@@ -1,6 +1,6 @@
 # agentic-fx 設計書
 
-- 日付: 2026-07-25 (改訂第 4 版 — ログ 2 軸分離 / news ソースリスト方式 / CLI 方針 / 初期起動フローを追加)
+- 日付: 2026-07-25 (改訂第 5 版 — feedly 廃止 / CLI⇔デーモン連携 (client.py) / plan 相当の保存先注記)
 - ステータス: 承認待ち
 - 前身: `~/project/finance` (IFD 計画型 FX 自動トレードシステム)
 
@@ -180,10 +180,10 @@ plugin を gitignore するのは、LLM が実装するツール群がプロジ�
 
 ### news はソースリスト方式 (plugin ではない)
 
-ニュースの取得方式は実質 **feed parse (RSS/Atom)** / **web fetch (HTML 記事抽出)** / **feedly (既存資産)** の 3 つに収斂するため、fetcher は `src/` の組み込み実装に固定し、**news の拡張はすべて `news_sources` テーブルへのデータ追加**とする:
+ニュースの取得方式は実質 **feed parse (RSS/Atom)** / **web fetch (HTML 記事抽出)** の 2 つに収斂するため、fetcher は `src/` の組み込み実装に固定し、**news の拡張はすべて `news_sources` テーブルへのデータ追加**とする (feedly は使わない — 前身の feedly_fetcher は移植しない):
 
 ```
-news_sources: id, name, fetcher (feed | web | feedly), url,
+news_sources: id, name, fetcher (feed | web), url,
               enabled, added_by (user | agent), status, created_at
 ```
 
@@ -263,6 +263,13 @@ discord_bot からの承認操作と状態確認のためだけの**限定 API**
 
 CLI は**ワンショットコマンド型**とする: 1 コマンド実行 → 結果表示 → 即終了。対話 REPL・ログのリアルタイム混在表示は作らない (前身 client.py の複雑さの原因だったため)。実装は Python + typer で言語を統一する。出力には技術ログを混ぜず、結果と activity のみを表示する (§13)。
 
+### CLI ⇔ デーモン連携 (client.py)
+
+`src/agentic_fx/client.py` は最小 API (§7) への薄い HTTP クライアント。CLI コマンドは次の規則でデーモン (`afx run`) と共存する:
+
+- **読み取り・承認系** (`status` / `activity` / `approve` / `reject`): デーモン稼働中は client.py 経由で API を叩き、応答がなければ直接 SQLite 読み書きにフォールバックする (bot / デーモン停止時でも操作可能)
+- **Mission 実行系** (`ask` / `improve` / `bootstrap`): API は Mission 起動エンドポイントを持たない (§7 の原則維持)。CLI プロセス自身が**クロスプロセス排他ロック** (SQLite ベース、デーモンの定期 Mission と同一ロック) を取得して実行する。LocalRunner は llama-swap への HTTP、ClaudeRunner は Agent SDK なので CLI プロセス内から直接実行できる
+
 | コマンド | 内容 |
 |---|---|
 | `afx init` | 対話ウィザード: settings.yaml 生成、DB 初期化、接続確認 (llama-swap / Discord / 価格ソース)。完了状態を記録 |
@@ -275,6 +282,14 @@ CLI は**ワンショットコマンド型**とする: 1 コマンド実行 → 
 | `afx status` | 残高・ポジション・直近 mission・kill switch 状態 |
 | `afx activity [--follow] [--category news\|tech\|trade\|improve]` | activity ログ表示 (--follow で tail -f 相当) |
 | `afx go-live` | live 切替 (Phase 3、明示操作) |
+
+### CLI とデーモンの連携 (client.py)
+
+`src/agentic_fx/client.py` は最小 API (§7) への薄い HTTP クライアント (`X-API-Key`)。CLI コマンドの動作規則:
+
+- **デーモン (`afx run`) 稼働中**: `status` / `activity` / `approve` / `reject` は client.py 経由で API を叩く (一貫したビュー・単一書き込み経路)
+- **デーモン停止中**: 同コマンドは直接 DB 読み書きにフォールバック (bot / API 停止時でも承認可能、§13 と整合)
+- **Mission 実行系** (`ask` / `improve` / `bootstrap`): API には Mission 起動エンドポイントを作らない原則 (§7) を維持し、**クロスプロセス排他ロック** (SQLite ベース、デーモンの定期実行と同一ロック) を取得して **CLI プロセス内で実行**する。ロックが取れない場合 (Mission 実行中) は待機または明示エラー
 
 ### 初期起動フロー
 
@@ -311,7 +326,7 @@ CLI は**ワンショットコマンド型**とする: 1 コマンド実行 → 
 |---|---|
 | PriceProvider + SQLite キャッシュ | orchestrator / planner / IFD 系一式 (trade_plans / order_intents / 条件監視) |
 | 指標計算 + MTF リサンプル (`resample.py`, `mtf.py`, `technical_scorer.py`) | signal_combiner の weight 合成 |
-| ニュース収集 + ChromaDB RAG (embedder 含む) | shadow metrics / cadence resolver |
+| ニュース収集 + ChromaDB RAG (embedder 含む、feedly_fetcher は除く) | shadow metrics / cadence resolver / feedly_fetcher |
 | 経済指標カレンダー (`econ_event_store` → SQLite 一本化) | RAG の insights / econ_analyses コレクション |
 | reflection 機構 (`cycles/reflection.py` + `analysis/reflector.py`) | candle_patterns (当面。必要になれば改善 loop が提案) |
 | 資金保護系 (`position_protection.py` / `portfolio_guard.py` / `bridge_health_gate.py`、Phase 3 で本格接続) | 旧 config 3 分割 merge 機構 |
@@ -331,7 +346,8 @@ discord_bot 側の finance cog (gate_cog / gate_ui / client) も再利用資産 
 
 ```
 agentic-fx/
-├── pyproject.toml             # [project.scripts] で CLI 登録 (main.py は削除)
+├── pyproject.toml             # [project.scripts] afx = "agentic_fx.cli:app"
+│                              #   (uv init 生成の main.py は Phase 1 実装時に削除)
 ├── config/
 │   ├── settings.yaml.example  # コミット (新規キーは必ず両方同期)
 │   └── settings.yaml          # gitignore
@@ -351,6 +367,8 @@ agentic-fx/
 │   ├── policy.py              # directives.md 読込・追記・4000 字注入
 │   ├── logging_setup.py       # 技術ログ (severity → logs/agentic.log + logrotate)
 │   ├── activity.py            # activity ログ (カテゴリ別イベント → logs/activity.log)
+│   ├── client.py              # 最小 API への薄い HTTP クライアント (CLI ⇔ デーモン連携, §8)
+│   ├── client.py              # 最小 API への薄い HTTP クライアント (CLI が使用、§8)
 │   ├── core/                  # ── 決定論的コア (LLM を一切 import しない) ──
 │   │   ├── scheduler.py       # 毎時起動・排他スロット・指値期限切れ取消
 │   │   ├── risk_gate.py       # 全ルール (テーブルテスト対象)
@@ -366,7 +384,7 @@ agentic-fx/
 │   ├── datafeed/              # ── データ収集 (移植が中心) ──
 │   │   ├── price_provider.py / indicators.py / resample.py / mtf.py
 │   │   ├── news_collector.py  # news_sources を読んで組み込み fetcher で収集
-│   │   ├── fetchers.py        # 組み込み fetcher: feed / web / feedly (§6)
+│   │   ├── fetchers.py        # 組み込み fetcher: feed / web (§6)
 │   │   ├── embedder.py / article_fetcher.py
 │   │   └── econ_calendar.py
 │   ├── runners/               # ── AgentRunner 抽象層 ──
@@ -398,7 +416,7 @@ agentic-fx/
 ## 12. 設定・ストレージ
 
 - 設定: `config/settings.yaml` 1 ファイル (gitignore) + `config/settings.yaml.example` (コミット)。前身の 3 分割はしない
-- 秘密情報: `.env` (`DISCORD_WEBHOOK_URL`, `TWELVEDATA_API_KEY`, `FEEDLY_ACCESS_TOKEN`, `AFX_API_KEY` など)
+- 秘密情報: `.env` (`DISCORD_WEBHOOK_URL`, `TWELVEDATA_API_KEY`, `AFX_API_KEY` など)
 
 ### SQLite スキーマ (`data/agentic.db`、前身 18 テーブル → 11 テーブルに再設計)
 
@@ -415,6 +433,8 @@ agentic-fx/
 | `econ_events` | 経済指標カレンダー (前身 econ_event_store 移植) |
 | `approval_requests` | 人間承認の一元管理 (§7: kind = tech_plugin / news_source / live_trade) |
 | `news_sources` | ニュース取得先リスト (§6: name, fetcher, url, enabled, added_by) |
+
+前身の `trade_plans` に相当するテーブルは**意図的に持たない** (IFD 計画型の廃止に伴う)。旧 plan の役割は 3 テーブルに分担される: LLM の判断内容 = `trade_intents`、「価格が来たら入る」予約 = `orders` の `status=pending` (期限付き指値)、live の承認待ち = `approval_requests` (kind=live_trade)。
 
 ### ChromaDB (`data/rag/`、前身 4 コレクション → 2 コレクション)
 
