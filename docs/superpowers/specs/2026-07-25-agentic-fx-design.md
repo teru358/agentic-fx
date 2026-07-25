@@ -1,6 +1,6 @@
 # agentic-fx 設計書
 
-- 日付: 2026-07-25 (改訂第 5 版 — feedly 廃止 / CLI⇔デーモン連携 (client.py) / plan 相当の保存先注記)
+- 日付: 2026-07-26 (改訂第 6 版 — main モデルへ変更: main.py 対話シェル付きサービス + client.py 操作クライアント、typer ワンショット CLI 廃止)
 - ステータス: 承認待ち
 - 前身: `~/project/finance` (IFD 計画型 FX 自動トレードシステム)
 
@@ -29,7 +29,7 @@ agentic-fx はこれを **agent loop 型**に置き換える。LLM agent が「�
 ┌──────────────────────────────────────────────────────┐
 │ 決定論的コア                                           │
 │  scheduler / data layer / risk gate / executor       │
-│  state store / notifier / 最小 API (承認 + status)     │
+│  state store / notifier / 操作 API (client.py, bot 用) │
 └──────┬──────────────────────┬────────────┬───────────┘
        │ ツール提供 + 判断依頼   │ 成績 + PR   │ approval_requests
 ┌──────▼───────────┐  ┌───────▼─────────┐ ┌▼──────────────────┐
@@ -99,7 +99,7 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 
 - 市場オープン中 (前身の `market_hours.py` を移植)、**1 時間毎に必ず実行する**。ポジションがなくても回し、「見送り (hold)」も判断として記録する — hold 判断も成績分析・振り返りのデータになる
 - エラー時はスキップして次周期 (リトライしない)。同時実行は常に 1 (agent 実行のグローバル排他)
-- **ワンショットのユーザープロンプト**: CLI `ask "..."` で排他スロットを取得して**臨時 Mission を即時実行**する。プロンプトはその 1 回だけ Mission に注入され (ワンショット)、結果は標準出力と Discord に返す。定期周期には影響しない。永続的な方針にしたい場合は `policy add` を使う
+- **ワンショットのユーザープロンプト**: main.py 対話シェルまたは client.py の `ask "..."` で**臨時 Mission を即時実行**する (実行は常にサービスプロセス内の排他スロット)。プロンプトはその 1 回だけ Mission に注入され (ワンショット)、結果は呼び出し元と Discord に返す。定期周期には影響しない。永続的な方針にしたい場合は `policy add` を使う
 
 ### Mission プロンプト構成
 
@@ -213,7 +213,7 @@ news_sources: id, name, fetcher (feed | web), url,
 ### 改善バックログ
 
 - SQLite `improvement_backlog` テーブル。source: `user` / `agent` / `research`、status: `open` / `selected` / `done` / `rejected`
-- ユーザーは CLI `improve add "アイデア"` でいつでも投入できる (収集へのユーザー入力受付)
+- ユーザーは `improve add "アイデア"` (対話シェル / client.py) でいつでも投入できる (収集へのユーザー入力受付)
 
 ### 許可ツール
 
@@ -242,70 +242,82 @@ reason, decided_by, decided_at, message_id, expires_at, created_at
 - `kind=live_trade` (Phase 3): live モードの open intent。payload は TradeIntent 全体。expires_at 超過で自動 expired
 - 決定の反映は冪等 (二重承認は 409 相当で拒否)
 
-### 最小 REST API (FastAPI)
+### 操作 REST API (FastAPI)
 
-discord_bot からの承認操作と状態確認のためだけの**限定 API**。§13 の「REST API サーバーは作らない」の唯一の例外であり、以下より広げない:
+稼働中サービスへの操作窓口。利用者は **client.py** (§8) と **discord_bot** (§9) の 2 つ。§16 の「汎用 REST API サーバーは作らない」の唯一の例外:
 
-| エンドポイント | 内容 |
-|---|---|
-| `GET /approvals?status=pending` | 承認待ち一覧 (bot が polling) |
-| `POST /approvals/{id}/approve` | 承認 |
-| `POST /approvals/{id}/reject` | 却下 (理由付き) |
-| `POST /approvals/{id}/message` | Discord message_id の保存 (bot の reconcile 用) |
-| `GET /status` | 読み取り専用: 残高・ポジション・直近 mission・kill switch 状態 |
+| エンドポイント | 内容 | 主な利用者 |
+|---|---|---|
+| `GET /status` | 残高・ポジション・直近 mission・kill switch 状態 | client.py / bot |
+| `GET /log?n=` | 技術ログの直近 n 行 | client.py |
+| `GET /activity?n=&category=` | activity ログの直近 n 行 | client.py |
+| `GET /approvals?status=pending` | 承認待ち一覧 (bot が polling) | bot |
+| `POST /approvals/{id}/approve` / `reject` | 承認 / 却下 (理由付き) | client.py / bot |
+| `POST /approvals/{id}/message` | Discord message_id の保存 (bot の reconcile 用) | bot |
+| `POST /ask` | 臨時 Mission の実行依頼 (実行は常にサービスプロセス内) | client.py |
+| `POST /policy` | 方針書への追記 | client.py |
+| `POST /backlog` | 改善アイデアの投入 | client.py |
 
-- `X-API-Key` 認証 (finance 方式踏襲)。**発注・設定変更・Mission 起動のエンドポイントは作らない** (書き込みは承認決定のみ)
-- CLI フォールバック: `improve approve/reject <id>` — bot 停止時でも承認できる
+- `X-API-Key` 認証 (finance 方式踏襲)
+- **載せない一線**: 発注操作・risk gate 等の設定変更・`go-live`・サービス停止。金を動かす経路と重大操作はホスト上の明示操作のみ
+- Mission 実行 (`/ask`) も含め、**Mission を実行するのは常にサービスプロセスだけ**。排他制御はプロセス内の Mission スロットで完結する (クロスプロセスロックは不要)
 
-## 8. CLI とユーザー入力チャネル
+## 8. エントリポイントと操作体系 (main モデル)
 
-### CLI 設計 (Python + typer、ワンショット型)
+エントリは **main.py (サービス本体)** と **client.py (稼働中サービスの操作クライアント)** の 2 つ。前身 finance と同じ運用感を踏襲しつつ、旧 client.py の問題 (ログのストリーミング表示が入力に割り込む) を「**ログ表示の pull 型コマンド化**」で解消する。
 
-CLI は**ワンショットコマンド型**とする: 1 コマンド実行 → 結果表示 → 即終了。対話 REPL・ログのリアルタイム混在表示は作らない (前身 client.py の複雑さの原因だったため)。実装は Python + typer で言語を統一する。出力には技術ログを混ぜず、結果と activity のみを表示する (§13)。
+### main.py — 対話シェル付きサービス
 
-### CLI ⇔ デーモン連携 (client.py)
+```
+uv run main.py              # サービス起動 + スプラッシュ + コマンド受付 (TTY のとき)
+uv run main.py --daemon     # systemd 用: コマンド受付なし (非 TTY 時は自動でこちら)
+uv run main.py init         # 設定ウィザード (サービスは起動しない)
+uv run main.py bootstrap    # 初期構築ウィザード (サービス非起動、--runner claude|local)
+uv run main.py go-live      # live 切替 (Phase 3、人間の明示操作。API には載せない)
+```
 
-`src/agentic_fx/client.py` は最小 API (§7) への薄い HTTP クライアント。CLI コマンドは次の規則でデーモン (`afx run`) と共存する:
+- 起動時**スプラッシュ**: mode (paper/live)・対象ペア・runner・risk gate 現行値・承認待ち件数・未約定指値・直近成績サマリを 1 画面表示
+- **コマンド受付 (対話シェル)**: プロンプトは常に静かで、ログを勝手に流さない。ログは `log` / `activity` コマンドで**必要なときに引く** (pull 型)
+- `stop` (または Ctrl-C) で **graceful shutdown**: スケジューラ停止 → 実行中 Mission の完了待ち (タイムアウト付き) → 終了。daemon モードの停止は `systemctl stop` の仕事
+- `[project.scripts]` に `afx` として同エントリを登録し、`uv run afx` でも起動可能にする
+- **起動ガード**: init 未完了なら通常起動・--daemon とも起動拒否 (systemd の Restart=always でも即終了を繰り返すだけで稼働しない)
 
-- **読み取り・承認系** (`status` / `activity` / `approve` / `reject`): デーモン稼働中は client.py 経由で API を叩き、応答がなければ直接 SQLite 読み書きにフォールバックする (bot / デーモン停止時でも操作可能)
-- **Mission 実行系** (`ask` / `improve` / `bootstrap`): API は Mission 起動エンドポイントを持たない (§7 の原則維持)。CLI プロセス自身が**クロスプロセス排他ロック** (SQLite ベース、デーモンの定期 Mission と同一ロック) を取得して実行する。LocalRunner は llama-swap への HTTP、ClaudeRunner は Agent SDK なので CLI プロセス内から直接実行できる
+### 操作コマンド体系 (main.py 対話シェルと client.py で共通)
+
+コマンド定義・パーサは 1 箇所で共有する。main.py はプロセス内で直接実行、client.py は操作 API (§7) 経由で同じ操作を実行する:
 
 | コマンド | 内容 |
 |---|---|
-| `afx init` | 対話ウィザード: settings.yaml 生成、DB 初期化、接続確認 (llama-swap / Discord / 価格ソース)。完了状態を記録 |
-| `afx bootstrap` | 初期構築の対話ウィザード (下記)。`--runner claude\|local` |
-| `afx run` | 常駐起動 (scheduler + loops + 最小 API)。**init 完了まで起動拒否** |
-| `afx ask "..."` | ワンショット臨時 Mission (即時実行) |
-| `afx policy add "..."` | 方針書へ追記 |
-| `afx improve` / `afx improve add "..."` | 改善 loop 手動起動 / バックログ投入 |
-| `afx approve <id>` / `afx reject <id>` | 承認の CLI フォールバック |
-| `afx status` | 残高・ポジション・直近 mission・kill switch 状態 |
-| `afx activity [--follow] [--category news\|tech\|trade\|improve]` | activity ログ表示 (--follow で tail -f 相当) |
-| `afx go-live` | live 切替 (Phase 3、明示操作) |
+| `status` | 残高・ポジション・直近 mission・kill switch 状態 |
+| `log [n]` | **技術ログ**の直近 n 行 (表示して終わり。ストリーミングしない) |
+| `activity [n] [news\|tech\|trade\|improve]` | **activity ログ**の直近 n 行 (カテゴリ絞り込み可) |
+| `ask "..."` | 臨時 Mission (実行は常にサービスプロセス内の排他スロット) |
+| `approve <id>` / `reject <id> [理由]` | 承認操作 |
+| `policy add "..."` | 方針書へ追記 |
+| `improve add "..."` / `backlog` | 改善アイデア投入 / バックログ一覧 |
+| `stop` | graceful shutdown (**main.py 対話シェルのみ**。API には載せない) |
 
-### CLI とデーモンの連携 (client.py)
+### client.py — 稼働中サービスの操作クライアント
 
-`src/agentic_fx/client.py` は最小 API (§7) への薄い HTTP クライアント (`X-API-Key`)。CLI コマンドの動作規則:
-
-- **デーモン (`afx run`) 稼働中**: `status` / `activity` / `approve` / `reject` は client.py 経由で API を叩く (一貫したビュー・単一書き込み経路)
-- **デーモン停止中**: 同コマンドは直接 DB 読み書きにフォールバック (bot / API 停止時でも承認可能、§13 と整合)
-- **Mission 実行系** (`ask` / `improve` / `bootstrap`): API には Mission 起動エンドポイントを作らない原則 (§7) を維持し、**クロスプロセス排他ロック** (SQLite ベース、デーモンの定期実行と同一ロック) を取得して **CLI プロセス内で実行**する。ロックが取れない場合 (Mission 実行中) は待機または明示エラー
+- 操作 API への薄い HTTP クライアント (`X-API-Key`)。`uv run client.py status` のようにワンショット実行し、即終了する
+- **--daemon 運用中の手元操作と、cron・シェルスクリプトからの連携**はこちらが担う (finance で実証済みのパターン)
+- サービス停止中は使えない。停止中に必要な操作は main.py サブコマンド (init / bootstrap / go-live) と、ログファイルの直接閲覧 (`tail logs/activity.log` — txt ベースなのでそのまま読める) でカバーする
 
 ### 初期起動フロー
 
-1. **`afx init`** — 設定ウィザード。完了までは `afx run` (常駐・サービス化) を**起動拒否**する。systemd unit 化はユーザーが明示的に行う (ドキュメントのみ提供)
-2. **`afx bootstrap`** (任意) — 初期構築ウィザード。対話で必要情報を収集 (取引ペア、リスク許容度、関心のあるニュース分野、好みのソース等) し、Mission に整形して改善 loop を手動起動。runner は `claude` / `local` を選択式 (ClaudeRunner = Agent SDK はサブスク認証で利用可能)。成果 (news_sources 追加・tech plugin) は通常の承認フローに乗る
-3. **`afx run`** — 常駐開始。bootstrap を省略しても組み込みデフォルト実装 (基本指標 + 基本ニュースソース) で稼働できる
+1. **`uv run main.py init`** — 設定ウィザード (settings.yaml 生成、DB 初期化、llama-swap / Discord / 価格ソースの接続確認)。完了までサービス起動を拒否。systemd unit 化はユーザーが明示的に行う (ドキュメントのみ提供)
+2. **`uv run main.py bootstrap`** (任意) — 初期構築ウィザード。対話で必要情報を収集 (取引ペア、リスク許容度、関心のあるニュース分野、好みのソース等) し、Mission に整形して改善 loop を手動起動。runner は `claude` / `local` を選択式 (ClaudeRunner = Agent SDK はサブスク認証で利用可能)。成果 (news_sources 追加・tech plugin) は通常の承認フローに乗る
+3. **`uv run main.py`** — サービス開始。bootstrap を省略しても組み込みデフォルト実装 (基本指標 + 基本ニュースソース) で稼働できる
 
 ### ユーザー入力チャネル
 
 | チャネル | 用途 | 消化タイミング |
 |---|---|---|
-| `afx policy add "..."` → `policy/directives.md` | 永続的な方針 (例: 「USDJPY は当面見送り」) | 全 Mission に毎回全文注入 (末尾 4000 文字) |
-| `afx ask "..."` | ワンショットの質問・指示 | 臨時 Mission を即時実行、その 1 回だけ注入 |
-| `afx improve add "..."` | 改善アイデアの投入 | 次回の改善 loop がバックログから選択 |
-| `afx bootstrap` | 初期構築の指示・必要情報の入力 | 改善 Mission を即時手動起動 |
-| Discord ボタン / `afx approve` | tech plugin・news ソース・live 発注の承認 | approval_requests の決定 |
+| `policy add "..."` → `policy/directives.md` | 永続的な方針 (例: 「USDJPY は当面見送り」) | 全 Mission に毎回全文注入 (末尾 4000 文字) |
+| `ask "..."` | ワンショットの質問・指示 | 臨時 Mission を即時実行、その 1 回だけ注入 |
+| `improve add "..."` | 改善アイデアの投入 | 次回の改善 loop がバックログから選択 |
+| `main.py bootstrap` | 初期構築の指示・必要情報の入力 | 改善 Mission を即時手動起動 |
+| Discord ボタン / `approve` | tech plugin・news ソース・live 発注の承認 | approval_requests の決定 |
 
 `policy/directives.md` はタイムスタンプ付き追記 (削除は手動編集)。サイズ超過時は起動時に警告する。
 
@@ -346,8 +358,9 @@ discord_bot 側の finance cog (gate_cog / gate_ui / client) も再利用資産 
 
 ```
 agentic-fx/
-├── pyproject.toml             # [project.scripts] afx = "agentic_fx.cli:app"
-│                              #   (uv init 生成の main.py は Phase 1 実装時に削除)
+├── pyproject.toml             # [project.scripts] afx = main.py と同エントリ (uv run afx でも起動可)
+├── main.py                    # サービス本体エントリ (対話シェル / --daemon / init / bootstrap / go-live, §8)
+├── client.py                  # 操作クライアントエントリ (操作 API 経由のワンショット実行, §8)
 ├── config/
 │   ├── settings.yaml.example  # コミット (新規キーは必ず両方同期)
 │   └── settings.yaml          # gitignore
@@ -361,14 +374,14 @@ agentic-fx/
 │   ├── superpowers/specs/     # 設計書
 │   └── examples/plugins/      # サンプル plugin (コミット対象、LLM の参照テンプレート)
 ├── src/agentic_fx/
-│   ├── cli.py                 # typer ワンショット型: init / bootstrap / run / ask / improve /
-│   │                          #   approve / status / activity / policy / go-live (§8)
+│   ├── service.py             # サービス起動シーケンス (起動ガード・スプラッシュ・scheduler 統合)
+│   ├── shell.py               # 対話シェル (コマンド受付・stop、ログは pull 型)
+│   ├── commands.py            # 操作コマンド定義 (main.py シェルと client.py で共有, §8)
+│   ├── ops_client.py          # client.py の実体 (操作 API への HTTP クライアント)
 │   ├── config.py              # settings.yaml ロード + 検証 (1 ファイル、3 分割しない)
 │   ├── policy.py              # directives.md 読込・追記・4000 字注入
 │   ├── logging_setup.py       # 技術ログ (severity → logs/agentic.log + logrotate)
 │   ├── activity.py            # activity ログ (カテゴリ別イベント → logs/activity.log)
-│   ├── client.py              # 最小 API への薄い HTTP クライアント (CLI ⇔ デーモン連携, §8)
-│   ├── client.py              # 最小 API への薄い HTTP クライアント (CLI が使用、§8)
 │   ├── core/                  # ── 決定論的コア (LLM を一切 import しない) ──
 │   │   ├── scheduler.py       # 毎時起動・排他スロット・指値期限切れ取消
 │   │   ├── risk_gate.py       # 全ルール (テーブルテスト対象)
@@ -377,7 +390,7 @@ agentic-fx/
 │   │   ├── market_hours.py    # (移植)
 │   │   └── notifier.py        # Discord webhook (移植)
 │   ├── store/                 # ── ストレージ層 ──
-│   │   ├── db.py              # SQLite 接続 + 10 テーブルスキーマ
+│   │   ├── db.py              # SQLite 接続 + 11 テーブルスキーマ
 │   │   ├── orders.py / missions.py / reflections.py / snapshots.py
 │   │   ├── backlog.py / econ_events.py / approvals.py / news_sources.py
 │   │   └── rag.py             # ChromaDB (news / reflections)
@@ -454,13 +467,13 @@ insights / econ_analyses は廃止。必要になれば改善 loop 自身が PR 
 | 軸 | 内容 | 出力先 | 読者 |
 |---|---|---|---|
 | **技術ログ** | severity (debug / info / warning / error / critical)。例外・接続失敗・リトライ | `logs/agentic.log` (+ journald) | 開発者・障害調査。CLI の通常出力には一切混ぜない |
-| **activity ログ** | カテゴリ別イベント (`news` / `tech` / `trade` / `improve` / `approval` / `system`)。「システムが何をしたか」の構造化 1 行記録 (ts, category, event, summary, ref_id) | `logs/activity.log` | ユーザー。`afx activity [--follow] [--category ...]`・Discord 通知・`?afx status` はこちらだけを読む |
+| **activity ログ** | カテゴリ別イベント (`news` / `tech` / `trade` / `improve` / `approval` / `system`)。「システムが何をしたか」の構造化 1 行記録 (ts, category, event, summary, ref_id) | `logs/activity.log` | ユーザー。`activity` コマンド (対話シェル / client.py)・`tail -f logs/activity.log`・Discord 通知・`?afx status` はこちらだけを読む |
 
 ### エラーハンドリング
 
 - LocalRunner: max_turns / timeout / JSON 修復不能 → MissionResult.status に記録し、その周期は「判断なし」として終了。ログ + Discord 通知。llama-swap TTL デッドロック時も timeout_sec で必ず抜ける
 - ClaudeRunner: SDK エラー・レート制限・クレジット枯渇 → 同上 (local への自動フォールバックはしない。挙動を予測可能に保つ)
-- 承認ゲート: bot / API 停止時も CLI `improve approve` で承認可能。live_trade の承認待ちは expires_at で必ず決着する (無限待ちなし)
+- 承認ゲート: bot 停止時も main.py 対話シェル / client.py の `approve` で承認可能。live_trade の承認待ちは expires_at で必ず決着する (無限待ちなし)
 - 全 MissionResult (transcript 含む) を SQLite `missions` に保存し、後から「なぜこの判断をしたか」を追跡可能にする
 
 ## 14. テスト戦略
@@ -477,13 +490,14 @@ insights / econ_analyses は廃止。必要になれば改善 loop 自身が PR 
 
 ## 15. 段階導入
 
-- **Phase 1**: 決定論的コア + LocalRunner + 取引判断 loop (ペーパー、ハイブリッド発注) + CLI 基盤 (`init` / `run` 起動ガード / `ask` / `status` / `activity`) + ログ 2 軸。ツールは get_ohlcv / get_indicators / search_news / get_positions の最小セット (組み込み実装 + news_sources 初期データのみ)
-- **Phase 2**: ClaudeRunner (Agent SDK) + 戦略改善 loop (バックログ + Web リサーチ) + tech plugin 機構 + news_sources 承認フロー + `bootstrap` + 最小 API + Discord 承認 (discord_bot 側 cog 含む) + policy チャネル
+- **Phase 1**: 決定論的コア + LocalRunner + 取引判断 loop (ペーパー、ハイブリッド発注) + main.py (スプラッシュ + 対話シェル + init 起動ガード + stop) + ログ 2 軸。ツールは get_ohlcv / get_indicators / search_news / get_positions の最小セット (組み込み実装 + news_sources 初期データのみ)
+- **Phase 2**: ClaudeRunner (Agent SDK) + 戦略改善 loop (バックログ + Web リサーチ) + tech plugin 機構 + news_sources 承認フロー + `bootstrap` + 操作 API + client.py + Discord 承認 (discord_bot 側 cog 含む) + policy チャネル
 - **Phase 3**: MT5 ブリッジ接続 + 資金保護系の本格接続 + live 切替 (`go-live`、人間の明示操作のみ) + live_trade Discord 承認ゲート
 
 ## 16. 非スコープ (YAGNI)
 
-- 汎用 REST API サーバー (§7 の最小 API — 承認 + 読み取り status — のみ例外として持つ。発注・設定変更・Mission 起動のエンドポイントは作らない)
+- 汎用 REST API サーバー (§7 の操作 API のみ例外として持つ。発注操作・設定変更・go-live・サービス停止のエンドポイントは作らない)
+- 対話シェルへのログのストリーミング表示 (旧 client.py の混線の原因。ログ表示は pull 型コマンドと tail で行う)
 - 改善の自動採用 (完全自動マージ / 無承認 plugin ロード)
 - local ⇔ claude の自動フォールバック / エスカレーション
 - IFD 的な条件監視付き予約注文 (前身の構造的限界の原因。指値 + 期限で代替)
