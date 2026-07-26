@@ -86,8 +86,15 @@ class Scheduler:
         else:
             self._maintain_reservations(now, account)
         self._force_close_day(now)
-        if account is not None:
-            self._process_fills(now)
+        # 修正ラウンド 2: account が不明な tick は「新規約定」だけをスキップ
+        # する (codex 1 の意図)。OPEN ポジションの SL/TP 監視
+        # (_process_exits) は既存建玉の資金保護であり、口座情報の有無に
+        # 関わらず必ず実行しなければならない — 以前は _process_fills 全体
+        # (約定処理と SL/TP 監視の両方) を丸ごとスキップしており、口座陳腐化
+        # 中は資金保護まで止まる回帰を生んでいた。
+        filled_ids = self._process_limit_fills(now) if account is not None \
+            else set()
+        self._process_exits(now, filled_ids)
         if self._last_trade is None or now - self._last_trade >= timedelta(hours=1):
             self._last_trade = now
             self.on_trade_mission()
@@ -148,7 +155,20 @@ class Scheduler:
         }
         for row in orders.list_by_status(self.conn, S.SUBMIT_UNKNOWN,
                                          S.CANCEL_UNKNOWN, S.CLOSE_UNKNOWN):
-            br = self.executor.broker.reconcile(row)
+            # 修正ラウンド 2: scheduler が直接呼ぶ broker.reconcile が例外を
+            # 投げても、その注文だけスキップして次の注文の処理・tick 全体は
+            # 継続する (executor 側は codex 2 で保護済みだが、scheduler が
+            # 直接呼ぶ箇所は未保護だった — ここで例外が伝播すると tick の
+            # 残り (SL/TP 監視含む) が全部飛ぶ)。
+            try:
+                br = self.executor.broker.reconcile(row)
+            except Exception as e:  # noqa: BLE001
+                self.activity.write(
+                    Category.TRADE, "reconcile_error",
+                    f"#{row['id']}: {e} — 次 tick 再試行",
+                    ref_id=str(row["id"]))
+                _log.warning("reconcile failed #%s: %s", row["id"], e)
+                continue
             # codex 4: 終端 (rejected/cancelled) への変換は、broker が
             # 「注文なし」と明言した (status=="ok" かつ message=="not_found")
             # ときだけ行う。status=="ok" だけで終端化すると、将来の broker が
@@ -187,7 +207,19 @@ class Scheduler:
             return
         price = q.bid if row["direction"] == "long" else q.ask
         fresh = orders.get(self.conn, row["id"])
-        br2 = self.executor.broker.close(fresh, price, "retry")
+        # 修正ラウンド 2: 直接呼ぶ broker.close も例外で tick 全体を落とさない
+        # よう保護する。ここでの例外は「まだ close 未実行」とみなせるため
+        # quote 障害と同様に次 tick 再試行として扱ってよい (DB 確定処理
+        # 到達前の失敗であり、broker 側が成功済みかもしれない状態とは違う)。
+        try:
+            br2 = self.executor.broker.close(fresh, price, "retry")
+        except Exception as e:  # noqa: BLE001
+            self.activity.write(Category.TRADE, "close_retry_deferred",
+                                f"{row['pair']}: broker error {e}",
+                                ref_id=str(row["id"]))
+            _log.warning("close retry deferred (broker) #%s: %s",
+                        row["id"], e)
+            return
         if br2.status == "ok":
             # broker 側は成功済み — 以降の DB 確定処理の失敗は握りつぶさない
             from agentic_fx.core.paper_broker import compute_pnl
@@ -286,13 +318,21 @@ class Scheduler:
             price = q.bid if row["direction"] == "long" else q.ask
             self.executor.close_order(row, price, reason="day_rollover")
 
-    def _process_fills(self, now: datetime) -> None:
+    def _process_limit_fills(self, now: datetime) -> set[int]:
+        """PENDING_FILL の約定処理。約定させた注文 ID の集合を返す。
+
+        修正ラウンド 2: account が不明な tick では呼ばない (tick() 側で
+        判定する) — 総リスク・レバレッジを再検証できない状態で新規建玉を
+        作らないため (codex 1)。SL/TP 監視 (`_process_exits`) とは別関数に
+        分離した (口座不明時に約定処理だけ止め、既存ポジションの保護は
+        止めないため)。
+        """
         # レビュー修正 1: 同一 tick で新規に約定させた注文 (OPEN に遷移させた
-        # もの) は第 2 ループで再取得しない。check_exit の
+        # もの) は _process_exits 側で再評価しない。check_exit の
         # entry_same_bar=True 抑制 (同一バー内でのエントリー成立と TP 到達は
-        # 順序判定不能) が、直後の第 2 ループで entry_same_bar=False として
-        # 再評価されると無効化され、本来確定できないはずの TP が確定して
-        # しまう欠陥があった。
+        # 順序判定不能) が、直後に entry_same_bar=False として再評価される
+        # と無効化され、本来確定できないはずの TP が確定してしまう欠陥が
+        # あった。
         filled_ids: set[int] = set()
         for row in orders.list_by_status(self.conn, S.PENDING_FILL):
             bar = self._fresh_bar(row["pair"], now)
@@ -313,9 +353,21 @@ class Scheduler:
             # 同一バーで SL/TP に到達し得る → 保守則で即時判定
             filled = orders.get(self.conn, row["id"])
             self._check_one_exit(filled, bar, entry_same_bar=True)
+        return filled_ids
+
+    def _process_exits(self, now: datetime, filled_ids: set[int]) -> None:
+        """OPEN ポジションの SL/TP 到達判定。
+
+        修正ラウンド 2 (Major 回帰の修正): 既存ポジションの資金保護は
+        口座 snapshot の有無に関わらず**必ず**実行する。以前は
+        `_process_fills` 一つの関数の中で約定処理と SL/TP 監視を両方行って
+        おり、account 不明時に呼び出し自体をスキップしていたため、口座
+        陳腐化中は建玉の SL/TP 監視まで丸ごと止まってしまっていた
+        (絶対制約「資金保護は決定論的コードで強制する」に抵触)。
+        """
         for row in orders.list_by_status(self.conn, S.OPEN):
             if row["id"] in filled_ids:
-                continue  # 上のループで entry_same_bar=True 判定済み
+                continue  # 同一 tick で約定済み — entry_same_bar=True 判定済み
             bar = self._fresh_bar(row["pair"], now)
             if bar is not None:
                 self._check_one_exit(row, bar, entry_same_bar=False)
@@ -324,7 +376,9 @@ class Scheduler:
         # CANCELLED が存在する pair) ではなく、config で宣言されている全
         # ペアにする。元の実装は「この tick でこれら 4 状態のいずれの注文も
         # 無い pair」のバーを一切マーキングせず、状態集合のドリフト (期限
-        # 切れのみ・unknown のみ等) に依存してしまっていた。
+        # 切れのみ・unknown のみ等) に依存してしまっていた。マーキングは
+        # account の有無に関わらず (_process_limit_fills が呼ばれなかった
+        # tick でも) 必ず行う。
         for pair in self.settings.pairs:
             bar = self.bars_fn(pair)
             if bar is not None:

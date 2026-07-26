@@ -445,3 +445,103 @@ def test_reconcile_does_not_finalize_when_broker_reports_still_exists(tmp_path):
         status="ok", message="not_found")
     env.sched.tick(WED + timedelta(minutes=1))
     assert orders.get(env.conn, oid)["status"] == "cancelled"
+
+
+# --- 修正ラウンド 2: 口座陳腐化中も既存ポジションの SL/TP 監視は止めない ---
+
+def test_open_position_sl_still_monitored_when_account_snapshot_unknown(tmp_path):
+    """回帰修正: codex 1 の `if account is not None: self._process_fills(now)`
+    は _process_fills 全体 (PENDING_FILL の約定処理 **と** OPEN の SL/TP
+    監視の両方) をスキップしてしまい、口座 snapshot 陳腐化中は既存建玉の
+    資金保護まで止まっていた。既存ポジションの SL/TP 監視は口座情報の有無に
+    関わらず必ず動かなければならない。"""
+    env = Env(tmp_path)
+    oid = env.place_limit(price=148.20, sl=147.80, tp=149.00)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                             148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=1))  # fill -> open
+    assert orders.get(env.conn, oid)["status"] == "open"
+    # 別ペア (EURUSD) の open ポジションを挿入し、バーを一度も与えないことで
+    # current_account を陳腐化させる (10 分超)
+    orders.insert(env.conn, pair="EURUSD", direction="long",
+                 entry_type="market", horizon="swing", status="open",
+                 now=WED, quantity=0.1, avg_fill_price=1.1000,
+                 stop_loss=1.0960, take_profit=1.1120)
+    # SL (147.80) を明確に下回るバー
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=12),
+                             147.60, 147.65, 147.50, 147.55, 100)
+    env.sched.tick(WED + timedelta(minutes=12))
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "closed"
+    assert row["close_reason"] == "sl"
+
+
+def test_pending_fill_still_skipped_when_account_snapshot_unknown_after_split(tmp_path):
+    """_process_limit_fills / _process_exits に分離した後も、修正 1 の意図
+    (口座不明時は新規約定させない) が維持されていることの回帰確認。"""
+    env = Env(tmp_path)
+    orders.insert(env.conn, pair="EURUSD", direction="long",
+                 entry_type="market", horizon="swing", status="open",
+                 now=WED, quantity=0.1, avg_fill_price=1.1000,
+                 stop_loss=1.0960, take_profit=1.1120)
+    oid = env.place_limit()  # USDJPY entry=148.20
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=11),
+                             148.30, 148.35, 148.15, 148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=11))
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "cancelled"
+    assert row["close_reason"] == "account_unknown"
+
+
+def test_reconcile_exception_skips_order_but_tick_continues(tmp_path):
+    """scheduler が直接呼ぶ broker.reconcile が例外を投げても、その注文だけ
+    スキップして他の注文の処理・tick 全体は継続すること。"""
+    from agentic_fx.core.contracts import BrokerResult
+
+    env = Env(tmp_path)
+    oid1 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="cancel_unknown", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8)
+    oid2 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="cancel_unknown", now=WED, quantity=0.1,
+                        requested_price=148.1, stop_loss=147.7)
+
+    def flaky_reconcile(row):
+        if row["id"] == oid1:
+            raise RuntimeError("reconcile down")
+        return BrokerResult(status="ok", message="not_found")
+
+    env.executor.broker.reconcile = flaky_reconcile
+    env.sched.tick(WED)  # oid1 の例外で落ちず、oid2 は解決される
+    assert orders.get(env.conn, oid1)["status"] == "cancel_unknown"
+    assert orders.get(env.conn, oid2)["status"] == "cancelled"
+
+
+def test_close_retry_broker_exception_skips_order_but_tick_continues(tmp_path):
+    """_retry_close 内の直接 broker.close 呼び出しが例外を投げても、その
+    注文だけスキップして他の注文の処理・tick 全体は継続すること。"""
+    from agentic_fx.core.contracts import BrokerResult
+
+    env = Env(tmp_path)
+    oid1 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="closing", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8,
+                        avg_fill_price=148.2)
+    oid2 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="closing", now=WED, quantity=0.1,
+                        requested_price=148.1, stop_loss=147.7,
+                        avg_fill_price=148.1)
+
+    def flaky_close(row, price, reason):
+        if row["id"] == oid1:
+            raise RuntimeError("close broker down")
+        return BrokerResult(status="ok")
+
+    env.executor.broker.close = flaky_close
+    env.sched.tick(WED)
+    assert orders.get(env.conn, oid1)["status"] == "closing"
+    assert orders.get(env.conn, oid2)["status"] == "closed"
