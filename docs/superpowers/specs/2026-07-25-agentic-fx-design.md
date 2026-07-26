@@ -16,7 +16,7 @@ agentic-fx はこれを **agent loop 型**に置き換える。LLM agent が「�
 
 - LLM 基盤は**ローカル LLM が基本** (llama-swap, OpenAI 互換 API, :8080)。Claude はサブスクリプション認証でのみ利用可。**Anthropic API (従量課金) は使用しない**
 - Claude 利用の課金実態 (2026-07 時点): `claude -p` / Agent SDK とも月次 Agent SDK クレジット枠から消費される。**usage credits (追加課金) は有効にしない** — クレジット枯渇時は ClaudeRunner が停止するだけで、従量課金は構造的に発生しない。枯渇時も local への自動フォールバックはしない (挙動を予測可能に保つ)
-- 両 loop とも LLM バックエンドは config で `local` / `claude` に切り替え可能。デフォルトは両方 `local`。稼働中の切替 (runner / ローカルモデル名) は `model` コマンド (§8) でも行える
+- 両 loop とも LLM バックエンドは config で `local` / `claude` に切り替え可能。デフォルトは両方 `local`。稼働中の切替 (runner / ローカルモデル) は `model` コマンド (§8、一覧から番号選択式) でも行える
 - 戦略改善 loop の変更採用は**必ず人間承認**を通す (トラック別のゲートは §6)
 - 発注・クローズ・SL/TP 変更・資金保護は LLM に委ねず、決定論的コードで強制する (例外: 未約定指値の取消のみ LLM に許可 — 資金リスクがゼロのため)
 - **取引モード (実資金) の新規発注は、初期は Discord/CLI の人間承認を最終ゲートとする**。成績実績を確認した上で、人間の明示操作 (`autopilot on`) でのみ自動発注へ移行できる — 最終目標は自動発注。切替は config 編集では不可 (明示コマンドのみ)、kill switch 等の risk gate は自動発注時も常時有効
@@ -286,7 +286,8 @@ reason, decided_by, decided_at, message_id, expires_at, created_at
 | `POST /policy` | 方針書への追記 | client.py |
 | `POST /backlog` | 改善アイデアの投入 | client.py |
 | `POST /news` | news ソース追加 (fetcher 自動判定 + 機械検証、§6) | client.py |
-| `POST /model` | LLM runner / ローカルモデルの切替 (資金と無関係のため API 可) | client.py |
+| `GET /models` | 利用可能モデル一覧 (llama-swap `/v1/models` + claude、番号付き) | client.py |
+| `POST /model` | LLM runner / ローカルモデルの切替 (client 側で番号→モデル名を解決して送る。資金と無関係のため API 可) | client.py |
 
 - `X-API-Key` 認証 (finance 方式踏襲)
 - **載せない一線**: 発注操作・risk gate 等の資金関連設定の変更・モード切替 (`mode`)・自動発注切替 (`autopilot`)・サービス停止。金を動かす経路と重大操作はホスト上の明示操作のみ
@@ -325,7 +326,8 @@ uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サー�
 | `policy add "..."` | 方針書へ追記 |
 | `improve add "..."` / `backlog` | 改善アイデア投入 / バックログ一覧 |
 | `news add <url> [--name]` / `news list` | ニュース取得対象の追加 (機械検証つき、§6) / 一覧 |
-| `model [trade\|improve] [local\|claude] [モデル名]` | LLM runner / ローカルモデルの表示・切替 |
+| `model` | 利用可能モデルの一覧表示 (llama-swap `/v1/models` から動的取得 + claude)。**各モデルに番号を割り振り**、両 loop の現在選択に印を付けて表示 |
+| `model <trade\|improve> <番号>` | 一覧の**番号で切替** (モデル名の手入力は不要。番号→モデル名の解決は表示時の一覧で行い、内部にはモデル名で保存する) |
 | `autopilot on\|off` | 取引モードの自動発注切替 (Phase 3、確認プロンプト付き。**対話シェルのみ**、API には載せない) |
 | `stop` | graceful shutdown (**main.py 対話シェルのみ**。API には載せない) |
 
