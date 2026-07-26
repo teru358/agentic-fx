@@ -1,0 +1,227 @@
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from agentic_fx.activity import ActivityLog
+from agentic_fx.config import load_settings
+from agentic_fx.core.accounting import record_snapshot
+from agentic_fx.core.contracts import (
+    FixedClock, InstrumentSpec, Origin, Quote, TradeIntent,
+)
+from agentic_fx.core.executor import Executor
+from agentic_fx.core.paper_broker import PaperBroker
+from agentic_fx.store import intents as intents_store
+from agentic_fx.store import missions, orders
+from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.state import StateStore
+
+NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+SETTINGS = load_settings(
+    Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+SPEC = InstrumentSpec(symbol="USDJPY", pip_size=0.01, min_lot=0.01,
+                      max_lot=50.0, lot_step=0.01, contract_size=100_000)
+QUOTE = Quote("USDJPY", 148.49, 148.51, NOW, "test")
+
+
+def _setup(tmp_path, broker=None):
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    record_snapshot(conn, now=NOW, balance=1_000_000, equity=1_000_000)
+    state = StateStore(tmp_path / "state.json")
+    from agentic_fx.core.notifier import Notifier
+    ex = Executor(conn=conn,
+                  broker=broker or PaperBroker(conn, SETTINGS, FixedClock(NOW)),
+                  settings=SETTINGS, state_store=state,
+                  activity=ActivityLog(tmp_path / "activity.log"),
+                  notifier=Notifier(enabled=False, webhook_url=None),
+                  clock=FixedClock(NOW), quote_fn=lambda p: QUOTE,
+                  spec_fn=lambda p: SPEC)
+    mid = missions.start(conn, "trade", "local", "m", NOW)
+    return conn, ex, state, mid
+
+
+class StubBroker:
+    """BrokerResult 分岐テスト用 (Phase 3 Mt5Broker の failure モード再現)。"""
+
+    def __init__(self, submit_status="ok", cancel_status="ok",
+                 close_status="ok"):
+        from agentic_fx.core.contracts import BrokerResult
+        self._r = BrokerResult
+        self.submit_status = submit_status
+        self.cancel_status = cancel_status
+        self.close_status = close_status
+
+    def equity(self):
+        return 1_000_000, 1_000_000
+
+    def submit(self, order_row, entry_price):
+        return self._r(status=self.submit_status, broker_order_id="s1")
+
+    def cancel(self, order_row):
+        return self._r(status=self.cancel_status)
+
+    def close(self, order_row, price, reason):
+        return self._r(status=self.close_status)
+
+
+def _open_intent(origin=Origin.SCHEDULER, **over):
+    d = {"action": "open", "pair": "USDJPY", "direction": "long",
+         "entry_type": "limit", "horizon": "day", "limit_price": 148.20,
+         "expires_in": "4h", "stop_loss": 147.80, "take_profit": 149.00,
+         "reasoning": "t"}
+    d.update(over)
+    return TradeIntent.from_llm_dict(d, origin=origin)
+
+
+def test_open_limit_creates_pending_fill(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    out = ex.handle_intent(_open_intent(), mid)
+    assert out["result"] == "pending"
+    row = orders.get(conn, out["order_id"])
+    assert row["status"] == "pending_fill"
+    assert row["quantity"] > 0
+    assert row["expires_at"] is not None
+
+
+def test_open_market_goes_straight_to_open(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    it = _open_intent(entry_type="market", limit_price=None, expires_in=None,
+                      stop_loss=148.00, take_profit=149.60)
+    out = ex.handle_intent(it, mid)
+    assert out["result"] == "opened"
+    row = orders.get(conn, out["order_id"])
+    assert row["status"] == "open"
+    assert row["avg_fill_price"] == QUOTE.ask
+
+
+def test_ask_origin_rejected_for_open(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    out = ex.handle_intent(_open_intent(origin=Origin.ASK), mid)
+    assert out["result"] == "rejected"
+    assert any("origin" in r for r in out["reasons"])
+    assert orders.list_by_status(conn, "pending_fill") == []
+
+
+def test_gate_reject_recorded(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    out = ex.handle_intent(_open_intent(take_profit=148.30), mid)  # RR 不足
+    assert out["result"] == "rejected"
+    row = conn.execute("SELECT * FROM trade_intents").fetchone()
+    assert row["gate_result"] == "rejected"
+
+
+def test_kill_switch_latches(tmp_path):
+    conn, ex, state, mid = _setup(tmp_path)
+    record_snapshot(conn, now=NOW, balance=970_000, equity=970_000)  # DD 3%
+    out = ex.handle_intent(_open_intent(), mid)
+    assert out["result"] == "rejected"
+    assert state.load().kill_switch_latched is True
+    # ラッチ後は equity が回復しても拒否される
+    record_snapshot(conn, now=NOW, balance=1_100_000, equity=1_100_000)
+    out2 = ex.handle_intent(_open_intent(), mid)
+    assert out2["result"] == "rejected"
+    assert any("latched" in r for r in out2["reasons"])
+
+
+def test_close_open_position(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    it = _open_intent(entry_type="market", limit_price=None, expires_in=None,
+                      stop_loss=148.00, take_profit=149.60)
+    oid = ex.handle_intent(it, mid)["order_id"]
+    close = TradeIntent.from_llm_dict({"action": "close", "order_id": oid},
+                                      origin=Origin.SCHEDULER)
+    out = ex.handle_intent(close, mid)
+    assert out["result"] == "closed"
+    row = orders.get(conn, oid)
+    assert row["status"] == "closed"
+    assert row["realized_pnl"] is not None
+
+
+def test_cancel_pending(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    oid = ex.handle_intent(_open_intent(), mid)["order_id"]
+    cancel = TradeIntent.from_llm_dict({"action": "cancel", "order_id": oid},
+                                       origin=Origin.SCHEDULER)
+    assert ex.handle_intent(cancel, mid)["result"] == "cancelled"
+
+
+def test_hold_records_only(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    hold = TradeIntent.from_llm_dict({"action": "hold", "reasoning": "wait"},
+                                     origin=Origin.SCHEDULER)
+    assert ex.handle_intent(hold, mid)["result"] == "hold"
+    assert conn.execute("SELECT COUNT(*) c FROM trade_intents").fetchone()["c"] == 1
+
+
+def test_pending_counts_toward_position_cap(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    ex.handle_intent(_open_intent(), mid)
+    ex.handle_intent(_open_intent(limit_price=148.10, stop_loss=147.70,
+                                  take_profit=148.90), mid)
+    out3 = ex.handle_intent(_open_intent(limit_price=148.00, stop_loss=147.60,
+                                         take_profit=148.80), mid)
+    assert out3["result"] == "rejected"
+    assert any("positions" in r for r in out3["reasons"])
+
+
+def test_no_fresh_snapshot_fail_closed(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    conn.execute("DELETE FROM account_snapshots")
+    conn.commit()
+    out = ex.handle_intent(_open_intent(), mid)
+    assert out["result"] == "rejected"
+    assert any("snapshot" in r for r in out["reasons"])
+
+
+def test_unresolved_unknown_blocks_new_open(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    orders.insert(conn, pair="USDJPY", direction="long", entry_type="market",
+                  horizon="day", status="submit_unknown", now=NOW,
+                  quantity=0.1, requested_price=148.5, stop_loss=148.0)
+    out = ex.handle_intent(_open_intent(), mid)
+    assert out["result"] == "rejected"
+    assert any("unknown" in r for r in out["reasons"])
+
+
+def test_submit_unknown_branches_to_submit_unknown(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path, broker=StubBroker(
+        submit_status="unknown"))
+    it = _open_intent(entry_type="market", limit_price=None, expires_in=None,
+                      stop_loss=148.00, take_profit=149.60)
+    out = ex.handle_intent(it, mid)
+    assert out["result"] == "unknown"
+    assert orders.get(conn, out["order_id"])["status"] == "submit_unknown"
+
+
+def test_submit_rejected_branches_to_rejected(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path, broker=StubBroker(
+        submit_status="rejected"))
+    it = _open_intent(entry_type="market", limit_price=None, expires_in=None,
+                      stop_loss=148.00, take_profit=149.60)
+    out = ex.handle_intent(it, mid)
+    assert out["result"] == "rejected"
+    assert orders.get(conn, out["order_id"])["status"] == "rejected"
+
+
+def test_close_unknown_not_marked_closed(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    it = _open_intent(entry_type="market", limit_price=None, expires_in=None,
+                      stop_loss=148.00, take_profit=149.60)
+    oid = ex.handle_intent(it, mid)["order_id"]
+    ex.broker = StubBroker(close_status="unknown")
+    row = orders.get(conn, oid)
+    ex.close_order(row, 148.60, reason="test")
+    row = orders.get(conn, oid)
+    assert row["status"] == "close_unknown"
+    assert row["realized_pnl"] is None  # closed 扱いにしない
+
+
+def test_cancel_rejected_means_fill_race(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    oid = ex.handle_intent(_open_intent(), mid)["order_id"]
+    ex.broker = StubBroker(cancel_status="rejected")
+    cancel = TradeIntent.from_llm_dict({"action": "cancel", "order_id": oid},
+                                       origin=Origin.SCHEDULER)
+    out = ex.handle_intent(cancel, mid)
+    assert orders.get(conn, oid)["status"] == "protection_pending"
