@@ -21,7 +21,7 @@ class SizeResult:
 
 def compute_size(*, equity: float, entry_price: float, stop_loss: float,
                  horizon: Horizon, pair: str, spec: InstrumentSpec,
-                 risk: RiskSettings) -> SizeResult:
+                 risk: RiskSettings, account_currency: str) -> SizeResult:
     # Important b: None check for numeric inputs and spec
     if spec is None:
         raise SizingError("spec is None")
@@ -52,6 +52,17 @@ def compute_size(*, equity: float, entry_price: float, stop_loss: float,
     rule = risk.pair_rules.get(pair)
     if rule is None:
         raise SizingError(f"pair_rules missing for {pair}")
+
+    # 口座通貨換算 (Phase 1: 為替レート未実装のため、換算できないペアは fail closed)
+    quote_currency = spec.symbol[3:] if len(spec.symbol) == 6 else None
+    if not quote_currency:
+        raise SizingError(
+            f"cannot derive quote currency from symbol '{spec.symbol}'")
+    if quote_currency != account_currency:
+        raise SizingError(
+            f"account currency conversion not implemented: quote currency "
+            f"'{quote_currency}' != account currency '{account_currency}' "
+            f"(口座通貨換算が未実装のため当該ペアは算出不可)")
 
     pct = risk.risk_per_trade_pct
     if horizon is Horizon.SWING:

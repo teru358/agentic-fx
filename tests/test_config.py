@@ -10,7 +10,7 @@ EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "settings.yaml.exampl
 def test_example_file_loads():
     s = load_settings(EXAMPLE)
     assert isinstance(s, Settings)
-    assert s.pairs == ["USDJPY", "EURUSD"]
+    assert s.pairs == ["USDJPY"]
     assert s.risk.rr_min == 1.5
     assert s.risk.risk_per_trade_pct == 0.5
     assert s.risk.swing_risk_factor == 0.5

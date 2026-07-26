@@ -5,7 +5,8 @@ import pytest
 
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import (
-    Horizon, InstrumentSpec, Origin, Quote, TradeIntent,
+    Action, Direction, EntryType, Horizon, InstrumentSpec, Origin, Quote,
+    TradeIntent,
 )
 from agentic_fx.core.risk_gate import GateContext, GateResult, evaluate
 
@@ -31,7 +32,7 @@ def _ctx(**over):
                 daily_start_equity=1_000_000.0, open_position_count=0,
                 existing_risk_total=0.0, existing_notional=0.0,
                 kill_switch_latched=False, has_unresolved_unknown=False,
-                now=NOW)
+                now=NOW, account_currency="JPY")
     base.update(over)
     return GateContext(**base)
 
@@ -151,3 +152,109 @@ def test_quote_symbol_mismatch_fail_closed():
     other = Quote("EURUSD", 1.10, 1.1002, NOW, "test")
     r = evaluate(_intent(), _ctx(quote=other), RISK)
     assert not r.accepted and any("symbol" in x for x in r.reasons)
+
+
+# --- レビュー指摘対応 (task-5 修正: A/B/C/D/E) ---
+
+def test_daily_start_equity_nan_fail_closed():
+    # A-1 (Critical): NaN は None と同様に fail closed でなければならない
+    r = evaluate(_intent(), _ctx(daily_start_equity=float("nan")), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_daily_start_equity_zero_fail_closed_no_exception():
+    # A-2 (Important): 0.0 は ZeroDivisionError を漏らさず却下すること
+    r = evaluate(_intent(), _ctx(daily_start_equity=0.0), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_daily_start_equity_negative_fail_closed():
+    r = evaluate(_intent(), _ctx(daily_start_equity=-1_000_000.0), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_hwm_zero_fail_closed_kill_switch_not_disabled():
+    # A-3 (Important): hwm<=0 で kill switch (DD 判定) が無効化されてはならない
+    r = evaluate(_intent(), _ctx(equity=1_000_000.0, hwm=0.0,
+                                 daily_start_equity=1_000_000.0), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_hwm_negative_fail_closed():
+    r = evaluate(_intent(), _ctx(equity=1_000_000.0, hwm=-5.0), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_negative_existing_risk_total_fail_closed():
+    # A-4 (Important): 負値は総リスク上限を素通りさせるため fail closed
+    r = evaluate(_intent(), _ctx(existing_risk_total=-1.0), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_negative_existing_notional_fail_closed():
+    r = evaluate(_intent(), _ctx(existing_notional=-1.0), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_naive_now_fail_closed():
+    # A: ctx.now が tz-naive だと day horizon で friday cutoff チェックを
+    # 経由せず素通りしてしまう問題への対応
+    naive_now = datetime(2026, 7, 22, 12, 0)  # tzinfo なし
+    r = evaluate(_intent(), _ctx(now=naive_now), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_nonpositive_stop_loss_fail_closed():
+    r = evaluate(_intent(stop_loss=-1.0), _ctx(), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_nonfinite_take_profit_fail_closed():
+    # TradeIntent.from_llm_dict はパース時に finite を強制するため、ここでは
+    # 「from_llm_dict を経由しない呼び出し元」を想定し、dataclass を直接構築して
+    # gate 自身の防御的検証 (defense-in-depth) を確認する
+    bad = TradeIntent(action=Action.OPEN, origin=Origin.SCHEDULER,
+                      pair="USDJPY", direction=Direction.LONG,
+                      entry_type=EntryType.LIMIT, horizon=Horizon.DAY,
+                      limit_price=148.20, expires_in_h=4.0, stop_loss=147.80,
+                      take_profit=float("inf"), confidence=0.7, reasoning="t")
+    r = evaluate(bad, _ctx(), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_nonpositive_limit_price_fail_closed():
+    r = evaluate(_intent(limit_price=0.0), _ctx(), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_kill_switch_latched_and_drawdown_both_listed():
+    # B: ラッチ済み かつ DD 超過のとき、両方の理由が reasons に入ること
+    r = evaluate(_intent(), _ctx(equity=979_000.0, kill_switch_latched=True), RISK)
+    assert any("kill switch latched" in x for x in r.reasons)
+    assert any("drawdown" in x for x in r.reasons)
+
+
+def test_rejected_result_has_no_size():
+    # D: 却下時は size が None であること (executor の誤用防止)
+    r = evaluate(_intent(take_profit=None), _ctx(), RISK)
+    assert not r.accepted and r.size is None
+
+
+def test_hold_action_raises_value_error_not_assert():
+    # C: assert ではなく ValueError (python -O でも安全に落ちる)
+    hold = _intent(action="hold")
+    with pytest.raises(ValueError):
+        evaluate(hold, _ctx(), RISK)
+
+
+def test_eurusd_intent_rejected_via_sizing_failure():
+    # E: 口座通貨 (JPY) とクォート通貨 (USD) が異なる EURUSD は
+    # sizing 側で fail closed され、gate はそれを理由に却下すること
+    eur_spec = InstrumentSpec(symbol="EURUSD", pip_size=0.0001, min_lot=0.01,
+                              max_lot=50.0, lot_step=0.01, contract_size=100_000)
+    eur_quote = Quote("EURUSD", 1.0999, 1.1001, NOW, "test")
+    eur_intent = _intent(pair="EURUSD", limit_price=1.1000, stop_loss=1.0960,
+                         take_profit=1.1120, expires_in="4h")
+    r = evaluate(eur_intent, _ctx(quote=eur_quote, spec=eur_spec), RISK)
+    assert not r.accepted and any("sizing failed" in x for x in r.reasons)
+    assert r.size is None

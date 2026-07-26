@@ -11,6 +11,7 @@ from agentic_fx.core.contracts import (
 from agentic_fx.core.market_hours import is_friday_after
 from agentic_fx.core.sizing import SizeResult, SizingError, compute_size
 from agentic_fx.core.accounting import drawdown_pct
+from agentic_fx.core.timeutil import as_utc
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,7 @@ class GateContext:
     kill_switch_latched: bool
     has_unresolved_unknown: bool  # *_unknown が 1 件でもあれば新規 open 不可
     now: datetime
+    account_currency: str
 
 
 def _validate_context(intent: TradeIntent, ctx: GateContext) -> list[str]:
@@ -42,6 +44,27 @@ def _validate_context(intent: TradeIntent, ctx: GateContext) -> list[str]:
                        f"quote={ctx.quote.symbol} spec={ctx.spec.symbol}")
     if ctx.has_unresolved_unknown:
         reasons.append("unresolved unknown orders exist (新規発注停止)")
+    if ctx.daily_start_equity is not None and (
+            not math.isfinite(ctx.daily_start_equity)
+            or ctx.daily_start_equity <= 0):
+        reasons.append("invalid context data (fail closed): "
+                       "daily_start_equity must be finite and positive")
+    if ctx.hwm <= 0:
+        reasons.append("invalid context data (fail closed): hwm must be > 0")
+    if ctx.existing_risk_total < 0 or ctx.existing_notional < 0:
+        reasons.append("invalid context data (fail closed): "
+                       "existing_risk_total/existing_notional must be >= 0")
+    try:
+        as_utc(ctx.now)
+    except ValueError:
+        reasons.append("invalid context data (fail closed): "
+                       "now must be timezone-aware")
+    for name, v in (("stop_loss", intent.stop_loss),
+                    ("take_profit", intent.take_profit),
+                    ("limit_price", intent.limit_price)):
+        if v is not None and (not math.isfinite(v) or v <= 0):
+            reasons.append(f"invalid context data (fail closed): "
+                           f"{name} must be finite and positive")
     return reasons
 
 
@@ -55,7 +78,8 @@ class GateResult:
 
 def evaluate(intent: TradeIntent, ctx: GateContext,
              risk: RiskSettings) -> GateResult:
-    assert intent.action is Action.OPEN, "gate は open のみ対象"
+    if intent.action is not Action.OPEN:
+        raise ValueError("gate は open のみ対象")
     reasons = _validate_context(intent, ctx)
     if reasons:
         # 入力が信頼できないので以降の評価はしない (fail closed)
@@ -111,10 +135,10 @@ def evaluate(intent: TradeIntent, ctx: GateContext,
         if rr < risk.rr_min:
             reasons.append(f"rr {rr:.2f} < {risk.rr_min}")
 
-    # kill switch (ラッチ or 現在 DD)
+    # kill switch (ラッチ・現在 DD は独立に判定し、両方該当時は両方を列挙する)
     if ctx.kill_switch_latched:
         reasons.append("kill switch latched")
-    elif drawdown_pct(ctx.equity, ctx.hwm) >= risk.drawdown_kill_pct:
+    if drawdown_pct(ctx.equity, ctx.hwm) >= risk.drawdown_kill_pct:
         reasons.append(
             f"kill switch: drawdown {drawdown_pct(ctx.equity, ctx.hwm):.2f}% "
             f">= {risk.drawdown_kill_pct}%")
@@ -144,7 +168,8 @@ def evaluate(intent: TradeIntent, ctx: GateContext,
     try:
         size = compute_size(equity=ctx.equity, entry_price=entry,
                             stop_loss=sl, horizon=intent.horizon,
-                            pair=intent.pair, spec=ctx.spec, risk=risk)
+                            pair=intent.pair, spec=ctx.spec, risk=risk,
+                            account_currency=ctx.account_currency)
     except SizingError as e:
         reasons.append(f"sizing failed: {e}")
     if size is not None:
@@ -160,5 +185,5 @@ def evaluate(intent: TradeIntent, ctx: GateContext,
 
     accepted = not reasons
     return GateResult(accepted=accepted, reasons=reasons,
-                      size=size if accepted else size,
+                      size=size if accepted else None,
                       entry_price=entry)

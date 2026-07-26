@@ -1,5 +1,5 @@
 # agentic-fx 設定 (このファイルを settings.yaml にコピーして編集。新キー追加時は両方を同期)
-pairs: [USDJPY, EURUSD]
+pairs: [USDJPY]  # EURUSD 等クォート通貨が口座通貨と異なるペアは、口座通貨換算の実装 (為替レート取得) 後に有効化する
 
 risk:
   rr_min: 1.5                 # 最小リスク報酬比 (spread 込み)
