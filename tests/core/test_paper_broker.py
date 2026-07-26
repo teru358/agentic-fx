@@ -55,3 +55,28 @@ def test_balance_reflects_realized_pnl(tmp_path):
                         quantity=0.1, realized_pnl=5000.0)
     balance, _ = b.equity()
     assert balance == 1_005_000
+
+
+def test_balance_reflects_fees_swap(tmp_path):
+    c, b = _broker(tmp_path)
+    oid = orders.insert(c, pair="USDJPY", direction="long", entry_type="market",
+                        horizon="day", status=OrderStatus.CLOSED, now=NOW,
+                        quantity=0.1, realized_pnl=5000.0, fees_swap=1200.0)
+    balance, _ = b.equity()
+    # balance = 1_000_000 + 5000 (realized) - 1200 (swap fees) = 1_003_800
+    assert balance == 1_003_800
+
+
+def test_balance_with_mixed_fees_and_pnl(tmp_path):
+    c, b = _broker(tmp_path)
+    # Order 1: closed with pnl and fees
+    orders.insert(c, pair="USDJPY", direction="long", entry_type="market",
+                  horizon="day", status=OrderStatus.CLOSED, now=NOW,
+                  quantity=0.1, realized_pnl=5000.0, fees_swap=500.0)
+    # Order 2: closed with pnl, no fees (fees_swap is NULL)
+    orders.insert(c, pair="EURUSD", direction="short", entry_type="market",
+                  horizon="day", status=OrderStatus.CLOSED, now=NOW,
+                  quantity=0.2, realized_pnl=3000.0)
+    balance, _ = b.equity()
+    # balance = 1_000_000 + 5000 + 3000 - 500 = 1_007_500
+    assert balance == 1_007_500

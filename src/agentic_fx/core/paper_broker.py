@@ -1,4 +1,10 @@
-"""PaperBroker — Broker 境界の paper 実装。SL/TP 添付は常に成功する想定。"""
+"""PaperBroker — Broker 境界の paper 実装。SL/TP 添付は常に成功する想定。
+
+Key assumptions (to avoid double-counting fees):
+- realized_pnl is commission-deducted (net value after commission_per_lot)
+- fees_swap is overnight swap fees ONLY (separate from realized_pnl, not included in it)
+- balance = starting_balance + Σ realized_pnl − Σ fees_swap (no double subtraction of commission)
+"""
 from __future__ import annotations
 
 import sqlite3
@@ -25,9 +31,9 @@ class PaperBroker:
 
     def equity(self) -> tuple[float, float]:
         row = self._conn.execute(
-            "SELECT COALESCE(SUM(realized_pnl), 0) AS pnl FROM orders "
-            "WHERE realized_pnl IS NOT NULL").fetchone()
-        balance = self._settings.paper.starting_balance + row["pnl"]
+            "SELECT COALESCE(SUM(realized_pnl), 0) AS pnl, "
+            "COALESCE(SUM(fees_swap), 0) AS fees FROM orders").fetchone()
+        balance = self._settings.paper.starting_balance + row["pnl"] - row["fees"]
         return balance, balance
 
     def submit(self, order_row: dict, entry_price: float) -> BrokerResult:
