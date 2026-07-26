@@ -36,7 +36,11 @@
 
 **Interfaces:**
 - Produces:
-  - `db.connect(db_path, *, check_same_thread: bool = False)` — シェルスレッドと scheduler スレッドが同一 conn を共有するため。書き込みの直列化は Mission スロット + 各 CRUD の即時 commit + WAL で担保
+  - `db.connect(db_path, *, check_same_thread: bool = False)` — さらに `PRAGMA busy_timeout=5000` を設定
+  - **スレッド × 接続の設計** (単一接続の同時使用はしない):
+    - **conn_core**: scheduler スレッドの tick と Mission 実行 (ask 含む) 専用。**`core_lock` (threading.RLock) が tick 全体と ask を排他**するため、conn_core に同時アクセスするスレッドは常に 1 つ
+    - **conn_shell**: シェル (Commands) 専用の**別接続**。approve/reject/status 等はこちら。WAL + busy_timeout により conn_core との並行書き込みは SQLite 側で直列化される
+    - Mission スロット = core_lock (「Mission 実行は常にサービスプロセス内の単一スロット」の実装。設計書 §7)
   - `class Policy(path: Path)`: `.tail(chars: int = 4000) -> str` (ファイル無しは空文字)、`.size_warning(limit_chars: int = 16000) -> str | None` (超過時に警告文)
   - `load_prompt(name: str) -> str` — `loops/prompts/<name>.md` を読む (`loops/prompts.py` 内)
 
@@ -110,6 +114,7 @@ def connect(db_path: Path, *, check_same_thread: bool = False) -> sqlite3.Connec
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 ```
 
@@ -238,7 +243,7 @@ git commit -m "feat: policy 注入・prompts (.md)・DB スレッド対応"
 - Produces:
   - `TRADE_INTENT_SCHEMA: dict` — `{"type": "object", "properties": {"action": {"enum": ["open", "close", "cancel", "hold"]}, ...}, "required": ["action", "reasoning"]}` (構造の最終防衛は `TradeIntent.from_llm_dict` — スキーマは LLM への再出力誘導用に緩めでよい)
   - `ANSWER_SCHEMA: dict` — `{"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}`
-  - `build_state_summary(conn, broker, econ, clock) -> str` — 設計書 §5 ②: 残高・エクイティ / 累計・日次 P&L / 現在ポジション + 未約定指値 (order_id・horizon 付き) / 直近 10 件のトレード 1 行要約 (ペア/方向/損益/クローズ理由) / 24h 以内の経済指標
+  - `build_state_summary(conn, broker, econ, clock, starting_balance: float) -> str` — 設計書 §5 ②: 残高・エクイティ / **累計 P&L (= equity − starting_balance)**・日次 P&L / 現在ポジション + 未約定指値 (order_id・horizon 付き) / 直近 10 件のトレード 1 行要約 (ペア/方向/損益/クローズ理由) / 24h 以内の経済指標
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -293,12 +298,14 @@ def test_summary_contains_positions_and_trades(tmp_path):
          "name": "CPI", "importance": 3}]
     text = build_state_summary(conn, PaperBroker(conn, SETTINGS,
                                                  FixedClock(NOW)),
-                               econ, FixedClock(NOW))
+                               econ, FixedClock(NOW),
+                               SETTINGS.paper.starting_balance)
     assert "USDJPY" in text and "swing" in text      # 未約定指値 + horizon
     assert f"#{oid}" in text or str(oid) in text      # order_id 提示
-    assert "sl" in text and "-1200" in text           # 直近トレード要約
+    assert "sl" in text and "-1,200" in text          # 直近トレード要約
     assert "CPI" in text                              # 経済指標
     assert "1,000,000" in text or "1000000" in text   # 残高
+    assert "累計" in text and "-1,200" in text        # 累計 P&L (realized -1200)
 ```
 
 - [ ] **Step 2: テストが失敗することを確認**
@@ -353,16 +360,18 @@ _ACTIVE = (OrderStatus.OPEN, OrderStatus.PENDING_FILL,
 
 
 def build_state_summary(conn: sqlite3.Connection, broker: PaperBroker,
-                        econ: EconCalendar, clock: Clock) -> str:
+                        econ: EconCalendar, clock: Clock,
+                        starting_balance: float) -> str:
     now = clock.now()
     balance, equity = broker.equity()
     day_start = daily_start_equity(conn, now)
     daily_pnl = (equity - day_start) if day_start else 0.0
+    total_pnl = equity - starting_balance
 
     lines = ["## 現在の状態 (システム生成)",
              f"- 時刻: {now.isoformat()}",
-             f"- 残高: {balance:,.0f} / エクイティ: {equity:,.0f} "
-             f"/ 日次損益: {daily_pnl:+,.0f}"]
+             f"- 残高: {balance:,.0f} / エクイティ: {equity:,.0f}",
+             f"- 累計損益: {total_pnl:+,.0f} / 日次損益: {daily_pnl:+,.0f}"]
 
     active = orders.list_by_status(conn, *_ACTIVE)
     if active:
@@ -423,7 +432,7 @@ git commit -m "feat: 状態サマリ生成 + Mission 出力スキーマ (intent/
     1. **fail closed**: `provider.healthcheck(settings.pairs[0])` が `DataUnhealthy` → activity SYSTEM `data_unhealthy` + notifier + **Mission を実行せず None**
     2. prompt = `load_prompt("trade_mission")` + policy.tail(4000) + `build_state_summary(...)`
     3. `Mission(tools=[get_ohlcv, get_indicators, search_news, get_econ_calendar, get_positions, get_account, get_recent_reflections, search_reflections], output_schema=TRADE_INTENT_SCHEMA, max_turns/timeout=settings.llama_swap)`
-    4. `missions.start(loop="trade")` → `runner.run` → **必ず `missions.finish`** (status・output・transcript)
+    4. `missions.start(loop="trade")` → `runner.run` を **try/except で包み、例外は `failed` の MissionResult に正規化** (AgentRunner 契約は無例外を保証しない) → **finally で必ず `missions.finish`** (status・output・transcript — 設計書 §13「全 MissionResult を保存」)。`finish` 自体の失敗は技術ログ exception
     5. runner 失敗 (completed 以外) → activity AGGREGATE `mission_failed` + notifier + None
     6. `TradeIntent.from_llm_dict(output, origin=Origin.SCHEDULER)` — `IntentParseError` → missions は completed のまま activity AGGREGATE `intent_parse_failed` + None
     7. `executor.handle_intent(intent, mid)` → activity AGGREGATE `decision` (result 要約) → 戻り値
@@ -523,6 +532,19 @@ def test_runner_failure_recorded(tmp_path):
     assert "mission_failed" in (tp / "a.log").read_text(encoding="utf-8")
 
 
+def test_runner_exception_normalized_to_failed(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [])
+
+    class Boom:
+        def run(self, mission):
+            raise RuntimeError("crash")
+
+    loop.runner = Boom()
+    assert loop.run_once() is None  # 例外が漏れない
+    m = conn.execute("SELECT * FROM missions").fetchone()
+    assert m["status"] == "failed"  # 必ず finish される
+
+
 def test_unparsable_intent_recorded(tmp_path):
     conn, loop, _, tp = _loop(tmp_path, [MissionResult(
         "completed", {"action": "buy!"}, [])])
@@ -584,8 +606,12 @@ from agentic_fx.loops.summary import (
     ANSWER_SCHEMA, TRADE_INTENT_SCHEMA, build_state_summary,
 )
 from agentic_fx.policy import Policy
-from agentic_fx.runners.base import AgentRunner, Mission
+from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
 from agentic_fx.store import missions
+
+import logging
+
+_log = logging.getLogger("agentic_fx.trade_loop")
 
 _TRADE_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
                 "get_econ_calendar", "get_positions", "get_account",
@@ -628,9 +654,7 @@ class TradeLoop:
         mid = missions.start(self.conn, "trade",
                              self.settings.runner.trade.backend,
                              self.settings.runner.trade.model, now)
-        result = self.runner.run(mission)
-        missions.finish(self.conn, mid, result.status, result.output,
-                        result.transcript, self.clock.now())
+        result = self._run_recorded(mid, mission)
         if result.status != "completed":
             self.activity.write(Category.AGGREGATE, "mission_failed",
                                 f"runner status={result.status}",
@@ -663,9 +687,7 @@ class TradeLoop:
         mid = missions.start(self.conn, "ask",
                              self.settings.runner.trade.backend,
                              self.settings.runner.trade.model, now)
-        result = self.runner.run(mission)
-        missions.finish(self.conn, mid, result.status, result.output,
-                        result.transcript, self.clock.now())
+        result = self._run_recorded(mid, mission)
         if result.status != "completed":
             return f"(Mission 失敗: {result.status})"
         self.activity.write(Category.AGGREGATE, "ask_answered",
@@ -674,13 +696,30 @@ class TradeLoop:
 
     # ---- internal -------------------------------------------------------
 
+    def _run_recorded(self, mid: int, mission: Mission) -> MissionResult:
+        """runner を実行し、例外を failed に正規化して必ず missions.finish する。"""
+        result: MissionResult | None = None
+        try:
+            result = self.runner.run(mission)
+        except Exception:  # noqa: BLE001 — runner 例外で周期を殺さない
+            _log.exception("runner raised")
+            result = MissionResult("failed", None, [])
+        finally:
+            try:
+                missions.finish(self.conn, mid, result.status, result.output,
+                                result.transcript, self.clock.now())
+            except Exception:  # noqa: BLE001
+                _log.exception("missions.finish failed for %s", mid)
+        return result
+
     def _build_prompt(self, system: str) -> str:
         parts = [system]
         tail = self.policy.tail(4000)
         if tail:
             parts.append(f"## ユーザー方針 (policy)\n{tail}")
-        parts.append(build_state_summary(self.conn, self.executor.broker,
-                                         self.econ, self.clock))
+        parts.append(build_state_summary(
+            self.conn, self.executor.broker, self.econ, self.clock,
+            self.settings.paper.starting_balance))
         return "\n\n".join(parts)
 ```
 
@@ -707,7 +746,7 @@ git commit -m "feat: 取引判断 loop (fail closed・全記録・ask 回答専�
 **Interfaces:**
 - Produces: `class ReflectionCycle`:
   - `__init__(self, *, conn, runner: AgentRunner, rag: Rag, settings: Settings, activity: ActivityLog, clock: Clock)`
-  - `run_pending(self) -> int` — **reflection 未作成の closed orders** を検索し、各件: `load_prompt("reflection")` + トレード詳細 (order row + 対応 intent の reasoning) で Mission (`output_schema={"content": string}`、loop="reflection" で記録) → `reflections.save` + `rag.add_reflection` (**SQLite + ChromaDB 二重保存** — 設計書 §12)。runner 失敗はその件をスキップ (次回再試行)。作成件数を返す。scheduler の毎時 Mission 後に呼ぶ (プラン 5 の service 配線)
+  - `run_pending(self) -> int` — **reflection 未作成の closed orders** を検索し、各件: `load_prompt("reflection")` + トレード詳細 (order row + 対応 intent の reasoning) で Mission (`output_schema={"content": string}`、loop="reflection" で記録) → **`rag.add_reflection` を先に、`reflections.save` を後に** 実行する (**SQLite + ChromaDB 二重保存** — 設計書 §12。順序が肝: SQLite 保存を完了マーカーとし、ChromaDB 失敗時は SQLite 行が残らないため次回 rag upsert (order_id 冪等) ごと再試行できる — 片側だけ恒久的に欠ける状態を作らない)。runner の失敗・例外はその件をスキップ (次回再試行、Mission 記録は try/finally で必ず finish)。作成件数を返す
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -774,6 +813,16 @@ def test_runner_failure_skips_for_retry(tmp_path):
     oid = _closed_order(conn)
     assert cyc.run_pending() == 0
     assert reflections.get(conn, oid) is None  # 次回再試行できる
+
+
+def test_rag_failure_leaves_no_sqlite_row(tmp_path):
+    # ChromaDB 失敗時に SQLite だけ残ると恒久的に片側欠けになる (#codex 指摘)
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "completed", {"content": "x"}, [])])
+    rag.add_reflection.side_effect = RuntimeError("chroma down")
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    assert reflections.get(conn, oid) is None  # 完了マーカーなし → 次回再試行
 ```
 
 - [ ] **Step 2: テストが失敗することを確認**
@@ -790,7 +839,10 @@ Expected: FAIL (ImportError)
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+
+_log = logging.getLogger("agentic_fx.reflection")
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import Settings
@@ -848,14 +900,30 @@ class ReflectionCycle:
         mid = missions.start(self.conn, "reflection",
                              self.settings.runner.trade.backend,
                              self.settings.runner.trade.model, now)
-        result = self.runner.run(mission)
-        missions.finish(self.conn, mid, result.status, result.output,
-                        result.transcript, self.clock.now())
+        result = None
+        try:
+            result = self.runner.run(mission)
+        except Exception:  # noqa: BLE001
+            _log.exception("reflection runner raised")
+            from agentic_fx.runners.base import MissionResult
+            result = MissionResult("failed", None, [])
+        finally:
+            try:
+                missions.finish(self.conn, mid, result.status, result.output,
+                                result.transcript, self.clock.now())
+            except Exception:  # noqa: BLE001
+                _log.exception("missions.finish failed for %s", mid)
         if result.status != "completed":
             return False
         content = result.output["content"]
+        # rag → SQLite の順 (SQLite 行が完了マーカー。rag 失敗時は次回丸ごと再試行)
+        try:
+            self.rag.add_reflection(row["id"], content, row["pair"])
+        except Exception:  # noqa: BLE001
+            _log.exception("rag.add_reflection failed for #%s — retry next run",
+                           row["id"])
+            return False
         reflections.save(self.conn, row["id"], content, now)
-        self.rag.add_reflection(row["id"], content, row["pair"])
         self.activity.write(Category.AGGREGATE, "reflection_created",
                             f"#{row['id']} {row['pair']}",
                             ref_id=str(row["id"]))
@@ -1274,14 +1342,13 @@ git commit -m "feat: 対話シェル + daemon 時の journald 経路 (stderr han
 
 **Interfaces:**
 - Produces:
-  - `@dataclass App(conn, settings, state, activity, broker, executor, provider, econ, collector, rag, trade_loop, reflection, scheduler, commands, registry, mission_lock: threading.Lock)`
-  - `build_app(root: Path, *, runner: AgentRunner | None = None, clock: Clock | None = None) -> App` — 全部品を配線して返す (テスト注入点: runner=FakeRunner / clock=FixedClock):
+  - `@dataclass App(conn_core, conn_shell, settings, state, activity, broker, executor, provider, econ, collector, rag, trade_loop, reflection, scheduler, commands, registry, core_lock: threading.RLock)`
+  - `build_app(root: Path, *, runner: AgentRunner | None = None, clock: Clock | None = None, quote_fn=None, spec_fn=None, bars_fn=None) -> App` — 全部品を配線して返す。**quote_fn / spec_fn / bars_fn は E2E テストの注入点** (None なら provider の実装を使う — build 後の patch では bound 済みクロージャに届かないため注入で解決):
     - registry: market/news/account/reflection の build を register_all
     - runner が None なら `LocalRunner(base_url=settings.llama_swap.base_url, model=settings.runner.trade.model, registry=registry)`
-    - `Scheduler(on_trade_mission=<mission_lock を取って trade_loop.run_once + reflection.run_pending>, on_news_cycle=collector.collect, bars_fn=provider.latest_1m_bar)`
-    - executor の `quote_fn=provider.get_quote / spec_fn=provider.spec`
-    - **equity 時価 snapshot**: `on_trade_mission` の先頭で `record_snapshot` (broker.equity ベース — Phase 1 近似、プラン 3 引き継ぎの注記どおり)
-  - `run_service(root: Path, *, daemon: bool = False) -> int` — ensure_initialized → build_app → policy サイズ警告表示 → **スプラッシュ表示** → scheduler スレッド起動 (60 秒毎 `tick(now)`、stop_event を 1 秒粒度で監視) → TTY なら `run_shell`、daemon なら SIGTERM/SIGINT 待ち → **graceful shutdown** (stop_event → mission_lock 取得を最大 30 秒待って終了)
+    - **conn_core** (scheduler/Mission 用) と **conn_shell** (Commands 用) の 2 接続。core_lock (RLock) が conn_core の全使用 (tick + ask) を排他
+    - `Scheduler(on_trade_mission=<trade_loop.run_once + reflection.run_pending>, on_news_cycle=collector.collect, bars_fn=...)` — tick 全体が core_lock 下で走るため on_trade_mission 内での二重ロックは不要 (RLock なので取っても安全)
+  - `run_service(root: Path, *, daemon: bool = False) -> int` — ensure_initialized → build_app → policy サイズ警告表示 → **スプラッシュ表示** → scheduler スレッド起動 (60 秒毎に **core_lock を取って** `tick(now)`。**stop_event が立っていたら新しい tick を開始しない**) → TTY なら `run_shell`、daemon なら SIGTERM/SIGINT 待ち → **graceful shutdown**: stop_event → `th.join(timeout=30)` → **join 成功時のみ activity `service_stopped` = "graceful"、タイムアウト時は "shutdown_timeout (Mission 継続中の可能性)" を正直に記録** (終了確認なしに graceful と書かない)
   - `build_splash(app) -> str` — mode・発注方式・対象ペア・runner/モデル・risk gate 現行値・承認待ち件数・未約定指値・直近成績。**項目は最小でよい (運用しながら調整 — 設計書 §8)**
   - entry: `--daemon` フラグ追加。非 TTY (`not sys.stdin.isatty()`) は自動で daemon 扱い
   - init 拡張: llama-swap 接続確認 (`GET {base_url}/models`、失敗は警告のみ)
@@ -1320,7 +1387,8 @@ def test_build_app_wires_everything(tmp_path):
     app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW))
     assert app.trade_loop is not None
     assert app.scheduler is not None
-    assert isinstance(app.mission_lock, type(threading.Lock()))
+    assert isinstance(app.core_lock, type(threading.RLock()))
+    assert app.conn_core is not app.conn_shell  # スレッド別接続
     # ツールが登録されている
     for name in ("get_ohlcv", "search_news", "get_positions",
                  "get_recent_reflections"):
@@ -1343,10 +1411,13 @@ def test_on_trade_mission_runs_loop_and_reflection(tmp_path):
                                      [])])
     app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW))
     from unittest.mock import patch
+    from agentic_fx.core.accounting import record_snapshot
+    record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
+                    equity=1_000_000)
     with patch.object(app.provider, "healthcheck", return_value="yfinance"):
         app.scheduler.on_trade_mission()
     assert len(fake.missions) >= 1  # trade mission が実行された
-    rows = app.conn.execute("SELECT * FROM missions").fetchall()
+    rows = app.conn_core.execute("SELECT * FROM missions").fetchall()
     assert any(r["loop"] == "trade" for r in rows)
 ```
 
@@ -1400,7 +1471,8 @@ class _SystemClock:
 
 @dataclass
 class App:
-    conn: object
+    conn_core: object
+    conn_shell: object
     settings: object
     state: object
     activity: object
@@ -1415,34 +1487,41 @@ class App:
     scheduler: object
     commands: object
     registry: object
-    mission_lock: threading.Lock
+    core_lock: threading.RLock
 
 
 def build_app(root: Path, *, runner: AgentRunner | None = None,
-              clock: Clock | None = None) -> App:
+              clock: Clock | None = None, quote_fn=None, spec_fn=None,
+              bars_fn=None) -> App:
     clock = clock or _SystemClock()
     settings = load_settings(root / "config" / "settings.yaml")
     state = _state_store(root)
     activity = ActivityLog(root / "logs" / "activity.log")
-    conn = connect(root / "data" / "agentic.db")
-    init_db(conn)
+    conn_core = connect(root / "data" / "agentic.db")
+    init_db(conn_core)
+    conn_shell = connect(root / "data" / "agentic.db")
 
-    provider = PriceProvider(conn, settings, clock)
-    econ = EconCalendar(conn, activity, clock)
+    provider = PriceProvider(conn_core, settings, clock)
+    quote_fn = quote_fn or provider.get_quote
+    spec_fn = spec_fn or provider.spec
+    bars_fn = bars_fn or provider.latest_1m_bar
+
+    econ = EconCalendar(conn_core, activity, clock)
     rag = Rag(root / "data" / "rag")
-    collector = NewsCollector(conn, rag, activity, clock)
-    broker = PaperBroker(conn, settings, clock)
+    collector = NewsCollector(conn_core, rag, activity, clock)
+    broker = PaperBroker(conn_core, settings, clock)
     notifier = Notifier(enabled=settings.discord.enabled,
                         webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"))
-    executor = Executor(conn=conn, broker=broker, settings=settings,
-                        state_store=state, activity=activity, clock=clock,
-                        quote_fn=provider.get_quote, spec_fn=provider.spec)
+    executor = Executor(conn=conn_core, broker=broker, settings=settings,
+                        state_store=state, activity=activity,
+                        notifier=notifier, clock=clock,
+                        quote_fn=quote_fn, spec_fn=spec_fn)
 
     registry = ToolRegistry()
     registry.register_all(market_tools.build(provider, econ))
     registry.register_all(news_tools.build(rag))
-    registry.register_all(account_tools.build(conn, broker))
-    registry.register_all(reflection_tools.build(conn, rag))
+    registry.register_all(account_tools.build(conn_core, broker))
+    registry.register_all(reflection_tools.build(conn_core, rag))
 
     if runner is None:
         runner = LocalRunner(base_url=settings.llama_swap.base_url,
@@ -1450,45 +1529,46 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                              registry=registry)
 
     policy = Policy(root / "policy" / "directives.md")
-    trade_loop = TradeLoop(conn=conn, runner=runner, settings=settings,
+    trade_loop = TradeLoop(conn=conn_core, runner=runner, settings=settings,
                            executor=executor, provider=provider, econ=econ,
                            policy=policy, activity=activity,
                            notifier=notifier, clock=clock)
-    reflection = ReflectionCycle(conn=conn, runner=runner, rag=rag,
+    reflection = ReflectionCycle(conn=conn_core, runner=runner, rag=rag,
                                  settings=settings, activity=activity,
                                  clock=clock)
 
-    mission_lock = threading.Lock()
+    core_lock = threading.RLock()
 
     def on_trade_mission() -> None:
-        with mission_lock:
-            balance, equity = broker.equity()
-            from agentic_fx.core.accounting import record_snapshot
-            record_snapshot(conn, now=clock.now(), balance=balance,
-                            equity=equity)
+        # tick 全体が core_lock 下で走る (RLock のため再取得も安全)
+        with core_lock:
             trade_loop.run_once()
             reflection.run_pending()
 
-    scheduler = Scheduler(conn=conn, executor=executor, settings=settings,
-                          state_store=state, activity=activity,
-                          bars_fn=provider.latest_1m_bar,
+    scheduler = Scheduler(conn=conn_core, executor=executor,
+                          settings=settings, state_store=state,
+                          activity=activity, bars_fn=bars_fn,
                           on_trade_mission=on_trade_mission,
                           on_news_cycle=collector.collect)
 
-    commands = Commands(conn=conn, state_store=state, broker=broker,
-                        trade_loop=_LockedAsk(trade_loop, mission_lock),
+    # Commands は conn_shell 束縛の broker を持つ (conn_core をシェルスレッドから触らない)
+    shell_broker = PaperBroker(conn_shell, settings, clock)
+    commands = Commands(conn=conn_shell, state_store=state,
+                        broker=shell_broker,
+                        trade_loop=_LockedAsk(trade_loop, core_lock),
                         activity=activity, log_dir=root / "logs", clock=clock)
-    return App(conn=conn, settings=settings, state=state, activity=activity,
-               broker=broker, executor=executor, provider=provider, econ=econ,
+    return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
+               state=state, activity=activity, broker=broker,
+               executor=executor, provider=provider, econ=econ,
                collector=collector, rag=rag, trade_loop=trade_loop,
                reflection=reflection, scheduler=scheduler, commands=commands,
-               registry=registry, mission_lock=mission_lock)
+               registry=registry, core_lock=core_lock)
 
 
 class _LockedAsk:
-    """ask を Mission スロット (排他) 経由で実行する薄いラッパー。"""
+    """ask を Mission スロット (core_lock) 経由で実行する薄いラッパー。"""
 
-    def __init__(self, trade_loop: TradeLoop, lock: threading.Lock) -> None:
+    def __init__(self, trade_loop: TradeLoop, lock: threading.RLock) -> None:
         self._loop = trade_loop
         self._lock = lock
 
@@ -1499,9 +1579,9 @@ class _LockedAsk:
 
 def build_splash(app: App) -> str:
     s = app.state.load()
-    balance, equity = app.broker.equity()
-    pending = len(approvals.pending(app.conn))
-    limits = len(orders.list_by_status(app.conn, "pending_fill"))
+    balance, equity = app.commands.broker.equity()  # conn_shell 側
+    pending = len(approvals.pending(app.conn_shell))
+    limits = len(orders.list_by_status(app.conn_shell, "pending_fill"))
     # 項目構成は運用しながら調整 (設計書 §8) — 初期実装は最小
     return (
         "=== agentic-fx ===\n"
@@ -1538,8 +1618,11 @@ def run_service(root: Path, *, daemon: bool = False) -> int:
         while not stop_event.is_set():
             if time.monotonic() - last >= 60:
                 last = time.monotonic()
+                if stop_event.is_set():
+                    break  # 停止フェーズ: 新しい tick を開始しない
                 try:
-                    app.scheduler.tick(datetime.now(timezone.utc))
+                    with app.core_lock:
+                        app.scheduler.tick(datetime.now(timezone.utc))
                 except Exception:  # noqa: BLE001
                     logging.getLogger("agentic_fx").exception("tick failed")
             stop_event.wait(1)
@@ -1556,11 +1639,14 @@ def run_service(root: Path, *, daemon: bool = False) -> int:
         from agentic_fx.shell import run_shell
         run_shell(app.commands, stop_event)
 
-    # graceful shutdown: 実行中 Mission の完了待ち (最大 30 秒)
-    acquired = app.mission_lock.acquire(timeout=30)
-    if acquired:
-        app.mission_lock.release()
-    th.join(timeout=5)
+    # graceful shutdown: scheduler スレッドの終了を確認してから記録する
+    # (tick は core_lock 下で走るため、join 完了 = 実行中 Mission も完了)
+    th.join(timeout=30)
+    if th.is_alive():
+        app.activity.write(Category.SYSTEM, "service_stopped",
+                           "shutdown_timeout (Mission 継続中の可能性)")
+        print("警告: 停止タイムアウト。実行中の処理が残っている可能性があります。")
+        return 1
     app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
     print("停止しました。")
     return 0
@@ -1648,7 +1734,10 @@ OPEN_INTENT = {"action": "open", "pair": "USDJPY", "direction": "long",
                "reasoning": "e2e"}
 
 
-def test_phase1_full_cycle(tmp_path, monkeypatch):
+HOLD_INTENT = {"action": "hold", "reasoning": "様子見"}
+
+
+def test_phase1_full_cycle(tmp_path):
     (tmp_path / "config").mkdir()
     src = open("config/settings.yaml.example", encoding="utf-8").read()
     (tmp_path / "config" / "settings.yaml.example").write_text(src)
@@ -1656,59 +1745,64 @@ def test_phase1_full_cycle(tmp_path, monkeypatch):
         pp.return_value.healthcheck.return_value = "yfinance"
         run_init(tmp_path)
 
+    # 実行順に合わせた結果列 (#codex 指摘: reflection は 2 周目の trade の後):
+    # tick1: trade → OPEN / (closed なし、reflection Mission は走らない)
+    # tick4: trade → HOLD → reflection → content
     fake = FakeRunner([
-        MissionResult("completed", OPEN_INTENT, []),          # 定期判断
-        MissionResult("completed", {"content": "振り返り"}, []),  # reflection
+        MissionResult("completed", OPEN_INTENT, []),
+        MissionResult("completed", HOLD_INTENT, []),
+        MissionResult("completed", {"content": "振り返り"}, []),
     ])
-    app = build_app(tmp_path, runner=fake, clock=FixedClock(WED))
 
+    from agentic_fx.core.contracts import InstrumentSpec, Quote
     bars = {}
-    quote = None
-    with patch.object(app.provider, "healthcheck", return_value="test"), \
-         patch.object(app.provider, "get_quote") as gq, \
-         patch.object(app.provider, "spec") as sp, \
-         patch.object(app.provider, "latest_1m_bar",
-                      side_effect=lambda p: bars.get(p)):
-        from agentic_fx.core.contracts import InstrumentSpec, Quote
-        gq.return_value = Quote("USDJPY", 148.49, 148.51, WED, "test")
-        sp.return_value = InstrumentSpec("USDJPY", 0.01, 0.01, 50.0, 0.01,
-                                         100_000)
-        # 注: executor は build_app 時点の provider.get_quote を束縛済みのため
-        # patch.object が効くように app.executor 側も差し替える
-        app.executor.quote_fn = gq
-        app.executor.spec_fn = sp
+    quote_fn = lambda p: Quote(p, 148.49, 148.51, WED, "test")  # noqa: E731
+    spec_fn = lambda p: InstrumentSpec(p, 0.01, 0.01, 50.0, 0.01,  # noqa: E731
+                                       100_000)
+    # build_app の注入点を使う (build 後の patch は bound クロージャに届かない)
+    app = build_app(tmp_path, runner=fake, clock=FixedClock(WED),
+                    quote_fn=quote_fn, spec_fn=spec_fn,
+                    bars_fn=lambda p: bars.get(p))
 
+    with patch.object(app.provider, "healthcheck", return_value="test"):
         # tick 1: 毎時 Mission → 指値発注
         app.scheduler.tick(WED)
-        rows = app.conn.execute("SELECT * FROM orders").fetchall()
+        rows = app.conn_core.execute("SELECT * FROM orders").fetchall()
         assert len(rows) == 1 and rows[0]["status"] == "pending_fill"
 
         # tick 2: 約定バー → open
         bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
                              148.25, 100)
         app.scheduler.tick(WED + timedelta(minutes=1))
-        assert app.conn.execute(
+        assert app.conn_core.execute(
             "SELECT status FROM orders").fetchone()["status"] == "open"
 
-        # tick 3: TP バー → closed
-        bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.90, 149.10, 148.85,
-                             149.05, 100)
+        # tick 3: TP バー (新しい ts — 同一バー再処理防止) → closed
+        bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.90, 149.10, 148.85, 149.05, 100)
         app.scheduler.tick(WED + timedelta(minutes=2))
-        row = app.conn.execute("SELECT * FROM orders").fetchone()
+        row = app.conn_core.execute("SELECT * FROM orders").fetchone()
         assert row["status"] == "closed" and row["realized_pnl"] > 0
 
-        # tick 4 (1 時間後): 次の定期 Mission 前に reflection が生成される
+        # tick 4 (1 時間後): 2 周目 trade (hold) → reflection 生成
+        bars["USDJPY"] = Bar("USDJPY", "1m",
+                             WED + timedelta(hours=1),
+                             149.00, 149.05, 148.95, 149.00, 100)
         app.scheduler.tick(WED + timedelta(hours=1, minutes=1))
-        refl = app.conn.execute("SELECT * FROM reflections").fetchall()
+        refl = app.conn_core.execute("SELECT * FROM reflections").fetchall()
         assert len(refl) == 1
 
-    # 監査痕跡
-    missions = app.conn.execute("SELECT loop, status FROM missions").fetchall()
-    assert {m["loop"] for m in missions} >= {"trade", "reflection"}
+    # 監査痕跡: 全 Mission が意図した status で完了している (#codex 指摘)
+    missions = app.conn_core.execute(
+        "SELECT loop, status FROM missions ORDER BY id").fetchall()
+    assert [(m["loop"], m["status"]) for m in missions] == [
+        ("trade", "completed"), ("trade", "completed"),
+        ("reflection", "completed")]
     act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
     for ev in ("decision", "limit_placed", "limit_filled", "order_closed",
                "reflection_created"):
         assert ev in act
+    assert "intent_parse_failed" not in act  # 途中の Mission 失敗を見逃さない
 ```
 
 - [ ] **Step 2: テストを実行して green にする**
@@ -1738,7 +1832,7 @@ git commit -m "test: Phase 1 E2E (FakeRunner フル自走 — 完成条件)"
 ## Phase 2 プランへの引き継ぎ事項
 
 - `Commands` に Phase 2 コマンド (policy add / improve / news / model / mode / autopilot) を追加し、client.py は操作 API 経由で同じ dispatch を呼ぶ
-- 操作 API (FastAPI) は `App` を共有し、`_LockedAsk` と同じ mission_lock を使う (Mission 実行は常にサービスプロセス内)
+- 操作 API (FastAPI) は `App` を共有し、`_LockedAsk` と同じ core_lock を使う (Mission 実行は常にサービスプロセス内)。API 用にも専用 conn を開く (conn_core をイベントループから触らない)
 - ClaudeRunner は `AgentRunner` 実装として追加し、`settings.runner.<loop>.backend == "claude"` のとき build_app が選択する
 - 改善 loop は `improve` 用の registry サブセット (research_tools + 書き込み系) を別途組む — 取引判断 loop の読み取り専用 registry に書き込み系を混ぜない
 - ChromaDB の `Rag` は改善 loop でもそのまま使う。plugin_loader は `get_indicators` の合成点 (market_tools.build に承認済み plugin の結果を追加) として実装する
