@@ -18,3 +18,17 @@ def latest(conn: sqlite3.Connection) -> dict | None:
     row = conn.execute(
         "SELECT * FROM account_snapshots ORDER BY id DESC LIMIT 1").fetchone()
     return dict(row) if row else None
+
+
+def first_since(conn: sqlite3.Connection, ts: datetime) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM account_snapshots WHERE ts >= ? ORDER BY ts LIMIT 1",
+        (ts.isoformat(),)).fetchone()
+    return dict(row) if row else None
+
+
+def last_before(conn: sqlite3.Connection, ts: datetime) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM account_snapshots WHERE ts < ? ORDER BY ts DESC LIMIT 1",
+        (ts.isoformat(),)).fetchone()
+    return dict(row) if row else None
