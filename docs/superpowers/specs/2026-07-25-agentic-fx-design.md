@@ -133,11 +133,19 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 
 ### データ取得元
 
-| データ | 取得元 |
-|---|---|
-| 取引対象ペアの OHLCV・現在価格 | **MT5 ブリッジ** (リアルタイム)。価格取得は読み取り専用で資金リスクがないため **Phase 1 から接続**する (発注系の接続は Phase 3 のまま)。ブリッジ死活は bridge_health で監視 |
-| 関連指標 (株価指数・金・原油など) | **MT5 に銘柄 (CFD) があるものは MT5 を優先** — リアルタイムで追加依存なし (OANDA MT5 は主要指数・XAUUSD・WTI 等を提供)。**MT5 にないもの** (DXY・米10年債利回り等) は Twelve Data (無料枠、前身でキー取得済み・リアルタイムに近い) を第一候補、**yfinance はタイムラグがあるため最終フォールバック**とする |
-| 経済指標カレンダー | 前身 econ_event_store の移植 |
+新規ユーザーが clone + init 直後に、口座・API キーなしで動かせることを優先し、**デフォルトはすべて yfinance** (キー不要) とする。MT5 / Twelve Data は**追加設定** (settings.yaml) で有効化する:
+
+| 構成 | 取引ペアの OHLCV・現在価格 | 関連指標 (指数・金・原油・金利など) |
+|---|---|---|
+| デフォルト (追加設定なし) | yfinance | yfinance |
+| + MT5 ブリッジ設定 | MT5 (リアルタイム) | MT5 に銘柄 (CFD) があるものは MT5 (OANDA MT5 は主要指数・XAUUSD・WTI 等を提供) |
+| + Twelve Data キー設定 | — | MT5 にないもの (DXY・米10年債利回り等) を TD で補完 |
+
+- 優先順位は **MT5 → Twelve Data → yfinance**。設定済みソースの取得失敗時は下位へフォールバックし、**yfinance が最終フォールバック** (キー不要ゆえ常に使える)
+- yfinance はタイムラグ (数分〜15 分程度) と非公式 API ゆえの仕様変更リスクがある。学習モードの判断・ペーパー約定判定には許容範囲とし、**PriceProvider 抽象でシンボル毎にソース解決**して差し替え可能にしておく。キー不要の代替は実質 Stooq のみ (日足中心で intraday が弱く、常用には不適 — 障害時の臨時フォールバック候補に留める)
+- MT5 の価格取得 (読み取り専用) は資金リスクがないため、設定すれば **Phase 1 から利用できる** (発注系の接続は Phase 3)。ブリッジ死活は bridge_health で監視
+- **取引モード (Phase 3) は MT5 接続が前提** (発注経路が MT5 のため、価格も自動的に MT5 優先になる)
+- 経済指標カレンダー: 前身 econ_event_store の移植
 
 ### 出力: TradeIntent v2
 
@@ -339,7 +347,7 @@ uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サー�
 
 ### 初期起動フロー (ウィザードは init だけ)
 
-1. **`uv run main.py init`** — 設定ウィザード (settings.yaml 生成、DB 初期化、稼働モードを学習で初期化、llama-swap / Discord / MT5 ブリッジ・価格ソースの接続確認)。完了までサービス起動を拒否。systemd unit 化はユーザーが明示的に行う (ドキュメントのみ提供)
+1. **`uv run main.py init`** — 設定ウィザード (settings.yaml 生成、DB 初期化、稼働モードを学習で初期化、llama-swap / Discord / 価格ソースの接続確認)。価格ソースはデフォルト yfinance で、MT5 ブリッジ / Twelve Data は任意の追加設定 (未設定ならスキップ、§5)。完了までサービス起動を拒否。systemd unit 化はユーザーが明示的に行う (ドキュメントのみ提供)
 2. **`uv run main.py`** — サービス開始。組み込みデフォルト実装 (基本指標 + 基本ニュースソース) でそのまま稼働できる
 
 初期構築 (ニュースソース拡充・指標追加) は専用ウィザードを持たず、**通常チャネルで行う**: `news add` で取得対象を足す、`improve add "..."` でアイデアを投入して `improve` を手動起動する (runner は config / `model` コマンドで claude / local を選択、ClaudeRunner はサブスク認証で利用可能)。成果は通常の承認フローに乗る。
@@ -539,7 +547,7 @@ activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 �
 
 ## 15. 段階導入
 
-- **Phase 1**: 決定論的コア + LocalRunner + 取引判断 loop (学習モード = ペーパー、ハイブリッド発注、horizon) + MT5 ブリッジの**価格取得のみ**接続 + main.py (スプラッシュ + 対話シェル + init 起動ガード + stop) + ログ 2 軸。ツールは get_ohlcv / get_indicators / search_news / get_positions の最小セット (組み込み実装 + news_sources 初期データのみ)
+- **Phase 1**: 決定論的コア + LocalRunner + 取引判断 loop (学習モード = ペーパー、ハイブリッド発注、horizon) + 価格取得 (デフォルト yfinance、設定時は MT5 / TD を優先) + main.py (スプラッシュ + 対話シェル + init 起動ガード + stop) + ログ 2 軸。ツールは get_ohlcv / get_indicators / search_news / get_positions の最小セット (組み込み実装 + news_sources 初期データのみ)
 - **Phase 2**: ClaudeRunner (Agent SDK) + 戦略改善 loop (バックログ + Web リサーチ) + tech plugin 機構 + news_sources 承認フロー + 操作 API + client.py + `news add` / `model` コマンド + Discord 承認 (discord_bot 側 cog 含む) + policy チャネル
 - **Phase 3**: MT5 の発注系接続 + 資金保護系の本格接続 + 取引モード切替 (`mode trading`、人間の明示操作のみ) + 手動承認ゲート (live_trade) + `autopilot` (自動発注への段階移行)
 
