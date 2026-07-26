@@ -1,6 +1,4 @@
-def main():
-    print("Hello from agentic-fx!")
-
+from agentic_fx.entry import main
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
