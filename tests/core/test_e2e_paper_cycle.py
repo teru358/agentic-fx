@@ -3,6 +3,8 @@ paper 約定 → 遷移 → close が LLM なしで一巡する。"""
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
 from agentic_fx.core.accounting import record_snapshot
@@ -56,6 +58,7 @@ def test_full_paper_cycle(tmp_path):
     out = executor.handle_intent(intent, mid)
     assert out["result"] == "pending"
     oid = out["order_id"]
+    assert orders.get(conn, oid)["status"] == "pending_fill"
 
     # 2. 指値到達 → open
     bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.32, 148.18,
@@ -72,9 +75,18 @@ def test_full_paper_cycle(tmp_path):
     assert row["close_reason"] == "tp"
     assert row["realized_pnl"] > 0
 
-    # 4. 監査痕跡: intent 記録・activity・snapshot 更新
+    # 4. 監査痕跡: intent 記録 (accepted)・activity・snapshot 更新
+    intent_row = conn.execute("SELECT * FROM trade_intents").fetchone()
     assert conn.execute("SELECT COUNT(*) c FROM trade_intents").fetchone()["c"] == 1
+    assert intent_row["gate_result"] == "accepted"
     log = (tmp_path / "activity.log").read_text(encoding="utf-8")
     assert "limit_placed" in log and "limit_filled" in log \
         and "order_closed" in log
+    # close 直後 (この tick の mark-to-market は close 前 = unrealized 込み)
     assert snapshots.latest(conn)["equity"] > 1_000_000
+
+    # 5. 次 tick の mark-to-market で realized_pnl が balance に反映されている
+    # ことを確認 (open ポジションが無いので stale-bar 分岐は関与しない)
+    sched.tick(WED + timedelta(minutes=3))
+    snap = snapshots.latest(conn)
+    assert snap["balance"] == pytest.approx(1_000_000 + row["realized_pnl"])
