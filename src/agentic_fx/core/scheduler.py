@@ -194,31 +194,41 @@ class Scheduler:
             self._retry_close(row, now)
 
     def _retry_close(self, row: dict, now: datetime) -> None:
-        """CLOSING の再試行。quote 障害は次 tick 再試行として握りつぶすが、
-        broker.close が成功した後の DB 確定処理 (pnl 計算・遷移) の失敗は
-        握りつぶさない (broker 側は既にクローズ済みかもしれず、不整合を
-        静かに握りつぶすのは資金保護上危険なため — レビュー修正 2)。"""
+        """CLOSING の再試行。
+
+        修正ラウンド 3 (Important 相当の設計不整合の修正): 例外の発生源で
+        扱いを変える必要がある。
+        - ``quote_fn`` の例外は **broker に触れる前** に起きる → 未実行が
+          確定しているので、状態を変えず次 tick 再試行してよい
+          (quote 障害と同じ扱い)。
+        - ``broker.close()`` の例外 (タイムアウト・接続断など) は
+          **broker 側では成功しているかもしれない** → 「まだ close
+          していない」とみなして黙って再試行するのは、Phase 3 の MT5 で
+          reconcile せず盲目的に再 close する二重クローズのリスクになる。
+          既存の `br2.status != "ok"` 分岐と同じ `S.CLOSE_UNKNOWN` に
+          遷移させ、次 tick の reconcile 経路 (`_resolve_unknowns`) に
+          乗せなければならない。
+        """
         try:
             q = self.executor.quote_fn(row["pair"])
-        except Exception as e:  # noqa: BLE001 — quote 障害のみ次 tick 再試行
+        except Exception as e:  # noqa: BLE001 — broker 未接触。次 tick 再試行
             self.activity.write(Category.TRADE, "close_retry_deferred",
                                 f"{row['pair']}: {e}", ref_id=str(row["id"]))
             _log.warning("close retry deferred (quote) #%s: %s", row["id"], e)
             return
         price = q.bid if row["direction"] == "long" else q.ask
         fresh = orders.get(self.conn, row["id"])
-        # 修正ラウンド 2: 直接呼ぶ broker.close も例外で tick 全体を落とさない
-        # よう保護する。ここでの例外は「まだ close 未実行」とみなせるため
-        # quote 障害と同様に次 tick 再試行として扱ってよい (DB 確定処理
-        # 到達前の失敗であり、broker 側が成功済みかもしれない状態とは違う)。
         try:
             br2 = self.executor.broker.close(fresh, price, "retry")
-        except Exception as e:  # noqa: BLE001
-            self.activity.write(Category.TRADE, "close_retry_deferred",
-                                f"{row['pair']}: broker error {e}",
-                                ref_id=str(row["id"]))
-            _log.warning("close retry deferred (broker) #%s: %s",
-                        row["id"], e)
+        except Exception as e:  # noqa: BLE001 — broker 側は成功済みかもしれない
+            transitions.transition(self.conn, row["id"], S.CLOSE_UNKNOWN, now)
+            self.activity.write(Category.TRADE, "close_unknown",
+                                f"{row['pair']} — reconcile 待ち "
+                                f"(broker error: {e})", ref_id=str(row["id"]))
+            self.executor.notifier.send(
+                f"[agentic-fx] クローズ結果不明 #{row['id']}")
+            _log.warning("close retry -> close_unknown (broker error) "
+                        "#%s: %s", row["id"], e)
             return
         if br2.status == "ok":
             # broker 側は成功済み — 以降の DB 確定処理の失敗は握りつぶさない

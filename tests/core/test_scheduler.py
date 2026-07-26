@@ -521,7 +521,8 @@ def test_reconcile_exception_skips_order_but_tick_continues(tmp_path):
 
 def test_close_retry_broker_exception_skips_order_but_tick_continues(tmp_path):
     """_retry_close 内の直接 broker.close 呼び出しが例外を投げても、その
-    注文だけスキップして他の注文の処理・tick 全体は継続すること。"""
+    注文だけスキップ (close_unknown へ, 下の修正ラウンド 3 参照) して他の
+    注文の処理・tick 全体は継続すること。"""
     from agentic_fx.core.contracts import BrokerResult
 
     env = Env(tmp_path)
@@ -543,5 +544,60 @@ def test_close_retry_broker_exception_skips_order_but_tick_continues(tmp_path):
 
     env.executor.broker.close = flaky_close
     env.sched.tick(WED)
-    assert orders.get(env.conn, oid1)["status"] == "closing"
+    # 修正ラウンド 3: broker.close の例外は CLOSING のまま次 tick 再試行
+    # するのではなく、CLOSE_UNKNOWN に遷移させ reconcile 経路に乗せる
+    # (broker 側は既に成功しているかもしれないため、盲目的な再試行=二重
+    # クローズのリスクを避ける)。
+    assert orders.get(env.conn, oid1)["status"] == "close_unknown"
     assert orders.get(env.conn, oid2)["status"] == "closed"
+
+
+# --- 修正ラウンド 3: _retry_close の例外は発生源で扱いを変える ---
+
+def test_close_retry_broker_exception_marks_close_unknown_not_closing(tmp_path):
+    """broker.close() の例外は「broker 側では成功しているかもしれない」
+    ため、CLOSING のまま黙って次 tick 再試行してはいけない (Phase 3 の
+    MT5 で reconcile せず盲目的に再 close する二重クローズのリスクになる)。
+    CLOSE_UNKNOWN に遷移させ、次 tick の reconcile 経路に乗せること。"""
+    def bad_broker_close(row, price, reason):
+        raise RuntimeError("broker close timeout")
+
+    env = Env(tmp_path)
+    oid = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="closing", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8,
+                        avg_fill_price=148.2)
+    env.executor.broker.close = bad_broker_close
+    env.sched.tick(WED)
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "close_unknown"
+    assert "close_unknown" in (env.tmp_path / "a.log").read_text(
+        encoding="utf-8")
+
+
+def test_close_retry_quote_exception_stays_closing_for_next_tick_retry(tmp_path):
+    """quote_fn の例外は broker に触れる前に起きる → 未実行が確定して
+    おり、CLOSING のまま次 tick で再試行してよい (broker.close の例外とは
+    区別されること — close_unknown にはならない)。"""
+    calls = {"n": 0}
+
+    def flaky_quote(pair):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("quote down")
+        return QUOTE
+
+    env = Env(tmp_path, quote_fn=flaky_quote)
+    oid = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="closing", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8,
+                        avg_fill_price=148.2)
+    env.sched.tick(WED)  # quote 障害 — closing のまま (close_unknown にしない)
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "closing"
+
+    env.sched.tick(WED + timedelta(minutes=1))  # quote 復旧 → 再試行で解決
+    row2 = orders.get(env.conn, oid)
+    assert row2["status"] == "closed"
