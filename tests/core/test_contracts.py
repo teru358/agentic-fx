@@ -58,6 +58,36 @@ def test_close_requires_order_id():
         TradeIntent.from_llm_dict({"action": "close"}, origin=Origin.SCHEDULER)
 
 
+def test_close_rejects_bool_true_order_id():
+    with pytest.raises(IntentParseError, match="order_id"):
+        TradeIntent.from_llm_dict({"action": "close", "order_id": True},
+                                  origin=Origin.SCHEDULER)
+
+
+def test_close_rejects_bool_false_order_id():
+    with pytest.raises(IntentParseError, match="order_id"):
+        TradeIntent.from_llm_dict({"action": "close", "order_id": False},
+                                  origin=Origin.SCHEDULER)
+
+
+def test_cancel_rejects_zero_order_id():
+    with pytest.raises(IntentParseError, match="order_id"):
+        TradeIntent.from_llm_dict({"action": "cancel", "order_id": 0},
+                                  origin=Origin.SCHEDULER)
+
+
+def test_cancel_rejects_negative_order_id():
+    with pytest.raises(IntentParseError, match="order_id"):
+        TradeIntent.from_llm_dict({"action": "cancel", "order_id": -1},
+                                  origin=Origin.SCHEDULER)
+
+
+def test_close_accepts_positive_order_id():
+    it = TradeIntent.from_llm_dict({"action": "close", "order_id": 42},
+                                   origin=Origin.SCHEDULER)
+    assert it.order_id == 42
+
+
 def test_hold_minimal():
     it = TradeIntent.from_llm_dict({"action": "hold", "reasoning": "様子見"},
                                    origin=Origin.SCHEDULER)

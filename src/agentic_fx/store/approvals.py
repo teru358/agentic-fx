@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime
+from typing import Literal
 
 
 class AlreadyDecidedError(Exception):
@@ -21,14 +22,31 @@ def create(conn: sqlite3.Connection, kind: str, payload: dict, now: datetime,
     return cur.lastrowid
 
 
-def decide(conn: sqlite3.Connection, approval_id: int, *, status: str,
+def decide(conn: sqlite3.Connection, approval_id: int, *,
+           status: Literal["approved", "rejected"],
            decided_by: str, now: datetime, reason: str | None = None) -> None:
+    if status not in ("approved", "rejected"):
+        raise ValueError(
+            f"status must be 'approved' or 'rejected', got {status!r}")
+    now_iso = now.isoformat()
     cur = conn.execute(
         "UPDATE approval_requests SET status=?, decided_by=?, decided_at=?, reason=? "
-        "WHERE id=? AND status='pending'",
-        (status, decided_by, now.isoformat(), reason, approval_id))
+        "WHERE id=? AND status='pending' AND (expires_at IS NULL OR expires_at >= ?)",
+        (status, decided_by, now_iso, reason, approval_id, now_iso))
     conn.commit()
     if cur.rowcount == 0:
+        row = conn.execute(
+            "SELECT status, expires_at FROM approval_requests WHERE id=?",
+            (approval_id,)).fetchone()
+        if row is not None and row["status"] == "pending":
+            # pending だが期限切れ (expires_at <= now) だったため更新対象外だった。
+            # この場で expired に確定させる (fail closed: 期限切れの承認は成立させない)。
+            conn.execute(
+                "UPDATE approval_requests SET status='expired' WHERE id=?",
+                (approval_id,))
+            conn.commit()
+            raise AlreadyDecidedError(
+                f"approval {approval_id} has expired and cannot be decided")
         raise AlreadyDecidedError(f"approval {approval_id} is not pending")
 
 

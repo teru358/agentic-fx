@@ -178,8 +178,10 @@ class TradeIntent:
 
         if action in (Action.CLOSE, Action.CANCEL):
             order_id = d.get("order_id")
-            if not isinstance(order_id, int):
-                raise IntentParseError(f"{action.value} requires integer order_id")
+            if type(order_id) is not int or order_id <= 0:
+                raise IntentParseError(
+                    f"{action.value} requires a positive integer order_id, "
+                    f"got {order_id!r}")
             return cls(action=action, origin=origin, order_id=order_id,
                        reasoning=reasoning)
 

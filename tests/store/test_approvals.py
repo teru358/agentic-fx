@@ -46,3 +46,46 @@ def test_pending_filter_by_kind(tmp_path):
     approvals.create(c, "tech_plugin", {}, NOW)
     approvals.create(c, "news_source", {}, NOW)
     assert len(approvals.pending(c, kind="tech_plugin")) == 1
+
+
+def test_decide_rejects_expired_approval_and_marks_expired(tmp_path):
+    c = _conn(tmp_path)
+    aid = approvals.create(c, "live_trade", {"pair": "USDJPY"}, NOW,
+                           expires_at=NOW + timedelta(minutes=15))
+    later = NOW + timedelta(minutes=16)
+    with pytest.raises(AlreadyDecidedError):
+        approvals.decide(c, aid, status="approved", decided_by="shell", now=later)
+    row = c.execute("SELECT status FROM approval_requests WHERE id=?", (aid,)).fetchone()
+    assert row["status"] == "expired"
+
+
+def test_decide_boundary_expires_at_equal_now_is_still_valid(tmp_path):
+    c = _conn(tmp_path)
+    aid = approvals.create(c, "live_trade", {"pair": "USDJPY"}, NOW,
+                           expires_at=NOW + timedelta(minutes=15))
+    boundary = NOW + timedelta(minutes=15)
+    approvals.decide(c, aid, status="approved", decided_by="shell", now=boundary)
+    row = c.execute("SELECT status FROM approval_requests WHERE id=?", (aid,)).fetchone()
+    assert row["status"] == "approved"
+
+
+def test_decide_rejects_pending_status_value(tmp_path):
+    c = _conn(tmp_path)
+    aid = approvals.create(c, "tech_plugin", {"path": "x"}, NOW)
+    with pytest.raises(ValueError):
+        approvals.decide(c, aid, status="pending", decided_by="shell", now=NOW)
+    row = c.execute(
+        "SELECT status, decided_by, decided_at FROM approval_requests WHERE id=?",
+        (aid,)).fetchone()
+    assert row["status"] == "pending"
+    assert row["decided_by"] is None
+    assert row["decided_at"] is None
+
+
+def test_decide_rejects_unknown_status_value(tmp_path):
+    c = _conn(tmp_path)
+    aid = approvals.create(c, "tech_plugin", {"path": "x"}, NOW)
+    with pytest.raises(ValueError):
+        approvals.decide(c, aid, status="invalidated", decided_by="shell", now=NOW)
+    row = c.execute("SELECT status FROM approval_requests WHERE id=?", (aid,)).fetchone()
+    assert row["status"] == "pending"

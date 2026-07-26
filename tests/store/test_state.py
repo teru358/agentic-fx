@@ -1,7 +1,9 @@
 import json
 
+import pytest
+
 from agentic_fx.core.contracts import Mode
-from agentic_fx.store.state import AppState, StateStore
+from agentic_fx.store.state import AppState, StateError, StateStore
 
 
 def test_defaults_when_missing(tmp_path):
@@ -34,3 +36,52 @@ def test_unknown_field_rejected(tmp_path):
         assert False, "should raise"
     except TypeError:
         pass
+
+
+def test_load_rejects_string_false_autopilot(tmp_path):
+    path = tmp_path / "app_state.json"
+    path.write_text(json.dumps({
+        "initialized": True, "mode": "learning",
+        "autopilot": "false", "kill_switch_latched": False,
+    }))
+    with pytest.raises(StateError):
+        StateStore(path).load()
+
+
+def test_load_rejects_string_false_initialized(tmp_path):
+    path = tmp_path / "app_state.json"
+    path.write_text(json.dumps({
+        "initialized": "false", "mode": "learning",
+        "autopilot": False, "kill_switch_latched": False,
+    }))
+    with pytest.raises(StateError):
+        StateStore(path).load()
+
+
+def test_load_rejects_bogus_mode(tmp_path):
+    path = tmp_path / "app_state.json"
+    path.write_text(json.dumps({
+        "initialized": True, "mode": "bogus",
+        "autopilot": False, "kill_switch_latched": False,
+    }))
+    with pytest.raises(StateError):
+        StateStore(path).load()
+
+
+def test_load_rejects_missing_key(tmp_path):
+    path = tmp_path / "app_state.json"
+    path.write_text(json.dumps({
+        "initialized": True, "mode": "learning", "autopilot": False,
+    }))
+    with pytest.raises(StateError):
+        StateStore(path).load()
+
+
+def test_load_rejects_int_for_bool_field(tmp_path):
+    path = tmp_path / "app_state.json"
+    path.write_text(json.dumps({
+        "initialized": 1, "mode": "learning",
+        "autopilot": False, "kill_switch_latched": False,
+    }))
+    with pytest.raises(StateError):
+        StateStore(path).load()
