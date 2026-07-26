@@ -168,7 +168,7 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 
 - **発注方式はハイブリッド**: `market` は即時発注、`limit` は有効期限付き指値。IFD 的な条件監視ループは作らない
 - `limit_price` / `expires_in` は `entry_type: limit` のみ。`expires_in` の上限は 24h。期限切れは scheduler が決定論的に自動取消
-- **トレード時間軸 (`horizon`) は agent が判断する** (open 時必須)。`day` = 当日決済想定 / `swing` = 数日保有想定。orders に保存し、状態サマリ・成績集計・reflection で horizon 別に扱う。決定論的な扱いの差: `day` は当日市場クローズ前に強制クローズ (決定論的)、`swing` は持ち越し可 (週末ギャップリスクは SL とkill switch で防御)。SL 幅・TP の妥当性判断は horizon を踏まえて agent が行う
+- **トレード時間軸 (`horizon`) は agent が判断する** (open 時必須)。`day` = 当日決済想定 / `swing` = 数日保有想定。orders に保存し、状態サマリ・成績集計・reflection で horizon 別に扱う。決定論的な扱いの差: `day` は日次ロールオーバー (NY 17:00 クローズ) 前に scheduler が強制クローズ (FX は 24 時間市場のため「当日」の境界をロールオーバーで定義する)、`swing` は持ち越し可 (週末ギャップリスクは SL と kill switch で防御)。SL 幅・TP の妥当性判断は horizon を踏まえて agent が行う
 - `stop_loss` は open 時必須。SL/TP は発注時にブローカー (ペーパー / MT5) 側に添付して管理する
 - `close` / `cancel` は対象を `order_id` で指定する (状態サマリに ID を含めて提示する)
 - `cancel` は未約定指値の取消 (資金リスクゼロのため LLM に許可)。**約定済みポジションの SL/TP 変更は LLM 不可** (決定論的な資金保護のみが変更できる)
@@ -261,7 +261,7 @@ news_sources: id, name, fetcher (feed | web), url,
 - main への直 push は不可 (branch protection + ツール実装で二重に防ぐ)
 - **採用は必ず人間承認** (コア改善 = PR、plugin = approval_requests)
 
-## 7. 承認ゲートと最小 REST API
+## 7. 承認ゲートと操作 REST API
 
 ### approval_requests (SQLite)
 
@@ -293,6 +293,7 @@ reason, decided_by, decided_at, message_id, expires_at, created_at
 | `POST /ask` | 臨時 Mission の実行依頼 (実行は常にサービスプロセス内) | client.py |
 | `POST /policy` | 方針書への追記 | client.py |
 | `POST /backlog` | 改善アイデアの投入 | client.py |
+| `POST /improve` | 改善 loop の即時手動起動 (実行は常にサービスプロセス内) | client.py |
 | `POST /news` | news ソース追加 (fetcher 自動判定 + 機械検証、§6) | client.py |
 | `GET /models` | 利用可能モデル一覧 (llama-swap `/v1/models` + claude、番号付き) | client.py |
 | `POST /model` | LLM runner / ローカルモデルの切替 (client 側で番号→モデル名を解決して送る。資金と無関係のため API 可) | client.py |
@@ -332,6 +333,7 @@ uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サー�
 | `ask "..."` | 臨時 Mission (実行は常にサービスプロセス内の排他スロット) |
 | `approve <id>` / `reject <id> [理由]` | 承認操作 |
 | `policy add "..."` | 方針書へ追記 |
+| `improve` | 改善 loop の即時手動起動 (実行は常にサービスプロセス内の排他スロット) |
 | `improve add "..."` / `backlog` | 改善アイデア投入 / バックログ一覧 |
 | `news add <url> [--name]` / `news list` | ニュース取得対象の追加 (機械検証つき、§6) / 一覧 |
 | `model` | 利用可能モデルの一覧表示 (llama-swap `/v1/models` から動的取得 + claude)。**各モデルに番号を割り振り**、両 loop の現在選択に印を付けて表示 |
@@ -457,7 +459,7 @@ agentic-fx/
 │   │   ├── account_tools.py   # get_positions / get_account
 │   │   ├── reflection_tools.py# get_recent_reflections / search_reflections
 │   │   └── research_tools.py  # web_search / fetch_article (改善 loop 専用)
-│   ├── api/                   # ── 最小 FastAPI (§7: 承認 + 読み取り status のみ) ──
+│   ├── api/                   # ── 操作 API (FastAPI, §7。発注・資金設定・mode/autopilot は載せない) ──
 │   └── loops/                 # ── 2 つの agent loop ──
 │       ├── trade_loop.py      # 状態サマリ生成 → Mission 実行 → intent 処理
 │       ├── improve_loop.py    # 成績レポート生成 → 3 ステップ Mission → 品質ゲート
