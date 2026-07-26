@@ -96,6 +96,11 @@ class DiscordSettings(_Strict):
     enabled: bool = False
 
 
+class PaperSettings(_Strict):
+    starting_balance: float = Field(gt=0)
+    currency: str = "JPY"
+
+
 class Settings(_Strict):
     pairs: list[str] = Field(min_length=1)
     risk: RiskSettings
@@ -107,6 +112,7 @@ class Settings(_Strict):
     logging: LoggingSettings
     api: ApiSettings
     discord: DiscordSettings
+    paper: PaperSettings
 
     @model_validator(mode="after")
     def _pair_rules_cover_pairs(self) -> "Settings":

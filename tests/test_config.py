@@ -89,3 +89,9 @@ def test_unknown_top_level_key_rejected(tmp_path):
     p.write_text("pairs: [USDJPY]\ntypo_key: 1\n")
     with pytest.raises(ConfigError, match="typo_key"):
         load_settings(p)
+
+
+def test_paper_settings():
+    s = load_settings(EXAMPLE)
+    assert s.paper.starting_balance == 1_000_000
+    assert s.paper.currency == "JPY"

@@ -51,3 +51,7 @@ api:
 
 discord:
   enabled: false              # webhook 通知 (URL は .env の DISCORD_WEBHOOK_URL)
+
+paper:
+  starting_balance: 1000000   # 学習モードの初期残高 (口座通貨建て)
+  currency: JPY
