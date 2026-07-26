@@ -813,6 +813,7 @@ git commit -m "feat: 設定ロード + 検証 (kill switch 無効化キーなし
 
 **Interfaces:**
 - Produces: `setup_technical_logging(log_dir: Path, level: str = "INFO") -> logging.Logger` — `agentic_fx` 名前空間の logger を `logs/agentic.log` (RotatingFileHandler 10MB × 5 世代) に接続。**stdout ハンドラは付けない** (設計書 §13: CLI 通常出力に混ぜない)。多重呼び出しでハンドラを増やさない
+- **journald 経路の契約 (実装はプラン 5)**: 設計書 §13 の「+ journald」は、`--daemon` 起動時のみ stderr への StreamHandler を追加し、systemd が journald へ取り込む構成で実現する。TTY (対話シェル) モードはファイルのみ — プラン 5 で `setup_technical_logging(log_dir, level, daemon=False)` の `daemon` パラメータとして拡張する
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -2137,7 +2138,7 @@ git commit -m "feat: 状態ストア (mode/autopilot、atomic write、config 非
 
 **Interfaces:**
 - Produces:
-  - `service.run_init(root: Path) -> int` — ①`config/settings.yaml` が無ければ example をコピー (**既存ファイルは決して上書きしない** — 冪等) ②`data/` `logs/` 作成 ③DB 初期化 (11 テーブル) ④state を **`initialized=True, mode=learning, autopilot=False` で明示保存** (再実行時も学習モードへ戻す — 安全方向のリセット。trading への切替は `mode` コマンドのみ) ⑤activity SYSTEM に `init_completed` を記録。戻り値は exit code (0 成功)
+  - `service.run_init(root: Path) -> int` — ①`config/settings.yaml` が無ければ example をコピー (**既存ファイルは決して上書きしない** — 冪等) ②`data/` `logs/` 作成 ③DB 初期化 (11 テーブル) ④state: **現在 mode が learning (または state 未作成) の場合のみ `initialized=True, mode=learning, autopilot=False` を明示保存。現在 mode=trading の場合は mode/autopilot を変更せず `initialized=True` のみ更新し警告を表示** — learning への切替はモード遷移ガード (§3、Phase 3 実装) を通る `mode` コマンドだけの仕事であり、init をガード迂回路にしない ⑤activity SYSTEM に `init_completed` を実際の mode で記録。戻り値は exit code (0 成功)
   - `service.ensure_initialized(root: Path) -> None` — 未 init なら **`SystemExit(2)`** with メッセージ「`uv run main.py init` を先に実行」
   - `service.run_service(root: Path) -> int` — 本プランでは**起動ガード通過後に「サービス本体はプラン 5 で実装」と表示して exit 0** するスタブ (ガード自体は本物)
   - `entry.main(argv: list[str] | None = None) -> int` — `init` / 引数なし (= run_service)。`[project.scripts] afx` と `main.py` の両方から呼ばれる。init は非対話・冪等 (プロンプトなし。対話的な接続確認はプラン 3/5 で追加)
@@ -2195,16 +2196,18 @@ def test_init_is_idempotent(tmp_path):
     assert "# user edit" in marker.read_text()  # 既存 settings.yaml を上書きしない
 
 
-def test_reinit_resets_mode_to_learning(tmp_path):
+def test_reinit_in_trading_keeps_mode(tmp_path):
+    # init をモード遷移ガード (§3) の迂回路にしない: trading 中は mode/autopilot 不変
     from agentic_fx.core.contracts import Mode
     _example(tmp_path)
     run_init(tmp_path)
     store = StateStore(tmp_path / "data" / "state" / "app_state.json")
     store.update(mode=Mode.TRADING, autopilot=True)
-    run_init(tmp_path)  # 再 init は安全方向へリセット
+    run_init(tmp_path)
     s = store.load()
-    assert s.mode is Mode.LEARNING
-    assert s.autopilot is False
+    assert s.mode is Mode.TRADING
+    assert s.autopilot is True
+    assert s.initialized is True
 
 
 def test_entry_init_subcommand(tmp_path, monkeypatch):
@@ -2276,13 +2279,21 @@ def run_init(root: Path) -> int:
     conn = connect(root / "data" / "agentic.db")
     init_db(conn)
 
-    # 再実行時も安全方向へ明示リセット (trading 復帰は mode コマンドのみ)
-    _state_store(root).update(initialized=True, mode=Mode.LEARNING,
-                              autopilot=False)
+    # learning への切替はモード遷移ガード (§3) を通る mode コマンドのみ。
+    # init はガードの迂回路にしない: trading 中は mode/autopilot に触れない。
+    store = _state_store(root)
+    if store.load().mode is Mode.TRADING:
+        state = store.update(initialized=True)
+        print("警告: 現在 trading モードです。init は mode/autopilot を変更しません "
+              "(切替は mode コマンドを使用)。")
+    else:
+        state = store.update(initialized=True, mode=Mode.LEARNING,
+                             autopilot=False)
 
     ActivityLog(root / "logs" / "activity.log").write(
         Category.SYSTEM, "init_completed",
-        f"pairs={settings.pairs} mode=learning autopilot=off")
+        f"pairs={settings.pairs} mode={state.mode.value} "
+        f"autopilot={'on' if state.autopilot else 'off'}")
     print("初期化が完了しました。`uv run main.py` でサービスを起動できます。")
     return 0
 
@@ -2385,3 +2396,4 @@ git commit -m "chore: プラン 1 完了 — 基盤 + 共有契約"
 - `TradeIntent` / `Quote` / `InstrumentSpec` / `AccountState` / `Clock` は contracts.py のものを使う。risk gate / sizing はこれらを入力に取る純関数として実装する
 - `snapshots.add` に渡す `hwm` の計算 (入出金調整済み HWM) はプラン 2 の責務
 - `orders.update_fields` の呼び出し元はプラン 2 の executor / 状態機械のみとする
+- プラン 5: `setup_technical_logging` に `daemon: bool = False` を追加し、--daemon 時のみ stderr StreamHandler (journald 経路)。モード遷移ガード (§3) は Phase 3 プランで `mode` コマンドとして実装 (init は今後もガードを迂回しない)
