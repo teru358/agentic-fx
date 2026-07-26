@@ -31,6 +31,18 @@ def test_snapshots_latest(tmp_path):
     assert snapshots.latest(c)["equity"] == 10100
 
 
+def test_snapshots_add_normalizes_ts_to_utc(tmp_path):
+    # add() は account_snapshots への書き込み経路であり、非 UTC の ts が
+    # そのまま保存されると first_since/last_before/latest の辞書式比較が壊れる。
+    c = _conn(tmp_path)
+    jst = timezone(timedelta(hours=9))
+    ts_jst = NOW.astimezone(jst)
+    snapshots.add(c, ts=ts_jst, balance=10000, equity=10000, hwm=10000)
+    row = snapshots.latest(c)
+    assert row["ts"] == NOW.isoformat()
+    assert row["ts"].endswith("+00:00")
+
+
 def test_econ_upsert_and_upcoming(tmp_path):
     c = _conn(tmp_path)
     ts = NOW + timedelta(hours=3)

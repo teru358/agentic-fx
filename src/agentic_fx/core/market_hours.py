@@ -1,16 +1,11 @@
 """FX 市場時間 (簡易 UTC 固定境界)。DST 精緻化は finance 移植で置換可能な境界を保つ。"""
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta
+
+from agentic_fx.core.timeutil import as_utc as _as_utc
 
 _ROLLOVER_UTC = time(21, 0)  # NY 17:00 相当の日次ロールオーバー (DST 無視の近似)
-
-
-def _as_utc(now: datetime) -> datetime:
-    """入力を UTC に正規化。naive datetime は ValueError を送出。"""
-    if now.tzinfo is None:
-        raise ValueError("timezone-aware な datetime が必要です")
-    return now.astimezone(timezone.utc)
 
 
 def is_market_open(now: datetime) -> bool:

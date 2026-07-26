@@ -3,9 +3,12 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 
+from agentic_fx.core.timeutil import as_utc
+
 
 def add(conn: sqlite3.Connection, *, ts: datetime, balance: float, equity: float,
         hwm: float, cashflow: float = 0.0, source: str = "paper") -> int:
+    ts = as_utc(ts)
     cur = conn.execute(
         "INSERT INTO account_snapshots (ts, balance, equity, hwm, cashflow, source) "
         "VALUES (?,?,?,?,?,?)",
@@ -16,7 +19,8 @@ def add(conn: sqlite3.Connection, *, ts: datetime, balance: float, equity: float
 
 def latest(conn: sqlite3.Connection) -> dict | None:
     row = conn.execute(
-        "SELECT * FROM account_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        "SELECT * FROM account_snapshots ORDER BY ts DESC, id DESC LIMIT 1"
+    ).fetchone()
     return dict(row) if row else None
 
 

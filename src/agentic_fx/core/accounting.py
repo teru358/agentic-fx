@@ -5,12 +5,14 @@ import sqlite3
 from datetime import datetime, timedelta
 
 from agentic_fx.core.market_hours import trading_day_start
+from agentic_fx.core.timeutil import as_utc
 from agentic_fx.store import snapshots
 
 
 def record_snapshot(conn: sqlite3.Connection, *, now: datetime, balance: float,
                     equity: float, cashflow: float = 0.0,
                     source: str = "paper") -> dict:
+    now = as_utc(now)
     # read-modify-write を単一トランザクションで (HWM の巻き戻り防止)
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -37,6 +39,7 @@ def drawdown_pct(equity: float, hwm: float) -> float:
 
 def daily_start_equity(conn: sqlite3.Connection, now: datetime, *,
                        max_age_hours: float = 48.0) -> float | None:
+    now = as_utc(now)
     day_start = trading_day_start(now)
     row = snapshots.first_since(conn, day_start)
     if row is None:
@@ -56,6 +59,7 @@ def daily_start_equity(conn: sqlite3.Connection, now: datetime, *,
 
 def current_account(conn: sqlite3.Connection, now: datetime, *,
                     max_age_min: float = 10.0) -> tuple[float, float] | None:
+    now = as_utc(now)
     row = snapshots.latest(conn)
     if row is None:
         return None
