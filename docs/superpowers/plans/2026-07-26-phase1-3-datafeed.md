@@ -34,7 +34,9 @@
 - Produces:
   - `DataUnhealthy(Exception)` — メッセージに理由を含む
   - `validate_quote(quote: Quote, now: datetime, freshness_max_min: float) -> None` — 鮮度超過・非正値・bid>ask で `DataUnhealthy`
-  - `validate_bars(bars: list[Bar], now: datetime, freshness_max_min: float, interval_min: float) -> None` — 空・最終バー鮮度・連続性 (欠損 3 本以上)・異常値 (0/NaN/前バー比 ±10% スパイク) で `DataUnhealthy`
+  - `validate_bars(bars: list[Bar], now: datetime, freshness_max_min: float, interval_min: float) -> None` — 空・最終バー鮮度・連続性 (欠損 3 本超)・異常値 (0/NaN/前バー比 ±10% スパイク) で `DataUnhealthy`
+  - **バー timestamp の定義: バーの開始時刻**。最終バー鮮度の許容 = `interval_min + freshness_max_min` (確定直後のバーを stale 扱いしない)
+  - **連続性の判定は市場休場を欠損としない**: ギャップ区間に市場クローズ時間 (週末) が含まれる場合はスキップ (`market_hours.is_market_open` を 1 時間刻みでサンプリング)
 
 - [ ] **Step 1: 依存を追加**
 
@@ -100,9 +102,21 @@ def test_stale_last_bar_rejected():
 
 def test_gap_rejected():
     bars = _bars()
-    del bars[10:14]  # 4 本欠損
+    del bars[10:14]  # 4 本欠損 (市場オープン中)
     with pytest.raises(DataUnhealthy, match="gap"):
         validate_bars(bars, NOW, freshness_max_min=90, interval_min=60)
+
+
+def test_weekend_gap_is_not_a_gap():
+    # 金 20:00 のバー → 日 21:00 再開のバー: 休場ギャップは欠損ではない
+    fri = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
+    sun = datetime(2026, 7, 26, 21, 0, tzinfo=timezone.utc)
+    bars = [Bar("USDJPY", "1h", fri + timedelta(hours=i),
+                148.0, 148.1, 147.9, 148.05, 100) for i in range(3)]
+    bars += [Bar("USDJPY", "1h", sun + timedelta(hours=i),
+                 148.0, 148.1, 147.9, 148.05, 100) for i in range(3)]
+    validate_bars(bars, sun + timedelta(hours=3), freshness_max_min=90,
+                  interval_min=60)  # 例外なし
 
 
 def test_spike_rejected():
@@ -133,12 +147,15 @@ Expected: FAIL (ImportError)
 `src/agentic_fx/datafeed/health.py`:
 
 ```python
-"""データ健全性検証 — 「取得成功」でなくこの検証の通過がフォールバック採用条件 (設計書 §5)。"""
+"""データ健全性検証 — 「取得成功」でなくこの検証の通過がフォールバック採用条件 (設計書 §5)。
+
+バー timestamp はバーの開始時刻とする。"""
 from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta
 
+from agentic_fx.core import market_hours
 from agentic_fx.core.contracts import Bar, Quote
 
 _MAX_GAP_BARS = 3
@@ -160,11 +177,23 @@ def validate_quote(quote: Quote, now: datetime,
         raise DataUnhealthy(f"bid/ask inverted: {quote.bid} > {quote.ask}")
 
 
+def _spans_market_close(a: datetime, b: datetime) -> bool:
+    """区間 [a, b] に市場クローズ時間が含まれるか (1 時間刻みサンプリング)。"""
+    cur = a
+    while cur <= b:
+        if not market_hours.is_market_open(cur):
+            return True
+        cur += timedelta(hours=1)
+    return not market_hours.is_market_open(b)
+
+
 def validate_bars(bars: list[Bar], now: datetime, freshness_max_min: float,
                   interval_min: float) -> None:
     if not bars:
         raise DataUnhealthy("empty bars")
-    if now - bars[-1].ts > timedelta(minutes=freshness_max_min):
+    # ts はバー開始時刻: 確定直後を stale にしないため interval 分を許容に足す
+    allowed = timedelta(minutes=freshness_max_min + interval_min)
+    if now - bars[-1].ts > allowed:
         raise DataUnhealthy(f"bars stale: last={bars[-1].ts}")
     prev = None
     for b in bars:
@@ -173,7 +202,7 @@ def validate_bars(bars: list[Bar], now: datetime, freshness_max_min: float,
             raise DataUnhealthy(f"anomalous bar (zero/NaN) at {b.ts}")
         if prev is not None:
             gap = (b.ts - prev.ts).total_seconds() / 60 / interval_min
-            if gap > _MAX_GAP_BARS:
+            if gap > _MAX_GAP_BARS and not _spans_market_close(prev.ts, b.ts):
                 raise DataUnhealthy(f"gap of {gap:.0f} bars before {b.ts}")
             move = abs(b.close - prev.close) / prev.close * 100
             if move > _SPIKE_PCT:
@@ -205,10 +234,11 @@ git commit -m "feat: データ健全性検証 (鮮度・連続性・異常値) +
 
 **Interfaces:**
 - Produces (各関数はネットワーク例外を握らず送出する — 選択は price_provider の責務):
-  - `yf_quote(pair: str) -> Quote` / `yf_bars(pair: str, interval: str, lookback_days: int) -> list[Bar]` — yfinance。pair `USDJPY` → ticker `USDJPY=X`。quote は直近 1m バーの close を bid=ask=mid として返す (yfinance に板がないため。source="yfinance")
-  - `mt5_quote(bridge_url: str, pair: str) -> Quote` / `mt5_bars(bridge_url, pair, interval, lookback_days) -> list[Bar]` — httpx GET `{bridge_url}/quote?symbol=` / `/rates?symbol=&timeframe=&count=` (mt5_bridge の既存エンドポイント形式)。source="mt5"
-  - `td_bars(api_key: str, pair: str, interval: str, lookback_days: int) -> list[Bar]` — Twelve Data `/time_series`。source="twelvedata"
-  - `INTERVAL_MIN: dict[str, float]` = `{"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}`
+  - `vendor_symbol(logical: str, vendor: str) -> str` — **論理シンボル → vendor 別シンボルの明示 resolver** (`VENDOR_SYMBOLS` テーブル)。Phase 1 は USDJPY / EURUSD (+ 関連指標の拡張点として DXY の例)。未定義は `KeyError` (provider 側でソース失敗として扱う)
+  - `yf_quote(pair) -> Quote` / `yf_bars(pair, interval, lookback_days) -> list[Bar]` — yfinance。**`multi_level_index=False` を明示** (現行 yfinance は単一 ticker でも MultiIndex 列がデフォルト — #critical)。quote は直近 1m バーの close を bid=ask として返す (yfinance に板がないため。source="yfinance")
+  - `mt5_quote(bridge_url, pair) -> Quote` / `mt5_bars(bridge_url, pair, interval, lookback_days) -> list[Bar]` — httpx GET (mt5_bridge の既存エンドポイント形式)。source="mt5"
+  - `td_quote(api_key, pair) -> Quote` / `td_bars(api_key, pair, interval, lookback_days) -> list[Bar]` — Twelve Data (`/quote` は実在する — quote チェーンにも入る)。**interval は `_TD_INTERVAL` で変換** (`1m→1min` 等)。`outputsize` は **5000 上限で clamp**
+  - `INTERVAL_MIN: dict[str, float]` = `{"1m": 1, "5m": 5, "15m": 15, "1h": 60, "1d": 1440}` — **`4h` はソース層に存在しない** (4h はツール層が 1h から resample で導出 — プラン 4)
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -219,26 +249,49 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
 from agentic_fx.datafeed.sources import (
-    INTERVAL_MIN, mt5_quote, td_bars, yf_bars, yf_quote,
+    INTERVAL_MIN, mt5_quote, td_bars, td_quote, vendor_symbol,
+    yf_bars, yf_quote,
 )
 
 IDX = pd.DatetimeIndex(
     [datetime(2026, 7, 22, 11, 58, tzinfo=timezone.utc),
      datetime(2026, 7, 22, 11, 59, tzinfo=timezone.utc)])
-DF = pd.DataFrame({"Open": [148.4, 148.45], "High": [148.5, 148.55],
-                   "Low": [148.3, 148.4], "Close": [148.45, 148.5],
-                   "Volume": [100, 120]}, index=IDX)
+_DATA = {"Open": [148.4, 148.45], "High": [148.5, 148.55],
+         "Low": [148.3, 148.4], "Close": [148.45, 148.5],
+         "Volume": [100, 120]}
+DF = pd.DataFrame(_DATA, index=IDX)
+# 現行 yfinance デフォルトの (Price, Ticker) MultiIndex 列も検証する
+DF_MULTI = pd.DataFrame(
+    {(k, "USDJPY=X"): v for k, v in _DATA.items()}, index=IDX)
+DF_MULTI.columns = pd.MultiIndex.from_tuples(DF_MULTI.columns)
+
+
+def test_vendor_symbol_resolver():
+    assert vendor_symbol("USDJPY", "yf") == "USDJPY=X"
+    assert vendor_symbol("USDJPY", "td") == "USD/JPY"
+    assert vendor_symbol("USDJPY", "mt5") == "USDJPY"
+    with pytest.raises(KeyError):
+        vendor_symbol("GBPUSD", "yf")  # 未定義は KeyError
 
 
 def test_yf_bars_maps_dataframe():
     with patch("yfinance.download", return_value=DF) as dl:
         bars = yf_bars("USDJPY", "1m", 1)
     assert dl.call_args[0][0] == "USDJPY=X"
+    assert dl.call_args[1]["multi_level_index"] is False
     assert len(bars) == 2
     assert bars[-1].close == 148.5
-    assert bars[-1].source if hasattr(bars[-1], "source") else True
+
+
+def test_yf_bars_normalizes_multiindex():
+    # multi_level_index=False が効かない旧版でも列を単層化して読めること
+    with patch("yfinance.download", return_value=DF_MULTI):
+        bars = yf_bars("USDJPY", "1m", 1)
+    assert len(bars) == 2
+    assert bars[-1].close == 148.5
 
 
 def test_yf_quote_uses_last_close():
@@ -259,7 +312,20 @@ def test_mt5_quote_parses_bridge_response():
     assert q.bid == 148.49 and q.source == "mt5"
 
 
-def test_td_bars_parses_values():
+def test_td_quote():
+    resp = MagicMock()
+    resp.json.return_value = {"symbol": "USD/JPY", "bid": "148.49",
+                              "ask": "148.51",
+                              "timestamp": 1784721570}
+    resp.raise_for_status = MagicMock()
+    with patch("httpx.get", return_value=resp) as g:
+        q = td_quote("key", "USDJPY")
+    assert g.call_args[1]["params"]["symbol"] == "USD/JPY"
+    assert q.bid == 148.49 and q.source == "twelvedata"
+    assert q.ts.tzinfo is not None
+
+
+def test_td_bars_parses_and_maps_interval():
     resp = MagicMock()
     resp.json.return_value = {"values": [
         {"datetime": "2026-07-22 11:59:00", "open": "148.45",
@@ -268,19 +334,22 @@ def test_td_bars_parses_values():
          "high": "148.50", "low": "148.30", "close": "148.45"},
     ]}
     resp.raise_for_status = MagicMock()
-    with patch("httpx.get", return_value=resp):
-        bars = td_bars("key", "USDJPY", "1m", 1)
-    assert bars[0].ts < bars[1].ts  # 昇順に並べ替え
+    with patch("httpx.get", return_value=resp) as g:
+        bars = td_bars("key", "USDJPY", "1m", 30)
+    params = g.call_args[1]["params"]
+    assert params["interval"] == "1min"      # TD の interval 表記へ変換
+    assert params["outputsize"] <= 5000      # API 上限で clamp
+    assert params["symbol"] == "USD/JPY"
+    assert bars[0].ts < bars[1].ts           # 昇順に並べ替え
     assert bars[-1].close == 148.5
-    assert bars[-1].source == "twelvedata" if hasattr(bars[-1], "source") \
-        else True
 
 
-def test_interval_table():
+def test_interval_table_has_no_4h():
     assert INTERVAL_MIN["1h"] == 60
+    assert "4h" not in INTERVAL_MIN  # 4h はツール層の resample で導出
 ```
 
-注: `Bar` は `source` フィールドを持たない (プラン 1 契約)。ソース識別は price_provider が返す `PriceResult.source` で扱う (Task 3)。上のテストの hasattr 分岐はこのための緩衝で、実装後に不要なら単純化してよい。
+注: `Bar` は `source` フィールドを持たない (プラン 1 契約)。バーの出所は `PriceProvider.last_bars_source(pair, interval)` (Task 3) で公開する。
 
 - [ ] **Step 2: テストが失敗することを確認**
 
@@ -292,40 +361,62 @@ Expected: FAIL (ImportError)
 `src/agentic_fx/datafeed/sources.py`:
 
 ```python
-"""ソース別 fetcher (yfinance / MT5 bridge / Twelve Data)。例外は送出、選択は provider。"""
+"""ソース別 fetcher (yfinance / MT5 bridge / Twelve Data)。例外は送出、選択は provider。
+
+論理シンボル → vendor 別シンボルは VENDOR_SYMBOLS で明示解決する
+(関連指標 — DXY 等 — の追加はこの表への行追加、設計書 §5)。"""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import httpx
+import pandas as pd
 import yfinance
 
 from agentic_fx.core.contracts import Bar, Quote
 
 INTERVAL_MIN: dict[str, float] = {
-    "1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+    "1m": 1, "5m": 5, "15m": 15, "1h": 60, "1d": 1440}
+# 4h はソース層に存在しない — ツール層が 1h から resample (プラン 4)
 
-_YF_INTERVAL = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h",
-                "4h": "1h", "1d": "1d"}  # 4h は 1h から MTF リサンプル
+_TD_INTERVAL = {"1m": "1min", "5m": "5min", "15m": "15min",
+                "1h": "1h", "1d": "1day"}
+_TD_MAX_OUTPUTSIZE = 5000
+
+VENDOR_SYMBOLS: dict[str, dict[str, str]] = {
+    "USDJPY": {"yf": "USDJPY=X", "td": "USD/JPY", "mt5": "USDJPY"},
+    "EURUSD": {"yf": "EURUSD=X", "td": "EUR/USD", "mt5": "EURUSD"},
+    # 関連指標の拡張例 (Phase 1 では未使用):
+    "DXY": {"yf": "DX-Y.NYB", "td": "DXY"},
+}
 
 
-def _yf_ticker(pair: str) -> str:
-    return f"{pair}=X"
+def vendor_symbol(logical: str, vendor: str) -> str:
+    return VENDOR_SYMBOLS[logical][vendor]
+
+
+def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
 
 
 def yf_bars(pair: str, interval: str, lookback_days: int) -> list[Bar]:
     df = yfinance.download(
-        _yf_ticker(pair), interval=_YF_INTERVAL[interval],
-        period=f"{lookback_days}d", progress=False, auto_adjust=False)
+        vendor_symbol(pair, "yf"), interval=interval,
+        period=f"{lookback_days}d", progress=False, auto_adjust=False,
+        multi_level_index=False)
+    df = _flatten_yf_columns(df)
     bars: list[Bar] = []
     for ts, row in df.iterrows():
         t = ts.to_pydatetime()
         if t.tzinfo is None:
             t = t.replace(tzinfo=timezone.utc)
+        volume = row["Volume"] if "Volume" in row else 0.0
         bars.append(Bar(pair, interval, t, float(row["Open"]),
                         float(row["High"]), float(row["Low"]),
-                        float(row["Close"]),
-                        float(row.get("Volume", 0) or 0)))
+                        float(row["Close"]), float(volume or 0)))
     return bars
 
 
@@ -338,7 +429,8 @@ def yf_quote(pair: str) -> Quote:
 
 
 def mt5_quote(bridge_url: str, pair: str) -> Quote:
-    r = httpx.get(f"{bridge_url}/quote", params={"symbol": pair}, timeout=10)
+    r = httpx.get(f"{bridge_url}/quote",
+                  params={"symbol": vendor_symbol(pair, "mt5")}, timeout=10)
     r.raise_for_status()
     d = r.json()
     return Quote(pair, float(d["bid"]), float(d["ask"]),
@@ -349,8 +441,8 @@ def mt5_bars(bridge_url: str, pair: str, interval: str,
              lookback_days: int) -> list[Bar]:
     count = int(lookback_days * 1440 / INTERVAL_MIN[interval])
     r = httpx.get(f"{bridge_url}/rates",
-                  params={"symbol": pair, "timeframe": interval,
-                          "count": count}, timeout=30)
+                  params={"symbol": vendor_symbol(pair, "mt5"),
+                          "timeframe": interval, "count": count}, timeout=30)
     r.raise_for_status()
     return [Bar(pair, interval, datetime.fromisoformat(x["time"]),
                 float(x["open"]), float(x["high"]), float(x["low"]),
@@ -358,14 +450,24 @@ def mt5_bars(bridge_url: str, pair: str, interval: str,
             for x in r.json()]
 
 
+def td_quote(api_key: str, pair: str) -> Quote:
+    r = httpx.get("https://api.twelvedata.com/quote",
+                  params={"symbol": vendor_symbol(pair, "td"),
+                          "apikey": api_key}, timeout=10)
+    r.raise_for_status()
+    d = r.json()
+    ts = datetime.fromtimestamp(int(d["timestamp"]), tz=timezone.utc)
+    return Quote(pair, float(d["bid"]), float(d["ask"]), ts, "twelvedata")
+
+
 def td_bars(api_key: str, pair: str, interval: str,
             lookback_days: int) -> list[Bar]:
-    symbol = f"{pair[:3]}/{pair[3:]}"
+    size = min(_TD_MAX_OUTPUTSIZE,
+               int(lookback_days * 1440 / INTERVAL_MIN[interval]))
     r = httpx.get("https://api.twelvedata.com/time_series",
-                  params={"symbol": symbol, "interval": interval,
-                          "outputsize": int(lookback_days * 1440
-                                            / INTERVAL_MIN[interval]),
-                          "apikey": api_key}, timeout=30)
+                  params={"symbol": vendor_symbol(pair, "td"),
+                          "interval": _TD_INTERVAL[interval],
+                          "outputsize": size, "apikey": api_key}, timeout=30)
     r.raise_for_status()
     values = r.json().get("values", [])
     bars = [Bar(pair, interval,
@@ -401,12 +503,13 @@ git commit -m "feat: ソース fetcher (yfinance/MT5 bridge/Twelve Data、全モ
 **Interfaces:**
 - Produces: `class PriceProvider`:
   - `__init__(self, conn, settings: Settings, clock: Clock)`
-  - `get_quote(self, pair: str) -> Quote` — 優先順位 **MT5 → TD (quote なし、スキップ) → yfinance**。enabled なソースを順に試し、**取得成功 + `validate_quote` 通過**した最初の Quote を返す。全滅なら `DataUnhealthy`
-  - `get_bars(self, pair: str, interval: str, lookback_days: int = 5) -> list[Bar]` — 同様に MT5 → TD → yfinance。健全性通過後 **ohlcv キャッシュに upsert** して返す。全滅時、キャッシュに健全なバーがあればそれを返し (source は "cache")、なければ `DataUnhealthy`
-  - `latest_1m_bar(self, pair: str) -> Bar | None` — scheduler の `bars_fn` 用。`get_bars(pair, "1m", 1)` の最終バー、`DataUnhealthy` は None (fills 判定をスキップさせる)
-  - `spec(self, pair: str) -> InstrumentSpec` — executor の `spec_fn` 用。Phase 1 は組み込みテーブル (USDJPY/EURUSD: pip_size 0.01/0.0001, min 0.01, max 50, step 0.01, contract 100,000)。Phase 3 で MT5 照会に置換
-  - `healthcheck(self, pair: str) -> str` — quote が取れた source 名を返す (trade_loop の fail-closed 判定 + init 接続確認用)。全滅は `DataUnhealthy`
-- 各ソースの失敗 (例外 / 検証不合格) は技術ログ warning + 次ソースへ。採用 source が yfinance の場合は品質フラグとしてそのまま `Quote.source` / activity に残る
+  - `get_quote(self, pair: str) -> Quote` — 優先順位 **MT5 → Twelve Data → yfinance** (quote も 3 ソース — TD には `/quote` がある)。**enabled なソースのみ**を順に試し、**取得成功 + `validate_quote` 通過**した最初の Quote を返す。全滅なら `DataUnhealthy`
+  - `get_bars(self, pair: str, interval: str, lookback_days: int = 5) -> list[Bar]` — 同順・同条件。`interval="4h"` は **`DataUnhealthy("4h is derived — request 1h")`** (ソース層に 4h はない)。健全性通過後 **ohlcv キャッシュに upsert** して返す。全滅時、キャッシュに健全なバーがあればそれを返し、なければ `DataUnhealthy`
+  - `last_bars_source(self, pair: str, interval: str) -> str | None` — 直近の `get_bars` が採用した source 名 (`"mt5" / "twelvedata" / "yfinance" / "cache"`)。**データ品質フラグの公開点** (設計書 §5: yfinance のみで得た判断に品質フラグを残す — trade_loop がこれを missions 記録・activity に添える)
+  - `latest_1m_bar(self, pair: str) -> Bar | None` — scheduler の `bars_fn` 用。`DataUnhealthy` は None (fills 判定をスキップさせる)
+  - `spec(self, pair: str) -> InstrumentSpec` — executor の `spec_fn` 用。Phase 1 は組み込みテーブル。Phase 3 で MT5 照会に置換
+  - `healthcheck(self, pair: str) -> str` — **quote と 1h バー (判断 Mission の主系列) の両方**が健全であることを確認し、quote の source 名を返す。どちらか全滅は `DataUnhealthy` (設計書 §5 の fail closed — quote だけの確認では OHLCV 不健全時に Mission が走ってしまう)
+- 各ソースの失敗 (例外 / 検証不合格) は技術ログ warning + 次ソースへ。yfinance も `enabled: false` なら試さない (ユーザーの明示的無効化を尊重)
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -523,6 +626,63 @@ def test_spec_builtin(tmp_path):
     assert p.spec("USDJPY").pip_size == 0.01
     assert p.spec("EURUSD").pip_size == 0.0001
     assert p.spec("USDJPY").contract_size == 100_000
+
+
+def test_td_quote_used_when_mt5_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "k")
+    s = load_settings(EXAMPLE).model_copy(deep=True)
+    s.datafeed.mt5.enabled = True
+    s.datafeed.twelvedata.enabled = True
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    p = PriceProvider(conn, s, FixedClock(NOW))
+    tdq = Quote("USDJPY", 148.49, 148.51, NOW, "twelvedata")
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_quote",
+               side_effect=OSError("down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.td_quote",
+               return_value=tdq):
+        assert p.get_quote("USDJPY").source == "twelvedata"
+
+
+def test_yfinance_disabled_is_respected(tmp_path):
+    s = load_settings(EXAMPLE).model_copy(deep=True)
+    s.datafeed.yfinance.enabled = False
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    p = PriceProvider(conn, s, FixedClock(NOW))
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote") as yq:
+        with pytest.raises(DataUnhealthy):
+            p.get_quote("USDJPY")
+        yq.assert_not_called()
+
+
+def test_get_bars_rejects_4h(tmp_path):
+    _, p = _provider(tmp_path)
+    with pytest.raises(DataUnhealthy, match="4h"):
+        p.get_bars("USDJPY", "4h")
+
+
+def test_last_bars_source_tracks_quality_flag(tmp_path):
+    conn, p = _provider(tmp_path)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_fresh_bars()):
+        p.get_bars("USDJPY", "1m", 1)
+    assert p.last_bars_source("USDJPY", "1m") == "yfinance"
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        p.get_bars("USDJPY", "1m", 1)  # キャッシュフォールバック
+    assert p.last_bars_source("USDJPY", "1m") == "cache"
+
+
+def test_healthcheck_requires_bars_too(tmp_path):
+    _, p = _provider(tmp_path)
+    q = Quote("USDJPY", 148.5, 148.5, NOW, "yfinance")
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               return_value=q), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        with pytest.raises(DataUnhealthy):
+            p.healthcheck("USDJPY")  # quote 健全でも bars 全滅なら fail closed
 ```
 
 - [ ] **Step 2: テストが失敗することを確認**
@@ -564,12 +724,18 @@ class PriceProvider:
         self.conn = conn
         self.settings = settings
         self.clock = clock
+        self._bars_source: dict[tuple[str, str], str] = {}
+
+    def _td_key(self) -> str | None:
+        if not self.settings.datafeed.twelvedata.enabled:
+            return None
+        return os.environ.get("TWELVEDATA_API_KEY")
 
     # ---- quote ----------------------------------------------------------
 
     def get_quote(self, pair: str) -> Quote:
         errors: list[str] = []
-        for name, fn in self._quote_chain(pair):
+        for name, fn in self._chain(pair, kind="quote"):
             try:
                 q = fn()
                 validate_quote(q, self.clock.now(),
@@ -580,40 +746,48 @@ class PriceProvider:
                 errors.append(f"{name}: {e}")
         raise DataUnhealthy(f"all quote sources failed for {pair}: {errors}")
 
-    def _quote_chain(self, pair: str):
+    def _chain(self, pair: str, *, kind: str, interval: str = "1m",
+               lookback_days: int = 5):
+        """優先順位 MT5 → TD → yfinance。enabled なソースのみ (設計書 §5)。"""
         d = self.settings.datafeed
+        td_key = self._td_key()
         chain = []
         if d.mt5.enabled:
-            chain.append(("mt5",
-                          lambda: sources.mt5_quote(d.mt5.bridge_url, pair)))
-        chain.append(("yfinance", lambda: sources.yf_quote(pair)))
+            chain.append(("mt5", (
+                lambda: sources.mt5_quote(d.mt5.bridge_url, pair))
+                if kind == "quote" else
+                (lambda: sources.mt5_bars(d.mt5.bridge_url, pair, interval,
+                                          lookback_days))))
+        if td_key:
+            chain.append(("twelvedata", (
+                lambda: sources.td_quote(td_key, pair))
+                if kind == "quote" else
+                (lambda: sources.td_bars(td_key, pair, interval,
+                                         lookback_days))))
+        if d.yfinance.enabled:
+            chain.append(("yfinance", (
+                lambda: sources.yf_quote(pair))
+                if kind == "quote" else
+                (lambda: sources.yf_bars(pair, interval, lookback_days))))
         return chain
 
     # ---- bars -----------------------------------------------------------
 
     def get_bars(self, pair: str, interval: str,
                  lookback_days: int = 5) -> list[Bar]:
+        if interval == "4h":
+            raise DataUnhealthy("4h is derived — request 1h and resample")
         d = self.settings.datafeed
         now = self.clock.now()
         interval_min = sources.INTERVAL_MIN[interval]
         errors: list[str] = []
-        chain = []
-        if d.mt5.enabled:
-            chain.append(("mt5", lambda: sources.mt5_bars(
-                d.mt5.bridge_url, pair, interval, lookback_days)))
-        if d.twelvedata.enabled and os.environ.get("TWELVEDATA_API_KEY"):
-            chain.append(("twelvedata", lambda: sources.td_bars(
-                os.environ["TWELVEDATA_API_KEY"], pair, interval,
-                lookback_days)))
-        chain.append(("yfinance", lambda: sources.yf_bars(
-            pair, interval, lookback_days)))
-
-        for name, fn in chain:
+        for name, fn in self._chain(pair, kind="bars", interval=interval,
+                                    lookback_days=lookback_days):
             try:
                 bars = fn()
-                validate_bars(bars, now, d.freshness_max_min * interval_min,
-                              interval_min)
+                validate_bars(bars, now, d.freshness_max_min, interval_min)
                 ohlcv.upsert_bars(self.conn, bars)
+                self._bars_source[(pair, interval)] = name
                 return bars
             except Exception as e:  # noqa: BLE001
                 _log.warning("bars source %s failed for %s: %s", name, pair, e)
@@ -622,13 +796,16 @@ class PriceProvider:
         cached = ohlcv.load_bars(self.conn, pair, interval)
         if cached:
             try:
-                validate_bars(cached, now,
-                              d.freshness_max_min * interval_min, interval_min)
+                validate_bars(cached, now, d.freshness_max_min, interval_min)
                 _log.warning("using cached bars for %s %s", pair, interval)
+                self._bars_source[(pair, interval)] = "cache"
                 return cached
             except DataUnhealthy as e:
                 errors.append(f"cache: {e}")
         raise DataUnhealthy(f"all bar sources failed for {pair}: {errors}")
+
+    def last_bars_source(self, pair: str, interval: str) -> str | None:
+        return self._bars_source.get((pair, interval))
 
     def latest_1m_bar(self, pair: str) -> Bar | None:
         try:
@@ -645,7 +822,10 @@ class PriceProvider:
             raise DataUnhealthy(f"no instrument spec for {pair}") from None
 
     def healthcheck(self, pair: str) -> str:
-        return self.get_quote(pair).source
+        """quote と 1h バー (判断 Mission の主系列) の両方を検証する。"""
+        source = self.get_quote(pair).source
+        self.get_bars(pair, "1h")
+        return source
 ```
 
 - [ ] **Step 4: テストが通ることを確認**
@@ -951,7 +1131,8 @@ git commit -m "feat: news fetcher (feed/web の 2 組み込みのみ)"
 
 **Interfaces:**
 - Produces: `class Rag`:
-  - `__init__(self, data_dir: Path)` — `chromadb.PersistentClient(path=data_dir)`、コレクション `news` / `reflections` (embedding は chromadb デフォルト)
+  - `__init__(self, data_dir: Path, embedding_function=None)` — `chromadb.PersistentClient(path=data_dir)`、コレクション `news` / `reflections`。`embedding_function=None` なら chromadb デフォルト (all-MiniLM-L6-v2、**初回にモデルを自動 DL する — オフライン環境では init 時に事前 DL するか注入が必要**)。**テストは決定論的な fake embedding を注入し、ネットワークに依存しない**
+  - 本番の初期化失敗 (モデル未配置 + オフライン) は Rag 生成時の例外としてサービス起動失敗で顕在化させる (黙って劣化しない)
   - `add_news(self, articles: list[dict], now: datetime) -> int` — dict keys: url/title/body/source_name/published。**url をIDにして重複 upsert**。metadata に `added_at` (ISO)。追加件数を返す
   - `search_news(self, query: str, n: int = 5) -> list[dict]` — `{url, title, body, source_name}` のリスト
   - `cleanup_news(self, now: datetime, hours: int = 48) -> int` — `added_at` が閾値より古いものを削除、削除件数を返す (設計書 §12)
@@ -962,11 +1143,32 @@ git commit -m "feat: news fetcher (feed/web の 2 組み込みのみ)"
 `tests/store/test_rag.py`:
 
 ```python
+import hashlib
+
 from datetime import datetime, timedelta, timezone
 
 from agentic_fx.store.rag import Rag
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+
+
+class FakeEmbedding:
+    """決定論的 fake embedding (ネットワーク・モデル DL 不要)。"""
+
+    def __call__(self, input):  # noqa: A002 — chromadb の EF 規約
+        out = []
+        for text in input:
+            h = hashlib.sha256(text.encode()).digest()
+            out.append([b / 255.0 for b in h[:16]])
+        return out
+
+    def name(self):
+        return "fake"
+
+
+def _rag(tmp_path):
+    return Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+
 
 ARTS = [
     {"url": "https://ex.com/a1", "title": "Dollar rallies on CPI",
@@ -979,7 +1181,7 @@ ARTS = [
 
 
 def test_add_and_search(tmp_path):
-    rag = Rag(tmp_path / "rag")
+    rag = _rag(tmp_path)
     assert rag.add_news(ARTS, NOW) == 2
     hits = rag.search_news("US dollar CPI", n=1)
     assert len(hits) == 1
@@ -987,14 +1189,14 @@ def test_add_and_search(tmp_path):
 
 
 def test_upsert_dedup_by_url(tmp_path):
-    rag = Rag(tmp_path / "rag")
+    rag = _rag(tmp_path)
     rag.add_news(ARTS, NOW)
     rag.add_news(ARTS, NOW)  # 再投入
     assert rag.count_news() == 2
 
 
 def test_cleanup_removes_old(tmp_path):
-    rag = Rag(tmp_path / "rag")
+    rag = _rag(tmp_path)
     rag.add_news([ARTS[0]], NOW - timedelta(hours=50))
     rag.add_news([ARTS[1]], NOW)
     removed = rag.cleanup_news(NOW, hours=48)
@@ -1003,7 +1205,7 @@ def test_cleanup_removes_old(tmp_path):
 
 
 def test_reflections_roundtrip(tmp_path):
-    rag = Rag(tmp_path / "rag")
+    rag = _rag(tmp_path)
     rag.add_reflection(1, "USDJPY long был stopped out due to CPI spike",
                        "USDJPY")
     hits = rag.search_reflections("stopped out CPI", n=1)
@@ -1032,10 +1234,14 @@ import chromadb
 
 
 class Rag:
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, embedding_function=None) -> None:
         self._client = chromadb.PersistentClient(path=str(data_dir))
-        self._news = self._client.get_or_create_collection("news")
-        self._refl = self._client.get_or_create_collection("reflections")
+        kwargs = {}
+        if embedding_function is not None:
+            kwargs["embedding_function"] = embedding_function
+        self._news = self._client.get_or_create_collection("news", **kwargs)
+        self._refl = self._client.get_or_create_collection("reflections",
+                                                           **kwargs)
 
     # ---- news -----------------------------------------------------------
 
@@ -1092,7 +1298,7 @@ class Rag:
 - [ ] **Step 4: テストが通ることを確認**
 
 Run: `uv run pytest tests/store/test_rag.py -v`
-Expected: PASS (初回は embedding モデルの DL で時間がかかる場合あり)
+Expected: PASS (fake embedding のためネットワーク・モデル DL 不要)
 
 - [ ] **Step 5: Commit**
 
@@ -1143,9 +1349,10 @@ ART = Article(url="https://ex.com/a1", title="t", body="b",
 
 
 def _env(tmp_path):
+    from tests.store.test_rag import FakeEmbedding
     conn = connect(tmp_path / "t.db")
     init_db(conn)
-    rag = Rag(tmp_path / "rag")
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
     col = NewsCollector(conn, rag, ActivityLog(tmp_path / "a.log"),
                         FixedClock(NOW))
     return conn, rag, col
@@ -1317,12 +1524,12 @@ FF_JSON = [
     {"title": "CPI y/y", "country": "USD", "date": "2026-07-22T15:30:00-04:00",
      "impact": "High", "forecast": "3.1%", "previous": "3.0%"},
     {"title": "Retail Sales", "country": "GBP",
-     "date": "2026-07-23T02:00:00-04:00", "impact": "Medium",
-     "forecast": "", "previous": "0.2%"},
+     "date": "2026-07-24T02:00:00-04:00", "impact": "Medium",
+     "forecast": "", "previous": "0.2%"},  # 7/24 06:00 UTC = 24h 圏外
 ]
 
 
-def test_fetch_maps_fields():
+def test_fetch_maps_fields_and_normalizes_utc():
     resp = MagicMock()
     resp.json.return_value = FF_JSON
     resp.raise_for_status = MagicMock()
@@ -1331,7 +1538,9 @@ def test_fetch_maps_fields():
     assert events[0]["country"] == "USD"
     assert events[0]["importance"] == 3
     assert events[1]["importance"] == 2
-    assert events[0]["ts"].tzinfo is not None
+    # ts は UTC へ正規化して保存する (ISO 文字列比較の順序保証のため)
+    assert events[0]["ts"].tzinfo == timezone.utc
+    assert events[0]["ts"].hour == 19  # 15:30-04:00 → 19:30 UTC
 
 
 def test_refresh_upserts_and_upcoming(tmp_path):
@@ -1345,7 +1554,7 @@ def test_refresh_upserts_and_upcoming(tmp_path):
         assert cal.refresh() == 2
         assert cal.refresh() == 2  # upsert 冪等
     rows = cal.upcoming(hours=24)
-    assert len(rows) == 1  # USD CPI (22 日 19:30 UTC) のみ 24h 以内
+    assert len(rows) == 1  # USD CPI (22 日 19:30 UTC) のみ。GBP は 42h 後で圏外
     assert rows[0]["name"] == "CPI y/y"
 
 
@@ -1372,7 +1581,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 
@@ -1390,7 +1599,9 @@ def fetch_ff_calendar() -> list[dict]:
     r.raise_for_status()
     out = []
     for e in r.json():
-        out.append({"ts": datetime.fromisoformat(e["date"]),
+        # UTC へ正規化 (store は ISO 文字列比較のため offset 混在を許さない)
+        ts = datetime.fromisoformat(e["date"]).astimezone(timezone.utc)
+        out.append({"ts": ts,
                     "country": e["country"], "name": e["title"],
                     "importance": _IMPACT.get(e.get("impact"), 0),
                     "forecast": e.get("forecast") or None,
