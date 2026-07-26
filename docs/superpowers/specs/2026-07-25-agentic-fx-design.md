@@ -1,6 +1,6 @@
 # agentic-fx 設計書
 
-- 日付: 2026-07-26 (改訂第 8 版 — codex 独立レビュー 19 件反映: ask の発注経路遮断 / 決定論的 position sizing / SL・TP 検証 / 承認時再検証 / plugin サンドボックス / API キー分離ほか)
+- 日付: 2026-07-26 (改訂第 9 版 — codex 再レビュー 12 件反映: 保護注文確認 (protection_pending) / broker 送信の非原子性の明示 / 週末ギャップの表現修正 + リスク率半減 / kill switch ラッチ / autopilot 中の API 制限ほか)
 - ステータス: 承認待ち
 - 前身: `~/project/finance` (IFD 計画型 FX 自動トレードシステム)
 
@@ -18,7 +18,7 @@ agentic-fx はこれを **agent loop 型**に置き換える。LLM agent が「�
 - Claude 利用の課金実態 (2026-07 時点): `claude -p` / Agent SDK とも月次 Agent SDK クレジット枠から消費される。**usage credits (追加課金) は有効にしない** — クレジット枯渇時は ClaudeRunner が停止するだけで、従量課金は構造的に発生しない。枯渇時も local への自動フォールバックはしない (挙動を予測可能に保つ)
 - 両 loop とも LLM バックエンドは config で `local` / `claude` に切り替え可能。デフォルトは両方 `local`。稼働中の切替 (runner / ローカルモデル) は `model` コマンド (§8、一覧から番号選択式) でも行える
 - 戦略改善 loop の変更採用は**必ず人間承認**を通す (トラック別のゲートは §6)
-- LLM ができるのは open / close / cancel の**提案** (TradeIntent) まで。**執行・注文数量 (position sizing)・SL/TP 管理・資金保護は決定論的コードが握る**。資金保護クローズ (SL/TP・day 期限・kill switch) は決定論的トリガーのみ。裁量クローズと未約定指値の取消は LLM 提案を決定論的検証の上で実行する (エクスポージャー縮小方向のため)
+- LLM ができるのは open / close / cancel の**提案** (TradeIntent) まで。**執行・注文数量 (position sizing)・SL/TP 管理・資金保護は決定論的コードが握る**。資金保護クローズ (SL/TP・day 期限) は決定論的トリガーのみ (kill switch は新規停止であってクローズはしない — §5 Risk Gate)。裁量クローズと未約定指値の取消は LLM 提案を決定論的検証の上で実行する (エクスポージャー縮小方向のため)
 - **取引モード (実資金) の新規発注は、初期は Discord/CLI の人間承認を最終ゲートとする**。成績実績を確認した上で、人間の明示操作 (`autopilot on`) でのみ自動発注へ移行できる — 最終目標は自動発注。切替は config 編集では不可 (明示コマンドのみ)、kill switch 等の risk gate は自動発注時も常時有効
 - GitHub 公開を前提とする (秘密情報は `.env` / gitignore 管理)。LLM が生成する plugin はユーザーごとに異なるため gitignore する
 - 前身リポジトリの実証済み部品は「agent のツール」として移植する。判断系 (orchestrator / planner / IFD / signal_combiner) は移植しない
@@ -171,7 +171,7 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 
 - **発注方式はハイブリッド**: `market` は即時発注、`limit` は有効期限付き指値。IFD 的な条件監視ループは作らない
 - `limit_price` / `expires_in` は `entry_type: limit` のみ。`expires_in` の上限は 24h。期限切れは scheduler が決定論的に自動取消
-- **トレード時間軸 (`horizon`) は agent が判断する** (open 時必須)。`day` = 当日決済想定 / `swing` = 数日保有想定。orders に保存し、状態サマリ・成績集計・reflection で horizon 別に扱う。決定論的な扱いの差: `day` は日次ロールオーバー (NY 17:00 クローズ) 前に scheduler が強制クローズ (FX は 24 時間市場のため「当日」の境界をロールオーバーで定義する)、`swing` は持ち越し可。**週末ギャップは SL では防げない** (ギャップで指定価格より不利に約定し得る) ため、損失の上限は position sizing の 1 取引リスク上限で管理し、金曜終盤の新規 swing 建ては制限する (時間帯は config)。SL 幅・TP の妥当性判断は horizon を踏まえて agent が行う
+- **トレード時間軸 (`horizon`) は agent が判断する** (open 時必須)。`day` = 当日決済想定 / `swing` = 数日保有想定。orders に保存し、状態サマリ・成績集計・reflection で horizon 別に扱う。決定論的な扱いの差: `day` は日次ロールオーバー (NY 17:00 クローズ) 前に scheduler が強制クローズ (FX は 24 時間市場のため「当日」の境界をロールオーバーで定義する)、`swing` は持ち越し可。**週末ギャップは SL では防げない** (ギャップで指定価格より不利に約定し得る)。1 取引リスク上限は**通常約定時の想定リスクであり、ギャップ時の損失上限を保証しない**ことを明記する。決定論的なギャップリスク規則: **週末を持ち越すポジションは 1 取引リスク率を半減 (config) して sizing** し、金曜終盤の新規 swing 建ては制限する (時間帯は config)。SL 幅・TP の妥当性判断は horizon を踏まえて agent が行う
 - `stop_loss` は open 時必須。SL/TP は発注時にブローカー (ペーパー / MT5) 側に添付して管理する
 - `close` / `cancel` は対象を `order_id` で指定する (状態サマリに ID を含めて提示する)
 - `cancel` は未約定指値の取消 (資金リスクゼロのため LLM に許可)。**約定済みポジションの SL/TP 変更は LLM 不可** (決定論的な資金保護のみが変更できる)
@@ -180,7 +180,7 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 
 ### Position Sizing (決定論的、LLM の外)
 
-注文数量は決定論的に算出する: `数量 = 口座エクイティ × 1 取引リスク率 (初期 0.5%) ÷ SL 距離` を pip value・口座通貨換算した上で、broker の最小/最大 lot・lot step に丸める。算出に必要な値 (価格・エクイティ・pip value) が欠けている場合は **fail closed** (発注しない)。SL があっても数量が未定義では過大損失が可能になるため、サイジング自体を資金保護の一部としてコアに置く。
+注文数量は決定論的に算出する: `数量 = 口座エクイティ × 1 取引リスク率 (初期 0.5%) ÷ SL 距離` を pip value・口座通貨換算した上で、broker の lot step に**切下げのみで丸める** (リスクを超えない方向。四捨五入・切上げ禁止)。リスク額には spread・想定 slippage・手数料を含める (config)。丸め後の数量で損失額を再計算し、上限以下であることを最終検証する。**算出量が最小 lot 未満なら発注拒否**。算出に必要な値 (価格・エクイティ・pip value) が欠けている場合は **fail closed** (発注しない)。SL があっても数量が未定義では過大損失が可能になるため、サイジング自体を資金保護の一部としてコアに置く。
 
 ### Risk Gate (決定論的、LLM の外)
 
@@ -200,15 +200,19 @@ TradeIntent は発注前に全ルールを通過しなければならない。1 
 | 指値期限上限 | expires_in > 24h は却下 |
 
 - `market` の entry 価格は判断時点でなく**発注直前の最新 bid/ask で再計算**する。RR・SL 検証も再計算後の値で行い、判断時点から許容スリッページ (config) を超えて動いていたら失効させる
+- **kill switch の HWM 定義**: HWM は**入出金調整済みエクイティ** (unrealized 込み) で計算する (入金は HWM に加算、出金は減算 — 入金が利益扱い、出金がドローダウン扱いになるのを防ぐ)。snapshot 更新は原子的に行い、再起動時は保存済み HWM を復元する。**発火はラッチ** (条件が戻っても自動解除しない): 解除は人間の明示操作 (対話シェルの専用コマンド) のみ。kill switch の発火動作は**新規停止のみ**で、既存ポジションはクローズせず SL/TP 監視を継続する
+- 日次損失の日初エクイティも入出金調整を同様に適用する
 - kill switch・日次損失の判定に使う account_snapshots が欠損・陳腐化している場合は **fail closed** (新規停止)
 
 ### Executor と取引モードの承認ゲート
 
 - Phase 1 は学習モード (ペーパー取引) のみ (前身の PositionManager 簡素版 + SQLite `orders` 状態機械)。学習モードでは risk gate 通過後に自動でペーパー発注する
-- **ペーパー約定規則**: 現在値のスナップショットではなく **1 分足の high/low で到達判定**する (ポーリング間の水準通過を見逃さないため)。同一バーで SL と TP の両方に到達した場合は**保守的に SL 約定**とする。約定価格は spread を考慮し、ギャップ時の SL はギャップ後の価格で約定させる (実勢の滑りを再現し、成績評価の歪みを防ぐ)
+- **ペーパー約定規則**: 現在値のスナップショットではなく **1 分足の high/low で到達判定**する (ポーリング間の水準通過を見逃さないため)。同一バーで SL と TP の両方に到達した場合は**保守的に SL 約定**とする。指値エントリーと SL/TP が同一バー内で成立し得る場合など、OHLC から順序を判定できないときも**最悪結果 (SL 約定) を採用**する。約定価格は spread を考慮し、ギャップ時の SL はギャップ後の価格で約定させる (実勢の滑りを再現し、成績評価の歪みを防ぐ)
 - MT5 の発注系接続は Phase 3。取引モードへの切替は config ではなく **`main.py mode trading` (人間の明示操作)** でのみ行う
 - **取引モードの手動承認ゲート (Phase 3、初期状態)**: risk gate を通過した open intent は `approval_requests` (kind=live_trade) に登録され、**人間の承認 (Discord ボタン or CLI) が下りるまで発注しない**。expires_at (指値は指値期限、market は 15 分) を過ぎると自動 expired となり発注しない。close / cancel は資金保護方向の操作なので承認不要で即時実行する
-- **承認時の再検証と原子的執行 (TOCTOU 対策)**: 承認までの間に価格・残高・kill switch 状態が変わり得るため、承認 POST は単なる status 更新ではなく、サービス内の単一トランザクション (排他区間) で ①pending・未失効の compare-and-set ②mode / autopilot / kill switch / 口座・ポジション状態の再取得 ③**最新 bid/ask で Risk Gate 全ルール + position sizing を再実行** ④合格時のみ 1 回だけ broker へ送信 ⑤broker order ID を保存して終端遷移 — を行う。再検証に失敗した場合は `invalidated` として理由を記録する (approved にしない)
+- **承認時の再検証 (TOCTOU 対策)**: 承認までの間に価格・残高・kill switch 状態が変わり得るため、承認 POST は単なる status 更新ではなく、サービス内の排他区間で ①pending・未失効の compare-and-set ②mode / autopilot / kill switch / 口座・ポジション状態の再取得 ③**最新 bid/ask で Risk Gate 全ルール + position sizing を再実行** — を行い、再検証に失敗した場合は `invalidated` として理由を記録する (approved にしない)
+- **broker 送信は DB トランザクションと原子化できない**前提で 2 段階に分ける: 再検証合格後、①**送信前に client_order_id (冪等キー) を永続化** (`submitting`) ②broker へ 1 回だけ送信。応答タイムアウト・結果不明・DB 保存失敗は**再送せず `submit_unknown`** とし、注文履歴・建玉の照合 (reconcile) で解決する。reconcile は再起動時に加えて**稼働中も定期実行** (毎分) し、**未解決の submit_unknown がある間は同一 intent の再送と新規発注を停止**する
+- **保護注文の確認 (SL/TP 添付失敗対策)**: broker が注文本体を受理しても SL/TP 設定だけ失敗・不明になり得る (MT5 は注文と建玉が別 ID)。約定後は注文・建玉・SL/TP を照合し、**保護の確認が取れるまで `open` にしない** (`protection_pending`)。SL 設定の失敗・欠落は即時再設定をリトライし、リトライ失敗時は**決定論的に緊急クローズ + 通知** — SL なしの実ポジションを存在させない
 - **自動発注への段階移行 (最終目標)**: 手動承認での成績実績を確認した上で、対話シェルの `autopilot on` (確認プロンプト付き、**API には載せない**) で承認ゲートを外し、risk gate 通過後に自動発注する。`autopilot off` でいつでも手動承認に戻せる。切替は activity ログに記録し Discord に必ず通知する。**config 編集では切替できない** (状態は `data/state/` 管理、§3)。自動発注時も risk gate・kill switch・日次損失上限は全件通過必須
 
 ## 6. 戦略改善 loop
@@ -246,8 +250,9 @@ news_sources: id, name, fetcher (feed | web), url,
   - `config.yaml` — テクニカル分析パラメータの既定値 (期間・閾値等)。**ユーザーがコードを触らずにパラメータ調整できる**ようにするため
   - `test_indicator.py` — テスト同梱必須
 - インターフェースは意図的に極小、かつ**純関数に限定** (I/O・外部アクセス禁止): `Indicator.compute(df, params) -> dict`。`params` は plugin_loader が `config.yaml` を読み込んで渡す。qwen3.6 クラスの実装力でも品質が安定し、テストが決定論的になる粒度にする
-- `tools/plugin_loader.py` が起動時にフォルダを discover し、**pytest 合格 + 承認済み** (approval_requests で approved) のもののみレジストリに登録。config.yaml のみの変更 (パラメータ調整) は再承認不要 (コードが変わらないため)
-- **サンドボックス実行**: 「純関数・I/O 禁止」は規約だけでは強制できない (import 時の任意コード実行を pytest では防げない) ため、plugin は**サービスプロセスに直接 import せずサブプロセスで実行**し、入力 (OHLCV DataFrame) と出力 (JSON) だけを IPC で渡す。ロード時に **AST 検査 + import allowlist** (numpy / pandas / math 等の計算系のみ) で禁止 import を拒否し、実行時はタイムアウト・出力サイズ制限を課す。ネットワーク・秘密情報・`data/state/`・broker 資格情報へは構造的に到達させない
+- `tools/plugin_loader.py` が起動時にフォルダを discover し、**pytest 合格 + 承認済み** (approval_requests で approved) のもののみレジストリに登録。承認は indicator.py + config.yaml の**内容ハッシュに対して**行う
+- config.yaml の再承認免除は**人間がローカルで明示的に編集した場合のみ**。**agent による config.yaml 変更はコード変更と同様に approval 対象**とし、戦略採用ゲート (下記) を通す — パラメータ変更は戦略結果を直接変えるため、承認迂回経路にしない
+- **サンドボックス実行**: 「純関数・I/O 禁止」は規約だけでは強制できない (import 時の任意コード実行を pytest では防げない) ため、plugin は**サービスプロセスに直接 import せずサブプロセスで実行**し、入力 (OHLCV DataFrame) と出力 (JSON) だけを IPC で渡す。ロード時に **AST 検査 + import allowlist** (numpy / pandas / math 等の計算系のみ) で禁止 import を拒否する。サブプロセスには**最小限の環境変数のみ渡し (秘密情報・broker 資格情報は渡さない)**、作業ディレクトリを限定し、CPU 時間・メモリ・プロセス数を resource limit で制限、タイムアウト・出力サイズ制限を課す。これらは**到達を最小化する多層防御であり完全な隔離の保証ではない** — だからこそ plugin の採用には人間承認を必須とする
 - 素の clone でも動くよう、組み込みデフォルト実装 (基本指標 + 基本ニュースソース数件の `news_sources` 初期データ) は `src/` 側にコミットする
 - サンプル plugin を `docs/examples/plugins/` にコミットし、LLM のリサーチ→実装時の参照テンプレートにする
 
@@ -324,6 +329,7 @@ reason, decided_by, decided_at, message_id, expires_at, created_at
 
 - `X-API-Key` 認証 (finance 方式踏襲)。ただし**キーは 2 段に分離**する: **operator キー** (閲覧・ask・policy・backlog・news・model・tech_plugin / news_source の承認) と **approver キー** (live_trade の承認/却下のみ)。単一キーの漏洩で実発注の承認まで通ることを防ぐ。`decided_by` はリクエスト本文でなく**認証主体から生成**する (本文の自己申告を信用しない)
 - API の bind は**デフォルト localhost のみ**。外部公開する場合は reverse proxy + TLS を前提とする (ドキュメントに明記)
+- **autopilot 中の追加制限**: trading + autopilot on の間は `POST /policy` / `POST /model` を拒否する (ホスト上の対話シェルのみ許可)。operator キー漏洩時に方針・判断モデルの変更で次周期から人間承認なしの実発注を誘導する経路を閉じるため
 - **載せない一線**: 発注操作・risk gate 等の資金関連設定の変更・モード切替 (`mode`)・自動発注切替 (`autopilot`)・サービス停止。金を動かす経路と重大操作はホスト上の明示操作のみ
 - Mission 実行 (`/ask`) も含め、**Mission を実行するのは常にサービスプロセスだけ**。排他制御はプロセス内の Mission スロットで完結する (クロスプロセスロックは不要)
 
@@ -509,7 +515,7 @@ agentic-fx/
 | `ohlcv` | 価格データ (symbol, interval, bar_time, OHLCV)。前身と同形 |
 | `missions` | 全 Mission 実行記録 (loop 種別, runner, status, output_json, transcript_json) |
 | `trade_intents` | LLM の全出力 + risk gate 判定 (accepted / rejected + 却下理由) |
-| `orders` | ポジション/指値の状態機械 (下記)。主要カラム: intent_id (FK), approval_id (FK, 取引モード手動承認時), entry_type, horizon (day/swing), **quantity** (sizing 算出値), SL/TP, requested_price / fill_price / close_price, fees_swap, **broker_order_id / broker_position_id** (MT5 では注文と建玉が別 ID になり得る), realized_pnl, close_reason, created_at / updated_at / filled_at / closed_at |
+| `orders` | ポジション/指値の状態機械 (下記)。主要カラム: intent_id (FK), approval_id (FK, 取引モード手動承認時), **client_order_id** (送信前に永続化する冪等キー), entry_type, horizon (day/swing), **quantity / filled_quantity / remaining_quantity / avg_fill_price** (部分約定対応), SL/TP, requested_price / close_price, fees_swap, **broker_order_id / broker_position_id** (MT5 では注文と建玉が別 ID になり得る), broker_synced_at (reconcile 最終照合時刻), realized_pnl, close_reason, created_at / updated_at / filled_at / closed_at |
 | `reflections` | トレード振り返り (order_id 主キー。前身から簡素化) |
 | `account_snapshots` | 残高・エクイティ推移 (kill switch 判定と成績レポートの根拠) |
 | `improvement_backlog` | 改善アイデア (source: user/agent/research, status: open/selected/done/rejected) |
@@ -521,15 +527,23 @@ agentic-fx/
 **orders の状態遷移** (approval のライフサイクルと broker のライフサイクルを混同しない):
 
 ```
-approval_pending → submitting → submitted → open → closing → closed
-       │               │            │                  └→ (SL/TP/強制クローズも同経路)
-       │               │            └→ (指値) pending_fill → open / expired / cancelled
-       │               └→ submit_unknown (送信結果不明 — 再起動時 reconcile で解決)
+approval_pending → submitting → submitted ─┬ (market) ──────────→ protection_pending → open
+       │               │                   └ (指値) pending_fill ──┘   │
+       │               │                        ├→ expired              └→ (保護確認失敗) 緊急クローズ → closing
+       │               │                        └→ cancelling → cancelled / cancel_unknown
+       │               ├→ rejected (broker 拒否)
+       │               └→ submit_unknown (送信結果不明)
        └→ rejected / expired / invalidated
+
+open → closing → closed
+         └→ close_unknown (クローズ結果不明 — closed 扱いにしない)
 ```
 
 - 学習モード・autopilot では approval_pending をスキップして submitting から始まる
-- 各遷移の主体は決定論的コア。broker 送信は冪等キー付きで 1 回だけ。**submit_unknown** (送信後に応答不明・DB 保存失敗等) は再起動時に broker 照会で reconcile する
+- **`protection_pending`**: 約定後、注文・建玉・SL/TP の照合確認が取れるまで `open` にしない (§5)。SL 再設定リトライ失敗は決定論的に緊急クローズ + 通知
+- **部分約定**: filled_quantity / remaining_quantity を保存。残数量は取消し、約定分は保護確認の上 open として扱う
+- **クローズ・取消の失敗/結果不明** (`close_unknown` / `cancel_unknown`) はシステム上 closed / cancelled にせず、再試行 + reconcile + 通知で解決するまで保持する
+- 各遷移の主体は決定論的コア。broker 送信は client_order_id (冪等キー) を**送信前に永続化**した上で 1 回だけ。**reconcile は再起動時 + 稼働中の定期実行 (毎分)** で broker 照会し、**未解決の `*_unknown` がある間は新規発注を停止**する
 - 「価格が来たら入る」予約 = `pending_fill` (期限付き指値)。旧 `trade_plans` に相当するテーブルは**意図的に持たない** (IFD 計画型の廃止に伴う): LLM の判断内容 = `trade_intents`、予約 = `orders.pending_fill`、実発注の承認待ち = `approval_requests` (kind=live_trade)
 
 ### ChromaDB (`data/rag/`、前身 4 コレクション → 2 コレクション)
@@ -580,6 +594,8 @@ activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 �
 - position sizing は境界値 (最小/最大 lot・step 丸め・算出不能時の fail closed) をテーブルテスト
 - **ask Mission の出力から intent が執行されないこと** (origin 検証) をテスト
 - live_trade の**承認時再検証** (価格変動で invalidated になるケース・二重承認拒否) をテスト
+- orders 状態機械の異常系をテスト: `submit_unknown` / `cancel_unknown` / `close_unknown` の reconcile 解決、未解決中の新規発注停止、`protection_pending` で SL 設定失敗 → 緊急クローズ、部分約定の残数量取消
+- kill switch の HWM 入出金調整・発火ラッチ (自動解除しないこと)・人間の明示リセットをテスト
 - データ健全性検証 (鮮度・連続性・異常値) と全ソース不健全時の fail closed をテスト
 - 指値のペーパー約定判定・期限切れ取消・approval expires・day ポジションの強制クローズ・市場クローズ中の処理停止 (ニュース収集のみ継続) はクロックモックでテスト
 - 稼働モード・autopilot の状態遷移は「config 編集では切り替わらない」「明示コマンドのみ」を含めてテスト
