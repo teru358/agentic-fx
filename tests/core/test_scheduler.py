@@ -362,3 +362,86 @@ def test_mark_to_market_skips_snapshot_on_stale_bar_but_tick_continues(tmp_path)
     assert "snapshot_stale_bar_skip" in (env.tmp_path / "a.log").read_text(
         encoding="utf-8")
     assert orders.get(env.conn, oid)["status"] == "open"  # tick 自体は継続
+
+
+# --- レビュー修正 (codex 1): 口座 snapshot 陳腐化時に指値を約定させない ---
+
+def test_pending_fill_not_processed_when_account_snapshot_unknown(tmp_path):
+    """current_account が陳腐化/欠損 (別ペアのバー欠落で mark_to_market の
+    snapshot 記録がずっとスキップされ続け、最後の snapshot が 10 分の陳腐化
+    チェックを超過するケース) の場合、_maintain_reservations が何もしない
+    だけでは不十分 — 総リスク・レバレッジを再検証できない状態で pending_fill
+    が約定してしまう (fail-open)。全 pending_fill を取消し、その tick の
+    fills 処理をスキップしなければならない。"""
+    env = Env(tmp_path)
+    # 別ペア (EURUSD) の open ポジションを直接挿入。このペアのバーは一度も
+    # 与えないため、mark_to_market は毎 tick 陳腐化スキップし続け、
+    # snapshot (Env.__init__ 時点の WED) が更新されないまま 10 分の陳腐化
+    # チェックを超過する
+    orders.insert(env.conn, pair="EURUSD", direction="long",
+                 entry_type="market", horizon="swing", status="open",
+                 now=WED, quantity=0.1, avg_fill_price=1.1000,
+                 stop_loss=1.0960, take_profit=1.1120)
+    oid = env.place_limit()  # USDJPY entry=148.20
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=11),
+                             148.30, 148.35, 148.15, 148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=11))
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "cancelled"
+    assert row["close_reason"] == "account_unknown"
+    assert "account_unknown" in (env.tmp_path / "a.log").read_text(
+        encoding="utf-8")
+
+
+# --- レビュー修正 (codex 3): day 強制決済は注文毎の期限で毎 tick 再試行 ---
+
+def test_day_forced_close_retries_past_rollover_after_quote_recovers(tmp_path):
+    """20:55-20:59 に quote 障害が続き 21:00 を過ぎると、旧実装は
+    next_rollover(now) が翌日を返すため day 強制決済の対象から外れてしまい、
+    day ポジションが約 24 時間 (金曜なら週末) 残ってしまっていた。注文毎の
+    期限 (filled_at 基準の next_rollover) で判定すれば、期限を過ぎた後も
+    quote が復旧し次第、毎 tick 再試行される。"""
+    def bad_quote(pair):
+        raise RuntimeError("quote down")
+
+    env = Env(tmp_path)
+    oid = env.place_limit()
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                             148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=1))  # fill (filled_at ≈ WED+1min)
+    env.executor.quote_fn = bad_quote
+    near_close = WED.replace(hour=20, minute=57)
+    env.sched.tick(near_close)  # quote 障害で延期
+    assert orders.get(env.conn, oid)["status"] == "open"
+
+    env.executor.quote_fn = lambda p: QUOTE  # quote 復旧
+    after_rollover = WED.replace(hour=21, minute=30)  # 期限 (21:00) を過ぎている
+    env.sched.tick(after_rollover)
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "closed"
+    assert row["close_reason"] == "day_rollover"
+
+
+# --- レビュー修正 (codex 4): reconcile は message="not_found" のときだけ終端化 ---
+
+def test_reconcile_does_not_finalize_when_broker_reports_still_exists(tmp_path):
+    from agentic_fx.core.contracts import BrokerResult
+
+    env = Env(tmp_path)
+    oid = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="cancel_unknown", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8)
+    # 将来の broker が「照会成功・注文はまだ存在する」を ok で返すケースの再現
+    env.executor.broker.reconcile = lambda row: BrokerResult(
+        status="ok", message="still_open")
+    env.sched.tick(WED)
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "cancel_unknown"  # status=="ok" だけでは終端化しない
+    assert has_unresolved_unknown(env.conn)
+
+    # message == "not_found" になれば次 tick で終端化される
+    env.executor.broker.reconcile = lambda row: BrokerResult(
+        status="ok", message="not_found")
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert orders.get(env.conn, oid)["status"] == "cancelled"

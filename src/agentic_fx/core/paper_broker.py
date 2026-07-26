@@ -51,6 +51,19 @@ class PaperBroker:
         return BrokerResult(status="ok")
 
     def reconcile(self, order_row: dict) -> BrokerResult:
-        """unknown 状態の照会。paper は常に「注文なし = 取消済み扱い」を返す。
-        Phase 3 の Mt5Broker は注文履歴・建玉を照会して真の状態を返す。"""
+        """unknown 状態の照会。paper は常に「注文なし = 取消済み扱い」を返す
+        (`status="ok", message="not_found"`)。
+
+        レビュー修正 (codex 4): 呼び出し側 (`scheduler._resolve_unknowns`) は
+        `status == "ok" かつ message == "not_found"` のときだけ終端状態
+        (rejected/cancelled) へ変換する。`status == "ok"` だけを見て終端化
+        すると、将来の実装が「照会成功・注文はまだ存在する」を `ok` で返した
+        場合に、実注文が残っているのに DB を終端にしてしまう。
+
+        Phase 3 の Mt5Broker は本物の照会結果を `message` で表現する必要が
+        ある (例: "not_found" / それ以外は再試行対象として扱われる)。将来的
+        には構造化された reconcile 結果型 (not_found / pending / filled /
+        open / closed / cancelled、数量、価格、broker ID、保護状態) を
+        導入すべきだが、それは Phase 3 のスコープとする。
+        """
         return BrokerResult(status="ok", message="not_found")

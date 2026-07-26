@@ -75,9 +75,19 @@ class Scheduler:
             return
         self._resolve_unknowns(now)
         self._expire_limits(now)
-        self._maintain_reservations(now)
+        # codex 1: account snapshot が陳腐化/欠損 (current_account が None) の
+        # 場合、総リスク・レバレッジを再検証できない。_maintain_reservations
+        # が何もせず戻るだけでは、同じ tick で _process_fills が新たな建玉を
+        # 生んでしまう (fail-open)。account が不明なら全 pending_fill を
+        # 取消し、この tick の fills 処理はスキップする。
+        account = accounting.current_account(self.conn, now)
+        if account is None:
+            self._cancel_pending_for_unknown_account(now)
+        else:
+            self._maintain_reservations(now, account)
         self._force_close_day(now)
-        self._process_fills(now)
+        if account is not None:
+            self._process_fills(now)
         if self._last_trade is None or now - self._last_trade >= timedelta(hours=1):
             self._last_trade = now
             self.on_trade_mission()
@@ -139,13 +149,23 @@ class Scheduler:
         for row in orders.list_by_status(self.conn, S.SUBMIT_UNKNOWN,
                                          S.CANCEL_UNKNOWN, S.CLOSE_UNKNOWN):
             br = self.executor.broker.reconcile(row)
-            if br.status != "ok":
-                continue  # まだ不明 — 新規発注停止は gate が継続
-            to = resolution[row["status"]]
-            transitions.transition(self.conn, row["id"], to, now)
-            self.activity.write(Category.TRADE, "unknown_resolved",
-                                f"#{row['id']} -> {to.value}",
-                                ref_id=str(row["id"]))
+            # codex 4: 終端 (rejected/cancelled) への変換は、broker が
+            # 「注文なし」と明言した (status=="ok" かつ message=="not_found")
+            # ときだけ行う。status=="ok" だけで終端化すると、将来の broker が
+            # 「照会成功・注文はまだ存在する」を ok で返した場合に、実注文が
+            # 残っているのに DB を終端にしてしまう。
+            if br.status == "ok" and br.message == "not_found":
+                to = resolution[row["status"]]
+                transitions.transition(self.conn, row["id"], to, now)
+                self.activity.write(Category.TRADE, "unknown_resolved",
+                                    f"#{row['id']} -> {to.value}",
+                                    ref_id=str(row["id"]))
+            else:
+                self.activity.write(
+                    Category.TRADE, "reconcile_pending",
+                    f"#{row['id']}: status={br.status} "
+                    f"message={br.message!r} — 次 tick 再試行",
+                    ref_id=str(row["id"]))
         # レビュー修正 2: CLOSING (今 tick 新規に遷移したものも、過去 tick から
         # quote 障害等で滞留しているものも含む) を毎 tick 再走査し、quote が
         # 復旧次第クローズを完結させる。executor._UNKNOWN 側にも CLOSING を
@@ -205,11 +225,23 @@ class Scheduler:
                     transitions.transition(self.conn, row["id"],
                                            S.CANCEL_UNKNOWN, now)
 
-    def _maintain_reservations(self, now: datetime) -> None:
+    def _cancel_pending_for_unknown_account(self, now: datetime) -> None:
+        """codex 1: current_account が陳腐化/欠損している場合、総リスク・
+        レバレッジを再検証できないまま指値を約定させるのは fail-open。
+        全 pending_fill を取消し (取消結果が cancel_unknown になったものは
+        そのまま新規発注停止に接続される)、この tick は約定処理をしない。"""
+        pending = orders.list_by_status(self.conn, S.PENDING_FILL)
+        if pending:
+            self.activity.write(
+                Category.SYSTEM, "account_unknown_cancel_pending",
+                f"{len(pending)} 件の pending_fill を取消 "
+                "(口座 snapshot が陳腐化/欠損 — 総リスク再検証不能)")
+        for row in pending:
+            self.executor.cancel_order(row, reason="account_unknown")
+
+    def _maintain_reservations(self, now: datetime,
+                               account: tuple[float, float]) -> None:
         """口座変動で維持できなくなった指値予約を約定前に取消す (設計書 §5)。"""
-        account = accounting.current_account(self.conn, now)
-        if account is None:
-            return  # 発注側の fail closed に委ねる
         equity, _ = account
         if equity <= 0:
             # レビュー修正 6: equity<=0 だと notional/equity がゼロ除算になる。
@@ -230,10 +262,20 @@ class Scheduler:
             self.executor.cancel_order(newest, reason="reservation")
 
     def _force_close_day(self, now: datetime) -> None:
-        if market_hours.next_rollover(now) - now > _DAY_CLOSE_BUFFER:
-            return
+        """codex 3: 期限は注文毎に (filled_at 起点の next_rollover で) 導出
+        する。tick 全体の「次の rollover まで 5 分以内」だけを条件にすると、
+        20:55-20:59 に quote 障害が続き 21:00 を過ぎた途端に
+        next_rollover(now) が翌日を指してしまい、day ポジションが対象から
+        外れて約 24 時間 (金曜なら週末) 残ってしまう。注文毎の期限を過ぎた
+        後もこの条件は真であり続けるため、quote が復旧し次第、毎 tick
+        再試行される。quote 取得失敗時に架空価格で閉じない挙動は維持する。
+        """
         for row in orders.list_by_status(self.conn, S.OPEN):
             if row["horizon"] != "day":
+                continue
+            anchor = row["filled_at"] or row["created_at"]
+            deadline = market_hours.next_rollover(datetime.fromisoformat(anchor))
+            if now < deadline - _DAY_CLOSE_BUFFER:
                 continue
             try:
                 q = self.executor.quote_fn(row["pair"])
