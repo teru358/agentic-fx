@@ -22,7 +22,11 @@ from agentic_fx.store.state import StateStore
 _EXPOSURE = (S.OPEN, S.PENDING_FILL, S.PROTECTION_PENDING, S.SUBMITTING,
              S.SUBMITTED, S.CLOSING, S.CANCELLING, S.SUBMIT_UNKNOWN,
              S.CANCEL_UNKNOWN, S.CLOSE_UNKNOWN)
-_UNKNOWN = (S.SUBMIT_UNKNOWN, S.CANCEL_UNKNOWN, S.CLOSE_UNKNOWN)
+# レビュー修正 (Task 10 fix 2): CLOSING は「broker 側は close 済みかもしれないが
+# DB 未確定」の状態であり、quote 障害等で滞留しうる。これを「未解決」扱いから
+# 除外すると gate が新規発注を許可し続けてしまうため、SUBMIT/CANCEL/CLOSE の
+# unknown と同じ扱いにする (has_unresolved_unknown に含める)。
+_UNKNOWN = (S.SUBMIT_UNKNOWN, S.CANCEL_UNKNOWN, S.CLOSE_UNKNOWN, S.CLOSING)
 
 
 def open_risk_and_notional(conn: sqlite3.Connection,
