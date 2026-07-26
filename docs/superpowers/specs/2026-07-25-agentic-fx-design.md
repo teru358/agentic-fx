@@ -1,6 +1,6 @@
 # agentic-fx 設計書
 
-- 日付: 2026-07-26 (改訂第 6 版 — main モデルへ変更: main.py 対話シェル付きサービス + client.py 操作クライアント、typer ワンショット CLI 廃止)
+- 日付: 2026-07-26 (改訂第 7 版 — 稼働モード再編 (学習/取引)・自動発注への段階移行・データ取得元・trade 時間軸 (horizon)・tech plugin フォルダ構成ほかレビュー 11 項目反映)
 - ステータス: 承認待ち
 - 前身: `~/project/finance` (IFD 計画型 FX 自動トレードシステム)
 
@@ -16,10 +16,10 @@ agentic-fx はこれを **agent loop 型**に置き換える。LLM agent が「�
 
 - LLM 基盤は**ローカル LLM が基本** (llama-swap, OpenAI 互換 API, :8080)。Claude はサブスクリプション認証でのみ利用可。**Anthropic API (従量課金) は使用しない**
 - Claude 利用の課金実態 (2026-07 時点): `claude -p` / Agent SDK とも月次 Agent SDK クレジット枠から消費される。**usage credits (追加課金) は有効にしない** — クレジット枯渇時は ClaudeRunner が停止するだけで、従量課金は構造的に発生しない。枯渇時も local への自動フォールバックはしない (挙動を予測可能に保つ)
-- 両 loop とも LLM バックエンドは config で `local` / `claude` に切り替え可能。デフォルトは両方 `local`
+- 両 loop とも LLM バックエンドは config で `local` / `claude` に切り替え可能。デフォルトは両方 `local`。稼働中の切替 (runner / ローカルモデル名) は `model` コマンド (§8) でも行える
 - 戦略改善 loop の変更採用は**必ず人間承認**を通す (トラック別のゲートは §6)
 - 発注・クローズ・SL/TP 変更・資金保護は LLM に委ねず、決定論的コードで強制する (例外: 未約定指値の取消のみ LLM に許可 — 資金リスクがゼロのため)
-- **live モードの新規発注は Discord/CLI の人間承認を最終ゲートとする (config で無効化不可)**
+- **取引モード (実資金) の新規発注は、初期は Discord/CLI の人間承認を最終ゲートとする**。成績実績を確認した上で、人間の明示操作 (`autopilot on`) でのみ自動発注へ移行できる — 最終目標は自動発注。切替は config 編集では不可 (明示コマンドのみ)、kill switch 等の risk gate は自動発注時も常時有効
 - GitHub 公開を前提とする (秘密情報は `.env` / gitignore 管理)。LLM が生成する plugin はユーザーごとに異なるため gitignore する
 - 前身リポジトリの実証済み部品は「agent のツール」として移植する。判断系 (orchestrator / planner / IFD / signal_combiner) は移植しない
 
@@ -43,7 +43,19 @@ agentic-fx はこれを **agent loop 型**に置き換える。LLM agent が「�
         (llama-swap)  (Claude Agent SDK, サブスク認証)
 ```
 
-原則: **LLM が自走するのは「判断」と「改善提案」まで**。金を動かす経路 (発注・クローズ・SL/TP 変更) と資金保護は常に決定論的コアが握り、live の新規発注はさらに人間の承認を最終ゲートとする。
+原則: **LLM が自走するのは「判断」と「改善提案」まで**。金を動かす経路 (発注・クローズ・SL/TP 変更) と資金保護は常に決定論的コアが握り、取引モードの新規発注は初期は人間承認をゲートとする (自動発注への移行は人間の明示操作のみ、§5)。
+
+### 稼働モード (前身の paper / shadow / live_test を 2 モードに集約)
+
+前身はモード間の違いが分かりにくかったため、役割の異なる 2 モードに集約する:
+
+| モード | 内容 |
+|---|---|
+| **学習モード** (learning) | ペーパー取引 + 情報蓄積 (ニュース RAG・reflection・成績データ)。初期状態。risk gate 通過後は自動でペーパー発注 |
+| **取引モード** (trading) | 実資金運用 (Phase 3)。発注方式を **手動承認** (Discord/CLI 承認が最終ゲート) ⇔ **自動発注** で切替可能。初期は手動承認、成績実績を確認してから自動へ |
+
+- モード切替は `main.py mode` (サービス停止中の人間の明示操作、§8)。config 編集では切替できない
+- 現在モード・発注方式は settings.yaml ではなく `data/state/` に保存する (config をいじっても実資金運用にならない構造的担保)
 
 ## 4. AgentRunner 抽象層
 
@@ -98,6 +110,7 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 ### 起動と頻度
 
 - 市場オープン中 (前身の `market_hours.py` を移植)、**1 時間毎に必ず実行する**。ポジションがなくても回し、「見送り (hold)」も判断として記録する — hold 判断も成績分析・振り返りのデータになる
+- **市場クローズ中は処理を極力停止する** (前身と同様): 取引判断 loop・価格取得・指値約定監視は止め、**ニュース収集のみ継続**する (econ カレンダー更新もクローズ中に行ってよい)
 - エラー時はスキップして次周期 (リトライしない)。同時実行は常に 1 (agent 実行のグローバル排他)
 - **ワンショットのユーザープロンプト**: main.py 対話シェルまたは client.py の `ask "..."` で**臨時 Mission を即時実行**する (実行は常にサービスプロセス内の排他スロット)。プロンプトはその 1 回だけ Mission に注入され (ワンショット)、結果は呼び出し元と Discord に返す。定期周期には影響しない。永続的な方針にしたい場合は `policy add` を使う
 
@@ -118,6 +131,14 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 - `get_positions()` / `get_account()` — 現在ポジション・残高
 - `get_recent_reflections(pair, n)` / `search_reflections(query)` — 過去トレードの振り返り (意味検索含む)
 
+### データ取得元
+
+| データ | 取得元 |
+|---|---|
+| 取引対象ペアの OHLCV・現在価格 | **MT5 ブリッジ** (リアルタイム)。価格取得は読み取り専用で資金リスクがないため **Phase 1 から接続**する (発注系の接続は Phase 3 のまま)。ブリッジ死活は bridge_health で監視 |
+| 関連指標 (株価指数・金・原油など) | **MT5 に銘柄 (CFD) があるものは MT5 を優先** — リアルタイムで追加依存なし (OANDA MT5 は主要指数・XAUUSD・WTI 等を提供)。**MT5 にないもの** (DXY・米10年債利回り等) は Twelve Data (無料枠、前身でキー取得済み・リアルタイムに近い) を第一候補、**yfinance はタイムラグがあるため最終フォールバック**とする |
+| 経済指標カレンダー | 前身 econ_event_store の移植 |
+
 ### 出力: TradeIntent v2
 
 ```json
@@ -127,6 +148,7 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
   "pair": "USDJPY",
   "direction": "long | short",
   "entry_type": "market | limit",
+  "horizon": "day | swing",
   "limit_price": 148.20,
   "expires_in": "4h",
   "stop_loss": 147.80,
@@ -138,7 +160,8 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 
 - **発注方式はハイブリッド**: `market` は即時発注、`limit` は有効期限付き指値。IFD 的な条件監視ループは作らない
 - `limit_price` / `expires_in` は `entry_type: limit` のみ。`expires_in` の上限は 24h。期限切れは scheduler が決定論的に自動取消
-- `stop_loss` は open 時必須。SL/TP は発注時にブローカー (paper/live) 側に添付して管理する
+- **トレード時間軸 (`horizon`) は agent が判断する** (open 時必須)。`day` = 当日決済想定 / `swing` = 数日保有想定。orders に保存し、状態サマリ・成績集計・reflection で horizon 別に扱う。決定論的な扱いの差: `day` は当日市場クローズ前に強制クローズ (決定論的)、`swing` は持ち越し可 (週末ギャップリスクは SL とkill switch で防御)。SL 幅・TP の妥当性判断は horizon を踏まえて agent が行う
+- `stop_loss` は open 時必須。SL/TP は発注時にブローカー (ペーパー / MT5) 側に添付して管理する
 - `close` / `cancel` は対象を `order_id` で指定する (状態サマリに ID を含めて提示する)
 - `cancel` は未約定指値の取消 (資金リスクゼロのため LLM に許可)。**約定済みポジションの SL/TP 変更は LLM 不可** (決定論的な資金保護のみが変更できる)
 - 次周期の agent は状態サマリで未約定指値を見て、取消/維持も判断できる
@@ -157,11 +180,12 @@ TradeIntent は発注前に全ルールを通過しなければならない。1 
 | limit 乖離上限 | limit_price が現値から 0.5% 超乖離なら却下 (config 可) |
 | 指値期限上限 | expires_in > 24h は却下 |
 
-### Executor と live 承認ゲート
+### Executor と取引モードの承認ゲート
 
-- Phase 1 はペーパー取引のみ (前身の PositionManager 簡素版 + SQLite `orders` 状態機械)。指値のペーパー約定判定は毎分の価格監視で行う。paper モードでは risk gate 通過後に自動発注する
-- MT5 ブリッジは Phase 3 で接続し、live 切替は config ではなく**人間の明示的な CLI 操作**でのみ行う
-- **live モードの最終承認ゲート (Phase 3)**: risk gate を通過した open intent は `approval_requests` (kind=live_trade) に登録され、**人間の承認 (Discord ボタン or CLI) が下りるまで発注しない**。expires_at (指値は指値期限、market は 15 分) を過ぎると自動 expired となり発注しない。このゲートは kill switch と同様 **config で無効化不可**。close / cancel は資金保護方向の操作なので承認不要で即時実行する
+- Phase 1 は学習モード (ペーパー取引) のみ (前身の PositionManager 簡素版 + SQLite `orders` 状態機械)。指値のペーパー約定判定は毎分の価格監視で行う。学習モードでは risk gate 通過後に自動でペーパー発注する
+- MT5 の発注系接続は Phase 3。取引モードへの切替は config ではなく **`main.py mode trading` (人間の明示操作)** でのみ行う
+- **取引モードの手動承認ゲート (Phase 3、初期状態)**: risk gate を通過した open intent は `approval_requests` (kind=live_trade) に登録され、**人間の承認 (Discord ボタン or CLI) が下りるまで発注しない**。expires_at (指値は指値期限、market は 15 分) を過ぎると自動 expired となり発注しない。close / cancel は資金保護方向の操作なので承認不要で即時実行する
+- **自動発注への段階移行 (最終目標)**: 手動承認での成績実績を確認した上で、対話シェルの `autopilot on` (確認プロンプト付き、**API には載せない**) で承認ゲートを外し、risk gate 通過後に自動発注する。`autopilot off` でいつでも手動承認に戻せる。切替は activity ログに記録し Discord に必ず通知する。**config 編集では切替できない** (状態は `data/state/` 管理、§3)。自動発注時も risk gate・kill switch・日次損失上限は全件通過必須
 
 ## 6. 戦略改善 loop
 
@@ -189,12 +213,16 @@ news_sources: id, name, fetcher (feed | web), url,
 
 - 根拠: ①ソース追加はデータ 1 行で機械検証できるが、plugin はコード審査が重い ②新しい取得方式が必要になるのは年数回程度で、news 側に plugin 機構を持つのは YAGNI ③fetcher (HTML 抽出・外部依存) は local LLM が最も失敗しやすいコードであり、コア改善 PR の人間レビューに載せる方が安全
 - 新しい取得方式 (認証付き API 等) が必要になった場合は、コア改善トラック (PR) で fetcher を追加する
+- **ユーザーによる追加コマンド**: `news add <url> [--name]` (§8)。fetcher (feed/web) を自動判定し、機械検証 (URL 到達性・parse 成功・重複) を実行して登録する。`added_by=user` は自分の意思による追加のため**人間承認は不要** (機械検証のみで enabled)。agent 追加は従来通り approval_requests を通す
 
 ### tech plugin 機構
 
-- 配置: `plugins/tech/<name>.py` + **テストファイル (`test_<name>.py`) 同梱必須**
-- インターフェースは意図的に極小、かつ**純関数に限定** (I/O・外部アクセス禁止): `Indicator.compute(df) -> dict`。qwen3.6 クラスの実装力でも品質が安定し、テストが決定論的になる粒度にする
-- `tools/plugin_loader.py` が起動時に discover し、**pytest 合格 + 承認済み** (approval_requests で approved) のもののみレジストリに登録
+- 配置: **1 plugin = 1 フォルダ** `plugins/tech/<name>/`。構成は 3 ファイル:
+  - `indicator.py` — 実装 (純関数)
+  - `config.yaml` — テクニカル分析パラメータの既定値 (期間・閾値等)。**ユーザーがコードを触らずにパラメータ調整できる**ようにするため
+  - `test_indicator.py` — テスト同梱必須
+- インターフェースは意図的に極小、かつ**純関数に限定** (I/O・外部アクセス禁止): `Indicator.compute(df, params) -> dict`。`params` は plugin_loader が `config.yaml` を読み込んで渡す。qwen3.6 クラスの実装力でも品質が安定し、テストが決定論的になる粒度にする
+- `tools/plugin_loader.py` が起動時にフォルダを discover し、**pytest 合格 + 承認済み** (approval_requests で approved) のもののみレジストリに登録。config.yaml のみの変更 (パラメータ調整) は再承認不要 (コードが変わらないため)
 - 素の clone でも動くよう、組み込みデフォルト実装 (基本指標 + 基本ニュースソース数件の `news_sources` 初期データ) は `src/` 側にコミットする
 - サンプル plugin を `docs/examples/plugins/` にコミットし、LLM のリサーチ→実装時の参照テンプレートにする
 
@@ -239,7 +267,7 @@ reason, decided_by, decided_at, message_id, expires_at, created_at
 
 - `kind=tech_plugin`: 改善ループが plugin を書いたら発行。payload は plugin パス・要約・テスト結果。承認されるまでロードされない
 - `kind=news_source`: ニュースソース追加。payload はソース情報 + 機械検証結果 (URL 到達性・parse 成功・取得サンプル)。承認されるまで `news_sources.enabled` にならない
-- `kind=live_trade` (Phase 3): live モードの open intent。payload は TradeIntent 全体。expires_at 超過で自動 expired
+- `kind=live_trade` (Phase 3): 取引モード (手動承認時) の open intent。payload は TradeIntent 全体。expires_at 超過で自動 expired。autopilot on の間は発行されない (§5)
 - 決定の反映は冪等 (二重承認は 409 相当で拒否)
 
 ### 操作 REST API (FastAPI)
@@ -257,9 +285,11 @@ reason, decided_by, decided_at, message_id, expires_at, created_at
 | `POST /ask` | 臨時 Mission の実行依頼 (実行は常にサービスプロセス内) | client.py |
 | `POST /policy` | 方針書への追記 | client.py |
 | `POST /backlog` | 改善アイデアの投入 | client.py |
+| `POST /news` | news ソース追加 (fetcher 自動判定 + 機械検証、§6) | client.py |
+| `POST /model` | LLM runner / ローカルモデルの切替 (資金と無関係のため API 可) | client.py |
 
 - `X-API-Key` 認証 (finance 方式踏襲)
-- **載せない一線**: 発注操作・risk gate 等の設定変更・`go-live`・サービス停止。金を動かす経路と重大操作はホスト上の明示操作のみ
+- **載せない一線**: 発注操作・risk gate 等の資金関連設定の変更・モード切替 (`mode`)・自動発注切替 (`autopilot`)・サービス停止。金を動かす経路と重大操作はホスト上の明示操作のみ
 - Mission 実行 (`/ask`) も含め、**Mission を実行するのは常にサービスプロセスだけ**。排他制御はプロセス内の Mission スロットで完結する (クロスプロセスロックは不要)
 
 ## 8. エントリポイントと操作体系 (main モデル)
@@ -269,14 +299,13 @@ reason, decided_by, decided_at, message_id, expires_at, created_at
 ### main.py — 対話シェル付きサービス
 
 ```
-uv run main.py              # サービス起動 + スプラッシュ + コマンド受付 (TTY のとき)
-uv run main.py --daemon     # systemd 用: コマンド受付なし (非 TTY 時は自動でこちら)
-uv run main.py init         # 設定ウィザード (サービスは起動しない)
-uv run main.py bootstrap    # 初期構築ウィザード (サービス非起動、--runner claude|local)
-uv run main.py go-live      # live 切替 (Phase 3、人間の明示操作。API には載せない)
+uv run main.py                        # サービス起動 + スプラッシュ + コマンド受付 (TTY のとき)
+uv run main.py --daemon               # systemd 用: コマンド受付なし (非 TTY 時は自動でこちら)
+uv run main.py init                   # 設定ウィザード (唯一のウィザード。サービスは起動しない)
+uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サービス停止中の人間の明示操作。API には載せない)
 ```
 
-- 起動時**スプラッシュ**: mode (paper/live)・対象ペア・runner・risk gate 現行値・承認待ち件数・未約定指値・直近成績サマリを 1 画面表示
+- 起動時**スプラッシュ**: mode (学習/取引)・発注方式 (手動/自動)・対象ペア・runner/モデル・risk gate 現行値・承認待ち件数・未約定指値・直近成績サマリを 1 画面表示。**項目構成は運用しながら調整する** (初期実装は最小でよい)
 - **コマンド受付 (対話シェル)**: プロンプトは常に静かで、ログを勝手に流さない。ログは `log` / `activity` コマンドで**必要なときに引く** (pull 型)
 - `stop` (または Ctrl-C) で **graceful shutdown**: スケジューラ停止 → 実行中 Mission の完了待ち (タイムアウト付き) → 終了。daemon モードの停止は `systemctl stop` の仕事
 - `[project.scripts]` に `afx` として同エントリを登録し、`uv run afx` でも起動可能にする
@@ -290,24 +319,28 @@ uv run main.py go-live      # live 切替 (Phase 3、人間の明示操作。API
 |---|---|
 | `status` | 残高・ポジション・直近 mission・kill switch 状態 |
 | `log [n]` | **技術ログ**の直近 n 行 (表示して終わり。ストリーミングしない) |
-| `activity [n] [news\|tech\|trade\|improve]` | **activity ログ**の直近 n 行 (カテゴリ絞り込み可) |
+| `activity [n] [カテゴリ]` | **activity ログ**の直近 n 行 (カテゴリ絞り込み可、§13) |
 | `ask "..."` | 臨時 Mission (実行は常にサービスプロセス内の排他スロット) |
 | `approve <id>` / `reject <id> [理由]` | 承認操作 |
 | `policy add "..."` | 方針書へ追記 |
 | `improve add "..."` / `backlog` | 改善アイデア投入 / バックログ一覧 |
+| `news add <url> [--name]` / `news list` | ニュース取得対象の追加 (機械検証つき、§6) / 一覧 |
+| `model [trade\|improve] [local\|claude] [モデル名]` | LLM runner / ローカルモデルの表示・切替 |
+| `autopilot on\|off` | 取引モードの自動発注切替 (Phase 3、確認プロンプト付き。**対話シェルのみ**、API には載せない) |
 | `stop` | graceful shutdown (**main.py 対話シェルのみ**。API には載せない) |
 
 ### client.py — 稼働中サービスの操作クライアント
 
 - 操作 API への薄い HTTP クライアント (`X-API-Key`)。`uv run client.py status` のようにワンショット実行し、即終了する
 - **--daemon 運用中の手元操作と、cron・シェルスクリプトからの連携**はこちらが担う (finance で実証済みのパターン)
-- サービス停止中は使えない。停止中に必要な操作は main.py サブコマンド (init / bootstrap / go-live) と、ログファイルの直接閲覧 (`tail logs/activity.log` — txt ベースなのでそのまま読める) でカバーする
+- サービス停止中は使えない。停止中に必要な操作は main.py サブコマンド (init / mode) と、ログファイルの直接閲覧 (`tail logs/activity.log` — txt ベースなのでそのまま読める) でカバーする
 
-### 初期起動フロー
+### 初期起動フロー (ウィザードは init だけ)
 
-1. **`uv run main.py init`** — 設定ウィザード (settings.yaml 生成、DB 初期化、llama-swap / Discord / 価格ソースの接続確認)。完了までサービス起動を拒否。systemd unit 化はユーザーが明示的に行う (ドキュメントのみ提供)
-2. **`uv run main.py bootstrap`** (任意) — 初期構築ウィザード。対話で必要情報を収集 (取引ペア、リスク許容度、関心のあるニュース分野、好みのソース等) し、Mission に整形して改善 loop を手動起動。runner は `claude` / `local` を選択式 (ClaudeRunner = Agent SDK はサブスク認証で利用可能)。成果 (news_sources 追加・tech plugin) は通常の承認フローに乗る
-3. **`uv run main.py`** — サービス開始。bootstrap を省略しても組み込みデフォルト実装 (基本指標 + 基本ニュースソース) で稼働できる
+1. **`uv run main.py init`** — 設定ウィザード (settings.yaml 生成、DB 初期化、稼働モードを学習で初期化、llama-swap / Discord / MT5 ブリッジ・価格ソースの接続確認)。完了までサービス起動を拒否。systemd unit 化はユーザーが明示的に行う (ドキュメントのみ提供)
+2. **`uv run main.py`** — サービス開始。組み込みデフォルト実装 (基本指標 + 基本ニュースソース) でそのまま稼働できる
+
+初期構築 (ニュースソース拡充・指標追加) は専用ウィザードを持たず、**通常チャネルで行う**: `news add` で取得対象を足す、`improve add "..."` でアイデアを投入して `improve` を手動起動する (runner は config / `model` コマンドで claude / local を選択、ClaudeRunner はサブスク認証で利用可能)。成果は通常の承認フローに乗る。
 
 ### ユーザー入力チャネル
 
@@ -315,9 +348,9 @@ uv run main.py go-live      # live 切替 (Phase 3、人間の明示操作。API
 |---|---|---|
 | `policy add "..."` → `policy/directives.md` | 永続的な方針 (例: 「USDJPY は当面見送り」) | 全 Mission に毎回全文注入 (末尾 4000 文字) |
 | `ask "..."` | ワンショットの質問・指示 | 臨時 Mission を即時実行、その 1 回だけ注入 |
-| `improve add "..."` | 改善アイデアの投入 | 次回の改善 loop がバックログから選択 |
-| `main.py bootstrap` | 初期構築の指示・必要情報の入力 | 改善 Mission を即時手動起動 |
-| Discord ボタン / `approve` | tech plugin・news ソース・live 発注の承認 | approval_requests の決定 |
+| `improve add "..."` | 改善アイデアの投入 | 次回の改善 loop がバックログから選択 (`improve` で即時起動も可) |
+| `news add <url>` | ニュース取得対象の追加 | 機械検証後に即 enabled (user 追加は承認不要、§6) |
+| Discord ボタン / `approve` | tech plugin・news ソース (agent 追加)・実発注の承認 | approval_requests の決定 |
 
 `policy/directives.md` はタイムスタンプ付き追記 (削除は手動編集)。サイズ超過時は起動時に警告する。
 
@@ -359,7 +392,7 @@ discord_bot 側の finance cog (gate_cog / gate_ui / client) も再利用資産 
 ```
 agentic-fx/
 ├── pyproject.toml             # [project.scripts] afx = main.py と同エントリ (uv run afx でも起動可)
-├── main.py                    # サービス本体エントリ (対話シェル / --daemon / init / bootstrap / go-live, §8)
+├── main.py                    # サービス本体エントリ (対話シェル / --daemon / init / mode, §8)
 ├── client.py                  # 操作クライアントエントリ (操作 API 経由のワンショット実行, §8)
 ├── config/
 │   ├── settings.yaml.example  # コミット (新規キーは必ず両方同期)
@@ -367,7 +400,7 @@ agentic-fx/
 ├── policy/
 │   └── directives.md          # ユーザー方針 (タイムスタンプ付き追記)
 ├── plugins/                   # gitignore — LLM 生成、ユーザーごとに異なる
-│   └── tech/                  #   Indicator 実装 (純関数) + test_*.py 同梱
+│   └── tech/<name>/           #   1 plugin = 1 フォルダ: indicator.py (純関数) + config.yaml (パラメータ) + test_indicator.py (§6)
 ├── data/                      # gitignore (agentic.db / rag/ / state/)
 ├── reports/                   # 改善 loop の分析レポート
 ├── docs/
@@ -383,9 +416,9 @@ agentic-fx/
 │   ├── logging_setup.py       # 技術ログ (severity → logs/agentic.log + logrotate)
 │   ├── activity.py            # activity ログ (カテゴリ別イベント → logs/activity.log)
 │   ├── core/                  # ── 決定論的コア (LLM を一切 import しない) ──
-│   │   ├── scheduler.py       # 毎時起動・排他スロット・指値期限切れ取消
+│   │   ├── scheduler.py       # 毎時起動・排他スロット・指値期限切れ取消・day 強制クローズ・クローズ中はニュース収集のみ
 │   │   ├── risk_gate.py       # 全ルール (テーブルテスト対象)
-│   │   ├── executor.py        # broker 抽象 + 発注経路 + live 承認ゲート待ち
+│   │   ├── executor.py        # broker 抽象 + 発注経路 + 取引モードの承認ゲート/autopilot 分岐
 │   │   ├── paper_broker.py    # ペーパー約定 (指値判定含む)
 │   │   ├── market_hours.py    # (移植)
 │   │   └── notifier.py        # Discord webhook (移植)
@@ -430,6 +463,7 @@ agentic-fx/
 
 - 設定: `config/settings.yaml` 1 ファイル (gitignore) + `config/settings.yaml.example` (コミット)。前身の 3 分割はしない
 - 秘密情報: `.env` (`DISCORD_WEBHOOK_URL`, `TWELVEDATA_API_KEY`, `AFX_API_KEY` など)
+- **稼働モード・発注方式 (autopilot) は settings.yaml に置かず `data/state/` に保存** (§3 — config 編集では実資金運用・自動発注に切り替わらない構造的担保)
 
 ### SQLite スキーマ (`data/agentic.db`、前身 18 テーブル → 11 テーブルに再設計)
 
@@ -438,7 +472,7 @@ agentic-fx/
 | `ohlcv` | 価格データ (symbol, interval, bar_time, OHLCV)。前身と同形 |
 | `missions` | 全 Mission 実行記録 (loop 種別, runner, status, output_json, transcript_json) |
 | `trade_intents` | LLM の全出力 + risk gate 判定 (accepted / rejected + 却下理由) |
-| `orders` | ポジション/指値の単一状態機械: pending → open → closed / cancelled / expired。entry_type, SL/TP, realized_pnl, close_reason |
+| `orders` | ポジション/指値の単一状態機械: pending → open → closed / cancelled / expired。entry_type, horizon (day/swing), SL/TP, realized_pnl, close_reason |
 | `reflections` | トレード振り返り (order_id 主キー。前身から簡素化) |
 | `account_snapshots` | 残高・エクイティ推移 (kill switch 判定と成績レポートの根拠) |
 | `improvement_backlog` | 改善アイデア (source: user/agent/research, status: open/selected/done/rejected) |
@@ -467,7 +501,19 @@ insights / econ_analyses は廃止。必要になれば改善 loop 自身が PR 
 | 軸 | 内容 | 出力先 | 読者 |
 |---|---|---|---|
 | **技術ログ** | severity (debug / info / warning / error / critical)。例外・接続失敗・リトライ | `logs/agentic.log` (+ journald) | 開発者・障害調査。CLI の通常出力には一切混ぜない |
-| **activity ログ** | カテゴリ別イベント (`news` / `tech` / `trade` / `improve` / `approval` / `system`)。「システムが何をしたか」の構造化 1 行記録 (ts, category, event, summary, ref_id) | `logs/activity.log` | ユーザー。`activity` コマンド (対話シェル / client.py)・`tail -f logs/activity.log`・Discord 通知・`?afx status` はこちらだけを読む |
+| **activity ログ** | カテゴリ別イベント (下表)。「システムが何をしたか」の構造化 1 行記録 (ts, category, event, summary, ref_id) | `logs/activity.log` | ユーザー。`activity` コマンド (対話シェル / client.py)・`tail -f logs/activity.log`・Discord 通知・`?afx status` はこちらだけを読む |
+
+activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 → 執行」に対応させる。運用しながら精査・追加してよい):
+
+| カテゴリ | 内容 |
+|---|---|
+| `NEWS` | ニュース収集・要約・RAG 格納 |
+| `TECH` | テクニカル指標の計算・tech plugin 実行 |
+| `AGGREGATE` | 取引判断 loop の統合判断 (毎時の判断結果・hold 理由・ask の回答) |
+| `TRADE` | 発注・約定・クローズ・期限切れ取消・risk gate 却下 |
+| `IMPROVE` | 改善 loop の活動 (発見・リサーチ・実装・PR/approval 発行) |
+| `APPROVAL` | 承認要求の発行・承認/却下/期限切れ |
+| `SYSTEM` | 起動・停止・モード切替・autopilot 切替・runner/モデル切替 |
 
 ### エラーハンドリング
 
@@ -482,7 +528,8 @@ insights / econ_analyses は廃止。必要になれば改善 loop 自身が PR 
 - **FakeRunner**: 定型 MissionResult を返す AgentRunner 実装。loop 制御・risk gate・executor・policy 注入・ask 差し込みを LLM なしで全件テスト
 - LocalRunner のループ制御は httpx モック (tool_calls 応答系列) でテスト
 - risk gate は全ルール × 境界値のテーブルテスト (limit 乖離・期限上限含む)
-- 指値のペーパー約定判定・期限切れ取消・approval expires はクロックモックでテスト
+- 指値のペーパー約定判定・期限切れ取消・approval expires・day ポジションの強制クローズ・市場クローズ中の処理停止 (ニュース収集のみ継続) はクロックモックでテスト
+- 稼働モード・autopilot の状態遷移は「config 編集では切り替わらない」「明示コマンドのみ」を含めてテスト
 - plugin_loader は「未承認はロードされない」「テスト不合格はロードされない」を含めてテスト
 - news_sources の機械検証 (URL 到達性・parse 成功・重複) は fetcher モックでテスト
 - activity ログはカテゴリ・イベント形式の書き出しをテスト (技術ログと混ざらないこと)
@@ -490,13 +537,13 @@ insights / econ_analyses は廃止。必要になれば改善 loop 自身が PR 
 
 ## 15. 段階導入
 
-- **Phase 1**: 決定論的コア + LocalRunner + 取引判断 loop (ペーパー、ハイブリッド発注) + main.py (スプラッシュ + 対話シェル + init 起動ガード + stop) + ログ 2 軸。ツールは get_ohlcv / get_indicators / search_news / get_positions の最小セット (組み込み実装 + news_sources 初期データのみ)
-- **Phase 2**: ClaudeRunner (Agent SDK) + 戦略改善 loop (バックログ + Web リサーチ) + tech plugin 機構 + news_sources 承認フロー + `bootstrap` + 操作 API + client.py + Discord 承認 (discord_bot 側 cog 含む) + policy チャネル
-- **Phase 3**: MT5 ブリッジ接続 + 資金保護系の本格接続 + live 切替 (`go-live`、人間の明示操作のみ) + live_trade Discord 承認ゲート
+- **Phase 1**: 決定論的コア + LocalRunner + 取引判断 loop (学習モード = ペーパー、ハイブリッド発注、horizon) + MT5 ブリッジの**価格取得のみ**接続 + main.py (スプラッシュ + 対話シェル + init 起動ガード + stop) + ログ 2 軸。ツールは get_ohlcv / get_indicators / search_news / get_positions の最小セット (組み込み実装 + news_sources 初期データのみ)
+- **Phase 2**: ClaudeRunner (Agent SDK) + 戦略改善 loop (バックログ + Web リサーチ) + tech plugin 機構 + news_sources 承認フロー + 操作 API + client.py + `news add` / `model` コマンド + Discord 承認 (discord_bot 側 cog 含む) + policy チャネル
+- **Phase 3**: MT5 の発注系接続 + 資金保護系の本格接続 + 取引モード切替 (`mode trading`、人間の明示操作のみ) + 手動承認ゲート (live_trade) + `autopilot` (自動発注への段階移行)
 
 ## 16. 非スコープ (YAGNI)
 
-- 汎用 REST API サーバー (§7 の操作 API のみ例外として持つ。発注操作・設定変更・go-live・サービス停止のエンドポイントは作らない)
+- 汎用 REST API サーバー (§7 の操作 API のみ例外として持つ。発注操作・資金関連設定の変更・mode / autopilot・サービス停止のエンドポイントは作らない)
 - 対話シェルへのログのストリーミング表示 (旧 client.py の混線の原因。ログ表示は pull 型コマンドと tail で行う)
 - 改善の自動採用 (完全自動マージ / 無承認 plugin ロード)
 - local ⇔ claude の自動フォールバック / エスカレーション
