@@ -116,3 +116,27 @@ def test_order_status_has_all_states():
 def test_fixed_clock():
     dt = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
     assert FixedClock(dt).now() == dt
+
+
+def test_ref_price_defaults_to_none():
+    it = TradeIntent.from_llm_dict(_open_dict(), origin=Origin.SCHEDULER)
+    assert it.ref_price is None
+
+
+def test_ref_price_from_kwarg_not_from_dict():
+    # レビュー修正 (codex 5): ref_price はシステムが供給するキーワード引数で
+    # あり、d に ref_price キーがあっても無視されること
+    it = TradeIntent.from_llm_dict(_open_dict(ref_price=999.0),
+                                   origin=Origin.SCHEDULER, ref_price=148.30)
+    assert it.ref_price == 148.30
+
+
+def test_ref_price_threaded_for_close_and_hold():
+    close_it = TradeIntent.from_llm_dict(
+        {"action": "close", "order_id": 1}, origin=Origin.SCHEDULER,
+        ref_price=148.30)
+    assert close_it.ref_price == 148.30
+    hold_it = TradeIntent.from_llm_dict(
+        {"action": "hold", "reasoning": "x"}, origin=Origin.SCHEDULER,
+        ref_price=148.30)
+    assert hold_it.ref_price == 148.30

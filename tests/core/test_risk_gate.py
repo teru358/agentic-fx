@@ -18,13 +18,14 @@ SPEC = InstrumentSpec(symbol="USDJPY", pip_size=0.01, min_lot=0.01,
 QUOTE = Quote(symbol="USDJPY", bid=148.49, ask=148.51, ts=NOW, source="test")
 
 
-def _intent(**over):
+def _intent(ref_price=None, **over):
     d = {"action": "open", "pair": "USDJPY", "direction": "long",
          "entry_type": "limit", "horizon": "day", "limit_price": 148.20,
          "expires_in": "4h", "stop_loss": 147.80, "take_profit": 149.00,
          "confidence": 0.7, "reasoning": "t"}
     d.update(over)
-    return TradeIntent.from_llm_dict(d, origin=Origin.SCHEDULER)
+    return TradeIntent.from_llm_dict(d, origin=Origin.SCHEDULER,
+                                     ref_price=ref_price)
 
 
 def _ctx(**over):
@@ -245,6 +246,58 @@ def test_hold_action_raises_value_error_not_assert():
     hold = _intent(action="hold")
     with pytest.raises(ValueError):
         evaluate(hold, _ctx(), RISK)
+
+
+# --- レビュー修正 (codex 5): market intent のスリッページ判定 ---
+
+def test_market_slippage_within_limit_no_rejection():
+    it = _intent(ref_price=QUOTE.ask, entry_type="market", limit_price=None,
+                 expires_in=None)
+    r = evaluate(it, _ctx(), RISK)
+    assert not any("slippage" in x for x in r.reasons)
+
+
+def test_market_slippage_exceeds_limit_rejected():
+    it = _intent(ref_price=140.00, entry_type="market", limit_price=None,
+                 expires_in=None)
+    r = evaluate(it, _ctx(), RISK)
+    assert any("slippage" in x for x in r.reasons)
+
+
+def test_market_ref_price_none_skips_slippage_check():
+    it = _intent(entry_type="market", limit_price=None, expires_in=None)
+    assert it.ref_price is None
+    r = evaluate(it, _ctx(), RISK)
+    assert not any("slippage" in x for x in r.reasons)
+
+
+def test_limit_intent_ref_price_not_checked_for_slippage():
+    # slippage 判定は market intent のみ (limit は判断価格=指値そのもの)
+    it = _intent(ref_price=100.0)  # 大きく乖離した ref_price でも limit は無関係
+    r = evaluate(it, _ctx(), RISK)
+    assert not any("slippage" in x for x in r.reasons)
+
+
+def test_ref_price_nonpositive_fail_closed():
+    r = evaluate(_intent(ref_price=-1.0), _ctx(), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+def test_ref_price_nonfinite_fail_closed():
+    r = evaluate(_intent(ref_price=float("nan")), _ctx(), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
+
+
+# --- レビュー修正 (codex 7): stop_loss=None の open intent を fail closed ---
+
+def test_stop_loss_none_fail_closed_no_type_error():
+    bad = TradeIntent(action=Action.OPEN, origin=Origin.SCHEDULER,
+                      pair="USDJPY", direction=Direction.LONG,
+                      entry_type=EntryType.LIMIT, horizon=Horizon.DAY,
+                      limit_price=148.20, expires_in_h=4.0, stop_loss=None,
+                      take_profit=149.00, confidence=0.7, reasoning="t")
+    r = evaluate(bad, _ctx(), RISK)
+    assert not r.accepted and any("invalid context" in x for x in r.reasons)
 
 
 def test_eurusd_intent_rejected_via_sizing_failure():

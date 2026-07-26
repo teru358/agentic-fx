@@ -61,10 +61,18 @@ def _validate_context(intent: TradeIntent, ctx: GateContext) -> list[str]:
                        "now must be timezone-aware")
     for name, v in (("stop_loss", intent.stop_loss),
                     ("take_profit", intent.take_profit),
-                    ("limit_price", intent.limit_price)):
+                    ("limit_price", intent.limit_price),
+                    ("ref_price", intent.ref_price)):
         if v is not None and (not math.isfinite(v) or v <= 0):
             reasons.append(f"invalid context data (fail closed): "
                            f"{name} must be finite and positive")
+    # レビュー修正 (codex 7): TradeIntent は公開契約として stop_loss=None を
+    # 許容するが、open の評価は SL 必須。ここで検証せず後段の `sl < entry`
+    # まで進むと TypeError になる (from_llm_dict 経由なら SL 必須のため実運用
+    # では到達しないが、防御的に検証する)。
+    if intent.action is Action.OPEN and intent.stop_loss is None:
+        reasons.append("invalid context data (fail closed): "
+                       "stop_loss is required for open")
     return reasons
 
 
@@ -92,6 +100,16 @@ def evaluate(intent: TradeIntent, ctx: GateContext,
     if intent.entry_type is EntryType.MARKET:
         entry = ctx.quote.ask if intent.direction is Direction.LONG \
             else ctx.quote.bid
+        # レビュー修正 (codex 5): market は発注直前の最新 quote で再計算するが、
+        # 判断時点の参照価格 (ref_price) から乖離しすぎていれば失効させる
+        # (設計書 §5)。ref_price が None (Phase 1 で trade loop 未実装のうち)
+        # は検証しない — gate 評価と約定が同一処理内で同じ quote を使うため、
+        # 構造的にスリッページはゼロ。
+        if intent.ref_price is not None:
+            slippage_pct = abs(entry - intent.ref_price) / intent.ref_price * 100
+            if slippage_pct > risk.max_slippage_pct:
+                reasons.append(f"slippage {slippage_pct:.3f}% > "
+                               f"{risk.max_slippage_pct}%")
     else:
         entry = intent.limit_price
         mid = (ctx.quote.bid + ctx.quote.ask) / 2

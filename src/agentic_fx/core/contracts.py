@@ -168,9 +168,15 @@ class TradeIntent:
     stop_loss: float | None = None
     take_profit: float | None = None
     confidence: float | None = None
+    # レビュー修正 (codex 5): 判断時点の参照価格。LLM が出す値ではなく、
+    # システムが Mission 開始時の quote から供給する (from_llm_dict は d から
+    # 読まずキーワード引数で受け取る)。market intent のスリッページ判定に使う
+    # (risk_gate.evaluate)。None ならスリッページ検証はスキップされる。
+    ref_price: float | None = None
 
     @classmethod
-    def from_llm_dict(cls, d: dict, *, origin: Origin) -> "TradeIntent":
+    def from_llm_dict(cls, d: dict, *, origin: Origin,
+                      ref_price: float | None = None) -> "TradeIntent":
         if not isinstance(d, dict):
             raise IntentParseError("intent must be an object")
         action = _enum(Action, d, "action")
@@ -183,10 +189,11 @@ class TradeIntent:
                     f"{action.value} requires a positive integer order_id, "
                     f"got {order_id!r}")
             return cls(action=action, origin=origin, order_id=order_id,
-                       reasoning=reasoning)
+                       reasoning=reasoning, ref_price=ref_price)
 
         if action is Action.HOLD:
-            return cls(action=action, origin=origin, reasoning=reasoning)
+            return cls(action=action, origin=origin, reasoning=reasoning,
+                       ref_price=ref_price)
 
         # action == open
         pair = d.get("pair")
@@ -218,4 +225,4 @@ class TradeIntent:
                    entry_type=entry_type, horizon=horizon, limit_price=limit_price,
                    expires_in_h=expires_in_h, stop_loss=stop_loss,
                    take_profit=take_profit, confidence=confidence,
-                   reasoning=reasoning)
+                   reasoning=reasoning, ref_price=ref_price)

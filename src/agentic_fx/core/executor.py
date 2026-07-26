@@ -9,7 +9,8 @@ from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import Settings
 from agentic_fx.core import accounting, transitions
 from agentic_fx.core.contracts import (
-    Action, Clock, InstrumentSpec, Origin, OrderStatus as S, Quote, TradeIntent,
+    Action, BrokerResult, Clock, InstrumentSpec, Origin, OrderStatus as S,
+    Quote, TradeIntent,
 )
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker, compute_pnl
@@ -147,7 +148,12 @@ class Executor:
             expires_at=(now + timedelta(hours=intent.expires_in_h)).isoformat()
             if intent.expires_in_h else None)
         row = orders.get(self.conn, oid)
-        br = self.broker.submit(row, entry_price=result.entry_price)
+        # レビュー修正 (codex 2): タイムアウト等の broker 例外は「結果不明」
+        # として扱う (設計書 §12)。Phase 3 の MT5 実装で必ず起きる経路。
+        try:
+            br = self.broker.submit(row, entry_price=result.entry_price)
+        except Exception as e:  # noqa: BLE001
+            br = BrokerResult(status="unknown", message=str(e))
         if br.status == "rejected":
             transitions.transition(self.conn, oid, S.REJECTED, now)
             self.activity.write(Category.TRADE, "broker_rejected",
@@ -211,7 +217,10 @@ class Executor:
         spec = self.spec_fn(row["pair"])
         transitions.transition(self.conn, row["id"], S.CLOSING, now,
                                close_reason=reason)
-        br = self.broker.close(row, price, reason)
+        try:
+            br = self.broker.close(row, price, reason)
+        except Exception as e:  # noqa: BLE001 — 結果不明として扱う (codex 2)
+            br = BrokerResult(status="unknown", message=str(e))
         if br.status != "ok":
             transitions.transition(self.conn, row["id"], S.CLOSE_UNKNOWN, now)
             self.activity.write(Category.TRADE, "close_unknown",
@@ -234,7 +243,10 @@ class Executor:
         戻り値は遷移後の状態。"""
         now = self.clock.now()
         transitions.transition(self.conn, row["id"], S.CANCELLING, now)
-        br = self.broker.cancel(row)
+        try:
+            br = self.broker.cancel(row)
+        except Exception as e:  # noqa: BLE001 — 結果不明として扱う (codex 2)
+            br = BrokerResult(status="unknown", message=str(e))
         if br.status == "ok":
             transitions.transition(self.conn, row["id"], S.CANCELLED, now,
                                    close_reason=reason)
@@ -276,5 +288,5 @@ def _intent_payload(intent: TradeIntent) -> dict:
         "order_id": intent.order_id, "limit_price": intent.limit_price,
         "expires_in_h": intent.expires_in_h, "stop_loss": intent.stop_loss,
         "take_profit": intent.take_profit, "confidence": intent.confidence,
-        "reasoning": intent.reasoning,
+        "reasoning": intent.reasoning, "ref_price": intent.ref_price,
     }

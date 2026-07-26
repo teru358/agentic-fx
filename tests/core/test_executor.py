@@ -56,12 +56,18 @@ class StubBroker:
         return 1_000_000, 1_000_000
 
     def submit(self, order_row, entry_price):
+        if self.submit_status == "raise":
+            raise RuntimeError("submit timeout")
         return self._r(status=self.submit_status, broker_order_id="s1")
 
     def cancel(self, order_row):
+        if self.cancel_status == "raise":
+            raise RuntimeError("cancel timeout")
         return self._r(status=self.cancel_status)
 
     def close(self, order_row, price, reason):
+        if self.close_status == "raise":
+            raise RuntimeError("close timeout")
         return self._r(status=self.close_status)
 
 
@@ -257,3 +263,55 @@ def test_cancel_rejected_means_fill_race(tmp_path):
                                        origin=Origin.SCHEDULER)
     out = ex.handle_intent(cancel, mid)
     assert orders.get(conn, oid)["status"] == "protection_pending"
+
+
+# --- レビュー修正 (codex 2): broker 例外は「結果不明」として扱う ---
+
+def test_submit_exception_treated_as_submit_unknown(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path, broker=StubBroker(submit_status="raise"))
+    it = _open_intent(entry_type="market", limit_price=None, expires_in=None,
+                      stop_loss=148.00, take_profit=149.60)
+    out = ex.handle_intent(it, mid)
+    assert out["result"] == "unknown"
+    assert orders.get(conn, out["order_id"])["status"] == "submit_unknown"
+
+
+def test_cancel_exception_treated_as_cancel_unknown(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    oid = ex.handle_intent(_open_intent(), mid)["order_id"]
+    ex.broker = StubBroker(cancel_status="raise")
+    cancel = TradeIntent.from_llm_dict({"action": "cancel", "order_id": oid},
+                                       origin=Origin.SCHEDULER)
+    out = ex.handle_intent(cancel, mid)
+    assert out["result"] == "unknown"
+    assert orders.get(conn, oid)["status"] == "cancel_unknown"
+
+
+def test_close_exception_treated_as_close_unknown(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    it = _open_intent(entry_type="market", limit_price=None, expires_in=None,
+                      stop_loss=148.00, take_profit=149.60)
+    oid = ex.handle_intent(it, mid)["order_id"]
+    ex.broker = StubBroker(close_status="raise")
+    close = TradeIntent.from_llm_dict({"action": "close", "order_id": oid},
+                                      origin=Origin.SCHEDULER)
+    out = ex.handle_intent(close, mid)
+    assert out["result"] == "unknown"
+    assert orders.get(conn, oid)["status"] == "close_unknown"
+
+
+# --- レビュー修正 (codex 5): ref_price が intent payload に記録される ---
+
+def test_ref_price_included_in_intent_payload(tmp_path):
+    import json
+    conn, ex, _, mid = _setup(tmp_path)
+    it = TradeIntent.from_llm_dict(
+        {"action": "open", "pair": "USDJPY", "direction": "long",
+         "entry_type": "market", "horizon": "day", "stop_loss": 148.00,
+         "take_profit": 149.60, "reasoning": "t"},
+        origin=Origin.SCHEDULER, ref_price=148.50)
+    ex.handle_intent(it, mid)
+    row = conn.execute(
+        "SELECT payload_json FROM trade_intents ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert json.loads(row["payload_json"])["ref_price"] == 148.50
