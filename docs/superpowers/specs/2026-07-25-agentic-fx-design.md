@@ -1,6 +1,6 @@
 # agentic-fx 設計書
 
-- 日付: 2026-07-26 (改訂第 11 版 — codex 4 回目レビュー 2 件反映: learning 切替ガードを実注文・中間状態ゼロ + reconcile 成功に強化 / 市場クローズ移行時に実指値を全取消)
+- 日付: 2026-07-26 (改訂第 12 版 — plugin 3 種別 (indicator/signal/strategy) + 平坦配置 / 口座通貨と換算 / バックテストの位置づけ / display_timezone)
 - ステータス: 承認待ち
 - 前身: `~/project/finance` (IFD 計画型 FX 自動トレードシステム)
 
@@ -104,7 +104,7 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 2. ClaudeRunner 向け in-process MCP ツール (Agent SDK)
 3. pytest から直接呼べる素の Python 関数
 
-`get_indicators` は組み込み指標 + **承認済み tech plugin** (§6) を合成して返す。`search_news` は `news_sources` (§6) に登録された全ソースから収集済みの RAG を検索する。
+`get_indicators` は組み込み指標 + **承認済み indicator plugin** (§6) を合成して返す。`search_news` は `news_sources` (§6) に登録された全ソースから収集済みの RAG を検索する。
 
 ## 5. 取引判断 loop
 
@@ -128,7 +128,7 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 詳細情報は agent がツールで取得する (**すべて読み取り専用**):
 
 - `get_ohlcv(pair, timeframe)` — 価格データ (SQLite キャッシュ付き)
-- `get_indicators(pair, timeframe)` — テクニカル指標 (MTF リサンプル込み、承認済み tech plugin を含む)
+- `get_indicators(pair, timeframe)` — テクニカル指標 (MTF リサンプル込み、承認済み indicator plugin を含む)
 - `search_news(query)` — ChromaDB RAG のニュース検索 (news_sources の全承認済みソースを含む)
 - `get_econ_calendar(days)` — 経済指標カレンダー (SQLite)
 - `get_positions()` / `get_account()` — 現在ポジション・残高
@@ -183,6 +183,18 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 
 注文数量は決定論的に算出する: `数量 = 口座エクイティ × 1 取引リスク率 (初期 0.5%、`horizon=swing` は半減) ÷ SL 距離` を pip value・口座通貨換算した上で、broker の lot step に**切下げのみで丸める** (リスクを超えない方向。四捨五入・切上げ禁止)。リスク額には spread・想定 slippage・手数料を含める (config)。丸め後の数量で損失額を再計算し、上限以下であることを最終検証する。**算出量が最小 lot 未満なら発注拒否**。算出に必要な値 (価格・エクイティ・pip value) が欠けている場合は **fail closed** (発注しない)。SL があっても数量が未定義では過大損失が可能になるため、サイジング自体を資金保護の一部としてコアに置く。
 
+### 口座通貨と換算 (決定論的、LLM の外)
+
+**`account_currency`** (トップレベル設定、既定 `JPY`) は**このシステムを使う人の基準通貨**であり、取引できるペアを制限するものではない。損益・リスク・エクイティをこの通貨で表現する。
+
+- **換算が必要な理由**: `loss_per_lot` は**クォート通貨建て** (`AAABBB` の `BBB`) で計算されるが、`risk_amount` は口座通貨建て。両者の通貨が異なるまま割ると数量が桁で狂う (実測: EURUSD / JPY 口座でリスク 150 倍、レバレッジ 20 倍の過小評価)
+- **換算レート**: 「クォート通貨 1 単位 = 口座通貨いくらか」を求める。①直接ペア `{quote}{account}` があればその価格 ②なければ逆ペア `{account}{quote}` の逆数 ③どちらも無ければ USD 経由のクロス。**いずれも得られない、または quote が不健全・陳腐な場合は `SizingError` で fail closed**
+- レートは**発注前検証で使う quote と同じ健全性検証** (鮮度・有限性・正値) を通す。古いレートでのサイジングは無音の過大建玉になる
+- **ペーパー (学習モード)**: `account_currency` が損益集計とエクイティの基準
+- **実取引 (Phase 3)**: **MT5 口座の通貨が真**。起動時に口座通貨を照会し、`account_currency` と**不一致なら起動拒否** (config が JPY で口座が USD なら全サイジングが約 150 倍ずれるため)。設定値は照合用であり、実行時は口座側を使う
+
+**Phase 1 の暫定措置**: 換算レートの供給元 (価格プロバイダ) が未実装のため、**クォート通貨 ≠ 口座通貨のペアは `SizingError` で fail closed**。プラン 3 でレート供給を実装した時点で解除する (config を書き換えるだけでは解除されない — コード側が拒否する)。
+
 ### Risk Gate (決定論的、LLM の外)
 
 TradeIntent は発注前に全ルールを通過しなければならない。1 つでも違反すれば却下し、却下理由を記録・通知する:
@@ -226,8 +238,8 @@ TradeIntent は発注前に全ルールを通過しなければならない。1 
 
 | 経路 | 対象 | 置き場所 | 承認ゲート |
 |---|---|---|---|
-| **コア改善** | risk gate パラメータ提案、Mission プロンプト改善、plugin 機構・news fetcher 自体の修正 | リポジトリ内 (git 管理) | **PR + 人間承認** (自動マージ禁止) |
-| **tech plugin 追加** | テクニカル指標の実装 (コード) | `plugins/tech/` (**gitignore**) | **approval_requests (kind=tech_plugin)** — Discord ボタン or CLI。承認前の plugin はロードされない |
+| **コア改善** | risk gate パラメータ提案、Mission プロンプト改善、plugin 機構・バックテスト基盤・news fetcher 自体の修正 | リポジトリ内 (git 管理) | **PR + 人間承認** (自動マージ禁止) |
+| **plugin 追加** | indicator / signal / strategy の実装 (コード) | `plugins/<name>/` (**gitignore**) | **approval_requests (kind=plugin)** — Discord ボタン or CLI。承認前の plugin はロードされない |
 | **news ソース追加** | ニュース取得先の追加 (**データ 1 行、コードなし**) | SQLite `news_sources` テーブル | **approval_requests (kind=news_source)** — 機械検証 (URL 到達性・parse 成功・重複) を自動実行した上で軽量な人間承認 |
 
 plugin を gitignore するのは、LLM が実装するツール群がプロジェクトを clone したユーザーごとに異なるため。公開リポジトリには plugin 機構と組み込みデフォルト実装のみをコミットする。
@@ -245,14 +257,24 @@ news_sources: id, name, fetcher (feed | web), url,
 - 新しい取得方式 (認証付き API 等) が必要になった場合は、コア改善トラック (PR) で fetcher を追加する
 - **ユーザーによる追加コマンド**: `news add <url> [--name]` (§8)。fetcher (feed/web) を自動判定し、機械検証 (URL 到達性・parse 成功・重複) を実行して登録する。`added_by=user` は自分の意思による追加のため**人間承認は不要** (機械検証のみで enabled)。agent 追加は従来通り approval_requests を通す
 
-### tech plugin 機構
+### plugin 機構
 
-- 配置: **1 plugin = 1 フォルダ** `plugins/tech/<name>/`。構成は 3 ファイル:
-  - `indicator.py` — 実装 (純関数)
-  - `config.yaml` — テクニカル分析パラメータの既定値 (期間・閾値等)。**ユーザーがコードを触らずにパラメータ調整できる**ようにするため
-  - `test_indicator.py` — テスト同梱必須
-- インターフェースは意図的に極小、かつ**純関数に限定** (I/O・外部アクセス禁止): `Indicator.compute(df, params) -> dict`。`params` は plugin_loader が `config.yaml` を読み込んで渡す。qwen3.6 クラスの実装力でも品質が安定し、テストが決定論的になる粒度にする
-- `tools/plugin_loader.py` が起動時にフォルダを discover し、**pytest 合格 + 承認済み** (approval_requests で approved) のもののみレジストリに登録。承認は indicator.py + config.yaml の**内容ハッシュに対して**行う
+- 配置: **1 plugin = 1 フォルダ** `plugins/<name>/` (**平坦**。news plugin 廃止に伴い `tech/` 階層は撤廃)。構成は 3 ファイル:
+  - `plugin.py` — 実装 (純関数)
+  - `config.yaml` — **`kind` 宣言 + パラメータ既定値** (期間・閾値等)。**ユーザーがコードを触らずにパラメータ調整できる**ようにするため
+  - `test_plugin.py` — テスト同梱必須
+- 種別はディレクトリでなく **`config.yaml` の `kind` で宣言**する。指標と戦略の境界は実際には曖昧 (例: 「MACD ダイバージェンス検出」) であり、ディレクトリ分割は作成時に分類を確定させ、後の変更をパス変更にしてしまうため。ローダーは `kind` に応じてインターフェースを検証する
+
+| kind | 出力 | 例 | バックテスト |
+|---|---|---|---|
+| `indicator` | 連続値 `dict[str, float]` | SMA / MACD / RSI / ATR | 対象外 (値に過ぎない) |
+| `signal` | 離散イベント `list[Signal]` (方向・強度・根拠、任意で SL/TP) | チャートパターン、ダイバージェンス | 可 (シグナル品質の検証) |
+| `strategy` | エントリー/エグジット条件 | 上記の組み合わせ | **主対象** |
+
+- インターフェースは意図的に極小、かつ**純関数に限定** (I/O・外部アクセス禁止)。`indicator` は `compute(df, params) -> dict`、`signal` は `detect(df, params) -> list[Signal]`、`strategy` は `evaluate(df, indicators, signals, params) -> StrategyDecision`。`params` は plugin_loader が `config.yaml` を読み込んで渡す。qwen3.6 クラスの実装力でも品質が安定し、テストが決定論的になる粒度にする
+- **plugin はシグナルを出すだけで発注はしない**。発注判断は LLM (取引判断 loop) が行い、執行は決定論的コアが行う (§2 の原則を維持)
+- `tools/plugin_loader.py` が起動時にフォルダを discover し、**pytest 合格 + 承認済み** (approval_requests で approved) のもののみレジストリに登録。承認は plugin.py + config.yaml の**内容ハッシュに対して**行う
+- **命名について**: 傘の呼称は `plugin` を維持する。`strategy` は 3 種別の 1 つの名前として使うため、傘と種別が同名になる衝突を避ける
 - config.yaml の再承認免除は**人間がローカルで明示的に編集した場合のみ**。**agent による config.yaml 変更はコード変更と同様に approval 対象**とし、戦略採用ゲート (下記) を通す — パラメータ変更は戦略結果を直接変えるため、承認迂回経路にしない
 - **サンドボックス実行**: 「純関数・I/O 禁止」は規約だけでは強制できない (import 時の任意コード実行を pytest では防げない) ため、plugin は**サービスプロセスに直接 import せずサブプロセスで実行**し、入力 (OHLCV DataFrame) と出力 (JSON) だけを IPC で渡す。ロード時に **AST 検査 + import allowlist** (numpy / pandas / math 等の計算系のみ) で禁止 import を拒否する。サブプロセスには**最小限の環境変数のみ渡し (秘密情報・broker 資格情報は渡さない)**、作業ディレクトリを限定し、CPU 時間・メモリ・プロセス数を resource limit で制限、タイムアウト・出力サイズ制限を課す。これらは**到達を最小化する多層防御であり完全な隔離の保証ではない** — だからこそ plugin の採用には人間承認を必須とする
 - 素の clone でも動くよう、組み込みデフォルト実装 (基本指標 + 基本ニュースソース数件の `news_sources` 初期データ) は `src/` 側にコミットする
@@ -277,7 +299,7 @@ news_sources: id, name, fetcher (feed | web), url,
 
 ### 許可ツール
 
-成績 DB 読取、`web_search` / `fetch_article` (無料実装: ddgs + 前身 article_fetcher 移植)、リポジトリ・`plugins/tech/` のファイル読み書き (コア変更は**専用ブランチ上のみ**)、news_sources への追加提案、`uv run pytest` 実行、バックテスト実行、PR 作成 (`gh`)、バックログ読み書き、approval_request 発行
+成績 DB 読取、`web_search` / `fetch_article` (無料実装: ddgs + 前身 article_fetcher 移植)、リポジトリ・`plugins/` のファイル読み書き (コア変更は**専用ブランチ上のみ**)、news_sources への追加提案、`uv run pytest` 実行、バックテスト実行、PR 作成 (`gh`)、バックログ読み書き、approval_request 発行
 
 ### 品質ゲート (loop 側で強制) — コード品質と戦略品質を分離
 
@@ -291,6 +313,24 @@ news_sources: id, name, fetcher (feed | web), url,
 - 評価は out-of-sample (期間分割) で行い、既存構成 (baseline) との比較値を approval_request / PR に添付する
 - 週次/日次で変更を繰り返す性質上、少数トレードへの過学習を防ぐことを人間レビューの観点として明記する
 
+### バックテスト (詳細設計は Phase 2 後半、プラン 5 完了後)
+
+**既存の決定論的コアを再利用する**。バックテスト専用のロジックを別に書かない:
+
+```
+バックテスト = ReplayClock + 履歴バー + plugin シグナル → 既存の scheduler.tick() ループ
+実運用      = 実クロック   + 実バー   + LLM 判断        → 同じ scheduler.tick() ループ
+```
+
+差し替えるのは**時計・バー供給・意図の出どころ**の 3 点のみ (いずれも既に注入可能: `Clock` / `bars_fn` / intent 生成元)。risk gate・sizing・約定判定・spread・丸め・状態遷移をすべて共有するため、「バックテストでは勝つのに実運用で負ける」という前身の失敗を構造的に防ぐ。
+
+**バックテストが測っているもの (誤読を防ぐため明記)**:
+> plugin はシグナルを出すだけで、実際の発注は LLM が判断する。したがって**バックテストの成績は実運用成績の予測値ではなく、「そのシグナルに機械的に従ったらどうなったか」というシグナル品質の指標**である。改善ループはこれを**足切り** (統計的に無意味なシグナルの排除) に使い、採用の十分条件としてはならない。
+
+**シグナルの機械的執行ルール**: `signal` / `strategy` が SL/TP を返せばそれを使い、返さなければハーネスの既定ルール (例: SL = ATR × 係数、TP = RR 下限) を適用する。plugin 側の設計自由度を保ちつつ、単純なシグナルも評価可能にする。
+
+履歴データは `ohlcv` テーブル (§12) を読む。長期履歴の取り込み手段は詳細設計時に定める。
+
 ## 7. 承認ゲートと操作 REST API
 
 ### approval_requests (SQLite)
@@ -298,12 +338,12 @@ news_sources: id, name, fetcher (feed | web), url,
 人間承認が必要な事象を一元管理する汎用テーブル:
 
 ```
-id, kind (tech_plugin | news_source | live_trade), payload_json,
+id, kind (plugin | news_source | live_trade), payload_json,
 status (pending | approved | rejected | expired | invalidated),
 reason, decided_by, decided_at, message_id, expires_at, created_at
 ```
 
-- `kind=tech_plugin`: 改善ループが plugin を書いたら発行。payload は plugin パス・要約・テスト結果。承認されるまでロードされない
+- `kind=plugin`: 改善ループが plugin を書いたら発行。payload は plugin パス・`kind` (indicator/signal/strategy)・要約・テスト結果・バックテスト結果 (strategy/signal のみ)。承認されるまでロードされない
 - `kind=news_source`: ニュースソース追加 (**agent 追加時のみ発行**。user 追加は機械検証成功後に直接 enabled — §6)。payload はソース情報 + 機械検証結果 (URL 到達性・parse 成功・取得サンプル)。承認されるまで `news_sources.enabled` にならない
 - `kind=live_trade` (Phase 3): 取引モード (手動承認時) の open intent。payload は TradeIntent 全体。expires_at 超過で自動 expired。autopilot on の間は発行されない (§5)
 - `status=invalidated`: live_trade の承認時再検証 (§5) に失敗した場合の終端状態 (理由を reason に記録)
@@ -329,7 +369,7 @@ reason, decided_by, decided_at, message_id, expires_at, created_at
 | `GET /models` | 利用可能モデル一覧 (llama-swap `/v1/models` + claude、番号付き) | client.py |
 | `POST /model` | LLM runner / ローカルモデルの切替 (client 側で番号→モデル名を解決して送る。資金と無関係のため API 可) | client.py |
 
-- `X-API-Key` 認証 (finance 方式踏襲)。ただし**キーは 2 段に分離**する: **operator キー** (閲覧・ask・policy・backlog・news・model・tech_plugin / news_source の承認) と **approver キー** (live_trade の承認/却下のみ)。単一キーの漏洩で実発注の承認まで通ることを防ぐ。`decided_by` はリクエスト本文でなく**認証主体から生成**する (本文の自己申告を信用しない)
+- `X-API-Key` 認証 (finance 方式踏襲)。ただし**キーは 2 段に分離**する: **operator キー** (閲覧・ask・policy・backlog・news・model・plugin / news_source の承認) と **approver キー** (live_trade の承認/却下のみ)。単一キーの漏洩で実発注の承認まで通ることを防ぐ。`decided_by` はリクエスト本文でなく**認証主体から生成**する (本文の自己申告を信用しない)
 - API の bind は**デフォルト localhost のみ**。外部公開する場合は reverse proxy + TLS を前提とする (ドキュメントに明記)
 - **autopilot 中の追加制限**: trading + autopilot on の間は **API の変更系操作を全面拒否**する — 許可するのは読み取り系 (`GET *`)・`reject` (安全方向の却下)・`ask` (回答専用) のみ。`POST /policy` / `/model` / `/news` / `/improve` / `/backlog` / approve は**ホスト上の対話シェルのみ**。operator キー漏洩時に判断入力・戦略構成の変更 (方針・モデル・ニュースソースの RAG 混入・plugin 承認) で次周期から人間承認なしの実発注を誘導する経路を、個別列挙でなく原則として閉じるため
 - **載せない一線**: 発注操作・risk gate 等の資金関連設定の変更・モード切替 (`mode`)・自動発注切替 (`autopilot`)・サービス停止。金を動かす経路と重大操作はホスト上の明示操作のみ
@@ -395,7 +435,7 @@ uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サー�
 | `ask "..."` | ワンショットの質問・指示 | 臨時 Mission を即時実行、その 1 回だけ注入 |
 | `improve add "..."` | 改善アイデアの投入 | 次回の改善 loop がバックログから選択 (`improve` で即時起動も可) |
 | `news add <url>` | ニュース取得対象の追加 | 機械検証後に即 enabled (user 追加は承認不要、§6) |
-| Discord ボタン / `approve` | tech plugin・news ソース (agent 追加)・実発注の承認 | approval_requests の決定 |
+| Discord ボタン / `approve` | plugin・news ソース (agent 追加)・実発注の承認 | approval_requests の決定 |
 
 `policy/directives.md` はタイムスタンプ付き追記 (削除は手動編集)。サイズ超過時は起動時に警告する。
 
@@ -408,7 +448,7 @@ uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サー�
 - `discord.ui.DynamicItem` + custom_id 正規表現 (`agentic_fx_gate:approve:{id}` — finance cog と衝突しない名前空間) で bot 再起動を跨いでボタンが生きる
 - 承認者ロール deny-by-default、却下理由 Modal、TOCTOU 再チェック、起動時 reconcile、重複投稿ガード
 
-表示: `kind=tech_plugin` は plugin パス・要約・テスト結果、`kind=news_source` はソース情報 + 機械検証結果、`kind=live_trade` は TradeIntent の内容 (ペア/方向/entry/SL/TP/理由) をそれぞれ embed 表示。`?afx status` は `GET /status` の内容を表示する。
+表示: `kind=plugin` は plugin パス・種別・要約・テスト結果・バックテスト結果、`kind=news_source` はソース情報 + 機械検証結果、`kind=live_trade` は TradeIntent の内容 (ペア/方向/entry/SL/TP/理由) をそれぞれ embed 表示。`?afx status` は `GET /status` の内容を表示する。
 
 ## 10. 前身からの移植資産
 
@@ -445,7 +485,7 @@ agentic-fx/
 ├── policy/
 │   └── directives.md          # ユーザー方針 (タイムスタンプ付き追記)
 ├── plugins/                   # gitignore — LLM 生成、ユーザーごとに異なる
-│   └── tech/<name>/           #   1 plugin = 1 フォルダ: indicator.py (純関数) + config.yaml (パラメータ) + test_indicator.py (§6)
+│   └── <name>/                #   1 plugin = 1 フォルダ (平坦): plugin.py + config.yaml (kind + パラメータ) + test_plugin.py (§6)
 ├── data/                      # gitignore (agentic.db / rag/ / state/)
 ├── reports/                   # 改善 loop の分析レポート
 ├── docs/
@@ -508,6 +548,8 @@ agentic-fx/
 
 - 設定: `config/settings.yaml` 1 ファイル (gitignore) + `config/settings.yaml.example` (コミット)。前身の 3 分割はしない
 - 秘密情報: `.env` (`DISCORD_WEBHOOK_URL`, `TWELVEDATA_API_KEY`, `AFX_OPERATOR_KEY`, `AFX_APPROVER_KEY` など — API キー 2 段分離は §7)
+- **`account_currency`** (トップレベル、既定 `JPY`): 利用者の基準通貨。損益・リスクの表現に使う (§5)。取引可能ペアを制限するものではない。実取引では MT5 口座通貨と照合し不一致なら起動拒否
+- **`display_timezone`** (トップレベル、既定 `UTC`): ログ・status 表示に使う IANA タイムゾーン。**保存は常に UTC、市場境界は NY 固定で変更不可** (§13)
 - **稼働モード・発注方式 (autopilot) は settings.yaml に置かず `data/state/` に保存** (§3 — config 編集では実資金運用・自動発注に切り替わらない構造的担保)
 
 ### SQLite スキーマ (`data/agentic.db`、前身 18 テーブル → 11 テーブルに再設計)
@@ -523,7 +565,7 @@ agentic-fx/
 | `improvement_backlog` | 改善アイデア (source: user/agent/research, status: open/selected/done/rejected) |
 | `improvement_runs` | 改善実施記録 (選択 backlog, PR URL / approval_request ID / レポートパス) |
 | `econ_events` | 経済指標カレンダー (前身 econ_event_store 移植) |
-| `approval_requests` | 人間承認の一元管理 (§7: kind = tech_plugin / news_source / live_trade) |
+| `approval_requests` | 人間承認の一元管理 (§7: kind = plugin / news_source / live_trade) |
 | `news_sources` | ニュース取得先リスト (§6: name, fetcher, url, enabled, added_by) |
 
 **orders の状態遷移** (approval のライフサイクルと broker のライフサイクルを混同しない):
@@ -573,7 +615,7 @@ activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 �
 | カテゴリ | 内容 |
 |---|---|
 | `NEWS` | ニュース収集・要約・RAG 格納 |
-| `TECH` | テクニカル指標の計算・tech plugin 実行 |
+| `TECH` | テクニカル指標の計算・plugin 実行 (indicator/signal/strategy) |
 | `AGGREGATE` | 取引判断 loop の統合判断 (毎時の判断結果・hold 理由・ask の回答) |
 | `TRADE` | 発注・約定・クローズ・期限切れ取消・risk gate 却下 |
 | `IMPROVE` | 改善 loop の活動 (発見・リサーチ・実装・PR/approval 発行) |
@@ -612,7 +654,7 @@ activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 �
 ## 15. 段階導入
 
 - **Phase 1**: 決定論的コア + LocalRunner + 取引判断 loop (学習モード = ペーパー、ハイブリッド発注、horizon) + 価格取得 (デフォルト yfinance、設定時は MT5 / TD を優先) + main.py (スプラッシュ + 対話シェル + init 起動ガード + stop) + ログ 2 軸。ツールは get_ohlcv / get_indicators / search_news / get_positions の最小セット (組み込み実装 + news_sources 初期データのみ)
-- **Phase 2**: ClaudeRunner (Agent SDK) + 戦略改善 loop (バックログ + Web リサーチ) + tech plugin 機構 + news_sources 承認フロー + 操作 API + client.py + `news add` / `model` コマンド + Discord 承認 (discord_bot 側 cog 含む) + policy チャネル
+- **Phase 2**: ClaudeRunner (Agent SDK) + 戦略改善 loop (バックログ + Web リサーチ) + plugin 機構 (indicator/signal/strategy) + news_sources 承認フロー + 操作 API + client.py + `news add` / `model` コマンド + Discord 承認 (discord_bot 側 cog 含む) + policy チャネル
 - **Phase 3**: MT5 の発注系接続 + 資金保護系の本格接続 + 取引モード切替 (`mode trading`、人間の明示操作のみ) + 手動承認ゲート (live_trade) + `autopilot` (自動発注への段階移行)
 
 ## 16. 非スコープ (YAGNI)

@@ -509,6 +509,11 @@ git commit -m "feat: ソース fetcher (yfinance/MT5 bridge/Twelve Data、全モ
   - `latest_1m_bar(self, pair: str) -> Bar | None` — scheduler の `bars_fn` 用。`DataUnhealthy` は None (fills 判定をスキップさせる)
   - `spec(self, pair: str) -> InstrumentSpec` — executor の `spec_fn` 用。Phase 1 は組み込みテーブル。Phase 3 で MT5 照会に置換
   - `healthcheck(self, pair: str) -> str` — **quote と 1h バー (判断 Mission の主系列) の両方**が健全であることを確認し、quote の source 名を返す。どちらか全滅は `DataUnhealthy` (設計書 §5 の fail closed — quote だけの確認では OHLCV 不健全時に Mission が走ってしまう)
+  - **`quote_to_account_rate(self, quote_ccy: str, account_ccy: str) -> float`** — 「クォート通貨 1 単位 = 口座通貨いくらか」を返す (設計書 §5「口座通貨と換算」)。**この実装により、プラン 2 で暫定的に fail closed にしていたクロス通貨ペア (JPY 口座での EURUSD 等) が扱えるようになる**
+    - `quote_ccy == account_ccy` なら `1.0`
+    - **①直接ペア `{quote}{account}`** の quote 価格 → そのまま。**②逆ペア `{account}{quote}`** → その逆数。**③どちらも無ければ USD 経由のクロス** (`{quote}USD` × `USD{account}` 相当)
+    - 使う quote は `get_quote` 経由なので**鮮度・有限性・正値の検証を必ず通る**。得られない場合は `DataUnhealthy` を送出し、呼び出し側 (sizing) が `SizingError` に変換して **fail closed**。古いレートでのサイジングは無音の過大建玉になるため、ここは握りつぶさないこと
+    - レート算出に使うペアは `VENDOR_SYMBOLS` に登録されている必要がある。未登録なら `DataUnhealthy`
 - 各ソースの失敗 (例外 / 検証不合格) は技術ログ warning + 次ソースへ。yfinance も `enabled: false` なら試さない (ユーザーの明示的無効化を尊重)
 
 - [ ] **Step 1: 失敗するテストを書く**
@@ -1754,3 +1759,38 @@ git commit -m "feat: init に基本ニュースソース投入 + 価格ソース
 - trade_loop (プラン 5) の fail closed: Mission 起動前に `PriceProvider.healthcheck` を呼び、`DataUnhealthy` なら Mission を実行せず activity SYSTEM `data_unhealthy` を記録
 - equity 時価評価: scheduler tick に「open ポジションの `latest_1m_bar` close で含み損益を計算し snapshot 記録」を追加する (プラン 5 の service 配線時)
 - `DEFAULT_SOURCES` の URL は実装時に実際の到達性を確認して差し替えること (テストはモックのため URL の生死に依存しない)
+
+---
+
+## 追記 (2026-07-26): 通貨換算とクロス通貨ペアの解禁
+
+設計書 改訂第 12 版で「口座通貨と換算」が明文化されたことに伴う、本プランへの追加要件。
+
+### 背景
+プラン 2 の実装中に**通貨単位の不整合**が見つかった。`loss_per_lot` はクォート通貨建て、
+`risk_amount` は口座通貨建てで、両者が異なるペア (JPY 口座での EURUSD 等) では
+**リスクを 150 倍、レバレッジを 20 倍過小評価**していた。換算レートの供給元が無かったため、
+暫定措置として `compute_size` がクォート通貨 ≠ 口座通貨のペアを `SizingError` で拒否している
+(config の `pairs` も USDJPY のみに縮小済み)。
+
+**本プランで `quote_to_account_rate` を実装することが、この制限を解除する条件**である。
+
+### Task 3 への追加 (上記 Interfaces 参照)
+`PriceProvider.quote_to_account_rate(quote_ccy, account_ccy) -> float` を実装する。
+直接ペア → 逆ペア → USD 経由クロス の順に解決し、いずれも不可なら `DataUnhealthy`。
+
+**テストで検証すること:**
+- 同一通貨は `1.0` (レート取得を試みないこと)
+- 直接ペア (quote=USD, account=JPY → USDJPY の価格)
+- 逆ペア (quote=JPY, account=USD → USDJPY の逆数)。**逆数が正しいこと**を実測で検証
+- USD 経由クロス (quote=EUR, account=JPY のような直接・逆ペアとも無い場合)
+- レート用 quote が陳腐・不健全なら `DataUnhealthy` (握りつぶさない)
+- `VENDOR_SYMBOLS` 未登録の通貨対で `DataUnhealthy`
+
+### 本プラン完了後に別途行うこと (このプランのスコープ外)
+1. `core/sizing.py` の暫定 fail closed を解除し、`quote_to_account_rate` の値を受け取って
+   `loss_per_lot` を口座通貨に換算する (`compute_size` に換算レート引数を追加)
+2. `core/risk_gate.py` の `GateContext` に換算レートを追加し、executor が PriceProvider から供給
+3. `config/settings.yaml.example` の `pairs` に EURUSD を戻す
+4. **非退行の確認**: USDJPY の数量が従来と一致すること (day 0.09 / swing 0.04)。
+   換算レート 1.0 の経路で計算結果が変わらないことを実測すること
