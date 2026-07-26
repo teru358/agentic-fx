@@ -17,6 +17,16 @@ def record_snapshot(conn: sqlite3.Connection, *, now: datetime, balance: float,
     conn.execute("BEGIN IMMEDIATE")
     try:
         prev = snapshots.latest(conn)
+        if prev is not None:
+            prev_ts = datetime.fromisoformat(prev["ts"])
+            if now < prev_ts:
+                # HWM 連鎖は時系列順の挿入を前提とした累積計算であり、
+                # out-of-order 挿入は HWM を巻き戻しうる (fail-open の方向)
+                # ため、その場で拒否する。同一 ts は許可 (now == prev_ts は OK)。
+                raise ValueError(
+                    f"record_snapshot: now ({now.isoformat()}) is older than "
+                    f"the latest snapshot ts ({prev['ts']}) — 時系列順の挿入"
+                    "が必要です (HWM 連鎖の巻き戻りを防止)")
         prev_hwm = (prev["hwm"] + cashflow) if prev else equity
         hwm = max(prev_hwm, equity)
         conn.execute(
