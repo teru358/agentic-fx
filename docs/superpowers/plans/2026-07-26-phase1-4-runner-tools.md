@@ -298,7 +298,7 @@ git commit -m "feat: JSON 修復 (think 除去・フェンス剥がし・バラ�
     - `register_all(self, tools: list[ToolDef]) -> None`
     - `names(self) -> list[str]`
     - `openai_tools(self, allowed: list[str]) -> list[dict]` — OpenAI function calling 形式 (`{"type": "function", "function": {name, description, parameters}}`)。allowed に無い名前は無視
-    - `execute(self, name: str, arguments: dict, allowed: list[str]) -> str` — func を kwargs で呼び、結果を `json.dumps(ensure_ascii=False, default=str)`。**未登録・非許可・実行例外はエラー文字列を返す** (LLM に返して継続させる — loop を止めない)
+    - `execute(self, name: str, arguments: dict, allowed: list[str]) -> str` — **実行前に `jsonschema.validate(arguments, tool.parameters)` で引数検証** (範囲外・余分な引数で関数を呼ばない)。合格なら func を kwargs で呼び、結果を `json.dumps(ensure_ascii=False, default=str)`。**未登録・非許可・引数不正・実行例外はエラー文字列を返す** (LLM に返して継続させる — loop を止めない)
     - `func(self, name: str) -> Callable` — pytest から素関数を直接叩く第 3 形態
   - (Phase 2 の MCP 変換はこのクラスにメソッド追加で対応する — 契約として注記)
 
@@ -364,6 +364,22 @@ def test_execute_exception_returns_error_string():
     assert "error" in out
 
 
+def test_execute_invalid_arguments_rejected_before_call():
+    called = []
+    reg = ToolRegistry()
+    reg.register(ToolDef(
+        "typed", "d",
+        {"type": "object",
+         "properties": {"n": {"type": "integer", "minimum": 1}},
+         "required": ["n"], "additionalProperties": False},
+        func=lambda n: called.append(n)))
+    out1 = reg.execute("typed", {"n": "abc"}, allowed=["typed"])
+    out2 = reg.execute("typed", {"n": 1, "extra": True}, allowed=["typed"])
+    out3 = reg.execute("typed", {}, allowed=["typed"])
+    assert all("error" in o for o in (out1, out2, out3))
+    assert called == []  # 検証不合格では関数を呼ばない
+
+
 def test_raw_func_access():
     reg = ToolRegistry()
     reg.register(_echo_tool())
@@ -387,6 +403,8 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Callable
+
+import jsonschema
 
 _log = logging.getLogger("agentic_fx.tools")
 
@@ -424,8 +442,13 @@ class ToolRegistry:
     def execute(self, name: str, arguments: dict, allowed: list[str]) -> str:
         if name not in allowed or name not in self._tools:
             return json.dumps({"error": f"tool {name!r} not allowed"})
+        tool = self._tools[name]
         try:
-            result = self._tools[name].func(**arguments)
+            jsonschema.validate(arguments, tool.parameters)
+        except jsonschema.ValidationError as e:
+            return json.dumps({"error": f"invalid arguments: {e.message}"})
+        try:
+            result = tool.func(**arguments)
             return json.dumps(result, ensure_ascii=False, default=str)
         except Exception as e:  # noqa: BLE001 — LLM に返して継続
             _log.warning("tool %s failed: %s", name, e)
@@ -453,6 +476,7 @@ git commit -m "feat: ツールレジストリ (OpenAI スキーマ変換・許�
 
 **Files:**
 - Create: `src/agentic_fx/tools/market_tools.py`, `src/agentic_fx/tools/news_tools.py`, `src/agentic_fx/tools/account_tools.py`, `src/agentic_fx/tools/reflection_tools.py`
+- Modify: `src/agentic_fx/store/reflections.py` (`recent_for_pair` 追加)
 - Test: `tests/tools/test_tool_impls.py`
 
 **Interfaces:**
@@ -465,7 +489,8 @@ git commit -m "feat: ツールレジストリ (OpenAI スキーマ変換・許�
   - `account_tools.build(conn, broker: PaperBroker) -> list[ToolDef]`:
     - `get_positions()` — open / pending_fill / protection_pending の orders を `[{order_id, pair, direction, status, quantity, entry, stop_loss, take_profit, horizon}]`
     - `get_account()` — `{balance, equity}`
-  - `reflection_tools.build(conn, rag: Rag) -> list[ToolDef]`: `get_recent_reflections(n)` / `search_reflections(query)`
+  - `reflection_tools.build(conn, rag: Rag) -> list[ToolDef]`: `get_recent_reflections(pair, n)` (スペック §5 のシグネチャどおり pair 必須 — orders と JOIN してペアで絞る。store に `reflections.recent_for_pair(conn, pair, n)` を追加) / `search_reflections(query)`
+- `get_ohlcv` / `get_indicators` の `timeframe="4h"` は **1h バーを `resample(df, "4h")` で集約して返す** (プラン 3 の yf_bars は 4h を 1h として取得するだけのため、ここで集約しないと 4h と称した 1h 足が LLM に渡る)
 - **全ツール読み取り専用** (書き込み系依存を一切受け取らない)
 
 - [ ] **Step 1: 失敗するテストを書く**
@@ -512,6 +537,17 @@ def test_market_tools():
     assert reg.func("get_econ_calendar")(days=1) == [{"name": "CPI"}]
 
 
+def test_get_ohlcv_4h_is_aggregated():
+    provider = MagicMock()
+    provider.get_bars.return_value = _bars(n=120)  # 1h × 120 本
+    reg = ToolRegistry()
+    reg.register_all(market_tools.build(provider, MagicMock()))
+    out = reg.func("get_ohlcv")(pair="USDJPY", timeframe="4h")
+    # 4h と称した 1h 足を返さない: 120 本の 1h → 30 本の 4h
+    assert len(out) == 30
+    provider.get_bars.assert_called_with("USDJPY", "1h", lookback_days=20)
+
+
 def test_news_and_reflection_tools(tmp_path):
     conn = connect(tmp_path / "t.db")
     init_db(conn)
@@ -527,7 +563,12 @@ def test_news_and_reflection_tools(tmp_path):
                         entry_type="market", horizon="day",
                         status=OrderStatus.CLOSED, now=NOW)
     reflections.save(conn, oid, "振り返り本文", NOW)
-    recent = reg.func("get_recent_reflections")(n=5)
+    other = orders.insert(conn, pair="EURUSD", direction="short",
+                          entry_type="market", horizon="day",
+                          status=OrderStatus.CLOSED, now=NOW)
+    reflections.save(conn, other, "別ペアの振り返り", NOW)
+    recent = reg.func("get_recent_reflections")(pair="USDJPY", n=5)
+    assert len(recent) == 1  # ペアで絞られる
     assert recent[0]["content"] == "振り返り本文"
 
 
@@ -579,14 +620,23 @@ _PAIR_PARAM = {"pair": {"type": "string", "description": "e.g. USDJPY"},
                              "enum": ["5m", "15m", "1h", "4h", "1d"]}}
 
 
+def _frame(provider: PriceProvider, pair: str, timeframe: str):
+    """4h は 1h バーを取得して集約する (ソース側は 4h ネイティブ非対応 — プラン 3)。"""
+    if timeframe == "4h":
+        df = bars_to_df(provider.get_bars(pair, "1h", lookback_days=20))
+        return resample(df, "4h")
+    return bars_to_df(provider.get_bars(pair, timeframe))
+
+
 def build(provider: PriceProvider, econ: EconCalendar) -> list[ToolDef]:
     def get_ohlcv(pair: str, timeframe: str) -> list[dict]:
-        bars = provider.get_bars(pair, timeframe)[-100:]
-        return [{"ts": b.ts.isoformat(), "open": b.open, "high": b.high,
-                 "low": b.low, "close": b.close} for b in bars]
+        df = _frame(provider, pair, timeframe).tail(100)
+        return [{"ts": ts.isoformat(), "open": r["open"], "high": r["high"],
+                 "low": r["low"], "close": r["close"]}
+                for ts, r in df.iterrows()]
 
     def get_indicators(pair: str, timeframe: str) -> dict:
-        df = bars_to_df(provider.get_bars(pair, timeframe))
+        df = _frame(provider, pair, timeframe)
         out = compute_indicators(df)
         if timeframe == "1h":
             out["mtf_4h"] = compute_indicators(resample(df, "4h"))
@@ -683,23 +733,34 @@ from agentic_fx.tools.registry import ToolDef
 
 
 def build(conn: sqlite3.Connection, rag: Rag) -> list[ToolDef]:
-    def get_recent_reflections(n: int = 5) -> list[dict]:
-        return reflections.recent(conn, n)
+    def get_recent_reflections(pair: str, n: int = 5) -> list[dict]:
+        return reflections.recent_for_pair(conn, pair, n)
 
     def search_reflections(query: str) -> list[dict]:
         return rag.search_reflections(query, n=5)
 
     return [
-        ToolDef("get_recent_reflections", "直近のトレード振り返り",
+        ToolDef("get_recent_reflections",
+                "指定ペアの直近トレード振り返り (スペック §5)",
                 {"type": "object",
-                 "properties": {"n": {"type": "integer", "minimum": 1,
+                 "properties": {"pair": {"type": "string"},
+                                "n": {"type": "integer", "minimum": 1,
                                       "maximum": 20}},
-                 "required": []}, get_recent_reflections),
+                 "required": ["pair"]}, get_recent_reflections),
         ToolDef("search_reflections", "過去の振り返りの意味検索 (類似局面)",
                 {"type": "object",
                  "properties": {"query": {"type": "string"}},
                  "required": ["query"]}, search_reflections),
     ]
+```
+
+`src/agentic_fx/store/reflections.py` に追記:
+
+```python
+def recent_for_pair(conn: sqlite3.Connection, pair: str, n: int) -> list[dict]:
+    return [dict(r) for r in conn.execute(
+        "SELECT r.* FROM reflections r JOIN orders o ON o.id = r.order_id "
+        "WHERE o.pair = ? ORDER BY r.created_at DESC LIMIT ?", (pair, n))]
 ```
 
 - [ ] **Step 4: テストが通ることを確認**
@@ -724,7 +785,9 @@ git commit -m "feat: Phase 1 ツール群 (market/news/account/reflection — �
 
 **Interfaces:**
 - Produces: `class LocalRunner(AgentRunner)`:
-  - `__init__(self, *, base_url: str, model: str, registry: ToolRegistry, transport: httpx.BaseTransport | None = None)` — transport はテスト注入用 (`httpx.MockTransport`)。実運用は None (通常の接続)
+  - `__init__(self, *, base_url: str, model: str, registry: ToolRegistry, transport: httpx.BaseTransport | None = None, time_fn: Callable[[], float] = time.monotonic)` — transport はテスト注入用 (`httpx.MockTransport`)、time_fn は deadline テスト注入用
+  - **deadline 規則 (timeout が常に優先 — 設計書 §4)**: HTTP timeout には残り時間をそのまま渡す (最低値で延長しない)。**HTTP 応答後・各ツール実行後・最終出力検証の直前・ループ終了時にも deadline を確認**し、超過していれば結果に関係なく `timeout` を返す。ループ上限に達した場合も期限超過なら `timeout`、そうでなければ `max_turns`
+  - ツール実行自体に個別タイムアウトは持たない (プロセス内同期呼び出しのため)。防御は ①各ツールの外部呼び出しが自前 timeout を持つこと (プラン 3 の httpx/yfinance は全て timeout 指定済み) ②ツール実行後の deadline 確認 — の 2 層 (この制約を docstring に明記)
   - `run(self, mission: Mission) -> MissionResult`:
     1. `messages = [{"role": "user", "content": mission.prompt}]`
     2. ループ (最大 `mission.max_turns` ターン): `POST {base_url}/chat/completions` body = `{model, messages, tools: registry.openai_tools(mission.tools), tool_choice: "auto"}`。HTTP timeout は**残り時間** (`deadline - now`、最低 1 秒)
@@ -828,12 +891,18 @@ Expected: FAIL (ImportError)
 `src/agentic_fx/runners/local_runner.py`:
 
 ```python
-"""LocalRunner — llama-swap OpenAI 互換 API への自前 tool-calling loop (設計書 §4)。"""
+"""LocalRunner — llama-swap OpenAI 互換 API への自前 tool-calling loop (設計書 §4)。
+
+deadline 規則: timeout_sec が常に優先。HTTP・ツール実行・最終検証のどの段階でも
+期限を過ぎていれば timeout を返す。ツール実行自体は同期呼び出しのため個別
+タイムアウトを持たない — ツール内の外部アクセスが自前 timeout を持つこと
+(プラン 3) と、実行後の deadline 確認の 2 層で防御する。"""
 from __future__ import annotations
 
 import json
 import logging
 import time
+from typing import Callable
 
 import httpx
 import jsonschema
@@ -848,20 +917,25 @@ _MAX_REPAIR_RETRIES = 2
 
 class LocalRunner(AgentRunner):
     def __init__(self, *, base_url: str, model: str, registry: ToolRegistry,
-                 transport: httpx.BaseTransport | None = None) -> None:
+                 transport: httpx.BaseTransport | None = None,
+                 time_fn: Callable[[], float] = time.monotonic) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._registry = registry
         self._client = httpx.Client(transport=transport)
+        self._time = time_fn
 
     def run(self, mission: Mission) -> MissionResult:
-        deadline = time.monotonic() + mission.timeout_sec
+        deadline = self._time() + mission.timeout_sec
         messages: list[dict] = [{"role": "user", "content": mission.prompt}]
         tools = self._registry.openai_tools(mission.tools)
         parse_retries = schema_retries = 0
 
+        def timed_out() -> bool:
+            return self._time() >= deadline
+
         for _turn in range(mission.max_turns):
-            remaining = deadline - time.monotonic()
+            remaining = deadline - self._time()
             if remaining <= 0:
                 return MissionResult("timeout", None, messages)
             try:
@@ -869,28 +943,40 @@ class LocalRunner(AgentRunner):
                     f"{self._base_url}/chat/completions",
                     json={"model": self._model, "messages": messages,
                           "tools": tools, "tool_choice": "auto"},
-                    timeout=max(remaining, 1.0))
+                    timeout=remaining)
                 resp.raise_for_status()
             except httpx.TimeoutException:
                 return MissionResult("timeout", None, messages)
             except httpx.HTTPError as e:
                 _log.warning("llama-swap request failed: %s", e)
                 return MissionResult("failed", None, messages)
+            if timed_out():
+                return MissionResult("timeout", None, messages)
 
-            msg = resp.json()["choices"][0]["message"]
+            try:
+                msg = resp.json()["choices"][0]["message"]
+                if not isinstance(msg, dict):
+                    raise TypeError("message is not an object")
+            except Exception as e:  # noqa: BLE001 — 不正応答は failed
+                _log.warning("malformed llama-swap response: %s", e)
+                return MissionResult("failed", None, messages)
             messages.append(msg)
 
             if msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     try:
                         args = json.loads(tc["function"]["arguments"] or "{}")
-                    except json.JSONDecodeError:
-                        args = {}
-                    result = self._registry.execute(
-                        tc["function"]["name"], args, mission.tools)
+                        result = self._registry.execute(
+                            tc["function"]["name"], args, mission.tools)
+                    except json.JSONDecodeError as e:
+                        # 引数破損は LLM に通知して再呼び出しさせる
+                        result = json.dumps(
+                            {"error": f"tool arguments are not valid JSON: {e}"})
                     messages.append({"role": "tool",
                                      "tool_call_id": tc["id"],
                                      "content": result})
+                    if timed_out():
+                        return MissionResult("timeout", None, messages)
                 continue
 
             content = msg.get("content") or ""
@@ -916,9 +1002,12 @@ class LocalRunner(AgentRunner):
                                             f"{e.message}。修正して JSON のみ"
                                             f"再出力してください。"})
                 continue
+            if timed_out():
+                return MissionResult("timeout", None, messages)
             return MissionResult("completed", output, messages)
 
-        return MissionResult("max_turns", None, messages)
+        status = "timeout" if timed_out() else "max_turns"
+        return MissionResult(status, None, messages)
 ```
 
 - [ ] **Step 4: テストが通ることを確認**
@@ -1024,6 +1113,70 @@ def test_network_timeout_is_timeout():
         raise httpx.ConnectTimeout("slow")
     r = _runner(handler).run(_mission())
     assert r.status == "timeout"
+
+
+class FakeTime:
+    """呼ばれるたびに advance 秒進む単調時計。"""
+
+    def __init__(self, advance=0.0):
+        self.t = 0.0
+        self.advance = advance
+
+    def __call__(self):
+        v = self.t
+        self.t += self.advance
+        return v
+
+
+def _runner_with_time(script, time_fn):
+    state = {"i": 0}
+
+    def handler(request):  # noqa: ANN001
+        msg = script[min(state["i"], len(script) - 1)]
+        state["i"] += 1
+        return httpx.Response(200, json={"choices": [{"message": msg}]})
+
+    from agentic_fx.runners.local_runner import LocalRunner
+    return LocalRunner(base_url="http://test/v1", model="m",
+                       registry=ToolRegistry(),
+                       transport=httpx.MockTransport(handler),
+                       time_fn=time_fn)
+
+
+def test_deadline_checked_after_response():
+    # 応答自体は返るが、その間に期限超過 → completed でなく timeout
+    good = {"role": "assistant", "content": '{"action": "hold"}'}
+    runner = _runner_with_time([good], FakeTime(advance=20.0))
+    r = runner.run(_mission(timeout_sec=30))  # 2 回目の時刻参照で 20s、3 回目で 40s
+    assert r.status == "timeout"
+
+
+def test_final_turn_over_deadline_is_timeout_not_max_turns():
+    tool_call = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "c", "type": "function",
+         "function": {"name": "nope", "arguments": "{}"}}]}
+    runner = _runner_with_time([tool_call], FakeTime(advance=10.0))
+    r = runner.run(_mission(max_turns=2, timeout_sec=15))
+    assert r.status == "timeout"  # ループ上限と期限超過が同時なら timeout 優先
+
+
+def test_malformed_response_is_failed():
+    def handler(request):  # noqa: ANN001
+        return httpx.Response(200, json={"choices": []})
+    r = _runner(handler).run(_mission())
+    assert r.status == "failed"
+
+
+def test_broken_tool_arguments_reported_to_llm():
+    tool_call = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "c1", "type": "function",
+         "function": {"name": "nope", "arguments": "{broken json"}}]}
+    good = {"role": "assistant", "content": '{"action": "hold"}'}
+    runner = _runner([tool_call, good])
+    r = runner.run(_mission())
+    assert r.status == "completed"
+    tool_msgs = [m for m in r.transcript if m.get("role") == "tool"]
+    assert tool_msgs and "not valid JSON" in tool_msgs[0]["content"]
 ```
 
 - [ ] **Step 2: テストを実行**
