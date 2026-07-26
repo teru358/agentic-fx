@@ -515,9 +515,33 @@ def test_example_file_loads():
     assert s.risk.rr_min == 1.5
     assert s.risk.risk_per_trade_pct == 0.5
     assert s.risk.swing_risk_factor == 0.5
+    assert s.risk.max_total_risk_pct == 1.5
+    assert s.risk.max_leverage == 10
+    assert s.risk.pair_rules["USDJPY"].sl_distance_min_pips == 5
+    assert s.risk.pair_rules["USDJPY"].assumed_spread_pips == 1.0
     assert s.runner.trade.backend == "local"
     assert s.datafeed.yfinance.enabled is True
     assert s.datafeed.mt5.enabled is False
+
+
+def test_pair_without_rule_rejected(tmp_path):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["pairs"] = ["USDJPY", "GBPUSD"]  # GBPUSD の pair_rules がない
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError, match="GBPUSD"):
+        load_settings(p)
+
+
+def test_sl_min_must_be_lt_max(tmp_path):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["risk"]["pair_rules"]["USDJPY"]["sl_distance_min_pips"] = 300
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError):
+        load_settings(p)
 
 
 def test_missing_file_raises():
@@ -532,12 +556,33 @@ def test_invalid_yaml_key_raises(tmp_path):
         load_settings(p)
 
 
-def test_kill_switch_cannot_be_disabled():
-    # Settings に kill switch を無効化するフィールドが存在しないこと (構造的担保)
-    fields = set()
-    for model in (Settings, *Settings.__annotations__.values()):
-        fields |= set(getattr(model, "model_fields", {}))
-    assert not any("kill" in f and ("enable" in f or "disable" in f) for f in fields)
+def test_kill_switch_cannot_be_disabled(tmp_path):
+    # 全モデルを再帰的に走査し、kill switch を無効化するフィールドが存在しないこと (構造的担保)
+    from pydantic import BaseModel
+
+    seen: set[type] = set()
+
+    def walk(model: type[BaseModel]):
+        if model in seen:
+            return
+        seen.add(model)
+        for name, field in model.model_fields.items():
+            assert not ("kill" in name and ("enable" in name or "disable" in name)), name
+            ann = field.annotation
+            for t in (ann, *getattr(ann, "__args__", ())):
+                if isinstance(t, type) and issubclass(t, BaseModel):
+                    walk(t)
+
+    walk(Settings)
+
+    # 無効化キーを混入させると ConfigError (extra="forbid")
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["risk"]["kill_switch_enabled"] = False
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError, match="kill_switch_enabled"):
+        load_settings(p)
 
 
 def test_unknown_top_level_key_rejected(tmp_path):
@@ -565,14 +610,18 @@ risk:
   risk_per_trade_pct: 0.5     # 1 取引リスク上限 (% of equity)
   swing_risk_factor: 0.5      # horizon=swing のリスク率係数 (常時半減)
   max_positions: 2            # 未約定指値も枠にカウント
+  max_total_risk_pct: 1.5     # 最大総エクスポージャー: 全ポジション + 未約定指値の予約リスク合算 (% of equity)
+  max_leverage: 10            # 必要証拠金ベースのレバレッジ上限
   daily_loss_limit_pct: 1.0   # 日初エクイティ比
   drawdown_kill_pct: 2.0      # HWM 比。kill switch 自体の無効化キーは存在しない
   limit_deviation_pct: 0.5    # 指値の現値乖離上限
   limit_expiry_max_h: 24
-  sl_distance_min_pips: 5
-  sl_distance_max_pips: 200
   max_slippage_pct: 0.1
   friday_swing_cutoff_utc: "18:00"  # 金曜この時刻以降の新規 swing 建て禁止
+  commission_per_lot: 0.0     # 往復手数料 (口座通貨建て、sizing のリスク額に算入)
+  pair_rules:                 # ペア毎の SL 距離制約 + 想定 spread (設計書 §5: SL 距離は pair 毎 config)
+    USDJPY: {sl_distance_min_pips: 5, sl_distance_max_pips: 200, assumed_spread_pips: 1.0}
+    EURUSD: {sl_distance_min_pips: 5, sl_distance_max_pips: 200, assumed_spread_pips: 1.0}
 
 runner:
   trade:   {backend: local, model: qwen3.6-35b}
@@ -618,7 +667,7 @@ from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 
 class ConfigError(Exception):
@@ -629,19 +678,33 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class PairRule(_Strict):
+    sl_distance_min_pips: float = Field(gt=0)
+    sl_distance_max_pips: float = Field(gt=0)
+    assumed_spread_pips: float = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _min_lt_max(self) -> "PairRule":
+        if self.sl_distance_min_pips >= self.sl_distance_max_pips:
+            raise ValueError("sl_distance_min_pips must be < sl_distance_max_pips")
+        return self
+
+
 class RiskSettings(_Strict):
     rr_min: float = Field(gt=0)
     risk_per_trade_pct: float = Field(gt=0, le=5)
     swing_risk_factor: float = Field(gt=0, le=1)
     max_positions: int = Field(ge=1)
+    max_total_risk_pct: float = Field(gt=0)
+    max_leverage: float = Field(gt=0)
     daily_loss_limit_pct: float = Field(gt=0)
     drawdown_kill_pct: float = Field(gt=0)
     limit_deviation_pct: float = Field(gt=0)
     limit_expiry_max_h: float = Field(gt=0, le=24)
-    sl_distance_min_pips: float = Field(gt=0)
-    sl_distance_max_pips: float = Field(gt=0)
     max_slippage_pct: float = Field(gt=0)
     friday_swing_cutoff_utc: str = "18:00"
+    commission_per_lot: float = Field(ge=0)
+    pair_rules: dict[str, PairRule]
 
 
 class RunnerChoice(_Strict):
@@ -707,6 +770,13 @@ class Settings(_Strict):
     api: ApiSettings
     discord: DiscordSettings
 
+    @model_validator(mode="after")
+    def _pair_rules_cover_pairs(self) -> "Settings":
+        missing = [p for p in self.pairs if p not in self.risk.pair_rules]
+        if missing:
+            raise ValueError(f"risk.pair_rules missing for pairs: {missing}")
+        return self
+
 
 def load_settings(path: Path) -> Settings:
     load_dotenv()
@@ -771,6 +841,17 @@ def test_idempotent_setup(tmp_path):
     l2 = setup_technical_logging(tmp_path)
     assert l1 is l2
     assert len(l2.handlers) == 1
+
+
+def test_reinit_with_different_dir_switches_file(tmp_path):
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    setup_technical_logging(dir_a).info("to-a")
+    logger = setup_technical_logging(dir_b)
+    logger.info("to-b")
+    assert len(logger.handlers) == 1
+    assert "to-b" not in (dir_a / "agentic.log").read_text(encoding="utf-8")
+    assert "to-b" in (dir_b / "agentic.log").read_text(encoding="utf-8")
 ```
 
 - [ ] **Step 2: テストが失敗することを確認**
@@ -795,15 +876,20 @@ _FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 def setup_technical_logging(log_dir: Path, level: str = "INFO") -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
+    target = (log_dir / "agentic.log").resolve()
     logger = logging.getLogger("agentic_fx")
     logger.setLevel(level.upper())
     logger.propagate = False
-    if not logger.handlers:
-        handler = RotatingFileHandler(
-            log_dir / "agentic.log", maxBytes=10 * 1024 * 1024,
-            backupCount=5, encoding="utf-8")
-        handler.setFormatter(logging.Formatter(_FORMAT))
-        logger.addHandler(handler)
+    # 同一パスなら既存 handler を再利用、異なるパスなら close して差し替える
+    for h in list(logger.handlers):
+        if isinstance(h, RotatingFileHandler) and Path(h.baseFilename) == target:
+            return logger
+        logger.removeHandler(h)
+        h.close()
+    handler = RotatingFileHandler(target, maxBytes=10 * 1024 * 1024,
+                                  backupCount=5, encoding="utf-8")
+    handler.setFormatter(logging.Formatter(_FORMAT))
+    logger.addHandler(handler)
     return logger
 ```
 
@@ -2051,10 +2137,10 @@ git commit -m "feat: 状態ストア (mode/autopilot、atomic write、config 非
 
 **Interfaces:**
 - Produces:
-  - `service.run_init(root: Path, *, assume_yes: bool = False) -> int` — ①`config/settings.yaml` が無ければ example をコピー ②`data/` `logs/` 作成 ③DB 初期化 (11 テーブル) ④state を `initialized=True, mode=learning` で保存 ⑤activity SYSTEM に `init_completed` を記録。戻り値は exit code (0 成功)。`assume_yes=False` かつ TTY のときのみ上書き確認プロンプト (テストは `assume_yes=True` を使う)
+  - `service.run_init(root: Path) -> int` — ①`config/settings.yaml` が無ければ example をコピー (**既存ファイルは決して上書きしない** — 冪等) ②`data/` `logs/` 作成 ③DB 初期化 (11 テーブル) ④state を **`initialized=True, mode=learning, autopilot=False` で明示保存** (再実行時も学習モードへ戻す — 安全方向のリセット。trading への切替は `mode` コマンドのみ) ⑤activity SYSTEM に `init_completed` を記録。戻り値は exit code (0 成功)
   - `service.ensure_initialized(root: Path) -> None` — 未 init なら **`SystemExit(2)`** with メッセージ「`uv run main.py init` を先に実行」
   - `service.run_service(root: Path) -> int` — 本プランでは**起動ガード通過後に「サービス本体はプラン 5 で実装」と表示して exit 0** するスタブ (ガード自体は本物)
-  - `entry.main(argv: list[str] | None = None) -> int` — `init [--yes]` / 引数なし (= run_service)。`[project.scripts] afx` と `main.py` の両方から呼ばれる
+  - `entry.main(argv: list[str] | None = None) -> int` — `init` / 引数なし (= run_service)。`[project.scripts] afx` と `main.py` の両方から呼ばれる。init は非対話・冪等 (プロンプトなし。対話的な接続確認はプラン 3/5 で追加)
   - パス規約: `root` 直下に `config/` `data/` `logs/` `policy/`。DB は `data/agentic.db`、state は `data/state/app_state.json`
 
 - [ ] **Step 1: 失敗するテストを書く**
@@ -2085,7 +2171,7 @@ def test_guard_blocks_before_init(tmp_path):
 
 def test_init_creates_everything(tmp_path):
     _example(tmp_path)
-    assert run_init(tmp_path, assume_yes=True) == 0
+    assert run_init(tmp_path) == 0
     assert (tmp_path / "config" / "settings.yaml").exists()
     assert (tmp_path / "data" / "agentic.db").exists()
     conn = connect(tmp_path / "data" / "agentic.db")
@@ -2102,14 +2188,29 @@ def test_init_creates_everything(tmp_path):
 
 def test_init_is_idempotent(tmp_path):
     _example(tmp_path)
-    assert run_init(tmp_path, assume_yes=True) == 0
-    assert run_init(tmp_path, assume_yes=True) == 0  # 既存 settings.yaml は保持
+    assert run_init(tmp_path) == 0
+    marker = tmp_path / "config" / "settings.yaml"
+    marker.write_text(marker.read_text() + "\n# user edit\n")
+    assert run_init(tmp_path) == 0
+    assert "# user edit" in marker.read_text()  # 既存 settings.yaml を上書きしない
+
+
+def test_reinit_resets_mode_to_learning(tmp_path):
+    from agentic_fx.core.contracts import Mode
+    _example(tmp_path)
+    run_init(tmp_path)
+    store = StateStore(tmp_path / "data" / "state" / "app_state.json")
+    store.update(mode=Mode.TRADING, autopilot=True)
+    run_init(tmp_path)  # 再 init は安全方向へリセット
+    s = store.load()
+    assert s.mode is Mode.LEARNING
+    assert s.autopilot is False
 
 
 def test_entry_init_subcommand(tmp_path, monkeypatch):
     _example(tmp_path)
     monkeypatch.chdir(tmp_path)
-    assert entry_main(["init", "--yes"]) == 0
+    assert entry_main(["init"]) == 0
 
 
 def test_entry_default_requires_init(tmp_path, monkeypatch):
@@ -2140,6 +2241,7 @@ from pathlib import Path
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_settings
+from agentic_fx.core.contracts import Mode
 from agentic_fx.logging_setup import setup_technical_logging
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.state import StateStore
@@ -2156,7 +2258,7 @@ def ensure_initialized(root: Path) -> None:
         raise SystemExit(2)
 
 
-def run_init(root: Path, *, assume_yes: bool = False) -> int:
+def run_init(root: Path) -> int:
     cfg_dir = root / "config"
     example = cfg_dir / "settings.yaml.example"
     target = cfg_dir / "settings.yaml"
@@ -2174,11 +2276,13 @@ def run_init(root: Path, *, assume_yes: bool = False) -> int:
     conn = connect(root / "data" / "agentic.db")
     init_db(conn)
 
-    _state_store(root).update(initialized=True)
+    # 再実行時も安全方向へ明示リセット (trading 復帰は mode コマンドのみ)
+    _state_store(root).update(initialized=True, mode=Mode.LEARNING,
+                              autopilot=False)
 
     ActivityLog(root / "logs" / "activity.log").write(
         Category.SYSTEM, "init_completed",
-        f"pairs={settings.pairs} mode=learning")
+        f"pairs={settings.pairs} mode=learning autopilot=off")
     print("初期化が完了しました。`uv run main.py` でサービスを起動できます。")
     return 0
 
@@ -2205,14 +2309,12 @@ from agentic_fx import service
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="afx", description="agentic-fx")
     sub = parser.add_subparsers(dest="command")
-    p_init = sub.add_parser("init", help="設定ウィザード (唯一のウィザード)")
-    p_init.add_argument("--yes", action="store_true",
-                        help="確認プロンプトなしでデフォルトを使用")
+    sub.add_parser("init", help="初期設定 (非対話・冪等。既存 settings.yaml は上書きしない)")
     args = parser.parse_args(argv)
 
     root = Path.cwd()
     if args.command == "init":
-        return service.run_init(root, assume_yes=args.yes)
+        return service.run_init(root)
     return service.run_service(root)
 
 
@@ -2238,7 +2340,7 @@ Expected: PASS
 
 ```bash
 uv run main.py            # → exit 2 (init 未完了メッセージ)
-uv run main.py init --yes # → 初期化完了
+uv run main.py init       # → 初期化完了
 uv run main.py            # → ガード通過メッセージ
 git status                # data/ logs/ config/settings.yaml が untracked に出ないこと (gitignore 確認)
 ```
