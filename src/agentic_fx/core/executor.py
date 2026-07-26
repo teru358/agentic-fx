@@ -194,13 +194,15 @@ class Executor:
                                       reject_reason=None)
         quote = self.quote_fn(row["pair"])
         price = quote.bid if row["direction"] == "long" else quote.ask
-        self.close_order(row, price, reason="llm_close")
-        return {"result": "closed", "order_id": row["id"], "reasons": []}
+        final = self.close_order(row, price, reason="llm_close")
+        result = "closed" if final == S.CLOSED else "unknown"
+        return {"result": result, "order_id": row["id"], "reasons": []}
 
-    def close_order(self, row: dict, price: float, reason: str) -> None:
+    def close_order(self, row: dict, price: float, reason: str) -> S:
         """裁量クローズ・SL/TP・強制クローズ共通の決定論的クローズ経路。
         結果不明は closed 扱いにしない (設計書 §12)。snapshot は scheduler の
-        mark-to-market が記録する。"""
+        mark-to-market が記録する。戻り値は遷移後の状態
+        (S.CLOSED / S.CLOSE_UNKNOWN) — cancel_order と対称。"""
         now = self.clock.now()
         spec = self.spec_fn(row["pair"])
         transitions.transition(self.conn, row["id"], S.CLOSING, now,
@@ -212,7 +214,7 @@ class Executor:
                                 f"{row['pair']} — reconcile 待ち",
                                 ref_id=str(row["id"]))
             self.notifier.send(f"[agentic-fx] クローズ結果不明 #{row['id']}")
-            return
+            return S.CLOSE_UNKNOWN
         pnl = compute_pnl(row, price, contract_size=spec.contract_size,
                           commission_per_lot=self.settings.risk.commission_per_lot)
         transitions.transition(self.conn, row["id"], S.CLOSED, now,
@@ -221,6 +223,7 @@ class Executor:
         self.activity.write(Category.TRADE, "order_closed",
                             f"{row['pair']} pnl={pnl:.0f} reason={reason}",
                             ref_id=str(row["id"]))
+        return S.CLOSED
 
     def cancel_order(self, row: dict, reason: str) -> S:
         """取消の共通経路 (LLM cancel / 期限切れ / 予約維持 / クローズ移行)。

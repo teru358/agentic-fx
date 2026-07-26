@@ -136,6 +136,35 @@ def test_close_open_position(tmp_path):
     row = orders.get(conn, oid)
     assert row["status"] == "closed"
     assert row["realized_pnl"] is not None
+    assert row["closed_at"] is not None
+
+
+def test_close_order_returns_final_status(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    it = _open_intent(entry_type="market", limit_price=None, expires_in=None,
+                      stop_loss=148.00, take_profit=149.60)
+    oid = ex.handle_intent(it, mid)["order_id"]
+    row = orders.get(conn, oid)
+    from agentic_fx.core.contracts import OrderStatus as S
+    final = ex.close_order(row, 148.60, reason="test")
+    assert final == S.CLOSED
+
+
+def test_close_unknown_via_handle_intent_does_not_report_closed(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    it = _open_intent(entry_type="market", limit_price=None, expires_in=None,
+                      stop_loss=148.00, take_profit=149.60)
+    oid = ex.handle_intent(it, mid)["order_id"]
+    ex.broker = StubBroker(close_status="unknown")
+    close = TradeIntent.from_llm_dict({"action": "close", "order_id": oid},
+                                      origin=Origin.SCHEDULER)
+    out = ex.handle_intent(close, mid)
+    assert out["result"] != "closed"
+    assert out["result"] == "unknown"
+    row = orders.get(conn, oid)
+    assert row["status"] == "close_unknown"
+    assert row["realized_pnl"] is None
+    assert row["closed_at"] is None
 
 
 def test_cancel_pending(tmp_path):
@@ -211,10 +240,13 @@ def test_close_unknown_not_marked_closed(tmp_path):
     oid = ex.handle_intent(it, mid)["order_id"]
     ex.broker = StubBroker(close_status="unknown")
     row = orders.get(conn, oid)
-    ex.close_order(row, 148.60, reason="test")
+    from agentic_fx.core.contracts import OrderStatus as S
+    final = ex.close_order(row, 148.60, reason="test")
+    assert final == S.CLOSE_UNKNOWN
     row = orders.get(conn, oid)
     assert row["status"] == "close_unknown"
     assert row["realized_pnl"] is None  # closed 扱いにしない
+    assert row["closed_at"] is None
 
 
 def test_cancel_rejected_means_fill_race(tmp_path):
