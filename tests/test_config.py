@@ -10,6 +10,7 @@ EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "settings.yaml.exampl
 def test_example_file_loads():
     s = load_settings(EXAMPLE)
     assert isinstance(s, Settings)
+    assert s.display_timezone == "Asia/Tokyo"
     assert s.pairs == ["USDJPY"]
     assert s.risk.rr_min == 1.5
     assert s.risk.risk_per_trade_pct == 0.5
@@ -95,3 +96,23 @@ def test_paper_settings():
     s = load_settings(EXAMPLE)
     assert s.paper.starting_balance == 1_000_000
     assert s.paper.currency == "JPY"
+
+
+def test_display_timezone_defaults_to_utc(tmp_path):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    del raw["display_timezone"]
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    s = load_settings(p)
+    assert s.display_timezone == "UTC"
+
+
+def test_invalid_display_timezone_rejected(tmp_path):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["display_timezone"] = "Not/A_Real_Zone"
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError, match="not a known IANA timezone"):
+        load_settings(p)

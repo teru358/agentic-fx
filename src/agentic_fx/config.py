@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel, ConfigDict, Field, ValidationError, field_validator,
+    model_validator,
+)
 
 
 class ConfigError(Exception):
@@ -40,7 +44,9 @@ class RiskSettings(_Strict):
     limit_deviation_pct: float = Field(gt=0)
     limit_expiry_max_h: float = Field(gt=0, le=24)
     max_slippage_pct: float = Field(gt=0)
-    friday_swing_cutoff_utc: str = "18:00"
+    # NY 現地時間。市場クローズ (NY 金 17:00) からの逆算で指定する
+    # (America/New_York は DST を跨ぐため、UTC 固定だと季節でずれる)
+    friday_swing_cutoff_ny: str = "14:00"
     commission_per_lot: float = Field(ge=0)
     pair_rules: dict[str, PairRule]
 
@@ -102,6 +108,8 @@ class PaperSettings(_Strict):
 
 
 class Settings(_Strict):
+    # ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)
+    display_timezone: str = "UTC"
     pairs: list[str] = Field(min_length=1)
     risk: RiskSettings
     runner: RunnerSettings
@@ -113,6 +121,16 @@ class Settings(_Strict):
     api: ApiSettings
     discord: DiscordSettings
     paper: PaperSettings
+
+    @field_validator("display_timezone")
+    @classmethod
+    def _valid_display_timezone(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except ZoneInfoNotFoundError as e:
+            raise ValueError(f"invalid display_timezone: {v!r} is not a "
+                             f"known IANA timezone") from e
+        return v
 
     @model_validator(mode="after")
     def _pair_rules_cover_pairs(self) -> "Settings":

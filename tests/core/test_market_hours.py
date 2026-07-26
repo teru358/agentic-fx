@@ -31,9 +31,12 @@ def test_next_rollover():
 
 
 def test_friday_cutoff():
-    assert is_friday_after(_dt(2026, 7, 24, 18, 30), "18:00") is True
-    assert is_friday_after(_dt(2026, 7, 24, 17, 59), "18:00") is False
-    assert is_friday_after(_dt(2026, 7, 23, 19, 0), "18:00") is False  # 木曜
+    """cutoff は NY 現地時間の hh:mm (friday_swing_cutoff_ny)。
+    夏 (EDT, UTC-4) では 18:00 UTC = NY 14:00 なので、cutoff "14:00" は
+    旧 UTC 固定 "18:00" と夏時間においては同じ境界になる。"""
+    assert is_friday_after(_dt(2026, 7, 24, 18, 30), "14:00") is True   # NY 14:30
+    assert is_friday_after(_dt(2026, 7, 24, 17, 59), "14:00") is False  # NY 13:59
+    assert is_friday_after(_dt(2026, 7, 23, 19, 0), "14:00") is False   # 木曜 (NY 15:00 木)
 
 
 def test_timezone_normalization():
@@ -57,8 +60,9 @@ def test_timezone_normalization():
     assert next_rollover(jst_time) == _dt(2026, 7, 24, 21, 0)
     assert next_rollover(utc_time) == _dt(2026, 7, 24, 21, 0)
 
-    # is_friday_after: JST では土曜、UTC では金曜
-    # → UTC に正規化すれば False (金曜 20:00 は "21:00" cutoff 前なので False)
+    # is_friday_after: JST では土曜、UTC では金曜、NY (夏時間) では金曜 16:00
+    # → いずれの表現でも同一の瞬間なので、NY 現地時間に正規化して判定すれば
+    #   金曜 16:00 は "21:00" cutoff 前なので False
     assert is_friday_after(jst_time, "21:00") is False
     assert is_friday_after(utc_time, "21:00") is False
 
@@ -78,6 +82,28 @@ def test_winter_dst_boundary_is_22_00_utc():
     assert trading_day_start(_dt(2026, 1, 14, 23, 0)) == _dt(2026, 1, 14, 22, 0)
 
     assert next_rollover(_dt(2026, 1, 14, 12, 0)) == _dt(2026, 1, 14, 22, 0)
+
+
+def test_friday_cutoff_dst_invariant():
+    """friday_swing_cutoff_ny のデフォルト "14:00" は NY 現地時間基準なので、
+    市場クローズ (NY 金 17:00) までの残り時間が季節によってずれない。"""
+    # 夏 (EDT, UTC-4): 18:30 UTC = NY 14:30 → cutoff 14:00 以降なので True
+    assert is_friday_after(_dt(2026, 7, 24, 18, 30), "14:00") is True
+    # 冬 (EST, UTC-5): 同じ 18:30 UTC でも NY 13:30 → cutoff 14:00 未満なので False
+    #   (UTC の時刻だけで判定する旧実装なら、ここで誤って True になってしまっていた)
+    assert is_friday_after(_dt(2026, 1, 16, 18, 30), "14:00") is False
+    # 冬に NY 14:00 ちょうどになる UTC 時刻 (19:00 UTC) では True
+    assert is_friday_after(_dt(2026, 1, 16, 19, 0), "14:00") is True
+
+
+def test_friday_cutoff_utc_ny_weekday_mismatch():
+    """UTC の曜日と NY の曜日が食い違うケース: 土曜 00:30 UTC (夏時間) は
+    NY では金曜 20:30。市場は既にクローズしているので実害はないが、
+    is_friday_after は NY 現地の曜日で判定するため True を返す
+    (UTC の曜日だけで判定していた旧実装ではここが False になってしまっていた)。"""
+    sat_utc = _dt(2026, 7, 25, 0, 30)
+    assert sat_utc.weekday() == 5  # UTC では土曜
+    assert is_friday_after(sat_utc, "20:00") is True  # NY では金曜 20:30
 
 
 def test_naive_datetime_rejected():

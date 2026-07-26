@@ -1,4 +1,5 @@
 import logging
+import time
 
 from agentic_fx.logging_setup import setup_technical_logging
 
@@ -31,3 +32,19 @@ def test_reinit_with_different_dir_switches_file(tmp_path):
     assert len(logger.handlers) == 1
     assert "to-b" not in (dir_a / "agentic.log").read_text(encoding="utf-8")
     assert "to-b" in (dir_b / "agentic.log").read_text(encoding="utf-8")
+
+
+def test_technical_log_timestamps_are_utc(tmp_path):
+    """技術ログは activity ログ (UTC) と突き合わせられるよう、UTC で統一する。
+    ローカルタイムゾーンに依存しない検証: converter が time.gmtime であること
+    (= localtime を使っていないこと) と、フォーマットに UTC 表記が含まれること。
+    """
+    logger = setup_technical_logging(tmp_path, level="INFO")
+    formatter = logger.handlers[0].formatter
+    assert formatter.converter is time.gmtime
+    fmt_text = (formatter._fmt or "") + (formatter.datefmt or "")
+    assert "UTC" in fmt_text
+
+    logger.info("utc-timestamp-check")
+    text = (tmp_path / "agentic.log").read_text(encoding="utf-8")
+    assert "UTC" in text

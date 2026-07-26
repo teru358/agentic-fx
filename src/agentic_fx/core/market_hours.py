@@ -6,8 +6,11 @@
 しまう (資金制限の意味が変わる)。`zoneinfo.ZoneInfo("America/New_York")` で
 現地 17:00 から UTC 境界を構成することで DST を吸収する。
 
-`is_friday_after` は設定キー `friday_swing_cutoff_utc` の名前が示すとおり
-明示的に UTC 基準の cutoff であり、NY 現地時間化の対象外 (意図的)。
+`is_friday_after` も設定キー `friday_swing_cutoff_ny` の名前が示すとおり
+NY 現地時間基準に変更した (レビュー修正: 従来は UTC 固定の cutoff だったため、
+市場クローズ (NY 金 17:00) までの残り時間が DST の季節で 1 時間ずれる欠陥が
+あった)。渡される cutoff_hhmm は NY 現地時間の hh:mm として扱い、曜日判定も
+NY 現地の曜日で行う。
 """
 from __future__ import annotations
 
@@ -48,7 +51,8 @@ def next_rollover(now: datetime) -> datetime:
 
 def is_friday_after(now: datetime, cutoff_hhmm: str) -> bool:
     now = _as_utc(now)
-    if now.weekday() != 4:
+    local = now.astimezone(_NY)
+    if local.weekday() != 4:
         return False
     hh, mm = map(int, cutoff_hhmm.split(":"))
-    return now.timetz().replace(tzinfo=None) >= time(hh, mm)
+    return local.timetz().replace(tzinfo=None) >= time(hh, mm)

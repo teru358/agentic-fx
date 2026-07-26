@@ -1,4 +1,6 @@
 # agentic-fx 設定 (このファイルを settings.yaml にコピーして編集。新キー追加時は両方を同期)
+display_timezone: Asia/Tokyo  # ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)
+
 pairs: [USDJPY]  # EURUSD 等クォート通貨が口座通貨と異なるペアは、口座通貨換算の実装 (為替レート取得) 後に有効化する
 
 risk:
@@ -13,7 +15,7 @@ risk:
   limit_deviation_pct: 0.5    # 指値の現値乖離上限
   limit_expiry_max_h: 24
   max_slippage_pct: 0.1
-  friday_swing_cutoff_utc: "18:00"  # 金曜この時刻以降の新規 swing 建て禁止
+  friday_swing_cutoff_ny: "14:00"  # NY 現地時間。市場クローズ (NY 金 17:00) からの逆算で指定する。この時刻以降の新規 swing 建て禁止
   commission_per_lot: 0.0     # 往復手数料 (口座通貨建て、sizing のリスク額に算入)
   pair_rules:                 # ペア毎の SL 距離制約 + 想定 spread (設計書 §5: SL 距離は pair 毎 config)
     USDJPY: {sl_distance_min_pips: 5, sl_distance_max_pips: 200, assumed_spread_pips: 1.0}

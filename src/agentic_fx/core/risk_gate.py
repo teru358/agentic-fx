@@ -178,7 +178,7 @@ def evaluate(intent: TradeIntent, ctx: GateContext,
 
     # 金曜 swing cutoff
     if intent.horizon is Horizon.SWING and \
-            is_friday_after(ctx.now, risk.friday_swing_cutoff_utc):
+            is_friday_after(ctx.now, risk.friday_swing_cutoff_ny):
         reasons.append("friday swing cutoff")
 
     # sizing (fail closed) + 総リスク・レバレッジ
