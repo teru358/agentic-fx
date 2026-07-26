@@ -31,6 +31,7 @@ def test_swing_halves_risk():
                          horizon=Horizon.SWING, pair="USDJPY", spec=SPEC, risk=RISK)
     assert swing.risk_amount == pytest.approx(day.risk_amount / 2)
     assert swing.quantity < day.quantity
+    assert swing.quantity == pytest.approx(0.04)  # swing_risk_factor=0.5 で半減
 
 
 def test_below_min_lot_rejected():
@@ -50,6 +51,7 @@ def test_rounding_is_floor_only():
     # raw が 0.0999 のような場合に 0.10 へ切上げないこと
     r = compute_size(equity=1_019_000, entry_price=148.50, stop_loss=148.00,
                      horizon=Horizon.DAY, pair="USDJPY", spec=SPEC, risk=RISK)
+    assert r.quantity == pytest.approx(0.09)  # 切下げのみ、四捨五入ではない
     assert r.quantity * r.loss_per_lot <= r.risk_amount + 1e-6
 
 
@@ -83,6 +85,47 @@ def test_size_result_values_asserted():
 
 
 def test_unknown_pair_fail_closed():
+    # pair="GBPUSD" is unknown in pair_rules (only USDJPY/EURUSD exist)
+    # Use spec with GBPUSD symbol to avoid mismatch check
+    gbpusd_spec = InstrumentSpec(symbol="GBPUSD", pip_size=0.0001, min_lot=0.01,
+                                 max_lot=50.0, lot_step=0.01, contract_size=100_000)
     with pytest.raises(SizingError, match="pair_rules"):
         compute_size(equity=1_000_000, entry_price=1.1, stop_loss=1.09,
-                     horizon=Horizon.DAY, pair="GBPUSD", spec=SPEC, risk=RISK)
+                     horizon=Horizon.DAY, pair="GBPUSD", spec=gbpusd_spec, risk=RISK)
+
+
+def test_pair_spec_symbol_mismatch_rejected():
+    # Important a: pair="EURUSD" + spec.symbol="USDJPY" は不整合でエラーにすべき
+    eurusd_spec = InstrumentSpec(symbol="EURUSD", pip_size=0.0001, min_lot=0.01,
+                                 max_lot=50.0, lot_step=0.01, contract_size=100_000)
+    with pytest.raises(SizingError, match="pair.*spec.symbol|spec.symbol.*pair"):
+        compute_size(equity=1_000_000, entry_price=1.1, stop_loss=1.09,
+                     horizon=Horizon.DAY, pair="EURUSD", spec=SPEC, risk=RISK)
+
+
+def test_fail_closed_on_none_equity():
+    # Important b: equity=None は SizingError にすべき
+    with pytest.raises(SizingError):
+        compute_size(equity=None, entry_price=148.50, stop_loss=148.00,
+                     horizon=Horizon.DAY, pair="USDJPY", spec=SPEC, risk=RISK)
+
+
+def test_fail_closed_on_none_entry_price():
+    # Important b: entry_price=None は SizingError にすべき
+    with pytest.raises(SizingError):
+        compute_size(equity=1_000_000, entry_price=None, stop_loss=148.00,
+                     horizon=Horizon.DAY, pair="USDJPY", spec=SPEC, risk=RISK)
+
+
+def test_fail_closed_on_none_stop_loss():
+    # Important b: stop_loss=None は SizingError にすべき
+    with pytest.raises(SizingError):
+        compute_size(equity=1_000_000, entry_price=148.50, stop_loss=None,
+                     horizon=Horizon.DAY, pair="USDJPY", spec=SPEC, risk=RISK)
+
+
+def test_fail_closed_on_none_spec():
+    # Important b: spec=None は SizingError にすべき
+    with pytest.raises(SizingError):
+        compute_size(equity=1_000_000, entry_price=148.50, stop_loss=148.00,
+                     horizon=Horizon.DAY, pair="USDJPY", spec=None, risk=RISK)

@@ -22,12 +22,28 @@ class SizeResult:
 def compute_size(*, equity: float, entry_price: float, stop_loss: float,
                  horizon: Horizon, pair: str, spec: InstrumentSpec,
                  risk: RiskSettings) -> SizeResult:
+    # Important b: None check for numeric inputs and spec
+    if spec is None:
+        raise SizingError("spec is None")
+
     for name, v in (("equity", equity), ("entry_price", entry_price),
                     ("stop_loss", stop_loss)):
-        if not math.isfinite(v):
-            raise SizingError(f"{name} is not finite")
+        if v is None:
+            raise SizingError(f"{name} is None")
+        try:
+            if not math.isfinite(v):
+                raise SizingError(f"{name} is not finite")
+        except TypeError:
+            raise SizingError(f"{name} is not a valid number")
+
     if equity <= 0 or entry_price <= 0:
         raise SizingError("equity/entry_price must be positive")
+
+    # Important a: Check pair and spec.symbol match
+    if spec.symbol != pair:
+        raise SizingError(
+            f"pair '{pair}' does not match spec.symbol '{spec.symbol}'")
+
     for name, v in (("pip_size", spec.pip_size), ("lot_step", spec.lot_step),
                     ("contract_size", spec.contract_size),
                     ("min_lot", spec.min_lot), ("max_lot", spec.max_lot)):
