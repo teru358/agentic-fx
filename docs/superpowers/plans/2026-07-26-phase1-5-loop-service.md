@@ -480,7 +480,9 @@ def _loop(tmp_path, results, healthy=True):
     broker = PaperBroker(conn, SETTINGS, clock)
     executor = Executor(conn=conn, broker=broker, settings=SETTINGS,
                         state_store=StateStore(tmp_path / "s.json"),
-                        activity=ActivityLog(tmp_path / "a.log"), clock=clock,
+                        activity=ActivityLog(tmp_path / "a.log"),
+                        notifier=Notifier(enabled=False, webhook_url=None),
+                        clock=clock,
                         quote_fn=lambda p: QUOTE, spec_fn=lambda p: SPEC)
     provider = MagicMock()
     if healthy:
