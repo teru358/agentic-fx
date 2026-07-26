@@ -1,0 +1,53 @@
+# agentic-fx 設定 (このファイルを settings.yaml にコピーして編集。新キー追加時は両方を同期)
+pairs: [USDJPY, EURUSD]
+
+risk:
+  rr_min: 1.5                 # 最小リスク報酬比 (spread 込み)
+  risk_per_trade_pct: 0.5     # 1 取引リスク上限 (% of equity)
+  swing_risk_factor: 0.5      # horizon=swing のリスク率係数 (常時半減)
+  max_positions: 2            # 未約定指値も枠にカウント
+  max_total_risk_pct: 1.5     # 最大総エクスポージャー: 全ポジション + 未約定指値の予約リスク合算 (% of equity)
+  max_leverage: 10            # 必要証拠金ベースのレバレッジ上限
+  daily_loss_limit_pct: 1.0   # 日初エクイティ比
+  drawdown_kill_pct: 2.0      # HWM 比。kill switch 自体の無効化キーは存在しない
+  limit_deviation_pct: 0.5    # 指値の現値乖離上限
+  limit_expiry_max_h: 24
+  max_slippage_pct: 0.1
+  friday_swing_cutoff_utc: "18:00"  # 金曜この時刻以降の新規 swing 建て禁止
+  commission_per_lot: 0.0     # 往復手数料 (口座通貨建て、sizing のリスク額に算入)
+  pair_rules:                 # ペア毎の SL 距離制約 + 想定 spread (設計書 §5: SL 距離は pair 毎 config)
+    USDJPY: {sl_distance_min_pips: 5, sl_distance_max_pips: 200, assumed_spread_pips: 1.0}
+    EURUSD: {sl_distance_min_pips: 5, sl_distance_max_pips: 200, assumed_spread_pips: 1.0}
+
+runner:
+  trade:   {backend: local, model: qwen3.6-35b}
+  improve: {backend: local, model: qwen3.6-35b}
+
+llama_swap:
+  base_url: "http://localhost:8080/v1"
+  timeout_sec: 300
+  max_turns: 16
+
+datafeed:
+  yfinance:   {enabled: true}
+  mt5:        {enabled: false, bridge_url: "http://localhost:8812"}
+  twelvedata: {enabled: false}
+  freshness_max_min: 20       # これより古い quote/bar は不健全扱い
+
+news:
+  cleanup_hours: 48
+
+schedule:
+  trade_interval_min: 60
+  improve: weekly             # weekly | daily
+
+logging:
+  level: INFO
+
+api:
+  enabled: false
+  host: 127.0.0.1
+  port: 8420
+
+discord:
+  enabled: false              # webhook 通知 (URL は .env の DISCORD_WEBHOOK_URL)
