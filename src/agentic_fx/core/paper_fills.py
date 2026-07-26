@@ -4,17 +4,20 @@ from __future__ import annotations
 from agentic_fx.core.contracts import Bar
 
 
-def check_limit_fill(order: dict, bar: Bar) -> float | None:
+def check_limit_fill(order: dict, bar: Bar, spread: float = 0.0) -> float | None:
     price = order["requested_price"]
+    half = spread / 2
     if order["direction"] == "long":
-        if bar.open <= price:      # ギャップ: 有利な open で約定
-            return bar.open
-        if bar.low <= price:
+        # long のエントリーは ask 側 (bar + half) で判定 — mid/bid 系列に対して保守側
+        if bar.open + half <= price:      # ギャップ: 有利な open で約定
+            return bar.open + half
+        if bar.low + half <= price:
             return price
     else:
-        if bar.open >= price:
-            return bar.open
-        if bar.high >= price:
+        # short のエントリーは bid 側 (bar - half) で判定
+        if bar.open - half >= price:
+            return bar.open - half
+        if bar.high - half >= price:
             return price
     return None
 
@@ -40,7 +43,9 @@ def check_exit(order: dict, bar: Bar, spread: float, *,
         base = max(bar.open, sl)
         return ("sl", base + half)
     if tp_hit:
-        # entry_same_bar の保守則は sl_hit を先に判定することで満たされる
-        # (同一バーで SL にも届き得るなら上で SL を返して return 済み)。
+        if entry_same_bar:
+            # 同一バー内でのエントリー成立と TP 到達の順序は判定不能
+            # (SL 未到達のためタイブレークにも該当しない) → この足では確定させない
+            return None
         return ("tp", tp - half if long else tp + half)
     return None
