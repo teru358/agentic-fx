@@ -63,6 +63,23 @@ def test_timezone_normalization():
     assert is_friday_after(utc_time, "21:00") is False
 
 
+# --- レビュー修正 (codex 6): NY 現地時間 17:00 基準 (冬時間は 22:00 UTC) ---
+
+def test_winter_dst_boundary_is_22_00_utc():
+    """NY 標準時 (EST, UTC-5) の 17:00 は 22:00 UTC (夏時間なら 21:00 UTC)。
+    固定 21:00 UTC のままだと冬季に日次リセット・day 強制決済が
+    本来より 1 時間早まってしまう (資金制限の意味が変わる — Critical 級)。"""
+    fri_open = _dt(2026, 1, 16, 21, 59)   # 金 21:59 UTC = 16:59 EST (冬) → まだ open
+    fri_close = _dt(2026, 1, 16, 22, 0)   # 金 22:00 UTC = 17:00 EST (冬) → close
+    assert is_market_open(fri_open) is True
+    assert is_market_open(fri_close) is False
+
+    assert trading_day_start(_dt(2026, 1, 14, 12, 0)) == _dt(2026, 1, 13, 22, 0)
+    assert trading_day_start(_dt(2026, 1, 14, 23, 0)) == _dt(2026, 1, 14, 22, 0)
+
+    assert next_rollover(_dt(2026, 1, 14, 12, 0)) == _dt(2026, 1, 14, 22, 0)
+
+
 def test_naive_datetime_rejected():
     """naive datetime (tzinfo なし) は ValueError を送出する"""
     naive = datetime(2026, 7, 24, 12, 0)  # tzinfo=None
