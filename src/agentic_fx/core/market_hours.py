@@ -6,7 +6,15 @@ from datetime import datetime, time, timedelta, timezone
 _ROLLOVER_UTC = time(21, 0)  # NY 17:00 相当の日次ロールオーバー (DST 無視の近似)
 
 
+def _as_utc(now: datetime) -> datetime:
+    """入力を UTC に正規化。naive datetime は ValueError を送出。"""
+    if now.tzinfo is None:
+        raise ValueError("timezone-aware な datetime が必要です")
+    return now.astimezone(timezone.utc)
+
+
 def is_market_open(now: datetime) -> bool:
+    now = _as_utc(now)
     wd, t = now.weekday(), now.timetz().replace(tzinfo=None)
     if wd == 4 and t >= _ROLLOVER_UTC:   # 金 21:00〜
         return False
@@ -18,6 +26,7 @@ def is_market_open(now: datetime) -> bool:
 
 
 def trading_day_start(now: datetime) -> datetime:
+    now = _as_utc(now)
     boundary = now.replace(hour=21, minute=0, second=0, microsecond=0)
     if now.timetz().replace(tzinfo=None) < _ROLLOVER_UTC:
         boundary -= timedelta(days=1)
@@ -29,6 +38,7 @@ def next_rollover(now: datetime) -> datetime:
 
 
 def is_friday_after(now: datetime, cutoff_hhmm: str) -> bool:
+    now = _as_utc(now)
     if now.weekday() != 4:
         return False
     hh, mm = map(int, cutoff_hhmm.split(":"))
