@@ -106,6 +106,65 @@ def test_friday_cutoff_utc_ny_weekday_mismatch():
     assert is_friday_after(sat_utc, "20:00") is True  # NY では金曜 20:30
 
 
+# --- レビュー修正 (方式比較の過程で発見): next_rollover の DST 遷移バグ ---
+#
+# next_rollover は trading_day_start (現地カレンダー基準) の結果に UTC のまま
+# timedelta(days=1) を足していたため、絶対時間で +24h になっていた。DST 遷移
+# (2026 年は 3/8 開始・11/1 終了) をまたぐ週末はそれぞれ 23h/25h のはずで、
+# 固定 24h だと 1 時間ずれる。以下は「trading_day_start の当日境界を過ぎた
+# 直後」を入力にして、次の境界 (翌現地日の 17:00) が DST をまたぐケースを
+# 直接検証する (zoneinfo で事前に確認済みの値)。
+
+def test_next_rollover_spring_forward_gap_is_23h():
+    """2026-03-08 (日) が夏時間開始 (2nd Sunday of March)。
+    土 2026-03-07 17:00 NY (EST) = 22:00 UTC の境界を過ぎた直後の時刻を入力にすると、
+    次の境界は 日 2026-03-08 17:00 NY (EDT) = 21:00 UTC になる (23 時間後)。"""
+    now = _dt(2026, 3, 7, 23, 0)  # 土 23:00 UTC = 18:00 EST (Sat 17:00 境界の直後)
+    start = trading_day_start(now)
+    rollover = next_rollover(now)
+    assert start == _dt(2026, 3, 7, 22, 0)
+    assert rollover == _dt(2026, 3, 8, 21, 0)
+    assert rollover - start == timedelta(hours=23)
+
+
+def test_next_rollover_fall_back_gap_is_25h():
+    """2026-11-01 (日) が夏時間終了 (1st Sunday of November)。
+    土 2026-10-31 17:00 NY (EDT) = 21:00 UTC の境界を過ぎた直後の時刻を入力にすると、
+    次の境界は 日 2026-11-01 17:00 NY (EST) = 22:00 UTC になる (25 時間後)。"""
+    now = _dt(2026, 10, 31, 22, 0)  # 土 22:00 UTC = 18:00 EDT (Sat 17:00 境界の直後)
+    start = trading_day_start(now)
+    rollover = next_rollover(now)
+    assert start == _dt(2026, 10, 31, 21, 0)
+    assert rollover == _dt(2026, 11, 1, 22, 0)
+    assert rollover - start == timedelta(hours=25)
+
+
+def test_next_rollover_normal_day_gap_stays_24h():
+    """DST 遷移をまたがない通常日は従来通り厳密に 24 時間 (回帰防止)。"""
+    now = _dt(2026, 7, 22, 12, 0)  # 夏、通常の水曜
+    start = trading_day_start(now)
+    rollover = next_rollover(now)
+    assert rollover - start == timedelta(hours=24)
+
+    now_winter = _dt(2026, 1, 14, 12, 0)  # 冬、通常の水曜
+    start_w = trading_day_start(now_winter)
+    rollover_w = next_rollover(now_winter)
+    assert rollover_w - start_w == timedelta(hours=24)
+
+
+def test_is_market_open_across_fall_back_weekend():
+    """秋の移行週末: 金曜クローズ (NY 17:00 EDT) と、翌日曜オープン (NY 17:00 EST) が
+    それぞれ正しい UTC オフセットで判定されること。"""
+    fri_close = _dt(2026, 10, 30, 21, 0)   # 金 17:00 EDT → close
+    fri_open = _dt(2026, 10, 30, 20, 59)   # 金 16:59 EDT → まだ open
+    sun_open = _dt(2026, 11, 1, 22, 0)     # 日 17:00 EST → open
+    sun_closed = _dt(2026, 11, 1, 21, 59)  # 日 16:59 EST → まだ closed
+    assert is_market_open(fri_open) is True
+    assert is_market_open(fri_close) is False
+    assert is_market_open(sun_closed) is False
+    assert is_market_open(sun_open) is True
+
+
 def test_naive_datetime_rejected():
     """naive datetime (tzinfo なし) は ValueError を送出する"""
     naive = datetime(2026, 7, 24, 12, 0)  # tzinfo=None

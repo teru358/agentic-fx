@@ -11,6 +11,16 @@ NY 現地時間基準に変更した (レビュー修正: 従来は UTC 固定�
 市場クローズ (NY 金 17:00) までの残り時間が DST の季節で 1 時間ずれる欠陥が
 あった)。渡される cutoff_hhmm は NY 現地時間の hh:mm として扱い、曜日判定も
 NY 現地の曜日で行う。
+
+**注意 (再発防止 — 方式比較の過程で発見したバグの教訓):** `next_rollover` /
+`trading_day_start` は必ず**現地カレンダー基準**で計算すること。tz-aware
+datetime への `timedelta` の加減算は壁時計ベース (tzinfo を保ったまま naive
+フィールドを操作) なので、NY 現地の datetime に対して `+ timedelta(days=1)`
+すれば「翌カレンダー日の同じ現地時刻」になり、その後 `astimezone(utc)` で
+その日の正しいオフセットが適用される。**逆に、UTC に変換した後に
+timedelta を加減算すると絶対時間になってしまい、DST 遷移週末に 1 時間
+ずれる** (2026 年: 3/8 開始の週は 23h、11/1 終了の週は 25h が正しいのに、
+UTC 側で +24h すると春は 1 時間遅く・秋は 1 時間早くなるバグがあった)。
 """
 from __future__ import annotations
 
@@ -46,7 +56,12 @@ def trading_day_start(now: datetime) -> datetime:
 
 
 def next_rollover(now: datetime) -> datetime:
-    return trading_day_start(now) + timedelta(days=1)
+    now = _as_utc(now)
+    local = now.astimezone(_NY)
+    boundary = local.replace(hour=17, minute=0, second=0, microsecond=0)
+    if local.timetz().replace(tzinfo=None) >= _LOCAL_ROLLOVER:
+        boundary += timedelta(days=1)  # 壁時計で翌日の現地 17:00
+    return boundary.astimezone(timezone.utc)
 
 
 def is_friday_after(now: datetime, cutoff_hhmm: str) -> bool:
