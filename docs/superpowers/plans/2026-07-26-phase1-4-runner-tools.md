@@ -493,6 +493,8 @@ git commit -m "feat: ツールレジストリ (OpenAI スキーマ変換・許�
 - `get_ohlcv` / `get_indicators` の `timeframe="4h"` は **1h バーを `resample(df, "4h")` で集約して返す** (プラン 3 の yf_bars は 4h を 1h として取得するだけのため、ここで集約しないと 4h と称した 1h 足が LLM に渡る)
 - **全ツール読み取り専用** (書き込み系依存を一切受け取らない)
 - **`get_ohlcv` に期間指定引数を足さないこと** (`since` / `until` / `from` / `to` 等)。「直近 100 本固定」は利便性の妥協ではなく**意図的な性質**である: 設計書 §6 の過剰適合防御が「履歴期間を任意に切り出せるツールをエージェントに与えない」ことに依存しており、期間を指定できると改善ループがバックテストのホールドアウトを自分で選べてしまう (改訂第 13 版)。期間を絞りたい要求が出た場合は、この plan の範囲外として持ち帰ること
+  - **注意書きだけでは防御にならない**ので、下記の回帰テストで固定する。将来「便利だから」と引数が足されたときに落ちる必要がある
+  - この制約は Phase 1 の取引 loop registry についてのもの。**改善ループ側の隔離 (バックテスト API の期間指定禁止 / `ohlcv` の直接読み取り禁止 / `data/` へのファイルアクセス禁止) は Phase 2 の範囲**であり、設計書 §6 の表に一覧がある。ここで取引 loop のツールを塞いだだけでホールドアウトが守れると誤解しないこと
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -547,6 +549,34 @@ def test_get_ohlcv_4h_is_aggregated():
     # 4h と称した 1h 足を返さない: 120 本の 1h → 30 本の 4h
     assert len(out) == 30
     provider.get_bars.assert_called_with("USDJPY", "1h", lookback_days=20)
+
+
+def test_no_tool_exposes_an_arbitrary_history_window():
+    """履歴期間を任意に切り出せる引数をどのツールも持たないこと。
+
+    設計書 §6 の過剰適合防御は「エージェントに任意期間の履歴を与えない」
+    ことに依存している。規約だけだと後から `since` 等が足されても気付けない
+    ため、tool schema をテストで固定する (codex レビュー 6)。
+    """
+    reg = ToolRegistry()
+    reg.register_all(market_tools.build(MagicMock(), MagicMock()))
+    banned = {"since", "until", "from", "to", "start", "end",
+              "start_date", "end_date", "lookback", "lookback_days", "bars"}
+    # 既存 API だけで検査する (ToolRegistry に新メソッドは足さない)
+    for spec in reg.openai_tools(allowed=reg.names()):
+        fn = spec["function"]
+        params = set(fn["parameters"].get("properties", {}))
+        assert not (params & banned), \
+            f"{fn['name']} が期間指定引数を持っている: {params & banned}"
+
+
+def test_get_ohlcv_always_returns_at_most_100_bars():
+    """入力が何本でも返すのは直近 100 本まで (期間の実質的な固定)。"""
+    provider = MagicMock()
+    provider.get_bars.return_value = _bars(n=5000)
+    reg = ToolRegistry()
+    reg.register_all(market_tools.build(provider, MagicMock()))
+    assert len(reg.func("get_ohlcv")(pair="USDJPY", timeframe="1h")) == 100
 
 
 def test_news_and_reflection_tools(tmp_path):

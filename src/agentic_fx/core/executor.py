@@ -16,6 +16,7 @@ from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker, compute_pnl
 from agentic_fx.core.risk_gate import GateContext, evaluate
 from agentic_fx.store import intents as intents_store
+from agentic_fx.store import missions as missions_store
 from agentic_fx.store import orders
 from agentic_fx.store.state import StateStore
 
@@ -78,6 +79,11 @@ class Executor:
                                 intent.reasoning[:120], ref_id=str(iid))
             return {"result": "hold", "order_id": None, "reasons": []}
 
+        # 設計書 §5: origin と mission_id を独立に検証する。origin は呼び出し
+        # 側が渡す enum 値に過ぎず、任意の内部コードが Origin.SCHEDULER を
+        # 構成できるため、origin 単独では「scheduler が起動した取引判断
+        # Mission の出力である」性質を担保できない (codex レビュー 4)。
+        # mission_id は DB で照合できるので、loop='trade' を併せて検証する。
         if intent.origin is not Origin.SCHEDULER:
             reasons = ["origin rejected: only scheduler missions may trade"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
@@ -85,6 +91,16 @@ class Executor:
             self.activity.write(Category.TRADE, "origin_rejected",
                                 f"{intent.action.value} from {intent.origin.value}",
                                 ref_id=str(iid))
+            return {"result": "rejected", "order_id": None, "reasons": reasons}
+
+        loop = missions_store.loop_of(self.conn, mission_id)
+        if loop != "trade":
+            reasons = [f"mission rejected: loop={loop!r} is not a trade mission"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason="; ".join(reasons))
+            self.activity.write(Category.TRADE, "mission_rejected",
+                                f"{intent.action.value} from mission "
+                                f"#{mission_id} (loop={loop!r})", ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
 
         if intent.action is Action.OPEN:

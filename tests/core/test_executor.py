@@ -7,7 +7,7 @@ from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
 from agentic_fx.core.accounting import record_snapshot
 from agentic_fx.core.contracts import (
-    FixedClock, InstrumentSpec, Origin, Quote, TradeIntent,
+    Action, FixedClock, InstrumentSpec, Origin, Quote, TradeIntent,
 )
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.paper_broker import PaperBroker
@@ -107,6 +107,49 @@ def test_ask_origin_rejected_for_open(tmp_path):
     assert out["result"] == "rejected"
     assert any("origin" in r for r in out["reasons"])
     assert orders.list_by_status(conn, "pending_fill") == []
+
+
+def test_ask_mission_id_rejected_even_with_scheduler_origin(tmp_path):
+    """origin を偽装しても、mission の loop が trade でなければ拒否される。
+
+    origin は呼び出し側が渡す enum 値に過ぎず、任意の内部コードが
+    Origin.SCHEDULER を構成できる。mission_id は DB で照合できるため、
+    executor は両方を独立に検証する (設計書 §5 / codex レビュー 4)。
+    """
+    conn, ex, _, _ = _setup(tmp_path)
+    ask_mid = missions.start(conn, "ask", "local", "m", NOW)
+    out = ex.handle_intent(_open_intent(), ask_mid)   # origin は scheduler のまま
+    assert out["result"] == "rejected"
+    assert any("not a trade mission" in r for r in out["reasons"])
+    assert orders.list_by_status(conn, "pending_fill") == []
+
+
+def test_nonexistent_mission_id_never_creates_an_order(tmp_path):
+    """存在しない mission_id では発注に至らない。
+
+    実際には loop 検証より前の trade_intents への記録 (全 intent を記録する
+    設計) が FK 制約で弾くため IntegrityError になる。これは呼び出し側の
+    プログラミングエラーでしか起きない経路であり、いずれにせよ**建玉は
+    生まれない**ことをここで固定する。
+    """
+    import sqlite3
+    conn, ex, _, _ = _setup(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        ex.handle_intent(_open_intent(), 999_999)
+    assert orders.list_by_status(conn, "pending_fill") == []
+    assert orders.list_by_status(conn, "open") == []
+
+
+def test_improve_mission_cannot_close_positions(tmp_path):
+    """close も同じ検証を通る (open だけの防御にしない)。"""
+    conn, ex, _, mid = _setup(tmp_path)
+    oid = ex.handle_intent(_open_intent(), mid)["order_id"]
+    improve_mid = missions.start(conn, "improve", "local", "m", NOW)
+    close = TradeIntent(action=Action.CLOSE, origin=Origin.SCHEDULER,
+                        order_id=oid)
+    out = ex.handle_intent(close, improve_mid)
+    assert out["result"] == "rejected"
+    assert any("not a trade mission" in r for r in out["reasons"])
 
 
 def test_gate_reject_recorded(tmp_path):

@@ -637,9 +637,9 @@ class TradeLoop:
         self.notifier = notifier
         self.clock = clock
 
-    # ---- 定期 Mission ---------------------------------------------------
+    # ---- 取引判断 Mission -------------------------------------------------
 
-    def run_once(self) -> dict | None:
+    def run_once(self, trigger: str = "cron") -> dict | None:
         now = self.clock.now()
         try:
             self.provider.healthcheck(self.settings.pairs[0])
@@ -655,7 +655,8 @@ class TradeLoop:
                           timeout_sec=self.settings.llama_swap.timeout_sec)
         mid = missions.start(self.conn, "trade",
                              self.settings.runner.trade.backend,
-                             self.settings.runner.trade.model, now)
+                             self.settings.runner.trade.model, now,
+                             trigger=trigger)   # 起動理由を監査列に記録
         result = self._run_recorded(mid, mission)
         if result.status != "completed":
             self.activity.write(Category.AGGREGATE, "mission_failed",
@@ -1417,10 +1418,32 @@ def test_on_trade_mission_runs_loop_and_reflection(tmp_path):
     record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                     equity=1_000_000)
     with patch.object(app.provider, "healthcheck", return_value="yfinance"):
-        app.scheduler.on_trade_mission()
+        app.scheduler.on_trade_mission("cron")
     assert len(fake.missions) >= 1  # trade mission が実行された
     rows = app.conn_core.execute("SELECT * FROM missions").fetchall()
     assert any(r["loop"] == "trade" for r in rows)
+
+
+def test_tick_propagates_trigger_to_missions_row(tmp_path):
+    """tick → on_trade_mission(reason) → run_once(trigger) → missions.trigger。
+
+    この配線は wrapper が引数を捨てても各層の単体テストでは緑のままに
+    なるため、tick 起点で通しで検証する (codex レビュー 1-4)。
+    """
+    _init(tmp_path)
+    fake = FakeRunner([MissionResult("completed",
+                                     {"action": "hold", "reasoning": "w"},
+                                     [])])
+    app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW))
+    from unittest.mock import patch
+    from agentic_fx.core.accounting import record_snapshot
+    record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
+                    equity=1_000_000)
+    with patch.object(app.provider, "healthcheck", return_value="yfinance"):
+        app.scheduler.tick(NOW)
+    row = app.conn_core.execute(
+        "SELECT trigger FROM missions WHERE loop='trade'").fetchone()
+    assert row["trigger"] == "cron"
 ```
 
 - [ ] **Step 2: テストが失敗することを確認**
@@ -1541,10 +1564,13 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
     core_lock = threading.RLock()
 
-    def on_trade_mission() -> None:
+    def on_trade_mission(trigger: str) -> None:
         # tick 全体が core_lock 下で走る (RLock のため再取得も安全)
+        # trigger は scheduler._trade_mission_due() が返した起動理由。
+        # ここで捨てると missions.trigger が常に既定値になり、監査列が
+        # 死ぬ (末尾「追記 (2026-07-27)」参照)
         with core_lock:
-            trade_loop.run_once()
+            trade_loop.run_once(trigger)
             reflection.run_pending()
 
     scheduler = Scheduler(conn=conn_core, executor=executor,
@@ -1847,7 +1873,7 @@ git commit -m "test: Phase 1 E2E (FakeRunner フル自走 — 完成条件)"
 
 **シグナル検出・`signals` テーブル・`get_signals` ツールは Phase 2 であり、本プランには含めない。**
 
-### 変更 1: `missions.trigger` 列を追加する
+### 変更 1: `missions.trigger` 列を追加する (migration 込み)
 
 `src/agentic_fx/store/db.py` の `missions` DDL に追加する:
 
@@ -1857,20 +1883,80 @@ CREATE TABLE IF NOT EXISTS missions (
   loop TEXT NOT NULL,            -- trade | improve | ask | reflection
   runner TEXT NOT NULL, model TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'running',
-  trigger TEXT NOT NULL DEFAULT 'cron',   -- cron | signal:<plugin> (Phase 2)
+  trigger TEXT,                  -- cron | signal:<plugin> (Phase 2)。loop='trade' 以外は NULL
   output_json TEXT, transcript_json TEXT,
   started_at TEXT NOT NULL, finished_at TEXT
 );
 ```
 
-`src/agentic_fx/store/missions.py` の `start` に `trigger: str = "cron"` を追加して INSERT に含める。既定値があるため既存の呼び出し (improve / ask / reflection) は無変更でよい。
+**`trigger` は nullable にし、既定値を持たせない。** 全 loop 共通で `DEFAULT 'cron'` にすると、ask / improve / reflection まで「cron 起動」と記録され、「cron 起動の ask Mission」という無意味な行が生まれる。この列は**取引判断 Mission の起動理由**なので、`loop='trade'` のときだけ値を入れ、集計は必ず `WHERE loop='trade'` で絞る (設計書 §12)。
+
+`src/agentic_fx/store/missions.py` の `start` に `trigger: str | None = None` を追加して INSERT に含める。既定が `None` なので既存の呼び出し (improve / ask / reflection) は無変更でよい。
+
+#### migration が必須 (これを省くと既存 DB で必ず落ちる)
+
+`init_db` は `CREATE TABLE IF NOT EXISTS` を使うため、**DDL に列を足しても既存の `data/agentic.db` には列が追加されない**。その状態で新しい `start()` が `INSERT ... trigger ...` を実行すると `sqlite3.OperationalError: table missions has no column named trigger` で落ちる。開発機には既に DB があるので、これは確実に踏む。
+
+`src/agentic_fx/store/db.py` に列の追加処理を書き、`init_db` から呼ぶ:
+
+```python
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str,
+                   ddl: str) -> None:
+    """存在しない列を追加する (SQLite は ADD COLUMN IF NOT EXISTS を持たない)。
+
+    init_db は CREATE TABLE IF NOT EXISTS なので、既存 DB のテーブル定義は
+    更新されない。列追加は PRAGMA で検査して ALTER する必要がある。
+    """
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA)
+    _ensure_column(conn, "missions", "trigger", "trigger TEXT")
+    conn.commit()
+```
+
+`ALTER TABLE ... ADD COLUMN trigger TEXT` は nullable かつ既定値なしなので、既存行はすべて `NULL` になる (改修前の Mission は起動理由が不明であり、`NULL` はその事実の正しい表現である)。
+
+**migration のテストを書くこと** (現行 `tests/store/test_db.py` は空 DB 作成と同一スキーマでの再実行しか見ていない):
+
+```python
+def test_init_db_adds_trigger_column_to_legacy_missions_table(tmp_path):
+    """旧スキーマの DB に init_db を流すと trigger 列が追加される。"""
+    p = tmp_path / "legacy.db"
+    conn = connect(p)
+    # trigger 列を持たない旧 missions テーブルを手で作る
+    conn.execute("CREATE TABLE missions ("
+                 "id INTEGER PRIMARY KEY AUTOINCREMENT, loop TEXT NOT NULL, "
+                 "runner TEXT NOT NULL, model TEXT NOT NULL, "
+                 "status TEXT NOT NULL DEFAULT 'running', "
+                 "output_json TEXT, transcript_json TEXT, "
+                 "started_at TEXT NOT NULL, finished_at TEXT)")
+    conn.execute("INSERT INTO missions (loop, runner, model, started_at) "
+                 "VALUES ('trade','local','m','2026-07-22T12:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)   # ここで ALTER が走る
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(missions)")}
+    assert "trigger" in cols
+    assert conn.execute("SELECT trigger FROM missions").fetchone()[0] is None
+    # 追加後に新しい start() が通ること
+    mid = missions.start(conn, "trade", "local", "m", NOW, trigger="cron")
+    assert conn.execute("SELECT trigger FROM missions WHERE id=?",
+                        (mid,)).fetchone()[0] == "cron"
+```
 
 **注意**: `TRIGGER` は SQLite のキーワード (`CREATE TRIGGER`) だが、列名としては引用符なしで使える。実測で確認済み:
 
 ```
 $ python3 -c "import sqlite3; c=sqlite3.connect(':memory:'); \
-  c.execute(\"CREATE TABLE t (id INTEGER PRIMARY KEY, trigger TEXT NOT NULL DEFAULT 'cron')\"); \
-  c.execute(\"INSERT INTO t (trigger) VALUES ('cron')\"); print(c.execute('SELECT trigger FROM t').fetchall())"
+  c.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, trigger TEXT)'); \
+  c.execute(\"INSERT INTO t (trigger) VALUES ('cron')\"); \
+  c.execute('ALTER TABLE t ADD COLUMN trigger2 TEXT'); \
+  print(c.execute('SELECT trigger FROM t').fetchall())"
 [('cron',)]
 ```
 
@@ -1907,12 +1993,36 @@ def _trade_mission_due(self, now: datetime) -> str | None:
 
 `on_trade_mission` の型は `Callable[[str], None]` になる。`TradeLoop.run_once(trigger)` をそこに差し込む。
 
+#### シグネチャ変更に伴う既存の呼び出し側の修正 (漏らすと `TypeError`)
+
+型が変わるので、`on_trade_mission` を渡している・呼んでいる箇所をすべて直す。**プランを上から順に実装すると Task 7 で初めて壊れるため、ここに一覧を置く**:
+
+| ファイル | 現状 | 変更後 |
+|---|---|---|
+| `src/agentic_fx/core/scheduler.py` | `on_trade_mission: Callable[[], None]` | `Callable[[str], None]` |
+| 本プラン Task 7 `build_app` | `def on_trade_mission() -> None:` → `trade_loop.run_once()` | `def on_trade_mission(trigger: str) -> None:` → `trade_loop.run_once(trigger)` (修正済み) |
+| 本プラン Task 7 のテスト | `app.scheduler.on_trade_mission()` | `app.scheduler.on_trade_mission("cron")` (修正済み) |
+| `tests/core/test_scheduler.py` の `Env._trade()` | 引数なしのスタブ | `def _trade(self, trigger): ...` (呼ばれた trigger を記録すると後段の検証に使える) |
+| `tests/core/test_e2e_paper_cycle.py` | `on_trade_mission=lambda: None` | `on_trade_mission=lambda trigger: None` |
+
 ### テスト (Task 3 の Step に追加する)
+
+**単体 2 本だけでは不足する。** `run_once` の既定値と `_trade_mission_due` を別々に検証しても、両者をつなぐ `build_app` の wrapper が `trigger` を捨てていた場合に検出できない — 今回もっとも壊れやすいのはその wrapper である。通しの伝播テスト (Task 7 の `test_tick_propagates_trigger_to_missions_row`) を必ず併せて書くこと。
 
 ```python
 def test_mission_trigger_is_recorded_as_cron():
     """cron 起動の Mission は missions.trigger = 'cron' で記録される。"""
     # TradeLoop.run_once() を既定引数で実行し、missions 行の trigger を検証する
+
+
+def test_signal_trigger_is_recorded_verbatim():
+    """任意の起動理由文字列がそのまま記録される (Phase 2 の "signal:<plugin>" 用)。"""
+    # TradeLoop.run_once("signal:demo") を実行し、trigger == "signal:demo" を検証
+
+
+def test_non_trade_missions_have_null_trigger():
+    """ask / reflection の Mission は trigger が NULL のままである。"""
+    # TradeLoop.ask_once(...) 実行後、その missions 行の trigger が None であること
 
 
 def test_trade_mission_due_returns_cron_then_none():
@@ -1921,3 +2031,11 @@ def test_trade_mission_due_returns_cron_then_none():
 ```
 
 `_trade_mission_due` が理由文字列を返すことをテストで固定しておくと、Phase 2 で分岐を足すときに既存挙動の回帰が検出できる。
+
+### Phase 2 への申し送り (本プランでは実装しない)
+
+設計書 改訂第 13 版 §5 で決めた以下は、シグナル起動を実装する際に必ず反映すること。Phase 1 では `_trade_mission_due` が `"cron" | None` を返すだけなので、まだ関係しない:
+
+- シグナルは `pending / claimed / consumed / abandoned` の 4 状態。claim は原子的に行い、Mission 失敗時は `pending` へ戻す (再キュー上限あり)。lease 期限切れの `claimed` は回収する
+- **cron の締切とシグナルのレート制限を別変数で持つ** (`_last_cron_mission` / `_last_signal_mission`)。シグナル起動で cron の締切を後ろへずらすと、シグナルが続く限り定期実行が事実上停止する
+- レート制限は口座全体の単位・DB 永続。排他スロットは**非ブロッキング取得**にし、取れなければ起動を諦めてシグナルは `pending` に残す

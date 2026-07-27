@@ -26,6 +26,20 @@ def finish(conn: sqlite3.Connection, mission_id: int, status: str,
     conn.commit()
 
 
+def loop_of(conn: sqlite3.Connection, mission_id: int) -> str | None:
+    """mission の loop 種別。存在しなければ None。
+
+    executor が「その intent は取引判断 Mission の出力か」を DB で照合する
+    ために使う (設計書 §5)。origin は呼び出し側が渡す enum 値に過ぎず、
+    任意の内部コードが Origin.SCHEDULER を構成できてしまうため、origin 検証
+    だけでは「scheduler が起動した取引判断 Mission だけ」という性質を担保
+    できない (codex レビュー 4)。
+    """
+    row = conn.execute(
+        "SELECT loop FROM missions WHERE id=?", (mission_id,)).fetchone()
+    return row["loop"] if row is not None else None
+
+
 def recent(conn: sqlite3.Connection, n: int) -> list[dict]:
     rows = conn.execute(
         "SELECT * FROM missions ORDER BY id DESC LIMIT ?", (n,)).fetchall()
