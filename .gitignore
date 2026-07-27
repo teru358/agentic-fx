@@ -21,3 +21,8 @@ CLAUDE.md
 
 # LLM-generated plugins (differ per user, approved locally — see design doc §6)
 plugins/
+
+# エディタの一時ファイル
+*.swp
+*.swo
+*~

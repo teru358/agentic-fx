@@ -104,12 +104,14 @@ class DiscordSettings(_Strict):
 
 class PaperSettings(_Strict):
     starting_balance: float = Field(gt=0)
-    currency: str = "JPY"
 
 
 class Settings(_Strict):
     # ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)
     display_timezone: str = "UTC"
+    # 利用者の基準通貨。損益・リスク・エクイティの表現に使う (取引可能ペアを
+    # 制限するものではない)。実取引では MT5 口座通貨と照合する (設計書 §5)
+    account_currency: str = Field(default="JPY", pattern="^[A-Z]{3}$")
     pairs: list[str] = Field(min_length=1)
     risk: RiskSettings
     runner: RunnerSettings

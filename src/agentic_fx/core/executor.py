@@ -117,7 +117,7 @@ class Executor:
             existing_notional=notional,
             kill_switch_latched=self.state.load().kill_switch_latched,
             has_unresolved_unknown=has_unresolved_unknown(self.conn),
-            account_currency=self.settings.paper.currency,
+            account_currency=self.settings.account_currency,
             now=now)
         result = evaluate(intent, ctx, self.settings.risk)
         if not result.accepted:

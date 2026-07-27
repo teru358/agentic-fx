@@ -1,5 +1,6 @@
 # agentic-fx 設定 (このファイルを settings.yaml にコピーして編集。新キー追加時は両方を同期)
 display_timezone: Asia/Tokyo  # ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)
+account_currency: JPY         # 利用者の基準通貨。損益・リスクの表現と換算に使う。取引可能ペアを制限するものではない (設計書 §5)。実取引では MT5 口座通貨が真で、起動時に照合する
 
 pairs: [USDJPY]  # EURUSD 等クォート通貨が口座通貨と異なるペアは、口座通貨換算の実装 (為替レート取得) 後に有効化する
 
@@ -56,4 +57,3 @@ discord:
 
 paper:
   starting_balance: 1000000   # 学習モードの初期残高 (口座通貨建て)
-  currency: JPY

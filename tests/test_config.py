@@ -95,7 +95,33 @@ def test_unknown_top_level_key_rejected(tmp_path):
 def test_paper_settings():
     s = load_settings(EXAMPLE)
     assert s.paper.starting_balance == 1_000_000
-    assert s.paper.currency == "JPY"
+
+
+def test_account_currency_default_example():
+    s = load_settings(EXAMPLE)
+    assert s.account_currency == "JPY"
+
+
+@pytest.mark.parametrize("value", ["JPY", "USD"])
+def test_account_currency_accepts_valid_iso4217_like_codes(tmp_path, value):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["account_currency"] = value
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    s = load_settings(p)
+    assert s.account_currency == value
+
+
+@pytest.mark.parametrize("value", ["jpy", "JPYY", ""])
+def test_account_currency_rejects_invalid_codes(tmp_path, value):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["account_currency"] = value
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError):
+        load_settings(p)
 
 
 def test_display_timezone_defaults_to_utc(tmp_path):
