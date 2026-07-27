@@ -26,6 +26,15 @@
 
 ### Task 1: 依存追加 + データ健全性検証 (datafeed/health.py)
 
+> **実装済み (2026-07-27、commits `8c846d8..ae656a2`)。以下のコードは実装と一致しません** — レビューで欠陥が見つかり、ユーザー裁定で書き換えました。**現在の正は `src/agentic_fx/datafeed/health.py`** です。変更点:
+>
+> 1. **`_spans_market_close` を廃止し `_closed_minutes` に置換**。旧実装は休場を跨ぐ区間の連続性チェックを**丸ごと免除**しており、週明けにフィードが止まって 24h 欠損していても「健全」と判定する fail-open だった。新実装は休場だった分**だけ**を差し引き、実際に開場していたはずの欠損本数で判定する
+> 2. **サンプリング粒度を `interval_min` に追従**させ、反復回数が `_MAX_CLOSED_TIME_SAMPLES` を超えたら fail closed に倒す (「数え切れない = 健全と断言できない」)
+> 3. **ギャップ検査を直近の窓に限定** (`_GAP_CHECK_WINDOW_BARS` / `_GAP_CHECK_WINDOW_MIN_MINUTES`)。検査が答えるべきは「フィードは今動いているか」であり、回復済みの過去の穴で取引を止めない。末尾隣接の穴は常に窓内に入るため、①の検出力は落ちない
+> 4. **`as_utc` で naive datetime を弾く** (規約どおり `ValueError`)
+>
+> **known issue (受容済み)**: `market_hours` が祝日カレンダーを持たないため、祝日隣接週は市場再開後**最大 24h** `DataUnhealthy` が継続する。fail closed 側の誤検知であり Phase 1 (ペーパー) では実損がない。祝日カレンダーの要否はプラン 3 完了後に判断する。
+
 **Files:**
 - Create: `src/agentic_fx/datafeed/__init__.py`, `src/agentic_fx/datafeed/health.py`
 - Test: `tests/datafeed/__init__.py`, `tests/datafeed/test_health.py`
