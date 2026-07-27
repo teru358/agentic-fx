@@ -1543,7 +1543,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                         quote_fn=quote_fn, spec_fn=spec_fn)
 
     registry = ToolRegistry()
-    registry.register_all(market_tools.build(provider, econ))
+    registry.register_all(market_tools.build(provider, econ, settings))
     registry.register_all(news_tools.build(rag))
     registry.register_all(account_tools.build(conn_core, broker))
     registry.register_all(reflection_tools.build(conn_core, rag))

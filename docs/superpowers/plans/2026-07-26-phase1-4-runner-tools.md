@@ -19,7 +19,7 @@
 - Anthropic API (従量課金) は使わない。本プランに Claude 関連コードは登場しない
 - コミットメッセージ末尾: `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
 
-**プラン 1〜3 から消費する契約** (変更禁止): `Settings.llama_swap (base_url/timeout_sec/max_turns)`、`Settings.runner (trade/improve: backend/model)`、`PriceProvider.get_bars/spec`、`compute_indicators/bars_to_df/resample`、`Rag.search_news/search_reflections`、`EconCalendar.upcoming`、`PaperBroker.equity`、`orders.list_by_status`、`reflections.recent`
+**プラン 1〜3 から消費する契約** (変更禁止): `Settings.llama_swap (base_url/timeout_sec/max_turns)`、`Settings.runner (trade/improve: backend/model)`、`PriceProvider.get_bars/bars_origin/spec`、`datafeed.bars.bars_to_df/df_to_bars/resample`、`datafeed.indicators.compute_indicators`、`Settings.datafeed.intervals/primary_intervals`、`Rag.search_news/search_reflections`、`EconCalendar.upcoming`、`PaperBroker.equity`、`orders.list_by_status`、`reflections.recent`
 
 ---
 
@@ -481,16 +481,17 @@ git commit -m "feat: ツールレジストリ (OpenAI スキーマ変換・許�
 
 **Interfaces:**
 - Produces (各 module に `build(...) -> list[ToolDef]` ファクトリ。依存はクロージャで注入 — LLM 層はレジストリ経由でしか触れない):
-  - `market_tools.build(provider: PriceProvider, econ: EconCalendar) -> list[ToolDef]`:
+  - `market_tools.build(provider: PriceProvider, econ: EconCalendar, settings: Settings) -> list[ToolDef]`:
     - `get_ohlcv(pair, timeframe)` — 直近 100 本を `[{ts, open, high, low, close}]`
-    - `get_indicators(pair, timeframe)` — `compute_indicators` の dict + `mtf_4h` キー (timeframe が 1h のとき resample("4h") で追補)
+    - `get_indicators(pair, timeframe)` — 要求された足の `compute_indicators` の dict。**`mtf_4h` の自動追補はしない** — 足を固定しない方針では 1h だけを特別扱いする根拠がなく、どの上位足を見るかは LLM / plugin が `timeframe` を変えて呼び直すことで表現する
     - `get_econ_calendar(days)` — `EconCalendar.upcoming(hours=days*24)`
   - `news_tools.build(rag: Rag) -> list[ToolDef]`: `search_news(query)` — 上位 5 件
   - `account_tools.build(conn, broker: PaperBroker) -> list[ToolDef]`:
     - `get_positions()` — open / pending_fill / protection_pending の orders を `[{order_id, pair, direction, status, quantity, entry, stop_loss, take_profit, horizon}]`
     - `get_account()` — `{balance, equity}`
   - `reflection_tools.build(conn, rag: Rag) -> list[ToolDef]`: `get_recent_reflections(pair, n)` (スペック §5 のシグネチャどおり pair 必須 — orders と JOIN してペアで絞る。store に `reflections.recent_for_pair(conn, pair, n)` を追加) / `search_reflections(query)`
-- `get_ohlcv` / `get_indicators` の `timeframe="4h"` は **1h バーを `resample(df, "4h")` で集約して返す** (プラン 3 の yf_bars は 4h を 1h として取得するだけのため、ここで集約しないと 4h と称した 1h 足が LLM に渡る)
+- **足の導出はツール層で行わない。`PriceProvider.get_bars(pair, interval)` に任せる** (プラン 3 で修正済み)。provider が「ソースがネイティブに持つならそのまま / 無ければより細かい足から resample」を判断し、由来を `bars_origin` で公開する。ツール層で resample すると、**MT5 のネイティブ 4h が使える環境でもわざわざ 1h から作り直す**ことになり、実運用とバックテストで違う 4h を見る原因になる
+- **`timeframe` は固定リストで縛らない。** 取引の時間軸は固定せず、day / swing で勝てる足を取りに行く方針のため、ツールの schema は `settings.datafeed.intervals` の値を enum として動的に生成する。設定に無い足を要求されたらエラー文字列を返す (レジストリの通常のエラー経路)
 - **全ツール読み取り専用** (書き込み系依存を一切受け取らない)
 - **`get_ohlcv` に期間指定引数を足さないこと** (`since` / `until` / `from` / `to` 等)。「直近 100 本固定」は利便性の妥協ではなく**意図的な性質**である: 設計書 §6 の過剰適合防御が「履歴期間を任意に切り出せるツールをエージェントに与えない」ことに依存しており、期間を指定できると改善ループがバックテストのホールドアウトを自分で選べてしまう (改訂第 13 版)。期間を絞りたい要求が出た場合は、この plan の範囲外として持ち帰ること
   - **注意書きだけでは防御にならない**ので、下記の回帰テストで固定する。将来「便利だから」と引数が足されたときに落ちる必要がある
@@ -531,24 +532,37 @@ def test_market_tools():
     econ = MagicMock()
     econ.upcoming.return_value = [{"name": "CPI"}]
     reg = ToolRegistry()
-    reg.register_all(market_tools.build(provider, econ))
+    reg.register_all(market_tools.build(provider, econ, SETTINGS))
     ohlcv = reg.func("get_ohlcv")(pair="USDJPY", timeframe="1h")
     assert len(ohlcv) == 100  # 直近 100 本に制限
     assert set(ohlcv[0]) == {"ts", "open", "high", "low", "close"}
     ind = reg.func("get_indicators")(pair="USDJPY", timeframe="1h")
-    assert "rsi_14" in ind and "mtf_4h" in ind
+    assert "rsi_14" in ind
     assert reg.func("get_econ_calendar")(days=1) == [{"name": "CPI"}]
 
 
-def test_get_ohlcv_4h_is_aggregated():
+def test_tools_do_not_resample_and_delegate_the_timeframe_to_the_provider():
+    """4h は provider にそのまま要求する (ツール層で 1h から作り直さない)。
+
+    MT5 のようにネイティブ 4h を持つソースがある環境で 1h から再構成すると、
+    実運用とバックテストで違う 4h を見ることになる (プラン 3 で provider 側に
+    ネイティブ / 導出の判断を集約した)。
+    """
     provider = MagicMock()
-    provider.get_bars.return_value = _bars(n=120)  # 1h × 120 本
+    provider.get_bars.return_value = _bars(n=30, interval="4h")
     reg = ToolRegistry()
-    reg.register_all(market_tools.build(provider, MagicMock()))
-    out = reg.func("get_ohlcv")(pair="USDJPY", timeframe="4h")
-    # 4h と称した 1h 足を返さない: 120 本の 1h → 30 本の 4h
-    assert len(out) == 30
-    provider.get_bars.assert_called_with("USDJPY", "1h", lookback_days=20)
+    reg.register_all(market_tools.build(provider, MagicMock(), SETTINGS))
+    reg.func("get_ohlcv")(pair="USDJPY", timeframe="4h")
+    provider.get_bars.assert_called_with("USDJPY", "4h")
+
+
+def test_timeframe_enum_comes_from_settings():
+    """timeframe の enum は設定の datafeed.intervals から作られる。"""
+    reg = ToolRegistry()
+    reg.register_all(market_tools.build(MagicMock(), MagicMock(), SETTINGS))
+    spec = next(s for s in reg.openai_tools(allowed=["get_ohlcv"]))
+    enum = spec["function"]["parameters"]["properties"]["timeframe"]["enum"]
+    assert enum == list(SETTINGS.datafeed.intervals)
 
 
 def test_no_tool_exposes_an_arbitrary_history_window():
@@ -559,7 +573,7 @@ def test_no_tool_exposes_an_arbitrary_history_window():
     ため、tool schema をテストで固定する (codex レビュー 6)。
     """
     reg = ToolRegistry()
-    reg.register_all(market_tools.build(MagicMock(), MagicMock()))
+    reg.register_all(market_tools.build(MagicMock(), MagicMock(), SETTINGS))
     banned = {"since", "until", "from", "to", "start", "end",
               "start_date", "end_date", "lookback", "lookback_days", "bars"}
     # 既存 API だけで検査する (ToolRegistry に新メソッドは足さない)
@@ -575,7 +589,7 @@ def test_get_ohlcv_always_returns_at_most_100_bars():
     provider = MagicMock()
     provider.get_bars.return_value = _bars(n=5000)
     reg = ToolRegistry()
-    reg.register_all(market_tools.build(provider, MagicMock()))
+    reg.register_all(market_tools.build(provider, MagicMock(), SETTINGS))
     assert len(reg.func("get_ohlcv")(pair="USDJPY", timeframe="1h")) == 100
 
 
@@ -622,7 +636,7 @@ def test_account_tools(tmp_path):
 
 def test_all_tools_have_schemas():
     provider, econ, rag = MagicMock(), MagicMock(), MagicMock()
-    tools = market_tools.build(provider, econ) + news_tools.build(rag)
+    tools = market_tools.build(provider, econ, settings) + news_tools.build(rag)
     for t in tools:
         assert t.parameters["type"] == "object"
         assert t.description
@@ -641,48 +655,56 @@ Expected: FAIL (ImportError)
 """market 系ツール — datafeed の薄い読み取り専用ラッパー。"""
 from __future__ import annotations
 
+from agentic_fx.config import Settings
+from agentic_fx.datafeed.bars import bars_to_df
 from agentic_fx.datafeed.econ_calendar import EconCalendar
-from agentic_fx.datafeed.indicators import bars_to_df, compute_indicators, resample
+from agentic_fx.datafeed.indicators import compute_indicators
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.tools.registry import ToolDef
 
-_PAIR_PARAM = {"pair": {"type": "string", "description": "e.g. USDJPY"},
-               "timeframe": {"type": "string",
-                             "enum": ["5m", "15m", "1h", "4h", "1d"]}}
+
+def _pair_param(settings: Settings) -> dict:
+    """timeframe の enum は設定から動的に作る (足を固定しない方針)。"""
+    return {"pair": {"type": "string", "description": "e.g. USDJPY"},
+            "timeframe": {"type": "string",
+                          "enum": list(settings.datafeed.intervals)}}
 
 
-def _frame(provider: PriceProvider, pair: str, timeframe: str):
-    """4h は 1h バーを取得して集約する (ソース側は 4h ネイティブ非対応 — プラン 3)。"""
-    if timeframe == "4h":
-        df = bars_to_df(provider.get_bars(pair, "1h", lookback_days=20))
-        return resample(df, "4h")
-    return bars_to_df(provider.get_bars(pair, timeframe))
+def build(provider: PriceProvider, econ: EconCalendar,
+          settings: Settings) -> list[ToolDef]:
+    # 足の導出 (ネイティブ / resample) は provider の責務。ここでは
+    # 要求された足をそのまま渡す — ツール層で resample すると、MT5 の
+    # ネイティブ 4h が使える環境でも 1h から作り直してしまう
+    def _frame(pair: str, timeframe: str):
+        return bars_to_df(provider.get_bars(pair, timeframe))
 
-
-def build(provider: PriceProvider, econ: EconCalendar) -> list[ToolDef]:
     def get_ohlcv(pair: str, timeframe: str) -> list[dict]:
-        df = _frame(provider, pair, timeframe).tail(100)
+        df = _frame(pair, timeframe).tail(100)
         return [{"ts": ts.isoformat(), "open": r["open"], "high": r["high"],
                  "low": r["low"], "close": r["close"]}
                 for ts, r in df.iterrows()]
 
     def get_indicators(pair: str, timeframe: str) -> dict:
-        df = _frame(provider, pair, timeframe)
-        out = compute_indicators(df)
-        if timeframe == "1h":
-            out["mtf_4h"] = compute_indicators(resample(df, "4h"))
-        return out
+        """要求された足の指標を返す。
+
+        MTF は「別の足を要求して呼び直す」で表現する (旧実装は 1h のとき
+        だけ mtf_4h を付けていたが、足を固定しない方針では 1h だけ特別扱い
+        する根拠がない。どの足の上位足を見たいかは LLM / plugin が決める)。
+        """
+        return compute_indicators(_frame(pair, timeframe))
 
     def get_econ_calendar(days: int = 1) -> list[dict]:
         return econ.upcoming(hours=days * 24)
 
+    pair_param = _pair_param(settings)
     return [
         ToolDef("get_ohlcv", "OHLCV 価格データ (直近 100 本)",
-                {"type": "object", "properties": _PAIR_PARAM,
+                {"type": "object", "properties": pair_param,
                  "required": ["pair", "timeframe"]}, get_ohlcv),
         ToolDef("get_indicators",
-                "テクニカル指標 (SMA/EMA/RSI/ATR/MACD/BB、1h には mtf_4h 付き)",
-                {"type": "object", "properties": _PAIR_PARAM,
+                "テクニカル指標 (SMA/EMA/RSI/ATR/MACD/BB)。"
+                "上位足を見たい場合は timeframe を変えて呼び直す",
+                {"type": "object", "properties": pair_param,
                  "required": ["pair", "timeframe"]}, get_indicators),
         ToolDef("get_econ_calendar", "経済指標カレンダー (今後 N 日)",
                 {"type": "object",

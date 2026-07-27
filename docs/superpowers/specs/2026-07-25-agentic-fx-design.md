@@ -1,6 +1,6 @@
 # agentic-fx 設計書
 
-- 日付: 2026-07-27 (改訂第 13 版 — plugin 種別の分類軸訂正 (知覚/注意/意見 + 種別ごとの検証手段) / strategy の位置づけと帰属規則 / ホールドアウトのハーネス所有 / strategy シグナルによる Mission 起動)
+- 日付: 2026-07-27 (改訂第 14 版 — 取引の時間軸を固定しない (intervals / primary_intervals / ソース能力ベースの足解決) / plugin 種別の分類軸訂正 (知覚/注意/意見 + 種別ごとの検証手段) / strategy の位置づけと帰属規則 / ホールドアウトのハーネス所有 / strategy シグナルによる Mission 起動)
 - ステータス: 承認待ち
 - 前身: `~/project/finance` (IFD 計画型 FX 自動トレードシステム)
 
@@ -198,12 +198,22 @@ Risk Gate・sizing・kill switch・取引モードの承認ゲートは一切迂
 詳細情報は agent がツールで取得する (**すべて読み取り専用**):
 
 - `get_ohlcv(pair, timeframe)` — 価格データ (SQLite キャッシュ付き)
-- `get_indicators(pair, timeframe)` — テクニカル指標 (MTF リサンプル込み、承認済み indicator plugin を含む) [知覚]
+- `get_indicators(pair, timeframe)` — 要求した足のテクニカル指標 (承認済み indicator plugin を含む) [知覚]。**上位足を見たいときは `timeframe` を変えて呼び直す** (特定の足に固定した MTF の自動追補はしない)
 - `get_signals(pair, since)` — 承認済み `signal` / `strategy` plugin の出力 (Phase 2)。`strategy` の提案には直近のバックテスト成績を添えて返す [注意 / 意見]
 - `search_news(query)` — ChromaDB RAG のニュース検索 (news_sources の全承認済みソースを含む)
 - `get_econ_calendar(days)` — 経済指標カレンダー (SQLite)
 - `get_positions()` / `get_account()` — 現在ポジション・残高
 - `get_recent_reflections(pair, n)` / `search_reflections(query)` — 過去トレードの振り返り (意味検索含む)
+
+### 取引の時間軸は固定しない
+
+**特定の足を「主系列」として system に焼き込まない。** day / swing のどちらでも、勝てる時間軸を積極的に取りに行く方針であり、時間軸に特化した `strategy` plugin を置くことも認める。バックテストも複数の時間軸で回す。
+
+- 扱う足は設定で決める: **`datafeed.intervals`** (取得・保持する足の集合。plugin とバックテストが使える) と **`datafeed.primary_intervals`** (判断 Mission が依存する足。healthcheck はこれを検証し、1 つでも不健全なら fail closed)
+- `intervals` は **`1m` を必ず含む** (ペーパー約定判定が 1 分足に依存する構造的要件)
+- **足を増やすほど単一障害点も増える** (`primary_intervals` のどれかが不健全なら Mission が止まる)。既定は `primary_intervals: [1h]` に留め、時間軸特化 plugin が使う足は `intervals` 側にだけ入れる
+- **足の可否はシステムの仕様ではなくソースの能力**として持つ (`NATIVE_INTERVALS`)。MT5 は `1m/5m/15m/30m/1h/4h/1d` をネイティブに持ち、yfinance は 4h・30m を持たない。**ネイティブにあればそれを使い、無ければより細かい足から resample で導出する**
+- 導出足はネイティブ足と**バケット境界が一致しないことがある** (ブローカーのサーバ時刻基準のため)。そのため `PriceProvider.bars_origin()` で由来 (ネイティブ / 導出) を記録する。実運用とバックテストで違う足を見ていないかを、ここで確認できるようにしておく
 
 ### データ取得元
 
@@ -657,7 +667,8 @@ agentic-fx/
 ## 12. 設定・ストレージ
 
 - 設定: `config/settings.yaml` 1 ファイル (gitignore) + `config/settings.yaml.example` (コミット)。前身の 3 分割はしない
-- 秘密情報: `.env` (`DISCORD_WEBHOOK_URL`, `TWELVEDATA_API_KEY`, `AFX_OPERATOR_KEY`, `AFX_APPROVER_KEY` など — API キー 2 段分離は §7)
+- 秘密情報: `.env` (`DISCORD_WEBHOOK_URL`, `TWELVEDATA_API_KEY`, **`MT5_BRIDGE_API_KEY`** (bridge の `X-Bridge-Api-Key` に使う), `AFX_OPERATOR_KEY`, `AFX_APPROVER_KEY` など — API キー 2 段分離は §7)
+- **`datafeed.intervals` / `datafeed.primary_intervals`**: 扱う足の集合と、判断 Mission が依存する足 (§5「取引の時間軸は固定しない」)。`intervals` は `1m` 必須、`primary_intervals` は `intervals` の非空の部分集合
 - **`account_currency`** (トップレベル、既定 `JPY`): 利用者の基準通貨。損益・リスクの表現に使う (§5)。取引可能ペアを制限するものではない。実取引では MT5 口座通貨と照合し不一致なら起動拒否
 - **`display_timezone`** (トップレベル、既定 `UTC`): ログ・status 表示に使う IANA タイムゾーン。**保存は常に UTC、市場境界は NY 固定で変更不可** (§13)
 - **稼働モード・発注方式 (autopilot) は settings.yaml に置かず `data/state/` に保存** (§3 — config 編集では実資金運用・自動発注に切り替わらない構造的担保)

@@ -236,9 +236,33 @@ git commit -m "feat: データ健全性検証 (鮮度・連続性・異常値) +
 - Produces (各関数はネットワーク例外を握らず送出する — 選択は price_provider の責務):
   - `vendor_symbol(logical: str, vendor: str) -> str` — **論理シンボル → vendor 別シンボルの明示 resolver** (`VENDOR_SYMBOLS` テーブル)。Phase 1 は USDJPY / EURUSD (+ 関連指標の拡張点として DXY の例)。未定義は `KeyError` (provider 側でソース失敗として扱う)
   - `yf_quote(pair) -> Quote` / `yf_bars(pair, interval, lookback_days) -> list[Bar]` — yfinance。**`multi_level_index=False` を明示** (現行 yfinance は単一 ticker でも MultiIndex 列がデフォルト — #critical)。quote は直近 1m バーの close を bid=ask として返す (yfinance に板がないため。source="yfinance")
-  - `mt5_quote(bridge_url, pair) -> Quote` / `mt5_bars(bridge_url, pair, interval, lookback_days) -> list[Bar]` — httpx GET (mt5_bridge の既存エンドポイント形式)。source="mt5"
+  - `mt5_quote(bridge_url, pair) -> Quote` / `mt5_bars(bridge_url, pair, interval, lookback_days) -> list[Bar]` / **`mt5_bars_range(bridge_url, pair, interval, start, end) -> list[Bar]`** — httpx GET。**実 bridge の API に厳密に合わせること** (下記)。source="mt5"
+
+    **重要 — 既存 bridge の実 API 仕様** (`~/project/finance/mt5_bridge/server.py` を実測。旧記述は実在しない `/rates?symbol&timeframe&count` を叩いており、着手した瞬間に 404/401 で全滅する):
+
+    | | 実際の仕様 |
+    |---|---|
+    | quote | `GET {bridge_url}/quote/{symbol}` — **symbol はパスパラメータ** (クエリではない) |
+    | quote 応答 | `{symbol, bid, ask, spread_points, time}` (`time` は ISO 8601 文字列)。**`spread_points` で実 spread が取れる** |
+    | bars | `GET {bridge_url}/ohlcv/{symbol}?from=<ISO>&to=<ISO>&interval=<tf>` — **count ではなく期間指定** |
+    | bars 応答 | `{symbol, interval, bars: [...]}` — **`r.json()["bars"]` を読む** (素の配列ではない) |
+    | bar の要素 | `{time, open, high, low, close, tick_volume, spread, real_volume}` |
+    | interval | `1m \| 5m \| 15m \| 30m \| 1h \| 4h \| 1d` — **4h もネイティブ対応** (`TIMEFRAME_H4`) |
+    | 認証 | **`X-Bridge-Api-Key` ヘッダ必須** (bridge 側 `auth_required` が真のとき)。値は `.env` の `MT5_BRIDGE_API_KEY` から `os.environ.get` で読む (秘密情報は `.env` のみ — 制約) |
+    | エラー | MT5 未接続 503 / 不正 symbol・期間 400 / symbol 不明 404 |
+
+    - **期間指定が本来の形**なので `mt5_bars_range` を素の関数とし、`mt5_bars(..., lookback_days)` はそれを呼ぶ薄いラッパーにする。この形にしておくと、Phase 2 の長期 backfill (バックテスト用の履歴取り込み) が**新しい経路を作らずそのまま使える**
   - `td_quote(api_key, pair) -> Quote` / `td_bars(api_key, pair, interval, lookback_days) -> list[Bar]` — Twelve Data (`/quote` は実在する — quote チェーンにも入る)。**interval は `_TD_INTERVAL` で変換** (`1m→1min` 等)。`outputsize` は **5000 上限で clamp**
-  - `INTERVAL_MIN: dict[str, float]` = `{"1m": 1, "5m": 5, "15m": 15, "1h": 60, "1d": 1440}` — **`4h` はソース層に存在しない** (4h はツール層が 1h から resample で導出 — プラン 4)
+  - `INTERVAL_MIN: dict[str, float]` = `{"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}`
+  - **`NATIVE_INTERVALS: dict[str, frozenset[str]]`** — ソース毎にネイティブ対応する足。**取引の時間軸は固定しない**方針 (day / swing で勝てる時間軸を取りに行く。時間軸特化の strategy plugin も許す) のため、足を 1h 決め打ちにせずソースの能力として持つ:
+
+    | source | ネイティブ対応 |
+    |---|---|
+    | `mt5` | `1m 5m 15m 30m 1h 4h 1d` (bridge の `TIMEFRAME_*` マップと一致させる) |
+    | `twelvedata` | `_TD_INTERVAL` のキー |
+    | `yfinance` | `1m 5m 15m 1h 1d` (**4h / 30m は無い**) |
+
+  - **ネイティブに無い足は、より細かい足から `resample` で導出する** (例: yfinance の 4h は 1h から)。導出はソース層の責務にせず `PriceProvider` が行い、**どちらの経路で得た足かを記録する** — バックテストと実運用で違う 4h を見ると、バックテストの意味が失われるため
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -376,11 +400,19 @@ import yfinance
 from agentic_fx.core.contracts import Bar, Quote
 
 INTERVAL_MIN: dict[str, float] = {
-    "1m": 1, "5m": 5, "15m": 15, "1h": 60, "1d": 1440}
-# 4h はソース層に存在しない — ツール層が 1h から resample (プラン 4)
+    "1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
 
-_TD_INTERVAL = {"1m": "1min", "5m": "5min", "15m": "15min",
-                "1h": "1h", "1d": "1day"}
+# ソース毎のネイティブ対応足。取引の時間軸は固定しないため、足の可否は
+# 「システムの仕様」ではなく「ソースの能力」として持つ。ネイティブに無い
+# 足は PriceProvider がより細かい足から resample で導出する。
+NATIVE_INTERVALS: dict[str, frozenset[str]] = {
+    "mt5": frozenset({"1m", "5m", "15m", "30m", "1h", "4h", "1d"}),
+    "twelvedata": frozenset(_TD_INTERVAL),
+    "yfinance": frozenset({"1m", "5m", "15m", "1h", "1d"}),
+}
+
+_TD_INTERVAL = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+                "1h": "1h", "4h": "4h", "1d": "1day"}
 _TD_MAX_OUTPUTSIZE = 5000
 
 VENDOR_SYMBOLS: dict[str, dict[str, str]] = {
@@ -428,26 +460,48 @@ def yf_quote(pair: str) -> Quote:
     return Quote(pair, last.close, last.close, last.ts, "yfinance")
 
 
+def _mt5_headers() -> dict[str, str]:
+    """bridge の API キー。auth_required が偽なら未設定でも通る。"""
+    key = os.environ.get("MT5_BRIDGE_API_KEY")
+    return {"X-Bridge-Api-Key": key} if key else {}
+
+
 def mt5_quote(bridge_url: str, pair: str) -> Quote:
-    r = httpx.get(f"{bridge_url}/quote",
-                  params={"symbol": vendor_symbol(pair, "mt5")}, timeout=10)
+    # symbol はパスパラメータ (クエリではない — 実 bridge 仕様)
+    sym = vendor_symbol(pair, "mt5")
+    r = httpx.get(f"{bridge_url}/quote/{sym}",
+                  headers=_mt5_headers(), timeout=10)
     r.raise_for_status()
-    d = r.json()
+    d = r.json()   # {symbol, bid, ask, spread_points, time}
     return Quote(pair, float(d["bid"]), float(d["ask"]),
                  datetime.fromisoformat(d["time"]), "mt5")
 
 
-def mt5_bars(bridge_url: str, pair: str, interval: str,
-             lookback_days: int) -> list[Bar]:
-    count = int(lookback_days * 1440 / INTERVAL_MIN[interval])
-    r = httpx.get(f"{bridge_url}/rates",
-                  params={"symbol": vendor_symbol(pair, "mt5"),
-                          "timeframe": interval, "count": count}, timeout=30)
+def mt5_bars_range(bridge_url: str, pair: str, interval: str,
+                   start: datetime, end: datetime) -> list[Bar]:
+    """期間指定でバーを取る (bridge の本来の形。copy_rates_range ベース)。
+
+    Phase 2 の長期 backfill もこの関数をそのまま使う。
+    """
+    sym = vendor_symbol(pair, "mt5")
+    r = httpx.get(f"{bridge_url}/ohlcv/{sym}",
+                  params={"from": start.isoformat(), "to": end.isoformat(),
+                          "interval": interval},
+                  headers=_mt5_headers(), timeout=30)
     r.raise_for_status()
+    payload = r.json()          # {symbol, interval, bars: [...]}
     return [Bar(pair, interval, datetime.fromisoformat(x["time"]),
                 float(x["open"]), float(x["high"]), float(x["low"]),
                 float(x["close"]), float(x.get("tick_volume", 0)))
-            for x in r.json()]
+            for x in payload["bars"]]
+
+
+def mt5_bars(bridge_url: str, pair: str, interval: str,
+             lookback_days: int) -> list[Bar]:
+    """lookback_days 形式の薄いラッパー (他ソースと同じ呼び口を保つため)。"""
+    end = datetime.now(timezone.utc)
+    return mt5_bars_range(bridge_url, pair, interval,
+                          end - timedelta(days=lookback_days), end)
 
 
 def td_quote(api_key: str, pair: str) -> Quote:
@@ -497,18 +551,41 @@ git commit -m "feat: ソース fetcher (yfinance/MT5 bridge/Twelve Data、全モ
 ### Task 3: PriceProvider (datafeed/price_provider.py)
 
 **Files:**
+- Create: `src/agentic_fx/datafeed/bars.py` — 足の変換 (Task 4 の indicators も import する共有モジュール)
 - Create: `src/agentic_fx/datafeed/price_provider.py`
-- Test: `tests/datafeed/test_price_provider.py`
+- Modify: `src/agentic_fx/config.py` — `DatafeedSettings` に `intervals` / `primary_intervals` を追加
+- Modify: `config/settings.yaml.example` — 同じキーを追加 (**両方を同期すること** — 規約)
+- Test: `tests/datafeed/test_bars.py`, `tests/datafeed/test_price_provider.py`
 
 **Interfaces:**
+- Produces: `datafeed/bars.py`:
+  - `bars_to_df(bars: list[Bar]) -> pd.DataFrame` — index=ts, columns open/high/low/close/volume
+  - `df_to_bars(df: pd.DataFrame, pair: str, interval: str) -> list[Bar]` — 逆変換 (導出足を `Bar` に戻す)
+  - `resample(df: pd.DataFrame, rule: str) -> pd.DataFrame` — OHLCV リサンプル。**バケット境界は UTC 固定** (`origin="epoch"`) とし、実運用とバックテストで同じ境界を使う
+
+- Produces: **config への追加** (取引の時間軸を固定しないため):
+
+  ```yaml
+  datafeed:
+    # ... 既存キー ...
+    intervals: [1m, 5m, 15m, 1h, 4h]   # 取得・保持する足。plugin とバックテストが使える足の集合
+    primary_intervals: [1h]            # 判断 Mission が依存する足。healthcheck はこれを検証する
+  ```
+
+  - `intervals` は **`1m` を必ず含む** (ペーパー約定判定が依存する構造的要件)。含まなければ `ConfigError`
+  - `primary_intervals` は **`intervals` の部分集合**かつ空でないこと。違反は `ConfigError`
+  - 全要素が `INTERVAL_MIN` のキーであること。違反は `ConfigError`
+  - **設計意図**: 判断に使う足を増やしたければ `primary_intervals` に足す。**足を増やすほど単一障害点も増える** (どれか 1 つ不健全なら fail closed で Mission が止まる) ため、既定は `[1h]` に留め、時間軸特化の strategy plugin が使う足は `intervals` 側にだけ入れる
+
 - Produces: `class PriceProvider`:
   - `__init__(self, conn, settings: Settings, clock: Clock)`
   - `get_quote(self, pair: str) -> Quote` — 優先順位 **MT5 → Twelve Data → yfinance** (quote も 3 ソース — TD には `/quote` がある)。**enabled なソースのみ**を順に試し、**取得成功 + `validate_quote` 通過**した最初の Quote を返す。全滅なら `DataUnhealthy`
-  - `get_bars(self, pair: str, interval: str, lookback_days: int = 5) -> list[Bar]` — 同順・同条件。`interval="4h"` は **`DataUnhealthy("4h is derived — request 1h")`** (ソース層に 4h はない)。健全性通過後 **ohlcv キャッシュに upsert** して返す。全滅時、キャッシュに健全なバーがあればそれを返し、なければ `DataUnhealthy`
+  - `get_bars(self, pair: str, interval: str, lookback_days: int = 5) -> list[Bar]` — 同順・同条件。**足を決め打ちしない**: ソースが `NATIVE_INTERVALS` で対応していればそのまま要求し、対応していなければ**より細かいネイティブ足を取って `resample` で導出する** (`4h` を持たない yfinance なら 1h → 4h)。健全性通過後 **ohlcv キャッシュに upsert** して返す (導出した足も upsert し、`interval` は要求された足で保存する)。全滅時、キャッシュに健全なバーがあればそれを返し、なければ `DataUnhealthy`。`INTERVAL_MIN` に無い足は `ValueError`
   - `last_bars_source(self, pair: str, interval: str) -> str | None` — 直近の `get_bars` が採用した source 名 (`"mt5" / "twelvedata" / "yfinance" / "cache"`)。**データ品質フラグの公開点** (設計書 §5: yfinance のみで得た判断に品質フラグを残す — trade_loop がこれを missions 記録・activity に添える)
   - `latest_1m_bar(self, pair: str) -> Bar | None` — scheduler の `bars_fn` 用。`DataUnhealthy` は None (fills 判定をスキップさせる)
   - `spec(self, pair: str) -> InstrumentSpec` — executor の `spec_fn` 用。Phase 1 は組み込みテーブル。Phase 3 で MT5 照会に置換
-  - `healthcheck(self, pair: str) -> str` — **quote と 1h バー (判断 Mission の主系列) の両方**が健全であることを確認し、quote の source 名を返す。どちらか全滅は `DataUnhealthy` (設計書 §5 の fail closed — quote だけの確認では OHLCV 不健全時に Mission が走ってしまう)
+  - `healthcheck(self, pair: str) -> str` — **quote と `settings.datafeed.primary_intervals` の全バー**が健全であることを確認し、quote の source 名を返す。どれか 1 つでも全滅なら `DataUnhealthy` (設計書 §5 の fail closed — quote だけの確認では OHLCV 不健全時に Mission が走ってしまう)。**1h 決め打ちにしない** — 取引の時間軸は固定せず、判断に使う足を設定で選ぶため
+  - **`bars_origin(self, pair: str, interval: str) -> str | None`** — 直近に返した足の由来 (`"mt5"` / `"yfinance(1h→4h derived)"` / `"cache"` 等)。導出足かネイティブ足かを記録し、status 表示とバックテストの再現性確認に使う
   - **`quote_to_account_rate(self, quote_ccy: str, account_ccy: str) -> float`** — 「クォート通貨 1 単位 = 口座通貨いくらか」を返す (設計書 §5「口座通貨と換算」)。**この実装により、プラン 2 で暫定的に fail closed にしていたクロス通貨ペア (JPY 口座での EURUSD 等) が扱えるようになる**
     - `quote_ccy == account_ccy` なら `1.0`
     - **①直接ペア `{quote}{account}`** の quote 価格 → そのまま。**②逆ペア `{account}{quote}`** → その逆数。**③どちらも無ければ USD 経由のクロス** (`{quote}USD` × `USD{account}` 相当)
@@ -661,10 +738,36 @@ def test_yfinance_disabled_is_respected(tmp_path):
         yq.assert_not_called()
 
 
-def test_get_bars_rejects_4h(tmp_path):
-    _, p = _provider(tmp_path)
-    with pytest.raises(DataUnhealthy, match="4h"):
+def test_get_bars_derives_4h_from_1h_on_yfinance(tmp_path):
+    """yfinance は 4h をネイティブに持たないので 1h から導出する。
+
+    足を固定しない方針のため、4h の要求を拒否せず導出で満たす。
+    由来を記録して「ネイティブ 4h」と区別できることも併せて確認する。
+    """
+    _, p = _provider(tmp_path)   # yfinance のみ enabled
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_fresh_bars(interval="1h", n=100)) as yb:
+        bars = p.get_bars("USDJPY", "4h")
+    yb.assert_called_once()
+    assert yb.call_args.args[1] == "1h"          # 1h を取りに行っている
+    assert all(b.interval == "4h" for b in bars)  # 返るのは 4h
+    assert "derived" in p.bars_origin("USDJPY", "4h")
+
+
+def test_get_bars_uses_native_4h_when_source_has_it(tmp_path):
+    """MT5 は 4h をネイティブに持つので resample しない。"""
+    _, p = _provider(tmp_path, mt5=True)
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
+               return_value=_fresh_bars(interval="4h", n=30)) as mb:
         p.get_bars("USDJPY", "4h")
+    assert mb.call_args.args[2] == "4h"           # 4h をそのまま要求
+    assert p.bars_origin("USDJPY", "4h") == "mt5"  # derived が付かない
+
+
+def test_get_bars_rejects_unknown_interval(tmp_path):
+    _, p = _provider(tmp_path)
+    with pytest.raises(ValueError, match="unknown interval"):
+        p.get_bars("USDJPY", "3h")
 
 
 def test_last_bars_source_tracks_quality_flag(tmp_path):
@@ -780,8 +883,10 @@ class PriceProvider:
 
     def get_bars(self, pair: str, interval: str,
                  lookback_days: int = 5) -> list[Bar]:
-        if interval == "4h":
-            raise DataUnhealthy("4h is derived — request 1h and resample")
+        # 足は決め打ちしない。ソースがネイティブに持つなら素直に要求し、
+        # 無ければより細かいネイティブ足から resample で導出する。
+        if interval not in sources.INTERVAL_MIN:
+            raise ValueError(f"unknown interval: {interval}")
         d = self.settings.datafeed
         now = self.clock.now()
         interval_min = sources.INTERVAL_MIN[interval]
@@ -789,10 +894,16 @@ class PriceProvider:
         for name, fn in self._chain(pair, kind="bars", interval=interval,
                                     lookback_days=lookback_days):
             try:
-                bars = fn()
+                if interval in sources.NATIVE_INTERVALS[name]:
+                    bars, origin = fn(), name
+                else:
+                    base = self._finest_native_base(name, interval)
+                    bars = self._derive(pair, name, base, interval,
+                                        lookback_days)
+                    origin = f"{name}({base}→{interval} derived)"
                 validate_bars(bars, now, d.freshness_max_min, interval_min)
                 ohlcv.upsert_bars(self.conn, bars)
-                self._bars_source[(pair, interval)] = name
+                self._bars_source[(pair, interval)] = origin
                 return bars
             except Exception as e:  # noqa: BLE001
                 _log.warning("bars source %s failed for %s: %s", name, pair, e)
@@ -812,6 +923,42 @@ class PriceProvider:
     def last_bars_source(self, pair: str, interval: str) -> str | None:
         return self._bars_source.get((pair, interval))
 
+    # bars_origin は last_bars_source の別名 (契約名。呼び出し側はこちらを使う)
+    bars_origin = last_bars_source
+
+    # ---- 足の導出 ---------------------------------------------------------
+
+    def _finest_native_base(self, source: str, interval: str) -> str:
+        """interval を導出できる、最も粗いネイティブ足を選ぶ。
+
+        粗いほど取得本数が少なく API 負荷が低い。interval_min の約数で
+        なければ境界が合わないため候補から外す (例: 4h を 15m から作るのは
+        可、90m からは不可)。
+        """
+        want = sources.INTERVAL_MIN[interval]
+        cands = [i for i in sources.NATIVE_INTERVALS[source]
+                 if sources.INTERVAL_MIN[i] < want
+                 and want % sources.INTERVAL_MIN[i] == 0]
+        if not cands:
+            raise DataUnhealthy(
+                f"{source} cannot provide or derive {interval}")
+        return max(cands, key=lambda i: sources.INTERVAL_MIN[i])
+
+    def _derive(self, pair: str, source: str, base: str, interval: str,
+                lookback_days: int) -> list[Bar]:
+        """base 足を取って interval へ resample する。
+
+        **バケット境界は UTC 固定**とする (`resample(..., origin="epoch")`)。
+        実運用とバックテストで同じ境界を使うことが目的であり、ここが
+        ブレると「バックテストと違う 4h を見る」状態になる。なお
+        **ネイティブ足 (MT5 の H4 等) とは境界が一致しないことがある**
+        (ブローカーのサーバ時刻基準のため)。だから由来を記録する。
+        """
+        raw = self._fetch_native(pair, source, base, lookback_days)
+        df = bars_to_df(raw)
+        out = resample(df, interval)
+        return df_to_bars(out, pair, interval)
+
     def latest_1m_bar(self, pair: str) -> Bar | None:
         try:
             return self.get_bars(pair, "1m", 1)[-1]
@@ -827,9 +974,14 @@ class PriceProvider:
             raise DataUnhealthy(f"no instrument spec for {pair}") from None
 
     def healthcheck(self, pair: str) -> str:
-        """quote と 1h バー (判断 Mission の主系列) の両方を検証する。"""
+        """quote と primary_intervals の全バーを検証する。
+
+        足は 1h 決め打ちにしない (取引の時間軸を固定しない方針)。判断が
+        依存する足はすべて健全でなければ Mission を回さない (fail closed)。
+        """
         source = self.get_quote(pair).source
-        self.get_bars(pair, "1h")
+        for interval in self.settings.datafeed.primary_intervals:
+            self.get_bars(pair, interval)   # DataUnhealthy はそのまま伝播
         return source
 ```
 
@@ -854,9 +1006,8 @@ git commit -m "feat: PriceProvider (ソース解決・健全性・キャッシ�
 - Test: `tests/datafeed/test_indicators.py`
 
 **Interfaces:**
+- Consumes: `datafeed/bars.py` の `bars_to_df` / `resample` (**Task 3 で作成済み** — 足の変換はデータ層の責務であり、PriceProvider がネイティブに無い足を導出するのに先に必要になる。indicators では import して使うだけで再定義しない)
 - Produces:
-  - `bars_to_df(bars: list[Bar]) -> pd.DataFrame` — index=ts, columns open/high/low/close/volume
-  - `resample(df: pd.DataFrame, rule: str) -> pd.DataFrame` — `"4h"` 等へ OHLCV リサンプル (MTF)
   - `compute_indicators(df: pd.DataFrame) -> dict` — 組み込み指標: `sma_20, sma_50, ema_12, ema_26, rsi_14, atr_14, macd, macd_signal, bb_upper, bb_lower` (各 float、直近値)。データ不足の指標は None
 - 前身の technical_scorer (判断系) は移植しない — 生の指標値だけを返し、判断は LLM (設計書 §2)
 
@@ -929,21 +1080,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from agentic_fx.core.contracts import Bar
-
-
-def bars_to_df(bars: list[Bar]) -> pd.DataFrame:
-    return pd.DataFrame(
-        {"open": [b.open for b in bars], "high": [b.high for b in bars],
-         "low": [b.low for b in bars], "close": [b.close for b in bars],
-         "volume": [b.volume for b in bars]},
-        index=pd.DatetimeIndex([b.ts for b in bars]))
-
-
-def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    return df.resample(rule).agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last",
-         "volume": "sum"}).dropna()
+# 足の変換は datafeed/bars.py (Task 3) に置く。ここで再定義しない
+from agentic_fx.datafeed.bars import bars_to_df, resample  # noqa: F401
 
 
 def _last(series: pd.Series, min_len: int) -> float | None:
