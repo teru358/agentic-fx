@@ -15,6 +15,43 @@ _SPIKE_PCT = 10.0
 # 休場時間サンプリングの上限回数。超過する場合は「数え切れない = 健全と
 # 断言できない」として fail closed (DataUnhealthy) にする (修正ラウンド 1: 指摘 1)。
 _MAX_CLOSED_TIME_SAMPLES = 100_000
+# 連続性 (gap) 検査の対象を末尾からの窓に限定する (修正ラウンド 2: 指摘 —
+# 祝日隣接週の回帰)。
+#
+# market_hours は祝日カレンダーを持たず週次の開場パターンしか判定できないため、
+# 祝日で実際には休場だった平日時間帯を「開場中の欠損」として検出してしまう
+# (例: 12/25 木曜のクリスマスは平日扱いのまま)。バー列全体を毎回走査すると、
+# この誤検出が「その穴がバー列の窓に残っている間ずっと」健全性判定を
+# 落とし続けてしまう。
+#
+# gap 検査が答えるべき問いは「フィードは “いま” ちゃんと動いているか」であり、
+# 過去に穴があっても以後データが連続して回復していれば feed 自体は健全と
+# 判断してよい。そこで検査対象を末尾直近の窓に絞る。
+#
+# 窓の幅は「バー本数」と「wall-clock 時間の下限」の大きい方
+# (`_GAP_CHECK_WINDOW_BARS * interval_min` 分 と `_GAP_CHECK_WINDOW_MIN_MINUTES`
+# 分の max) で決める。バー本数だけで決めると、1m 足では 24 本 = 24 分しか
+# ならず、フィード障害から 25 分程度で回復しただけで「もう健全」と誤判定
+# してしまう (advisor レビューで指摘)。逆に wall-clock 下限だけだと日足以上の
+# 粗い足で窓が 1 本未満になりかねないため、下限をバー本数でも設けている。
+#
+# 値の根拠:
+# - 指摘 1 (Critical) の再現ケース (金曜最後のバー + 月曜のバー) は
+#   穴がバー列の末尾に隣接しており、窓の広さによらず常に窓内に入るため
+#   検出され続ける (この定数を弱めても Critical の検出力は落ちない)。
+# - 祝日ギャップは、休場明けから概ね 1 日分の新しい定時データが蓄積されれば
+#   窓の外に押し出され、健全性判定への影響が消える。取引判断 loop は
+#   1 時間毎に実行される (設計書 §4) ため、1h 足なら丸 1 日、より粗い
+#   足でも概ね数日以内に通常運転へ復帰できることを優先し 24h とした。
+#   **ただし裏を返せば、祝日を挟んだ週は復帰まで最大 ~24h は健全性判定に
+#   落ち続けるということでもある** (今回のスコープでは祝日カレンダーを
+#   導入しないための意図的なトレードオフ。許容できない場合はプラン 3
+#   完了後に祝日カレンダー導入を検討)。
+# - 小さすぎると一時的なブローカー障害の検出漏れにつながるため、
+#   判断 loop の実行間隔に対して十分な余裕を持たせた。
+# - 祝日カレンダーの導入自体はスコープ外 (別途プラン 3 完了後に判断)。
+_GAP_CHECK_WINDOW_BARS = 24
+_GAP_CHECK_WINDOW_MIN_MINUTES = 24 * 60  # 24 時間 (sub-hour 足でも下限を保証)
 
 
 class DataUnhealthy(Exception):
@@ -73,6 +110,11 @@ def validate_bars(bars: list[Bar], now: datetime, freshness_max_min: float,
     allowed = timedelta(minutes=freshness_max_min + interval_min)
     if now - last_ts > allowed:
         raise DataUnhealthy(f"bars stale: last={last_ts}")
+    # gap (連続性) 検査は末尾直近の窓に限定する。zero/NaN・スパイク検査は
+    # バー個々のデータ整合性の話であり窓の対象外 (バー列全体で検査する)。
+    gap_window_minutes = max(_GAP_CHECK_WINDOW_BARS * interval_min,
+                             _GAP_CHECK_WINDOW_MIN_MINUTES)
+    gap_window_start = last_ts - timedelta(minutes=gap_window_minutes)
     prev_ts: datetime | None = None
     prev_close: float | None = None
     for b in bars:
@@ -82,7 +124,7 @@ def validate_bars(bars: list[Bar], now: datetime, freshness_max_min: float,
             raise DataUnhealthy(f"anomalous bar (zero/NaN) at {ts}")
         if prev_ts is not None:
             gap_units = (ts - prev_ts).total_seconds() / 60 / interval_min
-            if gap_units > _MAX_GAP_BARS:
+            if gap_units > _MAX_GAP_BARS and ts >= gap_window_start:
                 # 区間全体を免除するのではなく、休場だった時間だけを差し引き、
                 # 残り (開場中のはずの欠損) が閾値を超えるかで判定する
                 # (修正ラウンド 1: 指摘 1 — 丸ごと免除は fail-open だった)。
