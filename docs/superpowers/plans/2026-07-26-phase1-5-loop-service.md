@@ -30,13 +30,15 @@
 
 **Files:**
 - Modify: `src/agentic_fx/store/db.py`
+- Modify: `src/agentic_fx/store/missions.py`
 - Create: `src/agentic_fx/loops/__init__.py`, `src/agentic_fx/loops/prompts/trade_mission.md`, `src/agentic_fx/loops/prompts/ask_mission.md`, `src/agentic_fx/loops/prompts/reflection.md`
 - Create: `src/agentic_fx/policy.py`
-- Test: `tests/test_policy.py`, `tests/store/test_db.py` (追記)
+- Test: `tests/test_policy.py`, `tests/store/test_db.py` (追記), `tests/store/test_missions.py` (追記)
 
 **Interfaces:**
 - Produces:
   - `db.connect(db_path, *, check_same_thread: bool = False)` — さらに `PRAGMA busy_timeout=5000` を設定
+  - **`missions.trigger` 列 + migration + `missions.start(..., trigger=None)`** — **本 Task で実施する** (Task 3 の `TradeLoop.run_once(trigger)` が依存するため、ここで先に入れないと Task 3 のテストが `TypeError` になる)。詳細は末尾の「追記 (2026-07-27)」の変更 1 を参照
   - **スレッド × 接続の設計** (単一接続の同時使用はしない):
     - **conn_core**: scheduler スレッドの tick と Mission 実行 (ask 含む) 専用。**`core_lock` (threading.RLock) が tick 全体と ask を排他**するため、conn_core に同時アクセスするスレッドは常に 1 つ
     - **conn_shell**: シェル (Commands) 専用の**別接続**。approve/reject/status 等はこちら。WAL + busy_timeout により conn_core との並行書き込みは SQLite 側で直列化される
@@ -428,7 +430,7 @@ git commit -m "feat: 状態サマリ生成 + Mission 出力スキーマ (intent/
 **Interfaces:**
 - Produces: `class TradeLoop`:
   - `__init__(self, *, conn, runner: AgentRunner, settings: Settings, executor: Executor, provider: PriceProvider, econ: EconCalendar, policy: Policy, activity: ActivityLog, notifier: Notifier, clock: Clock)`
-  - `run_once(self, trigger: str = "cron") -> dict | None` — 取引判断 Mission (scheduler の `on_trade_mission` に差し込む)。`trigger` は起動理由で `missions.start` にそのまま渡す。**末尾の「追記 (2026-07-27)」を必ず読むこと** — この引数と `missions.trigger` 列、および `scheduler` 側の `_trade_mission_due` は Phase 2 のシグナル起動に向けた接合点であり、本タスクで形だけ用意する:
+  - `run_once(self, trigger: str = "cron") -> dict | None` — 取引判断 Mission (scheduler の `on_trade_mission` に差し込む)。`trigger` は起動理由で `missions.start` にそのまま渡す (**`missions.trigger` 列と `start(trigger=)` は Task 1 で追加済み**。未実施ならそちらを先に済ませること)。Phase 2 のシグナル起動に向けた接合点であり、背景は末尾の「追記 (2026-07-27)」にある:
     1. **fail closed**: `provider.healthcheck(settings.pairs[0])` が `DataUnhealthy` → activity SYSTEM `data_unhealthy` + notifier + **Mission を実行せず None**
     2. prompt = `load_prompt("trade_mission")` + policy.tail(4000) + `build_state_summary(...)`
     3. `Mission(tools=[get_ohlcv, get_indicators, search_news, get_econ_calendar, get_positions, get_account, get_recent_reflections, search_reflections], output_schema=TRADE_INTENT_SCHEMA, max_turns/timeout=settings.llama_swap)`
@@ -1869,11 +1871,18 @@ git commit -m "test: Phase 1 E2E (FakeRunner フル自走 — 完成条件)"
 
 ## 追記 (2026-07-27): Phase 2 シグナル起動に向けた接合点 (Task 3 に含める)
 
-設計書 改訂第 13 版 §5「strategy シグナルによる Mission 起動」を受けた変更。**Phase 2 で `strategy` plugin のシグナルが取引判断 Mission を前倒し起動できる**ようにするため、Phase 1 の段階で 2 点だけ形を用意しておく。後から入れると `scheduler.tick()` の中核と DB migration に手が入るため、先に整えるほうが安い。
+設計書 §5「strategy シグナルによる Mission 起動」を受けた変更。**Phase 2 で `strategy` plugin のシグナルが取引判断 Mission を前倒し起動できる**ようにするため、Phase 1 の段階で 2 点だけ形を用意しておく。後から入れると `scheduler.tick()` の中核と DB migration に手が入るため、先に整えるほうが安い。
 
 **シグナル検出・`signals` テーブル・`get_signals` ツールは Phase 2 であり、本プランには含めない。**
 
-### 変更 1: `missions.trigger` 列を追加する (migration 込み)
+**実施タイミング (上から順に実装できるように)**:
+
+| 変更 | 実施 Task | 理由 |
+|---|---|---|
+| 変更 1 (`missions.trigger` + migration + `start(trigger=)`) | **Task 1** | Task 3 の `run_once(trigger)` が依存する。後回しにすると Task 3 のテストが `TypeError` になる |
+| 変更 2 (`_trade_mission_due` + `on_trade_mission(reason)`) | **Task 7** (サービス配線) | scheduler と `build_app` の両方に触るため、配線を組む Task で一度に行う |
+
+### 変更 1: `missions.trigger` 列を追加する (migration 込み) — **Task 1 で実施**
 
 `src/agentic_fx/store/db.py` の `missions` DDL に追加する:
 
@@ -1962,7 +1971,7 @@ $ python3 -c "import sqlite3; c=sqlite3.connect(':memory:'); \
 
 INSERT では列名を明示すること (現行の `start` は既に明示しているので形は変わらない)。
 
-### 変更 2: `scheduler.tick()` の Mission 起動を「起動理由を返す関数」にする
+### 変更 2: `scheduler.tick()` の Mission 起動を「起動理由を返す関数」にする — **Task 7 で実施**
 
 現在 (`src/agentic_fx/core/scheduler.py`):
 

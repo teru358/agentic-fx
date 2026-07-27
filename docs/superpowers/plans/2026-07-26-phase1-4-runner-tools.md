@@ -509,6 +509,7 @@ from unittest.mock import MagicMock
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Bar, FixedClock, OrderStatus
 from agentic_fx.core.paper_broker import PaperBroker
+from agentic_fx.datafeed.sources import INTERVAL_MIN
 from agentic_fx.store import orders, reflections
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.tools import (
@@ -521,8 +522,9 @@ SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
 
 
-def _bars(n=120):
-    return [Bar("USDJPY", "1h", NOW - timedelta(hours=n - i),
+def _bars(n=120, interval="1h"):
+    step = timedelta(minutes=INTERVAL_MIN[interval])
+    return [Bar("USDJPY", interval, NOW - step * (n - i),
                 148.0, 148.2, 147.8, 148.1, 100) for i in range(n)]
 
 
@@ -636,7 +638,7 @@ def test_account_tools(tmp_path):
 
 def test_all_tools_have_schemas():
     provider, econ, rag = MagicMock(), MagicMock(), MagicMock()
-    tools = market_tools.build(provider, econ, settings) + news_tools.build(rag)
+    tools = market_tools.build(provider, econ, SETTINGS) + news_tools.build(rag)
     for t in tools:
         assert t.parameters["type"] == "object"
         assert t.description
