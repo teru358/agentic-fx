@@ -5,10 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "chromadb>=1.5.9",
+    "feedparser>=6.0.12",
+    "httpx>=0.28.1",
+    "pandas>=3.0.5",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
+    "trafilatura>=2.1.0",
     "tzdata>=2026.3",
+    "yfinance>=1.5.2",
 ]
 
 [dependency-groups]
