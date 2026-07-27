@@ -492,6 +492,7 @@ git commit -m "feat: ツールレジストリ (OpenAI スキーマ変換・許�
   - `reflection_tools.build(conn, rag: Rag) -> list[ToolDef]`: `get_recent_reflections(pair, n)` (スペック §5 のシグネチャどおり pair 必須 — orders と JOIN してペアで絞る。store に `reflections.recent_for_pair(conn, pair, n)` を追加) / `search_reflections(query)`
 - `get_ohlcv` / `get_indicators` の `timeframe="4h"` は **1h バーを `resample(df, "4h")` で集約して返す** (プラン 3 の yf_bars は 4h を 1h として取得するだけのため、ここで集約しないと 4h と称した 1h 足が LLM に渡る)
 - **全ツール読み取り専用** (書き込み系依存を一切受け取らない)
+- **`get_ohlcv` に期間指定引数を足さないこと** (`since` / `until` / `from` / `to` 等)。「直近 100 本固定」は利便性の妥協ではなく**意図的な性質**である: 設計書 §6 の過剰適合防御が「履歴期間を任意に切り出せるツールをエージェントに与えない」ことに依存しており、期間を指定できると改善ループがバックテストのホールドアウトを自分で選べてしまう (改訂第 13 版)。期間を絞りたい要求が出た場合は、この plan の範囲外として持ち帰ること
 
 - [ ] **Step 1: 失敗するテストを書く**
 

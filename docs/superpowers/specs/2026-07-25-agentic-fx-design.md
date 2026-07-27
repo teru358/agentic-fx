@@ -1,6 +1,6 @@
 # agentic-fx 設計書
 
-- 日付: 2026-07-26 (改訂第 12 版 — plugin 3 種別 (indicator/signal/strategy) + 平坦配置 / 口座通貨と換算 / バックテストの位置づけ / display_timezone)
+- 日付: 2026-07-27 (改訂第 13 版 — plugin 種別の分類軸訂正 (知覚/注意/意見 + 種別ごとの検証手段) / strategy の位置づけと帰属規則 / ホールドアウトのハーネス所有 / strategy シグナルによる Mission 起動)
 - ステータス: 承認待ち
 - 前身: `~/project/finance` (IFD 計画型 FX 自動トレードシステム)
 
@@ -115,7 +115,46 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 - **例外 (取引モードの実注文)**: クローズ中に実指値を監視外に残さないため、**市場クローズ移行時に取引モードの未約定実指値をすべて決定論的に取消す** (指値期限の上限が 24h であることとも整合)。取消と約定が競合した場合は約定済みとして扱い、即座に保護確認 (`protection_pending`) へ進む。broker との reconcile はクローズ中も継続する (頻度は下げてよい)
 - エラー時はスキップして次周期 (リトライしない)。同時実行は常に 1 (agent 実行のグローバル排他)
 - **ワンショットのユーザープロンプト**: main.py 対話シェルまたは client.py の `ask "..."` で**臨時 Mission を即時実行**する (実行は常にサービスプロセス内の排他スロット)。プロンプトはその 1 回だけ Mission に注入され (ワンショット)、結果は呼び出し元と Discord に返す。定期周期には影響しない。永続的な方針にしたい場合は `policy add` を使う
-- **ask Mission は回答・分析専用**: 出力スキーマは回答テキストのみで **TradeIntent を受理しない** (「買え」と指示しても発注経路には乗らない)。TradeIntent を生成できるのは **scheduler 起動の定期 Mission だけ**とし、executor は intent の起動元 (origin) を検証して定期 Mission 由来以外を拒否する — これがないと `POST /ask` が事実上の発注 API になり §7 の一線 (発注操作を API に載せない) が破れるため。取引判断に反映したい情報は `policy add` (永続) か次周期の定期 Mission を待つ
+- **ask Mission は回答・分析専用**: 出力スキーマは回答テキストのみで **TradeIntent を受理しない** (「買え」と指示しても発注経路には乗らない)。TradeIntent を生成できるのは **scheduler が起動した取引判断 Mission だけ** (起動理由が cron でもシグナルでも `origin` は `scheduler`。下記「strategy シグナルによる Mission 起動」参照) とし、executor は intent の起動元 (origin) を検証してそれ以外を拒否する — これがないと `POST /ask` が事実上の発注 API になり §7 の一線 (発注操作を API に載せない) が破れるため。取引判断に反映したい情報は `policy add` (永続) か次周期の定期 Mission を待つ
+
+### strategy シグナルによる Mission 起動 (Phase 2)
+
+`strategy` plugin は任意のタイミング (自身が宣言した時間足のバー確定時) で発火するため、1 時間毎の定期 Mission だけでは受け口がない。**Mission の起動タイミングだけ**を拡張してこれを受ける。
+
+**設計判断: `origin` は触らない。** 新しい `Origin` 値を足すと executor の許可リストと上記の一線 (`POST /ask` が発注 API 化するのを塞ぐ境界) の改訂になる。代わりにディスパッチャの発火条件を **`cron` から `cron OR 未処理シグナルあり`** に変えるだけとし、intent の `origin` は `SCHEDULER` のまま、executor は無変更とする。
+
+監査性は intent ではなく **mission 側**に持たせる: `missions.trigger = cron | signal:<plugin>` (§12)。これは副次的に「シグナル起動 Mission は cron Mission より成績が良いか」を測るデータになり、**この機能を残すか殺すかの判断根拠**になる。
+
+```
+strategy plugin (バー確定時にサブプロセス評価)
+  → signals テーブルに永続化 (未処理フラグつき)
+  → scheduler.tick() が毎分「未処理シグナルあり?」を判定
+  → レート制限通過 → 定期 Mission を前倒し起動 (missions.trigger = signal:<plugin>)
+  → LLM が判断 → TradeIntent → Risk Gate → sizing → executor   ← ここから先は既存経路と同一
+```
+
+Risk Gate・sizing・kill switch・取引モードの承認ゲートは一切迂回しない。増えるのは **LLM を起こす回数だけ**である。
+
+**実装上の必須事項** (いずれも省くと無音の不具合になる):
+
+1. **処理済みマークは「そのシグナルを読んだ Mission」が付ける。** 「Mission が完了した」で消してはならない — シグナル発生時点で既に走っていた cron Mission はそれを見ていないため、完了でフラグを落とすと無音で取りこぼす
+2. **重複排除キーに承認済みコンテンツハッシュを含める。** `(plugin, pair, timeframe, bar_ts)` だけだと `config.yaml` のパラメータ変更・再承認後に同じキーが再生成され、別条件のシグナルが「処理済み」で潰れる
+3. **レート制限は「起動」に対してのみ fail closed、「情報」に対しては閉じない。** 上限超過時もシグナルは signals テーブルに残り、次の定期 Mission が拾う。起動しないだけで判断材料は失われない
+4. 排他スロット (agent 実行はグローバル 1) が埋まっている場合は起動をスキップする。シグナルは残る
+
+**適用範囲: エグジット先行、エントリーはバックテストの実証後に判断する。** レイテンシ予算が非対称なため:
+
+| | LLM 判断 | 承認ゲート | 実効レイテンシ |
+|---|---|---|---|
+| エグジット | 1〜3 分 | 不要 (資金保護方向として即時実行) | 数分 |
+| エントリー (学習モード) | 1〜3 分 | 無し | 数分 |
+| エントリー (取引モード) | 1〜3 分 | 人間承認、market は 15 分で失効 | 最大 18 分 |
+
+取引モードのエントリーは承認待ちの間にシグナルの鮮度が失われるため、`autopilot on` までイベント駆動が実質的に効かない。エントリー側の是非はバックテストで「そのシグナルは 60 分待てるか」を測ってから決める。
+
+**前身の watch loop の再来ではない根拠**: finance の `watch_evaluator` は ①LLM が書いた ②AND のみの条件式を ③保留中の注文に紐付けて評価し、**発注そのものを発火**していた。本方式は ①人間承認済み・バックテスト済みの常設コードが ②特定の注文に紐付かず ③**判断を起こすだけ**である。とはいえ構造は近いため、条件語彙が育ち始めていないかを実装時に監視する。
+
+**新規リスクを生む起点はこの 2 つだけ** (定期実行 / strategy シグナル)。決済・取消は決定論的コアが独立に発行する (SL/TP 到達・day 強制決済・指値期限切れ・リスク予約維持・口座不明時の取消・市場クローズ時の取消・保護確認失敗の緊急クローズ) — これらは資金保護方向であり、LLM にもシグナルにも依存させない。
 
 ### Mission プロンプト構成
 
@@ -128,7 +167,8 @@ llama-swap の OpenAI 互換 API (`/v1/chat/completions`) に対する自前 too
 詳細情報は agent がツールで取得する (**すべて読み取り専用**):
 
 - `get_ohlcv(pair, timeframe)` — 価格データ (SQLite キャッシュ付き)
-- `get_indicators(pair, timeframe)` — テクニカル指標 (MTF リサンプル込み、承認済み indicator plugin を含む)
+- `get_indicators(pair, timeframe)` — テクニカル指標 (MTF リサンプル込み、承認済み indicator plugin を含む) [知覚]
+- `get_signals(pair, since)` — 承認済み `signal` / `strategy` plugin の出力 (Phase 2)。`strategy` の提案には直近のバックテスト成績を添えて返す [注意 / 意見]
 - `search_news(query)` — ChromaDB RAG のニュース検索 (news_sources の全承認済みソースを含む)
 - `get_econ_calendar(days)` — 経済指標カレンダー (SQLite)
 - `get_positions()` / `get_account()` — 現在ポジション・残高
@@ -265,11 +305,17 @@ news_sources: id, name, fetcher (feed | web), url,
   - `test_plugin.py` — テスト同梱必須
 - 種別はディレクトリでなく **`config.yaml` の `kind` で宣言**する。指標と戦略の境界は実際には曖昧 (例: 「MACD ダイバージェンス検出」) であり、ディレクトリ分割は作成時に分類を確定させ、後の変更をパス変更にしてしまうため。ローダーは `kind` に応じてインターフェースを検証する
 
-| kind | 出力 | 例 | バックテスト |
-|---|---|---|---|
-| `indicator` | 連続値 `dict[str, float]` | SMA / MACD / RSI / ATR | 対象外 (値に過ぎない) |
-| `signal` | 離散イベント `list[Signal]` (方向・強度・根拠、任意で SL/TP) | チャートパターン、ダイバージェンス | 可 (シグナル品質の検証) |
-| `strategy` | エントリー/エグジット条件 | 上記の組み合わせ | **主対象** |
+| kind | 出力 | LLM のどの段階に接続するか | 例 | 検証手段 |
+|---|---|---|---|---|
+| `indicator` | 連続値 `dict[str, float]` | **知覚** — 盤面を数値で見せる | SMA / MACD / RSI / ATR | **正しさ**を pytest で検証 (既知入力 → 既知出力) |
+| `signal` | 離散イベント `list[Signal]` (方向・強度・根拠、任意で SL/TP) | **注意** — 見るべき場所を指す | チャートパターン、ダイバージェンス | **検出精度**をラベル付きサンプルの再現率 / 適合率で検証 |
+| `strategy` | **閉じた提案** (entry + exit、任意で SL/TP) | **意見** — すべきことを主張する | 上記を材料にした売買ルール | **収益性**をバックテストで検証 |
+
+- **分類軸は「組み合わせているか」ではなく「出力の形 = LLM のどの認知段階に接続するか」**。指標を 5 個組み合わせても入口のイベントしか出さないなら `signal`、単一の SMA クロスでも entry と exit を両方言い切れば `strategy`
+- **3 種は弱い→強いの階段ではなく、消費される段階が違う。** strategy が「閉じている」のは、意見であるためには結末まで言い切る必要があるからであり、上位だからではない。**バックテストは strategy の検証手段のひとつに過ぎず**、indicator の正しさは pytest の方が厳密に検証できる
+- **strategy だけでは成立しない**: ①strategy が沈黙している時間の方が圧倒的に長く、そのとき盤面を見せるのは indicator である ②strategy の提案を裁定するには、その strategy が見ていない情報が要り、それも indicator である
+- `signal` の**損益ベース**評価は **plugin 単独に帰属しない** (決済規則を持たないため、測定対象は常に「signal + ハーネスが外挿した決済規則」になり、外挿ルールを変えれば評価が反転する)。signal の一次的な検証は損益ではなく検出精度で行う。検出精度の具体的な測り方 (ラベル付きサンプルの作成手順・基準値) は plugin 機構の実装時 (Phase 2) に定める
+- **前身との関係**: finance は `technical_scorer` の docstring が明言するとおり「LLM による非決定的な推論を置き換え」るため、indicator/signal を**決定論的スコアラー**が消費していた。agentic-fx では **LLM が直接消費する**。したがって `signal_combiner` 相当のスコア合成・重み調整層は不要であり、移植するのは指標・検出の計算部分のみとする
 
 - インターフェースは意図的に極小、かつ**純関数に限定** (I/O・外部アクセス禁止)。`indicator` は `compute(df, params) -> dict`、`signal` は `detect(df, params) -> list[Signal]`、`strategy` は `evaluate(df, indicators, signals, params) -> StrategyDecision`。`params` は plugin_loader が `config.yaml` を読み込んで渡す。qwen3.6 クラスの実装力でも品質が安定し、テストが決定論的になる粒度にする
 - **plugin はシグナルを出すだけで発注はしない**。発注判断は LLM (取引判断 loop) が行い、執行は決定論的コアが行う (§2 の原則を維持)
@@ -279,6 +325,17 @@ news_sources: id, name, fetcher (feed | web), url,
 - **サンドボックス実行**: 「純関数・I/O 禁止」は規約だけでは強制できない (import 時の任意コード実行を pytest では防げない) ため、plugin は**サービスプロセスに直接 import せずサブプロセスで実行**し、入力 (OHLCV DataFrame) と出力 (JSON) だけを IPC で渡す。ロード時に **AST 検査 + import allowlist** (numpy / pandas / math 等の計算系のみ) で禁止 import を拒否する。サブプロセスには**最小限の環境変数のみ渡し (秘密情報・broker 資格情報は渡さない)**、作業ディレクトリを限定し、CPU 時間・メモリ・プロセス数を resource limit で制限、タイムアウト・出力サイズ制限を課す。これらは**到達を最小化する多層防御であり完全な隔離の保証ではない** — だからこそ plugin の採用には人間承認を必須とする
 - 素の clone でも動くよう、組み込みデフォルト実装 (基本指標 + 基本ニュースソース数件の `news_sources` 初期データ) は `src/` 側にコミットする
 - サンプル plugin を `docs/examples/plugins/` にコミットし、LLM のリサーチ→実装時の参照テンプレートにする
+
+### strategy の位置づけ (実績つきの意見であり、発注権を持たない)
+
+indicator と signal は**材料**を出すが、strategy は**判断**を出す。そのため素朴に導入すると系に**判断主体が 2 つ**でき、LLM が追認機になるか strategy が無視されるかのどちらかに転ぶ。これを避けるため、strategy を **LLM への意見具申**と定義する。**提案するのは strategy、裁定するのは LLM**。
+
+- LLM の固有の仕事は 3 つ: ①複数 strategy の提案が矛盾したときの裁定 ②ニュース・経済指標イベントによる拒否権 ③strategy が見ていない文脈の考慮。いずれも indicator (知覚) と signal (注意) を材料として行う — **strategy の出力だけを並べても裁定はできない**
+- strategy の提案は「実績つき」で提示する (直近のバックテスト成績を添える)。ただし**それは助言の重みづけ材料であって、従う義務を課すものではない**
+- **帰属規則 (これが無いと成績が虚構になる)**:
+  - **strategy の成績**はバックテストで、その plugin 自身の閉じた提案からのみ計算する。LLM は一切絡まない
+  - **実運用の損益**は LLM が出した intent に帰属させ、「どの strategy 提案が存在したか / 従ったか」をタグとして保存する
+  - この分離が無いと、LLM が一度でも覆した時点で strategy の成績は虚構になり、「この strategy に従うと得か」を永久に測れなくなる
 
 ### Mission 構成: 発見 → リサーチ → 実施 (3 ステップ 1 Mission)
 
@@ -311,6 +368,8 @@ news_sources: id, name, fetcher (feed | web), url,
 **戦略採用ゲート** (risk gate パラメータ・戦略に影響する提案が対象。pytest 合格だけでは戦略の良し悪しは判定できないため):
 - バックテスト必須 (手数料・spread 込み)。**最低取引数 (初期 30) 未満の標本による変更提案は不可** — 「観察のみ」としてバックログに残す
 - 評価は out-of-sample (期間分割) で行い、既存構成 (baseline) との比較値を approval_request / PR に添付する
+- **ホールドアウト期間はハーネス (決定論的コア) が所有する。** 改善ループは「バックテスト実行」ツールを持つため、期間分割を自分で選べてしまうと out-of-sample は無意味になる。したがって **エージェント側のバックテスト実行ツールは期間を指定できない**ものとし、ホールドアウトでの評価は**エージェントが駆動しない採用ゲート側**で実行する
+- 同じ理由で、**履歴期間を任意に切り出せるツールをエージェントに与えない**。取引 loop の `get_ohlcv(pair, timeframe)` が直近 100 本固定で期間引数を持たないのは意図的な性質であり、維持する
 - 週次/日次で変更を繰り返す性質上、少数トレードへの過学習を防ぐことを人間レビューの観点として明記する
 
 ### バックテスト (詳細設計は Phase 2 後半、プラン 5 完了後)
@@ -327,7 +386,9 @@ news_sources: id, name, fetcher (feed | web), url,
 **バックテストが測っているもの (誤読を防ぐため明記)**:
 > plugin はシグナルを出すだけで、実際の発注は LLM が判断する。したがって**バックテストの成績は実運用成績の予測値ではなく、「そのシグナルに機械的に従ったらどうなったか」というシグナル品質の指標**である。改善ループはこれを**足切り** (統計的に無意味なシグナルの排除) に使い、採用の十分条件としてはならない。
 
-**シグナルの機械的執行ルール**: `signal` / `strategy` が SL/TP を返せばそれを使い、返さなければハーネスの既定ルール (例: SL = ATR × 係数、TP = RR 下限) を適用する。plugin 側の設計自由度を保ちつつ、単純なシグナルも評価可能にする。
+**シグナルの機械的執行ルール**: `signal` / `strategy` が SL/TP を返せばそれを使い、返さなければハーネスの既定ルール (例: SL = ATR × 係数、TP = RR 下限) を適用する。plugin 側の設計自由度を保ちつつ、単純なシグナルも評価可能にする。ただし**外挿を伴う `signal` の損益評価は plugin 単独に帰属しない** (種別表参照) — 外挿ルールを変えれば評価が反転するため、`signal` の一次的な検証は検出精度で行い、損益は参考値として扱う。
+
+**バックテストで LLM を代替するもの**: バックテストでは intent の出どころが plugin になる (LLM を経由せず、`strategy` の閉じた提案がそのまま Risk Gate に入る)。これは `ReplayClock` + ペーパー broker のシミュレーション専用経路であり、**実発注の経路ではない**。実運用で LLM を飛ばして plugin が発注する経路は存在しない (§5)。
 
 履歴データは `ohlcv` テーブル (§12) を読む。長期履歴の取り込み手段は詳細設計時に定める。
 
@@ -508,7 +569,7 @@ agentic-fx/
 │   │   ├── market_hours.py    # (移植)
 │   │   └── notifier.py        # Discord webhook (移植)
 │   ├── store/                 # ── ストレージ層 ──
-│   │   ├── db.py              # SQLite 接続 + 11 テーブルスキーマ
+│   │   ├── db.py              # SQLite 接続 + 12 テーブルスキーマ (signals は Phase 2)
 │   │   ├── orders.py / intents.py / missions.py / reflections.py / snapshots.py  # orders / trade_intents / missions / reflections / account_snapshots
 │   │   ├── backlog.py / improve_runs.py / econ_events.py / approvals.py / news_sources.py  # improvement_backlog / improvement_runs / econ_events / approval_requests / news_sources
 │   │   └── rag.py             # ChromaDB (news / reflections)
@@ -552,12 +613,12 @@ agentic-fx/
 - **`display_timezone`** (トップレベル、既定 `UTC`): ログ・status 表示に使う IANA タイムゾーン。**保存は常に UTC、市場境界は NY 固定で変更不可** (§13)
 - **稼働モード・発注方式 (autopilot) は settings.yaml に置かず `data/state/` に保存** (§3 — config 編集では実資金運用・自動発注に切り替わらない構造的担保)
 
-### SQLite スキーマ (`data/agentic.db`、前身 18 テーブル → 11 テーブルに再設計)
+### SQLite スキーマ (`data/agentic.db`、前身 18 テーブル → 12 テーブルに再設計。うち `signals` は Phase 2)
 
 | テーブル | 内容 |
 |---|---|
 | `ohlcv` | 価格データ (symbol, interval, bar_time, OHLCV)。前身と同形 |
-| `missions` | 全 Mission 実行記録 (loop 種別, runner, status, output_json, transcript_json) |
+| `missions` | 全 Mission 実行記録 (loop 種別, runner, status, output_json, transcript_json, **trigger**)。`trigger` は起動理由 (`cron` / `signal:<plugin>`) で、シグナル起動 Mission の成績を後から比較するための監査列 (§5) |
 | `trade_intents` | LLM の全出力 + risk gate 判定 (accepted / rejected + 却下理由) |
 | `orders` | ポジション/指値の状態機械 (下記)。主要カラム: intent_id (FK), approval_id (FK, 取引モード手動承認時), **client_order_id** (送信前に永続化する冪等キー), entry_type, horizon (day/swing), **quantity / filled_quantity / remaining_quantity / avg_fill_price** (部分約定対応), SL/TP, requested_price / close_price, fees_swap, **broker_order_id / broker_position_id** (MT5 では注文と建玉が別 ID になり得る), broker_synced_at (reconcile 最終照合時刻), realized_pnl, close_reason, created_at / updated_at / filled_at / closed_at |
 | `reflections` | トレード振り返り (order_id 主キー。前身から簡素化) |
@@ -567,6 +628,7 @@ agentic-fx/
 | `econ_events` | 経済指標カレンダー (前身 econ_event_store 移植) |
 | `approval_requests` | 人間承認の一元管理 (§7: kind = plugin / news_source / live_trade) |
 | `news_sources` | ニュース取得先リスト (§6: name, fetcher, url, enabled, added_by) |
+| `signals` | **Phase 2**。承認済み `signal` / `strategy` plugin の出力 (plugin, content_hash, pair, timeframe, bar_ts, kind, payload_json, processed_by_mission_id)。重複排除キーは (plugin, **content_hash**, pair, timeframe, bar_ts) — ハッシュを含めないと config 変更・再承認後のシグナルが「処理済み」で潰れる (§5) |
 
 **orders の状態遷移** (approval のライフサイクルと broker のライフサイクルを混同しない):
 
@@ -654,7 +716,8 @@ activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 �
 ## 15. 段階導入
 
 - **Phase 1**: 決定論的コア + LocalRunner + 取引判断 loop (学習モード = ペーパー、ハイブリッド発注、horizon) + 価格取得 (デフォルト yfinance、設定時は MT5 / TD を優先) + main.py (スプラッシュ + 対話シェル + init 起動ガード + stop) + ログ 2 軸。ツールは get_ohlcv / get_indicators / search_news / get_positions の最小セット (組み込み実装 + news_sources 初期データのみ)
-- **Phase 2**: ClaudeRunner (Agent SDK) + 戦略改善 loop (バックログ + Web リサーチ) + plugin 機構 (indicator/signal/strategy) + news_sources 承認フロー + 操作 API + client.py + `news add` / `model` コマンド + Discord 承認 (discord_bot 側 cog 含む) + policy チャネル
+  - **Phase 2 のシグナル起動に向けた接合点 (Phase 1 で形だけ用意する)**: ①`scheduler.tick()` の Mission 起動を、時刻の真偽値ではなく**起動理由を返す関数** (`"cron" | None`) にする ②`missions.trigger` 列を追加する。後から入れると `tick()` の中核と DB migration に手が入るため先に整える。**シグナル検出そのものは Phase 1 に含めない**
+- **Phase 2**: ClaudeRunner (Agent SDK) + 戦略改善 loop (バックログ + Web リサーチ) + plugin 機構 (indicator/signal/strategy) + `signals` テーブル + plugin 評価ランナー + `get_signals` ツール + **strategy シグナルによる Mission 起動** (§5、エグジット先行) + news_sources 承認フロー + 操作 API + client.py + `news add` / `model` コマンド + Discord 承認 (discord_bot 側 cog 含む) + policy チャネル
 - **Phase 3**: MT5 の発注系接続 + 資金保護系の本格接続 + 取引モード切替 (`mode trading`、人間の明示操作のみ) + 手動承認ゲート (live_trade) + `autopilot` (自動発注への段階移行)
 
 ## 16. 非スコープ (YAGNI)

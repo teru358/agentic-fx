@@ -428,7 +428,7 @@ git commit -m "feat: 状態サマリ生成 + Mission 出力スキーマ (intent/
 **Interfaces:**
 - Produces: `class TradeLoop`:
   - `__init__(self, *, conn, runner: AgentRunner, settings: Settings, executor: Executor, provider: PriceProvider, econ: EconCalendar, policy: Policy, activity: ActivityLog, notifier: Notifier, clock: Clock)`
-  - `run_once(self) -> dict | None` — 定期 Mission (scheduler の `on_trade_mission` に差し込む):
+  - `run_once(self, trigger: str = "cron") -> dict | None` — 取引判断 Mission (scheduler の `on_trade_mission` に差し込む)。`trigger` は起動理由で `missions.start` にそのまま渡す。**末尾の「追記 (2026-07-27)」を必ず読むこと** — この引数と `missions.trigger` 列、および `scheduler` 側の `_trade_mission_due` は Phase 2 のシグナル起動に向けた接合点であり、本タスクで形だけ用意する:
     1. **fail closed**: `provider.healthcheck(settings.pairs[0])` が `DataUnhealthy` → activity SYSTEM `data_unhealthy` + notifier + **Mission を実行せず None**
     2. prompt = `load_prompt("trade_mission")` + policy.tail(4000) + `build_state_summary(...)`
     3. `Mission(tools=[get_ohlcv, get_indicators, search_news, get_econ_calendar, get_positions, get_account, get_recent_reflections, search_reflections], output_schema=TRADE_INTENT_SCHEMA, max_turns/timeout=settings.llama_swap)`
@@ -1838,3 +1838,86 @@ git commit -m "test: Phase 1 E2E (FakeRunner フル自走 — 完成条件)"
 - ClaudeRunner は `AgentRunner` 実装として追加し、`settings.runner.<loop>.backend == "claude"` のとき build_app が選択する
 - 改善 loop は `improve` 用の registry サブセット (research_tools + 書き込み系) を別途組む — 取引判断 loop の読み取り専用 registry に書き込み系を混ぜない
 - ChromaDB の `Rag` は改善 loop でもそのまま使う。plugin_loader は `get_indicators` の合成点 (market_tools.build に承認済み plugin の結果を追加) として実装する
+
+---
+
+## 追記 (2026-07-27): Phase 2 シグナル起動に向けた接合点 (Task 3 に含める)
+
+設計書 改訂第 13 版 §5「strategy シグナルによる Mission 起動」を受けた変更。**Phase 2 で `strategy` plugin のシグナルが取引判断 Mission を前倒し起動できる**ようにするため、Phase 1 の段階で 2 点だけ形を用意しておく。後から入れると `scheduler.tick()` の中核と DB migration に手が入るため、先に整えるほうが安い。
+
+**シグナル検出・`signals` テーブル・`get_signals` ツールは Phase 2 であり、本プランには含めない。**
+
+### 変更 1: `missions.trigger` 列を追加する
+
+`src/agentic_fx/store/db.py` の `missions` DDL に追加する:
+
+```sql
+CREATE TABLE IF NOT EXISTS missions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  loop TEXT NOT NULL,            -- trade | improve | ask | reflection
+  runner TEXT NOT NULL, model TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running',
+  trigger TEXT NOT NULL DEFAULT 'cron',   -- cron | signal:<plugin> (Phase 2)
+  output_json TEXT, transcript_json TEXT,
+  started_at TEXT NOT NULL, finished_at TEXT
+);
+```
+
+`src/agentic_fx/store/missions.py` の `start` に `trigger: str = "cron"` を追加して INSERT に含める。既定値があるため既存の呼び出し (improve / ask / reflection) は無変更でよい。
+
+**注意**: `TRIGGER` は SQLite のキーワード (`CREATE TRIGGER`) だが、列名としては引用符なしで使える。実測で確認済み:
+
+```
+$ python3 -c "import sqlite3; c=sqlite3.connect(':memory:'); \
+  c.execute(\"CREATE TABLE t (id INTEGER PRIMARY KEY, trigger TEXT NOT NULL DEFAULT 'cron')\"); \
+  c.execute(\"INSERT INTO t (trigger) VALUES ('cron')\"); print(c.execute('SELECT trigger FROM t').fetchall())"
+[('cron',)]
+```
+
+INSERT では列名を明示すること (現行の `start` は既に明示しているので形は変わらない)。
+
+### 変更 2: `scheduler.tick()` の Mission 起動を「起動理由を返す関数」にする
+
+現在 (`src/agentic_fx/core/scheduler.py`):
+
+```python
+if self._last_trade is None or now - self._last_trade >= timedelta(hours=1):
+    self._last_trade = now
+    self.on_trade_mission()
+```
+
+変更後:
+
+```python
+reason = self._trade_mission_due(now)
+if reason is not None:
+    self._last_trade = now
+    self.on_trade_mission(reason)
+
+# ---- internal ----
+def _trade_mission_due(self, now: datetime) -> str | None:
+    """取引判断 Mission の起動理由を返す。起動不要なら None。
+
+    Phase 2 でシグナル起動 (`"signal:<plugin>"`) が加わる唯一の分岐点。
+    """
+    if self._last_trade is None or now - self._last_trade >= timedelta(hours=1):
+        return "cron"
+    return None
+```
+
+`on_trade_mission` の型は `Callable[[str], None]` になる。`TradeLoop.run_once(trigger)` をそこに差し込む。
+
+### テスト (Task 3 の Step に追加する)
+
+```python
+def test_mission_trigger_is_recorded_as_cron():
+    """cron 起動の Mission は missions.trigger = 'cron' で記録される。"""
+    # TradeLoop.run_once() を既定引数で実行し、missions 行の trigger を検証する
+
+
+def test_trade_mission_due_returns_cron_then_none():
+    """1 時間経過で "cron"、直後の tick では None を返す (二重起動しない)。"""
+    # Scheduler._trade_mission_due を直接呼び、境界を検証する
+```
+
+`_trade_mission_due` が理由文字列を返すことをテストで固定しておくと、Phase 2 で分岐を足すときに既存挙動の回帰が検出できる。
