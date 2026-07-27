@@ -575,6 +575,14 @@ git commit -m "feat: ソース fetcher (yfinance/MT5 bridge/Twelve Data、全モ
 
 ### Task 3: PriceProvider (datafeed/price_provider.py)
 
+> **⚠️ 着手前に必ず対処すること (Task 2 のレビューで判明、未解決)**
+>
+> **`yf_bars` / `yf_quote` が返す intraday バーは tz-aware だが UTC ではない。** yfinance 1.5.2 のソース実測によると、`ignore_tz=True` が効くのは日足のみで、`1m/5m/15m/30m/1h` は Yahoo の `exchangeTimezoneName` にローカライズされたインデックスを返す。Task 2 の実装は `if t.tzinfo is None: replace(tzinfo=utc)` なので、**既に非 UTC の tzinfo が付いている場合は素通り**する。プロジェクト制約「時刻は必ず tz-aware UTC」に反し、`bars_to_df` の `tz="UTC"` 指定や `ohlcv` への保存で問題になる。
+>
+> **Twelve Data の応答タイムゾーンも未検証。** `td_bars` は `timezone` パラメータを指定せず `fromisoformat(...).replace(tzinfo=utc)` で無条件に UTC ラベルを付けている。TD の既定が Exchange ローカル時刻なら**絶対時刻そのものがずれる** (yfinance より深刻)。`timezone=UTC` を明示するのが安全。
+>
+> どちらもソース層で正規化するか PriceProvider で一括正規化するかを決め、**テストで固定してから** Task 3 の本体に進むこと。
+
 **Files:**
 - Create: `src/agentic_fx/datafeed/bars.py` — 足の変換 (Task 4 の indicators も import する共有モジュール)
 - Create: `src/agentic_fx/datafeed/price_provider.py`
