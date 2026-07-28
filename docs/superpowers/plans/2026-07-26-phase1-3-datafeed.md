@@ -1307,6 +1307,12 @@ git commit -m "feat: PriceProvider (ソース解決・健全性・キャッシ�
 
 ### Task 4: 指標 + MTF (datafeed/indicators.py)
 
+> **実装済み (2026-07-28、commits `b5f6254..f6c8317`)。RSI のコードは実装と一致しません** — レビューで欠陥が見つかり書き換えました。**現在の正は `src/agentic_fx/datafeed/indicators.py`** です。
+>
+> 下の `rs = gain / loss.replace(0, pd.NA)` は、**直近 14 本がすべて陽線のとき `rsi_14` が `None` を返す**。この API で `None` は「データ不足」を意味するため、**判断材料として最も価値の高い「最大の買われすぎ」がデータ不在と区別できなくなり、しかも黙って捨てられる**。実装では `avg_gain`/`avg_loss` を直接計算し、`avg_loss == 0 かつ avg_gain > 0` は inf 演算で自然に `100.0`、`両方 0` (完全な横ばい) だけ明示的に `50.0` (中立、規約の選択) とした。**`None` が返るのはデータ不足のときだけ**という不変条件をコメントで明示している。
+>
+> **テストの書き方についての教訓 (他タスクにも効く)**: 当初のテストは滑らかな sine 波の fixture を使っていたため、**ATR の True Range から前日終値の項 (`.shift()`) を落としても値が一切変わらず**、回帰を検出できなかった (差分ちょうど 0.0 をレビュアーが独立に再現確認)。高ボラティリティの fixture を足して初めて判別できるようになった。指標のテストは「動くこと」ではなく「**壊したら落ちること**」で設計すること。
+
 **Files:**
 - Create: `src/agentic_fx/datafeed/indicators.py`
 - Test: `tests/datafeed/test_indicators.py`
