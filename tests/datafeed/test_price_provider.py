@@ -248,6 +248,47 @@ def test_get_bars_derives_30m_from_15m_on_yfinance(tmp_path):
     assert all(b.ts.minute % 30 == 0 for b in bars)
 
 
+def _gappy_1h_base():
+    """開場中 (水曜 02:00-06:00 UTC) の 1h 足が 5 本欠けた base 足。
+
+    導出後の 4h では穴がバケット内に吸収されて連続に見える (00-04 バケットは
+    00,01 が残り、04-08 バケットは 07 が残るため、4h 側に gap は現れない)。
+    base 足の段階で検査しないと素通りする — これが塞ぐべき fail closed の穴。
+    """
+    dropped = {NOW - timedelta(hours=h) for h in range(6, 11)}
+    return [b for b in _fresh_bars(interval="1h", n=100) if b.ts not in dropped]
+
+
+def test_derive_rejects_source_with_gappy_base_bars(tmp_path):
+    """base 足に開場中の欠損があるソースは採用しない (導出足では見えない)。"""
+    _, p = _provider(tmp_path)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_gappy_1h_base()):
+        with pytest.raises(DataUnhealthy, match="gap"):
+            p.get_bars("USDJPY", "4h")
+
+
+def test_derive_gappy_base_falls_through_to_next_candidate(tmp_path):
+    """base 不健全の DataUnhealthy は get_bars ごと落とさずフォールバックに流す。"""
+    conn, p = _provider(tmp_path)
+    ohlcv.upsert_bars(conn, _fresh_bars(interval="4h", n=30))
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_gappy_1h_base()):
+        bars = p.get_bars("USDJPY", "4h")
+    assert len(bars) == 30
+    assert p.last_bars_source("USDJPY", "4h") == "cache"
+
+
+def test_derive_accepts_healthy_base_bars(tmp_path):
+    """base 足が健全なら従来どおり導出足を返す (非退行)。"""
+    _, p = _provider(tmp_path)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_fresh_bars(interval="1h", n=100)):
+        bars = p.get_bars("USDJPY", "4h")
+    assert bars and all(b.interval == "4h" for b in bars)
+    assert p.last_bars_source("USDJPY", "4h") == "yfinance"
+
+
 def test_get_bars_uses_native_4h_when_source_has_it(tmp_path):
     """MT5 は 4h をネイティブに持つので resample しない。"""
     _, p = _provider(tmp_path, mt5=True)

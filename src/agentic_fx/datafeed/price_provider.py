@@ -200,6 +200,17 @@ class PriceProvider:
         # (5 日分の 4h は 30 本しかない)。取得期間に比の余裕を持たせる。
         ratio = sources.INTERVAL_MIN[interval] / sources.INTERVAL_MIN[base]
         raw = self._fetch_native(pair, source, base, lookback_days * ratio)
+        # **base 足の段階で健全性を検査する** (導出後の検査だけでは穴が開く)。
+        # resample は base の部分欠損をバケット内に吸収してしまう: 4h バケット内の
+        # 1h 4 本のうち 3 本が欠けても 1 本残ればバケットは生き残り、導出足は
+        # 連続に見えて validate_bars を素通りする。base の粒度で検査すると
+        # _MAX_GAP_BARS が「1h 欠損 3 本まで」という自然な意味になり、
+        # 導出足で検査するより厳しくなる — それが意図 (fail closed)。
+        # ここで送出される DataUnhealthy は get_bars のソース毎 except に
+        # 捕まり、技術ログ warning + 次ソース (最終的にキャッシュ) へ流れる。
+        validate_bars(raw, self.clock.now(),
+                      self.settings.datafeed.freshness_max_min,
+                      sources.INTERVAL_MIN[base])
         # interval 文字列は pandas の freq alias ではない (pandas_rule で写す)
         return df_to_bars(resample(bars_to_df(raw), pandas_rule(interval)),
                           pair, interval)
