@@ -77,6 +77,30 @@ class DatafeedSettings(_Strict):
     mt5: SourceToggle
     twelvedata: SourceToggle
     freshness_max_min: float = Field(gt=0)
+    # 取引の時間軸は固定しない (設計書 §5)。扱う足と、判断が依存する足
+    intervals: list[str] = Field(default_factory=lambda: ["1m", "1h"],
+                                 min_length=1)
+    primary_intervals: list[str] = Field(default_factory=lambda: ["1h"],
+                                         min_length=1)
+
+    @model_validator(mode="after")
+    def _check_intervals(self) -> "DatafeedSettings":
+        # INTERVAL_MIN は関数内 import。モジュールトップだと
+        # config → datafeed.sources → (yfinance/httpx) の重い依存が
+        # 設定読み込みに巻き込まれ、循環 import の温床にもなる
+        from agentic_fx.datafeed.sources import INTERVAL_MIN
+        unknown = [i for i in self.intervals + self.primary_intervals
+                   if i not in INTERVAL_MIN]
+        if unknown:
+            raise ValueError(f"unknown interval(s): {unknown}")
+        if "1m" not in self.intervals:
+            # ペーパー約定判定が 1 分足に依存する構造的要件
+            raise ValueError("datafeed.intervals must include '1m'")
+        missing = set(self.primary_intervals) - set(self.intervals)
+        if missing:
+            raise ValueError(
+                f"primary_intervals must be a subset of intervals: {missing}")
+        return self
 
 
 class NewsSettings(_Strict):

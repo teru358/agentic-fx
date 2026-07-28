@@ -36,6 +36,8 @@ datafeed:
   mt5:        {enabled: false, bridge_url: "http://localhost:8812"}
   twelvedata: {enabled: false}
   freshness_max_min: 20       # これより古い quote/bar は不健全扱い
+  intervals: [1m, 5m, 15m, 1h, 4h]   # 取得・保持する足 (1m は必須: ペーパー約定判定が依存)
+  primary_intervals: [1h]            # 判断 Mission が依存する足 (healthcheck の対象)。増やすほど単一障害点も増える
 
 news:
   cleanup_hours: 48

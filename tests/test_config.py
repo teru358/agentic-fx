@@ -134,6 +134,45 @@ def test_display_timezone_defaults_to_utc(tmp_path):
     assert s.display_timezone == "UTC"
 
 
+def _with_datafeed(tmp_path, **overrides):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["datafeed"].update(overrides)
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    return p
+
+
+def test_intervals_defaults_from_example():
+    s = load_settings(EXAMPLE)
+    assert "1m" in s.datafeed.intervals
+    assert set(s.datafeed.primary_intervals) <= set(s.datafeed.intervals)
+
+
+def test_intervals_must_include_1m(tmp_path):
+    """1m はペーパー約定判定の構造的要件なので外せない。"""
+    with pytest.raises(ConfigError, match="1m"):
+        load_settings(_with_datafeed(tmp_path, intervals=["1h", "4h"],
+                                     primary_intervals=["1h"]))
+
+
+def test_primary_intervals_must_be_subset(tmp_path):
+    with pytest.raises(ConfigError, match="subset"):
+        load_settings(_with_datafeed(tmp_path, intervals=["1m", "1h"],
+                                     primary_intervals=["4h"]))
+
+
+def test_unknown_interval_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="unknown interval"):
+        load_settings(_with_datafeed(tmp_path, intervals=["1m", "3h"],
+                                     primary_intervals=["1m"]))
+
+
+def test_empty_primary_intervals_rejected(tmp_path):
+    with pytest.raises(ConfigError):
+        load_settings(_with_datafeed(tmp_path, primary_intervals=[]))
+
+
 def test_invalid_display_timezone_rejected(tmp_path):
     import yaml
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
