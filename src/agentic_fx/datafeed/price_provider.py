@@ -4,8 +4,12 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import sqlite3
 from collections.abc import Callable
+from datetime import datetime
+
+import httpx
 
 from agentic_fx.config import Settings
 from agentic_fx.core.contracts import Bar, Clock, InstrumentSpec, Quote
@@ -17,6 +21,41 @@ from agentic_fx.datafeed.health import (
 from agentic_fx.store import ohlcv
 
 _log = logging.getLogger("agentic_fx.price")
+
+# 境界がソース依存の足。MT5 は H4/D1 をブローカーのサーバ時刻基準で集計するため
+# (実測 2026-07-28、稼働中の bridge に直接問い合わせ: サーバ UTC+3、H4 は真 UTC の
+# 21/01/05/09/13/17 時、D1 は 21:00 = NY クローズ 17:00 EDT)、ネイティブに取ると
+# ソースごとに違う格子の足が同じ interval の系列に混ざる。1h から epoch 導出した
+# 4h (00/04/08/12/16/20 時) とは 1 本も時刻を共有しない。ohlcv の主キーは
+# (symbol, interval, bar_time) で由来を区別できないため、混ざると時間的に重複した
+# 2 つの格子が 1 本の系列として返り、validate_bars も「足が多すぎる」方向は見ない。
+# 常に細かい足から導出し、システム内の格子を 1 つに保つ。
+DERIVE_ONLY_INTERVALS = frozenset({"4h", "1d"})
+
+# 例外メッセージから伏字にする秘密のパターン (多層防御)。Twelve Data は
+# apikey をクエリパラメータで送る仕様なので、httpx の例外文字列に URL ごと
+# 載る。URL 抑止 (_safe_error_text) を擦り抜けた経路でもここで止める。
+_SECRET_RE = re.compile(r"((?:api[-_]?key|apikey|token|secret)=)[^&\s'\"]+",
+                        re.IGNORECASE)
+
+
+def _safe_error_text(e: BaseException) -> str:
+    """例外を「外部に出してよい」文字列にする (ログ・DataUnhealthy 共通)。
+
+    これらのメッセージは mission 記録・activity・Discord 通知に載りうる。
+    httpx 由来は **URL を出さない** (秘密が載る) が、status code は診断に
+    要るので残す。自前の例外 (DataUnhealthy / ValueError 等) は URL を
+    含まないので情報量を落とさない。
+    """
+    if isinstance(e, httpx.HTTPStatusError):
+        text = f"{type(e).__name__}: HTTP {e.response.status_code}"
+    elif isinstance(e, httpx.HTTPError):
+        # ConnectError 等。message に URL が載る実装があるので型名だけにする
+        text = type(e).__name__
+    else:
+        text = f"{type(e).__name__}: {e}"
+    return _SECRET_RE.sub(r"\1***", text)
+
 
 # Phase 1 は組み込みテーブル。Phase 3 で MT5 の symbol_info 照会に置換する
 _SPECS = {
@@ -59,8 +98,9 @@ class PriceProvider:
                 # 弾く (fail closed) ため、DataUnhealthy/HTTPError だけを捕まえる
                 # と ValueError が漏れて get_quote ごと落ちる (フォールバックの
                 # はずが全滅する)
-                _log.warning("quote source %s failed for %s: %s", name, pair, e)
-                errors.append(f"{name}: {e}")
+                text = _safe_error_text(e)
+                _log.warning("quote source %s failed for %s: %s", name, pair, text)
+                errors.append(f"{name}: {text}")
         raise DataUnhealthy(f"all quote sources failed for {pair}: {errors}")
 
     def _chain(self, pair: str, *, kind: str, interval: str = "1m",
@@ -93,7 +133,9 @@ class PriceProvider:
     def get_bars(self, pair: str, interval: str,
                  lookback_days: int = 5) -> list[Bar]:
         # 足は決め打ちしない。ソースがネイティブに持つなら素直に要求し、
-        # 無ければより細かいネイティブ足から resample で導出する。
+        # 無ければより細かいネイティブ足から resample で導出する。ただし
+        # DERIVE_ONLY_INTERVALS はネイティブに持っていても必ず導出する
+        # (境界がソース依存のため。定数のコメント参照)。
         if interval not in sources.INTERVAL_MIN:
             raise ValueError(f"unknown interval: {interval}")
         d = self.settings.datafeed
@@ -103,36 +145,75 @@ class PriceProvider:
         for name, fn in self._chain(pair, kind="bars", interval=interval,
                                     lookback_days=lookback_days):
             try:
-                if interval in sources.NATIVE_INTERVALS[name]:
+                if (interval in sources.NATIVE_INTERVALS[name]
+                        and interval not in DERIVE_ONLY_INTERVALS):
                     bars, origin = fn(), name
+                    validate_bars(bars, now, d.freshness_max_min, interval_min)
+                    # 境界がソース非依存の足だけを保存する
+                    ohlcv.upsert_bars(self.conn, bars)
                 else:
                     base = self._finest_native_base(name, interval)
+                    # 保存は _derive が base 足に対して行う (導出足は保存しない)
                     bars = self._derive(pair, name, base, interval,
                                         lookback_days)
                     origin = f"{name}({base}→{interval} derived)"
-                validate_bars(bars, now, d.freshness_max_min, interval_min)
-                ohlcv.upsert_bars(self.conn, bars)
+                    validate_bars(bars, now, d.freshness_max_min, interval_min)
                 # source は素の名前、origin は導出情報つき (別々に持つ —
                 # 品質フラグの完全一致判定を導出で壊さないため)
                 self._bars_source[(pair, interval)] = name
                 self._bars_origin[(pair, interval)] = origin
                 return bars
             except Exception as e:  # noqa: BLE001 — get_quote と同じ理由で広く捕る
-                _log.warning("bars source %s failed for %s: %s", name, pair, e)
-                errors.append(f"{name}: {e}")
+                text = _safe_error_text(e)
+                _log.warning("bars source %s failed for %s: %s", name, pair, text)
+                errors.append(f"{name}: {text}")
 
-        cached = ohlcv.load_bars(self.conn, pair, interval)
-        if cached:
+        got = self._cached_bars(pair, interval, now, errors)
+        if got is not None:
+            bars, origin = got
+            _log.warning("using cached bars for %s %s (%s)", pair, interval,
+                         origin)
+            self._bars_source[(pair, interval)] = "cache"
+            self._bars_origin[(pair, interval)] = origin
+            return bars
+        raise DataUnhealthy(f"all bar sources failed for {pair}: {errors}")
+
+    def _cached_bars(self, pair: str, interval: str, now: datetime,
+                     errors: list[str]) -> tuple[list[Bar], str] | None:
+        """キャッシュから interval の足を作る。健全性検証を通らなければ None。
+
+        DERIVE_ONLY_INTERVALS は **キャッシュにも存在しない** (保存しない設計)
+        ため、base 足の行を読んで base 粒度で検証してから導出する。
+        """
+        d = self.settings.datafeed
+        if interval not in DERIVE_ONLY_INTERVALS:
+            cached = ohlcv.load_bars(self.conn, pair, interval)
+            if not cached:
+                return None
             try:
-                validate_bars(cached, now, d.freshness_max_min, interval_min)
-                _log.warning("using cached bars for %s %s", pair, interval)
-                self._bars_source[(pair, interval)] = "cache"
-                self._bars_origin[(pair, interval)] = "cache"
-                return cached
+                validate_bars(cached, now, d.freshness_max_min,
+                              sources.INTERVAL_MIN[interval])
             except Exception as e:  # noqa: BLE001
                 # キャッシュも健全性検証を通さない限り使わない (fail closed)
-                errors.append(f"cache: {e}")
-        raise DataUnhealthy(f"all bar sources failed for {pair}: {errors}")
+                errors.append(f"cache: {_safe_error_text(e)}")
+                return None
+            return cached, "cache"
+
+        for base in self._base_candidates(interval):
+            cached = ohlcv.load_bars(self.conn, pair, base)
+            if not cached:
+                continue
+            try:
+                validate_bars(cached, now, d.freshness_max_min,
+                              sources.INTERVAL_MIN[base])
+                derived = self._resample(cached, pair, interval)
+                validate_bars(derived, now, d.freshness_max_min,
+                              sources.INTERVAL_MIN[interval])
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"cache({base}): {_safe_error_text(e)}")
+                continue
+            return derived, f"cache({base}→{interval} derived)"
+        return None
 
     def last_bars_source(self, pair: str, interval: str) -> str | None:
         """素の source 名 ("mt5" / "twelvedata" / "yfinance" / "cache")。
@@ -170,21 +251,33 @@ class PriceProvider:
             return sources.yf_bars(pair, interval, days)
         raise ValueError(f"unknown source: {source}")
 
-    def _finest_native_base(self, source: str, interval: str) -> str:
-        """interval を導出できる、最も粗いネイティブ足を選ぶ。
+    def _base_candidates(self, interval: str) -> list[str]:
+        """interval を導出できる base 足を、粗い順に返す (ソース非依存)。
 
         粗いほど取得本数が少なく API 負荷が低い。interval_min の約数で
         なければ境界が合わないため候補から外す (例: 4h を 15m から作るのは
-        可、90m からは不可)。
+        可、90m からは不可)。**DERIVE_ONLY_INTERVALS は base にしない** —
+        1d を「ネイティブ 4h から導出」にすると、ブローカー格子が裏口から
+        入ってくる (1d は 1h から導出されること)。
         """
         want = sources.INTERVAL_MIN[interval]
-        cands = [i for i in sources.NATIVE_INTERVALS[source]
-                 if sources.INTERVAL_MIN[i] < want
-                 and want % sources.INTERVAL_MIN[i] == 0]
-        if not cands:
-            raise DataUnhealthy(
-                f"{source} cannot provide or derive {interval}")
-        return max(cands, key=lambda i: sources.INTERVAL_MIN[i])
+        cands = [i for i, m in sources.INTERVAL_MIN.items()
+                 if i not in DERIVE_ONLY_INTERVALS and m < want
+                 and want % m == 0]
+        return sorted(cands, key=lambda i: sources.INTERVAL_MIN[i],
+                      reverse=True)
+
+    def _finest_native_base(self, source: str, interval: str) -> str:
+        """interval を導出できる、最も粗いネイティブ足を選ぶ。
+
+        (関数名は `_finest` だが実際に選ぶのは「最も粗い」足。ブリーフの
+        逐語コード由来の命名で、挙動は docstring のとおり。)
+        """
+        native = sources.NATIVE_INTERVALS[source]
+        for base in self._base_candidates(interval):
+            if base in native:
+                return base
+        raise DataUnhealthy(f"{source} cannot provide or derive {interval}")
 
     def _derive(self, pair: str, source: str, base: str, interval: str,
                 lookback_days: int) -> list[Bar]:
@@ -201,6 +294,9 @@ class PriceProvider:
         ratio = sources.INTERVAL_MIN[interval] / sources.INTERVAL_MIN[base]
         raw = self._fetch_native(pair, source, base, lookback_days * ratio)
         # **base 足の段階で健全性を検査する** (導出後の検査だけでは穴が開く)。
+        # 検査後に **base 足を base の interval で保存する**。導出足は保存しない
+        # (DERIVE_ONLY_INTERVALS のコメント参照: 格子の違う足が同じ系列に
+        # 混ざるのを構造的に防ぐ。錨を変えてもキャッシュ破棄が要らなくなる)。
         # resample は base の部分欠損をバケット内に吸収してしまう: 4h バケット内の
         # 1h 4 本のうち 3 本が欠けても 1 本残ればバケットは生き残り、導出足は
         # 連続に見えて validate_bars を素通りする。base の粒度で検査すると
@@ -211,9 +307,16 @@ class PriceProvider:
         validate_bars(raw, self.clock.now(),
                       self.settings.datafeed.freshness_max_min,
                       sources.INTERVAL_MIN[base])
+        ohlcv.upsert_bars(self.conn, raw)
+        return self._resample(raw, pair, interval)
+
+    def _resample(self, base_bars: list[Bar], pair: str,
+                  interval: str) -> list[Bar]:
+        """base 足 → interval 足。錨は `bars.BAR_ANCHOR` (既定 UTC epoch)。"""
         # interval 文字列は pandas の freq alias ではない (pandas_rule で写す)
-        return df_to_bars(resample(bars_to_df(raw), pandas_rule(interval)),
-                          pair, interval)
+        return df_to_bars(
+            resample(bars_to_df(base_bars), pandas_rule(interval)),
+            pair, interval)
 
     def latest_1m_bar(self, pair: str) -> Bar | None:
         try:

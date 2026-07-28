@@ -1,11 +1,13 @@
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
 import pytest
 from pandas.tseries.frequencies import to_offset
 
 from agentic_fx.core.contracts import Bar
+from agentic_fx.datafeed import bars as bars_mod
 from agentic_fx.datafeed.bars import (
-    bars_to_df, df_to_bars, pandas_rule, resample,
+    BAR_ANCHOR, bars_to_df, df_to_bars, pandas_rule, resample,
 )
 from agentic_fx.datafeed.sources import INTERVAL_MIN
 
@@ -65,6 +67,31 @@ def test_resample_drops_gap_buckets():
     src = _bars(n=2) + _bars(n=1, start=NOW + timedelta(hours=9))
     out = df_to_bars(resample(bars_to_df(src), "4h"), "USDJPY", "4h")
     assert [b.ts.hour for b in out] == [0, 8]   # 04-08 は空なので落ちる
+
+
+def test_bar_anchor_default_is_epoch():
+    """錨の既定は UTC epoch (夏時間の影響を受けず、取得ウィンドウにも依存しない)。"""
+    assert BAR_ANCHOR == "epoch"
+
+
+def test_resample_reads_bar_anchor(monkeypatch):
+    """resample は錨を直書きせず BAR_ANCHOR を読むこと (切替を 1 箇所にする)。"""
+    monkeypatch.setattr(bars_mod, "BAR_ANCHOR",
+                        pd.Timestamp("2026-07-22 02:00", tz="UTC"))
+    out = df_to_bars(resample(bars_to_df(_bars(n=8)), "4h"), "USDJPY", "4h")
+    assert all(b.ts.hour % 4 == 2 for b in out)   # 境界が 02:00 基準へ動く
+
+
+def test_resample_rejects_non_epoch_anchor_for_non_tick_rule(monkeypatch):
+    """非 Tick (日足以上) は pandas が origin を無視する — 黙って epoch に戻さない。
+
+    錨を epoch 以外に変えるなら日足側は明示実装が要る。無言で違う錨の足を
+    作らないよう fail closed にしておく。
+    """
+    monkeypatch.setattr(bars_mod, "BAR_ANCHOR",
+                        pd.Timestamp("2026-07-22 02:00", tz="UTC"))
+    with pytest.raises(NotImplementedError):
+        resample(bars_to_df(_bars(n=8)), "1D")
 
 
 def test_pandas_rule_covers_every_supported_interval():

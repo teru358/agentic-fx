@@ -1,7 +1,9 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from agentic_fx.config import load_settings
@@ -182,6 +184,85 @@ def test_td_quote_used_when_mt5_fails(tmp_path, monkeypatch):
         assert p.get_quote("USDJPY").source == "twelvedata"
 
 
+def _td_only_provider(tmp_path):
+    """TD のみ enabled の provider (失敗経路のメッセージを単離するため)。"""
+    s = load_settings(EXAMPLE).model_copy(deep=True)
+    s.datafeed.twelvedata.enabled = True
+    s.datafeed.yfinance.enabled = False
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    return PriceProvider(conn, s, FixedClock(NOW))
+
+
+def test_td_http_error_does_not_leak_api_key(tmp_path, monkeypatch, caplog):
+    """TD の 401 で API キーが DataUnhealthy にもログにも出ないこと。
+
+    td_quote/td_bars は Twelve Data の仕様上 apikey をクエリで送るため、
+    httpx の例外文字列は URL ごとキーを含む。集約するこの層で潰す。
+    401 という診断情報は残すこと。
+    """
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "SECRET_KEY_123")
+    p = _td_only_provider(tmp_path)
+    url = ("https://api.twelvedata.com/quote"
+           "?symbol=USD%2FJPY&apikey=SECRET_KEY_123")
+    req = httpx.Request("GET", url)
+    err = httpx.HTTPStatusError(
+        f"Client error '401 Unauthorized' for url '{url}'",
+        request=req, response=httpx.Response(401, request=req))
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.price"), \
+         patch("agentic_fx.datafeed.price_provider.sources.td_quote",
+               side_effect=err):
+        with pytest.raises(DataUnhealthy) as ei:
+            p.get_quote("USDJPY")
+    assert "SECRET_KEY_123" not in str(ei.value)
+    assert "SECRET_KEY_123" not in caplog.text
+    assert "401" in str(ei.value) and "401" in caplog.text
+
+
+def test_td_bars_http_error_does_not_leak_api_key(tmp_path, monkeypatch, caplog):
+    """bars 側の集約も同じ扱い (quote だけ塞いでも意味がない)。"""
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "SECRET_KEY_123")
+    p = _td_only_provider(tmp_path)
+    url = ("https://api.twelvedata.com/time_series"
+           "?symbol=USD%2FJPY&apikey=SECRET_KEY_123")
+    req = httpx.Request("GET", url)
+    err = httpx.HTTPStatusError(
+        f"Client error '429 Too Many Requests' for url '{url}'",
+        request=req, response=httpx.Response(429, request=req))
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.price"), \
+         patch("agentic_fx.datafeed.price_provider.sources.td_bars",
+               side_effect=err):
+        with pytest.raises(DataUnhealthy) as ei:
+            p.get_bars("USDJPY", "1m", 1)
+    assert "SECRET_KEY_123" not in str(ei.value)
+    assert "SECRET_KEY_123" not in caplog.text
+    assert "429" in str(ei.value) and "429" in caplog.text
+
+
+def test_secret_is_redacted_from_non_httpx_messages(tmp_path, monkeypatch, caplog):
+    """多層防御: httpx 以外の経路で apikey が混入しても伏字にする。"""
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "SECRET_KEY_123")
+    p = _td_only_provider(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.price"), \
+         patch("agentic_fx.datafeed.price_provider.sources.td_quote",
+               side_effect=RuntimeError(
+                   "boom while calling ...&apikey=SECRET_KEY_123")):
+        with pytest.raises(DataUnhealthy) as ei:
+            p.get_quote("USDJPY")
+    assert "SECRET_KEY_123" not in str(ei.value)
+    assert "SECRET_KEY_123" not in caplog.text
+    assert "boom" in str(ei.value)          # 自前メッセージの情報量は落とさない
+
+
+def test_our_own_error_messages_keep_detail(tmp_path):
+    """DataUnhealthy/ValueError など自前のメッセージは削らない (診断に必要)。"""
+    _, p = _provider(tmp_path)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_gappy_1h_base()):
+        with pytest.raises(DataUnhealthy, match="gap"):
+            p.get_bars("USDJPY", "4h")
+
+
 def test_td_skipped_without_api_key(tmp_path, monkeypatch):
     """enabled でも API キーが無ければ試さない (呼べば必ず失敗するため)。"""
     monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
@@ -227,14 +308,30 @@ def test_get_bars_derives_4h_from_1h_on_yfinance(tmp_path):
     assert p.last_bars_source("USDJPY", "4h") == "yfinance"  # 品質フラグは素の名前
 
 
-def test_derived_bars_are_cached_under_requested_interval(tmp_path):
-    """導出した足も要求された interval でキャッシュされること。"""
+def test_only_base_bars_are_cached_for_derive_only_intervals(tmp_path):
+    """導出足は保存せず base 足を保存する (境界がソース依存の足を残さない)。
+
+    ohlcv の PK は (symbol, interval, bar_time) で由来を区別できないため、
+    格子の違う 4h が同じ系列に混ざると重複した足を 1 本の系列として返す。
+    """
     conn, p = _provider(tmp_path)
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_fresh_bars(interval="1h", n=100)):
         bars = p.get_bars("USDJPY", "4h")
-    cached = ohlcv.load_bars(conn, "USDJPY", "4h")
-    assert len(cached) == len(bars) and cached[0].interval == "4h"
+    assert bars and all(b.interval == "4h" for b in bars)
+    assert ohlcv.load_bars(conn, "USDJPY", "4h") == []      # 導出足は保存しない
+    assert len(ohlcv.load_bars(conn, "USDJPY", "1h")) == 100  # base を保存する
+
+
+def test_get_bars_1d_derives_from_1h_not_4h(tmp_path):
+    """1d の base は 1h。4h を base にすると格子問題が裏口から入る。"""
+    _, p = _provider(tmp_path, mt5=True)
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
+               return_value=_fresh_bars(interval="1h", n=100)) as mb:
+        bars = p.get_bars("USDJPY", "1d")
+    assert mb.call_args.args[2] == "1h"
+    assert all(b.interval == "1d" for b in bars)
+    assert p.bars_origin("USDJPY", "1d") == "mt5(1h→1d derived)"
 
 
 def test_get_bars_derives_30m_from_15m_on_yfinance(tmp_path):
@@ -271,11 +368,11 @@ def test_derive_rejects_source_with_gappy_base_bars(tmp_path):
 def test_derive_gappy_base_falls_through_to_next_candidate(tmp_path):
     """base 不健全の DataUnhealthy は get_bars ごと落とさずフォールバックに流す。"""
     conn, p = _provider(tmp_path)
-    ohlcv.upsert_bars(conn, _fresh_bars(interval="4h", n=30))
+    ohlcv.upsert_bars(conn, _fresh_bars(interval="1h", n=100))
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_gappy_1h_base()):
         bars = p.get_bars("USDJPY", "4h")
-    assert len(bars) == 30
+    assert bars and all(b.interval == "4h" for b in bars)
     assert p.last_bars_source("USDJPY", "4h") == "cache"
 
 
@@ -289,14 +386,44 @@ def test_derive_accepts_healthy_base_bars(tmp_path):
     assert p.last_bars_source("USDJPY", "4h") == "yfinance"
 
 
-def test_get_bars_uses_native_4h_when_source_has_it(tmp_path):
-    """MT5 は 4h をネイティブに持つので resample しない。"""
+def test_native_4h_is_never_requested_even_when_source_has_it(tmp_path):
+    """MT5 は 4h をネイティブに持つが要求しない (境界がソース依存のため)。
+
+    実測 (2026-07-28、稼働中の bridge): MT5 ネイティブ H4 の境界は真 UTC の
+    21/01/05/09/13/17 時で、1h から epoch 導出した 4h (00/04/08/12/16/20) と
+    1 本も時刻を共有しない。混ざると重複した足が 1 本の系列として返る。
+    """
     _, p = _provider(tmp_path, mt5=True)
     with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
-               return_value=_fresh_bars(interval="4h", n=30)) as mb:
-        p.get_bars("USDJPY", "4h")
-    assert mb.call_args.args[2] == "4h"           # 4h をそのまま要求
-    assert p.bars_origin("USDJPY", "4h") == "mt5"  # derived が付かない
+               return_value=_fresh_bars(interval="1h", n=100)) as mb:
+        bars = p.get_bars("USDJPY", "4h")
+    assert mb.call_args.args[2] == "1h"      # ネイティブ 4h を要求しない
+    assert all(b.interval == "4h" for b in bars)
+    assert p.bars_origin("USDJPY", "4h") == "mt5(1h→4h derived)"
+    assert p.last_bars_source("USDJPY", "4h") == "mt5"   # 品質フラグは素の名前
+
+
+def test_cache_fallback_derives_4h_from_cached_1h(tmp_path):
+    """全ソース失敗時、キャッシュの base 足から導出する (4h の行は読まない)。"""
+    conn, p = _provider(tmp_path)
+    ohlcv.upsert_bars(conn, _fresh_bars(interval="1h", n=100))
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        bars = p.get_bars("USDJPY", "4h")
+    assert bars and all(b.interval == "4h" for b in bars)
+    assert all(b.ts.hour % 4 == 0 for b in bars)          # epoch 錨の格子
+    assert p.last_bars_source("USDJPY", "4h") == "cache"  # 品質フラグは "cache"
+    assert p.bars_origin("USDJPY", "4h") == "cache(1h→4h derived)"
+
+
+def test_cache_fallback_rejects_unhealthy_base(tmp_path):
+    """キャッシュの base 足が不健全なら DataUnhealthy (fail closed の非退行)。"""
+    conn, p = _provider(tmp_path)
+    ohlcv.upsert_bars(conn, _gappy_1h_base())
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        with pytest.raises(DataUnhealthy):
+            p.get_bars("USDJPY", "4h")
 
 
 def test_get_bars_rejects_unknown_interval(tmp_path):
