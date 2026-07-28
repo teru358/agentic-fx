@@ -182,37 +182,37 @@ class PriceProvider:
                      errors: list[str]) -> tuple[list[Bar], str] | None:
         """キャッシュから interval の足を作る。健全性検証を通らなければ None。
 
-        DERIVE_ONLY_INTERVALS は **キャッシュにも存在しない** (保存しない設計)
-        ため、base 足の行を読んで base 粒度で検証してから導出する。
+        **要求された足そのもの → より細かい base 足、の順に試す**。
+        導出足は保存しない設計 (DERIVE_ONLY_INTERVALS のコメント参照) なので、
+        導出で得ていた足 (30m 等) はキャッシュにも存在しない。base へ流れないと
+        「ソース健在時は導出で返るのに、全滅時だけ落ちる」ことになる。
+
+        候補から DERIVE_ONLY_INTERVALS を除くのは `_base_candidates` と同じ規則。
+        **要求された足そのものにも適用する** — 4h/1d の行は本来存在しないが、
+        本修正より前のバイナリが書いた残骸があり得る。それはブローカー格子の
+        足なので、読むと I-2 で塞いだ「格子の混在」が静かに戻る。
         """
         d = self.settings.datafeed
-        if interval not in DERIVE_ONLY_INTERVALS:
-            cached = ohlcv.load_bars(self.conn, pair, interval)
-            if not cached:
-                return None
-            try:
-                validate_bars(cached, now, d.freshness_max_min,
-                              sources.INTERVAL_MIN[interval])
-            except Exception as e:  # noqa: BLE001
-                # キャッシュも健全性検証を通さない限り使わない (fail closed)
-                errors.append(f"cache: {_safe_error_text(e)}")
-                return None
-            return cached, "cache"
-
-        for base in self._base_candidates(interval):
-            cached = ohlcv.load_bars(self.conn, pair, base)
+        candidates = [i for i in [interval, *self._base_candidates(interval)]
+                      if i not in DERIVE_ONLY_INTERVALS]
+        for src in candidates:
+            cached = ohlcv.load_bars(self.conn, pair, src)
             if not cached:
                 continue
+            label = "cache" if src == interval else f"cache({src})"
             try:
+                # キャッシュも健全性検証を通さない限り使わない (fail closed)
                 validate_bars(cached, now, d.freshness_max_min,
-                              sources.INTERVAL_MIN[base])
+                              sources.INTERVAL_MIN[src])
+                if src == interval:
+                    return cached, "cache"
                 derived = self._resample(cached, pair, interval)
                 validate_bars(derived, now, d.freshness_max_min,
                               sources.INTERVAL_MIN[interval])
             except Exception as e:  # noqa: BLE001
-                errors.append(f"cache({base}): {_safe_error_text(e)}")
+                errors.append(f"{label}: {_safe_error_text(e)}")
                 continue
-            return derived, f"cache({base}→{interval} derived)"
+            return derived, f"cache({src}→{interval} derived)"
         return None
 
     def last_bars_source(self, pair: str, interval: str) -> str | None:

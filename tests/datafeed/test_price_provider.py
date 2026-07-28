@@ -416,6 +416,46 @@ def test_cache_fallback_derives_4h_from_cached_1h(tmp_path):
     assert p.bars_origin("USDJPY", "4h") == "cache(1h→4h derived)"
 
 
+def test_cache_fallback_derives_30m_from_cached_15m(tmp_path):
+    """DERIVE_ONLY 外の導出足 (30m) もキャッシュから復元できること。
+
+    導出足は保存しない設計にしたので、30m の行はどこにも存在しない。
+    base (15m) の行へ流れないと、修正前は効いていたフォールバックが死ぬ。
+    """
+    conn, p = _provider(tmp_path)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_fresh_bars(interval="15m", n=200)):
+        p.get_bars("USDJPY", "30m")
+    assert ohlcv.load_bars(conn, "USDJPY", "30m") == []   # 導出足は保存されない
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        bars = p.get_bars("USDJPY", "30m")
+    assert bars and all(b.interval == "30m" for b in bars)
+    assert p.last_bars_source("USDJPY", "30m") == "cache"
+    assert p.bars_origin("USDJPY", "30m") == "cache(15m→30m derived)"
+
+
+def test_cache_direct_read_still_works_for_native_intervals(tmp_path):
+    """ネイティブ足は従来どおり interval の行を直読みする (非退行)。"""
+    conn, p = _provider(tmp_path)
+    ohlcv.upsert_bars(conn, _fresh_bars(interval="15m", n=100))
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        bars = p.get_bars("USDJPY", "15m")
+    assert len(bars) == 100
+    assert p.bars_origin("USDJPY", "15m") == "cache"
+
+
+def test_stale_grid_rows_are_not_read_for_derive_only_intervals(tmp_path):
+    """旧バイナリが書いた 4h の行は読まない (ブローカー格子の混入を防ぐ)。"""
+    conn, p = _provider(tmp_path)
+    ohlcv.upsert_bars(conn, _fresh_bars(interval="4h", n=30))  # 旧形式の残骸
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        with pytest.raises(DataUnhealthy):
+            p.get_bars("USDJPY", "4h")
+
+
 def test_cache_fallback_rejects_unhealthy_base(tmp_path):
     """キャッシュの base 足が不健全なら DataUnhealthy (fail closed の非退行)。"""
     conn, p = _provider(tmp_path)
