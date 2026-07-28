@@ -1589,6 +1589,14 @@ git commit -m "feat: news fetcher (feed/web の 2 組み込みのみ)"
 
 ### Task 6: ChromaDB RAG (store/rag.py)
 
+> **実装済み (2026-07-28、commits `ee92789..07b9763`)。以下のコードは実装と一致しません**。**現在の正は `src/agentic_fx/store/rag.py`** です。**下のテストコードはそのままでは 1 本も通りません** (理由は 3)。変更点:
+>
+> 1. **初期化失敗を `Rag()` 構築時に表面化させる**。散文はそれを要求しているが、逐語コードでは達成できない — chromadb 1.5.9 の `DefaultEmbeddingFunction` (`api/types.py:955-965`) はモデル読み込みを最初の `__call__` まで遅延するため、コレクション作成は即座に成功してしまう。構築時に埋め込み関数を明示的にプローブしている
+> 2. **`search_news` が `body` に埋め込み用の `title\nbody` 連結文字列を返していた**のを修正 (出力契約違反)。元の `body` を metadata に別途保存している
+> 3. **ブリーフの `FakeEmbedding` に `embed_query` が無い**。chromadb 1.5.9 の `CollectionCommon.py:751` がクエリ時にフォールバック無しで呼ぶため `AttributeError` になる
+> 4. **`add_news` / `cleanup_news` で naive datetime を拒否** (プロジェクト全体の制約)
+> 5. **再取り込みで `added_at` を凍結する** (修正ラウンド 1)。掃除の基準は `published` ではなく `added_at` (`fetch_web` は常に `published=None` を返すため) だが、**同じ URL が返ってくるたびに時計が戻ると 48h 掃除が無期限に無効化される**。ピン留め記事・告知エントリ・更新頻度の低いフィードで普通に起きる。upsert 前に `get(ids=...)` をバッチ 1 回で引き、既存の `added_at` を再利用する。**title/body は通常どおり更新される** (metadata 全体を凍結してはならない)
+
 **Files:**
 - Create: `src/agentic_fx/store/rag.py`
 - Test: `tests/store/test_rag.py`
