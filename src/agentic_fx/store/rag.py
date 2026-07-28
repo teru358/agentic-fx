@@ -80,21 +80,33 @@ class Rag:
         tz-aware UTC で確定させるため、published の有無に関係なく一様に
         扱える。
 
-        既知の限界: 同一 URL の記事が同じ内容のまま繰り返し add_news される
-        (再クロールで同じ記事が返り続ける) と、upsert のたびに added_at が
-        「今」に更新され、実質的に掃除されなくなる。組み込み 2 fetcher
-        (feed/web) は通常「最新記事」だけを返すため実害は小さいと判断したが、
-        将来 backfill 的な使い方をする fetcher を追加する場合は要再検討。
+        **added_at は初回取り込み時刻を保つ (修正ラウンド 1)**: 「ニュース RAG は
+        48h で掃除」はプロジェクトの絶対要件であり、再取り込みで無効化されては
+        ならない。しかし同一 URL がフェッチのたびに返ってくること自体は珍しくない
+        (ピン留め記事・告知エントリ・更新頻度の低いフィード等) — これは敵対的な
+        入力ではなく通常運用で起きる。upsert のたびに added_at を「今」で
+        上書きすると、そのような記事は 48h を超えて無期限に残り続け、絶対要件に
+        直接反する (遅延ではなく無制限保持)。そこで upsert 前に既存レコードの
+        added_at をまとめて 1 回で引き (記事 1 件ごとに get を呼ぶと呼び出し回数が
+        記事数 N に比例してしまうため、`ids` をまとめて 1 回の get で引く)、既存が
+        あればその値を再利用する。本文・タイトルは常に新しい値で上書きする
+        (更新は反映されるべきで、凍結するのは時刻だけ)。
         """
         if not articles:
             return 0
         now_utc = _require_utc(now, "add_news now")
+        ids = [a["url"] for a in articles]
+        # 既存の added_at をまとめて 1 回で引く (N 件を N 回 get しない)
+        existing = self._news.get(ids=ids, include=["metadatas"])
+        existing_added_at = {i: m["added_at"] for i, m in
+                             zip(existing["ids"], existing["metadatas"])}
         self._news.upsert(
-            ids=[a["url"] for a in articles],
+            ids=ids,
             documents=[f"{a['title']}\n{a['body']}" for a in articles],
             metadatas=[{"url": a["url"], "title": a["title"],
                         "body": a["body"], "source_name": a["source_name"],
-                        "added_at": now_utc.isoformat()}
+                        "added_at": existing_added_at.get(
+                            a["url"], now_utc.isoformat())}
                        for a in articles])
         return len(articles)
 

@@ -83,8 +83,57 @@ def test_search_news_returns_original_body_not_embedding_document(tmp_path):
 def test_upsert_dedup_by_url(tmp_path):
     rag = _rag(tmp_path)
     rag.add_news(ARTS, NOW)
-    rag.add_news(ARTS, NOW)  # 再投入
+    # 逆順で再投入 (id を url 以外 — 例えばリスト内 index — から作る変異が
+    # あれば a1/a2 が別 id を得てしまい重複排除できない。同順で 2 回投入する
+    # だけだと index も安定してしまい、この種の変異を検出できない)
+    rag.add_news(list(reversed(ARTS)), NOW)
     assert rag.count_news() == 2
+
+
+def test_readd_same_url_preserves_first_added_at(tmp_path):
+    """修正ラウンド1: 同じ URL を時間を空けて再取り込みしても added_at は
+    初回のまま (「今」に上書きされない)。ピン留め記事・低頻度更新フィード等、
+    同じ URL がフェッチのたびに返ってくるのは通常運用で起き得るため、これを
+    保証しないと 48h 掃除が無期限に無効化される (絶対要件違反)。"""
+    rag = _rag(tmp_path)
+    rag.add_news([ARTS[0]], NOW)
+    rag.add_news([ARTS[0]], NOW + timedelta(hours=10))  # 同じ記事を再取り込み
+    got = rag._news.get(ids=[ARTS[0]["url"]], include=["metadatas"])
+    assert got["metadatas"][0]["added_at"] == NOW.isoformat()
+
+
+def test_readd_same_url_still_cleaned_up_from_first_added_at(tmp_path):
+    """レビュー指摘の再現テスト: 再取り込みで added_at がリセットされず、
+    初回時刻を基準に 48h 掃除が正しく効くこと。"""
+    rag = _rag(tmp_path)
+    rag.add_news([ARTS[0]], NOW)
+    # 49h 後にもう一度取り込まれる (フィードが同じ記事を返し続けるケース)
+    rag.add_news([ARTS[0]], NOW + timedelta(hours=49))
+    # 初回 (NOW) から 48h を超えた時点で掃除すれば消えるはず
+    removed = rag.cleanup_news(NOW + timedelta(hours=49), hours=48)
+    assert removed == 1
+    assert rag.count_news() == 0
+
+
+def test_readd_same_url_updates_title_and_body(tmp_path):
+    """added_at だけを凍結し、本文・タイトルの更新は反映されること。"""
+    rag = _rag(tmp_path)
+    rag.add_news([ARTS[0]], NOW)
+    updated = {**ARTS[0], "title": "Dollar rallies further",
+               "body": "Updated body text after revision."}
+    rag.add_news([updated], NOW + timedelta(hours=1))
+    hits = rag.search_news("Updated body text after revision", n=1)
+    assert hits[0]["title"] == "Dollar rallies further"
+    assert hits[0]["body"] == "Updated body text after revision."
+
+
+def test_new_url_uses_current_time_non_regression(tmp_path):
+    """新規 URL (既存レコード無し) では従来どおり呼び出し時の now が入ること。"""
+    rag = _rag(tmp_path)
+    rag.add_news([ARTS[0]], NOW)
+    rag.add_news([ARTS[1]], NOW + timedelta(hours=5))  # a2 は初出
+    got = rag._news.get(ids=[ARTS[1]["url"]], include=["metadatas"])
+    assert got["metadatas"][0]["added_at"] == (NOW + timedelta(hours=5)).isoformat()
 
 
 def test_cleanup_removes_old(tmp_path):
