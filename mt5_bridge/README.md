@@ -12,6 +12,7 @@
 ## Phase 1+2 のスコープ (現在)
 
 - **read-only のみ**: `/health` `/account` `/quote/{symbol}` `/positions` `/symbols`
+  `/ohlcv/{symbol}` `/server-time`
 - **発注 endpoint は意図的に未実装** (資金 0 の本番口座保護)
 - 認証は API キー (任意)、無設定なら LAN trust モードで起動
 
@@ -20,6 +21,46 @@
 - `BrokerAdapter` 抽象 (`finance` 側) の導入
 - 発注 endpoint (`/order`) の実装 — `DRY_RUN=true` で約定シミュレーション、`DRY_RUN=false` + 別フラグで実発注
 - ポジション変更 (modify/close)
+
+---
+
+## サーバ時刻オフセット (重要)
+
+MT5 が返す時刻 (`tick.time` / `position.time` / `deal.time` / `rates["time"]`) は
+すべて**ブローカーのサーバ時間帯におけるエポック秒**であり UTC ではない。
+`copy_rates_range` の `date_from` / `date_to` も同じくサーバ時刻空間で解釈される。
+
+実測 (2026-07-28、OANDA-Japan MT5 Live): **サーバ時刻 = UTC+3**。
+移植前の bridge はこれを無条件に UTC として扱っていたため、quote も OHLCV も
+3 時間先の時刻ラベルを返していた。
+
+bridge は `symbol_info_tick(symbol).time` とこちらの UTC 時計の差からオフセットを
+実測し、送受信の両方向で補正する。
+
+- 検出のガード: `|raw| > 12h` は棄却 / 30 分単位に丸める / 丸め残差 > 120s は棄却
+  (市場が閉まっている間は tick が古く、raw が最大 ~48h ずれるため)
+- 再計算は最短 300 秒間隔。棄却されたら直前の good 値を使う (週末もこれで動く)
+- good 値は `SERVER_OFFSET_PATH` (既定 `logs/server_offset.json`) に永続化され、
+  週末をまたぐ再起動でも残る
+- **good 値が 1 つも無ければ fail closed**。推測値は使わず、read 系エンドポイントは
+  **503** を返す (ずれた時刻で発注やサイジングをするより止まる方が安全)
+- 夏時間の切り替わりは定期再計算で自然に追随する
+
+### `GET /server-time`
+
+検証・運用の切り分け用。認証は他の read エンドポイントと同じ。
+
+```json
+{
+  "server_offset_sec": 10800,
+  "server_time": "2026-07-28T14:12:04+00:00",
+  "utc_time": "2026-07-28T11:12:04+00:00",
+  "offset_source": "live"
+}
+```
+
+`offset_source` は `"live"` (直近の検出が成功) / `"cached"` (直近は棄却され前回の
+good 値を使用中) の 2 値。オフセット未確定なら 503。
 
 ---
 

@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from admin_models import AdminStatus, HaltRequest
 from config import BridgeSettings, load_settings
-from mt5_client import Mt5Client, PreflightError
+from mt5_client import Mt5Client, PreflightError, ServerTimeUnknownError
 from ohlcv_models import OhlcvBar, OhlcvResponse
 from order_models import (
     ClosedDealResponse,
@@ -167,6 +167,8 @@ async def lifespan(app: FastAPI):
         login=_settings.mt5_login,
         password=_settings.mt5_password,
         server=_settings.mt5_server,
+        offset_cache_path=Path(__file__).parent / _settings.server_offset_path,
+        probe_symbol=_settings.server_time_symbol,
     )
     logger.warning(
         f"DRY_RUN={_runtime.dry_run} | api_key={'set' if _settings.auth_required else 'NOT SET (LAN trust mode)'}"
@@ -234,12 +236,31 @@ def account():
     return asdict(_client.get_account())
 
 
+@app.get("/server-time", dependencies=[Depends(require_api_key)])
+def server_time():
+    """こちらの UTC とブローカーのサーバ時刻を並べて返す (検証・運用の切り分け用)。
+
+    MT5 の時刻はすべてサーバ時間帯のエポック秒なので、bridge は tick から
+    オフセットを実測して補正している。その実測値をここから覗ける。
+    """
+    if _client is None or not _client.is_connected:
+        raise HTTPException(503, "MT5 not connected")
+    try:
+        return _client.get_server_time()
+    except ServerTimeUnknownError as e:
+        raise HTTPException(503, str(e))
+
+
 @app.get("/quote/{symbol}", dependencies=[Depends(require_api_key)])
 def quote(symbol: str):
     if _client is None or not _client.is_connected:
         raise HTTPException(503, "MT5 not connected")
     try:
         return asdict(_client.get_quote(symbol))
+    except ServerTimeUnknownError as e:
+        # RuntimeError のサブクラスなので 404 に落ちる前に捕まえる。
+        # 時刻が確定しないのは「見つからない」ではなく一時的な利用不能 = 503
+        raise HTTPException(503, str(e))
     except RuntimeError as e:
         raise HTTPException(404, str(e))
 
@@ -248,7 +269,10 @@ def quote(symbol: str):
 def positions():
     if _client is None or not _client.is_connected:
         raise HTTPException(503, "MT5 not connected")
-    return [asdict(p) for p in _client.get_positions()]
+    try:
+        return [asdict(p) for p in _client.get_positions()]
+    except ServerTimeUnknownError as e:
+        raise HTTPException(503, str(e))
 
 
 @app.get("/positions/{ticket}/closed-deal", response_model=ClosedDealResponse,
@@ -256,7 +280,10 @@ def positions():
 def closed_deal(ticket: int):
     if _client is None or not _client.is_connected:
         raise HTTPException(503, "MT5 not connected")
-    deal = _client.get_closed_deal(ticket)
+    try:
+        deal = _client.get_closed_deal(ticket)
+    except ServerTimeUnknownError as e:
+        raise HTTPException(503, str(e))
     if deal is None:
         raise HTTPException(404, f"closed deal not found for ticket={ticket}")
     return ClosedDealResponse(**asdict(deal))
@@ -299,6 +326,9 @@ def ohlcv(
         bars_raw = _client.copy_rates_range(symbol, interval, date_from, date_to)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except ServerTimeUnknownError as e:
+        # オフセット未確定のまま足を返すと、ずれた時刻でサイジングされる
+        raise HTTPException(503, str(e))
     except RuntimeError as e:
         raise HTTPException(404, str(e))
 

@@ -7,6 +7,21 @@ import time
 from mt5_client import Mt5Client
 
 
+def _seed_utc_server_offset(client: Mt5Client) -> None:
+    """サーバ時刻 = UTC (offset 0) を「たった今検出済み」として仕込む。
+
+    Mt5Client は MT5 の時刻をサーバ時間帯のエポック秒として扱い、オフセットが
+    未確定なら fail closed で例外を上げる。本ファイルのテストは lock による
+    直列化の検証が目的なので、offset 0 (= 移植前とまったく同じ挙動) を置いて
+    再検出 (MT5 への probe) が走らないようにする。probe が走ると call_log に
+    余分な tick 呼び出しが混じり、検証したい直列化と無関係な差分が出る。
+    """
+    client._server_offset_sec = 0
+    client._offset_checked_at = time.time()
+    client._offset_source = "cached"
+    client._offset_disk_loaded = True
+
+
 class _SlowFakeMt5:
     """各 MT5 呼び出しに sleep を入れ、interleave を観測可能にする Fake。"""
     def __init__(self, call_log, lock_for_log):
@@ -42,6 +57,7 @@ def test_copy_rates_range_is_serialized_across_threads():
     client = Mt5Client.__new__(Mt5Client)
     client._mt5 = _SlowFakeMt5(call_log, threading.Lock())
     client._lock = threading.Lock()
+    _seed_utc_server_offset(client)
 
     d0 = datetime(2026, 6, 30, tzinfo=timezone.utc)
     d1 = datetime(2026, 6, 30, 1, tzinfo=timezone.utc)
@@ -90,6 +106,7 @@ def test_disconnect_does_not_interleave_with_copy_rates():
     c._mt5 = _Fake()
     c._lock = threading.Lock()
     c._connected = True
+    _seed_utc_server_offset(c)
 
     d0 = datetime(2026, 6, 30, tzinfo=timezone.utc)
     d1 = datetime(2026, 6, 30, 1, tzinfo=timezone.utc)
@@ -150,6 +167,7 @@ def _preflight_client(fake):
     c = Mt5Client.__new__(Mt5Client)
     c._mt5 = fake
     c._lock = threading.Lock()
+    _seed_utc_server_offset(c)
     return c
 
 
@@ -226,6 +244,7 @@ def test_copy_rates_and_preflight_do_not_interleave():
     c = Mt5Client.__new__(Mt5Client)
     c._mt5 = _Fake()
     c._lock = threading.Lock()
+    _seed_utc_server_offset(c)
 
     d0 = datetime(2026, 6, 30, tzinfo=timezone.utc)
     d1 = datetime(2026, 6, 30, 1, tzinfo=timezone.utc)
@@ -276,6 +295,7 @@ def test_last_error_failure_path_is_serialized():
     c = Mt5Client.__new__(Mt5Client)
     c._mt5 = _FailFake()
     c._lock = threading.Lock()
+    _seed_utc_server_offset(c)
     d0 = datetime(2026, 6, 30, tzinfo=timezone.utc)
     d1 = datetime(2026, 6, 30, 1, tzinfo=timezone.utc)
 

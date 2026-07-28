@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from mt5_client import Mt5Client
+
+
+def _seed_utc_server_offset(client: Mt5Client) -> None:
+    """サーバ時刻 = UTC (offset 0) を「たった今検出済み」として仕込む。
+
+    Mt5Client は MT5 の時刻をサーバ時間帯のエポック秒として扱い、オフセットが
+    未確定なら fail closed で例外を上げる。本ファイルのテストは deal 集計の
+    検証が目的なので、offset 0 (= 移植前とまったく同じ時刻) を置いて再検出
+    (MT5 への probe) が走らないようにする。期待値は移植前から変えていない。
+    """
+    client._server_offset_sec = 0
+    client._offset_checked_at = time.time()
+    client._offset_source = "cached"
+    client._offset_disk_loaded = True
 
 
 def test_get_closed_deal_uses_out_deals_weighted_price_and_total_pnl():
@@ -53,6 +68,7 @@ def test_get_closed_deal_uses_out_deals_weighted_price_and_total_pnl():
 
     client._mt5 = _FakeMt5()
     client._lock = threading.Lock()
+    _seed_utc_server_offset(client)
 
     deal = client.get_closed_deal(111)
 
@@ -89,5 +105,6 @@ def test_get_closed_deal_returns_none_when_no_out_deal():
 
     client._mt5 = _FakeMt5()
     client._lock = threading.Lock()
+    _seed_utc_server_offset(client)
 
     assert client.get_closed_deal(111) is None

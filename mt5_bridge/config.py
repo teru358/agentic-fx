@@ -33,6 +33,8 @@ class BridgeSettings:
     halt_state_path: str
     filling_mode: str       # "IOC" | "FOK" | "RETURN" — タスク 1 で IOC のみと確認済
     deviation_points: int   # slippage 許容 (points 単位、1 pip ≈ 10 points)
+    server_offset_path: str  # サーバ時刻オフセットのディスクキャッシュ
+    server_time_symbol: str  # オフセット検出だけに使う symbol (cold start 用)
 
     @property
     def auth_required(self) -> bool:
@@ -72,4 +74,7 @@ def load_settings(env_file: Path | None = None) -> BridgeSettings:
         halt_state_path=_env("HALT_STATE_PATH", "logs/hard_halt.flag"),
         filling_mode=_env("FILLING_MODE", "IOC"),
         deviation_points=int(_env("DEVIATION_POINTS", "30")),
+        # 既定は halt_state_path と同じ logs/ 配下 (どちらも運用状態の永続化)
+        server_offset_path=_env("SERVER_OFFSET_PATH", "logs/server_offset.json"),
+        server_time_symbol=_env("SERVER_TIME_SYMBOL", "USDJPY"),
     )
