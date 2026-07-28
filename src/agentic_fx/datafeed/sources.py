@@ -42,6 +42,23 @@ def vendor_symbol(logical: str, vendor: str) -> str:
     return VENDOR_SYMBOLS[logical][vendor]
 
 
+def _to_utc(t: datetime, source: str) -> datetime:
+    """tz-aware datetime を UTC に正規化する (修正ラウンド 1: 指摘 1/3 共通)。
+
+    naive は ValueError で fail closed する — 「naive なら UTC とみなす」は
+    禁止 (プロジェクト制約)。tz 情報が落ちているときに UTC を仮定すると
+    絶対時刻が静かにずれる (yfinance の 1d が ignore_tz=True 既定で
+    取引所ローカル→naive を返す欠陥が実例)。Bar/Quote を構築する
+    sources.py 側でここに正規化を集約し、直接 fetcher を呼ぶ経路
+    (テスト・将来の backfill) にも漏れなく適用する。
+    """
+    if t.tzinfo is None:
+        raise ValueError(
+            f"{source} returned a naive datetime; tz info is required "
+            "(cannot safely assume UTC)")
+    return t.astimezone(timezone.utc)
+
+
 def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
@@ -50,16 +67,18 @@ def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def yf_bars(pair: str, interval: str, lookback_days: int) -> list[Bar]:
+    # ignore_tz=False を明示: 既定 (None) だと yfinance が
+    # `interval[-1] not in ('m', 'h')` で ignore_tz を解決してしまい、
+    # 1d だけ取引所ローカル→naive (絶対時刻がずれる)、他の足は tz-aware
+    # だが非 UTC (取引所ローカル) の index を返す (修正ラウンド 1: 指摘 1)。
     df = yfinance.download(
         vendor_symbol(pair, "yf"), interval=interval,
         period=f"{lookback_days}d", progress=False, auto_adjust=False,
-        multi_level_index=False)
+        multi_level_index=False, ignore_tz=False)
     df = _flatten_yf_columns(df)
     bars: list[Bar] = []
     for ts, row in df.iterrows():
-        t = ts.to_pydatetime()
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
+        t = _to_utc(ts.to_pydatetime(), "yfinance")
         volume = row["Volume"] if "Volume" in row else 0.0
         bars.append(Bar(pair, interval, t, float(row["Open"]),
                         float(row["High"]), float(row["Low"]),
@@ -88,8 +107,12 @@ def mt5_quote(bridge_url: str, pair: str) -> Quote:
                   headers=_mt5_headers(), timeout=10)
     r.raise_for_status()
     d = r.json()   # {symbol, bid, ask, spread_points, time}
+    # bridge は現行 +00:00 付き ISO を返すが、_to_utc を通すことで
+    # 非 UTC オフセット・naive を無言で受けない形にしておく
+    # (修正ラウンド 1: 指摘 3 の前提。MT5 サーバ時刻が UTC でない場合の
+    # 実害は bridge 改修が必要だが、少なくとも sources.py 側は fail closed にする)。
     return Quote(pair, float(d["bid"]), float(d["ask"]),
-                 datetime.fromisoformat(d["time"]), "mt5")
+                 _to_utc(datetime.fromisoformat(d["time"]), "mt5"), "mt5")
 
 
 def mt5_bars_range(bridge_url: str, pair: str, interval: str,
@@ -107,7 +130,7 @@ def mt5_bars_range(bridge_url: str, pair: str, interval: str,
     payload = r.json()          # {symbol, interval, bars: [...]}
     # bar の出来高キーは "volume" (bridge が MT5 の tick_volume を変換済み)。
     # "tick_volume" を読むと全バーが 0 になる
-    return [Bar(pair, interval, datetime.fromisoformat(x["time"]),
+    return [Bar(pair, interval, _to_utc(datetime.fromisoformat(x["time"]), "mt5"),
                 float(x["open"]), float(x["high"]), float(x["low"]),
                 float(x["close"]), float(x["volume"]))
             for x in payload["bars"]]
@@ -135,17 +158,28 @@ def td_bars(api_key: str, pair: str, interval: str,
             lookback_days: int) -> list[Bar]:
     size = min(_TD_MAX_OUTPUTSIZE,
                int(lookback_days * 1440 / INTERVAL_MIN[interval]))
+    # timezone を明示しないと Twelve Data は取引所ローカル時刻を既定にし、
+    # 絶対時刻そのものがずれる (修正ラウンド 1: 指摘 2)。"UTC" を明示送信する。
     r = httpx.get("https://api.twelvedata.com/time_series",
                   params={"symbol": vendor_symbol(pair, "td"),
                           "interval": _TD_INTERVAL[interval],
-                          "outputsize": size, "apikey": api_key}, timeout=30)
+                          "outputsize": size, "timezone": "UTC",
+                          "apikey": api_key}, timeout=30)
     r.raise_for_status()
     values = r.json().get("values", [])
-    bars = [Bar(pair, interval,
-                datetime.fromisoformat(v["datetime"]).replace(
-                    tzinfo=timezone.utc),
-                float(v["open"]), float(v["high"]), float(v["low"]),
-                float(v["close"]), 0.0)
-            for v in values]
+    bars = []
+    for v in values:
+        raw_ts = datetime.fromisoformat(v["datetime"])
+        if raw_ts.tzinfo is None:
+            # リクエストで timezone=UTC を指定しているため、naive な応答は
+            # UTC ラベル付けが正当 (指摘 2)。汎用ヘルパー (_to_utc) の
+            # フラグ引数にはしない — フラグとリクエストパラメータは後から
+            # 容易に乖離するため、このリクエストに紐づく分岐としてここに書く。
+            ts = raw_ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = _to_utc(raw_ts, "twelvedata")
+        bars.append(Bar(pair, interval, ts, float(v["open"]),
+                        float(v["high"]), float(v["low"]),
+                        float(v["close"]), 0.0))
     bars.sort(key=lambda b: b.ts)
     return bars

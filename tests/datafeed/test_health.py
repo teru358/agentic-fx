@@ -219,6 +219,56 @@ def test_gap_outside_window_is_not_flagged():
     validate_bars(bars, now, freshness_max_min=90, interval_min=60)  # 例外なし
 
 
+# --- Task 2 修正ラウンド 1: 指摘 3 (Critical) ---
+# MT5 bridge はサーバのローカル時刻を無条件に UTC として解釈しているため、
+# ブローカーのサーバ時刻が UTC より進んでいると未来時刻の timestamp が
+# 混入し得る。既存の stale (負方向) 検査だけでは正方向のずれを検出できない。
+# 注意: この health.py 内の「修正ラウンド 1/2」ラベルは祝日ギャップ回帰
+# (Task 3 側レビュー) のものであり、本節の「Task 2 修正ラウンド 1」とは
+# 別の修正イベント。
+
+
+def test_future_quote_rejected():
+    q = Quote("USDJPY", 148.49, 148.51, NOW + timedelta(minutes=10), "yfinance")
+    with pytest.raises(DataUnhealthy, match="future"):
+        validate_quote(q, NOW, freshness_max_min=20)
+
+
+def test_future_quote_within_tolerance_ok():
+    # ホスト時計のわずかなずれ (数秒〜1分程度) は許容し実運用を止めない。
+    q = Quote("USDJPY", 148.49, 148.51, NOW + timedelta(seconds=30), "yfinance")
+    validate_quote(q, NOW, freshness_max_min=20)  # 例外なし
+
+
+def test_future_last_bar_rejected():
+    bars = _bars()
+    last = bars[-1]
+    bars[-1] = Bar(last.symbol, last.interval, NOW + timedelta(minutes=10),
+                   last.open, last.high, last.low, last.close, last.volume)
+    with pytest.raises(DataUnhealthy, match="future"):
+        validate_bars(bars, NOW, freshness_max_min=90, interval_min=60)
+
+
+def test_future_middle_bar_rejected():
+    # 末尾だけでなく全バーを検査すること (ソースが途中に未来時刻を混ぜる
+    # ケースを取りこぼさない)。
+    bars = _bars()
+    mid = len(bars) // 2
+    m = bars[mid]
+    bars[mid] = Bar(m.symbol, m.interval, NOW + timedelta(minutes=10),
+                    m.open, m.high, m.low, m.close, m.volume)
+    with pytest.raises(DataUnhealthy, match="future"):
+        validate_bars(bars, NOW, freshness_max_min=90, interval_min=60)
+
+
+def test_bar_within_future_tolerance_ok():
+    bars = _bars()
+    last = bars[-1]
+    bars[-1] = Bar(last.symbol, last.interval, NOW + timedelta(seconds=30),
+                   last.open, last.high, last.low, last.close, last.volume)
+    validate_bars(bars, NOW, freshness_max_min=90, interval_min=60)  # 例外なし
+
+
 def test_fine_grained_interval_window_has_wall_clock_floor():
     # 窓をバー本数だけで決めると 1m 足では 24 本 = 24 分しかなくなり、
     # フィード停止から 25 分程度で回復しただけで「もう健全」と誤判定して

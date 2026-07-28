@@ -12,6 +12,15 @@ from agentic_fx.core.timeutil import as_utc
 
 _MAX_GAP_BARS = 3
 _SPIKE_PCT = 10.0
+# 未来時刻の許容幅 (分)。ホスト時計のわずかなずれを吸収するための小さな値。
+# バーの ts はバー開始時刻であり、形成中のバーであっても開始時刻は常に
+# 過去である (この不変条件が破れる = 時刻情報が壊れている、という意味)。
+# MT5 bridge はサーバのローカル時刻を無条件に UTC として解釈しており、
+# ブローカーのサーバ時刻が UTC より進んでいると未来時刻の timestamp が
+# 混入し得る。既存の stale (負方向) 検査だけでは正方向のずれを検出できない
+# (Task 2 修正ラウンド 1: 指摘 3 — このファイル内の「修正ラウンド 1/2」
+# ラベルは祝日ギャップ回帰などの別レビューのものであり、本定数とは無関係)。
+_MAX_FUTURE_MIN = 2.0
 # 休場時間サンプリングの上限回数。超過する場合は「数え切れない = 健全と
 # 断言できない」として fail closed (DataUnhealthy) にする (修正ラウンド 1: 指摘 1)。
 _MAX_CLOSED_TIME_SAMPLES = 100_000
@@ -64,6 +73,10 @@ def validate_quote(quote: Quote, now: datetime,
     ts = as_utc(quote.ts)
     if now - ts > timedelta(minutes=freshness_max_min):
         raise DataUnhealthy(f"quote stale: {ts} (source={quote.source})")
+    if ts - now > timedelta(minutes=_MAX_FUTURE_MIN):
+        raise DataUnhealthy(
+            f"quote timestamp in the future: {ts} (now={now}, "
+            f"source={quote.source})")
     if not (quote.bid > 0 and quote.ask > 0 and
             math.isfinite(quote.bid) and math.isfinite(quote.ask)):
         raise DataUnhealthy("quote has non-positive/NaN price")
@@ -119,6 +132,11 @@ def validate_bars(bars: list[Bar], now: datetime, freshness_max_min: float,
     prev_close: float | None = None
     for b in bars:
         ts = as_utc(b.ts)
+        # 未来時刻の検査は末尾バーだけでなく全バーに対して行う (ソースが
+        # 途中に未来時刻を混ぜるケースを取りこぼさないため。指摘 3)。
+        if ts - now > timedelta(minutes=_MAX_FUTURE_MIN):
+            raise DataUnhealthy(
+                f"bar timestamp in the future: {ts} (now={now})")
         vals = (b.open, b.high, b.low, b.close)
         if any(v <= 0 or not math.isfinite(v) for v in vals):
             raise DataUnhealthy(f"anomalous bar (zero/NaN) at {ts}")
