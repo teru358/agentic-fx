@@ -1,0 +1,13 @@
+# MT5 の口座番号・パスワードが入る。ルート .gitignore にも `.env` があるが、
+# 秘密情報の流出は取り返しがつかないので二重に防御する。
+.env
+
+# bridge.log とローテーション世代、hard halt フラグ
+logs/
+
+# uv がこのサブプロジェクト用に作る venv (ルートとは別物)
+.venv/
+
+__pycache__/
+*.py[oc]
+.pytest_cache/
