@@ -611,6 +611,15 @@ git commit -m "feat: ソース fetcher (yfinance/MT5 bridge/Twelve Data、全モ
 >
 > **⚠️ ただし Task 3 実装時に必ず確認すること**: `yf_bars` などが naive を受け取ったときに送出するのは `ValueError` である。`get_quote` / `get_bars` の**ソース毎の except 節がこれを捕まえて次ソースへフォールバックする**形になっていないと、フォールバックのはずが `get_bars` ごと落ちる。except 節を `DataUnhealthy` や `httpx.HTTPError` だけに絞らないこと。
 
+> **実装済み (2026-07-28、commits `e772f4e..8fbbb49`)。以下のコードは実装と一致しません** — レビューとユーザー裁定で方針が変わりました。**現在の正は `src/agentic_fx/datafeed/price_provider.py` と `bars.py`** です。変更点:
+>
+> 1. **`resample(df, interval)` は pandas 3 では成立しない**。`"1m"/"5m"/"15m"/"30m"` は月末 (`'ME'`) 扱いで `ValueError` になり、`4h` だけがたまたま通る。yfinance は `30m` をネイティブに持たないため**分足の導出は本番経路に実在**し、そのままだと「yfinance も死んだ」と無音で誤判定される。`bars.pandas_rule()` で明示写像した
+> 2. **`_derive` は resample の前に base 足を `validate_bars` する**。導出後の足しか検証しないと、base の部分欠損が resample に吸収されて検出されない (4h バケット内の 1h 4 本中 3 本が欠損しても健全を通る)。Task 1 の fail-open と同じ穴
+> 3. **`DERIVE_ONLY_INTERVALS = {"4h", "1d"}` を導入し、この 2 つはどのソースからもネイティブに取らない**。実測 (2026-07-28、稼働中 bridge): MT5 のネイティブ H4 は真 UTC の 21/01/05/09/13/17、D1 は 21:00 (= NY クローズ 17:00 EDT) で、epoch 導出の 00/04/08/12/16/20 と**1 本も時刻を共有しない**。`ohlcv` は由来を区別する列を持たないため、フォールバックでソースが切り替わると重複した 2 つの格子が 1 本の系列に混ざる。`NATIVE_INTERVALS` は「ソースの能力」の表なので書き換えず、base 候補とキャッシュ候補の両方から `DERIVE_ONLY_INTERVALS` を除外している
+> 4. **導出足は `ohlcv` に保存しない。保存するのは base 足**。キャッシュフォールバックも base から導出し、`bars_origin` は `"cache(1h→4h derived)"` になる (`"cache"` への退化を解消)
+> 5. **リサンプルの錨は `bars.BAR_ANCHOR` (既定 `"epoch"`)**。NY クローズ基準への切り替えはこの定数 1 箇所で済む (**導出足をキャッシュしない設計なのでキャッシュ破棄も不要**)。錨の是非はバックテスト spec の論点 (ユーザー裁定 2026-07-28: 「NY 基準にするのもすぐできるということで、なにか不都合が合った際に検討する」)
+> 6. **例外の文字列化は `_safe_error_text` に集約**。Twelve Data は `apikey` をクエリパラメータで送るため、httpx の例外文字列を素で `DataUnhealthy` のメッセージに連結すると、mission 記録・activity・Discord に API キーが載る
+
 **Files:**
 - Create: `src/agentic_fx/datafeed/bars.py` — 足の変換 (Task 4 の indicators も import する共有モジュール)
 - Create: `src/agentic_fx/datafeed/price_provider.py`
