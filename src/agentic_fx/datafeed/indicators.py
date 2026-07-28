@@ -49,18 +49,29 @@ def compute_indicators(df: pd.DataFrame) -> dict:
     out["macd_signal"] = _last(macd.ewm(span=9, adjust=False).mean(), 26)
 
     delta = close.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    # **既知の欠陥 (ブリーフのまま、報告に明記)**: 平均下落幅が 0 (直近 14 本が
-    # 連続上昇) だと rs が NA → rsi_14 も None になる。教科書的には RSI=100
-    # (最大の買われすぎ) とすべきところが、このモジュールでは None = 「デー
-    # タ不足でまだ計算できない」の意味で使っており、両者が衝突する。LLM 側は
-    # 「まだ指標が無い」と「今まさに天井圏」を区別できなくなる。fail closed の
-    # 観点では「無いものを見せない」なので危険ではないが、正しい意味の情報を
-    # 一つ握りつぶしている。修正は _last の外側で rs=NA を特別扱いする 1 行で
-    # 済むが、ブリーフの逐語コードなので勝手に直さず報告に記載するに留める
-    rs = gain / loss.replace(0, pd.NA)
-    out["rsi_14"] = _last(100 - 100 / (1 + rs), 15)
+    avg_gain = delta.clip(lower=0).rolling(14).mean()
+    avg_loss = (-delta.clip(upper=0)).rolling(14).mean()
+    # rs = avg_gain / avg_loss。avg_loss == 0 かつ avg_gain > 0 (直近 14 本が
+    # 連続上昇) のときは 0 除算で rs = inf になるが、そのまま
+    # `100 - 100/(1+inf)` を計算すると 100/(inf) = 0 で自然に 100.0 (教科書の
+    # RSI の極限どおり) に収束するため特別扱いは不要 (pandas は 0 除算で
+    # 例外を出さず inf/NaN を返す、実測確認済み)。
+    #
+    # 例外は avg_gain == 0 かつ avg_loss == 0 (直近 14 本の値動きがゼロ、
+    # 完全な横ばい) の 0/0 = NaN で、これだけは算術で自動解決しないため
+    # 明示的に埋める。**このモジュールの不変条件: rsi_14 が None を返すのは
+    # データ不足 (系列長 < 15) のときだけ**。avg_loss==0 を NaN のままにする
+    # と「データ不足」と「買われすぎ/横ばい」が区別できなくなり (実測: 単調
+    # 増加系列で rsi_14 が 100.0 ではなく None を返す欠陥があった)、LLM が
+    # 最も価値の高い判断材料 (天井圏) をデータ不足と誤認しかねないため修正した。
+    # 50.0 (中立) という値は業界標準ではなく本プロジェクトの規約 — RSI の
+    # 定義域 [0, 100] の中央値であり、上げも下げも無い以上「買われすぎでも
+    # 売られすぎでもない」とみなすのが妥当という判断
+    rs = avg_gain / avg_loss
+    rsi = 100 - 100 / (1 + rs)
+    flat = avg_gain.eq(0) & avg_loss.eq(0)
+    rsi = rsi.where(~flat, 50.0)
+    out["rsi_14"] = _last(rsi, 15)
 
     tr = pd.concat([high - low, (high - close.shift()).abs(),
                     (low - close.shift()).abs()], axis=1).max(axis=1)
