@@ -1449,6 +1449,15 @@ git commit -m "feat: 組み込み指標 (SMA/EMA/RSI/ATR/MACD/BB) + MTF リサ�
 
 ### Task 5: news fetcher (datafeed/fetchers.py)
 
+> **実装済み (2026-07-28、commits `ef8f7ba..172413a`)。以下のコードは実装と一致しません**。**現在の正は `src/agentic_fx/datafeed/fetchers.py`** です。変更点:
+>
+> 1. **Atom 用に `updated_parsed` フォールバックを追加**。下のコードは `published_parsed` しか見ないため、**純 Atom フィードでは `published` が丸ごと失われる**
+> 2. **`trafilatura.extract` に `include_comments=False`**。既定ではコメント欄のテキストが記事本文に混入し、それが取引判断の材料になる
+> 3. **エントリ単位の `title`/`link` アクセスを防御的にした**。1 件の壊れたエントリでフィード全体が落ちない
+> 4. **未知のタイムゾーン略号に warning を出す** (修正ラウンド 1)。feedparser は `rfc822.py:135` / `w3dtf.py:97` で**未知の略号 (`JST` を含む) を無音でオフセット 0 に倒す**ため、JST 表記の日付が 9 時間ずれてもそれと分からない。判定に使う既知略号は feedparser の**実辞書を import して導出**している (自前列挙するとライブラリ更新でずれる)。**記事は捨てない** — ニュースは価格と違い、取れなくても取引を止める種類のデータではない
+>
+> **⚠️ Task 7 (ニュースソースの選定) で効く残存問題**: `CST`/`CDT` は feedparser の辞書に「US Central (-6h)」として**存在する**ため、中国標準時 (CST、+8h) を出すソースがあると **14 時間ずれるうえ警告も出ない**。「無音で +0000」とは別の失敗様式で、feedparser 固有の曖昧性。ソース選定時に確認すること
+
 **Files:**
 - Create: `src/agentic_fx/datafeed/fetchers.py`
 - Test: `tests/datafeed/test_fetchers.py`
