@@ -32,6 +32,7 @@
 > 2. **サンプリング粒度を `interval_min` に追従**させ、反復回数が `_MAX_CLOSED_TIME_SAMPLES` を超えたら fail closed に倒す (「数え切れない = 健全と断言できない」)
 > 3. **ギャップ検査を直近の窓に限定** (`_GAP_CHECK_WINDOW_BARS` / `_GAP_CHECK_WINDOW_MIN_MINUTES`)。検査が答えるべきは「フィードは今動いているか」であり、回復済みの過去の穴で取引を止めない。末尾隣接の穴は常に窓内に入るため、①の検出力は落ちない
 > 4. **`as_utc` で naive datetime を弾く** (規約どおり `ValueError`)
+> 5. **未来時刻の検査を追加** (`_MAX_FUTURE_MIN`、commit `753c008`)。旧実装の鮮度検査は `now - ts > allowed` の形で**負の差 = 未来の timestamp を一切弾かなかった**。MT5 の `copy_rates` が返す `time` は「ターミナルのサーバ時間帯における」エポック秒であり、bridge (`~/project/finance/mt5_bridge/mt5_client.py:360`) が無条件に UTC として解釈しているため、ブローカーのサーバ時刻が UTC より進んでいると MT5 のバーだけ系統的にずれて `ohlcv` に混入し、resample のバケット境界が無音で壊れる (遅れ方向は既存の stale 検査が捕まえる)。`validate_quote` と `validate_bars` の**全バー**に適用する
 >
 > **known issue (受容済み)**: `market_hours` が祝日カレンダーを持たないため、祝日隣接週は市場再開後**最大 24h** `DataUnhealthy` が継続する。fail closed 側の誤検知であり Phase 1 (ペーパー) では実損がない。祝日カレンダーの要否はプラン 3 完了後に判断する。
 
@@ -457,17 +458,32 @@ def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _to_utc(t: datetime, source: str) -> datetime:
+    """tz-aware datetime を UTC に正規化する。naive は ValueError で fail closed。
+
+    「naive なら UTC とみなす」は禁止 (プロジェクト制約)。tz 情報が落ちて
+    いるときに UTC を仮定すると絶対時刻が静かにずれる。
+    """
+    if t.tzinfo is None:
+        raise ValueError(
+            f"{source} returned a naive datetime; tz info is required "
+            "(cannot safely assume UTC)")
+    return t.astimezone(timezone.utc)
+
+
 def yf_bars(pair: str, interval: str, lookback_days: int) -> list[Bar]:
+    # ignore_tz=False を明示すること。既定 (None) だと yfinance が
+    # `interval[-1] not in ('m', 'h')` で解決してしまい、1d だけ
+    # 取引所ローカル→naive (絶対時刻がずれる)、他の足は tz-aware だが
+    # 非 UTC の index を返す
     df = yfinance.download(
         vendor_symbol(pair, "yf"), interval=interval,
         period=f"{lookback_days}d", progress=False, auto_adjust=False,
-        multi_level_index=False)
+        multi_level_index=False, ignore_tz=False)
     df = _flatten_yf_columns(df)
     bars: list[Bar] = []
     for ts, row in df.iterrows():
-        t = ts.to_pydatetime()
-        if t.tzinfo is None:
-            t = t.replace(tzinfo=timezone.utc)
+        t = _to_utc(ts.to_pydatetime(), "yfinance")
         volume = row["Volume"] if "Volume" in row else 0.0
         bars.append(Bar(pair, interval, t, float(row["Open"]),
                         float(row["High"]), float(row["Low"]),
@@ -496,8 +512,10 @@ def mt5_quote(bridge_url: str, pair: str) -> Quote:
                   headers=_mt5_headers(), timeout=10)
     r.raise_for_status()
     d = r.json()   # {symbol, bid, ask, spread_points, time}
+    # bridge は現行 +00:00 付き ISO を返すが、_to_utc を通して
+    # 非 UTC オフセット・naive を無言で受けない形にしておく
     return Quote(pair, float(d["bid"]), float(d["ask"]),
-                 datetime.fromisoformat(d["time"]), "mt5")
+                 _to_utc(datetime.fromisoformat(d["time"]), "mt5"), "mt5")
 
 
 def mt5_bars_range(bridge_url: str, pair: str, interval: str,
@@ -515,7 +533,7 @@ def mt5_bars_range(bridge_url: str, pair: str, interval: str,
     payload = r.json()          # {symbol, interval, bars: [...]}
     # bar の出来高キーは "volume" (bridge が MT5 の tick_volume を変換済み)。
     # "tick_volume" を読むと全バーが 0 になる
-    return [Bar(pair, interval, datetime.fromisoformat(x["time"]),
+    return [Bar(pair, interval, _to_utc(datetime.fromisoformat(x["time"]), "mt5"),
                 float(x["open"]), float(x["high"]), float(x["low"]),
                 float(x["close"]), float(x["volume"]))
             for x in payload["bars"]]
@@ -543,18 +561,28 @@ def td_bars(api_key: str, pair: str, interval: str,
             lookback_days: int) -> list[Bar]:
     size = min(_TD_MAX_OUTPUTSIZE,
                int(lookback_days * 1440 / INTERVAL_MIN[interval]))
+    # timezone を明示しないと Twelve Data は取引所ローカル時刻を既定にし、
+    # 絶対時刻そのものがずれる。"UTC" を明示送信すること
     r = httpx.get("https://api.twelvedata.com/time_series",
                   params={"symbol": vendor_symbol(pair, "td"),
                           "interval": _TD_INTERVAL[interval],
-                          "outputsize": size, "apikey": api_key}, timeout=30)
+                          "outputsize": size, "timezone": "UTC",
+                          "apikey": api_key}, timeout=30)
     r.raise_for_status()
     values = r.json().get("values", [])
-    bars = [Bar(pair, interval,
-                datetime.fromisoformat(v["datetime"]).replace(
-                    tzinfo=timezone.utc),
-                float(v["open"]), float(v["high"]), float(v["low"]),
-                float(v["close"]), 0.0)
-            for v in values]
+    bars = []
+    for v in values:
+        raw_ts = datetime.fromisoformat(v["datetime"])
+        if raw_ts.tzinfo is None:
+            # リクエストで timezone=UTC を指定しているため、naive な応答は
+            # UTC ラベル付けが正当。_to_utc のフラグ引数にはしない —
+            # フラグとリクエストパラメータは後から容易に乖離する
+            ts = raw_ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = _to_utc(raw_ts, "twelvedata")
+        bars.append(Bar(pair, interval, ts, float(v["open"]),
+                        float(v["high"]), float(v["low"]),
+                        float(v["close"]), 0.0))
     bars.sort(key=lambda b: b.ts)
     return bars
 ```
@@ -575,13 +603,13 @@ git commit -m "feat: ソース fetcher (yfinance/MT5 bridge/Twelve Data、全モ
 
 ### Task 3: PriceProvider (datafeed/price_provider.py)
 
-> **⚠️ 着手前に必ず対処すること (Task 2 のレビューで判明、未解決)**
+> **✅ tz 正規化の宿題は解決済み (Task 2 修正ラウンド 1、コミット `753c008`)**
 >
-> **`yf_bars` / `yf_quote` が返す intraday バーは tz-aware だが UTC ではない。** yfinance 1.5.2 のソース実測によると、`ignore_tz=True` が効くのは日足のみで、`1m/5m/15m/30m/1h` は Yahoo の `exchangeTimezoneName` にローカライズされたインデックスを返す。Task 2 の実装は `if t.tzinfo is None: replace(tzinfo=utc)` なので、**既に非 UTC の tzinfo が付いている場合は素通り**する。プロジェクト制約「時刻は必ず tz-aware UTC」に反し、`bars_to_df` の `tz="UTC"` 指定や `ohlcv` への保存で問題になる。
+> 判明していた 2 件 (yfinance の `ignore_tz` 既定が interval 依存 / Twelve Data の `timezone` 未指定) に加え、**`health.py` に未来時刻の検査が無い** (Critical、MT5 のサーバ時刻オフセットが無音で通る) ことも同ラウンドで潰した。詳細は上の Task 2 のコードと `datafeed/health.py` を参照。
 >
-> **Twelve Data の応答タイムゾーンも未検証。** `td_bars` は `timezone` パラメータを指定せず `fromisoformat(...).replace(tzinfo=utc)` で無条件に UTC ラベルを付けている。TD の既定が Exchange ローカル時刻なら**絶対時刻そのものがずれる** (yfinance より深刻)。`timezone=UTC` を明示するのが安全。
+> **この節の以降の記述は前提が「時刻は既に tz-aware UTC で揃っている」に変わっている。** PriceProvider 側で重ねて正規化しないこと (正規化点はソース層に一本化した)。
 >
-> どちらもソース層で正規化するか PriceProvider で一括正規化するかを決め、**テストで固定してから** Task 3 の本体に進むこと。
+> **⚠️ ただし Task 3 実装時に必ず確認すること**: `yf_bars` などが naive を受け取ったときに送出するのは `ValueError` である。`get_quote` / `get_bars` の**ソース毎の except 節がこれを捕まえて次ソースへフォールバックする**形になっていないと、フォールバックのはずが `get_bars` ごと落ちる。except 節を `DataUnhealthy` や `httpx.HTTPError` だけに絞らないこと。
 
 **Files:**
 - Create: `src/agentic_fx/datafeed/bars.py` — 足の変換 (Task 4 の indicators も import する共有モジュール)
