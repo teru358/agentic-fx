@@ -68,7 +68,10 @@ def run_init(root: Path) -> int:
         print(f"警告: 価格ソースに接続できません ({safe_error_text(e)})。"
               "サービス起動後は fail closed で保護されます。")
     else:
-        print(f"価格ソース OK (source={source})")
+        # 確認したペアを明示する。config は複数ペアを許すが healthcheck は
+        # 先頭 1 ペアしか見ないため、無限定の「OK」は 2 ペア目以降が壊れて
+        # いても OK に見える (レビュー指摘 Minor-3)。
+        print(f"価格ソース OK ({settings.pairs[0]}, source={source})")
 
     # learning への切替はモード遷移ガード (§3) を通る mode コマンドのみ。
     # init はガードの迂回路にしない: trading 中は mode/autopilot に触れない。

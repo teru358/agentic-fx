@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import httpx
@@ -139,12 +140,39 @@ def test_init_seeds_news_sources_and_checks_price(tmp_path, capsys,
     # 数えることで「全件 enabled で入る」ことも同時に固定する
     assert len(news_sources.list_enabled(conn)) == len(DEFAULT_SOURCES)
     out = capsys.readouterr().out
-    assert "価格ソース OK (source=yfinance)" in out
+    assert "価格ソース OK (USDJPY, source=yfinance)" in out
     # 件数リテラルを書かない。tmp_path に数字が混ざるので部分一致では
     # 弱すぎる (print を消しても通ってしまう) — 文言ごと突き合わせる
     assert f"基本ニュースソースを {len(DEFAULT_SOURCES)} 件登録しました" in out
     # 確認するのは設定の先頭ペア (プラン 5 の fail closed と同じ対象)
     mock_price_check.return_value.healthcheck.assert_called_once_with("USDJPY")
+
+
+def test_init_seeds_with_a_real_utc_clock(tmp_path, mock_price_check):
+    """`run_init` が **`SystemClock` を実際に使っている**ことを固定する。
+
+    レビュー指摘 (I-1 / Minor-5): `SystemClock` 側のテストは
+    `tests/core/test_contracts.py` にあるが、**入口がそれを使っていること**には
+    ピンが 1 本も無かった。実測で 2 つの改変が全テスト緑のまま生存している:
+
+    ①`clock = SystemClock()` を `FixedClock(2020-01-01Z)` に差し替える →
+      止まった時計は `validate_quote` の鮮度検証を必ず落とすので、init が
+      **オンラインでも常に「接続できません」を出す**。exit 0 のままなので誰も気づかない
+    ②`seed_default_sources(conn, clock.now().replace(tzinfo=None))` で naive を渡す →
+      `store/news_sources.add` は `Rag.cleanup_news` と違って tz 検証を持たず
+      素で `now.isoformat()` を書く。**Task 9 がこの無防備な書き込み経路の
+      初の production 呼び出し元**
+
+    `created_at` の tz と実時刻近傍性を見ることで両方を同時に閉じる。
+    """
+    _example(tmp_path)
+    before = datetime.now(timezone.utc)
+    assert run_init(tmp_path) == 0
+    after = datetime.now(timezone.utc)
+    conn = connect(tmp_path / "data" / "agentic.db")
+    created = datetime.fromisoformat(news_sources.list_all(conn)[0]["created_at"])
+    assert created.tzinfo is not None          # naive を書かない (②)
+    assert before <= created <= after          # 実時計である (①)
 
 
 def test_init_seeding_is_idempotent(tmp_path, capsys):
@@ -278,5 +306,4 @@ def test_init_does_not_swallow_unexpected_errors(tmp_path, mock_price_check):
         run_init(tmp_path)
     with pytest.raises(SystemExit) as e:
         ensure_initialized(tmp_path)
-    assert e.value.code == 2
     assert e.value.code == 2
