@@ -58,16 +58,28 @@ def seed_default_sources(conn: sqlite3.Connection, now: datetime) -> int:
     到達性確認の結果 nhk-keizai の url だけ修正した場合) に対して
     再度 INSERT を試み、name の UNIQUE 制約で sqlite3.IntegrityError に
     なり init 自体が落ちる)。
+
+    **修正ラウンド 1 (レビュー指摘)**: `existing_names`/`existing_urls` は
+    ループの中で都度更新する。ループ前の 1 回だけのスナップショットだと
+    `DEFAULT_SOURCES` **自体の中に** name/url の衝突があった場合に検知
+    できない (2 件目を挿入しようとする時点で、まだ「同じループで挿入した
+    1 件目」を知らないため)。あわせて `news_sources.list_all(conn)` は
+    1 回だけ呼ぶ (以前は existing_names/urls それぞれで 1 回ずつ、計 2 回
+    呼んでいた)。
     """
-    existing_names = {s["name"] for s in news_sources.list_all(conn)}
-    existing_urls = {s["url"] for s in news_sources.list_all(conn)}
+    existing = news_sources.list_all(conn)
+    existing_names = {s["name"] for s in existing}
+    existing_urls = {s["url"] for s in existing}
     added = 0
     for s in DEFAULT_SOURCES:
-        if s["name"] not in existing_names and s["url"] not in existing_urls:
-            news_sources.add(conn, name=s["name"], fetcher=s["fetcher"],
-                             url=s["url"], added_by="user", now=now,
-                             enabled=True)
-            added += 1
+        if s["name"] in existing_names or s["url"] in existing_urls:
+            continue
+        news_sources.add(conn, name=s["name"], fetcher=s["fetcher"],
+                         url=s["url"], added_by="user", now=now,
+                         enabled=True)
+        existing_names.add(s["name"])
+        existing_urls.add(s["url"])
+        added += 1
     return added
 
 

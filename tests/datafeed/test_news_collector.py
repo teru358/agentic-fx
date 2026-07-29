@@ -1,5 +1,6 @@
+import logging
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from agentic_fx.activity import ActivityLog
 from agentic_fx.core.contracts import FixedClock
@@ -32,7 +33,54 @@ def test_seed_defaults_idempotent(tmp_path):
     n1 = seed_default_sources(conn, NOW)
     assert n1 == len(DEFAULT_SOURCES) >= 2
     assert seed_default_sources(conn, NOW) == 0  # 冪等
-    assert all(s["enabled"] for s in news_sources.list_all(conn))
+    rows = news_sources.list_all(conn)
+    assert all(s["enabled"] for s in rows)
+    # ブリーフが太字で指定する要件 (「enabled=True, added_by="user" で
+    # 未登録分のみ INSERT」)。added_by の値には元々どのテストも掛かって
+    # いなかった (レビューの変異テストで agent に変えても全緑と判明) ので
+    # ここでピンを打つ。
+    assert all(s["added_by"] == "user" for s in rows)
+
+
+def test_seed_defaults_dedupes_within_default_sources_list(tmp_path, monkeypatch):
+    """DEFAULT_SOURCES 自体の中で name が重複していても IntegrityError に
+    ならないこと。
+
+    修正ラウンド 1 で発見: existing_names/urls をループ開始前に 1 回だけ
+    スナップショットすると、リスト内部での重複は防げない (2 件目を
+    挿入しようとする時点で、同じループで挿入したばかりの 1 件目をまだ
+    「既存」として知らないため)。ループ内で集合を更新して初めて閉じる。
+    """
+    conn, _, _ = _env(tmp_path)
+    dup_sources = [
+        {"name": "dup-src", "fetcher": "feed", "url": "https://a.example/rss"},
+        {"name": "dup-src", "fetcher": "feed", "url": "https://b.example/rss"},
+    ]
+    monkeypatch.setattr("agentic_fx.datafeed.news_collector.DEFAULT_SOURCES",
+                        dup_sources)
+    n = seed_default_sources(conn, NOW)  # 例外を送出しないこと
+    assert n == 1
+    assert [s["name"] for s in news_sources.list_all(conn)] == ["dup-src"]
+
+
+def test_seed_defaults_dedupes_url_collision_within_list(tmp_path, monkeypatch):
+    """上と対になるケース: DEFAULT_SOURCES 内で **url** だけが重複する。
+
+    name 側だけを補ったつもりでも url 側の集合更新を落とすと、db.py:92 の
+    url UNIQUE で IntegrityError になり init が落ちる。name 衝突のケース
+    だけでは `existing_urls.add(...)` にピンが掛からない (変異テストで
+    実測: url 側の更新だけ削除しても name 衝突のテストは緑のままだった)。
+    """
+    conn, _, _ = _env(tmp_path)
+    dup_sources = [
+        {"name": "src-a", "fetcher": "feed", "url": "https://same.example/rss"},
+        {"name": "src-b", "fetcher": "feed", "url": "https://same.example/rss"},
+    ]
+    monkeypatch.setattr("agentic_fx.datafeed.news_collector.DEFAULT_SOURCES",
+                        dup_sources)
+    n = seed_default_sources(conn, NOW)  # 例外を送出しないこと
+    assert n == 1
+    assert [s["name"] for s in news_sources.list_all(conn)] == ["src-a"]
 
 
 def test_seed_defaults_skips_on_name_or_url_collision(tmp_path):
@@ -156,3 +204,31 @@ def test_collect_error_message_does_not_leak_url(tmp_path):
         col.collect()
     logged = " ".join(str(c) for c in mock_log.warning.call_args_list)
     assert "SECRET123" not in logged
+
+
+def test_collect_records_dead_feed_as_failure_and_continues(tmp_path, caplog):
+    """修正ラウンド 1: 死んだフィード (bozo=True, entries=[]) が collect を
+    通じて技術ログに残り、他ソースの取り込みは続くこと。
+
+    ここでは `fetch_feed` 自体はモックせず (news_collector.fetch_feed を
+    patch しない)、feedparser.parse だけを差し替えて実物の fetch_feed を
+    通す — fetchers.py が FeedFetchError を送出し、それを collect の
+    per-source except が拾うところまでを end-to-end で確認する。
+    """
+    conn, rag, col = _env(tmp_path)
+    news_sources.add(conn, name="dead", fetcher="feed",
+                     url="https://dead.example/rss",
+                     added_by="user", now=NOW, enabled=True)
+    news_sources.add(conn, name="good", fetcher="web", url="https://good",
+                     added_by="user", now=NOW, enabled=True)
+    dead_parsed = MagicMock(bozo=True, entries=[],
+                            bozo_exception=ConnectionRefusedError("refused"))
+    with patch("feedparser.parse", return_value=dead_parsed), \
+         patch("agentic_fx.datafeed.news_collector.fetch_web",
+               return_value=[ART]), \
+         caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
+        total = col.collect()
+    assert total == 1  # good だけ取り込まれる。dead は落ちない
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("dead" in m and "failed" in m for m in messages)
+    assert "dead.example" not in " ".join(messages)  # URL は出さない

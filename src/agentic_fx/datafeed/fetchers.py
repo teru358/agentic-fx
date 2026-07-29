@@ -126,16 +126,58 @@ def _feed_published(entry: object, source_name: str,
     return datetime(*parsed[:6], tzinfo=timezone.utc)
 
 
+class FeedFetchError(Exception):
+    """feedparser が bozo (取得/パース失敗) を報告し、1 件もエントリを
+    得られなかった場合に送出する。"取得失敗" を可視化するための例外。"""
+
+
+def _bozo_reason(bozo_exception: BaseException | None) -> str:
+    """bozo_exception を「ログ・例外メッセージに出してよい」文字列にする。
+
+    feedparser はネットワーク層の失敗 (urllib 由来の接続エラー等) も
+    bozo_exception に格納するため、その str() には URL やホスト名が
+    乗ることがある (price_provider._safe_error_text と同じ懸念)。
+    ここでは型名のみを使う — 診断には十分で、URL を含む本文は一切
+    出さない。
+    """
+    if bozo_exception is None:
+        return "unknown parse error"
+    return type(bozo_exception).__name__
+
+
 def fetch_feed(url: str, source_name: str) -> list[Article]:
     """RSS/Atom フィードを取得して Article のリストにする。
 
     1 エントリの欠損フィールド (title/link 等) でフィード全体が空になる
     ことがないよう、エントリ単位で防御的に読む (title は空文字に、
     link を欠くエントリのみ記事として成立しないためスキップし技術ログに
-    残す)。ネットワーク層の失敗は feedparser 自身が bozo フラグに吸収し
-    例外化しないため、本関数から通常は例外を送出しない。
+    残す)。
+
+    **修正ラウンド 1 (レビュー指摘)**: ネットワーク層の失敗は feedparser
+    自身が例外化せず bozo フラグ (+ bozo_exception) に無音で吸収する。
+    これを素通しすると「死んだフィードは 0 件を返し続けるだけで、技術
+    ログにも activity にも何も残らない」状態になり、グローバル制約
+    「失敗は技術ログに残す」に反する。そこで:
+    - bozo かつ entries が空 → 「フィードが空」ではなく「取得/パースに
+      失敗した」とみなし `FeedFetchError` を送出する (呼び出し側
+      `NewsCollector.collect` の per-source except が拾い、失敗として
+      技術ログに残す形になる)。
+    - bozo だが entries はある (部分的なパースエラー) → 取れたものは
+      返しつつ warning のみ出す (ニュースは fail-open — 価格と違い
+      欠損で取引を止める種類のデータではない)。
+    - bozo が立っていない (健全なフィードがたまたま 0 件) は従来どおり
+      無警告で空リストを返す — これはエラーではない。
     """
     parsed = feedparser.parse(url)
+    if getattr(parsed, "bozo", False):
+        reason = _bozo_reason(getattr(parsed, "bozo_exception", None))
+        if not parsed.entries:
+            raise FeedFetchError(f"{source_name}: feed fetch/parse failed "
+                                 f"({reason})")
+        _log.warning(
+            "feed %s: bozo flag set (%s) but %d entr%s recovered; "
+            "returning partial results", source_name, reason,
+            len(parsed.entries), "y" if len(parsed.entries) == 1 else "ies")
     out: list[Article] = []
     for e in parsed.entries:
         try:
