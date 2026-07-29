@@ -1790,7 +1790,7 @@ git commit -m "feat: ChromaDB RAG (news 48h 掃除 / reflections)"
 > 3. **未知の `fetcher` 値は警告してスキップする**。無言で `fetch_web` にフォールバックしない
 > 4. **ソース失敗ログは `_safe_error_text` を通す** (`price_provider` と同じ。URL/秘密を素で載せない)
 > 5. **`fetch_feed` が feedparser の `bozo` を見る** (修正ラウンド 1、Task 5 の `fetchers.py` 側の変更)。feedparser はネットワーク層の失敗を**例外化せず `bozo` フラグに吸収する**ため、本 Task の per-source `try/except` は `fetcher="feed"` に対して dead code だった — **死んだソースは 0 件を返し続け、警告も activity も永久に出ない**。`bozo` かつ `entries` 空 → `FeedFetchError` を送出 (collect が失敗として記録)、`bozo` だが `entries` あり → warning のみで取れたものは返す (ニュースは fail-open)、`bozo=False` の 0 件 → 従来どおり無警告。`bozo_exception` は**型名のみ**使う (`str()` に URL/ホスト名が乗りうる)
-> 6. **`DEFAULT_SOURCES` の 3 件を実接続で確認済み** (2026-07-29)。3 件とも `status=200` / `bozo=False` / entries あり。日付表記は `Z` / `+0900` / `GMT` で、**Task 5 から申し送りの `CST` の罠は該当しない**。`nhk-keizai` の `cat5.xml` は実測で経済カテゴリ。**ただし `yahoo-finance-topstories` は `summary` 要素を持たず 42 件すべて body が空になる** — RAG の doc がタイトルだけになる。扱い (差し替え / `fetcher="web"` 化 / 許容) は**ユーザー裁定待ち**
+> 6. **`DEFAULT_SOURCES` の 3 件を実接続で確認済み** (2026-07-29)。3 件とも `status=200` / `bozo=False` / entries あり。日付表記は `Z` / `+0900` / `GMT` で、**Task 5 から申し送りの `CST` の罠は該当しない**。`nhk-keizai` の `cat5.xml` は実測で経済カテゴリ。**ただし `yahoo-finance-topstories` は `summary` 要素を持たず 42 件すべて body が空になる** — RAG の doc がタイトルだけになる。扱いは**ユーザー裁定済み (2026-07-29)**: 「初期サンプルとして数件は残してよい。どれを初期値とするかは後ほど検討する」→ **DEFAULT_SOURCES は 3 件のまま変更しない**。ソース選定 (yahoo を残すか / `fetcher="web"` 化 / 差し替え) は後日の検討事項として繰り越し
 
 **Files:**
 - Create: `src/agentic_fx/datafeed/news_collector.py`
