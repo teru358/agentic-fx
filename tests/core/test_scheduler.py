@@ -1125,3 +1125,36 @@ def test_filled_id_is_recorded_before_the_same_bar_exit_check_can_raise(tmp_path
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
     assert "limit_fill_error" in log   # 失敗は無音にしない
     _assert_no_url(log)
+
+
+# --- 再レビュー N1: filled_ids.add は activity.write より前 -----------------
+
+def test_activity_write_failure_does_not_reopen_same_bar_tp_window(tmp_path):
+    """activity.write ("limit_filled") が I/O 障害で例外を投げても、
+    同一バー TP 誤確定 (レビュー修正 1 で塞いだ欠陥) が復活しないこと。
+
+    70167fb は filled_ids.add を _check_one_exit の前に置いたが
+    activity.write の後のままで、write が OSError (ENOSPC 等) になると
+    「DB は OPEN なのに filled_ids に無い」注文が生まれ、_process_exits が
+    entry_same_bar=False で再評価して TP を誤確定させていた
+    (再レビュー N1、実測で closed/tp を確認)。add を OPEN 遷移直後へ移動。
+    """
+    env = Env(tmp_path)
+    oid = env.place_limit(price=148.20, sl=147.80, tp=149.00)
+    orig = env.sched.activity.write
+
+    def flaky(cat, event, msg, **kw):
+        if event == "limit_filled":
+            raise OSError("disk full")
+        return orig(cat, event, msg, **kw)
+
+    env.sched.activity.write = flaky
+    # 148.20 で約定し、同一バーで TP 149.00 にも到達するバー
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.30, 149.10, 148.15, 149.00, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+    row = orders.get(env.conn, oid)
+    # 保守則は「同一バーの SL/TP は entry_same_bar=True で判定」であり、
+    # activity の障害がその判定条件を変えてはならない
+    assert row["status"] == "open", "同一バー TP が誤確定した"
+    assert row["close_reason"] is None

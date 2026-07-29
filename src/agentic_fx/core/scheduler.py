@@ -511,10 +511,15 @@ class Scheduler:
                     avg_fill_price=price, filled_quantity=row["quantity"],
                     remaining_quantity=0.0, filled_at=now.isoformat())
                 transitions.transition(self.conn, row["id"], S.OPEN, now)
+                # filled_ids への追加は OPEN 遷移の**直後・activity より前**。
+                # activity.write は I/O (ENOSPC 等で OSError になり得る) で、
+                # ここで例外が出ると「DB は OPEN なのに filled_ids に無い」
+                # 注文が生まれ、_process_exits が entry_same_bar=False で
+                # 再評価して同一バー TP を誤確定させる (再レビュー N1 で実測)。
+                filled_ids.add(row["id"])
                 self.activity.write(Category.TRADE, "limit_filled",
                                     f"{row['pair']} @{price}",
                                     ref_id=str(row["id"]))
-                filled_ids.add(row["id"])
                 # 同一バーで SL/TP に到達し得る → 保守則で即時判定
                 filled = orders.get(self.conn, row["id"])
                 self._check_one_exit(filled, bar, entry_same_bar=True)
