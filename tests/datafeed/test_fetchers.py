@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from urllib.error import URLError
 
 import httpx
 import pytest
@@ -11,13 +12,22 @@ from agentic_fx.datafeed.fetchers import (
 )
 
 # 修正ラウンド 1: fetch_feed が parsed.bozo を見るようになったため、テスト
-# 二重の MagicMock (parsed 側) には bozo=False を明示する。MagicMock は
-# 未設定属性を自動生成し、その値 (別の MagicMock) は bool() で常に True
-# になるため、明示しないと「健全なフィード」のつもりの fixture が
+# 二重の MagicMock (parsed 側) には bozo=False を明示する必要がある。
+# MagicMock は未設定属性を自動生成し、その値 (別の MagicMock) は bool() で
+# 常に True になるため、明示しないと「健全なフィード」のつもりの fixture が
 # 軒並み bozo=True 扱いになってしまう (このモジュールの既存テストが
 # 実際にそれで壊れた — Task 7 修正ラウンド 1 の実測)。
-FEED_XML_PARSED = MagicMock()
-FEED_XML_PARSED.bozo = False
+#
+# **書き忘れを構造的に防ぐため、parsed の二重は必ずこのヘルパーで作る**
+# (再レビュー指摘: 素の MagicMock を直接書くと、書き忘れたテストが
+# 意図より弱くなる — caplog を見ないテストでは無音で弱くなる)。
+def _parsed(**kw) -> MagicMock:
+    """feedparser.parse の戻り値の二重。bozo は既定で False (= 健全)。"""
+    kw.setdefault("bozo", False)
+    return MagicMock(**kw)
+
+
+FEED_XML_PARSED = _parsed()
 FEED_XML_PARSED.entries = [
     MagicMock(link="https://ex.com/a1", title="Dollar rallies",
               summary="USD up on CPI",
@@ -57,7 +67,7 @@ def test_fetch_feed_falls_back_to_updated_parsed_for_atom():
     entry = MagicMock(link="https://ex.com/a3", title="ECB speaks",
                        summary="", published_parsed=None,
                        updated_parsed=(2026, 7, 21, 9, 30, 45, 1, 202, 0))
-    parsed = MagicMock(bozo=False, entries=[entry])
+    parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
         arts = fetch_feed("https://ex.com/atom", "example")
     assert arts[0].published == datetime(2026, 7, 21, 9, 30, 45,
@@ -71,7 +81,7 @@ def test_fetch_feed_skips_entry_missing_link():
                            summary="s1", published_parsed=None)
     bad = SimpleNamespace(title="no link", summary="s2",
                           published_parsed=None)
-    parsed = MagicMock(bozo=False, entries=[good, bad])
+    parsed = _parsed(entries=[good, bad])
     with patch("feedparser.parse", return_value=parsed):
         arts = fetch_feed("https://ex.com/rss", "example")
     assert len(arts) == 1
@@ -81,7 +91,7 @@ def test_fetch_feed_skips_entry_missing_link():
 def test_fetch_feed_missing_title_defaults_to_empty_string():
     entry = SimpleNamespace(link="https://ex.com/a1", summary="s1",
                             published_parsed=None)
-    parsed = MagicMock(bozo=False, entries=[entry])
+    parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
         arts = fetch_feed("https://ex.com/rss", "example")
     assert arts[0].title == ""
@@ -131,7 +141,7 @@ def test_fetch_feed_warns_on_unrecognized_tz_abbreviation(caplog):
         link="https://ex.com/jst", title="JST article", summary="",
         published_parsed=(2026, 7, 22, 1, 0, 0, 2, 203, 0),
         published="Wed, 22 Jul 2026 10:00:00 JST")
-    parsed = MagicMock(bozo=False, entries=[entry])
+    parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
             arts = fetch_feed("https://ex.com/rss", "example")
@@ -147,7 +157,7 @@ def test_fetch_feed_no_warning_for_numeric_offset(caplog):
         link="https://ex.com/a", title="t", summary="",
         published_parsed=(2026, 7, 22, 1, 0, 0, 2, 203, 0),
         published="Wed, 22 Jul 2026 10:00:00 +0900")
-    parsed = MagicMock(bozo=False, entries=[entry])
+    parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
             fetch_feed("https://ex.com/rss", "example")
@@ -159,7 +169,7 @@ def test_fetch_feed_no_warning_for_known_abbreviation(caplog):
         link="https://ex.com/a", title="t", summary="",
         published_parsed=(2026, 7, 22, 10, 0, 0, 2, 203, 0),
         published="Wed, 22 Jul 2026 10:00:00 GMT")
-    parsed = MagicMock(bozo=False, entries=[entry])
+    parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
             fetch_feed("https://ex.com/rss", "example")
@@ -173,7 +183,7 @@ def test_fetch_feed_no_warning_when_raw_date_missing(caplog):
     entry = SimpleNamespace(
         link="https://ex.com/a", title="t", summary="",
         published_parsed=(2026, 7, 22, 10, 0, 0, 2, 203, 0))
-    parsed = MagicMock(bozo=False, entries=[entry])
+    parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
             arts = fetch_feed("https://ex.com/rss", "example")
@@ -239,8 +249,11 @@ def test_fetch_web_propagates_http_error():
 # activity にも何も残らない。
 
 def test_fetch_feed_raises_when_bozo_and_no_entries():
-    parsed = MagicMock(bozo=True, entries=[],
-                       bozo_exception=ConnectionRefusedError("refused"))
+    # 実 feedparser がネットワーク失敗時に bozo_exception へ入れるのは
+    # urllib.error.URLError (再レビューが到達不能ホストで実測)。fixture を
+    # 実物に合わせる。
+    parsed = _parsed(bozo=True, entries=[],
+                     bozo_exception=URLError("Connection refused"))
     with patch("feedparser.parse", return_value=parsed):
         with pytest.raises(FeedFetchError):
             fetch_feed("https://dead.example/rss", "deadsource")
@@ -249,24 +262,25 @@ def test_fetch_feed_raises_when_bozo_and_no_entries():
 def test_fetch_feed_raise_message_has_no_url_or_raw_exception_text():
     # bozo_exception の str() に URL/ホスト名が乗ることがある想定
     # (urllib 由来のエラー等) — 型名のみ使い、生の str(e) も URL も
-    # メッセージに出さない。
-    parsed = MagicMock(
+    # メッセージに出さない。**実物の URLError の str() は URL を含まない**
+    # ため、ここでは URL を含む str() を持つ例外を意図的に使い、
+    # 「型名しか出さない」構造そのものにピンを打つ。
+    parsed = _parsed(
         bozo=True, entries=[],
-        bozo_exception=ConnectionRefusedError(
-            "Connection refused to dead.example:443"))
+        bozo_exception=URLError("Connection refused to dead.example:443"))
     with patch("feedparser.parse", return_value=parsed):
         with pytest.raises(FeedFetchError) as exc_info:
             fetch_feed("https://dead.example/rss", "deadsource")
     msg = str(exc_info.value)
     assert "dead.example" not in msg
     assert "443" not in msg
-    assert "ConnectionRefusedError" in msg  # 型名は診断のため残る
+    assert "URLError" in msg  # 型名は診断のため残る
 
 
 def test_fetch_feed_warns_but_returns_partial_when_bozo_with_entries(caplog):
     entry = MagicMock(link="https://ex.com/a1", title="t", summary="",
                       published_parsed=None, updated_parsed=None)
-    parsed = MagicMock(bozo=True, entries=[entry],
+    parsed = _parsed(bozo=True, entries=[entry],
                        bozo_exception=ValueError("malformed trailer"))
     with patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
@@ -275,13 +289,19 @@ def test_fetch_feed_warns_but_returns_partial_when_bozo_with_entries(caplog):
     assert len(arts) == 1
     messages = [r.getMessage() for r in caplog.records]
     assert any("partialsource" in m for m in messages)
+    # 失敗理由 (bozo_exception の型名) も残ること。これが無いと
+    # 「失敗は技術ログに残す」が例外側にしかピンが無く片肺になる
+    # (再レビューの変異テストで reason を落としても全緑だった)。
+    assert any("ValueError" in m for m in messages)
     assert "ex.com" not in " ".join(messages)  # URL を出さない
+    # 生の str(e) は出さない (型名のみ)
+    assert "malformed trailer" not in " ".join(messages)
 
 
 def test_fetch_feed_no_bozo_warning_when_bozo_false(caplog):
     # 非退行: bozo=False (健全なフィードがたまたま 0 件) では警告も
     # 例外も出さない
-    parsed = MagicMock(bozo=False, entries=[])
+    parsed = _parsed(entries=[])
     with patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
             arts = fetch_feed("https://ex.com/rss", "example")

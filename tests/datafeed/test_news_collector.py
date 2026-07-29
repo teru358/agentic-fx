@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
+from urllib.error import URLError
 
 from agentic_fx.activity import ActivityLog
 from agentic_fx.core.contracts import FixedClock
@@ -40,6 +41,14 @@ def test_seed_defaults_idempotent(tmp_path):
     # いなかった (レビューの変異テストで agent に変えても全緑と判明) ので
     # ここでピンを打つ。
     assert all(s["added_by"] == "user" for s in rows)
+    # 再レビューで判明した同型の穴: fetcher / url にもピンが無く、
+    # `url=s["name"]` (DB に URL でなく名前が入る) や fetcher の固定値化に
+    # 変えても全テストが緑だった。DEFAULT_SOURCES の各フィールドが
+    # そのまま DB に載ることを name をキーに突き合わせる。
+    by_name = {s["name"]: s for s in rows}
+    for src in DEFAULT_SOURCES:
+        assert by_name[src["name"]]["url"] == src["url"]
+        assert by_name[src["name"]]["fetcher"] == src["fetcher"]
 
 
 def test_seed_defaults_dedupes_within_default_sources_list(tmp_path, monkeypatch):
@@ -214,6 +223,13 @@ def test_collect_records_dead_feed_as_failure_and_continues(tmp_path, caplog):
     patch しない)、feedparser.parse だけを差し替えて実物の fetch_feed を
     通す — fetchers.py が FeedFetchError を送出し、それを collect の
     per-source except が拾うところまでを end-to-end で確認する。
+
+    **どのモジュールが記録したかまで見る** (再レビュー指摘): fetchers と
+    news_collector は同じ logger 名 (`agentic_fx.news`) を使うため、
+    メッセージ本文だけを見ると「fetchers が自分で warning を出しただけ」
+    でも通ってしまい、`collect` の except 経路を検証できていなかった
+    (実測: raise を同文面の warning に置換してもこのテストは緑のままだった)。
+    `record.module` で発生源を区別する。
     """
     conn, rag, col = _env(tmp_path)
     news_sources.add(conn, name="dead", fetcher="feed",
@@ -221,14 +237,18 @@ def test_collect_records_dead_feed_as_failure_and_continues(tmp_path, caplog):
                      added_by="user", now=NOW, enabled=True)
     news_sources.add(conn, name="good", fetcher="web", url="https://good",
                      added_by="user", now=NOW, enabled=True)
+    # 実 feedparser がネットワーク失敗時に bozo_exception へ入れるのは
+    # urllib.error.URLError (再レビューが実接続で確認)。fixture も実物に合わせる。
     dead_parsed = MagicMock(bozo=True, entries=[],
-                            bozo_exception=ConnectionRefusedError("refused"))
+                            bozo_exception=URLError("Connection refused"))
     with patch("feedparser.parse", return_value=dead_parsed), \
          patch("agentic_fx.datafeed.news_collector.fetch_web",
                return_value=[ART]), \
          caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
         total = col.collect()
     assert total == 1  # good だけ取り込まれる。dead は落ちない
+    from_collector = [r.getMessage() for r in caplog.records
+                      if r.module == "news_collector"]
+    assert any("dead" in m and "failed" in m for m in from_collector)
     messages = [r.getMessage() for r in caplog.records]
-    assert any("dead" in m and "failed" in m for m in messages)
     assert "dead.example" not in " ".join(messages)  # URL は出さない
