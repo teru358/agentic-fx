@@ -2146,6 +2146,19 @@ git commit -m "feat: econ カレンダー (ForexFactory 週間 JSON、fail soft)
 
 ### Task 9: init 拡張 (価格ソース接続確認) + 仕上げ
 
+> **実装済み (2026-07-29、commits `57a9ec9..95ed641`)。以下のコードは実装と一致しません**。**現在の正は `src/agentic_fx/service.py` / `src/agentic_fx/core/contracts.py`** です。変更点:
+>
+> 1. **`core/contracts.py` に `SystemClock` を新設**。逐語コードは `run_init` の中で無名クラス `_Now` を作っていたが、**本番用の実時計がリポジトリに存在しなかった** (`Clock` Protocol と `FixedClock` のみ)。プラン 5 の service 配線でも同じものが要る。`FixedClock` と同形 (frozen + slots)、常に tz-aware UTC
+> 2. **`DataUnhealthy` のメッセージを `safe_error_text` に通してから print する** (多層防御)。init の標準出力は人が見てコピペする場所で、技術ログより秘密が漏れたときの帰結が重い
+> 3. **`DataUnhealthy` 以外は握り潰さない**。設定ミスや実装バグまで警告に落とすと init が「常に成功するだけ」のコマンドになる。この確認を **`store.update(initialized=True)` の前**に置くことで、想定外の例外時は未初期化のまま残り起動ガードが引き続き止める (配置が線引きの成立条件)
+> 4. **成功時の出力に確認対象ペアを含める**。config は複数ペアを許すが `healthcheck` は先頭 1 ペアしか見ないため、無限定の「OK」は 2 ペア目以降が壊れていても OK に見える
+> 5. **`tests/test_wiring.py` を新設**。プラン 2 の注入点への適合を目視でなく**実インスタンスを組み立てて実行**で確認する
+> 6. `settings.pairs[0]` は `config.py` の `Field(min_length=1)` が空を弾くので欠陥ではない (回帰ピンのみ追加)
+>
+> **レビューで判明した cross-plan の欠陥 2 件 (このタスクのスコープ外・未修正)**:
+> - 🚨 **`Scheduler.on_news_cycle` は市場クローズ中の tick からしか到達しない** (`scheduler.py:67` が `if not open_now:` ブロック内で、そのブロックは `return` する)。`is_market_open` は金 17:00 NY〜日 17:00 NY のみ false なので、**ニュース収集は週末しか走らない**。14 日間の実測で news cycle 192 回はすべて金夜〜日夕、取引 Mission 240 回はすべて「最終更新が最大 5 日前の RAG」を読む。`cleanup_news(48h)` も `collect()` の中にしかないので平日は掃除も走らず、RAG は**空にならず凍結して古くなる**。`search_news` は `published` も `added_at` も返さないため**エージェントも人間も古さを判別できない**。欠陥の所在は**プラン 2 の逐語コード** (`phase1-2-core.md:2155`)
+> - 🚨 **`EconCalendar.refresh` の呼び出し元が src / プラン 4 / プラン 5 のどこにも無い**。プラン 5 は `EconCalendar` を構築して `upcoming` だけ使うため、`econ_events` は永久に空のまま「予定なし」を返し続ける (例外は出ない)。**プラン 5 の計画の穴**
+
 **Files:**
 - Modify: `src/agentic_fx/service.py`
 - Modify: `tests/test_init_and_guard.py`
