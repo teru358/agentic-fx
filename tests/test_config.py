@@ -173,6 +173,22 @@ def test_empty_primary_intervals_rejected(tmp_path):
         load_settings(_with_datafeed(tmp_path, primary_intervals=[]))
 
 
+def test_empty_pairs_rejected(tmp_path):
+    """空の pairs を設定検証で弾く。
+
+    init / trade_loop の fail closed は `settings.pairs[0]` を確認対象に
+    するため、ここが通ると IndexError で init が例外死する。検証で弾かれる
+    ことをテストで固定しておく (min_length=1 が消えたら落ちる)。
+    """
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["pairs"] = []
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError, match="pairs"):
+        load_settings(p)
+
+
 def test_invalid_display_timezone_rejected(tmp_path):
     import yaml
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))

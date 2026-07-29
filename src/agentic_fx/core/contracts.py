@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Literal, Protocol
 
@@ -118,6 +118,25 @@ class FixedClock:
 
     def now(self) -> datetime:
         return self.fixed
+
+
+@dataclass(frozen=True, slots=True)
+class SystemClock:
+    """本番用の実時計 (Clock の唯一の実装。FixedClock はテスト用)。
+
+    **必ず tz-aware な UTC を返す** — `datetime.now()` (naive) や
+    `datetime.now().astimezone()` (ローカルの aware) は使わない。naive は
+    プロジェクトの絶対制約に反し、ローカル aware は ISO 文字列として比較・
+    整列する store 層 (econ_events / snapshots / orders) でオフセットが
+    混ざり、範囲検索と順序が無音で壊れる。
+
+    実時計が必要な入口 (init の価格ソース確認、プラン 5 の service 配線) は
+    その場で無名クラスを作らずこれを使う — 実装が分散すると片方だけ
+    naive に退行しても気づけない。
+    """
+
+    def now(self) -> datetime:
+        return datetime.now(timezone.utc)
 
 
 class IntentParseError(ValueError):

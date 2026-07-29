@@ -8,7 +8,11 @@ from pathlib import Path
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_settings
-from agentic_fx.core.contracts import Mode
+from agentic_fx.core.contracts import Mode, SystemClock
+from agentic_fx.datafeed._safe_error import safe_error_text
+from agentic_fx.datafeed.health import DataUnhealthy
+from agentic_fx.datafeed.news_collector import seed_default_sources
+from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.logging_setup import setup_technical_logging
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.state import StateStore
@@ -42,6 +46,29 @@ def run_init(root: Path) -> int:
 
     conn = connect(root / "data" / "agentic.db")
     init_db(conn)
+
+    clock = SystemClock()
+    seeded = seed_default_sources(conn, clock.now())
+    if seeded:
+        print(f"基本ニュースソースを {seeded} 件登録しました")
+
+    # 価格ソースの接続確認。**DataUnhealthy は警告に留めて init は成功させる**
+    # (オフライン環境でも初期化を完了できるようにする。データ不健全時に取引を
+    # 止める本防御線はサービス起動後の fail closed — 設計書 §5)。
+    # ただし DataUnhealthy 以外は握り潰さない: 設定ミスや実装バグまで警告に
+    # 落とすと init が「常に成功する」だけのコマンドになり、確認の意味が
+    # 無くなる。この確認は state 更新より前に置いてあるので、想定外の例外で
+    # 落ちた場合は未初期化のまま残り、起動ガードが引き続き止める。
+    try:
+        source = PriceProvider(conn, settings, clock).healthcheck(
+            settings.pairs[0])   # pairs は空を config が弾く (min_length=1)
+    except DataUnhealthy as e:
+        # safe_error_text を再度通す (多層防御)。init の標準出力は人が見て
+        # コピペする場所で、技術ログより秘密が漏れたときの帰結が重い
+        print(f"警告: 価格ソースに接続できません ({safe_error_text(e)})。"
+              "サービス起動後は fail closed で保護されます。")
+    else:
+        print(f"価格ソース OK (source={source})")
 
     # learning への切替はモード遷移ガード (§3) を通る mode コマンドのみ。
     # init はガードの迂回路にしない: trading 中は mode/autopilot に触れない。

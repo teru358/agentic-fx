@@ -1,10 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from agentic_fx.core.contracts import (
-    Action, Direction, EntryType, Horizon, IntentParseError,
-    Origin, OrderStatus, FixedClock, TradeIntent,
+    Action, Clock, Direction, EntryType, Horizon, IntentParseError,
+    Origin, OrderStatus, FixedClock, SystemClock, TradeIntent,
 )
 
 
@@ -116,6 +116,24 @@ def test_order_status_has_all_states():
 def test_fixed_clock():
     dt = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
     assert FixedClock(dt).now() == dt
+
+
+def test_system_clock_returns_tz_aware_utc():
+    """本番用の実時計。naive を作らない (プロジェクト絶対制約)。"""
+    before = datetime.now(timezone.utc)
+    got = SystemClock().now()
+    after = datetime.now(timezone.utc)
+    assert got.tzinfo is not None
+    # tz-aware なだけでなく **UTC** であること (ローカル時刻の aware を返すと
+    # ISO 文字列で保存・比較する store 側で窓が無音でずれる)
+    assert got.utcoffset() == timedelta(0)
+    assert before <= got <= after
+
+
+def test_system_clock_satisfies_clock_protocol():
+    """Clock を要求する注入点にそのまま渡せること (構造的部分型)。"""
+    clock: Clock = SystemClock()
+    assert isinstance(clock.now(), datetime)
 
 
 def test_ref_price_defaults_to_none():

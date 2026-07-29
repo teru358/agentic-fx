@@ -1,7 +1,14 @@
-import pytest
+from unittest.mock import patch
 
+import httpx
+import pytest
+import yaml
+
+from agentic_fx.datafeed.health import DataUnhealthy
+from agentic_fx.datafeed.news_collector import DEFAULT_SOURCES
 from agentic_fx.entry import main as entry_main
 from agentic_fx.service import ensure_initialized, run_init
+from agentic_fx.store import news_sources
 from agentic_fx.store.db import connect
 from agentic_fx.store.state import StateStore
 
@@ -10,6 +17,40 @@ def _example(root):
     (root / "config").mkdir(parents=True)
     src = open("config/settings.yaml.example", encoding="utf-8").read()
     (root / "config" / "settings.yaml.example").write_text(src)
+
+
+def _settings(root, **datafeed):
+    """example を元に settings.yaml を先に置く (init は既存を上書きしない)。
+
+    価格ソースの構成をテスト毎に変えるために使う。
+    """
+    raw = yaml.safe_load(
+        (root / "config" / "settings.yaml.example").read_text(encoding="utf-8"))
+    for key, value in datafeed.items():
+        raw["datafeed"][key] = value
+    (root / "config" / "settings.yaml").write_text(
+        yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def mock_price_check():
+    """既定で価格ソース確認をモックする — テストは外部アクセスしない (§9)。
+
+    init は実ネットワークを叩く healthcheck を含むため、モックしないと
+    既存テスト (init_creates_everything 等) が本物の yfinance を呼ぶ。
+    本物の PriceProvider を通したいテストは `real_price_provider` を要求する。
+    """
+    with patch("agentic_fx.service.PriceProvider") as mock:
+        mock.return_value.healthcheck.return_value = "yfinance"
+        yield mock
+
+
+@pytest.fixture
+def real_price_provider(mock_price_check):
+    """autouse のモックの上に本物のクラスを被せる (opt-in)。"""
+    from agentic_fx.datafeed.price_provider import PriceProvider
+    with patch("agentic_fx.service.PriceProvider", PriceProvider) as real:
+        yield real
 
 
 def test_guard_blocks_before_init(tmp_path):
@@ -70,4 +111,172 @@ def test_entry_default_requires_init(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     with pytest.raises(SystemExit) as e:
         entry_main([])
+    assert e.value.code == 2
+
+
+def test_init_without_example_returns_1(tmp_path, capsys):
+    """example が無いときの失敗経路 (戻り値 1) を固定する。
+
+    変異テストで、この `return 1` を `return 0` にしても全テストが通って
+    しまう (未ピン) ことが判明したため追加。
+    """
+    (tmp_path / "config").mkdir(parents=True)
+    assert run_init(tmp_path) == 1
+    assert "settings.yaml.example" in capsys.readouterr().err
+    with pytest.raises(SystemExit):     # 初期化済みにはならない
+        ensure_initialized(tmp_path)
+
+
+# ---- Task 9: 基本ニュースソース投入 + 価格ソース接続確認 --------------------
+
+
+def test_init_seeds_news_sources_and_checks_price(tmp_path, capsys,
+                                                  mock_price_check):
+    _example(tmp_path)
+    assert run_init(tmp_path) == 0
+    conn = connect(tmp_path / "data" / "agentic.db")
+    # 件数リテラルに結合しない (ソース選定は後日見直される)。list_enabled で
+    # 数えることで「全件 enabled で入る」ことも同時に固定する
+    assert len(news_sources.list_enabled(conn)) == len(DEFAULT_SOURCES)
+    out = capsys.readouterr().out
+    assert "価格ソース OK (source=yfinance)" in out
+    # 件数リテラルを書かない。tmp_path に数字が混ざるので部分一致では
+    # 弱すぎる (print を消しても通ってしまう) — 文言ごと突き合わせる
+    assert f"基本ニュースソースを {len(DEFAULT_SOURCES)} 件登録しました" in out
+    # 確認するのは設定の先頭ペア (プラン 5 の fail closed と同じ対象)
+    mock_price_check.return_value.healthcheck.assert_called_once_with("USDJPY")
+
+
+def test_init_seeding_is_idempotent(tmp_path, capsys):
+    _example(tmp_path)
+    run_init(tmp_path)
+    capsys.readouterr()
+    assert run_init(tmp_path) == 0
+    conn = connect(tmp_path / "data" / "agentic.db")
+    assert len(news_sources.list_all(conn)) == len(DEFAULT_SOURCES)
+    # 2 回目は「登録しました」を出さない (0 件を報告しない)
+    assert "ニュースソース" not in capsys.readouterr().out
+
+
+def test_init_survives_price_check_failure(tmp_path, capsys, mock_price_check):
+    """オフライン等で価格ソースが全滅しても init は完了する (警告のみ)。"""
+    _example(tmp_path)
+    mock_price_check.return_value.healthcheck.side_effect = \
+        DataUnhealthy("all down")
+    assert run_init(tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "警告" in out and "all down" in out
+    # 警告で終わっても初期化自体は完了していること (次回起動でガードに落ちない)
+    state = StateStore(tmp_path / "data" / "state" / "app_state.json").load()
+    assert state.initialized is True
+    ensure_initialized(tmp_path)
+
+
+def test_init_completes_offline_with_unreachable_bridge(tmp_path, capsys,
+                                                        real_price_provider):
+    """**本物の** PriceProvider で、実際に到達不能なソースを叩いて完了すること。
+
+    モックではなく閉じたローカルポートへ実接続する (外部ホストには触れない)。
+    httpx.ConnectError がソース層から上がる経路を実際に通し、
+    「オフラインでも init が完了する」を経路ごと確かめる。
+    """
+    _example(tmp_path)
+    _settings(tmp_path, yfinance={"enabled": False},
+              twelvedata={"enabled": False},
+              mt5={"enabled": True, "bridge_url": "http://127.0.0.1:1"})
+    assert run_init(tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "警告" in out
+    # ネットワーク層の例外が実際に通った証跡 (モックした風ではないこと)
+    assert "mt5: ConnectError" in out
+    ensure_initialized(tmp_path)
+
+
+def test_init_completes_when_every_source_refuses(tmp_path, capsys,
+                                                  monkeypatch,
+                                                  real_price_provider):
+    """3 ソースすべてが接続エラーでも完了する (yfinance 分岐も含めて網羅)。"""
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "k")
+    _example(tmp_path)
+    _settings(tmp_path, yfinance={"enabled": True},
+              twelvedata={"enabled": True},
+              mt5={"enabled": True, "bridge_url": "http://127.0.0.1:1"})
+    err = httpx.ConnectError("[Errno -3] Temporary failure in name resolution")
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_quote",
+               side_effect=err), \
+         patch("agentic_fx.datafeed.price_provider.sources.td_quote",
+               side_effect=err), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               side_effect=OSError("network is unreachable")):
+        assert run_init(tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "警告" in out
+    # 3 ソース全部の失敗が 1 つの DataUnhealthy に集約されて警告になる
+    for name in ("mt5", "twelvedata", "yfinance"):
+        assert name in out
+
+
+def test_init_price_warning_does_not_leak_api_key(tmp_path, capsys, monkeypatch,
+                                                  real_price_provider):
+    """**標準出力**に API キーが出ないこと。
+
+    init の出力は人が見てコピペする場所であり、技術ログより漏洩の帰結が重い。
+    price_provider 側の抑止 (_safe_error) が init の print 経路まで届いて
+    いることを、TD の 401 を実際に起こして確かめる。
+    """
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "SECRET_KEY_123")
+    _example(tmp_path)
+    _settings(tmp_path, yfinance={"enabled": False},
+              twelvedata={"enabled": True}, mt5={"enabled": False})
+    url = ("https://api.twelvedata.com/quote"
+           "?symbol=USD%2FJPY&apikey=SECRET_KEY_123")
+    req = httpx.Request("GET", url)
+    err = httpx.HTTPStatusError(
+        f"Client error '401 Unauthorized' for url '{url}'",
+        request=req, response=httpx.Response(401, request=req))
+    with patch("agentic_fx.datafeed.price_provider.sources.td_quote",
+               side_effect=err):
+        assert run_init(tmp_path) == 0
+    cap = capsys.readouterr()
+    assert "SECRET_KEY_123" not in cap.out and "SECRET_KEY_123" not in cap.err
+    assert "api.twelvedata.com" not in cap.out   # URL ごと出さない
+    assert "401" in cap.out                      # 診断情報は残す
+    # 技術ログ側も同じ (logging_setup は propagate=False なのでファイルを見る)
+    log = (tmp_path / "logs" / "agentic.log").read_text(encoding="utf-8")
+    assert "SECRET_KEY_123" not in log
+
+
+def test_init_warning_redacts_secrets_in_the_exception_itself(tmp_path, capsys,
+                                                              mock_price_check):
+    """多層防御: DataUnhealthy のメッセージ自体に秘密が載っていても伏字にする。
+
+    現状 price_provider 側で抑止済みだが、そこに依存すると抑止層が 1 枚に
+    なる (将来のソース追加や、_safe_error を通さない DataUnhealthy 送出で
+    無音の穴が開く)。init の print 側でも通していることを固定する。
+    """
+    _example(tmp_path)
+    mock_price_check.return_value.healthcheck.side_effect = DataUnhealthy(
+        "boom while calling https://api.twelvedata.com/quote"
+        "?apikey=SECRET_KEY_123")
+    assert run_init(tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "SECRET_KEY_123" not in out
+    assert "boom" in out                # 診断情報は落とさない
+
+
+def test_init_does_not_swallow_unexpected_errors(tmp_path, mock_price_check):
+    """DataUnhealthy 以外は握り潰さない (init を「常に成功する」コマンドにしない)。
+
+    実装バグや設定ミスまで警告に落とすと init の意味が無くなる。
+    かつ healthcheck は state 更新の前に走るので、落ちた場合は
+    **未初期化のまま**残り、起動ガードが引き続き止める。
+    """
+    _example(tmp_path)
+    mock_price_check.return_value.healthcheck.side_effect = \
+        TypeError("bug in provider")
+    with pytest.raises(TypeError):
+        run_init(tmp_path)
+    with pytest.raises(SystemExit) as e:
+        ensure_initialized(tmp_path)
+    assert e.value.code == 2
     assert e.value.code == 2
