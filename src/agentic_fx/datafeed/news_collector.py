@@ -10,14 +10,12 @@ tz-aware UTC を強制する経路はそのまま素通しし、ここで naive 
 from __future__ import annotations
 
 import logging
-import re
 import sqlite3
 from datetime import datetime
 
-import httpx
-
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
+from agentic_fx.datafeed._safe_error import safe_error_text as _safe_error_text
 from agentic_fx.datafeed.default_sources import DEFAULT_SOURCES
 from agentic_fx.datafeed.fetchers import fetch_feed, fetch_web
 from agentic_fx.store import news_sources
@@ -27,25 +25,13 @@ _log = logging.getLogger("agentic_fx.news")
 
 __all__ = ["DEFAULT_SOURCES", "NewsCollector", "seed_default_sources"]
 
-# price_provider.py の _safe_error_text と同じパターン (多層防御)。
-# collector は複数ソースの失敗を集約してログに残すため、ソース URL に
-# 秘密が含まれるケース (added_by="agent" で追加された将来のソース等) を
-# 想定して同じ配慮を独立に持つ。private ヘルパーをモジュール間で import
-# するのではなく複製する方針は rag.py の _require_utc (sources.py の
-# _to_utc と同方針だが複製) に倣う。
-_SECRET_RE = re.compile(r"((?:api[-_]?key|apikey|token|secret)=)[^&\s'\"]+",
-                        re.IGNORECASE)
-
-
-def _safe_error_text(e: BaseException) -> str:
-    """例外を「技術ログに出してよい」文字列にする (URL を出さない)。"""
-    if isinstance(e, httpx.HTTPStatusError):
-        text = f"{type(e).__name__}: HTTP {e.response.status_code}"
-    elif isinstance(e, httpx.HTTPError):
-        text = type(e).__name__
-    else:
-        text = f"{type(e).__name__}: {e}"
-    return _SECRET_RE.sub(r"\1***", text)
+# 秘密抑止は datafeed/_safe_error.py の safe_error_text に一本化した
+# (Task 8)。collector は複数ソースの失敗を集約してログに残すため、ソース
+# URL に秘密が含まれるケース (added_by="agent" で追加された将来のソース等)
+# を想定して同じ配慮が要る。以前はここに同じ関数を複製していたが
+# (「private ヘルパーはモジュール間で import せず複製する」方針)、econ
+# カレンダーが 3 つ目の複製先になる時点でその方針は割に合わない —
+# 抑止パターンを 1 箇所で更新できないと片側だけ古いままになる。
 
 
 def seed_default_sources(conn: sqlite3.Connection, now: datetime) -> int:

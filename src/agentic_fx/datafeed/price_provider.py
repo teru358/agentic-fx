@@ -4,16 +4,14 @@ from __future__ import annotations
 import logging
 import math
 import os
-import re
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime
 
-import httpx
-
 from agentic_fx.config import Settings
 from agentic_fx.core.contracts import Bar, Clock, InstrumentSpec, Quote
 from agentic_fx.datafeed import sources
+from agentic_fx.datafeed._safe_error import safe_error_text as _safe_error_text
 from agentic_fx.datafeed.bars import bars_to_df, df_to_bars, pandas_rule, resample
 from agentic_fx.datafeed.health import (
     DataUnhealthy, validate_bars, validate_quote,
@@ -32,29 +30,9 @@ _log = logging.getLogger("agentic_fx.price")
 # 常に細かい足から導出し、システム内の格子を 1 つに保つ。
 DERIVE_ONLY_INTERVALS = frozenset({"4h", "1d"})
 
-# 例外メッセージから伏字にする秘密のパターン (多層防御)。Twelve Data は
-# apikey をクエリパラメータで送る仕様なので、httpx の例外文字列に URL ごと
-# 載る。URL 抑止 (_safe_error_text) を擦り抜けた経路でもここで止める。
-_SECRET_RE = re.compile(r"((?:api[-_]?key|apikey|token|secret)=)[^&\s'\"]+",
-                        re.IGNORECASE)
-
-
-def _safe_error_text(e: BaseException) -> str:
-    """例外を「外部に出してよい」文字列にする (ログ・DataUnhealthy 共通)。
-
-    これらのメッセージは mission 記録・activity・Discord 通知に載りうる。
-    httpx 由来は **URL を出さない** (秘密が載る) が、status code は診断に
-    要るので残す。自前の例外 (DataUnhealthy / ValueError 等) は URL を
-    含まないので情報量を落とさない。
-    """
-    if isinstance(e, httpx.HTTPStatusError):
-        text = f"{type(e).__name__}: HTTP {e.response.status_code}"
-    elif isinstance(e, httpx.HTTPError):
-        # ConnectError 等。message に URL が載る実装があるので型名だけにする
-        text = type(e).__name__
-    else:
-        text = f"{type(e).__name__}: {e}"
-    return _SECRET_RE.sub(r"\1***", text)
+# 秘密抑止 (_safe_error_text) は datafeed/_safe_error.py に一本化してある
+# (Task 8: 同じ関数が price_provider / news_collector に複製され、3 つ目が
+# 生じる時点で複製方針が割に合わなくなったため)。挙動は従前と同一。
 
 
 # Phase 1 は組み込みテーブル。Phase 3 で MT5 の symbol_info 照会に置換する
