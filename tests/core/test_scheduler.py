@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -5,6 +6,7 @@ import pytest
 
 from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
+from agentic_fx.core import market_hours
 from agentic_fx.core.accounting import record_snapshot
 from agentic_fx.core.contracts import (
     Bar, FixedClock, InstrumentSpec, Mode, Origin, Quote, TradeIntent,
@@ -26,7 +28,8 @@ QUOTE = Quote("USDJPY", 148.49, 148.51, WED, "test")
 
 
 class Env:
-    def __init__(self, tmp_path, quote_fn=None, base=WED):
+    def __init__(self, tmp_path, quote_fn=None, base=WED, news_fn=None,
+                 econ_fn=None):
         from agentic_fx.core.notifier import Notifier
         self.conn = connect(tmp_path / "t.db")
         init_db(self.conn)
@@ -36,6 +39,9 @@ class Env:
         self.bars: dict[str, Bar] = {}
         self.trade_calls = 0
         self.news_calls = 0
+        self.econ_calls = 0
+        self._news_fn = news_fn
+        self._econ_fn = econ_fn
         self.base = base
         clock = FixedClock(base)
         self.executor = Executor(
@@ -48,13 +54,21 @@ class Env:
             conn=self.conn, executor=self.executor, settings=SETTINGS,
             state_store=self.state, activity=ActivityLog(tmp_path / "a.log"),
             bars_fn=lambda p: self.bars.get(p),
-            on_trade_mission=self._trade, on_news_cycle=self._news)
+            on_trade_mission=self._trade, on_news_cycle=self._news,
+            on_econ_cycle=self._econ)
 
     def _trade(self):
         self.trade_calls += 1
 
     def _news(self):
         self.news_calls += 1
+        if self._news_fn is not None:
+            self._news_fn()
+
+    def _econ(self):
+        self.econ_calls += 1
+        if self._econ_fn is not None:
+            self._econ_fn()
 
     def place_limit(self, price=148.20, sl=147.80, tp=149.00, hours=4):
         it = TradeIntent.from_llm_dict(
@@ -76,15 +90,205 @@ def test_hourly_trade_mission(tmp_path):
     assert env.trade_calls == 2
 
 
-def test_market_closed_only_news(tmp_path):
+def test_market_closed_runs_data_cycles_but_no_trade_mission(tmp_path):
+    """非退行 (旧 test_market_closed_only_news): クローズ中は Mission を
+    回さないが、ニュース / econ の収集サイクルは従来どおり回る。
+
+    改名の理由: cross-plan 修正で news / econ は開場中も回るようになった
+    ため、「クローズ中**だけ** news」を意味する旧名は誤りになった。"""
     env = Env(tmp_path)
+    assert not market_hours.is_market_open(SAT)
     env.sched.tick(SAT)
     assert env.trade_calls == 0
     assert env.news_calls == 1
+    assert env.econ_calls == 1
     env.sched.tick(SAT + timedelta(minutes=10))
     assert env.news_calls == 1  # 30 分間隔
     env.sched.tick(SAT + timedelta(minutes=31))
     assert env.news_calls == 2
+
+
+# --- cross-plan 修正①: ニュース / econ は開場中も回る -------------------
+
+def test_news_and_econ_cycles_run_while_market_open(tmp_path):
+    """欠陥①の直接のピン。
+
+    旧実装は `on_news_cycle` の呼び出しが `if not open_now:` ブロック内の
+    1 箇所だけで、そのブロックは直後に return していた。市場は金 17:00 NY
+    〜日 17:00 NY しか閉じないため、ニュース収集 (と RAG の 48h 掃除) は
+    **週末しか走らなかった** (14 日実測で news cycle は全部週末、最大間隔
+    5 日)。econ も呼び出し口自体が存在しなかった。"""
+    env = Env(tmp_path)
+    assert market_hours.is_market_open(WED)
+    env.sched.tick(WED)
+    assert env.news_calls == 1
+    assert env.econ_calls == 1
+
+
+def test_news_interval_is_consistent_across_market_boundary(tmp_path):
+    """_NEWS_INTERVAL の間隔判定が開場・閉場をまたいで一貫すること
+    (閉場中に呼んだ直後に開場しても 30 分経つまで再度呼ばない)。"""
+    t_closed = datetime(2026, 7, 26, 20, 50, tzinfo=timezone.utc)  # 日 閉場
+    t_open = t_closed + timedelta(minutes=20)   # 日 21:10 UTC = NY 17:10 開場
+    t_later = t_closed + timedelta(minutes=35)
+    assert not market_hours.is_market_open(t_closed)
+    assert market_hours.is_market_open(t_open)
+
+    env = Env(tmp_path, base=t_closed)
+    env.sched.tick(t_closed)
+    assert env.news_calls == 1
+    env.sched.tick(t_open)          # 開場したが 20 分しか経っていない
+    assert env.news_calls == 1
+    env.sched.tick(t_later)
+    assert env.news_calls == 2
+
+
+def test_econ_interval_is_six_hours_and_consistent_across_boundary(tmp_path):
+    """_ECON_INTERVAL (6 時間) が開場・閉場をまたいで一貫すること。
+
+    6 時間: ForexFactory は**週次**の JSON を返すので 30 分ごとは無駄だが、
+    当日の forecast/previous は更新されうるので 1 日 1 回よりは細かくする。"""
+    t_closed = datetime(2026, 7, 26, 18, 0, tzinfo=timezone.utc)   # 日 閉場
+    t_open = t_closed + timedelta(hours=3, minutes=10)             # 開場後
+    t_later = t_closed + timedelta(hours=6, minutes=10)
+    assert not market_hours.is_market_open(t_closed)
+    assert market_hours.is_market_open(t_open)
+    assert market_hours.is_market_open(t_later)
+
+    env = Env(tmp_path, base=t_closed)
+    env.sched.tick(t_closed)
+    assert env.econ_calls == 1
+    env.sched.tick(t_open)          # 6 時間経っていない
+    assert env.econ_calls == 1
+    env.sched.tick(t_later)
+    assert env.econ_calls == 2
+
+
+def test_scheduler_requires_on_econ_cycle_without_default(tmp_path):
+    """`on_econ_cycle` にデフォルト値を与えないことのピン。
+
+    デフォルトの no-op を与えると「呼び忘れ」がまさに欠陥② (EconCalendar.
+    refresh の呼び出し元がどこにも無く econ_events が永久に空) として再発
+    する。デフォルトが無ければ、未配線の呼び出し元をテストが列挙してくれる。
+    他の必須引数を落として TypeError を得る書き方だとデフォルトの有無を
+    区別できないので、**完全な kwargs から on_econ_cycle だけを抜く**。"""
+    env = Env(tmp_path)
+    kwargs = dict(
+        conn=env.conn, executor=env.executor, settings=SETTINGS,
+        state_store=env.state, activity=ActivityLog(tmp_path / "a.log"),
+        bars_fn=lambda p: None, on_trade_mission=lambda: None,
+        on_news_cycle=lambda: None, on_econ_cycle=lambda: None)
+    assert Scheduler(**kwargs) is not None      # 完全な kwargs では構築できる
+    kwargs.pop("on_econ_cycle")
+    with pytest.raises(TypeError, match="on_econ_cycle"):
+        Scheduler(**kwargs)
+
+
+# --- cross-plan 修正②: データ経路の障害で資金保護を止めない -------------
+
+def _boom(msg="hook down"):
+    def _f():
+        raise RuntimeError(msg)
+    return _f
+
+
+def test_news_cycle_exception_does_not_stop_fill_and_exit_monitoring(tmp_path):
+    """修正 2 の核心: news cycle は tick の冒頭 (= _process_exits より前)
+    に移ったので、ニュース経路の障害が SL/TP 監視 (資金保護) を止めては
+    ならない。例外が起きた**その tick**で約定処理と SL 判定が走ること。"""
+    env = Env(tmp_path, news_fn=_boom("news down"))
+    oid = env.place_limit(price=148.20, sl=147.80, tp=149.00)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                             148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert env.news_calls == 1                     # 例外を投げた
+    assert orders.get(env.conn, oid)["status"] == "open"
+    # 30 分後 = news が再び呼ばれる tick で SL に到達させる
+    later = WED + timedelta(minutes=31)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", later, 147.60, 147.65, 147.50,
+                             147.55, 100)
+    env.sched.tick(later)
+    assert env.news_calls == 2
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "closed"
+    assert row["close_reason"] == "sl"
+
+
+def test_econ_cycle_exception_does_not_stop_fill_and_exit_monitoring(tmp_path):
+    env = Env(tmp_path, econ_fn=_boom("econ down"))
+    oid = env.place_limit(price=148.20, sl=147.80, tp=149.00)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                             148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert env.econ_calls == 1
+    assert orders.get(env.conn, oid)["status"] == "open"
+    # 6 時間後 = econ が再び呼ばれる tick で SL に到達させる
+    later = WED + timedelta(hours=6, minutes=1)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", later, 147.60, 147.65, 147.50,
+                             147.55, 100)
+    env.sched.tick(later)
+    assert env.econ_calls == 2
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "closed"
+    assert row["close_reason"] == "sl"
+
+
+def test_hook_exception_does_not_stop_market_close_cancellation(tmp_path):
+    """クローズ移行時の未約定実指値の取消 (監視外に残さない = 資金保護) も、
+    冒頭に移った news / econ の障害で止まってはならない。"""
+    env = Env(tmp_path, base=FRI, news_fn=_boom(), econ_fn=_boom())
+    oid = env.place_limit(hours=12)
+    env.state.update(mode=Mode.TRADING)
+    fri_2101 = datetime(2026, 7, 24, 21, 1, tzinfo=timezone.utc)
+    env.sched.tick(fri_2101)
+    assert env.news_calls == 1 and env.econ_calls == 1   # 両方が例外を投げた
+    assert orders.get(env.conn, oid)["status"] == "cancelled"
+
+
+def test_hook_failure_is_recorded_in_activity_and_log_without_secrets(
+        tmp_path, caplog):
+    """無音で握り潰さない: 技術ログ (warning) と activity の**両方**に残る。
+    メッセージは safe_error_text を通し、URL / 秘密を出さない。"""
+    import httpx
+
+    def news_boom():
+        raise httpx.ConnectError(
+            "connect failed: https://news.example.com/feed?apikey=SECRET")
+
+    def econ_boom():
+        raise RuntimeError("econ down (apikey=SECRET)")
+
+    env = Env(tmp_path, news_fn=news_boom, econ_fn=econ_boom)
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.scheduler"):
+        env.sched.tick(WED)
+    act = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "news_cycle_error" in act
+    assert "econ_cycle_error" in act
+    both = act + caplog.text
+    assert "news cycle failed" in caplog.text
+    assert "econ cycle failed" in caplog.text
+    assert "SECRET" not in both                  # 秘密は伏字
+    assert "news.example.com" not in both        # httpx 由来は URL を出さない
+    assert "ConnectError" in both                # 型名は診断のため残す
+    assert "RuntimeError" in both
+
+
+def test_failed_hook_still_advances_the_interval(tmp_path):
+    """失敗しても `_last_news` / `_last_econ` を進める (毎 tick 再試行しない)。
+
+    根拠: hook は _process_exits (資金保護) より前に立つので、**遅い失敗**
+    (HTTP タイムアウト) を毎 tick 再試行すると、その遅延を毎 tick 資金保護
+    に負わせることになる。ニュース / econ は fail-open なので、間隔を空けて
+    再試行するほうが安全側。"""
+    env = Env(tmp_path, news_fn=_boom(), econ_fn=_boom())
+    env.sched.tick(WED)
+    assert (env.news_calls, env.econ_calls) == (1, 1)
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert (env.news_calls, env.econ_calls) == (1, 1)   # 即座に再試行しない
+    env.sched.tick(WED + timedelta(minutes=31))
+    assert (env.news_calls, env.econ_calls) == (2, 1)
+    env.sched.tick(WED + timedelta(hours=6, minutes=1))
+    assert (env.news_calls, env.econ_calls) == (3, 2)
 
 
 def test_limit_expiry_cancelled(tmp_path):

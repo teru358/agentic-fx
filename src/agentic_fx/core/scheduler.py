@@ -12,11 +12,15 @@ from agentic_fx.core import accounting, market_hours, transitions
 from agentic_fx.core.contracts import Bar, Mode, OrderStatus as S
 from agentic_fx.core.executor import Executor, open_risk_and_notional
 from agentic_fx.core.paper_fills import check_exit, check_limit_fill
+from agentic_fx.datafeed._safe_error import safe_error_text
 from agentic_fx.store import orders
 from agentic_fx.store.state import StateStore
 
 _log = logging.getLogger("agentic_fx.scheduler")
 _NEWS_INTERVAL = timedelta(minutes=30)
+# 経済指標カレンダーは **週次** の JSON なので 30 分ごとに取り直しても無駄。
+# ただし当日の forecast/previous は更新されうるので 1 日 1 回よりは細かく。
+_ECON_INTERVAL = timedelta(hours=6)
 _DAY_CLOSE_BUFFER = timedelta(minutes=5)
 _BAR_FRESHNESS = timedelta(minutes=5)
 
@@ -37,7 +41,8 @@ class Scheduler:
                  activity: ActivityLog,
                  bars_fn: Callable[[str], Bar | None],
                  on_trade_mission: Callable[[], None],
-                 on_news_cycle: Callable[[], None]) -> None:
+                 on_news_cycle: Callable[[], None],
+                 on_econ_cycle: Callable[[], None]) -> None:
         self.conn = conn
         self.executor = executor
         self.settings = settings
@@ -46,12 +51,40 @@ class Scheduler:
         self.bars_fn = bars_fn
         self.on_trade_mission = on_trade_mission
         self.on_news_cycle = on_news_cycle
+        # on_econ_cycle は **デフォルト値を与えない** (キーワード必須)。
+        # no-op のデフォルトを置くと「配線し忘れ」が無音で成立してしまい、
+        # まさに cross-plan 欠陥② (EconCalendar.refresh の呼び出し元がどこ
+        # にも無く econ_events が永久に空、例外も出ないのでエージェントが
+        # 「重要指標の前ではない」と誤認する) が再発する。必須にしておけば
+        # 未配線の呼び出し元は TypeError で列挙される。
+        self.on_econ_cycle = on_econ_cycle
         self._last_trade: datetime | None = None
         self._last_news: datetime | None = None
+        self._last_econ: datetime | None = None
         self._was_open: bool | None = None
         self._processed_bar_ts: dict[str, datetime] = {}
 
     def tick(self, now: datetime) -> None:
+        # cross-plan 修正①: データ収集サイクルは tick の **冒頭** (開場判定
+        # より前) で回す。
+        # - 開場・閉場を 1 箇所でカバーでき、同じロジックの重複を作らない。
+        #   以前はクローズ側ブロック (直後に return) の中にしか呼び出しが
+        #   無く、市場は金 17:00 NY〜日 17:00 NY しか閉じないため、ニュース
+        #   収集も RAG の 48h 掃除も **週末しか走らなかった** (実測: 14 日で
+        #   news cycle は全部週末、最大間隔 5 日)。
+        # - `_mark_to_market` の早期 return より前 = mark-to-market が失敗
+        #   する tick でもニュースは取れる (ニュースは価格と独立)。
+        # - `on_trade_mission` より前 = Mission が最新のニュースを読む。
+        # 冒頭に置いた代償として、これらの経路の障害が _process_exits
+        # (SL/TP 監視 = 資金保護) より前に立つ。だから呼び出しは必ず
+        # _run_data_hook 経由 (fail-open) にすること。
+        if self._last_news is None or now - self._last_news >= _NEWS_INTERVAL:
+            self._last_news = now
+            self._run_data_hook("news", self.on_news_cycle)
+        if self._last_econ is None or now - self._last_econ >= _ECON_INTERVAL:
+            self._last_econ = now
+            self._run_data_hook("econ", self.on_econ_cycle)
+
         open_now = market_hours.is_market_open(now)
         if not open_now:
             # レビュー修正 4: _was_open はプロセスメモリのみに保持される。
@@ -62,9 +95,6 @@ class Scheduler:
             if self._was_open is not False:
                 self._on_market_close(now)
             self._was_open = False
-            if self._last_news is None or now - self._last_news >= _NEWS_INTERVAL:
-                self._last_news = now
-                self.on_news_cycle()
             return
         self._was_open = True
 
@@ -100,6 +130,31 @@ class Scheduler:
             self.on_trade_mission()
 
     # ---- internal -------------------------------------------------------
+
+    def _run_data_hook(self, kind: str, fn: Callable[[], None]) -> None:
+        """ニュース / econ の収集フックを fail-open で呼ぶ。
+
+        cross-plan 修正②: これらは tick の冒頭 = `_process_exits`
+        (SL/TP 監視 = 資金保護) より前に立つ。ニュース・経済指標は
+        「欠損で取引を止めるデータではない」(fail-open) 一方、資金保護は
+        絶対なので、収集経路の例外を tick に貫通させてはならない。
+
+        ただし **無音では握り潰さない** — 技術ログ (warning) と activity の
+        両方に残す。activity に出ないと恒常的な失敗が人の目に触れる経路が
+        無くなる。例外テキストは `safe_error_text` を通す (フックの実体は
+        外部 HTTP を叩くので、例外文字列に URL や API キーが載りうる)。
+
+        SYSTEM カテゴリなのは、フックが例外を漏らした時点で **フック自身の
+        fail-soft 契約が破れている** (= システム側の異常) から。ソース単位の
+        通常の取得失敗は NewsCollector / EconCalendar が NEWS カテゴリで
+        既に記録している。
+        """
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 — 資金保護を止めない (fail-open)
+            text = safe_error_text(e)
+            _log.warning("%s cycle failed: %s", kind, text)
+            self.activity.write(Category.SYSTEM, f"{kind}_cycle_error", text)
 
     def _fresh_bar(self, pair: str, now: datetime) -> Bar | None:
         """鮮度検証 + 同一バー再処理防止を通ったバーのみ返す。"""

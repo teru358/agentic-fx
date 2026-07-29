@@ -45,7 +45,8 @@ def test_full_paper_cycle(tmp_path):
                       state_store=state, activity=activity,
                       bars_fn=lambda p: bars.get(p),
                       on_trade_mission=lambda: None,
-                      on_news_cycle=lambda: None)
+                      on_news_cycle=lambda: None,
+                      on_econ_cycle=lambda: None)
 
     # 1. 手製 intent (指値 open)
     intent = TradeIntent.from_llm_dict(

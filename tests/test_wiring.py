@@ -44,7 +44,7 @@ def _bars(pair="USDJPY", n=40, interval="1m", now=OPEN_NOW):
                 148.0, 148.1, 147.9, 148.05, 10) for i in range(n)]
 
 
-def _env(tmp_path, now):
+def _env(tmp_path, now, on_econ_cycle=None):
     from tests.store.test_rag import FakeEmbedding
     settings = load_settings(EXAMPLE)
     conn = connect(tmp_path / "t.db")
@@ -63,12 +63,16 @@ def _env(tmp_path, now):
         conn, Rag(tmp_path / "rag", embedding_function=FakeEmbedding()),
         activity, clock)
     trade_calls: list[int] = []
+    econ_calls: list[int] = []
     scheduler = Scheduler(
         conn=conn, executor=executor, settings=settings, state_store=state,
         activity=activity,
         bars_fn=provider.latest_1m_bar,          # ★ 注入点
         on_trade_mission=lambda: trade_calls.append(1),
-        on_news_cycle=collector.collect)         # ★ 注入点
+        on_news_cycle=collector.collect,         # ★ 注入点
+        # econ は既定ではカウンタ (EconCalendar.refresh は fetch_ff_calendar を
+        # 直接呼ぶため、既定で渡すとこのファイルの全 tick が外部アクセスする)
+        on_econ_cycle=on_econ_cycle or (lambda: econ_calls.append(1)))
     return provider, executor, scheduler, trade_calls
 
 
@@ -105,12 +109,6 @@ def test_scheduler_bars_fn_tolerates_unhealthy_feed(tmp_path):
 def test_scheduler_news_cycle_accepts_collector_collect(tmp_path):
     """クローズ中の tick が on_news_cycle=collector.collect を**本物のまま**呼ぶ。
 
-    **CLOSED_NOW を使うのは任意の選択ではない**: `Scheduler.tick` の
-    `on_news_cycle` 呼び出しは `if not open_now:` ブロック内の 1 箇所しかなく
-    (その直後に return)、市場オープン中の tick からは決して到達しない。
-    市場は週末しか閉じないため、この配線のままでは平日にニュースが 1 度も
-    収集されない (task-9-report.md §6-1 の申し送り)。
-
     collect をモックすると引数の食い違いを検出できないので実物を通す
     (news_sources は空なのでフェッチは起きない = 外部アクセスなし)。
     NewsCollector.collect は int を返すが Scheduler の注釈は
@@ -121,3 +119,45 @@ def test_scheduler_news_cycle_accepts_collector_collect(tmp_path):
     scheduler.tick(CLOSED_NOW)
     act = (tmp_path / "activity.log").read_text(encoding="utf-8")
     assert "collected" in act           # collect() が最後まで走った証跡
+
+
+def test_scheduler_news_cycle_runs_on_open_market_tick(tmp_path):
+    """cross-plan 修正①: **開場中**の tick でも本物の collect が走る。
+
+    旧実装では `on_news_cycle` の呼び出しが `if not open_now:` ブロック内の
+    1 箇所しかなく (その直後に return)、開場中の tick からは決して到達
+    しなかった。市場は週末しか閉じないため、平日はニュース収集も RAG の
+    48h 掃除も 1 度も走らなかった (task-9-report.md §6-1 の申し送り)。
+    """
+    _, _, scheduler, _ = _env(tmp_path, OPEN_NOW)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_bars()):
+        scheduler.tick(OPEN_NOW)
+    act = (tmp_path / "activity.log").read_text(encoding="utf-8")
+    assert "collected" in act
+
+
+def test_scheduler_econ_cycle_accepts_econ_calendar_refresh(tmp_path):
+    """cross-plan 修正②: `on_econ_cycle` 注入点に本物の
+    `EconCalendar.refresh` が嵌まり、tick から実際に呼ばれて
+    econ_events に保存されること (呼び出し元がどこにも無かったのが欠陥②)。
+
+    外部アクセスはしない — sources 層に相当する `fetch_ff_calendar` だけを
+    patch し、その先の変換・保存は本物を通す。"""
+    from agentic_fx.core.contracts import FixedClock
+    from agentic_fx.datafeed.econ_calendar import CalendarFetch, EconCalendar
+    from agentic_fx.store import econ_events
+
+    conn = connect(tmp_path / "econ.db")
+    init_db(conn)
+    activity = ActivityLog(tmp_path / "econ_activity.log")
+    cal = EconCalendar(conn, activity, FixedClock(CLOSED_NOW))
+    _, _, scheduler, _ = _env(tmp_path, CLOSED_NOW, on_econ_cycle=cal.refresh)
+    events = [{"ts": CLOSED_NOW + timedelta(hours=2), "country": "USD",
+               "name": "Nonfarm Payrolls", "importance": 3,
+               "forecast": "150K", "previous": "140K"}]
+    with patch("agentic_fx.datafeed.econ_calendar.fetch_ff_calendar",
+               return_value=CalendarFetch(events=events, dropped=0)) as m:
+        scheduler.tick(CLOSED_NOW)
+    assert m.called
+    assert len(econ_events.upcoming(conn, CLOSED_NOW, hours=24)) == 1
