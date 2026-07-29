@@ -5,6 +5,7 @@ import sqlite3
 from datetime import timedelta
 from typing import Callable
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import Settings
 from agentic_fx.core import accounting, transitions
@@ -169,7 +170,8 @@ class Executor:
         try:
             br = self.broker.submit(row, entry_price=result.entry_price)
         except Exception as e:  # noqa: BLE001
-            br = BrokerResult(status="unknown", message=str(e))
+            br = BrokerResult(status="unknown",
+                              message=safe_error_text(e))
         if br.status == "rejected":
             transitions.transition(self.conn, oid, S.REJECTED, now)
             self.activity.write(Category.TRADE, "broker_rejected",
@@ -236,7 +238,8 @@ class Executor:
         try:
             br = self.broker.close(row, price, reason)
         except Exception as e:  # noqa: BLE001 — 結果不明として扱う (codex 2)
-            br = BrokerResult(status="unknown", message=str(e))
+            br = BrokerResult(status="unknown",
+                              message=safe_error_text(e))
         if br.status != "ok":
             transitions.transition(self.conn, row["id"], S.CLOSE_UNKNOWN, now)
             self.activity.write(Category.TRADE, "close_unknown",
@@ -262,7 +265,8 @@ class Executor:
         try:
             br = self.broker.cancel(row)
         except Exception as e:  # noqa: BLE001 — 結果不明として扱う (codex 2)
-            br = BrokerResult(status="unknown", message=str(e))
+            br = BrokerResult(status="unknown",
+                              message=safe_error_text(e))
         if br.status == "ok":
             transitions.transition(self.conn, row["id"], S.CANCELLED, now,
                                    close_reason=reason)

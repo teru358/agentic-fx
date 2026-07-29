@@ -538,13 +538,80 @@ def test_processed_bar_marking_covers_pairs_without_tracked_orders(tmp_path):
 
 
 def test_reservation_maintenance_zero_equity_no_crash(tmp_path):
-    """レビュー修正 6: equity<=0 では notional/equity がゼロ除算になる。"""
+    """レビュー修正 6: equity<=0 では notional/equity がゼロ除算になる。
+
+    codex C-I1 で期待値を更新した。旧版は
+    `assert row["status"] == "pending_fill"  # gate 側の fail closed に委ねる`
+    で、**欠陥をテストが固定していた** — gate は「新規発注」時にしか走らず、
+    既に予約済みの指値が約定する経路 (`_process_limit_fills`) では再実行
+    されないので、equity<=0 (債務超過) のまま到達バーが来れば OPEN が
+    生まれてしまう。equity<=0 は口座 snapshot 欠損と同等以上に扱い、
+    全 pending_fill を取消す。ゼロ除算にならないことの検証はそのまま。
+    """
     env = Env(tmp_path)
     oid = env.place_limit()
     env.executor.broker.equity = lambda: (0.0, 0.0)
     env.sched.tick(WED + timedelta(minutes=1))  # ZeroDivisionError にならない
     row = orders.get(env.conn, oid)
-    assert row["status"] == "pending_fill"  # gate 側の fail closed に委ねる
+    assert row["status"] == "cancelled"
+    assert row["close_reason"] == "equity_nonpositive"
+
+
+# --- codex C-I1: equity<=0 でも予約済み指値が約定してしまう ---------------
+
+def test_zero_equity_cancels_pending_and_never_opens_but_exits_still_run(tmp_path):
+    """債務超過 (equity<=0) の tick で
+
+    1. 到達バーがあっても pending_fill から OPEN が生まれないこと
+    2. それでも既存 OPEN の SL/TP 監視 (資金保護) は必ず走ること
+
+    を 1 本のバーで同時に検証する。旧実装は `_maintain_reservations` が
+    equity<=0 で早期 return し「gate の fail closed に委ねる」としていたが、
+    gate は予約済み指値の約定時には再実行されない。
+    """
+    env = Env(tmp_path)
+    pending = env.place_limit(price=148.20, sl=147.80, tp=149.00)
+    # 既存 OPEN (swing — _force_close_day の対象外にして経路を混ぜない)
+    open_id = orders.insert(env.conn, pair="USDJPY", direction="long",
+                            entry_type="market", horizon="swing",
+                            status="open", now=WED, quantity=0.1,
+                            avg_fill_price=148.20, stop_loss=147.80,
+                            take_profit=149.00)
+    env.executor.broker.equity = lambda: (0.0, 0.0)
+    # 指値 (148.20) に到達し、かつ SL (147.80) も割るバー
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.30, 148.35, 147.50, 147.55, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    pending_row = orders.get(env.conn, pending)
+    assert pending_row["status"] != "open"          # 債務超過で OPEN を作らない
+    assert pending_row["status"] == "cancelled"
+    assert pending_row["close_reason"] == "equity_nonpositive"
+    open_row = orders.get(env.conn, open_id)
+    assert open_row["status"] == "closed"           # 資金保護は止めない
+    assert open_row["close_reason"] == "sl"
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "equity_nonpositive_cancel_pending" in log
+
+
+def test_zero_equity_skips_limit_fills_even_if_cancellation_is_neutralized(
+        tmp_path, monkeypatch):
+    """2 層目 (fills スキップ) の単独ピン。
+
+    1 層目 (全 pending 取消) が効いていると pending_fill が空になるため、
+    「`_process_limit_fills` のスキップ条件から equity<=0 を外す」変異は
+    上のテストでは検知できない (取消でマスクされる)。取消を無効化した
+    状態で、なお約定しないことを直接固定する。
+    """
+    env = Env(tmp_path)
+    oid = env.place_limit(price=148.20)
+    monkeypatch.setattr(env.sched, "_cancel_all_pending",
+                        lambda *a, **k: None)
+    env.executor.broker.equity = lambda: (0.0, 0.0)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.30, 148.35, 148.15, 148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert orders.get(env.conn, oid)["status"] == "pending_fill"  # OPEN ではない
 
 
 def test_mark_to_market_skips_snapshot_on_stale_bar_but_tick_continues(tmp_path):
@@ -805,3 +872,220 @@ def test_close_retry_quote_exception_stays_closing_for_next_tick_retry(tmp_path)
     env.sched.tick(WED + timedelta(minutes=1))  # quote 復旧 → 再試行で解決
     row2 = orders.get(env.conn, oid)
     assert row2["status"] == "closed"
+
+
+# --- codex C-I2: データ経路の想定外例外で資金保護に到達しない -------------
+
+LEAKY = "boom https://bridge.internal:8812/orders?apikey=SECRET_KEY_123"
+
+
+def _assert_no_url(text: str) -> None:
+    assert "bridge.internal" not in text
+    assert "/orders" not in text
+    assert "SECRET_KEY_123" not in text
+    assert "apikey" not in text
+
+
+def test_mark_to_market_unexpected_exception_does_not_stop_tick(tmp_path):
+    """`bars_fn` (= latest_1m_bar) は DataUnhealthy を握って None を返すが、
+    `broker.equity()` / `spec_fn` / sqlite3.Error 等の**想定外例外**は
+    `_mark_to_market` を貫通し、tick 全体 (= SL/TP 監視) を殺していた。
+    snapshot は記録しないが tick は継続すること。"""
+    import sqlite3
+
+    env = Env(tmp_path)
+    oid = env.place_limit(price=148.20, sl=147.80)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                             148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=1))       # fill -> OPEN
+    assert orders.get(env.conn, oid)["status"] == "open"
+
+    def boom():
+        raise sqlite3.OperationalError(LEAKY)
+
+    env.executor.broker.equity = boom
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=2),
+                             147.60, 147.65, 147.50, 147.55, 100)
+    env.sched.tick(WED + timedelta(minutes=2))
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "closed"                 # 資金保護は止めない
+    assert row["close_reason"] == "sl"
+    assert env.trade_calls == 1                      # tick は最後まで走った
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "mark_to_market_error" in log
+    _assert_no_url(log)                              # C-I3: URL を載せない
+
+
+def test_snapshot_out_of_order_still_skips_whole_tick(tmp_path):
+    """確立済みの裁定 (レビュー修正 3) は変えない — `record_snapshot` の
+    ValueError は「時計異常」であり、バー鮮度判定ごと信用できないので
+    tick 全体を安全側にスキップする。C-I2 の広い except がこれを
+    飲み込んで tick 継続に変わっていないことを固定する。"""
+    env = Env(tmp_path)
+    env.sched.tick(WED - timedelta(minutes=1))  # 基準 snapshot より過去
+    assert env.trade_calls == 0                 # tick 全体がスキップされる
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "snapshot_out_of_order" in log
+    assert "mark_to_market_error" not in log    # 広い except の側ではない
+    assert "ValueError" in log                  # safe_error_text 経由 (型名付き)
+
+
+def test_exit_monitoring_continues_when_one_orders_bar_lookup_raises(tmp_path):
+    """`_process_exits` は注文単位で例外を隔離する。
+
+    1 注文分の `bars_fn` 例外が、残りの注文の SL/TP 監視を殺してはならない。
+    末尾の `_processed_bar_ts` マーキング (settings.pairs 走査) も同じ
+    `bars_fn` を呼ぶので、そこで例外が漏れると tick の残り
+    (on_trade_mission) まで飛ぶ — こちらも隔離する。
+    """
+    env = Env(tmp_path)
+    # A (先に走査される) = USDJPY: bars_fn が例外を投げるペア
+    a = orders.insert(env.conn, pair="USDJPY", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=148.20,
+                      stop_loss=147.80, take_profit=149.00)
+    # B = EURUSD: 正常なバーで SL 到達
+    b = orders.insert(env.conn, pair="EURUSD", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=1.1000,
+                      stop_loss=1.0960, take_profit=1.1120)
+    bars = {"EURUSD": Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                          1.0950, 1.0955, 1.0900, 1.0905, 100)}
+
+    def flaky_bars(pair):
+        if pair == "USDJPY":
+            raise RuntimeError(LEAKY)
+        return bars.get(pair)
+
+    env.sched.bars_fn = flaky_bars
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert orders.get(env.conn, a)["status"] == "open"   # A はスキップされるだけ
+    row_b = orders.get(env.conn, b)
+    assert row_b["status"] == "closed"                   # B の保護は生きている
+    assert row_b["close_reason"] == "sl"
+    assert env.trade_calls == 1        # マーキング走査でも tick は死なない
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    _assert_no_url(log)
+
+
+def test_limit_fill_bar_exception_does_not_stop_exit_monitoring(tmp_path):
+    """`_process_limit_fills` は `_process_exits` の**前**に走るので、
+    そこで例外が漏れると資金保護に到達しない。約定処理も注文単位で隔離する。"""
+    env = Env(tmp_path)
+    pending = env.place_limit(price=148.20)          # USDJPY (bars_fn が例外)
+    b = orders.insert(env.conn, pair="EURUSD", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=1.1000,
+                      stop_loss=1.0960, take_profit=1.1120)
+    bars = {"EURUSD": Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                          1.0950, 1.0955, 1.0900, 1.0905, 100)}
+
+    def flaky_bars(pair):
+        if pair == "USDJPY":
+            raise RuntimeError(LEAKY)
+        return bars.get(pair)
+
+    env.sched.bars_fn = flaky_bars
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert orders.get(env.conn, pending)["status"] == "pending_fill"
+    row_b = orders.get(env.conn, b)
+    assert row_b["status"] == "closed"
+    assert row_b["close_reason"] == "sl"
+    assert env.trade_calls == 1
+
+
+# --- codex C-I3: scheduler が例外を safe_error_text を通さず記録していた ---
+
+def test_reconcile_error_activity_has_no_url(tmp_path):
+    env = Env(tmp_path)
+    orders.insert(env.conn, pair="USDJPY", direction="long",
+                  entry_type="limit", horizon="day", status="cancel_unknown",
+                  now=WED, quantity=0.1, requested_price=148.2,
+                  stop_loss=147.8)
+
+    def boom(row):
+        raise RuntimeError(LEAKY)
+
+    env.executor.broker.reconcile = boom
+    env.sched.tick(WED)
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "reconcile_error" in log
+    assert "RuntimeError" in log     # 型名は残す (診断)
+    _assert_no_url(log)
+
+
+def test_close_retry_and_day_close_activity_have_no_url(tmp_path):
+    """`close_retry_deferred` (quote_fn 例外) / `close_unknown`
+    (broker.close 例外) / `day_close_deferred` (quote_fn 例外) の 3 箇所。"""
+    def bad_quote(pair):
+        raise RuntimeError(LEAKY)
+
+    env = Env(tmp_path, quote_fn=bad_quote)
+    orders.insert(env.conn, pair="USDJPY", direction="long",
+                  entry_type="limit", horizon="day", status="closing",
+                  now=WED, quantity=0.1, requested_price=148.2,
+                  stop_loss=147.8, avg_fill_price=148.2)
+    env.sched.tick(WED)
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "close_retry_deferred" in log
+    _assert_no_url(log)
+
+    # broker.close 例外 (close_unknown)
+    env2 = Env(tmp_path / "b")
+    orders.insert(env2.conn, pair="USDJPY", direction="long",
+                  entry_type="limit", horizon="day", status="closing",
+                  now=WED, quantity=0.1, requested_price=148.2,
+                  stop_loss=147.8, avg_fill_price=148.2)
+
+    def bad_close(row, price, reason):
+        raise RuntimeError(LEAKY)
+
+    env2.executor.broker.close = bad_close
+    env2.sched.tick(WED)
+    log2 = (env2.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "close_unknown" in log2
+    _assert_no_url(log2)
+
+    # day 強制決済の quote 障害 (day_close_deferred)
+    env3 = Env(tmp_path / "c")
+    oid = env3.place_limit()
+    env3.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                              148.25, 100)
+    env3.sched.tick(WED + timedelta(minutes=1))     # fill -> OPEN (day)
+    env3.executor.quote_fn = bad_quote
+    env3.sched.tick(WED.replace(hour=20, minute=57))
+    assert orders.get(env3.conn, oid)["status"] == "open"
+    log3 = (env3.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "day_close_deferred" in log3
+    _assert_no_url(log3)
+
+
+# --- codex C-M5: tick() の単一呼び出し契約を明文化 ------------------------
+
+def test_tick_docstring_states_single_caller_contract():
+    """再入ガードを持たないことは**契約**なので、docstring から消えたら
+    落ちるようにしておく (ロックはプラン 5 の service 側 core_lock で持つ)。"""
+    doc = Scheduler.tick.__doc__ or ""
+    assert "再入ガード" in doc
+    assert "単一" in doc
+
+
+def test_reconcile_pending_activity_has_no_url(tmp_path):
+    """`br.message` は **broker が返す外部由来のテキスト**であり、
+    `reconcile_pending` は それを `!r` でそのまま activity に書いている。
+    Phase 3 の MT5 bridge がエラー本文に自分のエンドポイントを載せれば
+    そこから URL が漏れる (C-I3 が挙げた 5 箇所には入っていない経路)。"""
+    from agentic_fx.core.contracts import BrokerResult
+
+    env = Env(tmp_path)
+    orders.insert(env.conn, pair="USDJPY", direction="long",
+                  entry_type="limit", horizon="day", status="cancel_unknown",
+                  now=WED, quantity=0.1, requested_price=148.2,
+                  stop_loss=147.8)
+    env.executor.broker.reconcile = lambda row: BrokerResult(
+        status="error", message=f"bridge said: {LEAKY}")
+    env.sched.tick(WED)
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "reconcile_pending" in log
+    assert "bridge said" in log      # 非 URL 部分の情報は残す
+    _assert_no_url(log)

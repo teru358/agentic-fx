@@ -172,6 +172,50 @@ def test_collect_survives_source_failure(tmp_path):
     assert total == 1  # bad はスキップ
 
 
+# --- codex C-M4: ソース単位の失敗が activity に残らない -------------------
+
+def test_unknown_fetcher_is_recorded_in_activity_with_source_name(tmp_path):
+    """技術ログ warning だけだと、activity には成功 (`collected`) しか
+    載らない。恒常的に落ちているソースが人の目に触れる経路が無いので、
+    ソース名付きで NEWS カテゴリに残す。**fail-open は維持** (スキップ)。"""
+    conn, rag, col = _env(tmp_path)
+    news_sources.add(conn, name="weird", fetcher="bogus", url="https://ex.com/x",
+                     added_by="agent", now=NOW, enabled=True)
+    news_sources.add(conn, name="ok", fetcher="feed", url="https://ex.com/rss",
+                     added_by="user", now=NOW, enabled=True)
+    with patch("agentic_fx.datafeed.news_collector.fetch_feed",
+               return_value=[ART]):
+        total = col.collect()
+    assert total == 1                      # スキップして次のソースへ (fail-open)
+    log = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "news_source_failed" in log
+    assert "weird" in log                  # ソース名が分からないと対処できない
+    assert "bogus" in log                  # 何が未知だったか
+    assert "NEWS" in log
+
+
+def test_source_fetch_failure_is_recorded_in_activity(tmp_path):
+    """`_run_data_hook` の docstring は「ソース単位の通常の取得失敗は
+    NewsCollector / EconCalendar が NEWS カテゴリで既に記録している」と
+    書いているが、NewsCollector 側はそれが**事実でなかった** (技術ログ
+    warning のみ)。EconCalendar の `_record_failure` と同じ形に揃える。"""
+    conn, rag, col = _env(tmp_path)
+    news_sources.add(conn, name="bad", fetcher="feed",
+                     url="https://bad.example/rss?apikey=SECRET_KEY_123",
+                     added_by="user", now=NOW, enabled=True)
+    with patch("agentic_fx.datafeed.news_collector.fetch_feed",
+               side_effect=OSError(
+                   "down https://bad.example/rss?apikey=SECRET_KEY_123")):
+        total = col.collect()
+    assert total == 0
+    log = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "news_source_failed" in log
+    assert "bad" in log
+    assert "OSError" in log                       # 型名は診断に要る
+    assert "SECRET_KEY_123" not in log            # 秘密抑止を通す
+    assert "bad.example" not in log               # URL も出さない
+
+
 def test_collect_calls_cleanup_and_writes_activity(tmp_path):
     """cleanup_news(48h) が collect の度に呼ばれ、activity に記録が残ること。
 

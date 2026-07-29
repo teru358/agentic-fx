@@ -100,8 +100,8 @@ class NewsCollector:
                     # 以外を fetch_web に無言でフォールバックさせない
                     # (未知形式に httpx+trafilatura を適用すると壊れた
                     # 抽出結果が記事として RAG に混入しうる)。
-                    _log.warning("news source %s: unknown fetcher %r, skipped",
-                                src["name"], src["fetcher"])
+                    self._record_failure(
+                        src["name"], f"unknown fetcher {src['fetcher']!r}")
                     continue
                 articles = fetch(src["url"], src["name"])
                 total += self.rag.add_news(
@@ -109,9 +109,26 @@ class NewsCollector:
                       "source_name": a.source_name, "published": a.published}
                      for a in articles], now)
             except Exception as e:  # noqa: BLE001 — 1 ソース障害で止めない
-                _log.warning("news source %s failed: %s", src["name"],
-                            _safe_error_text(e))
+                self._record_failure(src["name"], _safe_error_text(e))
         removed = self.rag.cleanup_news(now, hours=48)
         self.activity.write(Category.NEWS, "collected",
                             f"{total} articles ({removed} cleaned)")
         return total
+
+    def _record_failure(self, source_name: str, detail: str) -> None:
+        """ソース単位の失敗を技術ログ **と** activity の両方に残す。
+
+        codex C-M4: 以前は技術ログ warning のみで、activity には成功
+        (`collected`) しか載らなかった。恒常的に落ちているソース (URL 失効・
+        未知 fetcher で登録されたエージェント追加ソース等) が人の目に触れる
+        経路が無く、`collected 0 articles` が「今日はニュースが無い」と
+        読めてしまう。EconCalendar._record_failure と同じ形に揃える。
+
+        **fail-open は維持する** — この関数は記録するだけで、呼び出し側の
+        制御フロー (スキップして次のソースへ) は変えない。detail は
+        `safe_error_text` を通した文字列を渡すこと (ソース URL に秘密が
+        含まれうる)。
+        """
+        _log.warning("news source %s failed: %s", source_name, detail)
+        self.activity.write(Category.NEWS, "news_source_failed",
+                            f"{source_name}: {detail}")

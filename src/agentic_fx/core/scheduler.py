@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 from agentic_fx.activity import ActivityLog, Category
-from agentic_fx._safe_error import safe_error_text
+from agentic_fx._safe_error import safe_error_text, safe_text
 from agentic_fx.config import Settings
 from agentic_fx.core import accounting, market_hours, transitions
 from agentic_fx.core.contracts import Bar, Mode, OrderStatus as S
@@ -65,6 +65,18 @@ class Scheduler:
         self._processed_bar_ts: dict[str, datetime] = {}
 
     def tick(self, now: datetime) -> None:
+        """1 tick 分の決定論的処理。
+
+        **呼び出し契約 (codex C-M5)**: `tick()` は **単一スレッド・単一
+        タイマーからの逐次呼び出し**を前提とする。再入ガード (ロック) は
+        **持たない** — 同時に 2 本走らせると、`_processed_bar_ts` の
+        read-modify-write や「取消 → 約定スキップ」の 2 段構えが
+        インターリーブし、同じバーの二重約定や取消と約定の競合を生む。
+        直列化はプロセス側の責務で、service 配線が `core_lock` の下に
+        置く (プラン 5)。ここでロックを持たないのは、tick と裁量操作
+        (Mission 由来の発注/クローズ) を **同じ**ロックで直列化する必要が
+        あり、scheduler 内部の自前ロックではその範囲を張れないため。
+        """
         # cross-plan 修正①: データ収集サイクルは tick の **冒頭** (開場判定
         # より前) で回す。
         # - 開場・閉場を 1 箇所でカバーでき、同じロジックの重複を作らない。
@@ -110,9 +122,25 @@ class Scheduler:
         # が何もせず戻るだけでは、同じ tick で _process_fills が新たな建玉を
         # 生んでしまう (fail-open)。account が不明なら全 pending_fill を
         # 取消し、この tick の fills 処理はスキップする。
+        # codex C-I1: equity<=0 (債務超過) は account 欠損と **同等以上** に
+        # 扱う。以前は _maintain_reservations が equity<=0 で早期 return し
+        # 「新規発注側の gate (fail closed) に委ねる」としていたが、gate は
+        # **新規発注時にしか走らない** — 予約済み指値が約定する経路
+        # (_process_limit_fills) では再実行されないので、到達バーが来れば
+        # 債務超過のまま OPEN が生まれてしまう (fail-open)。account 欠損と
+        # 同じ経路で全 pending_fill を取消し、この tick の約定処理も飛ばす。
         account = accounting.current_account(self.conn, now)
+        fills_allowed = account is not None and account[0] > 0
         if account is None:
-            self._cancel_pending_for_unknown_account(now)
+            self._cancel_all_pending(
+                now, reason="account_unknown",
+                event="account_unknown_cancel_pending",
+                why="口座 snapshot が陳腐化/欠損 — 総リスク再検証不能")
+        elif account[0] <= 0:
+            self._cancel_all_pending(
+                now, reason="equity_nonpositive",
+                event="equity_nonpositive_cancel_pending",
+                why="equity<=0 (債務超過) — 予約を維持できない")
         else:
             self._maintain_reservations(now, account)
         self._force_close_day(now)
@@ -122,8 +150,12 @@ class Scheduler:
         # 関わらず必ず実行しなければならない — 以前は _process_fills 全体
         # (約定処理と SL/TP 監視の両方) を丸ごとスキップしており、口座陳腐化
         # 中は資金保護まで止まる回帰を生んでいた。
-        filled_ids = self._process_limit_fills(now) if account is not None \
-            else set()
+        #
+        # 2 層構え (codex C-I1): 1 層目 = 上の全 pending 取消、2 層目 = ここの
+        # スキップ。1 層目の取消が broker 側で rejected/unknown になると行は
+        # PENDING_FILL に残らないが、取消経路そのものが例外や将来の変更で
+        # 効かなくなった場合に備えて、約定側にも独立した条件を置く。
+        filled_ids = self._process_limit_fills(now) if fills_allowed else set()
         self._process_exits(now, filled_ids)
         if self._last_trade is None or now - self._last_trade >= timedelta(hours=1):
             self._last_trade = now
@@ -173,7 +205,47 @@ class Scheduler:
         tick の snapshot 記録だけ** を見送る (レビュー修正 7: 古い価格で
         含み損益を計算し kill switch の判定を誤らせないため)。tick 自体は
         継続する (day 強制クローズ等はバー鮮度に依存せず独立して機能する)。
+
+        codex C-I2: 評価の本体は広い try で包む。`bars_fn` (= latest_1m_bar)
+        は `DataUnhealthy` を握って None を返すので典型的なデータ不健全は
+        既に安全だが、`broker.equity()` / `spec_fn` (未知ペアの
+        DataUnhealthy) / sqlite3.Error 等の**想定外例外**は貫通し、
+        tick 全体 = `_process_exits` (SL/TP 監視 = 資金保護) を殺していた。
+        想定外例外では snapshot を記録せず **tick は継続** する
+        (snapshot が止まれば current_account がやがて陳腐化し、新規約定側は
+        自動的に fail closed になる — 止まってはいけないのは保護の側だけ)。
         """
+        try:
+            balance, unrealized, stale = self._evaluate_positions(now)
+        except Exception as e:  # noqa: BLE001 — 資金保護を止めない
+            text = safe_error_text(e)
+            self.activity.write(Category.SYSTEM, "mark_to_market_error",
+                                f"{text} — snapshot 見送り (tick は継続)")
+            _log.warning("mark-to-market failed: %s", text)
+            return True
+        if stale:
+            return True  # snapshot は記録しないが tick は継続する
+        # レビュー修正 3 の裁定 (時系列逆行 = 時計異常 → tick 全体スキップ)
+        # は **上の広い except の外** に置く。中に入れると、将来 except の
+        # 側を触ったときに「時計異常でも tick 継続」へ無音で変質しうる。
+        try:
+            accounting.record_snapshot(self.conn, now=now, balance=balance,
+                                       equity=balance + unrealized)
+        except ValueError as e:
+            text = safe_error_text(e)
+            self.activity.write(Category.SYSTEM, "snapshot_out_of_order", text)
+            _log.warning("mark-to-market skipped (clock regression?): %s", text)
+            return False
+        except Exception as e:  # noqa: BLE001 — DB 障害でも資金保護は止めない
+            text = safe_error_text(e)
+            self.activity.write(Category.SYSTEM, "mark_to_market_error",
+                                f"{text} — snapshot 見送り (tick は継続)")
+            _log.warning("record_snapshot failed: %s", text)
+            return True
+        return True
+
+    def _evaluate_positions(self, now: datetime) -> tuple[float, float, bool]:
+        """(balance, unrealized, stale) を返す。例外は呼び出し側が握る。"""
         balance, _ = self.executor.broker.equity()
         unrealized = 0.0
         stale = False
@@ -190,17 +262,7 @@ class Scheduler:
             sign = 1.0 if row["direction"] == "long" else -1.0
             unrealized += (bar.close - row["avg_fill_price"]) \
                 * spec.contract_size * (row["quantity"] or 0.0) * sign
-        if stale:
-            return True  # snapshot は記録しないが tick は継続する
-        try:
-            accounting.record_snapshot(self.conn, now=now, balance=balance,
-                                       equity=balance + unrealized)
-        except ValueError as e:
-            self.activity.write(Category.SYSTEM, "snapshot_out_of_order",
-                                str(e))
-            _log.warning("mark-to-market skipped (clock regression?): %s", e)
-            return False
-        return True
+        return balance, unrealized, stale
 
     def _resolve_unknowns(self, now: datetime) -> None:
         resolution = {
@@ -218,11 +280,16 @@ class Scheduler:
             try:
                 br = self.executor.broker.reconcile(row)
             except Exception as e:  # noqa: BLE001
+                # codex C-I3: 例外テキストは必ず safe_error_text を通す。
+                # 現状の broker は paper なので実害は薄いが、Phase 3 で
+                # broker が MT5 bridge (httpx) になると、この文字列に
+                # bridge の URL がそのまま載って activity / 通知に流れる。
+                text = safe_error_text(e)
                 self.activity.write(
                     Category.TRADE, "reconcile_error",
-                    f"#{row['id']}: {e} — 次 tick 再試行",
+                    f"#{row['id']}: {text} — 次 tick 再試行",
                     ref_id=str(row["id"]))
-                _log.warning("reconcile failed #%s: %s", row["id"], e)
+                _log.warning("reconcile failed #%s: %s", row["id"], text)
                 continue
             # codex 4: 終端 (rejected/cancelled) への変換は、broker が
             # 「注文なし」と明言した (status=="ok" かつ message=="not_found")
@@ -236,10 +303,14 @@ class Scheduler:
                                     f"#{row['id']} -> {to.value}",
                                     ref_id=str(row["id"]))
             else:
+                # codex C-I3 (5 箇所の列挙に無かった同型の経路): br.message は
+                # **broker が返す外部由来のテキスト**。Phase 3 の MT5 bridge
+                # がエラー本文に自分のエンドポイントを載せれば、ここから
+                # activity に URL が出る。safe_text を通す。
                 self.activity.write(
                     Category.TRADE, "reconcile_pending",
                     f"#{row['id']}: status={br.status} "
-                    f"message={br.message!r} — 次 tick 再試行",
+                    f"message={safe_text(str(br.message))!r} — 次 tick 再試行",
                     ref_id=str(row["id"]))
         # レビュー修正 2: CLOSING (今 tick 新規に遷移したものも、過去 tick から
         # quote 障害等で滞留しているものも含む) を毎 tick 再走査し、quote が
@@ -267,23 +338,26 @@ class Scheduler:
         try:
             q = self.executor.quote_fn(row["pair"])
         except Exception as e:  # noqa: BLE001 — broker 未接触。次 tick 再試行
+            text = safe_error_text(e)   # codex C-I3
             self.activity.write(Category.TRADE, "close_retry_deferred",
-                                f"{row['pair']}: {e}", ref_id=str(row["id"]))
-            _log.warning("close retry deferred (quote) #%s: %s", row["id"], e)
+                                f"{row['pair']}: {text}", ref_id=str(row["id"]))
+            _log.warning("close retry deferred (quote) #%s: %s", row["id"],
+                         text)
             return
         price = q.bid if row["direction"] == "long" else q.ask
         fresh = orders.get(self.conn, row["id"])
         try:
             br2 = self.executor.broker.close(fresh, price, "retry")
         except Exception as e:  # noqa: BLE001 — broker 側は成功済みかもしれない
+            text = safe_error_text(e)   # codex C-I3
             transitions.transition(self.conn, row["id"], S.CLOSE_UNKNOWN, now)
             self.activity.write(Category.TRADE, "close_unknown",
                                 f"{row['pair']} — reconcile 待ち "
-                                f"(broker error: {e})", ref_id=str(row["id"]))
+                                f"(broker error: {text})", ref_id=str(row["id"]))
             self.executor.notifier.send(
                 f"[agentic-fx] クローズ結果不明 #{row['id']}")
             _log.warning("close retry -> close_unknown (broker error) "
-                        "#%s: %s", row["id"], e)
+                        "#%s: %s", row["id"], text)
             return
         if br2.status == "ok":
             # broker 側は成功済み — 以降の DB 確定処理の失敗は握りつぶさない
@@ -322,19 +396,27 @@ class Scheduler:
                     transitions.transition(self.conn, row["id"],
                                            S.CANCEL_UNKNOWN, now)
 
-    def _cancel_pending_for_unknown_account(self, now: datetime) -> None:
-        """codex 1: current_account が陳腐化/欠損している場合、総リスク・
+    def _cancel_all_pending(self, now: datetime, *, reason: str, event: str,
+                            why: str) -> None:
+        """予約済み指値を「約定させてはいけない」状態で全取消しする共通経路。
+
+        codex 1: current_account が陳腐化/欠損している場合、総リスク・
         レバレッジを再検証できないまま指値を約定させるのは fail-open。
+        codex C-I1: equity<=0 (債務超過) も同じ — むしろこちらは口座値が
+        分かっていて「維持できないと確定している」ぶん強い。どちらも
         全 pending_fill を取消し (取消結果が cancel_unknown になったものは
-        そのまま新規発注停止に接続される)、この tick は約定処理をしない。"""
+        そのまま新規発注停止に接続される)、この tick は約定処理をしない。
+
+        `reason` は orders.close_reason に載る (取消理由が activity と DB の
+        両方で区別できるよう、原因ごとに別の値を渡す)。
+        """
         pending = orders.list_by_status(self.conn, S.PENDING_FILL)
         if pending:
             self.activity.write(
-                Category.SYSTEM, "account_unknown_cancel_pending",
-                f"{len(pending)} 件の pending_fill を取消 "
-                "(口座 snapshot が陳腐化/欠損 — 総リスク再検証不能)")
+                Category.SYSTEM, event,
+                f"{len(pending)} 件の pending_fill を取消 ({why})")
         for row in pending:
-            self.executor.cancel_order(row, reason="account_unknown")
+            self.executor.cancel_order(row, reason=reason)
 
     def _maintain_reservations(self, now: datetime,
                                account: tuple[float, float]) -> None:
@@ -342,7 +424,11 @@ class Scheduler:
         equity, _ = account
         if equity <= 0:
             # レビュー修正 6: equity<=0 だと notional/equity がゼロ除算になる。
-            # ここでは何もせず、新規発注側の gate (fail closed) に委ねる。
+            # codex C-I1: 呼び出し側 (tick) が equity<=0 を先に捌く
+            # (全 pending 取消 + 約定スキップ) ので、ここは到達しない想定の
+            # 保険。**「gate の fail closed に委ねる」は誤り**だった —
+            # gate は新規発注時にしか走らず、予約済み指値の約定では
+            # 再実行されない。ゼロ除算だけは常に避ける。
             return
         risk = self.settings.risk
         while True:
@@ -377,8 +463,10 @@ class Scheduler:
             try:
                 q = self.executor.quote_fn(row["pair"])
             except Exception as e:  # noqa: BLE001 — 架空価格で閉じない
+                text = safe_error_text(e)   # codex C-I3
                 self.activity.write(Category.TRADE, "day_close_deferred",
-                                    f"{row['pair']}: {e}", ref_id=str(row["id"]))
+                                    f"{row['pair']}: {text}",
+                                    ref_id=str(row["id"]))
                 continue
             price = q.bid if row["direction"] == "long" else q.ask
             self.executor.close_order(row, price, reason="day_rollover")
@@ -400,24 +488,42 @@ class Scheduler:
         # あった。
         filled_ids: set[int] = set()
         for row in orders.list_by_status(self.conn, S.PENDING_FILL):
-            bar = self._fresh_bar(row["pair"], now)
-            if bar is None:
-                continue
-            price = check_limit_fill(row, bar, self._spread_for(row["pair"]))
-            if price is None:
-                continue
-            transitions.transition(self.conn, row["id"], S.PROTECTION_PENDING,
-                                   now, avg_fill_price=price,
-                                   filled_quantity=row["quantity"],
-                                   remaining_quantity=0.0,
-                                   filled_at=now.isoformat())
-            transitions.transition(self.conn, row["id"], S.OPEN, now)
-            self.activity.write(Category.TRADE, "limit_filled",
-                                f"{row['pair']} @{price}", ref_id=str(row["id"]))
-            filled_ids.add(row["id"])
-            # 同一バーで SL/TP に到達し得る → 保守則で即時判定
-            filled = orders.get(self.conn, row["id"])
-            self._check_one_exit(filled, bar, entry_same_bar=True)
+            # codex C-I2: この関数は _process_exits (資金保護) の **前** に
+            # 走るので、1 注文分の例外 (bars_fn / spec_fn の想定外例外、
+            # DB 障害等) がここを貫通すると、既存建玉の SL/TP 監視ごと
+            # 飛んでしまう。注文単位で隔離する。
+            #
+            # filled_ids.add は例外を投げうる呼び出し (_check_one_exit) の
+            # **前** に置く: 約定が成立した後で例外を握った場合、その注文が
+            # filled_ids に入っていないと _process_exits が
+            # entry_same_bar=False で再評価してしまい、レビュー修正 1 で
+            # 塞いだ「同一バー TP の誤確定」が再発する。
+            try:
+                bar = self._fresh_bar(row["pair"], now)
+                if bar is None:
+                    continue
+                price = check_limit_fill(row, bar,
+                                         self._spread_for(row["pair"]))
+                if price is None:
+                    continue
+                transitions.transition(
+                    self.conn, row["id"], S.PROTECTION_PENDING, now,
+                    avg_fill_price=price, filled_quantity=row["quantity"],
+                    remaining_quantity=0.0, filled_at=now.isoformat())
+                transitions.transition(self.conn, row["id"], S.OPEN, now)
+                self.activity.write(Category.TRADE, "limit_filled",
+                                    f"{row['pair']} @{price}",
+                                    ref_id=str(row["id"]))
+                filled_ids.add(row["id"])
+                # 同一バーで SL/TP に到達し得る → 保守則で即時判定
+                filled = orders.get(self.conn, row["id"])
+                self._check_one_exit(filled, bar, entry_same_bar=True)
+            except Exception as e:  # noqa: BLE001 — 資金保護を止めない
+                text = safe_error_text(e)
+                self.activity.write(Category.TRADE, "limit_fill_error",
+                                    f"#{row['id']} {row['pair']}: {text} "
+                                    "— 次 tick 再試行", ref_id=str(row["id"]))
+                _log.warning("limit fill failed #%s: %s", row["id"], text)
         return filled_ids
 
     def _process_exits(self, now: datetime, filled_ids: set[int]) -> None:
@@ -433,9 +539,21 @@ class Scheduler:
         for row in orders.list_by_status(self.conn, S.OPEN):
             if row["id"] in filled_ids:
                 continue  # 同一 tick で約定済み — entry_same_bar=True 判定済み
-            bar = self._fresh_bar(row["pair"], now)
-            if bar is not None:
-                self._check_one_exit(row, bar, entry_same_bar=False)
+            # codex C-I2: 1 注文分の例外 (bars_fn / spec_fn / broker の
+            # 想定外例外) が、**残りの注文の SL/TP 監視を殺してはならない**。
+            # 例外時はその注文をスキップして記録するだけ — **架空価格で
+            # クローズはしない** (価格が取れていないのだから、閉じるより
+            # 次 tick に賭けるほうが安全)。
+            try:
+                bar = self._fresh_bar(row["pair"], now)
+                if bar is not None:
+                    self._check_one_exit(row, bar, entry_same_bar=False)
+            except Exception as e:  # noqa: BLE001 — 他注文の保護を止めない
+                text = safe_error_text(e)
+                self.activity.write(Category.TRADE, "exit_check_error",
+                                    f"#{row['id']} {row['pair']}: {text} "
+                                    "— 次 tick 再試行", ref_id=str(row["id"]))
+                _log.warning("exit check failed #%s: %s", row["id"], text)
         # レビュー修正 5: 今 tick で見たバーを処理済みとして記録する走査対象
         # は、その時点の orders テーブルの状態 (PENDING_FILL/OPEN/CLOSED/
         # CANCELLED が存在する pair) ではなく、config で宣言されている全
@@ -444,8 +562,18 @@ class Scheduler:
         # 切れのみ・unknown のみ等) に依存してしまっていた。マーキングは
         # account の有無に関わらず (_process_limit_fills が呼ばれなかった
         # tick でも) 必ず行う。
+        # codex C-I2: マーキングも同じ bars_fn を呼ぶ。ここで例外が漏れると
+        # tick の残り (毎時 Mission) まで飛ぶうえ、_process_exits の末尾
+        # という「資金保護の直後」で落ちるため見た目が紛らわしい。ペア単位で
+        # 隔離する (マーキング漏れは同一バーの再処理を許すだけで、
+        # 保守側の check_exit が二重クローズを作ることはない)。
         for pair in self.settings.pairs:
-            bar = self.bars_fn(pair)
+            try:
+                bar = self.bars_fn(pair)
+            except Exception as e:  # noqa: BLE001
+                _log.warning("processed-bar marking failed for %s: %s", pair,
+                             safe_error_text(e))
+                continue
             if bar is not None:
                 self._processed_bar_ts[pair] = bar.ts
 
