@@ -1089,3 +1089,39 @@ def test_reconcile_pending_activity_has_no_url(tmp_path):
     assert "reconcile_pending" in log
     assert "bridge said" in log      # 非 URL 部分の情報は残す
     _assert_no_url(log)
+
+
+def test_filled_id_is_recorded_before_the_same_bar_exit_check_can_raise(tmp_path):
+    """C-I2 の注文単位 try が、レビュー修正 1 (同一バー TP の誤確定) を
+    復活させないこと。
+
+    `_process_limit_fills` は約定させた注文を `filled_ids` に入れてから
+    同一バーの SL/TP を `entry_same_bar=True` (順序判定不能なので TP は
+    抑制) で判定する。この判定が例外を投げたとき、`filled_ids.add` が
+    **後**に置かれていると、その注文は `_process_exits` で
+    `entry_same_bar=False` として再評価され、本来確定できないはずの TP が
+    確定してしまう。try/except の導入で新しく開いた窓なので直接固定する。
+    """
+    env = Env(tmp_path)
+    oid = env.place_limit(price=148.20, sl=147.80, tp=149.00)
+    calls = []
+    orig = env.sched._check_one_exit
+
+    def spy(row, bar, *, entry_same_bar):
+        calls.append((row["id"], entry_same_bar))
+        if entry_same_bar:
+            raise RuntimeError(LEAKY)      # 同一バー判定の途中で失敗
+        return orig(row, bar, entry_same_bar=entry_same_bar)
+
+    env.sched._check_one_exit = spy
+    # 指値 (148.20) に到達し、同一バーで TP (149.00) も超えるバー
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.30, 149.10, 148.15, 149.00, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert calls == [(oid, True)]      # entry_same_bar=False で再評価しない
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "open"     # TP は確定させない
+    assert row["close_reason"] is None
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "limit_fill_error" in log   # 失敗は無音にしない
+    _assert_no_url(log)
