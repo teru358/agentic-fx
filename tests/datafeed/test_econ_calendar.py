@@ -308,6 +308,39 @@ def test_refresh_success_is_recorded_in_activity(tmp_path):
     assert "\tNEWS\tecon_refreshed\t5 events (0 dropped)\t" in tail
 
 
+def test_refresh_genuinely_empty_week_is_success_not_failure(tmp_path):
+    """**本当に 0 件の週**は成功として記録する (再レビュー指摘)。
+
+    I-1 の修正で入った `if not events and dropped:` の `and dropped` 側に
+    ピンが無く、`and dropped` を落とす改変が全テスト緑のまま生存していた
+    (refresh 経路に空ペイロードを流すテストが 1 本も無かったため)。
+    これは Task 7 の「bozo=False の 0 件はエラーではない」と同型の論点 —
+    「取得できたが 1 件も使えなかった」(dropped > 0) だけが失敗であり、
+    「そもそもイベントが無い週」は失敗ではない。
+    """
+    cal = _cal(tmp_path)
+    with patch("httpx.get", return_value=_resp([])):
+        assert cal.refresh() == 0
+    tail = "\n".join(cal.activity.tail(10))
+    assert "\tNEWS\tecon_refreshed\t0 events (0 dropped)\t" in tail
+    assert "econ_refresh_failed" not in tail
+
+
+def test_fetch_raises_for_http_status(tmp_path):
+    """`raise_for_status()` の呼び出しにピンを打つ (再レビュー指摘)。
+
+    `_resp()` が `raise_for_status` を no-op の MagicMock にしているため、
+    実装から `r.raise_for_status()` を削除しても全テストが緑のままだった。
+    ここでは本物の `httpx.Response` を使い、404 が例外になることを確認する
+    (404 でエラーページが返る経路は、非 list 検査ではなくここで止まるのが正)。
+    """
+    req = httpx.Request("GET", "https://ex.example/cal.json")
+    resp = httpx.Response(404, request=req, text="<html>not found</html>")
+    with patch("httpx.get", return_value=resp):
+        with pytest.raises(httpx.HTTPStatusError):
+            fetch_ff_calendar()
+
+
 def test_refresh_failure_does_not_leak_url(tmp_path, caplog):
     """HTTPStatusError の str() には URL が丸ごと入る — ログにも activity にも出さない。"""
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json?apikey=SECRET123"
