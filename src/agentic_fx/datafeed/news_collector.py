@@ -13,9 +13,9 @@ import logging
 import sqlite3
 from datetime import datetime
 
+from agentic_fx._safe_error import safe_error_text as _safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
-from agentic_fx.datafeed._safe_error import safe_error_text as _safe_error_text
 from agentic_fx.datafeed.default_sources import DEFAULT_SOURCES
 from agentic_fx.datafeed.fetchers import fetch_feed, fetch_web
 from agentic_fx.store import news_sources

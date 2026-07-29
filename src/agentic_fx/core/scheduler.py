@@ -7,12 +7,12 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 from agentic_fx.activity import ActivityLog, Category
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.config import Settings
 from agentic_fx.core import accounting, market_hours, transitions
 from agentic_fx.core.contracts import Bar, Mode, OrderStatus as S
 from agentic_fx.core.executor import Executor, open_risk_and_notional
 from agentic_fx.core.paper_fills import check_exit, check_limit_fill
-from agentic_fx.datafeed._safe_error import safe_error_text
 from agentic_fx.store import orders
 from agentic_fx.store.state import StateStore
 

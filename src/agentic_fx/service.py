@@ -6,10 +6,10 @@ import shutil
 import sys
 from pathlib import Path
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Mode, SystemClock
-from agentic_fx.datafeed._safe_error import safe_error_text
 from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.news_collector import seed_default_sources
 from agentic_fx.datafeed.price_provider import PriceProvider

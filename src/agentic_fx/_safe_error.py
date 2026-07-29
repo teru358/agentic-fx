@@ -1,6 +1,7 @@
 """例外を「外部に出してよい」文字列にする共通ヘルパー。
 
-datafeed の各モジュール (price_provider / news_collector / econ_calendar) は
+datafeed の各モジュール (price_provider / news_collector / econ_calendar) と、
+それらを起動する core/service は
 外部 HTTP を叩くため、例外文字列にリクエスト URL がそのまま載る
 (`httpx.HTTPStatusError.__str__` は URL を含む)。これらのメッセージは
 技術ログだけでなく mission 記録・activity・Discord 通知に載りうるので、
@@ -10,6 +11,13 @@ datafeed の各モジュール (price_provider / news_collector / econ_calendar)
 (「private ヘルパーはモジュール間で import せず複製する」方針)。3 つ目の
 複製が生じる時点でその方針は割に合わない — 秘密抑止のパターンは
 1 箇所で更新できないと片側だけ古いままになり、抑止の穴は無音で残る。
+
+**配置**: 当初は `datafeed/` に置いていたが、`core/scheduler.py` (データ経路の
+障害を握って技術ログに残す) と `service.py` (init の標準出力) も使うため、
+パッケージ直下へ移した。`core` が `datafeed` を import するのは層の逆転で、
+`datafeed/__init__.py` に import が足された時点で本物の循環参照になる
+(`datafeed/econ_calendar.py` は既に `core.contracts` を import している)。
+このモジュールは `re` と `httpx` にしか依存しないので、どの層からでも安全に使える。
 """
 from __future__ import annotations
 

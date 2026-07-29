@@ -8,10 +8,10 @@ import sqlite3
 from collections.abc import Callable
 from datetime import datetime
 
+from agentic_fx._safe_error import safe_error_text as _safe_error_text
 from agentic_fx.config import Settings
 from agentic_fx.core.contracts import Bar, Clock, InstrumentSpec, Quote
 from agentic_fx.datafeed import sources
-from agentic_fx.datafeed._safe_error import safe_error_text as _safe_error_text
 from agentic_fx.datafeed.bars import bars_to_df, df_to_bars, pandas_rule, resample
 from agentic_fx.datafeed.health import (
     DataUnhealthy, validate_bars, validate_quote,

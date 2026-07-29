@@ -30,9 +30,9 @@ from datetime import datetime, timezone
 
 import httpx
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
-from agentic_fx.datafeed._safe_error import safe_error_text
 from agentic_fx.store import econ_events
 
 _log = logging.getLogger("agentic_fx.econ")

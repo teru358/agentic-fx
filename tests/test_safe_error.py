@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import httpx
 
-from agentic_fx.datafeed._safe_error import safe_error_text
+from agentic_fx._safe_error import safe_error_text
 
 URL = "https://api.example.com/v1/quote?symbol=USDJPY&apikey=SECRET_KEY_123"
 
