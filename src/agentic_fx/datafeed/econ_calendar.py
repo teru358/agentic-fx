@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import httpx
@@ -66,31 +67,62 @@ def _event_ts(raw: object) -> datetime:
 
 
 def _text_or_none(raw: object) -> str | None:
-    """空欄 ("" / 空白のみ / 欠損) を None にする。値はそのまま残す。"""
+    """空欄 ("" / 空白のみ / 欠損) を None にする。値はそのまま残す。
+
+    **非文字列は None** — 数値や list が来たら「値が無い」として扱う。
+    `str()` で文字列化すると `"['3.1%']"` のような偽の予想値が DB に入り、
+    LLM の判断材料として本物と区別できなくなる。
+    """
     if not isinstance(raw, str):
         return None
     return raw.strip() or None
 
 
-def fetch_ff_calendar() -> list[dict]:
+@dataclass(frozen=True, slots=True)
+class CalendarFetch:
+    """カレンダー 1 回分の取得結果。
+
+    **なぜ `list[dict]` (ブリーフの契約) ではなく型を返すか** (修正ラウンド 1
+    I-1): 「取れたイベント」だけを返すと、呼び出し側は「本当に 0 件の週」と
+    「92 件すべてを捨てた (= FF の仕様変更)」を区別できず、後者に対して
+    **成功行**を activity に書いてしまう。捨てた件数を一緒に返す必要がある。
+    タプルではなく dataclass にしたのは、(a) 呼び出し側が添字ではなく名前で
+    読むため取り違えが起きない、(b) 将来 unknown impact 件数などを足すときに
+    既存の呼び出し側を壊さずに済むため。frozen+slots は本リポジトリの
+    既存の値オブジェクト (Bar / Quote / Article) と同じ形。
+    """
+    events: list[dict]
+    dropped: int
+
+
+def fetch_ff_calendar() -> CalendarFetch:
     """ForexFactory の週間カレンダーを取得して正規化する。
 
     ネットワーク層・ペイロード全体の異常は例外として送出する (呼び出し側
     `EconCalendar.refresh` が fail soft に受ける)。**個々のイベントの
-    異常はここで捨てて警告する** — 1 件で週全体を失わないため。
+    異常はここで捨てて警告し、捨てた件数を戻り値に載せる** — 1 件で週全体を
+    失わないため、かつ「本当に 0 件の週」と「全件捨てた」を呼び出し側が
+    区別できるようにするため (修正ラウンド 1: I-1)。
+
+    **1 エントリの処理は最初から最後まで try の中で完結させる** (I-2)。
+    以前は `impact` の取得以降が try の外にあり、`{"impact": ["High"]}` の
+    ような 1 件が `TypeError: unhashable type` を投げて健全なイベントごと
+    週全体を落としていた — docstring がコードより広い主張をしていた。
     """
     r = httpx.get(_URL, timeout=30, follow_redirects=True)
     r.raise_for_status()
     payload = r.json()
     if not isinstance(payload, list):
-        # エラーページや仕様変更で dict / 文字列が返ることがある
-        # (実測: ff_calendar_nextweek.json は JSON ですらない応答を返す)。
+        # HTTP 200 のままエラーページや別形式が返る場合への防御。
         # dict をそのまま回すとキー文字列を全件捨てるだけになり、
         # 「0 件だった」と「取得に失敗した」が区別できなくなる。
+        # (存在しない週の URL は 404 + text/html なので、その経路は
+        #  ここではなく raise_for_status() が受ける — 実測値は報告書 §2)
         raise ValueError(
             f"unexpected calendar payload type: {type(payload).__name__}")
 
     out: list[dict] = []
+    dropped = 0
     unknown_impacts: Counter[str] = Counter()
     for raw in payload:
         try:
@@ -103,32 +135,35 @@ def fetch_ff_calendar() -> list[dict]:
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("entry has no usable title")
             ts = _event_ts(raw.get("date"))
+            # impact も try の内側で扱う: unhashable な値 (list/dict) は
+            # dict の get/in で TypeError になる
+            impact = raw.get("impact")
+            importance = _IMPACT.get(impact, _UNKNOWN_IMPACT)
+            unknown = impact not in _IMPACT
+            out.append({"ts": ts, "country": country.strip(),
+                        "name": name.strip(), "importance": importance,
+                        "forecast": _text_or_none(raw.get("forecast")),
+                        "previous": _text_or_none(raw.get("previous"))})
         except Exception as e:  # noqa: BLE001 — 1 件で週全体を落とさない
             # 生のエントリは丸ごとログに出さない (将来の仕様変更で何が
             # 載るか分からない)。title だけは同定に要るので repr で出す。
+            dropped += 1
             _log.warning("econ event skipped (%s): title=%r",
                          safe_error_text(e),
                          raw.get("title") if isinstance(raw, dict) else None)
             continue
-
-        impact = raw.get("impact")
-        importance = _IMPACT.get(impact, _UNKNOWN_IMPACT)
-        if impact not in _IMPACT:
+        if unknown:
             # 週内に同じ未知値が何十件も出るのでここでは溜めて、ループ後に
-            # 値ごとに 1 行だけ出す (無音にはしない / ログも溢れさせない)
+            # 値ごとに 1 行だけ出す (無音にはしない / ログも溢れさせない)。
+            # 集計だけをループ外に出し、値の取得自体は try の内側に置く。
             unknown_impacts[repr(impact)] += 1
-
-        out.append({"ts": ts, "country": country.strip(), "name": name.strip(),
-                    "importance": importance,
-                    "forecast": _text_or_none(raw.get("forecast")),
-                    "previous": _text_or_none(raw.get("previous"))})
 
     for value, count in unknown_impacts.items():
         _log.warning(
             "econ calendar: unknown impact %s on %d event(s); stored as "
             "importance=%d (means 'not on the High/Medium/Low scale', "
             "not 'harmless')", value, count, _UNKNOWN_IMPACT)
-    return out
+    return CalendarFetch(events=out, dropped=dropped)
 
 
 class EconCalendar:
@@ -144,11 +179,22 @@ class EconCalendar:
         失敗しても例外を漏らさない (fail soft)。ただし技術ログと activity
         の両方に残す — activity に出ないと、恒常的な失敗が人の目に触れる
         経路が無くなる。
+
+        **「取得はできたが 1 件も使えなかった」は成功ではない** (修正
+        ラウンド 1: I-1)。FF がキー名や日付書式を変えると全件がエントリ
+        単位で捨てられ、例外は 1 つも出ないまま `0 events` の成功行だけが
+        残る — 「本当に予定が無い週」と見分けが付かず、まさに気づく必要が
+        ある日に無音になる。捨てた件数を見て失敗として扱う。
         """
         try:
-            events = fetch_ff_calendar()
+            fetched = fetch_ff_calendar()
         except Exception as e:  # noqa: BLE001 — カレンダーで取引を止めない
             return self._record_failure("fetch", e)
+        events, dropped = fetched.events, fetched.dropped
+        if not events and dropped:
+            return self._record_failure("parse", ValueError(
+                f"all {dropped} calendar event(s) were dropped; "
+                "the upstream format may have changed"))
         stored = 0
         try:
             for ev in events:
@@ -165,8 +211,10 @@ class EconCalendar:
             # 失敗そのものは activity / 技術ログ側で可視化する。
             self._record_failure("store", e)
             return stored       # 成功行 (econ_refreshed) は書かない
+        # drop 件数も残す: 0 件なら「全部読めた」ことの記録になり、
+        # 増え始めたら仕様変更の予兆として人が気づける
         self.activity.write(Category.NEWS, "econ_refreshed",
-                            f"{stored} events")
+                            f"{stored} events ({dropped} dropped)")
         return stored
 
     def _record_failure(self, stage: str, e: BaseException) -> int:

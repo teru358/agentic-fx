@@ -64,8 +64,10 @@ def _cal(tmp_path, now: datetime = NOW) -> EconCalendar:
 
 def test_fetch_maps_fields_and_normalizes_utc():
     with patch("httpx.get", return_value=_resp(FF_JSON)):
-        events = fetch_ff_calendar()
+        fetched = fetch_ff_calendar()
+    events = fetched.events
     assert len(events) == 5
+    assert fetched.dropped == 0            # 全件読めたことも戻り値に載る
     assert events[0]["country"] == "USD"
     assert events[0]["name"] == "CPI y/y"
     # importance は 3 段すべてを固定する (1 つずらす改変を落とすため)
@@ -81,9 +83,21 @@ def test_fetch_maps_fields_and_normalizes_utc():
 def test_fetch_empty_strings_become_none():
     """実測では空欄は "" (null ではない)。DB には NULL として入れる。"""
     with patch("httpx.get", return_value=_resp(FF_JSON)):
-        events = fetch_ff_calendar()
+        fetched = fetch_ff_calendar()
+    events = fetched.events
     assert events[1]["forecast"] is None      # "" → None
     assert events[1]["previous"] == "0.2%"    # 値はそのまま
+
+
+def test_fetch_non_string_forecast_becomes_none():
+    """非文字列の予想値は None (str() で偽の値を作らない)。"""
+    payload = [{"title": "Odd", "country": "USD",
+                "date": "2026-07-22T15:30:00-04:00", "impact": "High",
+                "forecast": ["3.1%"], "previous": 3.0}]
+    with patch("httpx.get", return_value=_resp(payload)):
+        events = fetch_ff_calendar().events
+    assert events[0]["forecast"] is None
+    assert events[0]["previous"] is None
 
 
 def test_fetch_drops_naive_datetime_and_warns(caplog):
@@ -97,8 +111,10 @@ def test_fetch_drops_naive_datetime_and_warns(caplog):
                 "forecast": "", "previous": ""}, *FF_JSON]
     with caplog.at_level(logging.WARNING, logger="agentic_fx.econ"), \
          patch("httpx.get", return_value=_resp(payload)):
-        events = fetch_ff_calendar()
+        fetched = fetch_ff_calendar()
+    events = fetched.events
     assert len(events) == 5                       # 残り 5 件は生きている
+    assert fetched.dropped == 1                   # 捨てた件数を呼び出し側へ
     assert all(e["name"] != "No TZ" for e in events)
     assert "naive" in caplog.text.lower()
 
@@ -115,8 +131,10 @@ def test_fetch_skips_broken_entry_and_keeps_the_rest(caplog):
                *FF_JSON]
     with caplog.at_level(logging.WARNING, logger="agentic_fx.econ"), \
          patch("httpx.get", return_value=_resp(payload)):
-        events = fetch_ff_calendar()
+        fetched = fetch_ff_calendar()
+    events = fetched.events
     assert len(events) == 5
+    assert fetched.dropped == 4
     assert {e["name"] for e in events} == {
         "CPI y/y", "Retail Sales", "SPPI y/y", "At Now", "At Plus 24h"}
     assert caplog.text.count("skipped") >= 4       # 捨てたものは無音にしない
@@ -129,10 +147,31 @@ def test_fetch_unknown_impact_is_zero_and_warns(caplog):
                 "forecast": "", "previous": ""}]
     with caplog.at_level(logging.WARNING, logger="agentic_fx.econ"), \
          patch("httpx.get", return_value=_resp(payload)):
-        events = fetch_ff_calendar()
+        fetched = fetch_ff_calendar()
+    events = fetched.events
     assert len(events) == 1
     assert events[0]["importance"] == 0
     assert "Holiday" in caplog.text          # 実際の値をログに残すこと
+
+
+def test_fetch_unhashable_impact_does_not_kill_the_week():
+    """`impact` が list/dict でも週全体を落とさない (修正ラウンド 1: I-2)。
+
+    `_IMPACT.get(impact, ...)` / `impact not in _IMPACT` は unhashable な値で
+    `TypeError` を投げる。この処理が per-entry の try の外にあると、1 件で
+    健全なイベントごと全部失われる。
+    """
+    payload = [{"title": "Weird Impact", "country": "USD",
+                "date": "2026-07-22T15:30:00-04:00", "impact": ["High"],
+                "forecast": "", "previous": ""},
+               {"title": "Dict Impact", "country": "USD",
+                "date": "2026-07-22T16:30:00-04:00", "impact": {"a": 1},
+                "forecast": "", "previous": ""},
+               *FF_JSON]
+    with patch("httpx.get", return_value=_resp(payload)):
+        fetched = fetch_ff_calendar()          # 例外を貫通させない
+    assert len(fetched.events) == 5            # 健全な 5 件は生きている
+    assert fetched.dropped == 2
 
 
 def test_fetch_rejects_non_list_payload():
@@ -212,8 +251,36 @@ def test_refresh_partial_store_failure_returns_stored_count(tmp_path):
     assert cal.conn.execute("SELECT COUNT(*) FROM econ_events").fetchone()[0] == 2
     assert [r["name"] for r in cal.upcoming(hours=24)] == ["CPI y/y"]
     tail = "\n".join(cal.activity.tail(10))
-    assert "econ_refresh_failed" in tail
-    assert "econ_refreshed" not in tail       # 失敗を成功行で上書きしない
+    assert "\tNEWS\tecon_refresh_failed\tstore: OperationalError" in tail
+    assert "\tNEWS\tecon_refreshed\t" not in tail   # 失敗を成功行で上書きしない
+
+
+def test_refresh_all_dropped_is_recorded_as_failure(tmp_path):
+    """全件が捨てられたら「成功 0 件」ではなく**失敗**として残す (I-1)。
+
+    FF がキー名や日付書式を変えると、例外は 1 つも出ないまま全件が
+    エントリ単位で捨てられる。成功行を書くと「本当に予定が無い週」と
+    見分けが付かず、まさに気づく必要がある日に無音になる。
+    """
+    payload = [dict(e, date=e["date"][:19]) for e in FF_JSON]   # 全件 naive
+    cal = _cal(tmp_path)
+    with patch("httpx.get", return_value=_resp(payload)):
+        assert cal.refresh() == 0
+    tail = "\n".join(cal.activity.tail(10))
+    assert "\tNEWS\tecon_refresh_failed\tparse: ValueError:" in tail
+    assert "\tNEWS\tecon_refreshed\t" not in tail
+
+
+def test_refresh_success_summary_reports_dropped_count(tmp_path):
+    """成功時の summary にも drop 件数を残す (増え始めたら予兆として見える)。"""
+    payload = [{"title": "No TZ", "country": "USD",
+                "date": "2026-07-22T15:30:00", "impact": "High",
+                "forecast": "", "previous": ""}, *FF_JSON]
+    cal = _cal(tmp_path)
+    with patch("httpx.get", return_value=_resp(payload)):
+        assert cal.refresh() == 5
+    assert "\tNEWS\tecon_refreshed\t5 events (1 dropped)\t" in \
+        "\n".join(cal.activity.tail(10))
 
 
 def test_refresh_fail_soft(tmp_path):
@@ -228,8 +295,7 @@ def test_refresh_failure_is_recorded_in_activity(tmp_path):
     with patch("httpx.get", side_effect=OSError("down")):
         cal.refresh()
     tail = "\n".join(cal.activity.tail(10))
-    assert "econ_refresh_failed" in tail
-    assert "OSError" in tail
+    assert "\tNEWS\tecon_refresh_failed\tfetch: OSError: down\t" in tail
 
 
 def test_refresh_success_is_recorded_in_activity(tmp_path):
@@ -237,8 +303,9 @@ def test_refresh_success_is_recorded_in_activity(tmp_path):
     with patch("httpx.get", return_value=_resp(FF_JSON)):
         cal.refresh()
     tail = "\n".join(cal.activity.tail(10))
-    assert "econ_refreshed" in tail
-    assert "5" in tail
+    # summary フィールドに限定して照合する (行全体を対象にすると ISO
+    # タイムスタンプの数字が偶然一致して、件数が何でも通ってしまう)
+    assert "\tNEWS\tecon_refreshed\t5 events (0 dropped)\t" in tail
 
 
 def test_refresh_failure_does_not_leak_url(tmp_path, caplog):
