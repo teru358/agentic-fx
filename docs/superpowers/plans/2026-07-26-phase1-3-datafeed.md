@@ -1783,6 +1783,15 @@ git commit -m "feat: ChromaDB RAG (news 48h 掃除 / reflections)"
 
 ### Task 7: news collector + 初期ソースデータ (datafeed/news_collector.py)
 
+> **実装済み (2026-07-28〜29、commits `f69cd76..e9aba9b`)。以下のコードは実装と一致しません**。**現在の正は `src/agentic_fx/datafeed/news_collector.py` / `default_sources.py` / `datafeed/fetchers.py`** です。変更点:
+>
+> 1. **`seed_default_sources` の重複判定は url だけでなく name も見る**。`news_sources` は `name` と `url` の**両方**が UNIQUE (`store/db.py:90,92`)。url だけで事前チェックすると、name はそのままで url を差し替えた既存行に再 INSERT を試み、`sqlite3.IntegrityError` で init 自体が落ちる
+> 2. **`existing_names` / `existing_urls` はループ内で更新する** (修正ラウンド 1)。ループ前の 1 回のスナップショットだと `DEFAULT_SOURCES` **自体の中に**衝突があった場合に検知できない。`list_all` の呼び出しも 1 回に集約
+> 3. **未知の `fetcher` 値は警告してスキップする**。無言で `fetch_web` にフォールバックしない
+> 4. **ソース失敗ログは `_safe_error_text` を通す** (`price_provider` と同じ。URL/秘密を素で載せない)
+> 5. **`fetch_feed` が feedparser の `bozo` を見る** (修正ラウンド 1、Task 5 の `fetchers.py` 側の変更)。feedparser はネットワーク層の失敗を**例外化せず `bozo` フラグに吸収する**ため、本 Task の per-source `try/except` は `fetcher="feed"` に対して dead code だった — **死んだソースは 0 件を返し続け、警告も activity も永久に出ない**。`bozo` かつ `entries` 空 → `FeedFetchError` を送出 (collect が失敗として記録)、`bozo` だが `entries` あり → warning のみで取れたものは返す (ニュースは fail-open)、`bozo=False` の 0 件 → 従来どおり無警告。`bozo_exception` は**型名のみ**使う (`str()` に URL/ホスト名が乗りうる)
+> 6. **`DEFAULT_SOURCES` の 3 件を実接続で確認済み** (2026-07-29)。3 件とも `status=200` / `bozo=False` / entries あり。日付表記は `Z` / `+0900` / `GMT` で、**Task 5 から申し送りの `CST` の罠は該当しない**。`nhk-keizai` の `cat5.xml` は実測で経済カテゴリ。**ただし `yahoo-finance-topstories` は `summary` 要素を持たず 42 件すべて body が空になる** — RAG の doc がタイトルだけになる。扱い (差し替え / `fetcher="web"` 化 / 許容) は**ユーザー裁定待ち**
+
 **Files:**
 - Create: `src/agentic_fx/datafeed/news_collector.py`
 - Create: `src/agentic_fx/datafeed/default_sources.py`
