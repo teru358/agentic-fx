@@ -1974,6 +1974,20 @@ git commit -m "feat: news collector + 基本ソース初期データ (障害ス�
 
 ### Task 8: econ カレンダー (datafeed/econ_calendar.py)
 
+> **実装済み (2026-07-29、commits `2a77e7a..c50a771`)。以下のコードは実装と一致しません**。**現在の正は `src/agentic_fx/datafeed/econ_calendar.py`** です。変更点:
+>
+> 1. **`fetch_ff_calendar()` の戻り値は `list[dict]` ではなく `CalendarFetch(events, dropped)`** (frozen dataclass)。捨てた件数を呼び出し側に渡さないと、FF が仕様変更して全件 drop されたときに「0 件の週」と区別できず、`activity` に**成功行**が残ってしまう (Task 7 の「死んだフィードが無音」と同じ失敗様式)。`refresh` は `stored == 0 and dropped > 0` を失敗として記録する。**本当に 0 件の週 (`dropped == 0`) は成功**
+> 2. **`datetime.fromisoformat` が naive を返した場合はイベント単位で捨てて警告する**。`.astimezone(timezone.utc)` は naive を**ローカル時刻とみなす**ため、そのままではプロジェクト絶対制約「naive を UTC/ローカルとみなさない」の直接違反になる。カレンダーは執行系ではないので週全体を落とさず、時刻の誤ったイベントを混ぜないことを優先する
+> 3. **エントリ単位の防御が `impact` まで覆う**。`_IMPACT.get(impact, …)` も `impact not in _IMPACT` も dict 操作なので、`{"impact": ["High"]}` のような 1 件で `TypeError` が関数を貫通し**健全なイベントも全部失われる**
+> 4. **未知の `impact` 値は無音で 0 にせず警告する** (値ごとに 1 行、`Counter` で集約)
+> 5. **`_safe_error_text` を `src/agentic_fx/datafeed/_safe_error.py` に一本化**。`price_provider` / `news_collector` に同じ関数が複製されており、ここが 3 つ目になるところだった。既存 2 箇所も差し替え済み (挙動は不変)
+> 6. **失敗も activity に残す** (`econ_refresh_failed`)。技術ログの warning だけでは人の目に触れる経路が無い
+> 7. **`upcoming` は `clock.now()` を UTC に正規化してから store に渡す**。store は ISO **文字列**比較なので、非 UTC の clock だと窓が静かにずれ、naive だと 1 件も当たらない
+> 8. **非 list の JSON ペイロードを拒否する** (200 でエラーページが返る場合への防御)
+>
+> **ForexFactory の実測 (2026-07-29、実接続。実装者とレビュアーが独立に再現)**: HTTP 200 / `application/json` / **92 件** / 6 キーすべて全件に存在 / `date` は**常にオフセット付き**の NY ローカル ISO (`-04:00`、冬は `-05:00`。naive も `Z` も 0 件) / `impact` は **High 19・Medium 12・Low 61 の 3 種のみ** (`Holiday` は当該週に不在 = **未観測**) / 空欄は `""` (`null` は 0 件) / `(date, country, title)` は 92 件すべて一意。
+> `ff_calendar_nextweek.json` / `_lastweek.json` は **HTTP 404 + `text/html`** (`raise_for_status()` が先に発火するため、非 list 検査の経路には到達しない)。
+
 **Files:**
 - Create: `src/agentic_fx/datafeed/econ_calendar.py`
 - Test: `tests/datafeed/test_econ_calendar.py`
