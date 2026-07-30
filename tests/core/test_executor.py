@@ -7,10 +7,12 @@ from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
 from agentic_fx.core.accounting import record_snapshot
 from agentic_fx.core.contracts import (
-    Action, FixedClock, InstrumentSpec, Origin, Quote, TradeIntent,
+    Action, ConversionRate, FixedClock, InstrumentSpec, Origin, Quote,
+    TradeIntent,
 )
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.paper_broker import PaperBroker
+from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.store import intents as intents_store
 from agentic_fx.store import missions, orders
 from agentic_fx.store.db import connect, init_db
@@ -25,7 +27,16 @@ SPEC = InstrumentSpec(symbol="USDJPY", pip_size=0.01, min_lot=0.01,
 QUOTE = Quote("USDJPY", 148.49, 148.51, NOW, "test")
 
 
-def _setup(tmp_path, broker=None):
+def _rate_fn(ccy, account_ccy, now):
+    """USDJPY 専用の最小限のレート供給スタブ (JPY 恒等 / USD→JPY のみ)。"""
+    if ccy == account_ccy:
+        return ConversionRate(1.0, ccy, account_ccy, (now,))
+    if ccy == "USD" and account_ccy == "JPY":
+        return ConversionRate(QUOTE.ask, "USD", "JPY", (now,))
+    raise DataUnhealthy(f"no rate for {ccy}->{account_ccy}")
+
+
+def _setup(tmp_path, broker=None, rate_fn=None):
     conn = connect(tmp_path / "t.db")
     init_db(conn)
     record_snapshot(conn, now=NOW, balance=1_000_000, equity=1_000_000)
@@ -37,7 +48,7 @@ def _setup(tmp_path, broker=None):
                   activity=ActivityLog(tmp_path / "activity.log"),
                   notifier=Notifier(enabled=False, webhook_url=None),
                   clock=FixedClock(NOW), quote_fn=lambda p: QUOTE,
-                  spec_fn=lambda p: SPEC)
+                  spec_fn=lambda p: SPEC, rate_fn=rate_fn or _rate_fn)
     mid = missions.start(conn, "trade", "local", "m", NOW)
     return conn, ex, state, mid
 
@@ -359,3 +370,133 @@ def test_ref_price_included_in_intent_payload(tmp_path):
         "SELECT payload_json FROM trade_intents ORDER BY id DESC LIMIT 1"
     ).fetchone()
     assert json.loads(row["payload_json"])["ref_price"] == 148.50
+
+
+# --- 口座通貨換算層 (設計書 §5、改訂第16版) --------------------------------
+
+EUR_SPEC = InstrumentSpec("EURUSD", 0.0001, 0.01, 10.0, 0.01, 100_000,
+                          base_currency="EUR", quote_currency="USD")
+
+
+def test_open_risk_and_notional_converts_per_pair_no_price_in_notional(
+        tmp_path):
+    from agentic_fx.core.executor import open_risk_and_notional
+    conn, ex, _, _ = _setup(tmp_path)
+    orders.insert(conn, pair="USDJPY", direction="long", entry_type="market",
+                 horizon="day", status="open", now=NOW, quantity=0.10,
+                 avg_fill_price=148.20, stop_loss=147.80)
+    orders.insert(conn, pair="EURUSD", direction="long", entry_type="market",
+                 horizon="day", status="open", now=NOW, quantity=0.20,
+                 avg_fill_price=1.1000, stop_loss=1.0950)
+
+    def spec_fn(pair):
+        return SPEC if pair == "USDJPY" else EUR_SPEC
+
+    # EUR の base_to_account を entry 価格 (1.10 付近) とはかけ離れた値
+    # (200.0) にする — notional が entry を使っていれば桁が全く合わなくなる。
+    rates = {"JPY": ConversionRate(1.0, "JPY", "JPY", (NOW,)),
+            "USD": ConversionRate(148.51, "USD", "JPY", (NOW,)),
+            "EUR": ConversionRate(200.0, "EUR", "JPY", (NOW,))}
+
+    total_risk, total_notional, count = open_risk_and_notional(
+        conn, spec_fn, SETTINGS.risk, lambda ccy: rates[ccy])
+
+    assert count == 2
+    rule_usdjpy = SETTINGS.risk.pair_rules["USDJPY"]
+    spread_usdjpy = rule_usdjpy.assumed_spread_pips * SPEC.pip_size
+    risk_usdjpy = (0.40 + spread_usdjpy) * 100_000 * 0.10 * 1.0 \
+        + SETTINGS.risk.commission_per_lot * 0.10
+    rule_eur = SETTINGS.risk.pair_rules["EURUSD"]
+    spread_eur = rule_eur.assumed_spread_pips * EUR_SPEC.pip_size
+    sl_dist_eur = abs(1.1000 - 1.0950)
+    risk_eur = (sl_dist_eur + spread_eur) * 100_000 * 0.20 * 148.51 \
+        + SETTINGS.risk.commission_per_lot * 0.20
+    assert total_risk == pytest.approx(risk_usdjpy + risk_eur)
+
+    notional_usdjpy = 0.10 * 100_000 * 148.51   # base=USD
+    notional_eur = 0.20 * 100_000 * 200.0        # base=EUR (rate ≠ entry 価格)
+    assert total_notional == pytest.approx(notional_usdjpy + notional_eur)
+
+
+def test_cycle_rate_fn_fetches_once_per_currency_across_rows(tmp_path):
+    """スナップショット固定のピン: 同一サイクル内で同じ通貨の行が複数
+    あっても、外部レート取得は通貨ごとに 1 回だけであること (都度取得に
+    戻す変異のピン)。"""
+    from agentic_fx.core.executor import open_risk_and_notional
+    conn, ex, _, _ = _setup(tmp_path)
+    for _ in range(3):
+        orders.insert(conn, pair="USDJPY", direction="long",
+                      entry_type="market", horizon="day", status="open",
+                      now=NOW, quantity=0.05, avg_fill_price=148.20,
+                      stop_loss=147.80)
+    calls: list[str] = []
+
+    def counting_rate_fn(ccy, account_ccy, now):
+        calls.append(ccy)
+        return _rate_fn(ccy, account_ccy, now)
+
+    ex.rate_fn = counting_rate_fn
+    cycle_rate = ex.cycle_rate_fn(NOW)
+    open_risk_and_notional(conn, ex.spec_fn, SETTINGS.risk, cycle_rate)
+    # 3 行とも quote=JPY (恒等)・base=USD だが、キャッシュにより通貨ごとに
+    # 1 回だけ rate_fn が呼ばれる (恒等変換も呼び出し自体はカウントされる)。
+    assert calls.count("USD") == 1
+    assert calls.count("JPY") == 1
+
+
+def test_open_rejected_when_conversion_rate_unavailable(tmp_path):
+    """予約・建玉が無くても、この intent 自身の換算レートが取れなければ
+    却下される (設計書 §5: gate → intent 却下、理由に換算不能を明記)。"""
+    conn, ex, _, mid = _setup(tmp_path)
+    ex.spec_fn = lambda p: EUR_SPEC   # quote=USD, base=EUR
+    ex.rate_fn = _rate_fn             # EUR->JPY は解決不可 (スタブの制約)
+    it = _open_intent(pair="EURUSD", limit_price=1.1000, stop_loss=1.0950,
+                      take_profit=1.1200)
+    out = ex.handle_intent(it, mid)
+    assert out["result"] == "rejected"
+    assert any("conversion rate unavailable" in r for r in out["reasons"])
+    row = conn.execute("SELECT * FROM trade_intents").fetchone()
+    assert row["gate_result"] == "rejected"
+
+
+def test_close_degraded_falls_back_to_last_good_rate(tmp_path):
+    """クローズ時にレートが取れなくても、直前に成功したレートで degraded
+    換算して完遂すること (設計書 §5: クローズはレート欠損でも妨げない)。"""
+    conn, ex, _, mid = _setup(tmp_path)
+    it = _open_intent(entry_type="market", limit_price=None, expires_in=None,
+                      stop_loss=148.00, take_profit=149.60)
+    oid = ex.handle_intent(it, mid)["order_id"]
+    # 一度成功させて last_good_rate を温める (open 時に USD->JPY を取得済み)
+    row = orders.get(conn, oid)
+    assert ex._last_good_rate.get(("USD", "JPY")) is not None
+
+    def failing_rate_fn(ccy, account_ccy, now):
+        raise DataUnhealthy("rate feed down")
+
+    ex.rate_fn = failing_rate_fn
+    from agentic_fx.core.contracts import OrderStatus as S
+    final = ex.close_order(row, 148.60, reason="test")
+    assert final == S.CLOSED
+    closed = orders.get(conn, oid)
+    assert closed["status"] == "closed"
+    assert closed["realized_pnl"] is not None   # degraded だが計算できている
+
+
+def test_close_with_no_rate_ever_leaves_realized_pnl_none(tmp_path):
+    """直前に成功したレートも一度も無ければ、クローズ自体は完遂するが
+    realized_pnl は未確定のまま残す (次回の定期同期で解消)。"""
+    def never_rate_fn(ccy, account_ccy, now):
+        raise DataUnhealthy("rate feed down")
+
+    conn, ex, _, mid = _setup(tmp_path, rate_fn=never_rate_fn)
+    oid = orders.insert(conn, pair="USDJPY", direction="long",
+                        entry_type="market", horizon="day", status="open",
+                        now=NOW, quantity=0.10, avg_fill_price=148.20,
+                        stop_loss=147.80, take_profit=149.60)
+    row = orders.get(conn, oid)
+    from agentic_fx.core.contracts import OrderStatus as S
+    final = ex.close_order(row, 148.60, reason="test")
+    assert final == S.CLOSED
+    closed = orders.get(conn, oid)
+    assert closed["status"] == "closed"
+    assert closed["realized_pnl"] is None

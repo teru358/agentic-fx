@@ -58,7 +58,10 @@ def _env(tmp_path, now, on_econ_cycle=None):
         settings=settings, state_store=state, activity=activity,
         notifier=Notifier(enabled=False, webhook_url=None), clock=clock,
         # ★ プラン 2 の注入点にプラン 3 の実装をそのまま渡す
-        quote_fn=provider.get_quote, spec_fn=provider.spec)
+        quote_fn=provider.get_quote, spec_fn=provider.spec,
+        rate_fn=lambda ccy, account_ccy, now: provider.to_account_rate(
+            ccy, account_ccy, reference_ts=now,
+            max_skew_min=settings.datafeed.freshness_max_min))
     collector = NewsCollector(
         conn, Rag(tmp_path / "rag", embedding_function=FakeEmbedding()),
         activity, clock)

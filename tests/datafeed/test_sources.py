@@ -43,7 +43,7 @@ def test_vendor_symbol_resolver():
     assert vendor_symbol("USDJPY", "td") == "USD/JPY"
     assert vendor_symbol("USDJPY", "mt5") == "USDJPY"
     with pytest.raises(KeyError):
-        vendor_symbol("GBPUSD", "yf")  # 未定義は KeyError
+        vendor_symbol("CHFUSD", "yf")  # 未定義は KeyError
 
 
 def test_yf_bars_maps_dataframe():

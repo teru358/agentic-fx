@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Callable
 
 from agentic_fx._safe_error import safe_error_text
@@ -10,12 +10,13 @@ from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import Settings
 from agentic_fx.core import accounting, transitions
 from agentic_fx.core.contracts import (
-    Action, BrokerResult, Clock, InstrumentSpec, Origin, OrderStatus as S,
-    Quote, TradeIntent,
+    Action, BrokerResult, Clock, ConversionRate, InstrumentSpec, Origin,
+    OrderStatus as S, Quote, TradeIntent,
 )
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker, compute_pnl
 from agentic_fx.core.risk_gate import GateContext, evaluate
+from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.store import intents as intents_store
 from agentic_fx.store import missions as missions_store
 from agentic_fx.store import orders
@@ -32,9 +33,20 @@ _EXPOSURE = (S.OPEN, S.PENDING_FILL, S.PROTECTION_PENDING, S.SUBMITTING,
 _UNKNOWN = (S.SUBMIT_UNKNOWN, S.CANCEL_UNKNOWN, S.CLOSE_UNKNOWN, S.CLOSING)
 
 
-def open_risk_and_notional(conn: sqlite3.Connection,
-                           spec_fn: Callable[[str], InstrumentSpec],
-                           risk) -> tuple[float, float, int]:
+def open_risk_and_notional(
+        conn: sqlite3.Connection, spec_fn: Callable[[str], InstrumentSpec],
+        risk, rate_fn: Callable[[str], ConversionRate],
+) -> tuple[float, float, int]:
+    """既存の予約・建玉の総リスク・総 notional (いずれも口座通貨建て)。
+
+    設計書 §5「口座通貨と換算」: 損失・リスク額はクォート通貨建てなので
+    `rate_fn(spec.quote_currency)` で口座通貨へ換算する。commission_per_lot
+    は口座通貨建て (config で明記) のため換算しない。notional はベース通貨の
+    想定元本 (`qty × contract_size`、価格は掛けない) を
+    `rate_fn(spec.base_currency)` で換算する。`rate_fn` は呼び出し側が
+    1 回の判断 (gate 評価・予約再検証サイクル) 内で固定したスナップショット
+    (同一通貨は 1 回だけ取得) を渡すこと — ここでは呼び出し回数を制御しない。
+    """
     total_risk = total_notional = 0.0
     rows = orders.list_by_status(conn, *_EXPOSURE)
     for r in rows:
@@ -43,9 +55,12 @@ def open_risk_and_notional(conn: sqlite3.Connection,
         spread = rule.assumed_spread_pips * spec.pip_size if rule else 0.0
         entry = r["avg_fill_price"] or r["requested_price"] or 0.0
         qty = r["quantity"] or 0.0
+        quote_rate = rate_fn(spec.quote_currency)
         total_risk += (abs(entry - (r["stop_loss"] or entry)) + spread) \
-            * spec.contract_size * qty + risk.commission_per_lot * qty
-        total_notional += qty * spec.contract_size * entry
+            * spec.contract_size * qty * quote_rate.value \
+            + risk.commission_per_lot * qty
+        base_rate = rate_fn(spec.base_currency)
+        total_notional += qty * spec.contract_size * base_rate.value
     return total_risk, total_notional, len(rows)
 
 
@@ -58,7 +73,9 @@ class Executor:
                  settings: Settings, state_store: StateStore,
                  activity: ActivityLog, notifier: Notifier, clock: Clock,
                  quote_fn: Callable[[str], Quote],
-                 spec_fn: Callable[[str], InstrumentSpec]) -> None:
+                 spec_fn: Callable[[str], InstrumentSpec],
+                 rate_fn: Callable[[str, str, datetime], ConversionRate],
+                 ) -> None:
         self.conn = conn
         self.broker = broker
         self.settings = settings
@@ -68,6 +85,55 @@ class Executor:
         self.clock = clock
         self.quote_fn = quote_fn
         self.spec_fn = spec_fn
+        # 通貨 1 単位 = 口座通貨いくらか (設計書 §5)。quote_fn/spec_fn と同じ
+        # 注入点の作法 (PriceProvider.to_account_rate を呼び出し側が
+        # account_currency/max_skew_min を束縛して渡す想定)。
+        self.rate_fn = rate_fn
+        # 「最後に健全性検証を通ったレート」キャッシュ (クローズ経路専用 —
+        # 設計書 §5: クローズはレート欠損でも妨げない。**予約再検証・
+        # mark-to-market・gate 評価には使わない** — それらは判断の精度が
+        # 目的であり、恒久的な会計精度は定期同期が担う (設計書 §5)。
+        # このキャッシュは tick/判断をまたいで永続する意図的な例外。
+        self._last_good_rate: dict[tuple[str, str], ConversionRate] = {}
+
+    # ---- 換算レート -------------------------------------------------------
+
+    def cycle_rate_fn(self, now) -> Callable[[str], ConversionRate]:
+        """1 回の判断 (gate 評価・予約再検証・mark-to-market サイクル) 内で
+        レートを固定するローカルキャッシュを返す (設計書 §5)。呼び出し側は
+        `self` に保持せず、その判断の間だけ使い捨てること — 永続させると
+        「予約再検証は現在レートで行う」という運用方針に反する。
+
+        成功した取得は `_last_good_rate` (クローズ経路の degraded フォール
+        バック専用) も更新する。
+        """
+        cache: dict[str, ConversionRate] = {}
+        account_ccy = self.settings.account_currency
+
+        def fn(ccy: str) -> ConversionRate:
+            if ccy not in cache:
+                rate = self.rate_fn(ccy, account_ccy, now)
+                cache[ccy] = rate
+                self._last_good_rate[(ccy, account_ccy)] = rate
+            return cache[ccy]
+        return fn
+
+    def resolve_close_rate(self, ccy: str,
+                           now) -> tuple[ConversionRate | None, bool]:
+        """クローズ専用のレート解決。現在レートが取れなければ最後に健全性
+        検証を通ったレートへ degraded フォールバックする (設計書 §5:
+        クローズはレート欠損でも妨げない)。戻り値は (rate, degraded)。
+        rate が None なのは、一度も健全なレートを観測できていない場合のみ
+        (プロセス起動直後の初回クローズ等) — この場合 realized_pnl は
+        未確定のまま残し、次回の定期同期で解消する。
+        """
+        account_ccy = self.settings.account_currency
+        try:
+            rate = self.rate_fn(ccy, account_ccy, now)
+            self._last_good_rate[(ccy, account_ccy)] = rate
+            return rate, False
+        except Exception:  # noqa: BLE001 — クローズを止めない (設計書 §5)
+            return self._last_good_rate.get((ccy, account_ccy)), True
 
     # ---- public ---------------------------------------------------------
 
@@ -125,16 +191,32 @@ class Executor:
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
         equity, hwm = account
-        risk_total, notional, count = open_risk_and_notional(
-            self.conn, self.spec_fn, self.settings.risk)
+        # 1 回の gate 評価内でレートを固定する (設計書 §5)。既存集計
+        # (open_risk_and_notional) とこの intent 自身の換算に同じ
+        # スナップショットを使う — 途中で取り直さない。
+        cycle_rate = self.cycle_rate_fn(now)
+        try:
+            risk_total, notional, count = open_risk_and_notional(
+                self.conn, self.spec_fn, self.settings.risk, cycle_rate)
+            quote_to_account = cycle_rate(spec.quote_currency)
+            base_to_account = cycle_rate(spec.base_currency)
+        except DataUnhealthy as e:
+            reasons = [f"conversion rate unavailable: {safe_error_text(e)}"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": None, "reasons": reasons}
         ctx = GateContext(
             quote=quote, spec=spec, equity=equity, hwm=hwm,
             daily_start_equity=accounting.daily_start_equity(self.conn, now),
-            open_position_count=count, existing_risk_total=risk_total,
-            existing_notional=notional,
+            open_position_count=count, existing_risk_account=risk_total,
+            existing_notional_account=notional,
             kill_switch_latched=self.state.load().kill_switch_latched,
             has_unresolved_unknown=has_unresolved_unknown(self.conn),
             account_currency=self.settings.account_currency,
+            quote_to_account=quote_to_account,
+            base_to_account=base_to_account,
             now=now)
         result = evaluate(intent, ctx, self.settings.risk)
         if not result.accepted:
@@ -247,14 +329,32 @@ class Executor:
                                 ref_id=str(row["id"]))
             self.notifier.send(f"[agentic-fx] クローズ結果不明 #{row['id']}")
             return S.CLOSE_UNKNOWN
-        pnl = compute_pnl(row, price, contract_size=spec.contract_size,
-                          commission_per_lot=self.settings.risk.commission_per_lot)
+        # 設計書 §5: クローズはレート欠損でも妨げない。現在レートが取れなければ
+        # 最後に健全性検証を通ったレートへ degraded フォールバックする。
+        # どちらも無ければ (プロセス起動直後の初回クローズ等) realized_pnl は
+        # 未確定のまま残し、次回の定期同期で解消する (資金保護が換算に従属
+        # してはならない)。
+        rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
+        pnl = compute_pnl(
+            row, price, contract_size=spec.contract_size,
+            commission_per_lot=self.settings.risk.commission_per_lot,
+            quote_to_account_rate=rate.value) if rate is not None else None
         transitions.transition(self.conn, row["id"], S.CLOSED, now,
                                close_price=price, realized_pnl=pnl,
                                closed_at=now.isoformat())
+        pnl_text = f"{pnl:.0f}" if pnl is not None else "degraded(unresolved)"
         self.activity.write(Category.TRADE, "order_closed",
-                            f"{row['pair']} pnl={pnl:.0f} reason={reason}",
+                            f"{row['pair']} pnl={pnl_text} reason={reason}",
                             ref_id=str(row["id"]))
+        if degraded:
+            self.activity.write(
+                Category.TRADE, "close_pnl_rate_degraded",
+                f"{row['pair']}: 換算レート取得不能 — " + (
+                    "最後の健全レートで計算 (次回同期で吸収)" if pnl is not None
+                    else "realized_pnl 未確定 (次回同期で解消)"),
+                ref_id=str(row["id"]))
+            self.notifier.send(
+                f"[agentic-fx] クローズ換算レート degraded #{row['id']}")
         return S.CLOSED
 
     def cancel_order(self, row: dict, reason: str) -> S:

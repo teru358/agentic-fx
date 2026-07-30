@@ -9,9 +9,11 @@ from agentic_fx.config import load_settings
 from agentic_fx.core import market_hours
 from agentic_fx.core.accounting import record_snapshot
 from agentic_fx.core.contracts import (
-    Bar, FixedClock, InstrumentSpec, Mode, Origin, Quote, TradeIntent,
+    Bar, ConversionRate, FixedClock, InstrumentSpec, Mode, Origin, Quote,
+    TradeIntent,
 )
 from agentic_fx.core.executor import Executor, has_unresolved_unknown
+from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
 from agentic_fx.store import missions, orders
@@ -36,9 +38,24 @@ GBP_SPEC = InstrumentSpec("GBPJPY", 0.01, 0.01, 50.0, 0.01, 100_000,
 QUOTE = Quote("USDJPY", 148.49, 148.51, WED, "test")
 
 
+def _default_rate_fn(ccy, account_ccy, now):
+    """既存テスト (USDJPY のみ想定) 向けの最小限のレートスタブ。
+
+    spec_fn は常に SPEC (USDJPY: quote=JPY/base=USD) を返す既存の慣習
+    (site1 系テストのコメント参照) なので、このスタブは JPY 恒等と
+    USD->JPY (QUOTE.ask 固定) だけを知っていれば足りる。換算層自体の
+    新規テストは `env.executor.rate_fn` を明示的に差し替える。
+    """
+    if ccy == account_ccy:
+        return ConversionRate(1.0, ccy, account_ccy, (now,))
+    if ccy == "USD" and account_ccy == "JPY":
+        return ConversionRate(QUOTE.ask, "USD", "JPY", (now,))
+    raise DataUnhealthy(f"no rate for {ccy}->{account_ccy}")
+
+
 class Env:
     def __init__(self, tmp_path, quote_fn=None, base=WED, news_fn=None,
-                 econ_fn=None):
+                 econ_fn=None, rate_fn=None):
         from agentic_fx.core.notifier import Notifier
         self.conn = connect(tmp_path / "t.db")
         init_db(self.conn)
@@ -58,7 +75,8 @@ class Env:
             settings=SETTINGS, state_store=self.state,
             activity=ActivityLog(tmp_path / "a.log"),
             notifier=Notifier(enabled=False, webhook_url=None), clock=clock,
-            quote_fn=quote_fn or (lambda p: QUOTE), spec_fn=lambda p: SPEC)
+            quote_fn=quote_fn or (lambda p: QUOTE), spec_fn=lambda p: SPEC,
+            rate_fn=rate_fn or _default_rate_fn)
         self.sched = Scheduler(
             conn=self.conn, executor=self.executor, settings=SETTINGS,
             state_store=self.state, activity=ActivityLog(tmp_path / "a.log"),

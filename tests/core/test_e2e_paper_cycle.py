@@ -9,7 +9,8 @@ from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
 from agentic_fx.core.accounting import record_snapshot
 from agentic_fx.core.contracts import (
-    Bar, FixedClock, InstrumentSpec, Origin, Quote, TradeIntent,
+    Bar, ConversionRate, FixedClock, InstrumentSpec, Origin, Quote,
+    TradeIntent,
 )
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.notifier import Notifier
@@ -24,6 +25,14 @@ SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
 SPEC = InstrumentSpec("USDJPY", 0.01, 0.01, 50.0, 0.01, 100_000,
                       base_currency="USD", quote_currency="JPY")
+
+
+def _rate_fn(ccy, account_ccy, now):
+    if ccy == account_ccy:
+        return ConversionRate(1.0, ccy, account_ccy, (now,))
+    if ccy == "USD" and account_ccy == "JPY":
+        return ConversionRate(148.51, "USD", "JPY", (now,))
+    raise ValueError(f"no rate for {ccy}->{account_ccy}")
 
 
 def test_full_paper_cycle(tmp_path):
@@ -41,7 +50,7 @@ def test_full_paper_cycle(tmp_path):
                         notifier=Notifier(enabled=False, webhook_url=None),
                         clock=clock,
                         quote_fn=lambda p: Quote(p, 148.49, 148.51, WED, "t"),
-                        spec_fn=lambda p: SPEC)
+                        spec_fn=lambda p: SPEC, rate_fn=_rate_fn)
     sched = Scheduler(conn=conn, executor=executor, settings=SETTINGS,
                       state_store=state, activity=activity,
                       bars_fn=lambda p: bars.get(p),

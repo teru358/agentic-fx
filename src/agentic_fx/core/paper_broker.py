@@ -14,12 +14,22 @@ from agentic_fx.core.contracts import BrokerResult, Clock
 
 
 def compute_pnl(order_row: dict, close_price: float, *, contract_size: float,
-                commission_per_lot: float) -> float:
+                commission_per_lot: float,
+                quote_to_account_rate: float) -> float:
+    """戻り値は**口座通貨建て**の実現 PnL (commission 込み)。
+
+    `gross` はクォート通貨建てで計算する (`close_price`/`avg_fill_price` は
+    common pair 表記の quote 通貨建て)。呼び出し側が
+    `quote_to_account_rate` (spec.quote_currency → account_currency の
+    ConversionRate.value、クローズ時点のレート、取得不能なら最後に健全性
+    検証を通ったレートで degraded 換算) を供給する (設計書 §5)。
+    `commission_per_lot` は口座通貨建て (config で明記) のため**換算しない**。
+    """
     sign = 1.0 if order_row["direction"] == "long" else -1.0
     qty = order_row["quantity"]
-    gross = (close_price - order_row["avg_fill_price"]) * contract_size \
+    gross_quote = (close_price - order_row["avg_fill_price"]) * contract_size \
         * qty * sign
-    return gross - commission_per_lot * qty
+    return gross_quote * quote_to_account_rate - commission_per_lot * qty
 
 
 class PaperBroker:

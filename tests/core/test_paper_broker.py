@@ -39,13 +39,38 @@ def test_submit_returns_ok_with_paper_id(tmp_path):
 def test_compute_pnl_long_short():
     long_row = {"direction": "long", "avg_fill_price": 148.50,
                 "quantity": 0.1}
-    # (149.00-148.50)*100000*0.1 = 5000
+    # (149.00-148.50)*100000*0.1 = 5000 (quote_to_account_rate=1.0: 非退行)
     assert compute_pnl(long_row, 149.00, contract_size=100_000,
-                       commission_per_lot=0.0) == pytest.approx(5000)
+                       commission_per_lot=0.0,
+                       quote_to_account_rate=1.0) == pytest.approx(5000)
     short_row = {"direction": "short", "avg_fill_price": 148.50,
                  "quantity": 0.1}
     assert compute_pnl(short_row, 149.00, contract_size=100_000,
-                       commission_per_lot=0.0) == pytest.approx(-5000)
+                       commission_per_lot=0.0,
+                       quote_to_account_rate=1.0) == pytest.approx(-5000)
+
+
+def test_compute_pnl_converts_quote_to_account():
+    # 設計書 §5: gross はクォート通貨建てで計算し、quote_to_account_rate で
+    # 口座通貨へ換算する。rate≠1.0 で正しく掛かることを固定する (EURUSD
+    # golden と対をなす非退行ピン)。
+    row = {"direction": "long", "avg_fill_price": 1.1000, "quantity": 1.0}
+    # gross_quote = (1.1010-1.1000)*100000*1.0 = 100 (USD)
+    # → 100 * 163.665 = 16,366.5 JPY
+    pnl = compute_pnl(row, 1.1010, contract_size=100_000,
+                      commission_per_lot=0.0,
+                      quote_to_account_rate=163.665)
+    assert pnl == pytest.approx(16_366.5)
+
+
+def test_compute_pnl_commission_not_converted():
+    # commission_per_lot は口座通貨建てなので rate を掛けてはならない。
+    row = {"direction": "long", "avg_fill_price": 1.1000, "quantity": 1.0}
+    pnl = compute_pnl(row, 1.1010, contract_size=100_000,
+                      commission_per_lot=500.0,
+                      quote_to_account_rate=163.665)
+    gross_account = (1.1010 - 1.1000) * 100_000 * 1.0 * 163.665
+    assert pnl == pytest.approx(gross_account - 500.0)
 
 
 def test_balance_reflects_realized_pnl(tmp_path):

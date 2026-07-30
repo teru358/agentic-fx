@@ -10,7 +10,7 @@ from agentic_fx.activity import ActivityLog, Category
 from agentic_fx._safe_error import safe_error_text, safe_text
 from agentic_fx.config import Settings
 from agentic_fx.core import accounting, market_hours, transitions
-from agentic_fx.core.contracts import Bar, Mode, OrderStatus as S
+from agentic_fx.core.contracts import Bar, ConversionRate, Mode, OrderStatus as S
 from agentic_fx.core.executor import Executor, open_risk_and_notional
 from agentic_fx.core.paper_fills import check_exit, check_limit_fill
 from agentic_fx.store import orders
@@ -272,10 +272,18 @@ class Scheduler:
         return True
 
     def _evaluate_positions(self, now: datetime) -> tuple[float, float, bool]:
-        """(balance, unrealized, stale) を返す。例外は呼び出し側が握る。"""
+        """(balance, unrealized, stale) を返す。例外は呼び出し側が握る。
+
+        設計書 §5: 時価評価はポジション毎に quote→account 換算してから
+        合算する。**いずれかのポジションのレートが解決できない tick は
+        snapshot を記録しない** — バー陳腐化と同じ扱い (stale=True)。
+        1 回の判断 (このサイクル) 内でレートを固定する (`cycle_rate_fn`) —
+        このメソッドの呼び出しをまたいで使い回さない (毎 tick 新規に作る)。
+        """
         balance, _ = self.executor.broker.equity()
         unrealized = 0.0
         stale = False
+        cycle_rate = self.executor.cycle_rate_fn(now)
         for row in orders.list_by_status(self.conn, S.OPEN):
             bar = self.bars_fn(row["pair"])
             if bar is None or now - bar.ts > _BAR_FRESHNESS:
@@ -286,9 +294,22 @@ class Scheduler:
                     ref_id=str(row["id"]))
                 continue
             spec = self.executor.spec_fn(row["pair"])
+            try:
+                rate = cycle_rate(spec.quote_currency)
+            except Exception as e:  # noqa: BLE001 — バー陳腐化と同じ扱い
+                stale = True
+                text = safe_error_text(e)
+                self.activity.write(
+                    Category.SYSTEM, "snapshot_stale_rate_skip",
+                    f"{row['pair']}: {text} — 時価評価を見送り",
+                    ref_id=str(row["id"]))
+                _log.warning("mark-to-market rate unavailable for %s: %s",
+                            row["pair"], text)
+                continue
             sign = 1.0 if row["direction"] == "long" else -1.0
             unrealized += (bar.close - row["avg_fill_price"]) \
-                * spec.contract_size * (row["quantity"] or 0.0) * sign
+                * spec.contract_size * (row["quantity"] or 0.0) * sign \
+                * rate.value
         return balance, unrealized, stale
 
     def _resolve_unknowns(self, now: datetime) -> None:
@@ -390,12 +411,27 @@ class Scheduler:
             # broker 側は成功済み — 以降の DB 確定処理の失敗は握りつぶさない
             from agentic_fx.core.paper_broker import compute_pnl
             spec = self.executor.spec_fn(row["pair"])
+            # 設計書 §5: クローズはレート欠損でも妨げない (close_order と
+            # 同じ degraded フォールバック規律)。
+            rate, degraded = self.executor.resolve_close_rate(
+                spec.quote_currency, now)
             pnl = compute_pnl(
                 fresh, price, contract_size=spec.contract_size,
-                commission_per_lot=self.settings.risk.commission_per_lot)
+                commission_per_lot=self.settings.risk.commission_per_lot,
+                quote_to_account_rate=rate.value) if rate is not None else None
             transitions.transition(
                 self.conn, row["id"], S.CLOSED, now,
                 close_price=price, realized_pnl=pnl, closed_at=now.isoformat())
+            if degraded:
+                self.activity.write(
+                    Category.TRADE, "close_pnl_rate_degraded",
+                    f"{row['pair']}: 換算レート取得不能 — " + (
+                        "最後の健全レートで計算 (次回同期で吸収)"
+                        if pnl is not None
+                        else "realized_pnl 未確定 (次回同期で解消)"),
+                    ref_id=str(row["id"]))
+                self.executor.notifier.send(
+                    f"[agentic-fx] クローズ換算レート degraded #{row['id']}")
         else:
             transitions.transition(self.conn, row["id"], S.CLOSE_UNKNOWN, now)
 
@@ -566,16 +602,22 @@ class Scheduler:
             # 再実行されない。ゼロ除算だけは常に避ける。
             return True
         risk = self.settings.risk
+        # 設計書 §5: 1 回の予約再検証サイクル (この呼び出し全体、while ループ
+        # を含む) 内でレートを固定する。呼び出しをまたいで使い回さない
+        # (毎 tick 新規に作る) — 「予約再検証はその時点の現在レートで行う」
+        # という運用方針と一貫させるため。
+        cycle_rate = self.executor.cycle_rate_fn(now)
+        ok = self._cancel_pairs_with_unavailable_rate(cycle_rate)
         while True:
             total_risk, notional, _ = open_risk_and_notional(
-                self.conn, self.executor.spec_fn, risk)
+                self.conn, self.executor.spec_fn, risk, cycle_rate)
             within = (total_risk <= equity * risk.max_total_risk_pct / 100
                       and notional / equity <= risk.max_leverage)
             if within:
-                return True
+                return ok
             pending = orders.list_by_status(self.conn, S.PENDING_FILL)
             if not pending:
-                return True  # 指値以外の超過は取消では解消できない
+                return ok  # 指値以外の超過は取消では解消できない
             newest = pending[-1]
             # C1 (fix round 1): この while True ループは「予約が 1 件
             # 減って条件を再評価する」進行を cancel_order の成功
@@ -607,6 +649,60 @@ class Scheduler:
                 # tick() にこの tick の fills_allowed=False を委ねる
                 # (上の docstring 参照)。
                 return False
+
+    def _cancel_pairs_with_unavailable_rate(
+            self, cycle_rate: Callable[[str], ConversionRate]) -> bool:
+        """設計書 §5「レート取得不能時の層別動作」: 予約再検証で当該ペアの
+        口座通貨換算ができない場合、そのペアの pending_fill を取消す
+        (ペア単位。他ペアの予約は健全なレートで再検証を継続する)。
+
+        **`spec_fn(pair)` の例外はここでは保護しない** (既存の site1 系
+        テストが固定する挙動: spec 自体が引けない場合は「換算不能」とは
+        別の障害クラスであり、呼び出し元 `_maintain_reservations` /
+        `open_risk_and_notional` を通じて tick() の広い except に落ちる
+        既存の全体フォールバックに委ねる — ここで拾って握ると、
+        「取消は諦められた」という既存の観測可能な挙動が変わってしまう)。
+        保護するのは `cycle_rate` (= レート取得) の失敗だけ。
+
+        戻り値: すべてのペアの取消が (取消不能ペアが無ければ) 成功した場合
+        True。取消を試みて失敗した (cancel_order が CANCELLED 以外に終わる、
+        または例外を投げる) 場合は False — 呼び出し元はこの tick の
+        fills_allowed を False にする (資金保護の 2 層構えと同じ規律)。
+        """
+        ok = True
+        pairs = {row["pair"]
+                for row in orders.list_by_status(self.conn, S.PENDING_FILL)}
+        for pair in pairs:
+            spec = self.executor.spec_fn(pair)   # 保護しない (docstring 参照)
+            try:
+                cycle_rate(spec.quote_currency)
+                cycle_rate(spec.base_currency)
+            except Exception as e:  # noqa: BLE001 — 換算不能はペア単位取消
+                text = safe_error_text(e)
+                self.activity.write(
+                    Category.TRADE, "reservation_rate_unavailable",
+                    f"{pair}: {text} — 当該ペアの pending_fill を取消")
+                _log.warning("reservation rate unavailable for %s: %s",
+                            pair, text)
+                for row in orders.list_by_status(self.conn, S.PENDING_FILL):
+                    if row["pair"] != pair:
+                        continue
+                    try:
+                        final = self.executor.cancel_order(
+                            row, reason="rate_unavailable")
+                        if final != S.CANCELLED:
+                            ok = False
+                    except Exception as cancel_err:  # noqa: BLE001
+                        ok = False
+                        ctext = safe_error_text(cancel_err)
+                        self.activity.write(
+                            Category.TRADE, "reservation_rate_cancel_error",
+                            f"#{row['id']} {pair}: {ctext} — この tick の"
+                            "取消を打ち切り", ref_id=str(row["id"]))
+                        _log.warning(
+                            "reservation rate cancel failed #%s: %s",
+                            row["id"], ctext)
+        return ok
 
     def _force_close_day(self, now: datetime) -> None:
         """codex 3: 期限は注文毎に (filled_at 起点の next_rollover で) 導出
