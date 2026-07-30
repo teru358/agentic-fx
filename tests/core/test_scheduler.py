@@ -2581,8 +2581,19 @@ def test_maintain_reservations_rejected_rate_does_not_poison_later_pairs(
     env.sched.tick(WED + timedelta(minutes=1))
 
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
-    assert "reservation_rate_unavailable" in _event_names(log)
-    assert "GBP" in log, "真の外れ値通貨 (GBP) がエラーに現れていない"
+    unavailable_lines = [
+        line for line in log.splitlines()
+        if line and line.split("\t")[2] == "reservation_rate_unavailable"]
+    # fix round 4 (レビュー指摘 F4): 「"GBP" in log」だけだと GBPJPY という
+    # ペア名文字列自体に "GBP" が含まれるため、犯人 (offending currency) を
+    # 誤指名しても素通りしてしまう。event 行を 1 本に絞り、そのペア接頭辞
+    # (GBPJPY) と offending currency (GBP) の両方を厳密に確認する。
+    assert len(unavailable_lines) == 1, unavailable_lines
+    assert unavailable_lines[0].split("\t")[3].startswith("GBPJPY: "), (
+        unavailable_lines[0])
+    assert "offending currency: GBP)" in unavailable_lines[0], (
+        "真の外れ値通貨 (GBP) が offending currency として現れていない: "
+        f"{unavailable_lines[0]}")
     assert orders.get(env.conn, gbp_pending)["status"] == "cancelled", (
         "外れ値ペア (GBPJPY) が取消されていない")
     assert orders.get(env.conn, eur_pending)["status"] == "pending_fill", (
@@ -2590,3 +2601,75 @@ def test_maintain_reservations_rejected_rate_does_not_poison_later_pairs(
     assert orders.get(env.conn, zzz_pending)["status"] == "pending_fill", (
         "cascade: 外れ値の後に処理された健全ペア (ZZZCHF) が"
         "巻き添えで取消/約定した")
+
+
+def test_maintain_reservations_span_min_not_committed_misses_old_then_new_violation(
+        tmp_path):
+    """fix round 4 (レビュー指摘 F1・fail-open 方向): 確定行
+    `span_min, span_max = candidate_min, candidate_max` の **span_min 側を
+    確定しない** (span_max だけ確定する) 変異のピン。
+
+    この変異下では、新しいレートを検査するたびに `candidate_min` が
+    「これまでの最小」ではなく「このレート自身の脚」まで巻き戻ってしまう
+    (`span_min` が更新されないため `candidate_min is None` が常に成立し、
+    ループ内の `ts if candidate_min is None else ...` が毎回リセットされる
+    ように働く)。そのため「**古い**レートが先に受理され、**後から新しい**
+    レートが来る」方向の超過は、新しいレート自身の脚どうし (`candidate_max`
+    と、リセットされた `candidate_min`) の差だけで判定されてしまい、
+    実際には最初に確定した古いレートとの間に真の skew があっても検出
+    できない。
+
+    fix round 3 までに追加した既存テスト (EURUSD 健全 / GBPJPY 外れ値 /
+    ZZZCHF 健全、いずれも「新しいレートの方が古いレートより後で範囲外」
+    という向き) はこの変異ではカバーされない (レビュアー実測: 580 passed
+    のまま生存) ため、ここでは**逆向き** — EURUSD が「個別には健全だが
+    古い」(now-(skew-1)) 脚を持ち最初に処理され、GBPJPY/ZZZCHF が
+    now+2min (個別には健全) の脚を持つ構成にする。真の全体 span は
+    (skew-1)+2 = skew+1 > skew なので GBPJPY/ZZZCHF は本来どちらも
+    取消されるべきだが、この変異下では検出されず両方とも pending_fill の
+    まま残ってしまう。"""
+    env = Env(tmp_path)
+    env.executor.spec_fn = _spec_by_pair
+    skew = SETTINGS.datafeed.conversion_skew_max_min
+
+    def rate_fn(ccy, account_ccy, now):
+        # EURUSD の脚 (EUR, USD) は now-(skew-1)min ("古い" が個別には健全)
+        if ccy in ("EUR", "USD"):
+            return ConversionRate(148.51, ccy, "JPY",
+                                  (now - timedelta(minutes=skew - 1),))
+        if ccy == account_ccy:   # 恒等レートは本番同様 reference_ts=now
+            return ConversionRate(1.0, ccy, account_ccy, (now,))
+        # GBPJPY/ZZZCHF の脚 (GBP, CHF) は now+2min ("新しい" が個別には健全)
+        if ccy in ("GBP", "CHF"):
+            return ConversionRate(190.0, ccy, "JPY",
+                                  (now + timedelta(minutes=2),))
+        raise DataUnhealthy(f"no rate for {ccy}")
+
+    env.executor.rate_fn = rate_fn
+
+    eur_pending = orders.insert(
+        env.conn, pair="EURUSD", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.01,
+        requested_price=1.1000, stop_loss=1.0950, take_profit=1.1200,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+    gbp_pending = orders.insert(
+        env.conn, pair="GBPJPY", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.01,
+        requested_price=190.00, stop_loss=189.00, take_profit=192.00,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+    zzz_pending = orders.insert(
+        env.conn, pair="ZZZCHF", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.01,
+        requested_price=1.0500, stop_loss=1.0400, take_profit=1.0700,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    assert orders.get(env.conn, eur_pending)["status"] == "pending_fill", (
+        "先に確定した EURUSD (個別には健全) が巻き込まれて取消/約定した")
+    assert orders.get(env.conn, gbp_pending)["status"] == "cancelled", (
+        "span_min が確定されず、EURUSD との真の skew (>skew) が検出できて"
+        "いない (GBPJPY が取消されるべきなのに残っている)")
+    assert orders.get(env.conn, zzz_pending)["status"] == "cancelled", (
+        "span_min が確定されず、EURUSD との真の skew (>skew) が検出できて"
+        "いない (ZZZCHF が取消されるべきなのに残っている)")
