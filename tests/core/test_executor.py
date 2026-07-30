@@ -499,6 +499,103 @@ def test_cycle_rate_fn_allows_rates_within_overall_skew(tmp_path):
     assert eur.value == pytest.approx(1.10)
 
 
+def test_cycle_rate_fn_rejected_rate_does_not_poison_later_currencies(
+        tmp_path):
+    """fix round 3 (codex 節目レビュー再検証 — 新規 Important): 拒否した
+    レートの leg 時刻が running span (確定値) に残ると、以後のキャッシュ
+    未登録の通貨の要求までずっと巻き添えで失敗し続ける cascade になる。
+    USD (健全) → GBP (外れ値、全体スパンを破る) → CHF (健全、USD と同時刻)
+    の順で呼び、GBP だけが拒否され、CHF は cascade に巻き込まれず成功する
+    こと。2 通貨だけの構成では GBP の失敗を見て終わり、この cascade は
+    見えない — 3 通貨目 (CHF) が本テストの主眼。"""
+    conn, ex, _, _ = _setup(tmp_path)
+    skew = SETTINGS.datafeed.conversion_skew_max_min
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == "USD":
+            return ConversionRate(148.51, "USD", "JPY", (now,))
+        if ccy == "GBP":
+            return ConversionRate(190.0, "GBP", "JPY",
+                                  (now - timedelta(minutes=skew + 2),))
+        if ccy == "CHF":
+            return ConversionRate(160.0, "CHF", "JPY", (now,))
+        raise DataUnhealthy(f"no rate for {ccy}")
+
+    ex.rate_fn = rate_fn
+    cycle_rate = ex.cycle_rate_fn(NOW)
+    cycle_rate("USD")   # 健全、確定 span = {NOW, NOW}
+    with pytest.raises(DataUnhealthy, match="GBP"):
+        cycle_rate("GBP")   # 外れ値、拒否される (エラーは GBP を名指し)
+    chf = cycle_rate("CHF")   # cascade していれば GBP の外れ値に巻き込まれ
+    # て失敗するが、正しい実装では USD の確定 span だけで判定され成功する。
+    assert chf.value == pytest.approx(160.0)
+
+
+def test_cycle_rate_fn_does_not_cache_rejected_rate(tmp_path):
+    """M2 (未ピン不変条件, codex 再レビュー指摘): 全体スパンを破って
+    拒否されたレートが cache に入ってしまうと、同一判断内で同じ通貨を
+    **再度**要求したとき span 検証を経ずに (拒否されたはずの) レートを
+    黙って返す fail-open になる。同じ通貨 (GBP) を 2 回要求し、2 回とも
+    再取得され・2 回とも同じ理由で拒否されることを固定する
+    (`cache[ccy] = rate` を raise の前に移す変異のピン)。"""
+    conn, ex, _, _ = _setup(tmp_path)
+    skew = SETTINGS.datafeed.conversion_skew_max_min
+    calls: list[str] = []
+
+    def rate_fn(ccy, account_ccy, now):
+        calls.append(ccy)
+        if ccy == "USD":
+            return ConversionRate(148.51, "USD", "JPY", (now,))
+        if ccy == "GBP":
+            return ConversionRate(190.0, "GBP", "JPY",
+                                  (now - timedelta(minutes=skew + 2),))
+        raise DataUnhealthy(f"no rate for {ccy}")
+
+    ex.rate_fn = rate_fn
+    cycle_rate = ex.cycle_rate_fn(NOW)
+    cycle_rate("USD")
+    with pytest.raises(DataUnhealthy, match="GBP"):
+        cycle_rate("GBP")
+    with pytest.raises(DataUnhealthy, match="GBP"):
+        # 1 回目の拒否が cache に入っていれば、ここは (span 再検証されず)
+        # 例外を投げずに終わってしまう。
+        cycle_rate("GBP")
+    assert calls.count("GBP") == 2, (
+        "1 回目の拒否が cache され、2 回目が再取得すらしていない (fail-open)")
+
+
+def test_cycle_rate_fn_updates_last_good_rate_even_when_overall_skew_rejects(
+        tmp_path):
+    """M3 (未ピン不変条件, codex 再レビュー指摘): 全体 skew 検証で拒否
+    されたレートでも、個別には健全 (`to_account_rate` 自身の検証は通って
+    いる) なので `_last_good_rate` (クローズ経路の degraded フォールバック
+    専用、設計書 §5「クローズはレート欠損でも妨げない」) は更新される、
+    という報告書 fix round 2 の裁定を固定する (更新を span 検証の後に
+    移す変異のピン)。"""
+    conn, ex, _, _ = _setup(tmp_path)
+    skew = SETTINGS.datafeed.conversion_skew_max_min
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == "USD":
+            return ConversionRate(148.51, "USD", "JPY", (now,))
+        if ccy == "GBP":
+            return ConversionRate(190.0, "GBP", "JPY",
+                                  (now - timedelta(minutes=skew + 2),))
+        raise DataUnhealthy(f"no rate for {ccy}")
+
+    ex.rate_fn = rate_fn
+    cycle_rate = ex.cycle_rate_fn(NOW)
+    cycle_rate("USD")
+    assert ex._last_good_rate.get(("GBP", "JPY")) is None   # 前提: まだ無い
+    with pytest.raises(DataUnhealthy, match="GBP"):
+        cycle_rate("GBP")
+    cached = ex._last_good_rate.get(("GBP", "JPY"))
+    assert cached is not None, (
+        "全体 skew で拒否されたレートが _last_good_rate に反映されていない"
+        " (クローズの degraded フォールバックが使えなくなる)")
+    assert cached.value == pytest.approx(190.0)
+
+
 def test_open_rejected_when_conversion_rate_unavailable(tmp_path):
     """予約・建玉が無くても、この intent 自身の換算レートが取れなければ
     却下される (設計書 §5: gate → intent 却下、理由に換算不能を明記)。"""

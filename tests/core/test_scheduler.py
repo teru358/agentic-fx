@@ -35,6 +35,11 @@ EUR_SPEC = InstrumentSpec("EURUSD", 0.0001, 0.01, 50.0, 0.01, 100_000,
                           base_currency="EUR", quote_currency="USD")
 GBP_SPEC = InstrumentSpec("GBPJPY", 0.01, 0.01, 50.0, 0.01, 100_000,
                           base_currency="GBP", quote_currency="JPY")
+# fix round 3 (cascade テスト用): quote=CHF (base は EUR を再利用し、独立
+# した新規通貨を増やさない)。sorted() で "EURUSD" < "GBPJPY" < "ZZZCHF"
+# の順に処理されることを利用する。
+ZZZCHF_SPEC = InstrumentSpec("ZZZCHF", 0.01, 0.01, 50.0, 0.01, 100_000,
+                             base_currency="EUR", quote_currency="CHF")
 QUOTE = Quote("USDJPY", 148.49, 148.51, WED, "test")
 
 
@@ -2181,8 +2186,8 @@ def test_site2_close_order_failure_does_not_stop_remaining_day_positions(
 # 差し替える。
 
 def _spec_by_pair(pair):
-    return {"USDJPY": SPEC, "EURUSD": EUR_SPEC, "GBPJPY": GBP_SPEC}.get(
-        pair, SPEC)
+    return {"USDJPY": SPEC, "EURUSD": EUR_SPEC, "GBPJPY": GBP_SPEC,
+           "ZZZCHF": ZZZCHF_SPEC}.get(pair, SPEC)
 
 
 def test_maintain_reservations_cancels_only_the_pair_with_unavailable_rate(
@@ -2522,3 +2527,66 @@ def test_mark_to_market_overall_skew_skips_snapshot(tmp_path):
         "全体スパン超過なのに snapshot が更新された")
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
     assert "snapshot_stale_rate_skip" in _event_names(log)
+
+
+# --- fix round 3 (codex 節目レビュー再検証 — 新規 Important の cascade) ----
+#
+# 拒否したレートの leg 時刻が running span (確定値) に残り続けると、以後の
+# 健全な通貨の要求まで巻き添えで拒否され続ける。3 ペア (健全 / 外れ値 /
+# 健全・1 ペア目と同時刻) で「外れ値ペアだけが取消され、健全な 2 ペアは
+# 両方とも残る」ことを固定する — 2 ペア構成では cascade が隠れる
+# (2 ペア目の失敗を確認して終わり、3 ペア目の巻き添えを検出できない)。
+
+def test_maintain_reservations_rejected_rate_does_not_poison_later_pairs(
+        tmp_path):
+    """EURUSD (健全) → GBPJPY (外れ値、GBP が全体スパンを破る) → ZZZCHF
+    (健全、EURUSD と同時刻) の順に処理される (sorted)。GBPJPY だけが
+    取消され、EURUSD と ZZZCHF はどちらも pending のまま残ること。
+    エラーメッセージも真の外れ値通貨 (GBP) を指すこと。"""
+    env = Env(tmp_path)
+    env.executor.spec_fn = _spec_by_pair
+    skew = SETTINGS.datafeed.conversion_skew_max_min
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == account_ccy:
+            return ConversionRate(1.0, ccy, account_ccy, (now,))
+        if ccy in ("USD", "EUR", "CHF"):
+            return ConversionRate(148.51, ccy, "JPY", (now,))
+        if ccy == "GBP":
+            return ConversionRate(190.0, "GBP", "JPY",
+                                  (now - timedelta(minutes=skew + 2),))
+        raise DataUnhealthy(f"no rate for {ccy}")
+
+    env.executor.rate_fn = rate_fn
+
+    # quantity は小さく保つ (0.01): 総リスク・レバレッジの既存の上限
+    # トリミング (while ループ) が本テストの主眼である cascade 検証に
+    # 無関係に発火しないようにするため。
+    eur_pending = orders.insert(
+        env.conn, pair="EURUSD", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.01,
+        requested_price=1.1000, stop_loss=1.0950, take_profit=1.1200,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+    gbp_pending = orders.insert(
+        env.conn, pair="GBPJPY", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.01,
+        requested_price=190.00, stop_loss=189.00, take_profit=192.00,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+    zzz_pending = orders.insert(
+        env.conn, pair="ZZZCHF", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.01,
+        requested_price=1.0500, stop_loss=1.0400, take_profit=1.0700,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "reservation_rate_unavailable" in _event_names(log)
+    assert "GBP" in log, "真の外れ値通貨 (GBP) がエラーに現れていない"
+    assert orders.get(env.conn, gbp_pending)["status"] == "cancelled", (
+        "外れ値ペア (GBPJPY) が取消されていない")
+    assert orders.get(env.conn, eur_pending)["status"] == "pending_fill", (
+        "cascade: 先に確定した健全ペア (EURUSD) が巻き添えで取消/約定した")
+    assert orders.get(env.conn, zzz_pending)["status"] == "pending_fill", (
+        "cascade: 外れ値の後に処理された健全ペア (ZZZCHF) が"
+        "巻き添えで取消/約定した")

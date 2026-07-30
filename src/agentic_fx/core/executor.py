@@ -139,6 +139,22 @@ class Executor:
         先に確定した (キャッシュ済みの) ペアは取消されない — 「当該ペアの
         pending_fill のみ取消・他ペアは継続」という既存セマンティクスを
         保つ。報告書 fix round 2 節に根拠を記載。
+
+        fix round 3 (codex 節目レビュー再検証 — 新規 Important): 上記の
+        「running span」は**候補値で判定してから確定する**必要がある。
+        拒否したレートの leg 時刻を確定済み span (`span_min`/`span_max`)
+        に混ぜてしまうと、その外れ値が以後ずっと running span に居座り、
+        後続の (本来は健全な) 通貨の要求まで巻き添えで拒否され続ける
+        cascade になる (実測: pending 3 ペア = 健全 / 外れ値 / 健全・
+        1 ペア目と同時刻、で 3 ペア目まで取消され、エラーメッセージも
+        真の外れ値でない通貨を「offending currency」と誤指名した)。
+        これは設計書 §5 の「取消はペア単位に限定する (他ペアの予約は
+        健全なレートで再検証を継続する)」に反する。修正:
+        `span_min`/`span_max` は**このレートを受理する場合の候補値**として
+        別変数 (`candidate_min`/`candidate_max`) で計算し、候補が
+        `max_skew` 以内のときだけ `span_min`/`span_max`（確定値）と
+        `cache[ccy]` を更新する。拒否したレートの leg 時刻は確定値に
+        一切混ざらない。
         """
         cache: dict[str, ConversionRate] = {}
         account_ccy = self.settings.account_currency
@@ -156,14 +172,23 @@ class Executor:
                 # する — resolve_close_rate はこの全体 skew 検証の対象外
                 # (設計書 §5: クローズはレート欠損でも妨げない)。
                 self._last_good_rate[(ccy, account_ccy)] = rate
+                # fix round 3: 確定値 (span_min/span_max) はまだ書き換え
+                # ない。この呼び出しを受理する場合の候補値だけを計算する。
+                candidate_min, candidate_max = span_min, span_max
                 for ts in rate.leg_ts:
-                    span_min = ts if span_min is None else min(span_min, ts)
-                    span_max = ts if span_max is None else max(span_max, ts)
-                if span_max - span_min > max_skew:
+                    candidate_min = (
+                        ts if candidate_min is None else min(candidate_min, ts))
+                    candidate_max = (
+                        ts if candidate_max is None else max(candidate_max, ts))
+                if candidate_max - candidate_min > max_skew:
                     raise DataUnhealthy(
-                        f"conversion snapshot skew {span_max - span_min} "
-                        f"exceeds {max_skew} across this decision's rates "
+                        f"conversion snapshot skew "
+                        f"{candidate_max - candidate_min} exceeds "
+                        f"{max_skew} across this decision's rates "
                         f"(offending currency: {ccy})")
+                # 受理した場合のみ確定値を進める。拒否した呼び出しの leg
+                # 時刻はここに一切反映されない (cascade を防ぐ)。
+                span_min, span_max = candidate_min, candidate_max
                 cache[ccy] = rate
             return cache[ccy]
         return fn
