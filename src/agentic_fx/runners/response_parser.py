@@ -41,16 +41,39 @@ def _first_balanced_object(text: str) -> str | None:
 
 def parse_json_output(text: str) -> dict:
     cleaned = _THINK_RE.sub("", text)
+
+    # Fix 1: Discard everything from unclosed <think> to end
+    # (prevents decoy JSON inside unclosed think from being adopted)
+    think_pos = cleaned.find("<think>")
+    if think_pos != -1:
+        cleaned = cleaned[:think_pos]
+
     fence = _FENCE_RE.search(cleaned)
     if fence:
         cleaned = fence.group(1)
-    for candidate in (cleaned.strip(), _first_balanced_object(cleaned)):
-        if not candidate:
-            continue
+
+    # Try cleaned.strip() first (pure JSON case)
+    stripped = cleaned.strip()
+    if stripped:
+        try:
+            obj = json.loads(stripped)
+            # Fix 2: Reject top-level non-dict (arrays, scalars, etc)
+            if isinstance(obj, dict):
+                return obj
+            # Valid JSON but not dict -> raise immediately, don't fall back
+            raise ParseError(f"expected dict, got {type(obj).__name__}: {stripped[:100]!r}")
+        except json.JSONDecodeError:
+            # Not valid JSON at all, try balanced extraction
+            pass
+
+    # Try balanced object extraction (prose-embedded case)
+    candidate = _first_balanced_object(cleaned)
+    if candidate:
         try:
             obj = json.loads(candidate)
             if isinstance(obj, dict):
                 return obj
         except json.JSONDecodeError:
-            continue
+            pass
+
     raise ParseError(f"no parsable JSON object in: {text[:200]!r}")
