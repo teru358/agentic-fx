@@ -38,16 +38,26 @@ class ActivityLog:
         呼び出し site で同型の欠陥 N2 が実測された)。発生源であるここで
         一度だけ塞ぐ — 書き込みに失敗しても記録漏れとして技術ログに
         warning を残すのみで、呼び出し元には決して伝播させない。
+
+        I3 (fix round 1): 整形 3 行 (ts / clean / line の組み立て) も
+        try の中に含める。以前は try の外にあり、``summary=None``
+        (``None.split()``) や ``category`` が ``Category`` ではなく素の
+        str (``str.value`` は存在しない) のケースで「決して送出しない」
+        契約に反して例外が伝播していた (レビュアー実測)。
         """
-        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        clean = " ".join(summary.split())
-        line = "\t".join([ts, category.value, event, clean, ref_id or "-"])
         try:
+            ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            clean = " ".join(summary.split())
+            cat_value = category.value
+            line = "\t".join([ts, cat_value, event, clean, ref_id or "-"])
             with self._path.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception as e:  # noqa: BLE001 — write は送出しない契約
+            # category が Category でない場合に備え、ログ用表示は
+            # `.value` に依存しない (getattr で素通しできればそれを使う)。
+            cat_repr = getattr(category, "value", category)
             _log.warning("activity write failed (%s/%s): %s",
-                         category.value, event, safe_error_text(e))
+                         cat_repr, event, safe_error_text(e))
 
     def tail(self, n: int = 20, category: Category | None = None) -> list[str]:
         if not self._path.exists():

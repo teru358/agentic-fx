@@ -381,15 +381,30 @@ class Scheduler:
 
     def _expire_limits(self, now: datetime) -> None:
         for row in orders.list_by_status(self.conn, S.PENDING_FILL):
-            if not (row["expires_at"] and datetime.fromisoformat(
-                    row["expires_at"]) < now):
-                continue
-            # N3: 1 件の broker.cancel 例外で tick が落ちると、他の期限切れ
-            # 注文の取消・後続の _process_exits (資金保護) まで止まる
-            # (_cancel_all_pending と同型パターン)。注文単位で隔離する。
+            # I2 (fix round 1, advisor 指摘で追加): broker が結論
+            # (br.status) を返した**後**の失敗と、broker に結論を出させる
+            # 前の失敗を区別するフラグ。前者で無条件に CANCEL_UNKNOWN へ
+            # 落とすと、broker が "rejected" (= 既に約定済み/保護済み) と
+            # 教えてくれた注文が、こちら側の DB 書き込み失敗のせいで
+            # reconcile 経由 (not_found) で黙って cancelled になり得る
+            # (資金保護のハザード — Phase 1 の PaperBroker は "ok" しか
+            # 返さないため未到達だが、Phase 3 の MT5 で "rejected"/
+            # "unknown" が現実になる)。_retry_close が CLOSE_UNKNOWN を
+            # 「broker 未接触/結果不明」専用にしているのと同じ規律に揃える。
+            broker_answered = False
+            # N3/I1 (fix round 1): 期限判定 (datetime.fromisoformat) 自体も
+            # 隔離の内側に置く。以前は try の外にあり、不正な expires_at
+            # (ISO でない文字列等) の行が 1 件あるだけで毎 tick 同じ行で
+            # 例外を吐き、資金保護が恒久停止していた (レビュアー実測)。
+            # 注文単位で隔離する (_cancel_all_pending / _process_limit_fills
+            # / _process_exits と同型パターン)。
             try:
+                if not (row["expires_at"] and datetime.fromisoformat(
+                        row["expires_at"]) < now):
+                    continue
                 transitions.transition(self.conn, row["id"], S.CANCELLING, now)
                 br = self.executor.broker.cancel(row)
+                broker_answered = True
                 if br.status == "ok":
                     transitions.transition(self.conn, row["id"], S.EXPIRED, now)
                     self.activity.write(Category.TRADE, "limit_expired",
@@ -402,9 +417,48 @@ class Scheduler:
                                            S.CANCEL_UNKNOWN, now)
             except Exception as e:  # noqa: BLE001 — 他の期限切れ注文を止めない
                 text = safe_error_text(e)
+                # I2 (fix round 1): 以前の文言「— 次 tick 再試行」は事実に
+                # 反していた。broker.cancel 例外後の行は CANCELLING に
+                # 留まり、_expire_limits の PENDING_FILL 走査にも
+                # _resolve_unknowns の走査集合 (_UNKNOWN) にも入らず、
+                # 誰も再試行しない (gate も止まらない一方、_EXPOSURE には
+                # 算入されリスク枠を恒久占有する — 実測)。CANCEL_UNKNOWN へ
+                # 遷移させ _resolve_unknowns の走査に乗せる。
+                #
+                # ただし broker_answered が True (= broker が結論を返した
+                # 後の失敗) の場合はこの遷移を試みない — 上のコメント参照。
+                # broker が返した結論を無視して CANCELLING に留めておく方が、
+                # 誤って cancelled にするより安全側。
+                #
+                # 遷移の罠: 例外源が CANCELLING 遷移そのものだった場合、
+                # 行はまだ PENDING_FILL のままで ALLOWED[PENDING_FILL] に
+                # CANCEL_UNKNOWN は無く、無条件に遷移を試みると
+                # IllegalTransition がこのハンドラから漏れる。現在状態を
+                # 読み直し、CANCEL_UNKNOWN へ遷移可能な場合のみ試みる。
+                # 遷移呼び出し自体も独自の try で包み、どんな失敗でも
+                # この隔離を破らない。
+                note = "reconcile 未実施 — 手動確認が必要な場合あり"
+                if not broker_answered:
+                    current = orders.get(self.conn, row["id"])
+                    cur_status = S(current["status"]) if current else None
+                    if (cur_status is not None and S.CANCEL_UNKNOWN
+                            in transitions.ALLOWED.get(cur_status,
+                                                       frozenset())):
+                        try:
+                            transitions.transition(self.conn, row["id"],
+                                                   S.CANCEL_UNKNOWN, now)
+                            note = ("cancel_unknown へ遷移 — 次 tick の "
+                                   "reconcile で解決")
+                        except Exception as trans_err:  # noqa: BLE001 —
+                            # 隔離を破らない (遷移失敗でもこの注文を
+                            # スキップするのみ)
+                            _log.warning(
+                                "limit expire -> cancel_unknown failed "
+                                "#%s: %s", row["id"],
+                                safe_error_text(trans_err))
                 self.activity.write(
                     Category.TRADE, "limit_expire_error",
-                    f"#{row['id']} {row['pair']}: {text} — 次 tick 再試行",
+                    f"#{row['id']} {row['pair']}: {text} — {note}",
                     ref_id=str(row["id"]))
                 _log.warning("limit expire failed #%s: %s", row["id"], text)
 
@@ -468,7 +522,33 @@ class Scheduler:
             if not pending:
                 return  # 指値以外の超過は取消では解消できない
             newest = pending[-1]
-            self.executor.cancel_order(newest, reason="reservation")
+            # C1 (fix round 1): この while True ループは「予約が 1 件
+            # 減って条件を再評価する」進行を cancel_order の成功
+            # (CANCELLING への遷移) に依存している。ここで try/except →
+            # continue を当てると、cancel_order が同じ行で毎回 raise する
+            # 限り同じ行を掴み続けて無限ループ (tick ハング) になる
+            # (レビュアー実測)。他の隔離 site と異なり **return** して
+            # この tick の予約トリミングを諦め、後続の _process_exits
+            # (資金保護) に処理を渡す。
+            try:
+                self.executor.cancel_order(newest, reason="reservation")
+            except Exception as e:  # noqa: BLE001 — 資金保護 (SL/TP 監視) は
+                # この関数の外で続く。ここで諦めるのは「予約トリミング」
+                # だけであり、無限ループより安全側。
+                text = safe_error_text(e)
+                # I2 と同根の注意: cancel_order 内部の遷移が途中まで進んで
+                # いた場合、この行は PENDING_FILL から外れている可能性が
+                # あり (例: CANCELLING で停止)、その場合「次 tick 再試行」
+                # は事実に反する (次 tick の走査対象から漏れうる)。ここでは
+                # 断定を避け、事実 (この tick では打ち切った) だけを書く。
+                self.activity.write(
+                    Category.TRADE, "reservation_trim_error",
+                    f"#{newest['id']} {newest['pair']}: {text} "
+                    "— この tick の予約トリミングを打ち切り",
+                    ref_id=str(newest["id"]))
+                _log.warning("reservation trim failed #%s: %s",
+                            newest["id"], text)
+                return
 
     def _force_close_day(self, now: datetime) -> None:
         """codex 3: 期限は注文毎に (filled_at 起点の next_rollover で) 導出
