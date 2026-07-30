@@ -1,3 +1,5 @@
+import logging
+
 from agentic_fx.activity import ActivityLog, Category
 
 
@@ -31,3 +33,23 @@ def test_summary_newlines_sanitized(tmp_path):
     log = ActivityLog(tmp_path / "activity.log")
     log.write(Category.SYSTEM, "boot", "line1\nline2")
     assert len((tmp_path / "activity.log").read_text().strip().splitlines()) == 1
+
+
+def test_write_does_not_raise_on_io_error(tmp_path, caplog):
+    """N2 一次修正のピン: write は例外を送出しない契約。
+
+    activity は可観測性の記録であり、資金保護経路 (SL/TP 監視) の
+    隔離ハンドラのあらゆる場所から呼ばれるため、呼び出し側で毎回
+    try に包む方針はモグラ叩きになる (再レビュー N1 → N2 がその実証)。
+    書き込み不能でも記録漏れとして技術ログに warning を残すだけで、
+    呼び出し元へは決して伝播させない。
+
+    ``target`` をファイルではなくディレクトリにすることで、権限に依存
+    せず (root 実行でも) ``open("a")`` が確実に失敗する状況を作る。"""
+    target = tmp_path / "adir"
+    target.mkdir()
+    log = ActivityLog(target)
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.activity"):
+        log.write(Category.TRADE, "order_opened", "USDJPY long 0.10lot")
+    assert "activity write failed" in caplog.text
+    assert "order_opened" in caplog.text

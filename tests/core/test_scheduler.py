@@ -1158,3 +1158,270 @@ def test_activity_write_failure_does_not_reopen_same_bar_tp_window(tmp_path):
     # activity の障害がその判定条件を変えてはならない
     assert row["status"] == "open", "同一バー TP が誤確定した"
     assert row["close_reason"] is None
+
+
+# --- 再レビュー N2: 隔離ハンドラ内の activity.write が資金保護を殺す -----
+
+def test_exit_check_activity_write_failure_does_not_stop_remaining_orders(
+        tmp_path, caplog):
+    """N2 第二層のピン: `_process_exits` の per-order 隔離ハンドラが
+    `exit_check_error` を書こうとした ``activity.write`` 自体が (契約を
+    破る double で) 例外を投げても、後続の OPEN 注文の SL/TP 監視
+    (資金保護の最重要走査) を止めてはならず、tick 自体も完走すること。
+
+    `ActivityLog.write` 本体は一次修正で fail-soft になったが、この double
+    はそれを迂回して直接例外を投げるので、一次修正だけでは検出できない
+    — 第二層 (呼び出し site 側のさらなる try) をピンする。第二層の
+    ``safe_error_text(write_err)`` 経由も、write 例外のメッセージに
+    ``LEAKY`` (URL/秘密) を仕込んで確認する。"""
+    env = Env(tmp_path)
+    # A (先に走査される) = USDJPY: bars_fn が例外を投げる → 隔離ハンドラへ
+    a = orders.insert(env.conn, pair="USDJPY", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=148.20,
+                      stop_loss=147.80, take_profit=149.00)
+    # B = EURUSD: 正常なバーで SL 到達
+    b = orders.insert(env.conn, pair="EURUSD", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=1.1000,
+                      stop_loss=1.0960, take_profit=1.1120)
+    bars = {"EURUSD": Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                          1.0950, 1.0955, 1.0900, 1.0905, 100)}
+
+    def flaky_bars(pair):
+        if pair == "USDJPY":
+            raise RuntimeError("bar lookup down")
+        return bars.get(pair)
+
+    orig_write = env.sched.activity.write
+
+    def flaky_write(cat, event, msg, **kw):
+        if event == "exit_check_error":
+            raise OSError(LEAKY)
+        return orig_write(cat, event, msg, **kw)
+
+    env.sched.bars_fn = flaky_bars
+    env.sched.activity.write = flaky_write
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.scheduler"):
+        env.sched.tick(WED + timedelta(minutes=1))
+    row_a = orders.get(env.conn, a)
+    row_b = orders.get(env.conn, b)
+    assert row_a["status"] == "open"     # A は隔離されてスキップされるだけ
+    assert row_b["status"] == "closed"   # B の保護は生きている (第二層で保証)
+    assert row_b["close_reason"] == "sl"
+    assert env.trade_calls == 1          # tick は _process_exits の後まで完走
+    _assert_no_url(caplog.text)          # 第二層の safe_error_text(write_err)
+
+
+# --- N3: _cancel_all_pending / _expire_limits の無保護ループ --------------
+
+def test_cancel_all_pending_continues_after_one_cancel_order_raises(tmp_path):
+    """N3: equity<=0 (債務超過 = SL/TP が最も要る状態) で呼ばれる
+    `_cancel_all_pending` の 1 件目の cancel_order が例外を投げても、
+    2 件目の取消と、同一 tick 内の `_process_exits` (資金保護) を
+    止めてはならない。例外メッセージは `safe_error_text` を通した形で
+    activity に残ること (`LEAKY` で URL/秘密が漏れないことも確認)。"""
+    env = Env(tmp_path)
+    p1 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                       entry_type="limit", horizon="day",
+                       status="pending_fill", now=WED, quantity=0.1,
+                       requested_price=148.2, stop_loss=147.8)
+    p2 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                       entry_type="limit", horizon="day",
+                       status="pending_fill", now=WED, quantity=0.1,
+                       requested_price=148.1, stop_loss=147.7)
+    o = orders.insert(env.conn, pair="USDJPY", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=148.20,
+                      stop_loss=147.80, take_profit=149.00)
+
+    orig_cancel = env.executor.cancel_order
+
+    def flaky_cancel(row, reason):
+        if row["id"] == p1:
+            raise RuntimeError(LEAKY)
+        return orig_cancel(row, reason=reason)
+
+    env.executor.cancel_order = flaky_cancel
+    env.executor.broker.equity = lambda: (0.0, 0.0)
+    # SL (147.80) を明確に下回るバー
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.30, 148.35, 147.50, 147.55, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    assert orders.get(env.conn, p2)["status"] == "cancelled"  # 2 件目は取消
+    row_o = orders.get(env.conn, o)
+    assert row_o["status"] == "closed"                        # SL 監視は継続
+    assert row_o["close_reason"] == "sl"
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "cancel_all_pending_error" in log
+    _assert_no_url(log)
+
+
+def test_expire_limits_continues_after_one_broker_cancel_raises(tmp_path):
+    """修正 3: 期限切れ limit の `broker.cancel` 1 件が例外を投げても、
+    2 件目の expire 処理と tick 全体は継続すること。例外メッセージは
+    `safe_error_text` を通した形で activity に残ること (`LEAKY` で
+    URL/秘密が漏れないことも確認)。"""
+    expired = (WED - timedelta(minutes=1)).isoformat()
+    env = Env(tmp_path)
+    e1 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                       entry_type="limit", horizon="day",
+                       status="pending_fill", now=WED, quantity=0.1,
+                       requested_price=148.2, stop_loss=147.8,
+                       expires_at=expired)
+    e2 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                       entry_type="limit", horizon="day",
+                       status="pending_fill", now=WED, quantity=0.1,
+                       requested_price=148.1, stop_loss=147.7,
+                       expires_at=expired)
+
+    orig_cancel = env.executor.broker.cancel
+
+    def flaky_cancel(row):
+        if row["id"] == e1:
+            raise RuntimeError(LEAKY)
+        return orig_cancel(row)
+
+    env.executor.broker.cancel = flaky_cancel
+    env.sched.tick(WED)
+    assert orders.get(env.conn, e2)["status"] == "expired"    # 2 件目は解決
+    assert env.trade_calls == 1                                # tick は完走
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "limit_expired" in log
+    assert "limit_expire_error" in log
+    _assert_no_url(log)
+
+
+# --- カバレッジ穴 (修正 4): テスト追加のみ、実装変更なし ------------------
+
+def test_record_snapshot_non_value_error_does_not_stop_tick(tmp_path):
+    """R10/R11: `record_snapshot` の非 ValueError 分岐 (except Exception 節、
+    scheduler.py の record_snapshot 呼び出し直後) が丸ごと削除されても、
+    ValueError しか投げないテストでは全緑になり検出できない。
+    `sqlite3.OperationalError` で直接ピンする — ①tick は継続 (資金保護実行)
+    ②`mark_to_market_error` が activity に載る、の両方を確認する。"""
+    import sqlite3
+
+    from agentic_fx.core import scheduler as scheduler_mod
+
+    env = Env(tmp_path)
+    oid = env.place_limit(price=148.20, sl=147.80)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                             148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=1))       # fill -> OPEN
+    assert orders.get(env.conn, oid)["status"] == "open"
+
+    def boom(conn, *, now, balance, equity):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    orig = scheduler_mod.accounting.record_snapshot
+    scheduler_mod.accounting.record_snapshot = boom
+    try:
+        env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=2),
+                                 147.60, 147.65, 147.50, 147.55, 100)
+        env.sched.tick(WED + timedelta(minutes=2))
+    finally:
+        scheduler_mod.accounting.record_snapshot = orig
+
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "closed"          # 資金保護 (SL) は止まらない
+    assert row["close_reason"] == "sl"
+    assert env.trade_calls == 1                # tick は最後まで走った
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "mark_to_market_error" in log
+
+
+def test_news_hook_non_runtime_error_does_not_stop_tick(tmp_path):
+    """R2/R3: `_run_data_hook` の隔離 `except Exception` を
+    `except RuntimeError` に狭める変異は、RuntimeError しか投げない既存
+    テスト (`_boom`) では検出できない。OSError で直接ピンする。"""
+    def news_boom():
+        raise OSError("news io down")
+
+    env = Env(tmp_path, news_fn=news_boom)
+    oid = env.place_limit(price=148.20, sl=147.80, tp=149.00)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                             148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert env.news_calls == 1
+    assert orders.get(env.conn, oid)["status"] == "open"
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "news_cycle_error" in log
+
+
+def test_limit_fill_non_runtime_error_isolated_per_order(tmp_path):
+    """R2/R3: `_process_limit_fills` の隔離 `except Exception` を
+    `except RuntimeError` に狭める変異は、既存テスト (RuntimeError) では
+    検出できない。ValueError で直接ピンする。"""
+    env = Env(tmp_path)
+    pending = env.place_limit(price=148.20)          # USDJPY (bars_fn が例外)
+    b = orders.insert(env.conn, pair="EURUSD", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=1.1000,
+                      stop_loss=1.0960, take_profit=1.1120)
+    bars = {"EURUSD": Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                          1.0950, 1.0955, 1.0900, 1.0905, 100)}
+
+    def flaky_bars(pair):
+        if pair == "USDJPY":
+            raise ValueError("bad bar")
+        return bars.get(pair)
+
+    env.sched.bars_fn = flaky_bars
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert orders.get(env.conn, pending)["status"] == "pending_fill"
+    row_b = orders.get(env.conn, b)
+    assert row_b["status"] == "closed"
+    assert row_b["close_reason"] == "sl"
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "limit_fill_error" in log
+
+
+def test_exit_monitoring_non_runtime_error_isolated_per_order(tmp_path):
+    """R2/R3: `_process_exits` の隔離 `except Exception` を
+    `except RuntimeError` に狭める変異は、既存テスト (RuntimeError) では
+    検出できない。OSError で直接ピンする。"""
+    env = Env(tmp_path)
+    a = orders.insert(env.conn, pair="USDJPY", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=148.20,
+                      stop_loss=147.80, take_profit=149.00)
+    b = orders.insert(env.conn, pair="EURUSD", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=1.1000,
+                      stop_loss=1.0960, take_profit=1.1120)
+    bars = {"EURUSD": Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                          1.0950, 1.0955, 1.0900, 1.0905, 100)}
+
+    def flaky_bars(pair):
+        if pair == "USDJPY":
+            raise OSError("disk down")
+        return bars.get(pair)
+
+    env.sched.bars_fn = flaky_bars
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert orders.get(env.conn, a)["status"] == "open"
+    row_b = orders.get(env.conn, b)
+    assert row_b["status"] == "closed"
+    assert row_b["close_reason"] == "sl"
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "exit_check_error" in log
+
+
+def test_account_unknown_cancel_pending_activity_event_name(tmp_path):
+    """R16: account 不明時の `_cancel_all_pending` イベント名
+    (`account_unknown_cancel_pending`) を厳密にピンする。既存テストは
+    close_reason の `account_unknown` (部分一致) しか見ておらず、イベント名
+    そのものが変わっても検出できなかった。"""
+    env = Env(tmp_path)
+    orders.insert(env.conn, pair="EURUSD", direction="long",
+                 entry_type="market", horizon="swing", status="open",
+                 now=WED, quantity=0.1, avg_fill_price=1.1000,
+                 stop_loss=1.0960, take_profit=1.1120)
+    env.place_limit()  # USDJPY entry=148.20
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=11),
+                             148.30, 148.35, 148.15, 148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=11))
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "account_unknown_cancel_pending" in log
