@@ -77,6 +77,18 @@ class DatafeedSettings(_Strict):
     mt5: SourceToggle
     twelvedata: SourceToggle
     freshness_max_min: float = Field(gt=0)
+    # 換算レート (ConversionRate) の skew 許容 (設計書 §5): ①各脚の鮮度は
+    # freshness_max_min で検証済みなのでここでは見ない。②クロス2脚間の
+    # 時刻差 ③判断内スナップショット全体 (reference_ts) との時刻差、の
+    # 2 つを検証する専用の閾値。**freshness_max_min の使い回しは禁止**
+    # (レビュー指摘 F1): reference_ts が判断開始時の now、各脚の quote が
+    # 同じ clock の freshness_max_min 以内という構成では、2 つの検証に
+    # 同じ値を使うと「脚が freshness の範囲内である」ことと「skew が
+    # 閾値以内である」ことが数学的に同値になり、skew 超過が構造的に
+    # 発火しなくなる (fail closed が空文になる)。freshness_max_min より
+    # 十分小さい独立した値にすること — 検証 (`_skew_tighter_than_freshness`)
+    # で強制する。
+    conversion_skew_max_min: float = Field(gt=0)
     # 取引の時間軸は固定しない (設計書 §5)。扱う足と、判断が依存する足
     intervals: list[str] = Field(default_factory=lambda: ["1m", "1h"],
                                  min_length=1)
@@ -100,6 +112,19 @@ class DatafeedSettings(_Strict):
         if missing:
             raise ValueError(
                 f"primary_intervals must be a subset of intervals: {missing}")
+        return self
+
+    @model_validator(mode="after")
+    def _skew_tighter_than_freshness(self) -> "DatafeedSettings":
+        # レビュー指摘 F1: conversion_skew_max_min が freshness_max_min 以上
+        # だと、通常の (処理が速い) 判断では skew 検証が原理的に発火しない
+        # 設定に戻ってしまう。誤設定を起動時に弾く。
+        if self.conversion_skew_max_min >= self.freshness_max_min:
+            raise ValueError(
+                "datafeed.conversion_skew_max_min must be < freshness_max_min "
+                f"(got {self.conversion_skew_max_min} >= "
+                f"{self.freshness_max_min}) — 同じか大きいと skew 検証が "
+                "freshness 検証に埋没して発火しなくなる (設計書 §5)")
         return self
 
 

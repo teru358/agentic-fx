@@ -459,6 +459,40 @@ def test_open_rejected_when_conversion_rate_unavailable(tmp_path):
     assert row["gate_result"] == "rejected"
 
 
+# --- レビュー指摘 F2: gate_rejected (conversion rate unavailable) の例外
+# テキストが safe_error_text を通すこと (codex C-I3 系サイトと同じ規律) ---
+
+_LEAKY = "boom https://bridge.internal:8812/orders?apikey=SECRET_KEY_123"
+
+
+def _assert_no_url(text: str) -> None:
+    assert "bridge.internal" not in text
+    assert "/orders" not in text
+    assert "SECRET_KEY_123" not in text
+    assert "apikey" not in text
+
+
+def test_open_rejected_rate_error_message_is_sanitized(tmp_path):
+    conn, ex, _, mid = _setup(tmp_path)
+    ex.spec_fn = lambda p: EUR_SPEC
+
+    def leaky_rate_fn(ccy, account_ccy, now):
+        if ccy == account_ccy:
+            return ConversionRate(1.0, ccy, account_ccy, (now,))
+        raise DataUnhealthy(_LEAKY)
+
+    ex.rate_fn = leaky_rate_fn
+    it = _open_intent(pair="EURUSD", limit_price=1.1000, stop_loss=1.0950,
+                      take_profit=1.1200)
+    out = ex.handle_intent(it, mid)
+    assert out["result"] == "rejected"
+    assert any("conversion rate unavailable" in r for r in out["reasons"])
+    _assert_no_url("; ".join(out["reasons"]))
+    log_text = (tmp_path / "activity.log").read_text(encoding="utf-8")
+    assert "gate_rejected" in log_text
+    _assert_no_url(log_text)
+
+
 def test_close_degraded_falls_back_to_last_good_rate(tmp_path):
     """クローズ時にレートが取れなくても、直前に成功したレートで degraded
     換算して完遂すること (設計書 §5: クローズはレート欠損でも妨げない)。"""

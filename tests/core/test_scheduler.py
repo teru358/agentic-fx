@@ -2317,3 +2317,92 @@ def test_maintain_reservations_fetches_rate_once_per_currency_per_cycle(
     # USD の外部取得 (rate_fn 呼び出し) は 1 回だけ (JPY は恒等でも呼ばれ
     # 得るが、通貨ごとに 1 回であることが本質)。
     assert calls.count("USD") == 1, calls
+
+
+# --- レビュー指摘 F2: 換算層の新設例外テキスト経路が safe_error_text を
+# 通すこと (codex C-I3 系サイトと同じ規律)。LEAKY (URL + apikey) を
+# 投げ、activity ログに URL/秘密が残らないことを確認する。
+
+def test_mark_to_market_rate_error_message_is_sanitized(tmp_path):
+    """snapshot_stale_rate_skip の例外テキストが safe_error_text を通ること。"""
+    env = Env(tmp_path)
+    env.executor.spec_fn = _spec_by_pair
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == account_ccy:
+            return ConversionRate(1.0, ccy, account_ccy, (now,))
+        raise DataUnhealthy(LEAKY)
+
+    env.executor.rate_fn = rate_fn
+    orders.insert(env.conn, pair="EURUSD", direction="long",
+                 entry_type="market", horizon="day", status="open",
+                 now=WED, quantity=0.1, avg_fill_price=1.1000,
+                 stop_loss=1.0950, take_profit=1.1200)
+    env.bars["EURUSD"] = Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                             1.1010, 1.1020, 1.1000, 1.1015, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "snapshot_stale_rate_skip" in _event_names(log)
+    _assert_no_url(log)
+
+
+def test_maintain_reservations_rate_unavailable_message_is_sanitized(
+        tmp_path):
+    """reservation_rate_unavailable の例外テキストが safe_error_text を
+    通すこと。"""
+    env = Env(tmp_path)
+    env.executor.spec_fn = _spec_by_pair
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == account_ccy:
+            return ConversionRate(1.0, ccy, account_ccy, (now,))
+        if ccy == "USD" and account_ccy == "JPY":
+            return ConversionRate(QUOTE.ask, "USD", "JPY", (now,))
+        raise DataUnhealthy(LEAKY)   # EUR は不可
+
+    env.executor.rate_fn = rate_fn
+    orders.insert(
+        env.conn, pair="EURUSD", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.1,
+        requested_price=1.1000, stop_loss=1.0950, take_profit=1.1200,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "reservation_rate_unavailable" in _event_names(log)
+    _assert_no_url(log)
+
+
+def test_maintain_reservations_rate_cancel_error_message_is_sanitized(
+        tmp_path):
+    """reservation_rate_cancel_error の例外テキストが safe_error_text を
+    通すこと (ペア単位取消自体が失敗した場合の経路)。"""
+    env = Env(tmp_path)
+    env.executor.spec_fn = _spec_by_pair
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == account_ccy:
+            return ConversionRate(1.0, ccy, account_ccy, (now,))
+        raise DataUnhealthy(f"no rate for {ccy}->{account_ccy}")  # EUR は不可
+
+    env.executor.rate_fn = rate_fn
+    orig_cancel = env.executor.cancel_order
+
+    def flaky_cancel(row, reason):
+        if reason == "rate_unavailable":
+            raise RuntimeError(LEAKY)
+        return orig_cancel(row, reason)
+
+    env.executor.cancel_order = flaky_cancel
+    orders.insert(
+        env.conn, pair="EURUSD", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.1,
+        requested_price=1.1000, stop_loss=1.0950, take_profit=1.1200,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "reservation_rate_cancel_error" in _event_names(log)
+    _assert_no_url(log)

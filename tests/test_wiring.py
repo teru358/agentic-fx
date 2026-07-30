@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import (
@@ -24,6 +26,7 @@ from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
 from agentic_fx.datafeed import sources
+from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.news_collector import NewsCollector
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.store.db import connect, init_db
@@ -61,7 +64,7 @@ def _env(tmp_path, now, on_econ_cycle=None):
         quote_fn=provider.get_quote, spec_fn=provider.spec,
         rate_fn=lambda ccy, account_ccy, now: provider.to_account_rate(
             ccy, account_ccy, reference_ts=now,
-            max_skew_min=settings.datafeed.freshness_max_min))
+            max_skew_min=settings.datafeed.conversion_skew_max_min))
     collector = NewsCollector(
         conn, Rag(tmp_path / "rag", embedding_function=FakeEmbedding()),
         activity, clock)
@@ -164,3 +167,57 @@ def test_scheduler_econ_cycle_accepts_econ_calendar_refresh(tmp_path):
         scheduler.tick(CLOSED_NOW)
     assert m.called
     assert len(econ_events.upcoming(conn, CLOSED_NOW, hours=24)) == 1
+
+
+# --- レビュー指摘 F1: 換算レート skew 検証は本番配線の入力で実際に発火する
+# こと (専用キー conversion_skew_max_min。freshness_max_min の使い回しでは
+# reference_ts=now・脚の quote も同じ clock という配線の構造上、通常の
+# (処理が速い) 判断では②③が原理的に発火し得ない — レビュアー実測: 配線の
+# 閾値を 10_000 や 0.0 に変えても 560 passed だった)。
+
+def test_conversion_rate_snapshot_skew_fires_with_real_wiring(tmp_path):
+    """③ (判断内スナップショット全体の時刻差): 実配線の rate_fn
+    (`provider.to_account_rate` を `conversion_skew_max_min` で束縛したもの)
+    を通し、freshness (20min) 以内だが conversion_skew_max_min (5min) を
+    超える quote で実際に fail closed すること。専用キーが無ければ
+    (freshness_max_min を使い回していれば) この skew (6分) は 20 分以内
+    なので通ってしまう — この対比が M1 (配線の閾値を変える変異) のピンになる。
+    """
+    provider, executor, _, _ = _env(tmp_path, OPEN_NOW)
+    settings = load_settings(EXAMPLE)
+    skew_min = settings.datafeed.conversion_skew_max_min
+    freshness_min = settings.datafeed.freshness_max_min
+    assert skew_min < freshness_min, (
+        "この検証の前提: 専用キーが freshness より厳しいこと")
+    # freshness には収まる (fresh) が conversion_skew_max_min は超える quote。
+    stale_but_fresh = Quote("USDJPY", 148.0, 149.0,
+                           OPEN_NOW - timedelta(minutes=skew_min + 1),
+                           "yfinance")
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+              return_value=stale_but_fresh):
+        with pytest.raises(DataUnhealthy, match="skew"):
+            executor.rate_fn("USD", "JPY", OPEN_NOW)
+
+
+def test_conversion_rate_cross_leg_skew_fires_with_real_wiring(tmp_path):
+    """② (クロス2脚間の時刻差): EUR→JPY は USD 経由のクロス (EURUSD ×
+    USDJPY)。両脚とも freshness (20min) 以内だが、互いの観測時刻が
+    conversion_skew_max_min (5min) を超えて乖離すると実配線で fail closed
+    すること。"""
+    provider, executor, _, _ = _env(tmp_path, OPEN_NOW)
+    settings = load_settings(EXAMPLE)
+    skew_min = settings.datafeed.conversion_skew_max_min
+
+    def _fn(pair):
+        if pair == "EURUSD":
+            return Quote(pair, 1.08, 1.08, OPEN_NOW, "yfinance")
+        if pair == "USDJPY":
+            return Quote(pair, 148.0, 149.0,
+                        OPEN_NOW - timedelta(minutes=skew_min + 1),
+                        "yfinance")
+        raise OSError(f"no data for {pair}")
+
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+              side_effect=_fn):
+        with pytest.raises(DataUnhealthy, match="skew"):
+            executor.rate_fn("EUR", "JPY", OPEN_NOW)

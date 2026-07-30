@@ -173,6 +173,47 @@ def test_empty_primary_intervals_rejected(tmp_path):
         load_settings(_with_datafeed(tmp_path, primary_intervals=[]))
 
 
+# --- conversion_skew_max_min (レビュー指摘 F1: 換算 skew は freshness の
+# 使い回しにしない専用キー) -------------------------------------------------
+
+def test_conversion_skew_max_min_defaults_from_example():
+    s = load_settings(EXAMPLE)
+    assert s.datafeed.conversion_skew_max_min > 0
+    # F1: 専用キーが freshness_max_min より厳しい (小さい) こと自体が
+    # 「skew 検証が freshness に埋没しない」ための前提条件。
+    assert s.datafeed.conversion_skew_max_min < s.datafeed.freshness_max_min
+
+
+def test_conversion_skew_max_min_missing_rejected(tmp_path):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    del raw["datafeed"]["conversion_skew_max_min"]
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError):
+        load_settings(p)
+
+
+def test_conversion_skew_max_min_nonpositive_rejected(tmp_path):
+    with pytest.raises(ConfigError):
+        load_settings(_with_datafeed(tmp_path, conversion_skew_max_min=0.0))
+
+
+def test_conversion_skew_max_min_equal_to_freshness_rejected(tmp_path):
+    """F1 の再発防止: 専用キーを freshness_max_min と同値に (誤って) 設定
+    すると、skew 検証が freshness 検証に埋没して発火しなくなる (レビュー
+    実測の再現条件そのもの)。起動時に弾く。"""
+    with pytest.raises(ConfigError, match="conversion_skew_max_min"):
+        load_settings(_with_datafeed(tmp_path, conversion_skew_max_min=20.0,
+                                     freshness_max_min=20.0))
+
+
+def test_conversion_skew_max_min_larger_than_freshness_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="conversion_skew_max_min"):
+        load_settings(_with_datafeed(tmp_path, conversion_skew_max_min=30.0,
+                                     freshness_max_min=20.0))
+
+
 def test_empty_pairs_rejected(tmp_path):
     """空の pairs を設定検証で弾く。
 
