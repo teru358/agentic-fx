@@ -142,7 +142,16 @@ class Scheduler:
                 event="equity_nonpositive_cancel_pending",
                 why="equity<=0 (債務超過) — 予約を維持できない")
         else:
-            self._maintain_reservations(now, account)
+            # 新規 Important (fix round 2): _maintain_reservations が
+            # リスク超過の予約取消に失敗して中断 (C1 の except -> return)
+            # した場合でも、ここで fills_allowed を False に落とさないと、
+            # その予約が同一 tick の _process_limit_fills で (取消対象と
+            # 判定されたにも関わらず) 到達バーで約定してしまう fail-open
+            # 窓が開く (gate は予約約定経路では再実行されないため —
+            # レビュアー実測)。account 不明 / equity<=0 と同じ 2 層構えに
+            # 揃え、_maintain_reservations の戻り値 (bool) で判定する。
+            if not self._maintain_reservations(now, account):
+                fills_allowed = False
         self._force_close_day(now)
         # 修正ラウンド 2: account が不明な tick は「新規約定」だけをスキップ
         # する (codex 1 の意図)。OPEN ポジションの SL/TP 監視
@@ -439,23 +448,36 @@ class Scheduler:
                 # この隔離を破らない。
                 note = "reconcile 未実施 — 手動確認が必要な場合あり"
                 if not broker_answered:
-                    current = orders.get(self.conn, row["id"])
-                    cur_status = S(current["status"]) if current else None
-                    if (cur_status is not None and S.CANCEL_UNKNOWN
-                            in transitions.ALLOWED.get(cur_status,
-                                                       frozenset())):
-                        try:
+                    # 新規 Critical (fix round 2): 以前はこの復旧処理の
+                    # うち transitions.transition だけを内側 try で
+                    # 包んでおり、orders.get / S(current["status"]) は
+                    # 無保護のままだった。外側例外 (broker.cancel の
+                    # 例外) の最も自然な源は DB 障害であり、**同じ conn**
+                    # を使うこの orders.get も同じ理由で落ちうる
+                    # (レビュアー実測: sqlite3.OperationalError で SL
+                    # 未執行)。ここで例外が漏れると _expire_limits に
+                    # 外側 try が無いため tick を貫通し、後続の
+                    # _process_exits (SL/TP 監視) が丸ごと死ぬ。
+                    # orders.get / S(...) / 遷移をまとめて 1 つの try で
+                    # 包み、どんな失敗でもこの隔離を破らないようにする。
+                    try:
+                        current = orders.get(self.conn, row["id"])
+                        cur_status = (S(current["status"])
+                                     if current else None)
+                        if (cur_status is not None and S.CANCEL_UNKNOWN
+                                in transitions.ALLOWED.get(cur_status,
+                                                           frozenset())):
                             transitions.transition(self.conn, row["id"],
                                                    S.CANCEL_UNKNOWN, now)
                             note = ("cancel_unknown へ遷移 — 次 tick の "
                                    "reconcile で解決")
-                        except Exception as trans_err:  # noqa: BLE001 —
-                            # 隔離を破らない (遷移失敗でもこの注文を
-                            # スキップするのみ)
-                            _log.warning(
-                                "limit expire -> cancel_unknown failed "
-                                "#%s: %s", row["id"],
-                                safe_error_text(trans_err))
+                    except Exception as trans_err:  # noqa: BLE001 —
+                        # 隔離を破らない (復旧処理の失敗でもこの注文を
+                        # スキップするのみ)
+                        _log.warning(
+                            "limit expire -> cancel_unknown failed "
+                            "#%s: %s", row["id"],
+                            safe_error_text(trans_err))
                 self.activity.write(
                     Category.TRADE, "limit_expire_error",
                     f"#{row['id']} {row['pair']}: {text} — {note}",
@@ -499,8 +521,23 @@ class Scheduler:
                             text)
 
     def _maintain_reservations(self, now: datetime,
-                               account: tuple[float, float]) -> None:
-        """口座変動で維持できなくなった指値予約を約定前に取消す (設計書 §5)。"""
+                               account: tuple[float, float]) -> bool:
+        """口座変動で維持できなくなった指値予約を約定前に取消す (設計書 §5)。
+
+        戻り値 (fix round 2): **True** = 通常終了 (超過なし、または
+        解消できた/pending 無し)。**False** = cancel_order の例外で
+        トリミングを中断した場合 — 呼び出し元 tick() は**この tick の
+        fills_allowed を False にしなければならない**。
+
+        以前は戻り値を持たず、except -> return (C1 の無限ループ回避) だけ
+        していた。しかしそれだけだと、リスク超過と判定され取消対象に
+        上がった予約が、cancel_order 失敗で PENDING_FILL に残ったまま
+        fills_allowed=True の tick で _process_limit_fills に処理され、
+        到達バーがあれば約定してしまう fail-open 窓が開く (gate は予約
+        約定経路では再実行されないため — レビュアー実測)。account 不明 /
+        equity<=0 のときの 2 層構え (全 pending 取消 + fills_allowed=False)
+        に揃え、`_process_exits` (資金保護) は影響を受けず通常どおり走る。
+        """
         equity, _ = account
         if equity <= 0:
             # レビュー修正 6: equity<=0 だと notional/equity がゼロ除算になる。
@@ -509,7 +546,7 @@ class Scheduler:
             # 保険。**「gate の fail closed に委ねる」は誤り**だった —
             # gate は新規発注時にしか走らず、予約済み指値の約定では
             # 再実行されない。ゼロ除算だけは常に避ける。
-            return
+            return True
         risk = self.settings.risk
         while True:
             total_risk, notional, _ = open_risk_and_notional(
@@ -517,10 +554,10 @@ class Scheduler:
             within = (total_risk <= equity * risk.max_total_risk_pct / 100
                       and notional / equity <= risk.max_leverage)
             if within:
-                return
+                return True
             pending = orders.list_by_status(self.conn, S.PENDING_FILL)
             if not pending:
-                return  # 指値以外の超過は取消では解消できない
+                return True  # 指値以外の超過は取消では解消できない
             newest = pending[-1]
             # C1 (fix round 1): この while True ループは「予約が 1 件
             # 減って条件を再評価する」進行を cancel_order の成功
@@ -548,7 +585,10 @@ class Scheduler:
                     ref_id=str(newest["id"]))
                 _log.warning("reservation trim failed #%s: %s",
                             newest["id"], text)
-                return
+                # 新規 Important (fix round 2): False を返し、呼び出し元
+                # tick() にこの tick の fills_allowed=False を委ねる
+                # (上の docstring 参照)。
+                return False
 
     def _force_close_day(self, now: datetime) -> None:
         """codex 3: 期限は注文毎に (filled_at 起点の next_rollover で) 導出
