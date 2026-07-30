@@ -381,8 +381,13 @@ class Scheduler:
 
     def _expire_limits(self, now: datetime) -> None:
         for row in orders.list_by_status(self.conn, S.PENDING_FILL):
-            if row["expires_at"] and datetime.fromisoformat(
-                    row["expires_at"]) < now:
+            if not (row["expires_at"] and datetime.fromisoformat(
+                    row["expires_at"]) < now):
+                continue
+            # N3: 1 件の broker.cancel 例外で tick が落ちると、他の期限切れ
+            # 注文の取消・後続の _process_exits (資金保護) まで止まる
+            # (_cancel_all_pending と同型パターン)。注文単位で隔離する。
+            try:
                 transitions.transition(self.conn, row["id"], S.CANCELLING, now)
                 br = self.executor.broker.cancel(row)
                 if br.status == "ok":
@@ -395,6 +400,13 @@ class Scheduler:
                 else:
                     transitions.transition(self.conn, row["id"],
                                            S.CANCEL_UNKNOWN, now)
+            except Exception as e:  # noqa: BLE001 — 他の期限切れ注文を止めない
+                text = safe_error_text(e)
+                self.activity.write(
+                    Category.TRADE, "limit_expire_error",
+                    f"#{row['id']} {row['pair']}: {text} — 次 tick 再試行",
+                    ref_id=str(row["id"]))
+                _log.warning("limit expire failed #%s: %s", row["id"], text)
 
     def _cancel_all_pending(self, now: datetime, *, reason: str, event: str,
                             why: str) -> None:
@@ -416,7 +428,21 @@ class Scheduler:
                 Category.SYSTEM, event,
                 f"{len(pending)} 件の pending_fill を取消 ({why})")
         for row in pending:
-            self.executor.cancel_order(row, reason=reason)
+            # N3: この関数は equity<=0 (債務超過 = SL/TP が最も要る状態) で
+            # 呼ばれ、_process_exits より **前** に立つ。1 件の cancel_order
+            # 例外で以降の取消と後続の資金保護が全部止まってはならない —
+            # 注文単位で隔離する (_process_limit_fills / _process_exits と
+            # 同型パターン)。
+            try:
+                self.executor.cancel_order(row, reason=reason)
+            except Exception as e:  # noqa: BLE001 — 他注文の取消を止めない
+                text = safe_error_text(e)
+                self.activity.write(
+                    Category.TRADE, "cancel_all_pending_error",
+                    f"#{row['id']} {row['pair']}: {text} — 次 tick 再試行",
+                    ref_id=str(row["id"]))
+                _log.warning("cancel_all_pending failed #%s: %s", row["id"],
+                            text)
 
     def _maintain_reservations(self, now: datetime,
                                account: tuple[float, float]) -> None:
@@ -555,9 +581,19 @@ class Scheduler:
                     self._check_one_exit(row, bar, entry_same_bar=False)
             except Exception as e:  # noqa: BLE001 — 他注文の保護を止めない
                 text = safe_error_text(e)
-                self.activity.write(Category.TRADE, "exit_check_error",
-                                    f"#{row['id']} {row['pair']}: {text} "
-                                    "— 次 tick 再試行", ref_id=str(row["id"]))
+                # N2 第二層 (defense in depth): ActivityLog.write は送出しない
+                # 契約 (一次修正) だが、ここは資金保護の最重要走査なので、
+                # 注入された activity double が契約を破って例外を投げても
+                # 走査 (残りの注文の SL/TP 監視) は止めない。
+                try:
+                    self.activity.write(
+                        Category.TRADE, "exit_check_error",
+                        f"#{row['id']} {row['pair']}: {text} — 次 tick 再試行",
+                        ref_id=str(row["id"]))
+                except Exception as write_err:  # noqa: BLE001
+                    _log.warning(
+                        "activity write failed (exit_check_error) #%s: %s",
+                        row["id"], safe_error_text(write_err))
                 _log.warning("exit check failed #%s: %s", row["id"], text)
         # レビュー修正 5: 今 tick で見たバーを処理済みとして記録する走査対象
         # は、その時点の orders テーブルの状態 (PENDING_FILL/OPEN/CLOSED/
