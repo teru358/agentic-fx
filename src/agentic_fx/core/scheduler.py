@@ -150,7 +150,25 @@ class Scheduler:
             # 窓が開く (gate は予約約定経路では再実行されないため —
             # レビュアー実測)。account 不明 / equity<=0 と同じ 2 層構えに
             # 揃え、_maintain_reservations の戻り値 (bool) で判定する。
-            if not self._maintain_reservations(now, account):
+            #
+            # 新規 Critical site 1 (fix round 3): _maintain_reservations
+            # 呼び出し自体も無保護だった。内部の open_risk_and_notional は
+            # _EXPOSURE 全行に spec_fn(pair) を回すため、1 件の予約/建玉が
+            # spec を引けないペア (DataUnhealthy 等) だと、呼び出しが
+            # 無保護なら tick 全体が死ぬ (レビュアー実測: GBPJPY の
+            # PENDING_FILL 1 件 + spec_fn が GBPJPY のみ raise + USDJPY
+            # OPEN の SL 未執行)。取消失敗時と同じ 2 層構えに揃え、例外時は
+            # fills_allowed=False にして後続の _process_exits (資金保護)
+            # を必ず生かす。
+            try:
+                if not self._maintain_reservations(now, account):
+                    fills_allowed = False
+            except Exception as e:  # noqa: BLE001 — 資金保護を止めない
+                text = safe_error_text(e)
+                self.activity.write(
+                    Category.TRADE, "maintain_reservations_error",
+                    f"{text} — この tick の予約維持処理を中断")
+                _log.warning("maintain_reservations failed: %s", text)
                 fills_allowed = False
         self._force_close_day(now)
         # 修正ラウンド 2: account が不明な tick は「新規約定」だけをスキップ
@@ -602,20 +620,49 @@ class Scheduler:
         for row in orders.list_by_status(self.conn, S.OPEN):
             if row["horizon"] != "day":
                 continue
-            anchor = row["filled_at"] or row["created_at"]
-            deadline = market_hours.next_rollover(datetime.fromisoformat(anchor))
-            if now < deadline - _DAY_CLOSE_BUFFER:
-                continue
+            # site 2 (fix round 3): ポジション単位で隔離する。以前は
+            # datetime.fromisoformat(anchor) (I1 と同型の欠陥) も
+            # self.executor.close_order(...) も無保護で、1 件のポジション
+            # の例外 (close_order 内の spec_fn が DataUnhealthy で raise
+            # する等) が _force_close_day → tick を貫通し、後続の
+            # _process_exits (SL/TP 監視 = 資金保護) を丸ごと止めていた
+            # (レビュアー実測)。
             try:
-                q = self.executor.quote_fn(row["pair"])
-            except Exception as e:  # noqa: BLE001 — 架空価格で閉じない
-                text = safe_error_text(e)   # codex C-I3
-                self.activity.write(Category.TRADE, "day_close_deferred",
-                                    f"{row['pair']}: {text}",
-                                    ref_id=str(row["id"]))
-                continue
-            price = q.bid if row["direction"] == "long" else q.ask
-            self.executor.close_order(row, price, reason="day_rollover")
+                anchor = row["filled_at"] or row["created_at"]
+                deadline = market_hours.next_rollover(
+                    datetime.fromisoformat(anchor))
+                if now < deadline - _DAY_CLOSE_BUFFER:
+                    continue
+                try:
+                    q = self.executor.quote_fn(row["pair"])
+                except Exception as e:  # noqa: BLE001 — 架空価格で閉じない
+                    text = safe_error_text(e)   # codex C-I3
+                    self.activity.write(Category.TRADE, "day_close_deferred",
+                                        f"{row['pair']}: {text}",
+                                        ref_id=str(row["id"]))
+                    continue
+                price = q.bid if row["direction"] == "long" else q.ask
+                self.executor.close_order(row, price, reason="day_rollover")
+            except Exception as e:  # noqa: BLE001 — 他ポジションの day 強制
+                # 決済・後続の _process_exits (資金保護) を止めない。
+                text = safe_error_text(e)
+                # 注文状態がどちらに転んでも次 tick に必ず再走査される
+                # ため「次 tick 再試行」は事実に即している (I2 の教訓):
+                # ①close_order の例外源が spec_fn や CLOSING 遷移そのもの
+                # なら行は OPEN のまま残り、この関数自身が次 tick も
+                # day 判定を再実行する。②CLOSING まで進んだ後の失敗
+                # (broker.close 後の DB 確定処理等) なら、CLOSING は
+                # _resolve_unknowns の _retry_close の走査対象であり、
+                # 次 tick に必ず拾われる (I2 の CANCELLING のような
+                # 「誰の走査集合にも入らない」状態にはならない)。
+                # このため except ハンドラ内で orders.get 等の復旧処理を
+                # 追加していない — F1 の教訓 (復旧処理自体が外側例外と
+                # 同じ故障源で落ちる) をそもそも踏まない設計にした。
+                self.activity.write(
+                    Category.TRADE, "day_close_error",
+                    f"#{row['id']} {row['pair']}: {text} — 次 tick 再試行",
+                    ref_id=str(row["id"]))
+                _log.warning("day close failed #%s: %s", row["id"], text)
 
     def _process_limit_fills(self, now: datetime) -> set[int]:
         """PENDING_FILL の約定処理。約定させた注文 ID の集合を返す。
