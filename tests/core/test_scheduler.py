@@ -1848,10 +1848,185 @@ def test_maintain_reservations_cancel_order_failure_does_not_allow_same_tick_fil
     env.sched.tick(WED + timedelta(minutes=1))
 
     row = orders.get(env.conn, oid)
-    assert row["status"] != "open", (
+    # fix round 3 (レビュアー注記, Minor): `!= "open"` より `==
+    # "pending_fill"` の方が締まる (取消も約定もしていない、が正確な期待)。
+    assert row["status"] == "pending_fill", (
         "リスク超過で取消対象と判定された予約が同一 tick で約定した "
         f"(status={row['status']})")
     row_open = orders.get(env.conn, open_id)
     assert row_open["status"] == "closed"   # SL/TP 走査は通常どおり動く
     assert row_open["close_reason"] == "sl"
+    assert env.trade_calls == 1
+
+
+# --- fix round 3 (独立レビュー再判定 — 未裁定の既存無保護 site 2 件) -------
+#
+# 判定基準: 「pre-_process_exits の障害は、_process_exits 自身が同じ障害を
+# 生き延びるならば欠陥」— _process_exits は注文単位隔離 (line ~700 台) を
+# 持つのでペアローカル障害を吸収するのに、その前に立つ無保護呼び出しで
+# tick 全体が死ぬ非対称性が問題。
+
+def test_maintain_reservations_call_spec_fn_failure_does_not_stop_tick(
+        tmp_path):
+    """site 1 (Critical 相当): `_maintain_reservations` 呼び出し
+    (`tick():153`) が無保護。内部の `open_risk_and_notional`
+    (`executor.py:41`) は `_EXPOSURE` 全行に `spec_fn(pair)` を回すため、
+    1 件の予約が spec を引けないペア (DataUnhealthy 等) だと tick 全体が
+    死ぬ (レビュアー実測: GBPJPY の PENDING_FILL 1 件 + spec_fn が GBPJPY
+    のみ raise + USDJPY OPEN に SL 割れバー → RuntimeError が tick を
+    貫通し USDJPY の SL 未執行)。呼び出しを try/except で包み、例外時は
+    `fills_allowed = False` にして (取消失敗時の既存 2 層構えと同じ扱い)、
+    後続の `_process_exits` (資金保護) は必ず生かす。2 tick 目も死なない
+    ことも確認する。"""
+    env = Env(tmp_path)
+    gbp = orders.insert(env.conn, pair="GBPJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="pending_fill", now=WED, quantity=0.1,
+                        requested_price=190.0, stop_loss=189.0)
+    open_id = orders.insert(env.conn, pair="USDJPY", direction="long",
+                            entry_type="market", horizon="swing",
+                            status="open", now=WED, quantity=0.1,
+                            avg_fill_price=148.20, stop_loss=147.80,
+                            take_profit=149.00)
+    # 2 tick 目の資金保護も生きていることを直接示すため、別ペアの OPEN を
+    # もう 1 件用意し、2 tick 目のバーで SL に到達させる。
+    open_id2 = orders.insert(env.conn, pair="EURUSD", direction="long",
+                             entry_type="market", horizon="swing",
+                             status="open", now=WED, quantity=0.1,
+                             avg_fill_price=1.1000, stop_loss=1.0960,
+                             take_profit=1.1120)
+
+    orig_spec_fn = env.executor.spec_fn
+
+    def flaky_spec_fn(pair):
+        # DataUnhealthy (非 RuntimeError): 「except を RuntimeError に
+        # 狭める」変異を殺すための実際の想定例外型でもある。
+        if pair == "GBPJPY":
+            from agentic_fx.datafeed.health import DataUnhealthy
+            raise DataUnhealthy(LEAKY)
+        return orig_spec_fn(pair)
+
+    env.executor.spec_fn = flaky_spec_fn
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.30, 148.35, 147.50, 147.55, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    row_open = orders.get(env.conn, open_id)
+    assert row_open["status"] == "closed"          # SL 監視は継続
+    assert row_open["close_reason"] == "sl"
+    assert env.trade_calls == 1
+    row_gbp = orders.get(env.conn, gbp)
+    assert row_gbp["status"] == "pending_fill"     # 取消は諦められた
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "maintain_reservations_error" in _event_names(log)
+    _assert_no_url(log)
+
+    # 2 tick 目 (同じ GBPJPY 行が再び走査される) でも死なず、別ペアの SL
+    # 監視 (資金保護) が引き続き働くこと。
+    env.bars["EURUSD"] = Bar("EURUSD", "1m", WED + timedelta(minutes=2),
+                             1.0950, 1.0955, 1.0900, 1.0905, 100)
+    env.sched.tick(WED + timedelta(minutes=2))
+    row_open2 = orders.get(env.conn, open_id2)
+    assert row_open2["status"] == "closed"
+    assert row_open2["close_reason"] == "sl"
+
+
+def test_force_close_day_close_order_failure_isolated_per_position(
+        tmp_path):
+    """site 2 (Critical 相当): `_force_close_day` の `close_order`
+    (`tick():155` → `scheduler.py` 内) が無保護 (既存 try は `quote_fn`
+    だけを包んでいた)。1 件の day ポジションの `close_order` 例外
+    (spec_fn の DataUnhealthy 等) が `_force_close_day` → tick を貫通し、
+    後続の `_process_exits` (SL/TP 監視) を丸ごと止めていた (レビュアー
+    実測: EURUSD の day ポジションの close_order だけ raise →
+    RuntimeError が tick を貫通、USDJPY の SL 未執行)。ポジション単位で
+    隔離し、`datetime.fromisoformat(anchor)` (I1 と同型) も保護の内側へ
+    入れる。
+
+    注文状態がどちらに転んでも (OPEN のまま → 次 tick に `_force_close_day`
+    自身が再走査 / CLOSING に進んだ → `_resolve_unknowns` の
+    `_retry_close` が次 tick 再走査) 必ず再試行されるため、「次 tick
+    再試行」の文言は事実に即している。除外処理 (except ハンドラ) は
+    `orders.get` 等の復旧処理を追加しない (F1 の教訓: 復旧処理自体が
+    同じ故障源で落ちるのを避けるため、そもそも呼ばない)。"""
+    env = Env(tmp_path)
+    # A: EURUSD の day ポジション — close_order 内の spec_fn が例外を投げる
+    a = orders.insert(env.conn, pair="EURUSD", direction="long",
+                      entry_type="market", horizon="day", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=1.1000,
+                      stop_loss=1.0960, take_profit=1.1120,
+                      filled_at=WED.isoformat())
+    # B: USDJPY の swing ポジション — SL 到達 (1 tick 目)
+    b = orders.insert(env.conn, pair="USDJPY", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=148.20,
+                      stop_loss=147.80, take_profit=149.00)
+    # C: GBPJPY の swing ポジション — SL 到達 (2 tick 目、資金保護の継続確認用)
+    c = orders.insert(env.conn, pair="GBPJPY", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=190.00,
+                      stop_loss=189.00, take_profit=192.00)
+
+    orig_spec_fn = env.executor.spec_fn
+
+    def flaky_spec_fn(pair):
+        # DataUnhealthy (非 RuntimeError): 「except を RuntimeError に
+        # 狭める」変異を殺すための実際の想定例外型でもある。
+        if pair == "EURUSD":
+            from agentic_fx.datafeed.health import DataUnhealthy
+            raise DataUnhealthy(LEAKY)
+        return orig_spec_fn(pair)
+
+    env.executor.spec_fn = flaky_spec_fn
+    near_close = WED.replace(hour=20, minute=57)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", near_close,
+                             147.60, 147.65, 147.50, 147.55, 100)
+    env.sched.tick(near_close)
+
+    row_a = orders.get(env.conn, a)
+    row_b = orders.get(env.conn, b)
+    assert row_a["status"] == "open"     # A は隔離されただけ (close 未実施)
+    assert row_b["status"] == "closed"   # B の SL 監視は生きている
+    assert row_b["close_reason"] == "sl"
+    assert env.trade_calls == 1
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "day_close_error" in _event_names(log)
+    _assert_no_url(log)
+
+    # 2 tick 目 (同じ EURUSD ポジションが再び走査される) でも死なず、
+    # 別ペア (GBPJPY) の SL 監視が引き続き働くこと。
+    env.bars["GBPJPY"] = Bar("GBPJPY", "1m", near_close + timedelta(minutes=1),
+                             189.50, 189.55, 188.50, 188.90, 100)
+    env.sched.tick(near_close + timedelta(minutes=1))
+    row_c = orders.get(env.conn, c)
+    assert row_c["status"] == "closed"
+    assert row_c["close_reason"] == "sl"
+
+
+def test_force_close_day_invalid_filled_at_isolated_per_position(tmp_path):
+    """site 2 の I1 相当部分: `datetime.fromisoformat(anchor)`
+    (旧 `scheduler.py:606` 付近) が隔離の外にあると、不正な `filled_at`/
+    `created_at` を持つ day ポジション 1 件で毎 tick 同じ行が例外を吐き、
+    資金保護が恒久停止する。期限判定を隔離の内側に入れ、当該ポジション
+    だけスキップすること。"""
+    env = Env(tmp_path)
+    a = orders.insert(env.conn, pair="EURUSD", direction="long",
+                      entry_type="market", horizon="day", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=1.1000,
+                      stop_loss=1.0960, take_profit=1.1120,
+                      filled_at="not-a-real-timestamp")
+    b = orders.insert(env.conn, pair="USDJPY", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=148.20,
+                      stop_loss=147.80, take_profit=149.00)
+    near_close = WED.replace(hour=20, minute=57)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", near_close,
+                             147.60, 147.65, 147.50, 147.55, 100)
+    env.sched.tick(near_close)
+
+    row_a = orders.get(env.conn, a)
+    row_b = orders.get(env.conn, b)
+    assert row_a["status"] == "open"     # 不正な filled_at はスキップされるだけ
+    assert row_b["status"] == "closed"
+    assert row_b["close_reason"] == "sl"
     assert env.trade_calls == 1
