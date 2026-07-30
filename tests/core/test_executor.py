@@ -20,7 +20,8 @@ NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
 SPEC = InstrumentSpec(symbol="USDJPY", pip_size=0.01, min_lot=0.01,
-                      max_lot=50.0, lot_step=0.01, contract_size=100_000)
+                      max_lot=50.0, lot_step=0.01, contract_size=100_000,
+                      base_currency="USD", quote_currency="JPY")
 QUOTE = Quote("USDJPY", 148.49, 148.51, NOW, "test")
 
 

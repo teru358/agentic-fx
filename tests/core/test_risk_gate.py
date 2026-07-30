@@ -5,8 +5,8 @@ import pytest
 
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import (
-    Action, Direction, EntryType, Horizon, InstrumentSpec, Origin, Quote,
-    TradeIntent,
+    Action, ConversionRate, Direction, EntryType, Horizon, InstrumentSpec,
+    Origin, Quote, TradeIntent,
 )
 from agentic_fx.core.risk_gate import GateContext, GateResult, evaluate
 
@@ -14,8 +14,13 @@ RISK = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example").risk
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)  # 水曜
 SPEC = InstrumentSpec(symbol="USDJPY", pip_size=0.01, min_lot=0.01,
-                      max_lot=50.0, lot_step=0.01, contract_size=100_000)
+                      max_lot=50.0, lot_step=0.01, contract_size=100_000,
+                      base_currency="USD", quote_currency="JPY")
 QUOTE = Quote(symbol="USDJPY", bid=148.49, ask=148.51, ts=NOW, source="test")
+# USDJPY: quote_currency=JPY (口座通貨と同一 → 恒等) / base_currency=USD
+# (口座通貨へ換算が要る。保守側の USDJPY ask を使う — 実運用と同じ規約)
+IDENTITY_JPY = ConversionRate(1.0, "JPY", "JPY", (NOW,))
+USD_TO_JPY = ConversionRate(QUOTE.ask, "USD", "JPY", (NOW,))
 
 
 def _intent(ref_price=None, **over):
@@ -31,9 +36,10 @@ def _intent(ref_price=None, **over):
 def _ctx(**over):
     base = dict(quote=QUOTE, spec=SPEC, equity=1_000_000.0, hwm=1_000_000.0,
                 daily_start_equity=1_000_000.0, open_position_count=0,
-                existing_risk_total=0.0, existing_notional=0.0,
+                existing_risk_account=0.0, existing_notional_account=0.0,
                 kill_switch_latched=False, has_unresolved_unknown=False,
-                now=NOW, account_currency="JPY")
+                now=NOW, account_currency="JPY",
+                quote_to_account=IDENTITY_JPY, base_to_account=USD_TO_JPY)
     base.update(over)
     return GateContext(**base)
 
@@ -108,12 +114,22 @@ def test_max_positions_counts_pending():
 
 def test_total_risk_reservation():
     # 既存リスク 12,000 + 新規 ≈5,000 > 1.5% (15,000)
-    r = evaluate(_intent(), _ctx(existing_risk_total=12_000.0), RISK)
+    r = evaluate(_intent(), _ctx(existing_risk_account=12_000.0), RISK)
     assert any("total risk" in x for x in r.reasons)
 
 
 def test_leverage_cap():
-    r = evaluate(_intent(), _ctx(existing_notional=9_990_000_000.0), RISK)
+    r = evaluate(_intent(), _ctx(existing_notional_account=9_990_000_000.0), RISK)
+    assert any("leverage" in x for x in r.reasons)
+
+
+def test_notional_uses_base_to_account_not_entry_price():
+    # 設計書 §5: notional = qty × contract_size × base_to_account (price は
+    # 掛けない)。base_to_account に entry 価格 (148.20 付近) とかけ離れた
+    # 値を与え、その値で leverage cap 判定されることを固定する — notional に
+    # entry 価格を掛ける変異 (旧実装への回帰) のピン。
+    huge_base_rate = ConversionRate(1_000_000.0, "USD", "JPY", (NOW,))
+    r = evaluate(_intent(), _ctx(base_to_account=huge_base_rate), RISK)
     assert any("leverage" in x for x in r.reasons)
 
 
@@ -188,12 +204,12 @@ def test_hwm_negative_fail_closed():
 
 def test_negative_existing_risk_total_fail_closed():
     # A-4 (Important): 負値は総リスク上限を素通りさせるため fail closed
-    r = evaluate(_intent(), _ctx(existing_risk_total=-1.0), RISK)
+    r = evaluate(_intent(), _ctx(existing_risk_account=-1.0), RISK)
     assert not r.accepted and any("invalid context" in x for x in r.reasons)
 
 
 def test_negative_existing_notional_fail_closed():
-    r = evaluate(_intent(), _ctx(existing_notional=-1.0), RISK)
+    r = evaluate(_intent(), _ctx(existing_notional_account=-1.0), RISK)
     assert not r.accepted and any("invalid context" in x for x in r.reasons)
 
 
@@ -300,14 +316,39 @@ def test_stop_loss_none_fail_closed_no_type_error():
     assert not r.accepted and any("invalid context" in x for x in r.reasons)
 
 
-def test_eurusd_intent_rejected_via_sizing_failure():
-    # E: 口座通貨 (JPY) とクォート通貨 (USD) が異なる EURUSD は
-    # sizing 側で fail closed され、gate はそれを理由に却下すること
-    eur_spec = InstrumentSpec(symbol="EURUSD", pip_size=0.0001, min_lot=0.01,
-                              max_lot=50.0, lot_step=0.01, contract_size=100_000)
+EUR_SPEC = InstrumentSpec(symbol="EURUSD", pip_size=0.0001, min_lot=0.01,
+                          max_lot=10.0, lot_step=0.01, contract_size=100_000,
+                          base_currency="EUR", quote_currency="USD")
+
+
+def test_eurusd_intent_accepted_with_conversion_layer():
+    # 設計書 §5 (改訂第 16 版, 末尾の Phase 1 暫定措置): 換算層の実装を
+    # もって「クォート通貨 ≠ 口座通貨は fail closed」の暫定措置は解除される。
+    # EURUSD (quote=USD, base=EUR, 口座=JPY) は quote_to_account/
+    # base_to_account が供給されれば通常どおり受理される。
     eur_quote = Quote("EURUSD", 1.0999, 1.1001, NOW, "test")
+    quote_to_account = ConversionRate(163.665, "USD", "JPY", (NOW,))
+    base_to_account = ConversionRate(1.1001 * 163.665, "EUR", "JPY", (NOW,))
     eur_intent = _intent(pair="EURUSD", limit_price=1.1000, stop_loss=1.0960,
                          take_profit=1.1120, expires_in="4h")
-    r = evaluate(eur_intent, _ctx(quote=eur_quote, spec=eur_spec), RISK)
-    assert not r.accepted and any("sizing failed" in x for x in r.reasons)
+    r = evaluate(eur_intent, _ctx(quote=eur_quote, spec=EUR_SPEC,
+                                  quote_to_account=quote_to_account,
+                                  base_to_account=base_to_account), RISK)
+    assert r.accepted, r.reasons
+    assert r.size is not None and r.size.quantity > 0
+
+
+def test_eurusd_rate_currency_mismatch_rejected():
+    # base/quote 取り違えの構造的検出 (D-I2): quote_to_account に
+    # spec.quote_currency (USD) ではない通貨のレートを渡すと却下される。
+    eur_quote = Quote("EURUSD", 1.0999, 1.1001, NOW, "test")
+    wrong_rate = ConversionRate(163.665, "GBP", "JPY", (NOW,))  # USD のはず
+    base_to_account = ConversionRate(1.1001 * 163.665, "EUR", "JPY", (NOW,))
+    eur_intent = _intent(pair="EURUSD", limit_price=1.1000, stop_loss=1.0960,
+                         take_profit=1.1120, expires_in="4h")
+    r = evaluate(eur_intent, _ctx(quote=eur_quote, spec=EUR_SPEC,
+                                  quote_to_account=wrong_rate,
+                                  base_to_account=base_to_account), RISK)
+    assert not r.accepted
+    assert any("invalid context" in x for x in r.reasons)
     assert r.size is None

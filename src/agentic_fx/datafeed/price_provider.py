@@ -10,11 +10,13 @@ from datetime import datetime
 
 from agentic_fx._safe_error import safe_error_text as _safe_error_text
 from agentic_fx.config import Settings
-from agentic_fx.core.contracts import Bar, Clock, InstrumentSpec, Quote
+from agentic_fx.core.contracts import (
+    Bar, Clock, ConversionRate, InstrumentSpec, Quote,
+)
 from agentic_fx.datafeed import sources
 from agentic_fx.datafeed.bars import bars_to_df, df_to_bars, pandas_rule, resample
 from agentic_fx.datafeed.health import (
-    DataUnhealthy, validate_bars, validate_quote,
+    DataUnhealthy, validate_bars, validate_conversion_skew, validate_quote,
 )
 from agentic_fx.store import ohlcv
 
@@ -35,10 +37,15 @@ DERIVE_ONLY_INTERVALS = frozenset({"4h", "1d"})
 # 生じる時点で複製方針が割に合わなくなったため)。挙動は従前と同一。
 
 
-# Phase 1 は組み込みテーブル。Phase 3 で MT5 の symbol_info 照会に置換する
+# Phase 1 は組み込みテーブル。Phase 3 で MT5 の symbol_info 照会に置換する。
+# max_lot: 2026-07-29 OANDA-Japan MT5 実測で静的値 50.0 は実値 10.0 と不一致
+# だったため 10.0 に修正 (ブリーフ実測)。base_currency/quote_currency は
+# symbol の切り出しではなくここで明示する (設計書 §5)。
 _SPECS = {
-    "USDJPY": InstrumentSpec("USDJPY", 0.01, 0.01, 50.0, 0.01, 100_000),
-    "EURUSD": InstrumentSpec("EURUSD", 0.0001, 0.01, 50.0, 0.01, 100_000),
+    "USDJPY": InstrumentSpec("USDJPY", 0.01, 0.01, 10.0, 0.01, 100_000,
+                             base_currency="USD", quote_currency="JPY"),
+    "EURUSD": InstrumentSpec("EURUSD", 0.0001, 0.01, 10.0, 0.01, 100_000,
+                             base_currency="EUR", quote_currency="USD"),
 }
 
 
@@ -337,49 +344,74 @@ class PriceProvider:
             return f"{quote}{base}", True
         return None
 
-    def _rate_of(self, spec: tuple[str, bool]) -> float:
-        """シンボルの mid を取り、必要なら反転する。quote は健全性検証済み。
+    def _rate_of(self, spec: tuple[str, bool]) -> tuple[float, datetime]:
+        """シンボルの**保守側**価格を取り、必要なら反転する。quote は健全性
+        検証済み。戻り値は (rate, その脚の quote 観測時刻)。
 
-        mid (bid/ask の中値) を使う: 換算はサイジングの尺度であって約定価格
-        ではないため、方向 (買い/売り) に依存しない値を使う。
+        保守側 (設計書 §5 codex 指摘 D-M4): 損失・リスク・notional の
+        口座通貨換算は口座通貨額を**過小評価しない側**を使う — 直接ペアは
+        ask (価格が高いほど換算後の額が大きい)、逆ペアは 1/bid (bid が
+        小さいほど逆数が大きい)。mid は表示・分析用でここでは使わない。
         """
         symbol, invert = spec
         q = self.get_quote(symbol)      # 鮮度・有限性・正値の検証を通る
-        mid = (q.bid + q.ask) / 2
-        if not math.isfinite(mid) or mid <= 0:
-            raise DataUnhealthy(f"invalid mid price for {symbol}: {mid}")
-        return 1.0 / mid if invert else mid
+        price = q.bid if invert else q.ask
+        if not math.isfinite(price) or price <= 0:
+            raise DataUnhealthy(f"invalid price for {symbol}: {price}")
+        rate = 1.0 / price if invert else price
+        return rate, q.ts
 
-    def quote_to_account_rate(self, quote_ccy: str, account_ccy: str) -> float:
-        """クォート通貨 1 単位 = 口座通貨いくらか (設計書 §5「口座通貨と換算」)。
+    def to_account_rate(self, ccy: str, account_ccy: str, *,
+                        reference_ts: datetime,
+                        max_skew_min: float) -> ConversionRate:
+        """通貨 1 単位 = 口座通貨いくらか (設計書 §5「口座通貨と換算」)。
 
-        ①直接ペア → ②逆ペア (逆数) → ③USD 経由のクロス の順に解決する。
-        いずれも不可なら DataUnhealthy。呼び出し側 (sizing) はこれを
-        SizingError に変換して fail closed する — 古いレートや推測値での
-        サイジングは無音の過大建玉になるため、ここで握りつぶさない。
+        quote/base のどちらの通貨にも使う汎用関数 (旧
+        `quote_to_account_rate` — 互換 alias は作らない。呼び出し側を
+        全て更新する)。①直接ペア → ②逆ペア (逆数) → ③USD 経由のクロス の
+        順に解決し、**保守側** (`_rate_of` 参照) を使う。
+
+        `reference_ts`/`max_skew_min`: この換算が使われる判断 (gate 評価・
+        予約再検証サイクル) の基準時刻と許容skew。各脚の鮮度は quote 取得時
+        (`get_quote` → `validate_quote`) に検証済みだが、①クロス脚同士の
+        時刻差 ②この判断全体とのスナップショット時刻差 は
+        `validate_conversion_skew` で追加検証する (codex 指摘 D-I2)。
+
+        いずれも解決不可、または skew 超過なら DataUnhealthy。呼び出し側
+        (sizing / risk_gate / executor / scheduler) はこれを fail closed
+        (sizing は SizingError、gate/executor は却下、予約再検証は当該ペアの
+        pending_fill 取消) に変換する — 推測値でのサイジングは無音の過大
+        建玉になるため、ここで握りつぶさない。
         """
-        if quote_ccy == account_ccy:
-            return 1.0
-        direct = self._rate_symbol(quote_ccy, account_ccy)
+        if ccy == account_ccy:
+            return ConversionRate(1.0, ccy, account_ccy, (reference_ts,))
+        direct = self._rate_symbol(ccy, account_ccy)
         if direct is not None:
-            return self._rate_of(direct)
-
-        # ③ USD 経由のクロス (例: EUR→JPY = EURUSD × USDJPY)
-        legs: list[tuple[str, bool]] = []
-        for base, quote in ((quote_ccy, "USD"), ("USD", account_ccy)):
-            if base == quote:
-                continue                # 片脚が USD 同士なら換算不要
-            spec = self._rate_symbol(base, quote)
-            if spec is None:
+            rate, ts = self._rate_of(direct)
+            result = ConversionRate(rate, ccy, account_ccy, (ts,))
+        else:
+            # ③ USD 経由のクロス (例: EUR→JPY = EURUSD(ask) × USDJPY(ask))
+            legs: list[tuple[str, bool]] = []
+            for base, quote in ((ccy, "USD"), ("USD", account_ccy)):
+                if base == quote:
+                    continue            # 片脚が USD 同士なら換算不要
+                spec = self._rate_symbol(base, quote)
+                if spec is None:
+                    raise DataUnhealthy(
+                        f"cannot convert {ccy}->{account_ccy}: no symbol for "
+                        f"{base}/{quote} in VENDOR_SYMBOLS")
+                legs.append(spec)
+            if not legs:
+                # ccy == account_ccy は先に返しているため到達しない
                 raise DataUnhealthy(
-                    f"cannot convert {quote_ccy}->{account_ccy}: no symbol for "
-                    f"{base}/{quote} in VENDOR_SYMBOLS")
-            legs.append(spec)
-        if not legs:
-            # quote_ccy == account_ccy は先に返しているため到達しない
-            raise DataUnhealthy(
-                f"cannot convert {quote_ccy}->{account_ccy}: no route")
-        rate = 1.0
-        for spec in legs:
-            rate *= self._rate_of(spec)
-        return rate
+                    f"cannot convert {ccy}->{account_ccy}: no route")
+            rate = 1.0
+            leg_ts: list[datetime] = []
+            for spec in legs:
+                r, ts = self._rate_of(spec)
+                rate *= r
+                leg_ts.append(ts)
+            result = ConversionRate(rate, ccy, account_ccy, tuple(leg_ts))
+        validate_conversion_skew(result, reference_ts=reference_ts,
+                                 max_skew_min=max_skew_min)
+        return result

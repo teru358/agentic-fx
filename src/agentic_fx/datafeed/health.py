@@ -7,7 +7,7 @@ import math
 from datetime import datetime, timedelta
 
 from agentic_fx.core import market_hours
-from agentic_fx.core.contracts import Bar, Quote
+from agentic_fx.core.contracts import Bar, ConversionRate, Quote
 from agentic_fx.core.timeutil import as_utc
 
 _MAX_GAP_BARS = 3
@@ -111,6 +111,27 @@ def _closed_minutes(a: datetime, b: datetime, interval_min: float) -> float | No
     if samples == 0:
         return 0.0
     return closed / samples * total_min
+
+
+def validate_conversion_skew(rate: ConversionRate, *, reference_ts: datetime,
+                             max_skew_min: float) -> None:
+    """換算レートの脚間・判断内スナップショットの時刻差を検証する (設計書 §5)。
+
+    各脚の**鮮度**自体は脚を取得する quote の `validate_quote` 呼び出しで
+    既に検証済み (fail closed)。ここで見るのは残り 2 つ:
+    ①クロス (2 脚) の脚同士の時刻差 ②この換算レートと、それが使われる
+    判断 (gate 評価・予約再検証サイクル) の基準時刻 (`reference_ts`、
+    通常は判断に使う quote の ts か tick の `now`) との時刻差。
+    2 脚しかない場合でも `reference_ts` を含めた 3 点の最大-最小で両方を
+    一度に検証できる (直接・逆数ペアの 1 脚だけの場合は reference_ts との
+    差のみが効く)。超過は fail closed (DataUnhealthy)。
+    """
+    times = [as_utc(t) for t in rate.leg_ts] + [as_utc(reference_ts)]
+    span = max(times) - min(times)
+    if span > timedelta(minutes=max_skew_min):
+        raise DataUnhealthy(
+            f"conversion rate skew {span} exceeds {max_skew_min}min "
+            f"({rate.from_ccy}->{rate.to_ccy})")
 
 
 def validate_bars(bars: list[Bar], now: datetime, freshness_max_min: float,

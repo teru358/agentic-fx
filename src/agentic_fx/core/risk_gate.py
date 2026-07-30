@@ -6,7 +6,8 @@ from datetime import datetime
 
 from agentic_fx.config import RiskSettings
 from agentic_fx.core.contracts import (
-    Action, Direction, EntryType, Horizon, InstrumentSpec, Quote, TradeIntent,
+    Action, ConversionRate, Direction, EntryType, Horizon, InstrumentSpec,
+    Quote, TradeIntent,
 )
 from agentic_fx.core.market_hours import is_friday_after
 from agentic_fx.core.sizing import SizeResult, SizingError, compute_size
@@ -22,12 +23,20 @@ class GateContext:
     hwm: float
     daily_start_equity: float | None
     open_position_count: int      # 未約定指値・送信中・クローズ中を含む
-    existing_risk_total: float    # 上記の予約リスクを含む
-    existing_notional: float
+    existing_risk_account: float  # 上記の予約リスクを含む。口座通貨建て
+                                  # (ペア毎に換算済みで加算済み — 設計書 §5)
+    existing_notional_account: float  # 口座通貨建て (同上)
     kill_switch_latched: bool
     has_unresolved_unknown: bool  # *_unknown が 1 件でもあれば新規 open 不可
     now: datetime
     account_currency: str
+    # 設計書 §5「口座通貨と換算」: quote_to_account は spec.quote_currency→
+    # account_currency (loss_per_lot・total risk の換算に使う)。
+    # base_to_account は spec.base_currency→account_currency (notional の
+    # 換算に使う、price は掛けない)。1 回の gate 評価内でスナップショット
+    # 固定 (呼び出し側が同一サイクル内で使い回す)。
+    quote_to_account: ConversionRate
+    base_to_account: ConversionRate
 
 
 def _validate_context(intent: TradeIntent, ctx: GateContext) -> list[str]:
@@ -35,7 +44,7 @@ def _validate_context(intent: TradeIntent, ctx: GateContext) -> list[str]:
     import math
     reasons: list[str] = []
     numbers = [ctx.quote.bid, ctx.quote.ask, ctx.equity, ctx.hwm,
-               ctx.existing_risk_total, ctx.existing_notional]
+               ctx.existing_risk_account, ctx.existing_notional_account]
     if any(not math.isfinite(v) for v in numbers) or ctx.equity <= 0 \
             or ctx.quote.bid <= 0 or ctx.quote.bid > ctx.quote.ask:
         reasons.append("invalid context data (fail closed)")
@@ -51,9 +60,23 @@ def _validate_context(intent: TradeIntent, ctx: GateContext) -> list[str]:
                        "daily_start_equity must be finite and positive")
     if ctx.hwm <= 0:
         reasons.append("invalid context data (fail closed): hwm must be > 0")
-    if ctx.existing_risk_total < 0 or ctx.existing_notional < 0:
+    if ctx.existing_risk_account < 0 or ctx.existing_notional_account < 0:
         reasons.append("invalid context data (fail closed): "
-                       "existing_risk_total/existing_notional must be >= 0")
+                       "existing_risk_account/existing_notional_account must "
+                       "be >= 0")
+    # 換算レートの構造的検証 (設計書 §5 codex 指摘 D-I2): base/quote の
+    # 取り違えを ConversionRate のラベルで検出する (数値の偶然の一致に
+    # 頼らない)。鮮度・skew 自体は取得時 (to_account_rate) に検証済み。
+    for label, rate, expected_from in (
+            ("quote_to_account", ctx.quote_to_account, ctx.spec.quote_currency),
+            ("base_to_account", ctx.base_to_account, ctx.spec.base_currency)):
+        if (rate is None or rate.from_ccy != expected_from
+                or rate.to_ccy != ctx.account_currency
+                or not math.isfinite(rate.value) or rate.value <= 0):
+            reasons.append(
+                f"invalid context data (fail closed): {label} must convert "
+                f"{expected_from}->{ctx.account_currency} with a finite "
+                f"positive value")
     try:
         as_utc(ctx.now)
     except ValueError:
@@ -187,16 +210,22 @@ def evaluate(intent: TradeIntent, ctx: GateContext,
         size = compute_size(equity=ctx.equity, entry_price=entry,
                             stop_loss=sl, horizon=intent.horizon,
                             pair=intent.pair, spec=ctx.spec, risk=risk,
-                            account_currency=ctx.account_currency)
+                            account_currency=ctx.account_currency,
+                            quote_to_account=ctx.quote_to_account)
     except SizingError as e:
         reasons.append(f"sizing failed: {e}")
     if size is not None:
-        total = ctx.existing_risk_total + size.quantity * size.loss_per_lot
+        # total risk は size.loss_per_lot が既に口座通貨建て (compute_size が
+        # quote_to_account で換算済み) なので、そのまま加算する。
+        total = ctx.existing_risk_account + size.quantity * size.loss_per_lot
         cap = ctx.equity * risk.max_total_risk_pct / 100
         if total > cap:
             reasons.append(f"total risk {total:.0f} > cap {cap:.0f}")
-        notional = ctx.existing_notional \
-            + size.quantity * ctx.spec.contract_size * entry
+        # notional (レバレッジ判定の分子) はベース通貨の想定元本
+        # (qty × contract_size、price は掛けない) を base_to_account で
+        # 口座通貨へ換算する (設計書 §5)。
+        notional = ctx.existing_notional_account \
+            + size.quantity * ctx.spec.contract_size * ctx.base_to_account.value
         if notional / ctx.equity > risk.max_leverage:
             reasons.append(
                 f"leverage {notional / ctx.equity:.1f}x > {risk.max_leverage}x")

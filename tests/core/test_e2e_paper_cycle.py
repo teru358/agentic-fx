@@ -22,7 +22,8 @@ from agentic_fx.store.state import StateStore
 WED = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
-SPEC = InstrumentSpec("USDJPY", 0.01, 0.01, 50.0, 0.01, 100_000)
+SPEC = InstrumentSpec("USDJPY", 0.01, 0.01, 50.0, 0.01, 100_000,
+                      base_currency="USD", quote_currency="JPY")
 
 
 def test_full_paper_cycle(tmp_path):

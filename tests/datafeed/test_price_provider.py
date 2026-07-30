@@ -527,7 +527,15 @@ def test_healthcheck_covers_all_primary_intervals(tmp_path):
             p.healthcheck("USDJPY")
 
 
-# ---- quote_to_account_rate ------------------------------------------------
+# ---- to_account_rate -------------------------------------------------------
+#
+# 改訂第 16 版 (口座通貨と換算) 準拠。旧 quote_to_account_rate からの変更点:
+# ①戻り値が ConversionRate 値オブジェクト (float ではない)
+# ②mid ではなく保守側 (直接=ask、逆数=1/bid、クロスは脚ごと保守側) を使う
+# ③脚間・判断内スナップショットの時刻差 (skew) を検証する
+# 互換 alias は作らないため、呼び出し側は全て to_account_rate に更新する。
+
+_SKEW = 20.0  # settings.yaml.example の freshness_max_min と同じ値を再利用
 
 
 def _quote_map(**prices):
@@ -540,43 +548,78 @@ def _quote_map(**prices):
     return _fn
 
 
-def test_quote_to_account_rate_same_currency_is_one(tmp_path):
+def _rate(p, ccy, account_ccy, **kw):
+    kw.setdefault("reference_ts", NOW)
+    kw.setdefault("max_skew_min", _SKEW)
+    return p.to_account_rate(ccy, account_ccy, **kw)
+
+
+def test_to_account_rate_same_currency_is_one(tmp_path):
     """同一通貨はレート取得を試みない (無用な外部アクセス・失敗点を作らない)。"""
     _, p = _provider(tmp_path)
     with patch("agentic_fx.datafeed.price_provider.sources.yf_quote") as yq:
-        assert p.quote_to_account_rate("JPY", "JPY") == 1.0
+        rate = _rate(p, "JPY", "JPY")
     yq.assert_not_called()
+    assert rate.value == 1.0
+    assert rate.from_ccy == "JPY" and rate.to_ccy == "JPY"
 
 
-def test_quote_to_account_rate_direct_pair(tmp_path):
-    """quote=USD / account=JPY → USDJPY の mid をそのまま使う。"""
+def test_to_account_rate_direct_pair_uses_ask_not_mid(tmp_path):
+    """quote=USD / account=JPY → 直接ペア USDJPY の **ask** (保守側)。
+
+    保守側を mid に変える変異のピン: mid (148.5) ではなく ask (149.0) を
+    使うことをここで固定する。
+    """
     _, p = _provider(tmp_path)
     with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
                side_effect=_quote_map(USDJPY=(148.0, 149.0))):
-        assert p.quote_to_account_rate("USD", "JPY") == pytest.approx(148.5)
+        rate = _rate(p, "USD", "JPY")
+    assert rate.value == pytest.approx(149.0)
+    assert rate.value != pytest.approx(148.5)   # mid ではない
+    assert rate.from_ccy == "USD" and rate.to_ccy == "JPY"
+    assert rate.leg_ts == (NOW,)
 
 
-def test_quote_to_account_rate_inverse_pair(tmp_path):
-    """quote=JPY / account=USD → USDJPY の逆数。"""
+def test_to_account_rate_inverse_pair_uses_one_over_bid(tmp_path):
+    """quote=JPY / account=USD → USDJPY の **1/bid** (保守側)。"""
     _, p = _provider(tmp_path)
     with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
                side_effect=_quote_map(USDJPY=(148.0, 149.0))):
-        rate = p.quote_to_account_rate("JPY", "USD")
-    assert rate == pytest.approx(1 / 148.5)
-    assert rate * 148.5 == pytest.approx(1.0)   # 逆数であることの実測
+        rate = _rate(p, "JPY", "USD")
+    assert rate.value == pytest.approx(1 / 148.0)
+    assert rate.value != pytest.approx(1 / 148.5)   # mid の逆数ではない
+    assert rate.value * 148.0 == pytest.approx(1.0)
 
 
-def test_quote_to_account_rate_via_usd_cross(tmp_path):
-    """直接・逆ペアとも無い場合は USD 経由 (EUR→USD→JPY)。"""
+def test_to_account_rate_via_usd_cross(tmp_path):
+    """直接・逆ペアとも無い場合は USD 経由 (EUR→USD→JPY)、脚ごとに保守側。"""
     _, p = _provider(tmp_path)
     with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
-               side_effect=_quote_map(EURUSD=(1.08, 1.08),
+               side_effect=_quote_map(EURUSD=(1.08, 1.09),
                                       USDJPY=(148.0, 149.0))):
-        assert p.quote_to_account_rate("EUR", "JPY") == pytest.approx(
-            1.08 * 148.5)
+        rate = _rate(p, "EUR", "JPY")
+    assert rate.value == pytest.approx(1.09 * 149.0)  # 両脚とも ask (保守側)
+    assert len(rate.leg_ts) == 2
 
 
-def test_quote_to_account_rate_stale_quote_raises(tmp_path):
+def test_to_account_rate_eurjpy_golden_matches_order_calc_profit(tmp_path):
+    """EURUSD golden (ブリーフ実測): 1 lot +100pt → 100 USD → 16,367 JPY
+    @ USDJPY 163.665 (order_calc_profit 実測、2026-07-29 OANDA-Japan)。
+
+    ask==bid==163.665 に揃える — mid でも同じ数値になってしまうと、
+    「保守側」のピンと golden が偶然一致してしまい変異を殺せないため。
+    """
+    _, p = _provider(tmp_path)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               side_effect=_quote_map(EURUSD=(1.0999, 1.1001),
+                                      USDJPY=(163.665, 163.665))):
+        rate = _rate(p, "USD", "JPY")
+    pnl_usd = 100.0
+    pnl_jpy = pnl_usd * rate.value
+    assert pnl_jpy == pytest.approx(16_367, abs=1)
+
+
+def test_to_account_rate_stale_quote_raises(tmp_path):
     """レート用 quote が陳腐なら DataUnhealthy (握りつぶさない)。
 
     古いレートでのサイジングは無音の過大建玉になる。
@@ -586,22 +629,76 @@ def test_quote_to_account_rate_stale_quote_raises(tmp_path):
     with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
                return_value=stale):
         with pytest.raises(DataUnhealthy):
-            p.quote_to_account_rate("USD", "JPY")
+            _rate(p, "USD", "JPY")
 
 
-def test_quote_to_account_rate_unknown_symbol_raises(tmp_path):
-    """VENDOR_SYMBOLS 未登録の通貨対は DataUnhealthy。"""
+def test_to_account_rate_unknown_symbol_raises(tmp_path):
+    """VENDOR_SYMBOLS 未登録の通貨対は DataUnhealthy。
+
+    GBP は EURGBP/GBPJPY クロス解決テスト向けに GBPUSD を登録したため、
+    ここでは未登録のまま残る通貨 (CHF) を使う。
+    """
     _, p = _provider(tmp_path)
     with patch("agentic_fx.datafeed.price_provider.sources.yf_quote") as yq:
-        with pytest.raises(DataUnhealthy, match="GBP"):
-            p.quote_to_account_rate("GBP", "JPY")
+        with pytest.raises(DataUnhealthy, match="CHF"):
+            _rate(p, "CHF", "JPY")
     yq.assert_not_called()   # 存在しないシンボルを取りに行かない
 
 
-def test_quote_to_account_rate_cross_missing_leg_raises(tmp_path):
+def test_to_account_rate_cross_missing_leg_raises(tmp_path):
     """USD 経由の片脚が取れなければ DataUnhealthy (推測で埋めない)。"""
     _, p = _provider(tmp_path)
     with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
                side_effect=_quote_map(EURUSD=(1.08, 1.08))):
         with pytest.raises(DataUnhealthy):
-            p.quote_to_account_rate("EUR", "JPY")
+            _rate(p, "EUR", "JPY")
+
+
+def test_to_account_rate_gbp_jpy_cross_via_usd(tmp_path):
+    """GBP→JPY: GBPJPY 直接シンボル未登録のため GBPUSD × USDJPY で解決し、
+    保守側 (両脚 ask) を使うこと。この 1 通貨対の解決は GBPJPY (base=GBP)・
+    EURGBP (quote=GBP) の両ペアの換算が共通して依拠する経路 (設計書の
+    「①直接→②逆ペア→③USD経由クロス」は通貨対にのみ依存し、取引ペア文字列
+    には依存しない汎用関数であることの確認)。"""
+    _, p = _provider(tmp_path)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               side_effect=_quote_map(GBPUSD=(1.25, 1.26),
+                                      USDJPY=(163.0, 163.665))):
+        rate = _rate(p, "GBP", "JPY")
+    assert rate.value == pytest.approx(1.26 * 163.665)
+    assert len(rate.leg_ts) == 2
+
+
+def test_to_account_rate_snapshot_skew_exceeded_raises(tmp_path):
+    """判断の基準時刻 (reference_ts) とレートの観測時刻の差が
+    max_skew_min を超えたら fail closed。脚自体は fresh (validate_quote は
+    通る) でも、判断全体としては古い組み合わせになり得るため。"""
+    _, p = _provider(tmp_path)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               side_effect=_quote_map(USDJPY=(148.0, 149.0))):
+        with pytest.raises(DataUnhealthy, match="skew"):
+            _rate(p, "USD", "JPY",
+                 reference_ts=NOW + timedelta(minutes=_SKEW + 1))
+
+
+def test_to_account_rate_cross_leg_skew_exceeded_raises(tmp_path):
+    """クロスの 2 脚が互いに freshness 内でも、脚同士の時刻差が
+    max_skew_min を超えれば fail closed。"""
+    _, p = _provider(tmp_path)
+
+    # 両脚とも個別には fresh (freshness_max_min=20 以内) だが、一方は
+    # +2 分 (未来許容の上限ぎりぎり)・他方は -20 分 (陳腐化の上限ぎりぎり)
+    # なので脚間の差は 22 分 > 20 分 (max_skew_min) になる。
+    def _fn(pair):
+        if pair == "EURUSD":
+            return Quote(pair, 1.08, 1.08, NOW + timedelta(minutes=2),
+                        "yfinance")
+        if pair == "USDJPY":
+            return Quote(pair, 148.0, 149.0, NOW - timedelta(minutes=_SKEW),
+                        "yfinance")
+        raise OSError(f"no data for {pair}")
+
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               side_effect=_fn):
+        with pytest.raises(DataUnhealthy, match="skew"):
+            _rate(p, "EUR", "JPY", reference_ts=NOW)

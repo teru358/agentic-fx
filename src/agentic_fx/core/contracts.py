@@ -98,6 +98,33 @@ class InstrumentSpec:
     max_lot: float
     lot_step: float
     contract_size: float
+    # 設計書 §5「口座通貨と換算」: symbol 文字列の切り出し (`symbol[3:]`) や
+    # 部分一致による通貨推測は禁止 (前身 finance で 5 箇所に複製され XAU 等で
+    # 誤爆した)。base/quote は必ずここで明示する。
+    base_currency: str
+    quote_currency: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConversionRate:
+    """ある通貨 1 単位 = 口座通貨いくらか (設計書 §5)。裸の float でなく値
+    オブジェクトにする理由 (codex 指摘 D-I2): サイジング・リスク評価は
+    「この数値がいつ観測されたか」を無視できない — 古いレートでの計算は
+    無音の過大建玉になる。
+
+    - `from_ccy`/`to_ccy`: 変換元・変換先の通貨コード。呼び出し側が
+      base/quote を取り違えて渡した場合に、数値の偶然の一致に頼らず
+      構造的に検出できるようにするためのラベル (base/quote 取り違えの
+      変異テストの防御線)。
+    - `leg_ts`: 各脚 (直接・逆数ペアは 1 脚、USD 経由のクロスは 2 脚) の
+      quote 観測時刻。**同一通貨** (`from_ccy == to_ccy`) は外部取得なしの
+      恒等変換であり、`leg_ts` には呼び出し時点の参照時刻を 1 つだけ入れる
+      (鮮度・skew 検証を一様に扱うため)。
+    """
+    value: float
+    from_ccy: str
+    to_ccy: str
+    leg_ts: tuple[datetime, ...]
 
 
 @dataclass(frozen=True, slots=True)

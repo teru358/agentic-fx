@@ -33,6 +33,10 @@ NATIVE_INTERVALS: dict[str, frozenset[str]] = {
 VENDOR_SYMBOLS: dict[str, dict[str, str]] = {
     "USDJPY": {"yf": "USDJPY=X", "td": "USD/JPY", "mt5": "USDJPY"},
     "EURUSD": {"yf": "EURUSD=X", "td": "EUR/USD", "mt5": "EURUSD"},
+    # 口座通貨換算のクロス解決 (USD 経由) 用。Phase 1 で GBP 建てペアを
+    # 取引可能にするものではなく、任意通貨ペア対応の換算層 (口座通貨と換算)
+    # がクロス経路を一般に解決できることの検証に使う。
+    "GBPUSD": {"yf": "GBPUSD=X", "td": "GBP/USD", "mt5": "GBPUSD"},
     # 関連指標の拡張例 (Phase 1 では未使用):
     "DXY": {"yf": "DX-Y.NYB", "td": "DXY"},
 }

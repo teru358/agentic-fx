@@ -23,7 +23,16 @@ FRI = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)  # 金曜 正午
 SAT = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
 SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
-SPEC = InstrumentSpec("USDJPY", 0.01, 0.01, 50.0, 0.01, 100_000)
+SPEC = InstrumentSpec("USDJPY", 0.01, 0.01, 50.0, 0.01, 100_000,
+                      base_currency="USD", quote_currency="JPY")
+# 既存の site1 系テストは pair 文字列 (GBPJPY/EURUSD) をラベルとして使うだけで
+# spec_fn は常に SPEC (USDJPY) を返すスタブに依存している (通貨とは無関係な
+# 例外隔離テストのため)。EUR_SPEC/GBP_SPEC は換算層の新規テストが明示的に
+# spec_fn を差し替えるときのみ使う (Env のデフォルトは変更しない)。
+EUR_SPEC = InstrumentSpec("EURUSD", 0.0001, 0.01, 50.0, 0.01, 100_000,
+                          base_currency="EUR", quote_currency="USD")
+GBP_SPEC = InstrumentSpec("GBPJPY", 0.01, 0.01, 50.0, 0.01, 100_000,
+                          base_currency="GBP", quote_currency="JPY")
 QUOTE = Quote("USDJPY", 148.49, 148.51, WED, "test")
 
 
