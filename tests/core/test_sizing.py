@@ -225,19 +225,24 @@ def test_usdjpy_non_regression_pins_the_multiplication():
 def test_commission_is_not_converted():
     """commission_per_lot は口座通貨建てなので rate を掛けてはならない
     (設計書 §5)。rate≠1.0 でも commission 項がそのまま加算されることを
-    固定する — commission に rate を掛ける変異のピン。"""
+    固定する — commission に rate を掛ける変異のピン。
+
+    settings.yaml.example の commission_per_lot は 0.0 (rate を掛けても
+    掛けなくても差が出ない) なので、ここでは明示的に非ゼロへ上書きする。
+    """
     eurusd_spec = InstrumentSpec(symbol="EURUSD", pip_size=0.0001, min_lot=0.01,
                                  max_lot=10.0, lot_step=0.01, contract_size=100_000,
                                  base_currency="EUR", quote_currency="USD")
+    risk = RISK.model_copy(update={"commission_per_lot": 500.0})
     rate = ConversionRate(163.665, "USD", "JPY", (NOW,))
     r = compute_size(equity=100_000_000, entry_price=1.1000, stop_loss=1.0990,
                      horizon=Horizon.DAY, pair="EURUSD", spec=eurusd_spec,
-                     risk=RISK, account_currency="JPY",
+                     risk=risk, account_currency="JPY",
                      quote_to_account=rate)
-    spread = RISK.pair_rules["EURUSD"].assumed_spread_pips * eurusd_spec.pip_size
+    spread = risk.pair_rules["EURUSD"].assumed_spread_pips * eurusd_spec.pip_size
     price_term_account = (0.0010 + spread) * 100_000 * rate.value
     # commission_per_lot (config, 口座通貨建て) が rate 倍されていれば
     # loss_per_lot は price_term_account + commission*rate になってしまう。
     # ここでは commission がそのまま (× 1) 加算されていることを確認する。
     assert r.loss_per_lot == pytest.approx(
-        price_term_account + RISK.commission_per_lot)
+        price_term_account + risk.commission_per_lot)
