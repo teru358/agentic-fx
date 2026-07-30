@@ -2030,3 +2030,117 @@ def test_force_close_day_invalid_filled_at_isolated_per_position(tmp_path):
     assert row_b["status"] == "closed"
     assert row_b["close_reason"] == "sl"
     assert env.trade_calls == 1
+
+
+# --- fix round 4 (独立レビュー再判定 — fix diff の主張の未検証部分) --------
+#
+# round 3 の fix diff にコード上の新規欠陥は無かったが、変異テストで
+# 2 件が生存していた (レビュアーが実行可能なテストを作成済み — 本節は
+# それを移植したもの)。
+
+def test_site1_fills_allowed_false_prevents_reservation_fill_different_pair(
+        tmp_path):
+    """変異 A の識別テスト (Important): site 1 の except で
+    `fills_allowed = False` (`scheduler.py:172` 付近) を削除しても、
+    既存の site 1 テスト (`test_maintain_reservations_call_spec_fn_failure_does_not_stop_tick`)
+    は raise させるペアと予約のペアが同一 (GBPJPY) かつ GBPJPY にバーを
+    与えていないため約定経路に到達せず、この変異を殺せなかった (実測)。
+
+    raise させるペア (USDJPY, `spec_fn` が `DataUnhealthy`) と予約の
+    ペア (EURUSD, 到達バーあり) を**別**にすることで、
+    `fills_allowed=False` が落ちると「総リスクを再検証できない tick で
+    EURUSD の予約が約定してしまう」fail-open (fix round 2 の C1 と同じ
+    クラス) を直接ピンする。
+
+    罠 (レビュアー実測): spread = half 0.005 のため、`bar.low + half` が
+    指値を上回ると約定しない。SL は 1.0500 を使う — SL を 1.0900 に近い
+    値にすると、同一バー内で `entry_same_bar=True` の `check_exit` が
+    即座にクローズしてしまい、約定直後の `open` 状態を観測できなくなる
+    (指値到達と SL 到達がこの 1 本のバーで同時に起こるため)。"""
+    env = Env(tmp_path)
+    # USDJPY の OPEN — _EXPOSURE に入るので open_risk_and_notional が
+    # spec_fn(USDJPY) を呼び、raise して site 1 の except に落ちる。
+    open_id = orders.insert(env.conn, pair="USDJPY", direction="long",
+                            entry_type="market", horizon="swing",
+                            status="open", now=WED, quantity=0.1,
+                            avg_fill_price=148.20, stop_loss=147.80,
+                            take_profit=149.00)
+    # EURUSD の予約 — 到達バーを与える (USDJPY とは別ペア)。
+    res = orders.insert(env.conn, pair="EURUSD", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="pending_fill", now=WED, quantity=0.1,
+                        requested_price=1.1000, stop_loss=1.0500,
+                        take_profit=1.1200,
+                        expires_at=(WED + timedelta(hours=4)).isoformat())
+
+    orig_spec_fn = env.executor.spec_fn
+
+    def flaky_spec_fn(pair):
+        if pair == "USDJPY":
+            from agentic_fx.datafeed.health import DataUnhealthy
+            raise DataUnhealthy(LEAKY)
+        return orig_spec_fn(pair)
+
+    env.executor.spec_fn = flaky_spec_fn
+    # spread = assumed_spread_pips(1.0) * SPEC.pip_size(0.01) = 0.01 →
+    # half=0.005。long の指値到達は bar.low + 0.005 <= 1.1000 が必要。
+    env.bars["EURUSD"] = Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                             1.1050, 1.1055, 1.0900, 1.1000, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    names = _event_names(log)
+    # 前提: site 1 の except に到達している (mark_to_market は同じ raise を
+    # 握って tick を継続する)。
+    assert "maintain_reservations_error" in names, names
+    row_res = orders.get(env.conn, res)
+    assert row_res["status"] == "pending_fill", (
+        "総リスクを再検証できない tick で予約が約定した (fail-open): "
+        f"status={row_res['status']}")
+    assert orders.get(env.conn, open_id)["status"] == "open"
+
+
+def test_site2_close_order_failure_does_not_stop_remaining_day_positions(
+        tmp_path):
+    """変異 B の識別テスト (Minor): site 2 の except 末尾に `return`
+    を足しても (ループを打ち切っても)、既存の site 2 テスト
+    (`test_force_close_day_close_order_failure_isolated_per_position`)
+    は day ポジションが 1 件しか無いため 2 件目への継続が検証されず、
+    この変異を殺せなかった (実測)。
+
+    day ポジションを 2 件にし、1 件目 (EURUSD) の `close_order` が
+    (内部の `spec_fn` の `DataUnhealthy` で) raise しても、2 件目
+    (GBPJPY, 健全) の day 強制決済が同一 tick で実行され続けることを
+    直接ピンする (`return` だと 2 件目が rollover を越えて持ち越される)。"""
+    env = Env(tmp_path)
+    a = orders.insert(env.conn, pair="EURUSD", direction="long",
+                      entry_type="market", horizon="day", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=1.1000,
+                      stop_loss=1.0900, take_profit=1.1200,
+                      filled_at=WED.isoformat())
+    b = orders.insert(env.conn, pair="GBPJPY", direction="long",
+                      entry_type="market", horizon="day", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=190.00,
+                      stop_loss=189.00, take_profit=192.00,
+                      filled_at=WED.isoformat())
+
+    orig_spec_fn = env.executor.spec_fn
+
+    def flaky_spec_fn(pair):
+        if pair == "EURUSD":
+            from agentic_fx.datafeed.health import DataUnhealthy
+            raise DataUnhealthy(LEAKY)
+        return orig_spec_fn(pair)
+
+    env.executor.spec_fn = flaky_spec_fn
+    near_close = WED.replace(hour=20, minute=57)
+    env.sched.tick(near_close)
+
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "day_close_error" in _event_names(log)
+    assert orders.get(env.conn, a)["status"] == "open"   # A は隔離される
+    row_b = orders.get(env.conn, b)
+    assert row_b["status"] == "closed", (
+        "1 件目の close_order 例外で 2 件目の day 強制決済が止まった "
+        f"(status={row_b['status']}) — rollover 越えの持ち越し")
+    assert row_b["close_reason"] == "day_rollover"
