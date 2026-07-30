@@ -19,3 +19,51 @@ def test_fake_runner_returns_scripted_results():
 
 def test_fake_runner_is_agent_runner():
     assert isinstance(FakeRunner([]), AgentRunner)
+
+
+def test_fake_runner_empty_results_returns_failed():
+    """Pin: empty results list should return status='failed', not 'completed'."""
+    fake = FakeRunner([])
+    result = fake.run(_mission("m1"))
+    assert result.status == "failed", f"Expected 'failed', got '{result.status}'"
+    assert result.output is None
+
+
+def test_fake_runner_repeat_last_with_distinctive_value():
+    """Pin: repeat-last behavior distinguishable from default 'failed' status."""
+    r1 = MissionResult(status="completed", output={"a": 1}, transcript=[])
+    # Use max_turns as distinctive value different from default 'failed'
+    r2 = MissionResult(status="max_turns", output=None, transcript=[])
+    fake = FakeRunner([r1, r2])
+    assert fake.run(_mission("m1")).status == "completed"
+    assert fake.run(_mission("m2")).status == "max_turns"
+    # Third call should repeat the last result (r2 with status="max_turns")
+    assert fake.run(_mission("m3")).status == "max_turns"
+    # Verify it's still repeating the last result
+    assert fake.run(_mission("m4")).status == "max_turns"
+
+
+def test_fake_runner_missions_exact_object_recording():
+    """Pin: fake.missions records exact Mission objects, not just prompts."""
+    m1 = _mission("m1")
+    m2 = _mission("m2")
+    m3 = _mission("m3")
+    r1 = MissionResult(status="completed", output={"a": 1}, transcript=[])
+    fake = FakeRunner([r1])
+    fake.run(m1)
+    fake.run(m2)
+    fake.run(m3)
+    # Check exact object references
+    assert fake.missions[0] is m1
+    assert fake.missions[1] is m2
+    assert fake.missions[2] is m3
+    assert len(fake.missions) == 3
+
+
+def test_agent_runner_cannot_be_instantiated():
+    """Pin: AgentRunner is abstract and cannot be instantiated directly."""
+    try:
+        AgentRunner()
+        assert False, "AgentRunner() should raise TypeError"
+    except TypeError as e:
+        assert "abstract" in str(e).lower()
