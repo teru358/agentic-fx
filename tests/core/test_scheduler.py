@@ -1740,3 +1740,118 @@ def test_expire_limits_non_runtime_error_isolated_per_order(tmp_path):
     env.sched.tick(WED)
     assert orders.get(env.conn, e2)["status"] == "expired"
     assert env.trade_calls == 1
+
+
+# --- fix round 2 (独立レビュー再判定 — fix diff 自体が開けた新規欠陥 2 件) --
+
+def test_expire_limits_recovery_orders_get_failure_does_not_stop_tick(
+        tmp_path, caplog):
+    """新規 Critical: `_expire_limits` の except ハンドラ内の復旧処理
+    (`orders.get` / `S(current["status"])`) が無保護だった。内側 try
+    (`transitions.transition` のみ) の外にあり、broker.cancel が DB 障害の
+    連鎖で例外を投げる状況では、**同じ conn** を使うこの `orders.get` も
+    同じ理由で落ちる。その例外は except 節から漏れ、`_expire_limits` に
+    外側 try が無いため tick を貫通し、後続の `_process_exits`
+    (SL 執行) が丸ごと死ぬ (レビュアー実測: sqlite3.OperationalError で
+    SL 未執行)。
+
+    再現はレビュアーが実測に使った probe を書き直したもの。broker.cancel
+    が 1 回目の期限切れ注文で raise し、その直後に呼ばれる復旧処理内の
+    `orders.get` も 1 回だけ raise するよう仕込む。"""
+    import sqlite3
+
+    from agentic_fx.core import scheduler as scheduler_mod
+
+    expired = (WED - timedelta(minutes=1)).isoformat()
+    env = Env(tmp_path)
+    oid = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="pending_fill", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8,
+                        expires_at=expired)
+    open_id = orders.insert(env.conn, pair="EURUSD", direction="long",
+                            entry_type="market", horizon="swing",
+                            status="open", now=WED, quantity=0.1,
+                            avg_fill_price=1.1000, stop_loss=1.0960,
+                            take_profit=1.1120)
+
+    state = {"armed": False}
+
+    def flaky_broker_cancel(row):
+        state["armed"] = True
+        raise RuntimeError("broker down (db fault cascade)")
+
+    env.executor.broker.cancel = flaky_broker_cancel
+
+    orig_get = scheduler_mod.orders.get
+
+    def flaky_get(conn, order_id):
+        if state["armed"]:
+            state["armed"] = False       # ハンドラの 1 回だけ落とす
+            # LEAKY: 修正後の内側 except が safe_error_text を通すことも
+            # 同時にピンする (str(e) 変異を殺す)。
+            raise sqlite3.OperationalError("disk I/O error " + LEAKY)
+        return orig_get(conn, order_id)
+
+    scheduler_mod.orders.get = flaky_get
+    # EURUSD の SL (1.0960) を明確に下回るバー
+    env.bars["EURUSD"] = Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                             1.0950, 1.0955, 1.0900, 1.0905, 100)
+    try:
+        with caplog.at_level(logging.WARNING, logger="agentic_fx.scheduler"):
+            env.sched.tick(WED + timedelta(minutes=1))
+    finally:
+        scheduler_mod.orders.get = orig_get
+
+    row_open = orders.get(env.conn, open_id)
+    assert row_open["status"] == "closed", "資金保護 (SL) が止まった"
+    assert row_open["close_reason"] == "sl"
+    assert env.trade_calls == 1, "tick が完走していない"
+    assert orders.get(env.conn, oid) is not None
+    _assert_no_url(caplog.text)
+
+
+def test_maintain_reservations_cancel_order_failure_does_not_allow_same_tick_fill(
+        tmp_path):
+    """新規 Important: C1 の `return` が予約約定の fail-open 窓を開けた。
+
+    `_maintain_reservations` がリスク超過と判定した予約の取消に失敗して
+    `return` しても、tick 側の `fills_allowed` は True のままだったため、
+    同一 tick の `_process_limit_fills` が到達バーでその予約を約定させて
+    しまっていた (gate は予約約定経路では再実行されない — レビュアー実測:
+    a0a014f 時点では約定しなかったのに、C1 の fix 由来でこの回帰が入った)。
+
+    修正: `_maintain_reservations` が中断 (bool False) を呼び出し元へ返し、
+    tick がその tick の `fills_allowed` を False にする (account 不明/
+    equity<=0 と同じ既存の 2 層構えに揃える)。`_process_exits` は
+    `filled_ids=set()` で通常どおり走り続けること (C1 の目的である資金
+    保護継続と両立) も確認する。"""
+    env = Env(tmp_path)
+    oid = env.place_limit()          # USDJPY limit @148.20 (qty 0.12 相当)
+    open_id = orders.insert(env.conn, pair="EURUSD", direction="long",
+                            entry_type="market", horizon="swing",
+                            status="open", now=WED, quantity=0.1,
+                            avg_fill_price=1.1000, stop_loss=1.0960,
+                            take_profit=1.1120)
+    env.executor.broker.equity = lambda: (300_000.0, 300_000.0)  # リスク超過
+
+    def flaky_cancel(row, reason):
+        raise OSError("cancel io down")
+
+    env.executor.cancel_order = flaky_cancel
+    # entry (148.20) に到達する USDJPY のバー
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.30, 148.35, 148.15, 148.25, 100)
+    # SL (1.0960) を明確に下回る EURUSD のバー — 資金保護は継続すること
+    env.bars["EURUSD"] = Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                             1.0950, 1.0955, 1.0900, 1.0905, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    row = orders.get(env.conn, oid)
+    assert row["status"] != "open", (
+        "リスク超過で取消対象と判定された予約が同一 tick で約定した "
+        f"(status={row['status']})")
+    row_open = orders.get(env.conn, open_id)
+    assert row_open["status"] == "closed"   # SL/TP 走査は通常どおり動く
+    assert row_open["close_reason"] == "sl"
+    assert env.trade_calls == 1
