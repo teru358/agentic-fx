@@ -53,3 +53,17 @@ def test_write_does_not_raise_on_io_error(tmp_path, caplog):
         log.write(Category.TRADE, "order_opened", "USDJPY long 0.10lot")
     assert "activity write failed" in caplog.text
     assert "order_opened" in caplog.text
+
+
+def test_write_does_not_raise_on_none_summary_or_str_category(tmp_path, caplog):
+    """I3 のピン: 整形 3 行 (ts / clean / line の組み立て) が try の外に
+    あると、summary=None (``None.split()`` で AttributeError) や、
+    category が ``Category`` ではなく素の str のケース
+    (``"TRADE".value`` は存在せず AttributeError) で「決して送出しない」
+    契約に反して例外がそのまま伝播する (レビュアー実測)。整形も try の
+    中に入れ、ログ用の category 表示も ``.value`` に依存しない形にする。"""
+    log = ActivityLog(tmp_path / "activity.log")
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.activity"):
+        log.write("TRADE", "some_event", None)  # category が str, summary が None
+    assert "activity write failed" in caplog.text
+    assert "some_event" in caplog.text

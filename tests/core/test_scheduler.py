@@ -886,6 +886,15 @@ def _assert_no_url(text: str) -> None:
     assert "apikey" not in text
 
 
+def _event_names(log_text: str) -> set[str]:
+    """activity 行のタブ区切りフィールド (event = index 2) の完全一致集合。
+
+    M-a (fix round 1): 部分一致 (`"foo" in log`) だと接尾辞改名変異
+    (例: "foo" -> "foo_v2") が生存する。フィールド単位の完全一致で
+    イベント名そのものを固定する。"""
+    return {line.split("\t")[2] for line in log_text.splitlines() if line}
+
+
 def test_mark_to_market_unexpected_exception_does_not_stop_tick(tmp_path):
     """`bars_fn` (= latest_1m_bar) は DataUnhealthy を握って None を返すが、
     `broker.equity()` / `spec_fn` / sqlite3.Error 等の**想定外例外**は
@@ -1211,6 +1220,10 @@ def test_exit_check_activity_write_failure_does_not_stop_remaining_orders(
     assert row_b["close_reason"] == "sl"
     assert env.trade_calls == 1          # tick は _process_exits の後まで完走
     _assert_no_url(caplog.text)          # 第二層の safe_error_text(write_err)
+    # M-b: 第二層の except 本体が `pass` に変異しても上のアサーションは
+    # 全部通ってしまう (B の保護と tick 完走は第二層以前の一次修正だけで
+    # 説明できるため)。技術ログ warning が実際に出ることを直接ピンする。
+    assert "activity write failed (exit_check_error)" in caplog.text
 
 
 # --- N3: _cancel_all_pending / _expire_limits の無保護ループ --------------
@@ -1254,7 +1267,7 @@ def test_cancel_all_pending_continues_after_one_cancel_order_raises(tmp_path):
     assert row_o["status"] == "closed"                        # SL 監視は継続
     assert row_o["close_reason"] == "sl"
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
-    assert "cancel_all_pending_error" in log
+    assert "cancel_all_pending_error" in _event_names(log)
     _assert_no_url(log)
 
 
@@ -1288,8 +1301,9 @@ def test_expire_limits_continues_after_one_broker_cancel_raises(tmp_path):
     assert orders.get(env.conn, e2)["status"] == "expired"    # 2 件目は解決
     assert env.trade_calls == 1                                # tick は完走
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
-    assert "limit_expired" in log
-    assert "limit_expire_error" in log
+    events = _event_names(log)
+    assert "limit_expired" in events
+    assert "limit_expire_error" in events
     _assert_no_url(log)
 
 
@@ -1329,7 +1343,7 @@ def test_record_snapshot_non_value_error_does_not_stop_tick(tmp_path):
     assert row["close_reason"] == "sl"
     assert env.trade_calls == 1                # tick は最後まで走った
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
-    assert "mark_to_market_error" in log
+    assert "mark_to_market_error" in _event_names(log)
 
 
 def test_news_hook_non_runtime_error_does_not_stop_tick(tmp_path):
@@ -1347,7 +1361,7 @@ def test_news_hook_non_runtime_error_does_not_stop_tick(tmp_path):
     assert env.news_calls == 1
     assert orders.get(env.conn, oid)["status"] == "open"
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
-    assert "news_cycle_error" in log
+    assert "news_cycle_error" in _event_names(log)
 
 
 def test_limit_fill_non_runtime_error_isolated_per_order(tmp_path):
@@ -1375,7 +1389,7 @@ def test_limit_fill_non_runtime_error_isolated_per_order(tmp_path):
     assert row_b["status"] == "closed"
     assert row_b["close_reason"] == "sl"
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
-    assert "limit_fill_error" in log
+    assert "limit_fill_error" in _event_names(log)
 
 
 def test_exit_monitoring_non_runtime_error_isolated_per_order(tmp_path):
@@ -1406,7 +1420,7 @@ def test_exit_monitoring_non_runtime_error_isolated_per_order(tmp_path):
     assert row_b["status"] == "closed"
     assert row_b["close_reason"] == "sl"
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
-    assert "exit_check_error" in log
+    assert "exit_check_error" in _event_names(log)
 
 
 def test_account_unknown_cancel_pending_activity_event_name(tmp_path):
@@ -1424,4 +1438,305 @@ def test_account_unknown_cancel_pending_activity_event_name(tmp_path):
                              148.30, 148.35, 148.15, 148.25, 100)
     env.sched.tick(WED + timedelta(minutes=11))
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
-    assert "account_unknown_cancel_pending" in log
+    assert "account_unknown_cancel_pending" in _event_names(log)
+
+
+# --- fix round 1 (独立レビュー fix required) ------------------------------
+
+# C1: _maintain_reservations の while True ループの無保護 cancel_order
+
+def test_maintain_reservations_cancel_order_exception_falls_through_to_exits(
+        tmp_path):
+    """C1 (Critical): `_maintain_reservations` の `while True` ループは
+    予約トリミングの進行 (pending が減ること) を `cancel_order` の成功
+    (CANCELLING への遷移) に依存している。ここに try/except → continue を
+    当てると、cancel_order が同じ行で毎回 raise する限り同じ行を掴み
+    続けて無限ループ (tick ハング) になる (レビュアー実測)。
+
+    正しい修正は except → **return** — この tick の予約トリミングは
+    諦め、後続の `_process_exits` (資金保護) に処理を渡す。
+
+    レバレッジ超過の予約 1 件 + SL 到達バーの OPEN 1 件で、
+    ①tick が完走する (ハングしない) ②OPEN の SL が同一 tick で
+    執行されることを確認する。"""
+    env = Env(tmp_path)
+    # 予約は別ペア (EURUSD) に直接挿入する。同じ USDJPY にすると、下の
+    # OPEN の SL (147.80) を狙ったバーがそのまま予約の entry も割り込み、
+    # 同一バーで予約自体が約定してしまい ("予約が生き残っているか" を
+    # 検証できなくなる)。gate の limit deviation 制約 (spot ±0.5%) の
+    # せいで entry を離すことでも回避できないため、pair を分けて bars_fn
+    # がバーを持たない (= 約定判定の対象にならない) ようにする。数値は
+    # test_reservation_maintenance_cancels_limit が実測した既定値
+    # (quantity 0.12, entry 148.2, stop 147.8) をそのまま複製し、同じ
+    # レバレッジ超過 (equity 300,000 → 総リスク上限 4,500 < 予約リスク
+    # ≈4,920) を再現する。
+    pending = orders.insert(env.conn, pair="EURUSD", direction="long",
+                            entry_type="limit", horizon="day",
+                            status="pending_fill", now=WED, quantity=0.12,
+                            requested_price=148.2, stop_loss=147.8,
+                            take_profit=149.0)
+    open_id = orders.insert(env.conn, pair="USDJPY", direction="long",
+                            entry_type="market", horizon="swing",
+                            status="open", now=WED, quantity=0.1,
+                            avg_fill_price=148.20, stop_loss=147.80,
+                            take_profit=149.00)
+
+    def flaky_cancel(row, reason):
+        raise OSError(LEAKY)
+
+    env.executor.cancel_order = flaky_cancel
+    env.executor.broker.equity = lambda: (300_000.0, 300_000.0)
+    # SL (147.80) を明確に下回るバー (EURUSD のバーは与えないので予約は
+    # 約定判定の対象にならない)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.30, 148.35, 147.50, 147.55, 100)
+    env.sched.tick(WED + timedelta(minutes=1))  # ハングしないこと自体が検証
+
+    row_pending = orders.get(env.conn, pending)
+    assert row_pending["status"] == "pending_fill"  # トリミングは諦められた
+    row_open = orders.get(env.conn, open_id)
+    assert row_open["status"] == "closed"            # SL 監視は継続
+    assert row_open["close_reason"] == "sl"
+    assert env.trade_calls == 1                      # tick は完走
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    # advisor 指摘: RuntimeError の非漏洩メッセージだけだと
+    # safe_error_text 不使用 (str(e)) 変異や except RuntimeError への
+    # 狭小化変異、イベント名の接尾辞改名変異のいずれも検出できない。
+    # OSError(LEAKY) + イベント名の完全一致で 3 変異まとめて塞ぐ。
+    assert "reservation_trim_error" in _event_names(log)
+    _assert_no_url(log)
+
+
+# I1: _expire_limits の期限判定 (datetime.fromisoformat) 自体が隔離の外
+
+def test_expire_limits_invalid_expires_at_isolated_per_order(tmp_path):
+    """I1 (Important): `datetime.fromisoformat(row["expires_at"])` が隔離
+    try の外にあると、不正な `expires_at` (ISO でない文字列等) を持つ行が
+    1 件あるだけで**毎 tick** 同じ行で例外を吐き、資金保護が恒久停止する
+    (レビュアー実測)。期限判定を隔離の内側に入れ、当該行だけスキップする
+    ことで、SL 監視は同一 tick で執行され、2 tick 目も死なないこと。"""
+    env = Env(tmp_path)
+    orders.insert(env.conn, pair="USDJPY", direction="long",
+                 entry_type="limit", horizon="day", status="pending_fill",
+                 now=WED, quantity=0.1, requested_price=148.2,
+                 stop_loss=147.8, expires_at="not-a-real-timestamp")
+    open_id = orders.insert(env.conn, pair="USDJPY", direction="long",
+                            entry_type="market", horizon="swing",
+                            status="open", now=WED, quantity=0.1,
+                            avg_fill_price=148.20, stop_loss=147.80,
+                            take_profit=149.00)
+    # 2 tick 目の資金保護も生きていることを直接示すため、別ペアの OPEN を
+    # もう 1 件用意し、2 tick 目のバーで SL に到達させる。
+    open_id2 = orders.insert(env.conn, pair="EURUSD", direction="long",
+                             entry_type="market", horizon="swing",
+                             status="open", now=WED, quantity=0.1,
+                             avg_fill_price=1.1000, stop_loss=1.0960,
+                             take_profit=1.1120)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.30, 148.35, 147.50, 147.55, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+    row_open = orders.get(env.conn, open_id)
+    assert row_open["status"] == "closed"
+    assert row_open["close_reason"] == "sl"
+    assert env.trade_calls == 1
+    # 2 tick 目 (同じ不正行が再び走査される) でも死なず、別ペアの SL 監視
+    # (資金保護) が引き続き働くこと。
+    env.bars["EURUSD"] = Bar("EURUSD", "1m", WED + timedelta(minutes=2),
+                             1.0950, 1.0955, 1.0900, 1.0905, 100)
+    env.sched.tick(WED + timedelta(minutes=2))
+    row_open2 = orders.get(env.conn, open_id2)
+    assert row_open2["status"] == "closed"
+    assert row_open2["close_reason"] == "sl"
+
+
+# I2: _expire_limits の except 内の文言/状態遷移
+
+def test_expire_limits_broker_cancel_exception_transitions_to_cancel_unknown(
+        tmp_path):
+    """I2 (Important): 以前の except 内文言「— 次 tick 再試行」は事実に
+    反していた — `broker.cancel` 例外後の行は `CANCELLING` に留まり、
+    `_expire_limits` の `PENDING_FILL` 走査にも `_resolve_unknowns` の
+    走査集合にも入らず、誰も再試行しない (`_UNKNOWN` に含まれず gate も
+    止まらない一方、`_EXPOSURE` には算入されリスク枠を恒久占有する —
+    レビュアー実測)。
+
+    修正: 例外源が CANCELLING 遷移そのものでない限り (= 現在状態が
+    CANCEL_UNKNOWN へ遷移可能な限り) CANCEL_UNKNOWN へ遷移させ、
+    `_resolve_unknowns` の走査に乗せる。paper broker の reconcile は
+    常に not_found を返すため、次 tick で実際に `cancelled` まで解決
+    されることを確認する。"""
+    expired = (WED - timedelta(minutes=1)).isoformat()
+    env = Env(tmp_path)
+    oid = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="pending_fill", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8,
+                        expires_at=expired)
+
+    def bad_broker_cancel(row):
+        raise RuntimeError("broker cancel timeout")
+
+    env.executor.broker.cancel = bad_broker_cancel
+    env.sched.tick(WED)
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "cancel_unknown"
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "次 tick 再試行" not in log      # 事実に反する文言は消えている
+    assert "cancel_unknown" in log
+
+    env.sched.tick(WED + timedelta(minutes=1))  # _resolve_unknowns が先に走る
+    assert orders.get(env.conn, oid)["status"] == "cancelled"
+
+
+def test_expire_limits_broker_rejected_write_failure_does_not_mark_cancel_unknown(
+        tmp_path):
+    """I2 の再検証 (advisor 指摘): `broker.cancel` が `"rejected"`
+    (= 既に約定済み・保護されている) を返した**後**、その結果を DB に
+    落とす `transitions.transition(..., PROTECTION_PENDING, ...)` が
+    失敗した場合、`CANCEL_UNKNOWN` へ遷移させてはならない。
+    `CANCEL_UNKNOWN` は `_resolve_unknowns` 経由で reconcile され、
+    paper broker は常に not_found を返すため `cancelled` に落ちる —
+    broker が「もう埋まっている」と教えてくれた注文を、こちら側の
+    書き込み失敗のせいで黙って取消済みにしてしまうのは資金保護上の
+    ハザードになる (Phase 1 の PaperBroker.cancel は常に "ok" しか
+    返さないため未到達だが、Phase 3 の MT5 で "rejected" が現実になる)。
+    broker が答えを返した**後**の失敗は CANCEL_UNKNOWN 化の対象外とし、
+    CANCELLING のまま (次 tick は PENDING_FILL の走査対象からは外れる
+    ため、手動確認待ちになる — これは「broker 未接触」のケースより
+    悪化させない、という保守側の選択)。"""
+    from agentic_fx.core import scheduler as scheduler_mod
+    from agentic_fx.core.contracts import BrokerResult
+
+    expired = (WED - timedelta(minutes=1)).isoformat()
+    env = Env(tmp_path)
+    oid = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="pending_fill", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8,
+                        expires_at=expired)
+
+    env.executor.broker.cancel = lambda row: BrokerResult(status="rejected")
+
+    orig_transition = scheduler_mod.transitions.transition
+
+    def flaky_transition(conn, order_id, to, now, **fields):
+        if order_id == oid and to.value == "protection_pending":
+            raise RuntimeError("db write failed")
+        return orig_transition(conn, order_id, to, now, **fields)
+
+    scheduler_mod.transitions.transition = flaky_transition
+    try:
+        env.sched.tick(WED)
+    finally:
+        scheduler_mod.transitions.transition = orig_transition
+
+    row = orders.get(env.conn, oid)
+    assert row["status"] != "cancel_unknown"  # broker 応答後の書き込み
+    # 失敗を CANCEL_UNKNOWN 化 (→ 誤って cancelled に落ちる) してはならない
+    assert row["status"] == "cancelling"
+    assert env.trade_calls == 1  # tick は完走
+
+
+def test_expire_limits_cancelling_transition_exception_stays_isolated(
+        tmp_path):
+    """I2 の「遷移の罠」: 例外源が `CANCELLING` への遷移そのものだった
+    場合、行はまだ `PENDING_FILL` のままで `ALLOWED[PENDING_FILL]` に
+    `CANCEL_UNKNOWN` は無く、無条件に遷移を試みると `IllegalTransition`
+    が隔離ハンドラから漏れる。現在状態を読み直して分岐する (or 遷移
+    呼び出し自体を独自の try で包む) ことで、この罠を踏まず隔離を
+    破らないこと。"""
+    from agentic_fx.core import scheduler as scheduler_mod
+
+    expired = (WED - timedelta(minutes=1)).isoformat()
+    env = Env(tmp_path)
+    oid = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="pending_fill", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8,
+                        expires_at=expired)
+
+    orig_transition = scheduler_mod.transitions.transition
+
+    def flaky_transition(conn, order_id, to, now, **fields):
+        if order_id == oid and to.value == "cancelling":
+            raise RuntimeError("db write failed")
+        return orig_transition(conn, order_id, to, now, **fields)
+
+    scheduler_mod.transitions.transition = flaky_transition
+    try:
+        env.sched.tick(WED)   # IllegalTransition が隔離ハンドラから漏れない
+    finally:
+        scheduler_mod.transitions.transition = orig_transition
+
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "pending_fill"   # CANCELLING 自体が失敗 → 未変化
+    assert env.trade_calls == 1              # tick は完走
+
+
+# I4: 本ラウンドで新設した隔離 site の except RuntimeError 変異が生存
+
+def test_cancel_all_pending_non_runtime_error_isolated_per_order(tmp_path):
+    """I4: `_cancel_all_pending` の隔離 `except Exception` を
+    `except RuntimeError` に狭める変異は、RuntimeError しか投げない
+    既存テストでは検出できない。OSError で直接ピンする。"""
+    env = Env(tmp_path)
+    p1 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                       entry_type="limit", horizon="day",
+                       status="pending_fill", now=WED, quantity=0.1,
+                       requested_price=148.2, stop_loss=147.8)
+    p2 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                       entry_type="limit", horizon="day",
+                       status="pending_fill", now=WED, quantity=0.1,
+                       requested_price=148.1, stop_loss=147.7)
+    o = orders.insert(env.conn, pair="USDJPY", direction="long",
+                      entry_type="market", horizon="swing", status="open",
+                      now=WED, quantity=0.1, avg_fill_price=148.20,
+                      stop_loss=147.80, take_profit=149.00)
+
+    orig_cancel = env.executor.cancel_order
+
+    def flaky_cancel(row, reason):
+        if row["id"] == p1:
+            raise OSError("cancel io down")
+        return orig_cancel(row, reason=reason)
+
+    env.executor.cancel_order = flaky_cancel
+    env.executor.broker.equity = lambda: (0.0, 0.0)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.30, 148.35, 147.50, 147.55, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    assert orders.get(env.conn, p2)["status"] == "cancelled"
+    row_o = orders.get(env.conn, o)
+    assert row_o["status"] == "closed"
+    assert row_o["close_reason"] == "sl"
+
+
+def test_expire_limits_non_runtime_error_isolated_per_order(tmp_path):
+    """I4: `_expire_limits` の隔離 `except Exception` を `except
+    RuntimeError` に狭める変異は、既存テストでは検出できない。ValueError
+    で直接ピンする。"""
+    expired = (WED - timedelta(minutes=1)).isoformat()
+    env = Env(tmp_path)
+    e1 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                       entry_type="limit", horizon="day",
+                       status="pending_fill", now=WED, quantity=0.1,
+                       requested_price=148.2, stop_loss=147.8,
+                       expires_at=expired)
+    e2 = orders.insert(env.conn, pair="USDJPY", direction="long",
+                       entry_type="limit", horizon="day",
+                       status="pending_fill", now=WED, quantity=0.1,
+                       requested_price=148.1, stop_loss=147.7,
+                       expires_at=expired)
+
+    orig_cancel = env.executor.broker.cancel
+
+    def flaky_cancel(row):
+        if row["id"] == e1:
+            raise ValueError("broker cancel bad state")
+        return orig_cancel(row)
+
+    env.executor.broker.cancel = flaky_cancel
+    env.sched.tick(WED)
+    assert orders.get(env.conn, e2)["status"] == "expired"
+    assert env.trade_calls == 1
