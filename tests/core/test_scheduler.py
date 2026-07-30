@@ -2406,3 +2406,119 @@ def test_maintain_reservations_rate_cancel_error_message_is_sanitized(
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
     assert "reservation_rate_cancel_error" in _event_names(log)
     _assert_no_url(log)
+
+
+# --- fix round 2 (codex 節目レビュー): 判断内スナップショット全体の
+# 時刻差 (設計書 §5 ③)。個々の ConversionRate の個別検証を通っても、
+# 判断 (この tick の予約再検証・時価評価サイクル) で使う複数レートを
+# 跨いだ全体スパンが conversion_skew_max_min を超えれば fail closed する。
+
+def test_maintain_reservations_overall_skew_cancels_the_later_pair_only(
+        tmp_path):
+    """③ (予約再検証層): EURUSD (quote=USD, base=EUR) と GBPJPY
+    (quote=JPY 恒等, base=GBP) の 2 ペアが pending。USD/EUR の leg は
+    ほぼ同時刻、GBP の leg だけ大きくずれている。ペアは `sorted()` で
+    "EURUSD" → "GBPJPY" の順に処理されるため、EURUSD は先に確定して
+    キャッシュされ (それ自身は個別にもスパンにも違反しない)、GBPJPY の
+    GBP 取得時点で全体スパンが破れる。**破った側 (GBPJPY) だけが取消され、
+    先に確定した EURUSD は pending のまま継続する** (順序依存の扱いの
+    根拠は report の fix round 2 節を参照)。"""
+    env = Env(tmp_path)
+    env.executor.spec_fn = _spec_by_pair
+    skew = SETTINGS.datafeed.conversion_skew_max_min
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == account_ccy:
+            return ConversionRate(1.0, ccy, account_ccy, (now,))
+        if ccy in ("USD", "EUR"):
+            return ConversionRate(148.51 if ccy == "USD" else 1.10,
+                                  ccy, "JPY", (now,))
+        if ccy == "GBP":
+            return ConversionRate(190.0, "GBP", "JPY",
+                                  (now - timedelta(minutes=skew + 2),))
+        raise DataUnhealthy(f"no rate for {ccy}")
+
+    env.executor.rate_fn = rate_fn
+
+    eur_pending = orders.insert(
+        env.conn, pair="EURUSD", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.1,
+        requested_price=1.1000, stop_loss=1.0950, take_profit=1.1200,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+    gbp_pending = orders.insert(
+        env.conn, pair="GBPJPY", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.1,
+        requested_price=190.00, stop_loss=189.00, take_profit=192.00,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "reservation_rate_unavailable" in _event_names(log)
+    assert orders.get(env.conn, gbp_pending)["status"] == "cancelled", (
+        "全体スパンを破った側 (GBPJPY) が取消されていない")
+    assert orders.get(env.conn, eur_pending)["status"] == "pending_fill", (
+        "先に確定した EURUSD が巻き込まれて取消/約定した")
+
+
+def test_mark_to_market_overall_skew_skips_snapshot(tmp_path):
+    """③ (時価評価層): 時価評価はポジション毎に `spec.quote_currency` だけを
+    換算する (base_currency は notional 専用で mark-to-market には使わない)。
+    そのため、この層で全体スパン違反を起こすには**quote 通貨が異なる**
+    2 ポジションが要る。EURUSD (quote=USD, 先に評価・leg=now) と、
+    quote=GBP の合成ペア XXXGBP (後に評価・leg が大きくずれる) を使う。
+    個別にはどちらのレートも健全だが、全体スパンが破れた時点でその
+    **ポジションだけ** stale 扱いになり (バー陳腐化と同型)、snapshot 全体が
+    見送られる。"""
+    env = Env(tmp_path)
+    gbp_quote_spec = InstrumentSpec("XXXGBP", 0.01, 0.01, 10.0, 0.01,
+                                    100_000, base_currency="XXX",
+                                    quote_currency="GBP")
+
+    def spec_fn(pair):
+        if pair == "EURUSD":
+            return EUR_SPEC
+        if pair == "XXXGBP":
+            return gbp_quote_spec
+        return SPEC
+
+    env.executor.spec_fn = spec_fn
+    skew = SETTINGS.datafeed.conversion_skew_max_min
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == account_ccy:
+            return ConversionRate(1.0, ccy, account_ccy, (now,))
+        if ccy in ("USD", "EUR", "XXX"):
+            # _maintain_reservations の open_risk_and_notional は OPEN 行の
+            # base_currency も換算するため、mark-to-market だけの検証に
+            # するならこれらも (skew を破らない) 健全な値で用意する。
+            return ConversionRate(148.51, ccy, "JPY", (now,))
+        if ccy == "GBP":
+            return ConversionRate(190.0, "GBP", "JPY",
+                                  (now - timedelta(minutes=skew + 2),))
+        raise DataUnhealthy(f"no rate for {ccy}")
+
+    env.executor.rate_fn = rate_fn
+
+    orders.insert(env.conn, pair="EURUSD", direction="long",
+                 entry_type="market", horizon="day", status="open",
+                 now=WED, quantity=0.1, avg_fill_price=1.1000,
+                 stop_loss=1.0950, take_profit=1.1200)
+    orders.insert(env.conn, pair="XXXGBP", direction="long",
+                 entry_type="market", horizon="day", status="open",
+                 now=WED, quantity=0.1, avg_fill_price=190.00,
+                 stop_loss=189.00, take_profit=192.00)
+    env.bars["EURUSD"] = Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                             1.1005, 1.1015, 1.1000, 1.1010, 100)
+    env.bars["XXXGBP"] = Bar("XXXGBP", "1m", WED + timedelta(minutes=1),
+                             190.0, 190.1, 189.9, 190.05, 100)
+
+    from agentic_fx.store import snapshots
+    before = snapshots.latest(env.conn)
+    env.sched.tick(WED + timedelta(minutes=1))
+    after = snapshots.latest(env.conn)
+
+    assert after["ts"] == before["ts"], (
+        "全体スパン超過なのに snapshot が更新された")
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "snapshot_stale_rate_skip" in _event_names(log)

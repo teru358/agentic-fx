@@ -668,10 +668,22 @@ class Scheduler:
         True。取消を試みて失敗した (cancel_order が CANCELLED 以外に終わる、
         または例外を投げる) 場合は False — 呼び出し元はこの tick の
         fills_allowed を False にする (資金保護の 2 層構えと同じ規律)。
+
+        fix round 2 (codex 節目レビュー): `cycle_rate` は判断内の全レート
+        leg 時刻の running span も検証する (`Executor.cycle_rate_fn` 参照)。
+        そのため、あるペアの `cycle_rate` 呼び出しが「このペア自身のレート
+        個別には健全だが、既に取得済みの別ペアのレートと合わせた全体
+        スパンを破る」ことで失敗しうる。**先に処理され既にキャッシュ済みの
+        ペアは影響を受けず、後から処理されたペアの方が取消される** — この
+        関数はペアを `sorted()` で決定的な順序で処理し、「どのペアが破った
+        側として扱われるか」を再現可能にする。取消は破った側 1 ペアのみに
+        限定し、既に確定した他ペアの予約は取消さない (「当該ペアのみ取消・
+        他ペアは継続」という既存セマンティクスを維持)。
         """
         ok = True
-        pairs = {row["pair"]
-                for row in orders.list_by_status(self.conn, S.PENDING_FILL)}
+        pairs = sorted({row["pair"]
+                       for row in orders.list_by_status(self.conn,
+                                                        S.PENDING_FILL)})
         for pair in pairs:
             spec = self.executor.spec_fn(pair)   # 保護しない (docstring 参照)
             try:

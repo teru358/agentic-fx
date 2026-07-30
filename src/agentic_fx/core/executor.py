@@ -106,15 +106,65 @@ class Executor:
 
         成功した取得は `_last_good_rate` (クローズ経路の degraded フォール
         バック専用) も更新する。
+
+        fix round 2 (codex 節目レビュー): 各 `ConversionRate` は自分の脚と
+        `reference_ts=now` の差だけを検証する (`to_account_rate` /
+        `validate_conversion_skew`) が、`validate_quote` の鮮度窓が
+        `[now-freshness, now+2min]` を許すため、**この判断で使う複数の
+        レートを跨いだ全体の時刻差**は個別検証だけでは捕まえられない
+        (脚 A=now+2min と 脚 B=now-5min はどちらも個別には健全だが、
+        両者が同一判断に混在すると全体では 7min 開く)。設計書 §5 ③
+        「1 回の判断内のスナップショット全体の時刻差」はこの判断
+        (=この `cycle_rate_fn` 呼び出し) で観測した**全レートの leg 時刻の
+        running min/max** を見る必要がある。新しいレートを取得するたびに
+        その leg 時刻を取り込み、全体 span が `conversion_skew_max_min` を
+        超えたら (個々のレート自体は健全でも) `DataUnhealthy` で fail
+        closed する。超過を検出したレートはこのサイクルのキャッシュには
+        入れない (このサイクル内で確定した「使ってよいレート」ではない)。
+
+        層別動作は変えない: この関数が送出する `DataUnhealthy` は、既存の
+        レート不能時の各層の扱い (sizing→SizingError / gate→却下 /
+        予約再検証→当該ペアの pending_fill 取消 / mark-to-market→
+        snapshot 見送り) にそのまま乗る — 呼び出し側は個別レートの
+        鮮度失敗とこの全体 skew 失敗を区別しない (どちらも
+        「この判断ではこの通貨の換算が使えない」という同じ意味)。
+
+        予約再検証のペア単位取消における順序依存 (advisor/コードレビュー
+        指摘): 複数ペアを跨ぐ判断では、どのペアの取消要求が「span を破った
+        瞬間」になるかはペアの処理順に依存する — 先に処理されたペアの
+        レートが running span の基準を作り、後から処理されたペアの
+        レートがその基準を破れば**後から処理された方**が取消対象になる
+        (呼び出し元の `_cancel_pairs_with_unavailable_rate` が
+        `sorted(pairs)` で処理順を固定しているため、決定的に再現可能)。
+        先に確定した (キャッシュ済みの) ペアは取消されない — 「当該ペアの
+        pending_fill のみ取消・他ペアは継続」という既存セマンティクスを
+        保つ。報告書 fix round 2 節に根拠を記載。
         """
         cache: dict[str, ConversionRate] = {}
         account_ccy = self.settings.account_currency
+        max_skew = timedelta(
+            minutes=self.settings.datafeed.conversion_skew_max_min)
+        span_min: datetime | None = None
+        span_max: datetime | None = None
 
         def fn(ccy: str) -> ConversionRate:
+            nonlocal span_min, span_max
             if ccy not in cache:
                 rate = self.rate_fn(ccy, account_ccy, now)
-                cache[ccy] = rate
+                # 個別に健全と確認できたレートなので degraded フォール
+                # バック用キャッシュは (全体 skew の成否に関わらず) 更新
+                # する — resolve_close_rate はこの全体 skew 検証の対象外
+                # (設計書 §5: クローズはレート欠損でも妨げない)。
                 self._last_good_rate[(ccy, account_ccy)] = rate
+                for ts in rate.leg_ts:
+                    span_min = ts if span_min is None else min(span_min, ts)
+                    span_max = ts if span_max is None else max(span_max, ts)
+                if span_max - span_min > max_skew:
+                    raise DataUnhealthy(
+                        f"conversion snapshot skew {span_max - span_min} "
+                        f"exceeds {max_skew} across this decision's rates "
+                        f"(offending currency: {ccy})")
+                cache[ccy] = rate
             return cache[ccy]
         return fn
 

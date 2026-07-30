@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -444,6 +444,61 @@ def test_cycle_rate_fn_fetches_once_per_currency_across_rows(tmp_path):
     assert calls.count("JPY") == 1
 
 
+# --- fix round 2 (codex 節目レビュー): 判断内スナップショット全体の
+# 時刻差 (設計書 §5 ③)。個々の ConversionRate は自分の脚と reference_ts
+# だけを検証するため、複数レートを跨いだ全体スパンは cycle_rate_fn 側で
+# 別途検証する必要がある。
+
+def test_cycle_rate_fn_rejects_overall_snapshot_skew_across_currencies(
+        tmp_path):
+    """①: USD の leg が now+2min、EUR の leg が now-(skew+2)min。どちらも
+    それぞれ「個別」には健全 (このテストの rate_fn スタブは個別鮮度検証を
+    経ずに直接 ConversionRate を返すので、ここでは cycle_rate_fn 自身の
+    集約検証だけを対象にする) だが、2 つの leg を合わせた全体スパンは
+    conversion_skew_max_min を超える → fail closed。"""
+    conn, ex, _, _ = _setup(tmp_path)
+    skew = SETTINGS.datafeed.conversion_skew_max_min
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == "USD":
+            return ConversionRate(148.51, "USD", "JPY",
+                                  (now + timedelta(minutes=2),))
+        if ccy == "EUR":
+            return ConversionRate(1.10, "EUR", "JPY",
+                                  (now - timedelta(minutes=skew + 2),))
+        raise DataUnhealthy(f"no rate for {ccy}")
+
+    ex.rate_fn = rate_fn
+    cycle_rate = ex.cycle_rate_fn(NOW)
+    cycle_rate("USD")   # 先に取得・キャッシュされる (この時点では単独)
+    with pytest.raises(DataUnhealthy, match="skew"):
+        cycle_rate("EUR")   # USD の leg との全体スパンが skew を超える
+
+
+def test_cycle_rate_fn_allows_rates_within_overall_skew(tmp_path):
+    """②: 判断内の全レートが近接していれば (全体スパンが
+    conversion_skew_max_min 以内) 通常どおり通ること。"""
+    conn, ex, _, _ = _setup(tmp_path)
+    skew = SETTINGS.datafeed.conversion_skew_max_min
+    assert skew >= 2, "このテストは skew >= 2 min を前提にしている"
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == "USD":
+            return ConversionRate(148.51, "USD", "JPY",
+                                  (now + timedelta(minutes=1),))
+        if ccy == "EUR":
+            return ConversionRate(1.10, "EUR", "JPY",
+                                  (now - timedelta(minutes=1),))
+        raise DataUnhealthy(f"no rate for {ccy}")
+
+    ex.rate_fn = rate_fn
+    cycle_rate = ex.cycle_rate_fn(NOW)
+    usd = cycle_rate("USD")
+    eur = cycle_rate("EUR")   # 全体スパン 2min <= skew (既定 5min) — 通る
+    assert usd.value == pytest.approx(148.51)
+    assert eur.value == pytest.approx(1.10)
+
+
 def test_open_rejected_when_conversion_rate_unavailable(tmp_path):
     """予約・建玉が無くても、この intent 自身の換算レートが取れなければ
     却下される (設計書 §5: gate → intent 却下、理由に換算不能を明記)。"""
@@ -457,6 +512,34 @@ def test_open_rejected_when_conversion_rate_unavailable(tmp_path):
     assert any("conversion rate unavailable" in r for r in out["reasons"])
     row = conn.execute("SELECT * FROM trade_intents").fetchone()
     assert row["gate_result"] == "rejected"
+
+
+def test_open_rejected_when_overall_snapshot_skew_exceeded(tmp_path):
+    """fix round 2 (codex 節目レビュー): gate 評価層。EURUSD の
+    quote_to_account (USD) と base_to_account (EUR) はそれぞれ個別には
+    健全なレートだが、2 つの leg 時刻を跨いだ全体スパンが
+    conversion_skew_max_min を超えれば、既存の
+    "conversion rate unavailable" 却下経路にそのまま乗ること (層別動作は
+    変えない)。"""
+    conn, ex, _, mid = _setup(tmp_path)
+    ex.spec_fn = lambda p: EUR_SPEC   # quote=USD, base=EUR
+    skew = SETTINGS.datafeed.conversion_skew_max_min
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == "USD":
+            return ConversionRate(148.51, "USD", "JPY",
+                                  (now + timedelta(minutes=2),))
+        if ccy == "EUR":
+            return ConversionRate(1.10, "EUR", "JPY",
+                                  (now - timedelta(minutes=skew + 2),))
+        raise DataUnhealthy(f"no rate for {ccy}")
+
+    ex.rate_fn = rate_fn
+    it = _open_intent(pair="EURUSD", limit_price=1.1000, stop_loss=1.0950,
+                      take_profit=1.1200)
+    out = ex.handle_intent(it, mid)
+    assert out["result"] == "rejected"
+    assert any("conversion rate unavailable" in r for r in out["reasons"])
 
 
 # --- レビュー指摘 F2: gate_rejected (conversion rate unavailable) の例外
