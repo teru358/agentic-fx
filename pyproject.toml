@@ -8,6 +8,7 @@ dependencies = [
     "chromadb>=1.5.9",
     "feedparser>=6.0.12",
     "httpx>=0.28.1",
+    "jsonschema>=4.26.0",
     "pandas>=3.0.5",
     "pydantic>=2.13.4",
     "python-dotenv>=1.2.2",
