@@ -17,11 +17,12 @@ class Mission:
         max_turns: Maximum number of turns. Runner-neutral definition:
             1 turn = 1 LLM request + response pair.
             Tool execution within that request/response is part of the same turn.
-            JSON repair, schema re-output retries, and other corrections
-            are counted as 1 turn if they occur within a single request.
+            JSON repair and schema re-output retries each consume a new turn
+            (each retry is a new LLM request). Each retry type has a 2-retry limit;
+            if exhausted, return status="failed". Retries count toward max_turns.
             timeout_sec always takes priority and may force termination before max_turns.
 
-            Phase 2 ClaudeRunner (claude -p) does not have native turn limits.
+            Phase 2 ClaudeRunner (claude-agent-sdk) does not have native turn limits.
             It must count turns by this definition, force-terminate when max_turns
             is exceeded, and return status="max_turns" to notify the executor.
         timeout_sec: Wall-clock timeout in seconds. Always takes priority over max_turns.
