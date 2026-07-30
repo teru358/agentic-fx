@@ -2171,3 +2171,149 @@ def test_site2_close_order_failure_does_not_stop_remaining_day_positions(
         "1 件目の close_order 例外で 2 件目の day 強制決済が止まった "
         f"(status={row_b['status']}) — rollover 越えの持ち越し")
     assert row_b["close_reason"] == "day_rollover"
+
+
+# --- 口座通貨換算層 (設計書 §5、改訂第16版) --------------------------------
+#
+# ここまでの site1/site2 系テストは spec_fn が pair に関わらず SPEC
+# (USDJPY) を返すスタブに依存していた。ここからのテストは EURUSD の通貨を
+# 本物どおり (quote=USD, base=EUR) 扱うため、spec_fn/rate_fn を明示的に
+# 差し替える。
+
+def _spec_by_pair(pair):
+    return {"USDJPY": SPEC, "EURUSD": EUR_SPEC, "GBPJPY": GBP_SPEC}.get(
+        pair, SPEC)
+
+
+def test_maintain_reservations_cancels_only_the_pair_with_unavailable_rate(
+        tmp_path):
+    """設計書 §5「レート取得不能時の層別動作」: 予約再検証で換算不能なのは
+    EURUSD (EUR->JPY が解決できない) だけであり、USDJPY の予約は健全な
+    レートで通常どおり再検証が継続すること (ペア単位の隔離)。"""
+    env = Env(tmp_path)
+    env.executor.spec_fn = _spec_by_pair
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == account_ccy:
+            return ConversionRate(1.0, ccy, account_ccy, (now,))
+        if ccy == "USD" and account_ccy == "JPY":
+            return ConversionRate(QUOTE.ask, "USD", "JPY", (now,))
+        raise DataUnhealthy(f"no rate for {ccy}->{account_ccy}")  # EUR は不可
+
+    env.executor.rate_fn = rate_fn
+
+    eur_pending = orders.insert(
+        env.conn, pair="EURUSD", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.1,
+        requested_price=1.1000, stop_loss=1.0950, take_profit=1.1200,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+    usd_pending = orders.insert(
+        env.conn, pair="USDJPY", direction="long", entry_type="limit",
+        horizon="day", status="pending_fill", now=WED, quantity=0.1,
+        requested_price=148.20, stop_loss=147.80, take_profit=149.00,
+        expires_at=(WED + timedelta(hours=4)).isoformat())
+
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    names = _event_names(log)
+    assert "reservation_rate_unavailable" in names, names
+    assert orders.get(env.conn, eur_pending)["status"] == "cancelled"
+    # USDJPY はレート解決でき、超過も無いので pending のまま (取消されない)
+    assert orders.get(env.conn, usd_pending)["status"] == "pending_fill"
+    assert env.trade_calls == 1   # 資金保護に無関係な経路は通常どおり
+
+
+def test_mark_to_market_skips_snapshot_when_position_rate_unavailable(
+        tmp_path):
+    """設計書 §5: mark-to-market でポジションの換算レートが解決できない
+    tick は、バー陳腐化と同じ扱いで snapshot を記録しない。"""
+    env = Env(tmp_path)
+    env.executor.spec_fn = _spec_by_pair
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == account_ccy:
+            return ConversionRate(1.0, ccy, account_ccy, (now,))
+        raise DataUnhealthy(f"no rate for {ccy}->{account_ccy}")
+
+    env.executor.rate_fn = rate_fn
+
+    orders.insert(env.conn, pair="EURUSD", direction="long",
+                 entry_type="market", horizon="day", status="open",
+                 now=WED, quantity=0.1, avg_fill_price=1.1000,
+                 stop_loss=1.0950, take_profit=1.1200)
+    env.bars["EURUSD"] = Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                             1.1010, 1.1020, 1.1000, 1.1015, 100)
+
+    from agentic_fx.store import snapshots
+    before = snapshots.latest(env.conn)
+    env.sched.tick(WED + timedelta(minutes=1))
+    after = snapshots.latest(env.conn)
+
+    assert after["ts"] == before["ts"], "レート不能なのに snapshot が更新された"
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "snapshot_stale_rate_skip" in _event_names(log)
+
+
+def test_mark_to_market_converts_per_pair_and_sums(tmp_path):
+    """設計書 §5: 複数ペアの含み損益はペア毎に quote→account 換算してから
+    合算する。EURUSD (quote=USD, rate=163.665) の含み益がその換算で
+    balance/equity に正しく反映されることを固定する。"""
+    env = Env(tmp_path)
+    env.executor.spec_fn = _spec_by_pair
+
+    def rate_fn(ccy, account_ccy, now):
+        if ccy == account_ccy:
+            return ConversionRate(1.0, ccy, account_ccy, (now,))
+        if ccy == "USD" and account_ccy == "JPY":
+            return ConversionRate(163.665, "USD", "JPY", (now,))
+        raise DataUnhealthy(f"no rate for {ccy}->{account_ccy}")
+
+    env.executor.rate_fn = rate_fn
+
+    orders.insert(env.conn, pair="EURUSD", direction="long",
+                 entry_type="market", horizon="day", status="open",
+                 now=WED, quantity=1.0, avg_fill_price=1.1000,
+                 stop_loss=1.0500, take_profit=1.2000)
+    # +100pt (0.0010) の含み益 → 100 USD → 16,366.5 JPY (golden と同型)
+    env.bars["EURUSD"] = Bar("EURUSD", "1m", WED + timedelta(minutes=1),
+                             1.1005, 1.1015, 1.1000, 1.1010, 100)
+
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    from agentic_fx.store import snapshots
+    snap = snapshots.latest(env.conn)
+    expected_unrealized = 0.0010 * 100_000 * 1.0 * 163.665
+    assert snap["equity"] == pytest.approx(
+        1_000_000 + expected_unrealized, abs=1)
+
+
+def test_maintain_reservations_fetches_rate_once_per_currency_per_cycle(
+        tmp_path):
+    """スナップショット固定のピン (設計書 §5): 予約再検証サイクル (この
+    tick の _maintain_reservations 呼び出し全体) の中で、同じ通貨の
+    レートは 1 回しか外部取得されないこと。取消トリミングの while ループが
+    複数回まわっても取得回数は増えない。"""
+    env = Env(tmp_path)
+    calls: list[str] = []
+    orig_rate_fn = env.executor.rate_fn
+
+    def counting_rate_fn(ccy, account_ccy, now):
+        calls.append(ccy)
+        return orig_rate_fn(ccy, account_ccy, now)
+
+    env.executor.rate_fn = counting_rate_fn
+    # 複数の USDJPY pending を用意し、while ループが複数回まわるように
+    # 総リスクを上限超過させる (SL 距離を広く取り、大きな risk を作る)。
+    for i in range(3):
+        orders.insert(
+            env.conn, pair="USDJPY", direction="long", entry_type="limit",
+            horizon="day", status="pending_fill", now=WED, quantity=10.0,
+            requested_price=148.20, stop_loss=140.00, take_profit=160.00,
+            expires_at=(WED + timedelta(hours=4)).isoformat())
+
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    # USD の外部取得 (rate_fn 呼び出し) は 1 回だけ (JPY は恒等でも呼ばれ
+    # 得るが、通貨ごとに 1 回であることが本質)。
+    assert calls.count("USD") == 1, calls
