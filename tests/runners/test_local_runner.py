@@ -141,26 +141,64 @@ def test_normalized_message_no_extra_fields():
 
 
 def test_timeout_during_parse_retry():
-    """T-F4: deadline expires during last parse retry → status 'timeout'."""
-    # Use a time function that advances rapidly
+    """T-F4: deadline expires during retry exhaustion → status 'timeout' not 'failed'.
+
+    Uses schema-validation failures (not parse failures) to reach exhaustion.
+    The time_fn is calibrated so several turns complete normally, and the
+    deadline crosses only when _finish checks it during exhaustion.
+    """
     call_count = {"n": 0}
 
     def fake_time():
+        # Each call increments by 1.0s. Calibrated so:
+        # Turns 1-2: complete within deadline (schema retries happen normally)
+        # Turn 3: schema_retries reaches 3 > _MAX_REPAIR_RETRIES (=2), calls _finish
+        #         and at that point timed_out() becomes True
+        # deadline = 6.0 (set below)
+        # Turn 1: n=1,t=1.0 (loop start check); n=2,t=2.0 (HTTP); n=3,t=3.0 (schema++)
+        # Turn 2: n=4,t=4.0 (loop start check); n=5,t=5.0 (HTTP); n=6,t=6.0 (schema++)
+        # Turn 3: n=7,t=7.0 (loop start check) — 7.0 >= 6.0 deadline, but it checks
+        #         remaining <= 0 first, so it calls _finish("timeout") directly
+        # Actually, that hits the top-of-loop check. Let me recalibrate...
+        # Set deadline to 7.5 and ensure we reach exhaustion before then:
+        # Turn 1: n=1,1.0; HTTP n=2,2.0; schema_retries=1 n=3,3.0; continue
+        # Turn 2: n=4,4.0; HTTP n=5,5.0; schema_retries=2 n=6,6.0; continue
+        # Turn 3: n=7,7.0; HTTP n=8,8.0 >= 7.5 deadline! Would exit via remaining check
+        # Instead, use smaller increment: 0.7s per call, deadline 5.0:
+        # Turn 1: n=1,0.7; HTTP n=2,1.4; schema_retries=1 n=3,2.1; continue
+        # Turn 2: n=4,2.8; HTTP n=5,3.5; schema_retries=2 n=6,4.2; continue
+        # Turn 3: n=7,4.9; HTTP n=8,5.6 >= 5.0! would timeout at post-HTTP check
+        # But we want to reach exhaustion. Let's use: deadline 5.5, increment 0.6s:
+        # Turn 1: n=1,0.6; HTTP n=2,1.2; schema_retries=1 n=3,1.8; continue
+        # Turn 2: n=4,2.4; HTTP n=5,3.0; schema_retries=2 n=6,3.6; continue
+        # Turn 3: n=7,4.2; HTTP n=8,4.8; schema_retries=3 n=9,5.4; exhaustion, _finish called n=10,6.0 >= 5.5!
         call_count["n"] += 1
-        # Advance time 5 seconds per call
-        return call_count["n"] * 5
+        return call_count["n"] * 0.6
 
-    msgs = [
-        {"role": "assistant", "content": '{"action": "invalid"}'},  # fails schema
-        {"role": "assistant", "content": '{"action": "still_invalid"}'},  # fails again
-    ]
+    # All responses invalid per schema (missing "action" or wrong type)
+    invalid_schema = {"role": "assistant", "content": '{"wrong_field": "value"}'}
     runner = LocalRunner(base_url="http://test/v1", model="qwen",
                          registry=_registry(),
-                         transport=httpx.MockTransport(
-                             lambda r: _resp(msgs[min(len(msgs) - 1, 1)])),
+                         transport=httpx.MockTransport(lambda r: _resp(invalid_schema)),
                          time_fn=fake_time)
-    # timeout_sec=5 means deadline at 5s. With call_count advancing, we should hit
-    # deadline during the second schema validation, causing timeout instead of failed.
-    r = runner.run(_mission(timeout_sec=5))
-    # Since time advances quickly, should hit timeout
+    r = runner.run(_mission(timeout_sec=5.5, max_turns=10))
+    # Should timeout when retry-exhaustion check hits the deadline
     assert r.status == "timeout"
+
+
+def test_tool_call_entry_not_dict():
+    """O2 coverage: tool_calls entry is not a dict (e.g., string) → status 'failed'."""
+    tool_call_msg = {"role": "assistant", "content": None, "tool_calls": [
+        "invalid_string_entry"]}
+    runner, _ = _runner([tool_call_msg])
+    r = runner.run(_mission())
+    assert r.status == "failed"
+
+
+def test_tool_call_missing_function():
+    """O2 coverage: tool_calls entry missing 'function' field → status 'failed'."""
+    tool_call_msg = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "c1", "type": "function"}]}  # missing 'function'
+    runner, _ = _runner([tool_call_msg])
+    r = runner.run(_mission())
+    assert r.status == "failed"
