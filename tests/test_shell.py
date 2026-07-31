@@ -72,7 +72,8 @@ def test_external_stop_event_prevents_dispatch():
             return "first"
         # 2 番目の input で stop_event.set() (外部割り込み想定)
         stop.set()
-        raise EOFError
+        return "second"  # raise しない — 再チェックが無ければ dispatch("second") される
+        # 3 回目以降は呼ばれない (while 条件で抜ける) が念のため
 
     run_shell(cmds, stop, input_fn=fake_input, print_fn=outputs.append)
     assert stop.is_set()
