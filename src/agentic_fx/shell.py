@@ -14,9 +14,15 @@ def run_shell(commands: Commands, stop_event: threading.Event, *,
         except (EOFError, KeyboardInterrupt):
             stop_event.set()
             return
+        if stop_event.is_set():
+            return
         if not line:
             continue
         if line == "stop":
             stop_event.set()
             return
-        print_fn(commands.dispatch(line))
+        try:
+            print_fn(commands.dispatch(line))
+        except KeyboardInterrupt:
+            stop_event.set()
+            return

@@ -1,5 +1,7 @@
 import logging
+import sys
 import time
+from logging.handlers import RotatingFileHandler
 
 from agentic_fx.logging_setup import setup_technical_logging
 
@@ -51,11 +53,36 @@ def test_technical_log_timestamps_are_utc(tmp_path):
 
 
 def test_daemon_adds_stderr_handler(tmp_path):
+    # 1 回目: daemon=True で StreamHandler を追加
     logger = setup_technical_logging(tmp_path, daemon=True)
-    kinds = [type(h).__name__ for h in logger.handlers]
-    assert "RotatingFileHandler" in kinds
-    assert "StreamHandler" in kinds
+
+    # 2 回目: daemon=True で重複しないことを確認
+    logger2 = setup_technical_logging(tmp_path, daemon=True)
+    assert logger2 is logger  # 同一 logger インスタンス
+
+    # RotatingFileHandler がちょうど 1 個
+    file_handlers = [h for h in logger.handlers
+                     if isinstance(h, RotatingFileHandler)]
+    assert len(file_handlers) == 1
+
+    # 非 File StreamHandler がちょうど 1 個
+    stream_handlers = [h for h in logger.handlers
+                       if isinstance(h, logging.StreamHandler)
+                       and not isinstance(h, logging.FileHandler)]
+    assert len(stream_handlers) == 1
+
+    # StreamHandler が sys.stderr に向いていることを確認
+    stream_h = stream_handlers[0]
+    assert stream_h.stream is sys.stderr
+
+    # StreamHandler の formatter が UTC に統一されていることを確認
+    fmt = stream_h.formatter
+    assert fmt.converter is time.gmtime
+    fmt_text = (fmt._fmt or "") + (fmt.datefmt or "")
+    assert "UTC" in fmt_text
+
     # daemon=False に戻すと stderr handler は外れる
-    logger2 = setup_technical_logging(tmp_path, daemon=False)
-    assert [type(h).__name__ for h in logger2.handlers] == [
+    logger3 = setup_technical_logging(tmp_path, daemon=False)
+    assert logger3 is logger
+    assert [type(h).__name__ for h in logger3.handlers] == [
         "RotatingFileHandler"]
