@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS missions (
   loop TEXT NOT NULL,            -- trade | improve | ask | reflection
   runner TEXT NOT NULL, model TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'running',
+  trigger TEXT,                  -- cron | signal:<plugin> (Phase 2)。loop='trade' 以外は NULL
   output_json TEXT, transcript_json TEXT,
   started_at TEXT NOT NULL, finished_at TEXT
 );
@@ -104,15 +105,29 @@ TABLE_NAMES = frozenset({
 })
 
 
-def connect(db_path: Path) -> sqlite3.Connection:
+def connect(db_path: Path, *, check_same_thread: bool = False) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str,
+                   ddl: str) -> None:
+    """存在しない列を追加する (SQLite は ADD COLUMN IF NOT EXISTS を持たない)。
+
+    init_db は CREATE TABLE IF NOT EXISTS なので、既存 DB のテーブル定義は
+    更新されない。列追加は PRAGMA で検査して ALTER する必要がある。
+    """
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    _ensure_column(conn, "missions", "trigger", "trigger TEXT")
     conn.commit()

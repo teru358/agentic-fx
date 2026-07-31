@@ -6,10 +6,10 @@ from datetime import datetime
 
 
 def start(conn: sqlite3.Connection, loop: str, runner: str, model: str,
-          now: datetime) -> int:
+          now: datetime, trigger: str | None = None) -> int:
     cur = conn.execute(
-        "INSERT INTO missions (loop, runner, model, status, started_at) "
-        "VALUES (?,?,?,'running',?)", (loop, runner, model, now.isoformat()))
+        "INSERT INTO missions (loop, runner, model, status, started_at, trigger) "
+        "VALUES (?,?,?,'running',?,?)", (loop, runner, model, now.isoformat(), trigger))
     conn.commit()
     return cur.lastrowid
 
