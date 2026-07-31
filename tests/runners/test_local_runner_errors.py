@@ -117,11 +117,15 @@ def test_deadline_checked_after_response():
 
 
 def test_final_turn_over_deadline_is_timeout_not_max_turns():
+    # Calibrated to exercise final loop-exit with deadline expired (F4 timeout priority).
+    # time_fn calls: c0(deadline=35), c1(remaining chk), c2(post-HTTP),
+    # c3(post-tool), c_final(at _finish). With advance=10: t=0,10,20,30,40.
+    # In-loop checks see t<35; final check sees 40>=35 → must return "timeout".
     tool_call = {"role": "assistant", "content": None, "tool_calls": [
         {"id": "c", "type": "function",
          "function": {"name": "nope", "arguments": "{}"}}]}
     runner = _runner_with_time([tool_call], FakeTime(advance=10.0))
-    r = runner.run(_mission(max_turns=2, timeout_sec=15))
+    r = runner.run(_mission(max_turns=1, timeout_sec=35))
     assert r.status == "timeout"  # ループ上限と期限超過が同時なら timeout 優先
 
 
