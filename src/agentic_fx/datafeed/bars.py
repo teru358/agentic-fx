@@ -99,4 +99,4 @@ def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
                 f"BAR_ANCHOR={BAR_ANCHOR!r} is not applied to non-Tick rule "
                 f"{rule!r} (pandas ignores origin); implement it explicitly")
         kwargs = {}
-    return df.sort_index(kind="stable").resample(rule, **kwargs).agg(_AGG).dropna()
+    return df.resample(rule, **kwargs).agg(_AGG).dropna()

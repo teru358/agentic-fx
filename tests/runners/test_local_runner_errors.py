@@ -1,3 +1,5 @@
+import json
+
 import httpx
 
 from agentic_fx.runners.base import Mission
@@ -149,23 +151,48 @@ def test_broken_tool_arguments_reported_to_llm():
 
 
 def test_tool_calls_with_dict_content_stringified():
-    """tool_calls + dict content は content を文字列化してプロトコル互換を保つ。"""
+    """tool_calls + dict content は content を文字列化してプロトコル互換を保つ。
+
+    Verify that in the 2nd request body, the assistant message content is stringified.
+    """
     # First turn: tool_calls with non-string (dict) content
     bad_content = {"role": "assistant", "content": {"x": 1}, "tool_calls": [
         {"id": "c1", "type": "function",
          "function": {"name": "nope", "arguments": "{}"}}]}
     # Second turn: valid JSON output
     good = {"role": "assistant", "content": '{"action": "hold"}'}
-    runner = _runner([bad_content, good])
+
+    # Use a handler that captures request bodies
+    calls = {"i": 0, "bodies": []}
+    def handler(request):  # noqa: ANN001
+        calls["bodies"].append(json.loads(request.content))
+        msg = [bad_content, good][min(calls["i"], 1)]
+        calls["i"] += 1
+        return httpx.Response(200, json={"choices": [{"message": msg}]})
+
+    runner = LocalRunner(base_url="http://test/v1", model="m",
+                        registry=ToolRegistry(),
+                        transport=httpx.MockTransport(handler))
     r = runner.run(_mission())
     assert r.status == "completed"
-    # Find the assistant message with non-string content (it should be stringified)
+
+    # Check transcript: first assistant message should have stringified content
     assistant_msgs = [m for m in r.transcript if m.get("role") == "assistant"]
-    # First assistant message should have stringified content
     assert len(assistant_msgs) >= 1
     first_msg = assistant_msgs[0]
     assert "content" in first_msg
-    assert isinstance(first_msg["content"], str)  # Should be stringified now
+    assert isinstance(first_msg["content"], str), "Content should be stringified"
+
+    # Check request body: 2nd request should have stringified content in messages
+    assert len(calls["bodies"]) >= 2
+    second_req_msgs = calls["bodies"][1]["messages"]
+    # Find the assistant message in the 2nd request that had dict content
+    assistant_msgs_in_req = [m for m in second_req_msgs if m.get("role") == "assistant"]
+    assert len(assistant_msgs_in_req) >= 1
+    # The first assistant message (with originally dict content) should be stringified
+    first_assistant_in_req = assistant_msgs_in_req[0]
+    assert isinstance(first_assistant_in_req["content"], str), \
+        "Request body must have stringified content for protocol compatibility"
 
 
 def test_close_method_exists():
@@ -176,8 +203,10 @@ def test_close_method_exists():
 
 
 def test_broken_tool_arguments_with_utf8():
-    """W5: broken tool arguments with Japanese characters preserve UTF-8."""
-    # Tool argument is broken JSON containing Japanese characters
+    """W5: ensure_ascii=False in JSONDecodeError handling preserves UTF-8 (W5, code pin)."""
+    # Tool argument is broken JSON containing Japanese characters.
+    # The error handling uses ensure_ascii=False to preserve UTF-8 if it appears
+    # in the error message or related text.
     broken_json = '{壊れた'  # Broken JSON with Japanese chars
     tool_call = {"role": "assistant", "content": None, "tool_calls": [
         {"id": "c1", "type": "function",
@@ -188,6 +217,11 @@ def test_broken_tool_arguments_with_utf8():
     assert r.status == "completed"
     tool_msgs = [m for m in r.transcript if m.get("role") == "tool"]
     assert len(tool_msgs) >= 1
-    # Verify UTF-8 is preserved (not escaped as \\uXXXX)
-    error_msg = tool_msgs[0]["content"]
-    assert "壊れた" in error_msg or "not valid JSON" in error_msg
+    error_json_str = tool_msgs[0]["content"]
+    # Verify result is valid JSON (ensure_ascii=False produces valid JSON)
+    error_dict = json.loads(error_json_str)
+    assert "error" in error_dict
+    assert "not valid JSON" in error_dict["error"]
+    # Verify no unnecessary escape sequences where UTF-8 should be raw
+    # (if ensure_ascii=True was used, non-ASCII chars would be \uXXXX)
+    assert "\\u" not in error_json_str or error_json_str.count("\\u") == 0

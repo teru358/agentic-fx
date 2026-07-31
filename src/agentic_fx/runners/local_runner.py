@@ -175,12 +175,6 @@ class LocalRunner(AgentRunner):
                                             f"(content is not a string)"
                                             f"。JSON オブジェクトのみを"
                                             f"出力してください。"})
-                # Guard: tool_calls + non-string content must be stringified
-                # to keep the message protocol-valid for the next request
-                content = normalized_msg.get("content")
-                if content is not None and not isinstance(content, str):
-                    normalized_msg["content"] = json.dumps(
-                        content, ensure_ascii=False, default=str)
                 continue
 
             # Check deadline before parse_json_output (F4)
@@ -197,12 +191,6 @@ class LocalRunner(AgentRunner):
                                  "content": f"出力を JSON として解釈できません "
                                             f"({e})。JSON オブジェクトのみを"
                                             f"出力してください。"})
-                # Guard: tool_calls + non-string content must be stringified
-                # to keep the message protocol-valid for the next request
-                content = normalized_msg.get("content")
-                if content is not None and not isinstance(content, str):
-                    normalized_msg["content"] = json.dumps(
-                        content, ensure_ascii=False, default=str)
                 continue
             try:
                 jsonschema.validate(output, mission.output_schema)
@@ -214,12 +202,6 @@ class LocalRunner(AgentRunner):
                                  "content": f"出力がスキーマに合いません: "
                                             f"{e.message}。修正して JSON のみ"
                                             f"再出力してください。"})
-                # Guard: tool_calls + non-string content must be stringified
-                # to keep the message protocol-valid for the next request
-                content = normalized_msg.get("content")
-                if content is not None and not isinstance(content, str):
-                    normalized_msg["content"] = json.dumps(
-                        content, ensure_ascii=False, default=str)
                 continue
             except Exception as e:  # noqa: BLE001 — W2: SchemaError 等
                 # mission.output_schema 自体が不正 (SchemaError や $ref 解決

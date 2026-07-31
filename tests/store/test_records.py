@@ -42,6 +42,29 @@ def test_reflections_tiebreaker_by_order_id(tmp_path):
     assert recent_rows[1]["order_id"] == oid1
 
 
+def test_reflections_recent_for_pair_tiebreaker_by_order_id(tmp_path):
+    """recent_for_pair() も同一 created_at の複数反射で order_id DESC で決定的順序。"""
+    c = _conn(tmp_path)
+    # 同一ペア、同一 created_at の複数 order を作成
+    oid1 = orders.insert(c, pair="USDJPY", direction="long", entry_type="market",
+                         horizon="day", status=OrderStatus.CLOSED, now=NOW)
+    oid2 = orders.insert(c, pair="USDJPY", direction="long", entry_type="market",
+                         horizon="day", status=OrderStatus.CLOSED, now=NOW)
+    # 別ペアの order (チェック用)
+    oid3 = orders.insert(c, pair="EURUSD", direction="short", entry_type="market",
+                         horizon="day", status=OrderStatus.CLOSED, now=NOW)
+    # 同じ created_at で保存
+    reflections.save(c, oid1, "usdjpy_1", NOW)
+    reflections.save(c, oid2, "usdjpy_2", NOW)
+    reflections.save(c, oid3, "eurusd_1", NOW)
+    # recent_for_pair() で USDJPY の最新 2 件を取得
+    recent_rows = reflections.recent_for_pair(c, "USDJPY", 2)
+    assert len(recent_rows) == 2
+    # oid2 (新しい order_id) が最初に来ることを確認
+    assert recent_rows[0]["order_id"] == oid2
+    assert recent_rows[1]["order_id"] == oid1
+
+
 def test_snapshots_latest(tmp_path):
     c = _conn(tmp_path)
     snapshots.add(c, ts=NOW, balance=10000, equity=10000, hwm=10000)

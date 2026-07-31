@@ -151,14 +151,14 @@ def test_timeout_during_parse_retry():
     call_count = {"n": 0}
 
     def fake_time():
-        # deadline=5.5, increment=0.6s per call. Calibrated so retry
+        # deadline = 0.6 + 5.5 = 6.1, increment=0.6s per call. Calibrated so retry
         # exhaustion (schema_retries > _MAX_REPAIR_RETRIES=2) happens on
         # turn 3, and the deadline crosses only when _finish checks it
         # during that exhaustion (not at an earlier remaining<=0 check):
         # Turn 1: n=1,0.6; HTTP n=2,1.2; schema_retries=1 n=3,1.8; continue
         # Turn 2: n=4,2.4; HTTP n=5,3.0; schema_retries=2 n=6,3.6; continue
         # Turn 3: n=7,4.2; HTTP n=8,4.8; schema_retries=3 n=9,5.4;
-        #         exhaustion, _finish called n=11,6.6 >= 5.5
+        #         exhaustion, _finish called n=11,6.6 >= 6.1
         call_count["n"] += 1
         return call_count["n"] * 0.6
 
