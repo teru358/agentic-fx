@@ -10,8 +10,8 @@ from agentic_fx.tools.registry import ToolDef
 
 
 def _pair_param(settings: Settings) -> dict:
-    """timeframe の enum は設定から動的に作る (足を固定しない方針)。"""
-    return {"pair": {"type": "string", "description": "e.g. USDJPY"},
+    """pair と timeframe の enum は設定から動的に作る (足・通貨ペアを固定しない方針)。"""
+    return {"pair": {"enum": list(settings.pairs), "description": "e.g. USDJPY"},
             "timeframe": {"type": "string",
                           "enum": list(settings.datafeed.intervals)}}
 

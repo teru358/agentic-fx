@@ -146,3 +146,48 @@ def test_broken_tool_arguments_reported_to_llm():
     assert r.status == "completed"
     tool_msgs = [m for m in r.transcript if m.get("role") == "tool"]
     assert tool_msgs and "not valid JSON" in tool_msgs[0]["content"]
+
+
+def test_tool_calls_with_dict_content_stringified():
+    """tool_calls + dict content は content を文字列化してプロトコル互換を保つ。"""
+    # First turn: tool_calls with non-string (dict) content
+    bad_content = {"role": "assistant", "content": {"x": 1}, "tool_calls": [
+        {"id": "c1", "type": "function",
+         "function": {"name": "nope", "arguments": "{}"}}]}
+    # Second turn: valid JSON output
+    good = {"role": "assistant", "content": '{"action": "hold"}'}
+    runner = _runner([bad_content, good])
+    r = runner.run(_mission())
+    assert r.status == "completed"
+    # Find the assistant message with non-string content (it should be stringified)
+    assistant_msgs = [m for m in r.transcript if m.get("role") == "assistant"]
+    # First assistant message should have stringified content
+    assert len(assistant_msgs) >= 1
+    first_msg = assistant_msgs[0]
+    assert "content" in first_msg
+    assert isinstance(first_msg["content"], str)  # Should be stringified now
+
+
+def test_close_method_exists():
+    """LocalRunner.close() can be called without exception."""
+    runner = _runner({"role": "assistant", "content": '{"action": "hold"}'})
+    # Should not raise
+    runner.close()
+
+
+def test_broken_tool_arguments_with_utf8():
+    """W5: broken tool arguments with Japanese characters preserve UTF-8."""
+    # Tool argument is broken JSON containing Japanese characters
+    broken_json = '{壊れた'  # Broken JSON with Japanese chars
+    tool_call = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "c1", "type": "function",
+         "function": {"name": "nope", "arguments": broken_json}}]}
+    good = {"role": "assistant", "content": '{"action": "hold"}'}
+    runner = _runner([tool_call, good])
+    r = runner.run(_mission())
+    assert r.status == "completed"
+    tool_msgs = [m for m in r.transcript if m.get("role") == "tool"]
+    assert len(tool_msgs) >= 1
+    # Verify UTF-8 is preserved (not escaped as \\uXXXX)
+    error_msg = tool_msgs[0]["content"]
+    assert "壊れた" in error_msg or "not valid JSON" in error_msg

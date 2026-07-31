@@ -21,10 +21,10 @@ def get(conn: sqlite3.Connection, order_id: int) -> dict | None:
 
 def recent(conn: sqlite3.Connection, n: int) -> list[dict]:
     return [dict(r) for r in conn.execute(
-        "SELECT * FROM reflections ORDER BY created_at DESC LIMIT ?", (n,))]
+        "SELECT * FROM reflections ORDER BY created_at DESC, order_id DESC LIMIT ?", (n,))]
 
 
 def recent_for_pair(conn: sqlite3.Connection, pair: str, n: int) -> list[dict]:
     return [dict(r) for r in conn.execute(
         "SELECT r.* FROM reflections r JOIN orders o ON o.id = r.order_id "
-        "WHERE o.pair = ? ORDER BY r.created_at DESC LIMIT ?", (pair, n))]
+        "WHERE o.pair = ? ORDER BY r.created_at DESC, r.order_id DESC LIMIT ?", (pair, n))]

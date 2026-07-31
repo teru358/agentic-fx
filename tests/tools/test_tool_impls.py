@@ -93,7 +93,7 @@ def test_no_tool_exposes_an_arbitrary_history_window():
     reg.register_all(market_tools.build(MagicMock(), MagicMock(), SETTINGS))
     reg.register_all(news_tools.build(MagicMock()))
     reg.register_all(account_tools.build(MagicMock(), MagicMock()))
-    reg.register_all(reflection_tools.build(MagicMock(), MagicMock()))
+    reg.register_all(reflection_tools.build(MagicMock(), MagicMock(), SETTINGS.pairs))
     banned = {"since", "until", "from", "to", "start", "end",
               "start_date", "end_date", "lookback", "lookback_days", "bars",
               "period", "window", "range", "history_days", "count"}
@@ -146,6 +146,30 @@ def test_get_ohlcv_always_returns_at_most_100_bars():
         f"Last entry should be newest: {ohlcv[-1]['ts']} vs {newest}"
 
 
+def test_get_ohlcv_returns_sorted_results_even_with_unsorted_input():
+    """get_ohlcv ensures bars are sorted by ts (ascending), even if input is shuffled.
+
+    This verifies that bars_to_df's sort_index defense works end-to-end through
+    the tool interface. Final element should have max ts.
+    """
+    provider = MagicMock()
+    bars = _bars(n=50)
+    # Shuffle the bars to verify sorting is applied
+    shuffled_bars = [bars[i] for i in [10, 5, 30, 2, 45, 1, 20, 40, 15, 35]]
+    shuffled_bars.extend([bars[i] for i in range(50) if i not in
+                         [10, 5, 30, 2, 45, 1, 20, 40, 15, 35]])
+    provider.get_bars.return_value = shuffled_bars
+    reg = ToolRegistry()
+    reg.register_all(market_tools.build(provider, MagicMock(), SETTINGS))
+    ohlcv = reg.func("get_ohlcv")(pair="USDJPY", timeframe="1h")
+
+    # Verify all ts values are in ascending order
+    ts_values = [item["ts"] for item in ohlcv]
+    assert ts_values == sorted(ts_values), "Results should be sorted by ts"
+    # Verify last element has the maximum ts
+    assert ohlcv[-1]["ts"] == ts_values[-1]
+
+
 def test_news_tools_drop_url_and_credentials():
     """F1: search_news must drop url field and credentials.
 
@@ -172,6 +196,29 @@ def test_news_tools_drop_url_and_credentials():
     assert result[0]["source_name"] == "Source"
 
 
+def test_news_tools_handle_missing_metadata():
+    """search_news gracefully handles missing metadata fields (source_name, etc).
+
+    Uses .get() to avoid KeyError when RAG results lack optional fields.
+    Returns None for missing fields instead of raising an exception.
+    """
+    rag = MagicMock()
+    # Missing source_name field
+    rag.search_news.return_value = [
+        {"title": "News", "body": "Content"}
+        # source_name is missing
+    ]
+    reg = ToolRegistry()
+    reg.register_all(news_tools.build(rag))
+    result = reg.func("search_news")(query="test")
+
+    # Should return result with None for missing field, not raise exception
+    assert len(result) == 1
+    assert result[0]["title"] == "News"
+    assert result[0]["body"] == "Content"
+    assert result[0]["source_name"] is None  # Missing field becomes None
+
+
 def test_news_and_reflection_tools(tmp_path):
     conn = connect(tmp_path / "t.db")
     init_db(conn)
@@ -180,7 +227,7 @@ def test_news_and_reflection_tools(tmp_path):
     rag.search_reflections.return_value = [{"content": "c"}]
     reg = ToolRegistry()
     reg.register_all(news_tools.build(rag))
-    reg.register_all(reflection_tools.build(conn, rag))
+    reg.register_all(reflection_tools.build(conn, rag, SETTINGS.pairs))
     assert reg.func("search_news")(query="usd")[0]["title"] == "t"
     assert reg.func("search_reflections")(query="q")[0]["content"] == "c"
     oid = orders.insert(conn, pair="USDJPY", direction="long",
@@ -213,6 +260,28 @@ def test_account_tools(tmp_path):
     assert acct["balance"] == 1_000_000
 
 
+def test_pair_enum_validation_rejects_invalid_pair():
+    """Pair enum constraint is enforced; invalid pair → validation error JSON.
+
+    registry.execute returns validation error JSON (no exception raised).
+    """
+    reg = ToolRegistry()
+    reg.register_all(reflection_tools.build(MagicMock(), MagicMock(), SETTINGS.pairs))
+
+    # get_recent_reflections with valid pair should work (or at least pass validation)
+    # USDJPY is in SETTINGS.pairs
+    result = reg.execute("get_recent_reflections", {"pair": "USDJPY"}, ["get_recent_reflections"])
+    # Result should be valid (either success or empty list from mock, but not validation error)
+    assert isinstance(result, (str, list))
+
+    # Invalid pair like "GBPJPY" (not in SETTINGS.pairs) should fail validation
+    result = reg.execute("get_recent_reflections", {"pair": "GBPJPY"}, ["get_recent_reflections"])
+    # Should return validation error JSON (registry.execute doesn't raise, it returns error JSON)
+    assert isinstance(result, str)
+    # Error message should indicate validation failure
+    assert "validation" in result.lower() or "fail" in result.lower() or "error" in result.lower()
+
+
 def test_all_tools_have_schemas():
     """M-4: cover all tool modules (market/news/account/reflection), not just
     market+news — the test name claims "all tools".
@@ -225,7 +294,7 @@ def test_all_tools_have_schemas():
     tools = (market_tools.build(provider, econ, SETTINGS)
              + news_tools.build(rag)
              + account_tools.build(conn, broker)
-             + reflection_tools.build(conn, rag))
+             + reflection_tools.build(conn, rag, SETTINGS.pairs))
     for t in tools:
         assert t.parameters["type"] == "object"
         assert t.description

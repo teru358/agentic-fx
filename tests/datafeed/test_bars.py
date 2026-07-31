@@ -123,3 +123,37 @@ def test_bars_to_df_empty_returns_empty_df():
     df = bars_to_df([])
     assert len(df) == 0
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
+
+
+def test_bars_to_df_sorts_shuffled_input():
+    """シャッフル入力 → 昇順 (時系列 ts の順)。"""
+    bars = _bars(n=5)
+    # Shuffle the bars
+    shuffled = [bars[2], bars[0], bars[4], bars[1], bars[3]]
+    df = bars_to_df(shuffled)
+    # Index should be sorted (ascending)
+    assert (df.index == sorted(df.index)).all()
+    # Verify order matches original sorted order
+    assert df.index[0] == bars[0].ts
+    assert df.index[-1] == bars[4].ts
+
+
+def test_bars_to_df_sorts_descending_input():
+    """降順入力 → 昇順 (時系列 ts の順)。"""
+    bars = _bars(n=5)
+    # Reverse the bars
+    reversed_bars = list(reversed(bars))
+    df = bars_to_df(reversed_bars)
+    # Index should be sorted (ascending)
+    assert (df.index == sorted(df.index)).all()
+    # Verify order matches original sorted order
+    assert df.index[0] == bars[0].ts
+    assert df.index[-1] == bars[4].ts
+
+
+def test_bars_to_df_preserves_empty_structure():
+    """空入力で columns と (UTC) index が維持される。"""
+    df = bars_to_df([])
+    assert len(df) == 0
+    assert list(df.columns) == ["open", "high", "low", "close", "volume"]
+    assert df.index.tz is not None  # UTC timezone preserved

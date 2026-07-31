@@ -52,18 +52,21 @@ def bars_to_df(bars: list[Bar]) -> pd.DataFrame:
     **無言で UTC として localize** してしまい、「naive なら UTC とみなす」
     というプロジェクト禁止事項をそのまま実行することになるため
     (aware な入力に対しては変換のみで、tz の正規化点は sources.py 側)。
+
+    返却前に ts で昇順ソート (同一 ts は入力順維持 — 安定ソート)。
     """
     naive = [b for b in bars if b.ts.tzinfo is None]
     if naive:
         raise ValueError(
             f"naive datetime in bars (first={naive[0].ts}); "
             "timezone-aware timestamps are required")
-    return pd.DataFrame(
+    df = pd.DataFrame(
         {"open": [b.open for b in bars], "high": [b.high for b in bars],
          "low": [b.low for b in bars], "close": [b.close for b in bars],
          "volume": [b.volume for b in bars]},
         index=pd.DatetimeIndex([b.ts for b in bars], tz="UTC"),
         columns=list(_COLUMNS))
+    return df.sort_index(kind="stable")
 
 
 def df_to_bars(df: pd.DataFrame, symbol: str, interval: str) -> list[Bar]:
@@ -96,4 +99,4 @@ def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
                 f"BAR_ANCHOR={BAR_ANCHOR!r} is not applied to non-Tick rule "
                 f"{rule!r} (pandas ignores origin); implement it explicitly")
         kwargs = {}
-    return df.resample(rule, **kwargs).agg(_AGG).dropna()
+    return df.sort_index(kind="stable").resample(rule, **kwargs).agg(_AGG).dropna()

@@ -23,6 +23,25 @@ def test_reflection_upsert(tmp_path):
     assert len(reflections.recent(c, 5)) == 1
 
 
+def test_reflections_tiebreaker_by_order_id(tmp_path):
+    """同一 created_at の複数反射は order_id DESC で決定的順序が保証される。"""
+    c = _conn(tmp_path)
+    # 同一 created_at の複数 order を作成
+    oid1 = orders.insert(c, pair="USDJPY", direction="long", entry_type="market",
+                         horizon="day", status=OrderStatus.CLOSED, now=NOW)
+    oid2 = orders.insert(c, pair="USDJPY", direction="long", entry_type="market",
+                         horizon="day", status=OrderStatus.CLOSED, now=NOW)
+    # 同じ created_at で保存 (oid2 が大きい)
+    reflections.save(c, oid1, "content1", NOW)
+    reflections.save(c, oid2, "content2", NOW)
+    # recent() で最新 2 件を取得
+    recent_rows = reflections.recent(c, 2)
+    assert len(recent_rows) == 2
+    # oid2 (新しい order_id) が最初に来ることを確認
+    assert recent_rows[0]["order_id"] == oid2
+    assert recent_rows[1]["order_id"] == oid1
+
+
 def test_snapshots_latest(tmp_path):
     c = _conn(tmp_path)
     snapshots.add(c, ts=NOW, balance=10000, equity=10000, hwm=10000)
