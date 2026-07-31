@@ -192,13 +192,14 @@ def test_run_once_boundary_exception_from_healthcheck(tmp_path):
 
 
 def test_run_once_boundary_exception_from_executor(tmp_path):
-    """executor.handle_intent が例外 → 公開境界で catch・None・activity 記録。"""
+    """executor.handle_intent が例外 → intent_execution_failed で記録・None。"""
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed", {"action": "hold", "reasoning": "test"}, [])])
     loop.executor.handle_intent = MagicMock(side_effect=RuntimeError("executor_boom"))
     result = loop.run_once()
     assert result is None
-    assert "mission_boundary_failed" in (tp / "a.log").read_text(encoding="utf-8")
+    act_text = (tp / "a.log").read_text(encoding="utf-8")
+    assert "intent_execution_failed" in act_text
 
 
 def test_run_once_boundary_exception_from_activity_write(tmp_path):
@@ -211,39 +212,37 @@ def test_run_once_boundary_exception_from_activity_write(tmp_path):
 
 
 def test_ask_once_boundary_exception_returns_error_string(tmp_path):
-    """ask_once の例外 → error string 返却 (None ではなく文字列)。"""
+    """ask_once の境界例外 (missions.start) → 'internal_error' 返却 (正確一致)。"""
     conn, loop, _, _ = _loop(tmp_path, [])
-    loop.runner.run = MagicMock(side_effect=RuntimeError("runner_boom"))
-    result = loop.ask_once("test?")
-    assert isinstance(result, str)
-    assert "失敗" in result or "error" in result.lower()
+    with patch("agentic_fx.loops.trade_loop.missions.start") as mock_start:
+        mock_start.side_effect = RuntimeError("missions_boom")
+        result = loop.ask_once("test?")
+        # 公開境界を通る例外は内部エラーとして返される
+        assert result == "(Mission 失敗: internal_error)"
 
 
 def test_ask_once_invalid_output_dict_missing_answer(tmp_path):
-    """ask output が dict だが answer キーなし → error string 返却。"""
+    """ask output が dict だが answer キーなし → 'completed' error 返却 (正確一致)。"""
     conn, loop, _, _ = _loop(tmp_path, [MissionResult(
         "completed", {"wrong_key": "value"}, [])])
     result = loop.ask_once("test?")
-    assert isinstance(result, str)
-    assert "失敗" in result or "error" in result.lower()
+    assert result == "(Mission 失敗: completed)"
 
 
 def test_ask_once_invalid_output_not_dict(tmp_path):
-    """ask output が文字列 (dict ではない) → error string 返却。"""
+    """ask output が文字列 (dict ではない) → 'completed' error 返却 (正確一致)。"""
     conn, loop, _, _ = _loop(tmp_path, [MissionResult(
         "completed", "not a dict", [])])
     result = loop.ask_once("test?")
-    assert isinstance(result, str)
-    assert "失敗" in result or "error" in result.lower()
+    assert result == "(Mission 失敗: completed)"
 
 
 def test_ask_once_invalid_output_answer_not_string(tmp_path):
-    """ask output.answer が数値 (str ではない) → error string 返却。"""
+    """ask output.answer が数値 (str ではない) → 'completed' error 返却 (正確一致)。"""
     conn, loop, _, _ = _loop(tmp_path, [MissionResult(
         "completed", {"answer": 123}, [])])
     result = loop.ask_once("test?")
-    assert isinstance(result, str)
-    assert "失敗" in result or "error" in result.lower()
+    assert result == "(Mission 失敗: completed)"
 
 
 def test_missions_finish_failure_logged_not_blocking(tmp_path):
@@ -267,8 +266,169 @@ def test_ask_once_mismatched_schema_in_output(tmp_path):
         {"action": "hold", "reasoning": "misplaced trade intent"},
         [])])
     result = loop.ask_once("test?")
-    assert isinstance(result, str)
-    assert "失敗" in result or "error" in result.lower()
+    assert result == "(Mission 失敗: completed)"
+
+
+# ---- F1: handle_intent 例外の専用ハンドリング ----
+
+def test_handle_intent_exception_recorded(tmp_path):
+    """executor.handle_intent が例外 → activity intent_execution_failed・mid 記録・None."""
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "test"}, [])])
+    loop.executor.handle_intent = MagicMock(side_effect=RuntimeError("executor_crash"))
+    result = loop.run_once()
+    assert result is None
+    # activity に記録
+    act_text = (tp / "a.log").read_text(encoding="utf-8")
+    assert "intent_execution_failed" in act_text
+    # mission は finished
+    m = conn.execute("SELECT * FROM missions").fetchone()
+    assert m["status"] == "completed"
+
+
+# ---- F2: 欠落している境界例外注入テスト ----
+
+def test_run_once_boundary_exception_from_build_state_summary(tmp_path):
+    """build_state_summary が OSError → 公開境界で catch・None・mission_boundary_failed。"""
+    conn, loop, _, tp = _loop(tmp_path, [])
+    with patch("agentic_fx.loops.trade_loop.build_state_summary") as mock_summary:
+        mock_summary.side_effect = RuntimeError("summary_boom")
+        result = loop.run_once()
+        assert result is None
+        assert "mission_boundary_failed" in (tp / "a.log").read_text(encoding="utf-8")
+
+
+def test_run_once_boundary_exception_from_missions_start(tmp_path):
+    """missions.start が例外 → 公開境界で catch・None・mission_boundary_failed。"""
+    conn, loop, _, tp = _loop(tmp_path, [])
+    with patch("agentic_fx.loops.trade_loop.missions.start") as mock_start:
+        mock_start.side_effect = RuntimeError("start_boom")
+        result = loop.run_once()
+        assert result is None
+        assert "mission_boundary_failed" in (tp / "a.log").read_text(encoding="utf-8")
+
+
+def test_run_once_boundary_exception_from_trade_intent_parsing_type_error(tmp_path):
+    """TradeIntent.from_llm_dict が想定外 TypeError → 公開境界で catch・None。"""
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "test"}, [])])
+    with patch("agentic_fx.loops.trade_loop.TradeIntent.from_llm_dict") as mock_parse:
+        mock_parse.side_effect = TypeError("unexpected_type_error")
+        result = loop.run_once()
+        assert result is None
+        assert "mission_boundary_failed" in (tp / "a.log").read_text(encoding="utf-8")
+
+
+def test_run_once_boundary_exception_from_notifier_in_fail_closed(tmp_path):
+    """healthcheck 分岐の notifier.send が例外 → 例外漏れない・None。"""
+    conn, loop, _, tp = _loop(tmp_path, [], healthy=False)
+    loop.notifier.send = MagicMock(side_effect=RuntimeError("notifier_boom"))
+    result = loop.run_once()
+    assert result is None  # 例外は catch される
+
+
+# ---- F4: missions.finish 失敗テストの強化 ----
+
+def test_missions_finish_failure_activity_recorded_call_count(tmp_path):
+    """missions.finish が例外 → activity mission_finalize_failed 記録・finish は 1 回・結果は返す。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "test"}, [])])
+    with patch("agentic_fx.loops.trade_loop.missions.finish") as mock_finish:
+        mock_finish.side_effect = RuntimeError("finish_boom")
+        result = loop.run_once()
+        # 実行は成功・hold の結果は返される
+        assert result["result"] == "hold"
+        # finish は呼ばれたがちょうど 1 回
+        assert mock_finish.call_count == 1
+        # activity に記録の試み
+        act_text = (tp / "a.log").read_text(encoding="utf-8")
+        assert "mission_finalize_failed" in act_text
+
+
+# ---- F5: origin 固定と executor 不呼び出し ----
+
+def test_trade_intent_origin_is_scheduler(tmp_path):
+    """trade 経路の TradeIntent.from_llm_dict は Origin.SCHEDULER で呼ばれる。"""
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "test"}, [])])
+    with patch("agentic_fx.loops.trade_loop.TradeIntent.from_llm_dict") as mock_parse:
+        mock_parse.return_value = MagicMock(action=MagicMock(value="hold"))
+        loop.executor.handle_intent = MagicMock()
+        loop.run_once()
+        # from_llm_dict が呼ばれたことを確認
+        assert mock_parse.called
+        # origin 引数が Origin.SCHEDULER であること (キーワード引数チェック)
+        call_kwargs = mock_parse.call_args.kwargs
+        from agentic_fx.core.contracts import Origin
+        assert call_kwargs.get("origin") == Origin.SCHEDULER
+
+
+def test_ask_once_executor_not_called(tmp_path):
+    """ask 経路では executor.handle_intent が呼ばれない。"""
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"answer": "test"}, [])])
+    loop.executor.handle_intent = MagicMock()
+    loop.ask_once("test?")
+    # executor は呼ばれない
+    loop.executor.handle_intent.assert_not_called()
+
+
+# ---- F6: MissionWatch 統合テストの強化 ----
+
+def test_mission_watch_begin_end_called_with_correct_args(tmp_path):
+    """_run_recorded が watch.begin(mid, loop, timeout_sec)・end(mid) を呼ぶ。"""
+    conn, loop, runner, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "test"}, [])])
+    mock_watch = MagicMock()
+    loop.watch = mock_watch
+    loop.run_once()
+    # begin が呼ばれたことを確認・引数チェック (mid, "trade", timeout_sec)
+    begin_calls = mock_watch.begin.call_args_list
+    assert len(begin_calls) == 1
+    mid, loop_name, timeout_sec = begin_calls[0][0]
+    assert loop_name == "trade"
+    assert timeout_sec == 300.0  # SETTINGS.llama_swap.timeout_sec
+    # end が同じ mid で呼ばれたことを確認
+    end_calls = mock_watch.end.call_args_list
+    assert len(end_calls) == 1
+    assert end_calls[0][0][0] == mid  # 同じ mid
+
+
+def test_mission_watch_begin_end_order_on_exception(tmp_path):
+    """runner 例外時も begin → end の順で呼ぶ (finally で end)。"""
+    conn, loop, _, _ = _loop(tmp_path, [])
+
+    class Boom:
+        def run(self, mission):
+            raise RuntimeError("crash")
+
+    loop.runner = Boom()
+    mock_watch = MagicMock()
+    loop.watch = mock_watch
+    loop.run_once()
+    # begin が呼ばれたことを確認
+    assert mock_watch.begin.called
+    # end が呼ばれたことを確認
+    assert mock_watch.end.called
+    # begin が end より前に呼ばれたことを確認 (call_args_list)
+    all_calls = mock_watch.method_calls
+    begin_idx = next(i for i, call in enumerate(all_calls) if call[0] == "begin")
+    end_idx = next(i for i, call in enumerate(all_calls) if call[0] == "end")
+    assert begin_idx < end_idx
+
+
+def test_ask_once_watch_loop_name(tmp_path):
+    """ask 経路の watch.begin は loop="ask" で呼ぶ。"""
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"answer": "test"}, [])])
+    mock_watch = MagicMock()
+    loop.watch = mock_watch
+    loop.ask_once("test?")
+    # begin が呼ばれたことを確認・loop 引数が "ask"
+    begin_calls = mock_watch.begin.call_args_list
+    assert len(begin_calls) == 1
+    _, loop_name, _ = begin_calls[0][0]
+    assert loop_name == "ask"
 
 
 def test_mission_watch_begin_end_called(tmp_path):

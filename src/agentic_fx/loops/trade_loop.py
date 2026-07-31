@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import Settings
 from agentic_fx.core.contracts import Clock, IntentParseError, Origin, TradeIntent
@@ -107,7 +108,15 @@ class TradeLoop:
             self.activity.write(Category.AGGREGATE, "intent_parse_failed",
                                 str(e), ref_id=str(mid))
             return None
-        out = self.executor.handle_intent(intent, mid)
+        try:
+            out = self.executor.handle_intent(intent, mid)
+        except Exception as e:  # noqa: BLE001
+            _log.exception("executor.handle_intent raised")
+            self.activity.write(Category.AGGREGATE, "intent_execution_failed",
+                                safe_error_text(e), ref_id=str(mid))
+            self.notifier.send(
+                f"[agentic-fx] 注文処理失敗: {safe_error_text(e)}")
+            return None
         self.activity.write(Category.AGGREGATE, "decision",
                             f"{intent.action.value} -> {out['result']}",
                             ref_id=str(mid))
@@ -130,10 +139,10 @@ class TradeLoop:
             return f"(Mission 失敗: {result.status})"
         # output 検証: dict であり、answer キーが存在し、値が str であること
         if not isinstance(result.output, dict):
-            return "(Mission 失敗: invalid_output)"
+            return "(Mission 失敗: completed)"
         answer = result.output.get("answer")
         if not isinstance(answer, str):
-            return "(Mission 失敗: invalid_answer)"
+            return "(Mission 失敗: completed)"
         self.activity.write(Category.AGGREGATE, "ask_answered",
                             question[:80], ref_id=str(mid))
         return answer
