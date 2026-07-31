@@ -75,3 +75,145 @@ def test_raw_func_access():
     reg = ToolRegistry()
     reg.register(_echo_tool())
     assert reg.func("echo")(msg="direct") == {"echoed": "direct"}
+
+
+# ===== Killer Tests (T1-T8) =====
+
+def test_T1_invalid_schema_does_not_raise():
+    """T1: registered tool with invalid schema doesn't raise execute()."""
+    reg = ToolRegistry()
+    # Register with invalid schema type
+    reg.register(ToolDef(
+        "bad_schema", "d",
+        {"type": "not-a-real-type"},  # jsonschema.validate will raise SchemaError
+        func=lambda: "ok"))
+    # Should return error string, not raise
+    out = reg.execute("bad_schema", {}, allowed=["bad_schema"])
+    assert isinstance(out, str)
+    parsed = json.loads(out)
+    assert "error" in parsed
+
+
+def test_T2_unhashable_name_does_not_raise():
+    """T2: unhashable name (e.g. dict) doesn't raise execute()."""
+    reg = ToolRegistry()
+    reg.register(_echo_tool())
+    # Unhashable name would raise TypeError in `name not in self._tools`
+    out = reg.execute({}, {}, allowed=[])  # type: ignore
+    assert isinstance(out, str)
+    parsed = json.loads(out)
+    assert "error" in parsed
+
+
+def test_T3_exception_with_broken_str_does_not_raise():
+    """T3: tool raising exception whose __str__ raises doesn't crash execute()."""
+    class BrokenStrException(Exception):
+        def __str__(self):
+            raise ValueError("__str__ is broken!")
+
+    reg = ToolRegistry()
+    reg.register(ToolDef(
+        "broken_str", "d",
+        {"type": "object", "properties": {}},
+        func=lambda: (_ for _ in ()).throw(BrokenStrException("original"))))
+
+    out = reg.execute("broken_str", {}, allowed=["broken_str"])
+    assert isinstance(out, str)
+    parsed = json.loads(out)
+    assert "error" in parsed
+    # Should contain the exception type name even if __str__ fails
+    assert "BrokenStrException" in parsed["error"]
+
+
+def test_T4_exception_text_does_not_leak_secrets():
+    """T4: exception with secrets is sanitized (no URLs, no token values)."""
+    reg = ToolRegistry()
+    reg.register(ToolDef(
+        "secret_leaker", "d",
+        {"type": "object", "properties": {}},
+        func=lambda: (_ for _ in ()).throw(
+            RuntimeError("failed for https://user:secret@example.test/x?token=SECRET&apikey=KEY"))))
+
+    out = reg.execute("secret_leaker", {}, allowed=["secret_leaker"])
+    parsed = json.loads(out)
+    error_text = parsed["error"]
+
+    # Must not leak:
+    assert "example.test" not in error_text
+    assert "SECRET" not in error_text
+    assert "https://" not in error_text
+    # But should indicate it was sanitized
+    assert "<url>" in error_text or "apikey=***" in error_text
+
+
+def test_T5_allowed_but_unregistered_returns_error_not_keyerror():
+    """T5: tool in allowed but not registered returns error string, not KeyError."""
+    reg = ToolRegistry()
+    # Don't register "missing"
+    out = reg.execute("missing", {}, allowed=["missing"])
+    assert isinstance(out, str)
+    parsed = json.loads(out)
+    assert "error" in parsed
+    # Should mention "not allowed" (because it's not in self._tools)
+    assert "not allowed" in parsed["error"] or "missing" in parsed["error"]
+
+
+def test_T6_openai_tools_includes_full_schema_and_description():
+    """T6: openai_tools result includes description and full parameters schema."""
+    reg = ToolRegistry()
+    reg.register(ToolDef(
+        "test_tool", "This is the description",
+        {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]},
+        func=lambda x: x))
+
+    schemas = reg.openai_tools(["test_tool"])
+    assert len(schemas) == 1
+    func_def = schemas[0]["function"]
+
+    # Must have description
+    assert func_def["description"] == "This is the description"
+    # Must have full parameters
+    assert func_def["parameters"]["type"] == "object"
+    assert "x" in func_def["parameters"]["properties"]
+    assert "x" in func_def["parameters"]["required"]
+
+
+def test_T7_non_ascii_output_not_escaped():
+    """T7: tool returning non-ASCII characters preserves them as literals, not \\uXXXX."""
+    reg = ToolRegistry()
+    reg.register(ToolDef(
+        "unicode_tool", "d",
+        {"type": "object", "properties": {}},
+        func=lambda: {"msg": "円高"}))
+
+    out = reg.execute("unicode_tool", {}, allowed=["unicode_tool"])
+    # Should contain literal 円 and 高, not \u####
+    assert "円" in out
+    assert "高" in out
+    assert "\\u" not in out
+
+
+def test_T8_mutating_openai_tools_result_does_not_affect_execute():
+    """T8: mutating the dict from openai_tools doesn't affect subsequent execute validation."""
+    schema = {
+        "type": "object",
+        "properties": {"n": {"type": "integer"}},
+        "required": ["n"]
+    }
+    reg = ToolRegistry()
+    reg.register(ToolDef(
+        "mutate_test", "d",
+        schema,
+        func=lambda n: n))
+
+    # Get openai_tools and mutate the returned schema
+    schemas = reg.openai_tools(["mutate_test"])
+    returned_schema = schemas[0]["function"]["parameters"]
+    returned_schema["required"] = []  # Mutate to remove requirement
+
+    # Now execute should still validate against the original schema
+    # (with "n" required), not the mutated one
+    out = reg.execute("mutate_test", {}, allowed=["mutate_test"])
+    parsed = json.loads(out)
+    # Should fail validation because "n" is still required in the original
+    assert "error" in parsed
