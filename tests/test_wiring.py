@@ -68,13 +68,13 @@ def _env(tmp_path, now, on_econ_cycle=None):
     collector = NewsCollector(
         conn, Rag(tmp_path / "rag", embedding_function=FakeEmbedding()),
         activity, clock)
-    trade_calls: list[int] = []
+    trade_calls: list[str] = []
     econ_calls: list[int] = []
     scheduler = Scheduler(
         conn=conn, executor=executor, settings=settings, state_store=state,
         activity=activity,
         bars_fn=provider.latest_1m_bar,          # ★ 注入点
-        on_trade_mission=lambda: trade_calls.append(1),
+        on_trade_mission=lambda reason: trade_calls.append(reason),
         on_news_cycle=collector.collect,         # ★ 注入点
         # econ は既定ではカウンタ (EconCalendar.refresh は fetch_ff_calendar を
         # 直接呼ぶため、既定で渡すとこのファイルの全 tick が外部アクセスする)
@@ -100,7 +100,7 @@ def test_scheduler_bars_fn_accepts_latest_1m_bar(tmp_path):
                return_value=_bars()) as m:
         scheduler.tick(OPEN_NOW)
     assert m.called                     # latest_1m_bar → get_bars → sources
-    assert trade_calls == [1]
+    assert trade_calls == ["cron"]  # trigger が on_trade_mission まで伝搬する
 
 
 def test_scheduler_bars_fn_tolerates_unhealthy_feed(tmp_path):
@@ -109,7 +109,7 @@ def test_scheduler_bars_fn_tolerates_unhealthy_feed(tmp_path):
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("offline")):
         scheduler.tick(OPEN_NOW)        # DataUnhealthy を漏らさない
-    assert trade_calls == [1]
+    assert trade_calls == ["cron"]  # trigger が on_trade_mission まで伝搬する
 
 
 def test_scheduler_news_cycle_accepts_collector_collect(tmp_path):

@@ -1,21 +1,54 @@
-"""起動シーケンス: init ウィザードと起動ガード — 設計書 §8。
-本プランのスコープは基盤部分のみ (価格ソース接続確認はプラン 3、llama-swap 確認はプラン 5 で追加)。"""
+"""起動シーケンス (init ウィザード・起動ガード) とサービス本体の配線 — 設計書 §8。
+
+`build_app` が全部品 (決定論的コア + 2 つの loop + Commands) を配線し、
+`run_service` が scheduler スレッド・watchdog スレッド・対話シェル/daemon 待機・
+graceful shutdown を担う (Phase 1 プラン 5)。
+"""
 from __future__ import annotations
 
+import logging
+import os
 import shutil
+import signal
 import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+
+import jsonschema
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
+from agentic_fx.commands import Commands
 from agentic_fx.config import load_settings
-from agentic_fx.core.contracts import Mode, SystemClock
+from agentic_fx.core.contracts import Clock, Mode, SystemClock
+from agentic_fx.core.executor import Executor
+from agentic_fx.core.notifier import Notifier
+from agentic_fx.core.paper_broker import PaperBroker
+from agentic_fx.core.scheduler import Scheduler
+from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
-from agentic_fx.datafeed.news_collector import seed_default_sources
+from agentic_fx.datafeed.news_collector import NewsCollector, seed_default_sources
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.logging_setup import setup_technical_logging
+from agentic_fx.loops import reflection_cycle
+from agentic_fx.loops.mission_watch import MissionWatch
+from agentic_fx.loops.reflection_cycle import ReflectionCycle
+from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
+from agentic_fx.loops.trade_loop import _TRADE_TOOLS, TradeLoop
+from agentic_fx.policy import Policy
+from agentic_fx.runners.base import AgentRunner
+from agentic_fx.runners.local_runner import LocalRunner
+from agentic_fx.store import approvals, orders
 from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.rag import Rag
 from agentic_fx.store.state import StateStore
+from agentic_fx.tools import account_tools, market_tools, news_tools, reflection_tools
+from agentic_fx.tools.registry import ToolRegistry
+
+_log = logging.getLogger("agentic_fx.service")
 
 
 def _state_store(root: Path) -> StateStore:
@@ -27,6 +60,46 @@ def ensure_initialized(root: Path) -> None:
         print("初期化が完了していません。先に `uv run main.py init` を実行してください。",
               file=sys.stderr)
         raise SystemExit(2)
+
+
+def _check_llama_swap(settings) -> None:
+    """llama-swap 接続確認 (上書き 2)。一覧取得不能 / モデル不在 / cold-load
+    smoke 失敗の 3 種を区別して警告する。init から呼ばれる (失敗は警告のみ —
+    取引判断 Mission は実行時に fail closed で保護される)。"""
+    import httpx
+    base = settings.llama_swap.base_url
+    model = settings.runner.trade.model
+
+    try:
+        r = httpx.get(f"{base}/models", timeout=5)
+        r.raise_for_status()
+        ids = [m.get("id") for m in r.json().get("data", [])
+               if isinstance(m, dict)]
+    except (httpx.RequestError, httpx.HTTPStatusError,
+            ValueError, TypeError) as e:
+        print(f"警告: llama-swap のモデル一覧を取得できません ({e})。"
+              "取引判断 Mission は失敗として記録されます。")
+        return
+
+    if model not in ids:
+        print(f"警告: モデル '{model}' が llama-swap の /models に存在しません。"
+              f"alias 設定を確認してください (存在: {ids})")
+        return
+
+    try:
+        # cold-load smoke: TTL unload 後の初回 Mission がロード時間で
+        # timeout しないよう、1 トークン生成でロードを促す
+        r = httpx.post(f"{base}/chat/completions",
+                       json={"model": model, "max_tokens": 1,
+                             "messages": [{"role": "user", "content": "ping"}]},
+                       timeout=120)
+        r.raise_for_status()
+    except (httpx.RequestError, httpx.HTTPStatusError) as e:
+        print(f"警告: モデル '{model}' の cold-load smoke に失敗しました ({e})。"
+              "初回 Mission が timeout する可能性があります。")
+        return
+
+    print(f"llama-swap OK (model '{model}' loaded)")
 
 
 def run_init(root: Path) -> int:
@@ -73,6 +146,9 @@ def run_init(root: Path) -> int:
         # いても OK に見える (レビュー指摘 Minor-3)。
         print(f"価格ソース OK ({settings.pairs[0]}, source={source})")
 
+    # llama-swap 接続確認 (プラン 5 — 上書き 2)。失敗は警告のみ (init は成功させる)。
+    _check_llama_swap(settings)
+
     # learning への切替はモード遷移ガード (§3) を通る mode コマンドのみ。
     # init はガードの迂回路にしない: trading 中は mode/autopilot に触れない。
     store = _state_store(root)
@@ -92,8 +168,292 @@ def run_init(root: Path) -> int:
     return 0
 
 
-def run_service(root: Path) -> int:
+# ---- サービス本体配線 (プラン 5) -------------------------------------------
+
+
+@dataclass
+class App:
+    conn_core: object
+    conn_shell: object
+    settings: object
+    state: object
+    activity: object
+    broker: object
+    executor: object
+    provider: object
+    econ: object
+    collector: object
+    rag: object
+    trade_loop: object
+    reflection: object
+    scheduler: object
+    commands: object
+    registry: object
+    core_lock: threading.RLock
+    mission_watch: MissionWatch
+    notifier: object
+    runner: object
+    owns_runner: bool
+
+
+def _validate_startup(settings) -> None:
+    """起動時ガード (上書き 4): pairs 非空 + 実使用 schema の構文検証。
+
+    配線ミス (例: 壊れた schema 定義) を起動時の RuntimeError で殺す —
+    サイレントに Mission が全滅する事態を避ける。
+    """
+    if not settings.pairs:
+        raise RuntimeError("settings.pairs is empty — cannot start service")
+    schemas = (trade_intent_schema(settings.pairs), ANSWER_SCHEMA,
+              reflection_cycle._SCHEMA)
+    for schema in schemas:
+        try:
+            jsonschema.Draft202012Validator.check_schema(schema)
+        except jsonschema.exceptions.SchemaError as e:
+            raise RuntimeError(f"invalid tool/output schema: {e}") from e
+
+
+def _assert_tools_registered(registry: ToolRegistry, names: list[str]) -> None:
+    """配線ミスの即時検出 (上書き 5): 必要なツールが登録されていることを確認する。"""
+    missing = set(names) - set(registry.names())
+    if missing:
+        raise RuntimeError(f"tools not registered: {sorted(missing)}")
+
+
+class _LockedAsk:
+    """ask を Mission スロット (core_lock) 経由で実行する薄いラッパー。"""
+
+    def __init__(self, trade_loop: TradeLoop, lock: threading.RLock) -> None:
+        self._loop = trade_loop
+        self._lock = lock
+
+    def ask_once(self, question: str) -> str:
+        with self._lock:
+            return self._loop.ask_once(question)
+
+
+def build_app(root: Path, *, runner: AgentRunner | None = None,
+              clock: Clock | None = None, quote_fn=None, spec_fn=None,
+              bars_fn=None) -> App:
+    """全部品を配線して `App` を返す。
+
+    quote_fn / spec_fn / bars_fn は E2E テストの注入点 (None なら provider の
+    実装を使う — build 後の patch では bound 済みクロージャに届かないため
+    注入で解決する)。
+    """
+    clock = clock or SystemClock()
+    settings = load_settings(root / "config" / "settings.yaml")
+
+    state = _state_store(root)
+    activity = ActivityLog(root / "logs" / "activity.log")
+    conn_core = connect(root / "data" / "agentic.db")
+    init_db(conn_core)
+    conn_shell = connect(root / "data" / "agentic.db")
+
+    provider = PriceProvider(conn_core, settings, clock)
+    quote_fn = quote_fn or provider.get_quote
+    spec_fn = spec_fn or provider.spec
+    bars_fn = bars_fn or provider.latest_1m_bar
+
+    def rate_fn(ccy: str, account_ccy: str, now: datetime):
+        return provider.to_account_rate(
+            ccy, account_ccy, reference_ts=now,
+            max_skew_min=settings.datafeed.conversion_skew_max_min)
+
+    econ = EconCalendar(conn_core, activity, clock)
+    rag = Rag(root / "data" / "rag")
+    collector = NewsCollector(conn_core, rag, activity, clock)
+    broker = PaperBroker(conn_core, settings, clock)
+    notifier = Notifier(enabled=settings.discord.enabled,
+                        webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"))
+    executor = Executor(conn=conn_core, broker=broker, settings=settings,
+                        state_store=state, activity=activity,
+                        notifier=notifier, clock=clock,
+                        quote_fn=quote_fn, spec_fn=spec_fn, rate_fn=rate_fn)
+
+    registry = ToolRegistry()
+    registry.register_all(market_tools.build(provider, econ, settings))
+    registry.register_all(news_tools.build(rag))
+    registry.register_all(account_tools.build(conn_core, broker))
+    # 上書き 6: reflection_tools.build は pairs が必須引数 (Task 0-8)
+    registry.register_all(reflection_tools.build(conn_core, rag, settings.pairs))
+    # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
+    _validate_startup(settings)
+    _assert_tools_registered(registry, _TRADE_TOOLS)
+
+    owns_runner = runner is None
+    if runner is None:
+        runner = LocalRunner(base_url=settings.llama_swap.base_url,
+                             model=settings.runner.trade.model,
+                             registry=registry)
+
+    policy = Policy(root / "policy" / "directives.md")
+    # 上書き 3: MissionWatch は 1 インスタンスを trade_loop / reflection に共有注入
+    mission_watch = MissionWatch()
+    trade_loop = TradeLoop(conn=conn_core, runner=runner, settings=settings,
+                           executor=executor, provider=provider, econ=econ,
+                           policy=policy, activity=activity,
+                           notifier=notifier, clock=clock,
+                           watch=mission_watch)
+    reflection = ReflectionCycle(conn=conn_core, runner=runner, rag=rag,
+                                 settings=settings, activity=activity,
+                                 clock=clock, watch=mission_watch)
+
+    core_lock = threading.RLock()
+
+    def on_trade_mission(trigger: str) -> None:
+        # tick 全体が core_lock 下で走る (RLock のため再取得も安全)。
+        # trigger は scheduler._trade_mission_due() が返した起動理由。
+        # ここで捨てると missions.trigger が常に既定値になり監査列が死ぬ
+        # (上書き 1 参照)。
+        with core_lock:
+            trade_loop.run_once(trigger)
+            reflection.run_pending()
+
+    scheduler = Scheduler(conn=conn_core, executor=executor,
+                          settings=settings, state_store=state,
+                          activity=activity, bars_fn=bars_fn,
+                          on_trade_mission=on_trade_mission,
+                          on_news_cycle=collector.collect,
+                          on_econ_cycle=econ.refresh)
+
+    # Commands は conn_shell 束縛の broker を持つ (conn_core をシェルスレッドから触らない)
+    shell_broker = PaperBroker(conn_shell, settings, clock)
+    commands = Commands(conn=conn_shell, state_store=state,
+                        broker=shell_broker,
+                        trade_loop=_LockedAsk(trade_loop, core_lock),
+                        activity=activity, log_dir=root / "logs", clock=clock)
+    return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
+               state=state, activity=activity, broker=broker,
+               executor=executor, provider=provider, econ=econ,
+               collector=collector, rag=rag, trade_loop=trade_loop,
+               reflection=reflection, scheduler=scheduler, commands=commands,
+               registry=registry, core_lock=core_lock,
+               mission_watch=mission_watch, notifier=notifier,
+               runner=runner, owns_runner=owns_runner)
+
+
+def build_splash(app: App) -> str:
+    """起動スプラッシュ。項目は最小でよい (運用しながら調整 — 設計書 §8)。
+
+    transcript_json は機微データなので出さない (grep で自己確認済み)。
+    """
+    s = app.state.load()
+    balance, equity = app.commands.broker.equity()  # conn_shell 側
+    pending = len(approvals.pending(app.conn_shell))
+    limits = len(orders.list_by_status(app.conn_shell, "pending_fill"))
+    return (
+        "=== agentic-fx ===\n"
+        f"mode: {s.mode.value} / autopilot: {'on' if s.autopilot else 'off'}"
+        f" / kill switch: {'LATCHED' if s.kill_switch_latched else 'ok'}\n"
+        f"pairs: {', '.join(app.settings.pairs)}\n"
+        f"runner: {app.settings.runner.trade.backend}"
+        f" ({app.settings.runner.trade.model})\n"
+        f"risk: {app.settings.risk.risk_per_trade_pct}%/trade,"
+        f" DD kill {app.settings.risk.drawdown_kill_pct}%,"
+        f" daily {app.settings.risk.daily_loss_limit_pct}%\n"
+        f"残高: {balance:,.0f} / 承認待ち: {pending} / 未約定指値: {limits}\n"
+        "コマンドは help を参照。stop で終了。")
+
+
+def _watchdog_tick(app: App) -> None:
+    """1 回分の watchdog 監視 (上書き 3)。activity/notifier の失敗はスレッドを
+    殺さない — 呼び出し元 (watchdog スレッド) 側も広い try で包む。
+
+    missions 行には書かない (finalize の所有者は TradeLoop/ReflectionCycle の
+    `_run_recorded` の finally のみ — 二重終端を作らない)。
+    """
+    entry = app.mission_watch.breached(grace_sec=60)
+    if entry is None:
+        return
+    elapsed = time.monotonic() - entry.started
+    try:
+        app.activity.write(
+            Category.SYSTEM, "mission_watchdog_breach",
+            f"mission_id={entry.mission_id} loop={entry.loop} "
+            f"elapsed={elapsed:.0f}s (timeout={entry.timeout_sec:.0f}s)")
+    except Exception:  # noqa: BLE001
+        _log.exception("watchdog activity write failed")
+    try:
+        app.notifier.send(
+            f"[agentic-fx] Mission #{entry.mission_id} ({entry.loop}) が"
+            f" 想定時間 ({entry.timeout_sec:.0f}s) を超過しています"
+            f" (経過 {elapsed:.0f}s)")
+    except Exception:  # noqa: BLE001
+        _log.exception("watchdog notifier send failed")
+    try:
+        # Mission あたり 1 回だけ通知する (breached() は notified=True 以降 None を返す)
+        app.mission_watch.mark_notified(entry.mission_id)
+    except Exception:  # noqa: BLE001
+        _log.exception("watchdog mark_notified failed")
+
+
+def run_service(root: Path, *, daemon: bool = False) -> int:
     ensure_initialized(root)
-    # サービス本体 (scheduler / 対話シェル) はプラン 5 で実装する。
-    print("起動ガードを通過しました。サービス本体は Phase 1 プラン 5 で実装されます。")
+    settings = load_settings(root / "config" / "settings.yaml")
+    setup_technical_logging(root / "logs", settings.logging.level,
+                            daemon=daemon)
+    app = build_app(root)
+
+    warning = Policy(root / "policy" / "directives.md").size_warning()
+    if warning:
+        print(warning)
+    print(build_splash(app))
+    app.activity.write(Category.SYSTEM, "service_started",
+                       f"daemon={daemon}")
+
+    stop_event = threading.Event()
+
+    def scheduler_thread() -> None:
+        last = 0.0
+        while not stop_event.is_set():
+            if time.monotonic() - last >= 60:
+                last = time.monotonic()
+                if stop_event.is_set():
+                    break  # 停止フェーズ: 新しい tick を開始しない
+                try:
+                    with app.core_lock:
+                        app.scheduler.tick(datetime.now(timezone.utc))
+                except Exception:  # noqa: BLE001
+                    _log.exception("tick failed")
+            stop_event.wait(1)
+
+    def watchdog_thread() -> None:
+        while not stop_event.is_set():
+            stop_event.wait(30)
+            if stop_event.is_set():
+                break
+            try:
+                _watchdog_tick(app)
+            except Exception:  # noqa: BLE001 — スレッドを殺さない
+                _log.exception("watchdog tick failed")
+
+    th = threading.Thread(target=scheduler_thread, daemon=True)
+    th.start()
+    wd = threading.Thread(target=watchdog_thread, daemon=True)
+    wd.start()
+
+    if daemon:
+        signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+        signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+        while not stop_event.is_set():
+            stop_event.wait(1)
+    else:
+        from agentic_fx.shell import run_shell
+        run_shell(app.commands, stop_event)
+
+    # graceful shutdown: scheduler スレッドの終了を確認してから記録する
+    # (tick は core_lock 下で走るため、join 完了 = 実行中 Mission も完了)
+    th.join(timeout=30)
+    wd.join(timeout=5)
+    if th.is_alive():
+        app.activity.write(Category.SYSTEM, "service_stopped",
+                           "shutdown_timeout (Mission 継続中の可能性)")
+        print("警告: 停止タイムアウト。実行中の処理が残っている可能性があります。")
+        return 1
+    # 上書き 7: join 成功時のみ close する (使用中の client を別スレッドから閉じない)
+    if app.owns_runner and isinstance(app.runner, LocalRunner):
+        app.runner.close()
+    app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
+    print("停止しました。")
     return 0

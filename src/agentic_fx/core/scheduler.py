@@ -40,7 +40,7 @@ class Scheduler:
                  settings: Settings, state_store: StateStore,
                  activity: ActivityLog,
                  bars_fn: Callable[[str], Bar | None],
-                 on_trade_mission: Callable[[], None],
+                 on_trade_mission: Callable[[str], None],
                  on_news_cycle: Callable[[], None],
                  on_econ_cycle: Callable[[], None]) -> None:
         self.conn = conn
@@ -184,11 +184,24 @@ class Scheduler:
         # 効かなくなった場合に備えて、約定側にも独立した条件を置く。
         filled_ids = self._process_limit_fills(now) if fills_allowed else set()
         self._process_exits(now, filled_ids)
-        if self._last_trade is None or now - self._last_trade >= timedelta(hours=1):
+        reason = self._trade_mission_due(now)
+        if reason:
             self._last_trade = now
-            self.on_trade_mission()
+            self.on_trade_mission(reason)
 
     # ---- internal -------------------------------------------------------
+
+    def _trade_mission_due(self, now: datetime) -> str | None:
+        """毎時 Mission の起動要否と起動理由を返す (上書き 1 — 設計書改訂 5)。
+
+        現状の起動条件は cron (1 時間毎) のみなので理由は常に ``"cron"``。
+        戻り値を `str | None` にしておくことで、将来トリガー種別が増えても
+        `tick()` 側を変更せずに済む (missions.trigger の監査列を殺さないため
+        `on_trade_mission` には必ず理由を渡す)。
+        """
+        if self._last_trade is None or now - self._last_trade >= timedelta(hours=1):
+            return "cron"
+        return None
 
     def _run_data_hook(self, kind: str, fn: Callable[[], None]) -> None:
         """ニュース / econ の収集フックを fail-open で呼ぶ。

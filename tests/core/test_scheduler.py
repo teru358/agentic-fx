@@ -69,6 +69,7 @@ class Env:
         self.tmp_path = tmp_path
         self.bars: dict[str, Bar] = {}
         self.trade_calls = 0
+        self.trade_reasons: list[str] = []
         self.news_calls = 0
         self.econ_calls = 0
         self._news_fn = news_fn
@@ -89,8 +90,9 @@ class Env:
             on_trade_mission=self._trade, on_news_cycle=self._news,
             on_econ_cycle=self._econ)
 
-    def _trade(self):
+    def _trade(self, reason):
         self.trade_calls += 1
+        self.trade_reasons.append(reason)
 
     def _news(self):
         self.news_calls += 1
@@ -120,6 +122,26 @@ def test_hourly_trade_mission(tmp_path):
     assert env.trade_calls == 1  # まだ 1 時間経っていない
     env.sched.tick(WED + timedelta(hours=1))
     assert env.trade_calls == 2
+
+
+def test_trade_mission_due_reasons(tmp_path):
+    """上書き 1: `_trade_mission_due` 単体の起動理由 (初回 cron / 1 時間未満
+    None / 1 時間経過で再度 cron)。"""
+    env = Env(tmp_path)
+    assert env.sched._trade_mission_due(WED) == "cron"      # 初回
+    env.sched._last_trade = WED
+    assert env.sched._trade_mission_due(WED + timedelta(minutes=30)) is None
+    assert (env.sched._trade_mission_due(WED + timedelta(hours=1))
+            == "cron")
+
+
+def test_tick_passes_trade_mission_reason_to_callback(tmp_path):
+    """上書き 1: tick 経由で `on_trade_mission` が起動理由 "cron" を受け取る。"""
+    env = Env(tmp_path)
+    env.sched.tick(WED)
+    assert env.trade_reasons == ["cron"]
+    env.sched.tick(WED + timedelta(hours=1))
+    assert env.trade_reasons == ["cron", "cron"]
 
 
 def test_market_closed_runs_data_cycles_but_no_trade_mission(tmp_path):

@@ -46,6 +46,18 @@ def mock_price_check():
         yield mock
 
 
+@pytest.fixture(autouse=True)
+def mock_llama_swap_check():
+    """既定で llama-swap 接続確認をモックする (上書き 2)。
+
+    `_check_llama_swap` 自体を patch する — mock 漏れで timeout=120 の
+    実待ちが混入するのを防ぐ。挙動そのものを検証するテストは
+    tests/test_service_app.py 側に置く。
+    """
+    with patch("agentic_fx.service._check_llama_swap") as mock:
+        yield mock
+
+
 @pytest.fixture
 def real_price_provider(mock_price_check):
     """autouse のモックの上に本物のクラスを被せる (opt-in)。"""

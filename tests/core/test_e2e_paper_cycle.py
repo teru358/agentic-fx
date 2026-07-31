@@ -54,7 +54,7 @@ def test_full_paper_cycle(tmp_path):
     sched = Scheduler(conn=conn, executor=executor, settings=SETTINGS,
                       state_store=state, activity=activity,
                       bars_fn=lambda p: bars.get(p),
-                      on_trade_mission=lambda: None,
+                      on_trade_mission=lambda reason: None,
                       on_news_cycle=lambda: None,
                       on_econ_cycle=lambda: None)
 
