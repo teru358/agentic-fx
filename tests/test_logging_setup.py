@@ -48,3 +48,14 @@ def test_technical_log_timestamps_are_utc(tmp_path):
     logger.info("utc-timestamp-check")
     text = (tmp_path / "agentic.log").read_text(encoding="utf-8")
     assert "UTC" in text
+
+
+def test_daemon_adds_stderr_handler(tmp_path):
+    logger = setup_technical_logging(tmp_path, daemon=True)
+    kinds = [type(h).__name__ for h in logger.handlers]
+    assert "RotatingFileHandler" in kinds
+    assert "StreamHandler" in kinds
+    # daemon=False に戻すと stderr handler は外れる
+    logger2 = setup_technical_logging(tmp_path, daemon=False)
+    assert [type(h).__name__ for h in logger2.handlers] == [
+        "RotatingFileHandler"]
