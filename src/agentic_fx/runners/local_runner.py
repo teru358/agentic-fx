@@ -120,7 +120,8 @@ class LocalRunner(AgentRunner):
                         result = json.dumps(
                             {"error": f"tool arguments are not valid JSON: {e}"})
                     except (TypeError, KeyError) as e:
-                        _log.warning("tool_call shape validation failed: %s", e)
+                        _log.warning("tool_call shape validation failed: %s",
+                                     safe_error_text(e))
                         return _finish("failed")
                     messages.append({"role": "tool", "tool_call_id": tc["id"],
                                      "content": result})
