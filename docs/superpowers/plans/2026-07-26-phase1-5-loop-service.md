@@ -2048,3 +2048,212 @@ def test_trade_mission_due_returns_cron_then_none():
 - シグナルは `pending / claimed / consumed / abandoned` の 4 状態。claim は原子的に行い、Mission 失敗時は `pending` へ戻す (再キュー上限あり)。lease 期限切れの `claimed` は回収する
 - **cron の締切とシグナルのレート制限を別変数で持つ** (`_last_cron_mission` / `_last_signal_mission`)。シグナル起動で cron の締切を後ろへずらすと、シグナルが続く限り定期実行が事実上停止する
 - レート制限は口座全体の単位・DB 永続。排他スロットは**非ブロッキング取得**にし、取れなければ起動を諦めてシグナルは `pending` に残す
+
+---
+
+## 追記 (2026-07-31): プラン 4 吸収事項の織り込み (16 項目)
+
+出典: プラン 4 レジャー (`.superpowers/sdd/2026-07-26-phase1-4-runner-tools/progress.md`) 末尾「プラン 5 が吸収すべき事項」。プラン 4 の最終ブランチレビュー (fable)・codex 節目レビュー・fix wave 再レビューで「プラン 5 送り」と裁定された全項目を、本プランの各 Task に割り当てる。**本追記はプラン本文と同格の要求仕様であり、衝突時は本追記が優先する** (本文より新しい裁定のため)。
+
+### 冒頭「消費する契約 (変更禁止)」への例外
+
+本追記の実施のため、以下の**プラン 4 成果物の変更を許可する** (それ以外は引き続き変更禁止):
+
+| ファイル | 許可する変更 | 該当項目 |
+|---|---|---|
+| `src/agentic_fx/runners/local_runner.py` | A-6 の分岐ガード追加 / `close()` 追加 / W6 コメント数値修正 | A-6, chore |
+| `src/agentic_fx/tools/market_tools.py` | `_pair_param` の pair を enum 化 | A-4 |
+| `src/agentic_fx/tools/reflection_tools.py` | `build(conn, rag, pairs)` — pairs 引数追加 + pair enum 化 | A-4 |
+| `src/agentic_fx/tools/news_tools.py` | 射影の `.get()` 化 | chore |
+| `src/agentic_fx/datafeed/bars.py` | `bars_to_df` に昇順ソート追加 | A-8 |
+| `src/agentic_fx/store/reflections.py` | ORDER BY タイブレーク追加 | chore |
+
+既存テストの**期待値を弱める変更は不可** (whitelist ピン: get_ohlcv / get_indicators の properties キー集合は `{pair, timeframe}` のまま — enum 化は値の制約追加でありキー集合を変えない)。
+
+### Task 0 (新設): プラン 4 残穴 + chore 一括 — **Task 1 の前に実施**
+
+小粒・機械的な修正のバンドル。1 dispatch で完結させる。
+
+**Files:** Modify: `src/agentic_fx/runners/local_runner.py`, `src/agentic_fx/datafeed/bars.py`, `src/agentic_fx/store/reflections.py`, `src/agentic_fx/tools/news_tools.py` / Test: 各既存テストファイルに追記
+
+- [ ] **0-1 (A-6): tool_calls + 非文字列 content 複合形のガード** — `local_runner.py` の tool_calls 分岐 (`continue` の前) で、`normalized_msg` の content が `None` でも `str` でもない場合に W1 と同じ `json.dumps(content, ensure_ascii=False, default=str)` で文字列化する (W1 は content-only 分岐にしか効かず、複合形は素の非文字列のまま履歴に残り、型に厳しい互換サーバで次 POST が 400 になる — fix wave 再レビューの DEFER-TO-PLAN-5 裁定分)。**リトライ計上はしない** (tool_calls 分岐の意味論を変えない — 文字列化のみ)。テスト: tool_calls + dict content の応答 → 2 回目のリクエスト body で当該 assistant message の content が文字列であり、Mission は completed
+- [ ] **0-2 (chore): `LocalRunner.close()`** — `self._client.close()` を呼ぶメソッドを追加。テスト: close() が例外なく呼べることのみ。**所有権と終了経路は Task 7 で定義する** (A-1 実装の項を参照): `App` に `runner` と `owns_runner: bool` (build_app 内生成なら True、注入なら False) を追加し、shutdown で **`th.join(timeout=30)` が成功した場合のみ** `owns_runner and isinstance(runner, LocalRunner)` のとき close する。join タイムアウト時は close しない (使用中の client を別スレッドから閉じない)
+- [ ] **0-3 (chore): W5 ensure_ascii 回帰テスト** — ツール引数の破損 JSON (日本語を含む) → tool message の content に生の UTF-8 が残る (\\uXXXX エスケープでない) ことをピンする (fix wave W5 の revert 検知)
+- [ ] **0-4 (chore): W6 較正コメントの数値修正** — `tests/runners/` の `test_timeout_during_parse_retry` コメントを実測値に修正: **deadline=6.1、終端呼び出し n=11 t=6.6** (final-rereview.md の instrumented 実測。旧記載 deadline=5.5 / n=10 t=6.0 は誤り)。コメントのみの 1 行 diff
+- [ ] **0-5 (A-8): bars 昇順の防御ソート + 契約テスト** — `bars_to_df` の返す DataFrame を ts 昇順にソートする (`get_ohlcv` の `.tail(100)` = 「直近 100 本」は昇順前提。yfinance は昇順だが、Phase 3 の MT5 bridge がこの契約を知らずに壊すのを防ぐ)。実装は DataFrame 構築後に `return df.sort_index(kind="stable")` (同一 ts は入力順維持 — 安定ソート指定)。テスト: ①シャッフル入力 → 昇順 ②降順入力 → 昇順 ③空入力で columns / UTC index が維持される ④get_ohlcv の最終要素が最大 ts
+- [ ] **0-6 (chore): reflections の ORDER BY タイブレーク** — `recent_for_pair` / `recent` の `ORDER BY created_at DESC` に `, order_id DESC` (または `id DESC` — 実カラム名に合わせる) を追加。テスト: 同一 created_at の 2 行で決定的順序
+- [ ] **0-7 (chore): search_news 射影の `.get()` 化** — `{title, body, source_name}` 射影を `r.get(...)` にする (rag 側のメタデータ欠損行でツールが execute の例外経路に落ちない)。テスト: source_name 欠損の hit → エラーでなく `None` 入りで返る
+- [ ] **0-8 (A-4 前半): ツール schema の pair enum 化** — `market_tools._pair_param` の pair を `{"enum": list(settings.pairs)}` に (settings は既に build が受けている)。`reflection_tools.build(conn, rag, pairs: list[str])` に引数を追加し `get_recent_reflections` の pair を enum 化。**全呼び出し元を `rg -n "reflection_tools\.build" src tests` で洗い出して追随修正する** (現状 `tests/tools/test_tool_impls.py` に 3 箇所。本番配線は Task 7 — 上書き済みの `reflection_tools.build(conn_core, rag, settings.pairs)` を使う)。テスト: registry.execute で pairs 外の pair → validation エラー JSON (execute は無送出契約のまま)
+- [ ] **Commit**: `fix: プラン 4 残穴 (複合形ガード・pair enum・昇順契約) + chore 一括`
+
+### 割当表 (吸収 16 項目 → 実施 Task)
+
+| # | 項目 | 実施 Task | 裁定 | 種別 |
+|---|---|---|---|---|
+| A-1 | mission deadline のブロッキング外強制 + ツール資源 cap | Task 3 / 4 / 7 (MissionWatch) | **代替実装** (強制 → 検知+通知。preemption は Phase 2) | codex 必須 |
+| A-2 | /v1/models モデル ID 厳密検証 + cold-load smoke | Task 7 (init 上書き) | 実装 | codex 必須 |
+| A-3 | never-raise サービス境界 (schema 事前検証・finalize・slot 解放・transcript 機微) | Task 2 / 3 / 5 / 7 に分散 | 実装 (schema 検証は build_app 起動時 + テスト) | codex 必須 |
+| A-4 | pair を settings 由来 enum に | Task 0 (ツール schema) + Task 2 (intent schema) | 実装 | 最終レビュー M-1 |
+| A-5 | wiring assert `set(mission.tools) <= set(registry.names())` | Task 7 | 実装 | 最終レビュー M-6 |
+| A-6 | tool_calls + 非文字列 content 複合形ガード | Task 0 | 実装 | DEFER-TO-PLAN-5 |
+| A-7 | wiring テストは本番ファクトリ import | Task 7 / 8 (レビュー制約) | 実装 (制約) | 繰り越し |
+| A-8 | バー昇順の契約テスト | Task 0 | 実装 | 繰り越し |
+| A-9 | EURUSD 解禁 hard precondition 2 件 | 非対象 | **明示見送り** (解禁前チェックリストとして記録) | 繰り越し |
+| A-10 | snapshot 順序再設計 / ask 回答専用 | 前者は非対象、後者は本文 Task 3 で織り込み済み | 前者 **明示見送り** (バックテスト spec 時) / 後者 実装済み | 繰り越し |
+| chore | タイブレーク / close() / W5 / W6 / .get() | Task 0 | 実装 | chore |
+| chore | mypy 導入 | 非対象 | **明示見送り** (Phase 1 完了後の独立 chore) | chore |
+
+### A-1: mission deadline の外部強制 — 裁定と実装 (Task 7)
+
+**裁定: Phase 1 は「検知 + 通知」方式とし、preemption (強制中断) は Phase 2 のプロセス隔離まで送る。**
+
+根拠: ①Python スレッドは外部から kill できない ②実行放棄 (thread abandon) は、ツール群が保持する conn_core を放棄スレッドと次 tick が同時使用する競合を作り、ハング以上の正しさ危険がある ③現実のハング源は llama-swap HTTP で、httpx per-phase timeout (残り時間渡し) + localhost + monit watchdog + プラン 3 ツール自前 timeout が既に押さえている ④埋まっていない穴は「15 分想定の Mission が 3 時間走っても誰も気付かない」という**可観測性**であり、これは watchdog で閉じる。
+
+**注意 (縮退の明示)**: この裁定により「timeout_sec で必ず抜ける」は Phase 1 では**保証されない** (LocalRunner の各段 deadline 確認 + httpx per-phase timeout による近似のみ)。Phase 2 の preemption 実装 (プロセス隔離) の受入条件: worker process への Mission 隔離 / 子プロセス側 DB 接続の分離 / 親の壁時計監視と terminate→kill エスカレーション / kill 後の missions 行 timeout finalize / transcript の保存範囲 (kill 時点までの部分 transcript) の定義。
+
+**ツール資源 cap**: 総ツール実行数は既に `max_turns × _MAX_TOOL_CALLS_PER_TURN(=16)` で上界がある (プラン 4 W3)。新規コードは追加しない。
+
+**計測点 (codex レビュー指摘)**: watch の begin/end は複合コールバック (`on_trade_mission` = trade + reflection をまとめて実行) に置いては**いけない** — 計測対象が「run_once 全時間 + run_pending 全時間」になり、個別 Mission の timeout と一致しない (trade 250 秒正常完了 + reflection 150 秒実行中 = 合算 400 秒で、deadline 内の reflection を誤 breach する)。begin/end は**個々の `runner.run(mission)` を所有する層**に置く: `TradeLoop._run_recorded` (trade / ask を loop 引数で区別) と `ReflectionCycle._reflect_one` の runner 呼び出し部。
+
+**実装**:
+
+- **Task 3**: `src/agentic_fx/loops/mission_watch.py` に `MissionWatch` を新設:
+
+```python
+@dataclass(frozen=True)
+class MissionWatchEntry:
+    mission_id: int
+    loop: str
+    started: float
+    timeout_sec: float
+    notified: bool = False
+
+class MissionWatch:
+    def __init__(self, time_fn=time.monotonic) -> None:
+        self._lock = threading.Lock()
+        self._entry: MissionWatchEntry | None = None
+        self._time = time_fn
+
+    def begin(self, mission_id: int, loop: str, timeout_sec: float) -> None:
+        with self._lock:
+            if self._entry is not None:
+                # 全 Mission は core_lock 下で直列のため通常起きない。
+                # 起きても raise しない (begin の例外で missions.finish が
+                # 飛ばされる方が害が大きい) — 警告して上書き
+                _log.warning("mission watch slot occupied by #%s — overwriting",
+                             self._entry.mission_id)
+            self._entry = MissionWatchEntry(mission_id, loop, self._time(),
+                                            timeout_sec)
+
+    def end(self, mission_id: int) -> None:
+        with self._lock:
+            if self._entry is not None and self._entry.mission_id == mission_id:
+                self._entry = None
+
+    def mark_notified(self, mission_id: int) -> None: ...   # notified を True に
+
+    def breached(self, grace_sec: float = 60.0) -> MissionWatchEntry | None:
+        """timeout + grace 超過かつ未通知なら entry を返す。それ以外 None。"""
+```
+
+  `TradeLoop.__init__` / `ReflectionCycle.__init__` に `watch: MissionWatch | None = None` を追加 (None なら内部で新規生成 — 既存テストは無変更で通る)。`_run_recorded` (と ReflectionCycle の同型部) で `watch.begin(mid, loop, mission.timeout_sec)` を **try ブロックの内側**で呼び、finally で `watch.end(mid)` (begin が万一失敗しても finish が必ず走る順序にする)
+- **Task 4**: ReflectionCycle の runner 呼び出しを同型で begin/end する (loop="reflection")
+- **Task 7**: build_app が `MissionWatch` を 1 つ生成して TradeLoop / ReflectionCycle に注入し、`App.mission_watch` に持つ。run_service に watchdog スレッド (30 秒毎): `entry = app.mission_watch.breached(grace_sec=60)` が entry を返したら activity SYSTEM `mission_watchdog_breach` (mission_id / loop / 経過秒を含める) + notifier 通知し `mark_notified(entry.mission_id)` (**Mission あたり 1 回だけ**)。**missions 行には書かない** (行の finalize は `_run_recorded` の finally が唯一の所有者 — 二重終端を作らない)
+- テスト (fake monotonic clock で、スレッドは使わない): ①timeout+grace 未満は breached() が None ②超過で entry ③mark_notified 後は None ④end 後は None ⑤別 Mission の begin で notified がリセットされる (新 entry) ⑥trade 終了 → reflection 開始のとき、trade 開始からの合算でなく reflection 開始からの経過で判定される。watchdog スレッド配線は E2E では検証しない (スリープ依存テストを作らない — Task 7 セルフレビューで確認)
+
+### A-2: llama-swap init 検証の上書き (Task 7)
+
+本文 Task 7 の「`GET {base_url}/models`、失敗は警告のみ」を以下に**置き換える** (警告のみの方針は維持 — init は助言であり、サービスはオフラインでも起動できる)。3 種の失敗 (一覧取得不能 / モデル不在 / smoke 失敗) を**構造で区別する** — 単一 try に潰すと POST の 4xx/5xx を「OK」と誤報する (codex レビュー Critical 1):
+
+```python
+def _check_llama_swap(settings) -> None:
+    import httpx
+    base = settings.llama_swap.base_url
+    model = settings.runner.trade.model
+
+    try:
+        r = httpx.get(f"{base}/models", timeout=5)
+        r.raise_for_status()
+        ids = [m.get("id") for m in r.json().get("data", [])
+               if isinstance(m, dict)]
+    except (httpx.RequestError, httpx.HTTPStatusError,
+            ValueError, TypeError) as e:
+        print(f"警告: llama-swap のモデル一覧を取得できません ({e})。"
+              "取引判断 Mission は失敗として記録されます。")
+        return
+
+    if model not in ids:
+        print(f"警告: モデル '{model}' が llama-swap の /models に存在しません。"
+              f"alias 設定を確認してください (存在: {ids})")
+        return
+
+    try:
+        # cold-load smoke: TTL unload 後の初回 Mission がロード時間で
+        # timeout しないよう、1 トークン生成でロードを促す
+        r = httpx.post(f"{base}/chat/completions",
+                       json={"model": model, "max_tokens": 1,
+                             "messages": [{"role": "user", "content": "ping"}]},
+                       timeout=120)
+        r.raise_for_status()
+    except (httpx.RequestError, httpx.HTTPStatusError) as e:
+        print(f"警告: モデル '{model}' の cold-load smoke に失敗しました ({e})。"
+              "初回 Mission が timeout する可能性があります。")
+        return
+
+    print(f"llama-swap OK (model '{model}' loaded)")
+```
+
+`run_init` はこの `_check_llama_swap(settings)` を呼ぶ。**既存の init テスト (`tests/test_init_and_guard.py` のオフライン系 3 本) には `_check_llama_swap` 自体を patch して適用する** — mock 漏れで `timeout=120` の実待ちが混入するのを防ぐ。テスト (httpx を mock): ①GET 成功・モデル在・POST 成功 → "OK" ②モデル不在 → 警告にモデル名 ③GET 接続例外 → 一覧取得警告 ④GET 500 → 同 ⑤POST 500 → smoke 警告 (「OK」を出さない) ⑥POST timeout → smoke 警告。
+
+### A-3: never-raise サービス境界の分散割当
+
+- **Task 2**: `TRADE_INTENT_SCHEMA` / `ANSWER_SCHEMA` / `trade_intent_schema(pairs)` の返り値に対し `jsonschema.Draft202012Validator.check_schema(...)` が通ることをテストでピンする
+- **Task 7 (起動時検証)**: schema はテストだけでは足りない — `trade_intent_schema(pairs)` は**実行時設定から動的生成**され、誤設定 (例: `pairs: []` → `"enum": []` は JSON Schema として不正) はテストでは検出できない。`build_app` が**実際に使用する schema** (trade = `trade_intent_schema(settings.pairs)` / ask = `ANSWER_SCHEMA` / reflection = `_SCHEMA`) を `Draft202012Validator.check_schema` で起動時検証し、失敗は `RuntimeError` で即落とす (A-5 の wiring assert と同じ「配線ミスは起動時に殺す」方針)。あわせて `settings.pairs` が空でないことも assert。テスト: `pairs: []` 相当の settings で build_app が `RuntimeError`
+- **Task 3 (never-raise 公開境界 — 本文 Task 3 の上書き)**: 本文の `_run_recorded` は `runner.run` しか包んでおらず、その外側に例外源が多数ある (healthcheck の非 DataUnhealthy 例外 / `_build_prompt` 内の OSError・SQLite 例外 / `missions.start` の sqlite3.Error / `from_llm_dict` の想定外 TypeError / `executor.handle_intent` / activity・notifier の書き込み失敗 / ask の `result.output["answer"]` の KeyError — codex レビュー Critical 2)。二層に分ける:
+  1. `run_once` / `ask_once` は**実装を `_run_once_impl` / `_ask_once_impl` に退避し、公開側は全体を `try/except Exception`** で包む (BaseException は捕らえない)。捕捉時: 技術ログ exception + activity SYSTEM `mission_boundary_failed` + notifier — この 3 つの報告自体も個別 try/except で握る (`_safe_report_boundary_failure(loop)`) — し、run_once は None、ask_once は `"(Mission 失敗: internal_error)"` を返す
+  2. `_run_recorded` の強化: runner の返り値が `MissionResult` でない場合も failed に正規化 / `missions.finish` 失敗は技術ログに加えて activity SYSTEM `mission_finalize_failed` を試行 (それも失敗したらログのみ) / MissionWatch の begin は try 内・end は finally (A-1 参照)
+  3. ask の completed 出力検証: `result.output` が dict でない・`answer` が str でない場合は失敗扱いの文字列を返す (FakeRunner 注入や LLM の schema すり抜けで KeyError にしない)
+  - テスト: healthcheck / build_state_summary / missions.start / runner / missions.finish / executor / activity / notifier のそれぞれに例外を注入し、公開境界 (`run_once` / `ask_once`) から**例外が漏れない**ことを 1 経路ずつ検証する
+- **Task 5 / 7**: **transcript_json は機微データ** (プロンプト = policy 全文の末尾 + 口座状態 + ニュース本文を含む)。シェルコマンド (`status` / `log` / `activity`)・スプラッシュ・notifier 通知のいずれにも transcript を出さない。保存先は missions.transcript_json のみ。レビュー constraints に明記
+- **Task 7**: core_lock の取得は **`with` 文限定** (手動 acquire/release 禁止 — 全終端経路での解放を構文で保証)。セルフレビューで `grep -n "core_lock.acquire\|core_lock.release" src/` がヒットしないこと。scheduler_thread の最外周 `except Exception` (本文どおり) はスレッド死亡防止であり Mission 単位の正規化の代替ではない — 両方必要
+
+### A-4 後半: TradeIntent schema の pair enum 化 (Task 2)
+
+本文 Task 2 の `TRADE_INTENT_SCHEMA` 定数はそのまま維持し (「pair enum なし」の基底形)、**`trade_intent_schema(pairs: list[str]) -> dict`** を追加する: `copy.deepcopy(TRADE_INTENT_SCHEMA)` に `properties.pair["enum"] = list(pairs)` を設定して返す。Task 3 の TradeLoop は `trade_intent_schema(self.settings.pairs)` を使う (**本文 Task 3 の `output_schema=TRADE_INTENT_SCHEMA` を上書き**)。
+
+最終防衛は引き続き `TradeIntent.from_llm_dict` + executor — enum は LLM への誘導と早期拒否 (schema リトライで LLM に「pairs 外」を伝えられる) であり、防衛線の置き換えではない。
+
+テスト (Task 2 に追加): `trade_intent_schema(["USDJPY"])` で `pair: "EURUSD"` の open が ValidationError / `TRADE_INTENT_SCHEMA` 自体は pair 自由のまま (基底形の回帰ピン)。
+
+**Task 7 の本番配線上書き (0-8 のシグネチャ変更の追随 — 漏らすと build_app が TypeError)**: 本文 Task 7 の `registry.register_all(reflection_tools.build(conn_core, rag))` を **`reflection_tools.build(conn_core, rag, settings.pairs)`** に置き換える (market_tools は既に settings を受けるため無変更)。テスト (Task 7 に追加): `build_app` 後、`app.registry.openai_tools(["get_ohlcv"])` の pair enum が `app.settings.pairs` と一致すること (配線がテスト用の値でなく本番 settings を通っている検証)。
+
+### A-5: wiring assert (Task 7)
+
+`build_app` の registry 組み立て直後に検証する:
+
+```python
+    missing = set(_TRADE_TOOLS) - set(registry.names())
+    if missing:
+        raise RuntimeError(f"tools not registered: {sorted(missing)}")
+```
+
+(`_TRADE_TOOLS` は trade_loop から import。`openai_tools` は未知名を無音で落とすため、typo は起動時に殺す — 最終レビュー M-6。) テスト: registry 登録を 1 つ欠いた状態を作り `RuntimeError` を確認 (検証部を関数 `_assert_tools_registered(registry, names)` に切り出すとテストしやすい)。
+
+### A-7: レビュー制約 (Task 7 / 8)
+
+配線のテストは**本番ファクトリ (`build_app`) を import して使う**こと。テストローカルに部品を再組み立てして配線を再現する形 (旧 `_env` 再構築) は、本番配線の欠陥を検出できないため禁止。本文 Task 7/8 のテストは既にこの形 — 追加テストにも同じ制約を適用する。
+
+### A-9: EURUSD 解禁前チェックリスト (非対象 — 記録のみ)
+
+Phase 1 は `pairs: [USDJPY]` のまま。EURUSD (クォート通貨 ≠ 口座通貨) を settings.pairs に足す前に、以下 2 件を実装・検証すること:
+
+1. pips→口座通貨換算 (為替レート取得) — settings.yaml.example のコメントに既記載
+2. `realized_pnl` が NULL の行を含む会計集計 (daily_start_equity / 累計 P&L) の正しさ検証
+
+pair enum 化 (A-4) により、settings に足さない限り LLM もツールも EURUSD に触れない — 解禁は settings 変更 + 上記 2 件が揃った時点の明示判断。
+
+### A-10 / その他の非対象裁定
+
+- **snapshot 順序依存の再設計**: バックテスト spec 追記 (プラン 5 完了後のタスク) で扱う。本プランでは触れない
+- **mypy 導入 (chore)**: 見送り。8 タスク全部のレビューに型ノイズが乗り、導入自体が全ファイル横断変更になる。Phase 1 完了後に独立 chore として実施する
+- **W1 による transcript 非逐語化** (再レビュー note): Task 4 の reflection は order 行 + intent reasoning を材料とし、**transcript を ground truth として使わない** (本文は既にその設計 — レビュー constraints に明記して固定する)
