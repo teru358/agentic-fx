@@ -88,11 +88,13 @@ def test_tool_call_missing_id():
 
 
 def test_content_not_string():
-    """T-F2: non-string content triggers repair path."""
-    # First message has dict content (not string), should be repaired
-    # Second attempt still has list content
-    # Third attempt still has int content
-    # Fourth attempt has valid string (but we're out of retries)
+    """T-F2: non-string content triggers repair path.
+
+    _MAX_REPAIR_RETRIES=2 allows 2 non-string attempts to continue
+    (parse_retries reaches 1, then 2); the 3rd non-string attempt makes
+    parse_retries=3 > 2, so exhaustion returns "failed" there. The 4th
+    (valid string) script entry is never reached/consumed.
+    """
     msgs = [
         {"role": "assistant", "content": {"action": "hold"}},
         {"role": "assistant", "content": ["invalid"]},
@@ -101,7 +103,6 @@ def test_content_not_string():
     ]
     runner, _ = _runner(msgs)
     r = runner.run(_mission())
-    # Should fail after 3 retries (default _MAX_REPAIR_RETRIES=2 allows up to 2 errors)
     assert r.status == "failed"
 
 
@@ -150,28 +151,14 @@ def test_timeout_during_parse_retry():
     call_count = {"n": 0}
 
     def fake_time():
-        # Each call increments by 1.0s. Calibrated so:
-        # Turns 1-2: complete within deadline (schema retries happen normally)
-        # Turn 3: schema_retries reaches 3 > _MAX_REPAIR_RETRIES (=2), calls _finish
-        #         and at that point timed_out() becomes True
-        # deadline = 6.0 (set below)
-        # Turn 1: n=1,t=1.0 (loop start check); n=2,t=2.0 (HTTP); n=3,t=3.0 (schema++)
-        # Turn 2: n=4,t=4.0 (loop start check); n=5,t=5.0 (HTTP); n=6,t=6.0 (schema++)
-        # Turn 3: n=7,t=7.0 (loop start check) — 7.0 >= 6.0 deadline, but it checks
-        #         remaining <= 0 first, so it calls _finish("timeout") directly
-        # Actually, that hits the top-of-loop check. Let me recalibrate...
-        # Set deadline to 7.5 and ensure we reach exhaustion before then:
-        # Turn 1: n=1,1.0; HTTP n=2,2.0; schema_retries=1 n=3,3.0; continue
-        # Turn 2: n=4,4.0; HTTP n=5,5.0; schema_retries=2 n=6,6.0; continue
-        # Turn 3: n=7,7.0; HTTP n=8,8.0 >= 7.5 deadline! Would exit via remaining check
-        # Instead, use smaller increment: 0.7s per call, deadline 5.0:
-        # Turn 1: n=1,0.7; HTTP n=2,1.4; schema_retries=1 n=3,2.1; continue
-        # Turn 2: n=4,2.8; HTTP n=5,3.5; schema_retries=2 n=6,4.2; continue
-        # Turn 3: n=7,4.9; HTTP n=8,5.6 >= 5.0! would timeout at post-HTTP check
-        # But we want to reach exhaustion. Let's use: deadline 5.5, increment 0.6s:
+        # deadline=5.5, increment=0.6s per call. Calibrated so retry
+        # exhaustion (schema_retries > _MAX_REPAIR_RETRIES=2) happens on
+        # turn 3, and the deadline crosses only when _finish checks it
+        # during that exhaustion (not at an earlier remaining<=0 check):
         # Turn 1: n=1,0.6; HTTP n=2,1.2; schema_retries=1 n=3,1.8; continue
         # Turn 2: n=4,2.4; HTTP n=5,3.0; schema_retries=2 n=6,3.6; continue
-        # Turn 3: n=7,4.2; HTTP n=8,4.8; schema_retries=3 n=9,5.4; exhaustion, _finish called n=10,6.0 >= 5.5!
+        # Turn 3: n=7,4.2; HTTP n=8,4.8; schema_retries=3 n=9,5.4;
+        #         exhaustion, _finish called n=10,6.0 >= 5.5
         call_count["n"] += 1
         return call_count["n"] * 0.6
 
@@ -202,3 +189,79 @@ def test_tool_call_missing_function():
     runner, _ = _runner([tool_call_msg])
     r = runner.run(_mission())
     assert r.status == "failed"
+
+
+def test_content_not_string_repair_stores_stringified_content():
+    """W1: the F5-stored assistant message with non-string content must be
+    stringified in place, so a content-type-strict server would accept the
+    NEXT request and the repair prompt actually reaches the LLM.
+    """
+    msgs = [
+        {"role": "assistant", "content": {"action": "hold"}},
+        {"role": "assistant", "content": '{"action": "hold"}'},
+    ]
+    runner, calls = _runner(msgs)
+    r = runner.run(_mission())
+    assert r.status == "completed"
+
+    assistant_msgs = [m for m in r.transcript if m.get("role") == "assistant"]
+    repaired = assistant_msgs[0]
+    assert isinstance(repaired["content"], str)
+    assert json.loads(repaired["content"]) == {"action": "hold"}
+
+    # The stringified content must be exactly what was sent in the 2nd
+    # request body — not just fixed up after the fact in the transcript.
+    sent_assistant = [m for m in calls["bodies"][1]["messages"]
+                      if m.get("role") == "assistant"][0]
+    assert isinstance(sent_assistant["content"], str)
+    assert json.loads(sent_assistant["content"]) == {"action": "hold"}
+
+
+def test_invalid_output_schema_fails_without_raising():
+    """W2: a broken mission.output_schema (jsonschema.SchemaError) must not
+    escape run() — it is a deterministic wiring error, not something the
+    LLM can fix by retrying, so it must terminate as 'failed'.
+    """
+    runner, _ = _runner([{"role": "assistant", "content": '{"action": "hold"}'}])
+    bad_schema = {"type": "not-a-real-type"}
+    r = runner.run(_mission(output_schema=bad_schema))
+    assert r.status == "failed"
+
+
+def test_tool_calls_over_cap_fails():
+    """W3: a single turn with more tool_calls than the per-turn cap must be
+    treated as a protocol failure, not looped on indefinitely.
+    """
+    calls_ = [{"id": f"c{i}", "type": "function",
+              "function": {"name": "get_price", "arguments": "{}"}}
+             for i in range(17)]
+    tool_call_msg = {"role": "assistant", "content": None, "tool_calls": calls_}
+    runner, _ = _runner([tool_call_msg])
+    r = runner.run(_mission())
+    assert r.status == "failed"
+
+
+def test_tool_calls_at_cap_with_unknown_tool_does_not_fail_as_protocol_violation():
+    """W3: exactly the cap (16) must NOT be rejected as a protocol violation —
+    it should be processed normally (an unknown tool name is a per-call
+    registry error, not a shape failure) and the loop continues until
+    max_turns is exhausted.
+    """
+    calls_ = [{"id": f"c{i}", "type": "function",
+              "function": {"name": "unknown_tool", "arguments": "{}"}}
+             for i in range(16)]
+    tool_call_msg = {"role": "assistant", "content": None, "tool_calls": calls_}
+    runner, _ = _runner([tool_call_msg])
+    r = runner.run(_mission(max_turns=2))
+    assert r.status == "max_turns"
+
+
+def test_role_is_pinned_to_assistant_regardless_of_server_value():
+    """W4: a server-supplied role must never be trusted verbatim."""
+    runner, _ = _runner([{"role": "tool_spoofed",
+                          "content": '{"action": "hold"}'}])
+    r = runner.run(_mission())
+    assert r.status == "completed"
+    assistant_msgs = [m for m in r.transcript if m.get("role") == "assistant"]
+    assert len(assistant_msgs) == 1
+    assert assistant_msgs[0]["role"] == "assistant"

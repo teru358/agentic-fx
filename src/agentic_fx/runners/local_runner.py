@@ -25,6 +25,10 @@ from agentic_fx.tools.registry import ToolRegistry
 
 _log = logging.getLogger("agentic_fx.local_runner")
 _MAX_REPAIR_RETRIES = 2
+# 実際の tool_calls は 1 ターンあたり ~5 件以下が通常。16 は十分に余裕を持たせた
+# 上限で、1 レスポンスに大量の call を詰めて max_turns の実質的な資源予算
+# (1 turn = 1 request/response) を回避する経路を塞ぐ。
+_MAX_TOOL_CALLS_PER_TURN = 16
 
 
 class LocalRunner(AgentRunner):
@@ -81,7 +85,9 @@ class LocalRunner(AgentRunner):
                 return _finish("failed")
 
             # F5: Normalize message to standard fields only
-            normalized_msg = {"role": msg.get("role", "assistant")}
+            # W4: role is pinned unconditionally — do not trust a
+            # server-controlled role field.
+            normalized_msg = {"role": "assistant"}
             if "content" in msg:
                 normalized_msg["content"] = msg["content"]
             if "tool_calls" in msg:
@@ -92,6 +98,13 @@ class LocalRunner(AgentRunner):
             if normalized_msg.get("tool_calls"):
                 if not isinstance(normalized_msg["tool_calls"], list):
                     _log.warning("tool_calls is not a list")
+                    return _finish("failed")
+                # W3: unbounded tool_calls in one turn bypasses max_turns'
+                # implicit resource budget (1 turn = 1 request/response).
+                if len(normalized_msg["tool_calls"]) > _MAX_TOOL_CALLS_PER_TURN:
+                    _log.warning("tool_calls exceeds per-turn cap (%d > %d)",
+                                 len(normalized_msg["tool_calls"]),
+                                 _MAX_TOOL_CALLS_PER_TURN)
                     return _finish("failed")
                 for tc in normalized_msg["tool_calls"]:
                     if not isinstance(tc, dict):
@@ -118,7 +131,8 @@ class LocalRunner(AgentRunner):
                                                         mission.tools)
                     except json.JSONDecodeError as e:
                         result = json.dumps(
-                            {"error": f"tool arguments are not valid JSON: {e}"})
+                            {"error": f"tool arguments are not valid JSON: {e}"},
+                            ensure_ascii=False)
                     except (TypeError, KeyError) as e:
                         _log.warning("tool_call shape validation failed: %s",
                                      safe_error_text(e))
@@ -134,6 +148,14 @@ class LocalRunner(AgentRunner):
             if content is None:
                 content = ""
             elif not isinstance(content, str):
+                # W1: the offending assistant message is already stored in
+                # `messages` (F5) with its non-string content verbatim. A
+                # content-type-strict OpenAI-compatible server would 400 the
+                # NEXT request, so the repair prompt would never reach the
+                # LLM. Stringify the stored message's content in place so
+                # the history stays protocol-valid.
+                normalized_msg["content"] = json.dumps(
+                    content, ensure_ascii=False, default=str)
                 parse_retries += 1
                 if parse_retries > _MAX_REPAIR_RETRIES:
                     return _finish("failed")
@@ -170,6 +192,14 @@ class LocalRunner(AgentRunner):
                                             f"{e.message}。修正して JSON のみ"
                                             f"再出力してください。"})
                 continue
+            except Exception as e:  # noqa: BLE001 — W2: SchemaError 等
+                # mission.output_schema 自体が不正 (SchemaError や $ref 解決
+                # 失敗) は決定論的な配線エラーで、LLM の再出力では直らない。
+                # registry.execute の同型対策 (F1) と対称に、四終端契約
+                # (completed/failed/timeout/max_turns) を破らせない。
+                _log.warning("invalid mission.output_schema: %s",
+                             safe_error_text(e))
+                return _finish("failed")
             if timed_out():
                 return _finish("timeout")
             return MissionResult("completed", output, messages)

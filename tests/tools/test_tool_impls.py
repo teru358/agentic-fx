@@ -85,9 +85,15 @@ def test_no_tool_exposes_an_arbitrary_history_window():
     設計書 §6 の過剰適合防御は「エージェントに任意期間の履歴を与えない」
     ことに依存している。規約だけだと後から `since` 等が足されても気付けない
     ため、tool schema をテストで固定する (codex レビュー 6)。
+
+    M-4: market_tools だけでなく account_tools / reflection_tools も含める
+    — 主張名 (「どのツールも」) を実際に全ツールでカバーする。
     """
     reg = ToolRegistry()
     reg.register_all(market_tools.build(MagicMock(), MagicMock(), SETTINGS))
+    reg.register_all(news_tools.build(MagicMock()))
+    reg.register_all(account_tools.build(MagicMock(), MagicMock()))
+    reg.register_all(reflection_tools.build(MagicMock(), MagicMock()))
     banned = {"since", "until", "from", "to", "start", "end",
               "start_date", "end_date", "lookback", "lookback_days", "bars",
               "period", "window", "range", "history_days", "count"}
@@ -208,8 +214,18 @@ def test_account_tools(tmp_path):
 
 
 def test_all_tools_have_schemas():
+    """M-4: cover all tool modules (market/news/account/reflection), not just
+    market+news — the test name claims "all tools".
+
+    build() only stores references (no calls made at build time), so plain
+    MagicMocks for conn/broker/rag are enough here.
+    """
     provider, econ, rag = MagicMock(), MagicMock(), MagicMock()
-    tools = market_tools.build(provider, econ, SETTINGS) + news_tools.build(rag)
+    conn, broker = MagicMock(), MagicMock()
+    tools = (market_tools.build(provider, econ, SETTINGS)
+             + news_tools.build(rag)
+             + account_tools.build(conn, broker)
+             + reflection_tools.build(conn, rag))
     for t in tools:
         assert t.parameters["type"] == "object"
         assert t.description
