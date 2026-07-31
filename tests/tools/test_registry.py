@@ -95,14 +95,18 @@ def test_T1_invalid_schema_does_not_raise():
 
 
 def test_T2_unhashable_name_does_not_raise():
-    """T2: unhashable name (e.g. dict) doesn't raise execute()."""
+    """T2: unhashable name (e.g. dict) doesn't raise execute() when allowed list makes it reach self._tools check."""
     reg = ToolRegistry()
     reg.register(_echo_tool())
-    # Unhashable name would raise TypeError in `name not in self._tools`
-    out = reg.execute({}, {}, allowed=[])  # type: ignore
+    # Unhashable name with allowed=[{}] forces comparison {} not in [{}] to be False,
+    # which means it reaches `name not in self._tools` where unhashable name would raise TypeError.
+    # The isinstance guard must prevent the TypeError from escaping.
+    out = reg.execute({}, {}, allowed=[{}])  # type: ignore
     assert isinstance(out, str)
     parsed = json.loads(out)
     assert "error" in parsed
+    # Verify it's the isinstance guard that caught it (not short-circuit from allowed check)
+    assert "str" in parsed["error"]
 
 
 def test_T3_exception_with_broken_str_does_not_raise():
@@ -179,15 +183,18 @@ def test_T6_openai_tools_includes_full_schema_and_description():
 
 
 def test_T7_non_ascii_output_not_escaped():
-    """T7: tool returning non-ASCII characters preserves them as literals, not \\uXXXX."""
+    """T7: tool raising with non-ASCII message in error path preserves literals, not \\uXXXX."""
     reg = ToolRegistry()
     reg.register(ToolDef(
-        "unicode_tool", "d",
+        "unicode_error_tool", "d",
         {"type": "object", "properties": {}},
-        func=lambda: {"msg": "円高"}))
+        # Tool raises with non-ASCII error message, testing error-path ensure_ascii=False
+        func=lambda: (_ for _ in ()).throw(RuntimeError("円高エラー"))))
 
-    out = reg.execute("unicode_tool", {}, allowed=["unicode_tool"])
-    # Should contain literal 円 and 高, not \u####
+    out = reg.execute("unicode_error_tool", {}, allowed=["unicode_error_tool"])
+    # Should contain literal 円 and 高 in the error message, not \u####
+    # The error message goes through safe_error_text which calls str(e),
+    # then safe_text, then json.dumps with ensure_ascii=False
     assert "円" in out
     assert "高" in out
     assert "\\u" not in out
@@ -197,23 +204,28 @@ def test_T8_mutating_openai_tools_result_does_not_affect_execute():
     """T8: mutating the dict from openai_tools doesn't affect subsequent execute validation."""
     schema = {
         "type": "object",
-        "properties": {"n": {"type": "integer"}},
+        "properties": {"n": {"type": "integer", "minimum": 1}},
         "required": ["n"]
     }
     reg = ToolRegistry()
     reg.register(ToolDef(
         "mutate_test", "d",
         schema,
-        func=lambda n: n))
+        func=lambda n: {"result": n}))
 
     # Get openai_tools and mutate the returned schema
     schemas = reg.openai_tools(["mutate_test"])
     returned_schema = schemas[0]["function"]["parameters"]
-    returned_schema["required"] = []  # Mutate to remove requirement
+    # Mutate to change validation constraint (increase minimum from 1 to 100)
+    returned_schema["properties"]["n"]["minimum"] = 100
 
-    # Now execute should still validate against the original schema
-    # (with "n" required), not the mutated one
-    out = reg.execute("mutate_test", {}, allowed=["mutate_test"])
+    # Now execute with n=5 should succeed (valid under original schema where min=1)
+    # WITHOUT deepcopy, the mutation would propagate to the registry's internal schema,
+    # and validation would reject n=5 (since min would be 100).
+    # WITH deepcopy, the mutation only affects the returned copy, so validation passes.
+    out = reg.execute("mutate_test", {"n": 5}, allowed=["mutate_test"])
     parsed = json.loads(out)
-    # Should fail validation because "n" is still required in the original
-    assert "error" in parsed
+    # Should succeed and return the result, not an error
+    assert "error" not in parsed
+    assert "result" in parsed
+    assert parsed["result"] == 5
