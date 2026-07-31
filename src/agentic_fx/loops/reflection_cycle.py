@@ -124,8 +124,12 @@ class ReflectionCycle:
             return False
 
         reflections.save(self.conn, row["id"], content, now)
-        self.activity.write(
-            Category.AGGREGATE, "reflection_created",
-            f"#{row['id']} {row['pair']}",
-            ref_id=str(row["id"]))
+        # Activity recording is decoupled from save success (F1)
+        try:
+            self.activity.write(
+                Category.AGGREGATE, "reflection_created",
+                f"#{row['id']} {row['pair']}",
+                ref_id=str(row["id"]))
+        except Exception:  # noqa: BLE001
+            _log.exception("activity write failed for reflection #%s", row["id"])
         return True
