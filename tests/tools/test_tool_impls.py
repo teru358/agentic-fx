@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -37,6 +38,8 @@ def test_market_tools():
     ind = reg.func("get_indicators")(pair="USDJPY", timeframe="1h")
     assert "rsi_14" in ind
     assert reg.func("get_econ_calendar")(days=1) == [{"name": "CPI"}]
+    # F3: Verify days*24 multiplication (catches mutation days → days*24)
+    econ.upcoming.assert_called_with(hours=24)
 
 
 def test_tools_do_not_resample_and_delegate_the_timeframe_to_the_provider():
@@ -51,6 +54,19 @@ def test_tools_do_not_resample_and_delegate_the_timeframe_to_the_provider():
     reg = ToolRegistry()
     reg.register_all(market_tools.build(provider, MagicMock(), SETTINGS))
     reg.func("get_ohlcv")(pair="USDJPY", timeframe="4h")
+    provider.get_bars.assert_called_with("USDJPY", "4h")
+
+
+def test_get_indicators_passes_timeframe_to_provider():
+    """F5: get_indicators must pass timeframe unchanged to provider.
+
+    Catches hardcoded timeframe mutations inside get_indicators.
+    """
+    provider = MagicMock()
+    provider.get_bars.return_value = _bars(n=30, interval="4h")
+    reg = ToolRegistry()
+    reg.register_all(market_tools.build(provider, MagicMock(), SETTINGS))
+    reg.func("get_indicators")(pair="USDJPY", timeframe="4h")
     provider.get_bars.assert_called_with("USDJPY", "4h")
 
 
@@ -73,7 +89,8 @@ def test_no_tool_exposes_an_arbitrary_history_window():
     reg = ToolRegistry()
     reg.register_all(market_tools.build(MagicMock(), MagicMock(), SETTINGS))
     banned = {"since", "until", "from", "to", "start", "end",
-              "start_date", "end_date", "lookback", "lookback_days", "bars"}
+              "start_date", "end_date", "lookback", "lookback_days", "bars",
+              "period", "window", "range", "history_days", "count"}
     # 既存 API だけで検査する (ToolRegistry に新メソッドは足さない)
     for spec in reg.openai_tools(allowed=reg.names()):
         fn = spec["function"]
@@ -82,20 +99,78 @@ def test_no_tool_exposes_an_arbitrary_history_window():
             f"{fn['name']} が期間指定引数を持っている: {params & banned}"
 
 
+def test_market_tools_schema_whitelist():
+    """F2: Whitelist pin — exact properties per market tool.
+
+    Blacklist alone misses new param names. Pin exact schema.
+    """
+    reg = ToolRegistry()
+    reg.register_all(market_tools.build(MagicMock(), MagicMock(), SETTINGS))
+    specs = {s["function"]["name"]: s["function"]["parameters"]["properties"]
+             for s in reg.openai_tools(allowed=reg.names())}
+
+    # get_ohlcv: exactly {"pair", "timeframe"}
+    assert set(specs["get_ohlcv"]) == {"pair", "timeframe"}
+    # get_indicators: exactly {"pair", "timeframe"}
+    assert set(specs["get_indicators"]) == {"pair", "timeframe"}
+    # get_econ_calendar: exactly {"days"}
+    assert set(specs["get_econ_calendar"]) == {"days"}
+
+
 def test_get_ohlcv_always_returns_at_most_100_bars():
-    """入力が何本でも返すのは直近 100 本まで (期間の実質的な固定)。"""
+    """入力が何本でも返すのは直近 100 本まで (期間の実質的な固定)。
+
+    F4: Ordering assertions — catches tail(100) → head(100) mutation.
+    """
     provider = MagicMock()
-    provider.get_bars.return_value = _bars(n=5000)
+    bars = _bars(n=5000)
+    provider.get_bars.return_value = bars
     reg = ToolRegistry()
     reg.register_all(market_tools.build(provider, MagicMock(), SETTINGS))
-    assert len(reg.func("get_ohlcv")(pair="USDJPY", timeframe="1h")) == 100
+    ohlcv = reg.func("get_ohlcv")(pair="USDJPY", timeframe="1h")
+    assert len(ohlcv) == 100
+    # Verify we got the LAST (most recent) 100 bars.
+    # _bars: bars[0]=oldest(NOW-step*n), bars[n-1]=newest(NOW-step*1)
+    # tail(100) returns bars[4900:5000]
+    oldest_in_100 = bars[4900].ts.isoformat()
+    newest = bars[4999].ts.isoformat()
+    assert ohlcv[0]["ts"] == oldest_in_100, \
+        f"First entry should be 100th-newest: {ohlcv[0]['ts']} vs {oldest_in_100}"
+    assert ohlcv[-1]["ts"] == newest, \
+        f"Last entry should be newest: {ohlcv[-1]['ts']} vs {newest}"
+
+
+def test_news_tools_drop_url_and_credentials():
+    """F1: search_news must drop url field and credentials.
+
+    Registry does NOT sanitize successful results, so credential-bearing
+    URLs would reach LLM verbatim. LLM has no fetch tool anyway.
+    """
+    rag = MagicMock()
+    rag.search_news.return_value = [
+        {"title": "News", "body": "Content", "source_name": "Source",
+         "url": "https://feed.example/x?apikey=SECRET_KEY_12345"}
+    ]
+    reg = ToolRegistry()
+    reg.register_all(news_tools.build(rag))
+    result = reg.func("search_news")(query="test")
+
+    # Assert url is not in result
+    assert "url" not in result[0], "url field must be dropped"
+    # Assert no credential leak in JSON
+    result_json = json.dumps(result)
+    assert "SECRET" not in result_json, "Credentials leaked to LLM"
+    # Assert safe fields are present
+    assert result[0]["title"] == "News"
+    assert result[0]["body"] == "Content"
+    assert result[0]["source_name"] == "Source"
 
 
 def test_news_and_reflection_tools(tmp_path):
     conn = connect(tmp_path / "t.db")
     init_db(conn)
     rag = MagicMock()
-    rag.search_news.return_value = [{"title": "t"}]
+    rag.search_news.return_value = [{"title": "t", "body": "b", "source_name": "s"}]
     rag.search_reflections.return_value = [{"content": "c"}]
     reg = ToolRegistry()
     reg.register_all(news_tools.build(rag))
