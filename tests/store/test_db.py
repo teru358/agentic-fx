@@ -84,3 +84,17 @@ def test_init_db_adds_trigger_column_to_legacy_missions_table(tmp_path):
     mid = missions.start(conn, "trade", "local", "m", NOW, trigger="cron")
     assert conn.execute("SELECT trigger FROM missions WHERE id=?",
                         (mid,)).fetchone()[0] == "cron"
+
+
+def test_connect_pragmas_busy_timeout(tmp_path):
+    """I3: Verify PRAGMA busy_timeout=5000 is set (mutation kills if removed)."""
+    conn = connect(tmp_path / "pragmas.db")
+    timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert timeout == 5000
+
+
+def test_connect_pragmas_journal_mode(tmp_path):
+    """I3: Verify PRAGMA journal_mode=WAL is set."""
+    conn = connect(tmp_path / "pragmas.db")
+    mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode == "wal"

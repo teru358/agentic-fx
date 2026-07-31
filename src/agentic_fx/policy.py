@@ -9,13 +9,19 @@ class Policy:
         self._path = path
 
     def tail(self, chars: int = 4000) -> str:
-        if not self._path.exists():
+        if chars <= 0:
             return ""
-        return self._path.read_text(encoding="utf-8")[-chars:]
+        try:
+            return self._path.read_text(encoding="utf-8")[-chars:]
+        except FileNotFoundError:
+            return ""
 
     def size_warning(self, limit_chars: int = 16000) -> str | None:
-        if self._path.exists() and \
-                len(self._path.read_text(encoding="utf-8")) > limit_chars:
-            return (f"警告: {self._path} が {limit_chars} 文字を超えています。"
-                    "注入は末尾 4000 文字のみです。手動で整理してください。")
+        try:
+            text = self._path.read_text(encoding="utf-8")
+            if len(text) > limit_chars:
+                return (f"警告: {self._path} が {limit_chars} 文字を超えています。"
+                        "注入は末尾 4000 文字のみです。手動で整理してください。")
+        except FileNotFoundError:
+            pass
         return None
