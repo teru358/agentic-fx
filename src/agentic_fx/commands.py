@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
 from agentic_fx.core.paper_broker import PaperBroker
@@ -74,7 +75,9 @@ class Commands:
         except AlreadyDecidedError:
             return "その approval は決定済みです"
         except (ValueError, KeyError) as e:
-            return f"エラー: {e}\n{_HELP}"
+            return f"エラー: {safe_error_text(e)}\n{_HELP}"
+        except Exception as e:
+            return f"エラー: {safe_error_text(e)}"
         return _HELP
 
     def _status(self) -> str:
