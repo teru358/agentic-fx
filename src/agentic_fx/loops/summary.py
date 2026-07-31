@@ -58,7 +58,7 @@ def build_state_summary(conn: sqlite3.Connection, broker: PaperBroker,
     now = clock.now()
     balance, equity = broker.equity()
     day_start = daily_start_equity(conn, now)
-    daily_pnl = (equity - day_start) if day_start else 0.0
+    daily_pnl = (equity - day_start) if day_start is not None else 0.0
     total_pnl = equity - starting_balance
 
     lines = ["## 現在の状態 (システム生成)",
@@ -81,13 +81,16 @@ def build_state_summary(conn: sqlite3.Connection, broker: PaperBroker,
 
     closed = conn.execute(
         "SELECT * FROM orders WHERE status='closed' "
-        "ORDER BY closed_at DESC LIMIT 10").fetchall()
+        "ORDER BY closed_at IS NULL ASC, closed_at DESC, id DESC LIMIT 10").fetchall()
     if closed:
         lines.append("- 直近トレード:")
         for r in closed:
+            pnl_str = (f"{r['realized_pnl']:+,.0f}"
+                      if r['realized_pnl'] is not None
+                      else "未確定")
             lines.append(
                 f"  - #{r['id']} {r['pair']} {r['direction']} "
-                f"pnl={r['realized_pnl']:+,.0f} ({r['close_reason']})")
+                f"pnl={pnl_str} ({r['close_reason']})")
 
     events = econ.upcoming(hours=24)
     if events:
