@@ -388,7 +388,13 @@ def _watchdog_tick(app: App) -> None:
         _log.exception("watchdog mark_notified failed")
 
 
-def run_service(root: Path, *, daemon: bool = False) -> int:
+def run_service(root: Path, *, daemon: bool = False,
+               _stop_event: threading.Event | None = None) -> int:
+    """`_stop_event` はテスト用のシーム (fix round 1 F4)。省略時は内部で
+    `threading.Event()` を生成する (本番挙動は不変)。テストは事前に `.set()`
+    済みのイベントや、`.wait()` から `KeyboardInterrupt` を送出するカスタム
+    実装を注入することで、実スリープ・実シグナルなしに shutdown 経路を検証
+    できる。"""
     ensure_initialized(root)
     settings = load_settings(root / "config" / "settings.yaml")
     setup_technical_logging(root / "logs", settings.logging.level,
@@ -402,7 +408,7 @@ def run_service(root: Path, *, daemon: bool = False) -> int:
     app.activity.write(Category.SYSTEM, "service_started",
                        f"daemon={daemon}")
 
-    stop_event = threading.Event()
+    stop_event = _stop_event if _stop_event is not None else threading.Event()
 
     def scheduler_thread() -> None:
         last = 0.0
@@ -428,32 +434,61 @@ def run_service(root: Path, *, daemon: bool = False) -> int:
             except Exception:  # noqa: BLE001 — スレッドを殺さない
                 _log.exception("watchdog tick failed")
 
+    # F2 (fix round 1): シグナルハンドラはスレッド起動より**前**に登録する。
+    # 以前はスレッド起動後に登録しており、その間に SIGTERM が届くとデフォルト
+    # 動作 (即時終了) で graceful shutdown 経路を経ずにプロセスが死ぬ窓が
+    # あった。
+    if daemon:
+        signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+        signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+
     th = threading.Thread(target=scheduler_thread, daemon=True)
     th.start()
     wd = threading.Thread(target=watchdog_thread, daemon=True)
     wd.start()
 
-    if daemon:
-        signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
-        signal.signal(signal.SIGINT, lambda *_: stop_event.set())
-        while not stop_event.is_set():
-            stop_event.wait(1)
-    else:
-        from agentic_fx.shell import run_shell
-        run_shell(app.commands, stop_event)
+    try:
+        if daemon:
+            while not stop_event.is_set():
+                try:
+                    stop_event.wait(1)
+                except KeyboardInterrupt:
+                    # F2: シグナルハンドラを経ずに KeyboardInterrupt が
+                    # 素通りすると graceful shutdown 経路 (finally) を丸ごと
+                    # 飛ばして例外がそのまま伝播していた。ここで捕捉して
+                    # stop_event を立てるだけにし、後続の finally に処理を
+                    # 委ねる。
+                    stop_event.set()
+        else:
+            from agentic_fx.shell import run_shell
+            run_shell(app.commands, stop_event)
+    finally:
+        # F2: 待機部で想定外の例外 (KeyboardInterrupt 含む) が起きても、
+        # shutdown 手順 (stop・join・close・記録) は必ず実行する。ここでは
+        # 例外を握りつぶさない (return を置かない) — 記録後、元の例外があれば
+        # そのまま再送出される。
+        stop_event.set()
+        # graceful shutdown: scheduler スレッドの終了を確認してから記録する
+        # (tick は core_lock 下で走るため、join 完了 = 実行中 Mission も完了)
+        th.join(timeout=30)
+        # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
+        # 行う。notifier は最大 10 秒ブロックしうるため、記録を先にすると
+        # 「graceful」記録の後に watchdog がまだ activity へ書き込める窓が
+        # 生じる。判定権威は従来どおり th.join(30) のみ — wd はここで待つ
+        # だけで graceful/timeout の判定には関与しない。
+        wd.join(timeout=15)
+        if th.is_alive():
+            app.activity.write(Category.SYSTEM, "service_stopped",
+                               "shutdown_timeout (Mission 継続中の可能性)")
+        else:
+            # 上書き 7: join 成功時のみ close する (使用中の client を
+            # 別スレッドから閉じない)
+            if app.owns_runner and isinstance(app.runner, LocalRunner):
+                app.runner.close()
+            app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
 
-    # graceful shutdown: scheduler スレッドの終了を確認してから記録する
-    # (tick は core_lock 下で走るため、join 完了 = 実行中 Mission も完了)
-    th.join(timeout=30)
-    wd.join(timeout=5)
     if th.is_alive():
-        app.activity.write(Category.SYSTEM, "service_stopped",
-                           "shutdown_timeout (Mission 継続中の可能性)")
         print("警告: 停止タイムアウト。実行中の処理が残っている可能性があります。")
         return 1
-    # 上書き 7: join 成功時のみ close する (使用中の client を別スレッドから閉じない)
-    if app.owns_runner and isinstance(app.runner, LocalRunner):
-        app.runner.close()
-    app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
     print("停止しました。")
     return 0
