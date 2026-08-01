@@ -30,6 +30,12 @@ def test_import_mt5_pages_daily_and_imports(tmp_path):
     assert len(calls) == 2
     for u in calls:
         assert "/ohlcv/USDJPY?" in u and "interval=1m" in u
+    # MT5 は bid 系列を mid 近似として保存する — spread は必ず None (0.0 等の
+    # 既知値を装うと「spread 不明」と「spread ゼロ」の区別が消え、バックテスト
+    # のコストモデルが無料取引を読み込む実害になる。Task 4 の source パラメータ
+    # 変異と同種の無音故障源)。
+    assert ohlcv.load_spread(conn, "USDJPY", "1m", H.isoformat(),
+                             source="mt5") is None
 
 
 def test_import_mt5_last_window_clipped_to_end(tmp_path):
