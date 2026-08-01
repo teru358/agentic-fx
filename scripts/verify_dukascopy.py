@@ -192,11 +192,16 @@ def verify_symbol(symbol: str, hour_utc: datetime, mt5_base: str) -> tuple[bool,
         if not mae_pct_list:
             details.append(f"FAIL: {symbol} no ticks found matching MT5 bars")
         else:
-            avg_mae_pct = sum(mae_pct_list) / len(mae_pct_list)
-            if avg_mae_pct < 0.1:
-                details.append(f"PASS: {symbol} avg MAE {avg_mae_pct:.4f}% < 0.1% (n={len(mae_pct_list)})")
+            n = len(mae_pct_list)
+            # F3: Require at least 50 comparisons (not just 1)
+            if n < 50:
+                details.append(f"FAIL: {symbol} only {n} minute(s) compared (need >= 50)")
             else:
-                details.append(f"FAIL: {symbol} avg MAE {avg_mae_pct:.4f}% >= 0.1% (n={len(mae_pct_list)})")
+                avg_mae_pct = sum(mae_pct_list) / n
+                if avg_mae_pct < 0.1:
+                    details.append(f"PASS: {symbol} avg MAE {avg_mae_pct:.4f}% < 0.1% (n={n})")
+                else:
+                    details.append(f"FAIL: {symbol} avg MAE {avg_mae_pct:.4f}% >= 0.1% (n={n})")
 
     passed = all("FAIL" not in d for d in details)
     return passed, "\n  ".join(details)
@@ -214,6 +219,11 @@ def main():
 
     args = parser.parse_args()
 
+    # F4: Require both USDJPY and EURUSD in symbols (brief Assert 1: JPY + non-JPY point)
+    if "USDJPY" not in args.symbols or "EURUSD" not in args.symbols:
+        _log.error("--symbols must include both USDJPY and EURUSD (brief Assert 1 requirement)")
+        return 1
+
     # Parse hour
     try:
         hour_utc = datetime.fromisoformat(args.hour)
@@ -223,7 +233,8 @@ def main():
         _log.error(f"Invalid hour format: {e}")
         return 1
 
-    _log.info(f"Verifying {args.symbols} at {hour_utc} against {args.mt5_base}")
+    # F5: Don't log MT5 base URL directly (privacy concern)
+    _log.info(f"Verifying {args.symbols} at {hour_utc}")
 
     all_passed = True
     for symbol in args.symbols:

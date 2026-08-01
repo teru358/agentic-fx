@@ -44,3 +44,76 @@ def test_points_table_consistent_with_trading_specs():
     for sym, spec in _SPECS.items():
         expected = 1e-3 if spec.quote_currency == "JPY" else 1e-5
         assert point_of(sym) == expected
+
+
+def test_decode_rejects_out_of_range_ms_offset():
+    """ms_offset が [0, 3600000) 範囲外のレコードを棄却する。"""
+    # ms_offset < 0: rejected
+    bad_negative = _bi5([(-1, 148_205, 148_193, 1.0, 1.0)])
+    assert decode_bi5(bad_negative, point=1e-3, hour_start_utc=H) == []
+
+    # ms_offset >= 3600000: rejected (1 hour = 3600000 ms)
+    bad_overflow = _bi5([(3_600_000, 148_205, 148_193, 1.0, 1.0)])
+    assert decode_bi5(bad_overflow, point=1e-3, hour_start_utc=H) == []
+
+    # boundary: ms_offset = 3599999 should pass (if bid/ask valid)
+    valid_boundary = _bi5([(3_599_999, 148_205, 148_193, 1.0, 1.0)])
+    ticks = decode_bi5(valid_boundary, point=1e-3, hour_start_utc=H)
+    assert len(ticks) == 1
+
+
+def test_hour_url_requires_aware_utc_datetime():
+    """hour_url は naive または non-UTC datetime で ValueError を raise する。"""
+    from datetime import timezone as tz
+    from datetime import timedelta
+
+    naive = datetime(2026, 7, 22, 12, 0)  # no tzinfo
+    with pytest.raises(ValueError, match="timezone-aware"):
+        hour_url("USDJPY", naive)
+
+    # Non-UTC (JST = UTC+9)
+    jst = tz(timedelta(hours=9))
+    jst_dt = datetime(2026, 7, 22, 12, 0, tzinfo=jst)
+    with pytest.raises(ValueError, match="must be UTC"):
+        hour_url("USDJPY", jst_dt)
+
+
+def test_decode_bi5_requires_aware_utc_datetime():
+    """decode_bi5 は naive または non-UTC hour_start_utc で ValueError を raise する。"""
+    from datetime import timezone as tz
+    from datetime import timedelta
+
+    payload = _bi5([(1500, 148_205, 148_193, 1.0, 1.0)])
+
+    naive = datetime(2026, 7, 22, 12, 0)  # no tzinfo
+    with pytest.raises(ValueError, match="timezone-aware"):
+        decode_bi5(payload, point=1e-3, hour_start_utc=naive)
+
+    # Non-UTC (JST = UTC+9)
+    jst = tz(timedelta(hours=9))
+    jst_dt = datetime(2026, 7, 22, 12, 0, tzinfo=jst)
+    with pytest.raises(ValueError, match="must be UTC"):
+        decode_bi5(payload, point=1e-3, hour_start_utc=jst_dt)
+
+
+def test_decode_bi5_rejects_invalid_point():
+    """decode_bi5 は NaN, inf, <= 0 の point で ValueError を raise する。"""
+    import math
+
+    payload = _bi5([(1500, 148_205, 148_193, 1.0, 1.0)])
+
+    # NaN
+    with pytest.raises(ValueError, match="must be finite"):
+        decode_bi5(payload, point=float('nan'), hour_start_utc=H)
+
+    # Infinity
+    with pytest.raises(ValueError, match="must be finite"):
+        decode_bi5(payload, point=float('inf'), hour_start_utc=H)
+
+    # Negative
+    with pytest.raises(ValueError, match="must be positive"):
+        decode_bi5(payload, point=-1e-3, hour_start_utc=H)
+
+    # Zero
+    with pytest.raises(ValueError, match="must be positive"):
+        decode_bi5(payload, point=0.0, hour_start_utc=H)

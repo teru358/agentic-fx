@@ -1,6 +1,7 @@
 """Dukascopy tick data decoder — bi5 format parsing and tick extraction."""
 import logging
 import lzma
+import math
 import struct
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
@@ -27,7 +28,14 @@ def hour_url(symbol: str, dt_utc: datetime) -> str:
     """Dukascopy hourly tick data URL.
 
     Month is 0-based in Dukascopy URLs (1 January = "00").
+
+    Raises ValueError if dt_utc is naive or not UTC.
     """
+    if dt_utc.tzinfo is None:
+        raise ValueError(f"dt_utc must be timezone-aware; got naive datetime")
+    if dt_utc.tzinfo != timezone.utc:
+        raise ValueError(f"dt_utc must be UTC; got {dt_utc.tzinfo}")
+
     year = dt_utc.year
     month = dt_utc.month - 1  # 0-based
     day = dt_utc.day
@@ -42,9 +50,25 @@ def decode_bi5(payload: bytes, *, point: float, hour_start_utc: datetime) -> lis
     Format: LZMA (FORMAT_ALONE or FORMAT_XZ) containing 20-byte records.
     Each record: struct '>3i2f' = (ms_offset, ask_points, bid_points, ask_vol, bid_vol)
 
-    Rejects records where bid <= 0 or ask < bid.
+    Rejects records where:
+    - bid <= 0 or ask < bid
+    - ms_offset not in [0, 3600000) range
+
+    Raises ValueError if hour_start_utc is naive/non-UTC or point is not finite/positive.
     Returns list of Tick(ts, bid, ask).
     """
+    # Validate time contract
+    if hour_start_utc.tzinfo is None:
+        raise ValueError(f"hour_start_utc must be timezone-aware; got naive datetime")
+    if hour_start_utc.tzinfo != timezone.utc:
+        raise ValueError(f"hour_start_utc must be UTC; got {hour_start_utc.tzinfo}")
+
+    # Validate point contract
+    if not math.isfinite(point):
+        raise ValueError(f"point must be finite; got {point}")
+    if point <= 0:
+        raise ValueError(f"point must be positive; got {point}")
+
     # Decompress LZMA payload (try FORMAT_ALONE first, fallback to auto-detect)
     try:
         raw = lzma.decompress(payload, format=lzma.FORMAT_ALONE)
@@ -64,6 +88,11 @@ def decode_bi5(payload: bytes, *, point: float, hour_start_utc: datetime) -> lis
         ms_offset, ask_points, bid_points, ask_vol, bid_vol = struct.unpack(
             ">3i2f", raw[i:i+20]
         )
+
+        # Reject records with out-of-range ms_offset
+        if not (0 <= ms_offset < 3_600_000):
+            rejected += 1
+            continue
 
         # Convert points to prices
         bid = bid_points * point
