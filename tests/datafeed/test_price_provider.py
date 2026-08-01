@@ -403,6 +403,77 @@ def test_native_4h_is_never_requested_even_when_source_has_it(tmp_path):
     assert p.last_bars_source("USDJPY", "4h") == "mt5"   # 品質フラグは素の名前
 
 
+def test_mt5_native_bars_are_stored_under_mt5_live_source(tmp_path):
+    """F1 (fix round 1, codex Critical): live MT5 は ohlcv に "mt5-live" と
+    して永続化される ("mt5" では一括インポータ用の source と衝突する)。
+    品質フラグ (`last_bars_source`) はチェーン表示名 "mt5" のまま変わらない。
+    """
+    conn, p = _provider(tmp_path, mt5=True)
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
+               return_value=_fresh_bars(interval="1m", n=30)):
+        p.get_bars("USDJPY", "1m", 1)
+    assert p.last_bars_source("USDJPY", "1m") == "mt5"
+    assert len(ohlcv.load_bars(conn, "USDJPY", "1m", source="mt5-live")) == 30
+    assert ohlcv.load_bars(conn, "USDJPY", "1m", source="mt5") == []
+
+
+def test_mt5_derived_base_bars_are_stored_under_mt5_live_source(tmp_path):
+    """F1: `_derive` の base 足保存も同じ変換を通る。"""
+    conn, p = _provider(tmp_path, mt5=True)
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
+               return_value=_fresh_bars(interval="1h", n=100)):
+        p.get_bars("USDJPY", "4h")
+    assert len(ohlcv.load_bars(conn, "USDJPY", "1h", source="mt5-live")) == 100
+
+
+def test_cache_fallback_reads_mt5_live_storage_source(tmp_path):
+    """F1+F6: キャッシュフォールバックは "mt5-live" (永続化 ID) で読み、
+    "mt5" (チェーン表示名) では読まない。優先順位 (MT5→yfinance) も守る。"""
+    conn, p = _provider(tmp_path, mt5=True)
+    ohlcv.upsert_bars(conn, _fresh_bars(interval="1m", n=30), source="mt5-live")
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
+               side_effect=OSError("down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        bars = p.get_bars("USDJPY", "1m", 1)
+    assert len(bars) == 30
+    assert p.last_bars_source("USDJPY", "1m") == "cache"
+
+
+def test_cache_fallback_prefers_mt5_live_over_yfinance_cache(tmp_path):
+    """F6: source を外側ループにしても、MT5 優先度が yfinance より高いまま
+    であること (優先順位が崩れていないことの直接確認)。"""
+    conn, p = _provider(tmp_path, mt5=True)
+    mt5_bars = _fresh_bars(interval="1m", n=30)
+    yf_bars = [b.__class__(b.symbol, b.interval, b.ts, 999, 999, 999, 999,
+                           b.volume) for b in mt5_bars]
+    ohlcv.upsert_bars(conn, mt5_bars, source="mt5-live")
+    ohlcv.upsert_bars(conn, yf_bars, source="yfinance")
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
+               side_effect=OSError("down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        bars = p.get_bars("USDJPY", "1m", 1)
+    assert bars[0].open == mt5_bars[0].open  # mt5-live のキャッシュが優先
+
+
+def test_cache_fallback_does_not_use_only_first_live_source(tmp_path):
+    """sonnet SURVIVED 変異の再現防止: `live_sources` を先頭 1 件だけに
+    切り詰めると、優先度 1 位 (mt5) のキャッシュが無い時に 2 位以降
+    (yfinance) へフォールバックできなくなる。両方の実装 (source 外側/
+    interval 外側どちらでも) で崩れうる普遍的な回帰ガード。"""
+    conn, p = _provider(tmp_path, mt5=True)
+    # mt5-live のキャッシュは無い。yfinance のキャッシュだけ用意する
+    ohlcv.upsert_bars(conn, _fresh_bars(interval="1m", n=30), source="yfinance")
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
+               side_effect=OSError("down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        bars = p.get_bars("USDJPY", "1m", 1)
+    assert len(bars) == 30
+    assert p.last_bars_source("USDJPY", "1m") == "cache"
+
+
 def test_cache_fallback_derives_4h_from_cached_1h(tmp_path):
     """全ソース失敗時、キャッシュの base 足から導出する (4h の行は読まない)。"""
     conn, p = _provider(tmp_path)
