@@ -154,6 +154,27 @@ def test_in_sample_view_expands_metrics_json(tmp_path):
     assert "metrics_json" not in rows[0]
 
 
+def test_in_sample_view_whitelists_metric_keys_against_period_smuggling(tmp_path):
+    """F1 (fix round 1, codex Important): metrics dict は save_harness_run
+    の任意入力なので、"period_start"/"period_end" を metrics に混入すると
+    列遮断 (holdout 遮断 1) を metrics_json 経由で密輸できてしまう。
+    in_sample_view の白リスト濾過がそれを弾き、正規キーは残ることを検証。
+    """
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H),
+              metrics={"trades": 40, "pf": 1.5,
+                      "period_start": "2020-01-01T00:00:00+00:00",
+                      "period_end": "2020-06-01T00:00:00+00:00"},
+              settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+    rows = backtest_runs.in_sample_view(conn)
+    assert {"period_start", "period_end"}.isdisjoint(rows[0]["metrics"].keys())
+    assert rows[0]["metrics"]["trades"] == 40
+    assert rows[0]["metrics"]["pf"] == 1.5
+
+
 def test_naive_period_rejected(tmp_path):
     conn = _conn(tmp_path)
     naive = datetime(2026, 7, 22, 12, 0)
@@ -191,6 +212,26 @@ def test_settings_snapshot_hash_stable_and_sensitive_to_risk(tmp_path):
             update={"rr_min": settings.risk.rr_min + 1.0})})
     h3 = backtest_runs.settings_snapshot_hash(mutated)
     assert h3 != h1
+
+
+def test_settings_snapshot_hash_sensitive_to_backtest_section():
+    """F6 (fix round 1, sonnet M-1 killer): payload に backtest セクションが
+    実際に含まれていること (backtest.initial_balance の変化でハッシュが
+    変わること) を検証する — risk のみへの敏感性テストでは
+    "backtest": ... の行を削除しても検出できない。"""
+    from agentic_fx.config import load_settings
+    from pathlib import Path
+    settings = load_settings(
+        Path(__file__).resolve().parents[2] / "config" /
+        "settings.yaml.example")
+    h1 = backtest_runs.settings_snapshot_hash(settings)
+
+    mutated = settings.model_copy(update={
+        "backtest": settings.backtest.model_copy(
+            update={"initial_balance":
+                    settings.backtest.initial_balance + 1.0})})
+    h2 = backtest_runs.settings_snapshot_hash(mutated)
+    assert h2 != h1
 
 
 def test_core_commit_success(monkeypatch):

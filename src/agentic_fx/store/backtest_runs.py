@@ -12,6 +12,15 @@ issued_by='human_cli' 固定、CLI 用)。issuer を呼び出し引数として�
 ``in_sample_view`` は改善ループ (プラン 9) が読む唯一の面。
 ``scope='in_sample' AND issued_by='harness'`` に絞り、``period_start`` /
 ``period_end`` は返却列に含めない (holdout 遮断 1)。
+
+fix round 1 F1 (codex Important): metrics dict は save_harness_run の
+任意入力なので、"period_start"/"period_end" 等を metrics に混入されると
+列遮断を metrics_json 経由で密輸できてしまう。``in_sample_view`` は
+``agentic_fx.backtest.metrics.METRIC_KEYS`` で読み側の白リスト濾過を行う
+(このモジュールは store 配下だが backtest.metrics に依存する — 依存の
+向きが逆転しているように見えるが、遮断境界を「metrics 返却キーの定義元」
+に一元化するための意図的な選択。import 方向は store-first/backtest-first
+どちらの起動順でも循環しないことを確認済み)。
 """
 from __future__ import annotations
 
@@ -21,6 +30,8 @@ import sqlite3
 import subprocess
 from datetime import datetime, timezone
 from typing import Any
+
+from agentic_fx.backtest.metrics import METRIC_KEYS
 
 _HARNESS_SCOPES = frozenset({"in_sample", "holdout_gate"})
 
@@ -120,7 +131,13 @@ def in_sample_view(conn: sqlite3.Connection, *,
     for row in rows:
         d = dict(row)
         metrics_json = d.pop("metrics_json")
-        d["metrics"] = json.loads(metrics_json)
+        raw_metrics = json.loads(metrics_json)
+        # fix round 1 F1 (codex Important): metrics dict は save_harness_run
+        # の任意入力なので、"period_start"/"period_end" 等を metrics に
+        # 混入されると列遮断 (holdout 遮断 1) を密輸できてしまう。読み側で
+        # METRIC_KEYS の白リスト濾過をかける (遮断境界は view 側)。
+        d["metrics"] = {k: v for k, v in raw_metrics.items()
+                        if k in METRIC_KEYS}
         result.append(d)
     return result
 

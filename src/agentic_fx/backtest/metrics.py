@@ -3,19 +3,32 @@
 Task 7 の ``BacktestResult`` (orders は orders テーブルの生行、equity_curve
 は実現損益ベース) から成績指標を集計する。closed 注文のみを対象にする。
 
-fail closed 方針 (上書き節 A): closed 行の ``realized_pnl`` /
-``stop_loss`` / ``avg_fill_price`` / ``quantity`` が欠損、あるいは
-avg_r のリスク額が 0 (``avg_fill_price == stop_loss``) になるのは、
-実運用の risk gate 契約上あり得ないデータ破損なので黙って skip せず
-``ValueError`` にする。
+fail closed 方針 (上書き節 A + fix round 1 F2): closed 行の
+``realized_pnl`` / ``stop_loss`` / ``avg_fill_price`` / ``quantity`` が
+欠損・非有限 (nan/inf)、``quantity`` が 0 以下、あるいは avg_r のリスク額
+が 0 (``avg_fill_price == stop_loss``) になるのは、実運用の risk gate
+契約上あり得ないデータ破損なので黙って skip せず ``ValueError`` にする。
 """
 from __future__ import annotations
+
+import math
 
 from agentic_fx.backtest.runner import BacktestResult
 from agentic_fx.datafeed.price_provider import _SPECS
 
 # §6: 30 取引未満は足切り／採用いずれの判定にも使わない。
 EVALUABLE_MIN_TRADES = 30
+
+# compute_metrics の返却キー一覧 (公開定数)。fix round 1 F1 (codex Important):
+# save_harness_run(metrics={...}) は任意 dict を受け取れるため、metrics に
+# "period_start"/"period_end" 等の余計なキーを混入させれば in_sample_view
+# の列遮断 (holdout 遮断 1) を metrics_json 経由で密輸できてしまう。
+# 遮断境界は「改善ループが読む唯一の面」である in_sample_view 側なので、
+# 読み側 (store/backtest_runs.py) がこの定数で白リスト濾過する。
+METRIC_KEYS = frozenset({
+    "trades", "pf", "win_rate", "avg_r", "max_drawdown", "total_pnl",
+    "evaluable", "fallback_spread_used",
+})
 
 
 def _max_drawdown(equity_curve: list[tuple[str, float]]) -> float:
@@ -36,11 +49,25 @@ def _max_drawdown(equity_curve: list[tuple[str, float]]) -> float:
     return max_dd
 
 
-def _closed_metrics(closed: list[dict]) -> tuple[float, float, int, float, list[float]]:
-    """closed 行を 1 回走査して (total_pnl, gross合計対, wins, ...) を出す。
-
-    戻り値: (total_pnl, gross_profit, gross_loss, wins, r_multiples)
+def _require_finite(value: float | None, field: str, order_id) -> float:
+    """fix round 1 F2 (codex Minor): None だけでなく非有限値 (nan/inf) も
+    fail closed する。負・0 の quantity は呼び出し側で別途弾く (符号は
+    フィールドごとに意味が違うため、ここでは有限性のみを見る)。
     """
+    if value is None:
+        raise ValueError(
+            f"closed order id={order_id!r} has {field}=None "
+            "(data corruption)")
+    if not math.isfinite(value):
+        raise ValueError(
+            f"closed order id={order_id!r} has non-finite {field}={value!r} "
+            "(data corruption)")
+    return value
+
+
+def _closed_metrics(closed: list[dict]) -> tuple[float, float, float, int, list[float]]:
+    """closed 行を 1 回走査して (total_pnl, gross_profit, gross_loss, wins,
+    r_multiples) を出す。"""
     total_pnl = 0.0
     gross_profit = 0.0
     gross_loss = 0.0
@@ -48,30 +75,21 @@ def _closed_metrics(closed: list[dict]) -> tuple[float, float, int, float, list[
     r_multiples: list[float] = []
 
     for row in closed:
-        pnl = row["realized_pnl"]
-        if pnl is None:
-            raise ValueError(
-                f"closed order id={row.get('id')!r} has realized_pnl=None "
-                "(data corruption — closed orders must have realized_pnl)")
-        stop_loss = row["stop_loss"]
-        avg_fill_price = row["avg_fill_price"]
+        order_id = row.get("id")
+        pnl = _require_finite(row["realized_pnl"], "realized_pnl", order_id)
+        stop_loss = _require_finite(row["stop_loss"], "stop_loss", order_id)
+        avg_fill_price = _require_finite(
+            row["avg_fill_price"], "avg_fill_price", order_id)
         quantity = row["quantity"]
-        if stop_loss is None:
+        if quantity is None or not math.isfinite(quantity) or quantity <= 0:
             raise ValueError(
-                f"closed order id={row.get('id')!r} has stop_loss=None "
-                "(data corruption)")
-        if avg_fill_price is None:
-            raise ValueError(
-                f"closed order id={row.get('id')!r} has avg_fill_price=None "
-                "(data corruption)")
-        if quantity is None or quantity == 0:
-            raise ValueError(
-                f"closed order id={row.get('id')!r} has invalid "
-                f"quantity={quantity!r} (data corruption)")
+                f"closed order id={order_id!r} has invalid "
+                f"quantity={quantity!r} (data corruption — must be a "
+                "finite positive number)")
         risk_price = abs(avg_fill_price - stop_loss)
         if risk_price == 0:
             raise ValueError(
-                f"closed order id={row.get('id')!r} has zero risk "
+                f"closed order id={order_id!r} has zero risk "
                 "(avg_fill_price == stop_loss — data corruption)")
 
         contract_size = _SPECS[row["pair"]].contract_size  # 未知 pair は KeyError で fail closed
