@@ -6,21 +6,21 @@
 
 **運用**: プラン 1〜5 と同じ SDD パターン (実装 subagent + sonnet/codex 並行レビュー + コントローラ変異照合 + 節目停止 → ユーザー許可)。**絶対制約 (CLAUDE.md) は全プランに適用**: Anthropic API 従量課金 不使用 / 発注・SL 変更・クローズ・資金保護は決定論的コードのみ / drawdown kill switch は config で無効化不可 / 秘密は .env のみ。
 
-## プラン系列と依存
+## プラン系列と依存 (2026-08-01 レビュー反映: 堅牢化を改善ループの前に前倒し)
 
 ```
 プラン 6 (バックテスト基盤 + 履歴分析)   ← 依存なし。LLM 不要
    ↓
 プラン 7 (plugin 機構 + signals + シグナル起動)   ← 6 の評価基盤を使う
    ↓
-プラン 8 (ClaudeRunner + 改善ループ)   ← 6 の run_backtest ツール、7 の plugin 作成先
+プラン 8 (サービス堅牢化: worker 隔離 + preemption + park 返済)   ← 7 の sandbox 機構を共有
    ↓
-プラン 9 (操作 API + client.py + Discord 承認)   ← 8 の improve 起動
+プラン 9 (ClaudeRunner + 改善ループ)   ← 6/7 の成果物 + 8 の worker 隔離が前提
    ↓
-プラン 10 (サービス堅牢化: preemption ほか)   ← 7 の sandbox 機構を共有。全 loop 安定後
+プラン 10 (操作 API + client.py + Discord 承認)   ← 9 の improve 起動
 ```
 
-順序の根拠: 6 は LLM 不要で単体完結し、7 の採用ゲート・8 の品質ゲートの前提。10 (preemption) を最後に置くのは全 loop の実行形が出揃ってから隔離するため — ただし **8 の改善 Mission は長時間実行になるため、8 の実行前に 10 の前倒しを再検討してよい** (詳細化時の判断点として残す)。
+順序の根拠: 6 は LLM 不要で単体完結し、7 の採用ゲート・9 の品質ゲートの前提。**堅牢化 (旧プラン 10) を改善ループの前に置くのはレビュー裁定 (codex I10 / sonnet I7)**: 改善 Mission は長時間・コード編集・pytest 実行を伴うため、worker 隔離・preemption・「Mission 中も SL/TP 監視継続」(資金保護 = CLAUDE.md 絶対制約) が無いまま先に危険な実行形を完成させない。また **holdout の到達不能性 (遮断項目 2) は worker のプロセス/権限境界で初めて構造的に成立する** — プラン 6 が提供するのは遮断の部品までであり (下記)、改善ループを動かす前に境界が要る。
 
 ---
 
@@ -48,9 +48,11 @@
 | 11 | 人間 CLI | backtest / history / analyze サブコマンド |
 | 12 | 速度実測ゲート + E2E | 1 年相当 replay ベンチ + import→replay→記録の通し |
 
-**受入条件**: ①Dukascopy から取り込んだ実 1m で、scripted IntentSource による open→約定→TP→closed→成績記録が通る ②holdout 遮断の回帰テスト (期間引数なし・ビュー制限・分析出力スキーマ) が green ③1 年分 replay の実測時間を記録 (目標オーダー: 数分/年。超過時は次プランで最適化タスク化) ④既存 791+ tests green。
+**受入条件**: ①Dukascopy から取り込んだ実 1m で、scripted IntentSource による open→約定→TP→closed→成績記録が通る ②holdout 遮断の**部品**の回帰テスト (期間引数なし・ビュー制限 (issuer 込み)・分析出力スキーマ・エラー固定コード) が green ③1 年分 replay の実測時間を記録 (目標オーダー: 数分/年。超過時は次プランで最適化タスク化) ④既存 791+ tests green。
 
-**プラン 7 への提供物**: `IntentSource` プロトコル (plugin アダプタの差し込み先) / `run_backtest_in_sample(intent_source, pair)` / `run_holdout_gate(...)` (承認フローが呼ぶ) / analysis_runs 参照キー。
+**遮断の完成条件の明示 (レビュー裁定 codex C4)**: プラン 6 単体が保証するのは**遮断部品** (API 形状・ビュー・出力契約) までである。遮断 8 項目の**構造的成立** — holdout 実行の到達不能性 (項目 2)・DB 直読不能 (項目 3)・`data/` 不可視 (項目 4)・holdout 派生情報の非露出 (項目 8) — は改善 worker のプロセス/権限境界 (プラン 8) と改善ループ registry (プラン 9) で閉じる。**全 8 経路の統合回帰テストはプラン 9 の blocking 受入条件**とする (これが green になるまで改善ループは有効化しない)。
+
+**プラン 7 への提供物**: `IntentSource` プロトコル (plugin アダプタの差し込み先) / `run_in_sample(settings, *, history_conn, symbol, source, intent_source, eval_timeframe, plugin_ref, content_hash, kind, now)` / `run_holdout_gate(...)` (同引数 — 採用ゲート専用、到達不能化はプラン 8) / `analyze_for_agent` / analysis_runs 参照キー。
 
 ---
 
@@ -81,7 +83,29 @@
 
 ---
 
-## プラン 8: ClaudeRunner + 改善ループ
+## プラン 8: サービス堅牢化 (worker 隔離 + preemption + park 返済)
+
+**目的**: §15 Phase 2 の preemption 受入条件を満たすプロセス隔離と、プラン 5 最終レビューで park した堅牢化項目の返済。**改善ループ (プラン 9) の前提**。
+
+**spec 参照**: §15 Phase 2 受入条件 (worker process 隔離 / 子プロセス DB 分離 / terminate→kill / timeout finalize / 部分 transcript / **Mission 実行中も SL/TP 監視継続**)。
+
+**task 一覧 (概略)**:
+
+| # | task | 一言 |
+|---|---|---|
+| 1 | Mission worker プロセス | runner.run のプロセス隔離・子側 DB 接続分離・部分 transcript。**holdout/履歴 DB へ worker から到達不能な権限境界** (遮断項目 2/3/4 の構造的成立点) |
+| 2 | preemption | 親の壁時計監視・terminate→kill・timeout finalize (missions 行) |
+| 3 | 資金保護の並行継続 | Mission 中も _process_exits が走る構造 (core_lock 粒度の再設計) — CLAUDE.md 絶対制約 |
+| 4 | スレッド監督 | scheduler/watchdog の heartbeat・死亡時 activity+通知+非ゼロ終了 (park: codex I2) |
+| 5 | health ラッチ | activity 書き込み失敗の latched health + 別経路警告 (park: codex I3) |
+| 6 | 資源終端 | App.close 集約・build 失敗の逆順 cleanup (park: codex I4) |
+| 7 | 小口 park 返済 | retry policy 再設計 (_last_trade) / clock 配線 / provider ctor seam / policy OSError / shell readline 中断 / 残 minor 群 |
+
+**受入条件**: llama-swap ハング注入で Mission が kill され missions 行が timeout finalize される / Mission 実行中に SL 到達 → クローズが遅延なく実行されるテスト / worker プロセスから `run_holdout_gate`・`ohlcv` 直読・`data/` が構造的に到達不能であることのテスト。
+
+---
+
+## プラン 9: ClaudeRunner + 改善ループ
 
 **目的**: §4 ClaudeRunner (claude-agent-sdk、サブスク認証) と §6 戦略改善 loop (発見→リサーチ→実施の週次 Mission・品質ゲート・PR/approval 出力) を実装する。
 
@@ -100,13 +124,11 @@
 | 7 | policy チャネル | policy add コマンド + 全 Mission への注入は実装済み (Phase 1) — 追記経路のみ |
 | 8 | E2E | FakeRunner で発見→レポート→PR 化禁止分岐/approval 発行 |
 
-**受入条件**: 改善ループのツールセットに履歴 DB 直読・期間指定バックテスト・get_signals が**無い**ことの回帰テスト (遮断 8 項目) / main 直 push 不可 / ClaudeRunner はサブスク認証のみ。
-
-**判断点 (詳細化時)**: プラン 10 (preemption) を先行させるか — 改善 Mission は長時間・コード編集を伴うため。
+**受入条件 (blocking)**: **遮断 8 項目の全経路統合回帰テスト** (プラン 6 の部品 + プラン 8 の worker 境界を通しで検証 — これが green になるまで改善ループを有効化しない) / 改善ループのツールセットに履歴 DB 直読・期間指定バックテスト・get_signals が**無い**ことの回帰テスト / main 直 push 不可 / ClaudeRunner はサブスク認証のみ。改善 Mission は プラン 8 の worker 隔離上で実行する (in-process 実行の改善ループは作らない)。
 
 ---
 
-## プラン 9: 操作 API + client.py + Discord 承認
+## プラン 10: 操作 API + client.py + Discord 承認
 
 **目的**: §7 操作 REST API (FastAPI・キー 2 段・autopilot 中の変更系拒否) と §8 client.py、§9 discord_bot 連携 (cog は別リポジトリ)、news_sources 承認フローを実装する。
 
@@ -126,28 +148,6 @@
 | 8 | E2E | キー 2 段・autopilot 拒否・ask 発注不可の回帰 |
 
 **受入条件**: 「載せない一線」(発注操作・資金設定・mode・autopilot・停止) のエンドポイント不存在テスト / ask から TradeIntent 経路が無いこと。
-
----
-
-## プラン 10: サービス堅牢化 (preemption + park 返済)
-
-**目的**: §15 Phase 2 の preemption 受入条件を満たすプロセス隔離と、プラン 5 最終レビューで park した堅牢化項目の返済。
-
-**spec 参照**: §15 Phase 2 受入条件 (worker process 隔離 / 子プロセス DB 分離 / terminate→kill / timeout finalize / 部分 transcript / **Mission 実行中も SL/TP 監視継続**)。
-
-**task 一覧 (概略)**:
-
-| # | task | 一言 |
-|---|---|---|
-| 1 | Mission worker プロセス | runner.run のプロセス隔離・子側 DB 接続分離・部分 transcript |
-| 2 | preemption | 親の壁時計監視・terminate→kill・timeout finalize (missions 行) |
-| 3 | 資金保護の並行継続 | Mission 中も _process_exits が走る構造 (core_lock 粒度の再設計) |
-| 4 | スレッド監督 | scheduler/watchdog の heartbeat・死亡時 activity+通知+非ゼロ終了 (park: codex I2) |
-| 5 | health ラッチ | activity 書き込み失敗の latched health + 別経路警告 (park: codex I3) |
-| 6 | 資源終端 | App.close 集約・build 失敗の逆順 cleanup (park: codex I4) |
-| 7 | 小口 park 返済 | retry policy 再設計 (_last_trade) / clock 配線 / provider ctor seam / policy OSError / shell readline 中断 / 残 minor 群 |
-
-**受入条件**: llama-swap ハング注入で Mission が kill され missions 行が timeout finalize される / Mission 実行中に SL 到達 → クローズが遅延なく実行されるテスト。
 
 ---
 

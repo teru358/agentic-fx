@@ -81,10 +81,11 @@ EmbeddingFunction 互換要件は既存テストの実装を正とする。)
 **Interfaces:**
 - Produces:
   - DDL: `ohlcv(symbol, interval, bar_time, open, high, low, close, volume, source TEXT NOT NULL DEFAULT 'yfinance', spread REAL, PRIMARY KEY (symbol, interval, bar_time, source))`
-  - `upsert_bars(conn, bars, *, source: str = "yfinance") -> int` — **live キャッシュ用**。現行どおり ON CONFLICT 上書き (形成中バーの更新があるため)。既存呼び出し (price_provider) は無変更で動く
-  - `import_bars(conn, rows: list[tuple], *, source: str) -> ImportResult` — **インポータ用・既存行不変**。rows は `(symbol, interval, bar_time_iso, o, h, l, c, volume, spread|None)`。同一キー同一値 (float は誤差 1e-9 未満) は無変更、**値が異なる既存行はスキップして件数計上** (`ImportResult(inserted, unchanged, conflicted)`)、conflicted > 0 は WARNING ログ
-  - `load_bars(conn, symbol, interval, *, source: str = "yfinance", since=None, until=None) -> list[Bar]` — **source 必須の絞り込み** (既定 yfinance で既存呼び出しの意味は不変)。`until` は分析・バックテストの端点用 (endpoint は呼び出し側 = ハーネスが計算)
+  - `upsert_bars(conn, bars, *, source: str) -> int` — **live キャッシュ用・source は必須引数** (既定値を置かない)。現行どおり ON CONFLICT 上書き (形成中バーの更新があるため — spec §6 の live 例外)。**呼び出し追随 (レビュー裁定 codex I7)**: `price_provider.py` は現在どの取得元のバーも単一呼び出しで書いている — 取得チェーンの**実ソース名** (`"yfinance"` / `"twelvedata"` / `"mt5-live"`) を取得箇所毎に渡すよう追随修正する (全部を yfinance 名義で書くと live ソース同士が上書きし合い、source 列が嘘になる)。既存 ohlcv キャッシュ行は migration で `'yfinance'` になる (Phase 1 の実態と一致)
+  - `import_bars(conn, rows: list[tuple], *, source: str) -> ImportResult` — **インポータ用・既存行不変**。rows は `(symbol, interval, bar_time_iso, o, h, l, c, volume, spread|None)`。同一キー同一値 (float は誤差 1e-9 未満。**spread の NULL 同士は一致、NULL vs 数値は conflicted**) は無変更、**値が異なる既存行はスキップして件数計上** (`ImportResult(inserted, unchanged, conflicted)`)、conflicted > 0 は WARNING ログ
+  - `load_bars(conn, symbol, interval, *, source: str, since=None, until=None) -> list[Bar]` — **source はデフォルト無しの必須 keyword** (呼び忘れが静かに yfinance に流れるのを型で防ぐ — レビュー裁定 codex M2)。既存呼び出し (price_provider) は `source="yfinance"` 等を明示して追随。`until` は分析・バックテストの端点用 (endpoint は呼び出し側 = ハーネスが計算)
   - `load_spread(conn, symbol, bar_time_iso, *, source) -> float | None`
+  - **migration の運用手順 (レビュー裁定 codex I6)**: 再構築はトランザクション内 (`BEGIN IMMEDIATE` → RENAME → CREATE → INSERT..SELECT → DROP → COMMIT、例外時 ROLLBACK)。`init_db` は `executescript(_SCHEMA)` の**後**に `_migrate_ohlcv_v2` を呼ぶ (v1 検出 = `source` 列なし。途中失敗で `ohlcv_v1` が残った場合は次回起動時に再開できるよう、`ohlcv_v1` 存在 + `ohlcv` が v2 なら INSERT..SELECT からやり直す)。**実 DB への適用はサービス停止中に行い、CLI/手順書に「`cp data/agentic.db data/agentic.db.bak-YYYYMMDD` を先に取る」ことを明記**。テスト: 途中失敗注入 (INSERT..SELECT で例外を monkeypatch) → ROLLBACK され v1 のまま → 再実行で成功
 
 - [ ] **Step 1: migration の失敗するテストを書く** — `tests/store/test_db.py` に追記 (trigger 列 migration テストと同型):
 
@@ -188,6 +189,7 @@ def test_upsert_bars_still_overwrites_live_cache(tmp_path):
   - `backtest: BacktestSettings` — `holdout_months: int = 3 (ge=1)` / `initial_balance: float = 1_000_000 (gt=0)` / `speed_gate_note: str = ""` は持たない (YAGNI — ベンチ結果はレジャーに記録)
   - `datafeed.watch_symbols: list[str] = []` — 取引不可・分析専用 (§6)
   - `analysis: AnalysisSettings` — `max_watch_symbols: int = 10 (ge=1)` / `max_gap_pct: float = 5.0 (gt=0)`
+  - `Settings` の `model_validator` に **`len(datafeed.watch_symbols) <= analysis.max_watch_symbols`** を追加 (選定基準⑤の機械的強制 — 規約でなくバリデータ)
 
 - [ ] **Step 1: 失敗するテストを書く** — `tests/test_config.py` に追記:
 
@@ -201,13 +203,31 @@ def test_backtest_and_analysis_defaults():
     assert s.analysis.max_gap_pct == 5.0
 
 
-def test_watch_symbols_never_extend_pairs():
-    """watch は取引対象ではない — pairs との独立をピン。"""
-    s = load_settings(EXAMPLE)
-    assert set(s.datafeed.watch_symbols).isdisjoint(set(s.pairs)) or True
-    # 構造上の独立: watch_symbols は RiskSettings.pair_rules の検証対象外
-    # (pairs に足さない限り risk 検証は要求されない)
+def test_watch_symbols_never_extend_pairs(tmp_path):
+    """watch は取引対象ではない — pair enum / risk 検証との独立を実 assert でピン。"""
+    # watch_symbols を足した settings でも:
+    s = _settings_with(watch_symbols=["XAUUSD"])  # model_copy ヘルパ (下記)
+    # ① market_tools の pair enum は settings.pairs のみ (watch が混入しない)
+    from agentic_fx.tools import market_tools
+    from agentic_fx.tools.registry import ToolRegistry
+    reg = ToolRegistry()
+    reg.register_all(market_tools.build(MagicMock(), MagicMock(), s))
+    schema = [t for t in reg.openai_tools(["get_ohlcv"])][0]
+    enum = schema["function"]["parameters"]["properties"]["pair"]["enum"]
+    assert enum == list(s.pairs) and "XAUUSD" not in enum
+    # ② watch_symbols は risk.pair_rules の検証対象外 (load が通ること自体が証明)
+
+
+def test_watch_symbols_capped_by_max(tmp_path):
+    """選定基準⑤: 上限は設定バリデータで機械的に強制 (レビュー裁定)。"""
+    with pytest.raises(ValidationError):
+        _settings_with(watch_symbols=[f"SYM{i}" for i in range(11)])  # 11 > 10
 ```
+
+(`_settings_with` は example を読み `model_copy(update=...)` で datafeed を差し替える
+テストローカルヘルパ。上限強制は `Settings` の `model_validator` で
+`len(datafeed.watch_symbols) <= analysis.max_watch_symbols` を検証する実装。
+openai_tools の返却構造は実装時に実物で確認して assert を合わせること。)
 
 - [ ] **Step 2: FAIL → 実装** — `_Strict` サブクラスで `BacktestSettings` / `AnalysisSettings` を追加、`DatafeedSettings` に `watch_symbols: list[str] = []`。**example と個人 settings.yaml の両方**に追記 (コメントで「コア所有 — 変更は人間レビュー必須」と明記):
 
@@ -238,7 +258,7 @@ analysis:                      # コア所有 (§6 履歴分析)
 - Produces:
   - `hour_url(symbol: str, dt_utc: datetime) -> str` — `https://datafeed.dukascopy.com/datafeed/{SYM}/{YYYY}/{MM:02d}/{DD:02d}/{HH:02d}h_ticks.bi5`。**月は 0 始まり** (1 月 = `00`) — Dukascopy 仕様の罠。既知仕様として実装し、Step 5 の実データ照合で確定する
   - `decode_bi5(payload: bytes, *, point: float, hour_start_utc: datetime) -> list[Tick]` — LZMA 展開 → 20 byte レコード `struct '>3i2f'` = (ms_offset, ask_points, bid_points, ask_vol, bid_vol)。`Tick(ts, bid, ask)` (`bid = bid_points * point`)
-  - `point_of(symbol: str) -> float` — クォート通貨 JPY なら `1e-3`、それ以外 `1e-5` (InstrumentSpec の quote_currency を参照する薄い関数。**symbol 文字列切り出しは §5 で禁止** — spec テーブルに無い symbol は明示エラー)
+  - `point_of(symbol: str) -> float` — **取引 spec (`_SPECS`) とは分離した Dukascopy 用メタデータ表** `_DUKASCOPY_POINTS: dict[str, float]` を `backtest/dukascopy.py` 内に持つ (レビュー裁定 codex I9: `_SPECS` は取引対象 2 ペアのみで、watch 銘柄 (XAUUSD・指数等) をカバーできない)。初期エントリは USDJPY=1e-3 / EURUSD=1e-5。watch 銘柄の追加時にこの表へ 1 行足す (**symbol 文字列切り出しによる推測は §5 で禁止** — 表に無い symbol は明示エラー)。取引ペアについては `_SPECS` の quote_currency と表の整合をテストでピンする
   - `class Tick(NamedTuple): ts: datetime; bid: float; ask: float`
 
 - [ ] **Step 0: テスト共通ヘルパを作る** — `tests/backtest/conftest.py` (本プランの全テストが使う。以降の task のテスト内 `_conn` / `_row_at` / `_bi5` / `H` / `WED` / `SETTINGS` はここから import するか fixture で受ける):
@@ -338,7 +358,14 @@ print(url, len(ticks), ticks[0] if ticks else None)
 EOF
 ```
 
-期待: 数千 tick、bid/ask が当日の USDJPY レート帯 (MT5 実測と ±1% 以内)。**乖離したら仮定 (struct 順・point) を修正してテストも直す** — 合成フィクスチャは仮定の自己整合しか検証しないため、この照合が仮定の正しさを担保する。
+照合スクリプトは以下を**機械 assert** する (レビュー裁定 codex I8 — 先頭 tick の目視だけでは struct 順・volume 位置・point の誤りを検出できない):
+1. **USDJPY と EURUSD の両方** (JPY point と非 JPY point の双方を検証)
+2. 件数が閾値以上 (平日 12 時台 ≥ 500 tick) / **ms オフセットが単調非減少かつ 0..3,600,000 の範囲** / レコード長が 20 の倍数 (余りゼロ)
+3. 全 tick で `0 < bid < ask` かつ spread の中央値が現実的範囲 (USDJPY: 0.001〜0.05 / EURUSD: 0.00001〜0.0005)
+4. **同じ 1 時間の MT5 1m (bridge 経由) と突き合わせ**、分毎の `Dukascopy mid` vs `MT5 bid` の平均絶対誤差が 0.1% 未満
+5. 対象日時はスクリプト引数で渡す (固定日を埋め込まない — 再実行可能に)
+
+**乖離したら仮定 (struct 順・point・月 0 始まり) を修正してテストも直す** — 合成フィクスチャは仮定の自己整合しか検証しないため、この照合が仮定の正しさを担保する。スクリプトは `scripts/verify_dukascopy.py` として残す (再検証可能な資産)。
 
 ---
 
@@ -406,7 +433,7 @@ def test_import_skips_empty_hours(tmp_path):
 - Consumes: MT5 bridge `GET {base}/ohlcv/{sym}?from=..&to=..&interval=1m` (応答: `{"symbol","interval","bars":[{"time","open","high","low","close","volume"},...]}` — 2026-08-01 実測形)。Task 1 の `import_bars`
 - Produces:
   - `import_mt5(conn, symbol, start, end, *, base_url, fetch=None) -> ImportResult` — 1 日窓でページングし `import_bars(source="mt5")` (spread=None)。**MT5 は bid 系列** — mid 近似としてそのまま保存 (§6 の但し書きどおり)
-  - `compare_sources(conn, symbol, *, a="dukascopy", b="mt5") -> dict` — 両 source が重複する期間の close 差 `a_mid − assumed_half_spread` vs `b` の {count, mean, std, max_abs} を返す (人間 CLI / 報告用。assumed_half_spread は settings.risk.pair_rules の assumed_spread_pips から換算)
+  - `compare_sources(conn, symbol, settings, *, a="dukascopy", b="mt5") -> dict` — 両 source が重複する期間の close 差 `a_mid − assumed_half_spread` vs `b` の {count, mean, std, max_abs} を返す (人間 CLI / 報告用)。`assumed_half_spread` は **`settings.risk.pair_rules[symbol].assumed_spread_pips` から換算** — settings は明示引数 (暗黙ロードしない)
 
 - [ ] **Step 1: 失敗するテストを書く**:
 
@@ -432,7 +459,7 @@ def test_compare_sources_reports_distribution(tmp_path):
     ohlcv.import_bars(conn, [("USDJPY", "1m", H.isoformat(),
                               148.0, 148.2, 147.9, 148.10, 5, None)],
                       source="mt5")
-    rep = compare_sources(conn, "USDJPY")
+    rep = compare_sources(conn, "USDJPY", SETTINGS)
     assert rep["count"] == 1 and abs(rep["mean"]) < 0.01
 ```
 
@@ -454,7 +481,7 @@ def test_compare_sources_reports_distribution(tmp_path):
 - Consumes: `agentic_fx.core.contracts.Clock` (Protocol) / Task 1 の `load_bars(source 必須)`
 - Produces:
   - `class ReplayClock:` — `__init__(start: datetime)` / `now() -> datetime` (Clock 実装) / `advance() -> datetime` (+1 分して返す)。**履歴バーの有無に関わらず UTC 1m 格子を連続に進める** (§6 契約)
-  - `class BarFeed:` — `__init__(conn, symbol, *, source: str, start, end)`。1m バーを `{ts_iso: Bar}` に前読みし、`bar_at(ts) -> Bar | None` (欠損は None)。`latest_1m(ts) -> Bar | None` は `bar_at` の別名 (scheduler の `bars_fn` 契約に合わせ、その時刻のバーのみ返す — 過去へ遡らない: 欠損 tick で古いバーを返すと価格依存判定が「バー存在」と誤認するため)
+  - `class BarFeed:` — `__init__(conn, symbol, *, source: str, start, end)`。1m バーを `{ts_iso: Bar}` に前読みし、`bar_at(ts) -> Bar | None` (欠損は None)。`latest_1m(ts) -> Bar | None` は `bar_at` の別名 (scheduler の `bars_fn` 契約に合わせ、その時刻のバーのみ返す — 過去へ遡らない: 欠損 tick で古いバーを返すと価格依存判定が「バー存在」と誤認するため)。**`spread_at(ts) -> float | None` も持つ** (`ohlcv.spread` 列を同じ前読みで保持 — quote 生成の spread 解決経路。レビュー裁定 sonnet I2: 毎 tick の DB クエリを避け、未定義シンボル `spread_of` を置き換える)
   - `quote_from_bar(bar: Bar, spread: float) -> Quote` — `bid = close − spread/2`, `ask = close + spread/2`, ts=bar.ts, source="backtest"
 
 - [ ] **Step 1: 失敗するテストを書く**:
@@ -502,12 +529,35 @@ def test_quote_from_bar_half_spread():
   - `IntentSource = Callable[[Bar], dict | None]` — 引数は **確定した評価 timeframe バー**。返り値は LLM 出力と同形の dict (`{"action": "open", ...}` / None = 提案なし)。**プラン 7 の strategy plugin アダプタはこの型に合わせる**
   - `@dataclass BacktestResult: orders: list[dict]; equity_curve: list[tuple[str, float]]; start: datetime; end: datetime; source: str; fallback_spread_used: bool`
   - `run_replay(settings, *, symbol, source, start, end, intent_source, eval_timeframe="1h", history_conn) -> BacktestResult` — 中身:
-    1. `conn = connect(":memory:")` + `init_db(conn)` — **実 DB に触れない**。`StateStore` は `tempfile` 配下
-    2. `record_snapshot(conn, now=start, balance=settings.backtest.initial_balance, equity=...)`
-    3. no-op 注入: `_NullActivity` (write/tail が何もしない) / `Notifier(enabled=False, webhook_url=None)` / `on_news_cycle=lambda: None` / `on_econ_cycle=lambda: None`
-    4. `quote_fn = lambda pair: quote_from_bar(current_bar, spread_of(current_bar))` — spread は `ohlcv.spread` → 無ければ `settings.risk.pair_rules[pair].assumed_spread_pips` から換算 (使用したら `fallback_spread_used=True`)。`rate_fn` は同じ quote から構成 (test_wiring.py の実配線パターンに合わせる)
-    5. メインループ: `while clock.now() < end:` — `bar = feed.bar_at(now)`。`is_market_open(now)` かつ bar があれば `scheduler.tick(now)` 相当の**約定・SL/TP 監視のみ**を回す (取引判断 Mission は cron でなく IntentSource 駆動のため、`Scheduler` は `on_trade_mission=lambda reason: None` で組み、tick の fills/exits 経路だけを使う)。時間依存判定 (指値期限・day クローズ) は bar 欠損でも tick を呼んで進める (§6: 価格依存はスキップ・時間依存は進む — tick 内の fills は bars_fn が None を返すことで自然にスキップされる)
-    6. **評価 timeframe のバー確定を検出** (eval_timeframe 境界を跨いだ最初の 1m tick) したら、確定バーで `proposal = intent_source(closed_bar)`。None でなければ: `mid = missions.start(conn, "trade", "backtest", "intent-source", clock.now())` → `missions.finish(..., "completed", proposal, [], clock.now())` (**synthetic Mission** — §6。origin/mission_id/loop 検証を同一コードで通すため) → `intent = TradeIntent.from_llm_dict(proposal, origin=Origin.SCHEDULER)` → `executor.handle_intent(intent, mid)`。**呼び出しは次の 1m tick の advance 後** (先読み禁止 — 評価バー自身の 1m では約定に参加させない)
+    1. `conn = connect(":memory:")` + `init_db(conn)` — **実 DB に触れない**。`StateStore` は `tempfile` 配下。**state は mode=learning / autopilot=off のまま使う** (実運用 Phase 2 と同一条件での再生が忠実 — trading モードの再生は Phase 3 で扱う。レビュー裁定 codex I5)
+    2. **残高の配線 (レビュー裁定 sonnet C1 — これを欠くと kill switch が初回 tick で誤ラッチし得る)**: `PaperBroker.equity()` は `settings.paper.starting_balance` 基準のため、`bt_settings = settings.model_copy(update={"paper": settings.paper.model_copy(update={"starting_balance": settings.backtest.initial_balance})})` を作り、**broker/executor/scheduler にはこの bt_settings を渡す**。その上で `record_snapshot(conn, now=start, balance=settings.backtest.initial_balance, equity=同値)` を初期投入 (equity/hwm の起点と broker 残高が一致する)
+    3. no-op 注入: `_NullActivity` (write/tail が何もしない) / `Notifier(enabled=False, webhook_url=None)` / `on_news_cycle=lambda: None` / `on_econ_cycle=lambda: None` / `on_trade_mission=lambda reason: None` (取引判断は cron でなく IntentSource 駆動)
+    4. `bars_fn` は**現在 tick 時刻を閉じ込めたクロージャ** (レビュー裁定 sonnet I3): `current_ts` を nonlocal に持ち、`bars_fn = lambda pair: feed.bar_at(current_ts) if pair == symbol else None`。tick 呼び出しの直前に `current_ts = now` を更新する
+    5. `quote_fn = lambda pair: quote_from_bar(feed.bar_at(current_ts), _spread(current_ts))` — `_spread(ts)` は `feed.spread_at(ts)` → None なら `bt_settings.risk.pair_rules[symbol].assumed_spread_pips × pip_size` (使用したら `fallback_spread_used=True`)。`rate_fn` は同じ quote から構成 (tests/test_wiring.py の実配線パターンに合わせる)
+    6. **メインループ (逐語 — この順序が先読み禁止の本体。レビュー裁定 codex I4 / sonnet I5)**:
+
+```
+now = start
+while now < end:
+    current_ts = now
+    scheduler.tick(now)            # ← 無条件に毎分呼ぶ (市場クローズ判定は tick 内部。
+                                   #    レビュー裁定 sonnet I1 — 「bar があれば」で囲まない)
+    if pending_proposal is not None:            # 前 tick までに確定した提案を今 tick で執行
+        mid = missions.start(conn, "trade", "backtest", "intent-source", now)
+        missions.finish(conn, mid, "completed", pending_proposal, [], now)
+        intent = TradeIntent.from_llm_dict(pending_proposal, origin=Origin.SCHEDULER)
+        executor.handle_intent(intent, mid)     # market は今 tick の quote (= 評価バー外)。
+        pending_proposal = None                 # 指値の初回約定判定は次 tick の fills から
+    if now が eval_timeframe の bucket 境界 (bucket [B, B+tf) の終端 == now):
+        closed_bar = 直前 bucket の 1m バーを集約 (部分欠損はそのまま集約。
+                     bucket 内に 1m バーが 1 本も無ければ評価スキップ)
+        if closed_bar is not None and is_market_open(now):
+            pending_proposal = intent_source(closed_bar)     # 執行は次周回 (= 次 tick) 以降
+    now = clock.advance()
+```
+
+    - 順序の意味: 提案は「評価バケット終端の tick」で生成し、**執行 (handle_intent) はその次の tick の tick() 処理後**に行う。market 注文はその tick の quote (評価バケット外のバー) で約定し、指値の初回約定チェックはさらに次の tick の fills — いずれも評価に使ったバーでは約定しない。`test_no_lookahead_same_bar` がこの契約をピンする
+    - **bucket 確定の定義 (レビュー裁定 codex I3)**: bucket は `[B, B+tf)` の UTC 半開区間、確定検出は `now == B+tf` の tick。部分欠損 bucket はある分だけで集約 (実運用の get_ohlcv も欠損込みで返すため忠実)、全欠損はスキップ。`is_market_open(now)` が偽の間は評価しない (週末に評価だけ走る歪みを防ぐ)
     7. 終了時: open ポジションはそのまま (成績集計は Task 8 が closed のみ集計)。orders 全行と equity 推移を返す
 
 - [ ] **Step 1: 失敗するテストを書く** (フルサイクル — E2E テスト `tests/test_e2e_phase1.py` の OPEN_INTENT と同じ形の提案を使う):
@@ -590,7 +640,28 @@ def test_real_db_untouched(tmp_path, monkeypatch):
     assert not (tmp_path / "data").exists()
 ```
 
-- [ ] **Step 2: FAIL 確認** → **Step 3: 実装** (上記 Produces の 1〜7)。約定監視は `Scheduler` を組んで `tick(now)` を呼ぶ (fills/exits/期限/day クローズの実運用コードを共有)。cron 起動を抑止するため `Scheduler` の `on_trade_mission` は no-op を渡し、`_last_trade` は start に初期化して毎時発火を無害化する (発火しても no-op)。
+- [ ] **Step 1.5: 残高配線と kill switch のテストを追加** (レビュー裁定 sonnet C1 — 偽陽性 green の予防):
+
+```python
+def test_initial_balance_wiring_no_spurious_killswitch(tmp_path):
+    """backtest.initial_balance ≠ paper.starting_balance でも初回 tick で
+    kill switch がラッチしない (残高の二重基準を塞ぐ)。"""
+    hist = _conn(tmp_path); _seed_history(hist)
+    s = SETTINGS.model_copy(update={"backtest": SETTINGS.backtest.model_copy(
+        update={"initial_balance": 5_000_000.0})})   # paper 側は 1,000,000 のまま
+    res = run_replay(s, symbol="USDJPY", source="dukascopy",
+                     start=WED, end=WED + timedelta(hours=2),
+                     intent_source=lambda b: dict(OPEN),
+                     eval_timeframe="1h", history_conn=hist)
+    closed = [o for o in res.orders if o["status"] == "closed"]
+    assert closed  # ラッチしていれば gate_rejected で 0 件になる
+    assert res.equity_curve[0][1] == 5_000_000.0
+```
+
+- [ ] **Step 2: 現行 tick の時間依存契約を実測する** (レビュー裁定 codex C3 — 実装前の前提検証):
+現行 `Scheduler.tick` は `_mark_to_market` 失敗時に early return し (`scheduler.py:117` 付近)、`_expire_limits` / `_force_close_day` に到達しない可能性がある。**先に検証テストを書く**: pending_fill の指値 + 期限切れ時刻 + `bars_fn` が None を返す状態で `tick(now)` → 指値が expired になるか。**ならない場合は tick 内部を「時間依存 (期限・day クローズ) は mark-to-market の成否に関わらず実行する」構造へ小改修する** (実運用でも正しい変更 — データ欠損中に指値期限が凍結するのは欠陥。既存テストの期待は弱めず追随)。この改修は本 task のスコープに含む。
+
+- [ ] **Step 3: FAIL 確認 → 実装** (上記 Produces の 1〜7 とメインループ逐語どおり)。約定監視は `Scheduler` を組んで `tick(now)` を**毎分無条件に**呼ぶ (fills/exits/期限/day クローズ/クローズ判定の実運用コードを共有)。cron 起動は `on_trade_mission` の no-op で無害化する (private 属性への代入はしない)。
 
 - [ ] **Step 4: PASS → 全体 green 確認 → Commit** — `git commit -m "feat: BacktestRunner (in-memory 再生・synthetic Mission・先読み禁止)"`
 
@@ -608,9 +679,9 @@ def test_real_db_untouched(tmp_path, monkeypatch):
 - Consumes: Task 7 の `BacktestResult`
 - Produces:
   - `compute_metrics(result: BacktestResult) -> dict` — `{trades, pf, win_rate, avg_r, max_drawdown, total_pnl, evaluable, fallback_spread_used}`。closed のみ集計。`evaluable = trades >= 30` (§6: 未満は足切りにも採用にも使わない)。PF は `総利益/総損失` (損失 0 なら `inf` でなく None — JSON 保存のため)。avg_r の 1 取引リスク額は `abs(avg_fill_price − stop_loss) × quantity × contract_size` (クォート通貨建て — Phase 2 は USDJPY のみでクォート通貨 = 口座通貨。EURUSD 解禁時は §6 A-9 チェックリストで換算を扱う)。max_drawdown は equity_curve のピーク比。`fallback_spread_used` は BacktestResult から透過 (§6 の品質注記 — metrics_json に載って backtest_runs に残る)
-  - DDL: `backtest_runs(id INTEGER PK, plugin_ref TEXT NOT NULL, content_hash TEXT NOT NULL, kind TEXT NOT NULL, pair TEXT NOT NULL, timeframe TEXT NOT NULL, source TEXT NOT NULL, period_start TEXT NOT NULL, period_end TEXT NOT NULL, scope TEXT NOT NULL CHECK(scope IN ('in_sample','holdout_gate','human_custom')), metrics_json TEXT NOT NULL, settings_hash TEXT NOT NULL, core_commit TEXT NOT NULL, initial_balance REAL NOT NULL, created_at TEXT NOT NULL)`
-  - `backtest_runs.save(conn, *, plugin_ref, content_hash, kind, pair, timeframe, source, period, scope, metrics, settings_hash, core_commit, initial_balance, now) -> int`
-  - `backtest_runs.in_sample_view(conn, *, pair=None) -> list[dict]` — **`scope='in_sample'` のみ**。metrics_json を展開して返す (改善ループが読む唯一の面 — プラン 8 で tool 化)
+  - DDL: `backtest_runs(id INTEGER PK, plugin_ref TEXT NOT NULL, content_hash TEXT NOT NULL, kind TEXT NOT NULL, pair TEXT NOT NULL, timeframe TEXT NOT NULL, source TEXT NOT NULL, period_start TEXT NOT NULL, period_end TEXT NOT NULL, scope TEXT NOT NULL CHECK(scope IN ('in_sample','holdout_gate','human_custom')), **issued_by TEXT NOT NULL CHECK(issued_by IN ('harness','human_cli'))**, metrics_json TEXT NOT NULL, settings_hash TEXT NOT NULL, core_commit TEXT NOT NULL, initial_balance REAL NOT NULL, created_at TEXT NOT NULL)`
+  - **発行主体の分離 (レビュー裁定 codex C2 — 「ハーネス発行行」を判別可能にする)**: `save` は公開しない。公開面は 2 つ — `save_harness_run(...)` (scope は in_sample / holdout_gate のみ受理、`issued_by='harness'` 固定。**呼び出し元は Task 9 の run_in_sample / run_holdout_gate だけ**) と `save_human_run(...)` (scope='human_custom'・`issued_by='human_cli'` 固定 — CLI 用)。issuer を呼び出し引数にしないことで、任意コードが in_sample を偽装保存する経路をモジュール境界で塞ぐ (完全な強制はプラン 8 の worker 権限境界 — ここでは API 形状での防御)
+  - `backtest_runs.in_sample_view(conn, *, pair=None) -> list[dict]` — **`scope='in_sample' AND issued_by='harness'`**。metrics_json を展開して返す (改善ループが読む唯一の面 — プラン 9 で tool 化)。**period_start / period_end は返却列に含めない** (遮断 1)
   - `settings_snapshot_hash(settings) -> str` — risk / sizing 関連 + backtest + spread フォールバックを含む安定 JSON の sha256。`core_commit()` は `git rev-parse HEAD` (取得不能時 "unknown")
 
 - [ ] **Step 1: 失敗するテストを書く**:
@@ -625,25 +696,41 @@ def test_metrics_basic_and_evaluable_threshold():
     assert m2["evaluable"] is False
 
 
-def test_backtest_runs_scope_check_and_view(tmp_path):
+def test_backtest_runs_issuer_and_view(tmp_path):
     conn = _conn(tmp_path)
-    for scope in ("in_sample", "holdout_gate", "human_custom"):
-        backtest_runs.save(conn, plugin_ref="p.py", content_hash="h",
-                           kind="strategy", pair="USDJPY", timeframe="1h",
-                           source="dukascopy", period=(H, H), scope=scope,
-                           metrics={"trades": 0}, settings_hash="s",
-                           core_commit="c", initial_balance=1e6, now=H)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H), metrics={"trades": 0}, settings_hash="s",
+              core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+    backtest_runs.save_harness_run(conn, scope="holdout_gate", **kw)
+    backtest_runs.save_human_run(conn, **kw)     # scope は内部で human_custom 固定
     rows = backtest_runs.in_sample_view(conn)
-    assert len(rows) == 1 and rows[0]["scope"] == "in_sample"
-    with pytest.raises(sqlite3.IntegrityError):  # CHECK 違反 (旧二値 'holdout' は不可)
-        backtest_runs.save(conn, plugin_ref="p.py", content_hash="h",
-                           kind="strategy", pair="USDJPY", timeframe="1h",
-                           source="dukascopy", period=(H, H), scope="holdout",
-                           metrics={"trades": 0}, settings_hash="s",
-                           core_commit="c", initial_balance=1e6, now=H)
+    assert len(rows) == 1 and rows[0]["issued_by"] == "harness"
+    assert {"period_start", "period_end"}.isdisjoint(rows[0].keys())  # 遮断 1
+
+
+def test_human_run_cannot_forge_in_sample(tmp_path):
+    """human 面から in_sample を偽装できない (API 形状 + DB CHECK の二重)。"""
+    conn = _conn(tmp_path)
+    with pytest.raises(TypeError):
+        backtest_runs.save_human_run(conn, scope="in_sample",
+                                     plugin_ref="p", content_hash="h",
+                                     kind="strategy", pair="USDJPY",
+                                     timeframe="1h", source="dukascopy",
+                                     period=(H, H), metrics={},
+                                     settings_hash="s", core_commit="c",
+                                     initial_balance=1e6, now=H)  # scope 引数を受けない
+    with pytest.raises(sqlite3.IntegrityError):  # CHECK: 旧二値 'holdout' は不可
+        conn.execute(
+            "INSERT INTO backtest_runs (plugin_ref, content_hash, kind, pair,"
+            " timeframe, source, period_start, period_end, scope, issued_by,"
+            " metrics_json, settings_hash, core_commit, initial_balance,"
+            " created_at) VALUES ('p','h','strategy','USDJPY','1h','dukascopy',"
+            "'t','t','holdout','human_cli','{}','s','c',1,'t')")
 ```
 
-- [ ] **Step 2: FAIL → 実装 → PASS** — db.py の期待テーブル集合 (`"ohlcv", "missions", ...` の assert セット) に `backtest_runs` を追加。既存 DB への追加は `CREATE TABLE IF NOT EXISTS` で足りる (新テーブル)。
+- [ ] **Step 2: FAIL → 実装 → PASS** — db.py の期待テーブル集合 (`"ohlcv", "missions", ...`) は**テスト側とソース側 (`store/db.py` の TABLE_NAMES frozenset 本体) の両方**を更新する (レビュー裁定 sonnet M4)。既存 DB への追加は `CREATE TABLE IF NOT EXISTS` で足りる (新テーブル)。
 
 - [ ] **Step 3: Commit** — `git commit -m "feat: バックテスト成績集計 + backtest_runs (scope 3 値・再現性メタデータ)"`
 
@@ -659,8 +746,8 @@ def test_backtest_runs_scope_check_and_view(tmp_path):
 - Consumes: Task 7 `run_replay` / Task 8 `compute_metrics`・`backtest_runs.save` / `settings.backtest.holdout_months`
 - Produces:
   - `holdout_boundary(now: datetime, months: int) -> datetime` — `now` から暦月で months 遡った UTC 時刻 (端数日はそのまま — 単純減算。実装は `dateutil` を足さず「月を months 引き、日はクランプ」の純関数)
-  - `run_in_sample(settings, *, history_conn, symbol, source, intent_source, eval_timeframe, plugin_ref, content_hash, kind, now) -> dict` — **期間引数なし**。期間は `(source の最古バー, holdout_boundary(now))` をハーネスが計算。実行 → metrics → `backtest_runs.save(scope="in_sample")` → **metrics のみ返す (期間・端点は返さない)** (§6 遮断 1)
-  - `run_holdout_gate(...同上引数...) -> dict` — 期間 `(holdout_boundary(now), now)`。`scope="holdout_gate"` で保存し metrics を返す。**呼び出し元は採用ゲート (人間承認フロー) に限る** — プラン 7/8 の配線で強制し、本 task ではドキュメンテーションとテストで契約をピンする
+  - `run_in_sample(settings, *, history_conn, symbol, source, intent_source, eval_timeframe, plugin_ref, content_hash, kind, now) -> dict` — **期間引数なし**。期間は `(source の最古バー, holdout_boundary(now))` をハーネスが計算。実行 → metrics → `backtest_runs.save_harness_run(scope="in_sample")` → **metrics のみ返す (期間・端点は返さない)** (§6 遮断 1)
+  - `run_holdout_gate(...同上引数...) -> dict` — 期間 `(holdout_boundary(now), now)`。`save_harness_run(scope="holdout_gate")` で保存し metrics を返す。**呼び出し元は採用ゲート (人間承認フロー) に限る。本プランでの防御は API 形状 (issuer 固定・改善ループ tool に載せない) まで — 到達不能性の構造的成立 (エージェント worker からの import/実行遮断) はプラン 8 の worker 権限境界が担い、プラン 9 の blocking 受入条件で統合検証する** (レビュー裁定 codex C1)
 
 - [ ] **Step 1: 失敗するテストを書く**:
 
@@ -720,7 +807,8 @@ def test_in_sample_and_gate_use_disjoint_periods(tmp_path):
   - `corr_matrix(conn, symbols, *, timeframe, source, in_sample_until) -> dict[tuple[str, str], float]` — log リターンのピアソン相関。整列は UTC bar_time の inner join、欠損バー除外 (§6)
   - `rolling_corr_summary(conn, a, b, *, timeframe, window, source, in_sample_until) -> dict` — **固定 4 統計のみ** `{mean, std, min, max}` (窓系列・件数・日時は返さない — §6 出力契約)
   - `lead_lag(conn, a, b, *, timeframe, source, in_sample_until) -> dict` — `{peak_lag, peak_corr}` のみ
-  - `analyze_for_agent(conn, settings, request: dict, *, now) -> dict` — **改善ループに露出する唯一の面** (プラン 8 で tool 化)。`in_sample_until = holdout_boundary(now, settings.backtest.holdout_months)` を内部で適用。symbols は `settings.pairs + settings.datafeed.watch_symbols` 内に限定。実行毎に `analysis_runs.save` し、**返り値に `analysis_run_id` を含める** (approval への添付参照用)。返却 dict に日時型・list[時系列] を**含めない**
+  - `analyze_for_agent(conn, settings, request: dict, *, now) -> dict` — **改善ループに露出する唯一の面** (プラン 9 で tool 化)。`in_sample_until = holdout_boundary(now, settings.backtest.holdout_months)` を内部で適用。symbols は `settings.pairs + settings.datafeed.watch_symbols` 内に限定 (上限は Task 2 のバリデータで担保済みだが、**実行時にも `len(候補) <= analysis.max_watch_symbols + len(pairs)` を検証**)。実行毎に `analysis_runs.save` し、**返り値に `analysis_run_id` を含める** (approval への添付参照用)。返却 dict に日時型・list[時系列] を**含めない**
+  - **エラーの固定コード化 (レビュー裁定 codex I2)**: 失敗応答は `{"error": <code>}` のみで、code は列挙 `("invalid_request", "unknown_symbol", "insufficient_data")` に限る。**メッセージ文字列・件数・利用可能範囲・境界日時をエラーに含めない** (境界依存のエラー詳細はサイドチャネル — §6)。データ不足 (相関計算に必要な共通観測が閾値未満) は in-sample 境界の前後どちら起因でも同一の `insufficient_data` を返す
   - DDL: `analysis_runs(id INTEGER PK, params_json TEXT NOT NULL, trial_count INTEGER NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL)`。`trial_count` = その呼び出しで計算した相関値の個数 (多重比較の分母)
   - `analysis_runs.save(conn, *, params, trial_count, source, now) -> int`
   - `coverage_report(conn, symbol, *, timeframe, source, start, end) -> dict` — `{bars, expected_open_bars, gap_pct}` (market_hours のオープン分数に対する欠損率)。**watch 銘柄の選定基準③ (§6: 許容欠損率 初期 5%) を人間が判定するための関数** — 人間 CLI (Task 11) から使う
@@ -828,7 +916,22 @@ def test_agent_rejects_symbol_outside_watch_and_pairs(tmp_path):
     out = analyze_for_agent(conn, SETTINGS,
                             {"kind": "lead_lag", "a": "USDJPY", "b": "GBPZAR",
                              "timeframe": "1h"}, now=NOW)
-    assert "error" in out  # 列挙外 symbol は検証エラー (例外を投げない)
+    assert out == {"error": "unknown_symbol"}  # 固定コードのみ・詳細なし
+
+
+def test_error_shape_is_boundary_independent(tmp_path):
+    """データ不足エラーが境界の前後・件数によらず同一応答 (サイドチャネル遮断)。"""
+    conn = _conn(tmp_path)
+    _series(conn, "USDJPY", _sine(3), start=H)              # 過少データ
+    _series(conn, "EURUSD", _sine(3), start=H)
+    out1 = analyze_for_agent(conn, _settings_watch_eurusd(),
+                             {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD",
+                              "timeframe": "1h"}, now=NOW)
+    _series(conn, "EURUSD", _sine(3), start=NOW - timedelta(days=10))  # holdout 期のみ追加
+    out2 = analyze_for_agent(conn, _settings_watch_eurusd(),
+                             {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD",
+                              "timeframe": "1h"}, now=NOW)
+    assert out1 == out2 == {"error": "insufficient_data"}
 
 
 def test_analysis_runs_records_trials(tmp_path):
@@ -850,7 +953,7 @@ def test_coverage_report_gap_pct(tmp_path):
 
 (注: `analyze_for_agent` のテスト用 SETTINGS は watch_symbols に EURUSD を含む必要がある — conftest の SETTINGS を `model_copy(update=...)` で拡張するローカルヘルパを test_analysis.py に書くこと。)
 
-- [ ] **Step 2: FAIL → 実装** — 相関計算は純 Python (`statistics` + 手書きピアソン) か pandas (既存依存) のどちらでもよいが、**入力整列は必ず bar_time の集合積**で行う。`analyze_for_agent` は request 検証 (kind / symbol / timeframe / window / lag が列挙内) に失敗したら `{"error": "..."}` を返す (無送出)。
+- [ ] **Step 2: FAIL → 実装** — 相関計算は純 Python (`statistics` + 手書きピアソン) か pandas (既存依存) のどちらでもよいが、**入力整列は必ず bar_time の集合積**で行う。`analyze_for_agent` は request 検証に失敗したら固定コードの `{"error": ...}` を返す (無送出・Produces のエラー契約どおり)。`analysis_runs` 追加時は db.py の TABLE_NAMES 本体とテスト側の両方を更新 (Task 8 と同じ)。
 
 - [ ] **Step 3: PASS → Commit** — `git commit -m "feat: 履歴分析 (相関 3 種・非漏洩出力契約・analysis_runs)"`
 
@@ -872,6 +975,7 @@ def test_coverage_report_gap_pct(tmp_path):
   - `afx analyze corr --a USDJPY --b EURUSD --timeframe 1h --source dukascopy` — 人間は期間自由 (`--from/--to` 任意)。**analysis_runs には保存しない** (探索監査は改善ループ経路のみの契約 — 人間の探索まで記録すると探索数の意味が濁る。§6 の記録義務は「改善ループ向け API」に係る)
   - `afx history coverage --symbol EURUSD --timeframe 1h --source dukascopy --from ... --to ...` — Task 10 の `coverage_report` 表示 (watch 選定基準③の判定材料)
 - サービス系 (`run_service`) の既定動作は不変 — サブコマンド未指定時の挙動を変えない (既存 test_entry の期待維持)
+- **DB 解決契約 (レビュー裁定 codex M5)**: 全サブコマンドの root は `Path.cwd()`、DB は `root / "data" / "agentic.db"` (init 済みを要求 — 無ければ「`afx init` を先に実行」で終了)。CLI が触るのは**この実 DB のみ** (履歴・backtest_runs の保存先)。in-memory 再生 DB は run_replay 内部に閉じる。統合テスト 1 本は mock でなく一時 root + 実 DB ファイルで `human_custom` 行と期間・issued_by を確認する
 
 - [ ] **Step 1: 失敗するテストを書く** — argparse 配線と scope 記録のみを検証 (importer/runner は Task 4-10 でテスト済み — CLI は薄いアダプタに徹する)。`tests/backtest/test_cli.py`:
 
@@ -908,7 +1012,7 @@ def test_cli_backtest_run_records_human_custom_scope(tmp_path, monkeypatch):
                    "--from", "2026-07-01", "--to", "2026-07-02",
                    "--proposal-file", str(proposals)])
     assert rc == 0
-    assert br.save.call_args.kwargs["scope"] == "human_custom"
+    assert br.save_human_run.called  # scope/issued_by は save_human_run 内部で固定
 
 
 def test_cli_default_service_behavior_unchanged(monkeypatch):
@@ -928,7 +1032,7 @@ def test_cli_default_service_behavior_unchanged(monkeypatch):
 
 **Interfaces:** Consumes: 全 task。
 
-- [ ] **Step 1: 通し E2E を書く** — 合成 1 週間 (決定的生成・約 7,000 本の 1m) を import_bars → `run_replay` (指値→約定→TP を 3 回起こす提案列) → `compute_metrics` → `backtest_runs.save(in_sample)` → in_sample_view で読める、まで 1 テストで通す。assert: closed 3 件 / metrics 妥当 / view 経由で期間端点が**見えない**こと。
+- [ ] **Step 1: 通し E2E を書く** — 合成 1 週間 (決定的生成・約 7,000 本の 1m) を import_bars → `run_in_sample` (指値→約定→TP を 3 回起こす提案列。内部で run_replay + save_harness_run(in_sample)) → in_sample_view で読める、まで 1 テストで通す。assert: closed 3 件 / metrics 妥当 / view 経由で期間端点・issued_by 以外の発行元情報が**見えない**こと。
 
 - [ ] **Step 2: ベンチを書く** — 合成 1 年分 (約 37 万本) を投入し `run_replay` の実時間を測って `print` する (assert は「完走」のみ — 時間の合否はコントローラが実測をレジャーに記録して裁定する。目標オーダー: 数分/年)。
 
@@ -941,7 +1045,7 @@ def test_cli_default_service_behavior_unchanged(monkeypatch):
 ## プラン完了条件 (再掲 — 分割書と同一)
 
 1. Dukascopy 実データ照合 (Task 3 Step 5) と MT5 価格系差 (Task 5 Step 4) が報告書に記録されている
-2. 遮断回帰テスト (期間引数なし / in_sample ビュー制限 / 分析出力スキーマ) が green
+2. **遮断部品**の回帰テスト (期間引数なし / in_sample ビュー制限 (issuer 込み) / 分析出力スキーマ / エラー固定コード) が green — **遮断 8 項目の構造的成立はプラン 8 (worker 権限境界) + プラン 9 (blocking 統合回帰) で完成する。本プラン単体で「遮断が閉じた」と主張しない** (レビュー裁定 codex C4)
 3. 1 年 replay の実測時間がレジャーに記録されている
 4. 既存全テスト + 本プラン追加分が green。実 DB・実 HTTP に触れるテストが無い
 
@@ -949,5 +1053,6 @@ def test_cli_default_service_behavior_unchanged(monkeypatch):
 
 - `IntentSource` (Task 7) に strategy plugin アダプタを差し込む
 - `run_in_sample` / `run_holdout_gate` (Task 9) を評価ランナー・採用ゲートから呼ぶ
-- `analyze_for_agent` (Task 10) をプラン 8 で改善ループの tool にする (registry 登録はプラン 8)
+- `analyze_for_agent` (Task 10) をプラン 9 で改善ループの tool にする (registry 登録はプラン 9)
 - `afx backtest run --plugin` オプション追加 (プラン 7)
+- 到達不能性 (holdout / 履歴 DB / data/) の構造的成立はプラン 8 の worker 権限境界 — プラン 9 の blocking 受入条件 (遮断 8 項目統合回帰) で通しの検証を行う
