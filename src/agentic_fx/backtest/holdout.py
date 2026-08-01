@@ -22,6 +22,7 @@ Task 8 の ``compute_metrics``、永続化は ``backtest_runs.save_harness_run``
 from __future__ import annotations
 
 import calendar
+import logging
 import sqlite3
 from datetime import datetime, timezone
 
@@ -33,6 +34,7 @@ from agentic_fx.store.backtest_runs import (
 )
 
 _UTC = timezone.utc
+_log = logging.getLogger(__name__)
 
 
 def _require_aware(dt: datetime, label: str) -> datetime:
@@ -76,7 +78,21 @@ def _oldest_bar_start(history_conn: sqlite3.Connection, symbol: str,
         raise ValueError(
             f"no 1m history for symbol={symbol!r} source={source!r} "
             "(cannot determine in-sample start)")
-    return datetime.fromisoformat(bar_time_iso).astimezone(_UTC)
+    start = datetime.fromisoformat(bar_time_iso).astimezone(_UTC)
+    # F2 (fix round 1, codex Important + sonnet Important-3): ohlcv.
+    # import_bars/_validate_and_normalize_row は bar_time の分格子
+    # (second==microsecond==0) を検証しない — 別経路のインポータが秒付き
+    # タイムスタンプを書き込むと、そのまま run_replay/ReplayClock に渡って
+    # しまう。本番なら ReplayClock 構築時に確実に ValueError で落ちるが
+    # (fail closed)、原因が分かりにくいままそこまで到達させず、ここで
+    # 明示的に検出する。メッセージにタイムスタンプは含めない (F1 と同じ
+    # 遮断規律 — 期間・端点の漏洩は例外経路にも適用される)。
+    if start.second != 0 or start.microsecond != 0:
+        raise ValueError(
+            f"oldest 1m bar for symbol={symbol!r} source={source!r} is not "
+            "on minute boundary (second and microsecond must be 0 — data "
+            "corruption?)")
+    return start
 
 
 def _run_scope(settings: Settings, *, scope: str,
@@ -115,10 +131,17 @@ def run_in_sample(settings: Settings, *, history_conn: sqlite3.Connection,
     boundary = holdout_boundary(now_norm, settings.backtest.holdout_months)
     start = _oldest_bar_start(history_conn, symbol, source)
     if start >= boundary:
+        # F1 (fix round 1, codex Important): 遮断 1 (期間・端点はハーネスが
+        # 所有) は例外経路にも適用される — 改善ループが例外本文を観測でき
+        # る構成だと boundary の完全な時刻が漏れるため、例外メッセージには
+        # タイムスタンプを含めない。詳細は運用ログ (改善ループから隔離
+        # された側) にのみ出す。
+        _log.warning(
+            "in-sample period is empty for symbol=%r source=%r: oldest bar "
+            "%s >= holdout boundary %s", symbol, source, start.isoformat(),
+            boundary.isoformat())
         raise ValueError(
-            "in-sample period is empty: oldest bar "
-            f"({start.isoformat()}) >= holdout boundary "
-            f"({boundary.isoformat()})")
+            "in-sample period is empty (oldest bar >= holdout boundary)")
     return _run_scope(
         settings, scope="in_sample", history_conn=history_conn,
         symbol=symbol, source=source, intent_source=intent_source,

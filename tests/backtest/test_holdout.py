@@ -8,6 +8,7 @@
 実物を使う (配線検証)。
 """
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -23,6 +24,16 @@ from agentic_fx.store.backtest_runs import settings_snapshot_hash
 from tests.backtest.conftest import H, SETTINGS, WED, _conn, _row_at
 
 UTC = timezone.utc
+
+# F1/F2 (fix round 1, codex Important): 遮断 1 は例外メッセージ経路にも
+# 適用される — 期間の isoformat (4 桁年 + "T" 付き時刻) が例外文字列に
+# 含まれていないことを確認するヘルパ。
+_ISO_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+
+
+def _assert_no_timestamp_leak(message: str) -> None:
+    assert _ISO_TS_RE.search(message) is None, (
+        f"exception message leaks an isoformat timestamp: {message!r}")
 
 
 def _seed_history(hist):
@@ -177,11 +188,62 @@ def test_run_in_sample_empty_period_rejected(tmp_path, monkeypatch):
     ohlcv.import_bars(hist, rows, source="dukascopy")
     monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as excinfo:
         run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
                       source="dukascopy", intent_source=lambda b: None,
                       eval_timeframe="1h", plugin_ref="p", content_hash="h",
                       kind="strategy", now=now)
+    # F1 (fix round 1, codex Important): 遮断 1 (期間・端点はハーネスが
+    # 所有) は例外経路にも適用される — 最古バー/boundary の isoformat が
+    # メッセージに含まれていないこと。
+    _assert_no_timestamp_leak(str(excinfo.value))
+
+
+def test_run_in_sample_rejects_off_grid_oldest_bar(tmp_path, monkeypatch):
+    """F2 (fix round 1, codex Important + sonnet Important-3): 最古バーが
+    分格子外 (秒 != 0) だと import_bars 自体は受理してしまうが、run_in_sample
+    は ReplayClock まで到達させず明示的に ValueError にする。fake replay が
+    呼ばれていないこと (本番なら ReplayClock 構築時に落ちる契約違反を、
+    fake 経由のテストが隠さないこと) も確認する。"""
+    hist = _conn(tmp_path)
+    off_grid = H.replace(second=30, microsecond=0)
+    rows = [_row_at(off_grid, o=100.0, h=100.5, l=99.5, c=100.2)]
+    ohlcv.import_bars(hist, rows, source="dukascopy")
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    calls = []
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
+    with pytest.raises(ValueError) as excinfo:
+        run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
+                      source="dukascopy", intent_source=lambda b: None,
+                      eval_timeframe="1h", plugin_ref="p", content_hash="h",
+                      kind="strategy", now=WED + timedelta(days=120))
+    assert calls == []
+    _assert_no_timestamp_leak(str(excinfo.value))
+
+
+def test_run_holdout_gate_wires_eval_timeframe_and_created_at(
+        tmp_path, monkeypatch):
+    """F3+F4 (fix round 1, sonnet Important-1/2): eval_timeframe が
+    save_harness_run の timeframe 列まで実際に配線されていること、created_at
+    が UTC 正規化・分格子切り捨て済みの now であることを、"1h" 以外の
+    timeframe + 非正規化 (JST・秒/マイクロ秒付き) now で直接検証する
+    (全テストが "1h" 固定・既に分格子上の now だと、timeframe のハード
+    コード化や now_norm→now の差し替えが偶然一致して検出できない)。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
+    jst = timezone(timedelta(hours=9))
+    now = datetime(2026, 11, 19, 21, 37, 42, 123456, tzinfo=jst)
+    expected_created_at = datetime(2026, 11, 19, 12, 37, 0, tzinfo=UTC)
+    run_holdout_gate(SETTINGS, history_conn=hist, symbol="USDJPY",
+                     source="dukascopy", intent_source=lambda b: None,
+                     eval_timeframe="30m", plugin_ref="p", content_hash="h",
+                     kind="strategy", now=now)
+    row = dict(hist.execute(
+        "SELECT timeframe, created_at FROM backtest_runs").fetchone())
+    assert row["timeframe"] == "30m"
+    assert row["created_at"] == expected_created_at.isoformat()
 
 
 def test_run_holdout_gate_saves_scope_holdout_gate(tmp_path, monkeypatch):
@@ -205,8 +267,9 @@ def test_holdout_boundary_normalizes_non_utc_offset():
     """UTC へ正規化してから暦月減算する (naive → UTC 見なしではなく、非 UTC
     offset も正しく変換する)。"""
     jst = timezone(timedelta(hours=9))
-    # 2026-08-01 05:00+09:00 == 2026-07-31 20:00 UTC; 1 month back = June
-    # (30 days) なので日は変わらず 20:00 UTC のまま。
+    # 2026-08-01 05:00+09:00 == 2026-07-31 20:00 UTC; 1 month back = June。
+    # 時刻 (20:00) は変わらず、日は 6 月が 30 日までなので 31→30 にクランプ
+    # される (7 月 31 日 → 6 月 30 日)。
     now = datetime(2026, 8, 1, 5, 0, tzinfo=jst)
     assert holdout_boundary(now, 1) == datetime(2026, 6, 30, 20, 0, tzinfo=UTC)
 
