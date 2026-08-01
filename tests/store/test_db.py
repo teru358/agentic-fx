@@ -8,10 +8,11 @@ EXPECTED = {
     "ohlcv", "missions", "trade_intents", "orders", "reflections",
     "account_snapshots", "improvement_backlog", "improvement_runs",
     "econ_events", "approval_requests", "news_sources", "backtest_runs",
+    "analysis_runs",
 }
 
 
-def test_init_creates_all_12_tables(tmp_path):
+def test_init_creates_all_13_tables(tmp_path):
     conn = connect(tmp_path / "agentic.db")
     init_db(conn)
     rows = conn.execute(

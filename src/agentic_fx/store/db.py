@@ -1,4 +1,4 @@
-"""SQLite 接続 + 12 テーブルスキーマ — 設計書 §12。"""
+"""SQLite 接続 + 13 テーブルスキーマ — 設計書 §12。"""
 from __future__ import annotations
 
 import logging
@@ -115,12 +115,18 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
   core_commit TEXT NOT NULL, initial_balance REAL NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS analysis_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  params_json TEXT NOT NULL, trial_count INTEGER NOT NULL,
+  source TEXT NOT NULL, created_at TEXT NOT NULL
+);
 """
 
 TABLE_NAMES = frozenset({
     "ohlcv", "missions", "trade_intents", "orders", "reflections",
     "account_snapshots", "improvement_backlog", "improvement_runs",
     "econ_events", "approval_requests", "news_sources", "backtest_runs",
+    "analysis_runs",
 })
 
 
