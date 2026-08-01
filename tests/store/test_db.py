@@ -7,11 +7,11 @@ from agentic_fx.store.db import TABLE_NAMES, connect, init_db
 EXPECTED = {
     "ohlcv", "missions", "trade_intents", "orders", "reflections",
     "account_snapshots", "improvement_backlog", "improvement_runs",
-    "econ_events", "approval_requests", "news_sources",
+    "econ_events", "approval_requests", "news_sources", "backtest_runs",
 }
 
 
-def test_init_creates_all_11_tables(tmp_path):
+def test_init_creates_all_12_tables(tmp_path):
     conn = connect(tmp_path / "agentic.db")
     init_db(conn)
     rows = conn.execute(
