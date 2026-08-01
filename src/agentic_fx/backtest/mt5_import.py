@@ -40,20 +40,27 @@ def _window_url(base_url: str, symbol: str, start: datetime, end: datetime) -> s
             f"&to={quote(end.isoformat())}&interval=1m")
 
 
-def _normalize_bar_time(raw: str) -> str:
+def _normalize_bar_time(raw: str) -> tuple[str, bool]:
     """bridge の "time" は naive ISO の可能性がある。naive なら UTC とみなし
     (実測仕様。§ 上書き 3)、aware isoformat 文字列に正規化する。
 
     これを怠ると bar_time の文字列表現が Dukascopy 行 ("+00:00" 付き) と
     食い違い、compare_sources の bar_time JOIN が 0 件になる無音故障を
     起こす。
+
+    Returns:
+        (正規化済み isoformat 文字列, naive だったか)。呼び出し側 (import_mt5)
+        は naive 件数を集計し 1 回だけ warning を出す (F2, fix round 1)。
+        同じ bridge の時刻系統が実際に破損した実績があり、将来 bridge が
+        naive 応答を返し始めたときに無音で UTC 仮定され続けるのを防ぐ。
     """
     dt = datetime.fromisoformat(raw)
-    if dt.tzinfo is None:
+    was_naive = dt.tzinfo is None
+    if was_naive:
         dt = dt.replace(tzinfo=timezone.utc)
     else:
         dt = dt.astimezone(timezone.utc)
-    return dt.isoformat()
+    return dt.isoformat(), was_naive
 
 
 def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
@@ -89,6 +96,7 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
     total_inserted = 0
     total_unchanged = 0
     total_conflicted = 0
+    naive_count = 0
 
     current = start
     while current < end:
@@ -99,12 +107,14 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
         # payload["bars"] を必須で読む (F: sources.py:mt5_bars_range と同じ
         # fail-loud パターン)。.get(..., []) にすると HTTP 200 でエラー body
         # を返す bridge 障害時に「0 件」と区別が付かなくなる。
-        rows = [
-            (symbol, "1m", _normalize_bar_time(b["time"]),
-             float(b["open"]), float(b["high"]), float(b["low"]),
-             float(b["close"]), float(b["volume"]), None)
-            for b in payload["bars"]
-        ]
+        rows = []
+        for b in payload["bars"]:
+            bar_time_iso, was_naive = _normalize_bar_time(b["time"])
+            if was_naive:
+                naive_count += 1
+            rows.append((symbol, "1m", bar_time_iso,
+                        float(b["open"]), float(b["high"]), float(b["low"]),
+                        float(b["close"]), float(b["volume"]), None))
         if rows:
             result = import_bars(conn, rows, source="mt5")
             total_inserted += result.inserted
@@ -112,6 +122,17 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
             total_conflicted += result.conflicted
 
         current = window_end
+
+    if naive_count > 0:
+        # F2 (fix round 1, sonnet): 同じ bridge の時刻系統が実際に破損した
+        # 直後であり、将来 bridge が naive 応答を返し始めたときに無音で UTC
+        # 仮定され続けるのを防ぐ。毎バーではうるさいので import_mt5 呼び出し
+        # 単位で 1 回だけ warning する。
+        _log.warning(
+            "import_mt5: %d/%d bar(s) had naive \"time\" (assumed UTC) for "
+            "symbol=%s — bridge may be returning tz-less timestamps",
+            naive_count, total_inserted + total_unchanged + total_conflicted,
+            symbol)
 
     return ImportResult(total_inserted, total_unchanged, total_conflicted)
 
@@ -134,25 +155,38 @@ def compare_sources(conn, symbol: str, settings, *,
     assumed_spread_pips = settings.risk.pair_rules[symbol].assumed_spread_pips
     half_spread = assumed_spread_pips * pip_size / 2
 
-    rows = conn.execute(
+    cur = conn.execute(
         "SELECT ta.close AS a_close, tb.close AS b_close "
         "FROM ohlcv ta JOIN ohlcv tb "
         "ON ta.symbol = tb.symbol AND ta.interval = tb.interval "
         "AND ta.bar_time = tb.bar_time "
         "WHERE ta.symbol = ? AND ta.interval = '1m' "
         "AND ta.source = ? AND tb.source = ?",
-        (symbol, a, b)).fetchall()
+        (symbol, a, b))
 
-    diffs = [(r["a_close"] - half_spread) - r["b_close"] for r in rows]
-    count = len(diffs)
+    # F3 (fix round 1, codex Important-1): ストリーミング集計 (Welford 法)。
+    # 従来は全行を rows/diffs の 2 本の list に丸ごと実体化していたため、
+    # 数年分の 1m 照合ではメモリを不要に食う。カーソルを 1 行ずつ回し
+    # count/mean/m2 (分散の中間値)/max_abs を逐次更新する。返り値の契約
+    # (count/mean/std/max_abs、count=0→全 None、std は母標準偏差) は不変
+    # — count=1 のとき Welford は m2=0.0 を厳密に生成するため std=0.0 も
+    # 特別扱い無しで成立する (数学的に等価)。
+    count = 0
+    mean = 0.0
+    m2 = 0.0
+    max_abs = 0.0
+    for r in cur:
+        d = (r["a_close"] - half_spread) - r["b_close"]
+        count += 1
+        delta = d - mean
+        mean += delta / count
+        m2 += delta * (d - mean)
+        ad = abs(d)
+        if ad > max_abs:
+            max_abs = ad
+
     if count == 0:
         return {"count": 0, "mean": None, "std": None, "max_abs": None}
 
-    mean = sum(diffs) / count
-    if count == 1:
-        std = 0.0
-    else:
-        variance = sum((d - mean) ** 2 for d in diffs) / count
-        std = variance ** 0.5
-    max_abs = max(abs(d) for d in diffs)
+    std = (m2 / count) ** 0.5
     return {"count": count, "mean": mean, "std": std, "max_abs": max_abs}

@@ -38,6 +38,30 @@ def test_import_mt5_pages_daily_and_imports(tmp_path):
                              source="mt5") is None
 
 
+def test_import_mt5_uses_default_fetch_when_none(monkeypatch, tmp_path):
+    """F1 (fix round 1, sonnet Important-1): fetch=None のとき実際に
+    _default_fetch (httpx 経由) が使われ、その結果が DB まで届くこと。
+    以前は `fetch = _default_fetch` の配線自体を検証するテストが無く、
+    そこを `fetch = lambda url: {"bars": []}` に変異させても 14/14 PASS
+    だった (SURVIVED)。httpx.get を monkeypatch し実 HTTP は行わない。"""
+    conn = _conn(tmp_path)
+
+    def fake_get(url, headers=None, timeout=30):
+        request = httpx.Request("GET", url)
+        return httpx.Response(
+            200, request=request,
+            json={"symbol": "USDJPY", "interval": "1m", "bars": [
+                {"time": H.isoformat(), "open": 148.0, "high": 148.2,
+                 "low": 147.9, "close": 148.1, "volume": 10}]})
+
+    monkeypatch.setattr(mt5_import.httpx, "get", fake_get)
+    r = import_mt5(conn, "USDJPY", H, H + timedelta(days=1),
+                   base_url="http://x", fetch=None)
+    assert r.inserted == 1
+    bars = ohlcv.load_bars(conn, "USDJPY", "1m", source="mt5")
+    assert bars and bars[0].close == 148.1
+
+
 def test_import_mt5_last_window_clipped_to_end(tmp_path):
     """半端な最終窓 (< 1 日) でも to= が end に丸められる (over-fetch しない)。"""
     conn = _conn(tmp_path)
