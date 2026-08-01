@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from agentic_fx.backtest.dukascopy import Tick
 from agentic_fx.backtest.importer import ticks_to_1m, import_dukascopy
+from agentic_fx.store.ohlcv import load_bars
 from tests.backtest.conftest import _conn, _bi5, H
 
 
@@ -30,6 +31,12 @@ def test_import_dukascopy_uses_injected_fetch_and_is_idempotent(tmp_path):
     r2 = import_dukascopy(conn, "USDJPY", H, H + timedelta(hours=1), fetch=fetch)
     assert r1.inserted == 1 and r2.unchanged == 1 and r2.conflicted == 0
     assert all("datafeed.dukascopy.com" in u for u in calls)
+
+    # Verify data is readable with correct source (catches source parameter mutations)
+    bars = load_bars(conn, "USDJPY", "1m", source="dukascopy")
+    assert len(bars) == 1
+    assert bars[0].symbol == "USDJPY"
+    assert bars[0].interval == "1m"
 
 
 def test_import_skips_empty_hours(tmp_path):
