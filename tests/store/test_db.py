@@ -1,3 +1,7 @@
+import sqlite3
+
+import pytest
+
 from agentic_fx.store.db import TABLE_NAMES, connect, init_db
 
 EXPECTED = {
@@ -98,3 +102,122 @@ def test_connect_pragmas_journal_mode(tmp_path):
     conn = connect(tmp_path / "pragmas.db")
     mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
     assert mode == "wal"
+
+
+def test_init_db_migrates_legacy_ohlcv_to_v2(tmp_path):
+    """旧 PK (symbol,interval,bar_time) の ohlcv が source 込み PK に再構築される。"""
+    conn = connect(tmp_path / "legacy.db")
+    conn.execute(
+        "CREATE TABLE ohlcv (symbol TEXT NOT NULL, interval TEXT NOT NULL, "
+        "bar_time TEXT NOT NULL, open REAL NOT NULL, high REAL NOT NULL, "
+        "low REAL NOT NULL, close REAL NOT NULL, volume REAL NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (symbol, interval, bar_time))")
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100)")
+    conn.commit()
+
+    init_db(conn)  # ここで再構築 migration が走る
+
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
+    assert {"source", "spread"} <= cols
+    row = conn.execute("SELECT source, spread FROM ohlcv").fetchone()
+    assert row["source"] == "yfinance" and row["spread"] is None
+    # PK が source を含む: 同キー別 source が共存できる
+    conn.execute("INSERT INTO ohlcv (symbol,interval,bar_time,open,high,low,"
+                 "close,volume,source) VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,0,'dukascopy')")
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 2
+
+
+def test_init_db_ohlcv_migration_is_idempotent(tmp_path):
+    """v2 スキーマの DB に init_db を複数回流しても再構築が起きない。"""
+    conn = connect(tmp_path / "v2.db")
+    init_db(conn)
+    init_db(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
+    assert {"source", "spread"} <= cols
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='ohlcv_v1'"
+    ).fetchone()[0] == 0
+
+
+def test_ohlcv_migration_rolls_back_on_failure_and_resumes(tmp_path):
+    """INSERT..SELECT 中の失敗は ROLLBACK され、再実行で成功する (再開可能性)。"""
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "legacy2.db")
+    conn.execute(
+        "CREATE TABLE ohlcv (symbol TEXT NOT NULL, interval TEXT NOT NULL, "
+        "bar_time TEXT NOT NULL, open REAL NOT NULL, high REAL NOT NULL, "
+        "low REAL NOT NULL, close REAL NOT NULL, volume REAL NOT NULL DEFAULT 0, "
+        "PRIMARY KEY (symbol, interval, bar_time))")
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100)")
+    conn.commit()
+
+    class _FailingConn:
+        """sqlite3.Connection は immutable type でメソッドを直接パッチできない
+        (`cannot set 'execute' attribute of immutable type`) ため、実接続への
+        委譲プロキシで INSERT INTO ohlcv だけ落とす。トランザクションは実接続
+        (conn) 側で進むので ROLLBACK 後の状態は conn で確認できる。"""
+
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args, **kwargs):
+            if str(sql).strip().startswith("INSERT OR IGNORE INTO ohlcv "):
+                raise sqlite3.OperationalError("injected failure")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    with pytest.raises(sqlite3.OperationalError):
+        db_module._migrate_ohlcv_v2(_FailingConn(conn))
+
+    # ROLLBACK 済み: v1 のまま (ohlcv_v1 は無い。RENAME 前に例外が起きた形に
+    # 見えるよう、rebuild は commit まで全て 1 トランザクション内)
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "ohlcv_v1" not in names
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
+    assert "source" not in cols
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 1
+
+    # 再実行で成功する
+    init_db(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
+    assert {"source", "spread"} <= cols
+    row = conn.execute("SELECT source, spread FROM ohlcv").fetchone()
+    assert row["source"] == "yfinance" and row["spread"] is None
+
+
+def test_ohlcv_migration_resumes_from_stale_ohlcv_v1(tmp_path):
+    """v2 の ohlcv と ohlcv_v1 が両方残った (RENAME 後 DROP 前に失敗した) 状態
+    から再開できる — INSERT..SELECT からやり直す。"""
+    conn = connect(tmp_path / "resume.db")
+    init_db(conn)  # 正常な v2 スキーマを作る
+    conn.execute("ALTER TABLE ohlcv RENAME TO ohlcv_v1")
+    conn.executescript(db_v2_ddl_for_test())
+    conn.execute("INSERT INTO ohlcv_v1 VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,'yfinance',NULL)")
+    conn.commit()
+
+    init_db(conn)  # ohlcv_v1 が残っていても再開して片付く
+
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "ohlcv_v1" not in names
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 1
+
+
+def db_v2_ddl_for_test():
+    return (
+        "CREATE TABLE ohlcv ("
+        "symbol TEXT NOT NULL, interval TEXT NOT NULL, bar_time TEXT NOT NULL, "
+        "open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, "
+        "close REAL NOT NULL, volume REAL NOT NULL DEFAULT 0, "
+        "source TEXT NOT NULL DEFAULT 'yfinance', spread REAL, "
+        "PRIMARY KEY (symbol, interval, bar_time, source))"
+    )

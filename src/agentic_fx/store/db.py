@@ -1,16 +1,23 @@
 """SQLite 接続 + 11 テーブルスキーマ — 設計書 §12。"""
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 
-_SCHEMA = """
+_log = logging.getLogger("agentic_fx.store.db")
+
+_OHLCV_V2_DDL = """
 CREATE TABLE IF NOT EXISTS ohlcv (
   symbol TEXT NOT NULL, interval TEXT NOT NULL, bar_time TEXT NOT NULL,
   open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
   close REAL NOT NULL, volume REAL NOT NULL DEFAULT 0,
-  PRIMARY KEY (symbol, interval, bar_time)
+  source TEXT NOT NULL DEFAULT 'yfinance', spread REAL,
+  PRIMARY KEY (symbol, interval, bar_time, source)
 );
+"""
+
+_SCHEMA = _OHLCV_V2_DDL + """
 CREATE TABLE IF NOT EXISTS missions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   loop TEXT NOT NULL,            -- trade | improve | ask | reflection
@@ -127,7 +134,61 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str,
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
+def _migrate_ohlcv_v2(conn: sqlite3.Connection) -> None:
+    """ohlcv を v1 (PK: symbol,interval,bar_time) から v2 (source/spread 列・
+    PK に source を含む) へ table rebuild する。
+
+    SQLite は既存テーブルの PK を ALTER できないため rebuild が必要。
+    `_ensure_column` (単純な列追加) とは別関数にしてある。
+
+    トランザクション内で完結させる (BEGIN IMMEDIATE → RENAME → CREATE →
+    INSERT..SELECT → DROP → COMMIT、例外時 ROLLBACK)。途中失敗時の再開性:
+    - RENAME 前に失敗 → ROLLBACK で v1 のまま。次回起動時は `source` 列なし
+      と判定して最初からやり直す。
+    - RENAME 後 (`ohlcv_v1` 存在) かつ v2 の `ohlcv` も存在する状態で失敗
+      (DROP 前) → 次回起動時は `ohlcv` が既に v2 (source 列あり) なので
+      「移行不要」に見えてしまう。それを防ぐため、呼び出し側 (init_db) は
+      `source` 列の有無だけでなく `ohlcv_v1` の残存も見て、残っていれば
+      INSERT..SELECT からやり直す (このテーブルは INSERT OR IGNORE で
+      冪等)。
+
+    **運用手順 (実 DB への適用時)**: サービス停止中に行うこと。適用前に
+    `cp data/agentic.db data/agentic.db.bak-YYYYMMDD` でバックアップを取る
+    こと (トランザクション内 rebuild で ROLLBACK は保証するが、ディスク破損
+    やプロセス kill -9 等トランザクション保護の外側の事故に備える)。
+    """
+    _log.warning(
+        "ohlcv テーブルを v2 (source/spread 列・PK 再構築) へ移行します。"
+        "サービス停止中に実行し、実行前に "
+        "'cp data/agentic.db data/agentic.db.bak-YYYYMMDD' でバックアップを"
+        "取得済みであることを確認してください。")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        v1_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='ohlcv_v1'").fetchone() is not None
+        if not v1_exists:
+            conn.execute("ALTER TABLE ohlcv RENAME TO ohlcv_v1")
+        conn.execute(_OHLCV_V2_DDL)
+        conn.execute(
+            "INSERT OR IGNORE INTO ohlcv (symbol, interval, bar_time, open, "
+            "high, low, close, volume, source, spread) "
+            "SELECT symbol, interval, bar_time, open, high, low, close, "
+            "volume, 'yfinance', NULL FROM ohlcv_v1")
+        conn.execute("DROP TABLE ohlcv_v1")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
+    v1_leftover = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='ohlcv_v1'").fetchone() is not None
+    if "source" not in cols or v1_leftover:
+        _migrate_ohlcv_v2(conn)
     _ensure_column(conn, "missions", "trigger", "trigger TEXT")
     conn.commit()

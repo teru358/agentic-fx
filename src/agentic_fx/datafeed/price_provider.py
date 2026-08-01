@@ -134,8 +134,10 @@ class PriceProvider:
                         and interval not in DERIVE_ONLY_INTERVALS):
                     bars, origin = fn(), name
                     validate_bars(bars, now, d.freshness_max_min, interval_min)
-                    # 境界がソース非依存の足だけを保存する
-                    ohlcv.upsert_bars(self.conn, bars)
+                    # 境界がソース非依存の足だけを保存する。source にはチェーンの
+                    # 実ソース名を渡す (全部 yfinance 名義で書くと live ソース同士
+                    # が上書きし合い、source 列が嘘になる — レビュー裁定 codex I7)
+                    ohlcv.upsert_bars(self.conn, bars, source=name)
                 else:
                     base = self._finest_native_base(name, interval)
                     # 保存は _derive が base 足に対して行う (導出足は保存しない)
@@ -176,28 +178,39 @@ class PriceProvider:
         **要求された足そのものにも適用する** — 4h/1d の行は本来存在しないが、
         本修正より前のバイナリが書いた残骸があり得る。それはブローカー格子の
         足なので、読むと I-2 で塞いだ「格子の混在」が静かに戻る。
+
+        source 列は「どの source が書いたか」を区別する PK の一部になった
+        (ohlcv v2)。ここは「どの source が書いたか」を知らないサイトなので、
+        **`_chain` が返す live source 名を優先順に 1 つずつ試し**、各名で単一
+        source の `load_bars(..., source=name)` を読む — 複数 source の行を
+        1 回のクエリで混ぜて返さない (上書き 1)。Phase 1 の実態は yfinance
+        のみなので挙動は不変。
         """
         d = self.settings.datafeed
         candidates = [i for i in [interval, *self._base_candidates(interval)]
                       if i not in DERIVE_ONLY_INTERVALS]
+        live_sources = [name for name, _ in
+                        self._chain(pair, kind="bars", interval=interval)]
         for src in candidates:
-            cached = ohlcv.load_bars(self.conn, pair, src)
-            if not cached:
-                continue
-            label = "cache" if src == interval else f"cache({src})"
-            try:
-                # キャッシュも健全性検証を通さない限り使わない (fail closed)
-                validate_bars(cached, now, d.freshness_max_min,
-                              sources.INTERVAL_MIN[src])
-                if src == interval:
-                    return cached, "cache"
-                derived = self._resample(cached, pair, interval)
-                validate_bars(derived, now, d.freshness_max_min,
-                              sources.INTERVAL_MIN[interval])
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"{label}: {_safe_error_text(e)}")
-                continue
-            return derived, f"cache({src}→{interval} derived)"
+            for name in live_sources:
+                cached = ohlcv.load_bars(self.conn, pair, src, source=name)
+                if not cached:
+                    continue
+                label = ("cache" if src == interval else f"cache({src})")
+                label = f"{label}[{name}]"
+                try:
+                    # キャッシュも健全性検証を通さない限り使わない (fail closed)
+                    validate_bars(cached, now, d.freshness_max_min,
+                                  sources.INTERVAL_MIN[src])
+                    if src == interval:
+                        return cached, "cache"
+                    derived = self._resample(cached, pair, interval)
+                    validate_bars(derived, now, d.freshness_max_min,
+                                  sources.INTERVAL_MIN[interval])
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{label}: {_safe_error_text(e)}")
+                    continue
+                return derived, f"cache({src}→{interval} derived)"
         return None
 
     def last_bars_source(self, pair: str, interval: str) -> str | None:
@@ -292,7 +305,7 @@ class PriceProvider:
         validate_bars(raw, self.clock.now(),
                       self.settings.datafeed.freshness_max_min,
                       sources.INTERVAL_MIN[base])
-        ohlcv.upsert_bars(self.conn, raw)
+        ohlcv.upsert_bars(self.conn, raw, source=source)
         return self._resample(raw, pair, interval)
 
     def _resample(self, base_bars: list[Bar], pair: str,

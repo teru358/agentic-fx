@@ -115,12 +115,12 @@ def test_get_bars_caches(tmp_path):
                return_value=_fresh_bars()):
         bars = p.get_bars("USDJPY", "1m", 1)
     assert len(bars) == 30
-    assert len(ohlcv.load_bars(conn, "USDJPY", "1m")) == 30
+    assert len(ohlcv.load_bars(conn, "USDJPY", "1m", source="yfinance")) == 30
 
 
 def test_get_bars_falls_back_to_cache(tmp_path):
     conn, p = _provider(tmp_path)
-    ohlcv.upsert_bars(conn, _fresh_bars())
+    ohlcv.upsert_bars(conn, _fresh_bars(), source="yfinance")
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
         bars = p.get_bars("USDJPY", "1m", 1)
@@ -133,7 +133,7 @@ def test_stale_cache_is_not_used(tmp_path):
     stale = [b.__class__(b.symbol, b.interval, b.ts - timedelta(days=3),
                          b.open, b.high, b.low, b.close, b.volume)
              for b in _fresh_bars()]
-    ohlcv.upsert_bars(conn, stale)
+    ohlcv.upsert_bars(conn, stale, source="yfinance")
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
         with pytest.raises(DataUnhealthy):
@@ -319,8 +319,8 @@ def test_only_base_bars_are_cached_for_derive_only_intervals(tmp_path):
                return_value=_fresh_bars(interval="1h", n=100)):
         bars = p.get_bars("USDJPY", "4h")
     assert bars and all(b.interval == "4h" for b in bars)
-    assert ohlcv.load_bars(conn, "USDJPY", "4h") == []      # 導出足は保存しない
-    assert len(ohlcv.load_bars(conn, "USDJPY", "1h")) == 100  # base を保存する
+    assert ohlcv.load_bars(conn, "USDJPY", "4h", source="yfinance") == []      # 導出足は保存しない
+    assert len(ohlcv.load_bars(conn, "USDJPY", "1h", source="yfinance")) == 100  # base を保存する
 
 
 def test_get_bars_1d_derives_from_1h_not_4h(tmp_path):
@@ -368,7 +368,7 @@ def test_derive_rejects_source_with_gappy_base_bars(tmp_path):
 def test_derive_gappy_base_falls_through_to_next_candidate(tmp_path):
     """base 不健全の DataUnhealthy は get_bars ごと落とさずフォールバックに流す。"""
     conn, p = _provider(tmp_path)
-    ohlcv.upsert_bars(conn, _fresh_bars(interval="1h", n=100))
+    ohlcv.upsert_bars(conn, _fresh_bars(interval="1h", n=100), source="yfinance")
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_gappy_1h_base()):
         bars = p.get_bars("USDJPY", "4h")
@@ -406,7 +406,7 @@ def test_native_4h_is_never_requested_even_when_source_has_it(tmp_path):
 def test_cache_fallback_derives_4h_from_cached_1h(tmp_path):
     """全ソース失敗時、キャッシュの base 足から導出する (4h の行は読まない)。"""
     conn, p = _provider(tmp_path)
-    ohlcv.upsert_bars(conn, _fresh_bars(interval="1h", n=100))
+    ohlcv.upsert_bars(conn, _fresh_bars(interval="1h", n=100), source="yfinance")
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
         bars = p.get_bars("USDJPY", "4h")
@@ -426,7 +426,7 @@ def test_cache_fallback_derives_30m_from_cached_15m(tmp_path):
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_fresh_bars(interval="15m", n=200)):
         p.get_bars("USDJPY", "30m")
-    assert ohlcv.load_bars(conn, "USDJPY", "30m") == []   # 導出足は保存されない
+    assert ohlcv.load_bars(conn, "USDJPY", "30m", source="yfinance") == []   # 導出足は保存されない
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
         bars = p.get_bars("USDJPY", "30m")
@@ -438,7 +438,7 @@ def test_cache_fallback_derives_30m_from_cached_15m(tmp_path):
 def test_cache_direct_read_still_works_for_native_intervals(tmp_path):
     """ネイティブ足は従来どおり interval の行を直読みする (非退行)。"""
     conn, p = _provider(tmp_path)
-    ohlcv.upsert_bars(conn, _fresh_bars(interval="15m", n=100))
+    ohlcv.upsert_bars(conn, _fresh_bars(interval="15m", n=100), source="yfinance")
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
         bars = p.get_bars("USDJPY", "15m")
@@ -449,7 +449,7 @@ def test_cache_direct_read_still_works_for_native_intervals(tmp_path):
 def test_stale_grid_rows_are_not_read_for_derive_only_intervals(tmp_path):
     """旧バイナリが書いた 4h の行は読まない (ブローカー格子の混入を防ぐ)。"""
     conn, p = _provider(tmp_path)
-    ohlcv.upsert_bars(conn, _fresh_bars(interval="4h", n=30))  # 旧形式の残骸
+    ohlcv.upsert_bars(conn, _fresh_bars(interval="4h", n=30), source="yfinance")  # 旧形式の残骸
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
         with pytest.raises(DataUnhealthy):
@@ -459,7 +459,7 @@ def test_stale_grid_rows_are_not_read_for_derive_only_intervals(tmp_path):
 def test_cache_fallback_rejects_unhealthy_base(tmp_path):
     """キャッシュの base 足が不健全なら DataUnhealthy (fail closed の非退行)。"""
     conn, p = _provider(tmp_path)
-    ohlcv.upsert_bars(conn, _gappy_1h_base())
+    ohlcv.upsert_bars(conn, _gappy_1h_base(), source="yfinance")
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
         with pytest.raises(DataUnhealthy):

@@ -117,6 +117,10 @@ def run_init(root: Path) -> int:
     (root / "logs").mkdir(parents=True, exist_ok=True)
     setup_technical_logging(root / "logs", settings.logging.level)
 
+    # init_db は既存 DB のスキーマが旧形式なら移行 (例: ohlcv v1→v2 の table
+    # rebuild) を実行する。実運用の agentic.db に対して `init` を再実行する
+    # 前は、サービスを停止した上で
+    # `cp data/agentic.db data/agentic.db.bak-YYYYMMDD` を取ること。
     conn = connect(root / "data" / "agentic.db")
     init_db(conn)
 
