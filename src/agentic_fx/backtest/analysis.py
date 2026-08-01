@@ -57,6 +57,7 @@ ANALYSIS_SOURCE = "dukascopy"
 
 def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
                   source: str, in_sample_until: datetime,
+                  since: datetime | None = None,
                   ) -> dict[datetime, float]:
     """symbol の log リターン系列を返す (キーは aware UTC datetime)。
 
@@ -68,6 +69,10 @@ def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
     ``bar_time < ?`` を書く (境界バーが holdout 側の period_start に
     なるため — Task 9 裁定、上書き節 B)。
 
+    ``since`` (Task 11 上書き節 E の最小追加): 指定時は ``bar_time >= ?``
+    を追加する。既定 None は従来どおり全履歴 (改善ループ ``analyze_for_agent``
+    は since を渡さない — 挙動不変)。
+
     F1 (Fix Round 1, codex Important-1 = sonnet Minor-2): ohlcv.close に
     正値制約は無く (REAL NOT NULL のみ)、close<=0 のバーが混入すると
     ``math.log(c / prev)`` が ``prev==0`` で ZeroDivisionError を送出し
@@ -77,10 +82,18 @@ def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
     観測不足なら insufficient_data に自然合流する (fail closed)。
     """
     until_utc = as_utc(in_sample_until)
-    rows = conn.execute(
-        "SELECT bar_time, close FROM ohlcv WHERE symbol=? AND interval=? "
-        "AND source=? AND bar_time < ? ORDER BY bar_time",
-        (symbol, timeframe, source, until_utc.isoformat())).fetchall()
+    if since is None:
+        rows = conn.execute(
+            "SELECT bar_time, close FROM ohlcv WHERE symbol=? AND interval=? "
+            "AND source=? AND bar_time < ? ORDER BY bar_time",
+            (symbol, timeframe, source, until_utc.isoformat())).fetchall()
+    else:
+        since_utc = as_utc(since)
+        rows = conn.execute(
+            "SELECT bar_time, close FROM ohlcv WHERE symbol=? AND interval=? "
+            "AND source=? AND bar_time >= ? AND bar_time < ? ORDER BY bar_time",
+            (symbol, timeframe, source, since_utc.isoformat(),
+             until_utc.isoformat())).fetchall()
     closes = {datetime.fromisoformat(r["bar_time"]): r["close"] for r in rows}
     width = timedelta(minutes=_TF_MINUTES[timeframe])
     returns: dict[datetime, float] = {}
@@ -150,10 +163,11 @@ def _pick_peak(corrs: dict[int, float]) -> int:
 
 def _corr_matrix_impl(conn: sqlite3.Connection, symbols: list[str], *,
                       timeframe: str, source: str, in_sample_until: datetime,
+                      since: datetime | None = None,
                       ) -> tuple[dict[tuple[str, str], float], int]:
     _validate_timeframe(timeframe)
     returns = {s: _load_returns(conn, s, timeframe, source=source,
-                                in_sample_until=in_sample_until)
+                                in_sample_until=in_sample_until, since=since)
               for s in symbols}
     result: dict[tuple[str, str], float] = {}
     for i in range(len(symbols)):
@@ -168,11 +182,17 @@ def _corr_matrix_impl(conn: sqlite3.Connection, symbols: list[str], *,
 
 def corr_matrix(conn: sqlite3.Connection, symbols: list[str], *,
                 timeframe: str, source: str, in_sample_until: datetime,
+                since: datetime | None = None,
                 ) -> dict[tuple[str, str], float]:
-    """symbols の全 2-組合せ (入力順で i < j) の log リターン相関 (ピアソン)。"""
+    """symbols の全 2-組合せ (入力順で i < j) の log リターン相関 (ピアソン)。
+
+    ``since`` (Task 11 上書き節 E): 指定時は ``since <= bar_time`` に限定する
+    (人間 CLI の ``analyze corr --from`` 用。既定 None = 従来どおり全履歴)。
+    """
     result, _ = _corr_matrix_impl(conn, symbols, timeframe=timeframe,
                                   source=source,
-                                  in_sample_until=in_sample_until)
+                                  in_sample_until=in_sample_until,
+                                  since=since)
     return result
 
 
