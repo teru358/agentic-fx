@@ -121,7 +121,13 @@ def test_runner_non_mission_result_normalized_to_failed(tmp_path):
 
 
 def test_missions_finish_failure_recorded_in_activity(tmp_path):
-    """missions.finish failure writes activity SYSTEM mission_finalize_failed (F3)."""
+    """missions.finish failure writes activity SYSTEM mission_finalize_failed (F3).
+
+    W1-b: finish 失敗時は監査未確定 (missions 行が running のまま) のため
+    reflection も保存しない (以前は保存していた — 意図の変更・レビュー指摘
+    W1-b)。SQLite マーカー (reflections 行) が無いので次周期の run_pending
+    が同じ order を再試行対象のまま残す。
+    """
     conn, rag, cyc = _cycle(tmp_path, [MissionResult(
         "completed", {"content": "x"}, [])])
     activity = ActivityLog(tmp_path / "a.log")
@@ -139,12 +145,11 @@ def test_missions_finish_failure_recorded_in_activity(tmp_path):
     try:
         missions.finish = failing_finish
         oid = _closed_order(conn)
-        # missions.finish failure is logged but reflection still completes
-        # (finish is metadata recording, not part of the core reflection save)
+        # missions.finish failure → fail closed: reflection は保存されない
         result = cyc.run_pending()
-        assert result == 1  # reflection created despite missions.finish failure
-        assert reflections.get(conn, oid)["content"] == "x"
-        rag.add_reflection.assert_called_once_with(oid, "x", "USDJPY")
+        assert result == 0
+        assert reflections.get(conn, oid) is None
+        rag.add_reflection.assert_not_called()
 
         # F3: Verify missions.finish called exactly once and activity recorded
         assert finish_call_count == 1
@@ -152,6 +157,33 @@ def test_missions_finish_failure_recorded_in_activity(tmp_path):
                             (tmp_path / "a.log").read_text().split("\n")
                             if "mission_finalize_failed" in line]
         assert len(activity_entries) >= 1
+    finally:
+        missions.finish = orig_finish
+
+
+def test_finish_failure_retried_next_run_pending(tmp_path):
+    """W1-b: finish 失敗の周期後、次の run_pending で同じ order が再試行される。"""
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": "x"}, []),
+        MissionResult("completed", {"content": "y"}, []),
+    ])
+    orig_finish = missions.finish
+    calls = {"n": 0}
+
+    def flaky_finish(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("db error")
+        return orig_finish(*args, **kwargs)
+
+    try:
+        missions.finish = flaky_finish
+        oid = _closed_order(conn)
+        assert cyc.run_pending() == 0
+        assert reflections.get(conn, oid) is None
+        # 次回 run_pending は SQLite マーカーが無いので同じ order を再試行
+        assert cyc.run_pending() == 1
+        assert reflections.get(conn, oid)["content"] == "y"
     finally:
         missions.finish = orig_finish
 
@@ -272,6 +304,84 @@ def test_intent_reasoning_in_prompt(tmp_path):
 
     # Verify reasoning is in the prompt
     assert "市場が弱気だから売り" in mission_prompt
+
+
+# ---- W2: completed 出力の検証 ----
+
+def _row_dict(conn, oid):
+    return dict(conn.execute(
+        "SELECT * FROM orders WHERE id=?", (oid,)).fetchone())
+
+
+def test_completed_output_none_is_normalized_not_raised(tmp_path):
+    """W2: output=None の completed → _reflect_one が例外を出さず False を返す。
+
+    result.output["content"] を無条件参照すると TypeError が発生する
+    (`_reflect_one` を直接呼ぶことで、`run_pending` の per-item isolation
+    (`except Exception`) に隠されずに区別する — caplog はロガーの
+    propagate=False 設定に依存するため信頼できる判別に使わない)。
+    """
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "completed", None, [])])
+    oid = _closed_order(conn)
+    assert cyc._reflect_one(_row_dict(conn, oid)) is False
+    assert reflections.get(conn, oid) is None
+    rag.add_reflection.assert_not_called()
+    # run_pending 経由でも同じ (per-item isolation に落ちない = 0 件で正常終了)
+    assert cyc.run_pending() == 0
+
+
+def test_completed_output_missing_content_is_normalized_not_raised(tmp_path):
+    """W2: output dict だが content キー欠落 → _reflect_one が例外を出さず False。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "completed", {"wrong_key": "value"}, [])])
+    oid = _closed_order(conn)
+    assert cyc._reflect_one(_row_dict(conn, oid)) is False
+    assert reflections.get(conn, oid) is None
+    rag.add_reflection.assert_not_called()
+
+
+def test_completed_output_content_not_string_is_normalized(tmp_path):
+    """W2: output.content が str でない (int) → _reflect_one が例外を出さず False。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "completed", {"content": 123}, [])])
+    oid = _closed_order(conn)
+    assert cyc._reflect_one(_row_dict(conn, oid)) is False
+    assert reflections.get(conn, oid) is None
+    rag.add_reflection.assert_not_called()
+
+
+# ---- W3: run_pending の件数 cap ----
+
+def test_run_pending_caps_at_max_items(tmp_path):
+    """W3: 5 件の closed order → 1 回目は 3 件のみ処理・残り 2 件は次周期。"""
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": f"r{i}"}, [])
+        for i in range(5)])
+    oids = [_closed_order(conn) for _ in range(5)]
+    first = cyc.run_pending()
+    assert first == 3
+    for oid in oids[:3]:
+        assert reflections.get(conn, oid) is not None
+    for oid in oids[3:]:
+        assert reflections.get(conn, oid) is None
+    second = cyc.run_pending()
+    assert second == 2
+    for oid in oids[3:]:
+        assert reflections.get(conn, oid) is not None
+
+
+def test_run_pending_max_items_override(tmp_path):
+    """W3: max_items を明示指定すると SQL LIMIT に反映される。"""
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": f"r{i}"}, [])
+        for i in range(3)])
+    oids = [_closed_order(conn) for _ in range(3)]
+    result = cyc.run_pending(max_items=1)
+    assert result == 1
+    assert reflections.get(conn, oids[0]) is not None
+    assert reflections.get(conn, oids[1]) is None
+    assert reflections.get(conn, oids[2]) is None
 
 
 def test_null_intent_id_handled(tmp_path):

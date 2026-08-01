@@ -246,17 +246,51 @@ def test_ask_once_invalid_output_answer_not_string(tmp_path):
 
 
 def test_missions_finish_failure_logged_not_blocking(tmp_path):
-    """missions.finish が例外 → 記録は試行・例外は catch・結果は返る。"""
+    """missions.finish が例外 → fail closed で降格・executor 未呼び出し・None 返却。
+
+    W1: missions.finish 失敗時は監査 (missions 行) が running のまま未確定に
+    なるため、completed 相当の結果をそのまま返して発注させてはならない。
+    (意図の変更: 以前は hold の結果をそのまま返していたが、fail closed に
+    強化した — レビュー指摘 W1)
+    """
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed", {"action": "hold", "reasoning": "test"}, [])])
+    loop.executor.handle_intent = MagicMock()
     # missions.finish を mock で失敗させる
     with patch("agentic_fx.loops.trade_loop.missions.finish") as mock_finish:
         mock_finish.side_effect = RuntimeError("finish_boom")
         result = loop.run_once()
-        # 例外は catch されるが結果は返される (hold が成功したため)
-        assert result["result"] == "hold"
+        # 例外は catch されるが結果は failed に降格され None が返る
+        assert result is None
+        loop.executor.handle_intent.assert_not_called()
         # 失敗はログに記録されている
         # (activity.write も試行が行われる)
+
+
+def test_missions_finish_failure_fail_closed_no_order(tmp_path):
+    """W1: finish 失敗時、open intent でも executor.handle_intent は呼ばれない。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed",
+        {"action": "open", "pair": "USDJPY", "direction": "long",
+         "entry_type": "limit", "horizon": "day", "limit_price": 148.20,
+         "expires_in": "4h", "stop_loss": 147.80, "take_profit": 149.00,
+         "reasoning": "test"}, [])])
+    loop.executor.handle_intent = MagicMock()
+    with patch("agentic_fx.loops.trade_loop.missions.finish") as mock_finish:
+        mock_finish.side_effect = RuntimeError("finish_boom")
+        result = loop.run_once()
+        assert result is None
+        loop.executor.handle_intent.assert_not_called()
+
+
+def test_ask_once_finish_failure_returns_failed_string(tmp_path):
+    """W1: ask 経路で finish 失敗 → 失敗文字列を返す。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"answer": "test answer"}, [])])
+    with patch("agentic_fx.loops.trade_loop.missions.finish") as mock_finish:
+        mock_finish.side_effect = RuntimeError("finish_boom")
+        result = loop.ask_once("質問？")
+        assert result == "(Mission 失敗: failed)"
 
 
 def test_ask_once_mismatched_schema_in_output(tmp_path):
@@ -330,14 +364,17 @@ def test_run_once_boundary_exception_from_notifier_in_fail_closed(tmp_path):
 # ---- F4: missions.finish 失敗テストの強化 ----
 
 def test_missions_finish_failure_activity_recorded_call_count(tmp_path):
-    """missions.finish が例外 → activity mission_finalize_failed 記録・finish は 1 回・結果は返す。"""
+    """missions.finish が例外 → activity mission_finalize_failed 記録・finish は 1 回・結果は failed に降格。
+
+    W1: 返り値の期待を hold → None (fail closed) に更新 (意図の変更)。
+    """
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed", {"action": "hold", "reasoning": "test"}, [])])
     with patch("agentic_fx.loops.trade_loop.missions.finish") as mock_finish:
         mock_finish.side_effect = RuntimeError("finish_boom")
         result = loop.run_once()
-        # 実行は成功・hold の結果は返される
-        assert result["result"] == "hold"
+        # fail closed により降格され None が返る
+        assert result is None
         # finish は呼ばれたがちょうど 1 回
         assert mock_finish.call_count == 1
         # activity に記録の試み

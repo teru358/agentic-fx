@@ -96,6 +96,8 @@ class Commands:
                 f"直近 mission: {last}")
 
     def _log(self, n: int) -> str:
+        if n <= 0:
+            return ""
         path = self.log_dir / "agentic.log"
         if not path.exists():
             return "(ログなし)"

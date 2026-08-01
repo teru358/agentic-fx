@@ -56,6 +56,20 @@ def test_log_tail(tmp_path):
     assert "line2" in out and "line1" not in out
 
 
+def test_log_zero_returns_empty(tmp_path):
+    """W5: `log 0` は全ログを流さず空文字を返す。"""
+    _, _, _, cmds = _commands(tmp_path)
+    out = cmds.dispatch("log 0")
+    assert out == ""
+
+
+def test_log_negative_returns_empty(tmp_path):
+    """W5: 負の n も同じガードで空文字を返す。"""
+    _, _, _, cmds = _commands(tmp_path)
+    out = cmds.dispatch("log -1")
+    assert out == ""
+
+
 def test_activity_filter(tmp_path):
     _, _, activity, cmds = _commands(tmp_path)
     activity.write(Category.TRADE, "order_opened", "x")

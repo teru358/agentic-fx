@@ -175,6 +175,11 @@ class TradeLoop:
                                 result.transcript, self.clock.now())
             except Exception:  # noqa: BLE001
                 _log.exception("missions.finish failed for %s", mid)
+                # 監査未確定 (missions 行が running のまま output/transcript
+                # 未保存) で執行させない — fail closed。呼び出し元は
+                # completed 系の分岐に進まず、trade は mission_failed
+                # (発注なし)・ask は失敗文字列を返す
+                result = MissionResult("failed", None, [])
                 try:
                     self.activity.write(Category.SYSTEM, "mission_finalize_failed",
                                         f"mid={mid}")

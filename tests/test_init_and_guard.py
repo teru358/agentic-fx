@@ -73,7 +73,7 @@ def test_guard_blocks_before_init(tmp_path):
     assert e.value.code == 2
 
 
-def test_init_creates_everything(tmp_path):
+def test_init_creates_everything(tmp_path, mock_llama_swap_check):
     _example(tmp_path)
     assert run_init(tmp_path) == 0
     assert (tmp_path / "config" / "settings.yaml").exists()
@@ -88,6 +88,11 @@ def test_init_creates_everything(tmp_path):
     act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
     assert "init_completed" in act
     ensure_initialized(tmp_path)  # ガード通過 (例外なし)
+    # W4: run_init が _check_llama_swap を実際に呼んでいることの配線 assert
+    # (呼び出し行を削除しても全テスト緑という実測ギャップを閉じる。
+    # ensure_initialized は _check_llama_swap を経由しないので call_count は
+    # run_init の 1 回分のみ)
+    mock_llama_swap_check.assert_called_once()
 
 
 def test_init_is_idempotent(tmp_path):

@@ -34,12 +34,18 @@ class ReflectionCycle:
         self.clock = clock
         self.watch = watch if watch is not None else MissionWatch()
 
-    def run_pending(self) -> int:
-        """Reflect on closed orders without reflection. Per-item isolation."""
+    def run_pending(self, max_items: int = 3) -> int:
+        """Reflect on closed orders without reflection. Per-item isolation.
+
+        1 回の呼び出しで処理する件数を `max_items` に制限する — core_lock
+        保持中の Mission 合成時間を抑え、SL/TP 監視の停止窓を制限するため。
+        残りは次周期の呼び出しで処理される。
+        """
         rows = self.conn.execute(
             "SELECT o.* FROM orders o LEFT JOIN reflections r "
             "ON r.order_id = o.id WHERE o.status='closed' "
-            "AND r.order_id IS NULL ORDER BY o.id").fetchall()
+            "AND r.order_id IS NULL ORDER BY o.id LIMIT ?",
+            (max_items,)).fetchall()
         created = 0
         for row in rows:
             try:
@@ -82,6 +88,7 @@ class ReflectionCycle:
 
         # Run with watch and exception normalization (_run_recorded pattern)
         result: MissionResult | None = None
+        finalized = False
         try:
             self.watch.begin(mid, "reflection", mission.timeout_sec)
             result = self.runner.run(mission)
@@ -99,6 +106,7 @@ class ReflectionCycle:
                 missions.finish(
                     self.conn, mid, result.status, result.output,
                     result.transcript, self.clock.now())
+                finalized = True
             except Exception:  # noqa: BLE001
                 _log.exception("missions.finish failed for %s", mid)
                 try:
@@ -109,10 +117,21 @@ class ReflectionCycle:
                     _log.exception("failed to record mission_finalize_failed")
             self.watch.end(mid)
 
-        if result.status != "completed":
+        if result.status != "completed" or not finalized:
+            # finish 失敗時は監査未確定 (missions 行が running のまま) なので
+            # reflection も保存しない。SQLite マーカー (reflections 行) が
+            # 無いので次周期の run_pending が同じ order を再試行する
             return False
 
-        content = result.output["content"]
+        # completed 出力の検証: dict であり content が str であること。
+        # 不正なら failed 相当として扱い (per-item isolation で 0 件扱い)、
+        # missions 行は completed 保存済みでも reflection を毎周期再試行
+        # する非対称は起こさない (そもそもここで保存されない)
+        if not isinstance(result.output, dict):
+            return False
+        content = result.output.get("content")
+        if not isinstance(content, str):
+            return False
 
         # RAG → SQLite order (SQLite row is completion marker)
         # If RAG fails, no SQLite row → next run upsert (order_id idempotent)

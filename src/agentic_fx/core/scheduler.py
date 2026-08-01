@@ -185,7 +185,7 @@ class Scheduler:
         filled_ids = self._process_limit_fills(now) if fills_allowed else set()
         self._process_exits(now, filled_ids)
         reason = self._trade_mission_due(now)
-        if reason:
+        if reason is not None:
             self._last_trade = now
             self.on_trade_mission(reason)
 
