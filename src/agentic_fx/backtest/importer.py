@@ -10,6 +10,22 @@ from agentic_fx.store.ohlcv import ImportResult, import_bars
 _log = logging.getLogger(__name__)
 
 
+def _default_fetch(url: str) -> bytes:
+    """Default fetch implementation using httpx.
+
+    Returns b"" for 404 errors, raises HTTPStatusError for other HTTP errors,
+    and raises for network errors.
+    """
+    try:
+        resp = httpx.get(url, timeout=30)
+        resp.raise_for_status()
+        return resp.content
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return b""
+        raise
+
+
 def ticks_to_1m(ticks: list[Tick], symbol: str) -> list[tuple]:
     """Aggregate ticks to 1-minute bars.
 
@@ -26,6 +42,9 @@ def ticks_to_1m(ticks: list[Tick], symbol: str) -> list[tuple]:
     """
     if not ticks:
         return []
+
+    # F3: Defensive sort by timestamp (open/close depend on input order)
+    ticks = sorted(ticks, key=lambda t: t.ts)
 
     # Group ticks by minute (hour and minute components)
     minute_groups = {}
@@ -80,25 +99,31 @@ def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
     Args:
         conn: sqlite3 connection
         symbol: Trading pair symbol
-        start: Start time (inclusive) — aware UTC datetime
-        end: End time (exclusive) — aware UTC datetime
-        fetch: Optional fetch function (url: str) -> bytes. Defaults to httpx.get
-               with 30s timeout. 404 errors return empty bytes, other errors raise.
+        start: Start time (inclusive) — aware UTC datetime on hour boundary
+        end: End time (exclusive) — aware UTC datetime on hour boundary
+        fetch: Optional fetch function (url: str) -> bytes. Defaults to _default_fetch.
+               404 errors return empty bytes, other errors raise.
         progress: Optional callback (url_or_time) -> None. Called for each hour processed.
 
     Returns:
         ImportResult with inserted, unchanged, conflicted counts.
+
+    Raises:
+        ValueError if start/end are naive, non-UTC, or not on hour boundary.
     """
+    # F2: Validate start/end are aware UTC and on hour boundary
+    for dt, name in [(start, "start"), (end, "end")]:
+        if dt.tzinfo is None:
+            raise ValueError(f"{name} must be timezone-aware; got naive datetime")
+        if dt.tzinfo != timezone.utc:
+            raise ValueError(f"{name} must be UTC; got {dt.tzinfo}")
+        if dt.minute != 0 or dt.second != 0 or dt.microsecond != 0:
+            raise ValueError(
+                f"{name} must be on hour boundary (minute=0, second=0, microsecond=0); "
+                f"got {dt.isoformat()}")
+
     if fetch is None:
-        def fetch(url: str) -> bytes:
-            try:
-                resp = httpx.get(url, timeout=30)
-                resp.raise_for_status()
-                return resp.content
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    return b""
-                raise
+        fetch = _default_fetch
 
     # Get point value for the symbol
     point = point_of(symbol)
@@ -119,20 +144,15 @@ def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
         url = hour_url(symbol, current)
         payload = fetch(url)
 
-        # Skip empty payloads (404, no data)
+        # Skip empty payloads (404, no data) — only legitimate skip reasons
         if not payload:
             current += timedelta(hours=1)
             continue
 
-        # Decode bi5 payload
-        try:
-            ticks = decode_bi5(payload, point=point, hour_start_utc=current)
-        except Exception as e:
-            _log.error(f"Failed to decode bi5 for {symbol} at {current}: {e}")
-            current += timedelta(hours=1)
-            continue
+        # F1: Decode bi5 payload — exceptions propagate (corrupt data should fail, not silently skip)
+        ticks = decode_bi5(payload, point=point, hour_start_utc=current)
 
-        # Skip if no valid ticks
+        # Skip if no valid ticks (all records rejected or incomplete)
         if not ticks:
             current += timedelta(hours=1)
             continue
