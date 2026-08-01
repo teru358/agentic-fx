@@ -240,6 +240,12 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     quote_fn / spec_fn / bars_fn は E2E テストの注入点 (None なら provider の
     実装を使う — build 後の patch では bound 済みクロージャに届かないため
     注入で解決する)。
+
+    **`healthcheck()` は注入対象外** (fix round 1 F2): `PriceProvider.healthcheck`
+    は `self.get_quote(...)` に加えて `self.get_bars(...)` を呼ぶが、
+    `get_bars` は quote_fn/spec_fn/bars_fn のどれにもマップされていない。
+    決定論的なテストで `build_app` を使う場合、`app.provider.healthcheck` を
+    個別に patch すること (本 E2E テスト `tests/test_e2e_phase1.py` 参照)。
     """
     clock = clock or SystemClock()
     settings = load_settings(root / "config" / "settings.yaml")
@@ -252,11 +258,21 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
     provider = PriceProvider(conn_core, settings, clock)
     # 注入された quote_fn/spec_fn/bars_fn は provider 自身の束縛メソッドにも
-    # 反映する (Task 8 E2E で実測): `to_account_rate`/`_rate_of` 等 provider
-    # 内部の `self.get_quote`/`self.spec` 呼び出し (換算レート解決) はここで
-    # 作るローカル変数 quote_fn/spec_fn を参照しない。ローカル変数の差し替え
-    # だけでは届かず、口座通貨と異なる base_currency (例: USDJPY の USD 脚)
-    # の換算がテスト注入をすり抜けて実 provider (実 HTTP) を叩いてしまう。
+    # 反映する (Task 8 E2E で実測)。実際に内部 self-call が存在するのは
+    # `self.get_quote` だけ (`PriceProvider._rate_of` および `healthcheck`
+    # から呼ばれる — `to_account_rate` の換算レート解決がここを経由する)。
+    # `self.spec` / `self.latest_1m_bar` は現時点で provider 内部からは
+    # 一切呼ばれていない (呼び出し元は Executor/Scheduler にローカル変数
+    # 経由で渡した spec_fn/bars_fn のみ) — 以下 2 行は今の挙動には効いて
+    # いない。それでも残しているのは予防的措置 (fix round 1 F1): 将来
+    # provider 内部に `self.spec(...)` / `self.latest_1m_bar(...)` の
+    # 自己呼び出しが追加されたとき、ここが無いと `get_quote` と同じ
+    # 「注入がローカル変数にしか反映されず内部呼び出しをすり抜ける」バグを
+    # 無音で再発させる (quote_fn 側の実例がまさにそれだった)。
+    # 注意: `self.get_bars(...)` (`latest_1m_bar`/`healthcheck` から既に
+    # 呼ばれている) はこの 2 行では捕捉できない — 別メソッド名なので
+    # `provider.latest_1m_bar = bars_fn` は届かない。恒久的に注入対象外
+    # (docstring の fix round 1 F2 注記を参照)。
     if quote_fn is not None:
         provider.get_quote = quote_fn
     else:

@@ -68,12 +68,17 @@ def test_phase1_full_cycle(tmp_path):
         assert app.conn_core.execute(
             "SELECT status FROM orders").fetchone()["status"] == "open"
 
-        # tick 3: TP バー (新しい ts — 同一バー再処理防止) → closed
+        # tick 3: TP バー (新しい ts を渡す — 同一バー再処理ガードは
+        # unit 側で検証済み: tests/core/test_scheduler.py)。→ closed
         bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
                              148.90, 149.10, 148.85, 149.05, 100)
         app.scheduler.tick(WED + timedelta(minutes=2))
         row = app.conn_core.execute("SELECT * FROM orders").fetchone()
         assert row["status"] == "closed" and row["realized_pnl"] > 0
+        # fix round 1 F3: 正の PnL なら何でも通ってしまうのを塞ぐ — SL 逆行
+        # 等ではなく TP 到達でクローズしたことを close_reason で固定する
+        assert row["close_reason"] == "tp"
+        closed_order_id = row["id"]
 
         # tick 4 (1 時間後): 2 周目 trade (hold) → reflection 生成
         bars["USDJPY"] = Bar("USDJPY", "1m",
@@ -82,6 +87,9 @@ def test_phase1_full_cycle(tmp_path):
         app.scheduler.tick(WED + timedelta(hours=1, minutes=1))
         refl = app.conn_core.execute("SELECT * FROM reflections").fetchall()
         assert len(refl) == 1
+        # fix round 1 F3: 件数だけでは誤対象・別内容でも通ってしまうのを塞ぐ
+        assert refl[0]["order_id"] == closed_order_id
+        assert refl[0]["content"] == "振り返り"
 
     # 監査痕跡: 全 Mission が意図した status で完了している (#codex 指摘)
     missions = app.conn_core.execute(
