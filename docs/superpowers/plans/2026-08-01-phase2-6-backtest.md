@@ -331,31 +331,32 @@ def test_hour_url_month_is_zero_based():
         "https://datafeed.dukascopy.com/datafeed/USDJPY/2026/06/22/12h_ticks.bi5")
 
 
-def test_point_of_uses_spec_quote_currency():
+def test_point_of_uses_metadata_table():
     assert point_of("USDJPY") == 1e-3
     assert point_of("EURUSD") == 1e-5
+    with pytest.raises(KeyError):
+        point_of("GBPZAR")  # 表に無い symbol は明示エラー (文字列推測禁止)
+
+
+def test_points_table_consistent_with_trading_specs():
+    """取引ペアについては _SPECS の quote_currency と表の整合をピン。"""
+    from agentic_fx.datafeed.price_provider import _SPECS
+    for sym, spec in _SPECS.items():
+        expected = 1e-3 if spec.quote_currency == "JPY" else 1e-5
+        assert point_of(sym) == expected
 ```
 
-- [ ] **Step 2: FAIL 確認 → 実装** — `decode_bi5` は `lzma.decompress(payload)` (FORMAT_ALONE / FORMAT_XZ 両対応: `try FORMAT_ALONE → except LZMAError → 自動判定`)、20 byte 毎に unpack、`bid > 0 and ask >= bid` を満たさないレコードは黙って棄却 (件数を DEBUG ログ)。`point_of` は `price_provider` の InstrumentSpec 静的テーブル (`_SPECS` — 実名は実装時に `rg -n "_SPECS" src/agentic_fx/datafeed/price_provider.py` で確認) から `quote_currency == "JPY"` を判定。
+- [ ] **Step 2: FAIL 確認 → 実装** — `decode_bi5` は `lzma.decompress(payload)` (FORMAT_ALONE / FORMAT_XZ 両対応: `try FORMAT_ALONE → except LZMAError → 自動判定`)、20 byte 毎に unpack、`bid > 0 and ask >= bid` を満たさないレコードは黙って棄却 (件数を DEBUG ログ)。`point_of` は **`_DUKASCOPY_POINTS` 表の lookup のみ** (Interfaces の定義どおり — `_SPECS` を実行時参照しない。`_SPECS` との整合は上記テストで別途ピンする。表・spec の実カラム名は実装時に `rg -n "_SPECS" src/agentic_fx/datafeed/price_provider.py` で確認)。
 
 - [ ] **Step 3: PASS 確認** → `uv run pytest tests/backtest/ -v`
 
 - [ ] **Step 4: Commit** — `git commit -m "feat: Dukascopy bi5 デコーダ (合成フィクスチャ検証)"`
 
-- [ ] **Step 5 (実データ照合 — ネットワーク使用・pytest 外)**: 実装者はコミット後に 1 回だけ実 URL から直近営業日の 1 時間分を取得し、フォーマット仮定 (0 始まり月・struct 順・point) を実測確認して報告書に記録する:
+- [ ] **Step 5 (実データ照合 — ネットワーク使用・pytest 外)**: 実装者は `scripts/verify_dukascopy.py` を作成し、コミット後に 1 回実行して結果を報告書に記録する。実行例:
 
 ```bash
-uv run python - << 'EOF'
-from datetime import datetime, timedelta, timezone
-import httpx
-from agentic_fx.backtest.dukascopy import decode_bi5, hour_url, point_of
-# 直近の平日 12:00 UTC を選ぶ (週末は 404/空)
-dt = datetime(2026, 7, 30, 12, 0, tzinfo=timezone.utc)
-url = hour_url("USDJPY", dt)
-r = httpx.get(url, timeout=30); r.raise_for_status()
-ticks = decode_bi5(r.content, point=point_of("USDJPY"), hour_start_utc=dt)
-print(url, len(ticks), ticks[0] if ticks else None)
-EOF
+uv run python scripts/verify_dukascopy.py --hour 2026-07-30T12:00 \
+    --symbols USDJPY EURUSD --mt5-base http://localhost:8812
 ```
 
 照合スクリプトは以下を**機械 assert** する (レビュー裁定 codex I8 — 先頭 tick の目視だけでは struct 順・volume 位置・point の誤りを検出できない):
@@ -570,16 +571,26 @@ OPEN = {"action": "open", "pair": "USDJPY", "direction": "long",
 
 
 def _seed_history(conn):
-    """水曜 12:00 から: 1h バー確定 → 指値到達 → TP 到達、の 1m 列を投入。"""
+    """水曜 12:00 から: 1h バー確定 → (2 tick 後に) 指値到達 → TP 到達の 1m 列。
+
+    タイムライン (メインループ逐語契約に一致 — レビュー裁定 codex 2 周目 I2):
+      13:00 tick = bucket [12:00,13:00) 確定 → proposal 生成 (pending)
+      13:01 tick = tick() 後に pending 執行 → 指値 148.20 を発注
+      13:02 tick = fills が 13:02 バーで初回判定 → 指値到達
+      13:03 tick = TP 到達
+    """
     rows = []
     t = WED  # 2026-07-22 (水) 12:00 UTC — 市場オープン
     for i in range(60):          # 12:00-12:59 (評価対象の 1h を構成)
         rows.append(_row_at(t + timedelta(minutes=i), o=148.5, h=148.6,
                             l=148.4, c=148.5))
-    rows.append(_row_at(t + timedelta(hours=1), o=148.3, h=148.35,
-                        l=148.10, c=148.15))       # 13:00 — 指値 148.20 到達
-    rows.append(_row_at(t + timedelta(hours=1, minutes=1), o=148.9,
-                        h=149.10, l=148.85, c=149.05))  # 13:01 — TP 到達
+    for m in (60, 61):           # 13:00, 13:01 — 指値に届かないバー
+        rows.append(_row_at(t + timedelta(minutes=m), o=148.4, h=148.45,
+                            l=148.30, c=148.35))
+    rows.append(_row_at(t + timedelta(minutes=62), o=148.3, h=148.35,
+                        l=148.10, c=148.15))       # 13:02 — 指値 148.20 到達
+    rows.append(_row_at(t + timedelta(minutes=63), o=148.9,
+                        h=149.10, l=148.85, c=149.05))  # 13:03 — TP 到達
     ohlcv.import_bars(conn, rows, source="dukascopy")
 
 
