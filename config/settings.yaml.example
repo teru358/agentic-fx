@@ -23,8 +23,8 @@ risk:
     EURUSD: {sl_distance_min_pips: 5, sl_distance_max_pips: 200, assumed_spread_pips: 1.0}
 
 runner:
-  trade:   {backend: local, model: qwen3.6-35b}
-  improve: {backend: local, model: qwen3.6-35b}
+  trade:   {backend: local, model: qwen3.6-35b-a3b_Q4}
+  improve: {backend: local, model: qwen3.6-35b-a3b_Q4}
 
 llama_swap:
   base_url: "http://localhost:8080/v1"
