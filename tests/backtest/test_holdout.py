@@ -1,0 +1,262 @@
+"""holdout — in-sample / holdout gate 分割 (Task 9)。
+
+上書き節 A (task-9-brief.md, コントローラ照合 2026-08-01) がこのテストの
+契約: 実 run_replay は空履歴でも 30 日 136 秒かかるため、テストでは
+``monkeypatch.setattr("agentic_fx.backtest.holdout.run_replay", fake)`` で
+置換する。fake は受け取った kwargs (start/end/symbol/source/eval_timeframe)
+を記録し、最小の BacktestResult を返す。save_harness_run/compute_metrics は
+実物を使う (配線検証)。
+"""
+import json
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from agentic_fx.backtest import holdout, metrics, runner
+from agentic_fx.backtest.holdout import (
+    holdout_boundary, run_holdout_gate, run_in_sample,
+)
+from agentic_fx.backtest.runner import BacktestResult
+from agentic_fx.store import ohlcv
+from agentic_fx.store.backtest_runs import settings_snapshot_hash
+
+from tests.backtest.conftest import H, SETTINGS, WED, _conn, _row_at
+
+UTC = timezone.utc
+
+
+def _seed_history(hist):
+    """最古バー判定に足る少数行 (fake replay なので期間を覆う必要はない)。"""
+    rows = [
+        _row_at(H - timedelta(days=200), o=100.0, h=100.5, l=99.5, c=100.2),
+        _row_at(H - timedelta(days=199), o=100.2, h=100.6, l=99.8, c=100.3),
+        _row_at(H, o=100.3, h=100.7, l=99.9, c=100.4),
+    ]
+    ohlcv.import_bars(hist, rows, source="dukascopy")
+
+
+def _make_fake_replay(calls):
+    def fake(settings, *, symbol, source, start, end, intent_source,
+             eval_timeframe="1h", history_conn):
+        calls.append({"symbol": symbol, "source": source, "start": start,
+                      "end": end, "eval_timeframe": eval_timeframe})
+        return BacktestResult(
+            orders=[], equity_curve=[(start.isoformat(), 1e6)], start=start,
+            end=end, source=source, fallback_spread_used=False)
+    return fake
+
+
+def test_holdout_boundary_simple_months():
+    assert holdout_boundary(datetime(2026, 8, 1, tzinfo=UTC), 3) == \
+        datetime(2026, 5, 1, tzinfo=UTC)
+    assert holdout_boundary(datetime(2026, 3, 31, tzinfo=UTC), 1) == \
+        datetime(2026, 2, 28, tzinfo=UTC)  # 日クランプ
+
+
+def test_holdout_boundary_naive_rejected():
+    with pytest.raises(ValueError):
+        holdout_boundary(datetime(2026, 8, 1), 3)
+
+
+def test_holdout_boundary_months_below_one_rejected():
+    with pytest.raises(ValueError):
+        holdout_boundary(datetime(2026, 8, 1, tzinfo=UTC), 0)
+
+
+def test_wiring_pins_real_run_replay_and_compute_metrics():
+    """配線ピン: import が実物であることの固定 (上書き節 A)。"""
+    assert holdout.run_replay is runner.run_replay
+    assert holdout.compute_metrics is metrics.compute_metrics
+
+
+def test_run_in_sample_returns_metrics_without_period(tmp_path, monkeypatch):
+    """遮断 1: 期間・端点を返さない。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    calls = []
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
+    out = run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
+                        source="dukascopy", intent_source=lambda b: None,
+                        eval_timeframe="1h", plugin_ref="p", content_hash="h",
+                        kind="strategy", now=WED + timedelta(days=120))
+    assert "trades" in out
+    forbidden = {"period_start", "period_end", "start", "end", "boundary"}
+    assert forbidden.isdisjoint(out.keys())
+
+
+def test_in_sample_and_gate_use_disjoint_periods(tmp_path, monkeypatch):
+    """分割点の両側が交わらないことを backtest_runs の記録で検証。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    calls = []
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
+    now = WED + timedelta(days=120)
+    kw = dict(history_conn=hist, symbol="USDJPY", source="dukascopy",
+              intent_source=lambda b: None, eval_timeframe="1h",
+              plugin_ref="p", content_hash="h", kind="strategy", now=now)
+    run_in_sample(SETTINGS, **kw)
+    run_holdout_gate(SETTINGS, **kw)
+    rows = {r["scope"]: dict(r) for r in hist.execute(
+        "SELECT scope, period_start, period_end FROM backtest_runs")}
+    assert rows["in_sample"]["period_end"] == \
+        rows["holdout_gate"]["period_start"]
+
+
+def test_run_in_sample_passes_oldest_bar_to_boundary_as_period(tmp_path, monkeypatch):
+    """期間計算の本体検証: run_in_sample は start=最古バー・end=boundary を渡す。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    calls = []
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
+    now = WED + timedelta(days=120)
+    boundary = holdout_boundary(now, SETTINGS.backtest.holdout_months)
+    run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
+                 source="dukascopy", intent_source=lambda b: None,
+                 eval_timeframe="1h", plugin_ref="p", content_hash="h",
+                 kind="strategy", now=now)
+    assert len(calls) == 1
+    assert calls[0]["start"] == H - timedelta(days=200)
+    assert calls[0]["end"] == boundary
+    assert calls[0]["symbol"] == "USDJPY"
+    assert calls[0]["source"] == "dukascopy"
+    assert calls[0]["eval_timeframe"] == "1h"
+
+
+def test_run_holdout_gate_passes_boundary_to_now_as_period(tmp_path, monkeypatch):
+    """期間計算の本体検証: run_holdout_gate は start=boundary・end=now を渡す。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    calls = []
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
+    now = WED + timedelta(days=120)
+    boundary = holdout_boundary(now, SETTINGS.backtest.holdout_months)
+    run_holdout_gate(SETTINGS, history_conn=hist, symbol="USDJPY",
+                     source="dukascopy", intent_source=lambda b: None,
+                     eval_timeframe="1h", plugin_ref="p", content_hash="h",
+                     kind="strategy", now=now)
+    assert len(calls) == 1
+    assert calls[0]["start"] == boundary
+    assert calls[0]["end"] == now
+
+
+def test_run_in_sample_normalizes_naive_now_rejected(tmp_path, monkeypatch):
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
+    with pytest.raises(ValueError):
+        run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
+                      source="dukascopy", intent_source=lambda b: None,
+                      eval_timeframe="1h", plugin_ref="p", content_hash="h",
+                      kind="strategy", now=datetime(2026, 11, 19, 12, 0))
+
+
+def test_run_in_sample_no_history_rejected(tmp_path, monkeypatch):
+    hist = _conn(tmp_path)  # 履歴投入なし
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
+    with pytest.raises(ValueError):
+        run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
+                      source="dukascopy", intent_source=lambda b: None,
+                      eval_timeframe="1h", plugin_ref="p", content_hash="h",
+                      kind="strategy", now=WED + timedelta(days=120))
+
+
+def test_run_in_sample_empty_period_rejected(tmp_path, monkeypatch):
+    """最古バー >= boundary (in-sample 期間が空) → ValueError。境界の等号
+    そのもの (最古バー == boundary ちょうど) を狙う (start > boundary への
+    弱化を検出する)。"""
+    hist = _conn(tmp_path)
+    now = WED + timedelta(days=120)
+    boundary = holdout_boundary(now, SETTINGS.backtest.holdout_months)
+    rows = [_row_at(boundary, o=100.0, h=100.5, l=99.5, c=100.2)]
+    ohlcv.import_bars(hist, rows, source="dukascopy")
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
+    with pytest.raises(ValueError):
+        run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
+                      source="dukascopy", intent_source=lambda b: None,
+                      eval_timeframe="1h", plugin_ref="p", content_hash="h",
+                      kind="strategy", now=now)
+
+
+def test_run_holdout_gate_saves_scope_holdout_gate(tmp_path, monkeypatch):
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
+    now = WED + timedelta(days=120)
+    out = run_holdout_gate(SETTINGS, history_conn=hist, symbol="USDJPY",
+                           source="dukascopy", intent_source=lambda b: None,
+                           eval_timeframe="1h", plugin_ref="p",
+                           content_hash="h", kind="strategy", now=now)
+    assert "trades" in out
+    row = hist.execute(
+        "SELECT scope, issued_by FROM backtest_runs").fetchone()
+    assert row["scope"] == "holdout_gate"
+    assert row["issued_by"] == "harness"
+
+
+def test_holdout_boundary_normalizes_non_utc_offset():
+    """UTC へ正規化してから暦月減算する (naive → UTC 見なしではなく、非 UTC
+    offset も正しく変換する)。"""
+    jst = timezone(timedelta(hours=9))
+    # 2026-08-01 05:00+09:00 == 2026-07-31 20:00 UTC; 1 month back = June
+    # (30 days) なので日は変わらず 20:00 UTC のまま。
+    now = datetime(2026, 8, 1, 5, 0, tzinfo=jst)
+    assert holdout_boundary(now, 1) == datetime(2026, 6, 30, 20, 0, tzinfo=UTC)
+
+
+def test_run_holdout_gate_normalizes_non_utc_now_and_floors_to_minute(
+        tmp_path, monkeypatch):
+    """上書き節 B: now は UTC へ正規化し分格子へ切り捨ててから境界計算に
+    使う (run_replay の正時格子契約)。非 UTC offset + 秒/マイクロ秒付き
+    now を渡し、fake replay へ渡された kwargs が UTC・分格子であることを
+    確認する。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    calls = []
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
+    jst = timezone(timedelta(hours=9))
+    now = datetime(2026, 11, 19, 21, 37, 42, 123456, tzinfo=jst)
+    expected_now = datetime(2026, 11, 19, 12, 37, 0, tzinfo=UTC)
+    run_holdout_gate(SETTINGS, history_conn=hist, symbol="USDJPY",
+                     source="dukascopy", intent_source=lambda b: None,
+                     eval_timeframe="1h", plugin_ref="p", content_hash="h",
+                     kind="strategy", now=now)
+    assert len(calls) == 1
+    assert calls[0]["end"] == expected_now
+    assert calls[0]["end"].tzinfo == UTC
+    assert calls[0]["start"] == holdout_boundary(
+        expected_now, SETTINGS.backtest.holdout_months)
+
+
+def test_save_harness_run_full_argument_wiring(tmp_path, monkeypatch):
+    """§C: save_harness_run へ渡す全引数 (pair/timeframe/settings_hash/
+    core_commit/initial_balance/created_at/metrics_json) を配線検証する。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
+    now = WED + timedelta(days=120)
+    out = run_holdout_gate(SETTINGS, history_conn=hist, symbol="USDJPY",
+                           source="dukascopy", intent_source=lambda b: None,
+                           eval_timeframe="1h", plugin_ref="p",
+                           content_hash="h", kind="strategy", now=now)
+    row = dict(hist.execute("SELECT * FROM backtest_runs").fetchone())
+    assert row["pair"] == "USDJPY"
+    assert row["timeframe"] == "1h"
+    assert row["source"] == "dukascopy"
+    assert row["plugin_ref"] == "p"
+    assert row["content_hash"] == "h"
+    assert row["kind"] == "strategy"
+    assert row["settings_hash"] == settings_snapshot_hash(SETTINGS)
+    assert row["core_commit"] == "testcommit"
+    assert row["initial_balance"] == SETTINGS.backtest.initial_balance
+    assert row["created_at"] == now.isoformat()
+    assert json.loads(row["metrics_json"]) == out
