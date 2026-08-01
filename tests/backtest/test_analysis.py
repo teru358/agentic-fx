@@ -16,13 +16,15 @@ brief (task-10-brief.md Step 1) のテストを、上書き節 A (コントロ�
 from __future__ import annotations
 
 import math
+import statistics
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from agentic_fx.backtest.analysis import (
-    LAGS, MIN_COMMON_OBS, TIMEFRAMES, WINDOWS, _load_returns, analyze_for_agent,
-    corr_matrix, coverage_report, lead_lag, rolling_corr_summary,
+    LAGS, MIN_COMMON_OBS, TIMEFRAMES, WINDOWS, _load_returns, _pick_peak,
+    analyze_for_agent, corr_matrix, coverage_report, lead_lag,
+    rolling_corr_summary,
 )
 from agentic_fx.store import ohlcv
 
@@ -95,12 +97,10 @@ def _leaves(x):
     return keys, leaves
 
 
-def test_agent_output_contract_no_leak(tmp_path):
-    """§6 出力契約: 日時・系列・観測数・端点を返さない (再帰チェック)。"""
-    conn = _conn(tmp_path); _seed_two_series(conn, start=BEFORE_BOUNDARY)
-    out = analyze_for_agent(conn, _settings_watch_eurusd(),
-                            {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD",
-                             "timeframe": "1h"}, now=NOW)
+def _assert_output_contract_no_leak(out):
+    """§6 出力契約: 日時・系列・観測数・端点を返さない (再帰チェック)。
+    F4 (Fix Round 1, sonnet Minor-1) で 3 kind 全経路から共有するため
+    ヘルパへ抽出。"""
     keys, leaves = _leaves(out)
     for leaf in leaves:
         assert not isinstance(leaf, datetime)
@@ -110,6 +110,34 @@ def test_agent_output_contract_no_leak(tmp_path):
     forbidden = {"count", "n", "observations", "start", "end", "dates",
                  "period_start", "period_end", "window_series"}
     assert forbidden.isdisjoint(set(keys))
+
+
+def test_agent_output_contract_no_leak(tmp_path):
+    conn = _conn(tmp_path); _seed_two_series(conn, start=BEFORE_BOUNDARY)
+    out = analyze_for_agent(conn, _settings_watch_eurusd(),
+                            {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD",
+                             "timeframe": "1h"}, now=NOW)
+    _assert_output_contract_no_leak(out)
+
+
+def test_agent_output_contract_no_leak_corr_matrix(tmp_path):
+    """F4 (Fix Round 1, sonnet Minor-1): corr_matrix 経路にも同じ検査を適用。"""
+    conn = _conn(tmp_path); _seed_two_series(conn, start=BEFORE_BOUNDARY)
+    out = analyze_for_agent(conn, _settings_watch_eurusd(),
+                            {"kind": "corr_matrix", "timeframe": "1h"},
+                            now=NOW)
+    _assert_output_contract_no_leak(out)
+
+
+def test_agent_output_contract_no_leak_rolling_corr_summary(tmp_path):
+    """F4 (Fix Round 1, sonnet Minor-1): rolling_corr_summary 経路にも
+    同じ検査を適用。"""
+    conn = _conn(tmp_path); _seed_two_series(conn, start=BEFORE_BOUNDARY)
+    out = analyze_for_agent(
+        conn, _settings_watch_eurusd(),
+        {"kind": "rolling_corr_summary", "a": "USDJPY", "b": "EURUSD",
+         "timeframe": "1h", "window": 20}, now=NOW)
+    _assert_output_contract_no_leak(out)
 
 
 def test_agent_analysis_is_in_sample_bounded(tmp_path):
@@ -150,6 +178,78 @@ def test_error_shape_is_boundary_independent(tmp_path):
                              {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD",
                               "timeframe": "1h"}, now=NOW)
     assert out1 == out2 == {"error": "insufficient_data"}
+
+
+def test_error_shape_is_boundary_independent_partial_vs_empty_in_sample(
+        tmp_path):
+    """F1.4 (Fix Round 1, codex Minor-2): in-sample が非空だが 30 未満
+    (20 本) のケースと in-sample が空 (全データが holdout 期) のケースが
+    同一 {"error": "insufficient_data"} を返す (`test_error_shape_is_
+    boundary_independent` の補強 — 境界依存の詳細が応答形状に漏れない)。"""
+    conn_partial = _conn(tmp_path / "partial")
+    _series(conn_partial, "USDJPY", _sine(20, phase=0), start=BEFORE_BOUNDARY)
+    _series(conn_partial, "EURUSD", _sine(20, phase=1), start=BEFORE_BOUNDARY)
+    out_partial = analyze_for_agent(
+        conn_partial, _settings_watch_eurusd(),
+        {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD", "timeframe": "1h"},
+        now=NOW)
+
+    conn_empty = _conn(tmp_path / "empty")
+    holdout_only_start = NOW - timedelta(days=10)  # 境界 (2026-05-01) より後
+    _series(conn_empty, "USDJPY", _sine(20, phase=0), start=holdout_only_start)
+    _series(conn_empty, "EURUSD", _sine(20, phase=1), start=holdout_only_start)
+    out_empty = analyze_for_agent(
+        conn_empty, _settings_watch_eurusd(),
+        {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD", "timeframe": "1h"},
+        now=NOW)
+
+    assert out_partial == out_empty == {"error": "insufficient_data"}
+
+
+def test_agent_handles_non_positive_close_without_raising(tmp_path):
+    """F1.3 (Fix Round 1, codex Important-1 = sonnet Minor-2 killer):
+    close<=0 のバーが混入しても ZeroDivisionError を送出せず
+    insufficient_data に写像する。
+
+    再現の要件: 系列の**先頭バー**の close を 0 にする (先頭バーは
+    ``_load_returns`` 内で「自分の prev が存在しない」ため自身のリターン
+    計算はスキップされる — もし途中のバーを 0 にすると、そのバー自身の
+    リターン計算 (``log(0/prev)``) が先に ValueError を送出し、次のバーの
+    ``prev=0`` (ZeroDivisionError の本来の再現条件) には到達しない)。
+    先頭を 0 にすることで、2 本目のバーが「prev=0 での除算」を直接踏む。
+    """
+    conn = _conn(tmp_path)
+    values = [0.0, 100.0, 101.0, 102.0, 103.0]  # 先頭が close=0
+    rows = [("USDJPY", "1h", (BEFORE_BOUNDARY + i * timedelta(hours=1))
+             .isoformat(), v, v + 0.05, v - 0.05, v, 1.0, 0.01)
+            for i, v in enumerate(values)]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    _series(conn, "EURUSD", _sine(5, phase=1), start=BEFORE_BOUNDARY)
+    out = analyze_for_agent(conn, _settings_watch_eurusd(),
+                            {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD",
+                             "timeframe": "1h"}, now=NOW)
+    assert out == {"error": "insufficient_data"}
+
+
+def test_load_returns_excludes_non_positive_close_pairs(tmp_path):
+    """F1.1 (Fix Round 1, codex Important-1 killer, 低レベル API 直接呼び
+    出し): 正値ガードは ``_load_returns`` 自体が保証しなければならない
+    — ``analyze_for_agent`` の外側 ``except ArithmeticError`` (F1.2) は
+    あくまで防御の深層で、低レベル関数を直接呼ぶ経路 (Task 11 CLI 等、
+    その except に守られない) では ``_load_returns`` 自身が
+    ZeroDivisionError を送出してはならない。"""
+    conn = _conn(tmp_path)
+    values = [0.0, 100.0, 101.0, 102.0, 103.0]  # 先頭が close=0
+    rows = [("USDJPY", "1h", (BEFORE_BOUNDARY + i * timedelta(hours=1))
+             .isoformat(), v, v + 0.05, v - 0.05, v, 1.0, 0.01)
+            for i, v in enumerate(values)]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    returns = _load_returns(conn, "USDJPY", "1h", source="dukascopy",
+                            in_sample_until=FAR_FUTURE)  # ここで例外なし
+    # 2 本目 (close=100.0, prev=close=0.0) は正値ガードにより除外されな
+    # ければならない (さもなくば 100.0/0.0 で ZeroDivisionError)。
+    second_bar_time = BEFORE_BOUNDARY + timedelta(hours=1)
+    assert second_bar_time not in returns
 
 
 def test_analysis_runs_records_trials(tmp_path):
@@ -346,3 +446,81 @@ def test_module_enums_are_frozen_tuples():
     assert TIMEFRAMES == ("15m", "1h", "4h", "1d")
     assert WINDOWS == (20, 60, 120)
     assert list(LAGS) == list(range(-12, 13))
+
+
+# --- Fix Round 1 (sonnet + codex 統合裁定, F1-F6) ------------------------
+
+
+def test_rolling_corr_summary_matches_manual_stdev_not_population_stdev(
+        tmp_path):
+    """F2 (Fix Round 1, sonnet 自己変異 M-S1 killer): std は標本標準偏差
+    (statistics.stdev, N-1 分母) — 母標準偏差 (pstdev, N 分母) と区別できる
+    精度で照合する。テスト側で独立に log リターン・窓相関を再計算し、
+    rolling_corr_summary の出力と厳密照合する。"""
+    conn = _conn(tmp_path)
+    n = 31  # 30 リターン == MIN_COMMON_OBS ちょうど、window=20 → 11 窓
+    a_vals = [100 + math.sin(i / 3.0) for i in range(n)]
+    b_vals = [100 + math.sin(i / 7.0 + 1.3) for i in range(n)]
+    _series(conn, "USDJPY", a_vals, start=BEFORE_BOUNDARY)
+    _series(conn, "EURUSD", b_vals, start=BEFORE_BOUNDARY)
+
+    # production と同じ log リターン定義 (連続バー・ギャップ無しなので
+    # 単純な逐次差分)。
+    ret_a = [math.log(a_vals[i] / a_vals[i - 1]) for i in range(1, n)]
+    ret_b = [math.log(b_vals[i] / b_vals[i - 1]) for i in range(1, n)]
+    window = 20
+    n_windows = len(ret_a) - window + 1
+    corrs = [statistics.correlation(ret_a[i:i + window], ret_b[i:i + window])
+            for i in range(n_windows)]
+    expected_std = statistics.stdev(corrs)
+    expected_pstdev = statistics.pstdev(corrs)
+    # この系列で stdev と pstdev が判別可能なほど異なることを確認
+    # (さもないと以下の照合が stdev/pstdev の取り違えを検出できない)。
+    assert expected_std != pytest.approx(expected_pstdev, rel=1e-6)
+
+    out = rolling_corr_summary(conn, "USDJPY", "EURUSD", timeframe="1h",
+                               window=window, source="dukascopy",
+                               in_sample_until=FAR_FUTURE)
+    assert out["mean"] == pytest.approx(statistics.mean(corrs))
+    assert out["std"] == pytest.approx(expected_std, rel=1e-9)
+    assert out["std"] != pytest.approx(expected_pstdev, rel=1e-6)
+    assert out["min"] == pytest.approx(min(corrs))
+    assert out["max"] == pytest.approx(max(corrs))
+
+
+def test_pick_peak_prefers_larger_corr():
+    """F3 (Fix Round 1, sonnet 自己変異 M-S2 killer): 抽出した _pick_peak
+    の基本挙動 (単純な最大値選択)。"""
+    assert _pick_peak({-3: 0.1, 0: 0.2, 3: 0.5}) == 3
+
+
+def test_pick_peak_tie_prefers_smaller_abs_k():
+    assert _pick_peak({5: 0.5, 2: 0.5, -2: 0.3}) == 2
+
+
+def test_pick_peak_tie_break_prefers_ascending_k_on_abs_tie():
+    """|k| が同点 (3 と -3) の場合は k 昇順 (より小さい値、= 負の方) を
+    選ぶ。変異 `(corrs[k], 0, 0)` (tie-break 除去) は dict 走査順で最初に
+    現れた最大キーをそのまま返す (Python の max は同点で最初の要素を保持)
+    ため、挿入順を k=3 → k=-3 にしておけば、この tie を検出できる。"""
+    assert _pick_peak({3: 0.5, -3: 0.5, 0: 0.2}) == -3
+
+
+def test_corr_matrix_perfect_positive_and_negative_correlation(tmp_path):
+    """F5 (Fix Round 1, codex Minor-1): 解析的に正解が既知の系列で値その
+    ものを検算する。同一系列 → corr == 1.0。log リターンが厳密に符号反転
+    する系列 (b = C / a、log(b[i]/b[i-1]) = -log(a[i]/a[i-1])) → corr ==
+    -1.0 (単純な価格反転 (200 - a) では log リターンは厳密には符号反転
+    しないため、逆数系列を使う)。"""
+    conn = _conn(tmp_path)
+    n = 40
+    a_vals = [100 + math.sin(i / 4.0) for i in range(n)]  # 非定数・正値
+    b_same = list(a_vals)
+    b_recip = [10000.0 / v for v in a_vals]
+    _series(conn, "AAA", a_vals, start=BEFORE_BOUNDARY)
+    _series(conn, "BBB", b_same, start=BEFORE_BOUNDARY)
+    _series(conn, "CCC", b_recip, start=BEFORE_BOUNDARY)
+    m = corr_matrix(conn, ["AAA", "BBB", "CCC"], timeframe="1h",
+                    source="dukascopy", in_sample_until=FAR_FUTURE)
+    assert m[("AAA", "BBB")] == pytest.approx(1.0, abs=1e-9)
+    assert m[("AAA", "CCC")] == pytest.approx(-1.0, abs=1e-9)

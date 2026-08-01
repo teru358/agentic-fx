@@ -67,6 +67,14 @@ def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
     ``load_bars`` の ``until`` は inclusive なので直接使わず、SQL で
     ``bar_time < ?`` を書く (境界バーが holdout 側の period_start に
     なるため — Task 9 裁定、上書き節 B)。
+
+    F1 (Fix Round 1, codex Important-1 = sonnet Minor-2): ohlcv.close に
+    正値制約は無く (REAL NOT NULL のみ)、close<=0 のバーが混入すると
+    ``math.log(c / prev)`` が ``prev==0`` で ZeroDivisionError を送出し
+    ``analyze_for_agent`` の ``except ValueError`` を迂回して生の例外が
+    改善ループ面へ漏れ得る。log の定義域 (両側とも正の有限値) を明示的に
+    ガードし、非正値・非有限バーはリターン対象外とする — 結果として
+    観測不足なら insufficient_data に自然合流する (fail closed)。
     """
     until_utc = as_utc(in_sample_until)
     rows = conn.execute(
@@ -78,7 +86,8 @@ def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
     returns: dict[datetime, float] = {}
     for t, c in closes.items():
         prev = closes.get(t - width)
-        if prev is not None:
+        if (prev is not None and prev > 0 and c > 0
+                and math.isfinite(prev) and math.isfinite(c)):
             returns[t] = math.log(c / prev)
     return returns
 
@@ -128,6 +137,13 @@ def _pearson(xs: list[float], ys: list[float]) -> float:
 def _validate_timeframe(timeframe: str) -> None:
     if timeframe not in TIMEFRAMES:
         raise ValueError("timeframe is not one of the enumerated values")
+
+
+def _pick_peak(corrs: dict[int, float]) -> int:
+    """lead_lag の peak 選択 (F3, Fix Round 1, sonnet 自己変異 M-S2 対策で
+    独立関数へ抽出): 符号付き最大 corr の k、同点は |k| 最小 → さらに
+    同点は k 昇順 (決定的 tie-break)。"""
+    return max(corrs, key=lambda k: (corrs[k], -abs(k), -k))
 
 
 # --- 相関 3 種 (低レベル API — 期間は呼び出し元が渡す) -----------------
@@ -214,9 +230,7 @@ def _lead_lag_impl(conn: sqlite3.Connection, a: str, b: str, *,
         xs, ys = _align_lagged(ret_a, ret_b, lag_bars=k, width_minutes=width)
         # 全 lag のうち 1 つでも観測不足なら ValueError (分母 25 を固定 — §C)
         corrs[k] = _pearson(xs, ys)
-    # peak は符号付き最大 corr の k、同点は |k| 最小 → さらに同点は k 昇順
-    # (決定的 tie-break)。
-    peak_lag = max(corrs, key=lambda k: (corrs[k], -abs(k), -k))
+    peak_lag = _pick_peak(corrs)
     return {"peak_lag": peak_lag, "peak_corr": corrs[peak_lag]}, len(LAGS)
 
 
@@ -294,6 +308,15 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
     ハーネス側引数の欠陥 (naive now、settings 側の候補数超過) は request
     由来ではないので例外送出 (fail closed)。request 由来の失敗は固定コード
     ``{"error": <code>}`` のみを返す (無送出)。
+
+    許容漏洩の明文化 (F6, Fix Round 1 — コントローラ裁定 codex Important-3):
+    応答コードの違い (成功 / invalid_request / unknown_symbol /
+    insufficient_data) から「閾値を満たすか否か」の 1 ビットが観測できる
+    ことは、エラー応答を返す設計上不可避であり許容する。§6 の遮断対象は
+    期間・端点・件数の**値そのもの** (メッセージ・追加キーに含めないこと)
+    であって、応答コードの分岐自体ではない。問い合わせ回数の予算・
+    レート制限は改善ループ tool 側 (プラン 9) のスコープであり、この
+    モジュールの責務ではない。
     """
     now_utc = as_utc(now)  # naive now はハーネス側の欠陥 → 例外 (fail closed)
     candidates = list(dict.fromkeys(list(settings.pairs)
@@ -354,10 +377,13 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
                 conn, a, b, timeframe=timeframe, source=ANALYSIS_SOURCE,
                 in_sample_until=in_sample_until)
             payload_body = dict(result)
-    except ValueError:
+    except (ValueError, ArithmeticError):
         # データ不足 (相関計算に必要な共通観測が閾値未満) は in-sample 境界
         # の前後どちら起因でも同一の insufficient_data (サイドチャネル遮断
-        # — §6)。
+        # — §6)。ArithmeticError (F1, Fix Round 1): ZeroDivisionError /
+        # OverflowError は防御の深層 (`_load_returns` の正値ガードが主防御
+        # だが、想定外経路からの到達に備えて改善ループ面への生例外漏洩を
+        # 二重に塞ぐ)。
         return {"error": "insufficient_data"}
 
     run_id = analysis_runs_store.save(
