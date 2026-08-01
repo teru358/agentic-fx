@@ -290,7 +290,7 @@ Risk Gate・sizing・kill switch・取引モードの承認ゲートは一切迂
   - risk gate → intent 却下 (理由に換算不能を明記)
   - executor open → gate 却下と同経路
   - **scheduler の予約再検証 → 当該ペアの pending_fill を取消す**。根拠: 未約定指値は「将来の債務」であり、口座通貨でその大きさを見積もれなくなった予約を残すのは、口座情報欠損時に全 pending を取消す既存の裁定と非対称になる。取消はペア単位に限定する (他ペアの予約は健全なレートで再検証を継続)。取消不能は既存の `cancel_unknown` → 新規停止に接続
-- **資金保護に使うレートは保守側** (codex 指摘 D-M4): 損失・リスク・notional の口座通貨換算には**口座通貨額を過小評価しない側** (直接ペアなら ask、逆数なら 1/bid、クロスは脚ごとに保守側) を使う。mid は表示・分析用に限る
+- **資金保護に使うレートは保守側** (codex 指摘 D-M4): 損失・リスク・notional の口座通貨換算には**口座通貨額を過小評価しない側** (直接ペアなら ask、逆数なら 1/bid、クロスは脚ごとに保守側) を使う。**口座通貨換算レートとしての** mid は表示・分析用に限る (§6 バックテストの「ohlcv 本体 = mid 基準」は銘柄の OHLC 表現の話であり、この規則とは適用対象が別)
 - **ペーパー (学習モード)**: `account_currency` が損益集計とエクイティの基準
 - **実取引 (Phase 3)**: **MT5 口座の通貨が真**。起動時に口座通貨を照会し、`account_currency` と**不一致なら起動拒否** (config が JPY で口座が USD なら全サイジングが約 150 倍ずれるため)。設定値は照合用であり、実行時は口座側を使う。**銘柄仕様 (contract_size / volume 制限 / 通貨) も同様に照会して静的テーブルと照合し、不一致なら起動拒否** — 2026-07-29 の実測で静的テーブルの `max_lot=50` がブローカー実値 `10.0` と不一致だったのが実例 (contract_size 100,000 と通貨は一致)。MT5 `order_calc_profit` は自前換算の**検証オラクル**として使う (実行時経路にはしない — バックテストに MT5 は無いため二重実装を避ける)
 
@@ -478,7 +478,7 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 - strategy の評価タイミングは「plugin が宣言した timeframe のバー確定毎」。約定・SL/TP 判定は 1m バー (実運用互換)
 - **§5 の起動元検証を無効化しない**: BacktestRunner は strategy 判定毎に in-memory DB へ `loop='trade'` の **synthetic Mission 行を作成**し、intent は通常どおり `origin=SCHEDULER` + `mission_id` 実在 + `loop='trade'` の検証を**同一コードで通す**。executor の検証を注入で置換・緩和する実装は不可 (in-memory DB は実 DB と分離されているため、この synthetic 行が実運用の境界を弱めることはない)
 - **先読みの禁止 (look-ahead bias)**: 「確定バーを plugin に渡す時点」と「その intent が約定可能になる最初の 1m バー」を厳密に分ける。plugin が評価した確定バー (およびそれ以前) の 1m バーでは約定・SL/TP 判定に参加させず、**評価に使った確定バーの終了より後の 1m バーから**のみ約定可能とする (market 相当は次バーの open ± half-spread、指値は次バー以降の `check_limit_fill`)。実運用でも Mission はバー確定後に走るため、これが忠実な順序である
-- **ReplayClock と market_hours の契約**: ReplayClock は **UTC の 1m 格子を履歴バーの有無に関わらず連続に進める**。指値期限・day 強制クローズ・日次境界などの時間依存判定は時間経過で必ず進み、**価格依存判定 (約定・SL/TP) はその時刻のバーが存在する tick のみ**行う。市場オープン判定は実運用と同一の `market_hours` (週末・NY 17:00 ロールオーバー・DST を含む) に従う — **バー欠損 ≠ 市場クローズ** であり、market_hours が真
+- **ReplayClock と market_hours の契約**: ReplayClock は **UTC の 1m 格子を履歴バーの有無に関わらず連続に進める**。指値期限・day 強制クローズ・日次境界などの時間依存判定は時間経過で必ず進み、**価格依存判定 (約定・SL/TP) はその時刻のバーが存在する tick のみ**行う。市場オープン判定は実運用と同一の `market_hours` (週末・NY 17:00 ロールオーバー・DST を含む) が唯一の判定元であり、**バー欠損を市場クローズとみなしてはならない**: market_hours がオープンと判定し、かつバーが欠損している tick では、時間依存判定は通常どおり実行し、価格依存判定だけをスキップする (実運用でデータが一時欠損した状態と同じ扱い)
 - news / econ / reflection / activity / notifier には no-op を注入する (結果に寄与しない副作用を切る)
 - 速度は設計で約束しない — 1 年 ≈ 37 万 tick。実装プランに「1 年分の実測ゲート」を置き、遅い場合も**専用執行ロジックは書かず**、tick ループの外側 (バー供給・SQL) だけを最適化する
 
@@ -489,7 +489,8 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 - **長期 1m の一次ソース = Dukascopy** (無料公開、10 年超、bid/ask 両系列)。**直近の照合用 = MT5** (実口座と同一価格系。2026-08-01 実測の深度: 1m ≈ 3 ヶ月 / 5m ≈ 16 ヶ月 / 15m ≈ 4 年 / 1h ≈ 10 年 / 4h・1d ≈ 16 年超、価格は bid のみ)。yfinance はバックテストには使わない
 - **`ohlcv` 本体の基準価格は mid** とする (現行の約定判定 `bar ± half-spread` が「バー = mid」を前提に書かれているため)。変換式: Dukascopy は `mid = (bid + ask) / 2` で OHLC を構成し、**`spread` 列 (nullable) にバー内平均 (ask−bid) を記録**。MT5 (bid のみ) は mid 近似としてそのまま保存 (spread NULL — 系統誤差 ≈ half-spread は下記照合の但し書きに含める)。spread の単位は**クォート通貨の価格単位** (pips ではない)。欠損時は settings の **symbol 別**固定値にフォールバックし、フォールバックが使われた実行はその旨を結果に品質注記する
 - **平均 spread の限界を明記**: バー内で spread が拡大した瞬間の SL 到達はバー平均では楽観化される。`spread` 列は導出値であり、bid/ask 原系列は Dukascopy から再導出可能 — 将来 bid/ask の 1m OHLC 二系列保持へ拡張できる入力契約にしておく
-- **インポータの正規化契約**: タイムスタンプは UTC に正規化 (バー開始時刻)、1m への集約境界は UTC 分境界、volume はソース定義のまま保存 (意味はソース依存 — 比較に使わない)、重複は `(symbol, interval, bar_time, source)` の**冪等 upsert**、異常値 (負値・bid>ask) は棄却してログ。入力ファイル形式 (CSV / バイナリ tick) は実装判断
+- **インポータの正規化契約**: タイムスタンプは UTC に正規化 (バー開始時刻)、1m への集約境界は UTC 分境界、volume はソース定義のまま保存 (意味はソース依存 — 比較に使わない)、異常値 (負値・bid>ask) は棄却してログ。入力ファイル形式 (CSV / バイナリ tick) は実装判断
+- **既存行は不変 (再現性の根拠)**: 冪等 upsert の意味は「同一キー `(symbol, interval, bar_time, source)` への同一値の再挿入は無変更」であり、**既存行と値が異なる入力は上書きせず棄却してログ**する。確定した履歴バーは書き換わらない — この不変性があって初めて「期間端点 + source でデータ側の再現性が担保される」(下記 `backtest_runs`) が成立する
 - **同一バックテスト実行内でソースを混ぜない** (価格系の継ぎ目が成績を汚す)。使用 source は実行メタデータ (`backtest_runs`) に記録する
 - 導入時に 1 回、重複する直近期間で **MT5 と Dukascopy の価格系差を照合**し、以後の採用判断の但し書きにする。比較式: `Dukascopy mid − (固定 spread / 2)` vs `MT5 bid` の close 差の分布
 
@@ -505,7 +506,7 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 
 - 指標: 取引数 / PF / 勝率 / 平均 R / 最大 drawdown (equity 基準) / 総損益 (口座通貨) / 対象期間・timeframe
 - **30 取引未満は「評価不能」** — 足切りにも採用にも使わない (既定: 観察としてバックログへ)
-- 新テーブル **`backtest_runs`** (§12)。**再現に必要な入力を保存する**: plugin 識別 (パス + コンテンツハッシュ)・kind・pair・timeframe・source・**期間端点**・**scope** (下記)・指標 JSON・**設定スナップショット hash** (risk gate / sizing / spread フォールバック / 手数料 / 初期資金を含む)・**コア実装の git commit**・初期資金・created_at。ohlcv は追記型 + 単一 source 契約なので、期間端点 + source でデータ側の再現性は担保される
+- 新テーブル **`backtest_runs`** (§12)。**再現に必要な入力を保存する**: plugin 識別 (パス + コンテンツハッシュ)・kind・pair・timeframe・source・**期間端点**・**scope** (下記)・指標 JSON・**設定スナップショット hash** (risk gate / sizing / spread フォールバック / 手数料 / 初期資金を含む)・**コア実装の git commit**・初期資金・created_at。ohlcv は既存行不変 (上記「インポータの正規化契約」) + 単一 source 契約なので、期間端点 + source でデータ側の再現性は担保される
 - **`scope` は 3 値**: `in_sample` (改善ループのツールが発行) / `holdout_gate` (採用ゲートが発行) / `human_custom` (人間 CLI の任意期間実行)。**改善ループの読み取りビューは `scope='in_sample'` かつハーネス発行行のみ**を許可する — 人間の任意期間実行が二値分類のどちらかに紛れて holdout 情報の迂回路になるのを防ぐ
 - 「バックテスト成績は実運用成績の予測値ではない (足切り専用)」の注記は結果表示にも焼き込む
 
@@ -527,12 +528,12 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 バックテスト (執行シミュレーション) とは別の機能として、同じ履歴基盤 (`ohlcv` + 一括インポータ + ホールドアウト遮断) の上に置く。消費者は**改善ループ (indicator / signal の設計材料) と人間**。取引判断 loop のツールには載せない (最小ツールセット維持)。
 
 - **watch 銘柄**: `datafeed.watch_symbols` (§12) — **取引不可・分析専用**のシンボル集合 (例: EURUSD・EURJPY・XAUUSD・主要株価指数)。取引ツールの pair enum には決して入れない。`pairs` (取引対象) とは独立で、watch の追加は取引対象の拡大ではない (§16 のマルチアセット非スコープとも矛盾しない)
-- **初期リストは導入時に確定するが、選定基準は先に固定する**: ①Dukascopy で取得可能 ②履歴 10 年以上 ③許容欠損率を満たす ④分析はソース統一 (下記) ⑤**最大銘柄数の上限** (初期 10) — 候補の恣意的追加が多重比較の試行数を膨らませるのを防ぐ
+- **初期リストは導入時に確定するが、選定基準は先に固定する**: ①Dukascopy で取得可能 ②履歴 10 年以上 ③許容欠損率 (市場オープン時間に対する欠損バー比、**初期 5%**) を満たす ④分析はソース統一 (下記) ⑤**最大銘柄数の上限** (初期 10) — 候補の恣意的追加が多重比較の試行数を膨らませるのを防ぐ。③⑤の値は config (コア所有)
 - **機能**: ①リターン相関行列 (timeframe 指定) ②ローリング相関 (レジーム変化の検出) ③**ラグ付き相関 (lead-lag)** — 「watch 銘柄が trade 対象に先行するか」= signal plugin の種になる部分
 - **改善ループ向け API の出力契約 (遮断項目 7 の実装形)**: 許可パラメータは列挙制 (symbol 対・timeframe・window プリセット・lag 範囲プリセット — 自由な数値指定は与えない)。返すのは**固定個数の要約統計のみ** (例: 相関係数・ローリング相関の平均/分散/最大/最小・lead-lag のピーク lag と係数)。**返さないもの**: 日時・期間端点・順序付きの窓系列・総観測数・欠損位置・境界依存のエラー詳細 (応答可否や件数の観測で in-sample 境界を推測するサイドチャネルを塞ぐ)。人間 CLI はこの制約の対象外
 - **分析 1 回につき単一 source を必須**とする (バックテストと同じクエリ契約)。整列は UTC バー境界の inner join (共通観測時刻のみ)、欠損バーは除外、市場休場は共通除外 — 取引時間・欠損・bid/mid の差が見せかけの lead-lag を作るのを防ぐ
 - **使い方の規律**: 相関は**発見的材料**であり、採用根拠にしない。相関から作った indicator は pytest、signal は検出精度、strategy はバックテストという**各種別の検証手段で別途検証**する。多重比較・見せかけの相関で「効く watch 銘柄」は必ず見つかってしまうため、相関値そのものを成績として扱わない
-- **探索履歴の自動記録**: 相関探索の実行毎にパラメータ (候補集合・timeframe・window・lag 範囲) と試行数を分析実行記録として保存し、そこから生まれた plugin 提案の改善レポート / approval payload に**探索数と選択理由を添付**する — 「多重探索後の最大値を選んだ」事実を人間レビューが判定できるようにする。統計的補正 (FDR 等) は参考値として表示するに留め、採用条件にはしない
+- **探索履歴の自動記録**: 相関探索の実行毎にパラメータ (候補集合・timeframe・window・lag 範囲) と試行数を **`analysis_runs` テーブル (§12)** に保存し、そこから生まれた plugin 提案の改善レポート / approval payload に**参照した `analysis_run_id` 群・探索数・選択理由を添付**する — 「多重探索後の最大値を選んだ」事実を人間レビューが判定できるようにする。統計的補正 (FDR 等) は参考値として表示するに留め、採用条件にはしない
 - watch 銘柄の長期履歴も Dukascopy インポータの対象 (FX・貴金属・指数をカバー)。`ohlcv` に同居 (symbol + source で区別)
 - 将来の接続余地 (注記のみ): indicator plugin の入力 DataFrame に watch 銘柄のバーを含める拡張 — plugin 機構の設計時に判断する
 
@@ -718,7 +719,7 @@ agentic-fx/
 │   │   ├── holdout.py         # 分割点計算 + in-sample 制限 (コア所有 — 変更は人間レビュー必須)
 │   │   └── analysis.py        # 相関調査 (リターン/ローリング/lead-lag。集計値のみ返す)
 │   ├── store/                 # ── ストレージ層 ──
-│   │   ├── db.py              # SQLite 接続 + 13 テーブルスキーマ (signals / backtest_runs は Phase 2)
+│   │   ├── db.py              # SQLite 接続 + 14 テーブルスキーマ (signals / backtest_runs / analysis_runs は Phase 2)
 │   │   ├── orders.py / intents.py / missions.py / reflections.py / snapshots.py  # orders / trade_intents / missions / reflections / account_snapshots
 │   │   ├── backlog.py / improve_runs.py / econ_events.py / approvals.py / news_sources.py  # improvement_backlog / improvement_runs / econ_events / approval_requests / news_sources
 │   │   └── rag.py             # ChromaDB (news / reflections)
@@ -765,7 +766,7 @@ agentic-fx/
 - **`display_timezone`** (トップレベル、既定 `UTC`): ログ・status 表示に使う IANA タイムゾーン。**保存は常に UTC、市場境界は NY 固定で変更不可** (§13)
 - **稼働モード・発注方式 (autopilot) は settings.yaml に置かず `data/state/` に保存** (§3 — config 編集では実資金運用・自動発注に切り替わらない構造的担保)
 
-### SQLite スキーマ (`data/agentic.db`、前身 18 テーブル → 13 テーブルに再設計。うち `signals` / `backtest_runs` は Phase 2)
+### SQLite スキーマ (`data/agentic.db`、前身 18 テーブル → 14 テーブルに再設計。うち `signals` / `backtest_runs` / `analysis_runs` は Phase 2)
 
 | テーブル | 内容 |
 |---|---|
@@ -781,6 +782,7 @@ agentic-fx/
 | `approval_requests` | 人間承認の一元管理 (§7: kind = plugin / news_source / live_trade) |
 | `news_sources` | ニュース取得先リスト (§6: name, fetcher, url, enabled, added_by) |
 | `backtest_runs` | **Phase 2**。バックテスト実行記録 (plugin パス + コンテンツハッシュ, kind, pair, timeframe, source, 期間端点, **scope** (in_sample / holdout_gate / human_custom), 指標 JSON, 設定スナップショット hash, コア git commit, 初期資金, created_at)。**改善ループの読み取りビューは scope='in_sample' かつハーネス発行行のみ** (§6 バックテスト) |
+| `analysis_runs` | **Phase 2**。履歴分析 (相関探索) の実行記録 (params_json = 候補集合・timeframe・window・lag 範囲, trial_count, source, created_at)。plugin 提案の approval payload / `improvement_runs` が `analysis_run_id` で参照し、多重比較の探索数を人間レビューが監査できるようにする (§6 履歴分析) |
 | `signals` | **Phase 2**。承認済み `signal` / `strategy` plugin の出力 (plugin, content_hash, pair, timeframe, bar_ts, kind, payload_json, **status** (pending/claimed/consumed/abandoned), **claimed_by_mission_id**, **claimed_at**, **requeue_count**, created_at)。重複排除キーは (plugin, **content_hash**, pair, timeframe, bar_ts) — ハッシュを含めないと config 変更・再承認後のシグナルが「処理済み」で潰れる。claim/消費/再キュー/lease 回収の規則は §5 (2 段階では Mission 失敗時に再処理可否を決められない) |
 
 **orders の状態遷移** (approval のライフサイクルと broker のライフサイクルを混同しない):
