@@ -53,10 +53,12 @@ def decode_bi5(payload: bytes, *, point: float, hour_start_utc: datetime) -> lis
 
     ticks = []
     rejected = 0
+    incomplete = 0
 
     # Process 20-byte records
     for i in range(0, len(raw), 20):
         if len(raw) - i < 20:
+            incomplete = len(raw) - i  # Bytes remaining (< 20)
             break  # Incomplete record at end
 
         ms_offset, ask_points, bid_points, ask_vol, bid_vol = struct.unpack(
@@ -77,8 +79,11 @@ def decode_bi5(payload: bytes, *, point: float, hour_start_utc: datetime) -> lis
 
         ticks.append(Tick(ts, bid, ask))
 
-    if rejected > 0:
-        _log.debug(f"decode_bi5: rejected {rejected} invalid records")
+    if rejected > 0 or incomplete > 0:
+        msg = f"decode_bi5: rejected {rejected} invalid records"
+        if incomplete > 0:
+            msg += f", {incomplete} incomplete bytes at end"
+        _log.debug(msg)
 
     return ticks
 

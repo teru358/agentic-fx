@@ -111,9 +111,22 @@ def verify_symbol(symbol: str, hour_utc: datetime, mt5_base: str) -> tuple[bool,
         else:
             details.append(f"PASS: {symbol} ms_offset monotonic and in range")
 
-    # Assert 2b: Record length validation (implicit in decode_bi5)
-    # We already decode 20-byte records, so this is satisfied
-    details.append(f"PASS: {symbol} record length validated during decode")
+    # Assert 2b: Record length validation (20-byte multiples)
+    # Independently verify LZMA payload decompresses to multiple of 20 bytes
+    try:
+        import lzma
+        try:
+            raw = lzma.decompress(payload, format=lzma.FORMAT_ALONE)
+        except lzma.LZMAError:
+            raw = lzma.decompress(payload)
+
+        if len(raw) % 20 == 0:
+            details.append(f"PASS: {symbol} record length {len(raw)} is multiple of 20")
+        else:
+            remainder = len(raw) % 20
+            details.append(f"FAIL: {symbol} record length {len(raw)} has {remainder} byte remainder (not multiple of 20)")
+    except Exception as e:
+        details.append(f"FAIL: {symbol} could not decompress payload: {e}")
 
     # Assert 3: Bid/Ask validity and spread
     if ticks:
