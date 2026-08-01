@@ -251,9 +251,24 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     conn_shell = connect(root / "data" / "agentic.db")
 
     provider = PriceProvider(conn_core, settings, clock)
-    quote_fn = quote_fn or provider.get_quote
-    spec_fn = spec_fn or provider.spec
-    bars_fn = bars_fn or provider.latest_1m_bar
+    # 注入された quote_fn/spec_fn/bars_fn は provider 自身の束縛メソッドにも
+    # 反映する (Task 8 E2E で実測): `to_account_rate`/`_rate_of` 等 provider
+    # 内部の `self.get_quote`/`self.spec` 呼び出し (換算レート解決) はここで
+    # 作るローカル変数 quote_fn/spec_fn を参照しない。ローカル変数の差し替え
+    # だけでは届かず、口座通貨と異なる base_currency (例: USDJPY の USD 脚)
+    # の換算がテスト注入をすり抜けて実 provider (実 HTTP) を叩いてしまう。
+    if quote_fn is not None:
+        provider.get_quote = quote_fn
+    else:
+        quote_fn = provider.get_quote
+    if spec_fn is not None:
+        provider.spec = spec_fn
+    else:
+        spec_fn = provider.spec
+    if bars_fn is not None:
+        provider.latest_1m_bar = bars_fn
+    else:
+        bars_fn = provider.latest_1m_bar
 
     def rate_fn(ccy: str, account_ccy: str, now: datetime):
         return provider.to_account_rate(
