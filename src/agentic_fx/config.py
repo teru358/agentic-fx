@@ -94,6 +94,8 @@ class DatafeedSettings(_Strict):
                                  min_length=1)
     primary_intervals: list[str] = Field(default_factory=lambda: ["1h"],
                                          min_length=1)
+    # 取引不可・分析専用。pair enum には入らない (§6)
+    watch_symbols: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_intervals(self) -> "DatafeedSettings":
@@ -147,6 +149,16 @@ class ApiSettings(_Strict):
     port: int = 8420
 
 
+class BacktestSettings(_Strict):
+    holdout_months: int = Field(ge=1)
+    initial_balance: float = Field(gt=0)
+
+
+class AnalysisSettings(_Strict):
+    max_watch_symbols: int = Field(ge=1)
+    max_gap_pct: float = Field(gt=0)
+
+
 class DiscordSettings(_Strict):
     enabled: bool = False
 
@@ -165,12 +177,14 @@ class Settings(_Strict):
     risk: RiskSettings
     runner: RunnerSettings
     llama_swap: LlamaSwapSettings
+    backtest: BacktestSettings
     datafeed: DatafeedSettings
     news: NewsSettings
     schedule: ScheduleSettings
     logging: LoggingSettings
     api: ApiSettings
     discord: DiscordSettings
+    analysis: AnalysisSettings
     paper: PaperSettings
 
     @field_validator("display_timezone")
@@ -188,6 +202,14 @@ class Settings(_Strict):
         missing = [p for p in self.pairs if p not in self.risk.pair_rules]
         if missing:
             raise ValueError(f"risk.pair_rules missing for pairs: {missing}")
+        return self
+
+    @model_validator(mode="after")
+    def _watch_symbols_capped(self) -> "Settings":
+        if len(self.datafeed.watch_symbols) > self.analysis.max_watch_symbols:
+            raise ValueError(
+                f"datafeed.watch_symbols ({len(self.datafeed.watch_symbols)}) "
+                f"exceeds analysis.max_watch_symbols ({self.analysis.max_watch_symbols})")
         return self
 
 
