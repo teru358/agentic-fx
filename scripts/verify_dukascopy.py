@@ -7,17 +7,24 @@ Usage:
 """
 import argparse
 import logging
+import os
 import statistics
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 import requests
+from dotenv import load_dotenv
+
+# Load .env for MT5_BRIDGE_API_KEY
+load_dotenv()
 
 # Add src to path for imports
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from agentic_fx.backtest.dukascopy import decode_bi5, hour_url, point_of
+from agentic_fx.datafeed.sources import vendor_symbol
 
 _log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -36,18 +43,31 @@ def fetch_dukascopy_data(symbol: str, hour_utc: datetime) -> bytes | None:
 
 
 def fetch_mt5_bars(symbol: str, hour_utc: datetime, mt5_base: str) -> list[dict] | None:
-    """Fetch 1m bars from MT5 bridge for the hour."""
-    # MT5 bridge returns OHLCV data
+    """Fetch 1m bars from MT5 bridge for the hour.
+
+    Uses /ohlcv endpoint with ISO8601 dates (matching sources.py pattern).
+    """
     try:
-        # Build URL to fetch 1m bars for this hour
-        url = f"{mt5_base}/bars"
-        params = {
-            "symbol": symbol,
-            "timeframe": "1",  # 1m
-            "start": int(hour_utc.timestamp()),
-            "end": int((hour_utc.timestamp() + 3600)),
-        }
-        resp = requests.get(url, params=params, timeout=10)
+        sym = vendor_symbol(symbol, "mt5")
+        # Hour end is 1 second before the next hour (to include last tick of the hour)
+        end = hour_utc + timedelta(hours=1) - timedelta(seconds=1)
+
+        headers = {}
+        api_key = os.environ.get("MT5_BRIDGE_API_KEY")
+        if api_key:
+            headers["X-Bridge-Api-Key"] = api_key
+
+        # Use /ohlcv endpoint (matching sources.py mt5_bars_range pattern)
+        resp = httpx.get(
+            f"{mt5_base}/ohlcv/{sym}",
+            params={
+                "from": hour_utc.isoformat(),
+                "to": end.isoformat(),
+                "interval": "1m"
+            },
+            headers=headers,
+            timeout=30
+        )
         resp.raise_for_status()
         data = resp.json()
         return data.get("bars", [])
@@ -118,37 +138,52 @@ def verify_symbol(symbol: str, hour_utc: datetime, mt5_base: str) -> tuple[bool,
                     details.append(f"FAIL: {symbol} spread median {spread_median:.6f} out of range")
 
     # Assert 4: Compare with MT5 bid (Dukascopy mid vs MT5 bid, MAE < 0.1%)
+    # FAIL if cannot compare (no fallback to WARN)
     mt5_bars = fetch_mt5_bars(symbol, hour_utc, mt5_base)
-    if mt5_bars and ticks:
+    if not mt5_bars:
+        details.append(f"FAIL: {symbol} could not fetch MT5 bars")
+    elif not ticks:
+        details.append(f"FAIL: {symbol} no Dukascopy ticks for comparison")
+    else:
         mae_pct_list = []
         for bar in mt5_bars:
-            # MT5 returns bid only (per brief)
-            mt5_bid = bar.get("open")  # Use open as representative bid
+            # MT5 bar open price is used as representative bid (per brief)
+            mt5_bid = bar.get("open")
             if mt5_bid is None:
                 continue
-            # Find Dukascopy ticks in this minute
-            minute_start = hour_utc.replace(second=0, microsecond=0)
-            if "time" in bar:
-                # Parse bar time
-                bar_time = datetime.fromisoformat(bar["time"].replace("Z", "+00:00"))
-                minute_start = bar_time
-            # Filter ticks for this minute
+
+            # Parse bar time to determine minute boundary
+            bar_time_str = bar.get("time")
+            if not bar_time_str:
+                continue
+            bar_time = datetime.fromisoformat(bar_time_str.replace("Z", "+00:00"))
+            if bar_time.tzinfo is None:
+                bar_time = bar_time.replace(tzinfo=timezone.utc)
+
+            # Minute start: align to bar's minute boundary
+            minute_start = bar_time.replace(second=0, microsecond=0)
+            minute_end = minute_start + timedelta(minutes=1)
+
+            # Filter ticks for this minute: first tick from this minute onwards
             minute_ticks = [
                 t for t in ticks
-                if minute_start <= t.ts < minute_start.replace(minute=minute_start.minute + 1)
+                if minute_start <= t.ts < minute_end
             ]
+
             if minute_ticks:
+                # Dukascopy mid: average of all ticks in the minute
                 duka_mid = sum(t.bid + t.ask for t in minute_ticks) / (2 * len(minute_ticks))
-                mae_pct = abs(duka_mid - mt5_bid) / mt5_bid * 100
+                mae_pct = abs(duka_mid - mt5_bid) / abs(mt5_bid) * 100
                 mae_pct_list.append(mae_pct)
-        if mae_pct_list:
+
+        if not mae_pct_list:
+            details.append(f"FAIL: {symbol} no ticks found matching MT5 bars")
+        else:
             avg_mae_pct = sum(mae_pct_list) / len(mae_pct_list)
             if avg_mae_pct < 0.1:
-                details.append(f"PASS: {symbol} avg MAE {avg_mae_pct:.4f}% < 0.1%")
+                details.append(f"PASS: {symbol} avg MAE {avg_mae_pct:.4f}% < 0.1% (n={len(mae_pct_list)})")
             else:
-                details.append(f"FAIL: {symbol} avg MAE {avg_mae_pct:.4f}% >= 0.1%")
-    else:
-        details.append(f"WARN: {symbol} could not compare with MT5 (missing data)")
+                details.append(f"FAIL: {symbol} avg MAE {avg_mae_pct:.4f}% >= 0.1% (n={len(mae_pct_list)})")
 
     passed = all("FAIL" not in d for d in details)
     return passed, "\n  ".join(details)
