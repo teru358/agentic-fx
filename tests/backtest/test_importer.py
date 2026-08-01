@@ -6,9 +6,41 @@ import pytest
 
 from agentic_fx.backtest.dukascopy import Tick
 from agentic_fx.backtest import importer
-from agentic_fx.backtest.importer import ticks_to_1m, import_dukascopy
+from agentic_fx.backtest.importer import _default_fetch, ticks_to_1m, import_dukascopy
 from agentic_fx.store.ohlcv import load_bars
 from tests.backtest.conftest import _conn, _bi5, H
+
+
+# F4: _default_fetch (production fetch path) — 404 -> b"", other HTTP errors
+# and connection errors -> raise. httpx.get is monkeypatched so no real HTTP
+# request is made.
+
+def test_default_fetch_returns_empty_bytes_on_404(monkeypatch):
+    def fake_get(url, timeout=30):
+        request = httpx.Request("GET", url)
+        return httpx.Response(404, request=request)
+
+    monkeypatch.setattr(importer.httpx, "get", fake_get)
+    assert _default_fetch("http://example.com/missing") == b""
+
+
+def test_default_fetch_raises_http_status_error_on_500():
+    def fake_get(url, timeout=30):
+        request = httpx.Request("GET", url)
+        return httpx.Response(500, request=request)
+
+    with patch.object(importer.httpx, "get", fake_get):
+        with pytest.raises(httpx.HTTPStatusError):
+            _default_fetch("http://example.com/broken")
+
+
+def test_default_fetch_raises_connect_error_on_network_failure(monkeypatch):
+    def fake_get(url, timeout=30):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(importer.httpx, "get", fake_get)
+    with pytest.raises(httpx.ConnectError):
+        _default_fetch("http://example.com/unreachable")
 
 
 def test_ticks_to_1m_mid_and_mean_spread():
