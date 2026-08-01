@@ -234,11 +234,11 @@ class _LockedAsk:
 
 def build_app(root: Path, *, runner: AgentRunner | None = None,
               clock: Clock | None = None, quote_fn=None, spec_fn=None,
-              bars_fn=None) -> App:
+              bars_fn=None, embedding_fn=None) -> App:
     """全部品を配線して `App` を返す。
 
-    quote_fn / spec_fn / bars_fn は E2E テストの注入点 (None なら provider の
-    実装を使う — build 後の patch では bound 済みクロージャに届かないため
+    quote_fn / spec_fn / bars_fn / embedding_fn は E2E テストの注入点 (None なら
+    各部品の実装を使う — build 後の patch では bound 済みクロージャに届かないため
     注入で解決する)。
 
     **`healthcheck()` は注入対象外** (fix round 1 F2): `PriceProvider.healthcheck`
@@ -292,7 +292,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             max_skew_min=settings.datafeed.conversion_skew_max_min)
 
     econ = EconCalendar(conn_core, activity, clock)
-    rag = Rag(root / "data" / "rag")
+    rag = Rag(root / "data" / "rag", embedding_function=embedding_fn)
     collector = NewsCollector(conn_core, rag, activity, clock)
     broker = PaperBroker(conn_core, settings, clock)
     notifier = Notifier(enabled=settings.discord.enabled,

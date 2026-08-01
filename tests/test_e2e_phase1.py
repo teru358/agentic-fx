@@ -9,6 +9,7 @@ from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.service import build_app, run_init
 
 from tests.test_service_app import _no_real_network
+from tests.store.test_rag import FakeEmbedding
 
 WED = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 
@@ -52,7 +53,8 @@ def test_phase1_full_cycle(tmp_path):
     # build_app の注入点を使う (build 後の patch は bound クロージャに届かない)
     app = build_app(tmp_path, runner=fake, clock=FixedClock(WED),
                     quote_fn=quote_fn, spec_fn=spec_fn,
-                    bars_fn=lambda p: bars.get(p))
+                    bars_fn=lambda p: bars.get(p),
+                    embedding_fn=FakeEmbedding())
 
     with patch.object(app.provider, "healthcheck", return_value="test"), \
          _no_real_network():
