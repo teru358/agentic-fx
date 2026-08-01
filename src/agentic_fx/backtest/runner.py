@@ -17,8 +17,17 @@ mode=learning / autopilot=off での再生 (実運用 Phase 2 と同一条件で
 - バケット集約 (評価 timeframe の確定バー) だけは ``BarFeed.bar_at`` を
   直接読む — バケット終端の tick では、そのバケットに属する全ての 1 分足が
   既に完成しているため先読みではない。
-- equity は実現損益ベース (``PaperBroker.equity()`` の契約どおり)。含み
-  損益込みの評価は Task 8 のスコープ。
+
+equity の二重の意味 (fix round 1 F1 — codex Critical の裁定): この関数が
+返す ``BacktestResult.equity_curve`` は **実現損益ベース**
+(``PaperBroker.equity()`` の契約どおり、含み損益を含まない)。一方、
+``Scheduler._mark_to_market`` が ``account_snapshots`` に書き込む equity
+(kill switch のドローダウン判定・risk gate の総リスク評価が読む値) は
+**実運用と同じく含み損益込みの mark-to-market**である。両者は別物であり、
+BacktestRunner はこの違いを実運用のまま再現する (これは欠陥ではなく
+実運用の保護設計の忠実な再現 — コントローラ裁定 2026-08-01)。Task 8 の
+成績集計は ``equity_curve`` (実現損益ベース) を使うため、含み損益込みの
+評価が必要な場合は別途 mark-to-market snapshot を参照すること。
 """
 from __future__ import annotations
 
@@ -77,7 +86,26 @@ def _parse_timeframe(tf: str) -> timedelta:
     if not m:
         raise ValueError(f"unsupported eval_timeframe: {tf!r}")
     n, unit = int(m.group(1)), m.group(2)
+    if n == 0:
+        # fix round 1 F7: "0m"/"0h" は正規表現には通るが tf=timedelta(0) と
+        # なり、後段の `(now - _EPOCH) % tf` が ZeroDivisionError になる。
+        raise ValueError(f"eval_timeframe must be > 0: {tf!r}")
     return timedelta(hours=n) if unit == "h" else timedelta(minutes=n)
+
+
+def _require_minute_grid(dt: datetime, label: str) -> None:
+    """``ReplayClock``/``BarFeed`` と同じ正時格子契約 (second==microsecond==0)
+    を ``end`` にも適用する (fix round 1 F3 — codex Important)。格子外の
+    ``end`` は宣言した ``[start, end)`` を最大 1 分近く超過して処理して
+    しまう (``while now < end`` が格子未満の余りぶん余計に 1 回多く回る)。
+    """
+    if dt.tzinfo is None:
+        raise ValueError(f"{label} must be timezone-aware")
+    dt_utc = dt.astimezone(timezone.utc)
+    if dt_utc.second != 0 or dt_utc.microsecond != 0:
+        raise ValueError(
+            f"{label} must be on minute boundary (second and microsecond "
+            "must be 0)")
 
 
 def _aggregate_bucket(feed: BarFeed, symbol: str, interval: str,
@@ -120,6 +148,7 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
     別物 (``BarFeed`` にのみ渡す)。
     """
     tf = _parse_timeframe(eval_timeframe)
+    _require_minute_grid(end, "end")  # fix round 1 F3
 
     conn = connect(Path(":memory:"))
     init_db(conn)
@@ -205,11 +234,18 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
         current_ts = now
         scheduler.tick(now)            # 市場クローズ判定は tick 内部 — 無条件に毎分呼ぶ
         if pending_proposal is not None:
-            mid = missions.start(conn, "trade", "backtest", "intent-source", now)
-            missions.finish(conn, mid, "completed", pending_proposal, [], now)
-            intent = TradeIntent.from_llm_dict(pending_proposal,
-                                               origin=Origin.SCHEDULER)
-            executor.handle_intent(intent, mid)
+            # fix round 1 F2 (codex Important + sonnet Important): 評価時は
+            # 市場オープンでも、1 tick 遅れの執行時にクローズしている場合が
+            # ある (例: 金曜クローズ直前バケットの提案)。執行直前に再確認し、
+            # クローズ中なら発注せず破棄する (週明けの執行は stale で不可)。
+            if market_hours.is_market_open(now):
+                mid = missions.start(conn, "trade", "backtest",
+                                     "intent-source", now)
+                missions.finish(conn, mid, "completed", pending_proposal, [],
+                                now)
+                intent = TradeIntent.from_llm_dict(pending_proposal,
+                                                   origin=Origin.SCHEDULER)
+                executor.handle_intent(intent, mid)
             pending_proposal = None
         # バケット境界の錨は UTC epoch (実運用の datafeed.bars.resample /
         # BAR_ANCHOR="epoch" と同じ規律) — `start` 相対にすると、start が
@@ -222,7 +258,11 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
                                            bucket_start, tf)
             if closed_bar is not None and market_hours.is_market_open(now):
                 pending_proposal = intent_source(closed_bar)
-        equity_curve.append((now.isoformat(), broker.equity()[1]))
+        # fix round 1 F7 (sonnet M1): 先頭の seed 点 (start, initial_balance)
+        # と初回ループの tail 追記が同一 ts (= start) になり二重記録される
+        # ため、初回だけ tail 追記をスキップする (seed 点はそのまま維持)。
+        if now != start:
+            equity_curve.append((now.isoformat(), broker.equity()[1]))
         now = clock.advance()
 
     order_rows = [dict(r) for r in

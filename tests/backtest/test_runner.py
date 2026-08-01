@@ -9,6 +9,8 @@
 """
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from agentic_fx.core.accounting import record_snapshot
 from agentic_fx.core.contracts import (
     ConversionRate, FixedClock, InstrumentSpec, Origin, Quote, TradeIntent,
@@ -17,12 +19,13 @@ from agentic_fx.core.executor import Executor
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
-from agentic_fx.store import missions, orders, ohlcv
+from agentic_fx.store import missions, orders, ohlcv, snapshots
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.state import StateStore
 from agentic_fx.activity import ActivityLog
 
-from agentic_fx.backtest.runner import run_replay
+from agentic_fx.backtest.replay import BarFeed
+from agentic_fx.backtest.runner import _aggregate_bucket, run_replay
 
 from tests.backtest.conftest import H, WED, SETTINGS, _conn, _row_at
 
@@ -31,6 +34,11 @@ OPEN = {"action": "open", "pair": "USDJPY", "direction": "long",
         "limit_price": 148.20, "expires_in": "6h",
         "stop_loss": 147.80, "take_profit": 149.00,
         "reasoning": "bt"}
+
+OPEN_MARKET = {"action": "open", "pair": "USDJPY", "direction": "long",
+              "entry_type": "market", "horizon": "day",
+              "stop_loss": 148.30, "take_profit": 149.00,
+              "reasoning": "f4"}
 
 
 def _seed_history(conn):
@@ -88,8 +96,19 @@ def test_full_cycle_open_fill_tp(tmp_path):
     assert closed[0]["closed_at"].startswith("2026-07-22T13:04")
 
 
-def test_no_lookahead_same_bar(tmp_path):
-    """評価に使ったバーの 1m では約定しない — 先読み禁止 (§6)。"""
+def test_limit_price_only_reachable_within_eval_bucket_never_fills(tmp_path):
+    """評価バケット内 (12:00-12:59) にしか指値到達価格が無く、それ以降に
+    データが 1 本も無い場合は約定しない。
+
+    F6 (sonnet M2 — 名称訂正): 旧名 `test_no_lookahead_same_bar` は brief が
+    「この契約 (先読み禁止) をピンする」と名指ししていたが、13:01 以降の
+    データが無いため、bars_fn が `latest_completed_1m` (正) を使っても
+    `bar_at` (先読みバグ) を使っても結果が変わらない vacuous なテストだった
+    (実装者自身の変異記録: mutation 1 で SURVIVED と確認済み)。先読み禁止
+    そのもののピンは `test_limit_fill_uses_only_completed_bar_not_forming_bar`
+    に担わせ、このテストは実態どおり「フィード欠損時に指値が誤って約定
+    しない」ことの回帰テストとして名前を訂正して残す。
+    """
     hist = _conn(tmp_path)
     # 12:00-12:59 の 1h バー自体に指値到達価格を含める (13:00 以降は到達しない)
     rows = [_row_at(WED + timedelta(minutes=i), o=148.5, h=148.6,
@@ -102,6 +121,41 @@ def test_no_lookahead_same_bar(tmp_path):
                      intent_source=lambda b: dict(OPEN),
                      eval_timeframe="1h", history_conn=hist)
     assert not [o for o in res.orders if o["status"] in ("open", "closed")]
+
+
+def test_limit_fill_uses_only_completed_bar_not_forming_bar(tmp_path):
+    """先読み禁止 (§6) の核心 — 指値到達判定は「完成済み」1m バーのみを見る。
+
+    F6 (sonnet M2 の是正): `bars_fn` が正しく `latest_completed_1m` を使う
+    限り、tick=13:02 の時点でまだ「形成中」の 13:02 バー (低値 148.10、
+    指値到達) は見えず、13:01 の完成バー (届かない) しか見えない。指値
+    到達が観測できるのは、13:02 バーが完成し終える tick=13:03 になって
+    初めてである。`bars_fn` を誤って `bar_at` (形成中バーを直読み) に配線
+    すると、tick=13:02 の時点で既に (本来まだ見えないはずの) 13:02 バーの
+    低値が見え、1 tick 早く約定してしまう — `filled_at` の値でこれを
+    ピンする。
+    """
+    hist = _conn(tmp_path)
+    rows = [_row_at(WED + timedelta(minutes=i), o=148.5, h=148.6, l=148.4,
+                    c=148.5) for i in range(60)]              # 12:00-12:59 評価用 (届かない)
+    rows.append(_row_at(WED + timedelta(hours=1), o=148.5, h=148.6,
+                        l=148.4, c=148.5))                     # 13:00 entry quote (届かない)
+    rows.append(_row_at(WED + timedelta(hours=1, minutes=1), o=148.5,
+                        h=148.6, l=148.4, c=148.5))             # 13:01 完成バー (届かない)
+    rows.append(_row_at(WED + timedelta(hours=1, minutes=2), o=148.3,
+                        h=148.35, l=148.10, c=148.15))          # 13:02 完成バー (指値到達)
+    ohlcv.import_bars(hist, rows, source="dukascopy")
+
+    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+                     start=WED, end=WED + timedelta(hours=2),
+                     intent_source=lambda b: dict(OPEN),
+                     eval_timeframe="1h", history_conn=hist)
+    filled = [o for o in res.orders if o["status"] in ("open", "closed")]
+    assert len(filled) == 1
+    # latest_completed_1m を正しく使えば、13:02 バー (低値 148.10) は
+    # tick=13:03 の判定で初めて「完成済み」として見える — bar_at (形成中
+    # バー) を誤って使うと 1 tick 早い 13:02 で約定してしまう。
+    assert filled[0]["filled_at"].startswith("2026-07-22T13:03")
 
 
 def test_synthetic_mission_passes_origin_gate(tmp_path):
@@ -203,25 +257,257 @@ def test_bucket_alignment_uses_utc_epoch_anchor(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# fix round 1 (コントローラ 2026-08-01 — sonnet + codex 並行レビュー統合裁定)
+# ---------------------------------------------------------------------------
+
+def test_aggregate_bucket_ohlcv_values(tmp_path):
+    """F5 (sonnet I3 — `_aggregate_bucket` の OHLCV 集約値そのものが
+    無検証だった。`high` を先頭バーの値に差し替える変異が SURVIVED)。
+
+    この Bar はプラン 7 の strategy plugin が受け取る唯一の入力契約であり、
+    open=先頭バーの open / high=全体最大 / low=全体最小 / close=末尾バーの
+    close / volume=合計、を直接ピンする。
+    """
+    hist = _conn(tmp_path)
+    rows = [
+        _row_at(WED, o=100.0, h=101.0, l=99.0, c=100.5),
+        _row_at(WED + timedelta(minutes=1), o=100.5, h=105.0, l=100.0, c=102.0),
+        _row_at(WED + timedelta(minutes=2), o=102.0, h=103.0, l=95.0, c=101.0),
+    ]
+    ohlcv.import_bars(hist, rows, source="dukascopy")
+    feed = BarFeed(hist, "USDJPY", source="dukascopy", start=WED,
+                   end=WED + timedelta(minutes=3))
+    bar = _aggregate_bucket(feed, "USDJPY", "3m", WED, timedelta(minutes=3))
+    assert bar is not None
+    assert bar.open == 100.0     # 先頭バーの open
+    assert bar.high == 105.0     # 全体最大 (2 本目)
+    assert bar.low == 95.0       # 全体最小 (3 本目)
+    assert bar.close == 101.0    # 末尾バーの close
+    assert bar.volume == 30.0    # 合計 (10 + 10 + 10)
+
+
+def test_bucket_evaluation_skipped_when_market_closed(tmp_path):
+    """F2/I2 (codex Important + sonnet Important — sonnet 変異①の再現)。
+
+    brief 本文 §6「is_market_open(now) が偽の間は評価しない (週末に評価
+    だけ走る歪みを防ぐ)」— 金曜クローズ後 (NY 18:00, 夏時間で 22:00 UTC)
+    から土曜にかけて、バケットは確定してもクローズ中は intent_source を
+    一切呼んではならない。
+    """
+    fri_close = datetime(2026, 7, 24, 22, 0, tzinfo=timezone.utc)  # 金 22:00 UTC (NY 18:00, クローズ後)
+    hist = _conn(tmp_path)
+    rows = [_row_at(fri_close + timedelta(minutes=i), o=148.5, h=148.6,
+                    l=148.4, c=148.5)
+           for i in range(180)]  # 3h 分の連続 1m (バケット確定用データ)
+    ohlcv.import_bars(hist, rows, source="dukascopy")
+
+    fired = []
+    run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+              start=fri_close, end=fri_close + timedelta(hours=3),
+              intent_source=lambda b: fired.append(b.ts),
+              eval_timeframe="1h", history_conn=hist)
+    assert fired == []  # 週末クローズ中はバケットが確定しても評価されない
+
+
+def test_pending_proposal_discarded_when_market_closes_before_execution(tmp_path):
+    """F2 (codex Important + sonnet Important)。
+
+    評価時 (bucket 確定 tick) は市場オープンでも、1 tick 遅れの執行時に
+    市場がクローズしていれば発注してはならない。金曜 20:59 UTC (夏時間、
+    NY 16:59 でオープン中) で提案生成 → 21:00 UTC (NY 17:00, クローズ瞬間)
+    の執行 tick では発注が起きず orders は空のまま。
+    """
+    fri_start = datetime(2026, 7, 24, 20, 58, tzinfo=timezone.utc)
+    hist = _conn(tmp_path)
+    rows = [_row_at(fri_start + timedelta(minutes=i), o=148.5, h=148.6,
+                    l=148.4, c=148.5) for i in range(6)]
+    ohlcv.import_bars(hist, rows, source="dukascopy")
+
+    fired = []
+
+    def source(bar):
+        if not fired:
+            fired.append(bar.ts)
+            return dict(OPEN)
+        return None
+
+    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+                     start=fri_start, end=fri_start + timedelta(minutes=5),
+                     intent_source=source, eval_timeframe="1m",
+                     history_conn=hist)
+    assert fired  # 評価自体はオープン中 (20:59) に起きている
+    assert not res.orders  # クローズ後の執行は破棄される
+
+
+def test_pending_execution_happens_after_tick_not_before(tmp_path):
+    """F4 (sonnet I1 — sonnet 変異②の再現)。
+
+    brief 本文 §6 が「先読み禁止の本体」と名指しする実行順序
+    (scheduler.tick → pending 執行) をピンする。順序が入れ替わると、
+    市場注文が発注された**同一 tick**で SL/TP 監視 (`_process_exits`) の
+    対象になってしまい、正しい順序では次 tick 以降でしか評価されないはず
+    の建玉が同じ tick 内で閉じてしまう。
+
+    フィクスチャ: 13:01 tick で成行 (entry_type=market) が発注される。
+    entry quote の元になる完成バー (13:00) と、正しい順序ならまだ発注前で
+    評価対象にならないその同じバーの high (149.10) が TP (149.00) を
+    超える。正しい順序なら 13:01 では未発注 (tick が先) → 発注後に監視
+    対象になるのは次 tick (13:02) 以降で、そこでは 13:01 完成バー
+    (high=149.10, 同じく TP 到達) を使って初めて閉じる。つまり
+    `filled_at` (発注 tick) と `closed_at` (TP 確定 tick) は**同一になり
+    得ない**。順序が入れ替わると、発注直後の同一 tick (13:01) の
+    `_process_exits` が 13:00 完成バーで即座に TP 判定してしまい、
+    `filled_at == closed_at` になる。
+    """
+    hist = _conn(tmp_path)
+    rows = [_row_at(WED + timedelta(minutes=i), o=148.5, h=148.6, l=148.4,
+                    c=148.5) for i in range(60)]                # 12:00-12:59 評価用
+    rows.append(_row_at(WED + timedelta(hours=1), o=148.5, h=149.10,
+                        l=148.4, c=148.5))                       # 13:00 — entry quote + TP到達値
+    rows.append(_row_at(WED + timedelta(hours=1, minutes=1), o=148.5,
+                        h=149.10, l=148.4, c=148.5))              # 13:01 — 正しい順序での TP 判定対象
+    ohlcv.import_bars(hist, rows, source="dukascopy")
+
+    fired = []
+
+    def source(bar):
+        if not fired:
+            fired.append(bar.ts)
+            return dict(OPEN_MARKET)
+        return None
+
+    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+                     start=WED, end=WED + timedelta(hours=2),
+                     intent_source=source, eval_timeframe="1h",
+                     history_conn=hist)
+    closed = [o for o in res.orders if o["status"] == "closed"]
+    assert len(closed) == 1
+    assert closed[0]["close_reason"] == "tp"
+    # 順序退行 (pending 執行 → tick) だと同一 tick (13:01) で閉じてしまう。
+    assert closed[0]["filled_at"] != closed[0]["closed_at"]
+
+
+def test_end_must_be_on_minute_grid(tmp_path):
+    """F3 (codex Important) — `end` も `ReplayClock`/`BarFeed` と同じ正時
+    格子 (second==microsecond==0) を要求する。格子外の `end` は宣言した
+    `[start, end)` を最大 1 分近く超過して処理してしまう。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    with pytest.raises(ValueError, match="minute boundary"):
+        run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+                  start=WED, end=WED + timedelta(hours=1, seconds=30),
+                  intent_source=lambda b: None, eval_timeframe="1h",
+                  history_conn=hist)
+
+
+def test_parse_timeframe_rejects_zero(tmp_path):
+    """F7 (Minor 一括) — "0m"/"0h" は正規表現には通るが
+    `tf=timedelta(0)` になり、バケット判定の `% tf` が
+    ZeroDivisionError になる。事前に ValueError で拒否する。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    with pytest.raises(ValueError, match="eval_timeframe"):
+        run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+                  start=WED, end=WED + timedelta(hours=1),
+                  intent_source=lambda b: None, eval_timeframe="0m",
+                  history_conn=hist)
+
+
+def test_equity_curve_has_no_duplicate_timestamps(tmp_path):
+    """F7 (sonnet M1) — 先頭の seed 点 (start, initial_balance) と初回
+    ループの tail 追記が同一 ts になり二重記録されていた。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+                     start=WED, end=WED + timedelta(minutes=5),
+                     intent_source=lambda b: None, eval_timeframe="1h",
+                     history_conn=hist)
+    ts_list = [ts for ts, _ in res.equity_curve]
+    assert len(ts_list) == len(set(ts_list))
+    assert res.equity_curve[0] == (WED.isoformat(), SETTINGS.backtest.initial_balance)
+
+
+def test_drawdown_kill_switch_latches_and_blocks_next_open(tmp_path):
+    """F1(b) (codex Critical の裁定 — equity の二重の意味を実証する対となる
+    テスト)。既存の `test_initial_balance_wiring_no_spurious_killswitch` は
+    偽陽性 (誤ラッチしない) 側しか検証しておらず、真にドローダウン閾値
+    (drawdown_kill_pct=2.0%) を超えた場合に実際にラッチし新規発注を止める
+    方向は無検証だった (sonnet ⚠️ Cannot verify)。
+
+    1 件目の成行を建てた直後に巨大なギャップ (SL を大きく飛び越える) で
+    強制決済させ、口座を壊滅的なドローダウン (数十%) に陥らせる。その後の
+    2 件目の open 提案は kill switch (および同時に daily loss も) の
+    ガードで gate_rejected になり、orders テーブルに行が増えない
+    (orders.insert は gate 受理後にしか呼ばれない — 執行順序は F4 のとおり
+    正しく tick → pending 執行)。
+    """
+    hist = _conn(tmp_path)
+    rows = [_row_at(WED + timedelta(minutes=i), o=148.5, h=148.6, l=148.4,
+                    c=148.5) for i in range(60)]                # 12:00-12:59 (bucket1 評価用)
+    rows.append(_row_at(WED + timedelta(hours=1), o=148.5, h=148.6,
+                        l=148.4, c=148.5))                       # 13:00 — entry quote
+    rows.append(_row_at(WED + timedelta(hours=1, minutes=1),
+                        o=100.0, h=100.05, l=99.90, c=100.0))    # 13:01 — 巨大ギャップ暴落
+    rows.append(_row_at(WED + timedelta(hours=2), o=100.0, h=100.05,
+                        l=99.95, c=100.0))    # 14:00 — 2 件目 entry quote 用
+    ohlcv.import_bars(hist, rows, source="dukascopy")
+
+    calls: list = []
+
+    def source(bar):
+        calls.append(bar.ts)
+        if len(calls) == 1:
+            return dict(OPEN_MARKET)          # sl=148.30, tp=149.00 (最初の建玉)
+        if len(calls) == 2:
+            return {"action": "open", "pair": "USDJPY", "direction": "long",
+                    "entry_type": "market", "horizon": "day",
+                    "stop_loss": 98.50, "take_profit": 103.00,
+                    "reasoning": "f1b-after-crash"}
+        return None
+
+    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+                     start=WED, end=WED + timedelta(hours=3),
+                     intent_source=source, eval_timeframe="1h",
+                     history_conn=hist)
+    assert len(calls) == 2  # 2 バケット (13:00, 14:00) とも評価はされた
+    # 1 件目は暴落で SL 強制決済 (realized_pnl が大きく負)。
+    assert len(res.orders) == 1
+    assert res.orders[0]["close_reason"] == "sl"
+    assert res.orders[0]["realized_pnl"] < -10_000
+    # 2 件目は kill switch (ドローダウン) で gate_rejected — orders は
+    # 増えない (accepted の場合のみ orders.insert が呼ばれるため)。
+    initial_balance = SETTINGS.backtest.initial_balance
+    assert res.orders[0]["realized_pnl"] < -(initial_balance * 0.02)
+
+
+# ---------------------------------------------------------------------------
 # Step 2 (brief 裁定 codex C3): 実装前の前提検証 — 現行 Scheduler.tick は
 # mark-to-market 失敗時に early return し、_expire_limits / _force_close_day
 # に到達しない可能性がある。bars_fn が常に None を返す状態でも期限切れの
 # pending_fill が expired へ遷移するかを実測する。
 #
-# 実測結果: Scheduler._mark_to_market は bars_fn=None による stale=True
-# ケースでは (record_snapshot 自体は成功するので) True を返し、tick() の
-# early return (`if not self._mark_to_market(now): return`) は発火しない。
-# early return が起きるのは record_snapshot が ValueError (時系列逆行) を
-# 送出したときのみで、単調増加する ReplayClock ではこの経路に入らない。
-# よって tick 内部の改修は不要 — このテストは前提が成立することのピン留め。
+# fix round 1 訂正 (sonnet I4): 元のプローブ (brief Step2 の逐語どおり —
+# PENDING_FILL の指値のみ、OPEN ポジション無し) は、`_evaluate_positions`
+# の `stale` フラグが `orders.list_by_status(conn, S.OPEN)` をループして
+# のみ立つため、OPEN ポジションが無ければ bars_fn=None でも stale は
+# 一度も True にならず (`_expire_limits` 自体も bars_fn を参照しない)、
+# 「bars_fn=None の効果」を実質何も検証していなかった (report.md の記述は
+# 実測範囲を超えて主張していた — この点も訂正する)。
+#
+# 訂正後の実測: OPEN ポジションを 1 件作った上で bars_fn=None にすると、
+# `_mark_to_market` は `_evaluate_positions` の `stale=True` を実際に通り
+# (record_snapshot はスキップされ、account_snapshots の最新 ts は不変)、
+# それでも tick() の early return は発火せず `_expire_limits` に到達して
+# 期限切れの別注文が expired になることを確認した。よって tick 内部の
+# 改修は不要という結論は変わらないが、根拠は今回のテストで正しく担保する。
 # ---------------------------------------------------------------------------
 
-def test_expire_limits_reached_despite_missing_bar(tmp_path):
+def test_expire_limits_reached_despite_stale_mark_to_market(tmp_path):
     conn = connect(tmp_path / "sched.db")
     init_db(conn)
     record_snapshot(conn, now=WED, balance=1_000_000, equity=1_000_000)
     state = StateStore(tmp_path / "state.json")
-    clock = FixedClock(WED)
+    clock = FixedClock(WED + timedelta(minutes=1))
     quote = Quote("USDJPY", 148.49, 148.51, WED, "test")
     spec = InstrumentSpec("USDJPY", 0.01, 0.01, 50.0, 0.01, 100_000,
                           "USD", "JPY")
@@ -237,17 +523,33 @@ def test_expire_limits_reached_despite_missing_bar(tmp_path):
         settings=SETTINGS, state_store=state, activity=activity,
         notifier=Notifier(False, None), clock=clock,
         quote_fn=lambda p: quote, spec_fn=lambda p: spec, rate_fn=rate_fn)
-    it = TradeIntent.from_llm_dict(dict(OPEN), origin=Origin.SCHEDULER)
-    mid = missions.start(conn, "trade", "local", "m", WED)
-    oid = executor.handle_intent(it, mid)["order_id"]
-    assert orders.get(conn, oid)["status"] == "pending_fill"
-    orders.update_fields(conn, oid, now=WED,
+
+    # OPEN ポジション 1 件 (market) — _evaluate_positions の stale=True
+    # 分岐を実際に通す対象。
+    market_intent = TradeIntent.from_llm_dict(dict(OPEN_MARKET),
+                                              origin=Origin.SCHEDULER)
+    mid1 = missions.start(conn, "trade", "local", "m1", WED)
+    open_oid = executor.handle_intent(market_intent, mid1)["order_id"]
+    assert orders.get(conn, open_oid)["status"] == "open"
+
+    # 期限切れの pending_fill も別途作る (_expire_limits の到達対象)。
+    limit_intent = TradeIntent.from_llm_dict(dict(OPEN), origin=Origin.SCHEDULER)
+    mid2 = missions.start(conn, "trade", "local", "m2", WED)
+    pend_oid = executor.handle_intent(limit_intent, mid2)["order_id"]
+    assert orders.get(conn, pend_oid)["status"] == "pending_fill"
+    orders.update_fields(conn, pend_oid, now=WED,
                          expires_at=(WED - timedelta(minutes=1)).isoformat())
 
     sched = Scheduler(
         conn=conn, executor=executor, settings=SETTINGS, state_store=state,
-        activity=activity, bars_fn=lambda p: None,
+        activity=activity, bars_fn=lambda p: None,   # 常に None — stale 経路
         on_trade_mission=lambda reason: None, on_news_cycle=lambda: None,
         on_econ_cycle=lambda: None)
-    sched.tick(WED)
-    assert orders.get(conn, oid)["status"] == "expired"
+
+    before = snapshots.latest(conn)["ts"]
+    tick_now = WED + timedelta(minutes=1)
+    sched.tick(tick_now)
+
+    after = snapshots.latest(conn)["ts"]
+    assert after == before  # stale=True — この tick の snapshot は記録されない
+    assert orders.get(conn, pend_oid)["status"] == "expired"  # にも関わらず到達
