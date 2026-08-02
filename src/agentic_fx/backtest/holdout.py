@@ -68,6 +68,20 @@ def _normalize_now(now: datetime) -> datetime:
     return now_utc.replace(second=0, microsecond=0)
 
 
+def in_sample_until(now: datetime, months: int) -> datetime:
+    """in-sample 境界算術の単一所有者 (F1, 最終レビュー opus I-1 是正)。
+
+    ``holdout_boundary`` は h/m/s/µs を保持したまま暦月を引くだけなので、
+    呼び出し元が ``now`` を分格子へ切り捨てずに渡すと境界が呼び出し元ごと
+    に最大 1 分弱ずれる (``run_in_sample``/``run_holdout_gate`` は
+    ``_normalize_now`` 経由、``analyze_for_agent`` は素の ``as_utc`` 経由
+    だったため不一致が生じていた)。in-sample 境界を必要とする全ての
+    呼び出し元は本関数だけを経由すること — ``holdout_boundary`` を直接
+    呼ばない。
+    """
+    return holdout_boundary(_normalize_now(now), months)
+
+
 def _oldest_bar_start(history_conn: sqlite3.Connection, symbol: str,
                       source: str) -> datetime:
     row = history_conn.execute(
@@ -128,7 +142,7 @@ def run_in_sample(settings: Settings, *, history_conn: sqlite3.Connection,
     経由のみ (呼び出し側が境界を動かせる自由度を作らない)。
     """
     now_norm = _normalize_now(now)
-    boundary = holdout_boundary(now_norm, settings.backtest.holdout_months)
+    boundary = in_sample_until(now_norm, settings.backtest.holdout_months)
     start = _oldest_bar_start(history_conn, symbol, source)
     if start >= boundary:
         # F1 (fix round 1, codex Important): 遮断 1 (期間・端点はハーネスが
@@ -163,7 +177,7 @@ def run_holdout_gate(settings: Settings, *, history_conn: sqlite3.Connection,
     (レビュー裁定 codex C1)。
     """
     now_norm = _normalize_now(now)
-    boundary = holdout_boundary(now_norm, settings.backtest.holdout_months)
+    boundary = in_sample_until(now_norm, settings.backtest.holdout_months)
     return _run_scope(
         settings, scope="holdout_gate", history_conn=history_conn,
         symbol=symbol, source=source, intent_source=intent_source,

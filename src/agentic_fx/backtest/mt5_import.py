@@ -82,6 +82,8 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
     Raises:
         ValueError: start/end が naive、または UTC 以外の場合 (正時境界は
             不問 — Task 4 の hour boundary 要件はここには適用しない)。
+            または bridge が返したバーの time が要求窓 [current, window_end)
+            の外にある場合 (F5, 最終レビュー codex I2 — fail loud)。
     """
     for dt, name in [(start, "start"), (end, "end")]:
         if dt.tzinfo is None:
@@ -112,6 +114,18 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
             bar_time_iso, was_naive = _normalize_bar_time(b["time"])
             if was_naive:
                 naive_count += 1
+            # F5 (最終レビュー codex I2): 正規化後の timestamp を現在の取得窓
+            # [current, window_end) に対して検証する。bridge が "to" を
+            # inclusive 解釈した場合の境界重複や、bridge の不具合・キャッシュ
+            # 汚染による窓外行の無言混入を防ぐ (fail loud — import_bars の
+            # 既存行不変性は値の上書きを防ぐだけで、窓外の新規キー挿入は
+            # 防がない)。
+            bar_dt = datetime.fromisoformat(bar_time_iso)
+            if not (current <= bar_dt < window_end):
+                raise ValueError(
+                    f"import_mt5: symbol={symbol!r} のバー time={b['time']!r} "
+                    f"が要求窓 [{current.isoformat()}, {window_end.isoformat()}) "
+                    "の外です (bridge の不具合の可能性)")
             rows.append((symbol, "1m", bar_time_iso,
                         float(b["open"]), float(b["high"]), float(b["low"]),
                         float(b["close"]), float(b["volume"]), None))

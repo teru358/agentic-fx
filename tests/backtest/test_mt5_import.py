@@ -17,8 +17,11 @@ def test_import_mt5_pages_daily_and_imports(tmp_path):
 
     def fetch(url):
         calls.append(url)
+        # F5 (最終レビュー codex I2) の窓検証を満たすため、返すバーの time
+        # は要求された窓の開始 (= "from") に合わせる (窓ごとに異なる)。
+        window_start = _query_param(url, "from")
         return {"symbol": "USDJPY", "interval": "1m", "bars": [
-            {"time": H.isoformat(), "open": 148.0, "high": 148.2,
+            {"time": window_start, "open": 148.0, "high": 148.2,
              "low": 147.9, "close": 148.1, "volume": 10}]}
 
     r = import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
@@ -82,6 +85,25 @@ def test_import_mt5_last_window_clipped_to_end(tmp_path):
 
 def _query_param(url, name):
     return parse_qs(urlsplit(url).query)[name][0]
+
+
+def test_import_mt5_rejects_bar_time_outside_requested_window(tmp_path):
+    """F5 (最終レビュー codex I2): bridge が要求窓 [current, window_end) の
+    外のバーを返した場合は無言混入させず ValueError (fail loud)。窓終端
+    ちょうど (= 次窓の開始、bridge が "to" を inclusive 解釈した場合に
+    重複し得る境界) を狙う。"""
+    conn = _conn(tmp_path)
+    window_end = H + timedelta(days=1)  # [H, H+1day) の外 (ちょうど終端)
+
+    def fetch(url):
+        return {"symbol": "USDJPY", "interval": "1m", "bars": [
+            {"time": window_end.isoformat(), "open": 148.0, "high": 148.2,
+             "low": 147.9, "close": 148.1, "volume": 10}]}
+
+    with pytest.raises(ValueError, match="USDJPY"):
+        import_mt5(conn, "USDJPY", H, window_end,
+                   base_url="http://x", fetch=fetch)
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 0
 
 
 def test_import_mt5_rejects_naive_start(tmp_path):

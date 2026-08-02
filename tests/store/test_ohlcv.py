@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -138,6 +138,53 @@ def test_upsert_bars_rejects_non_live_source(tmp_path):
         ohlcv.upsert_bars(conn, [b], source="dukascopy")
     with pytest.raises(ValueError, match="live allowlist"):
         ohlcv.upsert_bars(conn, [b], source="mt5")
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 0
+
+
+# ---- F6/F7 (最終レビュー opus M-2 = codex Minor1・codex Minor2) ----------
+
+
+def test_load_bars_rejects_naive_since(tmp_path):
+    conn = _conn(tmp_path)
+    ohlcv.import_bars(conn, [ROW], source="dukascopy")
+    with pytest.raises(ValueError, match="naive"):
+        ohlcv.load_bars(conn, "USDJPY", "1m", source="dukascopy",
+                        since=datetime(2026, 7, 22))
+
+
+def test_load_bars_rejects_naive_until(tmp_path):
+    conn = _conn(tmp_path)
+    ohlcv.import_bars(conn, [ROW], source="dukascopy")
+    with pytest.raises(ValueError, match="naive"):
+        ohlcv.load_bars(conn, "USDJPY", "1m", source="dukascopy",
+                        until=datetime(2026, 7, 22))
+
+
+def test_load_bars_jst_since_matches_utc_instant(tmp_path):
+    """JST で指定した since が UTC 換算で同時刻なら、UTC 直接指定と同じ窓
+    (F6, opus M-2 = codex Minor1: 非 UTC offset を UTC 正規化してから比較
+    しないと窓が静かにずれる)。"""
+    conn = _conn(tmp_path)
+    ohlcv.import_bars(conn, [ROW], source="dukascopy")  # NOW_ISO = 12:00 UTC
+    jst = timezone(timedelta(hours=9))
+    since_jst = datetime.fromisoformat(NOW_ISO).astimezone(jst)  # 21:00 JST
+    bars_jst = ohlcv.load_bars(conn, "USDJPY", "1m", source="dukascopy",
+                               since=since_jst)
+    bars_utc = ohlcv.load_bars(conn, "USDJPY", "1m", source="dukascopy",
+                               since=datetime.fromisoformat(NOW_ISO))
+    assert len(bars_jst) == 1
+    assert bars_jst == bars_utc
+
+
+def test_upsert_bars_rejects_naive_bar_time(tmp_path):
+    """F7 (最終レビュー codex Minor2): live 書き込み口 (upsert_bars →
+    _iso_utc) も naive を fail closed する — import_bars/ReplayClock と同じ
+    規律に揃える。"""
+    conn = _conn(tmp_path)
+    naive_bar = Bar("USDJPY", "1m", datetime(2026, 7, 22, 12, 0),
+                    1, 2, 0.5, 1.5, 0)
+    with pytest.raises(ValueError, match="naive"):
+        ohlcv.upsert_bars(conn, [naive_bar], source="yfinance")
     assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 0
 
 

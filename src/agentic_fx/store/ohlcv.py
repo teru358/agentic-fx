@@ -22,7 +22,8 @@ LIVE_SOURCES = frozenset({"yfinance", "twelvedata", "mt5-live"})
 
 
 def _iso_utc(ts: datetime) -> str:
-    """aware datetime は UTC へ正規化してから isoformat する。
+    """aware datetime を UTC へ正規化してから isoformat する。naive は
+    ValueError (fail closed)。
 
     fix round 1 advisor 指摘: import_bars 側 (F4) は bar_time を UTC に
     正規化するのに upsert_bars 側は `b.ts.isoformat()` のまま非対称だった。
@@ -30,12 +31,18 @@ def _iso_utc(ts: datetime) -> str:
     文字列の辞書順比較なので、offset が混在すると窓 (`since`/`until`) や
     順序が静かに壊れる。現状 `datafeed/sources.py` の全ソース (`_to_utc`)
     は `Bar.ts` を必ず UTC aware で返す (実測で確認済み) ため実害は無いが、
-    対称性を保ち将来のソース追加でも壊れないようにする。naive はそのまま
-    (Bar.ts は常に aware のはずだが、防御的に勝手な tz 付与はしない)。
+    対称性を保ち将来のソース追加でも壊れないようにする。
+
+    F7 (最終レビュー codex Minor2): 当初は naive をそのまま通していたが
+    (「防御的に勝手な tz 付与はしない」という判断)、これでは
+    live 書き込み口 (`upsert_bars`) だけ契約が弱いまま残る —
+    `import_bars`/`ReplayClock` は naive を fail closed 済み。ここも同じ
+    規律に揃え、naive は ValueError で拒否する。
     """
-    if ts.tzinfo is not None:
-        return ts.astimezone(timezone.utc).isoformat()
-    return ts.isoformat()
+    if ts.tzinfo is None:
+        raise ValueError(
+            "_iso_utc: naive datetime is rejected (tz-aware UTC required)")
+    return ts.astimezone(timezone.utc).isoformat()
 
 
 def upsert_bars(conn: sqlite3.Connection, bars: list[Bar], *,
@@ -64,17 +71,30 @@ def upsert_bars(conn: sqlite3.Connection, bars: list[Bar], *,
     return len(bars)
 
 
+def _require_aware_utc(dt: datetime, label: str) -> datetime:
+    """F6 (最終レビュー opus M-2 = codex Minor1): naive は ValueError、aware
+    は UTC へ正規化する。DB の bar_time は UTC ISO 文字列に正規化済みで
+    文字列辞書順比較を使う (``_iso_utc``) ため、読み側の窓引数だけ非対称に
+    naive/非 UTC offset を許すと窓や順序が静かにずれる。"""
+    if dt.tzinfo is None:
+        raise ValueError(f"{label} is naive; tz-aware UTC datetime required "
+                          "(cannot safely assume UTC)")
+    return dt.astimezone(timezone.utc)
+
+
 def load_bars(conn: sqlite3.Connection, symbol: str, interval: str, *,
               source: str, since: datetime | None = None,
               until: datetime | None = None) -> list[Bar]:
     q = "SELECT * FROM ohlcv WHERE symbol=? AND interval=? AND source=?"
     args: list = [symbol, interval, source]
     if since is not None:
+        since_utc = _require_aware_utc(since, "since")
         q += " AND bar_time >= ?"
-        args.append(since.isoformat())
+        args.append(since_utc.isoformat())
     if until is not None:
+        until_utc = _require_aware_utc(until, "until")
         q += " AND bar_time <= ?"
-        args.append(until.isoformat())
+        args.append(until_utc.isoformat())
     rows = conn.execute(q + " ORDER BY bar_time", args).fetchall()
     return [Bar(r["symbol"], r["interval"],
                 datetime.fromisoformat(r["bar_time"]),

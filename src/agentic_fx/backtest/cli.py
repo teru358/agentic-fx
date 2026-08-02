@@ -220,6 +220,23 @@ def _backtest_run(conn, settings, args: argparse.Namespace) -> int:
     intent_source = _ProposalIntentSource(proposals)
     content_hash = hashlib.sha256(proposal_path.read_bytes()).hexdigest()
 
+    # F4 (最終レビュー opus I-4): 対象 source/期間に 1m 履歴が 0 行なら
+    # run_replay を呼ばずに fail closed する。run_replay 自体は空バー窓
+    # (市場クローズ期間等) の再生を前提にした既存テストと衝突しないよう
+    # 変更しない (裁定) — CLI 側で先に検査する。0 行のまま黙って完走すると
+    # 正常系と見分けのつかない human_custom 行が残る (--source のタイプミス
+    # 等を検出できない)。
+    n_bars = conn.execute(
+        "SELECT COUNT(*) FROM ohlcv WHERE symbol=? AND interval='1m' "
+        "AND source=? AND bar_time >= ? AND bar_time < ?",
+        (args.symbol, args.source, args.from_.isoformat(),
+         args.to.isoformat())).fetchone()[0]
+    if n_bars == 0:
+        print(f"エラー: symbol={args.symbol} source={args.source} の指定期間に "
+             "1m 履歴が 0 件です (source のタイプミスや未インポート期間の "
+             "可能性があります)", file=sys.stderr)
+        return 1
+
     result = run_replay(settings, symbol=args.symbol, source=args.source,
                         start=args.from_, end=args.to,
                         intent_source=intent_source,

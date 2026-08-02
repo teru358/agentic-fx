@@ -26,6 +26,7 @@ from agentic_fx.backtest.analysis import (
     analyze_for_agent, corr_matrix, coverage_report, lead_lag,
     rolling_corr_summary,
 )
+from agentic_fx.backtest.holdout import holdout_boundary
 from agentic_fx.store import ohlcv
 
 from tests.backtest.conftest import H, SETTINGS, _conn
@@ -270,6 +271,31 @@ def test_coverage_report_gap_pct(tmp_path):
     assert rep["bars"] == 24 and rep["gap_pct"] > 0  # 後半 24h が欠損
 
 
+def test_coverage_report_allows_1m(tmp_path):
+    """F3 (最終レビュー opus I-2 must-fix): coverage_report は 1m を拒否
+    しない — 本ブランチのインポータが書く唯一のデータを人間が検査できる
+    こと (TIMEFRAMES/_TF_MINUTES は不変のまま、coverage_report だけが
+    1m を追加で受け付ける)。``_series`` は 1h 固定間隔なので使わず、直接
+    1 分刻みの行を投入する。"""
+    conn = _conn(tmp_path)
+    values = _sine(60)
+    rows = [("USDJPY", "1m", (H + timedelta(minutes=i)).isoformat(),
+             v, v + 0.05, v - 0.05, v, 1.0, 0.01)
+            for i, v in enumerate(values)]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    rep = coverage_report(conn, "USDJPY", timeframe="1m", source="dukascopy",
+                          start=H, end=H + timedelta(minutes=60))
+    # H は水曜 12:00 UTC (全てオープン時間) なので、1 分刻みのステップが
+    # 実際に使われていれば expected_open_bars == 60・gap_pct == 0 になる。
+    # bars (COUNT(*)) だけの確認では `_COVERAGE_TF_MINUTES["1m"]` を 1 以外
+    # (例: 60) に変異させても検出できない (bars は timeframe に依存しない) —
+    # expected_open_bars/gap_pct まで見て「1 分ステップが実際に使われた」
+    # ことを直接検証する。
+    assert rep["bars"] == 60
+    assert rep["expected_open_bars"] == 60
+    assert rep["gap_pct"] == 0.0
+
+
 # --- 追加テスト (契約の細部・変異キラー) --------------------------------
 
 
@@ -504,6 +530,30 @@ def test_pick_peak_tie_break_prefers_ascending_k_on_abs_tie():
     現れた最大キーをそのまま返す (Python の max は同点で最初の要素を保持)
     ため、挿入順を k=3 → k=-3 にしておけば、この tie を検出できる。"""
     assert _pick_peak({3: 0.5, -3: 0.5, 0: 0.2}) == -3
+
+
+# --- F1 (最終レビュー opus I-1 must-fix): 境界算術の一元化 --------------
+
+def test_analyze_for_agent_boundary_matches_between_seconds_and_minute_grid_now(
+        tmp_path):
+    """秒/マイクロ秒付き now と分格子 now が同一の in-sample 境界 (= 同一の
+    分析結果) を返す。境界ちょうどのバーを 31 本目に置き、境界が分格子へ
+    正しく切り捨てられていれば (30 本 = 29 リターン < MIN_COMMON_OBS) は
+    insufficient_data、切り捨てが漏れて秒/µs 分だけ境界が後ろへずれると
+    (31 本 = 30 リターン == MIN_COMMON_OBS) 計算できてしまう — この差で
+    境界ちょうどのバーの混入を直接検出する。"""
+    conn = _conn(tmp_path)
+    boundary = holdout_boundary(NOW, SETTINGS.backtest.holdout_months)
+    start = boundary - timedelta(hours=30)
+    _series(conn, "USDJPY", _sine(31, phase=0), start=start)
+    _series(conn, "EURUSD", _sine(31, phase=1), start=start)
+    now_with_seconds = NOW + timedelta(seconds=42, microseconds=123456)
+    request = {"kind": "corr_matrix", "timeframe": "1h"}
+    out_seconds = analyze_for_agent(conn, _settings_watch_eurusd(), request,
+                                    now=now_with_seconds)
+    out_floor = analyze_for_agent(conn, _settings_watch_eurusd(), request,
+                                  now=NOW)
+    assert out_seconds == out_floor == {"error": "insufficient_data"}
 
 
 def test_corr_matrix_perfect_positive_and_negative_correlation(tmp_path):

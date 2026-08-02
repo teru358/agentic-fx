@@ -175,6 +175,22 @@ def test_in_sample_view_whitelists_metric_keys_against_period_smuggling(tmp_path
     assert rows[0]["metrics"]["pf"] == 1.5
 
 
+def test_in_sample_view_excludes_created_at(tmp_path):
+    """F2 (最終レビュー codex I1): created_at は返却列に含めない —
+    run_in_sample が保存する created_at (= now_norm, 分格子切り捨て済み) を
+    改善ループが読めると、holdout_months (既定値/設定/コードから既知) と
+    合わせて holdout_boundary(created_at, holdout_months) で period_end を
+    分精度で完全復元できてしまう (遮断 1 の派生漏洩)。"""
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H), metrics={"trades": 0}, settings_hash="s",
+              core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+    rows = backtest_runs.in_sample_view(conn)
+    assert "created_at" not in rows[0]
+
+
 def test_naive_period_rejected(tmp_path):
     conn = _conn(tmp_path)
     naive = datetime(2026, 7, 22, 12, 0)

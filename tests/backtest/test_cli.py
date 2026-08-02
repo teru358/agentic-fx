@@ -144,6 +144,18 @@ def test_cli_backtest_run_records_human_custom_scope(tmp_path, monkeypatch):
     _install_settings(tmp_path)
     proposals = tmp_path / "p.jsonl"
     proposals.write_text("", encoding="utf-8")  # 提案なし = 取引 0 で完走
+    # F4 (最終レビュー opus I-4) の空履歴 fail closed ガードを通すため、
+    # 対象 source/期間に 1m 履歴を最低 1 行 seed する (このテストの主眼は
+    # run_replay を mock した配線検証であり、ガード自体は
+    # test_cli_backtest_run_rejects_empty_history が別途検証する)。
+    from agentic_fx.store import ohlcv as ohlcv_store
+    seed_conn = connect(tmp_path / "data" / "agentic.db")
+    init_db(seed_conn)
+    ohlcv_store.import_bars(
+        seed_conn, [("USDJPY", "1m", "2026-07-01T00:00:00+00:00",
+                    148.0, 148.2, 147.9, 148.1, 10.0, 0.01)],
+        source="dukascopy")
+    seed_conn.close()
     fake_result = BacktestResult(
         orders=[], equity_curve=[("2026-07-01T00:00:00+00:00", 1_000_000.0)],
         start=datetime(2026, 7, 1, tzinfo=timezone.utc),
@@ -176,6 +188,26 @@ def test_cli_backtest_run_records_human_custom_scope(tmp_path, monkeypatch):
     assert kwargs["settings_hash"] == \
         backtest_runs_real.settings_snapshot_hash(settings)
     assert kwargs["initial_balance"] == settings.backtest.initial_balance
+
+
+def test_cli_backtest_run_rejects_empty_history(tmp_path, monkeypatch):
+    """F4 (最終レビュー opus I-4): 対象 source/期間に 1m 履歴が 0 行なら
+    run_replay を呼ばず rc=1 (--source のタイプミス等が正常系と見分けの
+    つかない human_custom 行を残さないこと)。"""
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    proposals = tmp_path / "p.jsonl"
+    proposals.write_text("", encoding="utf-8")  # 履歴は投入しない (DB は空)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay") as rr, \
+         patch("agentic_fx.backtest.cli.backtest_runs") as br:
+        rc = main(["backtest", "run", "--symbol", "USDJPY",
+                   "--source", "dukascopy",
+                   "--from", "2026-07-01", "--to", "2026-07-02",
+                   "--proposal-file", str(proposals)])
+    assert rc == 1
+    rr.assert_not_called()
+    br.save_human_run.assert_not_called()
 
 
 def test_cli_backtest_run_rejects_naive_ts_in_proposal_file(tmp_path, monkeypatch):

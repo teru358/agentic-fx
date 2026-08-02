@@ -7,10 +7,11 @@
 それ以外の低レベル関数 (``corr_matrix`` / ``rolling_corr_summary`` /
 ``lead_lag`` / ``coverage_report``) は Task 11 (人間 CLI) やテストから直接
 呼べるが、期間 (``in_sample_until``) は呼び出し元が明示的に渡す必要がある。
-``analyze_for_agent`` はその内部で ``holdout_boundary(now, ...)`` を適用する
-ことで期間の所有をこのモジュールに一元化する (Task 9 の holdout 遮断 1 と
-同じ規律: 改善ループへの返り値には日時型・list[時系列]・件数・境界日時を
-含めない)。
+``analyze_for_agent`` はその内部で ``holdout.in_sample_until(now, ...)``
+(UTC 正規化 + 分格子切り捨て込みの境界算術の単一所有者 — F1, 最終レビュー
+opus I-1) を適用することで期間の所有をこのモジュールに一元化する (Task 9
+の holdout 遮断 1 と同じ規律: 改善ループへの返り値には日時型・list[時系列]・
+件数・境界日時を含めない)。
 
 エラーは固定コード ``{"error": <code>}`` のみ (レビュー裁定 codex I2)。
 メッセージ文字列・件数・利用可能範囲・境界日時はエラーに含めない
@@ -24,7 +25,7 @@ import statistics
 from datetime import datetime, timedelta
 from typing import Any
 
-from agentic_fx.backtest.holdout import holdout_boundary
+from agentic_fx.backtest.holdout import in_sample_until as _in_sample_until
 from agentic_fx.config import Settings
 from agentic_fx.core.market_hours import is_market_open
 from agentic_fx.core.timeutil import as_utc
@@ -269,6 +270,17 @@ def lead_lag(conn: sqlite3.Connection, a: str, b: str, *, timeframe: str,
 
 # --- coverage_report (人間 CLI 用 — Task 11) ---------------------------
 
+# F3 (最終レビュー opus I-2 must-fix): coverage_report だけが 1m を許可する。
+# 本ブランチのインポータ (importer.py / mt5_import.py) は 1m しか書かない
+# ので、TIMEFRAMES (15m/1h/4h/1d) しか受けない coverage_report では人間が
+# 唯一投入されるデータを検査できなかった。spec §6 の列挙制は改善ループ向け
+# API (analyze_for_agent 経由) の契約であり、coverage_report は人間 CLI 専用
+# (§6 遮断の対象外、docstring どおり) なのでここだけ 1m を追加する。
+# **TIMEFRAMES / _TF_MINUTES / 直後の assert は一切変更しない** — 改善ループ
+# 面の列挙は不変 (ここを触るとモジュール import 時の assert が落ちる)。
+_COVERAGE_TF_MINUTES = {"1m": 1, **_TF_MINUTES}
+
+
 def coverage_report(conn: sqlite3.Connection, symbol: str, *, timeframe: str,
                     source: str, start: datetime, end: datetime) -> dict:
     """``{bars, expected_open_bars, gap_pct}``。
@@ -281,11 +293,16 @@ def coverage_report(conn: sqlite3.Connection, symbol: str, *, timeframe: str,
     が 0 なら計算不能として ValueError (fail closed)。start/end は naive
     なら ValueError (watch 銘柄選定基準③ を人間が判定するための関数 —
     改善ループには露出しないため §6 遮断の対象外)。
+
+    ``timeframe`` は ``TIMEFRAMES`` (改善ループ向け列挙) に加えて ``"1m"``
+    も受け付ける (F3, 最終レビュー opus I-2) — 本ブランチのインポータが
+    書くのは 1m のみのため。
     """
-    _validate_timeframe(timeframe)
+    if timeframe not in _COVERAGE_TF_MINUTES:
+        raise ValueError("timeframe is not one of the enumerated values")
     start_utc = as_utc(start)
     end_utc = as_utc(end)
-    step = timedelta(minutes=_TF_MINUTES[timeframe])
+    step = timedelta(minutes=_COVERAGE_TF_MINUTES[timeframe])
     expected_open_bars = 0
     t = start_utc
     while t < end_utc:
@@ -319,8 +336,10 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
                       request: dict, *, now: datetime) -> dict:
     """改善ループ (プラン 9) に露出する唯一の分析面。
 
-    ``in_sample_until = holdout_boundary(now, settings.backtest.holdout_months)``
-    を内部で適用する。symbols は ``settings.pairs + settings.datafeed.
+    ``in_sample_until = holdout.in_sample_until(now, settings.backtest.
+    holdout_months)`` (F1, 最終レビュー opus I-1 — UTC 正規化 + 分格子切り
+    捨て込みの境界算術の単一所有者) を内部で適用する。symbols は
+    ``settings.pairs + settings.datafeed.
     watch_symbols`` 内に限定 (重複除去・順序維持)。実行毎に
     ``analysis_runs.save`` し、返り値に ``analysis_run_id`` を含める
     (成功時のみ — 計算していない呼び出しを分母に入れない)。
@@ -373,7 +392,11 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
         if a not in candidates or b not in candidates:
             return {"error": "unknown_symbol"}
 
-    in_sample_until = holdout_boundary(now_utc,
+    # F1 (最終レビュー opus I-1 是正): 境界算術は holdout.in_sample_until が
+    # 単一所有する (UTC 正規化 + 分格子切り捨てを含む) — ここで
+    # holdout_boundary を直接呼ばない (run_in_sample/run_holdout_gate と
+    # 同じ経路で境界を得ることで、同じ now に対する境界のずれを無くす)。
+    in_sample_until = _in_sample_until(now_utc,
                                        settings.backtest.holdout_months)
 
     try:

@@ -37,9 +37,15 @@ _HARNESS_SCOPES = frozenset({"in_sample", "holdout_gate"})
 
 _VIEW_COLUMNS = (
     "id, plugin_ref, content_hash, kind, pair, timeframe, source, scope, "
-    "issued_by, metrics_json, settings_hash, core_commit, initial_balance, "
-    "created_at"
+    "issued_by, metrics_json, settings_hash, core_commit, initial_balance"
 )
+# F2 (最終レビュー codex I1): created_at をここに含めない。run_in_sample は
+# now_norm (分格子切り捨て済み) を created_at として保存するため、改善
+# ループが created_at をそのまま読み取り holdout_months (既定値/設定/コード
+# から既知) と合わせて holdout_boundary(created_at, holdout_months) を計算
+# すれば period_end を分精度で完全復元できてしまう — 遮断 1 (期間・端点を
+# 返さない) を列名だけで満たし、情報としては破っていた。SQL 内部の
+# ``ORDER BY created_at, id`` (下記) は返却列に含めないので継続してよい。
 
 
 def _require_utc(dt: datetime, what: str) -> datetime:
