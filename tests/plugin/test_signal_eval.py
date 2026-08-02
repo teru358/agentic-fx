@@ -159,22 +159,29 @@ def test_labels_json_top_level_not_dict_raises_value_error(tmp_path, settings):
 
 
 def test_labels_json_missing_bars_key_raises_value_error(tmp_path, settings):
+    """`match` はエラー文言固有の部分文字列にする — plugin 名
+    `no_bars_ind` 自体が 'bars' を含むため、`match="bars"` はメッセージ
+    本文から 'bars' を削っても plugin 名経由で偽陽性になり得る (レビュー
+    fix round 1 F6、変異で実証済み。kind ガードで踏んだ tmp_path 由来の
+    偽陽性と同種、キャリアが plugin 名なだけ)。"""
     d = _plugin_dir(tmp_path, "no_bars_ind")
     (d / "labels.json").write_text(json.dumps({"expected": [
         {"bar_ts": "2026-01-01T00:00:00Z", "direction": "long"}]}))
     meta = _meta(d, "no_bars_ind")
 
-    with pytest.raises(ValueError, match="bars"):
+    with pytest.raises(ValueError, match="missing 'bars' key"):
         signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
                                        settings=settings)
 
 
 def test_labels_json_missing_expected_key_raises_value_error(tmp_path, settings):
+    """plugin 名 `no_expected_ind` が 'expected' を含むための偽陽性回避
+    (F6、上記 test_labels_json_missing_bars_key と同種)。"""
     d = _plugin_dir(tmp_path, "no_expected_ind")
     (d / "labels.json").write_text(json.dumps({"bars": _bars(2)}))
     meta = _meta(d, "no_expected_ind")
 
-    with pytest.raises(ValueError, match="expected"):
+    with pytest.raises(ValueError, match="missing 'expected' key"):
         signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
                                        settings=settings)
 
@@ -239,12 +246,108 @@ def test_bars_out_of_order_raises_value_error(tmp_path, settings):
                                        settings=settings)
 
 
+def test_bars_empty_list_raises_value_error(tmp_path, settings):
+    """F7c (レビュー fix round 1、変異生存を実測) — `_bars_to_df` の空
+    bars ガードを外しても green だった (`pd.DataFrame([], columns=...)`
+    は空 DataFrame を素通しし、後段のウォークフォワードが 0 回のループで
+    黙って完走してしまう) ため killer テストを追加。"""
+    d = _plugin_dir(tmp_path, "empty_bars_ind")
+    _write_labels(d, [], [{"bar_ts": "2026-01-01T00:00:00Z", "direction": "long"}])
+    meta = _meta(d, "empty_bars_ind")
+
+    with pytest.raises(ValueError, match="must be a non-empty list"):
+        signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
+                                       settings=settings)
+
+
+def test_bars_duplicate_timestamp_raises_value_error(tmp_path, settings):
+    """F7d (レビュー fix round 1) — 同時刻の重複 bar_ts 単体の killer
+    テスト (これまでは非昇順の入れ替えテストしか無く、`<=` を `<` に緩め
+    て重複だけ許容する変異が生存し得た)。"""
+    d = _plugin_dir(tmp_path, "dup_ts_ind")
+    bars = _bars(2)
+    bars[1][0] = bars[0][0]  # 2 本目を 1 本目と同時刻に重複させる
+    _write_labels(d, bars, [{"bar_ts": bars[0][0], "direction": "long"}])
+    meta = _meta(d, "dup_ts_ind")
+
+    with pytest.raises(ValueError, match="strictly ascending"):
+        signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
+                                       settings=settings)
+
+
+def test_bars_timestamp_nat_raises_value_error(tmp_path, settings):
+    """F2 (レビュー fix round 1) — `pd.Timestamp("NaT")` は例外を出さず
+    NaT になり、tz 変換・昇順比較 (`<=`) を素通りしていた。bars 側の NaT
+    を拒否する。`match` は `_parse_utc_timestamp` のエラー文言固有の
+    'is NaT' にする (`{ts}` の repr が 'NaT' になる他のエラー経路 — 例:
+    F1 の '... bar_ts NaT is not present in ...' — との偶然一致を避ける
+    ため。実際に下記 test_expected_bar_ts_nat_raises_value_error で
+    この種の偽陽性を変異注入により発見した)。"""
+    d = _plugin_dir(tmp_path, "nat_bars_ind")
+    bars = _bars(2)
+    bars[0][0] = "NaT"
+    _write_labels(d, bars, [{"bar_ts": bars[1][0], "direction": "long"}])
+    meta = _meta(d, "nat_bars_ind")
+
+    with pytest.raises(ValueError, match="is NaT"):
+        signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
+                                       settings=settings)
+
+
+def test_bars_row_non_finite_value_raises_value_error(tmp_path, settings):
+    """F3 (レビュー fix round 1) — `json.loads` は既定で NaN/Infinity を
+    受理する。OHLCV の非有限値を拒否する。"""
+    d = _plugin_dir(tmp_path, "nonfinite_ind")
+    bars = _bars(2)
+    bars[0][1] = float("nan")  # open を NaN にする
+    _write_labels(d, bars, [{"bar_ts": bars[0][0], "direction": "long"}])
+    meta = _meta(d, "nonfinite_ind")
+
+    with pytest.raises(ValueError, match="finite"):
+        signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
+                                       settings=settings)
+
+
+def test_bars_row_integer_overflow_raises_value_error(tmp_path, settings):
+    """F3 (レビュー fix round 1) — JSON の巨大整数は Python の任意精度
+    int として読める (json.loads はそのまま受理) が、`float()` へのキャ
+    ストで `OverflowError` になり ValueError 契約から外れていた。"""
+    d = _plugin_dir(tmp_path, "overflow_ind")
+    bars = _bars(2)
+    bars[0][1] = 10 ** 400  # float の表現範囲を超える巨大整数
+    _write_labels(d, bars, [{"bar_ts": bars[0][0], "direction": "long"}])
+    meta = _meta(d, "overflow_ind")
+
+    with pytest.raises(ValueError, match="out of float range"):
+        signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
+                                       settings=settings)
+
+
+def test_labels_json_exceeds_size_limit_raises_value_error(tmp_path, settings, monkeypatch):
+    """F4 (レビュー fix round 1) — loader.py の 1MiB 上限
+    (`_MAX_FILE_BYTES`) と同じ値を labels.json にも適用する。実ファイル
+    を 1MiB 書くのは無駄なので上限自体を monkeypatch で小さくする
+    (loader からの単一定義 import を signal_eval モジュール属性として
+    差し替える)。"""
+    d = _plugin_dir(tmp_path, "huge_labels_ind")
+    _write_labels(d, _bars(2), [{"bar_ts": "2026-01-01T00:00:00Z", "direction": "long"}])
+    meta = _meta(d, "huge_labels_ind")
+    monkeypatch.setattr(signal_eval, "_MAX_FILE_BYTES", 10)
+
+    with pytest.raises(ValueError, match="exceeds size limit"):
+        signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
+                                       settings=settings)
+
+
 def test_expected_empty_list_raises_value_error(tmp_path, settings):
+    """plugin 名 `empty_expected_ind` が 'expected' を含むための偽陽性
+    回避 (F6 と同種の予防的修正 — レビューでの明示指摘対象ではないが同じ
+    リスクパターンのため合わせて締める)。"""
     d = _plugin_dir(tmp_path, "empty_expected_ind")
     _write_labels(d, _bars(2), [])
     meta = _meta(d, "empty_expected_ind")
 
-    with pytest.raises(ValueError, match="expected"):
+    with pytest.raises(ValueError, match="must be a non-empty list"):
         signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
                                        settings=settings)
 
@@ -256,6 +359,22 @@ def test_expected_invalid_direction_raises_value_error(tmp_path, settings):
     meta = _meta(d, "bad_dir_ind")
 
     with pytest.raises(ValueError):
+        signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
+                                       settings=settings)
+
+
+def test_expected_non_hashable_direction_raises_value_error_not_type_error(tmp_path, settings):
+    """F5 (レビュー fix round 1) — frozenset 包含判定
+    (`direction not in _VALID_DIRECTIONS`) を `isinstance(direction, str)`
+    より先に行うと、JSON の配列/オブジェクトのような非 hashable な値を
+    direction に渡した際に生の `TypeError` になり ValueError 契約が破れ
+    ていた。`isinstance` を先に検証していることを直接ピンする。"""
+    d = _plugin_dir(tmp_path, "list_dir_ind")
+    _write_labels(d, _bars(2),
+                 [{"bar_ts": "2026-01-01T00:00:00Z", "direction": ["long"]}])
+    meta = _meta(d, "list_dir_ind")
+
+    with pytest.raises(ValueError, match="direction must be"):
         signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
                                        settings=settings)
 
@@ -277,6 +396,39 @@ def test_expected_missing_bar_ts_raises_value_error(tmp_path, settings):
     meta = _meta(d, "missing_bar_ts_ind")
 
     with pytest.raises(ValueError):
+        signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
+                                       settings=settings)
+
+
+def test_expected_bar_ts_not_in_bars_raises_value_error(tmp_path, settings):
+    """F1 (レビュー fix round 1、Critical 相当) — expected の bar_ts が
+    bars に実在しない場合、その bar_ts はウォークフォワードのどの呼び出
+    しでも predicted 側に現れ得ず恒久的に fn となり recall を静かに汚染
+    する (Task 6 の承認判断の入力破損)。bars に無い bar_ts は fail closed
+    で拒否する。"""
+    d = _plugin_dir(tmp_path, "orphan_ind")
+    bars = _bars(2)  # 2026-01-01T00:00:00Z, 01:00:00Z の 2 本のみ
+    _write_labels(d, bars, [{"bar_ts": "2099-01-01T00:00:00Z", "direction": "long"}])
+    meta = _meta(d, "orphan_ind")
+
+    with pytest.raises(ValueError, match="not present in"):
+        signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
+                                       settings=settings)
+
+
+def test_expected_bar_ts_nat_raises_value_error(tmp_path, settings):
+    """F2 (レビュー fix round 1) — expected 側の NaT も同様に拒否する
+    (bars 側は test_bars_timestamp_nat_raises_value_error でカバー済み)。
+    `match` は 'is NaT' に固定する — `match="NaT"` だと、F2 の isna()
+    チェックを外した変異でも F1 の 'bar_ts NaT is not present in ...'
+    (NaT は自己非等価のためどの bars 集合にも属せず F1 に必ず捕まる) が
+    たまたま部分文字列 'NaT' を含んでしまい green のまま生存する偽陽性を
+    変異注入で実際に確認した。"""
+    d = _plugin_dir(tmp_path, "nat_expected_ind")
+    _write_labels(d, _bars(2), [{"bar_ts": "NaT", "direction": "long"}])
+    meta = _meta(d, "nat_expected_ind")
+
+    with pytest.raises(ValueError, match="is NaT"):
         signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
                                        settings=settings)
 
@@ -323,6 +475,34 @@ def test_naive_and_aware_iso_normalize_to_same_utc_instant(tmp_path, settings):
     assert result["fn"] == 0
     assert result["precision"] == pytest.approx(1.0)
     assert result["recall"] == pytest.approx(1.0)
+
+
+def test_positive_offset_iso_actually_shifts_to_utc(tmp_path, settings):
+    """F7a (レビュー fix round 1、変異生存を実測) —
+    `_parse_utc_timestamp` の `ts.tz_convert("UTC")` を `ts` (no-op) に
+    緩める変異は、絶対時刻ベースの `pd.Timestamp` 等価性だけを見るテスト
+    では検出できない (+09:00 の 09:00 も UTC の 00:00 も同一 instant の
+    ため `==` は変わらず True)。`.tz` 属性と時刻の値そのもの (hour) を
+    直接検証することで no-op を検出する。"""
+    d = _plugin_dir(tmp_path, "offset_ind")
+    # +09:00 の 09:00 = UTC の 00:00 (同一 instant だが tzinfo の表現が違う)
+    bars = [["2026-01-01T09:00:00+09:00", 1.0, 1.0, 1.0, 1.0, 1.0]]
+    _write_labels(d, bars, [{"bar_ts": "2026-01-01T09:00:00+09:00", "direction": "long"}])
+    meta = _meta(d, "offset_ind")
+
+    seen = []
+
+    def fake_sandbox_run(meta_arg, payload, *, settings):
+        seen.append(payload["df"].index[-1])
+        return {"signals": [{"direction": "long", "strength": 0.5, "rationale": "r"}]}
+
+    result = signal_eval.evaluate_detection(
+        meta, sandbox_run=fake_sandbox_run, settings=settings)
+
+    ts = seen[0]
+    assert str(ts.tz) == "UTC"
+    assert ts.hour == 0  # +09:00 09:00 → UTC 00:00 に実際にシフトしている
+    assert result["tp"] == 1
 
 
 # --- ウォークフォワード呼び出しパターン -----------------------------------
@@ -376,6 +556,26 @@ def test_duplicate_signals_at_same_bar_collapse_to_one_predicted(tmp_path, setti
 
     assert result["tp"] == 1
     assert result["fp"] == 0
+
+
+def test_precision_is_zero_when_no_signals_predicted(tmp_path, settings):
+    """F7b (レビュー fix round 1、変異生存を実測) — `_score` の precision
+    分母 0 分岐 (`0.0`) を `1.0` に緩める変異が、brief 逐語のテスト (常に
+    tp>0 で分母が非 0) では検出できなかった。predicted が完全に空
+    (tp=fp=0) のシナリオで拒否する。"""
+    d = _plugin_dir(tmp_path, "empty_pred_ind")
+    bars = _bars(2)
+    _write_labels(d, bars, [{"bar_ts": bars[0][0], "direction": "long"}])
+    meta = _meta(d, "empty_pred_ind")
+
+    result = signal_eval.evaluate_detection(
+        meta, sandbox_run=lambda *a, **k: {"signals": []}, settings=settings)
+
+    assert result["tp"] == 0
+    assert result["fp"] == 0
+    assert result["fn"] == 1
+    assert result["precision"] == 0.0
+    assert result["recall"] == 0.0
 
 
 # --- SandboxError の伝播 (fail closed、握りつぶさない) --------------------

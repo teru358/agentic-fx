@@ -36,12 +36,13 @@ plugin フォルダ同梱の `labels.json` (ラベル付きサンプル) を使�
 from __future__ import annotations
 
 import json
+import math
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 import pandas as pd
 
 from agentic_fx.plugin import sandbox as plugin_sandbox
-from agentic_fx.plugin.loader import PluginMeta
+from agentic_fx.plugin.loader import PluginMeta, _MAX_FILE_BYTES
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
@@ -66,14 +67,15 @@ def evaluate_detection(meta: PluginMeta, *, sandbox_run: SandboxRunFn | None = N
     `settings` は `config.Settings` 全体 (market_tools.build と同じ受け
     渡し方 — 内部で `settings.plugin` だけを sandbox 層に渡す)。
 
-    labels.json 欠落・parse 不能・スキーマ不正 (トップレベルが dict で
-    ない・"bars"/"expected" キー欠落や型不正・bars 各行が
-    [iso,o,h,l,c,v] の 6 要素でない/非数値・bars の時刻が昇順でない・
-    expected 各要素のキー過不足・direction が long/short 以外・expected
-    が空リスト)・`meta.kind != "signal"` はすべて `ValueError`
-    (fail closed)。`SandboxError` (plugin 実行時の timeout・クラッシュ・
-    戻り値スキーマ不正) は catch せずそのまま伝播させる (モジュール
-    docstring の fail closed 節を参照)。
+    labels.json 欠落・サイズ上限超過 (loader.py と同じ 1MiB)・parse 不能・
+    スキーマ不正 (トップレベルが dict でない・"bars"/"expected" キー欠落
+    や型不正・bars 各行が [iso,o,h,l,c,v] の 6 要素でない/非数値/非有限
+    (NaN・Infinity)・bars の時刻が昇順でない・時刻が NaT・expected 各
+    要素のキー過不足・expected の bar_ts が bars に実在しない・direction
+    が long/short 以外・expected が空リスト)・`meta.kind != "signal"` は
+    すべて `ValueError` (fail closed)。`SandboxError` (plugin 実行時の
+    timeout・クラッシュ・戻り値スキーマ不正) は catch せずそのまま伝播
+    させる (モジュール docstring の fail closed 節を参照)。
     """
     if meta.kind != "signal":
         raise ValueError(
@@ -82,7 +84,11 @@ def evaluate_detection(meta: PluginMeta, *, sandbox_run: SandboxRunFn | None = N
 
     labels = _load_labels(meta)
     df = _bars_to_df(labels["bars"])
-    expected = _parse_expected(labels["expected"])
+    # F1 (レビュー fix round 1): expected の bar_ts が bars に実在しない
+    # 場合、その bar_ts はどのウォークフォワード呼び出しでも predicted 側
+    # に現れ得ず恒久的に fn となり recall を静かに汚染する (Task 6 の承認
+    # 判断の入力破損) — bars の index 集合との照合を fail closed で行う。
+    expected = _parse_expected(labels["expected"], valid_bar_ts=frozenset(df.index))
 
     predicted: PredictedSet = set()
     if sandbox_run is None:
@@ -139,6 +145,15 @@ def _load_labels(meta: PluginMeta) -> dict[str, Any]:
     if not labels_path.is_file():
         raise ValueError(
             f"plugin {meta.name!r}: labels.json not found at {labels_path}")
+    # F4 (レビュー fix round 1): loader.py が plugin.py/config.yaml に課す
+    # 1MiB 上限 (`_MAX_FILE_BYTES`) と同じ値を labels.json にも適用する
+    # (無制限読み込みは loader の方針と不整合)。値は loader からの import
+    # のみを使い、ここで複製しない (単一定義)。
+    size = labels_path.stat().st_size
+    if size > _MAX_FILE_BYTES:
+        raise ValueError(
+            f"plugin {meta.name!r}: labels.json exceeds size limit "
+            f"({_MAX_FILE_BYTES} bytes, got {size})")
     try:
         raw = json.loads(labels_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
@@ -166,6 +181,12 @@ def _parse_utc_timestamp(value: Any, field: str) -> pd.Timestamp:
     except (ValueError, TypeError) as exc:
         raise ValueError(
             f"labels.json {field} is not a valid timestamp: {value!r}") from exc
+    # F2 (レビュー fix round 1): `pd.Timestamp("NaT")` は例外を出さず NaT
+    # になる。NaT は tz 変換も `<=` 比較 (昇順検証) も常に False を返して
+    # 素通りし、bars と expected の両方に NaT を置くと集合上「一致」して
+    # TP に化ける — 変換直後に fail closed で拒否する。
+    if pd.isna(ts):
+        raise ValueError(f"labels.json {field} is NaT (not a valid timestamp): {value!r}")
     if ts.tzinfo is None:
         return ts.tz_localize("UTC")
     return ts.tz_convert("UTC")
@@ -190,7 +211,23 @@ def _bars_to_df(bars_raw: list) -> pd.DataFrame:
             if isinstance(val, bool) or not isinstance(val, (int, float)):
                 raise ValueError(
                     f"labels.json bars[{i}][{j + 1}] must be a number, got {val!r}")
-            values.append(float(val))
+            # F3 (レビュー fix round 1): sandbox.py の
+            # `_validate_indicator_result` と同じパターン。①`float()` を
+            # try で包む — json.loads が受理する巨大整数は Python の
+            # 任意精度 int だが `float()` へのキャストで OverflowError に
+            # なり得る (ValueError 契約から外れる生例外)。②変換後に
+            # `math.isfinite` で NaN/Infinity (json.loads は既定で
+            # NaN/Infinity/-Infinity を受理する) を拒否する。
+            try:
+                fval = float(val)
+            except OverflowError as exc:
+                raise ValueError(
+                    f"labels.json bars[{i}][{j + 1}] is out of float range: "
+                    f"{val!r}") from exc
+            if not math.isfinite(fval):
+                raise ValueError(
+                    f"labels.json bars[{i}][{j + 1}] must be finite, got {val!r}")
+            values.append(fval)
         # 昇順前提のウォークフォワードを崩す入力は fail closed で拒否する
         # (順序が崩れると bar_ts の対応がずれ評価結果が無意味になる)。
         if prev_ts is not None and ts <= prev_ts:
@@ -204,7 +241,12 @@ def _bars_to_df(bars_raw: list) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=_OHLCV_COLUMNS, index=pd.DatetimeIndex(index))
 
 
-def _parse_expected(expected_raw: list) -> PredictedSet:
+def _parse_expected(expected_raw: list, *, valid_bar_ts: frozenset) -> PredictedSet:
+    """`valid_bar_ts` は `_bars_to_df` が算出した bars の index 集合 (UTC
+    aware `pd.Timestamp`)。F1 (レビュー fix round 1): expected の bar_ts
+    が bars に実在しない場合、ウォークフォワードのどの呼び出しでも
+    predicted 側に現れ得ず恒久的に fn となって recall を静かに汚染する
+    — fail closed で拒否する。"""
     if not expected_raw:
         raise ValueError("labels.json 'expected' must be a non-empty list")
 
@@ -222,8 +264,19 @@ def _parse_expected(expected_raw: list) -> PredictedSet:
                 f"labels.json expected[{i}] missing keys: {sorted(missing)}")
 
         ts = _parse_utc_timestamp(item["bar_ts"], f"expected[{i}].bar_ts")
+        if ts not in valid_bar_ts:
+            raise ValueError(
+                f"labels.json expected[{i}].bar_ts {ts} is not present in "
+                "labels.json 'bars' (expected bar_ts must reference an "
+                "existing bar)")
+
         direction = item["direction"]
-        if direction not in _VALID_DIRECTIONS:
+        # F5 (レビュー fix round 1): frozenset 包含判定より前に
+        # `isinstance(direction, str)` を検証する。list/dict のような非
+        # hashable な値を direction に渡すと `direction not in
+        # _VALID_DIRECTIONS` 自体が生の `TypeError` を送出し ValueError
+        # 契約から外れていた。
+        if not isinstance(direction, str) or direction not in _VALID_DIRECTIONS:
             raise ValueError(
                 f"labels.json expected[{i}].direction must be 'long' or "
                 f"'short', got {direction!r}")
