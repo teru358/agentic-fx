@@ -92,6 +92,41 @@ def test_two_matches_one_extra_gives_precision_recall_two_thirds(tmp_path, setti
     }
 
 
+def test_fp_and_fn_are_not_symmetric_tp_fp_fn_distinguishable(tmp_path, settings):
+    """fp != fn な入力で tp/fp/fn の取り違え (交換) を検出する — brief の
+    2 一致+1 余分シナリオは fp == fn == 1 のため、fp/fn を丸ごと入れ替える
+    変異が生存してしまう (自己レビューで実際に確認した)。"""
+    d = _plugin_dir(tmp_path, "asym_ind")
+    idx = pd.date_range("2026-01-01T00:00:00Z", periods=3, freq="1h", tz="UTC")
+    t0, t1, t2 = idx
+    bars = _bars(3)
+
+    # expected は t0 の long のみ (1 件)
+    _write_labels(d, bars, [{"bar_ts": t0.isoformat(), "direction": "long"}])
+    meta = _meta(d, "asym_ind")
+
+    def fake_sandbox_run(meta_arg, payload, *, settings):
+        latest = payload["df"].index[-1]
+        if latest == t0:
+            return {"signals": [{"direction": "long", "strength": 0.8, "rationale": "r"}]}
+        if latest == t1:
+            return {"signals": [{"direction": "short", "strength": 0.7, "rationale": "r"}]}
+        if latest == t2:
+            return {"signals": [{"direction": "long", "strength": 0.6, "rationale": "r"}]}
+        return {"signals": []}
+
+    result = signal_eval.evaluate_detection(
+        meta, sandbox_run=fake_sandbox_run, settings=settings)
+
+    # predicted = {t0 long, t1 short, t2 long} (3件), expected = {t0 long} (1件)
+    # tp=1 (t0 一致), fp=2 (t1, t2 は expected に無い余分), fn=0 (missed 無し)
+    assert result["tp"] == 1
+    assert result["fp"] == 2
+    assert result["fn"] == 0
+    assert result["precision"] == pytest.approx(1 / 3)
+    assert result["recall"] == pytest.approx(1.0)
+
+
 def test_missing_labels_json_raises_value_error(tmp_path, settings):
     d = _plugin_dir(tmp_path, "no_labels_ind")
     meta = _meta(d, "no_labels_ind")
@@ -247,10 +282,18 @@ def test_expected_missing_bar_ts_raises_value_error(tmp_path, settings):
 
 
 def test_kind_not_signal_raises_value_error(tmp_path, settings):
+    """kind ゲートが labels.json の有無より前に効くことを保証するため、
+    有効な labels.json を用意したうえで検証する — `tmp_path` (pytest が
+    テスト関数名から生成する一時ディレクトリ) がたまたま `match` 文字列
+    を部分文字列として含んでしまうケースを避けるため、`match` は kind
+    エラー文言に固有の 'requires' を使う (このテスト名自体に 'signal' が
+    含まれるため `match="signal"` は tmp_path のパス経由で偽陽性になり
+    得ることを自己レビューの変異注入で実際に確認した)。"""
     d = _plugin_dir(tmp_path, "wrong_kind_ind", kind="indicator")
+    _write_labels(d, _bars(2), [{"bar_ts": "2026-01-01T00:00:00Z", "direction": "long"}])
     meta = _meta(d, "wrong_kind_ind", kind="indicator")
 
-    with pytest.raises(ValueError, match="signal"):
+    with pytest.raises(ValueError, match="requires meta.kind"):
         signal_eval.evaluate_detection(meta, sandbox_run=lambda *a, **k: {"signals": []},
                                        settings=settings)
 
@@ -292,10 +335,14 @@ def test_walk_forward_clamps_window_to_max_bars_and_grows(tmp_path, settings):
 
     seen_lengths = []
     seen_payload_keys = []
+    seen_meta_args = []
+    seen_settings = []
 
-    def fake_sandbox_run(meta_arg, payload, *, settings):
+    def fake_sandbox_run(meta_arg, payload, **kwargs):
         seen_lengths.append(len(payload["df"]))
         seen_payload_keys.append(set(payload))
+        seen_meta_args.append(meta_arg)
+        seen_settings.append(kwargs["settings"])
         return {"signals": []}
 
     signal_eval.evaluate_detection(meta, sandbox_run=fake_sandbox_run, settings=settings)
@@ -303,6 +350,13 @@ def test_walk_forward_clamps_window_to_max_bars_and_grows(tmp_path, settings):
     # i=0,1,2,3 の 4 回呼ばれ、max_bars=2 でクランプされる
     assert seen_lengths == [1, 2, 2, 2]
     assert all(keys == {"df", "params"} for keys in seen_payload_keys)
+    # market_tools.build と同じ呼び出し規約: (meta, payload, *, settings=
+    # settings.plugin)。settings が `Settings` 全体のまま渡されると
+    # run_plugin/PluginSession 側で `settings.sandbox_timeout_sec` が
+    # AttributeError になる (PluginSettings のみが持つ属性) — その取り
+    # 違えを検出するため identity で固定する。
+    assert all(m is meta for m in seen_meta_args)
+    assert all(s is settings.plugin for s in seen_settings)
 
 
 def test_duplicate_signals_at_same_bar_collapse_to_one_predicted(tmp_path, settings):
