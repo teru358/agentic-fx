@@ -1,12 +1,18 @@
 """market 系ツール — datafeed の薄い読み取り専用ラッパー。"""
 from __future__ import annotations
 
+import logging
+
 from agentic_fx.config import Settings
 from agentic_fx.datafeed.bars import bars_to_df
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.indicators import compute_indicators
 from agentic_fx.datafeed.price_provider import PriceProvider
+from agentic_fx.plugin import sandbox as plugin_sandbox
+from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.tools.registry import ToolDef
+
+_log = logging.getLogger(__name__)
 
 
 def _pair_param(settings: Settings) -> dict:
@@ -16,8 +22,20 @@ def _pair_param(settings: Settings) -> dict:
                           "enum": list(settings.datafeed.intervals)}}
 
 
-def build(provider: PriceProvider, econ: EconCalendar,
-          settings: Settings) -> list[ToolDef]:
+def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
+          indicator_plugins: list[PluginMeta] | None = None,
+          sandbox_run=None) -> list[ToolDef]:
+    """`indicator_plugins` は `plugin_loader.approved_plugins()` の戻り値
+    (承認済み・任意 kind 混在) をそのまま渡してよい — `kind != "indicator"`
+    の要素はここで無視する (kind="indicator" だけが `get_indicators` の対象)。
+
+    `sandbox_run` は既定 `None` で `plugin.sandbox.run_plugin` を使う。テストは
+    fake を注入して実 subprocess を起動せずに合成ロジックだけを検証できる
+    (実サンドボックス起動の検証は Task 2 のテストの関心)。
+    """
+    indicator_plugins = [m for m in (indicator_plugins or []) if m.kind == "indicator"]
+    sandbox_run = sandbox_run if sandbox_run is not None else plugin_sandbox.run_plugin
+
     # 足の導出 (ネイティブ / resample) は provider の責務。ここでは
     # 要求された足をそのまま渡す — ツール層で resample すると、MT5 の
     # ネイティブ 4h が使える環境でも 1h から作り直してしまう
@@ -36,8 +54,39 @@ def build(provider: PriceProvider, econ: EconCalendar,
         MTF は「別の足を要求して呼び直す」で表現する (旧実装は 1h のとき
         だけ mtf_4h を付けていたが、足を固定しない方針では 1h だけ特別扱い
         する根拠がない。どの足の上位足を見たいかは LLM / plugin が決める)。
+
+        承認済み indicator plugin は、組み込み指標と**同じ `_frame(pair,
+        timeframe)` の df** (要求された pair/timeframe の bars) を
+        `meta.max_bars` で末尾クランプして渡す — 上位足を見たい plugin は
+        signal/strategy 同様、自身の config.yaml で明示的に別 timeframe を
+        持つのではなく、この get_indicators と同じ「呼び出し側が指定する
+        timeframe」の枠組みに従う (indicator kind の config.yaml は
+        timeframe を必須としない — 呼び出しごとに変わるため)。
+        `plugin:<name>` キーで合成し、SandboxError (timeout・クラッシュ・
+        スキーマ不正すべてを含む単一の例外) はそのキーだけを落として警告
+        ログを出す — 組み込み指標は plugin の失敗に関わらず必ず返す
+        (fail-open: plugin 出力は LLM 向けの参考情報であり、1 つの plugin
+        の不調で get_indicators 全体を失敗させない)。
         """
-        return compute_indicators(_frame(pair, timeframe))
+        df = _frame(pair, timeframe)
+        result = compute_indicators(df)
+        for meta in indicator_plugins:
+            if meta.max_bars > settings.plugin.max_bars_limit:
+                _log.warning(
+                    "plugin %s: max_bars %d exceeds settings.plugin.max_bars_limit "
+                    "%d — skipping", meta.name, meta.max_bars,
+                    settings.plugin.max_bars_limit)
+                continue
+            payload = {"df": df.tail(meta.max_bars), "params": meta.params}
+            try:
+                plugin_result = sandbox_run(meta, payload, settings=settings.plugin)
+            except plugin_sandbox.SandboxError as exc:
+                _log.warning("plugin %s: indicator failed (%s) — dropping "
+                             "plugin:%s key (built-ins unaffected)",
+                             meta.name, exc, meta.name)
+                continue
+            result[f"plugin:{meta.name}"] = plugin_result
+        return result
 
     def get_econ_calendar(days: int = 1) -> list[dict]:
         return econ.upcoming(hours=days * 24)

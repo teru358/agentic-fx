@@ -14,6 +14,7 @@ from agentic_fx.service import (
     _assert_tools_registered, _check_llama_swap, _validate_startup,
     build_app, build_splash, run_init, run_service,
 )
+from agentic_fx.tools import market_tools
 from tests.store.test_rag import FakeEmbedding
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
@@ -84,6 +85,40 @@ def test_build_app_wires_everything(tmp_path):
     for name in ("get_ohlcv", "search_news", "get_positions",
                  "get_recent_reflections"):
         assert name in app.registry.names()
+
+
+def test_build_app_wires_approved_plugins_into_market_tools(tmp_path):
+    """プラン 7 Task 3: `approved_plugins(conn_core, root / "plugins")` の
+    結果が `market_tools.build(..., indicator_plugins=...)` まで実際に届く
+    ことのピン。`indicator_plugins=approved` の削除や `plugins_dir` の
+    typo (例: `root / "plugin"`) をしても、plugins/ が存在しない通常の
+    テスト環境では `approved_plugins` が `[]` を返すだけで単体テストは
+    通ってしまう — 配線そのものを検証しないと検出できない回帰
+    (メモリ: verify-integration-not-just-units)。
+    """
+    _init(tmp_path)
+    sentinel_meta = object()  # market_tools.build に渡る値だけを見る (中身は不問)
+    captured: dict = {}
+    real_build = market_tools.build
+
+    def spy_build(*args, **kwargs):
+        captured.update(kwargs)
+        return real_build(*args, **{**kwargs, "indicator_plugins": None})
+
+    with patch("agentic_fx.service.plugin_loader.approved_plugins") as approved, \
+         patch("agentic_fx.service.market_tools.build",
+               side_effect=spy_build) as build_spy:
+        approved.return_value = [sentinel_meta]
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+
+    assert approved.call_count == 1
+    conn_arg, plugins_dir_arg = approved.call_args[0]
+    assert conn_arg is app.conn_core
+    assert plugins_dir_arg == tmp_path / "plugins"
+    assert build_spy.call_count == 1
+    assert captured["indicator_plugins"] == [sentinel_meta]
+    # spy 経由でも実装 (real_build) を実際に呼んでおり、登録は正常に完了する
+    assert "get_ohlcv" in app.registry.names()
 
 
 def test_splash_contains_key_fields(tmp_path):

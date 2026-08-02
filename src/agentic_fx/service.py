@@ -45,7 +45,9 @@ from agentic_fx.store import approvals, orders
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.rag import Rag
 from agentic_fx.store.state import StateStore
-from agentic_fx.tools import account_tools, market_tools, news_tools, reflection_tools
+from agentic_fx.tools import (
+    account_tools, market_tools, news_tools, plugin_loader, reflection_tools,
+)
 from agentic_fx.tools.registry import ToolRegistry
 
 _log = logging.getLogger("agentic_fx.service")
@@ -307,8 +309,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                         notifier=notifier, clock=clock,
                         quote_fn=quote_fn, spec_fn=spec_fn, rate_fn=rate_fn)
 
+    # プラン 7 Task 3: plugins/ 直下の承認済み plugin をロードする。反映は
+    # 次回起動時のみ (hot reload しない — YAGNI)。plugins/ が存在しない環境
+    # (未使用のデフォルト) でも approved_plugins は [] を返し起動を妨げない。
+    plugins_dir = root / "plugins"
+    approved = plugin_loader.approved_plugins(conn_core, plugins_dir)
+
     registry = ToolRegistry()
-    registry.register_all(market_tools.build(provider, econ, settings))
+    registry.register_all(market_tools.build(
+        provider, econ, settings, indicator_plugins=approved))
     registry.register_all(news_tools.build(rag))
     registry.register_all(account_tools.build(conn_core, broker))
     # 上書き 6: reflection_tools.build は pairs が必須引数 (Task 0-8)
