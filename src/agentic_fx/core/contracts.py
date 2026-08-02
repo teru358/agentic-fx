@@ -16,6 +16,15 @@ class Action(StrEnum):
     HOLD = "hold"
 
 
+class StrategyAction(StrEnum):
+    """strategy plugin (evaluate) の出力語彙。既存 Action とは別語彙 —
+    "exit" は含めない (プラン 7 D1: exit 表現は levels のみ、evaluate 型の
+    毎バー exit 判定は本プランでは未対応)。既存 Action (close/cancel を含む)
+    を流用・拡張しない。"""
+    OPEN = "open"
+    HOLD = "hold"
+
+
 class Direction(StrEnum):
     LONG = "long"
     SHORT = "short"
@@ -272,3 +281,77 @@ class TradeIntent:
                    expires_in_h=expires_in_h, stop_loss=stop_loss,
                    take_profit=take_profit, confidence=confidence,
                    reasoning=reasoning, ref_price=ref_price)
+
+
+@dataclass(frozen=True, slots=True)
+class Signal:
+    """signal plugin (`detect(df, params)`) の 1 件の検出出力 (プラン 7 §6)。
+
+    `bar_ts` は plugin の任意値ではなく、評価対象バケットからハーネス
+    (signal_producer, プラン 7 Task 8) が設定する監査キー — plugin 側の
+    `detect()` はこのフィールドを持たない dict を返し、ハーネスが
+    `Signal` へ組み立てる際に付与する (鮮度ゲート・重複排除の前提)。
+    """
+    plugin: str
+    pair: str
+    timeframe: str
+    bar_ts: datetime
+    direction: Direction
+    strength: float
+    rationale: str
+    stop_loss: float | None = None
+    take_profit: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.direction not in (Direction.LONG, Direction.SHORT):
+            raise ValueError(f"invalid direction: {self.direction!r}")
+        if isinstance(self.strength, bool) or not isinstance(self.strength, (int, float)):
+            raise ValueError(f"strength must be a number, got {self.strength!r}")
+        if not math.isfinite(self.strength) or not (0.0 <= self.strength <= 1.0):
+            raise ValueError(f"strength must be in [0, 1], got {self.strength!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyDecision:
+    """strategy plugin (`evaluate(df, indicators, signals, params)`) の出力
+    (プラン 7 §6)。exit 表現は levels (stop_loss/take_profit) のみ — D1。
+    action="open" は stop_loss 必須 (帰属規則: ハーネスの既定決済で補わない)。
+
+    フィールド順は「デフォルト無し → 有り」の dataclass 制約により
+    action, rationale (共に必須) を先頭に置く (仕様書の記載順はこの制約を
+    明示していないため、意味は保ったまま並べ替えている)。
+    """
+    action: StrategyAction
+    rationale: str
+    direction: Direction | None = None
+    entry_type: EntryType | None = None
+    limit_price: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.action not in (StrategyAction.OPEN, StrategyAction.HOLD):
+            raise ValueError(f"invalid action: {self.action!r}")
+        if self.direction is not None and self.direction not in (
+                Direction.LONG, Direction.SHORT):
+            raise ValueError(f"invalid direction: {self.direction!r}")
+        if self.entry_type is not None and self.entry_type not in (
+                EntryType.MARKET, EntryType.LIMIT):
+            raise ValueError(f"invalid entry_type: {self.entry_type!r}")
+
+        if self.action == StrategyAction.OPEN:
+            # brief 明記: open は stop_loss 必須。direction/entry_type は
+            # brief に明記が無いが、方向・執行方法の無い "open" は下流
+            # (Task 5 strategy_adapter の IntentSource 変換) で意味を成さない
+            # ため fail closed で必須化する。
+            if self.stop_loss is None:
+                raise ValueError("open requires stop_loss")
+            if self.direction is None:
+                raise ValueError("open requires direction")
+            if self.entry_type is None:
+                raise ValueError("open requires entry_type")
+
+        if self.entry_type == EntryType.LIMIT and self.limit_price is None:
+            raise ValueError("limit entry_type requires limit_price")
+        if self.entry_type != EntryType.LIMIT and self.limit_price is not None:
+            raise ValueError("limit_price is only valid when entry_type is limit")

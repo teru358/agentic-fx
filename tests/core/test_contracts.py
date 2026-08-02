@@ -4,7 +4,8 @@ import pytest
 
 from agentic_fx.core.contracts import (
     Action, Clock, Direction, EntryType, Horizon, IntentParseError,
-    Origin, OrderStatus, FixedClock, SystemClock, TradeIntent,
+    Origin, OrderStatus, FixedClock, Signal, StrategyAction,
+    StrategyDecision, SystemClock, TradeIntent,
 )
 
 
@@ -116,6 +117,109 @@ def test_order_status_has_all_states():
 def test_fixed_clock():
     dt = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
     assert FixedClock(dt).now() == dt
+
+
+def _bar_ts():
+    return datetime(2026, 8, 2, 1, 0, tzinfo=timezone.utc)
+
+
+def test_signal_accepts_valid_fields():
+    s = Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=0.5, rationale="oversold")
+    assert s.direction == Direction.LONG
+    assert s.stop_loss is None
+    assert s.take_profit is None
+
+
+def test_signal_rejects_invalid_direction():
+    with pytest.raises(ValueError, match="direction"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="up", strength=0.5, rationale="x")
+
+
+def test_signal_rejects_strength_out_of_range():
+    with pytest.raises(ValueError, match="strength"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=1.5, rationale="x")
+
+
+def test_signal_rejects_negative_strength():
+    with pytest.raises(ValueError, match="strength"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=-0.1, rationale="x")
+
+
+def test_signal_rejects_bool_strength():
+    with pytest.raises(ValueError, match="strength"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=True, rationale="x")
+
+
+def test_signal_rejects_nan_strength():
+    with pytest.raises(ValueError, match="strength"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=float("nan"), rationale="x")
+
+
+def test_signal_accepts_strength_boundaries():
+    Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+           direction="short", strength=0.0, rationale="x")
+    Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+           direction="short", strength=1.0, rationale="x")
+
+
+def test_strategy_decision_hold_minimal():
+    d = StrategyDecision(action="hold", rationale="様子見")
+    assert d.action == StrategyAction.HOLD
+    assert d.direction is None
+
+
+def test_strategy_decision_open_requires_stop_loss():
+    with pytest.raises(ValueError, match="stop_loss"):
+        StrategyDecision(action="open", rationale="x", direction="long",
+                         entry_type="market")
+
+
+def test_strategy_decision_open_requires_direction():
+    with pytest.raises(ValueError, match="direction"):
+        StrategyDecision(action="open", rationale="x", entry_type="market",
+                         stop_loss=147.0)
+
+
+def test_strategy_decision_open_requires_entry_type():
+    with pytest.raises(ValueError, match="entry_type"):
+        StrategyDecision(action="open", rationale="x", direction="long",
+                         stop_loss=147.0)
+
+
+def test_strategy_decision_open_market_minimal():
+    d = StrategyDecision(action="open", rationale="x", direction="long",
+                         entry_type="market", stop_loss=147.0)
+    assert d.action == StrategyAction.OPEN
+    assert d.limit_price is None
+
+
+def test_strategy_decision_limit_requires_limit_price():
+    with pytest.raises(ValueError, match="limit_price"):
+        StrategyDecision(action="open", rationale="x", direction="long",
+                         entry_type="limit", stop_loss=147.0)
+
+
+def test_strategy_decision_market_rejects_limit_price():
+    with pytest.raises(ValueError, match="limit_price"):
+        StrategyDecision(action="open", rationale="x", direction="long",
+                         entry_type="market", stop_loss=147.0,
+                         limit_price=148.0)
+
+
+def test_strategy_decision_rejects_exit_action():
+    with pytest.raises(ValueError, match="action"):
+        StrategyDecision(action="exit", rationale="x")
+
+
+def test_strategy_decision_rejects_invalid_direction():
+    with pytest.raises(ValueError, match="direction"):
+        StrategyDecision(action="hold", rationale="x", direction="up")
 
 
 def test_system_clock_returns_tz_aware_utc():

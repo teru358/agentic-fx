@@ -19,8 +19,11 @@ logs/
 reports/
 CLAUDE.md
 
-# LLM-generated plugins (differ per user, approved locally — see design doc §6)
-plugins/
+# LLM-generated plugins (differ per user, approved locally — see design doc
+# §6)。**リポジトリ直下のみ** — 末尾 `/` だけの無錨パターンは
+# `docs/examples/plugins/` (コミット対象のサンプル) も任意の深さで拾って
+# しまうため先頭 `/` で錨止めする (プラン 7 Task 1 レビュー指摘)。
+/plugins/
 
 # エディタの一時ファイル
 *.swp
