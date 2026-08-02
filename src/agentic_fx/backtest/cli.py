@@ -24,7 +24,7 @@ from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import compare_sources, import_mt5
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import load_settings
-from agentic_fx.core.contracts import Bar
+from agentic_fx.core.contracts import Bar, Origin, TradeIntent
 from agentic_fx.service import ensure_initialized
 from agentic_fx.store import backtest_runs
 from agentic_fx.store.db import connect, init_db
@@ -142,6 +142,14 @@ def _load_proposals(path: Path) -> list[tuple[datetime, dict]]:
 
     ts が欠落・parse 不能・naive なら ``ValueError`` (fail closed、部分実行
     しない — 上書き節 F 逐語)。
+
+    Fix Round 1 F3 (sonnet I-4 = codex Important): ts だけでなく intent 本体
+    の形状も **副作用 (run_replay 実行) の前に全行** 検証する。検証は
+    ``runner.py`` の実呼び出し (``TradeIntent.from_llm_dict(pending_proposal,
+    origin=Origin.SCHEDULER)``) と同じ形で行い、1 行でも不正なら
+    ``ValueError`` (fail closed、何も実行しない)。許容 action は ``open``
+    のみ (brief 「OPEN_INTENT 形」の裁定 — hold/close/cancel は proposal-file
+    としては不正)。
     """
     proposals: list[tuple[datetime, dict]] = []
     text = path.read_text(encoding="utf-8")
@@ -164,6 +172,13 @@ def _load_proposals(path: Path) -> list[tuple[datetime, dict]]:
             raise ValueError(f"line {lineno}: ts must be timezone-aware")
         ts = ts.astimezone(timezone.utc)
         intent = {k: v for k, v in obj.items() if k != "ts"}
+        if intent.get("action") != "open":
+            raise ValueError(
+                f"line {lineno}: only action='open' is supported in "
+                f"proposal-file, got {intent.get('action')!r}")
+        # IntentParseError は ValueError のサブクラスなのでそのまま伝播させる
+        # (ここで捕まえて包み直す必要はない — 呼び出し元は ValueError を見る)。
+        TradeIntent.from_llm_dict(intent, origin=Origin.SCHEDULER)
         proposals.append((ts, intent))
     proposals.sort(key=lambda p: p[0])
     return proposals
@@ -174,7 +189,10 @@ class _ProposalIntentSource:
     アダプタ (プラン 7 で ``--plugin`` に置き換わる — 上書き節 F)。
 
     ``closed_bar.ts >= ts`` の最古の未消費提案を 1 件返す。1 呼び出し
-    (1 バー) で 1 件のみ消費し、残りは次バー以降に持ち越す。
+    (1 バー) で 1 件のみ消費し、残りは次バー以降に持ち越す。この「1 バー
+    1 件」契約は ``run_replay`` が 1 closed bar につき本アダプタを最大 1 回
+    しか呼ばない前提 (runner.py の評価バケット確定処理) に依存する —
+    同一 ``Bar`` で 2 回呼ばれると 2 件消費してしまう (codex Minor 裁定)。
     """
 
     def __init__(self, proposals: list[tuple[datetime, dict]]) -> None:
@@ -241,12 +259,20 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
     conn = connect(root / "data" / "agentic.db")
     init_db(conn)
 
-    if args.command == "history":
-        if args.history_command == "import":
-            return _history_import(conn, settings, args)
-        if args.history_command == "compare":
-            return _history_compare(conn, settings, args)
-        return _history_coverage(conn, args)
-    if args.command == "backtest":
-        return _backtest_run(conn, settings, args)
-    return _analyze_corr(conn, args)
+    # Fix Round 1 F6 (sonnet I-3): 統一エラー境界。人間向け CLI なので生の
+    # traceback を出さない — 診断メッセージを stderr に出して rc=1 とする。
+    # SystemExit (ensure_initialized 由来) は Exception ではないのでここを
+    # 経由せず素通りする。
+    try:
+        if args.command == "history":
+            if args.history_command == "import":
+                return _history_import(conn, settings, args)
+            if args.history_command == "compare":
+                return _history_compare(conn, settings, args)
+            return _history_coverage(conn, args)
+        if args.command == "backtest":
+            return _backtest_run(conn, settings, args)
+        return _analyze_corr(conn, args)
+    except (ValueError, KeyError, OSError) as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        return 1

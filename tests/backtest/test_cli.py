@@ -8,15 +8,21 @@ importer/runner/metrics/analysis 自体は Task 4-10 で既にテスト済みな
 """
 from __future__ import annotations
 
+import hashlib
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import agentic_fx.backtest.cli as cli
+from agentic_fx.backtest import runner as runner_module
 from agentic_fx.backtest.runner import BacktestResult
 from agentic_fx.entry import main
-from agentic_fx.store.db import connect
+from agentic_fx.store import backtest_runs as backtest_runs_real
+from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.state import StateStore
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -26,6 +32,12 @@ def _install_settings(root: Path) -> None:
     (root / "config").mkdir(parents=True, exist_ok=True)
     shutil.copy(_REPO_ROOT / "config" / "settings.yaml.example",
                root / "config" / "settings.yaml")
+
+
+_OPEN_MARKET_LINE = (
+    '{{"ts": "{ts}", "action": "open", "pair": "USDJPY", "direction": "long", '
+    '"entry_type": "market", "horizon": "day", "stop_loss": 148.30, '
+    '"take_profit": 149.00, "reasoning": "{reasoning}"}}\n')
 
 
 # ---- history import ---------------------------------------------------
@@ -122,6 +134,12 @@ def test_cli_history_coverage_calls_report(tmp_path, monkeypatch):
 
 
 def test_cli_backtest_run_records_human_custom_scope(tmp_path, monkeypatch):
+    """Fix Round 1 F2 (sonnet I-2 — 自己変異 M-B SURVIVED の是正):
+    `source`/`settings_hash`/`initial_balance` を直接検証する。
+    `settings_hash` は実 `settings_snapshot_hash` に委譲する
+    (`backtest_runs` を丸ごと mock しても、実装が使う計算式そのものと
+    突き合わせるため — 単なる値の素通りでは検出できない)。
+    """
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
     proposals = tmp_path / "p.jsonl"
@@ -136,6 +154,9 @@ def test_cli_backtest_run_records_human_custom_scope(tmp_path, monkeypatch):
          patch("agentic_fx.backtest.cli.backtest_runs") as br:
         rr.return_value = fake_result
         br.save_human_run.return_value = 1
+        br.settings_snapshot_hash.side_effect = \
+            backtest_runs_real.settings_snapshot_hash
+        br.core_commit.return_value = "deadbeef"
         rc = main(["backtest", "run", "--symbol", "USDJPY",
                    "--source", "dukascopy",
                    "--from", "2026-07-01", "--to", "2026-07-02",
@@ -149,14 +170,24 @@ def test_cli_backtest_run_records_human_custom_scope(tmp_path, monkeypatch):
         datetime(2026, 7, 2, tzinfo=timezone.utc))
     assert kwargs["kind"] == "proposals"
     assert kwargs["timeframe"] == "1h"
+    assert kwargs["source"] == "dukascopy"
+    from agentic_fx.config import load_settings
+    settings = load_settings(tmp_path / "config" / "settings.yaml")
+    assert kwargs["settings_hash"] == \
+        backtest_runs_real.settings_snapshot_hash(settings)
+    assert kwargs["initial_balance"] == settings.backtest.initial_balance
 
 
 def test_cli_backtest_run_rejects_naive_ts_in_proposal_file(tmp_path, monkeypatch):
+    """ts の naive 性だけを不正要因として孤立させる (Fix Round 1 レビュー
+    指摘: action='open' の完全な有効 intent に naive ts だけを混ぜることで、
+    action 非 open 由来ではなく naive ts 由来で rc=1 になることをピンする —
+    でないと F3 の action 制約がこのテストの合否理由を静かに乗っ取る)。"""
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
     proposals = tmp_path / "p.jsonl"
     proposals.write_text(
-        '{"ts": "2026-07-01T00:00:00", "action": "hold", "reasoning": "x"}\n',
+        _OPEN_MARKET_LINE.format(ts="2026-07-01T00:00:00", reasoning="x"),
         encoding="utf-8")
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
          patch("agentic_fx.backtest.cli.run_replay") as rr:
@@ -212,38 +243,82 @@ def test_cli_backtest_run_integration_writes_human_custom_row(tmp_path,
                                                                monkeypatch):
     """一時 root + 実 DB ファイル + 実 run_replay で human_custom 行を確認する。
 
-    期間は 2 時間 (~3.2ms/tick 実測、Task 9 照合済み)。履歴なしで取引 0 の
-    完走でよい (上書き節 F)。市場オープン時間帯 (conftest の H = 水曜 12:00
-    UTC) を使う。core_commit は実 git を避けて patch する。
+    期間は 2 時間 (~3.2ms/tick 実測、Task 9 照合済み)。市場オープン時間帯
+    (conftest の H = 水曜 12:00 UTC) を使う。core_commit は実 git を避けて
+    patch する。
 
-    提案ファイルは空にしない (2099 年の ts = 再生期間中は絶対消費されない)
-    — content_hash/plugin_ref が空バイト列のハッシュ (定数)
-    に固定化されてしまうと、定数化変異が偶然一致して SURVIVED になり得る。
+    Fix Round 1 F1 (sonnet I-1 — 自己変異 M-A SURVIVED の是正): 従来はこの
+    テストが履歴なし・2099 年 ts (再生期間中は絶対消費されない) だったため、
+    `intent_source=intent_source` を `intent_source=lambda _bar: None` に
+    差し替える変異が全テスト green のまま SURVIVED していた。これは
+    「人間が用意した提案が実際に run_replay 経由で executor まで届くこと」
+    という Task 11 の中核機能を証明していなかった。ここでは (1) 再生期間の
+    先頭 1 時間強を覆う 1m ohlcv を実 DB に事前 seed し、(2) 期間内の ts
+    (=H) を持つ有効な open (market) intent を proposal-file に置き、
+    (3) `run_replay` を実体呼び出しに委譲する spy で結果を捕捉して
+    `orders` テーブル相当の行が実際に生成されたことを assert する —
+    `metrics.trades` は closed のみを数えるため、2 時間程度の短い窓では
+    ポジションが閉じない可能性が高く指標として不適切 (レビュー指摘どおり、
+    `result.orders` の件数を直接見る)。
     """
     from tests.backtest.conftest import H
 
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
-    from agentic_fx.store.state import StateStore
     StateStore(tmp_path / "data" / "state" / "app_state.json").update(
         initialized=True)
 
+    # (1) 再生期間の先頭を覆う 1m ohlcv を実 DB に事前 seed する。
+    #     12:00-13:00 (61 本、フラット) — 13:01 tick での成行執行が使う
+    #     quote (13:00 の完成バー) までを覆う。test_runner.py の
+    #     `test_pending_execution_happens_after_tick_not_before` と同型。
+    hist_conn = connect(tmp_path / "data" / "agentic.db")
+    init_db(hist_conn)
+    from agentic_fx.store import ohlcv as ohlcv_store
+    rows = [
+        (
+            "USDJPY", "1m", (H + timedelta(minutes=i)).isoformat(),
+            148.5, 148.6, 148.4, 148.5, 10.0, 0.01,
+        )
+        for i in range(61)  # H (12:00) から 13:00 まで inclusive
+    ]
+    ohlcv_store.import_bars(hist_conn, rows, source="dukascopy")
+    hist_conn.close()
+
+    # (2) 期間内 (ts=H) の有効な open (market) 提案。フラット相場なので
+    #     SL/TP には触れず「open のまま」残る (closed にはならない —
+    #     metrics.trades では検出できないことの実演でもある)。
     proposals = tmp_path / "p.jsonl"
     proposals.write_text(
-        '{"ts": "2099-01-01T00:00:00+00:00", "action": "hold", '
-        '"reasoning": "never reached in this window"}\n',
+        _OPEN_MARKET_LINE.format(ts=H.isoformat(), reasoning="f1 integration"),
         encoding="utf-8")
 
     start = H
     end = H + timedelta(hours=2)
 
-    with patch("agentic_fx.store.backtest_runs.core_commit",
+    # (3) run_replay を実体へ委譲する spy — 実行経路は変えず、CLI が
+    #     受け取るのと同じ BacktestResult を横取りして orders を検証する。
+    captured: dict[str, object] = {}
+
+    def _spy_run_replay(*args, **kwargs):
+        result = runner_module.run_replay(*args, **kwargs)
+        captured["result"] = result
+        return result
+
+    with patch("agentic_fx.backtest.cli.run_replay",
+               side_effect=_spy_run_replay), \
+         patch("agentic_fx.store.backtest_runs.core_commit",
                return_value="deadbeef"):
         rc = main(["backtest", "run", "--symbol", "USDJPY",
                    "--source", "dukascopy",
                    "--from", start.isoformat(), "--to", end.isoformat(),
                    "--proposal-file", str(proposals)])
     assert rc == 0
+
+    # 提案が実際に intent_source 経由で消費され、executor まで届いたことの
+    # 実証 (intent_source が無効化されると orders は空になり、ここが落ちる)。
+    assert len(captured["result"].orders) >= 1
+    assert captured["result"].orders[0]["pair"] == "USDJPY"
 
     conn = connect(tmp_path / "data" / "agentic.db")
     rows = conn.execute("SELECT * FROM backtest_runs").fetchall()
@@ -255,7 +330,6 @@ def test_cli_backtest_run_integration_writes_human_custom_row(tmp_path,
     assert row["period_end"] == end.isoformat()
     assert row["pair"] == "USDJPY"
     assert row["core_commit"] == "deadbeef"
-    import hashlib
     assert row["content_hash"] == hashlib.sha256(
         proposals.read_bytes()).hexdigest()
     assert row["plugin_ref"] == str(proposals.resolve())
@@ -266,9 +340,11 @@ def test_load_proposals_sorts_ascending_and_strips_ts(tmp_path):
     を直接検証する — CLI 経由のテストは中身に触れないため。"""
     path = tmp_path / "p.jsonl"
     path.write_text(
-        '{"ts": "2026-07-22T13:00:00+00:00", "action": "hold", "reasoning": "second"}\n'
-        '\n'  # 空行は無視される
-        '{"ts": "2026-07-22T12:00:00+00:00", "action": "hold", "reasoning": "first"}\n',
+        _OPEN_MARKET_LINE.format(ts="2026-07-22T13:00:00+00:00",
+                                 reasoning="second")
+        + '\n'  # 空行は無視される
+        + _OPEN_MARKET_LINE.format(ts="2026-07-22T12:00:00+00:00",
+                                   reasoning="first"),
         encoding="utf-8")
     proposals = cli._load_proposals(path)
     assert [ts for ts, _ in proposals] == [
@@ -277,6 +353,47 @@ def test_load_proposals_sorts_ascending_and_strips_ts(tmp_path):
     assert [intent["reasoning"] for _, intent in proposals] == ["first", "second"]
     for _, intent in proposals:
         assert "ts" not in intent
+
+
+def test_load_proposals_rejects_non_open_action(tmp_path):
+    """Fix Round 1 F3 (裁定: 許容 action は open のみ)。"""
+    path = tmp_path / "p.jsonl"
+    path.write_text(
+        '{"ts": "2026-07-22T12:00:00+00:00", "action": "hold", '
+        '"reasoning": "x"}\n', encoding="utf-8")
+    with pytest.raises(ValueError):
+        cli._load_proposals(path)
+
+
+def test_load_proposals_rejects_malformed_open_intent_before_any_execution(
+        tmp_path, monkeypatch):
+    """Fix Round 1 F3 (sonnet I-4 = codex Important): intent 本体の形状不正
+    (必須キー欠落) は run_replay 実行前に検出される — 前半行が有効でも
+    後半行が不正なら何も実行しない (fail closed、部分実行しない)。"""
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    path = tmp_path / "p.jsonl"
+    path.write_text(
+        _OPEN_MARKET_LINE.format(ts="2026-07-22T12:00:00+00:00",
+                                 reasoning="valid line")
+        # 2 行目: stop_loss 欠落 (open の必須キー) — TradeIntent.from_llm_dict
+        # が IntentParseError (ValueError のサブクラス) を送出するはず
+        + '{"ts": "2026-07-22T13:00:00+00:00", "action": "open", '
+        '"pair": "USDJPY", "direction": "long", "entry_type": "market", '
+        '"horizon": "day", "reasoning": "missing stop_loss"}\n',
+        encoding="utf-8")
+    with pytest.raises(ValueError):
+        cli._load_proposals(path)
+
+    # dispatch 経由でも rc=1・run_replay は一度も呼ばれない (部分実行なし)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay") as rr:
+        rc = main(["backtest", "run", "--symbol", "USDJPY",
+                   "--source", "dukascopy",
+                   "--from", "2026-07-01", "--to", "2026-07-02",
+                   "--proposal-file", str(path)])
+    assert rc == 1
+    rr.assert_not_called()
 
 
 # ---- analyze corr --------------------------------------------------------
@@ -315,6 +432,82 @@ def test_cli_analyze_corr_passes_from_as_since_and_to_as_in_sample_until(
     assert kwargs["since"] == datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert kwargs["in_sample_until"] == datetime(2026, 6, 1,
                                                  tzinfo=timezone.utc)
+
+
+def test_cli_analyze_corr_does_not_write_to_analysis_runs_real_db(
+        tmp_path, monkeypatch, capsys):
+    """Fix Round 1 F4 (codex I2): mock `corr_matrix` では「analysis_runs に
+    保存しない」契約を実質検証できていなかった。実 DB + 実 `corr_matrix`
+    で `analysis_runs` が 0 行のままであることを直接ピンする。"""
+    import math
+
+    from agentic_fx.store import ohlcv as ohlcv_store
+
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    StateStore(tmp_path / "data" / "state" / "app_state.json").update(
+        initialized=True)
+
+    conn = connect(tmp_path / "data" / "agentic.db")
+    init_db(conn)
+    start = datetime(2026, 1, 5, 0, 0, tzinfo=timezone.utc)
+    rows_a, rows_b = [], []
+    for i in range(45):  # MIN_COMMON_OBS(30) を十分上回る決定的系列
+        t = (start + timedelta(hours=i)).isoformat()
+        va = 100 + math.sin(i / 5.0)
+        vb = 50 + math.sin(i / 5.0 + 0.3)
+        rows_a.append(("USDJPY", "1h", t, va, va + 0.05, va - 0.05, va, 1.0,
+                       0.01))
+        rows_b.append(("EURUSD", "1h", t, vb, vb + 0.05, vb - 0.05, vb, 1.0,
+                       0.01))
+    ohlcv_store.import_bars(conn, rows_a, source="dukascopy")
+    ohlcv_store.import_bars(conn, rows_b, source="dukascopy")
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM analysis_runs").fetchone()["n"] == 0
+    conn.close()
+
+    rc = main(["analyze", "corr", "--a", "USDJPY", "--b", "EURUSD",
+               "--timeframe", "1h", "--source", "dukascopy"])
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert out  # 相関値が実際に出力されている (mock ではなく実計算)
+
+    conn2 = connect(tmp_path / "data" / "agentic.db")
+    assert conn2.execute(
+        "SELECT COUNT(*) AS n FROM analysis_runs").fetchone()["n"] == 0
+
+
+def test_cli_analyze_corr_invalid_timeframe_returns_rc1_without_traceback(
+        tmp_path, monkeypatch, capsys):
+    """Fix Round 1 F6 (sonnet I-3): 統一エラー境界。列挙外 `--timeframe` は
+    `corr_matrix` 内部の `ValueError` (`_validate_timeframe`) を rc=1 に
+    変換し、生の traceback を出さない。"""
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        rc = main(["analyze", "corr", "--a", "USDJPY", "--b", "EURUSD",
+                   "--timeframe", "3m", "--source", "dukascopy"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+
+
+# ---- init 未完時の実ガード (上書き節 C / Fix Round 1 F5) -------------------
+
+
+def test_cli_history_coverage_requires_init(tmp_path, monkeypatch):
+    """Fix Round 1 F5 (codex I3): 全 CLI テストが `ensure_initialized` を
+    patch しているため、dispatch からその呼び出しを削除しても検出できな
+    かった。ここでは patch せず、init 未完 root からサブコマンドを 1 つ
+    呼んで実ガード (`SystemExit(2)`) を固定する。"""
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    # StateStore を initialized=True にしない — 未初期化のまま
+    with pytest.raises(SystemExit) as exc_info:
+        main(["history", "coverage", "--symbol", "USDJPY",
+              "--timeframe", "1h", "--source", "dukascopy",
+              "--from", "2026-07-01", "--to", "2026-07-02"])
+    assert exc_info.value.code == 2
 
 
 # ---- 既定サービス動作の不変性 (上書き節 A) --------------------------------
