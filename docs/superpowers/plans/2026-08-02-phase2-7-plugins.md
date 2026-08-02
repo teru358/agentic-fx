@@ -171,7 +171,7 @@ def test_intra_bucket_gap_aggregates_present_bars(tmp_path):
 
 - [ ] **Step 1: 失敗するテストを書く** — ①content_hash の手計算照合 ②1 バイト変更でハッシュ変化 ③正常 plugin → PluginMeta (pairs/timeframe/exit_mode/max_bars) ④exit_mode: evaluate reject ⑤**timeframe: 5m の strategy が D5 で reject (15m は受理される)** ⑥kind 列挙外 / evaluate 欠落 / pairs 空 / max_bars 0 → reject ⑦3 ファイル欠けは skip。フィクスチャは tmp_path 生成
 - [ ] **Step 2: 実装 → green**
-- [ ] **Step 3: サンプル 2 個** — `rsi_indicator` (indicator) / `sma_cross` (strategy, 1h, levels, pairs: [USDJPY], max_bars: 200)。docs/examples は discover 対象外
+- [ ] **Step 3: サンプル 2 個** — `rsi_indicator` (indicator) / `sma_cross` (strategy, 1h, levels, pairs: [USDJPY], max_bars: 200)。docs/examples は discover 対象外。**サンプルの docstring/コメントに plugin 作者 (LLM/人間) 向けの注意 2 点を必ず含める**: ①warmup — `len(df)` を自ら検査し不足なら hold を返す責務 (max_bars は上限であり保証長ではない) ②**1d のバケット境界は UTC 00:00 (epoch 錨) であり、FX の取引日境界 (NY 17:00 ロールオーバー) とは別物** — 分析・承認バックテスト・本番 producer は全て同じ epoch 錨なので plugin から見た一貫性は保たれるが、「NY 基準の日足」を期待したロジック (日次ロールオーバー跨ぎの判定等) は意図とずれる。NY 錨の日足が必要な設計は本プランでは不可 (`datafeed.bars.resample` が epoch 以外の錨を NotImplementedError で明示拒否する既存防御と整合)
 - [ ] **Step 4: Commit** — `git commit -m "feat: plugin 契約 + discovery + content_hash (spec 逐語の単一算出規則)"`
 
 ---
