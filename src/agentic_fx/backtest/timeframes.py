@@ -84,11 +84,17 @@ def load_resampled_frame(conn: sqlite3.Connection, symbol: str,
       since より前になり index フィルタで落ちる — opus R2 I2。codex R1 I6
       の floor 拡張は `index >= since` フィルタと打ち消し合うため採らない)。
     - ``max_bars``: 末尾 max_bars 本のみ返し、SQL 読み出しも
-      ``until - max_bars×tf×2`` (安全係数 2 — 1m 欠損を許容) までに制限する
-      (毎評価の全履歴読みを防ぐ — opus R2 I1/I9)。窓の下限がバケット境界に
-      乗らない場合、先頭バケットが部分集約になり得るが、安全係数 2 の余裕
-      の中で tail(max_bars) に生き残ることは完全欠損級のデータ穴が無い限り
-      ない。
+      ``floor_to_bucket(until - max_bars×tf×2, timeframe)`` (安全係数 2 —
+      1m 欠損を許容。かつバケット境界へ切り下げる — レビュー Fix Round 1
+      codex High F1) までに制限する (毎評価の全履歴読みを防ぐ — opus R2
+      I1/I9)。**窓下限をバケット境界へ揃えることで、読み出し窓に含まれる
+      先頭バケットが冒頭行を欠いたまま「部分集約」されることは構造的に
+      無くなる** (window_lower 自身がそのバケットの開始時刻と一致するため、
+      SQL の ``bar_time >= window_lower`` 下限カットはそのバケットの内側を
+      一切削らない)。F1 修正前は ``until - max_bars×tf×2`` がバケット境界に
+      非整列だと、先頭バケットの冒頭側の 1m 行が SQL の WHERE で除外され、
+      OHLC (特に open) が壊れた状態のまま ``tail(max_bars)`` に生き残り
+      得た (codex 再現例: tf=1h, until=H+5h30m, max_bars=2)。
     - バケット内の 1m 欠損は「在る分だけの集約」— runner の
       ``_aggregate_bucket``・§6「バー欠損を市場クローズとみなさない」と
       同一規則 (codex R1 I7)。
@@ -113,7 +119,12 @@ def load_resampled_frame(conn: sqlite3.Connection, symbol: str,
 
     lower: datetime | None = since_utc
     if max_bars is not None:
-        window_lower = until_utc - max_bars * width * 2
+        # F1 (レビュー Fix Round 1, codex High): 生の until - max_bars*幅*2
+        # はバケット境界に非整列になり得る。境界へ切り下げないと、先頭
+        # バケットの冒頭行が SQL の WHERE bar_time >= window_lower で削られ
+        # 「部分集約」のまま tail(max_bars) に生き残る (docstring 参照)。
+        window_lower = floor_to_bucket(until_utc - max_bars * width * 2,
+                                       timeframe)
         lower = window_lower if lower is None else max(lower, window_lower)
 
     q = ("SELECT bar_time, open, high, low, close, volume FROM ohlcv "

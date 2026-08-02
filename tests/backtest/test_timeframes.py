@@ -134,6 +134,63 @@ def test_max_bars_limits_result_and_sql_window(tmp_path):
                in s for s in seen_sql)  # SQL 窓の下限が実際に渡っている
 
 
+def test_max_bars_window_lower_is_bucket_aligned_no_partial_head(tmp_path):
+    """F1 (レビュー Fix Round 1, codex High): max_bars の SQL 読み出し窓下限
+    (``until - max_bars*width*2``) はバケット境界に非整列になり得る。境界
+    へ切り下げないと、先頭バケットの冒頭行が SQL の WHERE bar_time >=
+    window_lower で削られ「部分集約」のまま tail(max_bars) に生き残る
+    (codex 再現例: tf=1h, until=H+5h30m, max_bars=2)。
+
+    再現データ: [H+1h,H+2h) バケット内に窓境界 (H+90分) を跨ぐ 2 行
+    (H+65分・H+115分、open を大きく違えて識別可能にする)、[H+2h,H+4h) は
+    無データ (ギャップ)、[H+4h,H+5h) に 1 行。until=H+5h30m・max_bars=2 の
+    完成バケットは [H+1h,H+2h) と [H+4h,H+5h) の 2 本のみ。
+    """
+    conn = _conn(tmp_path)
+    rows = [
+        _row_at(H + timedelta(minutes=65), o=100, h=100.5, l=99.5, c=100),
+        _row_at(H + timedelta(minutes=115), o=200, h=200.5, l=199.5, c=200),
+        _row_at(H + timedelta(minutes=245), o=300, h=300.5, l=299.5, c=300),
+    ]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                              until=H + timedelta(hours=5, minutes=30),
+                              max_bars=2)
+    assert len(df) == 2
+    assert df.index[0].to_pydatetime() == H + timedelta(hours=1)
+    assert df.index[-1].to_pydatetime() == H + timedelta(hours=4)
+    # 先頭バケットの open は「バケット内で時系列最初の行」(H+65分,
+    # open=100) でなければならない。窓下限がバケット境界 (H+60分) へ切り
+    # 下げられず生の H+90分のままだと、H+65分の行が SQL で除外されて
+    # H+115分の行 (open=200) が誤って先頭行扱いされる。
+    assert df.iloc[0]["open"] == 100
+
+
+def test_max_bars_completeness_cut_precedes_tail_not_after(tmp_path):
+    """F3 (レビュー Fix Round 1, sonnet Important-2): 「完成カット → since
+    → tail」の順序が保たれていることを直接検証する — tail を完成カットより
+    先に適用する変異は既存テストでは検出できなかった。
+
+    tf=1h, until=H+5h30m (オフグリッド), max_bars=2, H〜H+5h30m に密な 1m
+    データ。正実装: 完成バケットは ...[H+3h,H+4h),[H+4h,H+5h) まで (末尾の
+    形成中バケット [H+5h,H+6h) は bucket_end=H+6h > until で除外) →
+    tail(2) = [H+3h, H+4h] (len 2)。tail 先行の変異: 生のリサンプル結果
+    (末尾は [H+5h,H+6h) の形成中バケットまで含む) から tail(2) を取ると
+    [H+4h, H+5h] になり、その後の完成カットで [H+5h,H+6h) 相当の行が落ち
+    len 1 だけが残る — len と index の両方で判別できる。
+    """
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
+            for i in range(330)]  # H 〜 H+5h30m、密な 1m データ
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                              until=H + timedelta(hours=5, minutes=30),
+                              max_bars=2)
+    assert len(df) == 2
+    assert df.index[0].to_pydatetime() == H + timedelta(hours=3)
+    assert df.index[-1].to_pydatetime() == H + timedelta(hours=4)
+
+
 def test_intra_bucket_gap_aggregates_present_bars(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)

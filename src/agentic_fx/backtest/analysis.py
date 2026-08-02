@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from agentic_fx.backtest.holdout import in_sample_until as _in_sample_until
-from agentic_fx.backtest.timeframes import load_resampled_frame
+from agentic_fx.backtest.timeframes import floor_to_bucket, load_resampled_frame
 from agentic_fx.config import Settings
 from agentic_fx.core.market_hours import is_market_open
 from agentic_fx.core.timeutil import as_utc
@@ -70,14 +70,23 @@ def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
     ``load_resampled_frame(...).close`` へ配線を切り替えた (分析面の生産者
     不在ブロッカー解消 — 本ブランチのインポータは 1m しか書かない)。
 
-    境界の対応関係: 旧実装は ``bar_time < in_sample_until`` (interval=
-    timeframe の行を直接読む) だった。新実装は「完成バケットのみ
-    (``bucket_end <= until``)」(``load_resampled_frame`` 契約)。timeframe
-    幅の格子上にある on-grid なバー列 (バケットにつき 1 本、境界時刻
-    ぴったりに置かれたデータ) では、この 2 条件は同値になる
-    (``bar_time < until`` ⟺ ``bar_time <= until - width`` ⟺
+    境界の対応関係 (レビュー Fix Round 1, sonnet Important-1 で訂正):
+    旧実装は ``bar_time < in_sample_until`` (interval=timeframe の行を
+    直接読む) だった。新実装は「完成バケットのみ (``bucket_end <=
+    until``)」(``load_resampled_frame`` 契約)。**``in_sample_until`` が
+    timeframe 幅の格子上にある (on-grid な) 場合に限り**この 2 条件は同値
+    になる (``bar_time < until`` ⟺ ``bar_time <= until - width`` ⟺
     ``bar_time + width <= until``。整数個のバー幅刻みでは端数が出ない)。
-    よって振る舞いは変わらない。
+
+    **``in_sample_until`` が格子に非整列 (オフグリッド) な場合は同値では
+    ない** — これが実運用の通常ケースであることに注意 (``holdout.
+    in_sample_until`` は分格子にしか揃わず、4h/1d/15m のようなより粗い
+    timeframe の格子には一般に整合しない)。この場合、新実装は「until
+    時点でまだ形成中の末尾バケット」を旧実装より 1 本多く落とす —
+    旧実装なら ``bar_time < until`` を満たしてしまっていたバー (バケット
+    の開始時刻は until より前だが、終了時刻は until を超える) が、新実装
+    では ``bucket_end <= until`` を満たさず除外される。これは意図した
+    先読み防止の強化 (fail closed 方向) であり、退行ではない。
 
     ``in_sample_until`` は ``load_resampled_frame`` の ``until`` (排他/
     完成バケットのみ) として渡す。
@@ -289,16 +298,30 @@ def coverage_report(conn: sqlite3.Connection, symbol: str, *, timeframe: str,
                     source: str, start: datetime, end: datetime) -> dict:
     """``{bars, expected_open_bars, gap_pct}``。
 
-    ``expected_open_bars`` = ``[start, end)`` を timeframe 幅で刻んだ各バー
-    始点のうち ``is_market_open(bar_start)`` が True の個数。``bars`` は
-    プラン 7 Task 0 で「同じ範囲に実在する ohlcv 行の総数 (COUNT(*))」から
-    「``load_resampled_frame(..., since=start, until=end)`` が返す完成
-    リサンプル・バケットの本数」へ切り替えた (本ブランチのインポータは
-    1m しか書かないため、旧 COUNT(*) は interval=timeframe (例: "1h") の
-    行を素通りで数えており、1m 化以降は常に 0 になっていた)。市場時間外に
-    紛れ込んだ行があれば ``gap_pct`` が負になり得るが、これはそれ自体
-    データ品質の異常信号なので人間 CLI 向けにそのまま見せる (隠さない判断
-    — この振る舞いは resample 切り替え後も変わらない)。
+    ``expected_open_bars`` は ``bars`` (``load_resampled_frame`` の epoch
+    錨バケット契約) と**同じバケット格子**で数える (レビュー Fix Round 1,
+    codex Medium F4): バケット開始 ``t`` を ``floor_to_bucket(start,
+    timeframe)`` から ``step`` (timeframe 幅) 刻みで進め、``t >= start``
+    かつ ``t + step <= end`` (= ``bucket_end <= end``) を満たすものだけを
+    候補にし、そのうち ``is_market_open(t)`` が True の個数を数える。
+    ``start``/``end`` が timeframe の格子に整列している入力では、この
+    走査は「``[start, end)`` を timeframe 幅で刻んだ各バー始点」を数える
+    旧実装と同じ結果になる。**非整列な ``start``/``end`` では旧実装は
+    ``load_resampled_frame`` (``since``/``until`` = ``bucket_start >=
+    since`` かつ ``bucket_end <= until`` の epoch 錨契約) と格子がずれ、
+    データが完全に揃っていても偽の欠損率を報告し得た** (例:
+    12:30〜14:30・1h では、実際に判定対象となるのは epoch 錨バケット
+    [13:00,14:00) の 1 本のみだが、旧実装は ``[12:30,14:30)`` を 1h ごとに
+    刻んで 2 本と数えていた)。
+
+    ``bars`` は プラン 7 Task 0 で「同じ範囲に実在する ohlcv 行の総数
+    (COUNT(*))」から「``load_resampled_frame(..., since=start, until=end)``
+    が返す完成リサンプル・バケットの本数」へ切り替えた (本ブランチの
+    インポータは 1m しか書かないため、旧 COUNT(*) は interval=timeframe
+    (例: "1h") の行を素通りで数えており、1m 化以降は常に 0 になっていた)。
+    市場時間外に紛れ込んだ行があれば ``gap_pct`` が負になり得るが、これは
+    それ自体データ品質の異常信号なので人間 CLI 向けにそのまま見せる
+    (隠さない判断 — この振る舞いは resample 切り替え後も変わらない)。
     ``expected_open_bars`` が 0 なら計算不能として ValueError (fail
     closed)。start/end は naive なら ValueError (watch 銘柄選定基準③ を
     人間が判定するための関数 — 改善ループには露出しないため §6 遮断の
@@ -315,9 +338,13 @@ def coverage_report(conn: sqlite3.Connection, symbol: str, *, timeframe: str,
     end_utc = as_utc(end)
     step = timedelta(minutes=_COVERAGE_TF_MINUTES[timeframe])
     expected_open_bars = 0
-    t = start_utc
-    while t < end_utc:
-        if is_market_open(t):
+    # F4 (レビュー Fix Round 1, codex Medium): actual (load_resampled_frame)
+    # と同じ epoch 錨バケット格子を歩く — start からではなく
+    # floor_to_bucket(start) から刻み、t>=start かつ t+step<=end (=
+    # bucket_end<=end) のバケットだけを候補にする。
+    t = floor_to_bucket(start_utc, timeframe)
+    while t + step <= end_utc:
+        if t >= start_utc and is_market_open(t):
             expected_open_bars += 1
         t += step
     if expected_open_bars == 0:

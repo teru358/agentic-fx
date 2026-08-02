@@ -317,6 +317,34 @@ def test_coverage_report_allows_1m(tmp_path):
     assert rep["gap_pct"] == 0.0
 
 
+def test_coverage_report_epoch_anchor_matches_actual_for_offgrid_bounds(
+        tmp_path):
+    """F4 (レビュー Fix Round 1, codex Medium): ``expected_open_bars`` は
+    ``bars`` (``load_resampled_frame`` の epoch 錨バケット契約) と同じ格子
+    で数えなければならない。``start``/``end`` が timeframe 格子に非整列
+    (オフグリッド) だと、旧実装 (``start`` から素朴に刻む) は実データと
+    異なる格子を数え、データが完全に揃っていても偽の欠損率を報告し得た。
+
+    start=H+30分 (12:30)・end=H+2h30分 (14:30)・timeframe=1h。epoch 錨の
+    バケット格子で ``bucket_start>=start`` かつ ``bucket_end<=end`` を
+    満たすのは [13:00,14:00) の 1 本のみ。旧実装は [12:30,14:30) を 1h
+    ごとに素朴に刻んで 2 本 (12:30・13:30 起点) と数えていたため、全データ
+    が揃っていても gap_pct が 50% と偽の欠損を報告していた。
+    """
+    conn = _conn(tmp_path)
+    start = H + timedelta(minutes=30)
+    end = H + timedelta(hours=2, minutes=30)
+    rows = [("USDJPY", "1m", (H + timedelta(minutes=i)).isoformat(),
+             100.0 + i, 100.5 + i, 99.5 + i, 100.0 + i, 1.0, 0.01)
+            for i in range(150)]  # H 〜 H+2h30分、密な 1m データ (欠損なし)
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    rep = coverage_report(conn, "USDJPY", timeframe="1h", source="dukascopy",
+                          start=start, end=end)
+    assert rep["expected_open_bars"] == 1
+    assert rep["bars"] == 1
+    assert rep["gap_pct"] == 0.0
+
+
 # --- 追加テスト (契約の細部・変異キラー) --------------------------------
 
 
@@ -486,6 +514,59 @@ def test_load_returns_excludes_gap_crossing_return(tmp_path):
     assert (gap_time + timedelta(hours=1)) not in returns
     # ギャップから離れたバーは通常どおりリターンが定義される
     assert (start + timedelta(hours=2)) in returns
+
+
+# --- レビュー Fix Round 1 (2026-08-02, codex + sonnet 並行レビュー) ------
+
+
+def test_load_returns_offgrid_until_drops_forming_bucket_4h(tmp_path):
+    """F2 (sonnet Important-1): 実運用の ``in_sample_until``
+    (``holdout.in_sample_until``) は分格子にしか揃わず、4h/1d/15m のような
+    粗い timeframe の格子には一般に非整合 (オフグリッド)。オフグリッド
+    until では旧実装 (``bar_time < until``) と新実装
+    (``bucket_end <= until``) が分岐する — 新実装は「until 時点で形成中の
+    末尾バケット」を追加で落とす (意図した先読み防止の強化)。
+
+    tf=4h・バケットにつき 1m 行 1 本 (H, H+4h, H+8h)。until=H+9h30分
+    (570分、4h=240分の倍数ではないオフグリッド) では [H+8h,H+12h) は
+    bucket_end=H+12h > until のため未確定 → 旧実装なら
+    bar_time=H+8h < until を満たし含まれてしまっていたが、新実装は除外する。
+    """
+    conn = _conn(tmp_path)
+    _series(conn, "USDJPY", [100.0, 101.0, 102.0], start=H, timeframe="4h")
+    offgrid_until = H + timedelta(hours=9, minutes=30)  # 570分、非 4h 倍数
+    returns = _load_returns(conn, "USDJPY", "4h", source="dukascopy",
+                            in_sample_until=offgrid_until)
+    assert (H + timedelta(hours=8)) not in returns  # 形成中バケットは不算入
+    assert (H + timedelta(hours=4)) in returns
+    assert returns[H + timedelta(hours=4)] == pytest.approx(math.log(101 / 100))
+
+
+def test_load_returns_uses_bucket_last_close_not_first_1m_row(tmp_path):
+    """F5 (codex Low, 採用): 1 バケットに 2 本以上の 1m 行がある場合の
+    フォーカステスト。既存フィクスチャはバケットにつき 1m 行 1 本のため、
+    「resample を素通りして 1m 行を上位足 close と誤読する」regression を
+    全 analysis テストが検出できなかった。バケット内 first/last の close を
+    大きく違えることで、リターンが**バケット最終 close** から計算される
+    ことを直接検証する (直読みなら異なる値になる)。
+    """
+    conn = _conn(tmp_path)
+    rows = [
+        ("USDJPY", "1m", H.isoformat(), 100, 100.5, 99.5, 100, 1.0, 0.01),
+        ("USDJPY", "1m", (H + timedelta(minutes=30)).isoformat(),
+         105, 110.5, 99.5, 110, 1.0, 0.01),
+        ("USDJPY", "1m", (H + timedelta(minutes=60)).isoformat(),
+         200, 200.5, 199.5, 200, 1.0, 0.01),
+        ("USDJPY", "1m", (H + timedelta(minutes=90)).isoformat(),
+         210, 222.5, 199.5, 222, 1.0, 0.01),
+    ]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    returns = _load_returns(conn, "USDJPY", "1h", source="dukascopy",
+                            in_sample_until=H + timedelta(hours=2))
+    # 正: [H,H+1h) の close はバケット最終行 (H+30分, close=110)、
+    # [H+1h,H+2h) の close はバケット最終行 (H+90分, close=222)。
+    # 直読み (先頭行 close=100/200 をそのまま使う) なら log(200/100) になる。
+    assert returns[H + timedelta(hours=1)] == pytest.approx(math.log(222 / 110))
 
 
 def test_module_enums_are_frozen_tuples():
