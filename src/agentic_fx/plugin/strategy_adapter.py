@@ -1,0 +1,166 @@
+"""strategy 評価アダプタ — plugin (`evaluate`) を `IntentSource` へ変換する
+(プラン 7 Task 5、設計書 §6)。
+
+`IntentSource = Callable[[Bar], dict | None]` (backtest/runner.py) は
+「評価 timeframe の確定バーを受け取り、LLM 出力と同形の intent dict (または
+提案なし = None) を返す」契約。本モジュールはこれを strategy kind の
+plugin (`evaluate(df, indicators, signals, params)`) で実装する。
+
+**発火条件 (コントローラ裁定)**: `closed_bar.ts + eval_tf 幅` が plugin
+宣言 timeframe のバケット境界 (epoch 錨、`timeframes.floor_to_bucket`) に
+一致する tick のみ評価する。eval_tf 幅は `closed_bar.interval` から
+`timeframes.TF_MINUTES` で導出する (`runner._aggregate_bucket` が
+`interval=eval_timeframe` を設定するため、アダプタ側に新引数を足さない —
+brief 明記)。`closed_bar.interval` が未知の timeframe なら `ValueError`
+(fail closed)。発火格子に乗らない tick は素通しで None を返す。
+
+**データ供給**: `load_resampled_frame(..., until=bucket_end,
+max_bars=meta.max_bars)` — until 排他でも完成判定は
+`bucket_end <= until` なので、ちょうど閉じた宣言 tf バケットは含まれる
+(Task 0 の契約)。df が空なら評価せず None を返す (発火格子に乗っていても
+データが無ければ評価しない — fail closed。source のタイプミスや履歴欠損を
+「hold の連続」に読み替えてしまわないための判断)。
+
+**セッション所有権 (コントローラ裁定)**: `session=None` (既定) では初回
+発火時に `PluginSession` を lazy 生成して保持し、`close()` で閉じる —
+バックテスト全体を通じて worker サブプロセス 1 個を使い回す
+(`sandbox.py` の設計方針そのもの)。`session` が注入された場合、`close()`
+はそれを閉じない (所有権は注入者にある — テストでの fake session 差し替え、
+将来の producer 等での外部管理セッション共有を壊さないため)。
+
+**SandboxError は捕まえず、呼び出し元へそのまま貫通させる** (fail closed —
+plugin の実行時エラーは「評価そのものの失敗」であり、hold へ読み替えたり
+run_replay を続行させたりしない)。
+"""
+from __future__ import annotations
+
+import sqlite3
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any, Protocol
+
+from agentic_fx.backtest.timeframes import (
+    TF_MINUTES, floor_to_bucket, load_resampled_frame,
+)
+from agentic_fx.core.contracts import Bar
+from agentic_fx.plugin.loader import PluginMeta
+from agentic_fx.plugin.sandbox import PluginSession
+
+if TYPE_CHECKING:
+    from agentic_fx.config import Settings
+
+
+class _SessionLike(Protocol):
+    """`session` 注入シームが満たすべき最小契約 (`PluginSession.call` と
+    同じ形)。fake session (テスト) はこれだけを実装すればよい — `close`/
+    `__enter__` は「アダプタが lazy 生成する場合」にだけ要求される
+    (`PluginSession` 自身が満たす)。"""
+
+    def call(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+
+class PluginStrategyIntentSource:
+    """strategy plugin を 1 pair 分の `IntentSource` として振る舞わせる
+    アダプタ (1 インスタンス = 1 pair — brief 明記)。`build_intent_source`
+    経由で構築する。"""
+
+    def __init__(self, meta: PluginMeta, *, conn: sqlite3.Connection,
+                pair: str, source: str, settings: "Settings",
+                session: _SessionLike | None = None) -> None:
+        self._meta = meta
+        self._conn = conn
+        self._pair = pair
+        self._source = source
+        self._settings = settings
+        self._session = session
+        # session を注入した呼び出し元がその所有者 (close の責務も持つ)。
+        # 既定 (None) はこのアダプタ自身が lazy 生成し、自分で閉じる。
+        self._owns_session = session is None
+        # 観測性用カウンタ (brief 上書き節 6): 発火格子に乗り、かつ df が
+        # 非空で実際に plugin を評価した回数。CLI はバックテスト完走後に
+        # これが 0 なら「plugin が一度も発火しなかった」警告を出せる。
+        self.eval_count = 0
+
+    def __call__(self, closed_bar: Bar) -> dict | None:
+        if closed_bar.interval not in TF_MINUTES:
+            raise ValueError(
+                f"unknown eval bar interval: {closed_bar.interval!r} "
+                f"(known: {sorted(TF_MINUTES)})")
+        width = timedelta(minutes=TF_MINUTES[closed_bar.interval])
+        bucket_end = closed_bar.ts + width
+        if floor_to_bucket(bucket_end, self._meta.timeframe) != bucket_end:
+            return None  # plugin 宣言 timeframe の境界に乗っていない tick
+
+        df = load_resampled_frame(
+            self._conn, self._pair, self._meta.timeframe, source=self._source,
+            until=bucket_end, max_bars=self._meta.max_bars)
+        if df.empty:
+            return None  # 発火格子に乗っていてもデータが無ければ評価しない
+
+        session = self._ensure_session()
+        self.eval_count += 1
+        result = session.call({
+            "df": df, "indicators": None, "signals": None,
+            "params": self._meta.params})
+        return _strategy_result_to_intent(result, self._pair)
+
+    def _ensure_session(self) -> _SessionLike:
+        if self._session is None:
+            session = PluginSession(self._meta, settings=self._settings.plugin)
+            session.__enter__()
+            self._session = session
+        return self._session
+
+    def close(self) -> None:
+        """自分が生成したセッションのみ閉じる (注入されたセッションは
+        呼び出し元の所有物 — close しない。コントローラ裁定)。"""
+        if self._owns_session and self._session is not None:
+            self._session.close()
+            self._session = None
+
+
+def build_intent_source(meta: PluginMeta, *, conn: sqlite3.Connection,
+                        pair: str, source: str, settings: "Settings",
+                        session: _SessionLike | None = None,
+                        ) -> PluginStrategyIntentSource:
+    """`meta` (kind="strategy") から `pair` 用の `IntentSource` を組み立てる。
+
+    呼び出し元 (CLI 等) は `run_replay` 実行後、必ず `close()` を呼ぶこと
+    (try/finally — brief 明記。サンドボックスプロセスのリーク防止)。
+    """
+    return PluginStrategyIntentSource(
+        meta, conn=conn, pair=pair, source=source, settings=settings,
+        session=session)
+
+
+def _strategy_result_to_intent(result: dict[str, Any], pair: str) -> dict | None:
+    """`sandbox._validate_strategy_result` が返す検証済み dict
+    (`{"action", "rationale", "direction", "entry_type", "limit_price",
+    "stop_loss", "take_profit"}`) を LLM 出力と同形の intent dict へ写像
+    する。action="hold" は None。
+
+    `take_profit`: `None` なら省略する (コントローラ裁定 —
+    `TradeIntent.from_llm_dict` は `d.get("take_profit")` で読むため、
+    キー自体を省略しても値 `None` を明示的に含めても同値。省略側を選ぶ)。
+    `limit_price`/`expires_in` は `entry_type == "limit"` のときのみ含める
+    (brief 逐語)。`expires_in` は固定 "4h"。`confidence` は固定 0.5
+    (brief 逐語 — plugin は確信度を返さない語彙のため)。
+    """
+    if result["action"] == "hold":
+        return None
+
+    intent: dict[str, Any] = {
+        "action": "open",
+        "pair": pair,
+        "direction": result["direction"],
+        "entry_type": result["entry_type"],
+        "horizon": "day",
+        "stop_loss": result["stop_loss"],
+        "confidence": 0.5,
+        "reasoning": result["rationale"],
+    }
+    if result["take_profit"] is not None:
+        intent["take_profit"] = result["take_profit"]
+    if result["entry_type"] == "limit":
+        intent["limit_price"] = result["limit_price"]
+        intent["expires_in"] = "4h"
+    return intent

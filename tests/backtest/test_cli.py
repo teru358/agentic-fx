@@ -268,6 +268,187 @@ def test_proposal_intent_source_consumes_oldest_first_one_per_bar():
     assert src(bar_at_t1) == {"a": 2}
 
 
+# ---- backtest run --plugin (プラン 7 Task 5 — --proposal-file と相互排他) ---
+
+
+def _write_strategy_plugin(plugins_dir: Path, name: str, *, pairs: list[str],
+                           timeframe: str = "1h",
+                           plugin_body: str | None = None) -> Path:
+    """discover/check_source を通る最小限の strategy plugin フォルダを作る。"""
+    d = plugins_dir / name
+    d.mkdir(parents=True)
+    (d / "plugin.py").write_text(plugin_body or (
+        "def evaluate(df, indicators, signals, params):\n"
+        '    return {"action": "hold", "rationale": "noop"}\n'))
+    pairs_yaml = "[" + ", ".join(pairs) + "]"
+    (d / "config.yaml").write_text(
+        f"kind: strategy\ntimeframe: {timeframe}\npairs: {pairs_yaml}\n"
+        "exit_mode: levels\nmax_bars: 200\n")
+    (d / "test_plugin.py").write_text("def test_placeholder():\n    pass\n")
+    return d
+
+
+def test_cli_backtest_run_requires_plugin_xor_proposal_file():
+    """opus R2 M6: --proposal-file の required=True を解除し、--plugin との
+    相互排他 (どちらか一方必須) にする — どちらも指定しないと argparse が
+    SystemExit(2) で弾く (dispatch にすら到達しない)。"""
+    with pytest.raises(SystemExit) as exc_info:
+        main(["backtest", "run", "--symbol", "USDJPY", "--source", "dukascopy",
+             "--from", "2026-07-01", "--to", "2026-07-02"])
+    assert exc_info.value.code == 2
+
+
+def test_cli_backtest_run_rejects_both_plugin_and_proposal_file():
+    with pytest.raises(SystemExit) as exc_info:
+        main(["backtest", "run", "--symbol", "USDJPY", "--source", "dukascopy",
+             "--from", "2026-07-01", "--to", "2026-07-02",
+             "--proposal-file", "p.jsonl", "--plugin", "strat"])
+    assert exc_info.value.code == 2
+
+
+def test_cli_backtest_run_plugin_records_strategy_scope(tmp_path, monkeypatch,
+                                                          capsys):
+    """`--plugin` 経路は discover → check_source (承認は要求しない) →
+    pairs 照合 → `save_human_run(plugin_ref=..., content_hash=meta.content_hash,
+    kind="strategy")`。run_replay を mock しているので intent_source は
+    一度も発火せず (eval_count=0)、stderr に警告が出ることも併せて確認する。
+    """
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as real_content_hash
+    from agentic_fx.store import ohlcv as ohlcv_store
+    plugin_dir = _write_strategy_plugin(tmp_path / "plugins", "strat",
+                                        pairs=["USDJPY"])
+    seed_conn = connect(tmp_path / "data" / "agentic.db")
+    init_db(seed_conn)
+    ohlcv_store.import_bars(
+        seed_conn, [("USDJPY", "1m", "2026-07-01T00:00:00+00:00",
+                    148.0, 148.2, 147.9, 148.1, 10.0, 0.01)],
+        source="dukascopy")
+    seed_conn.close()
+    fake_result = BacktestResult(
+        orders=[], equity_curve=[("2026-07-01T00:00:00+00:00", 1_000_000.0)],
+        start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        source="dukascopy", fallback_spread_used=False)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay") as rr, \
+         patch("agentic_fx.backtest.cli.backtest_runs") as br:
+        rr.return_value = fake_result
+        br.save_human_run.return_value = 1
+        br.settings_snapshot_hash.side_effect = \
+            backtest_runs_real.settings_snapshot_hash
+        br.core_commit.return_value = "deadbeef"
+        rc = main(["backtest", "run", "--symbol", "USDJPY",
+                   "--source", "dukascopy",
+                   "--from", "2026-07-01", "--to", "2026-07-02",
+                   "--plugin", "strat"])
+    assert rc == 0
+    assert br.save_human_run.called
+    _, kwargs = br.save_human_run.call_args
+    assert kwargs["plugin_ref"] == "plugins/strat"
+    assert kwargs["content_hash"] == real_content_hash(plugin_dir)
+    assert kwargs["kind"] == "strategy"
+    assert kwargs["pair"] == "USDJPY"
+    assert kwargs["timeframe"] == "1h"
+    assert kwargs["source"] == "dukascopy"
+    err = capsys.readouterr().err
+    assert "警告" in err  # eval_count=0 (run_replay を mock している) の観測性警告
+
+
+def test_cli_backtest_run_plugin_not_found_rc1(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    (tmp_path / "plugins").mkdir()
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay") as rr, \
+         patch("agentic_fx.backtest.cli.backtest_runs") as br:
+        rc = main(["backtest", "run", "--symbol", "USDJPY",
+                   "--source", "dukascopy",
+                   "--from", "2026-07-01", "--to", "2026-07-02",
+                   "--plugin", "does-not-exist"])
+    assert rc == 1
+    rr.assert_not_called()
+    br.save_human_run.assert_not_called()
+
+
+def test_cli_backtest_run_plugin_missing_plugins_dir_rc1(tmp_path, monkeypatch):
+    """plugins/ フォルダ自体が無い場合も discover の FileNotFoundError で
+    クラッシュせず rc=1 (loader.discover は存在確認を呼び出し元に要求する
+    契約 — CLI 側で先に .is_dir() を見る)。"""
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay") as rr, \
+         patch("agentic_fx.backtest.cli.backtest_runs") as br:
+        rc = main(["backtest", "run", "--symbol", "USDJPY",
+                   "--source", "dukascopy",
+                   "--from", "2026-07-01", "--to", "2026-07-02",
+                   "--plugin", "strat"])
+    assert rc == 1
+    rr.assert_not_called()
+    br.save_human_run.assert_not_called()
+
+
+def test_cli_backtest_run_plugin_symbol_not_in_pairs_rc1(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    _write_strategy_plugin(tmp_path / "plugins", "strat", pairs=["EURUSD"])
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay") as rr, \
+         patch("agentic_fx.backtest.cli.backtest_runs") as br:
+        rc = main(["backtest", "run", "--symbol", "USDJPY",
+                   "--source", "dukascopy",
+                   "--from", "2026-07-01", "--to", "2026-07-02",
+                   "--plugin", "strat"])
+    assert rc == 1
+    rr.assert_not_called()
+    br.save_human_run.assert_not_called()
+
+
+def test_cli_backtest_run_plugin_check_source_rejects_rc1(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    _write_strategy_plugin(
+        tmp_path / "plugins", "strat", pairs=["USDJPY"],
+        plugin_body=(
+            "import os\n"
+            "def evaluate(df, indicators, signals, params):\n"
+            '    return {"action": "hold", "rationale": "noop"}\n'))
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay") as rr, \
+         patch("agentic_fx.backtest.cli.backtest_runs") as br:
+        rc = main(["backtest", "run", "--symbol", "USDJPY",
+                   "--source", "dukascopy",
+                   "--from", "2026-07-01", "--to", "2026-07-02",
+                   "--plugin", "strat"])
+    assert rc == 1
+    rr.assert_not_called()
+    br.save_human_run.assert_not_called()
+
+
+def test_cli_backtest_run_plugin_kind_mismatch_rc1(tmp_path, monkeypatch):
+    """kind=indicator の plugin を --plugin に指定した場合も rc=1 (strategy
+    以外の kind は strategy_adapter の契約と合わない — fail closed)。"""
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    d = tmp_path / "plugins" / "ind"
+    d.mkdir(parents=True)
+    (d / "plugin.py").write_text("def compute(df, params):\n    return {}\n")
+    (d / "config.yaml").write_text("kind: indicator\n")
+    (d / "test_plugin.py").write_text("def test_placeholder():\n    pass\n")
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay") as rr, \
+         patch("agentic_fx.backtest.cli.backtest_runs") as br:
+        rc = main(["backtest", "run", "--symbol", "USDJPY",
+                   "--source", "dukascopy",
+                   "--from", "2026-07-01", "--to", "2026-07-02",
+                   "--plugin", "ind"])
+    assert rc == 1
+    rr.assert_not_called()
+    br.save_human_run.assert_not_called()
+
+
 # ---- backtest run (統合版 — 実 DB・実 run_replay。上書き節 F 逐語) ---------
 
 

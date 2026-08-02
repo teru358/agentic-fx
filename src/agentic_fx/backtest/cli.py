@@ -25,6 +25,9 @@ from agentic_fx.backtest.mt5_import import compare_sources, import_mt5
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
+from agentic_fx.plugin import loader as plugin_loader
+from agentic_fx.plugin import sandbox as plugin_sandbox
+from agentic_fx.plugin import strategy_adapter
 from agentic_fx.service import ensure_initialized
 from agentic_fx.store import backtest_runs
 from agentic_fx.store.db import connect, init_db
@@ -74,7 +77,14 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     run.add_argument("--source", required=True)
     run.add_argument("--from", dest="from_", type=_parse_date, required=True)
     run.add_argument("--to", dest="to", type=_parse_date, required=True)
-    run.add_argument("--proposal-file", required=True)
+    # opus R2 M6: --proposal-file (既存の JSONL 提案列経路) と --plugin
+    # (プラン 7 — strategy plugin を IntentSource として評価する経路) は
+    # 相互排他 (どちらか一方が必須)。既存の proposal 経路の動作・保存契約
+    # (kind="proposals") は変えない。
+    source_group = run.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--proposal-file")
+    source_group.add_argument("--plugin", help="評価する strategy plugin の名前 "
+                              "(<cwd>/plugins/<name>/)")
     run.add_argument("--timeframe", default="1h")
 
     analyze = sub.add_parser("analyze", help="履歴分析")
@@ -186,7 +196,8 @@ def _load_proposals(path: Path) -> list[tuple[datetime, dict]]:
 
 class _ProposalIntentSource:
     """JSONL 提案列を ``IntentSource`` (Bar -> dict | None) に変換する薄い
-    アダプタ (プラン 7 で ``--plugin`` に置き換わる — 上書き節 F)。
+    アダプタ (プラン 7 Task 5 で ``--plugin`` 経路が追加されたが、置き換え
+    ではなく相互排他で共存する — コントローラ裁定)。
 
     ``closed_bar.ts >= ts`` の最古の未消費提案を 1 件返す。1 呼び出し
     (1 バー) で 1 件のみ消費し、残りは次バー以降に持ち越す。この「1 バー
@@ -209,7 +220,29 @@ class _ProposalIntentSource:
         return None
 
 
-def _backtest_run(conn, settings, args: argparse.Namespace) -> int:
+def _empty_history_guard(conn, args: argparse.Namespace) -> bool:
+    """F4 (最終レビュー opus I-4): 対象 source/期間に 1m 履歴が 0 行なら
+    run_replay を呼ばずに fail closed する。run_replay 自体は空バー窓
+    (市場クローズ期間等) の再生を前提にした既存テストと衝突しないよう
+    変更しない (裁定) — CLI 側で先に検査する。0 行のまま黙って完走すると
+    正常系と見分けのつかない human_custom 行が残る (--source のタイプミス
+    等を検出できない)。真偽値で「履歴あり (続行可)」を返す — 無ければ
+    ここで診断メッセージを出す。
+    """
+    n_bars = conn.execute(
+        "SELECT COUNT(*) FROM ohlcv WHERE symbol=? AND interval='1m' "
+        "AND source=? AND bar_time >= ? AND bar_time < ?",
+        (args.symbol, args.source, args.from_.isoformat(),
+         args.to.isoformat())).fetchone()[0]
+    if n_bars == 0:
+        print(f"エラー: symbol={args.symbol} source={args.source} の指定期間に "
+             "1m 履歴が 0 件です (source のタイプミスや未インポート期間の "
+             "可能性があります)", file=sys.stderr)
+        return False
+    return True
+
+
+def _backtest_run_proposal(conn, settings, args: argparse.Namespace) -> int:
     proposal_path = Path(args.proposal_file).resolve()
     try:
         proposals = _load_proposals(proposal_path)
@@ -220,21 +253,7 @@ def _backtest_run(conn, settings, args: argparse.Namespace) -> int:
     intent_source = _ProposalIntentSource(proposals)
     content_hash = hashlib.sha256(proposal_path.read_bytes()).hexdigest()
 
-    # F4 (最終レビュー opus I-4): 対象 source/期間に 1m 履歴が 0 行なら
-    # run_replay を呼ばずに fail closed する。run_replay 自体は空バー窓
-    # (市場クローズ期間等) の再生を前提にした既存テストと衝突しないよう
-    # 変更しない (裁定) — CLI 側で先に検査する。0 行のまま黙って完走すると
-    # 正常系と見分けのつかない human_custom 行が残る (--source のタイプミス
-    # 等を検出できない)。
-    n_bars = conn.execute(
-        "SELECT COUNT(*) FROM ohlcv WHERE symbol=? AND interval='1m' "
-        "AND source=? AND bar_time >= ? AND bar_time < ?",
-        (args.symbol, args.source, args.from_.isoformat(),
-         args.to.isoformat())).fetchone()[0]
-    if n_bars == 0:
-        print(f"エラー: symbol={args.symbol} source={args.source} の指定期間に "
-             "1m 履歴が 0 件です (source のタイプミスや未インポート期間の "
-             "可能性があります)", file=sys.stderr)
+    if not _empty_history_guard(conn, args):
         return 1
 
     result = run_replay(settings, symbol=args.symbol, source=args.source,
@@ -253,6 +272,81 @@ def _backtest_run(conn, settings, args: argparse.Namespace) -> int:
     print(f"backtest run id={run_id}")
     print(metrics)
     return 0
+
+
+def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
+                         root: Path) -> int:
+    """`--plugin <name>` 経路 (プラン 7 Task 5)。discover + check_source は
+    通す (承認 (approval_requests) は要求しない — 手元評価は承認前が自然)。
+    plugins_dir 規約はアプリ全体で確立済みの ``root / "plugins"``
+    (= 実行時の ``Path.cwd()``、service.py の承認済み plugin ロードと同じ)。
+    """
+    plugins_dir = root / "plugins"
+    metas = plugin_loader.discover(plugins_dir) if plugins_dir.is_dir() else []
+    meta = next((m for m in metas if m.name == args.plugin), None)
+    if meta is None:
+        print(f"エラー: plugin '{args.plugin}' が {plugins_dir} に見つかりません "
+             "(discover で検出できる 3 ファイル構成か確認してください)",
+             file=sys.stderr)
+        return 1
+    if meta.kind != "strategy":
+        print(f"エラー: plugin '{args.plugin}' の kind は {meta.kind!r} です "
+             "(backtest run --plugin は kind=strategy のみ対応)",
+             file=sys.stderr)
+        return 1
+    if args.symbol not in meta.pairs:
+        print(f"エラー: plugin '{args.plugin}' は symbol={args.symbol!r} を "
+             f"宣言していません (pairs={meta.pairs})", file=sys.stderr)
+        return 1
+    try:
+        plugin_sandbox.check_source(meta.path / "plugin.py")
+    except plugin_sandbox.SandboxError as e:
+        print(f"エラー: plugin '{args.plugin}' は sandbox 検査を通りません: {e}",
+             file=sys.stderr)
+        return 1
+
+    if not _empty_history_guard(conn, args):
+        return 1
+
+    intent_source = strategy_adapter.build_intent_source(
+        meta, conn=conn, pair=args.symbol, source=args.source,
+        settings=settings)
+    try:
+        # SandboxError (plugin 実行時のクラッシュ・timeout・戻り値スキーマ
+        # 不正) はここで捕まえず貫通させる (strategy_adapter の fail closed
+        # 契約どおり — human_custom 行は残さず、raw traceback で異常終了)。
+        result = run_replay(settings, symbol=args.symbol, source=args.source,
+                            start=args.from_, end=args.to,
+                            intent_source=intent_source,
+                            eval_timeframe=args.timeframe, history_conn=conn)
+    finally:
+        # 上書き節 3: run_replay が例外で終わってもサンドボックスプロセス
+        # をリークさせない。
+        intent_source.close()
+
+    if intent_source.eval_count == 0:
+        print("警告: plugin の評価が 1 回も発火しませんでした "
+             "(宣言 timeframe・期間・データ範囲を確認してください)",
+             file=sys.stderr)
+
+    metrics = compute_metrics(result)
+    run_id = backtest_runs.save_human_run(
+        conn, plugin_ref=f"plugins/{meta.name}", content_hash=meta.content_hash,
+        kind="strategy", pair=args.symbol, timeframe=args.timeframe,
+        source=args.source, period=(args.from_, args.to), metrics=metrics,
+        settings_hash=backtest_runs.settings_snapshot_hash(settings),
+        core_commit=backtest_runs.core_commit(),
+        initial_balance=settings.backtest.initial_balance,
+        now=datetime.now(timezone.utc))
+    print(f"backtest run id={run_id}")
+    print(metrics)
+    return 0
+
+
+def _backtest_run(conn, settings, args: argparse.Namespace, root: Path) -> int:
+    if args.plugin is not None:
+        return _backtest_run_plugin(conn, settings, args, root)
+    return _backtest_run_proposal(conn, settings, args)
 
 
 # ---- analyze corr -----------------------------------------------------------
@@ -288,7 +382,7 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
                 return _history_compare(conn, settings, args)
             return _history_coverage(conn, args)
         if args.command == "backtest":
-            return _backtest_run(conn, settings, args)
+            return _backtest_run(conn, settings, args, root)
         return _analyze_corr(conn, args)
     except (ValueError, KeyError, OSError) as e:
         print(f"エラー: {e}", file=sys.stderr)
