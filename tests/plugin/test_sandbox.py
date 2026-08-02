@@ -16,7 +16,7 @@ from agentic_fx.config import load_settings
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.sandbox import (
     SandboxError, check_source, run_plugin, _build_env, _SINGLE_THREAD_ENV,
-    PluginSession,
+    _reader_worker, PluginSession,
 )
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
@@ -213,6 +213,103 @@ def test_check_source_extra_allowed_permits_additional_root(tmp_path):
     check_source(src, extra_allowed=frozenset({"pytest", "plugin"}))
 
 
+# --- レビュー fix round 1 F1: from-import / 裸 Name のバイパス封鎖 --------
+
+def test_check_source_rejects_from_import_read_csv(tmp_path):
+    src = tmp_path / "bad.py"
+    src.write_text(
+        "from pandas import read_csv\n"
+        "def compute(df, params):\n    return {}\n")
+    with pytest.raises(SandboxError, match="read_csv"):
+        check_source(src)
+
+
+def test_check_source_rejects_from_import_read_csv_with_asname(tmp_path):
+    """`asname` で別名を付けても import 元の名前 (alias.name) で判定する
+    ため回避できない。"""
+    src = tmp_path / "bad.py"
+    src.write_text(
+        "from pandas import read_csv as rc\n"
+        "def compute(df, params):\n    return {}\n")
+    with pytest.raises(SandboxError, match="read_csv"):
+        check_source(src)
+
+
+def test_check_source_rejects_bare_read_csv_reference(tmp_path):
+    """import 文自体を素通りさせても (仮に), from-import で束縛された
+    裸の名前への参照そのものが `ast.Name` 検査で拒否される。"""
+    src = tmp_path / "bad.py"
+    src.write_text(
+        "def compute(df, params):\n"
+        "    fn = read_csv\n"
+        "    return {}\n")
+    with pytest.raises(SandboxError, match="read_csv"):
+        check_source(src)
+
+
+def test_check_source_rejects_from_numpy_import_load(tmp_path):
+    src = tmp_path / "bad.py"
+    src.write_text(
+        "from numpy import load\n"
+        "def compute(df, params):\n    return {}\n")
+    with pytest.raises(SandboxError, match="load"):
+        check_source(src)
+
+
+def test_check_source_rejects_function_named_with_denied_prefix(tmp_path):
+    """plugin 自身が `read_xxx`/`to_xxx` (許可 4 種を除く) という名前の
+    関数を定義するのも fail closed で拒否する — `ast.Attribute` を経由
+    しない直接呼び出しでの denylist 回避を防ぐ。"""
+    src = tmp_path / "bad.py"
+    src.write_text(
+        "def read_secret_file():\n    pass\n"
+        "def compute(df, params):\n    return {}\n")
+    with pytest.raises(SandboxError, match="read_secret_file"):
+        check_source(src)
+
+
+def test_check_source_allows_from_import_of_to_numpy_allowed_name(tmp_path):
+    """`to_numpy` は許可 4 種の 1 つ — from-import で持ち込んでも拒否
+    されないことのピン (実在の pandas API では無い名前だが、
+    `check_source` は AST のみを見て実行はしないため合成できる)。"""
+    src = tmp_path / "ok.py"
+    src.write_text(
+        "from pandas import to_numpy\n"
+        "def compute(df, params):\n    return {}\n")
+    check_source(src)  # 例外を投げなければ OK
+
+
+# --- レビュー fix round 1 F4: ExcelWriter/HDFStore/dump denylist 補完 ----
+
+def test_check_source_rejects_pd_excel_writer_attribute(tmp_path):
+    src = tmp_path / "bad.py"
+    src.write_text(
+        "import pandas as pd\n"
+        "def compute(df, params):\n    pd.ExcelWriter('x.xlsx')\n    return {}\n")
+    with pytest.raises(SandboxError, match="ExcelWriter"):
+        check_source(src)
+
+
+def test_check_source_rejects_pd_hdf_store_attribute(tmp_path):
+    src = tmp_path / "bad.py"
+    src.write_text(
+        "import pandas as pd\n"
+        "def compute(df, params):\n    pd.HDFStore('x.h5')\n    return {}\n")
+    with pytest.raises(SandboxError, match="HDFStore"):
+        check_source(src)
+
+
+def test_check_source_rejects_ndarray_dump(tmp_path):
+    src = tmp_path / "bad.py"
+    src.write_text(
+        "def compute(df, params):\n"
+        "    arr = df['close'].to_numpy()\n"
+        "    arr.dump('x')\n"
+        "    return {}\n")
+    with pytest.raises(SandboxError, match="dump"):
+        check_source(src)
+
+
 # --- env builder (⑨: AFX_* 非伝播) --------------------------------------
 
 def test_build_env_minimal_and_no_afx_propagation():
@@ -263,6 +360,34 @@ def test_session_reuses_same_worker_process_across_calls(tmp_path, plugin_settin
     assert pid_1 == pid_2
 
 
+# --- レビュー fix round 1 F5: シリアライズ失敗の契約・timeout_sec 検証 ---
+
+class _Unserializable:
+    """json.dumps できない型のスタンドイン (numpy スカラー等の代役)。"""
+
+
+def test_call_with_unserializable_params_raises_sandbox_error_session_survives(
+        tmp_path, plugin_settings):
+    meta = _meta(tmp_path, "ind", "indicator", INDICATOR_OK_PY)
+    with PluginSession(meta, settings=plugin_settings) as session:
+        with pytest.raises(SandboxError, match="serialize"):
+            session.call({"df": _df(), "params": {"bad": _Unserializable()}})
+        # F5: シリアライズ失敗は書き込み前に起きるためセッションは継続可能
+        # (timeout/oversize/EOF とは異なり session を破棄しない)。
+        out = session.call({"df": _df(), "params": {}})
+        assert out["mean_close"] == pytest.approx(_df()["close"].mean())
+
+
+def test_run_plugin_rejects_non_positive_timeout_sec(tmp_path, plugin_settings):
+    meta = _meta(tmp_path, "ind", "indicator", INDICATOR_OK_PY)
+    with pytest.raises(SandboxError, match="timeout_sec"):
+        run_plugin(meta, {"df": _df(), "params": {}}, timeout_sec=0,
+                  settings=plugin_settings)
+    with pytest.raises(SandboxError, match="timeout_sec"):
+        run_plugin(meta, {"df": _df(), "params": {}}, timeout_sec=-1.0,
+                  settings=plugin_settings)
+
+
 # --- ③④⑤ (check_source を通した実行経路: run_plugin も reject する) ------
 
 def test_run_plugin_rejects_disallowed_import_before_spawning(tmp_path, plugin_settings):
@@ -275,17 +400,42 @@ def test_run_plugin_rejects_disallowed_import_before_spawning(tmp_path, plugin_s
 # --- ⑥ 無限ループ → timeout 1s で SandboxError (実測上限 1 秒。唯一の実 sleep) ---
 
 def test_infinite_loop_times_out_within_one_second(tmp_path, plugin_settings):
+    import os
     import time
 
     meta = _meta(tmp_path, "loop", "indicator", INFINITE_LOOP_PY)
-    tight = plugin_settings.model_copy(update={"sandbox_timeout_sec": 1.0})
+    # `sandbox_session_cpu_sec` も併せて絞る: `_kill()` が壊れた場合の
+    # 保険 (万一 killpg が効かなくても RLIMIT_CPU の SIGXCPU で worker が
+    # 自滅し、`close()` の `proc.stdout.close()` がブロックし続ける最悪
+    # ケースの上限を既定 60s から 10s に縮める — レビュー fix round 1 F3
+    # の変異注入で実際にこの経路 (60s 張り付き) を踏んだ実測に基づく)。
+    tight = plugin_settings.model_copy(
+        update={"sandbox_timeout_sec": 1.0, "sandbox_session_cpu_sec": 10})
     session = PluginSession(meta, settings=tight)
     with session:
+        pid = session.pid
         start = time.monotonic()
         with pytest.raises(SandboxError, match="timed out"):
             session.call({"df": _df(), "params": {}})
         elapsed = time.monotonic() - start
         assert elapsed < 2.0  # 実測上限 1 秒 + 若干のプロセス kill 猶予
+
+        # レビュー fix round 1 F3: `_kill()` を no-op に劣化させる変異が
+        # 全テスト生存していた (timeout の判定はタイミングと `_dead`
+        # フラグしか見ていなかった) — worker の OS プロセスが実際に
+        # 死んでいることを直接確認する。`_kill()` 内で既に
+        # `proc.wait(timeout=5)` 済みのはずなので通常は即座に
+        # ProcessLookupError になる (ポーリングは念のための上限)。
+        assert pid is not None
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except (ProcessLookupError, PermissionError):
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail(f"worker pid {pid} still alive {2.0}s after kill")
 
         # session-dead-after-timeout: セッションは以後使用不能
         with pytest.raises(SandboxError, match="not usable"):
@@ -305,6 +455,55 @@ def test_oversize_output_marks_session_dead(tmp_path, plugin_settings):
             session.call({"df": _df(), "params": {}})
 
 
+# --- レビュー fix round 1 F7: _reader_worker の境界ピン (実プロセス無し) --
+
+class _FakeStream:
+    """`.read1(n)` だけを実装する最小限のフェイク stdout。事前に用意した
+    チャンク列を順に返す (実プロセス無しで境界の意味論を決定的に検証)。"""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    def read1(self, _n: int) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+def test_reader_worker_accepts_exact_boundary_size():
+    import queue as queue_module
+
+    content = b'{"ok": true, "x": 1}'
+    line = content + b"\n"
+
+    q = queue_module.Queue()
+    _reader_worker(_FakeStream([line]), len(line), q)  # ちょうど境界: 受理
+    kind, payload = q.get_nowait()
+    assert kind == "line"
+    assert payload == content
+
+
+def test_reader_worker_rejects_one_byte_over_boundary():
+    import queue as queue_module
+
+    content = b'{"ok": true, "x": 1}'
+    line = content + b"\n"
+
+    q = queue_module.Queue()
+    _reader_worker(_FakeStream([line]), len(line) - 1, q)  # 1 バイト超過
+    kind, _payload = q.get_nowait()
+    assert kind == "oversize"
+
+
+def test_reader_worker_oversize_detected_incrementally_across_chunks():
+    """1 行がまだ完成していなくても、蓄積済みバイト数が上限を超えた時点
+    (次チャンク到着時) で打ち切る意味論のピン。"""
+    import queue as queue_module
+
+    q = queue_module.Queue()
+    _reader_worker(_FakeStream([b"aaaa", b"bbbb\n"]), 6, q)
+    kind, _payload = q.get_nowait()
+    assert kind == "oversize"
+
+
 # --- worker 起動失敗 (__enter__ の ready=false 診断パス) -------------------
 
 def test_worker_import_time_crash_reports_startup_error(tmp_path, plugin_settings):
@@ -314,6 +513,63 @@ def test_worker_import_time_crash_reports_startup_error(tmp_path, plugin_setting
     meta = _meta(tmp_path, "crash", "indicator", IMPORT_TIME_CRASH_PY)
     with pytest.raises(SandboxError, match="ZeroDivisionError"):
         run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings)
+
+
+# --- レビュー fix round 1 F2: __enter__ 失敗時の fd リーク -----------------
+
+def test_enter_failure_closes_pipes_and_marks_dead(tmp_path, plugin_settings,
+                                                    monkeypatch):
+    """`__enter__` が起動応答 (ready=false) で失敗するケースで、
+    stdin/stdout パイプが確実に close されていることを直接検証する
+    (`subprocess.Popen` を実物のまま素通しさせつつ生成された proc を
+    横取りして、`close()` 後の `.closed` を見る)。以前は `close()` を
+    呼ばない失敗パスがあり fd が GC 任せになっていた。"""
+    import subprocess as subprocess_module
+
+    from agentic_fx.plugin import sandbox as sandbox_module
+
+    meta = _meta(tmp_path, "crash", "indicator", IMPORT_TIME_CRASH_PY)
+    captured: list = []
+    real_popen = subprocess_module.Popen
+
+    def _capturing_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        captured.append(proc)
+        return proc
+
+    monkeypatch.setattr(sandbox_module.subprocess, "Popen", _capturing_popen)
+
+    session = PluginSession(meta, settings=plugin_settings)
+    with pytest.raises(SandboxError, match="ZeroDivisionError"):
+        session.__enter__()
+
+    assert session._dead is True
+    assert session._proc is None  # close() が proc を確実に None にした
+    assert len(captured) == 1
+    proc = captured[0]
+    assert proc.stdin.closed
+    assert proc.stdout.closed
+
+
+def test_enter_wraps_unexpected_popen_failure_as_sandbox_error(
+        tmp_path, plugin_settings, monkeypatch):
+    """`subprocess.Popen` 自体が想定外の例外を投げても `SandboxError` に
+    写像される (呼び出し側は `SandboxError` 1 種だけ catch すればよい
+    契約を `__enter__` でも保つ)。"""
+    from agentic_fx.plugin import sandbox as sandbox_module
+
+    meta = _meta(tmp_path, "ind", "indicator", INDICATOR_OK_PY)
+
+    def _raising_popen(*args, **kwargs):
+        raise OSError("simulated exec failure")
+
+    monkeypatch.setattr(sandbox_module.subprocess, "Popen", _raising_popen)
+
+    session = PluginSession(meta, settings=plugin_settings)
+    with pytest.raises(SandboxError, match="simulated exec failure"):
+        session.__enter__()
+    assert session._dead is True
+    assert session._proc is None
 
 
 # --- print() がプロトコルに混入しない (stdout 保護) -------------------------

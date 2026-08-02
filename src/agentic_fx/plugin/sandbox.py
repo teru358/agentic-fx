@@ -102,17 +102,39 @@ _ALLOWED_IMPORT_ROOTS = frozenset({"math", "statistics", "numpy", "pandas",
 _DENY_IMPORT_PREFIXES = ("pandas.io", "numpy.lib.npyio")
 
 # 名前 (Name の id、または Attribute の attr) として出現したら拒否する
-# トークン集合 (codex R1 C6 の逐語リスト)。
+# トークン集合 (codex R1 C6 の逐語リスト + レビュー fix round 1 F4:
+# ExcelWriter/HDFStore (I/O 用クラス)・dump/dumps (ndarray の pickle 系
+# シリアライズメソッド、loads はあったが dump/dumps が抜けていた))。
 _DENY_NAMES = frozenset({
     "open", "eval", "exec", "compile", "__import__", "input", "breakpoint",
     "globals", "getattr", "setattr", "delattr", "vars",
     "load", "loads", "loadtxt", "genfromtxt", "save", "savetxt", "savez",
-    "memmap", "fromfile", "tofile", "pickle", "unpickle",
+    "memmap", "fromfile", "tofile", "pickle", "unpickle", "dump", "dumps",
+    "ExcelWriter", "HDFStore",
 })
 
 # `to_` 前綴りの属性は既定で禁止 (`to_csv`/`to_pickle`/`to_sql` 等の I/O
 # 系メソッドを想定) だが、純粋な型変換であるこの 4 つだけは許可する。
 _TO_ALLOWED = frozenset({"to_dict", "to_list", "to_numpy", "to_pydatetime"})
+
+
+def _is_denied_bare_name(name: str) -> bool:
+    """`read_`/`to_` 接頭辞規則 + 固定 denylist 集合を 1 箇所に統一した
+    判定 (レビュー fix round 1 F1)。**`ast.Attribute.attr`・`ast.Name.id`
+    (Store/Load 問わず)・`ast.FunctionDef`/`ast.AsyncFunctionDef` の関数
+    定義名・`ImportFrom` で実際に import される名前 (`alias.name`、
+    `asname` の有無に関わらず) の 4 箇所すべてに同じ判定を適用する** —
+    以前は `ast.Attribute` にしか及んでおらず、`from pandas import
+    read_csv` のような from-import 経由の別名バイパスや、plugin が
+    `def read_xxx(...): ...` のような名前の関数を自ら定義して
+    (`ast.Attribute` を経由しない直接呼び出しで) denylist を素通りする
+    経路が残っていた (codex+sonnet 並行レビュー F1, Critical)。
+    """
+    if name.startswith("read_"):
+        return True
+    if name.startswith("to_") and name not in _TO_ALLOWED:
+        return True
+    return name in _DENY_NAMES
 
 
 def check_source(path: Path, *, extra_allowed: frozenset[str] = frozenset()) -> None:
@@ -136,10 +158,15 @@ def check_source(path: Path, *, extra_allowed: frozenset[str] = frozenset()) -> 
         elif isinstance(node, ast.ImportFrom):
             _check_import_from(node, allowed_roots, path)
         elif isinstance(node, ast.Name):
-            if node.id in _DENY_NAMES:
+            if _is_denied_bare_name(node.id):
                 raise SandboxError(f"{path}: use of name {node.id!r} is not allowed")
         elif isinstance(node, ast.Attribute):
-            _check_attribute(node.attr, path)
+            if _is_denied_bare_name(node.attr):
+                raise SandboxError(f"{path}: attribute {node.attr!r} is not allowed")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if _is_denied_bare_name(node.name):
+                raise SandboxError(
+                    f"{path}: defining a function named {node.name!r} is not allowed")
         elif isinstance(node, ast.Global):
             raise SandboxError(f"{path}: 'global' statement is not allowed")
 
@@ -164,21 +191,20 @@ def _check_import_from(node: ast.ImportFrom, allowed_roots: frozenset[str],
     for alias in node.names:
         full = f"{module}.{alias.name}"
         _check_deny_prefix(full, path)
+        # F1: from-import の別名バイパス封鎖 — `from pandas import
+        # read_csv` や `from pandas import read_csv as rc` のように
+        # import される**元の**名前 (alias.name、asname は無視) 自体が
+        # denylist に触れるなら、そのモジュールが allowlist に載っていて
+        # ドット付きパスが _DENY_IMPORT_PREFIXES に一致しなくても拒否する。
+        if _is_denied_bare_name(alias.name):
+            raise SandboxError(
+                f"{path}: import of {module}.{alias.name} is not allowed")
 
 
 def _check_deny_prefix(dotted: str, path: Path) -> None:
     for prefix in _DENY_IMPORT_PREFIXES:
         if dotted == prefix or dotted.startswith(prefix + "."):
             raise SandboxError(f"{path}: import of {dotted!r} is not allowed")
-
-
-def _check_attribute(attr: str, path: Path) -> None:
-    if attr.startswith("read_"):
-        raise SandboxError(f"{path}: attribute {attr!r} is not allowed")
-    if attr.startswith("to_") and attr not in _TO_ALLOWED:
-        raise SandboxError(f"{path}: attribute {attr!r} is not allowed")
-    if attr in _DENY_NAMES:
-        raise SandboxError(f"{path}: attribute {attr!r} is not allowed")
 
 
 # --- env builder -------------------------------------------------------
@@ -269,33 +295,48 @@ class PluginSession:
         self.pid: int | None = None
 
     def __enter__(self) -> "PluginSession":
-        check_source(self._meta.path / "plugin.py")
-        env = _build_env()
-        self._proc = subprocess.Popen(
-            [sys.executable, "-m", "agentic_fx.plugin.worker", str(self._meta.path)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            cwd=str(self._meta.path), env=env, start_new_session=True,
-        )
-        handshake = {
-            "cpu_sec": self._settings.sandbox_session_cpu_sec,
-            "memory_mb": self._settings.sandbox_memory_mb,
-            "kind": self._meta.kind,
-        }
+        """起動シーケンス全体を 1 つの try/except で包む (レビュー fix
+        round 1 F2)。**`__enter__` が例外を投げると Python は `__exit__`
+        を一切呼ばない** — 以前は個別の失敗パスでだけ `close()`/`_kill()`
+        を呼んでいたため、想定していなかった失敗経路 (`subprocess.Popen`
+        自体の例外等) では `self._proc` の stdin/stdout パイプが GC 任せ
+        になり fd がリークし得た。ここで一括して `self.close()` を必ず
+        通してから re-raise する (`SandboxError` はメッセージを保持して
+        そのまま、それ以外の例外は `SandboxError` へ写像 — 呼び出し側が
+        `SandboxError` 1 種だけ catch すればよい契約を `__enter__` でも
+        維持する)。
+        """
         try:
+            check_source(self._meta.path / "plugin.py")
+            env = _build_env()
+            self._proc = subprocess.Popen(
+                [sys.executable, "-m", "agentic_fx.plugin.worker",
+                 str(self._meta.path)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, cwd=str(self._meta.path), env=env,
+                start_new_session=True,
+            )
+            handshake = {
+                "cpu_sec": self._settings.sandbox_session_cpu_sec,
+                "memory_mb": self._settings.sandbox_memory_mb,
+                "kind": self._meta.kind,
+            }
             self._write_line(handshake)
-        except OSError as exc:
+
+            response = self._read_response(_STARTUP_TIMEOUT_SEC, _STARTUP_MAX_BYTES)
+            if not response.get("ok"):
+                raise SandboxError(
+                    f"plugin worker failed to start: {response.get('error')}")
+            self.pid = response.get("pid")
+            return self
+        except SandboxError:
+            self._dead = True
+            self.close()
+            raise
+        except Exception as exc:
             self._dead = True
             self.close()
             raise SandboxError(f"failed to start plugin worker: {exc}") from exc
-
-        response = self._read_response(_STARTUP_TIMEOUT_SEC, _STARTUP_MAX_BYTES)
-        if not response.get("ok"):
-            self._dead = True
-            self.close()
-            raise SandboxError(
-                f"plugin worker failed to start: {response.get('error')}")
-        self.pid = response.get("pid")
-        return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
         self.close()
@@ -307,6 +348,15 @@ class PluginSession:
             return
         if proc.poll() is None:
             self._kill()
+        # 不変条件: この時点で proc は必ず終了済み (`_kill()` が
+        # `wait()` まで済ませている)。`_kill()` が実効性を失う変異を
+        # 注入すると `proc.stdout.close()` が **デッドロックする**
+        # (別スレッドの `_reader_worker` が `read1()` でブロックしたまま
+        # 戻ってこない — worker がまだ生きて出力を出さない限り解放され
+        # ない。レビュー fix round 1 F3 の変異テストで実際に踏んだ経路:
+        # `_kill()` no-op → ここで停止 → RLIMIT_CPU の SIGXCPU で worker
+        # が自滅し EOF が出るまで解けなかった)。順序 (`_kill()` を必ず
+        # 先に完了させる) を変えないこと。
         for stream in (proc.stdin, proc.stdout):
             try:
                 if stream is not None:
@@ -341,6 +391,12 @@ class PluginSession:
 
         try:
             self._write_line(request)
+        except SandboxError:
+            # `_write_line` 内の json.dumps 失敗 (payload に numpy スカラー
+            # 等シリアライズ不能な値が混入) — 実際にはまだ何もパイプへ
+            # 書き込んでいないため、セッションは継続利用可能 (レビュー
+            # fix round 1 F5)。
+            raise
         except OSError as exc:
             self._dead = True
             self._kill()
@@ -362,8 +418,19 @@ class PluginSession:
     # -- IPC 詳細 --
 
     def _write_line(self, obj: dict[str, Any]) -> None:
+        """1 行書き込む。**例外の型で「シリアライズ失敗 (書き込み前、
+        セッション継続可)」と「I/O 失敗 (壊れたパイプ、セッション死亡)」
+        を呼び出し元が区別できるようにする** (レビュー fix round 1 F5):
+        `json.dumps` が `TypeError`/`ValueError` (payload に numpy スカラー
+        等シリアライズ不能な値が混入) を出したら `SandboxError` として
+        送出し、実際のパイプ書き込みで失敗したら `OSError` をそのまま
+        伝播させる (呼び出し元の `call()`/`__enter__` が使い分ける)。
+        """
         assert self._proc is not None and self._proc.stdin is not None
-        data = json.dumps(obj).encode("utf-8") + b"\n"
+        try:
+            data = json.dumps(obj).encode("utf-8") + b"\n"
+        except (TypeError, ValueError) as exc:
+            raise SandboxError(f"failed to serialize request: {exc}") from exc
         self._proc.stdin.write(data)
         self._proc.stdin.flush()
 
@@ -433,6 +500,16 @@ class PluginSession:
 
 def _reader_worker(stream: Any, max_bytes: int,
                    result_queue: "queue.Queue[tuple[str, Any]]") -> None:
+    """境界の意味論 (レビュー fix round 1 F7 で明文化):
+    累積バイト数が **`max_bytes` ちょうど** なら許容 (`>` であって `>=`
+    ではない)、1 バイトでも超えたら oversize。判定は `read1()` の
+    チャンク到着ごとに行う — 1 行がまだ完成していなくても、蓄積量が
+    その時点で上限を超えていれば直ちに打ち切る (改行の到着を待たない)。
+    そのため、最終的な行の総バイト数が結果的に上限以内に収まる場合
+    でも、チャンク分割の途中経過で一時的に上限を超えていれば oversize
+    と判定され得る (「超過検知は次チャンク到着時」の意味論 — 出力を
+    無制限にバッファしないためのトレードオフ)。
+    """
     buf = bytearray()
     try:
         while True:
@@ -468,6 +545,16 @@ def run_plugin(meta: PluginMeta, payload: dict[str, Any], *,
     """
     eff_settings = settings
     if timeout_sec is not None:
+        # `PluginSettings.sandbox_timeout_sec` は pydantic の `Field(gt=0)`
+        # で検証されるが、`model_copy(update=...)` はバリデータを一切
+        # 再実行しない (pydantic の既知の挙動) — ここで検証せず素通しする
+        # と、0/負値が `queue.Queue.get(timeout=...)` まで届いてから生の
+        # `ValueError` になり「SandboxError 1 種だけ catch すればよい」
+        # 契約を破る (レビュー fix round 1 F5)。ここで明示的に fail closed。
+        if (isinstance(timeout_sec, bool) or not isinstance(timeout_sec, (int, float))
+                or not math.isfinite(timeout_sec) or timeout_sec <= 0):
+            raise SandboxError(
+                f"timeout_sec must be a finite positive number, got {timeout_sec!r}")
         eff_settings = settings.model_copy(update={"sandbox_timeout_sec": timeout_sec})
     with PluginSession(meta, settings=eff_settings) as session:
         return session.call(payload)

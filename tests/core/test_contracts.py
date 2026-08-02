@@ -168,6 +168,23 @@ def test_signal_accepts_strength_boundaries():
            direction="short", strength=1.0, rationale="x")
 
 
+# --- レビュー fix round 1 F8: rationale の非空 str 検証 --------------------
+
+def test_signal_rejects_empty_rationale():
+    with pytest.raises(ValueError, match="rationale"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=0.5, rationale="")
+
+
+def test_signal_rejects_non_str_rationale():
+    """`sandbox._validate_strategy_result` は `StrategyDecision` の
+    構築に検証を委ねる設計 — plugin が `rationale` に list 等の構造化
+    データを返しても `__post_init__` が拾えるようにする。"""
+    with pytest.raises(ValueError, match="rationale"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=0.5, rationale=["a", "b"])
+
+
 def test_strategy_decision_hold_minimal():
     d = StrategyDecision(action="hold", rationale="様子見")
     assert d.action == StrategyAction.HOLD
@@ -220,6 +237,16 @@ def test_strategy_decision_rejects_exit_action():
 def test_strategy_decision_rejects_invalid_direction():
     with pytest.raises(ValueError, match="direction"):
         StrategyDecision(action="hold", rationale="x", direction="up")
+
+
+def test_strategy_decision_rejects_empty_rationale():
+    with pytest.raises(ValueError, match="rationale"):
+        StrategyDecision(action="hold", rationale="")
+
+
+def test_strategy_decision_rejects_non_str_rationale():
+    with pytest.raises(ValueError, match="rationale"):
+        StrategyDecision(action="hold", rationale=["not", "a", "str"])
 
 
 def test_system_clock_returns_tz_aware_utc():

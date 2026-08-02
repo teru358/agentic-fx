@@ -56,19 +56,22 @@ import os
 import sys
 from typing import Any
 
-# RLIMIT_NPROC の固定上限。**per-uid の累積カウンタ**なので、実運用の
-# 開発機では既にこの値をとうに超えたプロセス/スレッド数が同一 uid 配下
-# に存在するのが普通であり、その場合 worker は新規スレッドを 1 つも
-# 作れない (setrlimit 自体は成功するが、以後の clone()/pthread_create()
-# が即座に失敗する) — つまり「まだ余裕がある」保証は無い。それでも安全
-# なのは、plugin.py が subprocess/os/threading を import すること自体が
+# RLIMIT_NPROC の固定上限。**per-uid の累積カウンタ**なので、値が小さす
+# ぎると「同一 uid が既に多数のプロセス/スレッドを持つ」通常の開発機
+# (常態) で worker 自身の起動が壊れる — レビュー fix round 1 F6:
+# 当初 32 だったが、これは典型的な開発機の同時プロセス/スレッド数を軽く
+# 下回り、正常な plugin 実行まで巻き込んで失敗させていた (setrlimit
+# 自体は成功するが、以後 clone()/pthread_create() が即座に失敗する)。
+# fork bomb 事故防止という目的に対しては十分に寛大な値で足りる —
+# plugin.py が subprocess/os/threading を import すること自体が
 # check_source の allowlist (math/statistics/numpy/pandas のみ) で既に
 # 拒否されており plugin コードが自発的に fork/thread を増やす経路が無い
 # のと、worker 起動時に env で BLAS/OpenMP をシングルスレッド化している
-# (sandbox._SINGLE_THREAD_ENV) ため worker 自身が新規スレッドを必要と
-# する場面もほぼ無いため。RLIMIT_NPROC はあくまでベストエフォートの追加
-# 防御であり、fail closed の主防御は RLIMIT_CPU/RLIMIT_AS の 2 軸。
-_NPROC_CAP = 32
+# (sandbox._SINGLE_THREAD_ENV) ため worker 自身が新規スレッドをほぼ必要
+# としないため、512 という寛大な値でも fail closed の実効性は変わらない
+# (RLIMIT_CPU/RLIMIT_AS が主防御、RLIMIT_NPROC はベストエフォートの追加
+# 防御という位置づけも変更なし)。
+_NPROC_CAP = 512
 
 
 def _set_resource_limits(cpu_sec: int, memory_mb: int) -> None:

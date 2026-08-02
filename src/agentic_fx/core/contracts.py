@@ -283,6 +283,18 @@ class TradeIntent:
                    reasoning=reasoning, ref_price=ref_price)
 
 
+def _require_nonempty_str(value: object, field_name: str) -> None:
+    """`rationale` 等の説明文フィールドの共通検証 (レビュー fix round 1
+    F8)。`sandbox._validate_strategy_result` は `StrategyDecision` を
+    実際に構築して検証を委ねる設計 (二重実装回避) だが、`__post_init__`
+    がフィールドの型を検証していないと素通りしてしまう — plugin が
+    `"rationale": ["a", "b"]` のような構造化データや空文字列を返しても
+    そのまま受理されていた。非 str・空文字列を fail closed で拒否する。
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a non-empty str, got {value!r}")
+
+
 def _optional_positive_price(value: float | None, field_name: str) -> None:
     """価格系フィールド (stop_loss/take_profit/limit_price) の共通検証
     (レビュー fix round 1 C4/C5)。None は許容 (未指定)。非 None なら
@@ -325,6 +337,7 @@ class Signal:
             raise ValueError(f"strength must be a number, got {self.strength!r}")
         if not math.isfinite(self.strength) or not (0.0 <= self.strength <= 1.0):
             raise ValueError(f"strength must be in [0, 1], got {self.strength!r}")
+        _require_nonempty_str(self.rationale, "rationale")
         _optional_positive_price(self.stop_loss, "stop_loss")
         _optional_positive_price(self.take_profit, "take_profit")
 
@@ -356,6 +369,7 @@ class StrategyDecision:
         if self.entry_type is not None and self.entry_type not in (
                 EntryType.MARKET, EntryType.LIMIT):
             raise ValueError(f"invalid entry_type: {self.entry_type!r}")
+        _require_nonempty_str(self.rationale, "rationale")
         _optional_positive_price(self.limit_price, "limit_price")
         _optional_positive_price(self.stop_loss, "stop_loss")
         _optional_positive_price(self.take_profit, "take_profit")
