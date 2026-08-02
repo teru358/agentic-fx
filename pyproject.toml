@@ -35,3 +35,5 @@ packages = ["src/agentic_fx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["bench: 長時間ベンチ (既定 skip、-m bench で実行)"]
+addopts = "-m 'not bench'"
