@@ -92,6 +92,11 @@ def detect(df, params):
              "bar_ts": "2026-01-01T00:00:00+00:00"}]
 """
 
+SIGNAL_EMPTY_RATIONALE_PY = """
+def detect(df, params):
+    return [{"direction": "long", "strength": 0.8, "rationale": ""}]
+"""
+
 INFINITE_LOOP_PY = """
 def compute(df, params):
     while True:
@@ -658,6 +663,19 @@ def test_signal_happy_path(tmp_path, plugin_settings):
     out = run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings)
     assert out["signals"] == [
         {"direction": "long", "strength": 0.8, "rationale": "test signal"}]
+
+
+# --- fix round 2 F8: signal 経路の空 rationale 拒否 ------------------------
+
+def test_signal_empty_rationale_rejected(tmp_path, plugin_settings):
+    """strategy 経路は `StrategyDecision` の実構築で非空 str 検証が自動
+    的にかかるが、signal 経路は Signal を構築せず手組み検証のため、
+    以前は `rationale=""` が素通りしていた (fix round 1 レビューの
+    残ギャップ)。"""
+    meta = _meta(tmp_path, "sig", "signal", SIGNAL_EMPTY_RATIONALE_PY,
+                timeframe="1h", pairs=("USDJPY",))
+    with pytest.raises(SandboxError, match="non-empty"):
+        run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings)
 
 
 def test_signal_bar_ts_key_rejected(tmp_path, plugin_settings):

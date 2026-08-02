@@ -638,9 +638,19 @@ def _validate_signal_result(result: Any) -> list[dict[str, Any]]:
         if not math.isfinite(strength) or not (0.0 <= strength <= 1.0):
             raise SandboxError(f"signal[{i}].strength must be in [0, 1], got {strength!r}")
 
+        # fix round 2 F8 残ギャップ: strategy 経路は StrategyDecision を
+        # 実構築するため contracts._require_nonempty_str (非空 str 検証)
+        # が自動的にかかるが、signal 経路は Signal オブジェクトを構築
+        # せず手組み検証のため、ここだけ空文字列 "" が素通りしていた。
+        # contracts._require_nonempty_str と同じ規則をここでも適用する
+        # (import して共有はしない — private ヘルパーのクロスモジュール
+        # import は本コードベースの既存慣習に反する。sandbox.py は
+        # Signal の全フィールドを持たない — bar_ts/pair/timeframe/plugin
+        # はハーネスが後付けするため、ここで実際に Signal を構築する
+        # ことはできない — ので、意味論だけを手組みで再現する)。
         rationale = item.get("rationale")
-        if not isinstance(rationale, str):
-            raise SandboxError(f"signal[{i}].rationale must be a str")
+        if not isinstance(rationale, str) or not rationale:
+            raise SandboxError(f"signal[{i}].rationale must be a non-empty str")
 
         validated: dict[str, Any] = {
             "direction": direction.value, "strength": strength, "rationale": rationale}
