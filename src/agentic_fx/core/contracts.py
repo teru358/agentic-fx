@@ -283,6 +283,22 @@ class TradeIntent:
                    reasoning=reasoning, ref_price=ref_price)
 
 
+def _optional_positive_price(value: float | None, field_name: str) -> None:
+    """価格系フィールド (stop_loss/take_profit/limit_price) の共通検証
+    (レビュー fix round 1 C4/C5)。None は許容 (未指定)。非 None なら
+    「bool でない実数・有限・正値 (> 0)」を要求する — fail closed。
+    価格が 0 以下・NaN/inf・bool (True/False は int のサブクラスで実数
+    チェックをすり抜けるため明示的に除外) は全て reject する。
+    """
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be a number, got {value!r}")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"{field_name} must be a finite positive number, got {value!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class Signal:
     """signal plugin (`detect(df, params)`) の 1 件の検出出力 (プラン 7 §6)。
@@ -309,6 +325,8 @@ class Signal:
             raise ValueError(f"strength must be a number, got {self.strength!r}")
         if not math.isfinite(self.strength) or not (0.0 <= self.strength <= 1.0):
             raise ValueError(f"strength must be in [0, 1], got {self.strength!r}")
+        _optional_positive_price(self.stop_loss, "stop_loss")
+        _optional_positive_price(self.take_profit, "take_profit")
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +356,9 @@ class StrategyDecision:
         if self.entry_type is not None and self.entry_type not in (
                 EntryType.MARKET, EntryType.LIMIT):
             raise ValueError(f"invalid entry_type: {self.entry_type!r}")
+        _optional_positive_price(self.limit_price, "limit_price")
+        _optional_positive_price(self.stop_loss, "stop_loss")
+        _optional_positive_price(self.take_profit, "take_profit")
 
         if self.action == StrategyAction.OPEN:
             # brief 明記: open は stop_loss 必須。direction/entry_type は

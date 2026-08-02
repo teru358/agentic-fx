@@ -47,7 +47,12 @@ def compute(df: pd.DataFrame, params: dict) -> dict:
     if pd.isna(avg_gain) or pd.isna(avg_loss):
         return {}
 
-    if avg_loss == 0:
+    if avg_gain == 0 and avg_loss == 0:
+        # 完全フラット (period 本の間、値上がり・値下がりが一度も無い) は
+        # 「買われすぎ」でも「売られすぎ」でもない中立状態 — 100.0 は
+        # 誤解を招く (レビュー fix round 1 C8)。
+        rsi = 50.0
+    elif avg_loss == 0:
         rsi = 100.0
     else:
         rs = avg_gain / avg_loss

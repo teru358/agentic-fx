@@ -262,3 +262,84 @@ def test_ref_price_threaded_for_close_and_hold():
         {"action": "hold", "reasoning": "x"}, origin=Origin.SCHEDULER,
         ref_price=148.30)
     assert hold_it.ref_price == 148.30
+
+
+# --- レビュー fix round 1 C4/C5: 価格系フィールドの正値・有限検証 -------
+
+def test_signal_accepts_positive_stop_loss_and_take_profit():
+    s = Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=0.5, rationale="x",
+               stop_loss=147.5, take_profit=149.0)
+    assert s.stop_loss == 147.5
+    assert s.take_profit == 149.0
+
+
+def test_signal_rejects_nan_stop_loss():
+    with pytest.raises(ValueError, match="stop_loss"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=0.5, rationale="x",
+               stop_loss=float("nan"))
+
+
+def test_signal_rejects_infinite_take_profit():
+    with pytest.raises(ValueError, match="take_profit"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=0.5, rationale="x",
+               take_profit=float("inf"))
+
+
+def test_signal_rejects_negative_stop_loss():
+    with pytest.raises(ValueError, match="stop_loss"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=0.5, rationale="x",
+               stop_loss=-1.0)
+
+
+def test_signal_rejects_zero_take_profit():
+    with pytest.raises(ValueError, match="take_profit"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=0.5, rationale="x",
+               take_profit=0.0)
+
+
+def test_signal_rejects_bool_stop_loss():
+    with pytest.raises(ValueError, match="stop_loss"):
+        Signal(plugin="rsi", pair="USDJPY", timeframe="1h", bar_ts=_bar_ts(),
+               direction="long", strength=0.5, rationale="x",
+               stop_loss=True)
+
+
+def test_strategy_decision_rejects_nan_stop_loss():
+    with pytest.raises(ValueError, match="stop_loss"):
+        StrategyDecision(action="open", rationale="x", direction="long",
+                         entry_type="market", stop_loss=float("nan"))
+
+
+def test_strategy_decision_rejects_negative_take_profit():
+    with pytest.raises(ValueError, match="take_profit"):
+        StrategyDecision(action="open", rationale="x", direction="long",
+                         entry_type="market", stop_loss=147.0,
+                         take_profit=-5.0)
+
+
+def test_strategy_decision_rejects_bool_limit_price():
+    with pytest.raises(ValueError, match="limit_price"):
+        StrategyDecision(action="open", rationale="x", direction="long",
+                         entry_type="limit", stop_loss=147.0,
+                         limit_price=True)
+
+
+def test_strategy_decision_rejects_infinite_limit_price():
+    with pytest.raises(ValueError, match="limit_price"):
+        StrategyDecision(action="open", rationale="x", direction="long",
+                         entry_type="limit", stop_loss=147.0,
+                         limit_price=float("inf"))
+
+
+def test_strategy_decision_accepts_positive_finite_prices():
+    d = StrategyDecision(action="open", rationale="x", direction="long",
+                         entry_type="limit", stop_loss=147.0,
+                         limit_price=148.0, take_profit=150.0)
+    assert d.stop_loss == 147.0
+    assert d.limit_price == 148.0
+    assert d.take_profit == 150.0

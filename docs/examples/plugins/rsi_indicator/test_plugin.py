@@ -42,3 +42,10 @@ def test_compute_respects_custom_period_param():
     closes = [100 + i * 0.1 for i in range(10)]
     out = compute(_df(closes), {"period": 5})
     assert "rsi_5" in out
+
+
+def test_compute_flat_series_yields_neutral_rsi():
+    """avg_gain == avg_loss == 0 (完全フラット) は中立 50.0 を返す —
+    100.0 (買われすぎ) は誤解を招く (レビュー fix round 1 C8)。"""
+    out = compute(_df([100.0] * 20), {})
+    assert out["rsi_14"] == 50.0

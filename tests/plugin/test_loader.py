@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from pathlib import Path
 
 import pytest
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
+from agentic_fx.plugin import loader as loader_module
 from agentic_fx.plugin.loader import PluginMeta, content_hash, discover
 
 INDICATOR_PY = """
@@ -451,3 +453,186 @@ def test_discover_multiple_plugins_independent_rejection(tmp_path):
 
     assert len(metas) == 1
     assert metas[0].name == "good_indicator"
+
+
+# --- レビュー fix round 1 (codex 指摘 C1-C10) -----------------------------
+
+# C1: YAML 重複キーを reject -------------------------------------------
+
+def test_discover_rejects_duplicate_yaml_keys(tmp_path, caplog):
+    """`kind` を 2 回書いた config は reject される (last-wins の無言受理は
+    人間レビューと discovery の見え方を食い違わせる承認迂回リスク)。"""
+    _write_plugin(tmp_path, "dup_key", plugin_py=INDICATOR_PY, config_yaml="""
+kind: strategy
+kind: indicator
+""")
+    with caplog.at_level(logging.WARNING):
+        metas = discover(tmp_path)
+    assert metas == []
+    assert "dup_key" in caplog.text
+
+
+# C2: デフォルト無し keyword-only 引数は fail-open --------------------------
+
+def test_discover_rejects_required_kwonly_arg(tmp_path, caplog):
+    """`evaluate(df, indicators, signals, params, *, secret)` はハーネスの
+    位置引数のみの呼び出しで TypeError になる — reject。"""
+    _write_plugin(tmp_path, "kwonly_required", plugin_py="""
+def evaluate(df, indicators, signals, params, *, secret):
+    return {"action": "hold", "rationale": "x"}
+""", config_yaml=STRATEGY_CONFIG)
+    with caplog.at_level(logging.WARNING):
+        metas = discover(tmp_path)
+    assert metas == []
+
+
+def test_discover_accepts_kwonly_arg_with_default(tmp_path):
+    """デフォルト付き kwonly は位置引数のみの呼び出しでも成立するので許容。"""
+    _write_plugin(tmp_path, "kwonly_default", plugin_py="""
+def evaluate(df, indicators, signals, params, *, mode="default"):
+    return {"action": "hold", "rationale": "x"}
+""", config_yaml=STRATEGY_CONFIG)
+    metas = discover(tmp_path)
+    assert len(metas) == 1
+
+
+# C3: デコレータ付き契約関数は fail-open ------------------------------------
+
+def test_discover_rejects_decorated_target_function(tmp_path, caplog):
+    """デコレータはモジュール属性を非 callable な別物に差し替え得る —
+    契約関数へのデコレータは一切許容しない。"""
+    _write_plugin(tmp_path, "decorated_compute", plugin_py="""
+def _noop(fn):
+    return fn
+
+
+@_noop
+def compute(df, params):
+    return {"rsi_14": 50.0}
+""", config_yaml=INDICATOR_CONFIG)
+    with caplog.at_level(logging.WARNING):
+        metas = discover(tmp_path)
+    assert metas == []
+
+
+# C6: pairs の空文字列・空白文字列は reject ---------------------------------
+
+def test_discover_rejects_blank_pair_entry(tmp_path, caplog):
+    _write_plugin(tmp_path, "blank_pair", plugin_py=SIGNAL_PY, config_yaml="""
+kind: signal
+timeframe: 1h
+pairs: ["   "]
+""")
+    with caplog.at_level(logging.WARNING):
+        metas = discover(tmp_path)
+    assert metas == []
+
+
+def test_discover_rejects_empty_string_pair_entry(tmp_path, caplog):
+    _write_plugin(tmp_path, "empty_string_pair", plugin_py=SIGNAL_PY,
+                  config_yaml="""
+kind: signal
+timeframe: 1h
+pairs: [""]
+""")
+    with caplog.at_level(logging.WARNING):
+        metas = discover(tmp_path)
+    assert metas == []
+
+
+# C7: discover が読むファイルのサイズ上限 -----------------------------------
+
+def test_discover_rejects_oversized_config(tmp_path, caplog, monkeypatch):
+    """上限定数を monkeypatch して小さくし、テストを高速に保つ。"""
+    monkeypatch.setattr(loader_module, "_MAX_FILE_BYTES", 32)
+    oversized_config = INDICATOR_CONFIG + ("# padding" * 10)
+    assert len(oversized_config.encode()) > 32
+    _write_plugin(tmp_path, "oversized_config", plugin_py=INDICATOR_PY,
+                  config_yaml=oversized_config)
+    with caplog.at_level(logging.WARNING):
+        metas = discover(tmp_path)
+    assert metas == []
+    assert "oversized_config" in caplog.text
+
+
+def test_discover_rejects_oversized_plugin_py(tmp_path, caplog, monkeypatch):
+    monkeypatch.setattr(loader_module, "_MAX_FILE_BYTES", 32)
+    oversized_py = INDICATOR_PY + ("\n# padding" * 10)
+    assert len(oversized_py.encode()) > 32
+    _write_plugin(tmp_path, "oversized_plugin_py", plugin_py=oversized_py,
+                  config_yaml=INDICATOR_CONFIG)
+    with caplog.at_level(logging.WARNING):
+        metas = discover(tmp_path)
+    assert metas == []
+
+
+def test_discover_accepts_file_within_size_limit(tmp_path, monkeypatch):
+    """上限を大きく下げても、既定サイズのサンプルはそのまま通ることのピン。"""
+    monkeypatch.setattr(loader_module, "_MAX_FILE_BYTES", 4096)
+    _write_plugin(tmp_path, "small_indicator", plugin_py=INDICATOR_PY,
+                  config_yaml=INDICATOR_CONFIG)
+    metas = discover(tmp_path)
+    assert len(metas) == 1
+
+
+# C10: フォルダ単位隔離の完全化 (config 読み/content_hash の OSError) --------
+
+def test_discover_isolates_unreadable_config_from_other_folders(tmp_path, caplog):
+    """config.yaml の読み込みで OSError (権限拒否) が出ても、そのフォルダ
+    だけ reject され、他フォルダの discovery は継続する。
+
+    root 実行では chmod によるパーミッション拒否が効かないため skip する。
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root では chmod によるパーミッション拒否を再現できない")
+
+    unreadable = _write_plugin(tmp_path, "unreadable_config",
+                               plugin_py=INDICATOR_PY,
+                               config_yaml=INDICATOR_CONFIG)
+    config_path = unreadable / "config.yaml"
+    os.chmod(config_path, 0)
+    try:
+        _write_plugin(tmp_path, "good_indicator", plugin_py=INDICATOR_PY,
+                      config_yaml=INDICATOR_CONFIG)
+        with caplog.at_level(logging.WARNING):
+            metas = discover(tmp_path)
+    finally:
+        os.chmod(config_path, 0o644)
+
+    assert len(metas) == 1
+    assert metas[0].name == "good_indicator"
+    assert "unreadable_config" in caplog.text
+
+
+def test_discover_isolates_content_hash_oserror_from_other_folders(
+        tmp_path, caplog, monkeypatch):
+    """content_hash 算出時の OSError も discover 全体を落とさず、そのフォ
+    ルダのみ reject する。
+
+    content_hash は config/plugin.py 検証・AST 検証が両方通った**後**にし
+    か呼ばれないため、ファイルシステム操作 (chmod 等) だけでこの経路を
+    単独で再現するのは難しい (plugin.py を読めなくすると先に AST 検証側で
+    reject されてしまう)。`content_hash` をフォルダ名で分岐する monkeypatch
+    スタブに差し替え、`discover` の `except OSError` ラッパーそのものの
+    契約 (どのフォルダで OSError が出ても隔離される) を直接検証する。
+    """
+    real_content_hash = loader_module.content_hash
+
+    def _flaky_content_hash(plugin_dir):
+        if plugin_dir.name == "hash_error":
+            raise OSError("simulated I/O failure during content_hash")
+        return real_content_hash(plugin_dir)
+
+    monkeypatch.setattr(loader_module, "content_hash", _flaky_content_hash)
+
+    _write_plugin(tmp_path, "hash_error", plugin_py=INDICATOR_PY,
+                  config_yaml=INDICATOR_CONFIG)
+    _write_plugin(tmp_path, "good_indicator", plugin_py=INDICATOR_PY,
+                  config_yaml=INDICATOR_CONFIG)
+
+    with caplog.at_level(logging.WARNING):
+        metas = discover(tmp_path)
+
+    assert len(metas) == 1
+    assert metas[0].name == "good_indicator"
+    assert "hash_error" in caplog.text
