@@ -312,6 +312,17 @@ def test_cli_backtest_run_plugin_records_strategy_scope(tmp_path, monkeypatch,
     pairs 照合 → `save_human_run(plugin_ref=..., content_hash=meta.content_hash,
     kind="strategy")`。run_replay を mock しているので intent_source は
     一度も発火せず (eval_count=0)、stderr に警告が出ることも併せて確認する。
+
+    F2 (sonnet Important — レビュー fix round 1): 以前は `save_human_run`
+    の kwargs しか見ておらず、`build_intent_source(pair=args.symbol)` を
+    固定値へすり替える変異・`run_replay(eval_timeframe=args.timeframe)` を
+    固定値へすり替える変異のいずれも 28 件 green のまま生存した (レビュ
+    アー実測)。`strategy_adapter.build_intent_source` を patch して呼び
+    出し kwargs (pair/source) を直接検証し、`run_replay` に渡った
+    symbol/source/eval_timeframe と intent_source の同一性 (patch の
+    戻り値そのものが渡っていること) も検証する。`--timeframe 2h` を明示
+    指定する (既定 "1h" とも、レビュアーが実測した具体的な固定値 "4h" と
+    も異なる値にすることで、どちらの偶然一致にも頼らない)。
     """
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
@@ -331,9 +342,13 @@ def test_cli_backtest_run_plugin_records_strategy_scope(tmp_path, monkeypatch,
         start=datetime(2026, 7, 1, tzinfo=timezone.utc),
         end=datetime(2026, 7, 2, tzinfo=timezone.utc),
         source="dukascopy", fallback_spread_used=False)
+    sentinel_source = MagicMock()
+    sentinel_source.eval_count = 0
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
          patch("agentic_fx.backtest.cli.run_replay") as rr, \
-         patch("agentic_fx.backtest.cli.backtest_runs") as br:
+         patch("agentic_fx.backtest.cli.backtest_runs") as br, \
+         patch("agentic_fx.backtest.cli.strategy_adapter.build_intent_source",
+               return_value=sentinel_source) as build_src:
         rr.return_value = fake_result
         br.save_human_run.return_value = 1
         br.settings_snapshot_hash.side_effect = \
@@ -342,18 +357,75 @@ def test_cli_backtest_run_plugin_records_strategy_scope(tmp_path, monkeypatch,
         rc = main(["backtest", "run", "--symbol", "USDJPY",
                    "--source", "dukascopy",
                    "--from", "2026-07-01", "--to", "2026-07-02",
+                   "--timeframe", "2h",
                    "--plugin", "strat"])
     assert rc == 0
+
+    assert build_src.called
+    _, build_kwargs = build_src.call_args
+    assert build_kwargs["pair"] == "USDJPY"
+    assert build_kwargs["source"] == "dukascopy"
+
+    assert rr.called
+    _, rr_kwargs = rr.call_args
+    assert rr_kwargs["symbol"] == "USDJPY"
+    assert rr_kwargs["source"] == "dukascopy"
+    assert rr_kwargs["eval_timeframe"] == "2h"
+    assert rr_kwargs["intent_source"] is sentinel_source  # build_src の戻り値そのもの
+
     assert br.save_human_run.called
     _, kwargs = br.save_human_run.call_args
     assert kwargs["plugin_ref"] == "plugins/strat"
     assert kwargs["content_hash"] == real_content_hash(plugin_dir)
     assert kwargs["kind"] == "strategy"
     assert kwargs["pair"] == "USDJPY"
-    assert kwargs["timeframe"] == "1h"
+    assert kwargs["timeframe"] == "2h"
     assert kwargs["source"] == "dukascopy"
     err = capsys.readouterr().err
-    assert "警告" in err  # eval_count=0 (run_replay を mock している) の観測性警告
+    assert "警告" in err  # eval_count=0 (sentinel_source) の観測性警告
+    sentinel_source.close.assert_called_once()  # try/finally が close() を呼ぶ
+
+
+def test_cli_backtest_run_plugin_closes_session_even_if_run_replay_raises(
+        tmp_path, monkeypatch):
+    """F3 (sonnet Important — レビュー fix round 1): `try/finally:
+    intent_source.close()` を丸ごと削っても既存テストは green のまま
+    だった (レビュアー実測 — 既存テストは発火 0 回で close() が no-op の
+    ため検出できなかった)。`run_replay` に例外 (`SandboxError` —
+    strategy_adapter の fail closed 契約どおり評価時に伝播し得る) を投げ
+    させ、①その例外が dispatch まで素通しされること (SandboxError は
+    dispatch() の統一エラー境界 (ValueError/KeyError/OSError) に含まれ
+    ない — brief 「貫通させる」の設計どおり) ②それでも close() が呼ばれた
+    こと、の両方を確認する。"""
+    from agentic_fx.plugin.sandbox import SandboxError
+
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    from agentic_fx.store import ohlcv as ohlcv_store
+    _write_strategy_plugin(tmp_path / "plugins", "strat", pairs=["USDJPY"])
+    seed_conn = connect(tmp_path / "data" / "agentic.db")
+    init_db(seed_conn)
+    ohlcv_store.import_bars(
+        seed_conn, [("USDJPY", "1m", "2026-07-01T00:00:00+00:00",
+                    148.0, 148.2, 147.9, 148.1, 10.0, 0.01)],
+        source="dukascopy")
+    seed_conn.close()
+
+    sentinel_source = MagicMock()
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay",
+               side_effect=SandboxError("plugin crashed mid-replay")) as rr, \
+         patch("agentic_fx.backtest.cli.backtest_runs") as br, \
+         patch("agentic_fx.backtest.cli.strategy_adapter.build_intent_source",
+               return_value=sentinel_source):
+        with pytest.raises(SandboxError, match="plugin crashed mid-replay"):
+            main(["backtest", "run", "--symbol", "USDJPY",
+                 "--source", "dukascopy",
+                 "--from", "2026-07-01", "--to", "2026-07-02",
+                 "--plugin", "strat"])
+    assert rr.called
+    sentinel_source.close.assert_called_once()
+    br.save_human_run.assert_not_called()  # run_replay が例外なので保存まで進まない
 
 
 def test_cli_backtest_run_plugin_not_found_rc1(tmp_path, monkeypatch):

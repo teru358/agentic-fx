@@ -8,11 +8,21 @@ plugin (`evaluate(df, indicators, signals, params)`) で実装する。
 
 **発火条件 (コントローラ裁定)**: `closed_bar.ts + eval_tf 幅` が plugin
 宣言 timeframe のバケット境界 (epoch 錨、`timeframes.floor_to_bucket`) に
-一致する tick のみ評価する。eval_tf 幅は `closed_bar.interval` から
-`timeframes.TF_MINUTES` で導出する (`runner._aggregate_bucket` が
-`interval=eval_timeframe` を設定するため、アダプタ側に新引数を足さない —
-brief 明記)。`closed_bar.interval` が未知の timeframe なら `ValueError`
-(fail closed)。発火格子に乗らない tick は素通しで None を返す。
+一致する tick のみ評価する。eval_tf 幅は `closed_bar.interval` から導出
+する (`runner._aggregate_bucket` が `interval=eval_timeframe` を設定する
+ため、アダプタ側に新引数を足さない — brief 明記)。`closed_bar.interval`
+が未知の timeframe なら `ValueError` (fail closed)。発火格子に乗らない
+tick は素通しで None を返す。
+
+**幅導出 (レビュー fix round 1 F1 — codex Medium)**: 幅は
+`timeframes.TF_MINUTES` ではなく `runner._parse_timeframe` を再利用して
+導出する。`TF_MINUTES` は plugin 宣言 timeframe (`PLUGIN_TIMEFRAMES` —
+15m/1h/4h/1d) 専用の列挙であり、`run_replay` が実際に受理する任意の
+eval_timeframe (`_TF_RE` = 任意の `Nm`/`Nh`、例: 30m/90m/2h) を含まない。
+`TF_MINUTES` で幅を引いていた旧実装は、CLI から到達可能な合法な
+`--timeframe` (30m 等) で最初の評価が必ず `ValueError` になるバグを持って
+いた。新しい写像テーブルは作らず、runner が `run_replay` 自身の駆動に
+使っているパーサをそのまま import して使う (二重実装回避)。
 
 **データ供給**: `load_resampled_frame(..., until=bucket_end,
 max_bars=meta.max_bars)` — until 排他でも完成判定は
@@ -35,12 +45,10 @@ run_replay を続行させたりしない)。
 from __future__ import annotations
 
 import sqlite3
-from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
-from agentic_fx.backtest.timeframes import (
-    TF_MINUTES, floor_to_bucket, load_resampled_frame,
-)
+from agentic_fx.backtest.runner import _parse_timeframe
+from agentic_fx.backtest.timeframes import floor_to_bucket, load_resampled_frame
 from agentic_fx.core.contracts import Bar
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.sandbox import PluginSession
@@ -81,11 +89,11 @@ class PluginStrategyIntentSource:
         self.eval_count = 0
 
     def __call__(self, closed_bar: Bar) -> dict | None:
-        if closed_bar.interval not in TF_MINUTES:
-            raise ValueError(
-                f"unknown eval bar interval: {closed_bar.interval!r} "
-                f"(known: {sorted(TF_MINUTES)})")
-        width = timedelta(minutes=TF_MINUTES[closed_bar.interval])
+        # F1 (レビュー fix round 1): TF_MINUTES ではなく runner の
+        # _parse_timeframe を再利用する (docstring 参照)。パース不能な
+        # interval は _parse_timeframe 自身が ValueError を送出する
+        # (fail closed — 独自メッセージへの包み直しはしない)。
+        width = _parse_timeframe(closed_bar.interval)
         bucket_end = closed_bar.ts + width
         if floor_to_bucket(bucket_end, self._meta.timeframe) != bucket_end:
             return None  # plugin 宣言 timeframe の境界に乗っていない tick

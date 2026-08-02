@@ -100,6 +100,37 @@ def test_fires_only_on_declared_timeframe_boundary(tmp_path):
     # bucket_end = closed_bar.ts + 1h が 4h 境界 (epoch 錨) と一致するのは
     # i=3 (bucket_end=H+4h) と i=7 (bucket_end=H+8h) のみ。
     assert fired_at == [3, 7]
+    # F4 (sonnet Minor — レビュー fix round 1): eval_count += 1 を
+    # __call__ 先頭へ移す変異 (発火判定を経ずに毎回カウントする) が
+    # fired_at の検証だけでは生存し得る — eval_count を直接ピンする。
+    assert src.eval_count == 2
+
+
+def test_fires_only_on_1h_boundary_with_30m_eval_grid(tmp_path):
+    """F1 (codex Medium — レビュー fix round 1): `closed_bar.interval` が
+    `TF_MINUTES` に無い任意の `run_replay` 合法値 (30m 等 — runner.py の
+    `_parse_timeframe` が受理する任意の "Nm"/"Nh") でも幅導出が機能する
+    ことを確認する。旧実装 (`TF_MINUTES` 参照) はこの eval_timeframe で
+    必ず `ValueError` になっていた — この RED が変異証明を兼ねる。"""
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 4 * 60 + 1)
+    meta = _meta(timeframe="1h")
+    session = _FakeSession()
+    src = strategy_adapter.build_intent_source(
+        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS,
+        session=session)
+
+    fired_at = []
+    for i in range(8):  # closed_bar ts = H, H+30m, ..., H+3h30m (30m 足 8 本)
+        before = len(session.calls)
+        src(_bar(H + timedelta(minutes=30 * i), interval="30m"))
+        if len(session.calls) > before:
+            fired_at.append(i)
+
+    # bucket_end = closed_bar.ts + 30m が 1h 境界と一致するのは奇数 i のみ
+    # (i=1: 12:30+30m=13:00, i=3: 14:00, i=5: 15:00, i=7: 16:00)。
+    assert fired_at == [1, 3, 5, 7]
+    assert src.eval_count == 4
 
 
 def test_unknown_eval_bar_interval_raises_value_error():
@@ -107,7 +138,10 @@ def test_unknown_eval_bar_interval_raises_value_error():
     src = strategy_adapter.build_intent_source(
         meta, conn=object(), pair="USDJPY", source="dukascopy",
         settings=SETTINGS, session=_FakeSession())
-    with pytest.raises(ValueError):
+    # F5 (sonnet Minor — レビュー fix round 1): エラー文言固有の部分文字列
+    # に絞る (本プランのテスト規約)。F1 で幅導出を runner._parse_timeframe
+    # へ委譲したため、実際に送出されるのはそちらのメッセージ。
+    with pytest.raises(ValueError, match="unsupported eval_timeframe"):
         src(_bar(H, interval="not-a-real-interval"))
 
 
