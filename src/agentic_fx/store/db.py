@@ -63,6 +63,13 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
   hwm REAL NOT NULL, cashflow REAL NOT NULL DEFAULT 0,
   source TEXT NOT NULL DEFAULT 'paper'
 );
+-- Task 12 Fix Round 1 (ユーザー裁定): snapshots.latest() の
+-- `ORDER BY ts DESC, id DESC LIMIT 1` が無索引で全表スキャンになり、tick
+-- 毎に呼ばれる実運用・バックテスト双方で行数に対し劣化する (O(n^2) 実測 —
+-- cProfile で latest() が実行時間の 92%)。ASC インデックスで十分 (SQLite
+-- は逆方向スキャン対応のため DESC 指定は不要)。
+CREATE INDEX IF NOT EXISTS ix_account_snapshots_ts_id
+  ON account_snapshots(ts, id);
 CREATE TABLE IF NOT EXISTS improvement_backlog (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   idea TEXT NOT NULL,

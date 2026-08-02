@@ -22,6 +22,21 @@ def test_init_creates_all_13_tables(tmp_path):
     assert TABLE_NAMES == frozenset(EXPECTED)
 
 
+def test_init_creates_account_snapshots_ts_id_index(tmp_path):
+    """Task 12 Fix Round 1 (ユーザー裁定): snapshots.latest() の
+    ``ORDER BY ts DESC, id DESC LIMIT 1`` が無索引だと全表スキャンになり
+    tick 数に対して劣化する (実測 O(n^2) — cProfile で latest() が実行
+    時間の 92%)。インデックスの存在そのものをピンする (init_db 再実行
+    でも冪等に効くこと — ``test_init_is_idempotent`` の対象と同じ conn)。
+    """
+    conn = connect(tmp_path / "agentic.db")
+    init_db(conn)
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND name='ix_account_snapshots_ts_id'").fetchall()
+    assert len(rows) == 1
+
+
 def test_init_is_idempotent(tmp_path):
     conn = connect(tmp_path / "agentic.db")
     init_db(conn)
