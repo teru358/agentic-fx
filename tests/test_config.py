@@ -1,6 +1,8 @@
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from agentic_fx.config import ConfigError, Settings, load_settings
 
@@ -143,6 +145,16 @@ def _with_datafeed(tmp_path, **overrides):
     return p
 
 
+def _settings_with(**datafeed_overrides) -> Settings:
+    """Example を読んで Settings.model_validate() で再検証する。
+    model_copy は validation をスキップするため、Settings-level の
+    model_validator を検証する必要があるときはこのヘルパを使う。"""
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["datafeed"].update(datafeed_overrides)
+    return Settings.model_validate(raw)
+
+
 def test_intervals_defaults_from_example():
     s = load_settings(EXAMPLE)
     assert "1m" in s.datafeed.intervals
@@ -238,3 +250,33 @@ def test_invalid_display_timezone_rejected(tmp_path):
     p.write_text(yaml.safe_dump(raw))
     with pytest.raises(ConfigError, match="not a known IANA timezone"):
         load_settings(p)
+
+
+def test_backtest_and_analysis_defaults():
+    s = load_settings(EXAMPLE)
+    assert s.backtest.holdout_months == 3
+    assert s.backtest.initial_balance > 0
+    assert s.datafeed.watch_symbols == []
+    assert s.analysis.max_watch_symbols == 10
+    assert s.analysis.max_gap_pct == 5.0
+
+
+def test_watch_symbols_never_extend_pairs():
+    """watch は取引対象ではない — pair enum / risk 検証との独立を実 assert でピン。"""
+    # watch_symbols を足した settings でも:
+    s = _settings_with(watch_symbols=["XAUUSD"])
+    # ① market_tools の pair enum は settings.pairs のみ (watch が混入しない)
+    from agentic_fx.tools import market_tools
+    from agentic_fx.tools.registry import ToolRegistry
+    reg = ToolRegistry()
+    reg.register_all(market_tools.build(MagicMock(), MagicMock(), s))
+    schema = [t for t in reg.openai_tools(["get_ohlcv"])][0]
+    enum = schema["function"]["parameters"]["properties"]["pair"]["enum"]
+    assert enum == list(s.pairs) and "XAUUSD" not in enum
+    # ② watch_symbols は risk.pair_rules の検証対象外 (load が通ること自体が証明)
+
+
+def test_watch_symbols_capped_by_max():
+    """選定基準⑤: 上限は設定バリデータで機械的に強制 (レビュー裁定)。"""
+    with pytest.raises(ValidationError):
+        _settings_with(watch_symbols=[f"SYM{i}" for i in range(11)])  # 11 > 10

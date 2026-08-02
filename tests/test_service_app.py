@@ -14,6 +14,7 @@ from agentic_fx.service import (
     _assert_tools_registered, _check_llama_swap, _validate_startup,
     build_app, build_splash, run_init, run_service,
 )
+from tests.store.test_rag import FakeEmbedding
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 
@@ -29,9 +30,14 @@ def _init(tmp_path):
 
 
 def _seam_app(tmp_path, runner):
-    """run_service のテスト用シームで注入する App を組み立てる (F4)。"""
+    """run_service のテスト用シームで注入する App を組み立てる (F4)。
+
+    FakeEmbedding を注入することで chromadb のモデル DL を避け、
+    テスト高速化を実現する (Task 0)。
+    """
     _init(tmp_path)
-    return build_app(tmp_path, runner=runner, clock=FixedClock(NOW))
+    return build_app(tmp_path, runner=runner, clock=FixedClock(NOW),
+                     embedding_fn=FakeEmbedding())
 
 
 @contextmanager
@@ -425,3 +431,28 @@ def test_run_service_daemon_survives_keyboard_interrupt_during_wait(tmp_path):
     assert rc == 0
     act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
     assert "service_stopped" in act and "graceful" in act
+
+
+# ---- Task 0: build_app の embedding seam ---------------------------------
+
+def test_build_app_accepts_embedding_fn(tmp_path):
+    """embedding_fn 注入で chromadb 既定モデルの probe を回避できる。"""
+    _init(tmp_path)
+    calls = []
+
+    class TrackingEmbedding(FakeEmbedding):
+        def __call__(self, input):  # noqa: A002
+            calls.append(list(input))
+            return super().__call__(input)
+
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=TrackingEmbedding())
+    assert app.rag is not None
+    # Rag 初期化時に probe が実行されるか、あるいは最初の操作で呼ばれるか
+    # を確認する (calls に記録がある = fake が通った)。
+    if not calls:
+        # Rag.__init__ が probe しない場合、add_news を呼んで検証
+        app.rag.add_news([{"url": "https://ex.com/a1", "title": "Test",
+                           "body": "Test article",
+                           "source_name": "ex", "published": None}], NOW)
+    assert calls  # embedding function が呼ばれた
