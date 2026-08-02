@@ -69,3 +69,10 @@ analysis:                      # コア所有 (§6 履歴分析)
 
 paper:
   starting_balance: 1000000   # 学習モードの初期残高 (口座通貨建て)
+
+plugin:                        # plugin サンドボックス (プラン 7 Task 2)。省略可 (既定値でロード可能)
+  sandbox_timeout_sec: 10       # 1 回の call() (indicator/signal/strategy 呼び出し) の待ち上限
+  sandbox_session_cpu_sec: 60   # RLIMIT_CPU: worker プロセス (1 セッション) 寿命の累積 CPU 秒数上限
+  sandbox_memory_mb: 512        # RLIMIT_AS: 仮想アドレス空間上限 (MiB)
+  sandbox_output_max_bytes: 1048576  # 1 応答行の生バイト数上限
+  max_bars_limit: 1000          # plugin config.yaml の max_bars がこれを超えたら discover で reject

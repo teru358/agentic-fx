@@ -167,6 +167,29 @@ class PaperSettings(_Strict):
     starting_balance: float = Field(gt=0)
 
 
+class PluginSettings(_Strict):
+    """plugin サンドボックス (プラン 7 Task 2) の resource limit・IPC 設定。
+    既定値のみで動く (`Settings.plugin` は default_factory を持つ) ため、
+    このセクションを持たない既存 settings.yaml も無変更でロードできる。
+    """
+    # 1 回の call() (indicator/signal/strategy 呼び出し) の待ち上限。
+    # セッション起動 (import plugin.py) の待ちには使わない (別枠の固定
+    # 起動タイムアウトを sandbox.py 側に持つ — pandas 初回 import の遅延
+    # と暴走 plugin を区別するため)。
+    sandbox_timeout_sec: float = Field(gt=0, default=10.0)
+    # RLIMIT_CPU — worker プロセス 1 個 (= 1 セッション) の寿命に対する
+    # 累積 CPU 秒数上限。
+    sandbox_session_cpu_sec: int = Field(ge=1, default=60)
+    # RLIMIT_AS (仮想アドレス空間) の上限 MiB。
+    sandbox_memory_mb: int = Field(ge=1, default=512)
+    # 1 応答行の生バイト数上限。無制限バッファを避けるため読み取り中に
+    # この上限を超えた時点で打ち切る。
+    sandbox_output_max_bytes: int = Field(ge=1, default=1_048_576)
+    # plugin に渡す DataFrame の末尾最大本数の上限 (config.yaml の
+    # max_bars はこれ以下でなければならない — 照合は消費側の責務)。
+    max_bars_limit: int = Field(ge=1, default=1000)
+
+
 class Settings(_Strict):
     # ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)
     display_timezone: str = "UTC"
@@ -186,6 +209,7 @@ class Settings(_Strict):
     discord: DiscordSettings
     analysis: AnalysisSettings
     paper: PaperSettings
+    plugin: PluginSettings = Field(default_factory=PluginSettings)
 
     @field_validator("display_timezone")
     @classmethod
