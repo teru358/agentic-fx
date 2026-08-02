@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from agentic_fx.backtest.holdout import in_sample_until as _in_sample_until
+from agentic_fx.backtest.timeframes import load_resampled_frame
 from agentic_fx.config import Settings
 from agentic_fx.core.market_hours import is_market_open
 from agentic_fx.core.timeutil import as_utc
@@ -62,17 +63,29 @@ def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
                   ) -> dict[datetime, float]:
     """symbol の log リターン系列を返す (キーは aware UTC datetime)。
 
-    各 bar_time について「ちょうど 1 バー幅前」の close が存在するペアの
+    各 bucket について「ちょうど 1 バー幅前」の close が存在するペアの
     みリターンを定義する — 欠損ギャップを跨ぐリターンは作らない (§C)。
 
-    ``in_sample_until`` は排他 (``bar_time < in_sample_until``)。
-    ``load_bars`` の ``until`` は inclusive なので直接使わず、SQL で
-    ``bar_time < ?`` を書く (境界バーが holdout 側の period_start に
-    なるため — Task 9 裁定、上書き節 B)。
+    プラン 7 Task 0 で ohlcv の 1m 行から
+    ``load_resampled_frame(...).close`` へ配線を切り替えた (分析面の生産者
+    不在ブロッカー解消 — 本ブランチのインポータは 1m しか書かない)。
 
-    ``since`` (Task 11 上書き節 E の最小追加): 指定時は ``bar_time >= ?``
-    を追加する。既定 None は従来どおり全履歴 (改善ループ ``analyze_for_agent``
-    は since を渡さない — 挙動不変)。
+    境界の対応関係: 旧実装は ``bar_time < in_sample_until`` (interval=
+    timeframe の行を直接読む) だった。新実装は「完成バケットのみ
+    (``bucket_end <= until``)」(``load_resampled_frame`` 契約)。timeframe
+    幅の格子上にある on-grid なバー列 (バケットにつき 1 本、境界時刻
+    ぴったりに置かれたデータ) では、この 2 条件は同値になる
+    (``bar_time < until`` ⟺ ``bar_time <= until - width`` ⟺
+    ``bar_time + width <= until``。整数個のバー幅刻みでは端数が出ない)。
+    よって振る舞いは変わらない。
+
+    ``in_sample_until`` は ``load_resampled_frame`` の ``until`` (排他/
+    完成バケットのみ) として渡す。
+
+    ``since`` (Task 11 上書き節 E の最小追加): 指定時は
+    ``load_resampled_frame`` の ``since`` (= since 以降に開始する完成
+    バケットのみ) として渡す。既定 None は従来どおり全履歴 (改善ループ
+    ``analyze_for_agent`` は since を渡さない — 挙動不変)。
 
     F1 (Fix Round 1, codex Important-1 = sonnet Minor-2): ohlcv.close に
     正値制約は無く (REAL NOT NULL のみ)、close<=0 のバーが混入すると
@@ -83,19 +96,10 @@ def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
     観測不足なら insufficient_data に自然合流する (fail closed)。
     """
     until_utc = as_utc(in_sample_until)
-    if since is None:
-        rows = conn.execute(
-            "SELECT bar_time, close FROM ohlcv WHERE symbol=? AND interval=? "
-            "AND source=? AND bar_time < ? ORDER BY bar_time",
-            (symbol, timeframe, source, until_utc.isoformat())).fetchall()
-    else:
-        since_utc = as_utc(since)
-        rows = conn.execute(
-            "SELECT bar_time, close FROM ohlcv WHERE symbol=? AND interval=? "
-            "AND source=? AND bar_time >= ? AND bar_time < ? ORDER BY bar_time",
-            (symbol, timeframe, source, since_utc.isoformat(),
-             until_utc.isoformat())).fetchall()
-    closes = {datetime.fromisoformat(r["bar_time"]): r["close"] for r in rows}
+    since_utc = None if since is None else as_utc(since)
+    df = load_resampled_frame(conn, symbol, timeframe, source=source,
+                              since=since_utc, until=until_utc)
+    closes = {ts.to_pydatetime(): float(c) for ts, c in df["close"].items()}
     width = timedelta(minutes=_TF_MINUTES[timeframe])
     returns: dict[datetime, float] = {}
     for t, c in closes.items():
@@ -287,16 +291,23 @@ def coverage_report(conn: sqlite3.Connection, symbol: str, *, timeframe: str,
 
     ``expected_open_bars`` = ``[start, end)`` を timeframe 幅で刻んだ各バー
     始点のうち ``is_market_open(bar_start)`` が True の個数。``bars`` は
-    同じ範囲に実在する ohlcv 行の総数 (市場時間外に紛れ込んだ行があれば
-    ``gap_pct`` が負になり得るが、これはそれ自体データ品質の異常信号なので
-    人間 CLI 向けにそのまま見せる — 隠さない判断)。``expected_open_bars``
-    が 0 なら計算不能として ValueError (fail closed)。start/end は naive
-    なら ValueError (watch 銘柄選定基準③ を人間が判定するための関数 —
-    改善ループには露出しないため §6 遮断の対象外)。
+    プラン 7 Task 0 で「同じ範囲に実在する ohlcv 行の総数 (COUNT(*))」から
+    「``load_resampled_frame(..., since=start, until=end)`` が返す完成
+    リサンプル・バケットの本数」へ切り替えた (本ブランチのインポータは
+    1m しか書かないため、旧 COUNT(*) は interval=timeframe (例: "1h") の
+    行を素通りで数えており、1m 化以降は常に 0 になっていた)。市場時間外に
+    紛れ込んだ行があれば ``gap_pct`` が負になり得るが、これはそれ自体
+    データ品質の異常信号なので人間 CLI 向けにそのまま見せる (隠さない判断
+    — この振る舞いは resample 切り替え後も変わらない)。
+    ``expected_open_bars`` が 0 なら計算不能として ValueError (fail
+    closed)。start/end は naive なら ValueError (watch 銘柄選定基準③ を
+    人間が判定するための関数 — 改善ループには露出しないため §6 遮断の
+    対象外)。
 
     ``timeframe`` は ``TIMEFRAMES`` (改善ループ向け列挙) に加えて ``"1m"``
     も受け付ける (F3, 最終レビュー opus I-2) — 本ブランチのインポータが
-    書くのは 1m のみのため。
+    書くのは 1m のみのため (``load_resampled_frame`` は "1m" を素通しで
+    返す)。
     """
     if timeframe not in _COVERAGE_TF_MINUTES:
         raise ValueError("timeframe is not one of the enumerated values")
@@ -312,12 +323,9 @@ def coverage_report(conn: sqlite3.Connection, symbol: str, *, timeframe: str,
     if expected_open_bars == 0:
         raise ValueError("expected_open_bars is zero (empty or fully closed "
                          "range)")
-    row = conn.execute(
-        "SELECT COUNT(*) AS n FROM ohlcv WHERE symbol=? AND interval=? "
-        "AND source=? AND bar_time >= ? AND bar_time < ?",
-        (symbol, timeframe, source, start_utc.isoformat(),
-         end_utc.isoformat())).fetchone()
-    bars = row["n"]
+    df = load_resampled_frame(conn, symbol, timeframe, source=source,
+                              since=start_utc, until=end_utc)
+    bars = len(df)
     gap_pct = (expected_open_bars - bars) / expected_open_bars * 100
     return {"bars": bars, "expected_open_bars": expected_open_bars,
             "gap_pct": gap_pct}

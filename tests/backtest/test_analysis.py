@@ -27,6 +27,7 @@ from agentic_fx.backtest.analysis import (
     rolling_corr_summary,
 )
 from agentic_fx.backtest.holdout import holdout_boundary
+from agentic_fx.backtest.timeframes import TF_MINUTES
 from agentic_fx.store import ohlcv
 
 from tests.backtest.conftest import H, SETTINGS, _conn
@@ -44,9 +45,29 @@ def _settings_watch_eurusd():
 
 
 def _series(conn, symbol, values, *, start, timeframe="1h"):
-    """決定的な close 列を 1h バーとして投入 (乱数・実時刻不使用)。"""
-    step = timedelta(hours=1)
-    rows = [(symbol, timeframe, (start + i * step).isoformat(),
+    """決定的な close 列を、timeframe 幅 (既定 1h) 刻みの **1m** バーとして
+    投入する (乱数・実時刻不使用)。
+
+    プラン 7 Task 0 で分析面が ``load_resampled_frame`` (ohlcv の 1m 行から
+    読み取り時リサンプル) 経由に切り替わったため、``interval=timeframe``
+    (例 "1h") の行を直接投入しても分析関数からは見えなくなった (本
+    ブランチのインポータが書くのは 1m のみという前提と揃えた)。resample
+    は「在る分だけ」を集約するので、timeframe バケットにつき 1m 行を
+    ちょうど 1 本 (バケット境界時刻に) 置けば、旧実装 (interval=timeframe
+    を直接投入) と同じ close 系列・同じ行数・同じ意味論を再現できる
+    (1h 系列を 1 分刻みで敷き詰める必要はない — 例えば
+    ``test_agent_analysis_is_in_sample_bounded`` は 4800 バーで 570 万行に
+    なってしまう)。``start`` は timeframe の epoch 錨バケット境界に乗って
+    いる必要がある。本ファイルの既存 start (H・BEFORE_BOUNDARY・NOW 由来の
+    各種オフセット) は全て分=0 の時刻なので、既定の "1h" (と "4h" — 12 が
+    4 の倍数の時刻はどれも成立) では整合する。**"1d" では成り立たない**
+    (epoch 錨の 1d バケットは UTC 00:00 始まりなので、H=12:00Z のような
+    正午始まりの行は 00:00 バケットへ丸め込まれてしまう) — 本ファイルは
+    "1d" を使うテストを持たないため実害は無いが、将来 timeframe="1d" で
+    ``_series`` を使う場合は ``start`` を UTC 00:00 に揃えること。
+    """
+    step = timedelta(minutes=TF_MINUTES[timeframe])
+    rows = [(symbol, "1m", (start + i * step).isoformat(),
              v, v + 0.05, v - 0.05, v, 1.0, 0.01)
             for i, v in enumerate(values)]
     ohlcv.import_bars(conn, rows, source="dukascopy")
@@ -221,7 +242,7 @@ def test_agent_handles_non_positive_close_without_raising(tmp_path):
     """
     conn = _conn(tmp_path)
     values = [0.0, 100.0, 101.0, 102.0, 103.0]  # 先頭が close=0
-    rows = [("USDJPY", "1h", (BEFORE_BOUNDARY + i * timedelta(hours=1))
+    rows = [("USDJPY", "1m", (BEFORE_BOUNDARY + i * timedelta(hours=1))
              .isoformat(), v, v + 0.05, v - 0.05, v, 1.0, 0.01)
             for i, v in enumerate(values)]
     ohlcv.import_bars(conn, rows, source="dukascopy")
@@ -241,7 +262,7 @@ def test_load_returns_excludes_non_positive_close_pairs(tmp_path):
     ZeroDivisionError を送出してはならない。"""
     conn = _conn(tmp_path)
     values = [0.0, 100.0, 101.0, 102.0, 103.0]  # 先頭が close=0
-    rows = [("USDJPY", "1h", (BEFORE_BOUNDARY + i * timedelta(hours=1))
+    rows = [("USDJPY", "1m", (BEFORE_BOUNDARY + i * timedelta(hours=1))
              .isoformat(), v, v + 0.05, v - 0.05, v, 1.0, 0.01)
             for i, v in enumerate(values)]
     ohlcv.import_bars(conn, rows, source="dukascopy")

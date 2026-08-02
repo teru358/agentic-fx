@@ -1,0 +1,243 @@
+"""timeframes — 上位足の読み取り時リサンプル (プラン 7 Task 0)。
+
+契約 (プラン Task 0):
+- until は**排他**。末尾の部分バケット (until 時点で終端未確定 =
+  bucket_end > until) は落とす (先読み防止)。
+- since は「since 以降に開始する完成バケットのみ」(epoch 錨なので部分集約
+  は生じない)。
+- max_bars 指定時は末尾 max_bars 本のみ返し、SQL 読み出しも
+  `until - max_bars×tf×2` (安全係数 2) までに制限する。
+- バケット内の 1m 欠損は「在る分だけの集約」(codex R1 I7)。
+
+プラン記述の欠陥修正 (レジャー参照): プラン原文の
+`test_max_bars_limits_result_and_sql_window` は index[-1] == H+3h を期待
+するが、since テストが固定する完成判定 (bucket_end <= until) の下では
+until=H+300m のとき bucket [H+4h, H+5h) は完成 → 正しくは H+4h。
+"""
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from agentic_fx.backtest.timeframes import (
+    PLUGIN_TIMEFRAMES, RESAMPLE_TIMEFRAMES, TF_MINUTES, floor_to_bucket,
+    load_resampled_frame,
+)
+from agentic_fx.core.contracts import Bar
+from agentic_fx.store import ohlcv
+
+from tests.backtest.conftest import H, _conn, _row_at
+
+
+def test_enums_and_minutes_are_consistent():
+    assert RESAMPLE_TIMEFRAMES == ("1m", "15m", "1h", "4h", "1d")
+    assert PLUGIN_TIMEFRAMES == ("15m", "1h", "4h", "1d")
+    # plugin 宣言足は「1m を除く RESAMPLE_TIMEFRAMES」(D5)
+    assert PLUGIN_TIMEFRAMES == tuple(
+        tf for tf in RESAMPLE_TIMEFRAMES if tf != "1m")
+    assert TF_MINUTES == {"1m": 1, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+
+
+# --- floor_to_bucket (Task 8 producer が使う epoch 錨切り下げ) ----------
+
+def test_floor_to_bucket_epoch_anchor():
+    ts = datetime(2026, 7, 22, 14, 37, 12, 345678, tzinfo=timezone.utc)
+    assert floor_to_bucket(ts, "1h") == datetime(
+        2026, 7, 22, 14, 0, tzinfo=timezone.utc)
+    assert floor_to_bucket(ts, "15m") == datetime(
+        2026, 7, 22, 14, 30, tzinfo=timezone.utc)
+    # 4h の epoch 錨は 00/04/08/12/16/20 時
+    assert floor_to_bucket(ts, "4h") == datetime(
+        2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+    # 1d は UTC 00:00 (epoch は深夜整列なので日付切り下げと一致)
+    assert floor_to_bucket(ts, "1d") == datetime(
+        2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+
+
+def test_floor_to_bucket_identity_on_boundary():
+    assert floor_to_bucket(H, "1h") == H
+    assert floor_to_bucket(H, "4h") == H  # H = 12:00 UTC は 4h 境界
+
+
+def test_floor_to_bucket_rejects_naive_and_unknown_tf():
+    with pytest.raises(ValueError):
+        floor_to_bucket(datetime(2026, 7, 22, 14, 0), "1h")  # naive
+    with pytest.raises(ValueError):
+        floor_to_bucket(H, "5m")  # 列挙外
+
+
+def test_floor_to_bucket_normalizes_non_utc_offset():
+    # +09:00 表記の同一瞬間も UTC の同一バケットへ
+    jst = timezone(timedelta(hours=9))
+    ts = datetime(2026, 7, 22, 23, 37, tzinfo=jst)  # = 14:37 UTC
+    assert floor_to_bucket(ts, "1h") == datetime(
+        2026, 7, 22, 14, 0, tzinfo=timezone.utc)
+
+
+# --- load_resampled_frame (プラン Step 1 の 5 テスト) --------------------
+
+def test_resampled_1h_bucket_anchor_and_ohlc(tmp_path):
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=i), o=100 + i, h=100 + i + 0.5,
+                    l=100 + i - 0.5, c=100 + i + 0.2) for i in range(90)]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                              until=H + timedelta(minutes=90))
+    assert len(df) == 1 and df.index[0].to_pydatetime() == H
+    assert df.iloc[0]["open"] == 100 and df.iloc[0]["high"] == 159.5
+    # close は最後の 1m バー (i=59) の close、low は最小値
+    assert df.iloc[0]["close"] == 159.2 and df.iloc[0]["low"] == 99.5
+
+
+def test_partial_tail_bucket_dropped_lookahead_guard(tmp_path):
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
+            for i in range(120)]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                              until=H + timedelta(minutes=61))
+    assert len(df) == 1
+
+
+def test_since_returns_only_buckets_starting_at_or_after_since(tmp_path):
+    """契約: since 以降に開始する完成バケットのみ (epoch 錨なので部分集約は生じない)。"""
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=i), o=100 + i, h=100 + i + 0.5,
+                    l=100 + i - 0.5, c=100 + i) for i in range(120)]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                              since=H + timedelta(minutes=30),
+                              until=H + timedelta(minutes=120))
+    assert len(df) == 1 and df.iloc[0]["open"] == 160  # [H+1h,) のみ・欠け open なし
+
+
+def test_max_bars_limits_result_and_sql_window(tmp_path):
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
+            for i in range(300)]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    # codex R3 M2: SQL 側の読み出し下限も観測する (tail() で誤魔化せないよう
+    # set_trace_callback で発行 SQL を記録し、bar_time >= のパラメータが
+    # until - max_bars*tf*2 に一致することを assert する)
+    seen_sql: list[str] = []
+    conn.set_trace_callback(seen_sql.append)
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                              until=H + timedelta(minutes=300), max_bars=2)
+    conn.set_trace_callback(None)
+    # プラン原文は index[-1]==H+3h だが完成判定 (bucket_end <= until) と
+    # 矛盾 (レジャー参照)。[H+3h, H+4h] の 2 本が正。
+    assert len(df) == 2
+    assert df.index[-1].to_pydatetime() == H + timedelta(hours=4)
+    assert df.index[0].to_pydatetime() == H + timedelta(hours=3)
+    assert any((H + timedelta(minutes=300 - 2 * 60 * 2)).isoformat()
+               in s for s in seen_sql)  # SQL 窓の下限が実際に渡っている
+
+
+def test_intra_bucket_gap_aggregates_present_bars(tmp_path):
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
+            for i in range(60) if i != 30]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                              until=H + timedelta(minutes=60))
+    assert len(df) == 1 and df.iloc[0]["volume"] == 59 * 10.0
+
+
+# --- 契約の細部 (fail closed / 1m 素通し / 空) ---------------------------
+
+def test_1m_is_passthrough_not_resampled(tmp_path):
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=i), o=100 + i, h=100.5 + i,
+                    l=99.5 + i, c=100 + i) for i in range(3)]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    df = load_resampled_frame(conn, "USDJPY", "1m", source="dukascopy",
+                              until=H + timedelta(minutes=3))
+    assert len(df) == 3
+    assert list(df["open"]) == [100, 101, 102]
+
+
+def test_1m_partial_tail_minute_dropped(tmp_path):
+    """1m でも完成判定は同一規則: bar_ts + 1m > until の行は返さない。"""
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
+            for i in range(3)]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    df = load_resampled_frame(conn, "USDJPY", "1m", source="dukascopy",
+                              until=H + timedelta(minutes=2, seconds=30))
+    assert len(df) == 2  # 3 本目 (H+2m) は終端 H+3m > until で未確定
+
+
+def test_unknown_timeframe_rejected(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        load_resampled_frame(conn, "USDJPY", "5m", source="dukascopy",
+                             until=H)
+
+
+def test_until_required_for_resampled_timeframes(tmp_path):
+    """until 無しでは完成判定の基準点が無い — fail closed (レジャー裁定)。"""
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy")
+    with pytest.raises(ValueError):  # max_bars の SQL 窓も until 依存
+        load_resampled_frame(conn, "USDJPY", "1m", source="dukascopy",
+                             max_bars=10)
+
+
+def test_naive_since_until_rejected(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             until=datetime(2026, 7, 22, 13, 0))  # naive
+    with pytest.raises(ValueError):
+        load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             since=datetime(2026, 7, 22, 12, 0),  # naive
+                             until=H + timedelta(hours=1))
+
+
+def test_max_bars_must_be_positive(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             until=H + timedelta(hours=1), max_bars=0)
+
+
+def test_empty_history_returns_empty_frame(tmp_path):
+    conn = _conn(tmp_path)
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                              until=H + timedelta(hours=1))
+    assert len(df) == 0
+    assert list(df.columns) == ["open", "high", "low", "close", "volume"]
+
+
+def test_source_is_filtered(tmp_path):
+    """単一 source の SQL 直読み — 他 source の行を混ぜない。"""
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
+            for i in range(60)]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.upsert_bars(
+        conn,
+        [Bar("USDJPY", "1m", H + timedelta(minutes=i), 200, 200.5, 199.5, 200,
+             10.0) for i in range(60)],
+        source="yfinance")
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                              until=H + timedelta(minutes=60))
+    assert len(df) == 1 and df.iloc[0]["open"] == 100
+
+
+def test_1d_bucket_anchored_at_utc_midnight(tmp_path):
+    """1d の境界は UTC 00:00 (epoch 錨) — NY ロールオーバーではない。"""
+    conn = _conn(tmp_path)
+    day = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+    # 1 日ぶんを疎に (0:00 と 23:59 の 2 本 — 在る分だけの集約)
+    rows = [_row_at(day, o=100, h=101, l=99, c=100.5),
+            _row_at(day + timedelta(hours=23, minutes=59),
+                    o=102, h=103, l=101, c=102.5)]
+    ohlcv.import_bars(conn, rows, source="dukascopy")
+    df = load_resampled_frame(conn, "USDJPY", "1d", source="dukascopy",
+                              until=day + timedelta(days=1))
+    assert len(df) == 1 and df.index[0].to_pydatetime() == day
+    assert df.iloc[0]["open"] == 100 and df.iloc[0]["close"] == 102.5
+    assert df.iloc[0]["high"] == 103 and df.iloc[0]["low"] == 99

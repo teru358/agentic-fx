@@ -484,13 +484,17 @@ def test_cli_analyze_corr_does_not_write_to_analysis_runs_real_db(
     init_db(conn)
     start = datetime(2026, 1, 5, 0, 0, tzinfo=timezone.utc)
     rows_a, rows_b = [], []
+    # プラン 7 Task 0: 分析関数は ohlcv の 1m 行から読み取り時リサンプルする
+    # ので (本ブランチのインポータは 1m のみ書く)、ここも interval="1m" で
+    # 1h 刻みに 1 本ずつ投入する (resample は「在る分だけ」の集約なので、
+    # 旧 interval="1h" 直接投入と同じ close 系列・行数になる)。
     for i in range(45):  # MIN_COMMON_OBS(30) を十分上回る決定的系列
         t = (start + timedelta(hours=i)).isoformat()
         va = 100 + math.sin(i / 5.0)
         vb = 50 + math.sin(i / 5.0 + 0.3)
-        rows_a.append(("USDJPY", "1h", t, va, va + 0.05, va - 0.05, va, 1.0,
+        rows_a.append(("USDJPY", "1m", t, va, va + 0.05, va - 0.05, va, 1.0,
                        0.01))
-        rows_b.append(("EURUSD", "1h", t, vb, vb + 0.05, vb - 0.05, vb, 1.0,
+        rows_b.append(("EURUSD", "1m", t, vb, vb + 0.05, vb - 0.05, vb, 1.0,
                        0.01))
     ohlcv_store.import_bars(conn, rows_a, source="dukascopy")
     ohlcv_store.import_bars(conn, rows_b, source="dukascopy")
