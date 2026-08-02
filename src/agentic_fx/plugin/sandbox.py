@@ -9,6 +9,12 @@ plugin コードの事故 (無限ループ・OOM・意図しない I/O)」を防
 承認** (§6 — plugin は承認されるまで discover/実行されず、承認は
 content_hash 一致を人間がレビューした版に限定する)。
 
+**実行時ハッシュ再検証 (プラン 7 Task 3 レビュー fix round 1 F1)**:
+`PluginSession.__enter__` は worker 起動前に `loader.content_hash` で
+plugin フォルダを再計算し `meta.content_hash` と照合する (TOCTOU 封鎖 —
+起動時の承認チェックと実行時の import の間で plugin.py が差し替えられて
+いないことを保証する)。詳細は `PluginSession.__enter__` の docstring。
+
 **セッション型 IPC の設計 (opus R2 I1)**: バックテストは同一 plugin を
 数千回評価するため、1 回の評価ごとに 1 プロセスを起動していては性能が
 成立しない。`PluginSession` は worker サブプロセストを 1 個だけ起動し、
@@ -70,7 +76,7 @@ from typing import TYPE_CHECKING, Any
 from agentic_fx.core.contracts import (
     Direction, EntryType, StrategyAction, StrategyDecision,
 )
-from agentic_fx.plugin.loader import PluginMeta
+from agentic_fx.plugin.loader import PluginMeta, content_hash
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -305,8 +311,34 @@ class PluginSession:
         そのまま、それ以外の例外は `SandboxError` へ写像 — 呼び出し側が
         `SandboxError` 1 種だけ catch すればよい契約を `__enter__` でも
         維持する)。
+
+        **実行時ハッシュ再検証 (プラン 7 Task 3 レビュー fix round 1 F1
+        — TOCTOU 封鎖)**: `check_source`/`subprocess.Popen` より前に
+        `loader.content_hash(self._meta.path)` を再計算し、`self._meta.
+        content_hash` (呼び出し元がこの meta を取得した時点でのハッシュ
+        — 通常は `plugin_loader.approved_plugins()` が起動時に承認と
+        照合したもの) と不一致なら `SandboxError` を送出する。
+        `approved_plugins()` は起動時 (discover 時点) にディスク内容を
+        検証するだけで、実際に worker が plugin.py を import するのは
+        その後の `get_indicators` 呼び出し時 — その間隔で plugin.py が
+        承認内容と異なる内容に差し替えられても、再検証が無ければ古い
+        承認のまま新しい (未承認の) コードが実行されてしまう
+        (「承認は内容ハッシュに対して行う」設計書 §6 の実行時破れ)。
+        ここでの再検証により、`run_plugin`/`PluginSession` を経由する
+        全消費者 (本 task の `get_indicators` 合成、将来の signal/strategy
+        評価) が一括で守られる。**なお、この再検証自体と実際の import
+        (worker プロセス起動後) の間にも理論上ミリ秒級のレースが残る
+        (再検証直後に書き換えられれば検出できない) — 本モジュールの
+        脅威モデル (悪意ある攻撃者からの完全な隔離は保証せず、善意だが
+        不注意な plugin コードの事故を防ぐことが目的) の範囲では許容する。
         """
         try:
+            current_hash = content_hash(self._meta.path)
+            if current_hash != self._meta.content_hash:
+                raise SandboxError(
+                    f"plugin {self._meta.name!r}: content changed since "
+                    "discovery (hash mismatch) — refusing to execute "
+                    f"(expected {self._meta.content_hash}, got {current_hash})")
             check_source(self._meta.path / "plugin.py")
             env = _build_env()
             self._proc = subprocess.Popen(

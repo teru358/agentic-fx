@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from agentic_fx.config import load_settings
-from agentic_fx.plugin.loader import PluginMeta
+from agentic_fx.plugin.loader import PluginMeta, content_hash as _real_content_hash
 from agentic_fx.plugin.sandbox import (
     SandboxError, check_source, run_plugin, _build_env, _SINGLE_THREAD_ENV,
     _reader_worker, PluginSession,
@@ -31,13 +31,17 @@ def plugin_settings():
 def _meta(base: Path, name: str, kind: str, plugin_py: str, *,
          max_bars: int = 200, timeframe: str | None = None,
          pairs: tuple[str, ...] = ()) -> PluginMeta:
+    """`content_hash` は**実際の** plugin.py/config.yaml から算出する
+    (レビュー fix round 1 F1: `PluginSession.__enter__` が実行時に
+    ハッシュを再検証するようになったため、固定プレースホルダだと全テスト
+    が起動直後の hash-mismatch で SandboxError になってしまう)。"""
     d = base / name
     d.mkdir()
     (d / "plugin.py").write_text(plugin_py)
     (d / "config.yaml").write_text(f"kind: {kind}\n")
     (d / "test_plugin.py").write_text("def test_placeholder():\n    pass\n")
     return PluginMeta(name=name, kind=kind, path=d, params={}, timeframe=timeframe,
-                      pairs=pairs, max_bars=max_bars, content_hash="0" * 64)
+                      pairs=pairs, max_bars=max_bars, content_hash=_real_content_hash(d))
 
 
 def _df(n: int = 30) -> pd.DataFrame:
@@ -402,6 +406,33 @@ def test_run_plugin_rejects_disallowed_import_before_spawning(tmp_path, plugin_s
         run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings)
 
 
+# --- レビュー fix round 1 F1 (Task 3 レビュー, codex Critical):
+# 起動時ハッシュ照合と実行時 import の TOCTOU を worker 起動前の再検証で
+# 封鎖する。`approved_plugins()` は起動時 (discover 時点) にディスクの
+# ハッシュを検証するだけで、実際に worker が plugin.py を import するのは
+# その後の呼び出し時 — この間隔で plugin.py が承認内容と異なる内容に
+# 差し替えられても、再検証が無ければ古い承認のまま新しいコードが実行され
+# てしまう ("承認は内容ハッシュに対して行う" 設計書 §6 の実行時破れ)。
+
+def test_run_plugin_rejects_when_plugin_edited_after_meta_captured(
+        tmp_path, plugin_settings):
+    """① meta 取得後に plugin.py を書き換える → run_plugin (= PluginSession.
+    __enter__ 経由) が worker を起動する前に SandboxError を送出する。"""
+    meta = _meta(tmp_path, "ind", "indicator", INDICATOR_OK_PY)
+    (meta.path / "plugin.py").write_text(
+        INDICATOR_OK_PY + "\n# edited after meta was captured\n")
+    with pytest.raises(SandboxError, match="content changed since discovery"):
+        run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings)
+
+
+def test_run_plugin_unedited_meta_still_runs_normally(tmp_path, plugin_settings):
+    """③ 回帰: plugin.py を編集しなければ従来どおり通る (①の対比 — 常に
+    reject される変異 (`raise SandboxError` を常時実行等) を検出する)。"""
+    meta = _meta(tmp_path, "ind", "indicator", INDICATOR_OK_PY)
+    out = run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings)
+    assert out["mean_close"] == pytest.approx(_df()["close"].mean())
+
+
 # --- ⑥ 無限ループ → timeout 1s で SandboxError (実測上限 1 秒。唯一の実 sleep) ---
 
 def test_infinite_loop_times_out_within_one_second(tmp_path, plugin_settings):
@@ -695,7 +726,7 @@ def test_sample_rsi_indicator_passes_check_source_and_runs(plugin_settings):
     check_source(plugin_dir / "plugin.py")
     meta = PluginMeta(name="rsi_indicator", kind="indicator", path=plugin_dir,
                       params={"period": 14}, timeframe=None, pairs=(),
-                      max_bars=200, content_hash="0" * 64)
+                      max_bars=200, content_hash=_real_content_hash(plugin_dir))
     closes = [100 + i * 0.1 for i in range(30)]
     idx = pd.date_range("2026-01-01", periods=len(closes), freq="1h", tz="UTC")
     df = pd.DataFrame(
@@ -713,7 +744,7 @@ def test_sample_sma_cross_passes_check_source_and_runs(plugin_settings):
                       params={"fast_period": 5, "slow_period": 20,
                              "stop_loss_pips": 20, "pip_size": 0.01},
                       timeframe="1h", pairs=("USDJPY",), max_bars=200,
-                      content_hash="0" * 64)
+                      content_hash=_real_content_hash(plugin_dir))
     closes = [120 - i for i in range(20)] + [200]
     idx = pd.date_range("2026-01-01", periods=len(closes), freq="1h", tz="UTC")
     df = pd.DataFrame(

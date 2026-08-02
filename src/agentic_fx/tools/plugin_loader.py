@@ -69,17 +69,33 @@ def approved_plugins(conn: sqlite3.Connection, plugins_dir: Path) -> list[Plugin
 
 def _approved_hashes_by_name(conn: sqlite3.Connection) -> dict[str, set[str]]:
     rows = conn.execute(
-        "SELECT payload_json FROM approval_requests "
+        "SELECT id, payload_json FROM approval_requests "
         "WHERE kind=? AND status='approved'", (APPROVAL_KIND,)).fetchall()
     out: dict[str, set[str]] = {}
     for row in rows:
         try:
             payload = json.loads(row["payload_json"])
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as exc:
+            # DB 破損 (手動編集・移行漏れ等) の観測性のため warning を残す
+            # (approved_plugins() 自体は fail closed で継続 — この行は
+            # ただ「承認情報として使えない」だけとして扱う)。
+            _log.warning(
+                "approval_requests id=%s (kind=%s): payload_json が JSON と"
+                "して解釈できません (%s) — skipping this row",
+                row["id"], APPROVAL_KIND, exc)
             continue
         if not isinstance(payload, dict):
+            _log.warning(
+                "approval_requests id=%s (kind=%s): payload が dict では"
+                "ありません (got %s) — skipping this row",
+                row["id"], APPROVAL_KIND, type(payload).__name__)
             continue
         name, content_hash = payload.get("name"), payload.get("content_hash")
         if isinstance(name, str) and isinstance(content_hash, str):
             out.setdefault(name, set()).add(content_hash)
+        else:
+            _log.warning(
+                "approval_requests id=%s (kind=%s): payload に有効な "
+                "name/content_hash (str) がありません — skipping this row",
+                row["id"], APPROVAL_KIND)
     return out

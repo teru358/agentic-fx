@@ -1,9 +1,16 @@
 """plugin_loader.approved_plugins + market_tools.build の indicator plugin
 合成テスト (プラン 7 Task 3)。
 
-実 subprocess サンドボックス (Task 2 の対象) は使わない — `sandbox_run` は
-すべて fake で差し替える。DB は tmp_path 上の sqlite のみ。実 HTTP/git/
-乱数/実時計は使わない。
+実 subprocess サンドボックス (Task 2 の対象) は基本的に使わない —
+`sandbox_run` はほとんどのテストで fake に差し替える。**唯一の例外**は
+`test_get_indicators_fail_open_on_real_toctou_hash_mismatch` (レビュー
+fix round 1 F1 の統合テスト) — 実行時ハッシュ再検証 (sandbox.py 側) が
+`get_indicators` の fail-open 経路と正しく繋がっていることを検証するため
+実 `plugin_sandbox.run_plugin` を呼ぶ。ただしこのテストのシナリオでは
+ハッシュ再検証が `subprocess.Popen` より**前**に走って即座に
+`SandboxError` を送出するため、実際には worker サブプロセスは 1 つも
+起動しない (実 subprocess コストはゼロ)。
+DB は tmp_path 上の sqlite のみ。実 HTTP/git/乱数/実時計は使わない。
 """
 from __future__ import annotations
 
@@ -101,6 +108,45 @@ def test_approved_plugins_includes_approved_hash_match(tmp_path):
     assert len(metas) == 1
     assert metas[0].name == "good_ind"
     assert isinstance(metas[0], PluginMeta)
+
+
+# レビュー fix round 1 F2 (Task 3 レビュー, codex) — status='approved' の
+# 完全一致を固定するテスト (status を LIKE 一致や大文字許容に緩める変異、
+# pending/rejected を admit してしまう変異を検出する)。
+
+def test_approved_plugins_excludes_pending_only(tmp_path, caplog):
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "pending_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash
+    # decide しない → status='pending' のまま
+    approvals.create(conn, "plugin",
+                     {"name": "pending_ind", "content_hash": content_hash(d)}, NOW)
+
+    with caplog.at_level(logging.WARNING):
+        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert metas == []
+    assert "pending_ind" in caplog.text
+
+
+def test_approved_plugins_excludes_rejected_only(tmp_path, caplog):
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "rejected_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash
+    aid = approvals.create(conn, "plugin",
+                           {"name": "rejected_ind", "content_hash": content_hash(d)}, NOW)
+    approvals.decide(conn, aid, status="rejected", decided_by="shell", now=NOW,
+                     reason="quality")
+
+    with caplog.at_level(logging.WARNING):
+        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert metas == []
+    assert "rejected_ind" in caplog.text
 
 
 # ③ 承認後の編集で出ない (ハッシュ不一致) --------------------------------
@@ -339,3 +385,40 @@ pairs: [USDJPY]
 
     assert called == []
     assert not any(k.startswith("plugin:") for k in result)
+
+
+# --- レビュー fix round 1 F1 (Task 3 レビュー, codex Critical) -----------
+# ② get_indicators 合成経路で TOCTOU シナリオ (meta 取得後に plugin.py を
+# 編集) → 実サンドボックス (`plugin_sandbox.run_plugin`, fake ではない) の
+# 実行時ハッシュ再検証が SandboxError を送出し、既存の fail-open
+# (`except plugin_sandbox.SandboxError`) が当該 plugin キーだけを落とし、
+# 組み込み指標は返ることを確認する — sandbox.py 側の修正と
+# market_tools.py 側の fail-open が実際に繋がっていることの統合テスト。
+
+def test_get_indicators_fail_open_on_real_toctou_hash_mismatch(tmp_path, caplog):
+    d = _write_plugin(tmp_path, "toctou_ind")
+    from agentic_fx.plugin.loader import content_hash as ch
+    meta = PluginMeta(name="toctou_ind", kind="indicator", path=d, params={},
+                      timeframe=None, pairs=(), max_bars=50, content_hash=ch(d))
+
+    # meta 取得後に plugin.py を書き換える (承認時のハッシュと現在のディス
+    # ク内容が食い違う — 実行時再検証が拾うべきシナリオ)。
+    (d / "plugin.py").write_text(INDICATOR_PY + "\n# edited after meta capture\n")
+
+    provider = MagicMock()
+    provider.get_bars.return_value = _bars(n=120, interval="1h")
+    from agentic_fx.config import load_settings
+    settings = load_settings(
+        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+
+    reg = ToolRegistry()
+    # sandbox_run 省略 → 実 plugin_sandbox.run_plugin (実サンドボックス)
+    reg.register_all(market_tools.build(
+        provider, MagicMock(), settings, indicator_plugins=[meta]))
+
+    with caplog.at_level(logging.WARNING):
+        result = reg.func("get_indicators")(pair="USDJPY", timeframe="1h")
+
+    assert "plugin:toctou_ind" not in result
+    assert "rsi_14" in result  # 組み込みは必ず返る (fail-open)
+    assert "toctou_ind" in caplog.text
