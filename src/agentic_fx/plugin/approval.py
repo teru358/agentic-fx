@@ -8,13 +8,15 @@ evaluate_detection`/`strategy_adapter`/`holdout.run_in_sample`) が意図的
 へ統一する (下流の docstring が明言する「fail closed で承認フロー
 (Task 6 の consumer) に伝える」の実装箇所がここ)。
 
-**検証順序 (brief 逐語、fail closed)**:
+**検証順序 (brief 逐語 + F1 レビュー fix round 1、fail closed)**:
 ① `check_source(plugin.py)` → ② `check_source(test_plugin.py,
 extra_allowed={"pytest", "plugin"})` → pytest 実行 → ③ kind 別検証
 (indicator: 何もしない / signal: `evaluate_detection` / strategy:
 `meta.pairs` 全数を `settings.pairs` と照合してから各 pair の
-`run_in_sample`) → ④ `approvals.create`。①〜③ のいずれの段階が失敗して
-も `approval_requests` 行は作らない (例外はすべて `ValueError` に統一 —
+`run_in_sample`) → ④ content_hash 再検証 (discover 時の `meta.
+content_hash` と検証完了時点のファイル内容が一致することを確認 — TOCTOU
+封鎖、F1) → ⑤ `approvals.create`。①〜④ のいずれの段階が失敗しても
+`approval_requests` 行は作らない (例外はすべて `ValueError` に統一 —
 `approvals.create` 自体の失敗 (DB エラー等) だけは変換せず素通しする —
 変換対象は「plugin 検証の失敗」に限る)。
 
@@ -39,6 +41,8 @@ decided_by="human_cli")` する。`submit_plugin` を呼んで id を得てか�
 from __future__ import annotations
 
 import hashlib
+import os
+import signal
 import subprocess
 import sys
 import sqlite3
@@ -50,6 +54,7 @@ from agentic_fx.backtest import holdout
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
 from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin.loader import PluginMeta
+from agentic_fx.plugin.loader import content_hash as _recompute_content_hash
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.signal_eval import SandboxRunFn, evaluate_detection
 from agentic_fx.store import approvals as approvals_store
@@ -88,6 +93,28 @@ def _pytest_summary(stdout_text: str) -> str:
     return lines[-1] if lines else ""
 
 
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """`proc` が属するプロセスグループごと SIGKILL する
+    (`sandbox.py` の `PluginSession._kill` と同じパターン)。
+
+    F4 (codex Important レビュー fix round 1): `subprocess.run(timeout=...)`
+    は直接の子プロセスだけを kill する — test_plugin.py がサンドボックス外
+    で実行される都合上 (`check_source` の denylist はあるが worker.py の
+    resource limit は掛からない)、test_plugin.py 自身がさらに子プロセスを
+    起動して固まった場合、直接の子を kill しても孫プロセスが孤児のまま残
+    る。`start_new_session=True` でプロセスグループリーダーとして起動し、
+    timeout 時は `os.killpg` でグループ全体を回収する。
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _default_pytest_runner(test_plugin_path: Path) -> dict[str, Any]:
     """既定の pytest 実行シーム。
 
@@ -96,18 +123,24 @@ def _default_pytest_runner(test_plugin_path: Path) -> dict[str, Any]:
     の pytest 呼び出しに乗せない、という確立済みの申し送り)。
     `-p no:cacheprovider` で plugin フォルダに `.pytest_cache` を作らせな
     い (キャッシュ汚染回避)。
+
+    timeout 発生時は `_kill_process_group` でプロセスグループごと回収する
+    (F4 — 直接の子だけを kill する `subprocess.run(timeout=...)` は使わ
+    ない)。
     """
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
+         str(test_plugin_path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True)
     try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
-             str(test_plugin_path)],
-            capture_output=True, text=True, timeout=_PYTEST_TIMEOUT_SEC)
+        stdout, stderr = proc.communicate(timeout=_PYTEST_TIMEOUT_SEC)
     except subprocess.TimeoutExpired as exc:
+        _kill_process_group(proc)
         raise ValueError(
             f"test_plugin.py timed out after {_PYTEST_TIMEOUT_SEC}s "
             f"({test_plugin_path})") from exc
-    return {"returncode": proc.returncode, "stdout": proc.stdout,
-            "stderr": proc.stderr}
+    return {"returncode": proc.returncode, "stdout": stdout, "stderr": stderr}
 
 
 def _validate_strategy(conn: sqlite3.Connection, meta: PluginMeta, *,
@@ -173,9 +206,13 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
                   run_in_sample_fn: RunInSampleFn | None = None) -> int:
     """plugin (kind=plugin) の承認申請行を作り、その id を返す。
 
-    どの検証段階が失敗しても `approval_requests` 行は作らない (fail
-    closed)。`SandboxError` は全段階で `ValueError` に変換して送出する
-    (承認フローの consumer としての統一契約)。
+    どの検証ゲート (check_source/pytest/kind 別検証/content_hash 再検証)
+    が失敗しても `approval_requests` 行は作らない (fail closed)。
+    `SandboxError` および検証ゲート自身が送出する `ValueError` はすべて
+    `ValueError` に正規化して送出する (承認フローの consumer としての
+    統一契約 — F5)。**環境障害 (`OSError`・`sqlite3.Error` 等、例えば
+    `approvals.create` の DB 書き込み失敗) はここでは catch せず、その
+    まま貫通させる** — 変換対象は「plugin 検証の失敗」に限る。
     """
     test_plugin_path = meta.path / "test_plugin.py"
     # test_file_hash は監査値 (ロード時検証には使わない)。ゲートを通る前の
@@ -203,6 +240,24 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
         metrics, evaluable = _validate_kind(
             conn, meta, settings=settings, now=now, sandbox_run=sandbox_run,
             run_in_sample_fn=run_in_sample_fn)
+
+        # F1 (codex Critical レビュー fix round 1): 全検証通過後・
+        # approvals.create の直前に content_hash を再計算し、discover 時に
+        # 取得した meta.content_hash と照合する (TOCTOU 封鎖)。stale hash
+        # swap シナリオ: discover で悪性版を拾う → 検証前に良性版へ差し替え
+        # → check_source/pytest は良性版で通過 → 悪性版に戻す → payload に
+        # 悪性版のハッシュが載り、tools/plugin_loader が悪性版を承認済みと
+        # して受理してしまう。signal/strategy は評価中に
+        # `sandbox.PluginSession.__enter__` の再検証に掛かるが、indicator
+        # は plugin.py を一切実行しないため無防備だった — kind に依らず
+        # ここで一律に再検証する。ms 級の残余レース (この再計算直後に再度
+        # 差し替えられる) は `sandbox.py` の脅威モデルと同じ許容範囲。
+        current_hash = _recompute_content_hash(meta.path)
+        if current_hash != meta.content_hash:
+            raise ValueError(
+                f"plugin {meta.name!r}: content changed since discovery "
+                "(hash mismatch) — refusing to approve "
+                f"(expected {meta.content_hash}, got {current_hash})")
     except SandboxError as exc:
         raise ValueError(f"plugin {meta.name!r}: {exc}") from exc
 

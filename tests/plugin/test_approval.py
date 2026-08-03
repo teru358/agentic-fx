@@ -11,11 +11,13 @@ submit_plugin`/`bless` が実際に呼ばれることを検証する (「単体�
 """
 from __future__ import annotations
 
+import signal
 import sqlite3
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -172,6 +174,35 @@ def test_indicator_success_creates_row_with_expected_payload(tmp_path, settings)
     assert payload["eval_source"] == "dukascopy"
     assert payload["live_source"] == settings.plugin.producer_source
     assert payload["note"] == "バックテスト成績は実運用成績の予測値ではない (足切り専用)"
+
+
+# --- F1 (レビュー fix round 1, codex Critical): content_hash 再検証 -------
+
+def test_content_hash_tampered_during_verification_raises_value_error(
+        tmp_path, settings):
+    """stale hash swap シナリオ: 検証中 (pytest 実行のタイミング) に
+    plugin.py の内容が書き換えられた場合、approvals.create 直前の
+    content_hash 再検証がこれを検出し ValueError で行を作らないこと。
+    discover 時に取得した meta.content_hash は書き換え前の内容のまま
+    (payload に古いハッシュが載って tools/plugin_loader を騙す、という
+    F1 の攻撃/事故シナリオそのものを再現する)。"""
+    d = _write_plugin(tmp_path, "ind_toctou", kind="indicator",
+                      plugin_py=INDICATOR_PY, config_yaml="kind: indicator\n")
+    meta = _indicator_meta(d, name="ind_toctou")
+    conn = _conn(tmp_path)
+
+    def tampering_pytest_runner(path: Path) -> dict:
+        # 検証 (pytest 実行) のタイミングで plugin.py の内容を変える —
+        # check_source/pytest はこの変更後の内容に対して実行される (=
+        # 「良性版に差し替えて検証を通す」の代わりに単に内容を変えるだけ
+        # でも discover 時のハッシュとズレることを示せば十分)。
+        (d / "plugin.py").write_text(INDICATOR_PY + "\n# tampered after discover\n")
+        return _ok_pytest_runner(path)
+
+    with pytest.raises(ValueError, match="content changed since discovery"):
+        approval.submit_plugin(conn, meta, settings=settings, now=NOW,
+                               pytest_runner=tampering_pytest_runner)
+    assert _count_rows(conn) == 0
 
 
 # --- signal: sandbox_run 経由で evaluate_detection が呼ばれる ------------
@@ -336,6 +367,123 @@ def test_strategy_pair_outside_settings_pairs_raises_value_error(tmp_path, setti
     assert _count_rows(conn) == 0
 
 
+def test_strategy_second_pair_outside_settings_pairs_raises_value_error(
+        tmp_path, settings):
+    """F2 (レビュー fix round 1, sonnet 変異生存): pairs 検証を
+    「先頭 pair のみ」に縮小する変異が既存テストでは検出できなかった
+    (先頭が不正なケースしか無かったため)。先頭は settings.pairs 内の
+    有効な pair ("USDJPY")・後方が settings.pairs 外 ("EURJPY") という
+    組み合わせで、後方の不正 pair も確実に検出されることをピンする。"""
+    d = _write_plugin(tmp_path, "strat_bad2", kind="strategy",
+                      plugin_py=STRATEGY_PY,
+                      config_yaml="kind: strategy\ntimeframe: 1h\n"
+                                 "pairs: [USDJPY, EURJPY]\nexit_mode: levels\n"
+                                 "max_bars: 200\n")
+    meta = _strategy_meta(d, name="strat_bad2", pairs=("USDJPY", "EURJPY"))
+    conn = _conn(tmp_path)  # settings.pairs は既定で ["USDJPY"] のみ
+
+    called = []
+
+    def fake_run_in_sample(settings_arg, **kwargs):
+        called.append(kwargs)
+        return {"trades": 0}
+
+    with pytest.raises(ValueError, match="not in settings.pairs"):
+        approval.submit_plugin(conn, meta, settings=settings, now=NOW,
+                               pytest_runner=_ok_pytest_runner,
+                               run_in_sample_fn=fake_run_in_sample)
+    assert called == []  # 先頭 pair が有効でも、後方の不正で 0 回のまま
+    assert _count_rows(conn) == 0
+
+
+# --- F3 (レビュー fix round 1, sonnet 変異生存): intent_source.close() ----
+
+
+class _FakeIntentSource:
+    """close() 呼び出しを観測するためだけの fake アダプタ
+    (strategy_adapter.build_intent_source を丸ごと差し替える)。"""
+
+    def __init__(self, pair: str) -> None:
+        self.pair = pair
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_strategy_close_called_for_each_pair_on_success(tmp_path, settings):
+    d = _write_plugin(tmp_path, "strat_close_ok", kind="strategy",
+                      plugin_py=STRATEGY_PY,
+                      config_yaml="kind: strategy\ntimeframe: 1h\n"
+                                 "pairs: [USDJPY, EURUSD]\nexit_mode: levels\n"
+                                 "max_bars: 200\n")
+    meta = _strategy_meta(d, name="strat_close_ok", pairs=("USDJPY", "EURUSD"))
+    two_pair_settings = settings.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
+    conn = _conn(tmp_path)
+
+    created: list[_FakeIntentSource] = []
+
+    def fake_build_intent_source(meta_arg, *, conn, pair, source, settings):
+        src = _FakeIntentSource(pair)
+        created.append(src)
+        return src
+
+    def fake_run_in_sample(settings_arg, **kwargs):
+        return {"trades": 0}
+
+    with patch("agentic_fx.plugin.approval.strategy_adapter.build_intent_source",
+               side_effect=fake_build_intent_source):
+        approval.submit_plugin(conn, meta, settings=two_pair_settings, now=NOW,
+                               pytest_runner=_ok_pytest_runner,
+                               run_in_sample_fn=fake_run_in_sample)
+
+    assert len(created) == 2
+    assert all(src.closed for src in created)
+
+
+def test_strategy_close_called_even_when_run_in_sample_raises(tmp_path, settings):
+    """F3 (レビュー fix round 1, sonnet 変異生存): 既存の fake
+    run_in_sample_fn はどれも intent_source を一度も呼ばなかったため、
+    session が lazy 未生成のままで `close()` を finally から外す変異が
+    19 テスト全部 green のまま生存した (実測)。close() 呼び出しを観測可能
+    な fake アダプタを直接注入し、run_in_sample_fn が例外を投げても
+    (a) その pair の close() が確実に呼ばれる (b) 以降の pair へは進まない
+    ことをピンする。"""
+    d = _write_plugin(tmp_path, "strat_close_err", kind="strategy",
+                      plugin_py=STRATEGY_PY,
+                      config_yaml="kind: strategy\ntimeframe: 1h\n"
+                                 "pairs: [USDJPY, EURUSD]\nexit_mode: levels\n"
+                                 "max_bars: 200\n")
+    meta = _strategy_meta(d, name="strat_close_err", pairs=("USDJPY", "EURUSD"))
+    two_pair_settings = settings.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
+    conn = _conn(tmp_path)
+
+    created: list[_FakeIntentSource] = []
+
+    def fake_build_intent_source(meta_arg, *, conn, pair, source, settings):
+        src = _FakeIntentSource(pair)
+        created.append(src)
+        return src
+
+    run_in_sample_calls: list[str] = []
+
+    def crashing_run_in_sample(settings_arg, **kwargs):
+        run_in_sample_calls.append(kwargs["symbol"])
+        raise RuntimeError("boom")
+
+    with patch("agentic_fx.plugin.approval.strategy_adapter.build_intent_source",
+               side_effect=fake_build_intent_source):
+        with pytest.raises(RuntimeError, match="boom"):
+            approval.submit_plugin(conn, meta, settings=two_pair_settings, now=NOW,
+                                   pytest_runner=_ok_pytest_runner,
+                                   run_in_sample_fn=crashing_run_in_sample)
+
+    assert run_in_sample_calls == ["USDJPY"]  # 2 pair 目には進まない
+    assert len(created) == 1
+    assert created[0].closed is True  # 例外が飛んでも finally で close() 済み
+    assert _count_rows(conn) == 0
+
+
 # --- ⑤ test_plugin.py の import os reject ------------------------------
 
 def test_test_plugin_py_import_os_is_rejected(tmp_path, settings):
@@ -418,6 +566,49 @@ def test_plugin_py_check_source_runs_before_pytest(tmp_path, settings):
         approval.submit_plugin(conn, meta, settings=settings, now=NOW,
                                pytest_runner=spy_runner)
     assert called == []
+
+
+# --- F4 (レビュー fix round 1, codex Important): pytest プロセスグループ回収 -
+
+
+def test_default_pytest_runner_starts_new_session(tmp_path):
+    """F4: `_default_pytest_runner` が `start_new_session=True` で起動
+    すること (孫プロセスの孤児化を防ぐための前提条件) を、実サブプロセス
+    を起動せず fake `Popen` で確認する。"""
+    fake_proc = MagicMock()
+    fake_proc.communicate.return_value = ("1 passed", "")
+    fake_proc.returncode = 0
+
+    with patch("agentic_fx.plugin.approval.subprocess.Popen",
+               return_value=fake_proc) as popen_mock:
+        result = approval._default_pytest_runner(tmp_path / "test_plugin.py")
+
+    assert result == {"returncode": 0, "stdout": "1 passed", "stderr": ""}
+    _, kwargs = popen_mock.call_args
+    assert kwargs.get("start_new_session") is True
+
+
+def test_default_pytest_runner_kills_process_group_on_timeout(tmp_path):
+    """F4: timeout 発生時、直接の子だけでなくプロセスグループ全体を
+    `os.killpg` で回収すること (孫プロセスの孤児化防止)。実タイムアウトは
+    起こさず (実スリープ禁止)、`communicate()` が `TimeoutExpired` を
+    送出するケースを fake で再現する。"""
+    fake_proc = MagicMock()
+    fake_proc.pid = 12345
+    fake_proc.communicate.side_effect = subprocess.TimeoutExpired(
+        cmd="pytest", timeout=approval._PYTEST_TIMEOUT_SEC)
+
+    with patch("agentic_fx.plugin.approval.subprocess.Popen",
+               return_value=fake_proc), \
+         patch("agentic_fx.plugin.approval.os.getpgid",
+               return_value=999) as getpgid_mock, \
+         patch("agentic_fx.plugin.approval.os.killpg") as killpg_mock:
+        with pytest.raises(ValueError, match="timed out"):
+            approval._default_pytest_runner(tmp_path / "test_plugin.py")
+
+    getpgid_mock.assert_called_once_with(12345)
+    killpg_mock.assert_called_once_with(999, signal.SIGKILL)
+    fake_proc.wait.assert_called_once()
 
 
 # --- 統合テスト①: 既定 pytest_runner の実サブプロセス実行 ---------------
