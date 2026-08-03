@@ -1,7 +1,7 @@
 # プラン 8 設計: サービス堅牢化 (Mission worker 隔離 + preemption + 起票返済)
 
 **日付**: 2026-08-03
-**status**: 改訂 2 — codex 敵対レビュー round 1 (C5/I9/M3) を全件反映。round 2 再レビュー待ち
+**status**: 改訂 3 — codex round 2 (新規 C5/I5/M1) を全件反映。round 3 再レビュー待ち
 **入力**: 分解書 (`docs/superpowers/plans/2026-08-01-phase2-decomposition.md` プラン 8 節) / 設計書 §15 Phase 2 受入条件 / プラン 7 レジャー起票束 (`.superpowers/sdd/2026-08-02-phase2-7-plugins/progress.md` 末尾) / プラン 5 レジャー park 一覧 (`.superpowers/sdd/2026-07-26-phase1-5-loop-service/progress.md` 統合裁定節) / codex round 1 (`.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round1.md`)
 
 ## 0. スコープ (ユーザー裁定: A + B 全部入れ)
@@ -40,7 +40,11 @@
 |---|---|---|---|
 | **prepare** | healthcheck (lock 外・timeout 付き) → `missions.start` / `signals.claim_oldest` / prompt 構築 (DB 読み) | 取得 | conn_core |
 | **run** | `WorkerRunner.run(mission)` — 子プロセスで LLM ループ | **非保持** | 子の RO 接続 (+RAG RPC) |
-| **commit** | 結果検証 → `TradeIntent.from_llm_dict` → `signals.consume` → `executor.handle_intent` → `missions.finish`。finally で未 consume claim の requeue | 取得 | conn_core |
+| **commit-pre** | 結果検証 → `TradeIntent.from_llm_dict` → 執行用 quote 取得 (外部 I/O。失敗/stale は intent 破棄 = 現行 executor の防御と同義) | **非保持** | — |
+| **commit-core** | Risk Gate 判定 → paper broker 執行 (DB 書込 = 決定論) → `signals.consume` → `missions.finish` (CAS)。finally で未 consume claim の requeue | 取得 | conn_core |
+| **commit-post** | Notifier 通知・activity 集約書込のうち lock 不要なもの | **非保持** | — |
+
+**commit の 3 小相分割の理由** (codex C2-5): `executor.handle_intent` は quote 取得 (network) と Notifier 同期 HTTP を含み、これを lock 下に置くと停止窓が無界に戻る。外部 I/O を commit-pre / commit-post に追い出し、**lock 下は決定論操作 (DB 書込) のみ**とする。executor の内部をこの 3 小相に沿って分割するリファクタが必要になるが、risk_gate / kill_switch のロジック自体は不変 (受入 6 の「決定論的コア diff ゼロ」は risk_gate/kill_switch に適用し、executor は「判定ロジック不変・I/O 位置のみ移動」を差分レビューで確認する条件に緩和する)。**Phase 3 の live broker submit** (外部 I/O だが順序保証が必要) の置き場所は Phase 3 設計論点として予約 — 本プランでは paper broker (DB 書込) のみ。
 
 - 相間で保持してよいのは不変データのみ (mission_id・claim した signal の raw 行・構築済み prompt・settings スナップショット)。
 - **接続契約**: `conn_core` は「core_lock 保持中のみ触れる」を規約として明文化する (docstring + レビュー観点)。
@@ -50,14 +54,14 @@
 
 | スレッド | 役割 | core_lock |
 |---|---|---|
-| scheduler | 毎 tick: **資金保護区間 (exits/SL/TP/kill switch) を先頭で実行** → データ hooks (timeout 必須) → Mission 起動判定 → supervisor へ `try_submit` して即 return | tick 全体で取得 (Mission を含まない) |
-| **mission supervisor (新設)** | 単一スロットで Mission ジョブを直列実行 (三相) | prepare / commit のみ取得 |
+| scheduler | 毎 tick: **資金保護区間 (`_process_limit_fills` → `_process_exits`、相対順序を保存) を先頭で実行** → データ hooks (timeout 必須) → Mission 起動判定 → supervisor へ `try_submit` して即 return | tick 全体で取得 (Mission を含まない) |
+| **mission supervisor (新設)** | 単一スロットで Mission ジョブを直列実行 (三相) | prepare / commit-core のみ取得 |
 | watchdog | 超過通知 (既存) + **スレッド監督の主体** (§6) | 取らない |
 | main/shell | daemon 待機 or shell。`ask` は supervisor 経由に統一 | — |
 
-- tick 内の順序を **資金保護先行** に再編する (現行は hooks が tick 冒頭 scheduler.py:93、exits が :209)。依存が無いことは writing-plans で現配線を確認の上で確定する。
-- データ hooks (news collector / econ refresh / RAG 書込) の**外部 I/O に timeout 上限を義務付け**、超過は skip + activity 警告。これにより資金保護の遅延上限 = 「前 tick の hooks timeout 合計 + 決定論区間」となり、有界になる。timeout でも殺せない極端なハングは watchdog の heartbeat 監督 (§6) が検出する。
-- 「Mission 実行中も SL/TP 監視継続」は *tick が Mission を待たない構造* + *hooks の有界化* の 2 点で成立する。
+- tick 内の順序再編は **fills→exits のペアを相対順序ごと先頭へ移し、データ hooks をその後ろへ下げる** (codex C2-1 対応)。`_process_exits` 単独を先頭に置いてはならない — exits 末尾の processed-bar マーキング (scheduler.py:949-) を `_process_limit_fills` の `_fresh_bar` (:879, :294) が参照し、exits→fills の順にすると当該バーの指値約定が抑止される回帰になる。fills→exits 間の `filled_ids` 受け渡し (同一バー TP の誤確定防止) も保存する。この契約 (fills→exits の順序 + processed-bar マーキングの位置) を**回帰ピンテスト**で固定する。
+- データ hooks (news collector / econ refresh / signal maintenance / RAG 書込) の **timeout の強制点は HTTP クライアント構築時の httpx timeout (connect/read/write/pool) を settings から必須注入すること** (codex I2-1 — 同期呼び出しのスレッド kill は不可能なため、`data_hook_timeout_sec` は「hook が内部で使う全ネットワーククライアントの timeout 上限」の規定であり wall-clock 保証ではない)。fetchers / collector のクライアント生成箇所の監査を task に含める。timeout が効かない極端なハング (DNS 等) は watchdog の heartbeat 監督 (§6) が検出し、§6 の死亡時規則 (両モードで停止) に接続する。
+- 「Mission 実行中も SL/TP 監視継続」は *tick が Mission を待たない構造* + *hooks の有界化* + *hooks を資金保護の後ろに置く順序* の 3 点で成立する。
 
 ### 3.3 supervisor とスロット意味論 (codex I-2/I-3/I-4 対応)
 
@@ -100,9 +104,11 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 
 **同時実行と待ち合わせの規則** (デッドロック封鎖):
 - 子は単一スレッドで動き、`tool_rpc` は**常に同時 1 件以下** (in-flight 1)。要求送信後は `tool_rpc_result` (rpc_id 一致) をブロッキング待ちする。
-- 親側の **writer は 2 時点で排他**: handshake は spawn 直後に WorkerRunner 呼び出しスレッド (supervisor) が書き、以後 stdin へ書くのは reader スレッドのみ (`tool_rpc_result` 返送)。時系列で重ならないため lock 不要だが、防御的に stdin 書込 lock を置く。
-- 親の reader スレッドはフレームを種別処理する: `event` → transcript バッファへ append / `tool_rpc` → **インラインで実行し** (in-flight 1 なので他フレームは来ない) 応答を書く / `result`・EOF → 完了 queue へ。supervisor (呼び出し元) は完了 queue を壁時計 timeout 付きで待つだけ — 「子が RPC 応答待ち・親が result 待ち」の相互待ちは、reader が RPC を処理する構造により発生しない。
-- **RPC の timeout / cancel**: RPC 実行時間は Mission の壁時計監視の内側にあり、独立 timeout は持たない (RAG 検索はローカル計算)。kill 時は応答不要 — 子は SIGKILL で死に、reader は EOF で終端する。SIGTERM 中に write が詰まる経路は「kill 完了後にパイプを閉じる」順序不変条件 + 応答書込の broken pipe を握って kill へ進むことで封鎖。
+- 親側の **writer は 2 時点で排他**: handshake は spawn 直後に WorkerRunner 呼び出しスレッド (supervisor) が書き、以後 stdin へ書くのは RPC 応答の返送のみ。防御的に stdin 書込 lock を置く。
+- 親の reader スレッドはフレームを種別処理する: `event` → transcript バッファへ append / `tool_rpc` → **専用 dispatcher スレッドへ引き渡す** (reader 自身は読み続ける) / `result`・EOF → 完了 queue へ。supervisor (呼び出し元) は完了 queue を壁時計 timeout 付きで待つだけ — 「子が RPC 応答待ち・親が result 待ち」の相互待ちは発生しない。
+- **RPC を reader インラインで実行しない理由** (codex I2-2): RAG 実装がハングした場合、reader ごと回収不能になり EOF 検出も止まる。dispatcher スレッド + **`rpc_timeout_sec` の応答待ち打ち切り** (超過は子へ tool error を返し、latched health に記録) とし、reader は常に生かしておく。timeout 後にリークした dispatcher スレッドが Rag lock を保持し続ける事故は §4.4 の lock 取得 timeout で波及を止める。
+- **`seq` の検証規則** (codex M2-1): 方向別に 1 起点の単調増加。受信側は重複・逆行・欠番を**プロトコル違反としてセッション死** (fail closed — sandbox の `_dead` 意味論と同じ)。
+- kill 時は応答不要 — 子は SIGKILL で死に、reader は EOF で終端する。SIGTERM 中に write が詰まる経路は「kill 完了後にパイプを閉じる」順序不変条件 + 応答書込の broken pipe を握って kill へ進むことで封鎖。
 
 **部分 transcript の保存範囲** (codex I-6, spec §15 の「保存範囲の定義」):
 - LocalRunner の messages への append を**単一 sink 関数に集約**し (初期 user prompt を含む全 append site: local_runner.py:50, :99, :144, :173, :190, :201)、sink が `event` を送出する。
@@ -113,6 +119,7 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 ### 4.4 RAG RPC と Rag のスレッド安全化 (codex I-8 対応)
 
 - 現行 `Rag` にはロックも close() もなく、同一インスタンスを scheduler tick の news 書込 (service.py:303)・reflection 書込・worker RPC 読取が共有することになる。chromadb のスレッド安全性は保証に頼れないため、**`Rag` に内部 lock を追加して全公開メソッドを直列化**する (低頻度・短時間なので十分)。RPC 応答はこの lock 経由 (改訂 1 の「ロック無しで応答」は撤回)。
+- **lock 取得は timeout 付き** (codex I2-2 の波及止め): RPC dispatcher が RAG ハングでリークして lock を保持し続けた場合でも、news collector / reflection 書込が永久ブロックしないよう、`Rag` の lock 取得は有限 timeout とし、失敗は「RAG 一時不可」として fail soft (該当機能 skip + latched health 記録)。RAG は補助機能であり、資金保護経路には無い。
 - `Rag.close()` は chromadb PersistentClient の実 API を writing-plans で確認して best-effort 実装 (無ければ参照破棄のみで可 — 読み書きは lock で直列化済み)。
 
 ### 4.5 env / rlimit (codex M-2 対応)
@@ -124,13 +131,13 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 ### 4.6 worker profile と権限境界 (codex C-2 対応 — 機構を 2 層に)
 
 - `"trade"`: RO db + network + RAG RPC。取引判断・reflection・ask で使用。
-- `"improve"`: **DB パス自体を渡さない**・network は必要分のみ。中身の registry はプラン 9。
+- `"improve"`: **DB パス自体を渡さない**。中身の registry はプラン 9。**network の制限もプラン 9 スコープ** (codex I2-5 — 本プランの improve profile が提供するのは FS 境界 + DB 非提供のみ。network 強制の機構候補 (env ベース毒入れの流用 / プロキシ allowlist) はプラン 9 の improve registry 設計と併せて裁定する)。
 
 **「構造的到達不能」の担保は 2 層で行う** (「パスを渡さない」だけでは同一 UID の子は絶対パス/相対パスでファイルを開けるため不十分 — codex C-2):
 1. **接続情報の非提供**: improve profile には DB パス・`data/` の位置を一切渡さない + cwd は専用空 workdir (相対パス到達の封鎖)。
 2. **Landlock による FS 自己制限**: worker bootstrap (mission コード実行前) で Linux Landlock (kernel 5.13+、本環境 7.0 で利用可) により FS アクセスを allowlist (コードツリー読取 + 専用 workdir 読書き) に制限し、`data/`・DB ファイルへの絶対パスアクセスを OS レベルで遮断する。実装は ctypes による syscall 直叩き (`landlock_create_ruleset` / `landlock_add_rule` / `landlock_restrict_self`) の小モジュール。**Landlock が利用不能な環境では improve profile の worker は起動拒否 (fail closed)**。trade profile では Landlock は任意 (RO 接続が主防御)。
 
-受入テストは「improve profile の実 worker プロセス内から `data/agentic.db` を絶対パスで open して失敗すること」を実測する (§9 受入 3)。
+**到達不能の意味論** (codex C2-4 対応): Landlock allowlist はコードツリーの読取を許すため、`run_holdout_gate` の**関数 import 自体は可能**である。遮断項目 2 の脅威モデルは「改善ループが holdout 成績を入手して過学習する」ことであり、その実体は**データ到達**にある — `run_holdout_gate` は `history_conn` (履歴 DB 接続) を必須引数に取り、improve worker は DB パス非提供 + Landlock の data/ 遮断により接続を構成できないため、import できても**実行が必ず失敗する**。受入条件は「import 不能」ではなく「**実行不能 (holdout 結果の入手不能)**」で定義する: improve profile の実 worker プロセス内から ①`data/agentic.db` の絶対パス open が失敗 ②`data/` 列挙が失敗 ③`run_holdout_gate` を呼んでもデータ到達不能で失敗 — の 3 点を実測する (§9 受入 3)。
 
 ### 4.7 preemption エスカレーション
 
@@ -147,18 +154,18 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 ### 4.8 残留の回収と孤児対策 (codex C-5 / I-5 対応)
 
 - **起動時回収は missions と signals を同一トランザクションで**: `status='running'` の missions 行を `'interrupted'` へ finalize すると同時に、`claimed_by_mission_id` がそれらの行を指す `claimed` signals を requeue (requeue_count 上限超過は abandoned) する。分離すると「mission は終端済みなのに signal は lease 満了 (最大 15 分) まで不可視」の不整合窓が生じる。`'interrupted'` は **DB 回収専用の状態値**であり、`MissionResult.status` の 4 値契約 (base.py:38) には現れない (codex M-1 — status 表示・集計はこの区別を明記)。
-- **孤児 worker 対策の主手段は `prctl(PR_SET_PDEATHSIG, SIGTERM)`** — 子 bootstrap で設定し、親死亡時に OS がシグナルを配送する (同期ブロック中でも効く。Linux 前提は本プロジェクトの動作環境と整合)。ppid 監視は補助 (PDEATHSIG は exec 前後の細部があるため belt-and-suspenders)。改訂 1 の「定期 ppid 監視のみ」は、LLM HTTP・tool 実行の同期ブロック中に確認できない (codex I-5) ため主手段から降格。
+- **孤児 worker 対策の主手段は `prctl(PR_SET_PDEATHSIG, SIGTERM)`** — 子 bootstrap で設定し、親死亡時に OS がシグナルを配送する (同期ブロック中でも効く。Linux 前提は本プロジェクトの動作環境と整合)。**設定前レースの封鎖** (codex I2-4): handshake で `expected_parent_pid` を受け取り、prctl 設定**直後**に `os.getppid()` と照合— 不一致 (= 設定前に親が死んで再親付けずみ) なら即終了する。ppid 監視は補助 (belt-and-suspenders)。改訂 1 の「定期 ppid 監視のみ」は、LLM HTTP・tool 実行の同期ブロック中に確認できない (codex I-5) ため主手段から降格。
 
 ## 5. シャットダウンと資源終端 (App.close — park: codex I4、停止状態機械: codex I-9 対応)
 
 停止は以下の**状態機械として一意に定義**する:
 
-1. **新規受付停止**: stop_event セット → scheduler は起動判定・hooks をスキップ (資金保護区間は最後の tick まで実行)、shell は新規コマンド拒否。
+1. **新規受付停止**: stop_event セット → scheduler は起動判定・hooks をスキップ (資金保護区間は最後の tick まで実行)、shell は新規コマンド拒否。同時に実行中 worker へ SIGTERM を発行 (3 と並行開始)。
 2. **supervisor drain**: queue 内の未着手ジョブを cancel し、pending Future を例外完了 (shell 解放)。
-3. **実行中 worker の終了**: SIGTERM → `worker_terminate_grace_sec` → SIGKILL。`WorkerRunner.run` が返り、commit 相 finally が finalize (missions 行の終端は shutdown でもこの 1 経路のみ)。
-4. **スレッド join**: supervisor → scheduler → watchdog の順 (finalize が済んでから conn を閉じるため supervisor が先)。
+3. **scheduler join を先に行う** (codex C2-2 — supervisor の commit-core は core_lock を要するため、lock を周期取得する scheduler を先に終わらせて lock 競合を消す。stop_event により scheduler は現 tick 完了で必ず抜け、lock を解放する)。
+4. **実行中 worker の終了と supervisor join**: SIGTERM → `worker_terminate_grace_sec` → SIGKILL。`WorkerRunner.run` が返り、commit 相 finally が finalize (missions 行の終端は shutdown でもこの 1 経路のみ)。その後 supervisor join → watchdog join。
 5. **資源 close (逆順)**: runner → rag → conn_core / conn_shell → notifier。
-6. join がタイムアウトした場合も 5 の close を**試みる** (現行は runner すら閉じない) — ただし当該スレッドが使用中の資源の close は破棄的である旨を activity/stderr に記録して exit 1。
+6. **join タイムアウト時の close は所有権で線引きする** (codex I2-3): スタックしたスレッドが使用中の資源 (scheduler スタック時の conn_core、supervisor スタック時の conn_core 等、対応表を実装で定義) は **close しない** — 使用中 close の未定義動作より fd リークを選ぶ。close できたものだけ close し、スキップした資源を activity/stderr に記録して exit 1。
 
 - `App.close()` がこの 2〜6 を集約する。`build_app` 途中失敗時は構築済み分のみ逆順 cleanup。
 - reader スレッドの終端は sandbox の順序不変条件 (kill 完了 → パイプ close) を踏襲。
@@ -167,7 +174,7 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 
 - **監督の主体は watchdog スレッドに一本化**する (改訂 1 の「main の待機ループ」は対話モードで main が shell にブロックし成立しない — codex I-4)。watchdog は scheduler / supervisor の heartbeat 鮮度と生存を 30 秒周期で監視し、死亡・鮮度超過を検出したら: activity 書込 + Notifier 通知 + supervisor 死亡時は pending Future の例外完了。
 - **watchdog 自身の監督**: scheduler tick が watchdog の heartbeat を相互確認し、死亡検出時は activity + 通知。両者同時死は monit (プロセス外) が最後の防波堤。
-- **終了規則**: daemon モードでは監督主体が回復不能死亡 (supervisor/scheduler の死亡) を検出したら**非ゼロ終了** — monit 再起動とかみ合わせる。対話モードでは勝手に exit せず、通知 + shell への警告表示に留める (人間が前にいる)。
+- **終了規則 (モード共通)**: scheduler / supervisor の回復不能死亡を検出したら、**対話モードでも即座に停止シーケンス (§5) を開始して非ゼロ終了**する (codex C2-3 — scheduler 死亡 = SL/TP 監視の永久停止であり、資金保護が動かないプロセスを生かしておくこと自体が絶対制約違反。改訂 2 の「対話モードは通知のみ」は撤回)。モード差は通知の出し方のみ: daemon は activity+Notifier、対話はそれに加えて shell へ警告を表示してから終了する。
 - **health ラッチ**: activity 書き込み失敗 (ディスクフル等) は App 内の latched health 状態に記録し、以後は別経路 (notifier + stderr) で警告。`status` コマンドでラッチ内容を表示。**ラッチは解除しない** (プロセス再起動でのみクリア — 「一度でも記録が欠けた稼働」を人間が確実に知るため)。
 
 ## 7. B 束 (プラン 7 起票) と park 小口の方式
@@ -192,7 +199,8 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 - `worker_terminate_grace_sec` — SIGTERM 後 SIGKILL までの猶予
 - `worker_startup_timeout_sec` — 子の import〜ready まで
 - `transcript_max_bytes` — Mission 累積 transcript 上限 (超過は truncate marker)
-- `data_hook_timeout_sec` — tick 内データ hooks の外部 I/O 上限 (§3.2)
+- `data_hook_timeout_sec` — tick 内データ hooks が内部で使う全ネットワーククライアントの timeout 上限 (§3.2 — wall-clock 保証ではない)
+- `rpc_timeout_sec` — RAG RPC の親側応答待ち上限 (§4.3)
 - shutdown 上限 (join タイムアウト)。既定値と ge/gt 制約は writing-plans で確定。
 
 ## 9. 受入条件
@@ -201,11 +209,12 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 
 1. **ハング注入で kill**: 子内 runner を無限ブロックする fake に差し替え → SIGTERM 無視時も SIGKILL され、missions 行が `timeout` finalize + 部分 transcript が保存される。
 2. **資金保護継続**: Mission 実行中 (worker ブロック中) に SL 到達 → 次 tick の `_process_exits` がクローズを実行する統合テスト。
-3. **improve profile 到達不能**: improve profile の**実 worker プロセス内**から `run_holdout_gate` 相当・`data/agentic.db` 絶対パス open・`data/` 列挙が失敗することの実測テスト (Landlock 層 + 非提供層)。Landlock 不能環境で improve worker が起動拒否することのテスト。
+3. **improve profile 到達不能 (実行不能の意味論 — §4.6)**: improve profile の**実 worker プロセス内**から ①`data/agentic.db` 絶対パス open 失敗 ②`data/` 列挙失敗 ③`run_holdout_gate` を呼んでもデータ到達不能で失敗 — の実測テスト (Landlock 層 + 非提供層)。Landlock 不能環境で improve worker が起動拒否することのテスト。
 4. **終端の一意性**: `missions.finish` CAS の二重終端拒否テスト / 起動時 `running`→`interrupted` + claimed signals 同時 requeue の同一トランザクションテスト。
 5. スレッド死亡 → (daemon) 非ゼロ終了・(対話) 通知 / App.close 全経路 (正常・join タイムアウト・build 途中失敗) / shutdown 時の pending Future 例外完了。
-6. **決定論的コア diff ゼロ**: risk_gate / executor / kill_switch の実装は不変 (呼び出し位置のみ supervisor へ移動)。最終ブランチレビューで照合。
-7. 既存 1404 tests green。
+6. **tick 順序契約の保存**: fills→exits の相対順序・`filled_ids` 受け渡し・processed-bar マーキング位置の回帰ピンテスト (指値約定がバー到達で成立し続けること — codex C2-1)。
+7. **決定論的コア**: risk_gate / kill_switch は diff ゼロ。executor は「判定ロジック不変・I/O 位置のみ 3 小相へ移動」を差分レビューで確認 (§3.1)。最終ブランチレビューで照合。
+8. 既存 1404 tests green。
 
 ## 10. テスト戦略と SDD 運用
 
@@ -222,3 +231,4 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 ## 12. レビュー履歴
 
 - **round 1 (codex, 2026-08-03)**: C5/I9/M3 — 全件反映。主変更: 三相分解 (C-1) / Landlock 2 層境界 + cwd 明示 (C-2) / 双方向 RPC プロトコル完全定義 (C-3) / finalize 一本化 + finish CAS (C-4) / 起動時 missions+signals 同時回収 (C-5) / tick 資金保護先行 + hooks timeout (I-1) / cron 遅延意味論 (I-2) / try_submit 原子化 (I-3) / Future 終了規則 + 監督の watchdog 一本化 (I-4) / PDEATHSIG (I-5) / transcript sink 集約 + 保存範囲定義 (I-6) / connect_readonly (I-7) / Rag lock 直列化 (I-8) / 停止状態機械 (I-9) / interrupted の位置づけ (M-1) / rlimit fail closed 方針 (M-2) / transcript 累積上限 (M-3)。全文: `.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round1.md`
+- **round 2 (codex, 2026-08-03)**: round 1 判定 ADDRESSED 10 / PARTIALLY 8 / NOT ADDRESSED 0 + 新規 C5/I5/M1 — 全件反映。主変更: fills→exits ペア保存の tick 再編 + processed-bar 契約ピン (C2-1、コントローラが実コードで CONFIRMED) / shutdown join を scheduler 先行に修正 (C2-2) / scheduler 死亡は両モードで停止 (C2-3) / holdout 到達不能を「実行不能」の意味論で定義 (C2-4) / commit を pre/core/post の 3 小相に分割し外部 I/O を lock 外へ (C2-5) / hooks timeout の強制点 = httpx クライアント注入 (I2-1) / RPC dispatcher スレッド + rpc_timeout + Rag lock timeout (I2-2) / join タイムアウト時 close の所有権線引き (I2-3) / PDEATHSIG 設定前レース照合 (I2-4) / improve network 制限はプラン 9 スコープと明記 (I2-5) / seq 検証規則 (M2-1)。全文: `.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round2.md`
