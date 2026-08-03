@@ -30,6 +30,13 @@ SQLite の ``datetime()`` はこれを受理するが返す文字列はスペー
 max_requeue 以上なら abandoned (増分しない)、未満なら pending へ戻し
 requeue_count を +1」。reclaim_expired (lease 切れの回収) も同じ判定を
 通す — lease 回収が上限を迂回しない (codex R1 I5)。
+
+**原子性の範囲 (fix round 1 F4)**: claim/requeue/reclaim_expired の原子性は
+「単一 Connection 上の単一 SQL 文 + SQLite の書き込み直列化」で成立する。
+同一 ``sqlite3.Connection`` を複数スレッドで共有した場合の直列性は保証
+しない (本アプリは単一プロセス・Mission を直列実行する前提 — 設計書 §5。
+複数プロセス/複数接続からの同時呼び出しは SQLite のロックにより直列化
+されるため、その意味での原子性は成立する)。
 """
 from __future__ import annotations
 
@@ -75,6 +82,52 @@ _REQUEUE_COUNT_EXPR = (
 )
 
 
+def _require_aware(dt: datetime, label: str) -> None:
+    """tz-aware であることを検証する (fail closed)。
+
+    F2 (レビュー fix round 1, codex Important): SQLite の datetime() は
+    naive な文字列を暗黙に UTC とみなす。呼び出し側が JST 等の naive
+    datetime を渡すと、鮮度・lease 判定が時差分ズレて **静かに** 誤動作
+    する (fail closed でない)。SQL 内で日時比較を行う公開関数の入口で
+    必ず検証する。
+    """
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ValueError(
+            f"{label} is naive; tz-aware UTC datetime required "
+            "(cannot safely assume UTC)")
+
+
+def _validate_bar_ts(conn: sqlite3.Connection, bar_ts: str) -> None:
+    """bar_ts がタイムゾーン付き ISO-8601 文字列であり、かつ SQLite の
+    ``datetime()`` が NULL を返さないことを検証する (fail closed)。
+
+    F1 (レビュー fix round 1, codex/sonnet 一致 Important): 不正な bar_ts
+    (パース不能な文字列) が入ると SQL 内の ``datetime(bar_ts)`` が NULL を
+    返し、鮮度条件・失効条件が両方 NULL (SQL 的に偽) になって「claim も
+    expire もされない不死身の pending 行」が生まれる (add() の timeframe
+    検証と同型の穴)。
+
+    F2: naive (tz 情報なし) な bar_ts も同じ理由 (SQLite が黙って UTC 扱い
+    するため時差分ズレる) で拒否する。
+    """
+    try:
+        parsed = datetime.fromisoformat(bar_ts)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"bar_ts is not a valid ISO-8601 datetime string: {bar_ts!r}"
+        ) from e
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(
+            f"bar_ts is naive; tz-aware UTC datetime string required "
+            f"(cannot safely assume UTC): {bar_ts!r}")
+    # SQLite 側の受理性そのものを最終確認する (この検証の本質的な保証は
+    # 「SQL 内 datetime(bar_ts) が NULL にならない」こと)。
+    row = conn.execute("SELECT datetime(?)", (bar_ts,)).fetchone()
+    if row[0] is None:
+        raise ValueError(
+            f"bar_ts is not accepted by SQLite datetime(): {bar_ts!r}")
+
+
 def add(conn: sqlite3.Connection, *, plugin: str, content_hash: str,
         pair: str, timeframe: str, bar_ts: str, kind: str, payload: dict,
         now: datetime) -> int | None:
@@ -86,10 +139,15 @@ def add(conn: sqlite3.Connection, *, plugin: str, content_hash: str,
     ``_TF_MINUTES_CASE`` が NULL を返し、鮮度条件・失効条件が両方 NULL
     (= 常に偽) になって「claim も expire もされない不死身の pending」が
     生まれる。ここで弾くのが唯一の防波堤。
+
+    bar_ts / now も同じ理由 (fail closed) で tz-aware かつ SQLite が
+    受理できる形式であることを検証する (F1/F2)。
     """
     if timeframe not in PLUGIN_TIMEFRAMES:
         raise ValueError(
             f"timeframe must be one of {PLUGIN_TIMEFRAMES}: {timeframe!r}")
+    _validate_bar_ts(conn, bar_ts)
+    _require_aware(now, "now")
     cur = conn.execute(
         "INSERT OR IGNORE INTO signals "
         "(plugin, content_hash, pair, timeframe, bar_ts, kind, "
@@ -109,6 +167,7 @@ def claim_oldest(conn: sqlite3.Connection, *, mission_id: int,
     expire_stale との 2 段の間に stale 行が現れても claim されない保証は
     claim 側にある (原子性は単一 UPDATE で成立)。
     """
+    _require_aware(now, "now")
     params: dict = {"mission_id": mission_id, "now": now.isoformat()}
     freshness_clause = ""
     if freshness_bars is not None:
@@ -135,6 +194,7 @@ def expire_stale(conn: sqlite3.Connection, *, now: datetime,
     前に呼ぶ想定だが、呼び忘れ・競合があっても claim_oldest 自身の鮮度
     条件が防波堤になる (このモジュール docstring 参照)。
     """
+    _require_aware(now, "now")
     cur = conn.execute(
         "UPDATE signals SET status='abandoned' "
         f"WHERE status='pending' AND {_STALE_CONDITION}",
@@ -195,6 +255,7 @@ def reclaim_expired(conn: sqlite3.Connection, *, now: datetime,
     codex R1 I5)。lease 境界は ``claimed_at <= now - lease_min`` (以下、
     含む) — ちょうど lease_min 分経過した行も回収対象。
     """
+    _require_aware(now, "now")
     cur = conn.execute(
         "UPDATE signals SET "
         f"status = {_REQUEUE_STATUS_EXPR}, "
@@ -226,6 +287,7 @@ def recent(conn: sqlite3.Connection, pair: str, *,
     取引判断 loop に「直近」として誤って見せてしまう (get_signals は
     設計書 §5/§8 で取引判断 loop 専用、最大 lookback を持つ想定)。
     """
+    _require_aware(since, "since")
     rows = conn.execute(
         "SELECT * FROM signals WHERE pair=? AND datetime(bar_ts) >= "
         "datetime(?) ORDER BY datetime(bar_ts), id",

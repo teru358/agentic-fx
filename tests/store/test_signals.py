@@ -456,3 +456,91 @@ def test_recent_filters_by_pair_and_bar_ts_since(tmp_path):
     assert ids == {new_bar}
     assert old_bar not in ids
     assert other_pair not in ids
+
+
+# ---------------------------------------------------------------------
+# fix round 1 F1 (codex/sonnet 一致 Important): add() が bar_ts を検証
+# せず、不正値が不死身 pending になる。
+# ---------------------------------------------------------------------
+def test_add_rejects_unparseable_bar_ts(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError, match="bar_ts is not a valid"):
+        signals.add(conn, plugin="p.py", content_hash="h", pair="USDJPY",
+                    timeframe="1h", bar_ts="not-a-date", kind="signal",
+                    payload={}, now=NOW)
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM signals").fetchone()["c"] == 0
+
+
+def test_add_rejects_naive_bar_ts(tmp_path):
+    """F2: naive な bar_ts は SQLite が黙って UTC 扱いし、時差分ズレて
+    鮮度・lease 判定が誤動作する — F1 と同じ関数で拒否する。"""
+    conn = _conn(tmp_path)
+    naive_bar_ts = datetime(2026, 8, 3, 12, 0).isoformat()  # tz 無し
+    with pytest.raises(ValueError, match="bar_ts is naive"):
+        signals.add(conn, plugin="p.py", content_hash="h", pair="USDJPY",
+                    timeframe="1h", bar_ts=naive_bar_ts, kind="signal",
+                    payload={}, now=NOW)
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM signals").fetchone()["c"] == 0
+
+
+# ---------------------------------------------------------------------
+# fix round 1 F2 (codex Important): naive now/since が SQLite に黙って
+# UTC として解釈され、鮮度/lease 判定が時差分ズレる。SQL 内で日時比較を
+# 行う公開関数の入口ですべて拒否することをピンする。
+# ---------------------------------------------------------------------
+NAIVE_NOW = datetime(2026, 8, 3, 12, 0)  # tz 無し
+
+
+def test_naive_now_rejected_across_sql_comparison_functions(tmp_path):
+    conn = _conn(tmp_path)
+
+    with pytest.raises(ValueError, match="now is naive"):
+        signals.add(conn, plugin="p.py", content_hash="h", pair="USDJPY",
+                    timeframe="1h", bar_ts=_iso(NOW), kind="signal",
+                    payload={}, now=NAIVE_NOW)
+    with pytest.raises(ValueError, match="now is naive"):
+        signals.claim_oldest(conn, mission_id=1, now=NAIVE_NOW,
+                             freshness_bars=None)
+    with pytest.raises(ValueError, match="now is naive"):
+        signals.expire_stale(conn, now=NAIVE_NOW, freshness_bars=2)
+    with pytest.raises(ValueError, match="now is naive"):
+        signals.reclaim_expired(conn, now=NAIVE_NOW, lease_min=15,
+                                max_requeue=2)
+    with pytest.raises(ValueError, match="since is naive"):
+        signals.recent(conn, "USDJPY", since=NAIVE_NOW)
+
+    # どの呼び出しも DB に副作用を残していない (fail closed)
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM signals").fetchone()["c"] == 0
+
+
+# ---------------------------------------------------------------------
+# fix round 1 F3 (sonnet 変異生存): reclaim_expired の status='claimed'
+# フィルタを外す変異が既存テスト全 green で生存した。consume() は
+# claimed_at をクリアしない設計 (監査情報として残す) のため、consumed 行
+# の claimed_at を backdate しても reclaim_expired が触れないことを直接
+# ピンする (consume() の動作は変更しない)。
+# ---------------------------------------------------------------------
+def test_reclaim_expired_does_not_touch_consumed_rows(tmp_path):
+    conn = _conn(tmp_path)
+    sid = _add(conn, bar_ts=NOW)
+    signals.claim_oldest(conn, mission_id=1, now=NOW, freshness_bars=None)
+    signals.consume(conn, sid, mission_id=1, now=NOW)
+
+    old_claimed_at = NOW - timedelta(hours=5)  # lease (15min) を大きく超過
+    conn.execute("UPDATE signals SET claimed_at=? WHERE id=?",
+                (old_claimed_at.isoformat(), sid))
+    conn.commit()
+
+    result = signals.reclaim_expired(conn, now=NOW, lease_min=15,
+                                     max_requeue=2)
+    assert result == []  # consumed 行は対象外なので何も回収されない
+
+    row = conn.execute(
+        "SELECT status, claimed_by_mission_id, requeue_count "
+        "FROM signals WHERE id=?", (sid,)).fetchone()
+    assert row["status"] == "consumed"  # pending に戻っていない
+    assert row["claimed_by_mission_id"] == 1  # 監査情報は残る (仕様どおり)
+    assert row["requeue_count"] == 0
