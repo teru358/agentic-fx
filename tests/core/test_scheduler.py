@@ -129,7 +129,7 @@ def test_trade_mission_due_reasons(tmp_path):
     None / 1 時間経過で再度 cron)。"""
     env = Env(tmp_path)
     assert env.sched._trade_mission_due(WED) == "cron"      # 初回
-    env.sched._last_trade = WED
+    env.sched._last_cron_trade = WED
     assert env.sched._trade_mission_due(WED + timedelta(minutes=30)) is None
     assert (env.sched._trade_mission_due(WED + timedelta(hours=1))
             == "cron")

@@ -80,3 +80,5 @@ plugin:                        # plugin サンドボックス (プラン 7 Task 
   signal_requeue_max: 2          # signals の requeue 上限 (超えたら abandoned)
   signal_lease_min: 15           # signals claim の lease 時間 (分。超過で reclaim_expired の回収対象)
   signal_freshness_bars: 2       # signals 鮮度ゲート: 宣言 timeframe の何バー分まで新鮮とみなすか
+  signal_min_interval_min: 10    # signal トリガー取引判断 Mission の最短起動間隔 (分)
+  signal_daily_max: 12           # signal トリガー取引判断 Mission の日次上限

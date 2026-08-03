@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from agentic_fx._safe_error import safe_error_text
@@ -25,7 +26,7 @@ from agentic_fx.loops.summary import (
 )
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
-from agentic_fx.store import missions
+from agentic_fx.store import missions, signals
 
 import logging
 
@@ -76,6 +77,15 @@ class TradeLoop:
     # ---- 実装本体 ---------------------------------------------------
 
     def _run_once_impl(self, trigger: str = "cron") -> dict | None:
+        """取引判断 Mission 1 回分。`trigger == "signal"` のときだけ
+        signal-aware lifecycle (§5 必須事項 1) を通る — それ以外の値
+        (`"cron"` や `run_once("signal:demo")` のような直接指定含む) は
+        従来どおり `missions.trigger` にそのまま記録されるだけの経路
+        (非退行: `test_signal_trigger_is_recorded_verbatim` 参照)。
+
+        healthcheck は claim より前 (claim 済みで healthcheck 死亡 →
+        requeue 漏れ、を構造的に防ぐ)。
+        """
         now = self.clock.now()
         try:
             self.provider.healthcheck(self.settings.pairs[0])
@@ -84,43 +94,121 @@ class TradeLoop:
             self.notifier.send(f"[agentic-fx] データ不健全のため判断をスキップ: {e}")
             return None
 
-        prompt = self._build_prompt(load_prompt("trade_mission"))
-        mission = Mission(
+        claimed: dict | None = None
+        mid: int | None = None
+        if trigger == "signal":
+            # ②missions.start(trigger="signal") — 暫定値。NULL 窓を作らず、
+            # signals_rate_ok の LIKE 'signal%' がこの行も数える (§12 不変
+            # 条件は維持したまま常に非 NULL trigger を持たせる)。
+            mid = missions.start(self.conn, "trade",
+                                 self.settings.runner.trade.backend,
+                                 self.settings.runner.trade.model, now,
+                                 trigger="signal")
+            # ③claim_oldest — 失敗なら LLM を起こさず即 finalize (skipped)。
+            claimed = signals.claim_oldest(
+                self.conn, mission_id=mid, now=now,
+                freshness_bars=self.settings.plugin.signal_freshness_bars)
+            if claimed is None:
+                missions.finish(self.conn, mid, "skipped", None, [], now)
+                return None
+
+        consumed = False
+        try:
+            if claimed is not None:
+                # ④set_trigger で plugin 名を確定 ⑤プロンプトへシグナル行を注入
+                missions.set_trigger(self.conn, mid, f"signal:{claimed['plugin']}")
+                prompt = (self._build_prompt(load_prompt("trade_mission"))
+                         + self._format_signal_injection(claimed))
+            else:
+                prompt = self._build_prompt(load_prompt("trade_mission"))
+            mission = self._build_mission(prompt)
+            if mid is None:
+                mid = missions.start(self.conn, "trade",
+                                     self.settings.runner.trade.backend,
+                                     self.settings.runner.trade.model, now,
+                                     trigger=trigger)
+            result = self._run_recorded(mid, mission, loop="trade")
+            if result.status != "completed":
+                self.activity.write(Category.AGGREGATE, "mission_failed",
+                                    f"runner status={result.status}",
+                                    ref_id=str(mid))
+                self.notifier.send(f"[agentic-fx] 判断 Mission 失敗: {result.status}")
+                return None
+            try:
+                intent = TradeIntent.from_llm_dict(result.output,
+                                                   origin=Origin.SCHEDULER)
+            except IntentParseError as e:
+                self.activity.write(Category.AGGREGATE, "intent_parse_failed",
+                                    str(e), ref_id=str(mid))
+                return None
+            # ⑥consume/requeue の確定規則: パース成功の時点で consume する
+            # (プロンプトに実際に載せた Mission が確定できる)。executor 実行後
+            # の requeue は二重発注ハザードになるため、ここで確定させる —
+            # handle_intent の例外は「消費済み」のまま (requeue しない)。
+            if claimed is not None:
+                signals.consume(self.conn, claimed["id"], mission_id=mid,
+                                now=self.clock.now())
+                consumed = True
+            try:
+                out = self.executor.handle_intent(intent, mid)
+            except Exception as e:  # noqa: BLE001
+                _log.exception("executor.handle_intent raised")
+                self.activity.write(Category.AGGREGATE, "intent_execution_failed",
+                                    safe_error_text(e), ref_id=str(mid))
+                self.notifier.send(
+                    f"[agentic-fx] 注文処理失敗: {safe_error_text(e)}")
+                return None
+            self.activity.write(Category.AGGREGATE, "decision",
+                                f"{intent.action.value} -> {out['result']}",
+                                ref_id=str(mid))
+            return out
+        finally:
+            # 例外時も claimed のまま残さない (lease 回収を待たず即 requeue)。
+            # consume 済みならここでは何もしない (二重発注ハザードを避ける
+            # ため — docstring 上の ⑥ 参照)。
+            if claimed is not None and not consumed:
+                self._requeue_signal(claimed)
+
+    def _build_mission(self, prompt: str) -> Mission:
+        return Mission(
             prompt=prompt, tools=_TRADE_TOOLS,
             output_schema=trade_intent_schema(self.settings.pairs),
             max_turns=self.settings.llama_swap.max_turns,
             timeout_sec=self.settings.llama_swap.timeout_sec)
-        mid = missions.start(self.conn, "trade",
-                             self.settings.runner.trade.backend,
-                             self.settings.runner.trade.model, now,
-                             trigger=trigger)
-        result = self._run_recorded(mid, mission, loop="trade")
-        if result.status != "completed":
-            self.activity.write(Category.AGGREGATE, "mission_failed",
-                                f"runner status={result.status}",
-                                ref_id=str(mid))
-            self.notifier.send(f"[agentic-fx] 判断 Mission 失敗: {result.status}")
-            return None
+
+    def _format_signal_injection(self, claimed: dict) -> str:
+        """claim した signals 行 (plugin/pair/timeframe/bar_ts/payload) を
+        LLM が判断材料にできる形でプロンプトに追記する (brief 上書き 6)。"""
+        payload = json.loads(claimed["payload_json"])
+        return (
+            "\n\n## 起動シグナル\n"
+            "このMissionは以下の signal/strategy plugin の出力をトリガーに"
+            "起動されました。判断の参考にしてください。\n"
+            f"- plugin: {claimed['plugin']}\n"
+            f"- kind: {claimed['kind']}\n"
+            f"- pair: {claimed['pair']}\n"
+            f"- timeframe: {claimed['timeframe']}\n"
+            f"- bar_ts: {claimed['bar_ts']}\n"
+            f"- payload: {json.dumps(payload, ensure_ascii=False)}\n")
+
+    def _requeue_signal(self, claimed: dict) -> None:
+        """claim した signal を pending へ戻す (上限超過なら abandoned +通知)。
+
+        保守処理そのものの失敗で `_run_once_impl` の本流 (既に確定した
+        結果/例外) を上書きしないよう、例外は握りつぶしログのみに残す。
+        """
         try:
-            intent = TradeIntent.from_llm_dict(result.output,
-                                               origin=Origin.SCHEDULER)
-        except IntentParseError as e:
-            self.activity.write(Category.AGGREGATE, "intent_parse_failed",
-                                str(e), ref_id=str(mid))
-            return None
-        try:
-            out = self.executor.handle_intent(intent, mid)
-        except Exception as e:  # noqa: BLE001
-            _log.exception("executor.handle_intent raised")
-            self.activity.write(Category.AGGREGATE, "intent_execution_failed",
-                                safe_error_text(e), ref_id=str(mid))
-            self.notifier.send(
-                f"[agentic-fx] 注文処理失敗: {safe_error_text(e)}")
-            return None
-        self.activity.write(Category.AGGREGATE, "decision",
-                            f"{intent.action.value} -> {out['result']}",
-                            ref_id=str(mid))
-        return out
+            status = signals.requeue(
+                self.conn, claimed["id"], now=self.clock.now(),
+                max_requeue=self.settings.plugin.signal_requeue_max)
+            if status == "abandoned":
+                self.notifier.send(
+                    f"[agentic-fx] signal #{claimed['id']} "
+                    f"({claimed['plugin']}) は requeue 上限超過のため "
+                    "abandoned になりました")
+        except Exception:  # noqa: BLE001 — 保守処理の失敗で本流を止めない
+            _log.exception("signal requeue failed for signal_id=%s",
+                           claimed["id"])
 
     def _ask_once_impl(self, question: str) -> str:
         now = self.clock.now()

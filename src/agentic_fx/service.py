@@ -38,10 +38,11 @@ from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
 from agentic_fx.loops.trade_loop import _TRADE_TOOLS, TradeLoop
+from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner
 from agentic_fx.runners.local_runner import LocalRunner
-from agentic_fx.store import approvals, orders
+from agentic_fx.store import approvals, missions, orders, signals
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.rag import Rag
 from agentic_fx.store.state import StateStore
@@ -315,6 +316,11 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     plugins_dir = root / "plugins"
     approved = plugin_loader.approved_plugins(conn_core, plugins_dir)
 
+    # プラン 7 Task 8: signal producer (承認済み signal/strategy plugin の
+    # 評価 → signals キュー投入)。producer は評価 cursor をメモリに持つ
+    # ため App 寿命で 1 個だけ生成する (再生成 = cursor 喪失)。
+    signal_producer = SignalProducer()
+
     registry = ToolRegistry()
     registry.register_all(market_tools.build(
         provider, econ, settings, indicator_plugins=approved))
@@ -355,12 +361,46 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             trade_loop.run_once(trigger)
             reflection.run_pending()
 
+    # プラン 7 Task 8: signal 起動の判定・保守処理を Scheduler へ配線する。
+    def on_signal_maintenance(now: datetime) -> None:
+        # Task 7 申し送り: pending_exists は鮮度を見ないため、起動判定前に
+        # stale な pending を掃除しておく (expire_stale)。次に lease 切れの
+        # claimed を回収し (reclaim_expired)、最後に producer で新規シグナル
+        # を評価・投入する。呼び出し元 (Scheduler._run_data_hook) が
+        # fail-open で包む。
+        signals.expire_stale(conn_core, now=now,
+                             freshness_bars=settings.plugin.signal_freshness_bars)
+        signals.reclaim_expired(conn_core, now=now,
+                                lease_min=settings.plugin.signal_lease_min,
+                                max_requeue=settings.plugin.signal_requeue_max)
+        signal_producer.evaluate_due_plugins(
+            conn_core, plugins=approved, now=now,
+            source=settings.plugin.producer_source, settings=settings)
+
+    def signal_due_fn(now: datetime) -> bool:
+        # D2: オープンポジション or pending_fill の注文が無いなら signal
+        # 起動は無意味 (新規建玉を提案しても executor が gate で弾くだけ
+        # ではなく、そもそも判断 Mission を起こす価値が薄い運用判断)。
+        if not orders.list_by_status(conn_core, "open", "pending_fill"):
+            return False
+        if not signals.pending_exists(conn_core):
+            return False
+        return missions.signals_rate_ok(conn_core, now, settings)
+
     scheduler = Scheduler(conn=conn_core, executor=executor,
                           settings=settings, state_store=state,
                           activity=activity, bars_fn=bars_fn,
                           on_trade_mission=on_trade_mission,
                           on_news_cycle=collector.collect,
-                          on_econ_cycle=econ.refresh)
+                          on_econ_cycle=econ.refresh,
+                          on_signal_maintenance=on_signal_maintenance,
+                          signal_due_fn=signal_due_fn)
+
+    # 起動時 reclaim 1 回 (コントローラ裁定): 前回停止時に claimed のまま
+    # 残った signal を、次の tick を待たずに起動直後から回収対象にする。
+    signals.reclaim_expired(conn_core, now=clock.now(),
+                            lease_min=settings.plugin.signal_lease_min,
+                            max_requeue=settings.plugin.signal_requeue_max)
 
     # Commands は conn_shell 束縛の broker を持つ (conn_core をシェルスレッドから触らない)
     shell_broker = PaperBroker(conn_shell, settings, clock)

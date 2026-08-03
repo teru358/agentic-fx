@@ -201,6 +201,12 @@ class PluginSettings(_Strict):
     signal_lease_min: int = Field(gt=0, default=15)
     # 鮮度ゲート (D4): 宣言 timeframe の何バー分まで新鮮とみなすか。
     signal_freshness_bars: int = Field(ge=1, default=2)
+    # signal トリガー取引判断 Mission の最短起動間隔 (分)。
+    # missions.signals_rate_ok (プラン 7 Task 8) が missions.trigger LIKE
+    # 'signal%' の行 (DB 永続カウンタそのもの) で判定する。
+    signal_min_interval_min: int = Field(gt=0, default=10)
+    # signal トリガー取引判断 Mission の日次上限 (trading_day_start 境界)。
+    signal_daily_max: int = Field(ge=1, default=12)
 
 
 class Settings(_Strict):

@@ -42,7 +42,9 @@ class Scheduler:
                  bars_fn: Callable[[str], Bar | None],
                  on_trade_mission: Callable[[str], None],
                  on_news_cycle: Callable[[], None],
-                 on_econ_cycle: Callable[[], None]) -> None:
+                 on_econ_cycle: Callable[[], None],
+                 on_signal_maintenance: Callable[[datetime], None] | None = None,
+                 signal_due_fn: Callable[[datetime], bool] | None = None) -> None:
         self.conn = conn
         self.executor = executor
         self.settings = settings
@@ -58,7 +60,18 @@ class Scheduler:
         # 「重要指標の前ではない」と誤認する) が再発する。必須にしておけば
         # 未配線の呼び出し元は TypeError で列挙される。
         self.on_econ_cycle = on_econ_cycle
-        self._last_trade: datetime | None = None
+        # プラン 7 Task 8: signal 起動を追加する新設フック。既定 None =
+        # 機能無効 (既存テスト互換) — on_signal_maintenance が None なら
+        # 保守処理 (producer/reclaim) を一切呼ばず、signal_due_fn が None
+        # なら `_trade_mission_due` は cron のみを見る (signal 判定を
+        # スキップ)。
+        self.on_signal_maintenance = on_signal_maintenance
+        self.signal_due_fn = signal_due_fn
+        # 上書き 1 の改名: cron (1 時間毎) の締切だけを追跡する。signal
+        # 起動 (reason == "signal") はこの締切に触れない — signal 起動後も
+        # 次の cron 締切が早まったり延びたりしないことをテストで固定する
+        # (§5 必須事項 4)。
+        self._last_cron_trade: datetime | None = None
         self._last_news: datetime | None = None
         self._last_econ: datetime | None = None
         self._was_open: bool | None = None
@@ -171,6 +184,16 @@ class Scheduler:
                 _log.warning("maintain_reservations failed: %s", text)
                 fills_allowed = False
         self._force_close_day(now)
+        # プラン 7 Task 8: signal 保守処理 (producer 評価 + reclaim_expired)。
+        # news/econ の data hook (tick 冒頭・開場判定より前) とは**別の新設
+        # 位置** — ここは開場ガード**内**・`_process_limit_fills` **より前**
+        # に置く (opus R2 I8-1: 同じ位置と誤認しないこと)。
+        # `_run_data_hook` と同型の fail-open 隔離を再利用する (producer/
+        # reclaim の失敗が資金保護 (_process_limit_fills/_process_exits) を
+        # 止めてはならない)。
+        if self.on_signal_maintenance is not None:
+            self._run_data_hook(
+                "signal_maintenance", lambda: self.on_signal_maintenance(now))
         # 修正ラウンド 2: account が不明な tick は「新規約定」だけをスキップ
         # する (codex 1 の意図)。OPEN ポジションの SL/TP 監視
         # (_process_exits) は既存建玉の資金保護であり、口座情報の有無に
@@ -186,7 +209,11 @@ class Scheduler:
         self._process_exits(now, filled_ids)
         reason = self._trade_mission_due(now)
         if reason is not None:
-            self._last_trade = now
+            # 上書き 1 の改名 + §5 必須事項 4: cron 締切の更新は
+            # reason == "cron" のときだけ。signal 起動は cron の締切を
+            # 一切動かさない (早めもしない・延ばしもしない)。
+            if reason == "cron":
+                self._last_cron_trade = now
             self.on_trade_mission(reason)
 
     # ---- internal -------------------------------------------------------
@@ -194,13 +221,38 @@ class Scheduler:
     def _trade_mission_due(self, now: datetime) -> str | None:
         """毎時 Mission の起動要否と起動理由を返す (上書き 1 — 設計書改訂 5)。
 
-        現状の起動条件は cron (1 時間毎) のみなので理由は常に ``"cron"``。
+        ①cron (1 時間毎) が優先 — 締切を過ぎていれば常に `"cron"`。
+        ②cron 未到来のときのみ `signal_due_fn` (既定 None = 常に不発火) を
+        見て `"signal"` を返す。plugin 名はここでは確定しない (`"signal"`
+        のまま — 実際にどの plugin の signal を消費するかは TradeLoop の
+        claim 結果で確定する。codex R1 I3)。
+
         戻り値を `str | None` にしておくことで、将来トリガー種別が増えても
         `tick()` 側を変更せずに済む (missions.trigger の監査列を殺さないため
         `on_trade_mission` には必ず理由を渡す)。
+
+        **原子性の注記**: `signal_due_fn` の判定 (`signals.pending_exists`
+        AND `missions.signals_rate_ok` AND D2 条件) から `on_trade_mission`
+        呼び出しまでの間に他の書き込みが割り込まないことは、`tick()` が
+        単一スレッド・単一タイマーからの逐次呼び出しであること (docstring
+        参照) にのみ依存する。複数スレッド/プロセスから同時に判定・起動が
+        行われる構成には拡張されていない (プラン 8 で再検討)。
+
+        `signal_due_fn` 自体の例外は「起動しない」に倒す (fail-open だが
+        tick は殺さない) — 判定失敗が資金保護より後段の Mission 起動判断
+        1 件を諦めるだけで済むようにする。
         """
-        if self._last_trade is None or now - self._last_trade >= timedelta(hours=1):
+        if (self._last_cron_trade is None
+                or now - self._last_cron_trade >= timedelta(hours=1)):
             return "cron"
+        if self.signal_due_fn is not None:
+            try:
+                if self.signal_due_fn(now):
+                    return "signal"
+            except Exception as e:  # noqa: BLE001 — 判定失敗は起動しないに倒す
+                text = safe_error_text(e)
+                self.activity.write(Category.SYSTEM, "signal_due_check_error", text)
+                _log.warning("signal_due_fn failed: %s", text)
         return None
 
     def _run_data_hook(self, kind: str, fn: Callable[[], None]) -> None:

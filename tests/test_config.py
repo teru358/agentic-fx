@@ -260,6 +260,9 @@ def test_plugin_signal_queue_settings_defaults_from_example():
     assert s.plugin.signal_requeue_max == 2
     assert s.plugin.signal_lease_min == 15
     assert s.plugin.signal_freshness_bars == 2
+    # プラン 7 Task 8 追加分
+    assert s.plugin.signal_min_interval_min == 10
+    assert s.plugin.signal_daily_max == 12
 
 
 def test_backtest_and_analysis_defaults():
