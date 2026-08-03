@@ -82,3 +82,4 @@ plugin:                        # plugin サンドボックス (プラン 7 Task 
   signal_freshness_bars: 2       # signals 鮮度ゲート: 宣言 timeframe の何バー分まで新鮮とみなすか
   signal_min_interval_min: 10    # signal トリガー取引判断 Mission の最短起動間隔 (分)
   signal_daily_max: 12           # signal トリガー取引判断 Mission の日次上限
+  signals_max_lookback_hours: 24 # get_signals ツールの since_hours 上限 (プラン 7 Task 9)

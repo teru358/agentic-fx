@@ -207,6 +207,10 @@ class PluginSettings(_Strict):
     signal_min_interval_min: int = Field(gt=0, default=10)
     # signal トリガー取引判断 Mission の日次上限 (trading_day_start 境界)。
     signal_daily_max: int = Field(ge=1, default=12)
+    # get_signals ツール (プラン 7 Task 9) の lookback 上限 (時間)。
+    # since_hours はこの値を超えてはならない (ToolDef スキーマの maximum
+    # + 関数側クランプの二重防御 — 詳細は tools/signal_tools.py)。
+    signals_max_lookback_hours: int = Field(ge=1, default=24)
 
 
 class Settings(_Strict):

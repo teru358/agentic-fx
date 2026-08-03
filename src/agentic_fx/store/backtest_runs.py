@@ -148,6 +148,32 @@ def in_sample_view(conn: sqlite3.Connection, *,
     return result
 
 
+def latest_in_sample_metrics(conn: sqlite3.Connection,
+                              content_hash: str) -> dict | None:
+    """指定 content_hash の in_sample 成績のうち最新 1 件の metrics を返す。
+
+    プラン 7 Task 9 (get_signals ツール) が strategy 行に成績を添付する
+    ために使う。``in_sample_view`` は content_hash 絞りを持たず
+    created_at も返さないため流用できない (opus R2 M8) — ``scope=
+    'in_sample' AND issued_by='harness' AND content_hash=?`` に絞り、
+    最新判定は ``id`` 降順 (created_at は分格子切り捨てで衝突しうるため
+    id で一意に決める) の LIMIT 1 で行う。
+
+    ``in_sample_view`` と同じ理由 (fix round 1 F1) で ``METRIC_KEYS`` の
+    白リスト濾過を通す — metrics dict は save_harness_run の任意入力
+    なので、濾過なしでは period_start 等の密輸経路になる。該当行が
+    無ければ None (未計測)。
+    """
+    row = conn.execute(
+        "SELECT metrics_json FROM backtest_runs WHERE scope='in_sample' "
+        "AND issued_by='harness' AND content_hash=? "
+        "ORDER BY id DESC LIMIT 1", (content_hash,)).fetchone()
+    if row is None:
+        return None
+    raw_metrics = json.loads(row["metrics_json"])
+    return {k: v for k, v in raw_metrics.items() if k in METRIC_KEYS}
+
+
 def settings_snapshot_hash(settings: Any) -> str:
     """risk / backtest 設定の安定 JSON の sha256 hexdigest (再現性メタデータ)。
 

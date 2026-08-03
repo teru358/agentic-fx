@@ -88,6 +88,65 @@ def test_build_app_wires_everything(tmp_path):
         assert name in app.registry.names()
 
 
+def test_build_app_registers_get_signals(tmp_path):
+    """⑦プラン 7 Task 9: signal_tools.build が service に配線され、起動時
+    _assert_tools_registered を通ること (build_app 相当の起動テスト)。"""
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    assert "get_signals" in app.registry.names()
+
+
+def test_get_signals_via_registry_execute_returns_decoded_payload(tmp_path):
+    """A (advisor 指摘): これまでのテストは `tool.func(...)` を直接呼ぶだけ
+    で、本番経路である `registry.execute` (jsonschema 検証 + json.dumps)
+    を一度も通していなかった (verify-integration-not-just-units と同型の
+    穴)。実際に LLM 相当の呼び出し形 (dict 引数 → JSON 文字列) で疎通する
+    ことを確認する。"""
+    import json as _json
+
+    from agentic_fx.store import signals as signals_store
+
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    signals_store.add(
+        app.conn_core, plugin="sig1", content_hash="h1", pair="USDJPY",
+        timeframe="1h", bar_ts=(NOW - timedelta(hours=1)).isoformat(),
+        kind="signal", payload={"direction": "long"}, now=NOW)
+
+    raw = app.registry.execute(
+        "get_signals", {"pair": "USDJPY"}, ["get_signals"])
+    out = _json.loads(raw)
+    assert isinstance(out, list) and len(out) == 1
+    assert out[0]["payload"] == {"direction": "long"}
+
+
+def test_get_signals_via_registry_execute_since_hours_over_max_is_schema_error(tmp_path):
+    """スキーマ maximum が先に弾く経路 (関数側クランプとは別の防御層):
+    LLM 経由 (registry.execute) では since_hours=100 はクランプされず
+    invalid arguments エラーになる — brief ①の「クランプ」は関数を直接
+    呼ぶ経路 (テスト・将来の呼び出し元) の防波堤であり、registry.execute
+    経由では二重防御のうちスキーマ側が先に発火する (opus R2 M11 の
+    「lookback 上限で遮断は保たれる」ことの確認)。"""
+    import json as _json
+
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    raw = app.registry.execute(
+        "get_signals", {"pair": "USDJPY", "since_hours": 100},
+        ["get_signals"])
+    out = _json.loads(raw)
+    assert "error" in out
+
+
+def test_bless_is_not_registered_as_a_tool(tmp_path):
+    """改善ループ非露出ピンの一部: bless は人間 CLI 専用であり、そもそも
+    ToolDef として registry に登録されない (プラン 9 の allowed リスト
+    実装前でも、この経路自体が存在しないことを固定する)。"""
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    assert "bless" not in app.registry.names()
+
+
 def test_build_app_wires_approved_plugins_into_market_tools(tmp_path):
     """プラン 7 Task 3: `approved_plugins(conn_core, root / "plugins")` の
     結果が `market_tools.build(..., indicator_plugins=...)` まで実際に届く

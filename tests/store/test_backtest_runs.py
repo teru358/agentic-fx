@@ -280,3 +280,70 @@ def test_core_commit_exception_is_unknown(monkeypatch):
 
     monkeypatch.setattr(backtest_runs.subprocess, "run", _fake_run)
     assert backtest_runs.core_commit() == "unknown"
+
+
+# ---- ⑥latest_in_sample_metrics (プラン 7 Task 9) ----------------------------
+#
+# get_signals ツールが strategy 行に成績を添付するための面。in_sample_view
+# は content_hash 絞りを持たず created_at も返さないため流用できない
+# (opus R2 M8) — scope='in_sample' AND issued_by='harness' AND
+# content_hash=? に絞り、最新判定は id 降順で行う。
+
+def test_latest_in_sample_metrics_returns_none_when_no_match(tmp_path):
+    conn = _conn(tmp_path)
+    assert backtest_runs.latest_in_sample_metrics(conn, "nope") is None
+
+
+def test_latest_in_sample_metrics_filters_content_hash(tmp_path):
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", kind="strategy", pair="USDJPY",
+              timeframe="1h", source="dukascopy", period=(H, H),
+              settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", content_hash="a", metrics={"trades": 1}, **kw)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", content_hash="b", metrics={"trades": 2}, **kw)
+    assert backtest_runs.latest_in_sample_metrics(conn, "a") == {"trades": 1}
+    assert backtest_runs.latest_in_sample_metrics(conn, "b") == {"trades": 2}
+
+
+def test_latest_in_sample_metrics_picks_latest_by_id_desc(tmp_path):
+    """同一 content_hash に複数行あるとき、id が最大 (最新挿入) の行を返す。
+    created_at (H 固定) が同一でも id で一意に決まることを検証する。"""
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H), settings_hash="s", core_commit="c",
+              initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", metrics={"trades": 1}, **kw)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", metrics={"trades": 99}, **kw)
+    assert backtest_runs.latest_in_sample_metrics(conn, "h") == {"trades": 99}
+
+
+def test_latest_in_sample_metrics_whitelists_metric_keys(tmp_path):
+    """metrics に period_start 等を混入しても密輸できない (in_sample_view
+    と同じ濾過境界)。"""
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H),
+              metrics={"trades": 40, "period_start": "2020-01-01T00:00:00+00:00"},
+              settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+    metrics = backtest_runs.latest_in_sample_metrics(conn, "h")
+    assert metrics == {"trades": 40}
+    assert "period_start" not in metrics
+
+
+def test_latest_in_sample_metrics_excludes_holdout_gate_and_human_custom(tmp_path):
+    """scope='in_sample' AND issued_by='harness' 以外は対象外。"""
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H), metrics={"trades": 1}, settings_hash="s",
+              core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(conn, scope="holdout_gate", **kw)
+    backtest_runs.save_human_run(conn, **kw)
+    assert backtest_runs.latest_in_sample_metrics(conn, "h") is None

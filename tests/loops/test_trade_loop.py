@@ -84,6 +84,24 @@ def test_hold_mission_recorded(tmp_path):
     assert "現在の状態" in prompt
 
 
+def test_run_once_mission_tools_include_get_signals(tmp_path):
+    """⑧プラン 7 Task 9: _TRADE_TOOLS への get_signals 追加が実際に
+    Mission.tools まで届くことのピン (registry 登録だけでは Mission から
+    使えない — codex R3 I3)。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "w"}, [])])
+    loop.run_once()
+    assert "get_signals" in runner.missions[0].tools
+
+
+def test_ask_once_mission_tools_include_get_signals(tmp_path):
+    """⑧ask Mission にも get_signals が露出する (brief どおり意図的)。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"answer": "test"}, [])])
+    loop.ask_once("今どう見てる？")
+    assert "get_signals" in runner.missions[0].tools
+
+
 def test_fail_closed_on_unhealthy_data(tmp_path):
     """healthcheck が DataUnhealthy → Mission 実行なし・activity 記録・None 返却。"""
     conn, loop, runner, tp = _loop(tmp_path, [], healthy=False)

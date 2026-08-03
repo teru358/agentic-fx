@@ -34,7 +34,8 @@ _log = logging.getLogger("agentic_fx.trade_loop")
 
 _TRADE_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
                 "get_econ_calendar", "get_positions", "get_account",
-                "get_recent_reflections", "search_reflections"]
+                "get_recent_reflections", "search_reflections",
+                "get_signals"]
 
 
 class TradeLoop:

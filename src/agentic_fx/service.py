@@ -48,6 +48,7 @@ from agentic_fx.store.rag import Rag
 from agentic_fx.store.state import StateStore
 from agentic_fx.tools import (
     account_tools, market_tools, news_tools, plugin_loader, reflection_tools,
+    signal_tools,
 )
 from agentic_fx.tools.registry import ToolRegistry
 
@@ -328,6 +329,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     registry.register_all(account_tools.build(conn_core, broker))
     # 上書き 6: reflection_tools.build は pairs が必須引数 (Task 0-8)
     registry.register_all(reflection_tools.build(conn_core, rag, settings.pairs))
+    # プラン 7 Task 9: get_signals (取引判断 loop 専用。_TRADE_TOOLS 経由で
+    # trade/ask 両 Mission に露出する)
+    registry.register_all(signal_tools.build(conn_core, settings, clock))
     # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
     _validate_startup(settings)
     _assert_tools_registered(registry, _TRADE_TOOLS)
