@@ -544,3 +544,21 @@ def test_reclaim_expired_does_not_touch_consumed_rows(tmp_path):
     assert row["status"] == "consumed"  # pending に戻っていない
     assert row["claimed_by_mission_id"] == 1  # 監査情報は残る (仕様どおり)
     assert row["requeue_count"] == 0
+
+
+# ---------------------------------------------------------------------
+# fix round 2 F5 (再レビュー変異生存): _validate_bar_ts の層 3 (SQLite
+# 受理性チェック) を削除する変異が既存 24 テスト全 green で生存した。
+# "+0000" (コロン無しオフセット) は Python fromisoformat は tz-aware
+# として受理する (層1・層2 を通過) が、SQLite の datetime() は NULL を
+# 返す — 層 3 だけが防ぐ実在の入力。
+# ---------------------------------------------------------------------
+def test_add_rejects_bar_ts_python_parseable_but_sqlite_null(tmp_path):
+    conn = _conn(tmp_path)
+    bar_ts = "2026-08-03T12:00:00+0000"  # tz-aware だが SQLite が NULL を返す形式
+    with pytest.raises(ValueError, match="not accepted by SQLite"):
+        signals.add(conn, plugin="p.py", content_hash="h", pair="USDJPY",
+                    timeframe="1h", bar_ts=bar_ts, kind="signal",
+                    payload={}, now=NOW)
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM signals").fetchone()["c"] == 0
