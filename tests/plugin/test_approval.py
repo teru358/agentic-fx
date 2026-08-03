@@ -265,6 +265,32 @@ def test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
     assert payload["evaluable"] is True
 
 
+def test_strategy_sandbox_error_from_run_in_sample_becomes_value_error(
+        tmp_path, settings):
+    """③ kind 別検証段階 (strategy の run_in_sample) で SandboxError が
+    出た場合も submit_plugin の統一契約どおり ValueError に変換され、
+    approval_requests 行は作られないこと (①/②の check_source 失敗経路
+    しか通らない import-os テストでは検証できない分岐 — advisor 指摘)。"""
+    from agentic_fx.plugin.sandbox import SandboxError
+
+    d = _write_plugin(tmp_path, "strat_crash", kind="strategy",
+                      plugin_py=STRATEGY_PY,
+                      config_yaml="kind: strategy\ntimeframe: 1h\n"
+                                 "pairs: [USDJPY]\nexit_mode: levels\n"
+                                 "max_bars: 200\n")
+    meta = _strategy_meta(d, name="strat_crash", pairs=("USDJPY",))
+    conn = _conn(tmp_path)
+
+    def crashing_run_in_sample(settings_arg, **kwargs):
+        raise SandboxError("plugin worker crashed mid-evaluation")
+
+    with pytest.raises(ValueError, match="plugin worker crashed mid-evaluation"):
+        approval.submit_plugin(conn, meta, settings=settings, now=NOW,
+                               pytest_runner=_ok_pytest_runner,
+                               run_in_sample_fn=crashing_run_in_sample)
+    assert _count_rows(conn) == 0
+
+
 def test_strategy_eval_timeframe_maps_1d_to_24h(tmp_path, settings):
     d = _write_plugin(tmp_path, "strat_1d", kind="strategy", plugin_py=STRATEGY_PY,
                       config_yaml="kind: strategy\ntimeframe: 1d\npairs: [USDJPY]\n"

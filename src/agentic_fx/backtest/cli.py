@@ -377,8 +377,10 @@ def _analyze_corr(conn, args: argparse.Namespace) -> int:
 
 
 def _find_plugin_meta(root: Path, name: str):
-    """discover して ``name`` に一致する ``PluginMeta`` を返す (無ければ
-    ``None``)。plugins_dir 規約はアプリ全体で確立済みの ``root / "plugins"``
+    """discover して ``name`` に一致する ``PluginMeta`` を探す。
+    ``(plugins_dir, meta)`` を返す (``meta`` は見つからなければ ``None`` —
+    呼び出し元がエラーメッセージに ``plugins_dir`` を使うため一緒に返す)。
+    plugins_dir 規約はアプリ全体で確立済みの ``root / "plugins"``
     (`--plugin` 経路・service.py の承認済み plugin ロードと同じ)。"""
     plugins_dir = root / "plugins"
     metas = plugin_loader.discover(plugins_dir) if plugins_dir.is_dir() else []
