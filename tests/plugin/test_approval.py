@@ -118,6 +118,45 @@ def _count_rows(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0]
 
 
+# --- 最終レビュー F1 (Fable/codex 両方一致, Important): max_bars_limit ----
+
+
+def test_submit_rejects_max_bars_over_limit_and_creates_no_row(tmp_path, settings):
+    """`max_bars: 500000` のような plugin は、承認バックテストの毎バケッ
+    トで全履歴読みを起こしうる (producer は資金保護処理より前に走るため
+    tick 遅延の実害がある)。市場ツール (get_indicators) だけが照合してい
+    た上限を、承認ゲート冒頭でも fail closed で照合する — 超過なら
+    check_source/pytest に進む前に ValueError で行 0 件のまま終える。"""
+    d = _write_plugin(tmp_path, "ind_huge", kind="indicator",
+                      plugin_py=INDICATOR_PY, config_yaml="kind: indicator\n")
+    meta = PluginMeta(name="ind_huge", kind="indicator", path=d, params={},
+                      timeframe=None, pairs=(), max_bars=500_000,
+                      content_hash=real_content_hash(d))
+    conn = _conn(tmp_path)
+
+    with pytest.raises(ValueError, match="max_bars_limit"):
+        approval.submit_plugin(conn, meta, settings=settings, now=NOW,
+                               pytest_runner=_ok_pytest_runner)
+    assert _count_rows(conn) == 0
+
+
+def test_submit_accepts_max_bars_at_limit_boundary(tmp_path, settings):
+    """`max_bars == settings.plugin.max_bars_limit` は許容される境界
+    (`>` 判定であって `>=` ではない)。"""
+    d = _write_plugin(tmp_path, "ind_at_limit", kind="indicator",
+                      plugin_py=INDICATOR_PY, config_yaml="kind: indicator\n")
+    meta = PluginMeta(name="ind_at_limit", kind="indicator", path=d, params={},
+                      timeframe=None, pairs=(),
+                      max_bars=settings.plugin.max_bars_limit,
+                      content_hash=real_content_hash(d))
+    conn = _conn(tmp_path)
+
+    approval_id = approval.submit_plugin(
+        conn, meta, settings=settings, now=NOW, pytest_runner=_ok_pytest_runner)
+    assert isinstance(approval_id, int)
+    assert _count_rows(conn) == 1
+
+
 # --- ① pytest 失敗で行ができない --------------------------------------
 
 def test_pytest_failure_raises_value_error_and_creates_no_row(tmp_path, settings):
@@ -586,6 +625,28 @@ def test_default_pytest_runner_starts_new_session(tmp_path):
     assert result == {"returncode": 0, "stdout": "1 passed", "stderr": ""}
     _, kwargs = popen_mock.call_args
     assert kwargs.get("start_new_session") is True
+
+
+# --- 最終レビュー F4 (F3 の重ね、多層防御): --noconftest ------------------
+
+
+def test_default_pytest_runner_passes_noconftest(tmp_path):
+    """`_default_pytest_runner` の pytest 引数に `--noconftest` が含まれる
+    こと。F3 (loader.py の discover reject) は plugin フォルダ**直下**の
+    conftest.py しか塞げない — 親ディレクトリ側に置かれた conftest.py を
+    pytest が自動収集する経路への多層防御として、pytest 自身に conftest
+    探索を止めさせる (既存の start_new_session テストと同型: 実サブプロセ
+    スは起動せず fake Popen の呼び出し引数だけを観測する)。"""
+    fake_proc = MagicMock()
+    fake_proc.communicate.return_value = ("1 passed", "")
+    fake_proc.returncode = 0
+
+    with patch("agentic_fx.plugin.approval.subprocess.Popen",
+               return_value=fake_proc) as popen_mock:
+        approval._default_pytest_runner(tmp_path / "test_plugin.py")
+
+    (argv,), _ = popen_mock.call_args
+    assert "--noconftest" in argv
 
 
 def test_default_pytest_runner_kills_process_group_on_timeout(tmp_path):

@@ -8,17 +8,18 @@ evaluate_detection`/`strategy_adapter`/`holdout.run_in_sample`) が意図的
 へ統一する (下流の docstring が明言する「fail closed で承認フロー
 (Task 6 の consumer) に伝える」の実装箇所がここ)。
 
-**検証順序 (brief 逐語 + F1 レビュー fix round 1、fail closed)**:
-① `check_source(plugin.py)` → ② `check_source(test_plugin.py,
+**検証順序 (brief 逐語 + レビュー fix、fail closed)**:
+⓪ `meta.max_bars <= settings.plugin.max_bars_limit` 照合 (最終レビュー
+F1) → ① `check_source(plugin.py)` → ② `check_source(test_plugin.py,
 extra_allowed={"pytest", "plugin"})` → pytest 実行 → ③ kind 別検証
 (indicator: 何もしない / signal: `evaluate_detection` / strategy:
 `meta.pairs` 全数を `settings.pairs` と照合してから各 pair の
 `run_in_sample`) → ④ content_hash 再検証 (discover 時の `meta.
 content_hash` と検証完了時点のファイル内容が一致することを確認 — TOCTOU
-封鎖、F1) → ⑤ `approvals.create`。①〜④ のいずれの段階が失敗しても
-`approval_requests` 行は作らない (例外はすべて `ValueError` に統一 —
-`approvals.create` 自体の失敗 (DB エラー等) だけは変換せず素通しする —
-変換対象は「plugin 検証の失敗」に限る)。
+封鎖、レビュー fix round 1 F1) → ⑤ `approvals.create`。⓪〜④ のいずれの
+段階が失敗しても `approval_requests` 行は作らない (例外はすべて
+`ValueError` に統一 — `approvals.create` 自体の失敗 (DB エラー等) だけは
+変換せず素通しする — 変換対象は「plugin 検証の失敗」に限る)。
 
 **承認 source と本番 source の差異を人間に見せる (opus R2 I1)**: payload
 の `eval_source` は承認バックテストが常に使う `"dukascopy"` 固定、
@@ -37,6 +38,17 @@ source) — 両者が異なり得ることを承認レビュー時に人間が�
 decided_by="human_cli")` する。`submit_plugin` を呼んで id を得てから
 `decide` するだけで、検証ロジックを二重に持たない。CLI からのみ呼ぶ
 (改善ループの tool 定義には絶対に載せない — 回帰ピンは Task 9 の関心)。
+
+**脅威モデル (最終レビュー F5、必読)**: `test_plugin.py` の pytest は
+サンドボックス外 (このプロセス自身の権限) で実行される — `worker.py` の
+resource limit も import 遮断も掛からない。`sandbox.check_source` の AST
+ゲートは import 文・denylist 名の**主要な迂回経路**を塞ぐが完全な隔離
+ではない (`sandbox.py` モジュール docstring の脅威モデルと同じ — 動的な
+名前組み立てや、未知の新しい迂回経路まで防ぐものではない)。したがって
+`submit_plugin`/`bless` は **自分自身または信頼できるソースが書いた
+plugin に対してのみ実行すること** — 出所不明な plugin をそのまま
+submit/bless する運用は想定していない。完全な (悪意ある入力に対しても
+安全な) 隔離はプラン 8 の sandbox 増強で扱う。
 """
 from __future__ import annotations
 
@@ -127,10 +139,17 @@ def _default_pytest_runner(test_plugin_path: Path) -> dict[str, Any]:
     timeout 発生時は `_kill_process_group` でプロセスグループごと回収する
     (F4 — 直接の子だけを kill する `subprocess.run(timeout=...)` は使わ
     ない)。
+
+    `--noconftest` (最終レビュー fix F4): loader.py の discover は plugin
+    フォルダ直下の同梱 `conftest.py` を reject するが (F3)、それだけでは
+    「plugin フォルダの**外側** (親ディレクトリ以上) に置かれた
+    conftest.py を pytest が自動収集する」経路までは塞げない。pytest は
+    既定で test_plugin.py から見て親方向の全ディレクトリの conftest.py
+    を探索して読み込む — `--noconftest` でこの探索自体を止める多層防御。
     """
     proc = subprocess.Popen(
-        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
-         str(test_plugin_path)],
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+         "--noconftest", "-q", str(test_plugin_path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         start_new_session=True)
     try:
@@ -206,8 +225,9 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
                   run_in_sample_fn: RunInSampleFn | None = None) -> int:
     """plugin (kind=plugin) の承認申請行を作り、その id を返す。
 
-    どの検証ゲート (check_source/pytest/kind 別検証/content_hash 再検証)
-    が失敗しても `approval_requests` 行は作らない (fail closed)。
+    どの検証ゲート (max_bars_limit/check_source/pytest/kind 別検証/
+    content_hash 再検証) が失敗しても `approval_requests` 行は作らない
+    (fail closed)。
     `SandboxError` および検証ゲート自身が送出する `ValueError` はすべて
     `ValueError` に正規化して送出する (承認フローの consumer としての
     統一契約 — F5)。**環境障害 (`OSError`・`sqlite3.Error` 等、例えば
@@ -226,6 +246,21 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
     test_file_hash = hashlib.sha256(test_plugin_bytes).hexdigest()
 
     try:
+        # F1 (最終レビュー — Fable/codex 両方一致、Important): max_bars_limit
+        # の照合は「消費側の責務」(config.py の docstring) だが、これまで
+        # 照合していたのは market_tools.get_indicators (indicator 合成)
+        # だけだった。承認 (submit/bless)・producer・CLI --plugin はどこも
+        # 照合しておらず、`max_bars: 500000` のような strategy/signal
+        # plugin が承認バックテストの毎バケットで全履歴読みを起こし得た
+        # (producer は資金保護処理より前に走るため tick 遅延の実害がある)。
+        # ここで検証ゲート冒頭に一律 fail closed で置くことで、bless は
+        # submit 経由なので自動的に守られ、producer は承認済み plugin しか
+        # 受け付けないため承認のこの 1 点だけで律速できる。
+        if meta.max_bars > settings.plugin.max_bars_limit:
+            raise ValueError(
+                f"plugin {meta.name!r}: max_bars {meta.max_bars} exceeds "
+                f"settings.plugin.max_bars_limit {settings.plugin.max_bars_limit}")
+
         check_source(meta.path / "plugin.py")
         check_source(test_plugin_path, extra_allowed=frozenset({"pytest", "plugin"}))
 

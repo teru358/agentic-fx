@@ -18,6 +18,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.backtest.analysis import coverage_report, corr_matrix
 from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
@@ -324,13 +325,22 @@ def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
         meta, conn=conn, pair=args.symbol, source=args.source,
         settings=settings)
     try:
-        # SandboxError (plugin 実行時のクラッシュ・timeout・戻り値スキーマ
-        # 不正) はここで捕まえず貫通させる (strategy_adapter の fail closed
-        # 契約どおり — human_custom 行は残さず、raw traceback で異常終了)。
+        # strategy_adapter の「貫通」契約 (SandboxError を hold へ読み替え
+        # ない・run_replay を止める) は変えない — run_replay は
+        # SandboxError をそのまま送出させる。ここで catch するのは
+        # 「人間向け CLI は生 traceback を出さない」という CLI 境界の
+        # 確立方針を --plugin 経路にも適用するため (最終レビュー F2、
+        # `plugin submit`/`bless` の既存 catch と同じ変換規律)。fail
+        # closed の実体 (human_custom 行を残さない・rc≠0) は維持する。
         result = run_replay(settings, symbol=args.symbol, source=args.source,
                             start=args.from_, end=args.to,
                             intent_source=intent_source,
                             eval_timeframe=args.timeframe, history_conn=conn)
+    except plugin_sandbox.SandboxError as e:
+        print(f"エラー: plugin '{args.plugin}' の評価がサンドボックスエラーで"
+             f"停止しました (backtest_runs 行は残しません): "
+             f"{safe_error_text(e)}", file=sys.stderr)
+        return 1
     finally:
         # 上書き節 3: run_replay が例外で終わってもサンドボックスプロセス
         # をリークさせない。

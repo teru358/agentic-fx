@@ -636,3 +636,60 @@ def test_discover_isolates_content_hash_oserror_from_other_folders(
     assert len(metas) == 1
     assert metas[0].name == "good_indicator"
     assert "hash_error" in caplog.text
+
+
+# --- 最終レビュー F3 (codex Critical): 同梱 conftest.py の reject --------
+
+
+def test_discover_rejects_bundled_conftest_py(tmp_path, caplog):
+    """plugin フォルダ直下に `conftest.py` を同梱すると、submit 時の
+    pytest がこれを AST 検査もハッシュ照合も受けずに自動ロードしてしまう
+    (pytest の仕様: test_plugin.py と同じディレクトリの conftest.py は
+    明示 import なしに読み込まれる)。discover の段階で reject し、
+    approval フロー (承認バックテスト) にすら乗せない。"""
+    d = _write_plugin(tmp_path, "with_conftest", plugin_py=INDICATOR_PY,
+                      config_yaml=INDICATOR_CONFIG)
+    (d / "conftest.py").write_text("import os\n")
+    with caplog.at_level(logging.WARNING):
+        metas = discover(tmp_path)
+    assert metas == []
+    assert "with_conftest" in caplog.text
+    assert "conftest.py" in caplog.text
+
+
+def test_discover_conftest_rejection_isolated_to_its_folder(tmp_path, caplog):
+    """他フォルダの discovery を道連れにしない (loader.py の既存規律 —
+    フォルダ単位の fail closed)。"""
+    d = _write_plugin(tmp_path, "with_conftest", plugin_py=INDICATOR_PY,
+                      config_yaml=INDICATOR_CONFIG)
+    (d / "conftest.py").write_text("import os\n")
+    _write_plugin(tmp_path, "good_indicator", plugin_py=INDICATOR_PY,
+                  config_yaml=INDICATOR_CONFIG)
+    with caplog.at_level(logging.WARNING):
+        metas = discover(tmp_path)
+    assert len(metas) == 1
+    assert metas[0].name == "good_indicator"
+
+
+def test_discover_ignores_pycache_directory(tmp_path):
+    """`__pycache__` はディレクトリであり `.py` ファイルではないため、
+    reject 対象にならない (規定 3 ファイル以外の**ファイル**判定は直下の
+    ファイルのみを見る — サブディレクトリは走査しない)。"""
+    d = _write_plugin(tmp_path, "with_pycache", plugin_py=INDICATOR_PY,
+                      config_yaml=INDICATOR_CONFIG)
+    pycache = d / "__pycache__"
+    pycache.mkdir()
+    (pycache / "plugin.cpython-313.pyc").write_bytes(b"\x00")
+    metas = discover(tmp_path)
+    assert len(metas) == 1
+    assert metas[0].name == "with_pycache"
+
+
+def test_discover_sample_plugins_directory_not_rejected():
+    """既存サンプル (docs/examples/plugins/*) は 3 ファイル構成 (+ 実行時
+    生成される __pycache__) のみで、この reject の影響を受けないこと。"""
+    samples_dir = (Path(__file__).resolve().parents[2] / "docs" / "examples"
+                  / "plugins")
+    metas = discover(samples_dir)
+    names = {m.name for m in metas}
+    assert {"rsi_indicator", "sma_cross"} <= names

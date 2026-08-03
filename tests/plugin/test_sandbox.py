@@ -101,6 +101,19 @@ def detect(df, params):
     return [{"direction": "long", "strength": 0.8, "rationale": ""}]
 """
 
+# 最終レビュー F6: rationale 長さ上限のテスト用 — params["rationale_len"]
+# 文字ちょうどの rationale を返す (境界値テストのため長さを外から制御)。
+SIGNAL_RATIONALE_LEN_PY = """
+def detect(df, params):
+    return [{"direction": "long", "strength": 0.8,
+             "rationale": "x" * params["rationale_len"]}]
+"""
+
+STRATEGY_RATIONALE_LEN_PY = """
+def evaluate(df, indicators, signals, params):
+    return {"action": "hold", "rationale": "x" * params["rationale_len"]}
+"""
+
 INFINITE_LOOP_PY = """
 def compute(df, params):
     while True:
@@ -317,6 +330,37 @@ def test_check_source_rejects_ndarray_dump(tmp_path):
         "    return {}\n")
     with pytest.raises(SandboxError, match="dump"):
         check_source(src)
+
+
+# --- 最終レビュー F5 (codex Critical): pytest.importorskip 迂回封鎖 -------
+
+
+def test_check_source_rejects_pytest_importorskip(tmp_path):
+    """`pytest.importorskip("os")` は許可済み `pytest` の属性呼び出しとし
+    て import allowlist/denylist の双方を素通りし、submit 実行だけで任意
+    モジュールが手に入る迂回経路だった。test_plugin.py の `extra_allowed`
+    (pytest 許可) を付けても reject されること。"""
+    src = tmp_path / "test_plugin.py"
+    src.write_text(
+        "import pytest\n"
+        "def test_bypass():\n"
+        "    os = pytest.importorskip('os')\n"
+        "    os.system('true')\n")
+    with pytest.raises(SandboxError, match="importorskip"):
+        check_source(src, extra_allowed=frozenset({"pytest", "plugin"}))
+
+
+def test_check_source_rejects_from_pytest_import_importorskip(tmp_path):
+    """`from pytest import importorskip` のような別名バイパスも、裸 Name
+    への束縛検査 (`_is_denied_bare_name`) で拒否される (F1 レビュー fix
+    round 1 と同じ機構への追加)。"""
+    src = tmp_path / "test_plugin.py"
+    src.write_text(
+        "from pytest import importorskip\n"
+        "def test_bypass():\n"
+        "    importorskip('os')\n")
+    with pytest.raises(SandboxError, match="importorskip"):
+        check_source(src, extra_allowed=frozenset({"pytest", "plugin"}))
 
 
 # --- env builder (⑨: AFX_* 非伝播) --------------------------------------
@@ -686,6 +730,27 @@ def test_strategy_hold_happy_path(tmp_path, plugin_settings):
     assert out["action"] == "hold"
 
 
+# --- 最終レビュー F6 (codex Important, 注入面縮小): rationale 最大長 -----
+
+
+def test_strategy_rationale_at_2000_chars_accepted(tmp_path, plugin_settings):
+    meta = _meta(tmp_path, "strat_rat_ok", "strategy", STRATEGY_RATIONALE_LEN_PY,
+                timeframe="1h", pairs=("USDJPY",))
+    out = run_plugin(
+        meta, {"df": _df(), "indicators": {}, "signals": [],
+              "params": {"rationale_len": 2000}}, settings=plugin_settings)
+    assert len(out["rationale"]) == 2000
+
+
+def test_strategy_rationale_over_2000_chars_rejected(tmp_path, plugin_settings):
+    meta = _meta(tmp_path, "strat_rat_ng", "strategy", STRATEGY_RATIONALE_LEN_PY,
+                timeframe="1h", pairs=("USDJPY",))
+    with pytest.raises(SandboxError, match="rationale exceeds max length"):
+        run_plugin(
+            meta, {"df": _df(), "indicators": {}, "signals": [],
+                  "params": {"rationale_len": 2001}}, settings=plugin_settings)
+
+
 # --- signal: happy path + bar_ts 拒否 (denylist mutation ガード) ----------
 
 def test_signal_happy_path(tmp_path, plugin_settings):
@@ -717,6 +782,25 @@ def test_signal_bar_ts_key_rejected(tmp_path, plugin_settings):
     # から静かに外れているだけで拾われている偽陽性ではないことを保証する)。
     with pytest.raises(SandboxError, match="harness-owned audit key"):
         run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings)
+
+
+# --- 最終レビュー F6 (codex Important, 注入面縮小): rationale 最大長 -----
+
+
+def test_signal_rationale_at_2000_chars_accepted(tmp_path, plugin_settings):
+    meta = _meta(tmp_path, "sig_rat_ok", "signal", SIGNAL_RATIONALE_LEN_PY,
+                timeframe="1h", pairs=("USDJPY",))
+    out = run_plugin(meta, {"df": _df(), "params": {"rationale_len": 2000}},
+                     settings=plugin_settings)
+    assert len(out["signals"][0]["rationale"]) == 2000
+
+
+def test_signal_rationale_over_2000_chars_rejected(tmp_path, plugin_settings):
+    meta = _meta(tmp_path, "sig_rat_ng", "signal", SIGNAL_RATIONALE_LEN_PY,
+                timeframe="1h", pairs=("USDJPY",))
+    with pytest.raises(SandboxError, match="rationale exceeds max length"):
+        run_plugin(meta, {"df": _df(), "params": {"rationale_len": 2001}},
+                  settings=plugin_settings)
 
 
 # --- integration: サンプル plugin (rsi_indicator / sma_cross) -------------

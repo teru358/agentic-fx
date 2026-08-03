@@ -387,16 +387,24 @@ def test_cli_backtest_run_plugin_records_strategy_scope(tmp_path, monkeypatch,
 
 
 def test_cli_backtest_run_plugin_closes_session_even_if_run_replay_raises(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, capsys):
     """F3 (sonnet Important — レビュー fix round 1): `try/finally:
     intent_source.close()` を丸ごと削っても既存テストは green のまま
     だった (レビュアー実測 — 既存テストは発火 0 回で close() が no-op の
     ため検出できなかった)。`run_replay` に例外 (`SandboxError` —
     strategy_adapter の fail closed 契約どおり評価時に伝播し得る) を投げ
-    させ、①その例外が dispatch まで素通しされること (SandboxError は
-    dispatch() の統一エラー境界 (ValueError/KeyError/OSError) に含まれ
-    ない — brief 「貫通させる」の設計どおり) ②それでも close() が呼ばれた
-    こと、の両方を確認する。"""
+    させ、close() が呼ばれることを確認する。
+
+    F2 (最終レビュー — 両レビュー一致): 以前は SandboxError が dispatch
+    まで素通しされ、人間向け CLI が生 traceback で落ちていた (「人間向け
+    CLI は生 traceback を出さない」の唯一の例外)。ここでは CLI 境界
+    (`_backtest_run_plugin`) で SandboxError を catch し、①`main()` が
+    例外を送出せず rc=1 を返すこと (= 生 traceback が出ないこと)
+    ②stderr に診断メッセージが出ること ③`backtest_runs.save_human_run`
+    が呼ばれないこと (fail closed — human_custom 行を残さない) の 3 点を
+    確認する。strategy_adapter 層の「SandboxError を hold へ読み替えず
+    run_replay を止める」契約自体は変えていない (`run_replay` は依然
+    SandboxError で例外終了する) — 変換するのはこの CLI 境界だけ。"""
     from agentic_fx.plugin.sandbox import SandboxError
 
     monkeypatch.chdir(tmp_path)
@@ -418,14 +426,17 @@ def test_cli_backtest_run_plugin_closes_session_even_if_run_replay_raises(
          patch("agentic_fx.backtest.cli.backtest_runs") as br, \
          patch("agentic_fx.backtest.cli.strategy_adapter.build_intent_source",
                return_value=sentinel_source):
-        with pytest.raises(SandboxError, match="plugin crashed mid-replay"):
-            main(["backtest", "run", "--symbol", "USDJPY",
-                 "--source", "dukascopy",
-                 "--from", "2026-07-01", "--to", "2026-07-02",
-                 "--plugin", "strat"])
+        rc = main(["backtest", "run", "--symbol", "USDJPY",
+                  "--source", "dukascopy",
+                  "--from", "2026-07-01", "--to", "2026-07-02",
+                  "--plugin", "strat"])
+    assert rc == 1
     assert rr.called
     sentinel_source.close.assert_called_once()
     br.save_human_run.assert_not_called()  # run_replay が例外なので保存まで進まない
+    err = capsys.readouterr().err
+    assert "plugin crashed mid-replay" in err
+    assert "Traceback" not in err
 
 
 def test_cli_backtest_run_plugin_not_found_rc1(tmp_path, monkeypatch):

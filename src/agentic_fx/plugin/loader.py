@@ -256,12 +256,38 @@ def discover(plugins_dir: Path) -> list[PluginMeta]:
     return metas
 
 
+def _reject_unexpected_py_files(entry: Path, name: str) -> bool:
+    """plugin フォルダ直下に規定 3 ファイル以外の `.py` ファイルがあれば
+    reject する (F3, codex Critical レビュー fix)。
+
+    典型例は `conftest.py`: 同梱すると submit 時に走る pytest が AST
+    検査もハッシュ照合も受けずに自動ロードしてしまう (pytest の仕様上、
+    テストファイルと同じディレクトリの `conftest.py` は明示 import なし
+    に読み込まれる)。`.py` 拡張子のみを対象とし、`__pycache__` ディレクト
+    リや `.yaml` などの非 `.py` ファイルは対象外 (直下の**ファイル**のみを
+    見る — サブディレクトリは走査しない)。
+    """
+    extra = sorted(
+        p.name for p in entry.iterdir()
+        if p.is_file() and p.suffix == ".py" and p.name not in REQUIRED_FILES)
+    if extra:
+        _reject(name, f"unexpected .py file(s) in plugin folder: {extra} "
+                      f"(only {list(REQUIRED_FILES)} are allowed — "
+                      "conftest.py 等の同梱は pytest の自動ロード対象になる "
+                      "ため reject する)")
+        return True
+    return False
+
+
 def _discover_one(entry: Path, name: str) -> PluginMeta | None:
     """1 フォルダ分の config 検証 + AST 検証 + content_hash 算出。
 
     呼び出し元 (`discover`) が OSError を一元的に捕捉するため、ここでは
     OSError を握りつぶさない (fail closed の隔離境界は `discover` 側)。
     """
+    if _reject_unexpected_py_files(entry, name):
+        return None
+
     config_path = entry / "config.yaml"
     plugin_path = entry / "plugin.py"
 

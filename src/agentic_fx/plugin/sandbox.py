@@ -110,13 +110,19 @@ _DENY_IMPORT_PREFIXES = ("pandas.io", "numpy.lib.npyio")
 # 名前 (Name の id、または Attribute の attr) として出現したら拒否する
 # トークン集合 (codex R1 C6 の逐語リスト + レビュー fix round 1 F4:
 # ExcelWriter/HDFStore (I/O 用クラス)・dump/dumps (ndarray の pickle 系
-# シリアライズメソッド、loads はあったが dump/dumps が抜けていた))。
+# シリアライズメソッド、loads はあったが dump/dumps が抜けていた) +
+# 最終レビュー F5: importorskip (`pytest.importorskip("os")` は許可済み
+# `pytest` の属性呼び出しとして import allowlist/denylist の双方を素通り
+# し、submit 実行だけで任意モジュールを import できてしまう迂回経路
+# だった — Attribute (`pytest.importorskip`) にも裸 Name (`from pytest
+# import importorskip` 経由の束縛) にも同じ判定がかかる既存機構にトークン
+# を 1 つ追加するだけで塞げる)。
 _DENY_NAMES = frozenset({
     "open", "eval", "exec", "compile", "__import__", "input", "breakpoint",
     "globals", "getattr", "setattr", "delattr", "vars",
     "load", "loads", "loadtxt", "genfromtxt", "save", "savetxt", "savez",
     "memmap", "fromfile", "tofile", "pickle", "unpickle", "dump", "dumps",
-    "ExcelWriter", "HDFStore",
+    "ExcelWriter", "HDFStore", "importorskip",
 })
 
 # `to_` 前綴りの属性は既定で禁止 (`to_csv`/`to_pickle`/`to_sql` 等の I/O
@@ -637,6 +643,14 @@ def _validate_indicator_result(result: Any) -> dict[str, float]:
 _SIGNAL_ALLOWED_KEYS = frozenset(
     {"direction", "strength", "rationale", "stop_loss", "take_profit"})
 
+# rationale の最大長 (最終レビュー F6, codex Important — 注入面縮小)。
+# rationale は plugin (LLM/人間問わず) が自由記述する説明文で、そのまま
+# 取引判断 loop のプロンプトに展開される — non-empty str 検証だけでは
+# 無制限長を許してしまい、プロンプトインジェクションの土台やコンテキスト
+# 肥大化に使われ得る。境界は「2000 文字は通す、2001 文字は reject」
+# (`len() > _RATIONALE_MAX_LEN` — ちょうど上限は許容)。
+_RATIONALE_MAX_LEN = 2000
+
 
 def _validate_signal_result(result: Any) -> list[dict[str, Any]]:
     if not isinstance(result, list):
@@ -683,6 +697,10 @@ def _validate_signal_result(result: Any) -> list[dict[str, Any]]:
         rationale = item.get("rationale")
         if not isinstance(rationale, str) or not rationale:
             raise SandboxError(f"signal[{i}].rationale must be a non-empty str")
+        if len(rationale) > _RATIONALE_MAX_LEN:
+            raise SandboxError(
+                f"signal[{i}].rationale exceeds max length "
+                f"{_RATIONALE_MAX_LEN} (got {len(rationale)})")
 
         validated: dict[str, Any] = {
             "direction": direction.value, "strength": strength, "rationale": rationale}
@@ -712,12 +730,25 @@ def _validate_strategy_result(result: Any) -> dict[str, Any]:
     `TypeError` (必須フィールド欠落) を `SandboxError` へ写像する — brief
     と同じ検証ロジックを二重実装しないための正道 (action="exit" 等の
     語彙外の値、open で stop_loss/direction/entry_type 欠落・非正値は
-    すべて `StrategyDecision.__post_init__` が拾う)。"""
+    すべて `StrategyDecision.__post_init__` が拾う)。
+
+    **rationale の最大長だけはここで独自に検査する** (F6): `contracts.
+    _require_nonempty_str` は非空 str のみを見て長さは見ない
+    (`contracts.py` は plugin 専用モジュールではなく無制限長を許す既存
+    呼び出し元があるため、上限をそちらへ足さない)。非 str の場合は長さを
+    測らず `StrategyDecision.__post_init__` 側の型検証に委ねる。
+    """
     if not isinstance(result, dict):
         raise SandboxError(f"strategy must return a dict, got {type(result).__name__}")
     unknown = set(result) - _STRATEGY_ALLOWED_KEYS
     if unknown:
         raise SandboxError(f"strategy result has unknown keys: {sorted(unknown)}")
+
+    rationale_raw = result.get("rationale")
+    if isinstance(rationale_raw, str) and len(rationale_raw) > _RATIONALE_MAX_LEN:
+        raise SandboxError(
+            f"strategy result rationale exceeds max length "
+            f"{_RATIONALE_MAX_LEN} (got {len(rationale_raw)})")
 
     kwargs = dict(result)
     action_raw = kwargs.pop("action", None)
