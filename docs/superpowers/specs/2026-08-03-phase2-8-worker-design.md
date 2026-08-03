@@ -1,7 +1,7 @@
 # プラン 8 設計: サービス堅牢化 (Mission worker 隔離 + preemption + 起票返済)
 
 **日付**: 2026-08-03
-**status**: 改訂 4 — codex round 3 (新規 C2/I3) を全件反映。round 4 収束確認待ち
+**status**: 改訂 5 — codex round 4 で収束 (「実装計画作成へ進んでよい」判定)。ユーザー最終レビュー待ち
 **入力**: 分解書 (`docs/superpowers/plans/2026-08-01-phase2-decomposition.md` プラン 8 節) / 設計書 §15 Phase 2 受入条件 / プラン 7 レジャー起票束 (`.superpowers/sdd/2026-08-02-phase2-7-plugins/progress.md` 末尾) / プラン 5 レジャー park 一覧 (`.superpowers/sdd/2026-07-26-phase1-5-loop-service/progress.md` 統合裁定節) / codex round 1 (`.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round1.md`)
 
 ## 0. スコープ (ユーザー裁定: A + B 全部入れ)
@@ -213,7 +213,7 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 2. **資金保護継続**: Mission 実行中 (worker ブロック中) に SL 到達 → 次 tick の `_process_exits` がクローズを実行する統合テスト。
 3. **improve profile 到達不能 (実行不能の意味論 — §4.6)**: improve profile の**実 worker プロセス内**から ①`data/agentic.db` 絶対パス open 失敗 ②`data/` 列挙失敗 ③`run_holdout_gate` を呼んでもデータ到達不能で失敗 — の実測テスト (Landlock 層 + 非提供層)。Landlock 不能環境で improve worker が起動拒否することのテスト。
 4. **終端の一意性**: `missions.finish` CAS の二重終端拒否テスト / 起動時 `running`→`interrupted` + claimed signals 同時 requeue の同一トランザクションテスト。
-5. スレッド死亡 → (daemon) 非ゼロ終了・(対話) 通知 / App.close 全経路 (正常・join タイムアウト・build 途中失敗) / shutdown 時の pending Future 例外完了。
+5. スレッド死亡 → **両モードとも停止シーケンス + 非ゼロ終了** (対話は shell 警告表示を追加 — §6。codex N4-1) / App.close 全経路 (正常・join タイムアウト・build 途中失敗) / shutdown 時の pending Future 例外完了。
 6. **tick 順序契約の保存**: 決定論ブロック (mark-to-market → account/予約再検証 → `fills_allowed` → fills → exits) の内部順序・`fills_allowed` ゲート・`filled_ids` 受け渡し・processed-bar マーキング位置の回帰ピンテスト (account 不明時に指値が約定しないこと / 指値約定がバー到達で成立し続けること — codex C2-1/C3-1)。commit-core の鮮度再検証 (stale スナップショットで発注拒否) のテスト (I3-3)。
 7. **決定論的コア**: risk_gate / kill_switch は diff ゼロ。executor は「判定ロジック不変・I/O 位置のみ 3 小相へ移動」を差分レビューで確認 (§3.1)。最終ブランチレビューで照合。
 8. 既存 1404 tests green。
@@ -224,6 +224,7 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 - テスト規約継続: `pytest.raises(match=...)` はエラー文言固有の部分文字列に絞る / 変異注入を実装者・レビュアー双方に必須化。
 - SDD 運用はプラン 7 と同一: implementer sonnet + (sonnet spec/変異 + codex 敵対) 並行レビュー + scoped 再レビュー + 節目停止。最終ブランチレビューは最上位モデル + codex で cross-task 接合部。
 - 想定 task 順序 (詳細は writing-plans で確定): 公開昇格 rename → B 小口束 → worker 基盤 (プロトコル + registry 抽出 + connect_readonly + Landlock) → WorkerRunner + preemption → 三相分解 + supervisor + tick 再編 → 監督 / health / close → park 返済 → E2E。
+- **writing-plans への申し送り** (codex round 4): ①N4-2 — commit-pre と commit-core の間に scheduler が新規 exposure を確定し、スナップショットに必要通貨が無い場合は **lock 内取得せず intent 拒否** (既定原則からの導出だが明示分岐 + テストを plan に置く) ②分解書のプラン 8 節へ「到達不能 = 実行不能の意味論」の注記を入れる (§4.6) ③rlimit 具体値の確定と通常起動の実測 (M-2 残余)。
 
 ## 11. プラン 9 への接続
 
@@ -233,5 +234,6 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 ## 12. レビュー履歴
 
 - **round 1 (codex, 2026-08-03)**: C5/I9/M3 — 全件反映。主変更: 三相分解 (C-1) / Landlock 2 層境界 + cwd 明示 (C-2) / 双方向 RPC プロトコル完全定義 (C-3) / finalize 一本化 + finish CAS (C-4) / 起動時 missions+signals 同時回収 (C-5) / tick 資金保護先行 + hooks timeout (I-1) / cron 遅延意味論 (I-2) / try_submit 原子化 (I-3) / Future 終了規則 + 監督の watchdog 一本化 (I-4) / PDEATHSIG (I-5) / transcript sink 集約 + 保存範囲定義 (I-6) / connect_readonly (I-7) / Rag lock 直列化 (I-8) / 停止状態機械 (I-9) / interrupted の位置づけ (M-1) / rlimit fail closed 方針 (M-2) / transcript 累積上限 (M-3)。全文: `.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round1.md`
+- **round 4 (codex, 2026-08-03)**: **収束 — 「実装計画作成へ進んでよい」**。round 3 指摘は全件「解消」判定、新規 blocking なし。N4-1 (受入 5 の対話モード表記) は本改訂で修正、N4-2 (commit 相間の exposure 増加時の fail-closed 分岐) は writing-plans 申し送り。全文: `.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round4.md`
 - **round 3 (codex, 2026-08-03)**: 判定「実装着手不可 (残 3 点 + 裁定 2 件)」— 全件反映。主変更: tick 再編を「決定論ブロック (mark-to-market〜exits) は内部順序不変のまま先頭、hooks のみ後段へ」に精密化 (C3-1 — fills 単独前倒しは fails_allowed ゲート迂回) / commit-pre を「Risk Gate に要る全外部取得 (quote + spec + 換算レート)」に拡張し commit-core を「スナップショット + DB 操作のみ」に (C3-2) / commit-core 開始時の鮮度再検証 + stale は発注拒否 (I3-3) / RPC dispatcher リークは 1 本目で health fatal → 停止 (I3-1 裁定) / 停止実行主体は main に一意化 (watchdog はイベントセットのみ)、shell readline 中断 seam を必須依存に昇格 (I3-2) / 分解書文言の読み替え注記 (C2-4 残余)。全文: `.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round3.md`
 - **round 2 (codex, 2026-08-03)**: round 1 判定 ADDRESSED 10 / PARTIALLY 8 / NOT ADDRESSED 0 + 新規 C5/I5/M1 — 全件反映。主変更: fills→exits ペア保存の tick 再編 + processed-bar 契約ピン (C2-1、コントローラが実コードで CONFIRMED) / shutdown join を scheduler 先行に修正 (C2-2) / scheduler 死亡は両モードで停止 (C2-3) / holdout 到達不能を「実行不能」の意味論で定義 (C2-4) / commit を pre/core/post の 3 小相に分割し外部 I/O を lock 外へ (C2-5) / hooks timeout の強制点 = httpx クライアント注入 (I2-1) / RPC dispatcher スレッド + rpc_timeout + Rag lock timeout (I2-2) / join タイムアウト時 close の所有権線引き (I2-3) / PDEATHSIG 設定前レース照合 (I2-4) / improve network 制限はプラン 9 スコープと明記 (I2-5) / seq 検証規則 (M2-1)。全文: `.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round2.md`
