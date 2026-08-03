@@ -252,6 +252,16 @@ def test_invalid_display_timezone_rejected(tmp_path):
         load_settings(p)
 
 
+def test_plugin_signal_queue_settings_defaults_from_example():
+    """プラン 7 Task 7: settings.yaml.example の値と PluginSettings 既定値の
+    乖離を検出する (キー有無は extra="forbid" で検出できるが、値のドリフト
+    は別に assert しないと見逃す)。"""
+    s = load_settings(EXAMPLE)
+    assert s.plugin.signal_requeue_max == 2
+    assert s.plugin.signal_lease_min == 15
+    assert s.plugin.signal_freshness_bars == 2
+
+
 def test_backtest_and_analysis_defaults():
     s = load_settings(EXAMPLE)
     assert s.backtest.holdout_months == 3

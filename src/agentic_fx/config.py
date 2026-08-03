@@ -193,6 +193,14 @@ class PluginSettings(_Strict):
     # 承認 payload の "live_source" にこの値を載せて「承認 source と本番
     # source の差異」を人間に見せる (プラン 7 Task 6, opus R2 I1)。
     producer_source: str = "yfinance"
+    # signals テーブル (プラン 7 Task 7) の requeue 上限。この回数以上
+    # requeue_count が溜まると reclaim/requeue で abandoned に終端する。
+    signal_requeue_max: int = Field(ge=0, default=2)
+    # claim の lease 時間 (分)。この分数だけ claimed のまま経過すると
+    # reclaim_expired の回収対象になる。
+    signal_lease_min: int = Field(gt=0, default=15)
+    # 鮮度ゲート (D4): 宣言 timeframe の何バー分まで新鮮とみなすか。
+    signal_freshness_bars: int = Field(ge=1, default=2)
 
 
 class Settings(_Strict):

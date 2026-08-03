@@ -77,3 +77,6 @@ plugin:                        # plugin サンドボックス (プラン 7 Task 
   sandbox_output_max_bytes: 1048576  # 1 応答行の生バイト数上限
   max_bars_limit: 1000          # plugin config.yaml の max_bars がこれを超えたら discover で reject
   producer_source: yfinance     # 本番 producer が signal/strategy plugin を評価する際の data source (プラン 7 Task 6)
+  signal_requeue_max: 2          # signals の requeue 上限 (超えたら abandoned)
+  signal_lease_min: 15           # signals claim の lease 時間 (分。超過で reclaim_expired の回収対象)
+  signal_freshness_bars: 2       # signals 鮮度ゲート: 宣言 timeframe の何バー分まで新鮮とみなすか
