@@ -25,6 +25,7 @@ from agentic_fx.backtest.mt5_import import compare_sources, import_mt5
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
+from agentic_fx.plugin import approval as plugin_approval
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin import strategy_adapter
@@ -97,6 +98,17 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     corr.add_argument("--source", required=True)
     corr.add_argument("--from", dest="from_", type=_parse_date, default=None)
     corr.add_argument("--to", dest="to", type=_parse_date, default=None)
+
+    # plugin 承認フロー (プラン 7 Task 6): submit は pending 行を作るだけ、
+    # bless は検証 + 即時承認 (人間 CLI からのみ — 改善ループには非露出)。
+    plugin = sub.add_parser("plugin", help="plugin 承認フロー")
+    plugin_sub = plugin.add_subparsers(dest="plugin_command", required=True)
+    submit = plugin_sub.add_parser(
+        "submit", help="plugin を検証し承認申請 (pending) 行を作る")
+    submit.add_argument("name")
+    bless_parser = plugin_sub.add_parser(
+        "bless", help="plugin を検証し即時承認する (人間 CLI 専用)")
+    bless_parser.add_argument("name")
 
 
 # ---- history import ------------------------------------------------------
@@ -361,6 +373,52 @@ def _analyze_corr(conn, args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- plugin submit / bless (プラン 7 Task 6) --------------------------------
+
+
+def _find_plugin_meta(root: Path, name: str):
+    """discover して ``name`` に一致する ``PluginMeta`` を返す (無ければ
+    ``None``)。plugins_dir 規約はアプリ全体で確立済みの ``root / "plugins"``
+    (`--plugin` 経路・service.py の承認済み plugin ロードと同じ)。"""
+    plugins_dir = root / "plugins"
+    metas = plugin_loader.discover(plugins_dir) if plugins_dir.is_dir() else []
+    return plugins_dir, next((m for m in metas if m.name == name), None)
+
+
+def _plugin_submit(conn, settings, args: argparse.Namespace, root: Path) -> int:
+    plugins_dir, meta = _find_plugin_meta(root, args.name)
+    if meta is None:
+        print(f"エラー: plugin '{args.name}' が {plugins_dir} に見つかりません "
+             "(discover で検出できる 3 ファイル構成か確認してください)",
+             file=sys.stderr)
+        return 1
+    try:
+        approval_id = plugin_approval.submit_plugin(
+            conn, meta, settings=settings, now=datetime.now(timezone.utc))
+    except (ValueError, plugin_sandbox.SandboxError) as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        return 1
+    print(f"approval id={approval_id}")
+    return 0
+
+
+def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
+    plugins_dir, meta = _find_plugin_meta(root, args.name)
+    if meta is None:
+        print(f"エラー: plugin '{args.name}' が {plugins_dir} に見つかりません "
+             "(discover で検出できる 3 ファイル構成か確認してください)",
+             file=sys.stderr)
+        return 1
+    try:
+        approval_id = plugin_approval.bless(
+            conn, meta, settings=settings, now=datetime.now(timezone.utc))
+    except (ValueError, plugin_sandbox.SandboxError) as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        return 1
+    print(f"approval id={approval_id} (approved)")
+    return 0
+
+
 # ---- dispatch ---------------------------------------------------------------
 
 
@@ -383,6 +441,10 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
             return _history_coverage(conn, args)
         if args.command == "backtest":
             return _backtest_run(conn, settings, args, root)
+        if args.command == "plugin":
+            if args.plugin_command == "submit":
+                return _plugin_submit(conn, settings, args, root)
+            return _plugin_bless(conn, settings, args, root)
         return _analyze_corr(conn, args)
     except (ValueError, KeyError, OSError) as e:
         print(f"エラー: {e}", file=sys.stderr)

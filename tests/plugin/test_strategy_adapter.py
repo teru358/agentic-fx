@@ -355,12 +355,12 @@ def test_close_does_not_close_injected_session(tmp_path):
 
 # --- ⑤ 統合: 1h 宣言 plugin + 5 時間 replay -----------------------------------
 
-# sma_cross サンプル (docs/examples/plugins) は take_profit を返さない
-# (levels のうち stop_loss のみを使う設計) ため、risk_gate の RR ルール
-# ("take_profit required") に必ず引っかかり orders に到達できない。統合
-# テストの主眼は「plugin 発の intent が実際に orders へ到達すること」なので、
-# take_profit も返す最小 SMA クロス plugin をこのテスト専用に用意する
-# (共有サンプルを RR ルール都合で改変しない)。
+# sma_cross サンプル (docs/examples/plugins) はプラン 7 Task 6 の修正で
+# take_profit を返すようになったが、本テストは fast_period=1/slow_period=2
+# のような極端なパラメータで数本のうちに確実にクロスを起こしたい (5 時間
+# replay という短い窓でも発火させるため)。共有サンプルのパラメータを
+# テスト都合で変えたくないので、引き続きこのテスト専用の最小 SMA クロス
+# plugin (take_profit も返す) を用意する。
 _CROSS_WITH_TP_PY = """
 import pandas as pd
 

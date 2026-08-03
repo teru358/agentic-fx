@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS econ_events (
 );
 CREATE TABLE IF NOT EXISTS approval_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind TEXT NOT NULL,            -- tech_plugin | news_source | live_trade
+  kind TEXT NOT NULL,            -- tech_plugin | news_source | live_trade | plugin
   payload_json TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   -- pending | approved | rejected | expired | invalidated

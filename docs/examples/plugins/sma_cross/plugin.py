@@ -30,6 +30,13 @@ df は本 plugin の宣言 timeframe (config.yaml: `timeframe: 1h`) にリサン
    れるが、NY 錨の日足自体が本プランでは未対応
    (`datafeed.bars.resample` が epoch 以外の錨を NotImplementedError で
    明示拒否している既存防御と整合)。
+
+3. **take_profit を必ず返すこと (プラン 7 Task 6 fix)。** exit は levels
+   固定であり、Risk Gate の RR ルール (`risk.rr_min`) は stop_loss だけの
+   open を必ず却下する — take_profit の無い open は黙って握りつぶされ
+   バックテストが「取引ゼロ」に見える (このサンプルが実際にそうだった)。
+   `take_profit_pips` (既定 40、stop_loss_pips=20 に対し RR=2.0) を追加
+   した。
 """
 from __future__ import annotations
 
@@ -41,6 +48,7 @@ def evaluate(df: pd.DataFrame, indicators: dict, signals: list,
     fast_period = int(params.get("fast_period", 5))
     slow_period = int(params.get("slow_period", 20))
     stop_loss_pips = float(params.get("stop_loss_pips", 20))
+    take_profit_pips = float(params.get("take_profit_pips", 40))
     pip_size = float(params.get("pip_size", 0.01))  # USDJPY 既定 (1pip=0.01)
 
     # 注意1 (warmup): クロス判定には直近2本の SMA (slow_period+1 本) が要る。
@@ -61,11 +69,13 @@ def evaluate(df: pd.DataFrame, indicators: dict, signals: list,
     curr_diff = curr_fast - curr_slow
     last_close = float(df["close"].iloc[-1])
     stop_offset = stop_loss_pips * pip_size
+    take_profit_offset = take_profit_pips * pip_size
 
     if prev_diff <= 0 and curr_diff > 0:
         return {
             "action": "open", "direction": "long", "entry_type": "market",
             "stop_loss": last_close - stop_offset,
+            "take_profit": last_close + take_profit_offset,
             "rationale": (f"fast SMA({fast_period}) crossed above "
                          f"slow SMA({slow_period})"),
         }
@@ -73,6 +83,7 @@ def evaluate(df: pd.DataFrame, indicators: dict, signals: list,
         return {
             "action": "open", "direction": "short", "entry_type": "market",
             "stop_loss": last_close + stop_offset,
+            "take_profit": last_close - take_profit_offset,
             "rationale": (f"fast SMA({fast_period}) crossed below "
                          f"slow SMA({slow_period})"),
         }

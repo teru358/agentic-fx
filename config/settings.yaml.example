@@ -76,3 +76,4 @@ plugin:                        # plugin サンドボックス (プラン 7 Task 
   sandbox_memory_mb: 512        # RLIMIT_AS: 仮想アドレス空間上限 (MiB)
   sandbox_output_max_bytes: 1048576  # 1 応答行の生バイト数上限
   max_bars_limit: 1000          # plugin config.yaml の max_bars がこれを超えたら discover で reject
+  producer_source: yfinance     # 本番 producer が signal/strategy plugin を評価する際の data source (プラン 7 Task 6)

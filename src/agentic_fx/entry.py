@@ -8,7 +8,7 @@ from pathlib import Path
 from agentic_fx import service
 from agentic_fx.backtest import cli as backtest_cli
 
-_BACKTEST_COMMANDS = ("history", "backtest", "analyze")
+_BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin")
 
 
 def main(argv: list[str] | None = None) -> int:

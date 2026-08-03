@@ -188,6 +188,11 @@ class PluginSettings(_Strict):
     # plugin に渡す DataFrame の末尾最大本数の上限 (config.yaml の
     # max_bars はこれ以下でなければならない — 照合は消費側の責務)。
     max_bars_limit: int = Field(ge=1, default=1000)
+    # 本番運用 (producer) が signal/strategy plugin を評価するときのデータ
+    # source。承認バックテスト (Task 6) は常に "dukascopy" を使うため、
+    # 承認 payload の "live_source" にこの値を載せて「承認 source と本番
+    # source の差異」を人間に見せる (プラン 7 Task 6, opus R2 I1)。
+    producer_source: str = "yfinance"
 
 
 class Settings(_Strict):
