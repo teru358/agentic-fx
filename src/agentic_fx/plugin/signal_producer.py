@@ -170,24 +170,45 @@ class SignalProducer:
         df = load_resampled_frame(
             conn, pair, meta.timeframe, source=source, until=bucket_end,
             max_bars=meta.max_bars)
-        if df.empty:
-            # 本番 source にまだバケット分の 1m 行が取り込まれていない等 —
-            # sandbox 失敗と同じ扱い (fail-open・cursor を進めず次 tick 再試行)。
+        # fix round 1 F3 (codex): df が非空でも「末尾行 = 対象バケット」と
+        # は限らない — 取り込みラグ/欠損で対象バケット分の 1m 行が 1 本も
+        # 無い場合、resample はそのバケットの行を生成せず、df の末尾は
+        # それより古い (既に評価済みの) バケットのままになる。この状態を
+        # 「評価完了」として扱い bar_ts=bucket_start の signal を偽造して
+        # cursor を進めてしまうと、後から本物のバーが取り込まれても二度と
+        # 再評価されない (cursor はバケット単位の単調増加のみ)。空 df と
+        # 同じ扱い (fail-open・cursor を進めず次 tick 再試行) にする。
+        if df.empty or df.index[-1] != bucket_start:
             raise ValueError(
-                f"no {source} data for {pair} {meta.timeframe} bucket "
-                f"ending {bucket_end.isoformat()}")
+                f"target bucket not yet present in {source} data for "
+                f"{pair} {meta.timeframe} bucket starting "
+                f"{bucket_start.isoformat()}")
 
         bar_ts = bucket_start.isoformat()
         if meta.kind == "signal":
             result = call(meta, {"df": df, "params": meta.params})
             inserted = 0
-            for sig in result["signals"]:
+            for i, sig in enumerate(result["signals"]):
                 row_id = signals.add(
                     conn, plugin=meta.name, content_hash=meta.content_hash,
                     pair=pair, timeframe=meta.timeframe, bar_ts=bar_ts,
                     kind="signal", payload=sig, now=now)
                 if row_id is not None:
                     inserted += 1
+                elif i > 0:
+                    # fix round 1 F4 (codex): UNIQUE (plugin, content_hash,
+                    # pair, timeframe, bar_ts) は同一バケットで 1 出力しか
+                    # 保持できない — DDL は §12 逐語のため変更しない
+                    # (plan 由来の構造的制約として最終レビューに送る)。
+                    # 2 出力目以降が dedupe で音もなく消えることだけは
+                    # observability を確保する (i==0 は「本物の重複」との
+                    # 区別がつかないため対象外)。
+                    _log.warning(
+                        "plugin %s (%s): signal[%d] at bar_ts=%s was "
+                        "dropped by the (plugin, content_hash, pair, "
+                        "timeframe, bar_ts) UNIQUE constraint — only the "
+                        "first signal per bucket is stored",
+                        meta.name, pair, i, bar_ts)
             return inserted
 
         # strategy: action="open" のみ保存 ("hold" は非保存)

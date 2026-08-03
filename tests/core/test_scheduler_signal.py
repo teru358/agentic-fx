@@ -221,3 +221,56 @@ def test_stale_pending_signal_is_abandoned_before_due_check(tmp_path):
         "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()
     assert row["status"] == "abandoned"
     assert env.trade_reasons == []  # pending が無くなったので signal 起動しない
+
+
+# ---------------------------------------------------------------------
+# fix round 1 F5 (codex): maintenance 例外 + activity.write 故障の二重
+# 故障でも tick は完走する (「except ハンドラが故障源を共有する」パターン
+# — maintenance は _process_limit_fills/_process_exits (資金保護) より前)
+# ---------------------------------------------------------------------
+def test_signal_maintenance_and_activity_write_double_failure_does_not_kill_tick(
+        tmp_path):
+    env = Env(tmp_path)
+
+    def maint(now):
+        raise RuntimeError("maintenance boom")
+
+    env.sched.on_signal_maintenance = maint
+    # activity.write を全面的に壊すと、tick 内の他の (この F5 とは無関係な)
+    # write 呼び出し (limit_filled 等) まで巻き込んで tick が別の理由で
+    # 落ちてしまう。二重故障を `_run_data_hook` の except 経路だけに絞る。
+    real_write = env.sched.activity.write
+
+    def flaky_write(category, event, *args, **kwargs):
+        if event == "signal_maintenance_cycle_error":
+            raise RuntimeError("activity boom")
+        return real_write(category, event, *args, **kwargs)
+
+    env.sched.activity.write = flaky_write
+
+    oid = env.place_limit(price=148.20, sl=147.80, tp=149.00)
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                             148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=1))  # 二重故障でも例外が漏れない
+
+    assert orders.get(env.conn, oid)["status"] == "open"  # 約定処理へ到達した
+
+
+# ---------------------------------------------------------------------
+# signal_due_fn 自体の例外は「起動しない」に倒す (fail-open だが tick は
+# 継続する — sonnet Minor 指摘)
+# ---------------------------------------------------------------------
+def test_signal_due_fn_exception_is_fail_open(tmp_path):
+    env = Env(tmp_path)
+    env.sched._last_cron_trade = WED  # cron を抑制し signal 経路だけ見る
+
+    def boom(now):
+        raise RuntimeError("signal_due_fn boom")
+
+    env.sched.signal_due_fn = boom
+
+    env.sched.tick(WED + timedelta(minutes=5))  # 例外が漏れない
+
+    assert env.trade_reasons == []  # 起動しない
+    log = (env.tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "signal_due_check_error" in log

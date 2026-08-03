@@ -1,6 +1,7 @@
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -201,6 +202,134 @@ def test_tick_propagates_trigger_to_missions_row(tmp_path):
     row = app.conn_core.execute(
         "SELECT trigger FROM missions WHERE loop='trade'").fetchone()
     assert row["trigger"] == "cron"
+
+
+# ---- プラン 7 Task 8 fix round 1 F1: service.py の signal 実配線 --------
+#
+# sonnet の実証: service.py から D2 条件を削除しても、起動時 reclaim を
+# 削除しても、テストは全緑のままだった (scheduler/trade_loop の単体テスト
+# は service の closure をミラーした local combinator を使っているため —
+# 「単体が緑でも配線が誰からも呼ばれない」欠陥クラス)。ここでは
+# `build_app` が返す実 App (実 Scheduler・実 on_signal_maintenance・実
+# signal_due_fn・実 SignalProducer) を通しで検証する。実サブプロセス
+# (PluginSession) だけは `test_signal_eval.py` と同じ流儀で fake に差し替え
+# る (sandbox 起動の健全性自体は Task 2 の関心)。
+
+
+class _FakeSignalSession:
+    """`plugin_sandbox.PluginSession` の代わりに注入する fake (F1(a))。
+    `signal_producer.py` の `sandbox_run=None` (本番既定) パスが実際に
+    使うクラスをそのまま差し替える — sandbox_run 引数の注入シームは
+    service.py の配線には存在しない (常に None) ため、これが唯一の seam。
+    """
+
+    def __init__(self, meta, *, settings) -> None:
+        del meta, settings
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+    def call(self, payload: dict) -> dict:
+        del payload
+        return {"signals": [{"direction": "long", "strength": 0.8,
+                             "rationale": "up"}]}
+
+    def close(self) -> None:
+        pass
+
+
+def _seed_1m(conn, source: str, start, minutes: int, *, price: float = 100.0,
+            symbol: str = "USDJPY") -> None:
+    from agentic_fx.store import ohlcv as ohlcv_store
+    rows = [(symbol, "1m", (start + timedelta(minutes=i)).isoformat(),
+             price, price, price, price, 10.0, None) for i in range(minutes)]
+    ohlcv_store.import_bars(conn, rows, source=source)
+
+
+def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
+    """F1(a): 承認済み plugin + settings.pairs 内のデータを仕込み、実
+    `scheduler.tick()` を 1 回呼ぶと producer が実際に評価され signals
+    テーブルへ行が挿入されること (on_signal_maintenance の実配線)。"""
+    from agentic_fx.core.accounting import record_snapshot
+    from agentic_fx.plugin.loader import PluginMeta
+
+    _init(tmp_path)
+    meta = PluginMeta(name="sig1", kind="signal", path=Path("/nonexistent"),
+                      params={}, timeframe="1h", pairs=("USDJPY",),
+                      max_bars=50, content_hash="h" * 64)
+
+    with patch("agentic_fx.service.plugin_loader.approved_plugins",
+              return_value=[meta]), \
+         patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
+              _FakeSignalSession):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+        record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
+                        equity=1_000_000)
+        _seed_1m(app.conn_core, app.settings.plugin.producer_source,
+                NOW - timedelta(hours=3), 3 * 60 + 1)
+        with _no_real_network(), \
+             patch.object(app.provider, "healthcheck", return_value="yfinance"):
+            app.scheduler.tick(NOW)
+
+    count = app.conn_core.execute(
+        "SELECT COUNT(*) c FROM signals").fetchone()["c"]
+    assert count >= 1
+
+
+def test_f1b_signal_mission_does_not_fire_without_d2_position(tmp_path):
+    """F1(b): open/pending_fill の注文が皆無 (D2 不成立) だと、pending
+    signal があっても signal トリガーの trade mission が起動しないこと。"""
+    from agentic_fx.store import signals as signals_store
+
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    from agentic_fx.core.accounting import record_snapshot
+    record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
+                    equity=1_000_000)
+    signals_store.add(app.conn_core, plugin="sig1", content_hash="h1",
+                      pair="USDJPY", timeframe="1h",
+                      bar_ts=(NOW - timedelta(hours=1)).isoformat(),
+                      kind="signal", payload={"direction": "long"}, now=NOW)
+    app.scheduler._last_cron_trade = NOW  # cron を抑制し signal 経路だけ見る
+    app.trade_loop.run_once = MagicMock(wraps=app.trade_loop.run_once)
+
+    with _no_real_network(), \
+         patch.object(app.provider, "healthcheck", return_value="yfinance"):
+        app.scheduler.tick(NOW + timedelta(minutes=5))
+
+    app.trade_loop.run_once.assert_not_called()  # D2 不成立で起動しない
+
+
+def test_f1c_startup_reclaim_recovers_claimed_signal(tmp_path):
+    """F1(c): 停止時に claimed のまま残った signal 行が、次の build_app
+    (= 次回起動) 直後、tick を待たずに pending へ回収されること。"""
+    from agentic_fx.store import signals as signals_store
+
+    _init(tmp_path)
+    app1 = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                     embedding_fn=FakeEmbedding())
+    sid = signals_store.add(
+        app1.conn_core, plugin="sig1", content_hash="h1", pair="USDJPY",
+        timeframe="1h", bar_ts=(NOW - timedelta(hours=1)).isoformat(),
+        kind="signal", payload={"direction": "long"}, now=NOW)
+    lease_min = app1.settings.plugin.signal_lease_min
+    old = NOW - timedelta(minutes=lease_min + 5)
+    claimed = signals_store.claim_oldest(app1.conn_core, mission_id=999,
+                                         now=old, freshness_bars=None)
+    assert claimed is not None and claimed["id"] == sid  # 前提
+
+    # 「再起動」を模して同じ DB に対しもう一度 build_app する
+    app2 = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                     embedding_fn=FakeEmbedding())
+
+    row = app2.conn_core.execute(
+        "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()
+    assert row["status"] == "pending"  # 起動時 reclaim が回収した
 
 
 # ---- 上書き 3: MissionWatch は 1 インスタンスを共有注入 --------------------

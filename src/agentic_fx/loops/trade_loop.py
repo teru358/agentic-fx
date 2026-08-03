@@ -105,12 +105,31 @@ class TradeLoop:
                                  self.settings.runner.trade.model, now,
                                  trigger="signal")
             # ③claim_oldest — 失敗なら LLM を起こさず即 finalize (skipped)。
-            claimed = signals.claim_oldest(
-                self.conn, mission_id=mid, now=now,
-                freshness_bars=self.settings.plugin.signal_freshness_bars)
-            if claimed is None:
-                missions.finish(self.conn, mid, "skipped", None, [], now)
-                return None
+            try:
+                claimed = signals.claim_oldest(
+                    self.conn, mission_id=mid, now=now,
+                    freshness_bars=self.settings.plugin.signal_freshness_bars)
+                if claimed is None:
+                    missions.finish(self.conn, mid, "skipped", None, [], now)
+                    return None
+            except Exception:
+                # fix round 1 F2 (codex): claim_oldest (または直後の
+                # "skipped" finish) が例外を出すと、以前は mission が
+                # running のまま永久残留していた。missions.start と
+                # claim_oldest の間、または claim 失敗直後の finish の間で
+                # 例外が起きても、mission を必ず終端させる。
+                #
+                # claim_oldest 内部で「DB は commit 済みだが呼び出し直後に
+                # Python 例外」という曖昧窓は原理的に残る (claimed 行が
+                # claimed のままリークし得る) — この窓を塞ぐのは
+                # `signals.reclaim_expired` (lease 回収) の役目であり、
+                # `signal_lease_min` が経過するまでは不可視になり得る。
+                try:
+                    missions.finish(self.conn, mid, "failed", None, [], now)
+                except Exception:  # noqa: BLE001 — 元の例外を握りつぶさない
+                    _log.exception(
+                        "failed to finalize mission %s after claim error", mid)
+                raise
 
         consumed = False
         try:

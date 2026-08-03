@@ -278,7 +278,18 @@ class Scheduler:
         except Exception as e:  # noqa: BLE001 — 資金保護を止めない (fail-open)
             text = safe_error_text(e)
             _log.warning("%s cycle failed: %s", kind, text)
-            self.activity.write(Category.SYSTEM, f"{kind}_cycle_error", text)
+            # fix round 1 F5 (codex): activity.write 自体が故障 (ディスク
+            # I/O 障害等) すると、この二次例外がここを突き抜けて tick が
+            # 死ぬ — このフックは `_process_limit_fills`/`_process_exits`
+            # (資金保護) より前に立つため、二重故障で約定処理・SL/TP 監視
+            # まで止まってしまう (except ハンドラが故障源を共有するパター
+            # ン)。activity.write 自体も保護し、失敗時は技術ログのみへ
+            # フォールバックする (無音にはしない)。
+            try:
+                self.activity.write(Category.SYSTEM, f"{kind}_cycle_error", text)
+            except Exception:  # noqa: BLE001 — 資金保護を止めない
+                _log.exception(
+                    "%s cycle failed and activity.write also failed", kind)
 
     def _fresh_bar(self, pair: str, now: datetime) -> Bar | None:
         """鮮度検証 + 同一バー再処理防止を通ったバーのみ返す。"""

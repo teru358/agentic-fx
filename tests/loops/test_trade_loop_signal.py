@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.store import signals
@@ -130,6 +130,25 @@ def test_signal_claim_respects_freshness_gate(tmp_path):
     assert row["status"] == "pending"  # claim されていない (abandoned でもない)
     m = conn.execute("SELECT status FROM missions").fetchone()
     assert m["status"] == "skipped"
+
+
+# ---------------------------------------------------------------------
+# fix round 1 F2 (codex): claim_oldest 自体が例外を出しても mission が
+# running のまま残らない (missions.finish("failed") で終端し、例外は
+# 公開境界 (run_once) まで伝播して never-raise 契約どおり None になる)。
+# ---------------------------------------------------------------------
+def test_signal_claim_oldest_exception_finalizes_mission_as_failed(tmp_path):
+    conn, loop, runner, tp = _loop(tmp_path, [])
+    _add_signal(conn)
+
+    with patch("agentic_fx.loops.trade_loop.signals.claim_oldest",
+              side_effect=RuntimeError("db boom")):
+        out = loop.run_once("signal")
+
+    assert out is None
+    assert runner.missions == []  # LLM は起動されていない
+    m = conn.execute("SELECT status FROM missions").fetchone()
+    assert m["status"] == "failed"  # running のまま残らない
 
 
 # ---------------------------------------------------------------------

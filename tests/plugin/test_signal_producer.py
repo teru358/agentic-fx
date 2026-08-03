@@ -368,3 +368,71 @@ def test_indicator_plugins_are_ignored(tmp_path):
         sandbox_run=fake, settings=SETTINGS)
     assert inserted == 0
     assert fake.calls == []
+
+
+# ---------------------------------------------------------------------
+# fix round 1 F3 (codex): df が非空でも対象バケットの行が無ければ
+# (取り込みラグ) 評価完了と誤認しない — 偽の signal を生成せず、cursor も
+# 進めない。データが後から到着すれば同じバケットが再評価される。
+# ---------------------------------------------------------------------
+def test_missing_target_bucket_data_is_not_mistaken_for_completion(tmp_path, caplog):
+    conn = _conn(tmp_path)
+    # データは H (排他) まで — 対象バケット [H, H+1h) の 1m 行は 1 本も無い
+    # (取り込みラグを模す)。バケット [H-1h, H) には十分なデータがある。
+    _seed_flat(conn, H - timedelta(hours=3), 3 * 60)
+    meta = _meta(kind="signal", timeframe="1h")
+    fake = _FakeSandbox()
+    fake.queue("sig", {"signals": [_signal_result()]})  # H-1:00 用の 1 件のみ
+    producer = SignalProducer()
+
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.plugin.signal_producer"):
+        producer.evaluate_due_plugins(
+            conn, plugins=[meta], now=H + timedelta(hours=1),
+            source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+
+    # H-1:00 は評価され signal 化されるが、対象バケット H:00 は不在として
+    # fail-open されるため signal は生成されない (bar_ts=H:00 の行が無い)。
+    rows = conn.execute("SELECT bar_ts FROM signals").fetchall()
+    assert [r["bar_ts"] for r in rows] == [(H - timedelta(hours=1)).isoformat()]
+    assert "not yet present" in caplog.text
+
+    # 後からバーが到着 (取り込みラグ解消) — cursor が進んでいないので同じ
+    # バケットが次 tick (同じ now) で再評価される。
+    _seed_flat(conn, H, 60)
+    fake.queue("sig", {"signals": [_signal_result()]})
+    producer.evaluate_due_plugins(
+        conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
+        sandbox_run=fake, settings=SETTINGS)
+
+    rows2 = conn.execute("SELECT bar_ts FROM signals ORDER BY bar_ts").fetchall()
+    assert [r["bar_ts"] for r in rows2] == [
+        (H - timedelta(hours=1)).isoformat(), H.isoformat()]
+
+
+# ---------------------------------------------------------------------
+# fix round 1 F4 (codex): 同一バケットで detect が複数出力を返すと UNIQUE
+# (plugin, content_hash, pair, timeframe, bar_ts) により 2 個目以降が
+# INSERT OR IGNORE で音もなく消える (DDL は §12 逐語のため変更しない —
+# plan 由来の制約) — 2 個目以降の drop だけは warning で観測可能にする。
+# ---------------------------------------------------------------------
+def test_multiple_signals_in_same_bucket_drop_is_observed_via_warning(
+        tmp_path, caplog):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    meta = _meta(kind="signal", timeframe="1h")
+    fake = _FakeSandbox()
+    # H-1:00 のバケットだけ 2 出力を積む (H:00 は既定の空リストのまま)
+    fake.queue("sig", {"signals": [_signal_result(direction="long"),
+                                   _signal_result(direction="short")]})
+    producer = SignalProducer()
+
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.plugin.signal_producer"):
+        inserted = producer.evaluate_due_plugins(
+            conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
+            sandbox_run=fake, settings=SETTINGS)
+
+    assert inserted == 1  # 2 出力中 1 個だけ挿入される
+    count = conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"]
+    assert count == 1
+    assert "dropped by" in caplog.text
+    assert "UNIQUE" in caplog.text
