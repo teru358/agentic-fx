@@ -13,11 +13,21 @@
 直接呼び出し) に対する防波堤。
 
 **strategy 行への成績添付**: ``kind=="strategy"`` の行には
-``backtest_runs.latest_in_sample_metrics(content_hash)`` を
-``"in_sample_metrics"`` キーで添付し、``_ANNOTATION`` (バックテスト成績は
-実運用成績の予測値ではない) を ``"note"`` キーで必ず同梱する (metrics が
-None = 未計測でも注記だけは付ける — None であることが判断材料になる)。
-signal 行には両キーとも付けない。
+``backtest_runs.latest_in_sample_metrics(content_hash, pair=row["pair"])``
+を ``"in_sample_metrics"`` キーで添付し、``_ANNOTATION`` (バックテスト
+成績は実運用成績の予測値ではない) を ``"note"`` キーで必ず同梱する
+(metrics が None = 未計測でも注記だけは付ける — None であることが判断
+材料になる)。signal 行には両キーとも付けない。pair を必ず渡すのは fix
+round 1 F2 (content_hash はコード由来で pair 非依存。渡さないと多 pair
+strategy で他 pair の成績が誤帰属される)。
+
+**返却 projection**: 返却 item は明示的なキー列挙で構築する
+(``dict(row)`` は使わない) — signals テーブルの内部管理列
+(``claimed_by_mission_id``/``claimed_at``/``requeue_count``/
+``created_at``) は LLM に渡さない。``"status"`` は例外的に露出する
+(pending/claimed/consumed/abandoned は判断材料として有用で漏洩問題は
+無い — fix round 1 F3(a): 欠落していると abandoned/consumed の行が
+pending と区別できず「直近シグナル」として誤認される)。
 
 **改善ループ非露出**: ``IMPROVE_FORBIDDEN`` は改善ループ (プラン 9) の
 allowed tools リストに現れてはならないツール名の集合。改善ループの
@@ -98,11 +108,15 @@ def build(conn: sqlite3.Connection, settings: Settings,
             item = {"id": row["id"], "plugin": row["plugin"],
                      "content_hash": row["content_hash"], "pair": row["pair"],
                      "timeframe": row["timeframe"], "bar_ts": row["bar_ts"],
-                     "kind": row["kind"], "payload": payload}
+                     "kind": row["kind"], "status": row["status"],
+                     "payload": payload}
             if row["kind"] == "strategy":
+                # fix round 1 F2: content_hash はコード由来で pair 非依存。
+                # pair を渡さないと多 pair strategy で他 pair の成績が
+                # 誤帰属される (latest_in_sample_metrics 側の docstring 参照)。
                 item["in_sample_metrics"] = (
                     backtest_runs.latest_in_sample_metrics(
-                        conn, row["content_hash"]))
+                        conn, row["content_hash"], pair=row["pair"]))
                 item["note"] = _ANNOTATION
             result.append(item)
         return result

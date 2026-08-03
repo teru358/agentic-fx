@@ -287,11 +287,16 @@ def test_core_commit_exception_is_unknown(monkeypatch):
 # get_signals ツールが strategy 行に成績を添付するための面。in_sample_view
 # は content_hash 絞りを持たず created_at も返さないため流用できない
 # (opus R2 M8) — scope='in_sample' AND issued_by='harness' AND
-# content_hash=? に絞り、最新判定は id 降順で行う。
+# content_hash=? AND pair=? に絞り、最新判定は id 降順で行う。
+#
+# fix round 1 F2 (sonnet 実証): content_hash はコード由来で pair 非依存。
+# 多 pair strategy は同一 hash で pair ごとに行ができるため、pair 絞りが
+# 無いと他 pair の成績が誤帰属される — シグネチャに pair を必須化した。
 
 def test_latest_in_sample_metrics_returns_none_when_no_match(tmp_path):
     conn = _conn(tmp_path)
-    assert backtest_runs.latest_in_sample_metrics(conn, "nope") is None
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "nope", pair="USDJPY") is None
 
 
 def test_latest_in_sample_metrics_filters_content_hash(tmp_path):
@@ -303,8 +308,10 @@ def test_latest_in_sample_metrics_filters_content_hash(tmp_path):
         conn, scope="in_sample", content_hash="a", metrics={"trades": 1}, **kw)
     backtest_runs.save_harness_run(
         conn, scope="in_sample", content_hash="b", metrics={"trades": 2}, **kw)
-    assert backtest_runs.latest_in_sample_metrics(conn, "a") == {"trades": 1}
-    assert backtest_runs.latest_in_sample_metrics(conn, "b") == {"trades": 2}
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "a", pair="USDJPY") == {"trades": 1}
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "b", pair="USDJPY") == {"trades": 2}
 
 
 def test_latest_in_sample_metrics_picks_latest_by_id_desc(tmp_path):
@@ -319,7 +326,8 @@ def test_latest_in_sample_metrics_picks_latest_by_id_desc(tmp_path):
         conn, scope="in_sample", metrics={"trades": 1}, **kw)
     backtest_runs.save_harness_run(
         conn, scope="in_sample", metrics={"trades": 99}, **kw)
-    assert backtest_runs.latest_in_sample_metrics(conn, "h") == {"trades": 99}
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "h", pair="USDJPY") == {"trades": 99}
 
 
 def test_latest_in_sample_metrics_whitelists_metric_keys(tmp_path):
@@ -332,7 +340,7 @@ def test_latest_in_sample_metrics_whitelists_metric_keys(tmp_path):
               metrics={"trades": 40, "period_start": "2020-01-01T00:00:00+00:00"},
               settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
-    metrics = backtest_runs.latest_in_sample_metrics(conn, "h")
+    metrics = backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
     assert metrics == {"trades": 40}
     assert "period_start" not in metrics
 
@@ -346,4 +354,92 @@ def test_latest_in_sample_metrics_excludes_holdout_gate_and_human_custom(tmp_pat
               core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="holdout_gate", **kw)
     backtest_runs.save_human_run(conn, **kw)
-    assert backtest_runs.latest_in_sample_metrics(conn, "h") is None
+    assert backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY") is None
+
+
+# ---- fix round 1 F1 (Critical, codex): ネスト密輸の遮断 ---------------------
+#
+# METRIC_KEYS の白リスト濾過はトップレベルキーしか見ていなかったため、
+# 白リストキーの値の中に {"trades": {"period_start": ...}} のようにネスト
+# して holdout 期間を密輸できた。値がスカラー (int/float/bool/None/str) の
+# ものだけを通すよう強化し、in_sample_view / latest_in_sample_metrics 両方
+# で確認する (濾過ヘルパを共有しているため両方で同一の欠陥・同一の修正)。
+
+def test_in_sample_view_filters_nested_dict_value_smuggling(tmp_path):
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H),
+              metrics={"trades": {"period_start": "2020-01-01T00:00:00+00:00",
+                                  "period_end": "2020-06-01T00:00:00+00:00"},
+                      "pf": 1.5},
+              settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+    rows = backtest_runs.in_sample_view(conn)
+    assert rows[0]["metrics"] == {"pf": 1.5}  # ネストした trades は落ちる
+    assert "trades" not in rows[0]["metrics"]
+
+
+def test_latest_in_sample_metrics_filters_nested_dict_value_smuggling(tmp_path):
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H),
+              metrics={"trades": {"period_start": "2020-01-01T00:00:00+00:00"},
+                      "pf": 1.5},
+              settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+    metrics = backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
+    assert metrics == {"pf": 1.5}
+    assert "trades" not in metrics
+
+
+def test_latest_in_sample_metrics_filters_list_value_smuggling(tmp_path):
+    """値が list のネスト密輸も同様に落ちる (dict だけを弾く変異への防波堤)。"""
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H),
+              metrics={"trades": ["2020-01-01T00:00:00+00:00"], "pf": 1.5},
+              settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+    metrics = backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
+    assert metrics == {"pf": 1.5}
+
+
+# ---- fix round 1 F2 (Important, sonnet): pair 帰属 --------------------------
+
+def test_latest_in_sample_metrics_scoped_by_pair_not_content_hash_alone(tmp_path):
+    """同一 content_hash (多 pair strategy) で pair ごとに成績を分離する。
+    pair 絞りが無いと EURUSD 側の呼び出しに USDJPY の成績が付く
+    (レビュアーが実 DB で再現した誤帰属)。"""
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="multi", kind="strategy",
+              timeframe="1h", source="dukascopy", period=(H, H),
+              settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", pair="USDJPY", metrics={"pf": 1.1}, **kw)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", pair="EURUSD", metrics={"pf": 2.2}, **kw)
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "multi", pair="USDJPY") == {"pf": 1.1}
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "multi", pair="EURUSD") == {"pf": 2.2}
+
+
+# ---- fix round 1 F4 (Important, codex): metrics_json 破損の fail-open -------
+
+def test_latest_in_sample_metrics_malformed_json_returns_none_fail_open(tmp_path):
+    """DB 破損や手動行で metrics_json が壊れていても None を返す (例外を
+    伝播させない) — get_signals が他の正常な行まで道連れにしないための
+    fail-open。"""
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H), metrics={"trades": 1}, settings_hash="s",
+              core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+    conn.execute("UPDATE backtest_runs SET metrics_json='not json' "
+                "WHERE content_hash='h'")
+    conn.commit()
+    assert backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY") is None

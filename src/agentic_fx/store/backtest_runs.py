@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
@@ -33,7 +34,24 @@ from typing import Any
 
 from agentic_fx.backtest.metrics import METRIC_KEYS
 
+_log = logging.getLogger("agentic_fx.store.backtest_runs")
+
 _HARNESS_SCOPES = frozenset({"in_sample", "holdout_gate"})
+
+# fix round 1 F1 (Critical, codex): METRIC_KEYS の白リスト濾過はトップ
+# レベルキーしか見ていなかったため、白リストキーの値の中に
+# {"trades": {"period_start": ...}} のようにネストして holdout 期間を
+# 密輸できた (現行の書き込み経路 (compute_metrics) はスカラーしか作らない
+# ため実害は無いが、遮断境界の防御深度の問題)。値がスカラー
+# (int/float/bool/None/str) のものだけを通す — in_sample_view と
+# latest_in_sample_metrics で共有する。
+_SCALAR_TYPES = (int, float, bool, str, type(None))
+
+
+def _filter_metrics(raw_metrics: dict) -> dict:
+    """METRIC_KEYS 白リスト濾過 + スカラー値限定 (fix round 1 F1)。"""
+    return {k: v for k, v in raw_metrics.items()
+            if k in METRIC_KEYS and isinstance(v, _SCALAR_TYPES)}
 
 _VIEW_COLUMNS = (
     "id, plugin_ref, content_hash, kind, pair, timeframe, source, scope, "
@@ -141,37 +159,58 @@ def in_sample_view(conn: sqlite3.Connection, *,
         # fix round 1 F1 (codex Important): metrics dict は save_harness_run
         # の任意入力なので、"period_start"/"period_end" 等を metrics に
         # 混入されると列遮断 (holdout 遮断 1) を密輸できてしまう。読み側で
-        # METRIC_KEYS の白リスト濾過をかける (遮断境界は view 側)。
-        d["metrics"] = {k: v for k, v in raw_metrics.items()
-                        if k in METRIC_KEYS}
+        # METRIC_KEYS の白リスト濾過 (+ スカラー値限定) をかける
+        # (遮断境界は view 側)。
+        d["metrics"] = _filter_metrics(raw_metrics)
         result.append(d)
     return result
 
 
-def latest_in_sample_metrics(conn: sqlite3.Connection,
-                              content_hash: str) -> dict | None:
-    """指定 content_hash の in_sample 成績のうち最新 1 件の metrics を返す。
+def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
+                              pair: str) -> dict | None:
+    """指定 content_hash・pair の in_sample 成績のうち最新 1 件の metrics
+    を返す。
 
     プラン 7 Task 9 (get_signals ツール) が strategy 行に成績を添付する
     ために使う。``in_sample_view`` は content_hash 絞りを持たず
     created_at も返さないため流用できない (opus R2 M8) — ``scope=
-    'in_sample' AND issued_by='harness' AND content_hash=?`` に絞り、
-    最新判定は ``id`` 降順 (created_at は分格子切り捨てで衝突しうるため
-    id で一意に決める) の LIMIT 1 で行う。
+    'in_sample' AND issued_by='harness' AND content_hash=? AND pair=?``
+    に絞り、最新判定は ``id`` 降順 (created_at は分格子切り捨てで衝突
+    しうるため id で一意に決める) の LIMIT 1 で行う。
+
+    fix round 1 F2 (sonnet 実証): content_hash はコード由来で pair 非依存。
+    多 pair strategy の承認では同一 hash で pair ごとに backtest_runs 行が
+    できるため、pair 絞りが無いと「最後に評価された pair」の成績が別 pair
+    の signal 行に誤帰属される (レビュアーが実 DB で再現)。pair を必須
+    キーワード引数にして WHERE に含める (timeframe は D5 裁定: 評価 tf は
+    宣言 tf 固定のため絞り不要)。
 
     ``in_sample_view`` と同じ理由 (fix round 1 F1) で ``METRIC_KEYS`` の
-    白リスト濾過を通す — metrics dict は save_harness_run の任意入力
-    なので、濾過なしでは period_start 等の密輸経路になる。該当行が
-    無ければ None (未計測)。
+    白リスト濾過 (+ スカラー値限定) を通す — metrics dict は
+    save_harness_run の任意入力なので、濾過なしでは period_start 等の
+    密輸経路になる。該当行が無ければ None (未計測)。
+
+    fix round 1 F4 (codex Important): metrics_json の decode 失敗
+    (DB 破損・手動行) を無保護で伝播させると、get_signals 経由の呼び出し
+    全体が registry エラーになり正常な他行まで返せなくなる。payload_json
+    (get_signals 側) と同じ fail-open 流儀で、decode 失敗は warning ログ +
+    None 返却にする。
     """
     row = conn.execute(
         "SELECT metrics_json FROM backtest_runs WHERE scope='in_sample' "
-        "AND issued_by='harness' AND content_hash=? "
-        "ORDER BY id DESC LIMIT 1", (content_hash,)).fetchone()
+        "AND issued_by='harness' AND content_hash=? AND pair=? "
+        "ORDER BY id DESC LIMIT 1", (content_hash, pair)).fetchone()
     if row is None:
         return None
-    raw_metrics = json.loads(row["metrics_json"])
-    return {k: v for k, v in raw_metrics.items() if k in METRIC_KEYS}
+    try:
+        raw_metrics = json.loads(row["metrics_json"])
+    except (TypeError, ValueError):
+        _log.warning(
+            "latest_in_sample_metrics: metrics_json decode failed for "
+            "content_hash=%s pair=%s — returning None (fail-open)",
+            content_hash, pair)
+        return None
+    return _filter_metrics(raw_metrics)
 
 
 def settings_snapshot_hash(settings: Any) -> str:

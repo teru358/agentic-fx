@@ -188,3 +188,84 @@ def test_schema_has_minimum_and_maximum(tmp_path):
     since_schema = tool.parameters["properties"]["since_hours"]
     assert since_schema["minimum"] == 1
     assert since_schema["maximum"] == SETTINGS.plugin.signals_max_lookback_hours
+
+
+# ---- fix round 1 F2 (Important, sonnet): 多 pair strategy の成績が pair 別に
+# 正しく帰属される (content_hash はコード由来で pair 非依存のため、pair
+# 絞りが無いと「最後に評価された pair」の成績が誤って付く)。
+
+def test_strategy_metrics_scoped_by_own_pair_not_other_pair(tmp_path):
+    conn = _conn(tmp_path)
+    settings2 = SETTINGS.model_copy(deep=True)
+    settings2.pairs = ["USDJPY", "EURUSD"]
+    _add_signal(conn, hours_ago=1, kind="strategy", content_hash="multi",
+               pair="USDJPY")
+    _add_signal(conn, hours_ago=1, kind="strategy", content_hash="multi",
+               pair="EURUSD")
+    kw = dict(plugin_ref="p.py", content_hash="multi", kind="strategy",
+              timeframe="1h", source="dukascopy", period=(NOW, NOW),
+              settings_hash="s", core_commit="c", initial_balance=1e6, now=NOW)
+    # EURUSD を後から保存する (id が大きい) — pair 絞りが無いと id 降順で
+    # USDJPY 側の呼び出しにも EURUSD の成績が誤って付く。
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", pair="USDJPY", metrics={"pf": 1.1}, **kw)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", pair="EURUSD", metrics={"pf": 2.2}, **kw)
+    tool = _tool(conn, settings=settings2)
+    usdjpy_out = tool.func(pair="USDJPY")
+    eurusd_out = tool.func(pair="EURUSD")
+    assert usdjpy_out[0]["in_sample_metrics"] == {"pf": 1.1}
+    assert eurusd_out[0]["in_sample_metrics"] == {"pf": 2.2}
+
+
+# ---- fix round 1 F3 (Important, sonnet+codex): status 露出 + projection ピン --
+
+def test_signal_row_status_present_and_exact_key_set(tmp_path):
+    """(a) status キーが返る。(b) projection を dict(row) にする変異
+    (claimed_by_mission_id 等の内部列の全露出) を検出するため、キー集合を
+    厳密に assert する。"""
+    conn = _conn(tmp_path)
+    _add_signal(conn, hours_ago=1, kind="signal", content_hash="sig1")
+    tool = _tool(conn)
+    out = tool.func(pair="USDJPY")
+    assert out[0]["status"] == "pending"
+    assert set(out[0].keys()) == {
+        "id", "plugin", "content_hash", "pair", "timeframe", "bar_ts",
+        "kind", "status", "payload"}
+
+
+def test_strategy_row_status_present_and_exact_key_set(tmp_path):
+    conn = _conn(tmp_path)
+    _add_signal(conn, hours_ago=1, kind="strategy", content_hash="strat1")
+    tool = _tool(conn)
+    out = tool.func(pair="USDJPY")
+    assert out[0]["status"] == "pending"
+    assert set(out[0].keys()) == {
+        "id", "plugin", "content_hash", "pair", "timeframe", "bar_ts",
+        "kind", "status", "payload", "in_sample_metrics", "note"}
+
+
+# ---- fix round 1 F4 (Important, codex): metrics_json 破損の fail-open -------
+
+def test_malformed_backtest_metrics_json_does_not_break_other_rows(tmp_path):
+    """1 件の strategy 行の backtest_runs.metrics_json が壊れていても、
+    get_signals 全体が例外で落ちず、他の正常な行 (signal 行) は普通に
+    返る。壊れた行自体は in_sample_metrics=None + note 付きで返る
+    (fail-open)。"""
+    conn = _conn(tmp_path)
+    _add_signal(conn, hours_ago=1, kind="signal", content_hash="good_sig")
+    _add_signal(conn, hours_ago=1, kind="strategy", content_hash="broken")
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="p.py", content_hash="broken",
+        kind="strategy", pair="USDJPY", timeframe="1h", source="dukascopy",
+        period=(NOW, NOW), metrics={"trades": 1}, settings_hash="s",
+        core_commit="c", initial_balance=1e6, now=NOW)
+    conn.execute("UPDATE backtest_runs SET metrics_json='not json' "
+                "WHERE content_hash='broken'")
+    conn.commit()
+    tool = _tool(conn)
+    out = tool.func(pair="USDJPY")
+    by_hash = {r["content_hash"]: r for r in out}
+    assert set(by_hash) == {"good_sig", "broken"}
+    assert by_hash["broken"]["in_sample_metrics"] is None
+    assert by_hash["broken"]["note"] == "バックテスト成績は実運用成績の予測値ではない"
