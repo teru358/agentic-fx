@@ -1,7 +1,7 @@
 # プラン 8 設計: サービス堅牢化 (Mission worker 隔離 + preemption + 起票返済)
 
 **日付**: 2026-08-03
-**status**: 改訂 3 — codex round 2 (新規 C5/I5/M1) を全件反映。round 3 再レビュー待ち
+**status**: 改訂 4 — codex round 3 (新規 C2/I3) を全件反映。round 4 収束確認待ち
 **入力**: 分解書 (`docs/superpowers/plans/2026-08-01-phase2-decomposition.md` プラン 8 節) / 設計書 §15 Phase 2 受入条件 / プラン 7 レジャー起票束 (`.superpowers/sdd/2026-08-02-phase2-7-plugins/progress.md` 末尾) / プラン 5 レジャー park 一覧 (`.superpowers/sdd/2026-07-26-phase1-5-loop-service/progress.md` 統合裁定節) / codex round 1 (`.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round1.md`)
 
 ## 0. スコープ (ユーザー裁定: A + B 全部入れ)
@@ -40,11 +40,11 @@
 |---|---|---|---|
 | **prepare** | healthcheck (lock 外・timeout 付き) → `missions.start` / `signals.claim_oldest` / prompt 構築 (DB 読み) | 取得 | conn_core |
 | **run** | `WorkerRunner.run(mission)` — 子プロセスで LLM ループ | **非保持** | 子の RO 接続 (+RAG RPC) |
-| **commit-pre** | 結果検証 → `TradeIntent.from_llm_dict` → 執行用 quote 取得 (外部 I/O。失敗/stale は intent 破棄 = 現行 executor の防御と同義) | **非保持** | — |
-| **commit-core** | Risk Gate 判定 → paper broker 執行 (DB 書込 = 決定論) → `signals.consume` → `missions.finish` (CAS)。finally で未 consume claim の requeue | 取得 | conn_core |
+| **commit-pre** | 結果検証 → `TradeIntent.from_llm_dict` → **Risk Gate/執行に要る全外部取得**: 執行用 quote + instrument spec + 全 exposure 通貨の換算レート (`rate_fn` 経由 — PriceProvider quote に到達する外部 I/O)。取得値は timestamp 付きスナップショットにする | **非保持** | — |
+| **commit-core** | **スナップショットの鮮度再検証** (期限超過は intent 拒否 — lock 内での再取得はしない) → DB 状態を読み直して GateContext 確定 → Risk Gate 判定 → paper broker 執行 (DB 書込 = 決定論) → `signals.consume` → `missions.finish` (CAS)。finally で未 consume claim の requeue | 取得 | conn_core |
 | **commit-post** | Notifier 通知・activity 集約書込のうち lock 不要なもの | **非保持** | — |
 
-**commit の 3 小相分割の理由** (codex C2-5): `executor.handle_intent` は quote 取得 (network) と Notifier 同期 HTTP を含み、これを lock 下に置くと停止窓が無界に戻る。外部 I/O を commit-pre / commit-post に追い出し、**lock 下は決定論操作 (DB 書込) のみ**とする。executor の内部をこの 3 小相に沿って分割するリファクタが必要になるが、risk_gate / kill_switch のロジック自体は不変 (受入 6 の「決定論的コア diff ゼロ」は risk_gate/kill_switch に適用し、executor は「判定ロジック不変・I/O 位置のみ移動」を差分レビューで確認する条件に緩和する)。**Phase 3 の live broker submit** (外部 I/O だが順序保証が必要) の置き場所は Phase 3 設計論点として予約 — 本プランでは paper broker (DB 書込) のみ。
+**commit の 3 小相分割の理由** (codex C2-5 / C3-2): `executor.handle_intent` は執行用 quote だけでなく、GateContext 構築中に `spec_fn` と `cycle_rate_fn` (cache miss 時 `rate_fn` → `PriceProvider.to_account_rate` → quote 取得: executor.py:166,256,272-277 / service.py:298 / price_provider.py:395) の**換算レート外部 I/O** を呼ぶ。これらが lock 下に残ると換算プロバイダのハングで SL/TP 監視が止まる。したがって **commit-pre で Risk Gate に必要な全外部取得を完了**させ、commit-core は「取得済みスナップショット + DB 操作」だけにする。**鮮度の契約** (codex I3-3): commit-pre の取得値は lock 待ちの間に陳腐化しうるため、commit-core 開始時に quote/rate の timestamp を再検証し、期限超過は**発注拒否して次周期へ送る** (lock 内再取得は C3-2 の再発なので禁止)。risk_gate / kill_switch のロジック自体は不変 (受入 7 の「決定論的コア」は risk_gate/kill_switch に diff ゼロを適用し、executor は「判定ロジック不変・I/O 位置のみ移動」を差分レビューで確認する条件)。**Phase 3 の live broker submit** (外部 I/O だが順序保証が必要) の置き場所は Phase 3 設計論点として予約 — 本プランでは paper broker (DB 書込) のみ。
 
 - 相間で保持してよいのは不変データのみ (mission_id・claim した signal の raw 行・構築済み prompt・settings スナップショット)。
 - **接続契約**: `conn_core` は「core_lock 保持中のみ触れる」を規約として明文化する (docstring + レビュー観点)。
@@ -54,12 +54,12 @@
 
 | スレッド | 役割 | core_lock |
 |---|---|---|
-| scheduler | 毎 tick: **資金保護区間 (`_process_limit_fills` → `_process_exits`、相対順序を保存) を先頭で実行** → データ hooks (timeout 必須) → Mission 起動判定 → supervisor へ `try_submit` して即 return | tick 全体で取得 (Mission を含まない) |
+| scheduler | 毎 tick: **決定論ブロック (mark-to-market → account/予約再検証 → `fills_allowed` 判定 → `_process_limit_fills` → `_process_exits`) を現行の内部順序のまま先頭で実行** → データ hooks (timeout 必須) → Mission 起動判定 → supervisor へ `try_submit` して即 return | tick 全体で取得 (Mission を含まない) |
 | **mission supervisor (新設)** | 単一スロットで Mission ジョブを直列実行 (三相) | prepare / commit-core のみ取得 |
 | watchdog | 超過通知 (既存) + **スレッド監督の主体** (§6) | 取らない |
 | main/shell | daemon 待機 or shell。`ask` は supervisor 経由に統一 | — |
 
-- tick 内の順序再編は **fills→exits のペアを相対順序ごと先頭へ移し、データ hooks をその後ろへ下げる** (codex C2-1 対応)。`_process_exits` 単独を先頭に置いてはならない — exits 末尾の processed-bar マーキング (scheduler.py:949-) を `_process_limit_fills` の `_fresh_bar` (:879, :294) が参照し、exits→fills の順にすると当該バーの指値約定が抑止される回帰になる。fills→exits 間の `filled_ids` 受け渡し (同一バー TP の誤確定防止) も保存する。この契約 (fills→exits の順序 + processed-bar マーキングの位置) を**回帰ピンテスト**で固定する。
+- tick 内の順序再編は **「hooks だけを決定論ブロックの後ろへ移す」** と定義する (codex C2-1 + C3-1 対応)。現行 tick は hooks (scheduler.py:93) → mark-to-market (:126) → account/予約再検証 → `fills_allowed` 判定 (:145) → `_process_limit_fills` (:208) → `_process_exits` (:209) の順であり、**決定論ブロック (:126 以降) は内部順序を一切変えずそのまま先頭へ繰り上がる**。fills だけを切り出して先頭に置いてはならない — mark-to-market・account snapshot 検証・予約リスク再検証が `fills_allowed` を決めており、これらを飛ばすと account 不明時や予約超過時にも指値が約定する fail-closed 破りになる (C3-1)。また `_process_exits` 単独を先頭に置いてもならない — exits 末尾の processed-bar マーキング (:949-) を fills の `_fresh_bar` (:879, :294) が参照し、順序が逆転すると当該バーの指値約定が抑止される (C2-1)。`filled_ids` 受け渡し (同一バー TP の誤確定防止) も保存する。**この契約 (決定論ブロックの内部順序 + processed-bar マーキング位置 + fills_allowed ゲート) を回帰ピンテストで固定する**。
 - データ hooks (news collector / econ refresh / signal maintenance / RAG 書込) の **timeout の強制点は HTTP クライアント構築時の httpx timeout (connect/read/write/pool) を settings から必須注入すること** (codex I2-1 — 同期呼び出しのスレッド kill は不可能なため、`data_hook_timeout_sec` は「hook が内部で使う全ネットワーククライアントの timeout 上限」の規定であり wall-clock 保証ではない)。fetchers / collector のクライアント生成箇所の監査を task に含める。timeout が効かない極端なハング (DNS 等) は watchdog の heartbeat 監督 (§6) が検出し、§6 の死亡時規則 (両モードで停止) に接続する。
 - 「Mission 実行中も SL/TP 監視継続」は *tick が Mission を待たない構造* + *hooks の有界化* + *hooks を資金保護の後ろに置く順序* の 3 点で成立する。
 
@@ -106,7 +106,8 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 - 子は単一スレッドで動き、`tool_rpc` は**常に同時 1 件以下** (in-flight 1)。要求送信後は `tool_rpc_result` (rpc_id 一致) をブロッキング待ちする。
 - 親側の **writer は 2 時点で排他**: handshake は spawn 直後に WorkerRunner 呼び出しスレッド (supervisor) が書き、以後 stdin へ書くのは RPC 応答の返送のみ。防御的に stdin 書込 lock を置く。
 - 親の reader スレッドはフレームを種別処理する: `event` → transcript バッファへ append / `tool_rpc` → **専用 dispatcher スレッドへ引き渡す** (reader 自身は読み続ける) / `result`・EOF → 完了 queue へ。supervisor (呼び出し元) は完了 queue を壁時計 timeout 付きで待つだけ — 「子が RPC 応答待ち・親が result 待ち」の相互待ちは発生しない。
-- **RPC を reader インラインで実行しない理由** (codex I2-2): RAG 実装がハングした場合、reader ごと回収不能になり EOF 検出も止まる。dispatcher スレッド + **`rpc_timeout_sec` の応答待ち打ち切り** (超過は子へ tool error を返し、latched health に記録) とし、reader は常に生かしておく。timeout 後にリークした dispatcher スレッドが Rag lock を保持し続ける事故は §4.4 の lock 取得 timeout で波及を止める。
+- **RPC を reader インラインで実行しない理由** (codex I2-2): RAG 実装がハングした場合、reader ごと回収不能になり EOF 検出も止まる。dispatcher スレッド + **`rpc_timeout_sec` の応答待ち打ち切り** (超過は子へ tool error を返す) とし、reader は常に生かしておく。
+- **dispatcher リークの裁定** (codex I3-1): timeout でハングした dispatcher スレッドは終了できず、Rag lock を保持したまま残りうる。これを「累積許容」しない — **リーク発生 1 本目で latched health fatal とし、§6 の停止シーケンス (非ゼロ終了 → monit 再起動) へ倒す**。RAG の別プロセス化はこの頻度 (ローカル計算のハングは稀) に対して過剰と裁定し、採らない。§4.4 の lock 取得 timeout は「fatal 検出〜停止完了までの間」の波及止めとして残す。
 - **`seq` の検証規則** (codex M2-1): 方向別に 1 起点の単調増加。受信側は重複・逆行・欠番を**プロトコル違反としてセッション死** (fail closed — sandbox の `_dead` 意味論と同じ)。
 - kill 時は応答不要 — 子は SIGKILL で死に、reader は EOF で終端する。SIGTERM 中に write が詰まる経路は「kill 完了後にパイプを閉じる」順序不変条件 + 応答書込の broken pipe を握って kill へ進むことで封鎖。
 
@@ -137,7 +138,7 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 1. **接続情報の非提供**: improve profile には DB パス・`data/` の位置を一切渡さない + cwd は専用空 workdir (相対パス到達の封鎖)。
 2. **Landlock による FS 自己制限**: worker bootstrap (mission コード実行前) で Linux Landlock (kernel 5.13+、本環境 7.0 で利用可) により FS アクセスを allowlist (コードツリー読取 + 専用 workdir 読書き) に制限し、`data/`・DB ファイルへの絶対パスアクセスを OS レベルで遮断する。実装は ctypes による syscall 直叩き (`landlock_create_ruleset` / `landlock_add_rule` / `landlock_restrict_self`) の小モジュール。**Landlock が利用不能な環境では improve profile の worker は起動拒否 (fail closed)**。trade profile では Landlock は任意 (RO 接続が主防御)。
 
-**到達不能の意味論** (codex C2-4 対応): Landlock allowlist はコードツリーの読取を許すため、`run_holdout_gate` の**関数 import 自体は可能**である。遮断項目 2 の脅威モデルは「改善ループが holdout 成績を入手して過学習する」ことであり、その実体は**データ到達**にある — `run_holdout_gate` は `history_conn` (履歴 DB 接続) を必須引数に取り、improve worker は DB パス非提供 + Landlock の data/ 遮断により接続を構成できないため、import できても**実行が必ず失敗する**。受入条件は「import 不能」ではなく「**実行不能 (holdout 結果の入手不能)**」で定義する: improve profile の実 worker プロセス内から ①`data/agentic.db` の絶対パス open が失敗 ②`data/` 列挙が失敗 ③`run_holdout_gate` を呼んでもデータ到達不能で失敗 — の 3 点を実測する (§9 受入 3)。
+**到達不能の意味論** (codex C2-4 対応): 分解書の「`run_holdout_gate`・`ohlcv` 直読・`data/` が構造的に到達不能」(2026-08-01-phase2-decomposition.md:96,104) は、本節の「実行不能」意味論で読み替える (writing-plans 時に分解書へ注記を入れる)。Landlock allowlist はコードツリーの読取を許すため、`run_holdout_gate` の**関数 import 自体は可能**である。遮断項目 2 の脅威モデルは「改善ループが holdout 成績を入手して過学習する」ことであり、その実体は**データ到達**にある — `run_holdout_gate` は `history_conn` (履歴 DB 接続) を必須引数に取り、improve worker は DB パス非提供 + Landlock の data/ 遮断により接続を構成できないため、import できても**実行が必ず失敗する**。受入条件は「import 不能」ではなく「**実行不能 (holdout 結果の入手不能)**」で定義する: improve profile の実 worker プロセス内から ①`data/agentic.db` の絶対パス open が失敗 ②`data/` 列挙が失敗 ③`run_holdout_gate` を呼んでもデータ到達不能で失敗 — の 3 点を実測する (§9 受入 3)。
 
 ### 4.7 preemption エスカレーション
 
@@ -175,6 +176,7 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 - **監督の主体は watchdog スレッドに一本化**する (改訂 1 の「main の待機ループ」は対話モードで main が shell にブロックし成立しない — codex I-4)。watchdog は scheduler / supervisor の heartbeat 鮮度と生存を 30 秒周期で監視し、死亡・鮮度超過を検出したら: activity 書込 + Notifier 通知 + supervisor 死亡時は pending Future の例外完了。
 - **watchdog 自身の監督**: scheduler tick が watchdog の heartbeat を相互確認し、死亡検出時は activity + 通知。両者同時死は monit (プロセス外) が最後の防波堤。
 - **終了規則 (モード共通)**: scheduler / supervisor の回復不能死亡を検出したら、**対話モードでも即座に停止シーケンス (§5) を開始して非ゼロ終了**する (codex C2-3 — scheduler 死亡 = SL/TP 監視の永久停止であり、資金保護が動かないプロセスを生かしておくこと自体が絶対制約違反。改訂 2 の「対話モードは通知のみ」は撤回)。モード差は通知の出し方のみ: daemon は activity+Notifier、対話はそれに加えて shell へ警告を表示してから終了する。
+- **停止シーケンスの実行主体の一意化** (codex I3-2): **watchdog は fatal event の記録 + `stop_event` セット + 通知までしか行わない** (watchdog 自身が `App.close()` を実行すると最後に自分自身を join する矛盾が生じる)。**停止状態機械 (§5) の実行主体は常に main スレッド**とする。daemon モードの main は 1 秒周期の `stop_event.wait` で即座に反応できる。対話モードの main は `input()` でブロックしているため、**shell readline 中断 seam (§7 のプラン 5 park 返済項目) を本設計の必須依存に昇格**し、stop_event セットで readline を確実に wake して main が §5 を実行する。
 - **health ラッチ**: activity 書き込み失敗 (ディスクフル等) は App 内の latched health 状態に記録し、以後は別経路 (notifier + stderr) で警告。`status` コマンドでラッチ内容を表示。**ラッチは解除しない** (プロセス再起動でのみクリア — 「一度でも記録が欠けた稼働」を人間が確実に知るため)。
 
 ## 7. B 束 (プラン 7 起票) と park 小口の方式
@@ -191,7 +193,7 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 | sqlite3.Error CLI 境界 | CLI 外側 except に sqlite3.Error を追加し診断 + rc=1 (Task 6 deferred ④) |
 | SQLite ≥3.35 起動 assert | RETURNING 前提の版数ガードを起動時に (Task 7 deferred ①) |
 | description f-string 化 | get_signals ToolDef の「既定 24h」を設定値から生成 (Task 9 deferred ①) |
-| プラン 5 park 小口 | retry policy 明文化 (`_last_trade` 前進 = 1 回/時再試行を意図として文書化 + テスト) / scheduler 時刻源の clock 配線 / provider ctor seam / policy OSError / shell readline 中断 / fable M3〜M7 残 minor |
+| プラン 5 park 小口 | retry policy 明文化 (`_last_trade` 前進 = 1 回/時再試行を意図として文書化 + テスト) / scheduler 時刻源の clock 配線 / provider ctor seam / policy OSError / **shell readline 中断 (§6 の停止実行主体の必須依存に昇格 — 対話モードで main を wake する唯一の経路)** / fable M3〜M7 残 minor |
 
 ## 8. 新設定キー (settings.yaml / example 同期)
 
@@ -212,7 +214,7 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 3. **improve profile 到達不能 (実行不能の意味論 — §4.6)**: improve profile の**実 worker プロセス内**から ①`data/agentic.db` 絶対パス open 失敗 ②`data/` 列挙失敗 ③`run_holdout_gate` を呼んでもデータ到達不能で失敗 — の実測テスト (Landlock 層 + 非提供層)。Landlock 不能環境で improve worker が起動拒否することのテスト。
 4. **終端の一意性**: `missions.finish` CAS の二重終端拒否テスト / 起動時 `running`→`interrupted` + claimed signals 同時 requeue の同一トランザクションテスト。
 5. スレッド死亡 → (daemon) 非ゼロ終了・(対話) 通知 / App.close 全経路 (正常・join タイムアウト・build 途中失敗) / shutdown 時の pending Future 例外完了。
-6. **tick 順序契約の保存**: fills→exits の相対順序・`filled_ids` 受け渡し・processed-bar マーキング位置の回帰ピンテスト (指値約定がバー到達で成立し続けること — codex C2-1)。
+6. **tick 順序契約の保存**: 決定論ブロック (mark-to-market → account/予約再検証 → `fills_allowed` → fills → exits) の内部順序・`fills_allowed` ゲート・`filled_ids` 受け渡し・processed-bar マーキング位置の回帰ピンテスト (account 不明時に指値が約定しないこと / 指値約定がバー到達で成立し続けること — codex C2-1/C3-1)。commit-core の鮮度再検証 (stale スナップショットで発注拒否) のテスト (I3-3)。
 7. **決定論的コア**: risk_gate / kill_switch は diff ゼロ。executor は「判定ロジック不変・I/O 位置のみ 3 小相へ移動」を差分レビューで確認 (§3.1)。最終ブランチレビューで照合。
 8. 既存 1404 tests green。
 
@@ -231,4 +233,5 @@ build_app からツール配線を `build_mission_registry(loop, conn, settings,
 ## 12. レビュー履歴
 
 - **round 1 (codex, 2026-08-03)**: C5/I9/M3 — 全件反映。主変更: 三相分解 (C-1) / Landlock 2 層境界 + cwd 明示 (C-2) / 双方向 RPC プロトコル完全定義 (C-3) / finalize 一本化 + finish CAS (C-4) / 起動時 missions+signals 同時回収 (C-5) / tick 資金保護先行 + hooks timeout (I-1) / cron 遅延意味論 (I-2) / try_submit 原子化 (I-3) / Future 終了規則 + 監督の watchdog 一本化 (I-4) / PDEATHSIG (I-5) / transcript sink 集約 + 保存範囲定義 (I-6) / connect_readonly (I-7) / Rag lock 直列化 (I-8) / 停止状態機械 (I-9) / interrupted の位置づけ (M-1) / rlimit fail closed 方針 (M-2) / transcript 累積上限 (M-3)。全文: `.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round1.md`
+- **round 3 (codex, 2026-08-03)**: 判定「実装着手不可 (残 3 点 + 裁定 2 件)」— 全件反映。主変更: tick 再編を「決定論ブロック (mark-to-market〜exits) は内部順序不変のまま先頭、hooks のみ後段へ」に精密化 (C3-1 — fills 単独前倒しは fails_allowed ゲート迂回) / commit-pre を「Risk Gate に要る全外部取得 (quote + spec + 換算レート)」に拡張し commit-core を「スナップショット + DB 操作のみ」に (C3-2) / commit-core 開始時の鮮度再検証 + stale は発注拒否 (I3-3) / RPC dispatcher リークは 1 本目で health fatal → 停止 (I3-1 裁定) / 停止実行主体は main に一意化 (watchdog はイベントセットのみ)、shell readline 中断 seam を必須依存に昇格 (I3-2) / 分解書文言の読み替え注記 (C2-4 残余)。全文: `.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round3.md`
 - **round 2 (codex, 2026-08-03)**: round 1 判定 ADDRESSED 10 / PARTIALLY 8 / NOT ADDRESSED 0 + 新規 C5/I5/M1 — 全件反映。主変更: fills→exits ペア保存の tick 再編 + processed-bar 契約ピン (C2-1、コントローラが実コードで CONFIRMED) / shutdown join を scheduler 先行に修正 (C2-2) / scheduler 死亡は両モードで停止 (C2-3) / holdout 到達不能を「実行不能」の意味論で定義 (C2-4) / commit を pre/core/post の 3 小相に分割し外部 I/O を lock 外へ (C2-5) / hooks timeout の強制点 = httpx クライアント注入 (I2-1) / RPC dispatcher スレッド + rpc_timeout + Rag lock timeout (I2-2) / join タイムアウト時 close の所有権線引き (I2-3) / PDEATHSIG 設定前レース照合 (I2-4) / improve network 制限はプラン 9 スコープと明記 (I2-5) / seq 検証規則 (M2-1)。全文: `.superpowers/sdd/2026-08-03-phase2-8-design-review/codex-round2.md`
