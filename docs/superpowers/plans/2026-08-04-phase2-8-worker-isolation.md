@@ -8,7 +8,12 @@
 
 **Tech Stack:** Python 3.12 / uv / pytest / sqlite3 / subprocess (`start_new_session=True` + `killpg`) / `ctypes` (Landlock syscall) / threading (`Lock`/`Event`/`Thread`/`Future` 相当の完了 queue)
 
-**プラン規約 (プラン 6/7 と同一の SDD 運用):** task 完了ごとに停止してユーザー確認 / 全 task で sonnet + codex 並行レビュー + コントローラ独立検証 / レジャー: `.superpowers/sdd/2026-08-04-phase2-8-worker-isolation/progress.md`
+**プラン規約 (マルチエージェント SDD — CLAUDE.md「実装体制」節に準拠。プラン 6/7 の「実装 sonnet + 全 task 停止」から変更):**
+- 全体指揮 + 実装監督: opus (main セッション)。実装担当: haiku (機械的 task = Task 1-4, 9, 11, 17 目安) / codex (重量 task = Task 7, 10, 13-16, 19 目安)。レビュー: sonnet + codex 交差 (codex 実装分は sonnet 主査)。変異検証: haiku 並列 fan-out
+- 大 task はテスト転写と実装転写を並列執筆し、統合 + red/green 実行は 1 レーン直列 (red 先行観測は統合役の実行順序で担保)。小 task は丸ごと 1 agent
+- 依存の浅い task 束は worktree 並列。**ユーザーへの節目確認は task 単位ではなく束単位**
+- エスカレーション: haiku 同一 task 2 回失敗 → codex/sonnet 再割当。割れた Critical は codex 反証要求 or ユーザー park
+- レジャー: `.superpowers/sdd/2026-08-04-phase2-8-worker-isolation/progress.md`
 
 ## 設計書からの委任事項 (writing-plans で確定させた 3 点 — §12 申し送り対応)
 
