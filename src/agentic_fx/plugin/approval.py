@@ -85,7 +85,7 @@ RunInSampleFn = Callable[..., dict[str, Any]]
 _EVAL_SOURCE = "dukascopy"
 _NOTE = "バックテスト成績は実運用成績の予測値ではない (足切り専用)"
 # D5: plugin 宣言 timeframe → run_in_sample に渡す eval_timeframe。"1d" だけ
-# "24h" へ写像する (runner._parse_timeframe が "1d" を受理しないため)。
+# "24h" へ写像する (runner.parse_timeframe が "1d" を受理しないため)。
 _EVAL_TIMEFRAME_OVERRIDE = {"1d": "24h"}
 
 # 既定 pytest 実行の待ち上限。sandbox.py の call() 用 sandbox_timeout_sec

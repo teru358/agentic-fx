@@ -81,7 +81,7 @@ class BacktestResult:
     fallback_spread_used: bool
 
 
-def _parse_timeframe(tf: str) -> timedelta:
+def parse_timeframe(tf: str) -> timedelta:
     m = _TF_RE.match(tf)
     if not m:
         raise ValueError(f"unsupported eval_timeframe: {tf!r}")
@@ -147,7 +147,7 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
     OHLCV 履歴の読み取り専用接続で、実行時状態を持つ in-memory 接続とは
     別物 (``BarFeed`` にのみ渡す)。
     """
-    tf = _parse_timeframe(eval_timeframe)
+    tf = parse_timeframe(eval_timeframe)
     _require_minute_grid(end, "end")  # fix round 1 F3
 
     conn = connect(Path(":memory:"))

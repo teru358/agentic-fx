@@ -15,7 +15,7 @@ from agentic_fx.tools.registry import ToolDef
 _log = logging.getLogger(__name__)
 
 
-def _pair_param(settings: Settings) -> dict:
+def pair_param(settings: Settings) -> dict:
     """pair と timeframe の enum は設定から動的に作る (足・通貨ペアを固定しない方針)。"""
     return {"pair": {"enum": list(settings.pairs), "description": "e.g. USDJPY"},
             "timeframe": {"type": "string",
@@ -91,17 +91,17 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
     def get_econ_calendar(days: int = 1) -> list[dict]:
         return econ.upcoming(hours=days * 24)
 
-    pair_param = _pair_param(settings)
+    pair_schema = pair_param(settings)
     return [
         ToolDef("get_ohlcv", "OHLCV 価格データ (直近 100 本)",
-                {"type": "object", "properties": pair_param,
+                {"type": "object", "properties": pair_schema,
                  "required": ["pair", "timeframe"]}, get_ohlcv),
         ToolDef("get_indicators",
                 "テクニカル指標 (SMA/EMA/RSI/ATR/MACD/BB)。"
                 "上位足を見たい場合は timeframe を変えて呼び直す。"
                 "承認済み plugin の指標が併記される場合は `plugin:<name>` "
                 "キーで区別できる",
-                {"type": "object", "properties": pair_param,
+                {"type": "object", "properties": pair_schema,
                  "required": ["pair", "timeframe"]}, get_indicators),
         ToolDef("get_econ_calendar", "経済指標カレンダー (今後 N 日)",
                 {"type": "object",

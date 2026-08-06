@@ -121,7 +121,7 @@ def build(conn: sqlite3.Connection, settings: Settings,
             result.append(item)
         return result
 
-    pair_schema = market_tools._pair_param(settings)["pair"]
+    pair_schema = market_tools.pair_param(settings)["pair"]
     return [
         ToolDef(
             "get_signals",

@@ -15,7 +15,7 @@ plugin (`evaluate(df, indicators, signals, params)`) で実装する。
 tick は素通しで None を返す。
 
 **幅導出 (レビュー fix round 1 F1 — codex Medium)**: 幅は
-`timeframes.TF_MINUTES` ではなく `runner._parse_timeframe` を再利用して
+`timeframes.TF_MINUTES` ではなく `runner.parse_timeframe` を再利用して
 導出する。`TF_MINUTES` は plugin 宣言 timeframe (`PLUGIN_TIMEFRAMES` —
 15m/1h/4h/1d) 専用の列挙であり、`run_replay` が実際に受理する任意の
 eval_timeframe (`_TF_RE` = 任意の `Nm`/`Nh`、例: 30m/90m/2h) を含まない。
@@ -47,7 +47,7 @@ from __future__ import annotations
 import sqlite3
 from typing import TYPE_CHECKING, Any, Protocol
 
-from agentic_fx.backtest.runner import _parse_timeframe
+from agentic_fx.backtest.runner import parse_timeframe
 from agentic_fx.backtest.timeframes import floor_to_bucket, load_resampled_frame
 from agentic_fx.core.contracts import Bar
 from agentic_fx.plugin.loader import PluginMeta
@@ -90,10 +90,10 @@ class PluginStrategyIntentSource:
 
     def __call__(self, closed_bar: Bar) -> dict | None:
         # F1 (レビュー fix round 1): TF_MINUTES ではなく runner の
-        # _parse_timeframe を再利用する (docstring 参照)。パース不能な
-        # interval は _parse_timeframe 自身が ValueError を送出する
+        # parse_timeframe を再利用する (docstring 参照)。パース不能な
+        # interval は parse_timeframe 自身が ValueError を送出する
         # (fail closed — 独自メッセージへの包み直しはしない)。
-        width = _parse_timeframe(closed_bar.interval)
+        width = parse_timeframe(closed_bar.interval)
         bucket_end = closed_bar.ts + width
         if floor_to_bucket(bucket_end, self._meta.timeframe) != bucket_end:
             return None  # plugin 宣言 timeframe の境界に乗っていない tick
