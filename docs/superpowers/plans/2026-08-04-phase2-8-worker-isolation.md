@@ -1,5 +1,7 @@
 # Phase 2 プラン 8: worker 隔離 + preemption + 起票返済 実装プラン (設計書 改訂 5 = a5c1dff 準拠)
 
+**改訂履歴**: レビュー反映 1 回目 (2026-08-06)。参照: `.superpowers/sdd/2026-08-04-phase2-8-worker-isolation/plan-review-adjudication.md` (裁定書)。sonnet 主査レビュー (`plan-review-sonnet.md`, CR-1〜6/IM-1〜10) + codex 敵対レビュー (`plan-review-codex.md`, P8-01〜07) + fork 指摘の反証検証 (`plan-review-fc-verdicts.md`) を統合し、CONFIRMED 判定分をこのプラン文書に反映した。修整は 1 回で打ち切り。Task 1〜11 分の反映ログ: `.superpowers/sdd/2026-08-04-phase2-8-worker-isolation/fix-log-part1.md`。Task 12〜20 + Task 3 補遺 + Global Constraints 分の反映ログ: `.superpowers/sdd/2026-08-04-phase2-8-worker-isolation/fix-log-part2.md`。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Mission (取引判断 loop / reflection / ask) を使い捨て子プロセス (`WorkerRunner` + `mission_worker`) に隔離し、preemption (SIGTERM→grace→SIGKILL) と「Mission 実行中も SL/TP 監視が止まらない」ロック粒度の再設計 (五相分解 + mission supervisor) を実装する。あわせてプラン 7 起票の B 束 (sandbox 増強・小口修正) と、プラン 5 レジャーの park 小口を返済する。
@@ -25,7 +27,7 @@
 
 ## Global Constraints
 
-- **Anthropic API (従量課金) は使用不可**。Claude 利用は `claude -p` (サブスク認証) のみ。本プランは `ClaudeRunner` を実装しない (プラン 9) — `runner.trade.backend == "claude"` を worker 子側が検出した場合は `RuntimeError` で明示的に fail closed する (Task 10)
+- **Anthropic API (従量課金) は使用不可**。Claude 利用は `claude -p` (サブスク認証) のみ。本プランは `ClaudeRunner` を実装しない (プラン 9) — `runner.trade.backend == "claude"` を worker 子側が検出した場合は `RuntimeError` で明示的に fail closed する (**Task 7** — `mission_worker.py` が子プロセス内で検出する。レビュー反映1回目 (裁定書 F-17/MN-1): 帰属記載の誤り (旧稿は「Task 10」と記載していたが、Task 10 は `WorkerRunner` 本体でありこの fail-closed 分岐の実装箇所ではない) を修正)
 - **発注・SL 変更・クローズ・資金保護は LLM に委ねない。決定論的コードで強制する。** risk_gate.py / core/paper_broker.py の判定ロジックは本プランで **diff ゼロ** (§9 受入 7)。executor.py の変更は「判定ロジック不変・外部 I/O の取得位置のみ commit-pre へ移動」に限る
 - **drawdown kill switch は config で無効化不可** — 本プランはこの経路 (`state.update(kill_switch_latched=True)`) に触れない
 - 秘密情報は `.env` のみ。`config/settings.yaml` は gitignore、新キー追加時は `config/settings.yaml.example` と両方を同期する
@@ -435,6 +437,7 @@ def test_default_pytest_runner_uses_minimal_env(monkeypatch, tmp_path):
     approval._default_pytest_runner(test_plugin_path)
 
     assert "AFX_SECRET_TOKEN" not in captured["env"]
+    assert captured["env"]["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
     assert captured["args"][:3] == [
         approval.sys.executable, "-m", "agentic_fx.plugin.pytest_sandbox_entry"]
     assert captured["preexec_fn"] is not None
@@ -523,11 +526,22 @@ def _default_pytest_runner(test_plugin_path: Path, *,
     """
     from agentic_fx.plugin.sandbox import _build_env
     eff_settings = settings if settings is not None else PluginSettings()
+    env = _build_env()
+    # FC-3 対応: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` はサードパーティ
+    # プラグインの setuptools entry-point 自動読込のみを止める (pytest
+    # 本体に同梱される builtin プラグインは対象外で、通常の収集・実行は
+    # 引き続き機能する)。これが無いと `anyio` 等の entry-point プラグイン
+    # が pytest.main() 実行中に (毒入れ済みの) `socket` を import しようと
+    # して `ImportError` になり、poison 後は毎回 exit=1 で test_plugin.py
+    # の承認が全滅する (実測で確認済み — poison を pytest 起動前に適用する
+    # 設計上、entry-point プラグインの自動読込そのものを止める以外に
+    # 安全な回避策が無い)。
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     proc = subprocess.Popen(
         [sys.executable, "-m", "agentic_fx.plugin.pytest_sandbox_entry",
          str(test_plugin_path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        start_new_session=True, env=_build_env(),
+        start_new_session=True, env=env,
         preexec_fn=_pytest_rlimit_preexec(
             memory_mb=eff_settings.sandbox_memory_mb,
             nofile=eff_settings.sandbox_nofile,
@@ -561,7 +575,34 @@ uv run pytest tests/plugin/ -q
 
 Expected: 全件 PASS。
 
-- [ ] **Step 11: 失敗するテストを書く (PluginSession スレッド安全性 assert)**
+- [ ] **Step 11 (FC-3 対応): 毒入れ後に pytest が実際に起動できることを実 subprocess で確認する**
+
+Step 6-10 のテストはすべて `subprocess.Popen` を fake に差し替えており、`_default_pytest_runner` が実際に spawn する `pytest_sandbox_entry` プロセスが**本当に collection まで到達して exit=0 を返すか**を一度も検証しない。`pytest.main(["--version"])` だけの確認では entry-point プラグイン (`anyio` 等) の自動読込は発火しないため不十分 — 実際に `-q <test_plugin.py>` で **収集・実行させる** ことを必須とする。`tests/plugin/test_approval.py` に以下を追加する:
+
+```python
+def test_default_pytest_runner_real_subprocess_exits_zero_after_poison(tmp_path):
+    """モックなしで `_default_pytest_runner` を実行し、ネットワーク毒入れ後
+    でも pytest が実際に収集・実行を完了して exit=0 を返すことを確認する
+    (FC-3: poison 後に entry-point プラグインの socket import で exit=1
+    になっていた回帰の実測ピン)。"""
+    from agentic_fx.plugin import approval
+
+    test_plugin_path = tmp_path / "test_plugin.py"
+    test_plugin_path.write_text("def test_x():\n    assert True\n")
+
+    result = approval._default_pytest_runner(test_plugin_path)
+
+    assert result["returncode"] == 0, result["stdout"] + result["stderr"]
+    assert "1 passed" in result["stdout"]
+```
+
+```bash
+uv run pytest tests/plugin/test_approval.py -q -k real_subprocess_exits_zero
+```
+
+Expected (修正前の `env=_build_env()` のみの状態で先に実行した場合): FAIL (`returncode == 1`)。Step 9 の `env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"` を実装済みであれば PASS になる — 実装順序上は Step 9 の直後に置いているため、ここでは PASS を確認する意味で実行する (実装なしで先に本テストのみ追加した場合の red 確認は変異テスト Step で兼ねる)。
+
+- [ ] **Step 12: 失敗するテストを書く (PluginSession スレッド安全性 assert)**
 
 `tests/plugin/test_sandbox_thread_safety.py` を新規作成する:
 
@@ -602,7 +643,7 @@ def test_call_from_other_thread_raises_runtime_error(tmp_path):
         session.call({"df": None, "params": {}})
 ```
 
-- [ ] **Step 12: テスト実行して FAIL を確認**
+- [ ] **Step 13: テスト実行して FAIL を確認**
 
 ```bash
 uv run pytest tests/plugin/test_sandbox_thread_safety.py -q
@@ -610,7 +651,7 @@ uv run pytest tests/plugin/test_sandbox_thread_safety.py -q
 
 Expected: FAIL (`AttributeError: 'PluginSession' object has no attribute '_owner_thread'`)。
 
-- [ ] **Step 13: `sandbox.py` を実装**
+- [ ] **Step 14: `sandbox.py` を実装**
 
 `src/agentic_fx/plugin/sandbox.py` の先頭 import 節に `import threading` を追加する。`PluginSession.__init__` (293-307 行) の末尾に以下を追加する:
 
@@ -631,7 +672,7 @@ Expected: FAIL (`AttributeError: 'PluginSession' object has no attribute '_owner
 
 `__enter__` (309 行) の docstring 直後、`try:` の直前に `self._check_owner_thread()` を追加する。`call()` (406 行) の docstring 直後、`if self._dead or self._proc is None:` の**前**に `self._check_owner_thread()` を追加する。`close()` (383 行) の先頭に `self._check_owner_thread()` を追加する (`proc = self._proc` の前)。
 
-- [ ] **Step 14: テスト実行して PASS を確認**
+- [ ] **Step 15: テスト実行して PASS を確認**
 
 ```bash
 uv run pytest tests/plugin/test_sandbox_thread_safety.py -q
@@ -640,7 +681,7 @@ uv run pytest tests/plugin/ -q
 
 Expected: 全件 PASS。
 
-- [ ] **Step 15: 全体 green**
+- [ ] **Step 16: 全体 green**
 
 ```bash
 uv run pytest -q
@@ -648,14 +689,15 @@ uv run pytest -q
 
 Expected: 全件 PASS。
 
-- [ ] **Step 16: 変異テスト**
+- [ ] **Step 17: 変異テスト**
 
-以下の 3 箇所を個別に改変し、対応するテストが red になることを確認してから元に戻す:
+以下の 4 箇所を個別に改変し、対応するテストが red になることを確認してから元に戻す:
 1. `worker.py` の `resource.setrlimit(resource.RLIMIT_NOFILE, ...)` 行を削除 → `test_set_resource_limits_sets_nofile_and_fsize` が red
 2. `approval.py:_default_pytest_runner` の `env=_build_env()` を削除 (env 未指定に戻す) → `test_default_pytest_runner_uses_minimal_env` が red
 3. `sandbox.py:PluginSession.call` 内の `self._check_owner_thread()` 呼び出しを削除 → `test_call_from_other_thread_raises_runtime_error` が red
+4. (FC-3) `approval.py:_default_pytest_runner` の `env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"` 行を削除 → `test_default_pytest_runner_uses_minimal_env` (env アサーション部分) と `test_default_pytest_runner_real_subprocess_exits_zero_after_poison` の両方が red (後者は環境に `anyio` 等の entry-point プラグインが入っている場合に限り red — 入っていない環境では poison 前から exit=0 のため red にならない点に注意。CI 環境の依存構成を確認し、red にならない場合は `uv run python -c "import importlib.metadata as m; [print(e) for e in m.entry_points(group='pytest11')]"` で entry-point プラグインの有無を確認した上でレビュアーに申し送る)
 
-- [ ] **Step 17: Commit**
+- [ ] **Step 18: Commit**
 
 ```bash
 git add src/agentic_fx/plugin/worker.py src/agentic_fx/plugin/sandbox.py \
@@ -697,25 +739,30 @@ EOF
   - `service._validate_startup(settings)` の追加検証: `settings.plugin.producer_source not in KNOWN_OHLCV_SOURCES` なら `RuntimeError`
   - `strategy_adapter.PluginStrategyIntentSource.__init__` は `pair not in meta.pairs` で `ValueError` を送出する (fail closed — producer 側の「settings.pairs 外は warning + skip」と対称の検証だが、adapter は 1 インスタンス = 1 pair の明示的構築のため即座に `ValueError` で拒否する。producer のように複数 pair を反復して一部だけ諦める構造ではないため skip という選択肢が無い)
   - `db.connect()` は接続直後に `sqlite3.sqlite_version_info < (3, 35, 0)` なら `RuntimeError` (signals.py の `claim_oldest`/`requeue`/`reclaim_expired` が `RETURNING` 句 — SQLite 3.35.0 (2021-03-12) 以降が必須)
+  - **(裁定書 F-16/IM-10 新設)** `service._run_signal_maintenance(*, conn, signal_producer, approved, settings, now: datetime) -> None` — `on_signal_maintenance` 閉包の実体を module レベル関数として抽出したもの。`build_app()` 全体を構築せずに単体テスト可能にする (実クロージャの順序を機械的に検証できない旧稿の欠陥の修正)
 
 - [ ] **Step 1: 失敗するテストを書く (maintenance 順序)**
+
+**(レビュー反映 1 回目 — 裁定書 F-16 / IM-10)**: 執筆者の当初案は `on_signal_maintenance` を**テスト内でローカルに再定義したフェイク閉包**に対して assert しており、`service.py` の実クロージャを一切呼ばない恒真テストだった (Step 2 が「このテストは `service.py` を変更せずとも green になる — 意図的」と明言していたこと自体が欠陥の自認)。**実クロージャを直接検証できるよう、`on_signal_maintenance` の本体を module レベル関数 `_run_signal_maintenance` に抽出**し (Step 3)、テストはその実関数を呼んで `agentic_fx.store.signals` の実モジュール関数を monkeypatch した状態で呼び出し順を記録する。
 
 `tests/test_service.py` (無ければ実ファイルを `ls tests/*.py` で確認し、`build_app` の統合テストが既にある場所に追記する) に以下を追加する:
 
 ```python
-def test_signal_maintenance_reclaims_before_expiring():
+def test_signal_maintenance_reclaims_before_expiring(monkeypatch):
     """reclaim_expired → expire_stale の順で呼ばれる (順序入替、codex M⑤)。
     reclaim で pending に戻った直後の stale 行が、同じ tick 内の
     expire_stale でまだ拾われずに 1 tick 分だけ実行機会を得ることを、
-    呼び出し順の記録で確認する (実際の SQL 結果ではなく呼び出し順に
-    絞ったユニットテスト — 統合的な確認は既存 test_scheduler_signal.py
-    に譲る)。
+    呼び出し順の記録で確認する。**(裁定書 F-16/IM-10)** `service.py` の
+    実クロージャが呼ぶ module レベル関数 `_run_signal_maintenance` を
+    直接呼び、`agentic_fx.store.signals` の実モジュール関数を
+    monkeypatch する — テスト内の再定義フェイクに対して assert する
+    恒真テストを避ける。
     """
-    calls: list[str] = []
+    from datetime import datetime, timezone
+
     import agentic_fx.service as service_mod
 
-    orig_reclaim = service_mod.signals.reclaim_expired
-    orig_expire = service_mod.signals.expire_stale
+    calls: list[str] = []
 
     def fake_reclaim(*a, **k):
         calls.append("reclaim")
@@ -725,61 +772,70 @@ def test_signal_maintenance_reclaims_before_expiring():
         calls.append("expire")
         return 0
 
-    # build_app 全体を起動するのはコストが高いため、on_signal_maintenance
-    # のクロージャ構築ロジックのみを直接検証する軽量ヘルパーを用意する
-    # (Task 12 のスケジューラ再編テストと同じ fixture 方針を先取りする)。
-    import types
-    fake_signals = types.SimpleNamespace(
-        reclaim_expired=fake_reclaim, expire_stale=fake_expire)
-    fake_producer = types.SimpleNamespace(evaluate_due_plugins=lambda **k: None)
+    monkeypatch.setattr(service_mod.signals, "reclaim_expired", fake_reclaim)
+    monkeypatch.setattr(service_mod.signals, "expire_stale", fake_expire)
 
-    from datetime import datetime, timezone
     now = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+    fake_producer = object()  # evaluate_due_plugins は呼ばれない前提で
+    # 属性アクセスされたら AttributeError で明示的に落ちるようにする
+    # (順序検証の対象外だが、意図せず呼ばれた場合は検出したい)。
 
-    def on_signal_maintenance(now):
-        fake_signals.reclaim_expired(None, now=now, lease_min=15,
-                                     max_requeue=2)
-        fake_signals.expire_stale(None, now=now, freshness_bars=2)
-        fake_producer.evaluate_due_plugins(
-            conn=None, plugins=[], now=now, source="yfinance", settings=None)
+    class _NoOpProducer:
+        def evaluate_due_plugins(self, **k):
+            calls.append("producer")
 
-    on_signal_maintenance(now)
-    assert calls == ["reclaim", "expire"]
+    service_mod._run_signal_maintenance(
+        conn=None, signal_producer=_NoOpProducer(), approved=[],
+        settings=service_mod.load_settings(
+            __import__("pathlib").Path(__file__).resolve().parents[1]
+            / "config" / "settings.yaml.example"),
+        now=now)
+
+    assert calls == ["reclaim", "expire", "producer"]
 ```
 
-注: このテストは「実装すべき呼び出し順」を fixture で先に固定するだけの単体テストであり、Step 3 で `service.py` の実クロージャを同じ順序に書き換えたことをレビュー時に diff で確認する (`on_signal_maintenance` 自体は起動時にしか組まれないため、本物の関数を差し替えて呼び出し順を記録する統合的なテストは `tests/core/test_scheduler_signal.py` に既存の fixture を使って追記してもよい — 実装者はどちらか一方を選び、両方は作らない)。
-
-- [ ] **Step 2: テスト実行して FAIL/PASS を確認**
-
-このテストは `service.py` を変更せずとも green になる (fixture 自体が期待順序で書かれているため) — **これは意図的**: Step 1 のテストは「順序の仕様」を固定するためのものであり、Step 3 の実装後に `service.py` の実クロージャ (下記) の diff とテストの整合をレビューで確認する。実装漏れ検出は Step 8 の変異テストで行う。
+- [ ] **Step 2: テスト実行して FAIL を確認**
 
 ```bash
 uv run pytest tests/test_service.py -q -k maintenance
 ```
 
-Expected: PASS (fixture 自体のテスト)。
+Expected: FAIL (`AttributeError: module 'agentic_fx.service' has no attribute '_run_signal_maintenance'` — Step 3 で新設するまで存在しない)。
 
-- [ ] **Step 3: `service.py` の `on_signal_maintenance` 順序を入替**
+- [ ] **Step 3: `service.py` の `on_signal_maintenance` 順序を入替 + 実クロージャ検証可能化**
 
-`src/agentic_fx/service.py:369-382` を以下に置き換える (`reclaim_expired` を `expire_stale` より前に呼ぶ — codex M⑤: stale 行が reclaim される前に abandoned 化されてしまうと、まだ requeue_count に余裕がある行が 1 tick 分の実行機会を失う):
+**(裁定書 F-16/IM-10)** `on_signal_maintenance` の本体を module レベル関数 `_run_signal_maintenance` として切り出し、`build_app` 内の閉包はこれを呼ぶだけにする — これにより Step 1 のテストが `build_app()` 全体を構築せずに実ロジックへ直接到達できる。`src/agentic_fx/service.py:369-382` を以下に置き換える (`reclaim_expired` を `expire_stale` より前に呼ぶ — codex M⑤: stale 行が reclaim される前に abandoned 化されてしまうと、まだ requeue_count に余裕がある行が 1 tick 分の実行機会を失う):
+
+```python
+def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
+                            now: datetime) -> None:
+    """`on_signal_maintenance` の実体 (裁定書 F-16/IM-10 — module レベル
+    関数として抽出し、`build_app()` 全体を構築せずに単体テスト可能に
+    する)。
+
+    Task 7 申し送り → プラン 8 B 束で順序入替 (codex M⑤): lease 切れの
+    claimed 行を先に reclaim_expired で pending へ戻し、その後に
+    expire_stale で鮮度切れの pending を abandoned 化する。逆順だと、
+    reclaim で pending に戻ったばかりの行が同じ tick 内で鮮度切れ判定に
+    巻き込まれて abandoned になり得た (無駄な 1 tick 分の巻き戻り)。
+    呼び出し元 (Scheduler._run_data_hook) が fail-open で包む。
+    """
+    signals.reclaim_expired(conn, now=now,
+                            lease_min=settings.plugin.signal_lease_min,
+                            max_requeue=settings.plugin.signal_requeue_max)
+    signals.expire_stale(conn, now=now,
+                         freshness_bars=settings.plugin.signal_freshness_bars)
+    signal_producer.evaluate_due_plugins(
+        conn=conn, plugins=approved, now=now,
+        source=settings.plugin.producer_source, settings=settings)
+```
+
+`build_app` 内の `on_signal_maintenance` 閉包定義を以下に置き換える:
 
 ```python
     def on_signal_maintenance(now: datetime) -> None:
-        # Task 7 申し送り → プラン 8 B 束で順序入替 (codex M⑤): lease 切れの
-        # claimed 行を先に reclaim_expired で pending へ戻し、その後に
-        # expire_stale で鮮度切れの pending を abandoned 化する。逆順だと、
-        # reclaim で pending に戻ったばかりの行が同じ tick 内で鮮度切れ
-        # 判定に巻き込まれて abandoned になり得た (無駄な 1 tick 分の
-        # 巻き戻り)。呼び出し元 (Scheduler._run_data_hook) が fail-open
-        # で包む。
-        signals.reclaim_expired(conn_core, now=now,
-                                lease_min=settings.plugin.signal_lease_min,
-                                max_requeue=settings.plugin.signal_requeue_max)
-        signals.expire_stale(conn_core, now=now,
-                             freshness_bars=settings.plugin.signal_freshness_bars)
-        signal_producer.evaluate_due_plugins(
-            conn_core, plugins=approved, now=now,
-            source=settings.plugin.producer_source, settings=settings)
+        _run_signal_maintenance(conn=conn_core, signal_producer=signal_producer,
+                                approved=approved, settings=settings, now=now)
 ```
 
 - [ ] **Step 4: 失敗するテストを書く (producer_source 検証・SQLite バージョン assert・description f-string)**
@@ -988,7 +1044,7 @@ Expected: 全件 PASS。
 - [ ] **Step 12: 変異テスト**
 
 以下を個別に改変し red を確認してから戻す:
-1. `service.py` の `on_signal_maintenance` で `reclaim_expired`/`expire_stale` の呼び出し順を元 (expire→reclaim) に戻す → Step 1 のテストは fixture 単体なので red にならない点に注意し、代わりに **Step 3 実装後の `service.py` の実際の行順を目視で確認**する (レビュー時の diff チェック項目として記録すること — このテストは「順序が実装からズレていないか」を機械的に検出できないため人手レビューが最終防波堤であることを progress.md に明記する)
+1. **(裁定書 F-16/IM-10 反映)** `_run_signal_maintenance` 内の `signals.reclaim_expired(...)` と `signals.expire_stale(...)` の呼び出し順を入れ替える (expire→reclaim に戻す) → `test_signal_maintenance_reclaims_before_expiring` が red (`calls == ["expire", "reclaim", "producer"]` になり `assert calls == ["reclaim", "expire", "producer"]` に失敗する) — 旧稿はテスト内のローカルフェイク閉包に対して assert しており実クロージャの変異を検出できなかったが (「目視で確認」が最終防波堤だった)、`_run_signal_maintenance` への抽出後は module 関数の実引数順序を直接監視するため機械的に red になる
 2. `service.py:_validate_startup` の producer_source チェックを削除 → `test_validate_startup_rejects_unknown_producer_source` が red
 3. `db.py:connect` のバージョン assert を削除 → `test_connect_rejects_old_sqlite_version` が red
 4. `strategy_adapter.py` の pair 検証を削除 → `test_build_intent_source_rejects_pair_not_in_meta_pairs` が red
@@ -1006,6 +1062,11 @@ git commit -m "$(cat <<'EOF'
 fix: B 束小口 6 項目 (maintenance順序/producer_source検証/adapter対称化/CLI境界/SQLite版数/description)
 
 プラン7起票の B 束 (設計書 §7) のうち独立した小口修正をまとめて返済する。
+
+レビュー反映1回目 (裁定書 F-16/IM-10): maintenance順序テストがテスト内
+ローカルフェイクに対する恒真テストだった欠陥を修正。on_signal_maintenance
+の本体を_run_signal_maintenanceとしてmodule関数へ抽出し、実クロージャを
+monkeypatch経由で直接検証できるようにした。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -1169,6 +1230,8 @@ class App:
     owns_runner: bool
     clock: object
 ```
+
+（`instance_lock` フィールドは本 task では追加しない — 単一インスタンス保証 (FC-2) は Task 11 の担当であり、`App` dataclass への追加・`return App(...)` への配線は Task 11 側で完結させる。Task 4 の時点でここに追加すると `return App(...)` (直後) が未対応のまま `TypeError` になり、本 task 自身の Step 8 が失敗する。）
 
 `build_app` のシグネチャ (244-246 行) に `provider: PriceProvider | None = None` を追加する:
 
@@ -1439,14 +1502,16 @@ EOF
 
 **Files:**
 - Modify: `src/agentic_fx/store/db.py` (`connect_readonly` 新設)
+- Modify: `src/agentic_fx/datafeed/price_provider.py` (`PriceProvider.__init__` に `readonly: bool = False` — CR-4 対応、裁定書 F-5)
 - Create: `src/agentic_fx/tools/mission_registry.py`
 - Modify: `src/agentic_fx/service.py:325-337` (`build_app` を `build_mission_registry` 経由に置換)
-- Test: `tests/store/test_db_readonly.py` (新規), `tests/tools/test_mission_registry.py` (新規)
+- Test: `tests/store/test_db_readonly.py` (新規), `tests/tools/test_mission_registry.py` (新規), `tests/datafeed/test_price_provider.py` (readonly モードのテスト追記)
 
 **Interfaces:**
 - Produces:
   - `db.connect_readonly(db_path: Path) -> sqlite3.Connection` — `sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)`。書き込み系 PRAGMA (`journal_mode`) は発行しない。`busy_timeout=5000` のみ設定。`db_path` が存在しなければ `FileNotFoundError` (RO 接続は稼働中サービスの既存 DB を前提とする)。既存 `connect()` と同じ SQLite バージョン assert (Task 3 で追加済みの `sqlite3.sqlite_version_info < (3, 35, 0)` チェック) をここにも適用する
-  - `mission_registry.build_mission_registry(loop: str, conn: sqlite3.Connection, settings: Settings, clock: Clock, rag: Rag, *, activity: ActivityLog, indicator_plugins: list[PluginMeta] | None = None, sandbox_run=None) -> ToolRegistry` — `provider`/`econ`/`broker` を内部で新規構築し (呼び出し側から受け取らない — 親の既存インスタンスと子の使い捨てインスタンスを同じ関数で作れることが目的)、`market_tools`/`news_tools`/`account_tools`/`reflection_tools`/`signal_tools` の全 `ToolDef` を登録した `ToolRegistry` を返す。**`loop` 引数は本プランでは配線を分岐しない** (常に同じ全ツール集合を構築する — どのツールを実際に Mission に見せるかは `Mission.tools` の呼び出し側リスト `_TRADE_TOOLS` が決める。`loop` は将来の improve 系 registry 分岐 (プラン 9) に向けた forward-compat 引数であることを docstring に明記する)
+  - `PriceProvider.__init__(conn, settings, clock, readonly: bool = False)` (CR-4 対応) — `readonly=True` のとき `get_bars`/`_derive` 内の `ohlcv.upsert_bars(...)` 呼び出しをスキップする (cache 読み取りは通常どおり行う)。RO 接続 (`connect_readonly`) と組み合わせて子プロセスで使う。RPC 経由で親に書込を委譲する設計は採らない (裁定書 F-5 — RPC 面を拡大しない)
+  - `mission_registry.build_mission_registry(loop: str, conn: sqlite3.Connection, settings: Settings, clock: Clock, rag: Rag, *, activity: ActivityLog, indicator_plugins: list[PluginMeta] | None = None, sandbox_run=None, readonly: bool = False) -> ToolRegistry` — `provider`/`econ`/`broker` を内部で新規構築し (呼び出し側から受け取らない — 親の既存インスタンスと子の使い捨てインスタンスを同じ関数で作れることが目的)、`market_tools`/`news_tools`/`account_tools`/`reflection_tools`/`signal_tools` の全 `ToolDef` を登録した `ToolRegistry` を返す。**`loop` 引数は本プランでは配線を分岐しない** (常に同じ全ツール集合を構築する — どのツールを実際に Mission に見せるかは `Mission.tools` の呼び出し側リスト `_TRADE_TOOLS` が決める。`loop` は将来の improve 系 registry 分岐 (プラン 9) に向けた forward-compat 引数であることを docstring に明記する)。`readonly` はそのまま `PriceProvider(..., readonly=readonly)` に渡すだけ (Task 7 が子プロセス構築時に `readonly=True` を渡す)
 - Consumes: `agentic_fx.tools.{market_tools,news_tools,account_tools,reflection_tools,signal_tools}` の既存 `build` 関数群 (シグネチャ不変)
 
 - [ ] **Step 1: 失敗するテストを書く (`connect_readonly`)**
@@ -1540,7 +1605,90 @@ uv run pytest tests/store/test_db_readonly.py -q
 
 Expected: PASS。
 
-- [ ] **Step 5: 失敗するテストを書く (`build_mission_registry`)**
+- [ ] **Step 5 (CR-4 対応): 失敗するテストを書く (`PriceProvider` readonly モード)**
+
+`tests/datafeed/test_price_provider.py` に以下を追加する (既存 `_provider`/`_fresh_bars` fixture をそのまま使う — ファイルを確認してから追記すること):
+
+```python
+def test_readonly_provider_skips_bar_cache_write(tmp_path):
+    """CR-4 対応 (裁定書 F-5): readonly=True で構築した PriceProvider は
+    get_bars 成功時に ohlcv.upsert_bars を呼ばない — RO 接続下でも
+    `sqlite3.OperationalError` にならないことの単体ピン。"""
+    s = load_settings(EXAMPLE)
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    p = PriceProvider(conn, s, FixedClock(NOW), readonly=True)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_fresh_bars()):
+        bars = p.get_bars("USDJPY", "1m", 1)
+    assert len(bars) == 30
+    assert ohlcv.load_bars(conn, "USDJPY", "1m", source="yfinance") == []
+
+
+def test_readonly_provider_skips_derived_bar_cache_write(tmp_path):
+    """readonly=True は _derive 経路 (base 足の保存) でも書込をスキップする。"""
+    s = load_settings(EXAMPLE)
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    p = PriceProvider(conn, s, FixedClock(NOW), readonly=True)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_fresh_bars(interval="1h", n=100)):
+        p.get_bars("USDJPY", "4h", 5)
+    assert ohlcv.load_bars(conn, "USDJPY", "1h", source="yfinance") == []
+```
+
+```bash
+uv run pytest tests/datafeed/test_price_provider.py -q -k readonly_provider
+```
+
+Expected: FAIL (`TypeError: PriceProvider.__init__() got an unexpected keyword argument 'readonly'`)。
+
+- [ ] **Step 6 (CR-4 対応): `price_provider.py` に `readonly` を実装**
+
+`src/agentic_fx/datafeed/price_provider.py` の `PriceProvider.__init__` (66-73 行) を以下に変更する:
+
+```python
+    def __init__(self, conn: sqlite3.Connection, settings: Settings,
+                 clock: Clock, readonly: bool = False) -> None:
+        self.conn = conn
+        self.settings = settings
+        self.clock = clock
+        # CR-4 (裁定書 F-5): 子プロセス (mission_worker.py) は conn に
+        # db.connect_readonly (mode=ro) を渡す。get_bars/_derive の
+        # cache 書込 (ohlcv.upsert_bars) は RO 接続下で
+        # sqlite3.OperationalError になるため、readonly=True のときは
+        # 書込呼び出し自体をスキップする (RPC 経由の親委譲はしない —
+        # RPC 面を拡大しない設計裁定)。
+        self.readonly = readonly
+        self._bars_source: dict[tuple[str, str], str] = {}
+        self._bars_origin: dict[tuple[str, str], str] = {}
+```
+
+`get_bars` (132-182 行) 内の以下の書込呼び出し (155-156 行) を条件分岐に変更する:
+
+```python
+                    if not self.readonly:
+                        ohlcv.upsert_bars(self.conn, bars,
+                                          source=_storage_source(name))
+```
+
+`_derive` (305-334 行) 内の書込呼び出し (333 行) も同様に変更する:
+
+```python
+        if not self.readonly:
+            ohlcv.upsert_bars(self.conn, raw, source=_storage_source(source))
+        return self._resample(raw, pair, interval)
+```
+
+- [ ] **Step 7 (CR-4 対応): テスト実行して PASS を確認**
+
+```bash
+uv run pytest tests/datafeed/test_price_provider.py -q
+```
+
+Expected: 全件 PASS (既存の書込ありテスト (`test_get_bars_caches` 等) が `readonly` 既定値 `False` のままなので壊れないことを含む)。
+
+- [ ] **Step 8: 失敗するテストを書く (`build_mission_registry`)**
 
 `tests/tools/test_mission_registry.py` を新規作成 (`tests/tools/test_market_tools.py` 等の既存 fixture 命名規約を確認してから書く):
 
@@ -1548,6 +1696,7 @@ Expected: PASS。
 """build_mission_registry (プラン 8 worker 基盤 — 設計書 §4.2)。"""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from agentic_fx.activity import ActivityLog
@@ -1586,22 +1735,86 @@ def test_build_mission_registry_registers_all_trade_tools(tmp_path):
 def test_build_mission_registry_econ_calendar_does_not_touch_activity(tmp_path):
     """econ.upcoming() (get_econ_calendar が呼ぶ) は self.activity に触れない
     — 子プロセスが activity=None 相当の最小構成で呼んでも安全なことの
-    構造的な確認 (worker.py が構築するときの前提)。"""
+    構造的な確認 (worker.py が構築するときの前提)。
+
+    I7 対応: `ToolRegistry.execute` はツール内で送出された全例外を
+    `json.dumps({"error": ...})` に変換して返す (`registry.py:63-73`)
+    ため、`result is not None` は常に真になり恒真テストになっていた
+    (exploding activity が実際に呼ばれて `AssertionError` が飛んでも、
+    その例外は registry に握り潰されて緑のまま通ってしまう)。ここでは
+    (a) `activity.write` を呼んだかどうかを例外ではなく明示カウンタで
+    記録し、(b) `result` を JSON decode して `list` 型 (`get_econ_calendar`
+    の正常戻り値の型) であることを確認する — decode 結果が
+    `{"error": ...}` の dict なら型不一致で確実に落ちる。
+    """
     conn = connect(tmp_path / "x.db")
     init_db(conn)
     rag = Rag(tmp_path / "rag", embedding_function=lambda texts: [[0.0] * 4 for _ in texts])
 
-    class ExplodingActivity:
-        def write(self, *a, **k):
-            raise AssertionError("activity.write must not be called by get_econ_calendar")
+    class CountingActivity:
+        def __init__(self) -> None:
+            self.write_calls = 0
 
+        def write(self, *a, **k):
+            self.write_calls += 1
+
+    activity = CountingActivity()
     registry = build_mission_registry(
-        "trade", conn, SETTINGS, _clock(), rag, activity=ExplodingActivity())
+        "trade", conn, SETTINGS, _clock(), rag, activity=activity)
     result = registry.execute("get_econ_calendar", {"days": 1}, ["get_econ_calendar"])
-    assert result is not None
+
+    parsed = json.loads(result)
+    assert isinstance(parsed, list), f"expected list payload, got: {result}"
+    assert activity.write_calls == 0
+
+
+def test_build_mission_registry_readonly_skips_bar_cache_write(tmp_path):
+    """CR-4 対応: `readonly=True` で構築した registry の `get_ohlcv` は
+    RO 接続 (`connect_readonly`) の下でも `ohlcv.upsert_bars` の書込を
+    スキップして成功する — 子プロセス (`connect_readonly` で開いた conn)
+    が `get_ohlcv` を呼んでも `sqlite3.OperationalError: attempt to write
+    a readonly database` にならないことの配線ピン。"""
+    from unittest.mock import patch
+
+    from agentic_fx.core.contracts import Bar
+    from agentic_fx.datafeed import sources
+    from agentic_fx.store import ohlcv
+    from agentic_fx.store.db import connect_readonly
+
+    db_path = tmp_path / "x.db"
+    rw_conn = connect(db_path)
+    init_db(rw_conn)
+    rw_conn.commit()
+
+    def _fresh_bars():
+        from datetime import timedelta
+        step = timedelta(minutes=1)
+        start = datetime(2026, 8, 4, 11, 0, tzinfo=timezone.utc)
+        return [Bar("USDJPY", "1m", start + step * i,
+                    148.0, 148.1, 147.9, 148.05, 10) for i in range(30)]
+
+    ro_conn = connect_readonly(db_path)
+    rag = Rag(tmp_path / "rag", embedding_function=lambda texts: [[0.0] * 4 for _ in texts])
+    registry = build_mission_registry(
+        "trade", ro_conn, SETTINGS, _clock(), rag,
+        activity=ActivityLog(tmp_path / "logs" / "activity.log"), readonly=True)
+
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_fresh_bars()):
+        result = registry.execute(
+            "get_ohlcv", {"pair": "USDJPY", "timeframe": "1m"}, ["get_ohlcv"])
+
+    parsed = json.loads(result)
+    # get_ohlcv の正常戻り値は list[dict] (market_tools.py 45-49 行)。RO
+    # 接続で書込が実際に走っていれば OperationalError が
+    # `{"error": ...}` の dict に化けて型不一致で検出される。
+    assert isinstance(parsed, list) and len(parsed) == 30, result
+    # 念のため RW 接続からも cache が空のままであることを確認する
+    # (write skip の直接証跡)。
+    assert ohlcv.load_bars(rw_conn, "USDJPY", "1m", source="yfinance") == []
 ```
 
-- [ ] **Step 6: テスト実行して FAIL を確認**
+- [ ] **Step 9: テスト実行して FAIL を確認**
 
 ```bash
 uv run pytest tests/tools/test_mission_registry.py -q
@@ -1609,7 +1822,7 @@ uv run pytest tests/tools/test_mission_registry.py -q
 
 Expected: FAIL (`ModuleNotFoundError: No module named 'agentic_fx.tools.mission_registry'`)。
 
-- [ ] **Step 7: `mission_registry.py` を新規作成**
+- [ ] **Step 10: `mission_registry.py` を新規作成**
 
 ```python
 """Mission ツール配線の単一の組み立て関数 (プラン 8 worker 基盤 — 設計書 §4.2)。
@@ -1649,14 +1862,25 @@ def build_mission_registry(
         loop: str, conn: sqlite3.Connection, settings: "Settings",
         clock: Clock, rag: Rag, *, activity: ActivityLog,
         indicator_plugins: "list[PluginMeta] | None" = None,
-        sandbox_run=None) -> ToolRegistry:
+        sandbox_run=None, readonly: bool = False) -> ToolRegistry:
     """`loop` は本プランでは配線を分岐しない (常に同じ全ツール集合を
     構築する) — forward-compat 引数。どのツールを実際に Mission に
     見せるかは呼び出し側の `Mission.tools` リスト (`_TRADE_TOOLS` 等) が
     決める。将来の improve 系 registry 分岐 (プラン 9) で `loop` を
     使い始める想定。
+
+    `readonly` (CR-4 対応、裁定書 F-5): 子プロセス (`mission_worker.py`)
+    は `conn` に `db.connect_readonly` (SQLite `mode=ro`) を渡すため、
+    `PriceProvider.get_bars`/`_derive` が通常経路で行う `ohlcv.upsert_bars`
+    キャッシュ書込は `sqlite3.OperationalError: attempt to write a
+    readonly database` になる。`readonly=True` は `PriceProvider` を
+    cache 書込スキップモードで構築する — 既存 cache は引き続き読むが、
+    新規取得したバーの書込だけをスキップする。RPC 経由で親に書込を
+    委譲する設計は採らない (設計裁定: RPC 面を拡大しない — 裁定書
+    F-5)。cache は性能最適化であり、親の scheduler tick が継続的に
+    cache を温めるため実害は限定的。
     """
-    provider = PriceProvider(conn, settings, clock)
+    provider = PriceProvider(conn, settings, clock, readonly=readonly)
     econ = EconCalendar(conn, activity, clock)
     broker = PaperBroker(conn, settings, clock)
 
@@ -1671,7 +1895,7 @@ def build_mission_registry(
     return registry
 ```
 
-- [ ] **Step 8: テスト実行して PASS を確認**
+- [ ] **Step 11: テスト実行して PASS を確認**
 
 ```bash
 uv run pytest tests/tools/test_mission_registry.py -q
@@ -1679,7 +1903,7 @@ uv run pytest tests/tools/test_mission_registry.py -q
 
 Expected: PASS。
 
-- [ ] **Step 9: `service.py` を `build_mission_registry` 経由に置換**
+- [ ] **Step 12: `service.py` を `build_mission_registry` 経由に置換**
 
 `src/agentic_fx/service.py` の import 節に `from agentic_fx.tools.mission_registry import build_mission_registry` を追加する。`build_app` (315-337 行) の以下のブロック:
 
@@ -1725,7 +1949,7 @@ Expected: PASS。
 
 `market_tools`/`news_tools`/`account_tools`/`reflection_tools` の import が `service.py` の他の箇所で使われていないことを `grep -n "market_tools\.\|news_tools\.\|account_tools\.\|reflection_tools\." src/agentic_fx/service.py` で確認し、未使用になった import (49-52 行の `from agentic_fx.tools import (...)`) から `market_tools, news_tools, account_tools, reflection_tools` を削除する (`signal_tools`/`plugin_loader` は他箇所で引き続き使用されているため残す — 実ファイルを見て要否を確認してから編集すること)。
 
-- [ ] **Step 10: 全体 green**
+- [ ] **Step 13: 全体 green**
 
 ```bash
 uv run pytest -q
@@ -1733,21 +1957,28 @@ uv run pytest -q
 
 Expected: 全件 PASS (`_assert_tools_registered` が引き続き通ることを含む)。
 
-- [ ] **Step 11: 変異テスト**
+- [ ] **Step 14: 変異テスト**
 
 1. `mission_registry.py` の `registry.register_all(signal_tools.build(...))` 行を削除 → `test_build_mission_registry_registers_all_trade_tools` が red (`get_signals` missing)
 2. `db.py:connect_readonly` の `mode=ro` を `mode=rw` に改変 → `test_connect_readonly_rejects_write` が red (INSERT が成功してしまう)
+3. (CR-4) `price_provider.py:get_bars` の `if not self.readonly:` ガードを外して常に `upsert_bars` を呼ぶよう改変 → `test_readonly_provider_skips_bar_cache_write` および `test_build_mission_registry_readonly_skips_bar_cache_write` が red
+4. (I7) `mission_registry.py` の econ 配線をそのままに、テスト対象を `CountingActivity` の代わりに `activity.write` を実際に呼ぶダミー econ 実装に差し替えて `write_calls == 0` assertion が red になることを一度確認する (実装差し替えではなくテストの自己点検 — 恒真化していないことの確認)
 
-- [ ] **Step 12: Commit**
+- [ ] **Step 15: Commit**
 
 ```bash
-git add src/agentic_fx/store/db.py src/agentic_fx/tools/mission_registry.py \
-  src/agentic_fx/service.py tests/store/test_db_readonly.py tests/tools/test_mission_registry.py
+git add src/agentic_fx/store/db.py src/agentic_fx/datafeed/price_provider.py \
+  src/agentic_fx/tools/mission_registry.py \
+  src/agentic_fx/service.py tests/store/test_db_readonly.py \
+  tests/datafeed/test_price_provider.py tests/tools/test_mission_registry.py
 git commit -m "$(cat <<'EOF'
 feat: db.connect_readonly + build_mission_registry (worker 基盤の共有配線点)
 
 親 (build_app) と子 (mission_worker.py, Task 7) が同一関数でツール配線を
-組み立てられるようにする (設計書 §3.4/§4.2)。
+組み立てられるようにする (設計書 §3.4/§4.2)。PriceProvider に readonly
+モードを追加し、RO 接続下でも get_ohlcv がキャッシュ書込なしで成功する
+ことを配線テストで固定する (レビュー CR-4)。econ_calendar 非依存テストの
+恒真化も修正する (レビュー I7)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -1768,7 +1999,7 @@ EOF
 **Interfaces:**
 - Produces:
   - `LocalRunner.__init__(self, *, base_url, model, registry, transport=None, time_fn=time.monotonic, on_message: Callable[[dict], None] | None = None)` — `on_message` 新設 kwarg (既定 None = 既存挙動と完全互換)
-  - `LocalRunner._sink(self, messages: list[dict], msg: dict) -> None` — 新設 private メソッド。`messages.append(msg)` の後、`self._on_message` が None でなければ呼ぶ。**`on_message` が例外を送出しても `run()` を止めない** (try/except で握って技術ログに warning — sink は観測性の記録であり Mission 実行そのものを阻害してはならない、という既存の `ActivityLog.write` 契約と同じ設計判断)
+  - `LocalRunner._sink(self, messages: list[dict], msg: dict) -> None` — 新設 private メソッド。`messages.append(msg)` の後、`self._on_message` が None でなければ呼ぶ。**`on_message` が例外を送出しても `run()` を止めない** (try/except で握って技術ログに warning — sink は観測性の記録であり Mission 実行そのものを阻害してはならない、という既存の `ActivityLog.write` 契約と同じ設計判断)。**I6 (裁定書) 注記**: この fail-soft 契約は「`on_message` が失敗しても Mission は継続してよい」ことを意味するが、`on_message` 自身が**外部への逐次通し番号付き送出** (mission_worker.py の `event` フレーム — Task 7) を行う場合はこの契約と衝突する。`_sink` は失敗を検出できないため、seq を消費した後の送出失敗は「継続」すると欠番になり親の `SeqTracker` が後続フレームを `ProtocolError` として reject する。**この種の `on_message` 実装 (Task 7) は `_sink` の fail-soft に頼らず、自分の中で失敗を検出して即座にプロセスを終了させる (fail closed) 責務を負う** — `_sink` 自体はここでは変更しない (汎用の観測性契約を保つ)
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -1942,7 +2173,8 @@ EOF
   - `mission_protocol.FRAME_TYPES_PARENT_TO_CHILD = frozenset({"handshake", "tool_rpc_result"})` / `FRAME_TYPES_CHILD_TO_PARENT = frozenset({"ready", "event", "tool_rpc", "result"})`
   - `mission_worker.main() -> None` — `python -m agentic_fx.mission_worker` のエントリ。標準入力から handshake (1 行) を読み、bootstrap (PDEATHSIG+ppid 照合 → rlimit → registry 構築) → `ready` 送出 → `LocalRunner.run(mission)` を実行 (on_message は `event` フレーム送出) → `result` 送出、の順で動く
   - `mission_worker._set_pdeathsig(sig: int) -> None` — `ctypes` で `prctl(PR_SET_PDEATHSIG, sig)` を呼ぶ (単体テストで `ctypes.CDLL` を fake 差し替え可能にする)
-  - `mission_worker._RagRpcProxy(write_frame_fn, read_frame_fn, seq_tracker) -> object` — `search_news(query, n=5) -> list[dict]` / `search_reflections(query, n=5) -> list[dict]` を実装 (`news_tools.build`/`reflection_tools.build` の duck-type 契約のみを満たす — 全メソッドは持たない)。`tool_rpc` フレーム送出 → `tool_rpc_result` を同期ブロッキング待ち (同時 1 件のみ、設計書 §4.3)
+  - `mission_worker._make_on_message(protocol_out, out_seq: SeqTracker) -> Callable[[dict], None]` (I6 対応) — `LocalRunner(on_message=...)` に渡すコールバックを組み立てる。`write_frame` が失敗したら `os._exit(1)` で即座にプロセスを終了する (fail closed) — `LocalRunner._sink` (Task 6) の fail-soft 契約に頼ると、write 失敗後も seq だけ消費されたまま実行が継続し、次の成功フレームが親の `SeqTracker` に欠番として reject される (レビュー I6)
+  - `mission_worker._RagRpcProxy(write_frame_fn, read_frame_fn, out_seq: SeqTracker, in_seq: SeqTracker) -> object` — `search_news(query, n=5) -> list[dict]` / `search_reflections(query, n=5) -> list[dict]` を実装 (`news_tools.build`/`reflection_tools.build` の duck-type 契約のみを満たす — 全メソッドは持たない)。`tool_rpc` フレーム送出 → `tool_rpc_result` を同期ブロッキング待ち (同時 1 件のみ、設計書 §4.3)。**`out_seq` は `main()` が `event`/`ready`/`result` の送出に使うのと同一インスタンスを共有する** (CR-3 対応 — 独立した `SeqTracker` を持たせると親の受信側検証 `in_seq` と衝突し `search_news`/`search_reflections` を使う Mission が初回呼出しで必ず `ProtocolError` になっていた)。`in_seq` は親→子方向 (`tool_rpc_result`) 専用の受信検証トラッカーで、`main()` が `handshake` の検証にも同じインスタンスを使う (I2 対応 — 親→子方向は従来 type/seq 検証が皆無だった)
 
 - [ ] **Step 1: 失敗するテストを書く (`mission_protocol.py`)**
 
@@ -2125,11 +2357,17 @@ def test_set_pdeathsig_raises_oserror_on_failure(monkeypatch):
 
 
 def test_rag_rpc_proxy_search_news_round_trip():
-    """tool_rpc → tool_rpc_result の同期往復。"""
+    """tool_rpc → tool_rpc_result の同期往復。
+
+    CR-3 対応の回帰ピン: `out_seq` は `main()` が `ready`/`event`/`result`
+    の送出に使うのと**同一インスタンス**を渡す (このテストでは 1 度も
+    他フレームを送出していないので `out_seq` の初期値は 1 のまま —
+    `tool_rpc` の seq は 1 になる)。"""
     from agentic_fx.core.mission_protocol import SeqTracker
 
     outbound = io.BytesIO()
-    seq_out = SeqTracker()
+    out_seq = SeqTracker()
+    in_seq = SeqTracker()
 
     def write_fn(frame):
         outbound.write((json.dumps(frame) + "\n").encode())
@@ -2139,15 +2377,44 @@ def test_rag_rpc_proxy_search_news_round_trip():
         return {"type": "tool_rpc_result", "seq": 1, "rpc_id": "1", "ok": True,
                 "result": [{"title": "t", "body": "b", "source_name": "s"}]}
 
-    proxy = mission_worker._RagRpcProxy(write_fn, read_fn, seq_out)
+    proxy = mission_worker._RagRpcProxy(write_fn, read_fn, out_seq, in_seq)
     result = proxy.search_news("usdjpy", n=5)
     assert result == [{"title": "t", "body": "b", "source_name": "s"}]
 
     outbound.seek(0)
     sent = json.loads(outbound.getvalue().splitlines()[0])
     assert sent["type"] == "tool_rpc"
+    assert sent["seq"] == 1
     assert sent["name"] == "search_news"
     assert sent["args"] == {"query": "usdjpy", "n": 5}
+
+
+def test_rag_rpc_proxy_shares_out_seq_with_other_child_to_parent_frames():
+    """CR-3 の直接回帰ピン: `main()` が `ready` (seq=1) を送出済みの状態を
+    模して `out_seq` を 1 個進めてから `_RagRpcProxy` に渡すと、
+    `tool_rpc` の seq は 2 になる (親の単一 `in_seq` — 全フレーム種別
+    共通 — が期待する次の値と一致する)。独立した `SeqTracker` を渡すと
+    ここが 1 に戻ってしまい、親側で `ProtocolError` になる。"""
+    from agentic_fx.core.mission_protocol import SeqTracker
+
+    outbound = io.BytesIO()
+    out_seq = SeqTracker()
+    out_seq._expected = 2  # ready (seq=1) を送出済みの状態を模す
+    in_seq = SeqTracker()
+
+    def write_fn(frame):
+        outbound.write((json.dumps(frame) + "\n").encode())
+
+    def read_fn():
+        return {"type": "tool_rpc_result", "seq": 1, "rpc_id": "1", "ok": True,
+                "result": []}
+
+    proxy = mission_worker._RagRpcProxy(write_fn, read_fn, out_seq, in_seq)
+    proxy.search_news("usdjpy")
+
+    outbound.seek(0)
+    sent = json.loads(outbound.getvalue().splitlines()[0])
+    assert sent["seq"] == 2
 
 
 def test_rag_rpc_proxy_propagates_error():
@@ -2160,9 +2427,86 @@ def test_rag_rpc_proxy_propagates_error():
         return {"type": "tool_rpc_result", "seq": 1, "rpc_id": "1", "ok": False,
                 "error": "rag unavailable"}
 
-    proxy = mission_worker._RagRpcProxy(write_fn, read_fn, SeqTracker())
+    proxy = mission_worker._RagRpcProxy(write_fn, read_fn, SeqTracker(), SeqTracker())
     with pytest.raises(RuntimeError, match="rag unavailable"):
         proxy.search_news("q")
+
+
+def test_rag_rpc_proxy_rejects_wrong_frame_type(): 
+    """I2 対応: 親→子方向 (tool_rpc_result) の type 検証。"""
+    from agentic_fx.core.mission_protocol import ProtocolError, SeqTracker
+
+    def write_fn(frame):
+        pass
+
+    def read_fn():
+        return {"type": "event", "seq": 1, "rpc_id": "1", "ok": True, "result": []}
+
+    proxy = mission_worker._RagRpcProxy(write_fn, read_fn, SeqTracker(), SeqTracker())
+    with pytest.raises(ProtocolError, match="tool_rpc_result"):
+        proxy.search_news("q")
+
+
+def test_rag_rpc_proxy_rejects_seq_gap():
+    """I2 対応: 親→子方向の seq 検証 (欠番/重複/逆行を一律 ProtocolError)。"""
+    from agentic_fx.core.mission_protocol import ProtocolError, SeqTracker
+
+    def write_fn(frame):
+        pass
+
+    def read_fn():
+        return {"type": "tool_rpc_result", "seq": 5, "rpc_id": "1", "ok": True,
+                "result": []}
+
+    proxy = mission_worker._RagRpcProxy(write_fn, read_fn, SeqTracker(), SeqTracker())
+    with pytest.raises(ProtocolError, match="seq"):
+        proxy.search_news("q")
+
+
+def test_on_message_exits_process_on_write_failure(monkeypatch):
+    """I6 対応: write_frame が失敗したら os._exit(1) で即座にプロセスを
+    終了する。LocalRunner._sink の fail-soft (Task 6) に頼って継続すると
+    out_seq だけが消費され、次の成功フレームが親の SeqTracker に欠番
+    として reject される。"""
+    from agentic_fx.core.mission_protocol import SeqTracker
+
+    exit_calls: list[int] = []
+    monkeypatch.setattr(mission_worker.os, "_exit", exit_calls.append)
+
+    class BrokenStream:
+        def write(self, data):
+            raise BrokenPipeError("broken pipe")
+
+        def flush(self):
+            pass
+
+    out_seq = SeqTracker()
+    on_message = mission_worker._make_on_message(BrokenStream(), out_seq)
+    on_message({"role": "assistant", "content": "x"})
+
+    assert exit_calls == [1]
+
+
+def test_main_rejects_handshake_with_wrong_type(monkeypatch, tmp_path):
+    """I2 対応: 子は handshake フレームの type/seq を検証してから bootstrap
+    に進む — 不一致なら ready を送らず即終了する (fail closed)。"""
+    import io as _io
+
+    frame = json.dumps({"type": "event", "seq": 1}).encode() + b"\n"
+    monkeypatch.setattr(mission_worker.sys, "stdin",
+                        type("S", (), {"buffer": _io.BytesIO(frame)})())
+    captured = _io.BytesIO()
+    monkeypatch.setattr(mission_worker, "_protect_protocol_stdout",
+                        lambda: captured)
+
+    mission_worker.main()
+
+    captured.seek(0)
+    lines = captured.getvalue().splitlines()
+    assert len(lines) == 1
+    sent = json.loads(lines[0])
+    assert sent["type"] == "ready"
+    assert sent["ok"] is False
 ```
 
 - [ ] **Step 6: テスト実行して FAIL を確認**
@@ -2200,6 +2544,8 @@ with open(f'/proc/{os.getpid()}/status') as f:
 
 **確定値**: `child_as_mb: 4096` (実測 VmPeak 1.65GB の約 2.4 倍の余裕) / `child_nofile: 128` (実測 5 fd に対し DB 接続・複数データソースへの HTTP 接続を見込んだ余裕) / `child_fsize_mb: 8` (mission worker は正常経路でファイルを書かない — plugin サンドボックスと同じ「想定外書込の検知」目的の小さい上限)。
 
+**IM-9 (裁定書 F-12〜F-16) 注記**: 上記実測は単一の 32 コア機での測定値である。OpenBLAS/numpy のスレッド用仮想アドレス予約はコア数に比例するため、より多コアな本番機では同じ `child_as_mb: 4096` でも `RLIMIT_AS` を超過し、mission worker が `MemoryError`/`ready: false` (rlimit 到達によるメモリ確保失敗) で起動できなくなり得る。本番デプロイ先のコア数が実測環境 (32 コア) を大きく上回る場合は、上記実測コマンドをデプロイ先で再実行して `VmPeak` を確認し、`child_as_mb` を `settings.yaml` (example ではなく実運用設定) で「実測 VmPeak の 2.4 倍以上」に個別調整すること。症状は mission worker が `ready` を送らず `worker_startup_timeout_sec` で timeout する、または `ready: false` に `MemoryError` 相当のエラーメッセージが載る形で現れる。
+
 `src/agentic_fx/config.py` に `WorkerSettings` を新設し `Settings` に追加する (`PluginSettings` の定義の直後、`class Settings(_Strict):` の直前に挿入):
 
 ```python
@@ -2233,7 +2579,7 @@ class WorkerSettings(_Strict):
 
 ```yaml
 worker:                        # mission worker (プラン8) の resource limit・preemption・IPC 設定。省略可
-  child_as_mb: 4096             # RLIMIT_AS (MiB): 実測 VmPeak 1.65GB (32コア環境) の約2.4倍の余裕
+  child_as_mb: 4096             # RLIMIT_AS (MiB): 実測 VmPeak 1.65GB (32コア環境) の約2.4倍の余裕。多コア機では要再実測 (IM-9)
   child_nofile: 128             # RLIMIT_NOFILE
   child_fsize_mb: 8             # RLIMIT_FSIZE (MiB): 正常経路ではファイルを書かない前提の小さい上限
   worker_grace_sec: 30          # runner soft deadline の外側マージン (壁時計監視)
@@ -2260,7 +2606,10 @@ Expected: 全件 PASS (新設 settings セクションは既存 `settings.yaml` 
 想定呼び出し元。
 
 **起動順序は厳守** (plugin/worker.py と同じ規律):
-1. handshake (最初の 1 行) を読む
+1. handshake (最初の 1 行) を読む → **type/seq を検証する** (I2 対応:
+   親→子方向専用の `in_seq` トラッカーで `type == "handshake"` かつ
+   `seq == 1` を確認。不一致は `ProtocolError` — 以降の `try` 節に含めて
+   fail closed で `ready: false` を返す)
 2. `_set_pdeathsig` (親死亡時に OS が SIGTERM を配送) → 設定**直後**に
    `os.getppid()` を `expected_parent_pid` と照合し、不一致 (= 設定前に
    親が死んで再親付けされた) なら即終了する (設計書 §4.8 codex I2-4)
@@ -2269,7 +2618,11 @@ Expected: 全件 PASS (新設 settings セクションは既存 `settings.yaml` 
    (Mission の消費は LLM 待ちの壁時計であり親の preemption が受け持つ —
    設計書 §4.5)
 4. `build_mission_registry` でツール配線を組み立てる (RAG は `_RagRpcProxy`
-   を注入)
+   を注入。**`out_seq` を先に構築し、`_RagRpcProxy` と `on_message` の
+   両方に同一インスタンスを共有させる** — CR-3 対応。独立した
+   `SeqTracker` を `_RagRpcProxy` に持たせると、親側 `WorkerRunner` の
+   `in_seq` (子→親の全フレーム種別を単一トラッカーで検証) と衝突し、
+   RAG 検索ツールの初回呼出しで必ず `ProtocolError` になっていた)
 5. `ready` を送出
 6. `LocalRunner.run(mission)` を実行 (`on_message` が `event` フレームを
    送出)
@@ -2279,6 +2632,13 @@ Expected: 全件 PASS (新設 settings セクションは既存 `settings.yaml` 
 Task 18 で bootstrap を拡張する)。`settings.runner.trade.backend` が
 "local" 以外 (= "claude") の場合は `RuntimeError` で fail closed する
 (ClaudeRunner は本プランでは実装しない — Global Constraints)。
+
+**I4 対応 (実時計)**: 子は Mission 実行中の鮮度判定 (`get_signals` 等)
+に `_build_clock()` (既定 `SystemClock()`) を使う。handshake 時刻で
+`FixedClock` に固定すると、Mission 後半でも鮮度境界の基準時刻が進まず、
+実時刻なら範囲外になったはずの古い signal が残り続ける fail-open になる
+(fork レビュー I4)。テストは `mission_worker._build_clock` を
+monkeypatch して `FixedClock` を注入できる (seam は残す)。
 """
 from __future__ import annotations
 
@@ -2288,11 +2648,23 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
-from agentic_fx.core.mission_protocol import SeqTracker, read_frame, write_frame
+from agentic_fx.core.mission_protocol import (
+    ProtocolError, SeqTracker, read_frame, write_frame,
+)
+
+if TYPE_CHECKING:
+    from agentic_fx.core.contracts import Clock
 
 _PR_SET_PDEATHSIG = 1
+
+
+def _build_clock() -> "Clock":
+    """本番は実時計を使う (I4 対応)。テストはこの関数を monkeypatch して
+    `FixedClock` を注入できる (seam)。"""
+    from agentic_fx.core.contracts import SystemClock
+    return SystemClock()
 
 
 def _set_pdeathsig(sig: int) -> None:
@@ -2319,14 +2691,27 @@ class _RagRpcProxy:
     が要求する duck-type 契約 (`search_news`/`search_reflections`) のみを
     実装する (chromadb PersistentClient は多プロセス同時アクセス非対応 —
     設計書 §4.4)。`tool_rpc` は常に同時 1 件以下、同期ブロッキング待ち
-    (設計書 §4.3)。"""
+    (設計書 §4.3)。
+
+    `out_seq` (CR-3 対応) — 子→親方向 (`ready`/`event`/`tool_rpc`/
+    `result`) の全フレームは `main()` が保持する単一の `SeqTracker` を
+    共有する。`_RagRpcProxy` が自前の独立した `SeqTracker` を持つと、
+    親側 `WorkerRunner.in_seq` (子→親の全フレーム種別を単一トラッカーで
+    検証 — 設計書 §4.3 codex M2-1) の期待値と衝突し、RAG 検索ツールを
+    使う Mission が初回呼出しで必ず `ProtocolError` になっていた
+    (レビュー CR-3)。
+
+    `in_seq` (I2 対応) — 親→子方向 (`tool_rpc_result`) 専用の受信検証
+    トラッカー。`main()` が `handshake` の検証にも同じインスタンスを
+    使う (親→子方向は 1 起点で共通)。"""
 
     def __init__(self, write_fn: Callable[[dict], None],
                 read_fn: Callable[[], dict | None],
-                seq_tracker: SeqTracker) -> None:
+                out_seq: SeqTracker, in_seq: SeqTracker) -> None:
         self._write = write_fn
         self._read = read_fn
-        self._seq = seq_tracker
+        self._out_seq = out_seq
+        self._in_seq = in_seq
         self._rpc_counter = 0
 
     def _call(self, name: str, args: dict) -> Any:
@@ -2337,6 +2722,11 @@ class _RagRpcProxy:
         response = self._read()
         if response is None:
             raise RuntimeError("parent closed the pipe while awaiting tool_rpc_result")
+        # I2 対応: type/seq を検証してから中身を信用する。
+        if response.get("type") != "tool_rpc_result":
+            raise ProtocolError(
+                f"expected tool_rpc_result, got {response.get('type')!r}")
+        self._in_seq.check(response.get("seq"))
         if response.get("rpc_id") != rpc_id:
             raise RuntimeError(
                 f"tool_rpc_result rpc_id mismatch: expected {rpc_id}, "
@@ -2346,13 +2736,14 @@ class _RagRpcProxy:
         return response.get("result")
 
     def _seq_next(self) -> int:
-        # 子→親方向の event/tool_rpc/result は同じカウンタを共有する
-        # (単一スレッドで動くため送出順=seq 順が自然に一致する)。
-        # WorkerRunner (Task 10) 側の SeqTracker.check() と対称に、
-        # ここでは単に「次の値」を払い出すだけの単純カウンタとして使う
-        # (受信側の検証責務は親が持つ — 子は自分の送出 seq を数えるだけ)。
-        n = self._seq._expected  # noqa: SLF001 — 同一モジュール内の協調実装
-        self._seq._expected += 1
+        # 子→親方向の ready/event/tool_rpc/result は同じカウンタ
+        # (main() から渡される out_seq) を共有する (CR-3 対応 — 単一
+        # スレッドで動くため送出順=seq 順が自然に一致する)。WorkerRunner
+        # (Task 10) 側の SeqTracker.check() と対称に、ここでは単に「次の
+        # 値」を払い出すだけの単純カウンタとして使う (受信側の検証責務は
+        # 親が持つ — 子は自分の送出 seq を数えるだけ)。
+        n = self._out_seq._expected  # noqa: SLF001 — 同一モジュール内の協調実装
+        self._out_seq._expected += 1
         return n
 
     def search_news(self, query: str, n: int = 5) -> list[dict]:
@@ -2360,6 +2751,28 @@ class _RagRpcProxy:
 
     def search_reflections(self, query: str, n: int = 5) -> list[dict]:
         return self._call("search_reflections", {"query": query, "n": n})
+
+
+def _make_on_message(protocol_out: Any, out_seq: SeqTracker) -> Callable[[dict], None]:
+    """`LocalRunner(on_message=...)` に渡すコールバックを組み立てる
+    (I6 対応 — 独立関数に切り出してあるのは単体テストで `os._exit` を
+    monkeypatch し、write 失敗時の fail-closed 経路を `main()` 全体を
+    実行せずに検証するため)。"""
+    def on_message(msg: dict) -> None:
+        try:
+            write_frame(protocol_out, {
+                "type": "event", "seq": _next_seq(out_seq), "message": msg})
+        except Exception:  # noqa: BLE001 — I6 対応 (fail closed)
+            # LocalRunner._sink (Task 6) は on_message の例外を握って
+            # run() を継続する契約 — しかしここで write_frame が失敗
+            # すると out_seq だけが消費され、次に成功する event フレーム
+            # の seq が欠番になり親の SeqTracker が ProtocolError を
+            # 送出する (レビュー I6)。fail-soft に「継続」させず、
+            # このプロセスを即座に終了する (親は EOF/予期しない終了
+            # として Mission を失敗させる — 既に壊れた状態で
+            # LocalRunner.run() を続けても無意味)。
+            os._exit(1)
+    return on_message
 
 
 def _protect_protocol_stdout() -> Any:
@@ -2381,8 +2794,16 @@ def main() -> None:
     if handshake is None:
         return
 
-    expected_parent_pid = handshake["expected_parent_pid"]
+    # I2 対応: 親→子方向 (handshake/tool_rpc_result) 専用の受信検証
+    # トラッカー。handshake は常に seq=1 (親の唯一の起動時送出)。
+    in_seq = SeqTracker()
     try:
+        if handshake.get("type") != "handshake":
+            raise ProtocolError(
+                f"expected handshake, got {handshake.get('type')!r}")
+        in_seq.check(handshake.get("seq"))
+
+        expected_parent_pid = handshake["expected_parent_pid"]
         _set_pdeathsig(signal.SIGTERM)
         if os.getppid() != expected_parent_pid:
             # 設計書 §4.8 codex I2-4: prctl 設定前に親が死んで再親付け
@@ -2407,17 +2828,16 @@ def main() -> None:
                 "not supported by mission_worker in this plan (ClaudeRunner "
                 "is Plan 9 scope) — fail closed")
 
-        from agentic_fx.core.contracts import FixedClock
         from agentic_fx.store.db import connect_readonly
         from agentic_fx.tools import plugin_loader
         from agentic_fx.tools.mission_registry import build_mission_registry
         from agentic_fx.activity import ActivityLog
 
         conn = connect_readonly(Path(handshake["db_path"]))
-        clock = FixedClock.__new__(FixedClock)  # placeholder, replaced below
-        from datetime import datetime, timezone
-        now = datetime.fromisoformat(handshake["now"])
-        clock = FixedClock(now)
+        # I4 対応: 本番は実時計を使う (handshake["now"] で FixedClock に
+        # 固定すると、Mission 後半でも鮮度判定の基準時刻が進まず
+        # get_signals 等の鮮度検証が fail-open になる — レビュー I4)。
+        clock = _build_clock()
         # 子は自身の scratch workdir に activity.log を持つ (§4.6 のとおり
         # econ.upcoming() は self.activity に触れないため実際には書かれ
         # ないが、EconCalendar のコンストラクタ契約を満たすためだけに
@@ -2428,23 +2848,27 @@ def main() -> None:
         approved = (plugin_loader.approved_plugins(conn, plugins_dir)
                    if plugins_dir is not None else [])
 
+        # CR-3 対応: out_seq を先に構築し、_RagRpcProxy と on_message
+        # (event フレーム送出) の両方に同一インスタンスを共有させる —
+        # 子→親方向の ready/event/tool_rpc/result は 1 起点の単一
+        # カウンタでなければならない (設計書 §4.3 codex M2-1、親側
+        # WorkerRunner.in_seq がそう検証する)。
+        out_seq = SeqTracker()
+
         registry = build_mission_registry(
             "trade", conn, settings, clock,
             _RagRpcProxy(
                 lambda frame: write_frame(protocol_out, frame),
                 lambda: read_frame(sys.stdin.buffer),
-                SeqTracker()),
-            activity=activity, indicator_plugins=approved)
+                out_seq, in_seq),
+            activity=activity, indicator_plugins=approved, readonly=True)
 
         from agentic_fx.runners.base import Mission
         from agentic_fx.runners.local_runner import LocalRunner
 
         mission = Mission(**handshake["mission"])
-        out_seq = SeqTracker()
 
-        def on_message(msg: dict) -> None:
-            write_frame(protocol_out, {
-                "type": "event", "seq": _next_seq(out_seq), "message": msg})
+        on_message = _make_on_message(protocol_out, out_seq)
 
         runner = LocalRunner(
             base_url=settings.llama_swap.base_url,
@@ -2506,6 +2930,11 @@ Expected: 全件 PASS (mission_worker.py は他モジュールから import さ�
 1. `mission_protocol.SeqTracker.check` の `if seq != self._expected:` を `if False:` に改変 → `test_seq_tracker_rejects_duplicate`/`_gap`/`_regression` が red
 2. `mission_worker._set_pdeathsig` 呼び出し後の `os.getppid() != expected_parent_pid` チェックを削除 (次 Step の実装から一時的に外す) → 対応する統合テストは Task 10 の E2E 側にあるため、ここでは `test_set_pdeathsig_calls_prctl_with_expected_args` に相当する fake 呼び出し引数アサートが red にならないことを逆に確認 (この変異はレビュー時に「Task 10 の統合テストで拾われる」ことをコメントで明記するに留める — Task 7 単体では観測できない設計上の限界)
 3. `_RagRpcProxy._call` の `if not response.get("ok"):` を削除 → `test_rag_rpc_proxy_propagates_error` が red
+4. (CR-3) `main()` の `_RagRpcProxy(...)` 呼び出しに渡す `out_seq` 引数を `SeqTracker()` (新規独立インスタンス) に差し替える → `test_rag_rpc_proxy_shares_out_seq_with_other_child_to_parent_frames` が red (`sent["seq"]` が 2 ではなく 1 に戻る)
+5. (I2) `_RagRpcProxy._call` の `if response.get("type") != "tool_rpc_result":` チェックを削除 → `test_rag_rpc_proxy_rejects_wrong_frame_type` が red。`self._in_seq.check(response.get("seq"))` 行を削除 → `test_rag_rpc_proxy_rejects_seq_gap` が red
+6. (I2) `main()` の `in_seq.check(handshake.get("seq"))` 呼び出しを削除 → `test_main_rejects_handshake_with_wrong_type` が red (`ready: false` を送らず bootstrap を続行してしまう — 実際には後続の `KeyError`/属性欠落で別の失敗はするが、type 違反を明示的に検出できなくなる)
+7. (I4) `_build_clock()` の戻り値を `SystemClock()` から `FixedClock(...)` に改変 → 直接検証するテストが Task 7 単体には無い (`_build_clock` の実装詳細は Task 20 の E2E が実時計依存の鮮度シナリオで拾う想定) ため、ここでは `_build_clock` が `mission_worker` モジュール属性として存在し `main()` から呼ばれていることを `grep -n "_build_clock" src/agentic_fx/mission_worker.py` で目視確認するに留める (単体では観測できない設計上の限界であることをレビューコメントに明記する)
+8. (I6) `_make_on_message` 内の `try/except` を削除し `os._exit(1)` 呼び出しごと外す → `test_on_message_exits_process_on_write_failure` が red (`exit_calls` が空のまま、または `BrokenPipeError` が素通しで送出されテストがエラー終了する — いずれにせよ green にならない)
 
 - [ ] **Step 12: Commit**
 
@@ -2517,7 +2946,11 @@ git commit -m "$(cat <<'EOF'
 feat: mission worker 子プロセス本体 (JSON行プロトコル + handshake + rlimit + PDEATHSIG)
 
 設計書 §4.1-§4.5/§4.7 の子プロセス側 (worker_profile=trade 限定)。
-親側 WorkerRunner は Task 10 で実装する。
+親側 WorkerRunner は Task 10 で実装する。out_seq を _RagRpcProxy と
+event 送出で共有し RAG ツール初回呼出しのセッション強制終了を修正
+(レビュー CR-3)。親→子方向の type/seq 検証を追加し (レビュー I2)、
+本番の鮮度判定を実時計に変更する (レビュー I4)。子の PriceProvider は
+readonly=True で構築する (レビュー CR-4、Task 5 参照)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -2574,11 +3007,20 @@ def test_restrict_to_raises_when_create_ruleset_fails(monkeypatch, tmp_path):
     import agentic_fx.core.landlock as landlock_mod
 
     class FakeLibc:
-        def syscall(self, *args):
-            return -1  # landlock_create_ruleset 失敗
-
-        def prctl(self, *args):
-            return 0
+        """I5 対応: `syscall`/`prctl` を通常メソッド (`def ...(self, ...)`)
+        として定義すると、`libc.syscall` はアクセスするたびにバインド
+        メソッドオブジェクトを新規生成し、Python のバインドメソッドは
+        任意属性の代入を許さない (`__dict__` を持たない) — 実装コードが
+        行う `libc.syscall.restype = ctypes.c_long` がここで
+        `AttributeError` になり、テスト対象コードに到達する前にテスト
+        自体が壊れる (レビュー I5)。属性代入を許す関数オブジェクトを
+        インスタンス属性として直接持たせることで、実 `ctypes` の関数
+        ポインタオブジェクトと同じ「`.restype` を保持できる callable」
+        という性質を fake でも再現する。
+        """
+        def __init__(self) -> None:
+            self.syscall = lambda *args: -1  # landlock_create_ruleset 失敗
+            self.prctl = lambda *args: 0
 
     monkeypatch.setattr(landlock_mod.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(landlock_mod.ctypes, "CDLL", lambda *a, **k: FakeLibc())
@@ -2587,7 +3029,7 @@ def test_restrict_to_raises_when_create_ruleset_fails(monkeypatch, tmp_path):
         restrict_to(read_only_paths=[tmp_path], read_write_paths=[])
 ```
 
-(`is_available` 自体を fake する統合はここでは避け、`restrict_to` 内部で `is_available()` の判定に使う `platform.machine`/`ctypes.CDLL` を個別に monkeypatch する — `is_available` の実装が `ctypes.CDLL(None)` を直接呼ぶため、`restrict_to` からの呼び出しも同じ fake を経由する設計にする。)
+(`is_available` 自体を fake する統合はここでは避け、`restrict_to` 内部で `is_available()` の判定に使う `platform.machine`/`ctypes.CDLL` を個別に monkeypatch する — `is_available` の実装が `ctypes.CDLL(None)` を直接呼ぶため、`restrict_to` からの呼び出しも同じ fake を経由する設計にする。**I5 対応の `FakeLibc` 実装に注意** — `syscall`/`prctl` はクラスメソッド (`def`) ではなく `__init__` 内でインスタンス属性として代入する関数オブジェクトにすること。クラスメソッドのままだと `libc.syscall.restype = ...` (実装コード, Step 3) がバインドメソッドの属性代入で `AttributeError` になり、Step 4 の PASS が成立しない。)
 
 - [ ] **Step 2: テスト実行して FAIL を確認**
 
@@ -2816,6 +3258,7 @@ Expected: 全件 PASS。
 
 1. `restrict_to` 内の `if rc != 0:` (landlock_restrict_self の結果検査) を削除 → `test_real_landlock_blocks_unlisted_paths` は失敗を検出できなくなるが直接的な red 化は難しいため、代わりに `is_available` の `return version >= 1` を `return False` に固定する変異を行い `test_is_available_false_on_non_x86_64` 相当のロジックテストで検出できることを確認する (実 syscall 系の変異は fake 経由のテストで検出できるものに絞る — これが本 task の変異テストの限界であり、実カーネル依存の壊れ方は Step 5 の実プロセステストが唯一の防波堤であることを progress.md に明記する)
 2. `restrict_to` の `libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)` 呼び出しを削除 → `test_restrict_to_raises_when_create_ruleset_fails` は影響を受けない (create_ruleset の失敗が先に発火するため) が、これは fake テストの限界として明記し、Step 5 の実プロセステストが `landlock_restrict_self` 自体の欠落 (NO_NEW_PRIVS が無いと restrict_self が EPERM で失敗する — カーネルの実際の防御) を間接的に検出することを確認する
+3. (I5) Step 1 の `FakeLibc.__init__` を元の `def syscall(self, *args): ...` (クラスメソッド) 形式に戻す → `test_restrict_to_raises_when_create_ruleset_fails` が `AttributeError: 'method' object has no attribute 'restype'` で red (`pytest.raises(LandlockUnavailable)` の外側で例外が飛ぶため red — Step 4 の PASS がそもそも成立しないことの確認。実装コード側の `.restype` 代入自体は正しい仕様のままなので `landlock.py` は変更しない)
 
 - [ ] **Step 8: Commit**
 
@@ -3065,12 +3508,13 @@ EOF
 - Produces:
   - `WorkerRunner(AgentRunner)` — `__init__(self, *, root: Path, settings: Settings, clock: Clock, rag: Rag, worker_profile: str = "trade", on_rpc_leak: Callable[[], None] | None = None) -> None`。`run(self, mission: Mission) -> MissionResult` (継承契約どおり)。`close(self) -> None` (no-op — 各 Mission が自分の子プロセスを spawn/reap するため永続資源を持たない。`service.py` の shutdown 判定を `LocalRunner` 専用の isinstance から `hasattr(app.runner, "close")` へ一般化するための対称メソッド)
   - `on_rpc_leak` — RPC dispatcher が `rpc_timeout_sec` を超えてハングした RAG 呼び出しを検出したときに呼ばれる (設計書 §4.3 codex I3-1 — 「累積許容しない」の通知経路。呼び出し元 = App/health ラッチ配線は Task 19)
+  - `worker_runner._mission_worker_env(worker_profile: str) -> dict[str, str]` (IM-3/P8-03 対応) — `plugin.sandbox._build_env()` の最小 env をベースに、`worker_profile == "trade"` のときだけ `TWELVEDATA_API_KEY`/`MT5_BRIDGE_API_KEY` を親環境から明示 allowlist で追加する。`improve` profile は資格情報を一切渡さない
 
 **設計判断 (writing-plans)**:
 - **cwd**: `tempfile.TemporaryDirectory(prefix="afx-mission-")` で Mission ごとに新規の空ディレクトリを作り `cwd=` に渡す。Mission 終了後 (成功・失敗・timeout いずれでも) `with` ブロックで自動削除する
-- **env**: `plugin/sandbox.py:_build_env()` を再利用する (`AFX_*` 等の秘密を継承しない最小 env — network poison (`_poison_network_modules`) は呼ばない。mission worker は信頼済みハーネスコードでネットワークが必要、という設計書 §4.5 の方針)
+- **env** (IM-3/P8-03 対応、裁定書 F-9): mission worker 専用の env builder `_mission_worker_env(worker_profile)` を新設する。`plugin/sandbox.py:_build_env()` (`AFX_*` 等の秘密を継承しない最小 env) をベースにしつつ、`plugin/sandbox.py` の env をそのまま流用すると `TWELVEDATA_API_KEY`/`MT5_BRIDGE_API_KEY` (データプロバイダ資格情報) が子に渡らず、MT5/TwelveData を有効化した構成で trade worker の市場データ取得が認証失敗する (レビュー IM-3/P8-03)。trade profile のときだけ、この 2 キーを親環境から明示 allowlist で追加する。`AFX_*`/`ANTHROPIC_*` は引き続き除外。**improve profile では資格情報も渡さない** (裁定書 F-9 — 遮断維持)。network poison (`_poison_network_modules`) はどちらの profile でも呼ばない (mission worker は信頼済みハーネスコードでネットワークが必要、という設計書 §4.5 の方針)
 - **handshake の `now`**: `clock.now()` を 1 回だけ取得し、子は `FixedClock(now)` として Mission 全体で使う (子内の全ツール呼び出しが同じ「判断時点」を見る — Mission 実行中に親と子で時刻がずれて判断材料が矛盾することを避ける、既存の `cycle_rate_fn`/`_evaluate_positions` が「1 回の判断内でレートを固定する」のと同じ設計思想)
-- **RPC dispatcher のリーク検出**: `concurrent.futures.ThreadPoolExecutor(max_workers=1)` に RAG 呼び出しを submit し、`future.result(timeout=rpc_timeout_sec)` で打ち切る。`TimeoutError` はリークとして扱い `on_rpc_leak()` を呼ぶ (worker 側のスレッドは回収できないまま残る — 設計書 §4.3 codex I3-1 の裁定どおり「別プロセス化はしない・累積許容もしない」)。`max_workers=1` により、1 回リークした後の後続 RPC は自然に (executor の唯一のワーカーが塞がっているため) 同様に timeout する — 追加のガード条件は不要
+- **RPC dispatcher のリーク検出** (FC-1 対応 — 裁定書の方針どおり `concurrent.futures.ThreadPoolExecutor` は使わない): RAG 呼び出しごとに使い捨ての `threading.Thread(daemon=True)` を spawn し、結果を `queue.Queue(maxsize=1)` 経由で受け取る。`queue.Queue.get(timeout=rpc_timeout_sec)` で打ち切る。`queue.Empty` はリークとして扱い `on_rpc_leak()` を呼ぶ (worker スレッドは回収できないまま残る — 設計書 §4.3 codex I3-1 の裁定どおり「別プロセス化はしない・累積許容もしない」は維持)。**`ThreadPoolExecutor` を使わない理由 (レビュー FC-1)**: `ThreadPoolExecutor` のワーカースレッドは Python の atexit ハンドラ (`concurrent.futures.thread._python_exit`) に登録され、`shutdown(wait=False)` を呼んでもリークして回収不能になったワーカースレッドの終了をインタプリタ終了時に待ち続け、プロセスの `sys.exit()`/非ゼロ終了そのものを無期限にブロックする (実測で再現確認済み — `ThreadPoolExecutor` に未 set の `Event.wait()` を submit して `shutdown(wait=False)` 後にプロセスを終えようとすると `timeout 3s` で rc=124)。**`daemon=True` の素の `threading.Thread` は interpreter 終了時に join されない** ため、リークしたスレッドが存在してもプロセスは正常に (非ゼロ) 終了できる。RAG 呼び出しごとに新規スレッドを spawn する設計変更により「1 回リークした後の後続 RPC も自然に timeout する」保証は `ThreadPoolExecutor(max_workers=1)` の飽和ではなく `Rag` 自身の内部 lock (Task 9, `lock_timeout_sec`) の飽和で担保される (後続呼び出しはリーク中の呼び出しが保持する lock の解放を待って `RagUnavailable`/timeout になる) — 追加のガード条件は不要
 
 - [ ] **Step 1: 失敗するテストを書く (FakeChild によるインプロセス単体テスト)**
 
@@ -3089,6 +3533,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -3126,6 +3572,48 @@ def _rag(tmp_path):
 def _mission():
     return Mission(prompt="hi", tools=[], output_schema={"type": "object"},
                    max_turns=1, timeout_sec=5.0)
+
+
+def test_mission_worker_env_includes_data_provider_credentials_for_trade(monkeypatch):
+    """IM-3/P8-03 対応: trade profile は TWELVEDATA_API_KEY/
+    MT5_BRIDGE_API_KEY を明示 allowlist で子に渡す。AFX_* は継承しない。"""
+    from agentic_fx.runners.worker_runner import _mission_worker_env
+
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "td-secret")
+    monkeypatch.setenv("MT5_BRIDGE_API_KEY", "mt5-secret")
+    monkeypatch.setenv("AFX_SOMETHING", "must-not-leak")
+
+    env = _mission_worker_env("trade")
+
+    assert env["TWELVEDATA_API_KEY"] == "td-secret"
+    assert env["MT5_BRIDGE_API_KEY"] == "mt5-secret"
+    assert "AFX_SOMETHING" not in env
+
+
+def test_mission_worker_env_excludes_credentials_for_improve(monkeypatch):
+    """improve profile では資格情報も渡さない (裁定書 F-9 — 遮断維持)。"""
+    from agentic_fx.runners.worker_runner import _mission_worker_env
+
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "td-secret")
+    monkeypatch.setenv("MT5_BRIDGE_API_KEY", "mt5-secret")
+
+    env = _mission_worker_env("improve")
+
+    assert "TWELVEDATA_API_KEY" not in env
+    assert "MT5_BRIDGE_API_KEY" not in env
+
+
+def test_mission_worker_env_omits_unset_credentials(monkeypatch):
+    """親環境にキーが無ければそもそも env に含めない (空文字を渡さない)。"""
+    from agentic_fx.runners.worker_runner import _mission_worker_env
+
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    monkeypatch.delenv("MT5_BRIDGE_API_KEY", raising=False)
+
+    env = _mission_worker_env("trade")
+
+    assert "TWELVEDATA_API_KEY" not in env
+    assert "MT5_BRIDGE_API_KEY" not in env
 
 
 class _FakeChildScript:
@@ -3186,10 +3674,26 @@ def test_worker_runner_completes_mission_via_pipes(tmp_path, monkeypatch):
         def poll(self):
             return None
 
+        def wait(self, timeout=None):
+            # I9 対応: `finally` 節の `_ensure_dead` → `_kill` は
+            # `poll() is None` の間 `proc.wait(timeout=5)` を必ず呼ぶ。
+            # `wait` を持たない FakeProc だと `AttributeError` になり
+            # Step 1 のテストが (正常系であっても) finally で必ず壊れる
+            # (レビュー I9)。
+            return -9
+
     fake_proc = FakeProc()
 
     import agentic_fx.runners.worker_runner as wr_mod
     monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    # I9 対応: FakeProc.pid はテストプロセス自身の pid (上記コメント参照)。
+    # `_kill`/`_escalate_kill` は `os.killpg(proc.pid, signal.SIGKILL)` を
+    # 呼ぶため、`os.killpg` を monkeypatch せずに実行すると
+    # **テストプロセス自身が SIGKILL される** (レビュー I9)。fake で
+    # 呼び出しを記録するだけにする。
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(wr_mod.os, "killpg",
+                        lambda pid, sig: killpg_calls.append((pid, sig)))
 
     root = _root(tmp_path)
     clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
@@ -3204,9 +3708,9 @@ def test_worker_runner_completes_mission_via_pipes(tmp_path, monkeypatch):
     assert {"role": "user", "content": "hi"} in result.transcript
 ```
 
-（この 1 本は WorkerRunner の I/O 配線を通しで確認する骨格テストであり、実装が `subprocess.Popen` をどう呼ぶか (`stdin`/`stdout` を `os.fdopen` した実ファイルオブジェクトとして扱うか) に依存する。**実装者は Step 3 を書いた後、この骨格に合わせてテストの `FakeProc` を調整すること** — 特に `stdin.write`/`stdout.readline` が実際に呼ばれる形と一致させる。）
+（この 1 本は WorkerRunner の I/O 配線を通しで確認する骨格テストであり、実装が `subprocess.Popen` をどう呼ぶか (`stdin`/`stdout` を `os.fdopen` した実ファイルオブジェクトとして扱うか) に依存する。**実装者は Step 3 を書いた後、この骨格に合わせてテストの `FakeProc` を調整すること** — 特に `stdin.write`/`stdout.readline` が実際に呼ばれる形と一致させる。**I9 対応: `FakeProc.wait()` と `os.killpg` の monkeypatch は必須**。`FakeProc.pid = os.getpid()` かつ `finally` 節が `poll() is None` なら無条件に `_kill(proc)` (→ `os.killpg` → `proc.wait(timeout=5)`) を呼ぶ実装であるため、この 2 つを欠かすとテスト実行そのものが `AttributeError` で壊れるか、最悪 `os.killpg` が実際に呼ばれてテストプロセス自身が SIGKILL される。）
 
-追加で以下のケースをカバーする独立したテストを書く (骨格は上と同じ `FakeProc`/`subprocess.Popen` monkeypatch パターンを流用し、子スレッドの応答内容だけを変える):
+追加で以下のケースをカバーする独立したテストを書く (骨格は上と同じ `FakeProc`/`subprocess.Popen` monkeypatch パターンを流用し、子スレッドの応答内容だけを変える。**I9 対応: `FakeProc` に `wait(self, timeout=None)` を必ず実装し、`os.killpg` を monkeypatch すること** — `FakeProc.pid` を `os.getpid()` にする場合は特に必須 (killpg を fake しないとテストプロセス自身に `SIGKILL` が飛ぶ)。`_FakeChildScript` (既存, 999999 という実在しない pid を使う) を流用する場合も `wait()` は既に実装済みだが `os.killpg` が `ProcessLookupError` を投げて `except` で握られることに変わりはないため、明示的に呼び出し引数を検証したいテスト (`test_worker_runner_mission_timeout_escalates_sigterm_then_sigkill` 等) は `os.killpg` を monkeypatch して呼出し引数を記録する方式に統一すること):
 
 1. `test_worker_runner_startup_timeout_kills_child` — `ready` を送らないまま `worker_startup_timeout_sec` (settings を `model_copy` で短縮して注入) を超過させ、`kill_fn` が呼ばれ `status == "failed"` になることを確認
 2. `test_worker_runner_mission_timeout_escalates_sigterm_then_sigkill` — `result` を送らないまま `mission.timeout_sec + worker_grace_sec` を超過させ、SIGTERM 相当の呼び出し (`terminate_fn`) → `worker_terminate_grace_sec` 経過後に `kill_fn` が呼ばれることを確認。`status == "timeout"`
@@ -3215,6 +3719,172 @@ def test_worker_runner_completes_mission_via_pipes(tmp_path, monkeypatch):
 5. `test_worker_runner_transcript_truncates_at_cap` — `transcript_max_bytes` を小さく (例: 200 バイト) 設定し、大量の `event` を送る → `result.transcript` に truncate marker が 1 件だけ含まれ、以後の `event` が積まれていないことを確認
 6. `test_worker_runner_rag_rpc_dispatches_to_rag_and_responds` — `tool_rpc` (`name="search_news"`) を送り、fake `Rag.search_news` が呼ばれて `tool_rpc_result` が子側パイプ (`r2`) から読めることを確認
 7. `test_worker_runner_rag_rpc_leak_calls_on_rpc_leak` — fake `Rag.search_news` を `rpc_timeout_sec` より長くブロックする関数に差し替え、`on_rpc_leak` コールバックが呼ばれることを確認 (mission 自体は `result` フレームが届けば completed のまま終わってよい — リーク検出とミッション結果は独立)
+8. (IM-7) `test_worker_runner_finally_joins_dispatcher_before_closing_stdin` — 下記の完全なコードを参照 (`threading.Thread` を monkeypatch して生成されたスレッドを捕捉し、`run()` 復帰時点で `afx-worker-dispatcher` という名前のスレッドが `is_alive() is False` であることを確認する — `finally` 節が `proc.stdin.close()` の前に dispatcher を join し終えていることの直接的な回帰ピン)
+9. (FC-1) `test_worker_runner_leaked_rag_rpc_returns_promptly_with_daemon_thread` — `rag.search_news` を永久にブロックする関数に差し替え、`run()` が `rpc_timeout_sec` 程度の有限時間で復帰すること (ハングしないこと) と、リークした `afx-rag-rpc` スレッドが `daemon=True` のまま `threading.enumerate()` に残っていること (= `ThreadPoolExecutor` の atexit join 対象になっていないこと) を確認する。下記の完全なコードを参照
+10. (FC-1) `test_leaked_daemon_thread_does_not_block_process_exit` — **実測統合テスト (裁定書必須項目)**。実 subprocess を spawn し、`afx-rag-rpc` と同じパターン (`threading.Thread(daemon=True, target=<永久にブロックする関数>)`) でスレッドをリークさせた直後に `sys.exit(7)` する小スクリプトを実行し、`subprocess.run(..., timeout=5)` が `TimeoutExpired` を送出せず `returncode == 7` で戻ることを確認する。下記の完全なコードを参照 (`ThreadPoolExecutor` 版であれば同じスクリプトが `timeout 5s` で `TimeoutExpired` になっていたことをコメントで明記する — 実際に手元の `uv run python -c "..."` でこの対比を実行し、修正前の再現も確認済み)
+
+```python
+def test_worker_runner_finally_joins_dispatcher_before_closing_stdin(tmp_path, monkeypatch):
+    """IM-7 対応: finally 節は proc.stdin を close する前に dispatcher
+    スレッドの join を完了させる (dispatcher が stdin_lock を保持して
+    tool_rpc_result を書込中に close が競合するレースを防ぐ — 設計書
+    §4.3「writer は 2 時点で排他」)。run() から戻った時点で dispatcher
+    スレッドが確実に終了している (is_alive() is False)ことを直接検証する。
+    """
+    import agentic_fx.runners.worker_runner as wr_mod
+
+    created_threads: list[threading.Thread] = []
+    orig_thread_cls = wr_mod.threading.Thread
+
+    def spying_thread(*args, **kwargs):
+        t = orig_thread_cls(*args, **kwargs)
+        created_threads.append(t)
+        return t
+
+    monkeypatch.setattr(wr_mod.threading, "Thread", spying_thread)
+
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "tool_rpc", "seq": 2, "rpc_id": "1",
+                                "name": "search_news",
+                                "args": {"query": "q", "n": 5}})
+        json.loads(child_in.readline())  # tool_rpc_result
+        write_frame(child_out, {"type": "result", "seq": 3,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    rag = _rag(tmp_path)
+    rag.search_news = lambda query, n=5: []  # 即応答 (遅延自体は対象外)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock, rag=rag)
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    dispatcher_threads = [th for th in created_threads
+                          if th.name == "afx-worker-dispatcher"]
+    assert dispatcher_threads, "dispatcher thread was not created"
+    assert all(not th.is_alive() for th in dispatcher_threads)
+```
+
+```python
+def test_worker_runner_leaked_rag_rpc_returns_promptly_with_daemon_thread(
+        tmp_path, monkeypatch):
+    """FC-1 対応: RAG RPC がリークしても run() は rpc_timeout_sec 程度の
+    有限時間で復帰し (ThreadPoolExecutor 版は atexit join でハングし
+    得た)、生成されたワーカースレッドは daemon=True のまま残る (=
+    ThreadPoolExecutor の atexit join 対象になっていない)。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "tool_rpc", "seq": 2, "rpc_id": "1",
+                                "name": "search_news",
+                                "args": {"query": "q", "n": 5}})
+        # tool_rpc_result (timeout 応答) を読んでから result を送る
+        json.loads(child_in.readline())
+        write_frame(child_out, {"type": "result", "seq": 3,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    rag = _rag(tmp_path)
+    rag.search_news = lambda query, n=5: threading.Event().wait()  # 永久リーク
+    settings = SETTINGS.model_copy(update={
+        "worker": SETTINGS.worker.model_copy(update={"rpc_timeout_sec": 0.2})})
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=settings, clock=clock, rag=rag)
+    t.start()
+    started = time.monotonic()
+    result = runner.run(_mission())
+    elapsed = time.monotonic() - started
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    # rpc_timeout_sec=0.2 に対して十分な余裕 (dispatcher.join の上限は
+    # rpc_timeout_sec + 5.0 — ThreadPoolExecutor 版なら atexit 待ちで
+    # 無期限にハングし得た経路)。
+    assert elapsed < 5.0
+    leaked = [th for th in threading.enumerate() if th.name == "afx-rag-rpc"]
+    assert leaked, "expected a leaked afx-rag-rpc thread to still be present"
+    assert all(th.daemon for th in leaked)
+```
+
+```python
+def test_leaked_daemon_thread_does_not_block_process_exit():
+    """FC-1 対応の実測統合テスト (裁定書必須項目)。実 subprocess で
+    afx-rag-rpc と同じパターン (`threading.Thread(daemon=True,
+    target=<永久ブロック>)`) を作った直後に `sys.exit(7)` するスクリプト
+    を実行し、プロセスが実際に有限時間で終了できることを確認する。
+
+    対比 (手元で実測確認済み — `ThreadPoolExecutor` 版の再現):
+    `concurrent.futures.ThreadPoolExecutor(max_workers=1)` に `submit`
+    した `threading.Event().wait()` を `shutdown(wait=False)` した後に
+    `sys.exit(...)` する同型スクリプトは、atexit ハンドラ
+    (`concurrent.futures.thread._python_exit`) がワーカースレッドの
+    終了を待つため `subprocess.run(..., timeout=5)` が
+    `TimeoutExpired` になる (rc=124 相当)。本テストは `daemon=True` の
+    素の `threading.Thread` に置き換えたことで、このハングが解消される
+    ことを実行結果で固定する。
+    """
+    script = (
+        "import threading, sys\n"
+        "threading.Thread(target=lambda: threading.Event().wait(), "
+        "daemon=True, name='afx-rag-rpc').start()\n"
+        "sys.exit(7)\n")
+    result = subprocess.run([sys.executable, "-c", script],
+                            capture_output=True, text=True, timeout=5)
+    assert result.returncode == 7
+```
 
 - [ ] **Step 2: テスト実行して FAIL を確認**
 
@@ -3239,7 +3909,6 @@ max_turns) に in-band で乗る (呼び出し元は他の AgentRunner 実装と
 """
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import os
 import queue
@@ -3264,6 +3933,33 @@ import logging
 
 _log = logging.getLogger("agentic_fx.worker_runner")
 
+# IM-3/P8-03 対応 (裁定書 F-9): trade profile の子だけに渡すデータ
+# プロバイダ資格情報の明示 allowlist。
+_DATA_PROVIDER_ENV_ALLOWLIST = ("TWELVEDATA_API_KEY", "MT5_BRIDGE_API_KEY")
+
+
+def _mission_worker_env(worker_profile: str) -> dict[str, str]:
+    """mission worker 専用の env builder (IM-3/P8-03 対応、裁定書 F-9)。
+
+    `plugin/sandbox.py:_build_env()` (`PATH`/`PYTHONPATH`/
+    `PYTHONSAFEPATH`/`_SINGLE_THREAD_ENV` のみの最小 env、`AFX_*` 等は
+    継承しない) をそのまま mission worker にも流用すると、
+    `price_provider.py`/`sources.py` が読む `TWELVEDATA_API_KEY`/
+    `MT5_BRIDGE_API_KEY` が子に渡らず、MT5/TwelveData を有効化した
+    構成で trade worker の市場データ取得ツールが恒常的に認証失敗する
+    (レビュー IM-3/P8-03)。`worker_profile == "trade"` のときだけ、
+    この 2 キーを親プロセスの環境から明示 allowlist で追加する。
+    `AFX_*`/`ANTHROPIC_*` 等は引き続き除外 (継承しない)。improve
+    profile では資格情報も渡さない (裁定書 F-9 — 遮断維持)。
+    """
+    env = _build_env()
+    if worker_profile == "trade":
+        for key in _DATA_PROVIDER_ENV_ALLOWLIST:
+            value = os.environ.get(key)
+            if value is not None:
+                env[key] = value
+    return env
+
 
 class WorkerRunner(AgentRunner):
     def __init__(self, *, root: Path, settings, clock: Clock, rag: Rag,
@@ -3286,7 +3982,8 @@ class WorkerRunner(AgentRunner):
             proc = subprocess.Popen(
                 [sys.executable, "-m", "agentic_fx.mission_worker"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, cwd=workdir, env=_build_env(),
+                stderr=subprocess.DEVNULL, cwd=workdir,
+                env=_mission_worker_env(self._worker_profile),
                 start_new_session=True)
             return self._run_with_child(proc, mission, w)
 
@@ -3344,24 +4041,41 @@ class WorkerRunner(AgentRunner):
             except Exception as e:  # noqa: BLE001 — reader は死なせない代わりに報告する
                 done_queue.put(("error", str(e)))
 
-        rpc_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="afx-rag-rpc")
-
         def dispatcher_loop() -> None:
             out_seq_holder = {"n": 0}
             while True:
                 frame = dispatch_queue.get()
                 if frame is None:  # shutdown 合図
                     return
-                future = rpc_executor.submit(
-                    self._call_rag, frame["name"], frame["args"])
+                # FC-1 対応: concurrent.futures.ThreadPoolExecutor は使わない
+                # (atexit ハンドラがワーカースレッドの終了を待つため、
+                # リークしたまま残ると sys.exit()/非ゼロ終了そのものを
+                # 無期限にブロックする — レビュー FC-1、実測で再現確認済み)。
+                # RAG 呼び出しごとに使い捨ての daemon スレッドを spawn し、
+                # 結果は queue.Queue 経由で受け取る。daemon スレッドは
+                # interpreter 終了時に join されないため、リークしても
+                # プロセスは正常に (非ゼロ) 終了できる。
+                result_queue: "queue.Queue[tuple[bool, object]]" = (
+                    queue.Queue(maxsize=1))
+
+                def _rpc_worker(name=frame["name"], args=frame["args"]) -> None:
+                    try:
+                        result_queue.put((True, self._call_rag(name, args)))
+                    except Exception as e:  # noqa: BLE001 — 子へ tool error として返す
+                        result_queue.put((False, str(e)))
+
+                threading.Thread(target=_rpc_worker, daemon=True,
+                                 name="afx-rag-rpc").start()
                 try:
-                    result = future.result(timeout=w.rpc_timeout_sec)
-                    response = {"ok": True, "result": result}
-                except concurrent.futures.TimeoutError:
+                    ok, payload = result_queue.get(timeout=w.rpc_timeout_sec)
+                    response = ({"ok": True, "result": payload} if ok
+                               else {"ok": False, "error": payload})
+                except queue.Empty:
                     _log.error("RAG RPC leaked past rpc_timeout_sec=%s "
                               "(name=%s) — this thread will never be "
-                              "reclaimed (设計書 §4.3 codex I3-1)",
+                              "reclaimed but will not block process exit "
+                              "(daemon thread — 设計書 §4.3 codex I3-1, "
+                              "レビュー FC-1)",
                               w.rpc_timeout_sec, frame["name"])
                     if self._on_rpc_leak is not None:
                         try:
@@ -3369,8 +4083,6 @@ class WorkerRunner(AgentRunner):
                         except Exception:  # noqa: BLE001
                             _log.exception("on_rpc_leak callback failed")
                     response = {"ok": False, "error": "rag rpc timed out"}
-                except Exception as e:  # noqa: BLE001 — RagUnavailable も含め子へ tool error として返す
-                    response = {"ok": False, "error": str(e)}
                 out_seq_holder["n"] += 1
                 try:
                     with stdin_lock:
@@ -3381,8 +4093,10 @@ class WorkerRunner(AgentRunner):
                 except (BrokenPipeError, OSError):
                     return  # 子が既に死んでいる — 応答不能
 
-        reader = threading.Thread(target=reader_loop, daemon=True)
-        dispatcher = threading.Thread(target=dispatcher_loop, daemon=True)
+        reader = threading.Thread(target=reader_loop, daemon=True,
+                                  name="afx-worker-reader")
+        dispatcher = threading.Thread(target=dispatcher_loop, daemon=True,
+                                      name="afx-worker-dispatcher")
         reader.start()
         dispatcher.start()
 
@@ -3435,12 +4149,26 @@ class WorkerRunner(AgentRunner):
             dispatch_queue.put(None)
             self._ensure_dead(proc, w)
             reader.join(timeout=5.0)
-            rpc_executor.shutdown(wait=False)
-            for stream in (proc.stdin, proc.stdout):
+            # IM-7 対応: dispatcher は `with stdin_lock: write_frame(proc.stdin,
+            # ...)` を実行し得る (tool_rpc_result 応答の送出中)。ここで
+            # stdin_lock の外から proc.stdin.close() すると、dispatcher が
+            # まさに書込中の瞬間と競合し得る (設計書 §4.3「writer は
+            # 2 時点で排他」違反 — レビュー IM-7)。dispatcher を先に join
+            # する (dispatcher 自身は `result_queue.get(timeout=
+            # w.rpc_timeout_sec)` で必ず打ち切られるため — FC-1 対応の
+            # daemon スレッドがリークしても、dispatcher 自体は有限時間で
+            # `dispatch_queue.get()` に戻り、None sentinel を見て return
+            # する — 有界待ち)。
+            dispatcher.join(timeout=w.rpc_timeout_sec + 5.0)
+            with stdin_lock:
                 try:
-                    stream.close()
+                    proc.stdin.close()
                 except OSError:
                     pass
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
 
     def _call_rag(self, name: str, args: dict):
         method = getattr(self._rag, name)
@@ -3476,7 +4204,7 @@ class WorkerRunner(AgentRunner):
             pass
 ```
 
-**実装者への注意**: 上記は骨格実装であり、Step 1 のテストを実際に流しながら以下を調整すること — ①`_FakeChildScript`/`FakeProc` が `os.killpg(proc.pid, ...)` を呼べない (FakeProc.pid が実プロセスでない) ケースをどう扱うか (テストでは `monkeypatch.setattr(wr_mod.os, "killpg", ...)` で `os.killpg` 自体を差し替え、呼び出し引数を記録する形にする) ②`out_seq_holder["n"] + 1` のオフセット (handshake が seq=1 を消費済みであることの整合) は実装しながら実際のフレーム列で検証すること ③`dispatcher_loop` の `dispatch_queue.put(None)` によるシャットダウン合図が、リーク中 (executor の唯一のワーカーが塞がっている) でも `dispatcher_loop` 自身のループ (`dispatch_queue.get()` 待ち) を正しく抜けられることを確認すること (dispatcher スレッド自体はリークしない — リークするのは `rpc_executor` 内の 1 ワーカースレッドのみ)。
+**実装者への注意**: 上記は骨格実装であり、Step 1 のテストを実際に流しながら以下を調整すること — ①`_FakeChildScript`/`FakeProc` が `os.killpg(proc.pid, ...)` を呼べない (FakeProc.pid が実プロセスでない) ケースをどう扱うか (テストでは `monkeypatch.setattr(wr_mod.os, "killpg", ...)` で `os.killpg` 自体を差し替え、呼び出し引数を記録する形にする) ②`out_seq_holder["n"] + 1` のオフセット (handshake が seq=1 を消費済みであることの整合) は実装しながら実際のフレーム列で検証すること ③`dispatcher_loop` の `dispatch_queue.put(None)` によるシャットダウン合図が、リーク中 (直近の RAG 呼び出しが `result_queue.get(timeout=w.rpc_timeout_sec)` で打ち切り待ち中) でも `dispatcher_loop` 自身のループ (`dispatch_queue.get()` 待ち) を正しく抜けられることを確認すること (dispatcher スレッド自体はリークしない — リークするのは FC-1 対応で spawn する使い捨て `afx-rag-rpc` daemon スレッドのみで、`ThreadPoolExecutor` は使わない)。
 
 - [ ] **Step 4: テスト実行して PASS を確認 (段階的に)**
 
@@ -3567,6 +4295,18 @@ Expected: 全件 PASS。**注意**: `build_app` を `runner=None` で呼ぶ既�
 2. `handle_event` の `if state["bytes"] + size > w.transcript_max_bytes:` の閾値判定を削除 → `test_worker_runner_transcript_truncates_at_cap` が red
 3. `dispatcher_loop` の `future.result(timeout=w.rpc_timeout_sec)` の `timeout=` を削除 (無期限待ちにする) → `test_worker_runner_rag_rpc_leak_calls_on_rpc_leak` が red (テストがタイムアウトするか `on_rpc_leak` が呼ばれない)
 4. `in_seq.check(frame.get("seq"))` の呼び出しを削除 → `test_worker_runner_protocol_violation_is_failed` が red
+5. (I9) `_kill` 内の `proc.wait(timeout=5)` 呼び出しを削除 → 直接 red 化するテストは無い (呼ばなくても既存アサーションは通る) ため、代わりに `test_worker_runner_completes_mission_via_pipes` の `FakeProc.wait` から `return -9` を削除し `raise AssertionError("wait must not be called")` に変える変異を行い、**現在の実装が `wait` を呼んでいること自体** を回帰確認する (呼ばれなければ変異前後でテスト結果が変わらず、レビュー時に「_kill が wait を呼ぶ」という設計意図がテストで担保されていないことが分かる — 担保されていなければ Step 3 の docstring 通りの実装になっているか目視で再確認すること)
+6. (IM-3/P8-03) `_mission_worker_env` の `if worker_profile == "trade":` ブロックを削除 (資格情報 allowlist を無条件スキップ) → `test_mission_worker_env_includes_data_provider_credentials_for_trade` が red
+7. (IM-7) `finally` 節の `dispatcher.join(timeout=w.rpc_timeout_sec + 5.0)` 行を削除 → `test_worker_runner_finally_joins_dispatcher_before_closing_stdin` が red (`dispatcher_threads` の `is_alive()` が `True` のまま残るケースが発生し得る — 環境によりタイミング依存で毎回 red にならない場合は、`dispatcher_loop` 内に `time.sleep(0.05)` を一時挿入してレースを顕在化させ、削除の効果を確認する旨をコメントで明記する)
+8. (FC-1) `dispatcher_loop` 内の `threading.Thread(target=_rpc_worker, daemon=True, ...)` を `daemon=False` に改変 → `test_leaked_daemon_thread_does_not_block_process_exit` は同型スクリプトを直接実行するため本改変では red にならない (WorkerRunner 内部の変更だけでは検出できない設計上の限界) — 代わりに `test_worker_runner_leaked_rag_rpc_returns_promptly_with_daemon_thread` の `assert all(th.daemon for th in leaked)` が red になることを確認する
+
+- [ ] **Step 9b (FC-1): 実 subprocess での対比実測を確認する**
+
+```bash
+uv run pytest tests/runners/test_worker_runner.py -q -k leaked_daemon_thread_does_not_block_process_exit
+```
+
+Expected: PASS。念のため `ThreadPoolExecutor` 版に戻した場合に red (`TimeoutExpired`) になることを、実装完了後に一度だけ手動で `concurrent.futures.ThreadPoolExecutor` を使った同型スクリプトに差し替えて確認し (恒久的にテストへは残さない — 対比確認のみ)、レビューコメントに実測結果を残す。
 
 - [ ] **Step 10: Commit**
 
@@ -3577,7 +4317,12 @@ git commit -m "$(cat <<'EOF'
 feat: WorkerRunner (使い捨て子プロセスへの Mission 隔離 + preemption + RPC dispatcher)
 
 設計書 §3.1/§4.1/§4.3/§4.7。build_app のデフォルト runner を WorkerRunner
-に差し替える (core_lock 粒度の再設計は Task 13/15/16)。
+に差し替える (core_lock 粒度の再設計は Task 13/15/16)。RAG RPC dispatcher
+は ThreadPoolExecutor をやめ daemon スレッド + Queue に置換し、リーク後も
+プロセスが非ゼロ終了できることを実測で固定する (レビュー FC-1)。
+finally 節は dispatcher を join してから stdin を close する (レビュー
+IM-7)。mission worker 専用の env builder でデータプロバイダ資格情報を
+trade profile にのみ明示 allowlist で渡す (レビュー IM-3/P8-03)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -3591,13 +4336,16 @@ EOF
 
 **Files:**
 - Modify: `src/agentic_fx/store/missions.py` (`finish` を CAS 化、`recover_interrupted` 新設)
-- Modify: `src/agentic_fx/service.py:262-266`(起動シーケンスに `recover_interrupted` 追加)
-- Test: `tests/store/test_missions_cas.py` (新規)
+- Create: `src/agentic_fx/store/instance_lock.py` (FC-2 対応 — 単一インスタンス保証)
+- Modify: `src/agentic_fx/service.py:262-266`(起動シーケンスに `recover_interrupted` 追加。FC-2: その**前**にプロセス排他 flock を取得)、`App` dataclass (`instance_lock` フィールド追加)、`return App(...)` (`instance_lock=instance_lock` 追加)
+- Test: `tests/store/test_missions_cas.py` (新規), `tests/store/test_instance_lock.py` (新規)
 
 **Interfaces:**
 - Produces:
   - `missions.finish(conn, mission_id: int, status: str, output: dict | None, transcript: list, now: datetime) -> bool` — **`WHERE id=? AND status='running'` の CAS**。戻り値 `True` = この呼び出しが終端を書いた、`False` = 既に終端済み (影響行数 0、上書きしない)。**呼び出し元は `False` のとき activity 警告を残し、この結果を上書きしないこと** (呼び出し元の更新は Task 15/16)
   - `missions.recover_interrupted(conn, *, now: datetime, max_requeue: int) -> dict` — `status='running'` の missions 行を全件 `'interrupted'` へ終端し、それらを claim していた `claimed` signals を**同一トランザクション**で requeue (上限超過は abandoned) する。戻り値 `{"missions_recovered": int, "signals_requeued": int, "signals_abandoned": int}`。**`'interrupted'` は DB 回収専用の状態値であり `MissionResult.status` の 4 値契約 (`runners/base.py:40`) には現れない** (codex M-1 — `missions` テーブルの `status` 列に CHECK 制約は無いためスキーマ変更不要)
+  - `instance_lock.InstanceAlreadyRunning(Exception)` (FC-2 対応、裁定書) — 別プロセスが同じ DB ディレクトリの instance lock を既に保持している場合の単一表現
+  - `instance_lock.acquire_instance_lock(db_dir: Path) -> IO` — `db_dir` (`root / "data"`) 直下の lock file に対する `fcntl.flock(LOCK_EX | LOCK_NB)`。取得できなければ `InstanceAlreadyRunning` を送出する (fail closed — 起動を中止する)。戻り値のファイルオブジェクトは **App の全寿命にわたって保持**すること (close/GC されると lock が解放される)。`recover_interrupted` は「稼働中の全 `running` mission」を無条件に対象とするため、二重起動があると先発の稼働中 Mission を後発が誤って `interrupted` 終端し claim 済み signal を横取りしかねない — この排他はそれを防ぐ (裁定書 FC-2)。**解放は Task 19 の `App.close()` で配線する** (本 task では `App` に `instance_lock` フィールドを追加して保持するところまでに留め、Task 19 本文は編集しない)
 
 - [ ] **Step 1: 失敗するテストを書く (`finish` の CAS 化)**
 
@@ -3607,6 +4355,7 @@ EOF
 """missions.finish の CAS 化 + 起動時回収 (プラン8, 設計書 §4.7/§4.8)。"""
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
@@ -3751,33 +4500,47 @@ def test_recover_interrupted_abandons_signal_over_requeue_limit(tmp_path):
     assert row["status"] == "abandoned"
 
 
-def test_recover_interrupted_is_atomic_no_partial_state_on_failure(tmp_path, monkeypatch):
+def test_recover_interrupted_is_atomic_no_partial_state_on_failure(tmp_path):
     """途中で例外が起きても missions/signals どちらも変更されない
-    (単一トランザクション — codex C-5)。"""
+    (単一トランザクション — codex C-5)。
+
+    I11 対応: `sqlite3.Connection.execute` は C 拡張型の read-only
+    属性であり `monkeypatch.setattr(conn, "execute", ...)` は
+    `AttributeError: 'sqlite3.Connection' object attribute 'execute'
+    is read-only` で失敗し、テストがそもそも実行できない (レビュー
+    I11、実測で確認済み)。DB 側の決定論的な failure point として
+    SQLite trigger を使う — `signals` の `status` を `'pending'` に
+    更新する UPDATE (`recover_interrupted` の requeue 分岐) だけを
+    確実に失敗させ、`recover_interrupted` 自身の `except BaseException:
+    conn.rollback(); raise` 経路を実際に通す。
+    """
     conn = _conn(tmp_path)
     mid = missions.start(conn, "trade", "local", "m", NOW)
     signals.add(conn, plugin="p", content_hash="h", pair="USDJPY",
                timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
                payload={}, now=NOW)
-    signals.claim_oldest(conn, mission_id=mid, now=NOW, freshness_bars=None)
+    claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
+                                   freshness_bars=None)
+    assert claimed is not None
 
-    orig_execute = conn.execute
-    call_count = {"n": 0}
+    conn.execute("""
+        CREATE TRIGGER fail_on_signal_requeue
+        BEFORE UPDATE OF status ON signals
+        WHEN NEW.status = 'pending'
+        BEGIN
+            SELECT RAISE(ABORT, 'simulated failure');
+        END;
+    """)
+    conn.commit()
 
-    def flaky_execute(sql, *a, **k):
-        call_count["n"] += 1
-        if "UPDATE signals SET status=" in sql:
-            raise sqlite3.OperationalError("simulated failure")
-        return orig_execute(sql, *a, **k)
-
-    import sqlite3
-    monkeypatch.setattr(conn, "execute", flaky_execute)
-    with pytest.raises(sqlite3.OperationalError):
+    with pytest.raises(sqlite3.Error):
         missions.recover_interrupted(conn, now=NOW, max_requeue=2)
 
-    monkeypatch.undo()
     row = conn.execute("SELECT status FROM missions WHERE id=?", (mid,)).fetchone()
-    assert row["status"] == "running"  # ロールバック済み
+    assert row["status"] == "running"  # ロールバック済み (missions 側も巻き戻る)
+    sig_row = conn.execute(
+        "SELECT status FROM signals WHERE id=?", (claimed["id"],)).fetchone()
+    assert sig_row["status"] == "claimed"  # signals 側も巻き戻る
 ```
 
 - [ ] **Step 6: テスト実行して FAIL を確認**
@@ -3865,11 +4628,123 @@ uv run pytest -q
 
 Expected: 全件 PASS。
 
-- [ ] **Step 9: `build_app` の起動シーケンスに配線**
+- [ ] **Step 9 (FC-2 対応): 失敗するテストを書く (`instance_lock`)**
 
-`src/agentic_fx/service.py` の `build_app` 内、`conn_core = connect(...)` / `init_db(conn_core)` の直後 (264-265 行) に追加する。**`settings` は既に 260 行目 (`settings = load_settings(root / "config" / "settings.yaml")`) で構築済みであり、`missions` は既に 45 行目 (`from agentic_fx.store import approvals, missions, orders, signals`) で import 済み** — 新たな import・別名は不要でどちらもそのまま使う:
+`tests/store/test_instance_lock.py` を新規作成:
 
 ```python
+"""単一インスタンス保証 (プラン8, 裁定書 FC-2)。"""
+from __future__ import annotations
+
+import pytest
+
+from agentic_fx.store.instance_lock import (
+    InstanceAlreadyRunning, acquire_instance_lock,
+)
+
+
+def test_acquire_instance_lock_succeeds_when_uncontended(tmp_path):
+    fh = acquire_instance_lock(tmp_path / "data")
+    assert fh is not None
+    fh.close()
+
+
+def test_acquire_instance_lock_raises_when_already_held(tmp_path):
+    """同一プロセス内でも、先に取得した lock file オブジェクトを close
+    せずに 2 回目を取得しようとすると失敗する (flock は open file
+    description 単位 — 2 回目の open は別の file description になる)。"""
+    db_dir = tmp_path / "data"
+    first = acquire_instance_lock(db_dir)
+    try:
+        with pytest.raises(InstanceAlreadyRunning):
+            acquire_instance_lock(db_dir)
+    finally:
+        first.close()
+
+
+def test_acquire_instance_lock_succeeds_again_after_release(tmp_path):
+    db_dir = tmp_path / "data"
+    first = acquire_instance_lock(db_dir)
+    first.close()  # 解放
+
+    second = acquire_instance_lock(db_dir)
+    second.close()
+```
+
+```bash
+uv run pytest tests/store/test_instance_lock.py -q
+```
+
+Expected: FAIL (`ModuleNotFoundError: No module named 'agentic_fx.store.instance_lock'`)。
+
+- [ ] **Step 10 (FC-2 対応): `instance_lock.py` を新規作成**
+
+```python
+"""単一インスタンス保証 (プラン8, 裁定書 FC-2)。
+
+`missions.recover_interrupted` は起動時に `status='running'` の全 mission
+を無条件に `'interrupted'` へ終端する。同じ DB ディレクトリに対する
+二重起動があると、後発プロセスが先発の稼働中 Mission を誤って終端し、
+claim 済み signal を横取り requeue しかねない (実 grep で確認済み —
+起動経路にプロセス排他が一切無かった)。DB と同一ディレクトリの lock
+file への `flock(LOCK_EX | LOCK_NB)` で単一インスタンスを強制する
+(fail closed — 取得できなければ起動そのものを中止する)。
+"""
+from __future__ import annotations
+
+import fcntl
+from pathlib import Path
+from typing import IO
+
+
+class InstanceAlreadyRunning(Exception):
+    """同じ DB ディレクトリに対する別プロセスが既に instance lock を
+    保持している (flock 取得失敗)。"""
+
+
+def acquire_instance_lock(db_dir: Path) -> IO:
+    """`db_dir` 直下の `instance.lock` を排他 lock する。
+
+    戻り値のファイルオブジェクトは **呼び出し元プロセスの生涯にわたって
+    保持**すること — close (または GC で暗黙 close) されると lock が
+    解放される。呼び出し元 (`build_app`) は `App.instance_lock` として
+    保持し、`App.close()` (Task 19) で明示的に close して解放する。
+    """
+    db_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = db_dir / "instance.lock"
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        fh.close()
+        raise InstanceAlreadyRunning(
+            f"another agentic-fx process already holds the instance lock "
+            f"at {lock_path} — refusing to start (fail closed, FC-2)") from e
+    return fh
+```
+
+- [ ] **Step 11 (FC-2 対応): テスト実行して PASS を確認**
+
+```bash
+uv run pytest tests/store/test_instance_lock.py -q
+```
+
+Expected: PASS。
+
+- [ ] **Step 12: `build_app` の起動シーケンスに配線**
+
+`src/agentic_fx/service.py` の `build_app` 内、`conn_core = connect(...)` / `init_db(conn_core)` の直前 (264-265 行) に、**FC-2 対応の instance lock 取得**を追加する。`settings` は既に 260 行目 (`settings = load_settings(root / "config" / "settings.yaml")`) で構築済みであり、`missions` は既に 45 行目 (`from agentic_fx.store import approvals, missions, orders, signals`) で import 済み — 新たな import・別名は不要でどちらもそのまま使う。`build_app` の import 節に `from agentic_fx.store.instance_lock import acquire_instance_lock` を追加する:
+
+```python
+    # FC-2 (裁定書): recover_interrupted は起動時に status='running' の
+    # 全 mission を無条件に interrupted 化する。二重起動があると、後発
+    # プロセスが先発の稼働中 Mission を誤って終端し claim 済み signal を
+    # 横取り requeue しかねないため、DB 接続・回収より**前**にプロセス
+    # 排他 flock を取得する。取得できなければ起動を中止する (fail
+    # closed — InstanceAlreadyRunning は呼び出し元の run_service/CLI
+    # エントリまで伝播させ、非ゼロ終了させる)。
+    instance_lock = acquire_instance_lock(root / "data")
+
     conn_core = connect(root / "data" / "agentic.db")
     init_db(conn_core)
     # プラン 8 (codex C-5): 前回停止時に running のまま残った mission と、
@@ -3882,28 +4757,61 @@ Expected: 全件 PASS。
         max_requeue=settings.plugin.signal_requeue_max)
 ```
 
+`App` dataclass (Task 4 で `clock: object` を追加済み) の末尾に `instance_lock: object` を追加する:
+
+```python
+@dataclass
+class App:
+    ...
+    clock: object
+    instance_lock: object
+```
+
+`build_app` の `return App(...)` に `instance_lock=instance_lock` を追加する (Task 4 で `clock=clock` を追加済みの箇所):
+
+```python
+    return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
+               state=state, activity=activity, broker=broker,
+               executor=executor, provider=provider, econ=econ,
+               collector=collector, rag=rag, trade_loop=trade_loop,
+               reflection=reflection, scheduler=scheduler, commands=commands,
+               registry=registry, core_lock=core_lock,
+               mission_watch=mission_watch, notifier=notifier,
+               runner=runner, owns_runner=owns_runner, clock=clock,
+               instance_lock=instance_lock)
+```
+
+**解放は Task 19 で配線する** (`App.close()` が保持中のリソースを逆順 close する箇所に `instance_lock.close()` を追加する — 本 task では追加しない。Task 19 本文は編集しないこと)。
+
+**実装者への注意 (FC-2 の副作用)**: 同一 `root` に対して `build_app` を複数回呼ぶ既存テスト (先に作った `App`/`instance_lock` を close せずに再度 `build_app(same_root)` する構成) があれば、2 回目が `InstanceAlreadyRunning` で失敗するようになる (意図どおりの回帰検出だが、既存テストの前提が壊れる)。`grep -rn "build_app(" tests/` で該当があれば、テスト側で 1 回目の `app.instance_lock.close()` を明示的に呼んでから 2 回目を build するよう修正すること (Task 19 の `App.close()` 配線を待たずに、テスト側だけの一時対応でよい)。
+
 ```bash
 uv run pytest -q
 ```
 
-Expected: 全件 PASS (`build_app` を使う既存テストが、`running` 状態の mission 行を残していない限り `recover_interrupted` は no-op で無影響)。
+Expected: 全件 PASS (`build_app` を使う既存テストが、`running` 状態の mission 行を残していない限り `recover_interrupted` は no-op で無影響。上記の複数回 `build_app` テストは事前に洗い出して対応済みであること)。
 
-- [ ] **Step 10: 変異テスト**
+- [ ] **Step 13: 変異テスト**
 
 1. `finish` の `WHERE id=? AND status='running'` から `AND status='running'` を削除 (無条件 UPDATE に戻す) → `test_finish_returns_false_on_second_call_and_does_not_overwrite` が red
 2. `recover_interrupted` の `except BaseException: conn.rollback(); raise` を削除 → `test_recover_interrupted_is_atomic_no_partial_state_on_failure` が red (部分的な状態変更が残る)
 3. `recover_interrupted` の `if row["requeue_count"] >= max_requeue:` を `if False:` に改変 → `test_recover_interrupted_abandons_signal_over_requeue_limit` が red
+4. (FC-2) `instance_lock.py` の `fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)` を no-op (`pass`) に改変 → `test_acquire_instance_lock_raises_when_already_held` が red
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 14: Commit**
 
 ```bash
-git add src/agentic_fx/store/missions.py src/agentic_fx/service.py \
-  tests/store/test_missions_cas.py
+git add src/agentic_fx/store/missions.py src/agentic_fx/store/instance_lock.py \
+  src/agentic_fx/service.py \
+  tests/store/test_missions_cas.py tests/store/test_instance_lock.py
 git commit -m "$(cat <<'EOF'
-feat: missions.finish の CAS 化 + 起動時 running→interrupted 同時回収
+feat: missions.finish の CAS 化 + 起動時 running→interrupted 同時回収 + 単一インスタンス保証
 
 設計書 §4.7 (codex C-4) / §4.8 (codex C-5)。呼び出し元の活用は Task
-15/16 の五相再構成で行う。
+15/16 の五相再構成で行う。起動時に DB ディレクトリの flock で単一
+インスタンスを強制し、recover_interrupted より前に取得することで
+二重起動による稼働中 Mission の誤終端を防ぐ (レビュー FC-2)。解放の
+配線は Task 19 に委ねる。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -4306,7 +5214,8 @@ EOF
     - `shutdown(self, *, drain_exc: Exception) -> None` — 新規受付停止 + queue 内の**未着手**ジョブの pending Future を `drain_exc` で例外完了させる (**ブロックしない** — 実行中ジョブの完了待ちは呼び出し側の `join()` の責務)
     - `fail_pending(self, *, exc: Exception) -> None` — supervisor スレッド死亡時に watchdog (Task 19) が呼ぶ想定。queue 内の pending Future を `exc` で例外完了させる (`shutdown` と同じ内部実装を共有してよい)
     - `join(self, timeout: float | None = None) -> None` / `is_alive(self) -> bool`
-    - `heartbeat: float` — `time.monotonic()` 由来の生存確認用属性 (ジョブ待ちループのたびに更新。watchdog (Task 19) が鮮度監視に使う)
+    - `heartbeat: float` — `time.monotonic()` 由来の生存確認用属性 (ジョブ待ちループのたびに更新。**加えて (裁定書 F-3 / CR-1) `_dispatch` 実行中も内部の heartbeat ポンプ daemon スレッドが `heartbeat_pump_interval_sec` 間隔で touch し続ける** — trade+reflection 連鎖が数百秒に及んでも watchdog (Task 19) の `heartbeat_grace_sec` を誤って超過しない。watchdog (Task 19) が鮮度監視に使う)
+    - `busy_since: float | None` — **(裁定書 F-3 / CR-1 advisor 指摘反映)** dispatch 開始時刻 (`time.monotonic()`)。非 busy 時は `None`。heartbeat ポンプ単体は「supervisor スレッドが生きている」ことしか示さず `_dispatch` 内部の genuine なデッドロックを見逃す (fail-open の穴) ため、Task 19 watchdog は `busy_since` と設定由来の上限 (`dispatch_ceiling_sec`) を突き合わせる独立した第二の軸でハングを検出する
   - `Scheduler.on_trade_mission: Callable[[str], bool]` — **戻り値の型が `None` → `bool` に変わる** (`True` = supervisor が受理、`False` = busy で拒否)。`tick()` の呼び出し側 (210-217 行) は戻り値を見て `reason == "cron"` かつ `True` のときだけ `_last_cron_trade` を前進させる (設計書 §3.3「cron の意味論」— busy 拒否は締切を維持し次 tick 以降で必ず再試行される)
   - `App.supervisor: MissionSupervisor` / `App.conn_supervisor: object` (新設フィールド。後者は Task 15 の commit-pre 相が使う読取専用の lock 外接続 — 本 task では構築するだけで未使用)
 
@@ -4418,6 +5327,46 @@ def test_shutdown_fails_pending_future_without_blocking():
 
     release.set()
     f1.result(timeout=2.0)  # 実行中ジョブは通常どおり完了する
+
+
+def test_heartbeat_is_touched_during_long_dispatch():
+    """裁定書 F-3 (CR-1) の回帰ピン: _dispatch が長時間ブロックしている
+    間も heartbeat が touch され続ける (while ループ先頭だけでは更新
+    されない — watchdog の heartbeat_grace_sec 誤検知を防ぐ)。real-sleep
+    予算内に収めるため pump 間隔を 0.05s に短縮して注入する。"""
+    release = threading.Event()
+    sup = MissionSupervisor(trade_fn=_blocking_trade_fn(release),
+                            reflection_fn=lambda: 0, ask_fn=lambda q: q,
+                            heartbeat_pump_interval_sec=0.05)
+    sup.start()
+    sup.try_submit("trade", trigger="cron")
+    time.sleep(0.02)
+    hb_before = sup.heartbeat
+    time.sleep(0.2)  # dispatch はまだ release 待ちでブロック中
+    hb_during = sup.heartbeat
+    assert hb_during > hb_before  # ポンプが touch している
+
+    release.set()
+
+
+def test_busy_since_is_set_during_dispatch_and_cleared_after():
+    """裁定書 F-3 (CR-1) advisor 指摘反映の回帰ピン: busy_since は
+    dispatch 開始時に time.monotonic() を持ち、完了後は None に戻る —
+    Task 19 watchdog の dispatch_ceiling_sec 判定の入力になる。"""
+    release = threading.Event()
+    sup = MissionSupervisor(trade_fn=_blocking_trade_fn(release),
+                            reflection_fn=lambda: 0, ask_fn=lambda q: q)
+    assert sup.busy_since is None
+    sup.start()
+    f1 = sup.try_submit("trade", trigger="cron")
+    time.sleep(0.05)
+    assert sup.busy_since is not None
+    assert sup.busy_since <= time.monotonic()
+
+    release.set()
+    f1.result(timeout=2.0)
+    time.sleep(0.05)  # finally 節が busy_since=None を反映するまで
+    assert sup.busy_since is None
 ```
 
 - [ ] **Step 2: テスト実行して FAIL を確認**
@@ -4455,10 +5404,15 @@ _log = logging.getLogger("agentic_fx.supervisor")
 class MissionSupervisor:
     def __init__(self, *, trade_fn: Callable[[str], object],
                 reflection_fn: Callable[[], object],
-                ask_fn: Callable[[str], str]) -> None:
+                ask_fn: Callable[[str], str],
+                heartbeat_pump_interval_sec: float = _HEARTBEAT_PUMP_INTERVAL_SEC,
+                ) -> None:
         self._trade_fn = trade_fn
         self._reflection_fn = reflection_fn
         self._ask_fn = ask_fn
+        # 裁定書 F-3 (CR-1): テストが real-sleep 予算 (数秒以内) を守れる
+        # よう、pump 間隔を注入可能にする (既定は本番用の定数)。
+        self._heartbeat_pump_interval_sec = heartbeat_pump_interval_sec
         self._lock = threading.Lock()
         self._busy = False
         self._queue: "queue.Queue[tuple[str, dict, Future] | None]" = \
@@ -4466,6 +5420,16 @@ class MissionSupervisor:
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self.heartbeat: float = time.monotonic()
+        # 裁定書 F-3 (CR-1) advisor 指摘反映: heartbeat ポンプは
+        # 「supervisor スレッドが生きている」ことしか示さず、_dispatch が
+        # 呼ぶ先 (broker.submit 等) が真にデッドロックした場合はポンプが
+        # 動き続けてしまい heartbeat だけでは検出できない (fail-open の
+        # 穴)。`busy_since` (dispatch 開始時刻、非 busy 時は None) を
+        # 別属性として公開し、Task 19 watchdog がこれと設定由来の上限
+        # (dispatch_ceiling_sec) を突き合わせて「heartbeat は新鮮だが
+        # dispatch が上限を超えて戻ってこない」を独立に検出できるように
+        # する (heartbeat 鮮度チェックと busy_since 上限チェックは別軸)。
+        self.busy_since: float | None = None
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -4521,6 +5485,19 @@ class MissionSupervisor:
             if item is None:
                 continue
             kind, kwargs, future = item
+            # レビュー反映1回目 (裁定書 F-3 / CR-1): _dispatch は trade+
+            # reflection 連鎖で数百秒に及びうる (mission.timeout_sec +
+            # worker_grace_sec を trade/reflection 各回で消費しうる) —
+            # while ループ先頭でしか heartbeat を touch しないと、watchdog
+            # の heartbeat_grace_sec (Task 19) を通常の Mission サイクル
+            # だけで超過し、誤って fatal 判定される。dispatch 実行中も
+            # 別スレッドで heartbeat を touch し続ける「ポンプ」を回す。
+            pump_stop = threading.Event()
+            pump = threading.Thread(
+                target=self._pump_heartbeat, args=(pump_stop,),
+                daemon=True, name="afx-supervisor-heartbeat-pump")
+            pump.start()
+            self.busy_since = time.monotonic()
             try:
                 result = self._dispatch(kind, kwargs)
                 if not future.cancelled():
@@ -4530,8 +5507,33 @@ class MissionSupervisor:
                 if not future.cancelled():
                     future.set_exception(e)
             finally:
+                pump_stop.set()
+                pump.join(timeout=1.0)
+                self.busy_since = None
                 with self._lock:
                     self._busy = False
+
+    def _pump_heartbeat(self, stop: threading.Event) -> None:
+        """裁定書 F-3 (CR-1): `_dispatch` 実行中も `heartbeat` を
+        `_HEARTBEAT_PUMP_INTERVAL_SEC` 間隔で touch し続ける。
+
+        **このポンプ単体は fail-open の穴を持つ**: `pump.daemon=True` の
+        スレッドは `_run` の親スレッド (supervisor スレッド) の生死とは
+        独立に走り続けるため、`_dispatch` 内部 (`trade_fn`/`reflection_fn`
+        が呼ぶ broker.submit・DB 書込等) が genuine にデッドロックしても
+        ポンプは `heartbeat` を touch し続けてしまい、`heartbeat` の鮮度
+        だけを見る監視では検出できない。**したがってこのポンプは
+        `heartbeat_grace_sec` (Task 19) を小さく保つためだけに存在し、
+        「supervisor が壊れていないか」の判定は `heartbeat` 鮮度チェック
+        単独では完結させない** — Task 19 watchdog は `busy_since`
+        (dispatch 開始時刻) と設定由来の `dispatch_ceiling_sec` を突き合わせる
+        **独立した第二の軸**で「heartbeat は新鮮だが dispatch が上限を
+        超えて戻ってこない」を検出する (Task 19 参照)。この 2 軸の組合せ
+        で初めて「grace は Mission 所要時間に非依存」かつ「回復不能な
+        ハングは必ず検出される」の両方が成立する。
+        """
+        while not stop.wait(self._heartbeat_pump_interval_sec):
+            self.heartbeat = time.monotonic()
 
     def _dispatch(self, kind: str, kwargs: dict) -> object:
         if kind == "trade":
@@ -4542,6 +5544,14 @@ class MissionSupervisor:
         if kind == "ask":
             return self._ask_fn(kwargs["question"])
         raise ValueError(f"unknown job kind: {kind!r}")
+```
+
+モジュール冒頭の定数群 (`_log = logging.getLogger(...)` の直後) に追加する:
+
+```python
+# 裁定書 F-3 (CR-1): heartbeat ポンプの touch 間隔。Task 19 の
+# heartbeat_grace_sec はこの値に対してのみ余裕 (目安 6 倍程度) を見ればよい。
+_HEARTBEAT_PUMP_INTERVAL_SEC = 5.0
 ```
 
 - [ ] **Step 4: テスト実行して PASS を確認**
@@ -4678,13 +5688,20 @@ class _SupervisorAsk:
                         activity=activity, log_dir=root / "logs", clock=clock)
 ```
 
-`build_app` 内、`conn_shell = connect(root / "data" / "agentic.db")` (266 行) の直後に以下を追加する (Task 15 の commit-pre 相が使う lock 外の読取専用接続 — 本 task では変数を用意するだけで未使用。**独立した名前付きローカル変数として定義する** — `App(...)` の kwargs に直接 `connect(...)` を書かないこと。Task 15 が `TradeLoop(...)` 構築時にこの変数をそのまま参照するため):
+`build_app` 内、`conn_shell = connect(root / "data" / "agentic.db")` (266 行) の直後に以下を追加する (Task 15 の commit-pre 相が使う lock 外の読取専用接続 — 本 task では変数を用意するだけで未使用。**独立した名前付きローカル変数として定義する** — `App(...)` の kwargs に直接 `connect_readonly(...)` を書かないこと。Task 15 が `TradeLoop(...)` 構築時にこの変数をそのまま参照するため)。
+
+**(レビュー反映 1 回目 — 裁定書 F-7 / IM-1 / P8-02)**: Global Constraints は `conn_supervisor` を「読取専用接続」と規定するが、当初案は通常の書込可能 `connect(...)` を使っていた — 文書上の性質がコードで強制されない。Task 5 で新設した `db.connect_readonly` (URI `mode=ro`) を使う (`query_only` PRAGMA ではなく真の RO 接続 — 設計書 §3.4 と同一契約):
 
 ```python
-    # プラン 8 (Task 13): commit-pre 相 (lock 外) が使う読取専用の
-    # lock 外接続。core_lock は取らない (Task 15 で使用開始)。
-    conn_supervisor = connect(root / "data" / "agentic.db")
+    # プラン 8 (Task 13, レビュー反映1回目 IM-1/P8-02): commit-pre 相
+    # (lock 外) が使う読取専用の lock 外接続。core_lock は取らない
+    # (Task 15 で使用開始)。Global Constraints「読取専用接続」の性質を
+    # connect_readonly (URI mode=ro) で構造的に強制する — query_only
+    # PRAGMA は使わない (プロセス内の別接続からは無効化されうるため)。
+    conn_supervisor = connect_readonly(root / "data" / "agentic.db")
 ```
+
+`build_app` の import 節に `from agentic_fx.store.db import connect, connect_readonly, init_db` (既存の `connect, init_db` に `connect_readonly` を追加) を確認する。
 
 `build_app` の `App(...)` 構築 (415-422 行) に `supervisor=supervisor, conn_supervisor=conn_supervisor` を追加する。`App` dataclass (183-206 行) に `supervisor: object` / `conn_supervisor: object` フィールドを追加する。
 
@@ -4706,11 +5723,32 @@ uv run pytest -q
 
 Expected: 全件 PASS。**注意**: `tests/test_service_app.py`/`tests/loops/` 等で `_LockedAsk` を直接 import/参照しているテストがあれば `grep -rn "_LockedAsk" tests/` で洗い出し、`_SupervisorAsk` へ更新する。`Commands.trade_loop` (実体は `_SupervisorAsk`/`_LockedAsk`) の型を直接 assert しているテストがあれば同様に更新する。
 
+**(レビュー反映 1 回目 — 裁定書 F-7 / IM-1 / P8-02) `tests/test_service_app.py` に追加**:
+
+```python
+def test_conn_supervisor_is_readonly(tmp_path):
+    """Global Constraints: conn_supervisor は読取専用接続でなければ
+    ならない (IM-1/P8-02) — 書込は OperationalError になる。"""
+    app = build_app(tmp_path)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            app.conn_supervisor.execute(
+                "INSERT INTO missions(loop, runner, model, status, "
+                "started_at) VALUES ('trade', 'local', 'x', 'running', 'x')")
+    finally:
+        app.close()
+```
+
+（`sqlite3` の import が無ければファイル冒頭に追加する。`missions` は `store/db.py` の既存スキーマ — 書込を試みる対象テーブルは既存の任意のテーブルでよい。）
+
 - [ ] **Step 11: 変異テスト**
 
 1. `MissionSupervisor.try_submit` の `if self._busy:` チェックを削除 → `test_try_submit_rejects_when_busy` が red (2 つの trade job が両方受理されてしまう)
 2. `_dispatch` の `reflection_result = self._reflection_fn()` 相当行 (`self._reflection_fn()` 呼び出し) を削除 → `test_trade_job_chains_reflection_after` が red
 3. `scheduler.py` の `if accepted and reason == "cron":` を `if reason == "cron":` に戻す (busy でも前進させる) → `test_cron_deadline_only_advances_when_on_trade_mission_returns_true` が red
+4. **(裁定書 F-7 追加)** `conn_supervisor = connect_readonly(...)` を `connect(...)` に戻す → `test_conn_supervisor_is_readonly` が red (書込が成功してしまう)
+5. **(裁定書 F-3 追加)** `_run` の heartbeat ポンプ起動 (`pump.start()`) をコメントアウトする → `test_heartbeat_is_touched_during_long_dispatch` が red (`hb_during == hb_before`)
+6. **(裁定書 F-3 advisor 指摘反映 追加)** `self.busy_since = time.monotonic()` の行を削除する → `test_busy_since_is_set_during_dispatch_and_cleared_after` が red (`sup.busy_since is None` のまま)
 
 - [ ] **Step 12: Commit**
 
@@ -4723,6 +5761,15 @@ feat: mission supervisor スケルトン (容量1 try_submit + trade/reflection�
 設計書 §3.3。lock の保持範囲は変えず (Task 15/16 で再設計)、Mission
 呼び出しの主体を scheduler スレッドから専用の supervisor スレッドへ移す。
 
+レビュー反映1回目 (裁定書 F-7 / IM-1 / P8-02): conn_supervisor を
+connect_readonly (URI mode=ro) で構築し、Global Constraints の
+「読取専用接続」をコードで強制する。
+
+レビュー反映1回目 (裁定書 F-3 / CR-1): _dispatch 実行中 (trade+
+reflection 連鎖で数百秒に及びうる) も heartbeat を touch し続ける
+daemon ポンプスレッドを追加し、Task 19 watchdog の heartbeat_grace_sec
+誤検知 (通常サイクルでサービス全体が自己停止する) を防ぐ。
+
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
 )"
@@ -4733,10 +5780,12 @@ EOF
 
 設計書 §3.1「commit の 3 小相分割」と §12 申し送り①「N4-2」を実装する。**`handle_intent`/`_open`/`open_risk_and_notional` は完全に不変のまま残す** — バックテストエンジン (`backtest/runner.py:248`) と既存の `tests/core/test_executor.py` (数十本) が `handle_intent` を直接呼ぶ唯一の経路として使い続けるため。新設する `open_from_snapshot` はこれと**並行する別経路** (Task 15 で TradeLoop の Mission 経路だけが使う)。判定ロジック (`evaluate(intent, ctx, settings.risk)` 以降) は両経路で**完全に同一の共有コード**を通す (Global Constraints: risk_gate/kill_switch は diff ゼロ、executor は I/O 位置のみ移動)。
 
-**スコープ決定 (writing-plans)**: 設計書 §3.1 の commit-pre 記述 (「Risk Gate/執行に要る全外部取得: 執行用 quote + instrument spec + 全 exposure 通貨の換算レート」) は文言上 **OPEN 経路**を指す。本 task は OPEN のみをスナップショット化する。CLOSE (`_close`) の `quote_fn` 呼び出しは各データソースが既に個別の timeout (`sources.py` の `httpx.get(..., timeout=10〜30)`) を持ち、OPEN 経路のような複数通貨を跨ぐ順次換算 (ハングの複利化) が無いため相対的にリスクが小さい — 本プランでは CLOSE/CANCEL の commit-core 内 I/O は変更しない (現状維持、退行ではない)。CANCEL は外部 I/O を持たない (`broker.cancel` は DB 状態変更のみ)。
+**スコープ決定 (レビュー反映 1 回目 — 裁定書 F-1 / CR-2 / P8-01)**: 執筆者の当初の独自裁定「snapshot API は OPEN のみ (CLOSE は各データソースの個別 timeout があるため相対的にリスクが小さい)」は**破棄する**。根拠が既定構成と食い違っていた — 実ファイル `sources.py` の `yf_quote`/`yf_bars` は `yfinance.download(...)` を **timeout 引数無し**で呼び (`mt5_quote`/`td_quote` の `timeout=10` と異なる)、`config/settings.yaml.example` の既定値は `yfinance.enabled: true` / `mt5.enabled: false` / `twelvedata.enabled: false` — **既定構成では yfinance が唯一有効な quote ソース**であり timeout が効かない。さらに `close_order` は `resolve_close_rate` 経由で `rate_fn` (換算レート取得、こちらも外部 I/O) も呼ぶため、CLOSE の未対策範囲は quote だけでなく換算レートにも及ぶ。設計書 §3.1 の commit-pre 契約 (Risk Gate/執行に要る全外部取得を lock 外で終える) は OPEN/CLOSE を区別しておらず、これが正である。
+
+**本 task で CLOSE 用スナップショット API も追加する** (CANCEL は `broker.cancel` が DB 状態変更のみで外部 I/O を持たないため対象外・現状維持)。`Executor.close_order` (scheduler の SL/TP・day rollover 等が使う既存の lock 保持中 I/O 込み経路) 自体は**変更しない** — scheduler tick はもともと tick 全体で `core_lock` を保持する設計であり、この経路の I/O 位置移動は本 task のスコープ外 (CR-2/P8-01 が問題にしているのは Mission の commit-core からの呼び出しのみ)。`close_order` の「broker 成功後の pnl 計算・DB 遷移・activity 記録」部分を `_finish_close`/`_close_unknown` として抽出し、新設する `close_order_from_snapshot` (commit-core 専用、外部 I/O 不要) と共有させることで、判定・記録ロジックを 1 箇所に保ち diff ゼロに近い形で分岐させる。
 
 **Files:**
-- Modify: `src/agentic_fx/core/executor.py` (`_open` の末尾を `_evaluate_and_execute_open` へ抽出、`open_risk_and_notional_from_snapshot`/`ExecutionSnapshot`/`SnapshotCoverageError`/`gather_open_snapshot`/`open_from_snapshot` 新設)
+- Modify: `src/agentic_fx/core/executor.py` (`_open` の末尾を `_evaluate_and_execute_open` へ抽出、`open_risk_and_notional_from_snapshot`/`ExecutionSnapshot`/`SnapshotCoverageError`/`gather_open_snapshot`/`open_from_snapshot` 新設。**追加 (裁定書 F-1): `close_order` の broker 成功後処理を `_finish_close`/`_close_unknown` へ抽出、`CloseSnapshot`/`gather_close_snapshot`/`close_order_from_snapshot` 新設**)
 - Test: `tests/core/test_executor_snapshot.py` (新規)
 
 **Interfaces:**
@@ -4747,6 +5796,10 @@ EOF
   - `executor.open_risk_and_notional_from_snapshot(conn, risk, snapshot: ExecutionSnapshot) -> tuple[float, float, int]` — `open_risk_and_notional` の DB-only 版。exposure 行の pair/通貨がスナップショットに無ければ `SnapshotCoverageError`
   - `Executor.open_from_snapshot(self, intent: TradeIntent, iid: int, snapshot: ExecutionSnapshot, *, max_snapshot_age_sec: float) -> dict` — **commit-core 専用、core_lock 保持中に呼ぶ**。①鮮度再検証 (`now - snapshot.captured_at > max_snapshot_age_sec` なら発注拒否、lock 内での再取得はしない) ②DB 状態読み直し (account/daily_start_equity/has_unresolved_unknown) ③`open_risk_and_notional_from_snapshot` (N4-2: `SnapshotCoverageError` も発注拒否) ④`GateContext` 確定 → `_evaluate_and_execute_open` へ委譲 (判定・執行ロジックは `_open` と完全共有)
   - `Executor._evaluate_and_execute_open(self, intent: TradeIntent, iid: int, ctx: GateContext) -> dict` (private — `_open`/`open_from_snapshot` の共有末尾。既存 `_open` の `result = evaluate(...)` 以降を**逐語**移動しただけで判定ロジックは 1 文字も変えない)
+  - **(裁定書 F-1 / CR-2 / P8-01 追加)** `executor.CloseSnapshot` (frozen dataclass): `price: float, spec: InstrumentSpec, rate: ConversionRate | None, rate_degraded: bool, captured_at: datetime`
+  - `Executor.gather_close_snapshot(self, row: dict) -> CloseSnapshot` — **commit-pre 専用、core_lock 非保持で呼ぶ**。`row` は呼び出し元 (Task 15) が `conn_supervisor` (lock 外の読取専用接続) から読んだ現在の order 行 (`pair`/`direction` を参照するだけ)。`quote_fn`(成行価格) → `spec_fn` → `resolve_close_rate`(`rate_fn` 経由) を 1 回で完了させる
+  - `Executor.close_order_from_snapshot(self, row: dict, snapshot: CloseSnapshot, reason: str) -> OrderStatus` — `close_order` の commit-core 専用版。`spec_fn`/`resolve_close_rate` を一切呼ばない。`broker.close`(paper broker=DB書込、外部 I/O ではない) と DB 遷移のみ commit-core で行う。`_finish_close`/`_close_unknown` を `close_order` と共有 (判定・記録ロジック不変 — I/O 位置のみ移動)
+  - `Executor._finish_close(self, row, price, contract_size, rate, degraded, reason, now) -> OrderStatus` / `Executor._close_unknown(self, row, now) -> OrderStatus` (private — `close_order`/`close_order_from_snapshot` の共有末尾。既存 `close_order` の broker 成功後処理を**逐語**移動しただけで判定ロジックは 1 文字も変えない)
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -4843,9 +5896,99 @@ def test_open_risk_and_notional_from_snapshot_raises_on_uncovered_pair(tmp_path)
         captured_at=datetime(2026, 8, 4, tzinfo=timezone.utc))
     with pytest.raises(SnapshotCoverageError):
         open_risk_and_notional_from_snapshot(ex.conn, ex.settings.risk, empty_snapshot)
+
+
+# ---- CLOSE snapshot (裁定書 F-1 / CR-2 / P8-01 — 独自裁定「OPEN のみ」を
+# 破棄した反映) ---------------------------------------------------------
+
+def test_gather_close_snapshot_captures_price_spec_and_rate(tmp_path):
+    """gather_close_snapshot は quote_fn/spec_fn/resolve_close_rate を
+    1 回ずつ呼び、CloseSnapshot に price/spec/rate を確定する。"""
+    ex = _make_executor(tmp_path)
+    row = {"pair": "USDJPY", "direction": "long"}
+    snapshot = ex.gather_close_snapshot(row)
+    assert snapshot.price == ex.quote_fn("USDJPY").bid
+    assert snapshot.spec.pair == "USDJPY"
+    assert snapshot.rate is not None
+    assert snapshot.rate_degraded is False
+
+
+def test_close_order_from_snapshot_does_not_call_quote_or_rate_fn(tmp_path):
+    """裁定書 F-1 の核心: close_order_from_snapshot は quote_fn/spec_fn/
+    resolve_close_rate を一切呼ばない (commit-core は取得済み値のみ使用)。
+    blocking な quote_fn を注入し、呼ばれたら即座に検出する。"""
+    calls: list[str] = []
+
+    def blocking_quote_fn(pair):
+        calls.append("quote_fn")
+        raise AssertionError("quote_fn must not be called in commit-core")
+
+    ex = _make_executor(tmp_path, quote_fn=blocking_quote_fn)
+    row = _insert_open_order(ex.conn, pair="USDJPY")
+    # snapshot 自体は healthy な quote_fn を持つ別 Executor で取得する
+    # (commit-pre 相を模す)。close_order_from_snapshot だけを、
+    # quote_fn が呼ばれたら AssertionError を送出する ex (commit-core 相
+    # を模す) に対して呼び、外部取得が一切発生しないことを確認する。
+    healthy_ex = _make_executor(tmp_path)
+    snapshot = healthy_ex.gather_close_snapshot(row)
+    ex.close_order_from_snapshot(row, snapshot, reason="llm_close")
+    assert calls == []  # quote_fn (blocking_quote_fn) が一度も呼ばれていない
+
+
+def test_close_order_from_snapshot_matches_close_order_result(tmp_path):
+    """判定・記録ロジック不変の確認: 同一 price/spec/rate を使えば
+    close_order (lock保持中に自前で取得) と close_order_from_snapshot
+    (取得済みスナップショットを使用) が同じ最終状態・pnl になる。"""
+    ex1 = _make_executor(tmp_path / "a")
+    ex2 = _make_executor(tmp_path / "b")
+    row1 = _insert_open_order(ex1.conn, pair="USDJPY")
+    row2 = _insert_open_order(ex2.conn, pair="USDJPY")
+
+    final1 = ex1.close_order(row1, price=ex1.quote_fn("USDJPY").bid,
+                             reason="llm_close")
+    snapshot = ex2.gather_close_snapshot(row2)
+    final2 = ex2.close_order_from_snapshot(row2, snapshot, reason="llm_close")
+
+    assert final1 == final2 == S.CLOSED
+    pnl1 = ex1.conn.execute(
+        "SELECT realized_pnl FROM orders WHERE id=?", (row1["id"],)).fetchone()[0]
+    pnl2 = ex2.conn.execute(
+        "SELECT realized_pnl FROM orders WHERE id=?", (row2["id"],)).fetchone()[0]
+    assert pnl1 == pnl2
+
+
+def test_close_from_snapshot_rejects_stale_snapshot(tmp_path):
+    ex = _make_executor(tmp_path)
+    row = _insert_open_order(ex.conn, pair="USDJPY")
+    mid = _start_trade_mission(ex.conn)
+    intent = _close_intent(order_id=row["id"])
+    iid = _insert_intent(ex.conn, mid, intent)
+    snapshot = ex.gather_close_snapshot(row)
+    stale = snapshot.__class__(
+        price=snapshot.price, spec=snapshot.spec, rate=snapshot.rate,
+        rate_degraded=snapshot.rate_degraded,
+        captured_at=snapshot.captured_at - timedelta(seconds=999))
+
+    out = ex.close_from_snapshot(intent, iid, stale, max_snapshot_age_sec=5.0)
+    assert out["result"] == "rejected"
+    assert "stale" in out["reasons"][0]
+
+
+def test_close_from_snapshot_rejects_when_snapshot_is_none(tmp_path):
+    """裁定書 F-1: commit-pre 時点で row が未 OPEN (snapshot 取得をスキップ)
+    だった場合、commit-core は lock 内で取得し直さず reject する。"""
+    ex = _make_executor(tmp_path)
+    row = _insert_open_order(ex.conn, pair="USDJPY")
+    mid = _start_trade_mission(ex.conn)
+    intent = _close_intent(order_id=row["id"])
+    iid = _insert_intent(ex.conn, mid, intent)
+
+    out = ex.close_from_snapshot(intent, iid, None, max_snapshot_age_sec=999.0)
+    assert out["result"] == "rejected"
+    assert "snapshot" in out["reasons"][0].lower()
 ```
 
-（`_make_executor`/`_open_intent`/`_start_trade_mission`/`_insert_intent`/`_insert_open_order` は既存 `tests/core/test_executor.py` の fixture 名・構築パターンに実装者が合わせること — 同ファイルを読んでから書く。）
+（`_make_executor`/`_open_intent`/`_close_intent`/`_start_trade_mission`/`_insert_intent`/`_insert_open_order` は既存 `tests/core/test_executor.py` の fixture 名・構築パターンに実装者が合わせること — 同ファイルを読んでから書く。`_make_executor` は `quote_fn`/`spec_fn`/`rate_fn` の差し替えを受け付けるキーワード引数を持つよう既存 fixture を拡張してよい (無ければ本 Step で拡張する)。`test_close_order_from_snapshot_does_not_call_quote_or_rate_fn` のプレースホルダ的な中間コードは実装時に削除し、`healthy_ex`/`ex` の 2 Executor パターンだけを残すこと。
 
 - [ ] **Step 2: テスト実行して FAIL を確認**
 
@@ -4856,6 +5999,8 @@ uv run pytest tests/core/test_executor_snapshot.py -q
 Expected: 全件 FAIL (`ImportError: cannot import name 'ExecutionSnapshot'`)。
 
 - [ ] **Step 3: `executor.py` を実装**
+
+import 節に `from dataclasses import dataclass` を追加する (現行 `executor.py` は `sqlite3`/`datetime`/`typing.Callable` のみ import しており `dataclass` が無い — 本 task で新設する `ExecutionSnapshot`/`SnapshotCoverageError`/`CloseSnapshot` はいずれも `@dataclass(frozen=True, slots=True)` を使うため必須)。
 
 `open_risk_and_notional` (36-64 行) の直後に追加:
 
@@ -5119,6 +6264,166 @@ def open_risk_and_notional_from_snapshot(
         return self._evaluate_and_execute_open(intent, iid, ctx)
 ```
 
+**(裁定書 F-1 / CR-2 / P8-01 追加) CLOSE 用スナップショット API を追加する**。まず既存 `close_order` (369-433 行付近) の「broker 成功後の pnl 計算・DB 遷移・activity 記録」部分を `_finish_close`/`_close_unknown` として抽出する (中身は逐語移動 — 判定・記録ロジックは 1 文字も変えない)。`close_order` 自体はこの 2 メソッドを呼ぶ形に変わるが、**scheduler が使う経路としての外部から見える挙動は完全不変** (`spec_fn`/`resolve_close_rate` は引き続き `close_order` の中で呼ぶ — scheduler tick は tick 全体で `core_lock` を保持する既存設計のままであり、本 task はここを変えない):
+
+```python
+    def _close_unknown(self, row: dict, now: datetime) -> S:
+        """close_order/close_order_from_snapshot 共有 (broker 応答が
+        'ok' でない場合の後処理)。"""
+        transitions.transition(self.conn, row["id"], S.CLOSE_UNKNOWN, now)
+        self.activity.write(Category.TRADE, "close_unknown",
+                            f"{row['pair']} — reconcile 待ち",
+                            ref_id=str(row["id"]))
+        self.notifier.send(f"[agentic-fx] クローズ結果不明 #{row['id']}")
+        return S.CLOSE_UNKNOWN
+
+    def _finish_close(self, row: dict, price: float, contract_size: float,
+                      rate: ConversionRate | None, degraded: bool,
+                      reason: str, now: datetime) -> S:
+        """close_order/close_order_from_snapshot 共有 (broker 成功後の
+        pnl 計算・DB 遷移・activity 記録 — 既存 close_order の当該部分を
+        **逐語**移動しただけで判定ロジックは 1 文字も変えない)。"""
+        pnl = compute_pnl(
+            row, price, contract_size=contract_size,
+            commission_per_lot=self.settings.risk.commission_per_lot,
+            quote_to_account_rate=rate.value) if rate is not None else None
+        transitions.transition(self.conn, row["id"], S.CLOSED, now,
+                               close_price=price, realized_pnl=pnl,
+                               closed_at=now.isoformat())
+        pnl_text = f"{pnl:.0f}" if pnl is not None else "degraded(unresolved)"
+        self.activity.write(Category.TRADE, "order_closed",
+                            f"{row['pair']} pnl={pnl_text} reason={reason}",
+                            ref_id=str(row["id"]))
+        if degraded:
+            self.activity.write(
+                Category.TRADE, "close_pnl_rate_degraded",
+                f"{row['pair']}: 換算レート取得不能 — " + (
+                    "最後の健全レートで計算 (次回同期で吸収)" if pnl is not None
+                    else "realized_pnl 未確定 (次回同期で解消)"),
+                ref_id=str(row["id"]))
+            self.notifier.send(
+                f"[agentic-fx] クローズ換算レート degraded #{row['id']}")
+        return S.CLOSED
+
+    def close_order(self, row: dict, price: float, reason: str) -> S:
+        """裁量クローズ・SL/TP・強制クローズ共通の決定論的クローズ経路
+        (scheduler の SL/TP・day rollover 等が使う — lock 保持中に自前で
+        spec_fn/resolve_close_rate を呼ぶ既存動作は不変。**snapshot 版は
+        close_order_from_snapshot** — Mission の commit-core から使う)。
+        結果不明は closed 扱いにしない (設計書 §12)。snapshot (mark-to-
+        market) は scheduler が記録する。戻り値は遷移後の状態
+        (S.CLOSED / S.CLOSE_UNKNOWN) — cancel_order と対称。"""
+        now = self.clock.now()
+        spec = self.spec_fn(row["pair"])
+        transitions.transition(self.conn, row["id"], S.CLOSING, now,
+                               close_reason=reason)
+        try:
+            br = self.broker.close(row, price, reason)
+        except Exception as e:  # noqa: BLE001 — 結果不明として扱う (codex 2)
+            br = BrokerResult(status="unknown", message=safe_error_text(e))
+        if br.status != "ok":
+            return self._close_unknown(row, now)
+        # 設計書 §5: クローズはレート欠損でも妨げない。現在レートが取れなければ
+        # 最後に健全性検証を通ったレートへ degraded フォールバックする。
+        rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
+        return self._finish_close(row, price, spec.contract_size, rate,
+                                  degraded, reason, now)
+
+    def gather_close_snapshot(self, row: dict) -> CloseSnapshot:
+        """commit-pre 相専用 (裁定書 F-1 / CR-2 / P8-01) — **core_lock
+        非保持で呼ぶこと**。CLOSE 実行に要る quote (成行価格) +
+        instrument spec + 換算レートを 1 回で取得し timestamp 付き
+        スナップショットにする。`row` は呼び出し元 (Task 15 の commit-pre
+        相) が `conn_supervisor` (lock 外の読取専用接続) から読んだ現在の
+        order 行 (`pair`/`direction` を参照するだけ)。"""
+        now = self.clock.now()
+        quote = self.quote_fn(row["pair"])
+        price = quote.bid if row["direction"] == "long" else quote.ask
+        spec = self.spec_fn(row["pair"])
+        rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
+        return CloseSnapshot(price=price, spec=spec, rate=rate,
+                             rate_degraded=degraded, captured_at=now)
+
+    def close_order_from_snapshot(self, row: dict, snapshot: CloseSnapshot,
+                                  reason: str) -> S:
+        """close_order の commit-core 専用版 (裁定書 F-1 / CR-2 / P8-01)
+        — `spec_fn`/`resolve_close_rate` を一切呼ばない (外部 I/O ゼロ)。
+        price/spec/rate は commit-pre で取得済みの `CloseSnapshot` を使う
+        (`broker.close` は paper broker の DB 書込であり外部 I/O ではない
+        ため commit-core に残す)。`_finish_close`/`_close_unknown` を
+        `close_order` と共有 — 判定・記録ロジックは `close_order` と完全
+        共有 (I/O 位置のみ移動)。"""
+        now = self.clock.now()
+        transitions.transition(self.conn, row["id"], S.CLOSING, now,
+                               close_reason=reason)
+        try:
+            br = self.broker.close(row, snapshot.price, reason)
+        except Exception as e:  # noqa: BLE001
+            br = BrokerResult(status="unknown", message=safe_error_text(e))
+        if br.status != "ok":
+            return self._close_unknown(row, now)
+        return self._finish_close(row, snapshot.price,
+                                  snapshot.spec.contract_size, snapshot.rate,
+                                  snapshot.rate_degraded, reason, now)
+
+    def close_from_snapshot(self, intent: TradeIntent, iid: int,
+                            snapshot: "CloseSnapshot | None", *,
+                            max_snapshot_age_sec: float) -> dict:
+        """commit-core 相専用 (裁定書 F-1 / CR-2 / P8-01) — **core_lock
+        保持中に呼ぶこと**。①DB 状態を読み直して row の現況を確定
+        (commit-pre 後に状態が変わっていないか確認) ②`snapshot` が None
+        (commit-pre 時点で row が OPEN でなく取得をスキップした場合、また
+        は commit-pre 後に OPEN へ遷移した稀なケース) なら lock 内で
+        取得し直さず reject する ③鮮度再検証 (lock 内での再取得はしない)
+        ④`close_order_from_snapshot` へ委譲。"""
+        now = self.clock.now()
+        row = orders.get(self.conn, intent.order_id)
+        if row is None or row["status"] != S.OPEN.value:
+            reasons = [f"order {intent.order_id} is not open"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            return {"result": "rejected", "order_id": intent.order_id,
+                    "reasons": reasons}
+        if snapshot is None:
+            reasons = [
+                "close snapshot unavailable (order was not open at "
+                "commit-pre time) — rejecting rather than re-fetching "
+                "while holding core_lock (設計書 §3.1)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            return {"result": "rejected", "order_id": intent.order_id,
+                    "reasons": reasons}
+        age_sec = (now - snapshot.captured_at).total_seconds()
+        if age_sec > max_snapshot_age_sec:
+            reasons = [
+                f"close snapshot is stale ({age_sec:.1f}s > "
+                f"{max_snapshot_age_sec}s) — rejecting rather than "
+                "re-fetching while holding core_lock (設計書 §3.1)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            return {"result": "rejected", "order_id": intent.order_id,
+                    "reasons": reasons}
+        intents_store.set_gate_result(self.conn, iid, accepted=True,
+                                      reject_reason=None)
+        final = self.close_order_from_snapshot(row, snapshot, reason="llm_close")
+        result = "closed" if final == S.CLOSED else "unknown"
+        return {"result": result, "order_id": row["id"], "reasons": []}
+```
+
+`open_risk_and_notional_from_snapshot` の直前 (`ExecutionSnapshot`/`SnapshotCoverageError` の直後) に `CloseSnapshot` を追加する:
+
+```python
+@dataclass(frozen=True, slots=True)
+class CloseSnapshot:
+    """commit-pre 相が集めた CLOSE 用の外部取得スナップショット (裁定書
+    F-1 / CR-2 / P8-01)。`captured_at` は commit-core の鮮度再検証が使う。"""
+    price: float
+    spec: InstrumentSpec
+    rate: ConversionRate | None
+    rate_degraded: bool
+    captured_at: datetime
+```
+
 - [ ] **Step 4: テスト実行して PASS を確認**
 
 ```bash
@@ -5127,13 +6432,16 @@ uv run pytest tests/core/test_executor.py -q
 uv run pytest -q
 ```
 
-Expected: 全件 PASS。**`tests/core/test_executor.py` が 1 本も壊れていないこと** (`handle_intent`/`_open` の外部から見える挙動は完全不変) を必ず確認する — 壊れていれば `_evaluate_and_execute_open` への切り出しで何かを取りこぼしている。
+Expected: 全件 PASS。**`tests/core/test_executor.py` が 1 本も壊れていないこと** (`handle_intent`/`_open`/`close_order`/`cancel_order` の外部から見える挙動は完全不変) を必ず確認する — 壊れていれば `_evaluate_and_execute_open`/`_finish_close`/`_close_unknown` への切り出しで何かを取りこぼしている。
 
 - [ ] **Step 5: 変異テスト**
 
 1. `_evaluate_and_execute_open` の `if not result.accepted:` を削除 → `tests/core/test_executor.py` の gate 却下系テストが red (`_open`/`open_from_snapshot` 両方に波及することを確認)
 2. `open_from_snapshot` の `if age_sec > max_snapshot_age_sec:` を削除 → `test_open_from_snapshot_rejects_stale_snapshot` が red
 3. `open_risk_and_notional_from_snapshot` の `if spec is None:` チェックを削除 → `test_open_from_snapshot_rejects_when_exposure_grew_after_commit_pre`/`test_open_risk_and_notional_from_snapshot_raises_on_uncovered_pair` が red
+4. **(裁定書 F-1 追加)** `close_order_from_snapshot` の `rate, degraded = self.resolve_close_rate(...)` 相当を `snapshot.rate, snapshot.rate_degraded` から `self.resolve_close_rate(row["pair"], now)` の直接呼び出しに戻す (外部 I/O を再導入する変異) → `test_close_order_from_snapshot_does_not_call_quote_or_rate_fn` が red
+5. `close_from_snapshot` の `if snapshot is None:` チェックを削除 → `test_close_from_snapshot_rejects_when_snapshot_is_none` が red (削除すると `snapshot.captured_at` で `AttributeError` になるはずが、モックの取り方次第で誤って通ってしまう場合は `snapshot=None` 時の分岐を明示的に固定するテストへ差し替える)
+6. `close_from_snapshot` の `if age_sec > max_snapshot_age_sec:` を削除 → `test_close_from_snapshot_rejects_stale_snapshot` が red
 
 - [ ] **Step 6: Commit**
 
@@ -5145,6 +6453,15 @@ feat: Executor snapshot API (commit-pre外部取得 + commit-core鮮度再検証
 設計書 §3.1 / §12 申し送り①。handle_intent/_open は完全不変のまま
 (バックテスト runner.py の既存経路)、open_from_snapshot を並行追加する。
 判定ロジックは _evaluate_and_execute_open として両経路が共有する。
+
+レビュー反映1回目 (裁定書 F-1 / CR-2 / P8-01): CLOSE 用の CloseSnapshot /
+gather_close_snapshot / close_order_from_snapshot / close_from_snapshot も
+追加。既定構成 (yfinance) では quote timeout が効かず CLOSE の外部 I/O が
+commit-core (core_lock 保持中) に残ると SL/TP 監視全体が止まるため、
+執筆者の独自裁定「snapshot API は OPEN のみ」を破棄し OPEN と同一契約で
+commit-pre スナップショット化する。close_order (scheduler 用、既存動作
+不変) と close_order_from_snapshot は _finish_close/_close_unknown を
+共有し判定・記録ロジックは 1 文字も変えない。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -5161,7 +6478,7 @@ EOF
 **Files:**
 - Modify: `src/agentic_fx/core/executor.py` (`handle_intent` を `record_and_validate_intent` + dispatch に分割、`_close`→`close_intent`/`_cancel`→`cancel_intent` の公開昇格)
 - Modify: `src/agentic_fx/loops/trade_loop.py` (全体 — 五相再構成)
-- Modify: `src/agentic_fx/service.py:359-380`(`_trade_fn`/`_ask_fn` の `with core_lock:` 除去 + `TradeLoop` construction に `core_lock`/`conn_supervisor` を渡す)
+- Modify: `src/agentic_fx/service.py:359-380`(`_trade_fn`/`_ask_fn` の `with core_lock:` 除去 + `TradeLoop` construction に `core_lock`/`conn_supervisor` を渡す。**追加 (裁定書 F-6 / CR-5): `healthcheck_provider = PriceProvider(conn_supervisor, settings, clock, readonly=True)` を新設し `TradeLoop(provider=healthcheck_provider, ...)` に渡す**)
 - Modify: `src/agentic_fx/config.py` (`WorkerSettings` に `snapshot_max_age_sec` 追加)
 - Modify: `config/settings.yaml.example` (同期)
 - Modify: `tests/loops/test_trade_loop.py:31-69` (`_loop` fixture に `core_lock`/`conn_supervisor` 追加)
@@ -5169,11 +6486,12 @@ EOF
 
 **Interfaces:**
 - Produces:
-  - `Executor.record_and_validate_intent(self, intent: TradeIntent, mission_id: int) -> tuple[int, dict | None]` — intent の DB 記録 (常に行う) + HOLD 短絡 + origin/loop 検証。`(iid, None)` なら呼び出し側が `open_from_snapshot`/`close_intent`/`cancel_intent` へ dispatch する。`(iid, result)` なら `result` がそのまま最終結果 (hold・origin_rejected・mission_rejected)。**`handle_intent` はこのメソッド + dispatch を連結しただけで挙動は完全不変** (バックテスト runner.py 経由の既存呼び出しに影響なし)
-  - `Executor.close_intent`/`Executor.cancel_intent` — 旧 `_close`/`_cancel` の公開昇格 (rename のみ、挙動不変。`handle_intent` 内の呼び出しも新名に更新)
-  - `TradeLoop.__init__(self, *, conn, runner, settings, executor, provider, econ, policy, activity, notifier, clock, watch=None, core_lock: threading.RLock, conn_supervisor: sqlite3.Connection)` — **`core_lock`/`conn_supervisor` が新設必須 kwarg**
+  - `Executor.record_and_validate_intent(self, intent: TradeIntent, mission_id: int) -> tuple[int, dict | None]` — intent の DB 記録 (常に行う) + HOLD 短絡 + origin/loop 検証。`(iid, None)` なら呼び出し側が `open_from_snapshot`/`close_from_snapshot`/`cancel_intent` へ dispatch する。`(iid, result)` なら `result` がそのまま最終結果 (hold・origin_rejected・mission_rejected)。**`handle_intent` はこのメソッド + dispatch を連結しただけで挙動は完全不変** (バックテスト runner.py 経由の既存呼び出しに影響なし)
+  - `Executor.close_intent`/`Executor.cancel_intent` — 旧 `_close`/`_cancel` の公開昇格 (rename のみ、挙動不変。`handle_intent` 内の呼び出しも新名に更新)。**`close_from_snapshot`/`gather_close_snapshot`/`close_order_from_snapshot` は Task 14 で追加済み — 本 task は TradeLoop からこれらを呼ぶ配線のみ行う**
+  - `TradeLoop.__init__(self, *, conn, runner, settings, executor, provider, econ, policy, activity, notifier, clock, watch=None, core_lock: threading.RLock, conn_supervisor: sqlite3.Connection)` — **`core_lock`/`conn_supervisor` が新設必須 kwarg**。**(裁定書 F-6 / CR-5) `provider` は呼び出し元が `conn_supervisor` (RO) で構築した `PriceProvider(readonly=True)` を渡すこと** — `TradeLoop` 内部で `self.provider` を使うのは lock 外の `healthcheck` 呼び出しだけであり、書込可能な `conn_core` 版を渡すと healthcheck 内の `get_bars`→`upsert_bars` が無保護で `conn_core` を書き込む (Global Constraints 違反)
   - `TradeLoop._finalize_mission(self, mid: int, result: MissionResult) -> None` — **呼び出し元が `core_lock` を保持している前提**。`missions.finish` の CAS 化された呼び出し (書き込み例外は fail closed、CAS 失敗 = 二重終端は警告のみ)
   - `TradeLoop._read_exposure_pairs(self) -> list[str]` — commit-pre 専用。`conn_supervisor` (lock 外) から既存 exposure (`executor._EXPOSURE` の全状態) の pair 一覧を読む
+  - `TradeLoop._read_close_row(self, order_id: int) -> dict | None` — **(裁定書 F-1 / CR-2 追加)** commit-pre 専用。`conn_supervisor` (lock 外) から CLOSE 対象の order 行を読む (`gather_close_snapshot` の入力)
 
 - [ ] **Step 1: 失敗するテストを書く (lock 境界の直接検証)**
 
@@ -5336,7 +6654,7 @@ Expected: FAIL (`TypeError: TradeLoop.__init__() missing ... 'core_lock'` 等 �
 
 - [ ] **Step 5: `trade_loop.py` を五相再構成**
 
-`src/agentic_fx/loops/trade_loop.py` の import 節に `import threading` と `import sqlite3` (既存) を確認し、`from agentic_fx.core.contracts import Action` を追加する (`Action.OPEN`/`Action.CLOSE` の分岐に使う — 既存 import は `IntentParseError, Origin, TradeIntent` のみなので `Action` を足す)。
+`src/agentic_fx/loops/trade_loop.py` の import 節に `import threading` と `import sqlite3` (既存) を確認し、`from agentic_fx.core.contracts import Action, OrderStatus as S` を追加する (既存 import は `Clock, IntentParseError, Origin, TradeIntent` のみなので `Action`/`OrderStatus as S` を足す — `Action.OPEN`/`Action.CLOSE` の分岐、および裁定書 F-1 (CR-2) の commit-pre CLOSE 分岐が `row["status"] == S.OPEN.value` を参照するために両方必要)。
 
 `TradeLoop.__init__` (42-58 行) を以下に変更する:
 
@@ -5375,7 +6693,12 @@ class TradeLoop:
         consume・Risk Gate・執行・finish) → commit-post (lock 非保持:
         aggregate 記録)。`healthcheck` は prepare よりさらに前 (lock 外)
         — claim 済みで healthcheck 死亡 → requeue 漏れ、を構造的に防ぐ
-        (既存の設計方針を維持)。
+        (既存の設計方針を維持)。**(裁定書 F-6 / CR-5) `self.provider` は
+        `conn_supervisor` (RO 接続) で構築した `readonly=True` の
+        `PriceProvider` — `healthcheck` 内部の `get_bars` が呼ぶ
+        `ohlcv.upsert_bars` は `readonly=True` によりスキップされるため、
+        lock 外のこの呼び出しが `conn_core` を無保護で書き込むことはない
+        (Global Constraints 違反の解消)。**
         """
         try:
             self.provider.healthcheck(self.settings.pairs[0])
@@ -5454,17 +6777,32 @@ class TradeLoop:
                                     str(e), ref_id=str(mid))
                 return None
 
-            snapshot = None
+            open_snapshot = None
+            close_snapshot = None
             snapshot_error: Exception | None = None
             if intent.action is Action.OPEN:
                 exposure_pairs = self._read_exposure_pairs()
                 try:
-                    snapshot = self.executor.gather_open_snapshot(
+                    open_snapshot = self.executor.gather_open_snapshot(
                         intent, exposure_pairs=exposure_pairs)
                 except Exception as e:  # noqa: BLE001 — commit-core で
                     # 執行失敗として扱う (fail closed、consume より前に
                     # 確定させておき commit-core 側の分岐を単純にする)。
                     snapshot_error = e
+            elif intent.action is Action.CLOSE:
+                # 裁定書 F-1 (CR-2/P8-01): CLOSE の quote/spec/close-rate も
+                # commit-pre (lock 非保持) で取得する。row が commit-pre
+                # 時点で OPEN でなければ snapshot 取得自体をスキップし
+                # (無駄な外部 I/O を避ける)、commit-core の
+                # close_from_snapshot が fresh な状態を読み直して reject
+                # する (snapshot=None のときの契約 — lock 内では取得し
+                # 直さない)。
+                row = self._read_close_row(intent.order_id)
+                if row is not None and row["status"] == S.OPEN.value:
+                    try:
+                        close_snapshot = self.executor.gather_close_snapshot(row)
+                    except Exception as e:  # noqa: BLE001
+                        snapshot_error = e
 
             # ---- commit-core (core_lock 保持) ----
             with self._core_lock:
@@ -5485,10 +6823,12 @@ class TradeLoop:
                         out = early
                     elif intent.action is Action.OPEN:
                         out = self.executor.open_from_snapshot(
-                            intent, iid, snapshot,
+                            intent, iid, open_snapshot,
                             max_snapshot_age_sec=self.settings.worker.snapshot_max_age_sec)
                     elif intent.action is Action.CLOSE:
-                        out = self.executor.close_intent(intent, iid)
+                        out = self.executor.close_from_snapshot(
+                            intent, iid, close_snapshot,
+                            max_snapshot_age_sec=self.settings.worker.snapshot_max_age_sec)
                     else:
                         out = self.executor.cancel_intent(intent, iid)
                 except Exception as e:  # noqa: BLE001
@@ -5510,8 +6850,14 @@ class TradeLoop:
         finally:
             # 例外時も claimed のまま残さない (lease 回収を待たず即 requeue)。
             # consume 済みならここでは何もしない (二重発注ハザードを避ける)。
+            # 裁定書 F-6 (CR-5): _requeue_signal は signals.requeue 経由で
+            # conn_core を書き込むため、core_lock を保持中に呼ぶ (Global
+            # Constraints 違反の解消 — この finally はメソッド全体の
+            # try に対するものであり、commit-core の with ブロックは
+            # 例外伝播時点で既に解放済みなので RLock の再取得は安全)。
             if claimed is not None and not consumed:
-                self._requeue_signal(claimed)
+                with self._core_lock:
+                    self._requeue_signal(claimed)
 
     def _finalize_mission(self, mid: int, result: MissionResult) -> None:
         """missions.finish の CAS 化された呼び出し (**core_lock 保持中に
@@ -5546,6 +6892,15 @@ class TradeLoop:
         from agentic_fx.store import orders as orders_store
         rows = orders_store.list_by_status(self._conn_supervisor, *_EXPOSURE)
         return sorted({r["pair"] for r in rows})
+
+    def _read_close_row(self, order_id: int) -> dict | None:
+        """commit-pre 専用 (裁定書 F-1 / CR-2): `conn_supervisor` (lock 外の
+        読取専用接続) から CLOSE 対象の order 行を読む。`gather_close_snapshot`
+        の入力にするだけで、commit-core は改めて `self.conn` (conn_core) から
+        読み直す (commit-pre 後に状態が変わっていないかの再確認 — 設計書
+        §3.1 の鮮度契約と同じ精神)。"""
+        from agentic_fx.store import orders as orders_store
+        return orders_store.get(self._conn_supervisor, order_id)
 ```
 
 **実装者への注意**: `_build_mission`/`_format_signal_injection`/`_requeue_signal`/`_build_prompt`/`_safe_report_boundary_failure` (192-320 行付近の残りのメソッド群) は無変更のため掲載を省略する — 削除しないこと。`_run_recorded` メソッド (260-297 行) は本 task で `_finalize_mission` に置き換わり、`_run_once_impl`/`_ask_once_impl` (次 Step) の両方が独自に run+commit の相を持つため**削除する** (どこからも呼ばれなくなることを `grep -n "_run_recorded" src/agentic_fx/loops/trade_loop.py` で確認する)。
@@ -5655,18 +7010,108 @@ Expected: 全件 PASS。
         return trade_loop.ask_once(question)
 ```
 
-`TradeLoop(...)` の構築 (348-352 行) に `core_lock=core_lock, conn_supervisor=conn_supervisor` を追加する (`conn_supervisor` は Task 13 で `App`/`build_app` に既に構築済み):
+`TradeLoop(...)` の構築 (348-352 行) に `core_lock=core_lock, conn_supervisor=conn_supervisor` を追加する (`conn_supervisor` は Task 13 で `App`/`build_app` に既に構築済み)。**(裁定書 F-6 / CR-5) `provider=provider` (書込可能な `conn_core` 版) を渡していた箇所を、`conn_supervisor` (RO) で構築した専用の `healthcheck_provider` に差し替える** — `provider` 変数自体は `market_tools.build(provider, ...)` (`_assert_tools_registered` の起動時検証用) や `Executor(quote_fn=...)` の束縛元として他所で使われ続けるため無変更のまま残し、`TradeLoop` にだけ別インスタンスを渡す (`TradeLoop.provider` は healthcheck 専用でこれ以外に使われないため、この差し替えの影響範囲は healthcheck だけに閉じる):
 
 ```python
+    # プラン 8 (Task 15, レビュー反映1回目 裁定書 F-6/CR-5): TradeLoop の
+    # provider は healthcheck 専用 (lock 外で呼ばれる) — 書込可能な
+    # conn_core 版を渡すと healthcheck 内の get_bars が無保護で conn_core
+    # を書き込む (Global Constraints 違反)。conn_supervisor (RO) +
+    # readonly=True で構築した専用インスタンスを渡す。
+    # 注意: readonly=True のため healthcheck はもう ohlcv キャッシュを
+    # 温めない (get_bars/derive の upsert_bars がスキップされる) —
+    # これは意図した挙動であり退行ではない。CR-4 と同じ理由でキャッシュの
+    # 一次的な書き手は scheduler tick (mark-to-market 等、既存の conn_core
+    # 版 provider) であり続けるため、healthcheck が書かなくてもキャッシュ
+    # 鮮度は保たれる。
+    healthcheck_provider = PriceProvider(conn_supervisor, settings, clock,
+                                         readonly=True)
     trade_loop = TradeLoop(conn=conn_core, runner=runner, settings=settings,
-                           executor=executor, provider=provider, econ=econ,
-                           policy=policy, activity=activity,
+                           executor=executor, provider=healthcheck_provider,
+                           econ=econ, policy=policy, activity=activity,
                            notifier=notifier, clock=clock,
                            core_lock=core_lock, conn_supervisor=conn_supervisor,
                            watch=mission_watch)
 ```
 
-**注意**: `conn_supervisor`/`core_lock` は `build_app` 内で `trade_loop = TradeLoop(...)` より**前**に定義されている必要がある。`conn_supervisor` は Task 13 で `conn_shell` 構築の直後 (かなり早い位置) に新設済みのため既に条件を満たすが、`core_lock = threading.RLock()` は既存コードで 357 行目 (= `trade_loop = TradeLoop(...)` の 348 行目より**後**) にある — `core_lock` の定義を `trade_loop` 構築より前に移動すること (`grep -n "core_lock = threading\|trade_loop = TradeLoop" src/agentic_fx/service.py` で現状の行順を確認してから並べ替える)。
+**注意**: `conn_supervisor`/`core_lock` は `build_app` 内で `trade_loop = TradeLoop(...)` より**前**に定義されている必要がある。`conn_supervisor` は Task 13 で `conn_shell` 構築の直後 (かなり早い位置) に新設済みのため既に条件を満たすが、`core_lock = threading.RLock()` は既存コードで 357 行目 (= `trade_loop = TradeLoop(...)` の 348 行目より**後**) にある — `core_lock` の定義を `trade_loop` 構築より前に移動すること (`grep -n "core_lock = threading\|trade_loop = TradeLoop" src/agentic_fx/service.py` で現状の行順を確認してから並べ替える)。`PriceProvider(..., readonly=True)` kwarg は Task 5 (CR-4 対応) で新設済み — 未実装のままここに到達している場合は Task 5 の適用漏れを疑うこと。
+
+**(裁定書 F-1 / CR-2 / P8-01 追加) `tests/loops/test_trade_loop_phases.py` に CLOSE 版の lock-free 回帰テストを追加する** (Step 1 の `test_scheduler_tick_can_acquire_lock_while_worker_runner_blocks` の直後):
+
+```python
+def test_scheduler_tick_can_acquire_lock_while_close_quote_fetch_blocks(tmp_path):
+    """裁定書 F-1 (CR-2/P8-01) の回帰ピン: CLOSE intent の quote 取得
+    (gather_close_snapshot) は commit-pre (lock 非保持) で行われるため、
+    quote_fn がブロックしていても scheduler tick は core_lock を取得できる
+    (既定構成の yfinance には timeout が効かないため、この lock-free 化
+    自体が安全性の担保になる)。"""
+    conn, loop, runner, tp = _loop(tmp_path, [])
+    order_id = orders_insert(  # tests/loops/test_trade_loop.py の
+        # orders.insert を使う (import 済み想定 — 無ければ追加する)
+        conn, pair="USDJPY", direction="long", entry_type="market",
+        horizon="day", status="open", now=NOW, quantity=0.1,
+        avg_fill_price=148.50)
+    runner.results = [MissionResult(
+        "completed", {"action": "close", "order_id": order_id,
+                      "reasoning": "x"}, [])]
+
+    release = threading.Event()
+
+    def blocking_quote_fn(pair):
+        release.wait(5.0)
+        return QUOTE
+
+    loop.executor.quote_fn = blocking_quote_fn
+    t = threading.Thread(target=lambda: loop.run_once("cron"), daemon=True)
+    t.start()
+    time.sleep(0.1)  # commit-pre の gather_close_snapshot がブロック中
+
+    acquired = loop._core_lock.acquire(timeout=1.0)
+    assert acquired, ("core_lock は CLOSE の quote 取得中も他スレッドから"
+                      "取得できるはず (commit-pre は lock 非保持)")
+    loop._core_lock.release()
+
+    release.set()
+    t.join(timeout=5.0)
+```
+
+（`orders_insert`/`NOW`/`QUOTE` は `tests/loops/test_trade_loop.py` からの import、または同モジュールの `orders.insert`/`NOW`/`QUOTE` をそのまま使う。`runner.results` は `FakeRunner` の既存属性に合わせて実装者が調整すること — 同ファイルの `FakeRunner` 実装を確認してから書く。）
+
+**(裁定書 F-6 / CR-5 追加) `tests/test_service_app.py` に追加**:
+
+```python
+def test_trade_loop_healthcheck_provider_is_readonly(tmp_path):
+    """裁定書 F-6 (CR-5): TradeLoop.provider (healthcheck 専用) は
+    conn_supervisor (RO) で構築されている — conn_core への書込可能な
+    provider を healthcheck に使っていないことの配線確認。"""
+    app = build_app(tmp_path)
+    try:
+        assert app.trade_loop.provider.conn is app.conn_supervisor
+        assert app.trade_loop.provider.readonly is True
+    finally:
+        app.close()
+```
+
+**(裁定書 F-6 / CR-5 追加) `tests/loops/test_trade_loop.py` に追加**:
+
+```python
+def test_requeue_signal_happens_under_core_lock(tmp_path):
+    """裁定書 F-6 (CR-5): finally 節の _requeue_signal は core_lock 保持中
+    に呼ばれる — 呼び出し中に他スレッドが core_lock を取得できないことで
+    検証する。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"bogus": "no action field"}, [])])  # parse失敗させる
+    # signal トリガーで claim させ、parse 失敗 → 例外なしで finalize される
+    # 経路 (requeue は起きない) ではなく、consume 前に例外を発生させて
+    # requeue 経路を通す必要がある。実装時は「claim 成功 → runner が
+    # 例外を送出」等、requeue が発生する既存の失敗系テスト
+    # (tests/loops/test_trade_loop_signal.py 等) の構成に倣い、
+    # _requeue_signal 呼び出しの直前に別スレッドで core_lock.acquire
+    # (blocking=False) を試みて False (取得できない = lock 保持中) を
+    # 確認する形に組み立てること。
+```
+
+（このテストは Step 1 で先に骨格だけ書き、実装時に `_requeue_signal` を monkeypatch して「呼ばれた瞬間に `loop._core_lock.acquire(blocking=False)` が False を返す」ことを assert する形へ具体化する — 呼び出し元スレッドから見た RLock の性質上、同一スレッドでの `acquire(blocking=False)` は常に成功してしまうため、検証は別スレッドから行うこと。）
 
 - [ ] **Step 10: 全体 green**
 
@@ -5681,19 +7126,30 @@ Expected: 全件 PASS。
 1. `_run_once_impl` の `with self._core_lock:` (commit-core 相) のインデントを崩して lock 外に出す (意図的な変異) → `test_run_once_does_not_hold_core_lock_during_runner_run` は影響を受けない設計 (run 相自体は変わらない) が、代わりに commit-core の DB 書込が保護されなくなることを検出する専用テストが無い — **これはこの task の変異テストの限界であり、Task 20 の E2E (Mission 実行中の SL/TP 監視) がこの種の退行を実質的に検出する唯一の防波堤であることを progress.md に明記する**
 2. `record_and_validate_intent` の `if intent.action is Action.HOLD:` を削除 → `tests/core/test_executor.py` の hold 系テストが red
 3. `_read_exposure_pairs` が `executor._EXPOSURE` の代わりに `(S.OPEN,)` のみを使うよう改変 → 専用テストが無ければ `tests/core/test_executor_snapshot.py` の `test_open_from_snapshot_rejects_when_exposure_grew_after_commit_pre` 相当が (統合すれば) red になることを確認する
+4. **(裁定書 F-1 追加)** commit-pre の CLOSE 分岐 (`elif intent.action is Action.CLOSE:` ブロック) を削除し、代わりに commit-core 内で毎回 `self.executor.gather_close_snapshot(row)` を呼ぶよう戻す (I/O をロック内に再導入する変異) → `test_scheduler_tick_can_acquire_lock_while_close_quote_fetch_blocks` が red (タイムアウトして `acquired is False`)
+5. **(裁定書 F-6 追加)** `TradeLoop` 構築時の `provider=healthcheck_provider` を `provider=provider` (書込可能版) に戻す → `test_trade_loop_healthcheck_provider_is_readonly` が red
+6. **(裁定書 F-6 追加)** finally 節の `with self._core_lock: self._requeue_signal(claimed)` を lock 無しの直接呼び出しに戻す → `test_requeue_signal_happens_under_core_lock` が red
 
 - [ ] **Step 12: Commit**
 
 ```bash
 git add src/agentic_fx/core/executor.py src/agentic_fx/loops/trade_loop.py \
   src/agentic_fx/service.py src/agentic_fx/config.py config/settings.yaml.example \
-  tests/loops/test_trade_loop.py tests/loops/test_trade_loop_phases.py
+  tests/loops/test_trade_loop.py tests/loops/test_trade_loop_phases.py \
+  tests/test_service_app.py
 git commit -m "$(cat <<'EOF'
 feat: TradeLoop 五相再構成 (prepare/run/commit-pre/commit-core/commit-post)
 
 設計書 §3.1。run相 (WorkerRunner.run) はcore_lockを一切保持しない —
 これによりMission実行中もscheduler tickがSL/TP監視のためlockを取得できる。
 askも三相再構成 (同じ理由)。
+
+レビュー反映1回目 (裁定書 F-1/CR-2/P8-01): CLOSE の quote/spec/rate も
+commit-pre で取得しcommit-coreはclose_from_snapshotで取得済み値のみ使う。
+
+レビュー反映1回目 (裁定書 F-6/CR-5): healthcheckをconn_supervisor(RO)+
+readonly=Trueのprovider専用インスタンスに切り替え、finallyのrequeueを
+core_lock保持中に移す (Global Constraints違反の解消)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -6059,7 +7515,7 @@ EOF
 **Interfaces:**
 - Produces:
   - `shell.run_shell(commands: Commands, stop_event: threading.Event, *, input_fn=input, print_fn=print, stdin_stream=None, poll_interval: float = 0.5) -> None` — **`input_fn` が既定値 (`input` そのもの) のときのみ**、新設の割込み可能読み取り (`_read_line_interruptible`) を使う。`input_fn` が上書きされている場合 (既存テストの fake 注入) は従来どおり `input_fn(prompt)` を直接呼ぶ (後方互換)。`stdin_stream` は割込み可能読み取りが使う実ストリーム (既定 `None` = `sys.stdin`) — テストが `os.pipe()` 経由の fake ストリームを注入できる
-  - `shell._read_line_interruptible(prompt: str, stop_event: threading.Event, *, stream, poll_interval: float) -> str | None` — `select.select([stream], [], [], poll_interval)` でポーリングし、`stop_event` が立てば `None` を返す (中断)。データが来れば 1 行読んで返す。EOF (空文字列読み取り) は `EOFError` を送出する
+  - `shell._read_line_interruptible(prompt: str, stop_event: threading.Event, *, stream, poll_interval: float) -> str | None` — `select.select([stream], [], [], poll_interval)` でポーリングし、`stop_event` が立てば `None` を返す (中断)。データが来れば 1 行読んで返す。EOF (空文字列読み取り) は `EOFError` を送出する。**(裁定書 F-15/IM-8)** `select` の前に `_stream_has_buffered_data(stream)` (`stream.buffer.peek(1)`) で Python 側バッファの残存を確認し、あれば select を経由せず直接読む — 複数行同時到着時の後続行滞留を防ぐ
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -6140,6 +7596,37 @@ def test_line_is_read_when_available(tmp_path):
     assert "echo: hello" in printed
     writer.close()
     stream.close()
+
+
+def test_multiple_lines_arriving_together_are_not_stuck(tmp_path):
+    """裁定書 F-15 (IM-8) の回帰ピン: ペースト等で複数行が 1 回の書込みで
+    同時到着した場合、2 行目以降が「次の新規入力が来るまで」滞留せず、
+    追加の書込みなしに両方処理されることを確認する。"""
+    r_fd, w_fd = os.pipe()
+    stream = os.fdopen(r_fd, "r")
+    writer = os.fdopen(w_fd, "w")
+    stop_event = threading.Event()
+    printed: list[str] = []
+
+    t = threading.Thread(
+        target=run_shell,
+        args=(_FakeCommands(), stop_event),
+        kwargs={"stdin_stream": stream, "poll_interval": 0.05,
+               "print_fn": printed.append},
+        daemon=True)
+    t.start()
+    time.sleep(0.1)
+    writer.write("hello\nworld\n")  # 2 行を 1 回の書込み・flush でまとめて送る
+    writer.flush()
+    time.sleep(0.3)  # 追加の書込みは一切行わない — この待ちだけで両方届くはず
+
+    stop_event.set()
+    t.join(timeout=2.0)
+
+    assert "echo: hello" in printed
+    assert "echo: world" in printed  # 旧稿はここが追加入力なしでは届かなかった
+    writer.close()
+    stream.close()
 ```
 
 - [ ] **Step 2: テスト実行して FAIL を確認**
@@ -6170,21 +7657,47 @@ import threading
 from agentic_fx.commands import Commands
 
 
+def _stream_has_buffered_data(stream) -> bool:
+    """裁定書 F-15 (IM-8): `select.select` は OS 側パイプ/ソケットの
+    読み取り可能性しか見ない。Python の `TextIOWrapper`/`BufferedReader`
+    は 1 回の `readline()` で OS から利用可能な分をまとめて先読みして
+    内部バッファに溜め込むため、複数行が同時到着した場合 (ペースト等)、
+    1 行目を `readline()` で消費した後、2 行目以降は OS 側に新規データが
+    無いまま Python 側バッファに残る。次回の `select.select` はこれを
+    検出できず (fd に新規データが来ていない)、2 行目が「次の何らかの
+    新規入力が来るまで」滞留する。`stream.buffer.peek(1)` で Python 側
+    バッファの残存を先にチェックし、あれば select を経由せず直接
+    `readline()` する (バッファ済みなのでブロックしない)。
+    """
+    buf = getattr(stream, "buffer", None)
+    if buf is None or not hasattr(buf, "peek"):
+        return False
+    try:
+        return bool(buf.peek(1))
+    except Exception:  # noqa: BLE001 — peek 不可なストリームは select 頼みにフォールバック
+        return False
+
+
 def _read_line_interruptible(prompt: str, stop_event: threading.Event, *,
                              stream, poll_interval: float) -> str | None:
     """`select.select` でストリームの読み取り可能性をポーリングする。
     `stop_event` が立てば即座に `None` を返す (中断 — EOF とは区別する)。
     データが来れば 1 行読んで (末尾改行を除いて) 返す。EOF は
-    `EOFError` を送出する。
+    `EOFError` を送出する。**(裁定書 F-15/IM-8)** Python 側バッファに
+    既に読み取り済みのデータが残っていれば (`_stream_has_buffered_data`)
+    select を経由せず即座に `readline()` する — 複数行同時到着時の
+    後続行滞留を防ぐ。
     """
     print(prompt, end="", flush=True)
     while not stop_event.is_set():
-        ready, _, _ = select.select([stream], [], [], poll_interval)
-        if ready:
-            line = stream.readline()
-            if line == "":
-                raise EOFError()
-            return line.rstrip("\n")
+        if not _stream_has_buffered_data(stream):
+            ready, _, _ = select.select([stream], [], [], poll_interval)
+            if not ready:
+                continue
+        line = stream.readline()
+        if line == "":
+            raise EOFError()
+        return line.rstrip("\n")
     return None
 
 
@@ -6242,6 +7755,7 @@ Expected: 全件 PASS。既存の `run_shell` テスト (`input_fn=` を明示�
 
 1. `_read_line_interruptible` の `while not stop_event.is_set():` を `while True:` に改変 (stop_event を見なくする) → `test_stop_event_wakes_blocked_shell_promptly` が red (timeout するか `t.is_alive()` が True のまま)
 2. `run_shell` の `use_interruptible = input_fn is input` を `use_interruptible = False` に固定 → `test_stop_event_wakes_blocked_shell_promptly` が red (通常の `input_fn` 経路に落ちて `stdin_stream` が使われなくなる)
+3. **(裁定書 F-15/IM-8 追加)** `_read_line_interruptible` の `if not _stream_has_buffered_data(stream):` 判定を削除し常に `select.select(...)` を経由するよう戻す → `test_multiple_lines_arriving_together_are_not_stuck` が red (`"echo: world"` が追加入力なしには届かない)
 
 - [ ] **Step 7: Commit**
 
@@ -6252,6 +7766,10 @@ feat: shell readline 中断 seam (select ポーリングで stop_event を検知
 
 設計書 §6 codex I3-2。対話モードの main を停止シーケンス開始時に
 確実に wake する唯一の経路。既存の input_fn 注入テストとは後方互換。
+
+レビュー反映1回目 (裁定書 F-15/IM-8): select.select とバッファ付き
+readline() の混用により複数行同時到着時に後続行が滞留する欠陥を修正。
+stream.buffer.peek() でPython側バッファの残存を先にチェックする。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -6270,7 +7788,7 @@ EOF
 
 **Interfaces:**
 - Produces:
-  - `mission_worker._bootstrap_improve_profile() -> None` — 呼び出し時点の `Path.cwd()` (WorkerRunner が `cwd=` に渡した専用空 workdir) と `Path(__file__).resolve().parents[1]` (src/ コードツリー) を使い、`landlock.restrict_to(read_only_paths=[code_root], read_write_paths=[workdir])` を呼ぶ。**`landlock.is_available()` が False なら `RuntimeError` (fail closed — improve worker は起動拒否)**
+  - `mission_worker._bootstrap_improve_profile() -> None` — 呼び出し時点の `Path.cwd()` (WorkerRunner が `cwd=` に渡した専用空 workdir) と `Path(__file__).resolve().parents[1]` (src/ コードツリー) を使い、`landlock.restrict_to(read_only_paths=[...], read_write_paths=[workdir])` を呼ぶ。**(裁定書 F-8/IM-2/P8-04) read_only_paths は `code_root` に加え `sys.prefix` (venv/site-packages) と `sys.base_prefix` (stdlib 実体) も含む** — この直後に `main()` が `pydantic`/`LocalRunner`/`ToolRegistry` を import するため、これらが無いと `PermissionError` で起動不能になる (実測確認済み — いずれも `data/` の祖先ではないため到達不能の意味論は保たれる)。**`landlock.is_available()` が False なら `RuntimeError` (fail closed — improve worker は起動拒否)**
   - `mission_worker.main()` の `worker_profile == "improve"` 分岐: `db_path`/`plugins_dir` を一切参照しない (handshake で `None` が渡ってくる前提 — `WorkerRunner` の Task 10 実装が既にこの条件分岐を持つ)。`_bootstrap_improve_profile()` → resource limit (trade と同じ `child_as_mb`/`child_nofile`/`child_fsize_mb`。ネットワーク毒入れはしない — 設計書 §4.5) → 空の `ToolRegistry()` (改善ループの実ツールセットはプラン 9) で `LocalRunner` を組み立てる
 
 - [ ] **Step 1: 分解書への注記追加 (§12 申し送り③)**
@@ -6323,7 +7841,11 @@ Expected: FAIL (`AttributeError: module 'agentic_fx.mission_worker' has no attri
 
 - [ ] **Step 4: `mission_worker.py` を実装**
 
-`src/agentic_fx/mission_worker.py` の import 節に `from agentic_fx.core import landlock` を追加する。`_set_resource_limits` の直後に追加:
+`src/agentic_fx/mission_worker.py` の import 節に `from agentic_fx.core import landlock` と `import sysconfig` を追加する (`sys`/`os` は既存 import 済み)。`_set_resource_limits` の直後に追加:
+
+**(レビュー反映 1 回目 — 裁定書 F-8 / IM-2 / P8-04)**: 当初案は Landlock 適用対象を `src/` コードツリーのみにしていたが、`main()` の improve 分岐は `_bootstrap_improve_profile()` の**直後**に `agentic_fx.config` (→ `pydantic`)・`agentic_fx.runners.local_runner`・`agentic_fx.tools.registry` を import する。これらは通常 venv (`sys.prefix` — 本プロジェクトでは `.venv/`) の site-packages や、venv とは別の Python 本体展開先 (`sys.base_prefix` — stdlib) にあり、`src/` allowlist には含まれないため `PermissionError` で improve worker が起動前に必ず落ちる (実測: `uv run python -c "import sys, sysconfig; print(sys.prefix, sys.base_prefix)"` で `sys.prefix=.../.venv`、`sys.base_prefix=~/.local/share/uv/python/...` と `src/` の 3 者が全く別ディレクトリであることを確認済み)。加えて受入 probe (Step 6, FC-5) は import 成功を「blocked」と区別できず、この破損を緑で通していた。
+
+**修正方針**: 必要モジュールを Landlock 適用**前**に import する案は「どのモジュールが必要か」を将来にわたって静的に列挙し続けねばならず保守コストが高いため、**実行に必要な read-only root を明示許可する**方式を採る。`sys.prefix` (venv — site-packages) と `sys.base_prefix` (stdlib の実体) を read-only allowlist に追加する。**両者とも `data/` の祖先ディレクトリではない** (`.venv` は `data/` と同じ repo root 直下の兄弟ディレクトリ、`sys.base_prefix` は repo 外の uv 管理 Python 展開先) ため、設計書 §4.6 の「`data/` の絶対パスアクセスを OS レベルで遮断する」意味論は保たれる (Step 6 の positive/negative 両プローブがこれを実測で固定する — `sys.prefix`/`data/` を誤って repo root ごと許可していないかは、そのプローブの `open_db`/`list_data_dir` が `blocked` のままであることで検出できる):
 
 ```python
 def _bootstrap_improve_profile() -> None:
@@ -6332,6 +7854,7 @@ def _bootstrap_improve_profile() -> None:
     **構造的到達不能の 2 層防御**: ①接続情報の非提供 (handshake に
     db_path/plugins_dir が含まれない — `main()` の improve 分岐がこれらを
     一切参照しない) ②Landlock による FS 自己制限 (コードツリー読取 +
+    venv/stdlib 読取 (裁定書 F-8/IM-2/P8-04 — 実行に必要な依存解決のため) +
     専用 workdir 読書きのみ allowlist、`data/` は遮断)。
 
     呼び出し時点の `Path.cwd()` は WorkerRunner が `cwd=` に渡した専用空
@@ -6348,7 +7871,17 @@ def _bootstrap_improve_profile() -> None:
             "(fail closed, 設計書 §4.6)")
     code_root = Path(__file__).resolve().parents[1]  # src/ ディレクトリ
     workdir = Path.cwd()
-    landlock.restrict_to(read_only_paths=[code_root], read_write_paths=[workdir])
+    # 裁定書 F-8 (IM-2/P8-04): この直後に main() が pydantic/LocalRunner/
+    # ToolRegistry を import する — venv (site-packages) と stdlib の実体
+    # ディレクトリを読取許可しないと PermissionError で起動不能になる。
+    # sys.prefix (venv) / sys.base_prefix (uv 管理 Python 本体) はいずれも
+    # data/ の祖先ではない (実測確認済み — 上記コメント参照)。
+    venv_root = Path(sys.prefix).resolve()
+    stdlib_root = Path(sysconfig.get_paths()["stdlib"]).resolve()
+    read_only = [code_root, venv_root, stdlib_root]
+    if Path(sys.base_prefix).resolve() != venv_root:
+        read_only.append(Path(sys.base_prefix).resolve())
+    landlock.restrict_to(read_only_paths=read_only, read_write_paths=[workdir])
 ```
 
 `main()` 内、`worker_profile != "trade"` を拒否していた既存の分岐 (Task 7 の実装) を以下に置き換える:
@@ -6418,7 +7951,11 @@ Expected: PASS。
 
 - [ ] **Step 6: 失敗するテストを書く (実 subprocess による到達不能性の実測)**
 
-`tests/test_improve_profile_isolation.py` に追記する。実 `mission_worker.py` の handshake プロトコルを経由せず、`_bootstrap_improve_profile` を直接 subprocess 内で呼ぶ**軽量プローブ**で検証する (LLM への実接続を避けるため — 受入条件 §9-3 が要求するのは「isolation の実測」であり LLM ループの実行ではない):
+`tests/test_improve_profile_isolation.py` に追記する。実 `mission_worker.py` の handshake プロトコルを経由せず、`_bootstrap_improve_profile` を直接 subprocess 内で呼ぶ**軽量プローブ**で検証する (LLM への実接続を避けるため — 受入条件 §9-3 が要求するのは「isolation の実測」であり LLM ループの実行ではない)。
+
+**(レビュー反映 1 回目 — 裁定書 FC-5)**: 旧稿のプローブは 2 つの欠陥を持っていた。①`holdout_data_reachable` の判定が `except Exception` で例外型を問わず「blocked」扱いにしており、IM-2 (Landlock allowlist 不備) 由来の意図しない `PermissionError` や、fixture 自体が仕込んだ「DB 内容を意図的に不正文字列にする」ことによる無関係な破損エラーも合格させてしまい**反証不能**だった (Landlock が全く機能していなくても、他の理由で例外さえ出れば緑になる)。②`run_holdout_gate` を実際には呼ばず import しただけで、受入条件 §9-3③ (`run_holdout_gate` を呼んでもデータ到達不能で失敗) を実測していなかった。
+
+修正方針: (a) `data/agentic.db` を**実際に有効な SQLite ファイル**として seed する (壊れた内容だと「壊れているから失敗しただけ」と区別がつかない)。(b) 例外の型を実測で確認したうえで narrow に絞る — 実測 (`uv run python -c "..."` で本環境の Landlock 適用後に `sqlite3.connect` を試す) により、**`open()`/`os.listdir()` の生 OS エラーは `PermissionError` (errno 13) だが、`sqlite3.connect()` 経由の失敗は SQLite が内部で OS エラーを吸収し `sqlite3.OperationalError: unable to open database file` として再送出する** (`PermissionError` ではない — 本環境で `sqlite3.connect('/tmp/<0755 でない dir>/x.db')` を実行し実測確認済み)。したがって `holdout_data_reachable` の判定は `sqlite3.OperationalError` を明示的に検査し、メッセージが `"unable to open database file"` を含むことまで確認する (他の `OperationalError` — 例えば SQL 構文誤り等 — と取り違えない)。(c) `run_holdout_gate` の**import 成功を別 assertion に分離**する (import できることと実行できないことの両方を独立に固定する — import 失敗と実行時データ到達不能を混同しない)。(d) **positive control**: allowlist 内のコードツリー読取・専用 workdir 読書きが実際に成功することを確認し、「全部失敗しているのは Landlock ポリシーが機能しているからであって、何かが壊れて全滅しているのではない」ことを積極的に示す:
 
 ```python
 _ISOLATION_PROBE_SCRIPT = textwrap.dedent("""
@@ -6429,26 +7966,70 @@ _ISOLATION_PROBE_SCRIPT = textwrap.dedent("""
     _bootstrap_improve_profile()
 
     data_dir = Path(sys.argv[1])
+    workdir = Path(sys.argv[2])
     results = {}
+
+    # 裁定書 FC-5 (b): run_holdout_gate の import 成功を別 assertion に
+    # 分離する (import できることと実行できないことを混同しない)。
+    try:
+        from agentic_fx.backtest.holdout import run_holdout_gate  # noqa: F401
+        results["holdout_import"] = "ok"
+    except Exception as e:
+        results["holdout_import"] = f"FAILED: {type(e).__name__}: {e}"
+
+    # ①data/agentic.db 絶対パス open 失敗 — 生 OS エラーは PermissionError
+    # (Task 8 で実測確認済みの errno 13)。
     try:
         open(str(data_dir / "agentic.db"))
         results["open_db"] = "UNEXPECTED_SUCCESS"
     except PermissionError:
         results["open_db"] = "blocked"
+    except Exception as e:  # noqa: BLE001 — 想定外の例外型は区別して記録する
+        results["open_db"] = f"UNEXPECTED_EXCEPTION_TYPE: {type(e).__name__}: {e}"
 
+    # ②data/ 列挙失敗
     try:
         os.listdir(str(data_dir))
         results["list_data_dir"] = "UNEXPECTED_SUCCESS"
     except PermissionError:
         results["list_data_dir"] = "blocked"
+    except Exception as e:  # noqa: BLE001
+        results["list_data_dir"] = f"UNEXPECTED_EXCEPTION_TYPE: {type(e).__name__}: {e}"
 
+    # ③run_holdout_gate を呼んでもデータ到達不能で失敗 — 実測により
+    # sqlite3.connect() 経由の失敗は PermissionError ではなく
+    # sqlite3.OperationalError("unable to open database file") である
+    # ことを確認済み。ここを PermissionError で判定すると (FC-5 が指摘
+    # した反証不能な広すぎる except と同じ穴になるため) 明示的に
+    # OperationalError + メッセージ内容まで確認する。
     try:
-        from agentic_fx.backtest.holdout import run_holdout_gate  # import 自体は可能
         conn = sqlite3.connect(str(data_dir / "agentic.db"))
         conn.execute("SELECT 1")
+        conn.close()
         results["holdout_data_reachable"] = "UNEXPECTED_SUCCESS"
-    except Exception as e:
-        results["holdout_data_reachable"] = f"blocked: {type(e).__name__}"
+    except sqlite3.OperationalError as e:
+        if "unable to open database file" in str(e):
+            results["holdout_data_reachable"] = f"blocked: {type(e).__name__}"
+        else:
+            results["holdout_data_reachable"] = (
+                f"UNEXPECTED_OPERATIONAL_ERROR_MESSAGE: {e}")
+    except Exception as e:  # noqa: BLE001 — 想定外の例外型は区別して記録する
+        results["holdout_data_reachable"] = f"UNEXPECTED_EXCEPTION_TYPE: {type(e).__name__}: {e}"
+
+    # 裁定書 FC-5 (d) positive control: allowlist 内は実際に成功する
+    # ことを積極的に示す (全滅していないことの証明)。
+    try:
+        (workdir / "probe.txt").write_text("ok")
+        (workdir / "probe.txt").read_text()
+        results["workdir_readwrite"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        results["workdir_readwrite"] = f"UNEXPECTED_FAILURE: {type(e).__name__}: {e}"
+    try:
+        import agentic_fx
+        Path(agentic_fx.__file__).read_text(encoding="utf-8")
+        results["code_tree_read"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        results["code_tree_read"] = f"UNEXPECTED_FAILURE: {type(e).__name__}: {e}"
 
     print(results)
 """)
@@ -6457,16 +8038,22 @@ _ISOLATION_PROBE_SCRIPT = textwrap.dedent("""
 def test_improve_profile_cannot_reach_data_dir(tmp_path):
     """受入条件 §9-3: improve profile の実 worker プロセス内から
     ①data/agentic.db 絶対パス open 失敗 ②data/ 列挙失敗
-    ③run_holdout_gate を呼んでもデータ到達不能で失敗、を実測する。
+    ③run_holdout_gate (import 可能・データ到達不能で実行失敗) を実測する。
+    positive control (workdir 読書き・コードツリー読取) が成功することも
+    確認し、「Landlock ポリシーが機能しているから遮断される」ことを
+    「何かが壊れて全滅している」ことと区別する (裁定書 FC-5)。
     """
     if not landlock_available():
         pytest.skip("Landlock not available on this kernel/architecture")
 
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "agentic.db").write_bytes(b"not a real sqlite file, "
-                                          b"but the open() itself must "
-                                          b"be blocked before content matters")
+    # 裁定書 FC-5 (a): 壊れた内容ではなく実際に有効な SQLite DB を seed
+    # する — 「壊れているから失敗しただけ」と区別できるようにする。
+    seed_conn = __import__("sqlite3").connect(str(data_dir / "agentic.db"))
+    seed_conn.execute("CREATE TABLE t (x INTEGER)")
+    seed_conn.commit()
+    seed_conn.close()
     workdir = tmp_path / "workdir"
     workdir.mkdir()
 
@@ -6474,11 +8061,66 @@ def test_improve_profile_cannot_reach_data_dir(tmp_path):
         [sys.executable, "-c", _ISOLATION_PROBE_SCRIPT, str(data_dir), str(workdir)],
         capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "'holdout_import': 'ok'" in result.stdout
     assert "'open_db': 'blocked'" in result.stdout
     assert "'list_data_dir': 'blocked'" in result.stdout
     assert "'holdout_data_reachable': 'blocked" in result.stdout
-    assert "UNEXPECTED_SUCCESS" not in result.stdout
+    assert "'workdir_readwrite': 'ok'" in result.stdout
+    assert "'code_tree_read': 'ok'" in result.stdout
+    assert "UNEXPECTED" not in result.stdout
 ```
+
+- [ ] **Step 6.5 (裁定書 F-8 / IM-2 / P8-04 追加): 実 improve worker が `ready` まで到達することの回帰テスト**
+
+`_ISOLATION_PROBE_SCRIPT` はプロセス起動失敗を検出できない (`_bootstrap_improve_profile` を直接呼ぶだけで、`main()` の handshake〜`ready` 送出フローを経由しない)。IM-2/P8-04 が指摘した実際の欠陥は「`main()` が Landlock 適用後に `pydantic`/`LocalRunner`/`ToolRegistry` を import して `PermissionError` で起動不能になる」ことであり、これは実際に `python -m agentic_fx.mission_worker` を子プロセスとして起動し handshake〜`ready` を実測しないと検出できない。`tests/test_improve_profile_isolation.py` に追加する:
+
+```python
+def test_real_improve_worker_reaches_ready(tmp_path):
+    """裁定書 F-8 (IM-2/P8-04) の回帰ピン: improve profile の実 worker
+    プロセスが handshake 後に PermissionError で落ちず `ready` フレーム
+    まで到達する。`ready` は LLM への実接続 (runner.run) より前に送出
+    されるため、llama-swap が起動していない CI 環境でも検証できる。
+    """
+    if not landlock_available():
+        pytest.skip("Landlock not available on this kernel/architecture")
+
+    from agentic_fx.config import load_settings
+    from agentic_fx.core.mission_protocol import read_frame, write_frame
+
+    settings_path = (Path(__file__).resolve().parents[1] / "config"
+                     / "settings.yaml.example")
+    settings = load_settings(settings_path)
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "agentic_fx.mission_worker"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, cwd=str(workdir), start_new_session=True)
+    try:
+        handshake = {
+            "type": "handshake", "seq": 1,
+            "expected_parent_pid": os.getpid(),
+            "db_path": None, "plugins_dir": None,
+            "settings": settings.model_dump(),
+            "mission": {"prompt": "test", "tools": [],
+                       "output_schema": {"type": "object"},
+                       "max_turns": 1, "timeout_sec": 30},
+            "worker_profile": "improve",
+            "now": "2026-08-06T00:00:00+00:00",
+        }
+        write_frame(proc.stdin, handshake)
+        frame = read_frame(proc.stdout)
+        assert frame["type"] == "ready", (
+            f"improve worker did not reach ready: {frame} "
+            f"stderr={proc.stderr.read(4096) if proc.stderr else ''}")
+        assert frame.get("ok") is True, frame
+    finally:
+        proc.kill()
+        proc.wait(timeout=5.0)
+```
+
+（既存 `tests/runners/test_worker_runner.py`/Task 7 のプロトコルテストの実装パターン (`write_frame`/`read_frame` の使い方、`proc.stdin`/`proc.stdout` のバッファリング) に実装者が合わせて調整すること。settings.yaml.example の `runner.improve.backend` が `"local"` であることを前提とする — 既定値がこれと異なる場合は該当キーを上書きした settings で構築すること。）
 
 - [ ] **Step 7: テスト実行して PASS を確認**
 
@@ -6500,6 +8142,8 @@ Expected: 全件 PASS。
 
 1. `_bootstrap_improve_profile` の `if not landlock.is_available():` チェックを削除 → `test_bootstrap_improve_profile_raises_when_landlock_unavailable` が red
 2. `_bootstrap_improve_profile` の `read_only_paths=[code_root]` を `read_only_paths=[code_root, data_dir]` のように仮に `data/` を含めるよう改変 (実装ミスの模擬) → `test_improve_profile_cannot_reach_data_dir` が red (`open_db`/`list_data_dir` が `UNEXPECTED_SUCCESS` になる)
+3. **(裁定書 F-8/IM-2 追加)** `read_only` から `venv_root`/`stdlib_root` を除去する (元の欠陥を再現する変異) → `test_real_improve_worker_reaches_ready` が red (`ready` フレームに到達せず EOF/`PermissionError` で終わる)
+4. **(裁定書 FC-5 追加)** `holdout_data_reachable` の判定を `except sqlite3.OperationalError` から `except Exception` に戻す (広すぎる except の再導入) → 単体では `test_improve_profile_cannot_reach_data_dir` は依然 green のままになりうる (反証不能性そのものが FC-5 の指摘点) — このため変異テストの効果は主に「レビュー時に except の型が narrow であることをコードで確認する」ことに置く。加えて `results["holdout_data_reachable"] = "blocked"` を無条件に固定する変異 (実際には何も検証していない状態を模す) を追加し、これが `test_improve_profile_cannot_reach_data_dir` を red にしない (= このテストだけでは検出できない) ことを実装者自身が手元で確認し、コメントで明記する
 
 - [ ] **Step 10: Commit**
 
@@ -6511,6 +8155,19 @@ feat: improve worker profile の権限境界 (DBパス非提供 + Landlock + 起
 
 設計書 §4.6。改善ループ本体・registry の中身はプラン9 — 本task は
 「構造的到達不能」の2層防御 (接続情報非提供 + Landlock) のみを実装する。
+
+レビュー反映1回目 (裁定書 F-8/IM-2/P8-04): Landlock allowlist に
+sys.prefix(venv)/sys.base_prefix(stdlib) を追加。Landlock適用後の
+main()がpydantic/LocalRunner/ToolRegistryを import する際の
+PermissionError起動不能を解消。実WorkerRunnerがreadyまで到達する
+回帰テストを追加。
+
+レビュー反映1回目 (裁定書 FC-5): 到達不能性プローブの except Exception
+を除去しsqlite3.OperationalErrorへnarrow化 (実測: sqlite3.connect失敗は
+PermissionErrorではなくOperationalErrorとして観測されることを確認)。
+run_holdout_gateのimport成功を別assertionに分離。positive control
+(workdir読書き・コードツリー読取) を追加。DBファイルも実測阻害要因を
+排除するため有効なSQLiteとしてseedする。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -6544,10 +8201,14 @@ EOF
   - `Scheduler.__init__(..., stop_event: threading.Event | None = None)` — 新設 kwarg (既定 None = 常時 hooks/Mission 起動判定を実行、既存テスト互換)。`tick()` の全 `_run_hooks` 呼び出しサイトと `_trade_mission_due` 呼び出しを `stop_event.is_set()` でガードする (決定論ブロックは常に実行)
   - `WorkerRunner.__init__(..., stop_event: threading.Event | None = None)` — 新設 kwarg。`ready_queue`/`done_queue` の待ちを `stop_event` も見るポーリングへ変更 (既定 None = 従来どおり単純 timeout 待ち)
   - `MissionSupervisor.heartbeat: float` (Task 13 で既存) — watchdog が鮮度監視に使う
-  - `App.close(self) -> list[str]` — 停止状態機械の資源終端 (§5 手順 2〜6)。戻り値は「close をスキップした資源名のリスト」(空なら全て close 完了)
-  - `App.stop_event: threading.Event` / `App.health_latch: HealthLatch` (新設フィールド)
-  - `service._watchdog_check(app: App, scheduler_thread_obj: threading.Thread, stop_event: threading.Event, *, heartbeat_grace_sec: float = 90.0) -> None` — モジュールレベル関数 (`run_service` のクロージャに閉じ込めず単体テスト可能にする)。1 回分の生存・heartbeat 鮮度チェック
-  - `service._record_fatal(app: App, stop_event: threading.Event, reason: str) -> None` — fatal event の記録 + 通知 + `stop_event.set()` (App.close は実行しない)
+  - `App.close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]` — 停止状態機械の資源終端 (§5 手順 2〜6)。戻り値は「close をスキップした資源名のリスト」(空なら全て close 完了)。**(裁定書 FC-2 前半申し送り) `instance_lock` の close (flock 解放) もこの resources リストに含める** — Task 11 で `App.instance_lock` フィールドは追加済みだが解放は本 task に委ねられている
+  - `App.stop_event: threading.Event` / `App.health_latch: HealthLatch` (新設フィールド)。**(裁定書 F-3 / CR-1 advisor 指摘反映 追加) `App.watchdog_heartbeat: float`** — watchdog スレッドが 30 秒周期ループの毎回先頭で touch する。scheduler 側の相互監視 (CR-6) が鮮度チェックに使う。`build_app` は起動直後の誤 fatal を避けるため `time.monotonic()` で初期化する (0/None にしない)。**(裁定書 IM-4 / P8-06 追加) `App.fatal_reason: str | None`** — `_record_fatal` が設定する。存在すれば join 成否によらず終了コードは 1 (`_exit_code` 参照)
+  - `service._watchdog_check(app: App, scheduler_thread_obj: threading.Thread, stop_event: threading.Event, *, heartbeat_grace_sec: float = 30.0, dispatch_ceiling_sec: float | None = None) -> None` — モジュールレベル関数 (`run_service` のクロージャに閉じ込めず単体テスト可能にする)。1 回分の生存・heartbeat 鮮度チェック。**(裁定書 F-3 / CR-1 advisor 指摘反映)** `heartbeat_grace_sec` は heartbeat ポンプ間隔 (Task 13, 既定 5.0s) に対してのみ余裕を見た小さい値 (既定 30.0s = 6 倍) に変更 — 旧既定 90.0s は「Mission サイクル全体を包含する」誤った前提に基づいていた。**さらに `busy_since`/`dispatch_ceiling_sec` による独立した第二の軸のチェックを追加** (heartbeat ポンプが「genuine なデッドロック」を隠蔽する fail-open の穴を塞ぐ — Task 13 参照)。`dispatch_ceiling_sec` が `None` なら `_default_dispatch_ceiling_sec(app)` で `app.settings` から算出する
+  - `service._default_dispatch_ceiling_sec(app: App) -> float` — **(裁定書 F-3 / CR-1 advisor 指摘反映 新設)** `(llama_swap.timeout_sec + worker.worker_grace_sec + worker.worker_terminate_grace_sec) × 4 + 60.0` (4 = trade 1 回 + reflection バッチ最大 3 回、設計書 §3.3。+60s はスケジューリング揺らぎのマージン)。dispatch 全体の壁時計上限であり Mission 実行時間そのものには依存しない設定由来の定数
+  - `service._check_watchdog_health(app: App, watchdog_thread_obj: threading.Thread, stop_event: threading.Event, *, wd_heartbeat_grace_sec: float = 90.0) -> None` — **(裁定書 F-2/F-3 / CR-6 / P8-05 新設)** scheduler 側から watchdog の生存・heartbeat 鮮度を確認する (設計書 §6「scheduler tick が watchdog の heartbeat を相互確認する」)。異常時は `_record_fatal` を呼ぶ
+  - `service._record_fatal(app: App, stop_event: threading.Event, reason: str) -> None` — fatal event の記録 + 通知 + `stop_event.set()` (App.close は実行しない)。**(裁定書 IM-4 / P8-06 追加) `app.fatal_reason = reason` もここでラッチする** (未設定なら — 最初の fatal 理由を保持し、以後の呼び出しでは上書きしない)
+  - `service._exit_code(app: App, scheduler_alive: bool, supervisor_alive: bool) -> int` — **(裁定書 IM-4 / P8-06 新設)** `app.fatal_reason is not None` なら join 成否に関係なく `1`。それ以外は `1 if (scheduler_alive or supervisor_alive) else 0` (現行の join タイムアウト判定を維持)。`run_service` の末尾はこの関数の戻り値をそのまま使う (単体テスト可能にするため `run_service` 内クロージャに閉じ込めない)
+  - `service._busy_resources_after_join(scheduler_still_busy: bool, supervisor_still_busy: bool) -> frozenset[str]` — **(裁定書 F-6 / IM-6 新設)** `App.close(busy_resources=...)` に渡す集合の判定を純関数として抽出。supervisor still-busy なら `conn_core` に加え `conn_supervisor` も busy に含める
 
 - [ ] **Step 1: 失敗するテストを書く (`HealthLatch`)**
 
@@ -6739,7 +8400,9 @@ Expected: 全件 PASS (`stop_event` 未指定の既存テストは `_stopping()`
 
 - [ ] **Step 6: `worker_runner.py` に `stop_event` を配線**
 
-`WorkerRunner.__init__` (Task 10) に `stop_event: threading.Event | None = None` を追加し `self._stop_event = stop_event` を保持する。`_run_with_child` 内の ready 待ち・result 待ちを以下のポーリング形式に変更する:
+`WorkerRunner.__init__` (Task 10) に `stop_event: threading.Event | None = None` を追加し `self._stop_event = stop_event` を保持する。`_run_with_child` 内の ready 待ち・result 待ちを以下のポーリング形式に変更する。
+
+**(前半 (Task 1〜11) からの申し送り — 対応済み)** Task 19 執筆時点でこの Step の `finally` 節に Task 10 修正前の古いコード (`rpc_executor.shutdown(wait=False)` を含む — ThreadPoolExecutor 版の名残) が埋め込まれており、Task 10 の現行コード (FC-1 の daemon スレッド化 + IM-7 の `dispatcher.join` 優先 + `stdin_lock` 排他) と不整合だった。以下は Task 10 の現行 `_run_with_child` (4103-4153 行付近) の `finally` 節と**完全に同一**の内容に更新済み — `dispatch_queue.put(None)` → `_ensure_dead` → `reader.join` → **`dispatcher.join(timeout=w.rpc_timeout_sec + 5.0)`** (IM-7: dispatcher が `stdin_lock` 保持中に `proc.stdin.close()` と競合しないよう、close より先に join する) → `with stdin_lock: proc.stdin.close()` → `proc.stdout.close()`、の順序を厳守する (`rpc_executor`/`ThreadPoolExecutor` は本プランに存在しない — FC-1 対応で使い捨て daemon スレッドに置換済み):
 
 ```python
         status = "failed"
@@ -6769,15 +8432,23 @@ Expected: 全件 PASS (`stop_event` 未指定の既存テストは `_stopping()`
                 output = None
             return MissionResult(status, output, transcript)
         finally:
+            # Task 10 (FC-1 の daemon スレッド化 + IM-7 の join 順序) の
+            # 現行 finally 節と同一 — rpc_executor/ThreadPoolExecutor は
+            # 存在しない。dispatcher を stdin close より先に join する
+            # (dispatcher が stdin_lock 保持中の書込と競合しないため)。
             dispatch_queue.put(None)
             self._ensure_dead(proc, w)
             reader.join(timeout=5.0)
-            rpc_executor.shutdown(wait=False)
-            for stream in (proc.stdin, proc.stdout):
+            dispatcher.join(timeout=w.rpc_timeout_sec + 5.0)
+            with stdin_lock:
                 try:
-                    stream.close()
+                    proc.stdin.close()
                 except OSError:
                     pass
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
 
     def _wait_with_stop(self, q, *, deadline_sec: float, poll_interval: float = 0.2):
         """`stop_event` が立てば即座に None を返す (中断)。それ以外は
@@ -6852,13 +8523,18 @@ def test_close_skips_conn_core_when_scheduler_thread_marked_busy(tmp_path):
 
 - [ ] **Step 8: `service.py` を実装 (`App.close` + `build_app`/`run_service` 統合)**
 
-`App` dataclass に `stop_event: threading.Event` / `health_latch: HealthLatch` フィールドを追加する。`build_app` のシグネチャに `stop_event: threading.Event | None = None` を追加し、冒頭 (`clock = clock or SystemClock()` の直後) で `stop_event = stop_event if stop_event is not None else threading.Event()` を確定させる。`activity = ActivityLog(...)` の構築 (263 行) を以下に変更する:
+`App` dataclass に `stop_event: threading.Event` / `health_latch: HealthLatch` フィールドを追加する。**(裁定書 F-3 / CR-1 advisor 指摘反映) `watchdog_heartbeat: float` フィールドも追加する** (watchdog スレッドが touch する — CR-6 の相互監視が使う)。**(裁定書 IM-4 / P8-06) `fatal_reason: str | None` フィールドも追加する** (`_record_fatal` がラッチする)。`build_app` のシグネチャに `stop_event: threading.Event | None = None` を追加し、冒頭 (`clock = clock or SystemClock()` の直後) で `stop_event = stop_event if stop_event is not None else threading.Event()` を確定させる。`activity = ActivityLog(...)` の構築 (263 行) を以下に変更する:
 
 ```python
     health_latch = HealthLatch()
     activity = ActivityLog(root / "logs" / "activity.log",
                            on_write_failure=lambda e: health_latch.record_failure(
                                f"activity write failed: {safe_error_text(e)}"))
+    # 裁定書 F-3 (CR-1 advisor 指摘反映): watchdog_heartbeat は起動直後の
+    # 誤 fatal を避けるため time.monotonic() で初期化する (0/None にしない
+    # — scheduler 側の CR-6 相互監視チェックが watchdog スレッド起動前の
+    # 一瞬に走っても stale 判定されないようにする)。
+    watchdog_heartbeat = time.monotonic()
 ```
 
 `owns_runner = runner is None` / `if runner is None: runner = WorkerRunner(...)` (Task 10) の**内側**の `WorkerRunner(...)` 呼び出しに `stop_event=stop_event, on_rpc_leak=_on_rpc_leak` を追加する — `if runner is None:` の条件分岐そのものは変更しない (テストが `build_app(root, runner=FakeRunner(...))` で注入するケースを壊さないため)。`_on_rpc_leak` はこのブロックの前で定義しておく:
@@ -6876,7 +8552,7 @@ def test_close_skips_conn_core_when_scheduler_thread_marked_busy(tmp_path):
                               stop_event=stop_event, on_rpc_leak=_on_rpc_leak)
 ```
 
-`Commands(...)` の構築に `health_latch=health_latch` を追加する。`App(...)` の構築に `stop_event=stop_event, health_latch=health_latch` を追加する。
+`Commands(...)` の構築に `health_latch=health_latch` を追加する。`App(...)` の構築に `stop_event=stop_event, health_latch=health_latch, watchdog_heartbeat=watchdog_heartbeat, fatal_reason=None` を追加する。
 
 `App` クラスに `close` メソッドを追加する:
 
@@ -6889,8 +8565,15 @@ def test_close_skips_conn_core_when_scheduler_thread_marked_busy(tmp_path):
         スキップした資源名のリスト (空なら全て close 完了)。
 
         close 順序は逆順 (runner → rag → conn_supervisor/conn_core/
-        conn_shell → notifier)。close できるものはすべて close し、1 つの
-        資源の close 失敗が他をブロックしないよう個別に隔離する。
+        conn_shell → instance_lock)。**(裁定書 MN-2 修正) `Notifier` は
+        `close()` を持たない (webhook 送信のみの薄いラッパー) ため、この
+        リストにも docstring にも含めない** — 旧稿の docstring は
+        「→ notifier」を謳っていたが実装の resources リストには元々
+        含まれておらず、記述だけが不整合だった。close できるものはすべて
+        close し、1 つの資源の close 失敗が他をブロックしないよう個別に
+        隔離する。**(裁定書 FC-2 前半申し送り) `instance_lock` (flock を
+        保持するファイルオブジェクト、Task 11) の解放もここで行う** —
+        Task 11 では取得のみ行い解放を本 task に委ねていた。
         """
         skipped: list[str] = []
         resources = [
@@ -6900,6 +8583,7 @@ def test_close_skips_conn_core_when_scheduler_thread_marked_busy(tmp_path):
             ("conn_supervisor", lambda: self.conn_supervisor.close()),
             ("conn_core", lambda: self.conn_core.close()),
             ("conn_shell", lambda: self.conn_shell.close()),
+            ("instance_lock", lambda: self.instance_lock.close()),
         ]
         for name, closer in resources:
             if name in busy_resources:
@@ -6912,15 +8596,20 @@ def test_close_skips_conn_core_when_scheduler_thread_marked_busy(tmp_path):
         return skipped
 ```
 
-`_watchdog_tick` (既存、448-478 行) の直後にモジュールレベル関数を 2 つ追加する (`run_service` 内のクロージャに閉じ込めず、単体テスト可能にするため — Step 10 の受入テストがこれらを直接呼ぶ):
+`_watchdog_tick` (既存、448-478 行) の直後にモジュールレベル関数を追加する (`run_service` 内のクロージャに閉じ込めず、単体テスト可能にするため — Step 10 の受入テストがこれらを直接呼ぶ)。**(裁定書 IM-4/P8-06, F-2/F-3/CR-6/P8-05, F-3/CR-1 advisor 指摘反映を統合)**:
 
 ```python
 def _record_fatal(app: App, stop_event: threading.Event, reason: str) -> None:
-    """codex C2-3: scheduler/supervisor の回復不能死亡は資金保護の恒久
-    停止に等しい — 対話モードでも即座に停止シーケンスを開始する。
-    fatal event の記録 + 通知 + stop_event セットのみを行う (App.close は
-    実行しない — 停止シーケンスの実行主体は常に main、設計書 §6)。
+    """codex C2-3: scheduler/supervisor/watchdog の回復不能死亡は資金保護の
+    恒久停止に等しい — 対話モードでも即座に停止シーケンスを開始する。
+    fatal event の記録 + 通知 + stop_event セットに加え、**(裁定書 IM-4/
+    P8-06) `app.fatal_reason` をラッチする** — 未設定 (None) の場合のみ
+    書き込む (最初の fatal 理由を保持し、以後の呼び出しで上書きしない)。
+    App.close は実行しない (停止シーケンスの実行主体は常に main、設計書
+    §6)。
     """
+    if app.fatal_reason is None:
+        app.fatal_reason = reason
     try:
         app.activity.write(Category.SYSTEM, "fatal_thread_death", reason)
     except Exception:  # noqa: BLE001
@@ -6932,13 +8621,39 @@ def _record_fatal(app: App, stop_event: threading.Event, reason: str) -> None:
     stop_event.set()
 
 
+def _default_dispatch_ceiling_sec(app: App) -> float:
+    """裁定書 F-3 (CR-1 advisor 指摘反映): supervisor の 1 回の dispatch
+    (trade 1 回 + reflection バッチ最大 3 回、設計書 §3.3) が壁時計上
+    絶対に超えないはずの上限。WorkerRunner の preemption
+    (`mission.timeout_sec + worker_grace_sec`、超過で SIGTERM →
+    `worker_terminate_grace_sec` 後 SIGKILL) が Mission 単体の上限を保証
+    するため、この式は Mission の実際の実行時間には依存しない設定由来の
+    定数になる。+60s はスケジューリング揺らぎのマージン。"""
+    w = app.settings.worker
+    per_mission = (app.settings.llama_swap.timeout_sec
+                   + w.worker_grace_sec + w.worker_terminate_grace_sec)
+    return per_mission * 4 + 60.0  # 4 = trade 1 + reflection 最大 3
+
+
 def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,
                     stop_event: threading.Event, *,
-                    heartbeat_grace_sec: float = 90.0) -> None:
+                    heartbeat_grace_sec: float = 30.0,
+                    dispatch_ceiling_sec: float | None = None) -> None:
     """1 回分の watchdog チェック (設計書 §6)。scheduler/supervisor の
     生存・heartbeat 鮮度を見て、異常があれば `_record_fatal` を呼ぶ。
     呼び出し元 (`run_service` の `watchdog_thread`) が 30 秒周期のループを
     持つ — このテストで直接叩けるよう周期そのものはこの関数の外に置く。
+
+    **(裁定書 F-3 / CR-1 advisor 指摘反映)** `heartbeat_grace_sec` の既定
+    30.0s は Task 13 の heartbeat ポンプ間隔 (既定 5.0s) に対してのみ
+    余裕を見た値 — 旧既定 90.0s は「Mission サイクル全体を包含する」
+    誤った前提に基づいていた。**ただし heartbeat ポンプは supervisor
+    スレッドが生きてさえいれば touch し続けるため、`_dispatch` 内部
+    (broker.submit 等) が genuine にデッドロックした場合を heartbeat 鮮度
+    だけでは検出できない (fail-open の穴)。これを塞ぐため
+    `busy_since`/`dispatch_ceiling_sec` による独立した第二の軸を追加する**
+    — heartbeat が新鮮でも `busy_since` からの経過が
+    `dispatch_ceiling_sec` を超えていれば fatal とする。
     """
     if not scheduler_thread_obj.is_alive():
         _record_fatal(app, stop_event, "scheduler thread is dead")
@@ -6950,10 +8665,71 @@ def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,
     if time.monotonic() - app.supervisor.heartbeat > heartbeat_grace_sec:
         _record_fatal(app, stop_event, "supervisor heartbeat stale")
         return
+    busy_since = app.supervisor.busy_since
+    ceiling = (dispatch_ceiling_sec if dispatch_ceiling_sec is not None
+              else _default_dispatch_ceiling_sec(app))
+    if busy_since is not None and time.monotonic() - busy_since > ceiling:
+        _record_fatal(
+            app, stop_event,
+            f"supervisor dispatch exceeded ceiling ({ceiling:.0f}s) — "
+            "heartbeat pump was fresh but dispatch did not return "
+            "(裁定書 F-3 advisor 指摘反映)")
+        app.supervisor.fail_pending(exc=RuntimeError("supervisor dispatch hung"))
+        return
     _watchdog_tick(app)
+
+
+def _check_watchdog_health(app: App, watchdog_thread_obj: threading.Thread,
+                           stop_event: threading.Event, *,
+                           wd_heartbeat_grace_sec: float = 90.0) -> None:
+    """裁定書 F-2 (CR-6/P8-05): 設計書 §6「scheduler tick が watchdog の
+    heartbeat を相互確認する」— watchdog 自身が (例外処理の想定漏れ等で)
+    静かに停止した場合、これまでは scheduler/supervisor の死亡検出手段が
+    完全に失われていた。scheduler 側から watchdog の生存・heartbeat 鮮度
+    (30 秒周期ループに対し 90s = 3 倍の余裕) を確認し、異常なら
+    `_record_fatal` を呼ぶ (同じ latch/停止経路に接続 — IM-4 の
+    fatal_reason はこの呼び出しもカバーする)。
+    """
+    if not watchdog_thread_obj.is_alive():
+        _record_fatal(app, stop_event, "watchdog thread is dead")
+        return
+    if time.monotonic() - app.watchdog_heartbeat > wd_heartbeat_grace_sec:
+        _record_fatal(app, stop_event, "watchdog heartbeat stale")
+
+
+def _busy_resources_after_join(scheduler_still_busy: bool,
+                               supervisor_still_busy: bool) -> frozenset[str]:
+    """裁定書 F-6 (IM-6): join タイムアウト時にどの接続を busy (close
+    スキップ対象) とするかを判定する純関数 (単体テスト可能にするため
+    `run_service` から抽出)。supervisor は commit-pre 相 (lock 非保持) で
+    `conn_supervisor` を使うため、supervisor が join タイムアウトで
+    still-busy なら `conn_supervisor` も busy に含める — 旧稿は
+    `conn_core` のみを対象にしており `conn_supervisor` が無条件に close
+    されうる欠陥があった。scheduler は `conn_supervisor` を使わない。
+    """
+    busy: set[str] = set()
+    if scheduler_still_busy:
+        busy.add("conn_core")
+    if supervisor_still_busy:
+        busy.add("conn_core")
+        busy.add("conn_supervisor")
+    return frozenset(busy)
+
+
+def _exit_code(app: App, scheduler_alive: bool, supervisor_alive: bool) -> int:
+    """裁定書 IM-4 (P8-06): 終了コード判定を `is_alive()` だけに頼らない。
+    `app.fatal_reason` がラッチされていれば (回復不能死亡が一度でも検出
+    されていれば)、その後 join が正常に完了していても非ゼロ終了する
+    (設計書 §6「回復不能死亡は非ゼロ終了」)。daemon/対話の両モードで
+    同じ判定を使う (モード分岐しない — この判定自体がモード非依存である
+    ことが「両モードで停止する」の担保)。
+    """
+    if app.fatal_reason is not None:
+        return 1
+    return 1 if (scheduler_alive or supervisor_alive) else 0
 ```
 
-`run_service` を以下の状態機械へ再構成する (既存の `stop_event = _stop_event if ...` 行から末尾までを置き換える):
+**(裁定書 FC-4 — 前回レビューで判明した誤り)** `run_service` を以下の状態機械へ再構成する。**置換範囲は「既存の `stop_event = _stop_event if ...` 行から末尾まで」ではない** — 現行 `run_service` (`service.py:480-`) は `app = build_app(root)` (491 行) が `stop_event = _stop_event if ... ` (500 行) より**前**にある。指示どおり 500 行から末尾だけを置換すると、旧 `app = build_app(root)` (491 行、`stop_event` 未指定) が残ったまま、置換後コードの冒頭に新しい `app = build_app(root, stop_event=stop_event)` が追加され、**`build_app` が二重実行される** (DB 二重 open・instance lock 二重取得で 2 回目が `InstanceAlreadyRunning` を送出し起動不能になる)。**置換範囲を `app = build_app(root)` (491 行) から末尾までに繰り上げる** — `settings = load_settings(...)` (488 行)・`setup_technical_logging(...)` (489-490 行) は現行のまま残し (1 回だけ実行)、`app = build_app(root)` 以降 (491 行〜) を以下に差し替える:
 
 ```python
     stop_event = _stop_event if _stop_event is not None else threading.Event()
@@ -6982,6 +8758,16 @@ def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,
                     _log.exception("tick failed")
                 finally:
                     scheduler_busy.clear()
+                # 裁定書 F-2 (CR-6/P8-05): scheduler tick 毎に watchdog
+                # 自身の生存・heartbeat 鮮度を確認する (設計書 §6 の
+                # 相互監視の scheduler→watchdog 方向)。tick の決定論
+                # ブロックより後 (資金保護そのものはこのチェックに依存
+                # しない) — wd は下で定義されるが、この関数はクロージャ
+                # として遅延評価されるため定義順の問題はない。
+                try:
+                    _check_watchdog_health(app, wd, stop_event)
+                except Exception:  # noqa: BLE001
+                    _log.exception("watchdog health check failed")
             stop_event.wait(1)
 
     def watchdog_thread() -> None:
@@ -6990,9 +8776,13 @@ def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,
         `_watchdog_check` に委譲する (クロージャに閉じ込めず単体テスト
         可能にするため — Task 19 の受入テストがこの関数を直接呼ぶ)。"""
         while not stop_event.is_set():
+            # 裁定書 F-2/F-3 (CR-6): scheduler 側の相互監視が読む
+            # app.watchdog_heartbeat をループ先頭で touch する。
+            app.watchdog_heartbeat = time.monotonic()
             stop_event.wait(30)
             if stop_event.is_set():
                 break
+            app.watchdog_heartbeat = time.monotonic()
             try:
                 _watchdog_check(app, th, stop_event)
             except Exception:  # noqa: BLE001 — スレッドを殺さない
@@ -7039,10 +8829,11 @@ def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,
 
         wd.join(timeout=15)
 
-        busy: set[str] = set()
-        if scheduler_still_busy or supervisor_still_busy:
-            busy.add("conn_core")  # 両スレッドとも conn_core を使う
-        skipped = app.close(busy_resources=frozenset(busy))  # 手順5-6
+        # 裁定書 F-6 (IM-6): busy 判定は _busy_resources_after_join に
+        # 委譲する (conn_supervisor も対象に含める — 旧稿の欠陥修正)。
+        skipped = app.close(
+            busy_resources=_busy_resources_after_join(
+                scheduler_still_busy, supervisor_still_busy))  # 手順5-6
         if skipped:
             app.activity.write(Category.SYSTEM, "close_skipped_resources",
                                f"{skipped} (join timeout — used-in-flight)")
@@ -7053,8 +8844,14 @@ def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,
         else:
             app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
 
-    if th.is_alive() or app.supervisor.is_alive():
-        print("警告: 停止タイムアウト。実行中の処理が残っている可能性があります。")
+    # 裁定書 IM-4 (P8-06): 終了コードは is_alive() だけでなく
+    # app.fatal_reason (watchdog/scheduler 相互監視・supervisor dispatch
+    # ceiling いずれかが検出した回復不能死亡) も考慮する。_exit_code は
+    # join 成否に関係なく fatal_reason があれば 1 を返す。
+    rc = _exit_code(app, th.is_alive(), app.supervisor.is_alive())
+    if rc == 1:
+        print("警告: 停止タイムアウト、または致命的なスレッド異常を検出しました。"
+              "実行中の処理が残っている可能性があります。")
         return 1
     print("停止しました。")
     return 0
@@ -7081,6 +8878,7 @@ Expected: 全件 PASS。`tests/test_service.py`/`tests/test_service_app.py` に 
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -7089,14 +8887,115 @@ from agentic_fx.service import run_service
 
 def test_run_service_stops_gracefully_with_pre_set_stop_event(tmp_path):
     """_stop_event を事前にセットして渡すと、run_service は即座に停止
-    状態機械を完走して 0 (graceful) または 1 を返す (実スリープ・実
-    シグナルなしで検証する既存パターン — fix round 1 F4)。"""
+    状態機械を完走する。**(裁定書 IM-4 / P8-06 — 変異耐性)** 新規に生成した
+    健全な app には Mission も fatal も存在しないため、戻り値は
+    `0` (graceful) に**厳密に一致する**はず — 旧稿の `rc in (0, 1)` は
+    `_exit_code` の実装をどう壊しても通ってしまう曖昧な assert だった。"""
     # root の init は既存 tests/test_service.py の init ヘルパーに合わせる
     root = _init_root(tmp_path)  # 既存 fixture 名で置き換えること
     stop_event = threading.Event()
     stop_event.set()
     rc = run_service(root, daemon=True, _stop_event=stop_event)
-    assert rc in (0, 1)
+    assert rc == 0
+
+
+def test_exit_code_is_1_when_fatal_reason_latched_even_if_threads_joined(tmp_path):
+    """裁定書 IM-4 (P8-06) の回帰ピン: fatal_reason がラッチされていれば、
+    scheduler/supervisor が両方とも正常 join (is_alive()==False) しても
+    終了コードは 1 になる — 旧稿は is_alive() だけを見ており、fatal 検出
+    後に join が完了すると誤って 0 を返していた。"""
+    from agentic_fx.service import _exit_code, build_app
+
+    root = _init_root(tmp_path)
+    app = build_app(root)
+    try:
+        app.fatal_reason = "supervisor thread is dead"
+        assert _exit_code(app, scheduler_alive=False, supervisor_alive=False) == 1
+    finally:
+        app.close()
+
+
+def test_exit_code_is_0_when_no_fatal_and_threads_joined(tmp_path):
+    from agentic_fx.service import _exit_code, build_app
+
+    root = _init_root(tmp_path)
+    app = build_app(root)
+    try:
+        assert app.fatal_reason is None
+        assert _exit_code(app, scheduler_alive=False, supervisor_alive=False) == 0
+    finally:
+        app.close()
+
+
+def test_busy_resources_after_join_includes_conn_supervisor_when_supervisor_busy():
+    """裁定書 F-6 (IM-6) の回帰ピン: supervisor still-busy なら
+    conn_supervisor も busy に含める (commit-pre 相が lock 非保持で
+    conn_supervisor を使うため)。"""
+    from agentic_fx.service import _busy_resources_after_join
+
+    busy = _busy_resources_after_join(
+        scheduler_still_busy=False, supervisor_still_busy=True)
+    assert busy == frozenset({"conn_core", "conn_supervisor"})
+
+    busy2 = _busy_resources_after_join(
+        scheduler_still_busy=True, supervisor_still_busy=False)
+    assert busy2 == frozenset({"conn_core"})  # scheduler は conn_supervisor を使わない
+
+
+def test_check_watchdog_health_records_fatal_when_watchdog_dead(tmp_path):
+    """裁定書 F-2 (CR-6/P8-05) の回帰ピン: scheduler 側が watchdog の
+    死亡を検出して fatal 経路に接続する (相互監視の scheduler→watchdog
+    方向)。"""
+    from agentic_fx.service import _check_watchdog_health, build_app
+
+    root = _init_root(tmp_path)
+    app = build_app(root)
+
+    class DeadWatchdog:
+        def is_alive(self) -> bool:
+            return False
+
+    _check_watchdog_health(app, DeadWatchdog(), app.stop_event)
+
+    assert app.stop_event.is_set()
+    assert app.fatal_reason is not None
+    log_lines = (root / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert "watchdog thread is dead" in log_lines
+
+
+def test_watchdog_check_detects_stale_dispatch_ceiling_even_with_fresh_heartbeat(tmp_path):
+    """裁定書 F-3 (CR-1 advisor 指摘反映) の回帰ピン: heartbeat ポンプが
+    touch し続けていても (heartbeat は新鮮)、busy_since からの経過が
+    dispatch_ceiling_sec を超えていれば fatal になる — heartbeat 鮮度
+    チェック単独では genuine なデッドロックを検出できない fail-open の
+    穴を塞ぐテスト。"""
+    from agentic_fx.service import _watchdog_check, build_app
+
+    root = _init_root(tmp_path)
+    app = build_app(root)
+
+    class AliveThread:
+        def is_alive(self) -> bool:
+            return True
+
+    class StuckSupervisor:
+        heartbeat = time.monotonic()  # ポンプが touch し続けている想定
+        busy_since = time.monotonic() - 9999.0  # 遥か昔に dispatch 開始
+
+        def is_alive(self) -> bool:
+            return True
+
+        def fail_pending(self, *, exc: Exception) -> None:
+            calls.append(exc)
+
+    calls: list[Exception] = []
+    app.supervisor = StuckSupervisor()
+
+    _watchdog_check(app, AliveThread(), app.stop_event, dispatch_ceiling_sec=60.0)
+
+    assert app.stop_event.is_set()
+    assert app.fatal_reason is not None
+    assert len(calls) == 1
 
 
 def test_watchdog_check_records_fatal_and_stops_when_supervisor_dead(tmp_path):
@@ -7176,6 +9075,10 @@ Expected: 全件 PASS。
 2. `scheduler.py` の `_stopping()` の呼び出しを `_run_hooks` の 3 箇所から 1 箇所だけ残して削除 → 対応する `test_hooks_run_even_when_market_closed` 等 (Task 12/19 で stop_event を絡めたテストがあれば) が red になることを確認する
 3. `_watchdog_check` の `if not app.supervisor.is_alive():` ブロックを削除 → `test_watchdog_check_records_fatal_and_stops_when_supervisor_dead` が red
 4. `App.close` の `if name in busy_resources:` チェックを削除 → `test_close_skips_conn_core_when_scheduler_thread_marked_busy` が red
+5. **(裁定書 IM-4 追加)** `_exit_code` の `if app.fatal_reason is not None: return 1` を削除 → `test_exit_code_is_1_when_fatal_reason_latched_even_if_threads_joined` が red
+6. **(裁定書 F-6/IM-6 追加)** `_busy_resources_after_join` の `if supervisor_still_busy: busy.add("conn_supervisor")` 相当行を削除 → `test_busy_resources_after_join_includes_conn_supervisor_when_supervisor_busy` が red
+7. **(裁定書 F-2/CR-6 追加)** `_check_watchdog_health` の `if not watchdog_thread_obj.is_alive():` ブロックを削除 → `test_check_watchdog_health_records_fatal_when_watchdog_dead` が red
+8. **(裁定書 F-3/CR-1 advisor 指摘反映 追加)** `_watchdog_check` の `busy_since`/`dispatch_ceiling_sec` 判定ブロックを削除 → `test_watchdog_check_detects_stale_dispatch_ceiling_even_with_fresh_heartbeat` が red
 
 - [ ] **Step 13: Commit**
 
@@ -7191,6 +9094,33 @@ feat: スレッド監督 (watchdog相互監視) + health latch + 停止状態機
 設計書 §5/§6。停止の実行主体を main に一意化し、scheduler join優先→
 supervisor drain/join→App.closeの所有権ベース資源終端まで一気通貫で実装。
 両モードでスレッド死亡時に停止 (codex C2-3)。
+
+レビュー反映1回目 (裁定書 F-2/F-3/CR-6/P8-05): scheduler tick 毎に
+watchdog自身の生存・heartbeat鮮度を確認する相互監視のscheduler→watchdog
+方向を追加 (これまでwatchdog→scheduler/supervisor方向のみだった)。
+
+レビュー反映1回目 (裁定書 F-3/CR-1 advisor指摘反映): heartbeatポンプ
+単独はgenuineなデッドロックを隠蔽するfail-openの穴を持つため、
+busy_since/dispatch_ceiling_secによる独立した第二の軸を追加。
+
+レビュー反映1回目 (裁定書 IM-4/P8-06): App.fatal_reasonをラッチし、
+_exit_codeがjoin成否によらず1を返すようにする。
+
+レビュー反映1回目 (裁定書 F-6/IM-6): busy_resources判定にconn_supervisor
+を追加 (supervisorのcommit-pre相はlock非保持でconn_supervisorを使う)。
+
+レビュー反映1回目 (裁定書 MN-2): App.closeのdocstringからNotifier close
+の誤記述を削除。
+
+レビュー反映1回目 (裁定書 FC-2 前半申し送り): instance_lockの解放を
+App.closeに配線。
+
+レビュー反映1回目 (裁定書 FC-4): run_serviceの置換範囲の誤り (build_app
+二重実行) を修正。
+
+前半 (Task 10) からの申し送り対応: _run_with_childのfinally節の古い
+コード (rpc_executor.shutdown) をTask 10現行 (FC-1のdaemonスレッド化 +
+IM-7のjoin順序) に合わせて更新。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -7268,28 +9198,40 @@ def test_worker_runner_kills_process_that_ignores_sigterm(tmp_path):
 
 
 def test_funds_protection_continues_during_blocked_mission(tmp_path):
-    """受入条件 2: Mission 実行中 (WorkerRunner がブロック中) でも、
-    scheduler tick の SL/TP 監視 (_process_exits) が core_lock を取得
-    できて実行される — 実 App (build_app) + ブロックする fake runner の
-    差し替えで統合実証する。
+    """受入条件 2 (**裁定書 F-11 / IM-5 / P8-07 反映**): Mission 実行中
+    (WorkerRunner がブロック中) でも、scheduler tick の SL/TP 監視
+    (_process_exits) が core_lock を取得できて実行される — **本番配線
+    (scheduler.tick → on_trade_mission → MissionSupervisor.try_submit →
+    _trade_fn → TradeLoop.run_once) を経由**して統合実証する。
+
+    旧稿は `app.trade_loop.run_once("cron")` を別スレッドから直接呼んで
+    おり、scheduler callback (`on_trade_mission`)・supervisor スレッド・
+    ジョブ受理判定のいずれかが壊れていても検出できない欠陥があった
+    (P8-07)。置き換えるのは `TradeLoop.runner` (WorkerRunner 相当) だけに
+    留め、それより上位の scheduler/supervisor/trade_loop の配線はすべて
+    実物を使う。
     """
     # 実装方針:
     # 1. build_app(root, clock=FixedClock(...)) で実 App を構築する
     #    (settings.yaml.example ベースの一時 root — 既存 E2E テストの
     #    init ヘルパーに合わせる)
-    # 2. app.runner を「.run() が threading.Event で解放されるまで
-    #    ブロックする」fake に差し替える (tests/loops/test_trade_loop_phases.py
-    #    の _SlowRunner/BlockingRunner と同型)
+    # 2. app.trade_loop.runner を「.run() 到達を Event で通知してから
+    #    別の Event で解放されるまでブロックする」fake に差し替える
+    #    (WorkerRunner 相当だけを差し替え、scheduler/supervisor/trade_loop
+    #    自体は実物のまま)
     # 3. OPEN 済みの注文 (SL 到達済みのバー) を DB に用意する
-    # 4. 別スレッドで app.trade_loop.run_once("cron") を起動しブロックさせる
-    # 5. メインスレッドで app.scheduler.tick(SL到達後の now) を core_lock
-    #    経由で呼び、SL クローズが実行されること (orders テーブルの
-    #    status が 'closed' になること) を確認する
-    # 6. fake runner を解放し、run_once スレッドを join する
+    # 4. app.supervisor.start() → app.scheduler.tick(now) を呼び、
+    #    scheduler.tick → on_trade_mission → try_submit → _trade_fn →
+    #    run_once → runner.run() という本番経路で Mission を起動する。
+    #    到達 Event を待って「1 回目の tick が実際に Mission を起動した」
+    #    ことを確認する (scheduler→supervisor 配線そのものの検証)。
+    # 5. Mission がブロックしたままの状態で、次 tick
+    #    (app.scheduler.tick(now + 1分)) を呼び、SL クローズが実行される
+    #    こと (orders テーブルの status が 'closed' になること) を確認する
+    # 6. release Event をセットし、supervisor.shutdown()+join() で後始末する
     #
-    # 既存の Env/fixture (tests/core/test_scheduler.py の SL 到達シナリオ、
-    # tests/loops/test_trade_loop_phases.py の BlockingRunner パターン) を
-    # 実ファイルで確認し、両者を組み合わせて実装すること。
+    # 既存の Env/fixture (tests/core/test_scheduler.py の SL 到達シナリオ) を
+    # 実ファイルで確認して実装すること。
     raise NotImplementedError(
         "実装者が Step 1 完了後、既存 fixture を組み合わせて具体化すること")
 ```
@@ -7304,7 +9246,7 @@ Expected: `test_worker_runner_kills_process_that_ignores_sigterm` は WorkerRunn
 
 - [ ] **Step 3: `test_funds_protection_continues_during_blocked_mission` を実装**
 
-Step 1 のコメントに書いた方針に従い、以下の形へ具体化する (実ファイルの既存 fixture 名に実装者が合わせること — 下記は骨格):
+Step 1 のコメントに書いた方針に従い、以下の形へ具体化する (実ファイルの既存 fixture 名に実装者が合わせること — 下記は骨格)。**(裁定書 F-11 / IM-5 / P8-07)** 直接 `trade_loop.run_once(...)` を呼ぶのではなく、`app.supervisor.start()` → `app.scheduler.tick(...)` という本番配線を経由する:
 
 ```python
 def test_funds_protection_continues_during_blocked_mission(tmp_path):
@@ -7322,43 +9264,67 @@ def test_funds_protection_continues_during_blocked_mission(tmp_path):
     clock = FixedClock(now)
     app = build_app(root, clock=clock)
 
-    # SL 到達済みの OPEN ポジションを 1 件用意する (既存 test_scheduler.py
-    # の SL/TP テストパターンに合わせて具体的な entry/SL/bar 価格を選ぶ)
-    oid = _seed_open_position_with_reachable_sl(app.conn_core, now)
+    try:
+        # SL 到達済みの OPEN ポジションを 1 件用意する (既存
+        # test_scheduler.py の SL/TP テストパターンに合わせて具体的な
+        # entry/SL/bar 価格を選ぶ)
+        oid = _seed_open_position_with_reachable_sl(app.conn_core, now)
 
-    class BlockingRunner:
-        def __init__(self):
-            self.release = threading.Event()
+        # 裁定書 F-11 (IM-5/P8-07): 差し替えるのは TradeLoop.runner
+        # (WorkerRunner 相当) だけ — scheduler/supervisor/trade_loop の
+        # 配線は実物のまま本番経路を通す。
+        reached = threading.Event()
+        release = threading.Event()
 
-        def run(self, mission: Mission) -> MissionResult:
-            self.release.wait(10.0)
-            return MissionResult("completed",
-                                 {"action": "hold", "reasoning": "x"}, [])
+        class BlockingRunner:
+            def run(self, mission: Mission) -> MissionResult:
+                reached.set()
+                release.wait(10.0)
+                return MissionResult("completed",
+                                     {"action": "hold", "reasoning": "x"}, [])
 
-    blocking = BlockingRunner()
-    app.trade_loop.runner = blocking
+        app.trade_loop.runner = BlockingRunner()
 
-    t = threading.Thread(
-        target=lambda: app.trade_loop.run_once("cron"), daemon=True)
-    t.start()
-    time.sleep(0.2)  # run_once が run 相 (lock 非保持) に入るまで待つ
+        # 本番経路で 1 回目の Mission を起動する: scheduler.tick →
+        # on_trade_mission → MissionSupervisor.try_submit → _trade_fn →
+        # TradeLoop.run_once → runner.run()。scheduler.tick 自体は
+        # core_lock を保持したまま実行し即座に return する (supervisor へ
+        # 委譲するだけで Mission 完了を待たない — Task 13/15 の設計どおり)。
+        app.supervisor.start()
+        with app.core_lock:
+            app.scheduler.tick(now)
+        assert reached.wait(5.0), (
+            "1 回目の tick が本番配線経由で Mission を起動しなかった "
+            "(scheduler→on_trade_mission→supervisor.try_submit の配線を疑う)")
 
-    # SL/TP 監視が core_lock を取得できることを確認しつつ実行する
-    acquired = app.core_lock.acquire(timeout=2.0)
-    assert acquired, "Mission 実行中でも core_lock が取得できるはず"
-    app.core_lock.release()
+        # Mission (BlockingRunner) がブロックしたままの状態で、次 tick が
+        # SL 到達を実際にクローズできることを確認する (これが受入条件 2
+        # の核心 — Mission 実行中も core_lock が scheduler tick に開放
+        # されている)。**bounded acquire (timeout 付き) を使う** —
+        # `with app.core_lock:` (無期限待ち) だと、変異テスト (lock 粒度を
+        # 意図的に壊す Step 8-2) で Mission 完了までブロックしたまま
+        # pytest 自体がハングし、失敗が「タイムアウトで検出される」の
+        # ではなく「無限に終わらない」になってしまう。
+        acquired = app.core_lock.acquire(timeout=3.0)
+        assert acquired, (
+            "Mission 実行中に core_lock を取得できなかった — "
+            "commit-core のロック粒度が壊れている可能性 (受入条件 2 の核心)")
+        try:
+            app.scheduler.tick(now + timedelta(minutes=1))  # SL 到達バー
+        finally:
+            app.core_lock.release()
 
-    with app.core_lock:
-        app.scheduler.tick(now + timedelta(minutes=1))  # SL 到達バーの tick
+        row = orders_store.get(app.conn_core, oid)
+        assert row["status"] == S.CLOSED.value
 
-    row = orders_store.get(app.conn_core, oid)
-    assert row["status"] == S.CLOSED.value
-
-    blocking.release.set()
-    t.join(timeout=10.0)
+        release.set()
+        app.supervisor.shutdown(drain_exc=RuntimeError("test cleanup"))
+        app.supervisor.join(timeout=10.0)
+    finally:
+        app.close()
 ```
 
-（`_init_root`/`_seed_open_position_with_reachable_sl` は既存の `tests/core/test_scheduler.py`/`tests/test_e2e_phase1.py` 等の E2E fixture パターンに実装者が合わせて書くこと — 具体的な SL 価格・バー価格の数値は既存 SL/TP テストの数値をそのまま転用してよい。)
+（`_init_root`/`_seed_open_position_with_reachable_sl` は既存の `tests/core/test_scheduler.py`/`tests/test_e2e_phase1.py` 等の E2E fixture パターンに実装者が合わせて書くこと — 具体的な SL 価格・バー価格の数値は既存 SL/TP テストの数値をそのまま転用してよい。`app.supervisor.shutdown(...)` は新規受付停止 + 未着手ジョブの drain のみ (ブロックしない) — 実行中だった 1 回目の Mission (既に `release.set()` 済みで完了間近) は `join(timeout=10.0)` が待つ。）
 
 - [ ] **Step 4: テスト実行して PASS を確認**
 
@@ -7377,6 +9343,48 @@ git diff main -- src/agentic_fx/core/transitions.py
 ```
 
 Expected: 3 ファイルとも **diff なし** (`risk_gate.py`/`paper_broker.py`/`transitions.py` は本プランのどの task でも Modify 対象に含まれていない — Files 一覧を全 task 通して `grep -n "risk_gate.py\|paper_broker.py\|transitions.py"` で確認し、1 件もヒットしないことをこの Step で再確認する)。`executor.py` は変更対象だが、`git diff main -- src/agentic_fx/core/executor.py` を目視し、**`evaluate(intent, ctx, ...)` の呼び出しと GateContext 構築ロジックが `_open`/`open_from_snapshot` の両方で完全に同一であること** (Task 14/15 の `_evaluate_and_execute_open` への切り出しが判定ロジックを 1 文字も変えていないこと) をコードレビューで確認する。
+
+**(裁定書 FC-6 追加) kill switch ラッチ書込は「目視」だけに頼らない — 機械検証を追加する**: `risk_gate.py`/`paper_broker.py`/`transitions.py` は「本プランで一切変更されない」ため `git diff` で機械判定できるが、kill switch ラッチの実書込 (`state.update(kill_switch_latched=True)` + `activity.write(Category.SYSTEM, "kill_switch_latched", ...)`) は `executor.py` の中 (Task 14 で `_evaluate_and_execute_open` へ移動済み) にあり、`executor.py` 自体は本プランで大きく変更されるため diff ゼロの対象にできない (旧稿はここを「目視」のみで済ませており、目視レビューが唯一の防波堤になっていた — 裁定書 FC-6)。以下を `tests/test_e2e_worker_isolation.py` に追加し、①ラッチ書込が `_open`/`open_from_snapshot` の**両方の経路**で確実に発火すること、②その判定ロジックのソース文字列を pin して無言の改変を検出できることの 2 点を機械的に固定する:
+
+```python
+def test_kill_switch_latch_fires_identically_via_open_and_open_from_snapshot(tmp_path):
+    """裁定書 FC-6: kill switch latch 書込 (executor.py) は risk_gate/
+    paper_broker/transitions の diff-zero 機械検証の対象外 (executor.py
+    自体は大きく変更されるため) — この回帰テストで代替の機械検証とする。
+    (a) _open (バックテスト/handle_intent 経由) と open_from_snapshot
+    (Mission 経由) の両方で、kill switch 却下時に state.kill_switch_latched
+    が True になり activity に kill_switch_latched が記録されることを
+    確認する。(b) _evaluate_and_execute_open のソースから kill switch
+    判定・書込の中核行が消えていないことを文字列 pin で確認する
+    (inspect.getsource — 無言の改変を検出する)。
+    """
+    import inspect
+
+    from agentic_fx.core.executor import Executor
+
+    src = inspect.getsource(Executor._evaluate_and_execute_open)
+    # 裁定書 FC-6: この 2 行が消える/条件が緩む変異を検出するための pin。
+    assert '"kill switch" in r and "latched" not in r' in src
+    assert "self.state.update(kill_switch_latched=True)" in src
+
+    # (a) 振る舞いの回帰: 実装時に tests/core/test_executor.py の kill
+    # switch 却下シナリオ (drawdown 閾値超過などで result.reasons に
+    # "kill switch" を含む拒否理由が入るケース) を _open 経由・
+    # open_from_snapshot 経由の両方で構築し、いずれも
+    # state_store.load().kill_switch_latched is True になることを
+    # 確認する形に具体化すること (既存 test_executor.py の kill switch
+    # テストの fixture 構築パターンに合わせる)。
+```
+
+- [ ] **Step 5.5 (前半 Task 11 からの申し送り — 既存テスト監査): 二重 `build_app` の既存テスト洗い出し**
+
+Task 11 (FC-2, 前半修整) が `build_app` にプロセス排他 flock (`acquire_instance_lock`) を追加したことで、**同一 `root` に対して `build_app()` を `close()` せず 2 回呼ぶ既存テストは `InstanceAlreadyRunning` で落ちる**。Task 19 で `App.close()` に `instance_lock` の解放が配線されて初めて「1 回目を `close()` してから 2 回目を呼ぶ」パターンが正しく動くようになるため、この監査は Task 19 完了後の本 task (最終統合) で行うのが安全:
+
+```bash
+grep -rn "build_app(" tests/ | grep -v "def \|#"
+```
+
+上記で洗い出した箇所のうち、同一 `tmp_path`/`root` に対して `build_app` を複数回呼んでいて、かつ 1 回目の `App` を `close()` していないものを個別に確認し、以下のいずれかで修正する: ①1 回目の `App` を使い終わったら `app.close()` してから 2 回目を呼ぶ ②2 回目が別の `root` (別ディレクトリ) を使うよう変更する。修正した箇所を progress.md に列挙する。
 
 - [ ] **Step 6: 全体 green (受入条件 8)**
 
@@ -7400,7 +9408,8 @@ uv run pytest tests/core/test_scheduler_tick_order.py tests/core/test_executor_s
 - [ ] **Step 8: 変異テスト**
 
 1. `WorkerRunner._kill` の `os.killpg(proc.pid, signal.SIGKILL)` を `os.killpg(proc.pid, signal.SIGTERM)` に改変 (SIGKILL を送らなくする) → `test_worker_runner_kills_process_that_ignores_sigterm` が red (`trap '' TERM` により無反応、`proc.poll()` が None のまま)
-2. `TradeLoop._run_once_impl` の commit-core `with self._core_lock:` を run 相の周りまで拡張する変異 (意図的に lock 粒度を壊す) → `test_funds_protection_continues_during_blocked_mission` が red (SL クローズが `run_once` 完了まで実行されない = `acquired` が False または tick 呼び出し自体がブロックする)
+2. `TradeLoop._run_once_impl` の commit-core `with self._core_lock:` を run 相の周りまで拡張する変異 (意図的に lock 粒度を壊す) → `test_funds_protection_continues_during_blocked_mission` が red (2 回目の `app.core_lock.acquire(timeout=3.0)` が `False` を返す — bounded acquire なのでテスト自体はハングせず確実に red になる)
+3. **(裁定書 FC-6 追加)** `_evaluate_and_execute_open` の `if any("kill switch" in r and "latched" not in r for r in result.reasons):` を `if False:` に改変 (ラッチが二度と発火しなくなる) → `test_kill_switch_latch_fires_identically_via_open_and_open_from_snapshot` が red (ソース pin の assert が最初に落ちる — さらに振る舞い側の assert も red になることを確認する)
 
 - [ ] **Step 9: Commit**
 
@@ -7411,6 +9420,16 @@ test: プラン8 E2E + 受入条件検証 (設計書 §9 の8項目)
 
 ハング注入→SIGTERM無視→SIGKILL の実プロセス実証、Mission実行中の
 SL/TP監視継続の統合実証を新規追加。他6項目は各taskの実測を集約する。
+
+レビュー反映1回目 (裁定書 F-11/IM-5/P8-07): 資金保護E2Eをtrade_loop.
+run_once直呼びから、supervisor.start()+scheduler.tickによる本番配線
+経由に変更。
+
+レビュー反映1回目 (裁定書 FC-6): kill switchラッチ書込 (executor.py)
+をdiff-zero機械検証の代替として、振る舞い回帰+ソースpinで機械検証する。
+
+前半 (Task 11) からの申し送り対応: 同一rootへのbuild_app二重呼び出し
+既存テストの監査ステップを追加。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -7435,4 +9454,67 @@ EOF
 - `runner.improve.backend == "claude"` は本プランでは `RuntimeError` で fail closed (ClaudeRunner 未実装) — プラン9 で `ClaudeRunner` 実装後にこの分岐を実装へ差し替える
 - 遮断 8 項目の全経路統合回帰テストはプラン9 の blocking 受入条件 (分解書どおり) — 本プランは項目 2 (holdout 実行到達不能性) の worker 境界のみ提供する
 - spec 小改訂束 (exit_mode② / signals UNIQUE 意図明文化 / approved+rejected 併存規則 / claimed_by FK / **close/cancel gate 論点**) はプラン9 前に実施 (分解書どおり、本プランでは着手しない)
+
+## 付録: 実装時照合リスト (未検証のレビュー指摘)
+
+これらは未検証の指摘であり、該当 task の実装者・レビュアーが着手時に照合すること。事実と確認できない場合は無視してよい。
+
+出典: `plan-review-sonnet.md` の「fork 報告」表 (tasks 5-9 担当 fork が発見、主査は詳細照合していない — 77 tool call・23 分の報告のうち件数が多く時間内に全件の再照合はできなかったもの)。裁定書 `plan-review-adjudication.md` の裁定 F-FR (「I14〜I29, I32〜I40 は未検証のまま適用しない。プラン末尾に『実装時照合リスト』として転記し、各 task の実装者・レビュアーが着手時に照合する」) に基づき転記する。
+
+### 表の一行要約 (原文ママ)
+
+| ID | Task | 一行要約 |
+|---|---|---|
+| I14〜I29 | 13, 15, 16, 19 | fork 報告多数 (finalize の finally 未配置、`try_submit` の stop_event 未考慮、`Scheduler(stop_event=)` 未配線、health ラッチの通知未実装、`build_app` 途中失敗時の cleanup 未実装 等) — 詳細は fork 出力を参照 (本ファイルには要約のみ転記) |
+| I32〜I40 | 1-4, 18, 20 | 既存テストの破壊的変更未対応、受入条件の網羅性不足、worktree 並列予定 task 間のファイル衝突 (`signal_tools.py`) 等 |
+
+### 展開済み個別項目 (主査が個別テーマとして書き留めたもの — 上表の範囲に含まれる)
+
+**I14 [Important] Task 13/15 — finalize の finally 未配置**
+該当: Task 15 `_run_once_impl`/`_ask_once_impl`。
+指摘内容: 五相再構成後、`_finalize_mission` (missions.finish 呼び出し) が各分岐 (runner 失敗・parse 失敗・snapshot 失敗・executor 例外) ごとに個別に呼ばれており、「finalize は必ず一度だけ呼ばれる」という不変条件を `finally` で一元的に保証する構造になっていない。将来分岐が増えた際に finalize 呼び忘れが発生しうる (現状の分岐網羅は fork が実装コードを追った限りでは漏れは無いとされるが、保証の仕方が構造的でなく列挙的)。
+fork の修正案: `try/finally` で `_finalize_mission` を一箇所に集約し、各分岐は `result`/`status` をセットして早期 return するだけにする。
+**照合メモ**: 本修整担当が Task 15 を編集した現行版でも `_finalize_mission` は複数分岐 (result.status!=completed / IntentParseError / executor 例外 / 正常系) それぞれで個別に呼ばれている (逐語コード引用は Task 15 本文参照)。列挙的な構造は変わっていない — 着手時に分岐網羅の再確認と、`try/finally` への一元化が可能か (commit-core の `with self._core_lock:` ブロック内で `finally` を使う場合、lock 解放タイミングとの整合に注意) を検討すること。
+
+**I17 [Important] Task 13 — `try_submit` が `stop_event` を考慮しない**
+該当: Task 13 `MissionSupervisor.try_submit`。
+指摘内容: `try_submit` は `self._busy` のみを見て受理判定するため、`shutdown()` で `stop_event` が立った後でも、`_busy` が False なら新規ジョブを queue に投入できてしまう (shutdown と try_submit の間に TOCTOU 的な窓がある)。「新規受付停止」を `stop_event` セットだけで実現している設計書 §5 手順1の想定と食い違う。
+fork の修正案: `try_submit` の先頭で `self._stop_event.is_set()` を確認し、立っていれば即 `None` を返す。
+**照合メモ**: 本修整担当は `MissionSupervisor.try_submit` を変更していない (現行版もまだ `self._stop_event.is_set()` チェックを持たない)。Task 19 で `stop_event` セット後の新規受付停止が要求されるため、着手時に実際に TOCTOU 窓が問題になるか (scheduler 側は `_stopping()` で `on_trade_mission` 呼び出し自体をスキップするため、shell の `ask` 経由だけが窓に該当しうる) を確認すること。
+
+**I19 [Important] Task 19 — `Scheduler(stop_event=...)` が未配線**
+該当: Task 19 の `build_app`/`Scheduler` 構築箇所。
+指摘内容: 設計書 §5 手順1「新規受付停止: stop_event セット → scheduler は起動判定・hooks をスキップ」を実現するには `Scheduler` 側が `stop_event` を参照して `_trade_mission_due`/`_run_hooks` をスキップする必要があるが、`Scheduler.__init__` のシグネチャ・`build_app` での構築のいずれにも `stop_event` パラメータが配線されていない。結果として stop_event セット後も次 tick で通常どおり hooks/Mission 起動判定が走ってしまう。
+fork の修正案: `Scheduler.__init__` に `stop_event: threading.Event | None = None` を追加し、`tick()` 冒頭で `stop_event.is_set()` なら hooks/Mission 起動をスキップして決定論ブロックのみ実行する分岐を追加する。
+**照合メモ**: 本修整担当が編集した現行 Task 19 は既に `Scheduler.__init__(..., stop_event: threading.Event | None = None)` と `_stopping()` メソッドを実装済みであり (Step 5 参照)、この指摘は**現行プランでは解消済み**と見られる。着手時に `build_app` が実際に `Scheduler(..., stop_event=stop_event)` を渡していることを diff で確認すること。
+
+**I22 [Important] Task 19 — health ラッチの通知経路が未実装**
+該当: Task 19 `HealthLatch` 相当のクラス定義箇所。
+指摘内容: 設計書 §6「health ラッチ: activity 書き込み失敗は latched health 状態に記録し、以後は別経路 (notifier + stderr) で警告」とあるが、`record_failure` の実装は内部記録のみで、`notifier.send(...)`/stderr 出力を伴う「別経路での警告」が実装されていない。`status` コマンドでの表示との整合も未確認。
+fork の修正案: `HealthLatch.record_failure` に `notifier`/`stderr` への即時通知を追加する。`Commands.status` の出力に latch 内容を含める実装漏れが無いか確認する。
+**照合メモ**: 本修整担当が編集した現行 Task 19 の `HealthLatch.record_failure` は `self._reasons.append(reason)` のみで、notifier/stderr への即時通知は実装していない (`Commands._status()` への表示は実装済み — pull 型)。設計書の「別経路 (notifier + stderr)」が push 型通知を要求しているのか `status` コマンドでの pull 表示で足りるのか、着手時に設計書と再照合すること。
+
+**I25 [Important] Task 19 — `build_app` 途中失敗時の cleanup 未実装**
+該当: Task 19 の `build_app` 全体。設計書 §5「`build_app` 途中失敗時は構築済み分のみ逆順 cleanup」。
+指摘内容: `build_app` は多数のリソースを順に構築するが、途中の構築 (例: `Rag(...)` の chromadb 初期化) が例外を送出した場合に、それ以前に開いた `conn_core`/`conn_shell` 等を閉じる `try/except`/`finally` が実装コードに見当たらない。
+fork の修正案: `build_app` 全体を `try/except` で包み、例外時はその時点までに構築済みのリソースリストを逆順 close してから re-raise する。
+**照合メモ**: 本修整担当は `build_app` 全体を `try/except` で包む変更を行っていない (現行版も未対応のまま)。`App.close()` (Task 19 で新設) は「完成した `App` インスタンス」を前提に動くため、構築途中の部分的なリソース (ローカル変数のみで `App` に未到達) には使えない。着手時に「本プランのスコープ内で対応するか」「プラン9 に送るか」をユーザーに確認すること (裁定書に明示指示が無いため本修整では手を付けていない)。
+
+**I32 [Important] Task 1-4 — 既存テストの破壊的変更未対応**
+該当: Task 3/4 の複数 step (config.py 新設 kwarg のキーワード必須化箇所)。
+指摘内容: `NewsCollector.__init__`/`EconCalendar.__init__` 等にキーワード必須の新設引数を追加する際、既存の呼び出し箇所 (本体コードだけでなく既存テストのフィクスチャ) 全てを洗い出して更新する指示が「全体 green を確認して失敗したら直す」という事後対応の書き方になっており、洗い出し漏れがあっても step の記述上は検出できる保証が弱い。
+fork の修正案: 事前に `grep` で影響箇所を全列挙してから step 内に明記する形式に統一する。
+**照合メモ**: 本修整担当のスコープ外 (Task 1-4 は担当外)。着手時に Task 3/4 の該当 step を確認し、事前 grep 洗い出しへの書き換えが必要か判断すること。
+
+**I35 [Important] Task 20 — 受入条件の網羅性不足**
+該当: Task 20 の受入条件対応表。
+指摘内容: 設計書 §9 の受入条件 8 項目のうち複数が「他 task で実測済み — 本 task は全体スイートに含まれることの確認のみ」という記載になっており、Task 20 自身が独立に end-to-end で再現するテストを書いていない項目がある。
+fork の修正案: Task 20 に、各受入条件について「他 task のテストを流用」ではなく「本番に近い組み立てで独立に再現する」テストを最低 1 本ずつ追加する。
+**照合メモ**: 本修整担当は受入条件 2 (IM-5/P8-07) を本番配線経由に修正したが、受入条件 3・4・5・6 は依然「他 task の実測を集約」のままであり (Task 20 本文の表参照)、この指摘は**部分的にのみ解消**。着手時に残り 4 項目について本番配線での独立再現が必要かユーザーと合意すること (裁定書に明示指示が無いため本修整ではスコープ外とした)。
+
+**I38 [Important] Task 20 — worktree 並列予定 task 間のファイル衝突 (`signal_tools.py`)**
+該当: プラン規約の「依存の浅い task 束は worktree 並列」の運用と、Task 3 (`signal_tools.py` の description f-string 化) / Task 9 (`signal_tools.py` 経由の Rag RPC 配線に関連する変更) が同一ファイルを編集する可能性。
+指摘内容: プラン本文には task 間の依存関係グラフや「同一ファイルを編集する task の組」が明示されておらず、実行時の判断に委ねられている。
+fork の修正案: プラン冒頭に「同一ファイル編集 task の一覧」を明記し、worktree 並列の対象から除外する組を指定する。
+**照合メモ**: 本修整担当は対応していない (プラン冒頭への一覧追加はスコープ外)。着手時に worktree 並列を計画する場合は `grep -rln "signal_tools.py" docs/superpowers/plans/2026-08-04-phase2-8-worker-isolation.md` 等で同一ファイル編集 task を都度洗い出すこと。
 
