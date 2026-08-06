@@ -2326,10 +2326,16 @@ import ctypes
 import io
 import json
 import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from agentic_fx import mission_worker
+from agentic_fx.config import load_settings
+from agentic_fx.store import signals
+from agentic_fx.store.db import connect, init_db
+from agentic_fx.tools import signal_tools
 
 
 def test_set_pdeathsig_calls_prctl_with_expected_args(monkeypatch):
@@ -2507,6 +2513,55 @@ def test_main_rejects_handshake_with_wrong_type(monkeypatch, tmp_path):
     sent = json.loads(lines[0])
     assert sent["type"] == "ready"
     assert sent["ok"] is False
+
+
+_BASE = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def test_build_clock_default_rejects_stale_signal_as_wall_clock_advances(
+        monkeypatch, tmp_path):
+    """(I4/R2-CX-01) `_build_clock()` の既定 (`SystemClock()`) は呼ぶたび
+    に壁時計を再評価する — Mission 実行中に実時間が進むと、`get_signals`
+    の鮮度窓の基準時刻も一緒に進み、窓の外に出た signal は除外され続ける
+    (fail closed)。`SystemClock.now` を monkeypatch して「1 回目の呼び出し
+    は handshake 直後・2 回目は 45 分後」の壁時計を模擬し、同一 signal が
+    1 回目は含まれ 2 回目は除外されることを検証する。
+
+    `_build_clock()` の戻り値を `FixedClock(...)` (handshake 時点で 1 回
+    だけ `now()` を取得して固定) に変異させると、2 回目の呼び出しでも
+    基準時刻が進まず signal が除外されなくなる (fail-open) — 本テストは
+    その場合に red になる (Task 20 の E2E は資金保護用の FixedClock しか
+    使わず worker 内時刻を進めるシナリオを持たないため、この退行を拾える
+    のは本テストのみ)。"""
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    settings = load_settings(
+        Path(__file__).resolve().parents[1] / "config"
+        / "settings.yaml.example")
+
+    # signal は handshake 時点 (_BASE) の 30 分前に観測された市場イベント
+    # (bar_ts 基準)。since_hours=1 (60分) の窓には handshake 直後は入るが、
+    # 壁時計が 45 分進んだ 2 回目には 75 分前になり窓 (60分) の外に出る。
+    signals.add(
+        conn, plugin="sig1", content_hash="h1", pair="USDJPY",
+        timeframe="1h", bar_ts=(_BASE - timedelta(minutes=30)).isoformat(),
+        kind="signal", payload={"x": 1}, now=_BASE)
+
+    wall_clock_ticks = iter([_BASE, _BASE + timedelta(minutes=45)])
+    monkeypatch.setattr(
+        "agentic_fx.core.contracts.SystemClock.now",
+        lambda self: next(wall_clock_ticks))
+
+    # `_build_clock()` 自身を呼ぶ (monkeypatch しない) — I4 変異
+    # (SystemClock() → FixedClock(...)) を検出する対象はこの呼び出し。
+    clock = mission_worker._build_clock()
+    get_signals = signal_tools.build(conn, settings, clock)[0].func
+
+    out_immediately = get_signals(pair="USDJPY", since_hours=1)
+    assert {r["content_hash"] for r in out_immediately} == {"h1"}
+
+    out_45min_later = get_signals(pair="USDJPY", since_hours=1)
+    assert out_45min_later == []
 ```
 
 - [ ] **Step 6: テスト実行して FAIL を確認**
@@ -2933,7 +2988,7 @@ Expected: 全件 PASS (mission_worker.py は他モジュールから import さ�
 4. (CR-3) `main()` の `_RagRpcProxy(...)` 呼び出しに渡す `out_seq` 引数を `SeqTracker()` (新規独立インスタンス) に差し替える → `test_rag_rpc_proxy_shares_out_seq_with_other_child_to_parent_frames` が red (`sent["seq"]` が 2 ではなく 1 に戻る)
 5. (I2) `_RagRpcProxy._call` の `if response.get("type") != "tool_rpc_result":` チェックを削除 → `test_rag_rpc_proxy_rejects_wrong_frame_type` が red。`self._in_seq.check(response.get("seq"))` 行を削除 → `test_rag_rpc_proxy_rejects_seq_gap` が red
 6. (I2) `main()` の `in_seq.check(handshake.get("seq"))` 呼び出しを削除 → `test_main_rejects_handshake_with_wrong_type` が red (`ready: false` を送らず bootstrap を続行してしまう — 実際には後続の `KeyError`/属性欠落で別の失敗はするが、type 違反を明示的に検出できなくなる)
-7. (I4) `_build_clock()` の戻り値を `SystemClock()` から `FixedClock(...)` に改変 → 直接検証するテストが Task 7 単体には無い (`_build_clock` の実装詳細は Task 20 の E2E が実時計依存の鮮度シナリオで拾う想定) ため、ここでは `_build_clock` が `mission_worker` モジュール属性として存在し `main()` から呼ばれていることを `grep -n "_build_clock" src/agentic_fx/mission_worker.py` で目視確認するに留める (単体では観測できない設計上の限界であることをレビューコメントに明記する)
+7. (I4/R2-CX-01) `_build_clock()` の戻り値を `SystemClock()` から `FixedClock(SystemClock().now())` (handshake 相当で 1 回だけ固定) に改変 → `test_build_clock_default_rejects_stale_signal_as_wall_clock_advances` が red になる (2 回目の `get_signals` 呼び出しでも基準時刻が進まず `out_45min_later` が `{"h1"}` のままで `== []` の assert に失敗する)
 8. (I6) `_make_on_message` 内の `try/except` を削除し `os._exit(1)` 呼び出しごと外す → `test_on_message_exits_process_on_write_failure` が red (`exit_calls` が空のまま、または `BrokenPipeError` が素通しで送出されテストがエラー終了する — いずれにせよ green にならない)
 
 - [ ] **Step 12: Commit**
@@ -3513,7 +3568,7 @@ EOF
 **設計判断 (writing-plans)**:
 - **cwd**: `tempfile.TemporaryDirectory(prefix="afx-mission-")` で Mission ごとに新規の空ディレクトリを作り `cwd=` に渡す。Mission 終了後 (成功・失敗・timeout いずれでも) `with` ブロックで自動削除する
 - **env** (IM-3/P8-03 対応、裁定書 F-9): mission worker 専用の env builder `_mission_worker_env(worker_profile)` を新設する。`plugin/sandbox.py:_build_env()` (`AFX_*` 等の秘密を継承しない最小 env) をベースにしつつ、`plugin/sandbox.py` の env をそのまま流用すると `TWELVEDATA_API_KEY`/`MT5_BRIDGE_API_KEY` (データプロバイダ資格情報) が子に渡らず、MT5/TwelveData を有効化した構成で trade worker の市場データ取得が認証失敗する (レビュー IM-3/P8-03)。trade profile のときだけ、この 2 キーを親環境から明示 allowlist で追加する。`AFX_*`/`ANTHROPIC_*` は引き続き除外。**improve profile では資格情報も渡さない** (裁定書 F-9 — 遮断維持)。network poison (`_poison_network_modules`) はどちらの profile でも呼ばない (mission worker は信頼済みハーネスコードでネットワークが必要、という設計書 §4.5 の方針)
-- **handshake の `now`**: `clock.now()` を 1 回だけ取得し、子は `FixedClock(now)` として Mission 全体で使う (子内の全ツール呼び出しが同じ「判断時点」を見る — Mission 実行中に親と子で時刻がずれて判断材料が矛盾することを避ける、既存の `cycle_rate_fn`/`_evaluate_positions` が「1 回の判断内でレートを固定する」のと同じ設計思想)
+- **handshake の `now`** (レビュー反映 2 回目 R2-CX-01 — Task 7 の `_build_clock()` 実時計方針 (裁定書 I4) に統一): `clock.now()` を 1 回取得して handshake フレームに含めるが、これは**監査・記録用の情報**に留める (transcript/activity に「親がこの Mission を起動した時点の時刻」として残すだけ)。子内の鮮度判定・データ取得境界 (`PriceProvider` の quote/bar 鮮度検証、`signal_tools` の検索境界等) は `FixedClock(now)` ではなく Task 7 の `_build_clock()` が返す実時計 (`SystemClock()`) を使う — handshake の `now` から `FixedClock` を組み立てて Mission 全体の時計として配線してはならない。旧稿にあった「1 回の判断内で時刻を固定し親子で判断材料を矛盾させない」という意図は、鮮度判定を fail-open にする副作用 (停止した Mission が古いデータ/signal を新鮮と誤判定し続ける) の方が上回るため採用しない — 判断材料の一貫性より鮮度の fail-closed を優先する (裁定書 I4)。
 - **RPC dispatcher のリーク検出** (FC-1 対応 — 裁定書の方針どおり `concurrent.futures.ThreadPoolExecutor` は使わない): RAG 呼び出しごとに使い捨ての `threading.Thread(daemon=True)` を spawn し、結果を `queue.Queue(maxsize=1)` 経由で受け取る。`queue.Queue.get(timeout=rpc_timeout_sec)` で打ち切る。`queue.Empty` はリークとして扱い `on_rpc_leak()` を呼ぶ (worker スレッドは回収できないまま残る — 設計書 §4.3 codex I3-1 の裁定どおり「別プロセス化はしない・累積許容もしない」は維持)。**`ThreadPoolExecutor` を使わない理由 (レビュー FC-1)**: `ThreadPoolExecutor` のワーカースレッドは Python の atexit ハンドラ (`concurrent.futures.thread._python_exit`) に登録され、`shutdown(wait=False)` を呼んでもリークして回収不能になったワーカースレッドの終了をインタプリタ終了時に待ち続け、プロセスの `sys.exit()`/非ゼロ終了そのものを無期限にブロックする (実測で再現確認済み — `ThreadPoolExecutor` に未 set の `Event.wait()` を submit して `shutdown(wait=False)` 後にプロセスを終えようとすると `timeout 3s` で rc=124)。**`daemon=True` の素の `threading.Thread` は interpreter 終了時に join されない** ため、リークしたスレッドが存在してもプロセスは正常に (非ゼロ) 終了できる。RAG 呼び出しごとに新規スレッドを spawn する設計変更により「1 回リークした後の後続 RPC も自然に timeout する」保証は `ThreadPoolExecutor(max_workers=1)` の飽和ではなく `Rag` 自身の内部 lock (Task 9, `lock_timeout_sec`) の飽和で担保される (後続呼び出しはリーク中の呼び出しが保持する lock の解放を待って `RagUnavailable`/timeout になる) — 追加のガード条件は不要
 
 - [ ] **Step 1: 失敗するテストを書く (FakeChild によるインプロセス単体テスト)**
@@ -4783,13 +4838,55 @@ class App:
 
 **解放は Task 19 で配線する** (`App.close()` が保持中のリソースを逆順 close する箇所に `instance_lock.close()` を追加する — 本 task では追加しない。Task 19 本文は編集しないこと)。
 
-**実装者への注意 (FC-2 の副作用)**: 同一 `root` に対して `build_app` を複数回呼ぶ既存テスト (先に作った `App`/`instance_lock` を close せずに再度 `build_app(same_root)` する構成) があれば、2 回目が `InstanceAlreadyRunning` で失敗するようになる (意図どおりの回帰検出だが、既存テストの前提が壊れる)。`grep -rn "build_app(" tests/` で該当があれば、テスト側で 1 回目の `app.instance_lock.close()` を明示的に呼んでから 2 回目を build するよう修正すること (Task 19 の `App.close()` 配線を待たずに、テスト側だけの一時対応でよい)。
+**副作用 (FC-2)**: 同一 `root` に対して `build_app` を複数回呼ぶ既存テスト (先に作った `App`/`instance_lock` を close せずに再度 `build_app(same_root)` する構成) があれば、2 回目が `InstanceAlreadyRunning` で失敗するようになる (意図どおりの回帰検出だが、既存テストの前提が壊れる)。この対処は次の Step 12.5 で正式なチェックボックス Step として行う (prose 注記に留めない — レビュー反映 2 回目 R2-SN-01)。
+
+- [ ] **Step 12.5 (レビュー反映 2 回目 R2-SN-01): 二重 `build_app` する既存テストを修正する**
+
+`grep -rn "build_app(" tests/` で洗い出した結果、同一 `root`/`tmp_path` に対して `close()` を挟まず `build_app` を 2 回呼ぶ既存テストは `tests/test_service_app.py::test_f1c_startup_reclaim_recovers_claimed_signal` の 1 件のみ (他の `build_app`/`_build_app` 呼び出しはすべて 1 テスト関数につき 1 回、または関数スコープの `tmp_path` フィクスチャで root が毎回別になる — 同種の二重 build_app は無いことを確認済み)。
+
+`tests/test_service_app.py:373-387` を以下のように修正する — `app1` を明示的に close してから `app2` を build する (テストの意図 = 再起動時の claimed signal 回収、を保ったまま。`app1.instance_lock.close()` だけでなく `app1.close(busy_resources=frozenset())` 相当の完全な close が Task 19 実装後は望ましいが、本 task 時点では `App.close()` に `instance_lock` の解放がまだ配線されていない — Step 12 冒頭の「解放は Task 19 で配線する」のとおり。よって本 task では `app1.instance_lock.close()` を直接呼ぶ最小修正に留める):
+
+```python
+def test_f1c_startup_reclaim_recovers_claimed_signal(tmp_path):
+    """F1(c): 停止時に claimed のまま残った signal 行が、次の build_app
+    (= 次回起動) 直後、tick を待たずに pending へ回収されること。"""
+    from agentic_fx.store import signals as signals_store
+
+    _init(tmp_path)
+    app1 = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                     embedding_fn=FakeEmbedding())
+    sid = signals_store.add(
+        app1.conn_core, plugin="sig1", content_hash="h1", pair="USDJPY",
+        timeframe="1h", bar_ts=(NOW - timedelta(hours=1)).isoformat(),
+        kind="signal", payload={"direction": "long"}, now=NOW)
+    lease_min = app1.settings.plugin.signal_lease_min
+    old = NOW - timedelta(minutes=lease_min + 5)
+    claimed = signals_store.claim_oldest(app1.conn_core, mission_id=999,
+                                         now=old, freshness_bars=None)
+    assert claimed is not None and claimed["id"] == sid  # 前提
+
+    # FC-2 (プラン8): instance_lock (flock) は App の全寿命で保持される
+    # ため、同一 root への 2 回目の build_app は 1 回目の instance_lock を
+    # 解放してからでないと InstanceAlreadyRunning になる。「再起動」を
+    # 模す以上、1 回目のプロセスが終了して lock を手放したことも模す
+    # 必要がある (App.close() への instance_lock 配線は Task 19)。
+    app1.instance_lock.close()
+
+    # 「再起動」を模して同じ DB に対しもう一度 build_app する
+    app2 = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                     embedding_fn=FakeEmbedding())
+
+    row = app2.conn_core.execute(
+        "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()
+    assert row["status"] == "pending"  # 起動時 reclaim が回収した
+```
 
 ```bash
+uv run pytest tests/test_service_app.py -q -k test_f1c_startup_reclaim_recovers_claimed_signal
 uv run pytest -q
 ```
 
-Expected: 全件 PASS (`build_app` を使う既存テストが、`running` 状態の mission 行を残していない限り `recover_interrupted` は no-op で無影響。上記の複数回 `build_app` テストは事前に洗い出して対応済みであること)。
+Expected: 全件 PASS (`build_app` を使う既存テストが、`running` 状態の mission 行を残していない限り `recover_interrupted` は no-op で無影響。二重 `build_app` テストは本 Step で対応済み)。
 
 - [ ] **Step 13: 変異テスト**
 
@@ -4803,7 +4900,8 @@ Expected: 全件 PASS (`build_app` を使う既存テストが、`running` 状�
 ```bash
 git add src/agentic_fx/store/missions.py src/agentic_fx/store/instance_lock.py \
   src/agentic_fx/service.py \
-  tests/store/test_missions_cas.py tests/store/test_instance_lock.py
+  tests/store/test_missions_cas.py tests/store/test_instance_lock.py \
+  tests/test_service_app.py
 git commit -m "$(cat <<'EOF'
 feat: missions.finish の CAS 化 + 起動時 running→interrupted 同時回収 + 単一インスタンス保証
 
@@ -4811,7 +4909,9 @@ feat: missions.finish の CAS 化 + 起動時 running→interrupted 同時回収
 15/16 の五相再構成で行う。起動時に DB ディレクトリの flock で単一
 インスタンスを強制し、recover_interrupted より前に取得することで
 二重起動による稼働中 Mission の誤終端を防ぐ (レビュー FC-2)。解放の
-配線は Task 19 に委ねる。
+配線は Task 19 に委ねる。二重 build_app する既存テスト
+(test_f1c_startup_reclaim_recovers_claimed_signal) を修正 (レビュー
+反映 2 回目 R2-SN-01)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -7092,26 +7192,68 @@ def test_trade_loop_healthcheck_provider_is_readonly(tmp_path):
         app.close()
 ```
 
-**(裁定書 F-6 / CR-5 追加) `tests/loops/test_trade_loop.py` に追加**:
+**(裁定書 F-6 / CR-5 追加、レビュー反映 2 回目 R2-CX-02 で完成形に置換) `tests/loops/test_trade_loop.py` に追加**:
+
+冒頭の import 節に `import threading` と `from agentic_fx.store import signals` を追加する (`tests/loops/test_trade_loop_signal.py` の `_add_signal` ヘルパー・requeue 誘発パターン — `MissionResult("timeout", None, [])` で runner 失敗 → requeue 経路 — に倣う。当ファイルには signal ヘルパーが無いため、下記テスト内にインライン展開する):
 
 ```python
 def test_requeue_signal_happens_under_core_lock(tmp_path):
-    """裁定書 F-6 (CR-5): finally 節の _requeue_signal は core_lock 保持中
-    に呼ばれる — 呼び出し中に他スレッドが core_lock を取得できないことで
-    検証する。"""
+    """裁定書 F-6 (CR-5) / レビュー反映 2 回目 R2-CX-02: finally 節の
+    `_requeue_signal` は core_lock 保持中に呼ばれる — 呼び出し中は他
+    スレッドから core_lock を取得できないこと、かつ呼び出しがちょうど
+    1 回であることを実際に検証する (骨格・恒真テストではない)。"""
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
-        "completed", {"bogus": "no action field"}, [])])  # parse失敗させる
-    # signal トリガーで claim させ、parse 失敗 → 例外なしで finalize される
-    # 経路 (requeue は起きない) ではなく、consume 前に例外を発生させて
-    # requeue 経路を通す必要がある。実装時は「claim 成功 → runner が
-    # 例外を送出」等、requeue が発生する既存の失敗系テスト
-    # (tests/loops/test_trade_loop_signal.py 等) の構成に倣い、
-    # _requeue_signal 呼び出しの直前に別スレッドで core_lock.acquire
-    # (blocking=False) を試みて False (取得できない = lock 保持中) を
-    # 確認する形に組み立てること。
-```
+        "timeout", None, [])])  # runner 失敗 → requeue 経路 (consume 前)
+    sid = signals.add(
+        conn, plugin="sig1", content_hash="h1", pair="USDJPY",
+        timeframe="1h", bar_ts=NOW.isoformat(), kind="signal",
+        payload={"direction": "long", "strength": 0.7, "rationale": "up"},
+        now=NOW)
 
-（このテストは Step 1 で先に骨格だけ書き、実装時に `_requeue_signal` を monkeypatch して「呼ばれた瞬間に `loop._core_lock.acquire(blocking=False)` が False を返す」ことを assert する形へ具体化する — 呼び出し元スレッドから見た RLock の性質上、同一スレッドでの `acquire(blocking=False)` は常に成功してしまうため、検証は別スレッドから行うこと。）
+    entered = threading.Event()
+    proceed = threading.Event()
+    calls: list[object] = []
+    original_requeue_signal = loop._requeue_signal  # bound method (self 済み)
+
+    def spy_requeue_signal(*args, **kwargs):
+        calls.append(args)
+        entered.set()
+        # requeue 呼び出しの「最中」を維持したまま、別スレッドに
+        # core_lock.acquire(blocking=False) を試させる猶予を作る。
+        assert proceed.wait(5.0), "checker スレッドが確認を完了しなかった"
+        return original_requeue_signal(*args, **kwargs)
+
+    loop._requeue_signal = spy_requeue_signal
+
+    t = threading.Thread(target=lambda: loop.run_once("signal"), daemon=True)
+    t.start()
+    assert entered.wait(5.0), "_requeue_signal が呼ばれなかった"
+
+    # RLock は同一スレッドからの acquire(blocking=False) は常に成功して
+    # しまう (再入可能) ため、必ず別スレッド (checker) から確認する。
+    acquired: list[bool] = []
+    checker = threading.Thread(
+        target=lambda: acquired.append(
+            loop._core_lock.acquire(blocking=False)))
+    checker.start()
+    checker.join(timeout=5.0)
+    if acquired and acquired[0]:
+        loop._core_lock.release()  # 誤って取れてしまった場合の後始末
+    assert acquired == [False], (
+        "_requeue_signal 実行中は他スレッドから core_lock を取得できない"
+        "はず (finally 節が with self._core_lock: で包んでいることの検証)")
+
+    proceed.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+
+    assert len(calls) == 1  # requeue はちょうど 1 回だけ呼ばれる
+    row = conn.execute(
+        "SELECT status, requeue_count FROM signals WHERE id=?",
+        (sid,)).fetchone()
+    assert row["status"] == "pending"
+    assert row["requeue_count"] == 1
+```
 
 - [ ] **Step 10: 全体 green**
 
@@ -7128,7 +7270,7 @@ Expected: 全件 PASS。
 3. `_read_exposure_pairs` が `executor._EXPOSURE` の代わりに `(S.OPEN,)` のみを使うよう改変 → 専用テストが無ければ `tests/core/test_executor_snapshot.py` の `test_open_from_snapshot_rejects_when_exposure_grew_after_commit_pre` 相当が (統合すれば) red になることを確認する
 4. **(裁定書 F-1 追加)** commit-pre の CLOSE 分岐 (`elif intent.action is Action.CLOSE:` ブロック) を削除し、代わりに commit-core 内で毎回 `self.executor.gather_close_snapshot(row)` を呼ぶよう戻す (I/O をロック内に再導入する変異) → `test_scheduler_tick_can_acquire_lock_while_close_quote_fetch_blocks` が red (タイムアウトして `acquired is False`)
 5. **(裁定書 F-6 追加)** `TradeLoop` 構築時の `provider=healthcheck_provider` を `provider=provider` (書込可能版) に戻す → `test_trade_loop_healthcheck_provider_is_readonly` が red
-6. **(裁定書 F-6 追加)** finally 節の `with self._core_lock: self._requeue_signal(claimed)` を lock 無しの直接呼び出しに戻す → `test_requeue_signal_happens_under_core_lock` が red
+6. **(裁定書 F-6 追加、レビュー反映 2 回目 R2-CX-02 でテスト本体を完成させたことで実際に検出できるようになった)** finally 節の `with self._core_lock: self._requeue_signal(claimed)` を lock 無しの直接呼び出しに戻す → `test_requeue_signal_happens_under_core_lock` が red (checker スレッドの `loop._core_lock.acquire(blocking=False)` が `True` を返してしまい `acquired == [False]` の assert に失敗する)
 
 - [ ] **Step 12: Commit**
 
@@ -9376,15 +9518,15 @@ def test_kill_switch_latch_fires_identically_via_open_and_open_from_snapshot(tmp
     # テストの fixture 構築パターンに合わせる)。
 ```
 
-- [ ] **Step 5.5 (前半 Task 11 からの申し送り — 既存テスト監査): 二重 `build_app` の既存テスト洗い出し**
+- [ ] **Step 5.5 (前半 Task 11 からの申し送り — 既存テスト監査、レビュー反映 2 回目 R2-SN-01 で役割を最終確認に限定): 二重 `build_app` の既存テスト横断監査**
 
-Task 11 (FC-2, 前半修整) が `build_app` にプロセス排他 flock (`acquire_instance_lock`) を追加したことで、**同一 `root` に対して `build_app()` を `close()` せず 2 回呼ぶ既存テストは `InstanceAlreadyRunning` で落ちる**。Task 19 で `App.close()` に `instance_lock` の解放が配線されて初めて「1 回目を `close()` してから 2 回目を呼ぶ」パターンが正しく動くようになるため、この監査は Task 19 完了後の本 task (最終統合) で行うのが安全:
+Task 11 (FC-2, 前半修整 + レビュー反映 2 回目 R2-SN-01 の Step 12.5) が `build_app` にプロセス排他 flock (`acquire_instance_lock`) を追加した時点で、当時判明していた唯一の該当ケース (`tests/test_service_app.py::test_f1c_startup_reclaim_recovers_claimed_signal`) は Task 11 内で個別対処済み (`app1.instance_lock.close()` を挟んでから 2 回目の `build_app` を呼ぶよう修正し、Task 11 の `git add` にも含めている)。**本 Step は新規の個別対処ではなく、Task 12〜19 の実装で新たに二重 `build_app` パターンが混入していないかを最終統合時点で横断監査するだけ**:
 
 ```bash
 grep -rn "build_app(" tests/ | grep -v "def \|#"
 ```
 
-上記で洗い出した箇所のうち、同一 `tmp_path`/`root` に対して `build_app` を複数回呼んでいて、かつ 1 回目の `App` を `close()` していないものを個別に確認し、以下のいずれかで修正する: ①1 回目の `App` を使い終わったら `app.close()` してから 2 回目を呼ぶ ②2 回目が別の `root` (別ディレクトリ) を使うよう変更する。修正した箇所を progress.md に列挙する。
+上記で洗い出した箇所のうち、同一 `tmp_path`/`root` に対して `build_app` を複数回呼んでいて、かつ 1 回目の `App` を `close()` (または `instance_lock.close()`) していないものが Task 11 対処分以外に無いことを確認する。万一見つかった場合のみ、以下のいずれかで個別修正する: ①1 回目の `App` を使い終わったら `app.close()` (Task 19 配線後) または `app.instance_lock.close()` してから 2 回目を呼ぶ ②2 回目が別の `root` (別ディレクトリ) を使うよう変更する。監査結果 (該当なし、または追加修正した箇所) を progress.md に記録する。
 
 - [ ] **Step 6: 全体 green (受入条件 8)**
 
