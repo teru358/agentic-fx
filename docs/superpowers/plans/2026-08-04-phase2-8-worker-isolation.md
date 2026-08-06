@@ -98,7 +98,7 @@ tests/
 - Modify: `src/agentic_fx/tools/market_tools.py:18`(定義)`,94`(呼び出し)
 - Modify: `src/agentic_fx/tools/signal_tools.py:124`(呼び出し)
 - Modify: `src/agentic_fx/plugin/approval.py:88`(コメント内の関数名言及のみ)
-- Test: 既存テスト (`tests/backtest/test_runner.py`, `tests/plugin/test_strategy_adapter.py`, `tests/tools/test_market_tools.py`, `tests/tools/test_signal_tools.py`) は private 名を直接 import していないため変更不要 — 既存スイート green であることが本 task の受入条件
+- Test: 既存テスト (`tests/backtest/test_runner.py`, `tests/plugin/test_strategy_adapter.py`, `tests/tools/test_tool_impls.py`, `tests/tools/test_signal_tools.py`) は private 名を直接 import していないため変更不要 — 既存スイート green であることが本 task の受入条件
 
 **Interfaces:**
 - Produces: `agentic_fx.backtest.runner.parse_timeframe(tf: str) -> timedelta` (旧 `_parse_timeframe`)、`agentic_fx.tools.market_tools.pair_param(settings: Settings) -> dict` (旧 `_pair_param`)。シグネチャ・挙動は無変更、名前のみ変更
@@ -107,7 +107,7 @@ tests/
 - [ ] **Step 1: 既存テストが green であることを確認するベースライン取得**
 
 ```bash
-uv run pytest tests/backtest/test_runner.py tests/plugin/test_strategy_adapter.py tests/tools/test_market_tools.py tests/tools/test_signal_tools.py -q
+uv run pytest tests/backtest/test_runner.py tests/plugin/test_strategy_adapter.py tests/tools/test_tool_impls.py tests/tools/test_signal_tools.py -q
 ```
 
 Expected: 全 PASS (rename 前のベースライン)。
@@ -193,7 +193,7 @@ Expected: 全件 PASS (rename 前と同じテスト数・結果)。
 
 - [ ] **Step 8: 変異テスト (rename の正しさをテストが検出できることの確認)**
 
-`market_tools.py` の `pair_schema = pair_param(settings)` を一時的に `pair_schema = {}` に改変して `uv run pytest tests/tools/test_market_tools.py -q` を実行し、`get_ohlcv`/`get_indicators` の schema 検証テストが red になることを確認する (既存テストが pair enum の中身を見ていることのピン)。確認後、改変を元に戻す。
+`market_tools.py` の `pair_schema = pair_param(settings)` を一時的に `pair_schema = {}` に改変して `uv run pytest tests/tools/test_tool_impls.py -q` を実行し、`get_ohlcv`/`get_indicators` の schema 検証テストが red になることを確認する (既存テストが pair enum の中身を見ていることのピン)。確認後、改変を元に戻す。
 
 - [ ] **Step 9: Commit**
 
@@ -1690,7 +1690,7 @@ Expected: 全件 PASS (既存の書込ありテスト (`test_get_bars_caches` �
 
 - [ ] **Step 8: 失敗するテストを書く (`build_mission_registry`)**
 
-`tests/tools/test_mission_registry.py` を新規作成 (`tests/tools/test_market_tools.py` 等の既存 fixture 命名規約を確認してから書く):
+`tests/tools/test_mission_registry.py` を新規作成 (`tests/tools/test_tool_impls.py` 等の既存 fixture 命名規約を確認してから書く):
 
 ```python
 """build_mission_registry (プラン 8 worker 基盤 — 設計書 §4.2)。"""

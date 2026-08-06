@@ -109,7 +109,7 @@ def test_fires_only_on_declared_timeframe_boundary(tmp_path):
 def test_fires_only_on_1h_boundary_with_30m_eval_grid(tmp_path):
     """F1 (codex Medium — レビュー fix round 1): `closed_bar.interval` が
     `TF_MINUTES` に無い任意の `run_replay` 合法値 (30m 等 — runner.py の
-    `_parse_timeframe` が受理する任意の "Nm"/"Nh") でも幅導出が機能する
+    `parse_timeframe` が受理する任意の "Nm"/"Nh") でも幅導出が機能する
     ことを確認する。旧実装 (`TF_MINUTES` 参照) はこの eval_timeframe で
     必ず `ValueError` になっていた — この RED が変異証明を兼ねる。"""
     conn = _conn(tmp_path)
@@ -139,7 +139,7 @@ def test_unknown_eval_bar_interval_raises_value_error():
         meta, conn=object(), pair="USDJPY", source="dukascopy",
         settings=SETTINGS, session=_FakeSession())
     # F5 (sonnet Minor — レビュー fix round 1): エラー文言固有の部分文字列
-    # に絞る (本プランのテスト規約)。F1 で幅導出を runner._parse_timeframe
+    # に絞る (本プランのテスト規約)。F1 で幅導出を runner.parse_timeframe
     # へ委譲したため、実際に送出されるのはそちらのメッセージ。
     with pytest.raises(ValueError, match="unsupported eval_timeframe"):
         src(_bar(H, interval="not-a-real-interval"))
