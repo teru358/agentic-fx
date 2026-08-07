@@ -168,6 +168,35 @@ def connect(db_path: Path, *, check_same_thread: bool = False) -> sqlite3.Connec
     return conn
 
 
+def connect_readonly(db_path: Path) -> sqlite3.Connection:
+    """読み取り専用で SQLite に接続する (mission worker 子プロセス専用 —
+    設計書 §3.4 codex I-7)。
+
+    書き込み系 PRAGMA (journal_mode 等) は発行しない — 既に WAL で稼働中の
+    親プロセスの DB を読むだけであり、モード変更は不要かつ RO 接続では
+    そもそも失敗する。`-wal`/`-shm` ファイルは親プロセスが作成済み (稼働中
+    サービスが前提) なので読み取り可能。
+
+    `db_path` が存在しない場合は `FileNotFoundError` — RO 接続は「既に
+    `init_db` 済みの DB」を前提とし、この関数自身はスキーマを作らない
+    (子プロセスがスキーマを作る権限を持つべきではない)。
+    """
+    if sqlite3.sqlite_version_info < (3, 35, 0):
+        raise RuntimeError(
+            f"SQLite {sqlite3.sqlite_version} is too old (>= 3.35 required)")
+    if not db_path.exists():
+        raise FileNotFoundError(
+            f"connect_readonly requires an already-initialized DB: {db_path}")
+    uri = f"file:{db_path}?mode=ro"
+    # isolation_level=None: autocommit mode — 読み取り専用なので buffering の
+    # 必要がなく、即座にエラーを検出する (execute() で直ちに SQLite へ到達)。
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False,
+                          isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str,
                    ddl: str) -> None:
     """存在しない列を追加する (SQLite は ADD COLUMN IF NOT EXISTS を持たない)。

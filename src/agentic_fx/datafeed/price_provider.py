@@ -65,10 +65,17 @@ _SPECS = {
 
 class PriceProvider:
     def __init__(self, conn: sqlite3.Connection, settings: Settings,
-                 clock: Clock) -> None:
+                 clock: Clock, readonly: bool = False) -> None:
         self.conn = conn
         self.settings = settings
         self.clock = clock
+        # CR-4 (裁定書 F-5): 子プロセス (mission_worker.py) は conn に
+        # db.connect_readonly (mode=ro) を渡す。get_bars/_derive の
+        # cache 書込 (ohlcv.upsert_bars) は RO 接続下で
+        # sqlite3.OperationalError になるため、readonly=True のときは
+        # 書込呼び出し自体をスキップする (RPC 経由の親委譲はしない —
+        # RPC 面を拡大しない設計裁定)。
+        self.readonly = readonly
         self._bars_source: dict[tuple[str, str], str] = {}
         self._bars_origin: dict[tuple[str, str], str] = {}
 
@@ -152,8 +159,9 @@ class PriceProvider:
                     # 実ソース名を渡す (全部 yfinance 名義で書くと live ソース同士
                     # が上書きし合い、source 列が嘘になる — レビュー裁定 codex I7)。
                     # 永続化用 ID への変換は _storage_source (F1)。
-                    ohlcv.upsert_bars(self.conn, bars,
-                                      source=_storage_source(name))
+                    if not self.readonly:
+                        ohlcv.upsert_bars(self.conn, bars,
+                                          source=_storage_source(name))
                 else:
                     base = self._finest_native_base(name, interval)
                     # 保存は _derive が base 足に対して行う (導出足は保存しない)
@@ -330,7 +338,8 @@ class PriceProvider:
         validate_bars(raw, self.clock.now(),
                       self.settings.datafeed.freshness_max_min,
                       sources.INTERVAL_MIN[base])
-        ohlcv.upsert_bars(self.conn, raw, source=_storage_source(source))
+        if not self.readonly:
+            ohlcv.upsert_bars(self.conn, raw, source=_storage_source(source))
         return self._resample(raw, pair, interval)
 
     def _resample(self, base_bars: list[Bar], pair: str,

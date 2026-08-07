@@ -166,7 +166,7 @@ def test_build_app_wires_approved_plugins_into_market_tools(tmp_path):
         return real_build(*args, **{**kwargs, "indicator_plugins": None})
 
     with patch("agentic_fx.service.plugin_loader.approved_plugins") as approved, \
-         patch("agentic_fx.service.market_tools.build",
+         patch("agentic_fx.tools.mission_registry.market_tools.build",
                side_effect=spy_build) as build_spy:
         approved.return_value = [sentinel_meta]
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))

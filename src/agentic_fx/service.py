@@ -47,9 +47,9 @@ from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.rag import Rag
 from agentic_fx.store.state import StateStore
 from agentic_fx.tools import (
-    account_tools, market_tools, news_tools, plugin_loader, reflection_tools,
-    signal_tools,
+    plugin_loader, signal_tools,
 )
+from agentic_fx.tools.mission_registry import build_mission_registry
 from agentic_fx.tools.registry import ToolRegistry
 
 _log = logging.getLogger("agentic_fx.service")
@@ -382,16 +382,17 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     # ため App 寿命で 1 個だけ生成する (再生成 = cursor 喪失)。
     signal_producer = SignalProducer()
 
-    registry = ToolRegistry()
-    registry.register_all(market_tools.build(
-        provider, econ, settings, indicator_plugins=approved))
-    registry.register_all(news_tools.build(rag))
-    registry.register_all(account_tools.build(conn_core, broker))
-    # 上書き 6: reflection_tools.build は pairs が必須引数 (Task 0-8)
-    registry.register_all(reflection_tools.build(conn_core, rag, settings.pairs))
-    # プラン 7 Task 9: get_signals (取引判断 loop 専用。_TRADE_TOOLS 経由で
-    # trade/ask 両 Mission に露出する)
-    registry.register_all(signal_tools.build(conn_core, settings, clock))
+    # プラン 8 worker 基盤: 親 (ここ) と子 (mission_worker.py) が同一関数
+    # (build_mission_registry) でツール配線を組み立てる。親は既に構築済みの
+    # provider/econ/broker を再利用せず、conn_core から独立に再構築する
+    # (子との配線一致を関数の同一性だけで担保するため — 親の長寿命
+    # インスタンスを別途 provider/econ/broker として保持している事実と
+    # 矛盾しない: registry 内のツールクロージャは新しく作った
+    # provider/econ/broker を束縛するが、これらは conn_core を共有する
+    # ため実質的に同じ DB 状態を見る)。
+    registry = build_mission_registry(
+        "trade", conn_core, settings, clock, rag, activity=activity,
+        indicator_plugins=approved)
     # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
     _validate_startup(settings)
     _assert_tools_registered(registry, _TRADE_TOOLS)

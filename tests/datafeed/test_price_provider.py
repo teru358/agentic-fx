@@ -773,3 +773,30 @@ def test_to_account_rate_cross_leg_skew_exceeded_raises(tmp_path):
                side_effect=_fn):
         with pytest.raises(DataUnhealthy, match="skew"):
             _rate(p, "EUR", "JPY", reference_ts=NOW)
+
+
+def test_readonly_provider_skips_bar_cache_write(tmp_path):
+    """CR-4 対応 (裁定書 F-5): readonly=True で構築した PriceProvider は
+    get_bars 成功時に ohlcv.upsert_bars を呼ばない — RO 接続下でも
+    `sqlite3.OperationalError` にならないことの単体ピン。"""
+    s = load_settings(EXAMPLE)
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    p = PriceProvider(conn, s, FixedClock(NOW), readonly=True)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_fresh_bars()):
+        bars = p.get_bars("USDJPY", "1m", 1)
+    assert len(bars) == 30
+    assert ohlcv.load_bars(conn, "USDJPY", "1m", source="yfinance") == []
+
+
+def test_readonly_provider_skips_derived_bar_cache_write(tmp_path):
+    """readonly=True は _derive 経路 (base 足の保存) でも書込をスキップする。"""
+    s = load_settings(EXAMPLE)
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    p = PriceProvider(conn, s, FixedClock(NOW), readonly=True)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               return_value=_fresh_bars(interval="1h", n=100)):
+        p.get_bars("USDJPY", "4h", 5)
+    assert ohlcv.load_bars(conn, "USDJPY", "1h", source="yfinance") == []
