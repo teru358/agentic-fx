@@ -14,6 +14,8 @@
 - 全体指揮 + 実装監督: opus (main セッション)。実装担当: haiku (機械的 task = Task 1-4, 9, 11, 17 目安) / codex (重量 task = Task 7, 10, 13-16, 19 目安)。レビュー: sonnet + codex 交差 (codex 実装分は sonnet 主査)。変異検証: haiku 並列 fan-out
 - 大 task はテスト転写と実装転写を並列執筆し、統合 + red/green 実行は 1 レーン直列 (red 先行観測は統合役の実行順序で担保)。小 task は丸ごと 1 agent
 - 依存の浅い task 束は worktree 並列。**ユーザーへの節目確認は task 単位ではなく束単位**
+- **各 step に書かれた変異リストは「下限」であって天井ではない** (Task 2 レビューで確定した運用規則)。実装者は「この task が守ろうとしている防御・性質」ごとに、それを外して red になるかを自分で 1 件ずつ確かめ、リストに無い変異を追加したら報告する。既存テストを弱める変更をする場合は、等価以上の代替ピンを同時に用意して報告する
+  - 根拠 (実測): Task 2 の実装者はプラン記載の変異 5 件を全て実測して red を確認したが、リストに無かった `--noconftest` の多層防御は無防備で、削除しても `tests/plugin/` の 201 テストが green のままだった (sonnet 副査が実測検出)
 - エスカレーション: haiku 同一 task 2 回失敗 → codex/sonnet 再割当。割れた Critical は codex 反証要求 or ユーザー park
 - レジャー: `.superpowers/sdd/2026-08-04-phase2-8-worker-isolation/progress.md`
 
@@ -228,7 +230,7 @@ EOF
 - Modify: `src/agentic_fx/plugin/sandbox.py:288-307`(`PluginSession.__init__`)`,309-341`(`__enter__`)`,406-424`(`call`)`,383-386`(`close`) — owner thread assert
 - Modify: `src/agentic_fx/config.py` (`PluginSettings` に `sandbox_nofile`/`sandbox_fsize_mb` 追加)
 - Modify: `config/settings.yaml.example` (同期)
-- Test: `tests/plugin/test_worker.py` (RLIMIT_NOFILE/FSIZE 追加テスト。無ければ `tests/plugin/test_sandbox.py` に追記), `tests/plugin/test_approval.py` (pytest_runner env/rlimit/poison テスト追記), `tests/plugin/test_sandbox_thread_safety.py` (新規)
+- Test: `tests/plugin/test_worker.py` (RLIMIT_NOFILE/FSIZE 追加テスト。**存在しないので新規作成する** — Step 1 の指示に従う。指揮者確認済み: `tests/plugin/` の実体は test_approval / test_loader / test_sandbox / test_signal_eval / test_signal_producer / test_strategy_adapter のみ), `tests/plugin/test_approval.py` (pytest_runner env/rlimit/poison テスト追記), `tests/plugin/test_sandbox_thread_safety.py` (新規)
 
 **Interfaces:**
 - Produces:
@@ -460,7 +462,7 @@ approval.py の `_default_pytest_runner` が spawn する唯一の想定呼び�
 `python -m pytest` を直接 spawn するのをやめてこのモジュールを経由させる
 理由: pytest がテストモジュール (test_plugin.py 経由で plugin.py) を
 import する**前**にネットワーク毒入れを適用するため。resource limit
-(RLIMIT_AS/NOFILE/FSIZE/CPU) は起動側 (approval.py の `preexec_fn`) が
+(RLIMIT_AS/NOFILE/FSIZE) は起動側 (approval.py の `preexec_fn`) が
 fork 直後・exec 直前に設定済みの前提で、ここでは毒入れと pytest 起動のみ
 行う。
 """
@@ -750,9 +752,11 @@ EOF
 ```python
 def test_signal_maintenance_reclaims_before_expiring(monkeypatch):
     """reclaim_expired → expire_stale の順で呼ばれる (順序入替、codex M⑤)。
-    reclaim で pending に戻った直後の stale 行が、同じ tick 内の
-    expire_stale でまだ拾われずに 1 tick 分だけ実行機会を得ることを、
-    呼び出し順の記録で確認する。**(裁定書 F-16/IM-10)** `service.py` の
+    reclaim で pending に戻った行が鮮度切れなら、同じ tick 内の
+    expire_stale で abandoned という終端状態に落ちることを、
+    呼び出し順の記録で確認する (**レビュー反映 2 回目 / Task 3 codex I-1**:
+    旧稿は「1 tick 分だけ実行機会を得る」と書いていたが因果が逆。
+    実際にはこの順序こそが同一 tick 内での終端化を起こす)。**(裁定書 F-16/IM-10)** `service.py` の
     実クロージャが呼ぶ module レベル関数 `_run_signal_maintenance` を
     直接呼び、`agentic_fx.store.signals` の実モジュール関数を
     monkeypatch する — テスト内の再定義フェイクに対して assert する
@@ -804,7 +808,7 @@ Expected: FAIL (`AttributeError: module 'agentic_fx.service' has no attribute '_
 
 - [ ] **Step 3: `service.py` の `on_signal_maintenance` 順序を入替 + 実クロージャ検証可能化**
 
-**(裁定書 F-16/IM-10)** `on_signal_maintenance` の本体を module レベル関数 `_run_signal_maintenance` として切り出し、`build_app` 内の閉包はこれを呼ぶだけにする — これにより Step 1 のテストが `build_app()` 全体を構築せずに実ロジックへ直接到達できる。`src/agentic_fx/service.py:369-382` を以下に置き換える (`reclaim_expired` を `expire_stale` より前に呼ぶ — codex M⑤: stale 行が reclaim される前に abandoned 化されてしまうと、まだ requeue_count に余裕がある行が 1 tick 分の実行機会を失う):
+**(裁定書 F-16/IM-10)** `on_signal_maintenance` の本体を module レベル関数 `_run_signal_maintenance` として切り出し、`build_app` 内の閉包はこれを呼ぶだけにする — これにより Step 1 のテストが `build_app()` 全体を構築せずに実ロジックへ直接到達できる。`src/agentic_fx/service.py:369-382` を以下に置き換える (`reclaim_expired` を `expire_stale` より前に呼ぶ — codex M⑤。**レビュー反映 2 回目 / Task 3 codex I-1 で因果を訂正**: この順序の利得は「無駄な mission の実行の回避」ではなく、reclaim で pending に戻った鮮度切れ行が同一 tick 内で abandoned という終端状態に落ちること、および `expire_stale` の戻り値 (呼び出し側が通知件数に使う) の正確さである。鮮度ゲート有効時は `claim_oldest` の WHERE が `_FRESH_CONDITION` を含み、`_STALE_CONDITION` はその厳密な補集合なので、stale な pending が mission に claim されることは構造的にあり得ない):
 
 ```python
 def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
@@ -815,10 +819,18 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
 
     Task 7 申し送り → プラン 8 B 束で順序入替 (codex M⑤): lease 切れの
     claimed 行を先に reclaim_expired で pending へ戻し、その後に
-    expire_stale で鮮度切れの pending を abandoned 化する。逆順だと、
-    reclaim で pending に戻ったばかりの行が同じ tick 内で鮮度切れ判定に
-    巻き込まれて abandoned になり得た (無駄な 1 tick 分の巻き戻り)。
-    呼び出し元 (Scheduler._run_data_hook) が fail-open で包む。
+    expire_stale で鮮度切れの pending を abandoned 化する。この順序に
+    より、reclaim で pending に戻った行が鮮度切れなら同じ tick 内で
+    abandoned という終端状態に落ちる。旧順序 (expire → reclaim) では、
+    その行は expire の時点でまだ claimed のため対象外となり、鮮度切れで
+    claim され得ない pending のまま次の maintenance まで居残った。
+    なお鮮度ゲート有効時 (freshness_bars is not None) は claim_oldest の
+    WHERE が _FRESH_CONDITION を含み、_STALE_CONDITION はその厳密な
+    補集合であるため、stale な pending が mission に拾われることはない
+    — 本順序の利得は「無駄な mission の実行の回避」ではなく、終端状態
+    への即時収束と expire_stale の戻り値 (呼び出し側が通知件数に使う)
+    の正確さである。呼び出し元 (Scheduler._run_data_hook) が fail-open
+    で包む。
     """
     signals.reclaim_expired(conn, now=now,
                             lease_min=settings.plugin.signal_lease_min,
@@ -9660,3 +9672,7 @@ fork の修正案: Task 20 に、各受入条件について「他 task のテ�
 fork の修正案: プラン冒頭に「同一ファイル編集 task の一覧」を明記し、worktree 並列の対象から除外する組を指定する。
 **照合メモ**: 本修整担当は対応していない (プラン冒頭への一覧追加はスコープ外)。着手時に worktree 並列を計画する場合は `grep -rln "signal_tools.py" docs/superpowers/plans/2026-08-04-phase2-8-worker-isolation.md` 等で同一ファイル編集 task を都度洗い出すこと。
 
+**T2-1 [制約メモ] Task 16/18 — `preexec_fn` はスレッド安全でない (Task 2 レビューで検出)**
+該当: `plugin/approval.py` の `_default_pytest_runner` が新設した `preexec_fn` (rlimit 設定)。
+内容: `subprocess.Popen(preexec_fn=...)` は原理的にスレッド安全でない (fork 後・exec 前の子で任意の Python コードを実行するため、他スレッドが保持していたロックがデッドロックし得る)。**現時点では plugin 承認が単一スレッドの CLI 経路からしか到達しないため実害はない** (sonnet 副査が確認、non-blocking 判定)。
+**照合メモ**: 本プラン 8 は supervisor / watchdog / scheduler / RPC dispatcher の 4 スレッドを新設する。**plugin 承認・plugin 評価がスレッド文脈から到達可能になる task (ReflectionCycle = Task 16、improve profile = Task 18 が候補) の着手時に、この経路がマルチスレッドから呼ばれないことを確認すること。** 呼ばれるなら `preexec_fn` を捨てて子側 (`pytest_sandbox_entry`) の先頭で rlimit を設定する方式へ移す。
