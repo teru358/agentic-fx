@@ -833,6 +833,50 @@ def test_dispatch_sqlite_error_returns_rc1_with_diagnostic(tmp_path, capsys, mon
     assert "database is locked" in capsys.readouterr().err
 
 
+def test_dispatch_sqlite_error_on_connect_returns_rc1_with_diagnostic(
+        tmp_path, capsys, monkeypatch):
+    """cli.connect が sqlite3.Error を起こした場合、生の traceback ではなく
+    診断メッセージ + rc=1 に正規化される (codex I-2: DB 初期化境界)。"""
+    import argparse
+    import sqlite3
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("cannot open database file")
+
+    monkeypatch.setattr(cli, "connect", boom)
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        args = argparse.Namespace(command="history", history_command="coverage",
+                                  symbol="USDJPY", timeframe="1h", source="dukascopy",
+                                  **{"from": "2026-07-01", "to": "2026-07-02"})
+        rc = cli.dispatch(args, tmp_path)
+    assert rc == 1
+    assert "cannot open database file" in capsys.readouterr().err
+
+
+def test_dispatch_sqlite_error_on_init_db_returns_rc1_with_diagnostic(
+        tmp_path, capsys, monkeypatch):
+    """cli.init_db が sqlite3.Error を起こした場合、生の traceback ではなく
+    診断メッセージ + rc=1 に正規化される (codex I-2: DB 初期化境界)。"""
+    import argparse
+    import sqlite3
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(cli, "init_db", boom)
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        args = argparse.Namespace(command="history", history_command="coverage",
+                                  symbol="USDJPY", timeframe="1h", source="dukascopy",
+                                  **{"from": "2026-07-01", "to": "2026-07-02"})
+        rc = cli.dispatch(args, tmp_path)
+    assert rc == 1
+    assert "disk I/O error" in capsys.readouterr().err
+
+
 # ---- 既定サービス動作の不変性 (上書き節 A) --------------------------------
 
 

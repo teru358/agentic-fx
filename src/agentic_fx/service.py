@@ -253,10 +253,17 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
 
     Task 7 申し送り → プラン 8 B 束で順序入替 (codex M⑤): lease 切れの
     claimed 行を先に reclaim_expired で pending へ戻し、その後に
-    expire_stale で鮮度切れの pending を abandoned 化する。逆順だと、
-    reclaim で pending に戻ったばかりの行が同じ tick 内で鮮度切れ判定に
-    巻き込まれて abandoned になり得た (無駄な 1 tick 分の巻き戻り)。
-    呼び出し元 (Scheduler._run_data_hook) が fail-open で包む。
+    expire_stale で鮮度切れの pending を abandoned 化する。この順序により、
+    reclaim で pending に戻った行が鮮度切れなら同じ tick 内で abandoned
+    という終端状態に落ちる。旧順序 (expire → reclaim) では、その行は
+    expire の時点でまだ claimed のため対象外となり、鮮度切れで claim され得
+    ない pending のまま次の maintenance まで居残った。なお鮮度ゲート有効時
+    (`freshness_bars is not None`) は `claim_oldest` の WHERE が
+    `_FRESH_CONDITION` を含むため、stale な pending が mission に拾われる
+    ことはない — 本順序の利得は「無駄な mission の実行の回避」ではなく、
+    終端状態への即時収束と `expire_stale` の戻り値 (呼び出し側が通知件数に
+    使う) の正確さである。呼び出し元 (Scheduler._run_data_hook) が
+    fail-open で包む。
     """
     signals.reclaim_expired(conn, now=now,
                             lease_min=settings.plugin.signal_lease_min,

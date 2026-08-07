@@ -438,27 +438,30 @@ def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
 def dispatch(args: argparse.Namespace, root: Path) -> int:
     ensure_initialized(root)
     settings = load_settings(root / "config" / "settings.yaml")
-    conn = connect(root / "data" / "agentic.db")
-    init_db(conn)
 
     # Fix Round 1 F6 (sonnet I-3): 統一エラー境界。人間向け CLI なので生の
     # traceback を出さない — 診断メッセージを stderr に出して rc=1 とする。
     # SystemExit (ensure_initialized 由来) は Exception ではないのでここを
-    # 経由せず素通りする。
+    # 経由せず素通りする。DB 接続・初期化も catch 対象に含める (codex I-2)。
     try:
-        if args.command == "history":
-            if args.history_command == "import":
-                return _history_import(conn, settings, args)
-            if args.history_command == "compare":
-                return _history_compare(conn, settings, args)
-            return _history_coverage(conn, args)
-        if args.command == "backtest":
-            return _backtest_run(conn, settings, args, root)
-        if args.command == "plugin":
-            if args.plugin_command == "submit":
-                return _plugin_submit(conn, settings, args, root)
-            return _plugin_bless(conn, settings, args, root)
-        return _analyze_corr(conn, args)
+        conn = connect(root / "data" / "agentic.db")
+        init_db(conn)
+        try:
+            if args.command == "history":
+                if args.history_command == "import":
+                    return _history_import(conn, settings, args)
+                if args.history_command == "compare":
+                    return _history_compare(conn, settings, args)
+                return _history_coverage(conn, args)
+            if args.command == "backtest":
+                return _backtest_run(conn, settings, args, root)
+            if args.command == "plugin":
+                if args.plugin_command == "submit":
+                    return _plugin_submit(conn, settings, args, root)
+                return _plugin_bless(conn, settings, args, root)
+            return _analyze_corr(conn, args)
+        finally:
+            conn.close()
     except (ValueError, KeyError, OSError, sqlite3.Error) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1

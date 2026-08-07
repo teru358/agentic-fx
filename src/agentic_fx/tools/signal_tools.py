@@ -83,7 +83,7 @@ def _clamp_since_hours(value: object, max_hours: int) -> int:
 
 def build(conn: sqlite3.Connection, settings: Settings,
           clock: Clock) -> list[ToolDef]:
-    """``get_signals(pair, since_hours=24)`` を提供する。
+    """``get_signals(pair, since_hours={_DEFAULT_SINCE_HOURS})`` を提供する。
 
     brief は ``build(conn, settings)`` だが、``since_hours`` → ``since``
     (aware datetime) の変換に ``now()`` が要るため ``clock`` 引数へ拡張
