@@ -403,14 +403,19 @@ def test_connect_rejects_old_sqlite_version(tmp_path, monkeypatch):
         db_mod.connect(tmp_path / "x.db")
 
 
-def test_connect_readonly_with_special_chars_in_filename(tmp_path):
+@pytest.mark.parametrize("filename", [
+    "question?.db",
+    "hash#.db",
+    "percent%.db",
+    "space name.db",
+])
+def test_connect_readonly_with_special_chars_in_filename(tmp_path, filename):
     """URI 内のパス部分を percent-encode する必要があるテスト (codex I-1)。
     `?` / `#` / `%` / 空白を含むファイル名で正しい DB を開くことを確認。
 
-    単一の RW 接続でセットアップ後に複数の RO 接続を検証する方式で、
-    WAL locking 問題を回避する。"""
-    # 特殊文字を含むファイル名でセットアップ
-    db_path = tmp_path / "question?.db"
+    各特殊文字について、RW 接続でセットアップ後に RO 接続で検証する。
+    WAL locking 問題を回避するため個別のテストデータを使う。"""
+    db_path = tmp_path / filename
 
     # RW 接続でセットアップ
     conn_rw = connect(db_path)
@@ -419,12 +424,13 @@ def test_connect_readonly_with_special_chars_in_filename(tmp_path):
     tables = {r[0] for r in conn_rw.execute(
         "SELECT name FROM sqlite_master WHERE type='table' "
         "AND name NOT LIKE 'sqlite_%'").fetchall()}
-    assert "missions" in tables, "missions table not created"
+    assert "missions" in tables, f"missions table not created for {filename}"
 
+    label = f"test_{filename}"  # ファイル名を label に含めてトレース容易に
     conn_rw.execute(
         "INSERT INTO missions (loop, runner, model, started_at) "
         "VALUES (?, ?, ?, ?)",
-        ("test_label", "test", "model", "2026-07-22T12:00:00+00:00"))
+        (label, "test", "model", "2026-07-22T12:00:00+00:00"))
     conn_rw.commit()
     conn_rw.close()
 
@@ -434,13 +440,13 @@ def test_connect_readonly_with_special_chars_in_filename(tmp_path):
         "SELECT name FROM sqlite_master WHERE type='table' "
         "AND name NOT LIKE 'sqlite_%'").fetchall()}
     assert "missions" in tables_ro, \
-        "RO connection opened wrong DB (missions table not found)"
+        f"RO connection opened wrong DB for {filename} (missions table not found)"
 
     row = conn_ro.execute(
-        "SELECT loop FROM missions WHERE loop=?", ("test_label",)).fetchone()
+        "SELECT loop FROM missions WHERE loop=?", (label,)).fetchone()
     conn_ro.close()
 
     # 正しいテーブルが読めたことを確認 (別の DB を開いていないことを保証)
     assert row is not None, \
-        "Failed to read from special-char filename: got None (opened wrong DB?)"
-    assert row["loop"] == "test_label"
+        f"Failed to read from {filename}: got None (opened wrong DB?)"
+    assert row["loop"] == label

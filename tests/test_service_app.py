@@ -1016,15 +1016,24 @@ def test_build_app_calls_assert_tools_registered(tmp_path):
     """build_app が起動時に _assert_tools_registered を呼んで、必須ツール
     が登録されていることを確認する (tool 検証呼び出し削除を検出する)。
 
-    spy で _assert_tools_registered が呼ばれることを直接確認する。呼び出し
-    削除の変異に対して red になることを保証する。"""
+    spy で _assert_tools_registered が呼ばれることを直接確認し、引数の
+    tool_list が実際に _TRADE_TOOLS であることを検証する。呼び出し削除および
+    tool_list を空にする変異に対して red になることを保証する。"""
+    from agentic_fx.loops.trade_loop import _TRADE_TOOLS
+
     _init(tmp_path)
 
-    call_count = [0]
+    call_args = []
     original_assert = _assert_tools_registered
 
     def spy_assert(registry, tool_list):
-        call_count[0] += 1
+        call_args.append({
+            "registry": registry,
+            "tool_list": tool_list,
+            "tool_list_is_trade_tools": tool_list is _TRADE_TOOLS,
+            "tool_list_not_empty": len(tool_list) > 0,
+            "tool_list_value": list(tool_list) if hasattr(tool_list, '__iter__') else tool_list,
+        })
         # 本来の検証も実行
         return original_assert(registry, tool_list)
 
@@ -1033,8 +1042,14 @@ def test_build_app_calls_assert_tools_registered(tmp_path):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
 
     # _assert_tools_registered が呼ばれたこと
-    assert call_count[0] >= 1, \
+    assert len(call_args) >= 1, \
         "_assert_tools_registered is not called from build_app"
+    # 渡された tool_list が _TRADE_TOOLS であること (参照の同一性で確認)
+    assert call_args[0]["tool_list_is_trade_tools"], \
+        f"tool_list is not _TRADE_TOOLS (got {call_args[0]['tool_list_value']})"
+    # tool_list が空でないこと (空集合置換変異を検出する)
+    assert call_args[0]["tool_list_not_empty"], \
+        "tool_list is empty (should contain required tools like 'get_ohlcv')"
     # ツールが登録されている
     assert "get_ohlcv" in app.registry.names()
 
@@ -1045,17 +1060,22 @@ def test_build_app_provider_seam_passed_to_mission_registry(tmp_path):
 
     registry への provider 渡しが削除されると、テスト注入の provider が
     tool registry では無視されるため、後続の E2E 決定性テストが予測不可能に
-    なる。registry.build_mission_registry のシグネチャ修正で provider kwarg
-    が追加されたため、build_app からそれが呼ばれることを確認する。"""
+    なる。provider=provider が削除される変異 (provider=None など) を検出する
+    ために、渡された provider インスタンスが非 None であることを確認する。"""
     _init(tmp_path)
 
-    # build_mission_registry の呼び出しを spy して、provider が渡されているか確認
+    # build_mission_registry の呼び出しを spy して、provider が実際に渡されているか確認
     from agentic_fx.tools import mission_registry as mr_module
     real_build_registry = mr_module.build_mission_registry
     calls: list[dict] = []
 
     def spy_build_registry(*args, **kwargs):
-        calls.append({"has_provider": "provider" in kwargs})
+        provider_arg = kwargs.get("provider")
+        calls.append({
+            "has_provider": "provider" in kwargs,
+            "provider_is_not_none": provider_arg is not None,
+            "provider_value": provider_arg,
+        })
         return real_build_registry(*args, **kwargs)
 
     with patch("agentic_fx.service.build_mission_registry",
@@ -1066,3 +1086,9 @@ def test_build_app_provider_seam_passed_to_mission_registry(tmp_path):
     assert len(calls) >= 1, "build_mission_registry not called"
     assert calls[0]["has_provider"], \
         "provider kwarg not passed to build_mission_registry"
+    # provider の値が None でないことを確認 (provider=None 変異を検出する)
+    assert calls[0]["provider_is_not_none"], \
+        "provider kwarg passed but value is None (should be a PriceProvider instance)"
+    # 渡された provider が registry に反映されていることを確認する
+    # (registry の tool が provider インスタンスを束縛しているため)
+    assert "get_ohlcv" in app.registry.names(), "get_ohlcv not in registry"

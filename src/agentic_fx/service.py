@@ -292,15 +292,22 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     場合は `ValueError` を送出して排他を強制する (provider が全挙動を握る seam
     のため、併用は static な設定ミスとして即座に検出する)。
 
-    **注入対象外**: `healthcheck()` と LLM ツール経由の呼び出し (`get_ohlcv` 等
-    mission registry の tool 実行) は注入対象外である (fix round 1 F2)。
-    `PriceProvider.healthcheck` は `self.get_quote(...)` に加えて
-    `self.get_bars(...)` を呼ぶが、`get_bars` は quote_fn/spec_fn/bars_fn の
-    どれにもマップされていない。Mission registry のツールは registry 内部で
-    別途に構築した PriceProvider インスタンスを束縛するため、注入された provider
-    に接続しない。決定論的なテストで `build_app` を使う場合、個別に必要な箇所
-    (Executor/Scheduler 用の bound-method、および tool registry 用の provider)
-    を patch すること (本 E2E テスト `tests/test_e2e_phase1.py` 参照)。
+    **注入対象外**: `healthcheck()` は個別関数注入 (`quote_fn`/`spec_fn`/`bars_fn`)
+    では到達不能である (fix round 1 F2)。`PriceProvider.healthcheck` は
+    `self.get_quote(...)` に加えて `self.get_bars(...)` を呼ぶが、`get_bars`
+    は quote_fn/spec_fn/bars_fn のどれにもマップされていない。
+
+    一方 mission registry のツールは以下の 2 つの経路で provider を束縛する:
+    (a) `provider=` 注入した場合: 同じインスタンスが registry に透通される
+    ため、mission registry のツールも注入 provider を使う。
+    (b) `provider=` 注入しない場合: registry が内部で新規構築した
+    PriceProvider インスタンスを束縛する。
+
+    `quote_fn`/`spec_fn`/`bars_fn` (個別関数注入) は (a)(b) いずれの場合でも
+    mission registry のツールに到達しない。決定論的な E2E テストで mission
+    registry のツール挙動を注入制御する場合、`provider=` パラメータで
+    カスタム PriceProvider を渡すこと (本 E2E テスト `tests/test_e2e_phase1.py`
+    参照)。
     """
     clock = clock or SystemClock()
     settings = load_settings(root / "config" / "settings.yaml")

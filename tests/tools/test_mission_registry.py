@@ -4,6 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from datetime import datetime, timezone
+
+import pytest
 
 from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
@@ -11,7 +14,6 @@ from agentic_fx.core.contracts import FixedClock
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.rag import Rag
 from agentic_fx.tools.mission_registry import build_mission_registry
-from datetime import datetime, timezone
 
 SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
@@ -136,3 +138,35 @@ def test_build_mission_registry_readonly_skips_bar_cache_write(tmp_path):
     # 念のため RW 接続からも cache が空のままであることを確認する
     # (write skip の直接証跡)。
     assert ohlcv.load_bars(rw_conn, "USDJPY", "1m", source="yfinance") == []
+
+
+def test_build_mission_registry_provider_and_readonly_guard(tmp_path):
+    """provider と readonly=True の併用は ValueError で即座に fail closed する
+    (sonnet I-1)。子プロセス (mission_worker.py) が誤って provider を渡して
+    も、guard で検出される。"""
+    from agentic_fx.datafeed.price_provider import PriceProvider
+
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+
+    # provider を注入して build_mission_registry を呼ぶ場合、readonly=True は併用禁止
+    injected_provider = PriceProvider(conn, SETTINGS, _clock())
+
+    with pytest.raises(ValueError, match="provider と readonly=True の併用は禁止"):
+        build_mission_registry(
+            "trade", conn, SETTINGS, _clock(), rag,
+            activity=activity, provider=injected_provider, readonly=True)
+
+    # provider なし、readonly=True は OK (子プロセスの正常系)
+    registry_ro = build_mission_registry(
+        "trade", conn, SETTINGS, _clock(), rag,
+        activity=activity, readonly=True)
+    assert "get_ohlcv" in registry_ro.names()
+
+    # provider あり、readonly=False は OK (親プロセスの正常系)
+    registry_rw = build_mission_registry(
+        "trade", conn, SETTINGS, _clock(), rag,
+        activity=activity, provider=injected_provider, readonly=False)
+    assert "get_ohlcv" in registry_rw.names()

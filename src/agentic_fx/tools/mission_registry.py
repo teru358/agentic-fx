@@ -4,10 +4,9 @@
 (mission_worker.py、実行時) が**同一関数**を共有する — 配線の二重化を
 防ぎ、「親で検証したものと子で動くものが同じ」を関数の同一性で担保する。
 
-`provider`/`econ`/`broker` はこの関数の内部で新規構築する (呼び出し側の
-既存インスタンスを受け取らない) — conn/settings/clock/activity から素直に
-組み立てられる薄いラッパーであり、親の長寿命インスタンスと子の使い捨て
-インスタンスを同じコードパスで作れることが本モジュールの目的そのもの。
+`provider` は呼び出し側の既存インスタンスを受け取る (注入 seam)。
+非 None なら使用、None なら内部構築。`econ`/`broker` はこの関数の内部で
+新規構築する (呼び出し側の既存インスタンスを受け取らない)。
 """
 from __future__ import annotations
 
@@ -56,10 +55,19 @@ def build_mission_registry(
 
     `provider` (注入 seam、build_app の `provider=` パラメータを透通する):
     非 None ならそれを使い、None なら `PriceProvider(conn, settings, clock,
-    readonly=readonly)` で内部構築する。子プロセス (`mission_worker.py`)
-    から呼ぶ場合は provider を渡さない — `readonly=True` で内部構築する。
-    このパラメータはテスト注入専用であり、本番環境では常に None である。
+    readonly=readonly)` で内部構築する。親 (build_app) からは常に非 None
+    (実プロバイダまたはテスト注入プロバイダ) で渡され、子 (mission_worker.py)
+    からは常に None で渡される (readonly=True で内部構築) 想定である。
     """
+    # provider と readonly=True の併用は禁止: provider が指定されると readonly
+    # は無視される。子プロセス (mission_worker.py) から呼ぶ場合は provider を
+    # 渡さないこと。親は provider を渡す (readonly=False)、子は provider を渡さない
+    # (readonly=True で内部構築)。
+    if provider is not None and readonly:
+        raise ValueError(
+            "provider と readonly=True の併用は禁止: provider が指定されると "
+            "readonly は無視される。子プロセスから呼ぶ場合は provider を渡さないこと。")
+
     if provider is None:
         provider = PriceProvider(conn, settings, clock, readonly=readonly)
     econ = EconCalendar(conn, activity, clock)
