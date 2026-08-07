@@ -292,11 +292,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     場合は `ValueError` を送出して排他を強制する (provider が全挙動を握る seam
     のため、併用は static な設定ミスとして即座に検出する)。
 
-    **`healthcheck()` は注入対象外** (fix round 1 F2): `PriceProvider.healthcheck`
-    は `self.get_quote(...)` に加えて `self.get_bars(...)` を呼ぶが、
-    `get_bars` は quote_fn/spec_fn/bars_fn のどれにもマップされていない。
-    決定論的なテストで `build_app` を使う場合、`app.provider.healthcheck` を
-    個別に patch すること (本 E2E テスト `tests/test_e2e_phase1.py` 参照)。
+    **注入対象外**: `healthcheck()` と LLM ツール経由の呼び出し (`get_ohlcv` 等
+    mission registry の tool 実行) は注入対象外である (fix round 1 F2)。
+    `PriceProvider.healthcheck` は `self.get_quote(...)` に加えて
+    `self.get_bars(...)` を呼ぶが、`get_bars` は quote_fn/spec_fn/bars_fn の
+    どれにもマップされていない。Mission registry のツールは registry 内部で
+    別途に構築した PriceProvider インスタンスを束縛するため、注入された provider
+    に接続しない。決定論的なテストで `build_app` を使う場合、個別に必要な箇所
+    (Executor/Scheduler 用の bound-method、および tool registry 用の provider)
+    を patch すること (本 E2E テスト `tests/test_e2e_phase1.py` 参照)。
     """
     clock = clock or SystemClock()
     settings = load_settings(root / "config" / "settings.yaml")
@@ -383,16 +387,13 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     signal_producer = SignalProducer()
 
     # プラン 8 worker 基盤: 親 (ここ) と子 (mission_worker.py) が同一関数
-    # (build_mission_registry) でツール配線を組み立てる。親は既に構築済みの
-    # provider/econ/broker を再利用せず、conn_core から独立に再構築する
-    # (子との配線一致を関数の同一性だけで担保するため — 親の長寿命
-    # インスタンスを別途 provider/econ/broker として保持している事実と
-    # 矛盾しない: registry 内のツールクロージャは新しく作った
-    # provider/econ/broker を束縛するが、これらは conn_core を共有する
-    # ため実質的に同じ DB 状態を見る)。
+    # (build_mission_registry) でツール配線を組み立てる。親は注入された provider
+    # (あるいは内部構築した provider) を registry に渡し、同じインスタンスを
+    # registry のツールが束縛する (テスト注入 seam)。子は provider を渡さず、
+    # readonly=True で内部構築する。
     registry = build_mission_registry(
         "trade", conn_core, settings, clock, rag, activity=activity,
-        indicator_plugins=approved)
+        indicator_plugins=approved, provider=provider)
     # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
     _validate_startup(settings)
     _assert_tools_registered(registry, _TRADE_TOOLS)

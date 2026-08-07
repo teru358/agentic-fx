@@ -21,7 +21,7 @@ from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.store.rag import Rag
 from agentic_fx.tools import (
-    account_tools, market_tools, news_tools, plugin_loader, reflection_tools,
+    account_tools, market_tools, news_tools, reflection_tools,
     signal_tools,
 )
 from agentic_fx.tools.registry import ToolRegistry
@@ -35,7 +35,8 @@ def build_mission_registry(
         loop: str, conn: sqlite3.Connection, settings: "Settings",
         clock: Clock, rag: Rag, *, activity: ActivityLog,
         indicator_plugins: "list[PluginMeta] | None" = None,
-        sandbox_run=None, readonly: bool = False) -> ToolRegistry:
+        sandbox_run=None, readonly: bool = False,
+        provider: PriceProvider | None = None) -> ToolRegistry:
     """`loop` は本プランでは配線を分岐しない (常に同じ全ツール集合を
     構築する) — forward-compat 引数。どのツールを実際に Mission に
     見せるかは呼び出し側の `Mission.tools` リスト (`_TRADE_TOOLS` 等) が
@@ -52,8 +53,15 @@ def build_mission_registry(
     委譲する設計は採らない (設計裁定: RPC 面を拡大しない — 裁定書
     F-5)。cache は性能最適化であり、親の scheduler tick が継続的に
     cache を温めるため実害は限定的。
+
+    `provider` (注入 seam、build_app の `provider=` パラメータを透通する):
+    非 None ならそれを使い、None なら `PriceProvider(conn, settings, clock,
+    readonly=readonly)` で内部構築する。子プロセス (`mission_worker.py`)
+    から呼ぶ場合は provider を渡さない — `readonly=True` で内部構築する。
+    このパラメータはテスト注入専用であり、本番環境では常に None である。
     """
-    provider = PriceProvider(conn, settings, clock, readonly=readonly)
+    if provider is None:
+        provider = PriceProvider(conn, settings, clock, readonly=readonly)
     econ = EconCalendar(conn, activity, clock)
     broker = PaperBroker(conn, settings, clock)
 

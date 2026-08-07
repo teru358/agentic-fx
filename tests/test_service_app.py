@@ -1010,3 +1010,59 @@ def test_watchdog_tick_uses_mission_watch_time_fn_directly(tmp_path):
     # に戻す変異はこのテストの assertion で red になる。
     assert any("81" in str(msg) for msg in captured_messages), \
         f"elapsed 81s を期待するが captured_messages={captured_messages}"
+
+
+def test_build_app_calls_assert_tools_registered(tmp_path):
+    """build_app が起動時に _assert_tools_registered を呼んで、必須ツール
+    が登録されていることを確認する (tool 検証呼び出し削除を検出する)。
+
+    spy で _assert_tools_registered が呼ばれることを直接確認する。呼び出し
+    削除の変異に対して red になることを保証する。"""
+    _init(tmp_path)
+
+    call_count = [0]
+    original_assert = _assert_tools_registered
+
+    def spy_assert(registry, tool_list):
+        call_count[0] += 1
+        # 本来の検証も実行
+        return original_assert(registry, tool_list)
+
+    with patch("agentic_fx.service._assert_tools_registered",
+               side_effect=spy_assert):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+
+    # _assert_tools_registered が呼ばれたこと
+    assert call_count[0] >= 1, \
+        "_assert_tools_registered is not called from build_app"
+    # ツールが登録されている
+    assert "get_ohlcv" in app.registry.names()
+
+
+def test_build_app_provider_seam_passed_to_mission_registry(tmp_path):
+    """build_app が構築した provider が build_mission_registry に実際に
+    渡されることを確認する (provider seam が registry に透通する)。
+
+    registry への provider 渡しが削除されると、テスト注入の provider が
+    tool registry では無視されるため、後続の E2E 決定性テストが予測不可能に
+    なる。registry.build_mission_registry のシグネチャ修正で provider kwarg
+    が追加されたため、build_app からそれが呼ばれることを確認する。"""
+    _init(tmp_path)
+
+    # build_mission_registry の呼び出しを spy して、provider が渡されているか確認
+    from agentic_fx.tools import mission_registry as mr_module
+    real_build_registry = mr_module.build_mission_registry
+    calls: list[dict] = []
+
+    def spy_build_registry(*args, **kwargs):
+        calls.append({"has_provider": "provider" in kwargs})
+        return real_build_registry(*args, **kwargs)
+
+    with patch("agentic_fx.service.build_mission_registry",
+               side_effect=spy_build_registry):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+
+    # build_mission_registry が provider kwarg を受け取ったことを確認
+    assert len(calls) >= 1, "build_mission_registry not called"
+    assert calls[0]["has_provider"], \
+        "provider kwarg not passed to build_mission_registry"

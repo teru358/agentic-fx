@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
+from urllib.parse import quote
 
 _log = logging.getLogger("agentic_fx.store.db")
 
@@ -187,7 +188,10 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise FileNotFoundError(
             f"connect_readonly requires an already-initialized DB: {db_path}")
-    uri = f"file:{db_path}?mode=ro"
+    # URI の path 部分を percent-encode して `?` / `#` を含むファイル名に対応する。
+    # safe="/" は絶対パスの `/` を encode しない設定。
+    encoded_path = quote(str(db_path), safe="/")
+    uri = f"file:{encoded_path}?mode=ro"
     # isolation_level=None: autocommit mode — 読み取り専用なので buffering の
     # 必要がなく、即座にエラーを検出する (execute() で直ちに SQLite へ到達)。
     conn = sqlite3.connect(uri, uri=True, check_same_thread=False,
