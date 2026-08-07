@@ -318,9 +318,12 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 "provider を使わない場合のみ個別関数を指定してください。")
         # プラン 8 park 返済: 呼び出し側が provider の全挙動を握る
         # (quote_fn/spec_fn/bars_fn の bound-method 差し替えは行わない)。
-        quote_fn = quote_fn if quote_fn is not None else provider.get_quote
-        spec_fn = spec_fn if spec_fn is not None else provider.spec
-        bars_fn = bars_fn if bars_fn is not None else provider.latest_1m_bar
+        # 上の ValueError で併用を弾いた後なので 3 つとも必ず None —
+        # 無条件に provider の束縛メソッドを採る (`x if x is not None else`
+        # の形は到達しない分岐を残し「併用可能」と誤読させる)。
+        quote_fn = provider.get_quote
+        spec_fn = provider.spec
+        bars_fn = provider.latest_1m_bar
     else:
         provider = PriceProvider(conn_core, settings, clock)
         # 注入された quote_fn/spec_fn/bars_fn は provider 自身の束縛メソッドにも
