@@ -15,7 +15,7 @@ import pytest
 from agentic_fx.backtest.metrics import METRIC_KEYS, compute_metrics
 from agentic_fx.backtest.runner import BacktestResult
 
-from tests.backtest.conftest import H
+from tests.backtest.factories import H
 
 
 def _closed_row(pnl: float, *, avg_fill_price=148.0, stop_loss=147.8,

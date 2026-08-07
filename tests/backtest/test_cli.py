@@ -540,7 +540,7 @@ def test_cli_backtest_run_integration_writes_human_custom_row(tmp_path,
     """一時 root + 実 DB ファイル + 実 run_replay で human_custom 行を確認する。
 
     期間は 2 時間 (~3.2ms/tick 実測、Task 9 照合済み)。市場オープン時間帯
-    (conftest の H = 水曜 12:00 UTC) を使う。core_commit は実 git を避けて
+    (factories の H = 水曜 12:00 UTC) を使う。core_commit は実 git を避けて
     patch する。
 
     Fix Round 1 F1 (sonnet I-1 — 自己変異 M-A SURVIVED の是正): 従来はこの
@@ -557,7 +557,7 @@ def test_cli_backtest_run_integration_writes_human_custom_row(tmp_path,
     ポジションが閉じない可能性が高く指標として不適切 (レビュー指摘どおり、
     `result.orders` の件数を直接見る)。
     """
-    from tests.backtest.conftest import H
+    from tests.backtest.factories import H
 
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)

@@ -27,7 +27,7 @@ from agentic_fx.activity import ActivityLog
 from agentic_fx.backtest.replay import BarFeed
 from agentic_fx.backtest.runner import _aggregate_bucket, run_replay
 
-from tests.backtest.conftest import H, WED, SETTINGS, _conn, _row_at
+from tests.backtest.factories import H, WED, SETTINGS, _conn, _row_at
 
 OPEN = {"action": "open", "pair": "USDJPY", "direction": "long",
         "entry_type": "limit", "horizon": "day",

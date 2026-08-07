@@ -207,6 +207,14 @@ class Scheduler:
         # 効かなくなった場合に備えて、約定側にも独立した条件を置く。
         filled_ids = self._process_limit_fills(now) if fills_allowed else set()
         self._process_exits(now, filled_ids)
+        # プラン 8 park 返済 (codex I1, プラン 5 レジャー): on_trade_mission
+        # が例外を送出しても _last_cron_trade は既に前進済み (下の
+        # if reason == "cron": 行が先に走る) — これは意図的な設計であり
+        # バグではない。毎 tick 再試行 (前進させない設計) は、Mission 起動
+        # 自体が壊れている状況で LLM/notifier を毎分連打することになり、
+        # 障害時により危険側に倒れる。1 時間ごとの再試行間隔を保つことで
+        # 障害時の負荷を抑える (test_cron_deadline_advances_even_when_
+        # mission_callback_raises がこの契約を固定する)。
         reason = self._trade_mission_due(now)
         if reason is not None:
             # 上書き 1 の改名 + §5 必須事項 4: cron 締切の更新は

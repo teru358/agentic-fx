@@ -2695,3 +2695,32 @@ def test_maintain_reservations_span_min_not_committed_misses_old_then_new_violat
     assert orders.get(env.conn, zzz_pending)["status"] == "cancelled", (
         "span_min が確定されず、EURUSD との真の skew (>skew) が検出できて"
         "いない (ZZZCHF が取消されるべきなのに残っている)")
+
+
+def test_cron_deadline_advances_even_when_mission_callback_raises(tmp_path):
+    """codex I1 (プラン5 park): on_trade_mission が例外を送出しても
+    _last_cron_trade は前進する — 1 回/時の再試行間隔を意図的な設計として
+    固定する (毎 tick 再試行すると障害時に LLM/notifier を連打するため
+    安全側)。tick() 自体は on_trade_mission の例外を保護しない
+    (呼び出し元 = service.py の scheduler_thread が広い try で包む) ため、
+    この pin は tick 側の呼び出し順序 (締切前進 → on_trade_mission 呼び出し)
+    が「前進してから呼ぶ」順であることを固定する。
+    """
+    env = Env(tmp_path)
+    calls: list[str] = []
+
+    def boom(reason):
+        calls.append(reason)
+        raise RuntimeError("mission callback failed")
+
+    env.sched.on_trade_mission = boom
+    first_call_time = WED
+    with pytest.raises(RuntimeError):
+        env.sched.tick(first_call_time)
+    assert calls == ["cron"]
+    # 締切は例外前に前進済み — 30 分後の tick では再起動しない
+    assert env.sched._trade_mission_due(
+        first_call_time + timedelta(minutes=30)) is None
+    # 1 時間後には再試行される
+    assert env.sched._trade_mission_due(
+        first_call_time + timedelta(hours=1)) == "cron"
