@@ -854,3 +854,64 @@ def test_validate_startup_rejects_unknown_producer_source():
             update={"producer_source": "typo-source"})})
     with pytest.raises(RuntimeError, match="producer_source"):
         _validate_startup(settings)
+
+
+def test_app_has_clock_field(tmp_path):
+    """App インスタンスが clock フィールドを持つことを確認。"""
+    from agentic_fx.core.contracts import FixedClock
+
+    fixed = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    _init(tmp_path)
+    app = build_app(tmp_path, clock=fixed)
+    assert app.clock is fixed
+
+
+class _FakeProvider:
+    """PriceProvider 互換の最小限 fake (provider seam test 用)。"""
+    def __init__(self):
+        self.get_quote = lambda pair: None
+        self.spec = lambda pair: None
+        self.latest_1m_bar = lambda pair: None
+
+
+def test_build_app_provider_seam_bypasses_quote_fn_patch(tmp_path):
+    """provider を直接注入した場合、quote_fn/spec_fn/bars_fn の
+    bound-method 差し替えは行われない (provider が全挙動を持つ)。"""
+    _init(tmp_path)
+    fake_provider = _FakeProvider()
+    app = build_app(tmp_path, provider=fake_provider,
+                    quote_fn=lambda pair: (_ for _ in ()).throw(
+                        AssertionError("quote_fn should not be used")))
+    assert app.provider is fake_provider
+
+
+def test_watchdog_tick_uses_mission_watch_time_fn(monkeypatch):
+    """_watchdog_tick の elapsed 算出が MissionWatch の time_fn 経由で
+    行われる (fable M4) — 生の time.monotonic() を直接呼ばない。"""
+    from agentic_fx.service import _watchdog_tick, App
+    from agentic_fx.loops.mission_watch import MissionWatch
+
+    fake_time = [1000.0]
+    watch = MissionWatch(time_fn=lambda: fake_time[0])
+    watch.begin(mission_id=1, loop="trade", timeout_sec=10.0)
+    fake_time[0] = 1000.0 + 10.0 + 61.0  # timeout + grace(60) を超過
+
+    calls: list[str] = []
+
+    class FakeActivity:
+        def write(self, *a, **k):
+            calls.append("write")
+
+    class FakeNotifier:
+        def send(self, *a, **k):
+            calls.append("send")
+
+    app = App(conn_core=None, conn_shell=None, settings=None, state=None,
+              activity=FakeActivity(), broker=None, executor=None,
+              provider=None, econ=None, collector=None, rag=None,
+              trade_loop=None, reflection=None, scheduler=None,
+              commands=None, registry=None, core_lock=None,
+              mission_watch=watch, notifier=FakeNotifier(), runner=None,
+              owns_runner=False, clock=None)
+    _watchdog_tick(app)
+    assert calls == ["write", "send"]

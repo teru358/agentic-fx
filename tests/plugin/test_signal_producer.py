@@ -4,7 +4,7 @@ sandbox サブプロセスは一切起動しない — 全テストで `sandbox_
 注入する (`_FakeSandbox`)。実 HTTP/git/乱数/実時刻取得も使わない。
 
 `H` は 2026-07-22T12:00 UTC (epoch 錨に対し 1h/4h いずれの境界にも整列 —
-`tests/backtest/conftest.py` の H と同じ選定理由)。
+`tests/backtest/factories.py` の H と同じ選定理由)。
 """
 from __future__ import annotations
 

@@ -20,7 +20,7 @@ from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin.loader import PluginMeta, content_hash as _real_content_hash
 from agentic_fx.plugin.sandbox import SandboxError
 from agentic_fx.store import ohlcv as ohlcv_store
-from tests.backtest.conftest import H, SETTINGS, _conn, _row_at
+from tests.backtest.factories import H, SETTINGS, _conn, _row_at
 
 SMA_CROSS_DIR = (Path(__file__).resolve().parents[2] / "docs" / "examples"
                  / "plugins" / "sma_cross")

@@ -8,7 +8,7 @@ from agentic_fx.backtest import mt5_import
 from agentic_fx.backtest.mt5_import import (
     _default_fetch, compare_sources, import_mt5)
 from agentic_fx.store import ohlcv
-from tests.backtest.conftest import H, SETTINGS, _conn
+from tests.backtest.factories import H, SETTINGS, _conn
 
 
 def test_import_mt5_pages_daily_and_imports(tmp_path):

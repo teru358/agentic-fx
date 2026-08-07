@@ -30,7 +30,7 @@ from agentic_fx.backtest.holdout import holdout_boundary
 from agentic_fx.backtest.timeframes import TF_MINUTES
 from agentic_fx.store import ohlcv
 
-from tests.backtest.conftest import H, SETTINGS, _conn
+from tests.backtest.factories import H, SETTINGS, _conn
 
 FAR_FUTURE = datetime(2030, 1, 1, tzinfo=timezone.utc)
 NOW = datetime(2026, 8, 1, tzinfo=timezone.utc)

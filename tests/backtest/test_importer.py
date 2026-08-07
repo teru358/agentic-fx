@@ -8,7 +8,7 @@ from agentic_fx.backtest.dukascopy import Tick
 from agentic_fx.backtest import importer
 from agentic_fx.backtest.importer import _default_fetch, ticks_to_1m, import_dukascopy
 from agentic_fx.store.ohlcv import load_bars
-from tests.backtest.conftest import _conn, _bi5, H
+from tests.backtest.factories import _conn, _bi5, H
 
 
 # F4: _default_fetch (production fetch path) — 404 -> b"", other HTTP errors

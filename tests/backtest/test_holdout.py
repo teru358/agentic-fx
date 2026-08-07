@@ -21,7 +21,7 @@ from agentic_fx.backtest.runner import BacktestResult
 from agentic_fx.store import ohlcv
 from agentic_fx.store.backtest_runs import settings_snapshot_hash
 
-from tests.backtest.conftest import H, SETTINGS, WED, _conn, _row_at
+from tests.backtest.factories import H, SETTINGS, WED, _conn, _row_at
 
 UTC = timezone.utc
 

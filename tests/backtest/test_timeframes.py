@@ -27,7 +27,7 @@ from agentic_fx.backtest.timeframes import (
 from agentic_fx.core.contracts import Bar
 from agentic_fx.store import ohlcv
 
-from tests.backtest.conftest import H, _conn, _row_at
+from tests.backtest.factories import H, _conn, _row_at
 
 
 def test_enums_and_minutes_are_consistent():

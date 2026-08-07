@@ -47,6 +47,12 @@ class MissionWatch:
             if self._entry is not None and self._entry.mission_id == mission_id:
                 self._entry = replace(self._entry, notified=True)
 
+    @property
+    def time_fn(self):
+        """テスト/watchdog が同じ時刻源を参照できるようにする公開アクセサ
+        (プラン 8 park 返済 — fable M4)。"""
+        return self._time
+
     def breached(self, grace_sec: float = 60.0) -> MissionWatchEntry | None:
         """timeout + grace 超過かつ未通知なら entry を返す。それ以外 None。"""
         with self._lock:

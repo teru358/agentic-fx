@@ -24,7 +24,7 @@ import pytest
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.store import ohlcv
 
-from tests.backtest.conftest import SETTINGS, _conn, _row_at
+from tests.backtest.factories import SETTINGS, _conn, _row_at
 
 _START = datetime(2026, 1, 5, 0, 0, tzinfo=timezone.utc)   # 月曜
 

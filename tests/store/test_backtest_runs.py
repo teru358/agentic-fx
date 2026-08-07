@@ -19,7 +19,7 @@ import pytest
 from agentic_fx.store import backtest_runs
 from agentic_fx.store.db import connect, init_db
 
-from tests.backtest.conftest import H
+from tests.backtest.factories import H
 
 
 def _conn(tmp_path):

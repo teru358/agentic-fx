@@ -4,7 +4,7 @@ import pytest
 from agentic_fx.backtest.replay import ReplayClock, BarFeed, quote_from_bar
 from agentic_fx.core.contracts import Bar
 from agentic_fx.store import ohlcv
-from tests.backtest.conftest import _conn, _row_at, H
+from tests.backtest.factories import _conn, _row_at, H
 
 
 # === ReplayClock tests ===

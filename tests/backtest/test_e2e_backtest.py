@@ -47,7 +47,7 @@ from agentic_fx.backtest.metrics import METRIC_KEYS
 from agentic_fx.store import ohlcv
 from agentic_fx.store.backtest_runs import in_sample_view
 
-from tests.backtest.conftest import SETTINGS, _conn, _row_at
+from tests.backtest.factories import SETTINGS, _conn, _row_at
 
 _UTC = timezone.utc
 

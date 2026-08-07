@@ -13,7 +13,7 @@ class Policy:
             return ""
         try:
             return self._path.read_text(encoding="utf-8")[-chars:]
-        except FileNotFoundError:
+        except OSError:
             return ""
 
     def size_warning(self, limit_chars: int = 16000) -> str | None:
@@ -22,6 +22,6 @@ class Policy:
             if len(text) > limit_chars:
                 return (f"警告: {self._path} が {limit_chars} 文字を超えています。"
                         "注入は末尾 4000 文字のみです。手動で整理してください。")
-        except FileNotFoundError:
+        except OSError:
             pass
         return None

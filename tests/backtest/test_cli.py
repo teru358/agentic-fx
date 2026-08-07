@@ -557,7 +557,7 @@ def test_cli_backtest_run_integration_writes_human_custom_row(tmp_path,
     ポジションが閉じない可能性が高く指標として不適切 (レビュー指摘どおり、
     `result.orders` の件数を直接見る)。
     """
-    from tests.backtest.conftest import H
+    from tests.backtest.factories import H
 
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)

@@ -68,3 +68,18 @@ def test_prompts_content_pinned():
 
     reflection = load_prompt("reflection")
     assert "教訓" in reflection
+
+
+def test_tail_returns_empty_on_permission_error(tmp_path, monkeypatch):
+    """tail/size_warning が FileNotFoundError だけでなく OSError
+    (PermissionError 等) も捕捉することを確認。"""
+    p = tmp_path / "directives.md"
+    p.write_text("x" * 100)
+    policy = Policy(p)
+
+    def boom(*a, **k):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(type(p), "read_text", boom)
+    assert policy.tail(10) == ""
+    assert policy.size_warning() is None
