@@ -20,6 +20,14 @@ _FLOAT_TOL = 1e-9
 # — datafeed/price_provider.py の _STORAGE_SOURCE 参照)。
 LIVE_SOURCES = frozenset({"yfinance", "twelvedata", "mt5-live"})
 
+# プラン 8 B 束: ohlcv.source 列に実際に書き込まれる値の正規列挙
+# (price_provider.py:_STORAGE_SOURCE / backtest/importer.py /
+# backtest/mt5_import.py / backtest/analysis.py:ANALYSIS_SOURCE /
+# plugin/approval.py:_EVAL_SOURCE の実値を集約)。起動時の
+# producer_source typo 検出 (service.py:_validate_startup) が参照する。
+KNOWN_OHLCV_SOURCES = frozenset(
+    {"yfinance", "mt5", "mt5-live", "twelvedata", "dukascopy"})
+
 
 def _iso_utc(ts: datetime) -> str:
     """aware datetime を UTC へ正規化してから isoformat する。naive は

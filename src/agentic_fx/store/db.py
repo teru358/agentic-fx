@@ -150,6 +150,15 @@ TABLE_NAMES = frozenset({
 
 
 def connect(db_path: Path, *, check_same_thread: bool = False) -> sqlite3.Connection:
+    # プラン 8 B 束: signals.py の claim_oldest/requeue/reclaim_expired は
+    # RETURNING 句に依存する (SQLite 3.35.0 = 2021-03-12 以降)。古い
+    # SQLite では RETURNING が構文エラーになり、失敗の意味が分かりにくい
+    # (「claim できない」ではなく「SQL 構文エラー」として現れる) ため、
+    # 接続確立時点で明示的に fail fast する。
+    if sqlite3.sqlite_version_info < (3, 35, 0):
+        raise RuntimeError(
+            f"SQLite {sqlite3.sqlite_version} is too old (>= 3.35 required "
+            "for signals.py RETURNING clauses)")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row

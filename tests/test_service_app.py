@@ -679,3 +679,178 @@ def test_build_app_accepts_embedding_fn(tmp_path):
                            "body": "Test article",
                            "source_name": "ex", "published": None}], NOW)
     assert calls  # embedding function が呼ばれた
+
+
+# ---- Task 3: B 束小口 6 項目 (maintenance 順序) ---------------------------------
+
+def test_signal_maintenance_reclaims_before_expiring(monkeypatch):
+    """reclaim_expired → expire_stale の順で呼ばれる (順序入替、codex M⑤)。
+    reclaim で pending に戻った直後の stale 行が、同じ tick 内の
+    expire_stale でまだ拾われずに 1 tick 分だけ実行機会を得ることを、
+    呼び出し順の記録で確認する。(裁定書 F-16/IM-10) `service.py` の
+    実クロージャが呼ぶ module レベル関数 `_run_signal_maintenance` を
+    直接呼び、`agentic_fx.store.signals` の実モジュール関数を
+    monkeypatch する — テスト内の再定義フェイクに対して assert する
+    恒真テストを避ける。
+    """
+    import agentic_fx.service as service_mod
+
+    calls: list[str] = []
+
+    def fake_reclaim(*a, **k):
+        calls.append("reclaim")
+        return []
+
+    def fake_expire(*a, **k):
+        calls.append("expire")
+        return 0
+
+    monkeypatch.setattr(service_mod.signals, "reclaim_expired", fake_reclaim)
+    monkeypatch.setattr(service_mod.signals, "expire_stale", fake_expire)
+
+    now = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+    fake_producer = object()  # evaluate_due_plugins は呼ばれない前提で
+    # 属性アクセスされたら AttributeError で明示的に落ちるようにする
+    # (順序検証の対象外だが、意図せず呼ばれた場合は検出したい)。
+
+    class _NoOpProducer:
+        def evaluate_due_plugins(self, **k):
+            calls.append("producer")
+
+    service_mod._run_signal_maintenance(
+        conn=None, signal_producer=_NoOpProducer(), approved=[],
+        settings=service_mod.load_settings(
+            Path(__file__).resolve().parents[1]
+            / "config" / "settings.yaml.example"),
+        now=now)
+
+    assert calls == ["reclaim", "expire", "producer"]
+
+
+def test_signal_maintenance_state_transition_stale_claimed_becomes_abandoned(tmp_path):
+    """stale かつ lease 切れの claimed 行が、reclaim → expire 後に
+    abandoned 状態になることを検証する (裁定書 I-1)。
+
+    期待値: stale な claimed 行は reclaim_expired で pending に戻された後、
+    同じ tick 内の expire_stale で abandoned に落ちる。最終状態は:
+    - status = 'abandoned'
+    - requeue_count = 元の値 + 1 (reclaim が +1 する。expire は触らない)
+    """
+    import agentic_fx.service as service_mod
+    from agentic_fx.store.db import connect, init_db
+
+    # テスト用 DB とデータ構築
+    _init(tmp_path)
+    conn = connect(tmp_path / "data" / "agentic.db")
+    settings = service_mod.load_settings(
+        tmp_path / "config" / "settings.yaml.example")
+
+    # テスト時点の time
+    now = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+    # cutoff よりずっと古いバー (stale 化させる)
+    stale_bar_ts = (now - timedelta(hours=100)).isoformat()
+    # lease 切れ (lease_min=15分。20分以上前に claimed)
+    expired_claimed_at = (now - timedelta(minutes=20)).isoformat()
+
+    # stale かつ lease 切れの claimed 行を INSERT
+    cursor = conn.execute(
+        """
+        INSERT INTO signals
+        (plugin, content_hash, pair, timeframe, bar_ts, kind, status,
+         requeue_count, claimed_at, created_at, payload_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("test_plugin", "hash1", "USDJPY", "1h", stale_bar_ts, "signal",
+         "claimed", 0, expired_claimed_at, now.isoformat(), '{"value": 1}'))
+    signal_id = cursor.lastrowid
+
+    # maintenance 実行前の状態確認
+    row_before = conn.execute(
+        "SELECT status, requeue_count FROM signals WHERE id = ?",
+        (signal_id,)).fetchone()
+    assert row_before["status"] == "claimed"
+    assert row_before["requeue_count"] == 0
+
+    # maintenance 実行
+    class _NoOpProducer:
+        def evaluate_due_plugins(self, **k):
+            pass
+
+    service_mod._run_signal_maintenance(
+        conn=conn, signal_producer=_NoOpProducer(), approved=[],
+        settings=settings, now=now)
+
+    # maintenance 後の状態確認
+    row_after = conn.execute(
+        "SELECT status, requeue_count FROM signals WHERE id = ?",
+        (signal_id,)).fetchone()
+
+    # 期待値: stale だから claimed → pending (by reclaim) → abandoned (by expire)
+    assert row_after["status"] == "abandoned", \
+        f"Expected abandoned, got {row_after['status']}"
+    # requeue_count は reclaim が +1 する (expire は touch しない)
+    assert row_after["requeue_count"] == 1, \
+        f"Expected requeue_count=1, got {row_after['requeue_count']}"
+
+    conn.close()
+
+
+def test_signal_maintenance_callback_integration(tmp_path, monkeypatch):
+    """build_app の on_signal_maintenance クロージャが scheduler に
+    正しく配線されていることを検証する (codex M-1)。
+
+    scheduler に渡された on_signal_maintenance callback を spy で監視し、
+    callback が _run_signal_maintenance を正しい引数で呼んでいることを
+    確認する。委譲を削除・旧本体に戻す変異は検出される。
+    """
+    import agentic_fx.service as service_mod
+
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+
+    # scheduler の on_signal_maintenance callback が _run_signal_maintenance
+    # を呼ぶ spy に切り替える
+    calls: list[dict] = []
+
+    def spy_run_signal_maintenance(*, conn, signal_producer, approved, settings, now):
+        calls.append({
+            "conn": conn is not None,
+            "signal_producer": signal_producer is not None,
+            "approved": approved is not None,
+            "settings": settings is not None,
+            "now": now is not None,
+            "now_value": now
+        })
+
+    monkeypatch.setattr(
+        service_mod, "_run_signal_maintenance", spy_run_signal_maintenance)
+
+    # scheduler の callback を通じて on_signal_maintenance を呼ぶ
+    test_now = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+    app.scheduler.on_signal_maintenance(test_now)
+
+    # callback が呼ばれたことと、全引数が渡されたことを確認
+    assert len(calls) == 1, f"Expected 1 call, got {len(calls)}"
+    call = calls[0]
+    assert call["conn"] is True, "conn should be passed"
+    assert call["signal_producer"] is True, "signal_producer should be passed"
+    assert call["approved"] is True, "approved should be passed"
+    assert call["settings"] is True, "settings should be passed"
+    assert call["now"] is True, "now should be passed"
+    assert call["now_value"] == test_now, "now value should match"
+
+
+def test_validate_startup_rejects_unknown_producer_source():
+    """producer_source が KNOWN_OHLCV_SOURCES に含まれない場合、
+    RuntimeError で reject する。"""
+    from agentic_fx.service import _validate_startup
+    from agentic_fx.config import load_settings
+
+    settings = load_settings(
+        Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example")
+    settings = settings.model_copy(
+        update={"plugin": settings.plugin.model_copy(
+            update={"producer_source": "typo-source"})})
+    with pytest.raises(RuntimeError, match="producer_source"):
+        _validate_startup(settings)

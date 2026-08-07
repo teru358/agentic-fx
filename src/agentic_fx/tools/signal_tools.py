@@ -54,6 +54,11 @@ _log = logging.getLogger("agentic_fx.tools.signal_tools")
 # strategy 行の in_sample_metrics に必ず同梱する注記 (brief 逐語)。
 _ANNOTATION = "バックテスト成績は実運用成績の予測値ではない"
 
+# プラン 8 B 束: ToolDef description の「既定 Nh」が since_hours の実際の
+# デフォルト値と独立に手打ちされ、乖離し得た (Task 9 deferred①)。
+# 1 箇所の定数に統一し description は f-string で生成する。
+_DEFAULT_SINCE_HOURS = 24
+
 # 改善ループの allowed tools リストに現れてはならないツール名の集合。
 # "get_signals": 取引判断 loop 専用 (改善ループがバックテスト成績を材料に
 # 使うのは run_in_sample/run_holdout_gate 経由であるべきで、この読み取り
@@ -78,7 +83,7 @@ def _clamp_since_hours(value: object, max_hours: int) -> int:
 
 def build(conn: sqlite3.Connection, settings: Settings,
           clock: Clock) -> list[ToolDef]:
-    """``get_signals(pair, since_hours=24)`` を提供する。
+    """``get_signals(pair, since_hours={_DEFAULT_SINCE_HOURS})`` を提供する。
 
     brief は ``build(conn, settings)`` だが、``since_hours`` → ``since``
     (aware datetime) の変換に ``now()`` が要るため ``clock`` 引数へ拡張
@@ -86,7 +91,7 @@ def build(conn: sqlite3.Connection, settings: Settings,
     """
     max_hours = settings.plugin.signals_max_lookback_hours
 
-    def get_signals(pair: str, since_hours: int = 24) -> list[dict]:
+    def get_signals(pair: str, since_hours: int = _DEFAULT_SINCE_HOURS) -> list[dict]:
         if pair not in settings.pairs:
             raise ValueError(
                 f"pair must be one of {settings.pairs}: {pair!r}")
@@ -126,9 +131,9 @@ def build(conn: sqlite3.Connection, settings: Settings,
         ToolDef(
             "get_signals",
             "取引判断 loop 専用: 承認済み signal/strategy plugin の直近 "
-            "出力 (pair, 直近 since_hours 時間分・既定 24h)。strategy 行に"
-            "は in_sample バックテスト成績 (in_sample_metrics) と、実運用"
-            "成績の予測値ではない旨の注記 (note) が付く",
+            f"出力 (pair, 直近 since_hours 時間分・既定 {_DEFAULT_SINCE_HOURS}h)。"
+            "strategy 行には in_sample バックテスト成績 (in_sample_metrics) "
+            "と、実運用成績の予測値ではない旨の注記 (note) が付く",
             {"type": "object",
              "properties": {
                  "pair": pair_schema,

@@ -269,3 +269,26 @@ def test_malformed_backtest_metrics_json_does_not_break_other_rows(tmp_path):
     assert set(by_hash) == {"good_sig", "broken"}
     assert by_hash["broken"]["in_sample_metrics"] is None
     assert by_hash["broken"]["note"] == "バックテスト成績は実運用成績の予測値ではない"
+
+
+# ---- Task 3: description f-string 化 -----------------------------------------
+
+def test_get_signals_description_reflects_default_lookback(tmp_path, monkeypatch):
+    """get_signals tool の description が _DEFAULT_SINCE_HOURS の実値を
+    反映する (硬コードされた 24h ではなく f-string から動的に参照する)。
+    リテラル値への逆変異を検出するため、_DEFAULT_SINCE_HOURS を動的に変更して
+    description が追従することを検証する (codex I-3)。"""
+    conn = _conn(tmp_path)
+
+    # 元の値で動作確認
+    tool_original = _tool(conn)
+    assert f"{signal_tools._DEFAULT_SINCE_HOURS}h" in tool_original.description
+    assert "24h" in tool_original.description  # 元の既定値
+
+    # _DEFAULT_SINCE_HOURS を 37 に変更し、description が新しい値を反映することを確認
+    monkeypatch.setattr(signal_tools, "_DEFAULT_SINCE_HOURS", 37)
+    tool_mutated = _tool(conn)
+    assert "37h" in tool_mutated.description, \
+        f"description should contain '37h' when _DEFAULT_SINCE_HOURS=37, got: {tool_mutated.description}"
+    assert "24h" not in tool_mutated.description, \
+        f"description should not contain '24h' when _DEFAULT_SINCE_HOURS=37, got: {tool_mutated.description}"
