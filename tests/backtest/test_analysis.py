@@ -3,7 +3,7 @@
 brief (task-10-brief.md Step 1) のテストを、上書き節 A (コントローラ照合
 2026-08-02) の読み替えを適用して収録する:
 
-- conftest の SETTINGS は pairs=["USDJPY"], datafeed.watch_symbols=[] な
+- factories の SETTINGS は pairs=["USDJPY"], datafeed.watch_symbols=[] な
   ので、EURUSD を使う analyze_for_agent 呼び出しは全て
   ``_settings_watch_eurusd()`` (ローカルヘルパ) を渡す
   (test_agent_output_contract_no_leak / test_agent_analysis_is_in_sample_bounded
@@ -38,7 +38,7 @@ BEFORE_BOUNDARY = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
 
 
 def _settings_watch_eurusd():
-    """conftest の SETTINGS (watch_symbols=[]) を EURUSD 込みに拡張する。"""
+    """factories の SETTINGS (watch_symbols=[]) を EURUSD 込みに拡張する。"""
     return SETTINGS.model_copy(update={
         "datafeed": SETTINGS.datafeed.model_copy(
             update={"watch_symbols": ["EURUSD"]})})

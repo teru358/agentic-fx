@@ -286,11 +286,11 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     各部品の実装を使う — build 後の patch では bound 済みクロージャに届かないため
     注入で解決する)。
 
-    `provider` (プラン 8 park 返済 — codex I-3): 非 None の場合、
-    `PriceProvider` の内部構築と `quote_fn`/`spec_fn`/`bars_fn` の
-    bound-method 差し替えを丸ごとスキップし、渡されたインスタンスを
-    そのまま使う。`quote_fn`/`spec_fn`/`bars_fn` と併用した場合は
-    `provider` が優先され、後者は無視される (provider が全挙動を握るため)。
+    `provider` (プラン 8 park 返済): 非 None の場合、`PriceProvider` の内部構築と
+    `quote_fn`/`spec_fn`/`bars_fn` の bound-method 差し替えを丸ごとスキップし、
+    渡されたインスタンスをそのまま使う。`quote_fn`/`spec_fn`/`bars_fn` と併用した
+    場合は `ValueError` を送出して排他を強制する (provider が全挙動を握る seam
+    のため、併用は static な設定ミスとして即座に検出する)。
 
     **`healthcheck()` は注入対象外** (fix round 1 F2): `PriceProvider.healthcheck`
     は `self.get_quote(...)` に加えて `self.get_bars(...)` を呼ぶが、
@@ -308,6 +308,14 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     conn_shell = connect(root / "data" / "agentic.db")
 
     if provider is not None:
+        # provider と quote_fn/spec_fn/bars_fn は排他的: provider が指定されたら
+        # 他の注入点は併用不可 (fail closed: 混合による silent の誤動作を防止)。
+        if any([quote_fn is not None, spec_fn is not None, bars_fn is not None]):
+            raise ValueError(
+                "provider と quote_fn/spec_fn/bars_fn は併用不可 — "
+                "provider が全挙動を握る seam であり、個別関数との混合は "
+                "設定ミス (provider 側の挙動が一部無視される)。"
+                "provider を使わない場合のみ個別関数を指定してください。")
         # プラン 8 park 返済: 呼び出し側が provider の全挙動を握る
         # (quote_fn/spec_fn/bars_fn の bound-method 差し替えは行わない)。
         quote_fn = quote_fn if quote_fn is not None else provider.get_quote
@@ -319,8 +327,18 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # 反映する (Task 8 E2E で実測)。実際に内部 self-call が存在するのは
         # `self.get_quote` だけ (`PriceProvider._rate_of` および `healthcheck`
         # から呼ばれる — `to_account_rate` の換算レート解決がここを経由する)。
-        # (以下、既存の 269-296 行のコメント・代入をそのまま維持する —
-        # provider が None のときだけ通るブランチへ字下げを 1 段追加する)
+        # `self.spec` / `self.latest_1m_bar` は現時点で provider 内部からは
+        # 一切呼ばれていない (呼び出し元は Executor/Scheduler にローカル変数
+        # 経由で渡した spec_fn/bars_fn のみ) — 以下 2 行は今の挙動には効いて
+        # いない。それでも残しているのは予防的措置 (fix round 1 F1): 将来
+        # provider 内部に `self.spec(...)` / `self.latest_1m_bar(...)` の
+        # 自己呼び出しが追加されたとき、ここが無いと `get_quote` と同じ
+        # 「注入がローカル変数にしか反映されず内部呼び出しをすり抜ける」バグを
+        # 無音で再発させる (quote_fn 側の実例がまさにそれだった)。
+        # 注意: `self.get_bars(...)` (`latest_1m_bar`/`healthcheck` から既に
+        # 呼ばれている) はこの 2 行では捕捉できない — 別メソッド名なので
+        # `provider.latest_1m_bar = bars_fn` は届かない。恒久的に注入対象外
+        # (docstring の fix round 1 F2 注記を参照)。
         if quote_fn is not None:
             provider.get_quote = quote_fn
         else:
@@ -473,6 +491,15 @@ def build_splash(app: App) -> str:
         "コマンドは help を参照。stop で終了。")
 
 
+def _scheduler_tick_once(app: App) -> None:
+    """scheduler_thread の 1 tick 分 (抽出 — 単体テスト用シーム)。
+
+    app.clock.now() を読んで scheduler に渡すことを固定する。
+    """
+    with app.core_lock:
+        app.scheduler.tick(app.clock.now())
+
+
 def _watchdog_tick(app: App) -> None:
     """1 回分の watchdog 監視 (上書き 3)。activity/notifier の失敗はスレッドを
     殺さない — 呼び出し元 (watchdog スレッド) 側も広い try で包む。
@@ -535,8 +562,7 @@ def run_service(root: Path, *, daemon: bool = False,
                 if stop_event.is_set():
                     break  # 停止フェーズ: 新しい tick を開始しない
                 try:
-                    with app.core_lock:
-                        app.scheduler.tick(app.clock.now())
+                    _scheduler_tick_once(app)
                 except Exception:  # noqa: BLE001
                     _log.exception("tick failed")
             stop_event.wait(1)

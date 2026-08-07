@@ -58,7 +58,7 @@ NOW = datetime(2026, 10, 25, 0, 0, tzinfo=_UTC)          # holdout_boundary(NOW,
 TRIGGER_HOURS = [
     datetime(2026, 7, 20, 12, 0, tzinfo=_UTC),   # 月
     datetime(2026, 7, 21, 12, 0, tzinfo=_UTC),   # 火
-    datetime(2026, 7, 22, 12, 0, tzinfo=_UTC),   # 水 (conftest の H と同一時刻)
+    datetime(2026, 7, 22, 12, 0, tzinfo=_UTC),   # 水 (factories の H と同一時刻)
 ]
 
 OPEN = {"action": "open", "pair": "USDJPY", "direction": "long",

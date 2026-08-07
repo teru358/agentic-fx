@@ -879,9 +879,7 @@ def test_build_app_provider_seam_bypasses_quote_fn_patch(tmp_path):
     bound-method 差し替えは行われない (provider が全挙動を持つ)。"""
     _init(tmp_path)
     fake_provider = _FakeProvider()
-    app = build_app(tmp_path, provider=fake_provider,
-                    quote_fn=lambda pair: (_ for _ in ()).throw(
-                        AssertionError("quote_fn should not be used")))
+    app = build_app(tmp_path, provider=fake_provider)
     assert app.provider is fake_provider
 
 
@@ -915,3 +913,100 @@ def test_watchdog_tick_uses_mission_watch_time_fn(monkeypatch):
               owns_runner=False, clock=None)
     _watchdog_tick(app)
     assert calls == ["write", "send"]
+
+
+def test_build_app_provider_seam_rejects_concurrent_quote_fn(tmp_path):
+    """provider と quote_fn を併用する場合は ValueError を送出して排他を
+    強制する (fail closed: provider が全挙動を握る seam の混合は設定ミス)。"""
+    _init(tmp_path)
+    fake_provider = _FakeProvider()
+    with pytest.raises(ValueError, match="provider と quote_fn/spec_fn/bars_fn は併用不可"):
+        build_app(tmp_path, provider=fake_provider,
+                  quote_fn=lambda pair: None)
+
+
+def test_build_app_provider_seam_rejects_concurrent_spec_fn(tmp_path):
+    """provider と spec_fn を併用する場合は ValueError を送出して排他を
+    強制する。"""
+    _init(tmp_path)
+    fake_provider = _FakeProvider()
+    with pytest.raises(ValueError, match="provider と quote_fn/spec_fn/bars_fn は併用不可"):
+        build_app(tmp_path, provider=fake_provider,
+                  spec_fn=lambda pair: None)
+
+
+def test_build_app_provider_seam_rejects_concurrent_bars_fn(tmp_path):
+    """provider と bars_fn を併用する場合は ValueError を送出して排他を
+    強制する。"""
+    _init(tmp_path)
+    fake_provider = _FakeProvider()
+    with pytest.raises(ValueError, match="provider と quote_fn/spec_fn/bars_fn は併用不可"):
+        build_app(tmp_path, provider=fake_provider,
+                  bars_fn=lambda pair: None)
+
+
+def test_build_app_provider_seam_falls_back_to_provider_bound_methods(tmp_path):
+    """provider のみ注入 (quote_fn/spec_fn/bars_fn 未指定) の場合でも、
+    Executor/Scheduler に渡る quote_fn/spec_fn/bars_fn は None ではなく
+    provider の束縛メソッドにフォールバックすること (fallback binding が
+    削除されると Mission 実行時に TypeError で遅延失敗する)。"""
+    _init(tmp_path)
+    fake_provider = _FakeProvider()
+    app = build_app(tmp_path, provider=fake_provider)
+    # provider のみを渡し、quote_fn/spec_fn/bars_fn は未指定の場合、
+    # Executor/Scheduler が保持する関数が provider の束縛メソッドになるはず
+    assert app.executor.quote_fn is fake_provider.get_quote
+    assert app.executor.spec_fn is fake_provider.spec
+    assert app.scheduler.bars_fn is fake_provider.latest_1m_bar
+
+
+def test_scheduler_tick_once_uses_app_clock(tmp_path):
+    """scheduler_thread の 1 tick 分が app.clock.now() を読むことを直接確認
+    (app.clock を壁時計に戻す変異で red になるべき)。"""
+    from agentic_fx.service import _scheduler_tick_once
+    from agentic_fx.core.contracts import FixedClock
+
+    fixed = FixedClock(datetime(2026, 8, 4, 9, 0, tzinfo=timezone.utc))
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=fixed)
+    seen: list = []
+    app.scheduler.tick = lambda now: seen.append(now)
+    _scheduler_tick_once(app)
+    assert seen == [fixed.now()]
+
+
+def test_watchdog_tick_uses_mission_watch_time_fn_directly(tmp_path):
+    """_watchdog_tick の elapsed 算出が MissionWatch.time_fn 経由で行われ、
+    結果を FakeActivity/FakeNotifier に観測する (time_fn を壁時計に戻す
+    変異で red になるべき)。"""
+    from agentic_fx.service import _watchdog_tick, App
+    from agentic_fx.loops.mission_watch import MissionWatch
+
+    fake_time = [1000.0]
+    watch = MissionWatch(time_fn=lambda: fake_time[0])
+    watch.begin(mission_id=1, loop="trade", timeout_sec=10.0)
+    fake_time[0] = 1000.0 + 10.0 + 71.0  # timeout(10) + grace(60) + margin(1) を超過 → elapsed 81s
+
+    captured_messages: list[str] = []
+
+    class FakeActivity:
+        def write(self, category, key, message):
+            captured_messages.append(message)
+
+    class FakeNotifier:
+        def send(self, message):
+            captured_messages.append(message)
+
+    app = App(conn_core=None, conn_shell=None, settings=None, state=None,
+              activity=FakeActivity(), broker=None, executor=None,
+              provider=None, econ=None, collector=None, rag=None,
+              trade_loop=None, reflection=None, scheduler=None,
+              commands=None, registry=None, core_lock=None,
+              mission_watch=watch, notifier=FakeNotifier(), runner=None,
+              owns_runner=False, clock=None)
+    _watchdog_tick(app)
+    # elapsed は fake_time に基づいた値 (81s) になるはず。
+    # 生の time.monotonic() (システム起動からの経過、通常大きい数値)
+    # に戻す変異はこのテストの assertion で red になる。
+    assert any("81" in str(msg) for msg in captured_messages), \
+        f"elapsed 81s を期待するが captured_messages={captured_messages}"
