@@ -16,6 +16,7 @@
 - 依存の浅い task 束は worktree 並列。**ユーザーへの節目確認は task 単位ではなく束単位**
 - **各 step に書かれた変異リストは「下限」であって天井ではない** (Task 2 レビューで確定した運用規則)。実装者は「この task が守ろうとしている防御・性質」ごとに、それを外して red になるかを自分で 1 件ずつ確かめ、リストに無い変異を追加したら報告する。既存テストを弱める変更をする場合は、等価以上の代替ピンを同時に用意して報告する
   - 根拠 (実測): Task 2 の実装者はプラン記載の変異 5 件を全て実測して red を確認したが、リストに無かった `--noconftest` の多層防御は無防備で、削除しても `tests/plugin/` の 201 テストが green のままだった (sonnet 副査が実測検出)
+- **重大度が割れたら指揮者が再判定する** (2026-08-07 ユーザー裁定)。codex と sonnet の重大度評価は系統的にずれる — 実測: Task 2 の `--noconftest` 無防備は codex Important / sonnet Critical、Task 4 の生存変異 3 件は codex Critical / sonnet Important〜Minor と**逆方向にずれた**。両者の重大度は参考値とし、指揮者が現物 (設計書・コード) を確認して最終的な重大度と採否を決める。Task 3 の I-1 (設計書 §7 と突き合わせて「実装は正しい・文書が誤り」と裁定) がその実例
 - エスカレーション: haiku 同一 task 2 回失敗 → codex/sonnet 再割当。割れた Critical は codex 反証要求 or ユーザー park
 - レジャー: `.superpowers/sdd/2026-08-04-phase2-8-worker-isolation/progress.md`
 
