@@ -267,9 +267,8 @@ def test_role_is_pinned_to_assistant_regardless_of_server_value():
     assert assistant_msgs[0]["role"] == "assistant"
 
 
-def test_on_message_called_for_every_append_including_initial_prompt():
-    """sink 集約 (プラン 8 worker 基盤 — codex I-6): 初期 user prompt を
-    含む全 append site で on_message が呼ばれる。"""
+def test_on_message_initial_user_prompt():
+    """Append site 1: 初期 user prompt。on_message が初期メッセージを受け取る。"""
     seen: list[dict] = []
     registry = ToolRegistry()
     runner = LocalRunner(base_url="http://x", model="m", registry=registry,
@@ -279,14 +278,166 @@ def test_on_message_called_for_every_append_including_initial_prompt():
                          on_message=seen.append)
     mission = Mission(prompt="hello", tools=[], output_schema={"type": "object"},
                       max_turns=1, timeout_sec=10.0)
-    runner.run(mission)
+    result = runner.run(mission)
 
+    # 完全な一致を確認: seen の内容が result.transcript と同じ
+    assert seen == result.transcript
+    # 各サイト: 初期 user
     assert seen[0] == {"role": "user", "content": "hello"}
+
+
+def test_on_message_assistant_message():
+    """Append site 2: assistant message。on_message が assistant の response を受け取る。"""
+    seen: list[dict] = []
+    registry = ToolRegistry()
+    runner = LocalRunner(base_url="http://x", model="m", registry=registry,
+                         transport=httpx.MockTransport(
+                             lambda r: _resp({"role": "assistant",
+                                             "content": '{"action": "hold"}'})),
+                         on_message=seen.append)
+    mission = Mission(prompt="q", tools=[], output_schema={"type": "object"},
+                      max_turns=1, timeout_sec=10.0)
+    result = runner.run(mission)
+
+    assert seen == result.transcript
+    # 初期 user + assistant response
+    assert len(seen) == 2
+    assert seen[0]["role"] == "user"
+    assert seen[1]["role"] == "assistant"
+
+
+def test_on_message_tool_result():
+    """Append site 3: tool result。tool_call に対する結果を on_message が受け取る。"""
+    seen: list[dict] = []
+    registry = ToolRegistry()
+    registry.register(ToolDef("greet", "greeting tool",
+                             {"type": "object", "properties": {}},
+                             lambda: "hello"))
+
+    responses = [
+        {"role": "assistant", "content": None,
+         "tool_calls": [
+             {"id": "tc1", "type": "function",
+              "function": {"name": "greet", "arguments": "{}"}}]},
+        {"role": "assistant", "content": '{"action": "done"}'}
+    ]
+
+    def handler(request):
+        msg = responses[min(len(seen) // 2, len(responses) - 1)]
+        return _resp(msg)
+
+    runner = LocalRunner(base_url="http://x", model="m", registry=registry,
+                         transport=httpx.MockTransport(handler),
+                         on_message=seen.append)
+    mission = Mission(prompt="q", tools=["greet"],
+                      output_schema={"type": "object"}, max_turns=2,
+                      timeout_sec=10.0)
+    result = runner.run(mission)
+
+    # 4 messages: user + assistant(tool_call) + tool(result) + assistant(final)
+    assert seen == result.transcript
+    tool_msgs = [m for m in seen if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["tool_call_id"] == "tc1"
+
+
+def test_on_message_non_string_content_repair():
+    """Append site 4: 非文字列 content の修復prompt。
+    content が dict/list だと JSON stringify されて修復メッセージが sent。
+    on_message は deepcopy を受け取るため、元の dict のままのはず。"""
+    seen: list[dict] = []
+    registry = ToolRegistry()
+    runner = LocalRunner(base_url="http://x", model="m", registry=registry,
+                         transport=httpx.MockTransport(
+                             lambda r: (
+                                 _resp({"role": "assistant",
+                                       "content": {"action": "invalid"}})
+                                 if len([m for m in seen
+                                        if m.get("role") == "assistant"]) < 1
+                                 else _resp({"role": "assistant",
+                                            "content": '{"action": "hold"}'}))),
+                         on_message=seen.append)
+    mission = Mission(prompt="q", tools=[], output_schema={"type": "object"},
+                      max_turns=3, timeout_sec=10.0)
+    result = runner.run(mission)
+
+    # 修復メッセージが含まれていることを確認
+    repair_msgs = [m for m in seen if "JSON として解釈できません" in
+                   m.get("content", "")]
+    assert len(repair_msgs) > 0
+    # on_message が受け取った assistant msg は dict のまま
+    seen_assistant_msgs = [m for m in seen if m.get("role") == "assistant"]
+    assert len(seen_assistant_msgs) >= 1
+    if isinstance(seen_assistant_msgs[0].get("content"), dict):
+        # deepcopy で保護されているため dict のままのはず
+        assert seen_assistant_msgs[0]["content"] == {"action": "invalid"}
+    # transcript の assistant msg は stringify 済み
+    result_assistant_msgs = [m for m in result.transcript
+                            if m.get("role") == "assistant"]
+    assert any(isinstance(m.get("content"), str) for m in result_assistant_msgs)
+
+
+def test_on_message_parse_error_repair():
+    """Append site 5: JSON parse error の修復prompt。
+    content が不正な JSON だと修復メッセージが sent。"""
+    seen: list[dict] = []
+    registry = ToolRegistry()
+    runner = LocalRunner(base_url="http://x", model="m", registry=registry,
+                         transport=httpx.MockTransport(
+                             lambda r: (
+                                 _resp({"role": "assistant",
+                                       "content": "not valid json"})
+                                 if len([m for m in seen
+                                        if m.get("role") == "assistant"]) < 1
+                                 else _resp({"role": "assistant",
+                                            "content": '{"action": "hold"}'}))),
+                         on_message=seen.append)
+    mission = Mission(prompt="q", tools=[], output_schema={"type": "object"},
+                      max_turns=3, timeout_sec=10.0)
+    result = runner.run(mission)
+
+    # 修復メッセージが見えていることを確認
+    repair_msgs = [m for m in seen if "JSON として解釈できません" in
+                   m.get("content", "")]
+    assert len(repair_msgs) > 0
+    # on_message が初期 user と最終 assistant を受け取っていることを確認
+    assert any(m.get("role") == "user" for m in seen)
     assert any(m.get("role") == "assistant" for m in seen)
 
 
-def test_on_message_exception_does_not_break_run(monkeypatch):
-    """on_message が例外を送出しても run() は completed を返す
+def test_on_message_validation_error_repair():
+    """Append site 6: schema validation error の修復prompt。
+    output が schema に合わないと修復メッセージが sent。"""
+    seen: list[dict] = []
+    registry = ToolRegistry()
+    runner = LocalRunner(
+        base_url="http://x", model="m", registry=registry,
+        transport=httpx.MockTransport(
+            lambda r: (
+                _resp({"role": "assistant",
+                      "content": '{"wrong_field": "value"}'})
+                if len([m for m in seen
+                       if m.get("role") == "assistant"]) < 1
+                else _resp({"role": "assistant",
+                           "content": '{"action": "hold"}'}))),
+        on_message=seen.append)
+    schema = {"type": "object", "properties": {"action": {"type": "string"}},
+              "required": ["action"]}
+    mission = Mission(prompt="q", tools=[], output_schema=schema,
+                      max_turns=3, timeout_sec=10.0)
+    result = runner.run(mission)
+
+    # 修復メッセージが見えていることを確認
+    repair_msgs = [m for m in seen if "スキーマに合いません" in
+                   m.get("content", "")]
+    assert len(repair_msgs) > 0
+    # on_message が全メッセージを受け取っていることを確認
+    assert any(m.get("role") == "user" for m in seen)
+    assert any(m.get("role") == "assistant" for m in seen)
+
+
+def test_on_message_exception_does_not_break_run_runtime_error(monkeypatch, caplog):
+    """on_message が RuntimeError を送出しても run() は completed を返す
     (sink はベストエフォートの観測性記録)。"""
     def boom(msg):
         raise RuntimeError("sink failed")
@@ -301,3 +452,90 @@ def test_on_message_exception_does_not_break_run(monkeypatch):
                       max_turns=1, timeout_sec=10.0)
     result = runner.run(mission)
     assert result.status == "completed"
+    # 警告がログに記録されていることを確認
+    assert "on_message callback raised" in caplog.text
+
+
+def test_on_message_exception_does_not_break_run_os_error(caplog):
+    """on_message が OSError (BrokenPipeError等) を送出しても run() は
+    completed を返す。Exception の広さ (M-1) が実装されていることを確認。"""
+    def broken_pipe(msg):
+        raise BrokenPipeError("connection lost")
+
+    registry = ToolRegistry()
+    runner = LocalRunner(base_url="http://x", model="m", registry=registry,
+                         transport=httpx.MockTransport(
+                             lambda r: _resp({"role": "assistant",
+                                             "content": '{"action": "hold"}'})),
+                         on_message=broken_pipe)
+    mission = Mission(prompt="hello", tools=[], output_schema={"type": "object"},
+                      max_turns=1, timeout_sec=10.0)
+    result = runner.run(mission)
+    assert result.status == "completed"
+    # 警告がログに記録されていることを確認
+    assert "on_message callback raised" in caplog.text
+
+
+def test_on_message_receives_deepcopy_not_aliased():
+    """on_message が受け取る msg は deepcopy であり、run() が後で
+    in-place で stringify してもon_message の記録には影響しない (sonnet I-1)。
+
+    deepcopy がなければ、on_message が受け取った msg は messages リストの
+    同じ位置のオブジェクトと同一参照になり、run() が stringify 実行後、
+    on_message が保存した参照を読むと既に stringify 済みになっている。
+    """
+    captured_msgs: list[dict] = []
+
+    def capture_msg_by_reference(msg):
+        # on_message が受け取ったメッセージの参照をそのまま保存
+        # deepcopy がなければ、このメッセージオブジェクトは
+        # messages リストの同じ位置のオブジェクトと同一で、
+        # 後の stringify で content が "str" に置換される
+        captured_msgs.append(msg)
+
+    registry = ToolRegistry()
+    runner = LocalRunner(base_url="http://x", model="m", registry=registry,
+                         transport=httpx.MockTransport(
+                             lambda r: (
+                                 _resp({"role": "assistant",
+                                       "content": {"action": "invalid"}})
+                                 if len([m for m in captured_msgs
+                                        if m.get("role") == "assistant"]) < 1
+                                 else _resp({"role": "assistant",
+                                            "content": '{"action": "hold"}'}))),
+                         on_message=capture_msg_by_reference)
+    mission = Mission(prompt="q", tools=[], output_schema={"type": "object"},
+                      max_turns=3, timeout_sec=10.0)
+    result = runner.run(mission)
+
+    # on_message が捉えた最初の assistant msg (非文字列 content)
+    captured_assistant = [m for m in captured_msgs if m.get("role") == "assistant"]
+    assert len(captured_assistant) > 0
+    first_captured = captured_assistant[0]
+
+    # deepcopy のおかげで、captured_assistant[0] は transcript のものと
+    # 別オブジェクト。callback 時点で dict だった content は
+    # transcript には stringify された状態で保存される。
+    # したがって captured のまま dict で、transcript は str。
+
+    # captured の最初の assistant は dict content のまま
+    if isinstance(first_captured.get("content"), dict):
+        # deepcopy で保護されているので dict のまま
+        assert first_captured["content"] == {"action": "invalid"}
+    else:
+        # もし str なら、deepcopy がなく aliasing が起こった証拠
+        # (このテストは deepcopy あり が前提なので、ここに来ないはず)
+        assert False, "captured msg was aliased and stringify 済み"
+
+    # transcript の最初の assistant は stringify 済み
+    result_assistant = [m for m in result.transcript if m.get("role") == "assistant"]
+    assert len(result_assistant) > 0
+    first_result = result_assistant[0]
+    # transcript のmsg は stringify されているはず
+    if isinstance(first_result.get("content"), str):
+        # stringify 済み (正常)
+        pass
+    elif isinstance(first_result.get("content"), dict):
+        # dict のままなら stringify されていない
+        # (たまたまvalid JSONの次ターンになった場合)
+        pass

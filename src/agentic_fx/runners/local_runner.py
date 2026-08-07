@@ -10,6 +10,7 @@ httpx timeout は connect/write/read/pool 各フェーズに適用されるた�
 (monit watchdog 管理下) と事後の deadline 確認で妥協。"""
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import time
@@ -54,11 +55,17 @@ class LocalRunner(AgentRunner):
     def _sink(self, messages: list[dict], msg: dict) -> None:
         """messages への唯一の append 経路。on_message はベストエフォート
         (例外を run() に伝播させない — 観測性の記録が Mission 実行を
-        阻害してはならない)。"""
+        阻害してはならない)。
+
+        Aliasing contract: `msg` は `run()` 内の後続処理で in-place 変更される
+        可能性がある (content の JSON stringify、tool_calls の処理等)。そのため
+        `on_message` には deepcopy を渡し、呼び出し側は同期消費でなくてよい。
+        `messages` に append されるのは元のオブジェクトのまま (run() の事後変更
+        が反映される)。"""
         messages.append(msg)
         if self._on_message is not None:
             try:
-                self._on_message(msg)
+                self._on_message(copy.deepcopy(msg))
             except Exception:  # noqa: BLE001 — 観測性記録は実行を止めない
                 _log.warning("on_message callback raised", exc_info=True)
 
