@@ -30,7 +30,7 @@ kind 別の戻り値スキーマ検証 (`bar_ts` 拒否、`StrategyDecision` 構
 docstring を同期すること):
 
 - handshake (最初の 1 行、親から):
-  `{"cpu_sec": int, "memory_mb": int, "kind": "indicator"|"signal"|"strategy"}`
+  `{"cpu_sec": int, "memory_mb": int, "nofile": int, "fsize_mb": int, "kind": "indicator"|"signal"|"strategy"}`
 - ready (handshake への応答、plugin.py の import 成功後に送る):
   `{"ok": true, "ready": true, "pid": int}` /
   `{"ok": false, "ready": false, "error": "<message>"}`
@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import json
 import os
+import resource
 import sys
 from typing import Any
 
@@ -74,14 +75,27 @@ from typing import Any
 _NPROC_CAP = 512
 
 
-def _set_resource_limits(cpu_sec: int, memory_mb: int) -> None:
-    import resource
-
+def _set_resource_limits(cpu_sec: int, memory_mb: int, nofile: int,
+                          fsize_mb: int) -> None:
     cpu = int(cpu_sec)
     resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
 
     mem_bytes = int(memory_mb) * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+
+    # プラン 8 B 束: worker は plugin.py の import と call() の応答書き込み
+    # 以外にファイル記述子を要しない (stdin/stdout/stderr の 3 つ +
+    # import 時の一時的な .so/.pyc オープン)。想定外の大量オープン
+    # (fork bomb 的 fd リーク) を検知する上限として十分寛大な値を渡す
+    # (呼び出し元が settings.plugin.sandbox_nofile を渡す — 既定 128)。
+    resource.setrlimit(resource.RLIMIT_NOFILE, (int(nofile), int(nofile)))
+
+    # RLIMIT_FSIZE: plugin コードは check_source の denylist
+    # (open/to_*/read_* 等) により意図的なファイル書き込みができない —
+    # ここでの上限は「想定外の書き込みを小さく抑える」多層防御 (呼び出し
+    # 元が settings.plugin.sandbox_fsize_mb を渡す — 既定 8MB)。
+    fsize_bytes = int(fsize_mb) * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_bytes, fsize_bytes))
 
     try:
         resource.setrlimit(resource.RLIMIT_NPROC, (_NPROC_CAP, _NPROC_CAP))
@@ -184,7 +198,8 @@ def main() -> None:
 
     pid = os.getpid()
     try:
-        _set_resource_limits(handshake["cpu_sec"], handshake["memory_mb"])
+        _set_resource_limits(handshake["cpu_sec"], handshake["memory_mb"],
+                              handshake["nofile"], handshake["fsize_mb"])
         _poison_network_modules()
         plugin_module = _import_plugin(plugin_dir)
         kind = handshake["kind"]

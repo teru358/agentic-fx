@@ -185,6 +185,15 @@ class PluginSettings(_Strict):
     # 1 応答行の生バイト数上限。無制限バッファを避けるため読み取り中に
     # この上限を超えた時点で打ち切る。
     sandbox_output_max_bytes: int = Field(ge=1, default=1_048_576)
+    # RLIMIT_NOFILE — worker プロセスが同時に開けるファイル記述子数の上限。
+    # plugin コードは check_source の denylist によりファイルを開けない
+    # ため、想定外の大量オープン (fd リーク) を検知する多層防御。
+    sandbox_nofile: int = Field(ge=1, default=128)
+    # RLIMIT_FSIZE (MiB) — 1 ファイルあたりの書き込みサイズ上限。plugin
+    # コードは denylist により意図的な書き込みができないため、想定外の
+    # 大量書き込みを小さく抑える多層防御。pytest サブプロセス (approval.py
+    # の test_plugin.py 実行) にも同じ 2 値を流用する。
+    sandbox_fsize_mb: int = Field(ge=1, default=8)
     # plugin に渡す DataFrame の末尾最大本数の上限 (config.yaml の
     # max_bars はこれ以下でなければならない — 照合は消費側の責務)。
     max_bars_limit: int = Field(ge=1, default=1000)

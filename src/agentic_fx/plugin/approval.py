@@ -39,21 +39,22 @@ decided_by="human_cli")` する。`submit_plugin` を呼んで id を得てか�
 `decide` するだけで、検証ロジックを二重に持たない。CLI からのみ呼ぶ
 (改善ループの tool 定義には絶対に載せない — 回帰ピンは Task 9 の関心)。
 
-**脅威モデル (最終レビュー F5、必読)**: `test_plugin.py` の pytest は
-サンドボックス外 (このプロセス自身の権限) で実行される — `worker.py` の
-resource limit も import 遮断も掛からない。`sandbox.check_source` の AST
-ゲートは import 文・denylist 名の**主要な迂回経路**を塞ぐが完全な隔離
-ではない (`sandbox.py` モジュール docstring の脅威モデルと同じ — 動的な
-名前組み立てや、未知の新しい迂回経路まで防ぐものではない)。したがって
-`submit_plugin`/`bless` は **自分自身または信頼できるソースが書いた
-plugin に対してのみ実行すること** — 出所不明な plugin をそのまま
-submit/bless する運用は想定していない。完全な (悪意ある入力に対しても
-安全な) 隔離はプラン 8 の sandbox 増強で扱う。
+**脅威モデル (Task 2 実装後)**: `test_plugin.py` の pytest は別プロセス
+(`agentic_fx.plugin.pytest_sandbox_entry` 経由) で実行され、最小 env
+(PATH/PYTHONPATH/PYTHONSAFEPATH + シングルスレッド化変数のみ)、resource
+limit (RLIMIT_AS/NOFILE/FSIZE)、ネットワークモジュール毒入れが適用される。
+完全な OS 隔離ではなく、AST ゲート (`sandbox.check_source`) は import 文・
+denylist 名の**主要な迂回経路**を塞ぐが動的な名前組み立ては防げない。
+したがって `submit_plugin`/`bless` は **自分自身または信頼できるソースが
+書いた plugin に対してのみ実行すること** — 出所不明な plugin をそのまま
+submit/bless する運用は想定していない (悪意ある入力に対する完全な隔離を
+保証するのではなく、善意だが不注意な plugin の事故防止を目的とする)。
 """
 from __future__ import annotations
 
 import hashlib
 import os
+import resource
 import signal
 import subprocess
 import sys
@@ -72,7 +73,7 @@ from agentic_fx.plugin.signal_eval import SandboxRunFn, evaluate_detection
 from agentic_fx.store import approvals as approvals_store
 
 if TYPE_CHECKING:
-    from agentic_fx.config import Settings
+    from agentic_fx.config import PluginSettings, Settings
 
 # pytest_runner 注入シームの型: test_plugin.py の絶対パス → 少なくとも
 # {"returncode": int, "stdout": str} を持つ dict。
@@ -127,31 +128,65 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
         pass
 
 
-def _default_pytest_runner(test_plugin_path: Path) -> dict[str, Any]:
+def _pytest_rlimit_preexec(memory_mb: int, nofile: int,
+                            fsize_mb: int) -> Callable[[], None]:
+    """`subprocess.Popen(preexec_fn=...)` に渡す純関数ファクトリ。
+
+    fork 直後・exec 直前に子プロセス側で実行される (Unix 専用 API —
+    本プロジェクトの動作環境は Linux 前提)。plugin worker (worker.py の
+    `_set_resource_limits`) と同じ 2 値 (settings.plugin.sandbox_nofile/
+    sandbox_fsize_mb) を pytest サブプロセスにも適用する。
+    """
+    def _fn() -> None:
+        mem_bytes = int(memory_mb) * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (int(nofile), int(nofile)))
+        fsize_bytes = int(fsize_mb) * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_bytes, fsize_bytes))
+    return _fn
+
+
+def _default_pytest_runner(test_plugin_path: Path, *,
+                            settings: "PluginSettings | None" = None,
+                            ) -> dict[str, Any]:
     """既定の pytest 実行シーム。
 
     **1 plugin につき 1 サブプロセス** で実行する (サンプル test_plugin.py
-    のモジュール名衝突回避 — 複数 plugin の test_plugin.py をまとめて 1 回
-    の pytest 呼び出しに乗せない、という確立済みの申し送り)。
-    `-p no:cacheprovider` で plugin フォルダに `.pytest_cache` を作らせな
-    い (キャッシュ汚染回避)。
+    のモジュール名衝突回避)。`agentic_fx.plugin.pytest_sandbox_entry`
+    経由で spawn する (ネットワーク毒入れを pytest のテスト収集より前に
+    適用するため — モジュール docstring 参照)。**最小 env** (`sandbox.
+    _build_env()` を再利用 — `AFX_*` 等の秘密を含む親 env を継承しない)
+    + **resource limit** (`_pytest_rlimit_preexec`) を適用する。
 
-    timeout 発生時は `_kill_process_group` でプロセスグループごと回収する
-    (F4 — 直接の子だけを kill する `subprocess.run(timeout=...)` は使わ
-    ない)。
+    `settings` が None の場合は plugin サンドボックスの既定値
+    (`PluginSettings()` のデフォルト) を使う — 呼び出し元 (`submit_plugin`)
+    は実際の `settings.plugin` を渡す。
 
-    `--noconftest` (最終レビュー fix F4): loader.py の discover は plugin
-    フォルダ直下の同梱 `conftest.py` を reject するが (F3)、それだけでは
-    「plugin フォルダの**外側** (親ディレクトリ以上) に置かれた
-    conftest.py を pytest が自動収集する」経路までは塞げない。pytest は
-    既定で test_plugin.py から見て親方向の全ディレクトリの conftest.py
-    を探索して読み込む — `--noconftest` でこの探索自体を止める多層防御。
+    timeout 発生時は `_kill_process_group` でプロセスグループごと回収する。
     """
+    from agentic_fx.plugin.sandbox import _build_env
+    from agentic_fx.config import PluginSettings
+    eff_settings = settings if settings is not None else PluginSettings()
+    env = _build_env()
+    # FC-3 対応: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` はサードパーティ
+    # プラグインの setuptools entry-point 自動読込のみを止める (pytest
+    # 本体に同梱される builtin プラグインは対象外で、通常の収集・実行は
+    # 引き続き機能する)。これが無いと `anyio` 等の entry-point プラグイン
+    # が pytest.main() 実行中に (毒入れ済みの) `socket` を import しようと
+    # して `ImportError` になり、poison 後は毎回 exit=1 で test_plugin.py
+    # の承認が全滅する (実測で確認済み — poison を pytest 起動前に適用する
+    # 設計上、entry-point プラグインの自動読込そのものを止める以外に
+    # 安全な回避策が無い)。
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     proc = subprocess.Popen(
-        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
-         "--noconftest", "-q", str(test_plugin_path)],
+        [sys.executable, "-m", "agentic_fx.plugin.pytest_sandbox_entry",
+         str(test_plugin_path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        start_new_session=True)
+        start_new_session=True, env=env,
+        preexec_fn=_pytest_rlimit_preexec(
+            memory_mb=eff_settings.sandbox_memory_mb,
+            nofile=eff_settings.sandbox_nofile,
+            fsize_mb=eff_settings.sandbox_fsize_mb))
     try:
         stdout, stderr = proc.communicate(timeout=_PYTEST_TIMEOUT_SEC)
     except subprocess.TimeoutExpired as exc:
@@ -264,7 +299,8 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
         check_source(meta.path / "plugin.py")
         check_source(test_plugin_path, extra_allowed=frozenset({"pytest", "plugin"}))
 
-        runner = pytest_runner if pytest_runner is not None else _default_pytest_runner
+        runner = (pytest_runner if pytest_runner is not None
+                  else lambda p: _default_pytest_runner(p, settings=settings.plugin))
         pytest_result = runner(test_plugin_path)
         if pytest_result["returncode"] != 0:
             raise ValueError(
