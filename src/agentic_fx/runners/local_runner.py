@@ -10,6 +10,7 @@ httpx timeout は connect/write/read/pool 各フェーズに適用されるた�
 (monit watchdog 管理下) と事後の deadline 確認で妥協。"""
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import time
@@ -34,20 +35,44 @@ _MAX_TOOL_CALLS_PER_TURN = 16
 class LocalRunner(AgentRunner):
     def __init__(self, *, base_url: str, model: str, registry: ToolRegistry,
                  transport: httpx.BaseTransport | None = None,
-                 time_fn: Callable[[], float] = time.monotonic) -> None:
+                 time_fn: Callable[[], float] = time.monotonic,
+                 on_message: Callable[[dict], None] | None = None) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._registry = registry
         self._client = httpx.Client(transport=transport)
         self._time = time_fn
+        # プラン 8 worker 基盤 (codex I-6): messages への全 append を単一
+        # sink に集約する。on_message は子プロセス (mission_worker.py) が
+        # event フレームを親へ送出するためのコールバック。既定 None は
+        # 既存挙動 (sink 呼び出しなし) と完全互換。
+        self._on_message = on_message
 
     def close(self) -> None:
         """Close the HTTP client connection."""
         self._client.close()
 
+    def _sink(self, messages: list[dict], msg: dict) -> None:
+        """messages への唯一の append 経路。on_message はベストエフォート
+        (例外を run() に伝播させない — 観測性の記録が Mission 実行を
+        阻害してはならない)。
+
+        Aliasing contract: `msg` は `run()` 内の後続処理で in-place 変更される
+        可能性がある (content の JSON stringify、tool_calls の処理等)。そのため
+        `on_message` には deepcopy を渡し、呼び出し側は同期消費でなくてよい。
+        `messages` に append されるのは元のオブジェクトのまま (run() の事後変更
+        が反映される)。"""
+        messages.append(msg)
+        if self._on_message is not None:
+            try:
+                self._on_message(copy.deepcopy(msg))
+            except Exception:  # noqa: BLE001 — 観測性記録は実行を止めない
+                _log.warning("on_message callback raised", exc_info=True)
+
     def run(self, mission: Mission) -> MissionResult:
         deadline = self._time() + mission.timeout_sec
-        messages: list[dict] = [{"role": "user", "content": mission.prompt}]
+        messages: list[dict] = []
+        self._sink(messages, {"role": "user", "content": mission.prompt})
         tools = self._registry.openai_tools(mission.tools)
         parse_retries = schema_retries = 0
 
@@ -96,7 +121,7 @@ class LocalRunner(AgentRunner):
                 normalized_msg["content"] = msg["content"]
             if "tool_calls" in msg:
                 normalized_msg["tool_calls"] = msg["tool_calls"]
-            messages.append(normalized_msg)
+            self._sink(messages, normalized_msg)
 
             # F1: Validate tool_calls structure defensively
             if normalized_msg.get("tool_calls"):
@@ -141,8 +166,8 @@ class LocalRunner(AgentRunner):
                         _log.warning("tool_call shape validation failed: %s",
                                      safe_error_text(e))
                         return _finish("failed")
-                    messages.append({"role": "tool", "tool_call_id": tc["id"],
-                                     "content": result})
+                    self._sink(messages, {"role": "tool", "tool_call_id": tc["id"],
+                                          "content": result})
                     if timed_out():
                         return _finish("timeout")
 
@@ -170,11 +195,11 @@ class LocalRunner(AgentRunner):
                 parse_retries += 1
                 if parse_retries > _MAX_REPAIR_RETRIES:
                     return _finish("failed")
-                messages.append({"role": "user",
-                                 "content": f"出力を JSON として解釈できません "
-                                            f"(content is not a string)"
-                                            f"。JSON オブジェクトのみを"
-                                            f"出力してください。"})
+                self._sink(messages, {"role": "user",
+                                      "content": f"出力を JSON として解釈できません "
+                                                 f"(content is not a string)"
+                                                 f"。JSON オブジェクトのみを"
+                                                 f"出力してください。"})
                 continue
 
             # Check deadline before parse_json_output (F4)
@@ -187,10 +212,10 @@ class LocalRunner(AgentRunner):
                 parse_retries += 1
                 if parse_retries > _MAX_REPAIR_RETRIES:
                     return _finish("failed")
-                messages.append({"role": "user",
-                                 "content": f"出力を JSON として解釈できません "
-                                            f"({e})。JSON オブジェクトのみを"
-                                            f"出力してください。"})
+                self._sink(messages, {"role": "user",
+                                      "content": f"出力を JSON として解釈できません "
+                                                 f"({e})。JSON オブジェクトのみを"
+                                                 f"出力してください。"})
                 continue
             try:
                 jsonschema.validate(output, mission.output_schema)
@@ -198,10 +223,10 @@ class LocalRunner(AgentRunner):
                 schema_retries += 1
                 if schema_retries > _MAX_REPAIR_RETRIES:
                     return _finish("failed")
-                messages.append({"role": "user",
-                                 "content": f"出力がスキーマに合いません: "
-                                            f"{e.message}。修正して JSON のみ"
-                                            f"再出力してください。"})
+                self._sink(messages, {"role": "user",
+                                      "content": f"出力がスキーマに合いません: "
+                                                 f"{e.message}。修正して JSON のみ"
+                                                 f"再出力してください。"})
                 continue
             except Exception as e:  # noqa: BLE001 — W2: SchemaError 等
                 # mission.output_schema 自体が不正 (SchemaError や $ref 解決
