@@ -29,3 +29,6 @@ CLAUDE.md
 *.swp
 *.swo
 *~
+
+# SDD 作業文書 (レビュー/修整ログ — ローカル運用、未追跡)
+/.superpowers/
