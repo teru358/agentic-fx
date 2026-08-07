@@ -2204,6 +2204,7 @@ EOF
 
 **設計判断 (writing-plans — 設計書の「必要サブセット」を具体化)**:
 - **handshake で渡す `settings` は `Settings.model_dump()` のフルダンプ**とする (「必要サブセットのみ」ではなく全体)。理由: settings.yaml に秘密情報は含まれない (CLAUDE.md 絶対制約 — 秘密は `.env` のみ) ため全体を渡しても安全であり、「どのキーが必要か」を都度洗い出す部分集合方式は将来のツール追加のたびに漏れる (fail-open の温床)。
+  - **Task 10 への申し送り (2026-08-08 指揮者の着手前実測)**: 親側は `model_dump()` ではなく **`model_dump(mode="json")`** を使うこと。`write_frame` は素の `json.dumps` を呼ぶため、`Settings` に将来 `Path`/`datetime`/`Enum` 型のフィールドが 1 つでも入ると `TypeError` で handshake 送出が壊れる。実測 (2026-08-08 現在): 現行 `Settings` は素の `model_dump()` でも `json.dumps` 可能・`mode="json"` でも `Settings.model_validate` に round-trip 可能 — つまり今は**どちらでも動くため、退行しても Task 10 のテストでしか気づけない**。Task 10 で `mode="json"` を使い、「handshake payload が JSON シリアライズ可能であること」の回帰ピンを 1 本置く。
 - **`runner` 設定は個別に渡さない** — `settings.runner.trade`/`settings.llama_swap.base_url` が既に `settings` 全体に含まれるため、trade profile の子は常にこれらから `LocalRunner` を組み立てる (`backend == "claude"` は Global Constraints のとおり `RuntimeError` で fail closed)。
 - **`indicator_plugins`/`approved plugins` は子が自分の RO 接続 + `plugins_dir` から自分で `plugin_loader.approved_plugins()` を呼んで再構築する** (`PluginMeta` は `Path` を含み JSON で素直にシリアライズできないため、ワイヤに乗せず子が独立に再計算する — 親と子は同じ `plugins_dir`/DB を見るので結果は一致する)。
 - **`transcript_max_bytes` (累積上限) は子には渡さない** — truncate 判定は親側 (`WorkerRunner`, Task 10) の責務にする。子は `event` フレームを無条件に送出し続け、親が受信側で打ち切る (パイプの背圧を避けるため、子は送出を止めない — 親は打ち切った後も読み続けてパイプを詰まらせない)。
@@ -2563,6 +2564,73 @@ def test_main_rejects_handshake_with_wrong_type(monkeypatch, tmp_path):
     assert sent["ok"] is False
 
 
+def test_main_rejects_handshake_with_wrong_seq(monkeypatch, tmp_path):
+    """I2 対応 (2026-08-08 指揮者の着手前照合で追加): `main()` の
+    `in_seq.check(handshake.get("seq"))` を単独で pin する。
+
+    `test_main_rejects_handshake_with_wrong_type` は type 検証が先に
+    `ProtocolError` を送出するため **seq 検証行に到達しない** — その行を
+    削除しても green のままになる (Task 2 の `--noconftest` と同じ
+    「防御はあるがテストが無い」型の穴)。本テストは `type` を正しい
+    `"handshake"` にしたうえで `seq` だけを不正にし、seq 検証行だけを
+    red で守る。"""
+    import io as _io
+
+    frame = json.dumps({"type": "handshake", "seq": 7}).encode() + b"\n"
+    monkeypatch.setattr(mission_worker.sys, "stdin",
+                        type("S", (), {"buffer": _io.BytesIO(frame)})())
+    captured = _io.BytesIO()
+    monkeypatch.setattr(mission_worker, "_protect_protocol_stdout",
+                        lambda: captured)
+
+    mission_worker.main()
+
+    captured.seek(0)
+    lines = captured.getvalue().splitlines()
+    assert len(lines) == 1
+    sent = json.loads(lines[0])
+    assert sent["type"] == "ready"
+    assert sent["ok"] is False
+    assert "seq" in sent["error"]
+
+
+def test_rag_rpc_proxy_in_seq_continues_after_handshake():
+    """親→子方向の seq 連続性 pin (2026-08-08 指揮者の着手前照合で追加)。
+
+    `in_seq` は `main()` が `handshake` (seq=1) の検証に使うのと**同一
+    インスタンス**であるため、本番では**最初の `tool_rpc_result` は
+    seq=2** でなければならない。他の RPC テストはいずれも新品の `in_seq`
+    に `seq: 1` を食わせており、この連続性を pin していない (どちらの
+    実装でも green になる)。Task 10 の親側実装者がそれらをワイヤ仕様と
+    読むと最初の `tool_rpc_result` を seq=1 で送り、**RAG 検索を使う
+    Mission が初回呼出しで必ず `ProtocolError` になる** — CR-3 の
+    親→子方向の鏡像。本テストがその契約を固定する。"""
+    from agentic_fx.core.mission_protocol import ProtocolError, SeqTracker
+
+    def write_fn(frame):
+        pass
+
+    in_seq = SeqTracker()
+    in_seq.check(1)  # main() が handshake (seq=1) を検証済みの状態
+
+    proxy_ok = mission_worker._RagRpcProxy(
+        write_fn,
+        lambda: {"type": "tool_rpc_result", "seq": 2, "rpc_id": "1",
+                 "ok": True, "result": []},
+        SeqTracker(), in_seq)
+    assert proxy_ok.search_news("q") == []
+
+    in_seq2 = SeqTracker()
+    in_seq2.check(1)
+    proxy_ng = mission_worker._RagRpcProxy(
+        write_fn,
+        lambda: {"type": "tool_rpc_result", "seq": 1, "rpc_id": "1",
+                 "ok": True, "result": []},
+        SeqTracker(), in_seq2)
+    with pytest.raises(ProtocolError, match="seq"):
+        proxy_ng.search_news("q")
+
+
 _BASE = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
 
 
@@ -2643,7 +2711,7 @@ with open(f'/proc/{os.getpid()}/status') as f:
 "
 ```
 
-実測結果 (32 コア環境): `VmPeak ≈ 1.65GB` / `VmRSS ≈ 123MB` / `num_fds = 5`。VmSize が RSS よりはるかに大きいのは OpenBLAS/numpy がコア数に比例したスレッド分の仮想アドレス空間を事前確保するため (`plugin/sandbox.py` の `_SINGLE_THREAD_ENV` コメントと同じ現象 — mission worker は plugin worker と異なり `_SINGLE_THREAD_ENV` を適用しない: pandas の演算性能を落とさないため。かわりに **RLIMIT_AS を「数 GB」に寛大に取る** ことで対応する、という設計書 §4.5 の方針をこの実測が裏付ける)。
+実測結果 (32 コア環境): `VmPeak ≈ 1.65GB` / `VmRSS ≈ 123MB` / `num_fds = 6` (2026-08-08 に指揮者が着手前に再実測して確認: `VmPeak 1653820 kB` / `VmRSS 125872 kB` / `num_fds 6` — 旧稿の `num_fds = 5` は誤り。`child_nofile: 128` の確定値には影響しない)。VmSize が RSS よりはるかに大きいのは OpenBLAS/numpy がコア数に比例したスレッド分の仮想アドレス空間を事前確保するため (`plugin/sandbox.py` の `_SINGLE_THREAD_ENV` コメントと同じ現象 — mission worker は plugin worker と異なり `_SINGLE_THREAD_ENV` を適用しない: pandas の演算性能を落とさないため。かわりに **RLIMIT_AS を「数 GB」に寛大に取る** ことで対応する、という設計書 §4.5 の方針をこの実測が裏付ける)。
 
 **確定値**: `child_as_mb: 4096` (実測 VmPeak 1.65GB の約 2.4 倍の余裕) / `child_nofile: 128` (実測 5 fd に対し DB 接続・複数データソースへの HTTP 接続を見込んだ余裕) / `child_fsize_mb: 8` (mission worker は正常経路でファイルを書かない — plugin サンドボックスと同じ「想定外書込の検知」目的の小さい上限)。
 
@@ -2700,6 +2768,8 @@ uv run pytest -q
 ```
 
 Expected: 全件 PASS (新設 settings セクションは既存 `settings.yaml` にも `default_factory` で無変更ロード可能)。
+
+**`config/settings.yaml` の同期について (明示判断 — 2026-08-08 指揮者)**: Global Constraints は「新キー追加時は `settings.yaml` と `.example` を両方同期する」と定めるが、`WorkerSettings` は全フィールドが既定値付きで `Settings.worker` も `default_factory` を持つため、**gitignore 対象の `config/settings.yaml` へ `worker:` セクションを追記しなくてもロードは成功する**。実装者は `.example` のみ更新すればよい (これは省略ではなく、この task 限定の明示判断)。実運用値の調整 (IM-9 の多コア機での `child_as_mb` 再実測など) が必要になった時点で `settings.yaml` 側に追記する。
 
 - [ ] **Step 8: `mission_worker.py` を実装**
 
@@ -2806,7 +2876,9 @@ class _RagRpcProxy:
 
     `in_seq` (I2 対応) — 親→子方向 (`tool_rpc_result`) 専用の受信検証
     トラッカー。`main()` が `handshake` の検証にも同じインスタンスを
-    使う (親→子方向は 1 起点で共通)。"""
+    使う (親→子方向は 1 起点で共通)。**この共有の帰結として、本番では
+    親が送る最初の `tool_rpc_result` の seq は 2 になる** (seq=1 は
+    handshake が消費済み) — Task 10 の親側実装はこれに合わせること。"""
 
     def __init__(self, write_fn: Callable[[dict], None],
                 read_fn: Callable[[], dict | None],
@@ -3035,7 +3107,9 @@ Expected: 全件 PASS (mission_worker.py は他モジュールから import さ�
 3. `_RagRpcProxy._call` の `if not response.get("ok"):` を削除 → `test_rag_rpc_proxy_propagates_error` が red
 4. (CR-3) `main()` の `_RagRpcProxy(...)` 呼び出しに渡す `out_seq` 引数を `SeqTracker()` (新規独立インスタンス) に差し替える → `test_rag_rpc_proxy_shares_out_seq_with_other_child_to_parent_frames` が red (`sent["seq"]` が 2 ではなく 1 に戻る)
 5. (I2) `_RagRpcProxy._call` の `if response.get("type") != "tool_rpc_result":` チェックを削除 → `test_rag_rpc_proxy_rejects_wrong_frame_type` が red。`self._in_seq.check(response.get("seq"))` 行を削除 → `test_rag_rpc_proxy_rejects_seq_gap` が red
-6. (I2) `main()` の `in_seq.check(handshake.get("seq"))` 呼び出しを削除 → `test_main_rejects_handshake_with_wrong_type` が red (`ready: false` を送らず bootstrap を続行してしまう — 実際には後続の `KeyError`/属性欠落で別の失敗はするが、type 違反を明示的に検出できなくなる)
+6. (I2) `main()` の `handshake.get("type") != "handshake"` チェックを削除 → `test_main_rejects_handshake_with_wrong_type` が red。**別途** `in_seq.check(handshake.get("seq"))` 行を削除 → `test_main_rejects_handshake_with_wrong_seq` が red
+   - **2026-08-08 指揮者の着手前照合による訂正**: 旧稿は「`in_seq.check(...)` 削除 → `test_main_rejects_handshake_with_wrong_type` が red」と書いていたが**これは誤り**。同テストの入力は `type="event"` であり、`main()` は type を先に検証して `ProtocolError` を送出するため **seq 検証行には到達しない** — 削除しても green のままになる。結果として handshake の seq 検証が**無防備のまま出荷される** (Task 2 の `--noconftest` と同型の穴)。Step 5 に `test_main_rejects_handshake_with_wrong_seq` を追加してこの行を単独で pin した
+9. (親→子 seq 連続性) `_RagRpcProxy` に渡す `in_seq` を `main()` 共有のものから新規 `SeqTracker()` に差し替える → `test_rag_rpc_proxy_in_seq_continues_after_handshake` が red (handshake 消費後の期待値 2 が 1 に戻る)
 7. (I4/R2-CX-01) `_build_clock()` の戻り値を `SystemClock()` から `FixedClock(SystemClock().now())` (handshake 相当で 1 回だけ固定) に改変 → `test_build_clock_default_rejects_stale_signal_as_wall_clock_advances` が red になる (2 回目の `get_signals` 呼び出しでも基準時刻が進まず `out_45min_later` が `{"h1"}` のままで `== []` の assert に失敗する)
 8. (I6) `_make_on_message` 内の `try/except` を削除し `os._exit(1)` 呼び出しごと外す → `test_on_message_exits_process_on_write_failure` が red (`exit_calls` が空のまま、または `BrokenPipeError` が素通しで送出されテストがエラー終了する — いずれにせよ green にならない)
 
