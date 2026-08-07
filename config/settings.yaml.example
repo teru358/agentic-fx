@@ -75,6 +75,8 @@ plugin:                        # plugin サンドボックス (プラン 7 Task 
   sandbox_session_cpu_sec: 60   # RLIMIT_CPU: worker プロセス (1 セッション) 寿命の累積 CPU 秒数上限
   sandbox_memory_mb: 512        # RLIMIT_AS: 仮想アドレス空間上限 (MiB)
   sandbox_output_max_bytes: 1048576  # 1 応答行の生バイト数上限
+  sandbox_nofile: 128           # RLIMIT_NOFILE: worker が同時に開けるファイル記述子数の上限
+  sandbox_fsize_mb: 8           # RLIMIT_FSIZE (MiB): 1 ファイルあたりの書き込みサイズ上限。pytest サブプロセスにも流用
   max_bars_limit: 1000          # plugin config.yaml の max_bars 上限。discover では照合しない — 承認 (submit/bless) と get_indicators (indicator 合成) で照合し、超過は拒否する
   producer_source: yfinance     # 本番 producer が signal/strategy plugin を評価する際の data source (プラン 7 Task 6)
   signal_requeue_max: 2          # signals の requeue 上限 (超えたら abandoned)

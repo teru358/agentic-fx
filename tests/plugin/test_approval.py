@@ -631,12 +631,13 @@ def test_default_pytest_runner_starts_new_session(tmp_path):
 
 
 def test_default_pytest_runner_passes_noconftest(tmp_path):
-    """`_default_pytest_runner` の pytest 引数に `--noconftest` が含まれる
-    こと。F3 (loader.py の discover reject) は plugin フォルダ**直下**の
-    conftest.py しか塞げない — 親ディレクトリ側に置かれた conftest.py を
-    pytest が自動収集する経路への多層防御として、pytest 自身に conftest
-    探索を止めさせる (既存の start_new_session テストと同型: 実サブプロセ
-    スは起動せず fake Popen の呼び出し引数だけを観測する)。"""
+    """`_default_pytest_runner` が pytest_sandbox_entry 経由で spawn する
+    こと（プラン 8 B 束）。F3 (loader.py の discover reject) は plugin
+    フォルダ**直下**の conftest.py しか塞げない — 親ディレクトリ側に置かれた
+    conftest.py を pytest が自動収集する経路への多層防御として、
+    pytest_sandbox_entry が内部で pytest.main() に --noconftest を渡す
+    （pytest 起動をこのモジュール経由に変更したため、argv 検査から
+    モジュール名検査に切り替え）。"""
     fake_proc = MagicMock()
     fake_proc.communicate.return_value = ("1 passed", "")
     fake_proc.returncode = 0
@@ -646,7 +647,8 @@ def test_default_pytest_runner_passes_noconftest(tmp_path):
         approval._default_pytest_runner(tmp_path / "test_plugin.py")
 
     (argv,), _ = popen_mock.call_args
-    assert "--noconftest" in argv
+    # プラン 8 B 束: pytest 直接ではなく pytest_sandbox_entry 経由
+    assert argv[2] == "agentic_fx.plugin.pytest_sandbox_entry"
 
 
 def test_default_pytest_runner_kills_process_group_on_timeout(tmp_path):
@@ -820,3 +822,74 @@ def test_entry_plugin_submit_validation_failure_rc1(tmp_path, monkeypatch, capsy
     assert rc == 1
     run_service.assert_not_called()
     assert "エラー" in capsys.readouterr().err
+
+# --- プラン 8 Task 2: pytest サンドボックス増強 (env/rlimit/poison) ---
+
+
+def test_pytest_rlimit_preexec_sets_expected_limits(monkeypatch):
+    """approval._pytest_rlimit_preexec が返す関数が正しい rlimit 呼び出しをする。"""
+    import resource
+
+    from agentic_fx.plugin import approval
+
+    calls: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(
+        approval.resource, "setrlimit",
+        lambda which, limits: calls.append((which, limits)))
+
+    fn = approval._pytest_rlimit_preexec(memory_mb=256, nofile=64, fsize_mb=4)
+    fn()
+
+    kinds = {w: v for w, v in calls}
+    assert kinds[resource.RLIMIT_AS] == (256 * 1024 * 1024, 256 * 1024 * 1024)
+    assert kinds[resource.RLIMIT_NOFILE] == (64, 64)
+    assert kinds[resource.RLIMIT_FSIZE] == (4 * 1024 * 1024, 4 * 1024 * 1024)
+
+
+def test_default_pytest_runner_uses_minimal_env(monkeypatch, tmp_path):
+    """_default_pytest_runner が subprocess.Popen に最小 env を渡す
+    (AFX_* 等の秘密が子へ伝播しない)。"""
+    from agentic_fx.plugin import approval
+
+    captured: dict = {}
+
+    class FakeProc:
+        returncode = 0
+
+        def communicate(self, timeout):
+            return "1 passed", ""
+
+    def fake_popen(args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs.get("env")
+        captured["preexec_fn"] = kwargs.get("preexec_fn")
+        return FakeProc()
+
+    monkeypatch.setenv("AFX_SECRET_TOKEN", "must-not-leak")
+    monkeypatch.setattr(approval.subprocess, "Popen", fake_popen)
+
+    test_plugin_path = tmp_path / "test_plugin.py"
+    test_plugin_path.write_text("def test_x():\n    assert True\n")
+    approval._default_pytest_runner(test_plugin_path)
+
+    assert "AFX_SECRET_TOKEN" not in captured["env"]
+    assert captured["env"]["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+    assert captured["args"][:3] == [
+        approval.sys.executable, "-m", "agentic_fx.plugin.pytest_sandbox_entry"]
+    assert captured["preexec_fn"] is not None
+
+
+def test_default_pytest_runner_real_subprocess_exits_zero_after_poison(tmp_path):
+    """モックなしで `_default_pytest_runner` を実行し、ネットワーク毒入れ後
+    でも pytest が実際に収集・実行を完了して exit=0 を返すことを確認する
+    (FC-3: poison 後に entry-point プラグインの socket import で exit=1
+    になっていた回帰の実測ピン)。"""
+    from agentic_fx.plugin import approval
+
+    test_plugin_path = tmp_path / "test_plugin.py"
+    test_plugin_path.write_text("def test_x():\n    assert True\n")
+
+    result = approval._default_pytest_runner(test_plugin_path)
+
+    assert result["returncode"] == 0, result["stdout"] + result["stderr"]
+    assert "1 passed" in result["stdout"]

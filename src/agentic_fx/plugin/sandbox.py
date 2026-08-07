@@ -305,6 +305,18 @@ class PluginSession:
         self._proc: subprocess.Popen | None = None
         self._dead = False
         self.pid: int | None = None
+        # プラン 8 B 束: PluginSession は単一スレッド所有が前提
+        # (全使用箇所が単一スレッド — ロックは追加しない)。construction
+        # したスレッドを記録し、実行時 assert で境界越えを検出する。
+        self._owner_thread = threading.get_ident()
+
+    def _check_owner_thread(self) -> None:
+        current = threading.get_ident()
+        if current != self._owner_thread:
+            raise RuntimeError(
+                f"PluginSession used from a different thread than its "
+                f"owner thread (owner={self._owner_thread}, "
+                f"current={current}) — PluginSession is single-thread-owned")
 
     def __enter__(self) -> "PluginSession":
         """起動シーケンス全体を 1 つの try/except で包む (レビュー fix
@@ -338,6 +350,7 @@ class PluginSession:
         脅威モデル (悪意ある攻撃者からの完全な隔離は保証せず、善意だが
         不注意な plugin コードの事故を防ぐことが目的) の範囲では許容する。
         """
+        self._check_owner_thread()
         try:
             current_hash = content_hash(self._meta.path)
             if current_hash != self._meta.content_hash:
@@ -357,6 +370,8 @@ class PluginSession:
             handshake = {
                 "cpu_sec": self._settings.sandbox_session_cpu_sec,
                 "memory_mb": self._settings.sandbox_memory_mb,
+                "nofile": self._settings.sandbox_nofile,
+                "fsize_mb": self._settings.sandbox_fsize_mb,
                 "kind": self._meta.kind,
             }
             self._write_line(handshake)
@@ -381,6 +396,7 @@ class PluginSession:
         return False
 
     def close(self) -> None:
+        self._check_owner_thread()
         proc = self._proc
         if proc is None:
             return
@@ -412,6 +428,7 @@ class PluginSession:
         `list[dict]` なため** brief の `call() -> dict` 契約に合わせて
         `{"signals": [検証済み dict, ...]}` にラップして返す。
         """
+        self._check_owner_thread()
         if self._dead or self._proc is None:
             raise SandboxError(
                 "plugin session is not usable (not started, or a previous "
