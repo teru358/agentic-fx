@@ -42,7 +42,7 @@ from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner
 from agentic_fx.runners.local_runner import LocalRunner
-from agentic_fx.store import approvals, missions, orders, signals
+from agentic_fx.store import approvals, missions, orders, signals, ohlcv
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.rag import Rag
 from agentic_fx.store.state import StateStore
@@ -220,6 +220,10 @@ def _validate_startup(settings) -> None:
             jsonschema.Draft202012Validator.check_schema(schema)
         except jsonschema.exceptions.SchemaError as e:
             raise RuntimeError(f"invalid tool/output schema: {e}") from e
+    if settings.plugin.producer_source not in ohlcv.KNOWN_OHLCV_SOURCES:
+        raise RuntimeError(
+            f"settings.plugin.producer_source={settings.plugin.producer_source!r} "
+            f"is not a known source (known: {sorted(ohlcv.KNOWN_OHLCV_SOURCES)})")
 
 
 def _assert_tools_registered(registry: ToolRegistry, names: list[str]) -> None:
@@ -239,6 +243,29 @@ class _LockedAsk:
     def ask_once(self, question: str) -> str:
         with self._lock:
             return self._loop.ask_once(question)
+
+
+def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
+                            now: datetime) -> None:
+    """`on_signal_maintenance` の実体 (裁定書 F-16/IM-10 — module レベル
+    関数として抽出し、`build_app()` 全体を構築せずに単体テスト可能に
+    する)。
+
+    Task 7 申し送り → プラン 8 B 束で順序入替 (codex M⑤): lease 切れの
+    claimed 行を先に reclaim_expired で pending へ戻し、その後に
+    expire_stale で鮮度切れの pending を abandoned 化する。逆順だと、
+    reclaim で pending に戻ったばかりの行が同じ tick 内で鮮度切れ判定に
+    巻き込まれて abandoned になり得た (無駄な 1 tick 分の巻き戻り)。
+    呼び出し元 (Scheduler._run_data_hook) が fail-open で包む。
+    """
+    signals.reclaim_expired(conn, now=now,
+                            lease_min=settings.plugin.signal_lease_min,
+                            max_requeue=settings.plugin.signal_requeue_max)
+    signals.expire_stale(conn, now=now,
+                         freshness_bars=settings.plugin.signal_freshness_bars)
+    signal_producer.evaluate_due_plugins(
+        conn=conn, plugins=approved, now=now,
+        source=settings.plugin.producer_source, settings=settings)
 
 
 def build_app(root: Path, *, runner: AgentRunner | None = None,
@@ -367,19 +394,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
     # プラン 7 Task 8: signal 起動の判定・保守処理を Scheduler へ配線する。
     def on_signal_maintenance(now: datetime) -> None:
-        # Task 7 申し送り: pending_exists は鮮度を見ないため、起動判定前に
-        # stale な pending を掃除しておく (expire_stale)。次に lease 切れの
-        # claimed を回収し (reclaim_expired)、最後に producer で新規シグナル
-        # を評価・投入する。呼び出し元 (Scheduler._run_data_hook) が
-        # fail-open で包む。
-        signals.expire_stale(conn_core, now=now,
-                             freshness_bars=settings.plugin.signal_freshness_bars)
-        signals.reclaim_expired(conn_core, now=now,
-                                lease_min=settings.plugin.signal_lease_min,
-                                max_requeue=settings.plugin.signal_requeue_max)
-        signal_producer.evaluate_due_plugins(
-            conn_core, plugins=approved, now=now,
-            source=settings.plugin.producer_source, settings=settings)
+        _run_signal_maintenance(conn=conn_core, signal_producer=signal_producer,
+                                approved=approved, settings=settings, now=now)
 
     def signal_due_fn(now: datetime) -> bool:
         # D2: オープンポジション or pending_fill の注文が無いなら signal

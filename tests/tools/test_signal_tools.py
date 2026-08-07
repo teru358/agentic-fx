@@ -269,3 +269,13 @@ def test_malformed_backtest_metrics_json_does_not_break_other_rows(tmp_path):
     assert set(by_hash) == {"good_sig", "broken"}
     assert by_hash["broken"]["in_sample_metrics"] is None
     assert by_hash["broken"]["note"] == "バックテスト成績は実運用成績の予測値ではない"
+
+
+# ---- Task 3: description f-string 化 -----------------------------------------
+
+def test_get_signals_description_reflects_default_lookback(tmp_path):
+    """get_signals tool の description が _DEFAULT_SINCE_HOURS の実値を
+    反映する (硬コードされた 24h ではなく f-string から動的に参照する)。"""
+    conn = _conn(tmp_path)
+    tool = _tool(conn)
+    assert f"{signal_tools._DEFAULT_SINCE_HOURS}h" in tool.description

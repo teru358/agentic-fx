@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -458,6 +459,6 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
                 return _plugin_submit(conn, settings, args, root)
             return _plugin_bless(conn, settings, args, root)
         return _analyze_corr(conn, args)
-    except (ValueError, KeyError, OSError) as e:
+    except (ValueError, KeyError, OSError, sqlite3.Error) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1

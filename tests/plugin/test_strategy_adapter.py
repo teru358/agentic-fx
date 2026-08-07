@@ -467,3 +467,16 @@ def test_integration_plugin_5h_replay_reaches_orders_with_single_session(
     assert len(captured_procs) == 1  # サブプロセス起動は 1 回のみ (セッション使い回し)
     assert session_pid is not None
     assert session_pid == captured_procs[0].pid
+
+
+# ---- Task 3: producer 対称化 ---------------------------------------------------
+
+def test_build_intent_source_rejects_pair_not_in_meta_pairs(tmp_path):
+    """producer 側 (settings.pairs 外は warning+skip) と対称の検証:
+    adapter は 1 インスタンス = 1 pair の明示的構築のため、meta.pairs に
+    無い pair を渡されたら即座に ValueError (fail closed, Fable M-1)。"""
+    meta = _meta(pairs=("USDJPY",))
+    with pytest.raises(ValueError, match="pairs"):
+        strategy_adapter.build_intent_source(
+            meta, conn=_conn(tmp_path), pair="EURUSD",
+            source="dukascopy", settings=SETTINGS)

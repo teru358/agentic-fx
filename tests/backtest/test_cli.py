@@ -810,6 +810,29 @@ def test_cli_history_coverage_requires_init(tmp_path, monkeypatch):
     assert exc_info.value.code == 2
 
 
+# ---- Task 3: sqlite3.Error CLI 境界 -------------------------------------------
+
+def test_dispatch_sqlite_error_returns_rc1_with_diagnostic(tmp_path, capsys, monkeypatch):
+    """DB 層の sqlite3.Error が生の traceback ではなく診断メッセージ +
+    rc=1 に正規化される (Task 6 deferred④、裁定書 F6)。"""
+    import argparse
+    import sqlite3
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(cli, "_history_coverage", boom)
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        args = argparse.Namespace(command="history", history_command="coverage",
+                                  symbol="USDJPY", timeframe="1h", source="dukascopy",
+                                  **{"from": "2026-07-01", "to": "2026-07-02"})
+        rc = cli.dispatch(args, tmp_path)
+    assert rc == 1
+    assert "database is locked" in capsys.readouterr().err
+
+
 # ---- 既定サービス動作の不変性 (上書き節 A) --------------------------------
 
 

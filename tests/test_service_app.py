@@ -679,3 +679,64 @@ def test_build_app_accepts_embedding_fn(tmp_path):
                            "body": "Test article",
                            "source_name": "ex", "published": None}], NOW)
     assert calls  # embedding function が呼ばれた
+
+
+# ---- Task 3: B 束小口 6 項目 (maintenance 順序) ---------------------------------
+
+def test_signal_maintenance_reclaims_before_expiring(monkeypatch):
+    """reclaim_expired → expire_stale の順で呼ばれる (順序入替、codex M⑤)。
+    reclaim で pending に戻った直後の stale 行が、同じ tick 内の
+    expire_stale でまだ拾われずに 1 tick 分だけ実行機会を得ることを、
+    呼び出し順の記録で確認する。(裁定書 F-16/IM-10) `service.py` の
+    実クロージャが呼ぶ module レベル関数 `_run_signal_maintenance` を
+    直接呼び、`agentic_fx.store.signals` の実モジュール関数を
+    monkeypatch する — テスト内の再定義フェイクに対して assert する
+    恒真テストを避ける。
+    """
+    import agentic_fx.service as service_mod
+
+    calls: list[str] = []
+
+    def fake_reclaim(*a, **k):
+        calls.append("reclaim")
+        return []
+
+    def fake_expire(*a, **k):
+        calls.append("expire")
+        return 0
+
+    monkeypatch.setattr(service_mod.signals, "reclaim_expired", fake_reclaim)
+    monkeypatch.setattr(service_mod.signals, "expire_stale", fake_expire)
+
+    now = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+    fake_producer = object()  # evaluate_due_plugins は呼ばれない前提で
+    # 属性アクセスされたら AttributeError で明示的に落ちるようにする
+    # (順序検証の対象外だが、意図せず呼ばれた場合は検出したい)。
+
+    class _NoOpProducer:
+        def evaluate_due_plugins(self, **k):
+            calls.append("producer")
+
+    service_mod._run_signal_maintenance(
+        conn=None, signal_producer=_NoOpProducer(), approved=[],
+        settings=service_mod.load_settings(
+            Path(__file__).resolve().parents[1]
+            / "config" / "settings.yaml.example"),
+        now=now)
+
+    assert calls == ["reclaim", "expire", "producer"]
+
+
+def test_validate_startup_rejects_unknown_producer_source():
+    """producer_source が KNOWN_OHLCV_SOURCES に含まれない場合、
+    RuntimeError で reject する。"""
+    from agentic_fx.service import _validate_startup
+    from agentic_fx.config import load_settings
+
+    settings = load_settings(
+        Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example")
+    settings = settings.model_copy(
+        update={"plugin": settings.plugin.model_copy(
+            update={"producer_source": "typo-source"})})
+    with pytest.raises(RuntimeError, match="producer_source"):
+        _validate_startup(settings)

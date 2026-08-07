@@ -391,3 +391,13 @@ def test_migration_skips_backup_for_inmemory_db():
 
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
     assert "source" in cols
+
+
+def test_connect_rejects_old_sqlite_version(tmp_path, monkeypatch):
+    """SQLite < 3.35 の場合、RETURNING 句が使えないため接続時に
+    RuntimeError で即座に fail-fast する (signals.py の使用要件)。"""
+    import agentic_fx.store.db as db_mod
+
+    monkeypatch.setattr(db_mod.sqlite3, "sqlite_version_info", (3, 34, 1))
+    with pytest.raises(RuntimeError, match="3.35"):
+        db_mod.connect(tmp_path / "x.db")

@@ -74,6 +74,15 @@ class PluginStrategyIntentSource:
     def __init__(self, meta: PluginMeta, *, conn: sqlite3.Connection,
                 pair: str, source: str, settings: "Settings",
                 session: _SessionLike | None = None) -> None:
+        # プラン 8 B 束 (Fable M-1): producer 側 (settings.pairs 外は
+        # warning + skip) と対称の検証。adapter は 1 インスタンス = 1 pair
+        # の明示的構築であり、meta.pairs に無い pair は「呼び出し側の
+        # 取り違え」であって producer のように複数 pair を反復して一部
+        # だけ諦める構造ではないため、即座に拒否する (fail closed)。
+        if pair not in meta.pairs:
+            raise ValueError(
+                f"pair {pair!r} is not in plugin {meta.name!r}'s declared "
+                f"pairs {meta.pairs!r}")
         self._meta = meta
         self._conn = conn
         self._pair = pair
