@@ -34,3 +34,25 @@ def test_call_from_other_thread_raises_runtime_error(tmp_path):
 
     with pytest.raises(RuntimeError, match="owner thread"):
         session.call({"df": None, "params": {}})
+
+
+def test_enter_from_other_thread_raises_runtime_error(tmp_path):
+    """`__enter__` を別スレッドから呼ぶと RuntimeError (IMPORTANT)。
+    owner-thread 防御は __enter__/__exit__/call/close の 4 箇所全て
+    に必要 — このテストは __enter__ の検査 (変異テスト対象)。"""
+    session = PluginSession(_fake_meta(tmp_path), settings=PluginSettings())
+    session._owner_thread = threading.get_ident() + 999999  # 別スレッドを偽装
+
+    with pytest.raises(RuntimeError, match="owner thread"):
+        session.__enter__()
+
+
+def test_close_from_other_thread_raises_runtime_error(tmp_path):
+    """`close()` を別スレッドから呼ぶと RuntimeError (IMPORTANT)。
+    owner-thread 防御は __enter__/__exit__/call/close の 4 箇所全て
+    に必要 — このテストは close() の検査 (変異テスト対象)。"""
+    session = PluginSession(_fake_meta(tmp_path), settings=PluginSettings())
+    session._owner_thread = threading.get_ident() + 999999  # 別スレッドを偽装
+
+    with pytest.raises(RuntimeError, match="owner thread"):
+        session.close()

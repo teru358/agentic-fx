@@ -39,16 +39,16 @@ decided_by="human_cli")` する。`submit_plugin` を呼んで id を得てか�
 `decide` するだけで、検証ロジックを二重に持たない。CLI からのみ呼ぶ
 (改善ループの tool 定義には絶対に載せない — 回帰ピンは Task 9 の関心)。
 
-**脅威モデル (最終レビュー F5、必読)**: `test_plugin.py` の pytest は
-サンドボックス外 (このプロセス自身の権限) で実行される — `worker.py` の
-resource limit も import 遮断も掛からない。`sandbox.check_source` の AST
-ゲートは import 文・denylist 名の**主要な迂回経路**を塞ぐが完全な隔離
-ではない (`sandbox.py` モジュール docstring の脅威モデルと同じ — 動的な
-名前組み立てや、未知の新しい迂回経路まで防ぐものではない)。したがって
-`submit_plugin`/`bless` は **自分自身または信頼できるソースが書いた
-plugin に対してのみ実行すること** — 出所不明な plugin をそのまま
-submit/bless する運用は想定していない。完全な (悪意ある入力に対しても
-安全な) 隔離はプラン 8 の sandbox 増強で扱う。
+**脅威モデル (Task 2 実装後)**: `test_plugin.py` の pytest は別プロセス
+(`agentic_fx.plugin.pytest_sandbox_entry` 経由) で実行され、最小 env
+(PATH/PYTHONPATH/PYTHONSAFEPATH + シングルスレッド化変数のみ)、resource
+limit (RLIMIT_AS/NOFILE/FSIZE)、ネットワークモジュール毒入れが適用される。
+完全な OS 隔離ではなく、AST ゲート (`sandbox.check_source`) は import 文・
+denylist 名の**主要な迂回経路**を塞ぐが動的な名前組み立ては防げない。
+したがって `submit_plugin`/`bless` は **自分自身または信頼できるソースが
+書いた plugin に対してのみ実行すること** — 出所不明な plugin をそのまま
+submit/bless する運用は想定していない (悪意ある入力に対する完全な隔離を
+保証するのではなく、善意だが不注意な plugin の事故防止を目的とする)。
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ from agentic_fx.plugin.signal_eval import SandboxRunFn, evaluate_detection
 from agentic_fx.store import approvals as approvals_store
 
 if TYPE_CHECKING:
-    from agentic_fx.config import Settings
+    from agentic_fx.config import PluginSettings, Settings
 
 # pytest_runner 注入シームの型: test_plugin.py の絶対パス → 少なくとも
 # {"returncode": int, "stdout": str} を持つ dict。

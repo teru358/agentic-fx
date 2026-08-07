@@ -30,7 +30,7 @@ kind 別の戻り値スキーマ検証 (`bar_ts` 拒否、`StrategyDecision` 構
 docstring を同期すること):
 
 - handshake (最初の 1 行、親から):
-  `{"cpu_sec": int, "memory_mb": int, "kind": "indicator"|"signal"|"strategy"}`
+  `{"cpu_sec": int, "memory_mb": int, "nofile": int, "fsize_mb": int, "kind": "indicator"|"signal"|"strategy"}`
 - ready (handshake への応答、plugin.py の import 成功後に送る):
   `{"ok": true, "ready": true, "pid": int}` /
   `{"ok": false, "ready": false, "error": "<message>"}`

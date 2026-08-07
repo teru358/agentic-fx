@@ -26,7 +26,7 @@ stdin/stdout の JSON 1 行ずつで `call()` を繰り返せる。`run_plugin` 
 であり、他モジュールから import して使うものではない)**:
 
 - handshake (セッション開始直後に親から送る 1 行のみ):
-  `{"cpu_sec": int, "memory_mb": int, "kind": "indicator"|"signal"|"strategy"}`
+  `{"cpu_sec": int, "memory_mb": int, "nofile": int, "fsize_mb": int, "kind": "indicator"|"signal"|"strategy"}`
 - ready (handshake に対する worker からの応答。plugin.py の import が
   成功したら送られる。**この 1 行だけは call() の応答ではなく起動応答**
   であり、`sandbox_timeout_sec` ではなく別枠の起動タイムアウトで待つ):

@@ -674,6 +674,65 @@ def test_default_pytest_runner_kills_process_group_on_timeout(tmp_path):
     fake_proc.wait.assert_called_once()
 
 
+def test_pytest_sandbox_entry_passes_noconftest_to_pytest_main():
+    """pytest_sandbox_entry.main() が pytest.main() に
+    '--noconftest' を含むargv で呼び出すことを直接ピンする (CRITICAL)。
+    --noconftest を削除する変異は本テストで赤になることを確認。"""
+    from agentic_fx.plugin import pytest_sandbox_entry as entry
+    import sys
+
+    captured = {}
+
+    def fake_main(args):
+        captured['args'] = args
+        return 0
+
+    def fake_poison():
+        pass
+
+    # monkeypatch sys.argv, pytest.main, worker._poison_network_modules
+    with patch.object(sys, 'argv', ['entry', '/tmp/test_plugin.py']), \
+         patch('pytest.main', fake_main), \
+         patch('agentic_fx.plugin.worker._poison_network_modules', fake_poison):
+        try:
+            entry.main()
+        except SystemExit:
+            pass
+
+    assert '--noconftest' in captured['args'], \
+        f"--noconftest not found in args: {captured.get('args', [])}"
+
+
+def test_pytest_sandbox_entry_calls_poison_before_pytest():
+    """pytest_sandbox_entry.main() が _poison_network_modules を
+    pytest.main() より前に呼ぶことを検証 (IMPORTANT)。
+    毒入れ削除・順序入替の変異は本テストで赤になることを確認。"""
+    from agentic_fx.plugin import pytest_sandbox_entry as entry
+    import sys
+
+    call_order = []
+
+    def fake_poison():
+        call_order.append('poison')
+
+    def fake_main(args):
+        call_order.append('pytest')
+        return 0
+
+    with patch.object(sys, 'argv', ['entry', '/tmp/test_plugin.py']), \
+         patch('pytest.main', fake_main), \
+         patch('agentic_fx.plugin.worker._poison_network_modules', fake_poison):
+        try:
+            entry.main()
+        except SystemExit:
+            pass
+
+    assert call_order == ['poison', 'pytest'], \
+        f"Expected ['poison', 'pytest'], got {call_order}"
+    assert len(call_order) == 2, \
+        "Both poison and pytest must be called exactly once each"
+
+
 # --- 統合テスト①: 既定 pytest_runner の実サブプロセス実行 ---------------
 
 def test_integration_default_pytest_runner_real_subprocess(tmp_path, settings):
