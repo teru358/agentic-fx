@@ -1101,7 +1101,7 @@ EOF
 **Interfaces:**
 - Produces:
   - `App.clock: Clock` (新設フィールド。`build_app` が保持している `clock` 変数をそのまま格納する — 既存の `clock = clock or SystemClock()` 行の直後で使う)
-  - `build_app(root, *, runner=None, clock=None, quote_fn=None, spec_fn=None, bars_fn=None, embedding_fn=None, provider=None)` — `provider: PriceProvider | None = None` (新設 kwarg)。**非 None の場合は内部での `PriceProvider(conn_core, settings, clock)` 構築と、それに続く `quote_fn`/`spec_fn`/`bars_fn` の bound-method 差し替え (285-296 行) を丸ごとスキップし、渡された `provider` インスタンスをそのまま使う** (呼び出し側が provider の全挙動を制御したい場合の直接注入 seam — 既存の `quote_fn`/`spec_fn`/`bars_fn` 個別注入とは併用不可・排他: 両方渡された場合は `provider` を優先し `quote_fn`/`spec_fn`/`bars_fn` は無視することを docstring に明記する)
+  - `build_app(root, *, runner=None, clock=None, quote_fn=None, spec_fn=None, bars_fn=None, embedding_fn=None, provider=None)` — `provider: PriceProvider | None = None` (新設 kwarg)。**非 None の場合は内部での `PriceProvider(conn_core, settings, clock)` 構築と、それに続く `quote_fn`/`spec_fn`/`bars_fn` の bound-method 差し替え (285-296 行) を丸ごとスキップし、渡された `provider` インスタンスをそのまま使う** (呼び出し側が provider の全挙動を制御したい場合の直接注入 seam — 既存の `quote_fn`/`spec_fn`/`bars_fn` 個別注入とは併用不可・排他: **両方渡された場合は `ValueError` を送出する** — **レビュー反映 2 回目 / Task 4 codex Critical 1 + Important 1 で裁定変更**。旧稿は「`provider` を優先し `quote_fn` 等は無視する」と書いていたが、①Interfaces 節・「注意」節・逐語コードの 3 者が互いに矛盾しており実装者が独自解釈する余地を残した ②「黙って無視」は静かな失敗で、E2E テストが「注入が効かない」ことに気づけず debug を困難にする。fail closed で拒否し、契約を docstring とテストで固定する)
   - `MissionWatch.time_fn` — `self._time` を返す読み取り専用 property (新設)
   - `_watchdog_tick(app: App) -> None` の内部実装のみ変更 (シグネチャ不変) — `elapsed` の算出を `app.mission_watch.time_fn()` 経由にする
   - `Policy.tail`/`Policy.size_warning` は `FileNotFoundError` ではなく `OSError` を捕捉する (`FileNotFoundError` は `OSError` のサブクラスなので上位互換)
@@ -1268,17 +1268,26 @@ docstring の `quote_fn / spec_fn / bars_fn / embedding_fn は E2E テストの�
 
 ```python
     if provider is not None:
-        # プラン 8 park 返済: 呼び出し側が provider の全挙動を握る
-        # (quote_fn/spec_fn/bars_fn の bound-method 差し替えは行わない)。
-        pass
+        # プラン 8 park 返済: 呼び出し側が provider の全挙動を握る seam。
+        # 個別注入との併用は fail closed で拒否する (レビュー反映 2 回目 —
+        # 「黙って無視」は注入が効かないことに気づけない静かな失敗)。
+        if quote_fn is not None or spec_fn is not None or bars_fn is not None:
+            raise ValueError(
+                "provider と quote_fn/spec_fn/bars_fn は併用できません "
+                "(provider が全挙動を握る seam です)")
+        quote_fn = provider.get_quote
+        spec_fn = provider.spec
+        bars_fn = provider.latest_1m_bar
     else:
         provider = PriceProvider(conn_core, settings, clock)
-        # 注入された quote_fn/spec_fn/bars_fn は provider 自身の束縛メソッドにも
-        # 反映する (Task 8 E2E で実測)。実際に内部 self-call が存在するのは
-        # `self.get_quote` だけ (`PriceProvider._rate_of` および `healthcheck`
-        # から呼ばれる — `to_account_rate` の換算レート解決がここを経由する)。
-        # (以下、既存の 269-296 行のコメント・代入をそのまま維持する —
-        # provider が None のときだけ通るブランチへ字下げを 1 段追加する)
+        # 【実装者への指示: 以下のコメント群は現行 service.py の該当箇所から
+        #  **逐語で引き写し**、字下げを 1 段追加するだけにすること。この指示行
+        #  自体は製品コードに転写しない (Task 4 レビューで、指示文がそのまま
+        #  コードコメントとして残り、元の警告本文が失われる事故が起きた)。
+        #  引き写す対象には fix round 1 F1 (将来 self.spec 等の自己呼び出しが
+        #  追加されたとき注入がすり抜けるバグを無音で再発させるという警告) と
+        #  F2 (self.get_bars は別メソッド名なので捕捉できず恒久的に注入対象外)
+        #  の 2 つの警告を必ず含める。】
         if quote_fn is not None:
             provider.get_quote = quote_fn
         else:
