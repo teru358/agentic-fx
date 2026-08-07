@@ -731,7 +731,7 @@ EOF
 - Modify: `src/agentic_fx/backtest/cli.py:1-20`(import)`,461`(except 節)
 - Modify: `src/agentic_fx/store/db.py:152-159` (`connect` に SQLite バージョン assert)
 - Modify: `src/agentic_fx/tools/signal_tools.py` (description f-string 化)
-- Test: `tests/core/test_scheduler_signal.py` または `tests/test_service.py` (maintenance 順序), `tests/test_service.py` (producer_source 検証), `tests/plugin/test_strategy_adapter.py` (pair 対称化), `tests/backtest/test_cli.py` (sqlite3.Error 境界), `tests/store/test_db.py` (SQLite バージョン assert), `tests/tools/test_signal_tools.py` (description)
+- Test: `tests/core/test_scheduler_signal.py` または `tests/test_service_app.py` (maintenance 順序), `tests/test_service_app.py` (producer_source 検証), `tests/plugin/test_strategy_adapter.py` (pair 対称化), `tests/backtest/test_cli.py` (sqlite3.Error 境界), `tests/store/test_db.py` (SQLite バージョン assert), `tests/tools/test_signal_tools.py` (description)
 
 **Interfaces:**
 - Produces:
@@ -745,7 +745,7 @@ EOF
 
 **(レビュー反映 1 回目 — 裁定書 F-16 / IM-10)**: 執筆者の当初案は `on_signal_maintenance` を**テスト内でローカルに再定義したフェイク閉包**に対して assert しており、`service.py` の実クロージャを一切呼ばない恒真テストだった (Step 2 が「このテストは `service.py` を変更せずとも green になる — 意図的」と明言していたこと自体が欠陥の自認)。**実クロージャを直接検証できるよう、`on_signal_maintenance` の本体を module レベル関数 `_run_signal_maintenance` に抽出**し (Step 3)、テストはその実関数を呼んで `agentic_fx.store.signals` の実モジュール関数を monkeypatch した状態で呼び出し順を記録する。
 
-`tests/test_service.py` (無ければ実ファイルを `ls tests/*.py` で確認し、`build_app` の統合テストが既にある場所に追記する) に以下を追加する:
+`tests/test_service_app.py` (無ければ実ファイルを `ls tests/*.py` で確認し、`build_app` の統合テストが既にある場所に追記する) に以下を追加する:
 
 ```python
 def test_signal_maintenance_reclaims_before_expiring(monkeypatch):
@@ -797,7 +797,7 @@ def test_signal_maintenance_reclaims_before_expiring(monkeypatch):
 - [ ] **Step 2: テスト実行して FAIL を確認**
 
 ```bash
-uv run pytest tests/test_service.py -q -k maintenance
+uv run pytest tests/test_service_app.py -q -k maintenance
 ```
 
 Expected: FAIL (`AttributeError: module 'agentic_fx.service' has no attribute '_run_signal_maintenance'` — Step 3 で新設するまで存在しない)。
@@ -840,7 +840,7 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
 
 - [ ] **Step 4: 失敗するテストを書く (producer_source 検証・SQLite バージョン assert・description f-string)**
 
-`tests/test_service.py` に追加:
+`tests/test_service_app.py` に追加:
 
 ```python
 def test_validate_startup_rejects_unknown_producer_source():
@@ -885,7 +885,7 @@ def test_get_signals_description_reflects_default_lookback():
 - [ ] **Step 5: テスト実行して FAIL を確認**
 
 ```bash
-uv run pytest tests/test_service.py tests/store/test_db.py tests/tools/test_signal_tools.py -q -k "producer_source or sqlite_version or default_lookback"
+uv run pytest tests/test_service_app.py tests/store/test_db.py tests/tools/test_signal_tools.py -q -k "producer_source or sqlite_version or default_lookback"
 ```
 
 Expected: 3 件とも FAIL (`_validate_startup` は producer_source を見ていない / `connect` はバージョンを見ていない / `_DEFAULT_SINCE_HOURS` が存在しない)。
@@ -958,7 +958,7 @@ _DEFAULT_SINCE_HOURS = 24
 - [ ] **Step 7: テスト実行して PASS を確認**
 
 ```bash
-uv run pytest tests/test_service.py tests/store/test_db.py tests/tools/test_signal_tools.py -q
+uv run pytest tests/test_service_app.py tests/store/test_db.py tests/tools/test_signal_tools.py -q
 uv run pytest -q
 ```
 
@@ -1056,7 +1056,7 @@ Expected: 全件 PASS。
 git add src/agentic_fx/service.py src/agentic_fx/store/ohlcv.py src/agentic_fx/store/db.py \
   src/agentic_fx/plugin/strategy_adapter.py src/agentic_fx/backtest/cli.py \
   src/agentic_fx/tools/signal_tools.py \
-  tests/test_service.py tests/store/test_db.py tests/tools/test_signal_tools.py \
+  tests/test_service_app.py tests/store/test_db.py tests/tools/test_signal_tools.py \
   tests/plugin/test_strategy_adapter.py tests/backtest/test_cli.py
 git commit -m "$(cat <<'EOF'
 fix: B 束小口 6 項目 (maintenance順序/producer_source検証/adapter対称化/CLI境界/SQLite版数/description)
@@ -1084,7 +1084,7 @@ EOF
 - Modify: `src/agentic_fx/loops/mission_watch.py:24-29` (`time_fn` プロパティ追加)
 - Modify: `src/agentic_fx/policy.py:11-27` (`OSError` 捕捉に拡張)
 - Rename: `tests/backtest/conftest.py` → `tests/backtest/factories.py` (13 箇所の import 更新)
-- Test: `tests/core/test_scheduler.py` (retry policy pin), `tests/test_service.py` (clock 配線・provider seam・watchdog 時刻源), `tests/test_policy.py` (OSError)
+- Test: `tests/core/test_scheduler.py` (retry policy pin), `tests/test_service_app.py` (clock 配線・provider seam・watchdog 時刻源), `tests/test_policy.py` (OSError)
 
 **Interfaces:**
 - Produces:
@@ -1161,7 +1161,7 @@ Expected: このテストは **現状の実装のまま PASS するはず** (`ti
 
 - [ ] **Step 5: 失敗するテストを書く (clock 配線・provider seam)**
 
-`tests/test_service.py` に追加:
+`tests/test_service_app.py` に追加:
 
 ```python
 def test_app_has_clock_field(tmp_path):
@@ -1190,12 +1190,12 @@ def test_build_app_provider_seam_bypasses_quote_fn_patch(tmp_path):
     assert app.provider is fake_provider
 ```
 
-(`_FakeProvider`/`_init_root` は既存の `tests/test_service.py` (または `tests/test_e2e_phase1.py`) の fixture 命名規約に合わせて実装すること。無ければ最小限の `PriceProvider` サブクラス/duck-type を新規に書く。)
+(`_FakeProvider`/`_init_root` は既存の `tests/test_service_app.py` (または `tests/test_e2e_phase1.py`) の fixture 命名規約に合わせて実装すること。無ければ最小限の `PriceProvider` サブクラス/duck-type を新規に書く。)
 
 - [ ] **Step 6: テスト実行して FAIL を確認**
 
 ```bash
-uv run pytest tests/test_service.py -q -k "app_has_clock_field or provider_seam"
+uv run pytest tests/test_service_app.py -q -k "app_has_clock_field or provider_seam"
 ```
 
 Expected: FAIL (`App` に `clock` 属性が無い / `build_app` に `provider` kwarg が無い)。
@@ -1299,14 +1299,14 @@ docstring の `quote_fn / spec_fn / bars_fn / embedding_fn は E2E テストの�
 - [ ] **Step 8: テスト実行して PASS を確認**
 
 ```bash
-uv run pytest tests/test_service.py -q
+uv run pytest tests/test_service_app.py -q
 ```
 
 Expected: PASS。
 
 - [ ] **Step 9: 失敗するテストを書く (scheduler_thread の clock 配線・watchdog 時刻源)**
 
-`tests/test_service.py` に追加:
+`tests/test_service_app.py` に追加:
 
 ```python
 def test_scheduler_thread_uses_app_clock(tmp_path, monkeypatch):
@@ -1374,7 +1374,7 @@ def test_watchdog_tick_uses_mission_watch_time_fn(monkeypatch):
 - [ ] **Step 10: テスト実行して FAIL を確認、実装、PASS を確認**
 
 ```bash
-uv run pytest tests/test_service.py -q -k "clock or watchdog_tick_uses"
+uv run pytest tests/test_service_app.py -q -k "clock or watchdog_tick_uses"
 ```
 
 Expected: FAIL。`src/agentic_fx/loops/mission_watch.py` の `MissionWatch` クラス (24-29 行) に以下のプロパティを追加する:
@@ -1403,7 +1403,7 @@ Expected: FAIL。`src/agentic_fx/loops/mission_watch.py` の `MissionWatch` ク�
 再実行:
 
 ```bash
-uv run pytest tests/test_service.py -q
+uv run pytest tests/test_service_app.py -q
 uv run pytest -q
 ```
 
@@ -1477,7 +1477,7 @@ Expected: 全件 PASS。
 ```bash
 git add src/agentic_fx/core/scheduler.py src/agentic_fx/service.py \
   src/agentic_fx/loops/mission_watch.py src/agentic_fx/policy.py \
-  tests/core/test_scheduler.py tests/test_service.py tests/test_policy.py \
+  tests/core/test_scheduler.py tests/test_service_app.py tests/test_policy.py \
   tests/backtest/factories.py
 git add -A tests/backtest/  # rename 検出のため
 git commit -m "$(cat <<'EOF'
