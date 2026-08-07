@@ -1541,7 +1541,7 @@ EOF
 - Produces:
   - `db.connect_readonly(db_path: Path) -> sqlite3.Connection` — `sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)`。書き込み系 PRAGMA (`journal_mode`) は発行しない。`busy_timeout=5000` のみ設定。`db_path` が存在しなければ `FileNotFoundError` (RO 接続は稼働中サービスの既存 DB を前提とする)。既存 `connect()` と同じ SQLite バージョン assert (Task 3 で追加済みの `sqlite3.sqlite_version_info < (3, 35, 0)` チェック) をここにも適用する
   - `PriceProvider.__init__(conn, settings, clock, readonly: bool = False)` (CR-4 対応) — `readonly=True` のとき `get_bars`/`_derive` 内の `ohlcv.upsert_bars(...)` 呼び出しをスキップする (cache 読み取りは通常どおり行う)。RO 接続 (`connect_readonly`) と組み合わせて子プロセスで使う。RPC 経由で親に書込を委譲する設計は採らない (裁定書 F-5 — RPC 面を拡大しない)
-  - `mission_registry.build_mission_registry(loop: str, conn: sqlite3.Connection, settings: Settings, clock: Clock, rag: Rag, *, activity: ActivityLog, indicator_plugins: list[PluginMeta] | None = None, sandbox_run=None, readonly: bool = False) -> ToolRegistry` — `provider`/`econ`/`broker` を内部で新規構築し (呼び出し側から受け取らない — 親の既存インスタンスと子の使い捨てインスタンスを同じ関数で作れることが目的)、`market_tools`/`news_tools`/`account_tools`/`reflection_tools`/`signal_tools` の全 `ToolDef` を登録した `ToolRegistry` を返す。**`loop` 引数は本プランでは配線を分岐しない** (常に同じ全ツール集合を構築する — どのツールを実際に Mission に見せるかは `Mission.tools` の呼び出し側リスト `_TRADE_TOOLS` が決める。`loop` は将来の improve 系 registry 分岐 (プラン 9) に向けた forward-compat 引数であることを docstring に明記する)。`readonly` はそのまま `PriceProvider(..., readonly=readonly)` に渡すだけ (Task 7 が子プロセス構築時に `readonly=True` を渡す)
+  - `mission_registry.build_mission_registry(loop: str, conn: sqlite3.Connection, settings: Settings, clock: Clock, rag: Rag, *, activity: ActivityLog, indicator_plugins: list[PluginMeta] | None = None, sandbox_run=None, readonly: bool = False, provider: "PriceProvider | None" = None) -> ToolRegistry` — `econ`/`broker` は内部で新規構築する (呼び出し側から受け取らない — 親の既存インスタンスと子の使い捨てインスタンスを同じ関数で作れることが目的)。**`provider` は非 None ならそれを使い、None なら内部構築する** (**レビュー反映 2 回目 / Task 5 sonnet Important-1**: 旧稿は provider も常に内部構築していたため、Task 4 で導入した `build_app(provider=...)` の注入 seam が registry 経由の tool から黙って迂回され、fake provider を注入しても実 yfinance を叩いていた — 実測再現済み)。**`provider` は親のテスト注入専用の seam であり、子プロセス (mission_worker) は `provider` を渡さず `readonly=True` で内部構築する**、`market_tools`/`news_tools`/`account_tools`/`reflection_tools`/`signal_tools` の全 `ToolDef` を登録した `ToolRegistry` を返す。**`loop` 引数は本プランでは配線を分岐しない** (常に同じ全ツール集合を構築する — どのツールを実際に Mission に見せるかは `Mission.tools` の呼び出し側リスト `_TRADE_TOOLS` が決める。`loop` は将来の improve 系 registry 分岐 (プラン 9) に向けた forward-compat 引数であることを docstring に明記する)。`readonly` はそのまま `PriceProvider(..., readonly=readonly)` に渡すだけ (Task 7 が子プロセス構築時に `readonly=True` を渡す)
 - Consumes: `agentic_fx.tools.{market_tools,news_tools,account_tools,reflection_tools,signal_tools}` の既存 `build` 関数群 (シグネチャ不変)
 
 - [ ] **Step 1: 失敗するテストを書く (`connect_readonly`)**
@@ -1601,6 +1601,8 @@ Expected: FAIL (`ImportError: cannot import name 'connect_readonly'`)。
 `src/agentic_fx/store/db.py` の `connect` 関数 (Task 3 で SQLite バージョン assert 済み) の直後に追加:
 
 ```python
+(`src/agentic_fx/store/db.py` の import 節に `import urllib.parse` を追加すること — 下の URI encode で使う。)
+
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
     """読み取り専用で SQLite に接続する (mission worker 子プロセス専用 —
     設計書 §3.4 codex I-7)。
@@ -1620,7 +1622,14 @@ def connect_readonly(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise FileNotFoundError(
             f"connect_readonly requires an already-initialized DB: {db_path}")
-    uri = f"file:{db_path}?mode=ro"
+    # path 部だけを percent-encode する (**レビュー反映 2 回目 / Task 5 codex
+    # I-1**: 無加工だとファイル名中の `?` が query 区切り、`#` が fragment
+    # 区切りと解釈され、`question?.db` / `hash#.db` で**別 DB を開く**。
+    # `db_path.exists()` は元の literal path に対して成功するため存在確認でも
+    # 防げない — 実測で `no such table: missions` を再現済み)。
+    # `resolve().as_uri()` は採らない: symlink を解決するため exists() チェックと
+    # 実接続が別パスを見る不整合を別の形で再導入し、相対パスの意味も変わる。
+    uri = f"file:{urllib.parse.quote(str(db_path), safe='/')}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
@@ -1878,8 +1887,7 @@ from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.store.rag import Rag
 from agentic_fx.tools import (
-    account_tools, market_tools, news_tools, plugin_loader, reflection_tools,
-    signal_tools,
+    account_tools, market_tools, news_tools, reflection_tools, signal_tools,
 )
 from agentic_fx.tools.registry import ToolRegistry
 
@@ -1892,7 +1900,8 @@ def build_mission_registry(
         loop: str, conn: sqlite3.Connection, settings: "Settings",
         clock: Clock, rag: Rag, *, activity: ActivityLog,
         indicator_plugins: "list[PluginMeta] | None" = None,
-        sandbox_run=None, readonly: bool = False) -> ToolRegistry:
+        sandbox_run=None, readonly: bool = False,
+        provider: "PriceProvider | None" = None) -> ToolRegistry:
     """`loop` は本プランでは配線を分岐しない (常に同じ全ツール集合を
     構築する) — forward-compat 引数。どのツールを実際に Mission に
     見せるかは呼び出し側の `Mission.tools` リスト (`_TRADE_TOOLS` 等) が
@@ -1964,15 +1973,18 @@ Expected: PASS。
 
     # プラン 8 worker 基盤: 親 (ここ) と子 (mission_worker.py) が同一関数
     # (build_mission_registry) でツール配線を組み立てる。親は既に構築済みの
-    # provider/econ/broker を再利用せず、conn_core から独立に再構築する
+    # econ/broker を再利用せず、conn_core から独立に再構築する
     # (子との配線一致を関数の同一性だけで担保するため — 親の長寿命
     # インスタンスを別途 provider/econ/broker として保持している事実と
     # 矛盾しない: registry 内のツールクロージャは新しく作った
     # provider/econ/broker を束縛するが、これらは conn_core を共有する
     # ため実質的に同じ DB 状態を見る)。
+    # provider だけは build_app が保持しているインスタンスを渡す
+    # (レビュー反映 2 回目 / Task 5 sonnet Important-1 — `build_app(provider=...)`
+    # の注入 seam が registry 経由の tool から迂回されるのを防ぐ)。
     registry = build_mission_registry(
         "trade", conn_core, settings, clock, rag, activity=activity,
-        indicator_plugins=approved)
+        indicator_plugins=approved, provider=provider)
     _validate_startup(settings)
     _assert_tools_registered(registry, _TRADE_TOOLS)
 ```
