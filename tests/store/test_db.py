@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from agentic_fx.store.db import TABLE_NAMES, connect, init_db
+from agentic_fx.store.db import TABLE_NAMES, connect, connect_readonly, init_db
 
 EXPECTED = {
     "ohlcv", "missions", "trade_intents", "orders", "reflections",
@@ -401,3 +401,52 @@ def test_connect_rejects_old_sqlite_version(tmp_path, monkeypatch):
     monkeypatch.setattr(db_mod.sqlite3, "sqlite_version_info", (3, 34, 1))
     with pytest.raises(RuntimeError, match="3.35"):
         db_mod.connect(tmp_path / "x.db")
+
+
+@pytest.mark.parametrize("filename", [
+    "question?.db",
+    "hash#.db",
+    "percent%.db",
+    "space name.db",
+])
+def test_connect_readonly_with_special_chars_in_filename(tmp_path, filename):
+    """URI 内のパス部分を percent-encode する必要があるテスト (codex I-1)。
+    `?` / `#` / `%` / 空白を含むファイル名で正しい DB を開くことを確認。
+
+    各特殊文字について、RW 接続でセットアップ後に RO 接続で検証する。
+    WAL locking 問題を回避するため個別のテストデータを使う。"""
+    db_path = tmp_path / filename
+
+    # RW 接続でセットアップ
+    conn_rw = connect(db_path)
+    init_db(conn_rw)
+    # テーブル exists を確認してからデータ挿入
+    tables = {r[0] for r in conn_rw.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%'").fetchall()}
+    assert "missions" in tables, f"missions table not created for {filename}"
+
+    label = f"test_{filename}"  # ファイル名を label に含めてトレース容易に
+    conn_rw.execute(
+        "INSERT INTO missions (loop, runner, model, started_at) "
+        "VALUES (?, ?, ?, ?)",
+        (label, "test", "model", "2026-07-22T12:00:00+00:00"))
+    conn_rw.commit()
+    conn_rw.close()
+
+    # RO 接続で読み取り確認
+    conn_ro = connect_readonly(db_path)
+    tables_ro = {r[0] for r in conn_ro.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%'").fetchall()}
+    assert "missions" in tables_ro, \
+        f"RO connection opened wrong DB for {filename} (missions table not found)"
+
+    row = conn_ro.execute(
+        "SELECT loop FROM missions WHERE loop=?", (label,)).fetchone()
+    conn_ro.close()
+
+    # 正しいテーブルが読めたことを確認 (別の DB を開いていないことを保証)
+    assert row is not None, \
+        f"Failed to read from {filename}: got None (opened wrong DB?)"
+    assert row["loop"] == label

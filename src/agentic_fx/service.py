@@ -47,9 +47,9 @@ from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.rag import Rag
 from agentic_fx.store.state import StateStore
 from agentic_fx.tools import (
-    account_tools, market_tools, news_tools, plugin_loader, reflection_tools,
-    signal_tools,
+    plugin_loader, signal_tools,
 )
+from agentic_fx.tools.mission_registry import build_mission_registry
 from agentic_fx.tools.registry import ToolRegistry
 
 _log = logging.getLogger("agentic_fx.service")
@@ -292,11 +292,22 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     場合は `ValueError` を送出して排他を強制する (provider が全挙動を握る seam
     のため、併用は static な設定ミスとして即座に検出する)。
 
-    **`healthcheck()` は注入対象外** (fix round 1 F2): `PriceProvider.healthcheck`
-    は `self.get_quote(...)` に加えて `self.get_bars(...)` を呼ぶが、
-    `get_bars` は quote_fn/spec_fn/bars_fn のどれにもマップされていない。
-    決定論的なテストで `build_app` を使う場合、`app.provider.healthcheck` を
-    個別に patch すること (本 E2E テスト `tests/test_e2e_phase1.py` 参照)。
+    **注入対象外**: `healthcheck()` は個別関数注入 (`quote_fn`/`spec_fn`/`bars_fn`)
+    では到達不能である (fix round 1 F2)。`PriceProvider.healthcheck` は
+    `self.get_quote(...)` に加えて `self.get_bars(...)` を呼ぶが、`get_bars`
+    は quote_fn/spec_fn/bars_fn のどれにもマップされていない。
+
+    一方 mission registry のツールは以下の 2 つの経路で provider を束縛する:
+    (a) `provider=` 注入した場合: 同じインスタンスが registry に透通される
+    ため、mission registry のツールも注入 provider を使う。
+    (b) `provider=` 注入しない場合: registry が内部で新規構築した
+    PriceProvider インスタンスを束縛する。
+
+    `quote_fn`/`spec_fn`/`bars_fn` (個別関数注入) は (a)(b) いずれの場合でも
+    mission registry のツールに到達しない。決定論的な E2E テストで mission
+    registry のツール挙動を注入制御する場合、`provider=` パラメータで
+    カスタム PriceProvider を渡すこと (本 E2E テスト `tests/test_e2e_phase1.py`
+    参照)。
     """
     clock = clock or SystemClock()
     settings = load_settings(root / "config" / "settings.yaml")
@@ -382,16 +393,14 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     # ため App 寿命で 1 個だけ生成する (再生成 = cursor 喪失)。
     signal_producer = SignalProducer()
 
-    registry = ToolRegistry()
-    registry.register_all(market_tools.build(
-        provider, econ, settings, indicator_plugins=approved))
-    registry.register_all(news_tools.build(rag))
-    registry.register_all(account_tools.build(conn_core, broker))
-    # 上書き 6: reflection_tools.build は pairs が必須引数 (Task 0-8)
-    registry.register_all(reflection_tools.build(conn_core, rag, settings.pairs))
-    # プラン 7 Task 9: get_signals (取引判断 loop 専用。_TRADE_TOOLS 経由で
-    # trade/ask 両 Mission に露出する)
-    registry.register_all(signal_tools.build(conn_core, settings, clock))
+    # プラン 8 worker 基盤: 親 (ここ) と子 (mission_worker.py) が同一関数
+    # (build_mission_registry) でツール配線を組み立てる。親は注入された provider
+    # (あるいは内部構築した provider) を registry に渡し、同じインスタンスを
+    # registry のツールが束縛する (テスト注入 seam)。子は provider を渡さず、
+    # readonly=True で内部構築する。
+    registry = build_mission_registry(
+        "trade", conn_core, settings, clock, rag, activity=activity,
+        indicator_plugins=approved, provider=provider)
     # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
     _validate_startup(settings)
     _assert_tools_registered(registry, _TRADE_TOOLS)
