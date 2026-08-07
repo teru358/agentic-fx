@@ -9685,3 +9685,8 @@ fork の修正案: プラン冒頭に「同一ファイル編集 task の一覧�
 該当: `plugin/approval.py` の `_default_pytest_runner` が新設した `preexec_fn` (rlimit 設定)。
 内容: `subprocess.Popen(preexec_fn=...)` は原理的にスレッド安全でない (fork 後・exec 前の子で任意の Python コードを実行するため、他スレッドが保持していたロックがデッドロックし得る)。**現時点では plugin 承認が単一スレッドの CLI 経路からしか到達しないため実害はない** (sonnet 副査が確認、non-blocking 判定)。
 **照合メモ**: 本プラン 8 は supervisor / watchdog / scheduler / RPC dispatcher の 4 スレッドを新設する。**plugin 承認・plugin 評価がスレッド文脈から到達可能になる task (ReflectionCycle = Task 16、improve profile = Task 18 が候補) の着手時に、この経路がマルチスレッドから呼ばれないことを確認すること。** 呼ばれるなら `preexec_fn` を捨てて子側 (`pytest_sandbox_entry`) の先頭で rlimit を設定する方式へ移す。
+
+**T4-1 [引き継ぎ] Task 19/20 — `tests/test_service.py` の参照が 4 箇所残っている**
+該当: 本プラン文書の 8638 / 9008 / 9012 / 9036 行付近 (Task 19 と Task 20 の記述)。
+内容: `tests/test_service.py` は**存在しない** (実体は `tests/test_service_app.py`)。Task 2-4 の範囲 (734-1480 行) は 2026-08-07 に一括置換済みだが、この 4 箇所は `tests/test_service.py tests/test_service_app.py` の**併記**が含まれ機械置換すると重複になるため保留した。
+**照合メモ**: Task 19/20 の着手時に、併記の有無を見て個別に修正すること。Task 1 ではこの種のパス誤りを実装者が黙って回避し、レビューで初めて発覚した。
