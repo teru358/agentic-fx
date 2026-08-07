@@ -265,3 +265,39 @@ def test_role_is_pinned_to_assistant_regardless_of_server_value():
     assistant_msgs = [m for m in r.transcript if m.get("role") == "assistant"]
     assert len(assistant_msgs) == 1
     assert assistant_msgs[0]["role"] == "assistant"
+
+
+def test_on_message_called_for_every_append_including_initial_prompt():
+    """sink 集約 (プラン 8 worker 基盤 — codex I-6): 初期 user prompt を
+    含む全 append site で on_message が呼ばれる。"""
+    seen: list[dict] = []
+    registry = ToolRegistry()
+    runner = LocalRunner(base_url="http://x", model="m", registry=registry,
+                         transport=httpx.MockTransport(
+                             lambda r: _resp({"role": "assistant",
+                                             "content": '{"action": "hold"}'})),
+                         on_message=seen.append)
+    mission = Mission(prompt="hello", tools=[], output_schema={"type": "object"},
+                      max_turns=1, timeout_sec=10.0)
+    runner.run(mission)
+
+    assert seen[0] == {"role": "user", "content": "hello"}
+    assert any(m.get("role") == "assistant" for m in seen)
+
+
+def test_on_message_exception_does_not_break_run(monkeypatch):
+    """on_message が例外を送出しても run() は completed を返す
+    (sink はベストエフォートの観測性記録)。"""
+    def boom(msg):
+        raise RuntimeError("sink failed")
+
+    registry = ToolRegistry()
+    runner = LocalRunner(base_url="http://x", model="m", registry=registry,
+                         transport=httpx.MockTransport(
+                             lambda r: _resp({"role": "assistant",
+                                             "content": '{"action": "hold"}'})),
+                         on_message=boom)
+    mission = Mission(prompt="hello", tools=[], output_schema={"type": "object"},
+                      max_turns=1, timeout_sec=10.0)
+    result = runner.run(mission)
+    assert result.status == "completed"
