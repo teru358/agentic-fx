@@ -836,10 +836,16 @@ def _silent_child_proc(tmp_path):
     r, w = os.pipe()
     r2, w2 = os.pipe()
 
+    # レビュー 2 周目 (sonnet Minor): ローカル変数のままだと関数を抜けた
+    # 時点で refcount が 0 になり、**CPython は fd を閉じてしまう**
+    # (「閉じない」というコメントが実装で保証されていなかった)。
+    # 親の後続 write が BrokenPipe にならないよう、明示的に参照を保持する。
+    kept: list = []
+
     def consume_handshake():
         child_in = os.fdopen(r2, "rb")
+        kept.append(child_in)        # 参照を保持して GC による close を防ぐ
         child_in.readline()          # handshake を読み捨てる
-        # 閉じない: 閉じると親の後続 write が BrokenPipe になる
 
     th = threading.Thread(target=consume_handshake, daemon=True)
     th.start()
@@ -924,8 +930,18 @@ def test_mission_deadline_includes_worker_grace_sec(tmp_path, monkeypatch):
     `worker_grace_sec` を相対的に大きく (0.5) 取り、**grace を足していれば
     まだ timeout していない**時刻に結果が出ないことで判別する。
     """
+    # **`worker_terminate_grace_sec` を極小にする** (レビュー 2 周目 sonnet):
+    # `_escalate_kill` の grace は timeout 検出**後**に走るので `elapsed` に
+    # 加算される。`_tiny_worker_settings` の既定 0.3 が乗ると、grace を
+    # 落とす変異でも `elapsed ≈ 0.05 + 0.3 = 0.351s` になり、閾値 0.4 との
+    # 差はわずか 0.05s しかなかった (実測)。**このテストと無関係な既定値が
+    # マージンを作っている**状態で、他テストの都合で 0.3 → 0.4 に変われば
+    # この pin は静かに死ぬ (Task 9 の「水増し」と同じ故障クラス)。
+    # 極小にすれば変異時 `elapsed ≈ 0.06`、正常時 `≈ 0.56` となり、
+    # 閾値 0.4 は両者の中間で十分なマージンを持つ。
     settings = _tiny_worker_settings(worker_grace_sec=0.5,
-                                     worker_startup_timeout_sec=2.0)
+                                     worker_startup_timeout_sec=2.0,
+                                     worker_terminate_grace_sec=0.01)
     r, w = os.pipe()
     r2, w2 = os.pipe()
 
@@ -1202,7 +1218,11 @@ def test_stdin_is_closed_only_after_the_dispatcher_finished_writing(
     th.join(timeout=3.0)
 
     assert result.status == "completed"
-    assert "rpc_computed" in order, "RPC が実行されていない"
-    assert order.index("rpc_computed") < order.index("stdin_closed"), (
+    # レビュー 2 周目 (sonnet Minor): 変異時は `rpc_computed` が **order に
+    # 現れない**ため、旧版は手前の `assert "rpc_computed" in order` で落ちて
+    # いた。捕まえてはいるが**意図と違う assert で落ちる**ので、将来の
+    # 読み手を誤導する。順序そのものを 1 つの assert で表現する。
+    assert order == ["rpc_computed", "stdin_closed"], (
         "dispatcher の完了を待たずに stdin を閉じている "
-        f"(IM-7 の排他契約違反): {order}")
+        f"(IM-7 の排他契約違反)。期待 ['rpc_computed', 'stdin_closed'] / "
+        f"実際 {order}")
