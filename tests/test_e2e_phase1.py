@@ -1,5 +1,6 @@
 """Phase 1 完成条件: 学習モードで scheduler tick → Mission → intent →
 ペーパー発注 → 約定 → reflection まで LLM なし (FakeRunner) で自走する。"""
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -56,42 +57,52 @@ def test_phase1_full_cycle(tmp_path):
                     bars_fn=lambda p: bars.get(p),
                     embedding_fn=FakeEmbedding())
 
-    with patch.object(app.provider, "healthcheck", return_value="test"), \
-         _no_real_network():
-        # tick 1: 毎時 Mission → 指値発注
-        app.scheduler.tick(WED)
-        rows = app.conn_core.execute("SELECT * FROM orders").fetchall()
-        assert len(rows) == 1 and rows[0]["status"] == "pending_fill"
+    # プラン 8 Task 13: on_trade_mission は supervisor 経由で非同期実行される
+    # ため、supervisor を起動する必要がある。
+    app.supervisor.start()
+    try:
+        with patch.object(app.provider, "healthcheck", return_value="test"), \
+             _no_real_network():
+            # tick 1: 毎時 Mission → 指値発注
+            app.scheduler.tick(WED)
+            time.sleep(0.5)  # supervisor スレッドが job を実行するまで待機
+            rows = app.conn_core.execute("SELECT * FROM orders").fetchall()
+            assert len(rows) == 1 and rows[0]["status"] == "pending_fill"
 
-        # tick 2: 約定バー → open
-        bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
-                             148.25, 100)
-        app.scheduler.tick(WED + timedelta(minutes=1))
-        assert app.conn_core.execute(
-            "SELECT status FROM orders").fetchone()["status"] == "open"
+            # tick 2: 約定バー → open
+            bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                                 148.25, 100)
+            app.scheduler.tick(WED + timedelta(minutes=1))
+            time.sleep(0.5)
+            assert app.conn_core.execute(
+                "SELECT status FROM orders").fetchone()["status"] == "open"
 
-        # tick 3: TP バー (新しい ts を渡す — 同一バー再処理ガードは
-        # unit 側で検証済み: tests/core/test_scheduler.py)。→ closed
-        bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
-                             148.90, 149.10, 148.85, 149.05, 100)
-        app.scheduler.tick(WED + timedelta(minutes=2))
-        row = app.conn_core.execute("SELECT * FROM orders").fetchone()
-        assert row["status"] == "closed" and row["realized_pnl"] > 0
-        # fix round 1 F3: 正の PnL なら何でも通ってしまうのを塞ぐ — SL 逆行
-        # 等ではなく TP 到達でクローズしたことを close_reason で固定する
-        assert row["close_reason"] == "tp"
-        closed_order_id = row["id"]
+            # tick 3: TP バー (新しい ts を渡す — 同一バー再処理ガードは
+            # unit 側で検証済み: tests/core/test_scheduler.py)。→ closed
+            bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                                 148.90, 149.10, 148.85, 149.05, 100)
+            app.scheduler.tick(WED + timedelta(minutes=2))
+            time.sleep(0.5)
+            row = app.conn_core.execute("SELECT * FROM orders").fetchone()
+            assert row["status"] == "closed" and row["realized_pnl"] > 0
+            # fix round 1 F3: 正の PnL なら何でも通ってしまうのを塞ぐ — SL 逆行
+            # 等ではなく TP 到達でクローズしたことを close_reason で固定する
+            assert row["close_reason"] == "tp"
+            closed_order_id = row["id"]
 
-        # tick 4 (1 時間後): 2 周目 trade (hold) → reflection 生成
-        bars["USDJPY"] = Bar("USDJPY", "1m",
-                             WED + timedelta(hours=1),
-                             149.00, 149.05, 148.95, 149.00, 100)
-        app.scheduler.tick(WED + timedelta(hours=1, minutes=1))
-        refl = app.conn_core.execute("SELECT * FROM reflections").fetchall()
-        assert len(refl) == 1
-        # fix round 1 F3: 件数だけでは誤対象・別内容でも通ってしまうのを塞ぐ
-        assert refl[0]["order_id"] == closed_order_id
-        assert refl[0]["content"] == "振り返り"
+            # tick 4 (1 時間後): 2 周目 trade (hold) → reflection 生成
+            bars["USDJPY"] = Bar("USDJPY", "1m",
+                                 WED + timedelta(hours=1),
+                                 149.00, 149.05, 148.95, 149.00, 100)
+            app.scheduler.tick(WED + timedelta(hours=1, minutes=1))
+            time.sleep(0.5)
+            refl = app.conn_core.execute("SELECT * FROM reflections").fetchall()
+            assert len(refl) == 1
+            # fix round 1 F3: 件数だけでは誤対象・別内容でも通ってしまうのを塞ぐ
+            assert refl[0]["order_id"] == closed_order_id
+            assert refl[0]["content"] == "振り返り"
+    finally:
+        app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
 
     # 監査痕跡: 全 Mission が意図した status で完了している (#codex 指摘)
     missions = app.conn_core.execute(

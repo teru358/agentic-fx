@@ -40,7 +40,7 @@ class Scheduler:
                  settings: Settings, state_store: StateStore,
                  activity: ActivityLog,
                  bars_fn: Callable[[str], Bar | None],
-                 on_trade_mission: Callable[[str], None],
+                 on_trade_mission: Callable[[str], bool],
                  on_news_cycle: Callable[[], None],
                  on_econ_cycle: Callable[[], None],
                  on_signal_maintenance: Callable[[datetime], None] | None = None,
@@ -184,9 +184,13 @@ class Scheduler:
 
         reason = self._trade_mission_due(now)
         if reason is not None:
-            if reason == "cron":
+            # プラン 8 (設計書 §3.3): cron 締切の前進は on_trade_mission
+            # (supervisor.try_submit の結果) が受理 (True) のときだけ。
+            # busy (False) なら締切は維持し、次 tick 以降で必ず再試行
+            # させる (signal は claim 前なので取りこぼしなし)。
+            accepted = self.on_trade_mission(reason)
+            if accepted and reason == "cron":
                 self._last_cron_trade = now
-            self.on_trade_mission(reason)
 
     def _run_hooks(self, now: datetime) -> None:
         """データ hooks (news/econ/signal maintenance) — try/finally で

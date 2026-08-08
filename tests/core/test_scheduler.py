@@ -93,6 +93,7 @@ class Env:
     def _trade(self, reason):
         self.trade_calls += 1
         self.trade_reasons.append(reason)
+        return True  # プラン 8 Task 13: on_trade_mission は bool を返す (accepted/rejected)
 
     def _news(self):
         self.news_calls += 1
@@ -2697,15 +2698,13 @@ def test_maintain_reservations_span_min_not_committed_misses_old_then_new_violat
         "いない (ZZZCHF が取消されるべきなのに残っている)")
 
 
-def test_cron_deadline_advances_even_when_mission_callback_raises(tmp_path):
-    """codex I1 (プラン5 park): on_trade_mission が例外を送出しても
-    _last_cron_trade は前進する — 1 回/時の再試行間隔を意図的な設計として
-    固定する (毎 tick 再試行すると障害時に LLM/notifier を連打するため
-    安全側)。tick() 自体は on_trade_mission の例外を保護しない
-    (呼び出し元 = service.py の scheduler_thread が広い try で包む) ため、
-    この pin は tick 側の呼び出し順序 (締切前進 → on_trade_mission 呼び出し)
-    が「前進してから呼ぶ」順であることを固定する。
-    """
+def test_cron_deadline_does_not_advance_when_mission_callback_raises(tmp_path):
+    """プラン 8 (Task 13): on_trade_mission が例外を送出する場合、
+    on_trade_mission は True を返さないため、_last_cron_trade は前進しない。
+    これは新しい意図的な設計 — supervisor が busy の場合と同じく、締切を
+    維持して次 tick で再試行する (Task 13 で on_trade_mission の戻り値型が
+    None -> bool に変わった — 例外を出す場合は True を返さないため、
+    前進しない)。"""
     env = Env(tmp_path)
     calls: list[str] = []
 
@@ -2718,9 +2717,24 @@ def test_cron_deadline_advances_even_when_mission_callback_raises(tmp_path):
     with pytest.raises(RuntimeError):
         env.sched.tick(first_call_time)
     assert calls == ["cron"]
-    # 締切は例外前に前進済み — 30 分後の tick では再起動しない
+    # 例外が発生したので on_trade_mission は True を返さず、
+    # 締切は前進しない — 直後の tick でも再び "cron" が due になる
     assert env.sched._trade_mission_due(
-        first_call_time + timedelta(minutes=30)) is None
-    # 1 時間後には再試行される
+        first_call_time + timedelta(minutes=1)) == "cron"
+    # 1 時間後にも再試行される (締切が前進していないため)
     assert env.sched._trade_mission_due(
         first_call_time + timedelta(hours=1)) == "cron"
+
+
+def test_cron_deadline_only_advances_when_on_trade_mission_returns_true(tmp_path):
+    """設計書 §3.3: cron 締切の前進は on_trade_mission (supervisor.
+    try_submit の結果) が True (受理) のときだけ。busy (False) なら
+    締切は維持され次 tick 以降で必ず再試行される。"""
+    env = Env(tmp_path)
+    env.sched.on_trade_mission = lambda reason: False  # busy を模す
+
+    env.sched.tick(WED)
+    # busy で拒否されたので締切は前進していない — 直後の tick でも
+    # 再び "cron" が due になる
+    assert env.sched._trade_mission_due(
+        WED + timedelta(minutes=1)) == "cron"

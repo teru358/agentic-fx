@@ -183,37 +183,44 @@ def test_approved_strategy_signal_triggers_advanced_mission(tmp_path):
                             source=app.settings.plugin.producer_source)
     order_id = _seed_open_position(app.conn_core)
 
-    with _no_real_network(), \
-         patch.object(app.provider, "healthcheck", return_value="yfinance"):
-        # ③ producer 本番経路を非分格子 now で直接呼ぶ (実 sandbox 実行)。
-        started = time.perf_counter()
-        app.scheduler.on_signal_maintenance(NOW_PRODUCER)
-        elapsed_producer = time.perf_counter() - started
+    # プラン 8 Task 13: on_trade_mission は supervisor 経由で非同期実行される
+    # ため、supervisor を起動する必要がある。
+    app.supervisor.start()
+    try:
+        with _no_real_network(), \
+             patch.object(app.provider, "healthcheck", return_value="yfinance"):
+            # ③ producer 本番経路を非分格子 now で直接呼ぶ (実 sandbox 実行)。
+            started = time.perf_counter()
+            app.scheduler.on_signal_maintenance(NOW_PRODUCER)
+            elapsed_producer = time.perf_counter() - started
 
-        signal_row = app.conn_core.execute(
-            "SELECT * FROM signals").fetchone()
-        assert signal_row is not None  # 中間状態①: signals pending 1 件
-        assert signal_row["status"] == "pending"
-        assert signal_row["plugin"] == "sma_cross"
-        assert signal_row["bar_ts"] == H.isoformat()
-        assert signal_row["kind"] == "strategy"
-        # 実 plugin (sma_cross) の evaluate() が実際に呼ばれた証跡: 捏造
-        # payload ではなく本物のクロス判定結果であること。stop_loss/
-        # take_profit の両方が入っていること自体が Task 6 の教訓の再確認
-        # (take_profit が無いと Risk Gate の RR ルールで黙殺される)。
-        payload = json.loads(signal_row["payload_json"])
-        assert payload["direction"] == "long"
-        assert payload["stop_loss"] is not None
-        assert payload["take_profit"] is not None
+            signal_row = app.conn_core.execute(
+                "SELECT * FROM signals").fetchone()
+            assert signal_row is not None  # 中間状態①: signals pending 1 件
+            assert signal_row["status"] == "pending"
+            assert signal_row["plugin"] == "sma_cross"
+            assert signal_row["bar_ts"] == H.isoformat()
+            assert signal_row["kind"] == "strategy"
+            # 実 plugin (sma_cross) の evaluate() が実際に呼ばれた証跡: 捏造
+            # payload ではなく本物のクロス判定結果であること。stop_loss/
+            # take_profit の両方が入っていること自体が Task 6 の教訓の再確認
+            # (take_profit が無いと Risk Gate の RR ルールで黙殺される)。
+            payload = json.loads(signal_row["payload_json"])
+            assert payload["direction"] == "long"
+            assert payload["stop_loss"] is not None
+            assert payload["take_profit"] is not None
 
-        # ④ cron 締切を「直前に済んだ」ことにして signal 起動だけを見る
-        # (test_service_app.py の F1(b) と同じ手法)。
-        app.scheduler._last_cron_trade = NOW_PRODUCER
-        last_cron_before = app.scheduler._last_cron_trade
+            # ④ cron 締切を「直前に済んだ」ことにして signal 起動だけを見る
+            # (test_service_app.py の F1(b) と同じ手法)。
+            app.scheduler._last_cron_trade = NOW_PRODUCER
+            last_cron_before = app.scheduler._last_cron_trade
 
-        started = time.perf_counter()
-        app.scheduler.tick(NOW_TICK)
-        elapsed_tick = time.perf_counter() - started
+            started = time.perf_counter()
+            app.scheduler.tick(NOW_TICK)
+            time.sleep(0.5)  # supervisor スレッドが job を実行するまで待機
+            elapsed_tick = time.perf_counter() - started
+    finally:
+        app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
 
     print(f"\n[Task 10 実測] on_signal_maintenance (実 sandbox): "
          f"{elapsed_producer:.3f}s / tick: {elapsed_tick:.3f}s")
