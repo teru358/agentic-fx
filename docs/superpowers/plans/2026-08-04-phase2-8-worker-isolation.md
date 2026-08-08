@@ -5440,11 +5440,15 @@ EOF
 **設計判断 (writing-plans — advisor 指摘を反映)**: 現行の hooks (news/econ) は `tick()` **冒頭** (`open_now` 判定より前) にあり、「市場が閉じていても hooks は毎 tick 走る」という cross-plan 修正① の意図を持つ。単純に「決定論ブロックの後ろ」へ移すと、決定論ブロックは `open_now` 判定の**内側**にしかない (市場閉鎖時は早期 `return` する) ため、hooks が閉場中に一切走らなくなり週末バグが再発する。**対応: hooks を `_run_hooks(now)` という 1 メソッドに切り出し、`tick()` の全ての return パス直前 (市場閉鎖時の return 直前・`_mark_to_market` 失敗時の return 直前・通常経路の Mission 起動判定の直前) で呼ぶ**。`on_signal_maintenance` (現在は開場ガード内・`_process_limit_fills` より前の独立した位置) も `_run_hooks` に統合する — 閉場中も signal 保守 (鮮度切れ pending の abandoned 化・claimed の lease 回収) が走るようになる点は、既存のちenkeck (news/econ が閉場中も走る) と対称な改善であり退行ではない。
 
 **Files:**
-- Modify: `src/agentic_fx/core/scheduler.py:80-218` (`tick` 全体の再構成、`_run_hooks` 新設)
-- Modify: `src/agentic_fx/datafeed/fetchers.py:148-160`(`fetch_feed`)`,200-219`(`fetch_web`)
-- Modify: `src/agentic_fx/datafeed/econ_calendar.py:171-224`(`fetch_ff_calendar`/`EconCalendar.refresh`)
-- Modify: `src/agentic_fx/datafeed/news_collector.py:74-114`(`NewsCollector.__init__`/`collect`)
-- Modify: `src/agentic_fx/service.py:303-305`(`NewsCollector`/`EconCalendar` の構築に `data_hook_timeout_sec` を配線)
+**【着手前照合 2026-08-08 — 参照行を実測で修正した。以下が正】**
+
+- Modify: `src/agentic_fx/core/scheduler.py:80-228` (`tick` 全体の再構成、`_run_hooks` 新設)。**`tick` は 80 行目から 228 行目まで** (次の `def _trade_mission_due` が 229 行)。既存 hooks は **104-111 行** (`open_now` 判定 = 113 行より前)、`on_signal_maintenance` は **194-196 行** (開場ガードの内側)。fail-open 隔離の `_run_data_hook` は **266 行**
+- Modify: `src/agentic_fx/datafeed/fetchers.py:148`(`fetch_feed` の def)**`,171`(`feedparser.parse(url)` の実体 — プラン旧記載の 148-160 には無い)**`,200`(`fetch_web` の def)`,212`(`httpx.get(url, timeout=30, ...)`)
+- Modify: `src/agentic_fx/datafeed/econ_calendar.py:98`(`fetch_ff_calendar` の def)`,112`(`httpx.get(_URL, timeout=30, ...)`)`,170`(`EconCalendar.__init__`)`,176`(`refresh`)。**プラン旧記載の `171-224` は `__init__`/`refresh` しか含まず、肝心の `fetch_ff_calendar` (98-112) を外していた**
+- Modify: `src/agentic_fx/datafeed/news_collector.py:75`(`__init__`)`,82`(`collect`)
+- Modify: `src/agentic_fx/service.py:396`(`EconCalendar(...)`)**`,399`(`NewsCollector(...)`)** — **Task 11 で `build_app` 全体を `try:` で囲んだためインデントが 1 段深くなり、約 93 行ドリフトした。かつ 2 つは連続しておらず間に他の構築が挟まる** (プラン旧記載の `303-305` は「連続 3 行」を前提にしていた)
+
+**照合で確認できたこと**: `data_hook_timeout_sec` は **`config.py:242` (`gt=0, default=30.0`) と `config/settings.yaml.example:97` に既に存在する** — 本 task は**配線のみ**でスキーマ追加は不要。ただし**個人設定 `config/settings.yaml` には未記載**なので、example との同期として追記すること (既定値があるので動作はするが、規約上 2 ファイルは同期させる)
 - Test: `tests/core/test_scheduler_tick_order.py` (新規 — tick 順序契約の回帰ピン), `tests/datafeed/test_fetchers.py`/`tests/datafeed/test_news_collector.py`/`tests/datafeed/test_econ_calendar.py` (timeout 配線)
 
 **Interfaces:**
