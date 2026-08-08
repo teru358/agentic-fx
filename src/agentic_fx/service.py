@@ -372,7 +372,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             max_skew_min=settings.datafeed.conversion_skew_max_min)
 
     econ = EconCalendar(conn_core, activity, clock)
-    rag = Rag(root / "data" / "rag", embedding_function=embedding_fn)
+    rag = Rag(root / "data" / "rag", embedding_function=embedding_fn,
+             lock_timeout_sec=settings.worker.rpc_timeout_sec)
     collector = NewsCollector(conn_core, rag, activity, clock)
     broker = PaperBroker(conn_core, settings, clock)
     notifier = Notifier(enabled=settings.discord.enabled,
