@@ -10,7 +10,7 @@ import pytest
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
-from agentic_fx.runners.local_runner import LocalRunner
+from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.service import (
     _assert_tools_registered, _check_llama_swap, _validate_startup,
     build_app, build_splash, run_init, run_service,
@@ -455,7 +455,7 @@ def test_owns_runner_true_when_built_locally(tmp_path):
     _init(tmp_path)
     app = build_app(tmp_path, clock=FixedClock(NOW))
     assert app.owns_runner is True
-    assert isinstance(app.runner, LocalRunner)
+    assert isinstance(app.runner, WorkerRunner)
     app.runner.close()
 
 
@@ -603,10 +603,10 @@ def test_run_service_daemon_graceful_shutdown_with_injected_runner(tmp_path):
 
 
 def test_run_service_closes_owned_runner_on_graceful_shutdown(tmp_path):
-    """F4-②: owns_runner=True 相当 (`LocalRunner` の spec を持つ mock に
+    """F4-②: owns_runner=True 相当 (`WorkerRunner` の spec を持つ mock に
     差し替え)。graceful shutdown で close() が 1 回だけ呼ばれること。"""
     app = _seam_app(tmp_path, FakeRunner([]))
-    mock_runner = MagicMock(spec=LocalRunner)
+    mock_runner = MagicMock(spec=WorkerRunner)
     app.runner = mock_runner
     app.owns_runner = True
     stop_event = threading.Event()
