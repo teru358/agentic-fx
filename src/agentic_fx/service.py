@@ -28,6 +28,7 @@ from agentic_fx.core.executor import Executor
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
+from agentic_fx.core.supervisor import MissionSupervisor
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.news_collector import NewsCollector, seed_default_sources
@@ -44,7 +45,7 @@ from agentic_fx.runners.base import AgentRunner
 from agentic_fx.runners.local_runner import LocalRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.store import approvals, missions, orders, signals, ohlcv
-from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.db import connect, connect_readonly, init_db
 from agentic_fx.store.instance_lock import acquire_instance_lock
 from agentic_fx.store.rag import Rag
 from agentic_fx.store.state import StateStore
@@ -207,6 +208,8 @@ class App:
     owns_runner: bool
     clock: object
     instance_lock: object
+    supervisor: object
+    conn_supervisor: object
 
 
 def _validate_startup(settings) -> None:
@@ -237,16 +240,29 @@ def _assert_tools_registered(registry: ToolRegistry, names: list[str]) -> None:
         raise RuntimeError(f"tools not registered: {sorted(missing)}")
 
 
-class _LockedAsk:
-    """ask を Mission スロット (core_lock) 経由で実行する薄いラッパー。"""
+class _SupervisorAsk:
+    """ask を supervisor 経由で実行する薄いラッパー (`_LockedAsk` の後継 —
+    設計書 §3.3「ask の統一」。core_lock を直接掴まない)。"""
 
-    def __init__(self, trade_loop: TradeLoop, lock: threading.RLock) -> None:
-        self._loop = trade_loop
-        self._lock = lock
+    def __init__(self, supervisor: MissionSupervisor,
+                wait_timeout_sec: float) -> None:
+        self._supervisor = supervisor
+        self._wait_timeout_sec = wait_timeout_sec
 
     def ask_once(self, question: str) -> str:
-        with self._lock:
-            return self._loop.ask_once(question)
+        future = self._supervisor.try_submit("ask", question=question)
+        if future is None:
+            return ("(現在 Mission 実行中のため質問を受け付けられません。"
+                    "しばらくして再試行してください)")
+        try:
+            return future.result(timeout=self._wait_timeout_sec)
+        except TimeoutError:
+            return "(Mission 失敗: ask がタイムアウトしました)"
+        except Exception as e:  # noqa: BLE001 — 元の ask_once の service
+            # boundary (trade_loop.ask_once 内) が normalize 済みの文字列を
+            # 返す設計だが、supervisor 経由の Future.exception() 化で
+            # 二重に例外化され得るため、ここでも最終防波堤を置く。
+            return f"(Mission 失敗: {e})"
 
 
 def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
@@ -339,6 +355,13 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             conn_core, now=clock.now(),
             max_requeue=settings.plugin.signal_requeue_max)
         conn_shell = connect(root / "data" / "agentic.db")
+
+        # プラン 8 (Task 13, レビュー反映1回目 IM-1/P8-02): commit-pre 相
+        # (lock 外) が使う読取専用の lock 外接続。core_lock は取らない
+        # (Task 15 で使用開始)。Global Constraints「読取専用接続」の性質を
+        # connect_readonly (URI mode=ro) で構造的に強制する — query_only
+        # PRAGMA は使わない (プロセス内の別接続からは無効化されうるため)。
+        conn_supervisor = connect_readonly(root / "data" / "agentic.db")
 
         if provider is not None:
             # provider と quote_fn/spec_fn/bars_fn は排他的: provider が指定されたら
@@ -449,14 +472,31 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
         core_lock = threading.RLock()
 
-        def on_trade_mission(trigger: str) -> None:
-            # tick 全体が core_lock 下で走る (RLock のため再取得も安全)。
-            # trigger は scheduler._trade_mission_due() が返した起動理由。
-            # ここで捨てると missions.trigger が常に既定値になり監査列が死ぬ
-            # (上書き 1 参照)。
+        # プラン 8 (段階分け — Task 13 では lock の保持範囲を変えない):
+        # trade/reflection/ask の実行は引き続き呼び出し全体を core_lock で
+        # 包む。scheduler tick との直列性を維持したまま、Mission 呼び出しの
+        # 主体を scheduler スレッドから supervisor スレッドへ移す (ロック
+        # 粒度の再設計は Task 15/16)。
+        def _trade_fn(trigger: str):
             with core_lock:
-                trade_loop.run_once(trigger)
-                reflection.run_pending()
+                return trade_loop.run_once(trigger)
+
+        def _reflection_fn():
+            with core_lock:
+                return reflection.run_pending()
+
+        def _ask_fn(question: str) -> str:
+            with core_lock:
+                return trade_loop.ask_once(question)
+
+        supervisor = MissionSupervisor(
+            trade_fn=_trade_fn, reflection_fn=_reflection_fn, ask_fn=_ask_fn)
+
+        def on_trade_mission(trigger: str) -> bool:
+            # trigger は scheduler._trade_mission_due() が返した起動理由。
+            # supervisor.try_submit が受理すれば True (scheduler 側が cron
+            # 締切を前進させる判断材料になる — 設計書 §3.3)。
+            return supervisor.try_submit("trade", trigger=trigger) is not None
 
         # プラン 7 Task 8: signal 起動の判定・保守処理を Scheduler へ配線する。
         def on_signal_maintenance(now: datetime) -> None:
@@ -490,9 +530,12 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
         # Commands は conn_shell 束縛の broker を持つ (conn_core をシェルスレッドから触らない)
         shell_broker = PaperBroker(conn_shell, settings, clock)
+        ask_wait_timeout_sec = (settings.llama_swap.timeout_sec
+                                + settings.worker.worker_grace_sec
+                                + settings.worker.worker_terminate_grace_sec + 10.0)
         commands = Commands(conn=conn_shell, state_store=state,
                             broker=shell_broker,
-                            trade_loop=_LockedAsk(trade_loop, core_lock),
+                            trade_loop=_SupervisorAsk(supervisor, ask_wait_timeout_sec),
                             activity=activity, log_dir=root / "logs", clock=clock)
         return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
@@ -502,7 +545,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    registry=registry, core_lock=core_lock,
                    mission_watch=mission_watch, notifier=notifier,
                    runner=runner, owns_runner=owns_runner, clock=clock,
-                   instance_lock=instance_lock)
+                   instance_lock=instance_lock, supervisor=supervisor,
+                   conn_supervisor=conn_supervisor)
     except BaseException:
         # 2 周目レビュー (sonnet Minor / KAT-Coder Critical): 素の
         # `instance_lock.close()` だと close 自身が送出した例外が伝播し、
@@ -634,6 +678,7 @@ def run_service(root: Path, *, daemon: bool = False,
         signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
         signal.signal(signal.SIGINT, lambda *_: stop_event.set())
 
+    app.supervisor.start()
     th = threading.Thread(target=scheduler_thread, daemon=True)
     th.start()
     wd = threading.Thread(target=watchdog_thread, daemon=True)
