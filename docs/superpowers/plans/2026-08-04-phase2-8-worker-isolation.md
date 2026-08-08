@@ -3248,6 +3248,12 @@ Expected: 全件 PASS (mission_worker.py は他モジュールから import さ�
 
 最終: 変異 **40 件を再走して生存 1 件** — 生存した 1 件は `encode_frame` を `write_frame` にインライン戻しする**等価変異** (equivalent mutant: 出力がバイト単位で同一なので、原理的にどのテストでも区別できない)。`uv run pytest -q` = **1504 passed, 1 deselected** (ベースライン 1459 + 45)。
 
+**レビュー 3 周目 (2026-08-08。監視役の判断で実施。codex 単独・差分限定)**: **指摘なし**。serialize/transport の責務分割に曖昧に混ざる経路はなく、`_make_on_message` の guard も (serialize 失敗という) 独立した責務が残っているため死んでいない、`_ExitCalled(BaseException)` は `main()` の内外の `except Exception` を両方通過するので exit 後のコードがテストでだけ実行されることはない、`_FlakyStream` の write 回数依存は assertion (先頭 2 行の type + 3 つ目が改行なし断片 + 再送なし) が意図した経路を同定している、と全て根拠つきで追認された。指揮者は結論の土台となる事実主張 (「Task 10 に EOF-before-result のテストが明記されている」) を現物照合し、一致を確認した。
+
+**3 周目が拾った唯一の実質的成果**は上記 Task 10 への前提の明文化 (`test_worker_runner_child_eof_before_result_is_failed` の直下に転記済み)。**指摘ゼロだが「打ち切ってよい」という判断の根拠を得た**という点で、監視役が 3 周目を指示した意義はあった。
+
+**未検査として明示された点** (codex): `BinaryIO.write()` の**短い正常 return** を検査していない。本番の `protocol_out` は blocking fd を `os.fdopen(..., "wb")` した `BufferedWriter` であり下層の partial write は処理されるため、今回の経路では欠陥ではないと判断された。**親側 (Task 10) が別種のストリームを使う場合はこの前提が崩れる**ので注意。
+
 **変異 driver の落とし穴 (実測)**: 変異が `os._exit` を踏むと **pytest プロセスごと停止**し、driver からは「FAILED 行なし = 生存」に見える。`_write_frame_or_die` 関連の変異で実際に偽の生存を 1 件出した。**pytest の要約行に `passed`/`failed`/`error` が無ければ「異常終了 = 検出扱い」とする判定を driver に入れること**。あわせて、fail-closed 経路を持つコードのテストは `os._exit` を必ず monkeypatch する (「終了しないこと」の assert も pin になる)。
 
 - [ ] **Step 12: Commit**
@@ -4029,6 +4035,11 @@ def test_worker_runner_completes_mission_via_pipes(tmp_path, monkeypatch):
 1. `test_worker_runner_startup_timeout_kills_child` — `ready` を送らないまま `worker_startup_timeout_sec` (settings を `model_copy` で短縮して注入) を超過させ、`kill_fn` が呼ばれ `status == "failed"` になることを確認
 2. `test_worker_runner_mission_timeout_escalates_sigterm_then_sigkill` — `result` を送らないまま `mission.timeout_sec + worker_grace_sec` を超過させ、SIGTERM 相当の呼び出し (`terminate_fn`) → `worker_terminate_grace_sec` 経過後に `kill_fn` が呼ばれることを確認。`status == "timeout"`
 3. `test_worker_runner_child_eof_before_result_is_failed` — `ready` 送出後、`result` を送らずに子スレッドがパイプを閉じる (EOF) → `status == "failed"`
+   - **Task 7 が親に課した前提 (2026-08-08、Task 7 レビュー 3 周目 codex が明文化)**: 子は **transport 失敗 (`write`/`flush` の例外) 時に structured error frame を送れないため `os._exit(1)` で黙って死ぬ**。親が観測できる確実な事実は **EOF / プロセス終了だけ**。したがって Task 10 は以下を守ること —
+     - `result` を正常受信する**前**の EOF は、終了コードが未取得でも、部分 JSON 行が残っていても **`failed`** とする
+     - EOF を「正常完了」「空 transcript」「startup timeout」として扱わない。**`ready` 前なら起動失敗、`ready` 後なら Mission 失敗**として区別する
+     - 部分行の JSON decode error / `ProtocolError` も `failed` とし、**同じ子への送信再開やフレーム再要求をしない**
+     - `finally` で子を reap し dispatcher を停止・join する。子の `os._exit` に cleanup frame を期待しない
 4. `test_worker_runner_protocol_violation_is_failed` — `event` フレームの `seq` を逆行させて送る → `status == "failed"` (fail closed — `mission_protocol.ProtocolError` を検出)
 5. `test_worker_runner_transcript_truncates_at_cap` — `transcript_max_bytes` を小さく (例: 200 バイト) 設定し、大量の `event` を送る → `result.transcript` に truncate marker が 1 件だけ含まれ、以後の `event` が積まれていないことを確認
 6. `test_worker_runner_rag_rpc_dispatches_to_rag_and_responds` — `tool_rpc` (`name="search_news"`) を送り、fake `Rag.search_news` が呼ばれて `tool_rpc_result` が子側パイプ (`r2`) から読めることを確認
