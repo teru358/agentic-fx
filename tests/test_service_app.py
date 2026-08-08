@@ -382,6 +382,13 @@ def test_f1c_startup_reclaim_recovers_claimed_signal(tmp_path):
                                          now=old, freshness_bars=None)
     assert claimed is not None and claimed["id"] == sid  # 前提
 
+    # FC-2 (プラン8): instance_lock (flock) は App の全寿命で保持される
+    # ため、同一 root への 2 回目の build_app は 1 回目の instance_lock を
+    # 解放してからでないと InstanceAlreadyRunning になる。「再起動」を
+    # 模す以上、1 回目のプロセスが終了して lock を手放したことも模す
+    # 必要がある (App.close() への instance_lock 配線は Task 19)。
+    app1.instance_lock.close()
+
     # 「再起動」を模して同じ DB に対しもう一度 build_app する
     app2 = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                      embedding_fn=FakeEmbedding())
@@ -910,7 +917,7 @@ def test_watchdog_tick_uses_mission_watch_time_fn(monkeypatch):
               trade_loop=None, reflection=None, scheduler=None,
               commands=None, registry=None, core_lock=None,
               mission_watch=watch, notifier=FakeNotifier(), runner=None,
-              owns_runner=False, clock=None)
+              owns_runner=False, clock=None, instance_lock=None)
     _watchdog_tick(app)
     assert calls == ["write", "send"]
 
@@ -1003,7 +1010,7 @@ def test_watchdog_tick_uses_mission_watch_time_fn_directly(tmp_path):
               trade_loop=None, reflection=None, scheduler=None,
               commands=None, registry=None, core_lock=None,
               mission_watch=watch, notifier=FakeNotifier(), runner=None,
-              owns_runner=False, clock=None)
+              owns_runner=False, clock=None, instance_lock=None)
     _watchdog_tick(app)
     # elapsed は fake_time に基づいた値 (81s) になるはず。
     # 生の time.monotonic() (システム起動からの経過、通常大きい数値)

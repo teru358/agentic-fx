@@ -45,6 +45,7 @@ from agentic_fx.runners.local_runner import LocalRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.store import approvals, missions, orders, signals, ohlcv
 from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.instance_lock import acquire_instance_lock
 from agentic_fx.store.rag import Rag
 from agentic_fx.store.state import StateStore
 from agentic_fx.tools import (
@@ -205,6 +206,7 @@ class App:
     runner: object
     owns_runner: bool
     clock: object
+    instance_lock: object
 
 
 def _validate_startup(settings) -> None:
@@ -315,8 +317,26 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
     state = _state_store(root)
     activity = ActivityLog(root / "logs" / "activity.log")
+
+    # FC-2 (裁定書): recover_interrupted は起動時に status='running' の
+    # 全 mission を無条件に interrupted 化する。二重起動があると、後発
+    # プロセスが先発の稼働中 Mission を誤って終端し claim 済み signal を
+    # 横取り requeue しかねないため、DB 接続・回収より**前**にプロセス
+    # 排他 flock を取得する。取得できなければ起動を中止する (fail
+    # closed — InstanceAlreadyRunning は呼び出し元の run_service/CLI
+    # エントリまで伝播させ、非ゼロ終了させる)。
+    instance_lock = acquire_instance_lock(root / "data")
+
     conn_core = connect(root / "data" / "agentic.db")
     init_db(conn_core)
+    # プラン 8 (codex C-5): 前回停止時に running のまま残った mission と、
+    # それが claim していた signal を同一トランザクションで回収する。
+    # 既存の signals.reclaim_expired (403-407 行付近、lease ベースの
+    # 一般的な回収) より前に置く — running mission の signal は claimed_at
+    # が直近であり得るため lease ベースでは長時間拾われない。
+    missions.recover_interrupted(
+        conn_core, now=clock.now(),
+        max_requeue=settings.plugin.signal_requeue_max)
     conn_shell = connect(root / "data" / "agentic.db")
 
     if provider is not None:
@@ -478,7 +498,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                reflection=reflection, scheduler=scheduler, commands=commands,
                registry=registry, core_lock=core_lock,
                mission_watch=mission_watch, notifier=notifier,
-               runner=runner, owns_runner=owns_runner, clock=clock)
+               runner=runner, owns_runner=owns_runner, clock=clock,
+               instance_lock=instance_lock)
 
 
 def build_splash(app: App) -> str:
