@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -38,14 +39,16 @@ def test_search_news_raises_rag_unavailable_when_lock_held(tmp_path):
               lock_timeout_sec=0.2)
 
     release = threading.Event()
+    holding = threading.Event()
 
     def hold_lock():
         with rag._lock:  # 内部実装への直接アクセス (テスト専用の白箱検証)
+            holding.set()
             release.wait(2.0)
 
     t = threading.Thread(target=hold_lock, daemon=True)
     t.start()
-    time.sleep(0.05)  # hold_lock が確実に lock を取ってから測る
+    assert holding.wait(timeout=2.0), "holder が lock を取得できなかった"
     try:
         with pytest.raises(RagUnavailable):
             rag.search_news("query")
@@ -69,14 +72,16 @@ def test_close_raises_rag_unavailable_when_lock_held(tmp_path):
               lock_timeout_sec=0.2)
 
     release = threading.Event()
+    holding = threading.Event()
 
     def hold_lock():
         with rag._lock:
+            holding.set()
             release.wait(2.0)
 
     t = threading.Thread(target=hold_lock, daemon=True)
     t.start()
-    time.sleep(0.05)
+    assert holding.wait(timeout=2.0), "holder が lock を取得できなかった"
     try:
         with pytest.raises(RagUnavailable):
             rag.close()
@@ -112,14 +117,16 @@ def test_all_public_methods_raise_rag_unavailable_when_lock_held(tmp_path, metho
               lock_timeout_sec=0.2)
 
     release = threading.Event()
+    holding = threading.Event()
 
     def hold_lock():
         with rag._lock:
+            holding.set()
             release.wait(2.0)
 
     t = threading.Thread(target=hold_lock, daemon=True)
     t.start()
-    time.sleep(0.05)
+    assert holding.wait(timeout=2.0), "holder が lock を取得できなかった"
 
     try:
         with pytest.raises(RagUnavailable):
@@ -214,14 +221,72 @@ def test_build_app_wires_lock_timeout_from_worker_settings(tmp_path):
         NOW, FakeEmbedding, FakeRunner, _init)
 
     _init(tmp_path)          # config/settings.yaml 等を用意する既存ヘルパー
+
+    # レビュー 1 周目 (codex + sonnet 一致): 既定値 (15.0) と一致することを
+    # 見るだけでは、**設定を読まず 15.0 を直書きする変異を検出できない**
+    # (両レビュアーが独立に実測して生存を確認)。`Rag` の既定 10.0 とも
+    # `WorkerSettings` の既定 15.0 とも異なる値を設定に書いてから構築する。
+    settings_path = tmp_path / "config" / "settings.yaml"
+    text = settings_path.read_text()
+    assert "rpc_timeout_sec" in text, "worker.rpc_timeout_sec が example に無い"
+    text = re.sub(r"rpc_timeout_sec:\s*[0-9.]+", "rpc_timeout_sec: 0.37", text)
+    settings_path.write_text(text)
+
     app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                     embedding_fn=FakeEmbedding())
     try:
-        assert (app.rag._lock_timeout_sec
-                == app.settings.worker.rpc_timeout_sec)
-        # 既定値そのものと取り違えないよう、値が実際に settings 由来である
-        # ことを別経路でも確かめる。
-        assert app.settings.worker.rpc_timeout_sec == 15.0
+        assert app.settings.worker.rpc_timeout_sec == 0.37   # 設定が効いている
+        assert app.rag._lock_timeout_sec == 0.37             # Rag へ届いている
     finally:
         app.conn_core.close()
         app.conn_shell.close()
+
+
+def test_lock_timeout_waits_and_succeeds_when_released_in_time(tmp_path):
+    """`lock_timeout_sec` が **実際の待ち時間**として機能することの pin。
+
+    既存テストは「deadline より長く保持すれば `RagUnavailable`」しか見て
+    おらず、**`acquire(timeout=0)` (try-lock 化) が全 13 本を素通りして
+    生存**していた (レビュー 1 周目で codex/sonnet が独立に実測)。
+    単一 lock で全操作を直列化する設計では**短い競合は正常系**なので、
+    0 秒化は可用性を実質的に変えてしまう。
+
+    **決定論的なハンドシェイクで組む** (指揮者の 1 回目の修正は
+    「holder が 0.05 秒保持 → main が呼ぶ」という順序だったため、main が
+    呼ぶ前に holder が解放してしまい変異が生存したまま緑になった):
+
+      1. holder が lock を取得し `holding` を立てる
+      2. main は `holding` を待ち、`about_to_call` を立ててから呼ぶ
+         (ここで **main は acquire でブロックする**)
+      3. holder は `about_to_call` を待ってから 0.3 秒保持し続けて解放
+      4. main の acquire が成功する (deadline 5.0 秒に対し 0.3 秒待ち)
+
+    `timeout=0` に変異すると 2. の呼び出しが即 `RagUnavailable` になり red。
+    """
+    rag = Rag(tmp_path / "rag", embedding_function=_FakeEmbedding(),
+              lock_timeout_sec=5.0)
+
+    holding = threading.Event()
+    about_to_call = threading.Event()
+    released = threading.Event()
+
+    def hold_until_main_blocks():
+        with rag._lock:
+            holding.set()
+            # main が「これから呼ぶ」と宣言するまで待ち、そこからさらに
+            # 保持し続ける → main は確実に acquire でブロックする。
+            about_to_call.wait(timeout=5.0)
+            time.sleep(0.3)
+        released.set()
+
+    th = threading.Thread(target=hold_until_main_blocks, daemon=True)
+    th.start()
+    try:
+        assert holding.wait(timeout=5.0), "holder が lock を取得できなかった"
+        about_to_call.set()
+        # deadline (5.0s) 内に解放されるので、待って取得できるはず。
+        assert rag.count_news() == 0
+        assert released.wait(timeout=5.0)
+    finally:
+        about_to_call.set()      # 例外時も holder を確実に前進させる
+        th.join(timeout=5.0)
