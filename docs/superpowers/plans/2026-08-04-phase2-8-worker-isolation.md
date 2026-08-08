@@ -3945,7 +3945,7 @@ Expected: 全件 PASS (既存 `tests/store/test_rag.py` 相当のテストが lo
 
 - [ ] **Step 5: `build_app` に `lock_timeout_sec` を配線**
 
-`src/agentic_fx/service.py:304` の `rag = Rag(root / "data" / "rag", embedding_function=embedding_fn)` を以下に変更する (`settings.worker.rpc_timeout_sec` を配線 — 実際に使い始めるのは Task 10 の RPC dispatcher からだが、値の由来をここで確定しておく):
+`src/agentic_fx/service.py:375` (**2026-08-08 指揮者が実測して訂正 — 旧稿の `:304` は 71 行のドリフト**) の `rag = Rag(root / "data" / "rag", embedding_function=embedding_fn)` を以下に変更する (`settings.worker.rpc_timeout_sec` を配線 — 実際に使い始めるのは Task 10 の RPC dispatcher からだが、値の由来をここで確定しておく):
 
 ```python
     rag = Rag(root / "data" / "rag", embedding_function=embedding_fn,
@@ -3964,6 +3964,22 @@ Expected: 全件 PASS。
 
 1. `_locked()` の `if not acquired:` を削除 (timeout 検出を無効化) → `test_search_news_raises_rag_unavailable_when_lock_held` が red
 2. `close()` から `with self._locked():` を外す → `test_close_calls_chromadb_client_close` 自体は red にならない可能性があるため (lock が無くても close は呼ばれる)、代わりに「lock 保持中に `close()` を呼ぶと `RagUnavailable` になる」ケースを追加確認する変異テストとして、`test_search_news_raises_rag_unavailable_when_lock_held` と同型のテストを `close()` に対しても書き、この変異で red になることを確認する (実装者は Step 1 のテストに `test_close_raises_rag_unavailable_when_lock_held` を追加してから本変異を実施すること)
+
+**2026-08-08 指揮者の着手前照合による追加 (波及の pin — Task 7 の教訓「配線そのものを検証する」)**:
+
+本 task は `RagUnavailable` という**新しい例外を既存の 5 つの呼び出し経路に注入する**。Interfaces 節は「呼び出し側の責務: news collector / reflection 書込 / RPC dispatcher は fail soft で受ける」と書いているが、**それを検証する step が無い**。指揮者が呼び出し側 5 箇所を実査した結果:
+
+| 呼び出し元 | 現状 |
+|---|---|
+| `reflection_cycle.py:139` `add_reflection` | `try/except Exception` で捕捉・次回リトライ ✓ |
+| `news_collector.py:107` `add_news` | ソース単位の `try/except Exception` の**内側** ✓ |
+| **`news_collector.py:113` `cleanup_news`** | **try の外側** — `collect()` を貫通する |
+| `news_tools.py:12` / `reflection_tools.py:15` | 素通し (LLM にツールエラーとして見える。許容) |
+
+`cleanup_news` の貫通は `scheduler._run_data_hook` (fail-open の隔離ハンドラ、`scheduler.py:266`) が捕捉するため**実害はない**。ただしこれは**確かめて初めて分かる性質**であり、隔離が外れれば「RAG の lock timeout が資金保護経路 (tick) を落とす」ことになる。
+
+3. **(波及の pin) `tests/store/test_rag_lock.py` に以下のテストを追加すること**: `Rag` の lock を保持したまま `Scheduler.tick()` を回し (既存 `tests/core/test_scheduler*.py` の fixture を流用)、**`RagUnavailable` が tick を貫通せず、`_process_exits` (資金保護) まで到達すること**を確認する。そのうえで `scheduler._run_data_hook` の `try/except` を外す変異を注入 → このテストが red になることを確認する
+   - **狙い**: 「`RagUnavailable` は fail soft で受けられる」という Interfaces 節の主張を、宣言ではなく**実行で固定**する。単体の lock timeout テストはこの性質を守らない
 
 - [ ] **Step 8: Commit**
 
