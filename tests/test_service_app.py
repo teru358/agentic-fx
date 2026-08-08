@@ -193,6 +193,8 @@ def test_splash_contains_key_fields(tmp_path):
 
 
 def test_on_trade_mission_runs_loop_and_reflection(tmp_path):
+    """Task 13 fix (coordinator指摘): scheduler.tick() 起点で on_trade_mission の
+    配線を検証。Future 待ちを patch 内側に移動。"""
     _init(tmp_path)
     fake = FakeRunner([MissionResult("completed",
                                      {"action": "hold", "reasoning": "w"},
@@ -202,13 +204,26 @@ def test_on_trade_mission_runs_loop_and_reflection(tmp_path):
     record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                     equity=1_000_000)
     # プラン 8 Task 13: on_trade_mission は supervisor 経由で非同期実行される
-    # ため、supervisor を起動してから呼ぶ必要がある。
+    # ため、supervisor を起動してから tick を呼ぶ必要がある。
     app.supervisor.start()
     try:
-        with patch.object(app.provider, "healthcheck", return_value="yfinance"):
-            future = app.supervisor.try_submit("trade", trigger="cron")
-            assert future is not None
-            future.result(timeout=5.0)  # Mission 完了まで待つ
+        # spy: supervisor.try_submit() が返す Future をキャプチャする
+        from agentic_fx.core.supervisor import MissionSupervisor
+        captured = []
+        original_try_submit = MissionSupervisor.try_submit
+        def spy_try_submit(self, kind, **kw):
+            f = original_try_submit(self, kind, **kw)
+            if f is not None:
+                captured.append(f)
+            return f
+        # 重要: Future.result() を patch の内側で呼ぶ
+        with _no_real_network(), \
+             patch.object(MissionSupervisor, "try_submit", spy_try_submit), \
+             patch.object(app.provider, "healthcheck", return_value="yfinance"):
+            app.scheduler.tick(NOW)
+            assert captured, "no Future was captured"
+            assert captured[0] is not None
+            captured[0].result(timeout=5.0)  # Mission 完了まで待つ (patch 内側)
         assert len(fake.missions) >= 1  # trade mission が実行された
         rows = app.conn_core.execute("SELECT * FROM missions").fetchall()
         assert any(r["loop"] == "trade" for r in rows)
@@ -222,7 +237,8 @@ def test_on_trade_mission_wrapper_also_runs_reflection(tmp_path):
     reflection` は緑のまま生存する (trade mission 実行の確認しかしていない
     ため)。closed 注文を 1 件用意し、`missions` に reflection loop の行が
     実際に作られること (= reflection.run_pending が呼ばれたこと) を直接
-    ピンする。"""
+    ピンする。Task 13 fix (coordinator指摘): scheduler.tick() 起点で検証、
+    Future 待ちを patch 内側に。"""
     _init(tmp_path)
     fake = FakeRunner([
         MissionResult("completed", {"action": "hold", "reasoning": "w"}, []),
@@ -239,13 +255,26 @@ def test_on_trade_mission_wrapper_also_runs_reflection(tmp_path):
         avg_fill_price=148.0, close_price=149.0, realized_pnl=100.0,
         close_reason="tp")
     # プラン 8 Task 13: on_trade_mission は supervisor 経由で非同期実行される
-    # ため、supervisor を起動してから呼ぶ必要がある。
+    # ため、supervisor を起動してから tick を呼ぶ必要がある。
     app.supervisor.start()
     try:
-        with patch.object(app.provider, "healthcheck", return_value="yfinance"):
-            future = app.supervisor.try_submit("trade", trigger="cron")
-            assert future is not None
-            future.result(timeout=5.0)  # Mission 完了まで待つ
+        # spy: supervisor.try_submit() が返す Future をキャプチャする
+        from agentic_fx.core.supervisor import MissionSupervisor
+        captured = []
+        original_try_submit = MissionSupervisor.try_submit
+        def spy_try_submit(self, kind, **kw):
+            f = original_try_submit(self, kind, **kw)
+            if f is not None:
+                captured.append(f)
+            return f
+        # 重要: Future.result() を patch の内側で呼ぶ
+        with _no_real_network(), \
+             patch.object(MissionSupervisor, "try_submit", spy_try_submit), \
+             patch.object(app.provider, "healthcheck", return_value="yfinance"):
+            app.scheduler.tick(NOW)
+            assert captured, "no Future was captured"
+            assert captured[0] is not None
+            captured[0].result(timeout=5.0)  # Mission 完了まで待つ (patch 内側)
         rows = app.conn_core.execute("SELECT * FROM missions").fetchall()
         assert any(r["loop"] == "reflection" for r in rows)
         refl_rows = app.conn_core.execute("SELECT * FROM reflections").fetchall()
@@ -259,6 +288,7 @@ def test_tick_propagates_trigger_to_missions_row(tmp_path):
 
     この配線は wrapper が引数を捨てても各層の単体テストでは緑のままに
     なるため、tick 起点で通しで検証する (codex レビュー 1-4)。
+    Task 13 fix (coordinator指摘): trigger の伝搬を assert し、Future 待ちを patch 内側に。
     """
     _init(tmp_path)
     fake = FakeRunner([MissionResult("completed",
@@ -277,18 +307,35 @@ def test_tick_propagates_trigger_to_missions_row(tmp_path):
     # ため、supervisor を起動してから tick を呼ぶ必要がある。
     app.supervisor.start()
     try:
-        # 直接 supervisor に job を submit して動作を確認
-        with patch.object(app.provider, "healthcheck", return_value="yfinance"):
-            future = app.supervisor.try_submit("trade", trigger="cron")
-            assert future is not None, "Supervisor rejected the job"
-            result = future.result(timeout=5.0)  # Job 完了を待つ
-            assert result is not None, "Mission execution failed"
+        # spy: supervisor.try_submit() が返す Future をキャプチャする
+        from agentic_fx.core.supervisor import MissionSupervisor
+        captured = []
+        original_try_submit = MissionSupervisor.try_submit
+        def spy_try_submit(self, kind, **kw):
+            f = original_try_submit(self, kind, **kw)
+            if f is not None:
+                captured.append(f)
+            return f
+        # 重要: Future.result() を patch の内側で呼ぶ
+        # (非同期実行なので patch が効いている間に完了させる)
+        with _no_real_network(), \
+             patch.object(MissionSupervisor, "try_submit", spy_try_submit), \
+             patch.object(app.provider, "healthcheck", return_value="yfinance"):
+            app.scheduler.tick(NOW)
+            # Future が返されたことを確認
+            assert captured, "no Future was captured (on_trade_mission not called)"
+            assert captured[0] is not None, "Supervisor rejected the job"
+            # job 完了を待つ (patch の効いている内側で)
+            result = captured[0].result(timeout=5.0)
 
-        # Job 実行後に mission row が作られているか確認
-        row = app.conn_core.execute(
-            "SELECT trigger FROM missions WHERE loop='trade'").fetchone()
-        assert row is not None, "Mission was not created in database"
-        assert row["trigger"] == "cron"
+        # job 実行後に mission row が作られているか確認
+        # trigger が "cron" であることを assert (C1 本体)
+        mission_row = app.conn_core.execute(
+            "SELECT * FROM missions WHERE loop='trade' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert mission_row is not None, "Mission was not created in database"
+        assert mission_row["trigger"] == "cron", \
+            f"trigger was {mission_row['trigger']!r}, expected 'cron'"
     finally:
         app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
 

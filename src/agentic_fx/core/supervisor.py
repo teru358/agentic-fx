@@ -60,6 +60,9 @@ class MissionSupervisor:
 
     def try_submit(self, kind: str, **kwargs) -> Future | None:
         with self._lock:
+            # C2 fix: shutdown 後は新規受付を停止する
+            if self._stop_event.is_set():
+                return None
             if self._busy:
                 return None
             self._busy = True
@@ -81,10 +84,13 @@ class MissionSupervisor:
             item = self._queue.get_nowait()
         except queue.Empty:
             return
-        if item is not None:
-            _, _, future = item
-            if not future.done():
-                future.set_exception(exc)
+        # m2 fix: None センチネルの場合でも _busy を必ず解放する
+        try:
+            if item is not None:
+                _, _, future = item
+                if not future.done():
+                    future.set_exception(exc)
+        finally:
             with self._lock:
                 self._busy = False
 
