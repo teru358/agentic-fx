@@ -222,6 +222,30 @@ class PluginSettings(_Strict):
     signals_max_lookback_hours: int = Field(ge=1, default=24)
 
 
+class WorkerSettings(_Strict):
+    """mission worker (プラン8) の壁時計監視・resource limit・IPC 設定。
+    既定値のみで動く (`Settings.worker` は default_factory を持つ)。
+    """
+    # 子プロセス側 resource limit (§12 申し送り② — 実測に基づく確定値。
+    # 上記実測手順のコメント参照)。
+    child_as_mb: int = Field(ge=1, default=4096)
+    child_nofile: int = Field(ge=1, default=128)
+    child_fsize_mb: int = Field(ge=1, default=8)
+    # 親側の preemption エスカレーション (設計書 §4.7)。
+    worker_grace_sec: float = Field(gt=0, default=30.0)
+    worker_terminate_grace_sec: float = Field(gt=0, default=10.0)
+    worker_startup_timeout_sec: float = Field(gt=0, default=30.0)
+    # Mission 累積 transcript 上限 (設計書 §4.3 codex M-3)。
+    transcript_max_bytes: int = Field(ge=1, default=1_048_576)
+    # tick 内データ hooks が内部で使う全ネットワーククライアントの
+    # timeout 上限 (設計書 §3.2 codex I2-1 — wall-clock 保証ではない)。
+    data_hook_timeout_sec: float = Field(gt=0, default=30.0)
+    # RAG RPC の親側応答待ち上限 (設計書 §4.3/§4.4)。
+    rpc_timeout_sec: float = Field(gt=0, default=15.0)
+    # 停止シーケンスの join 上限 (設計書 §5)。
+    shutdown_join_timeout_sec: float = Field(gt=0, default=30.0)
+
+
 class Settings(_Strict):
     # ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)
     display_timezone: str = "UTC"
@@ -242,6 +266,7 @@ class Settings(_Strict):
     analysis: AnalysisSettings
     paper: PaperSettings
     plugin: PluginSettings = Field(default_factory=PluginSettings)
+    worker: WorkerSettings = Field(default_factory=WorkerSettings)
 
     @field_validator("display_timezone")
     @classmethod

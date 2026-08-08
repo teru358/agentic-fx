@@ -85,3 +85,15 @@ plugin:                        # plugin サンドボックス (プラン 7 Task 
   signal_min_interval_min: 10    # signal トリガー取引判断 Mission の最短起動間隔 (分)
   signal_daily_max: 12           # signal トリガー取引判断 Mission の日次上限
   signals_max_lookback_hours: 24 # get_signals ツールの since_hours 上限 (プラン 7 Task 9)
+
+worker:                        # mission worker (プラン8) の resource limit・preemption・IPC 設定。省略可
+  child_as_mb: 4096             # RLIMIT_AS (MiB): 実測 VmPeak 1.65GB (32コア環境) の約2.4倍の余裕。多コア機では要再実測 (IM-9)
+  child_nofile: 128             # RLIMIT_NOFILE
+  child_fsize_mb: 8             # RLIMIT_FSIZE (MiB): 正常経路ではファイルを書かない前提の小さい上限
+  worker_grace_sec: 30          # runner soft deadline の外側マージン (壁時計監視)
+  worker_terminate_grace_sec: 10  # SIGTERM 後 SIGKILL までの猶予
+  worker_startup_timeout_sec: 30  # 子の import〜ready まで
+  transcript_max_bytes: 1048576   # Mission 累積 transcript 上限 (超過は truncate marker)
+  data_hook_timeout_sec: 30       # tick 内データ hooks の全ネットワーククライアント timeout 上限
+  rpc_timeout_sec: 15             # RAG RPC の親側応答待ち上限
+  shutdown_join_timeout_sec: 30   # 停止シーケンスの join 上限
