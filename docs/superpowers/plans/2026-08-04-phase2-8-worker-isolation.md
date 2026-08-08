@@ -3282,7 +3282,9 @@ EOF
 
 設計書 §4.6「Landlock による FS 自己制限」を実装する。improve worker profile (Task 18) が使う独立した小モジュール — Landlock 自体は本 task で完結してテストでき、improve profile への配線は Task 18 に譲る。
 
-**実機検証済み (writing-plans で実施)**: 本環境 (x86_64, kernel 7.0.0-28-generic) で syscall 番号・構造体レイアウトを実際に呼び出して検証した — `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` (syscall 444) が ABI バージョン 8 を返す (Landlock 利用可能)、`landlock_add_rule` (syscall 445) で `O_PATH` ディレクトリ fd に対する読み取り専用ルールを追加できる、`prctl(PR_SET_NO_NEW_PRIVS, 1)` → `landlock_restrict_self` (syscall 446) の順で自己制限を適用した後、許可ディレクトリ配下は `os.listdir` が成功し、`/tmp`・`/etc/hostname` は `PermissionError` (errno 13) になることを実測確認済み。**本モジュールは x86_64 Linux 専用** (syscall 番号はアーキテクチャ依存 — aarch64 等では異なる番号になる。`platform.machine() != "x86_64"` は起動時に `LandlockUnavailable` として拒否する)。
+**実機検証済み (writing-plans で実施。2026-08-08 に指揮者が着手前へ再実測 — kernel 7.0.0-**29**-generic で ABI バージョン 8、syscall 列は下記のとおり全て成功。旧稿の `7.0.0-28-generic` は当時の版数)**: 本環境 (x86_64) で syscall 番号・構造体レイアウトを実際に呼び出して検証した — `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` (syscall 444) が ABI バージョン 8 を返す (Landlock 利用可能)、`landlock_add_rule` (syscall 445) で `O_PATH` ディレクトリ fd に対する読み取り専用ルールを追加できる、`prctl(PR_SET_NO_NEW_PRIVS, 1)` → `landlock_restrict_self` (syscall 446) の順で自己制限を適用した後、許可ディレクトリ配下は `os.listdir` が成功し、`/tmp`・`/etc/hostname` は `PermissionError` (errno 13) になることを実測確認済み。**構造体レイアウトの注記 (2026-08-08 指揮者が実測。レビュアーはここを再導出しなくてよい)**: カーネルの `struct landlock_path_beneath_attr` は `__attribute__((packed))` で **12 バイト**だが、`ctypes.Structure` (packed 指定なし) では **16 バイト**になる。ただし**フィールドオフセットは 0 / 8 で一致**し (`__u64` の次に `__s32` は自然アライメントでも offset 8)、`landlock_add_rule` はサイズを引数に取らずカーネルが自分の 12 バイトを読むだけなので、**末尾パディングは無害**。`_pack_ = 1` を足す必要はない (足しても動くが挙動は変わらない)。
+
+**本モジュールは x86_64 Linux 専用** (syscall 番号はアーキテクチャ依存 — aarch64 等では異なる番号になる。`platform.machine() != "x86_64"` は起動時に `LandlockUnavailable` として拒否する)。
 
 **Files:**
 - Create: `src/agentic_fx/core/landlock.py`
@@ -3307,6 +3309,7 @@ fake ctypes.CDLL によるロジック検証 (このプロセス自身は制限�
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -3347,6 +3350,117 @@ def test_restrict_to_raises_when_create_ruleset_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(landlock_mod.ctypes, "get_errno", lambda: 38)  # ENOSYS
     with pytest.raises(LandlockUnavailable):
         restrict_to(read_only_paths=[tmp_path], read_write_paths=[])
+
+
+# --- 2026-08-08 指揮者が着手前に追加した失敗分岐ピン ----------------------
+# 旧稿は `restrict_to` の 4 つの失敗分岐 (create_ruleset / add_rule / prctl /
+# restrict_self) のうち **1 つしかテストしていなかった**。残り 3 つと
+# `is_available` の ABI 問い合わせ失敗、および `finally` での fd close は
+# 無防備で、削除しても全件 green のままになる (プラン 8 Task 7 で同型の穴が
+# 26 件中 16 件生存した実測を踏まえた予防)。
+
+
+class _ScriptedLibc:
+    """`syscall` の戻り値を呼び出し順に台本化した fake。
+
+    `syscall`/`prctl` は **必ずインスタンス属性の関数オブジェクト**にする
+    (I5 — クラスメソッドだと実装側の `libc.syscall.restype = ...` が
+    バインドメソッドへの属性代入になり `AttributeError` で落ちる)。
+    """
+
+    def __init__(self, *, syscall_results, prctl_result=0):
+        self._results = list(syscall_results)
+        self.syscall_numbers: list[int] = []
+        self.prctl_args: list[tuple] = []
+
+        def syscall(*args):
+            n = args[0]
+            self.syscall_numbers.append(getattr(n, "value", n))
+            return self._results.pop(0) if self._results else 0
+
+        def prctl(*args):
+            self.prctl_args.append(args)
+            return prctl_result
+
+        self.syscall = syscall
+        self.prctl = prctl
+
+
+def _install(monkeypatch, libc):
+    """`platform.machine`/`ctypes.CDLL`/`os.close` を差し替えて、閉じられた
+    fd の一覧を返す。
+
+    `os.close` を差し替えるのは必須 — 台本上の `ruleset_fd` は実在しない
+    番号 (4242) であり、実 `os.close` を通すと `OSError(EBADF)` が
+    `finally` の中で送出されて **本来送出されるはずの `LandlockUnavailable`
+    を置き換えてしまう**。あわせて「`finally` で確実に閉じている」ことの
+    ピンにもなる。
+    """
+    import agentic_fx.core.landlock as landlock_mod
+
+    closed: list[int] = []
+    real_close = os.close
+
+    def fake_close(fd):
+        closed.append(fd)
+        if fd < 1000:   # os.open で得た実 fd だけ本当に閉じる
+            real_close(fd)
+
+    monkeypatch.setattr(landlock_mod.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(landlock_mod.ctypes, "CDLL", lambda *a, **k: libc)
+    monkeypatch.setattr(landlock_mod.ctypes, "get_errno", lambda: 1)
+    monkeypatch.setattr(landlock_mod.os, "close", fake_close)
+    return closed
+
+
+def test_is_available_false_when_abi_query_fails(monkeypatch):
+    """カーネルが Landlock 非対応 (ENOSYS) なら False。x86_64 判定だけを
+    見ていると、この分岐は削除しても検出できない。"""
+    _install(monkeypatch, _ScriptedLibc(syscall_results=[-1]))
+    assert is_available() is False
+
+
+def test_restrict_to_raises_when_add_rule_fails(monkeypatch, tmp_path):
+    libc = _ScriptedLibc(syscall_results=[8, 4242, -1])  # abi, ruleset_fd, add_rule
+    closed = _install(monkeypatch, libc)
+    with pytest.raises(LandlockUnavailable, match="landlock_add_rule"):
+        restrict_to(read_only_paths=[tmp_path], read_write_paths=[])
+    assert 4242 in closed          # ruleset_fd を finally で閉じている
+    assert len(closed) == 2        # parent_fd も閉じている (fd リークなし)
+
+
+def test_restrict_to_raises_when_no_new_privs_fails(monkeypatch, tmp_path):
+    """`prctl(PR_SET_NO_NEW_PRIVS)` は `landlock_restrict_self` の前提条件。
+    失敗を無視すると後段が EPERM になる (実測で確認済み — Step 7 参照)。"""
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0], prctl_result=-1)
+    closed = _install(monkeypatch, libc)
+    with pytest.raises(LandlockUnavailable, match="NO_NEW_PRIVS"):
+        restrict_to(read_only_paths=[tmp_path], read_write_paths=[])
+    assert 4242 in closed
+
+
+def test_restrict_to_raises_when_restrict_self_fails(monkeypatch, tmp_path):
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, -1])
+    closed = _install(monkeypatch, libc)
+    with pytest.raises(LandlockUnavailable, match="landlock_restrict_self"):
+        restrict_to(read_only_paths=[tmp_path], read_write_paths=[])
+    assert 4242 in closed
+
+
+def test_restrict_to_issues_syscalls_in_required_order(monkeypatch, tmp_path):
+    """syscall の**順序**を pin する。`prctl(NO_NEW_PRIVS)` が
+    `landlock_restrict_self` より後になるとカーネルが EPERM を返す
+    (実測済み) — 順序は正しさの一部であって偶然ではない。"""
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    rw = tmp_path / "rw"; rw.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw])
+
+    # 444(abi) → 444(create) → 445(add ro) → 445(add rw) → 446(restrict)
+    assert libc.syscall_numbers == [444, 444, 445, 445, 446]
+    assert len(libc.prctl_args) == 1
+    assert libc.prctl_args[0][0] == 38   # PR_SET_NO_NEW_PRIVS
 ```
 
 (`is_available` 自体を fake する統合はここでは避け、`restrict_to` 内部で `is_available()` の判定に使う `platform.machine`/`ctypes.CDLL` を個別に monkeypatch する — `is_available` の実装が `ctypes.CDLL(None)` を直接呼ぶため、`restrict_to` からの呼び出しも同じ fake を経由する設計にする。**I5 対応の `FakeLibc` 実装に注意** — `syscall`/`prctl` はクラスメソッド (`def`) ではなく `__init__` 内でインスタンス属性として代入する関数オブジェクトにすること。クラスメソッドのままだと `libc.syscall.restype = ...` (実装コード, Step 3) がバインドメソッドの属性代入で `AttributeError` になり、Step 4 の PASS が成立しない。)
@@ -3519,42 +3633,74 @@ Expected: PASS。
 
 このプロセス自身を Landlock で制限すると以後のテストが全滅するため、**別プロセスを spawn してその中で実 `restrict_to` を呼ぶ**。`tests/core/test_landlock.py` に追記:
 
+**2026-08-08 指揮者による拡張**: 旧稿のスクリプトは `read_write_paths=[]` 固定で、**`_READ_WRITE_ACCESS` 定数を一度も通らなかった**。`_ACCESS_FS_MAKE_REG` を削っても、定数ごと `_READ_ONLY_ACCESS` に差し替えても全件 green のままになる — **Task 18 が依存する書き込み側の権限境界が丸ごと無防備**だった (Task 7 の「追加L」と同型)。1 つの子プロセスで 3 つの防御をまとめて検証する形に拡張する。
+
 ```python
 _REAL_LANDLOCK_SCRIPT = textwrap.dedent("""
     import sys
     from pathlib import Path
     from agentic_fx.core.landlock import restrict_to
 
-    allowed_dir = Path(sys.argv[1])
-    blocked_dir = Path(sys.argv[2])
-    restrict_to(read_only_paths=[allowed_dir], read_write_paths=[])
-    # 許可ディレクトリは読める
-    list(allowed_dir.iterdir())
-    # 許可外ディレクトリは読めない
+    ro_dir = Path(sys.argv[1])       # read_only_paths
+    rw_dir = Path(sys.argv[2])       # read_write_paths
+    blocked_dir = Path(sys.argv[3])  # どちらにも入れない
+
+    restrict_to(read_only_paths=[ro_dir], read_write_paths=[rw_dir])
+
+    # (1) read_only パスは読める
+    assert sorted(p.name for p in ro_dir.iterdir()) == ["x.txt"], "ro not readable"
+
+    # (2) read_only パスへは **書けない** (旧稿が見ていなかった防御)
+    try:
+        (ro_dir / "new.txt").write_text("x")
+        print("FAIL: write succeeded on a read-only path")
+        sys.exit(1)
+    except PermissionError:
+        pass
+
+    # (3) read_write パスへは書ける (_READ_WRITE_ACCESS の唯一のピン)
+    try:
+        (rw_dir / "new.txt").write_text("x")
+    except PermissionError:
+        print("FAIL: write was denied on a read-write path")
+        sys.exit(1)
+
+    # (4) 列挙していないパスは読めない
     try:
         list(blocked_dir.iterdir())
         print("FAIL: blocked_dir was readable")
         sys.exit(1)
     except PermissionError:
-        print("OK")
-        sys.exit(0)
+        pass
+
+    print("OK")
+    sys.exit(0)
 """)
 
 
-def test_real_landlock_blocks_unlisted_paths(tmp_path):
-    """実 Landlock (別プロセス) — カーネルが対応していなければ skip する。"""
+def test_real_landlock_enforces_read_only_read_write_and_blocked(tmp_path):
+    """実 Landlock (別プロセス) — カーネルが対応していなければ skip する。
+
+    **skip したかどうかを呼び出し側で必ず確認すること** (Step 5 の実行ログ)。
+    この 1 本が実カーネルの強制を触る唯一のテストであり、静かに skip される
+    と偽の green になる。本環境 (x86_64 / kernel 7.0.0-29-generic / ABI 8)
+    では実行されることを指揮者が実測確認済み。
+    """
     from agentic_fx.core.landlock import is_available
     if not is_available():
         pytest.skip("Landlock not available on this kernel/architecture")
 
-    allowed = tmp_path / "allowed"
-    allowed.mkdir()
-    (allowed / "x.txt").write_text("ok")
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    (ro / "x.txt").write_text("ok")
+    rw = tmp_path / "rw"
+    rw.mkdir()
     blocked = tmp_path / "blocked"
     blocked.mkdir()
 
     result = subprocess.run(
-        [sys.executable, "-c", _REAL_LANDLOCK_SCRIPT, str(allowed), str(blocked)],
+        [sys.executable, "-c", _REAL_LANDLOCK_SCRIPT,
+         str(ro), str(rw), str(blocked)],
         capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "OK" in result.stdout
@@ -3569,16 +3715,36 @@ Expected: PASS (実環境で Landlock 利用可能なら実際に制限を検証
 - [ ] **Step 6: 全体 green**
 
 ```bash
+find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 uv run pytest -q
 ```
 
-Expected: 全件 PASS。
+Expected: 全件 PASS。**Step 5 の実 Landlock テストが `skip` ではなく実際に走ったことを `-rs` で確認すること** (本環境では走る — 静かな skip は、実カーネルの強制を触る唯一のテストが無効化されたまま緑になる形になる)。
 
 - [ ] **Step 7: 変異テスト**
 
-1. `restrict_to` 内の `if rc != 0:` (landlock_restrict_self の結果検査) を削除 → `test_real_landlock_blocks_unlisted_paths` は失敗を検出できなくなるが直接的な red 化は難しいため、代わりに `is_available` の `return version >= 1` を `return False` に固定する変異を行い `test_is_available_false_on_non_x86_64` 相当のロジックテストで検出できることを確認する (実 syscall 系の変異は fake 経由のテストで検出できるものに絞る — これが本 task の変異テストの限界であり、実カーネル依存の壊れ方は Step 5 の実プロセステストが唯一の防波堤であることを progress.md に明記する)
-2. `restrict_to` の `libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)` 呼び出しを削除 → `test_restrict_to_raises_when_create_ruleset_fails` は影響を受けない (create_ruleset の失敗が先に発火するため) が、これは fake テストの限界として明記し、Step 5 の実プロセステストが `landlock_restrict_self` 自体の欠落 (NO_NEW_PRIVS が無いと restrict_self が EPERM で失敗する — カーネルの実際の防御) を間接的に検出することを確認する
-3. (I5) Step 1 の `FakeLibc.__init__` を元の `def syscall(self, *args): ...` (クラスメソッド) 形式に戻す → `test_restrict_to_raises_when_create_ruleset_fails` が `AttributeError: 'method' object has no attribute 'restype'` で red (`pytest.raises(LandlockUnavailable)` の外側で例外が飛ぶため red — Step 4 の PASS がそもそも成立しないことの確認。実装コード側の `.restype` 代入自体は正しい仕様のままなので `landlock.py` は変更しない)
+**2026-08-08 指揮者が着手前に実測して書き換えた** (旧稿は「直接的な red 化は難しい」「fake テストの限界」として 2 件を推論で諦めていたが、**どちらもスタンドアロンスクリプトで実測したところ検出可能だった**。Task 7 で「無効な変異」をそのまま出荷しかけた反省を踏まえ、推論ではなく実測で確定させる)。
+
+**実測の前提** (指揮者が本環境で確認済み。実装者は再実測不要):
+- `prctl(PR_SET_NO_NEW_PRIVS)` を**呼ばない**と、直後の `landlock_restrict_self` は **`rc != 0` を返す** (カーネルの前提条件)
+- `landlock_restrict_self` の**呼び出しごと削除**すると、プロセスは**まったく制限されない** (許可外ディレクトリが読める)
+
+変異リスト:
+
+1. `restrict_to` の `libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)` **呼び出しを削除** → 直後の `landlock_restrict_self` が失敗し `LandlockUnavailable` が送出される → 子プロセスが非ゼロ終了 → `test_real_landlock_enforces_read_only_read_write_and_blocked` が **red** (実測確認済み)
+2. `landlock_restrict_self` の **syscall 呼び出しごと削除** (`rc = 0` に置換) → 制限が一切掛からず `blocked_dir` が読める → 同テストが **red** (実測確認済み)
+3. `restrict_to` の `if rc != 0:` (`landlock_restrict_self` の結果検査) の**削除単独**は、正常経路では `rc == 0` なので**等価変異** (equivalent mutant — 原理的に検出不能)。**変異 1 と組み合わせたときだけ**「失敗しているのに成功として返る」危険な形になる。**1 と 3 を同時に注入して red になること**を確認する (単独での生存は正しい挙動なので生存扱いにしない)
+4. `is_available` の `return version >= 1` を `return False` に固定 → `restrict_to` が常に `LandlockUnavailable` → 上記実プロセステストが red
+5. `is_available` の `return version >= 1` を `return True` に固定 → `test_is_available_false_on_non_x86_64` / `test_is_available_false_when_abi_query_fails` が red
+6. `restrict_to` の `_READ_WRITE_ACCESS` を `_READ_ONLY_ACCESS` に差し替える → 実プロセステストの (3) が red (**旧稿のテストでは検出できなかった**)
+7. `_READ_WRITE_ACCESS` から `_ACCESS_FS_MAKE_REG` を外す → 同上 (新規ファイル作成が拒否される)
+8. `_READ_ONLY_ACCESS` に `_ACCESS_FS_WRITE_FILE` を足す → 実プロセステストの (2) が red (read-only パスへ書けてしまう)
+9. `restrict_to` の `finally: os.close(ruleset_fd)` を削除 → `test_restrict_to_raises_when_add_rule_fails` 等の `assert 4242 in closed` が red
+10. `_ABI_V1_HANDLED_ACCESS_FS` から `_ACCESS_FS_READ_DIR` を外す → その種別が ruleset の判定対象から外れ、`blocked_dir` の列挙が通ってしまう → 実プロセステストの (4) が red
+11. (I5) Step 1 の `FakeLibc.__init__` を元の `def syscall(self, *args): ...` (クラスメソッド) 形式に戻す → `test_restrict_to_raises_when_create_ruleset_fails` が `AttributeError: 'method' object has no attribute 'restype'` で red (`pytest.raises(LandlockUnavailable)` の外側で例外が飛ぶため。実装コード側の `.restype` 代入は正しい仕様なので `landlock.py` は変更しない)
+12. syscall 番号 `_SYS_LANDLOCK_ADD_RULE` を 445 → 446 に入れ替える → `test_restrict_to_issues_syscalls_in_required_order` が red
+
+**変異リストは下限**。実装者は「この task が守ろうとしている防御」ごとに自分で 1 件ずつ確かめ、リストに無い変異を追加したら報告すること。**生存した変異は必ず報告する** (等価変異と判断した場合はその根拠も添える)。
 
 - [ ] **Step 8: Commit**
 
