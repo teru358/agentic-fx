@@ -5819,10 +5819,20 @@ EOF
 設計書 §3.3「supervisor とスロット意味論」を実装する。**本 task では `core_lock` の保持範囲を変えない** — trade/reflection/ask の実行は引き続き呼び出し全体を `core_lock` で包む (scheduler tick との直列性は現状維持)。これは意図的な段階分け: 本 task は「Mission 実行を scheduler スレッドから専用の supervisor スレッドへ移し、正しいキューイング意味論 (単一スロット・原子的 `try_submit`・ask の Future 化) を導入する」ことだけに集中し、「lock の保持範囲を commit-core だけに狭める」(= 「Mission 実行中も SL/TP 監視継続」の本体) は Task 15/16 に委ねる。この段階分けにより、両 task を独立してレビュー・検証できる (Task 13 単体では tick の資金保護窓は変わらない — 変わるのは「誰が Mission を呼ぶスレッドか」だけ)。
 
 **Files:**
-- Create: `src/agentic_fx/core/supervisor.py`
-- Modify: `src/agentic_fx/core/scheduler.py:39-47`(`on_trade_mission` の型ヒント)`,210-217`(`tick` 内の呼び出し規約変更)
-- Modify: `src/agentic_fx/service.py:183-206`(`App` に `supervisor`/`conn_supervisor` 追加)`,232-241`(`_LockedAsk` 削除 → `_SupervisorAsk` 新設)`,357-414`(`on_trade_mission` を supervisor 経由に、`Commands` の `trade_loop=` 配線変更)`,502-514`(`scheduler_thread` — 変更なし、確認のみ)
-- Test: `tests/core/test_supervisor.py` (新規)
+
+**【着手前照合 2026-08-08 — 参照行を実測で修正した。以下が正】**
+
+- Create: `src/agentic_fx/core/supervisor.py` (既存なしを確認)
+- Modify: `src/agentic_fx/core/scheduler.py:43`(`on_trade_mission` の型ヒント — `Callable[[str], None]`)**`,185-189`(`tick` 内の呼び出し規約変更)**
+  - **Task 12 で `tick` を `try/finally` 化したので、`self.on_trade_mission(reason)` は `finally:` ブロックの外 (185-189 行) にある。** プラン旧記載の `210-217` は現在の `_trade_mission_due` の docstring あたりを指す
+- Modify: `src/agentic_fx/service.py:186`(`class App` — `supervisor`/`conn_supervisor` 追加)`,240`(`_LockedAsk` 削除 → `_SupervisorAsk` 新設)**`,452`(`on_trade_mission` の定義)`,495`(`Commands` の `trade_loop=_LockedAsk(...)` 配線)`,497-505`(`return App(...)` 構築)`,606`(`scheduler_thread` — 変更なし、確認のみ)**
+  - **Task 11 で `build_app` 全体を `try:` で囲んだため、配線箇所は約 90〜100 行ドリフトしている** (プラン旧記載 `357-414` / `415-422` / `502-514` はいずれも古い)。新しいコードは **`try:` の内側**に置くこと
+- Test: `tests/core/test_supervisor.py` (新規、既存なしを確認)
+
+**照合で確認できたこと**:
+- `heartbeat_pump_interval_sec` は**モジュール定数 `_HEARTBEAT_PUMP_INTERVAL_SEC` + 既定引数**であり、`config.py` / `settings.yaml` への追加は不要
+- `dispatch_ceiling_sec` は Task 19 (watchdog) 側の関心事で、本 task では `busy_since` を公開するだけ
+- `conn_supervisor` を `connect_readonly` で構築する修正 (プランレビュー I1 / 裁定書 F-7) は**プラン本文に反映済み** — Step 9 の逐語コードは正しい
 
 **Interfaces:**
 - Produces:
