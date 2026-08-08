@@ -10033,6 +10033,15 @@ EOF
 - `runner.improve.backend == "claude"` は本プランでは `RuntimeError` で fail closed (ClaudeRunner 未実装) — プラン9 で `ClaudeRunner` 実装後にこの分岐を実装へ差し替える
 - 遮断 8 項目の全経路統合回帰テストはプラン9 の blocking 受入条件 (分解書どおり) — 本プランは項目 2 (holdout 実行到達不能性) の worker 境界のみ提供する
 - spec 小改訂束 (exit_mode② / signals UNIQUE 意図明文化 / approved+rejected 併存規則 / claimed_by FK / **close/cancel gate 論点**) はプラン9 前に実施 (分解書どおり、本プランでは着手しない)
+- **[2026-08-08 ユーザー裁定] システムが生成した改善コードはリポジトリに含めない。** 理由: ①本体のベース更新と競合する ②各ユーザーで状況が異なる。これは設計書が既に `plugins/` を gitignore にしている根拠と同一であり、**既に plugin へ適用済みの原則を改善ループの出力全体へ一貫適用する**もの。**スペック改訂を上記 spec 小改訂束に合流させてプラン 9 着手前に実施する**
+  - **設計書 §6「出力の 3 経路」の「コア改善 → リポジトリ内 git 管理 → PR + 人間承認」経路は廃止**する。残るのは `plugins/` (gitignore) と `news_sources` (SQLite) の 2 経路
+  - **`gh` による PR 作成は不要**になる。GitHub を経由する自己改善の動線そのものが無くなる
+  - 改善ループの出力先は **gitignore 済みのユーザー固有領域**に収める (`config/settings.yaml` / `data/` / `logs/` / `reports/` / `plugins/`)
+  - 本体コード (plugin 機構・バックテスト基盤・news fetcher 自体) の改善は**提案レポート止まり**。受け皿は設計書に既にある (「分析レポート `reports/improve-YYYY-MM-DD.md` だけ残す」)
+  - risk gate パラメータは**コードでなく設定値**なので `approval_requests` の値提案で扱える
+  - **未確定**: Mission プロンプト (`prompts/`) の扱い (設計書は「コード外の .md」とするがディレクトリ未作成でリポジトリ内想定)
+  - **発見の経緯**: Task 8 完了時に `EXECUTE` 権を詰める中で、**設計書 §6 許可ツール「リポジトリのファイル読み書き」と §4.6 Landlock allowlist「コードツリー読取 + 専用 workdir 読書き」が矛盾**していることが判明した (Task 18 の配線どおりだと improve worker はリポジトリに 1 バイトも書けず、コア改善 PR 経路が成立しない)。この矛盾の解として本裁定が出た
+  - **Task 18 への影響**: リポジトリ (コードツリー) は `read_only_paths` のままでよく、**配線はほぼ正しかった**。ただし `plugins/` を `read_write_paths` に足す必要がある。**`EXECUTE` 権の論点も大幅に縮む** (`gh` が消えるため。`pytest` を worker 内で回す必要があるかはプラン 9 で再評価)
 
 ## 付録: 実装時照合リスト (未検証のレビュー指摘)
 
