@@ -355,76 +355,7 @@ class Executor:
             quote_to_account=quote_to_account,
             base_to_account=base_to_account,
             now=now)
-        result = evaluate(intent, ctx, self.settings.risk)
-        if not result.accepted:
-            intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason="; ".join(result.reasons))
-            if any("kill switch" in r and "latched" not in r
-                   for r in result.reasons):
-                self.state.update(kill_switch_latched=True)
-                self.activity.write(Category.SYSTEM, "kill_switch_latched",
-                                    "drawdown threshold hit — 新規停止 (解除は明示操作)")
-            self.activity.write(Category.TRADE, "gate_rejected",
-                                "; ".join(result.reasons)[:200], ref_id=str(iid))
-            return {"result": "rejected", "order_id": None,
-                    "reasons": result.reasons}
-
-        intents_store.set_gate_result(self.conn, iid, accepted=True,
-                                      reject_reason=None)
-        is_market = intent.entry_type.value == "market"
-        oid = orders.insert(
-            self.conn, pair=intent.pair, direction=intent.direction.value,
-            entry_type=intent.entry_type.value, horizon=intent.horizon.value,
-            status=S.SUBMITTING, now=now, intent_id=iid,
-            client_order_id=f"afx-{iid}-{now.timestamp():.0f}",
-            quantity=result.size.quantity,
-            remaining_quantity=result.size.quantity,
-            requested_price=result.entry_price,
-            stop_loss=intent.stop_loss, take_profit=intent.take_profit,
-            expires_at=(now + timedelta(hours=intent.expires_in_h)).isoformat()
-            if intent.expires_in_h else None)
-        row = orders.get(self.conn, oid)
-        # レビュー修正 (codex 2): タイムアウト等の broker 例外は「結果不明」
-        # として扱う (設計書 §12)。Phase 3 の MT5 実装で必ず起きる経路。
-        try:
-            br = self.broker.submit(row, entry_price=result.entry_price)
-        except Exception as e:  # noqa: BLE001
-            br = BrokerResult(status="unknown",
-                              message=safe_error_text(e))
-        if br.status == "rejected":
-            transitions.transition(self.conn, oid, S.REJECTED, now)
-            self.activity.write(Category.TRADE, "broker_rejected",
-                                f"{intent.pair}", ref_id=str(oid))
-            return {"result": "rejected", "order_id": oid,
-                    "reasons": ["broker rejected"]}
-        if br.status == "unknown":
-            transitions.transition(self.conn, oid, S.SUBMIT_UNKNOWN, now)
-            self.activity.write(Category.TRADE, "submit_unknown",
-                                f"{intent.pair} — reconcile 待ち", ref_id=str(oid))
-            self.notifier.send(f"[agentic-fx] 送信結果不明 #{oid} — "
-                               "解決まで新規発注停止")
-            return {"result": "unknown", "order_id": oid, "reasons": []}
-        transitions.transition(self.conn, oid, S.SUBMITTED, now,
-                               broker_order_id=br.broker_order_id,
-                               broker_position_id=br.broker_position_id)
-        if is_market:
-            transitions.transition(self.conn, oid, S.PROTECTION_PENDING, now,
-                                   avg_fill_price=result.entry_price,
-                                   filled_quantity=result.size.quantity,
-                                   remaining_quantity=0.0,
-                                   filled_at=now.isoformat())
-            transitions.transition(self.conn, oid, S.OPEN, now)  # paper: 保護は常に成功
-            self.activity.write(Category.TRADE, "order_opened",
-                                f"{intent.pair} {intent.direction.value} "
-                                f"{result.size.quantity}lot @{result.entry_price}",
-                                ref_id=str(oid))
-            return {"result": "opened", "order_id": oid, "reasons": []}
-        transitions.transition(self.conn, oid, S.PENDING_FILL, now)
-        self.activity.write(Category.TRADE, "limit_placed",
-                            f"{intent.pair} {intent.direction.value} "
-                            f"{result.size.quantity}lot @{result.entry_price}",
-                            ref_id=str(oid))
-        return {"result": "pending", "order_id": oid, "reasons": []}
+        return self._evaluate_and_execute_open(intent, iid, ctx)
 
     def _evaluate_and_execute_open(self, intent: TradeIntent, iid: int,
                                    ctx: GateContext) -> dict:
@@ -461,6 +392,8 @@ class Executor:
             expires_at=(now + timedelta(hours=intent.expires_in_h)).isoformat()
             if intent.expires_in_h else None)
         row = orders.get(self.conn, oid)
+        # レビュー修正 (codex 2): タイムアウト等の broker 例外は「結果不明」
+        # として扱う (設計書 §12)。Phase 3 の MT5 実装で必ず起きる経路。
         try:
             br = self.broker.submit(row, entry_price=result.entry_price)
         except Exception as e:  # noqa: BLE001
