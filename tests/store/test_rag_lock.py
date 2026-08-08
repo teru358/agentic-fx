@@ -5,6 +5,7 @@ import hashlib
 import re
 import threading
 import time
+from types import SimpleNamespace
 from datetime import datetime, timezone
 
 import pytest
@@ -265,8 +266,10 @@ def test_lock_timeout_waits_and_succeeds_when_released_in_time(tmp_path):
     `about_to_call.set()` してから実際に `acquire` へ入るまでの間に holder が
     解放し切ってしまう経路が残っており、CI 負荷下では `timeout=0` 変異が
     false-green になりうる (0.4 秒の遅延注入で実測された)。**契約を pin して
-    いるのは `test_locked_passes_the_configured_timeout_to_acquire` と
-    `test_locked_actually_waits_for_the_configured_duration` の 2 本**で、
+    いるのは `test_locked_passes_the_configured_timeout_to_acquire` (引数)、
+    `test_locked_actually_waits_for_the_configured_duration` (待ち時間)、
+    `test_two_real_operations_contend_on_the_lock_that_guards_the_body`
+    (観測している lock が実際に body を守っていること) の 3 本**で、
     こちらは「解放されれば待って成功する」という挙動の説明として残す。
     """
     rag = Rag(tmp_path / "rag", embedding_function=_FakeEmbedding(),
@@ -323,10 +326,21 @@ class _SpyLock:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.timeouts: list[float] = []
+        # `acquire` 呼び出しの**内側**で計った経過時間 (レビュー 3 周目 codex)。
+        # 外側 (public method の呼び出しを跨いだ計測) では、`started` 取得後
+        # acquire 進入前の deschedule が経過を**水増し**するため、下限
+        # assert (`elapsed >= 0.4`) が `timeout=0` 変異を false-green に
+        # してしまう (0.45 秒の遅延注入で実測された)。acquire の直前・直後で
+        # 計れば水増し経路が構造的に無くなる。
+        self.waits: list[float] = []
 
     def acquire(self, blocking: bool = True, timeout: float = -1):
         self.timeouts.append(timeout)
-        return self._lock.acquire(blocking, timeout)
+        started = time.monotonic()
+        try:
+            return self._lock.acquire(blocking, timeout)
+        finally:
+            self.waits.append(time.monotonic() - started)
 
     def release(self) -> None:
         self._lock.release()
@@ -361,20 +375,24 @@ def test_locked_passes_the_configured_timeout_to_acquire(tmp_path, configured):
 def test_locked_actually_waits_for_the_configured_duration(tmp_path):
     """`timeout` が **実際の待ち時間**として使われることの pin。
 
-    holder は**一度も解放しない**ので、経過時間は「待った時間」の下限に
-    なる — スケジューリング遅延は経過時間を**伸ばす方向にしか働かない**
-    ため、`timeout=0` 変異 (経過 ≈ 0) は**負荷に関係なく必ず red** になる。
-    codex 2 周目が指摘した「時間ベースのハンドシェイクは race で
-    false-green になる」問題を、解放しないことで構造的に回避している。
+    **計測は `_SpyLock.acquire` の内側で行う** (レビュー 3 周目 codex)。
+    指揮者の前版は public method 呼び出しの外側で `time.monotonic()` を
+    取っており、「`started` の後・acquire 進入の前」に main が deschedule
+    されると経過が**水増し**されて `timeout=0` 変異が green になった
+    (0.45 秒の遅延注入で実測)。「遅延は経過を伸ばす方向にしか働かない」と
+    いう前版の docstring の主張は**下限 assert に対しては逆に危険**だった。
+    acquire の直前・直後で計れば、水増しの経路そのものが無くなる。
     """
     rag = Rag(tmp_path / "rag", embedding_function=_FakeEmbedding(),
               lock_timeout_sec=0.5)
+    spy = _SpyLock()
+    rag._lock = spy
 
     holding = threading.Event()
     release = threading.Event()
 
     def hold_forever():
-        with rag._lock:
+        with spy:                      # 生 lock を保持 (記録を汚さない)
             holding.set()
             release.wait(10.0)
 
@@ -382,12 +400,86 @@ def test_locked_actually_waits_for_the_configured_duration(tmp_path):
     th.start()
     try:
         assert holding.wait(timeout=5.0), "holder が lock を取得できなかった"
-        started = time.monotonic()
         with pytest.raises(RagUnavailable):
             rag.count_news()
-        elapsed = time.monotonic() - started
-        # 0.5 秒待ってから諦めたはず。`timeout=0` なら ~0 秒で返る。
-        assert elapsed >= 0.4, f"待っていない (elapsed={elapsed:.3f}s)"
+        assert spy.timeouts == [0.5]
+        # acquire の内側で 0.5 秒待ってから諦めたはず。`timeout=0` なら ~0。
+        assert spy.waits[0] >= 0.4, f"待っていない (waits={spy.waits})"
     finally:
         release.set()
         th.join(timeout=5.0)
+
+
+def test_two_real_operations_contend_on_the_lock_that_guards_the_body(tmp_path):
+    """**観測している acquire が、実際に critical section を守っている
+    acquire であること**の pin (レビュー 3 周目 codex Important 1)。
+
+    これまでの pin はすべて「`rag._lock` を直接保持する holder」と
+    「1 本の public operation」の競合を見ていた。そのため codex が実測した
+    **おとり変異** — `self._lock` を configured timeout で取って即座に解放し
+    (spy はこれを正しく観測する)、実際の相互排他は別の `_body_lock` を
+    `timeout=0` で取って行う — が **全 1533 テストを生存**した。
+    「値は存在し、配線され、**観測もされる**が、実運用の競合には
+    load-bearing でない」という第 3 形態である。
+
+    そこで **2 本の実 operation 同士**を競合させる。1 本目は critical
+    section の内側 (`_count_news_unlocked` が呼ぶ `self._news.count`) で
+    ブロックし続けるため、lock がどれであれ確実に保持される。
+
+    **順序は spy で決定論的に固定する**: 2 本目が `_locked()` に入った
+    こと (= spy が 2 回目の acquire を記録したこと) を確認してから 1 本目を
+    解放する。おとり変異ではこの時点で 2 本目は既に `_body_lock` の
+    try-lock に失敗しているため `RagUnavailable` になり red。
+    正しい実装では 2 本目は待機中で、解放後に成功する。
+    """
+    rag = Rag(tmp_path / "rag", embedding_function=_FakeEmbedding(),
+              lock_timeout_sec=5.0)
+    spy = _SpyLock()
+    rag._lock = spy
+
+    inside = threading.Event()
+    release = threading.Event()
+    real_count = rag._news.count
+
+    def blocking_count():
+        inside.set()
+        release.wait(10.0)
+        return real_count()
+
+    rag._news = SimpleNamespace(count=blocking_count)
+
+    out: dict = {}
+
+    def op_first():
+        try:
+            rag.count_news()
+        except Exception as e:          # noqa: BLE001
+            out["first_exc"] = e
+
+    def op_second():
+        try:
+            out["second"] = rag.count_news()
+        except Exception as e:          # noqa: BLE001
+            out["second_exc"] = e
+
+    t1 = threading.Thread(target=op_first, daemon=True)
+    t2 = threading.Thread(target=op_second, daemon=True)
+    t1.start()
+    try:
+        assert inside.wait(timeout=5.0), "1 本目が critical section に入らない"
+        t2.start()
+        # 2 本目が `_locked()` に入る (spy が 2 件目を記録する) まで待つ。
+        deadline = time.monotonic() + 5.0
+        while len(spy.timeouts) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert len(spy.timeouts) == 2, f"2 本目が _locked() に入らない: {spy.timeouts}"
+    finally:
+        release.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+    assert "first_exc" not in out, f"1 本目が失敗した: {out.get('first_exc')}"
+    assert "second_exc" not in out, (
+        "2 本目が待たずに失敗した — 観測している acquire が実際の "
+        f"critical section を守っていない: {out.get('second_exc')}")
+    assert out["second"] == 0
