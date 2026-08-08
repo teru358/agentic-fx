@@ -4895,7 +4895,7 @@ EOF
 **Files:**
 - Modify: `src/agentic_fx/store/missions.py` (`finish` を CAS 化、`recover_interrupted` 新設)
 - Create: `src/agentic_fx/store/instance_lock.py` (FC-2 対応 — 単一インスタンス保証)
-- Modify: `src/agentic_fx/service.py:262-266`(起動シーケンスに `recover_interrupted` 追加。FC-2: その**前**にプロセス排他 flock を取得)、`App` dataclass (`instance_lock` フィールド追加)、`return App(...)` (`instance_lock=instance_lock` 追加)
+- Modify: `src/agentic_fx/service.py:462-466`(**2026-08-08 指揮者が実測して訂正 — 旧稿の `262-266` は約 200 行のドリフトで、無関係な docstring の途中を指していた**。実際の配線先は「起動時 reclaim 1 回」のコメントと `signals.reclaim_expired(conn_core, ...)` の箇所) に起動シーケンスの `recover_interrupted` を追加。FC-2: その**前**にプロセス排他 flock を取得、`App` dataclass (`instance_lock` フィールド追加)、`return App(...)` (`instance_lock=instance_lock` 追加)
 - Test: `tests/store/test_missions_cas.py` (新規), `tests/store/test_instance_lock.py` (新規)
 
 **Interfaces:**
@@ -4904,6 +4904,13 @@ EOF
   - `missions.recover_interrupted(conn, *, now: datetime, max_requeue: int) -> dict` — `status='running'` の missions 行を全件 `'interrupted'` へ終端し、それらを claim していた `claimed` signals を**同一トランザクション**で requeue (上限超過は abandoned) する。戻り値 `{"missions_recovered": int, "signals_requeued": int, "signals_abandoned": int}`。**`'interrupted'` は DB 回収専用の状態値であり `MissionResult.status` の 4 値契約 (`runners/base.py:40`) には現れない** (codex M-1 — `missions` テーブルの `status` 列に CHECK 制約は無いためスキーマ変更不要)
   - `instance_lock.InstanceAlreadyRunning(Exception)` (FC-2 対応、裁定書) — 別プロセスが同じ DB ディレクトリの instance lock を既に保持している場合の単一表現
   - `instance_lock.acquire_instance_lock(db_dir: Path) -> IO` — `db_dir` (`root / "data"`) 直下の lock file に対する `fcntl.flock(LOCK_EX | LOCK_NB)`。取得できなければ `InstanceAlreadyRunning` を送出する (fail closed — 起動を中止する)。戻り値のファイルオブジェクトは **App の全寿命にわたって保持**すること (close/GC されると lock が解放される)。`recover_interrupted` は「稼働中の全 `running` mission」を無条件に対象とするため、二重起動があると先発の稼働中 Mission を後発が誤って `interrupted` 終端し claim 済み signal を横取りしかねない — この排他はそれを防ぐ (裁定書 FC-2)。**解放は Task 19 の `App.close()` で配線する** (本 task では `App` に `instance_lock` フィールドを追加して保持するところまでに留め、Task 19 本文は編集しない)
+
+**2026-08-08 指揮者の着手前照合 (実測。実装者は再確認不要)**:
+
+- `missions.finish` の呼び出し元は **5 箇所** — `loops/trade_loop.py:114,129,282` / `loops/reflection_cycle.py:106` / `backtest/runner.py:244`。**いずれも戻り値を使っていない**ので、`None` → `bool` への変更で既存呼び出し元は無変更で動く (プランの想定どおり)
+- `App` dataclass は `service.py:184-207` (20 フィールド)。`instance_lock` は末尾に追加してよい
+- 起動シーケンスの実際の並び: `Scheduler(...)` 構築 → **「起動時 reclaim 1 回」コメント + `signals.reclaim_expired(...)`** (462-466) → `Commands` 構築 → `return App(...)` (474-)
+- ベースライン: `uv run pytest -q` = **1556 passed, 1 deselected**
 
 - [ ] **Step 1: 失敗するテストを書く (`finish` の CAS 化)**
 
