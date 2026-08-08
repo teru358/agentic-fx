@@ -3109,9 +3109,25 @@ Expected: 全件 PASS (mission_worker.py は他モジュールから import さ�
 5. (I2) `_RagRpcProxy._call` の `if response.get("type") != "tool_rpc_result":` チェックを削除 → `test_rag_rpc_proxy_rejects_wrong_frame_type` が red。`self._in_seq.check(response.get("seq"))` 行を削除 → `test_rag_rpc_proxy_rejects_seq_gap` が red
 6. (I2) `main()` の `handshake.get("type") != "handshake"` チェックを削除 → `test_main_rejects_handshake_with_wrong_type` が red。**別途** `in_seq.check(handshake.get("seq"))` 行を削除 → `test_main_rejects_handshake_with_wrong_seq` が red
    - **2026-08-08 指揮者の着手前照合による訂正**: 旧稿は「`in_seq.check(...)` 削除 → `test_main_rejects_handshake_with_wrong_type` が red」と書いていたが**これは誤り**。同テストの入力は `type="event"` であり、`main()` は type を先に検証して `ProtocolError` を送出するため **seq 検証行には到達しない** — 削除しても green のままになる。結果として handshake の seq 検証が**無防備のまま出荷される** (Task 2 の `--noconftest` と同型の穴)。Step 5 に `test_main_rejects_handshake_with_wrong_seq` を追加してこの行を単独で pin した
-9. (親→子 seq 連続性) `_RagRpcProxy` に渡す `in_seq` を `main()` 共有のものから新規 `SeqTracker()` に差し替える → `test_rag_rpc_proxy_in_seq_continues_after_handshake` が red (handshake 消費後の期待値 2 が 1 に戻る)
 7. (I4/R2-CX-01) `_build_clock()` の戻り値を `SystemClock()` から `FixedClock(SystemClock().now())` (handshake 相当で 1 回だけ固定) に改変 → `test_build_clock_default_rejects_stale_signal_as_wall_clock_advances` が red になる (2 回目の `get_signals` 呼び出しでも基準時刻が進まず `out_45min_later` が `{"h1"}` のままで `== []` の assert に失敗する)
 8. (I6) `_make_on_message` 内の `try/except` を削除し `os._exit(1)` 呼び出しごと外す → `test_on_message_exits_process_on_write_failure` が red (`exit_calls` が空のまま、または `BrokenPipeError` が素通しで送出されテストがエラー終了する — いずれにせよ green にならない)
+9. (親→子 seq 連続性) `_RagRpcProxy` に渡す `in_seq` を `main()` 共有のものから新規 `SeqTracker()` に差し替える → `test_rag_rpc_proxy_in_seq_continues_after_handshake` が red (handshake 消費後の期待値 2 が 1 に戻る)
+
+**Step 11 の実測による修正 (2026-08-08 指揮者。実測記録は worktree の `TASK7_MUTATION_REPORT.md`)**:
+
+プラン記載 9 件 + 自主追加 17 件を実測したところ、**16 件が生存**した。根本原因は 1 つ — **`main()` の bootstrap 本体に一切テストが無い**。Step 5 のテスト 12 本は `_RagRpcProxy`/`_make_on_message`/`_set_pdeathsig`/`_build_clock` の**単体**と、`main()` の**外側 `except` に落ちる 2 経路**しか通らない。
+
+- **プラン記載の変異 4・6a は無効だった** (どちらも生存):
+  - 変異 4 (と着手前に追加した変異 9) は `main()` の call site を変異させるが、対応テストは `_RagRpcProxy` を直接構築するため red にならない。**単体テストは契約を pin するが配線を pin しない**
+  - 変異 6a (handshake type チェック削除) も生存。削除しても後続の `handshake["expected_parent_pid"]` が `KeyError` を投げ、外側 `except` が同じ `ready: ok=False` を返すため。テストがエラー**内容**を検証していなかった
+- **変異 2 (ppid 照合) を「Task 7 単体では観測不能」と本文に書いたのは誤り**。`expected_parent_pid` を `os.getppid()+1` にして `main()` を駆動すれば「何も送らずに終了する」ことで pin できる
+- 特に重大な生存: **`runner.trade.backend != "local"` の fail closed (Global Constraints の強制点) が無防備**。CR-3 (`out_seq` 共有)・CR-4 (`readonly=True`)・§12 申し送り② (rlimit 適用) の回帰も同様に無防備だった
+
+**対応**: `tests/test_mission_worker_protocol.py` に **12 本を追加**し、既存 `test_main_rejects_handshake_with_wrong_type` に `assert "handshake" in sent["error"]` を追加した。追加テスト: `test_main_happy_path_emits_ready_event_result_in_one_seq_sequence` / `test_main_shares_out_seq_and_in_seq_with_rag_rpc_proxy` / `test_main_builds_registry_readonly_and_applies_resource_limits` / `test_main_reports_result_failed_when_runner_raises` / `test_main_exits_without_ready_when_reparented` / `test_main_rejects_unsupported_worker_profile` / `test_main_fails_closed_when_runner_backend_is_claude` / `test_set_resource_limits_sets_all_four_limits` / `test_seq_tracker_rejects_bool_as_seq` / `test_rag_rpc_proxy_rejects_rpc_id_mismatch` / `test_rag_rpc_proxy_raises_when_parent_closes_pipe` / `test_rag_rpc_proxy_advances_out_seq_across_successive_calls`。**生存 16 件 → 2 件**。
+
+**残存 2 件は accepted-unpinned** (意図的に次 task へ送る): 追加C (`write_frame` の `flush()` 削除) と 追加O (`_protect_protocol_stdout` の `dup2` 削除)。どちらも**実プロセスでしか症状が出ない** (インプロセステストは `_protect_protocol_stdout` 自体を monkeypatch している)。**Task 10 の実 spawn 統合テスト / Task 20 の E2E で拾う**。
+
+**後続 task への一般化**: `main()` 相当の「配線を組み立てる関数」は、構成要素の単体テストが全部緑でも無防備になる。Task 10 (`WorkerRunner`)・Task 13 (`MissionSupervisor`)・Task 19 (`build_app`/`App.close`) では、**単体テストとは別に「配線そのものを駆動して観測点を assert するテスト」を必ず 1 本以上置くこと**。
 
 - [ ] **Step 12: Commit**
 
