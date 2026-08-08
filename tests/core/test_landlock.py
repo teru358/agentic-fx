@@ -79,7 +79,13 @@ class _ScriptedLibc:
         def syscall(*args):
             n = args[0]
             self.syscall_numbers.append(getattr(n, "value", n))
-            return self._results.pop(0) if self._results else 0
+            if not self._results:
+                # sonnet 副査 (1 周目): 台本切れで 0 (成功) を返すのは
+                # fail-open。想定外の syscall が増えたときに黙って通す
+                # harness になるため、明示的に落とす。
+                raise AssertionError(
+                    f"_ScriptedLibc: 台本にない syscall 呼び出し ({n})")
+            return self._results.pop(0)
 
         def prctl(*args):
             self.prctl_args.append(args)
@@ -136,6 +142,38 @@ def test_restrict_to_raises_when_create_ruleset_fails(monkeypatch, tmp_path):
     with pytest.raises(LandlockUnavailable, match="landlock_create_ruleset"):
         restrict_to(read_only_paths=[tmp_path], read_write_paths=[])
     assert libc.syscall_numbers == [444, 444]   # add_rule へ進んでいない
+
+
+def test_is_available_false_when_abi_below_required(monkeypatch):
+    """ABI 1/2 のカーネルでは `TRUNCATE` を強制できないので fail closed。
+
+    「Landlock が使えるかどうか」ではなく「**本モジュールの要求水準で**
+    使えるか」を返す (レビュー 1 周目 codex)。ABI >= 1 で True にすると、
+    完全性を守れないカーネルで improve worker が起動してしまう。
+    """
+    _install(monkeypatch, _ScriptedLibc(syscall_results=[2]))
+    assert is_available() is False
+    _install(monkeypatch, _ScriptedLibc(syscall_results=[3]))
+    assert is_available() is True
+
+
+def test_ruleset_declares_truncate_in_handled_access(monkeypatch, tmp_path):
+    """`handled_access_fs` に `TRUNCATE` が入っていることを直接 pin する。
+
+    実カーネルでの検証 (統合テストの (5)) と二層で守る — 実 Landlock
+    テストが何らかの理由で skip された環境でも、この宣言漏れは検出される。
+    """
+    import agentic_fx.core.landlock as landlock_mod
+
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[])
+    assert landlock_mod._HANDLED_ACCESS_FS & landlock_mod._ACCESS_FS_TRUNCATE
+    # rw だけが TRUNCATE を許可され、ro は許可されない。
+    assert landlock_mod._READ_WRITE_ACCESS & landlock_mod._ACCESS_FS_TRUNCATE
+    assert not (landlock_mod._READ_ONLY_ACCESS
+                & landlock_mod._ACCESS_FS_TRUNCATE)
 
 
 def test_restrict_to_raises_when_add_rule_fails(monkeypatch, tmp_path):
@@ -204,6 +242,7 @@ def test_restrict_to_issues_syscalls_in_required_order(monkeypatch, tmp_path):
 
 
 _REAL_LANDLOCK_SCRIPT = textwrap.dedent("""
+    import os
     import sys
     from pathlib import Path
     from agentic_fx.core.landlock import restrict_to
@@ -271,6 +310,75 @@ _REAL_LANDLOCK_SCRIPT = textwrap.dedent("""
     except PermissionError:
         pass
 
+    # --- レビュー 1 周目 (codex Critical + sonnet Critical) の回帰ピン -------
+    # (5) read_only / allowlist 外のファイルを **truncate で破壊できない**。
+    #     `TRUNCATE` (ABI v3) を handled_access_fs に宣言していないと、
+    #     Landlock は truncate を**判定対象外として素通し**する。実測では
+    #     allowlist に一切列挙していない絶対パスのファイルまで 0 バイトに
+    #     破壊できた (通常の write は拒否されるので気づきにくい)。
+    try:
+        os.truncate(ro_dir / "x.txt", 0)
+        print("FAIL: truncate succeeded on a read-only path")
+        sys.exit(1)
+    except PermissionError:
+        pass
+    try:
+        os.truncate(blocked_dir / "victim.txt", 0)
+        print("FAIL: truncate succeeded on an unlisted path")
+        sys.exit(1)
+    except PermissionError:
+        pass
+
+    # (6) read_write パスは truncate **できる** (handled に入れた以上、rw に
+    #     明示付与しないと `open(..., "w")` = O_TRUNC が壊れる)。
+    try:
+        os.truncate(rw_dir / "existing.txt", 0)
+    except PermissionError:
+        print("FAIL: truncate was denied on a read-write path")
+        sys.exit(1)
+
+    # (7) READ_FILE の positive control (codex Important)。旧稿は
+    #     `iterdir()` しか試しておらず、これは `READ_DIR` の検査であって
+    #     `READ_FILE` の検査ではない。両マスクから READ_FILE を削っても
+    #     red にならなかった。
+    if (ro_dir / "x.txt").read_text() != "ok":
+        print("FAIL: read-only file content mismatch")
+        sys.exit(1)
+    if (rw_dir / "new.txt").read_text() != "x":
+        print("FAIL: read-write file content mismatch")
+        sys.exit(1)
+
+    # (7b) `WRITE_FILE` を `TRUNCATE` から**分離して** pin する。
+    #      `Path.write_text()` は `O_TRUNC` を使うため、`TRUNCATE` を
+    #      handled に入れた後は TRUNCATE 側で先に拒否され、
+    #      **`_READ_ONLY_ACCESS` に WRITE_FILE を足す変異が隠蔽されて
+    #      生存する** (レビュー 1 周目の修正直後に指揮者が実測した回帰)。
+    #      `open(..., "r+")` = `O_RDWR` は O_TRUNC を伴わないので、
+    #      WRITE_FILE だけを直接触れる。
+    try:
+        with open(ro_dir / "x.txt", "r+") as f:
+            f.write("Z")
+        print("FAIL: O_RDWR write succeeded on a read-only path")
+        sys.exit(1)
+    except PermissionError:
+        pass
+    try:
+        with open(rw_dir / "existing.txt", "r+") as f:
+            f.write("Z")
+    except PermissionError:
+        print("FAIL: O_RDWR write was denied on a read-write path")
+        sys.exit(1)
+
+    # (8) read_write は「専用 workdir」なのでディレクトリを作れる/消せる
+    #     (codex Important — MAKE_DIR/REMOVE_DIR が無い領域は workdir として
+    #     使えない)。read_only では作れない。
+    try:
+        (rw_dir / "sub").mkdir()
+        (rw_dir / "sub").rmdir()
+    except PermissionError:
+        print("FAIL: mkdir/rmdir denied on a read-write path")
+        sys.exit(1)
+
     print("OK")
     sys.exit(0)
 """)
@@ -296,6 +404,7 @@ def test_real_landlock_enforces_read_only_read_write_and_blocked(tmp_path):
     (rw / "existing.txt").write_text("before")
     blocked = tmp_path / "blocked"
     blocked.mkdir()
+    (blocked / "victim.txt").write_text("destroy me")
 
     result = subprocess.run(
         [sys.executable, "-c", _REAL_LANDLOCK_SCRIPT,
