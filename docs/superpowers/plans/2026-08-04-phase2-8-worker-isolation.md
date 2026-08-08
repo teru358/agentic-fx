@@ -7376,14 +7376,34 @@ EOF
 
 **設計上の注記 (writing-plans — Phase 1 の fail-closed 修正との関係)**: Phase 1 レジャーの「W1 (finish 失敗の fail-closed 化)」は「`missions.finish` が失敗しても completed 結果のまま intent 変換・execute へ進んでしまう」という**無警告の**バグを修正したものだった。本 task の設計書 §3.1 は `missions.finish(CAS)` を commit-core の**末尾** (paper broker 執行の後) に置く — 一見 W1 と逆行するように見えるが、以下 2 点により安全性は後退しない: ①`orders.insert`/`trade_intents` への記録は `missions.finish` と独立した書込みであり、finalize が失敗しても発注自体の監査証跡 (どの注文がどう約定したか) は失われない ②finalize 書込み自体が例外を出せば `_finalize_mission` が `mission_finalize_failed` を activity に**可視化して記録**し (W1 が塞いだ「無警告」の再発は無い)、mission 行は `running` のまま残るが次回起動時の `recover_interrupted` (Task 11) が `interrupted` へ確実に回収する。W1 が防いだのは「無警告のまま実行し続ける」ことであり、本 task はそれを維持したまま commit-core の末尾に finalize を置く設計書の順序をそのまま採用する。
 
+**(Task 14 レビュー 1 周からの申し送り — 本 task で必ず回収すること) `notifier.send` は commit-core から到達可能なブロッキング・ネットワーク I/O である。**
+
+`Notifier.send` (`core/notifier.py:16-26`) は `enabled` 時に **`urllib.request.urlopen(req, timeout=10)` を同期実行**する。Task 14 が commit-core 専用に新設した経路から、以下 3 箇所に到達できる (2026-08-09 指揮者が現物で確認):
+
+| `executor.py` の行 | 経路 | 発火条件 |
+|---|---|---|
+| `_evaluate_and_execute_open` 内 | `open_from_snapshot` → 委譲 | `broker.submit` が例外/unknown |
+| `_close_unknown` 内 | `close_order_from_snapshot` → 委譲 | `broker.close` が例外/非 ok |
+| `_finish_close` の degraded 分岐 | `close_order_from_snapshot` → 委譲 | commit-pre で換算レート取得に失敗し `rate_degraded=True` |
+
+**つまり Task 14 の「commit-core で外部 I/O ゼロ」は happy-path でのみ成立しており、障害時 (broker 例外・レート取得失敗) には最大 10 秒 × 呼び出し回数だけ `core_lock` を保持したままブロックしうる。** これは本プランの核心 (Mission 実行中も SL/TP 監視を止めない) を、よりによって**障害時に**裏切る。
+
+Task 14 で直さなかった理由: `_finish_close`/`_close_unknown`/`_evaluate_and_execute_open` は `close_order`/`_open` (scheduler・バックテストが使う既存経路) と**共有**されており、ここを触ると Task 14 の絶対条件「既存経路の挙動は完全不変」に反するため。**commit-post 相を持つ本 task が正しい回収先である。**
+
+回収方法 (本 task で実装すること): **commit-core 中の通知は送らずにキューへ積み、commit-post 相 (lock 解放後) でまとめて送る。** `Executor` に `notifier` を直接持たせるのをやめ、commit-core では「送るべき通知」をリストに溜めて返し、呼び出し元 (五相の commit-post) が送る形にする。既存経路 (`close_order` 等) は従来どおり即時送信でよい (scheduler tick は元から tick 全体で lock を持つ設計)。
+
+**pin の張り方**: `Notifier(enabled=True)` かつ webhook URL をローカルの遅い stub に向けた Executor を作り、**commit-core 相の実行中に `notifier.send` が 1 度も呼ばれないこと**を記録型スタブで確認する。Task 14 のテストは `Notifier(enabled=False, ...)` 固定だったためこの経路を一度も踏んでいない (レビューで判明)。
+
 **Files:**
-- Modify: `src/agentic_fx/core/executor.py` (`handle_intent` を `record_and_validate_intent` + dispatch に分割、`_close`→`close_intent`/`_cancel`→`cancel_intent` の公開昇格)
+- Modify: `src/agentic_fx/core/executor.py` (`handle_intent` を `record_and_validate_intent` + dispatch に分割、`_close`→`close_intent`/`_cancel`→`cancel_intent` の公開昇格。**追加 (Task 14 申し送り): commit-core 経路の通知を commit-post へ遅延させる**)
 - Modify: `src/agentic_fx/loops/trade_loop.py` (全体 — 五相再構成)
 - Modify: `src/agentic_fx/service.py:359-380`(`_trade_fn`/`_ask_fn` の `with core_lock:` 除去 + `TradeLoop` construction に `core_lock`/`conn_supervisor` を渡す。**追加 (裁定書 F-6 / CR-5): `healthcheck_provider = PriceProvider(conn_supervisor, settings, clock, readonly=True)` を新設し `TradeLoop(provider=healthcheck_provider, ...)` に渡す**)
 - Modify: `src/agentic_fx/config.py` (`WorkerSettings` に `snapshot_max_age_sec` 追加)
 - Modify: `config/settings.yaml.example` (同期)
 - Modify: `tests/loops/test_trade_loop.py:31-69` (`_loop` fixture に `core_lock`/`conn_supervisor` 追加)
-- Test: `tests/loops/test_trade_loop_phases.py` (新規 — lock 境界の直接検証)
+- Test: `tests/loops/test_trade_loop_phases.py` (新規 — lock 境界の直接検証。**追加 (Task 14 申し送り): commit-core 中に `notifier.send` が呼ばれないことの pin**)
+
+**(Task 14 レビュー 1 周からの申し送り — 本 task で併せて回収)** `close_from_snapshot` の拒否 3 分岐 (not-open / snapshot None / stale) は `set_gate_result` のみで **`activity.write` を書かない**。`open_from_snapshot` の拒否分岐がすべて `gate_rejected` を activity に記録するのと非対称である。既存 `_close` も同じ非対称を持つため Task 14 では**プラン記述通りに据え置いた** (直すと既存経路に波及するため)。本 task で `close_intent` 公開昇格を行う際に、**両経路の拒否分岐すべてに `activity.write(Category.TRADE, "gate_rejected", ...)` を入れて対称化すること。** 運用時に「なぜ LLM の close 指示が実行されなかったか」を activity ログだけで追えるようにする。
 
 **Interfaces:**
 - Produces:
