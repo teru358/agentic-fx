@@ -3981,6 +3981,23 @@ Expected: 全件 PASS。
 3. **(波及の pin) `tests/store/test_rag_lock.py` に以下のテストを追加すること**: `Rag` の lock を保持したまま `Scheduler.tick()` を回し (既存 `tests/core/test_scheduler*.py` の fixture を流用)、**`RagUnavailable` が tick を貫通せず、`_process_exits` (資金保護) まで到達すること**を確認する。そのうえで `scheduler._run_data_hook` の `try/except` を外す変異を注入 → このテストが red になることを確認する
    - **狙い**: 「`RagUnavailable` は fail soft で受けられる」という Interfaces 節の主張を、宣言ではなく**実行で固定**する。単体の lock timeout テストはこの性質を守らない
 
+**レビュー 1 周目の反映 (2026-08-08。codex 主査 I3/M1 + sonnet 副査 I3/M1。両者が独立に同じ 2 件の生存変異を実測)**:
+
+1. **[両者一致・実測] `_locked()` を `acquire(timeout=0)` (try-lock 化) する変異が全 13 本を素通りして生存**していた。既存テストは「deadline より長く保持すれば `RagUnavailable`」しか見ておらず、**timeout が「実際の待ち」であることの正方向の契約が無かった**。単一 lock で全操作を直列化する設計では**短い競合は正常系**なので、0 秒化は可用性を実質的に変える → `test_lock_timeout_waits_and_succeeds_when_released_in_time` を追加
+   - **指揮者の 1 回目の修正は race で素通りした** — 「holder が 0.05 秒保持 → main が呼ぶ」順序だと main が呼ぶ前に holder が解放してしまう。**決定論的なハンドシェイク** (holder が `holding` → main が `about_to_call` を立ててから呼ぶ → holder はそれを待ってから保持し続けて解放) に組み直して初めて red になった
+2. **[両者一致・実測] `service.py` の `lock_timeout_sec=15.0` 直書き変異が生存**していた。配線テストが**既定値 (15.0) と一致することしか見ていなかった**ため、「設定を読まない」変異を検出できなかった → 設定 YAML に**既定値とも `Rag` 既定 (10.0) とも異なる 0.37** を書いてから `build_app` する形に変更
+3. **[codex Minor] lock 保持テストが `sleep(0.05)` に依存**し holder の取得完了を同期していなかった (高負荷 CI で flaky になる) → 3 箇所すべて `Event` ハンドシェイクへ
+
+最終: 変異 **16 件で生存 0**。`uv run pytest -q` = **1530 passed, 1 deselected** (ベースライン 1516 + 14)。
+
+**[両者一致 Important — Task 9 では解かず申し送り] `RagUnavailable` の fail-soft 契約が正典・各 task 間で一意になっていない**:
+
+- 設計書 §4.4 は lock timeout を「RAG 一時不可として fail soft (**該当機能 skip + latched health 記録**)」と定めるが、**Task 9 は health 記録を App 層 (Task 19) へ送り、Task 19 の health callback は Task 10 の `queue.Empty` (RPC 呼び出し自体のリーク) だけを記録する**。結果として **`RagUnavailable` が期限内に正常返却されたケースは、どの task でも latch されない**
+- **tool 経路が内部エラー文字列を LLM の transcript に混入させる**: `ToolRegistry.execute` が例外文字列を `{"error": ...}` にし、`LocalRunner._sink` 経由で transcript に入って次 turn へ渡る。文言は `RAG lock not acquired within 0.2s (a caller is holding it — fail soft: skip this operation)` — `safe_error_text` は URL/秘密は落とすが**文言は落とさない**。モデルが一時的な lock 競合を「RAG の恒久故障」と解釈する余地がある。プラン Task 9 本文はこの素通しを「許容」と裁定していたが**検証していなかった**
+- **各経路で記録の質が不揃い**: `news_collector` の `add_news` は**系統的な RAG 障害を単一ソースの失敗として activity に誤帰属**、`cleanup_news` は scheduler の generic system activity、`reflection_cycle` は技術ログのみで activity に出ない
+- **[sonnet Minor] Task 12 が hooks を決定論ブロックの後段へ再編するまでの過渡状態では**、`NewsCollector.collect()` の per-source + cleanup が**それぞれ独立に `lock_timeout_sec` 待つ**ため、RAG が詰まると tick 完了 (= 資金保護 `_process_exits`) が最大 `(ソース数+1) × lock_timeout_sec` 遅延しうる
+- **対応方針 (Task 10 / 12 / 19 とスペック改訂で一意化する)**: ①`RagUnavailable` を予期された一時不可として各境界で明示 catch する ②read tool は**空結果または安定した非内部的な unavailable 表現に正規化**し、raw な lock 所有状況を transcript に入れない ③全経路から共通の App-level health recorder へ到達させ、**`RagUnavailable` の正常返却も RPC leak とは別イベントとして latch** する ④実 `NewsCollector`/`reflection`/2 tool/Task 10 dispatcher の各経路に例外注入テストを置き「skip・後続継続・health 記録・raw error 非露出」を pin する
+
 - [ ] **Step 8: Commit**
 
 ```bash
