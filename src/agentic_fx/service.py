@@ -502,7 +502,16 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    runner=runner, owns_runner=owns_runner, clock=clock,
                    instance_lock=instance_lock)
     except BaseException:
-        instance_lock.close()
+        # 2 周目レビュー (sonnet Minor / KAT-Coder Critical): 素の
+        # `instance_lock.close()` だと close 自身が送出した例外が伝播し、
+        # **元の失敗原因が呼び出し元から見えなくなる** (元の例外は __context__
+        # に退避されるだけで、except 節やエントリの終了コード判定は新しい例外を
+        # 見る)。解放の失敗より原因の伝播を優先する — ロックは fd なので
+        # プロセス終了時に OS が回収する。
+        try:
+            instance_lock.close()
+        except Exception:  # noqa: BLE001 — 元の例外を握り潰さないための抑制
+            pass
         raise
 
 

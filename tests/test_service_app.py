@@ -1190,3 +1190,50 @@ def test_i3_instance_lock_released_on_build_app_exception(tmp_path):
     # (held_exc の traceback が build_app のフレームを保持していても)
     fh = acquire_instance_lock(tmp_path / "data")  # 成功すればテスト合格
     fh.close()
+
+
+def test_i3b_lock_close_failure_does_not_mask_the_original_exception(
+        tmp_path, monkeypatch):
+    """解放処理が失敗しても、**元の失敗原因が呼び出し元に届く**こと。
+
+    2 周目レビュー指摘 (sonnet Minor / KAT-Coder Critical)。
+    `except BaseException: instance_lock.close(); raise` の素の形だと、
+    `close()` 自身が送出した例外が伝播してしまい、呼び出し元は「なぜ起動に
+    失敗したのか」を見失う (元の例外は `__context__` に退避されるだけで、
+    `except ValueError` は成立しなくなる)。ロックは fd なので解放に失敗しても
+    プロセス終了時に OS が回収する — 原因の伝播を優先する。
+    """
+    import agentic_fx.service as svc_mod
+
+    _init(tmp_path)
+
+    real_acquire = svc_mod.acquire_instance_lock
+
+    class _CloseExplodes:
+        """close が必ず失敗する lock ラッパ (解放系の故障を模す)。"""
+
+        def __init__(self, fh):
+            self._fh = fh
+
+        def close(self):
+            raise OSError("simulated close failure (e.g. ENOSPC on flush)")
+
+    holders = []
+
+    def _acquire(db_dir):
+        fh = real_acquire(db_dir)
+        holders.append(fh)          # 実 lock は保持し、test 終了時に解放する
+        return _CloseExplodes(fh)
+
+    monkeypatch.setattr(svc_mod, "acquire_instance_lock", _acquire)
+
+    try:
+        # build_app は provider と quote_fn の併用で ValueError を出す。
+        # close が失敗しても、呼び出し元に届くのは **ValueError** でなければ
+        # ならない (OSError にすり替わったら red)。
+        with pytest.raises(ValueError):
+            build_app(tmp_path, provider=_FakeProvider(),
+                      quote_fn=lambda pair: None)
+    finally:
+        for fh in holders:
+            fh.close()
