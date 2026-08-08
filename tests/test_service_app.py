@@ -1099,3 +1099,94 @@ def test_build_app_provider_seam_passed_to_mission_registry(tmp_path):
     # 渡された provider が registry に反映されていることを確認する
     # (registry の tool が provider インスタンスを束縛しているため)
     assert "get_ohlcv" in app.registry.names(), "get_ohlcv not in registry"
+
+
+# ---- C1: 起動シーケンスの順序が pin されていない (レビュー修正) ----------
+
+def test_c1_startup_order_acquire_lock_before_recover(tmp_path):
+    """acquire_instance_lock と missions.recover_interrupted の呼び出し順を
+    pin する。順序が acquire_lock → recover であることを spy で確認。"""
+    from agentic_fx.store import missions as missions_module
+    import agentic_fx.service as service_module
+
+    _init(tmp_path)
+
+    call_order: list[str] = []
+
+    # 実装の参照を保持
+    real_acquire = service_module.acquire_instance_lock
+    real_recover = missions_module.recover_interrupted
+
+    def spy_acquire(*args, **kwargs):
+        call_order.append("lock")
+        return real_acquire(*args, **kwargs)
+
+    def spy_recover(*args, **kwargs):
+        call_order.append("recover")
+        return real_recover(*args, **kwargs)
+
+    with patch("agentic_fx.service.acquire_instance_lock", side_effect=spy_acquire), \
+         patch("agentic_fx.service.missions.recover_interrupted", side_effect=spy_recover):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                       embedding_fn=FakeEmbedding())
+        app.instance_lock.close()
+
+    assert call_order == ["lock", "recover"], \
+        f"Expected ['lock', 'recover'], got {call_order}"
+
+
+def test_c1_double_startup_preserves_first_mission(tmp_path):
+    """二重起動があると、2 回目の build_app が InstanceAlreadyRunning を raise し、
+    その後で 1 回目の mission がまだ running のままであること。
+    (ロックを後に取る実装ならここが 'interrupted' になって red になる)。"""
+    from agentic_fx.store import missions as missions_module
+    from agentic_fx.store.instance_lock import InstanceAlreadyRunning
+
+    _init(tmp_path)
+
+    # 1 回目の起動
+    app1 = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+
+    # 1 回目で mission を 1 件作成
+    mid = missions_module.start(app1.conn_core, "trade", "local", "qwen",
+                               NOW, trigger="test")
+    assert mid is not None
+
+    # ロックを解放せずに 2 回目の build_app を試みる
+    with pytest.raises(InstanceAlreadyRunning):
+        build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                 embedding_fn=FakeEmbedding())
+
+    # 1 回目の mission がまだ running のままであること
+    row = app1.conn_core.execute(
+        "SELECT status FROM missions WHERE id=?", (mid,)).fetchone()
+    assert row["status"] == "running"
+
+    app1.instance_lock.close()
+
+
+# ---- I3: instance_lock の例外時解放 (レビュー修正) -------------------------
+
+def test_i3_instance_lock_released_on_build_app_exception(tmp_path):
+    """build_app の途中で例外が発生しても、acquire_instance_lock を
+    close して lock を解放すること。例外を変数に束縛して保持したまま、
+    別プロセスが同じ root に対する acquire_instance_lock に成功すること。"""
+    from agentic_fx.store.instance_lock import acquire_instance_lock
+
+    _init(tmp_path)
+
+    # build_app を ValueErrorで失敗させる。例外を変数に束縛して保持
+    held_exc = None
+    try:
+        build_app(tmp_path, provider=_FakeProvider(),
+                 quote_fn=lambda pair: None)  # ValueError で失敗
+    except ValueError as e:
+        held_exc = e  # 例外を保持してトレースバックがメモリに残る
+
+    assert held_exc is not None
+
+    # この時点で lock はリリースされていなければならない
+    # (held_exc の traceback が build_app のフレームを保持していても)
+    fh = acquire_instance_lock(tmp_path / "data")  # 成功すればテスト合格
+    fh.close()
