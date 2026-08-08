@@ -165,7 +165,9 @@ def test_signal_daily_max_and_rollover_reset(tmp_path):
 # ---------------------------------------------------------------------
 # ⑤ on_signal_maintenance が開場中のみ呼ばれ、例外が tick を殺さない (fail-open)
 # ---------------------------------------------------------------------
-def test_on_signal_maintenance_runs_only_when_open_and_fails_open(tmp_path):
+def test_on_signal_maintenance_runs_even_when_closed_and_fails_open(tmp_path):
+    """プラン 8 Task 12: signal_maintenance は市場開閉に関わらず毎 tick 走る
+    ようになった (cross-plan 修正① の対称性)。fail-open は変わらない。"""
     calls = []
 
     def maint(now):
@@ -175,14 +177,15 @@ def test_on_signal_maintenance_runs_only_when_open_and_fails_open(tmp_path):
     env = Env(tmp_path)
     env.sched.on_signal_maintenance = maint
 
-    env.sched.tick(SAT)  # 閉場中は呼ばれない
-    assert calls == []
+    env.sched.tick(SAT)  # 閉場中も呼ばれる (プラン 8 で変更)
+    assert len(calls) == 1
+    assert calls[0] == SAT
 
     oid = env.place_limit(price=148.20, sl=147.80, tp=149.00)
     env.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
                              148.25, 100)
-    env.sched.tick(WED + timedelta(minutes=1))  # 開場中は呼ばれる
-    assert len(calls) == 1
+    env.sched.tick(WED + timedelta(minutes=1))  # 開場中も呼ばれる
+    assert len(calls) == 2
     # 例外が資金保護 (約定処理) を止めていないこと
     assert orders.get(env.conn, oid)["status"] == "open"
     log = (env.tmp_path / "a.log").read_text(encoding="utf-8")

@@ -57,14 +57,14 @@ def _resp(payload: object) -> MagicMock:
 def _cal(tmp_path, now: datetime = NOW) -> EconCalendar:
     conn = connect(tmp_path / "t.db")
     init_db(conn)
-    return EconCalendar(conn, ActivityLog(tmp_path / "a.log"), FixedClock(now))
+    return EconCalendar(conn, ActivityLog(tmp_path / "a.log"), FixedClock(now), timeout_sec=10)
 
 
 # ---- fetch_ff_calendar ---------------------------------------------------
 
 def test_fetch_maps_fields_and_normalizes_utc():
     with patch("httpx.get", return_value=_resp(FF_JSON)):
-        fetched = fetch_ff_calendar()
+        fetched = fetch_ff_calendar(timeout_sec=10)
     events = fetched.events
     assert len(events) == 5
     assert fetched.dropped == 0            # 全件読めたことも戻り値に載る
@@ -83,7 +83,7 @@ def test_fetch_maps_fields_and_normalizes_utc():
 def test_fetch_empty_strings_become_none():
     """実測では空欄は "" (null ではない)。DB には NULL として入れる。"""
     with patch("httpx.get", return_value=_resp(FF_JSON)):
-        fetched = fetch_ff_calendar()
+        fetched = fetch_ff_calendar(timeout_sec=10)
     events = fetched.events
     assert events[1]["forecast"] is None      # "" → None
     assert events[1]["previous"] == "0.2%"    # 値はそのまま
@@ -95,7 +95,7 @@ def test_fetch_non_string_forecast_becomes_none():
                 "date": "2026-07-22T15:30:00-04:00", "impact": "High",
                 "forecast": ["3.1%"], "previous": 3.0}]
     with patch("httpx.get", return_value=_resp(payload)):
-        events = fetch_ff_calendar().events
+        events = fetch_ff_calendar(timeout_sec=10).events
     assert events[0]["forecast"] is None
     assert events[0]["previous"] is None
 
@@ -111,7 +111,7 @@ def test_fetch_drops_naive_datetime_and_warns(caplog):
                 "forecast": "", "previous": ""}, *FF_JSON]
     with caplog.at_level(logging.WARNING, logger="agentic_fx.econ"), \
          patch("httpx.get", return_value=_resp(payload)):
-        fetched = fetch_ff_calendar()
+        fetched = fetch_ff_calendar(timeout_sec=10)
     events = fetched.events
     assert len(events) == 5                       # 残り 5 件は生きている
     assert fetched.dropped == 1                   # 捨てた件数を呼び出し側へ
@@ -131,7 +131,7 @@ def test_fetch_skips_broken_entry_and_keeps_the_rest(caplog):
                *FF_JSON]
     with caplog.at_level(logging.WARNING, logger="agentic_fx.econ"), \
          patch("httpx.get", return_value=_resp(payload)):
-        fetched = fetch_ff_calendar()
+        fetched = fetch_ff_calendar(timeout_sec=10)
     events = fetched.events
     assert len(events) == 5
     assert fetched.dropped == 4
@@ -147,7 +147,7 @@ def test_fetch_unknown_impact_is_zero_and_warns(caplog):
                 "forecast": "", "previous": ""}]
     with caplog.at_level(logging.WARNING, logger="agentic_fx.econ"), \
          patch("httpx.get", return_value=_resp(payload)):
-        fetched = fetch_ff_calendar()
+        fetched = fetch_ff_calendar(timeout_sec=10)
     events = fetched.events
     assert len(events) == 1
     assert events[0]["importance"] == 0
@@ -169,7 +169,7 @@ def test_fetch_unhashable_impact_does_not_kill_the_week():
                 "forecast": "", "previous": ""},
                *FF_JSON]
     with patch("httpx.get", return_value=_resp(payload)):
-        fetched = fetch_ff_calendar()          # 例外を貫通させない
+        fetched = fetch_ff_calendar(timeout_sec=10)          # 例外を貫通させない
     assert len(fetched.events) == 5            # 健全な 5 件は生きている
     assert fetched.dropped == 2
 
@@ -182,7 +182,7 @@ def test_fetch_rejects_non_list_payload():
     """
     with patch("httpx.get", return_value=_resp({"error": "nope"})):
         with pytest.raises(ValueError):
-            fetch_ff_calendar()
+            fetch_ff_calendar(timeout_sec=10)
 
 
 # ---- EconCalendar.refresh ------------------------------------------------
@@ -338,7 +338,7 @@ def test_fetch_raises_for_http_status(tmp_path):
     resp = httpx.Response(404, request=req, text="<html>not found</html>")
     with patch("httpx.get", return_value=resp):
         with pytest.raises(httpx.HTTPStatusError):
-            fetch_ff_calendar()
+            fetch_ff_calendar(timeout_sec=10)
 
 
 def test_refresh_failure_does_not_leak_url(tmp_path, caplog):
@@ -357,3 +357,17 @@ def test_refresh_failure_does_not_leak_url(tmp_path, caplog):
         assert "SECRET123" not in text
         assert "faireconomy.media" not in text
         assert "503" in text               # 診断に要る status は残す
+
+
+def test_fetch_ff_calendar_uses_injected_timeout(monkeypatch):
+    captured = {}
+
+    def fake_get(url, timeout, **kwargs):
+        captured["timeout"] = timeout
+        raise RuntimeError("stop here")
+
+    import agentic_fx.datafeed.econ_calendar as econ_mod
+    monkeypatch.setattr(econ_mod.httpx, "get", fake_get)
+    with pytest.raises(RuntimeError):
+        econ_mod.fetch_ff_calendar(timeout_sec=7.5)
+    assert captured["timeout"] == 7.5

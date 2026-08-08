@@ -393,10 +393,12 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 ccy, account_ccy, reference_ts=now,
                 max_skew_min=settings.datafeed.conversion_skew_max_min)
 
-        econ = EconCalendar(conn_core, activity, clock)
+        econ = EconCalendar(conn_core, activity, clock,
+                            timeout_sec=settings.worker.data_hook_timeout_sec)
         rag = Rag(root / "data" / "rag", embedding_function=embedding_fn,
                  lock_timeout_sec=settings.worker.rpc_timeout_sec)
-        collector = NewsCollector(conn_core, rag, activity, clock)
+        collector = NewsCollector(conn_core, rag, activity, clock,
+                                  timeout_sec=settings.worker.data_hook_timeout_sec)
         broker = PaperBroker(conn_core, settings, clock)
         notifier = Notifier(enabled=settings.discord.enabled,
                             webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"))

@@ -67,7 +67,7 @@ def _env(tmp_path, now, on_econ_cycle=None):
             max_skew_min=settings.datafeed.conversion_skew_max_min))
     collector = NewsCollector(
         conn, Rag(tmp_path / "rag", embedding_function=FakeEmbedding()),
-        activity, clock)
+        activity, clock, timeout_sec=10)
     trade_calls: list[str] = []
     econ_calls: list[int] = []
     scheduler = Scheduler(
@@ -157,7 +157,7 @@ def test_scheduler_econ_cycle_accepts_econ_calendar_refresh(tmp_path):
     conn = connect(tmp_path / "econ.db")
     init_db(conn)
     activity = ActivityLog(tmp_path / "econ_activity.log")
-    cal = EconCalendar(conn, activity, FixedClock(CLOSED_NOW))
+    cal = EconCalendar(conn, activity, FixedClock(CLOSED_NOW), timeout_sec=10)
     _, _, scheduler, _ = _env(tmp_path, CLOSED_NOW, on_econ_cycle=cal.refresh)
     events = [{"ts": CLOSED_NOW + timedelta(hours=2), "country": "USD",
                "name": "Nonfarm Payrolls", "importance": 3,
