@@ -6,11 +6,19 @@ SQLite 側は order_id をキーにした確実な参照用、こちらは類似
 """
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import chromadb
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+
+
+class RagUnavailable(Exception):
+    """RAG 内部 lock を `lock_timeout_sec` 以内に取得できなかった (一時的な
+    不可 — 呼び出し側は fail soft (該当機能 skip) で受けること。設計書
+    §4.4 codex I2-2)。"""
 
 
 def _require_utc(dt: datetime, what: str) -> datetime:
@@ -33,7 +41,8 @@ def _require_utc(dt: datetime, what: str) -> datetime:
 class Rag:
     """news (48h 掃除) と reflections (トレード振り返り) の RAG ストア。"""
 
-    def __init__(self, data_dir: Path, embedding_function=None) -> None:
+    def __init__(self, data_dir: Path, embedding_function=None, *,
+                lock_timeout_sec: float = 10.0) -> None:
         # embedding_function 未指定時は chromadb 既定 (all-MiniLM-L6-V2、
         # 初回呼び出し時にモデルを自動 DL) を使う。
         #
@@ -59,8 +68,39 @@ class Rag:
             "news", embedding_function=ef)
         self._refl = self._client.get_or_create_collection(
             "reflections", embedding_function=ef)
+        # プラン 8 worker 基盤 (codex I-8): 全公開メソッドを直列化する
+        # 内部 lock。低頻度・短時間の呼び出しなので直列化のコストは
+        # 無視できる。
+        self._lock = threading.Lock()
+        self._lock_timeout_sec = lock_timeout_sec
+
+    @contextmanager
+    def _locked(self):
+        acquired = self._lock.acquire(timeout=self._lock_timeout_sec)
+        if not acquired:
+            raise RagUnavailable(
+                f"RAG lock not acquired within {self._lock_timeout_sec}s "
+                "(a caller is holding it — fail soft: skip this operation)")
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    def close(self) -> None:
+        """chromadb PersistentClient.close() を lock 保護下で呼ぶ
+        (実機確認済み — 1.5.9 に実在する)。lock 取得に失敗すれば
+        `RagUnavailable` (呼び出し側の App.close は「使用中は close しない」
+        所有権ルールに従ってこれを catch し、close をスキップして記録
+        すること — 設計書 §5)。
+        """
+        with self._locked():
+            self._client.close()
 
     # ---- news -------------------------------------------------------------
+
+    def _count_news_unlocked(self) -> int:
+        """lock を取らない count_news の内部実装 (search_news が内部呼び出しするため)。"""
+        return self._news.count()
 
     def add_news(self, articles: list[dict], now: datetime) -> int:
         """記事を upsert する (url を ID にして重複投入は上書き)。追加件数を返す。
@@ -92,60 +132,66 @@ class Rag:
         あればその値を再利用する。本文・タイトルは常に新しい値で上書きする
         (更新は反映されるべきで、凍結するのは時刻だけ)。
         """
-        if not articles:
-            return 0
-        now_utc = _require_utc(now, "add_news now")
-        ids = [a["url"] for a in articles]
-        # 既存の added_at をまとめて 1 回で引く (N 件を N 回 get しない)
-        existing = self._news.get(ids=ids, include=["metadatas"])
-        existing_added_at = {i: m["added_at"] for i, m in
-                             zip(existing["ids"], existing["metadatas"])}
-        self._news.upsert(
-            ids=ids,
-            documents=[f"{a['title']}\n{a['body']}" for a in articles],
-            metadatas=[{"url": a["url"], "title": a["title"],
-                        "body": a["body"], "source_name": a["source_name"],
-                        "added_at": existing_added_at.get(
-                            a["url"], now_utc.isoformat())}
-                       for a in articles])
-        return len(articles)
+        with self._locked():
+            if not articles:
+                return 0
+            now_utc = _require_utc(now, "add_news now")
+            ids = [a["url"] for a in articles]
+            # 既存の added_at をまとめて 1 回で引く (N 件を N 回 get しない)
+            existing = self._news.get(ids=ids, include=["metadatas"])
+            existing_added_at = {i: m["added_at"] for i, m in
+                                 zip(existing["ids"], existing["metadatas"])}
+            self._news.upsert(
+                ids=ids,
+                documents=[f"{a['title']}\n{a['body']}" for a in articles],
+                metadatas=[{"url": a["url"], "title": a["title"],
+                            "body": a["body"], "source_name": a["source_name"],
+                            "added_at": existing_added_at.get(
+                                a["url"], now_utc.isoformat())}
+                           for a in articles])
+            return len(articles)
 
     def search_news(self, query: str, n: int = 5) -> list[dict]:
         """意味検索で news を引く。body は元記事の本文 (embedding 用に
         連結した "title\\nbody" テキストではない — メタデータに別途持つ)。
         """
-        count = self.count_news()
-        if count == 0:
-            return []
-        res = self._news.query(query_texts=[query], n_results=min(n, count))
-        return [{"url": m["url"], "title": m["title"], "body": m["body"],
-                 "source_name": m["source_name"]}
-                for m in res["metadatas"][0]]
+        with self._locked():
+            count = self._count_news_unlocked()
+            if count == 0:
+                return []
+            res = self._news.query(query_texts=[query], n_results=min(n, count))
+            return [{"url": m["url"], "title": m["title"], "body": m["body"],
+                     "source_name": m["source_name"]}
+                    for m in res["metadatas"][0]]
 
     def count_news(self) -> int:
-        return self._news.count()
+        with self._locked():
+            return self._count_news_unlocked()
 
     def cleanup_news(self, now: datetime, hours: int = 48) -> int:
         """`added_at` が閾値より古い記事を削除する (設計書 §12)。削除件数を返す。"""
-        now_utc = _require_utc(now, "cleanup_news now")
-        cutoff = (now_utc - timedelta(hours=hours)).isoformat()
-        got = self._news.get(include=["metadatas"])
-        old = [i for i, m in zip(got["ids"], got["metadatas"])
-               if m["added_at"] < cutoff]
-        if old:
-            self._news.delete(ids=old)
-        return len(old)
+        with self._locked():
+            now_utc = _require_utc(now, "cleanup_news now")
+            cutoff = (now_utc - timedelta(hours=hours)).isoformat()
+            got = self._news.get(include=["metadatas"])
+            old = [i for i, m in zip(got["ids"], got["metadatas"])
+                   if m["added_at"] < cutoff]
+            if old:
+                self._news.delete(ids=old)
+            return len(old)
 
     # ---- reflections --------------------------------------------------------
 
     def add_reflection(self, order_id: int, content: str, pair: str) -> None:
-        self._refl.upsert(ids=[str(order_id)], documents=[content],
-                          metadatas=[{"order_id": order_id, "pair": pair}])
+        with self._locked():
+            self._refl.upsert(ids=[str(order_id)], documents=[content],
+                              metadatas=[{"order_id": order_id, "pair": pair}])
 
     def search_reflections(self, query: str, n: int = 5) -> list[dict]:
-        count = self._refl.count()
-        if count == 0:
-            return []
-        res = self._refl.query(query_texts=[query], n_results=min(n, count))
-        return [{"order_id": m["order_id"], "pair": m["pair"], "content": d}
-                for d, m in zip(res["documents"][0], res["metadatas"][0])]
+        with self._locked():
+            count = self._refl.count()
+            if count == 0:
+                return []
+            res = self._refl.query(query_texts=[query], n_results=min(n, count))
+            return [{"order_id": m["order_id"], "pair": m["pair"], "content": d}
+                    for d, m in zip(res["documents"][0], res["metadatas"][0])]
