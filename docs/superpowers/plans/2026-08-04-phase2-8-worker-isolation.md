@@ -6432,35 +6432,158 @@ EOF
   - `Executor._evaluate_and_execute_open(self, intent: TradeIntent, iid: int, ctx: GateContext) -> dict` (private — `_open`/`open_from_snapshot` の共有末尾。既存 `_open` の `result = evaluate(...)` 以降を**逐語**移動しただけで判定ロジックは 1 文字も変えない)
   - **(裁定書 F-1 / CR-2 / P8-01 追加)** `executor.CloseSnapshot` (frozen dataclass): `price: float, spec: InstrumentSpec, rate: ConversionRate | None, rate_degraded: bool, captured_at: datetime`
   - `Executor.gather_close_snapshot(self, row: dict) -> CloseSnapshot` — **commit-pre 専用、core_lock 非保持で呼ぶ**。`row` は呼び出し元 (Task 15) が `conn_supervisor` (lock 外の読取専用接続) から読んだ現在の order 行 (`pair`/`direction` を参照するだけ)。`quote_fn`(成行価格) → `spec_fn` → `resolve_close_rate`(`rate_fn` 経由) を 1 回で完了させる
+  - `Executor.close_from_snapshot(self, intent: TradeIntent, iid: int, snapshot: CloseSnapshot | None, *, max_snapshot_age_sec: float) -> dict` — **commit-core 専用、core_lock 保持中に呼ぶ**。`_close` (369-384 行) と並行する別経路。①row 現況の再確認 ②`snapshot is None` なら lock 内取得せず拒否 ③鮮度再検証 ④`close_order_from_snapshot` へ委譲
   - `Executor.close_order_from_snapshot(self, row: dict, snapshot: CloseSnapshot, reason: str) -> OrderStatus` — `close_order` の commit-core 専用版。`spec_fn`/`resolve_close_rate` を一切呼ばない。`broker.close`(paper broker=DB書込、外部 I/O ではない) と DB 遷移のみ commit-core で行う。`_finish_close`/`_close_unknown` を `close_order` と共有 (判定・記録ロジック不変 — I/O 位置のみ移動)
   - `Executor._finish_close(self, row, price, contract_size, rate, degraded, reason, now) -> OrderStatus` / `Executor._close_unknown(self, row, now) -> OrderStatus` (private — `close_order`/`close_order_from_snapshot` の共有末尾。既存 `close_order` の broker 成功後処理を**逐語**移動しただけで判定ロジックは 1 文字も変えない)
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`tests/core/test_executor_snapshot.py` を新規作成する (既存 `tests/core/test_executor.py` の fixture — `_env`/`_open_intent` 等 — を確認して揃える):
+`tests/core/test_executor_snapshot.py` を新規作成する。
+
+**現物照合済み (2026-08-09, 着手前検証)** — 既存 `tests/core/test_executor.py` の実際の姿は以下であり、
+下記スケルトンはこれに合わせて**プレースホルダを除去済み**である。実装者はこれをほぼそのまま使えるが、
+**必ず現物を読んでから**書くこと:
+
+- ヘルパーは `_setup(tmp_path, broker=None, rate_fn=None) -> (conn, ex, state, mid)` の 1 本のみ。
+  `_make_executor`/`_start_trade_mission`/`_insert_intent`/`_insert_open_order`/`_close_intent` は**存在しない** (本 Step で新規に書く)
+- `_setup` は `quote_fn=lambda p: QUOTE` / `spec_fn=lambda p: SPEC` を**固定注入**する (`quote_fn`/`spec_fn` の
+  差し替え引数は無い)。本 Step の新ファイルは `_setup` を import せず**独自の Executor 構築ヘルパーを持つ**
+- `SPEC` は `InstrumentSpec(symbol=..., ...)`。**フィールド名は `symbol` であって `pair` ではない**
+  (`contracts.py:103-115`)
+- `_open_intent` の既定は `entry_type="limit"` → 結果は `"pending"`。`"opened"` を期待するなら
+  `entry_type="market", limit_price=None, expires_in=None` を渡すこと
+- 既存 `_rate_fn` は JPY 恒等 + USD→JPY のみ。EUR を使うなら拡張が要る
+
+**テストスタブに「呼ばれたら raise」を使ってはならない** — `resolve_close_rate` (`executor.py:206-211`) と
+`_evaluate_and_execute_open`/`close_order_from_snapshot` の broker 呼び出し (`executor.py:395-399`) は
+どちらも `except Exception` で握り潰す。`AssertionError` も `Exception` なので**握り潰されてテストが緑になる**。
+呼び出し検出は必ず**記録型スタブ** (list に append して正常値を返す) + `assert calls == []` で行う。
 
 ```python
 """Executor snapshot API (プラン8, 設計書 §3.1 / §12 申し送り①N4-2)。"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
-from agentic_fx.core.executor import (
-    ExecutionSnapshot, SnapshotCoverageError, open_risk_and_notional_from_snapshot,
+from agentic_fx.activity import ActivityLog
+from agentic_fx.config import load_settings
+from agentic_fx.core.accounting import record_snapshot
+from agentic_fx.core.contracts import (
+    ConversionRate, FixedClock, InstrumentSpec, Origin,
+    OrderStatus as S, Quote, TradeIntent,
 )
-from agentic_fx.core.contracts import ConversionRate
+from agentic_fx.core.executor import (
+    ExecutionSnapshot, Executor, SnapshotCoverageError, _intent_payload,
+    open_risk_and_notional_from_snapshot,
+)
+from agentic_fx.core.notifier import Notifier
+from agentic_fx.core.paper_broker import PaperBroker
+from agentic_fx.datafeed.health import DataUnhealthy
+from agentic_fx.store import intents as intents_store
+from agentic_fx.store import missions, orders
+from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.state import StateStore
 
-# 以下は tests/core/test_executor.py の既存 fixture (Executor 構築ヘルパー・
-# SPEC・_open_intent 等) を import または同型に再現して使う。プレース
-# ホルダのまま使わず、実ファイルを確認してから書くこと。
+NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+SETTINGS = load_settings(
+    Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+
+# **pair ごとに異なる spec を返す** — 既存 test_executor.py の
+# `spec_fn=lambda p: SPEC` (常に USDJPY spec) を流用すると、USDJPY だけで
+# USD/JPY の両通貨が揃ってしまい、`gather_open_snapshot` の
+# exposure_pairs 展開ループを丸ごと消しても `rates` の assert が緑になる。
+# EURUSD に別の base/quote 通貨 (EUR/USD) を持たせて初めて
+# 「EUR が rates に入るか」が展開ループを pin する assert になる。
+SPECS = {
+    "USDJPY": InstrumentSpec(symbol="USDJPY", pip_size=0.01, min_lot=0.01,
+                             max_lot=50.0, lot_step=0.01,
+                             contract_size=100_000,
+                             base_currency="USD", quote_currency="JPY"),
+    "EURUSD": InstrumentSpec(symbol="EURUSD", pip_size=0.01, min_lot=0.01,
+                             max_lot=50.0, lot_step=0.01,
+                             contract_size=100_000,
+                             base_currency="EUR", quote_currency="USD"),
+}
+QUOTE = Quote("USDJPY", 148.49, 148.51, NOW, "test")
+
+
+def _rate_fn(ccy, account_ccy, now):
+    """JPY 恒等 / USD・EUR → JPY のみ供給する最小スタブ。"""
+    if ccy == account_ccy:
+        return ConversionRate(1.0, ccy, account_ccy, (now,))
+    if account_ccy == "JPY" and ccy in ("USD", "EUR"):
+        return ConversionRate(QUOTE.ask, ccy, "JPY", (now,))
+    raise DataUnhealthy(f"no rate for {ccy}->{account_ccy}")
+
+
+def _make_executor(tmp_path, *, quote_fn=None, spec_fn=None, rate_fn=None,
+                   broker=None) -> Executor:
+    """本ファイル専用の Executor 構築ヘルパー。
+
+    既存 `tests/core/test_executor.py::_setup` は `quote_fn`/`spec_fn` を
+    固定注入しており差し替えられないため、こちらを新設する。
+    `tmp_path / "a"` のようなサブディレクトリを渡せるよう mkdir する。
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    record_snapshot(conn, now=NOW, balance=1_000_000, equity=1_000_000)
+    return Executor(
+        conn=conn,
+        broker=broker or PaperBroker(conn, SETTINGS, FixedClock(NOW)),
+        settings=SETTINGS, state_store=StateStore(tmp_path / "state.json"),
+        activity=ActivityLog(tmp_path / "activity.log"),
+        notifier=Notifier(enabled=False, webhook_url=None),
+        clock=FixedClock(NOW),
+        quote_fn=quote_fn or (lambda p: QUOTE),
+        spec_fn=spec_fn or (lambda p: SPECS[p]),
+        rate_fn=rate_fn or _rate_fn)
+
+
+def _start_trade_mission(conn) -> int:
+    return missions.start(conn, "trade", "local", "m", NOW)
+
+
+def _insert_intent(conn, mid: int, intent: TradeIntent) -> int:
+    return intents_store.insert(conn, mid, _intent_payload(intent), NOW)
+
+
+def _open_intent(pair="USDJPY", origin=Origin.SCHEDULER, **over) -> TradeIntent:
+    """既定は **market** (即 OPEN になる) — 既存 test_executor.py の
+    `_open_intent` は limit 既定 (結果は "pending") なので同名だが別物。"""
+    d = {"action": "open", "pair": pair, "direction": "long",
+         "entry_type": "market", "horizon": "day", "limit_price": None,
+         "expires_in": None, "stop_loss": 148.00, "take_profit": 149.60,
+         "reasoning": "t"}
+    d.update(over)
+    return TradeIntent.from_llm_dict(d, origin=origin)
+
+
+def _close_intent(order_id: int) -> TradeIntent:
+    return TradeIntent.from_llm_dict({"action": "close", "order_id": order_id},
+                                     origin=Origin.SCHEDULER)
+
+
+def _insert_open_order(conn, pair: str) -> dict:
+    """Risk Gate を通さず OPEN の建玉行を直接作る (exposure の下ごしらえ
+    専用)。gate 経由にすると EURUSD の pip_size/価格の組合せでサイズ計算が
+    絡み、テストの意図 (exposure が存在すること) がぶれるため。"""
+    oid = orders.insert(
+        conn, pair=pair, direction="long", entry_type="market",
+        horizon="day", status=S.OPEN, now=NOW,
+        quantity=0.1, remaining_quantity=0.0, requested_price=148.20,
+        avg_fill_price=148.20, filled_quantity=0.1, stop_loss=147.80,
+        take_profit=149.00, filled_at=NOW.isoformat())
+    return orders.get(conn, oid)
 
 
 def test_gather_open_snapshot_covers_intent_pair_and_exposure_pairs(tmp_path):
     """gather_open_snapshot は intent.pair と exposure_pairs の両方の
     spec/通貨レートを含む。"""
-    ex = _make_executor(tmp_path)  # 既存 fixture ヘルパーに合わせて実装
+    ex = _make_executor(tmp_path)
     intent = _open_intent(pair="USDJPY")
     snapshot = ex.gather_open_snapshot(intent, exposure_pairs=["EURUSD"])
 
@@ -6468,6 +6591,9 @@ def test_gather_open_snapshot_covers_intent_pair_and_exposure_pairs(tmp_path):
     assert "EURUSD" in snapshot.specs_by_pair
     assert "JPY" in snapshot.rates  # USDJPY の quote_currency
     assert "USD" in snapshot.rates  # USDJPY の base / EURUSD の quote
+    # ↓ この 1 本だけが exposure_pairs 展開ループを pin する
+    #   (EUR は EURUSD の base_currency からしか入らない)
+    assert "EUR" in snapshot.rates
 
 
 def test_open_from_snapshot_rejects_stale_snapshot(tmp_path):
@@ -6485,6 +6611,9 @@ def test_open_from_snapshot_rejects_stale_snapshot(tmp_path):
                                 max_snapshot_age_sec=5.0)
     assert out["result"] == "rejected"
     assert "stale" in out["reasons"][0]
+    # 拒否は「発注しない」まで意味する — 行が 1 本も生まれていないこと
+    assert orders.list_by_status(ex.conn, S.SUBMITTING, S.OPEN,
+                                 S.PENDING_FILL) == []
 
 
 def test_open_from_snapshot_rejects_when_exposure_grew_after_commit_pre(tmp_path):
@@ -6504,12 +6633,12 @@ def test_open_from_snapshot_rejects_when_exposure_grew_after_commit_pre(tmp_path
     assert "snapshot" in out["reasons"][0].lower()
 
 
-def test_open_from_snapshot_accepts_when_gate_passes_and_matches_handle_intent(tmp_path):
+def test_open_from_snapshot_matches_handle_intent(tmp_path):
     """judgment ロジック不変の確認: 同じ intent/状況で handle_intent (ライブ
     経路) と open_from_snapshot (Mission 経路) が同じ結果になる。"""
     ex1 = _make_executor(tmp_path / "a")
     ex2 = _make_executor(tmp_path / "b")  # 同一初期状態の別 DB
-    intent = _open_intent(pair="USDJPY")
+    intent = _open_intent(pair="USDJPY")   # market → "opened" を期待
 
     mid1 = _start_trade_mission(ex1.conn)
     out1 = ex1.handle_intent(intent, mid1)
@@ -6517,9 +6646,37 @@ def test_open_from_snapshot_accepts_when_gate_passes_and_matches_handle_intent(t
     mid2 = _start_trade_mission(ex2.conn)
     iid2 = _insert_intent(ex2.conn, mid2, intent)
     snapshot = ex2.gather_open_snapshot(intent, exposure_pairs=[])
-    out2 = ex2.open_from_snapshot(intent, iid2, snapshot, max_snapshot_age_sec=999.0)
+    out2 = ex2.open_from_snapshot(intent, iid2, snapshot,
+                                  max_snapshot_age_sec=999.0)
 
     assert out1["result"] == out2["result"] == "opened"
+    row1 = orders.get(ex1.conn, out1["order_id"])
+    row2 = orders.get(ex2.conn, out2["order_id"])
+    # サイズ・約定価格まで一致すること (「同じ result 文字列」だけでは
+    # 判定ロジック共有の証明にならない)
+    assert row1["quantity"] == row2["quantity"]
+    assert row1["avg_fill_price"] == row2["avg_fill_price"]
+
+
+def test_open_from_snapshot_matches_handle_intent_on_gate_rejection(tmp_path):
+    """却下側も一致すること — kill switch ラッチ等の副作用込みで
+    `_evaluate_and_execute_open` を両経路が共有していることの pin。"""
+    ex1 = _make_executor(tmp_path / "a")
+    ex2 = _make_executor(tmp_path / "b")
+    # gate が必ず落とす intent (stop_loss を極端に離してリスク超過にする)
+    intent = _open_intent(pair="USDJPY", stop_loss=100.00)
+
+    mid1 = _start_trade_mission(ex1.conn)
+    out1 = ex1.handle_intent(intent, mid1)
+
+    mid2 = _start_trade_mission(ex2.conn)
+    iid2 = _insert_intent(ex2.conn, mid2, intent)
+    snapshot = ex2.gather_open_snapshot(intent, exposure_pairs=[])
+    out2 = ex2.open_from_snapshot(intent, iid2, snapshot,
+                                  max_snapshot_age_sec=999.0)
+
+    assert out1["result"] == out2["result"] == "rejected"
+    assert out1["reasons"] == out2["reasons"]
 
 
 def test_open_risk_and_notional_from_snapshot_raises_on_uncovered_pair(tmp_path):
@@ -6529,7 +6686,42 @@ def test_open_risk_and_notional_from_snapshot_raises_on_uncovered_pair(tmp_path)
         quote=None, spec=None, specs_by_pair={}, rates={},
         captured_at=datetime(2026, 8, 4, tzinfo=timezone.utc))
     with pytest.raises(SnapshotCoverageError):
-        open_risk_and_notional_from_snapshot(ex.conn, ex.settings.risk, empty_snapshot)
+        open_risk_and_notional_from_snapshot(ex.conn, ex.settings.risk,
+                                             empty_snapshot)
+
+
+def test_open_risk_and_notional_from_snapshot_raises_on_uncovered_currency(
+        tmp_path):
+    """spec はあるが通貨レートが欠けている場合も N4-2 として拒否する
+    (`if spec is None` だけを見て通貨チェックを削っても落ちるように)。"""
+    ex = _make_executor(tmp_path)
+    _insert_open_order(ex.conn, pair="EURUSD")
+    snapshot = ExecutionSnapshot(
+        quote=QUOTE, spec=SPECS["USDJPY"],
+        specs_by_pair={"EURUSD": SPECS["EURUSD"]},
+        rates={"USD": ConversionRate(1.0, "USD", "JPY", (NOW,))},  # EUR 欠落
+        captured_at=NOW)
+    with pytest.raises(SnapshotCoverageError):
+        open_risk_and_notional_from_snapshot(ex.conn, ex.settings.risk,
+                                             snapshot)
+
+
+def test_open_risk_and_notional_from_snapshot_matches_live_version(tmp_path):
+    """DB-only 版が既存 open_risk_and_notional と同じ数値を返すこと
+    (集計ロジックの逐語移植の pin)。"""
+    from agentic_fx.core.executor import open_risk_and_notional
+    ex = _make_executor(tmp_path)
+    _insert_open_order(ex.conn, pair="USDJPY")
+    _insert_open_order(ex.conn, pair="EURUSD")
+    cycle_rate = ex.cycle_rate_fn(NOW)
+    live = open_risk_and_notional(ex.conn, ex.spec_fn, ex.settings.risk,
+                                  cycle_rate)
+    intent = _open_intent(pair="USDJPY")
+    snapshot = ex.gather_open_snapshot(intent,
+                                       exposure_pairs=["USDJPY", "EURUSD"])
+    snap = open_risk_and_notional_from_snapshot(ex.conn, ex.settings.risk,
+                                                snapshot)
+    assert live == snap
 
 
 # ---- CLOSE snapshot (裁定書 F-1 / CR-2 / P8-01 — 独自裁定「OPEN のみ」を
@@ -6537,36 +6729,59 @@ def test_open_risk_and_notional_from_snapshot_raises_on_uncovered_pair(tmp_path)
 
 def test_gather_close_snapshot_captures_price_spec_and_rate(tmp_path):
     """gather_close_snapshot は quote_fn/spec_fn/resolve_close_rate を
-    1 回ずつ呼び、CloseSnapshot に price/spec/rate を確定する。"""
+    呼び、CloseSnapshot に price/spec/rate を確定する。"""
     ex = _make_executor(tmp_path)
     row = {"pair": "USDJPY", "direction": "long"}
     snapshot = ex.gather_close_snapshot(row)
-    assert snapshot.price == ex.quote_fn("USDJPY").bid
-    assert snapshot.spec.pair == "USDJPY"
+    assert snapshot.price == QUOTE.bid       # long → bid
+    assert snapshot.spec.symbol == "USDJPY"  # InstrumentSpec のフィールドは symbol
     assert snapshot.rate is not None
     assert snapshot.rate_degraded is False
 
 
-def test_close_order_from_snapshot_does_not_call_quote_or_rate_fn(tmp_path):
+def test_gather_close_snapshot_uses_ask_for_short(tmp_path):
+    ex = _make_executor(tmp_path)
+    snapshot = ex.gather_close_snapshot({"pair": "USDJPY",
+                                         "direction": "short"})
+    assert snapshot.price == QUOTE.ask
+
+
+def test_close_order_from_snapshot_performs_no_external_io(tmp_path):
     """裁定書 F-1 の核心: close_order_from_snapshot は quote_fn/spec_fn/
-    resolve_close_rate を一切呼ばない (commit-core は取得済み値のみ使用)。
-    blocking な quote_fn を注入し、呼ばれたら即座に検出する。"""
+    rate_fn を一切呼ばない (commit-core は取得済み値のみ使用)。
+
+    **スタブは「呼ばれたら raise」ではなく「記録して正常値を返す」にする** —
+    `resolve_close_rate` (executor.py:206-211) も broker 呼び出し
+    (executor.py:395-399) も `except Exception` で握り潰すため、
+    AssertionError を投げるスタブは静かに飲まれてテストが緑になる。
+    """
     calls: list[str] = []
 
-    def blocking_quote_fn(pair):
-        calls.append("quote_fn")
-        raise AssertionError("quote_fn must not be called in commit-core")
+    def rec_quote_fn(pair):
+        calls.append(f"quote_fn:{pair}")
+        return QUOTE
 
-    ex = _make_executor(tmp_path, quote_fn=blocking_quote_fn)
-    row = _insert_open_order(ex.conn, pair="USDJPY")
-    # snapshot 自体は healthy な quote_fn を持つ別 Executor で取得する
-    # (commit-pre 相を模す)。close_order_from_snapshot だけを、
-    # quote_fn が呼ばれたら AssertionError を送出する ex (commit-core 相
-    # を模す) に対して呼び、外部取得が一切発生しないことを確認する。
-    healthy_ex = _make_executor(tmp_path)
+    def rec_spec_fn(pair):
+        calls.append(f"spec_fn:{pair}")
+        return SPECS[pair]
+
+    def rec_rate_fn(ccy, account_ccy, now):
+        calls.append(f"rate_fn:{ccy}")
+        return _rate_fn(ccy, account_ccy, now)
+
+    # snapshot は commit-pre 相を模す健全な Executor で取得する
+    healthy_ex = _make_executor(tmp_path / "pre")
+    row = _insert_open_order(healthy_ex.conn, pair="USDJPY")
     snapshot = healthy_ex.gather_close_snapshot(row)
-    ex.close_order_from_snapshot(row, snapshot, reason="llm_close")
-    assert calls == []  # quote_fn (blocking_quote_fn) が一度も呼ばれていない
+
+    # commit-core 相を模す Executor — 外部取得が起きたら calls に残る
+    ex = _make_executor(tmp_path / "core", quote_fn=rec_quote_fn,
+                        spec_fn=rec_spec_fn, rate_fn=rec_rate_fn)
+    row2 = _insert_open_order(ex.conn, pair="USDJPY")
+    ex.close_order_from_snapshot(row2, snapshot, reason="llm_close")
+
+    assert calls == [], f"commit-core で外部取得が発生した: {calls}"
+    assert orders.get(ex.conn, row2["id"])["status"] == S.CLOSED.value
 
 
 def test_close_order_from_snapshot_matches_close_order_result(tmp_path):
@@ -6578,17 +6793,15 @@ def test_close_order_from_snapshot_matches_close_order_result(tmp_path):
     row1 = _insert_open_order(ex1.conn, pair="USDJPY")
     row2 = _insert_open_order(ex2.conn, pair="USDJPY")
 
-    final1 = ex1.close_order(row1, price=ex1.quote_fn("USDJPY").bid,
-                             reason="llm_close")
+    final1 = ex1.close_order(row1, price=QUOTE.bid, reason="llm_close")
     snapshot = ex2.gather_close_snapshot(row2)
     final2 = ex2.close_order_from_snapshot(row2, snapshot, reason="llm_close")
 
     assert final1 == final2 == S.CLOSED
-    pnl1 = ex1.conn.execute(
-        "SELECT realized_pnl FROM orders WHERE id=?", (row1["id"],)).fetchone()[0]
-    pnl2 = ex2.conn.execute(
-        "SELECT realized_pnl FROM orders WHERE id=?", (row2["id"],)).fetchone()[0]
-    assert pnl1 == pnl2
+    r1 = orders.get(ex1.conn, row1["id"])
+    r2 = orders.get(ex2.conn, row2["id"])
+    assert r1["realized_pnl"] == r2["realized_pnl"]
+    assert r1["close_price"] == r2["close_price"]
 
 
 def test_close_from_snapshot_rejects_stale_snapshot(tmp_path):
@@ -6606,6 +6819,8 @@ def test_close_from_snapshot_rejects_stale_snapshot(tmp_path):
     out = ex.close_from_snapshot(intent, iid, stale, max_snapshot_age_sec=5.0)
     assert out["result"] == "rejected"
     assert "stale" in out["reasons"][0]
+    # 拒否は「クローズしない」まで意味する
+    assert orders.get(ex.conn, row["id"])["status"] == S.OPEN.value
 
 
 def test_close_from_snapshot_rejects_when_snapshot_is_none(tmp_path):
@@ -6620,9 +6835,33 @@ def test_close_from_snapshot_rejects_when_snapshot_is_none(tmp_path):
     out = ex.close_from_snapshot(intent, iid, None, max_snapshot_age_sec=999.0)
     assert out["result"] == "rejected"
     assert "snapshot" in out["reasons"][0].lower()
+    assert orders.get(ex.conn, row["id"])["status"] == S.OPEN.value
+
+
+def test_close_from_snapshot_closes_when_fresh(tmp_path):
+    ex = _make_executor(tmp_path)
+    row = _insert_open_order(ex.conn, pair="USDJPY")
+    mid = _start_trade_mission(ex.conn)
+    intent = _close_intent(order_id=row["id"])
+    iid = _insert_intent(ex.conn, mid, intent)
+    snapshot = ex.gather_close_snapshot(row)
+
+    out = ex.close_from_snapshot(intent, iid, snapshot,
+                                 max_snapshot_age_sec=999.0)
+    assert out["result"] == "closed"
+    assert orders.get(ex.conn, row["id"])["status"] == S.CLOSED.value
 ```
 
-（`_make_executor`/`_open_intent`/`_close_intent`/`_start_trade_mission`/`_insert_intent`/`_insert_open_order` は既存 `tests/core/test_executor.py` の fixture 名・構築パターンに実装者が合わせること — 同ファイルを読んでから書く。`_make_executor` は `quote_fn`/`spec_fn`/`rate_fn` の差し替えを受け付けるキーワード引数を持つよう既存 fixture を拡張してよい (無ければ本 Step で拡張する)。`test_close_order_from_snapshot_does_not_call_quote_or_rate_fn` のプレースホルダ的な中間コードは実装時に削除し、`healthy_ex`/`ex` の 2 Executor パターンだけを残すこと。
+**実装者への注意 (着手前検証の結果)**:
+
+- `orders.insert` の受け付けるキーワードは `store/orders.py` の `_OPTIONAL` 集合で決まる
+  (未知キーは `ValueError`)。`_insert_open_order` の引数が弾かれたら `_OPTIONAL` を見て調整すること
+- `_open_intent(stop_loss=100.00)` で本当に gate が落ちるかは実測で確認する。落ちなければ
+  `test_open_from_snapshot_matches_handle_intent_on_gate_rejection` の intent を
+  「確実に落ちる値」(例: 極端な数量になる SL 距離、または position cap 超過の下ごしらえ) に差し替える。
+  **「落ちる想定だったが実は accepted だった」まま assert が通る形にしてはならない** —
+  `out1["result"] == "rejected"` を必ず実測で確認する
+- `TradeIntent.from_llm_dict` の必須キー・`expires_in` の受け付ける形は `contracts.py` の現物を見る
 
 - [ ] **Step 2: テスト実行して FAIL を確認**
 
@@ -6633,6 +6872,22 @@ uv run pytest tests/core/test_executor_snapshot.py -q
 Expected: 全件 FAIL (`ImportError: cannot import name 'ExecutionSnapshot'`)。
 
 - [ ] **Step 3: `executor.py` を実装**
+
+**⚠ 本 Step のコードブロックは「構造」を示すものであり、逐語の貼り付け原稿ではない (2026-08-09 着手前検証)。**
+プラン執筆時に**既存コメントが数箇所落ちている** — 下記ブロックを貼り付けると
+「1 文字も変えない」と言いながら実際にはコメントを削除することになる。移動対象領域の
+**既存コメントは 1 行残らず保存すること**:
+
+| 現物の行 | 落ちているコメント |
+|---|---|
+| `executor.py:269-272` | `cycle_rate` を 1 判断内で固定する理由 (設計書 §5) |
+| `executor.py:325-326` | broker 例外を「結果不明」扱いにする理由 (codex 2) |
+| `executor.py:354` 行内 | `# paper: 保護は常に成功` |
+| `executor.py:407-411` | クローズのレート degraded フォールバックの理由 (設計書 §5) |
+
+**また `config/settings.yaml` / `.example` は本 task では触らない。** `snapshot_max_age_sec` の
+config 化は Task 15 (`WorkerSettings`) の担当であり、Task 14 は `max_snapshot_age_sec` を
+キーワード引数として受け取るだけ。**設定キー同期の規約は本 task には適用されない。**
 
 import 節に `from dataclasses import dataclass` を追加する (現行 `executor.py` は `sqlite3`/`datetime`/`typing.Callable` のみ import しており `dataclass` が無い — 本 task で新設する `ExecutionSnapshot`/`SnapshotCoverageError`/`CloseSnapshot` はいずれも `@dataclass(frozen=True, slots=True)` を使うため必須)。
 
@@ -6689,7 +6944,7 @@ def open_risk_and_notional_from_snapshot(
     return total_risk, total_notional, len(rows)
 ```
 
-`Executor` クラスに `gather_open_snapshot`/`open_from_snapshot`/`_evaluate_and_execute_open` を追加する。まず `_open` メソッド (256-365 行) を「外部取得部分」と「判定・執行部分」に分割する。**`result = evaluate(intent, ctx, self.settings.risk)` から末尾までを `_evaluate_and_execute_open` として切り出し** (中身は 1 文字も変えない — 297-365 行をそのまま新メソッドへ移動する)、`_open` はその呼び出しに置き換える:
+`Executor` クラスに `gather_open_snapshot`/`open_from_snapshot`/`_evaluate_and_execute_open` を追加する。まず `_open` メソッド (**現物 256-365 行 — 照合済み**) を「外部取得部分」と「判定・執行部分」に分割する。**`result = evaluate(intent, ctx, self.settings.risk)` から末尾までを `_evaluate_and_execute_open` として切り出し** (中身は 1 文字も変えない — **296-365 行** (`result = evaluate(...)` は 296 行) をそのまま新メソッドへ移動する)、`_open` はその呼び出しに置き換える:
 
 ```python
     def _open(self, intent: TradeIntent, iid: int) -> dict:
@@ -6898,7 +7153,7 @@ def open_risk_and_notional_from_snapshot(
         return self._evaluate_and_execute_open(intent, iid, ctx)
 ```
 
-**(裁定書 F-1 / CR-2 / P8-01 追加) CLOSE 用スナップショット API を追加する**。まず既存 `close_order` (369-433 行付近) の「broker 成功後の pnl 計算・DB 遷移・activity 記録」部分を `_finish_close`/`_close_unknown` として抽出する (中身は逐語移動 — 判定・記録ロジックは 1 文字も変えない)。`close_order` 自体はこの 2 メソッドを呼ぶ形に変わるが、**scheduler が使う経路としての外部から見える挙動は完全不変** (`spec_fn`/`resolve_close_rate` は引き続き `close_order` の中で呼ぶ — scheduler tick は tick 全体で `core_lock` を保持する既存設計のままであり、本 task はここを変えない):
+**(裁定書 F-1 / CR-2 / P8-01 追加) CLOSE 用スナップショット API を追加する**。まず既存 `close_order` (**現物 386-433 行 — 照合済み。369 行は `_close` であってプラン旧記載の「369-433」は誤り**) の「broker 成功後の pnl 計算・DB 遷移・activity 記録」部分を `_finish_close`/`_close_unknown` として抽出する (中身は逐語移動 — 判定・記録ロジックは 1 文字も変えない)。`close_order` 自体はこの 2 メソッドを呼ぶ形に変わるが、**scheduler が使う経路としての外部から見える挙動は完全不変** (`spec_fn`/`resolve_close_rate` は引き続き `close_order` の中で呼ぶ — scheduler tick は tick 全体で `core_lock` を保持する既存設計のままであり、本 task はここを変えない):
 
 ```python
     def _close_unknown(self, row: dict, now: datetime) -> S:
@@ -7073,9 +7328,21 @@ Expected: 全件 PASS。**`tests/core/test_executor.py` が 1 本も壊れてい
 1. `_evaluate_and_execute_open` の `if not result.accepted:` を削除 → `tests/core/test_executor.py` の gate 却下系テストが red (`_open`/`open_from_snapshot` 両方に波及することを確認)
 2. `open_from_snapshot` の `if age_sec > max_snapshot_age_sec:` を削除 → `test_open_from_snapshot_rejects_stale_snapshot` が red
 3. `open_risk_and_notional_from_snapshot` の `if spec is None:` チェックを削除 → `test_open_from_snapshot_rejects_when_exposure_grew_after_commit_pre`/`test_open_risk_and_notional_from_snapshot_raises_on_uncovered_pair` が red
-4. **(裁定書 F-1 追加)** `close_order_from_snapshot` の `rate, degraded = self.resolve_close_rate(...)` 相当を `snapshot.rate, snapshot.rate_degraded` から `self.resolve_close_rate(row["pair"], now)` の直接呼び出しに戻す (外部 I/O を再導入する変異) → `test_close_order_from_snapshot_does_not_call_quote_or_rate_fn` が red
-5. `close_from_snapshot` の `if snapshot is None:` チェックを削除 → `test_close_from_snapshot_rejects_when_snapshot_is_none` が red (削除すると `snapshot.captured_at` で `AttributeError` になるはずが、モックの取り方次第で誤って通ってしまう場合は `snapshot=None` 時の分岐を明示的に固定するテストへ差し替える)
+3b. `open_risk_and_notional_from_snapshot` の**通貨カバレッジ**チェック (`if spec.quote_currency not in snapshot.rates ...`) だけを削除 (spec チェックは残す) → `test_open_risk_and_notional_from_snapshot_raises_on_uncovered_currency` が red
+3c. `gather_open_snapshot` の `for pair in exposure_pairs:` ループ本体を空にする → `test_gather_open_snapshot_covers_intent_pair_and_exposure_pairs` の `"EUR" in snapshot.rates` が red (**pair 非依存の `spec_fn` を使うとここが緑のまま生存する** — 新テストファイルが `SPECS[p]` を使う理由)
+4. **(裁定書 F-1 追加)** `close_order_from_snapshot` の `snapshot.rate, snapshot.rate_degraded` の使用を `self.resolve_close_rate(snapshot.spec.quote_currency, now)` の直接呼び出しに戻す (外部 I/O を再導入する変異) → `test_close_order_from_snapshot_performs_no_external_io` が red。
+   **記録型スタブでなければこの変異は生存する** — `resolve_close_rate` は `except Exception` で全例外を握り潰すので、`rate_fn` に raise するスタブを入れても degraded 扱いになるだけでテストは緑のまま通る (2026-08-09 着手前検証で確認)
+4b. `close_order_from_snapshot` の `snapshot.price` を `self.quote_fn(row["pair"]).bid` に戻す → 同テストが red (`quote_fn` の記録が残る)
+5. `close_from_snapshot` の `if snapshot is None:` チェックを削除 → `test_close_from_snapshot_rejects_when_snapshot_is_none` が red
 6. `close_from_snapshot` の `if age_sec > max_snapshot_age_sec:` を削除 → `test_close_from_snapshot_rejects_stale_snapshot` が red
+7. `open_from_snapshot` / `close_from_snapshot` の拒否 return を「拒否するが処理は続行」に変える (return を消す) → 「拒否は発注/クローズしないことまで含む」を pin する assert (`orders.list_by_status(...) == []` / `status == open`) が red
+
+**リストは下限。** この task が守ろうとしている性質は「**commit-core で外部 I/O が一切起きないこと**」と
+「**判定ロジックが `_open`/`open_from_snapshot` で完全に共有されていること**」の 2 点である。
+この 2 点を壊す変異を自分で追加し、red になるかを確かめよ。特に
+「`_evaluate_and_execute_open` の中身を片方の経路にだけ effect のある形に変える」変異
+(例: `intents_store.set_gate_result` の呼び出しを消す) が両経路のテストで red になるかを確認すること。
+**リストに無い変異を追加したら、その内容と結果 (KILLED/SURVIVED) を必ず報告せよ。**
 
 - [ ] **Step 6: Commit**
 
