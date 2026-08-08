@@ -39,7 +39,7 @@ FEED_XML_PARSED.entries = [
 
 def test_fetch_feed_maps_entries():
     with patch("feedparser.parse", return_value=FEED_XML_PARSED):
-        arts = fetch_feed("https://ex.com/rss", "example")
+        arts = fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
     assert len(arts) == 2
     assert arts[0].title == "Dollar rallies"
     assert arts[0].url == "https://ex.com/a1"
@@ -54,7 +54,7 @@ def test_fetch_feed_published_is_utc_from_gmt_normalized_tuple():
     # (rfc822.py: _parse_date_rfc822 の docstring「a UTC time tuple」)。
     # naive 化・オフセット取り違え・秒の切り捨てのいずれでも落ちる値を検証する。
     with patch("feedparser.parse", return_value=FEED_XML_PARSED):
-        arts = fetch_feed("https://ex.com/rss", "example")
+        arts = fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
     assert arts[0].published == datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
     assert arts[0].published.utcoffset() == timedelta(0)
 
@@ -69,7 +69,7 @@ def test_fetch_feed_falls_back_to_updated_parsed_for_atom():
                        updated_parsed=(2026, 7, 21, 9, 30, 45, 1, 202, 0))
     parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
-        arts = fetch_feed("https://ex.com/atom", "example")
+        arts = fetch_feed("https://ex.com/atom", "example", timeout_sec=10)
     assert arts[0].published == datetime(2026, 7, 21, 9, 30, 45,
                                          tzinfo=timezone.utc)
 
@@ -83,7 +83,7 @@ def test_fetch_feed_skips_entry_missing_link():
                           published_parsed=None)
     parsed = _parsed(entries=[good, bad])
     with patch("feedparser.parse", return_value=parsed):
-        arts = fetch_feed("https://ex.com/rss", "example")
+        arts = fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
     assert len(arts) == 1
     assert arts[0].url == "https://ex.com/a1"
 
@@ -93,7 +93,7 @@ def test_fetch_feed_missing_title_defaults_to_empty_string():
                             published_parsed=None)
     parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
-        arts = fetch_feed("https://ex.com/rss", "example")
+        arts = fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
     assert arts[0].title == ""
 
 
@@ -144,7 +144,7 @@ def test_fetch_feed_warns_on_unrecognized_tz_abbreviation(caplog):
     parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
-            arts = fetch_feed("https://ex.com/rss", "example")
+            arts = fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
     # 記事は捨てない (ニュースは fail-open、価格と違い欠損で取引を止めない)
     assert len(arts) == 1
     assert arts[0].published is not None
@@ -160,7 +160,7 @@ def test_fetch_feed_no_warning_for_numeric_offset(caplog):
     parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
-            fetch_feed("https://ex.com/rss", "example")
+            fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
     assert caplog.records == []
 
 
@@ -172,7 +172,7 @@ def test_fetch_feed_no_warning_for_known_abbreviation(caplog):
     parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
-            fetch_feed("https://ex.com/rss", "example")
+            fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
     assert caplog.records == []
 
 
@@ -186,7 +186,7 @@ def test_fetch_feed_no_warning_when_raw_date_missing(caplog):
     parsed = _parsed(entries=[entry])
     with patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
-            arts = fetch_feed("https://ex.com/rss", "example")
+            arts = fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
     assert caplog.records == []
     assert arts[0].published is not None
 
@@ -198,14 +198,14 @@ def test_fetch_web_extracts_body():
          patch("trafilatura.extract", return_value="本文テキスト") as ext, \
          patch("trafilatura.extract_metadata") as meta:
         meta.return_value = MagicMock(title="記事タイトル")
-        arts = fetch_web("https://ex.com/page", "example")
+        arts = fetch_web("https://ex.com/page", "example", timeout_sec=10)
     assert len(arts) == 1
     assert arts[0].body == "本文テキスト"
     assert arts[0].title == "記事タイトル"
     assert arts[0].url == "https://ex.com/page"
     assert arts[0].source_name == "example"
     assert arts[0].published is None
-    get.assert_called_once_with("https://ex.com/page", timeout=30,
+    get.assert_called_once_with("https://ex.com/page", timeout=10,
                                 follow_redirects=True)
     # コメント欄が本文に混入しないこと (ブリーフの逐語コードからの意図的変更)
     assert ext.call_args.kwargs.get("include_comments") is False
@@ -217,7 +217,7 @@ def test_fetch_web_title_falls_back_to_url_when_no_metadata():
     with patch("httpx.get", return_value=resp), \
          patch("trafilatura.extract", return_value="本文テキスト"), \
          patch("trafilatura.extract_metadata", return_value=None):
-        arts = fetch_web("https://ex.com/page", "example")
+        arts = fetch_web("https://ex.com/page", "example", timeout_sec=10)
     assert arts[0].title == "https://ex.com/page"
 
 
@@ -226,7 +226,7 @@ def test_fetch_web_extract_failure_returns_empty():
     resp.raise_for_status = MagicMock()
     with patch("httpx.get", return_value=resp), \
          patch("trafilatura.extract", return_value=None):
-        assert fetch_web("https://ex.com/page", "example") == []
+        assert fetch_web("https://ex.com/page", "example", timeout_sec=10) == []
 
 
 def test_fetch_web_propagates_http_error():
@@ -237,7 +237,7 @@ def test_fetch_web_propagates_http_error():
         "404", request=MagicMock(), response=MagicMock(status_code=404))
     with patch("httpx.get", return_value=resp):
         with pytest.raises(httpx.HTTPStatusError):
-            fetch_web("https://ex.com/page", "example")
+            fetch_web("https://ex.com/page", "example", timeout_sec=10)
 
 
 # ---- 修正ラウンド 1: bozo (死んだフィード) を無音にしない --------------------
@@ -254,9 +254,13 @@ def test_fetch_feed_raises_when_bozo_and_no_entries():
     # 実物に合わせる。
     parsed = _parsed(bozo=True, entries=[],
                      bozo_exception=URLError("Connection refused"))
-    with patch("feedparser.parse", return_value=parsed):
+    response_mock = MagicMock()
+    response_mock.content = b"<rss></rss>"
+    response_mock.raise_for_status = MagicMock()
+    with patch("agentic_fx.datafeed.fetchers.httpx.get", return_value=response_mock), \
+         patch("feedparser.parse", return_value=parsed):
         with pytest.raises(FeedFetchError):
-            fetch_feed("https://dead.example/rss", "deadsource")
+            fetch_feed("https://dead.example/rss", "deadsource", timeout_sec=10)
 
 
 def test_fetch_feed_raise_message_has_no_url_or_raw_exception_text():
@@ -268,9 +272,13 @@ def test_fetch_feed_raise_message_has_no_url_or_raw_exception_text():
     parsed = _parsed(
         bozo=True, entries=[],
         bozo_exception=URLError("Connection refused to dead.example:443"))
-    with patch("feedparser.parse", return_value=parsed):
+    response_mock = MagicMock()
+    response_mock.content = b"<rss></rss>"
+    response_mock.raise_for_status = MagicMock()
+    with patch("agentic_fx.datafeed.fetchers.httpx.get", return_value=response_mock), \
+         patch("feedparser.parse", return_value=parsed):
         with pytest.raises(FeedFetchError) as exc_info:
-            fetch_feed("https://dead.example/rss", "deadsource")
+            fetch_feed("https://dead.example/rss", "deadsource", timeout_sec=10)
     msg = str(exc_info.value)
     assert "dead.example" not in msg
     assert "443" not in msg
@@ -282,9 +290,13 @@ def test_fetch_feed_warns_but_returns_partial_when_bozo_with_entries(caplog):
                       published_parsed=None, updated_parsed=None)
     parsed = _parsed(bozo=True, entries=[entry],
                        bozo_exception=ValueError("malformed trailer"))
-    with patch("feedparser.parse", return_value=parsed):
+    response_mock = MagicMock()
+    response_mock.content = b"<rss></rss>"
+    response_mock.raise_for_status = MagicMock()
+    with patch("agentic_fx.datafeed.fetchers.httpx.get", return_value=response_mock), \
+         patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
-            arts = fetch_feed("https://ex.com/rss", "partialsource")
+            arts = fetch_feed("https://ex.com/rss", "partialsource", timeout_sec=10)
     # 部分的なパースエラーでも取れた記事は返す (ニュースは fail-open)
     assert len(arts) == 1
     messages = [r.getMessage() for r in caplog.records]
@@ -304,6 +316,40 @@ def test_fetch_feed_no_bozo_warning_when_bozo_false(caplog):
     parsed = _parsed(entries=[])
     with patch("feedparser.parse", return_value=parsed):
         with caplog.at_level(logging.WARNING, logger="agentic_fx.news"):
-            arts = fetch_feed("https://ex.com/rss", "example")
+            arts = fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
     assert arts == []
     assert caplog.records == []
+
+
+def test_fetch_web_uses_injected_timeout(monkeypatch):
+    captured = {}
+
+    def fake_get(url, timeout, **kwargs):
+        captured["timeout"] = timeout
+        raise RuntimeError("stop here — this test only checks the timeout arg")
+
+    import agentic_fx.datafeed.fetchers as fetchers_mod
+    monkeypatch.setattr(fetchers_mod.httpx, "get", fake_get)
+    with pytest.raises(RuntimeError):
+        fetchers_mod.fetch_web("http://x", "s", timeout_sec=7.5)
+    assert captured["timeout"] == 7.5
+
+
+def test_fetch_feed_uses_httpx_with_injected_timeout(monkeypatch):
+    """feedparser.parse(url) から httpx 経由の取得に変わったことの確認。"""
+    captured = {}
+
+    class FakeResponse:
+        content = b"<rss><channel></channel></rss>"
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, timeout, **kwargs):
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    import agentic_fx.datafeed.fetchers as fetchers_mod
+    monkeypatch.setattr(fetchers_mod.httpx, "get", fake_get)
+    fetchers_mod.fetch_feed("http://x", "s", timeout_sec=7.5)
+    assert captured["timeout"] == 7.5

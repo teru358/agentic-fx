@@ -73,11 +73,12 @@ class NewsCollector:
     """enabled な news_sources を全件回し、fetcher で取得して RAG へ upsert する。"""
 
     def __init__(self, conn: sqlite3.Connection, rag: Rag,
-                 activity: ActivityLog, clock: Clock) -> None:
+                 activity: ActivityLog, clock: Clock, *, timeout_sec: float) -> None:
         self.conn = conn
         self.rag = rag
         self.activity = activity
         self.clock = clock
+        self.timeout_sec = timeout_sec
 
     def collect(self) -> int:
         """1 サイクル分の収集を実行する。取得記事総数を返す。
@@ -103,7 +104,7 @@ class NewsCollector:
                     self._record_failure(
                         src["name"], f"unknown fetcher {src['fetcher']!r}")
                     continue
-                articles = fetch(src["url"], src["name"])
+                articles = fetch(src["url"], src["name"], timeout_sec=self.timeout_sec)
                 total += self.rag.add_news(
                     [{"url": a.url, "title": a.title, "body": a.body,
                       "source_name": a.source_name, "published": a.published}

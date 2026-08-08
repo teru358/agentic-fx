@@ -70,7 +70,8 @@ def build_mission_registry(
 
     if provider is None:
         provider = PriceProvider(conn, settings, clock, readonly=readonly)
-    econ = EconCalendar(conn, activity, clock)
+    econ = EconCalendar(conn, activity, clock,
+                        timeout_sec=settings.worker.data_hook_timeout_sec)
     broker = PaperBroker(conn, settings, clock)
 
     registry = ToolRegistry()

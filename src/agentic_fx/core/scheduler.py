@@ -89,27 +89,18 @@ class Scheduler:
         置く (プラン 5)。ここでロックを持たないのは、tick と裁量操作
         (Mission 由来の発注/クローズ) を **同じ**ロックで直列化する必要が
         あり、scheduler 内部の自前ロックではその範囲を張れないため。
-        """
-        # cross-plan 修正①: データ収集サイクルは tick の **冒頭** (開場判定
-        # より前) で回す。
-        # - 開場・閉場を 1 箇所でカバーでき、同じロジックの重複を作らない。
-        #   以前はクローズ側ブロック (直後に return) の中にしか呼び出しが
-        #   無く、市場は金 17:00 NY〜日 17:00 NY しか閉じないため、ニュース
-        #   収集も RAG の 48h 掃除も **週末しか走らなかった** (実測: 14 日で
-        #   news cycle は全部週末、最大間隔 5 日)。
-        # - `_mark_to_market` の早期 return より前 = mark-to-market が失敗
-        #   する tick でもニュースは取れる (ニュースは価格と独立)。
-        # - `on_trade_mission` より前 = Mission が最新のニュースを読む。
-        # 冒頭に置いた代償として、これらの経路の障害が _process_exits
-        # (SL/TP 監視 = 資金保護) より前に立つ。だから呼び出しは必ず
-        # _run_data_hook 経由 (fail-open) にすること。
-        if self._last_news is None or now - self._last_news >= _NEWS_INTERVAL:
-            self._last_news = now
-            self._run_data_hook("news", self.on_news_cycle)
-        if self._last_econ is None or now - self._last_econ >= _ECON_INTERVAL:
-            self._last_econ = now
-            self._run_data_hook("econ", self.on_econ_cycle)
 
+        **tick 再編 (プラン 8, 設計書 §3.2 codex C2-1/C3-1)**: 決定論
+        ブロック (mark-to-market → account/予約再検証 → fills_allowed
+        判定 → `_process_limit_fills` → `_process_exits`) は内部順序を
+        一切変えずそのまま先頭で実行する。データ hooks (news/econ/signal
+        maintenance) は `_run_hooks` に切り出し、**tick の全ての return
+        パス直前** (市場閉鎖時・mark-to-market 失敗時・通常経路の Mission
+        起動判定の直前) で呼ぶ — 市場閉鎖中も hooks が走ることを維持する
+        (cross-plan 修正① の意図の保存。単純に「決定論ブロックの後ろ」に
+        だけ置くと、決定論ブロックが `open_now` 判定の内側にしか無いため
+        市場閉鎖中に hooks が一切走らなくなる)。
+        """
         open_now = market_hours.is_market_open(now)
         if not open_now:
             # レビュー修正 4: _was_open はプロセスメモリのみに保持される。
@@ -120,6 +111,7 @@ class Scheduler:
             if self._was_open is not False:
                 self._on_market_close(now)
             self._was_open = False
+            self._run_hooks(now)
             return
         self._was_open = True
 
@@ -127,6 +119,7 @@ class Scheduler:
         # ValueError を送出した場合、mark-to-market 自体が信頼できないため、
         # この tick は安全側に全体スキップする。
         if not self._mark_to_market(now):
+            self._run_hooks(now)
             return
         self._resolve_unknowns(now)
         self._expire_limits(now)
@@ -184,45 +177,35 @@ class Scheduler:
                 _log.warning("maintain_reservations failed: %s", text)
                 fills_allowed = False
         self._force_close_day(now)
-        # プラン 7 Task 8: signal 保守処理 (producer 評価 + reclaim_expired)。
-        # news/econ の data hook (tick 冒頭・開場判定より前) とは**別の新設
-        # 位置** — ここは開場ガード**内**・`_process_limit_fills` **より前**
-        # に置く (opus R2 I8-1: 同じ位置と誤認しないこと)。
-        # `_run_data_hook` と同型の fail-open 隔離を再利用する (producer/
-        # reclaim の失敗が資金保護 (_process_limit_fills/_process_exits) を
-        # 止めてはならない)。
-        if self.on_signal_maintenance is not None:
-            self._run_data_hook(
-                "signal_maintenance", lambda: self.on_signal_maintenance(now))
-        # 修正ラウンド 2: account が不明な tick は「新規約定」だけをスキップ
-        # する (codex 1 の意図)。OPEN ポジションの SL/TP 監視
-        # (_process_exits) は既存建玉の資金保護であり、口座情報の有無に
-        # 関わらず必ず実行しなければならない — 以前は _process_fills 全体
-        # (約定処理と SL/TP 監視の両方) を丸ごとスキップしており、口座陳腐化
-        # 中は資金保護まで止まる回帰を生んでいた。
-        #
-        # 2 層構え (codex C-I1): 1 層目 = 上の全 pending 取消、2 層目 = ここの
-        # スキップ。1 層目の取消が broker 側で rejected/unknown になると行は
-        # PENDING_FILL に残らないが、取消経路そのものが例外や将来の変更で
-        # 効かなくなった場合に備えて、約定側にも独立した条件を置く。
         filled_ids = self._process_limit_fills(now) if fills_allowed else set()
         self._process_exits(now, filled_ids)
-        # プラン 8 park 返済 (codex I1, プラン 5 レジャー): on_trade_mission
-        # が例外を送出しても _last_cron_trade は既に前進済み (下の
-        # if reason == "cron": 行が先に走る) — これは意図的な設計であり
-        # バグではない。毎 tick 再試行 (前進させない設計) は、Mission 起動
-        # 自体が壊れている状況で LLM/notifier を毎分連打することになり、
-        # 障害時により危険側に倒れる。1 時間ごとの再試行間隔を保つことで
-        # 障害時の負荷を抑える (test_cron_deadline_advances_even_when_
-        # mission_callback_raises がこの契約を固定する)。
+
+        # プラン 8 tick 再編: hooks は決定論ブロック (mark-to-market〜
+        # exits) の**後**、Mission 起動判定の**前**。
+        self._run_hooks(now)
+
         reason = self._trade_mission_due(now)
         if reason is not None:
-            # 上書き 1 の改名 + §5 必須事項 4: cron 締切の更新は
-            # reason == "cron" のときだけ。signal 起動は cron の締切を
-            # 一切動かさない (早めもしない・延ばしもしない)。
             if reason == "cron":
                 self._last_cron_trade = now
             self.on_trade_mission(reason)
+
+    def _run_hooks(self, now: datetime) -> None:
+        """データ hooks (news/econ/signal maintenance) — 決定論ブロック
+        の後段で実行する (設計書 §3.2)。**tick() の全ての return パスの
+        直前で呼ぶこと** — 市場閉鎖時・mark-to-market 失敗時・通常時の
+        いずれでも hooks は毎 tick 走る (「hooks が週末しか走らない」旧
+        欠陥 = cross-plan 修正① の再発防止)。
+        """
+        if self._last_news is None or now - self._last_news >= _NEWS_INTERVAL:
+            self._last_news = now
+            self._run_data_hook("news", self.on_news_cycle)
+        if self._last_econ is None or now - self._last_econ >= _ECON_INTERVAL:
+            self._last_econ = now
+            self._run_data_hook("econ", self.on_econ_cycle)
+        if self.on_signal_maintenance is not None:
+            self._run_data_hook(
+                "signal_maintenance", lambda: self.on_signal_maintenance(now))
 
     # ---- internal -------------------------------------------------------
 

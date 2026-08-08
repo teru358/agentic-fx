@@ -145,7 +145,7 @@ def _bozo_reason(bozo_exception: BaseException | None) -> str:
     return type(bozo_exception).__name__
 
 
-def fetch_feed(url: str, source_name: str) -> list[Article]:
+def fetch_feed(url: str, source_name: str, *, timeout_sec: float) -> list[Article]:
     """RSS/Atom フィードを取得して Article のリストにする。
 
     1 エントリの欠損フィールド (title/link 等) でフィード全体が空になる
@@ -168,7 +168,9 @@ def fetch_feed(url: str, source_name: str) -> list[Article]:
     - bozo が立っていない (健全なフィードがたまたま 0 件) は従来どおり
       無警告で空リストを返す — これはエラーではない。
     """
-    parsed = feedparser.parse(url)
+    response = httpx.get(url, timeout=timeout_sec, follow_redirects=True)
+    response.raise_for_status()
+    parsed = feedparser.parse(response.content)
     if getattr(parsed, "bozo", False):
         reason = _bozo_reason(getattr(parsed, "bozo_exception", None))
         if not parsed.entries:
@@ -197,7 +199,7 @@ def fetch_feed(url: str, source_name: str) -> list[Article]:
     return out
 
 
-def fetch_web(url: str, source_name: str) -> list[Article]:
+def fetch_web(url: str, source_name: str, *, timeout_sec: float) -> list[Article]:
     """単一 web ページから本文を抽出する (1 記事)。抽出失敗は空リスト。
 
     published は常に None — 単一ページから発行日時を tz-aware UTC で
@@ -209,7 +211,7 @@ def fetch_web(url: str, source_name: str) -> list[Article]:
     trafilatura.extract の既定は True で、そのままだとコメント欄の文章が
     本文に混入し、LLM の取引判断材料として記事本文と同格に扱われてしまう。
     """
-    r = httpx.get(url, timeout=30, follow_redirects=True)
+    r = httpx.get(url, timeout=timeout_sec, follow_redirects=True)
     r.raise_for_status()
     body = trafilatura.extract(r.text, include_comments=False)
     if not body:

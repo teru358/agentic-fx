@@ -95,7 +95,7 @@ class CalendarFetch:
     dropped: int
 
 
-def fetch_ff_calendar() -> CalendarFetch:
+def fetch_ff_calendar(*, timeout_sec: float) -> CalendarFetch:
     """ForexFactory の週間カレンダーを取得して正規化する。
 
     ネットワーク層・ペイロード全体の異常は例外として送出する (呼び出し側
@@ -109,7 +109,7 @@ def fetch_ff_calendar() -> CalendarFetch:
     ような 1 件が `TypeError: unhashable type` を投げて健全なイベントごと
     週全体を落としていた — docstring がコードより広い主張をしていた。
     """
-    r = httpx.get(_URL, timeout=30, follow_redirects=True)
+    r = httpx.get(_URL, timeout=timeout_sec, follow_redirects=True)
     r.raise_for_status()
     payload = r.json()
     if not isinstance(payload, list):
@@ -168,10 +168,11 @@ def fetch_ff_calendar() -> CalendarFetch:
 
 class EconCalendar:
     def __init__(self, conn: sqlite3.Connection, activity: ActivityLog,
-                 clock: Clock) -> None:
+                 clock: Clock, *, timeout_sec: float) -> None:
         self.conn = conn
         self.activity = activity
         self.clock = clock
+        self.timeout_sec = timeout_sec
 
     def refresh(self) -> int:
         """カレンダーを取り込み、**保存できた件数**を返す。
@@ -187,7 +188,7 @@ class EconCalendar:
         ある日に無音になる。捨てた件数を見て失敗として扱う。
         """
         try:
-            fetched = fetch_ff_calendar()
+            fetched = fetch_ff_calendar(timeout_sec=self.timeout_sec)
         except Exception as e:  # noqa: BLE001 — カレンダーで取引を止めない
             return self._record_failure("fetch", e)
         events, dropped = fetched.events, fetched.dropped

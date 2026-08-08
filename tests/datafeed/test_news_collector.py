@@ -25,7 +25,7 @@ def _env(tmp_path):
     init_db(conn)
     rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
     col = NewsCollector(conn, rag, ActivityLog(tmp_path / "a.log"),
-                        FixedClock(NOW))
+                        FixedClock(NOW), timeout_sec=10)
     return conn, rag, col
 
 
@@ -118,7 +118,7 @@ def test_collect_fetches_enabled_sources(tmp_path):
     with patch("agentic_fx.datafeed.news_collector.fetch_feed",
                return_value=[ART]) as f:
         total = col.collect()
-    f.assert_called_once_with("https://ex.com/rss", "s1")  # 引数の順序・enabled のみ
+    f.assert_called_once_with("https://ex.com/rss", "s1", timeout_sec=10)  # 引数の順序・enabled のみ
     assert total == 1
     assert rag.count_news() == 1
 
