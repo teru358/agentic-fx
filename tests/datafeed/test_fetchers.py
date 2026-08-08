@@ -356,13 +356,28 @@ def test_fetch_feed_uses_httpx_with_injected_timeout(monkeypatch):
     assert captured["timeout"] == 7.5
 
 
-def test_fetch_feed_passes_response_headers_to_feedparser():
-    """F2: feedparser.parse が response_headers kwarg を受け取ることを確認。
-    charset 情報が response ヘッダから抽出される。
+def test_fetch_feed_forwards_response_headers_with_lowercase_keys():
+    """F2 (2 周目レビュー修正): `dict(response.headers)` の**キー正規化**まで pin する。
+
+    feedparser の `convert_to_utf8` は `http_headers['content-type']` を
+    **小文字キーでしか引かない** (実測)。大文字キーで届くと charset が
+    無視され、Shift_JIS のフィードで `'日本語'` → `'“ú–{Œê'` (bozo=True)
+    になる — これも実測で確認した。
+
+    **元のテストは素の `dict` を組み立てて `"Content-Type"` (大文字) が
+    そのまま渡ることを assert しており、動かない形を正解として固定していた。**
+    実物と同じ `httpx.Headers` を使い、届く側が小文字であることを見る。
+
+    なお `dict(...)` 自体は**載っていない防御**である (実測: 外しても
+    このテストは緑)。`httpx.Headers` は反復時点で既に小文字キーを返すため、
+    feedparser 側の `result['headers'].update(...)` がどちらでも同じ結果になる。
+    `dict()` は「Mapping 以外が来たら壊れる」ことを避ける保険にとどまる。
     """
     response_mock = MagicMock()
     response_mock.content = b"<rss><channel></channel></rss>"
-    response_mock.headers = {"Content-Type": "application/xml; charset=utf-8"}
+    # 実物と同じ httpx.Headers を使う (素の dict では正規化の検証にならない)
+    response_mock.headers = httpx.Headers(
+        [("Content-Type", "application/xml; charset=utf-8")])
     response_mock.raise_for_status = MagicMock()
 
     with patch("agentic_fx.datafeed.fetchers.httpx.get", return_value=response_mock), \
@@ -370,10 +385,36 @@ def test_fetch_feed_passes_response_headers_to_feedparser():
         mock_parse.return_value = _parsed(entries=[])
         fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
 
-    # response_headers が dict に変換されて渡されること
-    assert mock_parse.call_args.kwargs.get("response_headers") == {
-        "Content-Type": "application/xml; charset=utf-8"
-    }
+    forwarded = mock_parse.call_args.kwargs.get("response_headers")
+    assert forwarded == {"content-type": "application/xml; charset=utf-8"}, \
+        "feedparser は小文字キーでしか content-type を見ない"
+
+
+def test_fetch_feed_uses_header_charset_to_decode(monkeypatch):
+    """F2 の**実効**: ヘッダの charset で本文がデコードされること。
+
+    kwarg が渡ったかではなく、**文字化けしないこと**を直接見る。
+    XML 宣言にエンコーディングを書いていない Shift_JIS のフィードを使う
+    (自前宣言があるとヘッダを見なくても正しく読めてしまい検証にならない)。
+    """
+    body = ('<?xml version="1.0"?><rss version="2.0"><channel>'
+            '<title>日本語</title><item><title>記事</title>'
+            '<link>https://ex.com/1</link></item>'
+            '</channel></rss>').encode("shift_jis")
+
+    class _Resp:
+        content = body
+        headers = httpx.Headers(
+            [("Content-Type", "application/xml; charset=shift_jis")])
+
+        def raise_for_status(self):
+            return None
+
+    import agentic_fx.datafeed.fetchers as fetchers_mod
+    monkeypatch.setattr(fetchers_mod.httpx, "get", lambda *a, **k: _Resp())
+
+    articles = fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
+    assert [a.title for a in articles] == ["記事"]
 
 
 def test_fetch_feed_propagates_http_error():
