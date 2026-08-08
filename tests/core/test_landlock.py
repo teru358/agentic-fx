@@ -23,7 +23,7 @@ def test_is_available_false_on_non_x86_64(monkeypatch):
     assert is_available() is False
 
 
-def test_restrict_to_raises_when_create_ruleset_fails(monkeypatch, tmp_path):
+def test_restrict_to_raises_when_landlock_is_unavailable(monkeypatch, tmp_path):
     import agentic_fx.core.landlock as landlock_mod
 
     class FakeLibc:
@@ -45,7 +45,13 @@ def test_restrict_to_raises_when_create_ruleset_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(landlock_mod.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(landlock_mod.ctypes, "CDLL", lambda *a, **k: FakeLibc())
     monkeypatch.setattr(landlock_mod.ctypes, "get_errno", lambda: 38)  # ENOSYS
-    with pytest.raises(LandlockUnavailable):
+    # 2026-08-08 指揮者: **プラン記載のこのテストは名前どおりのことを検証
+    # していなかった**。`FakeLibc.syscall` は全呼び出しに -1 を返すため、
+    # `restrict_to` 冒頭の `is_available()` が False になってそこで送出され、
+    # `landlock_create_ruleset` の失敗分岐には**到達していない** (`match=`
+    # を足して実測発覚)。テスト名を実態に合わせ、create_ruleset の分岐は
+    # 下の専用テストで別途 pin する。
+    with pytest.raises(LandlockUnavailable, match="not available"):
         restrict_to(read_only_paths=[tmp_path], read_write_paths=[])
 
 
@@ -117,6 +123,21 @@ def test_is_available_false_when_abi_query_fails(monkeypatch):
     assert is_available() is False
 
 
+def test_restrict_to_raises_when_create_ruleset_fails(monkeypatch, tmp_path):
+    """`landlock_create_ruleset` の失敗分岐 (2026-08-08 指揮者が追加)。
+
+    ABI 問い合わせは成功させ (`is_available()` を通過させ)、**2 回目の
+    syscall = ruleset 作成だけを失敗**させる。これが無いと
+    `if ruleset_fd < 0:` を削除する変異が、後段の add_rule 失敗が投げる
+    同じ `LandlockUnavailable` によって green のまま生存する (実測)。
+    """
+    libc = _ScriptedLibc(syscall_results=[8, -1])   # abi ok, create_ruleset 失敗
+    _install(monkeypatch, libc)
+    with pytest.raises(LandlockUnavailable, match="landlock_create_ruleset"):
+        restrict_to(read_only_paths=[tmp_path], read_write_paths=[])
+    assert libc.syscall_numbers == [444, 444]   # add_rule へ進んでいない
+
+
 def test_restrict_to_raises_when_add_rule_fails(monkeypatch, tmp_path):
     libc = _ScriptedLibc(syscall_results=[8, 4242, -1])  # abi, ruleset_fd, add_rule
     closed = _install(monkeypatch, libc)
@@ -142,6 +163,28 @@ def test_restrict_to_raises_when_restrict_self_fails(monkeypatch, tmp_path):
     with pytest.raises(LandlockUnavailable, match="landlock_restrict_self"):
         restrict_to(read_only_paths=[tmp_path], read_write_paths=[])
     assert 4242 in closed
+
+
+def test_restrict_to_rejects_non_directory_path(monkeypatch, tmp_path):
+    """`os.O_DIRECTORY` の pin (2026-08-08 指揮者が追加)。
+
+    ディレクトリでないパスを渡したら **その場で失敗する** こと。
+    `O_DIRECTORY` を外すと `os.open` がファイルにも成功してしまい、
+    ファイルの fd に対して path_beneath ルールを張るという意図と違う
+    セマンティクスのまま**静かに通る** (実測: `O_DIRECTORY` 有りなら
+    `NotADirectoryError` errno 20、無しなら fd が取れてしまう)。
+
+    現状は `os.open` の `NotADirectoryError` がそのまま伝播する。
+    `LandlockUnavailable` へ正規化するかは設計判断としてレビューに委ねる
+    (`LandlockUnavailable` の定義は「カーネル非対応・非対応アーキテクチャ・
+    syscall 失敗」であり、呼び出し側のプログラム誤りは別クラス)。
+    """
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0])
+    _install(monkeypatch, libc)
+    a_file = tmp_path / "a.txt"
+    a_file.write_text("x")
+    with pytest.raises(NotADirectoryError):
+        restrict_to(read_only_paths=[a_file], read_write_paths=[])
 
 
 def test_restrict_to_issues_syscalls_in_required_order(monkeypatch, tmp_path):
@@ -174,19 +217,50 @@ _REAL_LANDLOCK_SCRIPT = textwrap.dedent("""
     # (1) read_only パスは読める
     assert sorted(p.name for p in ro_dir.iterdir()) == ["x.txt"], "ro not readable"
 
-    # (2) read_only パスへは **書けない** (旧稿が見ていなかった防御)
+    # (2) read_only パスへは **新規作成できない** (_ACCESS_FS_MAKE_REG 非付与)
     try:
         (ro_dir / "new.txt").write_text("x")
-        print("FAIL: write succeeded on a read-only path")
+        print("FAIL: create succeeded on a read-only path")
         sys.exit(1)
     except PermissionError:
         pass
 
-    # (3) read_write パスへは書ける (_READ_WRITE_ACCESS の唯一のピン)
+    # (2b) read_only パスの **既存ファイルも上書きできない**
+    #      (_ACCESS_FS_WRITE_FILE 非付与)。2026-08-08 指揮者が追加 —
+    #      (2) は新規作成しか試さないため MAKE_REG しか pin できず、
+    #      `_READ_ONLY_ACCESS` に WRITE_FILE を足す変異が **生存した**
+    #      (実測: 既存ファイルを上書きできてしまう = 権限境界が破れる)。
+    #      「同じ防御を複数の壊し方で」— 作成と上書きは別の access bit。
+    try:
+        (ro_dir / "x.txt").write_text("OVERWRITTEN")
+        print("FAIL: overwrite succeeded on a read-only path")
+        sys.exit(1)
+    except PermissionError:
+        pass
+
+    # (2c) read_only パスへは **ディレクトリも作れない**
+    #      (`_ABI_V1_HANDLED_ACCESS_FS` から MAKE_DIR が抜けると、その
+    #      種別が ruleset の判定対象外になり素通しする)。
+    try:
+        (ro_dir / "subdir").mkdir()
+        print("FAIL: mkdir succeeded on a read-only path")
+        sys.exit(1)
+    except PermissionError:
+        pass
+
+    # (3) read_write パスへは **新規作成できる** (_ACCESS_FS_MAKE_REG)
     try:
         (rw_dir / "new.txt").write_text("x")
     except PermissionError:
-        print("FAIL: write was denied on a read-write path")
+        print("FAIL: create was denied on a read-write path")
+        sys.exit(1)
+
+    # (3b) read_write パスの **既存ファイルも上書きできる**
+    #      (_ACCESS_FS_WRITE_FILE — (3) は MAKE_REG しか pin しない)
+    try:
+        (rw_dir / "existing.txt").write_text("updated")
+    except PermissionError:
+        print("FAIL: overwrite was denied on a read-write path")
         sys.exit(1)
 
     # (4) 列挙していないパスは読めない
@@ -219,6 +293,7 @@ def test_real_landlock_enforces_read_only_read_write_and_blocked(tmp_path):
     (ro / "x.txt").write_text("ok")
     rw = tmp_path / "rw"
     rw.mkdir()
+    (rw / "existing.txt").write_text("before")
     blocked = tmp_path / "blocked"
     blocked.mkdir()
 
