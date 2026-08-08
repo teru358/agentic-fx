@@ -160,4 +160,68 @@ def test_rag_unavailable_propagates_through_scheduler_tick(tmp_path):
     env.sched.tick(WED)
     # news_cycle は呼ばれているはず
     assert env.news_calls == 1
-    # tick が正常に返ってくるので何の例外も送出されない（fail soft）
+    # **tick が最後まで走ったこと** — 「例外が出ない」だけでは不十分で、
+    # 何らかの理由で tick が早期 return しても緑になってしまう。
+    # `on_trade_mission` は決定論ブロック (mark-to-market → 資金保護
+    # `_process_exits`) の**後段**にあるため、ここが呼ばれていれば資金保護
+    # まで到達したことが言える (既存 tests/core/test_scheduler.py が同じ
+    # イディオムを使っている — 「tick は最後まで走った」)。
+    # 2026-08-08 指揮者が追加: 実装者の版は「例外が出ない」までしか
+    # 検証しておらず、資金保護への到達を pin していなかった。
+    assert env.trade_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# 指揮者検証 (2026-08-08) で見つかった生存変異 2 件への回帰ピン。
+# ---------------------------------------------------------------------------
+
+
+def test_lock_is_released_when_locked_body_raises(tmp_path):
+    """`_locked()` の `finally` の pin。
+
+    lock 保護下の本体が例外を送出したときに lock を解放しないと、**以後
+    その `Rag` インスタンスは永久に使えなくなる** (どの公開メソッドも
+    `lock_timeout_sec` 経過後に `RagUnavailable` を出し続ける)。chromadb の
+    一時的なエラー 1 回で news 収集と reflection 書込が恒久停止する、という
+    可用性の欠陥になる。
+
+    実測: `finally` を外す変異は**全 1527 テストを素通りして生存**していた。
+    """
+    rag = Rag(tmp_path / "rag", embedding_function=_FakeEmbedding(),
+              lock_timeout_sec=0.2)
+    from datetime import datetime
+
+    # lock 保護下で例外を起こす (naive datetime → _require_utc が ValueError)。
+    with pytest.raises(ValueError):
+        rag.add_news([{"url": "https://x/1", "title": "t", "body": "b",
+                       "source_name": "s", "published": None}],
+                     datetime(2026, 8, 4))          # tz-naive
+
+    # lock が解放されていれば、後続の呼び出しは通常どおり成功する。
+    assert rag.count_news() == 0
+    assert rag.search_news("q") == []
+
+
+def test_build_app_wires_lock_timeout_from_worker_settings(tmp_path):
+    """Step 5 の配線の pin (`settings.worker.rpc_timeout_sec` → `Rag`)。
+
+    実測: この配線を外す変異は**全 1527 テストを素通りして生存**していた
+    (「単体は緑でも配線は誰も検証していない」— プラン 8 Task 7 と同型)。
+    """
+    from agentic_fx.core.contracts import FixedClock
+    from agentic_fx.service import build_app
+    from tests.test_service_app import (
+        NOW, FakeEmbedding, FakeRunner, _init)
+
+    _init(tmp_path)          # config/settings.yaml 等を用意する既存ヘルパー
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    try:
+        assert (app.rag._lock_timeout_sec
+                == app.settings.worker.rpc_timeout_sec)
+        # 既定値そのものと取り違えないよう、値が実際に settings 由来である
+        # ことを別経路でも確かめる。
+        assert app.settings.worker.rpc_timeout_sec == 15.0
+    finally:
+        app.conn_core.close()
+        app.conn_shell.close()
