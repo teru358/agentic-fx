@@ -2343,8 +2343,28 @@ class SeqTracker:
         self._expected += 1
 
 
+def encode_frame(frame: dict) -> bytes:
+    """フレームを wire 表現 (JSON 1 行) に変換する。**ストリームには触れない**。
+
+    レビュー 2 周目 (codex): 送出は「serialize 失敗 (wire 未接触 — 同じ seq で
+    別フレームを送り直してよい)」と「transport 失敗 (`write`/`flush` の例外 —
+    **配信の有無が確定できない**)」を区別しなければならない。両者を
+    `write_frame` の中で一体にしていると、呼び出し側はどちらが起きたのか
+    判定できず、部分書込み後の再送が wire 上に壊れた行を作る。
+    `mission_worker._send_frame` はこの関数で先に serialize してから
+    ストリームへ書く。
+
+    `json.dumps` の `TypeError` は `ProtocolError` に**正規化しない**
+    (レビュー 2 周目 codex/sonnet で確認した意図的な非対称)。`ProtocolError`
+    は「**受け取った**入力がプロトコル契約に反する」ことの表現であり、
+    こちらは「自分が送ろうとした値が JSON にならない」ローカルなプログラム
+    不備 — 別の故障クラスなので同じ型に潰すと親の分岐が誤る。
+    """
+    return json.dumps(frame, ensure_ascii=False).encode("utf-8") + b"\n"
+
+
 def write_frame(stream: BinaryIO, frame: dict) -> None:
-    stream.write(json.dumps(frame, ensure_ascii=False).encode("utf-8") + b"\n")
+    stream.write(encode_frame(frame))
     stream.flush()
 
 
@@ -2841,7 +2861,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from agentic_fx.core.mission_protocol import (
-    ProtocolError, SeqTracker, read_frame, write_frame,
+    ProtocolError, SeqTracker, encode_frame, read_frame,
 )
 
 if TYPE_CHECKING:
@@ -2950,13 +2970,18 @@ def _make_on_message(protocol_out: Any, out_seq: SeqTracker) -> Callable[[dict],
             _send_frame(protocol_out, out_seq, {"type": "event", "message": msg})
         except Exception:  # noqa: BLE001 — I6 対応 (fail closed)
             # LocalRunner._sink (Task 6) は on_message の例外を握って
-            # run() を継続する契約 — しかしここで write_frame が失敗
-            # すると out_seq だけが消費され、次に成功する event フレーム
-            # の seq が欠番になり親の SeqTracker が ProtocolError を
-            # 送出する (レビュー I6)。fail-soft に「継続」させず、
-            # このプロセスを即座に終了する (親は EOF/予期しない終了
-            # として Mission を失敗させる — 既に壊れた状態で
-            # LocalRunner.run() を続けても無意味)。
+            # run() を継続する契約 — しかし event フレームを送れないまま
+            # 実行を続けると、親は transcript の一部を永久に受け取れない
+            # (レビュー I6)。fail-soft に「継続」させず、このプロセスを
+            # 即座に終了する (親は EOF/予期しない終了として Mission を
+            # 失敗させる — 既に壊れた状態で run() を続けても無意味)。
+            #
+            # レビュー 2 周目 (codex) 以降、transport 失敗は
+            # `_write_frame_or_die` がプロセスごと落とすため、この節へ
+            # 実際に到達するのは **serialize 失敗** (transcript の message
+            # が JSON にならない) のとき。その場合 seq は未消費なので
+            # 欠番にはならないが、送れなかった事実は変わらないので
+            # 同じく fail closed にする。
             os._exit(1)
     return on_message
 
@@ -3051,7 +3076,7 @@ def main() -> None:
         registry = build_mission_registry(
             "trade", conn, settings, clock,
             _RagRpcProxy(
-                lambda frame: write_frame(protocol_out, frame),
+                lambda frame: _write_frame_or_die(protocol_out, frame),
                 lambda: read_frame(sys.stdin.buffer),
                 out_seq, in_seq),
             activity=activity, indicator_plugins=approved, readonly=True)
@@ -3100,6 +3125,32 @@ def main() -> None:
             pass
 
 
+def _write_frame_or_die(protocol_out: Any, frame: dict) -> None:
+    """1 フレームを protocol stream へ書く。**transport 失敗なら即プロセス終了**。
+
+    レビュー 2 周目 (codex): `write`/`flush` の例外は「フレームが wire に
+    1 バイトも出ていない」ことを**保証しない**。部分書込みの後に失敗して
+    いれば、同じ seq で別フレームを送り直すと `{"type":...` の途中に別の
+    JSON が連結されて**行が壊れる**。flush がデータを相手へ渡した後に失敗
+    したのなら、親は既に最初のフレームを受理しており、再送は**重複**に
+    なる。どちらが起きたかは呼び出し側から判定できない。
+
+    したがって transport 失敗は回復不能として扱い、**再送せずに子を即座に
+    終了する** (fail closed)。親は EOF / 異常終了として Mission を失敗
+    させる — これは `_make_on_message` (I6) が既に採っている方針と同じ。
+
+    serialize 失敗 (`encode_frame` の `TypeError` 等) は**ここへ来る前に**
+    送出され、ストリームには触れない。呼び出し側はその場合だけ同じ seq で
+    別フレームを送り直してよい。
+    """
+    line = encode_frame(frame)  # serialize 失敗はここ (wire 未接触 → 再送可)
+    try:
+        protocol_out.write(line)
+        protocol_out.flush()
+    except Exception:  # noqa: BLE001 — 配信有無が不明なので回復を試みない
+        os._exit(1)
+
+
 def _send_frame(protocol_out: Any, out_seq: SeqTracker, frame: dict) -> None:
     """子→親のフレームを 1 件送出する (`seq` はここで採番して付す)。
 
@@ -3110,12 +3161,16 @@ def _send_frame(protocol_out: Any, out_seq: SeqTracker, frame: dict) -> None:
     した。実測: `runner.run()` の戻り値が壊れていて result フレームの
     構築中に落ちると、wire 上は `ready(1)` の次が `result(3)` になった。
 
+    「送出が成功していないなら seq を進めない」が安全なのは **serialize
+    失敗のときだけ** — transport 失敗は `_write_frame_or_die` がプロセス
+    ごと落とすため、そもそも呼び出し側に戻らない (レビュー 2 周目 codex)。
+
     `SeqTracker` を採番器として流用する意図は Task 7 本文のとおり
     (「次に来る/送り出すべき値」の意味が受信検証と送信採番で一致する)。
     """
     payload = dict(frame)
     payload["seq"] = out_seq._expected  # noqa: SLF001 — 送出側は採番に使う
-    write_frame(protocol_out, payload)
+    _write_frame_or_die(protocol_out, payload)
     out_seq._expected += 1  # noqa: SLF001
 
 
@@ -3123,7 +3178,7 @@ if __name__ == "__main__":
     main()
 ```
 
-**実装者への注意**: `SeqTracker` は本来「受信側の検証」用に設計されているが、子の**送出側**でも「次に払い出すべき値」を同じフィールドから取り出す採番器として流用している (`_next_seq`/`_RagRpcProxy._seq_next` の `# noqa: SLF001` コメントのとおり、意図的な private 属性アクセス)。別の採番専用クラスを新設しない判断 (writing-plans) — `SeqTracker` の内部カウンタの意味 (「次に来る/送り出すべき値」) が両用途で一致するため。Task 10 (`WorkerRunner`) 側は同じ `SeqTracker` を**受信検証**に使う (`check()` 経由) — 送出用と受信検証用を混同しないこと (子の out_seq は「自分がこれから送る値」を採番するだけで `check()` は呼ばない。親の受信側 `SeqTracker` が `check()` で検証する)。
+**実装者への注意**: `SeqTracker` は本来「受信側の検証」用に設計されているが、子の**送出側**でも「次に払い出すべき値」を同じフィールドから取り出す採番器として流用している (`_send_frame` と `_RagRpcProxy._call` の `# noqa: SLF001` コメントのとおり、意図的な private 属性アクセス。**旧稿にあった `_next_seq` / `_RagRpcProxy._seq_next` はレビュー 2 周目で廃止済み** — 採番は必ず送出成功後に進めるため、送出と不可分な位置に置いた)。別の採番専用クラスを新設しない判断 (writing-plans) — `SeqTracker` の内部カウンタの意味 (「次に来る/送り出すべき値」) が両用途で一致するため。Task 10 (`WorkerRunner`) 側は同じ `SeqTracker` を**受信検証**に使う (`check()` 経由) — 送出用と受信検証用を混同しないこと (子の out_seq は「自分がこれから送る値」を採番するだけで `check()` は呼ばない。親の受信側 `SeqTracker` が `check()` で検証する)。
 
 - [ ] **Step 9: テスト実行して PASS を確認**
 
@@ -3181,7 +3236,18 @@ Expected: 全件 PASS (mission_worker.py は他モジュールから import さ�
 
 **Task 10 への申し送り (codex 主査)**: 子の `out_seq`/`in_seq` 共有は現状 `_expected` の内部状態観測で pin している。より堅いのは **wire レベルの往復** — fake runner が registry 内の RAG ツールを実行し、`ready(1) → tool_rpc(2) → result(3)` と handshake(1) 後の `tool_rpc_result(2)` を実際に往復させる統合テスト。Task 10 でこれを必須にすること。
 
-最終: 変異 **34 件を再走して生存 0 件**。`uv run pytest -q` = **1499 passed, 1 deselected** (ベースライン 1459 + 40)。
+**レビュー 2 周目の反映 (2026-08-08。差分限定レビュー。codex Important 1 + Minor 1 / sonnet Minor 3。重大度が割れたため指揮者が再判定し、codex の Important を採用)**:
+
+1. **[codex Important] 「送出例外 ⇒ wire 未接触」は成立しない仮定だった** — 1 周目の修正 (`_send_frame`) は `write`/`flush` の例外を受けて**同じ seq で再送**していたが、`write`/`flush` の例外は「フレームが wire に 1 バイトも出ていない」ことを**保証しない**。部分書込みの後に失敗していれば再送は `{"type":...` の途中に別 JSON を連結して**行を壊す**。flush がデータを相手へ渡した後の失敗なら親は既に受理済みで**重複**になる。**指揮者が 1 周目の修正で持ち込んだ新しい欠陥**であり、2 周目 (= 修正ラウンドのレビュー) が捕まえた実例
+   - **対応**: `mission_protocol.encode_frame()` を分離し、`mission_worker._write_frame_or_die()` を新設した。**serialize 失敗** (wire 未接触) は例外として上げて同じ seq での再送を許し、**transport 失敗** (配信有無が不明) は `os._exit(1)` で**再送せず即終了**する (fail closed — 親は EOF/異常終了として Mission を失敗させる。`_make_on_message` が既に採っていた方針と同じ)。`_RagRpcProxy` の `tool_rpc` 送出も同じ writer を通す
+   - **テストの脆さも同時に指摘された**: `_FlakyStream` は失敗回に**書き込む前に** raise しており、実 I/O の曖昧性 (部分書込み) をモデル化していなかった。`partial_bytes` を追加し、「部分書込み後の失敗」「全バイト書込み後の flush 失敗」「serialize 失敗」の 3 経路を個別に pin し直した
+2. **[sonnet 単独] `_RagRpcProxy._call` の「送出成功後に採番」が未 pin** — pre-increment に戻しても 1499 件が green だった (Task 6 と同型の append-site の穴)。回帰ピンを追加
+3. **[sonnet 単独] `write_frame` の `TypeError` を `ProtocolError` に正規化しない非対称が未文書** — `encode_frame` の docstring に理由を明記 (`ProtocolError` は「**受け取った**入力が契約違反」の表現。こちらは「自分が送る値が JSON にならない」ローカルなプログラム不備で別の故障クラス)
+4. **[codex Minor + sonnet 単独] 廃止済み helper への言及が散文に残っていた** — 上記「実装者への注意」と **Task 18 のスケッチコード** (`_next_seq` を使っていた) を現行 API に更新
+
+最終: 変異 **40 件を再走して生存 1 件** — 生存した 1 件は `encode_frame` を `write_frame` にインライン戻しする**等価変異** (equivalent mutant: 出力がバイト単位で同一なので、原理的にどのテストでも区別できない)。`uv run pytest -q` = **1504 passed, 1 deselected** (ベースライン 1459 + 45)。
+
+**変異 driver の落とし穴 (実測)**: 変異が `os._exit` を踏むと **pytest プロセスごと停止**し、driver からは「FAILED 行なし = 生存」に見える。`_write_frame_or_die` 関連の変異で実際に偽の生存を 1 件出した。**pytest の要約行に `passed`/`failed`/`error` が無ければ「異常終了 = 検出扱い」とする判定を driver に入れること**。あわせて、fail-closed 経路を持つコードのテストは `os._exit` を必ず monkeypatch する (「終了しないこと」の assert も pin になる)。
 
 - [ ] **Step 12: Commit**
 
@@ -8246,26 +8312,26 @@ def _bootstrap_improve_profile() -> None:
             mission = Mission(**handshake["mission"])
             out_seq = SeqTracker()
 
-            def on_message(msg: dict) -> None:
-                write_frame(protocol_out, {
-                    "type": "event", "seq": _next_seq(out_seq), "message": msg})
+            # Task 7 のレビュー 2 周目で `_next_seq` は廃止された。送出は
+            # 必ず `_send_frame` を通す (serialize 失敗と transport 失敗を
+            # 区別し、採番は送出成功後にだけ進める)。improve profile も
+            # 同じ規律に従うこと。
+            on_message = _make_on_message(protocol_out, out_seq)
 
             runner = LocalRunner(
                 base_url=settings.llama_swap.base_url,
                 model=settings.runner.improve.model, registry=registry,
                 on_message=on_message)
 
-            write_frame(protocol_out, {
-                "type": "ready", "seq": _next_seq(out_seq), "ok": True})
+            _send_frame(protocol_out, out_seq, {"type": "ready", "ok": True})
             try:
                 result = runner.run(mission)
-                write_frame(protocol_out, {
-                    "type": "result", "seq": _next_seq(out_seq),
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result",
                     "status": result.status, "output": result.output})
             except Exception as exc:  # noqa: BLE001
-                write_frame(protocol_out, {
-                    "type": "result", "seq": _next_seq(out_seq),
-                    "status": "failed", "output": None,
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result", "status": "failed", "output": None,
                     "error": f"{type(exc).__name__}: {exc}"})
             return
         if worker_profile != "trade":
