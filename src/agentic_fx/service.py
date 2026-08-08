@@ -42,6 +42,7 @@ from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner
 from agentic_fx.runners.local_runner import LocalRunner
+from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.store import approvals, missions, orders, signals, ohlcv
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.rag import Rag
@@ -408,9 +409,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
     owns_runner = runner is None
     if runner is None:
-        runner = LocalRunner(base_url=settings.llama_swap.base_url,
-                             model=settings.runner.trade.model,
-                             registry=registry)
+        runner = WorkerRunner(root=root, settings=settings, clock=clock,
+                              rag=rag, worker_profile="trade")
 
     policy = Policy(root / "policy" / "directives.md")
     # 上書き 3: MissionWatch は 1 インスタンスを trade_loop / reflection に共有注入
@@ -639,7 +639,7 @@ def run_service(root: Path, *, daemon: bool = False,
         else:
             # 上書き 7: join 成功時のみ close する (使用中の client を
             # 別スレッドから閉じない)
-            if app.owns_runner and isinstance(app.runner, LocalRunner):
+            if app.owns_runner and hasattr(app.runner, "close"):
                 app.runner.close()
             app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
 
