@@ -356,8 +356,15 @@ class _FakeLocalRunner:
 
 
 def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
-                settings_mutator=None, runner_raises=False):
-    """`main()` をインプロセスで駆動し、送出フレーム列と観測点を返す。"""
+                settings_mutator=None, runner_raises=False,
+                raw_stdin=None, out_stream=None, resource_limits_raise=False):
+    """`main()` をインプロセスで駆動し、送出フレーム列と観測点を返す。
+
+    `raw_stdin`: handshake の JSON 化を飛ばして生バイト列を stdin に流す
+    (不正 JSON の検証用)。`out_stream`: `_protect_protocol_stdout` の戻り値を
+    差し替える (送出失敗の注入用)。`resource_limits_raise`:
+    `_set_resource_limits` を例外送出する fake にする (fail closed の検証用)。
+    """
     import io as _io
 
     from agentic_fx.store.db import connect, init_db
@@ -383,18 +390,25 @@ def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
     }
     handshake.update(handshake_overrides or {})
 
+    stdin_bytes = (raw_stdin if raw_stdin is not None
+                   else json.dumps(handshake).encode() + b"\n")
     monkeypatch.setattr(
         mission_worker.sys, "stdin",
-        type("S", (), {"buffer": _io.BytesIO(
-            json.dumps(handshake).encode() + b"\n")})())
-    captured = _io.BytesIO()
+        type("S", (), {"buffer": _io.BytesIO(stdin_bytes)})())
+    captured = out_stream if out_stream is not None else _io.BytesIO()
     monkeypatch.setattr(mission_worker, "_protect_protocol_stdout",
                         lambda: captured)
 
     # 実プロセスの rlimit を壊さないため差し替える (呼び出し引数だけを見る)。
     rlimit_calls: list[dict] = []
+
+    def fake_set_resource_limits(**kw):
+        rlimit_calls.append(kw)
+        if resource_limits_raise:
+            raise OSError(1, "setrlimit refused by hard limit")
+
     monkeypatch.setattr(mission_worker, "_set_resource_limits",
-                        lambda **kw: rlimit_calls.append(kw))
+                        fake_set_resource_limits)
 
     registry_calls: list[tuple] = []
 
@@ -418,8 +432,9 @@ def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
 
     mission_worker.main()
 
-    captured.seek(0)
-    frames = [json.loads(l) for l in captured.getvalue().splitlines()]
+    raw = (bytes(captured.buf) if out_stream is not None
+           else captured.getvalue())
+    frames = [json.loads(l) for l in raw.splitlines()]
     return frames, rlimit_calls, registry_calls
 
 
@@ -608,3 +623,152 @@ def test_rag_rpc_proxy_advances_out_seq_across_successive_calls():
 
     assert [f["seq"] for f in sent] == [1, 2]
     assert [f["name"] for f in sent] == ["search_news", "search_reflections"]
+
+
+# ---------------------------------------------------------------------------
+# レビュー 1 周目 (codex 主査 I-1〜I-3 / sonnet 副査 C1・C2・B・rlimit) の
+# 反映で追加した回帰ピン。
+# ---------------------------------------------------------------------------
+
+
+class _FlakyStream:
+    """指定した回数目の `write()` だけ `BrokenPipeError` を送出する fake。
+
+    送出失敗が seq 採番に与える影響 (欠番・重複) を観測するために使う。
+    """
+
+    def __init__(self, fail_writes: set[int]) -> None:
+        self.calls = 0
+        self._fail = fail_writes
+        self.buf = bytearray()
+
+    def write(self, data: bytes) -> None:
+        self.calls += 1
+        if self.calls in self._fail:
+            raise BrokenPipeError("simulated pipe failure")
+        self.buf += data
+
+    def flush(self) -> None:
+        pass
+
+
+def test_main_reports_ready_false_on_malformed_handshake_json(
+        monkeypatch, tmp_path):
+    """codex I-1: 不正 JSON の handshake でも `ready: ok=False` を返す。
+
+    旧実装は `read_frame` を外側 `try` の**前**で呼んでいたため、
+    `JSONDecodeError` が素通しして traceback で異常終了し、**親からは
+    起動 timeout と区別がつかなかった**。"""
+    frames, rlimit_calls, registry_calls = _drive_main(
+        monkeypatch, tmp_path, raw_stdin=b"{not-json}\n")
+
+    assert len(frames) == 1
+    assert frames[0]["type"] == "ready" and frames[0]["ok"] is False
+    assert "ProtocolError" in frames[0]["error"]
+    assert rlimit_calls == [] and registry_calls == []
+
+
+def test_main_reports_ready_false_on_non_object_handshake(monkeypatch, tmp_path):
+    """codex I-1: JSON としては妥当だがフレーム契約に反する入力 (配列)。"""
+    frames, _, registry_calls = _drive_main(
+        monkeypatch, tmp_path, raw_stdin=b'["handshake", 1]\n')
+
+    assert len(frames) == 1
+    assert frames[0]["ok"] is False
+    assert "ProtocolError" in frames[0]["error"]
+    assert registry_calls == []
+
+
+def test_main_does_not_leave_seq_gap_when_result_write_fails_once(
+        monkeypatch, tmp_path):
+    """codex I-2: seq は**送出成功後**に進める。
+
+    3 回目の write (= result フレーム) を 1 度だけ失敗させる。内側 `except`
+    が送る failed result は **同じ seq=3** で出なければならない。旧実装は
+    送出前に採番していたため wire 上が `ready(1) → event(2) → result(4)`
+    となり、親の `SeqTracker` が欠番として reject した。"""
+    stream = _FlakyStream({3})
+    frames, _, _ = _drive_main(monkeypatch, tmp_path, out_stream=stream)
+
+    assert [f["type"] for f in frames] == ["ready", "event", "result"]
+    assert [f["seq"] for f in frames] == [1, 2, 3]
+    assert frames[2]["status"] == "failed"
+
+
+def test_main_does_not_resend_ready_when_outer_except_is_reached_after_ready(
+        monkeypatch, tmp_path):
+    """codex I-2: 外側 `except` の `seq: 1` ハードコードの回帰ピン。
+
+    result の送出 (3 回目) と、内側 `except` による failed result の送出
+    (4 回目) を両方失敗させると、外側 `except` に到達する。旧実装はここで
+    無条件に `{"type": "ready", "seq": 1, ...}` を送っていたため、既に送出
+    済みの `ready(seq=1)` と**重複**した。"""
+    stream = _FlakyStream({3, 4})
+    frames, _, _ = _drive_main(monkeypatch, tmp_path, out_stream=stream)
+
+    assert [f["type"] for f in frames] == ["ready", "event", "result"]
+    assert [f["seq"] for f in frames] == [1, 2, 3]
+    assert frames[0]["ok"] is True
+    assert frames[2]["status"] == "failed"
+    # ready は 1 回だけ。重複した ready は親の SeqTracker が reject する。
+    assert sum(1 for f in frames if f["type"] == "ready") == 1
+
+
+def test_main_fails_closed_when_resource_limits_cannot_be_set(
+        monkeypatch, tmp_path):
+    """sonnet 副査: docstring が明記する「resource limit の設定失敗は
+    fail closed」を実際に pin する。`_drive_main` は既定で常に成功する
+    fake に差し替えているため、この経路は変異 26 件にも追加 12 本にも
+    含まれておらず無防備だった。"""
+    frames, rlimit_calls, registry_calls = _drive_main(
+        monkeypatch, tmp_path, resource_limits_raise=True)
+
+    assert len(rlimit_calls) == 1  # 呼ばれてはいる
+    assert len(frames) == 1
+    assert frames[0]["type"] == "ready" and frames[0]["ok"] is False
+    assert "setrlimit" in frames[0]["error"]
+    # Mission 実行へは一切進まない。
+    assert registry_calls == []
+
+
+def test_protect_protocol_stdout_redirects_fd1_to_stderr(monkeypatch):
+    """sonnet 副査 B: `dup2` は実 subprocess なしで pin できる。
+
+    `sys.stdout`/`sys.stderr` を実 pipe fd を持つ fake に差し替えると、
+    実プロセスの fd 1 を触らずに「fd 1 への書込みが stderr へ流れる」
+    「protocol_out は元の stdout へ書き続けられる」を観測できる。
+    `dup2` を削除すると前者が成立せず red になる。"""
+    r_out, w_out = os.pipe()
+    r_err, w_err = os.pipe()
+    os.set_blocking(r_out, False)
+    os.set_blocking(r_err, False)
+
+    class FakeStream:
+        def __init__(self, fd):
+            self._fd = fd
+
+        def fileno(self):
+            return self._fd
+
+    monkeypatch.setattr(mission_worker.sys, "stdout", FakeStream(w_out))
+    monkeypatch.setattr(mission_worker.sys, "stderr", FakeStream(w_err))
+
+    protocol_out = mission_worker._protect_protocol_stdout()
+    try:
+        # 意図しない print 相当: fd 1 への書込みは stderr パイプへ流れる。
+        os.write(w_out, b"leaked-print\n")
+        assert os.read(r_err, 4096) == b"leaked-print\n"
+        with pytest.raises(BlockingIOError):
+            os.read(r_out, 4096)
+
+        # protocol_out (dup した元の stdout) は本来の相手へ届く。
+        protocol_out.write(b'{"type":"ready"}\n')
+        protocol_out.flush()
+        assert os.read(r_out, 4096) == b'{"type":"ready"}\n'
+    finally:
+        protocol_out.close()
+        for fd in (r_out, w_out, r_err, w_err):
+            try:
+                os.close(fd)
+            except OSError:
+                pass

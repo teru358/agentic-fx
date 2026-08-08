@@ -116,8 +116,14 @@ class _RagRpcProxy:
     def _call(self, name: str, args: dict) -> Any:
         self._rpc_counter += 1
         rpc_id = str(self._rpc_counter)
-        self._write({"type": "tool_rpc", "seq": self._seq_next(),
+        # レビュー 1 周目 (codex I-2): seq は**送出が成功してから**進める。
+        # 先に消費すると、write/flush が失敗したときにその seq が wire に
+        # 出ないまま欠番になり、次に成功したフレームを親の `SeqTracker` が
+        # reject する。
+        seq = self._out_seq._expected  # noqa: SLF001 — 送出側は採番に使う
+        self._write({"type": "tool_rpc", "seq": seq,
                      "rpc_id": rpc_id, "name": name, "args": args})
+        self._out_seq._expected += 1  # noqa: SLF001
         response = self._read()
         if response is None:
             raise RuntimeError("parent closed the pipe while awaiting tool_rpc_result")
@@ -134,17 +140,6 @@ class _RagRpcProxy:
             raise RuntimeError(str(response.get("error", "rag rpc failed")))
         return response.get("result")
 
-    def _seq_next(self) -> int:
-        # 子→親方向の ready/event/tool_rpc/result は同じカウンタ
-        # (main() から渡される out_seq) を共有する (CR-3 対応 — 単一
-        # スレッドで動くため送出順=seq 順が自然に一致する)。WorkerRunner
-        # (Task 10) 側の SeqTracker.check() と対称に、ここでは単に「次の
-        # 値」を払い出すだけの単純カウンタとして使う (受信側の検証責務は
-        # 親が持つ — 子は自分の送出 seq を数えるだけ)。
-        n = self._out_seq._expected  # noqa: SLF001 — 同一モジュール内の協調実装
-        self._out_seq._expected += 1
-        return n
-
     def search_news(self, query: str, n: int = 5) -> list[dict]:
         return self._call("search_news", {"query": query, "n": n})
 
@@ -159,8 +154,7 @@ def _make_on_message(protocol_out: Any, out_seq: SeqTracker) -> Callable[[dict],
     実行せずに検証するため)。"""
     def on_message(msg: dict) -> None:
         try:
-            write_frame(protocol_out, {
-                "type": "event", "seq": _next_seq(out_seq), "message": msg})
+            _send_frame(protocol_out, out_seq, {"type": "event", "message": msg})
         except Exception:  # noqa: BLE001 — I6 対応 (fail closed)
             # LocalRunner._sink (Task 6) は on_message の例外を握って
             # run() を継続する契約 — しかしここで write_frame が失敗
@@ -189,14 +183,25 @@ def _protect_protocol_stdout() -> Any:
 
 def main() -> None:
     protocol_out = _protect_protocol_stdout()
-    handshake = read_frame(sys.stdin.buffer)
-    if handshake is None:
-        return
 
     # I2 対応: 親→子方向 (handshake/tool_rpc_result) 専用の受信検証
     # トラッカー。handshake は常に seq=1 (親の唯一の起動時送出)。
     in_seq = SeqTracker()
+    # CR-3 対応: 子→親方向の ready/event/tool_rpc/result は 1 起点の単一
+    # カウンタを共有する (設計書 §4.3 codex M2-1、親側 WorkerRunner.in_seq
+    # がそう検証する)。レビュー 1 周目 (codex I-2) で `main()` の先頭へ
+    # 移動した — 外側 `except` からも採番できる必要があるため。
+    out_seq = SeqTracker()
+    ready_sent = False
     try:
+        # レビュー 1 周目 (codex I-1): handshake の読み取りを `try` の**内側**
+        # へ移した。旧実装は `try` の外で `read_frame` を呼んでいたため、
+        # 不正 JSON の handshake が `ProtocolError` を素通しさせて traceback
+        # で異常終了し、**`ready: ok=False` を一切返さなかった** (親からは
+        # 起動 timeout と区別がつかない)。EOF (None) は従来どおり正常終了。
+        handshake = read_frame(sys.stdin.buffer)
+        if handshake is None:
+            return
         if handshake.get("type") != "handshake":
             raise ProtocolError(
                 f"expected handshake, got {handshake.get('type')!r}")
@@ -247,13 +252,9 @@ def main() -> None:
         approved = (plugin_loader.approved_plugins(conn, plugins_dir)
                    if plugins_dir is not None else [])
 
-        # CR-3 対応: out_seq を先に構築し、_RagRpcProxy と on_message
-        # (event フレーム送出) の両方に同一インスタンスを共有させる —
-        # 子→親方向の ready/event/tool_rpc/result は 1 起点の単一
-        # カウンタでなければならない (設計書 §4.3 codex M2-1、親側
-        # WorkerRunner.in_seq がそう検証する)。
-        out_seq = SeqTracker()
-
+        # CR-3 対応: `main()` 冒頭で構築した out_seq を、_RagRpcProxy と
+        # on_message (event フレーム送出) の両方に**同一インスタンス**で
+        # 共有させる。
         registry = build_mission_registry(
             "trade", conn, settings, clock,
             _RagRpcProxy(
@@ -274,32 +275,55 @@ def main() -> None:
             model=settings.runner.trade.model, registry=registry,
             on_message=on_message)
 
-        write_frame(protocol_out, {
-            "type": "ready", "seq": _next_seq(out_seq), "ok": True})
+        _send_frame(protocol_out, out_seq, {"type": "ready", "ok": True})
+        ready_sent = True
 
         try:
             result = runner.run(mission)
-            write_frame(protocol_out, {
-                "type": "result", "seq": _next_seq(out_seq),
+            _send_frame(protocol_out, out_seq, {
+                "type": "result",
                 "status": result.status, "output": result.output})
         except Exception as exc:  # noqa: BLE001 — 必ず result を送る
-            write_frame(protocol_out, {
-                "type": "result", "seq": _next_seq(out_seq),
-                "status": "failed", "output": None,
+            _send_frame(protocol_out, out_seq, {
+                "type": "result", "status": "failed", "output": None,
                 "error": f"{type(exc).__name__}: {exc}"})
     except Exception as exc:  # noqa: BLE001 — ready 送出前の失敗も報告する
         try:
-            write_frame(protocol_out, {
-                "type": "ready", "seq": 1, "ok": False,
-                "error": f"{type(exc).__name__}: {exc}"})
+            # レビュー 1 周目 (codex I-2): 旧実装は無条件に
+            # `{"type": "ready", "seq": 1, ...}` を送っていた。`ready`
+            # (seq=1) を送出**済み**でこの節に到達する経路が実在する
+            # (内側 except 自身の送出が失敗した場合) ため、親の
+            # `SeqTracker` から見て seq=1 の**重複**になっていた。
+            # 送出済みなら `result: failed` として報告する。
+            if ready_sent:
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result", "status": "failed", "output": None,
+                    "error": f"{type(exc).__name__}: {exc}"})
+            else:
+                _send_frame(protocol_out, out_seq, {
+                    "type": "ready", "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}"})
         except Exception:  # noqa: BLE001 — パイプが壊れていれば諦める
             pass
 
 
-def _next_seq(tracker: SeqTracker) -> int:
-    n = tracker._expected  # noqa: SLF001 — 送出側は検証ではなく採番に使う
-    tracker._expected += 1
-    return n
+def _send_frame(protocol_out: Any, out_seq: SeqTracker, frame: dict) -> None:
+    """子→親のフレームを 1 件送出する (`seq` はここで採番して付す)。
+
+    **カウンタは送出が成功してから進める** (レビュー 1 周目 codex I-2)。
+    旧実装 (`_next_seq`) は serialize/write/flush より**前**に消費していた
+    ため、送出が失敗するとその seq が wire に出ないまま欠番になり、次に
+    成功したフレームを親の `SeqTracker` が `ProtocolError` として reject
+    した。実測: `runner.run()` の戻り値が壊れていて result フレームの
+    構築中に落ちると、wire 上は `ready(1)` の次が `result(3)` になった。
+
+    `SeqTracker` を採番器として流用する意図は Task 7 本文のとおり
+    (「次に来る/送り出すべき値」の意味が受信検証と送信採番で一致する)。
+    """
+    payload = dict(frame)
+    payload["seq"] = out_seq._expected  # noqa: SLF001 — 送出側は採番に使う
+    write_frame(protocol_out, payload)
+    out_seq._expected += 1  # noqa: SLF001
 
 
 if __name__ == "__main__":

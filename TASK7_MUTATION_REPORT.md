@@ -113,3 +113,32 @@
 
 - `uv run pytest -q` = **1489 passed, 1 deselected** (ベースライン 1459 + 30)
 - `mission_protocol.py` / `mission_worker.py` はプラン逐語コードと **byte 一致** (変異残留なし・機械照合済み)
+
+---
+
+# レビュー 1 周目の反映 (指揮者裁定, 2026-08-08)
+
+codex 主査 Important 3 件 + sonnet 副査 Important 4 件を裁定し、**全件採用**した。
+
+| 出典 | 指摘 | 裁定 |
+|---|---|---|
+| codex + sonnet | `read_frame` が `JSONDecodeError` を素通し (`ProtocolError` 単一表現と矛盾)。codex はさらに **`main()` が handshake 読取を `try` の外で呼ぶため不正 JSON では `ready:false` すら返らない**ことと、非 dict 検証の欠落を指摘 | **採用**。`read_frame` で `ValueError` を `ProtocolError` へ正規化 + 非 dict を拒否。handshake 読取を `try` 内へ移動 |
+| codex + sonnet | 外側 `except` の `seq: 1` ハードコード。codex はさらに **`_next_seq` が送出成功前にカウンタを消費する**ため内側 `except` 単独でも欠番が出ることを指摘 | **採用**。`_send_frame` を新設し**送出成功後**に採番を進める。外側 `except` は `ready_sent` を見て `result: failed` へ切替 |
+| codex + sonnet (両者一致) | accepted-unpinned 2 件 (`flush` / `dup2`) は Task 7 内で pin 可能 | **採用 — 指揮者の判断を撤回**。sonnet が `os.pipe()` を使う実行可能な probe を提示。両方 pin した |
+| sonnet 単独 | `_set_resource_limits` の fail closed が未検証 (`_drive_main` が常に成功する fake に差し替えているため) | **採用**。例外送出 fake で `ready:false` + registry 未到達を pin |
+
+重大度が割れた 1 件 (seq=1 ハードコード: codex「実害あり」/ sonnet「到達するが実害再現できず」) は、**codex の指摘した欠番経路が本質**と指揮者が判定して採用した。
+
+## 追加テスト 10 本
+
+`test_read_frame_raises_protocol_error_on_malformed_json` / `_on_invalid_utf8` / `test_read_frame_rejects_non_object_frames` / `test_write_frame_flushes_immediately` / `test_main_reports_ready_false_on_malformed_handshake_json` / `_on_non_object_handshake` / `test_main_does_not_leave_seq_gap_when_result_write_fails_once` / `test_main_does_not_resend_ready_when_outer_except_is_reached_after_ready` / `test_main_fails_closed_when_resource_limits_cannot_be_set` / `test_protect_protocol_stdout_redirects_fd1_to_stderr`
+
+## 変異テスト再走 (34 件)
+
+修正で変わったアンカーを更新し、**プラン記載 9 + 自主追加 17 + レビュー反映 8 = 34 件**を全て再注入。
+
+**生存 0 件**（初回の 16 件 → 12 本追加で 2 件 → レビュー反映で 0 件）。`追加D` は初回アンカーのインデント誤りで空振りしていたことも判明し、修正して red を確認した。
+
+## 最終状態
+
+- `uv run pytest -q` = **1499 passed, 1 deselected** (ベースライン 1459 + 40)

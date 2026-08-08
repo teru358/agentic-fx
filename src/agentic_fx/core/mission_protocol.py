@@ -55,4 +55,21 @@ def read_frame(stream: BinaryIO) -> dict | None:
     line = stream.readline()
     if not line:
         return None
-    return json.loads(line)
+    try:
+        frame = json.loads(line)
+    except ValueError as exc:
+        # レビュー 1 周目 (codex I-1 / sonnet C1): `ProtocolError` は
+        # 「プロトコル契約に反する入力全般の単一表現」と定義されているのに、
+        # 旧実装は `json.JSONDecodeError` (と不正 UTF-8 の
+        # `UnicodeDecodeError` — どちらも `ValueError` の派生) を素通し
+        # していた。親 (`WorkerRunner`, Task 10) が `except ProtocolError`
+        # をセッション違反の統一経路として実装しても捕捉できず、起動失敗の
+        # 分類・後始末が例外型に依存してしまう。
+        raise ProtocolError(f"malformed frame line: {exc}") from exc
+    if not isinstance(frame, dict):
+        # 同上。JSON の配列・文字列・数値は「行としては妥当」だがフレーム
+        # 契約には反する。型注釈上の `dict` を裏切ったまま返すと、受け手の
+        # `.get()` が `AttributeError` になり単一表現が崩れる。
+        raise ProtocolError(
+            f"frame must be a JSON object, got {type(frame).__name__}")
+    return frame
