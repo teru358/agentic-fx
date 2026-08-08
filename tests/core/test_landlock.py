@@ -74,11 +74,18 @@ class _ScriptedLibc:
     def __init__(self, *, syscall_results, prctl_result=0):
         self._results = list(syscall_results)
         self.syscall_numbers: list[int] = []
+        self.syscall_args: list[tuple] = []
         self.prctl_args: list[tuple] = []
 
         def syscall(*args):
             n = args[0]
             self.syscall_numbers.append(getattr(n, "value", n))
+            # レビュー 2 周目 (codex + sonnet 一致): 定数を見るだけでは
+            # 「その定数が実際に syscall へ渡されているか」を pin できない。
+            # `ctypes.byref(x)` は `CArgObject` を返し、`._obj` で元の
+            # 構造体を参照できる (CPython の実装詳細だがテスト専用)。
+            self.syscall_args.append(
+                tuple(getattr(a, "_obj", a) for a in args))
             if not self._results:
                 # sonnet 副査 (1 周目): 台本切れで 0 (成功) を返すのは
                 # fail-open。想定外の syscall が増えたときに黙って通す
@@ -157,23 +164,44 @@ def test_is_available_false_when_abi_below_required(monkeypatch):
     assert is_available() is True
 
 
-def test_ruleset_declares_truncate_in_handled_access(monkeypatch, tmp_path):
-    """`handled_access_fs` に `TRUNCATE` が入っていることを直接 pin する。
+def test_create_ruleset_is_handed_the_truncate_bit(monkeypatch, tmp_path):
+    """`landlock_create_ruleset` に**実際に渡される** `handled_access_fs` を
+    pin する (レビュー 2 周目 codex + sonnet 一致)。
 
-    実カーネルでの検証 (統合テストの (5)) と二層で守る — 実 Landlock
-    テストが何らかの理由で skip された環境でも、この宣言漏れは検出される。
+    旧版はモジュール定数 (`_HANDLED_ACCESS_FS` 等) を見るだけで、
+    `restrict_to` がその定数を本当に syscall へ渡しているかは見ていな
+    かった。**`_RulesetAttr(handled_access_fs=_ABI_V1_HANDLED_ACCESS_FS)`
+    に戻す配線変異は単体テストを全て素通りした** (実測)。
+    「実 Landlock テストが skip されても宣言漏れを検出する二層目」という
+    旧 docstring の主張は成立していなかった。
+
+    あわせて、各パスに渡される `allowed_access` (rule 側) も直接 pin する。
     """
     import agentic_fx.core.landlock as landlock_mod
 
-    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0])
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0])
     _install(monkeypatch, libc)
     ro = tmp_path / "ro"; ro.mkdir()
-    restrict_to(read_only_paths=[ro], read_write_paths=[])
-    assert landlock_mod._HANDLED_ACCESS_FS & landlock_mod._ACCESS_FS_TRUNCATE
-    # rw だけが TRUNCATE を許可され、ro は許可されない。
-    assert landlock_mod._READ_WRITE_ACCESS & landlock_mod._ACCESS_FS_TRUNCATE
-    assert not (landlock_mod._READ_ONLY_ACCESS
-                & landlock_mod._ACCESS_FS_TRUNCATE)
+    rw = tmp_path / "rw"; rw.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw])
+
+    # syscall 列: [444(abi), 444(create), 445(ro), 445(rw), 446]
+    create_attr = libc.syscall_args[1][1]
+    assert create_attr.handled_access_fs & landlock_mod._ACCESS_FS_TRUNCATE, \
+        "create_ruleset に TRUNCATE が宣言されていない"
+    assert create_attr.handled_access_fs == landlock_mod._HANDLED_ACCESS_FS
+
+    ro_attr = libc.syscall_args[2][3]
+    rw_attr = libc.syscall_args[3][3]
+    # rule 側の allowed_access は必ず handled の部分集合でなければならない
+    # (超えるとカーネルが EINVAL を返す)。
+    for attr in (ro_attr, rw_attr):
+        assert attr.allowed_access & ~create_attr.handled_access_fs == 0
+
+    assert not (ro_attr.allowed_access & landlock_mod._ACCESS_FS_TRUNCATE)
+    assert rw_attr.allowed_access & landlock_mod._ACCESS_FS_TRUNCATE
+    assert ro_attr.allowed_access == landlock_mod._READ_ONLY_ACCESS
+    assert rw_attr.allowed_access == landlock_mod._READ_WRITE_ACCESS
 
 
 def test_restrict_to_raises_when_add_rule_fails(monkeypatch, tmp_path):
@@ -254,7 +282,8 @@ _REAL_LANDLOCK_SCRIPT = textwrap.dedent("""
     restrict_to(read_only_paths=[ro_dir], read_write_paths=[rw_dir])
 
     # (1) read_only パスは読める
-    assert sorted(p.name for p in ro_dir.iterdir()) == ["x.txt"], "ro not readable"
+    assert sorted(p.name for p in ro_dir.iterdir()) == ["empty", "x.txt"], \
+        "ro not readable"
 
     # (2) read_only パスへは **新規作成できない** (_ACCESS_FS_MAKE_REG 非付与)
     try:
@@ -287,7 +316,8 @@ _REAL_LANDLOCK_SCRIPT = textwrap.dedent("""
     except PermissionError:
         pass
 
-    # (3) read_write パスへは **新規作成できる** (_ACCESS_FS_MAKE_REG)
+    # (3) read_write パスへは **新規作成できる** (MAKE_REG + WRITE_FILE を
+    #     同時に要求する — 各 bit の分離は (7b)/(7c) が担当する)
     try:
         (rw_dir / "new.txt").write_text("x")
     except PermissionError:
@@ -369,14 +399,60 @@ _REAL_LANDLOCK_SCRIPT = textwrap.dedent("""
         print("FAIL: O_RDWR write was denied on a read-write path")
         sys.exit(1)
 
+    # (7c) `MAKE_REG` を **単独で** pin する (レビュー 2 周目 sonnet)。
+    #      `Path.write_text()` は MAKE_REG と WRITE_FILE を同時に要求する
+    #      ため、(2) では MAKE_REG を分離できず、`_READ_ONLY_ACCESS` に
+    #      MAKE_REG を足す変異が生存した。`O_CREAT|O_RDONLY` は MAKE_REG
+    #      だけを要求する。
+    try:
+        fd = os.open(str(ro_dir / "created.txt"), os.O_CREAT | os.O_RDONLY, 0o644)
+        os.close(fd)
+        print("FAIL: O_CREAT succeeded on a read-only path")
+        sys.exit(1)
+    except PermissionError:
+        pass
+
+    # (7d) `REMOVE_FILE` の否定側 pin (レビュー 2 周目 sonnet)。read-only
+    #      パスのファイルを **削除** できないこと。1 周目の Critical と
+    #      同じクラス — 削除できれば `data/agentic.db` を消せる。
+    try:
+        os.unlink(ro_dir / "x.txt")
+        print("FAIL: unlink succeeded on a read-only path")
+        sys.exit(1)
+    except PermissionError:
+        pass
+
+    # (7e) `REMOVE_DIR` の否定側 pin (レビュー 2 周目 codex + sonnet)。
+    #      ro 配下の **既存の空ディレクトリ** を削除できないこと。
+    #      (2c) の mkdir 拒否は MAKE_DIR の検査であって REMOVE_DIR では
+    #      ないため、ro に REMOVE_DIR を足す変異が生存していた。
+    try:
+        os.rmdir(ro_dir / "empty")
+        print("FAIL: rmdir succeeded on a read-only path")
+        sys.exit(1)
+    except PermissionError:
+        pass
+
     # (8) read_write は「専用 workdir」なのでディレクトリを作れる/消せる
     #     (codex Important — MAKE_DIR/REMOVE_DIR が無い領域は workdir として
     #     使えない)。read_only では作れない。
+    #      どちらの bit が欠けたか分かるよう try を分ける (codex の指摘)。
     try:
         (rw_dir / "sub").mkdir()
+    except PermissionError:
+        print("FAIL: mkdir denied on a read-write path")
+        sys.exit(1)
+    try:
         (rw_dir / "sub").rmdir()
     except PermissionError:
-        print("FAIL: mkdir/rmdir denied on a read-write path")
+        print("FAIL: rmdir denied on a read-write path")
+        sys.exit(1)
+
+    # (9) `REMOVE_FILE` の positive control (rw では削除できる)。
+    try:
+        os.unlink(rw_dir / "new.txt")
+    except PermissionError:
+        print("FAIL: unlink denied on a read-write path")
         sys.exit(1)
 
     print("OK")
@@ -399,6 +475,7 @@ def test_real_landlock_enforces_read_only_read_write_and_blocked(tmp_path):
     ro = tmp_path / "ro"
     ro.mkdir()
     (ro / "x.txt").write_text("ok")
+    (ro / "empty").mkdir()      # (7e) REMOVE_DIR の否定 pin 用
     rw = tmp_path / "rw"
     rw.mkdir()
     (rw / "existing.txt").write_text("before")
