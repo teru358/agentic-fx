@@ -142,3 +142,43 @@ codex 主査 Important 3 件 + sonnet 副査 Important 4 件を裁定し、**全
 ## 最終状態
 
 - `uv run pytest -q` = **1499 passed, 1 deselected** (ベースライン 1459 + 40)
+
+---
+
+# レビュー 2 周目の反映 (指揮者裁定, 2026-08-08)
+
+**重大度が割れた** (codex: Important 1 + Minor 1 / sonnet: Minor 3 のみ)。規約どおり指揮者が再判定し、**codex の Important を採用**した。sonnet は「テストが元の欠陥を検出できるか」を 8 件の変異で実測確認したが、**retry ポリシー自体の健全性**は検証しておらず、この欠陥に到達していない。
+
+| 出典 | 指摘 | 裁定 |
+|---|---|---|
+| codex | **1 周目の修正が新しい欠陥を持ち込んでいた** — `write`/`flush` の例外は「wire に 1 バイトも出ていない」ことを保証しないのに、同じ seq で再送していた。部分書込み後なら**行が壊れ**、flush 後の失敗なら**重複**になる。あわせて `_FlakyStream` が「書き込む前に raise」しており実 I/O の曖昧性をモデル化していないことも指摘 | **採用 (Important)** |
+| sonnet 単独 | `_RagRpcProxy._call` の「送出成功後に採番」が未 pin (pre-increment に戻しても 1499 件 green) | **採用** |
+| sonnet 単独 | `write_frame` の `TypeError` を正規化しない非対称が未文書 | **採用** (docstring に理由を明記) |
+| codex + sonnet | 廃止済み `_next_seq` / `_seq_next` への言及が散文に残存。sonnet は **Task 18 のスケッチ**にも残っていることを追加検出 | **採用** |
+
+## 実装した修正
+
+- `mission_protocol.encode_frame()` を分離 (ストリームに触れない serialize 専用)
+- `mission_worker._write_frame_or_die()` を新設 — **serialize 失敗**は例外として上げ (wire 未接触 → 同一 seq で再送可)、**transport 失敗**は `os._exit(1)` で**再送せず即終了** (配信不明 → fail closed)
+- `_RagRpcProxy` の `tool_rpc` 送出も同じ writer を通す
+- `_FlakyStream` に `partial_bytes` を追加し、「部分書込み後の失敗」「全バイト書込み後の flush 失敗」「serialize 失敗」の 3 経路を個別に pin
+- `_make_on_message` のピンを **serialize 失敗**へ変更 (transport 失敗は `_write_frame_or_die` が先に落とすため、この guard の単独ピンにならなくなっていた)
+
+テスト 5 本追加 (計 45 本)。
+
+## 変異テスト再走 (40 件)
+
+**生存 1 件** — `encode_frame` を `write_frame` にインライン戻しする**等価変異** (equivalent mutant: 出力がバイト単位で同一なので、原理的にどのテストでも区別できない)。実質的な生存はゼロ。
+
+### 変異 driver の落とし穴 (今回実測)
+
+変異が `os._exit` を踏むと **pytest プロセスごと停止**し、driver からは「FAILED 行なし = 生存」に見える。`R2-b` (serialize 失敗も transport 扱いにする変異) で実際に**偽の生存**を 1 件出した。
+
+対策 2 つを入れた:
+1. driver 側: pytest の要約行に `passed`/`failed`/`error` が無ければ「異常終了 = 検出扱い」とする
+2. テスト側: fail-closed 経路を持つコードのテストは `os._exit` を必ず monkeypatch する。**「終了しないこと」の assert も pin になる** (serialize 失敗の 2 本に `assert codes == []` を追加した)
+
+## 最終状態
+
+- `uv run pytest -q` = **1504 passed, 1 deselected** (ベースライン 1459 + 45)
+- 実装ファイルはプラン Step 3 / Step 8 の逐語コードと **byte 一致** (機械照合済み)

@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from agentic_fx.core.mission_protocol import (
-    ProtocolError, SeqTracker, read_frame, write_frame,
+    ProtocolError, SeqTracker, encode_frame, read_frame,
 )
 
 if TYPE_CHECKING:
@@ -157,13 +157,18 @@ def _make_on_message(protocol_out: Any, out_seq: SeqTracker) -> Callable[[dict],
             _send_frame(protocol_out, out_seq, {"type": "event", "message": msg})
         except Exception:  # noqa: BLE001 — I6 対応 (fail closed)
             # LocalRunner._sink (Task 6) は on_message の例外を握って
-            # run() を継続する契約 — しかしここで write_frame が失敗
-            # すると out_seq だけが消費され、次に成功する event フレーム
-            # の seq が欠番になり親の SeqTracker が ProtocolError を
-            # 送出する (レビュー I6)。fail-soft に「継続」させず、
-            # このプロセスを即座に終了する (親は EOF/予期しない終了
-            # として Mission を失敗させる — 既に壊れた状態で
-            # LocalRunner.run() を続けても無意味)。
+            # run() を継続する契約 — しかし event フレームを送れないまま
+            # 実行を続けると、親は transcript の一部を永久に受け取れない
+            # (レビュー I6)。fail-soft に「継続」させず、このプロセスを
+            # 即座に終了する (親は EOF/予期しない終了として Mission を
+            # 失敗させる — 既に壊れた状態で run() を続けても無意味)。
+            #
+            # レビュー 2 周目 (codex) 以降、transport 失敗は
+            # `_write_frame_or_die` がプロセスごと落とすため、この節へ
+            # 実際に到達するのは **serialize 失敗** (transcript の message
+            # が JSON にならない) のとき。その場合 seq は未消費なので
+            # 欠番にはならないが、送れなかった事実は変わらないので
+            # 同じく fail closed にする。
             os._exit(1)
     return on_message
 
@@ -258,7 +263,7 @@ def main() -> None:
         registry = build_mission_registry(
             "trade", conn, settings, clock,
             _RagRpcProxy(
-                lambda frame: write_frame(protocol_out, frame),
+                lambda frame: _write_frame_or_die(protocol_out, frame),
                 lambda: read_frame(sys.stdin.buffer),
                 out_seq, in_seq),
             activity=activity, indicator_plugins=approved, readonly=True)
@@ -307,6 +312,32 @@ def main() -> None:
             pass
 
 
+def _write_frame_or_die(protocol_out: Any, frame: dict) -> None:
+    """1 フレームを protocol stream へ書く。**transport 失敗なら即プロセス終了**。
+
+    レビュー 2 周目 (codex): `write`/`flush` の例外は「フレームが wire に
+    1 バイトも出ていない」ことを**保証しない**。部分書込みの後に失敗して
+    いれば、同じ seq で別フレームを送り直すと `{"type":...` の途中に別の
+    JSON が連結されて**行が壊れる**。flush がデータを相手へ渡した後に失敗
+    したのなら、親は既に最初のフレームを受理しており、再送は**重複**に
+    なる。どちらが起きたかは呼び出し側から判定できない。
+
+    したがって transport 失敗は回復不能として扱い、**再送せずに子を即座に
+    終了する** (fail closed)。親は EOF / 異常終了として Mission を失敗
+    させる — これは `_make_on_message` (I6) が既に採っている方針と同じ。
+
+    serialize 失敗 (`encode_frame` の `TypeError` 等) は**ここへ来る前に**
+    送出され、ストリームには触れない。呼び出し側はその場合だけ同じ seq で
+    別フレームを送り直してよい。
+    """
+    line = encode_frame(frame)  # serialize 失敗はここ (wire 未接触 → 再送可)
+    try:
+        protocol_out.write(line)
+        protocol_out.flush()
+    except Exception:  # noqa: BLE001 — 配信有無が不明なので回復を試みない
+        os._exit(1)
+
+
 def _send_frame(protocol_out: Any, out_seq: SeqTracker, frame: dict) -> None:
     """子→親のフレームを 1 件送出する (`seq` はここで採番して付す)。
 
@@ -317,12 +348,16 @@ def _send_frame(protocol_out: Any, out_seq: SeqTracker, frame: dict) -> None:
     した。実測: `runner.run()` の戻り値が壊れていて result フレームの
     構築中に落ちると、wire 上は `ready(1)` の次が `result(3)` になった。
 
+    「送出が成功していないなら seq を進めない」が安全なのは **serialize
+    失敗のときだけ** — transport 失敗は `_write_frame_or_die` がプロセス
+    ごと落とすため、そもそも呼び出し側に戻らない (レビュー 2 周目 codex)。
+
     `SeqTracker` を採番器として流用する意図は Task 7 本文のとおり
     (「次に来る/送り出すべき値」の意味が受信検証と送信採番で一致する)。
     """
     payload = dict(frame)
     payload["seq"] = out_seq._expected  # noqa: SLF001 — 送出側は採番に使う
-    write_frame(protocol_out, payload)
+    _write_frame_or_die(protocol_out, payload)
     out_seq._expected += 1  # noqa: SLF001
 
 

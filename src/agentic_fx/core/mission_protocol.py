@@ -46,8 +46,28 @@ class SeqTracker:
         self._expected += 1
 
 
+def encode_frame(frame: dict) -> bytes:
+    """フレームを wire 表現 (JSON 1 行) に変換する。**ストリームには触れない**。
+
+    レビュー 2 周目 (codex): 送出は「serialize 失敗 (wire 未接触 — 同じ seq で
+    別フレームを送り直してよい)」と「transport 失敗 (`write`/`flush` の例外 —
+    **配信の有無が確定できない**)」を区別しなければならない。両者を
+    `write_frame` の中で一体にしていると、呼び出し側はどちらが起きたのか
+    判定できず、部分書込み後の再送が wire 上に壊れた行を作る。
+    `mission_worker._send_frame` はこの関数で先に serialize してから
+    ストリームへ書く。
+
+    `json.dumps` の `TypeError` は `ProtocolError` に**正規化しない**
+    (レビュー 2 周目 codex/sonnet で確認した意図的な非対称)。`ProtocolError`
+    は「**受け取った**入力がプロトコル契約に反する」ことの表現であり、
+    こちらは「自分が送ろうとした値が JSON にならない」ローカルなプログラム
+    不備 — 別の故障クラスなので同じ型に潰すと親の分岐が誤る。
+    """
+    return json.dumps(frame, ensure_ascii=False).encode("utf-8") + b"\n"
+
+
 def write_frame(stream: BinaryIO, frame: dict) -> None:
-    stream.write(json.dumps(frame, ensure_ascii=False).encode("utf-8") + b"\n")
+    stream.write(encode_frame(frame))
     stream.flush()
 
 

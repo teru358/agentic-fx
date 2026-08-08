@@ -148,13 +148,39 @@ def test_rag_rpc_proxy_rejects_seq_gap():
         proxy.search_news("q")
 
 
-def test_on_message_exits_process_on_write_failure(monkeypatch):
-    """I6 対応: write_frame が失敗したら os._exit(1) で即座にプロセスを
-    終了する。LocalRunner._sink の fail-soft (Task 6) に頼って継続すると
-    out_seq だけが消費され、次の成功フレームが親の SeqTracker に欠番
-    として reject される。"""
+def test_on_message_exits_process_on_serialize_failure(monkeypatch):
+    """I6 対応: event フレームを送れなかったら `os._exit(1)` で即座に
+    プロセスを終了する (`LocalRunner._sink` の fail-soft に頼って継続
+    しない — 親は transcript の一部を永久に受け取れなくなる)。
+
+    レビュー 2 周目 (codex) 以降、**transport 失敗は
+    `_write_frame_or_die` がプロセスごと落とす**ため、この節へ実際に
+    到達するのは serialize 失敗 (message が JSON にならない) のとき。
+    `_make_on_message` 自身の guard を単独で pin するため、ここでは
+    serialize 失敗を注入する (transport 失敗を注入すると
+    `_write_frame_or_die` 側で exit してしまい、この try/except を
+    削除しても green のままになる)。"""
+    import io as _io
+
     from agentic_fx.core.mission_protocol import SeqTracker
 
+    exit_calls: list[int] = []
+    monkeypatch.setattr(mission_worker.os, "_exit", exit_calls.append)
+
+    out_seq = SeqTracker()
+    stream = _io.BytesIO()
+    on_message = mission_worker._make_on_message(stream, out_seq)
+    on_message({"role": "assistant", "content": object()})  # JSON 化不可
+
+    assert exit_calls == [1]
+    assert stream.getvalue() == b""       # wire には何も出ていない
+    assert out_seq._expected == 1          # seq も消費していない
+
+
+def test_write_frame_or_die_exits_on_transport_failure(monkeypatch):
+    """レビュー 2 周目 (codex): `write`/`flush` の例外は「wire に 1 バイトも
+    出ていない」ことを保証しない (部分書込み / flush 後の失敗)。同じ seq で
+    再送すると壊れた行か重複フレームを作るため、**再送せず即終了**する。"""
     exit_calls: list[int] = []
     monkeypatch.setattr(mission_worker.os, "_exit", exit_calls.append)
 
@@ -165,11 +191,48 @@ def test_on_message_exits_process_on_write_failure(monkeypatch):
         def flush(self):
             pass
 
-    out_seq = SeqTracker()
-    on_message = mission_worker._make_on_message(BrokenStream(), out_seq)
-    on_message({"role": "assistant", "content": "x"})
-
+    mission_worker._write_frame_or_die(BrokenStream(), {"type": "ready", "seq": 1})
     assert exit_calls == [1]
+
+
+def test_write_frame_or_die_exits_when_flush_fails(monkeypatch):
+    """`write` が成功しても `flush` が失敗すれば配信は確定できない
+    (同じ防御を 2 方向から壊す — 変異リストは下限であって天井ではない)。"""
+    exit_calls: list[int] = []
+    monkeypatch.setattr(mission_worker.os, "_exit", exit_calls.append)
+
+    class FlushBrokenStream:
+        def __init__(self):
+            self.written = b""
+
+        def write(self, data):
+            self.written += data
+
+        def flush(self):
+            raise BrokenPipeError("flush failed")
+
+    mission_worker._write_frame_or_die(
+        FlushBrokenStream(), {"type": "ready", "seq": 1})
+    assert exit_calls == [1]
+
+
+def test_rag_rpc_proxy_does_not_advance_out_seq_when_send_fails():
+    """sonnet 副査 2 周目 (単独検出): `_call` の「送出成功後に採番を進める」
+    性質が未 pin だった (pre-increment に戻しても全 1499 件が green)。
+    `_send_frame` と同じ append-site の穴 (Task 6 で同型の指摘)。"""
+    from agentic_fx.core.mission_protocol import SeqTracker
+
+    out_seq = SeqTracker()
+
+    def failing_write(frame):
+        raise BrokenPipeError("send failed")
+
+    proxy = mission_worker._RagRpcProxy(
+        failing_write, lambda: None, out_seq, SeqTracker())
+    with pytest.raises(BrokenPipeError):
+        proxy.search_news("q")
+
+    assert out_seq._expected == 1  # 消費していない
 
 
 def test_main_rejects_handshake_with_wrong_type(monkeypatch, tmp_path):
@@ -357,7 +420,8 @@ class _FakeLocalRunner:
 
 def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
                 settings_mutator=None, runner_raises=False,
-                raw_stdin=None, out_stream=None, resource_limits_raise=False):
+                raw_stdin=None, out_stream=None, resource_limits_raise=False,
+                runner_cls=None):
     """`main()` をインプロセスで駆動し、送出フレーム列と観測点を返す。
 
     `raw_stdin`: handshake の JSON 化を飛ばして生バイト列を stdin に流す
@@ -421,7 +485,7 @@ def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
                         fake_build_mission_registry)
     _FakeLocalRunner.instances = []
     monkeypatch.setattr("agentic_fx.runners.local_runner.LocalRunner",
-                        _FakeLocalRunner)
+                        runner_cls if runner_cls is not None else _FakeLocalRunner)
     if runner_raises:
         orig_init = _FakeLocalRunner.__init__
 
@@ -631,25 +695,52 @@ def test_rag_rpc_proxy_advances_out_seq_across_successive_calls():
 # ---------------------------------------------------------------------------
 
 
-class _FlakyStream:
-    """指定した回数目の `write()` だけ `BrokenPipeError` を送出する fake。
+class _ExitCalled(BaseException):
+    """`os._exit` の代替。`main()` の `except Exception` に捕まらないよう
+    `BaseException` を継承する (実プロセスでは戻ってこない呼び出しなので、
+    テストでも「以降を実行しない」を再現する必要がある)。"""
 
-    送出失敗が seq 採番に与える影響 (欠番・重複) を観測するために使う。
+
+def _fake_os_exit(monkeypatch):
+    codes: list[int] = []
+
+    def fake_exit(code):
+        codes.append(code)
+        raise _ExitCalled(code)
+
+    monkeypatch.setattr(mission_worker.os, "_exit", fake_exit)
+    return codes
+
+
+class _FlakyStream:
+    """指定した回数目の `write()` で失敗する fake。
+
+    レビュー 2 周目 (codex): 旧版は失敗回に**書き込む前に** raise していた
+    ため、実 I/O の曖昧性 (部分書込み後の失敗) をモデル化できていなかった。
+    `partial_bytes` を指定すると「一部だけ書いてから失敗」を再現する。
     """
 
-    def __init__(self, fail_writes: set[int]) -> None:
+    def __init__(self, fail_writes: set[int], partial_bytes: int = 0) -> None:
         self.calls = 0
         self._fail = fail_writes
+        self._partial = partial_bytes
         self.buf = bytearray()
 
     def write(self, data: bytes) -> None:
         self.calls += 1
         if self.calls in self._fail:
+            if self._partial:
+                self.buf += data[:self._partial]  # 部分書込み後に失敗
             raise BrokenPipeError("simulated pipe failure")
         self.buf += data
 
     def flush(self) -> None:
         pass
+
+
+class _UnserializableOutput:
+    """`json.dumps` できない値 (`MissionResult.output` に載せて serialize
+    失敗を注入する)。"""
 
 
 def test_main_reports_ready_false_on_malformed_handshake_json(
@@ -679,39 +770,129 @@ def test_main_reports_ready_false_on_non_object_handshake(monkeypatch, tmp_path)
     assert registry_calls == []
 
 
-def test_main_does_not_leave_seq_gap_when_result_write_fails_once(
+def test_main_exits_without_retrying_when_result_write_fails(
         monkeypatch, tmp_path):
-    """codex I-2: seq は**送出成功後**に進める。
+    """レビュー 2 周目 (codex): **transport 失敗の後に同じ seq で再送しない**。
 
-    3 回目の write (= result フレーム) を 1 度だけ失敗させる。内側 `except`
-    が送る failed result は **同じ seq=3** で出なければならない。旧実装は
-    送出前に採番していたため wire 上が `ready(1) → event(2) → result(4)`
-    となり、親の `SeqTracker` が欠番として reject した。"""
-    stream = _FlakyStream({3})
-    frames, _, _ = _drive_main(monkeypatch, tmp_path, out_stream=stream)
+    旧版のピンは「3 回目の write を失敗させ、内側 `except` が同じ seq=3 で
+    failed result を送り直す」ことを期待していたが、これは「write 例外 ⇒
+    wire に 1 バイトも出ていない」という**成立しない仮定**に依存していた。
+    部分書込みの後に失敗していれば、再送は wire に壊れた行を作る。
 
+    ここでは result の write が**部分書込みの後に**失敗する状況を注入し、
+    子が即終了 (`os._exit(1)`) して**一切再送しない**ことを pin する。"""
+    codes = _fake_os_exit(monkeypatch)
+    stream = _FlakyStream({3}, partial_bytes=10)
+
+    with pytest.raises(_ExitCalled):
+        _drive_main(monkeypatch, tmp_path, out_stream=stream)
+
+    assert codes == [1]
+    # wire には ready(1) / event(2) と、途中で切れた 3 本目の断片だけ。
+    # **その後ろに再送フレームが連結されていない**ことが本質。
+    lines = bytes(stream.buf).split(b"\n")
+    assert json.loads(lines[0])["type"] == "ready"
+    assert json.loads(lines[1])["type"] == "event"
+    assert len(lines) == 3          # 断片 1 個のみ (末尾に改行が無い)
+    assert not lines[2].endswith(b"}")   # 完結した JSON 行ではない
+
+
+def test_main_exits_without_retrying_when_result_flush_fails(
+        monkeypatch, tmp_path):
+    """同じ防御を別方向から壊す: `write` が全バイト受理した後に `flush` が
+    失敗した場合。親が既に受理している可能性があるので、同じ seq の再送は
+    **重複**になる。やはり再送せず終了する。"""
+    codes = _fake_os_exit(monkeypatch)
+
+    class _FlushFailsOnThird:
+        def __init__(self):
+            self.calls = 0
+            self.buf = bytearray()
+
+        def write(self, data):
+            self.calls += 1
+            self.buf += data
+
+        def flush(self):
+            if self.calls == 3:
+                raise BrokenPipeError("flush failed after delivery")
+
+    stream = _FlushFailsOnThird()
+    with pytest.raises(_ExitCalled):
+        _drive_main(monkeypatch, tmp_path, out_stream=stream)
+
+    assert codes == [1]
+    frames = [json.loads(l) for l in bytes(stream.buf).splitlines()]
+    assert [f["type"] for f in frames] == ["ready", "event", "result"]
+    assert [f["seq"] for f in frames] == [1, 2, 3]
+    # seq=3 の result が 1 本だけ。再送していれば 2 本目が続く。
+    assert sum(1 for f in frames if f["seq"] == 3) == 1
+
+
+def test_main_reuses_seq_when_result_frame_cannot_be_serialized(
+        monkeypatch, tmp_path):
+    """レビュー 2 周目 (codex): **serialize 失敗は wire 未接触なので再送可**。
+
+    `runner.run()` が JSON 化できない `output` を返すと `encode_frame` が
+    `TypeError` を送出する — ストリームには触れていないので seq は未消費。
+    内側 `except` が送る failed result は**同じ seq=3** で出なければならず、
+    欠番も重複も生じない。これが「送出成功後に採番を進める」修正 (1 周目
+    codex I-2) の本来の適用範囲である。"""
+    class _BadOutputRunner(_FakeLocalRunner):
+        def run(self, mission):
+            from agentic_fx.runners.base import MissionResult
+            self.kwargs["on_message"]({"role": "assistant", "content": "hi"})
+            return MissionResult(status="completed",
+                                 output={"bad": _UnserializableOutput()})
+
+    # serialize 失敗では **プロセスを落とさない** ことも同時に pin する
+    # (落とすと wire 未接触なのに Mission 失敗を報告できなくなる)。
+    codes = _fake_os_exit(monkeypatch)
+    frames, _, _ = _drive_main(monkeypatch, tmp_path, runner_cls=_BadOutputRunner)
+
+    assert codes == []
     assert [f["type"] for f in frames] == ["ready", "event", "result"]
     assert [f["seq"] for f in frames] == [1, 2, 3]
     assert frames[2]["status"] == "failed"
+    assert "TypeError" in frames[2]["error"]
 
 
 def test_main_does_not_resend_ready_when_outer_except_is_reached_after_ready(
         monkeypatch, tmp_path):
-    """codex I-2: 外側 `except` の `seq: 1` ハードコードの回帰ピン。
+    """1 周目 codex I-2 (外側 `except` の `seq: 1` ハードコード) の回帰ピン。
 
-    result の送出 (3 回目) と、内側 `except` による failed result の送出
-    (4 回目) を両方失敗させると、外側 `except` に到達する。旧実装はここで
-    無条件に `{"type": "ready", "seq": 1, ...}` を送っていたため、既に送出
-    済みの `ready(seq=1)` と**重複**した。"""
-    stream = _FlakyStream({3, 4})
-    frames, _, _ = _drive_main(monkeypatch, tmp_path, out_stream=stream)
+    result の serialize と、内側 `except` が送る failed result の serialize を
+    **両方**失敗させると外側 `except` に到達する。旧実装はここで無条件に
+    `{"type": "ready", "seq": 1, ...}` を送っていたため、既に送出済みの
+    `ready(seq=1)` と重複した。"""
+    class _BadOutputRunner(_FakeLocalRunner):
+        def run(self, mission):
+            from agentic_fx.runners.base import MissionResult
+            self.kwargs["on_message"]({"role": "assistant", "content": "hi"})
+            return MissionResult(status="completed",
+                                 output={"bad": _UnserializableOutput()})
 
-    assert [f["type"] for f in frames] == ["ready", "event", "result"]
-    assert [f["seq"] for f in frames] == [1, 2, 3]
-    assert frames[0]["ok"] is True
-    assert frames[2]["status"] == "failed"
-    # ready は 1 回だけ。重複した ready は親の SeqTracker が reject する。
+    # 内側 except の failed result も serialize 不能にする — error 文字列に
+    # 直接は載らないので、encode_frame 自体を 2 回目以降失敗させる。
+    real_encode = mission_worker.encode_frame
+    state = {"n": 0}
+
+    def flaky_encode(frame):
+        if frame.get("type") == "result":
+            state["n"] += 1
+            if state["n"] <= 2:
+                raise TypeError("cannot serialize result")
+        return real_encode(frame)
+
+    monkeypatch.setattr(mission_worker, "encode_frame", flaky_encode)
+
+    codes = _fake_os_exit(monkeypatch)
+    frames, _, _ = _drive_main(monkeypatch, tmp_path, runner_cls=_BadOutputRunner)
+
+    assert codes == []
     assert sum(1 for f in frames if f["type"] == "ready") == 1
+    assert [f["seq"] for f in frames] == [1, 2, 3]
+    assert frames[2]["type"] == "result" and frames[2]["status"] == "failed"
 
 
 def test_main_fails_closed_when_resource_limits_cannot_be_set(
