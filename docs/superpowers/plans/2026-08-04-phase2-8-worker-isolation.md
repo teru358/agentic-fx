@@ -4024,7 +4024,7 @@ EOF
 
 **Files:**
 - Create: `src/agentic_fx/runners/worker_runner.py`
-- Modify: `src/agentic_fx/service.py:339-343`(`build_app` のデフォルト runner を `WorkerRunner` に)`,573-577`(shutdown の close 判定を `hasattr` ベースに一般化)
+- Modify: `src/agentic_fx/service.py:409-414`(`build_app` のデフォルト runner を `WorkerRunner` に)`,642-643`(shutdown の close 判定を `hasattr` ベースに一般化) — **2026-08-08 指揮者が実測して訂正。旧稿の `339-343`/`573-577` はそれぞれ約 70 行のドリフト**
 - Modify: `tests/test_service_app.py:453-459` (`isinstance(app.runner, LocalRunner)` → `WorkerRunner` に更新)
 - Test: `tests/runners/test_worker_runner.py` (新規 — FakeChild によるインプロセス単体テスト + 実 subprocess の最小 E2E 1 本)
 
@@ -4810,6 +4810,21 @@ def test_owns_runner_true_when_built_locally(tmp_path):
 
 `tests/test_service_app.py` の import 節に `from agentic_fx.runners.worker_runner import WorkerRunner` を追加する (`LocalRunner` の import が他で使われていなければ削除、使われていれば残す — `grep -n "LocalRunner" tests/test_service_app.py` で確認)。
 
+**2026-08-08 指揮者の着手前照合による追記 — 旧稿は更新対象を 1 箇所しか挙げていなかった**:
+
+`grep -n "LocalRunner" tests/test_service_app.py` の実測結果は **3 箇所** (`:13` import / `:458` isinstance / **`:609`**)。3 つ目が問題になる:
+
+```python
+def test_run_service_closes_owned_runner_on_graceful_shutdown(tmp_path):
+    """F4-②: owns_runner=True 相当 (`LocalRunner` の spec を持つ mock に
+    差し替え)。graceful shutdown で close() が 1 回だけ呼ばれること。"""
+    mock_runner = MagicMock(spec=LocalRunner)      # ← ここ
+```
+
+このテストは「所有する runner が graceful shutdown で close される」ことの唯一の pin である。本 task で `service.py:642` の判定を `isinstance(app.runner, LocalRunner)` から `hasattr(app.runner, "close")` へ**一般化**すると、`spec=LocalRunner` の mock は `close` を持つので**このテストは緑のまま通る** — つまり **`WorkerRunner` が close されることは一切検証されない**状態になる。Task 7〜9 で繰り返し出た「配線を検証していない」パターンそのものである。
+
+**対応 (必須)**: `spec=LocalRunner` を **`spec=WorkerRunner`** に変更する。そのうえで、**`service.py:642` の `hasattr(app.runner, "close")` 判定を削除する変異を注入して、このテストが red になることを確認する** (Step 9 の変異リストに追加すること)。`WorkerRunner.close()` は no-op だが、「所有権があれば close を呼ぶ」という配線自体が防御であり、Task 19 の `App.close` がこの規約を引き継ぐ。
+
 - [ ] **Step 8: 全体 green**
 
 ```bash
@@ -4828,6 +4843,10 @@ Expected: 全件 PASS。**注意**: `build_app` を `runner=None` で呼ぶ既�
 6. (IM-3/P8-03) `_mission_worker_env` の `if worker_profile == "trade":` ブロックを削除 (資格情報 allowlist を無条件スキップ) → `test_mission_worker_env_includes_data_provider_credentials_for_trade` が red
 7. (IM-7) `finally` 節の `dispatcher.join(timeout=w.rpc_timeout_sec + 5.0)` 行を削除 → `test_worker_runner_finally_joins_dispatcher_before_closing_stdin` が red (`dispatcher_threads` の `is_alive()` が `True` のまま残るケースが発生し得る — 環境によりタイミング依存で毎回 red にならない場合は、`dispatcher_loop` 内に `time.sleep(0.05)` を一時挿入してレースを顕在化させ、削除の効果を確認する旨をコメントで明記する)
 8. (FC-1) `dispatcher_loop` 内の `threading.Thread(target=_rpc_worker, daemon=True, ...)` を `daemon=False` に改変 → `test_leaked_daemon_thread_does_not_block_process_exit` は同型スクリプトを直接実行するため本改変では red にならない (WorkerRunner 内部の変更だけでは検出できない設計上の限界) — 代わりに `test_worker_runner_leaked_rag_rpc_returns_promptly_with_daemon_thread` の `assert all(th.daemon for th in leaked)` が red になることを確認する
+
+**2026-08-08 指揮者の着手前照合による追加変異**:
+
+- **(配線 pin) `service.py` の shutdown 判定 `if app.owns_runner and hasattr(app.runner, "close"):` を削除する** → `test_run_service_closes_owned_runner_on_graceful_shutdown` が red になることを確認する。**Step 7 で mock の spec を `WorkerRunner` に変えていないと、この変異は生存する** (`spec=LocalRunner` のままだと `hasattr` 判定の一般化が検証されないため)
 
 - [ ] **Step 9b (FC-1): 実 subprocess での対比実測を確認する**
 
