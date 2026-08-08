@@ -3210,7 +3210,7 @@ Expected: 全件 PASS (mission_worker.py は他モジュールから import さ�
 8. (I6) `_make_on_message` 内の `try/except` を削除し `os._exit(1)` 呼び出しごと外す → `test_on_message_exits_process_on_write_failure` が red (`exit_calls` が空のまま、または `BrokenPipeError` が素通しで送出されテストがエラー終了する — いずれにせよ green にならない)
 9. (親→子 seq 連続性) `_RagRpcProxy` に渡す `in_seq` を `main()` 共有のものから新規 `SeqTracker()` に差し替える → `test_rag_rpc_proxy_in_seq_continues_after_handshake` が red (handshake 消費後の期待値 2 が 1 に戻る)
 
-**Step 11 の実測による修正 (2026-08-08 指揮者。実測記録は worktree の `TASK7_MUTATION_REPORT.md`)**:
+**Step 11 の実測による修正 (2026-08-08 指揮者。実測記録は `.superpowers/sdd/2026-08-04-phase2-8-worker-isolation/task07-mutation-report.md`)**:
 
 プラン記載 9 件 + 自主追加 17 件を実測したところ、**16 件が生存**した。根本原因は 1 つ — **`main()` の bootstrap 本体に一切テストが無い**。Step 5 のテスト 12 本は `_RagRpcProxy`/`_make_on_message`/`_set_pdeathsig`/`_build_clock` の**単体**と、`main()` の**外側 `except` に落ちる 2 経路**しか通らない。
 
