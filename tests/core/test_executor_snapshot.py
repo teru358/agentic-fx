@@ -169,6 +169,8 @@ def test_open_from_snapshot_rejects_when_exposure_grew_after_commit_pre(tmp_path
     out = ex.open_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0)
     assert out["result"] == "rejected"
     assert "snapshot" in out["reasons"][0].lower()
+    # F3: 拒否は「発注しない」まで含む
+    assert orders.list_by_status(ex.conn, S.SUBMITTING, S.PENDING_FILL) == []
 
 
 def test_open_from_snapshot_matches_handle_intent(tmp_path):
@@ -215,6 +217,9 @@ def test_open_from_snapshot_matches_handle_intent_on_gate_rejection(tmp_path):
 
     assert out1["result"] == out2["result"] == "rejected"
     assert out1["reasons"] == out2["reasons"]
+    # F4: 副作用 (kill_switch_latched) も一致すること
+    assert (ex1.state.load().kill_switch_latched
+            == ex2.state.load().kill_switch_latched)
 
 
 def test_open_risk_and_notional_from_snapshot_raises_on_uncovered_pair(tmp_path):
@@ -388,6 +393,58 @@ def test_close_from_snapshot_closes_when_fresh(tmp_path):
                                  max_snapshot_age_sec=999.0)
     assert out["result"] == "closed"
     assert orders.get(ex.conn, row["id"])["status"] == S.CLOSED.value
+    # F1: gate_result が受理されたことを記録しているか確認
+    gate_result = ex.conn.execute(
+        "SELECT gate_result FROM trade_intents WHERE id=?", (iid,)
+    ).fetchone()[0]
+    assert gate_result == "accepted"
+
+
+def test_close_order_from_snapshot_records_degraded_rate(tmp_path):
+    """F2: rate_degraded フラグが activity 記録に反映されることを確認。"""
+    calls: list[str] = []
+
+    def rec_quote_fn(pair):
+        return QUOTE
+
+    def rec_spec_fn(pair):
+        return SPECS[pair]
+
+    def always_fail_rate_fn(ccy, account_ccy, now):
+        # 最初の 1 回だけ失敗させる (resolve_close_rate がフォールバック)
+        calls.append(f"rate_fn:{ccy}")
+        raise DataUnhealthy(f"rate unavailable for {ccy}")
+
+    # snapshot は commit-pre 相で取得 (rate_fn が失敗 → degraded=True)
+    healthy_ex = _make_executor(tmp_path / "pre")
+    row = _insert_open_order(healthy_ex.conn, pair="USDJPY")
+    # 健全な rate_fn で最初のスナップショットを作る
+    snapshot = healthy_ex.gather_close_snapshot(row)
+    assert snapshot.rate_degraded is False
+
+    # 次に失敗する rate_fn で再度 snapshot を取得
+    ex = _make_executor(tmp_path / "core", quote_fn=rec_quote_fn,
+                        spec_fn=rec_spec_fn, rate_fn=always_fail_rate_fn)
+    # 先に健全なレートをキャッシュさせておく (degraded フォールバック用)
+    ex.resolve_close_rate("JPY", NOW)
+    calls.clear()
+
+    # 失敗する rate_fn 下で snapshot を取得
+    row2 = _insert_open_order(ex.conn, pair="USDJPY")
+    degraded_snapshot = ex.gather_close_snapshot(row2)
+    assert degraded_snapshot.rate_degraded is True
+
+    # このスナップショットで close_order_from_snapshot を実行
+    ex.close_order_from_snapshot(row2, degraded_snapshot, reason="llm_close")
+
+    # activity に close_pnl_rate_degraded が記録されているか確認
+    from agentic_fx.activity import Category
+    activity_log = ex.activity.tail(n=100, category=Category.TRADE)
+    degraded_records = [
+        l for l in activity_log
+        if "close_pnl_rate_degraded" in l
+    ]
+    assert len(degraded_records) > 0, "close_pnl_rate_degraded が記録されていない"
 
 
 def test_open_from_snapshot_performs_no_external_io(tmp_path):
