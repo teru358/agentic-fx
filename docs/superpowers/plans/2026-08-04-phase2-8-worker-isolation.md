@@ -6240,7 +6240,13 @@ uv run pytest tests/core/test_scheduler.py -q
 uv run pytest -q
 ```
 
-Expected: 全件 PASS。既存の `test_cron_deadline_advances_even_when_mission_callback_raises` (Task 4) は `on_trade_mission` が例外を送出するケースであり、`accepted = self.on_trade_mission(reason)` の呼び出し自体で例外が伝播するため、この変更後も同じ挙動 (締切前進 → 例外伝播) を保つことを確認する。
+**【2026-08-08 訂正 — プランの自己矛盾を実装時に検出】** 旧記載は「既存の `test_cron_deadline_advances_even_when_mission_callback_raises` (Task 4) は変更後も同じ挙動 (締切前進 → 例外伝播) を保つ」としていたが、**上の逐語コードと両立しない**。`accepted = self.on_trade_mission(reason)` が例外を送出すれば `if accepted and ...` に到達しないので、**締切は前進しない**。
+
+**ユーザー裁定 (2026-08-08): 前進させない = 実装のままでよい。** 根拠 — プラン 5 で codex I1 を受けて「例外時も前進させる」と決めたのは「**毎 tick 再試行すると障害時に LLM/notifier を連打する**」からだった。しかし Task 13 以降 `on_trade_mission` は `supervisor.try_submit(...) is not None` を返すだけの**非ブロッキングな投入**であり、**Mission 本体は supervisor スレッドで走る**。例外が出るのは `try_submit` の内部エラーだけで、**LLM 呼び出しも notifier 送信も起きない** — 連打の懸念は前提ごと消えている。毎 tick 再試行してもログが出るだけ。
+
+したがって既存テストは `test_cron_deadline_does_not_advance_when_mission_callback_raises` へ改名し、期待値を反転させる (実装者が実施済み)。
+
+Expected: 全件 PASS。
 
 - [ ] **Step 9: `service.py` を実装 (supervisor 配線 + `_SupervisorAsk`)**
 
