@@ -170,7 +170,7 @@ def fetch_feed(url: str, source_name: str, *, timeout_sec: float) -> list[Articl
     """
     response = httpx.get(url, timeout=timeout_sec, follow_redirects=True)
     response.raise_for_status()
-    parsed = feedparser.parse(response.content)
+    parsed = feedparser.parse(response.content, response_headers=dict(response.headers))
     if getattr(parsed, "bozo", False):
         reason = _bozo_reason(getattr(parsed, "bozo_exception", None))
         if not parsed.entries:

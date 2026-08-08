@@ -341,6 +341,7 @@ def test_fetch_feed_uses_httpx_with_injected_timeout(monkeypatch):
 
     class FakeResponse:
         content = b"<rss><channel></channel></rss>"
+        headers = {}
 
         def raise_for_status(self):
             pass
@@ -353,3 +354,68 @@ def test_fetch_feed_uses_httpx_with_injected_timeout(monkeypatch):
     monkeypatch.setattr(fetchers_mod.httpx, "get", fake_get)
     fetchers_mod.fetch_feed("http://x", "s", timeout_sec=7.5)
     assert captured["timeout"] == 7.5
+
+
+def test_fetch_feed_passes_response_headers_to_feedparser():
+    """F2: feedparser.parse が response_headers kwarg を受け取ることを確認。
+    charset 情報が response ヘッダから抽出される。
+    """
+    response_mock = MagicMock()
+    response_mock.content = b"<rss><channel></channel></rss>"
+    response_mock.headers = {"Content-Type": "application/xml; charset=utf-8"}
+    response_mock.raise_for_status = MagicMock()
+
+    with patch("agentic_fx.datafeed.fetchers.httpx.get", return_value=response_mock), \
+         patch("feedparser.parse") as mock_parse:
+        mock_parse.return_value = _parsed(entries=[])
+        fetch_feed("https://ex.com/rss", "example", timeout_sec=10)
+
+    # response_headers が dict に変換されて渡されること
+    assert mock_parse.call_args.kwargs.get("response_headers") == {
+        "Content-Type": "application/xml; charset=utf-8"
+    }
+
+
+def test_fetch_feed_propagates_http_error():
+    """F3: fetch_feed が httpx の HTTP エラーを握り潰さず送出する。
+    (fetch_web 同型のテスト)
+    """
+    response_mock = MagicMock()
+    response_mock.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "404", request=MagicMock(), response=MagicMock(status_code=404))
+
+    with patch("agentic_fx.datafeed.fetchers.httpx.get", return_value=response_mock):
+        with pytest.raises(httpx.HTTPStatusError):
+            fetch_feed("https://dead.example/rss", "example", timeout_sec=10)
+
+
+def test_fetch_feed_propagates_timeout_error():
+    """F3: fetch_feed が httpx のタイムアウト例外を握り潰さず送出する。"""
+    def mock_get(url, timeout, **kwargs):
+        raise httpx.TimeoutException("timeout")
+
+    import agentic_fx.datafeed.fetchers as fetchers_mod
+    with patch.object(fetchers_mod.httpx, "get", side_effect=mock_get):
+        with pytest.raises(httpx.TimeoutException):
+            fetch_feed("https://slow.example/rss", "example", timeout_sec=2.0)
+
+
+def test_fetch_feed_uses_timeout_sec_argument(monkeypatch):
+    """F3: fetch_feed が timeout_sec を httpx.get に実際に渡す。"""
+    captured = {}
+
+    class FakeResponse:
+        content = b"<rss><channel></channel></rss>"
+        headers = {}
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, timeout, **kwargs):
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    import agentic_fx.datafeed.fetchers as fetchers_mod
+    monkeypatch.setattr(fetchers_mod.httpx, "get", fake_get)
+    fetchers_mod.fetch_feed("http://x", "s", timeout_sec=5.5)
+    assert captured["timeout"] == 5.5

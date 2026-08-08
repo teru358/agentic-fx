@@ -71,16 +71,14 @@ def test_hooks_run_even_when_mark_to_market_regresses(tmp_path):
 def test_account_unknown_still_cancels_pending_before_hooks_run(tmp_path):
     """account 不明時の全 pending 取消 (fail closed) は hooks より先に
     確定していること — 決定論ブロックの内部順序が保存されている回帰
-    確認 (既存 test_scheduler.py の account 系テストと同型だが、hooks
-    再編後も同じ結論になることをこのファイルでも固定する)。
+    確認。account 判定ロジック自体は Task 12 では変更していない。
     """
-    env = Env(tmp_path)  # account を意図的に欠損させる既存 fixture の使い方に
-                          # 合わせて実装すること (既存 test_scheduler.py の該当
-                          # テストの account snapshot 未記録パターンを踏襲)
+    # account を意図的に欠損させる既存 fixture の使い方に合わせた設定。
     # 別ペア (EURUSD) の open ポジションを直接挿入。このペアのバーは一度も
     # 与えないため、mark_to_market は毎 tick 陳腐化スキップし続け、
     # snapshot (Env.__init__ 時点の WED) が更新されないまま 10 分の陳腐化
-    # チェックを超過する
+    # チェックを超過する。
+    env = Env(tmp_path)
     orders_store.insert(env.conn, pair="EURUSD", direction="long",
                        entry_type="market", horizon="swing", status="open",
                        now=WED, quantity=0.1, avg_fill_price=1.1000,
@@ -89,10 +87,72 @@ def test_account_unknown_still_cancels_pending_before_hooks_run(tmp_path):
     env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=11),
                              148.30, 148.35, 148.15, 148.25, 100)
     env.sched.tick(WED + timedelta(minutes=11))
-    # 既存 test_scheduler.py の account_unknown 系アサーションと同じ
-    # 内容を実装者が転記する (このファイルの目的は「hooks 再編後も同じ
-    # 結論になる」ことの確認であり、account 判定ロジック自体は Task 12
-    # で変更しない)。
+    # 既存 test_scheduler.py の account_unknown 系アサーションと同じ内容。
+    # 目的は「hooks 再編後も同じ結論になる」ことの確認。
     row = orders_store.get(env.conn, oid)
     assert row["status"] == "cancelled"
     assert row["close_reason"] == "account_unknown"
+
+
+def test_hooks_run_even_when_process_exits_raises(tmp_path):
+    """プラン 8 レビュー修正 F1: _process_exits が未捕捉例外を投げても
+    hooks は走る (try/finally で構造的に保証される)。また例外は
+    呼び出し元に伝播する (握り潰されない)。
+    """
+    env = Env(tmp_path)
+    hooks_called = []
+    env.sched.on_news_cycle = lambda: hooks_called.append("news")
+    env.sched.on_signal_maintenance = lambda now: hooks_called.append("signal")
+
+    # _process_exits を例外で置き換え
+    def raise_in_exits(now, filled_ids):
+        raise RuntimeError("simulated _process_exits failure")
+
+    env.sched._process_exits = raise_in_exits
+
+    # 例外は伝播するはず
+    with pytest.raises(RuntimeError, match="simulated _process_exits failure"):
+        env.sched.tick(WED)
+
+    # しかし hooks は実行される
+    assert "news" in hooks_called
+    assert "signal" in hooks_called
+
+
+def test_hooks_run_even_when_early_code_raises(tmp_path):
+    """プラン 8 レビュー修正 F1: mark-to-market より前の処理
+    (_on_market_close 等) で例外が発生しても hooks は走る。
+    """
+    env = Env(tmp_path)
+    hooks_called = []
+    env.sched.on_news_cycle = lambda: hooks_called.append("news")
+
+    # market_hours.is_market_open を例外で置き換え
+    from unittest.mock import patch
+    with patch("agentic_fx.core.scheduler.market_hours.is_market_open") as mock_open:
+        mock_open.side_effect = RuntimeError("simulated early failure")
+
+        # 例外は伝播するはず
+        with pytest.raises(RuntimeError, match="simulated early failure"):
+            env.sched.tick(WED)
+
+        # しかし hooks は実行される
+        assert "news" in hooks_called
+
+
+def test_hooks_run_exactly_once_per_tick(tmp_path):
+    """プラン 8 レビュー修正 F1: 通常経路では hooks が厳密に 1 回だけ
+    走ること。複数経路から重複呼び出しされないことの確認。
+    """
+    env = Env(tmp_path)
+    signal_calls = []
+    env.sched.on_signal_maintenance = lambda now: signal_calls.append(now)
+
+    # 複数 tick を実行
+    env.sched.tick(WED)
+    env.sched.tick(WED + timedelta(minutes=1))
+
+    # それぞれ厳密に 1 回ずつ呼ばれたはず
+    assert len(signal_calls) == 2
+    assert signal_calls[0] == WED
+    assert signal_calls[1] == WED + timedelta(minutes=1)
