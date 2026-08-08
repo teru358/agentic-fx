@@ -382,6 +382,13 @@ def test_f1c_startup_reclaim_recovers_claimed_signal(tmp_path):
                                          now=old, freshness_bars=None)
     assert claimed is not None and claimed["id"] == sid  # 前提
 
+    # FC-2 (プラン8): instance_lock (flock) は App の全寿命で保持される
+    # ため、同一 root への 2 回目の build_app は 1 回目の instance_lock を
+    # 解放してからでないと InstanceAlreadyRunning になる。「再起動」を
+    # 模す以上、1 回目のプロセスが終了して lock を手放したことも模す
+    # 必要がある (App.close() への instance_lock 配線は Task 19)。
+    app1.instance_lock.close()
+
     # 「再起動」を模して同じ DB に対しもう一度 build_app する
     app2 = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                      embedding_fn=FakeEmbedding())
@@ -910,7 +917,7 @@ def test_watchdog_tick_uses_mission_watch_time_fn(monkeypatch):
               trade_loop=None, reflection=None, scheduler=None,
               commands=None, registry=None, core_lock=None,
               mission_watch=watch, notifier=FakeNotifier(), runner=None,
-              owns_runner=False, clock=None)
+              owns_runner=False, clock=None, instance_lock=None)
     _watchdog_tick(app)
     assert calls == ["write", "send"]
 
@@ -1003,7 +1010,7 @@ def test_watchdog_tick_uses_mission_watch_time_fn_directly(tmp_path):
               trade_loop=None, reflection=None, scheduler=None,
               commands=None, registry=None, core_lock=None,
               mission_watch=watch, notifier=FakeNotifier(), runner=None,
-              owns_runner=False, clock=None)
+              owns_runner=False, clock=None, instance_lock=None)
     _watchdog_tick(app)
     # elapsed は fake_time に基づいた値 (81s) になるはず。
     # 生の time.monotonic() (システム起動からの経過、通常大きい数値)
@@ -1092,3 +1099,141 @@ def test_build_app_provider_seam_passed_to_mission_registry(tmp_path):
     # 渡された provider が registry に反映されていることを確認する
     # (registry の tool が provider インスタンスを束縛しているため)
     assert "get_ohlcv" in app.registry.names(), "get_ohlcv not in registry"
+
+
+# ---- C1: 起動シーケンスの順序が pin されていない (レビュー修正) ----------
+
+def test_c1_startup_order_acquire_lock_before_recover(tmp_path):
+    """acquire_instance_lock と missions.recover_interrupted の呼び出し順を
+    pin する。順序が acquire_lock → recover であることを spy で確認。"""
+    from agentic_fx.store import missions as missions_module
+    import agentic_fx.service as service_module
+
+    _init(tmp_path)
+
+    call_order: list[str] = []
+
+    # 実装の参照を保持
+    real_acquire = service_module.acquire_instance_lock
+    real_recover = missions_module.recover_interrupted
+
+    def spy_acquire(*args, **kwargs):
+        call_order.append("lock")
+        return real_acquire(*args, **kwargs)
+
+    def spy_recover(*args, **kwargs):
+        call_order.append("recover")
+        return real_recover(*args, **kwargs)
+
+    with patch("agentic_fx.service.acquire_instance_lock", side_effect=spy_acquire), \
+         patch("agentic_fx.service.missions.recover_interrupted", side_effect=spy_recover):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                       embedding_fn=FakeEmbedding())
+        app.instance_lock.close()
+
+    assert call_order == ["lock", "recover"], \
+        f"Expected ['lock', 'recover'], got {call_order}"
+
+
+def test_c1_double_startup_preserves_first_mission(tmp_path):
+    """二重起動があると、2 回目の build_app が InstanceAlreadyRunning を raise し、
+    その後で 1 回目の mission がまだ running のままであること。
+    (ロックを後に取る実装ならここが 'interrupted' になって red になる)。"""
+    from agentic_fx.store import missions as missions_module
+    from agentic_fx.store.instance_lock import InstanceAlreadyRunning
+
+    _init(tmp_path)
+
+    # 1 回目の起動
+    app1 = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+
+    # 1 回目で mission を 1 件作成
+    mid = missions_module.start(app1.conn_core, "trade", "local", "qwen",
+                               NOW, trigger="test")
+    assert mid is not None
+
+    # ロックを解放せずに 2 回目の build_app を試みる
+    with pytest.raises(InstanceAlreadyRunning):
+        build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                 embedding_fn=FakeEmbedding())
+
+    # 1 回目の mission がまだ running のままであること
+    row = app1.conn_core.execute(
+        "SELECT status FROM missions WHERE id=?", (mid,)).fetchone()
+    assert row["status"] == "running"
+
+    app1.instance_lock.close()
+
+
+# ---- I3: instance_lock の例外時解放 (レビュー修正) -------------------------
+
+def test_i3_instance_lock_released_on_build_app_exception(tmp_path):
+    """build_app の途中で例外が発生しても、acquire_instance_lock を
+    close して lock を解放すること。例外を変数に束縛して保持したまま、
+    別プロセスが同じ root に対する acquire_instance_lock に成功すること。"""
+    from agentic_fx.store.instance_lock import acquire_instance_lock
+
+    _init(tmp_path)
+
+    # build_app を ValueErrorで失敗させる。例外を変数に束縛して保持
+    held_exc = None
+    try:
+        build_app(tmp_path, provider=_FakeProvider(),
+                 quote_fn=lambda pair: None)  # ValueError で失敗
+    except ValueError as e:
+        held_exc = e  # 例外を保持してトレースバックがメモリに残る
+
+    assert held_exc is not None
+
+    # この時点で lock はリリースされていなければならない
+    # (held_exc の traceback が build_app のフレームを保持していても)
+    fh = acquire_instance_lock(tmp_path / "data")  # 成功すればテスト合格
+    fh.close()
+
+
+def test_i3b_lock_close_failure_does_not_mask_the_original_exception(
+        tmp_path, monkeypatch):
+    """解放処理が失敗しても、**元の失敗原因が呼び出し元に届く**こと。
+
+    2 周目レビュー指摘 (sonnet Minor / KAT-Coder Critical)。
+    `except BaseException: instance_lock.close(); raise` の素の形だと、
+    `close()` 自身が送出した例外が伝播してしまい、呼び出し元は「なぜ起動に
+    失敗したのか」を見失う (元の例外は `__context__` に退避されるだけで、
+    `except ValueError` は成立しなくなる)。ロックは fd なので解放に失敗しても
+    プロセス終了時に OS が回収する — 原因の伝播を優先する。
+    """
+    import agentic_fx.service as svc_mod
+
+    _init(tmp_path)
+
+    real_acquire = svc_mod.acquire_instance_lock
+
+    class _CloseExplodes:
+        """close が必ず失敗する lock ラッパ (解放系の故障を模す)。"""
+
+        def __init__(self, fh):
+            self._fh = fh
+
+        def close(self):
+            raise OSError("simulated close failure (e.g. ENOSPC on flush)")
+
+    holders = []
+
+    def _acquire(db_dir):
+        fh = real_acquire(db_dir)
+        holders.append(fh)          # 実 lock は保持し、test 終了時に解放する
+        return _CloseExplodes(fh)
+
+    monkeypatch.setattr(svc_mod, "acquire_instance_lock", _acquire)
+
+    try:
+        # build_app は provider と quote_fn の併用で ValueError を出す。
+        # close が失敗しても、呼び出し元に届くのは **ValueError** でなければ
+        # ならない (OSError にすり替わったら red)。
+        with pytest.raises(ValueError):
+            build_app(tmp_path, provider=_FakeProvider(),
+                      quote_fn=lambda pair: None)
+    finally:
+        for fh in holders:
+            fh.close()

@@ -21,15 +21,90 @@ def start(conn: sqlite3.Connection, loop: str, runner: str, model: str,
 
 
 def finish(conn: sqlite3.Connection, mission_id: int, status: str,
-           output: dict | None, transcript: list, now: datetime) -> None:
-    conn.execute(
+           output: dict | None, transcript: list, now: datetime) -> bool:
+    """missions 行を終端状態へ CAS 更新する (設計書 §4.7 codex C-4)。
+
+    `WHERE status='running'` を満たさない (= 既に終端済み) 場合は影響行数
+    0 のまま何もしない — 無条件 UPDATE による「後勝ち上書き」を構造的に
+    封鎖する (finalize 所有権は commit 相の finally 一箇所のみ、という
+    設計書 §4.7 の不変条件をこの CAS が実装レベルで強制する)。
+
+    戻り値: `True` = この呼び出しが終端を書いた。`False` = 既に終端済み
+    だった (二重終端防止) — **呼び出し元はこの場合 activity 警告を残し、
+    この結果を上書きしたと誤認しないこと**。
+    """
+    cur = conn.execute(
         "UPDATE missions SET status=?, output_json=?, transcript_json=?, "
-        "finished_at=? WHERE id=?",
+        "finished_at=? WHERE id=? AND status='running'",
         (status,
          json.dumps(output, ensure_ascii=False) if output is not None else None,
          json.dumps(transcript, ensure_ascii=False),
          now.isoformat(), mission_id))
     conn.commit()
+    return cur.rowcount > 0
+
+
+def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
+                        max_requeue: int) -> dict:
+    """起動時回収 (設計書 §4.8 codex C-5): 前回停止時に `running` のまま
+    残った missions 行を `'interrupted'` へ終端し、それらを claim して
+    いた `claimed` signals を**同一トランザクション**で requeue (上限
+    超過は abandoned) する。
+
+    分離すると「mission は終端済みなのに signal は lease 満了 (最大 15
+    分) まで不可視」の不整合窓が生じる — signal の `claimed_at` は直近
+    (プロセス生存中の claim) であり得るため、通常の lease ベース回収
+    (`signals.reclaim_expired`) では長時間拾われない。
+
+    `'interrupted'` は DB 回収専用の状態値であり `MissionResult.status`
+    の 4 値契約 (`runners/base.py:40`) には現れない — status 表示・集計
+    はこの区別を明記すること (codex M-1)。
+
+    signals の requeue/abandon 判定は `signals.py` の
+    `_REQUEUE_STATUS_EXPR`/`_REQUEUE_COUNT_EXPR` と同じ規則 (現在の
+    requeue_count が max_requeue 以上なら abandoned、未満なら pending +
+    +1) を Python 側で再現する — `signals.reclaim_expired` を呼ぶと
+    それ自身が `conn.commit()` するため、missions の更新と同一トランザ
+    クションを構成できない (この関数専用に単一トランザクションで完結
+    させる必要がある)。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        running_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM missions WHERE status='running'").fetchall()]
+        for mid in running_ids:
+            conn.execute(
+                "UPDATE missions SET status='interrupted', finished_at=? "
+                "WHERE id=?", (now.isoformat(), mid))
+
+        signals_requeued = signals_abandoned = 0
+        if running_ids:
+            placeholders = ",".join("?" * len(running_ids))
+            claimed_rows = conn.execute(
+                "SELECT id, requeue_count FROM signals WHERE status='claimed' "
+                f"AND claimed_by_mission_id IN ({placeholders})",
+                running_ids).fetchall()
+            for row in claimed_rows:
+                if row["requeue_count"] >= max_requeue:
+                    conn.execute(
+                        "UPDATE signals SET status='abandoned', "
+                        "claimed_by_mission_id=NULL, claimed_at=NULL "
+                        "WHERE id=?", (row["id"],))
+                    signals_abandoned += 1
+                else:
+                    conn.execute(
+                        "UPDATE signals SET status='pending', "
+                        "requeue_count=requeue_count+1, "
+                        "claimed_by_mission_id=NULL, claimed_at=NULL "
+                        "WHERE id=?", (row["id"],))
+                    signals_requeued += 1
+        conn.commit()
+        return {"missions_recovered": len(running_ids),
+                "signals_requeued": signals_requeued,
+                "signals_abandoned": signals_abandoned}
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def set_trigger(conn: sqlite3.Connection, mission_id: int, trigger: str) -> None:

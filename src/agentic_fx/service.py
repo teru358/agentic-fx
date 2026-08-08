@@ -45,6 +45,7 @@ from agentic_fx.runners.local_runner import LocalRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.store import approvals, missions, orders, signals, ohlcv
 from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.instance_lock import acquire_instance_lock
 from agentic_fx.store.rag import Rag
 from agentic_fx.store.state import StateStore
 from agentic_fx.tools import (
@@ -205,6 +206,7 @@ class App:
     runner: object
     owns_runner: bool
     clock: object
+    instance_lock: object
 
 
 def _validate_startup(settings) -> None:
@@ -315,170 +317,202 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
     state = _state_store(root)
     activity = ActivityLog(root / "logs" / "activity.log")
-    conn_core = connect(root / "data" / "agentic.db")
-    init_db(conn_core)
-    conn_shell = connect(root / "data" / "agentic.db")
 
-    if provider is not None:
-        # provider と quote_fn/spec_fn/bars_fn は排他的: provider が指定されたら
-        # 他の注入点は併用不可 (fail closed: 混合による silent の誤動作を防止)。
-        if any([quote_fn is not None, spec_fn is not None, bars_fn is not None]):
-            raise ValueError(
-                "provider と quote_fn/spec_fn/bars_fn は併用不可 — "
-                "provider が全挙動を握る seam であり、個別関数との混合は "
-                "設定ミス (provider 側の挙動が一部無視される)。"
-                "provider を使わない場合のみ個別関数を指定してください。")
-        # プラン 8 park 返済: 呼び出し側が provider の全挙動を握る
-        # (quote_fn/spec_fn/bars_fn の bound-method 差し替えは行わない)。
-        # 上の ValueError で併用を弾いた後なので 3 つとも必ず None —
-        # 無条件に provider の束縛メソッドを採る (`x if x is not None else`
-        # の形は到達しない分岐を残し「併用可能」と誤読させる)。
-        quote_fn = provider.get_quote
-        spec_fn = provider.spec
-        bars_fn = provider.latest_1m_bar
-    else:
-        provider = PriceProvider(conn_core, settings, clock)
-        # 注入された quote_fn/spec_fn/bars_fn は provider 自身の束縛メソッドにも
-        # 反映する (Task 8 E2E で実測)。実際に内部 self-call が存在するのは
-        # `self.get_quote` だけ (`PriceProvider._rate_of` および `healthcheck`
-        # から呼ばれる — `to_account_rate` の換算レート解決がここを経由する)。
-        # `self.spec` / `self.latest_1m_bar` は現時点で provider 内部からは
-        # 一切呼ばれていない (呼び出し元は Executor/Scheduler にローカル変数
-        # 経由で渡した spec_fn/bars_fn のみ) — 以下 2 行は今の挙動には効いて
-        # いない。それでも残しているのは予防的措置 (fix round 1 F1): 将来
-        # provider 内部に `self.spec(...)` / `self.latest_1m_bar(...)` の
-        # 自己呼び出しが追加されたとき、ここが無いと `get_quote` と同じ
-        # 「注入がローカル変数にしか反映されず内部呼び出しをすり抜ける」バグを
-        # 無音で再発させる (quote_fn 側の実例がまさにそれだった)。
-        # 注意: `self.get_bars(...)` (`latest_1m_bar`/`healthcheck` から既に
-        # 呼ばれている) はこの 2 行では捕捉できない — 別メソッド名なので
-        # `provider.latest_1m_bar = bars_fn` は届かない。恒久的に注入対象外
-        # (docstring の fix round 1 F2 注記を参照)。
-        if quote_fn is not None:
-            provider.get_quote = quote_fn
-        else:
+    # FC-2 (裁定書): recover_interrupted は起動時に status='running' の
+    # 全 mission を無条件に interrupted 化する。二重起動があると、後発
+    # プロセスが先発の稼働中 Mission を誤って終端し claim 済み signal を
+    # 横取り requeue しかねないため、DB 接続・回収より**前**にプロセス
+    # 排他 flock を取得する。取得できなければ起動を中止する (fail
+    # closed — InstanceAlreadyRunning は呼び出し元の run_service/CLI
+    # エントリまで伝播させ、非ゼロ終了させる)。
+    instance_lock = acquire_instance_lock(root / "data")
+
+    try:
+        conn_core = connect(root / "data" / "agentic.db")
+        init_db(conn_core)
+        # プラン 8 (codex C-5): 前回停止時に running のまま残った mission と、
+        # それが claim していた signal を同一トランザクションで回収する。
+        # 既存の signals.reclaim_expired (403-407 行付近、lease ベースの
+        # 一般的な回収) より前に置く — running mission の signal は claimed_at
+        # が直近であり得るため lease ベースでは長時間拾われない。
+        missions.recover_interrupted(
+            conn_core, now=clock.now(),
+            max_requeue=settings.plugin.signal_requeue_max)
+        conn_shell = connect(root / "data" / "agentic.db")
+
+        if provider is not None:
+            # provider と quote_fn/spec_fn/bars_fn は排他的: provider が指定されたら
+            # 他の注入点は併用不可 (fail closed: 混合による silent の誤動作を防止)。
+            if any([quote_fn is not None, spec_fn is not None, bars_fn is not None]):
+                raise ValueError(
+                    "provider と quote_fn/spec_fn/bars_fn は併用不可 — "
+                    "provider が全挙動を握る seam であり、個別関数との混合は "
+                    "設定ミス (provider 側の挙動が一部無視される)。"
+                    "provider を使わない場合のみ個別関数を指定してください。")
+            # プラン 8 park 返済: 呼び出し側が provider の全挙動を握る
+            # (quote_fn/spec_fn/bars_fn の bound-method 差し替えは行わない)。
+            # 上の ValueError で併用を弾いた後なので 3 つとも必ず None —
+            # 無条件に provider の束縛メソッドを採る (`x if x is not None else`
+            # の形は到達しない分岐を残し「併用可能」と誤読させる)。
             quote_fn = provider.get_quote
-        if spec_fn is not None:
-            provider.spec = spec_fn
-        else:
             spec_fn = provider.spec
-        if bars_fn is not None:
-            provider.latest_1m_bar = bars_fn
-        else:
             bars_fn = provider.latest_1m_bar
+        else:
+            provider = PriceProvider(conn_core, settings, clock)
+            # 注入された quote_fn/spec_fn/bars_fn は provider 自身の束縛メソッドにも
+            # 反映する (Task 8 E2E で実測)。実際に内部 self-call が存在するのは
+            # `self.get_quote` だけ (`PriceProvider._rate_of` および `healthcheck`
+            # から呼ばれる — `to_account_rate` の換算レート解決がここを経由する)。
+            # `self.spec` / `self.latest_1m_bar` は現時点で provider 内部からは
+            # 一切呼ばれていない (呼び出し元は Executor/Scheduler にローカル変数
+            # 経由で渡した spec_fn/bars_fn のみ) — 以下 2 行は今の挙動には効いて
+            # いない。それでも残しているのは予防的措置 (fix round 1 F1): 将来
+            # provider 内部に `self.spec(...)` / `self.latest_1m_bar(...)` の
+            # 自己呼び出しが追加されたとき、ここが無いと `get_quote` と同じ
+            # 「注入がローカル変数にしか反映されず内部呼び出しをすり抜ける」バグを
+            # 無音で再発させる (quote_fn 側の実例がまさにそれだった)。
+            # 注意: `self.get_bars(...)` (`latest_1m_bar`/`healthcheck` から既に
+            # 呼ばれている) はこの 2 行では捕捉できない — 別メソッド名なので
+            # `provider.latest_1m_bar = bars_fn` は届かない。恒久的に注入対象外
+            # (docstring の fix round 1 F2 注記を参照)。
+            if quote_fn is not None:
+                provider.get_quote = quote_fn
+            else:
+                quote_fn = provider.get_quote
+            if spec_fn is not None:
+                provider.spec = spec_fn
+            else:
+                spec_fn = provider.spec
+            if bars_fn is not None:
+                provider.latest_1m_bar = bars_fn
+            else:
+                bars_fn = provider.latest_1m_bar
 
-    def rate_fn(ccy: str, account_ccy: str, now: datetime):
-        return provider.to_account_rate(
-            ccy, account_ccy, reference_ts=now,
-            max_skew_min=settings.datafeed.conversion_skew_max_min)
+        def rate_fn(ccy: str, account_ccy: str, now: datetime):
+            return provider.to_account_rate(
+                ccy, account_ccy, reference_ts=now,
+                max_skew_min=settings.datafeed.conversion_skew_max_min)
 
-    econ = EconCalendar(conn_core, activity, clock)
-    rag = Rag(root / "data" / "rag", embedding_function=embedding_fn,
-             lock_timeout_sec=settings.worker.rpc_timeout_sec)
-    collector = NewsCollector(conn_core, rag, activity, clock)
-    broker = PaperBroker(conn_core, settings, clock)
-    notifier = Notifier(enabled=settings.discord.enabled,
-                        webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"))
-    executor = Executor(conn=conn_core, broker=broker, settings=settings,
-                        state_store=state, activity=activity,
-                        notifier=notifier, clock=clock,
-                        quote_fn=quote_fn, spec_fn=spec_fn, rate_fn=rate_fn)
+        econ = EconCalendar(conn_core, activity, clock)
+        rag = Rag(root / "data" / "rag", embedding_function=embedding_fn,
+                 lock_timeout_sec=settings.worker.rpc_timeout_sec)
+        collector = NewsCollector(conn_core, rag, activity, clock)
+        broker = PaperBroker(conn_core, settings, clock)
+        notifier = Notifier(enabled=settings.discord.enabled,
+                            webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"))
+        executor = Executor(conn=conn_core, broker=broker, settings=settings,
+                            state_store=state, activity=activity,
+                            notifier=notifier, clock=clock,
+                            quote_fn=quote_fn, spec_fn=spec_fn, rate_fn=rate_fn)
 
-    # プラン 7 Task 3: plugins/ 直下の承認済み plugin をロードする。反映は
-    # 次回起動時のみ (hot reload しない — YAGNI)。plugins/ が存在しない環境
-    # (未使用のデフォルト) でも approved_plugins は [] を返し起動を妨げない。
-    plugins_dir = root / "plugins"
-    approved = plugin_loader.approved_plugins(conn_core, plugins_dir)
+        # プラン 7 Task 3: plugins/ 直下の承認済み plugin をロードする。反映は
+        # 次回起動時のみ (hot reload しない — YAGNI)。plugins/ が存在しない環境
+        # (未使用のデフォルト) でも approved_plugins は [] を返し起動を妨げない。
+        plugins_dir = root / "plugins"
+        approved = plugin_loader.approved_plugins(conn_core, plugins_dir)
 
-    # プラン 7 Task 8: signal producer (承認済み signal/strategy plugin の
-    # 評価 → signals キュー投入)。producer は評価 cursor をメモリに持つ
-    # ため App 寿命で 1 個だけ生成する (再生成 = cursor 喪失)。
-    signal_producer = SignalProducer()
+        # プラン 7 Task 8: signal producer (承認済み signal/strategy plugin の
+        # 評価 → signals キュー投入)。producer は評価 cursor をメモリに持つ
+        # ため App 寿命で 1 個だけ生成する (再生成 = cursor 喪失)。
+        signal_producer = SignalProducer()
 
-    # プラン 8 worker 基盤: 親 (ここ) と子 (mission_worker.py) が同一関数
-    # (build_mission_registry) でツール配線を組み立てる。親は注入された provider
-    # (あるいは内部構築した provider) を registry に渡し、同じインスタンスを
-    # registry のツールが束縛する (テスト注入 seam)。子は provider を渡さず、
-    # readonly=True で内部構築する。
-    registry = build_mission_registry(
-        "trade", conn_core, settings, clock, rag, activity=activity,
-        indicator_plugins=approved, provider=provider)
-    # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
-    _validate_startup(settings)
-    _assert_tools_registered(registry, _TRADE_TOOLS)
+        # プラン 8 worker 基盤: 親 (ここ) と子 (mission_worker.py) が同一関数
+        # (build_mission_registry) でツール配線を組み立てる。親は注入された provider
+        # (あるいは内部構築した provider) を registry に渡し、同じインスタンスを
+        # registry のツールが束縛する (テスト注入 seam)。子は provider を渡さず、
+        # readonly=True で内部構築する。
+        registry = build_mission_registry(
+            "trade", conn_core, settings, clock, rag, activity=activity,
+            indicator_plugins=approved, provider=provider)
+        # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
+        _validate_startup(settings)
+        _assert_tools_registered(registry, _TRADE_TOOLS)
 
-    owns_runner = runner is None
-    if runner is None:
-        runner = WorkerRunner(root=root, settings=settings, clock=clock,
-                              rag=rag, worker_profile="trade")
+        owns_runner = runner is None
+        if runner is None:
+            runner = WorkerRunner(root=root, settings=settings, clock=clock,
+                                  rag=rag, worker_profile="trade")
 
-    policy = Policy(root / "policy" / "directives.md")
-    # 上書き 3: MissionWatch は 1 インスタンスを trade_loop / reflection に共有注入
-    mission_watch = MissionWatch()
-    trade_loop = TradeLoop(conn=conn_core, runner=runner, settings=settings,
-                           executor=executor, provider=provider, econ=econ,
-                           policy=policy, activity=activity,
-                           notifier=notifier, clock=clock,
-                           watch=mission_watch)
-    reflection = ReflectionCycle(conn=conn_core, runner=runner, rag=rag,
-                                 settings=settings, activity=activity,
-                                 clock=clock, watch=mission_watch)
+        policy = Policy(root / "policy" / "directives.md")
+        # 上書き 3: MissionWatch は 1 インスタンスを trade_loop / reflection に共有注入
+        mission_watch = MissionWatch()
+        trade_loop = TradeLoop(conn=conn_core, runner=runner, settings=settings,
+                               executor=executor, provider=provider, econ=econ,
+                               policy=policy, activity=activity,
+                               notifier=notifier, clock=clock,
+                               watch=mission_watch)
+        reflection = ReflectionCycle(conn=conn_core, runner=runner, rag=rag,
+                                     settings=settings, activity=activity,
+                                     clock=clock, watch=mission_watch)
 
-    core_lock = threading.RLock()
+        core_lock = threading.RLock()
 
-    def on_trade_mission(trigger: str) -> None:
-        # tick 全体が core_lock 下で走る (RLock のため再取得も安全)。
-        # trigger は scheduler._trade_mission_due() が返した起動理由。
-        # ここで捨てると missions.trigger が常に既定値になり監査列が死ぬ
-        # (上書き 1 参照)。
-        with core_lock:
-            trade_loop.run_once(trigger)
-            reflection.run_pending()
+        def on_trade_mission(trigger: str) -> None:
+            # tick 全体が core_lock 下で走る (RLock のため再取得も安全)。
+            # trigger は scheduler._trade_mission_due() が返した起動理由。
+            # ここで捨てると missions.trigger が常に既定値になり監査列が死ぬ
+            # (上書き 1 参照)。
+            with core_lock:
+                trade_loop.run_once(trigger)
+                reflection.run_pending()
 
-    # プラン 7 Task 8: signal 起動の判定・保守処理を Scheduler へ配線する。
-    def on_signal_maintenance(now: datetime) -> None:
-        _run_signal_maintenance(conn=conn_core, signal_producer=signal_producer,
-                                approved=approved, settings=settings, now=now)
+        # プラン 7 Task 8: signal 起動の判定・保守処理を Scheduler へ配線する。
+        def on_signal_maintenance(now: datetime) -> None:
+            _run_signal_maintenance(conn=conn_core, signal_producer=signal_producer,
+                                    approved=approved, settings=settings, now=now)
 
-    def signal_due_fn(now: datetime) -> bool:
-        # D2: オープンポジション or pending_fill の注文が無いなら signal
-        # 起動は無意味 (新規建玉を提案しても executor が gate で弾くだけ
-        # ではなく、そもそも判断 Mission を起こす価値が薄い運用判断)。
-        if not orders.list_by_status(conn_core, "open", "pending_fill"):
-            return False
-        if not signals.pending_exists(conn_core):
-            return False
-        return missions.signals_rate_ok(conn_core, now, settings)
+        def signal_due_fn(now: datetime) -> bool:
+            # D2: オープンポジション or pending_fill の注文が無いなら signal
+            # 起動は無意味 (新規建玉を提案しても executor が gate で弾くだけ
+            # ではなく、そもそも判断 Mission を起こす価値が薄い運用判断)。
+            if not orders.list_by_status(conn_core, "open", "pending_fill"):
+                return False
+            if not signals.pending_exists(conn_core):
+                return False
+            return missions.signals_rate_ok(conn_core, now, settings)
 
-    scheduler = Scheduler(conn=conn_core, executor=executor,
-                          settings=settings, state_store=state,
-                          activity=activity, bars_fn=bars_fn,
-                          on_trade_mission=on_trade_mission,
-                          on_news_cycle=collector.collect,
-                          on_econ_cycle=econ.refresh,
-                          on_signal_maintenance=on_signal_maintenance,
-                          signal_due_fn=signal_due_fn)
+        scheduler = Scheduler(conn=conn_core, executor=executor,
+                              settings=settings, state_store=state,
+                              activity=activity, bars_fn=bars_fn,
+                              on_trade_mission=on_trade_mission,
+                              on_news_cycle=collector.collect,
+                              on_econ_cycle=econ.refresh,
+                              on_signal_maintenance=on_signal_maintenance,
+                              signal_due_fn=signal_due_fn)
 
-    # 起動時 reclaim 1 回 (コントローラ裁定): 前回停止時に claimed のまま
-    # 残った signal を、次の tick を待たずに起動直後から回収対象にする。
-    signals.reclaim_expired(conn_core, now=clock.now(),
-                            lease_min=settings.plugin.signal_lease_min,
-                            max_requeue=settings.plugin.signal_requeue_max)
+        # 起動時 reclaim 1 回 (コントローラ裁定): 前回停止時に claimed のまま
+        # 残った signal を、次の tick を待たずに起動直後から回収対象にする。
+        signals.reclaim_expired(conn_core, now=clock.now(),
+                                lease_min=settings.plugin.signal_lease_min,
+                                max_requeue=settings.plugin.signal_requeue_max)
 
-    # Commands は conn_shell 束縛の broker を持つ (conn_core をシェルスレッドから触らない)
-    shell_broker = PaperBroker(conn_shell, settings, clock)
-    commands = Commands(conn=conn_shell, state_store=state,
-                        broker=shell_broker,
-                        trade_loop=_LockedAsk(trade_loop, core_lock),
-                        activity=activity, log_dir=root / "logs", clock=clock)
-    return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
-               state=state, activity=activity, broker=broker,
-               executor=executor, provider=provider, econ=econ,
-               collector=collector, rag=rag, trade_loop=trade_loop,
-               reflection=reflection, scheduler=scheduler, commands=commands,
-               registry=registry, core_lock=core_lock,
-               mission_watch=mission_watch, notifier=notifier,
-               runner=runner, owns_runner=owns_runner, clock=clock)
+        # Commands は conn_shell 束縛の broker を持つ (conn_core をシェルスレッドから触らない)
+        shell_broker = PaperBroker(conn_shell, settings, clock)
+        commands = Commands(conn=conn_shell, state_store=state,
+                            broker=shell_broker,
+                            trade_loop=_LockedAsk(trade_loop, core_lock),
+                            activity=activity, log_dir=root / "logs", clock=clock)
+        return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
+                   state=state, activity=activity, broker=broker,
+                   executor=executor, provider=provider, econ=econ,
+                   collector=collector, rag=rag, trade_loop=trade_loop,
+                   reflection=reflection, scheduler=scheduler, commands=commands,
+                   registry=registry, core_lock=core_lock,
+                   mission_watch=mission_watch, notifier=notifier,
+                   runner=runner, owns_runner=owns_runner, clock=clock,
+                   instance_lock=instance_lock)
+    except BaseException:
+        # 2 周目レビュー (sonnet Minor / KAT-Coder Critical): 素の
+        # `instance_lock.close()` だと close 自身が送出した例外が伝播し、
+        # **元の失敗原因が呼び出し元から見えなくなる** (元の例外は __context__
+        # に退避されるだけで、except 節やエントリの終了コード判定は新しい例外を
+        # 見る)。解放の失敗より原因の伝播を優先する — ロックは fd なので
+        # プロセス終了時に OS が回収する。
+        try:
+            instance_lock.close()
+        except Exception:  # noqa: BLE001 — 元の例外を握り潰さないための抑制
+            pass
+        raise
 
 
 def build_splash(app: App) -> str:
