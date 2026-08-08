@@ -2352,7 +2352,24 @@ def read_frame(stream: BinaryIO) -> dict | None:
     line = stream.readline()
     if not line:
         return None
-    return json.loads(line)
+    try:
+        frame = json.loads(line)
+    except ValueError as exc:
+        # レビュー 1 周目 (codex I-1 / sonnet C1): `ProtocolError` は
+        # 「プロトコル契約に反する入力全般の単一表現」と定義されているのに、
+        # 旧実装は `json.JSONDecodeError` (と不正 UTF-8 の
+        # `UnicodeDecodeError` — どちらも `ValueError` の派生) を素通し
+        # していた。親 (`WorkerRunner`, Task 10) が `except ProtocolError`
+        # をセッション違反の統一経路として実装しても捕捉できず、起動失敗の
+        # 分類・後始末が例外型に依存してしまう。
+        raise ProtocolError(f"malformed frame line: {exc}") from exc
+    if not isinstance(frame, dict):
+        # 同上。JSON の配列・文字列・数値は「行としては妥当」だがフレーム
+        # 契約には反する。型注釈上の `dict` を裏切ったまま返すと、受け手の
+        # `.get()` が `AttributeError` になり単一表現が崩れる。
+        raise ProtocolError(
+            f"frame must be a JSON object, got {type(frame).__name__}")
+    return frame
 ```
 
 - [ ] **Step 4: テスト実行して PASS を確認**
@@ -2892,8 +2909,14 @@ class _RagRpcProxy:
     def _call(self, name: str, args: dict) -> Any:
         self._rpc_counter += 1
         rpc_id = str(self._rpc_counter)
-        self._write({"type": "tool_rpc", "seq": self._seq_next(),
+        # レビュー 1 周目 (codex I-2): seq は**送出が成功してから**進める。
+        # 先に消費すると、write/flush が失敗したときにその seq が wire に
+        # 出ないまま欠番になり、次に成功したフレームを親の `SeqTracker` が
+        # reject する。
+        seq = self._out_seq._expected  # noqa: SLF001 — 送出側は採番に使う
+        self._write({"type": "tool_rpc", "seq": seq,
                      "rpc_id": rpc_id, "name": name, "args": args})
+        self._out_seq._expected += 1  # noqa: SLF001
         response = self._read()
         if response is None:
             raise RuntimeError("parent closed the pipe while awaiting tool_rpc_result")
@@ -2910,17 +2933,6 @@ class _RagRpcProxy:
             raise RuntimeError(str(response.get("error", "rag rpc failed")))
         return response.get("result")
 
-    def _seq_next(self) -> int:
-        # 子→親方向の ready/event/tool_rpc/result は同じカウンタ
-        # (main() から渡される out_seq) を共有する (CR-3 対応 — 単一
-        # スレッドで動くため送出順=seq 順が自然に一致する)。WorkerRunner
-        # (Task 10) 側の SeqTracker.check() と対称に、ここでは単に「次の
-        # 値」を払い出すだけの単純カウンタとして使う (受信側の検証責務は
-        # 親が持つ — 子は自分の送出 seq を数えるだけ)。
-        n = self._out_seq._expected  # noqa: SLF001 — 同一モジュール内の協調実装
-        self._out_seq._expected += 1
-        return n
-
     def search_news(self, query: str, n: int = 5) -> list[dict]:
         return self._call("search_news", {"query": query, "n": n})
 
@@ -2935,8 +2947,7 @@ def _make_on_message(protocol_out: Any, out_seq: SeqTracker) -> Callable[[dict],
     実行せずに検証するため)。"""
     def on_message(msg: dict) -> None:
         try:
-            write_frame(protocol_out, {
-                "type": "event", "seq": _next_seq(out_seq), "message": msg})
+            _send_frame(protocol_out, out_seq, {"type": "event", "message": msg})
         except Exception:  # noqa: BLE001 — I6 対応 (fail closed)
             # LocalRunner._sink (Task 6) は on_message の例外を握って
             # run() を継続する契約 — しかしここで write_frame が失敗
@@ -2965,14 +2976,25 @@ def _protect_protocol_stdout() -> Any:
 
 def main() -> None:
     protocol_out = _protect_protocol_stdout()
-    handshake = read_frame(sys.stdin.buffer)
-    if handshake is None:
-        return
 
     # I2 対応: 親→子方向 (handshake/tool_rpc_result) 専用の受信検証
     # トラッカー。handshake は常に seq=1 (親の唯一の起動時送出)。
     in_seq = SeqTracker()
+    # CR-3 対応: 子→親方向の ready/event/tool_rpc/result は 1 起点の単一
+    # カウンタを共有する (設計書 §4.3 codex M2-1、親側 WorkerRunner.in_seq
+    # がそう検証する)。レビュー 1 周目 (codex I-2) で `main()` の先頭へ
+    # 移動した — 外側 `except` からも採番できる必要があるため。
+    out_seq = SeqTracker()
+    ready_sent = False
     try:
+        # レビュー 1 周目 (codex I-1): handshake の読み取りを `try` の**内側**
+        # へ移した。旧実装は `try` の外で `read_frame` を呼んでいたため、
+        # 不正 JSON の handshake が `ProtocolError` を素通しさせて traceback
+        # で異常終了し、**`ready: ok=False` を一切返さなかった** (親からは
+        # 起動 timeout と区別がつかない)。EOF (None) は従来どおり正常終了。
+        handshake = read_frame(sys.stdin.buffer)
+        if handshake is None:
+            return
         if handshake.get("type") != "handshake":
             raise ProtocolError(
                 f"expected handshake, got {handshake.get('type')!r}")
@@ -3023,13 +3045,9 @@ def main() -> None:
         approved = (plugin_loader.approved_plugins(conn, plugins_dir)
                    if plugins_dir is not None else [])
 
-        # CR-3 対応: out_seq を先に構築し、_RagRpcProxy と on_message
-        # (event フレーム送出) の両方に同一インスタンスを共有させる —
-        # 子→親方向の ready/event/tool_rpc/result は 1 起点の単一
-        # カウンタでなければならない (設計書 §4.3 codex M2-1、親側
-        # WorkerRunner.in_seq がそう検証する)。
-        out_seq = SeqTracker()
-
+        # CR-3 対応: `main()` 冒頭で構築した out_seq を、_RagRpcProxy と
+        # on_message (event フレーム送出) の両方に**同一インスタンス**で
+        # 共有させる。
         registry = build_mission_registry(
             "trade", conn, settings, clock,
             _RagRpcProxy(
@@ -3050,32 +3068,55 @@ def main() -> None:
             model=settings.runner.trade.model, registry=registry,
             on_message=on_message)
 
-        write_frame(protocol_out, {
-            "type": "ready", "seq": _next_seq(out_seq), "ok": True})
+        _send_frame(protocol_out, out_seq, {"type": "ready", "ok": True})
+        ready_sent = True
 
         try:
             result = runner.run(mission)
-            write_frame(protocol_out, {
-                "type": "result", "seq": _next_seq(out_seq),
+            _send_frame(protocol_out, out_seq, {
+                "type": "result",
                 "status": result.status, "output": result.output})
         except Exception as exc:  # noqa: BLE001 — 必ず result を送る
-            write_frame(protocol_out, {
-                "type": "result", "seq": _next_seq(out_seq),
-                "status": "failed", "output": None,
+            _send_frame(protocol_out, out_seq, {
+                "type": "result", "status": "failed", "output": None,
                 "error": f"{type(exc).__name__}: {exc}"})
     except Exception as exc:  # noqa: BLE001 — ready 送出前の失敗も報告する
         try:
-            write_frame(protocol_out, {
-                "type": "ready", "seq": 1, "ok": False,
-                "error": f"{type(exc).__name__}: {exc}"})
+            # レビュー 1 周目 (codex I-2): 旧実装は無条件に
+            # `{"type": "ready", "seq": 1, ...}` を送っていた。`ready`
+            # (seq=1) を送出**済み**でこの節に到達する経路が実在する
+            # (内側 except 自身の送出が失敗した場合) ため、親の
+            # `SeqTracker` から見て seq=1 の**重複**になっていた。
+            # 送出済みなら `result: failed` として報告する。
+            if ready_sent:
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result", "status": "failed", "output": None,
+                    "error": f"{type(exc).__name__}: {exc}"})
+            else:
+                _send_frame(protocol_out, out_seq, {
+                    "type": "ready", "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}"})
         except Exception:  # noqa: BLE001 — パイプが壊れていれば諦める
             pass
 
 
-def _next_seq(tracker: SeqTracker) -> int:
-    n = tracker._expected  # noqa: SLF001 — 送出側は検証ではなく採番に使う
-    tracker._expected += 1
-    return n
+def _send_frame(protocol_out: Any, out_seq: SeqTracker, frame: dict) -> None:
+    """子→親のフレームを 1 件送出する (`seq` はここで採番して付す)。
+
+    **カウンタは送出が成功してから進める** (レビュー 1 周目 codex I-2)。
+    旧実装 (`_next_seq`) は serialize/write/flush より**前**に消費していた
+    ため、送出が失敗するとその seq が wire に出ないまま欠番になり、次に
+    成功したフレームを親の `SeqTracker` が `ProtocolError` として reject
+    した。実測: `runner.run()` の戻り値が壊れていて result フレームの
+    構築中に落ちると、wire 上は `ready(1)` の次が `result(3)` になった。
+
+    `SeqTracker` を採番器として流用する意図は Task 7 本文のとおり
+    (「次に来る/送り出すべき値」の意味が受信検証と送信採番で一致する)。
+    """
+    payload = dict(frame)
+    payload["seq"] = out_seq._expected  # noqa: SLF001 — 送出側は採番に使う
+    write_frame(protocol_out, payload)
+    out_seq._expected += 1  # noqa: SLF001
 
 
 if __name__ == "__main__":
@@ -3128,6 +3169,19 @@ Expected: 全件 PASS (mission_worker.py は他モジュールから import さ�
 **残存 2 件は accepted-unpinned** (意図的に次 task へ送る): 追加C (`write_frame` の `flush()` 削除) と 追加O (`_protect_protocol_stdout` の `dup2` 削除)。どちらも**実プロセスでしか症状が出ない** (インプロセステストは `_protect_protocol_stdout` 自体を monkeypatch している)。**Task 10 の実 spawn 統合テスト / Task 20 の E2E で拾う**。
 
 **後続 task への一般化**: `main()` 相当の「配線を組み立てる関数」は、構成要素の単体テストが全部緑でも無防備になる。Task 10 (`WorkerRunner`)・Task 13 (`MissionSupervisor`)・Task 19 (`build_app`/`App.close`) では、**単体テストとは別に「配線そのものを駆動して観測点を assert するテスト」を必ず 1 本以上置くこと**。
+
+**レビュー 1 周目の反映 (2026-08-08。codex 主査 I3 件 + sonnet 副査 I4 件を全件採用。上記 Step 3 / Step 8 のコードブロックは反映後の実装と一致させてある)**:
+
+1. **`read_frame` の例外を `ProtocolError` に正規化** — 旧稿は `json.JSONDecodeError` (と不正 UTF-8 の `UnicodeDecodeError`) を素通ししており、`ProtocolError` の「プロトコル契約に反する入力全般の**単一表現**」という定義が成立していなかった。非 JSON object も拒否する。**Task 10 の親側は `except ProtocolError` をセッション違反の統一経路として書いてよい**
+2. **`main()` の handshake 読取を `try` の内側へ移動** — 旧稿は `try` の外で `read_frame` を呼んでいたため、不正 JSON の handshake で `ready: ok=False` を**一切返さず** traceback で異常終了していた (親からは起動 timeout と区別がつかない)
+3. **`_next_seq` を廃し `_send_frame` を新設 — seq は送出成功後に進める** — 旧稿は serialize/write/flush の**前**に採番を消費していたため、送出が失敗するとその seq が wire に出ないまま**欠番**になり、次に成功したフレームを親の `SeqTracker` が reject した。`_RagRpcProxy._call` の `tool_rpc` 採番も同様に修正 (`_seq_next` は廃止)
+4. **外側 `except` の `"seq": 1` ハードコードを廃止** — `ready` 送出**後**にこの節へ到達する経路が実在する (内側 `except` 自身の送出が失敗した場合) ため、親から見て seq=1 の**重複**になっていた。`ready_sent` フラグを見て `result: failed` へ切り替える
+5. **accepted-unpinned としていた 2 件を Task 7 内で pin した** — `flush()` / `dup2` は `os.pipe()` で**実 subprocess を spawn せずに**観測できる。両レビュアーが一致して「後送は過度に保守的」と指摘し、指揮者の判断を撤回した。実 subprocess での「効能」検証は引き続き Task 10/20 で行う (二層)
+6. **`_set_resource_limits` の fail closed を pin** (sonnet 単独検出) — docstring が「設定失敗は fail closed」と明記しているのに、`_drive_main` が常に成功する fake に差し替えていたため無防備だった
+
+**Task 10 への申し送り (codex 主査)**: 子の `out_seq`/`in_seq` 共有は現状 `_expected` の内部状態観測で pin している。より堅いのは **wire レベルの往復** — fake runner が registry 内の RAG ツールを実行し、`ready(1) → tool_rpc(2) → result(3)` と handshake(1) 後の `tool_rpc_result(2)` を実際に往復させる統合テスト。Task 10 でこれを必須にすること。
+
+最終: 変異 **34 件を再走して生存 0 件**。`uv run pytest -q` = **1499 passed, 1 deselected** (ベースライン 1459 + 40)。
 
 - [ ] **Step 12: Commit**
 
