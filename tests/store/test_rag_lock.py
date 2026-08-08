@@ -261,7 +261,13 @@ def test_lock_timeout_waits_and_succeeds_when_released_in_time(tmp_path):
       3. holder は `about_to_call` を待ってから 0.3 秒保持し続けて解放
       4. main の acquire が成功する (deadline 5.0 秒に対し 0.3 秒待ち)
 
-    `timeout=0` に変異すると 2. の呼び出しが即 `RagUnavailable` になり red。
+    **このテストは load-bearing ではない** (レビュー 2 周目 codex): main が
+    `about_to_call.set()` してから実際に `acquire` へ入るまでの間に holder が
+    解放し切ってしまう経路が残っており、CI 負荷下では `timeout=0` 変異が
+    false-green になりうる (0.4 秒の遅延注入で実測された)。**契約を pin して
+    いるのは `test_locked_passes_the_configured_timeout_to_acquire` と
+    `test_locked_actually_waits_for_the_configured_duration` の 2 本**で、
+    こちらは「解放されれば待って成功する」という挙動の説明として残す。
     """
     rag = Rag(tmp_path / "rag", embedding_function=_FakeEmbedding(),
               lock_timeout_sec=5.0)
@@ -289,4 +295,99 @@ def test_lock_timeout_waits_and_succeeds_when_released_in_time(tmp_path):
         assert released.wait(timeout=5.0)
     finally:
         about_to_call.set()      # 例外時も holder を確実に前進させる
+        th.join(timeout=5.0)
+
+
+class _SpyLock:
+    """テスト専用の `threading.Lock` ラッパ (レビュー 2 周目の反映)。
+
+    `_locked()` が `acquire` に渡した `timeout` 引数を記録する。
+
+    **なぜ必要か**: 2 周目で両レビュアーが別々の穴を実測した —
+    - sonnet: `acquire(timeout=self._lock_timeout_sec)` を **`timeout=1.0`
+      の直書き**に変えても 14 本すべてが素通りした。設定値が
+      `_lock_timeout_sec` に**格納**されることと `build_app` が**配線**する
+      ことは pin されていたが、**`_locked()` がその値を実際に消費している**
+      ことは誰も検証していなかった (「値は存在するが効いていない」— 1 周目の
+      配線テストと同じクラスの穴)
+    - codex: 時間ベースのハンドシェイクは **main が acquire に入る前に holder
+      が解放しうる**ため、`timeout=0` 変異が CI 負荷下で false-green になる
+      (`about_to_call.set()` 直後に 0.4 秒の遅延を注入して実測)
+
+    引数を直接観測すれば**スレッドも時間も使わずに**両方を殺せる。
+
+    `__enter__`/`__exit__` は生 lock を直接使う — holder 側の
+    `with rag._lock:` が `timeouts` を汚さないようにするため。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.timeouts: list[float] = []
+
+    def acquire(self, blocking: bool = True, timeout: float = -1):
+        self.timeouts.append(timeout)
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._lock.release()
+        return False
+
+
+@pytest.mark.parametrize("configured", [0.37, 1.25])
+def test_locked_passes_the_configured_timeout_to_acquire(tmp_path, configured):
+    """`_locked()` が **`_lock_timeout_sec` の値そのものを** `acquire` へ
+    渡すことの pin (レビュー 2 周目 sonnet + codex)。
+
+    スレッドを使わないので **race が原理的に起きない**。2 つの値で
+    パラメータ化しているため、どんな定数を直書きしても必ず一方で落ちる。
+    `timeout=0` 変異も同時に殺す (記録が 0 になり設定値と一致しない)。
+    """
+    rag = Rag(tmp_path / "rag", embedding_function=_FakeEmbedding(),
+              lock_timeout_sec=configured)
+    spy = _SpyLock()
+    rag._lock = spy
+
+    assert rag.count_news() == 0          # lock は空いているので即成功する
+    assert spy.timeouts == [configured]
+
+
+def test_locked_actually_waits_for_the_configured_duration(tmp_path):
+    """`timeout` が **実際の待ち時間**として使われることの pin。
+
+    holder は**一度も解放しない**ので、経過時間は「待った時間」の下限に
+    なる — スケジューリング遅延は経過時間を**伸ばす方向にしか働かない**
+    ため、`timeout=0` 変異 (経過 ≈ 0) は**負荷に関係なく必ず red** になる。
+    codex 2 周目が指摘した「時間ベースのハンドシェイクは race で
+    false-green になる」問題を、解放しないことで構造的に回避している。
+    """
+    rag = Rag(tmp_path / "rag", embedding_function=_FakeEmbedding(),
+              lock_timeout_sec=0.5)
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_forever():
+        with rag._lock:
+            holding.set()
+            release.wait(10.0)
+
+    th = threading.Thread(target=hold_forever, daemon=True)
+    th.start()
+    try:
+        assert holding.wait(timeout=5.0), "holder が lock を取得できなかった"
+        started = time.monotonic()
+        with pytest.raises(RagUnavailable):
+            rag.count_news()
+        elapsed = time.monotonic() - started
+        # 0.5 秒待ってから諦めたはず。`timeout=0` なら ~0 秒で返る。
+        assert elapsed >= 0.4, f"待っていない (elapsed={elapsed:.3f}s)"
+    finally:
+        release.set()
         th.join(timeout=5.0)
