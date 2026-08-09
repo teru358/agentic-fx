@@ -9283,6 +9283,18 @@ Task 15/16/17 と異なり、本 task の前提は**おおむね現物と一致�
 
 **stage 0 変異 sweep は、レビュアーが worktree に入る前に指揮者が完走させる** (2026-08-09 の運用規則)。
 
+## ⚠ 実装中の裁定: `/dev` をディレクトリ丸ごと read-only 許可する (2026-08-09 ユーザー裁定)
+
+**現象 (実測)**: improve worker は起動時に `/dev/urandom` を必要とする — allowlist から `/dev` を外すと `NotImplementedError: /dev/urandom (or equivalent) not found` で `ready` に到達しない。
+
+**なぜファイル単位に絞れないか**: `core/landlock.py` の `restrict_to` は allowlist の各パスを **`os.open(str(path), os.O_PATH | os.O_DIRECTORY)`** で開く (Task 8 の実装)。単一ファイルを渡すと `NotADirectoryError` になる。Landlock ABI 自体は通常ファイルへのルール追加を許すので、`/dev/urandom` だけに絞ること自体は可能だが、そのためには **Task 8 のファイル (`core/landlock.py`) にパスごとの access mask 対応 (`O_DIRECTORY` を外す + `READ_DIR` をファイルには付けない) を入れる**必要がある。
+
+**裁定 (ユーザー)**: **現状のまま `/dev` をディレクトリ許可で進める。** `landlock.py` の拡張は本 task のスコープ外とする。
+
+**受け入れたリスク**: improve worker は `/dev` 配下の全デバイスノードを**読取**できる。設計書 §4.6 が要求する「`data/` の絶対パスアクセスを OS レベルで遮断する」意味論は保たれる (`/dev` は `data/` の祖先ではなく、`test_improve_profile_cannot_reach_data_dir` が毎回実測する) が、**最小 allowlist の原則からは外れる**。プラン 9 で improve に実ツールセットが入る前に、ファイル粒度対応を再検討してよい。
+
+**あわせて実測した allowlist の最小化**: 実装者が当初 `/lib`・`/lib64`・`/usr/lib`・`/usr/lib64`・`/usr/share`・`/etc`・`/dev` の 7 つを (申告せずに) 追加していたが、指揮者が 1 つずつ外して実測し、**load-bearing なのは `/usr/lib` (`libgcc_s.so.1`)・`/usr/share/zoneinfo`・`/dev` の 3 つだけ**と確定した (`/lib`・`/lib64` は `/usr/lib`・`/usr/lib64` への symlink、`/usr/lib64` と `/etc` は不要)。
+
 **Files:**
 - Modify: `src/agentic_fx/mission_worker.py` (`worker_profile == "improve"` 分岐 + `_bootstrap_improve_profile` 新設)
 - Modify: `docs/superpowers/plans/2026-08-01-phase2-decomposition.md` (§12 申し送り③ — 「到達不能」表現への注記追加)
