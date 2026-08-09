@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable
 
@@ -60,6 +61,75 @@ def open_risk_and_notional(
             * spec.contract_size * qty * quote_rate.value \
             + risk.commission_per_lot * qty
         base_rate = rate_fn(spec.base_currency)
+        total_notional += qty * spec.contract_size * base_rate.value
+    return total_risk, total_notional, len(rows)
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionSnapshot:
+    """commit-pre 相が集めた Risk Gate 評価用の外部取得スナップショット
+    (設計書 §3.1)。`captured_at` は commit-core の鮮度再検証が使う。"""
+    quote: Quote
+    spec: InstrumentSpec
+    specs_by_pair: dict
+    rates: dict
+    captured_at: datetime
+
+
+class SnapshotCoverageError(Exception):
+    """commit-core 開始時点の exposure がスナップショットでカバーされて
+    いない (設計書 §12 申し送り① N4-2 — commit-pre と commit-core の間に
+    新規 exposure が確定した場合)。lock 内で再取得せず intent 拒否する。"""
+
+
+@dataclass(frozen=True, slots=True)
+class CloseSnapshot:
+    """commit-pre 相が集めた CLOSE 用の外部取得スナップショット (裁定書
+    F-1 / CR-2 / P8-01)。`captured_at` は commit-core の鮮度再検証が使う。
+
+    `order_id`/`pair` は commit-core の同一性検査用 (レビュー 3 周目)。
+    **`pair` だけでは足りない** — `price` は `row["direction"]` で bid/ask
+    を選び分けた値なので、同一 pair の long/short 2 本を取り違えると
+    pair 検査を素通りして**スプレッドの反対側でクローズ**してしまう。
+    `order_id` が pair と direction の両方を含意する最も強い束縛。"""
+    order_id: int
+    pair: str
+    price: float
+    spec: InstrumentSpec
+    rate: ConversionRate | None
+    rate_degraded: bool
+    captured_at: datetime
+
+
+def open_risk_and_notional_from_snapshot(
+        conn: sqlite3.Connection, risk,
+        snapshot: ExecutionSnapshot) -> tuple[float, float, int]:
+    """`open_risk_and_notional` の DB-only 版 (commit-core 専用 — 外部
+    I/O を一切行わない)。exposure 行の pair/通貨がスナップショットに
+    無ければ `SnapshotCoverageError` (N4-2)。"""
+    total_risk = total_notional = 0.0
+    rows = orders.list_by_status(conn, *_EXPOSURE)
+    for r in rows:
+        pair = r["pair"]
+        spec = snapshot.specs_by_pair.get(pair)
+        if spec is None:
+            raise SnapshotCoverageError(
+                f"pair {pair!r} is not covered by the execution snapshot "
+                "(exposure grew after commit-pre — N4-2)")
+        if (spec.quote_currency not in snapshot.rates
+                or spec.base_currency not in snapshot.rates):
+            raise SnapshotCoverageError(
+                f"currency for pair {pair!r} is not covered by the "
+                "execution snapshot (exposure grew after commit-pre — N4-2)")
+        rule = risk.pair_rules.get(pair)
+        spread = rule.assumed_spread_pips * spec.pip_size if rule else 0.0
+        entry = r["avg_fill_price"] or r["requested_price"] or 0.0
+        qty = r["quantity"] or 0.0
+        quote_rate = snapshot.rates[spec.quote_currency]
+        total_risk += (abs(entry - (r["stop_loss"] or entry)) + spread) \
+            * spec.contract_size * qty * quote_rate.value \
+            + risk.commission_per_lot * qty
+        base_rate = snapshot.rates[spec.base_currency]
         total_notional += qty * spec.contract_size * base_rate.value
     return total_risk, total_notional, len(rows)
 
@@ -293,6 +363,13 @@ class Executor:
             quote_to_account=quote_to_account,
             base_to_account=base_to_account,
             now=now)
+        return self._evaluate_and_execute_open(intent, iid, ctx)
+
+    def _evaluate_and_execute_open(self, intent: TradeIntent, iid: int,
+                                   ctx: GateContext) -> dict:
+        """`_open`/`open_from_snapshot` の共有末尾 (判定ロジック不変—
+        Global Constraints: risk_gate は diff ゼロ)。既存 `_open` の
+        `result = evaluate(...)` 以降を逐語移動しただけ。"""
         result = evaluate(intent, ctx, self.settings.risk)
         if not result.accepted:
             intents_store.set_gate_result(self.conn, iid, accepted=False,
@@ -310,6 +387,7 @@ class Executor:
         intents_store.set_gate_result(self.conn, iid, accepted=True,
                                       reject_reason=None)
         is_market = intent.entry_type.value == "market"
+        now = ctx.now
         oid = orders.insert(
             self.conn, pair=intent.pair, direction=intent.direction.value,
             entry_type=intent.entry_type.value, horizon=intent.horizon.value,
@@ -364,54 +442,145 @@ class Executor:
                             ref_id=str(oid))
         return {"result": "pending", "order_id": oid, "reasons": []}
 
-    # ---- close / cancel -------------------------------------------------
+    def gather_open_snapshot(self, intent: TradeIntent, *,
+                             exposure_pairs: list[str]) -> ExecutionSnapshot:
+        """commit-pre 相専用 (設計書 §3.1) — **core_lock を保持しない状態
+        で呼ぶこと**。Risk Gate 評価に要る全外部取得 (quote + 全 exposure
+        pair の instrument spec + 全 exposure 通貨の換算レート) を 1 回で
+        完了させ、timestamp 付きスナップショットにする。
 
-    def _close(self, intent: TradeIntent, iid: int) -> dict:
+        `exposure_pairs` は呼び出し元 (commit-pre 相) が `conn_supervisor`
+        (lock 外の読取専用接続) から読んだ既存 exposure の pair 一覧。
+        """
         now = self.clock.now()
-        row = orders.get(self.conn, intent.order_id)
-        if row is None or row["status"] != S.OPEN.value:
-            reasons = [f"order {intent.order_id} is not open"]
+        quote = self.quote_fn(intent.pair)
+        spec = self.spec_fn(intent.pair)
+        cycle_rate = self.cycle_rate_fn(now)
+        specs_by_pair: dict = {intent.pair: spec}
+        currencies: set = {spec.quote_currency, spec.base_currency}
+        for pair in exposure_pairs:
+            pair_spec = self.spec_fn(pair)
+            specs_by_pair[pair] = pair_spec
+            currencies.add(pair_spec.quote_currency)
+            currencies.add(pair_spec.base_currency)
+        # A3: rates の構築順を安定化 (PYTHONHASHSEED 依存を避ける)
+        rates = {ccy: cycle_rate(ccy) for ccy in sorted(currencies)}
+        return ExecutionSnapshot(quote=quote, spec=spec,
+                                 specs_by_pair=specs_by_pair, rates=rates,
+                                 captured_at=now)
+
+    def open_from_snapshot(self, intent: TradeIntent, iid: int,
+                           snapshot: ExecutionSnapshot, *,
+                           max_snapshot_age_sec: float) -> dict:
+        """commit-core 相専用 (設計書 §3.1) — **core_lock 保持中に呼ぶ
+        こと**。①スナップショットの鮮度再検証 (lock 内での再取得はしない)
+        ②DB 状態を読み直して GateContext を確定 ③Risk Gate 判定・paper
+        broker 執行は `_evaluate_and_execute_open` へ委譲 (`_open` と
+        完全共有 — 判定ロジック不変)。
+        """
+        now = self.clock.now()
+        age_sec = (now - snapshot.captured_at).total_seconds()
+        if age_sec > max_snapshot_age_sec:
+            reasons = [
+                f"execution snapshot is stale ({age_sec:.1f}s > "
+                f"{max_snapshot_age_sec}s) — rejecting rather than "
+                "re-fetching while holding core_lock (設計書 §3.1)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason=reasons[0])
-            return {"result": "rejected", "order_id": intent.order_id,
-                    "reasons": reasons}
-        intents_store.set_gate_result(self.conn, iid, accepted=True,
-                                      reject_reason=None)
-        quote = self.quote_fn(row["pair"])
-        price = quote.bid if row["direction"] == "long" else quote.ask
-        final = self.close_order(row, price, reason="llm_close")
-        result = "closed" if final == S.CLOSED else "unknown"
-        return {"result": result, "order_id": row["id"], "reasons": []}
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": None, "reasons": reasons}
 
-    def close_order(self, row: dict, price: float, reason: str) -> S:
-        """裁量クローズ・SL/TP・強制クローズ共通の決定論的クローズ経路。
-        結果不明は closed 扱いにしない (設計書 §12)。snapshot は scheduler の
-        mark-to-market が記録する。戻り値は遷移後の状態
-        (S.CLOSED / S.CLOSE_UNKNOWN) — cancel_order と対称。"""
-        now = self.clock.now()
-        spec = self.spec_fn(row["pair"])
-        transitions.transition(self.conn, row["id"], S.CLOSING, now,
-                               close_reason=reason)
+        account = accounting.current_account(self.conn, now)
+        if account is None:
+            reasons = ["no fresh account snapshot (fail closed)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": None, "reasons": reasons}
+        equity, hwm = account
+
         try:
-            br = self.broker.close(row, price, reason)
-        except Exception as e:  # noqa: BLE001 — 結果不明として扱う (codex 2)
-            br = BrokerResult(status="unknown",
-                              message=safe_error_text(e))
-        if br.status != "ok":
-            transitions.transition(self.conn, row["id"], S.CLOSE_UNKNOWN, now)
-            self.activity.write(Category.TRADE, "close_unknown",
-                                f"{row['pair']} — reconcile 待ち",
-                                ref_id=str(row["id"]))
-            self.notifier.send(f"[agentic-fx] クローズ結果不明 #{row['id']}")
-            return S.CLOSE_UNKNOWN
-        # 設計書 §5: クローズはレート欠損でも妨げない。現在レートが取れなければ
-        # 最後に健全性検証を通ったレートへ degraded フォールバックする。
-        # どちらも無ければ (プロセス起動直後の初回クローズ等) realized_pnl は
-        # 未確定のまま残し、次回の定期同期で解消する (資金保護が換算に従属
-        # してはならない)。
-        rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
+            risk_total, notional, count = open_risk_and_notional_from_snapshot(
+                self.conn, self.settings.risk, snapshot)
+        except SnapshotCoverageError as e:
+            # N4-2: commit-pre と commit-core の間に新規 exposure が確定
+            # した。lock 内で再取得せず intent 拒否 (次周期の判断へ送る)。
+            reasons = [f"execution snapshot coverage error: {e}"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": None, "reasons": reasons}
+
+        # intent と snapshot の紐付けが壊れていないかの fail-closed 検査
+        # (CLOSE 側の `snapshot.pair != row["pair"]` と対称)。
+        #
+        # レビュー 3 周目の指摘: `gather_open_snapshot` が必ず intent.pair を
+        # 入れるため、**commit-pre で作った snapshot をそのまま同じ intent で
+        # commit-core へ渡す限りこの分岐は到達不能**である。それでも残すのは、
+        # 紐付けを行うのが Task 15 の五相配線 (intent は DB から読み直し、
+        # snapshot は別途保持する) であり、**その配線が壊れたときに裸の
+        # KeyError を core_lock 保持中に飛ばさない**ためのガードだから。
+        # 裸の KeyError だと set_gate_result も activity も残らず、mission が
+        # 未 finalize のまま落ちる。
+        spec = snapshot.specs_by_pair.get(intent.pair)
+        if spec is None:
+            reasons = [f"pair {intent.pair!r} is not covered by the execution "
+                       "snapshot (N4-2)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": None, "reasons": reasons}
+
+        # 直上の spec ガードと対称に fail-closed にする (裸の KeyError を
+        # core_lock 保持中に飛ばさない — レビュー 3 周目)
+        quote_to_account = snapshot.rates.get(spec.quote_currency)
+        base_to_account = snapshot.rates.get(spec.base_currency)
+        if quote_to_account is None or base_to_account is None:
+            reasons = [f"currency for pair {intent.pair!r} is not covered "
+                       "by the execution snapshot (N4-2)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": None, "reasons": reasons}
+
+        ctx = GateContext(
+            quote=snapshot.quote, spec=spec, equity=equity, hwm=hwm,
+            daily_start_equity=accounting.daily_start_equity(self.conn, now),
+            open_position_count=count, existing_risk_account=risk_total,
+            existing_notional_account=notional,
+            kill_switch_latched=self.state.load().kill_switch_latched,
+            has_unresolved_unknown=has_unresolved_unknown(self.conn),
+            account_currency=self.settings.account_currency,
+            quote_to_account=quote_to_account,
+            base_to_account=base_to_account,
+            now=now)
+        return self._evaluate_and_execute_open(intent, iid, ctx)
+
+    # ---- close / cancel -------------------------------------------------
+
+    def _close_unknown(self, row: dict, now: datetime) -> S:
+        """close_order/close_order_from_snapshot 共有 (broker 応答が
+        'ok' でない場合の後処理)。"""
+        transitions.transition(self.conn, row["id"], S.CLOSE_UNKNOWN, now)
+        self.activity.write(Category.TRADE, "close_unknown",
+                            f"{row['pair']} — reconcile 待ち",
+                            ref_id=str(row["id"]))
+        self.notifier.send(f"[agentic-fx] クローズ結果不明 #{row['id']}")
+        return S.CLOSE_UNKNOWN
+
+    def _finish_close(self, row: dict, price: float, contract_size: float,
+                      rate: ConversionRate | None, degraded: bool,
+                      reason: str, now: datetime) -> S:
+        """close_order/close_order_from_snapshot 共有 (broker 成功後の
+        pnl 計算・DB 遷移・activity 記録 — 既存 close_order の当該部分を
+        **逐語**移動しただけで判定ロジックは 1 文字も変えない)。"""
         pnl = compute_pnl(
-            row, price, contract_size=spec.contract_size,
+            row, price, contract_size=contract_size,
             commission_per_lot=self.settings.risk.commission_per_lot,
             quote_to_account_rate=rate.value) if rate is not None else None
         transitions.transition(self.conn, row["id"], S.CLOSED, now,
@@ -431,6 +600,151 @@ class Executor:
             self.notifier.send(
                 f"[agentic-fx] クローズ換算レート degraded #{row['id']}")
         return S.CLOSED
+
+    def _close(self, intent: TradeIntent, iid: int) -> dict:
+        now = self.clock.now()
+        row = orders.get(self.conn, intent.order_id)
+        if row is None or row["status"] != S.OPEN.value:
+            reasons = [f"order {intent.order_id} is not open"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            return {"result": "rejected", "order_id": intent.order_id,
+                    "reasons": reasons}
+        intents_store.set_gate_result(self.conn, iid, accepted=True,
+                                      reject_reason=None)
+        quote = self.quote_fn(row["pair"])
+        price = quote.bid if row["direction"] == "long" else quote.ask
+        final = self.close_order(row, price, reason="llm_close")
+        result = "closed" if final == S.CLOSED else "unknown"
+        return {"result": result, "order_id": row["id"], "reasons": []}
+
+    def close_order(self, row: dict, price: float, reason: str) -> S:
+        """裁量クローズ・SL/TP・強制クローズ共通の決定論的クローズ経路
+        (scheduler の SL/TP・day rollover 等が使う — lock 保持中に自前で
+        spec_fn/resolve_close_rate を呼ぶ既存動作は不変。**snapshot 版は
+        close_order_from_snapshot** — Mission の commit-core から使う)。
+        結果不明は closed 扱いにしない (設計書 §12)。snapshot (mark-to-
+        market) は scheduler が記録する。戻り値は遷移後の状態
+        (S.CLOSED / S.CLOSE_UNKNOWN) — cancel_order と対称。"""
+        now = self.clock.now()
+        spec = self.spec_fn(row["pair"])
+        transitions.transition(self.conn, row["id"], S.CLOSING, now,
+                               close_reason=reason)
+        try:
+            br = self.broker.close(row, price, reason)
+        except Exception as e:  # noqa: BLE001 — 結果不明として扱う (codex 2)
+            br = BrokerResult(status="unknown", message=safe_error_text(e))
+        if br.status != "ok":
+            return self._close_unknown(row, now)
+        # 設計書 §5: クローズはレート欠損でも妨げない。現在レートが取れなければ
+        # 最後に健全性検証を通ったレートへ degraded フォールバックする。
+        rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
+        return self._finish_close(row, price, spec.contract_size, rate,
+                                  degraded, reason, now)
+
+    def gather_close_snapshot(self, row: dict) -> CloseSnapshot:
+        """commit-pre 相専用 (裁定書 F-1 / CR-2 / P8-01) — **core_lock
+        非保持で呼ぶこと**。CLOSE 実行に要る quote (成行価格) +
+        instrument spec + 換算レートを 1 回で取得し timestamp 付き
+        スナップショットにする。`row` は呼び出し元 (Task 15 の commit-pre
+        相) が `conn_supervisor` (lock 外の読取専用接続) から読んだ現在の
+        order 行 (`pair`/`direction` を参照するだけ)。"""
+        now = self.clock.now()
+        pair = row["pair"]
+        quote = self.quote_fn(pair)
+        price = quote.bid if row["direction"] == "long" else quote.ask
+        spec = self.spec_fn(pair)
+        rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
+        return CloseSnapshot(order_id=row["id"], pair=pair, price=price,
+                             spec=spec, rate=rate,
+                             rate_degraded=degraded, captured_at=now)
+
+    def close_order_from_snapshot(self, row: dict, snapshot: CloseSnapshot,
+                                  reason: str) -> S:
+        """close_order の commit-core 専用版 (裁定書 F-1 / CR-2 / P8-01)
+        — `spec_fn`/`resolve_close_rate` を一切呼ばない (外部 I/O ゼロ)。
+        price/spec/rate は commit-pre で取得済みの `CloseSnapshot` を使う
+        (`broker.close` は paper broker の DB 書込であり外部 I/O ではない
+        ため commit-core に残す)。`_finish_close`/`_close_unknown` を
+        `close_order` と共有 — 判定・記録ロジックは `close_order` と完全
+        共有 (I/O 位置のみ移動)。"""
+        # row と snapshot の同一性検査 (commit-core は取得済みの値しか
+        # 使わないので、取り違えを検出できるのはここだけ)。
+        # **order_id まで見る** — pair だけだと同一 pair の long/short を
+        # 取り違えたときに素通りし、`snapshot.price` が反対側の気配
+        # (bid/ask) のままクローズされて close_price/realized_pnl が
+        # 恒久的に誤る (レビュー 3 周目)。
+        if (snapshot.order_id != row["id"]
+                or snapshot.pair != row["pair"]):
+            raise SnapshotCoverageError(
+                f"snapshot (order_id={snapshot.order_id}, "
+                f"pair={snapshot.pair!r}) does not match row "
+                f"(id={row['id']}, pair={row['pair']!r})")
+        now = self.clock.now()
+        transitions.transition(self.conn, row["id"], S.CLOSING, now,
+                               close_reason=reason)
+        try:
+            br = self.broker.close(row, snapshot.price, reason)
+        except Exception as e:  # noqa: BLE001
+            br = BrokerResult(status="unknown", message=safe_error_text(e))
+        if br.status != "ok":
+            return self._close_unknown(row, now)
+        return self._finish_close(row, snapshot.price,
+                                  snapshot.spec.contract_size, snapshot.rate,
+                                  snapshot.rate_degraded, reason, now)
+
+    def close_from_snapshot(self, intent: TradeIntent, iid: int,
+                            snapshot: "CloseSnapshot | None", *,
+                            max_snapshot_age_sec: float) -> dict:
+        """commit-core 相専用 (裁定書 F-1 / CR-2 / P8-01) — **core_lock
+        保持中に呼ぶこと**。①DB 状態を読み直して row の現況を確定
+        (commit-pre 後に状態が変わっていないか確認) ②`snapshot` が None
+        (commit-pre 時点で row が OPEN でなく取得をスキップした場合、また
+        は commit-pre 後に OPEN へ遷移した稀なケース) なら lock 内で
+        取得し直さず reject する ③鮮度再検証 (lock 内での再取得はしない)
+        ④`close_order_from_snapshot` へ委譲。"""
+        now = self.clock.now()
+        row = orders.get(self.conn, intent.order_id)
+        if row is None or row["status"] != S.OPEN.value:
+            reasons = [f"order {intent.order_id} is not open"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            return {"result": "rejected", "order_id": intent.order_id,
+                    "reasons": reasons}
+        if snapshot is None:
+            reasons = [
+                "close snapshot unavailable (order was not open at "
+                "commit-pre time) — rejecting rather than re-fetching "
+                "while holding core_lock (設計書 §3.1)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            return {"result": "rejected", "order_id": intent.order_id,
+                    "reasons": reasons}
+        age_sec = (now - snapshot.captured_at).total_seconds()
+        if age_sec > max_snapshot_age_sec:
+            reasons = [
+                f"close snapshot is stale ({age_sec:.1f}s > "
+                f"{max_snapshot_age_sec}s) — rejecting rather than "
+                "re-fetching while holding core_lock (設計書 §3.1)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            return {"result": "rejected", "order_id": intent.order_id,
+                    "reasons": reasons}
+        intents_store.set_gate_result(self.conn, iid, accepted=True,
+                                      reject_reason=None)
+        try:
+            final = self.close_order_from_snapshot(row, snapshot, reason="llm_close")
+        except SnapshotCoverageError as e:
+            # A1: pair チェック失敗など、snapshot の同一性が確認できない
+            reasons = [f"close snapshot coverage error: {e}"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": intent.order_id,
+                    "reasons": reasons}
+        result = "closed" if final == S.CLOSED else "unknown"
+        return {"result": result, "order_id": row["id"], "reasons": []}
 
     def cancel_order(self, row: dict, reason: str) -> S:
         """取消の共通経路 (LLM cancel / 期限切れ / 予約維持 / クローズ移行)。
