@@ -1091,6 +1091,42 @@ def test_run_service_rejects_try_submit_during_shutdown_before_scheduler_exits(
     assert result_box.get("rc") == 0
 
 
+def test_shutdown_sequence_completes_even_if_supervisor_shutdown_raises(tmp_path):
+    """レビュー1周目 (指揮者所見) の回帰ピン: `supervisor.shutdown()` の
+    失敗で停止シーケンス全体を落とさない。
+
+    `shutdown` → `fail_pending` は `if not future.done()` の直後に
+    `future.set_exception()` を呼ぶため、supervisor スレッドが間で完了
+    させると `InvalidStateError` が伝播しうる。裸で呼ぶと **th.join /
+    app.close / service_stopped の記録が全て飛ぶ** (資源リーク + 元の
+    例外が置き換わる)。同ファイルの `instance_lock.close()` と同じ扱い。
+    """
+    app = _seam_app(tmp_path, FakeRunner([]))
+
+    def boom(*, drain_exc):
+        raise RuntimeError("supervisor already torn down")
+
+    app.supervisor.shutdown = boom
+    # shutdown が失敗すると supervisor へ停止が伝わらないため、本番では
+    # main が join budget (dispatch ceiling — 既定で 20 分超) を丸ごと
+    # 待つ。ここで見たいのは「シーケンスが最後まで走るか」だけなので
+    # join/is_alive は差し替える (待ち時間そのものは別の申し送り)。
+    app.supervisor.join = lambda timeout=None: None
+    app.supervisor.is_alive = lambda: False
+
+    stop_event = threading.Event()
+    stop_event.set()
+    with _no_real_network(), \
+         patch("agentic_fx.service.build_app", return_value=app), \
+         patch("agentic_fx.service.signal.signal"):
+        rc = run_service(tmp_path, daemon=True, _stop_event=stop_event)
+
+    assert rc == 0
+    act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert "service_stopped" in act, (
+        "supervisor.shutdown() の失敗で停止シーケンスが途中で落ちている")
+
+
 class _KeyboardInterruptOnMainWait(threading.Event):
     """メインスレッドの最初の `wait()` 呼び出しだけ `KeyboardInterrupt` を
     送出する (F2 のピン)。バックグラウンドスレッド (scheduler/watchdog) からの
