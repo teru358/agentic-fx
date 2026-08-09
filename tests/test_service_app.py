@@ -899,6 +899,45 @@ def test_run_service_derives_supervisor_join_timeout_from_dispatch_ceiling(
     assert recorded.get("timeout") == pytest.approx((42.0 + 3.0 + 2.0) * 4 + 60.0)
 
 
+def test_scheduler_tick_actually_invokes_the_watchdog_health_check(tmp_path):
+    """相互監視の scheduler→watchdog 方向が**実際に配線されている**ことを
+    確認する (2周目 ローカル LLM 指摘 — 指揮者が変異で CONFIRMED)。
+
+    `_check_watchdog_health` 自体の分岐と、それを囲む停止中ガードには
+    ピンがあったが、**`scheduler_thread` からの呼び出しを丸ごと削除しても
+    全件 1721 passed** だった。設計書 §6 の相互監視は「watchdog が
+    scheduler/supervisor を見る」方向だけでは片肺で、watchdog 自身が静かに
+    止まったときの検出手段が完全に失われる。
+    """
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    calls: list = []
+
+    def recorder(app_, watchdog_obj, stop_, **kwargs):
+        calls.append(watchdog_obj)
+        stop_.set()   # 1 回観測したら停止させる
+
+    # **バックストップ**: 配線が消えている変異では recorder が呼ばれず
+    # stop_event が永久に立たない。ハングは red より悪い (原因が読めない)
+    # ので、必ず停止させて assert で落ちるようにする。
+    backstop = threading.Timer(5.0, stop_event.set)
+    backstop.start()
+    try:
+        with _no_real_network(), \
+             patch("agentic_fx.service.build_app", return_value=app), \
+             patch("agentic_fx.service.signal.signal"), \
+             patch("agentic_fx.service._check_watchdog_health", recorder):
+            run_service(tmp_path, daemon=True, _stop_event=stop_event)
+    finally:
+        backstop.cancel()
+
+    assert calls, (
+        "scheduler tick が watchdog の健全性チェックを呼んでいない "
+        "(設計書 §6 の相互監視が片方向になっている)")
+    assert isinstance(calls[0], threading.Thread), (
+        "watchdog スレッドそのものが渡されていない")
+
+
 def test_watchdog_ceiling_and_join_budget_come_from_the_same_value(tmp_path):
     """裁定 B の順序関係 (join budget >= watchdog の dispatch ceiling) を
     実際の呼び出しで固定する。
@@ -933,11 +972,18 @@ def test_watchdog_ceiling_and_join_budget_come_from_the_same_value(tmp_path):
         recorded.setdefault("ceiling", kwargs.get("dispatch_ceiling_sec"))
         stop_.set()   # 1 回観測したら停止させる
 
-    with _no_real_network(), \
-         patch("agentic_fx.service.build_app", return_value=app), \
-         patch("agentic_fx.service.signal.signal"), \
-         patch("agentic_fx.service._watchdog_check", fake_watchdog_check):
-        run_service(tmp_path, daemon=True, _stop_event=stop_event)
+    # バックストップ (上の配線テストと同じ理由): 配線が消えた変異で
+    # ハングさせず、assert で落とす。
+    backstop = threading.Timer(5.0, stop_event.set)
+    backstop.start()
+    try:
+        with _no_real_network(), \
+             patch("agentic_fx.service.build_app", return_value=app), \
+             patch("agentic_fx.service.signal.signal"), \
+             patch("agentic_fx.service._watchdog_check", fake_watchdog_check):
+            run_service(tmp_path, daemon=True, _stop_event=stop_event)
+    finally:
+        backstop.cancel()
 
     assert recorded.get("ceiling") is not None, (
         "watchdog が dispatch_ceiling_sec を明示的に受け取っていない "
