@@ -44,9 +44,11 @@ import json
 import os
 import signal
 import sys
+import sysconfig
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from agentic_fx.core import landlock
 from agentic_fx.core.mission_protocol import (
     ProtocolError, SeqTracker, encode_frame, read_frame,
 )
@@ -81,6 +83,69 @@ def _set_resource_limits(*, as_mb: int, nofile: int, fsize_mb: int) -> None:
     fsize_bytes = int(fsize_mb) * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_bytes, fsize_bytes))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+def _bootstrap_improve_profile() -> None:
+    """improve worker profile の bootstrap (プラン8, 設計書 §4.6)。
+
+    **⚠ CRITICAL: Landlock は不可逆。この関数を呼ぶプロセスの生涯全体が
+    制限される。テストから呼ぶ場合は必ず `subprocess` を経由し、
+    in-process (pytest プロセス内) で実行してはいけない。**
+
+    **構造的到達不能の 2 層防御**: ①接続情報の非提供 (handshake に
+    db_path/plugins_dir が含まれない — `main()` の improve 分岐がこれらを
+    一切参照しない) ②Landlock による FS 自己制限 (コードツリー読取 +
+    venv/stdlib 読取 (裁定書 F-8/IM-2/P8-04 — 実行に必要な依存解決のため) +
+    専用 workdir 読書きのみ allowlist、`data/` は遮断)。
+
+    呼び出し時点の `Path.cwd()` は WorkerRunner が `cwd=` に渡した専用空
+    workdir (呼び出し元の責務 — このプロセス自身は検証しない)。
+
+    **Landlock 利用不能な環境では improve worker は起動拒否 (fail
+    closed)** — trade profile は Landlock を任意 (RO 接続が主防御) と
+    するが、improve profile は Landlock が唯一の FS 境界であるため必須。
+    """
+    if not landlock.is_available():
+        raise RuntimeError(
+            "Landlock is not available on this kernel/architecture — "
+            "improve worker profile refuses to start without it "
+            "(fail closed, 設計書 §4.6)")
+    code_root = Path(__file__).resolve().parents[1]
+    workdir = Path.cwd()
+    venv_root = Path(sys.prefix).resolve()
+    stdlib_root = Path(sysconfig.get_paths()["stdlib"]).resolve()
+    base_prefix = Path(sys.base_prefix).resolve()
+    read_only = [code_root, venv_root, stdlib_root]
+    if base_prefix != venv_root:
+        read_only.append(base_prefix)
+    # venv/stdlib の外にある実行時依存。**allowlist は防御の質そのものなので
+    # 最小に保つ** — 以下の 3 つは指揮者が 1 つずつ外して実測し、いずれも
+    # 外すと tests/test_improve_profile_isolation.py が red になることを
+    # 確認した「load-bearing な 3 つ」だけを残している (2026-08-09 実測):
+    #
+    #   /usr/lib             外すと `ImportError: libgcc_s.so.1: cannot open
+    #                        shared object file` で improve worker が起動不能
+    #   /usr/share/zoneinfo  タイムゾーンデータ。外すと起動不能
+    #   /dev                 `/dev/urandom` (乱数生成) のため。**ディレクトリ
+    #                        単位でしか許可できない** — `landlock.restrict_to`
+    #                        は対象を `O_PATH | O_DIRECTORY` で open するので
+    #                        単一ファイル (`/dev/urandom`) を渡すと
+    #                        `NotADirectoryError` になる (実測)
+    #
+    # 外しても red にならなかったため**削除した**もの: `/lib`・`/lib64`
+    # (どちらも `/usr/lib`・`/usr/lib64` への symlink)、`/usr/lib64`、`/etc`。
+    # 残した 3 つはいずれも `data/` の祖先ではないため、設計書 §4.6 の
+    # 「`data/` の絶対パスアクセスを OS レベルで遮断する」意味論は保たれる
+    # (`test_improve_profile_cannot_reach_data_dir` が毎回それを実測する)。
+    for sys_path in [Path("/usr/lib"), Path("/usr/share/zoneinfo"),
+                     Path("/dev")]:
+        if sys_path.exists():
+            read_only.append(sys_path)
+    try:
+        landlock.restrict_to(read_only_paths=read_only, read_write_paths=[workdir])
+    except landlock.LandlockUnavailable as e:
+        raise RuntimeError(
+            f"Landlock restriction failed (syscall error): {e} "
+            "(improve worker profile refuses to continue, fail closed)") from e
 
 
 class _RagRpcProxy:
@@ -221,6 +286,43 @@ def main() -> None:
             return
         settings_dict = handshake["settings"]
         worker_profile = handshake["worker_profile"]
+        if worker_profile == "improve":
+            _bootstrap_improve_profile()
+            _set_resource_limits(
+                as_mb=settings_dict["worker"]["child_as_mb"],
+                nofile=settings_dict["worker"]["child_nofile"],
+                fsize_mb=settings_dict["worker"]["child_fsize_mb"])
+            from agentic_fx.config import Settings
+            settings = Settings.model_validate(settings_dict)
+            if settings.runner.improve.backend != "local":
+                raise RuntimeError(
+                    f"runner.improve.backend={settings.runner.improve.backend!r} "
+                    "is not supported by mission_worker in this plan "
+                    "(ClaudeRunner is Plan 9 scope) — fail closed")
+            from agentic_fx.runners.base import Mission
+            from agentic_fx.runners.local_runner import LocalRunner
+            from agentic_fx.tools.registry import ToolRegistry
+
+            registry = ToolRegistry()
+            mission = Mission(**handshake["mission"])
+            on_message = _make_on_message(protocol_out, out_seq)
+            runner = LocalRunner(
+                base_url=settings.llama_swap.base_url,
+                model=settings.runner.improve.model, registry=registry,
+                on_message=on_message)
+
+            _send_frame(protocol_out, out_seq, {"type": "ready", "ok": True})
+            ready_sent = True
+            try:
+                result = runner.run(mission)
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result",
+                    "status": result.status, "output": result.output})
+            except Exception as exc:  # noqa: BLE001
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result", "status": "failed", "output": None,
+                    "error": f"{type(exc).__name__}: {exc}"})
+            return
         if worker_profile != "trade":
             raise RuntimeError(
                 f"unsupported worker_profile in this plan: {worker_profile!r}")

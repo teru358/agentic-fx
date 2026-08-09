@@ -103,6 +103,14 @@
 
 **受入条件**: llama-swap ハング注入で Mission が kill され missions 行が timeout finalize される / Mission 実行中に SL 到達 → クローズが遅延なく実行されるテスト / worker プロセスから `run_holdout_gate`・`ohlcv` 直読・`data/` が構造的に到達不能であることのテスト。
 
+> **注記 (プラン8, 設計書 §4.6)**: 「構造的に到達不能」は「実行不能」の意味論で読み替える
+> (**本文書中の同表現すべてに適用する** — 23 行・53 行・96 行・上記受入条件) —
+> Landlock の allowlist はコードツリーの読取を許すため `run_holdout_gate` の**関数 import
+> 自体は可能**。遮断の実体は**データ到達**にあり、`run_holdout_gate` は `history_conn`
+> (履歴 DB 接続) を必須引数に取るため、improve worker は DB パス非提供 + Landlock の
+> data/ 遮断により接続を構成できず、import できても**実行が必ず失敗する**
+> (プラン8 Task 18 で実測検証)。
+
 ---
 
 ## プラン 9: ClaudeRunner + 改善ループ

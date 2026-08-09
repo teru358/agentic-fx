@@ -576,15 +576,54 @@ def test_main_exits_without_ready_when_reparented(monkeypatch, tmp_path):
 
 
 def test_main_rejects_unsupported_worker_profile(monkeypatch, tmp_path):
-    """本プランのスコープは `worker_profile="trade"` のみ (improve は
-    Task 18)。それ以外は ready を送る前に fail closed する。"""
+    """本プランのスコープは `worker_profile="trade"` と Task 18 で実装した
+    `worker_profile="improve"` のみ。それ以外（例: bogus）は ready を送る前に
+    fail closed する。"""
     frames, _, registry_calls = _drive_main(
         monkeypatch, tmp_path,
-        handshake_overrides={"worker_profile": "improve"})
+        handshake_overrides={"worker_profile": "bogus"})
 
     assert len(frames) == 1
     assert frames[0]["type"] == "ready" and frames[0]["ok"] is False
-    assert "improve" in frames[0]["error"]
+    assert "bogus" in frames[0]["error"]
+    assert registry_calls == []
+
+
+def test_main_applies_landlock_bootstrap_before_running_improve_mission(
+        monkeypatch, tmp_path):
+    """**Task 18 の中心的防御の配線ピン** (プラン8, 設計書 §4.6)。
+
+    improve 分岐は `_bootstrap_improve_profile()` を、依存 import・
+    `LocalRunner` 構築・`ready` 送出のいずれよりも**先に必ず呼ぶ**。
+
+    根拠 (指揮者の段0 変異スイープで実測): `main()` からこの呼び出しを
+    削除しても `tests/test_improve_profile_isolation.py` は 5 件全て green
+    のままだった。あちらは `_bootstrap_improve_profile` を probe から
+    **直接**呼ぶので、「`main()` がそれを呼ぶか」を一切見ていない。
+    削除されると **improve worker が Landlock 無しで走る** — 本 task が
+    作った権限境界が丸ごと消える。
+
+    実 Landlock は不可逆 (プロセス生涯にわたって有効) なので、ここでは
+    呼び出しの有無と順序だけを観測する。実際の遮断の検証は
+    `tests/test_improve_profile_isolation.py` の実 subprocess 帯が持つ。
+    """
+    calls: list[int] = []
+    monkeypatch.setattr(
+        mission_worker, "_bootstrap_improve_profile",
+        lambda: calls.append(len(_FakeLocalRunner.instances)))
+
+    frames, _, registry_calls = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve",
+                             "db_path": None, "plugins_dir": None})
+
+    assert calls, ("main() の improve 分岐が _bootstrap_improve_profile を"
+                   "呼んでいない — Landlock 無しで improve worker が走る")
+    assert calls[0] == 0, ("_bootstrap_improve_profile が LocalRunner 構築"
+                           "より後に呼ばれている (Landlock 適用前に依存を"
+                           "読み込む順序になっている)")
+    assert frames[0]["type"] == "ready" and frames[0]["ok"] is True
+    # improve profile は trade の registry を組まない (DB 非参照の構造的成立)
     assert registry_calls == []
 
 
