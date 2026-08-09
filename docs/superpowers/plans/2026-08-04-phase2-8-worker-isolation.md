@@ -6430,7 +6430,8 @@ EOF
   - `executor.open_risk_and_notional_from_snapshot(conn, risk, snapshot: ExecutionSnapshot) -> tuple[float, float, int]` — `open_risk_and_notional` の DB-only 版。exposure 行の pair/通貨がスナップショットに無ければ `SnapshotCoverageError`
   - `Executor.open_from_snapshot(self, intent: TradeIntent, iid: int, snapshot: ExecutionSnapshot, *, max_snapshot_age_sec: float) -> dict` — **commit-core 専用、core_lock 保持中に呼ぶ**。①鮮度再検証 (`now - snapshot.captured_at > max_snapshot_age_sec` なら発注拒否、lock 内での再取得はしない) ②DB 状態読み直し (account/daily_start_equity/has_unresolved_unknown) ③`open_risk_and_notional_from_snapshot` (N4-2: `SnapshotCoverageError` も発注拒否) ④`GateContext` 確定 → `_evaluate_and_execute_open` へ委譲 (判定・執行ロジックは `_open` と完全共有)
   - `Executor._evaluate_and_execute_open(self, intent: TradeIntent, iid: int, ctx: GateContext) -> dict` (private — `_open`/`open_from_snapshot` の共有末尾。既存 `_open` の `result = evaluate(...)` 以降を**逐語**移動しただけで判定ロジックは 1 文字も変えない)
-  - **(裁定書 F-1 / CR-2 / P8-01 追加)** `executor.CloseSnapshot` (frozen dataclass): `price: float, spec: InstrumentSpec, rate: ConversionRate | None, rate_degraded: bool, captured_at: datetime`
+  - **(裁定書 F-1 / CR-2 / P8-01 追加)** `executor.CloseSnapshot` (frozen dataclass): `pair: str, price: float, spec: InstrumentSpec, rate: ConversionRate | None, rate_degraded: bool, captured_at: datetime`
+    - **`pair` はレビュー 2 周目の追加 (2026-08-09)**。当初案には `pair` が無く、`close_order_from_snapshot` は `snapshot.price` / `snapshot.spec.contract_size` を**無検査**で使っていた。OPEN 経路は `risk_gate.py:51` が `intent.pair != ctx.quote.symbol or intent.pair != ctx.spec.symbol` で fail-closed するのに対し、**CLOSE 経路には等価な防御が無かった**。Task 15 は row を `conn_supervisor` から、intent の `order_id` を別途読むため取り違えは構造的に起こりうる。起きると**別銘柄の bid/ask でクローズし、別通貨のレートで `realized_pnl` を確定して DB に永久記録**する (例外も出ない)。`close_order_from_snapshot` の**先頭** (`S.CLOSING` へ遷移する前) で `snapshot.pair != row["pair"]` なら `SnapshotCoverageError` を送出し、`close_from_snapshot` が N4-2 分岐と同じ形で拒否に変換する
   - `Executor.gather_close_snapshot(self, row: dict) -> CloseSnapshot` — **commit-pre 専用、core_lock 非保持で呼ぶ**。`row` は呼び出し元 (Task 15) が `conn_supervisor` (lock 外の読取専用接続) から読んだ現在の order 行 (`pair`/`direction` を参照するだけ)。`quote_fn`(成行価格) → `spec_fn` → `resolve_close_rate`(`rate_fn` 経由) を 1 回で完了させる
   - `Executor.close_from_snapshot(self, intent: TradeIntent, iid: int, snapshot: CloseSnapshot | None, *, max_snapshot_age_sec: float) -> dict` — **commit-core 専用、core_lock 保持中に呼ぶ**。`_close` (369-384 行) と並行する別経路。①row 現況の再確認 ②`snapshot is None` なら lock 内取得せず拒否 ③鮮度再検証 ④`close_order_from_snapshot` へ委譲
   - `Executor.close_order_from_snapshot(self, row: dict, snapshot: CloseSnapshot, reason: str) -> OrderStatus` — `close_order` の commit-core 専用版。`spec_fn`/`resolve_close_rate` を一切呼ばない。`broker.close`(paper broker=DB書込、外部 I/O ではない) と DB 遷移のみ commit-core で行う。`_finish_close`/`_close_unknown` を `close_order` と共有 (判定・記録ロジック不変 — I/O 位置のみ移動)
@@ -7402,6 +7403,14 @@ Task 14 で直さなかった理由: `_finish_close`/`_close_unknown`/`_evaluate
 - Modify: `config/settings.yaml.example` (同期)
 - Modify: `tests/loops/test_trade_loop.py:31-69` (`_loop` fixture に `core_lock`/`conn_supervisor` 追加)
 - Test: `tests/loops/test_trade_loop_phases.py` (新規 — lock 境界の直接検証。**追加 (Task 14 申し送り): commit-core 中に `notifier.send` が呼ばれないことの pin**)
+
+**(Task 14 レビュー 2 周からの申し送り — 本 task で必ず回収すること) commit-pre の外部取得失敗が「記録済みの gate 拒否」にならない。**
+
+`_open` (ライブ経路) はレート障害を `except DataUnhealthy` で捕まえ、**`intents_store.set_gate_result(accepted=False)` + `gate_rejected` activity** という**記録済みの拒否**に変換する。一方 `gather_open_snapshot` は `cycle_rate_fn(now)` の `DataUnhealthy` を捕まえず送出するだけで、この分岐が snapshot 経路のどこにも存在しない (2026-08-09 `/code-review` が検出、指揮者が現物照合)。
+
+既定構成では yfinance が唯一有効な quote/rate ソースなので、**1 通貨のレート取得失敗 (または `cycle_rate_fn` の全体 skew 検証の発火) で commit-pre が例外を送出する経路は現実的に起こる。** そのとき本 task の設計では `snapshot_error` として commit-core へ持ち越し、広い `except` で `intent_execution_failed` にするだけなので、**`trade_intents.gate_result` は NULL のまま・`gate_rejected` activity も残らない** — ライブ経路との監査証跡の非対称が生じる。
+
+Task 14 で直さなかった理由: 記録には `iid` が要り、`iid` を持つのは**呼び出し元 (= 本 task の commit-pre 相)** であって `gather_open_snapshot` ではない。**本 task で、commit-pre のスナップショット取得失敗を `_open` と同じ形の「記録済み gate 拒否」に変換すること。**
 
 **(Task 14 レビュー 1 周からの申し送り — 本 task で併せて回収)** `close_from_snapshot` の拒否 3 分岐 (not-open / snapshot None / stale) は `set_gate_result` のみで **`activity.write` を書かない**。`open_from_snapshot` の拒否分岐がすべて `gate_rejected` を activity に記録するのと非対称である。既存 `_close` も同じ非対称を持つため Task 14 では**プラン記述通りに据え置いた** (直すと既存経路に波及するため)。本 task で `close_intent` 公開昇格を行う際に、**両経路の拒否分岐すべてに `activity.write(Category.TRADE, "gate_rejected", ...)` を入れて対称化すること。** 運用時に「なぜ LLM の close 指示が実行されなかったか」を activity ログだけで追えるようにする。
 
