@@ -9632,6 +9632,62 @@ EOF
 
 設計書 §5 (停止状態機械) と §6 (スレッド監督・health ラッチ) を実装する。本プランで最後の統合 task — ここまでの全部品 (WorkerRunner・MissionSupervisor・Rag・shell readline seam) を停止シーケンスへ接続する。
 
+## ⚠ 着手前検証の結果 (2026-08-09、指揮者が現物照合) — **必ず最初に読むこと**
+
+本 task の Step 群は Task 12〜17 の実装より**前**に書かれており、以下がすでに現物と食い違っている。**プラン記述をそのまま転写すると、申し送りを回収し損ねる / 既存の防御を消す / 既に直した退行を戻す**。
+
+### (1) Step 5 の「`_run_hooks` の 3 呼び出しサイト」は **1 箇所**しか無い
+
+Task 12 が `tick()` を `try/finally` 化した結果 (`core/scheduler.py:105` の `try:` / `182` の `finally:`)、`_run_hooks(now)` の呼び出しは **`finally` 節の 1 箇所 (`scheduler.py:183`) だけ**になっている。市場閉鎖時・mark-to-market 失敗時の呼び出しは `return` 経由で同じ `finally` に集約済み。
+
+- **したがって Step 5 の「3 箇所を `if not self._stopping():` で包む」は空振りする** (包む対象が 1 つしかない)。
+- **さらに重要**: この 1 箇所は `finally` にあるため **`BaseException` (`KeyboardInterrupt`/`SystemExit`) でも走る**。Task 12 からの申し送り「停止処理の最中に news の HTTP 取得が走りうる」は**まさにこの経路**であり、ガードは `finally` の呼び出し側ではなく **`_run_hooks` の冒頭に `if self._stopping(): return` を置く**のが構造的に正しい (将来 `_run_hooks` の呼び出しが増えても漏れない)。
+- `_trade_mission_due(now)` は `finally` の**後** (`scheduler.py:185`) にあるので、Step 5 の `reason = None if self._stopping() else self._trade_mission_due(now)` はそのまま成立する。**これは hooks とは別の適用範囲**なので、変異も別々に当てること。
+
+### (2) Step 8 の `run_service` 置換コードは既存のテストシームを 2 つ壊す
+
+現行 `run_service` は `service.py:666-814` (FC-4 が書いた「491 行」は Task 15 の変更でドリフト済み。`app = build_app(root)` は **677 行**、`stop_event = _stop_event if ...` は **686 行**)。
+
+- Step 8 の `scheduler_thread` は `with app.core_lock: app.scheduler.tick(app.clock.now())` を**インライン展開**しているが、現行は **`_scheduler_tick_once(app)` (`service.py:621`) を呼んでいる**。転写すると同関数が孤児化し、`tests/test_service_app.py:941` の `patch("agentic_fx.service._scheduler_tick_once", ...)` と `test_scheduler_tick_once_uses_app_clock` (1308 行) が**意味を失う**。`scheduler_busy` の set/clear は `_scheduler_tick_once` 呼び出しを**残したまま**その外側に置くこと。
+- 同様に `watchdog_thread` も**既に存在する** (`service.py:702-709`)。Task 17 の申し送りに書いた「`watchdog_thread` (`service.py:701`) は立てず」は**記述が不正確** — スレッドは立っており `_watchdog_tick(app)` (mission 超過通知) を呼んでいる。**正しくは「現行 watchdog は `stop_event.set()` を一切しない**ので、`stop_event` の producer にはなっていない」。本 task が `_watchdog_check` / `_record_fatal` を差し込むことで初めて producer になる。
+
+### (3) Step 8 は Task 15 が直した退行を戻す
+
+Step 8 の `app.supervisor.join(timeout=app.settings.worker.shutdown_join_timeout_sec)` は、**Task 15 (codex E2) が「固定 30 秒だと run 相での停止が必ずタイムアウトする」として捨てた形**そのもの。現行 (`service.py:786-790`) は `llama_swap.timeout_sec + worker_grace_sec + worker_terminate_grace_sec + 10.0` で導出している。`shutdown_join_timeout_sec` (config.py:246, 既定 30.0) は設定としては存在するが、**この用途に使ってはいけない**。導出式を維持するか、reflection 連鎖 (最大 3 件) を含めた新しい導出を本 task で確定すること (Task 15 は「完全な導出は Task 19 の担当」と明記して残している)。
+
+### (4) Step 6 は flaky (`Bad file descriptor`) を**直さない**
+
+Step 6 の `finally` ブロックは自ら「Task 10 の現行 `finally` と**完全に同一**」と宣言している。申し送りの発生源はその `finally` 自体なので、**転写しても頻度 1/3 の flaky は残ったまま全件 green になる**。実際の修正 (dispatcher が close 済み `proc.stdin` に書かないようにする — `stdin_lock` 下でのクローズ済みフラグ等) を設計し、**`for i in $(seq 30)` の反復実行で before/after の発生回数を実測**すること。1 回の green は何も証明しない。
+
+### (5) `_wait_with_stop` (Step 6) と既存の時間 assert
+
+`tests/runners/test_worker_runner.py` に厳密な時間 assert が 2 本ある — `elapsed < 5.0` (717 行) と `elapsed >= 0.4` (978 行、`timeout_sec=0.05` の変異検出用)。`poll_interval=0.2` の粒度は**どちらも安全側**に働く (上限側は余裕、下限側は増える方向) が、実測して確認すること。
+
+### (6) fd 0 継承の全数 — 決着すべき対象は `approval.py` 1 箇所
+
+`grep` の全数調査結果: fd 0 を実際に継承するのは **`plugin/approval.py:181` の `Popen`** のみ (`plugin/sandbox.py:363` と `runners/worker_runner.py:83` は `stdin=subprocess.PIPE`、`store/backtest_runs.py:235` は `git rev-parse` の短命 `subprocess.run` で stdin を読まないが継承はする)。
+
+- **決着方針 (指揮者案)**: `stdin=subprocess.DEVNULL` を「コンソールを読む必要のない子プロセス全て」に付ける。`os.set_blocking(0, False)` は fd 0 をプロセス全体で非ブロック化するため、`BlockingIOError`/部分読みが `_InterruptibleLineReader` 側に波及し、同一 fd の他の利用者にも影響する。
+- ただし DEVNULL は**その箇所しか直らない**ので、「`stdin=` を指定しない `Popen` を新規追加したら落ちる」ピン (テストで `src/` を AST 走査する等) まで含めて初めて構造的な防御になる。
+
+### (7) 対話モードの停止 producer は Step 8 でも半分しか作られない
+
+Step 8 のコードは `signal.signal(SIGTERM/SIGINT)` を **`if daemon:` 配下に残したまま**。つまり本 task 完了後も対話モードの producer は watchdog の `_record_fatal` 経路だけで、**SIGTERM は依然ハンドラ無し**＝停止状態機械を通らずプロセスが落ちる。設計書 §5「両モードで停止」と整合するか、ハンドラを `if daemon:` の外へ出すかを**実装前に決着**させること。producer を列挙して各々にテストがあるかを表にする。
+
+### (8) `build_app` の配線状況 (Step 8 で実作業になる分)
+
+- `WorkerRunner(...)` の構築は `service.py:458-459`。**`stop_event=` も `on_rpc_leak=` も渡していない**。`on_rpc_leak` は ctor 側に既に存在する (`runners/worker_runner.py:68`) ので、配線だけが本 task の作業。
+- `App` の現行フィールドは 25 個。`App.close` の resources 6 個 (`runner`/`rag`/`conn_supervisor`/`conn_core`/`conn_shell`/`instance_lock`) 以外に close が要らないことを**明示的に確認**すること (`registry`/`mission_watch`/`provider`/`econ`/`collector`/`notifier`)。
+- 現行 `run_service` の `if app.owns_runner and hasattr(app.runner, "close")` (`service.py:800`) は `App.close` へ移す。
+- `commands.py` の `_status` は **83 行** (Step 4 の「86-95 行」はドリフト)。`__init__` は 27 行で一致。
+
+### (9) Step 12 の変異リストの誤りと追加分
+
+- **変異①「`HealthLatch` に `reset()` を追加する」は変異になっていない** — メソッドを*追加*しても既存テストは red にならない。`record_failure` を no-op 化 / `is_latched` を常に `False` にする、へ差し替える。
+- **追加すべき変異 (リストは下限)**: ①`App.close` の資源ごと `try/except` 隔離を外す ②resources リストから `instance_lock` を落とす (flock leak を捕まえるテストがあるか) ③`_record_fatal` の `if app.fatal_reason is None:` を外す (最初の理由が上書きされる) ④`_stopping()` を `_trade_mission_due` 側だけ外す (hooks とは別の適用範囲) ⑤`on_write_failure` 内側の `except` を外す (write 非送出契約が壊れる) ⑥supervisor join budget の導出式を固定 30 秒に戻す (上記 (3) の退行を捕まえるテストがあるか)
+
+**stage 0 変異 sweep は、レビュアーが worktree に入る前に指揮者が完走させる** (2026-08-09 の運用規則 — 変異が残っていると誤検出として報告される)。
+
 **設計判断 (writing-plans)**:
 - **`stop_event` は `build_app` の外 (`run_service`) で先に構築し、`build_app` へ渡す** — `WorkerRunner`/`Scheduler` が `stop_event` を必要とするため、`build_app` 内部で新規生成する既存パターンでは `run_service` 側の `_stop_event` テストシームと二重管理になる。`build_app(..., stop_event: threading.Event | None = None)` (既定 None なら内部で新規生成 — 既存の `clock` 引数と同じパターン)
 - **health ラッチの検出経路**: `ActivityLog` に `on_write_failure: Callable[[Exception], None] | None = None` を追加する (「write は例外を送出しない」契約は不変 — 失敗時にコールバックを**追加で**呼ぶだけ)。`build_app` がこれを `HealthLatch.record_failure` に配線する
