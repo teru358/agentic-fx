@@ -243,3 +243,88 @@ def test_real_improve_worker_reaches_ready(tmp_path):
     finally:
         proc.kill()
         proc.wait(timeout=5.0)
+
+
+def test_allowlist_never_covers_the_data_dir(monkeypatch, tmp_path):
+    """**allowlist の計算結果そのものを不変条件として検査する** (プラン8 Task 18)。
+
+    段0 変異スイープで、allowlist の計算を誤らせる変異が 2 つとも
+    フルスイート 1683 件を green のまま通り抜けた (codex 1周目 #1/#2):
+
+    - `WorkerRunner` の `Popen(..., cwd=workdir)` から `cwd=` を落とす
+      → 子の cwd がリポジトリ root になり `data/` が **read-write** に
+    - `code_root` を `src/` からリポジトリ root に広げる → `data/` が読取可能に
+
+    probe テスト (`test_improve_profile_cannot_reach_data_dir`) が遮断を
+    確認しているのは `tmp_path/data` であって**本物の `<repo>/data` ではない**
+    ため、どちらの変異も検出できなかった。ここでは実際に計算された
+    allowlist を捕まえ、`data/` の祖先が混ざらないことを直接見る。
+
+    `restrict_to` を差し替えているのでこのプロセスは Landlock されない。
+    """
+    import agentic_fx.mission_worker as mw_mod
+
+    captured: dict = {}
+    monkeypatch.setattr(mw_mod.landlock, "is_available", lambda: True)
+    monkeypatch.setattr(mw_mod.landlock, "restrict_to",
+                        lambda **kw: captured.update(kw))
+    monkeypatch.chdir(tmp_path)
+
+    mw_mod._bootstrap_improve_profile()
+
+    data_dir = mw_mod._guarded_data_dir()
+    allowed = list(captured["read_only_paths"]) + list(captured["read_write_paths"])
+    assert allowed, "allowlist が空 — restrict_to の呼び出しを捕まえられていない"
+    for p in allowed:
+        resolved = Path(p).resolve()
+        assert resolved != data_dir and resolved not in data_dir.parents, (
+            f"allowlist の {resolved} が {data_dir} を覆っている")
+    # data_dir 自身が allowlist に含まれていないことの否定的確認だけだと、
+    # 「allowlist が空でも通る」恒真に落ちるので、正の確認も置く。
+    code_root = Path(mw_mod.__file__).resolve().parents[1]  # <repo>/src
+    assert code_root in [Path(p).resolve() for p in captured["read_only_paths"]], \
+        "コードツリー (src/) が read_only allowlist に入っていない"
+    assert Path(tmp_path).resolve() in [
+        Path(p).resolve() for p in captured["read_write_paths"]], \
+        "専用 workdir (cwd) が read_write allowlist に入っていない"
+
+
+def test_bootstrap_fails_closed_when_cwd_would_expose_data_dir(monkeypatch):
+    """`Popen(cwd=...)` が専用 workdir でなくリポジトリ root になった場合
+    (= codex 1周目 #1 の変異)、**起動を拒否する**ことを pin する。
+
+    この経路が無いと、`cwd=` の指定漏れが `data/` を read-write allowlist に
+    入れたまま静かに成立してしまう。
+    """
+    import agentic_fx.mission_worker as mw_mod
+
+    repo_root = mw_mod._guarded_data_dir().parent
+    monkeypatch.setattr(mw_mod.landlock, "is_available", lambda: True)
+    monkeypatch.setattr(mw_mod.landlock, "restrict_to",
+                        lambda **kw: pytest.fail(
+                            "data/ を覆う allowlist で restrict_to を呼んでいる"))
+    monkeypatch.chdir(repo_root)
+
+    with pytest.raises(RuntimeError, match="would expose the history data"):
+        mw_mod._bootstrap_improve_profile()
+
+
+def test_run_holdout_gate_requires_history_conn_keyword():
+    """「import は可能・実行は不能」の意味論が寄りかかっている API 境界を pin
+    する (codex 1周目 #4)。
+
+    `run_holdout_gate` が `history_conn` を**必須の keyword-only 引数**として
+    取ることが、「DB に到達できない improve worker では実行が必ず失敗する」の
+    根拠そのもの。既定値が付く・関数内部で DB を探しにいく、といった退行が
+    起きると遮断の意味論が静かに崩れる。
+    """
+    import inspect
+
+    from agentic_fx.backtest.holdout import run_holdout_gate
+
+    sig = inspect.signature(run_holdout_gate)
+    param = sig.parameters["history_conn"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+        "history_conn が keyword-only でなくなっている")
+    assert param.default is inspect.Parameter.empty, (
+        "history_conn に既定値が付いた — DB 接続なしで実行できてしまう")

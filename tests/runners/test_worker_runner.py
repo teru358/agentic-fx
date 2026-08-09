@@ -1306,3 +1306,60 @@ def test_improve_profile_handshake_omits_db_and_plugin_paths(tmp_path, monkeypat
     assert trade["db_path"] is not None and trade["db_path"].endswith(
         "agentic.db"), "trade worker には DB パスが渡らなければならない"
     assert trade["plugins_dir"] is not None
+
+
+def test_child_cwd_is_a_dedicated_dir_outside_the_repository(tmp_path, monkeypatch):
+    """**`Popen(cwd=...)` は防御層② の一部** (プラン8 Task 18, codex 1周目 #1)。
+
+    子の cwd は `mission_worker._bootstrap_improve_profile` がそのまま
+    **read-write** allowlist に入れる。`cwd=` を落とすと子は親の cwd
+    (= リポジトリ root) を継承し、`data/` が書込可能になる。
+
+    段0 変異スイープで実測: `cwd=workdir` を削除してもフルスイート 1683 件が
+    全 green だった。子側には fail-closed ガードを入れたが、**親が正しい
+    cwd を渡していること自体**もここで直接押さえる (子のガードは最後の砦で
+    あって、親の配線の代わりにはならない)。
+    """
+    captured: dict = {}
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = None
+        stdout = None
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        # workdir は `tempfile.TemporaryDirectory` の context を抜けた時点で
+        # 消えるので、「空であること」はここ (子の起動時点) で見る。
+        if "cwd" in kwargs:
+            captured["cwd_entries"] = sorted(p.name for p in
+                                             Path(kwargs["cwd"]).iterdir())
+        raise RuntimeError("stop here — 見たいのは Popen の引数だけ")
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path), worker_profile="improve")
+    with pytest.raises(RuntimeError, match="stop here"):
+        runner.run(_mission())
+
+    assert "cwd" in captured, (
+        "Popen に cwd= を渡していない — 子がリポジトリ root を継承し、"
+        "improve worker の read-write allowlist に data/ が入る")
+    cwd = Path(captured["cwd"]).resolve()
+    data_dir = (root / "data").resolve()
+    assert cwd != data_dir and cwd not in data_dir.parents, (
+        f"子の cwd ({cwd}) が data/ ({data_dir}) を覆っている")
+    assert captured["cwd_entries"] == [], (
+        f"子の workdir は空でなければならない (実際: {captured['cwd_entries']})")

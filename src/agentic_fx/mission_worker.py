@@ -140,12 +140,53 @@ def _bootstrap_improve_profile() -> None:
                      Path("/dev")]:
         if sys_path.exists():
             read_only.append(sys_path)
+    _assert_allowlist_excludes_data_dir(read_only + [workdir])
     try:
         landlock.restrict_to(read_only_paths=read_only, read_write_paths=[workdir])
     except landlock.LandlockUnavailable as e:
         raise RuntimeError(
             f"Landlock restriction failed (syscall error): {e} "
             "(improve worker profile refuses to continue, fail closed)") from e
+
+
+def _guarded_data_dir() -> Path:
+    """遮断対象である `data/` の位置を、**handshake からではなくこのモジュール
+    自身の配置から**導く (`<repo>/src/agentic_fx/mission_worker.py` →
+    `<repo>/data`)。
+
+    improve worker は接続情報を渡されない (防御層①) ので `root` を知らない。
+    それでも「**許可してはいけない場所**」は知ることができる — 知るのが禁止
+    なのは到達手段であって、禁止領域の座標ではない。
+    """
+    return Path(__file__).resolve().parents[2] / "data"
+
+
+def _assert_allowlist_excludes_data_dir(paths: list[Path]) -> None:
+    """allowlist のどれ 1 つも `data/` の祖先 (または `data/` 自身) でない
+    ことを確認し、違反したら **fail closed** する (プラン8 Task 18)。
+
+    **なぜ必要か (段0 変異スイープで実測した 2 つの生存変異)**:
+
+    - `WorkerRunner` の `Popen(..., cwd=workdir)` から `cwd=` を落とすと、子の
+      cwd は親の cwd (= リポジトリ root) になり、`Path.cwd()` が
+      **read-write** allowlist に入って `data/` が書込可能になる。
+      フルスイート 1683 件は全 green のままだった
+    - `code_root` を `parents[1]` (= `src/`) から `parents[2]` (= リポジトリ
+      root) に広げると `data/` が読取可能になる。これも全 green のままだった
+
+    どちらも「allowlist の計算を間違えた」という同じ形の事故なので、**計算
+    結果そのものを不変条件として検査する**のがテストより確実な防御になる。
+    テスト側 (`test_allowlist_never_covers_the_data_dir`) はこの検査自体が
+    消されないことを pin する。
+    """
+    data_dir = _guarded_data_dir()
+    for p in paths:
+        resolved = Path(p).resolve()
+        if resolved == data_dir or resolved in data_dir.parents:
+            raise RuntimeError(
+                f"improve worker allowlist would expose the history data "
+                f"directory: {resolved} covers {data_dir} — refusing to start "
+                "(fail closed, 設計書 §4.6)")
 
 
 class _RagRpcProxy:
