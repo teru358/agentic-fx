@@ -9234,6 +9234,57 @@ EOF
 
 設計書 §4.6「worker profile と権限境界」を実装する。**改善ループ本体・improve registry の中身はプラン 9** — 本 task は「構造的到達不能」の 2 層防御 (接続情報の非提供 + Landlock による FS 自己制限) だけを `mission_worker.py` に実装する。§4.6 の「到達不能 = 実行不能」の意味論 (`run_holdout_gate` の import 自体は可能だが、データ到達 (DB 接続) が構造的に失敗する) を実測で固定する。
 
+## ⚠ 着手前検証の結果 (2026-08-09、指揮者が現物照合) — **必ず最初に読むこと**
+
+Task 15/16/17 と異なり、本 task の前提は**おおむね現物と一致している** (Task 7/8/10 以降に `mission_worker.py` の該当箇所が変わっていない)。ただし以下 7 点は転写前に直すこと。
+
+### (1) 確認済みで**そのまま使える**もの (再調査不要)
+
+- `mission_worker.py:223-226` に `worker_profile != "trade"` の拒否分岐が実在する。Step 4 の「trade 分岐の直前に挿入」は正しい。`settings_dict = handshake["settings"]` は既に上 (222 行) で取得済みなので improve 分岐からも参照できる。
+- `WorkerRunner` は `worker_profile != "trade"` のとき `db_path`/`plugins_dir` に `None` を入れる (`runners/worker_runner.py:208-211`)。**接続情報の非提供は親側で既に成立している**。
+- `landlock.is_available()` / `restrict_to(read_only_paths=, read_write_paths=)` のシグネチャは Step 4 の呼び出しと一致 (`core/landlock.py:118,135`)。**本実行環境で `is_available() == True` を実測済み** — Step 6/6.5 の `pytest.skip` は発火しない。
+- `config.RunnerSettings.improve: RunnerChoice` は既存 (`config.py:61`)。`settings.yaml.example:27` は `improve: {backend: local, model: qwen3.6-35b-a3b_Q4}` なので Step 6.5 の「backend が local である前提」は成立する。
+- `mission_protocol.write_frame` は内部で `flush()` する (`mission_protocol.py:69-72`)。Step 6.5 で明示 flush は不要。
+- `settings.model_dump()` の JSON 化は `WorkerRunner` の handshake (`worker_runner.py:212`) で既に実運用されている。Step 6.5 も同じ形でよい。
+- `backtest/holdout.py:167` の `run_holdout_gate` は `history_conn` を**必須キーワード引数**に取る。§4.6 の「import は可能・実行は不能」の意味論はこの引数依存で成立する。
+
+### (2) `LandlockUnavailable` は `RuntimeError` ではない — fail closed に穴が残る
+
+`core/landlock.py:105` の `class LandlockUnavailable(Exception)` は `Exception` 直系。Step 4 の `_bootstrap_improve_profile` は `is_available()` が False のときだけ自前の `RuntimeError` を送出するので、**`is_available()` を通過した後に `restrict_to` が syscall 失敗で `LandlockUnavailable` を送出する経路は `RuntimeError` にならない**。呼び出し元 (`main()` の外側 `except Exception`) は捕まえるので致命ではないが、「improve は Landlock が唯一の FS 境界だから fail closed」という契約をコードで表すなら、`restrict_to` を `try/except LandlockUnavailable` で包んで同じ `RuntimeError` に正規化すること。**変異リストに「この包みを外す」を追加**する。
+
+### (3) Step 6.5 のテストコードは `import os` が抜けている
+
+`test_real_improve_worker_reaches_ready` は `os.getpid()` を使うが、Step 6 で作るファイル冒頭の import は `subprocess` / `sys` / `textwrap` / `pathlib.Path` / `pytest` のみ。`import os` を追加すること。
+
+### (4) Step 6.5 は `read_frame` の `None` を踏む
+
+`read_frame` の戻り値は `dict | None` (`mission_protocol.py:74`)。worker が起動に失敗して EOF になると `frame["type"]` が `TypeError` になり、**せっかくの `stderr` 付きアサーションメッセージが出ない**。`assert frame is not None, proc.stderr.read(4096)` を先に置くこと (この test の存在意義はまさに「起動失敗を読める形で落とす」ことにある)。
+
+### (5) Step 9 の変異②は現行シグネチャでは書けない
+
+`_bootstrap_improve_profile()` は引数を取らず `data_dir` を知らないので、「`read_only_paths=[code_root, data_dir]`」という変異は文字どおりには書けない。プローブでは `data_dir = tmp_path/"data"`・`workdir = tmp_path/"workdir"` なので、**`read_write_paths=[workdir]` を `[workdir.parent]` (= `Path.cwd().parent`) に変える**変異で同じ効果 (`open_db`/`list_data_dir` が `UNEXPECTED_SUCCESS` になる) が得られる。こちらに読み替える。
+
+### (6) 実測した prefix 3 者 — Step 4 の主張は正しいが `stdlib_root` は冗長
+
+本環境の実測値:
+
+| 変数 | 値 |
+|---|---|
+| `code_root` | `<repo>/src` |
+| `sys.prefix` (venv) | `<repo>/.venv` |
+| `sys.base_prefix` | `~/.local/share/uv/python/cpython-3.13.14-linux-x86_64-gnu` |
+| `sysconfig.get_paths()["stdlib"]` | 同上 `/lib/python3.13` |
+
+- `.venv` は `<repo>/data` の**兄弟**であって祖先ではない → 「`data/` 遮断の意味論は保たれる」という Step 4 の主張は正しい。
+- `stdlib_root` は `sys.base_prefix` の**子**なので、`base_prefix` を許可する限り `read_only` に個別追加する必要はない。害はないので残してよいが、**「なぜ 3 つ入れるのか」をコメントで説明できないなら 2 つに減らす** (allowlist は最小にする方が意味論が明確)。
+- **未確認**: `.venv/lib/.../site-packages` に `base_prefix` 外を指す symlink があるパッケージが無いか。Step 6.5 が実プロセスで `ready` まで到達すればこれは自動的に検証される (だから Step 6.5 は省略不可)。
+
+### (7) 分解書 (Step 1) の注記挿入位置
+
+`grep` 実測: 「到達不能」を含む行は **23 / 53 / 96 / 104** の 4 箇所 (プランは「96/104 行付近」と記述 — 一致する)。注記は**受入条件の直後 (104 行の後)** に 1 つ置き、23/53/96 行の表現もこの注記が読み替えを定義する旨を明記する (4 箇所に同じ注記を貼らない)。
+
+**stage 0 変異 sweep は、レビュアーが worktree に入る前に指揮者が完走させる** (2026-08-09 の運用規則)。
+
 **Files:**
 - Modify: `src/agentic_fx/mission_worker.py` (`worker_profile == "improve"` 分岐 + `_bootstrap_improve_profile` 新設)
 - Modify: `docs/superpowers/plans/2026-08-01-phase2-decomposition.md` (§12 申し送り③ — 「到達不能」表現への注記追加)
