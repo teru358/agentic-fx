@@ -9473,6 +9473,8 @@ EOF
     - **(同上) `conn_supervisor` は Task 13 で `connect_readonly` により構築されたが誰も close していない。** `App.close()` の resources リストに含めること (`instance_lock` と同じ扱い)
     - **(Task 12 レビュー 2 周からの申し送り)** `Scheduler.tick` は本タスクで **`try/finally` 化**され、`finally` で `_run_hooks(now)` を呼ぶ。`finally` は **`BaseException` (`KeyboardInterrupt`/`SystemExit`) でも走る**ので、**停止処理の最中に news の HTTP 取得が走りうる**。本 task の停止状態機械で **`_run_hooks` に停止フラグのガードを入れること** (`stop_event` が立っていたら hooks を飛ばす)。現状は許容だが、停止時間の上限を壊す経路になる
     - **(Task 11 レビュー 2 周からの申し送り — E2E で回収すること)** Task 11 の検証は**すべて同一プロセス内の 2 接続**で行った。`instance_lock` が防ぐ本番の競合 (**別プロセスの二重起動**) と `recover_interrupted` の `BEGIN IMMEDIATE` が防ぐ**マルチプロセスの lock upgrade race** は、単体テストでは原理的に再現できていない。本 task の E2E で **`subprocess` による実プロセス 2 本の同時起動**を 1 本張ること。①後発が `InstanceAlreadyRunning` で非ゼロ終了する ②先発の `running` mission が壊れていない、の 2 点を見る (3 周目レビューではなく E2E で扱う、という 2026-08-08 の指揮者判断)
+    - **(Task 15 レビュー 3 周からの申し送り)** `tests/runners/test_worker_runner.py::test_protocol_violation_is_detected_by_seq_check_not_by_eof` に **flaky がある** (2026-08-09 指揮者が実測)。`PytestUnraisableExceptionWarning: Exception ignored in: <_io.BufferedWriter> / OSError: [Errno 9] Bad file descriptor` が**約 1/3 の頻度**で出る (テストは失敗扱いにならない)。**`main` でも再現するので Task 15 由来ではない** — WorkerRunner の dispatcher スレッドが閉じられた stdin パイプに書き込む競合で、Task 10 の `_run_with_child` の `finally` (dispatcher.join → stdin.close の順序) が発生源。**本 task が `_run_with_child` の停止順序を扱うので、ここで塞ぐこと。**
+    - **(同上) `run_service` の `finally` は Task 15 で以下が変わっている** — 本 task の停止状態機械はこの上に積むこと。①`app.supervisor.shutdown()` を `th.join()` の**前**に呼ぶ (停止中の `try_submit` 受理を防ぐ) ②`supervisor.join` の budget は `llama_swap.timeout_sec` から導出する (固定 30 秒だと run 相での停止が必ずタイムアウトした) ③**graceful / shutdown_timeout の判定は `th.is_alive() or app.supervisor.is_alive()`** — scheduler スレッドの join だけでは Mission の完了を意味しなくなった ④**`runner.close()` はタイムアウト時にも呼ぶ**ように変更した (旧「上書き 7: join 成功時のみ close」の裁定を、子プロセス leak 防止を優先して変更 — 本 task で再検討してよい)
     - **(同上) `except BaseException` 内の `instance_lock.close()` は `try/except` で包んである** (解放の失敗が元の失敗原因を隠さないため — `close()` の例外が伝播すると元の例外は `__context__` に退避されるだけで、`except` 節や終了コード判定は新しい例外を見る)。`App.close()` 側で同じ形を組むときも**同じ扱い**にすること
   - `App.stop_event: threading.Event` / `App.health_latch: HealthLatch` (新設フィールド)。**(裁定書 F-3 / CR-1 advisor 指摘反映 追加) `App.watchdog_heartbeat: float`** — watchdog スレッドが 30 秒周期ループの毎回先頭で touch する。scheduler 側の相互監視 (CR-6) が鮮度チェックに使う。`build_app` は起動直後の誤 fatal を避けるため `time.monotonic()` で初期化する (0/None にしない)。**(裁定書 IM-4 / P8-06 追加) `App.fatal_reason: str | None`** — `_record_fatal` が設定する。存在すれば join 成否によらず終了コードは 1 (`_exit_code` 参照)
   - `service._watchdog_check(app: App, scheduler_thread_obj: threading.Thread, stop_event: threading.Event, *, heartbeat_grace_sec: float = 30.0, dispatch_ceiling_sec: float | None = None) -> None` — モジュールレベル関数 (`run_service` のクロージャに閉じ込めず単体テスト可能にする)。1 回分の生存・heartbeat 鮮度チェック。**(裁定書 F-3 / CR-1 advisor 指摘反映)** `heartbeat_grace_sec` は heartbeat ポンプ間隔 (Task 13, 既定 5.0s) に対してのみ余裕を見た小さい値 (既定 30.0s = 6 倍) に変更 — 旧既定 90.0s は「Mission サイクル全体を包含する」誤った前提に基づいていた。**さらに `busy_since`/`dispatch_ceiling_sec` による独立した第二の軸のチェックを追加** (heartbeat ポンプが「genuine なデッドロック」を隠蔽する fail-open の穴を塞ぐ — Task 13 参照)。`dispatch_ceiling_sec` が `None` なら `_default_dispatch_ceiling_sec(app)` で `app.settings` から算出する
@@ -10401,6 +10403,18 @@ EOF
 
 ---
 ### Task 20: E2E + 受入条件検証 (設計書 §9 の 8 項目)
+
+**(Task 15 レビュー 3 周からの申し送り — 本 task で必ず実測すること) `snapshot_max_age_sec` の既定 10 秒は一度も実測されていない。**
+
+`gather_open_snapshot` は `captured_at = clock.now()` を **quote 取得より前** (メソッドの 1 行目) に刻み、その後に ①`quote_fn(pair)` ②全 exposure pair の `spec_fn` ③全 exposure 通貨の `cycle_rate(ccy)` を回す。③は各通貨ごとに **mt5 → twelvedata → yfinance のフォールバック連鎖**を通り、各段が自分の timeout を払ってから次へ落ちる。
+
+そのうえ commit-core は `core_lock` を待ち、その相手は **mark-to-market・SL/TP・reconcile・expiry を含む scheduler tick 一式** (`data_hook_timeout_sec` だけで 30 秒)。
+
+**つまり「gather の所要時間 + lock 待ち」が 10 秒を超えるのは、一次ソースが 1 つ劣化しただけで現実的に起こる。** 超えると `open_from_snapshot`/`close_from_snapshot` が「stale」として拒否し、**lock 内での再取得を明示的に拒む** — 結果は「**健全に見える `gate_rejected` を記録しながら一度も取引しないシステム**」になる。
+
+鮮度検査の**機構**は単体テスト済み (`tests/core/test_executor_snapshot.py` で `max_snapshot_age_sec=5.0`) だが、**TradeLoop のテストハーネスはすべて `FixedClock` なので `age_sec` は恒等的に 0.0** であり、**予算そのものは構造的に未検証**である。
+
+本 task で ①実際の gather 所要時間を計測する ②lock 競合下での commit-core 待ち時間を計測する ③その実測に基づいて既定値を決め直すか、`captured_at` を脚ごとに刻む設計へ変えるかを判断すること。
 
 設計書 §9 の受入条件を実測・レビューで確定する最終 task。Task 1〜19 で個別に検証済みの性質を、実 subprocess・複数コンポーネント間の統合で改めて実証する (単体テストの積み上げでは検出できない配線欠陥・タイミング窓を狙う)。
 
