@@ -21,6 +21,7 @@ stop_event も検知できない — プランの想定より深刻なデッド�
 """
 from __future__ import annotations
 
+import codecs
 import select
 import sys
 import threading
@@ -35,13 +36,34 @@ class _InterruptibleLineReader:
     無ければ `stream` 自体) を直接読んで自前で UTF-8 デコード・改行分割を
     行う。複数行が 1 回の read で同時到着した場合も pending バッファに
     保持し、次回の呼び出しでは追加の I/O 待ちなしに即座に返す。
+
+    (レビュー反映 G1) チャンクごとに独立して `decode()` すると、マルチ
+    バイト文字がチャンク境界で分断されたときに文字化けする
+    (例: `'あ'` の UTF-8 3 バイトが 2 チャンクに割れると `'あ'` の代わりに
+    replacement 文字が出る)。`codecs.getincrementaldecoder` を使い、
+    境界をまたぐ未確定バイト列をデコーダ内部に保持させる。
+
+    (レビュー反映 G2) `select.select` はストリームが `fileno()` を持たない
+    (例: `StringIO`、キャプチャされた stdin) と例外になる。構築時に
+    `fileno()` の可否を確認し、`usable` フラグで呼び出し側 (`run_shell`)
+    に判断材料を渡す — 使えない場合は割込み可能経路を諦め、
+    `_blocking_readline_fallback` (ブロッキング `readline()`) へ
+    フォールバックする (黙って停止性を失わないよう、フォールバックした
+    事実は `print_fn` 経由でログに残す)。
     """
 
-    def __init__(self, stream) -> None:
+    def __init__(self, stream, *, chunk_size: int = 4096) -> None:
         self._stream = stream
         self._raw = getattr(stream, "buffer", stream)
         self._pending: str = ""
         self._eof = False
+        self._chunk_size = chunk_size
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.usable = True
+        try:
+            stream.fileno()
+        except (AttributeError, OSError, ValueError):
+            self.usable = False
 
     def readline(self, stop_event: threading.Event, *,
                  poll_interval: float) -> str | None:
@@ -52,33 +74,62 @@ class _InterruptibleLineReader:
             if newline_at != -1:
                 line = self._pending[:newline_at]
                 self._pending = self._pending[newline_at + 1:]
-                return line
+                return line.rstrip("\r")  # G4: \r\n の \r を落とす
             if self._eof:
                 if self._pending:
                     line, self._pending = self._pending, ""
-                    return line
+                    return line.rstrip("\r")
                 raise EOFError()
             if stop_event.is_set():
                 return None
             ready, _, _ = select.select([self._stream], [], [], poll_interval)
             if not ready:
                 continue
-            chunk = self._raw.read1(4096) if hasattr(self._raw, "read1") \
-                else self._raw.read(4096)
+            chunk = self._raw.read1(self._chunk_size) \
+                if hasattr(self._raw, "read1") \
+                else self._raw.read(self._chunk_size)
             if not chunk:
                 self._eof = True
                 continue
             if isinstance(chunk, bytes):
-                chunk = chunk.decode("utf-8", errors="replace")
+                chunk = self._decoder.decode(chunk)
             self._pending += chunk
+
+
+def _blocking_readline_fallback(prompt: str, stream) -> str:
+    """G2: select 非対応ストリーム用の従来型フォールバック。
+
+    `stream.fileno()` が無い/使えない場合は select ベースの割込み可能
+    読み取りが構造的に不可能なので、単純なブロッキング `readline()` に
+    フォールバックする (中断可能性は失うが、少なくとも停止させずに
+    黙って動かなくなることは避ける)。EOF は `EOFError` を送出する。
+    """
+    print(prompt, end="", flush=True)
+    line = stream.readline()
+    if line == "":
+        raise EOFError()
+    return line.rstrip("\n").rstrip("\r")
 
 
 def run_shell(commands: Commands, stop_event: threading.Event, *,
               input_fn=input, print_fn=print, stdin_stream=None,
-              poll_interval: float = 0.5) -> None:
+              poll_interval: float = 0.5, chunk_size: int = 4096) -> None:
     use_interruptible = input_fn is input
     stream = stdin_stream if stdin_stream is not None else sys.stdin
-    reader = _InterruptibleLineReader(stream) if use_interruptible else None
+    reader = _InterruptibleLineReader(stream, chunk_size=chunk_size) \
+        if use_interruptible else None
+    fallback_stream = None
+    if reader is not None and not reader.usable:
+        # G2: fileno() が使えないストリーム (StringIO / capture 済み stdin
+        # 等) では select ベースの割込み可能経路が構造的に使えない。黙って
+        # 停止性を失わないよう、フォールバックした事実をログに残して
+        # ブロッキング readline() 経路に切り替える。
+        print_fn("[shell] stdin が select 非対応のため、"
+                 "割込み可能な読み取りを無効化してブロッキング読み取りに"
+                 "フォールバックします")
+        use_interruptible = False
+        reader = None
+        fallback_stream = stream
     while not stop_event.is_set():
         try:
             if use_interruptible:
@@ -87,6 +138,9 @@ def run_shell(commands: Commands, stop_event: threading.Event, *,
                 if raw is None:
                     return  # stop_event がポーリング中に立った (中断)
                 line = raw.strip()
+            elif fallback_stream is not None:
+                line = _blocking_readline_fallback(
+                    "afx> ", fallback_stream).strip()
             else:
                 line = input_fn("afx> ").strip()
         except (EOFError, KeyboardInterrupt):
