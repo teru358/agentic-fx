@@ -233,6 +233,36 @@ def test_open_risk_and_notional_from_snapshot_raises_on_uncovered_pair(tmp_path)
                                              empty_snapshot)
 
 
+def test_open_from_snapshot_rejects_when_intent_pair_not_in_snapshot(tmp_path):
+    """intent と snapshot の紐付けが壊れた場合の fail-closed。
+
+    レビュー 3 周目の指摘: `gather_open_snapshot` が必ず intent.pair を
+    入れるため、正しい呼び出し契約下では到達不能なガードである。しかし
+    紐付けを行うのは Task 15 の五相配線 (intent は DB から読み直し、
+    snapshot は別途保持) であり、そこが壊れたときに **core_lock 保持中に
+    裸の KeyError を飛ばさない** ことが目的。ガードとテストを対にして
+    残し、Task 15 でこの分岐がテスト対象から漏れないようにする。
+    CLOSE 側の test_close_order_from_snapshot_rejects_mismatched_pair と対称。
+    """
+    ex = _make_executor(tmp_path)
+    intent = _open_intent(pair="USDJPY")
+    mid = _start_trade_mission(ex.conn)
+    iid = _insert_intent(ex.conn, mid, intent)
+    # 別の pair 向けに作られた snapshot を渡す (配線ミスを模す)
+    other = _open_intent(pair="EURUSD")
+    snapshot = ex.gather_open_snapshot(other, exposure_pairs=[])
+    assert intent.pair not in snapshot.specs_by_pair
+
+    out = ex.open_from_snapshot(intent, iid, snapshot,
+                                max_snapshot_age_sec=999.0)
+
+    assert out["result"] == "rejected"
+    assert "not covered" in out["reasons"][0]
+    # 拒否は「発注しない」まで意味する
+    assert orders.list_by_status(ex.conn, S.SUBMITTING, S.OPEN,
+                                 S.PENDING_FILL) == []
+
+
 def test_open_risk_and_notional_from_snapshot_raises_on_uncovered_currency(
         tmp_path):
     """spec はあるが通貨レートが欠けている場合も N4-2 として拒否する

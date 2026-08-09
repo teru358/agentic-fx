@@ -507,7 +507,17 @@ class Executor:
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
 
-        # A2: intent.pair が snapshot に無い場合は N4-2 拒否
+        # intent と snapshot の紐付けが壊れていないかの fail-closed 検査
+        # (CLOSE 側の `snapshot.pair != row["pair"]` と対称)。
+        #
+        # レビュー 3 周目の指摘: `gather_open_snapshot` が必ず intent.pair を
+        # 入れるため、**commit-pre で作った snapshot をそのまま同じ intent で
+        # commit-core へ渡す限りこの分岐は到達不能**である。それでも残すのは、
+        # 紐付けを行うのが Task 15 の五相配線 (intent は DB から読み直し、
+        # snapshot は別途保持する) であり、**その配線が壊れたときに裸の
+        # KeyError を core_lock 保持中に飛ばさない**ためのガードだから。
+        # 裸の KeyError だと set_gate_result も activity も残らず、mission が
+        # 未 finalize のまま落ちる。
         spec = snapshot.specs_by_pair.get(intent.pair)
         if spec is None:
             reasons = [f"pair {intent.pair!r} is not covered by the execution "
