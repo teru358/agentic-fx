@@ -5,6 +5,18 @@
   (core_lock 保持: finalize) → commit-post。commit-post の内訳は一様
   ではない — **RAG 書込 (`Rag.add_reflection`) と activity 記録は
   core_lock 非保持** (RAG は Rag 自身の内部 lock に委ねる — Task 9)。
+
+  **ただし委譲はタダではない (レビュー 2 周目)。** Task 16 で
+  `_reflection_fn` の外側 lock を外した結果、**RAG の書き手が 2 つ並行
+  しうる**ようになった: この `add_reflection` と、scheduler tick 配下の
+  `NewsCollector.collect` (`rag.add_news`/`cleanup_news`) である。
+  従来は両方とも core_lock 下だったので構造的に排他されていた。
+  `Rag._locked()` の待ちは `lock_timeout_sec` (既定 10 秒) で打ち切られ
+  `RagUnavailable` になるため、**news の埋め込みが 10 秒を超えると、
+  直前に最大 300 秒かけた LLM の出力を捨てて次周期に丸ごとやり直す**
+  (自己修復はするが高価)。逆向きには、`collect` が RAG lock 待ちで
+  最大 10 秒 **core_lock を保持したまま**止まりうる。
+  **実測と対策 (bounded retry か timeout 調整) は Task 20 へ申し送り。**
   **SQLite 書込 (`reflections.save`) のみ core_lock 保持** (conn_core
   への書込のため — Global Constraints)。この非対称を崩して
   `reflections.save` を lock 外へ出すと Global Constraints 違反になる

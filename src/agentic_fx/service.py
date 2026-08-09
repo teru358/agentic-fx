@@ -631,8 +631,12 @@ def _watchdog_tick(app: App) -> None:
     """1 回分の watchdog 監視 (上書き 3)。activity/notifier の失敗はスレッドを
     殺さない — 呼び出し元 (watchdog スレッド) 側も広い try で包む。
 
-    missions 行には書かない (finalize の所有者は TradeLoop/ReflectionCycle の
-    `_run_recorded` の finally のみ — 二重終端を作らない)。
+    missions 行には書かない (finalize の所有者は
+    `agentic_fx.loops.mission_finalize.finalize_mission` のみ — TradeLoop /
+    ReflectionCycle の commit-core 相と、各ループの外側 `finally` の
+    fail-closed 経路から呼ばれる。二重終端は CAS が防ぐ)。
+    **`_run_recorded` はプラン 8 Task 15/16 で廃止済み** — 旧名で grep しても
+    見つからない (レビュー 2 周目の指摘)。
     """
     entry = app.mission_watch.breached(grace_sec=60)
     if entry is None:
