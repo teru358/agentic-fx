@@ -1246,6 +1246,149 @@ def test_stdin_is_closed_only_after_the_dispatcher_finished_writing(
         f"実際 {order}")
 
 
+def test_dispatcher_never_writes_to_stdin_after_it_was_closed(
+        tmp_path, monkeypatch):
+    """プラン8 Task 19: `dispatcher.join` がタイムアウトして生き残った
+    dispatcher は、close 済みの `proc.stdin` へ**書かない**。
+
+    `_run_with_child` の `finally` は `dispatcher.join(timeout=
+    rpc_timeout_sec + 5.0)` と**有界**なので (FC-1: dispatcher が無限に
+    ブロックしてもプロセス終了を妨げないため)、dispatcher が join を
+    生き延びる経路が構造的に存在する。その dispatcher が後から
+    `write_frame(proc.stdin, ...)` を実行すると、閉じた fd への書き込みに
+    なる。`stdin_state["closed"]` のガードはこれを防ぐためにある。
+
+    **このピンが無いと、ガードを消しても値の設定を消しても全件緑になる**
+    (2026-08-09 指揮者が変異 2 種を全件 1706 passed で生存させて実測)。
+
+    仕掛け: 子は tool_rpc を 2 本連続で送ってから result を送る。親の
+    dispatcher は 1 本目の応答書き込みで `stdin_lock` を保持したまま
+    join budget を超えて眠る。main はその間に join をタイムアウトさせ、
+    lock が空くのを待ってから `closed` を立てて stdin を閉じる。
+    dispatcher は 2 本目の応答でガードに当たる — ここで書けば red。
+    """
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    # join budget = rpc_timeout_sec + 5.0 = 5.05s。1 本目の書き込みは
+    # これを超えて眠る必要がある (超えないと dispatcher は join 内で
+    # 終了してしまい、close 後の経路がそもそも実行されない)。
+    settings = _tiny_worker_settings(rpc_timeout_sec=0.05)
+    first_write_sleep_sec = 5.5
+
+    rag_calls: list[str] = []
+
+    class CountingRag:
+        def search_news(self, query, n=5):
+            rag_calls.append(query)
+            return [{"title": "t", "body": "b", "source_name": "s"}]
+
+    # **子の読み取り端はテスト本体で保持する。** 子スレッド内のローカルに
+    # すると、スレッド終了時の参照カウント減で `r2` が閉じられ、その後の
+    # dispatcher の応答書き込み (flush) が `BrokenPipeError` になって
+    # `except (BrokenPipeError, OSError): return` へ落ちる。すると
+    # dispatcher が 2 本目の tool_rpc に到達せず、このテストが検証したい
+    # 「close 後の書き込み経路」が実行されない (2026-08-09 実測で判明)。
+    child_in = os.fdopen(r2, "rb")
+
+    def child_thread_fn():
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())                      # handshake
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "tool_rpc", "seq": 2, "rpc_id": "1",
+                                "name": "search_news",
+                                "args": {"query": "q1", "n": 5}})
+        write_frame(child_out, {"type": "tool_rpc", "seq": 3, "rpc_id": "2",
+                                "name": "search_news",
+                                "args": {"query": "q2", "n": 5}})
+        # 応答を待たずに result を送る → 親は dispatcher 実行中に finally へ。
+        write_frame(child_out, {"type": "result", "seq": 4,
+                                "status": "completed", "output": {"ok": 1}})
+        child_out.close()   # EOF — 親の reader.join を待たせない
+
+    th = threading.Thread(target=child_thread_fn, daemon=True)
+
+    real_stdin = os.fdopen(w2, "wb")
+
+    class SpyStdin:
+        """書き込みを記録し、`close()` の前後を区別する。"""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self.closed_flag = False
+            self.writes_before_close = 0
+            self.writes_after_close = 0
+            self._first_rpc_result_done = False
+
+        def write(self, data):
+            if self.closed_flag:
+                self.writes_after_close += 1
+                return len(data)
+            self.writes_before_close += 1
+            written = self._inner.write(data)
+            # 1 本目の tool_rpc_result 応答だけ、join budget を超えて眠る。
+            # handshake (親が最初に書く 1 本) は対象外。
+            if (not self._first_rpc_result_done
+                    and self.writes_before_close > 1):
+                self._first_rpc_result_done = True
+                time.sleep(first_write_sleep_sec)
+            return written
+
+        def flush(self):
+            if self.closed_flag:
+                return None
+            return self._inner.flush()
+
+        def close(self):
+            self.closed_flag = True
+            return self._inner.close()
+
+    spy = SpyStdin(real_stdin)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = spy
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    proc = FakeProc()
+    runner, _kill, _kw = _spawn_runner(
+        monkeypatch, tmp_path, proc, settings,
+        rag=CountingRag(), close_on_kill=w)
+    th.start()
+    result = runner.run(Mission(prompt="p", tools=[], output_schema={},
+                                max_turns=1, timeout_sec=5.0))
+    th.join(timeout=3.0)
+
+    assert result.status == "completed"
+
+    # dispatcher は daemon なので、2 本目の応答経路を通り終えるのを待つ。
+    deadline = time.monotonic() + 5.0
+    while len(rag_calls) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    # **恒真化の防止**: 2 本目の RPC が close の**後**に計算されたことを
+    # 確かめる。これが無いと「dispatcher が close 前に全部終えていたので
+    # 書き込みが無かっただけ」でも緑になり、ガードを何も守らない。
+    assert spy.closed_flag is True, "stdin が閉じられていない (前提が崩れている)"
+    assert len(rag_calls) == 2, (
+        "dispatcher が 2 本目の tool_rpc に到達していない — このテストは "
+        f"close 後の書き込み経路を検証できていない (rag_calls={rag_calls}, "
+        f"writes_before={spy.writes_before_close}, "
+        f"writes_after={spy.writes_after_close}, "
+        f"slept={spy._first_rpc_result_done})")
+
+    assert spy.writes_after_close == 0, (
+        "close 済みの stdin へ dispatcher が書き込んだ "
+        "(stdin_state['closed'] ガードが機能していない)")
+
+
 def _capture_handshake(base, monkeypatch, *, worker_profile):
     """WorkerRunner を 1 回走らせ、親が子へ送った handshake を返す。
 
