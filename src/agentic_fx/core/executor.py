@@ -85,7 +85,14 @@ class SnapshotCoverageError(Exception):
 @dataclass(frozen=True, slots=True)
 class CloseSnapshot:
     """commit-pre 相が集めた CLOSE 用の外部取得スナップショット (裁定書
-    F-1 / CR-2 / P8-01)。`captured_at` は commit-core の鮮度再検証が使う。"""
+    F-1 / CR-2 / P8-01)。`captured_at` は commit-core の鮮度再検証が使う。
+
+    `order_id`/`pair` は commit-core の同一性検査用 (レビュー 3 周目)。
+    **`pair` だけでは足りない** — `price` は `row["direction"]` で bid/ask
+    を選び分けた値なので、同一 pair の long/short 2 本を取り違えると
+    pair 検査を素通りして**スプレッドの反対側でクローズ**してしまう。
+    `order_id` が pair と direction の両方を含意する最も強い束縛。"""
+    order_id: int
     pair: str
     price: float
     spec: InstrumentSpec
@@ -528,6 +535,19 @@ class Executor:
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
 
+        # 直上の spec ガードと対称に fail-closed にする (裸の KeyError を
+        # core_lock 保持中に飛ばさない — レビュー 3 周目)
+        quote_to_account = snapshot.rates.get(spec.quote_currency)
+        base_to_account = snapshot.rates.get(spec.base_currency)
+        if quote_to_account is None or base_to_account is None:
+            reasons = [f"currency for pair {intent.pair!r} is not covered "
+                       "by the execution snapshot (N4-2)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": None, "reasons": reasons}
+
         ctx = GateContext(
             quote=snapshot.quote, spec=spec, equity=equity, hwm=hwm,
             daily_start_equity=accounting.daily_start_equity(self.conn, now),
@@ -536,8 +556,8 @@ class Executor:
             kill_switch_latched=self.state.load().kill_switch_latched,
             has_unresolved_unknown=has_unresolved_unknown(self.conn),
             account_currency=self.settings.account_currency,
-            quote_to_account=snapshot.rates[spec.quote_currency],
-            base_to_account=snapshot.rates[spec.base_currency],
+            quote_to_account=quote_to_account,
+            base_to_account=base_to_account,
             now=now)
         return self._evaluate_and_execute_open(intent, iid, ctx)
 
@@ -635,7 +655,8 @@ class Executor:
         price = quote.bid if row["direction"] == "long" else quote.ask
         spec = self.spec_fn(pair)
         rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
-        return CloseSnapshot(pair=pair, price=price, spec=spec, rate=rate,
+        return CloseSnapshot(order_id=row["id"], pair=pair, price=price,
+                             spec=spec, rate=rate,
                              rate_degraded=degraded, captured_at=now)
 
     def close_order_from_snapshot(self, row: dict, snapshot: CloseSnapshot,
@@ -647,11 +668,18 @@ class Executor:
         ため commit-core に残す)。`_finish_close`/`_close_unknown` を
         `close_order` と共有 — 判定・記録ロジックは `close_order` と完全
         共有 (I/O 位置のみ移動)。"""
-        # A1: row と snapshot の同一性チェック
-        if snapshot.pair != row["pair"]:
+        # row と snapshot の同一性検査 (commit-core は取得済みの値しか
+        # 使わないので、取り違えを検出できるのはここだけ)。
+        # **order_id まで見る** — pair だけだと同一 pair の long/short を
+        # 取り違えたときに素通りし、`snapshot.price` が反対側の気配
+        # (bid/ask) のままクローズされて close_price/realized_pnl が
+        # 恒久的に誤る (レビュー 3 周目)。
+        if (snapshot.order_id != row["id"]
+                or snapshot.pair != row["pair"]):
             raise SnapshotCoverageError(
-                f"snapshot pair {snapshot.pair!r} does not match row pair "
-                f"{row['pair']!r}")
+                f"snapshot (order_id={snapshot.order_id}, "
+                f"pair={snapshot.pair!r}) does not match row "
+                f"(id={row['id']}, pair={row['pair']!r})")
         now = self.clock.now()
         transitions.transition(self.conn, row["id"], S.CLOSING, now,
                                close_reason=reason)

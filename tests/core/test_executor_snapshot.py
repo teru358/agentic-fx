@@ -105,12 +105,12 @@ def _close_intent(order_id: int) -> TradeIntent:
                                      origin=Origin.SCHEDULER)
 
 
-def _insert_open_order(conn, pair: str) -> dict:
+def _insert_open_order(conn, pair: str, direction: str = "long") -> dict:
     """Risk Gate を通さず OPEN の建玉行を直接作る (exposure の下ごしらえ
     専用)。gate 経由にすると EURUSD の pip_size/価格の組合せでサイズ計算が
     絡み、テストの意図 (exposure が存在すること) がぶれるため。"""
     oid = orders.insert(
-        conn, pair=pair, direction="long", entry_type="market",
+        conn, pair=pair, direction=direction, entry_type="market",
         horizon="day", status=S.OPEN, now=NOW,
         quantity=0.1, remaining_quantity=0.0, requested_price=148.20,
         avg_fill_price=148.20, filled_quantity=0.1, stop_loss=147.80,
@@ -222,6 +222,34 @@ def test_open_from_snapshot_matches_handle_intent_on_gate_rejection(tmp_path):
             == ex2.state.load().kill_switch_latched)
 
 
+def test_open_from_snapshot_rejects_when_intent_currency_not_in_rates(tmp_path):
+    """intent の pair の spec はあるが換算レートが欠けている場合の fail-closed。
+
+    レビュー 3 周目: ここは `snapshot.rates[...]` の裸の添字アクセスで、
+    直上の spec ガードと非対称だった。exposure 行が 1 件も無いと
+    `open_risk_and_notional_from_snapshot` のループが空回りするため、
+    N4-2 検査を素通りしてこの行に到達する。裸の KeyError を
+    core_lock 保持中に飛ばさないことを pin する。
+    """
+    ex = _make_executor(tmp_path)
+    intent = _open_intent(pair="USDJPY")
+    mid = _start_trade_mission(ex.conn)
+    iid = _insert_intent(ex.conn, mid, intent)
+    # spec はあるが rates が空 (exposure 行は 1 件も作らない)
+    broken = ExecutionSnapshot(
+        quote=QUOTE, spec=SPECS["USDJPY"],
+        specs_by_pair={"USDJPY": SPECS["USDJPY"]}, rates={},
+        captured_at=NOW)
+
+    out = ex.open_from_snapshot(intent, iid, broken,
+                                max_snapshot_age_sec=999.0)
+
+    assert out["result"] == "rejected"
+    assert "not covered" in out["reasons"][0]
+    assert orders.list_by_status(ex.conn, S.SUBMITTING, S.OPEN,
+                                 S.PENDING_FILL) == []
+
+
 def test_open_risk_and_notional_from_snapshot_raises_on_uncovered_pair(tmp_path):
     ex = _make_executor(tmp_path)
     _insert_open_order(ex.conn, pair="EURUSD")
@@ -304,7 +332,7 @@ def test_gather_close_snapshot_captures_price_spec_and_rate(tmp_path):
     """gather_close_snapshot は quote_fn/spec_fn/resolve_close_rate を
     呼び、CloseSnapshot に price/spec/rate を確定する。"""
     ex = _make_executor(tmp_path)
-    row = {"pair": "USDJPY", "direction": "long"}
+    row = {"id": 1, "pair": "USDJPY", "direction": "long"}
     snapshot = ex.gather_close_snapshot(row)
     assert snapshot.price == QUOTE.bid       # long → bid
     assert snapshot.spec.symbol == "USDJPY"  # InstrumentSpec のフィールドは symbol
@@ -314,7 +342,7 @@ def test_gather_close_snapshot_captures_price_spec_and_rate(tmp_path):
 
 def test_gather_close_snapshot_uses_ask_for_short(tmp_path):
     ex = _make_executor(tmp_path)
-    snapshot = ex.gather_close_snapshot({"pair": "USDJPY",
+    snapshot = ex.gather_close_snapshot({"id": 1, "pair": "USDJPY",
                                          "direction": "short"})
     assert snapshot.price == QUOTE.ask
 
@@ -357,6 +385,35 @@ def test_close_order_from_snapshot_performs_no_external_io(tmp_path):
     assert orders.get(ex.conn, row2["id"])["status"] == S.CLOSED.value
 
 
+def test_close_order_from_snapshot_rejects_swapped_same_pair_orders(tmp_path):
+    """レビュー 3 周目: pair だけの検査では long/short の取り違えを防げない。
+
+    `gather_close_snapshot` は `row["direction"]` で bid/ask を選び分ける
+    ので、**同一 pair の long と short** の snapshot を取り違えると
+    pair 検査を素通りし、スプレッドの反対側でクローズされて
+    close_price/realized_pnl が恒久的に誤る。order_id まで束縛して防ぐ。
+    """
+    ex = _make_executor(tmp_path)
+    long_row = _insert_open_order(ex.conn, pair="USDJPY")
+    short_row = _insert_open_order(ex.conn, pair="USDJPY", direction="short")
+
+    long_snap = ex.gather_close_snapshot(long_row)
+    short_snap = ex.gather_close_snapshot(short_row)
+    # 前提: pair は同じで price だけが違う (= pair 検査では区別できない)
+    assert long_snap.pair == short_snap.pair
+    assert long_snap.price != short_snap.price
+
+    # 取り違え (long の row に short の snapshot) は弾かれる
+    with pytest.raises(SnapshotCoverageError):
+        ex.close_order_from_snapshot(long_row, short_snap, reason="llm_close")
+
+    # 弾かれた側は一切変更されていない
+    updated = orders.get(ex.conn, long_row["id"])
+    assert updated["status"] == S.OPEN.value
+    assert updated["close_price"] is None
+    assert updated["realized_pnl"] is None
+
+
 def test_close_order_from_snapshot_matches_close_order_result(tmp_path):
     """判定・記録ロジック不変の確認: 同一 price/spec/rate を使えば
     close_order (lock保持中に自前で取得) と close_order_from_snapshot
@@ -385,7 +442,7 @@ def test_close_from_snapshot_rejects_stale_snapshot(tmp_path):
     iid = _insert_intent(ex.conn, mid, intent)
     snapshot = ex.gather_close_snapshot(row)
     stale = snapshot.__class__(
-        pair=snapshot.pair,
+        order_id=snapshot.order_id, pair=snapshot.pair,
         price=snapshot.price, spec=snapshot.spec, rate=snapshot.rate,
         rate_degraded=snapshot.rate_degraded,
         captured_at=snapshot.captured_at - timedelta(seconds=999))
@@ -456,7 +513,11 @@ def test_close_order_from_snapshot_records_degraded_rate(tmp_path):
     # 次に失敗する rate_fn で再度 snapshot を取得
     ex = _make_executor(tmp_path / "core", quote_fn=rec_quote_fn,
                         spec_fn=rec_spec_fn, rate_fn=always_fail_rate_fn)
-    # 先に健全なレートをキャッシュさせておく (degraded フォールバック用)
+    # NOTE: ex の rate_fn は必ず失敗するので、この呼び出しでは
+    # _last_good_rate は温まらない。このテストが踏むのは
+    # 「rate が一度も取れず realized_pnl 未確定」の分岐である。
+    # 「最後の健全レートで pnl を計算する」本命分岐は
+    # test_close_order_from_snapshot_computes_pnl_from_degraded_rate が踏む。
     ex.resolve_close_rate("JPY", NOW)
     calls.clear()
 
@@ -522,7 +583,7 @@ def test_close_order_from_snapshot_rejects_mismatched_pair(tmp_path):
     ex = _make_executor(tmp_path)
     row = _insert_open_order(ex.conn, pair="USDJPY")
     # EURUSD の snapshot (別銘柄)
-    row_eurusd = {"pair": "EURUSD", "direction": "long"}
+    row_eurusd = {"id": row["id"], "pair": "EURUSD", "direction": "long"}
     snapshot = ex.gather_close_snapshot(row_eurusd)
     
     # USDJPY row に EURUSD snapshot で拒否
@@ -616,7 +677,8 @@ def test_close_order_from_snapshot_rejects_when_broker_fails(tmp_path):
     ex = _make_executor(tmp_path, broker=_StubBroker(close_status="unknown"))
     row = _insert_open_order(ex.conn, pair="USDJPY")
     snapshot = CloseSnapshot(
-        pair="USDJPY", price=QUOTE.bid, spec=SPECS["USDJPY"],
+        order_id=row["id"], pair="USDJPY", price=QUOTE.bid,
+        spec=SPECS["USDJPY"],
         rate=ConversionRate(1.0, "JPY", "JPY", (NOW,)),
         rate_degraded=False, captured_at=NOW)
 
