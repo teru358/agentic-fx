@@ -78,6 +78,20 @@ _HANDLED_ACCESS_FS = _ABI_V1_HANDLED_ACCESS_FS | _ACCESS_FS_TRUNCATE
 #   (渡せばそれ自体が設計誤り)、デバイスファイルの open 自体が allowlist 外で
 #   拒否されるため、handled にしなくても `data/` 到達には寄与しない。
 #   **Task 18 で `/dev` を含むパスを allowlist に入れる場合はここを見直すこと。**
+#   → **見直し済み (プラン8 Task 18, 2026-08-09。レビュー 2 周目
+#   `/code-review` が「この申し送りが未処理のまま `/dev` が入った」と指摘した
+#   ことによる)**: improve profile は `/dev/urandom` のために `/dev` を
+#   ディレクトリ単位で read-only 許可する (単一ファイル指定は `restrict_to` が
+#   `O_PATH | O_DIRECTORY` で open するため不可 — ユーザー裁定でスコープ外)。
+#   したがって**デバイスファイルの read open は成立し、その ioctl は ruleset の
+#   外に残る**。`_ACCESS_FS_IOCTL_DEV` は ABI v5 の定義なので、handled に加える
+#   なら `_REQUIRED_ABI` を 3 → 5 に上げることになり、v3/v4 カーネルで improve
+#   profile が一律起動拒否になる (要求水準そのものの変更)。
+#   **判断: 現状維持。** 根拠 — ①`/dev` 許可は `data/` 到達に寄与しない
+#   (§4.6 の意味論は保たれる) ②`WorkerRunner` は `start_new_session=True` で
+#   子を起動するため制御端末を持たず `/dev/tty` は `ENXIO` で開けない (実測)
+#   ③具体的な escape 経路は特定されていない。
+#   **プラン 9 で improve に実ツールセットを入れる前に再評価すること。**
 
 # 本モジュールが要求する最低 ABI。`TRUNCATE` (v3) を強制できない ABI 1/2 では
 # 完全性を守れないため、improve profile を通してはならない (設計書 §4.6

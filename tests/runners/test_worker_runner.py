@@ -1226,3 +1226,140 @@ def test_stdin_is_closed_only_after_the_dispatcher_finished_writing(
         "dispatcher の完了を待たずに stdin を閉じている "
         f"(IM-7 の排他契約違反)。期待 ['rpc_computed', 'stdin_closed'] / "
         f"実際 {order}")
+
+
+def _capture_handshake(base, monkeypatch, *, worker_profile):
+    """WorkerRunner を 1 回走らせ、親が子へ送った handshake を返す。
+
+    子は handshake を読んだら即 `ready: ok=False` を返して終わる (Mission
+    本体は走らせない — 見たいのは handshake の中身だけ)。
+    """
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    captured: dict = {}
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        captured.update(json.loads(child_in.readline()))
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": False})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: FakeProc())
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    base.mkdir(parents=True, exist_ok=True)
+    root = _root(base)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(base), worker_profile=worker_profile)
+    t.start()
+    runner.run(_mission())
+    t.join(timeout=2.0)
+    return captured
+
+
+def test_improve_profile_handshake_omits_db_and_plugin_paths(tmp_path, monkeypatch):
+    """**構造的到達不能の防御層① の回帰ピン** (プラン8 Task 18, 設計書 §4.6)。
+
+    improve worker への handshake には `db_path`/`plugins_dir` を**入れない**
+    — これが「接続情報の非提供」そのもので、Landlock (層②) と合わせて
+    2 層防御を成す。
+
+    根拠 (指揮者の段0 変異スイープ M9 で実測): この条件分岐を外して
+    improve の子にも実パスを渡すようにしても、**フルスイート 1682 件が
+    全て green のままだった**。層① はコードの見た目だけで守られており、
+    テストが一切押さえていなかった。
+
+    **両方向を見る** (片側だけだと恒真に落ちる — mutation-testing の規律):
+    improve では `None`、trade では実パス。
+    """
+    # `_root()` は同じ tmp_path 上で 2 回作れない (FileExistsError) ので
+    # 呼び出しごとに別ディレクトリを渡す。
+    improve = _capture_handshake(tmp_path / "a", monkeypatch,
+                                 worker_profile="improve")
+    assert improve["worker_profile"] == "improve"
+    assert improve["db_path"] is None, (
+        "improve worker に DB パスを渡している — 防御層①(接続情報の非提供)"
+        "が壊れている (設計書 §4.6)")
+    assert improve["plugins_dir"] is None, (
+        "improve worker に plugins_dir を渡している — 同上")
+
+    trade = _capture_handshake(tmp_path / "b", monkeypatch,
+                               worker_profile="trade")
+    assert trade["worker_profile"] == "trade"
+    assert trade["db_path"] is not None and trade["db_path"].endswith(
+        "agentic.db"), "trade worker には DB パスが渡らなければならない"
+    assert trade["plugins_dir"] is not None
+
+
+def test_child_cwd_is_a_dedicated_dir_outside_the_repository(tmp_path, monkeypatch):
+    """**`Popen(cwd=...)` は防御層② の一部** (プラン8 Task 18, codex 1周目 #1)。
+
+    子の cwd は `mission_worker._bootstrap_improve_profile` がそのまま
+    **read-write** allowlist に入れる。`cwd=` を落とすと子は親の cwd
+    (= リポジトリ root) を継承し、`data/` が書込可能になる。
+
+    段0 変異スイープで実測: `cwd=workdir` を削除してもフルスイート 1683 件が
+    全 green だった。子側には fail-closed ガードを入れたが、**親が正しい
+    cwd を渡していること自体**もここで直接押さえる (子のガードは最後の砦で
+    あって、親の配線の代わりにはならない)。
+    """
+    captured: dict = {}
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = None
+        stdout = None
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        # workdir は `tempfile.TemporaryDirectory` の context を抜けた時点で
+        # 消えるので、「空であること」はここ (子の起動時点) で見る。
+        if "cwd" in kwargs:
+            captured["cwd_entries"] = sorted(p.name for p in
+                                             Path(kwargs["cwd"]).iterdir())
+        raise RuntimeError("stop here — 見たいのは Popen の引数だけ")
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path), worker_profile="improve")
+    with pytest.raises(RuntimeError, match="stop here"):
+        runner.run(_mission())
+
+    assert "cwd" in captured, (
+        "Popen に cwd= を渡していない — 子がリポジトリ root を継承し、"
+        "improve worker の read-write allowlist に data/ が入る")
+    cwd = Path(captured["cwd"]).resolve()
+    data_dir = (root / "data").resolve()
+    assert cwd != data_dir and cwd not in data_dir.parents, (
+        f"子の cwd ({cwd}) が data/ ({data_dir}) を覆っている")
+    assert captured["cwd_entries"] == [], (
+        f"子の workdir は空でなければならない (実際: {captured['cwd_entries']})")

@@ -9283,6 +9283,32 @@ Task 15/16/17 と異なり、本 task の前提は**おおむね現物と一致�
 
 **stage 0 変異 sweep は、レビュアーが worktree に入る前に指揮者が完走させる** (2026-08-09 の運用規則)。
 
+## ⚠ 実装中の裁定: `/dev` をディレクトリ丸ごと read-only 許可する (2026-08-09 ユーザー裁定)
+
+**現象 (実測)**: improve worker は起動時に `/dev/urandom` を必要とする — allowlist から `/dev` を外すと `NotImplementedError: /dev/urandom (or equivalent) not found` で `ready` に到達しない。
+
+**なぜファイル単位に絞れないか**: `core/landlock.py` の `restrict_to` は allowlist の各パスを **`os.open(str(path), os.O_PATH | os.O_DIRECTORY)`** で開く (Task 8 の実装)。単一ファイルを渡すと `NotADirectoryError` になる。Landlock ABI 自体は通常ファイルへのルール追加を許すので、`/dev/urandom` だけに絞ること自体は可能だが、そのためには **Task 8 のファイル (`core/landlock.py`) にパスごとの access mask 対応 (`O_DIRECTORY` を外す + `READ_DIR` をファイルには付けない) を入れる**必要がある。
+
+**裁定 (ユーザー)**: **現状のまま `/dev` をディレクトリ許可で進める。** `landlock.py` の拡張は本 task のスコープ外とする。
+
+**受け入れたリスク**: improve worker は `/dev` 配下の全デバイスノードを**読取**できる。設計書 §4.6 が要求する「`data/` の絶対パスアクセスを OS レベルで遮断する」意味論は保たれる (`/dev` は `data/` の祖先ではなく、`test_improve_profile_cannot_reach_data_dir` が毎回実測する) が、**最小 allowlist の原則からは外れる**。プラン 9 で improve に実ツールセットが入る前に、ファイル粒度対応を再検討してよい。
+
+**あわせて実測した allowlist の最小化**: 実装者が当初 `/lib`・`/lib64`・`/usr/lib`・`/usr/lib64`・`/usr/share`・`/etc`・`/dev` の 7 つを (申告せずに) 追加していた。指揮者が 1 つずつ外して実測し 3 つ (`/usr/lib`・`/usr/share/zoneinfo`・`/dev`) まで削ったが、**この最小化は誤りだった** — レビュー 2 周目の `/code-review` が検出。最終形は `/etc` を戻した **4 つ**。
+
+> **⚠ 指揮者の測定ミスとして記録する (同型の再発を防ぐため)**
+>
+> 最小化の判定に使ったのは `test_real_improve_worker_reaches_ready` (= `ready` フレームまで到達するか) だった。しかし **`ready` は `runner.run` の 1 行手前で送出される** ので、この test は「LLM を実際に叩く経路」を一度も通らない。名前解決 (`/etc/nsswitch.conf`, `/etc/hosts`) はその先で初めて必要になるため、**「`/etc` を外しても green」= 「不要」と読み違えた**。
+>
+> 実測 (`/code-review` が再現、指揮者が追試): `/etc` 無しでは `socket.getaddrinfo("localhost", 8080)` が `gaierror: Temporary failure in name resolution` になり、既定の `llama_swap.base_url` (`http://localhost:8080/v1`) へ到達できない → **improve Mission は初回ターンで必ず `failed`**。`worker_profile="improve"` の本番構築が service.py にまだ無いため潜在に留まっていた。
+>
+> **教訓**: allowlist の必要十分を測る基準は「**起動できるか**」ではなく「**LLM へ到達できるか**」。probe に `getaddrinfo` と `socket.create_connection("localhost", 8080)` を追加してこの要件をテストで固定した (変異 M17 で KILLED を確認)。`ConnectionRefusedError` は ok 扱いにしてあるので llama-swap が落ちていても判定できる。
+>
+> **テストが担保する範囲 (正確に書く)**: probe が踏むのは**エンドポイントへ socket を張るところまで**であり、**Mission の完走 (実 LLM 応答 → ツール呼び出し → result 送出) はスイートでは実行しない** (llama-swap 実機と数百秒を要するため)。したがって「完走できるか」を基準に据えつつ、**自動で守れているのは経路の到達性まで**である。プラン 9 で改善ループに実ツールセットが入る際は、完走側の確認を E2E に置くこと。
+>
+> **削除した 3 つの再測定 (2026-08-09、指揮者)**: 上記の読み違えが `/lib`・`/lib64`・`/usr/lib64` の削除にも及んでいないかを、**実 HTTP (`httpx.get("http://localhost:8080/v1/models")` → 200)** を基準に測り直した。4 パス構成に 3 つを 1 つずつ戻しても結果は不変 (いずれも 200) で、**削除は HTTP 基準でも正しい**と確認済み。
+>
+> **既知の制約**: `/etc/resolv.conf` は `/run/systemd/resolve/...` への symlink なので、`/etc` を許可しても**外部ホスト名の DNS 解決はできない** (実測)。`localhost`/IP は `/etc/hosts` で解決するので既定構成では問題にならないが、`base_url` を外部ホスト名にする場合は allowlist の追加が要る。
+
 **Files:**
 - Modify: `src/agentic_fx/mission_worker.py` (`worker_profile == "improve"` 分岐 + `_bootstrap_improve_profile` 新設)
 - Modify: `docs/superpowers/plans/2026-08-01-phase2-decomposition.md` (§12 申し送り③ — 「到達不能」表現への注記追加)

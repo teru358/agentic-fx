@@ -25,10 +25,16 @@
    送出)
 7. `result` を送出して終了
 
-**worker_profile="trade" 限定** (本プランのスコープ — improve profile は
-Task 18 で bootstrap を拡張する)。`settings.runner.trade.backend` が
-"local" 以外 (= "claude") の場合は `RuntimeError` で fail closed する
-(ClaudeRunner は本プランでは実装しない — Global Constraints)。
+**対応 profile は `trade` と `improve` の 2 つ** (プラン8 Task 18 で improve を
+追加。それ以外の値は `ready: ok=False` で fail closed する)。上記 1〜7 の流れは
+`trade` のもので、`improve` は **DB にも plugin にも触れない別経路**を通る —
+`_bootstrap_improve_profile()` で Landlock を適用してから、空の `ToolRegistry()`
+で `LocalRunner` を組む (改善ループの実ツールセットはプラン 9)。
+
+`settings.runner.<profile>.backend` が "local" 以外 (= "claude") の場合は
+`RuntimeError` で fail closed する (ClaudeRunner は本プランでは実装しない —
+Global Constraints)。trade は `runner.trade.backend`、improve は
+`runner.improve.backend` をそれぞれ見る。
 
 **I4 対応 (実時計)**: 子は Mission 実行中の鮮度判定 (`get_signals` 等)
 に `_build_clock()` (既定 `SystemClock()`) を使う。handshake 時刻で
@@ -44,9 +50,11 @@ import json
 import os
 import signal
 import sys
+import sysconfig
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from agentic_fx.core import landlock
 from agentic_fx.core.mission_protocol import (
     ProtocolError, SeqTracker, encode_frame, read_frame,
 )
@@ -81,6 +89,164 @@ def _set_resource_limits(*, as_mb: int, nofile: int, fsize_mb: int) -> None:
     fsize_bytes = int(fsize_mb) * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_bytes, fsize_bytes))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+def _bootstrap_improve_profile() -> None:
+    """improve worker profile の bootstrap (プラン8, 設計書 §4.6)。
+
+    **⚠ CRITICAL: Landlock は不可逆。この関数を呼ぶプロセスの生涯全体が
+    制限される。テストから呼ぶ場合は必ず `subprocess` を経由し、
+    in-process (pytest プロセス内) で実行してはいけない。**
+
+    **構造的到達不能の 2 層防御**: ①接続情報の非提供 (handshake に
+    db_path/plugins_dir が含まれない — `main()` の improve 分岐がこれらを
+    一切参照しない) ②Landlock による FS 自己制限 (コードツリー読取 +
+    venv/stdlib 読取 (裁定書 F-8/IM-2/P8-04 — 実行に必要な依存解決のため) +
+    専用 workdir 読書きのみ allowlist、`data/` は遮断)。
+
+    呼び出し時点の `Path.cwd()` は WorkerRunner が `cwd=` に渡した専用空
+    workdir (呼び出し元の責務 — このプロセス自身は検証しない)。
+
+    **Landlock 利用不能な環境では improve worker は起動拒否 (fail
+    closed)** — trade profile は Landlock を任意 (RO 接続が主防御) と
+    するが、improve profile は Landlock が唯一の FS 境界であるため必須。
+    """
+    if not landlock.is_available():
+        raise RuntimeError(
+            "Landlock is not available on this kernel/architecture — "
+            "improve worker profile refuses to start without it "
+            "(fail closed, 設計書 §4.6)")
+    code_root = Path(__file__).resolve().parents[1]
+    workdir = Path.cwd()
+    venv_root = Path(sys.prefix).resolve()
+    stdlib_root = Path(sysconfig.get_paths()["stdlib"]).resolve()
+    base_prefix = Path(sys.base_prefix).resolve()
+    read_only = [code_root, venv_root, stdlib_root]
+    if base_prefix != venv_root:
+        read_only.append(base_prefix)
+    # venv/stdlib の外にある実行時依存。**allowlist は防御の質そのものなので
+    # 最小に保つ**が、**「起動できる (`ready` に到達する)」を基準に測っては
+    # いけない。「LLM エンドポイントへ到達できる」まで踏むこと** — `ready` は
+    # `runner.run` の 1 行手前で送出されるので、その先で初めて必要になる依存
+    # (名前解決など) の欠落を素通りさせる (2026-08-09 に実際にそれで `/etc` を
+    # 落とした。下記参照)。
+    #
+    # **実測が担保する範囲を正確に書く**: 下記の判定は
+    # `getaddrinfo` / `socket.create_connection` / `httpx.get("/v1/models")`
+    # → 200 までの**到達性**で測っている。**実 LLM 応答から `result` 送出まで
+    # の Mission 完走は測っていない** (llama-swap 実機と数百秒を要するため
+    # スイートに入れていない)。プラン 9 で改善ループに実ツールセットが入る際は
+    # 完走側の確認を E2E に置くこと:
+    #
+    #   /usr/lib             外すと `ImportError: libgcc_s.so.1: cannot open
+    #                        shared object file` で improve worker が起動不能
+    #   /usr/share/zoneinfo  タイムゾーンデータ。外すと起動不能
+    #   /dev                 `/dev/urandom` (乱数生成) のため。**ディレクトリ
+    #                        単位でしか許可できない** — `landlock.restrict_to`
+    #                        は対象を `O_PATH | O_DIRECTORY` で open するので
+    #                        単一ファイル (`/dev/urandom`) を渡すと
+    #                        `NotADirectoryError` になる (実測)
+    #   /etc                 **glibc の名前解決 (`/etc/nsswitch.conf`,
+    #                        `/etc/hosts`) に必要。** 外すと
+    #                        `socket.getaddrinfo("localhost", 8080)` が
+    #                        `gaierror: Temporary failure in name resolution`
+    #                        になり、既定の `llama_swap.base_url`
+    #                        (`http://localhost:8080/v1`) へ到達できず、
+    #                        **improve Mission が初回ターンで必ず failed に
+    #                        なる** (レビュー 2 周目 `/code-review` が検出)
+    #
+    # **`/etc` を一度削除した経緯 (同じ誤りを繰り返さないために残す)**:
+    # 指揮者の最初の最小化は「1 つずつ外して `test_real_improve_worker_
+    # reaches_ready` が red になるか」で測ったが、**この test は `ready`
+    # 送出までしか到達せず、その 1 行あとの `runner.run` (= 実際に LLM を
+    # 叩く経路) を通らない**。名前解決はその先で初めて必要になるので、
+    # 「外しても green」= 「不要」と読み違えた。いまは probe が
+    # `getaddrinfo` まで見る (`test_improve_profile_cannot_reach_data_dir`)。
+    #
+    # **既知の制約**: `/etc/resolv.conf` は `/run/systemd/resolve/...` への
+    # symlink なので、`/etc` を許可しても**外部ホスト名の DNS 解決はできない**
+    # (実測)。`localhost`/IP は `/etc/hosts` で解決するので既定構成では問題に
+    # ならない。`llama_swap.base_url` を外部ホスト名にする場合は allowlist の
+    # 追加が要る。
+    #
+    # 外しても **HTTP 到達性 (`/v1/models` → 200) に影響が無かった**ため削除
+    # したもの: `/lib`・`/lib64` (どちらも `/usr/lib`・`/usr/lib64` への
+    # symlink)、`/usr/lib64`。
+    # 残した 4 つはいずれも `data/` の祖先ではないため、設計書 §4.6 の
+    # 「`data/` の絶対パスアクセスを OS レベルで遮断する」意味論は保たれる
+    # (`test_improve_profile_cannot_reach_data_dir` が毎回それを実測する)。
+    for sys_path in [Path("/usr/lib"), Path("/usr/share/zoneinfo"),
+                     Path("/dev"), Path("/etc")]:
+        if sys_path.exists():
+            read_only.append(sys_path)
+    _assert_allowlist_excludes_data_dir(read_only + [workdir])
+    try:
+        landlock.restrict_to(read_only_paths=read_only, read_write_paths=[workdir])
+    except landlock.LandlockUnavailable as e:
+        raise RuntimeError(
+            f"Landlock restriction failed (syscall error): {e} "
+            "(improve worker profile refuses to continue, fail closed)") from e
+
+
+def _guarded_data_dir() -> Path:
+    """遮断対象である `data/` の位置を、**handshake からではなくこのモジュール
+    自身の配置から**導く (`<repo>/src/agentic_fx/mission_worker.py` →
+    `<repo>/data`)。
+
+    improve worker は接続情報を渡されない (防御層①) ので `root` を知らない。
+    それでも「**許可してはいけない場所**」は知ることができる — 知るのが禁止
+    なのは到達手段であって、禁止領域の座標ではない。
+
+    **`code_root` から導いてはいけない** (レビュー 1 周目の KAT が「`parents[1]`
+    と `parents[2]` で 2 段違うのは紛らわしい」と指摘した点への回答): この
+    ガードが塞いでいる事故の 1 つは **`code_root` の計算を誤って広げること**
+    そのもの (段0 M14)。`data/` の位置を `code_root` から導くと、`code_root`
+    がずれたときにガードの基準も一緒にずれて**検査が空振りする**。両者は
+    意図的に独立の式で、`__file__` という同じ 1 点からそれぞれ導く。
+    """
+    return Path(__file__).resolve().parents[2] / "data"
+
+
+def _assert_allowlist_excludes_data_dir(paths: list[Path]) -> None:
+    """allowlist のどれ 1 つも `data/` の祖先 (または `data/` 自身) でない
+    ことを確認し、違反したら **fail closed** する (プラン8 Task 18)。
+
+    **なぜ必要か (段0 変異スイープで実測した 2 つの生存変異)**:
+
+    - `WorkerRunner` の `Popen(..., cwd=workdir)` から `cwd=` を落とすと、子の
+      cwd は親の cwd (= リポジトリ root) になり、`Path.cwd()` が
+      **read-write** allowlist に入って `data/` が書込可能になる。
+      フルスイート 1683 件は全 green のままだった
+    - `code_root` を `parents[1]` (= `src/`) から `parents[2]` (= リポジトリ
+      root) に広げると `data/` が読取可能になる。これも全 green のままだった
+
+    どちらも「allowlist の計算を間違えた」という同じ形の事故なので、**計算
+    結果そのものを不変条件として検査する**のがテストより確実な防御になる。
+    テスト側 (`test_allowlist_never_covers_the_data_dir`) はこの検査自体が
+    消されないことを pin する。
+
+    **これは best-effort の第 2 層であり、第 1 層の代わりにはならない**
+    (レビュー 2 周目 `/code-review` の指摘): 本番の data root は
+    **サービスプロセスの cwd** (`entry.py` の `root = Path.cwd()`) であって
+    このモジュールの配置ではない。`afx` は console script なのでリポジトリ
+    外から起動する運用も正当で、そのとき `_guarded_data_dir()` は実在しない
+    `<repo>/data` を指し、**この検査は素通りする**。非 editable install
+    (wheel 配置) でも `parents[2]` は site-packages の親になる。
+    したがって「子の cwd が専用 workdir であること」は**親側で保証する**のが
+    本筋で (`WorkerRunner.run` の `Popen(cwd=...)` と
+    `test_child_cwd_is_a_dedicated_dir_outside_the_repository`)、この検査は
+    その配線が壊れたときに**運が良ければ捕まえる**最後の網に留まる。
+    """
+    data_dir = _guarded_data_dir()
+    for p in paths:
+        resolved = Path(p).resolve()
+        # 祖先・一致に加えて**子孫も弾く** (`data/` 配下を workdir にする
+        # 経路。レビュー 2 周目 `/code-review` の指摘)。
+        if (resolved == data_dir or resolved in data_dir.parents
+                or data_dir in resolved.parents):
+            raise RuntimeError(
+                f"improve worker allowlist would expose the history data "
+                f"directory: {resolved} covers or lives under {data_dir} — "
+                "refusing to start (fail closed, 設計書 §4.6)")
 
 
 class _RagRpcProxy:
@@ -221,6 +387,43 @@ def main() -> None:
             return
         settings_dict = handshake["settings"]
         worker_profile = handshake["worker_profile"]
+        if worker_profile == "improve":
+            _bootstrap_improve_profile()
+            _set_resource_limits(
+                as_mb=settings_dict["worker"]["child_as_mb"],
+                nofile=settings_dict["worker"]["child_nofile"],
+                fsize_mb=settings_dict["worker"]["child_fsize_mb"])
+            from agentic_fx.config import Settings
+            settings = Settings.model_validate(settings_dict)
+            if settings.runner.improve.backend != "local":
+                raise RuntimeError(
+                    f"runner.improve.backend={settings.runner.improve.backend!r} "
+                    "is not supported by mission_worker in this plan "
+                    "(ClaudeRunner is Plan 9 scope) — fail closed")
+            from agentic_fx.runners.base import Mission
+            from agentic_fx.runners.local_runner import LocalRunner
+            from agentic_fx.tools.registry import ToolRegistry
+
+            registry = ToolRegistry()
+            mission = Mission(**handshake["mission"])
+            on_message = _make_on_message(protocol_out, out_seq)
+            runner = LocalRunner(
+                base_url=settings.llama_swap.base_url,
+                model=settings.runner.improve.model, registry=registry,
+                on_message=on_message)
+
+            _send_frame(protocol_out, out_seq, {"type": "ready", "ok": True})
+            ready_sent = True
+            try:
+                result = runner.run(mission)
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result",
+                    "status": result.status, "output": result.output})
+            except Exception as exc:  # noqa: BLE001
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result", "status": "failed", "output": None,
+                    "error": f"{type(exc).__name__}: {exc}"})
+            return
         if worker_profile != "trade":
             raise RuntimeError(
                 f"unsupported worker_profile in this plan: {worker_profile!r}")
