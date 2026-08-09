@@ -8,7 +8,11 @@ import time
 
 import pytest
 
-from agentic_fx.shell import _InterruptibleLineReader, run_shell
+from agentic_fx.shell import (
+    _blocking_readline_fallback,
+    _InterruptibleLineReader,
+    run_shell,
+)
 
 
 class _FakeCommands:
@@ -236,4 +240,77 @@ def test_partial_line_before_eof_is_processed(tmp_path):
 
     assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
     assert "echo: partial" in printed
+    stream.close()
+
+
+def test_fallback_strips_carriage_return_from_crlf_line():
+    """H1 pin: フォールバック経路 (`_blocking_readline_fallback`) 単体で
+    \\r\\n の \\r が行末に残らないことを確認する。`run_shell` 経由だと
+    `.strip()` が \\r も除去してしまい欠陥を隠すため、関数を直接呼ぶ
+    (G4 と同じ理由で単体テストでしか検証できない契約)。"""
+    stream = io.StringIO("hello\r\n")
+    line = _blocking_readline_fallback(
+        "afx> ", stream, prompt_fn=lambda *_: None)
+    assert line == "hello"  # "hello\r" ではないこと
+
+
+def test_prompt_goes_through_prompt_fn_not_real_stdout(tmp_path, capsys):
+    """H3 pin: プロンプトが `prompt_fn` (専用の I/O seam) 経由で出力され、
+    実 stdout へ直接漏れないことを確認する。旧コードは `print()` 直書き
+    だったため、`print_fn`/`stdin_stream` を注入しても呼び出し元は
+    プロンプト出力を制御できなかった。"""
+    r_fd, w_fd = os.pipe()
+    stream = os.fdopen(r_fd, "r")
+    writer = os.fdopen(w_fd, "w")
+    stop_event = threading.Event()
+    prompts: list[str] = []
+
+    t, err = _start_shell(
+        _FakeCommands(), stop_event,
+        stdin_stream=stream, poll_interval=0.05, print_fn=lambda *_: None,
+        prompt_fn=prompts.append)
+    time.sleep(0.1)
+    writer.write("hello\n")
+    writer.flush()
+    time.sleep(0.2)
+
+    stop_event.set()
+    t.join(timeout=2.0)
+
+    assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
+    assert "afx> " in prompts  # prompt_fn 経由で呼ばれたこと
+    captured = capsys.readouterr()
+    assert "afx> " not in captured.out  # 実 stdout に直接漏れていないこと
+    writer.close()
+    stream.close()
+
+
+def test_partial_multibyte_sequence_at_eof_is_finalized(tmp_path):
+    """H5 pin: 改行なしで UTF-8 マルチバイト文字の途中 (先頭2バイトのみ)
+    で入力が終わっても (EOF)、デコーダ内部に残った未確定バイト列が
+    黙って捨てられず finalize されることを確認する。"""
+    r_fd, w_fd = os.pipe()
+    stream = os.fdopen(r_fd, "r")
+    writer = os.fdopen(w_fd, "wb")
+    stop_event = threading.Event()
+    printed: list[str] = []
+
+    t, err = _start_shell(
+        _FakeCommands(), stop_event,
+        stdin_stream=stream, poll_interval=0.05, print_fn=printed.append)
+    time.sleep(0.1)
+    # "あ" (U+3042) の UTF-8 は 3 バイト (0xE3 0x81 0x82)。先頭 2 バイトだけ
+    # 送って改行なしで EOF にする — マルチバイト文字の途中で入力が
+    # 終わるケースを再現する。
+    writer.write("prefix-".encode("utf-8") + "あ".encode("utf-8")[:2])
+    writer.flush()
+    writer.close()  # 改行なしで EOF
+
+    t.join(timeout=2.0)
+
+    assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
+    # 黙って捨てられていれば "echo: prefix-" (末尾バイトが消える) になる。
+    # finalize されていれば末尾に replacement 文字が付き長さが伸びる。
+    assert any(p.startswith("echo: prefix-") and len(p) > len("echo: prefix-")
+               for p in printed), printed
     stream.close()

@@ -1,10 +1,16 @@
 """対話シェル — 静かなプロンプト。ログは pull 型コマンドのみ (設計書 §8)。
 
 readline 中断 seam (プラン8, 設計書 §6 codex I3-2): 対話モードの main は
-`input()` でブロックするため、`stop_event` が別スレッド (watchdog) から
-セットされても自然には解けない。`select.select` によるポーリングへ
-置き換え、定期的に `stop_event` をチェックできるようにする — 対話モード
-で main を wake する唯一の経路。
+`input()` でブロックするため、`stop_event` が別スレッドからセットされても
+自然には解けない。`select.select` によるポーリングへ置き換え、定期的に
+`stop_event` をチェックできるようにする。
+
+(レビュー反映 H2) 現時点で `stop_event` を立てる producer は存在しない —
+`service.py` の setter は SIGTERM/SIGINT ハンドラ (`if daemon:` の下のみ)
+と `finally` だけで、`watchdog_thread` は `stop_event` を立てない。
+`run_shell` に到達するのは非 daemon モードのみなので、この seam は現状
+end-to-end で一度も駆動されていない。producer は Task 19 (停止状態機械)
+で配線する。**本 task はその seam を用意するもの**。
 
 実装ノート (プランからの逸脱): プラン原文は `stream.buffer.peek(1)` で
 Python 側バッファの残存を確認する方式 (裁定書 F-15/IM-8) を指定していたが、
@@ -58,7 +64,12 @@ class _InterruptibleLineReader:
         self._pending: str = ""
         self._eof = False
         self._chunk_size = chunk_size
-        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # H4: input() はストリーム自身の encoding でデコードする。
+        # ハードコードした "utf-8" だと encoding が異なるストリームで
+        # errors="replace" により UnicodeDecodeError が黙った U+FFFD 化に
+        # 変わってしまうため、stream.encoding を優先する。
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        self._decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
         self.usable = True
         try:
             stream.fileno()
@@ -82,6 +93,11 @@ class _InterruptibleLineReader:
                 raise EOFError()
             if stop_event.is_set():
                 return None
+            # `select` と `read1` の組合せが安全である根拠 (/code-review で
+            # 実測確認済み): `BufferedReader.read1(n)` は内部バッファが
+            # 空のとき raw からちょうど n バイト読むだけで先読みしない。
+            # そのため `read1(1)` の後も残りのバイトは OS 側パイプに
+            # 残ったままになり、次回の `select` が正しく検知できる。
             ready, _, _ = select.select([self._stream], [], [], poll_interval)
             if not ready:
                 continue
@@ -90,13 +106,22 @@ class _InterruptibleLineReader:
                 else self._raw.read(self._chunk_size)
             if not chunk:
                 self._eof = True
+                # H5: デコーダ内部に残った未確定のマルチバイト列を
+                # final デコードで確定させる。呼ばなければ、途中で
+                # 終わった入力の末尾バイト列が黙って捨てられる。
+                self._pending += self._decoder.decode(b"", final=True)
                 continue
             if isinstance(chunk, bytes):
                 chunk = self._decoder.decode(chunk)
             self._pending += chunk
 
 
-def _blocking_readline_fallback(prompt: str, stream) -> str:
+def _default_prompt_fn(prompt: str) -> None:
+    """H3 既定のプロンプト出力。末尾改行なしで即座に flush する。"""
+    print(prompt, end="", flush=True)
+
+
+def _blocking_readline_fallback(prompt: str, stream, *, prompt_fn) -> str:
     """G2: select 非対応ストリーム用の従来型フォールバック。
 
     `stream.fileno()` が無い/使えない場合は select ベースの割込み可能
@@ -104,16 +129,17 @@ def _blocking_readline_fallback(prompt: str, stream) -> str:
     フォールバックする (中断可能性は失うが、少なくとも停止させずに
     黙って動かなくなることは避ける)。EOF は `EOFError` を送出する。
     """
-    print(prompt, end="", flush=True)
+    prompt_fn(prompt)
     line = stream.readline()
     if line == "":
         raise EOFError()
-    return line.rstrip("\n").rstrip("\r")
+    return line.rstrip("\n").rstrip("\r")  # H1: \r\n の \r を落とす
 
 
 def run_shell(commands: Commands, stop_event: threading.Event, *,
-              input_fn=input, print_fn=print, stdin_stream=None,
-              poll_interval: float = 0.5, chunk_size: int = 4096) -> None:
+              input_fn=input, print_fn=print, prompt_fn=_default_prompt_fn,
+              stdin_stream=None, poll_interval: float = 0.5,
+              chunk_size: int = 4096) -> None:
     use_interruptible = input_fn is input
     stream = stdin_stream if stdin_stream is not None else sys.stdin
     reader = _InterruptibleLineReader(stream, chunk_size=chunk_size) \
@@ -133,14 +159,19 @@ def run_shell(commands: Commands, stop_event: threading.Event, *,
     while not stop_event.is_set():
         try:
             if use_interruptible:
-                print("afx> ", end="", flush=True)
+                # H3: プロンプトは print_fn を迂回せず prompt_fn (別の
+                # I/O seam) を経由する — 旧コードは input_fn(prompt) 経由
+                # だったため呼び出し元が完全にモックできたが、実 print
+                # 直書きだとテストで注入した print_fn/stdin_stream が
+                # プロンプトの出力先を制御できない。
+                prompt_fn("afx> ")
                 raw = reader.readline(stop_event, poll_interval=poll_interval)
                 if raw is None:
                     return  # stop_event がポーリング中に立った (中断)
                 line = raw.strip()
             elif fallback_stream is not None:
                 line = _blocking_readline_fallback(
-                    "afx> ", fallback_stream).strip()
+                    "afx> ", fallback_stream, prompt_fn=prompt_fn).strip()
             else:
                 line = input_fn("afx> ").strip()
         except (EOFError, KeyboardInterrupt):
