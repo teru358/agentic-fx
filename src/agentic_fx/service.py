@@ -503,7 +503,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                                watch=mission_watch)
         reflection = ReflectionCycle(conn=conn_core, runner=runner, rag=rag,
                                      settings=settings, activity=activity,
-                                     clock=clock, watch=mission_watch)
+                                     clock=clock, core_lock=core_lock,
+                                     watch=mission_watch)
 
         def _trade_fn(trigger: str):
             # プラン 8 (Task 15): TradeLoop 自身が prepare/commit-core で
@@ -513,10 +514,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             return trade_loop.run_once(trigger)
 
         def _reflection_fn():
-            # ReflectionCycle は Task 16 で五相再構成するまで、呼び出し全体
-            # を lock で包む現状維持。
-            with core_lock:
-                return reflection.run_pending()
+            # プラン 8 (Task 16): ReflectionCycle 自身が prepare/commit-core で
+            # core_lock を保持する三相構造になったため、ここでは lock を掴まない。
+            return reflection.run_pending()
 
         def _ask_fn(question: str) -> str:
             # プラン 8 (Task 15): TradeLoop.ask_once も三相構造になったため

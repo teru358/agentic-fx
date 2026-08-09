@@ -4,8 +4,9 @@
 - 公開 run_once/ask_once: サービス境界 (never-raise)
 - _run_once_impl: prepare/run/commit-pre/commit-core/commit-post の五相
 - _ask_once_impl: prepare/run/commit の三相
-- _finalize_mission: missions.finish の CAS 化された共通呼び出し (core_lock
-  保持中に呼ぶこと)
+- finalize_mission (agentic_fx.loops.mission_finalize): missions.finish の
+  CAS 化された共通呼び出し (core_lock 保持中に呼ぶこと。TradeLoop/
+  ReflectionCycle 共有 — プラン8 Task 16)
 """
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ from agentic_fx.core.notifier import Notifier
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.price_provider import PriceProvider
+from agentic_fx.loops.mission_finalize import finalize_mission
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.prompts_loader import load_prompt
 from agentic_fx.loops.summary import (
@@ -114,7 +116,7 @@ class TradeLoop:
         # 無かったため、claim 成功後の set_trigger/build_prompt/build_mission
         # で例外が出ると finally が一切実行されず、claimed signal も mid も
         # 回収されないまま呼び出し元 (run_once のサービス境界) まで抜けて
-        # いた。`finalized` は「_finalize_mission (または missions.finish) を
+        # いた。`finalized` は「finalize_mission (または missions.finish) を
         # 既に試みたか」を追跡し、finally での二重 finalize (CAS 上は無害だが
         # 無用な mission_finalize_conflict ログを出す) を避ける。
         claimed: dict | None = None
@@ -191,7 +193,8 @@ class TradeLoop:
             # ---- commit-pre (core_lock 非保持) ----
             if result.status != "completed":
                 with self._core_lock:
-                    self._finalize_mission(mid, result)
+                    finalize_mission(self.conn, self.activity, self.clock,
+                                     mid, result)
                 finalized = True
                 self.activity.write(Category.AGGREGATE, "mission_failed",
                                     f"runner status={result.status}",
@@ -203,7 +206,8 @@ class TradeLoop:
                                                    origin=Origin.SCHEDULER)
             except IntentParseError as e:
                 with self._core_lock:
-                    self._finalize_mission(mid, result)
+                    finalize_mission(self.conn, self.activity, self.clock,
+                                     mid, result)
                 finalized = True
                 self.activity.write(Category.AGGREGATE, "intent_parse_failed",
                                     str(e), ref_id=str(mid))
@@ -317,7 +321,8 @@ class TradeLoop:
                         out = self.executor.cancel_intent(intent, iid)
                 except Exception as e:  # noqa: BLE001
                     _log.exception("executor intent handling raised")
-                    self._finalize_mission(mid, result)
+                    finalize_mission(self.conn, self.activity, self.clock,
+                                     mid, result)
                     finalized = True
                     self.activity.write(Category.AGGREGATE,
                                         "intent_execution_failed",
@@ -330,7 +335,8 @@ class TradeLoop:
                         f"[agentic-fx] 注文処理失敗: {safe_error_text(e)}")
                     out = None
                 else:
-                    self._finalize_mission(mid, result)
+                    finalize_mission(self.conn, self.activity, self.clock,
+                                     mid, result)
                     finalized = True
 
             # ---- commit-post (core_lock 非保持) ----
@@ -377,49 +383,8 @@ class TradeLoop:
             # 無用なログを避けるため `finalized` で一度限りにする。
             if mid is not None and not finalized:
                 with self._core_lock:
-                    self._finalize_mission(
-                        mid, MissionResult("failed", None, []))
-
-    def _finalize_mission(self, mid: int, result: MissionResult) -> None:
-        """missions.finish の CAS 化された呼び出し (**core_lock 保持中に
-        呼ぶこと**)。設計書 §4.7 codex C-4: 二重終端は上書きせず警告のみ
-        残す。
-
-        **(レビュー 2 周目 codex D4 — docstring 訂正)** finish 失敗時も
-        執行 (発注等) は巻き戻さない (設計書 §3.1 が finalize を
-        commit-core の**末尾** — paper broker 執行の後 — に置くため。
-        Task 15 節「⚠ 着手前検証の結果 (4)」で明示的に許容された意図的な
-        挙動変更で、旧 `_run_recorded` の「finish 失敗時は result を
-        failed に差し替え、呼び出し元を completed 系の分岐に進ませない」
-        契約はもう維持していない)。監査未確定は fail closed にはせず、
-        `mission_finalize_failed` の activity 記録で可視化したうえで、
-        mission 行は `running` のまま残し、次回起動時の
-        `recover_interrupted` による `interrupted` 回収に委ねる
-        (無警告の再発防止という旧契約の目的そのものは、activity 記録と
-        recover_interrupted の組合せで別の形で担保している)。
-
-        `_ask_once_impl` も同じ契約 (finish 失敗時に回答文字列を巻き戻さ
-        ない) を採用している — ask は読み取り専用で資金に影響しないため
-        許容される (同 Step の判断)。"""
-        try:
-            finished = missions.finish(self.conn, mid, result.status,
-                                       result.output, result.transcript,
-                                       self.clock.now())
-        except Exception:  # noqa: BLE001
-            _log.exception("missions.finish failed for %s", mid)
-            try:
-                self.activity.write(Category.SYSTEM, "mission_finalize_failed",
-                                    f"mid={mid}")
-            except Exception:  # noqa: BLE001
-                _log.exception("failed to record mission_finalize_failed")
-            return
-        if not finished:
-            try:
-                self.activity.write(
-                    Category.SYSTEM, "mission_finalize_conflict",
-                    f"mid={mid} (already finalized elsewhere)")
-            except Exception:  # noqa: BLE001
-                _log.exception("failed to record mission_finalize_conflict")
+                    finalize_mission(self.conn, self.activity, self.clock,
+                                     mid, MissionResult("failed", None, []))
 
     def _read_exposure_pairs(self) -> list[str]:
         """commit-pre 専用: `conn_supervisor` (lock 外の読取専用接続) から
@@ -490,10 +455,10 @@ class TradeLoop:
         """ask Mission (プラン8 三相再構成 — trade と同じ理由: WorkerRunner
         呼び出しが長時間ブロックしうるため lock を保持しない)。
 
-        **(レビュー 2 周目 codex D4)** `_finalize_mission` (finish) が
-        失敗しても回答文字列は巻き戻さない — `_finalize_mission` の
-        docstring 参照。ask は読み取り専用で資金に影響しないため許容する
-        (`mission_finalize_failed` の activity 記録で無警告にはならない)。"""
+        **(レビュー 2 周目 codex D4)** `finalize_mission` (finish) が
+        失敗しても回答文字列は巻き戻さない。ask は読み取り専用で資金に
+        影響しないため許容する (`mission_finalize_failed` の activity
+        記録で無警告にはならない)。"""
         mid: int | None = None
         finalized = False
         try:
@@ -522,7 +487,8 @@ class TradeLoop:
                 self.watch.end(mid)
 
             with self._core_lock:
-                self._finalize_mission(mid, result)
+                finalize_mission(self.conn, self.activity, self.clock,
+                                 mid, result)
             finalized = True
 
             if result.status != "completed":
@@ -541,8 +507,8 @@ class TradeLoop:
             # ようにする (trade 経路の finally と同じ形)。
             if mid is not None and not finalized:
                 with self._core_lock:
-                    self._finalize_mission(
-                        mid, MissionResult("failed", None, []))
+                    finalize_mission(self.conn, self.activity, self.clock,
+                                     mid, MissionResult("failed", None, []))
 
     # ---- Internal -------------------------------------------------------
 
