@@ -6,16 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from agentic_fx.activity import ActivityLog
+from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_settings
 from agentic_fx.core.accounting import record_snapshot
 from agentic_fx.core.contracts import (
-    ConversionRate, FixedClock, InstrumentSpec, Origin,
+    BrokerResult, ConversionRate, FixedClock, InstrumentSpec, Origin,
     OrderStatus as S, Quote, TradeIntent,
 )
 from agentic_fx.core.executor import (
-    ExecutionSnapshot, Executor, SnapshotCoverageError, _intent_payload,
-    open_risk_and_notional_from_snapshot,
+    CloseSnapshot, ExecutionSnapshot, Executor, SnapshotCoverageError,
+    _intent_payload, open_risk_and_notional_from_snapshot,
 )
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
@@ -355,6 +355,7 @@ def test_close_from_snapshot_rejects_stale_snapshot(tmp_path):
     iid = _insert_intent(ex.conn, mid, intent)
     snapshot = ex.gather_close_snapshot(row)
     stale = snapshot.__class__(
+        pair=snapshot.pair,
         price=snapshot.price, spec=snapshot.spec, rate=snapshot.rate,
         rate_degraded=snapshot.rate_degraded,
         captured_at=snapshot.captured_at - timedelta(seconds=999))
@@ -506,148 +507,169 @@ def test_close_order_from_snapshot_rejects_mismatched_pair(tmp_path):
 
 
 def test_open_from_snapshot_rejects_when_account_snapshot_missing(tmp_path):
-    """B1: account snapshot が無いと拒否 (fail-closed)。"""
+    """B1: commit-core 開始時に account snapshot が無ければ fail-closed。
+
+    `_make_executor` は常に `record_snapshot` を呼ぶため、この分岐は
+    レビュー 2 周目まで一度も falsy になっていなかった (変異 SURVIVED)。
+    """
     ex = _make_executor(tmp_path)
     intent = _open_intent(pair="USDJPY")
     mid = _start_trade_mission(ex.conn)
     iid = _insert_intent(ex.conn, mid, intent)
     snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
-    
-    # account snapshot を削除
-    ex.conn.execute("DELETE FROM snapshots")
+
+    # commit-pre 後・commit-core 前に account snapshot が失われた状況を模す
+    ex.conn.execute("DELETE FROM account_snapshots")
     ex.conn.commit()
-    
-    out = ex.open_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0)
+
+    out = ex.open_from_snapshot(intent, iid, snapshot,
+                                max_snapshot_age_sec=999.0)
     assert out["result"] == "rejected"
     assert "no fresh account snapshot" in out["reasons"][0].lower()
+    # 拒否は「発注しない」まで意味する
+    assert orders.list_by_status(ex.conn, S.SUBMITTING, S.OPEN,
+                                 S.PENDING_FILL) == []
 
 
 def test_close_from_snapshot_rejects_when_row_already_closed(tmp_path):
-    """B2: row がもう CLOSED していると拒否 (commit-pre 後の二重クローズ防止)。"""
+    """B2: commit-pre 後に SL/TP 監視が既にクローズしていたら拒否する。
+
+    設計書 §3.1 の「commit-core で row の現況を再確認する」意図そのもの。
+    レビュー 2 周目まで変異 SURVIVED だった (二重クローズを防いでいる
+    ことを誰も確かめていなかった)。
+    """
     ex = _make_executor(tmp_path)
     row = _insert_open_order(ex.conn, pair="USDJPY")
     mid = _start_trade_mission(ex.conn)
     intent = _close_intent(order_id=row["id"])
     iid = _insert_intent(ex.conn, mid, intent)
     snapshot = ex.gather_close_snapshot(row)
-    
-    # row を先に CLOSED へ (SL/TP 監視が閉じてしまった状況)
-    transitions.transition(ex.conn, row["id"], S.CLOSED, NOW, close_price=148.50)
-    
-    out = ex.close_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0)
+
+    # commit-pre 後・commit-core 前に SL/TP 監視が閉じてしまった状況を模す
+    orders.update_fields(ex.conn, row["id"], now=NOW, status=S.CLOSED,
+                         close_price=148.50, realized_pnl=1234.0,
+                         closed_at=NOW.isoformat())
+
+    out = ex.close_from_snapshot(intent, iid, snapshot,
+                                 max_snapshot_age_sec=999.0)
     assert out["result"] == "rejected"
     assert "not open" in out["reasons"][0].lower()
-    
-    # 二重クローズが起きていないこと (close_price/realized_pnl が上書きされていない)
+
+    # 二重クローズが起きていないこと (先の約定結果が上書きされていない)
     updated = orders.get(ex.conn, row["id"])
     assert updated["status"] == S.CLOSED.value
     assert updated["close_price"] == 148.50
+    assert updated["realized_pnl"] == 1234.0
+
+
+class _StubBroker:
+    """BrokerResult 分岐テスト用 (tests/core/test_executor.py と同型)。"""
+
+    def __init__(self, close_status="ok"):
+        self.close_status = close_status
+
+    def equity(self):
+        return 1_000_000, 1_000_000
+
+    def close(self, order_row, price, reason):
+        if self.close_status == "raise":
+            raise RuntimeError("close timeout")
+        return BrokerResult(status=self.close_status)
 
 
 def test_close_order_from_snapshot_rejects_when_broker_fails(tmp_path):
-    """B3: broker が失敗すると CLOSE_UNKNOWN、realized_pnl は書かない。"""
-    from tests.core.test_executor import StubBroker
-    
-    ex = _make_executor(tmp_path / "a")
+    """B3: broker が ok を返さなければ CLOSE_UNKNOWN。closed 扱いにしない。
+
+    レビュー 2 周目まで変異 SURVIVED だった (snapshot 経路の broker 失敗
+    分岐を誰も踏んでいなかった)。
+    """
+    ex = _make_executor(tmp_path, broker=_StubBroker(close_status="unknown"))
     row = _insert_open_order(ex.conn, pair="USDJPY")
-    snapshot = ex.gather_close_snapshot(row)
-    
-    # broker が失敗する executor
-    fail_broker = StubBroker(conn=ex.conn, settings=SETTINGS,
-                             clock=FixedClock(NOW), close_status="unknown")
-    ex2 = _make_executor(tmp_path / "b", broker=fail_broker)
-    row2 = _insert_open_order(ex2.conn, pair="USDJPY")
-    snapshot2 = CloseSnapshot(pair="USDJPY", price=QUOTE.bid, spec=SPECS["USDJPY"],
-                              rate=ConversionRate(1.0, "USD", "JPY", (NOW,)),
-                              rate_degraded=False, captured_at=NOW)
-    
-    result = ex2.close_order_from_snapshot(row2, snapshot2, reason="test")
-    assert result == S.CLOSE_UNKNOWN
-    
-    updated = orders.get(ex2.conn, row2["id"])
+    snapshot = CloseSnapshot(
+        pair="USDJPY", price=QUOTE.bid, spec=SPECS["USDJPY"],
+        rate=ConversionRate(1.0, "JPY", "JPY", (NOW,)),
+        rate_degraded=False, captured_at=NOW)
+
+    final = ex.close_order_from_snapshot(row, snapshot, reason="llm_close")
+
+    assert final == S.CLOSE_UNKNOWN
+    updated = orders.get(ex.conn, row["id"])
     assert updated["status"] == S.CLOSE_UNKNOWN.value
-    assert updated["realized_pnl"] is None  # 計算されていない
+    # 結果不明を closed 扱いにしない (設計書 §12)
+    assert updated["realized_pnl"] is None
+    assert updated["closed_at"] is None
 
 
-def test_open_from_snapshot_matches_with_drawdown_for_kill_switch(tmp_path):
-    """B4: kill_switch_latched が一致することを確認 (drawdown ケース)。"""
+def test_open_from_snapshot_matches_handle_intent_on_kill_switch_latch(tmp_path):
+    """B4: kill switch のラッチという**副作用**が両経路で一致すること。
+
+    レビュー 1 周目で追加した assert は intent が kill switch と無関係
+    だったため `False == False` の恒真だった。ここでは drawdown を実際に
+    踏ませ、**両経路とも False から True へ遷移する**ことを確かめる。
+    """
     ex1 = _make_executor(tmp_path / "a")
     ex2 = _make_executor(tmp_path / "b")
-    
-    # drawdown を超えるように account を調整
-    record_snapshot(ex1.conn, now=NOW, balance=970_000, equity=970_000)  # 3% DD
+    # DD 3% — tests/core/test_executor.py::test_kill_switch_latches と同じ作り
+    record_snapshot(ex1.conn, now=NOW, balance=970_000, equity=970_000)
     record_snapshot(ex2.conn, now=NOW, balance=970_000, equity=970_000)
-    
-    # SL が drawdown 判定を引き起こす intent (または手動で state をセット)
-    # ここでは kill_switch_latched を手動で True にして、両経路の一致を確認
-    ex1.state.update(kill_switch_latched=True)
-    ex2.state.update(kill_switch_latched=True)
-    
-    # gate が却下する別の理由を持つ intent
-    intent = _open_intent(pair="USDJPY", stop_loss=100.00)
-    
+
+    # 前提: まだラッチされていない (恒真 assert 防止)
+    assert ex1.state.load().kill_switch_latched is False
+    assert ex2.state.load().kill_switch_latched is False
+
+    intent = _open_intent(pair="USDJPY")
+
     mid1 = _start_trade_mission(ex1.conn)
     out1 = ex1.handle_intent(intent, mid1)
-    
+
     mid2 = _start_trade_mission(ex2.conn)
     iid2 = _insert_intent(ex2.conn, mid2, intent)
     snapshot = ex2.gather_open_snapshot(intent, exposure_pairs=[])
-    out2 = ex2.open_from_snapshot(intent, iid2, snapshot, max_snapshot_age_sec=999.0)
-    
-    assert out1["result"] == "rejected"
-    assert out2["result"] == "rejected"
-    # 副作用が一致
-    assert (ex1.state.load().kill_switch_latched
-            == ex2.state.load().kill_switch_latched)
+    out2 = ex2.open_from_snapshot(intent, iid2, snapshot,
+                                  max_snapshot_age_sec=999.0)
+
+    assert out1["result"] == out2["result"] == "rejected"
+    assert out1["reasons"] == out2["reasons"]
+    # 本命: 副作用 (ラッチ) が両経路で発生していること
+    assert ex1.state.load().kill_switch_latched is True
+    assert ex2.state.load().kill_switch_latched is True
 
 
-def test_close_order_from_snapshot_records_degraded_with_cache_warmup(tmp_path):
-    """B5: rate degraded フラグが activity に記録されること (キャッシュ温め)。"""
-    calls: list[str] = []
+def test_close_order_from_snapshot_computes_pnl_from_degraded_rate(tmp_path):
+    """B5: degraded でも「最後の健全レート」で pnl を計算する分岐を踏む。
 
-    def rec_quote_fn(pair):
-        return QUOTE
-
-    def rec_spec_fn(pair):
-        return SPECS[pair]
-
+    レビュー 1 周目で追加したテストは、失敗する rate_fn を持つ Executor に
+    対して `resolve_close_rate` を呼んでいたため**キャッシュが温まらず**、
+    `snapshot.rate is None` の「pnl 計算せず」分岐しか踏んでいなかった。
+    ここでは健全な rate_fn でキャッシュを温めてから差し替える。
+    """
     def fail_rate_fn(ccy, account_ccy, now):
-        calls.append(f"rate_fn:{ccy}")
-        raise DataUnhealthy(f"rate unavailable")
+        raise DataUnhealthy(f"rate unavailable for {ccy}")
 
-    # commit-pre 相: 健全な rate_fn で snapshot と キャッシュを作成
-    healthy_ex = _make_executor(tmp_path / "pre")
-    row_pre = _insert_open_order(healthy_ex.conn, pair="USDJPY")
-    # 健全なレートを resolve_close_rate でキャッシュ
-    healthy_ex.resolve_close_rate("JPY", NOW)
-    snapshot = healthy_ex.gather_close_snapshot(row_pre)
-    assert snapshot.rate is not None
-    assert snapshot.rate_degraded is False
+    ex = _make_executor(tmp_path)
+    row = _insert_open_order(ex.conn, pair="USDJPY")
 
-    # commit-core 相: 失敗する rate_fn を差し替え
-    ex = _make_executor(tmp_path / "core", quote_fn=rec_quote_fn,
-                        spec_fn=rec_spec_fn, rate_fn=fail_rate_fn)
-    # キャッシュを継承 (属性差し替えなので同じ _last_good_rate を使う設計)
-    # 実際には新しい Executor なので、前もってキャッシュさせておく
-    ex.resolve_close_rate("JPY", NOW)  # 健全なレートをキャッシュ
-    
-    # 失敗する rate_fn に差し替え
+    # 健全な rate_fn でキャッシュを温める (_last_good_rate に入る)
+    healthy_rate, degraded = ex.resolve_close_rate("JPY", NOW)
+    assert healthy_rate is not None and degraded is False
+
+    # commit-pre 相: レート取得が失敗するようになった
     ex.rate_fn = fail_rate_fn
-    
-    row_core = _insert_open_order(ex.conn, pair="USDJPY")
-    # snapshot を再度取得 (この時点で rate_fn は失敗するので degraded=True になるはず)
-    # だが、snapshot は健全な時点で取得済みなので使う
-    ex.close_order_from_snapshot(row_core, snapshot, reason="llm_close")
+    snapshot = ex.gather_close_snapshot(row)
 
-    # activity に close_pnl_rate_degraded が記録されたか
-    # (snapshot.rate_degraded が False なので書かれないが、実装確認用)
-    activity_log = ex.activity.tail(n=100, category=Category.TRADE)
-    # snapshot.rate_degraded=False なので記録されない (期待通り)
+    # 本命の分岐を踏んでいることを明示する — rate は残っていて degraded
+    assert snapshot.rate is not None, "degraded フォールバックが効いていない"
+    assert snapshot.rate_degraded is True
 
-    # 正しくは degraded=True で snapshot を取る必要がある
-    # しかし、現在の実装では gather_close_snapshot は always_fail_rate_fn を使わないので
-    # snapshot.rate_degraded は False のまま。この試験は「実装がキャッシュを使っている」ことを
-    # 確認する意図だった。ここでは削除して別テストに統合すべき。
+    ex.close_order_from_snapshot(row, snapshot, reason="llm_close")
+
+    updated = orders.get(ex.conn, row["id"])
+    assert updated["status"] == S.CLOSED.value
+    # degraded でも pnl は計算される (最後の健全レートを使う — 設計書 §5)
+    assert updated["realized_pnl"] is not None
+    trade_log = ex.activity.tail(n=100, category=Category.TRADE)
+    assert any("close_pnl_rate_degraded" in line for line in trade_log), \
+        f"degraded の activity 記録が無い: {trade_log}"
 
 
 def test_open_from_snapshot_performs_no_external_io_returns_opened_result(tmp_path):
