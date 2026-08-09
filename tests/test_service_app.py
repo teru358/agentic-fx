@@ -219,7 +219,9 @@ def test_on_trade_mission_runs_loop_and_reflection(tmp_path):
         # 重要: Future.result() を patch の内側で呼ぶ
         with _no_real_network(), \
              patch.object(MissionSupervisor, "try_submit", spy_try_submit), \
-             patch.object(app.provider, "healthcheck", return_value="yfinance"):
+             patch.object(app.provider, "healthcheck", return_value="yfinance"), \
+             patch.object(app.trade_loop.provider, "healthcheck",
+                          return_value="yfinance"):
             app.scheduler.tick(NOW)
             assert captured, "no Future was captured"
             assert captured[0] is not None
@@ -270,7 +272,9 @@ def test_on_trade_mission_wrapper_also_runs_reflection(tmp_path):
         # 重要: Future.result() を patch の内側で呼ぶ
         with _no_real_network(), \
              patch.object(MissionSupervisor, "try_submit", spy_try_submit), \
-             patch.object(app.provider, "healthcheck", return_value="yfinance"):
+             patch.object(app.provider, "healthcheck", return_value="yfinance"), \
+             patch.object(app.trade_loop.provider, "healthcheck",
+                          return_value="yfinance"):
             app.scheduler.tick(NOW)
             assert captured, "no Future was captured"
             assert captured[0] is not None
@@ -320,7 +324,9 @@ def test_tick_propagates_trigger_to_missions_row(tmp_path):
         # (非同期実行なので patch が効いている間に完了させる)
         with _no_real_network(), \
              patch.object(MissionSupervisor, "try_submit", spy_try_submit), \
-             patch.object(app.provider, "healthcheck", return_value="yfinance"):
+             patch.object(app.provider, "healthcheck", return_value="yfinance"), \
+             patch.object(app.trade_loop.provider, "healthcheck",
+                          return_value="yfinance"):
             app.scheduler.tick(NOW)
             # Future が返されたことを確認
             assert captured, "no Future was captured (on_trade_mission not called)"
@@ -1327,3 +1333,13 @@ def test_conn_supervisor_is_readonly(tmp_path):
         app.conn_supervisor.execute(
             "INSERT INTO missions(loop, runner, model, status, "
             "started_at) VALUES ('trade', 'local', 'x', 'running', 'x')")
+
+
+def test_trade_loop_healthcheck_provider_is_readonly(tmp_path):
+    """裁定書 F-6 (CR-5): TradeLoop.provider (healthcheck 専用) は
+    conn_supervisor (RO) で構築されている — conn_core への書込可能な
+    provider を healthcheck に使っていないことの配線確認。"""
+    _init(tmp_path)
+    app = build_app(tmp_path)
+    assert app.trade_loop.provider.conn is app.conn_supervisor
+    assert app.trade_loop.provider.readonly is True

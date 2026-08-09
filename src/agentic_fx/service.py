@@ -461,33 +461,49 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         policy = Policy(root / "policy" / "directives.md")
         # 上書き 3: MissionWatch は 1 インスタンスを trade_loop / reflection に共有注入
         mission_watch = MissionWatch()
+
+        core_lock = threading.RLock()
+
+        # プラン 8 (Task 15, レビュー反映1回目 裁定書 F-6/CR-5): TradeLoop の
+        # provider は healthcheck 専用 (lock 外で呼ばれる) — 書込可能な
+        # conn_core 版を渡すと healthcheck 内の get_bars が無保護で conn_core
+        # を書き込む (Global Constraints 違反)。conn_supervisor (RO) +
+        # readonly=True で構築した専用インスタンスを渡す。
+        # 注意: readonly=True のため healthcheck はもう ohlcv キャッシュを
+        # 温めない (get_bars/derive の upsert_bars がスキップされる) —
+        # これは意図した挙動であり退行ではない。CR-4 と同じ理由でキャッシュの
+        # 一次的な書き手は scheduler tick (mark-to-market 等、既存の conn_core
+        # 版 provider) であり続けるため、healthcheck が書かなくてもキャッシュ
+        # 鮮度は保たれる。
+        healthcheck_provider = PriceProvider(conn_supervisor, settings, clock,
+                                             readonly=True)
         trade_loop = TradeLoop(conn=conn_core, runner=runner, settings=settings,
-                               executor=executor, provider=provider, econ=econ,
-                               policy=policy, activity=activity,
+                               executor=executor, provider=healthcheck_provider,
+                               econ=econ, policy=policy, activity=activity,
                                notifier=notifier, clock=clock,
+                               core_lock=core_lock, conn_supervisor=conn_supervisor,
                                watch=mission_watch)
         reflection = ReflectionCycle(conn=conn_core, runner=runner, rag=rag,
                                      settings=settings, activity=activity,
                                      clock=clock, watch=mission_watch)
 
-        core_lock = threading.RLock()
-
-        # プラン 8 (段階分け — Task 13 では lock の保持範囲を変えない):
-        # trade/reflection/ask の実行は引き続き呼び出し全体を core_lock で
-        # 包む。scheduler tick との直列性を維持したまま、Mission 呼び出しの
-        # 主体を scheduler スレッドから supervisor スレッドへ移す (ロック
-        # 粒度の再設計は Task 15/16)。
         def _trade_fn(trigger: str):
-            with core_lock:
-                return trade_loop.run_once(trigger)
+            # プラン 8 (Task 15): TradeLoop 自身が prepare/commit-core で
+            # core_lock を保持する五相構造になったため、ここでは lock を
+            # 掴まない (二重取得は RLock で技術的には安全だが、run 相の
+            # 間ずっと lock を保持したままになり Task 15 の目的を無効化する)。
+            return trade_loop.run_once(trigger)
 
         def _reflection_fn():
+            # ReflectionCycle は Task 16 で五相再構成するまで、呼び出し全体
+            # を lock で包む現状維持。
             with core_lock:
                 return reflection.run_pending()
 
         def _ask_fn(question: str) -> str:
-            with core_lock:
-                return trade_loop.ask_once(question)
+            # プラン 8 (Task 15): TradeLoop.ask_once も三相構造になったため
+            # ここでは lock を掴まない。
+            return trade_loop.ask_once(question)
 
         supervisor = MissionSupervisor(
             trade_fn=_trade_fn, reflection_fn=_reflection_fn, ask_fn=_ask_fn)

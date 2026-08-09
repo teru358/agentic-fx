@@ -62,6 +62,8 @@ def test_phase1_full_cycle(tmp_path):
     app.supervisor.start()
     try:
         with patch.object(app.provider, "healthcheck", return_value="test"), \
+             patch.object(app.trade_loop.provider, "healthcheck",
+                          return_value="test"), \
              _no_real_network():
             # tick 1: 毎時 Mission → 指値発注
             app.scheduler.tick(WED)
