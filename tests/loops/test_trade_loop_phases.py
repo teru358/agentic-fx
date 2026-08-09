@@ -419,3 +419,92 @@ def test_signals_consume_failure_is_caught_and_recorded(tmp_path):
     # 「running のまま残らない」こと。
     assert m["status"] != "running", "mission が running のまま残っている"
     assert m["status"] == "completed"
+
+
+# ---- `_finalize_mission` の lock 保持 (指揮者の変異スイープ・レビュー 3 周目)
+#
+# KAT-Coder のレビュー指摘 (「これらの経路にテストが無い」) を指揮者が実測し、
+# **3 経路すべてで `with self._core_lock:` を外しても全 1649 件が緑**
+# (SURVIVED) であることを確認した。`_finalize_mission` は `missions.finish`
+# で `conn_core` を書き込むので、lock 非保持は Global Constraints 違反。
+#
+# なお KAT の**修正案は誤り**だった (「lock を外せ」と主張していた)。
+# 正しいのは「lock は必須、テストが無いのが穴」である。
+
+
+def _assert_core_lock_held_during(loop, target_module_path, *, run,
+                                  reached_msg):
+    """`target_module_path` が呼ばれている**最中**に、別スレッドから
+    `core_lock` を取得できないことを確認する共通ヘルパー。
+
+    RLock は同一スレッドからの `acquire(blocking=False)` が常に成功する
+    (再入可能) ため、**必ず別スレッド (checker) から確かめる**。
+    """
+    entered = threading.Event()
+    proceed = threading.Event()
+    import agentic_fx.store.missions as missions_store
+    original = getattr(missions_store, target_module_path)
+
+    def spy(*args, **kwargs):
+        entered.set()
+        assert proceed.wait(5.0), "checker スレッドが確認を完了しなかった"
+        return original(*args, **kwargs)
+
+    with patch(f"agentic_fx.loops.trade_loop.missions.{target_module_path}",
+               spy):
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        assert entered.wait(5.0), reached_msg
+
+        acquired: list[bool] = []
+        checker = threading.Thread(
+            target=lambda: acquired.append(
+                loop._core_lock.acquire(blocking=False)))
+        checker.start()
+        checker.join(timeout=5.0)
+        if acquired and acquired[0]:
+            loop._core_lock.release()
+        assert acquired == [False], (
+            "`_finalize_mission` (missions.finish) は core_lock 保持中に"
+            "呼ばれるはず — conn_core への書込だから")
+
+        proceed.set()
+        t.join(timeout=5.0)
+        assert not t.is_alive()
+
+
+def test_finalize_mission_holds_core_lock_on_mission_failed(tmp_path):
+    """runner が completed 以外を返した経路 (commit-pre 相の早期 return) でも
+    `_finalize_mission` は core_lock 保持中に呼ばれる。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "timeout", None, [])])
+    _assert_core_lock_held_during(
+        loop, "finish", run=lambda: loop.run_once("cron"),
+        reached_msg="mission_failed 経路の finalize に到達しなかった")
+
+
+def test_finalize_mission_holds_core_lock_on_intent_parse_error(tmp_path):
+    """LLM 出力が intent として解釈できなかった経路でも
+    `_finalize_mission` は core_lock 保持中に呼ばれる。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "not_a_valid_action"}, [])])
+    _assert_core_lock_held_during(
+        loop, "finish", run=lambda: loop.run_once("cron"),
+        reached_msg="intent_parse_failed 経路の finalize に到達しなかった")
+
+
+def test_finalize_mission_holds_core_lock_on_unexpected_exception(tmp_path):
+    """想定外の例外で外側 finally が fail-closed finalize する経路でも
+    `_finalize_mission` は core_lock 保持中に呼ばれる。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "x"}, [])])
+    # **commit-core の except では捕まらない位置**で想定外例外を起こす。
+    # `record_and_validate_intent` を壊すと commit-core 内の
+    # `except Exception` が先に `_finalize_mission` を呼んでしまい
+    # (そこは lock 内なので保護済み)、外側 finally の未終端 finalize
+    # には到達しない — 実測で確認済み。`watch.begin` は run 相の手前・
+    # 内側 try の外なので、ここを壊すと外側 finally だけが finalize する。
+    loop.watch.begin = MagicMock(side_effect=RuntimeError("boom"))
+    _assert_core_lock_held_during(
+        loop, "finish", run=lambda: loop.run_once("cron"),
+        reached_msg="finally の未終端 finalize に到達しなかった")
