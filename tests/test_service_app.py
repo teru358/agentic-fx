@@ -107,6 +107,64 @@ def test_build_app_wires_one_stop_event_to_scheduler_and_worker(tmp_path):
         app.close()
 
 
+def test_build_app_activity_write_failure_actually_latches_health(tmp_path):
+    """レビュー1周目 I-2a: `on_write_failure` が「渡されている」ではなく
+    「効いている」ことを確認する。
+
+    旧テストは配線の有無しか見ておらず、`build_app` から
+    `on_write_failure=` を**丸ごと削除しても全件 1709 passed** だった
+    (指揮者が実測)。「配線されているが誰も効かない」型の欠陥をこのピンで
+    捕まえる。
+    """
+    from agentic_fx.activity import Category
+
+    _init(tmp_path)
+    app = build_app(tmp_path, clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    try:
+        assert app.health_latch.is_latched() is False
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+
+        # ActivityLog は「write は例外を送出しない」契約なので、失敗は
+        # コールバック経由でしか観測できない。
+        with patch.object(type(app.activity._path), "open", boom):
+            app.activity.write(Category.SYSTEM, "x", "y")
+
+        assert app.health_latch.is_latched() is True, (
+            "activity 書き込み失敗が health latch に届いていない "
+            "(build_app の on_write_failure 配線が効いていない)")
+        assert "activity write failed" in app.health_latch.summary()[0]
+    finally:
+        app.close()
+
+
+def test_build_app_rpc_leak_callback_latches_health_and_sets_stop(tmp_path):
+    """レビュー1周目 I-2b: `_on_rpc_leak` の中身が効いていることを確認する。
+
+    旧テストは `_on_rpc_leak is not None` しか見ておらず、閉包から
+    `stop_event.set()` の 1 行を削除しても全件緑だった (指揮者が実測)。
+    RPC leak は「dispatcher スレッドが二度と回収されない」状態なので、
+    latch だけでなく**停止まで到達する**ことが要件 (設計書 §4.3 codex I3-1)。
+    """
+    _init(tmp_path)
+    stop_event = threading.Event()
+    app = build_app(tmp_path, clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding(), stop_event=stop_event)
+    try:
+        assert app.health_latch.is_latched() is False
+        assert stop_event.is_set() is False
+
+        app.runner._on_rpc_leak()
+
+        assert app.health_latch.is_latched() is True
+        assert stop_event.is_set() is True, (
+            "RPC leak が停止シーケンスを起動していない")
+    finally:
+        app.close()
+
+
 def test_build_app_registers_get_signals(tmp_path):
     """⑦プラン 7 Task 9: signal_tools.build が service に配線され、起動時
     _assert_tools_registered を通ること (build_app 相当の起動テスト)。"""
@@ -838,6 +896,55 @@ def test_run_service_derives_supervisor_join_timeout_from_dispatch_ceiling(
 
     assert rc == 0
     assert recorded.get("timeout") == pytest.approx((42.0 + 3.0 + 2.0) * 4 + 60.0)
+
+
+def test_watchdog_ceiling_and_join_budget_come_from_the_same_value(tmp_path):
+    """裁定 B の順序関係 (join budget >= watchdog の dispatch ceiling) を
+    実際の呼び出しで固定する。
+
+    (レビュー1周目 I-3) 旧ピンは `_default_dispatch_ceiling_sec` を 2 回
+    呼んで比較する**恒真テスト**で、watchdog 側の呼び出しを
+    `dispatch_ceiling_sec=30.0` に書き換える変異が全件緑のまま生存した
+    (指揮者が実測)。**join budget が ceiling より小さいと main が先に join
+    を諦め、watchdog の `busy_since` 軸が構造的に到達不能になり
+    `fatal_reason` がその経路で永久にラッチしない。**
+
+    あわせて「watchdog は最初のチェックを 30 秒待たずに行う」ことも固定
+    する — 待ちが先だと起動直後 30 秒はスレッド死亡を検出できない盲窓に
+    なる (このテストが 30 秒でタイムアウトしないこと自体がその pin)。
+    """
+    app = _seam_app(tmp_path, FakeRunner([]))
+    app.settings.llama_swap.timeout_sec = 42.0
+    app.settings.worker.worker_grace_sec = 3.0
+    app.settings.worker.worker_terminate_grace_sec = 2.0
+
+    stop_event = threading.Event()
+    recorded: dict = {}
+    original_join = app.supervisor.join
+
+    def spy_join(timeout=None):
+        recorded["join_budget"] = timeout
+        return original_join(timeout=timeout)
+
+    app.supervisor.join = spy_join
+
+    def fake_watchdog_check(app_, thread_, stop_, **kwargs):
+        recorded.setdefault("ceiling", kwargs.get("dispatch_ceiling_sec"))
+        stop_.set()   # 1 回観測したら停止させる
+
+    with _no_real_network(), \
+         patch("agentic_fx.service.build_app", return_value=app), \
+         patch("agentic_fx.service.signal.signal"), \
+         patch("agentic_fx.service._watchdog_check", fake_watchdog_check):
+        run_service(tmp_path, daemon=True, _stop_event=stop_event)
+
+    assert recorded.get("ceiling") is not None, (
+        "watchdog が dispatch_ceiling_sec を明示的に受け取っていない "
+        "(join budget と独立に既定値へ落ちると順序関係を保証できない)")
+    assert recorded["join_budget"] >= recorded["ceiling"], (
+        f"join budget ({recorded['join_budget']}) が watchdog の "
+        f"dispatch ceiling ({recorded['ceiling']}) より小さい — "
+        "main が先に join を諦めるため busy_since 軸が到達不能になる")
 
 
 def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path):

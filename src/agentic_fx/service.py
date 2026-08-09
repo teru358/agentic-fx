@@ -710,7 +710,14 @@ def _watchdog_tick(app: App) -> None:
 def _record_fatal(app: App, stop_event: threading.Event, reason: str) -> None:
     if app.fatal_reason is None:
         app.fatal_reason = reason
-    app.activity.write(Category.SYSTEM, "fatal_thread_death", reason)
+    # レビュー1周目 C-1: 記録・通知の**どちらの失敗でも** stop_event.set()
+    # へ到達させる。ここが無防備だと、呼び出し元 (watchdog/scheduler) は
+    # `except Exception` で握って周期的に同じ経路を再実行し、毎回同じ行で
+    # 落ちるため**停止が永久にトリガーされない** (fatal_reason だけが立つ)。
+    try:
+        app.activity.write(Category.SYSTEM, "fatal_thread_death", reason)
+    except Exception:  # noqa: BLE001
+        _log.exception("failed to record fatal_thread_death")
     try:
         app.notifier.send(f"[agentic-fx] 致命的エラー: {reason} — 停止します")
     except Exception:  # noqa: BLE001
@@ -729,6 +736,14 @@ def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,
                     stop_event: threading.Event, *,
                     heartbeat_grace_sec: float = 30.0,
                     dispatch_ceiling_sec: float | None = None) -> None:
+    # レビュー1周目 I-3 に伴う追加: **停止シーケンスが始まっていたら何も
+    # 判定しない。** 停止中は main が supervisor を shutdown しスレッドが
+    # 順に終了していくため、その終了を「死亡」と誤認して fatal をラッチ
+    # すると graceful な停止が終了コード 1 になる。停止の実行主体は常に
+    # main であり、停止中の監視は不要 (scheduler→watchdog 方向にも同じ
+    # ガードが既にある)。
+    if stop_event.is_set():
+        return
     if not scheduler_thread_obj.is_alive():
         _record_fatal(app, stop_event, "scheduler thread is dead")
         return
@@ -821,17 +836,27 @@ def run_service(root: Path, *, daemon: bool = False,
                         _log.exception("watchdog health check failed")
             stop_event.wait(1)
 
+    # レビュー1周目 I-3: dispatch ceiling は**ここで 1 度だけ**求め、
+    # watchdog のチェックと supervisor.join の budget が同じ値を共有する
+    # 構造にする。両者が独立に同じ関数を呼ぶ形だと、片方だけを書き換える
+    # 変異 (実測で全件緑のまま生存) を構造的に防げない。**join budget が
+    # ceiling より小さいと main が先に join を諦め、watchdog の
+    # `busy_since` 軸が構造的に到達不能になり `fatal_reason` がその経路で
+    # 永久にラッチしない** (裁定 B の決め手)。
+    dispatch_ceiling_sec = _default_dispatch_ceiling_sec(app)
+
     def watchdog_thread() -> None:
+        # レビュー1周目 I-3: **チェックを待ちより先に行う。** 以前は
+        # `wait(30)` が先だったため、起動直後 30 秒はスレッド死亡を一切
+        # 検出できない盲窓があった (資金保護が止まっていても気付けない)。
         while not stop_event.is_set():
             app.watchdog_heartbeat = time.monotonic()
-            stop_event.wait(30)
-            if stop_event.is_set():
-                break
-            app.watchdog_heartbeat = time.monotonic()
             try:
-                _watchdog_check(app, th, stop_event)
+                _watchdog_check(app, th, stop_event,
+                                dispatch_ceiling_sec=dispatch_ceiling_sec)
             except Exception:  # noqa: BLE001 — スレッドを殺さない
                 _log.exception("watchdog tick failed")
+            stop_event.wait(30)
 
     # F2 (fix round 1): シグナルハンドラはスレッド起動より**前**に登録する。
     # 以前はスレッド起動後に登録しており、その間に SIGTERM が届くとデフォルト
@@ -842,10 +867,16 @@ def run_service(root: Path, *, daemon: bool = False,
         signal.signal(signal.SIGINT, lambda *_: stop_event.set())
 
     app.supervisor.start()
+    # レビュー1周目 I-3 に伴う修正: **両方を構築してから、監視される側
+    # (scheduler) を先に起動する。** watchdog は起動直後に 1 回目の
+    # チェックを行うため、`th` が「構築済みだが未起動」の状態を見ると
+    # `is_alive() == False` = 「scheduler thread is dead」と誤判定して
+    # graceful な停止が終了コード 1 になる (実測で判明)。構築を両方先に
+    # 済ませてあるので、`scheduler_thread` が参照する `wd` も束縛済み。
     th = threading.Thread(target=scheduler_thread, daemon=True)
     wd = threading.Thread(target=watchdog_thread, daemon=True)
-    wd.start()
     th.start()
+    wd.start()
 
     try:
         if daemon:
@@ -878,8 +909,17 @@ def run_service(root: Path, *, daemon: bool = False,
         # shutdown() 自体はブロックしない (queue 内の未着手ジョブを
         # fail_pending するだけ) ので、位置を早めても th.join() の意味は
         # 変わらない。
-        app.supervisor.shutdown(
-            drain_exc=RuntimeError("service shutting down"))
+        # レビュー1周目 (指揮者所見): `shutdown` → `fail_pending` は
+        # `if not future.done()` の直後に `future.set_exception()` を呼ぶ
+        # ため、supervisor スレッドが間で完了させると `InvalidStateError`
+        # が伝播する。裸で呼ぶと **th.join / app.close / 記録が全て飛ぶ**
+        # (資源リーク + 元の例外が置き換わる)。同ファイルの
+        # `instance_lock.close()` と同じ扱いに揃える。
+        try:
+            app.supervisor.shutdown(
+                drain_exc=RuntimeError("service shutting down"))
+        except Exception:  # noqa: BLE001 — 停止シーケンスは必ず最後まで走らせる
+            _log.exception("supervisor.shutdown() failed during shutdown")
         # scheduler スレッドの終了を確認する。
         # **(レビュー 2 周目 codex D1 — この task が壊した前提の修復)**
         # 旧コメント「tick は core_lock 下で走るため join 完了 = 実行中
@@ -901,14 +941,13 @@ def run_service(root: Path, *, daemon: bool = False,
         # `ask_wait_timeout_sec` (569 行付近) と同じ導出で、Mission が
         # WorkerRunner の preemption エスカレーション (worker_grace_sec →
         # worker_terminate_grace_sec) で確実に終端されるまでの上限を budget
-        # にする。**残存の粗さ**: supervisor の "trade" ジョブは dispatch
-        # 内で trade_fn の後に reflection_fn (最大 3 件を順に処理 —
-        # ReflectionCycle.run_pending の既定 max_items) を連鎖するため、
-        # 理論上の worst case はこの budget を超えうる。完全な導出
-        # (状態機械全体の再設計) は Task 19 の担当とし、ここでは「Mission
-        # 1 回分の timeout と無関係な定数 30 秒」という壊れた対応関係の
-        # 最小修復に留める。
-        supervisor_join_timeout_sec = _default_dispatch_ceiling_sec(app)
+        # にする。**Task 19 で完全な導出に置き換えた**: budget は
+        # `_default_dispatch_ceiling_sec` (trade 1 回 + reflection 最大
+        # 3 件の連鎖を含む) から導出し、watchdog の dispatch ceiling と
+        # **同じローカル変数を共有する**。join budget がそれより小さいと
+        # main が先に join を諦め、watchdog の `busy_since` 軸が構造的に
+        # 到達不能になり `fatal_reason` がその経路で永久にラッチしない。
+        supervisor_join_timeout_sec = dispatch_ceiling_sec
         app.supervisor.join(timeout=supervisor_join_timeout_sec)
         supervisor_still_busy = app.supervisor.is_alive()
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
