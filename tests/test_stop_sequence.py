@@ -162,14 +162,19 @@ def test_scheduler_side_detects_dead_watchdog():
 
 
 def test_busy_resource_mapping_and_exit_code():
-    assert _busy_resources_after_join(False, True) == frozenset(
-        {"conn_core", "conn_supervisor"})
     # (レビュー1周目 I-4) scheduler 単独 busy のケース。旧テストは
     # (False, True) しか通しておらず、`if scheduler_still_busy or ...` の
     # 左辺を落としても全件緑だった (指揮者が実測) — scheduler が join
     # タイムアウトで still-busy なのに `conn_core` を close してしまう
     # fd-safety の退行を見逃す。
-    assert _busy_resources_after_join(True, False) == frozenset({"conn_core"})
+    # (レビュー2周目 codex Critical) `instance_lock` も busy に含める —
+    # 残存スレッドが動いているのに flock を解放すると二重起動が可能になり、
+    # 後発の recover_interrupted が旧 supervisor の running mission を
+    # interrupted に書き換える。
+    assert _busy_resources_after_join(True, False) == frozenset(
+        {"conn_core", "instance_lock"})
+    assert _busy_resources_after_join(False, True) == frozenset(
+        {"conn_core", "conn_supervisor", "instance_lock"})
     assert _busy_resources_after_join(False, False) == frozenset()
     app = _minimal_app(); app.fatal_reason = "fatal"
     assert _exit_code(app, False, False) == 1
@@ -192,3 +197,33 @@ def test_watchdog_check_is_a_noop_once_stopping_has_begun():
 
     assert app.fatal_reason is None, (
         "停止中のスレッド終了を fatal と誤認している")
+
+
+def test_monitoring_does_not_mistake_an_unstarted_thread_for_a_dead_one():
+    """レビュー2周目 codex Important: **起動前と死亡後を区別する。**
+
+    `is_alive()` は start 前でも `False` を返すため、起動順に依存した誤検出が
+    両方向で起きる (実測): ①watchdog が先に起動すると未起動の scheduler を
+    ②scheduler が先だと初回 tick (`last = 0.0` で待ち無し) が未起動の
+    watchdog を、それぞれ死亡と誤判定して正常な起動が終了コード 1 になる。
+    **起動順の入れ替えでは原理的に片方しか塞げない。**
+    """
+    unstarted = type("T", (), {"ident": None,
+                               "is_alive": lambda self: False})()
+    started_then_died = type("T", (), {"ident": 4242,
+                                       "is_alive": lambda self: False})()
+
+    app = _minimal_app(); stop = threading.Event()
+    _watchdog_check(app, unstarted, stop)
+    assert app.fatal_reason is None, "未起動の scheduler を死亡と誤判定している"
+    assert stop.is_set() is False
+
+    app2 = _minimal_app(); stop2 = threading.Event()
+    _check_watchdog_health(app2, unstarted, stop2)
+    assert app2.fatal_reason is None, "未起動の watchdog を死亡と誤判定している"
+
+    # 起動後に死亡した場合は従来どおり検出する (ガードが検出そのものを
+    # 殺していないこと)。
+    app3 = _minimal_app(); stop3 = threading.Event()
+    _check_watchdog_health(app3, started_then_died, stop3)
+    assert app3.fatal_reason == "watchdog thread is dead"

@@ -707,6 +707,22 @@ def _watchdog_tick(app: App) -> None:
         _log.exception("watchdog mark_notified failed")
 
 
+def _thread_has_died(thread_obj) -> bool:
+    """**起動前**と**死亡後**を区別する (レビュー2周目 codex Important)。
+
+    `is_alive()` は「まだ start していないスレッド」でも `False` を返すため、
+    起動順に依存した誤検出が起きる — 実測で両方向が発生した:
+    ①`wd.start()` が先だと watchdog が未起動の scheduler を死亡と誤判定
+    ②`th.start()` が先だと scheduler の初回 tick (`last = 0.0` なので待ち
+    無しで走る) が未起動の watchdog を死亡と誤判定。**起動順を入れ替える
+    だけでは原理的に片方しか塞げない。**
+
+    `Thread.ident` は start 前は `None`、start 後は**死亡後も値が残る**ので、
+    「ident が付いていて、かつ生きていない」= 本当に死んだ、と判定できる。
+    """
+    return getattr(thread_obj, "ident", 1) is not None and not thread_obj.is_alive()
+
+
 def _record_fatal(app: App, stop_event: threading.Event, reason: str) -> None:
     if app.fatal_reason is None:
         app.fatal_reason = reason
@@ -744,7 +760,7 @@ def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,
     # ガードが既にある)。
     if stop_event.is_set():
         return
-    if not scheduler_thread_obj.is_alive():
+    if _thread_has_died(scheduler_thread_obj):
         _record_fatal(app, stop_event, "scheduler thread is dead")
         return
     if not app.supervisor.is_alive():
@@ -768,7 +784,7 @@ def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,
 def _check_watchdog_health(app: App, watchdog_thread_obj: threading.Thread,
                            stop_event: threading.Event, *,
                            wd_heartbeat_grace_sec: float = 90.0) -> None:
-    if not watchdog_thread_obj.is_alive():
+    if _thread_has_died(watchdog_thread_obj):
         _record_fatal(app, stop_event, "watchdog thread is dead")
         return
     if time.monotonic() - app.watchdog_heartbeat > wd_heartbeat_grace_sec:
@@ -780,6 +796,14 @@ def _busy_resources_after_join(scheduler_still_busy: bool,
     busy: set[str] = set()
     if scheduler_still_busy or supervisor_still_busy:
         busy.add("conn_core")
+        # レビュー2周目 codex Critical: `instance_lock` は単なる close 対象
+        # ではなく**残存 App 全体の単一起動所有権**を表す。残存スレッドが
+        # 旧 App の DB/broker/runner を使っているのに flock を解放すると、
+        # 別プロセス (または同一プロセスの再 build_app) が起動でき、後発の
+        # `recover_interrupted` が**旧 supervisor がまだ処理している
+        # `running` mission を `interrupted` に書き換える**。設計書 §5.6 の
+        # 「使用中資源は閉じず leak を選ぶ」はこの資源にも適用される。
+        busy.add("instance_lock")
     if supervisor_still_busy:
         busy.add("conn_supervisor")
     return frozenset(busy)
@@ -867,12 +891,13 @@ def run_service(root: Path, *, daemon: bool = False,
         signal.signal(signal.SIGINT, lambda *_: stop_event.set())
 
     app.supervisor.start()
-    # レビュー1周目 I-3 に伴う修正: **両方を構築してから、監視される側
-    # (scheduler) を先に起動する。** watchdog は起動直後に 1 回目の
-    # チェックを行うため、`th` が「構築済みだが未起動」の状態を見ると
-    # `is_alive() == False` = 「scheduler thread is dead」と誤判定して
-    # graceful な停止が終了コード 1 になる (実測で判明)。構築を両方先に
-    # 済ませてあるので、`scheduler_thread` が参照する `wd` も束縛済み。
+    # **起動順に依存しない。** 監視側は `_thread_has_died` (ident で
+    # 起動前/死亡後を区別) を使うため、どちらを先に起動しても
+    # 「構築済みだが未起動」を死亡と誤判定しない。1 周目で起動順の
+    # 入れ替えを試みたが、それでは逆方向のレース (scheduler の初回 tick が
+    # 未起動の watchdog を見る) が開くだけだった (レビュー2周目 codex)。
+    # 構築を両方先に済ませるのは `scheduler_thread` が参照する `wd` を
+    # 束縛しておくため。
     th = threading.Thread(target=scheduler_thread, daemon=True)
     wd = threading.Thread(target=watchdog_thread, daemon=True)
     th.start()
