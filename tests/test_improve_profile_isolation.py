@@ -151,6 +151,20 @@ _ISOLATION_PROBE_SCRIPT = textwrap.dedent("""
     except Exception as e:  # noqa: BLE001
         results["name_resolution"] = f"UNEXPECTED_FAILURE: {type(e).__name__}: {e}"
 
+    # 名前解決だけでなく **実際に socket を張るところまで**踏む。
+    # llama-swap が起動していない環境でも判定できるよう、
+    # `ConnectionRefusedError` (= 解決も接続試行も成立した) は ok 扱いにし、
+    # `gaierror` / `PermissionError` (= Landlock が経路を塞いだ) だけを
+    # 失敗とする。これで「起動できる」ではなく「LLM へ到達できる」を測る。
+    try:
+        import socket
+        socket.create_connection(("localhost", 8080), timeout=3).close()
+        results["llm_endpoint_reachable"] = "ok"
+    except ConnectionRefusedError:
+        results["llm_endpoint_reachable"] = "ok (refused — 経路は生きている)"
+    except Exception as e:  # noqa: BLE001
+        results["llm_endpoint_reachable"] = f"UNEXPECTED_FAILURE: {type(e).__name__}: {e}"
+
     # 裁定書 FC-5 (d) positive control: allowlist 内は実際に成功する
     # ことを積極的に示す (全滅していないことの証明)。
     try:
@@ -203,6 +217,9 @@ def test_improve_profile_cannot_reach_data_dir(tmp_path):
     assert "'name_resolution': 'ok'" in result.stdout, (
         "Landlock 適用後に名前解決ができない — improve Mission は初回ターンで "
         "failed になる (allowlist から /etc が落ちていないか確認すること)")
+    assert "'llm_endpoint_reachable': 'ok" in result.stdout, (
+        "Landlock 適用後に LLM エンドポイントへ socket を張れない — "
+        "improve Mission は初回ターンで failed になる")
     assert "'workdir_readwrite': 'ok'" in result.stdout
     assert "'code_tree_read': 'ok'" in result.stdout
     assert "UNEXPECTED" not in result.stdout

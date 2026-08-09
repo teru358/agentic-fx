@@ -9301,7 +9301,11 @@ Task 15/16/17 と異なり、本 task の前提は**おおむね現物と一致�
 >
 > 実測 (`/code-review` が再現、指揮者が追試): `/etc` 無しでは `socket.getaddrinfo("localhost", 8080)` が `gaierror: Temporary failure in name resolution` になり、既定の `llama_swap.base_url` (`http://localhost:8080/v1`) へ到達できない → **improve Mission は初回ターンで必ず `failed`**。`worker_profile="improve"` の本番構築が service.py にまだ無いため潜在に留まっていた。
 >
-> **教訓**: allowlist の必要十分を測る基準は「**起動できるか**」ではなく「**Mission を完走できるか**」。probe に `getaddrinfo` を追加してこの要件をテストで固定した (変異 M17 で KILLED を確認)。
+> **教訓**: allowlist の必要十分を測る基準は「**起動できるか**」ではなく「**LLM へ到達できるか**」。probe に `getaddrinfo` と `socket.create_connection("localhost", 8080)` を追加してこの要件をテストで固定した (変異 M17 で KILLED を確認)。`ConnectionRefusedError` は ok 扱いにしてあるので llama-swap が落ちていても判定できる。
+>
+> **テストが担保する範囲 (正確に書く)**: probe が踏むのは**エンドポイントへ socket を張るところまで**であり、**Mission の完走 (実 LLM 応答 → ツール呼び出し → result 送出) はスイートでは実行しない** (llama-swap 実機と数百秒を要するため)。したがって「完走できるか」を基準に据えつつ、**自動で守れているのは経路の到達性まで**である。プラン 9 で改善ループに実ツールセットが入る際は、完走側の確認を E2E に置くこと。
+>
+> **削除した 3 つの再測定 (2026-08-09、指揮者)**: 上記の読み違えが `/lib`・`/lib64`・`/usr/lib64` の削除にも及んでいないかを、**実 HTTP (`httpx.get("http://localhost:8080/v1/models")` → 200)** を基準に測り直した。4 パス構成に 3 つを 1 つずつ戻しても結果は不変 (いずれも 200) で、**削除は HTTP 基準でも正しい**と確認済み。
 >
 > **既知の制約**: `/etc/resolv.conf` は `/run/systemd/resolve/...` への symlink なので、`/etc` を許可しても**外部ホスト名の DNS 解決はできない** (実測)。`localhost`/IP は `/etc/hosts` で解決するので既定構成では問題にならないが、`base_url` を外部ホスト名にする場合は allowlist の追加が要る。
 
