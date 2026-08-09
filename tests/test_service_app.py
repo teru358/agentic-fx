@@ -771,6 +771,11 @@ def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path
     release.set()
     future.result(timeout=5.0)
     app.supervisor.join(timeout=5.0)
+    # レビュー 3 周目 (KAT-Coder): 後始末が本当に効いているかを assert する。
+    # スレッドが残ると後続テストを汚染するが、join のタイムアウトは黙って
+    # 通り過ぎるため、生死を明示的に確かめる。
+    assert not app.supervisor.is_alive(), (
+        "supervisor スレッドがテスト終了後も生存している (後続テストを汚染する)")
 
 
 class _KeyboardInterruptOnMainWait(threading.Event):
