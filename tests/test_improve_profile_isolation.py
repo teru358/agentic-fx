@@ -137,6 +137,20 @@ _ISOLATION_PROBE_SCRIPT = textwrap.dedent("""
     except Exception as e:  # noqa: BLE001 — 想定外の例外型は区別して記録する
         results["holdout_data_reachable"] = f"UNEXPECTED_EXCEPTION_TYPE: {type(e).__name__}: {e}"
 
+    # **positive control 2 (レビュー 2 周目 /code-review の HIGH 指摘)**:
+    # 名前解決が生きていること。allowlist から `/etc` を落とすと
+    # `getaddrinfo` が gaierror になり、既定の `llama_swap.base_url`
+    # (`http://localhost:8080/v1`) へ到達できず improve Mission が初回
+    # ターンで必ず failed になる。**`ready` 到達だけを見るテストでは
+    # この破壊を検出できない** (ready はその 1 行手前で送出される) ため、
+    # probe 側で実際に名前解決まで踏む。
+    try:
+        import socket
+        socket.getaddrinfo("localhost", 8080)
+        results["name_resolution"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        results["name_resolution"] = f"UNEXPECTED_FAILURE: {type(e).__name__}: {e}"
+
     # 裁定書 FC-5 (d) positive control: allowlist 内は実際に成功する
     # ことを積極的に示す (全滅していないことの証明)。
     try:
@@ -186,6 +200,9 @@ def test_improve_profile_cannot_reach_data_dir(tmp_path):
     assert "'open_db': 'blocked'" in result.stdout
     assert "'list_data_dir': 'blocked'" in result.stdout
     assert "'holdout_data_reachable': 'blocked" in result.stdout
+    assert "'name_resolution': 'ok'" in result.stdout, (
+        "Landlock 適用後に名前解決ができない — improve Mission は初回ターンで "
+        "failed になる (allowlist から /etc が落ちていないか確認すること)")
     assert "'workdir_readwrite': 'ok'" in result.stdout
     assert "'code_tree_read': 'ok'" in result.stdout
     assert "UNEXPECTED" not in result.stdout

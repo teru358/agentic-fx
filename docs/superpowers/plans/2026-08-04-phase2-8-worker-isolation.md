@@ -9293,7 +9293,17 @@ Task 15/16/17 と異なり、本 task の前提は**おおむね現物と一致�
 
 **受け入れたリスク**: improve worker は `/dev` 配下の全デバイスノードを**読取**できる。設計書 §4.6 が要求する「`data/` の絶対パスアクセスを OS レベルで遮断する」意味論は保たれる (`/dev` は `data/` の祖先ではなく、`test_improve_profile_cannot_reach_data_dir` が毎回実測する) が、**最小 allowlist の原則からは外れる**。プラン 9 で improve に実ツールセットが入る前に、ファイル粒度対応を再検討してよい。
 
-**あわせて実測した allowlist の最小化**: 実装者が当初 `/lib`・`/lib64`・`/usr/lib`・`/usr/lib64`・`/usr/share`・`/etc`・`/dev` の 7 つを (申告せずに) 追加していたが、指揮者が 1 つずつ外して実測し、**load-bearing なのは `/usr/lib` (`libgcc_s.so.1`)・`/usr/share/zoneinfo`・`/dev` の 3 つだけ**と確定した (`/lib`・`/lib64` は `/usr/lib`・`/usr/lib64` への symlink、`/usr/lib64` と `/etc` は不要)。
+**あわせて実測した allowlist の最小化**: 実装者が当初 `/lib`・`/lib64`・`/usr/lib`・`/usr/lib64`・`/usr/share`・`/etc`・`/dev` の 7 つを (申告せずに) 追加していた。指揮者が 1 つずつ外して実測し 3 つ (`/usr/lib`・`/usr/share/zoneinfo`・`/dev`) まで削ったが、**この最小化は誤りだった** — レビュー 2 周目の `/code-review` が検出。最終形は `/etc` を戻した **4 つ**。
+
+> **⚠ 指揮者の測定ミスとして記録する (同型の再発を防ぐため)**
+>
+> 最小化の判定に使ったのは `test_real_improve_worker_reaches_ready` (= `ready` フレームまで到達するか) だった。しかし **`ready` は `runner.run` の 1 行手前で送出される** ので、この test は「LLM を実際に叩く経路」を一度も通らない。名前解決 (`/etc/nsswitch.conf`, `/etc/hosts`) はその先で初めて必要になるため、**「`/etc` を外しても green」= 「不要」と読み違えた**。
+>
+> 実測 (`/code-review` が再現、指揮者が追試): `/etc` 無しでは `socket.getaddrinfo("localhost", 8080)` が `gaierror: Temporary failure in name resolution` になり、既定の `llama_swap.base_url` (`http://localhost:8080/v1`) へ到達できない → **improve Mission は初回ターンで必ず `failed`**。`worker_profile="improve"` の本番構築が service.py にまだ無いため潜在に留まっていた。
+>
+> **教訓**: allowlist の必要十分を測る基準は「**起動できるか**」ではなく「**Mission を完走できるか**」。probe に `getaddrinfo` を追加してこの要件をテストで固定した (変異 M17 で KILLED を確認)。
+>
+> **既知の制約**: `/etc/resolv.conf` は `/run/systemd/resolve/...` への symlink なので、`/etc` を許可しても**外部ホスト名の DNS 解決はできない** (実測)。`localhost`/IP は `/etc/hosts` で解決するので既定構成では問題にならないが、`base_url` を外部ホスト名にする場合は allowlist の追加が要る。
 
 **Files:**
 - Modify: `src/agentic_fx/mission_worker.py` (`worker_profile == "improve"` 分岐 + `_bootstrap_improve_profile` 新設)

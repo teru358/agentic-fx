@@ -25,10 +25,16 @@
    送出)
 7. `result` を送出して終了
 
-**worker_profile="trade" 限定** (本プランのスコープ — improve profile は
-Task 18 で bootstrap を拡張する)。`settings.runner.trade.backend` が
-"local" 以外 (= "claude") の場合は `RuntimeError` で fail closed する
-(ClaudeRunner は本プランでは実装しない — Global Constraints)。
+**対応 profile は `trade` と `improve` の 2 つ** (プラン8 Task 18 で improve を
+追加。それ以外の値は `ready: ok=False` で fail closed する)。上記 1〜7 の流れは
+`trade` のもので、`improve` は **DB にも plugin にも触れない別経路**を通る —
+`_bootstrap_improve_profile()` で Landlock を適用してから、空の `ToolRegistry()`
+で `LocalRunner` を組む (改善ループの実ツールセットはプラン 9)。
+
+`settings.runner.<profile>.backend` が "local" 以外 (= "claude") の場合は
+`RuntimeError` で fail closed する (ClaudeRunner は本プランでは実装しない —
+Global Constraints)。trade は `runner.trade.backend`、improve は
+`runner.improve.backend` をそれぞれ見る。
 
 **I4 対応 (実時計)**: 子は Mission 実行中の鮮度判定 (`get_signals` 等)
 に `_build_clock()` (既定 `SystemClock()`) を使う。handshake 時刻で
@@ -118,9 +124,8 @@ def _bootstrap_improve_profile() -> None:
     if base_prefix != venv_root:
         read_only.append(base_prefix)
     # venv/stdlib の外にある実行時依存。**allowlist は防御の質そのものなので
-    # 最小に保つ** — 以下の 3 つは指揮者が 1 つずつ外して実測し、いずれも
-    # 外すと tests/test_improve_profile_isolation.py が red になることを
-    # 確認した「load-bearing な 3 つ」だけを残している (2026-08-09 実測):
+    # 最小に保つ**が、**「起動できる」ではなく「Mission を完走できる」を
+    # 基準に測ること** (2026-08-09 実測):
     #
     #   /usr/lib             外すと `ImportError: libgcc_s.so.1: cannot open
     #                        shared object file` で improve worker が起動不能
@@ -130,14 +135,36 @@ def _bootstrap_improve_profile() -> None:
     #                        は対象を `O_PATH | O_DIRECTORY` で open するので
     #                        単一ファイル (`/dev/urandom`) を渡すと
     #                        `NotADirectoryError` になる (実測)
+    #   /etc                 **glibc の名前解決 (`/etc/nsswitch.conf`,
+    #                        `/etc/hosts`) に必要。** 外すと
+    #                        `socket.getaddrinfo("localhost", 8080)` が
+    #                        `gaierror: Temporary failure in name resolution`
+    #                        になり、既定の `llama_swap.base_url`
+    #                        (`http://localhost:8080/v1`) へ到達できず、
+    #                        **improve Mission が初回ターンで必ず failed に
+    #                        なる** (レビュー 2 周目 `/code-review` が検出)
     #
-    # 外しても red にならなかったため**削除した**もの: `/lib`・`/lib64`
-    # (どちらも `/usr/lib`・`/usr/lib64` への symlink)、`/usr/lib64`、`/etc`。
-    # 残した 3 つはいずれも `data/` の祖先ではないため、設計書 §4.6 の
+    # **`/etc` を一度削除した経緯 (同じ誤りを繰り返さないために残す)**:
+    # 指揮者の最初の最小化は「1 つずつ外して `test_real_improve_worker_
+    # reaches_ready` が red になるか」で測ったが、**この test は `ready`
+    # 送出までしか到達せず、その 1 行あとの `runner.run` (= 実際に LLM を
+    # 叩く経路) を通らない**。名前解決はその先で初めて必要になるので、
+    # 「外しても green」= 「不要」と読み違えた。いまは probe が
+    # `getaddrinfo` まで見る (`test_improve_profile_cannot_reach_data_dir`)。
+    #
+    # **既知の制約**: `/etc/resolv.conf` は `/run/systemd/resolve/...` への
+    # symlink なので、`/etc` を許可しても**外部ホスト名の DNS 解決はできない**
+    # (実測)。`localhost`/IP は `/etc/hosts` で解決するので既定構成では問題に
+    # ならない。`llama_swap.base_url` を外部ホスト名にする場合は allowlist の
+    # 追加が要る。
+    #
+    # 外しても Mission 完走に影響が無かったため削除したもの: `/lib`・`/lib64`
+    # (どちらも `/usr/lib`・`/usr/lib64` への symlink)、`/usr/lib64`。
+    # 残した 4 つはいずれも `data/` の祖先ではないため、設計書 §4.6 の
     # 「`data/` の絶対パスアクセスを OS レベルで遮断する」意味論は保たれる
     # (`test_improve_profile_cannot_reach_data_dir` が毎回それを実測する)。
     for sys_path in [Path("/usr/lib"), Path("/usr/share/zoneinfo"),
-                     Path("/dev")]:
+                     Path("/dev"), Path("/etc")]:
         if sys_path.exists():
             read_only.append(sys_path)
     _assert_allowlist_excludes_data_dir(read_only + [workdir])
@@ -185,15 +212,30 @@ def _assert_allowlist_excludes_data_dir(paths: list[Path]) -> None:
     結果そのものを不変条件として検査する**のがテストより確実な防御になる。
     テスト側 (`test_allowlist_never_covers_the_data_dir`) はこの検査自体が
     消されないことを pin する。
+
+    **これは best-effort の第 2 層であり、第 1 層の代わりにはならない**
+    (レビュー 2 周目 `/code-review` の指摘): 本番の data root は
+    **サービスプロセスの cwd** (`entry.py` の `root = Path.cwd()`) であって
+    このモジュールの配置ではない。`afx` は console script なのでリポジトリ
+    外から起動する運用も正当で、そのとき `_guarded_data_dir()` は実在しない
+    `<repo>/data` を指し、**この検査は素通りする**。非 editable install
+    (wheel 配置) でも `parents[2]` は site-packages の親になる。
+    したがって「子の cwd が専用 workdir であること」は**親側で保証する**のが
+    本筋で (`WorkerRunner.run` の `Popen(cwd=...)` と
+    `test_child_cwd_is_a_dedicated_dir_outside_the_repository`)、この検査は
+    その配線が壊れたときに**運が良ければ捕まえる**最後の網に留まる。
     """
     data_dir = _guarded_data_dir()
     for p in paths:
         resolved = Path(p).resolve()
-        if resolved == data_dir or resolved in data_dir.parents:
+        # 祖先・一致に加えて**子孫も弾く** (`data/` 配下を workdir にする
+        # 経路。レビュー 2 周目 `/code-review` の指摘)。
+        if (resolved == data_dir or resolved in data_dir.parents
+                or data_dir in resolved.parents):
             raise RuntimeError(
                 f"improve worker allowlist would expose the history data "
-                f"directory: {resolved} covers {data_dir} — refusing to start "
-                "(fail closed, 設計書 §4.6)")
+                f"directory: {resolved} covers or lives under {data_dir} — "
+                "refusing to start (fail closed, 設計書 §4.6)")
 
 
 class _RagRpcProxy:
