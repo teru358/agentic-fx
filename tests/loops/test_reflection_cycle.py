@@ -1,3 +1,4 @@
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, call
@@ -27,7 +28,7 @@ def _cycle(tmp_path, results, watch=None):
         conn=conn, runner=FakeRunner(results), rag=rag,
         settings=SETTINGS,
         activity=ActivityLog(tmp_path / "a.log"),
-        clock=FixedClock(NOW),
+        clock=FixedClock(NOW), core_lock=threading.RLock(),
         watch=watch)
     return conn, rag, cyc
 
@@ -108,7 +109,7 @@ def test_runner_non_mission_result_normalized_to_failed(tmp_path):
         conn=conn, runner=NonMissionResultRunner(), rag=rag,
         settings=SETTINGS,
         activity=ActivityLog(tmp_path / "a.log"),
-        clock=FixedClock(NOW))
+        clock=FixedClock(NOW), core_lock=threading.RLock())
 
     oid = _closed_order(conn)
     assert cyc.run_pending() == 0
@@ -234,7 +235,7 @@ def test_runner_raises_normalized_to_failed(tmp_path):
         conn=conn, runner=FailRunner(), rag=rag,
         settings=SETTINGS,
         activity=ActivityLog(tmp_path / "a.log"),
-        clock=FixedClock(NOW))
+        clock=FixedClock(NOW), core_lock=threading.RLock())
 
     oid = _closed_order(conn)
     assert cyc.run_pending() == 0

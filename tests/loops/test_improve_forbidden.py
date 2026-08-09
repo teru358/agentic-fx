@@ -8,6 +8,7 @@
 実行時に検証する。プラン 9 で改善ループの実 allowed リストが実装された
 ら、その組み立て箇所でも本集合との非交差を assert すること (引き継ぎ)。
 """
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -41,7 +42,8 @@ def test_reflection_cycle_mission_tools_disjoint_from_improve_forbidden(tmp_path
     runner = FakeRunner([MissionResult("completed", {"content": "x"}, [])])
     cyc = ReflectionCycle(
         conn=conn, runner=runner, rag=MagicMock(), settings=SETTINGS,
-        activity=ActivityLog(tmp_path / "a.log"), clock=FixedClock(NOW))
+        activity=ActivityLog(tmp_path / "a.log"), clock=FixedClock(NOW),
+        core_lock=threading.RLock())
     orders.insert(
         conn, pair="USDJPY", direction="long", entry_type="market",
         horizon="day", status=OrderStatus.CLOSED, now=NOW, quantity=0.1,
