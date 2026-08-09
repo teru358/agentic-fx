@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import signal
 import threading
@@ -1125,6 +1126,63 @@ def test_shutdown_sequence_completes_even_if_supervisor_shutdown_raises(tmp_path
     act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
     assert "service_stopped" in act, (
         "supervisor.shutdown() の失敗で停止シーケンスが途中で落ちている")
+
+
+def test_interactive_mode_actually_stops_via_stop_event_end_to_end(
+        tmp_path, capsys):
+    """裁定 C の E2E: 対話モードで `stop_event` が実際にシェルを起こし、
+    停止シーケンスが完走する。
+
+    Task 17 は割込み seam を用意しただけで **end-to-end では一度も駆動
+    されていなかった** (producer が存在しなかった)。本 task が producer を
+    配線したので、ここで初めて通しで確認できる。`run_shell` をモックせず、
+    実物の `_InterruptibleLineReader` (select ポーリング) に**データが
+    永久に来ないパイプ**を読ませ、別スレッドから `stop_event` を立てる。
+
+    これが無いと「配線はされたがシェルが起きない」型の欠陥
+    ([[verify-integration-not-just-units]]) を検出できない — `run_shell`
+    単体テスト (Task 17) も `run_service` 側のテスト (run_shell をモック)
+    も、結線点のズレは見ない。
+    """
+    app = _seam_app(tmp_path, FakeRunner([]))
+
+    r, w = os.pipe()          # 書き込み側は誰も書かない = 入力が来ない stdin
+    stdin_stream = os.fdopen(r, "rb", buffering=0)
+    stop_event = threading.Event()
+
+    class _Stdin:
+        """`sys.stdin` の代用 — `_InterruptibleLineReader` が要求するのは
+        `fileno()` と `buffer` (生バイト層) だけ。"""
+        buffer = stdin_stream
+
+        @staticmethod
+        def fileno():
+            return r
+
+    timer = threading.Timer(0.5, stop_event.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with _no_real_network(), \
+             patch("agentic_fx.service.build_app", return_value=app), \
+             patch("agentic_fx.service.signal.signal"), \
+             patch("sys.stdin", _Stdin()):
+            rc = run_service(tmp_path, daemon=False, _stop_event=stop_event)
+    finally:
+        timer.cancel()
+        stdin_stream.close()
+        os.close(w)
+    elapsed = time.monotonic() - started
+
+    assert rc == 0
+    assert elapsed < 15.0, (
+        f"対話モードで stop_event がシェルを起こしていない (elapsed={elapsed:.1f}s)")
+    act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert "service_stopped" in act
+    # **経路の取り違えを防ぐ**: select 非対応のフォールバック
+    # (ブロッキング readline) に落ちていたら、割込み seam を一切通らずに
+    # 緑になってしまう。フォールバックの告知が出ていないことを確認する。
+    assert "select 非対応" not in capsys.readouterr().out
 
 
 class _KeyboardInterruptOnMainWait(threading.Event):
