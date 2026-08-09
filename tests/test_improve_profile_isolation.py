@@ -311,8 +311,12 @@ def test_allowlist_never_covers_the_data_dir(monkeypatch, tmp_path):
     assert allowed, "allowlist が空 — restrict_to の呼び出しを捕まえられていない"
     for p in allowed:
         resolved = Path(p).resolve()
-        assert resolved != data_dir and resolved not in data_dir.parents, (
-            f"allowlist の {resolved} が {data_dir} を覆っている")
+        # 祖先・一致・**子孫**の 3 方向すべて (レビュー 3 周目 sonnet: 2 周目で
+        # ガード側に子孫棄却を足したのに、この assert が祖先/一致だけを見る
+        # 古い形のまま残っていた — ガードと pin が片方だけ進んでいた)。
+        assert (resolved != data_dir and resolved not in data_dir.parents
+                and data_dir not in resolved.parents), (
+            f"allowlist の {resolved} が {data_dir} を覆っている / 配下にある")
     # data_dir 自身が allowlist に含まれていないことの否定的確認だけだと、
     # 「allowlist が空でも通る」恒真に落ちるので、正の確認も置く。
     code_root = Path(mw_mod.__file__).resolve().parents[1]  # <repo>/src
@@ -362,3 +366,25 @@ def test_run_holdout_gate_requires_history_conn_keyword():
         "history_conn が keyword-only でなくなっている")
     assert param.default is inspect.Parameter.empty, (
         "history_conn に既定値が付いた — DB 接続なしで実行できてしまう")
+
+
+def test_guard_rejects_allowlist_paths_under_the_data_dir():
+    """`data/` の**配下**を allowlist に入れる経路も fail closed になること
+    (レビュー 3 周目 sonnet)。
+
+    2 周目 (`/code-review` の MEDIUM) でガードに子孫棄却を足したが、**その
+    分岐だけを守るテストが無く、削除しても 68 件が green のままだった**
+    (sonnet が実測)。ガードと pin が片方だけ進んでいた典型。
+
+    実運用では workdir は `tempfile.TemporaryDirectory()` が `/tmp` 配下に
+    作るのでこの分岐は発火しないが、`WorkerRunner` が将来 workdir の置き場
+    を変えたときに効く最後の網なので、退行を検出できる形にしておく。
+    """
+    import agentic_fx.mission_worker as mw_mod
+
+    inside = mw_mod._guarded_data_dir() / "sub"
+    with pytest.raises(RuntimeError, match="would expose the history data"):
+        mw_mod._assert_allowlist_excludes_data_dir([inside])
+
+    # 対称の確認: 無関係なパスは通る (上の raise が恒真でないこと)
+    mw_mod._assert_allowlist_excludes_data_dir([Path("/usr/lib")])
