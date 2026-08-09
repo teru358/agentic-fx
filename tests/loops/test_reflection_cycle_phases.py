@@ -11,7 +11,9 @@ import pytest
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.loops.mission_finalize import finalize_mission
+from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.runners.base import Mission, MissionResult
+from agentic_fx.store import reflections
 from tests.loops.test_reflection_cycle import _cycle, _closed_order
 
 _NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
@@ -175,14 +177,23 @@ def test_prepare_phase_holds_core_lock(tmp_path):
         t.start()
         assert entered.wait(5.0), "prepare 相に到達しなかった"
 
+        # **(レビュー 1 周目 F4)** release は取得したスレッド自身で行う
+        # (RLock の制約 — 他テストと同じ理由)。通常は acquired[0]==False
+        # なので release は呼ばれないが、prepare の lock を外す変異では
+        # acquired[0]==True になり、メインスレッドからの release が
+        # `RuntimeError: cannot release un-acquired lock` で落ちて
+        # 「狙った assert とは違う理由」で red になっていた (指揮者指摘)。
         acquired: list[bool] = []
-        checker = threading.Thread(
-            target=lambda: acquired.append(
-                cyc._core_lock.acquire(blocking=False)))
+
+        def _try_acquire():
+            ok = cyc._core_lock.acquire(blocking=False)
+            acquired.append(ok)
+            if ok:
+                cyc._core_lock.release()
+
+        checker = threading.Thread(target=_try_acquire)
         checker.start()
         checker.join(timeout=5.0)
-        if acquired and acquired[0]:
-            cyc._core_lock.release()
         assert acquired == [False], (
             "prepare 実行中は他スレッドから core_lock を取得できないはず")
 
@@ -317,3 +328,72 @@ def test_finalize_mission_conflict_recorded_when_not_finished(tmp_path):
     assert len(entries) >= 1, (
         "missions.finish が False を返したとき mission_finalize_conflict "
         "が記録されるはず")
+
+
+# ---- レビュー 1 周目 F1: watch.begin/watch.end の例外で mission が
+# running のまま残る (codex 実測・修正済み) の pin -----------------------
+
+def test_reflect_one_watch_begin_raises_finalizes_as_failed(tmp_path):
+    """`watch.begin` が例外を出しても mission は `running` のまま残らず
+    `failed` として終端され、reflection も保存されない (F1)。修正前は
+    `finalize_mission` に到達しないまま per-item isolation に握られ、
+    mission が `running` のまま永久残留していた (codex 実測)。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "completed", {"content": "振り返り"}, [])])
+    oid = _closed_order(conn)
+    watch = MagicMock(spec=MissionWatch)
+    watch.begin.side_effect = RuntimeError("watch.begin broken")
+    cyc.watch = watch
+
+    assert cyc.run_pending() == 0
+    assert reflections.get(conn, oid) is None
+    rag.add_reflection.assert_not_called()
+    mid_row = conn.execute(
+        "SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()
+    assert mid_row["status"] == "failed", (
+        "watch.begin の例外後も mission が running のまま残っている")
+
+
+def test_reflect_one_watch_end_raises_finalizes_as_failed(tmp_path):
+    """`watch.end` が例外を出しても mission は `running` のまま残らず
+    `failed` として終端され、reflection も保存されない (F1)。runner 自体は
+    completed を返しているが、watch.end の障害を「実は completed だった」
+    として黙って正常系続行させると、watch 計測の不具合を finalize が
+    隠蔽してしまう (このテストは watch.end 失敗時は fail-closed に倒す
+    ことを固定する)。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "completed", {"content": "振り返り"}, [])])
+    oid = _closed_order(conn)
+    watch = MagicMock(spec=MissionWatch)
+    watch.end.side_effect = RuntimeError("watch.end broken")
+    cyc.watch = watch
+
+    assert cyc.run_pending() == 0
+    assert reflections.get(conn, oid) is None
+    rag.add_reflection.assert_not_called()
+    mid_row = conn.execute(
+        "SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()
+    assert mid_row["status"] == "failed", (
+        "watch.end の例外後も mission が running のまま残っている")
+
+
+# ---- レビュー 1 周目 F6: RAG 書込失敗が activity に残らない の pin -----
+
+def test_rag_write_failure_recorded_in_activity(tmp_path):
+    """RAG 書込失敗時、次周期の自己修復とは別に activity にも
+    `reflection_rag_failed` が記録される (F6 — ローカル KAT の指摘)。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "completed", {"content": "振り返り"}, [])])
+    activity = ActivityLog(tmp_path / "rag_fail_a.log")
+    cyc.activity = activity
+    rag.add_reflection.side_effect = RuntimeError("chroma down")
+    oid = _closed_order(conn)
+
+    assert cyc.run_pending() == 0
+    assert reflections.get(conn, oid) is None
+    entries = [line for line in
+              (tmp_path / "rag_fail_a.log").read_text().split("\n")
+              if "reflection_rag_failed" in line]
+    assert len(entries) >= 1, (
+        "RAG 書込失敗が activity に reflection_rag_failed として"
+        "記録されていない")

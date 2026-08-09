@@ -287,6 +287,83 @@ def test_on_trade_mission_wrapper_also_runs_reflection(tmp_path):
         app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
 
 
+class _TradeThenBlockingReflectionRunner:
+    """trade/ask Mission (`mission.tools` が非空) は即座に completed を
+    返し、reflection Mission (`mission.tools == []` — `ReflectionCycle` の
+    `_SCHEMA` 構築点のみがこの形) では `release` されるまでブロックする
+    (レビュー 1 周目 F5 の pin 専用)。"""
+
+    def __init__(self) -> None:
+        self.missions: list = []
+        self.entered_reflection = threading.Event()
+        self.release = threading.Event()
+
+    def run(self, mission):
+        self.missions.append(mission)
+        if mission.tools:
+            return MissionResult(
+                "completed", {"action": "hold", "reasoning": "w"}, [])
+        self.entered_reflection.set()
+        assert self.release.wait(10.0), "release が来なかった"
+        return MissionResult("completed", {"content": "振り返り"}, [])
+
+
+def test_reflection_fn_wiring_does_not_hold_core_lock_during_run(tmp_path):
+    """レビュー 1 周目 F5 (指揮者の変異スイープで SURVIVED を実測):
+    `service.py` の `_reflection_fn` に `with core_lock:` を戻しても
+    `uv run pytest -q` が全 1661 件緑のままだった — 「`ReflectionCycle`
+    自身が prepare/commit-core でのみ lock を掴み、配線側 (`_reflection_fn`)
+    はそれを丸ごと再度 lock で包まない」という本 task の眼目が配線レベル
+    では無防備だった。
+
+    `build_app` で組み立てた実際の `App` を使い、supervisor 経由で
+    trade+reflection 連鎖を起動し、reflection Mission が `runner.run()`
+    でブロックしている最中に **別スレッド (このテスト自身のメイン
+    スレッド、Mission は supervisor スレッドで動く)** から
+    `app.core_lock` を取得できることを確認する。取得できなければ
+    `_reflection_fn` が再び `with core_lock:` で丸ごと包んでいる
+    (regression)。"""
+    _init(tmp_path)
+    from agentic_fx.core.accounting import record_snapshot
+    from agentic_fx.store import orders as orders_store
+
+    runner = _TradeThenBlockingReflectionRunner()
+    app = build_app(tmp_path, runner=runner, clock=FixedClock(NOW))
+    record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
+                    equity=1_000_000)
+    orders_store.insert(
+        app.conn_core, pair="USDJPY", direction="long", entry_type="market",
+        horizon="day", status="closed", now=NOW, quantity=0.1,
+        avg_fill_price=148.0, close_price=149.0, realized_pnl=100.0,
+        close_reason="tp")
+
+    with _no_real_network(), \
+         patch.object(app.provider, "healthcheck", return_value="yfinance"), \
+         patch.object(app.trade_loop.provider, "healthcheck",
+                      return_value="yfinance"):
+        app.supervisor.start()
+        try:
+            future = app.supervisor.try_submit("trade", trigger="cron")
+            assert future is not None, "supervisor がジョブを受理しなかった"
+            assert runner.entered_reflection.wait(5.0), (
+                "reflection の run 相 (runner.run) に到達しなかった")
+
+            acquired = app.core_lock.acquire(timeout=1.0)
+            if acquired:
+                app.core_lock.release()
+            assert acquired, (
+                "reflection の run 相の間、別スレッドから app.core_lock を"
+                "取得できるはず (_reflection_fn が with core_lock: で丸ごと"
+                "包んでいないこと — プラン8 Task 16 配線レベルの pin)")
+
+            runner.release.set()
+            future.result(timeout=10.0)
+        finally:
+            runner.release.set()  # 万一まだ待っていてもテストをハングさせない
+            app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
+            app.supervisor.join(timeout=5.0)
+
+
 def test_tick_propagates_trigger_to_missions_row(tmp_path):
     """tick → on_trade_mission(reason) → run_once(trigger) → missions.trigger。
 

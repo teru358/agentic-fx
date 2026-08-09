@@ -102,6 +102,21 @@ class TradeLoop:
         `ohlcv.upsert_bars` は `readonly=True` によりスキップされるため、
         lock 外のこの呼び出しが `conn_core` を無保護で書き込むことはない
         (Global Constraints 違反の解消)。**
+
+        **`finalize_mission` (共有ヘルパー — Task 16) が `False` を返した
+        場合 (`missions.finish` 自体が例外で失敗) でも、直前の執行結果
+        (発注等) は巻き戻さない** — 設計書 §3.1 が finalize を
+        commit-core の**末尾** (paper broker 執行の後) に置くため。
+        Task 15 節「⚠ 着手前検証の結果 (4)」で明示的に許容された意図的な
+        挙動 (旧 `_run_recorded` の「finish 失敗時は result を failed に
+        差し替え、呼び出し元を completed 系の分岐に進ませない」契約は
+        もう維持していない)。監査未確定は fail closed にはせず、
+        `mission_finalize_failed` の activity 記録で可視化したうえで、
+        mission 行は `running` のまま残し、次回起動時の
+        `recover_interrupted` による `interrupted` 回収に委ねる。
+        `_ask_once_impl` も同じ契約 (finish 失敗時に回答文字列を巻き戻さ
+        ない) を採用している — ask は読み取り専用で資金に影響しないため
+        許容される。
         """
         try:
             self.provider.healthcheck(self.settings.pairs[0])
