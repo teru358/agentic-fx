@@ -86,6 +86,7 @@ class SnapshotCoverageError(Exception):
 class CloseSnapshot:
     """commit-pre 相が集めた CLOSE 用の外部取得スナップショット (裁定書
     F-1 / CR-2 / P8-01)。`captured_at` は commit-core の鮮度再検証が使う。"""
+    pair: str
     price: float
     spec: InstrumentSpec
     rate: ConversionRate | None
@@ -455,7 +456,8 @@ class Executor:
             specs_by_pair[pair] = pair_spec
             currencies.add(pair_spec.quote_currency)
             currencies.add(pair_spec.base_currency)
-        rates = {ccy: cycle_rate(ccy) for ccy in currencies}
+        # A3: rates の構築順を安定化 (PYTHONHASHSEED 依存を避ける)
+        rates = {ccy: cycle_rate(ccy) for ccy in sorted(currencies)}
         return ExecutionSnapshot(quote=quote, spec=spec,
                                  specs_by_pair=specs_by_pair, rates=rates,
                                  captured_at=now)
@@ -505,7 +507,17 @@ class Executor:
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
 
-        spec = snapshot.specs_by_pair[intent.pair]
+        # A2: intent.pair が snapshot に無い場合は N4-2 拒否
+        spec = snapshot.specs_by_pair.get(intent.pair)
+        if spec is None:
+            reasons = [f"pair {intent.pair!r} is not covered by the execution "
+                       "snapshot (N4-2)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": None, "reasons": reasons}
+
         ctx = GateContext(
             quote=snapshot.quote, spec=spec, equity=equity, hwm=hwm,
             daily_start_equity=accounting.daily_start_equity(self.conn, now),
@@ -608,11 +620,12 @@ class Executor:
         相) が `conn_supervisor` (lock 外の読取専用接続) から読んだ現在の
         order 行 (`pair`/`direction` を参照するだけ)。"""
         now = self.clock.now()
-        quote = self.quote_fn(row["pair"])
+        pair = row["pair"]
+        quote = self.quote_fn(pair)
         price = quote.bid if row["direction"] == "long" else quote.ask
-        spec = self.spec_fn(row["pair"])
+        spec = self.spec_fn(pair)
         rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
-        return CloseSnapshot(price=price, spec=spec, rate=rate,
+        return CloseSnapshot(pair=pair, price=price, spec=spec, rate=rate,
                              rate_degraded=degraded, captured_at=now)
 
     def close_order_from_snapshot(self, row: dict, snapshot: CloseSnapshot,
@@ -624,6 +637,11 @@ class Executor:
         ため commit-core に残す)。`_finish_close`/`_close_unknown` を
         `close_order` と共有 — 判定・記録ロジックは `close_order` と完全
         共有 (I/O 位置のみ移動)。"""
+        # A1: row と snapshot の同一性チェック
+        if snapshot.pair != row["pair"]:
+            raise SnapshotCoverageError(
+                f"snapshot pair {snapshot.pair!r} does not match row pair "
+                f"{row['pair']!r}")
         now = self.clock.now()
         transitions.transition(self.conn, row["id"], S.CLOSING, now,
                                close_reason=reason)
@@ -676,7 +694,17 @@ class Executor:
                     "reasons": reasons}
         intents_store.set_gate_result(self.conn, iid, accepted=True,
                                       reject_reason=None)
-        final = self.close_order_from_snapshot(row, snapshot, reason="llm_close")
+        try:
+            final = self.close_order_from_snapshot(row, snapshot, reason="llm_close")
+        except SnapshotCoverageError as e:
+            # A1: pair チェック失敗など、snapshot の同一性が確認できない
+            reasons = [f"close snapshot coverage error: {e}"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": intent.order_id,
+                    "reasons": reasons}
         result = "closed" if final == S.CLOSED else "unknown"
         return {"result": result, "order_id": row["id"], "reasons": []}
 
