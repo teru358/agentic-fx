@@ -657,6 +657,10 @@ def test_close_from_snapshot_rejects_when_row_already_closed(tmp_path):
     assert updated["status"] == S.CLOSED.value
     assert updated["close_price"] == 148.50
     assert updated["realized_pnl"] == 1234.0
+    # レビュー 1 周目 codex B1 (指揮者のプラン記述漏れ): close_from_snapshot
+    # の not-open 拒否分岐も他の拒否分岐と対称に activity へ残す
+    assert any("gate_rejected" in l
+              for l in ex.activity.tail(n=50, category=Category.TRADE))
 
 
 class _StubBroker:

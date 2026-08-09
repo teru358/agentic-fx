@@ -767,6 +767,8 @@ class Executor:
             reasons = [f"order {intent.order_id} is not open"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
                     "reasons": reasons}
         if snapshot is None:

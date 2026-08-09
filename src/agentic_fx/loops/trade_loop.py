@@ -108,61 +108,74 @@ class TradeLoop:
             self.notifier.send(f"[agentic-fx] データ不健全のため判断をスキップ: {e}")
             return None
 
-        # ---- prepare (core_lock 保持) ----
+        # レビュー 1 周目 codex A2/A3: 以下の try/finally は
+        # `with self._core_lock:` (prepare) の**中**まで含めてメソッド全体を
+        # 覆う。以前は `try:` が prepare の外側 (with ブロックの後) にしか
+        # 無かったため、claim 成功後の set_trigger/build_prompt/build_mission
+        # で例外が出ると finally が一切実行されず、claimed signal も mid も
+        # 回収されないまま呼び出し元 (run_once のサービス境界) まで抜けて
+        # いた。`finalized` は「_finalize_mission (または missions.finish) を
+        # 既に試みたか」を追跡し、finally での二重 finalize (CAS 上は無害だが
+        # 無用な mission_finalize_conflict ログを出す) を避ける。
         claimed: dict | None = None
         mid: int | None = None
-        with self._core_lock:
-            now = self.clock.now()
-            if trigger == "signal":
-                # ②missions.start(trigger="signal") — 暫定値。NULL 窓を作らず、
-                # signals_rate_ok の LIKE 'signal%' がこの行も数える (§12 不変
-                # 条件は維持したまま常に非 NULL trigger を持たせる)。
-                mid = missions.start(self.conn, "trade",
-                                     self.settings.runner.trade.backend,
-                                     self.settings.runner.trade.model, now,
-                                     trigger="signal")
-                # ③claim_oldest — 失敗なら LLM を起こさず即 finalize (skipped)。
-                try:
-                    claimed = signals.claim_oldest(
-                        self.conn, mission_id=mid, now=now,
-                        freshness_bars=self.settings.plugin.signal_freshness_bars)
-                    if claimed is None:
-                        missions.finish(self.conn, mid, "skipped", None, [], now)
-                        return None
-                except Exception:
-                    # fix round 1 F2 (codex): claim_oldest (または直後の
-                    # "skipped" finish) が例外を出すと、以前は mission が
-                    # running のまま永久残留していた。missions.start と
-                    # claim_oldest の間、または claim 失敗直後の finish の間で
-                    # 例外が起きても、mission を必ず終端させる。
-                    #
-                    # claim_oldest 内部で「DB は commit 済みだが呼び出し直後に
-                    # Python 例外」という曖昧窓は原理的に残る (claimed 行が
-                    # claimed のままリークし得る) — この窓を塞ぐのは
-                    # `signals.reclaim_expired` (lease 回収) の役目であり、
-                    # `signal_lease_min` が経過するまでは不可視になり得る。
-                    try:
-                        missions.finish(self.conn, mid, "failed", None, [], now)
-                    except Exception:  # noqa: BLE001 — 元の例外を握りつぶさない
-                        _log.exception(
-                            "failed to finalize mission %s after claim error", mid)
-                    raise
-            if claimed is not None:
-                # ④set_trigger で plugin 名を確定 ⑤プロンプトへシグナル行を注入
-                missions.set_trigger(self.conn, mid, f"signal:{claimed['plugin']}")
-                prompt = (self._build_prompt(load_prompt("trade_mission"))
-                         + self._format_signal_injection(claimed))
-            else:
-                prompt = self._build_prompt(load_prompt("trade_mission"))
-            mission = self._build_mission(prompt)
-            if mid is None:
-                mid = missions.start(self.conn, "trade",
-                                     self.settings.runner.trade.backend,
-                                     self.settings.runner.trade.model, now,
-                                     trigger=trigger)
-
         consumed = False
+        finalized = False
         try:
+            # ---- prepare (core_lock 保持) ----
+            with self._core_lock:
+                now = self.clock.now()
+                if trigger == "signal":
+                    # ②missions.start(trigger="signal") — 暫定値。NULL 窓を作らず、
+                    # signals_rate_ok の LIKE 'signal%' がこの行も数える (§12 不変
+                    # 条件は維持したまま常に非 NULL trigger を持たせる)。
+                    mid = missions.start(self.conn, "trade",
+                                         self.settings.runner.trade.backend,
+                                         self.settings.runner.trade.model, now,
+                                         trigger="signal")
+                    # ③claim_oldest — 失敗なら LLM を起こさず即 finalize (skipped)。
+                    try:
+                        claimed = signals.claim_oldest(
+                            self.conn, mission_id=mid, now=now,
+                            freshness_bars=self.settings.plugin.signal_freshness_bars)
+                        if claimed is None:
+                            missions.finish(self.conn, mid, "skipped", None, [], now)
+                            finalized = True
+                            return None
+                    except Exception:
+                        # fix round 1 F2 (codex): claim_oldest (または直後の
+                        # "skipped" finish) が例外を出すと、以前は mission が
+                        # running のまま永久残留していた。missions.start と
+                        # claim_oldest の間、または claim 失敗直後の finish の間で
+                        # 例外が起きても、mission を必ず終端させる。
+                        #
+                        # claim_oldest 内部で「DB は commit 済みだが呼び出し直後に
+                        # Python 例外」という曖昧窓は原理的に残る (claimed 行が
+                        # claimed のままリークし得る) — この窓を塞ぐのは
+                        # `signals.reclaim_expired` (lease 回収) の役目であり、
+                        # `signal_lease_min` が経過するまでは不可視になり得る。
+                        try:
+                            missions.finish(self.conn, mid, "failed", None, [], now)
+                        except Exception:  # noqa: BLE001 — 元の例外を握りつぶさない
+                            _log.exception(
+                                "failed to finalize mission %s after claim error", mid)
+                        else:
+                            finalized = True
+                        raise
+                if claimed is not None:
+                    # ④set_trigger で plugin 名を確定 ⑤プロンプトへシグナル行を注入
+                    missions.set_trigger(self.conn, mid, f"signal:{claimed['plugin']}")
+                    prompt = (self._build_prompt(load_prompt("trade_mission"))
+                             + self._format_signal_injection(claimed))
+                else:
+                    prompt = self._build_prompt(load_prompt("trade_mission"))
+                mission = self._build_mission(prompt)
+                if mid is None:
+                    mid = missions.start(self.conn, "trade",
+                                         self.settings.runner.trade.backend,
+                                         self.settings.runner.trade.model, now,
+                                         trigger=trigger)
+
             # ---- run (core_lock 非保持) ----
             self.watch.begin(mid, "trade", mission.timeout_sec)
             try:
@@ -179,6 +192,7 @@ class TradeLoop:
             if result.status != "completed":
                 with self._core_lock:
                     self._finalize_mission(mid, result)
+                finalized = True
                 self.activity.write(Category.AGGREGATE, "mission_failed",
                                     f"runner status={result.status}",
                                     ref_id=str(mid))
@@ -190,6 +204,7 @@ class TradeLoop:
             except IntentParseError as e:
                 with self._core_lock:
                     self._finalize_mission(mid, result)
+                finalized = True
                 self.activity.write(Category.AGGREGATE, "intent_parse_failed",
                                     str(e), ref_id=str(mid))
                 return None
@@ -278,6 +293,7 @@ class TradeLoop:
                 except Exception as e:  # noqa: BLE001
                     _log.exception("executor intent handling raised")
                     self._finalize_mission(mid, result)
+                    finalized = True
                     self.activity.write(Category.AGGREGATE,
                                         "intent_execution_failed",
                                         safe_error_text(e), ref_id=str(mid))
@@ -290,6 +306,7 @@ class TradeLoop:
                     out = None
                 else:
                     self._finalize_mission(mid, result)
+                    finalized = True
 
             # ---- commit-post (core_lock 非保持) ----
             # commit-core で溜めた通知をここで送る (Step 3.5)。送信失敗で
@@ -315,9 +332,28 @@ class TradeLoop:
             # Constraints 違反の解消 — この finally はメソッド全体の
             # try に対するものであり、commit-core の with ブロックは
             # 例外伝播時点で既に解放済みなので RLock の再取得は安全)。
+            # レビュー 1 周目 codex A1: 通知の送信 (urlopen(timeout=10)) は
+            # lock 解放後に行う — _requeue_signal はもう送信しない
+            # (文面を返すだけ)。
             if claimed is not None and not consumed:
                 with self._core_lock:
-                    self._requeue_signal(claimed)
+                    _requeue_msg = self._requeue_signal(claimed)
+                if _requeue_msg:
+                    try:
+                        self.notifier.send(_requeue_msg)
+                    except Exception:  # noqa: BLE001 — 通知失敗で本流を止めない
+                        _log.exception("requeue notification failed")
+            # レビュー 1 周目 codex A3: run/commit-pre 相 (watch.begin/end・
+            # TradeIntent 解析想定外例外・_read_exposure_pairs/
+            # _read_close_row 等) で想定外の例外が出ても、mid が既に
+            # 発行されている限り mission を running のまま残さない
+            # (fail closed)。`missions.finish` は CAS 化されているため、
+            # 既に (正常経路で) finalize 済みなら二重呼び出しは無害だが、
+            # 無用なログを避けるため `finalized` で一度限りにする。
+            if mid is not None and not finalized:
+                with self._core_lock:
+                    self._finalize_mission(
+                        mid, MissionResult("failed", None, []))
 
     def _finalize_mission(self, mid: int, result: MissionResult) -> None:
         """missions.finish の CAS 化された呼び出し (**core_lock 保持中に
@@ -384,8 +420,14 @@ class TradeLoop:
             f"- bar_ts: {claimed['bar_ts']}\n"
             f"- payload: {json.dumps(payload, ensure_ascii=False)}\n")
 
-    def _requeue_signal(self, claimed: dict) -> None:
-        """claim した signal を pending へ戻す (上限超過なら abandoned +通知)。
+    def _requeue_signal(self, claimed: dict) -> str | None:
+        """claim した signal を pending へ戻す (**core_lock 保持中に呼ぶ** —
+        signals.requeue は conn_core を書き込むため)。
+
+        **通知はここで送らない** (レビュー 1 周目 codex A1)。Notifier.send は
+        urlopen(timeout=10) の同期実行なので、lock 保持中に呼ぶと SL/TP
+        監視が最大 10 秒止まる。送るべき文面を返すだけにし、呼び出し元が
+        lock 解放後に送る。
 
         保守処理そのものの失敗で `_run_once_impl` の本流 (既に確定した
         結果/例外) を上書きしないよう、例外は握りつぶしログのみに残す。
@@ -395,54 +437,66 @@ class TradeLoop:
                 self.conn, claimed["id"], now=self.clock.now(),
                 max_requeue=self.settings.plugin.signal_requeue_max)
             if status == "abandoned":
-                self.notifier.send(
-                    f"[agentic-fx] signal #{claimed['id']} "
-                    f"({claimed['plugin']}) は requeue 上限超過のため "
-                    "abandoned になりました")
+                return (f"[agentic-fx] signal #{claimed['id']} "
+                        f"({claimed['plugin']}) は requeue 上限超過のため "
+                        "abandoned になりました")
         except Exception:  # noqa: BLE001 — 保守処理の失敗で本流を止めない
             _log.exception("signal requeue failed for signal_id=%s",
                            claimed["id"])
+        return None
 
     def _ask_once_impl(self, question: str) -> str:
         """ask Mission (プラン8 三相再構成 — trade と同じ理由: WorkerRunner
         呼び出しが長時間ブロックしうるため lock を保持しない)。"""
-        with self._core_lock:
-            now = self.clock.now()
-            prompt = self._build_prompt(load_prompt("ask_mission")) \
-                + f"\n\n## ユーザーの質問\n{question}"
-            mission = Mission(
-                prompt=prompt, tools=_TRADE_TOOLS,
-                output_schema=ANSWER_SCHEMA,
-                max_turns=self.settings.llama_swap.max_turns,
-                timeout_sec=self.settings.llama_swap.timeout_sec)
-            mid = missions.start(self.conn, "ask",
-                                 self.settings.runner.trade.backend,
-                                 self.settings.runner.trade.model, now)
-
-        self.watch.begin(mid, "ask", mission.timeout_sec)
+        mid: int | None = None
+        finalized = False
         try:
-            result = self.runner.run(mission)
-            if not isinstance(result, MissionResult):
+            with self._core_lock:
+                now = self.clock.now()
+                prompt = self._build_prompt(load_prompt("ask_mission")) \
+                    + f"\n\n## ユーザーの質問\n{question}"
+                mission = Mission(
+                    prompt=prompt, tools=_TRADE_TOOLS,
+                    output_schema=ANSWER_SCHEMA,
+                    max_turns=self.settings.llama_swap.max_turns,
+                    timeout_sec=self.settings.llama_swap.timeout_sec)
+                mid = missions.start(self.conn, "ask",
+                                     self.settings.runner.trade.backend,
+                                     self.settings.runner.trade.model, now)
+
+            self.watch.begin(mid, "ask", mission.timeout_sec)
+            try:
+                result = self.runner.run(mission)
+                if not isinstance(result, MissionResult):
+                    result = MissionResult("failed", None, [])
+            except Exception:  # noqa: BLE001
+                _log.exception("runner raised")
                 result = MissionResult("failed", None, [])
-        except Exception:  # noqa: BLE001
-            _log.exception("runner raised")
-            result = MissionResult("failed", None, [])
+            finally:
+                self.watch.end(mid)
+
+            with self._core_lock:
+                self._finalize_mission(mid, result)
+            finalized = True
+
+            if result.status != "completed":
+                return f"(Mission 失敗: {result.status})"
+            if not isinstance(result.output, dict):
+                return "(Mission 失敗: completed)"
+            answer = result.output.get("answer")
+            if not isinstance(answer, str):
+                return "(Mission 失敗: completed)"
+            self.activity.write(Category.AGGREGATE, "ask_answered",
+                                question[:80], ref_id=str(mid))
+            return answer
         finally:
-            self.watch.end(mid)
-
-        with self._core_lock:
-            self._finalize_mission(mid, result)
-
-        if result.status != "completed":
-            return f"(Mission 失敗: {result.status})"
-        if not isinstance(result.output, dict):
-            return "(Mission 失敗: completed)"
-        answer = result.output.get("answer")
-        if not isinstance(answer, str):
-            return "(Mission 失敗: completed)"
-        self.activity.write(Category.AGGREGATE, "ask_answered",
-                            question[:80], ref_id=str(mid))
-        return answer
+            # レビュー 1 周目 codex A3: prepare/run 相の想定外例外
+            # (watch.begin/end 等) で mission が running のまま残らない
+            # ようにする (trade 経路の finally と同じ形)。
+            if mid is not None and not finalized:
+                with self._core_lock:
+                    self._finalize_mission(
+                        mid, MissionResult("failed", None, []))
 
     # ---- Internal -------------------------------------------------------
 
