@@ -7395,13 +7395,73 @@ Task 14 で直さなかった理由: `_finish_close`/`_close_unknown`/`_evaluate
 
 **pin の張り方**: `Notifier(enabled=True)` かつ webhook URL をローカルの遅い stub に向けた Executor を作り、**commit-core 相の実行中に `notifier.send` が 1 度も呼ばれないこと**を記録型スタブで確認する。Task 14 のテストは `Notifier(enabled=False, ...)` 固定だったためこの経路を一度も踏んでいない (レビューで判明)。
 
+---
+
+## ⚠ 着手前検証の結果 (2026-08-09、指揮者が現物照合) — **必ず最初に読むこと**
+
+### (1) 申し送り 3 件が「散文にはあるが Step のコードには無い」
+
+上の申し送り 3 件は**理由と方針だけが書かれていて、Step 3/5 の逐語コードには一切反映されていない**。
+それどころか **Step 5 のコードは、申し送りが「これではダメだ」と言っている形そのまま**である:
+
+```python
+except Exception as e:  # noqa: BLE001
+    snapshot_error = e      # → commit-core で raise → 汎用 intent_execution_failed
+```
+
+Step をなぞるだけの実装者は **3 件とも no-op のまま出荷し、しかも「逸脱なし」と正直に報告する**。
+本改訂で 3 件すべてを Step の中に具体化した (Step 3 / **Step 3.5 (新設)** / Step 5)。
+
+### (2) 参照行のドリフト (Task 14 で `executor.py` が 487→801 行に変わったため)
+
+| プラン旧記載 | 現物 | 備考 |
+|---|---|---|
+| `executor.py` `handle_intent` **215-252** | **285-322** | |
+| `executor.py` `_close` **369-384** | **604-619** | |
+| `executor.py` `_cancel` **461-473** | **775-787** | |
+| `service.py` `_trade_fn`/`_ask_fn` **359-380** | **480-491** | |
+| `service.py` `TradeLoop(...)` 構築 **348-352** | **464-471** | |
+| `service.py` `core_lock = threading.RLock()` **357** | **473** | **順序関係は不変** — `core_lock` (473) は `trade_loop` 構築 (464) より**後**なので、移動の指示は依然として有効 |
+
+**`trade_loop.py` と `tests/loops/test_trade_loop.py` の参照行は現物と一致している** (Task 14 で触っていないため)。
+
+### (3) Step 5 のコードブロックは既存コメントを落としている
+
+Task 14 と同じ問題。**移動対象領域の既存コメントは 1 行残らず保存すること。**
+下記は現物にあって Step 5 のブロックから消えているもの:
+
+| 現物の行 | 落ちているコメント |
+|---|---|
+| `trade_loop.py:101-103` | `②missions.start(trigger="signal")` — NULL 窓を作らない理由 |
+| `trade_loop.py:108` | `③claim_oldest — 失敗なら LLM を起こさず即 finalize` |
+| `trade_loop.py:117-127` | `fix round 1 F2 (codex)` — 曖昧窓と `reclaim_expired` の役割 |
+| `trade_loop.py:138` | `④set_trigger ⑤プロンプトへシグナル行を注入` |
+| `trade_loop.py:164-167` | `⑥consume/requeue の確定規則` |
+| `trade_loop.py:186-188` | `finally` の requeue 規則 |
+
+### (4) `_run_recorded` 削除で失われる挙動 — **ask 経路の扱いを明記する**
+
+現物の `_run_recorded` (260-297) は `missions.finish` が失敗したとき
+**`result` を `MissionResult("failed", ...)` に差し替える**。これにより呼び出し元は
+completed 系の分岐に進まない (Phase 1 レジャー W1 の fail-closed)。
+新設する `_finalize_mission` はこの差し替えを**行わない**。
+
+- **trade 経路**: 上の「設計上の注記」が意図的な変更として扱っており、そのまま採用する
+- **ask 経路**: `_finalize_mission` は `result.status != "completed"` の判定より**前**に呼ばれるため、
+  finish が失敗しても**回答文字列がそのまま返る** (従来は `"(Mission 失敗: ...)"` だった)。
+  **ask は読み取り専用で資金に影響しないため、この変更は許容する** —
+  ただし `mission_finalize_failed` の activity 記録は残るので無警告にはならない。
+  **この判断を実装者が独自に変えないこと。**
+
+---
+
 **Files:**
-- Modify: `src/agentic_fx/core/executor.py` (`handle_intent` を `record_and_validate_intent` + dispatch に分割、`_close`→`close_intent`/`_cancel`→`cancel_intent` の公開昇格。**追加 (Task 14 申し送り): commit-core 経路の通知を commit-post へ遅延させる**)
+- Modify: `src/agentic_fx/core/executor.py` (`handle_intent` を `record_and_validate_intent` + dispatch に分割、`_close`→`close_intent`/`_cancel`→`cancel_intent` の公開昇格 + **拒否分岐の activity 対称化**。**追加 (Task 14 申し送り): commit-core 経路の通知を commit-post へ遅延させる — 機構は Step 3.5 で確定**)
 - Modify: `src/agentic_fx/loops/trade_loop.py` (全体 — 五相再構成)
-- Modify: `src/agentic_fx/service.py:359-380`(`_trade_fn`/`_ask_fn` の `with core_lock:` 除去 + `TradeLoop` construction に `core_lock`/`conn_supervisor` を渡す。**追加 (裁定書 F-6 / CR-5): `healthcheck_provider = PriceProvider(conn_supervisor, settings, clock, readonly=True)` を新設し `TradeLoop(provider=healthcheck_provider, ...)` に渡す**)
+- Modify: `src/agentic_fx/service.py:480-491` (**現物照合済み — 旧記載 359-380 はドリフト**) (`_trade_fn`/`_ask_fn` の `with core_lock:` 除去 + `TradeLoop` construction に `core_lock`/`conn_supervisor` を渡す。**追加 (裁定書 F-6 / CR-5): `healthcheck_provider = PriceProvider(conn_supervisor, settings, clock, readonly=True)` を新設し `TradeLoop(provider=healthcheck_provider, ...)` に渡す**)
 - Modify: `src/agentic_fx/config.py` (`WorkerSettings` に `snapshot_max_age_sec` 追加)
 - Modify: `config/settings.yaml.example` (同期)
-- Modify: `tests/loops/test_trade_loop.py:31-69` (`_loop` fixture に `core_lock`/`conn_supervisor` 追加)
+- Modify: `tests/loops/test_trade_loop.py:31-69` (`_loop` fixture に `core_lock`/`conn_supervisor` 追加。**現物と一致 — ドリフトなし**)
 - Test: `tests/loops/test_trade_loop_phases.py` (新規 — lock 境界の直接検証。**追加 (Task 14 申し送り): commit-core 中に `notifier.send` が呼ばれないことの pin**)
 
 **(Task 14 レビュー 2 周からの申し送り — 本 task で必ず回収すること) commit-pre の外部取得失敗が「記録済みの gate 拒否」にならない。**
@@ -7506,7 +7566,7 @@ Expected: FAIL (`TypeError: TradeLoop.__init__() missing ... 'core_lock'` 等 �
 
 - [ ] **Step 3: `executor.py` の `record_and_validate_intent` + rename**
 
-`src/agentic_fx/core/executor.py` の `handle_intent` (215-252 行) を以下に置き換える:
+`src/agentic_fx/core/executor.py` の `handle_intent` (**現物 285-322 行 — 照合済み**) を以下に置き換える:
 
 ```python
     def record_and_validate_intent(self, intent: TradeIntent,
@@ -7563,7 +7623,126 @@ Expected: FAIL (`TypeError: TradeLoop.__init__() missing ... 'core_lock'` 等 �
         return self.cancel_intent(intent, iid)
 ```
 
-`_close` (369-384 行) を `close_intent` に rename する (メソッド名のみ変更、本体は無変更)。`_cancel` (461-473 行) を `cancel_intent` に rename する (同上)。`_close`/`_cancel` を呼んでいた他の箇所が無いことを `grep -n "self\._close(\|self\._cancel(" src/agentic_fx/core/executor.py` で確認する (`handle_intent` からの呼び出しは上で `close_intent`/`cancel_intent` に更新済み)。
+`_close` (**現物 604-619 行**) を `close_intent` に、`_cancel` (**現物 775-787 行**) を `cancel_intent` に rename する。`_close`/`_cancel` を呼んでいた他の箇所が無いことを `grep -n "self\._close(\|self\._cancel(" src/agentic_fx/core/executor.py` で確認する (`handle_intent` からの呼び出しは上で更新済み)。
+
+**さらに (Task 14 レビュー 1 周からの申し送りの回収 — 散文だけで Step に無かった分):
+拒否分岐の `activity.write` を対称化する。** 現状、`open_from_snapshot` の拒否分岐は
+すべて `gate_rejected` を activity に書くのに、CLOSE/CANCEL 側は `set_gate_result` しか
+書かない。運用時に「なぜ LLM の close 指示が実行されなかったか」が activity ログから
+追えない。**以下 4 箇所すべてに追加する** (いずれも既存の `set_gate_result` の直後):
+
+```python
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+```
+
+| メソッド | 分岐 |
+|---|---|
+| `close_intent` (旧 `_close`) | `row is None or row["status"] != S.OPEN.value` |
+| `cancel_intent` (旧 `_cancel`) | `row is None or row["status"] != S.PENDING_FILL.value` |
+| `close_from_snapshot` | `snapshot is None` |
+| `close_from_snapshot` | 鮮度切れ (stale) |
+
+**`close_from_snapshot` の `SnapshotCoverageError` 捕捉分岐は Task 14 で既に
+`activity.write` を持っている** — 重複して追加しないこと (現物を確認してから書く)。
+
+**pin の張り方**: `tests/core/test_executor_snapshot.py` の既存の拒否テスト
+(`test_close_from_snapshot_rejects_when_snapshot_is_none` /
+`test_close_from_snapshot_rejects_stale_snapshot`) に
+`assert any("gate_rejected" in l for l in ex.activity.tail(n=50, category=Category.TRADE))`
+を足す。**追加後、`activity.write` の行を消す変異で red になることを実測すること。**
+
+- [ ] **Step 3.5 (新設 — Task 14 申し送りの回収): commit-core の通知を commit-post へ遅延させる**
+
+**機構は「Executor 側の遅延フラグ + drain」に確定する (2026-08-09 指揮者裁定)。**
+戻り値で通知を返す案は採らない — `_finish_close`/`_close_unknown`/`_evaluate_and_execute_open` は
+`close_order`/`_open` (scheduler・バックテスト経路) と**共有**されており、Task 14 が 3 周かけて
+「逐語不変」として pin した契約を変えてしまうため。フラグ方式なら**共有メソッドのシグネチャは
+1 文字も変わらず、scheduler 経路は既定で従来どおり即時送信**になる。
+
+`Executor.__init__` に追加:
+
+```python
+        # commit-core 相 (core_lock 保持中) の通知を溜める先。None のとき
+        # は即時送信 (scheduler・バックテスト経路の既定)。設計書 §3.1 /
+        # Task 14 申し送り: Notifier.send は urlopen(timeout=10) の同期
+        # 実行なので、commit-core で呼ぶと core_lock を握ったまま最大 10 秒
+        # ブロックし、SL/TP 監視が止まる。
+        self._deferred_notifications: list[str] | None = None
+```
+
+`Executor` にメソッドを追加:
+
+```python
+    def _notify(self, text: str) -> None:
+        """通知の単一出口。遅延中なら溜めるだけ、そうでなければ即時送信。"""
+        if self._deferred_notifications is not None:
+            self._deferred_notifications.append(text)
+            return
+        self.notifier.send(text)
+
+    @contextmanager
+    def defer_notifications(self):
+        """commit-core 相専用 — この中の通知は送らずに溜め、`with` を抜けた
+        後に呼び出し元 (commit-post 相) が送る。
+
+        **スレッド安全性の根拠**: `Executor` は Mission スレッドと scheduler
+        スレッドで共有されるが、**commit-core も scheduler tick も
+        `core_lock` を保持している間しか executor を触らない**
+        (`service.py:592` の `with app.core_lock: app.scheduler.tick(...)`)。
+        したがって遅延窓と tick は相互排他であり、scheduler の通知が
+        Mission の遅延リストに紛れ込むことはない。
+        **この不変条件が崩れると通知が別 Mission に付け替わる** ので、
+        `core_lock` 非保持でこのコンテキストに入ってはならない。
+        """
+        assert self._deferred_notifications is None, \
+            "defer_notifications is not re-entrant"
+        pending: list[str] = []
+        self._deferred_notifications = pending
+        try:
+            yield pending
+        finally:
+            self._deferred_notifications = None
+```
+
+import 節に `from contextlib import contextmanager` を追加する。
+
+**既存の `self.notifier.send(...)` 4 箇所をすべて `self._notify(...)` に置き換える**
+(現物で行番号を確認してから — 2026-08-09 時点は下表):
+
+| 現物の行 | メソッド | 到達する commit-core 経路 |
+|---|---|---|
+| 420 | `_evaluate_and_execute_open` | `open_from_snapshot` |
+| 573 | `_close_unknown` | `close_order_from_snapshot` |
+| 600 | `_finish_close` (degraded 分岐) | `close_order_from_snapshot` |
+| 772 | `cancel_order` | `cancel_intent` |
+
+**`grep -c "self.notifier.send" src/agentic_fx/core/executor.py` が 0 になること**を確認する
+(`self.notifier` は `_notify` の中だけで使われる)。
+
+**pin の張り方** (Task 14 のテストは `Notifier(enabled=False)` 固定でこの経路を一度も
+踏んでいなかった — レビューで判明):
+
+`tests/core/test_executor_snapshot.py` に**記録型スタブ**で 1 本追加する。
+「呼ばれたら raise」は `except Exception` に飲まれるので使わないこと:
+
+```python
+class _RecordingNotifier:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def send(self, text: str) -> None:
+        self.sent.append(text)
+```
+
+- **遅延中**: `with ex.defer_notifications() as pending:` の中で
+  `close_order_from_snapshot` を broker 失敗させて呼び、
+  **`notifier.sent == []` かつ `pending` が 1 件**であること
+- **遅延外 (scheduler 経路の非退行)**: 同じ失敗を `close_order` (既存経路) で起こし、
+  **`notifier.sent` が 1 件**であること (= 既定は即時送信のまま)
+
+**変異**: `_notify` の遅延分岐 (`if self._deferred_notifications is not None:`) を
+削除して常に即時送信に戻す → 上の 1 本目が red になることを実測する。
 
 - [ ] **Step 4: `config.py`/`settings.yaml.example` に `snapshot_max_age_sec` を追加**
 
@@ -7612,7 +7791,11 @@ class TradeLoop:
         self.watch = watch if watch is not None else MissionWatch()
 ```
 
-`_run_once_impl` (80-190 行) を以下に置き換える:
+`_run_once_impl` (80-190 行 — **現物と一致**) を以下に置き換える。
+
+**⚠ このブロックは構造の指示であり逐語の貼り付け原稿ではない。** 上の着手前検証 (3) に挙げた
+既存コメント 6 箇所が落ちているので、**移動対象領域の既存コメントは 1 行残らず保存すること。**
+置き換え後に `git diff` を読み、消えたコメントが無いことを自分で確認せよ:
 
 ```python
     def _run_once_impl(self, trigger: str = "cron") -> dict | None:
@@ -7735,7 +7918,11 @@ class TradeLoop:
                         snapshot_error = e
 
             # ---- commit-core (core_lock 保持) ----
-            with self._core_lock:
+            # **通知は commit-post まで遅延させる (Step 3.5)** — Notifier.send は
+            # urlopen(timeout=10) の同期実行なので、ここで送ると core_lock を
+            # 握ったまま最大 10 秒ブロックし SL/TP 監視が止まる。
+            with self._core_lock, \
+                    self.executor.defer_notifications() as deferred:
                 if claimed is not None:
                     # ⑥consume/requeue の確定規則: パース成功の時点で
                     # consume する (プロンプトに実際に載せた Mission が
@@ -7745,11 +7932,34 @@ class TradeLoop:
                                     now=self.clock.now())
                     consumed = True
                 try:
-                    if snapshot_error is not None:
-                        raise snapshot_error
                     iid, early = self.executor.record_and_validate_intent(
                         intent, mid)
-                    if early is not None:
+                    if snapshot_error is not None:
+                        # **(Task 14 レビュー 2 周からの申し送りの回収)**
+                        # commit-pre の外部取得失敗を、ライブ経路 (`_open` の
+                        # `except DataUnhealthy`) と**同じ形の「記録済み gate
+                        # 拒否」**に変換する。ここを汎用の
+                        # `intent_execution_failed` にすると
+                        # `trade_intents.gate_result` が NULL のまま残り、
+                        # 「なぜ発注されなかったか」を DB から追えない。
+                        #
+                        # `record_and_validate_intent` を**先に**呼ぶのは
+                        # `iid` を得るため (intent の記録自体は常に行う契約)。
+                        # early (hold/origin/mission 拒否) が確定している
+                        # ケースはそちらを優先する — snapshot は使わない。
+                        if early is not None:
+                            out = early
+                        else:
+                            reasons = ["execution snapshot unavailable: "
+                                       + safe_error_text(snapshot_error)]
+                            intents_store.set_gate_result(
+                                self.conn, iid, accepted=False,
+                                reject_reason=reasons[0])
+                            self.activity.write(Category.TRADE, "gate_rejected",
+                                                reasons[0], ref_id=str(iid))
+                            out = {"result": "rejected", "order_id": None,
+                                   "reasons": reasons}
+                    elif early is not None:
                         out = early
                     elif intent.action is Action.OPEN:
                         out = self.executor.open_from_snapshot(
@@ -7767,12 +7977,28 @@ class TradeLoop:
                     self.activity.write(Category.AGGREGATE,
                                         "intent_execution_failed",
                                         safe_error_text(e), ref_id=str(mid))
-                    self.notifier.send(
+                    # **`self.notifier.send` をここで呼んではならない** —
+                    # まだ core_lock 保持中であり、urlopen(timeout=10) で
+                    # 最大 10 秒ブロックする。commit-post まで遅延させ、
+                    # `return` せずに with を抜けてから送る (Step 3.5)。
+                    deferred.append(
                         f"[agentic-fx] 注文処理失敗: {safe_error_text(e)}")
-                    return None
-                self._finalize_mission(mid, result)
+                    out = None
+                else:
+                    self._finalize_mission(mid, result)
 
             # ---- commit-post (core_lock 非保持) ----
+            # commit-core で溜めた通知をここで送る (Step 3.5)。送信失敗で
+            # 本流を殺さない — 通知は保守処理であり、発注結果は既に確定済み。
+            # **失敗経路 (out is None) もここを必ず通る** — commit-core から
+            # 直接 return すると通知が送られないまま捨てられる。
+            for _text in deferred:
+                try:
+                    self.notifier.send(_text)
+                except Exception:  # noqa: BLE001 — 通知失敗で本流を止めない
+                    _log.exception("deferred notification failed")
+            if out is None:
+                return None
             self.activity.write(Category.AGGREGATE, "decision",
                                 f"{intent.action.value} -> {out['result']}",
                                 ref_id=str(mid))
@@ -7940,7 +8166,7 @@ Expected: 全件 PASS。
         return trade_loop.ask_once(question)
 ```
 
-`TradeLoop(...)` の構築 (348-352 行) に `core_lock=core_lock, conn_supervisor=conn_supervisor` を追加する (`conn_supervisor` は Task 13 で `App`/`build_app` に既に構築済み)。**(裁定書 F-6 / CR-5) `provider=provider` (書込可能な `conn_core` 版) を渡していた箇所を、`conn_supervisor` (RO) で構築した専用の `healthcheck_provider` に差し替える** — `provider` 変数自体は `market_tools.build(provider, ...)` (`_assert_tools_registered` の起動時検証用) や `Executor(quote_fn=...)` の束縛元として他所で使われ続けるため無変更のまま残し、`TradeLoop` にだけ別インスタンスを渡す (`TradeLoop.provider` は healthcheck 専用でこれ以外に使われないため、この差し替えの影響範囲は healthcheck だけに閉じる):
+`TradeLoop(...)` の構築 (**現物 464-471 行**) に `core_lock=core_lock, conn_supervisor=conn_supervisor` を追加する (`conn_supervisor` は Task 13 で `App`/`build_app` に既に構築済み)。**(裁定書 F-6 / CR-5) `provider=provider` (書込可能な `conn_core` 版) を渡していた箇所を、`conn_supervisor` (RO) で構築した専用の `healthcheck_provider` に差し替える** — `provider` 変数自体は `market_tools.build(provider, ...)` (`_assert_tools_registered` の起動時検証用) や `Executor(quote_fn=...)` の束縛元として他所で使われ続けるため無変更のまま残し、`TradeLoop` にだけ別インスタンスを渡す (`TradeLoop.provider` は healthcheck 専用でこれ以外に使われないため、この差し替えの影響範囲は healthcheck だけに閉じる):
 
 ```python
     # プラン 8 (Task 15, レビュー反映1回目 裁定書 F-6/CR-5): TradeLoop の
@@ -7964,7 +8190,7 @@ Expected: 全件 PASS。
                            watch=mission_watch)
 ```
 
-**注意**: `conn_supervisor`/`core_lock` は `build_app` 内で `trade_loop = TradeLoop(...)` より**前**に定義されている必要がある。`conn_supervisor` は Task 13 で `conn_shell` 構築の直後 (かなり早い位置) に新設済みのため既に条件を満たすが、`core_lock = threading.RLock()` は既存コードで 357 行目 (= `trade_loop = TradeLoop(...)` の 348 行目より**後**) にある — `core_lock` の定義を `trade_loop` 構築より前に移動すること (`grep -n "core_lock = threading\|trade_loop = TradeLoop" src/agentic_fx/service.py` で現状の行順を確認してから並べ替える)。`PriceProvider(..., readonly=True)` kwarg は Task 5 (CR-4 対応) で新設済み — 未実装のままここに到達している場合は Task 5 の適用漏れを疑うこと。
+**注意**: `conn_supervisor`/`core_lock` は `build_app` 内で `trade_loop = TradeLoop(...)` より**前**に定義されている必要がある。`conn_supervisor` は Task 13 で `conn_shell` 構築の直後 (かなり早い位置) に新設済みのため既に条件を満たすが、`core_lock = threading.RLock()` は**現物 473 行目** (= `trade_loop = TradeLoop(...)` の **464 行目**より**後**) にある — `core_lock` の定義を `trade_loop` 構築より前に移動すること (`grep -n "core_lock = threading\|trade_loop = TradeLoop" src/agentic_fx/service.py` で現状の行順を確認してから並べ替える)。`PriceProvider(..., readonly=True)` kwarg は Task 5 (CR-4 対応) で新設済み — 未実装のままここに到達している場合は Task 5 の適用漏れを疑うこと。
 
 **(裁定書 F-1 / CR-2 / P8-01 追加) `tests/loops/test_trade_loop_phases.py` に CLOSE 版の lock-free 回帰テストを追加する** (Step 1 の `test_scheduler_tick_can_acquire_lock_while_worker_runner_blocks` の直後):
 
@@ -8095,7 +8321,76 @@ Expected: 全件 PASS。
 
 - [ ] **Step 11: 変異テスト**
 
-1. `_run_once_impl` の `with self._core_lock:` (commit-core 相) のインデントを崩して lock 外に出す (意図的な変異) → `test_run_once_does_not_hold_core_lock_during_runner_run` は影響を受けない設計 (run 相自体は変わらない) が、代わりに commit-core の DB 書込が保護されなくなることを検出する専用テストが無い — **これはこの task の変異テストの限界であり、Task 20 の E2E (Mission 実行中の SL/TP 監視) がこの種の退行を実質的に検出する唯一の防波堤であることを progress.md に明記する**
+**リストは下限。** この task が守ろうとしている性質は「**run 相で core_lock を保持しない**」と
+「**commit-core では保持する**」の 2 つ (対の不変条件)。この 2 点を壊す変異を自分で追加し、
+red になるかを確かめよ。**リストに無い変異を追加したら、その内容と結果 (KILLED/SURVIVED) を
+必ず報告せよ。** また **KILLED でも「落ちたテスト名が狙った防御のものか」を確認**すること
+(件数だけ見ない — 別の理由で落ちているケースが実在する)。
+
+1. `_run_once_impl` の `with self._core_lock:` (commit-core 相) を外して lock 非保持にする
+   → **下記の `test_commit_core_holds_core_lock` が red になること。**
+
+   **(2026-08-09 着手前検証で改訂)** 旧プランはここを「変異テストの限界」として Task 20 の
+   E2E に丸投げしていた。**本 task の存在理由そのものが lock 境界である以上、最も殺したい
+   変異を測れないまま先へ進めてはならない。** 同じファイル内の
+   `test_requeue_signal_happens_under_core_lock` (Step 9) が**まさにこの形を実現している** —
+   対象メソッドを spy で差し替えて呼び出しの「最中」に留め、**別スレッド (checker)** から
+   `acquire(blocking=False)` を試して `False` を期待する。`connect(check_same_thread=False)`
+   (`store/db.py:153`) なので別スレッドからの DB 利用も問題ない (現物確認済み)。
+
+   `tests/loops/test_trade_loop_phases.py` に追加する:
+
+   ```python
+   def test_commit_core_holds_core_lock(tmp_path):
+       """設計書 §3.1: commit-core 相 (consume/Risk Gate/執行/finish) は
+       core_lock を保持したまま実行される。run 相が lock 非保持であることと
+       対になる不変条件で、**こちらが崩れると DB 書込が無保護になる**。
+
+       executor の呼び出しを spy で捕まえて「実行中」に留め、別スレッドから
+       core_lock を取れないことを確認する (RLock は同一スレッドからは常に
+       取れてしまうため、必ず別スレッドで確かめる)。
+       """
+       conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+           "completed", {"action": "hold", "reasoning": "x"}, [])])
+
+       entered = threading.Event()
+       proceed = threading.Event()
+       original = loop.executor.record_and_validate_intent
+
+       def spy(*args, **kwargs):
+           entered.set()
+           assert proceed.wait(5.0), "checker スレッドが確認を完了しなかった"
+           return original(*args, **kwargs)
+
+       loop.executor.record_and_validate_intent = spy
+       t = threading.Thread(target=lambda: loop.run_once("cron"), daemon=True)
+       t.start()
+       assert entered.wait(5.0), "commit-core に到達しなかった"
+
+       acquired: list[bool] = []
+       checker = threading.Thread(
+           target=lambda: acquired.append(
+               loop._core_lock.acquire(blocking=False)))
+       checker.start()
+       checker.join(timeout=5.0)
+       if acquired and acquired[0]:
+           loop._core_lock.release()
+       assert acquired == [False], (
+           "commit-core 実行中は他スレッドから core_lock を取得できないはず")
+
+       proceed.set()
+       t.join(timeout=5.0)
+       assert not t.is_alive()
+   ```
+
+   **注意**: `record_and_validate_intent` は HOLD でも呼ばれる (intent の記録は常に行う契約)
+   ので、`{"action": "hold"}` の結果で commit-core に到達する。`runner.results` の与え方は
+   `FakeRunner` の現物に合わせること。
+
+   **これが green になれば、Task 20 の E2E は「唯一の防波堤」ではなくなる** —
+   progress.md への「限界」の明記は不要になる。もし何らかの理由でこのテストが
+   書けなかった場合のみ、旧プランどおり Task 20 への申し送りとして記録すること
+   (**書けなかった理由を必ず報告すること**)。
 2. `record_and_validate_intent` の `if intent.action is Action.HOLD:` を削除 → `tests/core/test_executor.py` の hold 系テストが red
 3. `_read_exposure_pairs` が `executor._EXPOSURE` の代わりに `(S.OPEN,)` のみを使うよう改変 → 専用テストが無ければ `tests/core/test_executor_snapshot.py` の `test_open_from_snapshot_rejects_when_exposure_grew_after_commit_pre` 相当が (統合すれば) red になることを確認する
 4. **(裁定書 F-1 追加)** commit-pre の CLOSE 分岐 (`elif intent.action is Action.CLOSE:` ブロック) を削除し、代わりに commit-core 内で毎回 `self.executor.gather_close_snapshot(row)` を呼ぶよう戻す (I/O をロック内に再導入する変異) → `test_scheduler_tick_can_acquire_lock_while_close_quote_fetch_blocks` が red (タイムアウトして `acquired is False`)
