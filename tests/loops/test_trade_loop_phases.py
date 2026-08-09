@@ -220,9 +220,18 @@ def test_signal_prepare_exception_after_claim_requeues_signal(tmp_path):
 
 
 def test_commit_pre_unexpected_exception_finalizes_mission(tmp_path):
-    """codex A3 (レビュー 1 周目): commit-pre の想定外例外
-    (`_read_exposure_pairs` 等、既存の try/except に入っていない箇所) でも
-    mission が running のまま残らないことを確認する。"""
+    """codex A3 (レビュー 1 周目) → **契約更新 (レビュー 3 周目 codex
+    E5)**: `_read_exposure_pairs` は以前は `gather_open_snapshot` の
+    try の**外**にあり、その例外は `_run_once_impl` を丸ごと脱出して
+    外側 finally の fail-closed finalize (mission "failed") に頼って
+    いた。これは D3 (`signals.consume`) で塞いだのと同じ欠陥クラスで、
+    `trade_intents` に一切痕跡が残らなかった (E5 で同じ try に統合)。
+
+    新しい契約では `_read_exposure_pairs` の失敗も `gather_open_snapshot`
+    の失敗と**同じ形の「記録済み gate 拒否」**になる — `_run_once_impl`
+    はもう例外を送出せず、`trade_intents` に `gate_result='rejected'` が
+    残り、mission は (実行自体は completed した runner 判断の) 通常の
+    commit-core 経路で finalize される。"""
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed",
         {"action": "open", "pair": "USDJPY", "direction": "long",
@@ -232,12 +241,23 @@ def test_commit_pre_unexpected_exception_finalizes_mission(tmp_path):
     loop._read_exposure_pairs = MagicMock(
         side_effect=RuntimeError("exposure_boom"))
 
-    with pytest.raises(RuntimeError):
-        loop._run_once_impl("cron")
+    out = loop.run_once("cron")
 
+    assert out is not None
+    assert out["result"] == "rejected"
+    iid_row = conn.execute(
+        "SELECT gate_result FROM trade_intents ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert iid_row["gate_result"] == "rejected"
+    act_text = (tp / "a.log").read_text(encoding="utf-8")
+    assert "gate_rejected" in act_text
+    assert "intent_execution_failed" not in act_text, (
+        "_read_exposure_pairs の失敗が汎用の intent_execution_failed に"
+        "落ちている (記録済み gate 拒否になっていない)")
     m = conn.execute(
         "SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()
-    assert m["status"] == "failed", "mission が running のまま残っている"
+    assert m["status"] != "running", "mission が running のまま残っている"
+    assert m["status"] == "completed"
 
 
 def test_ask_prepare_run_unexpected_exception_finalizes_mission(tmp_path):

@@ -711,6 +711,41 @@ def test_run_service_closes_owned_runner_on_graceful_shutdown(tmp_path):
     assert "service_stopped" in act and "graceful" in act
 
 
+def test_run_service_derives_supervisor_join_timeout_from_mission_timeout(
+        tmp_path):
+    """レビュー 3 周目 codex E2: `supervisor.join` の budget は
+    `shutdown_join_timeout_sec` (Mission の timeout と無関係な固定 30 秒)
+    ではなく、`llama_swap.timeout_sec + worker_grace_sec +
+    worker_terminate_grace_sec + 10.0` (`ask_wait_timeout_sec` と同じ
+    導出) から計算されることを直接確認する。"""
+    app = _seam_app(tmp_path, FakeRunner([]))
+    app.settings.llama_swap.timeout_sec = 42.0
+    app.settings.worker.worker_grace_sec = 3.0
+    app.settings.worker.worker_terminate_grace_sec = 2.0
+    # 使われないはずの旧 knob — 意図的にかけ離れた値にしておき、これが
+    # 使われていたら即座に露見するようにする。
+    app.settings.worker.shutdown_join_timeout_sec = 999.0
+
+    recorded: dict = {}
+    original_join = app.supervisor.join
+
+    def spy_join(timeout=None):
+        recorded["timeout"] = timeout
+        return original_join(timeout=timeout)
+
+    app.supervisor.join = spy_join
+
+    stop_event = threading.Event()
+    stop_event.set()
+    with _no_real_network(), \
+         patch("agentic_fx.service.build_app", return_value=app), \
+         patch("agentic_fx.service.signal.signal"):
+        rc = run_service(tmp_path, daemon=True, _stop_event=stop_event)
+
+    assert rc == 0
+    assert recorded.get("timeout") == pytest.approx(42.0 + 3.0 + 2.0 + 10.0)
+
+
 def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path):
     """レビュー 2 周目 codex D1 (Critical): プラン8 Task 15 で run 相/
     commit-pre/commit-post が core_lock を保持しなくなったため、scheduler
@@ -720,7 +755,11 @@ def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path
     もう成立しない。Mission (commit-core を含む) を実際に実行しているのは
     supervisor スレッドなので、その shutdown/join も判定に加わったことで、
     commit-core が途中で止まっている状況では graceful ではなく
-    shutdown_timeout が記録されることを確認する。"""
+    shutdown_timeout が記録されることを確認する。
+
+    レビュー 3 周目 codex E2 の pin も兼ねる: shutdown_timeout でも
+    (子プロセス/接続の leak を防ぐため) `runner.close()` が呼ばれること。
+    """
     from agentic_fx.core.accounting import record_snapshot
 
     entered = threading.Event()
@@ -728,9 +767,19 @@ def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path
 
     fake = FakeRunner([MissionResult(
         "completed", {"action": "hold", "reasoning": "x"}, [])])
+    fake.close = MagicMock()  # codex E2 pin: timeout 時も close() されること
     app = _seam_app(tmp_path, fake)
-    # supervisor.join のタイムアウトを短くしてテストを高速化する。
-    app.settings.worker.shutdown_join_timeout_sec = 0.3
+    app.owns_runner = True
+    # レビュー 3 周目 codex E2: supervisor.join の budget は
+    # `shutdown_join_timeout_sec` (廃止) ではなく
+    # `llama_swap.timeout_sec + worker_grace_sec +
+    # worker_terminate_grace_sec + 10.0` から導出されるようになった。
+    # テストを高速化するため Mission timeout 側を縮める (budget は
+    # 0.1+0.1+0.1+10.0 = 10.3 秒 — 固定マージン 10 秒はコード側の定数
+    # なので設定では縮められない)。
+    app.settings.llama_swap.timeout_sec = 0.1
+    app.settings.worker.worker_grace_sec = 0.1
+    app.settings.worker.worker_terminate_grace_sec = 0.1
     record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                     equity=1_000_000)
 
@@ -738,7 +787,9 @@ def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path
 
     def spy(*args, **kwargs):
         entered.set()
-        assert release.wait(10.0), "release が来なかった"
+        # budget (約 10.3 秒) より長く留まり続け、shutdown 判定が下る前に
+        # spy 自身が自然完了してしまわないようにする。
+        assert release.wait(30.0), "release が来なかった"
         return original(*args, **kwargs)
 
     app.trade_loop.executor.record_and_validate_intent = spy
@@ -767,6 +818,9 @@ def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path
     act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
     assert "shutdown_timeout" in act, (
         "commit-core 実行中にも関わらず graceful と記録されている")
+    # codex E2 pin: shutdown_timeout でも runner.close() は呼ばれる
+    # (子プロセス/接続の leak を防ぐ — 以前は join 成功時のみ close していた)
+    fake.close.assert_called_once()
 
     release.set()
     future.result(timeout=5.0)
@@ -776,6 +830,62 @@ def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path
     # 通り過ぎるため、生死を明示的に確かめる。
     assert not app.supervisor.is_alive(), (
         "supervisor スレッドがテスト終了後も生存している (後続テストを汚染する)")
+
+
+def test_run_service_rejects_try_submit_during_shutdown_before_scheduler_exits(
+        tmp_path):
+    """レビュー 3 周目 codex E3: `supervisor.shutdown()` は `th.join()`
+    より**前**に呼ぶ — stop_event.set() の時点で既に走っていた scheduler
+    tick は on_trade_mission → supervisor.try_submit まで到達しうるため、
+    shutdown() (新規受付停止) が後回しだと、停止処理の最中に新しい
+    trade+reflection Mission が受理されてしまう (それが timeout として
+    報告される)。
+
+    scheduler tick を任意の時点でブロックできるようにし、`th.join()` が
+    実際にブロック中の間に `try_submit` が既に拒否される (=
+    shutdown() が th.join() より前に実行済み) ことを確認する。
+    """
+    tick_entered = threading.Event()
+    tick_release = threading.Event()
+
+    def blocking_tick(app):
+        tick_entered.set()
+        assert tick_release.wait(10.0), "tick_release が来なかった"
+
+    fake = FakeRunner([])
+    app = _seam_app(tmp_path, fake)
+
+    stop_event = threading.Event()
+    result_box: dict = {}
+
+    def _run():
+        with patch("agentic_fx.service.build_app", return_value=app), \
+             patch("agentic_fx.service.signal.signal"), \
+             patch("agentic_fx.service._scheduler_tick_once",
+                  side_effect=blocking_tick):
+            result_box["rc"] = run_service(tmp_path, daemon=True,
+                                           _stop_event=stop_event)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    try:
+        assert tick_entered.wait(5.0), "scheduler tick が開始しなかった"
+        # tick がブロック中 (th.join(30) がまだ完了できない状況) に
+        # stop_event を立てる。run_service の finally は
+        # supervisor.shutdown() → th.join(30) の順で実行されるはずなので、
+        # th.join() がブロックしている間も try_submit は既に拒否される。
+        stop_event.set()
+        # run_service の finally が supervisor.shutdown() まで到達する
+        # ための猶予 (shutdown() 自体は一瞬で終わる — ブロックしない)。
+        time.sleep(0.3)
+        assert app.supervisor.try_submit("trade", trigger="cron") is None, (
+            "shutdown() が th.join() より後に実行されている — 停止処理の"
+            "最中に新しい Mission が受理されてしまう")
+    finally:
+        tick_release.set()
+        t.join(timeout=10.0)
+    assert not t.is_alive()
+    assert result_box.get("rc") == 0
 
 
 class _KeyboardInterruptOnMainWait(threading.Event):
@@ -1413,31 +1523,50 @@ def test_trade_loop_healthcheck_provider_is_readonly(tmp_path):
 
 
 def test_trade_loop_healthcheck_provider_uses_injected_dataflow_seam(tmp_path):
-    """レビュー 2 周目 codex D2: quote_fn/spec_fn/bars_fn (または provider)
-    でデータフィードを stub した呼び出し元では、TradeLoop の healthcheck
-    専用 provider もその同じ stub 済みインスタンスを使うこと — 素の起動時
-    専用に構築される実 PriceProvider (RO) を迂回して実 yfinance/MT5
-    チェーンへ行かないことを確認する (以前は quote_fn 等を stub しても
-    healthcheck だけ実ネットワークへ行っていた — 取引 Mission が
-    DataUnhealthy で黙ってスキップされる退行だった)。"""
+    """レビュー 3 周目 codex E1: quote_fn (テスト・オフライン E2E の注入
+    seam) は healthcheck 専用 provider の `get_quote` にも反映される —
+    ただし healthcheck_provider 自身は**常に** RO (`conn_supervisor` +
+    `readonly=True`) で構築された別インスタンスであること (F-6/CR-5)。
+
+    レビュー 2 周目 codex D2 は「注入時は app.provider をそのまま流用する」
+    という形で直したが、これは quote_fn だけを注入し provider= は注入
+    しない呼び出し元では、書込可能な conn_core 版 provider を healthcheck
+    に使うことになり F-6/CR-5 を打ち消していた (レビュー3周目 codex E1 —
+    指揮者の指示ミス)。RO であることと注入 seam が効くことの両方を
+    同時に確認する。
+    """
     _init(tmp_path)
-    quote_fn = lambda pair: None  # noqa: E731 — 呼ばれないことだけが関心
+    calls: list[str] = []
+
+    def quote_fn(pair):
+        calls.append(pair)
+        return None
+
     app = build_app(tmp_path, quote_fn=quote_fn)
-    # データフィードが注入された場合、healthcheck 専用の別インスタンスを
-    # 新規構築せず、`app.provider` (quote_fn が bound 済みの同一インスタンス)
-    # をそのまま使う — 1 箇所を patch/注入すれば healthcheck にも効く
-    # (プラン8 Task 15 以前の挙動に戻す)。
-    assert app.trade_loop.provider is app.provider
+    # healthcheck_provider は app.provider と別インスタンスの RO 版
+    assert app.trade_loop.provider is not app.provider
+    assert app.trade_loop.provider.conn is app.conn_supervisor
+    assert app.trade_loop.provider.readonly is True
+    # それでも注入した quote_fn は healthcheck_provider.get_quote 経由で
+    # 呼ばれる (stub が効く)
+    app.trade_loop.provider.get_quote("USDJPY")
+    assert calls == ["USDJPY"]
 
 
 def test_trade_loop_healthcheck_provider_reuses_injected_provider_seam(tmp_path):
-    """レビュー 2 周目 codex D2 (provider= フル注入版): `provider=` で
-    PriceProvider を丸ごと注入した場合も、healthcheck 専用に別の実
-    PriceProvider を新規構築せず、注入されたインスタンスをそのまま使う。"""
+    """レビュー 3 周目 codex E1 (provider= フル注入版): `provider=` で
+    PriceProvider を丸ごと注入した場合も、healthcheck 専用 provider は
+    RO (`conn_supervisor` + `readonly=True`) の別インスタンスのまま、
+    `get_quote`/`spec`/`latest_1m_bar` だけが注入された provider の
+    束縛メソッドを経由する (RO と stub 尊重の両立)。"""
     _init(tmp_path)
     stub_provider = MagicMock()
     stub_provider.get_quote = MagicMock()
     stub_provider.spec = MagicMock()
     stub_provider.latest_1m_bar = MagicMock()
     app = build_app(tmp_path, provider=stub_provider)
-    assert app.trade_loop.provider is stub_provider
+    assert app.trade_loop.provider is not stub_provider
+    assert app.trade_loop.provider.conn is app.conn_supervisor
+    assert app.trade_loop.provider.readonly is True
+    app.trade_loop.provider.get_quote("USDJPY")
+    stub_provider.get_quote.assert_called_once_with("USDJPY")

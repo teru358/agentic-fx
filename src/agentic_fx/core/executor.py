@@ -185,14 +185,35 @@ class Executor:
         """commit-core 相専用 — この中の通知は送らずに溜め、`with` を抜けた
         後に呼び出し元 (commit-post 相) が送る。
 
-        **スレッド安全性の根拠**: `Executor` は Mission スレッドと scheduler
-        スレッドで共有されるが、**commit-core も scheduler tick も
-        `core_lock` を保持している間しか executor を触らない**
-        (`service.py:592` の `with app.core_lock: app.scheduler.tick(...)`)。
-        したがって遅延窓と tick は相互排他であり、scheduler の通知が
-        Mission の遅延リストに紛れ込むことはない。
-        **この不変条件が崩れると通知が別 Mission に付け替わる** ので、
-        `core_lock` 非保持でこのコンテキストに入ってはならない。
+        **スレッド安全性の根拠 (レビュー 3 周目 codex E4 — docstring 訂正:
+        以前の記述「commit-core も scheduler tick も core_lock を保持
+        している間しか executor を触らない」は本 task (プラン8 Task 15)
+        で既に偽になっている)**: commit-pre 相 (`trade_loop.py` の
+        `gather_open_snapshot`/`gather_close_snapshot` 呼び出し箇所) は
+        **`core_lock` 非保持で** `Executor` を触り、`cycle_rate_fn`/
+        `resolve_close_rate` 経由で `Executor._last_good_rate` (dict) を
+        書き換える。したがって「executor に触るのは lock 内だけ」は成立
+        しない。
+
+        本当に守るべき不変条件は**遅延窓 (`with defer_notifications():`
+        の内側) が完全に `core_lock` の内側にあること**である —
+        `Executor` は Mission スレッドと scheduler スレッドで共有される
+        が、**commit-core も scheduler tick も、`_notify` に到達しうる
+        呼び出しは `core_lock` を保持している間にしか行わない**
+        (`service.py` の `with app.core_lock: app.scheduler.tick(...)`
+        および本 task の commit-core `with self._core_lock, \
+        self.executor.defer_notifications():`)。commit-pre が lock 非保持
+        で executor を触ることは事実だが、commit-pre から `_notify` へ
+        到達する経路は現時点で存在しない (`gather_*_snapshot` は
+        `_last_good_rate` の更新のみで通知を送らない)。
+        したがって遅延窓と tick (および `_notify` に到達しうる呼び出し)
+        は相互排他であり、scheduler の通知が Mission の遅延リストに
+        紛れ込むことはない。
+        **今後 commit-pre (または他の lock 非保持経路) から `_notify` へ
+        到達する呼び出しを増やす変更を行うときは、この遅延窓との排他が
+        崩れないかを必ず再検討すること** — 崩れると通知が別 Mission の
+        `deferred` に紛れ込む。`core_lock` 非保持でこのコンテキストに
+        入ってはならない、という制約自体は変わらない。
         """
         assert self._deferred_notifications is None, \
             "defer_notifications is not re-entrant"

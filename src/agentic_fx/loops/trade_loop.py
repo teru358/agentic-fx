@@ -213,8 +213,17 @@ class TradeLoop:
             close_snapshot = None
             snapshot_error: Exception | None = None
             if intent.action is Action.OPEN:
-                exposure_pairs = self._read_exposure_pairs()
                 try:
+                    # **(レビュー 3 周目 codex E5)** `_read_exposure_pairs`
+                    # (conn_supervisor の読取) も `gather_open_snapshot` と
+                    # 同じ try で包む。以前は 1 行上にあり、conn_supervisor
+                    # の読取失敗だけが `_run_once_impl` を丸ごと脱出して
+                    # `mission_boundary_failed` になっていた — 同じインフラ
+                    # 障害でも `gather_open_snapshot` の失敗は
+                    # `trade_intents` に記録済み gate 拒否として残るのに、
+                    # こちらは `trade_intents` の行が 1 つも残らない非対称
+                    # (D3 で塞いだのと同じ欠陥クラス) だった。
+                    exposure_pairs = self._read_exposure_pairs()
                     open_snapshot = self.executor.gather_open_snapshot(
                         intent, exposure_pairs=exposure_pairs)
                 except Exception as e:  # noqa: BLE001 — commit-core で
@@ -222,19 +231,22 @@ class TradeLoop:
                     # 確定させておき commit-core 側の分岐を単純にする)。
                     snapshot_error = e
             elif intent.action is Action.CLOSE:
-                # 裁定書 F-1 (CR-2/P8-01): CLOSE の quote/spec/close-rate も
-                # commit-pre (lock 非保持) で取得する。row が commit-pre
-                # 時点で OPEN でなければ snapshot 取得自体をスキップし
-                # (無駄な外部 I/O を避ける)、commit-core の
-                # close_from_snapshot が fresh な状態を読み直して reject
-                # する (snapshot=None のときの契約 — lock 内では取得し
-                # 直さない)。
-                row = self._read_close_row(intent.order_id)
-                if row is not None and row["status"] == S.OPEN.value:
-                    try:
+                try:
+                    # 裁定書 F-1 (CR-2/P8-01): CLOSE の quote/spec/
+                    # close-rate も commit-pre (lock 非保持) で取得する。
+                    # row が commit-pre 時点で OPEN でなければ snapshot
+                    # 取得自体をスキップし (無駄な外部 I/O を避ける)、
+                    # commit-core の close_from_snapshot が fresh な状態を
+                    # 読み直して reject する (snapshot=None のときの契約 —
+                    # lock 内では取得し直さない)。
+                    #
+                    # **(レビュー 3 周目 codex E5)** `_read_close_row` も
+                    # 同じ try で包む (OPEN 側と同じ理由)。
+                    row = self._read_close_row(intent.order_id)
+                    if row is not None and row["status"] == S.OPEN.value:
                         close_snapshot = self.executor.gather_close_snapshot(row)
-                    except Exception as e:  # noqa: BLE001
-                        snapshot_error = e
+                except Exception as e:  # noqa: BLE001
+                    snapshot_error = e
 
             # ---- commit-core (core_lock 保持) ----
             # **通知は commit-post まで遅延させる (Step 3.5)** — Notifier.send は
