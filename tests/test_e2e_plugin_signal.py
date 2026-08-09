@@ -188,9 +188,7 @@ def test_approved_strategy_signal_triggers_advanced_mission(tmp_path):
     app.supervisor.start()
     try:
         with _no_real_network(), \
-             patch.object(app.provider, "healthcheck", return_value="yfinance"), \
-             patch.object(app.trade_loop.provider, "healthcheck",
-                          return_value="yfinance"):
+             patch.object(app.provider, "healthcheck", return_value="yfinance"):
             # ③ producer 本番経路を非分格子 now で直接呼ぶ (実 sandbox 実行)。
             started = time.perf_counter()
             app.scheduler.on_signal_maintenance(NOW_PRODUCER)

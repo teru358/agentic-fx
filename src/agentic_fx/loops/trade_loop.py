@@ -242,15 +242,28 @@ class TradeLoop:
             # 握ったまま最大 10 秒ブロックし SL/TP 監視が止まる。
             with self._core_lock, \
                     self.executor.defer_notifications() as deferred:
-                if claimed is not None:
-                    # ⑥consume/requeue の確定規則: パース成功の時点で
-                    # consume する (プロンプトに実際に載せた Mission が
-                    # 確定できる)。executor 実行後の requeue は二重発注
-                    # ハザードになるため、ここで確定させる。
-                    signals.consume(self.conn, claimed["id"], mission_id=mid,
-                                    now=self.clock.now())
-                    consumed = True
                 try:
+                    if claimed is not None:
+                        # ⑥consume/requeue の確定規則: パース成功の時点で
+                        # consume する (プロンプトに実際に載せた Mission が
+                        # 確定できる)。executor 実行後の requeue は二重発注
+                        # ハザードになるため、ここで確定させる。
+                        #
+                        # **(レビュー 2 周目 codex D3)** `signals.consume`
+                        # は fail-closed (CAS 不一致で ValueError) であり、
+                        # `try:` の**内側**に置かなければならない。外側に
+                        # あると、この例外だけが `with self._core_lock,
+                        # self.executor.defer_notifications():` ブロック
+                        # 全体を素通りし、`record_and_validate_intent` が
+                        # 一度も呼ばれないまま (= `trade_intents` に行が
+                        # 残らないまま) 汎用の公開境界例外になってしまう
+                        # (completed した有効な intent が DB に理由の痕跡を
+                        # 一切残さず捨てられる)。consume が失敗したら
+                        # `consumed` は False のままにし (下の except で
+                        # 設定しない)、finally の requeue に委ねる。
+                        signals.consume(self.conn, claimed["id"],
+                                        mission_id=mid, now=self.clock.now())
+                        consumed = True
                     iid, early = self.executor.record_and_validate_intent(
                         intent, mid)
                     if snapshot_error is not None:
@@ -358,8 +371,24 @@ class TradeLoop:
     def _finalize_mission(self, mid: int, result: MissionResult) -> None:
         """missions.finish の CAS 化された呼び出し (**core_lock 保持中に
         呼ぶこと**)。設計書 §4.7 codex C-4: 二重終端は上書きせず警告のみ
-        残す。書き込み自体の例外は fail closed (旧 `_run_recorded` の
-        契約を維持)。"""
+        残す。
+
+        **(レビュー 2 周目 codex D4 — docstring 訂正)** finish 失敗時も
+        執行 (発注等) は巻き戻さない (設計書 §3.1 が finalize を
+        commit-core の**末尾** — paper broker 執行の後 — に置くため。
+        Task 15 節「⚠ 着手前検証の結果 (4)」で明示的に許容された意図的な
+        挙動変更で、旧 `_run_recorded` の「finish 失敗時は result を
+        failed に差し替え、呼び出し元を completed 系の分岐に進ませない」
+        契約はもう維持していない)。監査未確定は fail closed にはせず、
+        `mission_finalize_failed` の activity 記録で可視化したうえで、
+        mission 行は `running` のまま残し、次回起動時の
+        `recover_interrupted` による `interrupted` 回収に委ねる
+        (無警告の再発防止という旧契約の目的そのものは、activity 記録と
+        recover_interrupted の組合せで別の形で担保している)。
+
+        `_ask_once_impl` も同じ契約 (finish 失敗時に回答文字列を巻き戻さ
+        ない) を採用している — ask は読み取り専用で資金に影響しないため
+        許容される (同 Step の判断)。"""
         try:
             finished = missions.finish(self.conn, mid, result.status,
                                        result.output, result.transcript,
@@ -447,7 +476,12 @@ class TradeLoop:
 
     def _ask_once_impl(self, question: str) -> str:
         """ask Mission (プラン8 三相再構成 — trade と同じ理由: WorkerRunner
-        呼び出しが長時間ブロックしうるため lock を保持しない)。"""
+        呼び出しが長時間ブロックしうるため lock を保持しない)。
+
+        **(レビュー 2 周目 codex D4)** `_finalize_mission` (finish) が
+        失敗しても回答文字列は巻き戻さない — `_finalize_mission` の
+        docstring 参照。ask は読み取り専用で資金に影響しないため許容する
+        (`mission_finalize_failed` の activity 記録で無警告にはならない)。"""
         mid: int | None = None
         finalized = False
         try:

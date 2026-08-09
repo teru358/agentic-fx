@@ -328,6 +328,14 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     カスタム PriceProvider を渡すこと (本 E2E テスト `tests/test_e2e_phase1.py`
     参照)。
     """
+    # **(レビュー 2 周目 codex D2)** provider/quote_fn/spec_fn/bars_fn の
+    # いずれかが注入されているかを、これらの変数が下で再代入される**前**に
+    # 記録しておく。TradeLoop の healthcheck 専用 provider (下記) を、
+    # データフィードが stub 済みのときはその stub 経由にするか (real
+    # yfinance/MT5 への迂回を防ぐ)、素の起動時は F-6/CR-5 の RO
+    # PriceProvider にするかの分岐に使う。
+    _dataflow_injected = (provider is not None or quote_fn is not None
+                          or spec_fn is not None or bars_fn is not None)
     clock = clock or SystemClock()
     settings = load_settings(root / "config" / "settings.yaml")
 
@@ -475,8 +483,22 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # 一次的な書き手は scheduler tick (mark-to-market 等、既存の conn_core
         # 版 provider) であり続けるため、healthcheck が書かなくてもキャッシュ
         # 鮮度は保たれる。
-        healthcheck_provider = PriceProvider(conn_supervisor, settings, clock,
-                                             readonly=True)
+        #
+        # **(レビュー 2 周目 codex D2)** 上記は「データフィードが素の起動時」
+        # にのみ成立する。呼び出し元が provider/quote_fn/spec_fn/bars_fn の
+        # いずれかを注入した (テスト・オフライン E2E・バックテスト) 場合は、
+        # `provider` 自体が既にその stub を経由するよう配線済みの同一
+        # インスタンスなので、healthcheck 専用に別の実 PriceProvider を
+        # 新規構築すると stub を迂回して実 yfinance/MT5 チェーンへ行って
+        # しまう (取引 Mission が DataUnhealthy で黙ってスキップされる)。
+        # 注入時は `provider` をそのまま流用する — RO 制約はこの場合
+        # 呼び出し元 (stub) の責務であり、conn_core への実書込みは発生しない
+        # (テスト用途)。
+        if _dataflow_injected:
+            healthcheck_provider = provider
+        else:
+            healthcheck_provider = PriceProvider(conn_supervisor, settings,
+                                                 clock, readonly=True)
         trade_loop = TradeLoop(conn=conn_core, runner=runner, settings=settings,
                                executor=executor, provider=healthcheck_provider,
                                econ=econ, policy=policy, activity=activity,
@@ -721,16 +743,34 @@ def run_service(root: Path, *, daemon: bool = False,
         # 例外を握りつぶさない (return を置かない) — 記録後、元の例外があれば
         # そのまま再送出される。
         stop_event.set()
-        # graceful shutdown: scheduler スレッドの終了を確認してから記録する
-        # (tick は core_lock 下で走るため、join 完了 = 実行中 Mission も完了)
+        # scheduler スレッドの終了を確認する。
+        # **(レビュー 2 周目 codex D1 — この task が壊した前提の修復)**
+        # 旧コメント「tick は core_lock 下で走るため join 完了 = 実行中
+        # Mission も完了」はプラン8 Task 15 (五相再構成) でもう成立しない
+        # — run 相 (WorkerRunner.run) と commit-pre/commit-post は
+        # core_lock を保持しないため、scheduler スレッドは Mission が
+        # supervisor スレッドで実行中でも即座に tick を終えて th.join が
+        # 成功しうる。実際に Mission (commit-core 含む) を実行しているのは
+        # supervisor スレッドなので、以下で supervisor の shutdown/join も
+        # 判定に加える (完全な停止状態機械は Task 19 の担当 — ここでは
+        # 「join 完了 = 実行中 Mission も完了」という壊れた不変条件の
+        # 最小修復に留める)。
         th.join(timeout=30)
+        # supervisor: 新規受付停止 + queue 内未着手ジョブを失敗させ
+        # (fail_pending)、実行中ジョブ (commit-core を含みうる) の完了を
+        # 待つ。ブロックしないのは shutdown() 自体のみ — 完了待ちは
+        # join() の責務 (supervisor.py の docstring 参照)。
+        app.supervisor.shutdown(
+            drain_exc=RuntimeError("service shutting down"))
+        app.supervisor.join(
+            timeout=app.settings.worker.shutdown_join_timeout_sec)
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
         # 行う。notifier は最大 10 秒ブロックしうるため、記録を先にすると
         # 「graceful」記録の後に watchdog がまだ activity へ書き込める窓が
-        # 生じる。判定権威は従来どおり th.join(30) のみ — wd はここで待つ
-        # だけで graceful/timeout の判定には関与しない。
+        # 生じる。判定権威は th.join(30) + supervisor.join(...) — wd は
+        # ここで待つだけで graceful/timeout の判定には関与しない。
         wd.join(timeout=15)
-        if th.is_alive():
+        if th.is_alive() or app.supervisor.is_alive():
             app.activity.write(Category.SYSTEM, "service_stopped",
                                "shutdown_timeout (Mission 継続中の可能性)")
         else:
@@ -740,7 +780,7 @@ def run_service(root: Path, *, daemon: bool = False,
                 app.runner.close()
             app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
 
-    if th.is_alive():
+    if th.is_alive() or app.supervisor.is_alive():
         print("警告: 停止タイムアウト。実行中の処理が残っている可能性があります。")
         return 1
     print("停止しました。")

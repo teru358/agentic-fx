@@ -377,3 +377,45 @@ def test_ask_prepare_phase_holds_core_lock(tmp_path):
         proceed.set()
         t.join(timeout=5.0)
         assert not t.is_alive()
+
+
+def test_signals_consume_failure_is_caught_and_recorded(tmp_path):
+    """レビュー 2 周目 codex D3: `signals.consume` (fail-closed — CAS
+    不一致で ValueError) が commit-core の `try:` の**外**にあると、
+    例外が `with self._core_lock, defer_notifications():` ブロックを
+    丸ごと素通りし、`record_and_validate_intent` すら呼ばれないまま
+    completed した有効な intent が DB に痕跡を残さず捨てられていた。
+    `try:` の内側に移した後は、①少なくとも `intent_execution_failed` が
+    activity に残る ②signal が requeue される ③mission が終端される
+    ことを確認する。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "x"}, [])])
+    sid = signals.add(
+        conn, plugin="sig1", content_hash="h1", pair="USDJPY",
+        timeframe="1h", bar_ts=NOW.isoformat(), kind="signal",
+        payload={"direction": "long", "strength": 0.7, "rationale": "up"},
+        now=NOW)
+
+    with patch("agentic_fx.loops.trade_loop.signals.consume",
+              side_effect=ValueError("signal not claimed by mission")):
+        out = loop.run_once("signal")
+
+    assert out is None
+    act_text = (tp / "a.log").read_text(encoding="utf-8")
+    assert "intent_execution_failed" in act_text, (
+        "signals.consume の例外が commit-core の try 外へ素通りし、"
+        "activity に何も残らないまま公開境界の汎用失敗になっている")
+    row = conn.execute(
+        "SELECT status, requeue_count FROM signals WHERE id=?",
+        (sid,)).fetchone()
+    assert row["status"] == "pending", "claimed signal が回収されていない"
+    assert row["requeue_count"] == 1
+    m = conn.execute(
+        "SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()
+    # 注: _finalize_mission は runner の MissionResult.status (ここでは
+    # FakeRunner が返した "completed") で finalize する — 失敗したのは
+    # 「completed した Mission の intent 執行」であって Mission 自体の
+    # 判断ではないため、mission 行は "completed" になる。ここでの主張は
+    # 「running のまま残らない」こと。
+    assert m["status"] != "running", "mission が running のまま残っている"
+    assert m["status"] == "completed"

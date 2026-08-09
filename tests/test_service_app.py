@@ -711,6 +711,68 @@ def test_run_service_closes_owned_runner_on_graceful_shutdown(tmp_path):
     assert "service_stopped" in act and "graceful" in act
 
 
+def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path):
+    """レビュー 2 周目 codex D1 (Critical): プラン8 Task 15 で run 相/
+    commit-pre/commit-post が core_lock を保持しなくなったため、scheduler
+    スレッドは Mission (commit-core を含む) が supervisor スレッドで実行中
+    でも即座に tick を終えて `th.join(30)` が成功しうる — 旧コメント
+    「tick は core_lock 下で走るため join 完了 = 実行中 Mission も完了」は
+    もう成立しない。Mission (commit-core を含む) を実際に実行しているのは
+    supervisor スレッドなので、その shutdown/join も判定に加わったことで、
+    commit-core が途中で止まっている状況では graceful ではなく
+    shutdown_timeout が記録されることを確認する。"""
+    from agentic_fx.core.accounting import record_snapshot
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    fake = FakeRunner([MissionResult(
+        "completed", {"action": "hold", "reasoning": "x"}, [])])
+    app = _seam_app(tmp_path, fake)
+    # supervisor.join のタイムアウトを短くしてテストを高速化する。
+    app.settings.worker.shutdown_join_timeout_sec = 0.3
+    record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
+                    equity=1_000_000)
+
+    original = app.trade_loop.executor.record_and_validate_intent
+
+    def spy(*args, **kwargs):
+        entered.set()
+        assert release.wait(10.0), "release が来なかった"
+        return original(*args, **kwargs)
+
+    app.trade_loop.executor.record_and_validate_intent = spy
+
+    with patch.object(app.trade_loop.provider, "healthcheck",
+                      return_value="yfinance"), _no_real_network():
+        # supervisor を先に起動し、commit-core の最中 (spy でブロック) に
+        # 留めておく — run_service に入る前に「実行中 Mission」の状況を
+        # 作る。run_service は内部で app.supervisor.start() を呼ぶため、
+        # 二重起動 (別スレッドで queue を奪い合う) を避けて no-op に
+        # 差し替える。
+        app.supervisor.start()
+        future = app.supervisor.try_submit("trade", trigger="cron")
+        assert future is not None, "supervisor がジョブを受理しなかった"
+        assert entered.wait(5.0), (
+            "commit-core (record_and_validate_intent) に到達しなかった")
+        app.supervisor.start = lambda: None
+
+        stop_event = threading.Event()
+        stop_event.set()  # 実スリープなしで即座に shutdown 経路へ入る
+        with patch("agentic_fx.service.build_app", return_value=app), \
+             patch("agentic_fx.service.signal.signal"):
+            rc = run_service(tmp_path, daemon=True, _stop_event=stop_event)
+
+    assert rc == 1, "commit-core 実行中にも関わらず正常終了 (0) している"
+    act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert "shutdown_timeout" in act, (
+        "commit-core 実行中にも関わらず graceful と記録されている")
+
+    release.set()
+    future.result(timeout=5.0)
+    app.supervisor.join(timeout=5.0)
+
+
 class _KeyboardInterruptOnMainWait(threading.Event):
     """メインスレッドの最初の `wait()` 呼び出しだけ `KeyboardInterrupt` を
     送出する (F2 のピン)。バックグラウンドスレッド (scheduler/watchdog) からの
@@ -1343,3 +1405,34 @@ def test_trade_loop_healthcheck_provider_is_readonly(tmp_path):
     app = build_app(tmp_path)
     assert app.trade_loop.provider.conn is app.conn_supervisor
     assert app.trade_loop.provider.readonly is True
+
+
+def test_trade_loop_healthcheck_provider_uses_injected_dataflow_seam(tmp_path):
+    """レビュー 2 周目 codex D2: quote_fn/spec_fn/bars_fn (または provider)
+    でデータフィードを stub した呼び出し元では、TradeLoop の healthcheck
+    専用 provider もその同じ stub 済みインスタンスを使うこと — 素の起動時
+    専用に構築される実 PriceProvider (RO) を迂回して実 yfinance/MT5
+    チェーンへ行かないことを確認する (以前は quote_fn 等を stub しても
+    healthcheck だけ実ネットワークへ行っていた — 取引 Mission が
+    DataUnhealthy で黙ってスキップされる退行だった)。"""
+    _init(tmp_path)
+    quote_fn = lambda pair: None  # noqa: E731 — 呼ばれないことだけが関心
+    app = build_app(tmp_path, quote_fn=quote_fn)
+    # データフィードが注入された場合、healthcheck 専用の別インスタンスを
+    # 新規構築せず、`app.provider` (quote_fn が bound 済みの同一インスタンス)
+    # をそのまま使う — 1 箇所を patch/注入すれば healthcheck にも効く
+    # (プラン8 Task 15 以前の挙動に戻す)。
+    assert app.trade_loop.provider is app.provider
+
+
+def test_trade_loop_healthcheck_provider_reuses_injected_provider_seam(tmp_path):
+    """レビュー 2 周目 codex D2 (provider= フル注入版): `provider=` で
+    PriceProvider を丸ごと注入した場合も、healthcheck 専用に別の実
+    PriceProvider を新規構築せず、注入されたインスタンスをそのまま使う。"""
+    _init(tmp_path)
+    stub_provider = MagicMock()
+    stub_provider.get_quote = MagicMock()
+    stub_provider.spec = MagicMock()
+    stub_provider.latest_1m_bar = MagicMock()
+    app = build_app(tmp_path, provider=stub_provider)
+    assert app.trade_loop.provider is stub_provider
