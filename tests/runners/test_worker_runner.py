@@ -810,9 +810,27 @@ def _spawn_runner(monkeypatch, tmp_path, fake_proc, settings, *, rag=None,
         # fake がこれを模さないと、親は `proc.stdout.close()` で
         # (readline 中の reader がバッファロックを保持しているため)
         # 永久にブロックする。実測で判明した必須の忠実性。
+        #
+        # **生の `os.close()` は使わない (2026-08-09 Task 19 で実測した
+        # flaky の発生源)。** 子スレッド側は同じ fd を
+        # `child_out = os.fdopen(w, "wb")` でラップして**所有**している。
+        # ここで生 close すると同じ fd に所有者が 2 つできてしまい、先に
+        # こちらが閉じた後で `child_out` が (スレッド終了時の参照カウント
+        # 減で) finalize されると `OSError: [Errno 9] Bad file descriptor`
+        # が finalizer から送出され、`PytestUnraisableExceptionWarning`
+        # になる (main で 8/30 の頻度で再現)。
+        #
+        # `/dev/null` を `dup2` で被せると、①パイプの write 端は解放される
+        # ので親の reader は EOF を受け取れる (上記の忠実性は維持) ②fd 番号
+        # 自体は有効なまま残るので `child_out.close()` は正常に成功する
+        # (所有者が実質 1 つになる)。
         if sig == signal.SIGKILL and close_on_kill is not None:
             try:
-                os.close(close_on_kill)
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                try:
+                    os.dup2(devnull, close_on_kill)
+                finally:
+                    os.close(devnull)
             except OSError:
                 pass
 
@@ -1034,7 +1052,6 @@ def test_protocol_violation_is_detected_by_seq_check_not_by_eof(
     """
     r, w = os.pipe()
     r2, w2 = os.pipe()
-    child_done = threading.Event()
 
     def child_thread_fn():
         child_in = os.fdopen(r2, "rb")
@@ -1048,7 +1065,6 @@ def test_protocol_violation_is_detected_by_seq_check_not_by_eof(
         # **閉じない**。seq 検証が無ければ親はこの result を採用してしまう。
         write_frame(child_out, {"type": "result", "seq": 4,
                                 "status": "completed", "output": {"ok": 1}})
-        child_done.set()
 
     th = threading.Thread(target=child_thread_fn, daemon=True)
 
@@ -1059,7 +1075,7 @@ def test_protocol_violation_is_detected_by_seq_check_not_by_eof(
         returncode = None
 
         def poll(self):
-            return -9 if child_done.is_set() else None
+            return None
 
         def wait(self, timeout=None):
             return -9
@@ -1157,7 +1173,6 @@ def test_stdin_is_closed_only_after_the_dispatcher_finished_writing(
     r, w = os.pipe()
     r2, w2 = os.pipe()
     order: list[str] = []
-    child_done = threading.Event()
 
     class SlowRag:
         def search_news(self, query, n=5):
@@ -1177,7 +1192,6 @@ def test_stdin_is_closed_only_after_the_dispatcher_finished_writing(
         # finally へ入る。
         write_frame(child_out, {"type": "result", "seq": 3,
                                 "status": "completed", "output": {"ok": 1}})
-        child_done.set()
 
     th = threading.Thread(target=child_thread_fn, daemon=True)
 
@@ -1206,7 +1220,7 @@ def test_stdin_is_closed_only_after_the_dispatcher_finished_writing(
         returncode = None
 
         def poll(self):
-            return -9 if child_done.is_set() else None
+            return None
 
         def wait(self, timeout=None):
             return -9
