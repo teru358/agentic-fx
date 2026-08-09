@@ -97,3 +97,4 @@ worker:                        # mission worker (プラン8) の resource limit�
   data_hook_timeout_sec: 30       # tick 内データ hooks の全ネットワーククライアント timeout 上限
   rpc_timeout_sec: 15             # RAG RPC の親側応答待ち上限
   shutdown_join_timeout_sec: 30   # 停止シーケンスの join 上限
+  snapshot_max_age_sec: 10        # commit-pre スナップショットの許容鮮度 (秒)。超過は発注拒否 (lock内再取得しない)

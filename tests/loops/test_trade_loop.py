@@ -1,4 +1,5 @@
 """取引判断 loop テスト — fail closed・全記録・ask 回答専用・二層境界・trigger 記録。"""
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,7 @@ from agentic_fx.loops.trade_loop import TradeLoop
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
+from agentic_fx.store import signals
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.state import StateStore
 
@@ -64,7 +66,7 @@ def _loop(tmp_path, results, healthy=True):
         policy=Policy(policy_path),
         activity=activity_log,
         notifier=Notifier(enabled=False, webhook_url=None),
-        clock=clock,
+        clock=clock, core_lock=threading.RLock(), conn_supervisor=conn,
         watch=watch)
     return conn, loop, runner, tmp_path
 
@@ -210,10 +212,12 @@ def test_run_once_boundary_exception_from_healthcheck(tmp_path):
 
 
 def test_run_once_boundary_exception_from_executor(tmp_path):
-    """executor.handle_intent が例外 → intent_execution_failed で記録・None。"""
+    """executor.record_and_validate_intent が例外 (プラン8 五相再構成:
+    commit-core の dispatch 入口) → intent_execution_failed で記録・None。"""
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed", {"action": "hold", "reasoning": "test"}, [])])
-    loop.executor.handle_intent = MagicMock(side_effect=RuntimeError("executor_boom"))
+    loop.executor.record_and_validate_intent = MagicMock(
+        side_effect=RuntimeError("executor_boom"))
     result = loop.run_once()
     assert result is None
     act_text = (tp / "a.log").read_text(encoding="utf-8")
@@ -264,51 +268,62 @@ def test_ask_once_invalid_output_answer_not_string(tmp_path):
 
 
 def test_missions_finish_failure_logged_not_blocking(tmp_path):
-    """missions.finish が例外 → fail closed で降格・executor 未呼び出し・None 返却。
+    """missions.finish が例外 → mission_finalize_failed を記録するが、hold の
+    結果はそのまま返る (巻き戻さない)。
 
-    W1: missions.finish 失敗時は監査 (missions 行) が running のまま未確定に
-    なるため、completed 相当の結果をそのまま返して発注させてはならない。
-    (意図の変更: 以前は hold の結果をそのまま返していたが、fail closed に
-    強化した — レビュー指摘 W1)
+    設計上の注記 (プラン8 Task 15): trade 経路の `missions.finish(CAS)` は
+    commit-core の末尾 (paper broker 執行の後) に置く設計であり、finalize
+    失敗は「無警告のまま実行し続ける」ことを防ぐために可視化されるだけで、
+    intent の記録・実行自体 (`orders.insert`/`trade_intents` への書込み) は
+    finalize と独立している。旧 W1 の「completed 相当の結果を巻き戻す」は
+    trade 経路では意図的に撤回された (旧テストの意図とは逆転する変更)。
     """
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed", {"action": "hold", "reasoning": "test"}, [])])
-    loop.executor.handle_intent = MagicMock()
-    # missions.finish を mock で失敗させる
     with patch("agentic_fx.loops.trade_loop.missions.finish") as mock_finish:
         mock_finish.side_effect = RuntimeError("finish_boom")
         result = loop.run_once()
-        # 例外は catch されるが結果は failed に降格され None が返る
-        assert result is None
-        loop.executor.handle_intent.assert_not_called()
-        # 失敗はログに記録されている
-        # (activity.write も試行が行われる)
+        # hold の結果は finalize 失敗で巻き戻されない (設計上の注記)
+        assert result == {"result": "hold", "order_id": None, "reasons": []}
+        act_text = (tp / "a.log").read_text(encoding="utf-8")
+        assert "mission_finalize_failed" in act_text
 
 
-def test_missions_finish_failure_fail_closed_no_order(tmp_path):
-    """W1: finish 失敗時、open intent でも executor.handle_intent は呼ばれない。"""
+def test_missions_finish_failure_does_not_block_order_execution(tmp_path):
+    """設計上の注記 (プラン8 Task 15): finish 失敗時も open intent の発注自体は
+    実行される — `orders.insert`/`trade_intents` は `missions.finish` と独立
+    した書込みであり、finalize 失敗は監査証跡を失わせない
+    (旧 W1 「no_order」の期待とは逆転する意図的な変更)。"""
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed",
         {"action": "open", "pair": "USDJPY", "direction": "long",
          "entry_type": "limit", "horizon": "day", "limit_price": 148.20,
          "expires_in": "4h", "stop_loss": 147.80, "take_profit": 149.00,
          "reasoning": "test"}, [])])
-    loop.executor.handle_intent = MagicMock()
     with patch("agentic_fx.loops.trade_loop.missions.finish") as mock_finish:
         mock_finish.side_effect = RuntimeError("finish_boom")
         result = loop.run_once()
-        assert result is None
-        loop.executor.handle_intent.assert_not_called()
+        assert result["result"] == "pending"
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM orders").fetchone()["c"] == 1
+        act_text = (tp / "a.log").read_text(encoding="utf-8")
+        assert "mission_finalize_failed" in act_text
 
 
-def test_ask_once_finish_failure_returns_failed_string(tmp_path):
-    """W1: ask 経路で finish 失敗 → 失敗文字列を返す。"""
+def test_ask_once_finish_failure_returns_answer_despite_finalize_failure(tmp_path):
+    """(⚠ 着手前検証の結果 (4)) ask 経路: `_finalize_mission` は
+    `result.status != "completed"` の判定より前に呼ばれるため、finish が
+    失敗しても回答文字列がそのまま返る (従来は失敗文字列だった — ask は
+    読み取り専用で資金に影響しないため許容する。この判断は実装者が独自に
+    変えないこと、と本 task のプランに明記されている)。"""
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed", {"answer": "test answer"}, [])])
     with patch("agentic_fx.loops.trade_loop.missions.finish") as mock_finish:
         mock_finish.side_effect = RuntimeError("finish_boom")
         result = loop.ask_once("質問？")
-        assert result == "(Mission 失敗: failed)"
+        assert result == "test answer"
+        act_text = (tp / "a.log").read_text(encoding="utf-8")
+        assert "mission_finalize_failed" in act_text
 
 
 def test_ask_once_mismatched_schema_in_output(tmp_path):
@@ -324,10 +339,13 @@ def test_ask_once_mismatched_schema_in_output(tmp_path):
 # ---- F1: handle_intent 例外の専用ハンドリング ----
 
 def test_handle_intent_exception_recorded(tmp_path):
-    """executor.handle_intent が例外 → activity intent_execution_failed・mid 記録・None."""
+    """executor.record_and_validate_intent が例外 (プラン8 五相再構成:
+    commit-core の dispatch 入口) → activity intent_execution_failed・
+    mid 記録・None."""
     conn, loop, _, tp = _loop(tmp_path, [MissionResult(
         "completed", {"action": "hold", "reasoning": "test"}, [])])
-    loop.executor.handle_intent = MagicMock(side_effect=RuntimeError("executor_crash"))
+    loop.executor.record_and_validate_intent = MagicMock(
+        side_effect=RuntimeError("executor_crash"))
     result = loop.run_once()
     assert result is None
     # activity に記録
@@ -382,17 +400,18 @@ def test_run_once_boundary_exception_from_notifier_in_fail_closed(tmp_path):
 # ---- F4: missions.finish 失敗テストの強化 ----
 
 def test_missions_finish_failure_activity_recorded_call_count(tmp_path):
-    """missions.finish が例外 → activity mission_finalize_failed 記録・finish は 1 回・結果は failed に降格。
+    """missions.finish が例外 → activity mission_finalize_failed 記録・finish は 1 回。
 
-    W1: 返り値の期待を hold → None (fail closed) に更新 (意図の変更)。
+    設計上の注記 (プラン8 Task 15): hold の結果は finalize 失敗で巻き戻さない
+    (旧 W1 の「failed に降格」は trade 経路では意図的に撤回された)。
     """
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed", {"action": "hold", "reasoning": "test"}, [])])
     with patch("agentic_fx.loops.trade_loop.missions.finish") as mock_finish:
         mock_finish.side_effect = RuntimeError("finish_boom")
         result = loop.run_once()
-        # fail closed により降格され None が返る
-        assert result is None
+        # hold の結果は finalize 失敗で巻き戻されない (設計上の注記)
+        assert result == {"result": "hold", "order_id": None, "reasons": []}
         # finish は呼ばれたがちょうど 1 回
         assert mock_finish.call_count == 1
         # activity に記録の試み
@@ -513,3 +532,61 @@ def test_mission_watch_end_called_even_on_exception(tmp_path):
     loop.run_once()
     # end が呼ばれたことを確認
     assert mock_watch.end.called
+
+
+def test_requeue_signal_happens_under_core_lock(tmp_path):
+    """裁定書 F-6 (CR-5) / レビュー反映 2 回目 R2-CX-02: finally 節の
+    `_requeue_signal` は core_lock 保持中に呼ばれる — 呼び出し中は他
+    スレッドから core_lock を取得できないこと、かつ呼び出しがちょうど
+    1 回であることを実際に検証する (骨格・恒真テストではない)。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "timeout", None, [])])  # runner 失敗 → requeue 経路 (consume 前)
+    sid = signals.add(
+        conn, plugin="sig1", content_hash="h1", pair="USDJPY",
+        timeframe="1h", bar_ts=NOW.isoformat(), kind="signal",
+        payload={"direction": "long", "strength": 0.7, "rationale": "up"},
+        now=NOW)
+
+    entered = threading.Event()
+    proceed = threading.Event()
+    calls: list[object] = []
+    original_requeue_signal = loop._requeue_signal  # bound method (self 済み)
+
+    def spy_requeue_signal(*args, **kwargs):
+        calls.append(args)
+        entered.set()
+        # requeue 呼び出しの「最中」を維持したまま、別スレッドに
+        # core_lock.acquire(blocking=False) を試させる猶予を作る。
+        assert proceed.wait(5.0), "checker スレッドが確認を完了しなかった"
+        return original_requeue_signal(*args, **kwargs)
+
+    loop._requeue_signal = spy_requeue_signal
+
+    t = threading.Thread(target=lambda: loop.run_once("signal"), daemon=True)
+    t.start()
+    assert entered.wait(5.0), "_requeue_signal が呼ばれなかった"
+
+    # RLock は同一スレッドからの acquire(blocking=False) は常に成功して
+    # しまう (再入可能) ため、必ず別スレッド (checker) から確認する。
+    acquired: list[bool] = []
+    checker = threading.Thread(
+        target=lambda: acquired.append(
+            loop._core_lock.acquire(blocking=False)))
+    checker.start()
+    checker.join(timeout=5.0)
+    if acquired and acquired[0]:
+        loop._core_lock.release()  # 誤って取れてしまった場合の後始末
+    assert acquired == [False], (
+        "_requeue_signal 実行中は他スレッドから core_lock を取得できない"
+        "はず (finally 節が with self._core_lock: で包んでいることの検証)")
+
+    proceed.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+
+    assert len(calls) == 1  # requeue はちょうど 1 回だけ呼ばれる
+    row = conn.execute(
+        "SELECT status, requeue_count FROM signals WHERE id=?",
+        (sid,)).fetchone()
+    assert row["status"] == "pending"
+    assert row["requeue_count"] == 1

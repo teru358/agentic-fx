@@ -461,33 +461,67 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         policy = Policy(root / "policy" / "directives.md")
         # 上書き 3: MissionWatch は 1 インスタンスを trade_loop / reflection に共有注入
         mission_watch = MissionWatch()
+
+        core_lock = threading.RLock()
+
+        # プラン 8 (Task 15, レビュー反映1回目 裁定書 F-6/CR-5): TradeLoop の
+        # provider は healthcheck 専用 (lock 外で呼ばれる) — 書込可能な
+        # conn_core 版を渡すと healthcheck 内の get_bars が無保護で conn_core
+        # を書き込む (Global Constraints 違反)。conn_supervisor (RO) +
+        # readonly=True で構築した専用インスタンスを**常に**渡す (レビュー
+        # 3 周目 codex E1 — レビュー2周目 codex D2 の「注入時は provider を
+        # そのまま流用する」は RO 制約を打ち消しており指揮者の指示ミスだった:
+        # quote_fn/spec_fn/bars_fn だけを注入し provider= は注入しない
+        # 呼び出し元では、392 行の else 分岐で書込可能な conn_core 版
+        # provider が構築されるため、それを healthcheck_provider として
+        # そのまま使うと F-6/CR-5 が塞いだ違反が supervisor スレッドから
+        # core_lock 非保持で再発する)。
+        # 注意: readonly=True のため healthcheck はもう ohlcv キャッシュを
+        # 温めない (get_bars/derive の upsert_bars がスキップされる) —
+        # これは意図した挙動であり退行ではない。CR-4 と同じ理由でキャッシュの
+        # 一次的な書き手は scheduler tick (mark-to-market 等、既存の conn_core
+        # 版 provider) であり続けるため、healthcheck が書かなくてもキャッシュ
+        # 鮮度は保たれる。
+        healthcheck_provider = PriceProvider(conn_supervisor, settings,
+                                             clock, readonly=True)
+        # RO と stub 尊重を両立させる: `provider` (388-420 行) に適用した
+        # のと同じ注入バインドを healthcheck_provider にも適用する。この
+        # 時点で quote_fn/spec_fn/bars_fn は (注入されていれば呼び出し元の
+        # 関数、されていなければ `provider` の束縛メソッド) のいずれかで
+        # 必ず非 None。`get_bars` はどの注入点にもマップされない (docstring
+        # 313-318 行、fix round 1 F2) ため意図的に上書きしない —
+        # healthcheck_provider 自身の (readonly=True・conn_supervisor 版)
+        # get_bars がそのまま使われ、F-6/CR-5 の保護は保たれる。
+        healthcheck_provider.get_quote = quote_fn
+        healthcheck_provider.spec = spec_fn
+        healthcheck_provider.latest_1m_bar = bars_fn
         trade_loop = TradeLoop(conn=conn_core, runner=runner, settings=settings,
-                               executor=executor, provider=provider, econ=econ,
-                               policy=policy, activity=activity,
+                               executor=executor, provider=healthcheck_provider,
+                               econ=econ, policy=policy, activity=activity,
                                notifier=notifier, clock=clock,
+                               core_lock=core_lock, conn_supervisor=conn_supervisor,
                                watch=mission_watch)
         reflection = ReflectionCycle(conn=conn_core, runner=runner, rag=rag,
                                      settings=settings, activity=activity,
                                      clock=clock, watch=mission_watch)
 
-        core_lock = threading.RLock()
-
-        # プラン 8 (段階分け — Task 13 では lock の保持範囲を変えない):
-        # trade/reflection/ask の実行は引き続き呼び出し全体を core_lock で
-        # 包む。scheduler tick との直列性を維持したまま、Mission 呼び出しの
-        # 主体を scheduler スレッドから supervisor スレッドへ移す (ロック
-        # 粒度の再設計は Task 15/16)。
         def _trade_fn(trigger: str):
-            with core_lock:
-                return trade_loop.run_once(trigger)
+            # プラン 8 (Task 15): TradeLoop 自身が prepare/commit-core で
+            # core_lock を保持する五相構造になったため、ここでは lock を
+            # 掴まない (二重取得は RLock で技術的には安全だが、run 相の
+            # 間ずっと lock を保持したままになり Task 15 の目的を無効化する)。
+            return trade_loop.run_once(trigger)
 
         def _reflection_fn():
+            # ReflectionCycle は Task 16 で五相再構成するまで、呼び出し全体
+            # を lock で包む現状維持。
             with core_lock:
                 return reflection.run_pending()
 
         def _ask_fn(question: str) -> str:
-            with core_lock:
-                return trade_loop.ask_once(question)
+            # プラン 8 (Task 15): TradeLoop.ask_once も三相構造になったため
+            # ここでは lock を掴まない。
+            return trade_loop.ask_once(question)
 
         supervisor = MissionSupervisor(
             trade_fn=_trade_fn, reflection_fn=_reflection_fn, ask_fn=_ask_fn)
@@ -705,26 +739,71 @@ def run_service(root: Path, *, daemon: bool = False,
         # 例外を握りつぶさない (return を置かない) — 記録後、元の例外があれば
         # そのまま再送出される。
         stop_event.set()
-        # graceful shutdown: scheduler スレッドの終了を確認してから記録する
-        # (tick は core_lock 下で走るため、join 完了 = 実行中 Mission も完了)
+        # **(レビュー 3 周目 codex E3)** supervisor.shutdown() を
+        # th.join() より前に呼ぶ — stop_event.set() の時点で既に走って
+        # いた scheduler tick は on_trade_mission → supervisor.try_submit
+        # まで到達しうる。shutdown() (新規受付停止) が後回しだと、停止
+        # 処理の最中に新しい trade+reflection Mission が受理されてしまう。
+        # shutdown() 自体はブロックしない (queue 内の未着手ジョブを
+        # fail_pending するだけ) ので、位置を早めても th.join() の意味は
+        # 変わらない。
+        app.supervisor.shutdown(
+            drain_exc=RuntimeError("service shutting down"))
+        # scheduler スレッドの終了を確認する。
+        # **(レビュー 2 周目 codex D1 — この task が壊した前提の修復)**
+        # 旧コメント「tick は core_lock 下で走るため join 完了 = 実行中
+        # Mission も完了」はプラン8 Task 15 (五相再構成) でもう成立しない
+        # — run 相 (WorkerRunner.run) と commit-pre/commit-post は
+        # core_lock を保持しないため、scheduler スレッドは Mission が
+        # supervisor スレッドで実行中でも即座に tick を終えて th.join が
+        # 成功しうる。実際に Mission (commit-core 含む) を実行しているのは
+        # supervisor スレッドなので、以下で supervisor の join も判定に
+        # 加える (完全な停止状態機械は Task 19 の担当 — ここでは
+        # 「join 完了 = 実行中 Mission も完了」という壊れた不変条件の
+        # 最小修復に留める)。
         th.join(timeout=30)
+        # **(レビュー 3 周目 codex E2)** `shutdown_join_timeout_sec`
+        # (settings.yaml.example 既定 30 秒) は trade Mission の
+        # `llama_swap.timeout_sec` (既定 300 秒) と釣り合っておらず、
+        # run 相にいる最中に停止すると必ずタイムアウトしていた。
+        # `ask_wait_timeout_sec` (569 行付近) と同じ導出で、Mission が
+        # WorkerRunner の preemption エスカレーション (worker_grace_sec →
+        # worker_terminate_grace_sec) で確実に終端されるまでの上限を budget
+        # にする。**残存の粗さ**: supervisor の "trade" ジョブは dispatch
+        # 内で trade_fn の後に reflection_fn (最大 3 件を順に処理 —
+        # ReflectionCycle.run_pending の既定 max_items) を連鎖するため、
+        # 理論上の worst case はこの budget を超えうる。完全な導出
+        # (状態機械全体の再設計) は Task 19 の担当とし、ここでは「Mission
+        # 1 回分の timeout と無関係な定数 30 秒」という壊れた対応関係の
+        # 最小修復に留める。
+        supervisor_join_timeout_sec = (
+            app.settings.llama_swap.timeout_sec
+            + app.settings.worker.worker_grace_sec
+            + app.settings.worker.worker_terminate_grace_sec + 10.0)
+        app.supervisor.join(timeout=supervisor_join_timeout_sec)
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
         # 行う。notifier は最大 10 秒ブロックしうるため、記録を先にすると
         # 「graceful」記録の後に watchdog がまだ activity へ書き込める窓が
-        # 生じる。判定権威は従来どおり th.join(30) のみ — wd はここで待つ
-        # だけで graceful/timeout の判定には関与しない。
+        # 生じる。判定権威は th.join(30) + supervisor.join(...) — wd は
+        # ここで待つだけで graceful/timeout の判定には関与しない。
         wd.join(timeout=15)
-        if th.is_alive():
+        # **(レビュー 3 周目 codex E2)** タイムアウトでも runner.close()
+        # は呼ぶ — 子プロセス/接続の leak は停止の目的に反する
+        # (以前は join 成功時のみ close していた「上書き 7」の判断を、
+        # leak 防止を優先する形に変更する)。close 自体の失敗で shutdown
+        # シーケンスを止めない。
+        if app.owns_runner and hasattr(app.runner, "close"):
+            try:
+                app.runner.close()
+            except Exception:  # noqa: BLE001 — shutdown 記録は必ず行う
+                _log.exception("runner.close() failed during shutdown")
+        if th.is_alive() or app.supervisor.is_alive():
             app.activity.write(Category.SYSTEM, "service_stopped",
                                "shutdown_timeout (Mission 継続中の可能性)")
         else:
-            # 上書き 7: join 成功時のみ close する (使用中の client を
-            # 別スレッドから閉じない)
-            if app.owns_runner and hasattr(app.runner, "close"):
-                app.runner.close()
             app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
 
-    if th.is_alive():
+    if th.is_alive() or app.supervisor.is_alive():
         print("警告: 停止タイムアウト。実行中の処理が残っている可能性があります。")
         return 1
     print("停止しました。")

@@ -244,6 +244,10 @@ class WorkerSettings(_Strict):
     rpc_timeout_sec: float = Field(gt=0, default=15.0)
     # 停止シーケンスの join 上限 (設計書 §5)。
     shutdown_join_timeout_sec: float = Field(gt=0, default=30.0)
+    # commit-pre で取得したスナップショットの許容鮮度 (秒)。commit-core
+    # 開始時にこれを超えていれば発注拒否する (lock 内での再取得はしない
+    # — 設計書 §3.1)。
+    snapshot_max_age_sec: float = Field(gt=0, default=10.0)
 
 
 class Settings(_Strict):

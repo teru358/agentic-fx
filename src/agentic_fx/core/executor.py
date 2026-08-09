@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable
@@ -165,6 +166,63 @@ class Executor:
         # 目的であり、恒久的な会計精度は定期同期が担う (設計書 §5)。
         # このキャッシュは tick/判断をまたいで永続する意図的な例外。
         self._last_good_rate: dict[tuple[str, str], ConversionRate] = {}
+        # commit-core 相 (core_lock 保持中) の通知を溜める先。None のとき
+        # は即時送信 (scheduler・バックテスト経路の既定)。設計書 §3.1 /
+        # Task 14 申し送り: Notifier.send は urlopen(timeout=10) の同期
+        # 実行なので、commit-core で呼ぶと core_lock を握ったまま最大 10 秒
+        # ブロックし、SL/TP 監視が止まる。
+        self._deferred_notifications: list[str] | None = None
+
+    def _notify(self, text: str) -> None:
+        """通知の単一出口。遅延中なら溜めるだけ、そうでなければ即時送信。"""
+        if self._deferred_notifications is not None:
+            self._deferred_notifications.append(text)
+            return
+        self.notifier.send(text)
+
+    @contextmanager
+    def defer_notifications(self):
+        """commit-core 相専用 — この中の通知は送らずに溜め、`with` を抜けた
+        後に呼び出し元 (commit-post 相) が送る。
+
+        **スレッド安全性の根拠 (レビュー 3 周目 codex E4 — docstring 訂正:
+        以前の記述「commit-core も scheduler tick も core_lock を保持
+        している間しか executor を触らない」は本 task (プラン8 Task 15)
+        で既に偽になっている)**: commit-pre 相 (`trade_loop.py` の
+        `gather_open_snapshot`/`gather_close_snapshot` 呼び出し箇所) は
+        **`core_lock` 非保持で** `Executor` を触り、`cycle_rate_fn`/
+        `resolve_close_rate` 経由で `Executor._last_good_rate` (dict) を
+        書き換える。したがって「executor に触るのは lock 内だけ」は成立
+        しない。
+
+        本当に守るべき不変条件は**遅延窓 (`with defer_notifications():`
+        の内側) が完全に `core_lock` の内側にあること**である —
+        `Executor` は Mission スレッドと scheduler スレッドで共有される
+        が、**commit-core も scheduler tick も、`_notify` に到達しうる
+        呼び出しは `core_lock` を保持している間にしか行わない**
+        (`service.py` の `with app.core_lock: app.scheduler.tick(...)`
+        および本 task の commit-core `with self._core_lock, \
+        self.executor.defer_notifications():`)。commit-pre が lock 非保持
+        で executor を触ることは事実だが、commit-pre から `_notify` へ
+        到達する経路は現時点で存在しない (`gather_*_snapshot` は
+        `_last_good_rate` の更新のみで通知を送らない)。
+        したがって遅延窓と tick (および `_notify` に到達しうる呼び出し)
+        は相互排他であり、scheduler の通知が Mission の遅延リストに
+        紛れ込むことはない。
+        **今後 commit-pre (または他の lock 非保持経路) から `_notify` へ
+        到達する呼び出しを増やす変更を行うときは、この遅延窓との排他が
+        崩れないかを必ず再検討すること** — 崩れると通知が別 Mission の
+        `deferred` に紛れ込む。`core_lock` 非保持でこのコンテキストに
+        入ってはならない、という制約自体は変わらない。
+        """
+        assert self._deferred_notifications is None, \
+            "defer_notifications is not re-entrant"
+        pending: list[str] = []
+        self._deferred_notifications = pending
+        try:
+            yield pending
+        finally:
+            self._deferred_notifications = None
 
     # ---- 換算レート -------------------------------------------------------
 
@@ -282,14 +340,24 @@ class Executor:
 
     # ---- public ---------------------------------------------------------
 
-    def handle_intent(self, intent: TradeIntent, mission_id: int) -> dict:
+    def record_and_validate_intent(self, intent: TradeIntent,
+                                   mission_id: int) -> tuple[int, dict | None]:
+        """intent の DB 記録 (常に行う) + HOLD 短絡 + origin/loop 検証
+        (プラン8 五相再構成 — `handle_intent` から分割。判定ロジックは
+        1 文字も変えていない)。
+
+        戻り値: `(iid, None)` なら呼び出し側が open_from_snapshot/
+        close_intent/cancel_intent へ dispatch する。`(iid, result)` なら
+        `result` がそのまま最終結果 (hold・origin_rejected・
+        mission_rejected のいずれか)。
+        """
         now = self.clock.now()
         iid = intents_store.insert(self.conn, mission_id,
                                    _intent_payload(intent), now)
         if intent.action is Action.HOLD:
             self.activity.write(Category.AGGREGATE, "hold",
                                 intent.reasoning[:120], ref_id=str(iid))
-            return {"result": "hold", "order_id": None, "reasons": []}
+            return iid, {"result": "hold", "order_id": None, "reasons": []}
 
         # 設計書 §5: origin と mission_id を独立に検証する。origin は呼び出し
         # 側が渡す enum 値に過ぎず、任意の内部コードが Origin.SCHEDULER を
@@ -303,7 +371,7 @@ class Executor:
             self.activity.write(Category.TRADE, "origin_rejected",
                                 f"{intent.action.value} from {intent.origin.value}",
                                 ref_id=str(iid))
-            return {"result": "rejected", "order_id": None, "reasons": reasons}
+            return iid, {"result": "rejected", "order_id": None, "reasons": reasons}
 
         loop = missions_store.loop_of(self.conn, mission_id)
         if loop != "trade":
@@ -313,13 +381,22 @@ class Executor:
             self.activity.write(Category.TRADE, "mission_rejected",
                                 f"{intent.action.value} from mission "
                                 f"#{mission_id} (loop={loop!r})", ref_id=str(iid))
-            return {"result": "rejected", "order_id": None, "reasons": reasons}
+            return iid, {"result": "rejected", "order_id": None, "reasons": reasons}
 
+        return iid, None
+
+    def handle_intent(self, intent: TradeIntent, mission_id: int) -> dict:
+        """既存の全経路 (バックテスト runner.py・tests/core/test_executor.py)
+        向けの一体化エントリ。`record_and_validate_intent` + dispatch を
+        連結しただけで挙動は完全不変。"""
+        iid, early = self.record_and_validate_intent(intent, mission_id)
+        if early is not None:
+            return early
         if intent.action is Action.OPEN:
             return self._open(intent, iid)
         if intent.action is Action.CLOSE:
-            return self._close(intent, iid)
-        return self._cancel(intent, iid)
+            return self.close_intent(intent, iid)
+        return self.cancel_intent(intent, iid)
 
     # ---- open -----------------------------------------------------------
 
@@ -417,7 +494,7 @@ class Executor:
             transitions.transition(self.conn, oid, S.SUBMIT_UNKNOWN, now)
             self.activity.write(Category.TRADE, "submit_unknown",
                                 f"{intent.pair} — reconcile 待ち", ref_id=str(oid))
-            self.notifier.send(f"[agentic-fx] 送信結果不明 #{oid} — "
+            self._notify(f"[agentic-fx] 送信結果不明 #{oid} — "
                                "解決まで新規発注停止")
             return {"result": "unknown", "order_id": oid, "reasons": []}
         transitions.transition(self.conn, oid, S.SUBMITTED, now,
@@ -570,7 +647,7 @@ class Executor:
         self.activity.write(Category.TRADE, "close_unknown",
                             f"{row['pair']} — reconcile 待ち",
                             ref_id=str(row["id"]))
-        self.notifier.send(f"[agentic-fx] クローズ結果不明 #{row['id']}")
+        self._notify(f"[agentic-fx] クローズ結果不明 #{row['id']}")
         return S.CLOSE_UNKNOWN
 
     def _finish_close(self, row: dict, price: float, contract_size: float,
@@ -597,17 +674,19 @@ class Executor:
                     "最後の健全レートで計算 (次回同期で吸収)" if pnl is not None
                     else "realized_pnl 未確定 (次回同期で解消)"),
                 ref_id=str(row["id"]))
-            self.notifier.send(
+            self._notify(
                 f"[agentic-fx] クローズ換算レート degraded #{row['id']}")
         return S.CLOSED
 
-    def _close(self, intent: TradeIntent, iid: int) -> dict:
+    def close_intent(self, intent: TradeIntent, iid: int) -> dict:
         now = self.clock.now()
         row = orders.get(self.conn, intent.order_id)
         if row is None or row["status"] != S.OPEN.value:
             reasons = [f"order {intent.order_id} is not open"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
                     "reasons": reasons}
         intents_store.set_gate_result(self.conn, iid, accepted=True,
@@ -709,6 +788,8 @@ class Executor:
             reasons = [f"order {intent.order_id} is not open"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
                     "reasons": reasons}
         if snapshot is None:
@@ -718,6 +799,8 @@ class Executor:
                 "while holding core_lock (設計書 §3.1)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
                     "reasons": reasons}
         age_sec = (now - snapshot.captured_at).total_seconds()
@@ -728,6 +811,8 @@ class Executor:
                 "re-fetching while holding core_lock (設計書 §3.1)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
                     "reasons": reasons}
         intents_store.set_gate_result(self.conn, iid, accepted=True,
@@ -769,15 +854,17 @@ class Executor:
                                    now)
             return S.PROTECTION_PENDING
         transitions.transition(self.conn, row["id"], S.CANCEL_UNKNOWN, now)
-        self.notifier.send(f"[agentic-fx] 取消結果不明 #{row['id']}")
+        self._notify(f"[agentic-fx] 取消結果不明 #{row['id']}")
         return S.CANCEL_UNKNOWN
 
-    def _cancel(self, intent: TradeIntent, iid: int) -> dict:
+    def cancel_intent(self, intent: TradeIntent, iid: int) -> dict:
         row = orders.get(self.conn, intent.order_id)
         if row is None or row["status"] != S.PENDING_FILL.value:
             reasons = [f"order {intent.order_id} is not pending_fill"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason=reasons[0])
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
                     "reasons": reasons}
         intents_store.set_gate_result(self.conn, iid, accepted=True,

@@ -452,6 +452,9 @@ def test_close_from_snapshot_rejects_stale_snapshot(tmp_path):
     assert "stale" in out["reasons"][0]
     # 拒否は「クローズしない」まで意味する
     assert orders.get(ex.conn, row["id"])["status"] == S.OPEN.value
+    # Task 14 レビュー 1 周からの申し送り: 拒否分岐は活動ログにも残す
+    assert any("gate_rejected" in l
+              for l in ex.activity.tail(n=50, category=Category.TRADE))
 
 
 def test_close_from_snapshot_rejects_when_snapshot_is_none(tmp_path):
@@ -467,6 +470,9 @@ def test_close_from_snapshot_rejects_when_snapshot_is_none(tmp_path):
     assert out["result"] == "rejected"
     assert "snapshot" in out["reasons"][0].lower()
     assert orders.get(ex.conn, row["id"])["status"] == S.OPEN.value
+    # Task 14 レビュー 1 周からの申し送り: 拒否分岐は活動ログにも残す
+    assert any("gate_rejected" in l
+              for l in ex.activity.tail(n=50, category=Category.TRADE))
 
 
 def test_close_from_snapshot_closes_when_fresh(tmp_path):
@@ -651,6 +657,10 @@ def test_close_from_snapshot_rejects_when_row_already_closed(tmp_path):
     assert updated["status"] == S.CLOSED.value
     assert updated["close_price"] == 148.50
     assert updated["realized_pnl"] == 1234.0
+    # レビュー 1 周目 codex B1 (指揮者のプラン記述漏れ): close_from_snapshot
+    # の not-open 拒否分岐も他の拒否分岐と対称に activity へ残す
+    assert any("gate_rejected" in l
+              for l in ex.activity.tail(n=50, category=Category.TRADE))
 
 
 class _StubBroker:
@@ -794,3 +804,65 @@ def test_open_from_snapshot_performs_no_external_io_returns_opened_result(tmp_pa
     # B6: 結果が 'opened' であること
     assert out["result"] == "opened"
     assert out["order_id"] is not None
+
+
+class _RecordingNotifier:
+    """Task 14 申し送り (Step 3.5) の pin 用記録型スタブ。「呼ばれたら
+    raise」は except Exception に飲まれるので使わない。"""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def send(self, text: str) -> None:
+        self.sent.append(text)
+
+
+class _RaisingCloseBroker:
+    """close() が例外を送出し `_close_unknown` (→ self._notify) を踏ませる
+    ためのスタブ broker。"""
+
+    def close(self, row, price, reason):
+        raise RuntimeError("broker_close_boom")
+
+    def cancel(self, row):  # pragma: no cover — このテストでは使わない
+        raise NotImplementedError
+
+    def submit(self, *a, **kw):  # pragma: no cover
+        raise NotImplementedError
+
+
+def test_defer_notifications_queues_commit_core_notifications(tmp_path):
+    """Step 3.5 pin (Task 14 レビュー 1 周からの申し送り): commit-core 相
+    (defer_notifications の中) で notifier.send を直接呼ばず、溜めるだけに
+    すること。"""
+    recording = _RecordingNotifier()
+    ex = _make_executor(tmp_path, broker=_RaisingCloseBroker())
+    ex.notifier = recording
+    row = _insert_open_order(ex.conn, pair="USDJPY")
+    mid = _start_trade_mission(ex.conn)
+    intent = _close_intent(order_id=row["id"])
+    iid = _insert_intent(ex.conn, mid, intent)
+    snapshot = CloseSnapshot(order_id=row["id"], pair="USDJPY", price=148.49,
+                             spec=SPECS["USDJPY"], rate=None,
+                             rate_degraded=False, captured_at=NOW)
+
+    with ex.defer_notifications() as pending:
+        ex.close_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0)
+        assert recording.sent == []
+        assert len(pending) == 1
+
+    # with を抜けた後も遅延リストは変わらない (呼び出し元が commit-post で送る)
+    assert recording.sent == []
+
+
+def test_notify_sends_immediately_outside_defer_notifications(tmp_path):
+    """遅延外 (scheduler 経路の非退行): defer_notifications を使わない既存
+    close_order 経路は従来どおり即時送信のまま。"""
+    recording = _RecordingNotifier()
+    ex = _make_executor(tmp_path, broker=_RaisingCloseBroker())
+    ex.notifier = recording
+    row = _insert_open_order(ex.conn, pair="USDJPY")
+
+    ex.close_order(row, price=148.49, reason="sl_hit")
+
+    assert len(recording.sent) == 1
