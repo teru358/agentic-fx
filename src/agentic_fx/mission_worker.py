@@ -124,8 +124,18 @@ def _bootstrap_improve_profile() -> None:
     if base_prefix != venv_root:
         read_only.append(base_prefix)
     # venv/stdlib の外にある実行時依存。**allowlist は防御の質そのものなので
-    # 最小に保つ**が、**「起動できる」ではなく「Mission を完走できる」を
-    # 基準に測ること** (2026-08-09 実測):
+    # 最小に保つ**が、**「起動できる (`ready` に到達する)」を基準に測っては
+    # いけない。「LLM エンドポイントへ到達できる」まで踏むこと** — `ready` は
+    # `runner.run` の 1 行手前で送出されるので、その先で初めて必要になる依存
+    # (名前解決など) の欠落を素通りさせる (2026-08-09 に実際にそれで `/etc` を
+    # 落とした。下記参照)。
+    #
+    # **実測が担保する範囲を正確に書く**: 下記の判定は
+    # `getaddrinfo` / `socket.create_connection` / `httpx.get("/v1/models")`
+    # → 200 までの**到達性**で測っている。**実 LLM 応答から `result` 送出まで
+    # の Mission 完走は測っていない** (llama-swap 実機と数百秒を要するため
+    # スイートに入れていない)。プラン 9 で改善ループに実ツールセットが入る際は
+    # 完走側の確認を E2E に置くこと:
     #
     #   /usr/lib             外すと `ImportError: libgcc_s.so.1: cannot open
     #                        shared object file` で improve worker が起動不能
@@ -158,8 +168,9 @@ def _bootstrap_improve_profile() -> None:
     # ならない。`llama_swap.base_url` を外部ホスト名にする場合は allowlist の
     # 追加が要る。
     #
-    # 外しても Mission 完走に影響が無かったため削除したもの: `/lib`・`/lib64`
-    # (どちらも `/usr/lib`・`/usr/lib64` への symlink)、`/usr/lib64`。
+    # 外しても **HTTP 到達性 (`/v1/models` → 200) に影響が無かった**ため削除
+    # したもの: `/lib`・`/lib64` (どちらも `/usr/lib`・`/usr/lib64` への
+    # symlink)、`/usr/lib64`。
     # 残した 4 つはいずれも `data/` の祖先ではないため、設計書 §4.6 の
     # 「`data/` の絶対パスアクセスを OS レベルで遮断する」意味論は保たれる
     # (`test_improve_profile_cannot_reach_data_dir` が毎回それを実測する)。
