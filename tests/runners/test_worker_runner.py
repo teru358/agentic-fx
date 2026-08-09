@@ -789,7 +789,7 @@ def _tiny_worker_settings(**over):
 
 
 def _spawn_runner(monkeypatch, tmp_path, fake_proc, settings, *, rag=None,
-                  on_rpc_leak=None, close_on_kill=None):
+                  on_rpc_leak=None, close_on_kill=None, stop_event=None):
     """`subprocess.Popen` と `os.killpg` を差し替えて WorkerRunner を作り、
     `killpg` の呼び出し (pid, signal, 時刻) を記録するリストを返す。"""
     import agentic_fx.runners.worker_runner as wr_mod
@@ -839,7 +839,7 @@ def _spawn_runner(monkeypatch, tmp_path, fake_proc, settings, *, rag=None,
                           clock=FixedClock(datetime(2026, 8, 4,
                                                     tzinfo=timezone.utc)),
                           rag=rag if rag is not None else _rag(tmp_path),
-                          on_rpc_leak=on_rpc_leak)
+                          on_rpc_leak=on_rpc_leak, stop_event=stop_event)
     return runner, kill_calls, popen_kwargs
 
 
@@ -1387,6 +1387,89 @@ def test_dispatcher_never_writes_to_stdin_after_it_was_closed(
     assert spy.writes_after_close == 0, (
         "close 済みの stdin へ dispatcher が書き込んだ "
         "(stdin_state['closed'] ガードが機能していない)")
+
+
+def _hanging_child(*, send_ready: bool):
+    """`ready` を送る/送らないだけを選べる、result を永久に返さない子。
+
+    パイプは閉じない (= 生きている子)。SIGKILL の fake が `close_on_kill`
+    で write 端を解放するまで親の reader は EOF を受け取らない。
+    """
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    child_in = os.fdopen(r2, "rb")   # 保持しないと親の書き込みが EPIPE になる
+
+    def child_thread_fn():
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())                      # handshake
+        if send_ready:
+            write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        # result は送らない — 親を待たせ続ける。
+        while True:
+            time.sleep(0.05)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    return (threading.Thread(target=child_thread_fn, daemon=True),
+            FakeProc(), w, child_in)
+
+
+@pytest.mark.parametrize(
+    "send_ready,expected_status,phase",
+    [(True, "timeout", "result 待ち"), (False, "failed", "ready 待ち")])
+def test_stop_event_interrupts_the_wait_immediately(
+        tmp_path, monkeypatch, send_ready, expected_status, phase):
+    """プラン8 Task 19: `stop_event` が立ったら待ちを**即座に**打ち切る。
+
+    設計書 §5 手順1「同時に実行中 worker へ SIGTERM を発行 (3 と並行開始)」
+    — 停止シーケンスは実行中 Mission の自然完了を待たない。`_wait_with_stop`
+    はこのためにあり、`stop_event` を見ないと Mission の
+    `timeout_sec + worker_grace_sec` (既定 300 秒超) を待ち切ってしまう。
+
+    **このピンが無いと `stop_event` の配線 (build_app が同一 Event を渡して
+    いること) は緑でも、「立てたときに実際に中断できるか」は一度も検証され
+    ない** — `_wait_with_stop` はテストから一度も叩かれていなかった
+    (2026-08-09 指揮者が実測)。
+
+    停止で打ち切ったときの `MissionResult` の status は、`ready` 待ちなら
+    `"failed"`、`result` 待ちなら `"timeout"` になる (= 通常の待ち超過と
+    同じ扱い)。**これは in-band 契約 (kill は `status="timeout"` で返す、
+    設計書 §4.1) に沿った意図的な裁定**であり、停止専用の第 5 の status は
+    設けない (`MissionResult` の 4 値契約は本プランで不変)。
+    """
+    th, proc, w, _child_in = _hanging_child(send_ready=send_ready)
+    stop_event = threading.Event()
+
+    # Mission 側の予算は十分に長くする — stop_event を見ていなければ
+    # この待ちで確実にタイムアウト判定より先に時間切れになる。
+    settings = _tiny_worker_settings(worker_startup_timeout_sec=30.0)
+    runner, _kill, _kw = _spawn_runner(
+        monkeypatch, tmp_path, proc, settings, close_on_kill=w,
+        stop_event=stop_event)
+
+    th.start()
+    threading.Timer(0.3, stop_event.set).start()
+
+    started = time.monotonic()
+    result = runner.run(Mission(prompt="p", tools=[], output_schema={},
+                                max_turns=1, timeout_sec=30.0))
+    elapsed = time.monotonic() - started
+
+    assert result.status == expected_status
+    # 30 秒の予算を待ち切っていないこと (中断が効いている)。
+    assert elapsed < 5.0, (
+        f"{phase} で stop_event による中断が効いていない "
+        f"(elapsed={elapsed:.2f}s — 予算 30s を待ち切った疑い)")
 
 
 def _capture_handshake(base, monkeypatch, *, worker_profile):
