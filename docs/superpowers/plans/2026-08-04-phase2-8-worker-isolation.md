@@ -10821,6 +10821,26 @@ EOF
    `WorkerRunner` の `Popen(cwd=専用 tempdir)`。E2E で**リポジトリ外から起動した場合**の
    improve worker の遮断を確認できると、この層のギャップが実測で埋まる。
 
+**(Task 19 からの申し送り 4 件 — 本 task で扱うか、プラン 9 へ送るかを判断すること)**
+
+1. **`supervisor.shutdown()` が失敗すると main が join budget を丸ごと待つ。** 1 周目で
+   `shutdown()` を `try/except` で包み「停止シーケンスが必ず最後まで走る」ようにしたが、
+   shutdown が失敗すると **supervisor へ停止が伝わらない**ため、`app.supervisor.join(timeout=
+   dispatch_ceiling_sec)` が既定で **20 分超**待つ (実測: ピンの作成中にテストがハングして発覚)。
+   停止に上限を与えるなら、shutdown 失敗時は join budget を短縮する等の判断が要る。
+2. **`shutdown_join_timeout_sec` (config.py / settings.yaml.example) は完全にデッド。**
+   Task 15 で使われなくなり、裁定 B で「この用途に使わない」を確定させたが、キー自体は残って
+   おり `settings.yaml.example` のコメントは依然「停止シーケンスの join 上限」を謳う。
+   運用者が変更しても挙動は一切変わらない。削除するか、コメントを実態に合わせるか。
+3. **`_default_dispatch_ceiling_sec` の `× 4 + 60.0` は数式としての妥当性が未検証。**
+   実際の reflection 連鎖 (最大 3 件) との整合を挙動レベルで確認した E2E は無い
+   (プランの前提記述をそのまま受け入れている)。**過大なら停止が最大 20 分待ちになり、
+   過小なら watchdog が健全な dispatch を fatal と誤判定する。**
+4. **watchdog / scheduler の実クロージャが「周期的に呼ばれ続ける」ことの検証はコード読解のみ。**
+   `_watchdog_check` / `_check_watchdog_health` は単体では検証済みで、初回呼び出しは
+   `test_watchdog_ceiling_and_join_budget_come_from_the_same_value` が通しで駆動している。
+   だが **2 回目以降の周期実行**をモック無しで確認したテストは無い (30 秒周期のため)。
+
 **(Task 16 レビュー 2 周からの申し送り — 本 task で実測すること) RAG lock の競合窓が新設された。**
 
 Task 16 で `_reflection_fn` の外側 `core_lock` を外した結果、**RAG の書き手が 2 つ並行しうる**ようになった:
