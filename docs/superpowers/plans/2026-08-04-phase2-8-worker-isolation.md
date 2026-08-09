@@ -8428,12 +8428,82 @@ EOF
 
 設計書 §3.1「ReflectionCycle も同じ三相構造に再構成し、独自実装だった `_run_recorded` 相当を共通化する」を実装する。まず TradeLoop (Task 15) の `_finalize_mission` を共有モジュールへ抽出し (「共通化」の実体)、`TradeLoop` をそちらへ切り替えてから、`ReflectionCycle` を同じ関数を使う三相 (prepare/run/commit-core) + RAG 書込 (lock 不要 — Task 9 で `Rag` 自身が内部 lock を持つ) の構造に再構成する。
 
+---
+
+## ⚠ 着手前検証の結果 (2026-08-09、指揮者が現物照合) — **必ず最初に読むこと**
+
+### (1) Step 3 のテストは **Task 15 で削除した恒真パターンの復活**
+
+Step 3 の `_SlowRunner` は `runner.run()` の**中**で `core_lock.acquire(blocking=False)` を試す。
+これは **`run_once` を呼んだのと同じスレッド**であり、**`RLock` は所有スレッドからの
+`acquire` が常に成功する (再入可能)** ため、**run 相を誤って `with core_lock:` で包む変異を
+検出できない**。Task 15 で同型の `test_run_once_does_not_hold_core_lock_during_runner_run` を
+**実測で恒真と確認して削除済み** (実装者・codex・ローカルの 3 者が独立に指摘)。
+
+**同じものを新規に作ってはならない。** 必ず **`threading.Event` で `runner.run` を留め、
+別スレッド (checker) から `acquire(blocking=False)` を試す**形にすること。
+run 相では **`True` になるのが正** (lock 非保持だから取れる)。
+`tests/loops/test_trade_loop_phases.py` の
+`test_scheduler_tick_can_acquire_lock_while_worker_runner_blocks` が手本。
+
+### (2) 参照行のドリフト
+
+| プラン旧記載 | 現物 | 備考 |
+|---|---|---|
+| `service.py:353-355` (`ReflectionCycle` 構築) | **504-507** | |
+| `service.py` `core_lock = threading.RLock()` | **465** | **ReflectionCycle (504) より前にある** — Task 15 で移動済みなので「移動すること」の注意は**不要** |
+| `tests/loops/test_reflection_cycle.py` の 2・3 箇所目 | **107, 233** | 旧記載 100-110 / 228-237 |
+| `reflection_cycle.py` の `__init__` 25-35 / `run_pending` 37-57 / `_reflect_one` 59-154 | **一致** | ドリフトなし |
+
+### (3) Step 2 の「3 箇所の呼び出し」は **7 箇所**
+
+`grep -c "self._finalize_mission(" src/agentic_fx/loops/trade_loop.py` → **7**
+(194, 206, 320, 333, 380, 525, 544 行)。Task 15 のレビュー 3 周で例外経路の finalize が
+増えたため。**Step 2 の grep 指示に従えば漏れないが、件数の思い込みで止めないこと。**
+
+### (4) 既存テスト 3 本への影響 (**壊れない** — 確認済み)
+
+`tests/loops/test_trade_loop_phases.py` の
+`test_finalize_mission_holds_core_lock_on_{mission_failed,intent_parse_error,unexpected_exception}`
+は `patch("agentic_fx.loops.trade_loop.missions.finish", spy)` を使う。
+**`missions` はモジュールオブジェクトを共有するので、`mission_finalize.py` 経由の呼び出しも
+同じ patch で捕まる** — 共有関数化しても機能する。
+ただし**テスト名と docstring が `_finalize_mission` を指しており実体が無くなる**ので、
+文言を共有関数名に合わせて更新すること (挙動は変えない)。
+
+### (5) Task 15 の教訓の適用 — 「不変条件に依存している場所」の grep (**実施済み**)
+
+Task 15 では「`_trade_fn` から lock を外す」正しい修正が、**離れた場所 (`service.py` の
+停止判定) の暗黙の前提を壊した**。本 task も `_reflection_fn` から lock を外すので、
+指揮者が同じ grep を先に回した:
+
+- **停止判定は既に安全**。Task 15 で `if th.is_alive() or app.supervisor.is_alive():` に
+  変更済みで、reflection は supervisor スレッドで走る (Task 13 の trade→reflection 連鎖)
+  ため**この変更でカバーされている**
+- `service.py` の `core_lock` 関連コメント 3 箇所 (510, 754, 757 行) を確認 —
+  **reflection の lock 保持を前提にした記述は無い**
+- `_finalize_mission` の外部参照は `tests/loops/test_trade_loop_phases.py` のみ (上記 (4))
+
+**実装者も、実装後に同じ grep を回して報告すること** (`core_lock` を含むコメント・docstring を
+洗い、reflection の lock 保持を前提にした記述が残っていないか)。
+
+### (6) 未解決の設計上の問い — **レビューで見てもらう**
+
+`_reflect_one` は **RAG 書込 → SQLite 書込**の順で、SQLite 行を完了マーカーとする。
+RAG 成功後・`reflections.save` 前にプロセスが死ぬと、**次周期の再試行で RAG に 2 件目が
+入る**可能性がある。プランは「SQLite 行が無いので再試行する (idempotent)」と書くが、
+**その idempotent 性は SQLite 側の話であって RAG 側ではない。**
+`Rag.add_reflection` が同一 `order_id` で冪等かを**実装者が現物で確認**し、
+冪等でなければ**その事実を報告**すること (本 task で直すかはレビューで判断する)。
+
+---
+
 **Files:**
 - Create: `src/agentic_fx/loops/mission_finalize.py`
 - Modify: `src/agentic_fx/loops/trade_loop.py` (`_finalize_mission` を削除し共有関数の呼び出しに置換)
 - Modify: `src/agentic_fx/loops/reflection_cycle.py` (全体 — 三相再構成)
-- Modify: `src/agentic_fx/service.py:353-355`(`ReflectionCycle` construction に `core_lock` 追加)`,`(`_reflection_fn` の `with core_lock:` 除去)
-- Modify: `tests/loops/test_reflection_cycle.py:21-30,100-110,228-237` (3 箇所の `ReflectionCycle(...)` construction に `core_lock` 追加)
+- Modify: `src/agentic_fx/service.py:504-507` (**現物照合済み — 旧記載 353-355 はドリフト**) (`ReflectionCycle` construction に `core_lock` 追加) + `_reflection_fn` (515 行) の `with core_lock:` 除去
+- Modify: `tests/loops/test_reflection_cycle.py` の `ReflectionCycle(...)` 構築 **3 箇所 (26, 107, 233 行 — 現物照合済み)** に `core_lock` 追加
 - Test: `tests/loops/test_reflection_cycle_phases.py` (新規 — lock 境界の直接検証)
 
 **Interfaces:**
@@ -8492,7 +8562,7 @@ def finalize_mission(conn: sqlite3.Connection, activity: ActivityLog,
 
 - [ ] **Step 2: `trade_loop.py` を共有関数へ切り替え**
 
-`src/agentic_fx/loops/trade_loop.py` の import 節に `from agentic_fx.loops.mission_finalize import finalize_mission` を追加する。`TradeLoop._finalize_mission` メソッド (Task 15 で新設) を**削除**し、本体内の 3 箇所の呼び出し (`self._finalize_mission(mid, result)`) をすべて `finalize_mission(self.conn, self.activity, self.clock, mid, result)` に置換する (`grep -n "_finalize_mission" src/agentic_fx/loops/trade_loop.py` で呼び出し箇所を洗い出し、メソッド定義も含めて過不足なく置換すること)。
+`src/agentic_fx/loops/trade_loop.py` の import 節に `from agentic_fx.loops.mission_finalize import finalize_mission` を追加する。`TradeLoop._finalize_mission` メソッド (Task 15 で新設) を**削除**し、本体内の **7 箇所** (194, 206, 320, 333, 380, 525, 544 行 — **現物で数えた。旧記載の「3 箇所」は Task 15 前の値**) の呼び出し (`self._finalize_mission(mid, result)`) をすべて `finalize_mission(self.conn, self.activity, self.clock, mid, result)` に置換する (`grep -n "_finalize_mission" src/agentic_fx/loops/trade_loop.py` で呼び出し箇所を洗い出し、メソッド定義も含めて過不足なく置換すること)。
 
 ```bash
 uv run pytest tests/loops/test_trade_loop.py tests/loops/test_trade_loop_phases.py \
@@ -8505,8 +8575,12 @@ Expected: 全件 PASS (挙動は不変 — 関数の置き場所を変えただ�
 
 `tests/loops/test_reflection_cycle_phases.py` を新規作成する:
 
+**⚠ 旧プランの `_SlowRunner` 版は使わない (着手前検証 (1) 参照)。** 同一スレッドで
+`RLock.acquire(blocking=False)` を試す形は恒真であり、Task 15 で実測のうえ削除済み。
+**必ず別スレッド (checker) から確かめる。**
+
 ```python
-"""ReflectionCycle 五相再構成の lock 境界 (プラン8, 設計書 §3.1)。"""
+"""ReflectionCycle 三相再構成の lock 境界 (プラン8, 設計書 §3.1)。"""
 from __future__ import annotations
 
 import threading
@@ -8517,31 +8591,83 @@ from agentic_fx.runners.base import Mission, MissionResult
 from tests.loops.test_reflection_cycle import _cycle, _closed_order
 
 
-class _SlowRunner:
-    def __init__(self, core_lock: threading.RLock, result: MissionResult) -> None:
-        self._core_lock = core_lock
-        self._result = result
-        self.lock_was_free_during_run = False
-
-    def run(self, mission: Mission) -> MissionResult:
-        acquired = self._core_lock.acquire(blocking=False)
-        if acquired:
-            self.lock_was_free_during_run = True
-            self._core_lock.release()
-        return self._result
-
-
-def test_reflect_one_does_not_hold_core_lock_during_runner_run(tmp_path):
+def test_run_phase_does_not_hold_core_lock(tmp_path):
+    """run 相 (runner.run) は core_lock を保持しない — **別スレッド**から
+    取得できることで検証する (RLock は同一スレッドからは常に取れるので、
+    run() の中で試す形は恒真になる — Task 15 で実測済み)。"""
     conn, rag, cyc = _cycle(tmp_path, [])
-    slow = _SlowRunner(cyc._core_lock, MissionResult(
-        "completed", {"content": "振り返り"}, []))
-    cyc.runner = slow
     _closed_order(conn)
+    entered = threading.Event()
+    release = threading.Event()
 
-    cyc.run_pending()
+    class BlockingRunner:
+        def run(self, mission):
+            entered.set()
+            release.wait(5.0)
+            return MissionResult("completed", {"content": "振り返り"}, [])
 
-    assert slow.lock_was_free_during_run is True
+    cyc.runner = BlockingRunner()
+    t = threading.Thread(target=cyc.run_pending, daemon=True)
+    t.start()
+    assert entered.wait(5.0), "run 相に到達しなかった"
+
+    acquired: list[bool] = []
+    checker = threading.Thread(
+        target=lambda: acquired.append(cyc._core_lock.acquire(blocking=False)))
+    checker.start()
+    checker.join(timeout=5.0)
+    if acquired and acquired[0]:
+        cyc._core_lock.release()
+    assert acquired == [True], (
+        "run 相では core_lock は解放されているはず (別スレッドが取得できる)")
+
+    release.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+
+
+def test_prepare_phase_holds_core_lock(tmp_path):
+    """prepare 相 (missions.start 等) は core_lock を保持する — run 相と
+    対の不変条件。片方だけでは防御にならない。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "completed", {"content": "振り返り"}, [])])
+    _closed_order(conn)
+    entered = threading.Event()
+    proceed = threading.Event()
+    from agentic_fx.store import missions as missions_store
+    original = missions_store.start
+
+    def spy(*args, **kwargs):
+        entered.set()
+        assert proceed.wait(5.0), "checker が確認を完了しなかった"
+        return original(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("agentic_fx.loops.reflection_cycle.missions.start", spy)
+        t = threading.Thread(target=cyc.run_pending, daemon=True)
+        t.start()
+        assert entered.wait(5.0), "prepare 相に到達しなかった"
+
+        acquired: list[bool] = []
+        checker = threading.Thread(
+            target=lambda: acquired.append(
+                cyc._core_lock.acquire(blocking=False)))
+        checker.start()
+        checker.join(timeout=5.0)
+        if acquired and acquired[0]:
+            cyc._core_lock.release()
+        assert acquired == [False], (
+            "prepare 実行中は他スレッドから core_lock を取得できないはず")
+
+        proceed.set()
+        t.join(timeout=5.0)
+        assert not t.is_alive()
 ```
+
+（`_cycle` の戻り値・`_closed_order` の使い方は `tests/loops/test_reflection_cycle.py` の
+現物に合わせること。`pytest.MonkeyPatch` が使いにくければ
+`unittest.mock.patch` でよい — `tests/loops/test_trade_loop_phases.py` の
+`test_prepare_phase_holds_core_lock` が手本。）
 
 - [ ] **Step 4: テスト実行して FAIL を確認**
 
@@ -8727,7 +8853,7 @@ Expected: 全件 PASS。
                                  watch=mission_watch)
 ```
 
-**注意**: `core_lock` の定義位置が `reflection = ReflectionCycle(...)` より後ろにある場合 (Task 15 の並べ替え次第)、`core_lock = threading.RLock()` の定義を `trade_loop`/`reflection` の構築より前に移動すること (Task 15 Step 9 の注意と同じ配慮)。
+**注意 (2026-08-09 現物確認により解消)**: `core_lock = threading.RLock()` は **465 行**、`reflection = ReflectionCycle(...)` は **504 行**なので、既に定義が前にある (Task 15 で移動済み)。**移動は不要。**
 
 Task 15 で作った `_reflection_fn` (`with core_lock: return reflection.run_pending()`) を以下に変更する (`ReflectionCycle` 自身が prepare/commit-core で lock を管理するようになったため):
 
@@ -8750,7 +8876,67 @@ Expected: 全件 PASS。
 
 1. `finalize_mission` の `if not finished:` ブロックを削除 → 専用テストが無ければ `tests/store/test_missions_cas.py` の CAS 系テストとは別に、`finalize_mission` 自身の直接テストを 1 本追加してから (`tests/loops/test_reflection_cycle_phases.py` へ追記) この変異で red になることを確認する
 2. `_reflect_one` の `if result.status != "completed" or not finalized:` を `if result.status != "completed":` に改変 (finalized チェックを削除) → 専用テストとして「finalize が False を返すケースで reflection が保存されない」ことを確認するテストを追加してから確認する
-3. `_reflect_one` 内の RAG 書込ブロックを `with self._core_lock:` で誤って包む改変を行い、`test_reflect_one_does_not_hold_core_lock_during_runner_run` が red に**ならない**ことを確認する — これは run 相 (RAG 書込ではなく runner.run) の lock 非保持を検証するテストであり、RAG 書込の lock 有無を直接検出しない。**この限界を progress.md に明記し、RAG 書込が誤って lock 保持下に入っていないことは Step 5 の実装コード diff レビューで確認する** (テストで機械的に検出できない設計判断の限界)
+3. `_reflect_one` 内の RAG 書込 (`self.rag.add_reflection`) を `with self._core_lock:` で包む改変
+   → **下記の `test_rag_write_does_not_hold_core_lock` が red になること。**
+
+   **(2026-08-09 着手前検証で改訂)** 旧プランはここを「テストで機械的に検出できない設計判断の
+   限界」として progress.md への明記に逃がしていた。**Task 15 でも同じ逃げ (Step 11 変異 1) を
+   していたが、checker スレッド方式で実際に測れることが判明した** — 同じ方法がここでも使える。
+   RAG 書込は Rag 自身の内部 lock に委ねる設計 (Task 9) であり、**誤って `core_lock` に入ると
+   RAG の I/O 時間だけ SL/TP 監視が止まる**。この task の主旨そのものなので測れないままにしない。
+
+   `tests/loops/test_reflection_cycle_phases.py` に追加する:
+
+   ```python
+   def test_rag_write_does_not_hold_core_lock(tmp_path):
+       """RAG 書込は core_lock を保持しない (Rag 自身の内部 lock に委ねる
+       — Task 9)。誤って core_lock で包むと RAG の I/O 時間だけ SL/TP
+       監視が止まる。"""
+       conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+           "completed", {"content": "振り返り"}, [])])
+       _closed_order(conn)
+       entered = threading.Event()
+       release = threading.Event()
+       original = cyc.rag.add_reflection
+
+       def spy(*args, **kwargs):
+           entered.set()
+           assert release.wait(5.0), "checker が確認を完了しなかった"
+           return original(*args, **kwargs)
+
+       cyc.rag.add_reflection = spy
+       t = threading.Thread(target=cyc.run_pending, daemon=True)
+       t.start()
+       assert entered.wait(5.0), "RAG 書込に到達しなかった"
+
+       acquired: list[bool] = []
+       checker = threading.Thread(
+           target=lambda: acquired.append(
+               cyc._core_lock.acquire(blocking=False)))
+       checker.start()
+       checker.join(timeout=5.0)
+       if acquired and acquired[0]:
+           cyc._core_lock.release()
+       assert acquired == [True], (
+           "RAG 書込中は core_lock が解放されているはず "
+           "(誤って core_lock で包んでいる)")
+
+       release.set()
+       t.join(timeout=5.0)
+       assert not t.is_alive()
+   ```
+
+   **書けなかった場合のみ**旧プランどおり progress.md への明記に落とすこと
+   (**書けなかった理由を必ず報告する**)。
+
+4. `run_pending` の先頭 SELECT から `with self._core_lock:` を外す → prepare 相の lock を
+   pin するテスト (Step 3 の `test_prepare_phase_holds_core_lock`) が red になることを確認する
+
+**リストは下限。** この task が守ろうとしている性質は「**run 相と RAG 書込は core_lock を
+保持しない**」と「**prepare 相と commit-core 相は保持する**」の対の不変条件、および
+「**finalize が失敗したら reflection を保存しない**」の 3 つ。これらを壊す変異を自分で追加し、
+red になるかを確かめよ。**リストに無い変異を追加したら、内容と KILLED/SURVIVED を必ず報告せよ。**
+**KILLED でも「落ちたテスト名が狙った防御のものか」を確認**すること。
 
 - [ ] **Step 11: Commit**
 
