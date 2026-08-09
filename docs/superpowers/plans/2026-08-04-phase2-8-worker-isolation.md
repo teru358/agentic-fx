@@ -9803,6 +9803,88 @@ Step 8 のコードは `signal.signal(SIGTERM/SIGINT)` を **`if daemon:` 配下
   - `service._exit_code(app: App, scheduler_alive: bool, supervisor_alive: bool) -> int` — **(裁定書 IM-4 / P8-06 新設)** `app.fatal_reason is not None` なら join 成否に関係なく `1`。それ以外は `1 if (scheduler_alive or supervisor_alive) else 0` (現行の join タイムアウト判定を維持)。`run_service` の末尾はこの関数の戻り値をそのまま使う (単体テスト可能にするため `run_service` 内クロージャに閉じ込めない)
   - `service._busy_resources_after_join(scheduler_still_busy: bool, supervisor_still_busy: bool) -> frozenset[str]` — **(裁定書 F-6 / IM-6 新設)** `App.close(busy_resources=...)` に渡す集合の判定を純関数として抽出。supervisor still-busy なら `conn_core` に加え `conn_supervisor` も busy に含める
 
+## ✅ 実装前の裁定 (2026-08-09 指揮者 + ユーザー) — **以下は Step 群の記述に優先する**
+
+上記「着手前検証」で挙がった食い違いのうち、**実装前に決着が必要だったもの**をここで確定させた。Step 5〜12 の本文と矛盾する場合は**この節が正**。
+
+### A. `stop_event` の配線 — Step 5 の訂正 + **Step 8 に欠けている 1 行**
+
+1. ガードは **`_run_hooks` の冒頭に置く** (`scheduler.py:195`)。`tick()` の `finally` (`scheduler.py:183`) は呼び出しサイトが 1 箇所しかなく、しかも `BaseException` でも走るため、呼び出し側で包む形 (Step 5 の記述) は構造的に誤り。冒頭ガードなら将来呼び出しが増えても漏れない。
+
+```python
+    def _run_hooks(self, now: datetime) -> None:
+        """... 既存 docstring ...
+
+        設計書 §5 手順1: 停止シーケンス開始後 (`stop_event` セット後) は
+        hooks を実行しない。この判定を呼び出し側 (`tick` の `finally`) では
+        なくここに置くのは、`finally` が `BaseException` でも走るため
+        (Task 12 申し送り「停止処理の最中に news の HTTP 取得が走りうる」は
+        まさにこの経路) と、将来 `_run_hooks` の呼び出しが増えても漏れない
+        ため。
+        """
+        if self._stopping():
+            return
+```
+
+2. `_trade_mission_due` 側のガード (`reason = None if self._stopping() else ...`) は**別の適用範囲**。Step 5 のとおり `tick()` 本文に置く。変異も別々に当てる (プラン規約「防御の適用範囲全体に」)。
+
+3. **`build_app` の `Scheduler(...)` 構築 (`service.py:550`) に `stop_event=stop_event` を渡す。** Step 8 の build_app 変更リスト (ActivityLog / WorkerRunner / Commands / App) にはこの 1 行が**書かれていない**。渡し忘れると `_stopping()` が恒久 `False` になり、Step 5 の単体テストは全て緑のまま**ガード全体が死にコード**になる。
+   - **配線ピンを必ず張る**: `build_app(root)` が返す `app.scheduler` の `_stop_event` が `app.stop_event` と**同一オブジェクト**であること (`is` 比較)。単体ガードのテストだけでは検出できない ([[verify-integration-not-just-units]])。同じピンを `WorkerRunner` (`stop_event=`/`on_rpc_leak=`) にも張る。
+
+### B. supervisor join budget の導出 — 検証 (3) の決着
+
+`shutdown_join_timeout_sec` (固定 30 秒) は**使わない** (Task 15 が捨てた退行そのもの)。Task 15 の暫定式 (`llama_swap.timeout_sec + grace + terminate_grace + 10.0`) も**使わない** — これは Mission 1 回分しか包まず、dispatch は trade 1 + reflection 最大 3 件を連鎖する。
+
+**確定**: join budget は `_default_dispatch_ceiling_sec(app)` から導出する (同じ `per_mission × 4 + 60.0`)。
+
+```python
+        supervisor_join_timeout_sec = _default_dispatch_ceiling_sec(app)
+```
+
+- **決め手となった制約**: **join budget は watchdog の dispatch ceiling 以上でなければならない。** これより小さいと、watchdog が「dispatch が上限を超えた」と判定するより先に main が join を諦めるため、`_watchdog_check` の第二の軸 (`busy_since`/`dispatch_ceiling_sec`) が**構造的に到達不能**になり `fatal_reason` がその経路で永久にラッチしない。
+- **順序関係そのものをピンする** (どちらかを将来編集して逆転させたら red になるテストを 1 本置く)。Step 12 変異⑥ (固定 30 秒に戻す) はこのピンで殺せる。
+
+### C. 停止 producer の範囲 — 検証 (7) の決着 (**ユーザー裁定**)
+
+- **`SIGTERM` は `if daemon:` の外へ出す** (両モードで停止状態機械を通る — 設計書 §5)。
+- **`SIGINT` は `if daemon:` 配下のまま。** 対話シェルの Ctrl-C は「行のキャンセル」であり続ける必要があり、無条件化すると REPL の使用感を壊す。対話モードの Ctrl-C は従来どおり `KeyboardInterrupt` 経路。
+- 実装前に確認済み: `shell.py` の `_InterruptibleLineReader.readline` は `select.select(..., poll_interval)` で**タイムアウト付き**ポーリングをしている (`shell.py:101`)。したがって PEP 475 による `EINTR` 再開でシグナルが飲まれても、次のポーリング周回で `stop_event` を観測できる。**producer さえ配線すれば対話モードは実際に停止する。**
+- **producer の全数を表にしてテスト有無を示すこと** (Step 10 の成果物に含める): ①`SIGTERM` ハンドラ (両モード) ②`_record_fatal` (watchdog / scheduler 相互監視) ③`_on_rpc_leak` ④`run_service` の `finally` (べき等 set) ⑤daemon の `KeyboardInterrupt` 捕捉。
+
+### D. fd 0 継承 — 検証 (6) の決着
+
+- `plugin/approval.py:181` の `Popen` に **`stdin=subprocess.DEVNULL`** を渡す。`os.set_blocking(0, False)` はプロセス全体の fd 0 を非ブロック化し `_InterruptibleLineReader` を含む他の利用者に波及するため**却下**。
+- **DEVNULL だけでは 1 箇所しか直らない** (新規 `Popen` の追加で穴が再発する)。`src/` を `ast` で走査し「`subprocess.Popen`/`subprocess.run` の呼び出しで `stdin=` キーワードが無いもの」を検出して落とすピンを 1 本置く。既知の許容例外 (`store/backtest_runs.py:235` 等) は明示的な allowlist にし、**allowlist に載せた理由を各行に書く** (Task 18 で allowlist コメントの保証範囲を実測に揃えた経緯と同じ扱い)。
+
+### E. flaky (`Bad file descriptor`) — 検証 (4) の決着 (**ユーザー裁定: Task 19 で直す**)
+
+Step 6 の `finally` は自ら「Task 10 の現行と完全に同一」と宣言している。**発生源がその `finally` 自体なので、転写しても flaky は残ったまま全件 green になる。**
+
+- **実修正を設計する**: dispatcher スレッドが既に close 済みの `proc.stdin` へ書き込む競合を潰す。`stdin_lock` 下で立てる「クローズ済みフラグ」を導入し、dispatcher は書き込み前にフラグを確認する (join のタイムアウト経路で dispatcher が生き残った場合でも安全側)。
+- **before/after を実測する**: `for i in $(seq 30); do uv run pytest tests/runners/test_worker_runner.py -q -W error::pytest.PytestUnraisableExceptionWarning; done` 相当で **発生回数をカウントして報告**する。**1 回の green は何も証明しない** (現状の再現率は約 1/3)。
+- `_wait_with_stop` の `poll_interval=0.2` については、既存の時間 assert 2 本 (`elapsed < 5.0` @717 行 / `elapsed >= 0.4` @978 行) を**実測して確認**する (検証 (5))。
+
+### F. Step 8 の置換で壊してはならない既存シーム
+
+- **`_scheduler_tick_once(app)` (`service.py:621`) の呼び出しを残す。** Step 8 は `with app.core_lock: app.scheduler.tick(...)` をインライン展開しているが、転写すると同関数が孤児化し `tests/test_service_app.py:941` の `patch(...)` と `test_scheduler_tick_once_uses_app_clock` (1308 行) が意味を失う。`scheduler_busy` の set/clear は `_scheduler_tick_once` 呼び出しの**外側**に置く。
+- **`watchdog_thread` は既に存在する** (`service.py:702-709`、`_watchdog_tick(app)` を呼んでいる)。新規作成ではなく**改造**。本 task が `_watchdog_check`/`_record_fatal` を差し込むことで初めて `stop_event` の producer になる。
+- 置換範囲は `app = build_app(root)` (**677 行**) から末尾まで (FC-4 の「491 行」は Task 15 でドリフト)。`settings = load_settings(...)` / `setup_technical_logging(...)` は 1 回だけ実行のまま残す。
+- `App.close` の resources 6 個以外に close 不要であることを、**`App` の現行 25 フィールド全てに対して明示的に確認**して報告する (`registry`/`mission_watch`/`provider`/`econ`/`collector`/`notifier`)。
+- `commands.py` の `_status` は **83 行** (Step 4 の「86-95 行」はドリフト)。
+
+### G. Step 12 変異リストの訂正 (リストは下限)
+
+- **変異①「`HealthLatch` に `reset()` を追加する」は変異になっていない** — メソッドを*追加*しても既存テストは red にならない。**差し替え**: `record_failure` を no-op 化 / `is_latched` を常に `False` にする。
+- **追加分**: ①`App.close` の資源ごと `try/except` 隔離を外す ②resources から `instance_lock` を落とす (flock leak を捕まえるテストがあるか) ③`_record_fatal` の `if app.fatal_reason is None:` を外す (最初の理由が上書きされる) ④`_stopping()` を `_trade_mission_due` 側だけ外す (hooks とは別の適用範囲) ⑤`on_write_failure` 内側の `except` を外す (write 非送出契約が壊れる) ⑥join budget の導出を固定 30 秒に戻す (上記 B の順序関係ピンが殺すはず) ⑦**`build_app` の `Scheduler(stop_event=...)` を落とす** (上記 A-3 の配線ピンが殺すはず) ⑧`SIGTERM` ハンドラを `if daemon:` 配下へ戻す。
+
+### H. Task 20 へ移送するもの (**ユーザー裁定**)
+
+- **実プロセス 2 本の同時起動 E2E** (`InstanceAlreadyRunning` + 先発の `running` mission 無傷) は **Task 20 の担当**とする。Task 19 の Interfaces 節にある Task 11 申し送りの記述はここで上書きする (Task 20 は E2E 専任 task であり、Task 19 は上記 D/E の追加作業で既に肥大している)。
+
+**stage 0 変異 sweep は、レビュアーが worktree に入る前に指揮者が完走させる。変異を注入する主体は同時に 1 つだけ。**
+
+---
+
 - [ ] **Step 1: 失敗するテストを書く (`HealthLatch`)**
 
 `tests/core/test_health_latch.py` を新規作成:
