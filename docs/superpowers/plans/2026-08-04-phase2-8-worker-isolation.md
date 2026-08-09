@@ -10723,6 +10723,22 @@ EOF
 ---
 ### Task 20: E2E + 受入条件検証 (設計書 §9 の 8 項目)
 
+**(Task 18 からの申し送り — 本 task で扱うか、プラン 9 へ送るかを判断すること)**
+
+1. **improve worker の Mission 完走は一度も実行していない。** Task 18 のスイートが担保するのは
+   「LLM エンドポイントへ**到達できる**」まで (`getaddrinfo` + `socket.create_connection` +
+   実測での `httpx.get("/v1/models")` → 200)。**実 LLM 応答 → `result` 送出までの完走は
+   llama-swap 実機と数百秒を要するためスイートに入れていない。** allowlist の必要十分は
+   この終点でしか最終確定しない ([[measure-capability-not-startup]] の型 — Task 18 では
+   「`ready` 到達」で測って `/etc` を落とし、merge blocker を作った)。
+2. **外部ホスト名の DNS 解決は improve worker からできない** (`/etc/resolv.conf` が
+   `/run/systemd/resolve/...` への symlink で allowlist 外。実測)。`llama_swap.base_url` を
+   `localhost`/IP 以外にする運用があるなら allowlist の追加が要る。
+3. **`_assert_allowlist_excludes_data_dir` は best-effort の第 2 層**で、`afx` をリポジトリ外から
+   起動する運用では素通りする (data root はサービスプロセスの cwd)。第 1 層は
+   `WorkerRunner` の `Popen(cwd=専用 tempdir)`。E2E で**リポジトリ外から起動した場合**の
+   improve worker の遮断を確認できると、この層のギャップが実測で埋まる。
+
 **(Task 16 レビュー 2 周からの申し送り — 本 task で実測すること) RAG lock の競合窓が新設された。**
 
 Task 16 で `_reflection_fn` の外側 `core_lock` を外した結果、**RAG の書き手が 2 つ並行しうる**ようになった:
