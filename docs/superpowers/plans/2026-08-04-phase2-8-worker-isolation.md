@@ -10590,6 +10590,28 @@ EOF
 ---
 ### Task 20: E2E + 受入条件検証 (設計書 §9 の 8 項目)
 
+**(Task 16 レビュー 2 周からの申し送り — 本 task で実測すること) RAG lock の競合窓が新設された。**
+
+Task 16 で `_reflection_fn` の外側 `core_lock` を外した結果、**RAG の書き手が 2 つ並行しうる**ようになった:
+
+| 書き手 | 経路 | lock |
+|---|---|---|
+| `ReflectionCycle.add_reflection` | commit-post 相 | **`core_lock` 非保持** (Task 16 で変更) |
+| `NewsCollector.collect` の `add_news`/`cleanup_news` | `scheduler.tick` → `on_news_cycle` | **`core_lock` 保持** (`_scheduler_tick_once`) |
+
+**従来は両方とも `core_lock` 下だったので構造的に排他されていた。** いまは並行する。
+
+`Rag._locked()` の待ちは `lock_timeout_sec` (既定 **10 秒**) で打ち切られ `RagUnavailable` (ただの `Exception`) になる。具体的な悪い筋:
+
+1. scheduler スレッドが news バッチを埋め込み中 (all-MiniLM を CPU で回す + `cleanup_news`) で 10 秒超
+2. 直前に最大 `llama_swap.timeout_sec` (既定 **300 秒**) の LLM 時間を使った reflection Mission が `RagUnavailable` を受ける
+3. `reflection_rag_failed` を記録して**生成済みの content を捨て**、次周期に Mission ごとやり直す
+4. 同じ order に対して `completed` の missions 行が 2 本残る
+
+自己修復はするが**高価**。逆向きには、`collect` が RAG lock 待ちで最大 10 秒 **`core_lock` を保持したまま**止まりうる — **`core_lock` の保持時間が RAG の競合に依存するようになった**のは本プランの目的と逆方向である (`add_reflection` は単一 upsert なので小さいが、新規に生まれた依存であることは事実)。
+
+**本 task で ①news の埋め込みが RAG lock を実際に何秒保持するかを計測する ②その実測に基づいて `add_reflection` に bounded retry を入れるか `lock_timeout_sec` を調整するかを判断する。** 順序 (RAG → SQLite) は変えないこと — SQLite 行が完了マーカーである設計は意図的。
+
 **(Task 15 レビュー 3 周からの申し送り — 本 task で必ず実測すること) `snapshot_max_age_sec` の既定 10 秒は一度も実測されていない。**
 
 `gather_open_snapshot` は `captured_at = clock.now()` を **quote 取得より前** (メソッドの 1 行目) に刻み、その後に ①`quote_fn(pair)` ②全 exposure pair の `spec_fn` ③全 exposure 通貨の `cycle_rate(ccy)` を回す。③は各通貨ごとに **mt5 → twelvedata → yfinance のフォールバック連鎖**を通り、各段が自分の timeout を払ってから次へ落ちる。
