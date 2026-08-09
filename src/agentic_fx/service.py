@@ -13,7 +13,7 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +25,7 @@ from agentic_fx.commands import Commands
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
 from agentic_fx.core.executor import Executor
+from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
@@ -210,6 +211,31 @@ class App:
     instance_lock: object
     supervisor: object
     conn_supervisor: object
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    health_latch: HealthLatch = field(default_factory=HealthLatch)
+    watchdog_heartbeat: float = field(default_factory=time.monotonic)
+    fatal_reason: str | None = None
+
+    def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
+        skipped: list[str] = []
+        resources = [
+            ("runner", lambda: self.runner.close()
+             if self.owns_runner and hasattr(self.runner, "close") else None),
+            ("rag", self.rag.close),
+            ("conn_supervisor", self.conn_supervisor.close),
+            ("conn_core", self.conn_core.close),
+            ("conn_shell", self.conn_shell.close),
+            ("instance_lock", self.instance_lock.close),
+        ]
+        for name, closer in resources:
+            if name in busy_resources:
+                skipped.append(name)
+                continue
+            try:
+                closer()
+            except Exception as e:  # noqa: BLE001 — continue closing owned resources
+                _log.warning("App.close: %s failed: %s", name, safe_error_text(e))
+        return skipped
 
 
 def _validate_startup(settings) -> None:
@@ -298,7 +324,8 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
 def build_app(root: Path, *, runner: AgentRunner | None = None,
               clock: Clock | None = None, quote_fn=None, spec_fn=None,
               bars_fn=None, embedding_fn=None,
-              provider: PriceProvider | None = None) -> App:
+              provider: PriceProvider | None = None,
+              stop_event: threading.Event | None = None) -> App:
     """全部品を配線して `App` を返す。
 
     quote_fn / spec_fn / bars_fn / embedding_fn は E2E テストの注入点 (None なら
@@ -329,10 +356,16 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     参照)。
     """
     clock = clock or SystemClock()
+    stop_event = stop_event if stop_event is not None else threading.Event()
     settings = load_settings(root / "config" / "settings.yaml")
 
     state = _state_store(root)
-    activity = ActivityLog(root / "logs" / "activity.log")
+    health_latch = HealthLatch()
+    activity = ActivityLog(
+        root / "logs" / "activity.log",
+        on_write_failure=lambda e: health_latch.record_failure(
+            f"activity write failed: {safe_error_text(e)}"))
+    watchdog_heartbeat = time.monotonic()
 
     # FC-2 (裁定書): recover_interrupted は起動時に status='running' の
     # 全 mission を無条件に interrupted 化する。二重起動があると、後発
@@ -454,9 +487,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         _assert_tools_registered(registry, _TRADE_TOOLS)
 
         owns_runner = runner is None
+        def _on_rpc_leak() -> None:
+            health_latch.record_failure(
+                "RAG RPC dispatcher leaked past rpc_timeout_sec")
+            stop_event.set()
         if runner is None:
             runner = WorkerRunner(root=root, settings=settings, clock=clock,
-                                  rag=rag, worker_profile="trade")
+                                  rag=rag, worker_profile="trade",
+                                  stop_event=stop_event,
+                                  on_rpc_leak=_on_rpc_leak)
 
         policy = Policy(root / "policy" / "directives.md")
         # 上書き 3: MissionWatch は 1 インスタンスを trade_loop / reflection に共有注入
@@ -554,7 +593,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                               on_news_cycle=collector.collect,
                               on_econ_cycle=econ.refresh,
                               on_signal_maintenance=on_signal_maintenance,
-                              signal_due_fn=signal_due_fn)
+                              signal_due_fn=signal_due_fn,
+                              stop_event=stop_event)
 
         # 起動時 reclaim 1 回 (コントローラ裁定): 前回停止時に claimed のまま
         # 残った signal を、次の tick を待たずに起動直後から回収対象にする。
@@ -570,7 +610,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         commands = Commands(conn=conn_shell, state_store=state,
                             broker=shell_broker,
                             trade_loop=_SupervisorAsk(supervisor, ask_wait_timeout_sec),
-                            activity=activity, log_dir=root / "logs", clock=clock)
+                            activity=activity, log_dir=root / "logs", clock=clock,
+                            health_latch=health_latch)
         return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
                    executor=executor, provider=provider, econ=econ,
@@ -580,7 +621,10 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    mission_watch=mission_watch, notifier=notifier,
                    runner=runner, owns_runner=owns_runner, clock=clock,
                    instance_lock=instance_lock, supervisor=supervisor,
-                   conn_supervisor=conn_supervisor)
+                   conn_supervisor=conn_supervisor, stop_event=stop_event,
+                   health_latch=health_latch,
+                   watchdog_heartbeat=watchdog_heartbeat,
+                   fatal_reason=None)
     except BaseException:
         # 2 周目レビュー (sonnet Minor / KAT-Coder Critical): 素の
         # `instance_lock.close()` だと close 自身が送出した例外が伝播し、
@@ -663,6 +707,76 @@ def _watchdog_tick(app: App) -> None:
         _log.exception("watchdog mark_notified failed")
 
 
+def _record_fatal(app: App, stop_event: threading.Event, reason: str) -> None:
+    if app.fatal_reason is None:
+        app.fatal_reason = reason
+    app.activity.write(Category.SYSTEM, "fatal_thread_death", reason)
+    try:
+        app.notifier.send(f"[agentic-fx] 致命的エラー: {reason} — 停止します")
+    except Exception:  # noqa: BLE001
+        _log.exception("failed to notify fatal_thread_death")
+    stop_event.set()
+
+
+def _default_dispatch_ceiling_sec(app: App) -> float:
+    w = app.settings.worker
+    per_mission = (app.settings.llama_swap.timeout_sec
+                   + w.worker_grace_sec + w.worker_terminate_grace_sec)
+    return per_mission * 4 + 60.0
+
+
+def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,
+                    stop_event: threading.Event, *,
+                    heartbeat_grace_sec: float = 30.0,
+                    dispatch_ceiling_sec: float | None = None) -> None:
+    if not scheduler_thread_obj.is_alive():
+        _record_fatal(app, stop_event, "scheduler thread is dead")
+        return
+    if not app.supervisor.is_alive():
+        _record_fatal(app, stop_event, "supervisor thread is dead")
+        app.supervisor.fail_pending(exc=RuntimeError("supervisor thread died"))
+        return
+    if time.monotonic() - app.supervisor.heartbeat > heartbeat_grace_sec:
+        _record_fatal(app, stop_event, "supervisor heartbeat stale")
+        return
+    ceiling = (dispatch_ceiling_sec if dispatch_ceiling_sec is not None
+               else _default_dispatch_ceiling_sec(app))
+    busy_since = app.supervisor.busy_since
+    if busy_since is not None and time.monotonic() - busy_since > ceiling:
+        _record_fatal(app, stop_event,
+                      f"supervisor dispatch exceeded ceiling ({ceiling:.0f}s)")
+        app.supervisor.fail_pending(exc=RuntimeError("supervisor dispatch hung"))
+        return
+    _watchdog_tick(app)
+
+
+def _check_watchdog_health(app: App, watchdog_thread_obj: threading.Thread,
+                           stop_event: threading.Event, *,
+                           wd_heartbeat_grace_sec: float = 90.0) -> None:
+    if not watchdog_thread_obj.is_alive():
+        _record_fatal(app, stop_event, "watchdog thread is dead")
+        return
+    if time.monotonic() - app.watchdog_heartbeat > wd_heartbeat_grace_sec:
+        _record_fatal(app, stop_event, "watchdog heartbeat stale")
+
+
+def _busy_resources_after_join(scheduler_still_busy: bool,
+                               supervisor_still_busy: bool) -> frozenset[str]:
+    busy: set[str] = set()
+    if scheduler_still_busy or supervisor_still_busy:
+        busy.add("conn_core")
+    if supervisor_still_busy:
+        busy.add("conn_supervisor")
+    return frozenset(busy)
+
+
+def _exit_code(app: App, scheduler_alive: bool,
+               supervisor_alive: bool) -> int:
+    if app.fatal_reason is not None:
+        return 1
+    return 1 if scheduler_alive or supervisor_alive else 0
+
+
 def run_service(root: Path, *, daemon: bool = False,
                _stop_event: threading.Event | None = None) -> int:
     """`_stop_event` はテスト用のシーム (fix round 1 F4)。省略時は内部で
@@ -674,7 +788,8 @@ def run_service(root: Path, *, daemon: bool = False,
     settings = load_settings(root / "config" / "settings.yaml")
     setup_technical_logging(root / "logs", settings.logging.level,
                             daemon=daemon)
-    app = build_app(root)
+    stop_event = _stop_event if _stop_event is not None else threading.Event()
+    app = build_app(root, stop_event=stop_event)
 
     warning = Policy(root / "policy" / "directives.md").size_warning()
     if warning:
@@ -683,7 +798,7 @@ def run_service(root: Path, *, daemon: bool = False,
     app.activity.write(Category.SYSTEM, "service_started",
                        f"daemon={daemon}")
 
-    stop_event = _stop_event if _stop_event is not None else threading.Event()
+    scheduler_busy = threading.Event()
 
     def scheduler_thread() -> None:
         last = 0.0
@@ -692,19 +807,29 @@ def run_service(root: Path, *, daemon: bool = False,
                 last = time.monotonic()
                 if stop_event.is_set():
                     break  # 停止フェーズ: 新しい tick を開始しない
+                scheduler_busy.set()
                 try:
                     _scheduler_tick_once(app)
                 except Exception:  # noqa: BLE001
                     _log.exception("tick failed")
+                finally:
+                    scheduler_busy.clear()
+                if not stop_event.is_set():
+                    try:
+                        _check_watchdog_health(app, wd, stop_event)
+                    except Exception:  # noqa: BLE001
+                        _log.exception("watchdog health check failed")
             stop_event.wait(1)
 
     def watchdog_thread() -> None:
         while not stop_event.is_set():
+            app.watchdog_heartbeat = time.monotonic()
             stop_event.wait(30)
             if stop_event.is_set():
                 break
+            app.watchdog_heartbeat = time.monotonic()
             try:
-                _watchdog_tick(app)
+                _watchdog_check(app, th, stop_event)
             except Exception:  # noqa: BLE001 — スレッドを殺さない
                 _log.exception("watchdog tick failed")
 
@@ -712,15 +837,15 @@ def run_service(root: Path, *, daemon: bool = False,
     # 以前はスレッド起動後に登録しており、その間に SIGTERM が届くとデフォルト
     # 動作 (即時終了) で graceful shutdown 経路を経ずにプロセスが死ぬ窓が
     # あった。
+    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
     if daemon:
-        signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
         signal.signal(signal.SIGINT, lambda *_: stop_event.set())
 
     app.supervisor.start()
     th = threading.Thread(target=scheduler_thread, daemon=True)
-    th.start()
     wd = threading.Thread(target=watchdog_thread, daemon=True)
     wd.start()
+    th.start()
 
     try:
         if daemon:
@@ -737,6 +862,8 @@ def run_service(root: Path, *, daemon: bool = False,
         else:
             from agentic_fx.shell import run_shell
             run_shell(app.commands, stop_event)
+            if stop_event.is_set() and app.fatal_reason is not None:
+                print("警告: システムスレッドの異常を検出したため停止します。")
     finally:
         # F2: 待機部で想定外の例外 (KeyboardInterrupt 含む) が起きても、
         # shutdown 手順 (stop・join・close・記録) は必ず実行する。ここでは
@@ -766,6 +893,7 @@ def run_service(root: Path, *, daemon: bool = False,
         # 「join 完了 = 実行中 Mission も完了」という壊れた不変条件の
         # 最小修復に留める)。
         th.join(timeout=30)
+        scheduler_still_busy = scheduler_busy.is_set() and th.is_alive()
         # **(レビュー 3 周目 codex E2)** `shutdown_join_timeout_sec`
         # (settings.yaml.example 既定 30 秒) は trade Mission の
         # `llama_swap.timeout_sec` (既定 300 秒) と釣り合っておらず、
@@ -780,11 +908,9 @@ def run_service(root: Path, *, daemon: bool = False,
         # (状態機械全体の再設計) は Task 19 の担当とし、ここでは「Mission
         # 1 回分の timeout と無関係な定数 30 秒」という壊れた対応関係の
         # 最小修復に留める。
-        supervisor_join_timeout_sec = (
-            app.settings.llama_swap.timeout_sec
-            + app.settings.worker.worker_grace_sec
-            + app.settings.worker.worker_terminate_grace_sec + 10.0)
+        supervisor_join_timeout_sec = _default_dispatch_ceiling_sec(app)
         app.supervisor.join(timeout=supervisor_join_timeout_sec)
+        supervisor_still_busy = app.supervisor.is_alive()
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
         # 行う。notifier は最大 10 秒ブロックしうるため、記録を先にすると
         # 「graceful」記録の後に watchdog がまだ activity へ書き込める窓が
@@ -796,18 +922,18 @@ def run_service(root: Path, *, daemon: bool = False,
         # (以前は join 成功時のみ close していた「上書き 7」の判断を、
         # leak 防止を優先する形に変更する)。close 自体の失敗で shutdown
         # シーケンスを止めない。
-        if app.owns_runner and hasattr(app.runner, "close"):
-            try:
-                app.runner.close()
-            except Exception:  # noqa: BLE001 — shutdown 記録は必ず行う
-                _log.exception("runner.close() failed during shutdown")
+        skipped = app.close(busy_resources=_busy_resources_after_join(
+            scheduler_still_busy, supervisor_still_busy))
+        if skipped:
+            app.activity.write(Category.SYSTEM, "close_skipped_resources",
+                               f"{skipped} (join timeout — used-in-flight)")
         if th.is_alive() or app.supervisor.is_alive():
             app.activity.write(Category.SYSTEM, "service_stopped",
                                "shutdown_timeout (Mission 継続中の可能性)")
         else:
             app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
 
-    if th.is_alive() or app.supervisor.is_alive():
+    if _exit_code(app, th.is_alive(), app.supervisor.is_alive()):
         print("警告: 停止タイムアウト。実行中の処理が残っている可能性があります。")
         return 1
     print("停止しました。")

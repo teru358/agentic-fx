@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timedelta
 from typing import Callable
 
@@ -44,7 +45,8 @@ class Scheduler:
                  on_news_cycle: Callable[[], None],
                  on_econ_cycle: Callable[[], None],
                  on_signal_maintenance: Callable[[datetime], None] | None = None,
-                 signal_due_fn: Callable[[datetime], bool] | None = None) -> None:
+                 signal_due_fn: Callable[[datetime], bool] | None = None,
+                 stop_event: threading.Event | None = None) -> None:
         self.conn = conn
         self.executor = executor
         self.settings = settings
@@ -67,6 +69,7 @@ class Scheduler:
         # スキップ)。
         self.on_signal_maintenance = on_signal_maintenance
         self.signal_due_fn = signal_due_fn
+        self._stop_event = stop_event
         # 上書き 1 の改名: cron (1 時間毎) の締切だけを追跡する。signal
         # 起動 (reason == "signal") はこの締切に触れない — signal 起動後も
         # 次の cron 締切が早まったり延びたりしないことをテストで固定する
@@ -182,7 +185,7 @@ class Scheduler:
         finally:
             self._run_hooks(now)
 
-        reason = self._trade_mission_due(now)
+        reason = None if self._stopping() else self._trade_mission_due(now)
         if reason is not None:
             # プラン 8 (設計書 §3.3): cron 締切の前進は on_trade_mission
             # (supervisor.try_submit の結果) が受理 (True) のときだけ。
@@ -191,6 +194,9 @@ class Scheduler:
             accepted = self.on_trade_mission(reason)
             if accepted and reason == "cron":
                 self._last_cron_trade = now
+
+    def _stopping(self) -> bool:
+        return self._stop_event is not None and self._stop_event.is_set()
 
     def _run_hooks(self, now: datetime) -> None:
         """データ hooks (news/econ/signal maintenance) — try/finally で
@@ -205,6 +211,8 @@ class Scheduler:
         HTTP 取得が走りうる。`_run_data_hook` は fail-open なので安全側だが、
         この挙動を許容してよいかは 2 周目レビューに委ねる。
         """
+        if self._stopping():
+            return
         if self._last_news is None or now - self._last_news >= _NEWS_INTERVAL:
             self._last_news = now
             self._run_data_hook("news", self.on_news_cycle)

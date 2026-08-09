@@ -65,13 +65,15 @@ def _mission_worker_env(worker_profile: str) -> dict[str, str]:
 class WorkerRunner(AgentRunner):
     def __init__(self, *, root: Path, settings, clock: Clock, rag: Rag,
                 worker_profile: str = "trade",
-                on_rpc_leak: Callable[[], None] | None = None) -> None:
+                on_rpc_leak: Callable[[], None] | None = None,
+                stop_event: threading.Event | None = None) -> None:
         self._root = root
         self._settings = settings
         self._clock = clock
         self._rag = rag
         self._worker_profile = worker_profile
         self._on_rpc_leak = on_rpc_leak
+        self._stop_event = stop_event
 
     def close(self) -> None:
         """no-op — 各 Mission が自分の子プロセスを spawn/reap するため
@@ -92,6 +94,7 @@ class WorkerRunner(AgentRunner):
 
     def _run_with_child(self, proc, mission: Mission, w) -> MissionResult:
         stdin_lock = threading.Lock()
+        stdin_state = {"closed": False}
         in_seq = SeqTracker()  # 子→親方向の受信検証
         ready_queue: "queue.Queue[dict]" = queue.Queue(maxsize=1)
         done_queue: "queue.Queue[tuple[str, object]]" = queue.Queue(maxsize=1)
@@ -187,6 +190,8 @@ class WorkerRunner(AgentRunner):
                 out_seq_holder["n"] += 1
                 try:
                     with stdin_lock:
+                        if stdin_state["closed"]:
+                            return
                         write_frame(proc.stdin, {
                             "type": "tool_rpc_result",
                             "seq": out_seq_holder["n"] + 1,  # handshake=1 済み
@@ -224,7 +229,8 @@ class WorkerRunner(AgentRunner):
         output = None
         try:
             try:
-                ready = ready_queue.get(timeout=w.worker_startup_timeout_sec)
+                ready = self._wait_with_stop(
+                    ready_queue, timeout=w.worker_startup_timeout_sec)
                 if not ready.get("ok", False):
                     status = "failed"
                     return MissionResult(status, None, transcript)
@@ -234,7 +240,8 @@ class WorkerRunner(AgentRunner):
 
             deadline_budget = mission.timeout_sec + w.worker_grace_sec
             try:
-                kind, payload = done_queue.get(timeout=deadline_budget)
+                kind, payload = self._wait_with_stop(
+                    done_queue, timeout=deadline_budget)
             except queue.Empty:
                 self._escalate_kill(proc, w)
                 return MissionResult("timeout", None, transcript)
@@ -262,6 +269,7 @@ class WorkerRunner(AgentRunner):
             # する — 有界待ち)。
             dispatcher.join(timeout=w.rpc_timeout_sec + 5.0)
             with stdin_lock:
+                stdin_state["closed"] = True
                 try:
                     proc.stdin.close()
                 except OSError:
@@ -270,6 +278,20 @@ class WorkerRunner(AgentRunner):
                 proc.stdout.close()
             except OSError:
                 pass
+
+    def _wait_with_stop(self, q: queue.Queue, *, timeout: float,
+                        poll_interval: float = 0.2):
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._stop_event is not None and self._stop_event.is_set():
+                raise queue.Empty
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise queue.Empty
+            try:
+                return q.get(timeout=min(poll_interval, remaining))
+            except queue.Empty:
+                continue
 
     def _call_rag(self, name: str, args: dict):
         method = getattr(self._rag, name)

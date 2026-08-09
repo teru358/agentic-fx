@@ -181,6 +181,7 @@ def _default_pytest_runner(test_plugin_path: Path, *,
     proc = subprocess.Popen(
         [sys.executable, "-m", "agentic_fx.plugin.pytest_sandbox_entry",
          str(test_plugin_path)],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         start_new_session=True, env=env,
         preexec_fn=_pytest_rlimit_preexec(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -22,8 +23,10 @@ class Category(StrEnum):
 
 
 class ActivityLog:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *,
+                 on_write_failure: Callable[[Exception], None] | None = None) -> None:
         self._path = path
+        self._on_write_failure = on_write_failure
         path.parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, category: Category, event: str, summary: str,
@@ -58,6 +61,11 @@ class ActivityLog:
             cat_repr = getattr(category, "value", category)
             _log.warning("activity write failed (%s/%s): %s",
                          cat_repr, event, safe_error_text(e))
+            if self._on_write_failure is not None:
+                try:
+                    self._on_write_failure(e)
+                except Exception:  # noqa: BLE001 — write remains non-throwing
+                    _log.exception("activity write failure callback failed")
 
     def tail(self, n: int = 20, category: Category | None = None) -> list[str]:
         if not self._path.exists():

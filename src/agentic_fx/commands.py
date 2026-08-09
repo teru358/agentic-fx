@@ -7,6 +7,7 @@ from pathlib import Path
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
+from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.store import approvals, missions, orders
 from agentic_fx.store.approvals import AlreadyDecidedError
@@ -26,7 +27,8 @@ _HELP = """コマンド一覧:
 class Commands:
     def __init__(self, *, conn: sqlite3.Connection, state_store: StateStore,
                  broker: PaperBroker, trade_loop, activity: ActivityLog,
-                 log_dir: Path, clock: Clock) -> None:
+                 log_dir: Path, clock: Clock,
+                 health_latch: HealthLatch | None = None) -> None:
         self.conn = conn
         self.state = state_store
         self.broker = broker
@@ -34,6 +36,7 @@ class Commands:
         self.activity = activity
         self.log_dir = log_dir
         self.clock = clock
+        self.health_latch = health_latch or HealthLatch()
 
     def dispatch(self, line: str) -> str:
         parts = line.strip().split()
@@ -88,12 +91,16 @@ class Commands:
         recent = missions.recent(self.conn, 1)
         last = (f"{recent[0]['loop']}:{recent[0]['status']} "
                 f"({recent[0]['started_at']})") if recent else "なし"
-        return (f"mode: {s.mode.value} / autopilot: "
+        result = (f"mode: {s.mode.value} / autopilot: "
                 f"{'on' if s.autopilot else 'off'} / kill switch: "
                 f"{'LATCHED' if s.kill_switch_latched else 'ok'}\n"
                 f"残高: {balance:,.0f} / エクイティ: {equity:,.0f}\n"
                 f"アクティブ orders: {len(active)}\n"
                 f"直近 mission: {last}")
+        if self.health_latch.is_latched():
+            reasons = "; ".join(self.health_latch.summary()[:3])
+            result += f"\nhealth: LATCHED ({reasons})"
+        return result
 
     def _log(self, n: int) -> str:
         if n <= 0:

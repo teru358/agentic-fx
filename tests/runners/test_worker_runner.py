@@ -1034,6 +1034,7 @@ def test_protocol_violation_is_detected_by_seq_check_not_by_eof(
     """
     r, w = os.pipe()
     r2, w2 = os.pipe()
+    child_done = threading.Event()
 
     def child_thread_fn():
         child_in = os.fdopen(r2, "rb")
@@ -1047,6 +1048,7 @@ def test_protocol_violation_is_detected_by_seq_check_not_by_eof(
         # **閉じない**。seq 検証が無ければ親はこの result を採用してしまう。
         write_frame(child_out, {"type": "result", "seq": 4,
                                 "status": "completed", "output": {"ok": 1}})
+        child_done.set()
 
     th = threading.Thread(target=child_thread_fn, daemon=True)
 
@@ -1057,7 +1059,7 @@ def test_protocol_violation_is_detected_by_seq_check_not_by_eof(
         returncode = None
 
         def poll(self):
-            return None
+            return -9 if child_done.is_set() else None
 
         def wait(self, timeout=None):
             return -9
@@ -1155,6 +1157,7 @@ def test_stdin_is_closed_only_after_the_dispatcher_finished_writing(
     r, w = os.pipe()
     r2, w2 = os.pipe()
     order: list[str] = []
+    child_done = threading.Event()
 
     class SlowRag:
         def search_news(self, query, n=5):
@@ -1174,6 +1177,7 @@ def test_stdin_is_closed_only_after_the_dispatcher_finished_writing(
         # finally へ入る。
         write_frame(child_out, {"type": "result", "seq": 3,
                                 "status": "completed", "output": {"ok": 1}})
+        child_done.set()
 
     th = threading.Thread(target=child_thread_fn, daemon=True)
 
@@ -1202,7 +1206,7 @@ def test_stdin_is_closed_only_after_the_dispatcher_finished_writing(
         returncode = None
 
         def poll(self):
-            return None
+            return -9 if child_done.is_set() else None
 
         def wait(self, timeout=None):
             return -9

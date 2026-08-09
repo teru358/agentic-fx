@@ -8,6 +8,7 @@ fills → exits) の内部順序・processed-bar マーキング位置・fills_a
 from __future__ import annotations
 
 from datetime import timedelta
+import threading
 
 import pytest
 
@@ -32,6 +33,30 @@ def test_hooks_run_even_when_market_closed(tmp_path):
     assert news_calls == [1]
     assert econ_calls == [1]
     assert maint_calls == [SAT]
+
+
+def test_stop_event_skips_hooks_even_from_tick_finally(tmp_path):
+    env = Env(tmp_path)
+    stop_event = threading.Event()
+    stop_event.set()
+    env.sched._stop_event = stop_event
+    calls = []
+    env.sched.on_news_cycle = lambda: calls.append("news")
+
+    env.sched.tick(SAT)
+
+    assert calls == []
+
+
+def test_stop_event_separately_skips_trade_mission_due(tmp_path):
+    env = Env(tmp_path)
+    stop_event = threading.Event()
+    stop_event.set()
+    env.sched._stop_event = stop_event
+
+    env.sched.tick(WED)
+
+    assert env.trade_calls == 0
 
 
 def test_hooks_run_after_deterministic_block_when_market_open(tmp_path):

@@ -1,4 +1,5 @@
 import sqlite3
+import signal
 import threading
 import time
 from contextlib import contextmanager
@@ -88,6 +89,22 @@ def test_build_app_wires_everything(tmp_path):
     for name in ("get_ohlcv", "search_news", "get_positions",
                  "get_recent_reflections"):
         assert name in app.registry.names()
+
+
+def test_build_app_wires_one_stop_event_to_scheduler_and_worker(tmp_path):
+    _init(tmp_path)
+    stop_event = threading.Event()
+    app = build_app(tmp_path, clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding(), stop_event=stop_event)
+    try:
+        assert app.stop_event is stop_event
+        assert app.scheduler._stop_event is stop_event
+        assert isinstance(app.runner, WorkerRunner)
+        assert app.runner._stop_event is stop_event
+        assert app.runner._on_rpc_leak is not None
+        assert app.commands.health_latch is app.health_latch
+    finally:
+        app.close()
 
 
 def test_build_app_registers_get_signals(tmp_path):
@@ -788,7 +805,7 @@ def test_run_service_closes_owned_runner_on_graceful_shutdown(tmp_path):
     assert "service_stopped" in act and "graceful" in act
 
 
-def test_run_service_derives_supervisor_join_timeout_from_mission_timeout(
+def test_run_service_derives_supervisor_join_timeout_from_dispatch_ceiling(
         tmp_path):
     """レビュー 3 周目 codex E2: `supervisor.join` の budget は
     `shutdown_join_timeout_sec` (Mission の timeout と無関係な固定 30 秒)
@@ -820,7 +837,7 @@ def test_run_service_derives_supervisor_join_timeout_from_mission_timeout(
         rc = run_service(tmp_path, daemon=True, _stop_event=stop_event)
 
     assert rc == 0
-    assert recorded.get("timeout") == pytest.approx(42.0 + 3.0 + 2.0 + 10.0)
+    assert recorded.get("timeout") == pytest.approx((42.0 + 3.0 + 2.0) * 4 + 60.0)
 
 
 def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path):
@@ -872,7 +889,9 @@ def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path
     app.trade_loop.executor.record_and_validate_intent = spy
 
     with patch.object(app.trade_loop.provider, "healthcheck",
-                      return_value="yfinance"), _no_real_network():
+                      return_value="yfinance"), _no_real_network(), \
+         patch("agentic_fx.service._default_dispatch_ceiling_sec",
+               return_value=0.1):
         # supervisor を先に起動し、commit-core の最中 (spy でブロック) に
         # 留めておく — run_service に入る前に「実行中 Mission」の状況を
         # 作る。run_service は内部で app.supervisor.start() を呼ぶため、
@@ -998,6 +1017,19 @@ def test_run_service_daemon_survives_keyboard_interrupt_during_wait(tmp_path):
     assert rc == 0
     act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
     assert "service_stopped" in act and "graceful" in act
+
+
+def test_run_service_registers_sigterm_in_interactive_mode(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    stop_event.set()
+    with patch("agentic_fx.service.build_app", return_value=app), \
+         patch("agentic_fx.service.signal.signal") as register, \
+         patch("agentic_fx.shell.run_shell"):
+        assert run_service(tmp_path, daemon=False, _stop_event=stop_event) == 0
+    registered = [call.args[0] for call in register.call_args_list]
+    assert signal.SIGTERM in registered
+    assert signal.SIGINT not in registered
 
 
 # ---- Task 0: build_app の embedding seam ---------------------------------

@@ -6,6 +6,7 @@ from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.commands import Commands
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
+from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.store import approvals
 from agentic_fx.store.db import connect, init_db
@@ -26,10 +27,12 @@ def _commands(tmp_path):
         "line1\nline2\nline3\n", encoding="utf-8")
     trade_loop = MagicMock()
     trade_loop.ask_once.return_value = "回答です"
+    health_latch = HealthLatch()
     cmds = Commands(conn=conn, state_store=state,
                     broker=PaperBroker(conn, SETTINGS, FixedClock(NOW)),
                     trade_loop=trade_loop, activity=activity,
-                    log_dir=tmp_path / "logs", clock=FixedClock(NOW))
+                    log_dir=tmp_path / "logs", clock=FixedClock(NOW),
+                    health_latch=health_latch)
     return conn, state, activity, cmds
 
 
@@ -48,6 +51,15 @@ def test_status_latched(tmp_path):
     state.update(kill_switch_latched=True)
     out = cmds.dispatch("status")
     assert "LATCHED" in out
+
+
+def test_status_shows_process_health_latch_reasons(tmp_path):
+    _, _, _, cmds = _commands(tmp_path)
+    cmds.health_latch.record_failure("disk full")
+
+    out = cmds.dispatch("status")
+
+    assert "health: LATCHED (disk full)" in out
 
 
 def test_log_tail(tmp_path):
