@@ -11167,6 +11167,8 @@ grep -rn "build_app(" tests/ | grep -v "def \|#"
 
 上記で洗い出した箇所のうち、同一 `tmp_path`/`root` に対して `build_app` を複数回呼んでいて、かつ 1 回目の `App` を `close()` (または `instance_lock.close()`) していないものが Task 11 対処分以外に無いことを確認する。万一見つかった場合のみ、以下のいずれかで個別修正する: ①1 回目の `App` を使い終わったら `app.close()` (Task 19 配線後) または `app.instance_lock.close()` してから 2 回目を呼ぶ ②2 回目が別の `root` (別ディレクトリ) を使うよう変更する。監査結果 (該当なし、または追加修正した箇所) を progress.md に記録する。
 
+**(2026-08-10 実施結果)**: `tests/` 全体で `build_app(` は 49 箇所。同一テスト関数内で 2 回以上呼ぶのは **2 本のみ**で、いずれも問題なし — ①`test_f1c_startup_reclaim_recovers_claimed_signal` (Task 11 で対処済み) ②`test_c1_double_startup_preserves_first_mission` (**意図的**。2 回目が `InstanceAlreadyRunning` を raise することを検証するテストで、末尾に `app1.instance_lock.close()` がある)。**Task 12〜19 で新たな混入なし、追加修正なし。** 詳細は `.superpowers/sdd/2026-08-04-phase2-8-worker-isolation/task20-completion.md`。
+
 - [ ] **Step 6: 全体 green (受入条件 8)**
 
 ```bash
@@ -11192,7 +11194,13 @@ uv run pytest tests/core/test_scheduler_tick_order.py tests/core/test_executor_s
 
 1-b. **(2026-08-10 着手前検証で追加 — 変異の方向が 1 つしかなかった)** `WorkerRunner._kill` の `os.killpg(proc.pid, signal.SIGKILL)` を `os.kill(proc.pid, signal.SIGKILL)` に改変 (グループでなく直接の子だけを撃つ) → 同テストが red。**この変異こそが受入条件 1 の本体** (worker ツリーの kill)。実測済み: 旧稿の assert (`proc.poll() is not None` のみ) では**この変異が生存する** — `sh` だけ死んで `poll()` は -9 を返し、`sleep 60` の孤児が残る
 2. `TradeLoop._run_once_impl` の commit-core `with self._core_lock:` を run 相の周りまで拡張する変異 (意図的に lock 粒度を壊す) → `test_funds_protection_continues_during_blocked_mission` が red (2 回目の `app.core_lock.acquire(timeout=3.0)` が `False` を返す — bounded acquire なのでテスト自体はハングせず確実に red になる)
-3. **(裁定書 FC-6 追加)** `_evaluate_and_execute_open` の `if any("kill switch" in r and "latched" not in r for r in result.reasons):` を `if False:` に改変 (ラッチが二度と発火しなくなる) → `test_kill_switch_latch_fires_identically_via_open_and_open_from_snapshot` が red (ソース pin の assert が最初に落ちる — さらに振る舞い側の assert も red になることを確認する)
+3. **(裁定書 FC-6 追加)** `_evaluate_and_execute_open` の `if any("kill switch" in r and "latched" not in r for r in result.reasons):` を `if False:` に改変 (ラッチが二度と発火しなくなる) → `test_kill_switch_latch_fires_identically_via_open_and_open_from_snapshot` が red (ソース pin の assert が最初に落ちる)
+
+   **(2026-08-10 実測で訂正)** 旧稿はここに「さらに振る舞い側の assert も red になることを確認する」と書いていたが、**この変異では原理的に確認できない**。変異 3 は `assert '"kill switch" in r and "latched" not in r' in src` を**最初に**落とし、pytest はそこで停止するため、**振る舞い側の assert (両 OPEN 経路のラッチ + activity.log) は一度も実行されない**。**テスト内の assert は、production の早期 `return` とまったく同じように後続の検査を短絡させる** ([[mutation-testing]] 3.12 のテスト側の双子)。
+
+3-b. **(2026-08-10 追加 — 振る舞い側を実際に走らせる唯一の変異)** `_evaluate_and_execute_open` の `self.activity.write(Category.SYSTEM, "kill_switch_latched", ...)` を削除する。**この文字列はソース pin 2 本のどちらにも現れない**ため、pin を素通りして振る舞い側の assert に到達する → `assert "kill_switch_latched" in (...activity.log).read_text()` が red (実測済み)。
+
+   **残る限界 (accepted)**: `self.state.update(kill_switch_latched=True)` 側は**ソース pin のみ**で守られている。この行を変えるとソース pin が先に落ちるため、振る舞い側 (`state.load().kill_switch_latched is True`) を単独で駆動する変異が作れない。
 
 - [ ] **Step 9: Commit**
 
