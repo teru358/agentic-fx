@@ -208,18 +208,35 @@ def test_watchdog_health_check_is_a_noop_once_stopping_has_begun():
     graceful に終了した watchdog を「死亡」と誤認して fatal をラッチする
     (= 正常停止が終了コード 1 になる)。ガードは関数**内部**に置く。
 
-    死亡分岐と鮮度分岐の**両方**を停止中に踏ませて、片方だけガードされる
-    非対称が再発しないようにする。
+    死亡分岐と鮮度分岐を**独立のケース**として停止中に踏ませ、片方だけが
+    ガードされる非対称が再発しないようにする。
+
+    (3周目 codex) 両分岐を 1 ケースに同居させても**鮮度分岐は pin されない**
+    — `is_alive()==False` なら死亡分岐が先に return するので、ガードを死亡
+    分岐の内側だけに下ろす変異が生き残る。鮮度側は `is_alive()==True` の
+    スタブで独立に踏ませること。
     """
+    # ケース1: 死亡分岐 (is_alive False)
     app = _minimal_app(); stop = threading.Event()
     stop.set()
-    app.watchdog_heartbeat = time.monotonic() - 999.0  # 鮮度分岐も踏ませる
     dead = type("Thread", (), {"is_alive": lambda self: False})()
 
     _check_watchdog_health(app, dead, stop)
 
     assert app.fatal_reason is None, (
-        "停止中の watchdog 終了を fatal と誤認している")
+        "停止中の watchdog 終了を fatal と誤認している (死亡分岐)")
+
+    # ケース2: 鮮度分岐 (生きているが heartbeat が stale)。死亡分岐を
+    # 通過させないと、この経路には到達しない
+    app2 = _minimal_app(); stop2 = threading.Event()
+    stop2.set()
+    app2.watchdog_heartbeat = time.monotonic() - 999.0
+    alive = type("Thread", (), {"is_alive": lambda self: True})()
+
+    _check_watchdog_health(app2, alive, stop2)
+
+    assert app2.fatal_reason is None, (
+        "停止中の heartbeat 停滞を fatal と誤認している (鮮度分岐)")
 
 
 def test_monitoring_does_not_mistake_an_unstarted_thread_for_a_dead_one():

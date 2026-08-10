@@ -813,9 +813,15 @@ def _busy_resources_after_join(scheduler_still_busy: bool,
         # `running` mission を `interrupted` に書き換える**。設計書 §5.6 の
         # 「使用中資源は閉じず leak を選ぶ」はこの資源にも適用される。
         #
-        # (レビュー3周目 F1) **この leak はプロセス終了でしか回収されない。**
-        # flock はプロセス単位なので、同一プロセス内で `run_service` を再度
-        # 呼ぶ経路を将来足すと、以降ずっと `InstanceAlreadyRunning` になる。
+        # (レビュー3周目 F1) **この leak は現実的にはプロセス終了でしか
+        # 回収されない。** flock は open file description に紐づくので、
+        # 解放されるのは lock を保持する file object が close された時
+        # (明示 close または参照喪失) — だが busy skip した以上その file
+        # object は残存 App が握ったままであり、close される契機が無い。
+        # 同一プロセス内で `run_service` を再度呼ぶ経路を将来足すと、
+        # **別の file object で開き直しても競合し** (これは同一プロセス内でも
+        # 成立する。`store/instance_lock.py` のテストが前提にしている挙動)、
+        # 以降ずっと `InstanceAlreadyRunning` になる。
         # 現状の本番エントリ (console_script / `__main__`) はどちらも
         # `run_service` の戻り値を終了コードにしてプロセスを終えるため成立
         # している。**「run_service は 1 プロセスにつき 1 回」が契約である。**
