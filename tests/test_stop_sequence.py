@@ -199,6 +199,29 @@ def test_watchdog_check_is_a_noop_once_stopping_has_begun():
         "停止中のスレッド終了を fatal と誤認している")
 
 
+def test_watchdog_health_check_is_a_noop_once_stopping_has_begun():
+    """(レビュー3周目 F0) 相互監視の **scheduler→watchdog 方向**にも同じ
+    停止中ガードが要る。
+
+    呼び出し元 `scheduler_thread` の `if not stop_event.is_set():` は
+    check-then-act であり、通過直後に main が `stop_event.set()` すると、
+    graceful に終了した watchdog を「死亡」と誤認して fatal をラッチする
+    (= 正常停止が終了コード 1 になる)。ガードは関数**内部**に置く。
+
+    死亡分岐と鮮度分岐の**両方**を停止中に踏ませて、片方だけガードされる
+    非対称が再発しないようにする。
+    """
+    app = _minimal_app(); stop = threading.Event()
+    stop.set()
+    app.watchdog_heartbeat = time.monotonic() - 999.0  # 鮮度分岐も踏ませる
+    dead = type("Thread", (), {"is_alive": lambda self: False})()
+
+    _check_watchdog_health(app, dead, stop)
+
+    assert app.fatal_reason is None, (
+        "停止中の watchdog 終了を fatal と誤認している")
+
+
 def test_monitoring_does_not_mistake_an_unstarted_thread_for_a_dead_one():
     """レビュー2周目 codex Important: **起動前と死亡後を区別する。**
 

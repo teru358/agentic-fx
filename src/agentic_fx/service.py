@@ -784,6 +784,15 @@ def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,
 def _check_watchdog_health(app: App, watchdog_thread_obj: threading.Thread,
                            stop_event: threading.Event, *,
                            wd_heartbeat_grace_sec: float = 90.0) -> None:
+    # レビュー3周目 F0: `_watchdog_check` (watchdog→scheduler 方向) と**対称**
+    # にする。1周目 I-3 のガードは片方向にしか転写されておらず、こちらは
+    # 呼び出し元 (`scheduler_thread`) の外側ガードだけに頼っていた。外側
+    # ガードは check-then-act であり、通過した直後に main が
+    # `stop_event.set()` すると、graceful に終了した watchdog を「死亡」と
+    # 誤認して fatal をラッチし、正常停止が終了コード 1 になる。停止の実行
+    # 主体は常に main なので、停止中の監視はどちらの方向にも不要。
+    if stop_event.is_set():
+        return
     if _thread_has_died(watchdog_thread_obj):
         _record_fatal(app, stop_event, "watchdog thread is dead")
         return
@@ -803,6 +812,13 @@ def _busy_resources_after_join(scheduler_still_busy: bool,
         # `recover_interrupted` が**旧 supervisor がまだ処理している
         # `running` mission を `interrupted` に書き換える**。設計書 §5.6 の
         # 「使用中資源は閉じず leak を選ぶ」はこの資源にも適用される。
+        #
+        # (レビュー3周目 F1) **この leak はプロセス終了でしか回収されない。**
+        # flock はプロセス単位なので、同一プロセス内で `run_service` を再度
+        # 呼ぶ経路を将来足すと、以降ずっと `InstanceAlreadyRunning` になる。
+        # 現状の本番エントリ (console_script / `__main__`) はどちらも
+        # `run_service` の戻り値を終了コードにしてプロセスを終えるため成立
+        # している。**「run_service は 1 プロセスにつき 1 回」が契約である。**
         busy.add("instance_lock")
     if supervisor_still_busy:
         busy.add("conn_supervisor")
