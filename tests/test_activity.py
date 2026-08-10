@@ -3,6 +3,33 @@ import logging
 from agentic_fx.activity import ActivityLog, Category
 
 
+def test_write_failure_calls_callback_without_propagating(tmp_path, monkeypatch):
+    calls = []
+    log = ActivityLog(tmp_path / "activity.log", on_write_failure=calls.append)
+
+    def fail_open(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(type(log._path), "open", fail_open)
+    log.write(Category.SYSTEM, "event", "summary")
+
+    assert len(calls) == 1
+    assert isinstance(calls[0], OSError)
+
+
+def test_write_failure_callback_error_is_also_suppressed(tmp_path, monkeypatch):
+    def callback(_exc):
+        raise RuntimeError("callback failed")
+
+    log = ActivityLog(tmp_path / "activity.log", on_write_failure=callback)
+
+    def fail_open(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(type(log._path), "open", fail_open)
+    log.write(Category.SYSTEM, "event", "summary")
+
+
 def test_write_format(tmp_path):
     log = ActivityLog(tmp_path / "activity.log")
     log.write(Category.TRADE, "order_opened", "USDJPY long 0.10lot", ref_id="42")
