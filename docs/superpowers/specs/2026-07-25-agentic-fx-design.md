@@ -1,6 +1,6 @@
 # agentic-fx 設計書
 
-- 日付: 2026-07-29 (改訂第 16 版 — codex 節目レビューを反映: 実現/未実現 PnL の換算契約 / レートの値オブジェクト化とスナップショット固定 / レート不能時の層別動作 (予約はペア単位取消) / 保守側レート。第 15 版 — 口座通貨換算の要件を MT5 実測に基づき具体化: 損失=クォート建て・notional=ベース建て想定元本の 2 種を区別 / commission は換算しない / 合算はペア毎換算 / 予約再検証は現在レート / ブローカー証拠金率は Phase 3 で order_calc_margin に委譲 / InstrumentSpec に通貨フィールド / Phase 3 起動時に銘柄仕様照合)
+- 日付: 2026-08-11 (改訂第 17 版 — プラン 9 前の spec 小改訂束 6 項目: ①close/cancel への Risk Gate 非適用の裁定と脅威モデル明文化 ②`exit_mode: evaluate` は当面非サポートで確定 (需要実証で再訪) ③signals UNIQUE「同一バー 1 シグナル」の意図明文化 ④approval の同一対象複数決定は最新決定優先 (取り消し可能化、プラン 9 実装) ⑤`signals.claimed_by_mission_id` に FK (プラン 9 migration) ⑥改善ループのコア改善 PR 経路廃止 — 出力は plugins/ (gitignore)・news_sources・提案レポートのみ + plugins/ 入れ子 git リポジトリ。第 16 版 — codex 節目レビューを反映: 実現/未実現 PnL の換算契約 / レートの値オブジェクト化とスナップショット固定 / レート不能時の層別動作 (予約はペア単位取消) / 保守側レート。第 15 版 — 口座通貨換算の要件を MT5 実測に基づき具体化: 損失=クォート建て・notional=ベース建て想定元本の 2 種を区別 / commission は換算しない / 合算はペア毎換算 / 予約再検証は現在レート / ブローカー証拠金率は Phase 3 で order_calc_margin に委譲 / InstrumentSpec に通貨フィールド / Phase 3 起動時に銘柄仕様照合)
 - ステータス: 承認待ち
 - 前身: `~/project/finance` (IFD 計画型 FX 自動トレードシステム)
 
@@ -31,7 +31,7 @@ agentic-fx はこれを **agent loop 型**に置き換える。LLM agent が「�
 │  scheduler / data layer / risk gate / executor       │
 │  state store / notifier / 操作 API (client.py, bot 用) │
 └──────┬──────────────────────┬────────────┬───────────┘
-       │ ツール提供 + 判断依頼   │ 成績 + PR   │ approval_requests
+       │ ツール提供 + 判断依頼   │ 成績 + 提案 │ approval_requests
 ┌──────▼───────────┐  ┌───────▼─────────┐ ┌▼──────────────────┐
 │ 取引判断 loop      │  │ 戦略改善 loop     │ │ discord_bot        │
 │ (毎時・読取専用     │  │ (週次・コード編集  │ │ (別リポジトリ,      │
@@ -159,6 +159,7 @@ Risk Gate・sizing・kill switch・取引モードの承認ゲートは一切迂
 - 対象は `plugin.py` と `config.yaml` の 2 ファイルのみ (plugin は純関数で外部依存を持たないため、これで閉じる)
 - 各ファイルを**バイト列のまま** (改行変換・正規化なし) 読み、`sha256(b"plugin.py\0" + bytes + b"\0config.yaml\0" + bytes)` で算出する
 - **plugin_loader の承認ハッシュと signals の `content_hash` は同一関数を呼ぶ**。別実装にしない (定義がずれた瞬間に、承認していないコードのシグナルが「承認済み扱い」で通る)
+- **重複排除キーは DDL の UNIQUE 制約であり、「1 (plugin, content_hash, pair, timeframe, bar) につき 1 シグナル」は仕様である** (裁定 2026-08-11、プラン 7 B-3 の明文化)。同一の評価呼び出しが複数シグナルを返した場合、2 件目以降は保存されず warning を記録する (実装済み)。**再評価 (cursor 巻き戻し・再起動) による 1 件目の冪等重複は無通知で捨てる** — これは冪等回復の正常動作であり、複数出力の drop と機械的に区別できないため意図的。意図: ①producer の冪等回復 (cursor 巻き戻し・再評価・再起動) は「同じバーを再評価しても行が増えない」ことに依存しており、UNIQUE がその担保である ②複数行を許す拡張 (キーに連番を足す等) は「plugin 出力の順序決定性」という**未検証の前提**を持ち込む (再評価で順序が変われば重複排除が壊れる)。plugin 作者規約: 同一バーの複数根拠は 1 シグナルに集約して返すこと
 
 **3. レート制限は「起動」に対してのみ fail closed、「情報」に対しては閉じない。** 上限超過時もシグナルは `pending` のまま残り、次の cron Mission が拾う。起動しないだけで判断材料は失われない。単位と永続性を明示する:
 
@@ -319,6 +320,8 @@ TradeIntent は発注前に全ルールを通過しなければならない。1 
 - 日次損失の日初エクイティも入出金調整を同様に適用する
 - kill switch・日次損失の判定に使う account_snapshots が欠損・陳腐化している場合は **fail closed** (新規停止)
 
+**close / cancel への Risk Gate 非適用 (裁定 2026-08-11 — プラン 7 最終レビュー codex I③ の spec 論点)**: `close` / `cancel` intent は Risk Gate を通さず即時実行する方針を**維持**する。根拠: ①どちらも **gross エクスポージャー**の削減方向である — cancel はリスクゼロ (未約定の取消)、close は個別注文の建玉を減らし、新規の建玉を生まない ②gate の各ルール (RR・sizing・総量上限) は open の意味論であり、close に適用する対象が無い ③誤検知で close をブロックする方が資金保護に反する (失敗コストが非対称 — 資金保護方向の操作を機械が堰き止めない)。ただし決定論的コアが強制する検証は維持する: 対象は `order_id` で指定し、実在かつ状態機械 (§12) 上 close / cancel 可能な状態の注文のみ受理する。約定済みポジションの SL/TP 変更・撤去は従来どおり LLM 不可。**残余リスクの認識**: ⓐplugin の `rationale` や news 本文など外部由来テキストがプロンプト経由で LLM に close / cancel を誘導する経路は存在する (rationale の長さ上限 2000 字・plugin の人間承認・news のソース承認で注入面を縮小済み) ⓑ**同一ペアに両方向のポジションが併存する構成 (ヘッジ) では、片脚だけの close は net の方向性エクスポージャーを増やし得る** — orders はヘッジ併存を禁止していないため、「被害上限は機会損失のみ」はヘッジ構成では成立しない。片脚 close 後に残る gross exposure は close 前にゲートを通過した総量以下に留まる (総エクスポージャー上限が制限するのは発注・予約時の想定リスク / notional であり、その後の相場変動・ギャップによる**実損の上限ではない** — 本節冒頭の週末ギャップの注意と同じ) が、**net 方向の増加自体は防がれない** (最大同時 2 ポジションは件数のみの検査で方向を見ない — ヘッジ 2 脚の片方を close すると net はほぼゼロから残存脚全量まで増え得る)。ヘッジ運用を本格化する場合は「close 後に net exposure が悪化しないか」の決定論的検出を別途設計する (Risk Gate の適用ではなく close 専用の検証として)。close の連発・不審な close は `trade_intents` の全件記録と reflection で観測されるため、決定論的な追加制限 (close レート制限等) は設けない (YAGNI)。
+
 ### Executor と取引モードの承認ゲート
 
 - Phase 1 は学習モード (ペーパー取引) のみ (前身の PositionManager 簡素版 + SQLite `orders` 状態機械)。学習モードでは risk gate 通過後に自動でペーパー発注する
@@ -335,15 +338,16 @@ TradeIntent は発注前に全ルールを通過しなければならない。1 
 - 起動: **週次** (config で日次に変更可)。手動起動 (`improve` コマンド) も可
 - 前提: local バックエンド (qwen3.6 クラス) ではコード編集の品質が揺れる。品質ゲートで守り、不足なら config 1 行で `claude` に切替える
 
-### 出力の 3 経路 (人間承認の実装手段が異なる)
+### 出力の 2 経路 + 提案レポート (人間承認の実装手段が異なる)
 
 | 経路 | 対象 | 置き場所 | 承認ゲート |
 |---|---|---|---|
-| **コア改善** | risk gate パラメータ提案、Mission プロンプト改善、plugin 機構・バックテスト基盤・news fetcher 自体の修正 | リポジトリ内 (git 管理) | **PR + 人間承認** (自動マージ禁止) |
-| **plugin 追加** | indicator / signal / strategy の実装 (コード) | `plugins/<name>/` (**gitignore**) | **approval_requests (kind=plugin)** — Discord ボタン or CLI。承認前の plugin はロードされない |
+| **plugin 追加・変更** | indicator / signal / strategy の実装 (コード) | `plugins/<name>/` (**gitignore**) | **approval_requests (kind=plugin)** — Discord ボタン or CLI。承認前の plugin はロードされない |
 | **news ソース追加** | ニュース取得先の追加 (**データ 1 行、コードなし**) | SQLite `news_sources` テーブル | **approval_requests (kind=news_source)** — 機械検証 (URL 到達性・parse 成功・重複) を自動実行した上で軽量な人間承認 |
 
 plugin を gitignore するのは、LLM が実装するツール群がプロジェクトを clone したユーザーごとに異なるため。公開リポジトリには plugin 機構と組み込みデフォルト実装のみをコミットする。
+
+**本体コード (plugin 機構・バックテスト基盤・news fetcher 自体)・Mission プロンプト・risk gate パラメータの改善は提案レポート止まり**とする (`reports/improve-YYYY-MM-DD.md`、gitignore)。人間が読んで手動反映する。**旧「コア改善 → リポジトリ内 git 管理 → PR + 人間承認」経路は廃止** (2026-08-08 ユーザー裁定): ①生成物がリポジトリに入ると本体のベース更新と競合する ②各ユーザーで状況が異なるため、ある環境で有効な改善が他環境で有効とは限らない — これは plugin を gitignore してきた根拠と同一であり、同じ原則を改善ループの出力全体へ一貫適用したもの。これに伴い **`gh` による PR 作成とリポジトリ本体への書き込みは改善ループの能力から撤去**する (GitHub を経由する自己改善の動線そのものが無くなる)。risk gate パラメータは**コードでなく設定値**なので、将来必要になれば approval_requests への値提案 (kind 追加) に載せられるが、当面は提案レポートで足りる (YAGNI)。
 
 ### news はソースリスト方式 (plugin ではない)
 
@@ -354,8 +358,8 @@ news_sources: id, name, fetcher (feed | web), url,
               enabled, added_by (user | agent), status, created_at
 ```
 
-- 根拠: ①ソース追加はデータ 1 行で機械検証できるが、plugin はコード審査が重い ②新しい取得方式が必要になるのは年数回程度で、news 側に plugin 機構を持つのは YAGNI ③fetcher (HTML 抽出・外部依存) は local LLM が最も失敗しやすいコードであり、コア改善 PR の人間レビューに載せる方が安全
-- 新しい取得方式 (認証付き API 等) が必要になった場合は、コア改善トラック (PR) で fetcher を追加する
+- 根拠: ①ソース追加はデータ 1 行で機械検証できるが、plugin はコード審査が重い ②新しい取得方式が必要になるのは年数回程度で、news 側に plugin 機構を持つのは YAGNI ③fetcher (HTML 抽出・外部依存) は local LLM が最も失敗しやすいコードであり、改善ループに書かせず人間が保守する方が安全
+- 新しい取得方式 (認証付き API 等) が必要になった場合は、改善ループの提案レポートを受けて**人間が** fetcher を追加する (改善ループは本体コードを書けない — 上記「出力の 2 経路」)
 - **ユーザーによる追加コマンド**: `news add <url> [--name]` (§8)。fetcher (feed/web) を自動判定し、機械検証 (URL 到達性・parse 成功・重複) を実行して登録する。`added_by=user` は自分の意思による追加のため**人間承認は不要** (機械検証のみで enabled)。agent 追加は従来通り approval_requests を通す
 
 ### plugin 機構
@@ -375,7 +379,7 @@ news_sources: id, name, fetcher (feed | web), url,
 - **分類軸は「組み合わせているか」ではなく「出力の形 = LLM のどの認知段階に接続するか」**。指標を 5 個組み合わせても入口のイベントしか出さないなら `signal`、単一の SMA クロスでも entry と exit を両方言い切れば `strategy`
 - **3 種は弱い→強いの階段ではなく、消費される段階が違う。** strategy が「閉じている」のは、意見であるためには結末まで言い切る必要があるからであり、上位だからではない。**バックテストは strategy の検証手段のひとつに過ぎず**、indicator の正しさは pytest の方が厳密に検証できる
 - **strategy だけでは成立しない**: ①strategy が沈黙している時間の方が圧倒的に長く、そのとき盤面を見せるのは indicator である ②strategy の提案を裁定するには、その strategy が見ていない情報が要り、それも indicator である
-- **`strategy` は exit を省略できない。** exit の表現は 2 通りを認め、**どちらも plugin 自身の出力**とする: ①`stop_loss` / `take_profit` の価格水準 ②後続バーでの `evaluate()` が返す exit 判定 (保有中は毎バー呼ばれる)。②を使う場合も、暴走防止のため SL は必須とする。**exit を返さない plugin は `strategy` として登録できない** (ローダーが拒否し、`signal` として再宣言させる) — ハーネスの既定決済規則で補ってしまうと「plugin 自身の閉じた提案のみから成績を計算する」帰属規則が破れるため
+- **`strategy` は exit を省略できない。** exit の表現は **①`stop_loss` / `take_profit` の価格水準 (`exit_mode: levels`) のみを正式サポート**する。**②保有中の毎バー `evaluate()` 呼び出しによる exit 判定 (`exit_mode: evaluate`) は当面サポートしない** — ローダーが「未対応」として reject する (fail closed。黙って levels 扱いにしない)。裁定 (2026-08-11、プラン 7 D1 の再訪): ②には保有状態 (order_id・建値・現在 SL 等) を plugin の評価契約へ注入する必要があり、plugin 契約・サンドボックス IPC・バックテスト実行器の 3 層にまたがる契約変更になる。一方①だけでも SL 必須 + TP で「閉じた提案」は成立しており帰属規則は破れない。②を要する strategy の需要はまだ実証されていないため、**採用条件は「levels では表現できない strategy 案 (トレーリング・指標条件 exit 等) が改善バックログで具体化したとき」**とし、その時点で専用プランとして再訪する。中途半端な部分実装 (ハーネス既定則による決済の外挿) は「plugin 自身の閉じた提案のみから成績を計算する」帰属規則を破るため禁止。**exit を返さない plugin は `strategy` として登録できない** (ローダーが拒否し、`signal` として再宣言させる)
 - `signal` の**損益ベース**評価は **plugin 単独に帰属しない** (決済規則を持たないため、測定対象は常に「signal + ハーネスが外挿した決済規則」になり、外挿ルールを変えれば評価が反転する)。signal の一次的な検証は損益ではなく検出精度で行う。検出精度の具体的な測り方 (ラベル付きサンプルの作成手順・基準値) は plugin 機構の実装時 (Phase 2) に定める
 - **`signal` と `strategy` の境界例**: `signal` が補助的に SL/TP 水準を添えること自体は「注意」のままで矛盾しない (どこで反応すべきかの目安に過ぎない)。ただし**方向・entry・exit をすべて固定して主張するなら、それは `strategy` である**。境界の判定規則はローダーのインターフェース検証として Phase 2 で明文化する
 - **前身との関係**: finance は `technical_scorer` の docstring が明言するとおり「LLM による非決定的な推論を置き換え」るため、indicator/signal を**決定論的スコアラー**が消費していた。agentic-fx では **LLM が直接消費する**。したがって `signal_combiner` 相当のスコア合成・重み調整層は不要であり、移植するのは指標・検出の計算部分のみとする
@@ -384,10 +388,11 @@ news_sources: id, name, fetcher (feed | web), url,
 - **plugin はシグナルを出すだけで発注はしない**。発注判断は LLM (取引判断 loop) が行い、執行は決定論的コアが行う (§2 の原則を維持)
 - `tools/plugin_loader.py` が起動時にフォルダを discover し、**pytest 合格 + 承認済み** (approval_requests で approved) のもののみレジストリに登録。承認は plugin.py + config.yaml の**内容ハッシュに対して**行う
 - **命名について**: 傘の呼称は `plugin` を維持する。`strategy` は 3 種別の 1 つの名前として使うため、傘と種別が同名になる衝突を避ける
-- config.yaml の再承認免除は**人間がローカルで明示的に編集した場合のみ**。**agent による config.yaml 変更はコード変更と同様に approval 対象**とし、戦略採用ゲート (下記) を通す — パラメータ変更は戦略結果を直接変えるため、承認迂回経路にしない
+- **config.yaml の変更に再承認免除は無い** (裁定 2026-08-11 — 旧「人間がローカルで明示的に編集した場合のみ免除」は**廃止**): 編集主体 (人間 / agent) はファイル内容からもハッシュからも判別できず、免除経路を設けると agent がそれを装う迂回を原理的に塞げない。**あらゆる内容変更は新しい content_hash への承認が必要** (現実装も従来からハッシュ一致のみで判定しており、実態の追認でもある)。人間が自分で編集した場合は bless CLI で自分の変更を即時承認すればよい (コストは 1 コマンド)。**agent による `strategy` の config.yaml 変更は戦略採用ゲート (下記) を通す** — パラメータ変更は戦略結果を直接変えるため、承認迂回経路にしない。`indicator` / `signal` の config 変更は各種別の検証手段 (§6 分類表: pytest / 検出精度) + 人間承認で足りる (収益バックテストは帰属不能のため課さない)
 - **サンドボックス実行**: 「純関数・I/O 禁止」は規約だけでは強制できない (import 時の任意コード実行を pytest では防げない) ため、plugin は**サービスプロセスに直接 import せずサブプロセスで実行**し、入力 (OHLCV DataFrame) と出力 (JSON) だけを IPC で渡す。ロード時に **AST 検査 + import allowlist** (numpy / pandas / math 等の計算系のみ) で禁止 import を拒否する。サブプロセスには**最小限の環境変数のみ渡し (秘密情報・broker 資格情報は渡さない)**、作業ディレクトリを限定し、CPU 時間・メモリ・プロセス数を resource limit で制限、タイムアウト・出力サイズ制限を課す。これらは**到達を最小化する多層防御であり完全な隔離の保証ではない** — だからこそ plugin の採用には人間承認を必須とする
 - 素の clone でも動くよう、組み込みデフォルト実装 (基本指標 + 基本ニュースソース数件の `news_sources` 初期データ) は `src/` 側にコミットする
 - サンプル plugin を `docs/examples/plugins/` にコミットし、LLM のリサーチ→実装時の参照テンプレートにする
+- **plugin 原本の履歴管理 (プラン 9 で実装)**: 現状は承認台帳 (`approval_requests` の `content_hash`) はあるが**原本の履歴が無い** — 改善ループが plugin を上書きすると前の版が失われ、承認済み状態へ戻せない。そこで `plugins/` 配下を**親から独立した入れ子 git リポジトリ**とし、生成物に履歴とロールバックを持たせる (価値は改善ループが plugin を上書きし始めた時点から発生するため、実装はプラン 9 と同時でよい)。確定 3 点: ①**submodule にしない** (親リポジトリに gitlink が入り、切り離したはずの結合が戻る) ②**commit を打つのは親プロセスのみ** (worker はファイルを書くだけ。承認時に親が commit する — worker に exec 権が不要になり、履歴が「承認済み状態の歴史」になる) ③**git 操作の失敗を資金保護に波及させない** (取引・SL/TP 監視は plugin 履歴と無関係に継続する)。ただし**承認の有効化は原本保全と切り離さない** — 「履歴 = 承認済み状態の歴史」は commit が承認の有効化に先行するときだけ成立するため、commit 失敗時は承認決定を保留 (pending のまま再試行 + 通知) とし、原本を保全できないまま plugin を有効化しない (fail closed)。**承認有効化の不変条件** (詳細設計はプラン 9): ⓐ**決定時に content_hash を再計算し申請時ハッシュと照合**する — 申請〜承認操作の間に plugin が上書きされた場合は承認を成立させない (submit 時の再照合だけでは不十分) ⓑcommit は**対象 plugin のパスに限定**する (無関係な作業中ファイルを「承認済み状態」に混入させない) ⓒ**同一対象への決定は直列化**する ⓓcommit 失敗で保留中の承認より**後発の決定が優先** — 後発 reject が付いたら保留中の古い承認は失効させ、再試行で復活させない
 
 ### strategy の位置づけ (実績つきの意見であり、発注権を持たない)
 
@@ -404,7 +409,7 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 
 1. **発見**: 注入されたコンテキストから課題を特定し、`improvement_backlog` に追記する
 2. **リサーチ**: `web_search` / `fetch_article` ツールで「自分が知らないテクニカル手法・ニュースソース」を外部から調査し、候補をバックログに追記する。LLM は自分に何が足りないか自覚できない (unknown unknowns) ため、外部知識の取り込みステップを明示的に組み込む
-3. **実施**: バックログから最も効果的な 1 件を選んで実装し、テスト・評価して提出する (plugin なら approval_request 発行、コア変更なら PR)
+3. **実施**: バックログから最も効果的な 1 件を選んで実装し、テスト・評価して提出する (plugin なら approval_request 発行、本体コードに関わる発見は提案レポートに記載)
 
 ### 注入コンテキスト (決定論的コードが集計・生成)
 
@@ -419,18 +424,18 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 
 ### 許可ツール
 
-成績 DB 読取、`web_search` / `fetch_article` (無料実装: ddgs + 前身 article_fetcher 移植)、リポジトリ・`plugins/` のファイル読み書き (コア変更は**専用ブランチ上のみ**)、news_sources への追加提案、`uv run pytest` 実行、バックテスト実行、PR 作成 (`gh`)、バックログ読み書き、approval_request 発行
+成績 DB 読取、`web_search` / `fetch_article` (無料実装: ddgs + 前身 article_fetcher 移植)、**`plugins/` のファイル読み書き** (リポジトリ本体は**読取のみ** — 出力の 2 経路の裁定に伴い、コア変更用の専用ブランチ・PR 作成 (`gh`) は撤去)、news_sources への追加提案、`uv run pytest` 実行 (plugin の同梱テスト — worker 内で回す要否はプラン 9 で再評価)、バックテスト実行、バックログ読み書き、approval_request 発行、提案レポート書き出し (`reports/`)
 
 ### 品質ゲート (loop 側で強制) — コード品質と戦略品質を分離
 
 **コード品質ゲート**:
-- テストが 1 件でも落ちる変更は PR / approval_request にしない。分析レポート (`reports/improve-YYYY-MM-DD.md`) だけ残す
-- main への直 push は不可 (branch protection + ツール実装で二重に防ぐ)
-- **採用は必ず人間承認** (コア改善 = PR、plugin = approval_requests)
+- テストが 1 件でも落ちる変更は approval_request にしない。分析レポート (`reports/improve-YYYY-MM-DD.md`) だけ残す
+- **採用は必ず人間承認** (plugin / news_source = approval_requests。本体コードの変更経路は改善ループに存在しない — 出力の 2 経路)
 
-**戦略採用ゲート** (risk gate パラメータ・戦略に影響する提案が対象。pytest 合格だけでは戦略の良し悪しは判定できないため):
+**戦略採用ゲート** (対象 = `strategy` plugin の採用と、agent による **`strategy` plugin の** `config.yaml` パラメータ変更。pytest 合格だけでは戦略の良し悪しは判定できないため。**`indicator` / `signal` は対象外** — 収益バックテストが plugin 単独に帰属しない (§6 分類表) ため、各種別の検証手段 + コード品質ゲート + 人間承認で採用する):
 - バックテスト必須 (手数料・spread 込み)。**最低取引数 (初期 30) 未満の標本による変更提案は不可** — 「観察のみ」としてバックログに残す
-- 評価は out-of-sample (期間分割) で行い、既存構成 (baseline) との比較値を approval_request / PR に添付する。分割の定義は下記「バックテスト」節の「ホールドアウト分割」(直近 K ヶ月固定)
+- 評価は out-of-sample (期間分割) で行い、既存構成 (baseline) との比較値を approval_request に添付する。分割の定義は下記「バックテスト」節の「ホールドアウト分割」(直近 K ヶ月固定)
+- **risk gate パラメータの提案は approval_request を発行しない** (§6 出力の 2 経路 — 提案レポート止まり。approval kind にも存在しない)。ただし本ゲートの規律 (バックテスト必須・最低取引数・out-of-sample 比較) は**レポートに添える根拠にも同様に適用**する — 根拠のないパラメータ提案は人間の判断材料にならない
 - **ホールドアウト期間はハーネス (決定論的コア) が所有する。** 改善ループは「バックテスト実行」ツールを持つため、期間分割を自分で選べてしまうと out-of-sample は無意味になる。**ツール 1 個に期間引数を付けないだけでは防御にならない** — 履歴に到達する経路をすべて塞いで初めて成立するため、以下を**すべて**満たすこと:
 
 | # | 塞ぐ経路 | 具体策 |
@@ -438,15 +443,15 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 | 1 | バックテストツールの期間指定 | エージェント向け API は**期間を受け取らない**。返すのは in-sample の集計結果のみ (期間の端点も返さない) |
 | 2 | ホールドアウト実行 | **エージェントが駆動しない採用ゲート側**でハーネスが実行する。エージェントからは起動できない |
 | 3 | 履歴 DB への直接アクセス | 改善ループのツールに**任意 SQL・`ohlcv` テーブルの直接読み取りを持たせない**。成績 DB 読取は集計済みビューに限る |
-| 4 | ファイル経由の迂回 | 改善ループのファイル読み書きは**リポジトリと `plugins/` に限定**し、`data/` (DB・履歴・RAG) を対象外にする |
+| 4 | ファイル経由の迂回 | 改善ループの**書き込みは `plugins/` と `reports/` のみ** (リポジトリ本体は読取のみ — §6 許可ツール)。`data/` (DB・履歴・RAG) は読み書きとも対象外にする |
 | 5 | plugin 経由の迂回 | plugin はサンドボックスのサブプロセスで実行され、**入力 DataFrame はハーネスが与える**。plugin 自身が履歴を取りに行く経路は I/O 禁止・import allowlist で既に塞がれている (§6 サンドボックス実行) |
 | 6 | 取引 loop ツールの流用 | `get_ohlcv(pair, timeframe)` が直近 100 本固定で期間引数を持たないのは**意図的な性質**であり維持する。`get_signals(pair, since)` の `since` も最大 lookback を設ける (下記) |
 | 7 | 履歴分析ツール経由の迂回 | **エージェントに露出する履歴分析 (相関調査を含む、下記「履歴分析」) もすべて in-sample に閉じる**。バックテストだけの規則にしない — ローリング窓の探索でも holdout 期のレジームは推測できるため、境界は履歴に触れる分析全体で一枚にする。出力契約 (返してよい要約統計の列挙) は「履歴分析」節 |
 | 8 | holdout 結果の派生情報 | holdout の**指標・baseline との差分・閾値別の合否・承認理由**を改善ループに露出しない。approval の結果は「人間判断の結果 (承認 / 却下)」という最小状態のみ返す — 派生情報の反復観測は holdout フィードバックの迂回路になる |
 
 - **`get_signals` の `since` は取引判断 loop 専用**とし、最大 lookback を config で制限する (既定 24h)。過去の strategy 出力と添付成績を任意期間で探索できると、ホールドアウトの推測や反復選択の材料になり得るため、**改善ループのツールセットには含めない**
-- 上記は**規約ではなくテストで固定する**。「ツールスキーマに期間引数が存在しないこと」「改善ループ registry に履歴 DB を直接読むツールが無いこと」に加え、「分析 API の返却スキーマに日時・順序付き窓列・観測数が含まれないこと」「改善ループの backtest_runs ビューが `scope='in_sample'` 以外を返さないこと」を回帰テストとして書く (規約だけでは、後から「便利だから」と引数が足される)
-- 完全な隔離ではないことは認識しておく (エージェントはコード編集権を持つため、ハーネス自体の改変を提案できる)。だからこそ**採用は必ず人間承認**であり、ハーネスのホールドアウト実装への変更は特に注意してレビューする
+- 上記は**規約ではなくテストで固定する**。「ツールスキーマに期間引数が存在しないこと」「改善ループ registry に履歴 DB を直接読むツールが無いこと」に加え、「分析 API の返却スキーマに日時・順序付き窓列・観測数が含まれないこと」「改善ループの backtest_runs ビューが `scope='in_sample'` 以外を返さないこと」「**改善ループの書き込み可能パスが `plugins/` と `reports/` に閉じていること** (リポジトリ本体への write 経路が存在しないこと)」を回帰テストとして書く (規約だけでは、後から「便利だから」と引数が足される)
+- 完全な隔離ではないことは認識しておく — 改善ループは**ハーネスを改変できない** (本体は読取のみ、§6 出力の 2 経路) が、**提案レポート経由で人間にハーネス変更を促すことはできる**。ホールドアウト実装に触れる提案は人間が特に注意してレビューする
 - 週次/日次で変更を繰り返す性質上、少数トレードへの過学習を防ぐことを人間レビューの観点として明記する
 
 ### バックテスト (詳細設計 2026-08-01 確定。実装は Phase 2)
@@ -555,6 +560,8 @@ reason, decided_by, decided_at, message_id, expires_at, created_at
 - `kind=live_trade` (Phase 3): 取引モード (手動承認時) の open intent。payload は TradeIntent 全体。expires_at 超過で自動 expired。autopilot on の間は発行されない (§5)
 - `status=invalidated`: live_trade の承認時再検証 (§5) に失敗した場合の終端状態 (理由を reason に記録)
 - 決定の反映は冪等 (二重承認は 409 相当で拒否)
+- **kind=plugin の同一対象への複数決定の規則 (裁定 2026-08-11、プラン 7 T3-3)**: 個々の行の決定は冪等だが、**同一対象 (name, content_hash) に決定済み行が複数併存し得る** — 例: 承認済みハッシュに対し、後から別リクエストで reject。有効な決定は**最新の決定** (decided_at 最大、同時刻は id 大) とする。rejected が approved より後なら**承認の取り消し**として機能する。根拠: ①取り消し不能な承認は「採用は必ず人間承認」の意味を弱める (誤承認・事後の問題発覚に対処する手段が要る) ②「rejected が 1 つでもあれば拒否」(deny-wins) は誤った却下を恒久化し、再承認の意思を表明できなくなる — 時系列の最新意思を正とするのが監査直観とも一致する。現実装 (プラン 7) は「一致する approved 行が 1 つでもあれば承認」で取り消しが効かないため、**プラン 9 で最新決定優先へ改める**。反映は従来どおり次回起動時 (plugin ロードは起動時 1 回) — 即時失効が必要ならサービス再起動を運用手順とする
+- **この規則は kind=plugin 専用** (他 kind には複数行を横断して消費する実装が無く、同一性キーの意味論も異なる): `live_trade` は時点依存の単発要求であり**行単位の冪等のみ** — 別行による事後取り消しは適用しない (承認後の安全弁は承認時再検証 (§5) と expires_at)。`news_source` の取り消しは承認履歴ではなく **`news_sources.enabled` を落とす操作**で行う (approval は enable の入口に過ぎず、行の無効化が即時かつ唯一の失効手段)
 
 ### 操作 REST API (FastAPI)
 
@@ -754,7 +761,7 @@ agentic-fx/
 ```
 
 - **tools/ と datafeed/ の分離**: ツールは「LLM に見せる薄い口」、実装は datafeed/store 側。pytest から素関数として直接叩ける
-- **prompts/ をコード外の .md に**: 改善 loop がプロンプト改善の PR を出すとき、テンプレート差分になりレビューしやすい
+- **prompts/ をコード外の .md に**: プロンプトをコードから分離し、人間がレビュー・編集しやすくする。**prompts/ はリポジトリ内・人間管理**とする (裁定 2026-08-11): 改善ループは prompts/ を編集できない (プロンプト改善は提案レポート止まり — §6 出力の 2 経路)。ユーザー固有の上書き層は設けない — 実行時のユーザー入力チャネルは `policy/directives.md` が既に担っており、二重の注入層は YAGNI
 
 ## 12. 設定・ストレージ
 
@@ -778,13 +785,13 @@ agentic-fx/
 | `reflections` | トレード振り返り (order_id 主キー。前身から簡素化) |
 | `account_snapshots` | 残高・エクイティ推移 (kill switch 判定と成績レポートの根拠) |
 | `improvement_backlog` | 改善アイデア (source: user/agent/research, status: open/selected/done/rejected) |
-| `improvement_runs` | 改善実施記録 (選択 backlog, PR URL / approval_request ID / レポートパス) |
+| `improvement_runs` | 改善実施記録 (選択 backlog, approval_request ID / レポートパス)。旧 PR 経路の廃止 (§6) に伴い `result='pr'` / `pr_url` は使用しない (既存列の削除 migration はプラン 9 で判断) |
 | `econ_events` | 経済指標カレンダー (前身 econ_event_store 移植) |
 | `approval_requests` | 人間承認の一元管理 (§7: kind = plugin / news_source / live_trade) |
 | `news_sources` | ニュース取得先リスト (§6: name, fetcher, url, enabled, added_by) |
 | `backtest_runs` | **Phase 2**。バックテスト実行記録 (plugin パス + コンテンツハッシュ, kind, pair, timeframe, source, 期間端点, **scope** (in_sample / holdout_gate / human_custom), 指標 JSON, 設定スナップショット hash, コア git commit, 初期資金, created_at)。**改善ループの読み取りビューは scope='in_sample' かつハーネス発行行のみ** (§6 バックテスト) |
 | `analysis_runs` | **Phase 2**。履歴分析 (相関探索) の実行記録 (params_json = 候補集合・timeframe・window・lag 範囲, trial_count, source, created_at)。plugin 提案の approval payload / `improvement_runs` が `analysis_run_id` で参照し、多重比較の探索数を人間レビューが監査できるようにする (§6 履歴分析) |
-| `signals` | **Phase 2**。承認済み `signal` / `strategy` plugin の出力 (plugin, content_hash, pair, timeframe, bar_ts, kind, payload_json, **status** (pending/claimed/consumed/abandoned), **claimed_by_mission_id**, **claimed_at**, **requeue_count**, created_at)。重複排除キーは (plugin, **content_hash**, pair, timeframe, bar_ts) — ハッシュを含めないと config 変更・再承認後のシグナルが「処理済み」で潰れる。claim/消費/再キュー/lease 回収の規則は §5 (2 段階では Mission 失敗時に再処理可否を決められない) |
+| `signals` | **Phase 2**。承認済み `signal` / `strategy` plugin の出力 (plugin, content_hash, pair, timeframe, bar_ts, kind, payload_json, **status** (pending/claimed/consumed/abandoned), **claimed_by_mission_id**, **claimed_at**, **requeue_count**, created_at)。重複排除キーは (plugin, **content_hash**, pair, timeframe, bar_ts) の **UNIQUE 制約** — ハッシュを含めないと config 変更・再承認後のシグナルが「処理済み」で潰れる。**同一バー 1 シグナルは仕様** (§5)。`claimed_by_mission_id` は **`missions(id)` への FK を張る** (裁定 2026-08-11、プラン 7 T7-7。プラン 9 で migration): missions は削除しない台帳なので参照制約の運用コストは無く、存在しない mission id での claim という配線不整合を書き込み時に検出できる。claim は missions 行の作成後に行われ (実装済みの順序)、書き込み接続は `PRAGMA foreign_keys=ON` 済み。claim/消費/再キュー/lease 回収の規則は §5 (2 段階では Mission 失敗時に再処理可否を決められない) |
 
 **orders の状態遷移** (approval のライフサイクルと broker のライフサイクルを混同しない):
 
@@ -813,7 +820,7 @@ open → closing → closed
 - `news` — ニュース記事 (48h で掃除)
 - `reflections` — トレード振り返り (類似局面の意味検索用。SQLite と二重保存)
 
-insights / econ_analyses は廃止。必要になれば改善 loop 自身が PR でコレクション追加を提案できる。
+insights / econ_analyses は廃止。必要になれば改善 loop が提案レポートでコレクション追加を提案できる (本体コードの変更は人間が行う — §6)。
 
 すべて gitignore (`data/`)。
 
@@ -836,7 +843,7 @@ activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 �
 | `TECH` | テクニカル指標の計算・plugin 実行 (indicator/signal/strategy) |
 | `AGGREGATE` | 取引判断 loop の統合判断 (毎時の判断結果・hold 理由・ask の回答) |
 | `TRADE` | 発注・約定・クローズ・期限切れ取消・risk gate 却下 |
-| `IMPROVE` | 改善 loop の活動 (発見・リサーチ・実装・PR/approval 発行) |
+| `IMPROVE` | 改善 loop の活動 (発見・リサーチ・実装・approval 発行・提案レポート) |
 | `APPROVAL` | 承認要求の発行・承認/却下/期限切れ |
 | `SYSTEM` | 起動・停止・モード切替・autopilot 切替・runner/モデル切替 |
 
@@ -867,7 +874,7 @@ activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 �
 - plugin_loader は「未承認はロードされない」「テスト不合格はロードされない」を含めてテスト
 - news_sources の機械検証 (URL 到達性・parse 成功・重複) は fetcher モックでテスト
 - activity ログはカテゴリ・イベント形式の書き出しをテスト (技術ログと混ざらないこと)
-- CI (GitHub Actions): pytest を PR 必須チェックにする (改善 loop の品質ゲートの土台)
+- CI (GitHub Actions): pytest を PR 必須チェックにする (人間の開発フロー用 — 改善 loop は PR を作らない、§6)
 
 ## 15. 段階導入
 
