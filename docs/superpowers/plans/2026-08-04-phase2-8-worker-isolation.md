@@ -10902,6 +10902,7 @@ Task 16 で `_reflection_fn` の外側 `core_lock` を外した結果、**RAG �
 """プラン8 E2E — 設計書 §9 受入条件 1・2 (実 subprocess・実統合)。"""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -10926,6 +10927,7 @@ def test_worker_runner_kills_process_that_ignores_sigterm(tmp_path):
     proc = subprocess.Popen(
         ["sh", "-c", "trap '' TERM; sleep 60"],
         start_new_session=True)
+    pgid = proc.pid  # start_new_session=True なので pid == pgid
     w = WorkerSettings(worker_terminate_grace_sec=1.0)
 
     runner = WorkerRunner.__new__(WorkerRunner)  # コンストラクタを経由せず
@@ -10940,6 +10942,28 @@ def test_worker_runner_kills_process_that_ignores_sigterm(tmp_path):
 
     assert proc.poll() is not None  # 実際に死んでいる
     assert elapsed < 5.0  # grace(1s) + kill 完了が数秒以内
+
+    # **(2026-08-10 着手前検証で追加)** `proc.poll()` だけでは受入条件 1 を
+    # 測れていない。受入条件 1 は「worker の**プロセスツリー**を kill できる
+    # こと」であり、`proc` 単体の死亡ではない。実測: `sh` は `sleep` を
+    # fork する (exec しない) ので、`_kill` の `os.killpg(...)` を
+    # `os.kill(...)` に退行させると **`sh` だけ死んで `proc.poll()` は -9 を
+    # 返し、テストは green のまま `sleep 60` の孤児が残る**。
+    #
+    # 期限付きポーリングにすること — `proc.wait()` が刈るのは `sh` だけで、
+    # fork された `sleep` は init に引き取られて**非同期に**刈られる。さらに
+    # `killpg(pgid, 0)` はメンバーが zombie の間も成功するため、直後に
+    # `pytest.raises(ProcessLookupError)` を置くと新たな flaky 源になる。
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("プロセスグループが残存している "
+                    "(worker ツリーを kill できていない)")
 
 
 def test_funds_protection_continues_during_blocked_mission(tmp_path):
@@ -11081,11 +11105,23 @@ Expected: 全件 PASS。
 
 - [ ] **Step 5: 決定論的コア diff ゼロの確認 (受入条件 7)**
 
+**(2026-08-10 着手前検証で改訂 — 旧稿の `git diff main` は恒真だった)** Task 20 は
+本プランの**最終 task** であり、この時点で Task 1〜19 は既に main にマージ済みである。
+したがって `git diff main` は「main と main の差分」に近く、**3 ファイルが本プランで
+変更されていたとしても必ず空になる** — 検証が成立しない。基準は**プラン 8 の起点**
+`8fd4d3e` (`Merge branch 'phase2-implementation'`) にすること。
+
 ```bash
-git diff main -- src/agentic_fx/core/risk_gate.py
-git diff main -- src/agentic_fx/core/paper_broker.py
-git diff main -- src/agentic_fx/core/transitions.py
+BASE=8fd4d3e   # プラン 8 の起点
+git diff $BASE -- src/agentic_fx/core/risk_gate.py
+git diff $BASE -- src/agentic_fx/core/paper_broker.py
+git diff $BASE -- src/agentic_fx/core/transitions.py
+# 「変更 → revert」で diff が空になる形も潰す (履歴自体が空であること)
+git log --oneline $BASE..HEAD -- src/agentic_fx/core/risk_gate.py \
+    src/agentic_fx/core/paper_broker.py src/agentic_fx/core/transitions.py
 ```
+
+(着手前検証で実測済み: 起点基準の diff・履歴とも**空**。性質自体は成立している。)
 
 Expected: 3 ファイルとも **diff なし** (`risk_gate.py`/`paper_broker.py`/`transitions.py` は本プランのどの task でも Modify 対象に含まれていない — Files 一覧を全 task 通して `grep -n "risk_gate.py\|paper_broker.py\|transitions.py"` で確認し、1 件もヒットしないことをこの Step で再確認する)。`executor.py` は変更対象だが、`git diff main -- src/agentic_fx/core/executor.py` を目視し、**`evaluate(intent, ctx, ...)` の呼び出しと GateContext 構築ロジックが `_open`/`open_from_snapshot` の両方で完全に同一であること** (Task 14/15 の `_evaluate_and_execute_open` への切り出しが判定ロジックを 1 文字も変えていないこと) をコードレビューで確認する。
 
@@ -11153,6 +11189,8 @@ uv run pytest tests/core/test_scheduler_tick_order.py tests/core/test_executor_s
 - [ ] **Step 8: 変異テスト**
 
 1. `WorkerRunner._kill` の `os.killpg(proc.pid, signal.SIGKILL)` を `os.killpg(proc.pid, signal.SIGTERM)` に改変 (SIGKILL を送らなくする) → `test_worker_runner_kills_process_that_ignores_sigterm` が red (`trap '' TERM` により無反応、`proc.poll()` が None のまま)
+
+1-b. **(2026-08-10 着手前検証で追加 — 変異の方向が 1 つしかなかった)** `WorkerRunner._kill` の `os.killpg(proc.pid, signal.SIGKILL)` を `os.kill(proc.pid, signal.SIGKILL)` に改変 (グループでなく直接の子だけを撃つ) → 同テストが red。**この変異こそが受入条件 1 の本体** (worker ツリーの kill)。実測済み: 旧稿の assert (`proc.poll() is not None` のみ) では**この変異が生存する** — `sh` だけ死んで `poll()` は -9 を返し、`sleep 60` の孤児が残る
 2. `TradeLoop._run_once_impl` の commit-core `with self._core_lock:` を run 相の周りまで拡張する変異 (意図的に lock 粒度を壊す) → `test_funds_protection_continues_during_blocked_mission` が red (2 回目の `app.core_lock.acquire(timeout=3.0)` が `False` を返す — bounded acquire なのでテスト自体はハングせず確実に red になる)
 3. **(裁定書 FC-6 追加)** `_evaluate_and_execute_open` の `if any("kill switch" in r and "latched" not in r for r in result.reasons):` を `if False:` に改変 (ラッチが二度と発火しなくなる) → `test_kill_switch_latch_fires_identically_via_open_and_open_from_snapshot` が red (ソース pin の assert が最初に落ちる — さらに振る舞い側の assert も red になることを確認する)
 
@@ -11275,6 +11313,8 @@ fork の修正案: 事前に `grep` で影響箇所を全列挙してから step
 指摘内容: 設計書 §9 の受入条件 8 項目のうち複数が「他 task で実測済み — 本 task は全体スイートに含まれることの確認のみ」という記載になっており、Task 20 自身が独立に end-to-end で再現するテストを書いていない項目がある。
 fork の修正案: Task 20 に、各受入条件について「他 task のテストを流用」ではなく「本番に近い組み立てで独立に再現する」テストを最低 1 本ずつ追加する。
 **照合メモ**: 本修整担当は受入条件 2 (IM-5/P8-07) を本番配線経由に修正したが、受入条件 3・4・5・6 は依然「他 task の実測を集約」のままであり (Task 20 本文の表参照)、この指摘は**部分的にのみ解消**。着手時に残り 4 項目について本番配線での独立再現が必要かユーザーと合意すること (裁定書に明示指示が無いため本修整ではスコープ外とした)。
+
+**(2026-08-10 ユーザー裁定 — 本保留を閉じる)**: **受入条件 3・4・5・6 は「集約のみ」で確定**。Task 20 の新規テストは受入条件 1・2 の 2 本 + FC-6 の kill switch ラッチ検証に留め、3〜6 は Step 7 で各 task の実測を再実行して集約する。**この裁定は実測 3 件 (RAG lock 保持時間 / `snapshot_max_age_sec` / improve worker の Mission 完走) を含まない** — プランは `snapshot_max_age_sec` を「必ず実測」と指定しており、その扱いは別途決める。
 
 **I38 [Important] Task 20 — worktree 並列予定 task 間のファイル衝突 (`signal_tools.py`)**
 該当: プラン規約の「依存の浅い task 束は worktree 並列」の運用と、Task 3 (`signal_tools.py` の description f-string 化) / Task 9 (`signal_tools.py` 経由の Rag RPC 配線に関連する変更) が同一ファイルを編集する可能性。
