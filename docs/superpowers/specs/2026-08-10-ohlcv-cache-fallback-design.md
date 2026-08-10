@@ -1,13 +1,13 @@
 # 設計: ohlcv キャッシュ・フォールバックの読み込み窓と配線 pin
 
 **位置づけ**: プラン 9 の task として実装する。本書はその spec。
-**日付**: 2026-08-10 (**改訂 3**)
+**日付**: 2026-08-10 (**改訂 4** — codex 3 周目 Important 2 を反映し確定)
 **改訂履歴**: 改訂 1 は中核命題 3 つが誤っており大幅に書き直した (codex 1 周目 Important 6)。
 改訂 2 はその書き直し自体が新しい欠陥を持ち込んだ (codex 2 周目 Important 3 / Minor 1)。
 **2 周とも「修正ラウンドは新しい欠陥を持ち込む」を実証している。**
 **出自**: C3 調査 (`.superpowers/sdd/2026-08-04-phase2-8-worker-isolation/c3-investigation.md`) の副産物。
 C3 自体は「エスカレーション不要・実質解消済み」で閉じた。
-**レビュー記録**: `.superpowers/sdd/2026-08-10-ohlcv-cache-fallback/spec-review-codex.md` (1 周目) / `spec-review2-codex.md` (2 周目)
+**レビュー記録**: `.superpowers/sdd/2026-08-10-ohlcv-cache-fallback/spec-review-codex.md` (1 周目) / `spec-review2-codex.md` (2 周目) / `spec-review3-codex.md` (3 周目)
 
 ---
 
@@ -198,8 +198,23 @@ floor 時刻の base 行が未保存・欠損・取得漏れであれば、同�
 
    実際の経路: `Scheduler.tick → _process_exits → settings.pairs の
    processed-bar marking → bars_fn` (`scheduler.py:918-977`)。
-   前提は**対象 pair が `settings.pairs` にあること**と、tick がここまで到達する
-   設定・時刻であること。
+
+   **到達条件を具体化する (codex 3 周目 I2)。`_process_exits` の手前の早期 return は
+   2 つだけ** (実コードで確認):
+
+   | # | 分岐 | pin テストの要求 |
+   |---|---|---|
+   | 1 | **市場閉場**: `is_market_open(now)` が偽なら return (`scheduler.py:110-119`) | `now` は**開場中の UTC 時刻**を使う |
+   | 2 | **snapshot 時系列逆行**: `_mark_to_market` が偽なら return (`:122-126`。`record_snapshot` の `ValueError`) | `now` は **DB の最新 account snapshot 以降**にする |
+
+   **skip 条件ではないもの** (到達条件に含めない): kill switch (exit 走査を止める分岐は
+   tick に無い) / account 欠損・equity 0 以下 (`fills_allowed=false` になるだけで
+   `_process_exits` へ進む) / open position のバー欠損・レート不健全
+   (`_mark_to_market` は継続扱い)。
+
+   ただし `_process_exits` より**手前の処理から未捕捉例外が漏れれば**到達しない —
+   **空の注文 DB** を使えば注文依存の手前処理はほぼ消える (これも order を seed
+   しない理由の一つ)。
 
    逆に **order を seed すると `bars_fn` が複数回呼ばれる** (時価評価 `:370-378` /
    exit `:928-939` / 末尾マーキング `:969-977`)。「1 回だけ返す」ような fixture は
@@ -252,8 +267,8 @@ cache を温めるため実害は限定的」とだけ書いている。**tick �
 | 8 | **クエリ切断由来の部分バケットが先頭に出ない** (7 とは別の観測点) | floor を外す |
 | 9 | `1d` の floor が UTC 00:00 になる | Tick 系と同じ実装を流用する |
 | 10 | 末尾の形成中バケットは従来どおり残る | 末尾も落とす |
-| 11 | **本番連鎖**: build_app → order seed → tick が 1m を書く → 1h 行が空であることを確認 → ライブ全滅 → `bars_origin == "cache(1m→1h derived)"` | `_base_candidates` から 1m を外す |
-| 12 | 11 の前提条件そのもの: tick が `bars_fn` を呼んでいる | `bars_fn` の配線を切る |
+| 11 | **本番連鎖 (無注文)**: build_app → **空の注文 DB** で tick → 1h 行が空であることを確認 → ライブ全滅 → `bars_origin == "cache(1m→1h derived)"`。**order は seed しない** (§3.4 手順 2 — seed すると注文依存経路で 1m が書かれてしまい、processed-bar marking の配線を切る変異が green になる) | `_base_candidates` から 1m を外す |
+| 12 | **tick → processed-bar marking → `bars_fn` → 1m 保存の配線** (書かれた source の確認を含む)。**これは検査目的であってテスト 11 の前提条件ではない** — 落ちたら production の配線欠陥を見つけたことになる | `bars_fn` の配線を切る / marking の走査を削除する |
 | 13 | 蓄積が大きくても読み込み件数が窓ぶんに収まる | 絞りを外す |
 | 14 | **窓の縮小で受理集合が変わることの明示** (§6) — 窓外の古い異常行があってもフォールバックが成立する | 全期間検証に戻す |
 | 15 | **非既定の `lookback_days` が `get_bars` から `load_bars(since=...)` まで届く** | `_cached_bars` 内で既定値を推測する |
@@ -267,13 +282,25 @@ cache を温めるため実害は限定的」とだけ書いている。**tick �
 **「複数の検査目的を 1 テストに詰めるな」**である。**前提条件の assert は別**:
 
 - **検査目的ごとにテストを分ける** — テスト 11 (最終フォールバックが成立する)、
-  12 (tick が `bars_fn` を呼ぶ)、13 (読み込み量が窓に収まる) はそれぞれ独立
-- **1 本の E2E 連鎖の中では、前提条件の assert を並べてよい** — テスト 11 の
-  「1m が書かれた」「同 source の 1h が空」は**それ自体が検査目的ではなく、
-  観測が成立するための前提**である。これを落とすと、既存 1h 行や別 source の
-  キャッシュで green になる偽陽性を防げない
-- 見分け方: **その assert が落ちたとき「別の欠陥を見つけた」なら検査目的、
-  「テストが前提を満たせていない」なら前提条件**。前提条件は同居してよい
+  12 (marking の配線が 1m を書く)、13 (読み込み量が窓に収まる) はそれぞれ独立
+- **1 本の E2E 連鎖の中では、前提条件の assert を並べてよい**。ただし
+  **前提条件と検査目的の分類は spec 側で確定させる** (下記)
+- 見分け方: **その assert が落ちたとき「別の production 欠陥を見つけた」なら検査目的、
+  「テスト自身の fixture/DB が汚れている」なら前提条件**。前提条件は同居してよい
+
+**テスト 11 の各 assert の分類 (codex 3 周目 I2 で確定)**:
+
+| assert | 分類 | 根拠 |
+|---|---|---|
+| 同 source の 1h 行が空 | **前提条件** (同居可) | 落ちたら fixture/DB の汚染。production の欠陥ではない |
+| 1m が書かれた | **検査目的 — テスト 11 に置かない** | 落ちたら marking 配線の欠陥 = **テスト 12 の対象**。テスト 11 では `pytest.fail("setup failure: ...")` で **setup 失敗として明示的に** abort する (検査目的の assert と区別が付く形にする) |
+| `bars_origin == "cache(1m→1h derived)"` | **検査目的** (テスト 11 の本体) | — |
+
+**短絡の残余とその補償**: テスト 11 は 1m 不在で abort した場合、最終導出の検査点は
+未実行になる。**これは許容する — ただし補償として、最終導出を単独で殺すテストが
+独立に存在すること** (既存の `test_cache_fallback_derives_*` 系が `1m → 1h` 版を持つこと。
+テスト 4 がこれを兼ねる) を対応表で示す。「suite のどこかが red になる」ではなく、
+**「短絡した E2E の後段を、どのテストが独立に検査するか」を名指し**する。
 
 ---
 
