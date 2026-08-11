@@ -8,7 +8,7 @@ import json
 import httpx
 
 from agentic_fx.runners.base import Mission
-from agentic_fx.runners.local_runner import LocalRunner
+from agentic_fx.runners.local_runner import _MAX_REASON_CHARS, LocalRunner
 from agentic_fx.tools.registry import ToolRegistry
 
 SCHEMA = {"type": "object", "properties": {"action": {"type": "string"}},
@@ -113,9 +113,24 @@ def test_reason_strips_non_whitespace_nonprintable_character():
 
 
 def test_reason_length_is_capped():
+    """⚠️ 旧版は `<= 550` で、実装の最大 512 (=500 + "…(truncated)") に対し
+    38 文字の余裕があった。上限を 549 まで緩める変異が通ってしまう
+    (ローカル LLM muse-glimmer が境界値の退化として指摘・指揮者が確認)。
+    実装の定数を直接参照して厳密に固定し、切り詰め接尾辞の付与も見る。"""
     envelope = {"error": {"type": "other", "message": "x" * 10_000}}
     r = _runner_for_json_body(400, envelope).run(_mission())
-    assert len(r.reason) <= 550
+    # ⚠️ 定数を import して比較すると **定数を変えてもテストが追随して通る**
+    # (指揮者が 500→540 の変異で実測)。上限の実効性は「切り詰めが起きること」
+    # で見て、**上限値そのものは別テストで明示的に pin する** (1 検査目的 1 テスト)。
+    assert len(r.reason) < 10_000            # 切り詰めが起きている
+    assert r.reason.endswith("…(truncated)")  # 切り詰め接尾辞が付く
+
+
+def test_max_reason_chars_constant_is_pinned():
+    """上限値の変更を**意図的な操作**にする。`reason` は activity ログ・
+    Discord 通知・worker の result frame をそのまま経由するので、上限が
+    黙って伸びると漏洩面がその分広がる。調整するならこのテストも直すこと。"""
+    assert _MAX_REASON_CHARS == 500
 
 
 def test_reason_uses_safe_text_to_strip_urls():
@@ -251,3 +266,72 @@ def test_json_body_that_is_not_a_dict_falls_back_to_generic_reason():
     assert r.status == "failed"
     assert r.reason is not None
     assert "HTTPStatusError" in r.reason
+
+
+# ---- 1 周目 (codex) が検出した生存変異への pin -----------------------------
+# いずれも実装は正しく、テストが無いだけだった。指揮者がフルスイート 1750
+# 全緑のまま生存することを実測してから追加している。
+
+def test_error_value_that_is_not_a_dict_falls_back_to_generic_reason():
+    """`{"error": []}` のように `error` が dict でない形。`isinstance(err,
+    dict)` ガードを外すと `err.get()` で **AttributeError** になる (実測)。
+    既存のキー欠落テストは `{"error": {}}` しか見ておらず、この型は素通り
+    していた — 段 0 で見つけた payload 型ガード漏れと**同型**の穴。"""
+    r = _runner_for_json_body(400, {"error": [1, 2, 3]}).run(_mission())
+    assert r.status == "failed"
+    assert "HTTPStatusError" in r.reason
+
+
+def test_ctx_zero_prompt_tokens_downgrades_to_message():
+    """spec §4.1「**正整数**」。`_is_positive_int` から `v > 0` を外すと
+    `0` が受理され、`prompt 0 tokens` という無意味な診断が出る (実測で
+    フルスイート全緑のまま生存)。既存の型テストは str と bool しか見て
+    いなかった。"""
+    env = dict(_CTX_ENVELOPE)
+    env["error"] = dict(_CTX_ENVELOPE["error"], n_prompt_tokens=0)
+    r = _runner_for_json_body(400, env).run(_mission())
+    assert "context exceeded" not in r.reason
+    assert "exceeds the available context" in r.reason   # message へ降格
+
+
+def test_ctx_negative_n_ctx_downgrades_to_message():
+    """同上の負数側。`v > 0` を外すと `-1` も受理される。"""
+    env = dict(_CTX_ENVELOPE)
+    env["error"] = dict(_CTX_ENVELOPE["error"], n_ctx=-1)
+    r = _runner_for_json_body(400, env).run(_mission())
+    assert "context exceeded" not in r.reason
+    assert "exceeds the available context" in r.reason
+
+
+def test_empty_message_falls_back_to_generic_reason():
+    """`message` が空文字のとき。`and message` を外すと **空の reason** が
+    返り、汎用文言への退避が起きない (実測)。運用者は「失敗したが理由欄が
+    空」という最も情報の無い状態を見ることになる。"""
+    r = _runner_for_json_body(400, {"error": {"type": "other",
+                                              "message": ""}}).run(_mission())
+    assert r.status == "failed"
+    assert r.reason
+    assert "HTTPStatusError" in r.reason
+
+
+def test_non_string_message_falls_back_to_generic_reason():
+    """`message` が非文字列 (整数) のとき。`isinstance(message, str)` を
+    真偽値判定に弱めると `_normalize_reason(12345)` となり `safe_text` が
+    例外を出す (実測)。「形状不正でも例外を出さず退避」の未固定部分。"""
+    r = _runner_for_json_body(400, {"error": {"type": "other",
+                                              "message": 12345}}).run(_mission())
+    assert r.status == "failed"
+    assert "HTTPStatusError" in r.reason
+
+
+def test_response_body_not_written_to_logs(caplog):
+    """spec §4.1 は transcript と**ログの両方**への本文保存を禁じている。
+    既存の非保存テストは transcript しか見ておらず、`_log.warning` の引数を
+    `safe_error_text(e)` から `e.response.text` に変える変異が生存していた
+    (実測)。ログは技術ログとしてファイルに残るので漏洩面は transcript と同等。"""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.runners.local"):
+        _runner_for_json_body(400, _CTX_ENVELOPE).run(_mission())
+    logged = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "exceed_context_size_error" not in logged
+    assert "90010" not in logged
