@@ -631,3 +631,46 @@ def test_mission_failed_notification_omits_separator_for_empty_reason(tmp_path):
     assert loop.run_once() is None
     sent = loop.notifier.send.call_args[0][0]
     assert " —" not in sent
+
+
+def test_failed_mission_output_never_reaches_the_intent_path(tmp_path):
+    """Task 4 / 1 周目 codex 指摘 I1: `status != "completed"` の分岐の
+    早期 `return None` を固定する。
+
+    ⚠️ **既存の失敗系テストはこの防御を測れない。** すべて `output=None`
+    なので、`return None` を削除しても直後の
+    `TradeIntent.from_llm_dict(None)` が `IntentParseError` を出し、
+    `intent_parse_failed` 経路が同じく `None` を返す — 別の出口が同じ
+    見かけの結果を作るため、変異はフルスイート 1776 passed のまま生存
+    する (指揮者が実測)。
+
+    **失敗 Mission が構文的に妥当な output を伴った場合に露出する** —
+    早期 return が無いと、失敗した LLM 出力がそのまま intent 化され
+    執行経路へ進む。CLAUDE.md「発注・SL 変更・クローズ・資金保護は LLM に
+    委ねない。決定論的コードで強制」に直接かかる防御であり、
+    `status != "completed"` を**唯一の**判断根拠として止めきること自体が
+    契約になる。"""
+    # ⚠️ **output は「実際に注文が通る」形でなければ意味がない。** 最初に
+    # 書いた版は `action="enter"` (存在しない action) を使っており、変異を
+    # 入れても `IntentParseError` 側で止まっていた — 早期 return を消した
+    # 危険 (執行経路への到達) を一度も踏まないまま KILLED になっていた
+    # (指揮者が実測して差し替え)。
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", {"action": "open", "pair": "USDJPY", "direction": "long",
+                   "entry_type": "limit", "horizon": "day",
+                   "limit_price": 148.20, "expires_in": "4h",
+                   "stop_loss": 147.80, "take_profit": 149.00,
+                   "reasoning": "壊れた runner の出力"},
+        [], reason="context exceeded: prompt 90010 tokens > n_ctx 65536")])
+
+    assert loop.run_once() is None
+
+    # intent は 1 本も作られない (執行経路へ進んでいない)。
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM trade_intents").fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"] == 0
+
+    act = (tp / "a.log").read_text(encoding="utf-8")
+    assert "mission_failed" in act
+    # 失敗分岐で止まっており、後続の parse 経路へ落ちていない。
+    assert "intent_parse_failed" not in act
