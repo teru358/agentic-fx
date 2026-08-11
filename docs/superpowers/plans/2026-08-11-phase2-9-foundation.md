@@ -9278,10 +9278,28 @@ def test_trade_intents_migration_accepts_legacy_rejected_row_with_null_action(tm
 
 
 def test_trade_intents_migration_is_idempotent(tmp_path):
+    """⚠️ 旧版は空 DB で `init_db` を 2 回呼び `COUNT(*) == 0` を見るだけで、
+    **migration が実際に行われたか / 2 回目が既存行を壊さないかを一切検証して
+    いなかった** (空の新規 DB は何をしても 0 件。ローカル LLM 2 本が一致して
+    指摘し指揮者が裏取りした)。legacy 行を 1 件持つ DB で 2 回流し、**行が
+    生き残り列も揃っている**ことを見る形に変える。"""
     c = connect(tmp_path / "db.sqlite")
+    c.executescript("CREATE TABLE missions (id INTEGER PRIMARY KEY, loop TEXT NOT NULL,"
+                    "runner TEXT NOT NULL,model TEXT NOT NULL,status TEXT NOT NULL,"
+                    "started_at TEXT NOT NULL);" + _legacy_trade_intents_ddl())
+    c.execute("INSERT INTO missions VALUES (1,'trade','local','m','completed','x')")
+    c.execute("INSERT INTO trade_intents (mission_id,payload_json,gate_result,"
+              "reject_reason,created_at) VALUES (1,'{}','rejected','legacy','x')")
+    c.commit()
     init_db(c)
-    init_db(c)
-    assert c.execute("SELECT COUNT(*) FROM trade_intents").fetchone()[0] == 0
+    init_db(c)                      # 2 回目が壊さないことが本題
+    rows = c.execute("SELECT action,reject_category,reject_reason "
+                     "FROM trade_intents").fetchall()
+    assert len(rows) == 1                              # 行が重複も消失もしない
+    assert rows[0]["reject_reason"] == "legacy"        # 中身が保たれている
+    assert rows[0]["action"] is None                   # legacy は NULL のまま
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(trade_intents)")}
+    assert {"action", "reject_category"} <= cols       # 列が消えていない
 
 
 def test_trade_intents_check_rejects_invalid_gate_category_pair(tmp_path):
@@ -9397,16 +9415,35 @@ def test_gate_alert_reads_only_conn_supervisor(tmp_path, monkeypatch):
     assert notifier.sent
 
 
-def test_gate_alert_notifier_is_never_called_on_scheduler_thread(tmp_path):
-    loop, core, ro, notifier = _loop_with_threshold(tmp_path, threshold=1)
-    _intent(core, "open", "rejected", "risk_gate")
-    scheduler_ident = threading.get_ident()
-    notifier.on_send = lambda: pytest.fail(
-        "notifier called on scheduler thread") if threading.get_ident() == scheduler_ident else None
-    t = threading.Thread(target=loop._notify_gate_reject_streak,
-                         name="mission-supervisor-test")
-    t.start(); t.join(timeout=5)
-    assert notifier.sent
+# ⚠️ 旧版はここに test_gate_alert_notifier_is_never_called_on_scheduler_thread
+# を置いていたが、**vacuous (どんな実装でも PASS する) だった** — ローカル LLM
+# レビュー (KAT) が検出し指揮者が裏取りした。旧版は
+# `threading.Thread(target=loop._notify_gate_reject_streak)` で**メソッドを直接**
+# 別スレッドから呼んでいたため、notifier 内の `threading.get_ident()` は決して
+# テスト実行スレッドの ident と一致せず、`pytest.fail` ガードは**構造的に発火
+# 不能**だった。しかも殺すべき変異は「**呼び出し元**を scheduler へ移す」ことで
+# あり、実際の呼び出し元を一切通らないこのテストでは変異が生存する。
+#
+# 正しい pin は「**scheduler tick 経路を実際に走らせて notifier が呼ばれない**」
+# ことと「**commit-post 経路では呼ばれる**」ことの対を見ることである。
+
+def test_scheduler_tick_never_notifies_gate_reject_streak(tmp_path):
+    """呼び出し元の pin (本命)。閾値を超える却下が既にある状態で scheduler の
+    tick を実運用と同じ経路で回し、**通知が 1 件も出ない**ことを見る。
+    `_notify_gate_reject_streak` を maintenance / tick へ移す変異はここで死ぬ。"""
+    app = _app_with_threshold(tmp_path, threshold=1)
+    _intent(app.conn_core, "open", "rejected", "risk_gate")
+    _scheduler_tick_once(app)          # 実配線 (service.py) をそのまま使う
+    assert app.notifier.sent == []
+
+
+def test_commit_post_notifies_gate_reject_streak(tmp_path):
+    """対になる肯定側の pin。commit-post 経路では実際に通知が出ることを見る
+    (上のテストだけだと「どこからも呼ばない」実装でも green になるため)。"""
+    conn, loop, runner, tp = _completed_hold_loop(tmp_path, threshold=1)
+    _intent(conn, "open", "rejected", "risk_gate")
+    loop.run_once()
+    assert len(loop.notifier.sent) == 1
 
 
 @pytest.mark.parametrize("stage", ["evaluate", "notify", "state_update"])
@@ -9580,7 +9617,9 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | 通知成功後の `alert_state.set` を削除 | `test_threshold_notifies_once_per_accepted_streak` |
 | 通知失敗を捕捉後も id を更新する | `test_notification_failure_does_not_update_streak_id` |
 | 判定接続を `self.conn` (`conn_core`) にする | `test_gate_alert_reads_only_conn_supervisor` |
-| `_notify_gate_reject_streak` を `_scheduler_tick_once` / maintenance から呼ぶ | `test_gate_alert_notifier_is_never_called_on_scheduler_thread` |
+| `_notify_gate_reject_streak` を `_scheduler_tick_once` / maintenance から呼ぶ | **`test_scheduler_tick_never_notifies_gate_reject_streak`** (旧 `test_gate_alert_notifier_is_never_called_on_scheduler_thread` は vacuous で**この変異を殺せなかった** — ローカル LLM レビューで検出) |
+| commit-post から `_notify_gate_reject_streak` の呼び出しを削除する (どこからも呼ばない) | **`test_commit_post_notifies_gate_reject_streak`** (上の否定側テストだけでは「呼ばない実装」が生存するため対で持つ) |
+| migration を 2 回目に no-op でなく再実行し既存行を壊す | **`test_trade_intents_migration_is_idempotent`** (旧版は空 DB で `COUNT(*)==0` を見るだけで**この変異を殺せなかった**) |
 | commit-post helper の `except Exception` を外す（evaluate） | `test_commit_post_alert_exception_never_changes_finalized_mission_to_failed[evaluate]` |
 | commit-post helper の `except Exception` を外す（notify） | `test_commit_post_alert_exception_never_changes_finalized_mission_to_failed[notify]` |
 | commit-post helper の `except Exception` を外す（state update） | `test_commit_post_alert_exception_never_changes_finalized_mission_to_failed[state_update]` |
