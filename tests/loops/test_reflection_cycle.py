@@ -428,11 +428,17 @@ def test_reflection_mission_failed_activity_written_with_reason(tmp_path):
 
 
 def test_reflection_current_retry_behavior_is_pinned(tmp_path):
-    """Task 4 / CP16 (回帰固定): 同一 order で 2 回 run_pending を呼んでも
-    starvation せず**毎回同じ order が選ばれ続ける** — missions 行が 2 本
+    """Task 4 / CP16 (回帰固定): 同一 order で 2 回 run_pending を呼ぶと
+    **毎回同じ order が選ばれ続ける** — missions 行が 2 本
     (どちらも failed)・reflection_mission_failed activity が 2 本・
     reflections 行は 0 本のまま (無制限再試行の現挙動。修正は設計書 §4.5
-    codex I3 で既に独立課題として起票済み・本 task では直さない)。"""
+    codex I3 で既に独立課題として起票済み・本 task では直さない)。
+
+    ⚠️ **計画の docstring にあった「starvation せず」は誤り**なので削除した
+    (1 周目 codex 指摘 I4)。同じ order が選ばれ続けることは、まさに後続の
+    order を starve させる原因そのものである。starvation 側は order を
+    1 件しか作らないこのテストでは**原理的に観測できない** —
+    `test_failed_reflections_starve_later_orders` が別に固定する。"""
     conn, rag, cyc = _cycle(tmp_path, [
         MissionResult("failed", None, [], reason="boom1"),
         MissionResult("failed", None, [], reason="boom2"),
@@ -622,3 +628,38 @@ def test_reflection_mission_failed_activity_line_is_pinned_field_by_field(
     assert summary == (
         f"order_id={oid} mission_id={mid} status=failed — {reason}")
     assert ref_id == str(oid)
+
+
+def test_failed_reflections_starve_later_orders(tmp_path):
+    """Task 4 / 1 周目 codex 指摘 I4 (回帰固定): **失敗し続ける古い order が
+    `max_items` 枠を占有し、後続の order を永久に starve させる**現挙動を
+    固定する (設計書 §4.5 codex I3 の独立課題。本 task では直さない)。
+
+    `run_pending` の SELECT は「reflections 行が無い closed order」を
+    `ORDER BY o.id LIMIT max_items` で取る。失敗しても reflections 行は
+    作られないので、先頭 3 件が失敗し続ける限り 4 件目は**一度も選ばれない**。
+
+    ⚠️ **order を 1 件しか作らない `test_reflection_current_retry_behavior_
+    is_pinned` ではこれを観測できない。** 「失敗済み order を、他に pending が
+    あるときだけ後順位へ送る」変異は、単独 order のテストを従来どおり通過
+    しながら starvation を解消してしまう (codex 指摘)。現挙動を課題として
+    起票した以上、**その現挙動が本当に起きていること**を測れる形で残す。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult("failed", None, [])])
+    oids = [_closed_order(conn) for _ in range(4)]
+    assert len(set(oids)) == 4
+
+    for _ in range(3):
+        assert cyc.run_pending() == 0
+
+    # 先頭 3 件が 3 周期とも試行され、4 件目は一度も選ばれない。
+    summaries = [ln.split("\t")[3] for ln in
+                 (tmp_path / "a.log").read_text(encoding="utf-8").splitlines()
+                 if "\treflection_mission_failed\t" in ln]
+    for oid in oids[:3]:
+        assert sum(1 for s in summaries
+                   if s.startswith(f"order_id={oid} ")) == 3
+    assert not any(s.startswith(f"order_id={oids[3]} ") for s in summaries)
+
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
+    ).fetchone()["c"] == 9
