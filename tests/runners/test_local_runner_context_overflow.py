@@ -211,3 +211,43 @@ def test_ctx_n_ctx_bool_downgrades_to_message():
     r = _runner_for_json_body(400, envelope).run(_mission())
     assert "context exceeded" not in r.reason
     assert "ctx bool edge case" in r.reason
+
+
+# ---- 段 0 の変異スイープで検出した無防備な防御 (指揮者追加) ----------------
+# 計画の変異リスト M1〜M15 では拾えなかった 2 つの退避経路。どちらも
+# 「例外を出さず汎用文言に退避する」という spec §4.1 の中核要件そのもの
+# なのに、フルスイート 1748 全緑のまま防御を削除できてしまった。
+
+def test_connection_error_without_response_falls_back_to_generic_reason():
+    """spec §4.1「接続エラー等 response を持たない HTTPError は従来文言の
+    まま」。`_reason_from_http_error` の `isinstance(e, HTTPStatusError)`
+    ガードを外すと `e.response` に触れて **AttributeError** が送出される
+    (実測)。llama-swap 停止・ネットワーク断という最もありふれた障害の経路
+    であり、ここで例外が漏れると Mission が診断不能なまま落ちる。"""
+    def handler(request):  # noqa: ANN001
+        raise httpx.ConnectError("connection refused")
+
+    runner = LocalRunner(base_url="http://test/v1", model="m",
+                         registry=ToolRegistry(),
+                         transport=httpx.MockTransport(handler))
+    r = runner.run(_mission())
+    assert r.status == "failed"
+    assert r.reason is not None
+    assert "ConnectError" in r.reason
+
+
+def test_json_body_that_is_not_a_dict_falls_back_to_generic_reason():
+    """検査点 8 の穴。本文が **valid JSON だが dict ではない** (配列・
+    スカラー) ケース。`isinstance(payload, dict)` ガードを外すと
+    `payload.get()` で **AttributeError: 'list' object has no attribute
+    'get'** になる (実測)。リバースプロキシや互換層が配列を返す実在の形。"""
+    def handler(request):  # noqa: ANN001
+        return httpx.Response(400, content=b"[1,2,3]")
+
+    runner = LocalRunner(base_url="http://test/v1", model="m",
+                         registry=ToolRegistry(),
+                         transport=httpx.MockTransport(handler))
+    r = runner.run(_mission())
+    assert r.status == "failed"
+    assert r.reason is not None
+    assert "HTTPStatusError" in r.reason
