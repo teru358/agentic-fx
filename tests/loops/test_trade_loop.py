@@ -590,3 +590,44 @@ def test_requeue_signal_happens_under_core_lock(tmp_path):
         (sid,)).fetchone()
     assert row["status"] == "pending"
     assert row["requeue_count"] == 1
+
+
+def test_mission_failed_activity_includes_reason_when_present(tmp_path):
+    """Task 4 / CP13: reason があれば mission_failed activity 本文に
+    含まれる。"""
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason="context exceeded: prompt 90010 tokens "
+                                    "> n_ctx 65536 (model=m)")])
+    assert loop.run_once() is None
+    act = (tp / "a.log").read_text(encoding="utf-8")
+    assert "context exceeded: prompt 90010 tokens > n_ctx 65536" in act
+
+
+def test_mission_failed_notification_includes_reason_when_present(tmp_path):
+    """Task 4 / CP14: reason があれば通知本文にも含まれる。"""
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason="context exceeded: prompt 1 tokens "
+                                    "> n_ctx 2 (model=m)")])
+    loop.notifier.send = MagicMock()
+    assert loop.run_once() is None
+    sent = loop.notifier.send.call_args[0][0]
+    assert "context exceeded: prompt 1 tokens > n_ctx 2" in sent
+
+
+def test_mission_failed_activity_omits_separator_for_empty_reason(tmp_path):
+    """Task 4 mutation pin: 空 reason は activity に区切りを残さない。"""
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason="")])
+    assert loop.run_once() is None
+    act = (tp / "a.log").read_text(encoding="utf-8")
+    assert " —" not in act
+
+
+def test_mission_failed_notification_omits_separator_for_empty_reason(tmp_path):
+    """Task 4 mutation pin: 空 reason は通知に区切りを残さない。"""
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason="")])
+    loop.notifier.send = MagicMock()
+    assert loop.run_once() is None
+    sent = loop.notifier.send.call_args[0][0]
+    assert " —" not in sent

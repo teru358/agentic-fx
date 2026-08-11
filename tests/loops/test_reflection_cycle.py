@@ -409,3 +409,91 @@ def test_null_intent_id_handled(tmp_path):
     runner = cyc.runner
     mission_prompt = runner.missions[0].prompt
     assert '"entry_reasoning": null' in mission_prompt
+
+
+def test_reflection_mission_failed_activity_written_with_reason(tmp_path):
+    """Task 4 / CP15: reflection Mission 失敗時に reflection_mission_failed
+    activity が reason 付きで書かれる (通知は出さない — cyc は Notifier を
+    持たないため、通知しないことは構造的に保証されている)。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason="context exceeded: prompt 1 tokens "
+                                    "> n_ctx 2 (model=m)")])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    act = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "reflection_mission_failed" in act
+    assert "context exceeded: prompt 1 tokens > n_ctx 2" in act
+    assert f"order_id={oid}" in act
+
+
+def test_reflection_current_retry_behavior_is_pinned(tmp_path):
+    """Task 4 / CP16 (回帰固定): 同一 order で 2 回 run_pending を呼んでも
+    starvation せず**毎回同じ order が選ばれ続ける** — missions 行が 2 本
+    (どちらも failed)・reflection_mission_failed activity が 2 本・
+    reflections 行は 0 本のまま (無制限再試行の現挙動。修正は設計書 §4.5
+    codex I3 で既に独立課題として起票済み・本 task では直さない)。"""
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("failed", None, [], reason="boom1"),
+        MissionResult("failed", None, [], reason="boom2"),
+    ])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+
+    failed_missions = conn.execute(
+        "SELECT COUNT(*) c FROM missions WHERE status='failed'"
+    ).fetchone()["c"]
+    assert failed_missions == 2
+
+    act = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert act.count("reflection_mission_failed") == 2
+
+    assert reflections.get(conn, oid) is None
+
+
+def test_reflection_mission_failed_omits_separator_for_empty_reason(tmp_path):
+    """Task 4 mutation pin: 空 reason は activity に区切りを残さない。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason="")])
+    _closed_order(conn)
+    assert cyc.run_pending() == 0
+    act = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "reflection_mission_failed" in act
+    assert " —" not in act
+
+
+def test_reflection_failed_status_with_content_does_not_persist(tmp_path):
+    """Task 4 mutation pin: failed の output は保存経路へ流さない。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", {"content": "must not persist"}, [], reason="boom")])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    assert reflections.get(conn, oid) is None
+    rag.add_reflection.assert_not_called()
+
+
+def test_completed_reflection_does_not_write_failure_activity(tmp_path):
+    """Task 4 mutation pin: completed を failure event として記録しない。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "completed", {"content": "ok"}, [])])
+    _closed_order(conn)
+    assert cyc.run_pending() == 1
+    assert not any("reflection_mission_failed" in line
+                   for line in cyc.activity.tail(10))
+
+
+def test_reflection_mission_failed_ref_id_is_order_id(tmp_path):
+    """Task 4 mutation pin: failure event の ref_id は order ID。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason="boom")])
+    seed_mid = missions.start(
+        conn, "reflection", SETTINGS.runner.trade.backend,
+        SETTINGS.runner.trade.model, NOW)
+    assert missions.finish(conn, seed_mid, "completed", {}, [], NOW)
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+
+    event_line = next(
+        line for line in cyc.activity.tail(10)
+        if "\treflection_mission_failed\t" in line)
+    assert event_line.split("\t")[-1] == str(oid)
