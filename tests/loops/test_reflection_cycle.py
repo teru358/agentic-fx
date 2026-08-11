@@ -542,3 +542,54 @@ def test_reflection_failure_event_write_error_is_caught_at_the_event_site(
                for m in messages), messages
     # per-item isolation まで昇格していないこと (= 本経路を巻き込んでいない)。
     assert not any("per-item reflection failed" in m for m in messages), messages
+
+
+@pytest.mark.parametrize("status", ["failed", "timeout", "max_turns"])
+def test_reflection_failure_event_covers_every_non_completed_status(
+        tmp_path, status):
+    """Task 4 / 1 周目 codex 指摘 I2: **`completed` 以外のすべての status**
+    で failure event が 1 件残り、status が本文に入る。reason は `None`。
+
+    Task 4 の event テストはどれも `status="failed"` かつ reason 付き
+    だったため、ガードを `if result.status == "failed":` に狭める変異も、
+    `if result.reason is not None:` に置き換える変異も**フルスイート
+    1777 passed のまま生存する** (指揮者が実測)。
+
+    `timeout` は llama-swap の応答が `llama_swap.timeout_sec` を超えた
+    ときに出る**最も起きやすい失敗**であり、ここが記録されないと
+    reflection が黙って進まなくなる。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(status, None, [])])
+    oid = _closed_order(conn)
+
+    assert cyc.run_pending() == 0
+
+    act = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert act.count("reflection_mission_failed") == 1
+    assert f"status={status}" in act
+    assert f"order_id={oid}" in act
+    # reason が None なら区切りも "None" も出さない。
+    assert "—" not in act
+    assert "None" not in act
+
+
+@pytest.mark.parametrize("status", ["failed", "timeout", "max_turns"])
+def test_non_completed_never_saves_reflection_even_with_valid_content(
+        tmp_path, status):
+    """Task 4 / 1 周目 codex 指摘 I2: `completed` 以外は、**output が
+    保存可能な形をしていても** reflection を保存しない。
+
+    既存の失敗系テストは output=None なので、早期出口
+    (`if result.status != "completed" or not finalize_ok:`) を
+    `== "failed"` に狭める変異を打っても、後段の型ガードが同じく
+    `False` を返して同じ見かけの結果になる — 別の防御に隠れて生存する
+    (Task 4 の trade 側 I1 と同じ構造)。
+
+    status が真の判断根拠であることを、**後段のどの防御にも頼らない
+    形**で固定する。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        status, {"content": "SL 幅が狭すぎた"}, [])])
+    oid = _closed_order(conn)
+
+    assert cyc.run_pending() == 0
+    assert reflections.get(conn, oid) is None
+    rag.add_reflection.assert_not_called()
