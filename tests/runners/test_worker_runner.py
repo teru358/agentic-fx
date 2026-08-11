@@ -1771,3 +1771,60 @@ def test_worker_runner_reason_defaults_to_none_for_legacy_result_frame(
 
     assert result.status == "failed"
     assert result.reason is None
+
+
+def test_worker_runner_preserves_empty_string_reason(tmp_path, monkeypatch):
+    """Task 3 / 1 周目 codex 指摘 M8: 子が **明示的に** `"reason": ""` を
+    送ってきたら、親はそれを空文字のまま `MissionResult.reason` に載せる。
+
+    `payload.get("reason")` を `payload.get("reason") or None` に緩める変異
+    (空文字を None へ潰す) は既存テスト全件を素通りする — 受信側テストが
+    非空文字列とキー欠落しか渡していないため (指揮者が実測: 1762 passed の
+    まま)。「キーが無い (診断なし → None)」と「キーはあるが空 (子が空の
+    診断を送った → プロトコル違反の兆候)」は別の事象であり、親が両者を
+    同一視すると子側の不具合が観測できなくなる。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "failed", "output": None,
+                                "reason": ""})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "failed"
+    assert result.reason == ""
+    assert result.reason is not None
