@@ -171,7 +171,7 @@
 | # | task | 一言 |
 |---|---|---|
 | 1 | ClaudeRunner | claude-agent-sdk で AgentRunner 実装・config 切替・**従量課金 API 不使用の構造的担保** (子 env から `ANTHROPIC_API_KEY` を除去) + **ユーザー設定の非継承を強制** (`setting_sources=[]` / `strict_mcp_config=True` / `plugins=[]`) |
-| 1b | **CodexRunner** | **公式 Python SDK `openai-codex`** (PyPI 0.144.4、`openai-codex-cli-bin` 同梱 = CLI ラッパ) で AgentRunner 実装。**ClaudeRunner と両方導入し config で切替** (ユーザー裁定 2026-08-11)。`codex login` のサブスク認証で従量課金を回避。**PyPI の `openai-codex-sdk` は素性不明の別物なので使わない**。実測項目・注意点はプラン 9 設計書 §5 を参照 |
+| 1b | **CodexRunner** | **公式 Python SDK `openai-codex`** (PyPI 0.144.4、`openai-codex-cli-bin` 同梱 = CLI ラッパ) で AgentRunner 実装。**ClaudeRunner と両方導入し config で切替** (ユーザー裁定 2026-08-11。`RunnerChoice.backend` を `^(local|claude|codex)$` へ拡張)。`codex login` のサブスク認証で従量課金を回避 (`account()` で ChatGPT Plus を実測確認)。**PyPI の `openai-codex-sdk` は素性不明の別物なので使わない**。両 SDK のサンドボックス特性の実測比較・実測必須項目はプラン 9 設計書 §5 を参照 |
 | 2 | 改善用 registry | research_tools (web_search=ddgs / fetch_article 移植) + 書き込み系 — 取引 loop registry と分離 |
 | 3 | バックログ + 注入コンテキスト | improvement_backlog CRUD・決定論的な成績集計注入 |
 | 4 | 改善 Mission 本体 | 3 ステップ 1 Mission・週次スケジュール |
@@ -183,7 +183,7 @@
 
 **受入条件 (blocking)**: **遮断 8 項目の全経路統合回帰テスト** (プラン 6 の部品 + プラン 8 の worker 境界を通しで検証 — これが green になるまで改善ループを有効化しない。**registry Task 2 直後に red で書き始める** — 最後の E2E に置くと 3 プラン跨ぎの blocking 条件が終盤まで検証されない) / 改善ループのツールセットに履歴 DB 直読・期間指定バックテスト・`get_signals` が**無い**ことの回帰テスト / **改善ループの書き込み可能パスが `plugins/` と `reports/` に閉じていること** — registry にツールが無いことだけでなく、**worker 実プロセスからリポジトリ本体へ書けないこと**まで踏む (Landlock allowlist と registry の 2 層で成立する) / ClaudeRunner はサブスク認証のみ。改善 Mission は プラン 8 の worker 隔離上で実行する (in-process 実行の改善ループは作らない)。
 
-**設計段階で裁定が要る事項 (task に埋めない)**: **improve worker 内で `uv run pytest` を回すか** — DB パス非提供 + 空 cwd + コードツリー読取専用の上で pytest を回すには EXECUTE 権と一時書き込み先が必要で、Landlock 設計 (プラン 8 Task 18) に跳ね返る。設計書 §6 許可ツールが再評価を求めている項目であり、**本プランの設計段階で確定させる** (task に埋めると Landlock 配線の変更が実装中に発覚する)。
+**設計段階で裁定が要る事項 (task に埋めない)**: ①**D3 の前提放棄を受けた受入条件の組み直し** — 「改善ループに汎用シェルを与えない」は放棄され (プラン 9 設計書 §5)、代替不変条件は**「改善 worker から `data/` と DB パスに到達できないこと」**。したがって検証すべきは「シェルが無いこと」ではなく「`data/` へ到達できないこと」であり、**`plugins/` を `read_write_paths` に足す際に `data/` を巻き込まないこと**が最重要の検査点になる。②**同梱 CLI バイナリ (336 MB) を使うか `codex_bin` でシステム側を指すか** (「clone + init で動く」原則とのトレードオフ)。③**improve worker 内で `uv run pytest` を回すか** — DB パス非提供 + 空 cwd + コードツリー読取専用の上で pytest を回すには EXECUTE 権と一時書き込み先が必要で、Landlock 設計 (プラン 8 Task 18) に跳ね返る。設計書 §6 許可ツールが再評価を求めている項目であり、**本プランの設計段階で確定させる** (task に埋めると Landlock 配線の変更が実装中に発覚する)。
 
 ---
 

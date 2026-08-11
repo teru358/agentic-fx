@@ -439,12 +439,35 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
 - **D6 の受入条件をプラン 10 側で持つ**: **git サブプロセス実行が scheduler スレッドから呼ばれないこと**の回帰テスト (プラン 9 の受入条件から移送した)
 - **`plugins/` を Landlock `read_write_paths` に追加する** (改善 worker が plugin を書くため。**D6 と同じ契機**で必要になる)
 - **improve worker 内で `uv run pytest` を回すかの裁定** — EXECUTE 権と一時書き込み先が要り Landlock 設計に跳ね返るため、**プラン 10 の設計段階で確定させる** (task に埋めない)
+
+- **⚠ D3 の前提を覆す裁定 (ユーザー 2026-08-11)**: プラン 7 の D3 は「**改善ループに汎用シェル/コマンド実行ツールを与えない**」を前提にしていた (与えると `afx plugin bless` で自己承認でき人間承認を迂回できる、という懸念)。**この前提は放棄する。**
+  - **理由**: 改善ループは **plugin の pytest を回すことが職務**であり、その時点で**任意コード実行が成立する** (設計書 §6 が既に「plugin submit 時の pytest は sandbox 外実行。AST 防御は原理的に不完全」と認めている)。シェルだけを絞っても実効的な差が無い。**ツール層で絞るのは形式的な防御にすぎない**
+  - **代替となる不変条件 (これが D3 の役割を引き継ぐ)**: **改善 worker から `data/` と DB パスに到達できないこと**。`bless` は `approval_requests` への書き込みを要するので、**到達できなければ実行できない** (「到達不能 = 実行不能」§4.6 の意味論)。プラン 8 が既に持っている防御 (DB パス非提供 + Landlock) がそのまま担う
+  - **したがってプラン 10 の受入条件で検証すべきは「シェルが無いこと」ではなく「`data/` へ到達できないこと」**である。**`plugins/` を `read_write_paths` に足す際に `data/` を巻き込まないこと**が最重要の検査点になる
+  - **残余リスク (明示)**: 改善 worker は web 取得のためネットワークを要する。任意コード実行 + ネットワークが揃うため、**plugin ソースの信頼性に対する脅威モデルは従来どおり「submit/bless は信頼できるソースのみ」**のまま (設計書 §6 のセキュリティ残余と同じ)
 - **CodexRunner を第 4 の AgentRunner として加える (ユーザー裁定 2026-08-11)**。`ClaudeRunner` と**両方を導入し、config で切り替えられる**ようにする (既存の「LocalRunner / ClaudeRunner を config で切替」と同じ枠組みに乗せる)。**設計書 §4 の改訂はプラン 10 の設計時に行う** (本プランのスコープ外)。
   - **公式 Python SDK が存在する (2026-08-11 実測)**: **`openai-codex`** (PyPI 0.144.4、`openai/codex` リポジトリの `sdk/python`、`requires_python >=3.10`)。依存は `pydantic>=2.12` と **`openai-codex-cli-bin==0.144.4`** — **claude-agent-sdk と同じく CLI をラップする構造**であり、実体は CLI サブプロセスである
   - **紛らわしい別パッケージに注意**: PyPI の **`openai-codex-sdk`** (0.1.11) は `author: OpenAI` を名乗るが **repository も homepage も無く**、版体系も公式 (0.14x) と一致しない。**使わないこと**。TypeScript 版の公式は `@openai/codex-sdk` (0.147.0, Apache-2.0)
   - **従量課金の回避は成立する見込み**: `codex login` の ChatGPT サブスクリプション認証を使えば、CLAUDE.md の絶対制約 (従量課金 API 不可) と両立する。ただし**未実測**
   - **プラン 10 で実測すべきこと**: ①worker 隔離下 (DB パス非提供・空 cwd・Landlock) で `codex exec` が完走するか ②`openai-codex-cli-bin` がバイナリを同梱するため **Landlock の allowlist に効く** — 実行可能パスの扱い ③ClaudeRunner と同様に**ユーザー個人の設定 (`~/.codex/`・MCP・plugin) を継承しないか** (claude-agent-sdk は既定で継承した。同型の問題を疑うこと) ④従量課金経路の遮断をどう構造的に強制するか (Claude 側は子 env から `ANTHROPIC_API_KEY` を除去する形にした)
   - ローカル CLI は `codex-cli 0.147.0`、Python SDK は 0.144.4 で**版が少しずれている**
+  - **API 形状は AgentRunner と相性が良い (実測)**: `Codex().thread_start(...)` → `Thread.run(input, *, output_schema=..., model=..., effort=..., sandbox=..., approval_mode=..., cwd=...)` → `TurnResult`。**`output_schema` がネイティブにある**ので `Mission.output_schema` をそのまま渡せ、**JSON 修復リトライが不要になる可能性がある** (LocalRunner の自前 tool-calling loop との差)。`CodexConfig(codex_bin=..., env=..., cwd=...)` で**バイナリパスと環境変数を明示できる**
+  - **サブスク認証は確認済み (実測)**: `Codex().account()` が ChatGPT Plus アカウントを返した。`login_chatgpt` / `login_api_key` が SDK に分かれており、**API キー経路を使わない構成が取れる**
+  - **同梱バイナリは 336 MB** で、`bin/codex` のほか **`bwrap` (サンドボックス)・`zsh`・`rg`** を含む。Landlock の allowlist と依存の重さの両方に効く。`codex_bin` でシステム側 CLI を指せば回避できるが、「clone + init で動く」原則から外れる — **どちらを採るかはプラン 10 で裁定**
+
+- **⚠ 両 SDK のサンドボックス特性は正反対だった (2026-08-11 同一条件で実測)**。空 cwd を与え、①cwd への書き込み ②`/etc/passwd` 読み ③`ls ~` を試した結果:
+
+  | | **codex** (`Sandbox.read_only` + `deny_all`) | **claude-agent-sdk** (`allowed_tools=["Bash"]`) |
+  |---|---|---|
+  | cwd への書き込み | **blocked** (読み取り専用 FS) | **成功** (`probe.txt` が実際に作られた) |
+  | cwd 外の読み取り | 通る | 通る |
+  | SDK 層のサンドボックス | **実効** (独自機構。`bwrap` は経由していなかった) | **無し** (素の bash) |
+  | シェルの起動形 | `bash -c "cmd"` (使い捨て) | **`bash -c -l`** (ログインシェル) |
+  | ツールの無効化 | **できない** (シェルは常にある) | `allowed_tools=[]` で**ゼロにできる** |
+
+  - **claude は「ツールの有無」を制御でき、codex は「権限」を制御できる。** 改善ループはシェルを必要とする (pytest) ので、**効くのは後者の軸**である。`Sandbox.workspace-write` + `cwd=plugins/` にすれば「**plugins/ にだけ書ける**」が SDK 層で宣言的に成立し、Landlock がその上の二重防御になる。claude 側は Bash/Write を許可した時点で **Landlock だけが唯一の防御線**になる
+  - **claude 側の追加要件 (新規発見)**: `setting_sources=[]` / `strict_mcp_config=True` / `plugins=[]` を指定しても、**Bash ツールは `bash -c -l` (ログインシェル) を起動し `~/.claude/shell-snapshots/` を読み込む**。既存の隔離オプションは**シェル環境までは覆わない**。改善 worker がユーザーの shell rc 環境を継承するため、**env を明示的に組み立てる等の対処をプラン 10 の要件に含めること**
+  - **プロセス階層が深くなる (実測)**: `worker → codex/claude CLI → (code-mode-host) → bash → 実コマンド`。プラン 8 の `WorkerSettings` (resource limit) と**停止シーケンス (`start_new_session=True` + `killpg`) の再検証が要る** — CLI 自身が子を作るため二重になる
 
 - **ClaudeRunner の実測結果 (2026-08-11、本設計時に確認済み)**:
   - `claude-agent-sdk` 0.2.134 の依存は `anyio` / `mcp` / `sniffio` のみで **`anthropic` SDK を含まない**。`shutil.which("claude")` で **CLI をサブプロセス起動する**構造であり、**サブスク認証で完動する** (`ANTHROPIC_API_KEY` 未設定で応答を得た)。設計書 §4「Claude Agent SDK」と CLAUDE.md「`claude -p`」は**矛盾しない** — SDK は CLI のラッパである
