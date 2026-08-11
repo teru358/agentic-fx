@@ -9359,11 +9359,37 @@ def test_alert_state_rejects_unknown_key(tmp_path):
 
 ```python
 def test_streak_id_is_previous_accepted_open_id(tmp_path):
+    """⚠️ 旧版は accepted を **1 行**しか作らず `(accepted, 2, "risk_gate")` を
+    見ていたため、2 つの穴があった (ローカル LLM muse-glimmer が検出し、
+    指揮者が実 SQLite で裏取り):
+
+    ① accepted が 1 行だと `MAX(id)` と `MIN(id)` が同値になり、**`MAX`→`MIN`
+       変異が生き残る**。この変異は致命的で、`MIN` だと streak_id が最初の
+       accepted に固定され続け、**accepted が入っても連続が切れなくなる**
+       (= 取引できているのに通知が鳴り続ける)。accepted を **2 行**作って
+       初めて区別できる (実測: MAX=3→count 2 / MIN=1→count 3)。
+    ② `risk_gate` 1 件・`execution` 1 件は**同数タイ**であり、SQL ③ の
+       `ORDER BY c DESC LIMIT 1` の勝者は SQLite 任せで**非決定的**。
+       支配的カテゴリを assert するなら**差を付ける**こと。
+    """
     c = _conn(tmp_path)
-    accepted = _intent(c, "open", "accepted", None)
+    _intent(c, "open", "accepted", None)                 # 古い accepted (id=1)
+    _intent(c, "open", "rejected", "risk_gate")          # これは数えてはいけない
+    accepted = _intent(c, "open", "accepted", None)      # 最新 accepted (id=3)
+    _intent(c, "open", "rejected", "risk_gate")
+    _intent(c, "open", "rejected", "risk_gate")
+    _intent(c, "open", "rejected", "execution")          # risk_gate 2 : execution 1
+    assert gate_reject_streak(c) == (accepted, 3, "risk_gate")
+
+
+def test_dominant_category_is_the_majority_not_a_tie(tmp_path):
+    """支配的カテゴリが**多数派**で決まることを単独で pin する
+    (上のテストと検査目的が別。タイでの非決定性を持ち込まないため件数に差を付ける)。"""
+    c = _conn(tmp_path)
     _intent(c, "open", "rejected", "risk_gate")
     _intent(c, "open", "rejected", "execution")
-    assert gate_reject_streak(c) == (accepted, 2, "risk_gate")
+    _intent(c, "open", "rejected", "execution")
+    assert gate_reject_streak(c)[2] == "execution"
 
 
 def test_streak_count_does_not_filter_reject_category(tmp_path):
@@ -9620,6 +9646,8 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | `_notify_gate_reject_streak` を `_scheduler_tick_once` / maintenance から呼ぶ | **`test_scheduler_tick_never_notifies_gate_reject_streak`** (旧 `test_gate_alert_notifier_is_never_called_on_scheduler_thread` は vacuous で**この変異を殺せなかった** — ローカル LLM レビューで検出) |
 | commit-post から `_notify_gate_reject_streak` の呼び出しを削除する (どこからも呼ばない) | **`test_commit_post_notifies_gate_reject_streak`** (上の否定側テストだけでは「呼ばない実装」が生存するため対で持つ) |
 | migration を 2 回目に no-op でなく再実行し既存行を壊す | **`test_trade_intents_migration_is_idempotent`** (旧版は空 DB で `COUNT(*)==0` を見るだけで**この変異を殺せなかった**) |
+| SQL ① の `MAX(id)` を `MIN(id)` に変える (**変異リストに無かった追加分**。`MIN` だと streak_id が最初の accepted に固定され、accepted が入っても連続が切れず鳴り続ける) | **`test_streak_id_is_previous_accepted_open_id`** (旧版は accepted 1 行で `MAX`/`MIN` が同値になり**生存していた** — ローカル LLM が検出) |
+| SQL ③ の `ORDER BY c DESC` を `ASC` に変える (**追加分**) | **`test_dominant_category_is_the_majority_not_a_tie`** (件数に差を付けて非決定性を排したので殺せる) |
 | commit-post helper の `except Exception` を外す（evaluate） | `test_commit_post_alert_exception_never_changes_finalized_mission_to_failed[evaluate]` |
 | commit-post helper の `except Exception` を外す（notify） | `test_commit_post_alert_exception_never_changes_finalized_mission_to_failed[notify]` |
 | commit-post helper の `except Exception` を外す（state update） | `test_commit_post_alert_exception_never_changes_finalized_mission_to_failed[state_update]` |

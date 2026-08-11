@@ -133,7 +133,7 @@ WHERE o.status='closed' AND r.order_id IS NULL ORDER BY o.id LIMIT ?
 - `trade_intents` に **`action TEXT`** と **`reject_category TEXT`** を追加する (migration)
 - **`action` は `store/intents.py` の `insert(...)` に必須引数として渡す** (codex 2 周目 I2)。現行の `insert(conn, mission_id, payload: dict, now)` は `TradeIntent` ではなく**任意の dict** を受けるため、「`intent.action` から書く」だけでは書き込み契約が閉じない。payload から再抽出せず**呼び出し側に明示させる** (`executor.py:355` の唯一の呼び出し点)。**既存行の `action` は NULL を許す** — 移行前の行は集計対象外として扱う (集計クエリが `action='open'` で絞るので自然に除外される)
 - **`reject_category` の書き込み点は `store/intents.py` の `set_gate_result(...)` ただ 1 つ**である。**既定値の無い必須引数**にして、全呼び出し点に種別の申告を強制する
-  - **呼び出し点は 2026-08-11 時点で 23 箇所** (`core/executor.py` + `loops/trade_loop.py:318`)、**うち 4 箇所は `accepted=True`** である。件数を設計書に固定値として書かない — 実装時に全 call site を機械的に列挙すること (codex 2 周目 M1: 初稿の「10 箇所」は実コードと不一致だった)
+  - **呼び出し点は 2026-08-11 時点で 21 箇所** (`core/executor.py` + `loops/trade_loop.py:318`)、**うち 4 箇所は `accepted=True`** である。件数を設計書に固定値として書かない — 実装時に全 call site を機械的に列挙すること (codex 2 周目 M1: 初稿の「10 箇所」は実コードと不一致だった)
   - **組み合わせ制約 (codex 2 周目 I1)**: `reject_category` は**引数としては常に必須**とし、値は **`accepted=True` のとき必ず `None`** / **`accepted=False` のとき必ず 4 値のいずれか** (`risk_gate` / `origin` / `mission` / `execution`) とする。この対応は**DB の CHECK 制約でも固定する**。ただし **`action IS NULL` の移行前既存行を必ず除外する (codex 3 周目 I1)** — legacy 行は `gate_result='rejected'` を持ちながら `reject_category` が NULL なので、素朴な CHECK では**テーブル再構築時のコピーで移行そのものが落ちる**:
 
 ```sql
