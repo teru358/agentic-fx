@@ -507,21 +507,25 @@ def test_reflection_mission_failed_ref_id_is_order_id(tmp_path):
 
 
 def test_reflection_failure_event_write_error_is_caught_at_the_event_site(
-        tmp_path, caplog):
+        tmp_path):
     """Task 4 / 段 0 の生存変異: `reflection_mission_failed` の書込みが
-    例外を投げても reflection 経路は止まらず、**その例外は event 書込みの
-    場所で捕まる**。
+    例外を投げても、その例外は **event 書込みの場所で捕まる**。
 
-    ⚠️ **「経路が止まらないこと」だけを見る形では、この防御を測れない。**
-    `run_pending` は per-item isolation の `except Exception` を別に持つ
-    ため、実装の `try/except` を丸ごと外しても `run_pending() == 0` と
-    `reflections.get(...) is None` は**どちらも変わらない**
-    (指揮者が実測: フルスイート 1776 passed のまま生存)。防御が二重に
-    なっているぶん、外側の観測点では差が出ない。
+    ⚠️ **`run_pending()` 越しに「経路が止まらないこと」だけを見る形では、
+    この防御を測れない。** `run_pending` は per-item isolation の
+    `except Exception` を別に持つため、実装の `try/except` を丸ごと外しても
+    戻り値も `reflections` 行も変わらない (指揮者が実測: フルスイート
+    1776 passed のまま生存)。防御が二重になっているぶん、外側の観測点では
+    差が出ない。
 
-    そこで **どちらの層が捕まえたかをログで区別する**。event 書込み側の
-    ガードが消えると、例外は per-item isolation まで昇格し、
-    `"failed to record reflection_mission_failed"` が出なくなる。
+    そこで **per-item isolation を経由しない `_reflect_one` を直接呼ぶ**。
+    event 書込み側のガードが消えれば、例外はここまで漏れてくる。
+
+    (最初は「どちらの層が捕まえたか」をログ文言で区別する形にしたが、
+    `caplog.at_level(logger=...)` は指定 logger のレベルを変えるだけで
+    handler は root に付くため、`setup_technical_logging()` が親
+    `agentic_fx` を `propagate=False` にした後に走るとログが届かない —
+    テスト順序に依存する pin になっていた。1 周目 codex 指摘 M5。)
 
     層が縮退する (= 例外が本経路を巻き込んでから捕まる) と、将来 event
     書込みの後ろに処理を足したときに、その処理が黙って飛ばされる。"""
@@ -529,6 +533,8 @@ def test_reflection_failure_event_write_error_is_caught_at_the_event_site(
         "failed", None, [], reason="context exceeded: prompt 1 tokens "
                                    "> n_ctx 2 (model=m)")])
     oid = _closed_order(conn)
+    row = dict(conn.execute(
+        "SELECT * FROM orders WHERE id=?", (oid,)).fetchone())
 
     real_write = cyc.activity.write
 
@@ -539,15 +545,11 @@ def test_reflection_failure_event_write_error_is_caught_at_the_event_site(
 
     cyc.activity.write = exploding_write
 
-    with caplog.at_level(logging.ERROR, logger="agentic_fx.reflection"):
-        assert cyc.run_pending() == 0
-
+    # ガードが消えていればここで OSError が漏れる (per-item isolation は
+    # run_pending 側にあり、この呼び出しでは効かない)。
+    assert cyc._reflect_one(row) is False
     assert reflections.get(conn, oid) is None
-    messages = [r.getMessage() for r in caplog.records]
-    assert any("failed to record reflection_mission_failed" in m
-               for m in messages), messages
-    # per-item isolation まで昇格していないこと (= 本経路を巻き込んでいない)。
-    assert not any("per-item reflection failed" in m for m in messages), messages
+    rag.add_reflection.assert_not_called()
 
 
 @pytest.mark.parametrize("status", ["failed", "timeout", "max_turns"])
