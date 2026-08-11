@@ -1713,3 +1713,61 @@ def test_worker_runner_tolerates_unknown_keys_in_result_frame(
     assert result.status == "completed"
     assert result.output == {"x": 1}
     assert result.reason == "some reason"
+
+
+def test_worker_runner_reason_defaults_to_none_for_legacy_result_frame(
+        tmp_path, monkeypatch):
+    """Task 3 / 1 周目の生存変異 X1: `reason` キーを持たない result
+    フレーム (例外パスの `error` フレーム・プラン 8 以前の子) では
+    `MissionResult.reason` が **None のまま**であることを固定する。
+
+    `payload.get("reason")` を `payload.get("reason", "")` に緩める変異は
+    既存 9 件の後方互換テストをすべて素通りする (指揮者が実測)。既存
+    テストは reason を assert しないため、空文字が入り込んでも気づけない。
+    Task 1 の契約は「reason の既定は None」であり、`is None` で診断の
+    有無を判定する呼び出し側はこの差で壊れる。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        # mission_worker の例外パスが送る形 (reason は無く error を持つ)。
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "failed", "output": None,
+                                "error": "RuntimeError: boom"})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "failed"
+    assert result.reason is None
