@@ -151,7 +151,7 @@
 | 12 | approval 最新決定優先 | 設計書 §7: kind=plugin の (name, content_hash) 単位で承認取り消しを成立させる |
 | 13 | `signals.claimed_by_mission_id` FK | 設計書 §12: migration + 配線不整合の書き込み時検出 |
 | 15 | reflection の再試行ポリシー | 独立起票①: 恒久失敗 order の starvation と `missions` 行の無制限増大 |
-| 16 | `ohlcv` 保持ポリシー | 独立起票②: `DELETE` も保持ポリシーも無い (1 ペア 1 日 1,440 行) |
+| 16 | **`ohlcv` 分割** + 保持ポリシー | 独立起票②: `DELETE` も保持ポリシーも無い (1 ペア 1 日 1,440 行)。**`ohlcv_cache` / `ohlcv_history` に分割**し、キャッシュ削除が履歴に到達できないことを構造で保証する (設計書 §12 改訂・ユーザー承認 2026-08-11) |
 | 17 | `gate_rejected` の可観測性 | Task 20 申し送り③: 集計も通知も無く「健全に見えるが取引しない」が誰にも上がらない |
 | 18 | `llama_swap.timeout_sec` 実測 | Task 20 申し送り②: **設計ではなく計測 task**。TTL unload 後の cold load 込み初回が未計測 |
 | 19 | `improvement_runs` の PR 列 | 設計書 §12: `result='pr'` / `pr_url` の扱い (残置 or migration) を裁定し反映 |

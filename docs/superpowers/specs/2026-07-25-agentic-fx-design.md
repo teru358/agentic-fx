@@ -291,7 +291,7 @@ Risk Gate・sizing・kill switch・取引モードの承認ゲートは一切迂
   - risk gate → intent 却下 (理由に換算不能を明記)
   - executor open → gate 却下と同経路
   - **scheduler の予約再検証 → 当該ペアの pending_fill を取消す**。根拠: 未約定指値は「将来の債務」であり、口座通貨でその大きさを見積もれなくなった予約を残すのは、口座情報欠損時に全 pending を取消す既存の裁定と非対称になる。取消はペア単位に限定する (他ペアの予約は健全なレートで再検証を継続)。取消不能は既存の `cancel_unknown` → 新規停止に接続
-- **資金保護に使うレートは保守側** (codex 指摘 D-M4): 損失・リスク・notional の口座通貨換算には**口座通貨額を過小評価しない側** (直接ペアなら ask、逆数なら 1/bid、クロスは脚ごとに保守側) を使う。**口座通貨換算レートとしての** mid は表示・分析用に限る (§6 バックテストの「ohlcv 本体 = mid 基準」は銘柄の OHLC 表現の話であり、この規則とは適用対象が別)
+- **資金保護に使うレートは保守側** (codex 指摘 D-M4): 損失・リスク・notional の口座通貨換算には**口座通貨額を過小評価しない側** (直接ペアなら ask、逆数なら 1/bid、クロスは脚ごとに保守側) を使う。**口座通貨換算レートとしての** mid は表示・分析用に限る (§6 バックテストの「価格データ本体 = mid 基準」は銘柄の OHLC 表現の話であり、この規則とは適用対象が別)
 - **ペーパー (学習モード)**: `account_currency` が損益集計とエクイティの基準
 - **実取引 (Phase 3)**: **MT5 口座の通貨が真**。起動時に口座通貨を照会し、`account_currency` と**不一致なら起動拒否** (config が JPY で口座が USD なら全サイジングが約 150 倍ずれるため)。設定値は照合用であり、実行時は口座側を使う。**銘柄仕様 (contract_size / volume 制限 / 通貨) も同様に照会して静的テーブルと照合し、不一致なら起動拒否** — 2026-07-29 の実測で静的テーブルの `max_lot=50` がブローカー実値 `10.0` と不一致だったのが実例 (contract_size 100,000 と通貨は一致)。MT5 `order_calc_profit` は自前換算の**検証オラクル**として使う (実行時経路にはしない — バックテストに MT5 は無いため二重実装を避ける)
 
@@ -442,7 +442,7 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 |---|---|---|
 | 1 | バックテストツールの期間指定 | エージェント向け API は**期間を受け取らない**。返すのは in-sample の集計結果のみ (期間の端点も返さない) |
 | 2 | ホールドアウト実行 | **エージェントが駆動しない採用ゲート側**でハーネスが実行する。エージェントからは起動できない |
-| 3 | 履歴 DB への直接アクセス | 改善ループのツールに**任意 SQL・`ohlcv` テーブルの直接読み取りを持たせない**。成績 DB 読取は集計済みビューに限る |
+| 3 | 履歴 DB への直接アクセス | 改善ループのツールに**任意 SQL・`ohlcv_history` / `ohlcv_cache` の直接読み取りを持たせない**。成績 DB 読取は集計済みビューに限る |
 | 4 | ファイル経由の迂回 | 改善ループの**書き込みは `plugins/` と `reports/` のみ** (リポジトリ本体は読取のみ — §6 許可ツール)。`data/` (DB・履歴・RAG) は読み書きとも対象外にする |
 | 5 | plugin 経由の迂回 | plugin はサンドボックスのサブプロセスで実行され、**入力 DataFrame はハーネスが与える**。plugin 自身が履歴を取りに行く経路は I/O 禁止・import allowlist で既に塞がれている (§6 サンドボックス実行) |
 | 6 | 取引 loop ツールの流用 | `get_ohlcv(pair, timeframe)` が直近 100 本固定で期間引数を持たないのは**意図的な性質**であり維持する。`get_signals(pair, since)` の `since` も最大 lookback を設ける (下記) |
@@ -478,7 +478,7 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 
 #### 実行アーキテクチャ (2026-08-01 確定)
 
-- **BacktestRunner** (コア所有の新モジュール) が組み立てる: `ReplayClock` (`Clock` 実装 — 履歴の 1m 格子に沿って進む) / `bars_fn`・`quote_fn`・`spec_fn` = `ohlcv` テーブルからの履歴供給 / intent 生成元 = strategy plugin の閉じた提案
+- **BacktestRunner** (コア所有の新モジュール) が組み立てる: `ReplayClock` (`Clock` 実装 — 履歴の 1m 格子に沿って進む) / `bars_fn`・`quote_fn`・`spec_fn` = `ohlcv_history` テーブルからの履歴供給 / intent 生成元 = strategy plugin の閉じた提案
 - DB は **in-memory SQLite に `init_db`** して実行毎に使い捨てる。実 DB (`data/agentic.db`)・実 `data/state/` には一切触れない。risk gate・sizing・約定判定 (`check_limit_fill` / `check_exit`)・executor・scheduler は実運用と同一コードを通す
 - strategy の評価タイミングは「plugin が宣言した timeframe のバー確定毎」。約定・SL/TP 判定は 1m バー (実運用互換)
 - **§5 の起動元検証を無効化しない**: BacktestRunner は strategy 判定毎に in-memory DB へ `loop='trade'` の **synthetic Mission 行を作成**し、intent は通常どおり `origin=SCHEDULER` + `mission_id` 実在 + `loop='trade'` の検証を**同一コードで通す**。executor の検証を注入で置換・緩和する実装は不可 (in-memory DB は実 DB と分離されているため、この synthetic 行が実運用の境界を弱めることはない)
@@ -489,10 +489,10 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 
 #### 履歴データ (2026-08-01 実測を反映)
 
-- 保存先は実運用と同じ **`ohlcv` テーブルを共有**し、`source` 列で由来を区別する。**取り込み経路だけ分離**: 実運用 = 逐次キャッシュ (yfinance / Phase 3 MT5)、バックテスト = **一括インポータ** (コア所有 CLI。エージェントのツールには載せない)
+- 保存先は **`ohlcv_history` テーブル** (実運用の逐次キャッシュ `ohlcv_cache` とは**別テーブル**。裁定は §12)。`source` 列で由来 (`dukascopy` / `mt5`) を区別する。**取り込み経路も分離**: 実運用 = 逐次キャッシュ (yfinance / Phase 3 MT5)、バックテスト = **一括インポータ** (コア所有 CLI。エージェントのツールには載せない)
 - **一意キーは `(symbol, interval, bar_time, source)`** (Phase 2 で migration)。同一時刻の別ソース行は共存であり上書きも重複拒否もしない。**BacktestRunner と履歴分析の全履歴クエリは単一 `source` の指定を必須**とする — 「ソース混在禁止」を宣言でなくクエリ契約で強制する
 - **長期 1m の一次ソース = Dukascopy** (無料公開、10 年超、bid/ask 両系列)。**直近の照合用 = MT5** (実口座と同一価格系。2026-08-01 実測の深度: 1m ≈ 3 ヶ月 / 5m ≈ 16 ヶ月 / 15m ≈ 4 年 / 1h ≈ 10 年 / 4h・1d ≈ 16 年超、価格は bid のみ)。yfinance はバックテストには使わない
-- **`ohlcv` 本体の基準価格は mid** とする (現行の約定判定 `bar ± half-spread` が「バー = mid」を前提に書かれているため)。変換式: Dukascopy は `mid = (bid + ask) / 2` で OHLC を構成し、**`spread` 列 (nullable) にバー内平均 (ask−bid) を記録**。MT5 (bid のみ) は mid 近似としてそのまま保存 (spread NULL — 系統誤差 ≈ half-spread は下記照合の但し書きに含める)。spread の単位は**クォート通貨の価格単位** (pips ではない)。欠損時は settings の **symbol 別**固定値にフォールバックし、フォールバックが使われた実行はその旨を結果に品質注記する
+- **価格データ本体 (両テーブル) の基準価格は mid** とする (現行の約定判定 `bar ± half-spread` が「バー = mid」を前提に書かれているため)。変換式: Dukascopy は `mid = (bid + ask) / 2` で OHLC を構成し、**`spread` 列 (nullable) にバー内平均 (ask−bid) を記録**。MT5 (bid のみ) は mid 近似としてそのまま保存 (spread NULL — 系統誤差 ≈ half-spread は下記照合の但し書きに含める)。spread の単位は**クォート通貨の価格単位** (pips ではない)。欠損時は settings の **symbol 別**固定値にフォールバックし、フォールバックが使われた実行はその旨を結果に品質注記する
 - **平均 spread の限界を明記**: バー内で spread が拡大した瞬間の SL 到達はバー平均では楽観化される。`spread` 列は導出値であり、bid/ask 原系列は Dukascopy から再導出可能 — 将来 bid/ask の 1m OHLC 二系列保持へ拡張できる入力契約にしておく
 - **インポータの正規化契約**: タイムスタンプは UTC に正規化 (バー開始時刻)、1m への集約境界は UTC 分境界、volume はソース定義のまま保存 (意味はソース依存 — 比較に使わない)、異常値 (負値・bid>ask) は棄却してログ。入力ファイル形式 (CSV / バイナリ tick) は実装判断
 - **既存行は不変 (再現性の根拠)**: 冪等 upsert の意味は「同一キー `(symbol, interval, bar_time, source)` への同一値の再挿入は無変更」であり、**既存行と値が異なる入力は上書きせず棄却してログ**する。確定した履歴バーは書き換わらない — この不変性があって初めて「期間端点 + source でデータ側の再現性が担保される」(下記 `backtest_runs`) が成立する
@@ -512,7 +512,7 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 
 - 指標: 取引数 / PF / 勝率 / 平均 R / 最大 drawdown (equity 基準) / 総損益 (口座通貨) / 対象期間・timeframe
 - **30 取引未満は「評価不能」** — 足切りにも採用にも使わない (既定: 観察としてバックログへ)
-- 新テーブル **`backtest_runs`** (§12)。**再現に必要な入力を保存する**: plugin 識別 (パス + コンテンツハッシュ)・kind・pair・timeframe・source・**期間端点**・**scope** (下記)・指標 JSON・**設定スナップショット hash** (risk gate / sizing / spread フォールバック / 手数料 / 初期資金を含む)・**コア実装の git commit**・初期資金・created_at。ohlcv は既存行不変 (上記「インポータの正規化契約」) + 単一 source 契約なので、期間端点 + source でデータ側の再現性は担保される
+- 新テーブル **`backtest_runs`** (§12)。**再現に必要な入力を保存する**: plugin 識別 (パス + コンテンツハッシュ)・kind・pair・timeframe・source・**期間端点**・**scope** (下記)・指標 JSON・**設定スナップショット hash** (risk gate / sizing / spread フォールバック / 手数料 / 初期資金を含む)・**コア実装の git commit**・初期資金・created_at。`ohlcv_history` は既存行不変 (上記「インポータの正規化契約」) + 単一 source 契約なので、期間端点 + source でデータ側の再現性は担保される
 - **`scope` は 3 値**: `in_sample` (改善ループのツールが発行) / `holdout_gate` (採用ゲートが発行) / `human_custom` (人間 CLI の任意期間実行)。**改善ループの読み取りビューは `scope='in_sample'` かつハーネス発行行のみ**を許可する — 人間の任意期間実行が二値分類のどちらかに紛れて holdout 情報の迂回路になるのを防ぐ
 - 「バックテスト成績は実運用成績の予測値ではない (足切り専用)」の注記は結果表示にも焼き込む
 
@@ -527,11 +527,11 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 #### spread・手数料・スリッページ
 
 - 執行モデルは現行ペーパー broker と完全同一 (half-spread 判定・limit は価格保証・SL は不利方向判定)。バックテスト専用の執行仮定を作らない
-- spread は `ohlcv.spread` (実測列) → 無ければ settings の固定値。手数料は OANDA (スプレッド込み・コミッション 0) 前提で 0 と明記し、Phase 3 で broker 設定化する
+- spread は `ohlcv_history.spread` (実測列) → 無ければ settings の固定値。手数料は OANDA (スプレッド込み・コミッション 0) 前提で 0 と明記し、Phase 3 で broker 設定化する
 
 ### 履歴分析: trade 対象 × watch 銘柄の相関調査 (Phase 2)
 
-バックテスト (執行シミュレーション) とは別の機能として、同じ履歴基盤 (`ohlcv` + 一括インポータ + ホールドアウト遮断) の上に置く。消費者は**改善ループ (indicator / signal の設計材料) と人間**。取引判断 loop のツールには載せない (最小ツールセット維持)。
+バックテスト (執行シミュレーション) とは別の機能として、同じ履歴基盤 (`ohlcv_history` + 一括インポータ + ホールドアウト遮断) の上に置く。消費者は**改善ループ (indicator / signal の設計材料) と人間**。取引判断 loop のツールには載せない (最小ツールセット維持)。
 
 - **watch 銘柄**: `datafeed.watch_symbols` (§12) — **取引不可・分析専用**のシンボル集合 (例: EURUSD・EURJPY・XAUUSD・主要株価指数)。取引ツールの pair enum には決して入れない。`pairs` (取引対象) とは独立で、watch の追加は取引対象の拡大ではない (§16 のマルチアセット非スコープとも矛盾しない)
 - **初期リストは導入時に確定するが、選定基準は先に固定する**: ①Dukascopy で取得可能 ②履歴 10 年以上 ③許容欠損率 (市場オープン時間に対する欠損バー比、**初期 5%**) を満たす ④分析はソース統一 (下記) ⑤**最大銘柄数の上限** (初期 10) — 候補の恣意的追加が多重比較の試行数を膨らませるのを防ぐ。③⑤の値は config (コア所有)
@@ -540,7 +540,7 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 - **分析 1 回につき単一 source を必須**とする (バックテストと同じクエリ契約)。整列は UTC バー境界の inner join (共通観測時刻のみ)、欠損バーは除外、市場休場は共通除外 — 取引時間・欠損・bid/mid の差が見せかけの lead-lag を作るのを防ぐ
 - **使い方の規律**: 相関は**発見的材料**であり、採用根拠にしない。相関から作った indicator は pytest、signal は検出精度、strategy はバックテストという**各種別の検証手段で別途検証**する。多重比較・見せかけの相関で「効く watch 銘柄」は必ず見つかってしまうため、相関値そのものを成績として扱わない
 - **探索履歴の自動記録**: 相関探索の実行毎にパラメータ (候補集合・timeframe・window・lag 範囲) と試行数を **`analysis_runs` テーブル (§12)** に保存し、そこから生まれた plugin 提案の改善レポート / approval payload に**参照した `analysis_run_id` 群・探索数・選択理由を添付**する — 「多重探索後の最大値を選んだ」事実を人間レビューが判定できるようにする。統計的補正 (FDR 等) は参考値として表示するに留め、採用条件にはしない
-- watch 銘柄の長期履歴も Dukascopy インポータの対象 (FX・貴金属・指数をカバー)。`ohlcv` に同居 (symbol + source で区別)
+- watch 銘柄の長期履歴も Dukascopy インポータの対象 (FX・貴金属・指数をカバー)。`ohlcv_history` に同居 (symbol + source で区別)
 - 将来の接続余地 (注記のみ): indicator plugin の入力 DataFrame に watch 銘柄のバーを含める拡張 — plugin 機構の設計時に判断する
 
 ## 7. 承認ゲートと操作 REST API
@@ -723,7 +723,7 @@ agentic-fx/
 │   │   └── notifier.py        # Discord webhook (移植)
 │   ├── backtest/              # ── バックテスト + 履歴分析 (Phase 2、§6) ──
 │   │   ├── runner.py          # BacktestRunner (ReplayClock + in-memory DB + tick 再生)
-│   │   ├── importer.py        # 一括インポータ (Dukascopy / MT5 → ohlcv。コア所有 CLI)
+│   │   ├── importer.py        # 一括インポータ (Dukascopy / MT5 → ohlcv_history。コア所有 CLI)
 │   │   ├── holdout.py         # 分割点計算 + in-sample 制限 (コア所有 — 変更は人間レビュー必須)
 │   │   └── analysis.py        # 相関調査 (リターン/ローリング/lead-lag。集計値のみ返す)
 │   ├── store/                 # ── ストレージ層 ──
@@ -778,7 +778,21 @@ agentic-fx/
 
 | テーブル | 内容 |
 |---|---|
-| `ohlcv` | 価格データ (symbol, interval, bar_time, OHLCV, source, **spread** (nullable — Dukascopy 取り込み時のバー内平均 ask−bid。無いソースは NULL、§6 バックテスト))。**一意キーは (symbol, interval, bar_time, source)** (Phase 2 で migration — 本体価格は mid 基準、§6)。実運用の逐次キャッシュとバックテスト用一括インポートが同居し、履歴クエリは単一 source 指定を必須とする。watch 銘柄 (§6 履歴分析) も symbol として同居 |
+| `ohlcv_cache` | **実運用の逐次キャッシュ専用** (symbol, interval, bar_time, OHLCV, source)。source はライブチェーンの永続化名 (`yfinance` / `twelvedata` / `mt5-live`) のみ。**保持ポリシーの対象** (§12「キャッシュの保持」)。`spread` 列は持たない (ライブ経路は埋めない) |
+| `ohlcv_history` | **バックテスト・履歴分析専用** (同カラム + **`spread`** (nullable — Dukascopy 取り込み時のバー内平均 ask−bid。無いソースは NULL、§6))。通常の書き手が受理する source は一括インポータの名前 (`dukascopy` / `mt5`) のみ (migration 由来の未知 source は**隔離して保持され得る** — §12 の移行方針)。**削除しない**。watch 銘柄 (§6 履歴分析) も symbol として同居 |
+
+**一意キーはどちらも (symbol, interval, bar_time, source)**。本体価格は mid 基準 (§6)。履歴クエリは単一 source 指定を必須とする。
+
+**キャッシュと履歴をテーブルで分ける (裁定 2026-08-11)**。旧設計は 1 つの `ohlcv` に両者を同居させ `source` 列で区別していたが、**キャッシュに保持ポリシー (削除) を入れる時点でこの同居は危険になる**:
+
+- 永続化名が **`mt5-live` (ライブ) と `mt5` (一括インポート)** で 1 文字違いであり、`source` を見ずに削除すると**再取得に数時間かかる履歴を無音で破壊する**。失敗が非対称 (キャッシュ消失は次の tick で回復、履歴消失は回復不能) なので、**規約とテストではなく構造で守る**
+- 分離すれば「キャッシュの削除は履歴に到達できない」が**設計上の事実**になる。improve worker に DB パスを渡さないことで遮断を成立させたのと同じ思想 (§4.6)
+- **境界は実際に割れている**: plugin 採用ゲートは評価 source を `dukascopy` に固定し、source 間の照合 (`compare_sources`) は `dukascopy` × `mt5` の履歴同士、キャッシュ経路はライブチェーンの source しか読まない。**両テーブルを跨いで読む経路は存在しない**
+- 副次的に、`spread` 列がキャッシュ側で常に NULL になる不整合が消える (`VACUUM` は **SQLite では database 単位でありテーブル単位では掛けられない** — キャッシュだけを vacuum したければ**別 DB ファイルへの物理分離**が要る。本裁定はテーブル分離までに留める)
+
+**書き分けは API で強制する**: 書き込み関数をテーブルごとに分け (キャッシュ書き込み / 履歴インポート)、**それぞれが受理する source 名を検証する**。呼び出し側がテーブルを引数で選ぶ形にはしない (誤爆の余地を API 層へ移すだけになる)。
+
+**キャッシュのバックテストは対象外**とする。キャッシュは保持期間 (既定 30 日) で刈られるため最低取引数 (30) を満たす標本にならず、「直近の判断材料」であって履歴ではない。人間 CLI のバックテスト・履歴分析は**履歴テーブルのみ**を対象とする。キャッシュから履歴への「昇格」が必要になったら別途設計する (現時点では YAGNI)。
 | `missions` | 全 Mission 実行記録 (loop 種別, runner, status, output_json, transcript_json, **trigger**)。`trigger` は**取引判断 Mission の起動理由** (`cron` / `signal:<plugin>`) で、シグナル起動 Mission の成績を後から比較するための監査列 (§5)。**`loop='trade'` 以外 (ask/improve/reflection) では意味を持たないため `NULL`** とし、集計は必ず `loop='trade'` で絞る (全 loop に既定 `cron` を入れると「cron 起動の ask Mission」という無意味な行が生まれる) |
 | `trade_intents` | LLM の全出力 + risk gate 判定 (accepted / rejected + 却下理由) |
 | `orders` | ポジション/指値の状態機械 (下記)。主要カラム: intent_id (FK), approval_id (FK, 取引モード手動承認時), **client_order_id** (送信前に永続化する冪等キー), entry_type, horizon (day/swing), **quantity / filled_quantity / remaining_quantity / avg_fill_price** (部分約定対応), SL/TP, requested_price / close_price, fees_swap, **broker_order_id / broker_position_id** (MT5 では注文と建玉が別 ID になり得る), broker_synced_at (reconcile 最終照合時刻), realized_pnl, close_reason, created_at / updated_at / filled_at / closed_at |

@@ -77,10 +77,28 @@ WHERE o.status='closed' AND r.order_id IS NULL ORDER BY o.id LIMIT ?
 
 `mt5` と `mt5-live` が 1 文字違いで意味が正反対である。**symbol/interval/期間だけで prune すると、バックテストの履歴 (再取得に数時間かかる) を無音で消す。**
 
-したがって:
+**裁定 (2026-08-11、ユーザー承認): `ohlcv` を `ohlcv_cache` と `ohlcv_history` の 2 テーブルに分割する。** 設計書 §12 を改訂済み。
 
-- prune 対象 source は**ライブチェーン名から導出する** (`_storage_source(name) for name in ライブチェーン`)。リテラルの denylist を書かない — 単一の真実源から引く
-- **未知の source は決して prune しない** (fail-safe の向き)。新しいライブ source を足して prune 対象に入れ忘れた場合の帰結は「そのソースだけ増え続ける」(無害側)、逆向きの誤りは「履歴の破壊」(回復不能)。**非対称なので安全側に倒す**
+当初の設計は「prune 対象をライブチェーン名から導出し、未知 source は決して prune しない」という**規約 + 変異テスト**で履歴を守るものだった。これでも実害は防げるが、**構造で守れるなら構造で守る**方がこのプロジェクトの原則に合う (improve worker に DB パスを渡さないことで遮断を成立させたのと同型)。分割すれば **`DELETE FROM ohlcv_cache` は履歴に到達できない** — 規約ではなく設計上の事実になる。
+
+**今やる理由 (移行コストがゼロ)**: 実 DB は **116K・`ohlcv` 0 行**である (2026-08-11 実測)。分割は DDL の差し替えで済む。**後になるほど高くつく** (180 日運用で 161.9 MB)。
+
+**境界が実際に割れていることを実コードで確認済み** — 両テーブルを跨いで読む経路は存在しない:
+
+| 経路 | 読む source | 分割後 |
+|---|---|---|
+| plugin 採用ゲート | **`_EVAL_SOURCE = "dukascopy"` 固定** (`plugin/approval.py:86`) | 履歴のみ |
+| `compare_sources` | `dukascopy` × `mt5` (`backtest/mt5_import.py:155`) | 両方履歴・同一テーブル |
+| `PriceProvider._cached_bars` | ライブチェーンの source のみ | キャッシュのみ |
+| 人間 CLI `--source` | ユーザー指定 | **履歴のみを対象とする** (下記) |
+
+**設計の要点**:
+
+- **書き分けは API で強制する**。書き込み関数をテーブルごとに分け (キャッシュ書き込み / 履歴インポート)、**それぞれが受理する source 名を検証する** (キャッシュ側はライブチェーン名のみ、履歴側はインポータ名のみ)。**呼び出し側がテーブルを引数で選ぶ形にしない** — それでは誤爆の余地を prune から API 層へ移すだけになる
+- **prune は `DELETE FROM ohlcv_cache WHERE bar_time < cutoff` だけ**になり、source 絞りも「未知 source は消さない」fail-safe 分岐も**不要**になる
+- **キャッシュのバックテストは対象外**とする。キャッシュは保持期間 (既定 30 日) で刈られるため**最低取引数 30 を満たす標本にならない**。人間 CLI のバックテスト・履歴分析は履歴テーブルのみを対象とし、ライブ source 名を渡されたら **fail closed** (「キャッシュはバックテスト対象外」と明示エラー)。昇格経路は YAGNI として起票のみ
+- **`spread` 列はキャッシュ側に持たない** (ライブ経路は埋めないため常に NULL だった)
+- **移行**: 空 DB なら DDL 差し替え。**非空の既存 DB に備えて**、source 名でキャッシュ/履歴に振り分ける migration を書く。**未知の source は履歴側へ入れる** (fail-safe の向き — 履歴側は削除されないため、判断を誤っても失われない)
 - **保持期間の下限は読み込み窓から決まる**。spec ③ の `live_window_days(source, interval, lookback_days)` が要求する最大値を下回る保持期間は、キャッシュフォールバックを自ら壊す。config `datafeed.cache_retention_days` (既定 **30**) を設定検証にかけ、下回れば**起動拒否する** (`intervals` に `1m` 必須と同じ扱い。**黙って clamp しない** — 設定ミスを隠すため)
 
   **検証対象の集合を厳密に定める (codex C1)**。`live_window_days` は `lookback_days` を入力に取るので「全 intervals の最大値」だけでは値が定まらない:
@@ -97,7 +115,7 @@ WHERE o.status='closed' AND r.order_id IS NULL ORDER BY o.id LIMIT ?
 - **バッチは「追いつくまで毎 maintenance」実行する (codex I3)**。「1 日 1 回・残りは次回」にすると、削除 `LIMIT` が日次増分 (1m で 1 ペア 1 source あたり 1,440 行/日、ペア数 × source 数で乗算される) を下回った瞬間に**永久に追いつかず DB が増え続ける**。正しい定常状態の見立ては次のとおり: **初回 prune だけが大量削除**であり (既存 DB の蓄積分)、追いついた後の 1 回あたり削除量は「1 maintenance 間隔ぶんの増分」に落ちる。したがって**有界バッチ × 毎 maintenance で追いつくまで回す**なら、初回の lock 保持窓を抑えつつ定常では自明に容量が足りる。受入条件として「日次投入量 > 1 回のバッチ上限」でも蓄積が収束することをテストで示す
 - **ファイルサイズは `VACUUM` 無しでは縮まない** ことを明記する。自動 `VACUUM` は本 task のスコープ外 (長時間の排他が要るため)。運用手順として文書化する
 
-**変異**: prune の source 絞りを外す (→ `dukascopy`/`mt5` が消える。**このテストが最重要**) / 未知 source の除外を外す / 保持期間の設定検証を削除 / バッチ `LIMIT` を外す / maintenance の呼び出しを削除。
+**変異**: **prune の対象を `ohlcv_cache` から `ohlcv_history` に差し替える** (→ 履歴が消える。**このテストが最重要**。分割前は「source 絞りを外す」変異が担っていた検査点) / **キャッシュ書き込み関数に履歴 source 名 (`dukascopy`) を渡しても通るようにする** (→ source 検証の迂回) / **履歴インポートにライブ source 名を渡しても通るようにする** / migration の振り分けで未知 source をキャッシュ側に入れる (→ 削除されうる) / 保持期間の設定検証を削除 / バッチ `LIMIT` を外す / maintenance の呼び出しを削除 / 人間 CLI がライブ source を受理する。
 
 ### D3. `gate_rejected` の可観測性 (Task 17) — Task 20 申し送り③
 
@@ -348,14 +366,14 @@ GIT_INDEX_FILE=<tmp>  git write-tree             # → tree
 | **B** | 6 | monotonic 注入 + gather deadline (OPEN/**CLOSE 両方**) | spec ① | — |
 | B | 7 | deadline の脚伝播 (`to_account_rate` の `for spec in legs`) | spec ① | 6 |
 | **C** | 8 | 窓計算ヘルパ + floor (`1d` を含む) | spec ③ | — |
+| C | **16** | **`ohlcv` の 2 テーブル分割** + 保持ポリシー (**束 C の中に置く — 下記**) | D2 | 8 |
 | C | 9 | `lookback_days` 配線 (**既定値の推測禁止**) | spec ③ | 8 |
-| C | 10 | `_cached_bars` 窓適用 (**source 単位 try の中**) | spec ③ | 8, 9 |
+| C | 10 | `_cached_bars` 窓適用 (**source 単位 try の中**) | spec ③ | 8, 9, **16** |
 | C | 11 | 本番連鎖 E2E pin + 実データ実測 | spec ③ | 10 |
 | **D** | 12 | approval 最新決定優先 | D4 | — |
 | D | 13 | `signals.claimed_by_mission_id` FK migration | D5 | — |
 | D | 19 | `improvement_runs` の PR 列 migration | D7 | — |
 | **E** | 15 | reflection の再試行ポリシー | D1 | **4** (ピンを更新する) |
-| E | 16 | `ohlcv` 保持ポリシー | D2 | **8** (窓の最大値が保持期間の下限) |
 | E | 17 | `gate_rejected` の可観測性 (`trade_intents` 列追加 + `alert_state`) | D3 | — (ただし `executor.py` を触るため束 B の後) |
 | E | 18 | `llama_swap.timeout_sec` 実測 | D8 | — (計測のみ) |
 
@@ -363,9 +381,15 @@ GIT_INDEX_FILE=<tmp>  git write-tree             # → tree
 
 ```
 A ─┐
-C ─┴─ B ─┐
+C ─┴─ B ─┐          C = 8 → 16 → 9 → 10 → 11 (この順で直列)
 D ───────┴─ E   (E は A・C・D・B すべての後)
 ```
+
+**束 C の内部順序 — Task 16 (分割) を `_cached_bars` の改修より前に置く (codex 指摘)**。分割を後に回すと、Task 9〜11 を旧 `ohlcv` 前提で実装・単体テスト・E2E pin まで作った直後に、Task 16 が **API・fixture・SQL・assert を全面的に作り直す**ことになる (特に E2E テスト 11/12 は**保存先テーブルまで観測する**ので、そのままでは成立しない)。
+
+- **Task 16 は Task 8 のみに依存** (保持期間の下限計算に窓計算ヘルパを使う)
+- **Task 10 は 8・9・16 に依存** — 最初から**キャッシュ専用 API に対して**実装できる
+- Task 16 が束 C に移ったので、**束 E は 15・17・18 の 3 task** になる
 
 - **A / C / D は worktree 並列**に置ける
 - **B は C の後に直列**で流す (両者が `price_provider.py` の別関数を触る。B は 2 task と小さく、並列の利得より衝突解決コストが上回る)
@@ -394,8 +418,9 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
 - **`core/executor.py` の変更は 2 種に限る**: spec ① の deadline 追加と、Task 17 の `set_gate_result` 引数追加。**どちらも判定ロジックを変えない** — 却下条件・受理条件の差分がゼロであることをレビューで明示的に確認する
 - 既存テストが 1 本も壊れない (プラン 9 開始時点 1726 passed / 1 deselected)
 - 新規 config キーは `config/settings.yaml.example` と同期する (`reflection.max_attempts` / `datafeed.cache_retention_days` / `alert.consecutive_gate_reject`)
-- **migration は既存 DB に対して冪等**であること (**Task 13 / 15 / 17 / 19** — Task 16 は prune・設定検証・maintenance 配線のみで DDL 変更を含まない)。空 DB と既存 DB の双方でテストする
-- **prune の収束性**: 日次投入量が 1 回のバッチ上限を超える構成でも、`ohlcv` の行数が保持窓ぶんに収束することをテストで示す (D2)
+- **migration は既存 DB に対して冪等**であること (**Task 13 / 15 / 16 / 17 / 19**)。空 DB と既存 DB の双方でテストする。**Task 16 の分割 migration は「非空の旧 `ohlcv` を source 名で振り分け、未知 source は履歴側へ」**をテストで固定する
+- **テーブル分離の構造的保証 (Task 16)**: キャッシュ書き込み関数が履歴 source を、履歴インポートがライブ source を**それぞれ拒否する**こと / prune が `ohlcv_history` に一切触れないこと / 人間 CLI がライブ source を fail closed で拒否すること
+- **prune の収束性**: 日次投入量が 1 回のバッチ上限を超える構成でも、**`ohlcv_cache`** の行数が保持窓ぶんに収束することをテストで示す (D2)
 - **実行位置 (D3')**: **通知送信が scheduler スレッドから呼ばれないこと**を回帰テストで固定する (呼ばれたら fail するシームを置く)。**「`core_lock` 内か」ではなく「どのスレッドか」で検査する** — lock を外しても同一スレッドの同期実行なら次の tick が止まり、しかも watchdog はスレッド生存を見るので検出できない (3 周目 C1)。**git サブプロセスについての同等の検査は D6 と一緒にプラン 10 の受入条件へ移す** (本プランには git を実行する経路が無い)
 - **スキーマ制約**: `trade_intents` の `gate_result` と `reject_category` の対応が **CHECK 制約**で強制されていること (不正な組み合わせの INSERT/UPDATE が DB 層で落ちる)。**かつ `action IS NULL` の移行前既存行を含む DB で migration が成功すること**
 
@@ -405,7 +430,7 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
 - `captured_at` を刻む位置・`snapshot_max_age_sec` の既定 10.0・commit-core の鮮度再検証 (spec ①)
 - `MissionResult.status` の 4 値・送信前のトークン見積もり (**入れない**)・`n_ctx` のキャッシュ (spec ②)
 - `readonly` の silent-skip (裁定書 F-5 / CR-4 — RPC 面を拡大しない)・`DERIVE_ONLY_INTERVALS` の設計・**先頭バケットの欠損許容** (spec ③)
-- **バックテスト履歴の source (`dukascopy` / `mt5`)** — prune 対象に決して入れない (D2)
+- **`ohlcv_history` の中身** — prune の対象に決して入れない (D2。分割後は構造的に到達しない)
 - Landlock の `read_write_paths` (`plugins/` の追加はプラン 10。書き手が居ないうちに権限を開けない)
 
 ## 5. プラン 10 への申し送り
@@ -427,7 +452,8 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
 - `missions.failure_reason` 列の要否 (spec ② §4.6 — 永続監査が必要になったら)
 - `WorkerRunner` の親側失敗 (startup timeout / worker timeout / protocol error / EOF) の理由付け (spec ② §4.3 が明示的に範囲外とした)
 - `stream=true` 導入時の SSE error event 設計 (spec ② §4.7)
-- `ohlcv` の `VACUUM` 運用 (D2 — 自動化は長時間の排他が要る)
+- **`ohlcv_cache` を別 DB ファイルへ物理分離するか** (D2 — `VACUUM` は SQLite では database 単位なので、**同一 DB 内のテーブル分割では履歴を巻き込む**。キャッシュだけを vacuum したければ物理分離が要る。あわせて `run_in_sample(*, history_conn=...)` が既に接続を別引数で受けている構造とも噛み合う)
+- **キャッシュ → 履歴の「昇格」経路** (D2 — Dukascopy が提供しないペアで蓄積したキャッシュをバックテストしたくなった場合。現時点では YAGNI)
 - ヘッジ併存時の「close 後 net exposure 悪化」検出 (設計書 §5 — ヘッジ運用を本格化する場合)
 
 ## 7. レビュー方針
