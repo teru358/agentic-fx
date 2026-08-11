@@ -445,7 +445,22 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
   - **代替となる不変条件 (これが D3 の役割を引き継ぐ)**: **改善 worker から `data/` と DB パスに到達できないこと**。`bless` は `approval_requests` への書き込みを要するので、**到達できなければ実行できない** (「到達不能 = 実行不能」§4.6 の意味論)。プラン 8 が既に持っている防御 (DB パス非提供 + Landlock) がそのまま担う
   - **したがってプラン 10 の受入条件で検証すべきは「シェルが無いこと」ではなく「`data/` へ到達できないこと」**である。**`plugins/` を `read_write_paths` に足す際に `data/` を巻き込まないこと**が最重要の検査点になる
   - **残余リスク (明示)**: 改善 worker は web 取得のためネットワークを要する。任意コード実行 + ネットワークが揃うため、**plugin ソースの信頼性に対する脅威モデルは従来どおり「submit/bless は信頼できるソースのみ」**のまま (設計書 §6 のセキュリティ残余と同じ)
-- **CodexRunner を第 4 の AgentRunner として加える (ユーザー裁定 2026-08-11)**。`ClaudeRunner` と**両方を導入し、config で切り替えられる**ようにする (既存の「LocalRunner / ClaudeRunner を config で切替」と同じ枠組みに乗せる)。**設計書 §4 の改訂はプラン 10 の設計時に行う** (本プランのスコープ外)。
+- **CodexRunner を第 4 の AgentRunner として加える (ユーザー裁定 2026-08-11)**。`ClaudeRunner` と**両方を導入し、config で切り替えられる**ようにする (既存の「LocalRunner / ClaudeRunner を config で切替」と同じ枠組みに乗せる)。**設計書 §4 の改訂はプラン 10 の設計時に行う** (本プランのスコープ外)。用途は**改善ループ (plugin 実装・news ソース取得)**。取引 loop は既定どおり `local` — `RunnerChoice.backend` は `^(local|claude|codex)$` へ拡張し、`config/settings.yaml.example` と同期する。
+
+  **実装順序 (ユーザー承認 2026-08-11 — この順を守ること)**:
+
+  | # | やること | なぜこの位置か |
+  |---|---|---|
+  | 1 | **codex の実現可能性実測** — worker 隔離下 (Landlock + DB パス非提供 + 空 cwd) で **1 ターン完走するか**だけを見る | **基盤を作る前**に置く。improve profile は `landlock.is_available()` が偽なら起動拒否する設計であり、**codex は独自サンドボックス機構を持つ**ので衝突すると成立しない。後で判明すると基盤の作り直しになる。**動かなければ CodexRunner を落としプラン 10 のスコープを縮める** |
+  | 2 | **共通基盤 (契約層) の設計** | **両方の実測結果を見てから**決める。ClaudeRunner だけ見て作ると claude 都合に偏る |
+  | 3 | **ClaudeRunner 実装** — 動作基盤の確保 | 完動を実測済みでリスクが低い |
+  | 4 | **CodexRunner 実装** — 契約を揃える | 機構は codex の強みを活かす (下記) |
+  | 5 | **両者で同一の不変条件が成立することを検証** | 機構によらず「`data/` に到達できない」を確認する |
+
+  **「同様な動作」の範囲を取り違えないこと。契約は揃えるが、防御機構は揃えない**:
+  - **揃えるもの (契約)**: `MissionResult` の 4 終端 status / spec ② の `reason` 契約 (安全化済み・単一行・上限内・外部応答の本文を生で入れない) / `output_schema` の扱い / `max_turns`・`timeout_sec` の意味論
+  - **揃えないもの (機構)**: claude は `allowed_tools` で絞り **Landlock が唯一の防御線**。codex は `Sandbox.workspace-write` + `cwd=plugins/` で **SDK 層でも絞れる** (Landlock は二重防御)。**「codex を claude と同様に」動かすと codex の強みを捨てることになる**
+  - **揃えるべきは不変条件であって手段ではない**。両者に共通して成立させるのは ①**改善 worker から `data/` と DB パスに到達できない** ②従量課金経路が無い ③ユーザー個人の設定を継承しない — の 3 つで、実現手段は SDK ごとに違ってよい
   - **公式 Python SDK が存在する (2026-08-11 実測)**: **`openai-codex`** (PyPI 0.144.4、`openai/codex` リポジトリの `sdk/python`、`requires_python >=3.10`)。依存は `pydantic>=2.12` と **`openai-codex-cli-bin==0.144.4`** — **claude-agent-sdk と同じく CLI をラップする構造**であり、実体は CLI サブプロセスである
   - **紛らわしい別パッケージに注意**: PyPI の **`openai-codex-sdk`** (0.1.11) は `author: OpenAI` を名乗るが **repository も homepage も無く**、版体系も公式 (0.14x) と一致しない。**使わないこと**。TypeScript 版の公式は `@openai/codex-sdk` (0.147.0, Apache-2.0)
   - **従量課金の回避は成立する見込み**: `codex login` の ChatGPT サブスクリプション認証を使えば、CLAUDE.md の絶対制約 (従量課金 API 不可) と両立する。ただし**未実測**
