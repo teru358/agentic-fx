@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import signal
@@ -749,6 +750,17 @@ class _StubSettingsTrailingSlash:
     runner = _RunnerStub()
 
 
+class _LlamaSwapStubNoV1:
+    # 1 周目 codex I3: /v1 を含まない base_url。`endswith("/v1")` の**偽側**を
+    # 踏む唯一のスタブ (他は全て /v1 終端)。
+    base_url = "http://localhost:8080"
+
+
+class _StubSettingsNoV1:
+    llama_swap = _LlamaSwapStubNoV1()
+    runner = _RunnerStub()
+
+
 def _mock_client(handler) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))
 
@@ -882,7 +894,11 @@ def test_check_llama_swap_different_models_improve_first_trade_last(capsys):
             return httpx.Response(200, json={
                 "default_generation_settings": {"n_ctx": 4096}})
         if path.endswith("/chat/completions"):
-            call_order.append(("smoke", None))
+            # 1 周目 codex I1: smoke の**対象モデル**まで採る。順序だけを
+            # 見ていると `json={"model": improve_model, ...}` への変異が
+            # 生存し (実測 1801 passed)、init 終了時に hot なのが trade で
+            # なく improve になる — 設計書 §4.4 の中核が破れる。
+            call_order.append(("smoke", json.loads(request.content)["model"]))
             return httpx.Response(200, json={})
         return httpx.Response(200, json={})
 
@@ -890,10 +906,9 @@ def test_check_llama_swap_different_models_improve_first_trade_last(capsys):
     with patch("httpx.get", client.get), patch("httpx.post", client.post):
         _check_llama_swap(_StubSettingsDiff())
 
-    kinds = [c[0] for c in call_order]
-    assert kinds == ["props", "smoke", "props"]
-    models_called = [c[1] for c in call_order if c[0] == "props"]
-    assert models_called == ["improve-m", "trade-m"]
+    # 種別と対象モデルを組で固定する (kinds だけだと I1 が生存する)
+    assert call_order == [
+        ("props", "improve-m"), ("smoke", "trade-m"), ("props", "trade-m")]
     assert capsys.readouterr().out == (
         "improve model 'improve-m' ctx 4096\n"
         "llama-swap OK (model 'trade-m' loaded, ctx 4096)\n")
@@ -1053,6 +1068,34 @@ def test_check_llama_swap_props_trailing_slash_base_uses_root(capsys):
     assert calls["props"] == 1
     assert capsys.readouterr().out == (
         "llama-swap OK (model 'qwen3.6-35b' loaded, ctx 32768)\n")
+
+
+def test_check_llama_swap_props_base_without_v1_is_not_truncated(capsys):
+    """1 周目 codex I3: base_url が /v1 で終わらないとき `[:-3]` を**しない**。
+
+    既存スタブは全て /v1 終端なので `endswith("/v1")` の偽側が一度も踏まれず、
+    ガードを外して常に `[:-3]` する変異が生存する (実測 1801 passed)。
+    その変異下では http://localhost:8080 が http://localhost: に化ける。
+    """
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
+        if path == "/props":
+            calls.append(str(request.url))
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": 16384}})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettingsNoV1())
+    # host:port が切り詰められていないことまで見る (パス一致だけだと生存する)
+    assert calls == ["http://localhost:8080/props?model=qwen3.6-35b"]
+    assert capsys.readouterr().out == (
+        "llama-swap OK (model 'qwen3.6-35b' loaded, ctx 16384)\n")
 
 
 def test_check_llama_swap_unexpected_exception_in_props_is_not_swallowed():
