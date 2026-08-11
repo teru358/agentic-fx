@@ -418,7 +418,8 @@ def main() -> None:
                 result = runner.run(mission)
                 _send_frame(protocol_out, out_seq, {
                     "type": "result",
-                    "status": result.status, "output": result.output})
+                    "status": result.status, "output": result.output,
+                    "reason": result.reason})
             except Exception as exc:  # noqa: BLE001
                 _send_frame(protocol_out, out_seq, {
                     "type": "result", "status": "failed", "output": None,
@@ -490,7 +491,8 @@ def main() -> None:
             result = runner.run(mission)
             _send_frame(protocol_out, out_seq, {
                 "type": "result",
-                "status": result.status, "output": result.output})
+                "status": result.status, "output": result.output,
+                "reason": result.reason})
         except Exception as exc:  # noqa: BLE001 — 必ず result を送る
             _send_frame(protocol_out, out_seq, {
                 "type": "result", "status": "failed", "output": None,
