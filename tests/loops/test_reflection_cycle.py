@@ -593,3 +593,32 @@ def test_non_completed_never_saves_reflection_even_with_valid_content(
     assert cyc.run_pending() == 0
     assert reflections.get(conn, oid) is None
     rag.add_reflection.assert_not_called()
+
+
+def test_reflection_mission_failed_activity_line_is_pinned_field_by_field(
+        tmp_path):
+    """Task 4 / 1 周目 codex 指摘 I3: `reflection_mission_failed` の
+    activity 行を**フィールド単位の完全一致**で固定する。
+
+    本文から `mission_id` や `status` を落とす変異、category を
+    `AGGREGATE` 以外にする変異が、部分一致の assert では素通りしていた。
+    reflection は通知を持たないため、**この 1 行が失敗を知る唯一の
+    経路**であり、欠けたフィールドは復元できない。"""
+    reason = "context exceeded: prompt 1 tokens > n_ctx 2 (model=m)"
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason=reason)])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+
+    mid = conn.execute(
+        "SELECT id FROM missions WHERE loop='reflection'").fetchone()["id"]
+    lines = [ln for ln in (tmp_path / "a.log").read_text(
+        encoding="utf-8").splitlines()
+        if "\treflection_mission_failed\t" in ln]
+    assert len(lines) == 1, lines
+    _ts, category, event, summary, ref_id = lines[0].split("\t")
+    assert category == "AGGREGATE"
+    assert event == "reflection_mission_failed"
+    assert summary == (
+        f"order_id={oid} mission_id={mid} status=failed — {reason}")
+    assert ref_id == str(oid)

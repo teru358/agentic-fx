@@ -674,3 +674,43 @@ def test_failed_mission_output_never_reaches_the_intent_path(tmp_path):
     assert "mission_failed" in act
     # 失敗分岐で止まっており、後続の parse 経路へ落ちていない。
     assert "intent_parse_failed" not in act
+
+
+def test_mission_failed_activity_line_is_pinned_field_by_field(tmp_path):
+    """Task 4 / 1 周目 codex 指摘 I3: `mission_failed` の activity 行を
+    **フィールド単位の完全一致**で固定する。
+
+    Task 4 のテストは reason の部分文字列しか見ていなかったため、
+    ①既存の `runner status=...` を削除する ②category を変える
+    ③`ref_id` を mission ID 以外にする ④区切りを `" — "` 以外にする、
+    のいずれの変異も素通りしていた (codex 指摘)。activity 行は運用時に
+    人が読む唯一の一次記録であり、書式そのものが契約になる。
+
+    行の形は `ts \\t category \\t event \\t summary \\t ref_id`
+    (`ActivityLog.write` — summary は空白畳み込み済み)。"""
+    reason = "context exceeded: prompt 90010 tokens > n_ctx 65536 (model=m)"
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason=reason)])
+    assert loop.run_once() is None
+
+    mid = conn.execute("SELECT id FROM missions").fetchone()["id"]
+    lines = [ln for ln in (tp / "a.log").read_text(encoding="utf-8").splitlines()
+             if "\tmission_failed\t" in ln]
+    assert len(lines) == 1, lines
+    _ts, category, event, summary, ref_id = lines[0].split("\t")
+    assert category == "AGGREGATE"
+    assert event == "mission_failed"
+    assert summary == f"runner status=failed — {reason}"
+    assert ref_id == str(mid)
+
+
+def test_mission_failed_notification_body_is_pinned_exactly(tmp_path):
+    """Task 4 / 1 周目 codex 指摘 I3: 通知本文を全文一致で固定する
+    (既存プレフィックス・status・区切りのいずれを消しても red になる)。"""
+    reason = "context exceeded: prompt 1 tokens > n_ctx 2 (model=m)"
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason=reason)])
+    loop.notifier.send = MagicMock()
+    assert loop.run_once() is None
+    assert loop.notifier.send.call_args[0][0] == (
+        f"[agentic-fx] 判断 Mission 失敗: failed — {reason}")
