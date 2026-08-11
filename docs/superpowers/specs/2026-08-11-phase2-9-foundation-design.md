@@ -505,7 +505,15 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
 ## 6. 起票 (本プランでは直さない)
 
 - `missions.failure_reason` 列の要否 (spec ② §4.6 — 永続監査が必要になったら)
-- `WorkerRunner` の親側失敗 (startup timeout / worker timeout / protocol error / EOF) の理由付け (spec ② §4.3 が明示的に範囲外とした)
+- **worker 診断タスク (独立して起票する)** — `WorkerRunner` の親側失敗の理由付け。spec ② §4.3 は `reason` の対象を「`LocalRunner` が解釈できた HTTP failure」に限定し、worker 基盤由来の理由付けを明示的に範囲外とした。プラン 9 Task 3 の 1 周目レビュー (codex) で、**その範囲外部分が運用上の実害を持つことが確認された**ため、範囲を具体化して残す。
+
+  **確認された欠落**: 子プロセスで例外が起きたとき、**診断は親・activity・通知のいずれにも残らない**。子は `{"type": "result", "status": "failed", "output": None, "error": f"{type(exc).__name__}: {exc}"}` を送るが、`WorkerRunner` は `error` を**読まない** (`kind == "result"` の分岐は `status` / `output` / `reason` しか見ない)。代替経路も無く、子の stderr は `subprocess.DEVNULL` に接続されている。
+
+  **`mission_worker.py` の result フレーム構築は計 5 箇所** (成功 2 = trade/improve、例外 3 = trade/improve + `ready_sent` 後に外側 `except` へ到達する経路)。Task 3 が配線したのは成功側の 2 箇所のみ。**5 箇所目 (外側 `except`) は指揮者が当初 4 箇所と数え違えた**ので、起票時に必ず数え直すこと。
+
+  **対象に含めるもの**: ① 例外 result の 3 経路 ② `ready(ok=False)` の `error` ③ protocol error / EOF / startup timeout / mission timeout ④ 生の例外文字列の安全化 (改行除去・秘密除去・長さ上限 — `LocalRunner._normalize_reason` と同じ規律) ⑤ 生の `error` をそのまま通知へ流さない契約テスト。
+
+  **プラン 9 Task 4 に混ぜてはならない** — Task 4 は「安全化済み `reason`」を表示する出口であり、生の例外を安全化する責務を持たない (codex 裁定)。
 - `stream=true` 導入時の SSE error event 設計 (spec ② §4.7)
 - **`ohlcv_cache` を別 DB ファイルへ物理分離するか** (D2 — `VACUUM` は SQLite では database 単位なので、**同一 DB 内のテーブル分割では履歴を巻き込む**。キャッシュだけを vacuum したければ物理分離が要る。あわせて `run_in_sample(*, history_conn=...)` が既に接続を別引数で受けている構造とも噛み合う)
 - **キャッシュ → 履歴の「昇格」経路** (D2 — Dukascopy が提供しないペアで蓄積したキャッシュをバックテストしたくなった場合。現時点では YAGNI)
