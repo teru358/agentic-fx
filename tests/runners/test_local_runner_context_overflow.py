@@ -8,7 +8,8 @@ import json
 import httpx
 
 from agentic_fx.runners.base import Mission
-from agentic_fx.runners.local_runner import _MAX_REASON_CHARS, LocalRunner
+from agentic_fx.runners.local_runner import (
+    _MAX_ERROR_BODY_BYTES, _MAX_REASON_CHARS, LocalRunner)
 from agentic_fx.tools.registry import ToolRegistry
 
 SCHEMA = {"type": "object", "properties": {"action": {"type": "string"}},
@@ -142,6 +143,24 @@ def test_reason_uses_safe_text_to_strip_urls():
     assert "http://internal.example" not in r.reason
 
 
+def test_reason_strips_secrets_that_are_not_inside_a_url():
+    """2 周目 codex: 上のテストは秘密を**URL のクエリの中にだけ**置いている
+    ため、「URL ごと消えた」のか「秘密を独立に伏せた」のかを区別できない。
+
+    実測: `_normalize_reason` の `safe_text(text)` を「`https?://\\S+` を消す
+    だけ」の正規表現に差し替える変異が **1803 passed で生存**した。その変異
+    下では、URL を含まない `token=SECRET123` が activity 行・Discord 通知・
+    worker の result frame へ**平文のまま**流れる。
+
+    URL を一切含まない秘密で、`safe_text` の関与を独立に測る。
+    """
+    envelope = {"error": {"type": "other",
+                          "message": "upstream rejected token=SECRET123"}}
+    r = _runner_for_json_body(400, envelope).run(_mission())
+    assert "SECRET123" not in r.reason
+    assert "token=***" in r.reason   # 伏字に**置換**されている (削除ではない)
+
+
 # ---- 検査点 6: status は "failed" のまま ------------------------------------
 
 def test_ctx_overflow_status_is_still_failed():
@@ -182,6 +201,43 @@ def test_oversized_body_falls_back_to_generic_reason():
     r = _runner_for_raw_body(400, huge).run(_mission())
     assert "HTTP 400" in r.reason
     assert "context exceeded" not in r.reason
+
+
+def test_max_error_body_bytes_constant_is_pinned():
+    """上限値の変更を**意図的な操作**にする ([[_MAX_REASON_CHARS]] と同じ規律)。
+
+    2 周目 codex: 上の oversized fixture は 200KB で上限 65536 から遠すぎる。
+    実測で **`65536` → `100000` に緩める変異が 1803 passed で生存**した
+    (200KB は依然として退避するので誰も気付かない)。伸ばせばその分だけ
+    JSON 解析にかける外部由来本文が増える。調整するならこのテストも直すこと。
+    """
+    assert _MAX_ERROR_BODY_BYTES == 65536
+
+
+def test_body_at_the_limit_is_parsed_but_one_byte_over_is_not():
+    """上限の**両側**を 1 バイト差で踏む。定数 pin だけだと
+    `if len(body) > _MAX` の比較子側 (`>` → `>=`) が残るため対で測る。"""
+    def _body_of(size: int) -> bytes:
+        # padding 以外の JSON 構文分を差し引いて、ちょうど size バイトにする
+        base = json.dumps({"error": {"type": _CTX_ENVELOPE["error"]["type"],
+                                     "message": "",
+                                     "n_prompt_tokens": 90010,
+                                     "n_ctx": 65536}}).encode()
+        return json.dumps({"error": {"type": _CTX_ENVELOPE["error"]["type"],
+                                     "message": "x" * (size - len(base)),
+                                     "n_prompt_tokens": 90010,
+                                     "n_ctx": 65536}}).encode()
+
+    at_limit = _body_of(_MAX_ERROR_BODY_BYTES)
+    assert len(at_limit) == _MAX_ERROR_BODY_BYTES
+    r = _runner_for_raw_body(400, at_limit).run(_mission())
+    assert "context exceeded" in r.reason      # 上限ちょうどは解析される
+
+    over = _body_of(_MAX_ERROR_BODY_BYTES + 1)
+    assert len(over) == _MAX_ERROR_BODY_BYTES + 1
+    r = _runner_for_raw_body(400, over).run(_mission())
+    assert "context exceeded" not in r.reason  # 1 バイト超過で退避
+    assert "HTTP 400" in r.reason
 
 
 # ---- 受入条件 5 の補強: 応答本文そのものは transcript に残らない -----------
