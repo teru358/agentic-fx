@@ -171,6 +171,7 @@
 | # | task | 一言 |
 |---|---|---|
 | 1 | ClaudeRunner | claude-agent-sdk で AgentRunner 実装・config 切替・**従量課金 API 不使用の構造的担保** (子 env から `ANTHROPIC_API_KEY` を除去) + **ユーザー設定の非継承を強制** (`setting_sources=[]` / `strict_mcp_config=True` / `plugins=[]`) |
+| 1b | **CodexRunner** | **公式 Python SDK `openai-codex`** (PyPI 0.144.4、`openai-codex-cli-bin` 同梱 = CLI ラッパ) で AgentRunner 実装。**ClaudeRunner と両方導入し config で切替** (ユーザー裁定 2026-08-11)。`codex login` のサブスク認証で従量課金を回避。**PyPI の `openai-codex-sdk` は素性不明の別物なので使わない**。実測項目・注意点はプラン 9 設計書 §5 を参照 |
 | 2 | 改善用 registry | research_tools (web_search=ddgs / fetch_article 移植) + 書き込み系 — 取引 loop registry と分離 |
 | 3 | バックログ + 注入コンテキスト | improvement_backlog CRUD・決定論的な成績集計注入 |
 | 4 | 改善 Mission 本体 | 3 ステップ 1 Mission・週次スケジュール |

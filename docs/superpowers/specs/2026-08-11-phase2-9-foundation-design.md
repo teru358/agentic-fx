@@ -439,6 +439,13 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
 - **D6 の受入条件をプラン 10 側で持つ**: **git サブプロセス実行が scheduler スレッドから呼ばれないこと**の回帰テスト (プラン 9 の受入条件から移送した)
 - **`plugins/` を Landlock `read_write_paths` に追加する** (改善 worker が plugin を書くため。**D6 と同じ契機**で必要になる)
 - **improve worker 内で `uv run pytest` を回すかの裁定** — EXECUTE 権と一時書き込み先が要り Landlock 設計に跳ね返るため、**プラン 10 の設計段階で確定させる** (task に埋めない)
+- **CodexRunner を第 4 の AgentRunner として加える (ユーザー裁定 2026-08-11)**。`ClaudeRunner` と**両方を導入し、config で切り替えられる**ようにする (既存の「LocalRunner / ClaudeRunner を config で切替」と同じ枠組みに乗せる)。**設計書 §4 の改訂はプラン 10 の設計時に行う** (本プランのスコープ外)。
+  - **公式 Python SDK が存在する (2026-08-11 実測)**: **`openai-codex`** (PyPI 0.144.4、`openai/codex` リポジトリの `sdk/python`、`requires_python >=3.10`)。依存は `pydantic>=2.12` と **`openai-codex-cli-bin==0.144.4`** — **claude-agent-sdk と同じく CLI をラップする構造**であり、実体は CLI サブプロセスである
+  - **紛らわしい別パッケージに注意**: PyPI の **`openai-codex-sdk`** (0.1.11) は `author: OpenAI` を名乗るが **repository も homepage も無く**、版体系も公式 (0.14x) と一致しない。**使わないこと**。TypeScript 版の公式は `@openai/codex-sdk` (0.147.0, Apache-2.0)
+  - **従量課金の回避は成立する見込み**: `codex login` の ChatGPT サブスクリプション認証を使えば、CLAUDE.md の絶対制約 (従量課金 API 不可) と両立する。ただし**未実測**
+  - **プラン 10 で実測すべきこと**: ①worker 隔離下 (DB パス非提供・空 cwd・Landlock) で `codex exec` が完走するか ②`openai-codex-cli-bin` がバイナリを同梱するため **Landlock の allowlist に効く** — 実行可能パスの扱い ③ClaudeRunner と同様に**ユーザー個人の設定 (`~/.codex/`・MCP・plugin) を継承しないか** (claude-agent-sdk は既定で継承した。同型の問題を疑うこと) ④従量課金経路の遮断をどう構造的に強制するか (Claude 側は子 env から `ANTHROPIC_API_KEY` を除去する形にした)
+  - ローカル CLI は `codex-cli 0.147.0`、Python SDK は 0.144.4 で**版が少しずれている**
+
 - **ClaudeRunner の実測結果 (2026-08-11、本設計時に確認済み)**:
   - `claude-agent-sdk` 0.2.134 の依存は `anyio` / `mcp` / `sniffio` のみで **`anthropic` SDK を含まない**。`shutil.which("claude")` で **CLI をサブプロセス起動する**構造であり、**サブスク認証で完動する** (`ANTHROPIC_API_KEY` 未設定で応答を得た)。設計書 §4「Claude Agent SDK」と CLAUDE.md「`claude -p`」は**矛盾しない** — SDK は CLI のラッパである
   - **既定ではユーザーの Claude Code 設定 (hooks / plugins / MCP / settings) を継承する** — 素の実行で hook が 4 本発火した。トレードシステムがユーザー個人の設定に左右されるのは受け入れられない。**`setting_sources=[]` / `strict_mcp_config=True` / `plugins=[]` を構造的に強制する** (実測で hook 発火 4 → 0)

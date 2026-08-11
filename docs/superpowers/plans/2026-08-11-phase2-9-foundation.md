@@ -529,7 +529,11 @@ def test_reason_strips_non_whitespace_nonprintable_character():
     """M5b: split/join だけでは除去できない NUL を isprintable が落とす。"""
     envelope = {"error": {"type": "other", "message": "alpha\x00beta"}}
     r = _runner_for_json_body(400, envelope).run(_mission())
-    assert r.reason == "alphabeta"
+    # ⚠️ `_normalize_reason` は非印字文字を**削除ではなく空白 1 文字へ置換**する
+    # (`ch if ch.isprintable() else " "`)。3 周目レビューで「削除」を前提にした
+    # 期待値 "alphabeta" になっており、**正しい実装に対しても永久に red** だった。
+    # 指揮者が実測: _normalize_reason("alpha\x00beta") == "alpha beta"
+    assert r.reason == "alpha beta"
 
 
 def test_reason_length_is_capped():
@@ -910,8 +914,9 @@ def test_main_puts_reason_in_result_frame_for_improve_profile(
     の improve 分岐は trade 分岐と独立した result frame 構築コードを持つ)。"""
     # Landlock はプロセス生涯に不可逆。既存テストと同じ seam で bootstrap を
     # 止め、pytest プロセスを sandbox 化しない。
-    import agentic_fx.mission_worker as worker_module
-    monkeypatch.setattr(worker_module, "_bootstrap_improve_profile",
+    # 命名は同ファイル冒頭の既存 import (`from agentic_fx import mission_worker`)
+    # と既存テストに合わせる (新規テストだけ別名を持ち込まない)。
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
                         lambda *args, **kwargs: None)
 
     def settings_mutator(settings_dict):
@@ -4061,8 +4066,8 @@ def test_prune_cache_repeated_calls_converge(tmp_path):
         # capacity=9 > daily_ingest=7 となり、その日の backlog が消える。
         for _ in range(3):
             ohlcv.prune_cache(conn, cutoff=cutoff, limit=batch_limit)
+        # 各日の終わりに backlog が消えていること (これが収束の本体)
         assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
 
 
 def test_prune_cache_rejects_naive_cutoff(tmp_path):
@@ -5073,9 +5078,10 @@ Expected: `ohlcv_history`/`import_history_bars`/`load_history_bars`/`load_histor
 履歴側は既存 backtest 10 ファイルに加え、次を含む全 grep 結果を更新する:
 `tests/test_e2e_plugin_signal.py`、`tests/test_service_app.py`、
 `tests/plugin/test_approval.py`、`tests/plugin/test_signal_producer.py`、
-`tests/plugin/test_strategy_adapter.py`。キャッシュ側は
-`tests/test_e2e_worker_isolation.py`、`tests/store/test_records.py`、
-`tests/tools/test_mission_registry.py` を更新する。import 文も call site と別に検索する。
+`tests/plugin/test_strategy_adapter.py`。キャッシュ側で**本 Step が触るのは
+`tests/test_e2e_worker_isolation.py` のみ**である — `tests/store/test_records.py` と
+`tests/tools/test_mission_registry.py` は **Step 13 で既にリネーム済み**なので
+ここでは対象外 (下の sed に含まれていないのは意図的)。import 文も call site と別に検索する。
 
 ```bash
 FILES="tests/backtest/test_mt5_import.py tests/backtest/test_analysis.py \
@@ -8222,7 +8228,10 @@ def test_f1c_startup_reclaim_recovers_claimed_signal(tmp_path):
 
     # 起動時 recover_interrupted が claim を先に戻さないよう mission を終端化。
     # これにより次回起動で pending 化する唯一の主体が lease 回収になる。
-    missions_module.finish(app1.conn_core, mid, "completed", NOW)
+    # ⚠️ `missions.finish` は 6 引数必須 (conn, mission_id, status,
+    #    output, transcript, now)。既定値は無い (`store/missions.py:23-24`)。
+    #    4 引数だと NOW が output に束縛され TypeError で落ちる (3 周目レビュー)。
+    missions_module.finish(app1.conn_core, mid, "completed", None, [], NOW)
 
     # FC-2 (プラン8): instance_lock (flock) は App の全寿命で保持される
     # ため、同一 root への 2 回目の build_app は 1 回目の instance_lock を
