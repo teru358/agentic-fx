@@ -1,3 +1,4 @@
+import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -497,3 +498,47 @@ def test_reflection_mission_failed_ref_id_is_order_id(tmp_path):
         line for line in cyc.activity.tail(10)
         if "\treflection_mission_failed\t" in line)
     assert event_line.split("\t")[-1] == str(oid)
+
+
+def test_reflection_failure_event_write_error_is_caught_at_the_event_site(
+        tmp_path, caplog):
+    """Task 4 / 段 0 の生存変異: `reflection_mission_failed` の書込みが
+    例外を投げても reflection 経路は止まらず、**その例外は event 書込みの
+    場所で捕まる**。
+
+    ⚠️ **「経路が止まらないこと」だけを見る形では、この防御を測れない。**
+    `run_pending` は per-item isolation の `except Exception` を別に持つ
+    ため、実装の `try/except` を丸ごと外しても `run_pending() == 0` と
+    `reflections.get(...) is None` は**どちらも変わらない**
+    (指揮者が実測: フルスイート 1776 passed のまま生存)。防御が二重に
+    なっているぶん、外側の観測点では差が出ない。
+
+    そこで **どちらの層が捕まえたかをログで区別する**。event 書込み側の
+    ガードが消えると、例外は per-item isolation まで昇格し、
+    `"failed to record reflection_mission_failed"` が出なくなる。
+
+    層が縮退する (= 例外が本経路を巻き込んでから捕まる) と、将来 event
+    書込みの後ろに処理を足したときに、その処理が黙って飛ばされる。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason="context exceeded: prompt 1 tokens "
+                                   "> n_ctx 2 (model=m)")])
+    oid = _closed_order(conn)
+
+    real_write = cyc.activity.write
+
+    def exploding_write(category, event, message, **kwargs):
+        if event == "reflection_mission_failed":
+            raise OSError("No space left on device")
+        return real_write(category, event, message, **kwargs)
+
+    cyc.activity.write = exploding_write
+
+    with caplog.at_level(logging.ERROR, logger="agentic_fx.reflection"):
+        assert cyc.run_pending() == 0
+
+    assert reflections.get(conn, oid) is None
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("failed to record reflection_mission_failed" in m
+               for m in messages), messages
+    # per-item isolation まで昇格していないこと (= 本経路を巻き込んでいない)。
+    assert not any("per-item reflection failed" in m for m in messages), messages
