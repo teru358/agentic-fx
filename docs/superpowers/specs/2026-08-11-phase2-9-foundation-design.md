@@ -514,6 +514,9 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
   **対象に含めるもの**: ① 例外 result の 3 経路 ② `ready(ok=False)` の `error` ③ protocol error / EOF / startup timeout / mission timeout ④ 生の例外文字列の安全化 (改行除去・秘密除去・長さ上限 — `LocalRunner._normalize_reason` と同じ規律) ⑤ 生の `error` をそのまま通知へ流さない契約テスト。
 
   **プラン 9 Task 4 に混ぜてはならない** — Task 4 は「安全化済み `reason`」を表示する出口であり、生の例外を安全化する責務を持たない (codex 裁定)。
+- **improve モデルの `/models` 存在確認** (プラン 9 Task 5 の 1 周目で判明、範囲外として残す) — `_check_llama_swap` の `if trade_model not in ids` は **trade だけ**を検査する。improve モデルが llama-swap の `/models` に無い場合、`_fetch_model_ctx` が静かに `None` を返して improve の ctx 行が出ないだけで、**警告は一切出ない**。alias 設定ミスに init が沈黙する。
+
+  Task 5 の宣言スコープは「`n_ctx` の可視化」であり存在確認の拡張ではないため、**Task 5 では直さない**。着手時は trade 側と同じ警告文言・同じ早期 return 規律を使うか、improve は「警告のみで続行」にするかを先に決めること (improve が無くても取引判断は成立するので、trade と同じ扱いにするのは過剰かもしれない)。
 - `stream=true` 導入時の SSE error event 設計 (spec ② §4.7)
 - **`ohlcv_cache` を別 DB ファイルへ物理分離するか** (D2 — `VACUUM` は SQLite では database 単位なので、**同一 DB 内のテーブル分割では履歴を巻き込む**。キャッシュだけを vacuum したければ物理分離が要る。あわせて `run_in_sample(*, history_conn=...)` が既に接続を別引数で受けている構造とも噛み合う)
 - **キャッシュ → 履歴の「昇格」経路** (D2 — Dukascopy が提供しないペアで蓄積したキャッシュをバックテストしたくなった場合。現時点では YAGNI)

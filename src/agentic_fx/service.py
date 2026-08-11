@@ -118,7 +118,6 @@ def _check_llama_swap(settings) -> None:
     import httpx
     base = settings.llama_swap.base_url
     trade_model = settings.runner.trade.model
-    improve_model = settings.runner.improve.model
 
     try:
         r = httpx.get(f"{base}/models", timeout=5)
