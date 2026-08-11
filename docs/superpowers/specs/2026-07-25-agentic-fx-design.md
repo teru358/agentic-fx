@@ -424,7 +424,7 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 
 ### 許可ツール
 
-成績 DB 読取、`web_search` / `fetch_article` (無料実装: ddgs + 前身 article_fetcher 移植)、**`plugins/` のファイル読み書き** (リポジトリ本体は**読取のみ** — 出力の 2 経路の裁定に伴い、コア変更用の専用ブランチ・PR 作成 (`gh`) は撤去)、news_sources への追加提案、`uv run pytest` 実行 (plugin の同梱テスト — worker 内で回す要否はプラン 9 で再評価)、バックテスト実行、バックログ読み書き、approval_request 発行、提案レポート書き出し (`reports/`)
+成績 DB 読取、`web_search` / `fetch_article` (無料実装: ddgs + 前身 article_fetcher 移植)、**`plugins/` のファイル読み書き** (リポジトリ本体は**読取のみ** — 出力の 2 経路の裁定に伴い、コア変更用の専用ブランチ・PR 作成 (`gh`) は撤去)、news_sources への追加提案、`uv run pytest` 実行 (plugin の同梱テスト — **worker 内で回す要否は改善ループ実装プランの設計段階で確定させる**。EXECUTE 権と一時書き込み先が要り Landlock 設計に跳ね返るため、task に埋めない)、バックテスト実行、バックログ読み書き、approval_request 発行、提案レポート書き出し (`reports/`)
 
 ### 品質ゲート (loop 側で強制) — コード品質と戦略品質を分離
 
