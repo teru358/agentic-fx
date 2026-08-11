@@ -35,3 +35,6 @@ CLAUDE.md
 
 # 一時ファイル置き場 (2026-08-10 ユーザー方針: 一時ファイルは /tmp か tmp/ に置く)
 /tmp/
+
+# git worktree (並列レーン用 — リポジトリに入れない)
+.worktrees/
