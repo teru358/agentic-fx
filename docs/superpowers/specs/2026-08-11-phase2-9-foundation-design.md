@@ -451,7 +451,7 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
 
   | # | やること | なぜこの位置か |
   |---|---|---|
-  | 1 | **codex の実現可能性実測** — worker 隔離下 (Landlock + DB パス非提供 + 空 cwd) で **1 ターン完走するか**だけを見る | **基盤を作る前**に置く。improve profile は `landlock.is_available()` が偽なら起動拒否する設計であり、**codex は独自サンドボックス機構を持つ**ので衝突すると成立しない。後で判明すると基盤の作り直しになる。**動かなければ CodexRunner を落としプラン 10 のスコープを縮める** |
+  | 1 | **codex の実現可能性実測** — worker 隔離下 (Landlock + DB パス非提供 + 空 cwd) で **1 ターン完走するか**だけを見る。**サブスク駆動とローカル LLM 駆動の両方**で測る (どちらも成立することは隔離無しで確認済み) | **基盤を作る前**に置く。improve profile は `landlock.is_available()` が偽なら起動拒否する設計であり、**codex は独自サンドボックス機構を持つ**ので衝突すると成立しない。後で判明すると基盤の作り直しになる。**動かなければ CodexRunner を落としプラン 10 のスコープを縮める** |
   | 2 | **共通基盤 (契約層) の設計** | **両方の実測結果を見てから**決める。ClaudeRunner だけ見て作ると claude 都合に偏る |
   | 3 | **ClaudeRunner 実装** — 動作基盤の確保 | 完動を実測済みでリスクが低い |
   | 4 | **CodexRunner 実装** — 契約を揃える | 機構は codex の強みを活かす (下記) |
@@ -463,7 +463,17 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
   - **揃えるべきは不変条件であって手段ではない**。両者に共通して成立させるのは ①**改善 worker から `data/` と DB パスに到達できない** ②従量課金経路が無い ③ユーザー個人の設定を継承しない — の 3 つで、実現手段は SDK ごとに違ってよい
   - **公式 Python SDK が存在する (2026-08-11 実測)**: **`openai-codex`** (PyPI 0.144.4、`openai/codex` リポジトリの `sdk/python`、`requires_python >=3.10`)。依存は `pydantic>=2.12` と **`openai-codex-cli-bin==0.144.4`** — **claude-agent-sdk と同じく CLI をラップする構造**であり、実体は CLI サブプロセスである
   - **紛らわしい別パッケージに注意**: PyPI の **`openai-codex-sdk`** (0.1.11) は `author: OpenAI` を名乗るが **repository も homepage も無く**、版体系も公式 (0.14x) と一致しない。**使わないこと**。TypeScript 版の公式は `@openai/codex-sdk` (0.147.0, Apache-2.0)
-  - **従量課金の回避は成立する見込み**: `codex login` の ChatGPT サブスクリプション認証を使えば、CLAUDE.md の絶対制約 (従量課金 API 不可) と両立する。ただし**未実測**
+  - **従量課金の回避は成立する (2026-08-11 実測で確定)**: `~/.codex/auth.json` は **`auth_mode: "chatgpt"`** / **`OPENAI_API_KEY: null`** / `chatgpt_plan_type: "plus"` で、tokens は OAuth (`id_token`/`access_token`/`refresh_token`) のみ。環境変数にも `OPENAI_API_KEY` は無い。**API キー経路が存在せず、ChatGPT サブスクリプションで動いている**。CLAUDE.md の絶対制約と両立する
+    - `auth.json` に **`chatgpt_subscription_active_until`** があるので**サブスク期限切れを検出できる**。ClaudeRunner の既存裁定 (「クレジット枯渇時は停止するだけ。local への自動フォールバックはしない — 挙動を予測可能に保つ」設計書 §13) と**同じ扱いにする**
+  - **⚠ codex は Chat Completions API をサポートしない (2026-08-11 実測)**。カスタムプロバイダに `wire_api="chat"` を設定すると **`wire_api = "chat" is no longer supported. set wire_api = "responses"` で起動拒否**される。**Responses API を実装していないサーバーでは codex は使えない**
+  - **ローカル LLM 駆動が成立した (2026-08-11 実測)**: llama-swap をカスタムプロバイダとして定義し、`qwen3-coder-30b-a3b-instruct` で応答を得た (`2+2` → `4`)。llama-swap は `/v1/responses` と `/v1/chat/completions` の**両方が 200** を返すため通った。設定:
+    ```
+    model_providers.llamaswap.base_url = "http://127.0.0.1:8080/v1"
+    model_providers.llamaswap.wire_api = "responses"     # "chat" は不可
+    ```
+    → **「codex の harness (サンドボックス・自前ツール実行・`output_schema`) をローカル LLM で駆動する」構成が取れる**。改善ループの実装能力という観点では、自前 tool-calling loop の `LocalRunner` より強い可能性がある (codex はファイル編集・シェル・サンドボックスを自前で持つ)。**費用ゼロ**
+    - **ただし現時点では可能性の確認まで**。**プラン 10 の実測項目に「ローカル LLM 駆動の codex harness が実際に plugin 実装をこなせるか」を追加する** (「起動できる」で測らない — [[measure-capability-not-startup]])
+    - 構成の選択肢は 3 つになる: ①CodexRunner + ChatGPT サブスク (最も強いモデル・サブスク枠を消費) ②**CodexRunner + llama-swap (費用ゼロ・codex harness)** ③LocalRunner (費用ゼロ・自前 tool-calling)
   - **プラン 10 で実測すべきこと**: ①worker 隔離下 (DB パス非提供・空 cwd・Landlock) で `codex exec` が完走するか ②`openai-codex-cli-bin` がバイナリを同梱するため **Landlock の allowlist に効く** — 実行可能パスの扱い ③ClaudeRunner と同様に**ユーザー個人の設定 (`~/.codex/`・MCP・plugin) を継承しないか** (claude-agent-sdk は既定で継承した。同型の問題を疑うこと) ④従量課金経路の遮断をどう構造的に強制するか (Claude 側は子 env から `ANTHROPIC_API_KEY` を除去する形にした)
   - ローカル CLI は `codex-cli 0.147.0`、Python SDK は 0.144.4 で**版が少しずれている**
   - **API 形状は AgentRunner と相性が良い (実測)**: `Codex().thread_start(...)` → `Thread.run(input, *, output_schema=..., model=..., effort=..., sandbox=..., approval_mode=..., cwd=...)` → `TurnResult`。**`output_schema` がネイティブにある**ので `Mission.output_schema` をそのまま渡せ、**JSON 修復リトライが不要になる可能性がある** (LocalRunner の自前 tool-calling loop との差)。`CodexConfig(codex_bin=..., env=..., cwd=...)` で**バイナリパスと環境変数を明示できる**
