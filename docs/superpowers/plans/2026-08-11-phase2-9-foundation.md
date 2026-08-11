@@ -5387,18 +5387,25 @@ def test_cache_maintenance_prunes_old_cache_rows(tmp_path):
         pp.return_value.healthcheck.return_value = "yfinance"
         app = build_app(tmp_path, clock=FixedClock(NOW))
     try:
-        old_bar = Bar("USDJPY", "1m", NOW - timedelta(days=40),
+        # ⚠️ **境界の両側**を置く。旧版は 40 日前の 1 本だけを入れて「消えたこと」
+        # しか見ておらず、**`cutoff` を retention 非依存の固定値にする変異が生存**
+        # していた (ローカル LLM muse-glimmer が検出・指揮者が裏取り) — 例えば
+        # `cutoff = NOW` (全削除) でもこのテストは PASS してしまう。
+        # 残るべき 1 本を足して初めて「retention 由来の cutoff」を pin できる。
+        old_bar = Bar("USDJPY", "1m", NOW - timedelta(days=40),      # 保持外 → 消える
                       148.0, 148.1, 147.9, 148.05, 10)
-        ohlcv.upsert_cache_bars(app.conn_core, [old_bar], source="yfinance")
-        assert ohlcv.load_cache_bars(
-            app.conn_core, "USDJPY", "1m", source="yfinance",
-            since=NOW - timedelta(days=41)) != []
+        keep_bar = Bar("USDJPY", "1m", NOW - timedelta(days=10),     # 保持内 → 残る
+                       149.0, 149.1, 148.9, 149.05, 11)
+        ohlcv.upsert_cache_bars(app.conn_core, [old_bar, keep_bar],
+                                source="yfinance")
 
         app.scheduler.on_cache_maintenance(NOW)
 
-        assert ohlcv.load_cache_bars(
+        rows = ohlcv.load_cache_bars(
             app.conn_core, "USDJPY", "1m", source="yfinance",
-            since=NOW - timedelta(days=41)) == []
+            since=NOW - timedelta(days=41))
+        # 「消えた」だけでなく「残った」も見る。全削除・無削除の双方を殺す。
+        assert [b.ts for b in rows] == [NOW - timedelta(days=10)]
     finally:
         app.close()
 ```
@@ -8353,7 +8360,7 @@ EOF
 | 1 | FK を付けない (`_SIGNALS_V2_DDL` から `REFERENCES missions(id)` を削る) | `test_init_db_fresh_signals_table_has_missions_fk`・`test_signals_fk_rejects_nonexistent_mission_id_after_migration` |
 | 2 | `claimed` の修復を落とす (INSERT..SELECT の CASE 式から claimed 分岐を削り、dangling 行をそのままコピーする) | `test_migrate_signals_fk_repairs_dangling_claimed_row` (repair されない値で assert が落ちる、または `foreign_key_check` が violations を検出して RuntimeError になり、いずれにせよテストが red になる) |
 | 3 | `consumed`/`abandoned` を pending に戻す (CASE の ELSE を 'pending' にする等) | `test_migrate_signals_fk_repairs_dangling_consumed_row_without_reviving`・`test_migrate_signals_fk_repairs_dangling_abandoned_row_without_reviving` |
-| 4 | `foreign_key_check` を削除する (violations チェックのブロックを消す) | 直接には `test_migrate_signals_fk_leaves_foreign_key_check_clean` (このテストは `_migrate_signals_fk` が violations を検査すること自体を前提にしていないため、単独では殺せない場合がある — **実装時に「foreign_key_check を削除しても upstream 挙動が変わらないか」を手動確認すること**。#2 の repair が正しく効いていれば violations は元々空になるため、このテストは主として「検査コード自体の削除」の直接ピンではなく「検査が空であること」の契約ピンである。実装者は、`_migrate_signals_fk` から violations チェックのブロックそのものを削除した変異を当てたとき、**他のどのテストも red にならない可能性がある** ことを認識し、その場合は mutation ledger に "既存テストでは殺せない — 将来 repair ロジックにバグが入っても検出できない防御なので残す" と明記すること) |
+| 4 | `foreign_key_check` を削除する (violations チェックのブロックを消す) | **❌ 殺せない — killer テストは存在しない (codex 1 周目 Critical 3)。** `test_migrate_signals_fk_leaves_foreign_key_check_clean` は「移行後に violations が空である」という**契約**のピンであって、**検査コードの存在**のピンではない。#2 の repair が正しく効いていれば violations は元々空なので、検査ブロックを丸ごと消しても**どのテストも red にならない**。**mutation ledger には「既存テストでは殺せない」と明記し、削除しないことをレビューで明示的に確認する**。どうしても動的に殺したいなら「repair 後・検査前に violation を注入するテスト専用 seam」を足す必要があるが、**最終防波堤のためだけに production へ seam を足す判断は実装者に委ねる** (足すなら理由を報告すること) |
 | 5 (追加) | `PRAGMA foreign_keys=OFF` を `BEGIN IMMEDIATE` の後に移動する (landmine — SQLite はトランザクション開始後のこの PRAGMA 変更を無視する) | `test_migrate_signals_fk_repairs_dangling_claimed_row` ほか repair 系全テスト (FK が実効的に ON のままだと dangling 行の INSERT で `sqlite3.IntegrityError` が飛び、repair 自体が実行できない) |
 | 6 (追加) | `finally: conn.execute("PRAGMA foreign_keys=ON")` を削除する | `test_migrate_signals_fk_restores_foreign_keys_pragma_after_failure` |
 | 7 (追加) | INSERT..SELECT の列リストから `id` を落とす (AUTOINCREMENT に任せて renumber してしまう) | `test_signals_migration_preserves_ids_and_autoincrement_sequence` |
@@ -9031,6 +9038,32 @@ Expected: `no such table: reflection_attempts`、`ModuleNotFoundError: agentic_f
 
 - [ ] **Step 3: 最小実装**
 
+最初に `tests/store/test_db.py` の全表集合を Task 15 完了時点へ更新する。Task 16
+完了時点の 15 表集合にこの task の 1 表を足すので、変更は次のとおりである。
+
+```python
+EXPECTED = {
+    "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
+    "reflections", "account_snapshots", "improvement_backlog",
+    "improvement_runs", "econ_events", "approval_requests", "news_sources",
+    "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
+}
+
+
+def test_init_creates_all_16_tables(tmp_path):
+    conn = connect(tmp_path / "agentic.db")
+    init_db(conn)
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%'").fetchall()
+    assert {r["name"] for r in rows} == EXPECTED
+    assert TABLE_NAMES == frozenset(EXPECTED)
+```
+
+`EXPECTED` は省略記号をソースへ書かず、Task 16 が作った 15 個の文字列をすべて
+温存して末尾へ `"reflection_attempts"` を追加する。この変更後、Task 15 単独の
+Step 4 で `TABLE_NAMES == frozenset(EXPECTED)` と実 DB の 16 表が一致する。
+
 `store/db.py` の `_SCHEMA` に orders より後で次を追加し、`TABLE_NAMES` に `reflection_attempts` を加える。`CREATE TABLE IF NOT EXISTS` なので空 DB・既存 DB・二重実行で同じ経路を使う。
 
 ```sql
@@ -9199,6 +9232,7 @@ git commit -m "feat: reflection 再試行を上限付き台帳で有限化する
 - Modify/Test: `tests/store/test_intents.py`
 - Create/Test: `tests/store/test_alert_state.py`
 - Create/Test: `tests/loops/test_gate_reject_alert.py`
+- Create/Test: `tests/core/test_executor_category.py`
 - Modify/Test: `tests/core/test_executor.py`, `tests/core/test_executor_snapshot.py`, `tests/loops/test_trade_loop_phases.py`
 
 **Interfaces:**
@@ -9216,9 +9250,12 @@ git commit -m "feat: reflection 再試行を上限付き台帳で有限化する
   def get(conn: sqlite3.Connection, key: str) -> str | None: ...
   def set(conn: sqlite3.Connection, key: str, value: str, *,
           now: datetime) -> None: ...
-  def gate_reject_streak(conn: sqlite3.Connection) -> tuple[int, int, str | None]: ...
+  # src/agentic_fx/loops/trade_loop.py
+  def gate_reject_streak(
+      conn: sqlite3.Connection,
+  ) -> tuple[int, int, str | None]: ...
   ```
-  tuple は `(streak_id, rejected_count, dominant_category)`。SQL ①②③を順に実行し、②はカテゴリで絞らない。
+  tuple は `(streak_id, rejected_count, dominant_category)`。SQL ①②③を順に実行し、②はカテゴリで絞らない。配置は `TradeLoop` の commit-post 専用集計であり store の CRUD ではないため、`src/agentic_fx/loops/trade_loop.py` の module-level 関数に確定する。テストは必ず `from agentic_fx.loops.trade_loop import gate_reject_streak` と import し、裸の未定義名を使わない。
 
 #### 全 `set_gate_result` call site の現物一覧
 
@@ -9247,6 +9284,14 @@ git commit -m "feat: reflection 再試行を上限付き台帳で有限化する
 | `executor.py:864` | False | `execution` | cancel 対象が pending_fill でない |
 | `executor.py:870` | True | `None` | cancel 受理 |
 | `trade_loop.py:318` | False | `execution` | commit-pre snapshot 取得失敗 |
+
+上表を最終 DB 行で観測できるのは **20 site** である。`executor.py:818` は正常 close
+なら `accepted/NULL` が残るので観測できるが、直後の
+`close_order_from_snapshot()` が `SnapshotCoverageError` を投げる経路では
+`executor.py:825` が同じ行を `rejected/execution` に上書きする。したがって
+818 の category 変異を「coverage error 後の最終 `trade_intents.reject_category`」で
+殺すことはできない。818 は正常 close 経路、825 は coverage error 経路で別々に
+検査する。これ以外の到達不能 site は現物テスト fixture との照合では無い。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -9336,6 +9381,38 @@ def test_set_gate_result_requires_category_and_persists_it(tmp_path):
     assert intents.get(c, iid)["reject_category"] == "risk_gate"
 ```
 
+必須 keyword 化で壊れる既存呼び出しは、次の grep で得た **全 3 件**を同じ
+Step 1 で先に直す（production の `executor.py:355` は Step 3 で直す）。
+
+```bash
+rg -n --glob '*.py' '(intents_store|intents)\.(insert|set_gate_result)\(' tests src
+```
+
+```diff
+# tests/store/test_intents.py
+-iid = intents.insert(c, mid, {"action": "hold", "reasoning": "様子見"}, NOW)
+-intents.set_gate_result(c, iid, accepted=False, reject_reason="RR below 1.5")
++iid = intents.insert(c, mid, {"action": "hold", "reasoning": "様子見"},
++                     NOW, action="hold")
++intents.set_gate_result(c, iid, accepted=False, reject_reason="RR below 1.5",
++                        reject_category="mission")
+
+# tests/core/test_executor_snapshot.py
+-return intents_store.insert(conn, mid, _intent_payload(intent), NOW)
++return intents_store.insert(conn, mid, _intent_payload(intent), NOW,
++                            action=intent.action.value)
+```
+
+既存テスト内の `insert` は上の 2 件、`set_gate_result` は上の 1 件だけである。
+Step 3 では production の残る 1 件を次のとおり直す。
+
+```diff
+ iid = intents_store.insert(self.conn, mission_id,
+-                           _intent_payload(intent), now)
++                           _intent_payload(intent), now,
++                           action=intent.action.value)
+```
+
 `tests/store/test_alert_state.py` を作成する。
 
 ```python
@@ -9359,7 +9436,114 @@ def test_alert_state_rejects_unknown_key(tmp_path):
         alert_state.set(c, "anything", "1", now=NOW)
 ```
 
-`tests/loops/test_gate_reject_alert.py` は DB fixture で SQL 意味論と commit-post を分離して書く。
+`tests/loops/test_gate_reject_alert.py` は DB fixture で SQL 意味論と commit-post を分離して書く。ファイル先頭と全 helper は次の実コードにする（既存 `tests/loops/test_trade_loop.py::_loop` と production の `build_app` / `_scheduler_tick_once` をそのまま通す）。
+
+```python
+from pathlib import Path
+from shutil import copyfile
+from unittest.mock import patch
+
+import pytest
+
+from agentic_fx.core.contracts import FixedClock
+from agentic_fx.loops.trade_loop import gate_reject_streak
+from agentic_fx.runners.base import MissionResult
+from agentic_fx.runners.fake_runner import FakeRunner
+from agentic_fx.service import _scheduler_tick_once, build_app, run_init
+from agentic_fx.store import alert_state, intents, missions
+from agentic_fx.store.db import connect, init_db
+from tests.loops.test_trade_loop import NOW, _loop
+from tests.store.test_rag import FakeEmbedding
+
+
+class _RecordingNotifier:
+    def __init__(self):
+        self.sent = []
+        self.fail = False
+
+    def send(self, text):
+        if self.fail:
+            raise RuntimeError("notify failed")
+        self.sent.append(text)
+
+
+class _ExecuteFails:
+    def __init__(self, message):
+        self.message = message
+
+    def execute(self, *args, **kwargs):
+        raise AssertionError(self.message)
+
+
+def _conn(tmp_path):
+    c = connect(tmp_path / "alerts.db")
+    init_db(c)
+    return c
+
+
+def _intent(c, action, gate_result, reject_category):
+    mid = missions.start(c, "trade", "local", "test", NOW)
+    iid = intents.insert(c, mid, {"action": action}, NOW, action=action)
+    intents.set_gate_result(
+        c, iid, accepted=gate_result == "accepted",
+        reject_reason=None if gate_result == "accepted" else "test rejection",
+        reject_category=reject_category)
+    return iid
+
+
+def _settings_with_threshold(settings, threshold):
+    return settings.model_copy(update={
+        "alert": settings.alert.model_copy(update={
+            "consecutive_gate_reject": threshold})})
+
+
+def _completed_hold_loop(tmp_path, threshold=10):
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "test"}, [])])
+    loop.settings = _settings_with_threshold(loop.settings, threshold)
+    loop.executor.settings = loop.settings
+    loop.notifier = _RecordingNotifier()
+    return conn, loop, runner, tp
+
+
+def _loop_with_threshold(tmp_path, threshold):
+    conn, loop, _, _ = _completed_hold_loop(tmp_path, threshold)
+    notifier = loop.notifier
+    return loop, conn, loop._conn_supervisor, notifier
+
+
+def _app_with_threshold(tmp_path, threshold):
+    root = tmp_path / "app"
+    (root / "config").mkdir(parents=True)
+    copyfile(Path(__file__).resolve().parents[2] /
+             "config" / "settings.yaml.example",
+             root / "config" / "settings.yaml.example")
+    with patch("agentic_fx.service.PriceProvider") as provider, \
+         patch("agentic_fx.service._check_llama_swap"):
+        provider.return_value.healthcheck.return_value = "test"
+        run_init(root)
+        app = build_app(root, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    app.settings = _settings_with_threshold(app.settings, threshold)
+    app.trade_loop.settings = app.settings
+    app.executor.settings = app.settings
+    app.notifier = _RecordingNotifier()
+    app.trade_loop.notifier = app.notifier
+    return app
+
+
+def _inject_alert_failure(loop, stage, monkeypatch):
+    if stage == "evaluate":
+        monkeypatch.setattr(
+            "agentic_fx.loops.trade_loop.gate_reject_streak",
+            lambda conn: (_ for _ in ()).throw(RuntimeError("evaluate")))
+    elif stage == "notify":
+        loop.notifier.fail = True
+    else:
+        monkeypatch.setattr(
+            alert_state, "set",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("state_update")))
+```
 
 ```python
 def test_streak_id_is_previous_accepted_open_id(tmp_path):
@@ -9479,11 +9663,91 @@ def test_commit_post_notifies_gate_reject_streak(tmp_path):
 @pytest.mark.parametrize("stage", ["evaluate", "notify", "state_update"])
 def test_commit_post_alert_exception_never_changes_finalized_mission_to_failed(
         tmp_path, stage, monkeypatch):
-    conn, loop, runner, tp = _completed_hold_loop(tmp_path)
+    conn, loop, runner, tp = _completed_hold_loop(tmp_path, threshold=1)
+    _intent(conn, "open", "rejected", "risk_gate")
     _inject_alert_failure(loop, stage, monkeypatch)
     assert loop.run_once() == {"result": "hold", "order_id": None, "reasons": []}
     assert conn.execute("SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()[0] == "completed"
 ```
+
+同じ Step 1 で `tests/core/test_executor_category.py` を新設し、21 site を次の
+1 本の table-driven test で管理する。`route` は同ファイル内の callable で、
+各 callable はコメントに示した既存 fixture と public/commit-core API を呼び、
+戻り値を `(conn, intent_id)` に統一する。
+
+```python
+@pytest.mark.parametrize(
+    ("site", "route", "expected"),
+    [
+        ("executor.py:369", route_origin_non_scheduler, "origin"),
+        ("executor.py:379", route_non_trade_mission, "mission"),
+        ("executor.py:410", route_legacy_open_no_account, "risk_gate"),
+        ("executor.py:427", route_legacy_open_bad_conversion, "risk_gate"),
+        ("executor.py:452", route_open_risk_gate_reject, "risk_gate"),
+        ("executor.py:464", route_open_accepted, None),
+        ("executor.py:565", route_open_snapshot_stale, "execution"),
+        ("executor.py:574", route_open_snapshot_no_account, "risk_gate"),
+        ("executor.py:588", route_open_exposure_not_covered, "execution"),
+        ("executor.py:609", route_open_pair_not_covered, "execution"),
+        ("executor.py:622", route_open_currency_not_covered, "execution"),
+        ("executor.py:686", route_legacy_close_not_open, "execution"),
+        ("executor.py:692", route_legacy_close_accepted, None),
+        ("executor.py:789", route_close_snapshot_not_open, "execution"),
+        ("executor.py:800", route_close_snapshot_missing, "execution"),
+        ("executor.py:812", route_close_snapshot_stale, "execution"),
+        ("executor.py:818", route_close_snapshot_accepted, None),
+        ("executor.py:825", route_close_snapshot_mismatch, "execution"),
+        ("executor.py:864", route_cancel_not_pending, "execution"),
+        ("executor.py:870", route_cancel_pending, None),
+        ("trade_loop.py:318", route_commit_pre_snapshot_failure, "execution"),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_every_set_gate_result_site_persists_category(
+        tmp_path, site, route, expected):
+    conn, iid = route(tmp_path)
+    row = conn.execute(
+        "SELECT gate_result,reject_category FROM trade_intents WHERE id=?",
+        (iid,),
+    ).fetchone()
+    assert row is not None, f"{site} did not persist its intent"
+    assert row["reject_category"] == expected
+    assert row["gate_result"] == ("accepted" if expected is None else "rejected")
+```
+
+各 route の入力と DB 前提は曖昧にせず次で固定する。実装時には表の「既存
+fixture / 呼出し」をそのまま callable 本体へ移す（各 route は 5--15 行で、
+最後に `SELECT MAX(id)` を読み `(conn, iid)` を返す）。
+
+| route | intent / DB 前提 | 既存 fixture / 呼出し |
+|---|---|---|
+| `route_origin_non_scheduler` | OPEN, `Origin.ASK`; fresh account | `test_executor._setup`; `handle_intent` |
+| `route_non_trade_mission` | OPEN, scheduler; mission loop=`ask` | `_setup`; `missions.start(...,"ask",...)`; `handle_intent` |
+| `route_legacy_open_no_account` | OPEN; `DELETE account_snapshots` | `_setup`; `handle_intent` |
+| `route_legacy_open_bad_conversion` | OPEN; fresh account; `rate_fn` raises `DataUnhealthy` | `_setup`; replace `cycle_rate_fn`; `handle_intent` |
+| `route_open_risk_gate_reject` | OPEN, `take_profit=148.30` | `_setup`; `handle_intent` |
+| `route_open_accepted` | valid OPEN | `_setup`; `handle_intent` |
+| `route_open_snapshot_stale` | valid OPEN; captured_at=`NOW-999s` | `test_executor_snapshot._make_executor`; `open_from_snapshot(...,max_snapshot_age_sec=5)` |
+| `route_open_snapshot_no_account` | valid snapshot then delete account | `_make_executor`; `open_from_snapshot` |
+| `route_open_exposure_not_covered` | snapshot後に EURUSD OPEN を insert | `_make_executor`; `_insert_open_order`; `open_from_snapshot` |
+| `route_open_pair_not_covered` | USDJPY intent + EURUSD snapshot | `_make_executor`; `open_from_snapshot` |
+| `route_open_currency_not_covered` | USDJPY spec + empty rates | `_make_executor`; `ExecutionSnapshot`; `open_from_snapshot` |
+| `route_legacy_close_not_open` | CLOSE order_id=999999 | `_setup`; `handle_intent` |
+| `route_legacy_close_accepted` | valid OPEN order then CLOSE | `_setup`; `handle_intent` |
+| `route_close_snapshot_not_open` | cancelled row + CLOSE | `_make_executor`; `close_from_snapshot` |
+| `route_close_snapshot_missing` | OPEN row + snapshot=None | `_make_executor`; `close_from_snapshot` |
+| `route_close_snapshot_stale` | OPEN row + old `CloseSnapshot` | `_make_executor`; `close_from_snapshot(...,max_snapshot_age_sec=5)` |
+| `route_close_snapshot_accepted` | OPEN row + matching fresh `CloseSnapshot` | `_make_executor`; `close_from_snapshot` |
+| `route_close_snapshot_mismatch` | OPEN row + different order_id の fresh `CloseSnapshot` | `_make_executor`; `close_from_snapshot` |
+| `route_cancel_not_pending` | CANCEL order_id=999999 | `_setup`; `handle_intent` |
+| `route_cancel_pending` | valid limit OPENで pending_fill を作り CANCEL | `_setup`; `handle_intent` |
+| `route_commit_pre_snapshot_failure` | completed OPEN; `gather_open_snapshot` raises `DataUnhealthy` | `test_trade_loop._loop`; `run_once` |
+
+`executor.py:818` と `executor.py:825` は前述の上書き関係があるため、818 の
+route は matching snapshot で正常終了させ、825 の route だけ mismatch を渡す。
+これにより各変異を別々に殺せる。commit-pre が正しく作った snapshot を同じ
+intent に渡す production 配線だけでは 609/622/825 は到達しないが、既存の
+commit-core API 防御テストと同じく壊れた境界入力を直接渡して到達させる。
 
 - [ ] **Step 2: 失敗を確認し、call site 件数を再監査する**
 
@@ -9495,11 +9759,37 @@ rg -n 'intents_store\.set_gate_result\(' src/agentic_fx/core/executor.py src/age
 rg -n 'accepted=True' src/agentic_fx/core/executor.py src/agentic_fx/loops/trade_loop.py
 ```
 
-Expected: 列/table/helper が無いため FAIL。束 B 合流後の grep は親骨格どおり 23 / accepted 4 が期待値。現物どおり 21 / accepted 4 のままなら、この Step で実装を止めて指揮者に「親骨格の 23 が現物と不一致」と報告し、親プランの既知事実を訂正してから再開する。
+Expected: 列/table/helper が無いため FAIL。束 B 合流後も **21 / accepted 4** が正常値。21 以外なら束 B が call site を増減した事実と新しい grep 全行を指揮者へ報告し、表と parametrize を現物に同期してから再開する。
 
 - [ ] **Step 3: 最小実装**
 
 `store/db.py` は `trade_intents` を定数 DDL + rebuild migration にする。新 DDL の CHECK は legacy の `action IS NULL` を先頭で除外する。
+
+同時に `tests/store/test_db.py` の Task 15 完了時点 16 表集合へ
+`"alert_state"` を追加し、関数名を次のように更新する。
+
+```python
+EXPECTED = {
+    "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
+    "reflections", "account_snapshots", "improvement_backlog",
+    "improvement_runs", "econ_events", "approval_requests", "news_sources",
+    "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
+    "alert_state",
+}
+
+
+def test_init_creates_all_17_tables(tmp_path):
+    conn = connect(tmp_path / "agentic.db")
+    init_db(conn)
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%'").fetchall()
+    assert {r["name"] for r in rows} == EXPECTED
+    assert TABLE_NAMES == frozenset(EXPECTED)
+```
+
+省略記号は説明用でありソースには書かない。Task 15 までの 16 文字列を温存して
+17 表にするため、Task 17 の Step 4 がこの task 単独で green になる。
 
 ```sql
 CREATE TABLE IF NOT EXISTS trade_intents (
@@ -9627,6 +9917,7 @@ commit-post の deferred 通知 drain 後、`out is None` 判定より前に `se
 ```bash
 uv run pytest tests/store/test_db.py tests/store/test_intents.py tests/store/test_alert_state.py -q
 uv run pytest tests/core/test_executor.py tests/core/test_executor_snapshot.py tests/loops/test_trade_loop.py tests/loops/test_trade_loop_phases.py tests/loops/test_gate_reject_alert.py -q
+uv run pytest tests/core/test_executor_category.py -q
 rg -n 'intents_store\.set_gate_result\(' src/agentic_fx/core/executor.py src/agentic_fx/loops/trade_loop.py
 rg -n 'reject_category=' src/agentic_fx/core/executor.py src/agentic_fx/loops/trade_loop.py
 ```
@@ -9657,17 +9948,12 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | commit-post helper の `except Exception` を外す（state update） | `test_commit_post_alert_exception_never_changes_finalized_mission_to_failed[state_update]` |
 | `action IS NULL` を CHECK から外す | `test_trade_intents_migration_accepts_legacy_rejected_row_with_null_action` |
 
-call site category 変異は上表の **全 21 箇所（束 B 後に 23 なら全 23）へ 1 箇所ずつ独立に**当てる。accepted 4 箇所は `None → "risk_gate"`、rejected は正しい値を別の 3 category の一つへ変え、該当経路の既存テストに `trade_intents.reject_category` の単独 assert を追加して 1:1 で殺す。最低対応は次のとおり。
-
-| site 群 | killer test |
-|---|---|
-| origin / mission | `test_ask_origin_rejected_for_open_category` / `test_ask_mission_id_rejected_category` |
-| `_open` account / conversion / evaluate | `test_no_fresh_snapshot_reject_category` / `test_open_rejected_conversion_category` / `test_gate_reject_category` |
-| open snapshot 5 site | `tests/core/test_executor_snapshot.py` に site ごとの既存 fixture を使う `test_*_reject_category` 5 本 |
-| legacy close rejected / accepted | `test_close_non_open_reject_category` / `test_close_open_accept_category_none` |
-| close snapshot 5 site | `tests/core/test_executor_snapshot.py` に `test_close_*_reject_category` 4 本 + accepted 1 本 |
-| cancel rejected / accepted | `test_cancel_non_pending_reject_category` / `test_cancel_pending_accept_category_none` |
-| trade_loop snapshot error | `test_commit_pre_snapshot_failure_has_execution_category` |
+call site category 変異は Step 1 の
+`test_every_set_gate_result_site_persists_category` の **21 行へ 1 箇所ずつ独立に**
+当てる。accepted 4 箇所は `None -> "risk_gate"`、rejected 17 箇所は表の期待値を
+別 category に変える。killer 名は全 site 共通の上記 parametrize test で、pytest
+node id の `site`（例: `executor.py:369`）が 1:1 の識別子になる。818/825 は
+matching/mismatch route を分け、上書き後の同じ行を誤って検査しない。
 
 各変異で `grep -n -A2 -B1 'set_gate_result' <対象ファイル>` を表示し、固有テストだけが red になること、revert 後 green を ledger に記録する。
 
@@ -9679,6 +9965,7 @@ git add src/agentic_fx/store/db.py src/agentic_fx/store/intents.py \
   src/agentic_fx/loops/trade_loop.py src/agentic_fx/config.py \
   config/settings.yaml.example tests/store/test_db.py tests/store/test_intents.py \
   tests/store/test_alert_state.py tests/loops/test_gate_reject_alert.py \
+  tests/core/test_executor_category.py \
   tests/core/test_executor.py tests/core/test_executor_snapshot.py \
   tests/loops/test_trade_loop_phases.py
 git commit -m "feat: gate rejection の連続区間を commit-post で通知する (plan9 task17)"
@@ -9821,10 +10108,10 @@ git commit -m "docs: llama-swap timeout の cold warm 実測を記録する (pla
 | D3 last id 更新削除 | 17 / 5 | `test_threshold_notifies_once_per_accepted_streak` |
 | D3 action=open 削除 | 17 / 5 | `test_close_rejection_is_not_counted` |
 | D3 category=risk_gate を SQL ②へ追加 | 17 / 5 | `test_streak_count_does_not_filter_reject_category` |
-| D3 call site category 誤値（適用範囲全体） | 17 / 5 | site 群 21（束 B 後 23 なら 23）の category 単独テスト |
+| D3 call site category 誤値（適用範囲全体） | 17 / 5 | site 群 **21** の category 単独テスト (下の parametrize 表で全件) |
 | D3 通知失敗後も id 更新 | 17 / 5 | `test_notification_failure_does_not_update_streak_id` |
 | D3 判定を conn_core 化 | 17 / 5 | `test_gate_alert_reads_only_conn_supervisor` |
-| D3 scheduler thread で評価 | 17 / 5 | `test_gate_alert_notifier_is_never_called_on_scheduler_thread` |
+| D3 scheduler thread で評価 | 17 / 5 | `test_scheduler_tick_never_notifies_gate_reject_streak` |
 | D3 commit-post 例外捕捉削除 | 17 / 5 | `test_commit_post_alert_exception_never_changes_finalized_mission_to_failed[evaluate/notify/state_update]` |
 | D8 cold / warm の片方欠落 | 18 / 5 | 計測文書の cold / warm heading 検査 |
 | D8 異なる 2 モデルの second cold 欠落 | 18 / 5 | improve alias/value 検査 |
@@ -9833,7 +10120,11 @@ git commit -m "docs: llama-swap timeout の cold warm 実測を記録する (pla
 
 #### ② プレースホルダ不在の確認
 
-実装計画に未確定値の代用文字列、内容省略、他 Task への丸投げは無い。Task 18 は計測前に成果物自体を作らず、実測後に実値だけで作成するため仮の timeout 値を置かない。
+Task 15/17 の表数更新、旧 signature 呼出し、alert fixture、scheduler 実配線、
+`gate_reject_streak` の import と配置は具体化した。Task 17 の category 検査は
+21 行の parametrize に集約し、site id・到達条件・期待 category を 1:1 にした。
+Task 18 は計測前に成果物自体を作らず、実測後に実値だけで作成するため仮の
+timeout 値を置かない。
 
 #### ③ 束 A Task 4 の回帰ピン書換え
 
@@ -9843,15 +10134,19 @@ git commit -m "docs: llama-swap timeout の cold warm 実測を記録する (pla
 
 | ファイル | 競合 | 統合規則 |
 |---|---|---|
-| `store/db.py` | Task 13/19 が rebuild helper と `init_db`、Task 16 が OHLCV 分割、Task 15/17 が新表・trade_intents rebuild | 束 D/C を先に取り込み、既存 migration 呼び出しを一つも落とさず Task 15 → 17 を末尾へ直列追加。`TABLE_NAMES` と `tests/store/test_db.py::EXPECTED` を最終集合で更新 |
+| `store/db.py` | Task 13/19 が rebuild helper と `init_db`、Task 16 が OHLCV 分割、Task 15/17 が新表・trade_intents rebuild | 束 D/C を先に取り込み、既存 migration 呼び出しを一つも落とさず Task 15 → 17 を末尾へ直列追加。Task 16=15 表、Task 15=16 表、Task 17=17 表として各 task 内で `TABLE_NAMES` と `tests/store/test_db.py::EXPECTED` を同期 |
 | `executor.py` | Task 6/7 が deadline 配線、Task 17 が insert/set_gate_result 引数のみ | 束 B 後に grep を再実行。Task 17 は判定・return・risk gate 呼出しを変えず keyword 引数だけ追加 |
 | `trade_loop.py` | Task 4 が reason 出口、Task 17 が snapshot reject category と commit-post alert | Task 4 の failure reason と deferred notification drain を温存。alert は 357-366 の commit-post 内、scheduler から非到達 |
 | `config.py` / example | Task 16 が cache retention、Task 15/17 が reflection/alert | strict model の top-level fields と example sections を同じ commit 系列で同期 |
 
 #### ⑤ カバーできなかった項目
 
-- 親骨格の既知事実「`set_gate_result` 23 箇所」と現 worktree の機械検索結果「21 箇所」が不一致。現在存在する 21 箇所は全列挙したが、存在しない 2 箇所は列挙できない。Task 17 Step 2 で束 B 合流後に再計数し、21 のままなら親プラン訂正を blocking とする。
-- Task 17 Step 1 の `_loop_with_threshold` / `_intent` / `_completed_hold_loop` / `_inject_alert_failure` / `_ExecuteFails` は同じ新規テストファイル内で実 fixture を組み立てる必要がある。本計画ではテスト本体の検査コードを示したが、既存 `_loop` fixture の引数形が束 A/B 統合後に変わる可能性があるため、その時点の constructor に合わせる統合作業が残る。
+- ~~親骨格の「23 箇所」と現物「21 箇所」の不一致~~ → **解消済み**。指揮者が現物照合し **21 が正**と確定 (23 は定義行とコメント言及を含む誤記) で、親骨格・設計書とも訂正済み。Task 17 Step 2 の再計数は「21 以外なら束 B が call site を増減させた」という**変化の検出**が目的であり、21 は正常値である。
+- `executor.py:609` / `622` / `825` の defensive branch は production の正常な
+  commit-pre→commit-core 配線では到達しない。Step 1 は既存 snapshot API テストと
+  同じく壊れた境界入力を直接渡して call site を到達させる。`818` は `825` に
+  上書きされ得るため matching snapshot の正常 close で単独観測する。この制約を
+  外して「production 経路だけで全 21 site」を殺すことはできない。
 - Task 18 の実測値・採用 timeout は実機の TTL unload と GPU 環境が無ければ計画段階では確定できない。これは D8 が明示する計測 task の本質であり、仮値は置かなかった。
 - notifier の成功判定は現行 `Notifier.send()` が例外なしを成功とする契約に依存する。HTTP 2xx 以外を内部で握り潰す実装へ将来変わる場合は、戻り値契約を別 task で明示する必要がある。
 
