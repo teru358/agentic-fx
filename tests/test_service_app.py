@@ -2184,3 +2184,37 @@ def test_trade_loop_healthcheck_provider_reuses_injected_provider_seam(tmp_path)
     assert app.trade_loop.provider.readonly is True
     app.trade_loop.provider.get_quote("USDJPY")
     stub_provider.get_quote.assert_called_once_with("USDJPY")
+
+
+def test_check_llama_swap_improve_props_failure_omits_improve_line(capsys):
+    """Task 5 / 段 0 の生存変異: **異モデル構成で improve の /props だけが
+    失敗**したとき、improve 行を出さない (trade 側は従来どおり表示する)。
+
+    `if improve_ctx is not None:` を外す変異は**フルスイート 1800 passed の
+    まま生存する** (指揮者が実測) — 既存の異モデルテストは /props が必ず
+    成功する handler しか持たず、/props 失敗のテストは**同一モデル構成**の
+    ものしかないため、improve 側のガードだけが未検査で残っていた。
+
+    ガードが無いと init が `improve model 'improve-m' ctx None` と表示する。
+    「取得できなかった」ことを「ctx が None である」と読める形で出すのは、
+    設定ミスの診断を誤らせる。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "trade-m"}]})
+        if path == "/props":
+            if request.url.params.get("model") == "improve-m":
+                return httpx.Response(500)
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": 65536}})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettingsDiff())
+
+    out = capsys.readouterr().out
+    assert "improve model" not in out
+    assert "None" not in out
+    # trade 側は影響を受けない。
+    assert "llama-swap OK (model 'trade-m' loaded, ctx 65536)" in out
