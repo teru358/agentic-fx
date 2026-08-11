@@ -96,4 +96,13 @@ def test_agent_runner_docstring_states_reason_contract():
     (設計: 2026-08-10-context-overflow-diagnosis-design.md §4.3)。"""
     doc = AgentRunner.__doc__ or ""
     assert "reason" in doc
-    assert "外部応答の本文を生で" in doc
+    # ⚠️ pin は**動詞まで**含める。`"外部応答の本文を生で"` だけだと
+    # `入れない` → `入れてよい` の**意味反転を素通り**させる (ローカル LLM
+    # レビュー 3 本が一致して指摘・指揮者が実測確認)。
+    assert "外部応答の本文を生で入れない" in doc
+    # 「現在の適用範囲」段落 (spec §4.3 が本 task に含めよと明示した内容) は
+    # **丸ごと削除しても上の 2 assert が通ってしまう**ため個別に pin する
+    # (sonnet レビュー I1・実測確認済み)。特に最後の一文は**プラン 10 実装者
+    # への申し送り**であり、黙って消えると誰も気づけない。
+    assert "現在の適用範囲" in doc
+    assert "ブロッキングチェックリスト" in doc

@@ -19,7 +19,7 @@ from typing import Callable
 import httpx
 import jsonschema
 
-from agentic_fx._safe_error import safe_error_text
+from agentic_fx._safe_error import safe_error_text, safe_text
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
 from agentic_fx.runners.response_parser import ParseError, parse_json_output
 from agentic_fx.tools.registry import ToolRegistry
@@ -30,6 +30,67 @@ _MAX_REPAIR_RETRIES = 2
 # 上限で、1 レスポンスに大量の call を詰めて max_turns の実質的な資源予算
 # (1 turn = 1 request/response) を回避する経路を塞ぐ。
 _MAX_TOOL_CALLS_PER_TURN = 16
+_CTX_EXCEEDED_TYPE = "exceed_context_size_error"
+# 実測の envelope は ~200B。65KB 超は異常 (例: リバースプロキシが返す
+# HTML エラーページ) として解析せず汎用文言に退避する (設計書 §4.1)。
+_MAX_ERROR_BODY_BYTES = 65536
+# activity 一行・Discord 通知・worker result frame を肥大化させない上限
+# (設計書 §4.1 「文字数の上限を定める」)。
+_MAX_REASON_CHARS = 500
+
+
+def _is_positive_int(v: object) -> bool:
+    """bool を除く正整数か (設計書 §4.1: 「str/bool を除く正整数」)。"""
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def _normalize_reason(text: str) -> str:
+    """`reason` を activity/通知向けに正規化する: `safe_text` で URL・
+    秘密を伏字にし、改行・制御文字を単一行へ畳み、文字数上限で切り詰める
+    (設計書 §4.1 — 安全化・単一行化・長さ上限)。"""
+    text = safe_text(text)
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    text = " ".join(text.split())
+    if len(text) > _MAX_REASON_CHARS:
+        text = text[:_MAX_REASON_CHARS] + "…(truncated)"
+    return text
+
+
+def _reason_from_http_error(e: httpx.HTTPError, model: str) -> str:
+    """HTTPError から `reason` を組み立てる (設計書 §4.1)。
+
+    **status code で分岐しない** — 413/422/500 でも同じ JSON error
+    envelope を同じロジックで解析する (codex I4)。解析できなければ
+    (JSON でない・上限超過・形状不正・型不正) 例外を出さず、従来どおりの
+    汎用文言 (`safe_error_text(e)`) に退避する。**レスポンス本文そのもの
+    はここで一度読むだけで、呼び出し元 (`messages`/transcript) には
+    一切渡さない。**
+    """
+    if not isinstance(e, httpx.HTTPStatusError):
+        return _normalize_reason(safe_error_text(e))
+    body = e.response.content
+    if len(body) > _MAX_ERROR_BODY_BYTES:
+        return _normalize_reason(safe_error_text(e))
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return _normalize_reason(safe_error_text(e))
+    if not isinstance(payload, dict):
+        return _normalize_reason(safe_error_text(e))
+    err = payload.get("error")
+    if not isinstance(err, dict):
+        return _normalize_reason(safe_error_text(e))
+    if err.get("type") == _CTX_EXCEEDED_TYPE:
+        n_prompt = err.get("n_prompt_tokens")
+        n_ctx = err.get("n_ctx")
+        if _is_positive_int(n_prompt) and _is_positive_int(n_ctx):
+            return _normalize_reason(
+                f"context exceeded: prompt {n_prompt} tokens > "
+                f"n_ctx {n_ctx} (model={model})")
+    message = err.get("message")
+    if isinstance(message, str) and message:
+        return _normalize_reason(message)
+    return _normalize_reason(safe_error_text(e))
 
 
 class LocalRunner(AgentRunner):
@@ -79,10 +140,10 @@ class LocalRunner(AgentRunner):
         def timed_out() -> bool:
             return self._time() >= deadline
 
-        def _finish(status: str) -> MissionResult:
+        def _finish(status: str, *, reason: str | None = None) -> MissionResult:
             """Terminal return with timeout priority (F4)."""
             return MissionResult("timeout" if timed_out() else status, None,
-                                 messages)
+                                 messages, reason=reason)
 
         for _turn in range(mission.max_turns):
             remaining = deadline - self._time()
@@ -98,9 +159,10 @@ class LocalRunner(AgentRunner):
             except httpx.TimeoutException:
                 return MissionResult("timeout", None, messages)
             except httpx.HTTPError as e:
+                reason = _reason_from_http_error(e, self._model)
                 _log.warning("llama-swap request failed: %s",
                              safe_error_text(e))
-                return _finish("failed")
+                return _finish("failed", reason=reason)
             if timed_out():
                 return _finish("timeout")
 
