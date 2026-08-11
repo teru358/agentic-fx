@@ -518,6 +518,20 @@ def test_reason_is_single_line():
     assert "\t" not in r.reason
 
 
+def test_reason_collapses_printable_horizontal_whitespace():
+    """M5a: isprintable() だけでは除去できない空白を split/join が畳む。"""
+    envelope = {"error": {"type": "other", "message": "alpha  beta"}}
+    r = _runner_for_json_body(400, envelope).run(_mission())
+    assert r.reason == "alpha beta"
+
+
+def test_reason_strips_non_whitespace_nonprintable_character():
+    """M5b: split/join だけでは除去できない NUL を isprintable が落とす。"""
+    envelope = {"error": {"type": "other", "message": "alpha\x00beta"}}
+    r = _runner_for_json_body(400, envelope).run(_mission())
+    assert r.reason == "alphabeta"
+
+
 def test_reason_length_is_capped():
     envelope = {"error": {"type": "other", "message": "x" * 10_000}}
     r = _runner_for_json_body(400, envelope).run(_mission())
@@ -578,10 +592,21 @@ def test_oversized_body_falls_back_to_generic_reason():
 # ---- 受入条件 5 の補強: 応答本文そのものは transcript に残らない -----------
 
 def test_response_body_not_stored_in_transcript():
+    """⚠️ 旧版の 2 本目は `assert "90010" not in serialized or "90010" in
+    (r.reason or "")` という **恒真な assert** だった (2 周目のローカル LLM
+    レビューで KAT が検出・指揮者が裏取り)。ctx 超過の `reason` には設計上
+    必ず `90010` が入る (`test_ctx_overflow_reason_includes_prompt_tokens`
+    がそれを要求している) ため **`or` の右辺が常に真**で、左辺が偽でも
+    assert は通る = **構造的に失敗し得ない**。
+    なお M15 (`messages` に応答本文を append する変異) 自体は 1 本目の
+    `exceed_context_size_error` の assert が殺すので「検出不能」ではないが、
+    **1 本目を弱めたり別の envelope に差し替えたりした瞬間に無防備になる**。
+    `reason` 側の検査は別テストの担当なので、ここでは transcript だけを
+    厳密に見る (1 検査目的 1 テスト)。"""
     r = _runner_for_json_body(400, _CTX_ENVELOPE).run(_mission())
     serialized = json.dumps(r.transcript)
-    assert "exceed_context_size_error" not in serialized
-    assert "90010" not in serialized or "90010" in (r.reason or "")
+    assert "exceed_context_size_error" not in serialized   # エラー種別が漏れない
+    assert "90010" not in serialized                       # 本文由来の数値も漏れない
 
 
 # ---- 追加検査 (spec 21 項目には無いが §4.1 の型検証要件): -----------------
@@ -750,7 +775,8 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M2 | `n_prompt_tokens` の f-string 埋め込みを削除 (`prompt X tokens` の `X` を空にする) | `test_ctx_overflow_reason_includes_prompt_tokens` |
 | M3 | `n_ctx` の f-string 埋め込みを削除 | `test_ctx_overflow_reason_includes_n_ctx` |
 | M4 | `model=` の f-string 埋め込みを削除 | `test_ctx_overflow_reason_includes_model` |
-| M5 | `_normalize_reason` の改行畳み込み (`" ".join(text.split())`) を削除 | `test_reason_is_single_line` |
+| M5a | `_normalize_reason` の空白畳み込み (`" ".join(text.split())`) を削除 | `test_reason_collapses_printable_horizontal_whitespace` |
+| M5b | `_normalize_reason` の `isprintable()` フィルタを削除 | `test_reason_strips_non_whitespace_nonprintable_character` |
 | M6 | `_normalize_reason` の長さ上限判定 (`if len(text) > _MAX_REASON_CHARS`) を削除 | `test_reason_length_is_capped` |
 | M7 | `_normalize_reason` から `safe_text(text)` 呼び出しを削除 | `test_reason_uses_safe_text_to_strip_urls` |
 | M8 | `_finish` 内の `status` を固定文字列 `"context_exceeded"` に差し替える | `test_ctx_overflow_status_is_still_failed` |
@@ -882,6 +908,12 @@ def test_main_puts_reason_in_result_frame_for_improve_profile(
         monkeypatch, tmp_path):
     """Task 3 / CP10 の improve profile 側 (別コードパス — mission_worker.py
     の improve 分岐は trade 分岐と独立した result frame 構築コードを持つ)。"""
+    # Landlock はプロセス生涯に不可逆。既存テストと同じ seam で bootstrap を
+    # 止め、pytest プロセスを sandbox 化しない。
+    import agentic_fx.mission_worker as worker_module
+    monkeypatch.setattr(worker_module, "_bootstrap_improve_profile",
+                        lambda *args, **kwargs: None)
+
     def settings_mutator(settings_dict):
         pass  # improve は既定 settings のまま (backend=local)
 
@@ -1444,7 +1476,7 @@ def test_check_llama_swap_same_model_calls_props_once(capsys):
         path = request.url.path
         if path.endswith("/models"):
             return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
-        if path.endswith("/props"):
+        if path == "/props":
             calls["props"] += 1
             return httpx.Response(200, json={
                 "default_generation_settings": {"n_ctx": 65536}})
@@ -1467,7 +1499,7 @@ def test_check_llama_swap_different_models_improve_first_trade_last(capsys):
         path = request.url.path
         if path.endswith("/models"):
             return httpx.Response(200, json={"data": [{"id": "trade-m"}]})
-        if path.endswith("/props"):
+        if path == "/props":
             model = request.url.params.get("model")
             call_order.append(("props", model))
             return httpx.Response(200, json={
@@ -1495,7 +1527,7 @@ def test_check_llama_swap_props_http_failure_does_not_fail_init(capsys):
         path = request.url.path
         if path.endswith("/models"):
             return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
-        if path.endswith("/props"):
+        if path == "/props":
             calls["props"] += 1
             return httpx.Response(500)
         return httpx.Response(200, json={})
@@ -1517,7 +1549,7 @@ def test_check_llama_swap_props_ctx_wrong_type_is_not_displayed(capsys):
         path = request.url.path
         if path.endswith("/models"):
             return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
-        if path.endswith("/props"):
+        if path == "/props":
             calls["props"] += 1
             return httpx.Response(200, json={
                 "default_generation_settings": {"n_ctx": "65536"}})
@@ -1540,7 +1572,7 @@ def test_check_llama_swap_props_ctx_missing_is_not_displayed(capsys):
         path = request.url.path
         if path.endswith("/models"):
             return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
-        if path.endswith("/props"):
+        if path == "/props":
             calls["props"] += 1
             return httpx.Response(200, json={"default_generation_settings": {}})
         return httpx.Response(200, json={})
@@ -1562,7 +1594,7 @@ def test_check_llama_swap_props_ctx_bool_is_not_displayed(capsys):
         path = request.url.path
         if path.endswith("/models"):
             return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
-        if path.endswith("/props"):
+        if path == "/props":
             calls["props"] += 1
             return httpx.Response(200, json={
                 "default_generation_settings": {"n_ctx": True}})
@@ -1585,7 +1617,7 @@ def test_check_llama_swap_unexpected_exception_in_props_is_not_swallowed():
         path = request.url.path
         if path.endswith("/models"):
             return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
-        if path.endswith("/props"):
+        if path == "/props":
             raise RuntimeError("unexpected boom")
         return httpx.Response(200, json={})
 
@@ -1638,7 +1670,10 @@ def _fetch_model_ctx(base: str, model: str) -> int | None:
     失敗でも None を返し、想定外例外は伝播させて init を落とす。"""
     import httpx
     try:
-        r = httpx.get(f"{base}/props", params={"model": model}, timeout=5)
+        api_root = base.rstrip("/")
+        if api_root.endswith("/v1"):
+            api_root = api_root[:-3]
+        r = httpx.get(f"{api_root}/props", params={"model": model}, timeout=5)
         r.raise_for_status()
         n_ctx = r.json()["default_generation_settings"]["n_ctx"]
     except (httpx.RequestError, httpx.HTTPStatusError, ValueError,
@@ -1733,6 +1768,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M4 | `_fetch_model_ctx` の型検証 (`if not isinstance(n_ctx, int) or ...`) を削除し常に `n_ctx` を返す | `test_check_llama_swap_props_ctx_wrong_type_is_not_displayed` / `_missing_is_not_displayed` (`KeyError` 由来で None になるので実際には `_missing` は既存 except 節で守られる。型検証削除の主対象は wrong_type/bool) |
 | M5 | `isinstance(n_ctx, bool)` の除外を削除する | `test_check_llama_swap_props_ctx_bool_is_not_displayed` |
 | M6 | `_fetch_model_ctx` の `except (...)` を `except Exception:` に広げる | `test_check_llama_swap_unexpected_exception_in_props_is_not_swallowed` |
+| M7 | `/v1` を除かず `f"{base}/props"` に戻す | 全 handler が `request.url.path == "/props"` を要求するため props call-count が 0 となり、`test_check_llama_swap_same_model_calls_props_once` ほかが red |
 
 各変異を注入したら `grep -n "_model_load_order\|_fetch_model_ctx" src/agentic_fx/service.py` で改変を目視確認してから対象テストのみ実行し red を確認、revert して green に戻す。
 
@@ -1747,7 +1783,8 @@ trade モデルしか見ていなかった _check_llama_swap を improve も含�
 重複除去リストに拡張。異なるモデルなら improve→trade の順で処理し、
 trade を最後に置く (llama-swap の VRAM/TTL 次第で後発ロードが先発を
 unload しうるため、init 終了時に取引判断モデルを hot にする)。
-/props の取得失敗・形状不正は警告止まりで init を成功させ、想定外
+/props は OpenAI 互換 `/v1` ではなく llama-swap root から取得する。
+取得失敗・形状不正は警告止まりで init を成功させ、想定外
 例外だけは握らず落とす。n_ctx は表示のみで保存しない。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
@@ -1885,6 +1922,9 @@ EOF
         # 注入点の作法 (PriceProvider.to_account_rate を呼び出し側が
         # account_currency/max_skew_min を束縛して渡す想定)。
         self.rate_fn = rate_fn
+        # 以下も既存 __init__ の一部であり、置換時に必ず温存する。省略不可。
+        self._last_good_rate: dict[tuple[str, str], ConversionRate] = {}
+        self._deferred_notifications: list[str] | None = None
 ```
 
 #### 現状 (`src/agentic_fx/core/executor.py:522-547` — `gather_open_snapshot`)
@@ -2130,6 +2170,10 @@ from typing import Callable
         # 注入点の作法 (PriceProvider.to_account_rate を呼び出し側が
         # account_currency/max_skew_min を束縛して渡す想定)。
         self.rate_fn = rate_fn
+        # CLOSE の fail-soft と commit-post 通知 drain が依存する既存状態。
+        # __init__ 置換で落としてはならない。
+        self._last_good_rate: dict[tuple[str, str], ConversionRate] = {}
+        self._deferred_notifications: list[str] | None = None
 ```
 
 `gather_open_snapshot` の直前 (:521 の空行の後、`def gather_open_snapshot` の前) に新設する:
@@ -2567,7 +2611,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M4 | CLOSE-1 の検査 (`check(f"spec:{pair}")`) を削除 | `test_gather_close_snapshot_aborts_before_spec` |
 | M5 | CLOSE-2 の検査 (`check(f"rate:{spec.quote_currency}")`) を削除 | `test_gather_close_snapshot_aborts_before_resolve_close_rate` |
 | M6 | `_make_deadline_checker` の `budget` 引数を無視し独立の大きな定数 (例: `999.0`) に差し替える | `test_gather_open_snapshot_aborts_before_spec_of_intent_pair`・`test_gather_close_snapshot_aborts_before_spec` 他、超過系の全テスト |
-| M7 | 経過測定を `self.monotonic_fn() - start` から `self.clock.now() - self.clock.now()` (常に 0) 相当に変える (`monotonic_fn` を使わず `clock` を使う変異) | `test_gather_open_snapshot_deadline_independent_of_fixed_clock` (他の超過系テストも道連れで red になるが、このテストが最も直接に検出目的を表す) |
+| M7 | `_make_deadline_checker` の `elapsed = self.monotonic_fn() - start` を `elapsed = 0.0` にする（型を壊さず deadline を無効化する意味的変異） | `test_gather_open_snapshot_deadline_independent_of_fixed_clock` (`DataUnhealthy` が上がらず red。`datetime - datetime` と float の比較による `TypeError` だけで殺す変異にはしない) |
 | M8 | 比較を `elapsed > budget` から `elapsed >= budget` に変える | `test_gather_open_snapshot_boundary_exact_budget_still_succeeds`・`test_gather_close_snapshot_boundary_exact_budget_still_succeeds` |
 | M9 | `DataUnhealthy` を送出せず `return None` にする (checker が握りつぶす) | `test_gather_open_snapshot_aborts_before_spec_of_intent_pair`・`test_deadline_checker_raises_just_over_budget` |
 
@@ -2945,6 +2989,13 @@ def test_gather_close_snapshot_absorbs_cross_leg_deadline_into_degraded_rate(
     assert yq.call_args.args[0] == "EURUSD"
 ```
 
+この CLOSE 統合テストの識別力は末尾 2 assert にある。catch-all は stub の
+`AssertionError` も `DataUnhealthy` に変えるため、`rate_degraded/rate` だけでは
+伝播有無を区別できない。必ず `call_count == 1` と第 1 脚名を残す。また現行の
+CLOSE 契約では cross-leg deadline も catch-all に吸収され、外部には `stale`
+相当の degraded として見える。これは診断性上の既知制約であり、本 task では
+fail-soft 契約を変えない。
+
 このテストは `unittest.mock.patch` を使うため、ファイル冒頭の import に追記する:
 
 ```python
@@ -2956,8 +3007,8 @@ from unittest.mock import patch
 Run: `uv run pytest tests/core/test_executor_gather_deadline.py -v -k "propagates_deadline_check or absorbs_cross_leg"`
 Expected: 3 件とも FAIL する。
 - `test_cycle_rate_fn_propagates_deadline_check_to_rate_fn`: `assert all(cb is not None for cb in received)` が `received == [None, None]` で AssertionError。
-- `test_resolve_close_rate_propagates_deadline_check_to_rate_fn`: 同様に `received == [None]` で AssertionError。
-- `test_gather_close_snapshot_absorbs_cross_leg_deadline_into_degraded_rate`: `to_account_rate` は Step 3 で既に `deadline_check` を受け取れるが、`resolve_close_rate` がまだそれを転送しないため `deadline_check=None` のまま両脚が正常に解決し `rate_degraded is False`・`yq.call_count == 2` になり、`assert snapshot.rate_degraded is True` で AssertionError。
+- `test_resolve_close_rate_propagates_deadline_check_to_rate_fn`: `received == [None]` となり AssertionError。
+- `test_gather_close_snapshot_absorbs_cross_leg_deadline_into_degraded_rate`: `rate_degraded/rate` は catch-all のため変更前後とも同値になり得る。未転送なら第 2 脚まで呼ばれて `yq.call_count == 2`、正しく転送すれば第 1 脚後に止まり `== 1` なので、call-count assert で FAIL する。
 
 - [ ] **Step 7: `cycle_rate_fn` に `deadline_check` を実装し `gather_open_snapshot` から配線する**
 
@@ -3997,15 +4048,20 @@ def test_prune_cache_respects_limit(tmp_path):
 
 
 def test_prune_cache_repeated_calls_converge(tmp_path):
-    """毎 maintenance 呼び続ければ有界バッチでも最終的に追いつく (D2)。"""
+    """日次投入量が 1 batch を超えても複数 maintenance/日で追いつく。"""
     conn = _conn(tmp_path)
-    for i in range(10):
-        _cache_row(conn, f"2026-06-{i+1:02d}T00:00:00+00:00")
     cutoff = datetime(2026, 7, 22, tzinfo=timezone.utc)
-    total = 0
-    for _ in range(20):  # 上限より十分多い回数
-        total += ohlcv.prune_cache(conn, cutoff=cutoff, limit=3)
-    assert total == 10
+    batch_limit = 3
+    daily_ingest = 7
+    assert daily_ingest > batch_limit
+    for day in range(3):
+        for i in range(daily_ingest):
+            _cache_row(conn, f"2026-06-{day * daily_ingest + i + 1:02d}T00:00:00+00:00")
+        # scheduler は日次一回ではなく maintenance ごとに呼ぶ。3 回なら
+        # capacity=9 > daily_ingest=7 となり、その日の backlog が消える。
+        for _ in range(3):
+            ohlcv.prune_cache(conn, cutoff=cutoff, limit=batch_limit)
+        assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
 
 
@@ -4025,13 +4081,17 @@ def test_prune_cache_rejects_non_positive_limit(tmp_path):
 - [ ] **Step 2: テストを実行し、新関数が存在せず AttributeError で落ちることを確認する**
 
 Run: `uv run pytest tests/store/test_ohlcv.py -v`
-Expected: 全件 FAIL/ERROR (`AttributeError: module 'agentic_fx.store.ohlcv' has no attribute 'import_history_bars'` 等)
+Expected: 新 API を直接要求するテストは FAIL/ERROR
+(`AttributeError: ... import_history_bars` 等)。入力検証など変更前から成立する
+回帰 pin は green でよく、「全件 FAIL」は要求しない。
 
 #### Step 群 B: `store/db.py` の DDL + migration
 
 - [ ] **Step 3: `src/agentic_fx/store/db.py` の DDL を `ohlcv_cache`/`ohlcv_history` の 2 テーブルへ差し替える**
 
-`_OHLCV_V2_DDL` を削除し、以下に置き換える (`_SCHEMA` の先頭部分):
+`_OHLCV_V2_DDL` は既存 `_migrate_ohlcv_v2` が参照するため**モジュール定数として
+残す**。`_SCHEMA` の連結からだけ外し、以下の 2 定数を追加して先頭部分を
+`_OHLCV_CACHE_DDL + _OHLCV_HISTORY_DDL` に置き換える:
 
 ```python
 _OHLCV_CACHE_DDL = """
@@ -4187,6 +4247,11 @@ def _migrate_ohlcv_split(conn: sqlite3.Connection) -> None:
         conn.rollback()
         raise
 ```
+
+> **FK 再構築の警告:** この RENAME 先行形は `ohlcv` を参照する外部キーが
+> 無いから成立する。参照される側を再構築すると SQLite が参照元 DDL を旧名へ
+> 書き換えるため、必ず「`name_new` を CREATE → コピー →旧 `name` を DROP →
+> `name_new` を `name` へ RENAME」の順序を使う。Task 17 はこの順序で実装する。
 
 - [ ] **Step 6: `init_db` を新しい migration チェーンで書き換える**
 
@@ -4381,6 +4446,8 @@ def test_migrate_ohlcv_split_routes_unknown_source_to_history(tmp_path):
 
     conn = connect(tmp_path / "unknown.db")
     conn.executescript(db_v2_ddl_for_test())
+    conn.executescript(db_module._OHLCV_CACHE_DDL +
+                       db_module._OHLCV_HISTORY_DDL)
     conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
                  "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,"
                  "'some-future-vendor',NULL)")
@@ -4401,6 +4468,8 @@ def test_migrate_ohlcv_split_routes_live_and_import_sources_correctly(tmp_path):
 
     conn = connect(tmp_path / "mixed.db")
     conn.executescript(db_v2_ddl_for_test())
+    conn.executescript(db_module._OHLCV_CACHE_DDL +
+                       db_module._OHLCV_HISTORY_DDL)
     conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
                  "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,'yfinance',NULL)")
     conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
@@ -4999,9 +5068,14 @@ grep -n "FROM ohlcv\b\|INTO ohlcv\b\|import_bars(\|load_bars(\|load_spread(" \
 ```
 Expected: `ohlcv_history`/`import_history_bars`/`load_history_bars`/`load_history_spread` のみが残り、旧名は 0 件
 
-- [ ] **Step 23: `tests/backtest/` 配下のテストファイルを sed で一括リネームする**
+- [ ] **Step 23: grep で確定した全 call site を API の用途別にリネームする**
 
-対象は事前 grep で確認済みの 10 ファイル。すべて `source="dukascopy"`/`"mt5"` のみを使うため曖昧さは無い (`test_timeframes.py` の `ohlcv.upsert_bars(...source="yfinance")` 1 箇所だけがキャッシュ側 — 別 sed で扱う)。
+履歴側は既存 backtest 10 ファイルに加え、次を含む全 grep 結果を更新する:
+`tests/test_e2e_plugin_signal.py`、`tests/test_service_app.py`、
+`tests/plugin/test_approval.py`、`tests/plugin/test_signal_producer.py`、
+`tests/plugin/test_strategy_adapter.py`。キャッシュ側は
+`tests/test_e2e_worker_isolation.py`、`tests/store/test_records.py`、
+`tests/tools/test_mission_registry.py` を更新する。import 文も call site と別に検索する。
 
 ```bash
 FILES="tests/backtest/test_mt5_import.py tests/backtest/test_analysis.py \
@@ -5011,25 +5085,40 @@ FILES="tests/backtest/test_mt5_import.py tests/backtest/test_analysis.py \
   tests/backtest/test_cli.py tests/backtest/test_importer.py"
 
 sed -i \
-  -e 's/\bimport_bars(/import_history_bars(/g' \
-  -e 's/\bload_bars(/load_history_bars(/g' \
-  -e 's/\bload_spread(/load_history_spread(/g' \
-  -e 's/\bFROM ohlcv\b/FROM ohlcv_history/g' \
+  -e 's/import_bars/import_history_bars/g' \
+  -e 's/load_bars/load_history_bars/g' \
+  -e 's/load_spread/load_history_spread/g' \
+  -e 's/FROM ohlcv/FROM ohlcv_history/g' \
   $FILES
 
 # test_timeframes.py の唯一のキャッシュ側呼び出し (他 source との
 # 混入防止テスト) だけは upsert_cache_bars へ個別に直す
 sed -i 's/ohlcv\.upsert_bars(/ohlcv.upsert_cache_bars(/' \
   tests/backtest/test_timeframes.py
+
+HISTORY_FIXTURES="tests/test_e2e_plugin_signal.py tests/test_service_app.py \
+  tests/plugin/test_approval.py tests/plugin/test_signal_producer.py \
+  tests/plugin/test_strategy_adapter.py"
+sed -i 's/ohlcv_store\.import_bars(/ohlcv_store.import_history_bars(/g' \
+  $HISTORY_FIXTURES
+
+sed -i -e 's/ohlcv_store\.upsert_bars(/ohlcv_store.upsert_cache_bars(/g' \
+  tests/test_e2e_worker_isolation.py
+
+# `from ... import load_bars` も拾う。末尾 `(` を要求してはならない。
+sed -i -e 's/import load_bars/import load_history_bars/' \
+  -e 's/load_bars(/load_history_bars(/g' tests/backtest/test_importer.py
 ```
 
 - [ ] **Step 24: リネーム漏れが無いことを確認し、backtest 層のテスト一式を実行する**
 
 ```bash
-grep -rn "\bimport_bars(\|\bload_bars(\|\bload_spread(\|\bupsert_bars(\|FROM ohlcv\b" \
-  tests/backtest/
+rg -n '\b(import_bars|load_bars|load_spread|upsert_bars)\b|FROM ohlcv\b' \
+  src tests --glob '*.py'
 ```
-Expected: 出力なし
+Expected: 旧 API の定義・migration 用旧テーブル SQL・説明コメント以外の call
+site/import は出力なし。出力を一行ずつ分類し、上記一覧に無い call site があれば
+用途 (`LIVE_SOURCES` か `IMPORT_SOURCES`) を確認して同じ step で追加修正する。
 
 ```bash
 find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
@@ -7215,7 +7304,8 @@ def test_migrate_signals_fk_leaves_claimed_row_with_valid_mission_untouched(
     from agentic_fx.store import missions
 
     conn = _legacy_signals_and_missions_conn(tmp_path)
-    mid = missions.start(conn, "trade", "local", "m", NOW)
+    now = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
+    mid = missions.start(conn, "trade", "local", "m", now)
     _insert_legacy_signal(conn, content_hash="valid_claimed",
                           status="claimed", claimed_by_mission_id=mid,
                           claimed_at="2026-08-03T11:30:00+00:00")
@@ -7398,6 +7488,28 @@ def test_migrate_signals_fk_restores_foreign_keys_pragma_after_failure(
         db_module._migrate_signals_fk(_FailingConn(conn))
 
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_migrate_signals_fk_disables_foreign_keys_before_begin(tmp_path):
+    """順序そのものを観測し、BEGIN 後へ OFF を移す変異を殺す。"""
+    from agentic_fx.store import db as db_module
+    real = _legacy_signals_and_missions_conn(tmp_path)
+
+    class _OrderConn:
+        def __init__(self, conn):
+            self._conn, self.events = conn, []
+        def execute(self, sql, *args, **kwargs):
+            normalized = " ".join(str(sql).split()).upper()
+            if normalized in {"PRAGMA FOREIGN_KEYS=OFF", "BEGIN IMMEDIATE"}:
+                self.events.append(normalized)
+            return self._conn.execute(sql, *args, **kwargs)
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    observed = _OrderConn(real)
+    db_module._migrate_signals_fk(observed)
+    assert observed.events.index("PRAGMA FOREIGN_KEYS=OFF") < \
+           observed.events.index("BEGIN IMMEDIATE")
 ```
 
 - [ ] **Step 1.5: `datetime`/`timezone` の import を `test_db.py` に追加する**
@@ -7417,7 +7529,8 @@ from agentic_fx.store.db import TABLE_NAMES, connect, connect_readonly, init_db
 
 Run: `uv run pytest tests/store/test_db.py -k signals -v`
 
-Expected: **全件 FAIL** (`db_module._migrate_signals_fk` が存在しない `AttributeError`、または FK が無いことによる assert 失敗)
+Expected: 新 migration を直接要求するテストは FAIL。既存 schema/fixture の
+回帰 pin など変更前から成立するテストは green でよく、「全件 FAIL」は要求しない。
 
 - [ ] **Step 3: 既存の 3 ファイルの前提を修理する (まだ FK は追加しない — この時点ではスイート全体が green のままであること)**
 
@@ -8107,6 +8220,10 @@ def test_f1c_startup_reclaim_recovers_claimed_signal(tmp_path):
                                          now=old, freshness_bars=None)
     assert claimed is not None and claimed["id"] == sid  # 前提
 
+    # 起動時 recover_interrupted が claim を先に戻さないよう mission を終端化。
+    # これにより次回起動で pending 化する唯一の主体が lease 回収になる。
+    missions_module.finish(app1.conn_core, mid, "completed", NOW)
+
     # FC-2 (プラン8): instance_lock (flock) は App の全寿命で保持される
     # ため、同一 root への 2 回目の build_app は 1 回目の instance_lock を
     # 解放してからでないと InstanceAlreadyRunning になる。「再起動」を
@@ -8224,6 +8341,10 @@ def _migrate_signals_fk(conn: sqlite3.Connection) -> None:
     修復後は `PRAGMA foreign_key_check(signals)` が空であることを検査して
     からコミットする (D5 逐語)。空でなければ repair ロジックの不備であり、
     黙って進めず例外にする。
+
+    **FK 再構築の警告:** `signals` は現時点で参照元が無いため RENAME 先行が
+    動くにすぎない。参照される側を再構築するときは「新名 CREATE → コピー →
+    旧表 DROP → 新表を本来名へ RENAME」の順序を使う (Task 17 を参照)。
     """
     fk_present = any(
         fk["table"] == "missions" and fk["from"] == "claimed_by_mission_id"
@@ -8361,7 +8482,7 @@ EOF
 | 2 | `claimed` の修復を落とす (INSERT..SELECT の CASE 式から claimed 分岐を削り、dangling 行をそのままコピーする) | `test_migrate_signals_fk_repairs_dangling_claimed_row` (repair されない値で assert が落ちる、または `foreign_key_check` が violations を検出して RuntimeError になり、いずれにせよテストが red になる) |
 | 3 | `consumed`/`abandoned` を pending に戻す (CASE の ELSE を 'pending' にする等) | `test_migrate_signals_fk_repairs_dangling_consumed_row_without_reviving`・`test_migrate_signals_fk_repairs_dangling_abandoned_row_without_reviving` |
 | 4 | `foreign_key_check` を削除する (violations チェックのブロックを消す) | **❌ 殺せない — killer テストは存在しない (codex 1 周目 Critical 3)。** `test_migrate_signals_fk_leaves_foreign_key_check_clean` は「移行後に violations が空である」という**契約**のピンであって、**検査コードの存在**のピンではない。#2 の repair が正しく効いていれば violations は元々空なので、検査ブロックを丸ごと消しても**どのテストも red にならない**。**mutation ledger には「既存テストでは殺せない」と明記し、削除しないことをレビューで明示的に確認する**。どうしても動的に殺したいなら「repair 後・検査前に violation を注入するテスト専用 seam」を足す必要があるが、**最終防波堤のためだけに production へ seam を足す判断は実装者に委ねる** (足すなら理由を報告すること) |
-| 5 (追加) | `PRAGMA foreign_keys=OFF` を `BEGIN IMMEDIATE` の後に移動する (landmine — SQLite はトランザクション開始後のこの PRAGMA 変更を無視する) | `test_migrate_signals_fk_repairs_dangling_claimed_row` ほか repair 系全テスト (FK が実効的に ON のままだと dangling 行の INSERT で `sqlite3.IntegrityError` が飛び、repair 自体が実行できない) |
+| 5 (追加) | `PRAGMA foreign_keys=OFF` を `BEGIN IMMEDIATE` の後に移動する | `test_migrate_signals_fk_disables_foreign_keys_before_begin` が実行順を直接観測して red。repair SQL はコピー時に dangling FK を NULL 化するため、repair 系だけではこの順序を pin できない |
 | 6 (追加) | `finally: conn.execute("PRAGMA foreign_keys=ON")` を削除する | `test_migrate_signals_fk_restores_foreign_keys_pragma_after_failure` |
 | 7 (追加) | INSERT..SELECT の列リストから `id` を落とす (AUTOINCREMENT に任せて renumber してしまう) | `test_signals_migration_preserves_ids_and_autoincrement_sequence` |
 | 8 (追加) | `_SIGNALS_V2_DDL` から `UNIQUE(...)` を落とす | `test_signals_migration_preserves_unique_constraint` |
@@ -8529,11 +8650,13 @@ def test_improvement_runs_check_allows_null_result_for_unfinished_run(
 
 Run: `uv run pytest tests/store/test_db.py -k improvement_runs -v`
 
-Expected: 全件 FAIL (`pr_url` がまだ存在する・CHECK がまだ無い・ガードが無いため)
+Expected: 新制約・guard を直接要求するテストは FAIL。変更前から成立する保存系・
+冪等性の回帰 pin は green でよく、「全件 FAIL」は要求しない。
 
 - [ ] **Step 3: `improve_runs.finish()` から `pr_url` を削除するテストを書く (`tests/store/test_backlog.py`)**
 
-ファイル末尾に以下を追記する:
+`tests/store/test_backlog.py` の import に `import pytest` を追加し、ファイル末尾に
+以下を追記する:
 
 ```python
 def test_finish_no_longer_accepts_pr_url(tmp_path):
@@ -8555,6 +8678,10 @@ Run: `uv run pytest tests/store/test_backlog.py::test_finish_no_longer_accepts_p
 Expected: FAIL (現行の `finish()` は `pr_url` を受理してしまうため、`pytest.raises(TypeError)` の中で例外が起きず `Failed: DID NOT RAISE`)
 
 - [ ] **Step 5: `_IMPROVEMENT_RUNS_V2_DDL` 定数を追加し `_SCHEMA` を書き換える (`src/agentic_fx/store/db.py`)**
+
+> **FK 再構築の警告:** `improvement_runs` は現時点で参照元が無いので RENAME
+> 先行が成立する。参照される側では「新名 CREATE → コピー →旧表 DROP →
+> 新表を本来名へ RENAME」を使う。Task 17 の `trade_intents` が実例である。
 
 （Task 13 の Step 5 で新設された）`_SIGNALS_V2_DDL` の定義ブロックの直後、`_SCHEMA = _OHLCV_V2_DDL + """` の直前に以下を挿入する:
 
@@ -8999,13 +9126,29 @@ def test_success_clears_prior_attempt_row(tmp_path):
     reflection_attempts.bump(conn, oid, now=NOW, reason="old")
     assert cyc.run_pending() == 1
     assert reflection_attempts.attempts_of(conn, oid) == 0
+
+
+def test_rag_failure_consumes_attempt_and_stops_at_limit(tmp_path):
+    from unittest.mock import Mock
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": "ok"}, []),
+        MissionResult("completed", {"content": "ok"}, [])])
+    oid = _closed_order(conn)
+    rag.add_reflection = Mock(side_effect=RuntimeError("chroma down"))
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert reflection_attempts.attempts_of(conn, oid) == 2
+    before = conn.execute("SELECT COUNT(*) FROM missions").fetchone()[0]
+    assert cyc.run_pending() == 0
+    assert conn.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == before
 ```
 
 `tests/test_commands.py` と `tests/test_config.py` に追加する。
 
 ```python
 def test_reflect_retry_deletes_attempt_row(tmp_path):
-    cmd, conn = _commands(tmp_path)
+    conn, _state, _activity, cmd = _commands(tmp_path)
     now = cmd.clock.now()
     conn.execute("INSERT INTO orders (pair,direction,entry_type,horizon,status,"
                  "created_at,updated_at) VALUES ('USDJPY','long','market','day',"
@@ -9018,7 +9161,7 @@ def test_reflect_retry_deletes_attempt_row(tmp_path):
 
 
 def test_reflection_and_alert_defaults_from_example():
-    s = load_settings(ROOT / "config" / "settings.yaml.example")
+    s = load_settings(EXAMPLE)
     assert s.reflection.max_attempts == 2
     assert s.alert.consecutive_gate_reject == 10
 ```
@@ -9158,6 +9301,25 @@ if not finalize_ok:
     return False
 ```
 
+`rag.add_reflection(...)` の既存 `except Exception` も「completed だから無料」に
+せず、activity `reflection_rag_failed` の記録後、return 前に次を実行する:
+
+```python
+with self._core_lock:
+    attempts = reflection_attempts.bump(
+        self.conn, row["id"], now=self.clock.now(),
+        reason="rag.add_reflection failed")
+if attempts == self.settings.reflection.max_attempts:
+    try:
+        self.activity.write(
+            Category.AGGREGATE, "reflection_abandoned",
+            f"order_id={row['id']} attempts={attempts}",
+            ref_id=str(row["id"]))
+    except Exception:  # noqa: BLE001
+        _log.exception("failed to record reflection_abandoned for #%s", row["id"])
+return False
+```
+
 成功の completion marker 保存直後、同じ `core_lock` 内で `clear` する。
 
 ```python
@@ -9199,6 +9361,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | `bump()` の `attempts+1` を `attempts` にする | `test_bump_returns_incremented_attempt_count` |
 | `reflection_abandoned` write を削除 | `test_reflection_abandoned_activity_written_once_at_limit` |
 | `LEFT JOIN reflection_attempts` または join 条件を削除 | `test_failed_old_order_does_not_starve_later_order` |
+| `rag.add_reflection` 例外経路の `bump()` を削除 | `test_rag_failure_consumes_attempt_and_stops_at_limit` |
 | `:max` を `999` にする | `test_reflection_retries_to_limit_then_stops` |
 | 成功時 `clear()` を削除 | `test_success_clears_prior_attempt_row` |
 | shell の `clear()` を削除 | `test_reflect_retry_deletes_attempt_row` |
@@ -9351,6 +9514,24 @@ def test_trade_intents_migration_is_idempotent(tmp_path):
     assert {"action", "reject_category"} <= cols       # 列が消えていない
 
 
+def test_trade_intents_migration_keeps_orders_fk_usable(tmp_path):
+    """参照される側の rebuild 後も orders FK は trade_intents を指す。"""
+    c = connect(tmp_path / "legacy.db")
+    c.executescript("CREATE TABLE missions (id INTEGER PRIMARY KEY, loop TEXT NOT NULL,"
+                    "runner TEXT NOT NULL,model TEXT NOT NULL,status TEXT NOT NULL,"
+                    "started_at TEXT NOT NULL);" + _legacy_trade_intents_ddl() +
+                    "CREATE TABLE orders (id INTEGER PRIMARY KEY, intent_id INTEGER "
+                    "REFERENCES trade_intents(id));")
+    c.execute("INSERT INTO missions VALUES (1,'trade','local','m','completed','x')")
+    c.execute("INSERT INTO trade_intents (id,mission_id,payload_json,created_at) "
+              "VALUES (7,1,'{}','x')")
+    c.commit()
+    init_db(c)
+    fk = c.execute("PRAGMA foreign_key_list(orders)").fetchone()
+    assert fk["table"] == "trade_intents"
+    c.execute("INSERT INTO orders (intent_id) VALUES (7)")
+
+
 def test_trade_intents_check_rejects_invalid_gate_category_pair(tmp_path):
     c = connect(tmp_path / "db.sqlite")
     init_db(c)
@@ -9416,6 +9597,7 @@ Step 3 では production の残る 1 件を次のとおり直す。
 `tests/store/test_alert_state.py` を作成する。
 
 ```python
+import pytest
 from datetime import datetime, timezone
 from agentic_fx.store import alert_state
 from agentic_fx.store.db import connect, init_db
@@ -9473,6 +9655,18 @@ class _ExecuteFails:
 
     def execute(self, *args, **kwargs):
         raise AssertionError(self.message)
+
+
+class _RejectTradeIntentReads:
+    """alert_state の get/set は通し、判定 SQL を conn_core で読む変異だけ殺す。"""
+    def __init__(self, real):
+        self.real = real
+    def execute(self, sql, *args, **kwargs):
+        if "FROM trade_intents" in str(sql):
+            raise AssertionError("trade_intents must use conn_supervisor")
+        return self.real.execute(sql, *args, **kwargs)
+    def __getattr__(self, name):
+        return getattr(self.real, name)
 
 
 def _conn(tmp_path):
@@ -9624,7 +9818,7 @@ def test_notification_failure_does_not_update_streak_id(tmp_path):
 def test_gate_alert_reads_only_conn_supervisor(tmp_path, monkeypatch):
     loop, core, ro, notifier = _loop_with_threshold(tmp_path, threshold=1)
     _intent(core, "open", "rejected", "risk_gate")
-    monkeypatch.setattr(loop, "conn", _ExecuteFails("conn_core read forbidden"))
+    monkeypatch.setattr(loop, "conn", _RejectTradeIntentReads(core))
     loop._notify_gate_reject_streak()
     assert notifier.sent
 
@@ -9814,7 +10008,68 @@ CREATE TABLE IF NOT EXISTS alert_state (
 );
 ```
 
-`_migrate_trade_intents_observability(conn)` は `PRAGMA table_info` で両列があり残骸 `trade_intents_v1` が無ければ return、`BEGIN IMMEDIATE` 後に再検査、RENAME、DDL、全旧列を明示コピーし新列は NULL、行数一致を確認、DROP、commit、例外時 rollback とする。`init_db()` から Task 13/16/19/15 migration 後に呼び、`TABLE_NAMES` に `alert_state` を足す。
+`trade_intents` は `orders.intent_id` から参照されるため RENAME 先行は禁止。
+SQLite は RENAME 時に `orders` の DDL まで旧名へ書き換える。次の順序をそのまま
+実装する: 新名で作成 → コピー →旧表 DROP → 新表を本来名へ RENAME。
+
+```python
+_TRADE_INTENTS_NEW_DDL = """
+CREATE TABLE trade_intents_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mission_id INTEGER NOT NULL REFERENCES missions(id),
+  payload_json TEXT NOT NULL,
+  action TEXT, gate_result TEXT, reject_reason TEXT, reject_category TEXT,
+  created_at TEXT NOT NULL,
+  CHECK (action IS NULL OR gate_result IS NULL
+         OR (gate_result='accepted' AND reject_category IS NULL)
+         OR (gate_result='rejected' AND reject_category IN
+             ('risk_gate','origin','mission','execution')))
+);
+"""
+
+def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(trade_intents)")}
+    new_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='trade_intents_new'").fetchone() is not None
+    if {"action", "reject_category"} <= cols and not new_exists:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(trade_intents)")}
+        new_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='trade_intents_new'").fetchone() is not None
+        if {"action", "reject_category"} <= cols and not new_exists:
+            conn.commit()
+            return
+        if new_exists:
+            conn.execute("DROP TABLE trade_intents_new")
+        old_count = conn.execute("SELECT COUNT(*) FROM trade_intents").fetchone()[0]
+        # executescript は暗黙 commit し得るため migration transaction 内では使わない。
+        conn.execute(_TRADE_INTENTS_NEW_DDL)
+        conn.execute(
+            "INSERT INTO trade_intents_new "
+            "(id,mission_id,payload_json,action,gate_result,reject_reason,"
+            "reject_category,created_at) "
+            "SELECT id,mission_id,payload_json,NULL,gate_result,reject_reason,"
+            "NULL,created_at FROM trade_intents")
+        new_count = conn.execute(
+            "SELECT COUNT(*) FROM trade_intents_new").fetchone()[0]
+        if new_count != old_count:
+            raise RuntimeError("trade_intents migration row count mismatch")
+        conn.execute("DROP TABLE trade_intents")
+        conn.execute("ALTER TABLE trade_intents_new RENAME TO trade_intents")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+```
+
+`init_db()` から Task 13/16/19/15 migration 後に呼び、`TABLE_NAMES` に
+`alert_state` を足す。Task 13/16/19 の RENAME 先行は参照元が無い場合に限る
+ことを各束の警告コメントでも明記する。
 
 `store/intents.py` を更新する。
 
@@ -10034,7 +10289,10 @@ models = [("trade", s.runner.trade.model)]
 if s.runner.improve.model != s.runner.trade.model:
     models.append(("improve", s.runner.improve.model))
 for role, model in models:
-    input(f"{model} の TTL unload をログで確認後 Enter: ")
+    with open("/dev/tty", "r", encoding="utf-8") as tty_in:
+        print(f"{model} の TTL unload をログで確認後 Enter: ",
+              end="", flush=True)
+        tty_in.readline()
     payload = {"model": model, "max_tokens": 1,
                "messages": [{"role": "user", "content": "ping"}]}
     for phase in ("cold", "warm"):
@@ -10047,6 +10305,9 @@ for role, model in models:
         r.raise_for_status()
 PY
 ```
+
+ヒアドキュメントで stdin は EOF になるため `input()` は呼ばない。対話入力だけ
+上のコードのとおり `/dev/tty` から読む。
 
 trade と improve が同一 alias なら 1 組だけ測り、表の improve 行へ「same as trade; no second cold load」と記録する。異なるならスクリプトが improve の TTL unload 確認を別に要求して **2 回目の cold**を測る。生 JSON 出力を計測文書へ貼り、環境、結果、判断の全欄を実値で作成する。
 
