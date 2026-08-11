@@ -80,16 +80,37 @@ def _model_load_order(settings) -> list[str]:
     return [trade] if trade == improve else [improve, trade]
 
 
-def _fetch_model_ctx(base: str, model: str) -> int | None:
+# `/props` は**モデルをロードさせる** (llama-swap が swap/spawn する)。
+# したがって呼び出し側の状況で必要な予算が 4 桁違う — 単一の timeout では
+# 必ずどちらかが壊れる。実測 (2026-08-12、:8080):
+#   nomic-embed-text (137M) cold 4.26s / hot 0.0003s
+#   qwen3.6-35b-a3b_Q4 (35B) cold 13.86s / hot 0.0005s
+# 2 周目レビューの指摘: 全経路 timeout=5 だったため improve 側 (常に cold)
+# が必ず ReadTimeout → None となり、improve の ctx 行は**この機能が作られた
+# 唯一の構成 (trade != improve) で永久に出なかった**。テストは MockTransport
+# が即答するので 1802 passed はこの行の証拠にならない。
+# 短い予算で中断すると llama-swap を swap 途中に置き去りにし、後続の trade
+# smoke がそれを待つ (llama-swap-environment の TTL/incoming-request race)。
+_PROPS_TIMEOUT_COLD = 120  # smoke 前の improve。cold load を跨ぐ (smoke と同額)
+_PROPS_TIMEOUT_HOT = 5     # smoke 直後の trade。既にロード済み
+
+
+def _fetch_model_ctx(base: str, model: str, timeout: float) -> int | None:
     """`GET /props?model=<model>` から `default_generation_settings.n_ctx`
     を取得する。**例外境界を限定する** (codex I2) — 取得・形状のいずれかの
-    失敗でも None を返し、想定外例外は伝播させて init を落とす。"""
+    失敗でも None を返し、想定外例外は伝播させて init を落とす。
+
+    `timeout` に既定値は置かない。呼び出し側が cold / hot のどちらを踏むか
+    を必ず意識させるため (既定値を置くと第 3 の呼び出し点が黙って cold に
+    5 秒を割り当てて同じ欠陥が再発する)。
+    """
     import httpx
     try:
         api_root = base.rstrip("/")
         if api_root.endswith("/v1"):
             api_root = api_root[:-3]
-        r = httpx.get(f"{api_root}/props", params={"model": model}, timeout=5)
+        r = httpx.get(f"{api_root}/props", params={"model": model},
+                      timeout=timeout)
         r.raise_for_status()
         n_ctx = r.json()["default_generation_settings"]["n_ctx"]
     except (httpx.RequestError, httpx.HTTPStatusError, ValueError,
@@ -137,7 +158,8 @@ def _check_llama_swap(settings) -> None:
 
     order = _model_load_order(settings)
     if len(order) == 2:
-        improve_ctx = _fetch_model_ctx(base, order[0])
+        # improve はここが初回接触なので**必ず cold**。smoke と同額を積む
+        improve_ctx = _fetch_model_ctx(base, order[0], _PROPS_TIMEOUT_COLD)
         if improve_ctx is not None:
             print(f"improve model '{order[0]}' ctx {improve_ctx}")
 
@@ -154,7 +176,8 @@ def _check_llama_swap(settings) -> None:
               "初回 Mission が timeout する可能性があります。")
         return
 
-    trade_ctx = _fetch_model_ctx(base, trade_model)
+    # trade は直前の smoke でロード済みなので hot
+    trade_ctx = _fetch_model_ctx(base, trade_model, _PROPS_TIMEOUT_HOT)
     if trade_ctx is not None:
         print(f"llama-swap OK (model '{trade_model}' loaded, ctx {trade_ctx})")
     else:

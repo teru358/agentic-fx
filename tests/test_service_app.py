@@ -1070,6 +1070,42 @@ def test_check_llama_swap_props_trailing_slash_base_uses_root(capsys):
         "llama-swap OK (model 'qwen3.6-35b' loaded, ctx 32768)\n")
 
 
+def test_check_llama_swap_props_timeout_budget_differs_cold_vs_hot(capsys):
+    """2 周目レビュー: `/props` は**モデルをロードさせる**ので、cold な
+    improve と hot な trade で必要な予算が 4 桁違う。
+
+    実測 (2026-08-12, :8080): qwen3.6-35b-a3b_Q4 は cold 13.86s / hot 0.0005s。
+    全経路 timeout=5 だった元実装では improve 側 (常に cold) が必ず
+    ReadTimeout → None となり、improve の ctx 行が **trade != improve という
+    この機能唯一の対象構成で永久に出なかった**。
+
+    MockTransport は即答するので経過時間では測れない。**予算そのものが契約**
+    なので `request.extensions["timeout"]` を直接 assert する。
+    """
+    budgets: list[tuple[str | None, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "trade-m"}]})
+        if path == "/props":
+            budgets.append((request.url.params.get("model"),
+                            request.extensions["timeout"]["read"]))
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": 4096}})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettingsDiff())
+
+    assert budgets == [("improve-m", 120), ("trade-m", 5)]
+    # cold 側は smoke と同額であること。smoke の予算を上げて /props を
+    # 据え置く変異 (逆もまた) を殺す
+    improve_budget = dict(budgets)["improve-m"]
+    assert improve_budget >= 120
+
+
 def test_check_llama_swap_props_base_without_v1_is_not_truncated(capsys):
     """1 周目 codex I3: base_url が /v1 で終わらないとき `[:-3]` を**しない**。
 
