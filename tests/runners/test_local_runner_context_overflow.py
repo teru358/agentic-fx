@@ -121,9 +121,15 @@ def test_reason_length_is_capped():
     envelope = {"error": {"type": "other", "message": "x" * 10_000}}
     r = _runner_for_json_body(400, envelope).run(_mission())
     # ⚠️ 定数を import して比較すると **定数を変えてもテストが追随して通る**
-    # (指揮者が 500→540 の変異で実測)。上限の実効性は「切り詰めが起きること」
-    # で見て、**上限値そのものは別テストで明示的に pin する** (1 検査目的 1 テスト)。
-    assert len(r.reason) < 10_000            # 切り詰めが起きている
+    # (指揮者が 500→540 の変異で実測)。だから**リテラル**で固定する。
+    #
+    # 2 周目 (ローカル KAT 指摘・指揮者が実測): 旧版は `len < 10_000` という
+    # 緩すぎる上界だった。定数 pin は「定数の値」しか見ておらず、**その定数の
+    # 使われ方**は守っていないため、`text[:_MAX_REASON_CHARS * 2]` へ変える
+    # 変異が **1808 passed のまま生存**した (実効上限が黙って 2 倍になる)。
+    # 実効長そのものをリテラルで固定する。定数を意図的に変えるときは
+    # test_max_reason_chars_constant_is_pinned と併せてここも直すこと。
+    assert len(r.reason) == 500 + len("…(truncated)")
     assert r.reason.endswith("…(truncated)")  # 切り詰め接尾辞が付く
 
 
