@@ -160,7 +160,7 @@ class PriceProvider:
                     # が上書きし合い、source 列が嘘になる — レビュー裁定 codex I7)。
                     # 永続化用 ID への変換は _storage_source (F1)。
                     if not self.readonly:
-                        ohlcv.upsert_bars(self.conn, bars,
+                        ohlcv.upsert_cache_bars(self.conn, bars,
                                           source=_storage_source(name))
                 else:
                     base = self._finest_native_base(name, interval)
@@ -225,7 +225,7 @@ class PriceProvider:
         for name in live_sources:
             storage_name = _storage_source(name)
             for src in candidates:
-                cached = ohlcv.load_bars(self.conn, pair, src,
+                cached = ohlcv.load_cache_bars(self.conn, pair, src,
                                          source=storage_name)
                 if not cached:
                     continue
@@ -339,7 +339,7 @@ class PriceProvider:
                       self.settings.datafeed.freshness_max_min,
                       sources.INTERVAL_MIN[base])
         if not self.readonly:
-            ohlcv.upsert_bars(self.conn, raw, source=_storage_source(source))
+            ohlcv.upsert_cache_bars(self.conn, raw, source=_storage_source(source))
         return self._resample(raw, pair, interval)
 
     def _resample(self, base_bars: list[Bar], pair: str,

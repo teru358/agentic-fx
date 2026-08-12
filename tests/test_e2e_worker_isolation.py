@@ -121,7 +121,7 @@ def test_funds_protection_continues_during_blocked_mission(tmp_path):
     try:
         # TradeLoop の read-only healthcheck_provider.get_bars は bars_fn 注入
         # の対象外。実 DB キャッシュを用意し、本物の healthcheck を通す。
-        ohlcv_store.upsert_bars(
+        ohlcv_store.upsert_cache_bars(
             app.conn_core,
             [Bar("USDJPY", "1h", now, 148.00, 148.30, 147.90,
                  148.20, 100.0)],

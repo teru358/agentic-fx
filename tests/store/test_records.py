@@ -100,10 +100,10 @@ def test_ohlcv_roundtrip(tmp_path):
     c = _conn(tmp_path)
     bars = [Bar("USDJPY", "1h", NOW + timedelta(hours=i),
                 148.0, 148.5, 147.9, 148.2, 1000) for i in range(3)]
-    assert ohlcv.upsert_bars(c, bars, source="yfinance") == 3
-    ohlcv.upsert_bars(c, bars, source="yfinance")  # 冪等
-    loaded = ohlcv.load_bars(c, "USDJPY", "1h", source="yfinance")
+    assert ohlcv.upsert_cache_bars(c, bars, source="yfinance") == 3
+    ohlcv.upsert_cache_bars(c, bars, source="yfinance")  # 冪等
+    loaded = ohlcv.load_cache_bars(c, "USDJPY", "1h", source="yfinance")
     assert len(loaded) == 3
     assert loaded[0].close == 148.2
-    assert len(ohlcv.load_bars(c, "USDJPY", "1h", source="yfinance",
+    assert len(ohlcv.load_cache_bars(c, "USDJPY", "1h", source="yfinance",
                                since=NOW + timedelta(hours=2))) == 1

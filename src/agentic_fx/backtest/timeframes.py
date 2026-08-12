@@ -17,6 +17,30 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from agentic_fx.datafeed.bars import pandas_rule, resample
+from agentic_fx.store.ohlcv import IMPORT_SOURCES, LIVE_SOURCES
+
+
+def _table(source: str) -> str:
+    """`source` から読むテーブルを導出する (プラン 9 Task 16)。
+
+    本モジュールは backtest 専用ではない — `plugin/signal_producer.py` が
+    `settings.plugin.producer_source` (既定 "yfinance" = ライブ) で
+    `load_resampled_frame` を呼ぶ。読むテーブルを `ohlcv_history` に固定
+    すると、ライブ経路は空の履歴テーブルを読み、signal が 1 本も出ない
+    (producer は plugin 単位で fail-open のため WARNING が出るだけで
+    上位に伝わらない)。
+
+    テーブルは**呼び出し側に選ばせない** (store/ohlcv.py の設計判断 #1 と
+    同じ不変条件)。互いに素な allowlist から一意に導出し、どちらにも属さ
+    ない source は fail closed。
+    """
+    if source in LIVE_SOURCES:
+        return "ohlcv_cache"
+    if source in IMPORT_SOURCES:
+        return "ohlcv_history"
+    raise ValueError(
+        f"load_resampled_frame: source={source!r} は KNOWN_OHLCV_SOURCES "
+        f"{sorted(LIVE_SOURCES | IMPORT_SOURCES)} に含まれません")
 
 # 本モジュールの許容 timeframe の正規列挙 (分析用に 15m を含む)。
 RESAMPLE_TIMEFRAMES = ("1m", "15m", "1h", "4h", "1d")
@@ -127,7 +151,7 @@ def load_resampled_frame(conn: sqlite3.Connection, symbol: str,
                                        timeframe)
         lower = window_lower if lower is None else max(lower, window_lower)
 
-    q = ("SELECT bar_time, open, high, low, close, volume FROM ohlcv "
+    q = (f"SELECT bar_time, open, high, low, close, volume FROM {_table(source)} "
          "WHERE symbol=? AND interval='1m' AND source=?")
     args: list = [symbol, source]
     if lower is not None:

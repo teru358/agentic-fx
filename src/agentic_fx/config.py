@@ -96,6 +96,12 @@ class DatafeedSettings(_Strict):
                                          min_length=1)
     # 取引不可・分析専用。pair enum には入らない (§6)
     watch_symbols: list[str] = Field(default_factory=list)
+    # プラン 9 Task 16: ohlcv_cache の保持期間 (日)。起動時検証
+    # (service.py:_validate_startup) が構成済み intervals の要求日数と
+    # 突き合わせる — ここでは正値検証のみ (interval との整合はキャッシュ
+    # 窓計算 (cache_window) を import する必要があり、config.py を
+    # datafeed 層に依存させない方針を保つため service.py 側に置く)。
+    cache_retention_days: int = Field(default=30, gt=0)
 
     @model_validator(mode="after")
     def _check_intervals(self) -> "DatafeedSettings":

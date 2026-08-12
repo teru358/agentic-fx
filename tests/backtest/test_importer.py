@@ -7,7 +7,7 @@ import pytest
 from agentic_fx.backtest.dukascopy import Tick
 from agentic_fx.backtest import importer
 from agentic_fx.backtest.importer import _default_fetch, ticks_to_1m, import_dukascopy
-from agentic_fx.store.ohlcv import load_bars
+from agentic_fx.store.ohlcv import load_history_bars
 from tests.backtest.factories import _conn, _bi5, H
 
 
@@ -70,7 +70,7 @@ def test_import_dukascopy_uses_injected_fetch_and_is_idempotent(tmp_path):
     assert all("datafeed.dukascopy.com" in u for u in calls)
 
     # Verify data is readable with correct source (catches source parameter mutations)
-    bars = load_bars(conn, "USDJPY", "1m", source="dukascopy")
+    bars = load_history_bars(conn, "USDJPY", "1m", source="dukascopy")
     assert len(bars) == 1
     assert bars[0].symbol == "USDJPY"
     assert bars[0].interval == "1m"

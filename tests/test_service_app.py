@@ -539,10 +539,13 @@ class _FakeSignalSession:
 
 def _seed_1m(conn, source: str, start, minutes: int, *, price: float = 100.0,
             symbol: str = "USDJPY") -> None:
+    from agentic_fx.core.contracts import Bar
     from agentic_fx.store import ohlcv as ohlcv_store
-    rows = [(symbol, "1m", (start + timedelta(minutes=i)).isoformat(),
-             price, price, price, price, 10.0, None) for i in range(minutes)]
-    ohlcv_store.import_bars(conn, rows, source=source)
+    # 呼び出し側は producer_source (ライブ) を渡すので**キャッシュ側**へ書く
+    # (プラン 9 Task 16 の分割以降、ライブ source は履歴 API が拒否する)。
+    bars = [Bar(symbol, "1m", start + timedelta(minutes=i),
+                price, price, price, price, 10.0) for i in range(minutes)]
+    ohlcv_store.upsert_cache_bars(conn, bars, source=source)
 
 
 def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
@@ -2309,3 +2312,48 @@ def test_check_llama_swap_improve_props_failure_omits_improve_line(capsys):
     assert "None" not in out
     # trade 側は影響を受けない。
     assert "llama-swap OK (model 'trade-m' loaded, ctx 65536)" in out
+
+
+def test_build_app_rejects_cache_retention_below_interval_requirement(
+        tmp_path):
+    """設計書 D2: cache_retention_days が構成済み intervals の要求日数を
+    下回ると起動拒否する (黙って clamp しない)。yfinance で 1d を intervals
+    に足すと要求日数が 120 日に跳ね上がる (base=1h, ratio=24, lookback=5)
+    ことを使って再現する。"""
+    (tmp_path / "config").mkdir()
+    src = open("config/settings.yaml.example", encoding="utf-8").read()
+    src = src.replace(
+        "intervals: [1m, 5m, 15m, 1h, 4h]",
+        "intervals: [1m, 5m, 15m, 1h, 4h, 1d]")
+    (tmp_path / "config" / "settings.yaml").write_text(src)
+    with pytest.raises(RuntimeError, match="cache_retention_days"):
+        with patch("agentic_fx.service.PriceProvider"), \
+             patch("agentic_fx.service._check_llama_swap"):
+            build_app(tmp_path)
+
+
+def test_build_app_error_message_names_interval_and_required_days(tmp_path):
+    (tmp_path / "config").mkdir()
+    src = open("config/settings.yaml.example", encoding="utf-8").read()
+    src = src.replace(
+        "intervals: [1m, 5m, 15m, 1h, 4h]",
+        "intervals: [1m, 5m, 15m, 1h, 4h, 1d]")
+    (tmp_path / "config" / "settings.yaml").write_text(src)
+    with pytest.raises(RuntimeError, match="1d") as exc:
+        with patch("agentic_fx.service.PriceProvider"), \
+             patch("agentic_fx.service._check_llama_swap"):
+            build_app(tmp_path)
+    assert "120" in str(exc.value)
+
+
+def test_build_app_accepts_default_example_intervals_and_retention(tmp_path):
+    """既定の settings.yaml.example (intervals 5 種、cache_retention_days=30)
+    は起動を通る — 最大要求は 20 日 (4h: base=1h, ratio=4, lookback=5)。"""
+    (tmp_path / "config").mkdir()
+    src = open("config/settings.yaml.example", encoding="utf-8").read()
+    (tmp_path / "config" / "settings.yaml").write_text(src)
+    with patch("agentic_fx.service.PriceProvider") as pp, \
+         patch("agentic_fx.service._check_llama_swap"):
+        pp.return_value.healthcheck.return_value = "yfinance"
+        app = build_app(tmp_path)
+    app.close()

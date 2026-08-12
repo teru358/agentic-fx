@@ -85,7 +85,7 @@ def in_sample_until(now: datetime, months: int) -> datetime:
 def _oldest_bar_start(history_conn: sqlite3.Connection, symbol: str,
                       source: str) -> datetime:
     row = history_conn.execute(
-        "SELECT MIN(bar_time) FROM ohlcv WHERE symbol=? AND interval='1m' "
+        "SELECT MIN(bar_time) FROM ohlcv_history WHERE symbol=? AND interval='1m' "
         "AND source=?", (symbol, source)).fetchone()
     bar_time_iso = row[0] if row is not None else None
     if bar_time_iso is None:

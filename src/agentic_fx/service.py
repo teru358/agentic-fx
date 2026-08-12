@@ -30,6 +30,7 @@ from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
 from agentic_fx.core.supervisor import MissionSupervisor
+from agentic_fx.datafeed import cache_window, sources
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.news_collector import NewsCollector, seed_default_sources
@@ -316,6 +317,38 @@ class App:
         return skipped
 
 
+# service.py:get_bars の既定引数 (datafeed/price_provider.py:get_bars) と
+# 同じ値。ここが乖離すると保持期間検証が実際の要求と食い違う。
+_DEFAULT_LOOKBACK_DAYS = 5
+
+
+def _validate_cache_retention(settings) -> None:
+    """起動時ガード: datafeed.cache_retention_days が構成済み intervals の
+    live_window_days 最大値を下回っていないか (設計書 D2)。
+
+    enabled に関わらず全既知チェーン source (mt5/twelvedata/yfinance) で
+    検証する — config の enabled は運用中いつでも切り替わりうるため、
+    「今 enabled な source だけ」を基準にすると、後から別 source を有効化
+    した瞬間にキャッシュフォールバックが黙って壊れる余地を残す。
+    """
+    d = settings.datafeed
+    for interval in d.intervals:
+        for source in sources.NATIVE_INTERVALS:
+            try:
+                needed = cache_window.live_window_days(
+                    source, interval, _DEFAULT_LOOKBACK_DAYS)
+            except DataUnhealthy:
+                continue  # この source は interval を提供も導出もできない
+            if needed > d.cache_retention_days:
+                raise RuntimeError(
+                    f"datafeed.cache_retention_days={d.cache_retention_days} "
+                    f"日は interval={interval!r} (source={source!r}) が要求 "
+                    f"する {needed} 日を下回っています — "
+                    "datafeed.cache_retention_days を "
+                    f"{needed} 以上に増やすか、datafeed.intervals から "
+                    f"{interval!r} を外してください")
+
+
 def _validate_startup(settings) -> None:
     """起動時ガード (上書き 4): pairs 非空 + 実使用 schema の構文検証。
 
@@ -335,6 +368,7 @@ def _validate_startup(settings) -> None:
         raise RuntimeError(
             f"settings.plugin.producer_source={settings.plugin.producer_source!r} "
             f"is not a known source (known: {sorted(ohlcv.KNOWN_OHLCV_SOURCES)})")
+    _validate_cache_retention(settings)
 
 
 def _assert_tools_registered(registry: ToolRegistry, names: list[str]) -> None:

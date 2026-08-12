@@ -3,7 +3,7 @@
 ``_run_bench(tmp_path, span)`` は共通 helper: 合成データ (決定的 sine
 生成、平日分のみ — dukascopy 実データと同じく週末は 1m が存在しない) を
 tmp_path 上の sqlite DB に投入し、``run_replay`` の実行時間だけを
-``time.monotonic()`` で計測して返す (生成・``import_bars`` は計測対象外)。
+``time.monotonic()`` で計測して返す (生成・``import_history_bars`` は計測対象外)。
 
 - ``test_bench_one_year`` (``@pytest.mark.bench`` — 既定 skip、``-m bench``
   で実行): 合成 1 年分 (約 37 万本の平日 1m) を投入し、経過秒と tick 単価を
@@ -45,7 +45,7 @@ def _run_bench(tmp_path, span: timedelta) -> tuple[float, int]:
 
     計測は ``time.monotonic()`` のみ (実時刻 ``datetime.now`` は使わない
     — 上書き節 C の裁定どおり計測用途は「実時刻禁止」の対象外)。合成
-    データの生成・``import_bars`` は計測開始前に完了させ、計測区間には
+    データの生成・``import_history_bars`` は計測開始前に完了させ、計測区間には
     ``run_replay`` の呼び出しのみを含める。
     """
     rows = []
@@ -54,7 +54,7 @@ def _run_bench(tmp_path, span: timedelta) -> tuple[float, int]:
         rows.append(_row_at(ts, o=base, h=base + 0.05, l=base - 0.05,
                             c=base, spread=0.01))
     conn = _conn(tmp_path)
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     end = _START + span
 
     t0 = time.monotonic()

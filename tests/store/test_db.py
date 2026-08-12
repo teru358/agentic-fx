@@ -5,14 +5,14 @@ import pytest
 from agentic_fx.store.db import TABLE_NAMES, connect, connect_readonly, init_db
 
 EXPECTED = {
-    "ohlcv", "missions", "trade_intents", "orders", "reflections",
-    "account_snapshots", "improvement_backlog", "improvement_runs",
-    "econ_events", "approval_requests", "news_sources", "backtest_runs",
-    "analysis_runs", "signals",
+    "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
+    "reflections", "account_snapshots", "improvement_backlog",
+    "improvement_runs", "econ_events", "approval_requests", "news_sources",
+    "backtest_runs", "analysis_runs", "signals",
 }
 
 
-def test_init_creates_all_14_tables(tmp_path):
+def test_init_creates_all_15_tables(tmp_path):
     conn = connect(tmp_path / "agentic.db")
     init_db(conn)
     rows = conn.execute(
@@ -120,8 +120,9 @@ def test_connect_pragmas_journal_mode(tmp_path):
     assert mode == "wal"
 
 
-def test_init_db_migrates_legacy_ohlcv_to_v2(tmp_path):
-    """旧 PK (symbol,interval,bar_time) の ohlcv が source 込み PK に再構築される。"""
+def test_init_db_migrates_legacy_v1_ohlcv_into_cache_table(tmp_path):
+    """旧 v1 PK (symbol,interval,bar_time) の ohlcv が、v2 (source 込み PK)
+    を経て ohlcv_cache (source='yfinance' 合成) へ収束する。"""
     conn = connect(tmp_path / "legacy.db")
     conn.execute(
         "CREATE TABLE ohlcv (symbol TEXT NOT NULL, interval TEXT NOT NULL, "
@@ -132,37 +133,32 @@ def test_init_db_migrates_legacy_ohlcv_to_v2(tmp_path):
                  "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100)")
     conn.commit()
 
-    init_db(conn)  # ここで再構築 migration が走る
+    init_db(conn)  # v1 → v2 → split が連鎖して走る
 
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
-    assert {"source", "spread"} <= cols
-    row = conn.execute("SELECT * FROM ohlcv").fetchone()
-    assert row["source"] == "yfinance" and row["spread"] is None
-    # F9: 列順反転 (open/low 入替等) の変異を検出するため OHLCV 値を個別に
-    # 検証する (元行: 1,2,0.5,1.5,100 は全列が異なる値なので入替が露呈する)
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "ohlcv" not in names and "ohlcv_v1" not in names
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv_cache)")}
+    assert "source" in cols and "spread" not in cols
+    row = conn.execute("SELECT * FROM ohlcv_cache").fetchone()
+    assert row["source"] == "yfinance"
     assert row["open"] == 1
     assert row["high"] == 2
     assert row["low"] == 0.5
     assert row["close"] == 1.5
     assert row["volume"] == 100
-    # PK が source を含む: 同キー別 source が共存できる
-    conn.execute("INSERT INTO ohlcv (symbol,interval,bar_time,open,high,low,"
-                 "close,volume,source) VALUES ('USDJPY','1m',"
-                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,0,'dukascopy')")
-    conn.commit()
-    assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 2
 
 
 def test_init_db_ohlcv_migration_is_idempotent(tmp_path):
-    """v2 スキーマの DB に init_db を複数回流しても再構築が起きない。"""
+    """新規 DB (v1 ohlcv が最初から無い) に init_db を複数回流しても
+    split/v2 migration が何もしないこと。"""
     conn = connect(tmp_path / "v2.db")
     init_db(conn)
     init_db(conn)
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
-    assert {"source", "spread"} <= cols
-    assert conn.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name='ohlcv_v1'"
-    ).fetchone()[0] == 0
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "ohlcv" not in names and "ohlcv_v1" not in names
+    assert "ohlcv_cache" in names and "ohlcv_history" in names
 
 
 def test_ohlcv_migration_rolls_back_on_failure_and_resumes(tmp_path):
@@ -208,12 +204,15 @@ def test_ohlcv_migration_rolls_back_on_failure_and_resumes(tmp_path):
     assert "source" not in cols
     assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 1
 
-    # 再実行で成功する
+    # 再実行で成功する (v1 → v2 → split の連鎖が走り、ohlcv_cache に収束する)
     init_db(conn)
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
-    assert {"source", "spread"} <= cols
-    row = conn.execute("SELECT source, spread FROM ohlcv").fetchone()
-    assert row["source"] == "yfinance" and row["spread"] is None
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "ohlcv" not in names
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv_cache)")}
+    assert "source" in cols
+    row = conn.execute("SELECT source FROM ohlcv_cache").fetchone()
+    assert row["source"] == "yfinance"
 
 
 def _legacy_v1_ddl() -> str:
@@ -257,13 +256,13 @@ def test_ohlcv_migration_resumes_from_stale_ohlcv_v1(tmp_path):
                  "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,'yfinance',NULL)")
     conn.commit()
 
-    init_db(conn)  # ohlcv_v1 が残っていても再開して片付く
+    init_db(conn)  # ohlcv_v1 が残っていても再開して片付く (v2 → split も連鎖)
 
     names = {r["name"] for r in
              conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert "ohlcv_v1" not in names
-    assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 1
-    row = conn.execute("SELECT * FROM ohlcv").fetchone()
+    assert "ohlcv_v1" not in names and "ohlcv" not in names
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 1
+    row = conn.execute("SELECT * FROM ohlcv_cache").fetchone()
     assert (row["open"], row["high"], row["low"], row["close"],
            row["volume"]) == (1, 2, 0.5, 1.5, 100)
 
@@ -301,23 +300,21 @@ def test_ohlcv_migration_resume_raises_on_value_conflict(tmp_path):
 def test_migrate_ohlcv_v2_is_noop_when_already_migrated_by_another_connection(
         tmp_path):
     """F2: BEGIN IMMEDIATE 取得後に「既に完全移行済み」を再検証し、redundant
-    な rebuild を実行しないこと。2 接続が同時に v1 判定した状況を、同じ
-    関数を連続で呼ぶことで再現する (2 回目 = 別接続が先に完了させていた
-    想定)。"""
+    な rebuild を実行しないこと。"""
     from agentic_fx.store import db as db_module
 
     conn = connect(tmp_path / "race.db")
-    init_db(conn)  # 1 回目の移行 (正常)
-    # 別 source の行を追加。redundant rebuild が起きて INSERT..SELECT が
-    # source='yfinance' に決め打ちで上書きすれば、この行の由来情報が消える
+    conn.execute(_legacy_v1_ddl())
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100)")
+    conn.commit()
+    db_module._migrate_ohlcv_v2(conn)  # 1 回目の移行 (正常) — v2 単一テーブル止まり
     conn.execute("INSERT INTO ohlcv (symbol,interval,bar_time,open,high,low,"
                  "close,volume,source) VALUES ('USDJPY','1m',"
                  "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,0,'dukascopy')")
     conn.commit()
 
     class _SpyConn:
-        """RENAME が実際に発行されたかを数える委譲プロキシ。"""
-
         def __init__(self, real):
             self._real = real
             self.rename_calls = 0
@@ -374,7 +371,7 @@ def test_migration_backup_not_overwritten_on_retry(tmp_path):
     conn.execute(_legacy_v1_ddl())
     conn.commit()
 
-    db_module._backup_before_migration(conn)
+    db_module._backup_before_migration(conn, ".bak-ohlcv-v2")
 
     assert bak.read_text() == "sentinel"  # 上書きされていない
 
@@ -389,7 +386,10 @@ def test_migration_skips_backup_for_inmemory_db():
 
     init_db(conn)  # backup 対象パスが無いのでスキップされ、移行は成功する
 
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "ohlcv" not in names
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv_cache)")}
     assert "source" in cols
 
 
@@ -450,3 +450,98 @@ def test_connect_readonly_with_special_chars_in_filename(tmp_path, filename):
     assert row is not None, \
         f"Failed to read from {filename}: got None (opened wrong DB?)"
     assert row["loop"] == label
+
+def test_migrate_ohlcv_split_routes_unknown_source_to_history(tmp_path):
+    """設計書 §12 移行方針: 未知 source は履歴側へ隔離する (fail-safe —
+    履歴側は削除されないため、判断を誤っても失われない)。"""
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "unknown.db")
+    conn.executescript(db_v2_ddl_for_test())
+    conn.executescript(db_module._OHLCV_CACHE_DDL +
+                       db_module._OHLCV_HISTORY_DDL)
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,"
+                 "'some-future-vendor',NULL)")
+    conn.commit()
+
+    db_module._migrate_ohlcv_split(conn)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM ohlcv_history WHERE source='some-future-vendor'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM ohlcv_cache WHERE source='some-future-vendor'"
+    ).fetchone()[0] == 0
+
+
+def test_migrate_ohlcv_split_routes_live_and_import_sources_correctly(tmp_path):
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "mixed.db")
+    conn.executescript(db_v2_ddl_for_test())
+    conn.executescript(db_module._OHLCV_CACHE_DDL +
+                       db_module._OHLCV_HISTORY_DDL)
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,'yfinance',NULL)")
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:01:00+00:00',1,2,0.5,1.5,100,'mt5-live',NULL)")
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:02:00+00:00',1,2,0.5,1.5,100,'dukascopy',0.01)")
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:03:00+00:00',1,2,0.5,1.5,100,'mt5',NULL)")
+    conn.commit()
+
+    db_module._migrate_ohlcv_split(conn)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM ohlcv_history").fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM ohlcv_cache WHERE source IN ('dukascopy','mt5')"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM ohlcv_history WHERE source IN "
+        "('yfinance','mt5-live')").fetchone()[0] == 0
+
+
+def test_migrate_ohlcv_split_is_noop_when_ohlcv_table_absent(tmp_path):
+    """フレッシュ DB (init_db 直後) には `ohlcv` が存在しない — 直接呼んでも
+    何もせず正常終了する。"""
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "fresh.db")
+    init_db(conn)
+    db_module._migrate_ohlcv_split(conn)  # 例外なく即座に戻る
+    assert conn.execute(
+        "SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
+
+
+def test_migrate_ohlcv_split_raises_on_value_conflict(tmp_path):
+    """F3 相当: 分割先に既に食い違う値の行がある場合は例外で停止し、
+    `ohlcv` を温存する (黙って破棄しない)。"""
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "split_conflict.db")
+    conn.executescript(db_v2_ddl_for_test())
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,'yfinance',NULL)")
+    conn.commit()
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS ohlcv_cache ("
+        "symbol TEXT NOT NULL, interval TEXT NOT NULL, bar_time TEXT NOT NULL, "
+        "open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, "
+        "close REAL NOT NULL, volume REAL NOT NULL DEFAULT 0, "
+        "source TEXT NOT NULL, "
+        "PRIMARY KEY (symbol, interval, bar_time, source));")
+    conn.execute("INSERT INTO ohlcv_cache VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',999,2,0.5,1.5,100,'yfinance')")
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="一致しない"):
+        db_module._migrate_ohlcv_split(conn)
+
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "ohlcv" in names  # 温存されている

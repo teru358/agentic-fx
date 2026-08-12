@@ -44,6 +44,7 @@ datafeed:
   intervals: [1m, 5m, 15m, 1h, 4h]   # 取得・保持する足 (1m は必須: ペーパー約定判定が依存)
   primary_intervals: [1h]            # 判断 Mission が依存する足 (healthcheck の対象)。増やすほど単一障害点も増える
   watch_symbols: []           # 取引不可・分析専用 (§6)。pair enum には入れない
+  cache_retention_days: 30    # ohlcv_cache の保持期間 (日)。intervals の構成が要求する最小日数を下回ると起動拒否 (プラン9 Task16)
 
 news:
   cleanup_hours: 48

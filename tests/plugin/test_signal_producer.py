@@ -14,6 +14,7 @@ from pathlib import Path
 
 from agentic_fx.backtest.timeframes import floor_to_bucket
 from agentic_fx.config import load_settings
+from agentic_fx.core.contracts import Bar
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.sandbox import SandboxError
 from agentic_fx.plugin.signal_producer import SignalProducer
@@ -35,9 +36,13 @@ def _conn(tmp_path):
 
 def _seed_flat(conn, start: datetime, minutes: int, *, price: float = 100.0,
                source: str = SOURCE, symbol: str = "USDJPY") -> None:
-    rows = [(symbol, "1m", (start + timedelta(minutes=i)).isoformat(),
-             price, price, price, price, 10.0, None) for i in range(minutes)]
-    ohlcv_store.import_bars(conn, rows, source=source)
+    """producer は `settings.plugin.producer_source` (ライブ source) の足を
+    読むので、seed も**キャッシュ側**へ書く (プラン 9 Task 16 の分割以降、
+    ライブ source を履歴 API へ渡すと allowlist が拒否する)。
+    """
+    bars = [Bar(symbol, "1m", start + timedelta(minutes=i),
+                price, price, price, price, 10.0) for i in range(minutes)]
+    ohlcv_store.upsert_cache_bars(conn, bars, source=source)
 
 
 def _meta(*, name: str = "sig", kind: str = "signal", timeframe: str = "1h",

@@ -82,7 +82,7 @@ class BarFeed:
         # Preload bars and spreads from database
         # Use custom SELECT to get spread column (load_bars doesn't return it)
         rows = conn.execute(
-            "SELECT * FROM ohlcv WHERE symbol=? AND interval='1m' AND source=? "
+            "SELECT * FROM ohlcv_history WHERE symbol=? AND interval='1m' AND source=? "
             "AND bar_time>=? AND bar_time<=? ORDER BY bar_time",
             (symbol, source, start_utc.isoformat(), end_utc.isoformat())
         ).fetchall()

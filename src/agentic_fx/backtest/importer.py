@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from agentic_fx.backtest.dukascopy import Tick, decode_bi5, hour_url, point_of
-from agentic_fx.store.ohlcv import ImportResult, import_bars
+from agentic_fx.store.ohlcv import ImportResult, import_history_bars
 
 _log = logging.getLogger(__name__)
 
@@ -162,7 +162,7 @@ def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
 
         # Import bars into database
         if rows:
-            result = import_bars(conn, rows, source="dukascopy")
+            result = import_history_bars(conn, rows, source="dukascopy")
             total_inserted += result.inserted
             total_unchanged += result.unchanged
             total_conflicted += result.conflicted

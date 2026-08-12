@@ -137,7 +137,7 @@ def test_build_mission_registry_readonly_skips_bar_cache_write(tmp_path):
     assert isinstance(parsed, list) and len(parsed) == 30, result
     # 念のため RW 接続からも cache が空のままであることを確認する
     # (write skip の直接証跡)。
-    assert ohlcv.load_bars(rw_conn, "USDJPY", "1m", source="yfinance") == []
+    assert ohlcv.load_cache_bars(rw_conn, "USDJPY", "1m", source="yfinance") == []
 
 
 def test_build_mission_registry_provider_and_readonly_guard(tmp_path):

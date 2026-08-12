@@ -18,7 +18,7 @@ import httpx
 
 from agentic_fx.datafeed.price_provider import _SPECS
 from agentic_fx.datafeed.sources import _mt5_headers
-from agentic_fx.store.ohlcv import ImportResult, import_bars
+from agentic_fx.store.ohlcv import ImportResult, import_history_bars
 
 _log = logging.getLogger(__name__)
 
@@ -147,7 +147,7 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
                         float(b["open"]), float(b["high"]), float(b["low"]),
                         float(b["close"]), float(b["volume"]), None))
         if rows:
-            result = import_bars(conn, rows, source="mt5")
+            result = import_history_bars(conn, rows, source="mt5")
             total_inserted += result.inserted
             total_unchanged += result.unchanged
             total_conflicted += result.conflicted
@@ -197,7 +197,7 @@ def compare_sources(conn, symbol: str, settings, *,
 
     cur = conn.execute(
         "SELECT ta.close AS a_close, tb.close AS b_close "
-        "FROM ohlcv ta JOIN ohlcv tb "
+        "FROM ohlcv_history ta JOIN ohlcv_history tb "
         "ON ta.symbol = tb.symbol AND ta.interval = tb.interval "
         "AND ta.bar_time = tb.bar_time "
         "WHERE ta.symbol = ? AND ta.interval = '1m' "

@@ -759,7 +759,7 @@ def _seed_flat(conn, start: datetime, minutes: int, *, price: float,
                source: str = "dukascopy") -> None:
     rows = [("USDJPY", "1m", (start + timedelta(minutes=i)).isoformat(),
              price, price, price, price, 10.0, 0.01) for i in range(minutes)]
-    ohlcv_store.import_bars(conn, rows, source=source)
+    ohlcv_store.import_history_bars(conn, rows, source=source)
 
 
 def test_integration_strategy_real_session_and_run_in_sample(tmp_path, settings):
