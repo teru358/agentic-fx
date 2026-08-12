@@ -2,7 +2,7 @@
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
@@ -714,3 +714,85 @@ def test_mission_failed_notification_body_is_pinned_exactly(tmp_path):
     assert loop.run_once() is None
     assert loop.notifier.send.call_args[0][0] == (
         f"[agentic-fx] 判断 Mission 失敗: failed — {reason}")
+
+
+# ---- 2 周目 (ローカル qwen 指摘・指揮者が実測で確定) ---------------------
+# `MissionResult` 契約の強制点である `if not isinstance(result, MissionResult)`
+# は 3 箇所にある。**reflection_cycle だけが pin されており
+# (test_runner_non_mission_result_normalized_to_failed)、trade_loop の 2 箇所は
+# 裸だった** — どちらを消してもフルスイート 1806 passed のまま通る (実測)。
+# 経路の非対称であり、pin が無いのは**実注文を作る側**という最悪の組合せ。
+#
+# **失われるのは資金保護ではなく診断の帰属**である (指揮者が probe で両状態を
+# 突き合わせて確定。当初「周期が死ぬ」と書いたのは誤りだった):
+#
+#   | | ガードあり | ガードなし |
+#   |---|---|---|
+#   | run_once の戻り値 | None | None       ← 区別できない |
+#   | missions 行 | failed | failed         ← 区別できない |
+#   | orders | 0 | 0                        ← 区別できない |
+#   | activity | AGGREGATE mission_failed (ref_id=<mid>) | SYSTEM mission_boundary_failed (ref_id 無し) |
+#   | 通知 | 判断 Mission 失敗: failed | trade Mission が内部エラーで失敗しました |
+#
+# ガードが無いと AttributeError が `run_once` の never-raise サービス境界に
+# 落ち、**どの Mission がなぜ失敗したのか追えない不透明な内部エラー**になる。
+# したがって pin は activity の event 名と ref_id、および通知本文に置く
+# (戻り値や missions 行を見る pin は**恒真**になる)。
+
+class _NonMissionResultRunner:
+    """runner 契約を破って dict を返す (壊れた runner の代理)。"""
+
+    def __init__(self) -> None:
+        self.missions: list = []
+
+    def run(self, mission):
+        self.missions.append(mission)
+        return {"status": "completed",
+                "output": {"action": "open", "pair": "USDJPY",
+                           "side": "buy", "qty": 0.01}}
+
+
+def test_run_once_non_mission_result_is_attributed_not_boundary_swallowed(
+        tmp_path):
+    """runner が MissionResult 以外を返したとき、**Mission の失敗として
+    帰属される** (サービス境界の不透明な内部エラーに落ちない)。
+
+    ガードを消すと activity は `mission_boundary_failed` (ref_id 無し) に、
+    通知は「内部エラー」に変わる — どの Mission がなぜ失敗したのか追えない。
+    """
+    conn, loop, _, tp = _loop(tmp_path, [])
+    loop.runner = _NonMissionResultRunner()
+    loop.notifier.send = MagicMock()
+
+    assert loop.run_once() is None
+
+    mid = conn.execute(
+        "SELECT id FROM missions ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    lines = [ln.split("\t")
+             for ln in (tp / "a.log").read_text(encoding="utf-8").splitlines()]
+    # Mission に紐づく失敗として記録されること (event 名と ref_id の両方)
+    assert [(c, e, r) for _ts, c, e, _s, r in lines] == [
+        ("AGGREGATE", "mission_failed", str(mid))]
+    assert loop.notifier.send.call_args_list == [
+        call("[agentic-fx] 判断 Mission 失敗: failed")]
+    # 併せて: dict の中身は執行経路へ進まない
+    assert conn.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"] == 0
+
+
+def test_ask_once_non_mission_result_is_attributed_not_boundary_swallowed(
+        tmp_path):
+    """ask 経路 (`_ask_once_impl`) 側の同じガード。こちらも裸だった。
+
+    ここは戻り値そのものが両者を分ける — ガードありなら実 status を載せた
+    `(Mission 失敗: failed)`、無しならサービス境界の
+    `(Mission 失敗: internal_error)` になる。
+    """
+    conn, loop, _, _ = _loop(tmp_path, [])
+    loop.runner = _NonMissionResultRunner()
+
+    ans = loop.ask_once("今どう見てる？")
+
+    assert ans == "(Mission 失敗: failed)"       # internal_error ではない
+    row = conn.execute(
+        "SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status"] == "failed"
