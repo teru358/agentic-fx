@@ -89,21 +89,100 @@ def _query_param(url, name):
 
 def test_import_mt5_rejects_bar_time_outside_requested_window(tmp_path):
     """F5 (最終レビュー codex I2): bridge が要求窓 [current, window_end) の
-    外のバーを返した場合は無言混入させず ValueError (fail loud)。窓終端
-    ちょうど (= 次窓の開始、bridge が "to" を inclusive 解釈した場合に
-    重複し得る境界) を狙う。"""
+    外のバーを返した場合は無言混入させず ValueError (fail loud)。
+
+    ⚠ **旧版は「窓終端ちょうど」を fail loud の対象にしていたが、実測で
+    bridge は `to` を inclusive 解釈すると確定したため、終端ちょうどだけを
+    良性の落とし物として除外した** (下の
+    `test_import_mt5_drops_inclusive_right_edge_bar_without_error` が担当)。
+    **fail loud 自体は弱めていない** — ここでは終端を「1 分超えた」バーを
+    使い、真に窓外のものは従来どおり例外になることを固定する。
+    """
     conn = _conn(tmp_path)
-    window_end = H + timedelta(days=1)  # [H, H+1day) の外 (ちょうど終端)
+    window_end = H + timedelta(days=1)
+    outside = window_end + timedelta(minutes=1)   # 終端ちょうどではなく明確に外
 
     def fetch(url):
         return {"symbol": "USDJPY", "interval": "1m", "bars": [
-            {"time": window_end.isoformat(), "open": 148.0, "high": 148.2,
+            {"time": outside.isoformat(), "open": 148.0, "high": 148.2,
              "low": 147.9, "close": 148.1, "volume": 10}]}
 
     with pytest.raises(ValueError, match="USDJPY"):
         import_mt5(conn, "USDJPY", H, window_end,
                    base_url="http://x", fetch=fetch)
     assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 0
+
+
+def test_import_mt5_rejects_bar_time_before_window_start(tmp_path):
+    """窓の**左**外側も従来どおり fail loud (右端の例外化で左が緩まない)。"""
+    conn = _conn(tmp_path)
+    window_end = H + timedelta(days=1)
+    before = H - timedelta(minutes=1)
+
+    def fetch(url):
+        return {"symbol": "USDJPY", "interval": "1m", "bars": [
+            {"time": before.isoformat(), "open": 148.0, "high": 148.2,
+             "low": 147.9, "close": 148.1, "volume": 10}]}
+
+    with pytest.raises(ValueError, match="USDJPY"):
+        import_mt5(conn, "USDJPY", H, window_end,
+                   base_url="http://x", fetch=fetch)
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 0
+
+
+def test_import_mt5_drops_inclusive_right_edge_bar_without_error(tmp_path):
+    """bridge は `to` を **inclusive** で返す (実機 :8812 で実測 —
+    1 日窓に対し先頭 `T00:00`・末尾は翌 `T00:00` が含まれる)。
+
+    終端ちょうどのバーは「次窓の開始」であって bridge の不具合ではないので、
+    **例外にせず落とす**。旧実装はここで ValueError を投げており、
+    境界に 1 本でも乗ると**取り込み全体が失敗**していた
+    (実機で 1440 本が 1 本も入らなかった)。
+    """
+    conn = _conn(tmp_path)
+    window_end = H + timedelta(days=1)
+
+    def fetch(url):
+        return {"symbol": "USDJPY", "interval": "1m", "bars": [
+            {"time": H.isoformat(), "open": 148.0, "high": 148.2,
+             "low": 147.9, "close": 148.1, "volume": 10},
+            {"time": window_end.isoformat(), "open": 149.0, "high": 149.2,
+             "low": 148.9, "close": 149.1, "volume": 20}]}
+
+    r = import_mt5(conn, "USDJPY", H, window_end,
+                   base_url="http://x", fetch=fetch)
+
+    assert r.inserted == 1                       # 窓内の 1 本だけ入る
+    bars = ohlcv.load_bars(conn, "USDJPY", "1m", source="mt5")
+    assert [b.ts for b in bars] == [H]           # 終端の 1 本は入っていない
+
+
+def test_import_mt5_right_edge_bar_is_picked_up_by_the_next_window(tmp_path):
+    """落とした右端は**次窓の左端として取り込まれる** — 欠損しない。
+
+    これが無いと「右端を落とす」判断が単なるデータ欠損になる。
+    ページング境界をまたいで 1 本も失われないことを固定する。
+    """
+    conn = _conn(tmp_path)
+    boundary = H + timedelta(days=1)             # 窓 1 の終端 = 窓 2 の開始
+
+    def fetch(url):
+        ws = datetime.fromisoformat(_query_param(url, "from"))
+        we = datetime.fromisoformat(_query_param(url, "to"))
+        # bridge の実挙動を模す: 窓の両端を inclusive で返す
+        return {"symbol": "USDJPY", "interval": "1m", "bars": [
+            {"time": ws.isoformat(), "open": 148.0, "high": 148.2,
+             "low": 147.9, "close": 148.1, "volume": 10},
+            {"time": we.isoformat(), "open": 149.0, "high": 149.2,
+             "low": 148.9, "close": 149.1, "volume": 20}]}
+
+    import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
+               base_url="http://x", fetch=fetch)
+
+    bars = ohlcv.load_bars(conn, "USDJPY", "1m", source="mt5")
+    # 窓 1 の右端 (= boundary) は窓 2 の左端として入る。最終窓の右端だけが
+    # 落ちる — end は exclusive なので正しい
+    assert [b.ts for b in bars] == [H, boundary]
 
 
 def test_import_mt5_rejects_naive_start(tmp_path):

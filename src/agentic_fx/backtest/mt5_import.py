@@ -82,8 +82,11 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
     Raises:
         ValueError: start/end が naive、または UTC 以外の場合 (正時境界は
             不問 — Task 4 の hour boundary 要件はここには適用しない)。
-            または bridge が返したバーの time が要求窓 [current, window_end)
-            の外にある場合 (F5, 最終レビュー codex I2 — fail loud)。
+            または bridge が返したバーの time が要求窓の外にある場合
+            (F5, 最終レビュー codex I2 — fail loud)。**窓終端ちょうどは
+            例外にせず黙って落とす** — bridge の `to` は inclusive で
+            (実機実測)、その 1 本は次のページング窓が取り直すため欠損しない。
+            最終窓の右端だけは落ちるが `end` は exclusive なのでそれが正しい。
     """
     for dt, name in [(start, "start"), (end, "end")]:
         if dt.tzinfo is None:
@@ -99,6 +102,7 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
     total_unchanged = 0
     total_conflicted = 0
     naive_count = 0
+    right_edge_drops = 0
 
     current = start
     while current < end:
@@ -121,6 +125,19 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
             # 既存行不変性は値の上書きを防ぐだけで、窓外の新規キー挿入は
             # 防がない)。
             bar_dt = datetime.fromisoformat(bar_time_iso)
+            if bar_dt == window_end:
+                # bridge は "to" を **inclusive** で返す (2026-08-12 実機実測:
+                # 1 日窓に対し先頭 T00:00・末尾は翌 T00:00 が含まれ 1440 本)。
+                # 終端ちょうどは「次窓の開始」であって不具合ではないので
+                # 落とす。次のページング窓が current=window_end で取り直すため
+                # **欠損しない** (最終窓の右端だけは落ちるが、end は exclusive
+                # なのでそれが正しい)。
+                #
+                # 旧実装はここも fail loud にしており、境界に 1 本乗るだけで
+                # **取り込み全体が失敗**していた (実機で 1440 本が 1 本も
+                # 入らなかった)。窓外の無言混入を防ぐ F5 の目的は下の判定で維持。
+                right_edge_drops += 1
+                continue
             if not (current <= bar_dt < window_end):
                 raise ValueError(
                     f"import_mt5: symbol={symbol!r} のバー time={b['time']!r} "
@@ -136,6 +153,15 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
             total_conflicted += result.conflicted
 
         current = window_end
+
+    if right_edge_drops > 0:
+        # 期待どおりの挙動なので debug。ただし**件数は残す** — bridge が
+        # exclusive へ変わればここが 0 になり、逆に窓数より大きく増えれば
+        # bridge 側の異常を疑える。
+        _log.debug(
+            "import_mt5: dropped %d right-edge bar(s) at window_end for "
+            "symbol=%s (bridge returns \"to\" inclusive; picked up by the "
+            "next window)", right_edge_drops, symbol)
 
     if naive_count > 0:
         # F2 (fix round 1, sonnet): 同じ bridge の時刻系統が実際に破損した
