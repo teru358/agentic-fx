@@ -94,3 +94,24 @@ def test_floor_to_interval_non_utc_offset_normalizes_to_utc():
     ts = datetime(2026, 7, 22, 21, 30, tzinfo=jst)
     assert cache_window.floor_to_interval(ts, "1h") == datetime(
         2026, 7, 22, 12, 0, tzinfo=UTC)
+
+
+def test_native_1d_is_still_forced_through_the_derive_branch():
+    """段 0 変異スイープ (指揮者): `DERIVE_ONLY_INTERVALS` から `1d` を落とす
+    変異が **15 passed のまま生存**した。プランのテスト 14 件も、実装者が
+    追加した 1 件も、`1d` が derive-only であること自体を固定していない
+    (`test_base_candidates_excludes_derive_only_intervals` が見ているのは
+    「`4h` が base 候補にならない」であって `1d` の扱いではない)。
+
+    **全 source (mt5 / twelvedata / yfinance) が `1d` をネイティブに持つ**ため、
+    `1d` が DERIVE_ONLY から外れると native 分岐に落ち、窓が
+    **120 日 → 5 日と 24 分の 1 になる**。日足の導出元となる 1h キャッシュを
+    読む量が足りず、生成される日足が激減する。
+
+    `1d` を derive-only に留める理由は `4h` と同じ — 日境界はブローカー格子
+    依存 (このブローカーの D1 は真 UTC 21:00 = NY クローズ) であり、
+    ネイティブ日足を使うと格子が裏口から入る。
+    """
+    # 5 日 × (1440 / 60) = 120。native 分岐なら 5 になる
+    assert cache_window.live_window_days("yfinance", "1d", 5) == 120
+    assert cache_window.live_window_days("mt5", "1d", 3) == 72
