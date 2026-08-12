@@ -4899,6 +4899,15 @@ Expected: 全件 PASS (44 件)
 
 このファイルの `ohlcv.load_bars`/`ohlcv.upsert_bars` 呼び出しは全て live source (`yfinance`/`mt5-live`) を使っており、全件がキャッシュ API への単純改名で済む (曖昧さなし — 事前 grep で確認済み)。
 
+> **プラン欠陥 #5 (2026-08-12 実行時に判明・修正済み)**: この「事前 grep で確認済み」は**誤り**。
+> `tests/datafeed/test_price_provider.py:417` が `ohlcv.load_bars(..., source="mt5") == []` を
+> assert しており、`mt5` は IMPORT_SOURCES 側の名前。単純改名すると新 API の読み側 allowlist が
+> `ValueError` を投げ、Step 14 の期待「全件 PASS」に到達できない。
+> **修正**: 分割前の保証「`mt5` では空が返る」より、分割後の「読み側が名前ごと拒否する」の方が
+> 検査目的 (一括インポータ source の混入防止) に対して強い。assert を
+> `with pytest.raises(ValueError): ohlcv.load_cache_bars(conn, "USDJPY", "1m", source="mt5")`
+> へ置き換えた。
+
 ```bash
 sed -i \
   -e 's/ohlcv\.load_bars(/ohlcv.load_cache_bars(/g' \
@@ -4936,6 +4945,31 @@ Expected: 全件 PASS (この時点で Task 8/9/10 の窓ロジックはまだ�
 #### Step 群 E: backtest 層 (履歴専用) の付け替え
 
 すべて `ohlcv_history` へ付け替える — backtest 層は履歴データしか読み書きしないため、曖昧さは無い (事前 grep で確認済み)。
+
+> **プラン欠陥 #6 (2026-08-12 実行時に判明・修正済み — 本番の読み経路を壊す)**:
+> この「backtest 層は履歴データしか読み書きしない」は**誤り**。
+> `backtest/timeframes.py:load_resampled_frame` は backtest 専用ではなく、
+> **本番のライブ経路と共有されたリーダ**である。呼び出し元は 3 系統:
+> `backtest/analysis.py` (履歴)、`plugin/strategy_adapter.py` (`_EVAL_SOURCE="dukascopy"` = 履歴)、
+> そして **`plugin/signal_producer.py:170` (`settings.plugin.producer_source` = 既定 `"yfinance"` = ライブ)**。
+>
+> SQL を `FROM ohlcv_history` に固定すると、本番の signal producer はライブデータの入った
+> `ohlcv_cache` ではなく空の `ohlcv_history` を読む。**症状は例外ではない** —
+> `signal_producer._evaluate_one` は plugin 単位で fail-open (WARNING → cursor を進めず次 tick
+> 再試行) なので、**signal が永久に 1 本も出ないまま上位に失敗が伝わらない**。
+> `service.py:_validate_startup` の `producer_source ∈ KNOWN_OHLCV_SOURCES` (union) 検証も
+> ライブ source を通すのでここでは捕まらない。
+>
+> **修正**: `load_resampled_frame` が `source` からテーブルを**導出**する `_table()` を追加した
+> (`LIVE_SOURCES` → `ohlcv_cache` / `IMPORT_SOURCES` → `ohlcv_history` / それ以外は `ValueError`)。
+> 設計判断 #1「API はテーブルを引数で選ばせない」の不変条件は保たれる — #1 が禁じているのは
+> **呼び出し側がテーブルを選ぶこと**であり、互いに素な allowlist からの一意導出はこれに当たらない。
+> 両テーブルで SELECT する列は同一 (`spread` は履歴側のみだがこの SELECT は使わない) なので、
+> `ohlcv.py` のようにリーダを 2 本へ割る必要はない。
+> 併せて、ライブ source で seed していたフィクスチャ 3 本
+> (`tests/plugin/test_signal_producer.py` / `tests/test_e2e_plugin_signal.py` /
+> `tests/test_service_app.py`) を `upsert_cache_bars` へ振り直した。
+> 観測点は `tests/backtest/test_timeframes.py` の 4 テスト (変異 X-1/X-2 で kill 済み)。
 
 - [ ] **Step 15: `src/agentic_fx/backtest/importer.py` を付け替える**
 
@@ -5630,8 +5664,10 @@ Expected: 全件 PASS (親プランの既存件数 1726 + Task 8/16 で追加し
 | M16-12 | `_validate_cache_retention` の比較演算子を反転する (`needed > d.cache_retention_days` → `<`) | `service.py:_validate_cache_retention` | `test_build_app_rejects_cache_retention_below_interval_requirement` (今度は逆に、正常設定側で誤って RuntimeError が出て `test_build_app_accepts_default_example_intervals_and_retention` が落ちる) |
 | M16-13 | `Scheduler.__init__`/`_run_hooks` から `on_cache_maintenance` の呼び出しを削除する (配線を切る) | `core/scheduler.py:_run_hooks` | `test_tick_calls_on_cache_maintenance_every_tick_when_configured` |
 | M16-14 | `build_app` の `Scheduler(...)` から `on_cache_maintenance=on_cache_maintenance` 引数を削除する | `service.py:build_app` | `test_build_app_wires_cache_maintenance_hook` と `test_cache_maintenance_prunes_old_cache_rows` |
-| M16-15 | `on_cache_maintenance` の `cutoff` 計算から `settings.datafeed.cache_retention_days` を外し固定値にする | `service.py:on_cache_maintenance` | `test_cache_maintenance_prunes_old_cache_rows` (直接は殺せない可能性がある場合、40 日前のバーで境界固定するテストが検出する — 抜き取り確認で固定値がテストの前提と食い違うことを確認する) |
-| M16-16 | `backtest/cli.py` の `cov`/`run`/`corr` から `choices=sorted(ohlcv.IMPORT_SOURCES)` を削除する | `backtest/cli.py:register_subparsers` | `test_backtest_run_rejects_live_source` / `test_history_coverage_rejects_live_source` / `test_analyze_corr_rejects_live_source` (3 本すべて) |
+| M16-15 | `on_cache_maintenance` の `cutoff` 計算から `settings.datafeed.cache_retention_days` を外し固定値にする | `service.py:on_cache_maintenance` | **実測 (2026-08-12): 記載の `test_cache_maintenance_prunes_old_cache_rows` では生存した。** 固定値として自然に選ぶ `30` が `settings.yaml.example` の既定と一致し**等価変異**になるため (40 日/10 日の境界両側を置いても 30 日と 30 日は同じ挙動)。既定と異なる保持期間 (45 日) を明示し、30 日固定なら消える 35 日前のバーが残ることを見る `test_cache_maintenance_cutoff_follows_configured_retention_days` を追加して kill した |
+| M16-16 | `backtest/cli.py` の `cov`/`run`/`corr` から `choices=sorted(ohlcv.IMPORT_SOURCES)` を削除する | `backtest/cli.py:register_subparsers` | **実測 (2026-08-12): 記載の 3 本では生存した。** `choices` が無くても後段の初期化ガードが同じ `SystemExit(2)` を返すため、exit code だけを見る assert では**拒否した主体を区別できない**。3 本に `assert "invalid choice" in capsys.readouterr().err` を足して kill した (`test_backtest_run_rejects_live_source` / `test_history_coverage_rejects_live_source` / `test_analyze_corr_rejects_live_source`) |
+| X-1 | (指揮者の自主変異) `timeframes._table` の `LIVE_SOURCES` 分岐が `ohlcv_history` を返すようにする | `backtest/timeframes.py:_table` | `test_live_source_reads_the_cache_table` |
+| X-2 | (指揮者の自主変異) `timeframes._table` の末尾 `raise` の手前で `ohlcv_history` を返す (fail closed を既定値へ落とす) | `backtest/timeframes.py:_table` | `test_unknown_source_is_rejected` |
 | M16-17 | `_ohlcv_legacy_exists` を常に `False` を返すようにする (migration チェーンを丸ごと無効化) | `store/db.py:_ohlcv_legacy_exists` | `test_init_db_migrates_legacy_v1_ohlcv_into_cache_table` |
 
 **変異は 1 つずつ独立に当て、殺した固有のテスト名を記録する。**
