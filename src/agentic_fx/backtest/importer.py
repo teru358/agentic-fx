@@ -1,5 +1,6 @@
 """Dukascopy importer — fetch hourly tick data, aggregate to 1-minute bars, store."""
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -8,6 +9,20 @@ from agentic_fx.backtest.dukascopy import Tick, decode_bi5, hour_url, point_of
 from agentic_fx.store.ohlcv import ImportResult, import_bars
 
 _log = logging.getLogger(__name__)
+
+# ---- 応急封鎖 (2026-08-12) — 外向きリクエストの抑制 ------------------------
+# **設計の欠陥への暫定対処。** 設計書は Dukascopy を「長期 1m の一次ソース
+# (無料公開、10 年超)」と位置づけている (agentic-fx-design.md §データ) 一方で、
+# **外向きリクエストの予算という制約クラスが設計に存在しない**。この関数は
+# 1 時間 1 リクエストを間隔なしで連射するため、設計が想定する 10 年分の取得は
+# 約 87,600 リクエストになる。実際にこの開発機は Dukascopy に遮断された
+# (別 IP では同一 URL が通ることを対照実験で確認済み)。
+# **リポジトリは公開済みであり、クローンした人が同じ目に遭う** — 他人に損害を
+# 与える不具合なので、本設計 (第三者向け出口の集約: 間隔・バックオフ・総量上限・
+# 素性を名乗る UA) が入るまでの応急封鎖としてここに最小限を置く。
+_MIN_INTERVAL_SEC = 1.0     # 連続リクエストの最小間隔 (無料公開データへの礼儀)
+_MAX_REQUESTS = 500         # 1 回の呼び出しで投げる既定上限 (≈ 3 週間分)
+_THROTTLE_STATUS = (429, 503)   # 実測: UA 無しで 429、UA 付きで 503
 
 
 def _default_fetch(url: str) -> bytes:
@@ -89,7 +104,8 @@ def ticks_to_1m(ticks: list[Tick], symbol: str) -> list[tuple]:
 
 
 def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
-                     fetch=None, progress=None) -> ImportResult:
+                     fetch=None, progress=None, sleep=None,
+                     max_requests: int = _MAX_REQUESTS) -> ImportResult:
     """Import Dukascopy tick data and aggregate to 1-minute bars.
 
     Fetches hourly tick data files from Dukascopy, decodes them, aggregates
@@ -104,12 +120,20 @@ def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
         fetch: Optional fetch function (url: str) -> bytes. Defaults to _default_fetch.
                404 errors return empty bytes, other errors raise.
         progress: Optional callback (url_or_time) -> None. Called for each hour processed.
+        sleep: Optional sleep function (seconds: float) -> None. Defaults to
+               time.sleep. 連続リクエストの**間**にのみ挟む (先頭の前には入れない)。
+        max_requests: この呼び出しで投げる上限 (既定 500 ≈ 3 週間分)。
+               長期取得は**明示的に引き上げて意図を表明する**。
 
     Returns:
         ImportResult with inserted, unchanged, conflicted counts.
 
     Raises:
-        ValueError if start/end are naive, non-UTC, or not on hour boundary.
+        ValueError: start/end が naive・非 UTC・正時境界でない場合。
+            または要求範囲が `max_requests` を超える場合 (**1 本も投げずに拒否**)。
+        RuntimeError: 相手が 429/503 を返した場合。**再試行せず即座に中止**する
+            — 既に絞られている相手に再試行を重ねると状況を悪化させる
+            (リトライ/バックオフの設計は本設計の担当)。
     """
     # F2: Validate start/end are aware UTC and on hour boundary
     for dt, name in [(start, "start"), (end, "end")]:
@@ -124,6 +148,18 @@ def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
 
     if fetch is None:
         fetch = _default_fetch
+    if sleep is None:
+        sleep = time.sleep
+
+    # **1 本も投げる前に**範囲を検査する。投げてから気付いても遅い。
+    planned = int((end - start).total_seconds() // 3600) if end > start else 0
+    if planned > max_requests:
+        raise ValueError(
+            f"import_dukascopy: 要求範囲が {planned} リクエストになり "
+            f"max_requests={max_requests} を超えます。範囲を分けるか、"
+            f"意図的なら max_requests を明示的に引き上げてください "
+            f"(相手は無料公開サービスです — {_MIN_INTERVAL_SEC}s 間隔で "
+            f"{planned} 本なら約 {planned * _MIN_INTERVAL_SEC / 60:.0f} 分かかります)")
 
     # Get point value for the symbol
     point = point_of(symbol)
@@ -132,6 +168,7 @@ def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
     total_inserted = 0
     total_unchanged = 0
     total_conflicted = 0
+    sent = 0
 
     # Iterate through hours in [start, end)
     current = start
@@ -142,7 +179,20 @@ def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
 
         # Fetch hourly data
         url = hour_url(symbol, current)
-        payload = fetch(url)
+        if sent > 0:
+            # 連続リクエストの**間**にのみ挟む (先頭の前に待つ意味は無い)
+            sleep(_MIN_INTERVAL_SEC)
+        try:
+            payload = fetch(url)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in _THROTTLE_STATUS:
+                raise RuntimeError(
+                    f"import_dukascopy: HTTP {e.response.status_code} — "
+                    "相手にリクエストを絞られています。**再試行しません**。"
+                    f"{sent} 本目で中止しました。時間を空けてから、範囲を狭めて "
+                    "再開してください (連射すると遮断が長引きます)") from e
+            raise
+        sent += 1
 
         # Skip empty payloads (404, no data) — only legitimate skip reasons
         if not payload:

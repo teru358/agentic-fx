@@ -60,6 +60,10 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     imp.add_argument("--symbol", required=True)
     imp.add_argument("--from", dest="from_", type=_parse_date, required=True)
     imp.add_argument("--to", dest="to", type=_parse_date, required=True)
+    imp.add_argument("--max-requests", type=int, default=None,
+                     help="dukascopy: 1 回で投げるリクエスト上限 (既定 500)。"
+                          "相手は無料公開サービスなので 1 秒間隔で投げる — "
+                          "長期取得は範囲を分けるか、この値を明示的に上げること")
 
     comp = history_sub.add_parser("compare", help="source 間の close 差照合")
     comp.add_argument("--symbol", required=True)
@@ -130,8 +134,10 @@ def _make_dukascopy_progress():
 
 def _history_import(conn, settings, args: argparse.Namespace) -> int:
     if args.source == "dukascopy":
+        kw = {} if args.max_requests is None else {
+            "max_requests": args.max_requests}
         result = import_dukascopy(conn, args.symbol, args.from_, args.to,
-                                  progress=_make_dukascopy_progress())
+                                  progress=_make_dukascopy_progress(), **kw)
     else:  # mt5
         bridge_url = settings.datafeed.mt5.bridge_url
         if bridge_url is None:
