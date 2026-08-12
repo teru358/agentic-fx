@@ -413,59 +413,68 @@ def _migrate_ohlcv_split(conn: sqlite3.Connection) -> None:
         if not exists:
             conn.commit()
             return
-        rows = conn.execute(
-            "SELECT symbol, interval, bar_time, open, high, low, close, "
-            "volume, source, spread FROM ohlcv").fetchall()
-        for r in rows:
-            if r["source"] in LIVE_SOURCES:
-                conn.execute(
-                    "INSERT OR IGNORE INTO ohlcv_cache (symbol, interval, "
-                    "bar_time, open, high, low, close, volume, source) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    (r["symbol"], r["interval"], r["bar_time"], r["open"],
-                     r["high"], r["low"], r["close"], r["volume"],
-                     r["source"]))
-            else:
-                conn.execute(
-                    "INSERT OR IGNORE INTO ohlcv_history (symbol, interval, "
-                    "bar_time, open, high, low, close, volume, source, "
-                    "spread) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (r["symbol"], r["interval"], r["bar_time"], r["open"],
-                     r["high"], r["low"], r["close"], r["volume"],
-                     r["source"], r["spread"]))
+        # 移行先を自己完結で用意する。`init_db` は `_SCHEMA` を先に流すので
+        # 通常は既にあるが、集合演算版は**両方のテーブルへ 1 文ずつ**流す
+        # (旧実装は「その行に必要な側」しか触らなかった) ため、片側しか
+        # 無い DB でも壊れないようにする。DDL は IF NOT EXISTS で冪等。
+        # **`executescript` は使わない** — 実行前に暗黙の COMMIT を打つため、
+        # 上で取った BEGIN IMMEDIATE の書き込みロックが落ちて、二重移行を
+        # 防ぐ排他が無効になる。各定数は単一文なので `execute` で足りる。
+        conn.execute(_OHLCV_CACHE_DDL)
+        conn.execute(_OHLCV_HISTORY_DDL)
 
-        mismatches = []
-        for r in rows:
-            target = "ohlcv_cache" if r["source"] in LIVE_SOURCES \
-                else "ohlcv_history"
-            # 履歴側は spread も比較する。ohlcv_cache に spread 列は無いので
-            # キャッシュ側は OHLCV 5 列のみ。5 列だけを見ると、spread だけ
-            # 食い違う行が「一致」と判定されて旧 ohlcv が DROP され、旧 spread
-            # が無警告で失われる (spread はバックテストのコスト計算に効く)。
-            cols = "open, high, low, close, volume"
-            if target == "ohlcv_history":
-                cols += ", spread"
-            existing = conn.execute(
-                f"SELECT {cols} FROM {target} "
-                "WHERE symbol=? AND interval=? AND bar_time=? AND source=?",
-                (r["symbol"], r["interval"], r["bar_time"],
-                 r["source"])).fetchone()
-            ok = (existing is not None
-                  and _values_match(existing["open"], r["open"])
-                  and _values_match(existing["high"], r["high"])
-                  and _values_match(existing["low"], r["low"])
-                  and _values_match(existing["close"], r["close"])
-                  and _values_match(existing["volume"], r["volume"])
-                  and (target != "ohlcv_history"
-                       or _values_match(existing["spread"], r["spread"])))
-            if not ok:
-                mismatches.append(
-                    f"{r['symbol']}/{r['interval']}/{r['bar_time']}/"
-                    f"{r['source']}")
-        if mismatches:
+        # `_migrate_ohlcv_v2` と同じく**集合演算**で移す。旧実装は全行を
+        # Python へ materialize し、1 行あたり 2 文 (INSERT + 検証 SELECT)
+        # を発行していた。2 年分の 1m を 1 通貨ペアぶん持つ実 DB は ~75 万行
+        # あり、BEGIN IMMEDIATE の書き込みロックを保持したまま 150 万文を
+        # 流すことになる。移行はユーザーごとに 1 回きり・無人で走り、対象は
+        # 最も大きくなりやすい DB なので、行数に依存しない形にする。
+        live = sorted(LIVE_SOURCES)
+        marks = ",".join("?" * len(live))
+        conn.execute(
+            "INSERT OR IGNORE INTO ohlcv_cache (symbol, interval, bar_time, "
+            "open, high, low, close, volume, source) "
+            "SELECT symbol, interval, bar_time, open, high, low, close, "
+            f"volume, source FROM ohlcv WHERE source IN ({marks})", live)
+        conn.execute(
+            "INSERT OR IGNORE INTO ohlcv_history (symbol, interval, bar_time, "
+            "open, high, low, close, volume, source, spread) "
+            "SELECT symbol, interval, bar_time, open, high, low, close, "
+            f"volume, source, spread FROM ohlcv WHERE source NOT IN ({marks})",
+            live)
+
+        # 値一致検証も JOIN で行い、**不一致の行だけ**を取り出す (通常は
+        # 0 行なので行数に依存しない)。比較規則は `_values_match` と同じ —
+        # 非 NULL 同士は絶対差が許容誤差未満なら一致、NULL 同士は一致、
+        # 片側だけ NULL は不一致。
+        num = " OR ".join(f"abs(o.{c} - t.{c}) >= {_FLOAT_TOL}"
+                          for c in ("open", "high", "low", "close", "volume"))
+        # 履歴側は spread も比較する。ohlcv_cache に spread 列は無いので
+        # キャッシュ側は OHLCV 5 列のみ。5 列だけを見ると、spread だけ
+        # 食い違う行が「一致」と判定されて旧 ohlcv が DROP され、旧 spread
+        # が無警告で失われる (spread はバックテストのコスト計算に効く)。
+        spread_mismatch = (
+            "((o.spread IS NULL) <> (t.spread IS NULL) "
+            "OR (o.spread IS NOT NULL AND t.spread IS NOT NULL "
+            f"AND abs(o.spread - t.spread) >= {_FLOAT_TOL}))")
+        bad = None
+        for target, where, extra in (
+                ("ohlcv_cache", f"o.source IN ({marks})", ""),
+                ("ohlcv_history", f"o.source NOT IN ({marks})",
+                 f" OR {spread_mismatch}")):
+            bad = conn.execute(
+                "SELECT o.symbol, o.interval, o.bar_time, o.source "
+                f"FROM ohlcv o JOIN {target} t "
+                "ON t.symbol = o.symbol AND t.interval = o.interval "
+                "AND t.bar_time = o.bar_time AND t.source = o.source "
+                f"WHERE {where} AND ({num}{extra}) LIMIT 1", live).fetchone()
+            if bad is not None:
+                break
+        if bad is not None:
             raise RuntimeError(
                 "ohlcv split migration: ohlcv と ohlcv_cache/ohlcv_history で"
-                f"値が一致しない行があります ({mismatches[0]})。ohlcv は"
+                f"値が一致しない行があります ({bad['symbol']}/"
+                f"{bad['interval']}/{bad['bar_time']}/{bad['source']})。ohlcv は"
                 "温存しました。data/agentic.db.bak-ohlcv-split (または手動"
                 "バックアップ) からの復元と手動調査が必要です。")
 

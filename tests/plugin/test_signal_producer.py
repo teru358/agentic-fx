@@ -441,3 +441,28 @@ def test_multiple_signals_in_same_bucket_drop_is_observed_via_warning(
     assert count == 1
     assert "dropped by" in caplog.text
     assert "UNIQUE" in caplog.text
+
+
+def test_short_window_is_reported(tmp_path, caplog):
+    """要求 max_bars に満たない窓しか読めなかったら loud に知らせる。
+
+    `load_resampled_frame(..., max_bars=N)` は「在る分だけ」を返す。
+    キャッシュ保持期間 (`datafeed.cache_retention_days`) が plugin の
+    max_bars が要求する窓より短いと、末尾バケットは存在するので
+    `_evaluate_bucket` の fail-open 分岐に入らず、**切り詰められた系列で
+    指標が計算され signal がそのまま出る**。承認時は削除されない履歴
+    テーブルで評価するため、この劣化は本番でしか現れない。
+    """
+    conn = _conn(tmp_path)
+    # 1h plugin が 50 本要求するのに 3 バケット分しか無い状態
+    _seed_flat(conn, H - timedelta(hours=3), 3 * 60 + 1)
+    meta = _meta(name="short", kind="signal", timeframe="1h", max_bars=50)
+    fake = _FakeSandbox()
+    fake.queue("short", {"signals": []})
+    producer = SignalProducer()
+    with caplog.at_level(logging.WARNING):
+        producer.evaluate_due_plugins(
+            conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
+            sandbox_run=fake, settings=SETTINGS)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("cache_retention_days" in m for m in msgs), msgs

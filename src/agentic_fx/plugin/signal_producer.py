@@ -184,6 +184,20 @@ class SignalProducer:
                 f"{pair} {meta.timeframe} bucket starting "
                 f"{bucket_start.isoformat()}")
 
+        # `load_resampled_frame` は「在る分だけ」を返すので、要求 max_bars に
+        # 満たない窓でも上の fail-open 分岐には入らない (末尾バケットは
+        # 存在する)。切り詰められた系列で指標が計算され signal がそのまま
+        # 出るため、無音のまま品質が落ちる。承認時は削除されない履歴
+        # テーブルで評価するので、この劣化は本番でしか現れない。窓が
+        # 足りない主因はキャッシュ保持期間なので、設定名を出して知らせる。
+        if len(df) < meta.max_bars:
+            _log.warning(
+                "plugin %s (%s): %s の窓が %d 本しか読めなかった "
+                "(max_bars=%d 要求) — datafeed.cache_retention_days が "
+                "plugin の要求窓に対して短い可能性がある。指標は切り詰め"
+                "られた系列で計算される",
+                meta.name, pair, meta.timeframe, len(df), meta.max_bars)
+
         bar_ts = bucket_start.isoformat()
         if meta.kind == "signal":
             result = call(meta, {"df": df, "params": meta.params})

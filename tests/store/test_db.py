@@ -633,10 +633,9 @@ def test_migrate_ohlcv_split_rolls_back_partial_writes_on_conflict(tmp_path):
 def test_migrate_ohlcv_split_backup_uses_split_suffix(tmp_path):
     """分割 migration のバックアップ名は `.bak-ohlcv-split`。
 
-    エラーメッセージが復元先としてこの名前を案内しているので、suffix が
-    ずれると案内が実在しないファイルを指す。既存テストは
-    `_backup_before_migration` を直接呼ぶ形で、v2 用の suffix しか見て
-    いなかったため、分割側の suffix 変更が検出できなかった。
+    衝突時のエラーメッセージが復元先としてこの名前を案内しているので、
+    suffix がずれると案内が実在しないファイルを指す。v1→v2 移行の
+    `.bak-ohlcv-v2` とは別物なので、分割側は分割側で固定する。
     """
     from agentic_fx.store import db as db_module
 
