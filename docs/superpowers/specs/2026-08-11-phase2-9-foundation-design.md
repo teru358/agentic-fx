@@ -517,6 +517,18 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
 - **improve モデルの `/models` 存在確認** (プラン 9 Task 5 の 1 周目で判明、範囲外として残す) — `_check_llama_swap` の `if trade_model not in ids` は **trade だけ**を検査する。improve モデルが llama-swap の `/models` に無い場合、`_fetch_model_ctx` が静かに `None` を返して improve の ctx 行が出ないだけで、**警告は一切出ない**。alias 設定ミスに init が沈黙する。
 
   Task 5 の宣言スコープは「`n_ctx` の可視化」であり存在確認の拡張ではないため、**Task 5 では直さない**。着手時は trade 側と同じ警告文言・同じ早期 return 規律を使うか、improve は「警告のみで続行」にするかを先に決めること (improve が無くても取引判断は成立するので、trade と同じ扱いにするのは過剰かもしれない)。
+- **plugin の `max_bars` とキャッシュ保持期間の整合検証** (プラン 9 Task 16 の 2 周目 `/code-review high` で判明。ユーザー裁定 2026-08-12 で「producer 側を loud にして本体は起票」)
+
+  **確認された欠落**: `_validate_cache_retention` は `cache_window.live_window_days` (= price_provider が使う窓) だけを `cache_retention_days` と突き合わせる。しかし `plugin/signal_producer.py:_evaluate_bucket` は `load_resampled_frame(..., max_bars=meta.max_bars)` を呼び、これは `max_bars × width × 2` ぶん遡って 1m 行を読む。**この窓は起動時に一切検証されない。**
+
+  **症状は無音**。`load_resampled_frame` は「在る分だけ」を返し、末尾バケットは存在するので `_evaluate_bucket` の fail-open 分岐にも入らない。**切り詰められた系列で指標が計算され、signal がそのまま出る。** 承認 (`plugin/approval.py`、`_EVAL_SOURCE="dukascopy"`) は**削除されない履歴テーブル**で評価するので、plugin は満たされた窓で検証を通り、**本番に出て初めて劣化する**。
+
+  **実測 (2026-08-12)**: 120 日ぶんを入れて 30 日で prune すると、`max_bars=60` の要求に対し `len(df)=30`。例外も警告も出なかった。保持期間 30 日での突破本数は **1d=15 / 4h=90 / 1h=360 / 15m=1440 本**。`plugin.max_bars_limit` の既定は **1000** なので、**1d の plugin は既定設定でほぼ確実に踏む**。
+
+  **暫定対処 (実施済み)**: `_evaluate_bucket` に「要求 `max_bars` に満たない窓しか読めなかったら `datafeed.cache_retention_days` を名指しして WARNING」を入れた。無音は解消したが、**検証はしていない**。
+
+  **本設計で決めること**: ①検証を承認時 (`submit_plugin`/`bless`) に置くか、起動時に置くか。②起動時に置くなら `max_bars_limit` (既定 1000 × 1d = 4000 日) をそのまま使うと既定設定で起動拒否になるため、上限の扱いを別途決める必要がある。③承認済み plugin は実行時に増減するので、起動時検証だけでは構造的に取りこぼす。④踏んだときに fail closed にする (signal を出さない) か、WARNING で続行するか。⑤`plugin/strategy_adapter.py` も同じ `max_bars` 経路を通るが、現在は履歴 source 専用なので影響しない — ライブ source を通す将来変更で同じ穴が開く。
+
 - `stream=true` 導入時の SSE error event 設計 (spec ② §4.7)
 - **`ohlcv_cache` を別 DB ファイルへ物理分離するか** (D2 — `VACUUM` は SQLite では database 単位なので、**同一 DB 内のテーブル分割では履歴を巻き込む**。キャッシュだけを vacuum したければ物理分離が要る。あわせて `run_in_sample(*, history_conn=...)` が既に接続を別引数で受けている構造とも噛み合う)
 - **キャッシュ → 履歴の「昇格」経路** (D2 — Dukascopy が提供しないペアで蓄積したキャッシュをバックテストしたくなった場合。現時点では YAGNI)
