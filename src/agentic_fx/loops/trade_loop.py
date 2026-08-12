@@ -211,10 +211,14 @@ class TradeLoop:
                     finalize_mission(self.conn, self.activity, self.clock,
                                      mid, result)
                 finalized = True
-                self.activity.write(Category.AGGREGATE, "mission_failed",
-                                    f"runner status={result.status}",
-                                    ref_id=str(mid))
-                self.notifier.send(f"[agentic-fx] 判断 Mission 失敗: {result.status}")
+                self.activity.write(
+                    Category.AGGREGATE, "mission_failed",
+                    f"runner status={result.status}"
+                    + (f" — {result.reason}" if result.reason else ""),
+                    ref_id=str(mid))
+                self.notifier.send(
+                    f"[agentic-fx] 判断 Mission 失敗: {result.status}"
+                    + (f" — {result.reason}" if result.reason else ""))
                 return None
             try:
                 intent = TradeIntent.from_llm_dict(result.output,

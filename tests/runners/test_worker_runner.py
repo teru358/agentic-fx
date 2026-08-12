@@ -1607,3 +1607,230 @@ def test_child_cwd_is_a_dedicated_dir_outside_the_repository(tmp_path, monkeypat
         f"子の cwd ({cwd}) が data/ ({data_dir}) を覆っている")
     assert captured["cwd_entries"] == [], (
         f"子の workdir は空でなければならない (実際: {captured['cwd_entries']})")
+
+
+def test_worker_runner_reads_reason_from_result_frame(tmp_path, monkeypatch):
+    """Task 3 / CP11: 子が result フレームに載せた reason が
+    MissionResult.reason まで届く。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "failed", "output": None,
+                                "reason": "context exceeded: prompt 1 "
+                                          "tokens > n_ctx 2 (model=m)"})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "failed"
+    assert result.reason == (
+        "context exceeded: prompt 1 tokens > n_ctx 2 (model=m)")
+
+
+def test_worker_runner_tolerates_unknown_keys_in_result_frame(
+        tmp_path, monkeypatch):
+    """Task 3 / CP12 (codex M2): result フレームに reason に加えて未知
+    キーが混ざっても reader は落ちず、reason を含む既知キーだけを使って
+    MissionResult を組み立てる (将来のフレーム拡張に対する前方互換の
+    回帰固定 — `mission_protocol.read_frame` は dict であることと seq
+    しか検証しないことを実コードで確認済み)。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {"x": 1},
+                                "reason": "some reason",
+                                "future_field_not_yet_defined": "ignore me"})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert result.output == {"x": 1}
+    assert result.reason == "some reason"
+
+
+def test_worker_runner_reason_defaults_to_none_for_legacy_result_frame(
+        tmp_path, monkeypatch):
+    """Task 3 / 1 周目の生存変異 X1: `reason` キーを持たない result
+    フレーム (例外パスの `error` フレーム・プラン 8 以前の子) では
+    `MissionResult.reason` が **None のまま**であることを固定する。
+
+    `payload.get("reason")` を `payload.get("reason", "")` に緩める変異は
+    既存 9 件の後方互換テストをすべて素通りする (指揮者が実測)。既存
+    テストは reason を assert しないため、空文字が入り込んでも気づけない。
+    Task 1 の契約は「reason の既定は None」であり、`is None` で診断の
+    有無を判定する呼び出し側はこの差で壊れる。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        # mission_worker の例外パスが送る形 (reason は無く error を持つ)。
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "failed", "output": None,
+                                "error": "RuntimeError: boom"})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "failed"
+    assert result.reason is None
+
+
+def test_worker_runner_preserves_empty_string_reason(tmp_path, monkeypatch):
+    """Task 3 / 1 周目 codex 指摘 M8: 子が **明示的に** `"reason": ""` を
+    送ってきたら、親はそれを空文字のまま `MissionResult.reason` に載せる。
+
+    `payload.get("reason")` を `payload.get("reason") or None` に緩める変異
+    (空文字を None へ潰す) は既存テスト全件を素通りする — 受信側テストが
+    非空文字列とキー欠落しか渡していないため (指揮者が実測: 1762 passed の
+    まま)。「キーが無い (診断なし → None)」と「キーはあるが空 (子が空の
+    診断を送った → プロトコル違反の兆候)」は別の事象であり、**プロトコル層
+    は子が送った値をそのまま親へ渡す**。
+
+    ⚠️ これは**表示層の契約ではない**。Task 4 の trade/reflection 出口は
+    `if result.reason` で真値判定するため、空文字は表示・通知の上では
+    None と同じく「reason 無し」に丸められる (その丸めは表示層の判断で
+    あって、プロトコル層が先回りして潰してよい理由にはならない)。
+    2 つの層が食い違って見えても、それは意図された役割分担である。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "failed", "output": None,
+                                "reason": ""})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "failed"
+    assert result.reason == ""
+    assert result.reason is not None

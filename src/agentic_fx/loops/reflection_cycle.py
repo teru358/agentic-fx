@@ -168,6 +168,23 @@ class ReflectionCycle:
             # 二重に呼んでしまう (実測で発見・修正)。
             finalized = True
 
+            if result.status != "completed":
+                # プラン 9 Task 4: reflection Mission の失敗を可視化する。
+                # 通知は出さない (資金に直結しないため activity で足りる —
+                # 設計書 2026-08-10-context-overflow-diagnosis-design.md
+                # §4.5)。
+                try:
+                    self.activity.write(
+                        Category.AGGREGATE, "reflection_mission_failed",
+                        f"order_id={row['id']} mission_id={mid} "
+                        f"status={result.status}"
+                        + (f" — {result.reason}" if result.reason else ""),
+                        ref_id=str(row["id"]))
+                except Exception:  # noqa: BLE001 — 記録の失敗で reflection 経路を止めない
+                    _log.exception(
+                        "failed to record reflection_mission_failed for #%s",
+                        row["id"])
+
             if result.status != "completed" or not finalize_ok:
                 # finish 失敗時は監査未確定 (missions 行が running のまま) なので
                 # reflection も保存しない。SQLite マーカー (reflections 行) が

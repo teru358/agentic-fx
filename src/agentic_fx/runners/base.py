@@ -40,8 +40,31 @@ class MissionResult:
     status: Literal["completed", "failed", "timeout", "max_turns"]
     output: dict[str, Any] | None
     transcript: list[dict[str, Any]] = field(default_factory=list)
+    # runner が診断できた失敗理由 (安全化済み・単一行・上限内)。既定 None —
+    # 既存呼び出しは無変更 (設計書 2026-08-10-context-overflow-diagnosis-
+    # design.md §4.2)。「なぜ失敗したか」の軸であり、`status` (「どの
+    # 終端状態か」の軸) とは独立 — 新しい status 値は作らない (同 §4.1)。
+    reason: str | None = None
 
 
 class AgentRunner(ABC):
+    """Mission 実行を抽象化する runner インターフェース。
+
+    **reason の規範** (設計書 docs/superpowers/specs/2026-08-10-context-
+    overflow-diagnosis-design.md §4.3): runner は `failed`/`timeout`/
+    `max_turns` を返すとき、可能な限り安全化済みの `reason` を設定する。
+    外部応答の本文を生で入れない — activity ログ・Discord 通知・worker
+    の result frame をそのまま経由しうるため、秘密や長大なペイロードを
+    漏らしてはならない。
+
+    **現在の適用範囲**: 本規範を満たすのは `LocalRunner` (HTTP failure
+    から解釈できた reason — プラン 9 Task 2) のみ。`WorkerRunner` が
+    親側で生成する失敗 (起動 timeout・protocol error・EOF) と
+    `ClaudeRunner` (未実装、プラン 10 スコープ) の理由付けはこの規範の
+    対象外 — 予測実装しない (同 §4.3)。プラン 10 で `ClaudeRunner` を
+    実装する task は、この docstring の規範を満たす契約テストを
+    ブロッキングチェックリストに含めること。
+    """
+
     @abstractmethod
     def run(self, mission: Mission) -> MissionResult: ...

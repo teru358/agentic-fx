@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import signal
@@ -714,10 +715,49 @@ class _RunnerChoiceStub:
 
 class _RunnerStub:
     trade = _RunnerChoiceStub()
+    improve = _RunnerChoiceStub()  # 既定は trade と同一モデル (既存 6 テストの前提を変えない)
 
 
 class _StubSettings:
     llama_swap = _LlamaSwapStub()
+    runner = _RunnerStub()
+
+
+class _RunnerChoiceStubTrade:
+    model = "trade-m"
+
+
+class _RunnerChoiceStubImprove:
+    model = "improve-m"
+
+
+class _RunnerStubDiff:
+    trade = _RunnerChoiceStubTrade()
+    improve = _RunnerChoiceStubImprove()
+
+
+class _StubSettingsDiff:
+    llama_swap = _LlamaSwapStub()
+    runner = _RunnerStubDiff()
+
+
+class _LlamaSwapStubTrailingSlash:
+    base_url = "http://localhost:8080/v1/"
+
+
+class _StubSettingsTrailingSlash:
+    llama_swap = _LlamaSwapStubTrailingSlash()
+    runner = _RunnerStub()
+
+
+class _LlamaSwapStubNoV1:
+    # 1 周目 codex I3: /v1 を含まない base_url。`endswith("/v1")` の**偽側**を
+    # 踏む唯一のスタブ (他は全て /v1 終端)。
+    base_url = "http://localhost:8080"
+
+
+class _StubSettingsNoV1:
+    llama_swap = _LlamaSwapStubNoV1()
     runner = _RunnerStub()
 
 
@@ -813,6 +853,315 @@ def test_check_llama_swap_smoke_timeout(capsys):
     out = capsys.readouterr().out
     assert "警告" in out and "smoke" in out
     assert "OK" not in out and "存在しません" not in out and "一覧" not in out
+
+
+# ---- プラン9 Task5: n_ctx 可視化 (CP17〜21) ---------------------------------
+
+def test_check_llama_swap_same_model_calls_props_once(capsys):
+    """CP17: trade == improve なら /props は 1 回だけ呼ばれる。"""
+    calls = {"props": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
+        if path == "/props":
+            calls["props"] += 1
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": 65536}})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettings())
+    assert calls["props"] == 1
+    out = capsys.readouterr().out
+    assert "ctx 65536" in out
+
+
+def test_check_llama_swap_different_models_improve_first_trade_last(capsys):
+    """CP18: trade != improve なら improve の /props が先 (表示のみ)、
+    trade は存在確認→smoke→/props の順で**最後**に処理される。"""
+    call_order: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "trade-m"}]})
+        if path == "/props":
+            model = request.url.params.get("model")
+            call_order.append(("props", model))
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": 4096}})
+        if path.endswith("/chat/completions"):
+            # 1 周目 codex I1: smoke の**対象モデル**まで採る。順序だけを
+            # 見ていると `json={"model": improve_model, ...}` への変異が
+            # 生存し (実測 1801 passed)、init 終了時に hot なのが trade で
+            # なく improve になる — 設計書 §4.4 の中核が破れる。
+            call_order.append(("smoke", json.loads(request.content)["model"]))
+            return httpx.Response(200, json={})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettingsDiff())
+
+    # 種別と対象モデルを組で固定する (kinds だけだと I1 が生存する)
+    assert call_order == [
+        ("props", "improve-m"), ("smoke", "trade-m"), ("props", "trade-m")]
+    assert capsys.readouterr().out == (
+        "improve model 'improve-m' ctx 4096\n"
+        "llama-swap OK (model 'trade-m' loaded, ctx 4096)\n")
+
+
+def test_check_llama_swap_props_http_failure_does_not_fail_init(capsys):
+    """CP19: /props の HTTP 失敗でも init は成功する (表示だけ省略)。"""
+    calls = {"props": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
+        if path == "/props":
+            calls["props"] += 1
+            return httpx.Response(500)
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettings())  # 例外を出さない = init は成功
+    assert calls["props"] >= 1  # /props に実際に到達したことを確認
+    out = capsys.readouterr().out
+    assert "llama-swap OK" in out
+    assert "ctx" not in out
+
+
+@pytest.mark.parametrize("failure_kind", ["request", "value", "type"])
+def test_check_llama_swap_props_expected_failure_is_not_displayed(
+        capsys, failure_kind):
+    """RequestError/ValueError/TypeError は init を落とさず表示を省略する。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
+        if path == "/props":
+            if failure_kind == "request":
+                raise httpx.ConnectError("props unavailable")
+            if failure_kind == "value":
+                return httpx.Response(200, content=b"{")
+            return httpx.Response(200, json={
+                "default_generation_settings": None})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettings())
+    assert capsys.readouterr().out == (
+        "llama-swap OK (model 'qwen3.6-35b' loaded)\n")
+
+
+def test_check_llama_swap_props_ctx_wrong_type_is_not_displayed(capsys):
+    """CP20 (str): n_ctx が文字列なら表示しない。init は成功する。"""
+    calls = {"props": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
+        if path == "/props":
+            calls["props"] += 1
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": "65536"}})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettings())
+    assert calls["props"] >= 1
+    out = capsys.readouterr().out
+    assert "llama-swap OK" in out
+    assert "ctx" not in out
+
+
+def test_check_llama_swap_props_ctx_missing_is_not_displayed(capsys):
+    """CP20 (欠落): n_ctx キーが無ければ表示しない。init は成功する。"""
+    calls = {"props": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
+        if path == "/props":
+            calls["props"] += 1
+            return httpx.Response(200, json={"default_generation_settings": {}})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettings())
+    assert calls["props"] >= 1
+    out = capsys.readouterr().out
+    assert "llama-swap OK" in out
+    assert "ctx" not in out
+
+
+def test_check_llama_swap_props_ctx_bool_is_not_displayed(capsys):
+    """CP20 (bool): n_ctx が bool なら表示しない (「bool を除く正整数」)。"""
+    calls = {"props": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
+        if path == "/props":
+            calls["props"] += 1
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": True}})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettings())
+    assert calls["props"] >= 1
+    out = capsys.readouterr().out
+    assert "llama-swap OK" in out
+    assert "ctx" not in out
+
+
+@pytest.mark.parametrize("n_ctx", [0, -1])
+def test_check_llama_swap_props_ctx_non_positive_is_not_displayed(
+        capsys, n_ctx):
+    """n_ctx が 0 または負数なら表示しない。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
+        if path == "/props":
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": n_ctx}})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettings())
+    assert capsys.readouterr().out == (
+        "llama-swap OK (model 'qwen3.6-35b' loaded)\n")
+
+
+def test_check_llama_swap_props_trailing_slash_base_uses_root(capsys):
+    """base_url が /v1/ 終端でも root /props から n_ctx を表示する。"""
+    calls = {"props": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
+        if path == "/props":
+            calls["props"] += 1
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": 32768}})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettingsTrailingSlash())
+    assert calls["props"] == 1
+    assert capsys.readouterr().out == (
+        "llama-swap OK (model 'qwen3.6-35b' loaded, ctx 32768)\n")
+
+
+def test_check_llama_swap_props_timeout_budget_differs_cold_vs_hot(capsys):
+    """2 周目レビュー: `/props` は**モデルをロードさせる**ので、cold な
+    improve と hot な trade で必要な予算が 4 桁違う。
+
+    実測 (2026-08-12, :8080): qwen3.6-35b-a3b_Q4 は cold 13.86s / hot 0.0005s。
+    全経路 timeout=5 だった元実装では improve 側 (常に cold) が必ず
+    ReadTimeout → None となり、improve の ctx 行が **trade != improve という
+    この機能唯一の対象構成で永久に出なかった**。
+
+    MockTransport は即答するので経過時間では測れない。**予算そのものが契約**
+    なので `request.extensions["timeout"]` を直接 assert する。
+
+    3 周目レビュー: 当初は `/props` の 2 箇所しか採っておらず、**cold load
+    本体である smoke 自身の `timeout` が pin から漏れていた** — 120 → 5 に
+    縮める変異が 1808 passed のまま生存した。cold load を跨ぎうる要求は
+    smoke を含めて 1 つの予算 (`_COLD_LOAD_TIMEOUT`) に束ねてあるので、
+    **3 要求すべてを 1 本の列で固定する**。
+    """
+    budgets: list[tuple[str, str | None, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        read_budget = request.extensions["timeout"]["read"]
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "trade-m"}]})
+        if path == "/props":
+            budgets.append(("props", request.url.params.get("model"),
+                            read_budget))
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": 4096}})
+        if path.endswith("/chat/completions"):
+            budgets.append(("smoke", json.loads(request.content)["model"],
+                            read_budget))
+            return httpx.Response(200, json={})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettingsDiff())
+
+    # 種別 × 対象 × 予算 を組で固定する。cold を踏む 2 要求 (improve /props と
+    # smoke) が同額であること、hot な trade /props だけが短いことまで見る。
+    assert budgets == [
+        ("props", "improve-m", 120),
+        ("smoke", "trade-m", 120),
+        ("props", "trade-m", 5)]
+
+
+def test_check_llama_swap_props_base_without_v1_is_not_truncated(capsys):
+    """1 周目 codex I3: base_url が /v1 で終わらないとき `[:-3]` を**しない**。
+
+    既存スタブは全て /v1 終端なので `endswith("/v1")` の偽側が一度も踏まれず、
+    ガードを外して常に `[:-3]` する変異が生存する (実測 1801 passed)。
+    その変異下では http://localhost:8080 が http://localhost: に化ける。
+    """
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
+        if path == "/props":
+            calls.append(str(request.url))
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": 16384}})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettingsNoV1())
+    # host:port が切り詰められていないことまで見る (パス一致だけだと生存する)
+    assert calls == ["http://localhost:8080/props?model=qwen3.6-35b"]
+    assert capsys.readouterr().out == (
+        "llama-swap OK (model 'qwen3.6-35b' loaded, ctx 16384)\n")
+
+
+def test_check_llama_swap_unexpected_exception_in_props_is_not_swallowed():
+    """CP21: RequestError/HTTPStatusError/ValueError/TypeError/KeyError の
+    いずれでもない想定外例外は握らず、_check_llama_swap を通じて呼び出し
+    元まで伝播する (init は落ちる)。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "qwen3.6-35b"}]})
+        if path == "/props":
+            raise RuntimeError("unexpected boom")
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post), \
+         pytest.raises(RuntimeError, match="unexpected boom"):
+        _check_llama_swap(_StubSettings())
 
 
 # ---- F4 (fix round 1): run_service の shutdown 経路 -------------------------
@@ -1926,3 +2275,37 @@ def test_trade_loop_healthcheck_provider_reuses_injected_provider_seam(tmp_path)
     assert app.trade_loop.provider.readonly is True
     app.trade_loop.provider.get_quote("USDJPY")
     stub_provider.get_quote.assert_called_once_with("USDJPY")
+
+
+def test_check_llama_swap_improve_props_failure_omits_improve_line(capsys):
+    """Task 5 / 段 0 の生存変異: **異モデル構成で improve の /props だけが
+    失敗**したとき、improve 行を出さない (trade 側は従来どおり表示する)。
+
+    `if improve_ctx is not None:` を外す変異は**フルスイート 1800 passed の
+    まま生存する** (指揮者が実測) — 既存の異モデルテストは /props が必ず
+    成功する handler しか持たず、/props 失敗のテストは**同一モデル構成**の
+    ものしかないため、improve 側のガードだけが未検査で残っていた。
+
+    ガードが無いと init が `improve model 'improve-m' ctx None` と表示する。
+    「取得できなかった」ことを「ctx が None である」と読める形で出すのは、
+    設定ミスの診断を誤らせる。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/models"):
+            return httpx.Response(200, json={"data": [{"id": "trade-m"}]})
+        if path == "/props":
+            if request.url.params.get("model") == "improve-m":
+                return httpx.Response(500)
+            return httpx.Response(200, json={
+                "default_generation_settings": {"n_ctx": 65536}})
+        return httpx.Response(200, json={})
+
+    client = _mock_client(handler)
+    with patch("httpx.get", client.get), patch("httpx.post", client.post):
+        _check_llama_swap(_StubSettingsDiff())
+
+    out = capsys.readouterr().out
+    assert "improve model" not in out
+    assert "None" not in out
+    # trade 側は影響を受けない。
+    assert "llama-swap OK (model 'trade-m' loaded, ctx 65536)" in out

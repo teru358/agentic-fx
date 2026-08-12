@@ -70,13 +70,79 @@ def ensure_initialized(root: Path) -> None:
         raise SystemExit(2)
 
 
+def _model_load_order(settings) -> list[str]:
+    """trade/improve の重複除去済み順序付きリスト。異なる場合は
+    improve→trade (trade を最後に置くのは意図的 — 設計書 §4.4: llama-swap
+    の常駐数/VRAM/TTL 次第では後発ロードが先発を unload しうるため、
+    init 終了時に取引判断で使うモデルを hot な状態で終わらせる)。"""
+    trade = settings.runner.trade.model
+    improve = settings.runner.improve.model
+    return [trade] if trade == improve else [improve, trade]
+
+
+# `/props` は**モデルをロードさせる** (llama-swap が swap/spawn する)。
+# したがって呼び出し側の状況で必要な予算が 4 桁違う — 単一の timeout では
+# 必ずどちらかが壊れる。実測 (2026-08-12、:8080):
+#   nomic-embed-text (137M) cold 4.26s / hot 0.0003s
+#   qwen3.6-35b-a3b_Q4 (35B) cold 13.86s / hot 0.0005s
+# 2 周目レビューの指摘: 全経路 timeout=5 だったため improve 側 (常に cold)
+# が必ず ReadTimeout → None となり、improve の ctx 行は**この機能が作られた
+# 唯一の構成 (trade != improve) で永久に出なかった**。テストは MockTransport
+# が即答するので 1802 passed はこの行の証拠にならない。
+# 短い予算で中断すると llama-swap を swap 途中に置き去りにし、後続の trade
+# smoke がそれを待つ (llama-swap-environment の TTL/incoming-request race)。
+# 3 周目レビュー: cold load を跨ぎうる要求は **smoke 自身も含めて** この 1 つの
+# 予算に束ねる。分離した当初は `/props` の 2 箇所だけを対象にしたため、最も
+# cold-load 耐性が要る smoke の `timeout=120` が pin から漏れ、5 へ縮める変異が
+# 1808 passed のまま生存した。
+_COLD_LOAD_TIMEOUT = 120   # smoke 本体と、smoke 前の improve `/props`
+_PROPS_TIMEOUT_HOT = 5     # smoke 直後の trade `/props`。既にロード済み
+
+
+def _fetch_model_ctx(base: str, model: str, timeout: float) -> int | None:
+    """`GET /props?model=<model>` から `default_generation_settings.n_ctx`
+    を取得する。**例外境界を限定する** (codex I2) — 取得・形状のいずれかの
+    失敗でも None を返し、想定外例外は伝播させて init を落とす。
+
+    `timeout` に既定値は置かない。呼び出し側が cold / hot のどちらを踏むか
+    を必ず意識させるため (既定値を置くと第 3 の呼び出し点が黙って cold に
+    5 秒を割り当てて同じ欠陥が再発する)。
+    """
+    import httpx
+    try:
+        api_root = base.rstrip("/")
+        if api_root.endswith("/v1"):
+            api_root = api_root[:-3]
+        r = httpx.get(f"{api_root}/props", params={"model": model},
+                      timeout=timeout)
+        r.raise_for_status()
+        n_ctx = r.json()["default_generation_settings"]["n_ctx"]
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError,
+            TypeError, KeyError):
+        return None
+    if not isinstance(n_ctx, int) or isinstance(n_ctx, bool) or n_ctx <= 0:
+        return None
+    return n_ctx
+
+
 def _check_llama_swap(settings) -> None:
-    """llama-swap 接続確認 (上書き 2)。一覧取得不能 / モデル不在 / cold-load
-    smoke 失敗の 3 種を区別して警告する。init から呼ばれる (失敗は警告のみ —
-    取引判断 Mission は実行時に fail closed で保護される)。"""
+    """llama-swap 接続確認 (上書き 2、プラン 9 Task 5)。一覧取得不能 /
+    モデル不在 / cold-load smoke 失敗の 3 種を区別して警告する。init から
+    呼ばれる (失敗は警告のみ — 取引判断 Mission は実行時に fail closed で
+    保護される)。
+
+    **対象モデルは重複除去した順序付きリスト** (`_model_load_order`)。
+    trade == improve なら存在確認→smoke→/props を各 1 回。異なるなら
+    improve の /props を先に (表示のみ)、trade は従来どおり最後に
+    存在確認→smoke→/props (設計書 §4.4 — trade を最後に置くのは意図的。
+    improve が trade と異なる場合、init に cold load 1 回分の時間が
+    増えることを既知コストとして許容する)。`n_ctx` は表示のみで
+    保存しない (§3 のドリフト回避 — llama-swap 側の --ctx-size 変更で
+    陳腐化するため)。
+    """
     import httpx
     base = settings.llama_swap.base_url
-    model = settings.runner.trade.model
+    trade_model = settings.runner.trade.model
 
     try:
         r = httpx.get(f"{base}/models", timeout=5)
@@ -89,25 +155,37 @@ def _check_llama_swap(settings) -> None:
               "取引判断 Mission は失敗として記録されます。")
         return
 
-    if model not in ids:
-        print(f"警告: モデル '{model}' が llama-swap の /models に存在しません。"
+    if trade_model not in ids:
+        print(f"警告: モデル '{trade_model}' が llama-swap の /models に存在しません。"
               f"alias 設定を確認してください (存在: {ids})")
         return
+
+    order = _model_load_order(settings)
+    if len(order) == 2:
+        # improve はここが初回接触なので**必ず cold**。smoke と同額を積む
+        improve_ctx = _fetch_model_ctx(base, order[0], _COLD_LOAD_TIMEOUT)
+        if improve_ctx is not None:
+            print(f"improve model '{order[0]}' ctx {improve_ctx}")
 
     try:
         # cold-load smoke: TTL unload 後の初回 Mission がロード時間で
         # timeout しないよう、1 トークン生成でロードを促す
         r = httpx.post(f"{base}/chat/completions",
-                       json={"model": model, "max_tokens": 1,
+                       json={"model": trade_model, "max_tokens": 1,
                              "messages": [{"role": "user", "content": "ping"}]},
-                       timeout=120)
+                       timeout=_COLD_LOAD_TIMEOUT)
         r.raise_for_status()
     except (httpx.RequestError, httpx.HTTPStatusError) as e:
-        print(f"警告: モデル '{model}' の cold-load smoke に失敗しました ({e})。"
+        print(f"警告: モデル '{trade_model}' の cold-load smoke に失敗しました ({e})。"
               "初回 Mission が timeout する可能性があります。")
         return
 
-    print(f"llama-swap OK (model '{model}' loaded)")
+    # trade は直前の smoke でロード済みなので hot
+    trade_ctx = _fetch_model_ctx(base, trade_model, _PROPS_TIMEOUT_HOT)
+    if trade_ctx is not None:
+        print(f"llama-swap OK (model '{trade_model}' loaded, ctx {trade_ctx})")
+    else:
+        print(f"llama-swap OK (model '{trade_model}' loaded)")
 
 
 def run_init(root: Path) -> int:

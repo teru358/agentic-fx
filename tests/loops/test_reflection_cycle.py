@@ -1,3 +1,4 @@
+import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -409,3 +410,258 @@ def test_null_intent_id_handled(tmp_path):
     runner = cyc.runner
     mission_prompt = runner.missions[0].prompt
     assert '"entry_reasoning": null' in mission_prompt
+
+
+def test_reflection_mission_failed_activity_written_with_reason(tmp_path):
+    """Task 4 / CP15: reflection Mission 失敗時に reflection_mission_failed
+    activity が reason 付きで書かれる (通知は出さない — cyc は Notifier を
+    持たないため、通知しないことは構造的に保証されている)。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason="context exceeded: prompt 1 tokens "
+                                    "> n_ctx 2 (model=m)")])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    act = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "reflection_mission_failed" in act
+    assert "context exceeded: prompt 1 tokens > n_ctx 2" in act
+    assert f"order_id={oid}" in act
+
+
+def test_reflection_current_retry_behavior_is_pinned(tmp_path):
+    """Task 4 / CP16 (回帰固定): 同一 order で 2 回 run_pending を呼ぶと
+    **毎回同じ order が選ばれ続ける** — missions 行が 2 本
+    (どちらも failed)・reflection_mission_failed activity が 2 本・
+    reflections 行は 0 本のまま (無制限再試行の現挙動。修正は設計書 §4.5
+    codex I3 で既に独立課題として起票済み・本 task では直さない)。
+
+    ⚠️ **計画の docstring にあった「starvation せず」は誤り**なので削除した
+    (1 周目 codex 指摘 I4)。同じ order が選ばれ続けることは、まさに後続の
+    order を starve させる原因そのものである。starvation 側は order を
+    1 件しか作らないこのテストでは**原理的に観測できない** —
+    `test_failed_reflections_starve_later_orders` が別に固定する。"""
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("failed", None, [], reason="boom1"),
+        MissionResult("failed", None, [], reason="boom2"),
+    ])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+
+    failed_missions = conn.execute(
+        "SELECT COUNT(*) c FROM missions WHERE status='failed'"
+    ).fetchone()["c"]
+    assert failed_missions == 2
+
+    act = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert act.count("reflection_mission_failed") == 2
+
+    assert reflections.get(conn, oid) is None
+
+
+def test_reflection_mission_failed_omits_separator_for_empty_reason(tmp_path):
+    """Task 4 mutation pin: 空 reason は activity に区切りを残さない。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason="")])
+    _closed_order(conn)
+    assert cyc.run_pending() == 0
+    act = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert "reflection_mission_failed" in act
+    assert " —" not in act
+
+
+def test_reflection_failed_status_with_content_does_not_persist(tmp_path):
+    """Task 4 mutation pin: failed の output は保存経路へ流さない。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", {"content": "must not persist"}, [], reason="boom")])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    assert reflections.get(conn, oid) is None
+    rag.add_reflection.assert_not_called()
+
+
+def test_completed_reflection_does_not_write_failure_activity(tmp_path):
+    """Task 4 mutation pin: completed を failure event として記録しない。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "completed", {"content": "ok"}, [])])
+    _closed_order(conn)
+    assert cyc.run_pending() == 1
+    assert not any("reflection_mission_failed" in line
+                   for line in cyc.activity.tail(10))
+
+
+def test_reflection_mission_failed_ref_id_is_order_id(tmp_path):
+    """Task 4 mutation pin: failure event の ref_id は order ID。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason="boom")])
+    seed_mid = missions.start(
+        conn, "reflection", SETTINGS.runner.trade.backend,
+        SETTINGS.runner.trade.model, NOW)
+    assert missions.finish(conn, seed_mid, "completed", {}, [], NOW)
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+
+    event_line = next(
+        line for line in cyc.activity.tail(10)
+        if "\treflection_mission_failed\t" in line)
+    assert event_line.split("\t")[-1] == str(oid)
+
+
+def test_reflection_failure_event_write_error_is_caught_at_the_event_site(
+        tmp_path):
+    """Task 4 / 段 0 の生存変異: `reflection_mission_failed` の書込みが
+    例外を投げても、その例外は **event 書込みの場所で捕まる**。
+
+    ⚠️ **`run_pending()` 越しに「経路が止まらないこと」だけを見る形では、
+    この防御を測れない。** `run_pending` は per-item isolation の
+    `except Exception` を別に持つため、実装の `try/except` を丸ごと外しても
+    戻り値も `reflections` 行も変わらない (指揮者が実測: フルスイート
+    1776 passed のまま生存)。防御が二重になっているぶん、外側の観測点では
+    差が出ない。
+
+    そこで **per-item isolation を経由しない `_reflect_one` を直接呼ぶ**。
+    event 書込み側のガードが消えれば、例外はここまで漏れてくる。
+
+    (最初は「どちらの層が捕まえたか」をログ文言で区別する形にしたが、
+    `caplog.at_level(logger=...)` は指定 logger のレベルを変えるだけで
+    handler は root に付くため、`setup_technical_logging()` が親
+    `agentic_fx` を `propagate=False` にした後に走るとログが届かない —
+    テスト順序に依存する pin になっていた。1 周目 codex 指摘 M5。)
+
+    層が縮退する (= 例外が本経路を巻き込んでから捕まる) と、将来 event
+    書込みの後ろに処理を足したときに、その処理が黙って飛ばされる。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason="context exceeded: prompt 1 tokens "
+                                   "> n_ctx 2 (model=m)")])
+    oid = _closed_order(conn)
+    row = dict(conn.execute(
+        "SELECT * FROM orders WHERE id=?", (oid,)).fetchone())
+
+    real_write = cyc.activity.write
+
+    def exploding_write(category, event, message, **kwargs):
+        if event == "reflection_mission_failed":
+            raise OSError("No space left on device")
+        return real_write(category, event, message, **kwargs)
+
+    cyc.activity.write = exploding_write
+
+    # ガードが消えていればここで OSError が漏れる (per-item isolation は
+    # run_pending 側にあり、この呼び出しでは効かない)。
+    assert cyc._reflect_one(row) is False
+    assert reflections.get(conn, oid) is None
+    rag.add_reflection.assert_not_called()
+
+
+@pytest.mark.parametrize("status", ["failed", "timeout", "max_turns"])
+def test_reflection_failure_event_covers_every_non_completed_status(
+        tmp_path, status):
+    """Task 4 / 1 周目 codex 指摘 I2: **`completed` 以外のすべての status**
+    で failure event が 1 件残り、status が本文に入る。reason は `None`。
+
+    Task 4 の event テストはどれも `status="failed"` かつ reason 付き
+    だったため、ガードを `if result.status == "failed":` に狭める変異も、
+    `if result.reason is not None:` に置き換える変異も**フルスイート
+    1777 passed のまま生存する** (指揮者が実測)。
+
+    `timeout` は llama-swap の応答が `llama_swap.timeout_sec` を超えた
+    ときに出る**最も起きやすい失敗**であり、ここが記録されないと
+    reflection が黙って進まなくなる。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(status, None, [])])
+    oid = _closed_order(conn)
+
+    assert cyc.run_pending() == 0
+
+    act = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert act.count("reflection_mission_failed") == 1
+    assert f"status={status}" in act
+    assert f"order_id={oid}" in act
+    # reason が None なら区切りも "None" も出さない。
+    assert "—" not in act
+    assert "None" not in act
+
+
+@pytest.mark.parametrize("status", ["failed", "timeout", "max_turns"])
+def test_non_completed_never_saves_reflection_even_with_valid_content(
+        tmp_path, status):
+    """Task 4 / 1 周目 codex 指摘 I2: `completed` 以外は、**output が
+    保存可能な形をしていても** reflection を保存しない。
+
+    既存の失敗系テストは output=None なので、早期出口
+    (`if result.status != "completed" or not finalize_ok:`) を
+    `== "failed"` に狭める変異を打っても、後段の型ガードが同じく
+    `False` を返して同じ見かけの結果になる — 別の防御に隠れて生存する
+    (Task 4 の trade 側 I1 と同じ構造)。
+
+    status が真の判断根拠であることを、**後段のどの防御にも頼らない
+    形**で固定する。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        status, {"content": "SL 幅が狭すぎた"}, [])])
+    oid = _closed_order(conn)
+
+    assert cyc.run_pending() == 0
+    assert reflections.get(conn, oid) is None
+    rag.add_reflection.assert_not_called()
+
+
+def test_reflection_mission_failed_activity_line_is_pinned_field_by_field(
+        tmp_path):
+    """Task 4 / 1 周目 codex 指摘 I3: `reflection_mission_failed` の
+    activity 行を**フィールド単位の完全一致**で固定する。
+
+    本文から `mission_id` や `status` を落とす変異、category を
+    `AGGREGATE` 以外にする変異が、部分一致の assert では素通りしていた。
+    reflection は通知を持たないため、**この 1 行が失敗を知る唯一の
+    経路**であり、欠けたフィールドは復元できない。"""
+    reason = "context exceeded: prompt 1 tokens > n_ctx 2 (model=m)"
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason=reason)])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+
+    mid = conn.execute(
+        "SELECT id FROM missions WHERE loop='reflection'").fetchone()["id"]
+    lines = [ln for ln in (tmp_path / "a.log").read_text(
+        encoding="utf-8").splitlines()
+        if "\treflection_mission_failed\t" in ln]
+    assert len(lines) == 1, lines
+    _ts, category, event, summary, ref_id = lines[0].split("\t")
+    assert category == "AGGREGATE"
+    assert event == "reflection_mission_failed"
+    assert summary == (
+        f"order_id={oid} mission_id={mid} status=failed — {reason}")
+    assert ref_id == str(oid)
+
+
+def test_failed_reflections_starve_later_orders(tmp_path):
+    """Task 4 / 1 周目 codex 指摘 I4 (回帰固定): **失敗し続ける古い order が
+    `max_items` 枠を占有し、後続の order を永久に starve させる**現挙動を
+    固定する (設計書 §4.5 codex I3 の独立課題。本 task では直さない)。
+
+    `run_pending` の SELECT は「reflections 行が無い closed order」を
+    `ORDER BY o.id LIMIT max_items` で取る。失敗しても reflections 行は
+    作られないので、先頭 3 件が失敗し続ける限り 4 件目は**一度も選ばれない**。
+
+    ⚠️ **order を 1 件しか作らない `test_reflection_current_retry_behavior_
+    is_pinned` ではこれを観測できない。** 「失敗済み order を、他に pending が
+    あるときだけ後順位へ送る」変異は、単独 order のテストを従来どおり通過
+    しながら starvation を解消してしまう (codex 指摘)。現挙動を課題として
+    起票した以上、**その現挙動が本当に起きていること**を測れる形で残す。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult("failed", None, [])])
+    oids = [_closed_order(conn) for _ in range(4)]
+    assert len(set(oids)) == 4
+
+    for _ in range(3):
+        assert cyc.run_pending() == 0
+
+    # 先頭 3 件が 3 周期とも試行され、4 件目は一度も選ばれない。
+    summaries = [ln.split("\t")[3] for ln in
+                 (tmp_path / "a.log").read_text(encoding="utf-8").splitlines()
+                 if "\treflection_mission_failed\t" in ln]
+    for oid in oids[:3]:
+        assert sum(1 for s in summaries
+                   if s.startswith(f"order_id={oid} ")) == 3
+    assert not any(s.startswith(f"order_id={oids[3]} ") for s in summaries)
+
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
+    ).fetchone()["c"] == 9

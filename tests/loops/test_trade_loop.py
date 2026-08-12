@@ -2,7 +2,7 @@
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
@@ -590,3 +590,209 @@ def test_requeue_signal_happens_under_core_lock(tmp_path):
         (sid,)).fetchone()
     assert row["status"] == "pending"
     assert row["requeue_count"] == 1
+
+
+def test_mission_failed_activity_includes_reason_when_present(tmp_path):
+    """Task 4 / CP13: reason があれば mission_failed activity 本文に
+    含まれる。"""
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason="context exceeded: prompt 90010 tokens "
+                                    "> n_ctx 65536 (model=m)")])
+    assert loop.run_once() is None
+    act = (tp / "a.log").read_text(encoding="utf-8")
+    assert "context exceeded: prompt 90010 tokens > n_ctx 65536" in act
+
+
+def test_mission_failed_notification_includes_reason_when_present(tmp_path):
+    """Task 4 / CP14: reason があれば通知本文にも含まれる。"""
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason="context exceeded: prompt 1 tokens "
+                                    "> n_ctx 2 (model=m)")])
+    loop.notifier.send = MagicMock()
+    assert loop.run_once() is None
+    sent = loop.notifier.send.call_args[0][0]
+    assert "context exceeded: prompt 1 tokens > n_ctx 2" in sent
+
+
+def test_mission_failed_activity_omits_separator_for_empty_reason(tmp_path):
+    """Task 4 mutation pin: 空 reason は activity に区切りを残さない。"""
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason="")])
+    assert loop.run_once() is None
+    act = (tp / "a.log").read_text(encoding="utf-8")
+    assert " —" not in act
+
+
+def test_mission_failed_notification_omits_separator_for_empty_reason(tmp_path):
+    """Task 4 mutation pin: 空 reason は通知に区切りを残さない。"""
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason="")])
+    loop.notifier.send = MagicMock()
+    assert loop.run_once() is None
+    sent = loop.notifier.send.call_args[0][0]
+    assert " —" not in sent
+
+
+def test_failed_mission_output_never_reaches_the_intent_path(tmp_path):
+    """Task 4 / 1 周目 codex 指摘 I1: `status != "completed"` の分岐の
+    早期 `return None` を固定する。
+
+    ⚠️ **既存の失敗系テストはこの防御を測れない。** すべて `output=None`
+    なので、`return None` を削除しても直後の
+    `TradeIntent.from_llm_dict(None)` が `IntentParseError` を出し、
+    `intent_parse_failed` 経路が同じく `None` を返す — 別の出口が同じ
+    見かけの結果を作るため、変異はフルスイート 1776 passed のまま生存
+    する (指揮者が実測)。
+
+    **失敗 Mission が構文的に妥当な output を伴った場合に露出する** —
+    早期 return が無いと、失敗した LLM 出力がそのまま intent 化され
+    執行経路へ進む。CLAUDE.md「発注・SL 変更・クローズ・資金保護は LLM に
+    委ねない。決定論的コードで強制」に直接かかる防御であり、
+    `status != "completed"` を**唯一の**判断根拠として止めきること自体が
+    契約になる。"""
+    # ⚠️ **output は「実際に注文が通る」形でなければ意味がない。** 最初に
+    # 書いた版は `action="enter"` (存在しない action) を使っており、変異を
+    # 入れても `IntentParseError` 側で止まっていた — 早期 return を消した
+    # 危険 (執行経路への到達) を一度も踏まないまま KILLED になっていた
+    # (指揮者が実測して差し替え)。
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", {"action": "open", "pair": "USDJPY", "direction": "long",
+                   "entry_type": "limit", "horizon": "day",
+                   "limit_price": 148.20, "expires_in": "4h",
+                   "stop_loss": 147.80, "take_profit": 149.00,
+                   "reasoning": "壊れた runner の出力"},
+        [], reason="context exceeded: prompt 90010 tokens > n_ctx 65536")])
+
+    assert loop.run_once() is None
+
+    # intent は 1 本も作られない (執行経路へ進んでいない)。
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM trade_intents").fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"] == 0
+
+    act = (tp / "a.log").read_text(encoding="utf-8")
+    assert "mission_failed" in act
+    # 失敗分岐で止まっており、後続の parse 経路へ落ちていない。
+    assert "intent_parse_failed" not in act
+
+
+def test_mission_failed_activity_line_is_pinned_field_by_field(tmp_path):
+    """Task 4 / 1 周目 codex 指摘 I3: `mission_failed` の activity 行を
+    **フィールド単位の完全一致**で固定する。
+
+    Task 4 のテストは reason の部分文字列しか見ていなかったため、
+    ①既存の `runner status=...` を削除する ②category を変える
+    ③`ref_id` を mission ID 以外にする ④区切りを `" — "` 以外にする、
+    のいずれの変異も素通りしていた (codex 指摘)。activity 行は運用時に
+    人が読む唯一の一次記録であり、書式そのものが契約になる。
+
+    行の形は `ts \\t category \\t event \\t summary \\t ref_id`
+    (`ActivityLog.write` — summary は空白畳み込み済み)。"""
+    reason = "context exceeded: prompt 90010 tokens > n_ctx 65536 (model=m)"
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason=reason)])
+    assert loop.run_once() is None
+
+    mid = conn.execute("SELECT id FROM missions").fetchone()["id"]
+    lines = [ln for ln in (tp / "a.log").read_text(encoding="utf-8").splitlines()
+             if "\tmission_failed\t" in ln]
+    assert len(lines) == 1, lines
+    _ts, category, event, summary, ref_id = lines[0].split("\t")
+    assert category == "AGGREGATE"
+    assert event == "mission_failed"
+    assert summary == f"runner status=failed — {reason}"
+    assert ref_id == str(mid)
+
+
+def test_mission_failed_notification_body_is_pinned_exactly(tmp_path):
+    """Task 4 / 1 周目 codex 指摘 I3: 通知本文を全文一致で固定する
+    (既存プレフィックス・status・区切りのいずれを消しても red になる)。"""
+    reason = "context exceeded: prompt 1 tokens > n_ctx 2 (model=m)"
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], reason=reason)])
+    loop.notifier.send = MagicMock()
+    assert loop.run_once() is None
+    assert loop.notifier.send.call_args[0][0] == (
+        f"[agentic-fx] 判断 Mission 失敗: failed — {reason}")
+
+
+# ---- 2 周目 (ローカル qwen 指摘・指揮者が実測で確定) ---------------------
+# `MissionResult` 契約の強制点である `if not isinstance(result, MissionResult)`
+# は 3 箇所にある。**reflection_cycle だけが pin されており
+# (test_runner_non_mission_result_normalized_to_failed)、trade_loop の 2 箇所は
+# 裸だった** — どちらを消してもフルスイート 1806 passed のまま通る (実測)。
+# 経路の非対称であり、pin が無いのは**実注文を作る側**という最悪の組合せ。
+#
+# **失われるのは資金保護ではなく診断の帰属**である (指揮者が probe で両状態を
+# 突き合わせて確定。当初「周期が死ぬ」と書いたのは誤りだった):
+#
+#   | | ガードあり | ガードなし |
+#   |---|---|---|
+#   | run_once の戻り値 | None | None       ← 区別できない |
+#   | missions 行 | failed | failed         ← 区別できない |
+#   | orders | 0 | 0                        ← 区別できない |
+#   | activity | AGGREGATE mission_failed (ref_id=<mid>) | SYSTEM mission_boundary_failed (ref_id 無し) |
+#   | 通知 | 判断 Mission 失敗: failed | trade Mission が内部エラーで失敗しました |
+#
+# ガードが無いと AttributeError が `run_once` の never-raise サービス境界に
+# 落ち、**どの Mission がなぜ失敗したのか追えない不透明な内部エラー**になる。
+# したがって pin は activity の event 名と ref_id、および通知本文に置く
+# (戻り値や missions 行を見る pin は**恒真**になる)。
+
+class _NonMissionResultRunner:
+    """runner 契約を破って dict を返す (壊れた runner の代理)。"""
+
+    def __init__(self) -> None:
+        self.missions: list = []
+
+    def run(self, mission):
+        self.missions.append(mission)
+        return {"status": "completed",
+                "output": {"action": "open", "pair": "USDJPY",
+                           "side": "buy", "qty": 0.01}}
+
+
+def test_run_once_non_mission_result_is_attributed_not_boundary_swallowed(
+        tmp_path):
+    """runner が MissionResult 以外を返したとき、**Mission の失敗として
+    帰属される** (サービス境界の不透明な内部エラーに落ちない)。
+
+    ガードを消すと activity は `mission_boundary_failed` (ref_id 無し) に、
+    通知は「内部エラー」に変わる — どの Mission がなぜ失敗したのか追えない。
+    """
+    conn, loop, _, tp = _loop(tmp_path, [])
+    loop.runner = _NonMissionResultRunner()
+    loop.notifier.send = MagicMock()
+
+    assert loop.run_once() is None
+
+    mid = conn.execute(
+        "SELECT id FROM missions ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    lines = [ln.split("\t")
+             for ln in (tp / "a.log").read_text(encoding="utf-8").splitlines()]
+    # Mission に紐づく失敗として記録されること (event 名と ref_id の両方)
+    assert [(c, e, r) for _ts, c, e, _s, r in lines] == [
+        ("AGGREGATE", "mission_failed", str(mid))]
+    assert loop.notifier.send.call_args_list == [
+        call("[agentic-fx] 判断 Mission 失敗: failed")]
+    # 併せて: dict の中身は執行経路へ進まない
+    assert conn.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"] == 0
+
+
+def test_ask_once_non_mission_result_is_attributed_not_boundary_swallowed(
+        tmp_path):
+    """ask 経路 (`_ask_once_impl`) 側の同じガード。こちらも裸だった。
+
+    ここは戻り値そのものが両者を分ける — ガードありなら実 status を載せた
+    `(Mission 失敗: failed)`、無しならサービス境界の
+    `(Mission 失敗: internal_error)` になる。
+    """
+    conn, loop, _, _ = _loop(tmp_path, [])
+    loop.runner = _NonMissionResultRunner()
+
+    ans = loop.ask_once("今どう見てる？")
+
+    assert ans == "(Mission 失敗: failed)"       # internal_error ではない
+    row = conn.execute(
+        "SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["status"] == "failed"

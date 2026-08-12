@@ -992,3 +992,103 @@ def test_protect_protocol_stdout_redirects_fd1_to_stderr(monkeypatch):
                 os.close(fd)
             except OSError:
                 pass
+
+
+class _FakeLocalRunnerWithReason:
+    """Task 3 (CP10) 用の `LocalRunner` 差し替え。reason 付き failed
+    `MissionResult` を返す。`_FakeLocalRunner` と違い `on_message` は
+    呼ばない (event フレームは本テストの対象外)。"""
+
+    instances: list["_FakeLocalRunnerWithReason"] = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        _FakeLocalRunnerWithReason.instances.append(self)
+
+    def run(self, mission):
+        from agentic_fx.runners.base import MissionResult
+        return MissionResult(
+            status="failed", output=None,
+            reason="context exceeded: prompt 90010 tokens > "
+                   "n_ctx 65536 (model=m)")
+
+
+def test_main_puts_reason_in_result_frame_when_runner_sets_it(
+        monkeypatch, tmp_path):
+    """Task 3 / CP10: LocalRunner が MissionResult.reason を設定したら、
+    子は result フレームにそれを載せる (worker_profile=trade 経路)。"""
+    frames, _, _ = _drive_main(monkeypatch, tmp_path,
+                               runner_cls=_FakeLocalRunnerWithReason)
+    result_frame = frames[-1]
+    assert result_frame["type"] == "result"
+    assert result_frame["status"] == "failed"
+    assert result_frame["reason"] == (
+        "context exceeded: prompt 90010 tokens > n_ctx 65536 (model=m)")
+
+
+def test_main_puts_reason_in_result_frame_for_improve_profile(
+        monkeypatch, tmp_path):
+    """Task 3 / CP10 の improve profile 側 (別コードパス — mission_worker.py
+    の improve 分岐は trade 分岐と独立した result frame 構築コードを持つ)。"""
+    # Landlock はプロセス生涯に不可逆。既存テストと同じ seam で bootstrap を
+    # 止め、pytest プロセスを sandbox 化しない。
+    # 命名は同ファイル冒頭の既存 import (`from agentic_fx import mission_worker`)
+    # と既存テストに合わせる (新規テストだけ別名を持ち込まない)。
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda *args, **kwargs: None)
+
+    def settings_mutator(settings_dict):
+        pass  # improve は既定 settings のまま (backend=local)
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve",
+                             "db_path": None, "plugins_dir": None},
+        settings_mutator=settings_mutator,
+        runner_cls=_FakeLocalRunnerWithReason)
+    result_frame = frames[-1]
+    assert result_frame["type"] == "result"
+    assert result_frame["reason"] == (
+        "context exceeded: prompt 90010 tokens > n_ctx 65536 (model=m)")
+
+
+def test_result_frame_carries_null_reason_when_runner_leaves_it_unset(
+        monkeypatch, tmp_path):
+    """Task 3 / 1 周目 codex 指摘 M6: runner が `reason` を設定しなかった
+    (既定 None) とき、result フレームは `reason` キーを **持ち、その値が
+    null** であることを固定する (trade profile)。
+
+    `"reason": result.reason` を `"reason": result.reason or ""` に緩める
+    変異は、reason 付きテストが**非空文字列しか渡さない**ため既存テスト
+    全件を素通りする (指揮者が実測: 1762 passed のまま)。空文字が親へ
+    渡ると Task 1 の「既定は None」契約が壊れ、`is None` で診断の有無を
+    判定する呼び出し側が「診断あり」と誤読する。"""
+    frames, _, _ = _drive_main(monkeypatch, tmp_path)
+    result_frame = frames[-1]
+    assert result_frame["type"] == "result"
+    assert result_frame["status"] == "completed"
+    assert "reason" in result_frame
+    assert result_frame["reason"] is None
+
+
+def test_result_frame_carries_null_reason_for_improve_profile(
+        monkeypatch, tmp_path):
+    """Task 3 / 1 周目 codex 指摘 M7: 上と同じ性質を improve profile 側の
+    独立した result frame 構築コードでも固定する。"""
+    # Landlock はプロセス生涯に不可逆。既存テストと同じ seam で bootstrap を
+    # 止め、pytest プロセスを sandbox 化しない。
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda *args, **kwargs: None)
+
+    def settings_mutator(settings_dict):
+        pass  # improve は既定 settings のまま (backend=local)
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve",
+                             "db_path": None, "plugins_dir": None},
+        settings_mutator=settings_mutator)
+    result_frame = frames[-1]
+    assert result_frame["type"] == "result"
+    assert "reason" in result_frame
+    assert result_frame["reason"] is None

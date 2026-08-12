@@ -249,10 +249,12 @@ class WorkerRunner(AgentRunner):
             if kind == "result":
                 status = payload["status"]
                 output = payload.get("output")
+                reason = payload.get("reason")
             else:  # eof / protocol_error / error — すべて failed に正規化
                 status = "failed"
                 output = None
-            return MissionResult(status, output, transcript)
+                reason = None
+            return MissionResult(status, output, transcript, reason=reason)
         finally:
             dispatch_queue.put(None)
             self._ensure_dead(proc, w)
