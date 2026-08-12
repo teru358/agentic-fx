@@ -598,3 +598,56 @@ def test_migrate_ohlcv_split_accepts_matching_null_spread_on_rerun(tmp_path):
     names = {r["name"] for r in
              conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "ohlcv" not in names  # 一致したので移行完了
+
+
+def test_migrate_ohlcv_split_rolls_back_partial_writes_on_conflict(tmp_path):
+    """衝突で中断したとき、分割先への部分書き込みも巻き戻る。
+
+    既存の衝突テストは `ohlcv` が温存されることしか見ておらず、
+    `except` の `conn.rollback()` を削除する変異が生き残る。巻き戻らないと
+    接続に未コミットの部分行が残り、後続の commit で確定してしまう。
+    """
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "split_rollback.db")
+    conn.executescript(db_v2_ddl_for_test())
+    # 1 行目は衝突しない (=分割先へ書かれる)、2 行目が衝突して例外を起こす
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,'dukascopy',NULL)")
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:01:00+00:00',1,2,0.5,1.5,100,'yfinance',NULL)")
+    conn.commit()
+    conn.executescript(db_module._OHLCV_CACHE_DDL + db_module._OHLCV_HISTORY_DDL)
+    conn.execute("INSERT INTO ohlcv_cache VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:01:00+00:00',999,2,0.5,1.5,100,'yfinance')")
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="一致しない"):
+        db_module._migrate_ohlcv_split(conn)
+
+    # 衝突しなかった dukascopy 行が history へ残っていない = 巻き戻っている
+    n = conn.execute("SELECT COUNT(*) FROM ohlcv_history").fetchone()[0]
+    assert n == 0
+
+
+def test_migrate_ohlcv_split_backup_uses_split_suffix(tmp_path):
+    """分割 migration のバックアップ名は `.bak-ohlcv-split`。
+
+    エラーメッセージが復元先としてこの名前を案内しているので、suffix が
+    ずれると案内が実在しないファイルを指す。既存テストは
+    `_backup_before_migration` を直接呼ぶ形で、v2 用の suffix しか見て
+    いなかったため、分割側の suffix 変更が検出できなかった。
+    """
+    from agentic_fx.store import db as db_module
+
+    db = tmp_path / "split_backup.db"
+    conn = connect(db)
+    conn.executescript(db_v2_ddl_for_test())
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,'yfinance',NULL)")
+    conn.commit()
+    conn.executescript(db_module._OHLCV_CACHE_DDL + db_module._OHLCV_HISTORY_DDL)
+
+    db_module._migrate_ohlcv_split(conn)
+
+    assert (tmp_path / "split_backup.db.bak-ohlcv-split").exists()

@@ -423,3 +423,42 @@ def test_prune_cache_rejects_non_positive_limit(tmp_path):
     with pytest.raises(ValueError, match="limit"):
         ohlcv.prune_cache(conn, cutoff=datetime(2026, 7, 22, tzinfo=timezone.utc),
                           limit=0)
+
+
+def test_upsert_cache_bars_rejects_unknown_source(tmp_path):
+    """どちらの allowlist にも属さない source も拒否する。
+
+    既存の拒否テストは IMPORT_SOURCES の名前しか渡していないため、検証を
+    「IMPORT_SOURCES なら拒否」という形に狭める変異が生き残る。狭めると
+    未知 source (設定 typo・将来の新 source) が黙ってキャッシュへ書ける。
+    """
+    conn = _conn(tmp_path)
+    b = Bar("USDJPY", "1m", datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc),
+            1, 2, 0.5, 1.5, 10)
+    with pytest.raises(ValueError):
+        ohlcv.upsert_cache_bars(conn, [b], source="yfinace")
+
+
+def test_load_cache_bars_rejects_unknown_source(tmp_path):
+    """読み側も同様に、どちらの allowlist にも属さない source を拒否する。"""
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        ohlcv.load_cache_bars(conn, "USDJPY", "1m", source="yfinace")
+
+
+def test_prune_cache_keeps_row_exactly_at_cutoff(tmp_path):
+    """cutoff ちょうどの行は残る (`bar_time < cutoff` の strict less than)。
+
+    既存テストは cutoff の両側に離れた 2 点しか置いておらず、`<` → `<=`
+    の変異を検出できない。
+    """
+    conn = _conn(tmp_path)
+    cutoff = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    _cache_row(conn, cutoff.isoformat())
+    _cache_row(conn, (cutoff - timedelta(minutes=1)).isoformat())
+
+    assert ohlcv.prune_cache(conn, cutoff=cutoff, limit=100) == 1
+
+    left = [r["bar_time"] for r in
+            conn.execute("SELECT bar_time FROM ohlcv_cache")]
+    assert left == [cutoff.isoformat()]
