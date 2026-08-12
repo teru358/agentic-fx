@@ -1,7 +1,7 @@
 """上位足供給 — ohlcv の 1m 行からの読み取り時リサンプル (プラン 7 Task 0)。
 
 設計判断 (ユーザー裁定 2026-08-02): 導出保存ではなく**読み取り時リサンプル**。
-①導出保存は ohlcv の既存行不変契約 (import_bars) と衝突する ②spec §5
+①導出保存は ohlcv の既存行不変契約 (import_history_bars) と衝突する ②spec §5
 「細かい足から resample」と同一思想 ③`datafeed.bars.resample` は
 `BAR_ANCHOR="epoch"` でバックテストのバケット錨と整合済み。
 

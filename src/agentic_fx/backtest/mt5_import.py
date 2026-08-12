@@ -1,7 +1,7 @@
 """MT5 bridge 一括インポータ + 価格系差照合。
 
 MT5 bridge (`GET {base}/ohlcv/{sym}?from=ISO&to=ISO&interval=1m`) から
-1 分足を 1 日窓でページングして取り込み (`import_bars(source="mt5")`)、
+1 分足を 1 日窓でページングして取り込み (`import_history_bars(source="mt5")`)、
 Dukascopy 等の他 source と重複期間の close 差を照合する。
 
 MT5 は bid 系列 — mid 近似としてそのまま保存する (spec §6 の但し書きどおり。
@@ -121,7 +121,7 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
             # F5 (最終レビュー codex I2): 正規化後の timestamp を現在の取得窓
             # [current, window_end) に対して検証する。bridge が "to" を
             # inclusive 解釈した場合の境界重複や、bridge の不具合・キャッシュ
-            # 汚染による窓外行の無言混入を防ぐ (fail loud — import_bars の
+            # 汚染による窓外行の無言混入を防ぐ (fail loud — import_history_bars の
             # 既存行不変性は値の上書きを防ぐだけで、窓外の新規キー挿入は
             # 防がない)。
             bar_dt = datetime.fromisoformat(bar_time_iso)

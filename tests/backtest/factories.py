@@ -21,7 +21,7 @@ def _conn(tmp_path):
 
 
 def _row_at(ts, *, o, h, l, c, v=10.0, spread=0.01, symbol="USDJPY"):
-    """ohlcv.import_bars 用の row タプル。"""
+    """ohlcv.import_history_bars 用の row タプル。"""
     return (symbol, "1m", ts.isoformat(), o, h, l, c, v, spread)
 
 

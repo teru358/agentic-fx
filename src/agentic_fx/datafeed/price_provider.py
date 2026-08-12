@@ -35,10 +35,10 @@ DERIVE_ONLY_INTERVALS = frozenset({"4h", "1d"})
 # F1 (fix round 1, codex Critical): 永続化用 source ID とチェーン表示名の
 # マッピング。live MT5 は ohlcv に "mt5-live" として保存する
 # (spec §6: live="mt5-live" / 一括インポータ="mt5" — 混在させると、Task 5 の
-# 一括履歴インポート (既存行不変・import_bars) を Phase 3 の live 上書き
-# (upsert_bars) が破壊する PK 衝突になる)。`_chain`/`last_bars_source`/
+# 一括履歴インポート (既存行不変・import_history_bars) を Phase 3 の live 上書き
+# (upsert_cache_bars) が破壊する PK 衝突になる)。`_chain`/`last_bars_source`/
 # `bars_origin` はチェーンの表示名 ("mt5") をそのまま使い続ける — 変えるのは
-# 永続化境界 (upsert_bars/load_bars の source 引数) だけ。
+# 永続化境界 (upsert_cache_bars/load_cache_bars の source 引数) だけ。
 _STORAGE_SOURCE = {"mt5": "mt5-live"}
 
 
@@ -71,7 +71,7 @@ class PriceProvider:
         self.clock = clock
         # CR-4 (裁定書 F-5): 子プロセス (mission_worker.py) は conn に
         # db.connect_readonly (mode=ro) を渡す。get_bars/_derive の
-        # cache 書込 (ohlcv.upsert_bars) は RO 接続下で
+        # cache 書込 (ohlcv.upsert_cache_bars) は RO 接続下で
         # sqlite3.OperationalError になるため、readonly=True のときは
         # 書込呼び出し自体をスキップする (RPC 経由の親委譲はしない —
         # RPC 面を拡大しない設計裁定)。
@@ -206,7 +206,7 @@ class PriceProvider:
         source 列は「どの source が書いたか」を区別する PK の一部になった
         (ohlcv v2)。ここは「どの source が書いたか」を知らないサイトなので、
         **`_chain` が返す live source 名を優先順に 1 つずつ試し**、各名で単一
-        source の `load_bars(..., source=...)` を読む (永続化 ID への変換は
+        source の `load_cache_bars(..., source=...)` を読む (永続化 ID への変換は
         `_storage_source`、F1) — 複数 source の行を 1 回のクエリで混ぜて
         返さない (上書き 1)。Phase 1 の実態は yfinance のみなので挙動は不変。
 

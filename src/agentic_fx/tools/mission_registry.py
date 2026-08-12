@@ -44,7 +44,7 @@ def build_mission_registry(
 
     `readonly` (CR-4 対応、裁定書 F-5): 子プロセス (`mission_worker.py`)
     は `conn` に `db.connect_readonly` (SQLite `mode=ro`) を渡すため、
-    `PriceProvider.get_bars`/`_derive` が通常経路で行う `ohlcv.upsert_bars`
+    `PriceProvider.get_bars`/`_derive` が通常経路で行う `ohlcv.upsert_cache_bars`
     キャッシュ書込は `sqlite3.OperationalError: attempt to write a
     readonly database` になる。`readonly=True` は `PriceProvider` を
     cache 書込スキップモードで構築する — 既存 cache は引き続き読むが、

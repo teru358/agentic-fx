@@ -781,7 +781,7 @@ def test_to_account_rate_cross_leg_skew_exceeded_raises(tmp_path):
 
 def test_readonly_provider_skips_bar_cache_write(tmp_path):
     """CR-4 対応 (裁定書 F-5): readonly=True で構築した PriceProvider は
-    get_bars 成功時に ohlcv.upsert_bars を呼ばない — RO 接続下でも
+    get_bars 成功時に ohlcv.upsert_cache_bars を呼ばない — RO 接続下でも
     `sqlite3.OperationalError` にならないことの単体ピン。"""
     s = load_settings(EXAMPLE)
     conn = connect(tmp_path / "t.db")

@@ -30,7 +30,7 @@ def ticks_to_1m(ticks: list[Tick], symbol: str) -> list[tuple]:
     """Aggregate ticks to 1-minute bars.
 
     Converts mid=(bid+ask)/2 prices to OHLC, calculates mean spread,
-    and returns import_bars row tuples.
+    and returns import_history_bars row tuples.
 
     Args:
         ticks: List of Tick(ts, bid, ask) objects

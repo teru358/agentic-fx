@@ -23,6 +23,21 @@ C3 自体は「エスカレーション不要・実質解消済み」で閉じ�
 | 「`ohlcv` 全体が無制限に増える」(§1) | **`ohlcv_cache` が無制限に増える**。`ohlcv_history` は意図的に保持する (削除しない) |
 | §7 起票「`ohlcv` の無制限増大 / 保持ポリシー」 | **プラン 9 Task 16 で解決済み** — 分割 + `ohlcv_cache` の保持ポリシー。起票は閉じる |
 
+**API 名の読み替え表** (Task 16 完了時点の実装が正。本文中の旧名はすべてこの表で読み替える —
+3 周目レビューで「本文が旧名のままだと Task 9/10 の実装者が古い名前を前提にする」と指摘されたため明記する):
+
+| 本文の旧名 | Task 16 以降の正 | 対象テーブル |
+|---|---|---|
+| `ohlcv.load_bars(...)` (キャッシュ読み文脈) | `ohlcv.load_cache_bars(conn, symbol, interval, *, source, since=None, until=None)` | `ohlcv_cache` |
+| `ohlcv.upsert_bars(...)` | `ohlcv.upsert_cache_bars(conn, bars, *, source)` | `ohlcv_cache` |
+| `ohlcv.load_bars(...)` (履歴読み文脈) | `ohlcv.load_history_bars(...)` | `ohlcv_history` |
+| `ohlcv.import_bars(...)` | `ohlcv.import_history_bars(...)` | `ohlcv_history` |
+| `ohlcv.load_spread(...)` | `ohlcv.load_history_spread(...)` | `ohlcv_history` |
+
+受理する `source` は**読み側にも書き側にも** allowlist で強制される
+(`LIVE_SOURCES = {"yfinance","twelvedata","mt5-live"}` / `IMPORT_SOURCES = {"dukascopy","mt5"}`)。
+検査点 1・15 の「`load_bars(since=...)`」は **`load_cache_bars(since=...)`** と読む。
+
 **テストの対象テーブルを `ohlcv_cache` に固定する** (検査点 1・5・11・12・13・15 の spy / fixture / SQL / 行数検査)。
 
 **検査点を 1 つ追加する (17)**: **`ohlcv_history` に同時刻・同 symbol・同 interval の行があっても、キャッシュ経路はそれを拾わない**。分割前の E2E は「別 source の混入」を防いだが、**「履歴テーブルへ誤配線された loader」を殺せない**。これは分割の目的を直接検査する負例であり、変異は「キャッシュ読み口を履歴テーブルへ向ける」。

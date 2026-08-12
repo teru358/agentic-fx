@@ -94,7 +94,7 @@ def _oldest_bar_start(history_conn: sqlite3.Connection, symbol: str,
             "(cannot determine in-sample start)")
     start = datetime.fromisoformat(bar_time_iso).astimezone(_UTC)
     # F2 (fix round 1, codex Important + sonnet Important-3): ohlcv.
-    # import_bars/_validate_and_normalize_row は bar_time の分格子
+    # import_history_bars/_validate_and_normalize_row は bar_time の分格子
     # (second==microsecond==0) を検証しない — 別経路のインポータが秒付き
     # タイムスタンプを書き込むと、そのまま run_replay/ReplayClock に渡って
     # しまう。本番なら ReplayClock 構築時に確実に ValueError で落ちるが

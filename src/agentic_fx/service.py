@@ -634,7 +634,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # そのまま使うと F-6/CR-5 が塞いだ違反が supervisor スレッドから
         # core_lock 非保持で再発する)。
         # 注意: readonly=True のため healthcheck はもう ohlcv キャッシュを
-        # 温めない (get_bars/derive の upsert_bars がスキップされる) —
+        # 温めない (get_bars/derive の upsert_cache_bars がスキップされる) —
         # これは意図した挙動であり退行ではない。CR-4 と同じ理由でキャッシュの
         # 一次的な書き手は scheduler tick (mark-to-market 等、既存の conn_core
         # 版 provider) であり続けるため、healthcheck が書かなくてもキャッシュ
