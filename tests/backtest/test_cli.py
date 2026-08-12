@@ -886,9 +886,15 @@ def test_cli_default_service_behavior_unchanged(monkeypatch):
     assert rc == 0 and rs.called
 
 
-def test_backtest_run_rejects_live_source(tmp_path, monkeypatch):
+def test_backtest_run_rejects_live_source(tmp_path, monkeypatch, capsys):
     """人間 CLI にライブ source を渡すと argparse が fail closed する
-    (設計書 D2)。SystemExit(2) は argparse の標準的な引数エラー終了コード。"""
+    (設計書 D2)。SystemExit(2) は argparse の標準的な引数エラー終了コード。
+
+    段 0 の変異 M16-16 (`choices=sorted(ohlcv.IMPORT_SOURCES)` の削除) は
+    exit code だけを見る版では**生存した** — choices が無くても後段の
+    初期化ガードが同じ SystemExit(2) を出すため。拒否した主体が argparse の
+    allowlist であることまで見る。
+    """
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
     with pytest.raises(SystemExit) as exc:
@@ -896,9 +902,10 @@ def test_backtest_run_rejects_live_source(tmp_path, monkeypatch):
              "--from", "2026-01-01", "--to", "2026-01-02",
              "--proposal-file", "dummy.jsonl"])
     assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
-def test_history_coverage_rejects_live_source(tmp_path, monkeypatch):
+def test_history_coverage_rejects_live_source(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
     with pytest.raises(SystemExit) as exc:
@@ -906,12 +913,14 @@ def test_history_coverage_rejects_live_source(tmp_path, monkeypatch):
              "--timeframe", "1h", "--source", "mt5-live",
              "--from", "2026-01-01", "--to", "2026-01-02"])
     assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
-def test_analyze_corr_rejects_live_source(tmp_path, monkeypatch):
+def test_analyze_corr_rejects_live_source(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
     with pytest.raises(SystemExit) as exc:
         main(["analyze", "corr", "--a", "USDJPY", "--b", "EURUSD",
              "--timeframe", "1h", "--source", "twelvedata"])
     assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err

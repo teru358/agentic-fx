@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import jsonschema
@@ -58,6 +58,12 @@ from agentic_fx.tools.mission_registry import build_mission_registry
 from agentic_fx.tools.registry import ToolRegistry
 
 _log = logging.getLogger("agentic_fx.service")
+
+# プラン 9 Task 16: 1 回の DELETE が SL/TP 監視 (_process_exits) の許容
+# 遅延を超えないことを基準にした有界バッチ上限。実測は Task 16 Step 43
+# のコメントを参照。実測 2026-08-12: 5000 行の DELETE が 0.0049 秒
+# (ローカル SQLite、WAL)。
+_OHLCV_PRUNE_BATCH_LIMIT = 5000
 
 
 def _state_store(root: Path) -> StateStore:
@@ -688,6 +694,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             _run_signal_maintenance(conn=conn_core, signal_producer=signal_producer,
                                     approved=approved, settings=settings, now=now)
 
+        def on_cache_maintenance(now: datetime) -> None:
+            # プラン 9 Task 16: ohlcv_cache の保持ポリシー。有界バッチ
+            # (_OHLCV_PRUNE_BATCH_LIMIT) × 毎 maintenance 実行で、初回の
+            # 大量削除 (既存蓄積分) の lock 保持窓を抑えつつ、定常状態では
+            # 1 回の呼び出しで日次増分に追いつく (設計書 D2)。
+            cutoff = now - timedelta(days=settings.datafeed.cache_retention_days)
+            ohlcv.prune_cache(conn_core, cutoff=cutoff,
+                              limit=_OHLCV_PRUNE_BATCH_LIMIT)
+
         def signal_due_fn(now: datetime) -> bool:
             # D2: オープンポジション or pending_fill の注文が無いなら signal
             # 起動は無意味 (新規建玉を提案しても executor が gate で弾くだけ
@@ -705,6 +720,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                               on_news_cycle=collector.collect,
                               on_econ_cycle=econ.refresh,
                               on_signal_maintenance=on_signal_maintenance,
+                              on_cache_maintenance=on_cache_maintenance,
                               signal_due_fn=signal_due_fn,
                               stop_event=stop_event)
 

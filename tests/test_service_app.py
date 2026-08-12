@@ -2357,3 +2357,96 @@ def test_build_app_accepts_default_example_intervals_and_retention(tmp_path):
         pp.return_value.healthcheck.return_value = "yfinance"
         app = build_app(tmp_path)
     app.close()
+
+
+def test_build_app_wires_cache_maintenance_hook(tmp_path):
+    """build_app が Scheduler に on_cache_maintenance を配線すること
+    (None のままではない)。"""
+    (tmp_path / "config").mkdir()
+    src = open("config/settings.yaml.example", encoding="utf-8").read()
+    (tmp_path / "config" / "settings.yaml").write_text(src)
+    with patch("agentic_fx.service.PriceProvider") as pp, \
+         patch("agentic_fx.service._check_llama_swap"):
+        pp.return_value.healthcheck.return_value = "yfinance"
+        app = build_app(tmp_path)
+    try:
+        assert app.scheduler.on_cache_maintenance is not None
+    finally:
+        app.close()
+
+
+def test_cache_maintenance_prunes_old_cache_rows(tmp_path):
+    """配線された on_cache_maintenance が実際に ohlcv_cache を刈ること
+    (cutoff = tick 時刻 - cache_retention_days)。"""
+    from agentic_fx.core.contracts import Bar
+    from agentic_fx.store import ohlcv
+
+    (tmp_path / "config").mkdir()
+    src = open("config/settings.yaml.example", encoding="utf-8").read()
+    (tmp_path / "config" / "settings.yaml").write_text(src)
+    with patch("agentic_fx.service.PriceProvider") as pp, \
+         patch("agentic_fx.service._check_llama_swap"):
+        pp.return_value.healthcheck.return_value = "yfinance"
+        app = build_app(tmp_path, clock=FixedClock(NOW))
+    try:
+        # ⚠️ **境界の両側**を置く。旧版は 40 日前の 1 本だけを入れて「消えたこと」
+        # しか見ておらず、**`cutoff` を retention 非依存の固定値にする変異が生存**
+        # していた (ローカル LLM muse-glimmer が検出・指揮者が裏取り) — 例えば
+        # `cutoff = NOW` (全削除) でもこのテストは PASS してしまう。
+        # 残るべき 1 本を足して初めて「retention 由来の cutoff」を pin できる。
+        old_bar = Bar("USDJPY", "1m", NOW - timedelta(days=40),      # 保持外 → 消える
+                      148.0, 148.1, 147.9, 148.05, 10)
+        keep_bar = Bar("USDJPY", "1m", NOW - timedelta(days=10),     # 保持内 → 残る
+                       149.0, 149.1, 148.9, 149.05, 11)
+        ohlcv.upsert_cache_bars(app.conn_core, [old_bar, keep_bar],
+                                source="yfinance")
+
+        app.scheduler.on_cache_maintenance(NOW)
+
+        rows = ohlcv.load_cache_bars(
+            app.conn_core, "USDJPY", "1m", source="yfinance",
+            since=NOW - timedelta(days=41))
+        # 「消えた」だけでなく「残った」も見る。全削除・無削除の双方を殺す。
+        assert [b.ts for b in rows] == [NOW - timedelta(days=10)]
+    finally:
+        app.close()
+
+
+def test_cache_maintenance_cutoff_follows_configured_retention_days(tmp_path):
+    """cutoff は `datafeed.cache_retention_days` の**設定値**から導出される。
+
+    段 0 の変異 M16-15 (`cutoff = now - timedelta(days=30)` と固定値化) は
+    既存テストでは**生存した** — settings.yaml.example の既定が 30 日なので
+    固定値 30 が設定値と一致し、等価変異になっていた。既定と異なる保持期間
+    (45 日) を明示し、30 日固定なら消えてしまう 35 日前のバーを残ることの
+    観測点に使う。
+    """
+    from agentic_fx.core.contracts import Bar
+    from agentic_fx.store import ohlcv
+
+    (tmp_path / "config").mkdir()
+    src = open("config/settings.yaml.example", encoding="utf-8").read()
+    src = src.replace("cache_retention_days: 30", "cache_retention_days: 45")
+    assert "cache_retention_days: 45" in src  # 前提: 置換が効いたこと
+    (tmp_path / "config" / "settings.yaml").write_text(src)
+    with patch("agentic_fx.service.PriceProvider") as pp, \
+         patch("agentic_fx.service._check_llama_swap"):
+        pp.return_value.healthcheck.return_value = "yfinance"
+        app = build_app(tmp_path, clock=FixedClock(NOW))
+    try:
+        assert app.settings.datafeed.cache_retention_days == 45  # 前提
+        drop_bar = Bar("USDJPY", "1m", NOW - timedelta(days=50),   # 45 日外 → 消える
+                       148.0, 148.1, 147.9, 148.05, 10)
+        keep_bar = Bar("USDJPY", "1m", NOW - timedelta(days=35),   # 45 日内 → 残る
+                       149.0, 149.1, 148.9, 149.05, 11)            # (30 日固定なら消える)
+        ohlcv.upsert_cache_bars(app.conn_core, [drop_bar, keep_bar],
+                                source="yfinance")
+
+        app.scheduler.on_cache_maintenance(NOW)
+
+        rows = ohlcv.load_cache_bars(
+            app.conn_core, "USDJPY", "1m", source="yfinance",
+            since=NOW - timedelta(days=51))
+        assert [b.ts for b in rows] == [NOW - timedelta(days=35)]
+    finally:
+        app.close()

@@ -45,6 +45,7 @@ class Scheduler:
                  on_news_cycle: Callable[[], None],
                  on_econ_cycle: Callable[[], None],
                  on_signal_maintenance: Callable[[datetime], None] | None = None,
+                 on_cache_maintenance: Callable[[datetime], None] | None = None,
                  signal_due_fn: Callable[[datetime], bool] | None = None,
                  stop_event: threading.Event | None = None) -> None:
         self.conn = conn
@@ -68,6 +69,10 @@ class Scheduler:
         # なら `_trade_mission_due` は cron のみを見る (signal 判定を
         # スキップ)。
         self.on_signal_maintenance = on_signal_maintenance
+        # プラン 9 Task 16: ohlcv_cache の保持ポリシー (prune) 用フック。
+        # 既定 None = 機能無効 (既存テスト互換)。signal maintenance とは
+        # 責務が異なるため専用フックにする (責務混在を避ける)。
+        self.on_cache_maintenance = on_cache_maintenance
         self.signal_due_fn = signal_due_fn
         self._stop_event = stop_event
         # 上書き 1 の改名: cron (1 時間毎) の締切だけを追跡する。signal
@@ -222,6 +227,9 @@ class Scheduler:
         if self.on_signal_maintenance is not None:
             self._run_data_hook(
                 "signal_maintenance", lambda: self.on_signal_maintenance(now))
+        if self.on_cache_maintenance is not None:
+            self._run_data_hook(
+                "cache_maintenance", lambda: self.on_cache_maintenance(now))
 
     # ---- internal -------------------------------------------------------
 
