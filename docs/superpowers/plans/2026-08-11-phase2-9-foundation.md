@@ -1656,6 +1656,14 @@ uv run pytest tests/test_service_app.py -k "check_llama_swap_ok or model_missing
 
 - [ ] **Step 3: 最小実装**
 
+> **追補 (2 周目レビュー)**: 以下の指示は着手時点の記述であり、**現行実装とは
+> 意図的に異なる**。`_fetch_model_ctx` には後から**必須引数 `timeout: float`**
+> が加わり、`timeout=5` のリテラルは `_COLD_LOAD_TIMEOUT = 120` /
+> `_PROPS_TIMEOUT_HOT = 5` に分離された。`/props` はモデルをロードさせるため、
+> smoke より前に呼ぶ improve 側は必ず cold になり、5 秒では届かない
+> (実機 35B 実測 cold 13.86s / hot 0.0005s)。3 周目レビューで cold load 本体で
+> ある smoke 自身も同じ予算に束ねた。詳細は §③ と実装のコメントを参照。
+
 `src/agentic_fx/service.py:73-110` を以下に置き換える:
 
 ```python
@@ -1853,7 +1861,8 @@ EOF
 - `AgentRunner.__doc__` の規範文言 (Task 1) は Task 2 の実装方針 (単一行・上限・安全化・生本文を入れない) と文言レベルで一致させた
 - `mission_worker.py` の result frame キー `"reason"` (Task 3 produce) と `worker_runner.py` の `payload.get("reason")` (Task 3 consume) は同一プロセス内の Task 3 で閉じており、他 Task には露出しない
 - Task 4 が読む `result.reason` は Task 2/3 が設定する値と同じ型 (`str | None`) で、Task 4 側は追加の変換をしない (Interfaces 節に明記済み)
-- Task 5 は他 Task と型を共有しない (独立 leaf task)。`_model_load_order(settings) -> list[str]` と `_fetch_model_ctx(base: str, model: str) -> int | None` は `service.py` 内で完結する private 関数として定義した
+- Task 5 は他 Task と型を共有しない (独立 leaf task)。`_model_load_order(settings) -> list[str]` と `_fetch_model_ctx(base: str, model: str, timeout: float) -> int | None` は `service.py` 内で完結する private 関数として定義した
+  - **`timeout` は 2 周目レビューで追加した必須引数** (3 周目レビューで本文との乖離を検出し追記)。`/props` はモデルをロードさせるため、呼び出し側が cold を踏むか hot を踏むかで必要な予算が 4 桁違う (実機 35B で cold 13.86s / hot 0.0005s)。既定値を置くと第 3 の呼び出し点が黙って cold に 5 秒を割り当てて同じ欠陥が再発するため、**既定値を置かない**
 
 #### ④ カバーできなかった項目 (正直に列挙)
 

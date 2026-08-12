@@ -91,8 +91,12 @@ def _model_load_order(settings) -> list[str]:
 # が即答するので 1802 passed はこの行の証拠にならない。
 # 短い予算で中断すると llama-swap を swap 途中に置き去りにし、後続の trade
 # smoke がそれを待つ (llama-swap-environment の TTL/incoming-request race)。
-_PROPS_TIMEOUT_COLD = 120  # smoke 前の improve。cold load を跨ぐ (smoke と同額)
-_PROPS_TIMEOUT_HOT = 5     # smoke 直後の trade。既にロード済み
+# 3 周目レビュー: cold load を跨ぎうる要求は **smoke 自身も含めて** この 1 つの
+# 予算に束ねる。分離した当初は `/props` の 2 箇所だけを対象にしたため、最も
+# cold-load 耐性が要る smoke の `timeout=120` が pin から漏れ、5 へ縮める変異が
+# 1808 passed のまま生存した。
+_COLD_LOAD_TIMEOUT = 120   # smoke 本体と、smoke 前の improve `/props`
+_PROPS_TIMEOUT_HOT = 5     # smoke 直後の trade `/props`。既にロード済み
 
 
 def _fetch_model_ctx(base: str, model: str, timeout: float) -> int | None:
@@ -159,7 +163,7 @@ def _check_llama_swap(settings) -> None:
     order = _model_load_order(settings)
     if len(order) == 2:
         # improve はここが初回接触なので**必ず cold**。smoke と同額を積む
-        improve_ctx = _fetch_model_ctx(base, order[0], _PROPS_TIMEOUT_COLD)
+        improve_ctx = _fetch_model_ctx(base, order[0], _COLD_LOAD_TIMEOUT)
         if improve_ctx is not None:
             print(f"improve model '{order[0]}' ctx {improve_ctx}")
 
@@ -169,7 +173,7 @@ def _check_llama_swap(settings) -> None:
         r = httpx.post(f"{base}/chat/completions",
                        json={"model": trade_model, "max_tokens": 1,
                              "messages": [{"role": "user", "content": "ping"}]},
-                       timeout=120)
+                       timeout=_COLD_LOAD_TIMEOUT)
         r.raise_for_status()
     except (httpx.RequestError, httpx.HTTPStatusError) as e:
         print(f"警告: モデル '{trade_model}' の cold-load smoke に失敗しました ({e})。"

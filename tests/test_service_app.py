@@ -1081,29 +1081,41 @@ def test_check_llama_swap_props_timeout_budget_differs_cold_vs_hot(capsys):
 
     MockTransport は即答するので経過時間では測れない。**予算そのものが契約**
     なので `request.extensions["timeout"]` を直接 assert する。
+
+    3 周目レビュー: 当初は `/props` の 2 箇所しか採っておらず、**cold load
+    本体である smoke 自身の `timeout` が pin から漏れていた** — 120 → 5 に
+    縮める変異が 1808 passed のまま生存した。cold load を跨ぎうる要求は
+    smoke を含めて 1 つの予算 (`_COLD_LOAD_TIMEOUT`) に束ねてあるので、
+    **3 要求すべてを 1 本の列で固定する**。
     """
-    budgets: list[tuple[str | None, float]] = []
+    budgets: list[tuple[str, str | None, float]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        read_budget = request.extensions["timeout"]["read"]
         if path.endswith("/models"):
             return httpx.Response(200, json={"data": [{"id": "trade-m"}]})
         if path == "/props":
-            budgets.append((request.url.params.get("model"),
-                            request.extensions["timeout"]["read"]))
+            budgets.append(("props", request.url.params.get("model"),
+                            read_budget))
             return httpx.Response(200, json={
                 "default_generation_settings": {"n_ctx": 4096}})
+        if path.endswith("/chat/completions"):
+            budgets.append(("smoke", json.loads(request.content)["model"],
+                            read_budget))
+            return httpx.Response(200, json={})
         return httpx.Response(200, json={})
 
     client = _mock_client(handler)
     with patch("httpx.get", client.get), patch("httpx.post", client.post):
         _check_llama_swap(_StubSettingsDiff())
 
-    assert budgets == [("improve-m", 120), ("trade-m", 5)]
-    # cold 側は smoke と同額であること。smoke の予算を上げて /props を
-    # 据え置く変異 (逆もまた) を殺す
-    improve_budget = dict(budgets)["improve-m"]
-    assert improve_budget >= 120
+    # 種別 × 対象 × 予算 を組で固定する。cold を踏む 2 要求 (improve /props と
+    # smoke) が同額であること、hot な trade /props だけが短いことまで見る。
+    assert budgets == [
+        ("props", "improve-m", 120),
+        ("smoke", "trade-m", 120),
+        ("props", "trade-m", 5)]
 
 
 def test_check_llama_swap_props_base_without_v1_is_not_truncated(capsys):
