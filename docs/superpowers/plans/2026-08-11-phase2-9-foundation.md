@@ -3579,7 +3579,7 @@ Expected: 既存件数 + 15 件が passed (この時点では `cache_window.py` 
 | M8-2 | 導出分岐で ratio を落とす (`lookback_days * ratio` → `lookback_days`) | `live_window_days` の derive 分岐 | `test_derive_interval_window_multiplies_by_ratio` |
 | M8-3 | `base_candidates` から `DERIVE_ONLY_INTERVALS` 除外を外す | `base_candidates` | `test_base_candidates_excludes_derive_only_intervals` |
 | M8-4 | `finest_native_base` のループ順を反転 (`sorted(..., reverse=True)` → `reverse=False`) | `base_candidates` | `test_finest_native_base_picks_coarsest_native_divisor` (最も粗い足ではなく最も細かい足が選ばれ 1h ではなく 1m が返る) |
-| M8-5 | `floor_to_interval` で `astimezone(timezone.utc)` を消す (非 UTC offset をそのまま使う) | `floor_to_interval` | `test_floor_to_interval_non_utc_offset_normalizes_to_utc` |
+| ~~M8-5~~ | ~~`floor_to_interval` で `astimezone(timezone.utc)` を消す~~ **この変異は等価であり ledger の誤り** (2026-08-12 実測・1 周目 codex 指摘)。`ts - _EPOCH` は aware 同士なので絶対時刻で差を取り、その結果を UTC の `_EPOCH` に足すため**戻り値が変わらない**。実測でフルスイート 1827 passed のまま生存する。**代替**: `ts.astimezone(timezone.utc)` → `ts.replace(tzinfo=timezone.utc)` (オフセットを換算せず付け替えるので JST テストが red になる) | `floor_to_interval` | 代替変異なら `test_floor_to_interval_non_utc_offset_normalizes_to_utc` |
 | M8-6 | `floor_to_interval` の naive チェックを消す | `floor_to_interval` | `test_floor_to_interval_rejects_naive_datetime` |
 | M8-7 | `_EPOCH` を `1970-01-01T00:00:01` (1 秒ずらす) にする | `_EPOCH` | `test_floor_to_interval_1d_floors_to_utc_midnight` (00:00 ではなく 23:59:59 のバケットが返る) |
 

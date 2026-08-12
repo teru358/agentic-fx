@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agentic_fx.datafeed import cache_window
+from agentic_fx.datafeed import cache_window, sources
 from agentic_fx.datafeed.health import DataUnhealthy
 
 UTC = timezone.utc
@@ -115,3 +115,44 @@ def test_native_1d_is_still_forced_through_the_derive_branch():
     # 5 日 × (1440 / 60) = 120。native 分岐なら 5 になる
     assert cache_window.live_window_days("yfinance", "1d", 5) == 120
     assert cache_window.live_window_days("mt5", "1d", 3) == 72
+
+
+# ---- 1 周目 codex (sol) 指摘・指揮者が実測で確定 --------------------------
+
+def test_base_candidates_excludes_non_divisors(monkeypatch):
+    """codex #1: `want % m == 0` の約数判定を消しても**全テストが通る**
+    (実測 1827 passed)。現行の `INTERVAL_MIN` は `1h` より細かい足が
+    すべて 60 の約数なので、**fixture が防御を退化させている**。
+
+    境界の合わない足を base に選ぶと、導出したバーの境界がずれる。
+    合成 interval で非約数のケースを作って固定する。
+    """
+    monkeypatch.setitem(sources.INTERVAL_MIN, "7m", 7)
+    # 7 は 60 の約数ではないので base 候補に入ってはならない
+    assert "7m" not in cache_window.base_candidates("1h")
+    # 約数である足は従来どおり入る (判定ごと消す変異と区別するため)
+    assert "5m" in cache_window.base_candidates("1h")
+
+
+def test_live_window_days_returns_int_not_float(monkeypatch):
+    """codex #2: `int(...)` を外しても**全テストが通る** (実測 1827 passed) —
+    Python では `20.0 == 20` が真なので、値だけを見る assert は
+    **型の退化を見逃す**。
+
+    `ratio` は `INTERVAL_MIN` 同士の除算なので float になる。戻り値の
+    annotation とプランの interface は `int` を明記しており、後続が
+    整数日数を前提にすると静かに伝播する。
+    """
+    result = cache_window.live_window_days("yfinance", "4h", 5)
+    assert result == 20
+    assert type(result) is int          # 20.0 では落ちる
+
+    native = cache_window.live_window_days("yfinance", "1h", 5)
+    assert type(native) is int          # native 分岐も同じ契約
+
+
+def test_derive_only_intervals_is_an_immutable_frozenset():
+    """codex #3: `frozenset` を可変 `set` にしてもテストが通る (実測)。
+    共有定数が実行中・テスト中に書き換え可能になる。"""
+    assert isinstance(cache_window.DERIVE_ONLY_INTERVALS, frozenset)
+    assert cache_window.DERIVE_ONLY_INTERVALS == {"4h", "1d"}
