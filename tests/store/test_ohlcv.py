@@ -462,3 +462,40 @@ def test_prune_cache_keeps_row_exactly_at_cutoff(tmp_path):
     left = [r["bar_time"] for r in
             conn.execute("SELECT bar_time FROM ohlcv_cache")]
     assert left == [cutoff.isoformat()]
+
+
+def test_prune_cache_accepts_limit_of_one(tmp_path):
+    """有効な下限 `limit=1` は受理し、ちょうど 1 件だけ削る。
+
+    既存テストは `limit=2` と `limit<=0` しか渡しておらず、下限判定を
+    `limit < 2` へずらす変異 (= 正当な 1 を拒否する) を検出できない。
+    """
+    conn = _conn(tmp_path)
+    for d in (1, 2, 3):
+        _cache_row(conn, f"2026-07-0{d}T00:00:00+00:00")
+
+    n = ohlcv.prune_cache(
+        conn, cutoff=datetime(2026, 7, 15, tzinfo=timezone.utc), limit=1)
+
+    assert n == 1
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 2
+
+
+def test_prune_cache_deletes_every_live_source(tmp_path):
+    """prune は source を絞らない — キャッシュテーブル全体が対象。
+
+    既存の prune テストは `yfinance` の行しか置いておらず、SQL に
+    `source=...` の絞りが入っても通ってしまう。絞りが入ると
+    `twelvedata` / `mt5-live` の行が永久に削除されずキャッシュが
+    際限なく育つ。
+    """
+    conn = _conn(tmp_path)
+    old = "2026-07-01T00:00:00+00:00"
+    for src in ("yfinance", "twelvedata", "mt5-live"):
+        _cache_row(conn, old, source=src)
+
+    n = ohlcv.prune_cache(
+        conn, cutoff=datetime(2026, 7, 15, tzinfo=timezone.utc), limit=100)
+
+    assert n == 3
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
