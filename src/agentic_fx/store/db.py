@@ -438,8 +438,15 @@ def _migrate_ohlcv_split(conn: sqlite3.Connection) -> None:
         for r in rows:
             target = "ohlcv_cache" if r["source"] in LIVE_SOURCES \
                 else "ohlcv_history"
+            # 履歴側は spread も比較する。ohlcv_cache に spread 列は無いので
+            # キャッシュ側は OHLCV 5 列のみ。5 列だけを見ると、spread だけ
+            # 食い違う行が「一致」と判定されて旧 ohlcv が DROP され、旧 spread
+            # が無警告で失われる (spread はバックテストのコスト計算に効く)。
+            cols = "open, high, low, close, volume"
+            if target == "ohlcv_history":
+                cols += ", spread"
             existing = conn.execute(
-                f"SELECT open, high, low, close, volume FROM {target} "
+                f"SELECT {cols} FROM {target} "
                 "WHERE symbol=? AND interval=? AND bar_time=? AND source=?",
                 (r["symbol"], r["interval"], r["bar_time"],
                  r["source"])).fetchone()
@@ -448,7 +455,9 @@ def _migrate_ohlcv_split(conn: sqlite3.Connection) -> None:
                   and _values_match(existing["high"], r["high"])
                   and _values_match(existing["low"], r["low"])
                   and _values_match(existing["close"], r["close"])
-                  and _values_match(existing["volume"], r["volume"]))
+                  and _values_match(existing["volume"], r["volume"])
+                  and (target != "ohlcv_history"
+                       or _values_match(existing["spread"], r["spread"])))
             if not ok:
                 mismatches.append(
                     f"{r['symbol']}/{r['interval']}/{r['bar_time']}/"

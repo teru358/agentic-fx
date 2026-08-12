@@ -545,3 +545,56 @@ def test_migrate_ohlcv_split_raises_on_value_conflict(tmp_path):
     names = {r["name"] for r in
              conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "ohlcv" in names  # 温存されている
+
+
+def test_migrate_ohlcv_split_raises_on_history_spread_conflict(tmp_path):
+    """履歴側の衝突検証は `spread` も見る。
+
+    OHLCV 5 列だけを比較すると、`spread` だけ食い違う行が「一致」と判定され、
+    旧 `ohlcv` が DROP されて旧 spread が無警告で失われる。spread はバック
+    テストのコスト計算に効くので、他の列と同じ扱い (不一致なら温存) にする。
+    """
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "split_spread_conflict.db")
+    conn.executescript(db_v2_ddl_for_test())
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,'dukascopy',1.1)")
+    conn.commit()
+    conn.executescript(db_module._OHLCV_HISTORY_DDL)
+    # OHLCV 5 列は完全一致・spread だけ違う (再実行で別データが入った状況)
+    conn.execute("INSERT INTO ohlcv_history VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,'dukascopy',9.9)")
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="一致しない"):
+        db_module._migrate_ohlcv_split(conn)
+
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "ohlcv" in names  # 温存されている
+
+
+def test_migrate_ohlcv_split_accepts_matching_null_spread_on_rerun(tmp_path):
+    """spread が両側とも NULL なら一致として扱う (NULL 同士で誤検出しない)。
+
+    上のテストだけだと「spread を比較しない」→「常に不一致とみなす」への
+    退行を区別できない。
+    """
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "split_spread_null.db")
+    conn.executescript(db_v2_ddl_for_test())
+    conn.execute("INSERT INTO ohlcv VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,'dukascopy',NULL)")
+    conn.commit()
+    conn.executescript(db_module._OHLCV_HISTORY_DDL)
+    conn.execute("INSERT INTO ohlcv_history VALUES ('USDJPY','1m',"
+                 "'2026-07-22T12:00:00+00:00',1,2,0.5,1.5,100,'dukascopy',NULL)")
+    conn.commit()
+
+    db_module._migrate_ohlcv_split(conn)
+
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "ohlcv" not in names  # 一致したので移行完了
