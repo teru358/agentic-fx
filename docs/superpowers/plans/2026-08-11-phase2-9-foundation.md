@@ -118,7 +118,7 @@
 | A | 5 | init の `n_ctx` 可視化 | — |
 | C | 8 | 窓計算ヘルパ + floor | — |
 | C | 16 | **`ohlcv` 2 テーブル分割 + prune + 保持期間検証** | 8 |
-| C | 9 | `lookback_days` 配線 | 8 |
+| C | 9 | `lookback_days` 配線 | 8, 16 |
 | C | 10 | `_cached_bars` 窓適用 | 8, 9, 16 |
 | C | 11 | 本番連鎖 E2E pin + 実データ実測 | 10 |
 | B | 6 | monotonic 注入 + gather deadline (OPEN/CLOSE 両方) | C 完了後 |
