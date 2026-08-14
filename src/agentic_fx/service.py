@@ -639,6 +639,10 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # 一次的な書き手は scheduler tick (mark-to-market 等、既存の conn_core
         # 版 provider) であり続けるため、healthcheck が書かなくてもキャッシュ
         # 鮮度は保たれる。
+        # scheduler tick の processed-bar marking が書き込み可能 provider 経由で
+        # 1m cache を継続的に温める。1h は live 1h が検証を通れば直接保存され、
+        # 通らない場合は保存済み 1m から cache(1m→1h derived) として復元される。
+        # readonly Mission provider はこの二段構えの書き手ではない。
         healthcheck_provider = PriceProvider(conn_supervisor, settings,
                                              clock, readonly=True)
         # RO と stub 尊重を両立させる: `provider` (388-420 行) に適用した

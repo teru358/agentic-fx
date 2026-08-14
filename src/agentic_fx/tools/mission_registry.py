@@ -53,6 +53,11 @@ def build_mission_registry(
     F-5)。cache は性能最適化であり、親の scheduler tick が継続的に
     cache を温めるため実害は限定的。
 
+    scheduler tick の processed-bar marking が書き込み可能 provider 経由で
+    1m cache を継続的に温める。1h は live 1h が検証を通れば直接保存され、
+    通らない場合は保存済み 1m から cache(1m→1h derived) として復元される。
+    readonly Mission provider はこの二段構えの書き手ではない。
+
     `provider` (注入 seam、build_app の `provider=` パラメータを透通する):
     非 None ならそれを使い、None なら `PriceProvider(conn, settings, clock,
     readonly=readonly)` で内部構築する。親 (build_app) からは常に非 None
