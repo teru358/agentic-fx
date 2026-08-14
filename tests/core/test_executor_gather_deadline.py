@@ -434,3 +434,38 @@ def test_gather_close_snapshot_absorbs_cross_leg_deadline_into_degraded_rate(
     # 2 脚目 (USDJPY) は一度も取得されていない (打ち切りが効いている)
     assert yq.call_count == 1
     assert yq.call_args.args[0] == "EURUSD"
+
+
+# ---- codex 1 周目 指摘 2: gather ごとに新しい checker になること ----------
+
+def test_each_gather_open_gets_a_fresh_budget(tmp_path):
+    """1 回の gather ごとに新しい checker が作られる (予算は gather 単位で
+    リセットされる) ことのピン。checker を Executor にキャッシュして使い
+    回す退行では、2 回目の gather の最初の検査が 1 回目の経過を引き継いで
+    予算超過になり red になる。"""
+    mono = _Mono()
+    calls, quote_fn, spec_fn, rate_fn = _recording_stubs(
+        mono, leg_costs={"quote:USDJPY": BUDGET * 0.9})
+    ex = _make_executor(tmp_path, monotonic_fn=mono, quote_fn=quote_fn,
+                        spec_fn=spec_fn, rate_fn=rate_fn)
+    intent = _open_intent("USDJPY")
+
+    ex.gather_open_snapshot(intent, exposure_pairs=[])
+    ex.gather_open_snapshot(intent, exposure_pairs=[])
+
+    assert calls == ["quote:USDJPY", "spec:USDJPY", "rate:JPY", "rate:USD"] * 2
+
+
+def test_each_gather_close_gets_a_fresh_budget(tmp_path):
+    """CLOSE 側の対称ピン (同上)。"""
+    mono = _Mono()
+    calls, quote_fn, spec_fn, rate_fn = _recording_stubs(
+        mono, leg_costs={"quote:USDJPY": BUDGET * 0.9})
+    ex = _make_executor(tmp_path, monotonic_fn=mono, quote_fn=quote_fn,
+                        spec_fn=spec_fn, rate_fn=rate_fn)
+    row = _insert_open_order(ex.conn)
+
+    ex.gather_close_snapshot(row)
+    ex.gather_close_snapshot(row)
+
+    assert calls == ["quote:USDJPY", "spec:USDJPY", "rate:JPY"] * 2

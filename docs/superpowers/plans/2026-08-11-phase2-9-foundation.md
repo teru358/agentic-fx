@@ -3274,7 +3274,9 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 uv run pytest -q
 ```
 
-Expected: **1921 passed, 0 failed** (Task 6 完了時点の HEAD が 1915 passed + Task 7 の 6 件 (price_provider 3 + executor 3)。Task 6 の 13 件は既に 1915 に含まれているので二重に足さないこと — 着手前検証の probe 実測)。
+Expected: **1923 passed, 0 failed** (Task 6 完了時点の HEAD が 1915 passed + Task 7 の 6 件 (price_provider 3 + executor 3)。Task 6 の 13 件は既に 1915 に含まれているので二重に足さないこと — 着手前検証の probe 実測)。
+
+> 注記 (2026-08-14 レビュー反映): codex 1 周目 指摘 2 (gather ごとに新しい checker になることが未検証 — checker を Executor にキャッシュする退行が全緑で生存すると probe 実測) を受け、`tests/core/test_executor_gather_deadline.py` に pin 2 本 (`test_each_gather_open_gets_a_fresh_budget` / `test_each_gather_close_gets_a_fresh_budget`) を追加。期待件数を 1921 → 1923 に更新。
 
 - [ ] **Step 15: コミット**
 
