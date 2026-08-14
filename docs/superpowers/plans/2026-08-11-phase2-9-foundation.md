@@ -2918,10 +2918,10 @@ Expected: `test_to_account_rate_deadline_check_called_before_each_cross_leg` と
         return result
 ```
 
-- [ ] **Step 4: テストを実行し新規 3 件が green になり、既存の to_account_rate テスト (13 件) が壊れていないことを確認する**
+- [ ] **Step 4: テストを実行し新規 3 件が green になり、既存の to_account_rate テスト (11 件) が壊れていないことを確認する**
 
 Run: `uv run pytest tests/datafeed/test_price_provider.py -v -k "to_account_rate"`
-Expected: 既存 13 件 + 新規 3 件 = 16 件全件 PASS。
+Expected: 既存 11 件 + 新規 3 件 = **14 件**全件 PASS (着手前検証の `--collect-only` 実測)。
 
 - [ ] **Step 5: Executor レベルの伝播テストを `tests/core/test_executor_gather_deadline.py` に追記する**
 
@@ -2952,6 +2952,11 @@ def test_cycle_rate_fn_propagates_deadline_check_to_rate_fn(tmp_path):
     assert all(cb is not None for cb in received)
     # 1 回の gather = 1 つの deadline (通貨ごとに別オブジェクトを渡さない)
     assert len(set(id(cb) for cb in received)) == 1
+    # 受け取った callable が「生きた予算つき checker」であることの pin
+    # (no-op ラムダに差し替える変異を殺す — 着手前検証)
+    mono.t += BUDGET + 0.1
+    with pytest.raises(DataUnhealthy):
+        received[0]("probe")
 
 
 def test_resolve_close_rate_propagates_deadline_check_to_rate_fn(tmp_path):
@@ -3026,7 +3031,7 @@ def test_gather_close_snapshot_absorbs_cross_leg_deadline_into_degraded_rate(
 
     def eurusd_quote(pair):
         assert pair == "EURUSD"
-        mono.t = BUDGET + 0.1  # 1 脚目取得に予算を使い切ったことを模す
+        mono.t += BUDGET + 0.1  # 1 脚目取得に予算を使い切ったことを模す (相対加算 — `_Mono` の基準は 12_345.0)
         return Quote("EURUSD", 1.08, 1.09, NOW, "yfinance")
 
     with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
@@ -3099,9 +3104,21 @@ Expected: 3 件とも FAIL する。
 
 (以降 `self._last_good_rate[(ccy, account_ccy)] = rate` から関数末尾までは 1 文字も変えない。)
 
-`gather_open_snapshot` の `cycle_rate = self.cycle_rate_fn(now)` の行を次に変える:
+`gather_open_snapshot` 内の `cycle_rate = self.cycle_rate_fn(now)` (**:589 のみ**) を書き換える。**`:426` (`_evaluate_and_execute_open` 経路) は 3 引数のまま変更しない**。一意化のため、直前 2 行 (`check(f"spec:{intent.pair}")` / `spec = self.spec_fn(intent.pair)`) を含めた 3 行ブロックで置換すること。
+
+置換前 (この 3 行ブロックを検索する):
 
 ```python
+        check(f"spec:{intent.pair}")
+        spec = self.spec_fn(intent.pair)
+        cycle_rate = self.cycle_rate_fn(now)
+```
+
+置換後:
+
+```python
+        check(f"spec:{intent.pair}")
+        spec = self.spec_fn(intent.pair)
         cycle_rate = self.cycle_rate_fn(now, deadline_check=check)
 ```
 
@@ -3142,9 +3159,19 @@ Expected: 3 件とも FAIL する。
             return self._last_good_rate.get((ccy, account_ccy)), True
 ```
 
-`gather_close_snapshot` の `rate, degraded = self.resolve_close_rate(spec.quote_currency, now)` の行を次に変える:
+`gather_close_snapshot` 内の `rate, degraded = self.resolve_close_rate(spec.quote_currency, now)` (**:808 のみ**) を書き換える。**`:780` (`close_order` 経路) は 3 引数のまま変更しない**。一意化のため、直前行 `check(f"rate:{spec.quote_currency}")` を含めた 2 行ブロックで置換すること。
+
+置換前 (この 2 行ブロックを検索する):
 
 ```python
+        check(f"rate:{spec.quote_currency}")
+        rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
+```
+
+置換後:
+
+```python
+        check(f"rate:{spec.quote_currency}")
         rate, degraded = self.resolve_close_rate(
             spec.quote_currency, now, deadline_check=check)
 ```
@@ -3152,7 +3179,7 @@ Expected: 3 件とも FAIL する。
 - [ ] **Step 9: テストを実行し Step 5 の 3 件が green になり、`test_executor_gather_deadline.py` 全体が壊れていないことを確認する**
 
 Run: `uv run pytest tests/core/test_executor_gather_deadline.py -v`
-Expected: Task 6 の 13 件 + Task 7 の 3 件 = 16 件全件 PASS。
+Expected: このファイル内の Task 6 の 12 件 + Task 7 の 3 件 = **15 件**全件 PASS (Task 6 の 13 件目 `test_commit_pre_gather_deadline_produces_reason_distinct_from_stale` は `tests/loops/test_trade_loop_phases.py` 側にあるためここには含まれない — 着手前検証の `--collect-only` 実測)。
 
 - [ ] **Step 10: `tests/core/test_executor_snapshot.py` の `rate_fn` stub を kwarg 許容に更新する**
 
@@ -3235,6 +3262,8 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M13 | `resolve_close_rate` の `deadline_check` 転送を削除する (常に 3 引数呼び出しに戻す) | `test_resolve_close_rate_propagates_deadline_check_to_rate_fn`・`test_gather_close_snapshot_absorbs_cross_leg_deadline_into_degraded_rate` |
 | M14 | `gather_open_snapshot` の `cycle_rate_fn(now, deadline_check=check)` を `cycle_rate_fn(now)` に戻す (配線切断) | `test_cycle_rate_fn_propagates_deadline_check_to_rate_fn` |
 | M15 | `gather_close_snapshot` の `resolve_close_rate(..., deadline_check=check)` を `deadline_check` 無しに戻す (配線切断) | `test_resolve_close_rate_propagates_deadline_check_to_rate_fn`・`test_gather_close_snapshot_absorbs_cross_leg_deadline_into_degraded_rate` |
+| M16 | `gather_open_snapshot` の `deadline_check=check` を `deadline_check=lambda leg: None` に差し替える (no-op 化) | `test_cycle_rate_fn_propagates_deadline_check_to_rate_fn` |
+| M17 | `to_account_rate` の `deadline_check(...)` 呼び出しを `_rate_of(spec)` の後ろへ移す (順序逆転) | `test_to_account_rate_deadline_check_called_before_each_cross_leg` (`yq.call_count == 1` が殺す) |
 
 各変異を注入したら `grep -n "deadline_check" src/agentic_fx/datafeed/price_provider.py src/agentic_fx/core/executor.py` で改変を目視確認してから対象テストのみ実行し red を確認、revert して green に戻す。revert 後も `find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +` を実行する。
 
@@ -3245,7 +3274,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 uv run pytest -q
 ```
 
-Expected: 束 B 開始前の既存件数 + Task 6 の 13 件 + Task 7 の 6 件 (price_provider 3 + executor 3) = 全件 PASS、0 failed。
+Expected: **1921 passed, 0 failed** (Task 6 完了時点の HEAD が 1915 passed + Task 7 の 6 件 (price_provider 3 + executor 3)。Task 6 の 13 件は既に 1915 に含まれているので二重に足さないこと — 着手前検証の probe 実測)。
 
 - [ ] **Step 15: コミット**
 
@@ -3274,6 +3303,8 @@ Risk Gate / commit-core の判定ロジックは 1 文字も変えていない�
 EOF
 )"
 ```
+
+> 注記 (2026-08-14 着手前検証): 訂正 ①〜④ は probe 実測済み (red 2F→3F、green 14/15/194/1921、M10〜15 全指定キラー kill、M16 は pin 追記前 84 件全 survive → 追記後 red、M17 は yq.call_count==1 が殺す)。executor.py :426/:780 の 3 引数呼び出しは変更禁止 (本番 2 経路)
 
 ---
 
