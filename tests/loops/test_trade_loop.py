@@ -37,7 +37,10 @@ def _loop(tmp_path, results, healthy=True, monotonic_fn=None):
     record_snapshot(conn, now=NOW, balance=1_000_000, equity=1_000_000)
     clock = FixedClock(NOW)
     broker = PaperBroker(conn, SETTINGS, clock)
-    def rate_fn(ccy: str, account_ccy: str, now) -> ConversionRate:
+    def rate_fn(ccy: str, account_ccy: str, now, **_ignored) -> ConversionRate:
+        # **_ignored: Task 7 (プラン9 束B) の deadline_check kwarg を
+        # 無害に許容する (このテスト用 stub は skew/クロスを模さない
+        # ため kwarg 自体は使わない)。
         return ConversionRate(value=1.0, from_ccy=ccy, to_ccy=account_ccy,
                               leg_ts=(now,))
 

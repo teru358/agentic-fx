@@ -397,7 +397,9 @@ class PriceProvider:
 
     def to_account_rate(self, ccy: str, account_ccy: str, *,
                         reference_ts: datetime,
-                        max_skew_min: float) -> ConversionRate:
+                        max_skew_min: float,
+                        deadline_check: Callable[[str], None] | None = None,
+                        ) -> ConversionRate:
         """通貨 1 単位 = 口座通貨いくらか (設計書 §5「口座通貨と換算」)。
 
         quote/base のどちらの通貨にも使う汎用関数 (旧
@@ -416,6 +418,16 @@ class PriceProvider:
         (sizing は SizingError、gate/executor は却下、予約再検証は当該ペアの
         pending_fill 取消) に変換する — 推測値でのサイジングは無音の過大
         建玉になるため、ここで握りつぶさない。
+
+        `deadline_check` (Task 7, プラン9 束B): `Executor.gather_*_snapshot`
+        の snapshot 予算を USD クロスの各脚まで伝播させる checker。
+        `None` (既定・通常の呼び出し元) では no-op。`for spec in legs`
+        の**各脚の前**で呼ぶ — 直接/逆ペア (1 脚) では呼ばない
+        (スコープは USD クロスの脚間のみ — 改稿 C2)。leg 名は実シンボル
+        まで含める (例: `"rate:EUR:EURUSD"`)。`cycle_rate(ccy)` 1 回の
+        内部で最大 2 本のネットワーク脚が走るため、gather 直下の検査
+        だけでは 1 通貨のクロスで予算 × 2 を払ってしまう
+        (改稿 C2 の実測根拠)。
         """
         if ccy == account_ccy:
             return ConversionRate(1.0, ccy, account_ccy, (reference_ts,))
@@ -442,6 +454,8 @@ class PriceProvider:
             rate = 1.0
             leg_ts: list[datetime] = []
             for spec in legs:
+                if deadline_check is not None:
+                    deadline_check(f"rate:{ccy}:{spec[0]}")
                 r, ts = self._rate_of(spec)
                 rate *= r
                 leg_ts.append(ts)

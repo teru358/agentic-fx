@@ -779,6 +779,53 @@ def test_to_account_rate_cross_leg_skew_exceeded_raises(tmp_path):
             _rate(p, "EUR", "JPY", reference_ts=NOW)
 
 
+def test_to_account_rate_deadline_check_called_before_each_cross_leg(tmp_path):
+    """PROV-1 (確定仕様 #5): USD クロスの `for spec in legs` の各脚の前で
+    `deadline_check` が呼ばれ、そこで拒否されると 2 脚目の `_rate_of`
+    (=quote 取得) が実行されない。"""
+    _, p = _provider(tmp_path)
+    checked: list[str] = []
+
+    def deadline_check(leg: str) -> None:
+        checked.append(leg)
+        if leg == "rate:EUR:USDJPY":
+            raise DataUnhealthy(f"gather deadline exceeded before {leg}")
+
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               side_effect=_quote_map(EURUSD=(1.08, 1.09),
+                                      USDJPY=(148.0, 149.0))) as yq:
+        with pytest.raises(DataUnhealthy, match="gather deadline exceeded"):
+            _rate(p, "EUR", "JPY", deadline_check=deadline_check)
+
+    assert checked == ["rate:EUR:EURUSD", "rate:EUR:USDJPY"]
+    # 2 脚目で打ち切ったので quote 取得は 1 回 (EURUSD) だけ
+    assert yq.call_count == 1
+
+
+def test_to_account_rate_deadline_check_not_called_for_direct_pair(tmp_path):
+    """スコープ確認: 直接/逆ペア (1 脚) は `for spec in legs` を通らない
+    ため `deadline_check` は呼ばれない (確定仕様 #5 のスコープは USD
+    クロスの脚間のみ)。"""
+    _, p = _provider(tmp_path)
+    checked: list[str] = []
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               side_effect=_quote_map(USDJPY=(148.0, 149.0))):
+        _rate(p, "USD", "JPY", deadline_check=checked.append)
+    assert checked == []
+
+
+def test_to_account_rate_deadline_check_default_none_is_backward_compatible(
+        tmp_path):
+    """`deadline_check` 省略時 (既定 None) は素通り — 既存の全呼び出し元
+    (直接/逆ペア/クロスいずれも) の挙動を変えないことの pin。"""
+    _, p = _provider(tmp_path)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               side_effect=_quote_map(EURUSD=(1.08, 1.09),
+                                      USDJPY=(148.0, 149.0))):
+        rate = _rate(p, "EUR", "JPY")  # deadline_check を渡さない
+    assert rate.value == pytest.approx(1.09 * 149.0)
+
+
 def test_readonly_provider_skips_bar_cache_write(tmp_path):
     """CR-4 対応 (裁定書 F-5): readonly=True で構築した PriceProvider は
     get_bars 成功時に ohlcv.upsert_cache_bars を呼ばない — RO 接続下でも

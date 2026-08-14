@@ -233,7 +233,9 @@ class Executor:
 
     # ---- 換算レート -------------------------------------------------------
 
-    def cycle_rate_fn(self, now) -> Callable[[str], ConversionRate]:
+    def cycle_rate_fn(self, now, *,
+                      deadline_check: Callable[[str], None] | None = None
+                      ) -> Callable[[str], ConversionRate]:
         """1 回の判断 (gate 評価・予約再検証・mark-to-market サイクル) 内で
         レートを固定するローカルキャッシュを返す (設計書 §5)。呼び出し側は
         `self` に保持せず、その判断の間だけ使い捨てること — 永続させると
@@ -290,6 +292,14 @@ class Executor:
         `max_skew` 以内のときだけ `span_min`/`span_max`（確定値）と
         `cache[ccy]` を更新する。拒否したレートの leg 時刻は確定値に
         一切混ざらない。
+
+        Task 7 (プラン9 束B): `deadline_check` を渡すと `self.rate_fn` へ
+        そのまま転送する — `rate_fn` が `PriceProvider.to_account_rate` に
+        束縛されている場合、USD クロスの `for spec in legs` の各脚の前で
+        呼ばれる (改稿 C2)。`None` (既定・gather 以外の全呼び出し元
+        `_open` 等) では `rate_fn` に kwarg 自体を渡さない — 3 引数のみを
+        期待する既存の `rate_fn` 実装 (backtest/runner.py・scheduler 系
+        テストの多数の stub) を壊さないため。
         """
         cache: dict[str, ConversionRate] = {}
         account_ccy = self.settings.account_currency
@@ -301,7 +311,11 @@ class Executor:
         def fn(ccy: str) -> ConversionRate:
             nonlocal span_min, span_max
             if ccy not in cache:
-                rate = self.rate_fn(ccy, account_ccy, now)
+                if deadline_check is not None:
+                    rate = self.rate_fn(ccy, account_ccy, now,
+                                        deadline_check=deadline_check)
+                else:
+                    rate = self.rate_fn(ccy, account_ccy, now)
                 # 個別に健全と確認できたレートなので degraded フォール
                 # バック用キャッシュは (全体 skew の成否に関わらず) 更新
                 # する — resolve_close_rate はこの全体 skew 検証の対象外
@@ -328,18 +342,32 @@ class Executor:
             return cache[ccy]
         return fn
 
-    def resolve_close_rate(self, ccy: str,
-                           now) -> tuple[ConversionRate | None, bool]:
+    def resolve_close_rate(self, ccy: str, now, *,
+                           deadline_check: Callable[[str], None] | None = None
+                           ) -> tuple[ConversionRate | None, bool]:
         """クローズ専用のレート解決。現在レートが取れなければ最後に健全性
         検証を通ったレートへ degraded フォールバックする (設計書 §5:
         クローズはレート欠損でも妨げない)。戻り値は (rate, degraded)。
         rate が None なのは、一度も健全なレートを観測できていない場合のみ
         (プロセス起動直後の初回クローズ等) — この場合 realized_pnl は
         未確定のまま残し、次回の定期同期で解消する。
+
+        `deadline_check` (Task 7, プラン9 束B): `cycle_rate_fn` と同じ
+        転送規約 — `None` (既定) なら `rate_fn` を 3 引数のまま呼ぶ。
+        **`deadline_check` が USD クロスの 2 脚目の前で `DataUnhealthy`
+        を送出しても、この関数自体の fail-soft 契約は変えない** —
+        直下の `except Exception` がそれを吸収し degraded フォールバック
+        にする。CLOSE はレート欠損でも妨げない、という既存方針の帰結
+        であり、意図的な挙動 (2 脚目相当の外部 I/O だけを打ち切り、
+        CLOSE 自体は失敗させない)。
         """
         account_ccy = self.settings.account_currency
         try:
-            rate = self.rate_fn(ccy, account_ccy, now)
+            if deadline_check is not None:
+                rate = self.rate_fn(ccy, account_ccy, now,
+                                    deadline_check=deadline_check)
+            else:
+                rate = self.rate_fn(ccy, account_ccy, now)
             self._last_good_rate[(ccy, account_ccy)] = rate
             return rate, False
         except Exception:  # noqa: BLE001 — クローズを止めない (設計書 §5)
@@ -586,7 +614,7 @@ class Executor:
         quote = self.quote_fn(intent.pair)
         check(f"spec:{intent.pair}")
         spec = self.spec_fn(intent.pair)
-        cycle_rate = self.cycle_rate_fn(now)
+        cycle_rate = self.cycle_rate_fn(now, deadline_check=check)
         specs_by_pair: dict = {intent.pair: spec}
         currencies: set = {spec.quote_currency, spec.base_currency}
         for pair in exposure_pairs:
@@ -805,7 +833,8 @@ class Executor:
         check(f"spec:{pair}")
         spec = self.spec_fn(pair)
         check(f"rate:{spec.quote_currency}")
-        rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
+        rate, degraded = self.resolve_close_rate(
+            spec.quote_currency, now, deadline_check=check)
         return CloseSnapshot(order_id=row["id"], pair=pair, price=price,
                              spec=spec, rate=rate,
                              rate_degraded=degraded, captured_at=now)

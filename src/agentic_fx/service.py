@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -562,10 +563,12 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             else:
                 bars_fn = provider.latest_1m_bar
 
-        def rate_fn(ccy: str, account_ccy: str, now: datetime):
+        def rate_fn(ccy: str, account_ccy: str, now: datetime, *,
+                    deadline_check: Callable[[str], None] | None = None):
             return provider.to_account_rate(
                 ccy, account_ccy, reference_ts=now,
-                max_skew_min=settings.datafeed.conversion_skew_max_min)
+                max_skew_min=settings.datafeed.conversion_skew_max_min,
+                deadline_check=deadline_check)
 
         econ = EconCalendar(conn_core, activity, clock,
                             timeout_sec=settings.worker.data_hook_timeout_sec)

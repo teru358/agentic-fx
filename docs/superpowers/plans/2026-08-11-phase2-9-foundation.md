@@ -3104,7 +3104,7 @@ Expected: 3 件とも FAIL する。
 
 (以降 `self._last_good_rate[(ccy, account_ccy)] = rate` から関数末尾までは 1 文字も変えない。)
 
-`gather_open_snapshot` 内の `cycle_rate = self.cycle_rate_fn(now)` (**:589 のみ**) を書き換える。**`:426` (`_evaluate_and_execute_open` 経路) は 3 引数のまま変更しない**。一意化のため、直前 2 行 (`check(f"spec:{intent.pair}")` / `spec = self.spec_fn(intent.pair)`) を含めた 3 行ブロックで置換すること。
+`gather_open_snapshot` 内の `cycle_rate = self.cycle_rate_fn(now)` (**:589 のみ**) を書き換える。**`:454` (`_open` 経路 — ctx 構築後に `_evaluate_and_execute_open` へ委譲する側) は 3 引数のまま変更しない**。一意化のため、直前 2 行 (`check(f"spec:{intent.pair}")` / `spec = self.spec_fn(intent.pair)`) を含めた 3 行ブロックで置換すること。
 
 置換前 (この 3 行ブロックを検索する):
 
@@ -3304,7 +3304,7 @@ EOF
 )"
 ```
 
-> 注記 (2026-08-14 着手前検証): 訂正 ①〜④ は probe 実測済み (red 2F→3F、green 14/15/194/1921、M10〜15 全指定キラー kill、M16 は pin 追記前 84 件全 survive → 追記後 red、M17 は yq.call_count==1 が殺す)。executor.py :426/:780 の 3 引数呼び出しは変更禁止 (本番 2 経路)
+> 注記 (2026-08-14 着手前検証): 訂正 ①〜④ は probe 実測済み (red 2F→3F、green 14/15/194/1921、M10〜15 全指定キラー kill、M16 は pin 追記前 84 件全 survive → 追記後 red、M17 は yq.call_count==1 が殺す)。executor.py の `_open` (:454) / `close_order` (:808) の 3 引数呼び出しは変更禁止 (本番 2 経路。検証時実測の行番号)
 
 ---
 

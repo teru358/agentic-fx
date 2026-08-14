@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -316,3 +317,120 @@ def test_gather_close_snapshot_aborts_before_resolve_close_rate(tmp_path):
         ex.gather_close_snapshot(row)
 
     assert calls == ["quote:USDJPY", "spec:USDJPY"]
+
+
+# ---- Task 7: 脚伝播 (Executor → rate_fn への deadline_check 配線) ----------
+
+def test_cycle_rate_fn_propagates_deadline_check_to_rate_fn(tmp_path):
+    """Task 7: `cycle_rate_fn` が `deadline_check` を `rate_fn` へ転送する
+    こと (`to_account_rate` 自体の脚検査は price_provider 側のテストが
+    担うので、ここでは「渡ったこと」だけを見る configuration test)。"""
+    mono = _Mono()
+    received: list[object] = []
+
+    def rate_fn(ccy, account_ccy, now, *, deadline_check=None):
+        received.append(deadline_check)
+        return ConversionRate(1.0, ccy, account_ccy, (now,))
+
+    ex = _make_executor(tmp_path, monotonic_fn=mono,
+                        quote_fn=lambda p: QUOTE, spec_fn=lambda p: SPECS[p],
+                        rate_fn=rate_fn)
+    intent = _open_intent("USDJPY")
+
+    ex.gather_open_snapshot(intent, exposure_pairs=[])
+
+    assert len(received) == 2  # JPY, USD の 2 通貨
+    assert all(cb is not None for cb in received)
+    # 1 回の gather = 1 つの deadline (通貨ごとに別オブジェクトを渡さない)
+    assert len(set(id(cb) for cb in received)) == 1
+    # 受け取った callable が「生きた予算つき checker」であることの pin
+    # (no-op ラムダに差し替える変異を殺す — 着手前検証)
+    mono.t += BUDGET + 0.1
+    with pytest.raises(DataUnhealthy):
+        received[0]("probe")
+
+
+def test_resolve_close_rate_propagates_deadline_check_to_rate_fn(tmp_path):
+    """Task 7: `gather_close_snapshot` → `resolve_close_rate` →
+    `rate_fn` への転送 (CLOSE 側)。"""
+    mono = _Mono()
+    received: list[object] = []
+
+    def rate_fn(ccy, account_ccy, now, *, deadline_check=None):
+        received.append(deadline_check)
+        return ConversionRate(1.0, ccy, account_ccy, (now,))
+
+    ex = _make_executor(tmp_path, monotonic_fn=mono,
+                        quote_fn=lambda p: QUOTE, spec_fn=lambda p: SPECS[p],
+                        rate_fn=rate_fn)
+    row = _insert_open_order(ex.conn, pair="USDJPY")
+
+    ex.gather_close_snapshot(row)
+
+    assert len(received) == 1
+    assert received[0] is not None
+
+
+def test_gather_close_snapshot_absorbs_cross_leg_deadline_into_degraded_rate(
+        tmp_path):
+    """CLOSE の吸収契約の pin (advisor 指摘): 実際の `PriceProvider.
+    to_account_rate` を `rate_fn` に束縛し、EUR→JPY の USD クロス
+    (2 脚) の 1 脚目取得後に deadline を超過させる。`resolve_close_rate`
+    は例外を握りつぶし degraded フォールバックにする既存契約 (設計書
+    §5「クローズはレート欠損でも妨げない」) があるため、
+    `gather_close_snapshot` 自体は例外を投げずに完了する。ただし 2 脚目
+    (USDJPY) の quote は一度も取得されていないこと (=打ち切りが実際に
+    効いていること) まで確認する — 「degraded になった」だけでは
+    (rate_fn が別の理由で単純に失敗しても同じ結果になるため) 偶然の
+    一致と区別できない。
+
+    本番の `_SPECS` (USDJPY/EURUSD のみ) には quote_currency=EUR を持つ
+    銘柄が無い (account_currency=JPY からは常に直接ペアで解決できる) ため、
+    このテストだけ架空の EURJPY spec を注入して EUR→JPY クロスを踏ませる。
+    """
+    mono = _Mono()
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    record_snapshot(conn, now=NOW, balance=1_000_000, equity=1_000_000)
+    from agentic_fx.datafeed.price_provider import PriceProvider
+    provider = PriceProvider(conn, SETTINGS, FixedClock(NOW))
+
+    def rate_fn(ccy, account_ccy, now, **kw):
+        return provider.to_account_rate(
+            ccy, account_ccy, reference_ts=now,
+            max_skew_min=SETTINGS.datafeed.conversion_skew_max_min, **kw)
+
+    eurjpy_spec = InstrumentSpec(
+        symbol="EURJPY", pip_size=0.01, min_lot=0.01, max_lot=50.0,
+        lot_step=0.01, contract_size=100_000,
+        base_currency="EUR", quote_currency="EUR")
+
+    def quote_fn(pair):
+        return Quote("EURJPY", 160.0, 160.2, NOW, "test")
+
+    def spec_fn(pair):
+        return eurjpy_spec
+
+    ex = Executor(
+        conn=conn, broker=PaperBroker(conn, SETTINGS, FixedClock(NOW)),
+        settings=SETTINGS, state_store=StateStore(tmp_path / "state.json"),
+        activity=ActivityLog(tmp_path / "activity.log"),
+        notifier=Notifier(enabled=False, webhook_url=None),
+        clock=FixedClock(NOW), monotonic_fn=mono,
+        quote_fn=quote_fn, spec_fn=spec_fn, rate_fn=rate_fn)
+    row = _insert_open_order(ex.conn, pair="EURJPY")
+
+    def eurusd_quote(pair):
+        assert pair == "EURUSD"
+        mono.t += BUDGET + 0.1  # 1 脚目取得に予算を使い切ったことを模す (相対加算 — `_Mono` の基準は 12_345.0)
+        return Quote("EURUSD", 1.08, 1.09, NOW, "yfinance")
+
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               side_effect=eurusd_quote) as yq:
+        snapshot = ex.gather_close_snapshot(row)
+
+    assert snapshot.rate_degraded is True
+    assert snapshot.rate is None
+    # 2 脚目 (USDJPY) は一度も取得されていない (打ち切りが効いている)
+    assert yq.call_count == 1
+    assert yq.call_args.args[0] == "EURUSD"
