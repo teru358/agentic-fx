@@ -1,4 +1,5 @@
-"""SQLite 接続 + 14 テーブルスキーマ — 設計書 §12。"""
+"""SQLite 接続 + 15 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
+`ohlcv` は含まない) — 設計書 §12。"""
 from __future__ import annotations
 
 import logging
@@ -160,6 +161,15 @@ CREATE TABLE IF NOT EXISTS signals (
   created_at TEXT NOT NULL,
   UNIQUE(plugin, content_hash, pair, timeframe, bar_ts)
 );
+-- プラン 9 束 C (codex 指摘の裏取り): prune_cache (store/ohlcv.py) の
+-- `WHERE bar_time < ?` は PK (symbol, interval, bar_time, source) の先頭列に
+-- 当たらず、autoindex のカバリングスキャンになる。定常状態では cutoff を
+-- 跨ぐ行が毎分 4 行程度しかなく LIMIT に到達しないため、毎 tick (60s、
+-- core_lock 保持下) 索引全体を走り切る。実測 (対象ゼロ、commit 込み、warm
+-- 中央値): 20 万行 8.8ms / 100 万行 35.9ms → 索引後はいずれも 0.0055ms。
+-- 書き込み側の劣化は実運用経路 (per-tick 4 bars upsert) で 30→33µs のノイズ。
+CREATE INDEX IF NOT EXISTS ix_ohlcv_cache_bar_time
+  ON ohlcv_cache(bar_time);
 """
 
 TABLE_NAMES = frozenset({

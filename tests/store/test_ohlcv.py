@@ -475,6 +475,39 @@ def test_prune_cache_rejects_non_positive_limit(tmp_path):
                           limit=0)
 
 
+def test_prune_cache_query_uses_bar_time_index(tmp_path):
+    """prune_cache の探索が `ix_ohlcv_cache_bar_time` に載ること。
+
+    索引の存在テスト (tests/store/test_db.py) だけでは「SQL 側が索引を
+    使えない形に書き換わる」退行 (bar_time を関数で包む、OR 条件を足す等)
+    を取れない。ここでは実際に `prune_cache` が発行した SQL を trace で
+    捕まえ、その query plan を検査する — リテラルを二重に書かないので、
+    実装側の SQL 変更が必ずこのテストに反映される。
+
+    索引が無い場合の plan は
+    `SCAN ohlcv_cache USING COVERING INDEX sqlite_autoindex_ohlcv_cache_1`
+    (= 行数に比例、実測 20 万行 8.8ms/回) で、これが毎 tick core_lock 下で
+    走るのを防ぐのが索引の目的。
+    """
+    conn = _conn(tmp_path)
+    _cache_row(conn, "2026-07-01T00:00:00+00:00")
+    seen: list[str] = []
+    conn.set_trace_callback(seen.append)
+    try:
+        ohlcv.prune_cache(conn, cutoff=datetime(2026, 7, 15, tzinfo=timezone.utc),
+                          limit=5000)
+    finally:
+        conn.set_trace_callback(None)
+    deletes = [s for s in seen if s.lstrip().upper().startswith("DELETE")]
+    assert len(deletes) == 1, f"prune_cache の DELETE を捕捉できない: {seen}"
+    sql = deletes[0]
+    args = ["2026-07-15T00:00:00+00:00", 5000][:sql.count("?")]
+    plan = " ".join(
+        str(r[3]) for r in conn.execute("EXPLAIN QUERY PLAN " + sql, args))
+    assert "ix_ohlcv_cache_bar_time" in plan, plan
+    assert "SCAN ohlcv_cache" not in plan, plan
+
+
 def test_upsert_cache_bars_rejects_unknown_source(tmp_path):
     """どちらの allowlist にも属さない source も拒否する。
 

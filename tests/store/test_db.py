@@ -37,6 +37,23 @@ def test_init_creates_account_snapshots_ts_id_index(tmp_path):
     assert len(rows) == 1
 
 
+def test_init_creates_ohlcv_cache_bar_time_index(tmp_path):
+    """プラン 9 束 C: prune_cache の `WHERE bar_time < ?` は PK
+    (symbol, interval, bar_time, source) の先頭列に当たらないため、索引が
+    無いと autoindex のカバリングスキャンになる。定常状態では cutoff を
+    跨ぐ行が少なく LIMIT に届かないので、毎 tick (60s、core_lock 保持下)
+    索引全体を走り切る (実測 20 万行 8.8ms / 100 万行 35.9ms → 索引後
+    0.0055ms)。インデックスの存在そのものをピンする (既存 DB へは
+    init_db の executescript が無条件に適用する)。
+    """
+    conn = connect(tmp_path / "agentic.db")
+    init_db(conn)
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND name='ix_ohlcv_cache_bar_time'").fetchall()
+    assert len(rows) == 1
+
+
 def test_init_is_idempotent(tmp_path):
     conn = connect(tmp_path / "agentic.db")
     init_db(conn)

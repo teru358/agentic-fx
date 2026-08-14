@@ -216,6 +216,11 @@ def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
     conflicted = 0
     conn.execute("SAVEPOINT import_history_bars")
     try:
+        # 行単位ループは意図的 — inserted/unchanged/conflicted の三分計上は
+        # 集合演算 (executemany + 一括 diff) では再現できない。migration 側を
+        # 集合演算にしたのはロック保持時間の制約によるもので、ここはプロファイル
+        # が別 (前景・窓分割済み・SAVEPOINT 直後に commit)。1 コールで 10 万行
+        # 超を流す呼び出し元が生まれたら再評価する (実測 10 万行 0.33s)。
         for (symbol, interval, bar_time_iso, o, h, l, c, volume,  # noqa: E741
              spread) in normalized_rows:
             cur = conn.execute(
