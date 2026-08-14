@@ -1881,7 +1881,7 @@ EOF
 
 ### 束内の実行順序・前提
 
-- **束 B は束 C 完了後に着手する** (親骨格の実行グラフ)。理由: Task 7 が触る `src/agentic_fx/datafeed/price_provider.py` の `to_account_rate` (:411-464) は、束 C の Task 9/10 が触る `_cached_bars`/`get_bars`/`_chain` (:139-247) と**同一ファイル**にあるため、並行 worktree で進めると diff 競合が起きる。関数自体は disjoint (行範囲が重ならない) だが、ファイル単位の worktree マージでは無条件に安全とは言えない。詳細は本書末尾「束 B 自己レビュー」③。
+- **束 B は束 C 完了後に着手する** (親骨格の実行グラフ)。理由: Task 7 が触る `src/agentic_fx/datafeed/price_provider.py` の `to_account_rate` (現 HEAD で **:398-**。旧記載 :411-464 は束 C merge 前の値) は、束 C の Task 9/10 が触る `_chain` (**:116-**) / `get_bars` (**:143-**) / `_cached_bars` (**:196-**) と**同一ファイル**にあるため、並行 worktree で進めると diff 競合が起きる。関数自体は disjoint (行範囲が重ならない) だが、ファイル単位の worktree マージでは無条件に安全とは言えない。詳細は本書末尾「束 B 自己レビュー」③。
 - Task 6 → Task 7 の順で直列に進める (Task 7 は Task 6 が作る `Executor.monotonic_fn`/`_make_deadline_checker`/gather 内のローカル変数 `check` を再利用する)。
 - **Task 17 (`E` 束) は「束 B 完了後」に依存する** — `core/executor.py` の同一ファイル競合を避けるため。Task 17 実装者への申し送り: 本書 Task 6/7 が `open_from_snapshot`/`close_from_snapshot` の commit-core 鮮度検証ロジックを 1 文字も変えていないこと、`trade_loop.py` の `snapshot_error` 経路 (commit-pre の `except Exception`) がそのまま deadline 例外も飲み込むため Task 17 の `reject_category` は既存の execution 系分類 (`"execution"`) がそのまま適用できることを確認済み (新しい分類軸は不要)。
 
@@ -1897,7 +1897,7 @@ EOF
 - Test 実行対象 (既存回帰確認): `tests/core/test_executor_snapshot.py`、`tests/loops/test_trade_loop.py`、`tests/loops/test_trade_loop_phases.py`、`tests/test_e2e_worker_isolation.py`
 
 **Interfaces:**
-- Consumes: `agentic_fx.datafeed.health.DataUnhealthy` (既存例外型。新しい配管は作らない — `trade_loop.py` の commit-pre `except Exception` (:248, :267) がそのまま捕捉する)。`settings.worker.snapshot_max_age_sec` (既存 config キー、既定 10.0 — 新キーは作らない)
+- Consumes: `agentic_fx.datafeed.health.DataUnhealthy` (既存例外型。新しい配管は作らない — `trade_loop.py` の commit-pre `except Exception` (**:252** = OPEN 側, **:271** = CLOSE 側。束 A/C merge 後の現 HEAD で実測。旧記載の :248/:267 は merge 前の値) がそのまま捕捉し `snapshot_error` に入る → :304-328 で `set_gate_result(accepted=False, reject_reason=...)` → `{"result": "rejected"}`)。`settings.worker.snapshot_max_age_sec` (既存 config キー、既定 10.0 — 新キーは作らない)
 - Produces (Task 7 が consume):
   ```python
   # src/agentic_fx/core/executor.py — Executor
@@ -1914,6 +1914,8 @@ EOF
   `gather_open_snapshot`/`gather_close_snapshot` のシグネチャ・戻り値型は**不変**。内部にローカル変数 `check = self._make_deadline_checker(budget)` を持つ (Task 7 がこの `check` を `cycle_rate_fn`/`resolve_close_rate` へ渡す配線を追加する)。
 
 #### 現状 (`src/agentic_fx/core/executor.py:143-174` — `Executor.__init__`)
+
+**逐語転写 (2026-08-14 着手前検証で現 HEAD の 143-174 行と機械 diff 済み・差分 0 — 省略・言い換えは一切していない)**:
 
 ```python
     def __init__(self, *, conn: sqlite3.Connection, broker: PaperBroker,
@@ -1936,8 +1938,17 @@ EOF
         # 注入点の作法 (PriceProvider.to_account_rate を呼び出し側が
         # account_currency/max_skew_min を束縛して渡す想定)。
         self.rate_fn = rate_fn
-        # 以下も既存 __init__ の一部であり、置換時に必ず温存する。省略不可。
+        # 「最後に健全性検証を通ったレート」キャッシュ (クローズ経路専用 —
+        # 設計書 §5: クローズはレート欠損でも妨げない。**予約再検証・
+        # mark-to-market・gate 評価には使わない** — それらは判断の精度が
+        # 目的であり、恒久的な会計精度は定期同期が担う (設計書 §5)。
+        # このキャッシュは tick/判断をまたいで永続する意図的な例外。
         self._last_good_rate: dict[tuple[str, str], ConversionRate] = {}
+        # commit-core 相 (core_lock 保持中) の通知を溜める先。None のとき
+        # は即時送信 (scheduler・バックテスト経路の既定)。設計書 §3.1 /
+        # Task 14 申し送り: Notifier.send は urlopen(timeout=10) の同期
+        # 実行なので、commit-core で呼ぶと core_lock を握ったまま最大 10 秒
+        # ブロックし、SL/TP 監視が止まる。
         self._deferred_notifications: list[str] | None = None
 ```
 
@@ -2044,10 +2055,19 @@ QUOTE = Quote("USDJPY", 148.49, 148.51, NOW, "test")
 class _Mono:
     """テスト用可変 monotonic フェイク。缶詰の呼び出し順シーケンスにしない
     (呼び出し回数が実装の一部を変えるだけで壊れるため) — leg スタブ自身が
-    `t` を進める。"""
+    `t` を進める。
+
+    **基準時刻は 0.0 にしない (着手前検証 M6-10)。** 本番の
+    `time.monotonic()` は起動時間ベースの大きな値を返す。0 起点のフェイクを
+    使うと `start = self.monotonic_fn()` を `start = 0.0` に潰す変異が
+    `elapsed = t - 0.0` と区別できず**全テストを生き延びる** (実測: 13 件
+    全 PASS)。この変異は本番では最初の `check` が必ず発火する = 一度も
+    取引しないシステムになる、Task 6 が防ごうとしているまさにその故障。
+    以降のテストは絶対値代入 (`mono.t = ...`) ではなく**必ず相対加算**
+    (`mono.t += ...`) を使うこと。"""
 
     def __init__(self) -> None:
-        self.t = 0.0
+        self.t = 12_345.0  # 0 起点にしない (上記 M6-10)
 
     def __call__(self) -> float:
         return self.t
@@ -2122,7 +2142,7 @@ def test_deadline_checker_accepts_exact_budget_boundary(tmp_path):
                         quote_fn=lambda p: QUOTE, spec_fn=lambda p: SPECS[p],
                         rate_fn=lambda c, a, n, **k: ConversionRate(1.0, c, a, (n,)))
     check = ex._make_deadline_checker(BUDGET)
-    mono.t = BUDGET  # ちょうど予算を使い切った
+    mono.t += BUDGET  # ちょうど予算を使い切った (相対加算 — M6-10 参照)
     check("leg")  # raise しないこと
 
 
@@ -2132,7 +2152,7 @@ def test_deadline_checker_raises_just_over_budget(tmp_path):
                         quote_fn=lambda p: QUOTE, spec_fn=lambda p: SPECS[p],
                         rate_fn=lambda c, a, n, **k: ConversionRate(1.0, c, a, (n,)))
     check = ex._make_deadline_checker(BUDGET)
-    mono.t = BUDGET + 0.1
+    mono.t += BUDGET + 0.1  # 相対加算 — M6-10 参照
     with pytest.raises(DataUnhealthy, match="deadline exceeded"):
         check("leg:x")
 ```
@@ -2156,6 +2176,8 @@ from typing import Callable
 ```
 
 `Executor.__init__` (:143-174) を書き換える (`clock: Clock,` の直後に `monotonic_fn` を追加。他の代入行は無変更):
+
+> **この置換は `monotonic_fn: Callable[[], float] = time.monotonic,` の 1 行と `self.monotonic_fn = monotonic_fn` (+ その直上のコメント) の追加のみ。既存の行・コメントは 1 文字も変えない。** 特に `_last_good_rate` / `_deferred_notifications` の各 5 行コメントは過去レビュー裁定の根拠 (設計書 §5 の「予約再検証・mark-to-market・gate 評価には使わない」、Task 14 申し送りの「core_lock を握ったまま最大 10 秒ブロック」) であり、要約・言い換え・削除は禁止。**適用後に `git diff src/agentic_fx/core/executor.py` を目視し、削除行 (`-`) が既存行に 1 行も無いこと (追加行 `+` のみであること) を確認する。**
 
 ```python
     def __init__(self, *, conn: sqlite3.Connection, broker: PaperBroker,
@@ -2184,9 +2206,17 @@ from typing import Callable
         # 注入点の作法 (PriceProvider.to_account_rate を呼び出し側が
         # account_currency/max_skew_min を束縛して渡す想定)。
         self.rate_fn = rate_fn
-        # CLOSE の fail-soft と commit-post 通知 drain が依存する既存状態。
-        # __init__ 置換で落としてはならない。
+        # 「最後に健全性検証を通ったレート」キャッシュ (クローズ経路専用 —
+        # 設計書 §5: クローズはレート欠損でも妨げない。**予約再検証・
+        # mark-to-market・gate 評価には使わない** — それらは判断の精度が
+        # 目的であり、恒久的な会計精度は定期同期が担う (設計書 §5)。
+        # このキャッシュは tick/判断をまたいで永続する意図的な例外。
         self._last_good_rate: dict[tuple[str, str], ConversionRate] = {}
+        # commit-core 相 (core_lock 保持中) の通知を溜める先。None のとき
+        # は即時送信 (scheduler・バックテスト経路の既定)。設計書 §3.1 /
+        # Task 14 申し送り: Notifier.send は urlopen(timeout=10) の同期
+        # 実行なので、commit-core で呼ぶと core_lock を握ったまま最大 10 秒
+        # ブロックし、SL/TP 監視が止まる。
         self._deferred_notifications: list[str] | None = None
 ```
 
@@ -2518,7 +2548,7 @@ Expected: `test_gather_close_snapshot_completes_when_within_budget`/`..._boundar
 - [ ] **Step 12: テストを実行し CLOSE 側 4 件が全件 green になり、既存 gather 系テストが壊れていないことを確認する**
 
 Run: `uv run pytest tests/core/test_executor_gather_deadline.py tests/core/test_executor_snapshot.py -v`
-Expected: 新規 12 件 (OPEN 8 + CLOSE 4) + `test_executor_snapshot.py` 既存 20 件が全件 PASS。既存テストは `monotonic_fn` を渡さない (既定 `time.monotonic`) ため実測経過は常にミリ秒未満 — 既定予算 10.0s を超えず deadline は発火しない。
+Expected: 新規 12 件 (OPEN 8 + CLOSE 4) + `test_executor_snapshot.py` 既存 **29 件** (着手前検証で実測。旧記載の 20 件は束 A/C merge 前の値) = **41 passed**。既存テストは `monotonic_fn` を渡さない (既定 `time.monotonic`) ため実測経過は常にミリ秒未満 — 既定予算 10.0s を超えず deadline は発火しない。
 
 - [ ] **Step 13: `tests/loops/test_trade_loop.py` の `_loop` ヘルパに `monotonic_fn` 注入を追加する**
 
@@ -2567,7 +2597,7 @@ Expected: 既存全件 PASS (`monotonic_fn=None` は `time.monotonic` にフォ�
 ```python
 def test_commit_pre_gather_deadline_produces_reason_distinct_from_stale(tmp_path):
     """出口のピン (確定仕様テスト観点 4): gather_open_snapshot の deadline
-    超過は commit-pre の既存 `except Exception` (trade_loop.py:248) に
+    超過は commit-pre の既存 `except Exception` (trade_loop.py:252) に
     そのまま乗り、trade_intents に理由が残る。文言は commit-core の
     "execution snapshot is stale" (executor.py の open_from_snapshot)
     とは異なることを確認する — ログを読む人が「ハングで打ち切った」のか
@@ -2626,19 +2656,22 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M5 | CLOSE-2 の検査 (`check(f"rate:{spec.quote_currency}")`) を削除 | `test_gather_close_snapshot_aborts_before_resolve_close_rate` |
 | M6 | `_make_deadline_checker` の `budget` 引数を無視し独立の大きな定数 (例: `999.0`) に差し替える | `test_gather_open_snapshot_aborts_before_spec_of_intent_pair`・`test_gather_close_snapshot_aborts_before_spec` 他、超過系の全テスト |
 | M7 | `_make_deadline_checker` の `elapsed = self.monotonic_fn() - start` を `elapsed = 0.0` にする（型を壊さず deadline を無効化する意味的変異） | `test_gather_open_snapshot_deadline_independent_of_fixed_clock` (`DataUnhealthy` が上がらず red。`datetime - datetime` と float の比較による `TypeError` だけで殺す変異にはしない) |
-| M8 | 比較を `elapsed > budget` から `elapsed >= budget` に変える | `test_gather_open_snapshot_boundary_exact_budget_still_succeeds`・`test_gather_close_snapshot_boundary_exact_budget_still_succeeds` |
+| M8 | 比較を `elapsed > budget` から `elapsed >= budget` に変える | `test_gather_open_snapshot_boundary_exact_budget_still_succeeds`・`test_gather_close_snapshot_boundary_exact_budget_still_succeeds` (実測ではこれに `test_deadline_checker_accepts_exact_budget_boundary` を加えた 3 件が殺す — この 2 件は下限) |
 | M9 | `DataUnhealthy` を送出せず `return None` にする (checker が握りつぶす) | `test_gather_open_snapshot_aborts_before_spec_of_intent_pair`・`test_deadline_checker_raises_just_over_budget` |
+| M6-10 | `_make_deadline_checker` の `start = self.monotonic_fn()` を `start = 0.0` にする (基準時刻を捨てる — 本番の `time.monotonic()` は起動時間ベースなので最初の `check` が必ず発火し「一度も取引しないシステム」になる) | `test_gather_close_snapshot_completes_when_within_budget`・`test_gather_open_snapshot_aborts_before_second_exposure_pair_spec` 他 (`_Mono` の基準時刻が `12_345.0` であること**が前提** — 0 起点だとこの変異は 13 件全部を生き延びる。実測: 修正前 0 件 red → 修正後 8 件 red) |
 
 各変異を注入したら `grep -n "_make_deadline_checker\|check(f\"" src/agentic_fx/core/executor.py` で改変を目視確認してから対象テストのみ実行し red を確認、revert して green に戻す。revert 後も `find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +` を実行する。
 
-- [ ] **Step 18: 全体テストを実行し、既存 1726 件が壊れていないことを確認する**
+- [ ] **Step 18: 全体テストを実行し、既存 1902 件が壊れていないことを確認する**
 
 ```bash
 find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 uv run pytest -q
 ```
 
-Expected: 既存件数 + Task 6 の新規 13 件 (checker 2 + OPEN 6 + CLOSE 4 + 出口ピン 1) が全件 PASS、0 failed。
+Expected: **1902 (束 C merge 後の baseline、着手前検証で実測) + Task 6 の新規 13 件 (checker 2 + OPEN 6 + CLOSE 4 + 出口ピン 1) = 1915 passed、0 failed** (1 deselected)。
+
+なお M6-10 (`start = 0.0`) は Step 17 の「対象テストのみ実行」では取り逃す性質の変異ではなくなったが (上表の修正済み `_Mono` で殺せる)、参考までに全体テストでは 27 件が落ちる (E2E の kill switch 系を含む) — 全体実行はこの種の「本番既定パスだけが壊れる」変異に対する最後の網でもある。
 
 - [ ] **Step 19: コミット**
 
@@ -2663,6 +2696,10 @@ Risk Gate / commit-core の判定ロジックは 1 文字も変えていない�
 EOF
 )"
 ```
+
+> **注記 (2026-08-14 着手前検証)**: 上記の訂正は probe (`git archive HEAD` で抽出したクリーンツリー、repo 非改変) で実測済み — Step 2/6/10 の red は 6 failed / 6 passed でプラン記述と一致、Step 4/8/12 の green は 41 passed、Step 14 は 63 passed、Step 18 は 1915 passed。M6-1〜M6-9 は 9 件すべて指定キラーで kill を確認。M6-10 (`start = 0.0`) は `_Mono` の基準時刻を `12_345.0` に直す**前**は 13 件全部を生き延び (0 件 red)、直した**後**は 8 件 red になることを確認。M6-8 は表の 2 件に `test_deadline_checker_accepts_exact_budget_boundary` を加えた 3 件が殺す (表は下限)。
+>
+> あわせて確認した不変条件 (資金保護経路への非影響): `gather_open_snapshot`/`gather_close_snapshot` の `src/` 側呼び出し元は `trade_loop.py` の commit-pre のみ (全数 grep — `core/scheduler.py`・`backtest/runner.py` は呼ばない)。deadline の予算 = `worker.snapshot_max_age_sec`、`captured_at` は gather 入口の `self.clock.now()`、commit-core は `age_sec > max_snapshot_age_sec` (`executor.py:560` / `:807` — **どちらも `>`** で Step 3 の checker と同一境界) で拒否する。よって deadline を踏む gather は仮に完走しても commit-core が必ず拒否した snapshot であり、**従来成功していた発注が新たに拒否になることはない**。`monotonic_fn` は keyword-only の既定付きなので本番 (`service.py:579`) とバックテスト (`backtest/runner.py:219`) は無変更で `time.monotonic` に落ちる。`settings.worker.snapshot_max_age_sec` は `config.py:260` に `Field(gt=0, default=10.0)` で実在、`config/settings.yaml.example:101` にあり (個人 `settings.yaml` には `worker:` 節が無く既定 10.0 が効く — 新キーではないので同期違反ではない)。
 
 ---
 
