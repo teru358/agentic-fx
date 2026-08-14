@@ -469,3 +469,45 @@ def test_each_gather_close_gets_a_fresh_budget(tmp_path):
     ex.gather_close_snapshot(row)
 
     assert calls == ["quote:USDJPY", "spec:USDJPY", "rate:JPY"] * 2
+
+
+# ---- 束B 1周目 ローカル LLM レビュー: 検査は「脚の前」かの判別 -------------
+
+def test_gather_open_snapshot_aborts_before_first_exposure_pair_spec(tmp_path):
+    """打ち切りのピン (OPEN-2', 検査位置の判別): intent pair の spec_fn で
+    予算超過 → exposure ループの **1 件目** (EURUSD) の spec_fn が呼ばれない。
+
+    既存の OPEN-2 は超過コストを「そのループ反復の脚自身」(spec:EURUSD) に
+    載せているため、`check(f"spec:{pair}")` を `self.spec_fn(pair)` の
+    **後ろ**へ移す変異でも呼び出し列と raise が完全に一致し green のまま
+    生き延びる (実測 1923 passed)。超過を「1 つ前の脚」に載せて初めて
+    前後が区別できる。"""
+    mono = _Mono()
+    calls, quote_fn, spec_fn, rate_fn = _recording_stubs(
+        mono, leg_costs={"spec:USDJPY": BUDGET + 0.1})
+    ex = _make_executor(tmp_path, monotonic_fn=mono, quote_fn=quote_fn,
+                        spec_fn=spec_fn, rate_fn=rate_fn)
+    intent = _open_intent("USDJPY")
+
+    with pytest.raises(DataUnhealthy, match="deadline exceeded"):
+        ex.gather_open_snapshot(intent, exposure_pairs=["EURUSD", "GBPUSD"])
+
+    assert calls == ["quote:USDJPY", "spec:USDJPY"]
+
+
+def test_gather_open_snapshot_aborts_before_first_currency_rate(tmp_path):
+    """打ち切りのピン (OPEN-3', 検査位置の判別): intent pair の spec_fn で
+    予算超過 → rates ループの **1 件目** (JPY) の rate_fn が呼ばれない。
+    既存の OPEN-3 は `check(f"rate:{ccy}")` を `cycle_rate(ccy)` の後ろへ
+    移す変異を検出できない (同上、実測 1923 passed)。"""
+    mono = _Mono()
+    calls, quote_fn, spec_fn, rate_fn = _recording_stubs(
+        mono, leg_costs={"spec:USDJPY": BUDGET + 0.1})
+    ex = _make_executor(tmp_path, monotonic_fn=mono, quote_fn=quote_fn,
+                        spec_fn=spec_fn, rate_fn=rate_fn)
+    intent = _open_intent("USDJPY")
+
+    with pytest.raises(DataUnhealthy, match="deadline exceeded"):
+        ex.gather_open_snapshot(intent, exposure_pairs=[])
+
+    assert calls == ["quote:USDJPY", "spec:USDJPY"]

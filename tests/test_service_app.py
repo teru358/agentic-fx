@@ -2450,3 +2450,34 @@ def test_cache_maintenance_cutoff_follows_configured_retention_days(tmp_path):
         assert [b.ts for b in rows] == [NOW - timedelta(days=35)]
     finally:
         app.close()
+
+
+def test_build_app_rate_fn_forwards_deadline_check_to_price_provider(tmp_path):
+    """束B 1周目 ローカル LLM レビュー (KAT c2 / muse c2): 本番配線
+    (`service.py` の `rate_fn` クロージャ) が `deadline_check` を
+    `PriceProvider.to_account_rate` まで転送すること。
+
+    `tests/test_wiring.py::_env` は **自前の 3 引数 lambda** を
+    `rate_fn` に束縛しているため service.py の本番クロージャを一度も
+    通らない。実測: `service.py:571` の `deadline_check=deadline_check`
+    を削除しても全 1923 件が green (gather deadline が本番でだけ
+    `to_account_rate` の脚に届かなくなる = Task 7 の目的が本番で無効)。"""
+    (tmp_path / "config").mkdir()
+    src = open("config/settings.yaml.example", encoding="utf-8").read()
+    (tmp_path / "config" / "settings.yaml").write_text(src)
+    with patch("agentic_fx.service.PriceProvider") as pp, \
+         patch("agentic_fx.service._check_llama_swap"):
+        pp.return_value.healthcheck.return_value = "yfinance"
+        app = build_app(tmp_path)
+    try:
+        def probe(leg: str) -> None:
+            return None
+
+        app.executor.rate_fn("USD", "JPY", NOW, deadline_check=probe)
+
+        kwargs = pp.return_value.to_account_rate.call_args.kwargs
+        assert kwargs["deadline_check"] is probe, (
+            "本番配線の rate_fn が deadline_check を to_account_rate へ"
+            "転送していない")
+    finally:
+        app.close()
