@@ -835,3 +835,160 @@ def test_cached_bars_since_is_not_none_and_varies_with_lookback_days(
     assert since_for_1 is not None
     assert since_for_20 is not None
     assert since_for_20 < since_for_1
+
+
+def test_window_independent_of_cache_base_used_for_derivation(tmp_path, monkeypatch):
+    """spec ③ テスト 4: 窓は「キャッシュ側の base」に依存しない — 1m から
+    1h を作っても窓は 5 日 (キャッシュ base の比を誤って使う退行なら
+    60 倍の 300 日になる)。"""
+    conn, p = _provider(tmp_path)
+    captured = {}
+    orig = ohlcv.load_cache_bars
+
+    def _spy(conn_, symbol, interval, *, source, since=None, until=None):
+        captured.setdefault(interval, since)
+        return orig(conn_, symbol, interval, source=source, since=since,
+                    until=until)
+
+    monkeypatch.setattr(ohlcv, "load_cache_bars", _spy)
+    p._cached_bars("USDJPY", "1h", NOW, [], 5)
+
+    since_1m = captured["1m"]
+    assert NOW - since_1m <= timedelta(days=5, hours=1)  # floor の余白込み
+    assert NOW - since_1m > timedelta(days=4)
+
+
+def test_rows_older_than_window_are_excluded(tmp_path):
+    """spec ③ テスト 5: 窓より古い行が結果に入らない。"""
+    conn, p = _provider(tmp_path)
+    old_bar = Bar("USDJPY", "1h", NOW - timedelta(days=10), 148, 148.1,
+                 147.9, 148.05, 10)
+    fresh_bar = Bar("USDJPY", "1h", NOW - timedelta(hours=1), 148, 148.1,
+                    147.9, 148.05, 10)
+    ohlcv.upsert_cache_bars(conn, [old_bar, fresh_bar], source="yfinance")
+
+    result = p._cached_bars("USDJPY", "1h", NOW, [], 5)
+
+    assert result is not None
+    cached, origin = result
+    assert origin == "cache"
+    assert len(cached) == 1
+    assert cached[0].ts == fresh_bar.ts
+
+
+def test_direct_read_candidate_since_is_not_floored(tmp_path, monkeypatch):
+    """spec ③ テスト 6: 直読候補 (src == interval) は window_start を
+    そのまま渡す (floor すると要求より広く返してしまう)。"""
+    conn, p = _provider(tmp_path)
+    now = datetime(2026, 7, 22, 0, 47, 0, tzinfo=timezone.utc)
+    captured = {}
+    orig = ohlcv.load_cache_bars
+
+    def _spy(conn_, symbol, interval, *, source, since=None, until=None):
+        captured.setdefault(interval, since)
+        return orig(conn_, symbol, interval, source=source, since=since,
+                    until=until)
+
+    monkeypatch.setattr(ohlcv, "load_cache_bars", _spy)
+    p._cached_bars("USDJPY", "1h", now, [], 0)  # lookback_days=0 → window_start=now
+
+    assert captured["1h"] == now  # 未 floor
+
+
+def test_derive_candidate_since_is_floored_to_requested_interval(
+        tmp_path, monkeypatch):
+    """spec ③ テスト 7: 導出候補 (src != interval) は要求 interval の
+    境界へ floor される — floor の基準は要求 interval であって base の
+    interval ではない (1h を作るなら 1h 境界)。"""
+    conn, p = _provider(tmp_path)
+    now = datetime(2026, 7, 22, 0, 47, 0, tzinfo=timezone.utc)
+    captured = {}
+    orig = ohlcv.load_cache_bars
+
+    def _spy(conn_, symbol, interval, *, source, since=None, until=None):
+        captured.setdefault(interval, since)
+        return orig(conn_, symbol, interval, source=source, since=since,
+                    until=until)
+
+    monkeypatch.setattr(ohlcv, "load_cache_bars", _spy)
+    p._cached_bars("USDJPY", "1h", now, [], 0)
+
+    assert captured["1m"] == datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def test_query_truncation_does_not_leave_partial_leading_bucket(tmp_path):
+    """spec ③ テスト 8 (テスト 7 とは別の観測点): floor されたクエリ境界の
+    ため、導出バケットの先頭が「クエリ切断由来の部分バケット」にならない
+    こと。open を分単位で単調増加させ、floor が無ければバケットの open が
+    境界時刻の行ではなく now 直前の 1 行だけを反映してしまうことを検出
+    する。"""
+    conn, p = _provider(tmp_path)
+    now = datetime(2026, 7, 22, 0, 47, 0, tzinfo=timezone.utc)
+    boundary = datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc)
+    bars = [Bar("USDJPY", "1m", boundary + timedelta(minutes=i),
+               148.0 + i * 0.01, 148.1 + i * 0.01, 147.9 + i * 0.01,
+               148.05 + i * 0.01, 10)
+           for i in range(48)]  # 00:00 (境界) 〜 00:47 (= now)
+    ohlcv.upsert_cache_bars(conn, bars, source="yfinance")
+
+    result = p._cached_bars("USDJPY", "1h", now, [], 0)  # lookback_days=0
+
+    assert result is not None
+    derived, origin = result
+    assert origin == "cache(1m→1h derived)"
+    assert len(derived) == 1
+    assert derived[0].open == pytest.approx(148.00)  # 境界行 (i=0) の open
+
+
+def test_read_volume_bounded_by_window_regardless_of_accumulation(tmp_path):
+    """spec ③ テスト 13: DB の蓄積量に関係なく、読み込み件数が窓ぶんに
+    収まる。"""
+    conn, p = _provider(tmp_path)
+    bars = [Bar("USDJPY", "1h", NOW - timedelta(hours=i), 148, 148.1, 147.9,
+               148.05, 10) for i in range(30 * 24)]  # 30 日分
+    ohlcv.upsert_cache_bars(conn, bars, source="yfinance")
+
+    result = p._cached_bars("USDJPY", "1h", NOW, [], 5)  # 窓は 5 日 (native)
+
+    assert result is not None
+    cached, origin = result
+    assert origin == "cache"
+    assert len(cached) <= 5 * 24 + 1  # 窓 5 日ぶん (端数の余裕を許容)
+
+
+def test_prior_source_window_failure_does_not_block_next_source(
+        tmp_path, monkeypatch):
+    """spec ③ テスト 16: 先順位 source が導出不能でも、後順位 source の
+    健全なキャッシュに進む。窓計算は source 単位の try の中に置くこと —
+    try の外に置くと先順位 source の失敗が後順位のキャッシュ試行を殺す。"""
+    conn, p = _provider(tmp_path, mt5=True)  # mt5 有効 → チェーン先頭
+    # mt5 の能力を落とし、5m を提供も導出もできないようにする
+    monkeypatch.setitem(sources.NATIVE_INTERVALS, "mt5", frozenset())
+    fresh = _fresh_bars(interval="5m", n=30)
+    ohlcv.upsert_cache_bars(conn, fresh, source="yfinance")
+
+    result = p._cached_bars("USDJPY", "5m", NOW, [], 5)
+
+    assert result is not None
+    cached, origin = result
+    assert origin == "cache"
+
+
+def test_cache_window_is_widened_by_derive_ratio(tmp_path, monkeypatch):
+    """spec ③ テスト 4 の裏面 (配線の検査): 導出が要る interval では窓が
+    ライブ経路と同じ ratio 倍に広がる。cache_window.live_window_days を
+    呼ばず lookback_days をそのまま使う退行は、単体 (test_cache_window)
+    が緑のまま素通りするのでここで殺す。"""
+    conn, p = _provider(tmp_path)
+    captured = {}
+    orig = ohlcv.load_cache_bars
+
+    def _spy(conn_, symbol, interval, *, source, since=None, until=None):
+        captured.setdefault(interval, since)
+        return orig(conn_, symbol, interval, source=source, since=since,
+                    until=until)
+
+    monkeypatch.setattr(ohlcv, "load_cache_bars", _spy)
+    p._cached_bars("USDJPY", "4h", NOW, [], 5)   # 4h は DERIVE_ONLY → base 1h, ratio 4
+    span = NOW - captured["1h"]
+    assert timedelta(days=20) <= span < timedelta(days=20, hours=4)

@@ -6159,6 +6159,7 @@ Expected: **2 件 FAIL** (`test_derive_candidate_since_is_floored_to_requested_i
                 label = ("cache" if src == interval else f"cache({src})")
                 label = f"{label}[{storage_name}]"
                 try:
+                    # キャッシュも健全性検証を通さない限り使わない (fail closed)
                     validate_bars(cached, now, d.freshness_max_min,
                                   sources.INTERVAL_MIN[src])
                     if src == interval:
