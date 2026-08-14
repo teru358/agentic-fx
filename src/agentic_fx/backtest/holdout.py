@@ -85,7 +85,7 @@ def in_sample_until(now: datetime, months: int) -> datetime:
 def _oldest_bar_start(history_conn: sqlite3.Connection, symbol: str,
                       source: str) -> datetime:
     row = history_conn.execute(
-        "SELECT MIN(bar_time) FROM ohlcv WHERE symbol=? AND interval='1m' "
+        "SELECT MIN(bar_time) FROM ohlcv_history WHERE symbol=? AND interval='1m' "
         "AND source=?", (symbol, source)).fetchone()
     bar_time_iso = row[0] if row is not None else None
     if bar_time_iso is None:
@@ -94,7 +94,7 @@ def _oldest_bar_start(history_conn: sqlite3.Connection, symbol: str,
             "(cannot determine in-sample start)")
     start = datetime.fromisoformat(bar_time_iso).astimezone(_UTC)
     # F2 (fix round 1, codex Important + sonnet Important-3): ohlcv.
-    # import_bars/_validate_and_normalize_row は bar_time の分格子
+    # import_history_bars/_validate_and_normalize_row は bar_time の分格子
     # (second==microsecond==0) を検証しない — 別経路のインポータが秒付き
     # タイムスタンプを書き込むと、そのまま run_replay/ReplayClock に渡って
     # しまう。本番なら ReplayClock 構築時に確実に ValueError で落ちるが

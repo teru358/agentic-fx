@@ -14,6 +14,7 @@ from pathlib import Path
 
 from agentic_fx.backtest.timeframes import floor_to_bucket
 from agentic_fx.config import load_settings
+from agentic_fx.core.contracts import Bar
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.sandbox import SandboxError
 from agentic_fx.plugin.signal_producer import SignalProducer
@@ -35,9 +36,13 @@ def _conn(tmp_path):
 
 def _seed_flat(conn, start: datetime, minutes: int, *, price: float = 100.0,
                source: str = SOURCE, symbol: str = "USDJPY") -> None:
-    rows = [(symbol, "1m", (start + timedelta(minutes=i)).isoformat(),
-             price, price, price, price, 10.0, None) for i in range(minutes)]
-    ohlcv_store.import_bars(conn, rows, source=source)
+    """producer は `settings.plugin.producer_source` (ライブ source) の足を
+    読むので、seed も**キャッシュ側**へ書く (プラン 9 Task 16 の分割以降、
+    ライブ source を履歴 API へ渡すと allowlist が拒否する)。
+    """
+    bars = [Bar(symbol, "1m", start + timedelta(minutes=i),
+                price, price, price, price, 10.0) for i in range(minutes)]
+    ohlcv_store.upsert_cache_bars(conn, bars, source=source)
 
 
 def _meta(*, name: str = "sig", kind: str = "signal", timeframe: str = "1h",
@@ -436,3 +441,28 @@ def test_multiple_signals_in_same_bucket_drop_is_observed_via_warning(
     assert count == 1
     assert "dropped by" in caplog.text
     assert "UNIQUE" in caplog.text
+
+
+def test_short_window_is_reported(tmp_path, caplog):
+    """要求 max_bars に満たない窓しか読めなかったら loud に知らせる。
+
+    `load_resampled_frame(..., max_bars=N)` は「在る分だけ」を返す。
+    キャッシュ保持期間 (`datafeed.cache_retention_days`) が plugin の
+    max_bars が要求する窓より短いと、末尾バケットは存在するので
+    `_evaluate_bucket` の fail-open 分岐に入らず、**切り詰められた系列で
+    指標が計算され signal がそのまま出る**。承認時は削除されない履歴
+    テーブルで評価するため、この劣化は本番でしか現れない。
+    """
+    conn = _conn(tmp_path)
+    # 1h plugin が 50 本要求するのに 3 バケット分しか無い状態
+    _seed_flat(conn, H - timedelta(hours=3), 3 * 60 + 1)
+    meta = _meta(name="short", kind="signal", timeframe="1h", max_bars=50)
+    fake = _FakeSandbox()
+    fake.queue("short", {"signals": []})
+    producer = SignalProducer()
+    with caplog.at_level(logging.WARNING):
+        producer.evaluate_due_plugins(
+            conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
+            sandbox_run=fake, settings=SETTINGS)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("cache_retention_days" in m for m in msgs), msgs

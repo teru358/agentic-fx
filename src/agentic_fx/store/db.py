@@ -1,4 +1,5 @@
-"""SQLite 接続 + 14 テーブルスキーマ — 設計書 §12。"""
+"""SQLite 接続 + 15 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
+`ohlcv` は含まない) — 設計書 §12。"""
 from __future__ import annotations
 
 import logging
@@ -18,7 +19,27 @@ CREATE TABLE IF NOT EXISTS ohlcv (
 );
 """
 
-_SCHEMA = _OHLCV_V2_DDL + """
+_OHLCV_CACHE_DDL = """
+CREATE TABLE IF NOT EXISTS ohlcv_cache (
+  symbol TEXT NOT NULL, interval TEXT NOT NULL, bar_time TEXT NOT NULL,
+  open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
+  close REAL NOT NULL, volume REAL NOT NULL DEFAULT 0,
+  source TEXT NOT NULL,
+  PRIMARY KEY (symbol, interval, bar_time, source)
+);
+"""
+
+_OHLCV_HISTORY_DDL = """
+CREATE TABLE IF NOT EXISTS ohlcv_history (
+  symbol TEXT NOT NULL, interval TEXT NOT NULL, bar_time TEXT NOT NULL,
+  open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL,
+  close REAL NOT NULL, volume REAL NOT NULL DEFAULT 0,
+  source TEXT NOT NULL, spread REAL,
+  PRIMARY KEY (symbol, interval, bar_time, source)
+);
+"""
+
+_SCHEMA = _OHLCV_CACHE_DDL + _OHLCV_HISTORY_DDL + """
 CREATE TABLE IF NOT EXISTS missions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   loop TEXT NOT NULL,            -- trade | improve | ask | reflection
@@ -140,13 +161,22 @@ CREATE TABLE IF NOT EXISTS signals (
   created_at TEXT NOT NULL,
   UNIQUE(plugin, content_hash, pair, timeframe, bar_ts)
 );
+-- プラン 9 束 C (codex 指摘の裏取り): prune_cache (store/ohlcv.py) の
+-- `WHERE bar_time < ?` は PK (symbol, interval, bar_time, source) の先頭列に
+-- 当たらず、autoindex のカバリングスキャンになる。定常状態では cutoff を
+-- 跨ぐ行が毎分 4 行程度しかなく LIMIT に到達しないため、毎 tick (60s、
+-- core_lock 保持下) 索引全体を走り切る。実測 (対象ゼロ、commit 込み、warm
+-- 中央値): 20 万行 8.8ms / 100 万行 35.9ms → 索引後はいずれも 0.0055ms。
+-- 書き込み側の劣化は実運用経路 (per-tick 4 bars upsert) で 30→33µs のノイズ。
+CREATE INDEX IF NOT EXISTS ix_ohlcv_cache_bar_time
+  ON ohlcv_cache(bar_time);
 """
 
 TABLE_NAMES = frozenset({
-    "ohlcv", "missions", "trade_intents", "orders", "reflections",
-    "account_snapshots", "improvement_backlog", "improvement_runs",
-    "econ_events", "approval_requests", "news_sources", "backtest_runs",
-    "analysis_runs", "signals",
+    "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
+    "reflections", "account_snapshots", "improvement_backlog",
+    "improvement_runs", "econ_events", "approval_requests", "news_sources",
+    "backtest_runs", "analysis_runs", "signals",
 })
 
 
@@ -222,25 +252,17 @@ def _values_match(a: float | None, b: float | None) -> bool:
     return abs(a - b) < _FLOAT_TOL
 
 
-def _backup_before_migration(conn: sqlite3.Connection) -> None:
-    """移行が必要と判定された時だけ、移行前スナップショットを取る
-    (fix round 1 F8 — コメント頼みの手動バックアップ手順をやめる)。
-
-    `sqlite3` の backup API を使う (WAL の未チェックポイント分もこれなら
-    安全に含めて複製できる — 生ファイルを `cp` するだけだと WAL 中身が
-    抜ける可能性がある)。in-memory / パス解決できない接続 (`PRAGMA
-    database_list` の file が空文字) はバックアップ対象が無いのでスキップ
-    する。再試行 (途中失敗からの再開) でバックアップファイルが既に存在する
-    場合は上書きしない — 上書きすると「本当に移行前の状態」ではなく
-    「前回失敗後の状態」を複製してしまい、復元の意味が薄れる。
-    """
+def _backup_before_migration(conn: sqlite3.Connection, suffix: str) -> None:
+    """移行が必要と判定された時だけ、移行前スナップショットを取る。
+    `suffix` は移行の種類ごとに別ファイルにするための識別子
+    (Task 16: v1→v2 移行と v2→split 移行を別バックアップにする)。"""
     main = next((r for r in conn.execute("PRAGMA database_list")
                 if r["name"] == "main"), None)
     db_file = main["file"] if main is not None else ""
     if not db_file:
         return
     src_path = Path(db_file)
-    bak_path = src_path.with_name(src_path.name + ".bak-ohlcv-v2")
+    bak_path = src_path.with_name(src_path.name + suffix)
     if bak_path.exists():
         return
     bak_conn = sqlite3.connect(bak_path)
@@ -248,7 +270,7 @@ def _backup_before_migration(conn: sqlite3.Connection) -> None:
         conn.backup(bak_conn)
     finally:
         bak_conn.close()
-    _log.warning("ohlcv v2 移行前のバックアップを作成しました: %s", bak_path)
+    _log.warning("ohlcv 移行前のバックアップを作成しました: %s", bak_path)
 
 
 def _migrate_ohlcv_v2(conn: sqlite3.Connection) -> None:
@@ -296,7 +318,7 @@ def _migrate_ohlcv_v2(conn: sqlite3.Connection) -> None:
     取る (このバックアップは「移行前スナップショット」— F3 の例外時の
     手動復元先)。
     """
-    _backup_before_migration(conn)
+    _backup_before_migration(conn, ".bak-ohlcv-v2")
     conn.execute("BEGIN IMMEDIATE")
     try:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
@@ -372,13 +394,122 @@ def _migrate_ohlcv_v2(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_ohlcv_split(conn: sqlite3.Connection) -> None:
+    """v2 単一テーブル `ohlcv` (source 列あり) を `ohlcv_cache`/
+    `ohlcv_history` へ分割する (プラン 9 Task 16。設計書 §12「キャッシュと
+    履歴をテーブルで分ける」)。
+
+    source が LIVE_SOURCES ならキャッシュへ、それ以外 (IMPORT_SOURCES を
+    含む) は履歴へ — **未知 source は履歴側へ隔離する** (fail-safe。履歴
+    側は削除しないため、判断を誤っても失われない。設計書 §12 移行方針)。
+
+    `_migrate_ohlcv_v2` と同型の再開安全パターン: BEGIN IMMEDIATE →
+    存在検査 (無ければ既に完了 済み — 何もせず抜ける) → INSERT OR IGNORE →
+    値一致検証 (F3 相当 — 無視された行が「同じ値だから」か「破損/想定外
+    書き込みと衝突したから」かを区別する) → DROP → COMMIT。失敗時 ROLLBACK。
+
+    `LIVE_SOURCES` は store/ohlcv.py にある (関数内 import — db.py と
+    ohlcv.py の間に将来循環 import が生じても壊れないようにする防御的
+    パターン。config.py の INTERVAL_MIN 関数内 import と同じ流儀)。
+    """
+    from agentic_fx.store.ohlcv import LIVE_SOURCES
+
+    _backup_before_migration(conn, ".bak-ohlcv-split")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='ohlcv'").fetchone() is not None
+        if not exists:
+            conn.commit()
+            return
+        # 移行先を自己完結で用意する。`init_db` は `_SCHEMA` を先に流すので
+        # 通常は既にあるが、集合演算版は**両方のテーブルへ 1 文ずつ**流す
+        # (旧実装は「その行に必要な側」しか触らなかった) ため、片側しか
+        # 無い DB でも壊れないようにする。DDL は IF NOT EXISTS で冪等。
+        # **`executescript` は使わない** — 実行前に暗黙の COMMIT を打つため、
+        # 上で取った BEGIN IMMEDIATE の書き込みロックが落ちて、二重移行を
+        # 防ぐ排他が無効になる。各定数は単一文なので `execute` で足りる。
+        conn.execute(_OHLCV_CACHE_DDL)
+        conn.execute(_OHLCV_HISTORY_DDL)
+
+        # `_migrate_ohlcv_v2` と同じく**集合演算**で移す。旧実装は全行を
+        # Python へ materialize し、1 行あたり 2 文 (INSERT + 検証 SELECT)
+        # を発行していた。2 年分の 1m を 1 通貨ペアぶん持つ実 DB は ~75 万行
+        # あり、BEGIN IMMEDIATE の書き込みロックを保持したまま 150 万文を
+        # 流すことになる。移行はユーザーごとに 1 回きり・無人で走り、対象は
+        # 最も大きくなりやすい DB なので、行数に依存しない形にする。
+        live = sorted(LIVE_SOURCES)
+        marks = ",".join("?" * len(live))
+        conn.execute(
+            "INSERT OR IGNORE INTO ohlcv_cache (symbol, interval, bar_time, "
+            "open, high, low, close, volume, source) "
+            "SELECT symbol, interval, bar_time, open, high, low, close, "
+            f"volume, source FROM ohlcv WHERE source IN ({marks})", live)
+        conn.execute(
+            "INSERT OR IGNORE INTO ohlcv_history (symbol, interval, bar_time, "
+            "open, high, low, close, volume, source, spread) "
+            "SELECT symbol, interval, bar_time, open, high, low, close, "
+            f"volume, source, spread FROM ohlcv WHERE source NOT IN ({marks})",
+            live)
+
+        # 値一致検証も JOIN で行い、**不一致の行だけ**を取り出す (通常は
+        # 0 行なので行数に依存しない)。比較規則は `_values_match` と同じ —
+        # 非 NULL 同士は絶対差が許容誤差未満なら一致、NULL 同士は一致、
+        # 片側だけ NULL は不一致。
+        num = " OR ".join(f"abs(o.{c} - t.{c}) >= {_FLOAT_TOL}"
+                          for c in ("open", "high", "low", "close", "volume"))
+        # 履歴側は spread も比較する。ohlcv_cache に spread 列は無いので
+        # キャッシュ側は OHLCV 5 列のみ。5 列だけを見ると、spread だけ
+        # 食い違う行が「一致」と判定されて旧 ohlcv が DROP され、旧 spread
+        # が無警告で失われる (spread はバックテストのコスト計算に効く)。
+        spread_mismatch = (
+            "((o.spread IS NULL) <> (t.spread IS NULL) "
+            "OR (o.spread IS NOT NULL AND t.spread IS NOT NULL "
+            f"AND abs(o.spread - t.spread) >= {_FLOAT_TOL}))")
+        bad = None
+        for target, where, extra in (
+                ("ohlcv_cache", f"o.source IN ({marks})", ""),
+                ("ohlcv_history", f"o.source NOT IN ({marks})",
+                 f" OR {spread_mismatch}")):
+            bad = conn.execute(
+                "SELECT o.symbol, o.interval, o.bar_time, o.source "
+                f"FROM ohlcv o JOIN {target} t "
+                "ON t.symbol = o.symbol AND t.interval = o.interval "
+                "AND t.bar_time = o.bar_time AND t.source = o.source "
+                f"WHERE {where} AND ({num}{extra}) LIMIT 1", live).fetchone()
+            if bad is not None:
+                break
+        if bad is not None:
+            raise RuntimeError(
+                "ohlcv split migration: ohlcv と ohlcv_cache/ohlcv_history で"
+                f"値が一致しない行があります ({bad['symbol']}/"
+                f"{bad['interval']}/{bad['bar_time']}/{bad['source']})。ohlcv は"
+                "温存しました。data/agentic.db.bak-ohlcv-split (または手動"
+                "バックアップ) からの復元と手動調査が必要です。")
+
+        conn.execute("DROP TABLE ohlcv")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _ohlcv_legacy_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='ohlcv'").fetchone() is not None
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
-    v1_leftover = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' "
-        "AND name='ohlcv_v1'").fetchone() is not None
-    if "source" not in cols or v1_leftover:
-        _migrate_ohlcv_v2(conn)
+    if _ohlcv_legacy_exists(conn):
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
+        v1_leftover = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='ohlcv_v1'").fetchone() is not None
+        if "source" not in cols or v1_leftover:
+            _migrate_ohlcv_v2(conn)     # v1 → v2 (既存、無変更)
+        _migrate_ohlcv_split(conn)      # v2 → ohlcv_cache/ohlcv_history (新設)
     _ensure_column(conn, "missions", "trigger", "trigger TEXT")
     conn.commit()

@@ -165,6 +165,29 @@ def test_init_seeds_news_sources_and_checks_price(tmp_path, capsys,
     mock_price_check.return_value.healthcheck.assert_called_once_with("USDJPY")
 
 
+def test_init_price_check_constructor_args(tmp_path, mock_price_check):
+    """`run_init` が PriceProvider を**正しい接続・設定・時計で構築している**
+    ことを固定する。
+
+    裏取り実測 (codex 指摘 1): 直上の
+    `healthcheck.assert_called_once_with("USDJPY")` は「呼んでいるか」しか
+    見ないため、構築引数の誤配線は全 1892 テスト緑のまま生存する
+    (実測: `conn` を `sqlite3.connect(":memory:")` に差し替える変異、
+    `clock` を `FixedClock(1970)` に差し替える変異が共に生存)。
+    E2E (`tests/datafeed/test_cache_fallback_e2e.py`) は `run_init` の
+    PriceProvider を MagicMock で置換するため、構造的にここを観測できない。
+    既存の `_check_llama_swap` 配線ピン (91-94 行) の欠けた兄弟にあたる。
+    """
+    from agentic_fx.core.contracts import SystemClock
+    _example(tmp_path)
+    assert run_init(tmp_path) == 0
+    conn_arg, settings_arg, clock_arg = mock_price_check.call_args.args
+    files = [row[2] for row in conn_arg.execute("PRAGMA database_list")]
+    assert str(tmp_path / "data" / "agentic.db") in files
+    assert settings_arg.pairs == ["USDJPY"]
+    assert isinstance(clock_arg, SystemClock)
+
+
 def test_init_seeds_with_a_real_utc_clock(tmp_path, mock_price_check):
     """`run_init` が **`SystemClock` を実際に使っている**ことを固定する。
 

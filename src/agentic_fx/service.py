@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import jsonschema
@@ -30,6 +30,7 @@ from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
 from agentic_fx.core.supervisor import MissionSupervisor
+from agentic_fx.datafeed import cache_window, sources
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.news_collector import NewsCollector, seed_default_sources
@@ -57,6 +58,12 @@ from agentic_fx.tools.mission_registry import build_mission_registry
 from agentic_fx.tools.registry import ToolRegistry
 
 _log = logging.getLogger("agentic_fx.service")
+
+# プラン 9 Task 16: 1 回の DELETE が SL/TP 監視 (_process_exits) の許容
+# 遅延を超えないことを基準にした有界バッチ上限。実測は Task 16 Step 43
+# のコメントを参照。実測 2026-08-12: 5000 行の DELETE が 0.0049 秒
+# (ローカル SQLite、WAL)。
+_OHLCV_PRUNE_BATCH_LIMIT = 5000
 
 
 def _state_store(root: Path) -> StateStore:
@@ -316,6 +323,38 @@ class App:
         return skipped
 
 
+# service.py:get_bars の既定引数 (datafeed/price_provider.py:get_bars) と
+# 同じ値。ここが乖離すると保持期間検証が実際の要求と食い違う。
+_DEFAULT_LOOKBACK_DAYS = 5
+
+
+def _validate_cache_retention(settings) -> None:
+    """起動時ガード: datafeed.cache_retention_days が構成済み intervals の
+    live_window_days 最大値を下回っていないか (設計書 D2)。
+
+    enabled に関わらず全既知チェーン source (mt5/twelvedata/yfinance) で
+    検証する — config の enabled は運用中いつでも切り替わりうるため、
+    「今 enabled な source だけ」を基準にすると、後から別 source を有効化
+    した瞬間にキャッシュフォールバックが黙って壊れる余地を残す。
+    """
+    d = settings.datafeed
+    for interval in d.intervals:
+        for source in sources.NATIVE_INTERVALS:
+            try:
+                needed = cache_window.live_window_days(
+                    source, interval, _DEFAULT_LOOKBACK_DAYS)
+            except DataUnhealthy:
+                continue  # この source は interval を提供も導出もできない
+            if needed > d.cache_retention_days:
+                raise RuntimeError(
+                    f"datafeed.cache_retention_days={d.cache_retention_days} "
+                    f"日は interval={interval!r} (source={source!r}) が要求 "
+                    f"する {needed} 日を下回っています — "
+                    "datafeed.cache_retention_days を "
+                    f"{needed} 以上に増やすか、datafeed.intervals から "
+                    f"{interval!r} を外してください")
+
+
 def _validate_startup(settings) -> None:
     """起動時ガード (上書き 4): pairs 非空 + 実使用 schema の構文検証。
 
@@ -335,6 +374,7 @@ def _validate_startup(settings) -> None:
         raise RuntimeError(
             f"settings.plugin.producer_source={settings.plugin.producer_source!r} "
             f"is not a known source (known: {sorted(ohlcv.KNOWN_OHLCV_SOURCES)})")
+    _validate_cache_retention(settings)
 
 
 def _assert_tools_registered(registry: ToolRegistry, names: list[str]) -> None:
@@ -594,11 +634,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # そのまま使うと F-6/CR-5 が塞いだ違反が supervisor スレッドから
         # core_lock 非保持で再発する)。
         # 注意: readonly=True のため healthcheck はもう ohlcv キャッシュを
-        # 温めない (get_bars/derive の upsert_bars がスキップされる) —
+        # 温めない (get_bars/derive の upsert_cache_bars がスキップされる) —
         # これは意図した挙動であり退行ではない。CR-4 と同じ理由でキャッシュの
         # 一次的な書き手は scheduler tick (mark-to-market 等、既存の conn_core
         # 版 provider) であり続けるため、healthcheck が書かなくてもキャッシュ
         # 鮮度は保たれる。
+        # scheduler tick の processed-bar marking が書き込み可能 provider 経由で
+        # 1m cache を継続的に温める。1h は live 1h が検証を通れば直接保存され、
+        # 通らない場合は保存済み 1m から cache(1m→1h derived) として復元される。
+        # readonly Mission provider はこの二段構えの書き手ではない。
         healthcheck_provider = PriceProvider(conn_supervisor, settings,
                                              clock, readonly=True)
         # RO と stub 尊重を両立させる: `provider` (388-420 行) に適用した
@@ -654,6 +698,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             _run_signal_maintenance(conn=conn_core, signal_producer=signal_producer,
                                     approved=approved, settings=settings, now=now)
 
+        def on_cache_maintenance(now: datetime) -> None:
+            # プラン 9 Task 16: ohlcv_cache の保持ポリシー。有界バッチ
+            # (_OHLCV_PRUNE_BATCH_LIMIT) × 毎 maintenance 実行で、初回の
+            # 大量削除 (既存蓄積分) の lock 保持窓を抑えつつ、定常状態では
+            # 1 回の呼び出しで日次増分に追いつく (設計書 D2)。
+            cutoff = now - timedelta(days=settings.datafeed.cache_retention_days)
+            ohlcv.prune_cache(conn_core, cutoff=cutoff,
+                              limit=_OHLCV_PRUNE_BATCH_LIMIT)
+
         def signal_due_fn(now: datetime) -> bool:
             # D2: オープンポジション or pending_fill の注文が無いなら signal
             # 起動は無意味 (新規建玉を提案しても executor が gate で弾くだけ
@@ -671,6 +724,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                               on_news_cycle=collector.collect,
                               on_econ_cycle=econ.refresh,
                               on_signal_maintenance=on_signal_maintenance,
+                              on_cache_maintenance=on_cache_maintenance,
                               signal_due_fn=signal_due_fn,
                               stop_event=stop_event)
 

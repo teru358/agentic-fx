@@ -99,7 +99,7 @@ class TradeLoop:
         (既存の設計方針を維持)。**(裁定書 F-6 / CR-5) `self.provider` は
         `conn_supervisor` (RO 接続) で構築した `readonly=True` の
         `PriceProvider` — `healthcheck` 内部の `get_bars` が呼ぶ
-        `ohlcv.upsert_bars` は `readonly=True` によりスキップされるため、
+        `ohlcv.upsert_cache_bars` は `readonly=True` によりスキップされるため、
         lock 外のこの呼び出しが `conn_core` を無保護で書き込むことはない
         (Global Constraints 違反の解消)。**
 

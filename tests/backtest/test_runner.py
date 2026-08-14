@@ -64,7 +64,7 @@ def _seed_history(conn):
                         l=148.10, c=148.15))       # 13:02 — 指値 148.20 到達
     rows.append(_row_at(t + timedelta(minutes=63), o=148.9,
                         h=149.10, l=148.85, c=149.05))  # 13:03 — TP 到達
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
 
 
 def test_full_cycle_open_fill_tp(tmp_path):
@@ -115,7 +115,7 @@ def test_limit_price_only_reachable_within_eval_bucket_never_fills(tmp_path):
                     l=148.10, c=148.5) for i in range(60)]
     rows.append(_row_at(WED + timedelta(hours=1), o=148.5, h=148.6,
                         l=148.4, c=148.5))
-    ohlcv.import_bars(conn=hist, rows=rows, source="dukascopy")
+    ohlcv.import_history_bars(conn=hist, rows=rows, source="dukascopy")
     res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
                      start=WED, end=WED + timedelta(hours=2),
                      intent_source=lambda b: dict(OPEN),
@@ -144,7 +144,7 @@ def test_limit_fill_uses_only_completed_bar_not_forming_bar(tmp_path):
                         h=148.6, l=148.4, c=148.5))             # 13:01 完成バー (届かない)
     rows.append(_row_at(WED + timedelta(hours=1, minutes=2), o=148.3,
                         h=148.35, l=148.10, c=148.15))          # 13:02 完成バー (指値到達)
-    ohlcv.import_bars(hist, rows, source="dukascopy")
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
     res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
                      start=WED, end=WED + timedelta(hours=2),
@@ -224,7 +224,7 @@ def test_fallback_spread_used_when_db_spread_missing(tmp_path):
                         l=148.10, c=148.15, spread=None))
     rows.append(_row_at(t + timedelta(minutes=63), o=148.9, h=149.10,
                         l=148.85, c=149.05, spread=None))
-    ohlcv.import_bars(hist, rows, source="dukascopy")
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
     res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
                      start=WED, end=WED + timedelta(hours=2),
@@ -245,7 +245,7 @@ def test_bucket_alignment_uses_utc_epoch_anchor(tmp_path):
     rows = [_row_at(off_grid_start + timedelta(minutes=i), o=148.5, h=148.6,
                     l=148.4, c=148.5)
            for i in range(180)]  # 12:30-15:29 の連続 1m
-    ohlcv.import_bars(hist, rows, source="dukascopy")
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
     fired = []
     run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
@@ -274,7 +274,7 @@ def test_aggregate_bucket_ohlcv_values(tmp_path):
         _row_at(WED + timedelta(minutes=1), o=100.5, h=105.0, l=100.0, c=102.0),
         _row_at(WED + timedelta(minutes=2), o=102.0, h=103.0, l=95.0, c=101.0),
     ]
-    ohlcv.import_bars(hist, rows, source="dukascopy")
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
     feed = BarFeed(hist, "USDJPY", source="dukascopy", start=WED,
                    end=WED + timedelta(minutes=3))
     bar = _aggregate_bucket(feed, "USDJPY", "3m", WED, timedelta(minutes=3))
@@ -299,7 +299,7 @@ def test_bucket_evaluation_skipped_when_market_closed(tmp_path):
     rows = [_row_at(fri_close + timedelta(minutes=i), o=148.5, h=148.6,
                     l=148.4, c=148.5)
            for i in range(180)]  # 3h 分の連続 1m (バケット確定用データ)
-    ohlcv.import_bars(hist, rows, source="dukascopy")
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
     fired = []
     run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
@@ -321,7 +321,7 @@ def test_pending_proposal_discarded_when_market_closes_before_execution(tmp_path
     hist = _conn(tmp_path)
     rows = [_row_at(fri_start + timedelta(minutes=i), o=148.5, h=148.6,
                     l=148.4, c=148.5) for i in range(6)]
-    ohlcv.import_bars(hist, rows, source="dukascopy")
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
     fired = []
 
@@ -366,7 +366,7 @@ def test_pending_execution_happens_after_tick_not_before(tmp_path):
                         l=148.4, c=148.5))                       # 13:00 — entry quote + TP到達値
     rows.append(_row_at(WED + timedelta(hours=1, minutes=1), o=148.5,
                         h=149.10, l=148.4, c=148.5))              # 13:01 — 正しい順序での TP 判定対象
-    ohlcv.import_bars(hist, rows, source="dukascopy")
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
     fired = []
 
@@ -450,7 +450,7 @@ def test_drawdown_kill_switch_latches_and_blocks_next_open(tmp_path):
                         o=100.0, h=100.05, l=99.90, c=100.0))    # 13:01 — 巨大ギャップ暴落
     rows.append(_row_at(WED + timedelta(hours=2), o=100.0, h=100.05,
                         l=99.95, c=100.0))    # 14:00 — 2 件目 entry quote 用
-    ohlcv.import_bars(hist, rows, source="dukascopy")
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
     calls: list = []
 

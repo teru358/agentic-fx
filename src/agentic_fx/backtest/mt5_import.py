@@ -1,7 +1,7 @@
 """MT5 bridge 一括インポータ + 価格系差照合。
 
 MT5 bridge (`GET {base}/ohlcv/{sym}?from=ISO&to=ISO&interval=1m`) から
-1 分足を 1 日窓でページングして取り込み (`import_bars(source="mt5")`)、
+1 分足を 1 日窓でページングして取り込み (`import_history_bars(source="mt5")`)、
 Dukascopy 等の他 source と重複期間の close 差を照合する。
 
 MT5 は bid 系列 — mid 近似としてそのまま保存する (spec §6 の但し書きどおり。
@@ -18,7 +18,7 @@ import httpx
 
 from agentic_fx.datafeed.price_provider import _SPECS
 from agentic_fx.datafeed.sources import _mt5_headers
-from agentic_fx.store.ohlcv import ImportResult, import_bars
+from agentic_fx.store.ohlcv import ImportResult, import_history_bars
 
 _log = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
             # F5 (最終レビュー codex I2): 正規化後の timestamp を現在の取得窓
             # [current, window_end) に対して検証する。bridge が "to" を
             # inclusive 解釈した場合の境界重複や、bridge の不具合・キャッシュ
-            # 汚染による窓外行の無言混入を防ぐ (fail loud — import_bars の
+            # 汚染による窓外行の無言混入を防ぐ (fail loud — import_history_bars の
             # 既存行不変性は値の上書きを防ぐだけで、窓外の新規キー挿入は
             # 防がない)。
             bar_dt = datetime.fromisoformat(bar_time_iso)
@@ -147,7 +147,7 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
                         float(b["open"]), float(b["high"]), float(b["low"]),
                         float(b["close"]), float(b["volume"]), None))
         if rows:
-            result = import_bars(conn, rows, source="mt5")
+            result = import_history_bars(conn, rows, source="mt5")
             total_inserted += result.inserted
             total_unchanged += result.unchanged
             total_conflicted += result.conflicted
@@ -197,7 +197,7 @@ def compare_sources(conn, symbol: str, settings, *,
 
     cur = conn.execute(
         "SELECT ta.close AS a_close, tb.close AS b_close "
-        "FROM ohlcv ta JOIN ohlcv tb "
+        "FROM ohlcv_history ta JOIN ohlcv_history tb "
         "ON ta.symbol = tb.symbol AND ta.interval = tb.interval "
         "AND ta.bar_time = tb.bar_time "
         "WHERE ta.symbol = ? AND ta.interval = '1m' "

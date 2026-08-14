@@ -118,7 +118,7 @@
 | A | 5 | init の `n_ctx` 可視化 | — |
 | C | 8 | 窓計算ヘルパ + floor | — |
 | C | 16 | **`ohlcv` 2 テーブル分割 + prune + 保持期間検証** | 8 |
-| C | 9 | `lookback_days` 配線 | 8 |
+| C | 9 | `lookback_days` 配線 | 8, 16 |
 | C | 10 | `_cached_bars` 窓適用 | 8, 9, 16 |
 | C | 11 | 本番連鎖 E2E pin + 実データ実測 | 10 |
 | B | 6 | monotonic 注入 + gather deadline (OPEN/CLOSE 両方) | C 完了後 |
@@ -3579,7 +3579,7 @@ Expected: 既存件数 + 15 件が passed (この時点では `cache_window.py` 
 | M8-2 | 導出分岐で ratio を落とす (`lookback_days * ratio` → `lookback_days`) | `live_window_days` の derive 分岐 | `test_derive_interval_window_multiplies_by_ratio` |
 | M8-3 | `base_candidates` から `DERIVE_ONLY_INTERVALS` 除外を外す | `base_candidates` | `test_base_candidates_excludes_derive_only_intervals` |
 | M8-4 | `finest_native_base` のループ順を反転 (`sorted(..., reverse=True)` → `reverse=False`) | `base_candidates` | `test_finest_native_base_picks_coarsest_native_divisor` (最も粗い足ではなく最も細かい足が選ばれ 1h ではなく 1m が返る) |
-| M8-5 | `floor_to_interval` で `astimezone(timezone.utc)` を消す (非 UTC offset をそのまま使う) | `floor_to_interval` | `test_floor_to_interval_non_utc_offset_normalizes_to_utc` |
+| ~~M8-5~~ | ~~`floor_to_interval` で `astimezone(timezone.utc)` を消す~~ **この変異は等価であり ledger の誤り** (2026-08-12 実測・1 周目 codex 指摘)。`ts - _EPOCH` は aware 同士なので絶対時刻で差を取り、その結果を UTC の `_EPOCH` に足すため**戻り値が変わらない**。実測でフルスイート 1827 passed のまま生存する。**代替**: `ts.astimezone(timezone.utc)` → `ts.replace(tzinfo=timezone.utc)` (オフセットを換算せず付け替えるので JST テストが red になる) | `floor_to_interval` | 代替変異なら `test_floor_to_interval_non_utc_offset_normalizes_to_utc` |
 | M8-6 | `floor_to_interval` の naive チェックを消す | `floor_to_interval` | `test_floor_to_interval_rejects_naive_datetime` |
 | M8-7 | `_EPOCH` を `1970-01-01T00:00:01` (1 秒ずらす) にする | `_EPOCH` | `test_floor_to_interval_1d_floors_to_utc_midnight` (00:00 ではなく 23:59:59 のバケットが返る) |
 
@@ -4899,6 +4899,15 @@ Expected: 全件 PASS (44 件)
 
 このファイルの `ohlcv.load_bars`/`ohlcv.upsert_bars` 呼び出しは全て live source (`yfinance`/`mt5-live`) を使っており、全件がキャッシュ API への単純改名で済む (曖昧さなし — 事前 grep で確認済み)。
 
+> **プラン欠陥 #5 (2026-08-12 実行時に判明・修正済み)**: この「事前 grep で確認済み」は**誤り**。
+> `tests/datafeed/test_price_provider.py:417` が `ohlcv.load_bars(..., source="mt5") == []` を
+> assert しており、`mt5` は IMPORT_SOURCES 側の名前。単純改名すると新 API の読み側 allowlist が
+> `ValueError` を投げ、Step 14 の期待「全件 PASS」に到達できない。
+> **修正**: 分割前の保証「`mt5` では空が返る」より、分割後の「読み側が名前ごと拒否する」の方が
+> 検査目的 (一括インポータ source の混入防止) に対して強い。assert を
+> `with pytest.raises(ValueError): ohlcv.load_cache_bars(conn, "USDJPY", "1m", source="mt5")`
+> へ置き換えた。
+
 ```bash
 sed -i \
   -e 's/ohlcv\.load_bars(/ohlcv.load_cache_bars(/g' \
@@ -4936,6 +4945,31 @@ Expected: 全件 PASS (この時点で Task 8/9/10 の窓ロジックはまだ�
 #### Step 群 E: backtest 層 (履歴専用) の付け替え
 
 すべて `ohlcv_history` へ付け替える — backtest 層は履歴データしか読み書きしないため、曖昧さは無い (事前 grep で確認済み)。
+
+> **プラン欠陥 #6 (2026-08-12 実行時に判明・修正済み — 本番の読み経路を壊す)**:
+> この「backtest 層は履歴データしか読み書きしない」は**誤り**。
+> `backtest/timeframes.py:load_resampled_frame` は backtest 専用ではなく、
+> **本番のライブ経路と共有されたリーダ**である。呼び出し元は 3 系統:
+> `backtest/analysis.py` (履歴)、`plugin/strategy_adapter.py` (`_EVAL_SOURCE="dukascopy"` = 履歴)、
+> そして **`plugin/signal_producer.py:170` (`settings.plugin.producer_source` = 既定 `"yfinance"` = ライブ)**。
+>
+> SQL を `FROM ohlcv_history` に固定すると、本番の signal producer はライブデータの入った
+> `ohlcv_cache` ではなく空の `ohlcv_history` を読む。**症状は例外ではない** —
+> `signal_producer._evaluate_one` は plugin 単位で fail-open (WARNING → cursor を進めず次 tick
+> 再試行) なので、**signal が永久に 1 本も出ないまま上位に失敗が伝わらない**。
+> `service.py:_validate_startup` の `producer_source ∈ KNOWN_OHLCV_SOURCES` (union) 検証も
+> ライブ source を通すのでここでは捕まらない。
+>
+> **修正**: `load_resampled_frame` が `source` からテーブルを**導出**する `_table()` を追加した
+> (`LIVE_SOURCES` → `ohlcv_cache` / `IMPORT_SOURCES` → `ohlcv_history` / それ以外は `ValueError`)。
+> 設計判断 #1「API はテーブルを引数で選ばせない」の不変条件は保たれる — #1 が禁じているのは
+> **呼び出し側がテーブルを選ぶこと**であり、互いに素な allowlist からの一意導出はこれに当たらない。
+> 両テーブルで SELECT する列は同一 (`spread` は履歴側のみだがこの SELECT は使わない) なので、
+> `ohlcv.py` のようにリーダを 2 本へ割る必要はない。
+> 併せて、ライブ source で seed していたフィクスチャ 3 本
+> (`tests/plugin/test_signal_producer.py` / `tests/test_e2e_plugin_signal.py` /
+> `tests/test_service_app.py`) を `upsert_cache_bars` へ振り直した。
+> 観測点は `tests/backtest/test_timeframes.py` の 4 テスト (変異 X-1/X-2 で kill 済み)。
 
 - [ ] **Step 15: `src/agentic_fx/backtest/importer.py` を付け替える**
 
@@ -5630,8 +5664,10 @@ Expected: 全件 PASS (親プランの既存件数 1726 + Task 8/16 で追加し
 | M16-12 | `_validate_cache_retention` の比較演算子を反転する (`needed > d.cache_retention_days` → `<`) | `service.py:_validate_cache_retention` | `test_build_app_rejects_cache_retention_below_interval_requirement` (今度は逆に、正常設定側で誤って RuntimeError が出て `test_build_app_accepts_default_example_intervals_and_retention` が落ちる) |
 | M16-13 | `Scheduler.__init__`/`_run_hooks` から `on_cache_maintenance` の呼び出しを削除する (配線を切る) | `core/scheduler.py:_run_hooks` | `test_tick_calls_on_cache_maintenance_every_tick_when_configured` |
 | M16-14 | `build_app` の `Scheduler(...)` から `on_cache_maintenance=on_cache_maintenance` 引数を削除する | `service.py:build_app` | `test_build_app_wires_cache_maintenance_hook` と `test_cache_maintenance_prunes_old_cache_rows` |
-| M16-15 | `on_cache_maintenance` の `cutoff` 計算から `settings.datafeed.cache_retention_days` を外し固定値にする | `service.py:on_cache_maintenance` | `test_cache_maintenance_prunes_old_cache_rows` (直接は殺せない可能性がある場合、40 日前のバーで境界固定するテストが検出する — 抜き取り確認で固定値がテストの前提と食い違うことを確認する) |
-| M16-16 | `backtest/cli.py` の `cov`/`run`/`corr` から `choices=sorted(ohlcv.IMPORT_SOURCES)` を削除する | `backtest/cli.py:register_subparsers` | `test_backtest_run_rejects_live_source` / `test_history_coverage_rejects_live_source` / `test_analyze_corr_rejects_live_source` (3 本すべて) |
+| M16-15 | `on_cache_maintenance` の `cutoff` 計算から `settings.datafeed.cache_retention_days` を外し固定値にする | `service.py:on_cache_maintenance` | **実測 (2026-08-12): 記載の `test_cache_maintenance_prunes_old_cache_rows` では生存した。** 固定値として自然に選ぶ `30` が `settings.yaml.example` の既定と一致し**等価変異**になるため (40 日/10 日の境界両側を置いても 30 日と 30 日は同じ挙動)。既定と異なる保持期間 (45 日) を明示し、30 日固定なら消える 35 日前のバーが残ることを見る `test_cache_maintenance_cutoff_follows_configured_retention_days` を追加して kill した |
+| M16-16 | `backtest/cli.py` の `cov`/`run`/`corr` から `choices=sorted(ohlcv.IMPORT_SOURCES)` を削除する | `backtest/cli.py:register_subparsers` | **実測 (2026-08-12): 記載の 3 本では生存した。** `choices` が無くても後段の初期化ガードが同じ `SystemExit(2)` を返すため、exit code だけを見る assert では**拒否した主体を区別できない**。3 本に `assert "invalid choice" in capsys.readouterr().err` を足して kill した (`test_backtest_run_rejects_live_source` / `test_history_coverage_rejects_live_source` / `test_analyze_corr_rejects_live_source`) |
+| X-1 | (指揮者の自主変異) `timeframes._table` の `LIVE_SOURCES` 分岐が `ohlcv_history` を返すようにする | `backtest/timeframes.py:_table` | `test_live_source_reads_the_cache_table` |
+| X-2 | (指揮者の自主変異) `timeframes._table` の末尾 `raise` の手前で `ohlcv_history` を返す (fail closed を既定値へ落とす) | `backtest/timeframes.py:_table` | `test_unknown_source_is_rejected` |
 | M16-17 | `_ohlcv_legacy_exists` を常に `False` を返すようにする (migration チェーンを丸ごと無効化) | `store/db.py:_ohlcv_legacy_exists` | `test_init_db_migrates_legacy_v1_ohlcv_into_cache_table` |
 
 **変異は 1 つずつ独立に当て、殺した固有のテスト名を記録する。**
@@ -5742,7 +5778,7 @@ Expected: FAIL — `captured_since` の要素が全て `None` のままなので
         got = self._cached_bars(pair, interval, now, errors, lookback_days)
 ```
 
-`_cached_bars` のシグネチャと候補ループ内の呼び出しを更新する (旧 `:192-229`):
+`_cached_bars` のシグネチャと候補ループ内の呼び出しを更新する (旧 `:192-247`)。**既存 docstring の全段落 (F1/F6/DERIVE_ONLY 残骸の根拠) と旧 `:235` の fail closed コメントはそのまま残し**、docstring 末尾に下記転写ブロック中の `lookback_days` に言及する段落を**追記**する。コード側の変更は ①シグネチャに `lookback_days: int` を追加 ②`since = now - timedelta(days=lookback_days)` を `d = ...` の直後に挿入 ③`load_cache_bars(...)` に `since=since` を追加 — の 3 箇所のみ。
 
 ```python
     def _cached_bars(self, pair: str, interval: str, now: datetime,
@@ -5802,7 +5838,7 @@ from datetime import datetime, timedelta
 find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 uv run pytest tests/datafeed/test_price_provider.py -v
 ```
-Expected: 全件 PASS (既存キャッシュ系テストは `lookback_days=1`/`5` の既定と一致する `since` になるため無影響 — `since = now - N日` は「窓より新しいキャッシュ行を排除しない」範囲であることを既存の `_fresh_bars` (直近数十分〜数時間) が保証する)
+Expected: 全件 PASS (キャッシュ経路を踏む既存フィクスチャの最長スパンは `_fresh_bars(interval="1h", n=100)` = 100h で、既定 `lookback_days=5` = 120h に対し余裕 20h。`_fresh_bars(interval="4h", n=30)` = 120h ちょうどの残骸フィクスチャは `DERIVE_ONLY_INTERVALS` により candidates から外れ読まれない。よって `since = now - N日` で排除される行は存在しない)
 
 - [ ] **Step 5: 全体テストを実行する**
 
@@ -5842,6 +5878,8 @@ load_cache_bars(since=...) まで到達させる。窓計算 (native/derive の
 EOF
 )"
 ```
+
+> 注記 (2026-08-14 着手前検証): Step 4 の旧根拠 (「_fresh_bars が保証」) は事実誤りだったため差し替え済み。Task 10 で窓を `live_window_days` に変える際はこの実測値 (最長フィクスチャ 100h) を前提にすること。
 
 ---
 
@@ -6042,6 +6080,26 @@ def test_prior_source_window_failure_does_not_block_next_source(
     assert result is not None
     cached, origin = result
     assert origin == "cache"
+
+
+def test_cache_window_is_widened_by_derive_ratio(tmp_path, monkeypatch):
+    """spec ③ テスト 4 の裏面 (配線の検査): 導出が要る interval では窓が
+    ライブ経路と同じ ratio 倍に広がる。cache_window.live_window_days を
+    呼ばず lookback_days をそのまま使う退行は、単体 (test_cache_window)
+    が緑のまま素通りするのでここで殺す。"""
+    conn, p = _provider(tmp_path)
+    captured = {}
+    orig = ohlcv.load_cache_bars
+
+    def _spy(conn_, symbol, interval, *, source, since=None, until=None):
+        captured.setdefault(interval, since)
+        return orig(conn_, symbol, interval, source=source, since=since,
+                    until=until)
+
+    monkeypatch.setattr(ohlcv, "load_cache_bars", _spy)
+    p._cached_bars("USDJPY", "4h", NOW, [], 5)   # 4h は DERIVE_ONLY → base 1h, ratio 4
+    span = NOW - captured["1h"]
+    assert timedelta(days=20) <= span < timedelta(days=20, hours=4)
 ```
 
 - [ ] **Step 4: テストを実行し、窓計算未適用のため落ちることを確認する**
@@ -6053,7 +6111,7 @@ uv run pytest tests/datafeed/test_price_provider.py \
 or derive_candidate_since or query_truncation or read_volume_bounded or \
 prior_source_window_failure" -v
 ```
-Expected: 全件 FAIL (現行 `_cached_bars` は Task 9 時点の素朴な `since = now - timedelta(days=lookback_days)` のままで、native/derive の区別・floor が無いため、`since` の値・除外件数・バケット構造のいずれかが期待と食い違う)
+Expected: **2 件 FAIL** (`test_derive_candidate_since_is_floored_to_requested_interval` / `test_query_truncation_does_not_leave_partial_leading_bucket`)。残る 5 件は Task 9 の素朴な `since` でも成立するため PASS のまま (本 task では退行ガードとして機能する)。全件 FAIL にはならない。訂正 2 の追加テスト (`test_cache_window_is_widened_by_derive_ratio`) を含めると red は 3 件。(2026-08-14 着手前検証の probe 実測)
 
 - [ ] **Step 5: `_cached_bars` を書き換える**
 
@@ -6101,6 +6159,7 @@ Expected: 全件 FAIL (現行 `_cached_bars` は Task 9 時点の素朴な `sinc
                 label = ("cache" if src == interval else f"cache({src})")
                 label = f"{label}[{storage_name}]"
                 try:
+                    # キャッシュも健全性検証を通さない限り使わない (fail closed)
                     validate_bars(cached, now, d.freshness_max_min,
                                   sources.INTERVAL_MIN[src])
                     if src == interval:
@@ -6121,7 +6180,7 @@ Expected: 全件 FAIL (現行 `_cached_bars` は Task 9 時点の素朴な `sinc
 find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 uv run pytest tests/datafeed/test_price_provider.py -v
 ```
-Expected: 全件 PASS (Task 8/9 分 + 本 task 7 件 + 既存回帰分)
+Expected: 全件 PASS (Task 8/9 分 + 本 task 8 件 + 既存回帰分)
 
 - [ ] **Step 7: 全体テストを実行する**
 
@@ -6138,11 +6197,12 @@ Expected: 全件 PASS
 |---|---|---|---|
 | M10-1 | `since = window_start if src == interval else derive_since` を `since = derive_since` (常に floor) に変える | `_cached_bars` の候補ループ | `test_direct_read_candidate_since_is_not_floored` |
 | M10-2 | 同上を `since = window_start` (常に未 floor) に変える | 同上 | `test_derive_candidate_since_is_floored_to_requested_interval` と `test_query_truncation_does_not_leave_partial_leading_bucket` の両方 |
-| M10-3 | 窓計算を `cache_window.live_window_days(name, interval, lookback_days)` から `cache_window.live_window_days(name, src, lookback_days)` に変える (candidates ループの内側へ誤って移し、base 足の interval で窓を計算する退行) | `_cached_bars` | `test_window_independent_of_cache_base_used_for_derivation` |
-| M10-4 | `window_start`/`derive_since` の計算 (窓計算) を source 単位の `try` の外 (関数冒頭) へ移す | `_cached_bars` の構造 | `test_prior_source_window_failure_does_not_block_next_source` |
+| M10-3 | 窓計算を candidates ループの内側へ移し、比を**キャッシュ base から**取る (`window_days = int(lookback_days * sources.INTERVAL_MIN[interval] / sources.INTERVAL_MIN[src])`) | `_cached_bars` | `test_window_independent_of_cache_base_used_for_derivation` (1m 経路で 300 日になり窓上限 5日+1h を超える) |
+| M10-4 | `window_start`/`derive_since` の計算を **`for name` ループ内・`try` の外** へ出す (計算だけを try の直前に置く) | 同上 | `test_prior_source_window_failure_does_not_block_next_source` |
 | M10-5 | `since=since` を `load_cache_bars` 呼び出しから削除する (窓の絞りを外す) | `_cached_bars` の `ohlcv.load_cache_bars(...)` 呼び出し | `test_rows_older_than_window_are_excluded` と `test_read_volume_bounded_by_window_regardless_of_accumulation` の両方 |
+| M10-6 | `window_days = cache_window.live_window_days(name, interval, lookback_days)` を `window_days = lookback_days` に変える (Task 8 の窓計算を呼ばない退行) | `_cached_bars` | `test_cache_window_is_widened_by_derive_ratio` |
 
-**M10-1〜M10-5 はいずれも「1 つの検査目的につき 1 テスト」の原則に沿って、それぞれ固有のテストが検出する。**
+**M10-1〜M10-6 はいずれも「1 つの検査目的につき 1 テスト」の原則に沿って、それぞれ固有のテストが検出する。**
 
 - [ ] **Step 9: 全体テストを再実行し green に戻っていることを確認する**
 
@@ -6171,6 +6231,8 @@ EOF
 )"
 ```
 
+> 注記 (2026-08-14 着手前検証): 上記訂正 1〜4 は probe 実測済み (red 2+1 件 / M10-3 旧文面は survive / M10-6 は追加テストが無いと全 survive)。probe は scratchpad の test_task10_probe.py。
+
 ---
 
 
@@ -6194,7 +6256,11 @@ EOF
 
 - [ ] **Step 1: 失敗するテストを書く**
 
-`tests/datafeed/test_cache_fallback_e2e.py` を次の内容で新規作成する。`_init_root` は実 `run_init` が作る設定・policy・DB を使い、`_build_real_app` は実 `build_app` factory に `FakeRunner` と `FakeEmbedding` だけを注入する。order は一件も seed しない。`OPEN_NOW` は水曜 12:00 UTC で、`run_init` が作成した最新 account snapshot と同時刻以上になる。
+`tests/datafeed/test_cache_fallback_e2e.py` を次の内容で新規作成する。`_init_root` は実 `run_init` が作る設定・policy・DB を使い、`_build_real_app` は実 `build_app` factory に `FakeRunner` と `FakeEmbedding` だけを注入する。order は一件も seed しない。`OPEN_NOW` は水曜 12:00 UTC で、`market_hours.is_market_open(OPEN_NOW)` が True になる (P1 実測) — ここが False だと `tick` が `_process_exits` の手前で return し、テスト 11・12 が共に死ぬ。
+
+訂正 9 (着手前検証): `run_init` は account snapshot を**作らない** (`service.py:198-266` に記述なし)。`tick` の唯一の硬いゲート `if not self._mark_to_market(now): return` は、注文 0 件・snapshot 0 件の初期状態でも True を返し、`_process_exits` 末尾の processed-bar marking まで到達する (P1 実測: 5 passed)。したがってこのテストは account snapshot の事前 seed を必要としない。
+
+訂正 1 (着手前検証): テスト 12・11 の `app.scheduler.tick(...)` は `_no_real_network()` で包む。理由: `tick` の `_run_hooks` は `finally` で無条件に走り、seed 済み RSS 3 本 + ForexFactory へ実 HTTP を出す (実測 4 件/tick)。`tests/test_e2e_phase1.py` が同一理由で同一ヘルパを使っている。適用後 5 passed / 0.96 秒 (実測)。
 
 ```python
 from __future__ import annotations
@@ -6209,6 +6275,7 @@ from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.service import build_app, run_init
 from agentic_fx.store import ohlcv
 from tests.store.test_rag import FakeEmbedding
+from tests.test_service_app import _no_real_network
 
 
 OPEN_NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
@@ -6266,7 +6333,8 @@ def test_tick_processed_bar_marking_persists_one_minute_without_orders(tmp_path)
     app = _build_real_app(tmp_path)
     try:
         assert app.conn_core.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
-        with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+        with _no_real_network(), \
+             patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                    side_effect=_only_one_minute):
             app.scheduler.tick(OPEN_NOW)
         rows = ohlcv.load_cache_bars(
@@ -6284,7 +6352,8 @@ def test_build_app_tick_then_final_one_minute_to_one_hour_fallback(tmp_path):
     app = _build_real_app(tmp_path)
     try:
         assert app.conn_core.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
-        with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+        with _no_real_network(), \
+             patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                    side_effect=_only_one_minute):
             app.scheduler.tick(OPEN_NOW)
 
@@ -6398,7 +6467,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 uv run pytest tests/datafeed/test_cache_fallback_e2e.py -v
 ```
 
-Expected: `test_tick_processed_bar_marking_persists_one_minute_without_orders` と `test_build_app_tick_then_final_one_minute_to_one_hour_fallback` は Task 16 適用前なら `AttributeError: module 'agentic_fx.store.ohlcv' has no attribute 'load_cache_bars'`、Task 16 適用後かつ Task 10 未適用なら `_cached_bars()` の `lookback_days` シグネチャまたは未絞り挙動の相違で FAIL。`test_cache_fallback_keeps_trailing_in_progress_bucket`、`test_window_excludes_old_abnormal_bar_and_changes_acceptance`、`test_cache_fallback_ignores_matching_history_rows` の少なくとも一件が、Task 10/16 の最終形が未適用なら期待した origin・行集合・テーブル境界のいずれかで FAIL する。
+Expected: **5 passed**。Task 8/16/9/10 を先行適用済みの束 C 実行順では red は成立しない (実測: HEAD 72b4082 で 5 passed / 0.96 秒)。観測点が有効であることは Step 11 の変異 M11-1〜7 で確認する。
 
 - [ ] **Step 3: E2E に必要な本番実装を確認し、テスト目的ごとの最小修正を実装**
 
@@ -6425,7 +6494,7 @@ Expected: 5 passed。非同期 Mission supervisor は start しておらず観�
 
 - [ ] **Step 5: 実データ計測スクリプトを書く**
 
-`scripts/measure_cache_validation_window.py` を次の内容で作成する。履歴 DB の実バーをそのまま読み、全期間と `live_window_days` で切った期間の双方について `validate_bars` の合否・中央値時間・ピークメモリ・行数を測る。隣接 bar 間に 48 時間以上の差が一つも無ければ、週末ギャップを含む実データという前提を満たさないため終了コード 2 で拒否する。
+`scripts/measure_cache_validation_window.py` を次の内容で作成する。履歴 DB の実バーをそのまま読み、全期間と `live_window_days` で切った期間の双方について `validate_bars` の合否・中央値時間・ピークメモリ・行数を測る。隣接 bar 間に 48 時間以上の差が一つも無ければ、週末ギャップを含む実データという前提を満たさないため、メッセージを出して非ゼロ (exit 1) で拒否する。
 
 ```python
 from __future__ import annotations
@@ -6539,13 +6608,22 @@ if __name__ == "__main__":
 
 - [ ] **Step 6: 実データで窓縮小の前後を測る**
 
-実装 worktree の `data/agentic.db` に週末を跨ぐ履歴が無い場合は、運用で保持している Dukascopy/MT5 履歴 DB のコピーを `--db` に指定する。実データを repo に commit しない。
+実装 worktree に `data/` は無く、運用 DB は分割前スキーマ (`ohlcv` 単一テーブル) のため、まずコピーを取って移行する。
+
+```bash
+cp ~/project/agentic-fx/data/agentic.db /tmp/measure-src.db   # 運用 DB を止めずにコピー
+uv run python -c "from pathlib import Path; from agentic_fx.store.db import connect, init_db; init_db(connect(Path('/tmp/measure-src.db')))"
+```
+
+`init_db` が `ohlcv` → `ohlcv_cache`/`ohlcv_history` の分割移行を行う (実測 0.07 秒、`mt5` 24465 行は履歴側へ)。移行前バックアップ `*.bak-ohlcv-split` が自動生成される。実データは repo に commit しない。
+
+**Dukascopy からの新規取得は禁止** (この IP は遮断確定)。本 Step はローカル DB の読み取りのみで、外部への接続は一切行わない。
 
 ```bash
 uv run python scripts/measure_cache_validation_window.py \
-  --db data/agentic.db \
+  --db /tmp/measure-src.db \
   --symbol USDJPY \
-  --history-source dukascopy \
+  --history-source mt5 \
   --window-source yfinance \
   --interval 1m \
   --lookback-days 5 \
@@ -6553,7 +6631,7 @@ uv run python scripts/measure_cache_validation_window.py \
   --output /tmp/cache-validation-real-data.json
 ```
 
-Expected: exit 0。JSON の `weekend_gaps_ge_48h` が 1 以上で、`before` と `after` の `outcome`、`error`、`rows`、`median_seconds`、`peak_bytes_max` が埋まる。`after.rows < before.rows` かつ `after.median_seconds < before.median_seconds` を実測値で確認する。合否が変わらない実データでも値を改変せず記録し、古い異常行を含む実データで `before=FAIL` / `after=PASS` になった場合もそのまま記録する。§1.4 の 180 日連続合成値 5.76 秒 / 161.9 MB を転記して実測値の代用にしない。
+Expected: exit 0。JSON の `weekend_gaps_ge_48h` が 1 以上で、`before` と `after` の `outcome`、`error`、`rows`、`median_seconds`、`peak_bytes_max` が埋まる。`after.rows < before.rows` かつ `after.median_seconds < before.median_seconds` を実測値で確認する。着手前検証の実測値は `weekend_gaps_ge_48h=3`、before 24465 行 PASS 0.176 秒、after 4316 行 PASS 0.029 秒 — どちらの不等式も 4〜6 倍の差で、run 間ばらつきに埋もれない。**合否は両方 PASS で変わらない** — その事実をそのまま記録する。合否が変わらない実データでも値を改変せず記録し、古い異常行を含む実データで `before=FAIL` / `after=PASS` になった場合もそのまま記録する。§1.4 の 180 日連続合成値 5.76 秒 / 161.9 MB を転記して実測値の代用にしない。
 
 - [ ] **Step 7: 実測結果を記録する**
 
@@ -6568,6 +6646,7 @@ Expected: exit 0。JSON の `weekend_gaps_ge_48h` が 1 以上で、`before` と
 - 48 時間以上の週末ギャップ数: 実際の整数
 - 反復数: 7
 - 実行コマンド: 秘密情報を除いた Step 6 のコマンド
+- peak bytes は `validate_bars` 呼び出し中の**増分**割当 (バー列本体は計測開始前に確保済み)。§1.4 の 161.9 MB とは測定対象が異なるので大小比較しない
 
 | 条件 | 行数 | validate_bars 合否 | 失敗理由 | 中央値秒 | peak bytes |
 |---|---:|---|---|---:|---:|
@@ -6601,7 +6680,7 @@ uv run pytest tests/datafeed/test_cache_fallback_e2e.py \
 uv run pytest -q
 ```
 
-Expected: 対象テスト全件 PASS、全体テスト全件 PASS、開始時点の 1726 passed / 1 deselected から意図した新規テスト件数以外の減少なし。
+Expected: 対象テスト全件 PASS、全体テスト全件 PASS、開始時点の **1887 passed** (HEAD 72b4082) から、新規 5 件を加えた 1892 passed。
 
 - [ ] **Step 10: 短絡補償を確認する**
 
@@ -6626,7 +6705,7 @@ Expected: 対象テスト全件 PASS、全体テスト全件 PASS、開始時点
 | M11-3 | `build_app` の Scheduler 配線を `bars_fn=lambda pair: None` に差し替える | `test_tick_processed_bar_marking_persists_one_minute_without_orders` |
 | M11-4 | `_process_exits` 末尾の `for pair in self.settings.pairs` 走査を削除する | `test_tick_processed_bar_marking_persists_one_minute_without_orders` |
 | M11-5 | `load_cache_bars(..., since=since)` から `since` を削除して全期間を検証へ戻す | `test_window_excludes_old_abnormal_bar_and_changes_acceptance` |
-| M11-6 | `_cached_bars` の読み口 `ohlcv.load_cache_bars` を同じ引数で `ohlcv_history` を読む実装へ向ける | `test_cache_fallback_ignores_matching_history_rows` |
+| M11-6 | `store/ohlcv.py:82` の `load_cache_bars` のクエリ `FROM ohlcv_cache` を `FROM ohlcv_history` に書き換える (呼び出し側は変えない)。`load_history_bars` への関数差し替えにはしない — `source="yfinance"` が `IMPORT_SOURCES` ガードに当たり、`_cached_bars` の try の**外** (231 行) で `ValueError` になって「テーブル境界」ではなく「source ガード」を殺してしまう | `test_cache_fallback_ignores_matching_history_rows` |
 | M11-7 | E2E の `build_app(...)` をローカルな `PriceProvider` + `Scheduler` 組立てへ置換する変異はテスト変異なので許容しない。production の `build_app` から `bars_fn=provider.latest_1m_bar` の束縛を削除する | `test_tick_processed_bar_marking_persists_one_minute_without_orders` |
 
 変異を全て戻した後、次を実行する。
@@ -6650,6 +6729,8 @@ git add tests/datafeed/test_cache_fallback_e2e.py \
 git commit -m "test: 本番 OHLCV 最終フォールバックを E2E で pin する (プラン9 Task11)"
 ```
 
+> 注記 (2026-08-14 着手前検証): 訂正 1〜8 は probe 実測済み (P1〜P6)。訂正 1 (外向き HTTP 遮断) 未適用のまま Step 4 を回すことは禁止。Dukascopy への接続は本 task のどの Step にも存在しない (Step 6 はローカル DB 読みのみ)
+
 ---
 
 ### 束 C 自己レビュー
@@ -6662,6 +6743,7 @@ git commit -m "test: 本番 OHLCV 最終フォールバックを E2E で pin す
 | 2 | Task 8 Step 1 | `test_native_interval_window_equals_lookback_days` |
 | 3 | Task 8 Step 1 | `test_derive_interval_window_multiplies_by_ratio` |
 | 4 | Task 10 Step 3 | `test_window_independent_of_cache_base_used_for_derivation` |
+| 4 の裏面 (配線の検査) | Task 10 Step 3 | `test_cache_window_is_widened_by_derive_ratio` — 導出 interval で窓が ratio 倍に広がることを `_cached_bars` 経由で検査 (Task 10 訂正 2 で追加) |
 | 5 | Task 10 Step 3 | `test_rows_older_than_window_are_excluded` |
 | 6 | Task 10 Step 3 | `test_direct_read_candidate_since_is_not_floored` |
 | 7 | Task 10 Step 3 | `test_derive_candidate_since_is_floored_to_requested_interval` |

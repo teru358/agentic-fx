@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from agentic_fx.backtest.dukascopy import Tick, decode_bi5, hour_url, point_of
-from agentic_fx.store.ohlcv import ImportResult, import_bars
+from agentic_fx.store.ohlcv import ImportResult, import_history_bars
 
 _log = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ def ticks_to_1m(ticks: list[Tick], symbol: str) -> list[tuple]:
     """Aggregate ticks to 1-minute bars.
 
     Converts mid=(bid+ask)/2 prices to OHLC, calculates mean spread,
-    and returns import_bars row tuples.
+    and returns import_history_bars row tuples.
 
     Args:
         ticks: List of Tick(ts, bid, ask) objects
@@ -212,7 +212,7 @@ def import_dukascopy(conn, symbol: str, start: datetime, end: datetime, *,
 
         # Import bars into database
         if rows:
-            result = import_bars(conn, rows, source="dukascopy")
+            result = import_history_bars(conn, rows, source="dukascopy")
             total_inserted += result.inserted
             total_unchanged += result.unchanged
             total_conflicted += result.conflicted

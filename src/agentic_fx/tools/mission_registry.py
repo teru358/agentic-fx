@@ -44,7 +44,7 @@ def build_mission_registry(
 
     `readonly` (CR-4 対応、裁定書 F-5): 子プロセス (`mission_worker.py`)
     は `conn` に `db.connect_readonly` (SQLite `mode=ro`) を渡すため、
-    `PriceProvider.get_bars`/`_derive` が通常経路で行う `ohlcv.upsert_bars`
+    `PriceProvider.get_bars`/`_derive` が通常経路で行う `ohlcv.upsert_cache_bars`
     キャッシュ書込は `sqlite3.OperationalError: attempt to write a
     readonly database` になる。`readonly=True` は `PriceProvider` を
     cache 書込スキップモードで構築する — 既存 cache は引き続き読むが、
@@ -52,6 +52,11 @@ def build_mission_registry(
     委譲する設計は採らない (設計裁定: RPC 面を拡大しない — 裁定書
     F-5)。cache は性能最適化であり、親の scheduler tick が継続的に
     cache を温めるため実害は限定的。
+
+    scheduler tick の processed-bar marking が書き込み可能 provider 経由で
+    1m cache を継続的に温める。1h は live 1h が検証を通れば直接保存され、
+    通らない場合は保存済み 1m から cache(1m→1h derived) として復元される。
+    readonly Mission provider はこの二段構えの書き手ではない。
 
     `provider` (注入 seam、build_app の `provider=` パラメータを透通する):
     非 None ならそれを使い、None なら `PriceProvider(conn, settings, clock,

@@ -151,7 +151,7 @@ def test_cli_backtest_run_records_human_custom_scope(tmp_path, monkeypatch):
     from agentic_fx.store import ohlcv as ohlcv_store
     seed_conn = connect(tmp_path / "data" / "agentic.db")
     init_db(seed_conn)
-    ohlcv_store.import_bars(
+    ohlcv_store.import_history_bars(
         seed_conn, [("USDJPY", "1m", "2026-07-01T00:00:00+00:00",
                     148.0, 148.2, 147.9, 148.1, 10.0, 0.01)],
         source="dukascopy")
@@ -332,7 +332,7 @@ def test_cli_backtest_run_plugin_records_strategy_scope(tmp_path, monkeypatch,
                                         pairs=["USDJPY"])
     seed_conn = connect(tmp_path / "data" / "agentic.db")
     init_db(seed_conn)
-    ohlcv_store.import_bars(
+    ohlcv_store.import_history_bars(
         seed_conn, [("USDJPY", "1m", "2026-07-01T00:00:00+00:00",
                     148.0, 148.2, 147.9, 148.1, 10.0, 0.01)],
         source="dukascopy")
@@ -413,7 +413,7 @@ def test_cli_backtest_run_plugin_closes_session_even_if_run_replay_raises(
     _write_strategy_plugin(tmp_path / "plugins", "strat", pairs=["USDJPY"])
     seed_conn = connect(tmp_path / "data" / "agentic.db")
     init_db(seed_conn)
-    ohlcv_store.import_bars(
+    ohlcv_store.import_history_bars(
         seed_conn, [("USDJPY", "1m", "2026-07-01T00:00:00+00:00",
                     148.0, 148.2, 147.9, 148.1, 10.0, 0.01)],
         source="dukascopy")
@@ -578,7 +578,7 @@ def test_cli_backtest_run_integration_writes_human_custom_row(tmp_path,
         )
         for i in range(61)  # H (12:00) から 13:00 まで inclusive
     ]
-    ohlcv_store.import_bars(hist_conn, rows, source="dukascopy")
+    ohlcv_store.import_history_bars(hist_conn, rows, source="dukascopy")
     hist_conn.close()
 
     # (2) 期間内 (ts=H) の有効な open (market) 提案。フラット相場なので
@@ -760,8 +760,8 @@ def test_cli_analyze_corr_does_not_write_to_analysis_runs_real_db(
                        0.01))
         rows_b.append(("EURUSD", "1m", t, vb, vb + 0.05, vb - 0.05, vb, 1.0,
                        0.01))
-    ohlcv_store.import_bars(conn, rows_a, source="dukascopy")
-    ohlcv_store.import_bars(conn, rows_b, source="dukascopy")
+    ohlcv_store.import_history_bars(conn, rows_a, source="dukascopy")
+    ohlcv_store.import_history_bars(conn, rows_b, source="dukascopy")
     assert conn.execute(
         "SELECT COUNT(*) AS n FROM analysis_runs").fetchone()["n"] == 0
     conn.close()
@@ -884,3 +884,43 @@ def test_cli_default_service_behavior_unchanged(monkeypatch):
     with patch("agentic_fx.service.run_service", return_value=0) as rs:
         rc = main([])
     assert rc == 0 and rs.called
+
+
+def test_backtest_run_rejects_live_source(tmp_path, monkeypatch, capsys):
+    """人間 CLI にライブ source を渡すと argparse が fail closed する
+    (設計書 D2)。SystemExit(2) は argparse の標準的な引数エラー終了コード。
+
+    段 0 の変異 M16-16 (`choices=sorted(ohlcv.IMPORT_SOURCES)` の削除) は
+    exit code だけを見る版では**生存した** — choices が無くても後段の
+    初期化ガードが同じ SystemExit(2) を出すため。拒否した主体が argparse の
+    allowlist であることまで見る。
+    """
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        main(["backtest", "run", "--symbol", "USDJPY", "--source", "yfinance",
+             "--from", "2026-01-01", "--to", "2026-01-02",
+             "--proposal-file", "dummy.jsonl"])
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_history_coverage_rejects_live_source(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        main(["history", "coverage", "--symbol", "USDJPY",
+             "--timeframe", "1h", "--source", "mt5-live",
+             "--from", "2026-01-01", "--to", "2026-01-02"])
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_analyze_corr_rejects_live_source(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        main(["analyze", "corr", "--a", "USDJPY", "--b", "EURUSD",
+             "--timeframe", "1h", "--source", "twelvedata"])
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err

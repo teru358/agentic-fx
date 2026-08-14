@@ -81,7 +81,7 @@ def test_resampled_1h_bucket_anchor_and_ohlc(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row_at(H + timedelta(minutes=i), o=100 + i, h=100 + i + 0.5,
                     l=100 + i - 0.5, c=100 + i + 0.2) for i in range(90)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
                               until=H + timedelta(minutes=90))
     assert len(df) == 1 and df.index[0].to_pydatetime() == H
@@ -94,7 +94,7 @@ def test_partial_tail_bucket_dropped_lookahead_guard(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
             for i in range(120)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
                               until=H + timedelta(minutes=61))
     assert len(df) == 1
@@ -105,7 +105,7 @@ def test_since_returns_only_buckets_starting_at_or_after_since(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row_at(H + timedelta(minutes=i), o=100 + i, h=100 + i + 0.5,
                     l=100 + i - 0.5, c=100 + i) for i in range(120)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
                               since=H + timedelta(minutes=30),
                               until=H + timedelta(minutes=120))
@@ -116,7 +116,7 @@ def test_max_bars_limits_result_and_sql_window(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
             for i in range(300)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     # codex R3 M2: SQL 側の読み出し下限も観測する (tail() で誤魔化せないよう
     # set_trace_callback で発行 SQL を記録し、bar_time >= のパラメータが
     # until - max_bars*tf*2 に一致することを assert する)
@@ -152,7 +152,7 @@ def test_max_bars_window_lower_is_bucket_aligned_no_partial_head(tmp_path):
         _row_at(H + timedelta(minutes=115), o=200, h=200.5, l=199.5, c=200),
         _row_at(H + timedelta(minutes=245), o=300, h=300.5, l=299.5, c=300),
     ]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
                               until=H + timedelta(hours=5, minutes=30),
                               max_bars=2)
@@ -182,7 +182,7 @@ def test_max_bars_completeness_cut_precedes_tail_not_after(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
             for i in range(330)]  # H 〜 H+5h30m、密な 1m データ
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
                               until=H + timedelta(hours=5, minutes=30),
                               max_bars=2)
@@ -195,7 +195,7 @@ def test_intra_bucket_gap_aggregates_present_bars(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
             for i in range(60) if i != 30]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
                               until=H + timedelta(minutes=60))
     assert len(df) == 1 and df.iloc[0]["volume"] == 59 * 10.0
@@ -207,7 +207,7 @@ def test_1m_is_passthrough_not_resampled(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row_at(H + timedelta(minutes=i), o=100 + i, h=100.5 + i,
                     l=99.5 + i, c=100 + i) for i in range(3)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1m", source="dukascopy",
                               until=H + timedelta(minutes=3))
     assert len(df) == 3
@@ -219,7 +219,7 @@ def test_1m_partial_tail_minute_dropped(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
             for i in range(3)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1m", source="dukascopy",
                               until=H + timedelta(minutes=2, seconds=30))
     assert len(df) == 2  # 3 本目 (H+2m) は終端 H+3m > until で未確定
@@ -273,8 +273,8 @@ def test_source_is_filtered(tmp_path):
     conn = _conn(tmp_path)
     rows = [_row_at(H + timedelta(minutes=i), o=100, h=100.5, l=99.5, c=100)
             for i in range(60)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
-    ohlcv.upsert_bars(
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
+    ohlcv.upsert_cache_bars(
         conn,
         [Bar("USDJPY", "1m", H + timedelta(minutes=i), 200, 200.5, 199.5, 200,
              10.0) for i in range(60)],
@@ -292,9 +292,61 @@ def test_1d_bucket_anchored_at_utc_midnight(tmp_path):
     rows = [_row_at(day, o=100, h=101, l=99, c=100.5),
             _row_at(day + timedelta(hours=23, minutes=59),
                     o=102, h=103, l=101, c=102.5)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1d", source="dukascopy",
                               until=day + timedelta(days=1))
     assert len(df) == 1 and df.index[0].to_pydatetime() == day
     assert df.iloc[0]["open"] == 100 and df.iloc[0]["close"] == 102.5
     assert df.iloc[0]["high"] == 103 and df.iloc[0]["low"] == 99
+
+
+# --- source からのテーブル導出 (プラン 9 Task 16 欠陥 #6 の修正) ---------
+# load_resampled_frame は backtest 専用ではなく、本番の signal_producer
+# (source = settings.plugin.producer_source = "yfinance" 既定) からも呼ば
+# れる共有リーダ。テーブルを `FROM ohlcv_history` に固定すると、ライブ経路
+# は空の履歴テーブルを読み、signal が永久に出ない (fail-open で WARNING が
+# 出るだけ) 状態になる。読むテーブルは source から導出する。
+
+def test_live_source_reads_the_cache_table(tmp_path):
+    """ライブ source (LIVE_SOURCES) はキャッシュテーブルを読む。"""
+    conn = _conn(tmp_path)
+    bars = [Bar("USDJPY", "1m", H + timedelta(minutes=i),
+                100.0, 101.0, 99.0, 100.5, 10.0) for i in range(60)]
+    ohlcv.upsert_cache_bars(conn, bars, source="yfinance")
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="yfinance",
+                              until=H + timedelta(minutes=60))
+    assert len(df) == 1
+    assert df.index[0].to_pydatetime() == H
+
+
+def test_history_source_does_not_read_cache_rows(tmp_path):
+    """履歴 source は、同じ symbol/interval のキャッシュ行を読まない
+    (テーブル導出が「どちらか一方」であることの観測点 — 両方 UNION する
+    実装なら本テストが落ちる)。"""
+    conn = _conn(tmp_path)
+    bars = [Bar("USDJPY", "1m", H + timedelta(minutes=i),
+                100.0, 101.0, 99.0, 100.5, 10.0) for i in range(60)]
+    ohlcv.upsert_cache_bars(conn, bars, source="yfinance")
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                              until=H + timedelta(minutes=60))
+    assert df.empty
+
+
+def test_live_source_does_not_read_history_rows(tmp_path):
+    """逆向き — ライブ source は履歴行を読まない。"""
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=i), o=100, h=101, l=99, c=100.5)
+            for i in range(60)]
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
+    df = load_resampled_frame(conn, "USDJPY", "1h", source="yfinance",
+                              until=H + timedelta(minutes=60))
+    assert df.empty
+
+
+def test_unknown_source_is_rejected(tmp_path):
+    """どちらの allowlist にも属さない source は fail closed。
+    (テーブル既定値へ暗黙に落ちる実装なら本テストが落ちる)"""
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError, match="KNOWN_OHLCV_SOURCES"):
+        load_resampled_frame(conn, "USDJPY", "1h", source="yfinace",
+                             until=H + timedelta(minutes=60))

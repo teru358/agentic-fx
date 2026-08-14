@@ -65,7 +65,7 @@ def test_replay_clock_accepts_utc9_datetime():
 def test_bar_feed_returns_none_for_gap(tmp_path):
     """BarFeed.bar_at returns None for missing bars (no look-back)."""
     conn = _conn(tmp_path)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(H + timedelta(minutes=2), o=148.1, h=148.3, l=148.0, c=148.2)],
@@ -79,7 +79,7 @@ def test_bar_feed_returns_none_for_gap(tmp_path):
 def test_bar_feed_respects_start_boundary(tmp_path):
     """BarFeed.bar_at returns None for bars before start."""
     conn = _conn(tmp_path)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H - timedelta(minutes=2), o=147.0, h=147.2, l=146.9, c=147.1),
          _row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
@@ -92,7 +92,7 @@ def test_bar_feed_respects_start_boundary(tmp_path):
 def test_bar_feed_respects_end_boundary(tmp_path):
     """BarFeed.bar_at returns None for bars after end."""
     conn = _conn(tmp_path)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(H + timedelta(minutes=10), o=148.1, h=148.3, l=148.0, c=148.2)],
@@ -106,7 +106,7 @@ def test_bar_feed_bar_at_end_boundary_included(tmp_path):
     """BarFeed should include bars exactly at the end boundary."""
     conn = _conn(tmp_path)
     end_time = H + timedelta(minutes=5)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(end_time, o=148.1, h=148.3, l=148.0, c=148.2)],
@@ -119,11 +119,11 @@ def test_bar_feed_filters_by_source(tmp_path):
     """BarFeed must filter by source (catch source parameter mutations)."""
     conn = _conn(tmp_path)
     # Import same bar_time under two different sources
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
         source="dukascopy")
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=149.0, h=149.2, l=148.9, c=149.1)],
         source="mt5")
@@ -136,7 +136,7 @@ def test_bar_feed_filters_by_source(tmp_path):
 def test_bar_feed_latest_completed_1m_returns_previous_bar(tmp_path):
     """BarFeed.latest_completed_1m(ts) returns bar at ts-1m (completed bar)."""
     conn = _conn(tmp_path)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(H + timedelta(minutes=1), o=148.1, h=148.3, l=148.0, c=148.2)],
@@ -151,7 +151,7 @@ def test_bar_feed_latest_completed_1m_returns_previous_bar(tmp_path):
 def test_bar_feed_latest_completed_1m_gap_returns_none(tmp_path):
     """BarFeed.latest_completed_1m returns None if previous bar missing (gap)."""
     conn = _conn(tmp_path)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(H + timedelta(minutes=2), o=148.1, h=148.3, l=148.0, c=148.2)],
@@ -164,7 +164,7 @@ def test_bar_feed_latest_completed_1m_gap_returns_none(tmp_path):
 def test_bar_feed_latest_completed_1m_before_start_returns_none(tmp_path):
     """BarFeed.latest_completed_1m(H) returns None (no bar at H-1m)."""
     conn = _conn(tmp_path)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
         source="dukascopy")
@@ -195,7 +195,7 @@ def test_bar_feed_accepts_non_utc_start_and_normalizes(tmp_path):
     utc9 = timezone(timedelta(hours=9))
     # 21:00:00+09:00 = 12:00:00 UTC
     start_utc9 = datetime(2026, 7, 22, 21, 0, tzinfo=utc9)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
         source="dukascopy")
@@ -210,7 +210,7 @@ def test_bar_feed_accepts_non_utc_end_and_normalizes(tmp_path):
     utc9 = timezone(timedelta(hours=9))
     # 21:05:00+09:00 = 12:05:00 UTC
     end_utc9 = datetime(2026, 7, 22, 21, 5, tzinfo=utc9)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(H + timedelta(minutes=5), o=148.1, h=148.3, l=148.0, c=148.2)],
@@ -231,7 +231,7 @@ def test_bar_feed_rejects_start_greater_than_end(tmp_path):
 def test_bar_feed_bar_at_rejects_naive_ts(tmp_path):
     """BarFeed.bar_at rejects naive datetime."""
     conn = _conn(tmp_path)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
         source="dukascopy")
@@ -244,7 +244,7 @@ def test_bar_feed_bar_at_rejects_naive_ts(tmp_path):
 def test_bar_feed_bar_at_accepts_non_utc_aware_and_normalizes(tmp_path):
     """BarFeed.bar_at accepts non-UTC aware datetime and normalizes (F5)."""
     conn = _conn(tmp_path)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
         source="dukascopy")
@@ -260,7 +260,7 @@ def test_bar_feed_bar_at_accepts_non_utc_aware_and_normalizes(tmp_path):
 def test_bar_feed_spread_at_returns_none_for_gap(tmp_path):
     """BarFeed.spread_at returns None for missing bars."""
     conn = _conn(tmp_path)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1, spread=0.02),
          _row_at(H + timedelta(minutes=2), o=148.1, h=148.3, l=148.0, c=148.2, spread=0.03)],
@@ -274,7 +274,7 @@ def test_bar_feed_spread_at_uses_actual_value(tmp_path):
     """BarFeed.spread_at must read actual spread, not hardcoded value."""
     conn = _conn(tmp_path)
     # Use non-default spread value to catch hardcoded mutations
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1, spread=0.03)],
         source="dukascopy")
@@ -285,7 +285,7 @@ def test_bar_feed_spread_at_uses_actual_value(tmp_path):
 def test_bar_feed_spread_at_rejects_naive_ts(tmp_path):
     """BarFeed.spread_at rejects naive datetime (F3)."""
     conn = _conn(tmp_path)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1, spread=0.02)],
         source="dukascopy")
@@ -298,7 +298,7 @@ def test_bar_feed_spread_at_rejects_naive_ts(tmp_path):
 def test_bar_feed_spread_at_accepts_non_utc_ts_and_normalizes(tmp_path):
     """BarFeed.spread_at accepts non-UTC aware datetime and normalizes (F5)."""
     conn = _conn(tmp_path)
-    ohlcv.import_bars(
+    ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1, spread=0.02)],
         source="dukascopy")

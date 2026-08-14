@@ -293,3 +293,13 @@ def test_watch_symbols_capped_by_max():
     """選定基準⑤: 上限は設定バリデータで機械的に強制 (レビュー裁定)。"""
     with pytest.raises(ValidationError):
         _settings_with(watch_symbols=[f"SYM{i}" for i in range(11)])  # 11 > 10
+
+
+def test_cache_retention_days_defaults_to_30():
+    s = load_settings(EXAMPLE)
+    assert s.datafeed.cache_retention_days == 30
+
+
+def test_cache_retention_days_must_be_positive(tmp_path):
+    with pytest.raises(ConfigError, match="cache_retention_days"):
+        load_settings(_with_datafeed(tmp_path, cache_retention_days=0))

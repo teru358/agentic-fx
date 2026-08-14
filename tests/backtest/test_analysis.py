@@ -70,7 +70,7 @@ def _series(conn, symbol, values, *, start, timeframe="1h"):
     rows = [(symbol, "1m", (start + i * step).isoformat(),
              v, v + 0.05, v - 0.05, v, 1.0, 0.01)
             for i, v in enumerate(values)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
 
 
 def _sine(n, *, phase=0):
@@ -87,7 +87,7 @@ def _seed_two_series(conn, *, start=H):
 def test_corr_matrix_inner_join_and_gap_exclusion(tmp_path):
     conn = _conn(tmp_path); _seed_two_series(conn)
     # USDJPY 側の 1 バーを欠損させても inner join で落ちるだけで計算は通る
-    conn.execute("DELETE FROM ohlcv WHERE symbol='USDJPY' AND bar_time=?",
+    conn.execute("DELETE FROM ohlcv_history WHERE symbol='USDJPY' AND bar_time=?",
                  ((H + timedelta(hours=7)).isoformat(),)); conn.commit()
     m = corr_matrix(conn, ["USDJPY", "EURUSD"], timeframe="1h",
                     source="dukascopy", in_sample_until=FAR_FUTURE)
@@ -245,7 +245,7 @@ def test_agent_handles_non_positive_close_without_raising(tmp_path):
     rows = [("USDJPY", "1m", (BEFORE_BOUNDARY + i * timedelta(hours=1))
              .isoformat(), v, v + 0.05, v - 0.05, v, 1.0, 0.01)
             for i, v in enumerate(values)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     _series(conn, "EURUSD", _sine(5, phase=1), start=BEFORE_BOUNDARY)
     out = analyze_for_agent(conn, _settings_watch_eurusd(),
                             {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD",
@@ -265,7 +265,7 @@ def test_load_returns_excludes_non_positive_close_pairs(tmp_path):
     rows = [("USDJPY", "1m", (BEFORE_BOUNDARY + i * timedelta(hours=1))
              .isoformat(), v, v + 0.05, v - 0.05, v, 1.0, 0.01)
             for i, v in enumerate(values)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     returns = _load_returns(conn, "USDJPY", "1h", source="dukascopy",
                             in_sample_until=FAR_FUTURE)  # ここで例外なし
     # 2 本目 (close=100.0, prev=close=0.0) は正値ガードにより除外されな
@@ -303,7 +303,7 @@ def test_coverage_report_allows_1m(tmp_path):
     rows = [("USDJPY", "1m", (H + timedelta(minutes=i)).isoformat(),
              v, v + 0.05, v - 0.05, v, 1.0, 0.01)
             for i, v in enumerate(values)]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     rep = coverage_report(conn, "USDJPY", timeframe="1m", source="dukascopy",
                           start=H, end=H + timedelta(minutes=60))
     # H は水曜 12:00 UTC (全てオープン時間) なので、1 分刻みのステップが
@@ -337,7 +337,7 @@ def test_coverage_report_epoch_anchor_matches_actual_for_offgrid_bounds(
     rows = [("USDJPY", "1m", (H + timedelta(minutes=i)).isoformat(),
              100.0 + i, 100.5 + i, 99.5 + i, 100.0 + i, 1.0, 0.01)
             for i in range(150)]  # H 〜 H+2h30分、密な 1m データ (欠損なし)
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     rep = coverage_report(conn, "USDJPY", timeframe="1h", source="dukascopy",
                           start=start, end=end)
     assert rep["expected_open_bars"] == 1
@@ -503,7 +503,7 @@ def test_load_returns_excludes_gap_crossing_return(tmp_path):
     start = H
     _series(conn, "USDJPY", _sine(10), start=start)
     gap_time = start + timedelta(hours=4)
-    conn.execute("DELETE FROM ohlcv WHERE symbol='USDJPY' AND bar_time=?",
+    conn.execute("DELETE FROM ohlcv_history WHERE symbol='USDJPY' AND bar_time=?",
                  (gap_time.isoformat(),))
     conn.commit()
     returns = _load_returns(conn, "USDJPY", "1h", source="dukascopy",
@@ -560,7 +560,7 @@ def test_load_returns_uses_bucket_last_close_not_first_1m_row(tmp_path):
         ("USDJPY", "1m", (H + timedelta(minutes=90)).isoformat(),
          210, 222.5, 199.5, 222, 1.0, 0.01),
     ]
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
     returns = _load_returns(conn, "USDJPY", "1h", source="dukascopy",
                             in_sample_until=H + timedelta(hours=2))
     # 正: [H,H+1h) の close はバケット最終行 (H+30分, close=110)、

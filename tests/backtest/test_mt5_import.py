@@ -27,7 +27,7 @@ def test_import_mt5_pages_daily_and_imports(tmp_path):
     r = import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
                    base_url="http://x", fetch=fetch)
     assert r.inserted >= 1
-    bars = ohlcv.load_bars(conn, "USDJPY", "1m", source="mt5")
+    bars = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
     assert bars and bars[0].close == 148.1
     # 上書き §5: 2 日指定で fetch は 1 日窓 x 2 回呼ばれる
     assert len(calls) == 2
@@ -37,7 +37,7 @@ def test_import_mt5_pages_daily_and_imports(tmp_path):
     # 既知値を装うと「spread 不明」と「spread ゼロ」の区別が消え、バックテスト
     # のコストモデルが無料取引を読み込む実害になる。Task 4 の source パラメータ
     # 変異と同種の無音故障源)。
-    assert ohlcv.load_spread(conn, "USDJPY", "1m", H.isoformat(),
+    assert ohlcv.load_history_spread(conn, "USDJPY", "1m", H.isoformat(),
                              source="mt5") is None
 
 
@@ -61,7 +61,7 @@ def test_import_mt5_uses_default_fetch_when_none(monkeypatch, tmp_path):
     r = import_mt5(conn, "USDJPY", H, H + timedelta(days=1),
                    base_url="http://x", fetch=None)
     assert r.inserted == 1
-    bars = ohlcv.load_bars(conn, "USDJPY", "1m", source="mt5")
+    bars = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
     assert bars and bars[0].close == 148.1
 
 
@@ -110,7 +110,7 @@ def test_import_mt5_rejects_bar_time_outside_requested_window(tmp_path):
     with pytest.raises(ValueError, match="USDJPY"):
         import_mt5(conn, "USDJPY", H, window_end,
                    base_url="http://x", fetch=fetch)
-    assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_history").fetchone()[0] == 0
 
 
 def test_import_mt5_rejects_bar_time_before_window_start(tmp_path):
@@ -127,7 +127,7 @@ def test_import_mt5_rejects_bar_time_before_window_start(tmp_path):
     with pytest.raises(ValueError, match="USDJPY"):
         import_mt5(conn, "USDJPY", H, window_end,
                    base_url="http://x", fetch=fetch)
-    assert conn.execute("SELECT COUNT(*) FROM ohlcv").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_history").fetchone()[0] == 0
 
 
 def test_import_mt5_drops_inclusive_right_edge_bar_without_error(tmp_path):
@@ -153,7 +153,7 @@ def test_import_mt5_drops_inclusive_right_edge_bar_without_error(tmp_path):
                    base_url="http://x", fetch=fetch)
 
     assert r.inserted == 1                       # 窓内の 1 本だけ入る
-    bars = ohlcv.load_bars(conn, "USDJPY", "1m", source="mt5")
+    bars = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
     assert [b.ts for b in bars] == [H]           # 終端の 1 本は入っていない
 
 
@@ -179,7 +179,7 @@ def test_import_mt5_right_edge_bar_is_picked_up_by_the_next_window(tmp_path):
     import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
                base_url="http://x", fetch=fetch)
 
-    bars = ohlcv.load_bars(conn, "USDJPY", "1m", source="mt5")
+    bars = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
     # 窓 1 の右端 (= boundary) は窓 2 の左端として入る。最終窓の右端だけが
     # 落ちる — end は exclusive なので正しい
     assert [b.ts for b in bars] == [H, boundary]
@@ -241,7 +241,7 @@ def test_import_mt5_normalizes_naive_bar_time_for_join(tmp_path):
 
     import_mt5(conn, "USDJPY", H, H + timedelta(days=1),
               base_url="http://x", fetch=fetch)
-    ohlcv.import_bars(conn, [("USDJPY", "1m", H.isoformat(),
+    ohlcv.import_history_bars(conn, [("USDJPY", "1m", H.isoformat(),
                               148.005, 148.2, 147.9, 148.105, 5, 0.01)],
                       source="dukascopy")
     rep = compare_sources(conn, "USDJPY", SETTINGS)
@@ -250,10 +250,10 @@ def test_import_mt5_normalizes_naive_bar_time_for_join(tmp_path):
 
 def test_compare_sources_reports_distribution(tmp_path):
     conn = _conn(tmp_path)
-    ohlcv.import_bars(conn, [("USDJPY", "1m", H.isoformat(),
+    ohlcv.import_history_bars(conn, [("USDJPY", "1m", H.isoformat(),
                               148.005, 148.2, 147.9, 148.105, 5, 0.01)],
                       source="dukascopy")
-    ohlcv.import_bars(conn, [("USDJPY", "1m", H.isoformat(),
+    ohlcv.import_history_bars(conn, [("USDJPY", "1m", H.isoformat(),
                               148.0, 148.2, 147.9, 148.10, 5, None)],
                       source="mt5")
     rep = compare_sources(conn, "USDJPY", SETTINGS)
@@ -269,7 +269,7 @@ def test_compare_sources_reports_distribution(tmp_path):
 
 def test_compare_sources_empty_overlap_returns_none_fields(tmp_path):
     conn = _conn(tmp_path)
-    ohlcv.import_bars(conn, [("USDJPY", "1m", H.isoformat(),
+    ohlcv.import_history_bars(conn, [("USDJPY", "1m", H.isoformat(),
                               148.005, 148.2, 147.9, 148.105, 5, 0.01)],
                       source="dukascopy")
     rep = compare_sources(conn, "USDJPY", SETTINGS)

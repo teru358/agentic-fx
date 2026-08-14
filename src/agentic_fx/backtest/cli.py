@@ -32,7 +32,7 @@ from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin import strategy_adapter
 from agentic_fx.service import ensure_initialized
-from agentic_fx.store import backtest_runs
+from agentic_fx.store import backtest_runs, ohlcv
 from agentic_fx.store.db import connect, init_db
 
 # analyze corr で --to 未指定時の in_sample_until (aware far-future 定数 —
@@ -71,7 +71,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     cov = history_sub.add_parser("coverage", help="カバレッジレポート")
     cov.add_argument("--symbol", required=True)
     cov.add_argument("--timeframe", required=True)
-    cov.add_argument("--source", required=True)
+    cov.add_argument("--source", required=True, choices=sorted(ohlcv.IMPORT_SOURCES))
     cov.add_argument("--from", dest="from_", type=_parse_date, required=True)
     cov.add_argument("--to", dest="to", type=_parse_date, required=True)
 
@@ -81,7 +81,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     run = backtest_sub.add_parser(
         "run", help="人間用バックテスト実行 (自由期間・scope=human_custom)")
     run.add_argument("--symbol", required=True)
-    run.add_argument("--source", required=True)
+    run.add_argument("--source", required=True, choices=sorted(ohlcv.IMPORT_SOURCES))
     run.add_argument("--from", dest="from_", type=_parse_date, required=True)
     run.add_argument("--to", dest="to", type=_parse_date, required=True)
     # opus R2 M6: --proposal-file (既存の JSONL 提案列経路) と --plugin
@@ -101,7 +101,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     corr.add_argument("--a", required=True)
     corr.add_argument("--b", required=True)
     corr.add_argument("--timeframe", required=True)
-    corr.add_argument("--source", required=True)
+    corr.add_argument("--source", required=True, choices=sorted(ohlcv.IMPORT_SOURCES))
     corr.add_argument("--from", dest="from_", type=_parse_date, default=None)
     corr.add_argument("--to", dest="to", type=_parse_date, default=None)
 
@@ -250,7 +250,7 @@ def _empty_history_guard(conn, args: argparse.Namespace) -> bool:
     ここで診断メッセージを出す。
     """
     n_bars = conn.execute(
-        "SELECT COUNT(*) FROM ohlcv WHERE symbol=? AND interval='1m' "
+        "SELECT COUNT(*) FROM ohlcv_history WHERE symbol=? AND interval='1m' "
         "AND source=? AND bar_time >= ? AND bar_time < ?",
         (args.symbol, args.source, args.from_.isoformat(),
          args.to.isoformat())).fetchone()[0]

@@ -6,13 +6,14 @@ import math
 import os
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from agentic_fx._safe_error import safe_error_text as _safe_error_text
 from agentic_fx.config import Settings
 from agentic_fx.core.contracts import (
     Bar, Clock, ConversionRate, InstrumentSpec, Quote,
 )
+from agentic_fx.datafeed import cache_window
 from agentic_fx.datafeed import sources
 from agentic_fx.datafeed.bars import bars_to_df, df_to_bars, pandas_rule, resample
 from agentic_fx.datafeed.health import (
@@ -30,15 +31,18 @@ _log = logging.getLogger("agentic_fx.price")
 # (symbol, interval, bar_time) で由来を区別できないため、混ざると時間的に重複した
 # 2 つの格子が 1 本の系列として返り、validate_bars も「足が多すぎる」方向は見ない。
 # 常に細かい足から導出し、システム内の格子を 1 つに保つ。
-DERIVE_ONLY_INTERVALS = frozenset({"4h", "1d"})
+# 定義元は datafeed/cache_window.py (Task 8/10)。ここでは re-export のみ —
+# 本ファイル内の DERIVE_ONLY_INTERVALS という裸名参照 (複数箇所) を変えずに
+# 定義元を一本化するため。
+DERIVE_ONLY_INTERVALS = cache_window.DERIVE_ONLY_INTERVALS
 
 # F1 (fix round 1, codex Critical): 永続化用 source ID とチェーン表示名の
 # マッピング。live MT5 は ohlcv に "mt5-live" として保存する
 # (spec §6: live="mt5-live" / 一括インポータ="mt5" — 混在させると、Task 5 の
-# 一括履歴インポート (既存行不変・import_bars) を Phase 3 の live 上書き
-# (upsert_bars) が破壊する PK 衝突になる)。`_chain`/`last_bars_source`/
+# 一括履歴インポート (既存行不変・import_history_bars) を Phase 3 の live 上書き
+# (upsert_cache_bars) が破壊する PK 衝突になる)。`_chain`/`last_bars_source`/
 # `bars_origin` はチェーンの表示名 ("mt5") をそのまま使い続ける — 変えるのは
-# 永続化境界 (upsert_bars/load_bars の source 引数) だけ。
+# 永続化境界 (upsert_cache_bars/load_cache_bars の source 引数) だけ。
 _STORAGE_SOURCE = {"mt5": "mt5-live"}
 
 
@@ -71,7 +75,7 @@ class PriceProvider:
         self.clock = clock
         # CR-4 (裁定書 F-5): 子プロセス (mission_worker.py) は conn に
         # db.connect_readonly (mode=ro) を渡す。get_bars/_derive の
-        # cache 書込 (ohlcv.upsert_bars) は RO 接続下で
+        # cache 書込 (ohlcv.upsert_cache_bars) は RO 接続下で
         # sqlite3.OperationalError になるため、readonly=True のときは
         # 書込呼び出し自体をスキップする (RPC 経由の親委譲はしない —
         # RPC 面を拡大しない設計裁定)。
@@ -160,7 +164,7 @@ class PriceProvider:
                     # が上書きし合い、source 列が嘘になる — レビュー裁定 codex I7)。
                     # 永続化用 ID への変換は _storage_source (F1)。
                     if not self.readonly:
-                        ohlcv.upsert_bars(self.conn, bars,
+                        ohlcv.upsert_cache_bars(self.conn, bars,
                                           source=_storage_source(name))
                 else:
                     base = self._finest_native_base(name, interval)
@@ -179,7 +183,7 @@ class PriceProvider:
                 _log.warning("bars source %s failed for %s: %s", name, pair, text)
                 errors.append(f"{name}: {text}")
 
-        got = self._cached_bars(pair, interval, now, errors)
+        got = self._cached_bars(pair, interval, now, errors, lookback_days)
         if got is not None:
             bars, origin = got
             _log.warning("using cached bars for %s %s (%s)", pair, interval,
@@ -190,32 +194,21 @@ class PriceProvider:
         raise DataUnhealthy(f"all bar sources failed for {pair}: {errors}")
 
     def _cached_bars(self, pair: str, interval: str, now: datetime,
-                     errors: list[str]) -> tuple[list[Bar], str] | None:
+                     errors: list[str], lookback_days: int
+                     ) -> tuple[list[Bar], str] | None:
         """キャッシュから interval の足を作る。健全性検証を通らなければ None。
 
-        **要求された足そのもの → より細かい base 足、の順に試す**。
-        導出足は保存しない設計 (DERIVE_ONLY_INTERVALS のコメント参照) なので、
-        導出で得ていた足 (30m 等) はキャッシュにも存在しない。base へ流れないと
-        「ソース健在時は導出で返るのに、全滅時だけ落ちる」ことになる。
+        窓 (spec ③ §3.1): source ごとに `cache_window.live_window_days` で
+        取得日数を求め、`window_start = now - N日` を直読候補 (floor しない)、
+        `floor_to_interval(window_start, interval)` を導出候補 (要求
+        interval の境界へ floor) に使う。窓計算はキャッシュの中身を見ない
+        (DB 非依存) ので「キャッシュ側の base に依存しない」性質が構造的に
+        保たれる。
 
-        候補から DERIVE_ONLY_INTERVALS を除くのは `_base_candidates` と同じ規則。
-        **要求された足そのものにも適用する** — 4h/1d の行は本来存在しないが、
-        本修正より前のバイナリが書いた残骸があり得る。それはブローカー格子の
-        足なので、読むと I-2 で塞いだ「格子の混在」が静かに戻る。
-
-        source 列は「どの source が書いたか」を区別する PK の一部になった
-        (ohlcv v2)。ここは「どの source が書いたか」を知らないサイトなので、
-        **`_chain` が返す live source 名を優先順に 1 つずつ試し**、各名で単一
-        source の `load_bars(..., source=...)` を読む (永続化 ID への変換は
-        `_storage_source`、F1) — 複数 source の行を 1 回のクエリで混ぜて
-        返さない (上書き 1)。Phase 1 の実態は yfinance のみなので挙動は不変。
-
-        **F6 (fix round 1, codex I4 + sonnet Important-3): ループ順は
-        source を外側・interval 候補を内側**にする (優先順位 MT5→TD→
-        yfinance を維持したまま)。interval を外側にすると、優先度の低い
-        source の「要求された足そのもの」が、優先度の高い source の
-        「より粗い base 足からの導出」より先に採用されてしまい、
-        ソース優先順位が崩れる。
+        **窓計算は source 単位の try の中に置く** — `finest_native_base` は
+        提供も導出もできない source に対して DataUnhealthy を送出する。
+        ここを try の外に置くと、先順位 source が導出不能というだけで
+        後順位 source の健全なキャッシュへ進めなくなる (spec ③ テスト 16)。
         """
         d = self.settings.datafeed
         candidates = [i for i in [interval, *self._base_candidates(interval)]
@@ -224,9 +217,20 @@ class PriceProvider:
                         self._chain(pair, kind="bars", interval=interval)]
         for name in live_sources:
             storage_name = _storage_source(name)
+            try:
+                window_days = cache_window.live_window_days(
+                    name, interval, lookback_days)
+                window_start = now - timedelta(days=window_days)
+                derive_since = cache_window.floor_to_interval(
+                    window_start, interval)
+            except Exception as e:  # noqa: BLE001 — 次 source へ (テスト16)
+                errors.append(f"{name}: {_safe_error_text(e)}")
+                continue
             for src in candidates:
-                cached = ohlcv.load_bars(self.conn, pair, src,
-                                         source=storage_name)
+                since = window_start if src == interval else derive_since
+                cached = ohlcv.load_cache_bars(self.conn, pair, src,
+                                               source=storage_name,
+                                               since=since)
                 if not cached:
                     continue
                 label = ("cache" if src == interval else f"cache({src})")
@@ -283,32 +287,15 @@ class PriceProvider:
         raise ValueError(f"unknown source: {source}")
 
     def _base_candidates(self, interval: str) -> list[str]:
-        """interval を導出できる base 足を、粗い順に返す (ソース非依存)。
-
-        粗いほど取得本数が少なく API 負荷が低い。interval_min の約数で
-        なければ境界が合わないため候補から外す (例: 4h を 15m から作るのは
-        可、90m からは不可)。**DERIVE_ONLY_INTERVALS は base にしない** —
-        1d を「ネイティブ 4h から導出」にすると、ブローカー格子が裏口から
-        入ってくる (1d は 1h から導出されること)。
-        """
-        want = sources.INTERVAL_MIN[interval]
-        cands = [i for i, m in sources.INTERVAL_MIN.items()
-                 if i not in DERIVE_ONLY_INTERVALS and m < want
-                 and want % m == 0]
-        return sorted(cands, key=lambda i: sources.INTERVAL_MIN[i],
-                      reverse=True)
+        """interval を導出できる base 足を、粗い順に返す。
+        実装は cache_window.base_candidates に委譲する (Task 10 — Task 8 が
+        一時的に重複させていたロジックの定義元を一本化)。"""
+        return cache_window.base_candidates(interval)
 
     def _finest_native_base(self, source: str, interval: str) -> str:
         """interval を導出できる、最も粗いネイティブ足を選ぶ。
-
-        (関数名は `_finest` だが実際に選ぶのは「最も粗い」足。ブリーフの
-        逐語コード由来の命名で、挙動は docstring のとおり。)
-        """
-        native = sources.NATIVE_INTERVALS[source]
-        for base in self._base_candidates(interval):
-            if base in native:
-                return base
-        raise DataUnhealthy(f"{source} cannot provide or derive {interval}")
+        実装は cache_window.finest_native_base に委譲する (Task 10)。"""
+        return cache_window.finest_native_base(source, interval)
 
     def _derive(self, pair: str, source: str, base: str, interval: str,
                 lookback_days: int) -> list[Bar]:
@@ -339,7 +326,7 @@ class PriceProvider:
                       self.settings.datafeed.freshness_max_min,
                       sources.INTERVAL_MIN[base])
         if not self.readonly:
-            ohlcv.upsert_bars(self.conn, raw, source=_storage_source(source))
+            ohlcv.upsert_cache_bars(self.conn, raw, source=_storage_source(source))
         return self._resample(raw, pair, interval)
 
     def _resample(self, base_bars: list[Bar], pair: str,

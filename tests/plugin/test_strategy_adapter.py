@@ -45,7 +45,7 @@ def _seed_flat(conn, start, minutes: int, *, price: float = 100.0,
                source: str = "dukascopy") -> None:
     rows = [_row_at(start + timedelta(minutes=i), o=price, h=price, l=price,
                     c=price) for i in range(minutes)]
-    ohlcv_store.import_bars(conn, rows, source=source)
+    ohlcv_store.import_history_bars(conn, rows, source=source)
 
 
 _HOLD_RESULT = {"action": "hold", "rationale": "no-op", "direction": None,
@@ -436,7 +436,7 @@ def test_integration_plugin_5h_replay_reaches_orders_with_single_session(
             _row_at(H + timedelta(hours=hour, minutes=m), o=price, h=price,
                    l=price, c=price)
             for m in range(60))
-    ohlcv_store.import_bars(hist_conn, rows, source="dukascopy")
+    ohlcv_store.import_history_bars(hist_conn, rows, source="dukascopy")
 
     plugin_dir = tmp_path / "plugin_src" / "cross_with_tp"
     _write_cross_with_tp_plugin(plugin_dir)

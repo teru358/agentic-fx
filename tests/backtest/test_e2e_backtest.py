@@ -1,7 +1,7 @@
-"""通し E2E — import_bars → run_in_sample → in_sample_view (プラン 6 Task 12)。
+"""通し E2E — import_history_bars → run_in_sample → in_sample_view (プラン 6 Task 12)。
 
 Task 0〜11 の成果を実際の呼び出し経路で通す唯一のテスト:
-- ohlcv.import_bars で合成 1 週間 (月曜〜金曜、約 7,200 本の 1m) を投入
+- ohlcv.import_history_bars で合成 1 週間 (月曜〜金曜、約 7,200 本の 1m) を投入
 - run_in_sample (内部で run_replay + compute_metrics +
   backtest_runs.save_harness_run(scope="in_sample")) を 1 回呼ぶ
 - in_sample_view(conn) で保存された行を読み、遮断 1 (期間端点の非露出) を
@@ -97,7 +97,7 @@ def _seed_week(conn):
 
     rows = [rows_by_ts[ts] for ts in sorted(rows_by_ts)]
     assert len(rows) == 7_200          # 5 日 x 1,440 分 (上書き節 B — 約 7,000 本)
-    ohlcv.import_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
 
 
 def _make_source():

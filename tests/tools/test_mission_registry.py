@@ -95,7 +95,7 @@ def test_build_mission_registry_econ_calendar_does_not_touch_activity(tmp_path):
 
 def test_build_mission_registry_readonly_skips_bar_cache_write(tmp_path):
     """CR-4 対応: `readonly=True` で構築した registry の `get_ohlcv` は
-    RO 接続 (`connect_readonly`) の下でも `ohlcv.upsert_bars` の書込を
+    RO 接続 (`connect_readonly`) の下でも `ohlcv.upsert_cache_bars` の書込を
     スキップして成功する — 子プロセス (`connect_readonly` で開いた conn)
     が `get_ohlcv` を呼んでも `sqlite3.OperationalError: attempt to write
     a readonly database` にならないことの配線ピン。"""
@@ -137,7 +137,7 @@ def test_build_mission_registry_readonly_skips_bar_cache_write(tmp_path):
     assert isinstance(parsed, list) and len(parsed) == 30, result
     # 念のため RW 接続からも cache が空のままであることを確認する
     # (write skip の直接証跡)。
-    assert ohlcv.load_bars(rw_conn, "USDJPY", "1m", source="yfinance") == []
+    assert ohlcv.load_cache_bars(rw_conn, "USDJPY", "1m", source="yfinance") == []
 
 
 def test_build_mission_registry_provider_and_readonly_guard(tmp_path):

@@ -43,7 +43,7 @@ def _seed_history(hist):
         _row_at(H - timedelta(days=199), o=100.2, h=100.6, l=99.8, c=100.3),
         _row_at(H, o=100.3, h=100.7, l=99.9, c=100.4),
     ]
-    ohlcv.import_bars(hist, rows, source="dukascopy")
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
 
 def _make_fake_replay(calls):
@@ -185,7 +185,7 @@ def test_run_in_sample_empty_period_rejected(tmp_path, monkeypatch):
     now = WED + timedelta(days=120)
     boundary = holdout_boundary(now, SETTINGS.backtest.holdout_months)
     rows = [_row_at(boundary, o=100.0, h=100.5, l=99.5, c=100.2)]
-    ohlcv.import_bars(hist, rows, source="dukascopy")
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
     monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
     with pytest.raises(ValueError) as excinfo:
@@ -201,14 +201,14 @@ def test_run_in_sample_empty_period_rejected(tmp_path, monkeypatch):
 
 def test_run_in_sample_rejects_off_grid_oldest_bar(tmp_path, monkeypatch):
     """F2 (fix round 1, codex Important + sonnet Important-3): 最古バーが
-    分格子外 (秒 != 0) だと import_bars 自体は受理してしまうが、run_in_sample
+    分格子外 (秒 != 0) だと import_history_bars 自体は受理してしまうが、run_in_sample
     は ReplayClock まで到達させず明示的に ValueError にする。fake replay が
     呼ばれていないこと (本番なら ReplayClock 構築時に落ちる契約違反を、
     fake 経由のテストが隠さないこと) も確認する。"""
     hist = _conn(tmp_path)
     off_grid = H.replace(second=30, microsecond=0)
     rows = [_row_at(off_grid, o=100.0, h=100.5, l=99.5, c=100.2)]
-    ohlcv.import_bars(hist, rows, source="dukascopy")
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
     monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
     calls = []
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))

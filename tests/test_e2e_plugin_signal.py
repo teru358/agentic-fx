@@ -133,12 +133,12 @@ def _seed_crossover_history(conn, *, source: str) -> None:
     from agentic_fx.store import ohlcv as ohlcv_store
 
     closes = [120.0 - i for i in range(20)] + [200.0]  # 21 本 (H-20h .. H)
-    rows = []
-    for i, price in enumerate(closes):
-        ts = H - timedelta(hours=20 - i)
-        rows.append(("USDJPY", "1m", ts.isoformat(), price, price, price,
-                     price, 10.0, None))
-    ohlcv_store.import_bars(conn, rows, source=source)
+    # producer が読むのはライブ source なので**キャッシュ側**へ書く
+    # (プラン 9 Task 16 の分割以降、ライブ source は履歴 API が拒否する)。
+    bars = [Bar("USDJPY", "1m", H - timedelta(hours=20 - i),
+                price, price, price, price, 10.0)
+            for i, price in enumerate(closes)]
+    ohlcv_store.upsert_cache_bars(conn, bars, source=source)
 
 
 def _seed_open_position(conn) -> int:
