@@ -18,6 +18,7 @@
     --output /tmp/cache-validation-real-data.json
   ```
 - peak bytes は `validate_bars` 呼び出し中の**増分**割当 (バー列本体は計測開始前に確保済み)。§1.4 の 161.9 MB とは測定対象が異なるので大小比較しない
+- **測定範囲**: 本計測が再現するのは `_cached_bars` の**直読枝** (`price_provider.py:230` の `src == interval` — floor しない `window_start` を下限に使う) のみ。導出枝の `derive_since` (要求 interval へ floor した下限) は対象外 — script は resample を行わないため構造上その枝に到達しない
 
 | 条件 | 行数 | validate_bars 合否 | 失敗理由 | 中央値秒 | peak bytes |
 |---|---:|---|---|---:|---:|
