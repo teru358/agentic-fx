@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -143,6 +144,7 @@ class Executor:
     def __init__(self, *, conn: sqlite3.Connection, broker: PaperBroker,
                  settings: Settings, state_store: StateStore,
                  activity: ActivityLog, notifier: Notifier, clock: Clock,
+                 monotonic_fn: Callable[[], float] = time.monotonic,
                  quote_fn: Callable[[str], Quote],
                  spec_fn: Callable[[str], InstrumentSpec],
                  rate_fn: Callable[[str, str, datetime], ConversionRate],
@@ -154,6 +156,11 @@ class Executor:
         self.activity = activity
         self.notifier = notifier
         self.clock = clock
+        # Task 6 (プラン9 束B): gather deadline の経過測定専用。
+        # `self.clock` は captured_at にのみ使う — FixedClock/ReplayClock
+        # は進まないため clock 基準の deadline は永久に到来しない
+        # (spec 改稿 C1)。
+        self.monotonic_fn = monotonic_fn
         self.quote_fn = quote_fn
         self.spec_fn = spec_fn
         # 通貨 1 単位 = 口座通貨いくらか (設計書 §5)。quote_fn/spec_fn と同じ
@@ -519,6 +526,42 @@ class Executor:
                             ref_id=str(oid))
         return {"result": "pending", "order_id": oid, "reasons": []}
 
+    def _make_deadline_checker(self, budget: float) -> Callable[[str], None]:
+        """1 回の gather (`gather_open_snapshot`/`gather_close_snapshot`)
+        専用の deadline checker を作る (Task 6, プラン9 束B — 設計:
+        `docs/superpowers/specs/2026-08-11-gather-deadline-design.md`
+        確定仕様 #2/#3)。
+
+        - 予算は呼び出し元が渡す (`settings.worker.snapshot_max_age_sec`
+          を流用。新 config キーは作らない)。
+        - 経過は `self.monotonic_fn()` (既定 `time.monotonic`) で測る。
+          `self.clock` は `captured_at` にのみ使う — `FixedClock`/
+          `ReplayClock` は進まないため clock 基準の deadline は永久に
+          到来しない (改稿 C1)。
+        - 比較は `>` (等号は受理側 — commit-core の
+          `age_sec > max_snapshot_age_sec` (`open_from_snapshot`/
+          `close_from_snapshot`) と揃える)。
+        - 戻り値の `check(leg)` は次の脚を呼ぶ**前**に呼ぶこと。予算超過
+          なら `DataUnhealthy` を送出する。文言は commit-core の
+          `"execution/close snapshot is stale"` と区別できるよう
+          "deadline exceeded" を使う (trade_loop.py の commit-pre が
+          既存の `except Exception` で捕捉する — 新しい配管は作らない)。
+        - Task 7 でこの checker を `cycle_rate_fn`/`resolve_close_rate`
+          経由で `PriceProvider.to_account_rate` の `for spec in legs`
+          まで伝播させる (改稿 C2)。実行中の 1 脚は中断できない —
+          deadline が保証するのは「次の脚に進まないこと」のみ (確定
+          仕様 #9)。
+        """
+        start = self.monotonic_fn()
+
+        def check(leg: str) -> None:
+            elapsed = self.monotonic_fn() - start
+            if elapsed > budget:
+                raise DataUnhealthy(
+                    f"snapshot gather deadline exceeded: {elapsed:.1f}s "
+                    f"elapsed (budget {budget:.1f}s) — aborting before {leg}")
+        return check
+
     def gather_open_snapshot(self, intent: TradeIntent, *,
                              exposure_pairs: list[str]) -> ExecutionSnapshot:
         """commit-pre 相専用 (設計書 §3.1) — **core_lock を保持しない状態
@@ -528,20 +571,37 @@ class Executor:
 
         `exposure_pairs` は呼び出し元 (commit-pre 相) が `conn_supervisor`
         (lock 外の読取専用接続) から読んだ既存 exposure の pair 一覧。
+
+        **Task 6 (プラン9 束B): gather deadline。** 予算は
+        `settings.worker.snapshot_max_age_sec` を流用 (新 config キーは
+        作らない)。経過は `self.monotonic_fn()` で測る (`self.clock` は
+        `captured_at` にのみ使う)。比較は `>` (等号は受理側 — commit-core
+        の `age_sec > max_snapshot_age_sec` と揃える)。予算超過は
+        `DataUnhealthy` (次の脚を呼ぶ前に打ち切る — 実行中の 1 脚は
+        中断できない)。
         """
         now = self.clock.now()
+        budget = self.settings.worker.snapshot_max_age_sec
+        check = self._make_deadline_checker(budget)
         quote = self.quote_fn(intent.pair)
+        check(f"spec:{intent.pair}")
         spec = self.spec_fn(intent.pair)
         cycle_rate = self.cycle_rate_fn(now)
         specs_by_pair: dict = {intent.pair: spec}
         currencies: set = {spec.quote_currency, spec.base_currency}
         for pair in exposure_pairs:
+            check(f"spec:{pair}")
             pair_spec = self.spec_fn(pair)
             specs_by_pair[pair] = pair_spec
             currencies.add(pair_spec.quote_currency)
             currencies.add(pair_spec.base_currency)
-        # A3: rates の構築順を安定化 (PYTHONHASHSEED 依存を避ける)
-        rates = {ccy: cycle_rate(ccy) for ccy in sorted(currencies)}
+        # A3: rates の構築順を安定化 (PYTHONHASHSEED 依存を避ける)。dict
+        # comprehension だった箇所を for ループに変える (Task 6: 通貨
+        # ごとの deadline 検査を挟むため — ソート順を含め挙動は従前と同一)。
+        rates: dict = {}
+        for ccy in sorted(currencies):
+            check(f"rate:{ccy}")
+            rates[ccy] = cycle_rate(ccy)
         return ExecutionSnapshot(quote=quote, spec=spec,
                                  specs_by_pair=specs_by_pair, rates=rates,
                                  captured_at=now)
@@ -727,12 +787,24 @@ class Executor:
         instrument spec + 換算レートを 1 回で取得し timestamp 付き
         スナップショットにする。`row` は呼び出し元 (Task 15 の commit-pre
         相) が `conn_supervisor` (lock 外の読取専用接続) から読んだ現在の
-        order 行 (`pair`/`direction` を参照するだけ)。"""
+        order 行 (`pair`/`direction` を参照するだけ)。
+
+        **Task 6 (プラン9 束B): gather deadline。** OPEN と対称に予算を
+        適用する — 初稿の「CLOSE には入れない」は誤りとして撤回された
+        (改稿 I1): `close_from_snapshot` も同じ予算で stale を拒否する
+        (`age_sec > max_snapshot_age_sec`) ため、待って得られるのは古い
+        snapshot と拒否であって close ではない。早く失敗を確定して次の
+        再試行機会に戻る方が資金保護に有利。
+        """
         now = self.clock.now()
+        budget = self.settings.worker.snapshot_max_age_sec
+        check = self._make_deadline_checker(budget)
         pair = row["pair"]
         quote = self.quote_fn(pair)
         price = quote.bid if row["direction"] == "long" else quote.ask
+        check(f"spec:{pair}")
         spec = self.spec_fn(pair)
+        check(f"rate:{spec.quote_currency}")
         rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
         return CloseSnapshot(order_id=row["id"], pair=pair, price=price,
                              spec=spec, rate=rate,

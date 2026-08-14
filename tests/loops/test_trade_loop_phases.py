@@ -528,3 +528,44 @@ def test_finalize_mission_holds_core_lock_on_unexpected_exception(tmp_path):
     _assert_core_lock_held_during(
         loop, "finish", run=lambda: loop.run_once("cron"),
         reached_msg="finally の未終端 finalize に到達しなかった")
+
+
+def test_commit_pre_gather_deadline_produces_reason_distinct_from_stale(tmp_path):
+    """出口のピン (確定仕様テスト観点 4): gather_open_snapshot の deadline
+    超過は commit-pre の既存 `except Exception` (trade_loop.py:252) に
+    そのまま乗り、trade_intents に理由が残る。文言は commit-core の
+    "execution snapshot is stale" (executor.py の open_from_snapshot)
+    とは異なることを確認する — ログを読む人が「ハングで打ち切った」のか
+    「取得はできたが古かった」のかを区別できる必要がある (確定仕様 #8)。
+
+    ここでは境界の厳密さではなく「配線が実際に効いているか」だけを見る
+    粗い統合テストなので、monotonic フェイクは呼び出し回数に依存しない
+    増分方式にする (厳密な境界テストは test_executor_gather_deadline.py
+    側が担う)。
+    """
+    class _AlwaysLateMono:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def __call__(self) -> float:
+            self.n += 1
+            return self.n * 1000.0
+
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed",
+        {"action": "open", "pair": "USDJPY", "direction": "long",
+         "entry_type": "market", "horizon": "day", "limit_price": None,
+         "expires_in": None, "stop_loss": 147.80, "take_profit": 149.00,
+         "reasoning": "x"}, [])], monotonic_fn=_AlwaysLateMono())
+
+    out = loop.run_once("cron")
+
+    assert out is not None
+    assert out["result"] == "rejected"
+    iid_row = conn.execute(
+        "SELECT gate_result, reject_reason FROM trade_intents "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert iid_row["gate_result"] == "rejected"
+    reason = iid_row["reject_reason"]
+    assert "deadline exceeded" in reason
+    assert "stale" not in reason
