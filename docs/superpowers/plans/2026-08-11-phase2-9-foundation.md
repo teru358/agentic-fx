@@ -6080,6 +6080,26 @@ def test_prior_source_window_failure_does_not_block_next_source(
     assert result is not None
     cached, origin = result
     assert origin == "cache"
+
+
+def test_cache_window_is_widened_by_derive_ratio(tmp_path, monkeypatch):
+    """spec ③ テスト 4 の裏面 (配線の検査): 導出が要る interval では窓が
+    ライブ経路と同じ ratio 倍に広がる。cache_window.live_window_days を
+    呼ばず lookback_days をそのまま使う退行は、単体 (test_cache_window)
+    が緑のまま素通りするのでここで殺す。"""
+    conn, p = _provider(tmp_path)
+    captured = {}
+    orig = ohlcv.load_cache_bars
+
+    def _spy(conn_, symbol, interval, *, source, since=None, until=None):
+        captured.setdefault(interval, since)
+        return orig(conn_, symbol, interval, source=source, since=since,
+                    until=until)
+
+    monkeypatch.setattr(ohlcv, "load_cache_bars", _spy)
+    p._cached_bars("USDJPY", "4h", NOW, [], 5)   # 4h は DERIVE_ONLY → base 1h, ratio 4
+    span = NOW - captured["1h"]
+    assert timedelta(days=20) <= span < timedelta(days=20, hours=4)
 ```
 
 - [ ] **Step 4: テストを実行し、窓計算未適用のため落ちることを確認する**
@@ -6091,7 +6111,7 @@ uv run pytest tests/datafeed/test_price_provider.py \
 or derive_candidate_since or query_truncation or read_volume_bounded or \
 prior_source_window_failure" -v
 ```
-Expected: 全件 FAIL (現行 `_cached_bars` は Task 9 時点の素朴な `since = now - timedelta(days=lookback_days)` のままで、native/derive の区別・floor が無いため、`since` の値・除外件数・バケット構造のいずれかが期待と食い違う)
+Expected: **2 件 FAIL** (`test_derive_candidate_since_is_floored_to_requested_interval` / `test_query_truncation_does_not_leave_partial_leading_bucket`)。残る 5 件は Task 9 の素朴な `since` でも成立するため PASS のまま (本 task では退行ガードとして機能する)。全件 FAIL にはならない。訂正 2 の追加テスト (`test_cache_window_is_widened_by_derive_ratio`) を含めると red は 3 件。(2026-08-14 着手前検証の probe 実測)
 
 - [ ] **Step 5: `_cached_bars` を書き換える**
 
@@ -6159,7 +6179,7 @@ Expected: 全件 FAIL (現行 `_cached_bars` は Task 9 時点の素朴な `sinc
 find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 uv run pytest tests/datafeed/test_price_provider.py -v
 ```
-Expected: 全件 PASS (Task 8/9 分 + 本 task 7 件 + 既存回帰分)
+Expected: 全件 PASS (Task 8/9 分 + 本 task 8 件 + 既存回帰分)
 
 - [ ] **Step 7: 全体テストを実行する**
 
@@ -6176,11 +6196,12 @@ Expected: 全件 PASS
 |---|---|---|---|
 | M10-1 | `since = window_start if src == interval else derive_since` を `since = derive_since` (常に floor) に変える | `_cached_bars` の候補ループ | `test_direct_read_candidate_since_is_not_floored` |
 | M10-2 | 同上を `since = window_start` (常に未 floor) に変える | 同上 | `test_derive_candidate_since_is_floored_to_requested_interval` と `test_query_truncation_does_not_leave_partial_leading_bucket` の両方 |
-| M10-3 | 窓計算を `cache_window.live_window_days(name, interval, lookback_days)` から `cache_window.live_window_days(name, src, lookback_days)` に変える (candidates ループの内側へ誤って移し、base 足の interval で窓を計算する退行) | `_cached_bars` | `test_window_independent_of_cache_base_used_for_derivation` |
-| M10-4 | `window_start`/`derive_since` の計算 (窓計算) を source 単位の `try` の外 (関数冒頭) へ移す | `_cached_bars` の構造 | `test_prior_source_window_failure_does_not_block_next_source` |
+| M10-3 | 窓計算を candidates ループの内側へ移し、比を**キャッシュ base から**取る (`window_days = int(lookback_days * sources.INTERVAL_MIN[interval] / sources.INTERVAL_MIN[src])`) | `_cached_bars` | `test_window_independent_of_cache_base_used_for_derivation` (1m 経路で 300 日になり窓上限 5日+1h を超える) |
+| M10-4 | `window_start`/`derive_since` の計算を **`for name` ループ内・`try` の外** へ出す (計算だけを try の直前に置く) | 同上 | `test_prior_source_window_failure_does_not_block_next_source` |
 | M10-5 | `since=since` を `load_cache_bars` 呼び出しから削除する (窓の絞りを外す) | `_cached_bars` の `ohlcv.load_cache_bars(...)` 呼び出し | `test_rows_older_than_window_are_excluded` と `test_read_volume_bounded_by_window_regardless_of_accumulation` の両方 |
+| M10-6 | `window_days = cache_window.live_window_days(name, interval, lookback_days)` を `window_days = lookback_days` に変える (Task 8 の窓計算を呼ばない退行) | `_cached_bars` | `test_cache_window_is_widened_by_derive_ratio` |
 
-**M10-1〜M10-5 はいずれも「1 つの検査目的につき 1 テスト」の原則に沿って、それぞれ固有のテストが検出する。**
+**M10-1〜M10-6 はいずれも「1 つの検査目的につき 1 テスト」の原則に沿って、それぞれ固有のテストが検出する。**
 
 - [ ] **Step 9: 全体テストを再実行し green に戻っていることを確認する**
 
@@ -6208,6 +6229,8 @@ DERIVE_ONLY_INTERVALS は cache_window への委譲に統一 (Task 8 が
 EOF
 )"
 ```
+
+> 注記 (2026-08-14 着手前検証): 上記訂正 1〜4 は probe 実測済み (red 2+1 件 / M10-3 旧文面は survive / M10-6 は追加テストが無いと全 survive)。probe は scratchpad の test_task10_probe.py。
 
 ---
 
@@ -6700,6 +6723,7 @@ git commit -m "test: 本番 OHLCV 最終フォールバックを E2E で pin す
 | 2 | Task 8 Step 1 | `test_native_interval_window_equals_lookback_days` |
 | 3 | Task 8 Step 1 | `test_derive_interval_window_multiplies_by_ratio` |
 | 4 | Task 10 Step 3 | `test_window_independent_of_cache_base_used_for_derivation` |
+| 4 の裏面 (配線の検査) | Task 10 Step 3 | `test_cache_window_is_widened_by_derive_ratio` — 導出 interval で窓が ratio 倍に広がることを `_cached_bars` 経由で検査 (Task 10 訂正 2 で追加) |
 | 5 | Task 10 Step 3 | `test_rows_older_than_window_are_excluded` |
 | 6 | Task 10 Step 3 | `test_direct_read_candidate_since_is_not_floored` |
 | 7 | Task 10 Step 3 | `test_derive_candidate_since_is_floored_to_requested_interval` |
