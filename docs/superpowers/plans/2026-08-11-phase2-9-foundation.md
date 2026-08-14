@@ -5778,7 +5778,7 @@ Expected: FAIL — `captured_since` の要素が全て `None` のままなので
         got = self._cached_bars(pair, interval, now, errors, lookback_days)
 ```
 
-`_cached_bars` のシグネチャと候補ループ内の呼び出しを更新する (旧 `:192-229`):
+`_cached_bars` のシグネチャと候補ループ内の呼び出しを更新する (旧 `:192-247`)。**既存 docstring の全段落 (F1/F6/DERIVE_ONLY 残骸の根拠) と旧 `:235` の fail closed コメントはそのまま残し**、docstring 末尾に下記転写ブロック中の `lookback_days` に言及する段落を**追記**する。コード側の変更は ①シグネチャに `lookback_days: int` を追加 ②`since = now - timedelta(days=lookback_days)` を `d = ...` の直後に挿入 ③`load_cache_bars(...)` に `since=since` を追加 — の 3 箇所のみ。
 
 ```python
     def _cached_bars(self, pair: str, interval: str, now: datetime,
@@ -5838,7 +5838,7 @@ from datetime import datetime, timedelta
 find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 uv run pytest tests/datafeed/test_price_provider.py -v
 ```
-Expected: 全件 PASS (既存キャッシュ系テストは `lookback_days=1`/`5` の既定と一致する `since` になるため無影響 — `since = now - N日` は「窓より新しいキャッシュ行を排除しない」範囲であることを既存の `_fresh_bars` (直近数十分〜数時間) が保証する)
+Expected: 全件 PASS (キャッシュ経路を踏む既存フィクスチャの最長スパンは `_fresh_bars(interval="1h", n=100)` = 100h で、既定 `lookback_days=5` = 120h に対し余裕 20h。`_fresh_bars(interval="4h", n=30)` = 120h ちょうどの残骸フィクスチャは `DERIVE_ONLY_INTERVALS` により candidates から外れ読まれない。よって `since = now - N日` で排除される行は存在しない)
 
 - [ ] **Step 5: 全体テストを実行する**
 
@@ -5878,6 +5878,8 @@ load_cache_bars(since=...) まで到達させる。窓計算 (native/derive の
 EOF
 )"
 ```
+
+> 注記 (2026-08-14 着手前検証): Step 4 の旧根拠 (「_fresh_bars が保証」) は事実誤りだったため差し替え済み。Task 10 で窓を `live_window_days` に変える際はこの実測値 (最長フィクスチャ 100h) を前提にすること。
 
 ---
 

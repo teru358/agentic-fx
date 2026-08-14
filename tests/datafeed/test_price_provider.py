@@ -804,3 +804,34 @@ def test_readonly_provider_skips_derived_bar_cache_write(tmp_path):
                return_value=_fresh_bars(interval="1h", n=100)):
         p.get_bars("USDJPY", "4h", 5)
     assert ohlcv.load_cache_bars(conn, "USDJPY", "1h", source="yfinance") == []
+
+
+def test_cached_bars_since_is_not_none_and_varies_with_lookback_days(
+        tmp_path, monkeypatch):
+    """spec ③ テスト 15: 非既定の lookback_days が get_bars から
+    load_cache_bars(since=...) まで届く。helper 側で既定値を推測する退行は
+    「lookback_days を変えても since が変わらない」形で現れるため、
+    2 回の呼び出しを比較して単調性を確認する (固定値埋め込みも検出する)。
+    """
+    conn, p = _provider(tmp_path)
+    captured_since = []
+    orig = ohlcv.load_cache_bars
+
+    def _spy(conn_, symbol, interval, *, source, since=None, until=None):
+        captured_since.append(since)
+        return orig(conn_, symbol, interval, source=source, since=since,
+                    until=until)
+
+    monkeypatch.setattr(ohlcv, "load_cache_bars", _spy)
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        with pytest.raises(DataUnhealthy):
+            p.get_bars("USDJPY", "1m", 1)
+        since_for_1 = captured_since[-1]
+        with pytest.raises(DataUnhealthy):
+            p.get_bars("USDJPY", "1m", 20)
+        since_for_20 = captured_since[-1]
+
+    assert since_for_1 is not None
+    assert since_for_20 is not None
+    assert since_for_20 < since_for_1

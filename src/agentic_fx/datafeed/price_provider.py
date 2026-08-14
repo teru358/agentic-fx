@@ -6,7 +6,7 @@ import math
 import os
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from agentic_fx._safe_error import safe_error_text as _safe_error_text
 from agentic_fx.config import Settings
@@ -179,7 +179,7 @@ class PriceProvider:
                 _log.warning("bars source %s failed for %s: %s", name, pair, text)
                 errors.append(f"{name}: {text}")
 
-        got = self._cached_bars(pair, interval, now, errors)
+        got = self._cached_bars(pair, interval, now, errors, lookback_days)
         if got is not None:
             bars, origin = got
             _log.warning("using cached bars for %s %s (%s)", pair, interval,
@@ -190,7 +190,8 @@ class PriceProvider:
         raise DataUnhealthy(f"all bar sources failed for {pair}: {errors}")
 
     def _cached_bars(self, pair: str, interval: str, now: datetime,
-                     errors: list[str]) -> tuple[list[Bar], str] | None:
+                     errors: list[str], lookback_days: int
+                     ) -> tuple[list[Bar], str] | None:
         """キャッシュから interval の足を作る。健全性検証を通らなければ None。
 
         **要求された足そのもの → より細かい base 足、の順に試す**。
@@ -216,8 +217,18 @@ class PriceProvider:
         source の「要求された足そのもの」が、優先度の高い source の
         「より粗い base 足からの導出」より先に採用されてしまい、
         ソース優先順位が崩れる。
+
+        `lookback_days` は必須引数 (既定値で誤魔化さない — spec ③: helper
+        側で推測すると `latest_1m_bar` の lookback_days=1 と通常呼び出しの
+        既定 5 を区別できなくなる)。
+
+        本 task (プラン 9 Task 9) 時点では `since` の計算は素朴な
+        `now - timedelta(days=lookback_days)` — native/derive の区別・
+        floor 適用は Task 10 が実装する。配線そのものが正しいことを
+        独立に検査するための中間状態。
         """
         d = self.settings.datafeed
+        since = now - timedelta(days=lookback_days)
         candidates = [i for i in [interval, *self._base_candidates(interval)]
                       if i not in DERIVE_ONLY_INTERVALS]
         live_sources = [name for name, _ in
@@ -226,7 +237,8 @@ class PriceProvider:
             storage_name = _storage_source(name)
             for src in candidates:
                 cached = ohlcv.load_cache_bars(self.conn, pair, src,
-                                         source=storage_name)
+                                               source=storage_name,
+                                               since=since)
                 if not cached:
                     continue
                 label = ("cache" if src == interval else f"cache({src})")
