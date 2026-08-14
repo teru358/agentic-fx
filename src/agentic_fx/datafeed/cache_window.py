@@ -6,10 +6,11 @@ docs/superpowers/specs/2026-08-10-ohlcv-cache-fallback-design.md §3.1/3.2
 (改訂 5 が本文に優先するが、本ファイルが実装する窓計算・floor の規則
 自体は改訂 5 でも不変)。
 
-`_base_candidates`/`_finest_native_base`/`DERIVE_ONLY_INTERVALS` は
-`price_provider.py` の既存実装 (Task 8 時点) と同じロジックをここに
-新規実装している (一時的な重複 — Task 10 で `PriceProvider` 側をこの
-モジュールへの委譲に置き換えて解消する)。
+`base_candidates`/`finest_native_base`/`DERIVE_ONLY_INTERVALS` の定義元は
+このモジュール。Task 8 時点では `price_provider.py` の既存実装と一時的に
+重複していたが、Task 10 で `PriceProvider._base_candidates` /
+`_finest_native_base` をこのモジュールへの委譲に置き換えて解消済み
+(重複は残っていない)。
 """
 from __future__ import annotations
 
@@ -49,6 +50,17 @@ def live_window_days(source: str, interval: str, lookback_days: int) -> int:
     窓は要求 (source, interval, lookback_days) だけで決まり、キャッシュ側で
     どの base を使うか (実際に何がキャッシュされているか) には一切依存
     しない — この関数はキャッシュの中身を読まない (DB 非依存)。
+
+    **定義域は `lookback_days >= 1`**。`lookback_days=0` は窓 0 日
+    (`window_start == now`) に退化し、ライブ経路 (`_fetch_native` の
+    `days = max(1, int(lookback_days))`) が最低 1 日に持ち上げるのとは
+    非対称になる。本番呼び出し元で 0 を渡すものは無い (既定 5 /
+    `latest_1m_bar` は 1)。ここで `max(1, ...)` を掛けて対称化しない
+    のは、`tests/datafeed/test_price_provider.py` の floor 防御
+    (直読候補は floor しない / 導出候補は floor する) が
+    `lookback_days=0` を `window_start == now` を観測可能にする道具として
+    使っているため — 対称化するとその観測点が潰れる (束 C 1 周目 実測:
+    `max(1, ...)` を入れると当該 2 テストが赤)。
     """
     if (interval in sources.NATIVE_INTERVALS[source]
             and interval not in DERIVE_ONLY_INTERVALS):

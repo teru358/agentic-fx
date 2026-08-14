@@ -303,6 +303,56 @@ def test_upsert_cache_bars_normalizes_bar_time_to_utc(tmp_path):
     assert len(loaded) == 1 and loaded[0].ts == datetime.fromisoformat(NOW_ISO)
 
 
+# ---- load_cache_bars の since/until は UTC 正規化してから文字列比較する ----
+#
+# `bar_time` は `_iso_utc` により必ず `+00:00` 表記で保存され、SQL 側の
+# `bar_time >= ?` / `<= ?` は**文字列比較**である。したがって `since`/`until`
+# を UTC へ直さずに `isoformat()` した文字列を渡すと、オフセット表記の差
+# (`+09:00`) がそのまま辞書順に効いて窓が静かにずれる。
+# `load_history_bars` 側には `test_load_history_bars_jst_since_matches_utc_instant`
+# があるが cache 側に兄弟が無く、`since_utc.isoformat()` → `since.isoformat()`
+# の変異が全 1893 テスト緑のまま生存していた (束 C 1 周目 実測)。`until` 枝は
+# 同型のパターンなので同時に覆う。
+
+def _cache_two_bars(tmp_path):
+    """11:00 UTC と 12:00 UTC の 2 本。窓の境界がどちらに転んでも
+    件数が変わるようにするため 2 本置く (1 本だと JST 文字列でも
+    たまたま同じ結果になり変異を観測できない)。"""
+    conn = _conn(tmp_path)
+    later = datetime.fromisoformat(NOW_ISO)              # 12:00Z
+    earlier = later - timedelta(hours=1)                 # 11:00Z
+    ohlcv.upsert_cache_bars(
+        conn,
+        [Bar("USDJPY", "1m", earlier, 1, 2, 0.5, 1.5, 0),
+         Bar("USDJPY", "1m", later, 1, 2, 0.5, 1.5, 0)],
+        source="yfinance")
+    return conn, earlier, later
+
+
+def test_load_cache_bars_jst_since_matches_utc_instant(tmp_path):
+    """`since` を JST-aware で渡しても UTC 同一時刻と同じ行を返す。"""
+    conn, _earlier, later = _cache_two_bars(tmp_path)
+    jst = timezone(timedelta(hours=9))
+    bars_jst = ohlcv.load_cache_bars(conn, "USDJPY", "1m", source="yfinance",
+                                     since=later.astimezone(jst))
+    bars_utc = ohlcv.load_cache_bars(conn, "USDJPY", "1m", source="yfinance",
+                                     since=later)
+    assert bars_jst == bars_utc
+    assert [b.ts for b in bars_jst] == [later]
+
+
+def test_load_cache_bars_jst_until_matches_utc_instant(tmp_path):
+    """`until` を JST-aware で渡しても UTC 同一時刻と同じ行を返す。"""
+    conn, earlier, _later = _cache_two_bars(tmp_path)
+    jst = timezone(timedelta(hours=9))
+    bars_jst = ohlcv.load_cache_bars(conn, "USDJPY", "1m", source="yfinance",
+                                     until=earlier.astimezone(jst))
+    bars_utc = ohlcv.load_cache_bars(conn, "USDJPY", "1m", source="yfinance",
+                                     until=earlier)
+    assert bars_jst == bars_utc
+    assert [b.ts for b in bars_jst] == [earlier]
+
+
 def test_upsert_cache_bars_different_sources_coexist(tmp_path):
     conn = _conn(tmp_path)
     b = Bar("USDJPY", "1m", datetime.fromisoformat(NOW_ISO), 1, 2, 0.5, 1.5, 0)
