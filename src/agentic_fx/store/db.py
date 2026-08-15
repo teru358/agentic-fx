@@ -678,6 +678,12 @@ def _migrate_improvement_runs_v2(conn: sqlite3.Connection) -> None:
     M1)**: 残存表の行は新スキーマへコピーされていない可能性がある。黙って
     早期 return すると取り残した行を見捨てる経路になる (変異ノート #7 の
     理念に反する) ため、表名を名指しして raise する。
+    `_migrate_signals_fk` が同じ状態から**自動再開する**のとは意図的に
+    非対称: signals 側は「宙吊り行の修復」という決定論的なコピー規則を
+    持つため v1 の行を機械的に持ち直せるが、こちらは v1 に旧 PR 経路の
+    不正値 (`result='pr'` / `pr_url`) が混じっている可能性があり、それを
+    黙って通すか捨てるかは人が判断すべき事項 (束 D 2 周目 /code-review で
+    非対称の説明が無い点を指摘され追記)。
     """
     cols = {r["name"] for r in
            conn.execute("PRAGMA table_info(improvement_runs)")}
