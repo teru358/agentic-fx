@@ -9134,16 +9134,18 @@ Task 15 → Task 17 → Task 18 の順で実施する。Task 15 と Task 17 は�
 
 ### Task 15: reflection 再試行ポリシー
 
+> **(着手前検証 2026-08-15 で訂正: 行番号は束 A〜D の merge で全項目ずれていたため、内容アンカーへ置き換えた。)**
+
 **Files:**
 - Create: `src/agentic_fx/store/reflection_attempts.py`
-- Modify: `src/agentic_fx/store/db.py:11-21,31-60,145-150,375-384`
-- Modify: `src/agentic_fx/loops/reflection_cycle.py:41,65-88,90-215`
-- Modify: `src/agentic_fx/config.py:133-140,253-273`
-- Modify: `config/settings.yaml.example:48-54`
-- Modify: `src/agentic_fx/commands.py:12,16-24,41-84`
+- Modify: `src/agentic_fx/store/db.py` — module docstring 1 行目 / `_SCHEMA` 内 `CREATE TABLE IF NOT EXISTS reflections (` ブロックの直後 / `TABLE_NAMES` の `"backtest_runs", "analysis_runs", "signals",` の行。**`init_db` 本体には触らない** (下記 Step 3)
+- Modify: `src/agentic_fx/loops/reflection_cycle.py` — `from agentic_fx.store import missions, reflections` / `run_pending` の `rows = self.conn.execute(` / `_reflect_one` の 3 アンカー (Step 3)
+- Modify: `src/agentic_fx/config.py` — `class NewsSettings(_Strict):` の直前 / `Settings` の `worker: WorkerSettings = Field(default_factory=WorkerSettings)` の直後
+- Modify: `config/settings.yaml.example` — 末尾 (`  snapshot_max_age_sec: 10 ...` の行の直後)
+- Modify: `src/agentic_fx/commands.py` — `from agentic_fx.store import approvals, missions, orders` / `_HELP` の `  killswitch reset ...` 行の直後 / `dispatch` の `return "kill switch ラッチを解除しました"` の直後
 - Test: `tests/store/test_db.py`
 - Create/Test: `tests/store/test_reflection_attempts.py`
-- Modify/Test: `tests/loops/test_reflection_cycle.py`（束 A Task 4 が追加する `test_reflection_current_retry_behavior_is_pinned` を名指しで置換）
+- Modify/Test: `tests/loops/test_reflection_cycle.py`（束 A Task 4 の `test_reflection_current_retry_behavior_is_pinned` **と** `test_failed_reflections_starve_later_orders` の **2 本**を名指しで置換 — 後者は着手前検証 2026-08-15 で追加。Task 15 の実装だけを入れると後者が必ず落ちる）
 - Modify/Test: `tests/test_commands.py`
 - Modify/Test: `tests/test_config.py`
 
@@ -9314,7 +9316,120 @@ def test_rag_failure_consumes_attempt_and_stops_at_limit(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == before
 ```
 
-`tests/test_commands.py` と `tests/test_config.py` に追加する。
+**(着手前検証 2026-08-15 で追加: 実装だけを当てると
+`test_failed_reflections_starve_later_orders` が `assert 2 == 3` で必ず落ちる
+— 束 A Task 4 の codex I4 が固定した starvation 現挙動を Task 15 が解消するため。)**
+同じファイルの `test_failed_reflections_starve_later_orders` も削除せず、
+次の名前と内容へ置換する (アンカーは docstring 冒頭
+`"""Task 4 / 1 周目 codex 指摘 I4 (回帰固定):`)。
+
+```python
+def test_abandon_releases_starved_later_orders(tmp_path):
+    """Task 4 / codex I4 のピンを Task 15 (設計書 D1) の契約へ更新する。
+
+    旧ピンは「失敗し続ける先頭 3 件が `max_items` 枠を永久に占有し、
+    4 件目は一度も選ばれない」という**現挙動の固定**だった。D1 は
+    `ORDER BY o.id` を変えずに **abandon で枠を空ける**ことで starvation を
+    解く。したがってこのテストは「上限到達までは先頭 3 件が占有し、
+    到達後は 4 件目が選ばれる」へ書き換える (削除ではなく更新)。"""
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult("failed", None, [])])
+    oids = [_closed_order(conn) for _ in range(4)]
+    assert len(set(oids)) == 4
+
+    for _ in range(3):
+        assert cyc.run_pending() == 0
+
+    summaries = [ln.split("\t")[3] for ln in
+                 (tmp_path / "a.log").read_text(encoding="utf-8").splitlines()
+                 if "\treflection_mission_failed\t" in ln]
+    # 先頭 3 件は上限 (2) まで試行され、そこで打ち切られる。
+    for oid in oids[:3]:
+        assert sum(1 for s in summaries
+                   if s.startswith(f"order_id={oid} ")) == 2
+    # 3 周期目で枠が空き、4 件目がはじめて選ばれる (starvation の解消)。
+    assert sum(1 for s in summaries
+               if s.startswith(f"order_id={oids[3]} ")) == 1
+
+    abandoned = [ln for ln in
+                 (tmp_path / "a.log").read_text(encoding="utf-8").splitlines()
+                 if "\treflection_abandoned\t" in ln]
+    assert len(abandoned) == 3
+
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
+    ).fetchone()["c"] == 7
+```
+
+**(着手前検証 2026-08-15 で追加: 以下 3 本が無いと、契約に直結する変異が
+フルスイート green のまま生存することを probe で実測した。)**
+同じファイルへ追加する。
+
+```python
+def test_finalize_failure_does_not_consume_an_attempt(tmp_path, monkeypatch):
+    """Task 15 (設計書 D1) の契約: `finalize_ok=False` は **mission 監査
+    書込みの失敗**であって reflection 自体の失敗ではない。試行回数を
+    消費させると、`missions.finish` が継続的に失敗する環境で
+    **振り返りが max_attempts 回で恒久 abandon される** —
+    「監査が書けない」という別の故障が、学習材料の永久喪失に化ける。
+
+    段 0 実測: このピンが無いと `not finalize_ok` 経路で bump する変異が
+    フルスイート green のまま生存する。"""
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": "ok"}, []),
+        MissionResult("completed", {"content": "ok"}, [])])
+    oid = _closed_order(conn)
+    monkeypatch.setattr(
+        "agentic_fx.loops.reflection_cycle.finalize_mission",
+        lambda *a, **k: False)
+
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert reflection_attempts.attempts_of(conn, oid) == 0
+    assert reflections.get(conn, oid) is None
+    # 上限を消費していないので、3 周期目も同じ order が選ばれ続ける。
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
+    ).fetchone()["c"] == 2
+
+
+def test_bump_is_committed_immediately(tmp_path):
+    """Task 15 (設計書 D1): 失敗台帳は **その場で commit** する。
+    `bump` の `conn.commit()` を落とすと、未コミットのまま次周期を待つ
+    ことになり、プロセス障害 (kill switch 後の再起動・OOM) で試行回数が
+    巻き戻って無制限再試行が復活する。別接続から見えることで固定する。"""
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason="boom")])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    other = connect(tmp_path / "t.db")
+    assert reflection_attempts.attempts_of(other, oid) == 1
+
+
+def test_bump_records_the_mission_failure_reason(tmp_path):
+    """Task 15 (設計書 D1): 台帳の `last_reason` には **spec ② の安全化済み
+    `reason` をそのまま**入れる。`reflection_abandoned` の activity は
+    件数と order_id しか持たないので、**なぜ恒久失敗したか**を残す唯一の
+    場所がこの列である。
+
+    段 0 実測: `reason=result.reason` を `reason=None` にする変異は
+    フルスイート green のまま生存する。"""
+    reason = "context exceeded: prompt 1 tokens > n_ctx 2 (model=m)"
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason=reason)])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    row = conn.execute(
+        "SELECT attempts, last_reason FROM reflection_attempts "
+        "WHERE order_id=?", (oid,)).fetchone()
+    assert row["attempts"] == 1
+    assert row["last_reason"] == reason
+```
+
+`tests/test_commands.py` と `tests/test_config.py` に追加する
+(下 2 本は **着手前検証 2026-08-15 で追加** — shell の存在ガードと `ge=1` に
+killer が無く、削除変異がフルスイート green で生存したため)。
 
 ```python
 def test_reflect_retry_deletes_attempt_row(tmp_path):
@@ -9330,11 +9445,36 @@ def test_reflect_retry_deletes_attempt_row(tmp_path):
     assert reflection_attempts.attempts_of(conn, oid) == 0
 
 
+def test_reflect_retry_rejects_unknown_order(tmp_path):
+    """Task 15: 存在しない order への `reflect retry` は成功メッセージを
+    返さない。台帳に無い id を「戻しました」と報告すると、運用者は
+    abandon が解けたと誤認して調査をやめる (`reflection_abandoned` の
+    activity から辿る唯一の復帰手段がこのコマンドである)。"""
+    conn, _state, _activity, cmd = _commands(tmp_path)
+    out = cmd.dispatch("reflect retry 999")
+    assert "再試行対象へ戻しました" not in out
+    assert "does not exist" in out
+
+
 def test_reflection_and_alert_defaults_from_example():
     s = load_settings(EXAMPLE)
     assert s.reflection.max_attempts == 2
     assert s.alert.consecutive_gate_reject == 10
+
+
+def test_reflection_max_attempts_must_be_at_least_one():
+    """Task 15: `ge=1` を落とすと `max_attempts: 0` が通り、抽出条件
+    `a.attempts < 0` により **どの order も一度も振り返られなくなる**
+    (無効化キーが増える)。設計書 D1 は上限の下限を 1 に固定する。"""
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["reflection"] = {"max_attempts": 0}
+    with pytest.raises(ValidationError):
+        Settings.model_validate(raw)
 ```
+
+`tests/test_config.py` は `pytest` / `ValidationError` / `Settings` / `load_settings` /
+`EXAMPLE` をすべて既に import 済みなので、import の追加は不要である。
 
 - [ ] **Step 2: 失敗を確認**
 
@@ -9343,11 +9483,31 @@ Run:
 ```bash
 uv run pytest tests/store/test_db.py -k reflection_attempts -v
 uv run pytest tests/store/test_reflection_attempts.py -v
-uv run pytest tests/loops/test_reflection_cycle.py -k "retries_to_limit or abandoned_activity or starve or success_clears" -v
-uv run pytest tests/test_commands.py::test_reflect_retry_deletes_attempt_row tests/test_config.py::test_reflection_and_alert_defaults_from_example -v
+uv run pytest tests/loops/test_reflection_cycle.py \
+  -k "retries_to_limit or abandoned_activity or starve or success_clears \
+      or rag_failure_consumes or finalize_failure or bump_is_committed \
+      or bump_records" -v
+uv run pytest tests/test_commands.py -k reflect_retry \
+  tests/test_config.py -k "reflection_and_alert or max_attempts_must_be" -v
 ```
 
-Expected: `no such table: reflection_attempts`、`ModuleNotFoundError: agentic_fx.store.reflection_attempts`、旧回帰ピンでは 3 本目の mission が作られて `assert 3 == 2`、command は help を返し、config は `Settings` に `reflection` / `alert` が無く FAIL。
+**(着手前検証 2026-08-15 で訂正: 旧 Expected の「ModuleNotFoundError」「help を返す」
+は実測と異なる。`-k` 式も追加テストを拾えていなかった。)**
+
+Expected:
+
+- `tests/store/test_db.py` は **3 本 FAIL**。内訳は fresh が `assert set() == {'order_id', ...}`、
+  legacy が `sqlite3.OperationalError: no such table: reflection_attempts`、
+  idempotent が `assert 0 == 1`
+- `tests/store/test_reflection_attempts.py` は **collection error**
+  `ImportError: cannot import name 'reflection_attempts' from 'agentic_fx.store'`
+  (`ModuleNotFoundError` ではない — `from ... import ...` 形のため)
+- `tests/loops/test_reflection_cycle.py` は **6 本 FAIL**
+  (`retries_to_limit` / `abandoned_activity` / `does_not_starve` / `success_clears` /
+  `rag_failure_consumes` / `abandon_releases_starved`)。追加 3 本も同様に FAIL
+- `tests/test_commands.py` も同じ `ImportError` (テスト内 import が先に落ちるので
+  help までは到達しない)
+- `tests/test_config.py` は `AttributeError: 'Settings' object has no attribute 'reflection'`
 
 - [ ] **Step 3: 最小実装**
 
@@ -9376,8 +9536,16 @@ def test_init_creates_all_16_tables(tmp_path):
 `EXPECTED` は省略記号をソースへ書かず、Task 16 が作った 15 個の文字列をすべて
 温存して末尾へ `"reflection_attempts"` を追加する。この変更後、Task 15 単独の
 Step 4 で `TABLE_NAMES == frozenset(EXPECTED)` と実 DB の 16 表が一致する。
+既存のテスト名 `test_init_creates_all_15_tables` は **改名**する (新規追加ではない)。
 
-`store/db.py` の `_SCHEMA` に orders より後で次を追加し、`TABLE_NAMES` に `reflection_attempts` を加える。`CREATE TABLE IF NOT EXISTS` なので空 DB・既存 DB・二重実行で同じ経路を使う。
+`store/db.py` の `_SCHEMA` に次を追加し、`TABLE_NAMES` に `reflection_attempts` を加える。`CREATE TABLE IF NOT EXISTS` なので空 DB・既存 DB・二重実行で同じ経路を使う。
+
+**(着手前検証 2026-08-15 で訂正: `_SCHEMA` は DDL 定数と inline 文字列の連結
+(`_OHLCV_CACHE_DDL + _OHLCV_HISTORY_DDL + """...""" + _IMPROVEMENT_RUNS_V2_DDL + ...`)
+になっているため、「orders より後」だけでは位置が定まらない。)**
+挿入位置は inline セグメント内、`reflections` テーブルの直後 (アンカーは
+`CREATE TABLE IF NOT EXISTS reflections (` ブロックの閉じ `);`)。
+`_SIGNALS_V2_DDL` のような定数化はしない (rebuild から再利用しないため)。
 
 ```sql
 CREATE TABLE IF NOT EXISTS reflection_attempts (
@@ -9386,6 +9554,19 @@ CREATE TABLE IF NOT EXISTS reflection_attempts (
   last_attempt_at TEXT NOT NULL,
   last_reason TEXT
 );
+```
+
+**`init_db` 本体は一行も変更しない。** `_SCHEMA` は `conn.executescript(_SCHEMA)`
+で流れるので migration 関数は不要である。既存の
+`_ensure_column(...)` → `_migrate_signals_fk(conn)` → `_migrate_improvement_runs_v2(conn)`
+→ `conn.commit()` の並びを動かさないこと (束 D で「`init_db` 全体置換が既存配線を
+消す」事故が 3 回出ている)。
+
+`db.py` の module docstring 1 行目も更新する。
+
+```
+アンカー: """SQLite 接続 + 15 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
+→        """SQLite 接続 + 16 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
 ```
 
 `src/agentic_fx/store/reflection_attempts.py` を作成する。
@@ -9422,7 +9603,12 @@ def attempts_of(conn: sqlite3.Connection, order_id: int) -> int:
     return int(row["attempts"]) if row else 0
 ```
 
-`config.py` に次を足し `Settings` に default factory で載せる。example へ `reflection: {max_attempts: 2}` と、Task 17 用の `alert: {consecutive_gate_reject: 10}` を同時に追加する。
+`RETURNING` は SQLite 3.35+ を要求するが、`db.connect()` が既に 3.35 未満で
+`RuntimeError` を出す fail fast を持っているので追加のガードは要らない。
+
+`config.py` に次を足し `Settings` に default factory で載せる。
+**挿入位置は `class NewsSettings(_Strict):` の直前** (着手前検証 2026-08-15 で明示)。
+Task 17 用の `AlertSettings` も **この task で先行追加する**。
 
 ```python
 class ReflectionSettings(_Strict):
@@ -9432,17 +9618,44 @@ class ReflectionSettings(_Strict):
 class AlertSettings(_Strict):
     consecutive_gate_reject: int = Field(ge=1, default=10)
 
-# Settings fields
-reflection: ReflectionSettings = Field(default_factory=ReflectionSettings)
-alert: AlertSettings = Field(default_factory=AlertSettings)
+
+class NewsSettings(_Strict):          # ← 既存 (アンカー)
+    cleanup_hours: int = Field(gt=0)
 ```
 
-`reflection_cycle.py` は import に `reflection_attempts` を加え、抽出を named parameter 化する。
+`Settings` のフィールドは `worker: WorkerSettings = ...` の直後 (末尾) に置く。
+
+```python
+    plugin: PluginSettings = Field(default_factory=PluginSettings)
+    worker: WorkerSettings = Field(default_factory=WorkerSettings)
+    reflection: ReflectionSettings = Field(default_factory=ReflectionSettings)
+    alert: AlertSettings = Field(default_factory=AlertSettings)
+```
+
+`config/settings.yaml.example` の **末尾** (アンカー: `worker:` 節の最終行
+`  snapshot_max_age_sec: 10 ...`) に次を追加する。`Settings` は `_Strict`
+(extra 禁止) なので config.py と example は必ず同じ commit で同期する。
+
+```yaml
+reflection:                    # reflection cycle の再試行ポリシー (プラン9 Task15)。省略可
+  max_attempts: 2               # 同一 order の reflection 再試行上限。到達で abandon (reflect retry <id> で復帰)
+
+alert:                         # 運用アラート (プラン9 Task17)。省略可
+  consecutive_gate_reject: 10   # risk gate の連続 rejection がこの本数に達したら一度だけ通知
+```
+
+`reflection_cycle.py` は import に `reflection_attempts` を加え
+(`from agentic_fx.store import missions, reflection_attempts, reflections`)、
+抽出を named parameter 化する。`run_pending` の `rows = self.conn.execute(...)`
+は資産を持たないので、この 1 文だけ差し替えてよい。
 
 ```python
 rows = self.conn.execute(
     "SELECT o.* FROM orders o "
     "LEFT JOIN reflections r ON r.order_id=o.id "
+    # `ORDER BY o.id` は設計書 D1 が明示的に据え置くと決めた条件。
+    # 変えないこと (着手前検証 2026-08-15: この削除変異は黒箱テストでは
+    # 殺せない — 順序は実行計画依存。規約としてここに残す)。
     "LEFT JOIN reflection_attempts a ON a.order_id=o.id "
     "WHERE o.status='closed' AND r.order_id IS NULL "
     "AND (a.attempts IS NULL OR a.attempts < :max) "
@@ -9453,44 +9666,87 @@ rows = self.conn.execute(
 
 `_reflect_one` の Mission 失敗分岐では `core_lock` 内で bump し、到達時だけ activity を書く。`finalize_ok=False` は mission 監査書込み失敗なので試行回数を消費せず、既存の再試行契約を維持する。
 
+**(着手前検証 2026-08-15 で訂正: 旧稿は分岐全体を「置換」する形で、束 A Task 4 の
+`reflection_mission_failed` activity 書込みと裁定コメントを消していた。
+アンカー付きの「挿入」に改める。)**
+アンカーは `_log.exception("failed to record reflection_mission_failed for #%s", row["id"])`
+の直後、既存の複合ガード `if result.status != "completed" or not finalize_ok:` の直前。
+**この複合ガードは一文字も変更しない**
+(`test_non_completed_never_saves_reflection_even_with_valid_content` /
+`test_reflection_failed_status_with_content_does_not_persist` が依存している)。
+
 ```python
-if result.status != "completed":
-    with self._core_lock:
-        attempts = reflection_attempts.bump(
-            self.conn, row["id"], now=self.clock.now(), reason=result.reason)
-    if attempts == self.settings.reflection.max_attempts:
-        try:
-            self.activity.write(
-                Category.AGGREGATE, "reflection_abandoned",
-                f"order_id={row['id']} attempts={attempts}",
-                ref_id=str(row["id"]))
-        except Exception:  # noqa: BLE001
-            _log.exception("failed to record reflection_abandoned for #%s", row["id"])
-    return False
-if not finalize_ok:
-    return False
+                try:                                    # ← 既存 (Task 4)
+                    self.activity.write(
+                        Category.AGGREGATE, "reflection_mission_failed",
+                        f"order_id={row['id']} mission_id={mid} "
+                        f"status={result.status}"
+                        + (f" — {result.reason}" if result.reason else ""),
+                        ref_id=str(row["id"]))
+                except Exception:  # noqa: BLE001 — 記録の失敗で reflection 経路を止めない
+                    _log.exception(
+                        "failed to record reflection_mission_failed for #%s",
+                        row["id"])
+                # ↓ここから挿入 (プラン 9 Task 15、設計書 D1)
+                # 失敗を台帳に刻み、上限到達で abandon する。
+                # `finalize_ok=False` は mission 監査書込みの失敗なので
+                # 試行回数を消費しない (下の複合ガードはそのまま温存する)。
+                with self._core_lock:
+                    attempts = reflection_attempts.bump(
+                        self.conn, row["id"], now=self.clock.now(),
+                        reason=result.reason)
+                if attempts == self.settings.reflection.max_attempts:
+                    try:
+                        self.activity.write(
+                            Category.AGGREGATE, "reflection_abandoned",
+                            f"order_id={row['id']} attempts={attempts}",
+                            ref_id=str(row["id"]))
+                    except Exception:  # noqa: BLE001
+                        _log.exception(
+                            "failed to record reflection_abandoned for #%s",
+                            row["id"])
+                # ↑ここまで挿入
 ```
+
+この直後に続く既存行 `if result.status != "completed" or not finalize_ok:` と、
+その中の裁定コメント (「finish 失敗時は監査未確定 …」) は**一文字も変更しない**。
 
 `rag.add_reflection(...)` の既存 `except Exception` も「completed だから無料」に
-せず、activity `reflection_rag_failed` の記録後、return 前に次を実行する:
+せず、activity `reflection_rag_failed` の記録後、return 前に次を挿入する。
+アンカーは `_log.exception("failed to record reflection_rag_failed for #%s", row["id"])`
+の直後・既存の `return False` の直前 (F6 の activity 書込みを消さないこと)。
 
 ```python
-with self._core_lock:
-    attempts = reflection_attempts.bump(
-        self.conn, row["id"], now=self.clock.now(),
-        reason="rag.add_reflection failed")
-if attempts == self.settings.reflection.max_attempts:
-    try:
-        self.activity.write(
-            Category.AGGREGATE, "reflection_abandoned",
-            f"order_id={row['id']} attempts={attempts}",
-            ref_id=str(row["id"]))
-    except Exception:  # noqa: BLE001
-        _log.exception("failed to record reflection_abandoned for #%s", row["id"])
-return False
+                try:                                    # ← 既存 (F6)
+                    self.activity.write(
+                        Category.SYSTEM, "reflection_rag_failed",
+                        f"#{row['id']} {row['pair']}", ref_id=str(row["id"]))
+                except Exception:  # noqa: BLE001
+                    _log.exception(
+                        "failed to record reflection_rag_failed for #%s",
+                        row["id"])
+                # ↓ここから挿入 (プラン 9 Task 15、設計書 D1)
+                # RAG 書込失敗も再試行を消費する — 「completed だから無料」に
+                # すると恒久的な RAG 障害で無制限再試行が復活する。
+                with self._core_lock:
+                    attempts = reflection_attempts.bump(
+                        self.conn, row["id"], now=self.clock.now(),
+                        reason="rag.add_reflection failed")
+                if attempts == self.settings.reflection.max_attempts:
+                    try:
+                        self.activity.write(
+                            Category.AGGREGATE, "reflection_abandoned",
+                            f"order_id={row['id']} attempts={attempts}",
+                            ref_id=str(row["id"]))
+                    except Exception:  # noqa: BLE001
+                        _log.exception(
+                            "failed to record reflection_abandoned for #%s",
+                            row["id"])
+                # ↑ここまで挿入
+                return False        # ← 既存行、無変更
 ```
 
-成功の completion marker 保存直後、同じ `core_lock` 内で `clear` する。
+成功の completion marker 保存直後、同じ `core_lock` 内で `clear` する (1 行追加のみ)。
 
 ```python
 with self._core_lock:
@@ -9498,32 +9754,55 @@ with self._core_lock:
     reflection_attempts.clear(self.conn, row["id"])
 ```
 
-`commands.py` は `reflection_attempts` を import し、help と dispatch に追加する。
+`commands.py` は `reflection_attempts` を import し
+(`from agentic_fx.store import approvals, missions, orders, reflection_attempts`)、
+help と dispatch に追加する。`orders` は既に import 済みで追加不要。
+
+`_HELP` は `  killswitch reset ...` 行の直後へ 1 行:
+
+```
+  reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
+```
+
+`dispatch` は `return "kill switch ラッチを解除しました"` の直後、
+`except AlreadyDecidedError:` の直前へ:
 
 ```python
-if cmd == "reflect" and len(args) == 2 and args[0] == "retry":
-    order_id = int(args[1])
-    if orders.get(self.conn, order_id) is None:
-        raise ValueError(f"order #{order_id} does not exist")
-    reflection_attempts.clear(self.conn, order_id)
-    self.activity.write(Category.SYSTEM, "reflection_requeued",
-                        f"order_id={order_id} via shell", ref_id=str(order_id))
-    return f"order #{order_id} を reflection 再試行対象へ戻しました"
+            if cmd == "reflect" and len(args) == 2 and args[0] == "retry":
+                order_id = int(args[1])
+                if orders.get(self.conn, order_id) is None:
+                    raise ValueError(f"order #{order_id} does not exist")
+                reflection_attempts.clear(self.conn, order_id)
+                self.activity.write(Category.SYSTEM, "reflection_requeued",
+                                    f"order_id={order_id} via shell",
+                                    ref_id=str(order_id))
+                return f"order #{order_id} を reflection 再試行対象へ戻しました"
 ```
 
 - [ ] **Step 4: 成功を確認**
 
 ```bash
 uv run pytest tests/store/test_db.py tests/store/test_reflection_attempts.py tests/loops/test_reflection_cycle.py tests/test_commands.py tests/test_config.py -q
+find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
+uv run pytest -q -p no:cacheprovider
 ```
 
 Expected: 全件 PASS。`test_reflection_retries_to_limit_then_stops` は missions=2、`test_reflection_abandoned_activity_written_once_at_limit` は通知 seam を一切持たず activity 1 行、成功行は attempts=0。
+`test_abandon_releases_starved_later_orders` は missions=7 (旧ピンの 9 から変わる)。
+
+**フルスイートの期待件数は 1997 passed, 1 deselected**
+(着手前検証 2026-08-15 に probe で実測。束 D merge 時点のベースライン 1981 起点 +16 —
+db.py +3 / reflection_attempts +2 / reflection_cycle +7 / commands +2 / config +2)。
 
 - [ ] **Step 5: 変異テスト**
 
 ```bash
 find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 ```
+
+**(着手前検証 2026-08-15 で更新: 下 8 行は probe で全件 KILLED を実測済み・
+killer 名も一致。下 6 行は指揮者が追加した変異で、うち 5 件は追加テスト無しでは
+フルスイート green のまま生存した。最終行は「殺せない」と結論した変異。)**
 
 | 変異 | red になる固有テスト |
 |---|---|
@@ -9535,8 +9814,17 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | `:max` を `999` にする | `test_reflection_retries_to_limit_then_stops` |
 | 成功時 `clear()` を削除 | `test_success_clears_prior_attempt_row` |
 | shell の `clear()` を削除 | `test_reflect_retry_deletes_attempt_row` |
+| 上限判定 `==` を `>` にする (abandon が一度も書かれない) | `test_reflection_abandoned_activity_written_once_at_limit` |
+| `finalize_ok=False` 経路でも `bump()` する | `test_finalize_failure_does_not_consume_an_attempt` |
+| `bump()` の `conn.commit()` を削除 | `test_bump_is_committed_immediately` |
+| `bump(..., reason=result.reason)` を `reason=None` にする | `test_bump_records_the_mission_failure_reason` |
+| shell の `orders.get(...) is None` ガードを削除 | `test_reflect_retry_rejects_unknown_order` |
+| `max_attempts` の `ge=1` を外す | `test_reflection_max_attempts_must_be_at_least_one` |
+| 抽出 SQL の `ORDER BY o.id` を削除 | **殺せない (受容)** — 専用テストを書いて実測しても生存する (順序は実行計画依存で黒箱から固定できない)。テストは足さず、Step 3 の SQL に規約コメントを残す |
 
 各変異は 1 件ずつ当て、`grep -n "reflection_attempts\|reflection_abandoned\|attempts <"` で改変を表示後、表の単独テストを実行する。revert 後も同じ単独テストが green であることを確認し ledger に記録する。
+**revert は `git checkout` ではなくバックアップからのファイル全体コピーで行う**
+(同バイト置換 + 同秒 revert の取りこぼしを構造的に避けるため — 着手前検証の実務メモ)。
 
 - [ ] **Step 6: コミット**
 
@@ -10534,6 +10822,12 @@ git commit -m "docs: llama-swap timeout の cold warm 実測を記録する (pla
 | D1 LEFT JOIN 条件削除 | 15 / 5 | `test_failed_old_order_does_not_starve_later_order` |
 | D1 上限を大定数化 | 15 / 5 | `test_reflection_retries_to_limit_then_stops` |
 | D1 成功 clear 削除 | 15 / 5 | `test_success_clears_prior_attempt_row` |
+| D1 `last_reason` を空にする | 15 / 5 | `test_bump_records_the_mission_failure_reason` (着手前検証 2026-08-15 で追加 — 無いとフルスイート green で生存) |
+| D1 `finalize_ok=False` でも消費 | 15 / 5 | `test_finalize_failure_does_not_consume_an_attempt` (同上) |
+| D1 台帳を commit しない | 15 / 5 | `test_bump_is_committed_immediately` (同上) |
+| D1 復帰コマンドの存在ガード削除 | 15 / 5 | `test_reflect_retry_rejects_unknown_order` (同上) |
+| D1 上限の `ge=1` を外す | 15 / 5 | `test_reflection_max_attempts_must_be_at_least_one` (同上) |
+| D1 `ORDER BY o.id` 削除 | 15 / 5 | **殺せない (受容)** — 順序は実行計画依存で黒箱から固定できない。Step 3 の SQL に規約コメントを残す |
 | D3 閾値判定削除 | 17 / 5 | `test_threshold_notifies_once_per_accepted_streak` |
 | D3 streak_id を最新 id 化 | 17 / 5 | `test_threshold_notifies_once_per_accepted_streak` |
 | D3 last id 更新削除 | 17 / 5 | `test_threshold_notifies_once_per_accepted_streak` |
@@ -10561,14 +10855,23 @@ timeout 値を置かない。
 
 `plan-bundle-A.md` Task 4 / Step 1 の正確なテスト名 **`test_reflection_current_retry_behavior_is_pinned`** を削除せず、Task 15 Step 1 で **`test_reflection_retries_to_limit_then_stops`** へ改名・内容置換する。旧期待「同一 order で 2 回 `run_pending` → failed missions 2 本（以後も無制限）」を、新期待「`max_attempts=2` までは failed missions 2 本、3 回目は新 mission なし、attempts=2、abandoned activity は一度」へ変える。
 
+**(着手前検証 2026-08-15 で追加)** Task 4 が固定した回帰ピンは **もう 1 本ある**。
+`tests/loops/test_reflection_cycle.py` の **`test_failed_reflections_starve_later_orders`**
+(Task 4 の 1 周目 codex 指摘 I4) は starvation の現挙動を固定しており、
+Task 15 の実装だけを当てると `assert 2 == 3` で必ず落ちる (probe で実測)。
+これも削除せず **`test_abandon_releases_starved_later_orders`** へ改名・内容置換し、
+旧期待「先頭 3 件が 3 周期とも試行され 4 件目は一度も選ばれない・missions 9 本」を、
+新期待「先頭 3 件は上限 2 で打ち切り、3 周期目に 4 件目が選ばれる・abandoned 3 本・
+**missions 7 本**」へ変える。**上の改名 1 本だけを見て着手すると green にならない。**
+
 #### ④ 他 task との競合ポイント
 
 | ファイル | 競合 | 統合規則 |
 |---|---|---|
-| `store/db.py` | Task 13/19 が rebuild helper と `init_db`、Task 16 が OHLCV 分割、Task 15/17 が新表・trade_intents rebuild | 束 D/C を先に取り込み、既存 migration 呼び出しを一つも落とさず Task 15 → 17 を末尾へ直列追加。Task 16=15 表、Task 15=16 表、Task 17=17 表として各 task 内で `TABLE_NAMES` と `tests/store/test_db.py::EXPECTED` を同期 |
+| `store/db.py` | Task 13/19 が rebuild helper と `init_db`、Task 16 が OHLCV 分割、Task 15/17 が新表・trade_intents rebuild | 束 D/C を先に取り込み、既存 migration 呼び出しを一つも落とさず Task 15 → 17 を末尾へ直列追加。Task 16=15 表、Task 15=16 表、Task 17=17 表として各 task 内で `TABLE_NAMES` と `tests/store/test_db.py::EXPECTED` を同期。**(着手前検証 2026-08-15)** Task 15 は `_SCHEMA` への DDL 追加だけで済み **`init_db` 本体は無変更**。Task 17 は `conn.commit()` の直前へ rebuild を 1 行足す形になり、既存 3 本 (`_ensure_column` / `_migrate_signals_fk` / `_migrate_improvement_runs_v2`) を動かさない |
 | `executor.py` | Task 6/7 が deadline 配線、Task 17 が insert/set_gate_result 引数のみ | 束 B 後に grep を再実行。Task 17 は判定・return・risk gate 呼出しを変えず keyword 引数だけ追加 |
 | `trade_loop.py` | Task 4 が reason 出口、Task 17 が snapshot reject category と commit-post alert | Task 4 の failure reason と deferred notification drain を温存。alert は 357-366 の commit-post 内、scheduler から非到達 |
-| `config.py` / example | Task 16 が cache retention、Task 15/17 が reflection/alert | strict model の top-level fields と example sections を同じ commit 系列で同期 |
+| `config.py` / example | Task 16 が cache retention、Task 15/17 が reflection/alert | strict model の top-level fields と example sections を同じ commit 系列で同期。**(着手前検証 2026-08-15)** `ReflectionSettings` と `AlertSettings` の**両方を Task 15 が先行追加**し、example にも `reflection:` / `alert:` の両節を作る。Task 17 は `AlertSettings` にフィールドを足し example の既存 `alert:` 節へ追記するだけで、節の新設はしない |
 
 #### ⑤ カバーできなかった項目
 
