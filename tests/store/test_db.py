@@ -835,7 +835,10 @@ def test_migrate_signals_fk_leaves_claimed_row_with_valid_mission_untouched(
 def test_migrate_signals_fk_repairs_dangling_consumed_row_without_reviving(
         tmp_path):
     """D5: status='consumed' かつ dangling → claimed_by_mission_id のみ
-    NULL、status は 'consumed' のまま (終端状態を蘇らせない)。"""
+    NULL、status は 'consumed' のまま (終端状態を蘇らせない)。claimed_at は
+    温存する (F3: レビュー 1 周目・muse 指摘 — claimed_at の CASE から
+    `status='claimed' AND` を削る変異は終端状態の claimed_at まで NULL 化
+    してしまうため、元の値のまま残ることを直接ピンする)。"""
     from agentic_fx.store import db as db_module
 
     conn = _legacy_signals_and_missions_conn(tmp_path)
@@ -846,16 +849,18 @@ def test_migrate_signals_fk_repairs_dangling_consumed_row_without_reviving(
     db_module._migrate_signals_fk(conn)
 
     row = conn.execute(
-        "SELECT status, claimed_by_mission_id FROM signals "
+        "SELECT status, claimed_by_mission_id, claimed_at FROM signals "
         "WHERE content_hash='dangling_consumed'").fetchone()
     assert row["status"] == "consumed"  # pending に戻さない
     assert row["claimed_by_mission_id"] is None
+    assert row["claimed_at"] == "2026-08-03T11:30:00+00:00"  # 温存 (F3)
 
 
 def test_migrate_signals_fk_repairs_dangling_abandoned_row_without_reviving(
         tmp_path):
     """D5: status='abandoned' かつ dangling → claimed_by_mission_id のみ
-    NULL、status は 'abandoned' のまま。"""
+    NULL、status は 'abandoned' のまま。claimed_at は温存する (F3、上と
+    同型の pin)。"""
     from agentic_fx.store import db as db_module
 
     conn = _legacy_signals_and_missions_conn(tmp_path)
@@ -866,10 +871,46 @@ def test_migrate_signals_fk_repairs_dangling_abandoned_row_without_reviving(
     db_module._migrate_signals_fk(conn)
 
     row = conn.execute(
-        "SELECT status, claimed_by_mission_id FROM signals "
+        "SELECT status, claimed_by_mission_id, claimed_at FROM signals "
         "WHERE content_hash='dangling_abandoned'").fetchone()
     assert row["status"] == "abandoned"
     assert row["claimed_by_mission_id"] is None
+    assert row["claimed_at"] == "2026-08-03T11:30:00+00:00"  # 温存 (F3)
+
+
+def test_migrate_signals_fk_repairs_claimed_row_with_null_owner(tmp_path):
+    """F1 (レビュー 1 周目 Important): status='claimed' だが
+    claimed_by_mission_id が既に NULL の旧スキーマ行 (所有者無しの claimed)
+    も pending に戻し claimed_at も NULL にする。旧 CASE 条件は
+    `claimed_by_mission_id IS NOT NULL AND ... NOT IN (...)` を要求して
+    おり、owner が NULL のこの行を素通りさせていた — 素通りすると
+    `reclaim_expired` が `datetime(claimed_at)` (NULL) で選べず永久滞留する。
+
+    missions テーブルに 1 行実在させておく — `NOT IN (SELECT id FROM
+    missions)` のサブクエリが空だと `NULL NOT IN ()` が SQL の空リスト
+    特例で vacuous-true になり、`IS NULL OR` を落とす変異でも本テストが
+    誤って green になってしまう (実測で確認)。非空サブクエリなら `NULL
+    NOT IN (非空集合)` は unknown (偽扱い) になるため、`IS NULL OR` が
+    無いと条件全体が偽になり変異を正しく red にできる。
+    """
+    from agentic_fx.store import db as db_module
+    from agentic_fx.store import missions as missions_module
+
+    conn = _legacy_signals_and_missions_conn(tmp_path)
+    now = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
+    missions_module.start(conn, "trade", "local", "m", now)
+    _insert_legacy_signal(conn, content_hash="null_owner_claimed",
+                          status="claimed", claimed_by_mission_id=None,
+                          claimed_at="2026-08-03T11:30:00+00:00")
+
+    db_module._migrate_signals_fk(conn)
+
+    row = conn.execute(
+        "SELECT status, claimed_by_mission_id, claimed_at FROM signals "
+        "WHERE content_hash='null_owner_claimed'").fetchone()
+    assert row["status"] == "pending"
+    assert row["claimed_by_mission_id"] is None
+    assert row["claimed_at"] is None
 
 
 def test_migrate_signals_fk_leaves_pending_row_unchanged(tmp_path):
@@ -1241,6 +1282,28 @@ def test_improvement_runs_migration_error_names_offending_row_ids(tmp_path):
 
     with pytest.raises(RuntimeError, match=f"id={bad_id}"):
         init_db(conn)
+
+
+def test_improvement_runs_migration_error_names_all_offending_row_ids(
+        tmp_path):
+    """F4 (Minor, KAT+muse 一致): bad 行が複数あるとき、エラーメッセージに
+    **両方の** id が含まれること。列挙を先頭 1 件に潰す変異
+    (`bad_rows[0]` 相当) の killer。"""
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (id, result, started_at) VALUES "
+        "(1, 'pr', '2026-08-11T09:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO improvement_runs "
+        "(id, result, pr_url, started_at) VALUES "
+        "(2, 'report', 'https://example.invalid/pr/2', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        init_db(conn)
+
+    assert "id=1, 2" in str(excinfo.value)
 
 
 def test_improvement_runs_check_rejects_invalid_result_after_migration(

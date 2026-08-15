@@ -641,3 +641,98 @@ def test_approved_plugins_keeps_all_approved_hashes_for_a_name(tmp_path):
         "multi_ind": {h, "1" * 64}}
     metas = plugin_loader.approved_plugins(conn, plugins_dir)
     assert len(metas) == 1 and metas[0].name == "multi_ind"
+
+
+# F2 (レビュー 1 周目・3 モデル一致): payload 型ガード 3 種の pin ----------
+#
+# `isinstance(name, str) and isinstance(content_hash, str)` を `True` に
+# する変異が 22 passed で生存した実測を受け、payload_json が壊れている行
+# ・payload が dict でない行・name が str でない行のそれぞれが warning を
+# 出して skip され、同名 plugin の正規の承認判定に影響しないことを直接
+# ピンする。
+
+def test_approved_plugins_skips_row_with_malformed_payload_json(
+        tmp_path, caplog):
+    """payload_json が JSON として壊れている行は warning + skip され、
+    同名 plugin の正規の approved 判定を汚染しない。
+
+    汚染の観測可能性のため、壊れた行は正規の approve より**後**の
+    decided_at で status='rejected' にする — `continue` が外れて前回
+    イテレーションの stale `payload` (Python はループ変数をブロックスコープ
+    しない) が使い回された場合、同じ (name, content_hash) に対して
+    最終決定が rejected に上書きされ `metas == []` になって観測できる。
+    status を approved のままにすると stale payload の再代入が偶然
+    無害になり、汚染有無を観測できない (実測で確認)。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "broken_json_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "broken_json_ind", h, status="approved", now=NOW)
+    later = NOW + timedelta(minutes=1)
+    conn.execute(
+        "INSERT INTO approval_requests (kind, payload_json, status, "
+        "decided_by, decided_at, created_at) VALUES "
+        "('plugin', '{broken', 'rejected', 'shell', ?, ?)",
+        (later.isoformat(), later.isoformat()))
+    conn.commit()
+
+    with caplog.at_level(logging.WARNING):
+        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert len(metas) == 1 and metas[0].name == "broken_json_ind"
+    assert "JSON" in caplog.text
+
+
+def test_approved_plugins_skips_row_with_non_dict_payload(tmp_path, caplog):
+    """payload が dict でない (JSON としては妥当だが list 等) 行は
+    warning + skip され、同名 plugin の正規の approved 判定を汚染しない。
+
+    上のテストと同型の理由で、壊れた行は正規の approve より後の decided_at
+    で status='rejected' にして汚染を観測可能にする。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "nondict_payload_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "nondict_payload_ind", h, status="approved", now=NOW)
+    later = NOW + timedelta(minutes=1)
+    conn.execute(
+        "INSERT INTO approval_requests (kind, payload_json, status, "
+        "decided_by, decided_at, created_at) VALUES "
+        "('plugin', '[1]', 'rejected', 'shell', ?, ?)",
+        (later.isoformat(), later.isoformat()))
+    conn.commit()
+
+    with caplog.at_level(logging.WARNING):
+        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert len(metas) == 1 and metas[0].name == "nondict_payload_ind"
+    assert "dict" in caplog.text
+
+
+def test_approved_plugins_skips_row_with_non_str_name(tmp_path, caplog):
+    """name (または content_hash) が str でない行は warning + skip され、
+    同名 plugin の正規の approved 判定を汚染しない。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "nonstr_name_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "nonstr_name_ind", h, status="approved", now=NOW)
+    conn.execute(
+        "INSERT INTO approval_requests (kind, payload_json, status, "
+        "decided_by, decided_at, created_at) VALUES "
+        "('plugin', ?, 'approved', 'shell', ?, ?)",
+        (json.dumps({"name": 5, "content_hash": "0" * 64}),
+         NOW.isoformat(), NOW.isoformat()))
+    conn.commit()
+
+    with caplog.at_level(logging.WARNING):
+        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert len(metas) == 1 and metas[0].name == "nonstr_name_ind"
+    assert "name/content_hash" in caplog.text

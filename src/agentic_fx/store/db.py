@@ -526,10 +526,17 @@ def _migrate_signals_fk(conn: sqlite3.Connection) -> None:
     修復無しでコピーすると FK 違反になる。
 
     status ごとの修復規則 (D5):
-    - claimed かつ宙吊り: status='pending' + claimed_by_mission_id=NULL +
-      claimed_at=NULL (lease 回収と同じ扱いに戻す)
+    - claimed かつ宙吊り (claimed_by_mission_id が missions に実在しない
+      **か、そもそも NULL** — 旧スキーマでは「claimed なのに owner が
+      NULL」の行が残りうる。レビュー 1 周目 F1 で修正: 旧条件は
+      `claimed_by_mission_id IS NOT NULL` を要求しており、owner が NULL
+      のこの行を素通りさせていた。素通りすると `reclaim_expired` は
+      `datetime(claimed_at)` で選ぶため claimed_at が非 NULL のままでも
+      owner NULL の行を対象にできず永久滞留する): status='pending' +
+      claimed_by_mission_id=NULL + claimed_at=NULL (lease 回収と同じ扱いに
+      戻す)
     - consumed/abandoned かつ宙吊り: claimed_by_mission_id=NULL のみ
-      (**終端状態を蘇らせない** — status は変えない)
+      (**終端状態を蘇らせない** — status も claimed_at も変えない)
     - pending: 元々 claimed_by_mission_id は NULL のため対象外
 
     **PRAGMA foreign_keys は BEGIN の外側でトグルする**。SQLite は
@@ -592,15 +599,17 @@ def _migrate_signals_fk(conn: sqlite3.Connection) -> None:
                 "requeue_count, created_at) "
                 "SELECT id, plugin, content_hash, pair, timeframe, bar_ts, "
                 "kind, payload_json, "
-                "CASE WHEN status='claimed' AND claimed_by_mission_id "
-                "IS NOT NULL AND claimed_by_mission_id NOT IN "
-                "(SELECT id FROM missions) THEN 'pending' ELSE status END, "
+                "CASE WHEN status='claimed' AND "
+                "(claimed_by_mission_id IS NULL OR claimed_by_mission_id "
+                "NOT IN (SELECT id FROM missions)) THEN 'pending' "
+                "ELSE status END, "
                 "CASE WHEN claimed_by_mission_id IS NOT NULL "
                 "AND claimed_by_mission_id NOT IN (SELECT id FROM missions) "
                 "THEN NULL ELSE claimed_by_mission_id END, "
-                "CASE WHEN status='claimed' AND claimed_by_mission_id "
-                "IS NOT NULL AND claimed_by_mission_id NOT IN "
-                "(SELECT id FROM missions) THEN NULL ELSE claimed_at END, "
+                "CASE WHEN status='claimed' AND "
+                "(claimed_by_mission_id IS NULL OR claimed_by_mission_id "
+                "NOT IN (SELECT id FROM missions)) THEN NULL "
+                "ELSE claimed_at END, "
                 "requeue_count, created_at FROM signals_v1")
 
             copied = conn.execute(
