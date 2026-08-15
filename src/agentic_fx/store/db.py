@@ -1,4 +1,4 @@
-"""SQLite 接続 + 15 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
+"""SQLite 接続 + 16 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
 `ohlcv` は含まない) — 設計書 §12。"""
 from __future__ import annotations
 
@@ -111,6 +111,12 @@ CREATE TABLE IF NOT EXISTS reflections (
   order_id INTEGER PRIMARY KEY REFERENCES orders(id),
   content TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reflection_attempts (
+  order_id INTEGER PRIMARY KEY REFERENCES orders(id),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT NOT NULL,
+  last_reason TEXT
+);
 CREATE TABLE IF NOT EXISTS account_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL, balance REAL NOT NULL, equity REAL NOT NULL,
@@ -191,7 +197,7 @@ TABLE_NAMES = frozenset({
     "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
-    "backtest_runs", "analysis_runs", "signals",
+    "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
 })
 
 

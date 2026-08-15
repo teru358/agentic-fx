@@ -9,7 +9,7 @@ from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
-from agentic_fx.store import approvals, missions, orders
+from agentic_fx.store import approvals, missions, orders, reflection_attempts
 from agentic_fx.store.approvals import AlreadyDecidedError
 from agentic_fx.store.state import StateStore
 
@@ -20,6 +20,7 @@ _HELP = """コマンド一覧:
   ask <質問>                  臨時 Mission (回答専用 — 発注はしない)
   approve <id> / reject <id> [理由]   承認操作
   killswitch reset           kill switch ラッチの解除 (人間の明示操作)
+  reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
   stop                       graceful shutdown (シェルのみ)
 (Phase 2 で追加: policy add / improve / news / model / mode / autopilot)"""
 
@@ -75,6 +76,15 @@ class Commands:
                 self.activity.write(Category.SYSTEM, "kill_switch_reset",
                                     "human explicit reset via shell")
                 return "kill switch ラッチを解除しました"
+            if cmd == "reflect" and len(args) == 2 and args[0] == "retry":
+                order_id = int(args[1])
+                if orders.get(self.conn, order_id) is None:
+                    raise ValueError(f"order #{order_id} does not exist")
+                reflection_attempts.clear(self.conn, order_id)
+                self.activity.write(Category.SYSTEM, "reflection_requeued",
+                                    f"order_id={order_id} via shell",
+                                    ref_id=str(order_id))
+                return f"order #{order_id} を reflection 再試行対象へ戻しました"
         except AlreadyDecidedError:
             return "その approval は決定済みです"
         except (ValueError, KeyError) as e:

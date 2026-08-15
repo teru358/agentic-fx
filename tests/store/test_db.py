@@ -9,11 +9,11 @@ EXPECTED = {
     "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
-    "backtest_runs", "analysis_runs", "signals",
+    "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
 }
 
 
-def test_init_creates_all_15_tables(tmp_path):
+def test_init_creates_all_16_tables(tmp_path):
     conn = connect(tmp_path / "agentic.db")
     init_db(conn)
     rows = conn.execute(
@@ -1485,3 +1485,39 @@ def test_migrate_improvement_runs_copies_rows_with_dangling_backlog_id(tmp_path)
     row = conn.execute(
         "SELECT backlog_id FROM improvement_runs").fetchone()
     assert row["backlog_id"] == 999
+
+
+def test_init_db_fresh_creates_reflection_attempts(tmp_path):
+    conn = connect(tmp_path / "fresh.db")
+    init_db(conn)
+    cols = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(reflection_attempts)")}
+    assert cols == {"order_id", "attempts", "last_attempt_at", "last_reason"}
+
+
+def test_init_db_existing_database_adds_reflection_attempts(tmp_path):
+    conn = connect(tmp_path / "legacy.db")
+    conn.executescript(
+        "CREATE TABLE missions (id INTEGER PRIMARY KEY, loop TEXT NOT NULL, "
+        "runner TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL, "
+        "output_json TEXT, transcript_json TEXT, started_at TEXT NOT NULL, "
+        "finished_at TEXT);"
+        "CREATE TABLE trade_intents (id INTEGER PRIMARY KEY, mission_id INTEGER "
+        "NOT NULL, payload_json TEXT NOT NULL, gate_result TEXT, reject_reason "
+        "TEXT, created_at TEXT NOT NULL);"
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, intent_id INTEGER, "
+        "pair TEXT NOT NULL, direction TEXT NOT NULL, entry_type TEXT NOT NULL, "
+        "horizon TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL);"
+    )
+    init_db(conn)
+    assert conn.execute("SELECT COUNT(*) FROM reflection_attempts").fetchone()[0] == 0
+
+
+def test_reflection_attempts_migration_is_idempotent(tmp_path):
+    conn = connect(tmp_path / "existing.db")
+    init_db(conn)
+    init_db(conn)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+        "AND name='reflection_attempts'").fetchone()[0] == 1

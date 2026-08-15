@@ -222,3 +222,27 @@ def test_status_with_broken_state_json(tmp_path):
     # 例外を投げずに文字列を返すこと
     assert isinstance(out, str)
     assert "エラー" in out
+
+
+def test_reflect_retry_deletes_attempt_row(tmp_path):
+    conn, _state, _activity, cmd = _commands(tmp_path)
+    now = cmd.clock.now()
+    conn.execute("INSERT INTO orders (pair,direction,entry_type,horizon,status,"
+                 "created_at,updated_at) VALUES ('USDJPY','long','market','day',"
+                 "'closed',?,?)", (now.isoformat(), now.isoformat()))
+    oid = conn.execute("SELECT id FROM orders").fetchone()[0]
+    from agentic_fx.store import reflection_attempts
+    reflection_attempts.bump(conn, oid, now=now, reason="boom")
+    assert cmd.dispatch(f"reflect retry {oid}") == f"order #{oid} を reflection 再試行対象へ戻しました"
+    assert reflection_attempts.attempts_of(conn, oid) == 0
+
+
+def test_reflect_retry_rejects_unknown_order(tmp_path):
+    """Task 15: 存在しない order への `reflect retry` は成功メッセージを
+    返さない。台帳に無い id を「戻しました」と報告すると、運用者は
+    abandon が解けたと誤認して調査をやめる (`reflection_abandoned` の
+    activity から辿る唯一の復帰手段がこのコマンドである)。"""
+    conn, _state, _activity, cmd = _commands(tmp_path)
+    out = cmd.dispatch("reflect retry 999")
+    assert "再試行対象へ戻しました" not in out
+    assert "does not exist" in out

@@ -303,3 +303,20 @@ def test_cache_retention_days_defaults_to_30():
 def test_cache_retention_days_must_be_positive(tmp_path):
     with pytest.raises(ConfigError, match="cache_retention_days"):
         load_settings(_with_datafeed(tmp_path, cache_retention_days=0))
+
+
+def test_reflection_and_alert_defaults_from_example():
+    s = load_settings(EXAMPLE)
+    assert s.reflection.max_attempts == 2
+    assert s.alert.consecutive_gate_reject == 10
+
+
+def test_reflection_max_attempts_must_be_at_least_one():
+    """Task 15: `ge=1` を落とすと `max_attempts: 0` が通り、抽出条件
+    `a.attempts < 0` により **どの order も一度も振り返られなくなる**
+    (無効化キーが増える)。設計書 D1 は上限の下限を 1 に固定する。"""
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["reflection"] = {"max_attempts": 0}
+    with pytest.raises(ValidationError):
+        Settings.model_validate(raw)

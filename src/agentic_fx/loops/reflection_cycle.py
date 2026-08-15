@@ -38,7 +38,7 @@ from agentic_fx.loops.mission_finalize import finalize_mission
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.prompts_loader import load_prompt
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
-from agentic_fx.store import missions, reflections
+from agentic_fx.store import missions, reflection_attempts, reflections
 from agentic_fx.store.rag import Rag
 
 _log = logging.getLogger("agentic_fx.reflection")
@@ -73,10 +73,17 @@ class ReflectionCycle:
         """
         with self._core_lock:
             rows = self.conn.execute(
-                "SELECT o.* FROM orders o LEFT JOIN reflections r "
-                "ON r.order_id = o.id WHERE o.status='closed' "
-                "AND r.order_id IS NULL ORDER BY o.id LIMIT ?",
-                (max_items,)).fetchall()
+                "SELECT o.* FROM orders o "
+                "LEFT JOIN reflections r ON r.order_id=o.id "
+                # `ORDER BY o.id` は設計書 D1 が明示的に据え置くと決めた条件。
+                # 変えないこと (着手前検証 2026-08-15: この削除変異は黒箱テストでは
+                # 殺せない — 順序は実行計画依存。規約としてここに残す)。
+                "LEFT JOIN reflection_attempts a ON a.order_id=o.id "
+                "WHERE o.status='closed' AND r.order_id IS NULL "
+                "AND (a.attempts IS NULL OR a.attempts < :max) "
+                "ORDER BY o.id LIMIT :limit",
+                {"max": self.settings.reflection.max_attempts, "limit": max_items},
+            ).fetchall()
         created = 0
         for row in rows:
             try:
@@ -184,6 +191,25 @@ class ReflectionCycle:
                     _log.exception(
                         "failed to record reflection_mission_failed for #%s",
                         row["id"])
+                # ↓ここから挿入 (プラン 9 Task 15、設計書 D1)
+                # 失敗を台帳に刻み、上限到達で abandon する。
+                # `finalize_ok=False` は mission 監査書込みの失敗なので
+                # 試行回数を消費しない (下の複合ガードはそのまま温存する)。
+                with self._core_lock:
+                    attempts = reflection_attempts.bump(
+                        self.conn, row["id"], now=self.clock.now(),
+                        reason=result.reason)
+                if attempts == self.settings.reflection.max_attempts:
+                    try:
+                        self.activity.write(
+                            Category.AGGREGATE, "reflection_abandoned",
+                            f"order_id={row['id']} attempts={attempts}",
+                            ref_id=str(row["id"]))
+                    except Exception:  # noqa: BLE001
+                        _log.exception(
+                            "failed to record reflection_abandoned for #%s",
+                            row["id"])
+                # ↑ここまで挿入
 
             if result.status != "completed" or not finalize_ok:
                 # finish 失敗時は監査未確定 (missions 行が running のまま) なので
@@ -217,10 +243,29 @@ class ReflectionCycle:
                     _log.exception(
                         "failed to record reflection_rag_failed for #%s",
                         row["id"])
+                # ↓ここから挿入 (プラン 9 Task 15、設計書 D1)
+                # RAG 書込失敗も再試行を消費する — 「completed だから無料」に
+                # すると恒久的な RAG 障害で無制限再試行が復活する。
+                with self._core_lock:
+                    attempts = reflection_attempts.bump(
+                        self.conn, row["id"], now=self.clock.now(),
+                        reason="rag.add_reflection failed")
+                if attempts == self.settings.reflection.max_attempts:
+                    try:
+                        self.activity.write(
+                            Category.AGGREGATE, "reflection_abandoned",
+                            f"order_id={row['id']} attempts={attempts}",
+                            ref_id=str(row["id"]))
+                    except Exception:  # noqa: BLE001
+                        _log.exception(
+                            "failed to record reflection_abandoned for #%s",
+                            row["id"])
+                # ↑ここまで挿入
                 return False
 
             with self._core_lock:
                 reflections.save(self.conn, row["id"], content, now)
+                reflection_attempts.clear(self.conn, row["id"])
             try:
                 self.activity.write(
                     Category.AGGREGATE, "reflection_created",

@@ -427,35 +427,138 @@ def test_reflection_mission_failed_activity_written_with_reason(tmp_path):
     assert f"order_id={oid}" in act
 
 
-def test_reflection_current_retry_behavior_is_pinned(tmp_path):
-    """Task 4 / CP16 (回帰固定): 同一 order で 2 回 run_pending を呼ぶと
-    **毎回同じ order が選ばれ続ける** — missions 行が 2 本
-    (どちらも failed)・reflection_mission_failed activity が 2 本・
-    reflections 行は 0 本のまま (無制限再試行の現挙動。修正は設計書 §4.5
-    codex I3 で既に独立課題として起票済み・本 task では直さない)。
-
-    ⚠️ **計画の docstring にあった「starvation せず」は誤り**なので削除した
-    (1 周目 codex 指摘 I4)。同じ order が選ばれ続けることは、まさに後続の
-    order を starve させる原因そのものである。starvation 側は order を
-    1 件しか作らないこのテストでは**原理的に観測できない** —
-    `test_failed_reflections_starve_later_orders` が別に固定する。"""
+def test_reflection_retries_to_limit_then_stops(tmp_path):
     conn, rag, cyc = _cycle(tmp_path, [
         MissionResult("failed", None, [], reason="boom1"),
         MissionResult("failed", None, [], reason="boom2"),
+        MissionResult("failed", None, [], reason="must-not-run"),
     ])
     oid = _closed_order(conn)
     assert cyc.run_pending() == 0
     assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM missions WHERE loop='reflection' "
+        "AND status='failed'").fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT attempts FROM reflection_attempts WHERE order_id=?", (oid,)
+    ).fetchone()[0] == 2
 
-    failed_missions = conn.execute(
-        "SELECT COUNT(*) c FROM missions WHERE status='failed'"
-    ).fetchone()["c"]
-    assert failed_missions == 2
 
-    act = (tmp_path / "a.log").read_text(encoding="utf-8")
-    assert act.count("reflection_mission_failed") == 2
+def test_reflection_abandoned_activity_written_once_at_limit(tmp_path):
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("failed", None, [], reason="one"),
+        MissionResult("failed", None, [], reason="two"),
+    ])
+    _closed_order(conn)
+    cyc.run_pending()
+    cyc.run_pending()
+    cyc.run_pending()
+    text = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert text.count("reflection_abandoned") == 1
 
+
+def test_failed_old_order_does_not_starve_later_order(tmp_path):
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("failed", None, [], reason="one"),
+        MissionResult("failed", None, [], reason="two"),
+        MissionResult("completed", {"content": "later"}, []),
+    ])
+    first = _closed_order(conn)
+    second = _closed_order(conn)
+    cyc.run_pending(max_items=1)
+    cyc.run_pending(max_items=1)
+    assert cyc.run_pending(max_items=1) == 1
+    assert reflections.get(conn, first) is None
+    assert reflections.get(conn, second)["content"] == "later"
+
+
+def test_success_clears_prior_attempt_row(tmp_path):
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": "ok"}, [])])
+    oid = _closed_order(conn)
+    from agentic_fx.store import reflection_attempts
+    reflection_attempts.bump(conn, oid, now=NOW, reason="old")
+    assert cyc.run_pending() == 1
+    assert reflection_attempts.attempts_of(conn, oid) == 0
+
+
+def test_rag_failure_consumes_attempt_and_stops_at_limit(tmp_path):
+    from unittest.mock import Mock
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": "ok"}, []),
+        MissionResult("completed", {"content": "ok"}, [])])
+    oid = _closed_order(conn)
+    rag.add_reflection = Mock(side_effect=RuntimeError("chroma down"))
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert reflection_attempts.attempts_of(conn, oid) == 2
+    before = conn.execute("SELECT COUNT(*) FROM missions").fetchone()[0]
+    assert cyc.run_pending() == 0
+    assert conn.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == before
+
+
+def test_finalize_failure_does_not_consume_an_attempt(tmp_path, monkeypatch):
+    """Task 15 (設計書 D1) の契約: `finalize_ok=False` は **mission 監査
+    書込みの失敗**であって reflection 自体の失敗ではない。試行回数を
+    消費させると、`missions.finish` が継続的に失敗する環境で
+    **振り返りが max_attempts 回で恒久 abandon される** —
+    「監査が書けない」という別の故障が、学習材料の永久喪失に化ける。
+
+    段 0 実測: このピンが無いと `not finalize_ok` 経路で bump する変異が
+    フルスイート green のまま生存する。"""
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": "ok"}, []),
+        MissionResult("completed", {"content": "ok"}, [])])
+    oid = _closed_order(conn)
+    monkeypatch.setattr(
+        "agentic_fx.loops.reflection_cycle.finalize_mission",
+        lambda *a, **k: False)
+
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert reflection_attempts.attempts_of(conn, oid) == 0
     assert reflections.get(conn, oid) is None
+    # 上限を消費していないので、3 周期目も同じ order が選ばれ続ける。
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
+    ).fetchone()["c"] == 2
+
+
+def test_bump_is_committed_immediately(tmp_path):
+    """Task 15 (設計書 D1): 失敗台帳は **その場で commit** する。
+    `bump` の `conn.commit()` を落とすと、未コミットのまま次周期を待つ
+    ことになり、プロセス障害 (kill switch 後の再起動・OOM) で試行回数が
+    巻き戻って無制限再試行が復活する。別接続から見えることで固定する。"""
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason="boom")])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    other = connect(tmp_path / "t.db")
+    assert reflection_attempts.attempts_of(other, oid) == 1
+
+
+def test_bump_records_the_mission_failure_reason(tmp_path):
+    """Task 15 (設計書 D1): 台帳の `last_reason` には **spec ② の安全化済み
+    `reason` をそのまま**入れる。`reflection_abandoned` の activity は
+    件数と order_id しか持たないので、**なぜ恒久失敗したか**を残す唯一の
+    場所がこの列である。
+
+    段 0 実測: `reason=result.reason` を `reason=None` にする変異は
+    フルスイート green のまま生存する。"""
+    reason = "context exceeded: prompt 1 tokens > n_ctx 2 (model=m)"
+    conn, rag, cyc = _cycle(tmp_path, [MissionResult(
+        "failed", None, [], reason=reason)])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    row = conn.execute(
+        "SELECT attempts, last_reason FROM reflection_attempts "
+        "WHERE order_id=?", (oid,)).fetchone()
+    assert row["attempts"] == 1
+    assert row["last_reason"] == reason
 
 
 def test_reflection_mission_failed_omits_separator_for_empty_reason(tmp_path):
@@ -632,20 +735,14 @@ def test_reflection_mission_failed_activity_line_is_pinned_field_by_field(
     assert ref_id == str(oid)
 
 
-def test_failed_reflections_starve_later_orders(tmp_path):
-    """Task 4 / 1 周目 codex 指摘 I4 (回帰固定): **失敗し続ける古い order が
-    `max_items` 枠を占有し、後続の order を永久に starve させる**現挙動を
-    固定する (設計書 §4.5 codex I3 の独立課題。本 task では直さない)。
+def test_abandon_releases_starved_later_orders(tmp_path):
+    """Task 4 / codex I4 のピンを Task 15 (設計書 D1) の契約へ更新する。
 
-    `run_pending` の SELECT は「reflections 行が無い closed order」を
-    `ORDER BY o.id LIMIT max_items` で取る。失敗しても reflections 行は
-    作られないので、先頭 3 件が失敗し続ける限り 4 件目は**一度も選ばれない**。
-
-    ⚠️ **order を 1 件しか作らない `test_reflection_current_retry_behavior_
-    is_pinned` ではこれを観測できない。** 「失敗済み order を、他に pending が
-    あるときだけ後順位へ送る」変異は、単独 order のテストを従来どおり通過
-    しながら starvation を解消してしまう (codex 指摘)。現挙動を課題として
-    起票した以上、**その現挙動が本当に起きていること**を測れる形で残す。"""
+    旧ピンは「失敗し続ける先頭 3 件が `max_items` 枠を永久に占有し、
+    4 件目は一度も選ばれない」という**現挙動の固定**だった。D1 は
+    `ORDER BY o.id` を変えずに **abandon で枠を空ける**ことで starvation を
+    解く。したがってこのテストは「上限到達までは先頭 3 件が占有し、
+    到達後は 4 件目が選ばれる」へ書き換える (削除ではなく更新)。"""
     conn, rag, cyc = _cycle(tmp_path, [MissionResult("failed", None, [])])
     oids = [_closed_order(conn) for _ in range(4)]
     assert len(set(oids)) == 4
@@ -653,15 +750,22 @@ def test_failed_reflections_starve_later_orders(tmp_path):
     for _ in range(3):
         assert cyc.run_pending() == 0
 
-    # 先頭 3 件が 3 周期とも試行され、4 件目は一度も選ばれない。
     summaries = [ln.split("\t")[3] for ln in
                  (tmp_path / "a.log").read_text(encoding="utf-8").splitlines()
                  if "\treflection_mission_failed\t" in ln]
+    # 先頭 3 件は上限 (2) まで試行され、そこで打ち切られる。
     for oid in oids[:3]:
         assert sum(1 for s in summaries
-                   if s.startswith(f"order_id={oid} ")) == 3
-    assert not any(s.startswith(f"order_id={oids[3]} ") for s in summaries)
+                   if s.startswith(f"order_id={oid} ")) == 2
+    # 3 周期目で枠が空き、4 件目がはじめて選ばれる (starvation の解消)。
+    assert sum(1 for s in summaries
+               if s.startswith(f"order_id={oids[3]} ")) == 1
+
+    abandoned = [ln for ln in
+                 (tmp_path / "a.log").read_text(encoding="utf-8").splitlines()
+                 if "\treflection_abandoned\t" in ln]
+    assert len(abandoned) == 3
 
     assert conn.execute(
         "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
-    ).fetchone()["c"] == 9
+    ).fetchone()["c"] == 7
