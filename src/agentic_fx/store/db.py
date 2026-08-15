@@ -530,9 +530,10 @@ def _migrate_signals_fk(conn: sqlite3.Connection) -> None:
       **か、そもそも NULL** — 旧スキーマでは「claimed なのに owner が
       NULL」の行が残りうる。レビュー 1 周目 F1 で修正: 旧条件は
       `claimed_by_mission_id IS NOT NULL` を要求しており、owner が NULL
-      のこの行を素通りさせていた。素通りすると `reclaim_expired` は
-      `datetime(claimed_at)` で選ぶため claimed_at が非 NULL のままでも
-      owner NULL の行を対象にできず永久滞留する): status='pending' +
+      のこの行を素通りさせていた。素通りすると `recover_interrupted` は
+      owner で引くため拾えず lease 満了までは不可視になり、claimed_at
+      も NULL の行は `reclaim_expired` (`datetime(claimed_at)` で選ぶ)
+      でも回収されず永久滞留する): status='pending' +
       claimed_by_mission_id=NULL + claimed_at=NULL (lease 回収と同じ扱いに
       戻す)
     - consumed/abandoned かつ宙吊り: claimed_by_mission_id=NULL のみ

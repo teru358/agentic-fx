@@ -884,7 +884,9 @@ def test_migrate_signals_fk_repairs_claimed_row_with_null_owner(tmp_path):
     も pending に戻し claimed_at も NULL にする。旧 CASE 条件は
     `claimed_by_mission_id IS NOT NULL AND ... NOT IN (...)` を要求して
     おり、owner が NULL のこの行を素通りさせていた — 素通りすると
-    `reclaim_expired` が `datetime(claimed_at)` (NULL) で選べず永久滞留する。
+    `recover_interrupted` は owner で引くため拾えず、claimed_at も NULL の
+    行は `reclaim_expired` (`datetime(claimed_at)` で選ぶ) でも回収されず
+    永久滞留する (claimed_at 非 NULL なら lease 満了で回収はされる)。
 
     missions テーブルに 1 行実在させておく — `NOT IN (SELECT id FROM
     missions)` のサブクエリが空だと `NULL NOT IN ()` が SQL の空リスト
