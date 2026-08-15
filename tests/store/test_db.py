@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 
@@ -667,3 +668,454 @@ def test_migrate_ohlcv_split_backup_uses_split_suffix(tmp_path):
     db_module._migrate_ohlcv_split(conn)
 
     assert (tmp_path / "split_backup.db.bak-ohlcv-split").exists()
+
+
+def _legacy_signals_ddl() -> str:
+    """FK 追加前 (Task 13 以前) の signals DDL。claimed_by_mission_id に
+    REFERENCES が無い。"""
+    return (
+        "CREATE TABLE signals ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "plugin TEXT NOT NULL, content_hash TEXT NOT NULL,"
+        "pair TEXT NOT NULL, timeframe TEXT NOT NULL, bar_ts TEXT NOT NULL,"
+        "kind TEXT NOT NULL, payload_json TEXT NOT NULL,"
+        "status TEXT NOT NULL DEFAULT 'pending'"
+        "  CHECK(status IN ('pending','claimed','consumed','abandoned')),"
+        "claimed_by_mission_id INTEGER, claimed_at TEXT,"
+        "requeue_count INTEGER NOT NULL DEFAULT 0,"
+        "created_at TEXT NOT NULL,"
+        "UNIQUE(plugin, content_hash, pair, timeframe, bar_ts))")
+
+
+def _legacy_signals_and_missions_conn(tmp_path):
+    """レガシー (FK 無し) signals + 標準スキーマの missions 等を持つ接続を
+    返す (Task 13 の repair 単体テスト用)。`_SCHEMA` は signals を
+    `CREATE TABLE IF NOT EXISTS` で作るため、先に手動でレガシー signals を
+    作っておけば `executescript(_SCHEMA)` はそれを温存したまま missions 等
+    他テーブルだけを作る。"""
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "legacy.db")
+    conn.execute(_legacy_signals_ddl())
+    conn.commit()
+    conn.executescript(db_module._SCHEMA)
+    return conn
+
+
+def _insert_legacy_signal(conn, *, content_hash, status,
+                          claimed_by_mission_id, claimed_at):
+    conn.execute(
+        "INSERT INTO signals (plugin, content_hash, pair, timeframe, "
+        "bar_ts, kind, payload_json, status, claimed_by_mission_id, "
+        "claimed_at, requeue_count, created_at) VALUES "
+        "('p', ?, 'USDJPY', '1h', '2026-08-03T12:00:00+00:00', 'signal', "
+        "'{}', ?, ?, ?, 0, '2026-08-03T11:00:00+00:00')",
+        (content_hash, status, claimed_by_mission_id, claimed_at))
+    conn.commit()
+
+
+# --- 受入条件: FK 自体 ------------------------------------------------
+
+def test_init_db_fresh_signals_table_has_missions_fk(tmp_path):
+    conn = connect(tmp_path / "fresh.db")
+    init_db(conn)
+    fks = conn.execute("PRAGMA foreign_key_list(signals)").fetchall()
+    assert any(fk["table"] == "missions"
+              and fk["from"] == "claimed_by_mission_id" for fk in fks)
+
+
+def test_signals_fk_rejects_nonexistent_mission_id_after_migration(tmp_path):
+    conn = connect(tmp_path / "fresh.db")
+    init_db(conn)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO signals (plugin, content_hash, pair, timeframe, "
+            "bar_ts, kind, payload_json, status, claimed_by_mission_id, "
+            "claimed_at, requeue_count, created_at) VALUES "
+            "('p','h','USDJPY','1h','2026-08-03T12:00:00+00:00','signal',"
+            "'{}','claimed', 12345, '2026-08-03T12:00:00+00:00', 0, "
+            "'2026-08-03T11:00:00+00:00')")
+
+
+# --- 受入条件: legacy DB からの移行 (エンドツーエンド) -------------------
+
+def test_init_db_migrates_legacy_signals_to_v2(tmp_path):
+    """旧 (FK 無し) signals を持つ DB に init_db を流すと FK 付きへ
+    再構築され、宙吊り行 (missions 行が無い claimed) が修復されること。"""
+    conn = connect(tmp_path / "legacy.db")
+    conn.execute(_legacy_signals_ddl())
+    conn.execute(
+        "INSERT INTO signals (plugin, content_hash, pair, timeframe, "
+        "bar_ts, kind, payload_json, status, claimed_by_mission_id, "
+        "claimed_at, requeue_count, created_at) VALUES "
+        "('p','h','USDJPY','1h','2026-08-03T12:00:00+00:00','signal','{}',"
+        "'claimed', 999, '2026-08-03T11:30:00+00:00', 0, "
+        "'2026-08-03T11:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)  # missions は空のまま作られるので 999 は宙吊り
+
+    row = conn.execute(
+        "SELECT status, claimed_by_mission_id, claimed_at "
+        "FROM signals").fetchone()
+    assert row["status"] == "pending"
+    assert row["claimed_by_mission_id"] is None
+    assert row["claimed_at"] is None
+    fks = conn.execute("PRAGMA foreign_key_list(signals)").fetchall()
+    assert any(fk["table"] == "missions" for fk in fks)
+
+
+def test_signals_migration_is_idempotent(tmp_path):
+    conn = connect(tmp_path / "legacy.db")
+    conn.execute(_legacy_signals_ddl())
+    conn.execute(
+        "INSERT INTO signals (plugin, content_hash, pair, timeframe, "
+        "bar_ts, kind, payload_json, status, requeue_count, created_at) "
+        "VALUES ('p','h','USDJPY','1h','2026-08-03T12:00:00+00:00','signal',"
+        "'{}','pending', 0, '2026-08-03T11:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+    init_db(conn)  # 2 回目でも例外なし
+
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "signals_v1" not in names
+    assert conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"] == 1
+
+
+# --- 受入条件: status ごとの修復規則 (D5、1 検査目的 1 テスト) -----------
+
+def test_migrate_signals_fk_repairs_dangling_claimed_row(tmp_path):
+    """D5: status='claimed' かつ参照先 missions 行が無い → pending に戻し
+    claimed_by_mission_id/claimed_at を NULL にする。"""
+    from agentic_fx.store import db as db_module
+
+    conn = _legacy_signals_and_missions_conn(tmp_path)
+    _insert_legacy_signal(conn, content_hash="dangling_claimed",
+                          status="claimed", claimed_by_mission_id=999,
+                          claimed_at="2026-08-03T11:30:00+00:00")
+
+    db_module._migrate_signals_fk(conn)
+
+    row = conn.execute(
+        "SELECT status, claimed_by_mission_id, claimed_at FROM signals "
+        "WHERE content_hash='dangling_claimed'").fetchone()
+    assert row["status"] == "pending"
+    assert row["claimed_by_mission_id"] is None
+    assert row["claimed_at"] is None
+
+
+def test_migrate_signals_fk_leaves_claimed_row_with_valid_mission_untouched(
+        tmp_path):
+    """claimed かつ参照先 missions 行が実在する場合は無変更 — repair が
+    dangling 行だけに当たり、有効な claim の監査情報を壊さないことの
+    ピン (D5 の変異リストには無いが、"claimed の修復を落とす" の逆方向の
+    検査として必要)。"""
+    from agentic_fx.store import db as db_module
+    from agentic_fx.store import missions
+
+    conn = _legacy_signals_and_missions_conn(tmp_path)
+    now = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
+    mid = missions.start(conn, "trade", "local", "m", now)
+    _insert_legacy_signal(conn, content_hash="valid_claimed",
+                          status="claimed", claimed_by_mission_id=mid,
+                          claimed_at="2026-08-03T11:30:00+00:00")
+
+    db_module._migrate_signals_fk(conn)
+
+    row = conn.execute(
+        "SELECT status, claimed_by_mission_id, claimed_at FROM signals "
+        "WHERE content_hash='valid_claimed'").fetchone()
+    assert row["status"] == "claimed"
+    assert row["claimed_by_mission_id"] == mid
+    assert row["claimed_at"] == "2026-08-03T11:30:00+00:00"
+
+
+def test_migrate_signals_fk_repairs_dangling_consumed_row_without_reviving(
+        tmp_path):
+    """D5: status='consumed' かつ dangling → claimed_by_mission_id のみ
+    NULL、status は 'consumed' のまま (終端状態を蘇らせない)。"""
+    from agentic_fx.store import db as db_module
+
+    conn = _legacy_signals_and_missions_conn(tmp_path)
+    _insert_legacy_signal(conn, content_hash="dangling_consumed",
+                          status="consumed", claimed_by_mission_id=999,
+                          claimed_at="2026-08-03T11:30:00+00:00")
+
+    db_module._migrate_signals_fk(conn)
+
+    row = conn.execute(
+        "SELECT status, claimed_by_mission_id FROM signals "
+        "WHERE content_hash='dangling_consumed'").fetchone()
+    assert row["status"] == "consumed"  # pending に戻さない
+    assert row["claimed_by_mission_id"] is None
+
+
+def test_migrate_signals_fk_repairs_dangling_abandoned_row_without_reviving(
+        tmp_path):
+    """D5: status='abandoned' かつ dangling → claimed_by_mission_id のみ
+    NULL、status は 'abandoned' のまま。"""
+    from agentic_fx.store import db as db_module
+
+    conn = _legacy_signals_and_missions_conn(tmp_path)
+    _insert_legacy_signal(conn, content_hash="dangling_abandoned",
+                          status="abandoned", claimed_by_mission_id=999,
+                          claimed_at="2026-08-03T11:30:00+00:00")
+
+    db_module._migrate_signals_fk(conn)
+
+    row = conn.execute(
+        "SELECT status, claimed_by_mission_id FROM signals "
+        "WHERE content_hash='dangling_abandoned'").fetchone()
+    assert row["status"] == "abandoned"
+    assert row["claimed_by_mission_id"] is None
+
+
+def test_migrate_signals_fk_leaves_pending_row_unchanged(tmp_path):
+    """D5: status='pending' (claimed_by_mission_id は元々 NULL) → 無変更。"""
+    from agentic_fx.store import db as db_module
+
+    conn = _legacy_signals_and_missions_conn(tmp_path)
+    _insert_legacy_signal(conn, content_hash="already_pending",
+                          status="pending", claimed_by_mission_id=None,
+                          claimed_at=None)
+
+    db_module._migrate_signals_fk(conn)
+
+    row = conn.execute(
+        "SELECT status, claimed_by_mission_id, claimed_at FROM signals "
+        "WHERE content_hash='already_pending'").fetchone()
+    assert row["status"] == "pending"
+    assert row["claimed_by_mission_id"] is None
+    assert row["claimed_at"] is None
+
+
+def test_migrate_signals_fk_leaves_foreign_key_check_clean(tmp_path):
+    """移行後は PRAGMA foreign_key_check(signals) が空であること (D5 の
+    受入条件の直接ピン)。"""
+    from agentic_fx.store import db as db_module
+
+    conn = _legacy_signals_and_missions_conn(tmp_path)
+    _insert_legacy_signal(conn, content_hash="dangling",
+                          status="claimed", claimed_by_mission_id=999,
+                          claimed_at="2026-08-03T11:30:00+00:00")
+
+    db_module._migrate_signals_fk(conn)
+
+    violations = conn.execute("PRAGMA foreign_key_check(signals)").fetchall()
+    assert violations == []
+
+
+# --- 受入条件: UNIQUE / CHECK / id / sqlite_sequence の温存 ------------
+
+def test_signals_migration_preserves_unique_constraint(tmp_path):
+    conn = connect(tmp_path / "legacy.db")
+    conn.execute(_legacy_signals_ddl())
+    conn.execute(
+        "INSERT INTO signals (plugin, content_hash, pair, timeframe, "
+        "bar_ts, kind, payload_json, status, requeue_count, created_at) "
+        "VALUES ('p','h','USDJPY','1h','2026-08-03T12:00:00+00:00','signal',"
+        "'{}','pending', 0, '2026-08-03T11:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+
+    from agentic_fx.store import signals as signals_module
+    dup = signals_module.add(
+        conn, plugin="p", content_hash="h", pair="USDJPY", timeframe="1h",
+        bar_ts="2026-08-03T12:00:00+00:00", kind="signal", payload={"x": 2},
+        now=datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc))
+    assert dup is None  # UNIQUE(plugin,content_hash,pair,timeframe,bar_ts)
+
+
+def test_signals_migration_preserves_status_check(tmp_path):
+    conn = connect(tmp_path / "legacy.db")
+    conn.execute(_legacy_signals_ddl())
+    conn.commit()
+
+    init_db(conn)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO signals (plugin, content_hash, pair, timeframe, "
+            "bar_ts, kind, payload_json, status, requeue_count, created_at) "
+            "VALUES ('p','h','USDJPY','1h','2026-08-03T12:00:00+00:00',"
+            "'signal','{}','bogus_status', 0, '2026-08-03T11:00:00+00:00')")
+
+
+def test_signals_migration_preserves_ids_and_autoincrement_sequence(
+        tmp_path):
+    conn = connect(tmp_path / "legacy.db")
+    conn.execute(_legacy_signals_ddl())
+    conn.execute(
+        "INSERT INTO signals (id, plugin, content_hash, pair, timeframe, "
+        "bar_ts, kind, payload_json, status, claimed_by_mission_id, "
+        "claimed_at, requeue_count, created_at) VALUES "
+        "(7,'p','h','USDJPY','1h','2026-08-03T12:00:00+00:00','signal','{}',"
+        "'pending', NULL, NULL, 0, '2026-08-03T11:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+
+    row = conn.execute("SELECT id FROM signals").fetchone()
+    assert row["id"] == 7  # id は書き換えられない
+
+    from agentic_fx.store import signals as signals_module
+    new_id = signals_module.add(
+        conn, plugin="p2", content_hash="h2", pair="USDJPY", timeframe="1h",
+        bar_ts="2026-08-03T13:00:00+00:00", kind="signal", payload={},
+        now=datetime(2026, 8, 3, 13, 0, tzinfo=timezone.utc))
+    assert new_id > 7  # AUTOINCREMENT シーケンスが id=7 を踏まえて続く
+
+
+# --- PRAGMA foreign_keys の復元 (BEGIN 前後のトグル順序のピン) ---------
+
+def test_migrate_signals_fk_restores_foreign_keys_pragma_after_failure(
+        tmp_path):
+    """SQLite はトランザクション開始後の `PRAGMA foreign_keys` 変更を
+    無視する (実測確認済み)。migration は BEGIN の**外側**で OFF にし、
+    成功・失敗を問わず ON に戻さねばならない — 戻し忘れると以降の
+    プロセス全体で FK 保護が無効になる。INSERT を意図的に失敗させ、
+    例外後も `PRAGMA foreign_keys` が 1 (ON) であることを確認する。"""
+    from agentic_fx.store import db as db_module
+
+    conn = _legacy_signals_and_missions_conn(tmp_path)
+    _insert_legacy_signal(conn, content_hash="x", status="pending",
+                          claimed_by_mission_id=None, claimed_at=None)
+
+    class _FailingConn:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args, **kwargs):
+            if str(sql).strip().startswith("INSERT OR IGNORE INTO signals "):
+                raise sqlite3.OperationalError("injected failure")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    with pytest.raises(sqlite3.OperationalError):
+        db_module._migrate_signals_fk(_FailingConn(conn))
+
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_migrate_signals_fk_disables_foreign_keys_before_begin(tmp_path):
+    """順序そのものを観測し、BEGIN 後へ OFF を移す変異を殺す。"""
+    from agentic_fx.store import db as db_module
+    real = _legacy_signals_and_missions_conn(tmp_path)
+
+    class _OrderConn:
+        def __init__(self, conn):
+            self._conn, self.events = conn, []
+        def execute(self, sql, *args, **kwargs):
+            normalized = " ".join(str(sql).split()).upper()
+            if normalized in {"PRAGMA FOREIGN_KEYS=OFF", "BEGIN IMMEDIATE"}:
+                self.events.append(normalized)
+            return self._conn.execute(sql, *args, **kwargs)
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    observed = _OrderConn(real)
+    db_module._migrate_signals_fk(observed)
+    assert observed.events.index("PRAGMA FOREIGN_KEYS=OFF") < \
+           observed.events.index("BEGIN IMMEDIATE")
+
+
+def test_migrate_signals_fk_restores_foreign_keys_pragma_after_success(
+        tmp_path):
+    """成功経路でも PRAGMA foreign_keys が ON に戻ること。
+
+    **着手前検証で追加。** 失敗経路だけを見る `..._after_failure` では、
+    `finally` を `except BaseException` に変えて「成功時は OFF のまま」に
+    する変異が `tests/` 全 1946 件 green で生存する (実測)。戻し忘れると、
+    既存 DB から起動した以降のプロセス全体で FK 保護が無効になり、Task 13
+    が追加した防御そのものが機能しなくなる (実測: bogus mission_id での
+    INSERT が通ってしまう)。fresh DB では `_migrate_signals_fk` が early
+    return して pragma に触らないため、legacy 経路で見る必要がある。
+    """
+    from agentic_fx.store import db as db_module
+
+    conn = _legacy_signals_and_missions_conn(tmp_path)
+    _insert_legacy_signal(conn, content_hash="x", status="pending",
+                          claimed_by_mission_id=None, claimed_at=None)
+
+    db_module._migrate_signals_fk(conn)
+
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    # pragma が実際に効いていることまで見る (値だけでは強制の有無は分からない)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO signals (plugin, content_hash, pair, timeframe, "
+            "bar_ts, kind, payload_json, status, claimed_by_mission_id, "
+            "claimed_at, requeue_count, created_at) VALUES "
+            "('p','after','USDJPY','1h','2026-08-03T12:00:00+00:00','signal',"
+            "'{}','claimed', 424242, '2026-08-03T12:00:00+00:00', 0, "
+            "'2026-08-03T11:00:00+00:00')")
+
+
+def test_migrate_signals_fk_resumes_after_crash_between_rename_and_copy(
+        tmp_path):
+    """RENAME + CREATE の直後にクラッシュした DB から再開できること。
+
+    **着手前検証で追加。** signals は FK 付きで空、signals_v1 に行が残って
+    いる状態。冪等ガードを `if fk_present: return` に弱める変異は、この形が
+    無いと `tests/` 全 1946 件 green で生存し、再開時に全行を失う (実測:
+    signals 0 行 + signals_v1 が孤児として残存)。
+    `test_signals_migration_is_idempotent` はクリーンな legacy DB 上でしか
+    回らず、どちらのガード形でも 2 周目に early return するため殺せない。
+    """
+    from agentic_fx.store import db as db_module
+
+    conn = _legacy_signals_and_missions_conn(tmp_path)
+    _insert_legacy_signal(conn, content_hash="survivor", status="pending",
+                          claimed_by_mission_id=None, claimed_at=None)
+    # クラッシュ状態を再現: RENAME 済み + 新表 CREATE 済み + コピー前
+    conn.execute("ALTER TABLE signals RENAME TO signals_v1")
+    conn.execute(db_module._SIGNALS_V2_DDL)
+    conn.commit()
+
+    db_module._migrate_signals_fk(conn)
+
+    rows = conn.execute("SELECT content_hash FROM signals").fetchall()
+    assert [r["content_hash"] for r in rows] == ["survivor"]
+    names = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "signals_v1" not in names
+
+
+# --- 移行前バックアップ (他 2 つの rebuild と規約統一) -------------------
+
+def test_migrate_signals_fk_backup_uses_signals_fk_suffix(tmp_path):
+    """signals FK migration のバックアップ名は `.bak-signals-fk`。
+
+    **着手前検証で追加 (指揮者裁定)。** `db.py` の他 2 つの table rebuild
+    (`_migrate_ohlcv_v2` = `.bak-ohlcv-v2` / `_migrate_ohlcv_split` =
+    `.bak-ohlcv-split`) と同じ規約で、移行の種類ごとに別ファイルへ退避する。
+    suffix がずれると別移行のバックアップを上書きしかねない。
+    `test_migrate_ohlcv_split_backup_uses_split_suffix` と同型の pin。
+    """
+    from agentic_fx.store import db as db_module
+
+    conn = _legacy_signals_and_missions_conn(tmp_path)
+    _insert_legacy_signal(conn, content_hash="x", status="pending",
+                          claimed_by_mission_id=None, claimed_at=None)
+
+    db_module._migrate_signals_fk(conn)
+
+    assert (tmp_path / "legacy.db.bak-signals-fk").exists()
+
+
+def test_migrate_signals_fk_skips_backup_when_already_migrated(tmp_path):
+    """冪等ガードで抜ける通常起動ではバックアップを取らないこと。
+
+    **着手前検証で追加 (指揮者裁定)。** backup 呼び出しの位置がガードより
+    前へずれると、毎起動で DB 全体のコピーコストが乗る。
+    """
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "fresh.db")
+    init_db(conn)          # fresh は _SCHEMA 側で FK 付き → 移行不要
+    assert not (tmp_path / "fresh.db.bak-signals-fk").exists()

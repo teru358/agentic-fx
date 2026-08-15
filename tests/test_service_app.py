@@ -610,6 +610,7 @@ def test_f1b_signal_mission_does_not_fire_without_d2_position(tmp_path):
 def test_f1c_startup_reclaim_recovers_claimed_signal(tmp_path):
     """F1(c): 停止時に claimed のまま残った signal 行が、次の build_app
     (= 次回起動) 直後、tick を待たずに pending へ回収されること。"""
+    from agentic_fx.store import missions as missions_module
     from agentic_fx.store import signals as signals_store
 
     _init(tmp_path)
@@ -619,11 +620,21 @@ def test_f1c_startup_reclaim_recovers_claimed_signal(tmp_path):
         app1.conn_core, plugin="sig1", content_hash="h1", pair="USDJPY",
         timeframe="1h", bar_ts=(NOW - timedelta(hours=1)).isoformat(),
         kind="signal", payload={"direction": "long"}, now=NOW)
+    # Task 13: claimed_by_mission_id に missions(id) への FK が付くため、
+    # 実在する mission 行が必要 (以前はダミー整数 999 だった)。
+    mid = missions_module.start(app1.conn_core, "trade", "local", "m", NOW)
     lease_min = app1.settings.plugin.signal_lease_min
     old = NOW - timedelta(minutes=lease_min + 5)
-    claimed = signals_store.claim_oldest(app1.conn_core, mission_id=999,
+    claimed = signals_store.claim_oldest(app1.conn_core, mission_id=mid,
                                          now=old, freshness_bars=None)
     assert claimed is not None and claimed["id"] == sid  # 前提
+
+    # 起動時 recover_interrupted が claim を先に戻さないよう mission を終端化。
+    # これにより次回起動で pending 化する唯一の主体が lease 回収になる。
+    # ⚠️ `missions.finish` は 6 引数必須 (conn, mission_id, status,
+    #    output, transcript, now)。既定値は無い (`store/missions.py:23-24`)。
+    #    4 引数だと NOW が output に束縛され TypeError で落ちる (3 周目レビュー)。
+    missions_module.finish(app1.conn_core, mid, "completed", None, [], NOW)
 
     # FC-2 (プラン8): instance_lock (flock) は App の全寿命で保持される
     # ため、同一 root への 2 回目の build_app は 1 回目の instance_lock を
