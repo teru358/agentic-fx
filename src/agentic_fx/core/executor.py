@@ -6,7 +6,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable
+from typing import Callable, Protocol
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
@@ -146,6 +146,36 @@ def has_unresolved_unknown(conn: sqlite3.Connection) -> bool:
     return bool(orders.list_by_status(conn, *_UNKNOWN))
 
 
+class RateFn(Protocol):
+    """`Executor` に注入する換算レート供給の契約 (Task 7, プラン9 束B)。
+
+    `deadline_check` は **keyword-only かつ受理必須** — gather 経路
+    (`gather_open_snapshot` → `cycle_rate_fn` / `gather_close_snapshot` →
+    `resolve_close_rate`) は無条件に kwarg 付きで呼ぶ。gather 以外の経路
+    (`_open` 等) は kwarg を渡さないので、実装側は既定値 `None` を持つ
+    こと。
+
+    `Callable[[str, str, datetime], ConversionRate]` は keyword-only 引数を
+    表現できず、3 引数しか受けない実装を「適合」に見せてしまうため
+    Protocol にする (束B レビュー: codex 静的読解の指摘)。3 引数の実装を
+    配線すると gather で `TypeError` になり、OPEN は健全でも
+    `"execution snapshot unavailable: ..."` の gate 拒否、CLOSE は
+    `resolve_close_rate` の広い `except` に吸収されて `rate=None` の
+    degraded (realized_pnl が未確定のまま残る) になる。
+
+    構造的部分型なので実装側の継承・import は不要 (kwarg を受ければ適合)。
+    **本リポジトリは静的型検査器を使っていない (CI は pytest のみ) ため、
+    この宣言に強制力は無い。** 実際の退行検出は gather を実駆動する配線
+    テスト (`tests/test_service_app.py` の
+    `test_build_app_open_gather_drives_production_rate_fn` /
+    `test_build_app_close_gather_is_not_degraded`) が担う。
+    """
+
+    def __call__(self, ccy: str, account_ccy: str, now: datetime, *,
+                 deadline_check: Callable[[str], None] | None = None
+                 ) -> ConversionRate: ...
+
+
 class Executor:
     def __init__(self, *, conn: sqlite3.Connection, broker: PaperBroker,
                  settings: Settings, state_store: StateStore,
@@ -153,7 +183,7 @@ class Executor:
                  monotonic_fn: Callable[[], float] = time.monotonic,
                  quote_fn: Callable[[str], Quote],
                  spec_fn: Callable[[str], InstrumentSpec],
-                 rate_fn: Callable[[str, str, datetime], ConversionRate],
+                 rate_fn: RateFn,
                  ) -> None:
         self.conn = conn
         self.broker = broker

@@ -62,9 +62,14 @@ def _env(tmp_path, now, on_econ_cycle=None):
         notifier=Notifier(enabled=False, webhook_url=None), clock=clock,
         # ★ プラン 2 の注入点にプラン 3 の実装をそのまま渡す
         quote_fn=provider.get_quote, spec_fn=provider.spec,
-        rate_fn=lambda ccy, account_ccy, now: provider.to_account_rate(
-            ccy, account_ccy, reference_ts=now,
-            max_skew_min=settings.datafeed.conversion_skew_max_min))
+        # `Executor` の `RateFn` 契約どおり keyword-only `deadline_check` を
+        # 受けて転送する (このファイルは gather を駆動しないので実際には
+        # 常に None だが、3 引数のままだと「本番と同型の配線」を騙る)。
+        rate_fn=lambda ccy, account_ccy, now, *, deadline_check=None: (
+            provider.to_account_rate(
+                ccy, account_ccy, reference_ts=now,
+                max_skew_min=settings.datafeed.conversion_skew_max_min,
+                deadline_check=deadline_check)))
     collector = NewsCollector(
         conn, Rag(tmp_path / "rag", embedding_function=FakeEmbedding()),
         activity, clock, timeout_sec=10)

@@ -12,7 +12,10 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from agentic_fx.core.contracts import FixedClock
+from agentic_fx.core.contracts import (
+    Action, ConversionRate, Direction, EntryType, FixedClock, Horizon,
+    InstrumentSpec, Origin, Quote, TradeIntent,
+)
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
@@ -2479,5 +2482,81 @@ def test_build_app_rate_fn_forwards_deadline_check_to_price_provider(tmp_path):
         assert kwargs["deadline_check"] is probe, (
             "本番配線の rate_fn が deadline_check を to_account_rate へ"
             "転送していない")
+    finally:
+        app.close()
+
+
+# ---- 本番配線 gather の実駆動 (束B レビュー: rate_fn 契約の宣言/実態一致) ---
+
+_GATHER_SPEC = InstrumentSpec(
+    symbol="USDJPY", pip_size=0.01, min_lot=0.01, max_lot=50.0, lot_step=0.01,
+    contract_size=100_000, base_currency="USD", quote_currency="JPY")
+
+
+def _gather_app(tmp_path):
+    """build_app の本番配線で executor を組み、gather が実駆動できる最小の
+    PriceProvider スタブを当てる (外部アクセスなし)。"""
+    (tmp_path / "config").mkdir()
+    src = open("config/settings.yaml.example", encoding="utf-8").read()
+    (tmp_path / "config" / "settings.yaml").write_text(src)
+    with patch("agentic_fx.service.PriceProvider") as pp, \
+         patch("agentic_fx.service._check_llama_swap"):
+        pp.return_value.healthcheck.return_value = "yfinance"
+        pp.return_value.get_quote.return_value = Quote(
+            "USDJPY", 148.49, 148.51, NOW, "test")
+        pp.return_value.spec.return_value = _GATHER_SPEC
+        pp.return_value.to_account_rate.side_effect = (
+            lambda ccy, account_ccy, **kw: ConversionRate(
+                1.0 if ccy == account_ccy else 148.51, ccy, account_ccy,
+                (kw["reference_ts"],)))
+        return build_app(tmp_path)
+
+
+def test_build_app_open_gather_drives_production_rate_fn(tmp_path):
+    """本番配線 (build_app) の executor で OPEN gather を実駆動する。
+
+    `Executor.__init__` の `rate_fn` は gather 経由で必ず keyword-only の
+    `deadline_check` 付きで呼ばれる (executor.py `cycle_rate_fn`)。この契約に
+    適合しない 3 引数 `rate_fn` を配線すると TypeError になり、trade_loop の
+    commit-pre が `"execution snapshot unavailable: ..."` の gate 拒否に変換
+    する (健全でも発注できない)。既存テストはこの経路を build_app 配線で一度も
+    踏まない — `tests/test_wiring.py` は gather を呼ばず、
+    `test_build_app_rate_fn_forwards_deadline_check_to_price_provider` は
+    `rate_fn` を直接呼ぶだけ。
+
+    kill: 配線側の `rate_fn` を 3 引数に戻すと TypeError で red。
+    """
+    app = _gather_app(tmp_path)
+    try:
+        intent = TradeIntent(action=Action.OPEN, origin=Origin.SCHEDULER,
+                             reasoning="t", pair="USDJPY",
+                             direction=Direction.LONG,
+                             entry_type=EntryType.MARKET, horizon=Horizon.DAY,
+                             stop_loss=147.0, take_profit=150.0)
+        snapshot = app.executor.gather_open_snapshot(intent,
+                                                     exposure_pairs=[])
+        assert set(snapshot.rates) == {"USD", "JPY"}
+        assert snapshot.rates["USD"].value == 148.51
+    finally:
+        app.close()
+
+
+def test_build_app_close_gather_is_not_degraded(tmp_path):
+    """CLOSE gather は本番配線で degraded に落ちないこと。
+
+    **「例外にならない」ではピンにならない** — `resolve_close_rate` の広い
+    `except Exception` が契約不整合の TypeError も吸収するため、3 引数
+    `rate_fn` を配線しても `gather_close_snapshot` は raise せず、
+    `rate=None` / `rate_degraded=True` で静かに縮退する (realized_pnl が
+    未確定のまま残る)。`rate_degraded is False` と
+    `rate_degraded_reason is None` まで見て初めて kill できる。
+    """
+    app = _gather_app(tmp_path)
+    try:
+        row = {"id": 1, "pair": "USDJPY", "direction": "long"}
+        snapshot = app.executor.gather_close_snapshot(row)
+        assert snapshot.rate_degraded is False, snapshot.rate_degraded_reason
+        assert snapshot.rate_degraded_reason is None
+        assert snapshot.rate is not None and snapshot.rate.value == 1.0
     finally:
         app.close()
