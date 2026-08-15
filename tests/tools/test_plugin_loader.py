@@ -736,3 +736,33 @@ def test_approved_plugins_skips_row_with_non_str_name(tmp_path, caplog):
 
     assert len(metas) == 1 and metas[0].name == "nonstr_name_ind"
     assert "name/content_hash" in caplog.text
+
+
+def test_approved_plugins_skips_row_with_non_str_content_hash(tmp_path, caplog):
+    """content_hash が str でない行も warning + skip される (name 側の
+    `..._non_str_name` と対をなす pin — 型ガードは 2 項で、片側だけ pin
+    すると他方を落とす変異が生き残る)。壊れた行は正規の (name, h) を
+    上書きしないため `metas` だけでは観測できず、`_approved_hashes_by_name`
+    の戻り値集合に非 str が混入していないことを直接 pin する。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "nonstr_hash_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "nonstr_hash_ind", h, status="approved", now=NOW)
+    conn.execute(
+        "INSERT INTO approval_requests (kind, payload_json, status, "
+        "decided_by, decided_at, created_at) VALUES "
+        "('plugin', ?, 'approved', 'shell', ?, ?)",
+        (json.dumps({"name": "nonstr_hash_ind", "content_hash": 5}),
+         NOW.isoformat(), NOW.isoformat()))
+    conn.commit()
+
+    with caplog.at_level(logging.WARNING):
+        hashes = plugin_loader._approved_hashes_by_name(conn)
+        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert hashes == {"nonstr_hash_ind": {h}}  # 5 が混入していない
+    assert len(metas) == 1 and metas[0].name == "nonstr_hash_ind"
+    assert "name/content_hash" in caplog.text
