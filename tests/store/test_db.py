@@ -99,6 +99,34 @@ def test_repeated_init_db_does_not_wipe_action_and_category(tmp_path):
     assert row["reject_category"] == "risk_gate"
 
 
+def test_leftover_new_table_does_not_trigger_destructive_rebuild(tmp_path):
+    """F5 (Task 17 検証 Minor-6): `trade_intents_new` が残存し**かつ**
+    `trade_intents` が既に新列を持つ状態で `init_db` すると、旧
+    `_needs_migration()` は「列が揃っていても new_exists なら True」を
+    返すため、破壊的 rebuild が再走して `action`/`reject_category` を
+    NULL 化していた (`INSERT ... SELECT ... NULL AS action` のコピー元は
+    常に旧 `trade_intents`)。列が揃っている場合は残骸の DROP だけで済ませ、
+    rebuild しないことを固定する。"""
+    from agentic_fx.store import intents, missions
+    c = connect(tmp_path / "leftover.db")
+    init_db(c)
+    mid = missions.start(c, "trade", "local", "m", NOW)
+    iid = intents.insert(c, mid, {}, NOW, action="open")
+    intents.set_gate_result(c, iid, accepted=False, reject_reason="r",
+                            reject_category="risk_gate")
+    c.execute("CREATE TABLE trade_intents_new (x INTEGER)")
+    c.commit()
+    init_db(c)
+    row = c.execute("SELECT action,reject_category FROM trade_intents "
+                    "WHERE id=?", (iid,)).fetchone()
+    assert row["action"] == "open"
+    assert row["reject_category"] == "risk_gate"
+    leftover = c.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='trade_intents_new'").fetchone()
+    assert leftover is None
+
+
 def test_trade_intents_migration_keeps_orders_fk_usable(tmp_path):
     """参照される側の rebuild 後も orders FK は trade_intents を指す。
 

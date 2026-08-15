@@ -246,3 +246,52 @@ def test_reflect_retry_rejects_unknown_order(tmp_path):
     out = cmd.dispatch("reflect retry 999")
     assert "再試行対象へ戻しました" not in out
     assert "does not exist" in out
+
+
+def test_reflect_retry_rejects_open_order(tmp_path):
+    """F3 (レビュー 1 周目 codex Minor-3): `reflect retry` は order の存在
+    しか検査していなかった。まだ open な order へ retry を発行すると
+    (reflection はそもそも closed 前提のため) 台帳を無意味に触るだけで、
+    運用者に誤った成功メッセージを返す。"""
+    conn, _state, _activity, cmd = _commands(tmp_path)
+    now = cmd.clock.now()
+    conn.execute("INSERT INTO orders (pair,direction,entry_type,horizon,status,"
+                 "created_at,updated_at) VALUES ('USDJPY','long','market','day',"
+                 "'open',?,?)", (now.isoformat(), now.isoformat()))
+    oid = conn.execute("SELECT id FROM orders").fetchone()[0]
+    out = cmd.dispatch(f"reflect retry {oid}")
+    assert "再試行対象へ戻しました" not in out
+    assert "closed ではありません" in out
+    assert "status=open" in out
+
+
+def test_reflect_retry_rejects_already_reflected_order(tmp_path):
+    """F3: 既に reflection 済みの order へ retry を発行しても、reflection は
+    `run_pending` の SQL (`r.order_id IS NULL`) で最初から除外されるため
+    台帳を触っても無意味 — 運用者に誤解を与えないよう明示的に拒否する。"""
+    from agentic_fx.store import reflections
+    conn, _state, _activity, cmd = _commands(tmp_path)
+    now = cmd.clock.now()
+    conn.execute("INSERT INTO orders (pair,direction,entry_type,horizon,status,"
+                 "created_at,updated_at) VALUES ('USDJPY','long','market','day',"
+                 "'closed',?,?)", (now.isoformat(), now.isoformat()))
+    oid = conn.execute("SELECT id FROM orders").fetchone()[0]
+    reflections.save(conn, oid, "既存の振り返り", now)
+    out = cmd.dispatch(f"reflect retry {oid}")
+    assert "再試行対象へ戻しました" not in out
+    assert "既に reflection 済みです" in out
+
+
+def test_reflect_retry_notes_when_no_attempt_row_existed(tmp_path):
+    """F3: 台帳に試行記録が無い closed order (= まだ一度も失敗していない)
+    への retry は成功として扱うが、文言末尾に「(台帳に試行記録なし)」を
+    付けて運用者へ「これは何も戻していない」ことを明示する。"""
+    conn, _state, _activity, cmd = _commands(tmp_path)
+    now = cmd.clock.now()
+    conn.execute("INSERT INTO orders (pair,direction,entry_type,horizon,status,"
+                 "created_at,updated_at) VALUES ('USDJPY','long','market','day',"
+                 "'closed',?,?)", (now.isoformat(), now.isoformat()))
+    oid = conn.execute("SELECT id FROM orders").fetchone()[0]
+    out = cmd.dispatch(f"reflect retry {oid}")
+    assert out == (f"order #{oid} を reflection 再試行対象へ戻しました"
+                   " (台帳に試行記録なし)")

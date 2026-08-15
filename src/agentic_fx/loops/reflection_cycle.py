@@ -62,6 +62,25 @@ class ReflectionCycle:
         self._core_lock = core_lock
         self.watch = watch if watch is not None else MissionWatch()
 
+    def _consume_attempt(self, order_id: int, reason: str | None) -> None:
+        """失敗台帳を 1 消費し、上限到達なら abandon activity を書く
+        (レビュー 1 周目 F1)。挙動は Task 15 導入時の bump+abandon 3 箇所
+        と完全に同じ (この private メソッドはそれを 1 箇所へ集約しただけ)。
+        `core_lock` は呼び出し側で保持済みであること前提にはしない —
+        ここで取得する (呼び出し site はどこも既に lock 外から呼ぶため)。"""
+        with self._core_lock:
+            attempts = reflection_attempts.bump(
+                self.conn, order_id, now=self.clock.now(), reason=reason)
+        if attempts == self.settings.reflection.max_attempts:
+            try:
+                self.activity.write(
+                    Category.AGGREGATE, "reflection_abandoned",
+                    f"order_id={order_id} attempts={attempts}",
+                    ref_id=str(order_id))
+            except Exception:  # noqa: BLE001
+                _log.exception(
+                    "failed to record reflection_abandoned for #%s", order_id)
+
     def run_pending(self, max_items: int = 3) -> int:
         """Reflect on closed orders without reflection. Per-item isolation.
 
@@ -192,23 +211,11 @@ class ReflectionCycle:
                         "failed to record reflection_mission_failed for #%s",
                         row["id"])
                 # ↓ここから挿入 (プラン 9 Task 15、設計書 D1)
-                # 失敗を台帳に刻み、上限到達で abandon する。
-                # `finalize_ok=False` は mission 監査書込みの失敗なので
-                # 試行回数を消費しない (下の複合ガードはそのまま温存する)。
-                with self._core_lock:
-                    attempts = reflection_attempts.bump(
-                        self.conn, row["id"], now=self.clock.now(),
-                        reason=result.reason)
-                if attempts == self.settings.reflection.max_attempts:
-                    try:
-                        self.activity.write(
-                            Category.AGGREGATE, "reflection_abandoned",
-                            f"order_id={row['id']} attempts={attempts}",
-                            ref_id=str(row["id"]))
-                    except Exception:  # noqa: BLE001
-                        _log.exception(
-                            "failed to record reflection_abandoned for #%s",
-                            row["id"])
+                # 失敗を台帳へ刻む — `_consume_attempt` (レビュー 1 周目 F1)。
+                # ここは **Mission 自体の失敗**であり、`finalize_ok` の成否に
+                # 関係なく消費する (F2: completed かつ finalize 失敗の場合の
+                # み消費しない — 下の複合ガードはそのまま温存する)。
+                self._consume_attempt(row["id"], result.reason)
                 # ↑ここまで挿入
 
             if result.status != "completed" or not finalize_ok:
@@ -225,20 +232,7 @@ class ReflectionCycle:
             content = (result.output.get("content")
                        if isinstance(result.output, dict) else None)
             if not isinstance(content, str):
-                with self._core_lock:
-                    attempts = reflection_attempts.bump(
-                        self.conn, row["id"], now=self.clock.now(),
-                        reason="malformed output")
-                if attempts == self.settings.reflection.max_attempts:
-                    try:
-                        self.activity.write(
-                            Category.AGGREGATE, "reflection_abandoned",
-                            f"order_id={row['id']} attempts={attempts}",
-                            ref_id=str(row["id"]))
-                    except Exception:  # noqa: BLE001
-                        _log.exception(
-                            "failed to record reflection_abandoned for #%s",
-                            row["id"])
+                self._consume_attempt(row["id"], "malformed output")
                 return False
 
             # RAG → SQLite order (SQLite row is completion marker)。RAG 書込は
@@ -262,22 +256,10 @@ class ReflectionCycle:
                         "failed to record reflection_rag_failed for #%s",
                         row["id"])
                 # ↓ここから挿入 (プラン 9 Task 15、設計書 D1)
-                # RAG 書込失敗も再試行を消費する — 「completed だから無料」に
-                # すると恒久的な RAG 障害で無制限再試行が復活する。
-                with self._core_lock:
-                    attempts = reflection_attempts.bump(
-                        self.conn, row["id"], now=self.clock.now(),
-                        reason="rag.add_reflection failed")
-                if attempts == self.settings.reflection.max_attempts:
-                    try:
-                        self.activity.write(
-                            Category.AGGREGATE, "reflection_abandoned",
-                            f"order_id={row['id']} attempts={attempts}",
-                            ref_id=str(row["id"]))
-                    except Exception:  # noqa: BLE001
-                        _log.exception(
-                            "failed to record reflection_abandoned for #%s",
-                            row["id"])
+                # RAG 書込失敗も再試行を消費する (`_consume_attempt` —
+                # レビュー 1 周目 F1) — 「completed だから無料」にすると
+                # 恒久的な RAG 障害で無制限再試行が復活する。
+                self._consume_attempt(row["id"], "rag.add_reflection failed")
                 # ↑ここまで挿入
                 return False
 
@@ -301,3 +283,16 @@ class ReflectionCycle:
                 with self._core_lock:
                     finalize_mission(self.conn, self.activity, self.clock,
                                      mid, MissionResult("failed", None, []))
+                # (Task 15) 台帳へ刻む — `_consume_attempt`。想定外例外で
+                # finalize_mission に一度も到達しなかった経路 (watch.end が
+                # 例外を投げ続ける等) は、上の 3 箇所の bump がどれも通ら
+                # ないまま fail-closed で mission を終端するだけだった。
+                # 台帳が進まないと LLM 呼出しを伴う Mission が無制限に
+                # 再試行され続ける — 例外中なのでこの消費自体の失敗も
+                # 隔離する。
+                try:
+                    self._consume_attempt(row["id"], "aborted before finalize")
+                except Exception:  # noqa: BLE001
+                    _log.exception(
+                        "failed to consume attempt in outer finally for #%s",
+                        row["id"])

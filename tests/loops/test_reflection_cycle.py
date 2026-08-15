@@ -500,11 +500,15 @@ def test_rag_failure_consumes_attempt_and_stops_at_limit(tmp_path):
 
 
 def test_finalize_failure_does_not_consume_an_attempt(tmp_path, monkeypatch):
-    """Task 15 (設計書 D1) の契約: `finalize_ok=False` は **mission 監査
-    書込みの失敗**であって reflection 自体の失敗ではない。試行回数を
-    消費させると、`missions.finish` が継続的に失敗する環境で
-    **振り返りが max_attempts 回で恒久 abandon される** —
-    「監査が書けない」という別の故障が、学習材料の永久喪失に化ける。
+    """Task 15 (設計書 D1) の契約は 2 次元 (レビュー 1 周目 F2 で精緻化):
+    **completed かつ finalize 失敗**は消費しない — reflection 自体は成功
+    しているため (`finalize_ok=False` は **mission 監査書込みの失敗**で
+    あって reflection 自体の失敗ではない)。試行回数を消費させると、
+    `missions.finish` が継続的に失敗する環境で **振り返りが max_attempts
+    回で恒久 abandon される** — 「監査が書けない」という別の故障が、学習
+    材料の永久喪失に化ける。(対比: **Mission 自体の失敗**は finalize の
+    成否に関係なく消費する —
+    `test_mission_failure_consumes_attempt_even_if_finalize_fails` が守る。)
 
     段 0 実測: このピンが無いと `not finalize_ok` 経路で bump する変異が
     フルスイート green のまま生存する。"""
@@ -525,6 +529,24 @@ def test_finalize_failure_does_not_consume_an_attempt(tmp_path, monkeypatch):
     assert conn.execute(
         "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
     ).fetchone()["c"] == 2
+
+
+def test_mission_failure_consumes_attempt_even_if_finalize_fails(tmp_path, monkeypatch):
+    """F2 (レビュー 1 周目、指揮者が Minor 格下げ): 契約は 2 次元。
+    `finalize_ok=False` が消費を止めるのは **completed かつ finalize 失敗**
+    の場合のみ (reflection 自体は成功しているため)。**Mission 自体の失敗**
+    は finalize の成否に関係なく消費する — さもないと `missions.finish` が
+    継続的に失敗する環境で、失敗し続ける Mission の再試行が無制限に残る。"""
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("failed", None, [], reason="boom")])
+    oid = _closed_order(conn)
+    monkeypatch.setattr(
+        "agentic_fx.loops.reflection_cycle.finalize_mission",
+        lambda *a, **k: False)
+
+    assert cyc.run_pending() == 0
+    assert reflection_attempts.attempts_of(conn, oid) == 1
 
 
 def test_bump_is_committed_immediately(tmp_path):
@@ -769,6 +791,37 @@ def test_abandon_releases_starved_later_orders(tmp_path):
     assert conn.execute(
         "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
     ).fetchone()["c"] == 7
+
+
+def test_watch_end_failure_consumes_attempt_via_outer_finally(tmp_path):
+    """F1 (レビュー 1 周目 codex Important-2): `watch.end` が例外を投げ続ける
+    と、内側の try/finally がその例外を再送出し、下の bump 3 箇所
+    (Mission 失敗 / 不正 output / RAG 失敗) はどれも通らないまま外側
+    `finally` の fail-closed finalize だけが効いていた。台帳が進まず、
+    LLM 呼出しを伴う Mission が無制限に再試行され続けていた
+    (`_consume_attempt` 導入前は本テストが red になる)。"""
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": "ok"}, []),
+        MissionResult("completed", {"content": "ok"}, []),
+        MissionResult("completed", {"content": "must-not-run"}, []),
+    ])
+    watch = MagicMock(spec=MissionWatch)
+    watch.end.side_effect = RuntimeError("watch end boom")
+    cyc.watch = watch
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert reflection_attempts.attempts_of(conn, oid) == SETTINGS.reflection.max_attempts
+    text = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert text.count("reflection_abandoned") == 1
+    # 上限到達後 3 周目は同じ order がクエリから外れる → mission は 2 件のまま。
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
+    ).fetchone()["c"] == SETTINGS.reflection.max_attempts
+    # reflections 行は保存されない (finalize は failed で終端しているため)。
+    assert reflections.get(conn, oid) is None
 
 
 def test_malformed_output_consumes_an_attempt(tmp_path):

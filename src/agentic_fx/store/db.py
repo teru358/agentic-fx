@@ -814,15 +814,41 @@ def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
     2 回目の rebuild は `INSERT ... SELECT ... NULL AS action` なので、
     ガードが効かないと**既に書かれた action / reject_category を全消去する**
     (`test_repeated_init_db_does_not_wipe_action_and_category` が守る)。
+
+    **(レビュー 1 周目 F5)** 「rebuild が必要か」と「`trade_intents_new`
+    残骸が残っているか」は別の判定である。旧実装は 2 つを 1 つの bool へ
+    束ねていたため、**列は既に揃っているのに残骸だけが残っている**状態
+    (rebuild 済みの別接続がロールバック等で `trade_intents_new` を消し
+    忘れた場合) でも rebuild 分岐へ入ってしまい、`INSERT ... SELECT ...
+    NULL AS action` が**揃っている `action`/`reject_category` を NULL 化
+    する** (`test_leftover_new_table_does_not_trigger_destructive_rebuild`
+    が守る)。列が揃っている場合は残骸の `DROP TABLE` だけを行い、rebuild
+    へは進まない。外側・内側の 2 段ガードは同じ `_needs_rebuild()` /
+    `_has_leftover_new_table()` の組を使う。
     """
-    def _needs_migration() -> bool:
+    def _needs_rebuild() -> bool:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(trade_intents)")}
-        new_exists = conn.execute(
+        return not ({"action", "reject_category"} <= cols)
+
+    def _has_leftover_new_table() -> bool:
+        return conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' "
             "AND name='trade_intents_new'").fetchone() is not None
-        return not ({"action", "reject_category"} <= cols) or new_exists
 
-    if not _needs_migration():
+    if not _needs_rebuild() and not _has_leftover_new_table():
+        return
+
+    if not _needs_rebuild():
+        # 列は揃っているが `trade_intents_new` が残骸として残っている
+        # (レビュー 1 周目 F5) — rebuild はせず、残骸だけ DROP する。
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not _needs_rebuild() and _has_leftover_new_table():
+                conn.execute("DROP TABLE trade_intents_new")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return
 
     _backup_before_migration(conn, ".bak-trade-intents-observability")
@@ -831,12 +857,10 @@ def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
         conn.execute("BEGIN IMMEDIATE")
         try:
             # ロック取得までの間に別接続が移行を完了させていないか再検査。
-            if not _needs_migration():
+            if not _needs_rebuild():
                 conn.commit()
                 return
-            if conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' "
-                    "AND name='trade_intents_new'").fetchone() is not None:
+            if _has_leftover_new_table():
                 conn.execute("DROP TABLE trade_intents_new")
             old_count = conn.execute(
                 "SELECT COUNT(*) c FROM trade_intents").fetchone()["c"]

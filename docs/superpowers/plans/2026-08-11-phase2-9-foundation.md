@@ -9887,6 +9887,12 @@ killer 名も一致。下 6 行は指揮者が追加した変異で、うち 5 �
 | `:max` を `999` にする | `test_reflection_retries_to_limit_then_stops` |
 | 成功時 `clear()` を削除 | `test_success_clears_prior_attempt_row` |
 | shell の `clear()` を削除 | `test_reflect_retry_deletes_attempt_row` |
+| （レビュー 1 周目 F1、`_consume_attempt` 集約後に追記）Mission 失敗 site の `_consume_attempt` 呼び出しを削除 | `test_reflection_retries_to_limit_then_stops` |
+| （F1）不正 output site の `_consume_attempt` 呼び出しを削除 | `test_malformed_output_consumes_an_attempt` |
+| （F1）RAG 失敗 site の `_consume_attempt` 呼び出しを削除 | `test_rag_failure_consumes_attempt_and_stops_at_limit` |
+| （F1）外側 `finally` (`not finalized`) の `_consume_attempt` 呼び出しを削除 | `test_watch_end_failure_consumes_attempt_via_outer_finally` |
+| （F1）`_consume_attempt` 内の `bump()` を削除 | `test_reflection_retries_to_limit_then_stops`（他 9 テストも同時に red） |
+| （F2、指揮者が Minor 格下げ）Mission 失敗 site の `_consume_attempt` 呼び出しを `if finalize_ok:` で囲む | `test_mission_failure_consumes_attempt_even_if_finalize_fails` |
 | 上限判定 `==` を `>` にする (abandon が一度も書かれない) | `test_reflection_abandoned_activity_written_once_at_limit` |
 | `finalize_ok=False` 経路でも `bump()` する | `test_finalize_failure_does_not_consume_an_attempt` |
 | `bump()` の `conn.commit()` を削除 | `test_bump_is_committed_immediately` |
@@ -11398,6 +11404,9 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | **`init_db` からの `_migrate_trade_intents_observability(conn)` 呼び出しを削除 (配線変異)** | `tests/store/test_db.py` (複数) | KILLED |
 | `action IS NULL` を CHECK から外す | **killer 無し — 受容** | **SURVIVED (原理的)** |
 | migration の行数一致ガード / `foreign_key_check` を外す | **killer 無し — 受容** | **SURVIVED (防御ガード)** |
+| （Task 17 検証 Minor-5、レビュー 1 周目 F4）通知文言の `dominant or 'unknown'` を `'unknown'` 固定にする | `test_notification_message_includes_dominant_category` | KILLED |
+| （Task 17 検証 Minor-6、レビュー 1 周目 F5）`_needs_rebuild()`/`_has_leftover_new_table()` の分岐を潰して常に rebuild する | `test_leftover_new_table_does_not_trigger_destructive_rebuild` | KILLED |
+| （レビュー 1 周目 F5）冪等ガードの内側再検査 (`BEGIN IMMEDIATE` 内の `if not _needs_rebuild():` 早期 return) だけを削除 | **殺せない (受容)** — 別接続との競合時 (自プロセスの外側判定後、`BEGIN IMMEDIATE` 取得までの間に別接続が rebuild を完了させた場合) のみ発動する経路であり、単一接続のテストでは到達しない。束 D の `_migrate_signals_fk`/`_migrate_improvement_runs_v2` と同クラスの受容対象 | **SURVIVED (受容)** |
 
 **受容した SURVIVED 2 件 (指揮者裁定 2026-08-15)**:
 

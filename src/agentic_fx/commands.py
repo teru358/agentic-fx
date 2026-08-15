@@ -9,7 +9,8 @@ from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
-from agentic_fx.store import approvals, missions, orders, reflection_attempts
+from agentic_fx.store import (approvals, missions, orders,
+                              reflection_attempts, reflections)
 from agentic_fx.store.approvals import AlreadyDecidedError
 from agentic_fx.store.state import StateStore
 
@@ -78,13 +79,31 @@ class Commands:
                 return "kill switch ラッチを解除しました"
             if cmd == "reflect" and len(args) == 2 and args[0] == "retry":
                 order_id = int(args[1])
-                if orders.get(self.conn, order_id) is None:
+                order = orders.get(self.conn, order_id)
+                if order is None:
                     raise ValueError(f"order #{order_id} does not exist")
+                # F3 (レビュー 1 周目 codex Minor-3): 存在チェックだけでは、
+                # まだ open な order や既に reflection 済みの order にも
+                # 「戻しました」という誤った成功メッセージを返してしまう
+                # (どちらも run_pending の抽出対象外で、台帳を触っても
+                # 無意味)。
+                status = order["status"]
+                if status != "closed":
+                    raise ValueError(
+                        f"order #{order_id} は closed ではありません "
+                        f"(status={status})")
+                if reflections.get(self.conn, order_id) is not None:
+                    raise ValueError(
+                        f"order #{order_id} は既に reflection 済みです")
+                had_attempt = reflection_attempts.attempts_of(
+                    self.conn, order_id) > 0
                 reflection_attempts.clear(self.conn, order_id)
                 self.activity.write(Category.SYSTEM, "reflection_requeued",
                                     f"order_id={order_id} via shell",
                                     ref_id=str(order_id))
-                return f"order #{order_id} を reflection 再試行対象へ戻しました"
+                suffix = "" if had_attempt else " (台帳に試行記録なし)"
+                return (f"order #{order_id} を reflection 再試行対象へ"
+                       f"戻しました{suffix}")
         except AlreadyDecidedError:
             return "その approval は決定済みです"
         except (ValueError, KeyError) as e:

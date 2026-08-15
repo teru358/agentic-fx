@@ -204,6 +204,19 @@ def test_threshold_notifies_once_per_accepted_streak(tmp_path):
     assert "2 件連続" in notifier.sent[0]
 
 
+def test_notification_message_includes_dominant_category(tmp_path):
+    """F4 (Task 17 検証 Minor-5): 通知文言の最多カテゴリが未 pin だった
+    (`dominant or 'unknown'` を `'unknown'` 固定にする変異が全 green のまま
+    生存していた)。risk_gate 2 件で通知文言に「最多カテゴリ: risk_gate」が
+    含まれることを単独で固定する。"""
+    loop, core, ro, notifier = _loop_with_threshold(tmp_path, threshold=2)
+    _intent(core, "open", "rejected", "risk_gate")
+    _intent(core, "open", "rejected", "risk_gate")
+    loop._notify_gate_reject_streak()
+    assert len(notifier.sent) == 1
+    assert "最多カテゴリ: risk_gate" in notifier.sent[0]
+
+
 def test_below_threshold_does_not_notify(tmp_path):
     """(着手前検証 2026-08-15 で追加) **閾値判定そのものを削除する変異**の
     killer。旧対応先の `test_threshold_notifies_once_per_accepted_streak` は
