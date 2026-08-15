@@ -42,9 +42,12 @@ def approved_plugins(conn: sqlite3.Connection, plugins_dir: Path) -> list[Plugin
     `FileNotFoundError` を送出する — 未初期化環境で service.py の起動を
     妨げないよう、ここで吸収する)。
 
-    同名 plugin に対して承認済み行が複数存在する場合、**現在のハッシュに
-    一致する行が 1 つでもあれば**承認とみなす (「どれが最新の承認か」は
-    判定しない — 一致という事実だけで十分)。
+    同一 (name, content_hash) に対して決定 (approved/rejected) が複数
+    存在する場合、**最新の決定** (`decided_at` 最大、同時刻は `id` 最大)
+    が有効になる (設計書 §7 / D4、プラン9 Task 12)。後から reject すれば
+    承認は取り消され、後から re-approve すれば再承認される。`expired` /
+    `invalidated` は決定として数えない (新しい要求の失効が古い承認を
+    取り消すのは誤り)。
     """
     if not plugins_dir.is_dir():
         _log.info("plugins dir %s does not exist — no plugins loaded", plugins_dir)
@@ -68,10 +71,32 @@ def approved_plugins(conn: sqlite3.Connection, plugins_dir: Path) -> list[Plugin
 
 
 def _approved_hashes_by_name(conn: sqlite3.Connection) -> dict[str, set[str]]:
+    """(name, content_hash) ごとの**最新決定**が approved のものだけを
+    admit する (設計書 §7 / D4、プラン9 Task 12)。
+
+    `status IN ('approved','rejected')` かつ `decided_at IS NOT NULL` を
+    `ORDER BY decided_at, id` で読み、同じ (name, content_hash) を持つ行を
+    順に上書きする — 最後に残った決定が最新の決定になる。同時刻は id が
+    タイブレーク (SQL の第二ソートキー)。
+
+    `decided_at` は TEXT (isoformat) なので `ORDER BY` は辞書順比較 —
+    書き込み側 (`approvals.decide`) に渡す `now` が常に tz-aware な UTC
+    (`SystemClock` の契約) であることに依存する。非 UTC のオフセットが
+    混在すると「最新の決定」の判定が時系列と食い違う。
+
+    **`expired` / `invalidated` は決定として数えない** — WHERE 句で最初
+    から除外する。どちらも「決定されないまま終端した要求」であり、新しい
+    要求の失効が古い承認を取り消すのは誤り (D4)。
+
+    既存の防御 (payload が JSON でない / dict でない / name・content_hash
+    が str でない行の warning + skip) はそのまま維持する。
+    """
     rows = conn.execute(
-        "SELECT id, payload_json FROM approval_requests "
-        "WHERE kind=? AND status='approved'", (APPROVAL_KIND,)).fetchall()
-    out: dict[str, set[str]] = {}
+        "SELECT id, payload_json, status FROM approval_requests "
+        "WHERE kind=? AND status IN ('approved','rejected') "
+        "AND decided_at IS NOT NULL "
+        "ORDER BY decided_at, id", (APPROVAL_KIND,)).fetchall()
+    latest_status: dict[tuple[str, str], str] = {}
     for row in rows:
         try:
             payload = json.loads(row["payload_json"])
@@ -92,10 +117,15 @@ def _approved_hashes_by_name(conn: sqlite3.Connection) -> dict[str, set[str]]:
             continue
         name, content_hash = payload.get("name"), payload.get("content_hash")
         if isinstance(name, str) and isinstance(content_hash, str):
-            out.setdefault(name, set()).add(content_hash)
+            latest_status[(name, content_hash)] = row["status"]
         else:
             _log.warning(
                 "approval_requests id=%s (kind=%s): payload に有効な "
                 "name/content_hash (str) がありません — skipping this row",
                 row["id"], APPROVAL_KIND)
+
+    out: dict[str, set[str]] = {}
+    for (name, content_hash), status in latest_status.items():
+        if status == "approved":
+            out.setdefault(name, set()).add(content_hash)
     return out

@@ -14,6 +14,7 @@ DB は tmp_path 上の sqlite のみ。実 HTTP/git/乱数/実時計は使わな
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -422,3 +423,221 @@ def test_get_indicators_fail_open_on_real_toctou_hash_mismatch(tmp_path, caplog)
     assert "plugin:toctou_ind" not in result
     assert "rsi_14" in result  # 組み込みは必ず返る (fail-open)
     assert "toctou_ind" in caplog.text
+
+
+# ===========================================================================
+# Task 12 (プラン9 束D、設計書 D4): approval の最新決定優先
+# ===========================================================================
+
+def _decide(conn, name: str, content_hash: str, *, status: str,
+           now: datetime) -> int:
+    """`_approve` の一般化版 (status を選べる)。既存の `_approve` は
+    approved 固定のヘルパとして残す (既存テストの呼び出しを変えない)。"""
+    aid = approvals.create(conn, "plugin",
+                           {"name": name, "content_hash": content_hash}, now)
+    approvals.decide(conn, aid, status=status, decided_by="shell", now=now)
+    return aid
+
+
+def test_approved_plugins_reject_after_approve_revokes(tmp_path):
+    """D4: 後から reject すれば承認は取り消される。これは現行バグ
+    (status='approved' 集合方式は取り消しが効かない) の回帰ピン ——
+    このテストが無いと退行しても検出できない。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "flip_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "flip_ind", h, status="approved", now=NOW)
+    _decide(conn, "flip_ind", h, status="rejected",
+           now=NOW + timedelta(minutes=1))
+
+    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert metas == []
+
+
+def test_approved_plugins_approve_after_reject_readmits(tmp_path):
+    """D4: 後から re-approve すれば再承認される。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "flip_back_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "flip_back_ind", h, status="rejected", now=NOW)
+    _decide(conn, "flip_back_ind", h, status="approved",
+           now=NOW + timedelta(minutes=1))
+
+    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert len(metas) == 1 and metas[0].name == "flip_back_ind"
+
+
+def test_approved_plugins_expired_after_approve_does_not_revoke(tmp_path):
+    """D4 が必須とする肯定検査: expired は決定として数えない。承認後に
+    **別の** 承認要求 (同じ name/content_hash) が発行され、それが期限切れ
+    で expired になっても、先の承認は取り消され *ない* こと。
+    `decide()` は expired を書けず (approved/rejected のみ)、
+    `expire_due()` は pending にしか触れないため、この経路だけが
+    「本物の expired 行」を作れる (raw SQL に頼らない)。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "expire_noop_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "expire_noop_ind", h, status="approved", now=NOW)
+    later = NOW + timedelta(minutes=1)
+    approvals.create(conn, "plugin",
+                     {"name": "expire_noop_ind", "content_hash": h}, later,
+                     expires_at=later + timedelta(minutes=15))
+    n = approvals.expire_due(conn, later + timedelta(minutes=16))
+    assert n == 1  # 前提: 2 件目の要求が確かに expired になった
+
+    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert len(metas) == 1 and metas[0].name == "expire_noop_ind"
+
+
+def test_approved_plugins_invalidated_after_approve_does_not_revoke(tmp_path):
+    """D4: invalidated も決定として数えない。現行コードに kind=plugin へ
+    invalidated を書く経路が無い (Phase 3 の live_trade 専用、設計書 §7)
+    ため、DB を直接操作して再現する。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "invalidated_noop_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "invalidated_noop_ind", h, status="approved", now=NOW)
+    later = NOW + timedelta(minutes=1)
+    conn.execute(
+        "INSERT INTO approval_requests (kind, payload_json, status, "
+        "decided_by, decided_at, created_at) VALUES "
+        "('plugin', ?, 'invalidated', 'system', ?, ?)",
+        (json.dumps({"name": "invalidated_noop_ind", "content_hash": h}),
+         later.isoformat(), later.isoformat()))
+    conn.commit()
+
+    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert len(metas) == 1 and metas[0].name == "invalidated_noop_ind"
+
+
+def test_approved_plugins_excludes_approved_row_with_null_decided_at(
+        tmp_path):
+    """`decided_at IS NOT NULL` の絞り込みのピン — status='approved' でも
+    decided_at が NULL (DB 破損・移行漏れ等の想定外行) は決定として
+    数えない。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "null_decided_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    conn.execute(
+        "INSERT INTO approval_requests (kind, payload_json, status, "
+        "created_at) VALUES ('plugin', ?, 'approved', ?)",
+        (json.dumps({"name": "null_decided_ind", "content_hash": h}),
+         NOW.isoformat()))
+    conn.commit()
+
+    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert metas == []
+
+
+def test_approved_plugins_orders_by_decided_at_not_insertion_order(
+        tmp_path):
+    """`ORDER BY decided_at, id` を落とす変異の killer。id (=挿入順) は
+    reject → approve の順だが、decided_at は逆 (approve が先・reject が
+    後) にする。decided_at 基準の実装なら最終決定は reject (除外)。もし
+    ORDER BY が抜けて SQL の物理走査順 (= 挿入順 = id 昇順) にフォール
+    バックすれば最終決定は approve (含まれる) ため、観測結果でどちらの
+    ロジックかを判別できる。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "chronology_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    later = NOW + timedelta(hours=1)
+    # id=1 (先に INSERT) が reject だが decided_at は「後」(later)。
+    _decide(conn, "chronology_ind", h, status="rejected", now=later)
+    # id=2 (後に INSERT) が approve だが decided_at は「先」(NOW)。
+    _decide(conn, "chronology_ind", h, status="approved", now=NOW)
+
+    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    # decided_at 基準の正しい時系列は approve(NOW) → reject(later) なので
+    # 最終決定は reject = 除外。
+    assert metas == []
+
+
+def test_approved_plugins_same_decided_at_ties_break_by_higher_id(tmp_path):
+    """同時刻決定のタイブレークは id 最大、という契約のピン。
+
+    **注記 (mutation ledger に転記すること)**: SQLite はインデックス無しの
+    単純スキャンで rowid (=id) 昇順を返す実装になっているため、
+    `ORDER BY decided_at, id` から `, id` を削る変異は、本テストの構成
+    (物理走査順 = id 昇順 = 意図したタイブレーク勝者の順) では実行結果を
+    変えない可能性が高い (equivalent mutant の疑い)。それでも**契約の
+    ピンとして意味がある** (将来 SQL 実行計画が変わっても仕様どおりに
+    振る舞うことを保証する) ため削除しない。実測して mutation ledger に
+    生死どちらでも記録すること。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "tie_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "tie_ind", h, status="approved", now=NOW)  # id 小
+    _decide(conn, "tie_ind", h, status="rejected", now=NOW)  # id 大・同時刻
+
+    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert metas == []  # id が大きい reject が勝つ
+
+
+def test_approved_plugins_reject_of_other_hash_does_not_revoke(tmp_path):
+    """鍵は (name, content_hash) の**対**であることのピン。別ハッシュ
+    (= 旧版 plugin) への reject が、現在有効な承認を取り消してはならない。
+    鍵を name だけに潰す変異 (#9) の killer。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "pairkey_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "pairkey_ind", h, status="approved", now=NOW)
+    _decide(conn, "pairkey_ind", "0" * 64, status="rejected",
+            now=NOW + timedelta(minutes=1))
+
+    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert len(metas) == 1 and metas[0].name == "pairkey_ind"
+
+
+def test_approved_plugins_keeps_all_approved_hashes_for_a_name(tmp_path):
+    """戻り値 `dict[str, set[str]]` が表明する「1 name に複数ハッシュ」の
+    ピン。`out.setdefault(name, set()).add(...)` を `out[name] = {...}` の
+    上書きに変える変異 (#10) の killer。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "multi_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "multi_ind", h, status="approved", now=NOW)
+    _decide(conn, "multi_ind", "1" * 64, status="approved",
+            now=NOW + timedelta(minutes=1))
+
+    # 公開 API だけの観測 (`metas`) は `latest_status` の挿入順に依存して
+    # しまう (`_decide` の順序を入れ替えると上書き変異 #10 を殺さなくなる)
+    # ため、集合そのものを内部ヘルパで直接ピンする。
+    assert plugin_loader._approved_hashes_by_name(conn) == {
+        "multi_ind": {h, "1" * 64}}
+    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+    assert len(metas) == 1 and metas[0].name == "multi_ind"
