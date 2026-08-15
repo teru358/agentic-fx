@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable
+from typing import Callable, Protocol
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
@@ -100,6 +101,12 @@ class CloseSnapshot:
     rate: ConversionRate | None
     rate_degraded: bool
     captured_at: datetime
+    # `resolve_close_rate` が吸収した例外の要旨 (`safe_error_text` 済み)。
+    # commit-core の `_finish_close` が degraded activity に載せて
+    # 「gather deadline 打ち切り」と「ベンダ障害」を運用ログ上で識別可能に
+    # するためだけの観測用フィールド (判定には一切使わない)。既存の
+    # 位置引数構築を壊さないよう**末尾に**既定値つきで足す。
+    rate_degraded_reason: str | None = None
 
 
 def open_risk_and_notional_from_snapshot(
@@ -139,13 +146,44 @@ def has_unresolved_unknown(conn: sqlite3.Connection) -> bool:
     return bool(orders.list_by_status(conn, *_UNKNOWN))
 
 
+class RateFn(Protocol):
+    """`Executor` に注入する換算レート供給の契約 (Task 7, プラン9 束B)。
+
+    `deadline_check` は **keyword-only かつ受理必須** — gather 経路
+    (`gather_open_snapshot` → `cycle_rate_fn` / `gather_close_snapshot` →
+    `resolve_close_rate`) は無条件に kwarg 付きで呼ぶ。gather 以外の経路
+    (`_open` 等) は kwarg を渡さないので、実装側は既定値 `None` を持つ
+    こと。
+
+    `Callable[[str, str, datetime], ConversionRate]` は keyword-only 引数を
+    表現できず、3 引数しか受けない実装を「適合」に見せてしまうため
+    Protocol にする (束B レビュー: codex 静的読解の指摘)。3 引数の実装を
+    配線すると gather で `TypeError` になり、OPEN は健全でも
+    `"execution snapshot unavailable: ..."` の gate 拒否、CLOSE は
+    `resolve_close_rate` の広い `except` に吸収されて `rate=None` の
+    degraded (realized_pnl が未確定のまま残る) になる。
+
+    構造的部分型なので実装側の継承・import は不要 (kwarg を受ければ適合)。
+    **本リポジトリは静的型検査器を使っていない (CI は pytest のみ) ため、
+    この宣言に強制力は無い。** 実際の退行検出は gather を実駆動する配線
+    テスト (`tests/test_service_app.py` の
+    `test_build_app_open_gather_drives_production_rate_fn` /
+    `test_build_app_close_gather_is_not_degraded`) が担う。
+    """
+
+    def __call__(self, ccy: str, account_ccy: str, now: datetime, *,
+                 deadline_check: Callable[[str], None] | None = None
+                 ) -> ConversionRate: ...
+
+
 class Executor:
     def __init__(self, *, conn: sqlite3.Connection, broker: PaperBroker,
                  settings: Settings, state_store: StateStore,
                  activity: ActivityLog, notifier: Notifier, clock: Clock,
+                 monotonic_fn: Callable[[], float] = time.monotonic,
                  quote_fn: Callable[[str], Quote],
                  spec_fn: Callable[[str], InstrumentSpec],
-                 rate_fn: Callable[[str, str, datetime], ConversionRate],
+                 rate_fn: RateFn,
                  ) -> None:
         self.conn = conn
         self.broker = broker
@@ -154,6 +192,11 @@ class Executor:
         self.activity = activity
         self.notifier = notifier
         self.clock = clock
+        # Task 6 (プラン9 束B): gather deadline の経過測定専用。
+        # `self.clock` は captured_at にのみ使う — FixedClock/ReplayClock
+        # は進まないため clock 基準の deadline は永久に到来しない
+        # (spec 改稿 C1)。
+        self.monotonic_fn = monotonic_fn
         self.quote_fn = quote_fn
         self.spec_fn = spec_fn
         # 通貨 1 単位 = 口座通貨いくらか (設計書 §5)。quote_fn/spec_fn と同じ
@@ -226,7 +269,9 @@ class Executor:
 
     # ---- 換算レート -------------------------------------------------------
 
-    def cycle_rate_fn(self, now) -> Callable[[str], ConversionRate]:
+    def cycle_rate_fn(self, now, *,
+                      deadline_check: Callable[[str], None] | None = None
+                      ) -> Callable[[str], ConversionRate]:
         """1 回の判断 (gate 評価・予約再検証・mark-to-market サイクル) 内で
         レートを固定するローカルキャッシュを返す (設計書 §5)。呼び出し側は
         `self` に保持せず、その判断の間だけ使い捨てること — 永続させると
@@ -283,6 +328,14 @@ class Executor:
         `max_skew` 以内のときだけ `span_min`/`span_max`（確定値）と
         `cache[ccy]` を更新する。拒否したレートの leg 時刻は確定値に
         一切混ざらない。
+
+        Task 7 (プラン9 束B): `deadline_check` を渡すと `self.rate_fn` へ
+        そのまま転送する — `rate_fn` が `PriceProvider.to_account_rate` に
+        束縛されている場合、USD クロスの `for spec in legs` の各脚の前で
+        呼ばれる (改稿 C2)。`None` (既定・gather 以外の全呼び出し元
+        `_open` 等) では `rate_fn` に kwarg 自体を渡さない — 3 引数のみを
+        期待する既存の `rate_fn` 実装 (backtest/runner.py・scheduler 系
+        テストの多数の stub) を壊さないため。
         """
         cache: dict[str, ConversionRate] = {}
         account_ccy = self.settings.account_currency
@@ -294,7 +347,11 @@ class Executor:
         def fn(ccy: str) -> ConversionRate:
             nonlocal span_min, span_max
             if ccy not in cache:
-                rate = self.rate_fn(ccy, account_ccy, now)
+                if deadline_check is not None:
+                    rate = self.rate_fn(ccy, account_ccy, now,
+                                        deadline_check=deadline_check)
+                else:
+                    rate = self.rate_fn(ccy, account_ccy, now)
                 # 個別に健全と確認できたレートなので degraded フォール
                 # バック用キャッシュは (全体 skew の成否に関わらず) 更新
                 # する — resolve_close_rate はこの全体 skew 検証の対象外
@@ -321,22 +378,47 @@ class Executor:
             return cache[ccy]
         return fn
 
-    def resolve_close_rate(self, ccy: str,
-                           now) -> tuple[ConversionRate | None, bool]:
+    def resolve_close_rate(self, ccy: str, now, *,
+                           deadline_check: Callable[[str], None] | None = None
+                           ) -> tuple[ConversionRate | None, bool, str | None]:
         """クローズ専用のレート解決。現在レートが取れなければ最後に健全性
         検証を通ったレートへ degraded フォールバックする (設計書 §5:
-        クローズはレート欠損でも妨げない)。戻り値は (rate, degraded)。
+        クローズはレート欠損でも妨げない)。戻り値は
+        (rate, degraded, degraded_reason)。
         rate が None なのは、一度も健全なレートを観測できていない場合のみ
         (プロセス起動直後の初回クローズ等) — この場合 realized_pnl は
         未確定のまま残し、次回の定期同期で解消する。
+
+        `deadline_check` (Task 7, プラン9 束B): `cycle_rate_fn` と同じ
+        転送規約 — `None` (既定) なら `rate_fn` を 3 引数のまま呼ぶ。
+        **`deadline_check` が USD クロスの 2 脚目の前で `DataUnhealthy`
+        を送出しても、この関数自体の fail-soft 契約は変えない** —
+        直下の `except Exception` がそれを吸収し degraded フォールバック
+        にする。CLOSE はレート欠損でも妨げない、という既存方針の帰結
+        であり、意図的な挙動 (2 脚目相当の外部 I/O だけを打ち切り、
+        CLOSE 自体は失敗させない)。
+
+        **吸収した例外の要旨は捨てない (観測性 — /code-review 2 周目)。**
+        3 要素目 `degraded_reason` (`safe_error_text` 済み) として返し、
+        `_finish_close` が `close_pnl_rate_degraded` activity に載せる。
+        これが無いと運用ログ上「gather deadline による打ち切り」と
+        「ベンダ障害」がバイト単位で同一になり、`_make_deadline_checker`
+        が "deadline exceeded" の文言で確保したはずの識別性がこの吸収
+        経路だけ失われる。**fail-soft 契約 (レート欠損でクローズを妨げ
+        ない) は不変** — 追加するのは記録だけ。
         """
         account_ccy = self.settings.account_currency
         try:
-            rate = self.rate_fn(ccy, account_ccy, now)
+            if deadline_check is not None:
+                rate = self.rate_fn(ccy, account_ccy, now,
+                                    deadline_check=deadline_check)
+            else:
+                rate = self.rate_fn(ccy, account_ccy, now)
             self._last_good_rate[(ccy, account_ccy)] = rate
-            return rate, False
-        except Exception:  # noqa: BLE001 — クローズを止めない (設計書 §5)
-            return self._last_good_rate.get((ccy, account_ccy)), True
+            return rate, False, None
+        except Exception as e:  # noqa: BLE001 — クローズを止めない (設計書 §5)
+            return (self._last_good_rate.get((ccy, account_ccy)), True,
+                    safe_error_text(e))
 
     # ---- public ---------------------------------------------------------
 
@@ -519,6 +601,42 @@ class Executor:
                             ref_id=str(oid))
         return {"result": "pending", "order_id": oid, "reasons": []}
 
+    def _make_deadline_checker(self, budget: float) -> Callable[[str], None]:
+        """1 回の gather (`gather_open_snapshot`/`gather_close_snapshot`)
+        専用の deadline checker を作る (Task 6, プラン9 束B — 設計:
+        `docs/superpowers/specs/2026-08-11-gather-deadline-design.md`
+        確定仕様 #2/#3)。
+
+        - 予算は呼び出し元が渡す (`settings.worker.snapshot_max_age_sec`
+          を流用。新 config キーは作らない)。
+        - 経過は `self.monotonic_fn()` (既定 `time.monotonic`) で測る。
+          `self.clock` は `captured_at` にのみ使う — `FixedClock`/
+          `ReplayClock` は進まないため clock 基準の deadline は永久に
+          到来しない (改稿 C1)。
+        - 比較は `>` (等号は受理側 — commit-core の
+          `age_sec > max_snapshot_age_sec` (`open_from_snapshot`/
+          `close_from_snapshot`) と揃える)。
+        - 戻り値の `check(leg)` は次の脚を呼ぶ**前**に呼ぶこと。予算超過
+          なら `DataUnhealthy` を送出する。文言は commit-core の
+          `"execution/close snapshot is stale"` と区別できるよう
+          "deadline exceeded" を使う (trade_loop.py の commit-pre が
+          既存の `except Exception` で捕捉する — 新しい配管は作らない)。
+        - Task 7 でこの checker を `cycle_rate_fn`/`resolve_close_rate`
+          経由で `PriceProvider.to_account_rate` の `for spec in legs`
+          まで伝播させる (改稿 C2)。実行中の 1 脚は中断できない —
+          deadline が保証するのは「次の脚に進まないこと」のみ (確定
+          仕様 #9)。
+        """
+        start = self.monotonic_fn()
+
+        def check(leg: str) -> None:
+            elapsed = self.monotonic_fn() - start
+            if elapsed > budget:
+                raise DataUnhealthy(
+                    f"snapshot gather deadline exceeded: {elapsed:.1f}s "
+                    f"elapsed (budget {budget:.1f}s) — aborting before {leg}")
+        return check
+
     def gather_open_snapshot(self, intent: TradeIntent, *,
                              exposure_pairs: list[str]) -> ExecutionSnapshot:
         """commit-pre 相専用 (設計書 §3.1) — **core_lock を保持しない状態
@@ -528,20 +646,37 @@ class Executor:
 
         `exposure_pairs` は呼び出し元 (commit-pre 相) が `conn_supervisor`
         (lock 外の読取専用接続) から読んだ既存 exposure の pair 一覧。
+
+        **Task 6 (プラン9 束B): gather deadline。** 予算は
+        `settings.worker.snapshot_max_age_sec` を流用 (新 config キーは
+        作らない)。経過は `self.monotonic_fn()` で測る (`self.clock` は
+        `captured_at` にのみ使う)。比較は `>` (等号は受理側 — commit-core
+        の `age_sec > max_snapshot_age_sec` と揃える)。予算超過は
+        `DataUnhealthy` (次の脚を呼ぶ前に打ち切る — 実行中の 1 脚は
+        中断できない)。
         """
         now = self.clock.now()
+        budget = self.settings.worker.snapshot_max_age_sec
+        check = self._make_deadline_checker(budget)
         quote = self.quote_fn(intent.pair)
+        check(f"spec:{intent.pair}")
         spec = self.spec_fn(intent.pair)
-        cycle_rate = self.cycle_rate_fn(now)
+        cycle_rate = self.cycle_rate_fn(now, deadline_check=check)
         specs_by_pair: dict = {intent.pair: spec}
         currencies: set = {spec.quote_currency, spec.base_currency}
         for pair in exposure_pairs:
+            check(f"spec:{pair}")
             pair_spec = self.spec_fn(pair)
             specs_by_pair[pair] = pair_spec
             currencies.add(pair_spec.quote_currency)
             currencies.add(pair_spec.base_currency)
-        # A3: rates の構築順を安定化 (PYTHONHASHSEED 依存を避ける)
-        rates = {ccy: cycle_rate(ccy) for ccy in sorted(currencies)}
+        # A3: rates の構築順を安定化 (PYTHONHASHSEED 依存を避ける)。dict
+        # comprehension だった箇所を for ループに変える (Task 6: 通貨
+        # ごとの deadline 検査を挟むため — ソート順を含め挙動は従前と同一)。
+        rates: dict = {}
+        for ccy in sorted(currencies):
+            check(f"rate:{ccy}")
+            rates[ccy] = cycle_rate(ccy)
         return ExecutionSnapshot(quote=quote, spec=spec,
                                  specs_by_pair=specs_by_pair, rates=rates,
                                  captured_at=now)
@@ -652,10 +787,18 @@ class Executor:
 
     def _finish_close(self, row: dict, price: float, contract_size: float,
                       rate: ConversionRate | None, degraded: bool,
-                      reason: str, now: datetime) -> S:
+                      reason: str, now: datetime,
+                      degraded_reason: str | None = None) -> S:
         """close_order/close_order_from_snapshot 共有 (broker 成功後の
         pnl 計算・DB 遷移・activity 記録 — 既存 close_order の当該部分を
-        **逐語**移動しただけで判定ロジックは 1 文字も変えない)。"""
+        **逐語**移動しただけで判定ロジックは 1 文字も変えない)。
+        2026-08-14 束 B 2 周目: activity 文言に cause 接尾辞を追加 —
+        判定ロジックは引き続き不変。
+
+        `degraded_reason` は `resolve_close_rate` が吸収した例外の要旨
+        (`safe_error_text` 済み)。degraded activity にだけ載せる —
+        通知 (`_notify`) は汎用文言のまま (外部由来テキストを Discord に
+        流さない既存規律)。"""
         pnl = compute_pnl(
             row, price, contract_size=contract_size,
             commission_per_lot=self.settings.risk.commission_per_lot,
@@ -672,7 +815,9 @@ class Executor:
                 Category.TRADE, "close_pnl_rate_degraded",
                 f"{row['pair']}: 換算レート取得不能 — " + (
                     "最後の健全レートで計算 (次回同期で吸収)" if pnl is not None
-                    else "realized_pnl 未確定 (次回同期で解消)"),
+                    else "realized_pnl 未確定 (次回同期で解消)")
+                + (f" [cause: {degraded_reason}]"
+                   if degraded_reason else ""),
                 ref_id=str(row["id"]))
             self._notify(
                 f"[agentic-fx] クローズ換算レート degraded #{row['id']}")
@@ -717,9 +862,10 @@ class Executor:
             return self._close_unknown(row, now)
         # 設計書 §5: クローズはレート欠損でも妨げない。現在レートが取れなければ
         # 最後に健全性検証を通ったレートへ degraded フォールバックする。
-        rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
+        rate, degraded, degraded_reason = self.resolve_close_rate(
+            spec.quote_currency, now)
         return self._finish_close(row, price, spec.contract_size, rate,
-                                  degraded, reason, now)
+                                  degraded, reason, now, degraded_reason)
 
     def gather_close_snapshot(self, row: dict) -> CloseSnapshot:
         """commit-pre 相専用 (裁定書 F-1 / CR-2 / P8-01) — **core_lock
@@ -727,16 +873,30 @@ class Executor:
         instrument spec + 換算レートを 1 回で取得し timestamp 付き
         スナップショットにする。`row` は呼び出し元 (Task 15 の commit-pre
         相) が `conn_supervisor` (lock 外の読取専用接続) から読んだ現在の
-        order 行 (`pair`/`direction` を参照するだけ)。"""
+        order 行 (`pair`/`direction` を参照するだけ)。
+
+        **Task 6 (プラン9 束B): gather deadline。** OPEN と対称に予算を
+        適用する — 初稿の「CLOSE には入れない」は誤りとして撤回された
+        (改稿 I1): `close_from_snapshot` も同じ予算で stale を拒否する
+        (`age_sec > max_snapshot_age_sec`) ため、待って得られるのは古い
+        snapshot と拒否であって close ではない。早く失敗を確定して次の
+        再試行機会に戻る方が資金保護に有利。
+        """
         now = self.clock.now()
+        budget = self.settings.worker.snapshot_max_age_sec
+        check = self._make_deadline_checker(budget)
         pair = row["pair"]
         quote = self.quote_fn(pair)
         price = quote.bid if row["direction"] == "long" else quote.ask
+        check(f"spec:{pair}")
         spec = self.spec_fn(pair)
-        rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
+        check(f"rate:{spec.quote_currency}")
+        rate, degraded, degraded_reason = self.resolve_close_rate(
+            spec.quote_currency, now, deadline_check=check)
         return CloseSnapshot(order_id=row["id"], pair=pair, price=price,
                              spec=spec, rate=rate,
-                             rate_degraded=degraded, captured_at=now)
+                             rate_degraded=degraded, captured_at=now,
+                             rate_degraded_reason=degraded_reason)
 
     def close_order_from_snapshot(self, row: dict, snapshot: CloseSnapshot,
                                   reason: str) -> S:
@@ -770,7 +930,8 @@ class Executor:
             return self._close_unknown(row, now)
         return self._finish_close(row, snapshot.price,
                                   snapshot.spec.contract_size, snapshot.rate,
-                                  snapshot.rate_degraded, reason, now)
+                                  snapshot.rate_degraded, reason, now,
+                                  snapshot.rate_degraded_reason)
 
     def close_from_snapshot(self, intent: TradeIntent, iid: int,
                             snapshot: "CloseSnapshot | None", *,

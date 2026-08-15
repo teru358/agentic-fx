@@ -504,7 +504,7 @@ class Scheduler:
             spec = self.executor.spec_fn(row["pair"])
             # 設計書 §5: クローズはレート欠損でも妨げない (close_order と
             # 同じ degraded フォールバック規律)。
-            rate, degraded = self.executor.resolve_close_rate(
+            rate, degraded, degraded_reason = self.executor.resolve_close_rate(
                 spec.quote_currency, now)
             pnl = compute_pnl(
                 fresh, price, contract_size=spec.contract_size,
@@ -519,7 +519,14 @@ class Scheduler:
                     f"{row['pair']}: 換算レート取得不能 — " + (
                         "最後の健全レートで計算 (次回同期で吸収)"
                         if pnl is not None
-                        else "realized_pnl 未確定 (次回同期で解消)"),
+                        else "realized_pnl 未確定 (次回同期で解消)")
+                    # 観測性 (/code-review 2 周目): executor._finish_close と
+                    # 同じ形で吸収原因を載せる。producer によって同じ
+                    # activity 種別の行が無音で食い違わないようにする。
+                    # ここは deadline_check を渡さない経路なので原因は
+                    # 常にベンダ障害側だが、種別の識別には要る。
+                    + (f" [cause: {degraded_reason}]"
+                       if degraded_reason else ""),
                     ref_id=str(row["id"]))
                 self.executor.notifier.send(
                     f"[agentic-fx] クローズ換算レート degraded #{row['id']}")

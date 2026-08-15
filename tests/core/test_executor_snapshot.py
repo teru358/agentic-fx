@@ -48,8 +48,10 @@ SPECS = {
 QUOTE = Quote("USDJPY", 148.49, 148.51, NOW, "test")
 
 
-def _rate_fn(ccy, account_ccy, now):
-    """JPY 恒等 / USD・EUR → JPY のみ供給する最小スタブ。"""
+def _rate_fn(ccy, account_ccy, now, **_ignored):
+    """JPY 恒等 / USD・EUR → JPY のみ供給する最小スタブ。**_ignored:
+    Task 7 (プラン9 束B) が gather 経由の呼び出しで rate_fn へ
+    deadline_check kwarg を渡すため、この既存 stub は無害に許容する。"""
     if ccy == account_ccy:
         return ConversionRate(1.0, ccy, account_ccy, (now,))
     if account_ccy == "JPY" and ccy in ("USD", "EUR"):
@@ -504,8 +506,9 @@ def test_close_order_from_snapshot_records_degraded_rate(tmp_path):
     def rec_spec_fn(pair):
         return SPECS[pair]
 
-    def always_fail_rate_fn(ccy, account_ccy, now):
-        # 最初の 1 回だけ失敗させる (resolve_close_rate がフォールバック)
+    def always_fail_rate_fn(ccy, account_ccy, now, **_ignored):
+        # 最初の 1 回だけ失敗させる (resolve_close_rate がフォールバック)。
+        # **_ignored: Task 7 の deadline_check kwarg を無害に許容する。
         calls.append(f"rate_fn:{ccy}")
         raise DataUnhealthy(f"rate unavailable for {ccy}")
 
@@ -752,8 +755,9 @@ def test_close_order_from_snapshot_computes_pnl_from_degraded_rate(tmp_path):
     row = _insert_open_order(ex.conn, pair="USDJPY")
 
     # 健全な rate_fn でキャッシュを温める (_last_good_rate に入る)
-    healthy_rate, degraded = ex.resolve_close_rate("JPY", NOW)
+    healthy_rate, degraded, reason = ex.resolve_close_rate("JPY", NOW)
     assert healthy_rate is not None and degraded is False
+    assert reason is None  # 成功時に原因を作らない
 
     # commit-pre 相: レート取得が失敗するようになった
     ex.rate_fn = fail_rate_fn

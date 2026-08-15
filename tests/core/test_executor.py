@@ -310,6 +310,38 @@ def test_close_unknown_not_marked_closed(tmp_path):
     assert row["closed_at"] is None
 
 
+def test_close_order_degraded_activity_carries_absorbed_cause(tmp_path):
+    """観測性の pin (/code-review 2 周目): 非 snapshot 経路 (`close_order`
+    — SL/TP・day rollover・裁量クローズが使う本番で最も回る経路) でも、
+    `resolve_close_rate` が吸収した例外の要旨が
+    `close_pnl_rate_degraded` activity に残ること。
+
+    これが無いと degraded の行から原因が消え、運用ログ上で
+    「gather deadline による打ち切り」と「ベンダ障害」が区別できない。
+    `close_order` への `degraded_reason` 受け渡しを落とす退行変異は
+    (既定値 None のため) 無音で通るので、ここで固定する。"""
+    from agentic_fx.activity import Category
+    from agentic_fx.core.contracts import OrderStatus as S
+
+    def failing_rate_fn(ccy, account_ccy, now, **_ignored):
+        raise DataUnhealthy(f"vendor outage for {ccy}")
+
+    conn, ex, _, mid = _setup(tmp_path)
+    it = _open_intent(entry_type="market", limit_price=None, expires_in=None,
+                      stop_loss=148.00, take_profit=149.60)
+    oid = ex.handle_intent(it, mid)["order_id"]
+    ex.rate_fn = failing_rate_fn  # commit 後にレート供給が壊れた
+
+    final = ex.close_order(orders.get(conn, oid), 148.60, reason="sl_hit")
+
+    assert final == S.CLOSED  # fail-soft 契約は不変 (クローズは妨げない)
+    degraded = [l for l in ex.activity.tail(n=100, category=Category.TRADE)
+                if "close_pnl_rate_degraded" in l]
+    assert len(degraded) == 1, degraded
+    assert "vendor outage for JPY" in degraded[0], degraded[0]
+    assert "DataUnhealthy" in degraded[0], degraded[0]
+
+
 def test_cancel_rejected_means_fill_race(tmp_path):
     conn, ex, _, mid = _setup(tmp_path)
     oid = ex.handle_intent(_open_intent(), mid)["order_id"]

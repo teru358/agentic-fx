@@ -199,7 +199,13 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
     def spec_fn(pair: str):
         return _SPECS[pair]  # 表に無い pair は KeyError で fail closed
 
-    def rate_fn(ccy: str, account_ccy: str, now: datetime) -> ConversionRate:
+    def rate_fn(ccy: str, account_ccy: str, now: datetime, *,
+                deadline_check: Callable[[str], None] | None = None
+                ) -> ConversionRate:
+        # `Executor` の `RateFn` 契約 (keyword-only `deadline_check` を受理
+        # 必須) に適合させる。backtest は `handle_intent` 直呼びで gather を
+        # 通らないため実際には常に `None` で、挙動は従前と完全に同一 —
+        # 受けるだけで使わない (束B レビュー: 契約の宣言/実態一致)。
         if ccy == account_ccy:
             return ConversionRate(1.0, ccy, account_ccy, (now,))
         spec = _SPECS[symbol]

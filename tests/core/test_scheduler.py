@@ -2738,3 +2738,36 @@ def test_cron_deadline_only_advances_when_on_trade_mission_returns_true(tmp_path
     # 再び "cron" が due になる
     assert env.sched._trade_mission_due(
         WED + timedelta(minutes=1)) == "cron"
+
+
+# --- 束B 2 周目ローカル (muse c5b 起点 / 変異 M-a): degraded 原因の producer 対称性 ---
+
+def test_close_retry_degraded_activity_carries_absorbed_cause(tmp_path):
+    """`Scheduler._retry_close` の `close_pnl_rate_degraded` にも
+    `resolve_close_rate` が吸収した原因が載ること。
+
+    同じ activity 種別を `Executor._finish_close` と
+    `Scheduler._retry_close` の **2 つの producer** が書く。原因接尾辞を
+    片方だけ落とすと、運用ログ上「gather deadline 打ち切り」と
+    「ベンダ障害」の識別が producer 依存で無音に食い違う
+    (executor 側は `test_close_order_degraded_activity_carries_absorbed_cause`
+    が pin 済みだが scheduler 側は未 pin だった)。
+    """
+    def failing_rate_fn(ccy, account_ccy, now, **_ignored):
+        raise DataUnhealthy("vendor outage for JPY")
+
+    env = Env(tmp_path, rate_fn=failing_rate_fn)
+    oid = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="closing", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8,
+                        avg_fill_price=148.2)
+    env.sched.tick(WED)
+    assert orders.get(env.conn, oid)["status"] == "closed"
+
+    degraded = [ln for ln in (env.tmp_path / "a.log").read_text(
+        encoding="utf-8").splitlines() if "close_pnl_rate_degraded" in ln]
+    assert len(degraded) == 1, degraded
+    # 原因テキストが activity まで届いていること (これが M-a を殺す)
+    assert "vendor outage for JPY" in degraded[0], degraded[0]
+    assert "DataUnhealthy" in degraded[0], degraded[0]

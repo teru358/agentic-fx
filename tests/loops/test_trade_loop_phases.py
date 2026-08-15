@@ -528,3 +528,80 @@ def test_finalize_mission_holds_core_lock_on_unexpected_exception(tmp_path):
     _assert_core_lock_held_during(
         loop, "finish", run=lambda: loop.run_once("cron"),
         reached_msg="finally の未終端 finalize に到達しなかった")
+
+
+def test_commit_pre_gather_deadline_produces_reason_distinct_from_stale(tmp_path):
+    """出口のピン (確定仕様テスト観点 4): gather_open_snapshot の deadline
+    超過は commit-pre の既存 `except Exception` (trade_loop.py:252) に
+    そのまま乗り、trade_intents に理由が残る。文言は commit-core の
+    "execution snapshot is stale" (executor.py の open_from_snapshot)
+    とは異なることを確認する — ログを読む人が「ハングで打ち切った」のか
+    「取得はできたが古かった」のかを区別できる必要がある (確定仕様 #8)。
+
+    ここでは境界の厳密さではなく「配線が実際に効いているか」だけを見る
+    粗い統合テストなので、monotonic フェイクは呼び出し回数に依存しない
+    増分方式にする (厳密な境界テストは test_executor_gather_deadline.py
+    側が担う)。
+    """
+    class _AlwaysLateMono:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def __call__(self) -> float:
+            self.n += 1
+            return self.n * 1000.0
+
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed",
+        {"action": "open", "pair": "USDJPY", "direction": "long",
+         "entry_type": "market", "horizon": "day", "limit_price": None,
+         "expires_in": None, "stop_loss": 147.80, "take_profit": 149.00,
+         "reasoning": "x"}, [])], monotonic_fn=_AlwaysLateMono())
+
+    out = loop.run_once("cron")
+
+    assert out is not None
+    assert out["result"] == "rejected"
+    iid_row = conn.execute(
+        "SELECT gate_result, reject_reason FROM trade_intents "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert iid_row["gate_result"] == "rejected"
+    reason = iid_row["reject_reason"]
+    assert "deadline exceeded" in reason
+    assert "stale" not in reason
+
+
+def test_commit_pre_close_snapshot_failure_becomes_recorded_gate_rejection(
+        tmp_path):
+    """束B 1周目 ローカル LLM レビュー (muse c4 / KAT c4 / qwen c4 の共通
+    指摘の裏取り): commit-pre の **CLOSE 側** gather 失敗も OPEN と対称に
+    「記録済み gate 拒否」になること。
+
+    既存の `test_commit_pre_snapshot_failure_becomes_recorded_gate_rejection`
+    は `gather_open_snapshot` しか壊しておらず、CLOSE 分岐の
+    `snapshot_error = e` を潰す変異は全 1923 件を生き延びる (実測)。
+    その退行では CLOSE の外部取得失敗が `trade_intents.gate_result` を
+    NULL のまま残し、「なぜクローズされなかったか」を DB から追えない。"""
+    conn, loop, runner, tp = _loop(tmp_path, [])
+    order_id = orders.insert(
+        conn, pair="USDJPY", direction="long", entry_type="market",
+        horizon="day", status="open", now=NOW, quantity=0.1,
+        avg_fill_price=148.50)
+    runner._results = [MissionResult(
+        "completed", {"action": "close", "order_id": order_id,
+                      "reasoning": "x"}, [])]
+    loop.executor.gather_close_snapshot = MagicMock(
+        side_effect=RuntimeError("close_snapshot_boom"))
+
+    out = loop.run_once("cron")
+
+    assert out is not None
+    assert out["result"] == "rejected"
+    row = conn.execute(
+        "SELECT gate_result, reject_reason FROM trade_intents "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["gate_result"] == "rejected"
+    assert "execution snapshot unavailable" in row["reject_reason"]
+    act_text = (tp / "a.log").read_text(encoding="utf-8")
+    assert "gate_rejected" in act_text
+    assert "intent_execution_failed" not in act_text

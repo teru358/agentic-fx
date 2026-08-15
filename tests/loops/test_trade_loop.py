@@ -1,5 +1,6 @@
 """取引判断 loop テスト — fail closed・全記録・ask 回答専用・二層境界・trigger 記録。"""
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -30,13 +31,16 @@ SPEC = InstrumentSpec("USDJPY", 0.01, 0.01, 50.0, 0.01, 100_000, "USD", "JPY")
 QUOTE = Quote("USDJPY", 148.49, 148.51, NOW, "test")
 
 
-def _loop(tmp_path, results, healthy=True):
+def _loop(tmp_path, results, healthy=True, monotonic_fn=None):
     conn = connect(tmp_path / "t.db")
     init_db(conn)
     record_snapshot(conn, now=NOW, balance=1_000_000, equity=1_000_000)
     clock = FixedClock(NOW)
     broker = PaperBroker(conn, SETTINGS, clock)
-    def rate_fn(ccy: str, account_ccy: str, now) -> ConversionRate:
+    def rate_fn(ccy: str, account_ccy: str, now, **_ignored) -> ConversionRate:
+        # **_ignored: Task 7 (プラン9 束B) の deadline_check kwarg を
+        # 無害に許容する (このテスト用 stub は skew/クロスを模さない
+        # ため kwarg 自体は使わない)。
         return ConversionRate(value=1.0, from_ccy=ccy, to_ccy=account_ccy,
                               leg_ts=(now,))
 
@@ -45,7 +49,7 @@ def _loop(tmp_path, results, healthy=True):
         state_store=StateStore(tmp_path / "s.json"),
         activity=ActivityLog(tmp_path / "a.log"),
         notifier=Notifier(enabled=False, webhook_url=None),
-        clock=clock,
+        clock=clock, monotonic_fn=monotonic_fn or time.monotonic,
         quote_fn=lambda p: QUOTE, spec_fn=lambda p: SPEC,
         rate_fn=rate_fn)
     provider = MagicMock()
