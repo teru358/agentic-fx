@@ -1119,3 +1119,304 @@ def test_migrate_signals_fk_skips_backup_when_already_migrated(tmp_path):
     conn = connect(tmp_path / "fresh.db")
     init_db(conn)          # fresh は _SCHEMA 側で FK 付き → 移行不要
     assert not (tmp_path / "fresh.db.bak-signals-fk").exists()
+
+
+def _legacy_improvement_runs_ddl() -> str:
+    """pr_url 列を持つ旧 (Task 19 以前) improvement_runs DDL。"""
+    return (
+        "CREATE TABLE improvement_runs ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "backlog_id INTEGER REFERENCES improvement_backlog(id),"
+        "result TEXT,"
+        "pr_url TEXT, approval_id INTEGER, report_path TEXT,"
+        "started_at TEXT NOT NULL, finished_at TEXT)")
+
+
+def _legacy_improvement_runs_conn(tmp_path):
+    """レガシー (pr_url 付き) improvement_runs + 標準スキーマの他テーブルを
+    持つ接続を返す。
+
+    **着手前検証 B2 で修正。** `connect()` は `PRAGMA foreign_keys=ON` を
+    張るため、参照先 `improvement_backlog` を先に用意しないと旧表への
+    INSERT が `no such table: main.improvement_backlog` で落ちる (実測)。
+    `_SCHEMA` は `CREATE TABLE IF NOT EXISTS` なので、先に作ったレガシー
+    `improvement_runs` は温存したまま他テーブルだけが揃う。Task 13 の
+    `_legacy_signals_and_missions_conn` と同じ形。
+    """
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "legacy.db")
+    conn.execute(_legacy_improvement_runs_ddl())
+    conn.commit()
+    conn.executescript(db_module._SCHEMA)
+    return conn
+
+
+def test_init_db_migrates_legacy_improvement_runs_drops_pr_url(tmp_path):
+    """旧 PR 経路の名残 (pr_url 列) が落ち、result の値域が CHECK で
+    固定される (D7)。"""
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (result, report_path, started_at, "
+        "finished_at) VALUES ('report', 'reports/x.md', "
+        "'2026-08-11T09:00:00+00:00', '2026-08-11T09:05:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+
+    cols = {r["name"] for r in
+           conn.execute("PRAGMA table_info(improvement_runs)")}
+    assert "pr_url" not in cols
+    row = conn.execute(
+        "SELECT result, report_path FROM improvement_runs").fetchone()
+    assert row["result"] == "report"
+    assert row["report_path"] == "reports/x.md"
+
+
+def test_improvement_runs_migration_is_idempotent(tmp_path):
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (result, started_at) VALUES "
+        "('report', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+    init_db(conn)  # 2 回目でも例外なし
+
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "improvement_runs_v1" not in names
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM improvement_runs").fetchone()["c"] == 1
+
+
+def test_improvement_runs_migration_aborts_on_legacy_pr_result_with_null_pr_url(
+        tmp_path):
+    """codex I6: result='pr', pr_url=NULL は現スキーマで合法 (result に
+    CHECK が無いため) — pr_url だけ見るガードはこの行を見逃す。result 側
+    の検査が要ることの直接ピン。"""
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (result, pr_url, started_at) "
+        "VALUES ('pr', NULL, '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="旧 PR 経路"):
+        init_db(conn)
+
+    # 中断時は旧テーブルのまま (pr_url 列が残っている) — 部分適用しない。
+    # **この assert はガードの実行「位置」については何も保証しない**
+    # (rollback が RENAME を巻き戻すため — 着手前検証 B3 で実測)。位置は
+    # test_improvement_runs_guard_runs_before_any_table_rebuild が守る。
+    cols = {r["name"] for r in
+           conn.execute("PRAGMA table_info(improvement_runs)")}
+    assert "pr_url" in cols
+
+
+def test_improvement_runs_migration_aborts_on_nonnull_pr_url_with_other_result(
+        tmp_path):
+    """result が 'pr' でなくても pr_url が非NULLなら中断する
+    (result='pr' OR pr_url IS NOT NULL の OR のもう半分)。"""
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (result, pr_url, started_at) "
+        "VALUES ('report', 'https://example/pr/1', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="旧 PR 経路"):
+        init_db(conn)
+
+
+def test_improvement_runs_migration_error_names_offending_row_ids(tmp_path):
+    """「黙って捨てない」は人間が該当行を見つけられて初めて意味を持つ —
+    エラーメッセージに対象 id を含めることを直接ピンする。"""
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (result, started_at) VALUES "
+        "('pr', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+    bad_id = conn.execute(
+        "SELECT id FROM improvement_runs").fetchone()["id"]
+
+    with pytest.raises(RuntimeError, match=f"id={bad_id}"):
+        init_db(conn)
+
+
+def test_improvement_runs_check_rejects_invalid_result_after_migration(
+        tmp_path):
+    conn = connect(tmp_path / "fresh.db")
+    init_db(conn)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO improvement_runs (result, started_at) VALUES "
+            "('pr', '2026-08-11T09:00:00+00:00')")
+
+
+def test_improvement_runs_check_allows_null_result_for_unfinished_run(
+        tmp_path):
+    """CHECK(result IN (...)) は NULL を拒否しない (SQLite の CHECK は
+    NULL に対して常に通過する) — start() 直後 (未 finish) の行が新スキーマ
+    でも作れることのピン。NOT NULL や `result IS NOT NULL` を書き足す
+    誤実装だけがこれを壊す。"""
+    from agentic_fx.store import improve_runs
+
+    conn = connect(tmp_path / "fresh.db")
+    init_db(conn)
+    rid = improve_runs.start(conn, None, datetime(2026, 8, 11, 9, 0,
+                                                   tzinfo=timezone.utc))
+    row = conn.execute(
+        "SELECT result FROM improvement_runs WHERE id=?", (rid,)).fetchone()
+    assert row["result"] is None
+
+
+def test_improvement_runs_guard_runs_before_any_table_rebuild(tmp_path):
+    """ガードは RENAME/CREATE より前に実行されること (**着手前検証 B3 で追加**)。
+
+    中断後の状態検査ではこの順序を観測できない — migration 全体が rollback に
+    包まれているため、ガードを RENAME の後へ移す変異が
+    `assert "pr_url" in cols` を素通りすることを実測で確認済み。実行された
+    SQL を直接観測して順序そのものを固定する。
+    """
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (result, started_at) VALUES "
+        "('pr', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    seen: list[str] = []
+    conn.set_trace_callback(seen.append)
+    try:
+        with pytest.raises(RuntimeError, match="旧 PR 経路"):
+            init_db(conn)
+    finally:
+        conn.set_trace_callback(None)
+
+    assert not any("RENAME TO improvement_runs_v1" in s for s in seen), \
+        f"ガードより前に RENAME が実行された: {seen}"
+
+
+def test_improvement_runs_migration_preserves_each_rows_result(tmp_path):
+    """コピーが result 列を行ごとに保存すること (定数で潰さない)。
+    **着手前検証で追加** — 単一行のテストでは列を定数に潰す変異が生存する。"""
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (id, result, started_at) VALUES "
+        "(1, 'report', '2026-08-11T09:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO improvement_runs (id, result, started_at) VALUES "
+        "(2, 'approval', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+
+    rows = {r["id"]: r["result"] for r in
+            conn.execute("SELECT id, result FROM improvement_runs")}
+    assert rows == {1: "report", 2: "approval"}
+
+
+def test_schema_improvement_runs_definition_has_no_pr_url():
+    """`_SCHEMA` 側の inline 定義も新 DDL に置き換わっていること
+    (**着手前検証で追加**)。
+
+    migration が後から作り直すため振る舞いでは差が出ず、`_SCHEMA` だけ旧定義に
+    戻す変異 (Step 5 の半分を実施しない) が生存する。定義そのものを検査する。
+    """
+    from agentic_fx.store import db as db_module
+
+    assert "pr_url" not in db_module._SCHEMA
+    assert db_module._IMPROVEMENT_RUNS_V2_DDL in db_module._SCHEMA
+
+
+def test_improvement_runs_migration_aborts_on_leftover_v1_table(tmp_path):
+    """中断痕跡 `improvement_runs_v1` が残っていたら表名を挙げて中断する
+    (**着手前検証 M1 で追加**)。
+
+    残存表の行は新スキーマへコピーされていない可能性があり、黙って早期
+    return すると取り残した行を見捨てる経路になる (変異ノート #7 の理念に
+    反する)。「移行済みだから何もしない」で済ませないことを直接ピンする。
+    """
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (result, started_at) VALUES "
+        "('report', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+    init_db(conn)   # 正常に移行済みの状態にする
+
+    # 前回の移行が中断した痕跡を人為的に作る
+    conn.execute(
+        "CREATE TABLE improvement_runs_v1 "
+        "(id INTEGER PRIMARY KEY, result TEXT)")
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="improvement_runs_v1"):
+        init_db(conn)
+
+
+def test_migrate_improvement_runs_backup_uses_improvement_runs_suffix(tmp_path):
+    """バックアップ名は `.bak-improvement-runs-v2` (**着手前検証 B4 で追加**)。
+
+    `db.py` の他 3 つの table rebuild (`_migrate_ohlcv_v2` = `.bak-ohlcv-v2` /
+    `_migrate_ohlcv_split` = `.bak-ohlcv-split` / `_migrate_signals_fk` =
+    `.bak-signals-fk`) と同じ規約で、移行の種類ごとに別ファイルへ退避する。
+    suffix がずれると別移行のバックアップを上書きしかねない。
+    `test_migrate_signals_fk_backup_uses_signals_fk_suffix` と同型の pin。
+    """
+    from agentic_fx.store import db as db_module
+
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (result, started_at) VALUES "
+        "('report', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    db_module._migrate_improvement_runs_v2(conn)
+
+    assert (tmp_path / "legacy.db.bak-improvement-runs-v2").exists()
+
+
+def test_migrate_improvement_runs_skips_backup_when_already_migrated(tmp_path):
+    """冪等ガードで抜ける通常起動ではバックアップを取らないこと
+    (**着手前検証 B4 で追加**)。毎起動で DB 全体をコピーしては困る。"""
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "fresh.db")
+    init_db(conn)   # 新規 DB — pr_url は最初から無い
+
+    db_module._migrate_improvement_runs_v2(conn)
+
+    assert not (tmp_path / "fresh.db.bak-improvement-runs-v2").exists()
+
+
+def test_migrate_improvement_runs_restores_foreign_keys_pragma(tmp_path):
+    """FK トグルを成功パスで必ず元に戻すこと (**着手前検証 B4 で追加**)。
+    戻し忘れると以降のプロセス全体で FK 保護が無効になる。"""
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (result, started_at) VALUES "
+        "('report', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_migrate_improvement_runs_copies_rows_with_dangling_backlog_id(tmp_path):
+    """参照切れの backlog_id があってもコピーが FK 違反で落ちないこと
+    (**着手前検証 B4 で追加**)。improvement_runs は improvement_backlog を
+    参照する **子** 側なので、FK を OFF にせずコピーすると
+    `IntegrityError: FOREIGN KEY constraint failed` になる (実測)。"""
+    conn = _legacy_improvement_runs_conn(tmp_path)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        "INSERT INTO improvement_runs (backlog_id, result, started_at) "
+        "VALUES (999, 'report', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT backlog_id FROM improvement_runs").fetchone()
+    assert row["backlog_id"] == 999
