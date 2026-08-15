@@ -9427,6 +9427,33 @@ def test_bump_records_the_mission_failure_reason(tmp_path):
     assert row["last_reason"] == reason
 ```
 
+**(Task 15 検証 ③ 2026-08-15 で追加: completed だが不正 output の経路が
+bump せず無制限再試行が残る欠落 — 実装後検証で発見、プラン側の欠落)**
+同じファイルの末尾に追加する。
+
+```python
+def test_malformed_output_consumes_an_attempt(tmp_path):
+    """Task 15 検証 ③ (2026-08-15) のピン: `completed` だが output が dict でない /
+    content が str でない経路も試行を消費する。消費しないと、恒久的に
+    壊れた出力を返す runner/model の故障で無制限再試行が残る。"""
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": 123}, []),
+        MissionResult("completed", {"content": 123}, []),
+        MissionResult("completed", {"content": 123}, []),
+    ])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert reflection_attempts.attempts_of(conn, oid) == 2
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
+    ).fetchone()["c"] == 2
+    text = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert text.count("reflection_abandoned") == 1
+```
+
 `tests/test_commands.py` と `tests/test_config.py` に追加する
 (下 2 本は **着手前検証 2026-08-15 で追加** — shell の存在ガードと `ge=1` に
 killer が無く、削除変異がフルスイート green で生存したため)。
@@ -9746,6 +9773,48 @@ rows = self.conn.execute(
                 return False        # ← 既存行、無変更
 ```
 
+**(Task 15 検証 ③ 2026-08-15 で追加: `completed` だが output/content が不正な
+経路も bump せず無制限再試行が残る欠落 — 実装後検証で発見、プラン側の欠落。
+不正 output ガードの併合 + bump。)**
+アンカーは既存の複合ガード `if result.status != "completed" or not finalize_ok:
+return False` の直後。次の 2 ガードを 1 本へ併合する。
+
+```python
+            if not isinstance(result.output, dict):
+                return False
+            content = result.output.get("content")
+            if not isinstance(content, str):
+                return False
+```
+
+を、次で置き換える:
+
+```python
+            # ↓Task 15 検証 ③ (2026-08-15): 不正 output も試行を消費する。
+            # `completed` だが output が dict でない / content が str でない
+            # のは「使えない出力」であり、恒久的に同じ出力を返す runner /
+            # model の故障では無制限再試行が残る。上の 2 ガードを 1 本へ
+            # 併合し、bump site を 1 箇所に保つ。
+            content = (result.output.get("content")
+                       if isinstance(result.output, dict) else None)
+            if not isinstance(content, str):
+                with self._core_lock:
+                    attempts = reflection_attempts.bump(
+                        self.conn, row["id"], now=self.clock.now(),
+                        reason="malformed output")
+                if attempts == self.settings.reflection.max_attempts:
+                    try:
+                        self.activity.write(
+                            Category.AGGREGATE, "reflection_abandoned",
+                            f"order_id={row['id']} attempts={attempts}",
+                            ref_id=str(row["id"]))
+                    except Exception:  # noqa: BLE001
+                        _log.exception(
+                            "failed to record reflection_abandoned for #%s",
+                            row["id"])
+                return False
+```
+
 成功の completion marker 保存直後、同じ `core_lock` 内で `clear` する (1 行追加のみ)。
 
 ```python
@@ -9794,6 +9863,10 @@ Expected: 全件 PASS。`test_reflection_retries_to_limit_then_stops` は missio
 (着手前検証 2026-08-15 に probe で実測。束 D merge 時点のベースライン 1981 起点 +16 —
 db.py +3 / reflection_attempts +2 / reflection_cycle +7 / commands +2 / config +2)。
 
+**(Task 15 検証 ③ 2026-08-15 で注記: 上記ピン 1 本を加えると
+1997 → 1998 (Task 15 単独時)。束 E 全体では別 task の追加テストと合算するため
+実測値はそちらを正とする。)**
+
 - [ ] **Step 5: 変異テスト**
 
 ```bash
@@ -9821,6 +9894,7 @@ killer 名も一致。下 6 行は指揮者が追加した変異で、うち 5 �
 | shell の `orders.get(...) is None` ガードを削除 | `test_reflect_retry_rejects_unknown_order` |
 | `max_attempts` の `ge=1` を外す | `test_reflection_max_attempts_must_be_at_least_one` |
 | 抽出 SQL の `ORDER BY o.id` を削除 | **殺せない (受容)** — 専用テストを書いて実測しても生存する (順序は実行計画依存で黒箱から固定できない)。テストは足さず、Step 3 の SQL に規約コメントを残す |
+| 不正 output 経路の `bump()` を削除 | `test_malformed_output_consumes_an_attempt` |
 
 各変異は 1 件ずつ当て、`grep -n "reflection_attempts\|reflection_abandoned\|attempts <"` で改変を表示後、表の単独テストを実行する。revert 後も同じ単独テストが green であることを確認し ledger に記録する。
 **revert は `git checkout` ではなくバックアップからのファイル全体コピーで行う**

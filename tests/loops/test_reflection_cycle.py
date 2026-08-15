@@ -769,3 +769,25 @@ def test_abandon_releases_starved_later_orders(tmp_path):
     assert conn.execute(
         "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
     ).fetchone()["c"] == 7
+
+
+def test_malformed_output_consumes_an_attempt(tmp_path):
+    """Task 15 検証 ③ (2026-08-15) のピン: `completed` だが output が dict でない /
+    content が str でない経路も試行を消費する。消費しないと、恒久的に
+    壊れた出力を返す runner/model の故障で無制限再試行が残る。"""
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": 123}, []),
+        MissionResult("completed", {"content": 123}, []),
+        MissionResult("completed", {"content": 123}, []),
+    ])
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert reflection_attempts.attempts_of(conn, oid) == 2
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
+    ).fetchone()["c"] == 2
+    text = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert text.count("reflection_abandoned") == 1

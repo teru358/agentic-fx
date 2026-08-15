@@ -217,10 +217,28 @@ class ReflectionCycle:
                 # 無いので次周期の run_pending が同じ order を再試行する
                 return False
 
-            if not isinstance(result.output, dict):
-                return False
-            content = result.output.get("content")
+            # ↓Task 15 検証 ③ (2026-08-15): 不正 output も試行を消費する。
+            # `completed` だが output が dict でない / content が str でない
+            # のは「使えない出力」であり、恒久的に同じ出力を返す runner /
+            # model の故障では無制限再試行が残る。上の 2 ガードを 1 本へ
+            # 併合し、bump site を 1 箇所に保つ。
+            content = (result.output.get("content")
+                       if isinstance(result.output, dict) else None)
             if not isinstance(content, str):
+                with self._core_lock:
+                    attempts = reflection_attempts.bump(
+                        self.conn, row["id"], now=self.clock.now(),
+                        reason="malformed output")
+                if attempts == self.settings.reflection.max_attempts:
+                    try:
+                        self.activity.write(
+                            Category.AGGREGATE, "reflection_abandoned",
+                            f"order_id={row['id']} attempts={attempts}",
+                            ref_id=str(row["id"]))
+                    except Exception:  # noqa: BLE001
+                        _log.exception(
+                            "failed to record reflection_abandoned for #%s",
+                            row["id"])
                 return False
 
             # RAG → SQLite order (SQLite row is completion marker)。RAG 書込は
