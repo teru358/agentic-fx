@@ -5,15 +5,18 @@ import pytest
 
 from agentic_fx.store.db import TABLE_NAMES, connect, connect_readonly, init_db
 
+NOW = datetime(2026, 8, 11, tzinfo=timezone.utc)
+
 EXPECTED = {
     "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
+    "alert_state",
 }
 
 
-def test_init_creates_all_16_tables(tmp_path):
+def test_init_creates_all_17_tables(tmp_path):
     conn = connect(tmp_path / "agentic.db")
     init_db(conn)
     rows = conn.execute(
@@ -21,6 +24,182 @@ def test_init_creates_all_16_tables(tmp_path):
         "AND name NOT LIKE 'sqlite_%'").fetchall()
     assert {r["name"] for r in rows} == EXPECTED
     assert TABLE_NAMES == frozenset(EXPECTED)
+
+
+def _legacy_trade_intents_ddl():
+    return ("CREATE TABLE trade_intents (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "mission_id INTEGER NOT NULL REFERENCES missions(id),"
+            "payload_json TEXT NOT NULL,gate_result TEXT,reject_reason TEXT,"
+            "created_at TEXT NOT NULL);")
+
+
+_MISSIONS_DDL = ("CREATE TABLE missions (id INTEGER PRIMARY KEY, loop TEXT NOT NULL,"
+                 "runner TEXT NOT NULL,model TEXT NOT NULL,status TEXT NOT NULL,"
+                 "started_at TEXT NOT NULL);")
+
+
+def test_init_db_fresh_trade_intents_has_observability_columns(tmp_path):
+    c = connect(tmp_path / "fresh.db")
+    init_db(c)
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(trade_intents)")}
+    assert {"action", "reject_category"} <= cols
+
+
+def test_trade_intents_migration_accepts_legacy_rejected_row_with_null_action(tmp_path):
+    c = connect(tmp_path / "legacy.db")
+    c.executescript(_MISSIONS_DDL + _legacy_trade_intents_ddl())
+    c.execute("INSERT INTO missions VALUES (1,'trade','local','m','completed','x')")
+    c.execute("INSERT INTO trade_intents (mission_id,payload_json,gate_result,"
+              "reject_reason,created_at) VALUES (1,'{}','rejected','legacy','x')")
+    c.commit()
+    init_db(c)
+    row = c.execute("SELECT action,reject_category FROM trade_intents").fetchone()
+    assert row["action"] is None and row["reject_category"] is None
+
+
+def test_trade_intents_migration_is_idempotent(tmp_path):
+    """legacy 行を 1 件持つ DB で 2 回流し、**行が生き残り列も揃っている**
+    ことを見る (空 DB で `COUNT(*) == 0` を見るだけの旧々版は何も検証して
+    いなかった)。**ただしこのテストだけでは冪等ガード除去を殺せない** —
+    下の `test_repeated_init_db_does_not_wipe_action_and_category` が要る。"""
+    c = connect(tmp_path / "db.sqlite")
+    c.executescript(_MISSIONS_DDL + _legacy_trade_intents_ddl())
+    c.execute("INSERT INTO missions VALUES (1,'trade','local','m','completed','x')")
+    c.execute("INSERT INTO trade_intents (mission_id,payload_json,gate_result,"
+              "reject_reason,created_at) VALUES (1,'{}','rejected','legacy','x')")
+    c.commit()
+    init_db(c)
+    init_db(c)                      # 2 回目が壊さないことが本題
+    rows = c.execute("SELECT action,reject_category,reject_reason "
+                     "FROM trade_intents").fetchall()
+    assert len(rows) == 1                              # 行が重複も消失もしない
+    assert rows[0]["reject_reason"] == "legacy"        # 中身が保たれている
+    assert rows[0]["action"] is None                   # legacy は NULL のまま
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(trade_intents)")}
+    assert {"action", "reject_category"} <= cols       # 列が消えていない
+
+
+def test_repeated_init_db_does_not_wipe_action_and_category(tmp_path):
+    """(着手前検証 2026-08-15 で追加) 冪等ガードを外す / 弱める変異の**真の
+    killer**。上の idempotent テストは legacy 行 (action が元から NULL) しか
+    置かないため、**2 回目の rebuild が `INSERT ... SELECT ... NULL AS action`
+    で既存の action / reject_category を全消去する**という本番致命の壊れ方を
+    観測できない (実測: 冪等ガード 2 段の除去がそのテストでは SURVIVED)。
+    移行済みの行を 1 件置いて再度 init_db を通す。"""
+    from agentic_fx.store import intents, missions
+    c = connect(tmp_path / "x.db")
+    init_db(c)
+    mid = missions.start(c, "trade", "local", "m", NOW)
+    iid = intents.insert(c, mid, {}, NOW, action="open")
+    intents.set_gate_result(c, iid, accepted=False, reject_reason="r",
+                            reject_category="risk_gate")
+    init_db(c)
+    row = c.execute("SELECT action,reject_category FROM trade_intents").fetchone()
+    assert row["action"] == "open"
+    assert row["reject_category"] == "risk_gate"
+
+
+def test_trade_intents_migration_keeps_orders_fk_usable(tmp_path):
+    """参照される側の rebuild 後も orders FK は trade_intents を指す。
+
+    (着手前検証 2026-08-15 で訂正) **`orders` に子行を 1 件入れる**。旧版は
+    orders を空のまま `init_db` を呼ぶため、`PRAGMA foreign_keys=ON` 下の
+    `DROP TABLE trade_intents` が成功してしまい、**本番致命の欠陥を素通り
+    させていた** (実測: FK トグル除去変異が旧版では SURVIVED、子行 1 件で
+    KILLED)。"""
+    c = connect(tmp_path / "legacy.db")
+    c.executescript(_MISSIONS_DDL + _legacy_trade_intents_ddl() +
+                    "CREATE TABLE orders (id INTEGER PRIMARY KEY, intent_id INTEGER "
+                    "REFERENCES trade_intents(id));")
+    c.execute("INSERT INTO missions VALUES (1,'trade','local','m','completed','x')")
+    c.execute("INSERT INTO trade_intents (id,mission_id,payload_json,created_at) "
+              "VALUES (7,1,'{}','x')")
+    c.execute("INSERT INTO orders (id,intent_id) VALUES (1,7)")   # ← 訂正点
+    c.commit()
+    init_db(c)
+    fk = c.execute("PRAGMA foreign_key_list(orders)").fetchone()
+    assert fk["table"] == "trade_intents"
+    c.execute("INSERT INTO orders (intent_id) VALUES (7)")
+
+
+def test_trade_intents_migration_leaves_foreign_keys_enabled(tmp_path):
+    """(着手前検証 2026-08-15 で追加) 成功パスで `PRAGMA foreign_keys=ON` へ
+    戻し忘れる変異の killer。戻し忘れると以降のプロセス全体で FK 保護が
+    無効になる (束 D `_migrate_signals_fk` の docstring が明示する壊れ方)。"""
+    c = connect(tmp_path / "legacy.db")
+    c.executescript(_MISSIONS_DDL + _legacy_trade_intents_ddl())
+    c.execute("INSERT INTO missions VALUES (1,'trade','local','m','completed','x')")
+    c.execute("INSERT INTO trade_intents (id,mission_id,payload_json,created_at) "
+              "VALUES (7,1,'{}','x')")
+    c.commit()
+    init_db(c)
+    assert c.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_trade_intents_migration_preserves_intent_ids(tmp_path):
+    """(着手前検証 2026-08-15 で追加) `INSERT ... SELECT` から `id` を落とす
+    変異の killer。AUTOINCREMENT が再採番すると `orders.intent_id` が別の
+    intent を指す (静かなデータ破壊)。"""
+    c = connect(tmp_path / "legacy.db")
+    c.executescript(_MISSIONS_DDL + _legacy_trade_intents_ddl() +
+                    "CREATE TABLE orders (id INTEGER PRIMARY KEY, intent_id INTEGER "
+                    "REFERENCES trade_intents(id));")
+    c.execute("INSERT INTO missions VALUES (1,'trade','local','m','completed','x')")
+    for iid in (5, 9):
+        c.execute("INSERT INTO trade_intents (id,mission_id,payload_json,created_at) "
+                  "VALUES (?,1,'{}','x')", (iid,))
+    c.execute("INSERT INTO orders (id,intent_id) VALUES (1,9)")
+    c.commit()
+    init_db(c)
+    assert [r["id"] for r in c.execute(
+        "SELECT id FROM trade_intents ORDER BY id")] == [5, 9]
+
+
+def test_trade_intents_migration_backs_up_before_rebuild(tmp_path):
+    """(着手前検証 2026-08-15 で追加) 束 D 規約 (移行前バックアップ) の pin。"""
+    path = tmp_path / "legacy.db"
+    c = connect(path)
+    c.executescript(_MISSIONS_DDL + _legacy_trade_intents_ddl())
+    c.commit()
+    init_db(c)
+    assert (tmp_path / "legacy.db.bak-trade-intents-observability").exists()
+
+
+def test_trade_intents_check_rejects_invalid_gate_category_pair(tmp_path):
+    c = connect(tmp_path / "db.sqlite")
+    init_db(c)
+    c.execute("INSERT INTO missions (id,loop,runner,model,status,started_at) "
+              "VALUES (999,'trade','local','m','completed','x')")
+    with pytest.raises(sqlite3.IntegrityError):
+        c.execute("INSERT INTO trade_intents (mission_id,payload_json,action,"
+                  "gate_result,reject_category,created_at) VALUES "
+                  "(999,'{}','open','accepted','risk_gate','x')")
+
+
+def test_fresh_and_migrated_trade_intents_have_the_same_shape(tmp_path):
+    """(着手前検証 2026-08-15 で追加) fresh の `_SCHEMA` 側と migration 側の
+    DDL が同一契約であることの pin。**`sqlite_master.sql` の文字列比較にしては
+    ならない** — RENAME を経た表の DDL は `CREATE TABLE "trade_intents" (` と
+    引用符付きになるため偽陽性になる (実測)。`PRAGMA table_info` と CHECK の
+    実挙動で比較する。"""
+    fresh = connect(tmp_path / "fresh.db")
+    init_db(fresh)
+    legacy = connect(tmp_path / "legacy.db")
+    legacy.executescript(_MISSIONS_DDL + _legacy_trade_intents_ddl())
+    legacy.commit()
+    init_db(legacy)
+
+    def shape(c):
+        return [(r["name"], r["type"], r["notnull"], r["pk"])
+                for r in c.execute("PRAGMA table_info(trade_intents)")]
+    assert shape(fresh) == shape(legacy)
+    for c in (fresh, legacy):
+        c.execute("INSERT INTO missions (id,loop,runner,model,status,started_at) "
+                  "VALUES (999,'trade','local','m','completed','x')")
+        with pytest.raises(sqlite3.IntegrityError):
+            c.execute("INSERT INTO trade_intents (mission_id,payload_json,action,"
+                      "gate_result,reject_category,created_at) VALUES "
+                      "(999,'{}','open','rejected','bogus','x')")
 
 
 def test_init_creates_account_snapshots_ts_id_index(tmp_path):

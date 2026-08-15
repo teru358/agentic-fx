@@ -33,6 +33,7 @@ from agentic_fx.loops.summary import (
 )
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
+from agentic_fx.store import alert_state
 from agentic_fx.store import intents as intents_store
 from agentic_fx.store import missions, signals
 
@@ -44,6 +45,23 @@ _TRADE_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
                 "get_econ_calendar", "get_positions", "get_account",
                 "get_recent_reflections", "search_reflections",
                 "get_signals"]
+
+
+def gate_reject_streak(conn: sqlite3.Connection) -> tuple[int, int, str | None]:
+    """(streak_id, rejected_count, dominant_category) — 設計書 D3 の SQL ①②③。
+    **`conn_supervisor` (lock 外の読取専用接続) で呼ぶこと。**"""
+    streak_id = int(conn.execute(
+        "SELECT COALESCE(MAX(id),0) FROM trade_intents "
+        "WHERE action='open' AND gate_result='accepted'").fetchone()[0])
+    count = int(conn.execute(
+        "SELECT COUNT(*) FROM trade_intents WHERE action='open' "
+        "AND gate_result='rejected' AND id > ?", (streak_id,)).fetchone()[0])
+    row = conn.execute(
+        "SELECT reject_category,COUNT(*) c FROM trade_intents "
+        "WHERE action='open' AND gate_result='rejected' AND id > ? "
+        "GROUP BY reject_category ORDER BY c DESC,reject_category ASC LIMIT 1",
+        (streak_id,)).fetchone()
+    return streak_id, count, row["reject_category"] if row else None
 
 
 class TradeLoop:
@@ -321,7 +339,8 @@ class TradeLoop:
                                        + safe_error_text(snapshot_error)]
                             intents_store.set_gate_result(
                                 self.conn, iid, accepted=False,
-                                reject_reason=reasons[0])
+                                reject_reason=reasons[0],
+                                reject_category="execution")
                             self.activity.write(Category.TRADE, "gate_rejected",
                                                 reasons[0], ref_id=str(iid))
                             out = {"result": "rejected", "order_id": None,
@@ -368,6 +387,7 @@ class TradeLoop:
                     self.notifier.send(_text)
                 except Exception:  # noqa: BLE001 — 通知失敗で本流を止めない
                     _log.exception("deferred notification failed")
+            self._notify_gate_reject_streak()        # ← Task 17 が足す 1 行
             if out is None:
                 return None
             self.activity.write(Category.AGGREGATE, "decision",
@@ -404,6 +424,35 @@ class TradeLoop:
                 with self._core_lock:
                     finalize_mission(self.conn, self.activity, self.clock,
                                      mid, MissionResult("failed", None, []))
+
+    def _notify_gate_reject_streak(self) -> None:
+        """commit-post 専用 (設計書 D3 / D3')。判定は `_conn_supervisor`、
+        通知は lock 非保持、ラッチ更新だけ短い `core_lock` + `self.conn`。
+        scheduler / maintenance からは決して呼ばない。
+
+        **`self.notifier.send` を `core_lock` の中へ入れてはならない** —
+        `send` は `urlopen(timeout=10)` の同期実行であり、SL/TP 監視を最大
+        10 秒止める (Global Constraints)。
+        `test_gate_alert_notification_is_sent_without_holding_core_lock` が守る。
+        """
+        try:
+            streak_id, count, dominant = gate_reject_streak(self._conn_supervisor)
+            if count < self.settings.alert.consecutive_gate_reject:
+                return
+            with self._core_lock:
+                last = alert_state.get(
+                    self.conn, alert_state.GATE_REJECT_STREAK_KEY)
+            if last == str(streak_id):
+                return
+            self.notifier.send(
+                f"[agentic-fx] open intent が {count} 件連続で却下されています"
+                f" (最多カテゴリ: {dominant or 'unknown'})")
+            with self._core_lock:
+                alert_state.set(
+                    self.conn, alert_state.GATE_REJECT_STREAK_KEY,
+                    str(streak_id), now=self.clock.now())
+        except Exception:  # noqa: BLE001 — finalize 済み Mission を失敗に見せない
+            _log.exception("gate rejection alert evaluation failed")
 
     def _read_exposure_pairs(self) -> list[str]:
         """commit-pre 専用: `conn_supervisor` (lock 外の読取専用接続) から
