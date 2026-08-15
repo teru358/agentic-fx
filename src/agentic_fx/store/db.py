@@ -19,6 +19,38 @@ CREATE TABLE IF NOT EXISTS ohlcv (
 );
 """
 
+# Task 13 (プラン9 束D、設計書 D5): signals.claimed_by_mission_id に
+# missions(id) への FK を追加する。既存 DB では table rebuild が要るため
+# (SQLite は ADD CONSTRAINT を持たない)、DDL を _migrate_signals_fk からも
+# 再利用できるよう定数として切り出す (_OHLCV_V2_DDL と同型)。
+_SIGNALS_V2_DDL = """
+CREATE TABLE IF NOT EXISTS signals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  plugin TEXT NOT NULL, content_hash TEXT NOT NULL,
+  pair TEXT NOT NULL, timeframe TEXT NOT NULL, bar_ts TEXT NOT NULL,
+  kind TEXT NOT NULL, payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK(status IN ('pending','claimed','consumed','abandoned')),
+  claimed_by_mission_id INTEGER REFERENCES missions(id), claimed_at TEXT,
+  requeue_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  UNIQUE(plugin, content_hash, pair, timeframe, bar_ts)
+);
+"""
+
+# Task 19 (プラン9 束D、設計書 D7): improvement_runs から pr_url を落とし
+# result を approval|report に限定する (旧 PR 経路の廃止、設計書改訂17)。
+# 理由は _SIGNALS_V2_DDL と同じ — rebuild からも再利用するため定数化する。
+_IMPROVEMENT_RUNS_V2_DDL = """
+CREATE TABLE IF NOT EXISTS improvement_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  backlog_id INTEGER REFERENCES improvement_backlog(id),
+  result TEXT CHECK (result IN ('approval','report')),
+  approval_id INTEGER, report_path TEXT,
+  started_at TEXT NOT NULL, finished_at TEXT
+);
+"""
+
 _OHLCV_CACHE_DDL = """
 CREATE TABLE IF NOT EXISTS ohlcv_cache (
   symbol TEXT NOT NULL, interval TEXT NOT NULL, bar_time TEXT NOT NULL,
@@ -99,13 +131,7 @@ CREATE TABLE IF NOT EXISTS improvement_backlog (
   status TEXT NOT NULL DEFAULT 'open',  -- open | selected | done | rejected
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS improvement_runs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  backlog_id INTEGER REFERENCES improvement_backlog(id),
-  result TEXT,                   -- pr | approval | report
-  pr_url TEXT, approval_id INTEGER, report_path TEXT,
-  started_at TEXT NOT NULL, finished_at TEXT
-);
+""" + _IMPROVEMENT_RUNS_V2_DDL + """
 CREATE TABLE IF NOT EXISTS econ_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL, country TEXT NOT NULL, name TEXT NOT NULL,
@@ -149,18 +175,7 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
   params_json TEXT NOT NULL, trial_count INTEGER NOT NULL,
   source TEXT NOT NULL, created_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS signals (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  plugin TEXT NOT NULL, content_hash TEXT NOT NULL,
-  pair TEXT NOT NULL, timeframe TEXT NOT NULL, bar_ts TEXT NOT NULL,
-  kind TEXT NOT NULL, payload_json TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending'
-    CHECK(status IN ('pending','claimed','consumed','abandoned')),
-  claimed_by_mission_id INTEGER, claimed_at TEXT,
-  requeue_count INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  UNIQUE(plugin, content_hash, pair, timeframe, bar_ts)
-);
+""" + _SIGNALS_V2_DDL + """
 -- プラン 9 束 C (codex 指摘の裏取り): prune_cache (store/ohlcv.py) の
 -- `WHERE bar_time < ?` は PK (symbol, interval, bar_time, source) の先頭列に
 -- 当たらず、autoindex のカバリングスキャンになる。定常状態では cutoff を
@@ -501,6 +516,245 @@ def _ohlcv_legacy_exists(conn: sqlite3.Connection) -> bool:
         "AND name='ohlcv'").fetchone() is not None
 
 
+def _migrate_signals_fk(conn: sqlite3.Connection) -> None:
+    """signals.claimed_by_mission_id に missions(id) への FK を追加する
+    table rebuild (設計書 §12 裁定 2026-08-11 / D5、プラン9 Task 13)。
+
+    SQLite は既存テーブルへの ADD CONSTRAINT を持たないため rebuild が要る。
+    移行前に残りうる宙吊り行 (参照先 missions 行が既に無い
+    claimed_by_mission_id) を status ごとに修復してからコピーする —
+    修復無しでコピーすると FK 違反になる。
+
+    status ごとの修復規則 (D5):
+    - claimed かつ宙吊り (claimed_by_mission_id が missions に実在しない
+      **か、そもそも NULL** — 旧スキーマでは「claimed なのに owner が
+      NULL」の行が残りうる。レビュー 1 周目 F1 で修正: 旧条件は
+      `claimed_by_mission_id IS NOT NULL` を要求しており、owner が NULL
+      のこの行を素通りさせていた。素通りすると `recover_interrupted` は
+      owner で引くため拾えず lease 満了までは不可視になり、claimed_at
+      も NULL の行は `reclaim_expired` (`datetime(claimed_at)` で選ぶ)
+      でも回収されず永久滞留する): status='pending' +
+      claimed_by_mission_id=NULL + claimed_at=NULL (lease 回収と同じ扱いに
+      戻す)
+    - consumed/abandoned かつ宙吊り: claimed_by_mission_id=NULL のみ
+      (**終端状態を蘇らせない** — status も claimed_at も変えない)
+    - pending: 元々 claimed_by_mission_id は NULL のため対象外
+
+    **PRAGMA foreign_keys は BEGIN の外側でトグルする**。SQLite は
+    トランザクション開始後の `PRAGMA foreign_keys` 変更を無視する (実測
+    確認済み — BEGIN 後に発行した OFF は次の PRAGMA 読み出しでも ON の
+    ままになる)。OFF にした後は成功・失敗を問わず finally で必ず ON に
+    戻す — 戻し忘れると以降のプロセス全体で FK 保護が無効になる。
+
+    修復後は `PRAGMA foreign_key_check(signals)` が空であることを検査して
+    からコミットする (D5 逐語)。空でなければ repair ロジックの不備であり、
+    黙って進めず例外にする。
+
+    **移行前バックアップ (着手前検証・指揮者裁定で追加)**: `db.py` の他 2 つの
+    table rebuild (`_migrate_ohlcv_v2` / `_migrate_ohlcv_split`) と規約を統一し、
+    冪等ガードを通過した (= 実際に rebuild が走る) 場合にのみ
+    `_backup_before_migration(conn, ".bak-signals-fk")` でスナップショットを取る。
+    ガードで抜ける通常起動では呼ばれないため、毎起動のコストにはならない。
+    suffix は移行の種類ごとに別ファイルにする規約 (`.bak-ohlcv-v2` /
+    `.bak-ohlcv-split` と衝突させない)。
+
+    **FK 再構築の警告:** `signals` は現時点で参照元が無いため RENAME 先行が
+    動くにすぎない。参照される側を再構築するときは「新名 CREATE → コピー →
+    旧表 DROP → 新表を本来名へ RENAME」の順序を使う (Task 17 を参照)。
+    """
+    fk_present = any(
+        fk["table"] == "missions" and fk["from"] == "claimed_by_mission_id"
+        for fk in conn.execute("PRAGMA foreign_key_list(signals)"))
+    v1_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='signals_v1'").fetchone() is not None
+    if fk_present and not v1_exists:
+        return  # 既に移行済み
+
+    _backup_before_migration(conn, ".bak-signals-fk")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # F2 型の再検査: ロック取得までの間に別接続が移行を完了させて
+            # いないか確認する。
+            fk_present2 = any(
+                fk["table"] == "missions"
+                and fk["from"] == "claimed_by_mission_id"
+                for fk in conn.execute("PRAGMA foreign_key_list(signals)"))
+            v1_exists2 = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='signals_v1'").fetchone() is not None
+            if fk_present2 and not v1_exists2:
+                conn.commit()
+                return
+
+            if not v1_exists2:
+                conn.execute("ALTER TABLE signals RENAME TO signals_v1")
+            conn.execute(_SIGNALS_V2_DDL)
+
+            conn.execute(
+                "INSERT OR IGNORE INTO signals "
+                "(id, plugin, content_hash, pair, timeframe, bar_ts, kind, "
+                "payload_json, status, claimed_by_mission_id, claimed_at, "
+                "requeue_count, created_at) "
+                "SELECT id, plugin, content_hash, pair, timeframe, bar_ts, "
+                "kind, payload_json, "
+                "CASE WHEN status='claimed' AND "
+                "(claimed_by_mission_id IS NULL OR claimed_by_mission_id "
+                "NOT IN (SELECT id FROM missions)) THEN 'pending' "
+                "ELSE status END, "
+                "CASE WHEN claimed_by_mission_id IS NOT NULL "
+                "AND claimed_by_mission_id NOT IN (SELECT id FROM missions) "
+                "THEN NULL ELSE claimed_by_mission_id END, "
+                "CASE WHEN status='claimed' AND "
+                "(claimed_by_mission_id IS NULL OR claimed_by_mission_id "
+                "NOT IN (SELECT id FROM missions)) THEN NULL "
+                "ELSE claimed_at END, "
+                "requeue_count, created_at FROM signals_v1")
+
+            copied = conn.execute(
+                "SELECT COUNT(*) c FROM signals").fetchone()["c"]
+            original = conn.execute(
+                "SELECT COUNT(*) c FROM signals_v1").fetchone()["c"]
+            if copied != original:
+                raise RuntimeError(
+                    "signals migration: 行数が一致しません "
+                    f"(signals_v1={original}, signals={copied})。"
+                    "OR IGNORE が想定外の重複と衝突した可能性があります。")
+
+            violations = conn.execute(
+                "PRAGMA foreign_key_check(signals)").fetchall()
+            if violations:
+                raise RuntimeError(
+                    "signals migration: 修復後も FK 違反が残っています "
+                    f"({len(violations)} 行): "
+                    f"{[dict(v) for v in violations]}")
+
+            conn.execute("DROP TABLE signals_v1")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_improvement_runs_v2(conn: sqlite3.Connection) -> None:
+    """improvement_runs から pr_url 列を落とし、result に
+    CHECK (approval|report) を追加する table rebuild (設計書 §12 / D7、
+    プラン9 Task 19)。
+
+    旧 PR 経路の廃止 (設計書改訂17) により result='pr' / pr_url は死んだ
+    概念になった。**移行前に result='pr' OR pr_url IS NOT NULL の行が
+    1 件でもあれば中断してエラーにする** — 現スキーマは result に CHECK が
+    無いため `result='pr', pr_url=NULL` が合法であり、pr_url だけを見る
+    ガードはこの行を見逃して不正値を新契約に持ち込む (codex I6)。
+
+    **ガードは RENAME より前に置く (着手前検証 B3)**。migration 全体が
+    rollback に包まれているため、ガードを RENAME の後に置いても事後状態
+    (`pr_url` 列の有無) からは違いを観測できない — 実測で確認済み。順序は
+    `test_improvement_runs_guard_runs_before_any_table_rebuild` が実行 SQL を
+    直接観測して守る。
+
+    **移行前バックアップ・FK トグル・行数一致ガード (着手前検証 B4)**:
+    `db.py` の他 3 つの table rebuild (`_migrate_ohlcv_v2` = `.bak-ohlcv-v2` /
+    `_migrate_ohlcv_split` = `.bak-ohlcv-split` / `_migrate_signals_fk` =
+    `.bak-signals-fk`) と規約を統一する。
+    - backup: 冪等ガードを通過した (= 実際に rebuild が走る) 場合のみ取る。
+    - FK トグル: `improvement_runs.backlog_id` は `improvement_backlog(id)` を
+      **参照する側** (子) なので、`INSERT..SELECT` で FK が再検証される。
+      参照切れの `backlog_id` が 1 行でもあると素の IntegrityError で落ちる
+      (実測確認済み) ため OFF にしてコピーし、成功・失敗を問わず `finally` で
+      必ず ON へ戻す。**PRAGMA は BEGIN の外側でトグルする** (SQLite は
+      トランザクション開始後の変更を無視する — Task 13 で実測済み)。
+      なお Step 5 の「参照元が無いので RENAME 先行が成立する」は親側の話で
+      正しく、ここで扱うのは子側という別の論点である。
+    - 行数一致ガード: コピーは `INSERT OR IGNORE` なので id 衝突時に黙って
+      捨てる。変異ノート #7 の理念 (「黙って捨てない」) を実効的に満たすため、
+      コピー後に v1 との行数一致を検査する。
+
+    **中断痕跡 (`improvement_runs_v1` 残存) は明示的に中断する (着手前検証
+    M1)**: 残存表の行は新スキーマへコピーされていない可能性がある。黙って
+    早期 return すると取り残した行を見捨てる経路になる (変異ノート #7 の
+    理念に反する) ため、表名を名指しして raise する。
+    `_migrate_signals_fk` が同じ状態から**自動再開する**のとは意図的に
+    非対称: signals 側は「宙吊り行の修復」という決定論的なコピー規則を
+    持つため v1 の行を機械的に持ち直せるが、こちらは v1 に旧 PR 経路の
+    不正値 (`result='pr'` / `pr_url`) が混じっている可能性があり、それを
+    黙って通すか捨てるかは人が判断すべき事項 (束 D 2 周目 /code-review で
+    非対称の説明が無い点を指摘され追記)。
+    """
+    cols = {r["name"] for r in
+           conn.execute("PRAGMA table_info(improvement_runs)")}
+    v1_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='improvement_runs_v1'").fetchone() is not None
+    if v1_exists:
+        raise RuntimeError(
+            "improvement_runs migration: 前回の移行が中断した痕跡 "
+            "improvement_runs_v1 が残っています。この表の行は新スキーマへ"
+            "コピーされていない可能性があり、黙って進めると失われます。"
+            "手動で内容を確認し、退避または削除してから再実行してください。")
+    if "pr_url" not in cols:
+        return  # 既に移行済み
+
+    _backup_before_migration(conn, ".bak-improvement-runs-v2")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # F2 型の再検査: ロック取得までの間に別接続が移行を完了させて
+            # いないか確認する。
+            cols2 = {r["name"] for r in
+                    conn.execute("PRAGMA table_info(improvement_runs)")}
+            if "pr_url" not in cols2:
+                conn.commit()
+                return  # 別接続が先に移行済み
+
+            # 移行対象データの検査は RENAME より前 — 中断時に旧テーブルへ
+            # 一切触れない (黙って捨てず、対象行の id を名指しして中断する)。
+            bad_rows = conn.execute(
+                "SELECT id FROM improvement_runs "
+                "WHERE result='pr' OR pr_url IS NOT NULL").fetchall()
+            if bad_rows:
+                ids = ", ".join(str(r["id"]) for r in bad_rows)
+                raise RuntimeError(
+                    "improvement_runs migration: 旧 PR 経路の行が残っています "
+                    f"(result='pr' または pr_url が非NULL、id={ids})。新スキーマ"
+                    "はこの値域を持てません。手動で調査・退避してから再実行して"
+                    "ください。")
+
+            conn.execute(
+                "ALTER TABLE improvement_runs RENAME TO improvement_runs_v1")
+            conn.execute(_IMPROVEMENT_RUNS_V2_DDL)
+            conn.execute(
+                "INSERT OR IGNORE INTO improvement_runs "
+                "(id, backlog_id, result, approval_id, report_path, "
+                "started_at, finished_at) "
+                "SELECT id, backlog_id, result, approval_id, report_path, "
+                "started_at, finished_at FROM improvement_runs_v1")
+
+            copied = conn.execute(
+                "SELECT COUNT(*) c FROM improvement_runs").fetchone()["c"]
+            original = conn.execute(
+                "SELECT COUNT(*) c FROM improvement_runs_v1").fetchone()["c"]
+            if copied != original:
+                raise RuntimeError(
+                    "improvement_runs migration: 行数が一致しません "
+                    f"(improvement_runs_v1={original}, "
+                    f"improvement_runs={copied})。OR IGNORE が想定外の重複と"
+                    "衝突した可能性があります。")
+
+            conn.execute("DROP TABLE improvement_runs_v1")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     if _ohlcv_legacy_exists(conn):
@@ -512,4 +766,6 @@ def init_db(conn: sqlite3.Connection) -> None:
             _migrate_ohlcv_v2(conn)     # v1 → v2 (既存、無変更)
         _migrate_ohlcv_split(conn)      # v2 → ohlcv_cache/ohlcv_history (新設)
     _ensure_column(conn, "missions", "trigger", "trigger TEXT")
+    _migrate_signals_fk(conn)           # Task 13
+    _migrate_improvement_runs_v2(conn)  # Task 19 (追加するのはこの 1 行だけ)
     conn.commit()

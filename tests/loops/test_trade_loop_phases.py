@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agentic_fx.runners.base import Mission, MissionResult
-from agentic_fx.store import orders, signals
+from agentic_fx.store import missions, orders, signals
 from tests.loops.test_trade_loop import NOW, QUOTE, SETTINGS, _loop
 
 
@@ -175,12 +175,15 @@ def test_requeue_signal_does_not_send_notification_itself(tmp_path):
         timeframe="1h", bar_ts=NOW.isoformat(), kind="signal",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
         now=NOW)
+    # Task 13: claimed_by_mission_id に missions(id) への FK が付くため、
+    # 実在する mission 行が必要 (以前はダミー整数 1 だった)。
+    mid = missions.start(conn, "trade", "local", "m", NOW)
     for _ in range(max_requeue):
-        claimed = signals.claim_oldest(conn, mission_id=1, now=NOW,
+        claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
                                        freshness_bars=None)
         assert claimed is not None, "claim できなかった (テスト前提が崩れている)"
         signals.requeue(conn, sid, now=NOW, max_requeue=max_requeue)
-    claimed = signals.claim_oldest(conn, mission_id=1, now=NOW,
+    claimed = signals.claim_oldest(conn, mission_id=mid, now=NOW,
                                    freshness_bars=None)
     assert claimed is not None
 

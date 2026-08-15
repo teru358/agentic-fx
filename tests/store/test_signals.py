@@ -15,6 +15,14 @@ signals は 4 状態 (pending/claimed/consumed/abandoned) のキュー。§5 の
 - requeue の上限判定は「現在の requeue_count >= max_requeue なら
   abandoned (増分なし)、未満なら pending + requeue_count+1」
   (controller 解決 #6 の逐語)。reclaim_expired も同じ判定を通す。
+
+**Task 13 (プラン9 束D、設計書 D5)**: claimed_by_mission_id に
+missions(id) への FK が付いたため、claim_oldest に渡す mission_id は
+実在する missions 行でなければならない。以前はダミー整数リテラル
+(1, 2, 3, ...) を使っていたが、`_mid(conn)` で実在する missions 行を
+作ってその id を渡す。consume() の mismatch 比較や、naive now を拒否する
+テストのように SQL の UPDATE が実行されない (=書き込みが起きない) 箇所は
+FK の影響を受けないため変更していない。
 """
 from __future__ import annotations
 
@@ -24,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
-from agentic_fx.store import signals
+from agentic_fx.store import missions, signals
 from agentic_fx.store.db import connect, init_db
 
 NOW = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
@@ -46,6 +54,13 @@ def _add(conn, *, bar_ts: datetime, content_hash="h1", pair="USDJPY",
         conn, plugin="p.py", content_hash=content_hash, pair=pair,
         timeframe=timeframe, bar_ts=_iso(bar_ts), kind=kind,
         payload=payload or {"x": 1}, now=now)
+
+
+def _mid(conn) -> int:
+    """テスト用に実在する missions 行を 1 つ作り、その id を返す
+    (Task 13: claim_oldest が書き込む mission id は missions テーブルに
+    実在しないと sqlite3.IntegrityError になる)。"""
+    return missions.start(conn, "trade", "local", "m", NOW)
 
 
 # ---------------------------------------------------------------------
@@ -89,12 +104,13 @@ def test_claim_oldest_picks_oldest_bar_ts_even_if_inserted_later(tmp_path):
                     content_hash="older")
     assert newer_id < older_id  # id 順は逆 (先に入れた方が古い bar_ts)
 
-    claimed = signals.claim_oldest(conn, mission_id=1, now=NOW,
+    m1 = _mid(conn)
+    claimed = signals.claim_oldest(conn, mission_id=m1, now=NOW,
                                     freshness_bars=None)
     assert claimed is not None
     assert claimed["id"] == older_id
     assert claimed["status"] == "claimed"
-    assert claimed["claimed_by_mission_id"] == 1
+    assert claimed["claimed_by_mission_id"] == m1
 
 
 # ---------------------------------------------------------------------
@@ -106,11 +122,14 @@ def test_two_consecutive_claims_return_different_rows(tmp_path):
               content_hash="a")
     id2 = _add(conn, bar_ts=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
               content_hash="b")
-    c1 = signals.claim_oldest(conn, mission_id=1, now=NOW, freshness_bars=None)
-    c2 = signals.claim_oldest(conn, mission_id=2, now=NOW, freshness_bars=None)
+    c1 = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                              freshness_bars=None)
+    c2 = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                              freshness_bars=None)
     assert {c1["id"], c2["id"]} == {id1, id2}
     assert c1["id"] != c2["id"]
-    c3 = signals.claim_oldest(conn, mission_id=3, now=NOW, freshness_bars=None)
+    c3 = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                              freshness_bars=None)
     assert c3 is None  # もう pending は無い
 
 
@@ -120,9 +139,11 @@ def test_two_consecutive_claims_return_different_rows(tmp_path):
 def test_consume_rejects_mismatched_mission_id(tmp_path):
     conn = _conn(tmp_path)
     _add(conn, bar_ts=NOW)
-    claimed = signals.claim_oldest(conn, mission_id=1, now=NOW,
+    claimed = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
                                     freshness_bars=None)
     with pytest.raises(ValueError, match="not claimed"):
+        # 999 は claimed_by_mission_id へ書き込まれない (WHERE の比較にしか
+        # 使われない) ため実在の missions 行である必要は無い。
         signals.consume(conn, claimed["id"], mission_id=999, now=NOW)
     row = conn.execute("SELECT status FROM signals WHERE id=?",
                        (claimed["id"],)).fetchone()
@@ -132,9 +153,10 @@ def test_consume_rejects_mismatched_mission_id(tmp_path):
 def test_consume_succeeds_with_matching_mission_id(tmp_path):
     conn = _conn(tmp_path)
     _add(conn, bar_ts=NOW)
-    claimed = signals.claim_oldest(conn, mission_id=1, now=NOW,
+    m1 = _mid(conn)
+    claimed = signals.claim_oldest(conn, mission_id=m1, now=NOW,
                                     freshness_bars=None)
-    signals.consume(conn, claimed["id"], mission_id=1, now=NOW)
+    signals.consume(conn, claimed["id"], mission_id=m1, now=NOW)
     row = conn.execute("SELECT status FROM signals WHERE id=?",
                        (claimed["id"],)).fetchone()
     assert row["status"] == "consumed"
@@ -157,21 +179,24 @@ def test_requeue_boundary_table(tmp_path):
     max_requeue = 2
     sid = _add(conn, bar_ts=NOW)
 
-    signals.claim_oldest(conn, mission_id=1, now=NOW, freshness_bars=None)
+    signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                         freshness_bars=None)
     status = signals.requeue(conn, sid, now=NOW, max_requeue=max_requeue)
     assert status == "pending"
     row = conn.execute("SELECT requeue_count FROM signals WHERE id=?",
                        (sid,)).fetchone()
     assert row["requeue_count"] == 1
 
-    signals.claim_oldest(conn, mission_id=2, now=NOW, freshness_bars=None)
+    signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                         freshness_bars=None)
     status = signals.requeue(conn, sid, now=NOW, max_requeue=max_requeue)
     assert status == "pending"
     row = conn.execute("SELECT requeue_count FROM signals WHERE id=?",
                        (sid,)).fetchone()
     assert row["requeue_count"] == 2
 
-    signals.claim_oldest(conn, mission_id=3, now=NOW, freshness_bars=None)
+    signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                         freshness_bars=None)
     status = signals.requeue(conn, sid, now=NOW, max_requeue=max_requeue)
     assert status == "abandoned"  # requeue_count(2) >= max_requeue(2)
     row = conn.execute(
@@ -201,28 +226,32 @@ def test_reclaim_expired_boundary_and_transitions(tmp_path):
 
     # 期限内 (claimed_at == now - 14min, cutoff は now - 15min): 不変
     within_id = _add(conn, bar_ts=NOW, content_hash="within")
-    signals.claim_oldest(conn, mission_id=1, now=NOW, freshness_bars=None)
+    signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                         freshness_bars=None)
     within_claimed_at = NOW - timedelta(minutes=14)
     conn.execute("UPDATE signals SET claimed_at=? WHERE id=?",
                 (within_claimed_at.isoformat(), within_id))
 
     # ちょうど境界 (claimed_at == now - 15min): <= なので回収対象
     boundary_id = _add(conn, bar_ts=NOW, content_hash="boundary")
-    signals.claim_oldest(conn, mission_id=2, now=NOW, freshness_bars=None)
+    signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                         freshness_bars=None)
     boundary_claimed_at = NOW - timedelta(minutes=15)
     conn.execute("UPDATE signals SET claimed_at=? WHERE id=?",
                 (boundary_claimed_at.isoformat(), boundary_id))
 
     # 期限切れ・requeue_count=1 で上限未満 → pending + count=2
     expired_id = _add(conn, bar_ts=NOW, content_hash="expired")
-    signals.claim_oldest(conn, mission_id=3, now=NOW, freshness_bars=None)
+    signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                         freshness_bars=None)
     conn.execute(
         "UPDATE signals SET claimed_at=?, requeue_count=1 WHERE id=?",
         ((NOW - timedelta(hours=2)).isoformat(), expired_id))
 
     # 期限切れ・requeue_count=2 (>= max_requeue) → abandoned・増分なし
     over_id = _add(conn, bar_ts=NOW, content_hash="over")
-    signals.claim_oldest(conn, mission_id=4, now=NOW, freshness_bars=None)
+    signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                         freshness_bars=None)
     conn.execute(
         "UPDATE signals SET claimed_at=?, requeue_count=2 WHERE id=?",
         ((NOW - timedelta(hours=2)).isoformat(), over_id))
@@ -262,12 +291,13 @@ def test_reclaim_expired_boundary_and_transitions(tmp_path):
 def test_abandoned_is_not_claimable(tmp_path):
     conn = _conn(tmp_path)
     sid = _add(conn, bar_ts=NOW)
-    signals.claim_oldest(conn, mission_id=1, now=NOW, freshness_bars=None)
+    signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                         freshness_bars=None)
     signals.requeue(conn, sid, now=NOW, max_requeue=0)  # 即 abandoned
     row = conn.execute("SELECT status FROM signals WHERE id=?",
                        (sid,)).fetchone()
     assert row["status"] == "abandoned"
-    claimed = signals.claim_oldest(conn, mission_id=2, now=NOW,
+    claimed = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
                                    freshness_bars=None)
     assert claimed is None
 
@@ -290,9 +320,11 @@ def test_expire_stale_only_touches_stale_pending(tmp_path):
     # claim_oldest は bar_ts 最古優先で stale_id (同じ bar_ts だが id が
     # 若い) を選んでしまうため、対象行を直接 claimed にする (このテストは
     # claim_oldest の選択ロジックではなく expire_stale の対象範囲を見る)。
+    # Task 13: claimed_by_mission_id には実在する mission id が要る。
+    m1 = _mid(conn)
     conn.execute("UPDATE signals SET status='claimed', "
-                "claimed_by_mission_id=1, claimed_at=? WHERE id=?",
-                (NOW.isoformat(), claimed_stale_id))
+                "claimed_by_mission_id=?, claimed_at=? WHERE id=?",
+                (m1, NOW.isoformat(), claimed_stale_id))
     conn.commit()
     row = conn.execute("SELECT status FROM signals WHERE id=?",
                        (claimed_stale_id,)).fetchone()
@@ -354,7 +386,7 @@ def test_claim_oldest_skips_stale_row_without_expire_stale(tmp_path):
                                           tzinfo=timezone.utc),
                     content_hash="fresh")  # 30min 前 -> fresh
 
-    claimed = signals.claim_oldest(conn, mission_id=1, now=NOW,
+    claimed = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
                                    freshness_bars=freshness_bars)
     assert claimed is not None
     assert claimed["id"] == fresh_id  # stale はスキップされ fresh が選ばれる
@@ -384,7 +416,7 @@ def test_claim_oldest_computes_cutoff_per_row_timeframe(tmp_path):
         conn, bar_ts=datetime(2026, 8, 3, 9, 0, tzinfo=timezone.utc),
         content_hash="fresh_4h", timeframe="4h")
 
-    claimed = signals.claim_oldest(conn, mission_id=1, now=NOW,
+    claimed = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
                                    freshness_bars=freshness_bars)
     assert claimed is not None
     assert claimed["id"] == fresh_4h_id  # stale な 1h 行はスキップされる
@@ -400,7 +432,7 @@ def test_claim_oldest_computes_cutoff_per_row_timeframe(tmp_path):
 def test_claim_oldest_freshness_none_disables_gate(tmp_path):
     conn = _conn(tmp_path)
     stale_id = _add(conn, bar_ts=datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc))
-    claimed = signals.claim_oldest(conn, mission_id=1, now=NOW,
+    claimed = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
                                    freshness_bars=None)
     assert claimed is not None
     assert claimed["id"] == stale_id
@@ -489,6 +521,11 @@ def test_add_rejects_naive_bar_ts(tmp_path):
 # fix round 1 F2 (codex Important): naive now/since が SQLite に黙って
 # UTC として解釈され、鮮度/lease 判定が時差分ズレる。SQL 内で日時比較を
 # 行う公開関数の入口ですべて拒否することをピンする。
+#
+# Task 13 注記: 以下の claim_oldest(mission_id=1, now=NAIVE_NOW, ...) は
+# _require_aware(now, ...) が UPDATE 文の実行前に例外を送出するため、
+# claimed_by_mission_id への書き込みは一切発生しない。よってダミー整数 1
+# のままで FK の影響を受けず、変更不要。
 # ---------------------------------------------------------------------
 NAIVE_NOW = datetime(2026, 8, 3, 12, 0)  # tz 無し
 
@@ -526,8 +563,9 @@ def test_naive_now_rejected_across_sql_comparison_functions(tmp_path):
 def test_reclaim_expired_does_not_touch_consumed_rows(tmp_path):
     conn = _conn(tmp_path)
     sid = _add(conn, bar_ts=NOW)
-    signals.claim_oldest(conn, mission_id=1, now=NOW, freshness_bars=None)
-    signals.consume(conn, sid, mission_id=1, now=NOW)
+    m1 = _mid(conn)
+    signals.claim_oldest(conn, mission_id=m1, now=NOW, freshness_bars=None)
+    signals.consume(conn, sid, mission_id=m1, now=NOW)
 
     old_claimed_at = NOW - timedelta(hours=5)  # lease (15min) を大きく超過
     conn.execute("UPDATE signals SET claimed_at=? WHERE id=?",
@@ -542,7 +580,7 @@ def test_reclaim_expired_does_not_touch_consumed_rows(tmp_path):
         "SELECT status, claimed_by_mission_id, requeue_count "
         "FROM signals WHERE id=?", (sid,)).fetchone()
     assert row["status"] == "consumed"  # pending に戻っていない
-    assert row["claimed_by_mission_id"] == 1  # 監査情報は残る (仕様どおり)
+    assert row["claimed_by_mission_id"] == m1  # 監査情報は残る (仕様どおり)
     assert row["requeue_count"] == 0
 
 
