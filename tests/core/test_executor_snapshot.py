@@ -755,8 +755,9 @@ def test_close_order_from_snapshot_computes_pnl_from_degraded_rate(tmp_path):
     row = _insert_open_order(ex.conn, pair="USDJPY")
 
     # 健全な rate_fn でキャッシュを温める (_last_good_rate に入る)
-    healthy_rate, degraded = ex.resolve_close_rate("JPY", NOW)
+    healthy_rate, degraded, reason = ex.resolve_close_rate("JPY", NOW)
     assert healthy_rate is not None and degraded is False
+    assert reason is None  # 成功時に原因を作らない
 
     # commit-pre 相: レート取得が失敗するようになった
     ex.rate_fn = fail_rate_fn

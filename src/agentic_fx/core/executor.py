@@ -101,6 +101,12 @@ class CloseSnapshot:
     rate: ConversionRate | None
     rate_degraded: bool
     captured_at: datetime
+    # `resolve_close_rate` が吸収した例外の要旨 (`safe_error_text` 済み)。
+    # commit-core の `_finish_close` が degraded activity に載せて
+    # 「gather deadline 打ち切り」と「ベンダ障害」を運用ログ上で識別可能に
+    # するためだけの観測用フィールド (判定には一切使わない)。既存の
+    # 位置引数構築を壊さないよう**末尾に**既定値つきで足す。
+    rate_degraded_reason: str | None = None
 
 
 def open_risk_and_notional_from_snapshot(
@@ -344,10 +350,11 @@ class Executor:
 
     def resolve_close_rate(self, ccy: str, now, *,
                            deadline_check: Callable[[str], None] | None = None
-                           ) -> tuple[ConversionRate | None, bool]:
+                           ) -> tuple[ConversionRate | None, bool, str | None]:
         """クローズ専用のレート解決。現在レートが取れなければ最後に健全性
         検証を通ったレートへ degraded フォールバックする (設計書 §5:
-        クローズはレート欠損でも妨げない)。戻り値は (rate, degraded)。
+        クローズはレート欠損でも妨げない)。戻り値は
+        (rate, degraded, degraded_reason)。
         rate が None なのは、一度も健全なレートを観測できていない場合のみ
         (プロセス起動直後の初回クローズ等) — この場合 realized_pnl は
         未確定のまま残し、次回の定期同期で解消する。
@@ -360,6 +367,15 @@ class Executor:
         にする。CLOSE はレート欠損でも妨げない、という既存方針の帰結
         であり、意図的な挙動 (2 脚目相当の外部 I/O だけを打ち切り、
         CLOSE 自体は失敗させない)。
+
+        **吸収した例外の要旨は捨てない (観測性 — /code-review 2 周目)。**
+        3 要素目 `degraded_reason` (`safe_error_text` 済み) として返し、
+        `_finish_close` が `close_pnl_rate_degraded` activity に載せる。
+        これが無いと運用ログ上「gather deadline による打ち切り」と
+        「ベンダ障害」がバイト単位で同一になり、`_make_deadline_checker`
+        が "deadline exceeded" の文言で確保したはずの識別性がこの吸収
+        経路だけ失われる。**fail-soft 契約 (レート欠損でクローズを妨げ
+        ない) は不変** — 追加するのは記録だけ。
         """
         account_ccy = self.settings.account_currency
         try:
@@ -369,9 +385,10 @@ class Executor:
             else:
                 rate = self.rate_fn(ccy, account_ccy, now)
             self._last_good_rate[(ccy, account_ccy)] = rate
-            return rate, False
-        except Exception:  # noqa: BLE001 — クローズを止めない (設計書 §5)
-            return self._last_good_rate.get((ccy, account_ccy)), True
+            return rate, False, None
+        except Exception as e:  # noqa: BLE001 — クローズを止めない (設計書 §5)
+            return (self._last_good_rate.get((ccy, account_ccy)), True,
+                    safe_error_text(e))
 
     # ---- public ---------------------------------------------------------
 
@@ -740,10 +757,18 @@ class Executor:
 
     def _finish_close(self, row: dict, price: float, contract_size: float,
                       rate: ConversionRate | None, degraded: bool,
-                      reason: str, now: datetime) -> S:
+                      reason: str, now: datetime,
+                      degraded_reason: str | None = None) -> S:
         """close_order/close_order_from_snapshot 共有 (broker 成功後の
         pnl 計算・DB 遷移・activity 記録 — 既存 close_order の当該部分を
-        **逐語**移動しただけで判定ロジックは 1 文字も変えない)。"""
+        **逐語**移動しただけで判定ロジックは 1 文字も変えない)。
+        2026-08-14 束 B 2 周目: activity 文言に cause 接尾辞を追加 —
+        判定ロジックは引き続き不変。
+
+        `degraded_reason` は `resolve_close_rate` が吸収した例外の要旨
+        (`safe_error_text` 済み)。degraded activity にだけ載せる —
+        通知 (`_notify`) は汎用文言のまま (外部由来テキストを Discord に
+        流さない既存規律)。"""
         pnl = compute_pnl(
             row, price, contract_size=contract_size,
             commission_per_lot=self.settings.risk.commission_per_lot,
@@ -760,7 +785,9 @@ class Executor:
                 Category.TRADE, "close_pnl_rate_degraded",
                 f"{row['pair']}: 換算レート取得不能 — " + (
                     "最後の健全レートで計算 (次回同期で吸収)" if pnl is not None
-                    else "realized_pnl 未確定 (次回同期で解消)"),
+                    else "realized_pnl 未確定 (次回同期で解消)")
+                + (f" [cause: {degraded_reason}]"
+                   if degraded_reason else ""),
                 ref_id=str(row["id"]))
             self._notify(
                 f"[agentic-fx] クローズ換算レート degraded #{row['id']}")
@@ -805,9 +832,10 @@ class Executor:
             return self._close_unknown(row, now)
         # 設計書 §5: クローズはレート欠損でも妨げない。現在レートが取れなければ
         # 最後に健全性検証を通ったレートへ degraded フォールバックする。
-        rate, degraded = self.resolve_close_rate(spec.quote_currency, now)
+        rate, degraded, degraded_reason = self.resolve_close_rate(
+            spec.quote_currency, now)
         return self._finish_close(row, price, spec.contract_size, rate,
-                                  degraded, reason, now)
+                                  degraded, reason, now, degraded_reason)
 
     def gather_close_snapshot(self, row: dict) -> CloseSnapshot:
         """commit-pre 相専用 (裁定書 F-1 / CR-2 / P8-01) — **core_lock
@@ -833,11 +861,12 @@ class Executor:
         check(f"spec:{pair}")
         spec = self.spec_fn(pair)
         check(f"rate:{spec.quote_currency}")
-        rate, degraded = self.resolve_close_rate(
+        rate, degraded, degraded_reason = self.resolve_close_rate(
             spec.quote_currency, now, deadline_check=check)
         return CloseSnapshot(order_id=row["id"], pair=pair, price=price,
                              spec=spec, rate=rate,
-                             rate_degraded=degraded, captured_at=now)
+                             rate_degraded=degraded, captured_at=now,
+                             rate_degraded_reason=degraded_reason)
 
     def close_order_from_snapshot(self, row: dict, snapshot: CloseSnapshot,
                                   reason: str) -> S:
@@ -871,7 +900,8 @@ class Executor:
             return self._close_unknown(row, now)
         return self._finish_close(row, snapshot.price,
                                   snapshot.spec.contract_size, snapshot.rate,
-                                  snapshot.rate_degraded, reason, now)
+                                  snapshot.rate_degraded, reason, now,
+                                  snapshot.rate_degraded_reason)
 
     def close_from_snapshot(self, intent: TradeIntent, iid: int,
                             snapshot: "CloseSnapshot | None", *,

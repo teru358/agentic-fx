@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agentic_fx.activity import ActivityLog
+from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_settings
 from agentic_fx.core.accounting import record_snapshot
 from agentic_fx.core.contracts import (
@@ -434,6 +434,21 @@ def test_gather_close_snapshot_absorbs_cross_leg_deadline_into_degraded_rate(
     # 2 脚目 (USDJPY) は一度も取得されていない (打ち切りが効いている)
     assert yq.call_count == 1
     assert yq.call_args.args[0] == "EURUSD"
+
+    # ---- 観測性の pin (/code-review 2 周目) -------------------------------
+    # 吸収経路を通っても degraded activity に原因が残ること。ここまで
+    # 駆動しないと `CloseSnapshot.rate_degraded_reason` の受け渡しを
+    # 一切踏まない (activity 行を書くのは `_finish_close` だけ)。
+    ex.close_order_from_snapshot(row, snapshot, reason="llm_close")
+
+    degraded_lines = [
+        line for line in ex.activity.tail(n=100, category=Category.TRADE)
+        if "close_pnl_rate_degraded" in line]
+    assert len(degraded_lines) == 1, degraded_lines
+    # 「ハング打ち切り」と「ベンダ障害」がログ上で識別できること。
+    # `_make_deadline_checker` が確保した文言がここまで届く。
+    assert "deadline exceeded" in degraded_lines[0], degraded_lines[0]
+    assert "DataUnhealthy" in degraded_lines[0], degraded_lines[0]
 
 
 # ---- codex 1 周目 指摘 2: gather ごとに新しい checker になること ----------
