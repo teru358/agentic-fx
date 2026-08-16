@@ -48,7 +48,8 @@ plugin の自己改善ループを回すにあたり、**自前のローカル L
 | 従量課金遮断 | 「Claude 側は子 env から `ANTHROPIC_API_KEY` を除去」 | **「除去」ではなく「最初から継承しない」** (env は allowlist で完全指定)。claude は鍵があるとサブスク認証より優先しハングする (probe P5)。codex は `auth_mode=chatgpt` なら鍵を無視したが契約は同じく非継承 |
 | news 提案 | 分解書 Task 2/6 の許可ツールに「news_sources への追加提案」 | **プラン 11 へ (R2)** |
 | plugins/ への書込 | 「`read_write_paths` に `plugins/` を追加」 | **`plugins/` 全体は渡さない**。候補置き場 `plugins/_staging/<mission_id>/` のみ (§2.3) |
-| Landlock 拡張 | 「EXECUTE 権の与え方は Task 18 で裁定」(未裁定) | **`execute_paths` を新設** (§2.2)。対象は python・ローダ・CLI ディレクトリ |
+| Landlock 拡張 | 「EXECUTE 権の与え方は Task 18 で裁定」(未裁定) | **`execute_paths` を新設** (§2.2)。対象は backend ごとの exec closure (python・ローダ・CLI・shell 系) |
+| 書込先 (`reports/`) | 分解書「書き込み可能パスが `plugins/` と `reports/` に閉じている」 | **worker は `reports/` に書かない** (案 A で親だけが書く — §2.1/§4-6)。worker の書込先は候補置き場 + workdir + `/dev`。「`plugins/` と `reports/`」は**親を含むシステム全体**の出力先として引き続き正 |
 
 ---
 
@@ -67,10 +68,10 @@ runners/factory.py       build_runner(profile, settings, registry, *, on_message
 
 `CliRunner` の責務 (両 CLI 共通):
 
-1. **子プロセス起動**: `subprocess.Popen(argv, cwd=workdir, env=<完全指定>, stdin=<open("/dev/null", O_RDONLY)>, stdout=PIPE, stderr=PIPE, start_new_session=False)`。**`subprocess.DEVNULL` は使わない** — Landlock 下で `/dev` が ro だと Python は `/dev/null` を `O_RDWR` で開けず失敗する (probe §5-③)。`/dev` は §2 で rw にするが、`CliRunner` 単体テストは ro 環境でも動く形にしておく
+1. **子プロセス起動**: `subprocess.Popen(argv, cwd=workdir, env=<完全指定>, stdin=<open("/dev/null", O_RDONLY)>, stdout=PIPE, stderr=PIPE, start_new_session=True, preexec_fn=<PDEATHSIG>)` (項 4)。**`subprocess.DEVNULL` は使わない** — Landlock 下で `/dev` が ro だと Python は `/dev/null` を `O_RDWR` で開けず失敗する (probe §5-③)。`/dev` は §2 で rw にするが、`CliRunner` 単体テストは ro 環境でも動く形にしておく
 2. **scratch home**: Mission ごとに `workdir/home/` (`$HOME`) と `workdir/cfg/` (`$CODEX_HOME` または `$CLAUDE_CONFIG_DIR`) を作り、**認証ファイルだけ**をコピーする — codex: `~/.codex/auth.json` / claude: `~/.claude/.credentials.json`。ソースの場所は `runner.codex.auth_file` / `runner.claude.credentials_file` (既定は上記。`~` 展開はサービス側)。**コピー先が更新されても元へ書き戻さない** (トークンリフレッシュが起きた実行では実ファイルが古くなる方向のドリフトが予想される — 起票 §10)。実ファイルは Landlock allowlist に**入れない** (probe P4: strace で実 `~/.codex` への openat 0 件)
 3. **env の完全指定** (継承しない。`_mission_worker_env` の allowlist を拡張する形): `PATH=/usr/bin:/bin` (codex が shell snapshot で `/bin/bash` を起動する — probe §3) / `HOME` / `TMPDIR` / `CODEX_HOME` or `CLAUDE_CONFIG_DIR` / `PYTHONPATH` `PYTHONSAFEPATH` (既存)。**`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `AFX_*` / データ資格情報は構造的に存在しない**。pin テスト: 起動 argv と env をキャプチャする fake Popen で「鍵の名前を含む変数がゼロ」を assert
-4. **timeout**: `mission.timeout_sec` を壁時計で監視。超過で SIGTERM → `runner.cli_terminate_grace_sec` (既定 10) → `os.killpg(os.getpgid(proc.pid), SIGKILL)`。CLI は親 (mission_worker) と同一 pgid に留まる (probe P9) ので `WorkerRunner._escalate_kill` の外側防衛線も効く。`status="timeout"`
+4. **timeout と子孫の所有**: CLI は **`start_new_session=True` で自分専用のセッション/pgid** に置き (`killpg` が mission_worker 自身に当たらないように)、`preexec_fn` で `prctl(PR_SET_PDEATHSIG, SIGKILL)` を設定する (worker が死ねば CLI も死ぬ)。`mission.timeout_sec` を壁時計で監視し、超過で CLI セッションへ SIGTERM → `runner.cli_terminate_grace_sec` (既定 10) → `os.killpg(cli_pgid, SIGKILL)` → `status="timeout"` の result を返す。mission_worker 既存の SIGTERM ハンドラ (transcript flush) も **終了前に CLI セッションを kill** する。外側 `WorkerRunner._escalate_kill` (worker の pgid への killpg) は不変。**残余リスク (§2.4・§10)**: `setsid()` を呼ぶ孫は CLI の pgid から逃げる。完全な包含には cgroup v2 が要る (起票)。probe P9 は同一 pgid + synthetic 連鎖の範囲でしか測っていない
 5. **transcript**: CLI のストリーム出力 (claude `stream-json` の各行 / codex `--json` の各イベント) を `on_message` sink に流す → 既存の worker `event` フレームに乗る。1 行上限・累積上限は既存の transcript 上限に従う
 6. **出力の正規化と検証**: 最終出力文字列を `response_parser.parse_json_output` (フェンス剥がし・`<think>` 除去) に通し、`jsonschema` で `output_schema` 検証。不適合は **`status="failed"`, reason=`"output_schema mismatch: <安全化済み要約>"`** (CLI runner では再出力リトライをしない — CLI 再起動 = 全コンテキスト再送で高価。llama-swap provider の schema 非強制 (probe P1②) はフェンス剥がしで吸収し、それでも駄目なら失敗として E2E で計測する)
 7. **`reason` 安全化**: `LocalRunner._normalize_reason` と同じ規律 (単一行・上限 200 文字・秘密除去・外部応答本文を生で入れない)。CLI の stderr は**要約 (先頭行 + 終了コード) のみ**を reason に載せ、本文は transcript の `truncated_stderr` イベントに切り詰めて残す
@@ -107,7 +108,7 @@ argv (probe P1①/P1②/rl_codex_noplugins で完走した形):
   --ignore-user-config
   --dangerously-bypass-approvals-and-sandbox      # §0.3 — 自前 sandbox は Landlock 下で使えない
   --disable plugins --disable remote_plugin --disable recommended_plugins
-  --disable apps                                   # ← probe 未検証 (§10 起票 / 実装計画の実測項目)
+  --disable apps                                   # ← 効果は probe 未検証。本プラン Task 13 で実測・記録 (§7.2)。残る egress の停止手段は起票 (§10)
   -c mcp_servers.afx.command=<python> -c mcp_servers.afx.args=[…]   # §1.6
   [-c model_providers.llamaswap.base_url=<llama_swap.base_url> -c model_providers.llamaswap.wire_api=responses
    -c model_provider=llamaswap]                    # provider=llama_swap のとき
@@ -115,7 +116,7 @@ argv (probe P1①/P1②/rl_codex_noplugins で完走した形):
 ```
 
 - **`--disable plugins --disable remote_plugin --disable recommended_plugins` は必須** — 起動時に 11.8MB のプラグインカタログを外部取得し、本番 `RLIMIT_FSIZE=8MB` で `SIGXFSZ` 即死する (probe §5-②)。argv pin テストで固定
-- `apps` feature は provider が llama-swap でも `https://chatgpt.com/backend-api/ps/mcp` を叩く (probe §5-②)。`--disable apps` で止まるかは**未検証** — 実装計画で実測し、止まらなければ代替 (config key) を探す。**LLM エンドポイント以外の egress が既定で存在する**事実は §6 の egress pin に含める
+- `apps` feature は provider が llama-swap でも `https://chatgpt.com/backend-api/ps/mcp` を叩く (probe §5-②)。`--disable apps` で止まるかは**未検証**。**本プランでは Task 13 (実機 E2E) で `strace -e trace=connect` 相当で測定し結果を記録するところまで**を行う。止まらなかった場合の停止手段 (別 config key・proxy) は**起票** (§10) — argv pin は「未確認の egress を対処済みにする」ものではなく、既知の 3 つ (plugins/remote_plugin/recommended_plugins) の退行防止である
 - 最終出力は `-o` ファイル。llama-swap provider ではフェンス付きで返ることが多い (probe P1②) → §1.1-6
 - **improve 専用**。`runner.trade.backend=codex` は `Settings` の validator で拒否 (`ValueError`)。理由: codex は shell を外せない (probe §5 表: ツールの無効化はできない)。trade worker は Landlock 無し + `TWELVEDATA_API_KEY` 等を持つ
 - provider `chatgpt` のとき `auth.json` の `chatgpt_subscription_active_until` を起動時検査で読み、期限が近い/過ぎていれば警告 (§1.4)。期限切れ実行は Mission failed で止まる — **local への自動フォールバックはしない** (設計書 §13 の既存裁定と同じ)
@@ -173,59 +174,77 @@ runner:
 4. CodexRunner の追加 (improve 専用・provider 2 択・`max_turns` 到達不能)
 5. 「認証は `claude login`」→「認証は各 CLI のログイン (サブスク)。サービスは認証ファイルだけを Mission ごとの scratch home にコピーして使う」
 
-**変異 (§1)**: env に `ANTHROPIC_API_KEY` を通す (→ pin が落ちる) / scratch home でなく実 `$HOME` を渡す / `--setting-sources ""` を落とす / codex の `--disable plugins…` を落とす (→ argv pin) / `--dangerously-bypass…` を落とす (→ shell 全滅、E2E で検出) / trade+claude の allowedTools に `Bash` を足す (→ pin) / `runner.trade.backend=codex` を通す (→ validator pin) / timeout 後に killpg しない (→ 孫残留テスト) / `parse_json_output` を通さず生 JSON を `json.loads` (→ フェンス付き fake 出力で failed になる契約テスト) / reason に stderr 全文を入れる (→ 安全化契約テスト) / `max_turns` 超過で `completed` を返す (claude fake の `num_turns` 上限テスト)。
+**変異 (§1)**: env に `ANTHROPIC_API_KEY` を通す (→ pin が落ちる) / scratch home でなく実 `$HOME` を渡す / `--setting-sources ""` を落とす / codex の `--disable plugins…` を落とす (→ argv pin) / `--dangerously-bypass…` を落とす (→ shell 全滅、E2E で検出) / trade+claude の allowedTools に `Bash` を足す (→ pin) / `runner.trade.backend=codex` を通す (→ validator pin) / timeout 後に CLI セッションを killpg しない (→ 孫残留テスト) / CLI を worker と同一 pgid で起動する (→ 内側 killpg が worker 自身を殺し result が返らない fake テスト) / `parse_json_output` を通さず生 JSON を `json.loads` (→ フェンス付き fake 出力で failed になる契約テスト) / reason に stderr 全文を入れる (→ 安全化契約テスト) / `max_turns` 超過で `completed` を返す (claude fake の `num_turns` 上限テスト)。
 
 ---
 
 ## 2. improve worker profile の拡張 — 権限境界と不変条件 (裁定①)
 
-### 2.1 不変条件 (受入条件の核。§7-1 で実プロセスに対して測る)
+### 2.1 不変条件 (受入条件の核。§7.1-1 で実プロセスに対して測る)
 
 improve worker プロセスとその**全子孫** (claude / codex CLI・MCP シム・pytest・shell) について:
 
 1. `data/` 配下 (DB・履歴・RAG) に読み書きとも到達できない (`open` / `listdir` / `truncate` / `exec` すべて `EACCES`)
-2. 書き込み可能パスが **①候補置き場 `<root>/plugins/_staging/<mission_id>/` ②`<root>/reports/` ③workdir (scratch home を含む) ④`/dev`** に閉じる。**`plugins/` 全体・リポジトリ本体・`config/`・`policy/` には書けない**
+2. 書き込み可能パスが **①候補置き場 `<root>/plugins/_staging/<mission_id>/` ②workdir (scratch home・`TMPDIR` を含む) ③`/dev`** に閉じる。**`reports/`・`plugins/` 全体・リポジトリ本体・`config/`・`policy/` には書けない**。`reports/` は案 A (R6) により**親だけが書く** — worker が書ける場所に親が予測可能な名前で書き込む構造を作らない (codex 1 周目 C1: 所有境界の単純化)
 3. 従量課金経路が無い (env に鍵が無い — §1.1)
 4. 個人設定を継承しない (scratch home / `--ignore-user-config` / `--setting-sources ""`)
+5. **shell を許す = `/usr/bin` 配下の実行 (と読取拡大) を許す**、と明示する。改善 profile の claude / codex は shell を持つので、execute closure に `/usr/bin` (この環境では `/bin` → `/usr/bin` の symlink) が入る。読取範囲がその分広がることを不変条件 1 と両立させる (どちらも `data/` の祖先ではない)
 
 **「シェルが無いこと」は条件にしない** (プラン 9 §5 の D3 放棄裁定)。
 
 ### 2.2 Landlock 配線の変更 (`core/landlock.py` + `mission_worker._bootstrap_improve_profile`)
 
 - `restrict_to(*, read_only_paths, read_write_paths, execute_paths: list[Path] = ())` に **`execute_paths` を追加**。マスクは `_EXECUTE_ACCESS = _ACCESS_FS_EXECUTE | _ACCESS_FS_READ_FILE | _ACCESS_FS_READ_DIR` (**自己充足** — 同一 inode に対する ro ルールとの併合に依存させない。probe の `landlock_probe.py` と同一)。`_HANDLED_ACCESS_FS` は不変 (EXECUTE は元から handled)
-- **execute_paths** = `sys.prefix` (venv), `sys.base_prefix` (uv の cpython), `/usr/lib`, `/usr/lib64` (動的リンクのローダ — claude・python 双方に必須。`/usr/lib64` 単独では不十分、probe §2.2), **選択された backend の CLI 実体ディレクトリ** (`shutil.which(bin)` → realpath の親。node ラッパなら node の親も)。backend=local のときは CLI ディレクトリを入れない
+- **exec closure を backend ごとに明示する** (codex 1 周目 C4 — CLI 本体だけ許しても、CLI が起動する shell / shebang interpreter で `EACCES` になり主機能に到達しない):
+
+  | 区分 | パス (realpath) | 根拠 |
+  |---|---|---|
+  | 共通 | `sys.prefix`, `sys.base_prefix` | worker 内 pytest・MCP シムの python |
+  | 共通 | `/usr/lib`, `/usr/lib64` | 動的リンクのローダ (claude・python。`/usr/lib64` 単独では不十分 — probe §2.2) |
+  | shell 系 (improve+claude / codex) | **`/usr/bin`** (`bash`, `env`, coreutils)。bootstrap 時に `/bin` が実ディレクトリなら `/bin` も追加 (この環境は symlink) | codex は shell snapshot と shell tool で `/bin/bash` を起動 (probe §3、P6 は `PATH=/usr/bin:/bin` で完走)。claude の `Bash` ツールも同じ |
+  | claude | `<runner.claude.bin>` の realpath の親 (`~/.local/share/claude/versions`) | probe §2.2 |
+  | codex | `<runner.codex.bin>` の realpath の親。**node ラッパ (nvm) なら node の realpath の親も** (shebang `/usr/bin/env node` は `/usr/bin` で解決) | probe §2.1 は vendor native 直指定で完走。ラッパ経由は Task 13 で実測 |
+  | local | 共通のみ (CLI・shell 系を入れない) | LocalRunner は subprocess を起こさない (worker 内 pytest のみ) |
+
+  **起動時検査 (§1.4) が shebang を解決し、interpreter が closure に無ければ起動拒否 (fail closed)**。実装計画で closure を「1 要素 drop で何が壊れるか」の pin にする (実測して固定。推測で増やさない)
 - **read_only 追加**: `/run/systemd/resolve` (外部 DNS。`/etc/resolv.conf` が symlink で Landlock は解決先で判定 — probe §2.1。存在するときのみ) / `/proc` (claude のみ。bun が panic して SIGABRT — probe §2.2)
-- **`/dev` を read_only → read_write へ**。理由: `subprocess.DEVNULL`・bash のリダイレクト・pytest logging が `/dev/null` を書込オープンする (probe §5-③、P7)。**脅威分析**: rw マスクに `MAKE_CHAR` は無いのでデバイスノード作成は不可。既存デバイスへの write は Unix パーミッション次第で `/dev/shm` (tmpfs) には書ける — `data/` 到達には寄与しない。`_ACCESS_FS_IOCTL_DEV` は従来どおり handled にしない (プラン 8 の判断を維持)
-- **read_write 追加**: `<root>/plugins/_staging/<mission_id>/` (親が spawn 前に mkdir) と `<root>/reports/` (親が起動時に mkdir)。**`<root>/plugins/` 自体は入れない**
-- **`_assert_allowlist_excludes_data_dir` を拡張**: 入力を `read_only + read_write + execute` の全部にする。加えて**静的 pin**: `read_write_paths` の集合が `{staging, reports, workdir, /dev}` と一致し、いずれも `<root>` 直下の `plugins/_staging/<id>` と `reports/` 以外に `<root>` 配下を含まないこと (テストは `_bootstrap_improve_profile` が組む allowlist を dry-run で取り出して assert)
-- **rlimit**: `child_fsize_mb=8` は維持 (codex は `--disable plugins…` で 664KB が最大 — probe §5-⑧)。**claude を rlimit 下で実 1 ターン回すのは未測** → 実装計画の実測項目 (超えるなら improve のみ `child_fsize_mb` を上げる)
+- **`/dev` を read_only → read_write へ**。理由: `subprocess.DEVNULL`・bash のリダイレクト・pytest logging が `/dev/null` を書込オープンする (probe §5-③、P7)。**脅威分析**: rw マスクに `MAKE_CHAR` も `MAKE_SYM` も無い (現行 `_READ_WRITE_ACCESS`、`landlock.py:111-114`) のでデバイスノード・symlink の作成は不可。既存デバイスへの write は Unix パーミッション次第で `/dev/shm` (tmpfs) には書ける — `data/` 到達には寄与しない。`_ACCESS_FS_IOCTL_DEV` は従来どおり handled にしない (プラン 8 の判断を維持)
+- **read_write 追加**: `<root>/plugins/_staging/<mission_id>/` (親が spawn 前に mkdir) **のみ**。`<root>/plugins/` 自体・`<root>/reports/` は入れない
+- **`_assert_allowlist_excludes_data_dir` を拡張**: 入力を `read_only + read_write + execute` の全部にする。加えて**静的 pin**: `read_write_paths` の集合が `{staging, workdir, /dev}` と**一致**し、`<root>` 配下は `plugins/_staging/<id>` 以外を含まないこと (テストは `_bootstrap_improve_profile` が組む allowlist を dry-run で取り出して assert)
+- **rlimit**: `child_fsize_mb=8` は維持 (codex は `--disable plugins…` で 664KB が最大 — probe §5-⑧)。**claude を rlimit 下で実 1 ターン回すのは未測** → Task 13 の実測項目 (超えるなら improve のみ `child_fsize_mb` を上げる)。**`RLIMIT_NPROC` は mission worker に適用しない** (現行どおり。plugin sandbox のみ)
 - **env 追加** (`_mission_worker_env` の improve 分岐): `HOME=<workdir>/home`, `TMPDIR=<workdir>/tmp`, `CODEX_HOME=<workdir>/cfg` または `CLAUDE_CONFIG_DIR=<workdir>/cfg`。値は WorkerRunner が workdir を作った後に決まるので、handshake で子に渡すのではなく **Popen の env に直接入れる** (子は Landlock 適用前に mkdir する)
 
 ### 2.3 候補置き場 (staging) の意味論
 
 - worker が plugin を書ける唯一の場所は `plugins/_staging/<mission_id>/<name>/`。**稼働中の `plugins/<name>/` は読めるが書けない**
 - 根拠: 承認済み plugin をその場で書き換えると content_hash が承認済みハッシュと不一致になり、**承認が下りるまでその plugin は `approved_plugins()` から消える** — 週次の改善が稼働中の指標を止める。staging なら承認までは旧版が生き続ける
-- `plugin/loader.discover` は先頭が `_` のディレクトリを無視する (`_staging` を予約。`_reject_unexpected_py_files` の走査も同様)
-- ライフサイクル: 親が Mission 起動前に空 dir を作る → worker が書く → commit 相 (§4) でゲート → 承認申請を出した候補は**決定まで残す** → 承認時に git 記録 → 昇格 (§5、この順) → 決定 (approved / rejected / expired / invalidated) 時に削除。承認申請に至らなかった候補は commit 相の末尾で削除
-- **孤児の掃除**: 起動時 reconcile (§5.4 の位置) で、`_staging/` 配下のうち「対応する pending の approval_request が無い」ものを削除する
+- **plugin 名の正規形** (codex 1 周目 C2): `^[a-z][a-z0-9_]{0,63}$` — 単一パス成分。`.`・`..`・`/`・絶対パス・大文字・ハイフンを含まない。**出力 schema (§3.5) と親側 (§4-1) の両方で検証**し、候補パス `staging/<name>` と昇格先 `plugins/<name>` は `resolve()` 後にそれぞれ「mission staging 直下の 1 階層目」「plugins 直下の 1 階層目」であることを再検証する。同じ正規形を `afx plugin bless` / `submit` の CLI と `plugin/loader.discover` にも適用する — **正規形に反する既存の plugin ディレクトリは discover が WARNING を出して skip する** (ロードされなくなる。移行は人間が rename)
+- **`plugin/loader.discover` の列挙条件に「先頭が `_` または `.` のディレクトリを除外」を追加する** (codex 1 周目 M3: 現行は全子ディレクトリを列挙し、3 ファイル欠落で**偶然** skip されているだけ。`_staging/`・`.versions/`・`.locks/` (§5) を予約する)。`_reject_unexpected_py_files` の走査も同様。**Task 5 の受入 pin**
+- ライフサイクル: 親が Mission 起動前に空 dir を作る → worker が書く → commit 相 (§4) でゲート (候補は**読取専用のスナップショット**として扱う) → 承認申請を出した候補は**決定まで残す** → 承認時に版ディレクトリへコピー → git 記録 → symlink 切替 (§5、この順) → 決定 (approved / rejected / expired / invalidated) 時に削除。承認申請に至らなかった候補は commit 相の末尾で削除
+- **孤児の掃除**: 起動時 reconcile (§5.3 の位置) で、`_staging/` 配下のうち「対応する pending の approval_request が無い」ものを削除する
 - `.gitignore` の `/plugins/` はそのまま staging も覆う
 
 ### 2.4 残余リスク (明記)
 
-improve worker は任意コード実行 + ネットワーク (LLM・研究ツール) を持つ。plugin ソースの信頼モデルは従来どおり「人間承認まで信用しない」。egress は §6 の予算で律する。`/dev/shm` への書込は可能 (上記)。
+- improve worker は任意コード実行 + ネットワーク (LLM・研究ツール) を持つ。plugin ソースの信頼モデルは従来どおり「人間承認まで信用しない」。egress は §6 のとおり**予算はツール契約であって安全保証ではない**
+- `/dev/shm` への書込は可能 (§2.2)
+- **プロセス包含は pgid ベース** (§1.1-4): `setsid()` を呼ぶ孫は CLI の pgid から逃げ、timeout / shutdown 後も生存し得る (LLM egress・staging 書込を継続)。完全な包含は cgroup v2 (systemd --user scope) が要る — **起票 (§10)**。`RLIMIT_NPROC` も掛けていない
+- shell を許すため `/usr/bin` 配下の読取・実行が可能 (§2.1-5)
 
-**変異 (§2)**: `execute_paths` を `_assert_allowlist_excludes_data_dir` に渡さない (→ `data/` を execute に入れても通る、pin が落ちる) / `plugins/` 全体を rw に入れる (→ 静的 pin) / `/dev` を ro に戻す (→ subprocess.DEVNULL 経路の実測テスト) / staging を Mission id で分けず共有にする (→ 並行 Mission の衝突テスト) / `discover` が `_staging` を拾う (→ 承認前 plugin がロードされる pin) / 孤児 reconcile を落とす (→ 起動時テスト) / `HOME` に実ホームを渡す (→ env pin)。
+**変異 (§2)**: `execute_paths` を `_assert_allowlist_excludes_data_dir` に渡さない (→ `data/` を execute に入れても通る、pin が落ちる) / `plugins/` 全体または `reports/` を rw に入れる (→ 静的 pin) / `/dev` を ro に戻す (→ subprocess.DEVNULL 経路の実測テスト) / `/usr/bin` を closure から落とす (→ shell 系 backend の 1 要素 drop pin) / staging を Mission id で分けず共有にする (→ 並行 Mission の衝突テスト) / `discover` が `_staging` / `.versions` を拾う (→ 承認前 plugin がロードされる pin) / 正規形に反する名前を discover が受ける (→ `Foo-bar` ディレクトリが skip される pin) / 孤児 reconcile を落とす (→ 起動時テスト) / `HOME` に実ホームを渡す (→ env pin)。
 
 ---
 
 ## 3. 改善 Mission — 起動・レーン・注入・道具・出力
 
-### 3.1 起動とレーン (R7)
+### 3.1 起動とレーン (R7) — wave 意味論
 
-- **起動契機**: `schedule.improve` (`weekly` / `daily`、既存 config で未消費だったキーをここで消費) — scheduler tick が `improve_due(now)` を判定し `improve_supervisor.try_submit(...)`。**手動**: 対話シェル `improve` (即時 1 件)。どちらも missions 行 `loop='improve'`, `trigger` は NULL (設計書 §12 — trigger は trade 専用)
+- **起動契機**: `schedule.improve` (`weekly` / `daily`、既存 config で未消費だったキーをここで消費) — scheduler tick が `improve_due(now)` を判定し **wave を 1 つ**起こす。**手動**: 対話シェル `improve` (M=1 の wave、**分担なし** = 全バックログを見る)。どちらも missions 行 `loop='improve'`, `trigger` は NULL (設計書 §12 — trigger は trade 専用)
 - **別レーン**: 新設 `ImproveSupervisor` (`core/improve_supervisor.py`)。容量 `improve.parallel` (既定 1、上限 4)。**取引レーン (`MissionSupervisor`、容量 1) とは独立** — 改善実行中も取引 Mission は受理される。**preemption はしない** (改善は取引のために中断されない)。実装は `MissionSupervisor` の一般化 (N スロット + `kind="improve"`) でも別クラスでもよいが、**取引レーンの直列性契約 (容量 1・原子的 try_submit) を変えない**ことを受入条件に置く
+- **wave** (codex 1 周目 I3): due event ごとに ①`M = min(improve.parallel, 空きスロット数)` を原子的に決め (M=0 なら wave を起こさず activity に記録) ②`open|observation` の backlog id を**不変スナップショット**として取り ③partition `k=0..M-1` を一度ずつ予約し ④M 件の Mission を `k` 付きで submit する。分担は `id % M == k`。**発見・リサーチで新規に見つけた課題は自由に追加してよい**が、他 partition の課題は一覧に載せても「選ばないこと」と指示する。部分 submit 失敗 (spawn 失敗等) の partition は**この wave では働かない** (activity に記録)。次 wave は新しいスナップショットで再分割する。**手動 `improve` は M=1・分担なし**。手動と週次が重なった場合はスロットが埋まっている分だけ M が減るだけで、二重予約は起きない (partition は wave 内で閉じる)
 - **各 Mission は独立した improve worker** (WorkerRunner `worker_profile="improve"`) を持つ。workdir・staging・scratch home は Mission id 単位
-- **並行 Mission の課題分担**: 親が起動時に open バックログを `id % N == k` で分割し、Mission k には「あなたの担当分」として渡す (他の分は一覧に載せるが「選ばないこと」と指示)。発見・リサーチで新規に見つけた課題は自由に追加してよい。commit 相で同じ課題を選んだ結果が重なった場合、**先に commit した方を採り、後着は「観察」に落とす** (捨てない)
+- **重複解決の線形化点は §4-2 の backlog CAS** (先に `selected` を取った方が勝ち、後着は observation)。「先に commit した方」ではなく「先に選択を DB に取った方」
+- **shutdown / join** (I4): `ImproveSupervisor.shutdown()` は `stop_event` を立てて新規 submit を拒否し、走行中の N 本の WorkerRunner に stop を伝播 (`WorkerRunner` の既存 `stop_event` を共有 — 各 WorkerRunner が自分の worker を kill し `MissionResult` を返す) → 各 commit 相の `finally` が missions 行を終端 → `ImproveSupervisor.join(shutdown_join_timeout_sec)`。`run_service` の停止シーケンスは取引レーンの `supervisor.join` と**同じ位置で**改善レーンも join する (取引側の順序は変えない)
 - **LLM の競合**: backend=local で改善と取引が別 alias を使うと llama-swap がモデルを入れ替える (TTL・swap 遅延)。既定は同一 alias。設定で別 alias にした場合の遅延は受容 (警告を出す)。claude / codex は競合しない
 - 週次の tick は取引 Mission と重ならない時間帯 (`schedule.improve_at` = 曜日+時刻、既定 土曜 03:00 表示 TZ) に置く
 
@@ -238,9 +257,10 @@ improve worker は任意コード実行 + ネットワーク (LLM・研究ツー
 | 成績レポート | 直近 30/90 日の勝率・PF・ペア別・時間帯別・却下 intent の内訳 (reject_category 別)・hold 率 | `trade_intents` / `orders` (親の RO 集計) |
 | 改善履歴 | 過去の `improvement_runs` (何を試し、approval / report / observation のどれで終わったか)。**各バックログ課題の試行回数と、strategy なら標本 (取引数)** を添える (R8) | `improvement_runs` / `improvement_backlog` / `backtest_runs` |
 | 現行構成インベントリ | 組み込み + 承認済み plugin (kind・pairs・timeframe)、ニュースソース一覧、risk gate 現行値 | registry / `approved_plugins` / `news_sources` / settings |
-| バックログ | open + observation の一覧 (担当分に印) | `improvement_backlog` |
+| バックログ | open + observation の一覧 (担当 partition に印。手動 wave は印なし) | `improvement_backlog` |
 | ユーザー方針 | `policy/directives.md` 末尾 4000 文字 (全 Mission 共通) | `Policy.tail` |
-| 参照 | サンプル plugin の場所 (`docs/examples/plugins/`)・plugin 契約の要約・候補置き場のパス | 定数 |
+| 参照 | サンプル plugin の場所 (`docs/examples/plugins/`)・plugin 契約の要約・候補置き場のパス・**plugin 名の正規形** | 定数 |
+| 規律 | **ツール外の直接通信 (shell/python から HTTP) を禁じる** (§6 — 予算はツールでしか数えられない)。1 回の結果で課題を捨てないこと | prompt 定数 |
 
 ### 3.3 3 ステップ 1 Mission (設計書 §6 のまま)
 
@@ -254,89 +274,95 @@ improve worker は任意コード実行 + ネットワーク (LLM・研究ツー
 
 | ツール | 実行場所 | 内容 | 制約 |
 |---|---|---|---|
-| `web_search(query, max_results)` | worker | ddgs (DuckDuckGo) 検索 | §6 の Mission 予算 |
+| `web_search(query, max_results)` | worker | ddgs (DuckDuckGo) 検索 | §6 の Mission 予算 (advisory) |
 | `fetch_article(url)` | worker | 記事本文抽出 (`trafilatura`、既存依存。前身 article_fetcher 相当) | §6 の予算 / サイズ上限 / `data/` 不可視のまま |
-| `list_staging()` / `read_staging_file(name, rel)` / `write_staging_file(name, rel, content)` | worker | 候補置き場のファイル操作。`name` は plugin 名、`rel ∈ {plugin.py, config.yaml, test_plugin.py}` のみ。パス正規化して staging 外は拒否 | LocalRunner 用。claude/codex はネイティブでも同じ場所しか書けない (Landlock) |
+| `list_staging()` / `read_staging_file(name, rel)` / `write_staging_file(name, rel, content)` | worker | 候補置き場のファイル操作。`name` は正規形 (§2.3)、`rel ∈ {plugin.py, config.yaml, test_plugin.py}` のみ。パス正規化して staging 外は拒否 | LocalRunner 用。claude/codex はネイティブでも同じ場所しか書けない (Landlock) |
 | `read_plugin_source(name)` | worker | 稼働中 plugin の 3 ファイル読取 (改良の起点) | 読取のみ |
 | `run_plugin_tests(name)` | worker | `python -m pytest -q -p no:logging <staging>/<name>/test_plugin.py` を subprocess (rlimit 継承・timeout `plugin.pytest_timeout_sec`) | 結果は**参考** — 親が改めて回す (§4) |
-| `run_backtest(name, pair)` | **親 RPC** | `holdout.run_in_sample` を親が回し、**集計指標のみ** (取引数・PF・勝率・平均 R・DD。期間端点なし) を返す。`backtest_runs` に `scope=in_sample, issued_by=harness` で保存 | 遮断 1・2 |
-| `analyze_corr(request)` | **親 RPC** | 既存 `backtest.analysis.analyze_for_agent` (列挙制パラメータ・固定個数の要約統計) | 遮断 7 |
+| `run_backtest(name, pair)` | **親 RPC** | `holdout.run_in_sample` を親が回し、**集計指標のみ** (取引数・PF・勝率・平均 R・DD。期間端点なし) を返す。**DB には書かない** — 呼出し (params・result・mission_id) は親の **Mission 内 RPC 台帳** (メモリ) に積まれ、commit 相で `backtest_runs` (`scope=in_sample, issued_by=harness`) として永続化される (§4-0、codex 1 周目 I1) | 遮断 1・2 |
+| `analyze_corr(request)` | **親 RPC** | 既存 `backtest.analysis.analyze_for_agent` (列挙制パラメータ・固定個数の要約統計)。**`analysis_runs.save` は呼ばない** (`persist=False` 相当に改修) — 同じく台帳経由で commit 相に永続化 | 遮断 7 |
 | **無いもの** | — | `get_signals` / 任意 SQL / `ohlcv_*` 直読 / holdout / `bless` / approval 発行 / backlog 書込 / news 提案 | 遮断 3・6・8、R2、R6 |
 
-RPC は既存 `tool_rpc` フレーム (in-flight 1) に `run_backtest` / `analyze_corr` を追加する。親側 dispatcher は `rpc_timeout_sec` を **RPC 種別ごと**に持つ (バックテストは数十秒〜数分。`improve.backtest_rpc_timeout_sec` 既定 600)。
+RPC は既存 `tool_rpc` フレーム (in-flight 1) に `run_backtest` / `analyze_corr` を追加する。親側 dispatcher は `rpc_timeout_sec` を **RPC 種別ごと**に持つ (バックテストは数十秒〜数分。`improve.backtest_rpc_timeout_sec` 既定 600)。**RPC 台帳** (`ImproveRpcLedger`、Mission ごと・メモリ): dispatcher は各呼出しの params / 集計結果 / 実 trial 数を追記する。**追記前に当該 missions 行がまだ `running` であることを確認**し、finalize 済みなら破棄 (timeout 後に遅れて戻る RPC スレッド対策)。台帳は finalize で破棄される (成功時は commit 相が読み取ってから)
 
 ### 3.5 出力 schema (`loops/summary.py` に `IMPROVE_OUTPUT_SCHEMA`)
 
 ```json
 {
-  "discoveries":  [{"idea": str, "source": "agent"|"research", "evidence": str}],   // 上限 §4.2
+  "discoveries":  [{"idea": str, "source": "agent"|"research", "evidence": str}],   // 上限 §4-2
   "selected":     {"backlog_id": int|null, "idea": str},                             // 既存 id か新規
-  "artifact":     {"type": "plugin", "name": str, "kind": "indicator"|"signal"|"strategy",
+  "artifact":     {"type": "plugin", "name": "^[a-z][a-z0-9_]{0,63}$", "kind": "indicator"|"signal"|"strategy",
                    "self_test": "passed"|"failed"|"not_run", "summary": str}
                |  {"type": "report", "title": str, "body_md": str}
                |  {"type": "observation", "reason": str},
-  "analysis_refs": {"analysis_run_ids": [int], "trial_count": int, "selection_rationale": str}
+  "selection_rationale": str        // 分析 id・探索回数は agent に書かせない — 親が RPC 台帳から作る (codex 1 周目 I7)
 }
 ```
 
+`analysis_run_ids` / `trial_count` は**出力 schema に無い**。approval payload とレポートに載る値は親が台帳から生成する (§4-5)。agent が本文中に id を書いても無視される。
+
 ### 3.6 失敗の扱い
 
-timeout / 出力不正 / worker 異常死 → missions 行を該当 status で終端、`improvement_runs` は `result=NULL` のまま `finished_at` を書く (新しい終端値は足さない — 既存 CHECK `('approval','report')` を維持し、失敗は missions 側で読む)、staging を削除。**再試行はしない** (次の週次で自然に再実行。R8 により課題は消えない)。
+timeout / 出力不正 / worker 異常死 → missions 行を該当 status で終端、`improvement_runs` は `result=NULL` のまま `finished_at` を書く (新しい終端値は足さない — 既存 CHECK `('approval','report')` を維持し、失敗は missions 側で読む)、staging を削除、**RPC 台帳を破棄 (`backtest_runs` / `analysis_runs` は書かれない)**。**再試行はしない** (次の wave で自然に再実行。R8 により課題は消えない)。
 
-**変異 (§3)**: 改善を取引レーンに submit する (→ 取引受理テスト) / 分担を渡さず全件を全 Mission に見せる (→ 重複解決テストが二重採用を検出) / `IMPROVE_FORBIDDEN` のツールが improve registry に居る (→ 既存 pin 拡張) / `run_backtest` が期間端点を返す (→ 返却 schema pin) / `write_staging_file` が `..` を通す (→ パス正規化テスト) / `run_plugin_tests` の結果でゲートを省く (§4 の変異) / 週次判定を落とす (→ scheduler pin)。
+**変異 (§3)**: 改善を取引レーンに submit する (→ 取引受理テスト) / wave が M=1 しか起こさない (→ `parallel=4` で 4 partition が全て担当されるテスト) / 分担を渡さず全件を全 Mission に見せる (→ 重複解決テストが二重採用を検出) / `IMPROVE_FORBIDDEN` のツールが improve registry に居る (→ 既存 pin 拡張) / `run_backtest` が期間端点を返す (→ 返却 schema pin) / **RPC が `backtest_runs` に直接書く** (→ timeout Mission 後に行が残るテスト) / 台帳が finalize 後の遅延 RPC を受け付ける (→ 遅延注入テスト) / `write_staging_file` が `..` を通す (→ パス正規化テスト) / `run_plugin_tests` の結果でゲートを省く (§4 の変異) / 週次判定を落とす (→ scheduler pin) / shutdown が改善レーンを join しない (→ 停止時に worker 残留テスト)。
 
 ---
 
 ## 4. 親側 commit 相 — 出力の検証とゲート (`loops/improve_loop.py`)
 
-`ImproveLoop` は `TradeLoop` と同じ prepare / run / commit の三相。prepare (core_lock 内・短時間): missions 行作成・staging mkdir・注入コンテキスト生成。run (lock 外): `WorkerRunner.run`。commit (lock 外、**DB は improve レーン専用接続**、`missions.finish` の CAS で終端):
+`ImproveLoop` は `TradeLoop` と同じ prepare / run / commit の三相。prepare (core_lock 内・短時間): missions 行作成・staging mkdir・注入コンテキスト生成・RPC 台帳の生成。run (lock 外): `WorkerRunner.run`。commit (lock 外、**DB は improve レーン専用接続**、`missions.finish` の CAS で終端):
 
-1. **出力検査**: schema 検証 (runner 側でも済んでいるが親で再検証) / `selected.backlog_id` が実在し open|observation / `artifact.type=plugin` なら `staging/<name>/` が存在し 3 ファイルが揃う。不合格 → Mission `failed`、staging 削除、終わり
-2. **バックログ反映**: `discoveries` を追加 (`source` = agent|research)。**正規化 (空白・大小文字) した `idea` の完全一致は重複として捨てる**。**上限 `improve.max_new_backlog_per_mission` (既定 20)** — 超過分は捨てて activity に件数を記録。`selected` を `selected` 状態へ (新規なら追加してから)。**並行 Mission の後着が同じ id を選んでいたら `observation` に落とす** (R7)
-   - **新 status `observation`**: 既存の `open|selected|done|rejected` に加える。`improvement_backlog.status` に CHECK は無い (`db.py:168-174`) ので migration 不要。`store/backlog.py` の `list_open` は `open` と `observation` を返す (observation は「再挑戦可」)。`attempts INTEGER NOT NULL DEFAULT 0` と `last_result TEXT` を `ensure_column` で追加し (冪等)、commit 相で `attempts += 1`、`last_result` に終わり方 (approval / report / observation:<reason>) を書く (R8 の履歴材料)
-3. **plugin ゲート (artifact.type=plugin)** — 順に、どれか 1 つでも不合格なら**承認申請は出さず**、結果をレポートに残して `selected` を `observation` へ:
-   - a. 3 ファイル存在・サイズ上限・`config.yaml` の `kind` 一致・`plugin/loader._validate_config` 相当
-   - b. `plugin/sandbox.check_source` (AST allowlist)
-   - c. **pytest を Landlock で囲った別プロセスで回す**: 新ヘルパ `plugin/gate_pytest.py:run_gate_pytest(plugin_dir, *, settings) -> GateResult`。実装は `sys.executable -m agentic_fx.plugin.gate_pytest_worker` を `Popen(cwd=<tmp workdir>, env=最小, start_new_session=True)`、子は起動直後に **improve profile と同じ allowlist ファミリ** (`read_only` = code_root/venv/stdlib/`/usr/lib`/zoneinfo/`/etc`, `execute` = venv/base/`/usr/lib`/`/usr/lib64`, `read_write` = tmp workdir + **対象 plugin_dir (`__pycache__` のため)** + `/dev`) で `landlock.restrict_to` → `pytest.main(["-q", "-p", "no:logging", "-p", "no:cacheprovider", str(plugin_dir)])`。rlimit は既存 `_pytest_rlimit_preexec`、timeout は `plugin.pytest_timeout_sec`。**Landlock 不可の環境では improve と同様 fail closed** (ゲート pytest を回せない = 承認申請を出せない)。**`submit_plugin` / `bless` の `_default_pytest_runner` もこのヘルパに置き換える** (人間の plugin にも害はない。`plugin/approval.py:149` の無隔離実行を廃止)
-   - d. `content_hash(staging/<name>)` を計算
-4. **戦略採用ゲート (kind=strategy のみ)**: 親が `holdout.run_in_sample` を各 pair で回す (worker の `run_backtest` 結果は使わない)。**取引数 < `backtest.min_trades` (30) → 「評価不能」: 承認申請を出さず `observation` (悪いとは記録しない — R8)**。≥30 → `run_holdout_gate` を回し、結果は **approval payload の添付のみ** (改善ループの読取ビューには載せない — 遮断 8)。`indicator` / `signal` はこのゲートを課さない (設計書 §6)
-5. **承認申請**: `approvals.create(kind="plugin", payload={name, kind, staging_path, content_hash, mission_id, in_sample: {...}, holdout: {...}|null, baseline: {...}|null, analysis_run_ids, trial_count, selection_rationale, summary})`。**`bless` は経由しない** (改善ループに自己承認経路は無い)
-6. **レポート**: `artifact.type=report`、およびゲート不合格・評価不能・observation のとき、`reports/improve-YYYY-MM-DD-<mission_id>.md` を親が整形して書く (見出し・Mission 要約・ゲート結果・添付。**agent の `body_md` は「提案本文」節に引用として入れる — 信用しない**)。`reports/` は起動時に mkdir、gitignore 済み
+0. **RPC 台帳の永続化準備**: run 相で積まれた `run_backtest` / `analyze_corr` の呼出しを、**この commit 相の transaction の中で** `backtest_runs` / `analysis_runs` へ保存する (Mission が完了に至った場合のみ。1 の不合格や timeout では破棄)。`analyze_for_agent` は `persist=False` で呼び、保存に要するパラメータを返す形へ改修。`run_in_sample` の内部 `save_harness_run` も `record_fn` シンクに差し替え、親が台帳へ積む (実装計画で API 形を確定)
+1. **出力検査**: schema 検証 (runner 側でも済んでいるが親で再検証) / `artifact.name` が正規形 (§2.3) / `selected.backlog_id` が実在し `open|observation` / `artifact.type=plugin` なら `resolve(staging/<name>)` が mission staging 直下 1 階層で、`plugins/<name>` も plugins 直下 1 階層。不合格 → Mission `failed`、staging 削除、台帳破棄、終わり
+2. **バックログ反映と選択の線形化 (codex 1 周目 I2)**: `discoveries` を追加 (`source` = agent|research)。**正規化 (空白・大小文字) した `idea` の完全一致は重複として捨てる**。**上限 `improve.max_new_backlog_per_mission` (既定 20)** — 超過分は捨てて activity に件数を記録。次に **`BEGIN IMMEDIATE; UPDATE improvement_backlog SET status='selected', attempts=attempts+1, updated_at=? WHERE id=? AND status IN ('open','observation')`** — `rowcount=1` がこの Mission を**唯一の勝者**にする線形化点。`rowcount=0` (並行 Mission が先に取った / 人間が閉じた) → **副作用を出す前に**この Mission の成果物を observation に格下げ (plugin 候補なら承認申請を出さない。レポートは「重複のため見送り」を注記して書く)。新規 idea なら INSERT してから同じ UPDATE
+   - **新 status `observation`**: 既存の `open|selected|done|rejected` に加える。`improvement_backlog.status` に CHECK は無い (`db.py:168-174`) ので migration 不要。`store/backlog.py` の `list_open` は `open` と `observation` を返す (observation は「再挑戦可」)。`attempts INTEGER NOT NULL DEFAULT 0` と `last_result TEXT` を `ensure_column` で追加し (冪等)、`last_result` に終わり方 (approval / report / observation:<reason>) を書く (R8 の履歴材料)
+3. **plugin ゲート (artifact.type=plugin) — 候補は不変スナップショットとして扱う (codex 1 周目 C3)**。順に、どれか 1 つでも不合格なら**承認申請は出さず**、結果をレポートに残して `selected` を `observation` へ:
+   - a. **スナップショット検査**: `staging/<name>/` 直下に**ちょうど 3 本の通常ファイル** (`plugin.py` / `config.yaml` / `test_plugin.py`)、サブディレクトリ・symlink・hardlink (`st_nlink==1`)・その他ファイル無し、各サイズ ≤ `_MAX_FILE_BYTES`。dirfd + `O_NOFOLLOW` で開く。`config.yaml` の `kind` 一致・`plugin/loader._validate_config` 相当
+   - b. **`content_hash` を先に計算 (H_before)**
+   - c. `plugin/sandbox.check_source` を **`plugin.py` と `test_plugin.py` の両方**に (現行 `submit_plugin` と同じ)
+   - d. **pytest を Landlock で囲った別プロセスで回す — 候補ディレクトリは read-only**: 新ヘルパ `plugin/gate_pytest.py:run_gate_pytest(plugin_dir, *, settings) -> GateResult`。`sys.executable -m agentic_fx.plugin.gate_pytest_worker` を `Popen(cwd=<tmp workdir>, env=最小, start_new_session=True)`、子は起動直後に **improve profile と同じ allowlist ファミリ** (`read_only` = code_root/venv/stdlib/`/usr/lib`/zoneinfo/`/etc` **+ 候補 plugin_dir (ro)**、`execute` = venv/base/`/usr/lib`/`/usr/lib64`、`read_write` = **tmp workdir + `/dev` のみ**) で `landlock.restrict_to` → `PYTHONPYCACHEPREFIX=<tmp workdir>/pyc` を設定した上で `pytest.main(["-q", "-p", "no:logging", "-p", "no:cacheprovider", "--rootdir", <tmp>, str(plugin_dir)])`。**`PYTHONPYCACHEPREFIX` を採る** (`PYTHONDONTWRITEBYTECODE` は不要 — pyc は tmp に逃げる)。rlimit は既存 `_pytest_rlimit_preexec`、timeout は `plugin.pytest_timeout_sec`。**Landlock 不可の環境では improve と同様 fail closed** (ゲート pytest を回せない = 承認申請を出せない)。**`submit_plugin` / `bless` の `_default_pytest_runner` もこのヘルパに置き換える** (人間の plugin にも害はない。`plugin/approval.py:149` の無隔離実行を廃止)
+   - e. **`content_hash` を再計算 (H_after)。H_after ≠ H_before → 不合格** (テストが自分の plugin を書き換えた = 検査済みでない内容を承認申請に載せない)。以後の全工程 (strategy ゲート・approval payload・git 記録・昇格) は **H_before (= H_after) の内容**だけを入力にする
+4. **戦略採用ゲート (kind=strategy のみ)**: 親が `holdout.run_in_sample` を各 pair で回す (worker の `run_backtest` 結果は使わない。この呼出しは台帳でなく直接 `backtest_runs` に保存 — 親自身の判断用)。**取引数 < `backtest.min_trades` (30) → 「評価不能」: 承認申請を出さず `observation` (悪いとは記録しない — R8)**。≥30 → `run_holdout_gate` を回し、結果は **approval payload の添付のみ** (改善ループの読取ビューには載せない — 遮断 8)。`indicator` / `signal` はこのゲートを課さない (設計書 §6)
+5. **承認申請**: `approvals.create(kind="plugin", payload={name, kind, staging_path, content_hash: H_before, mission_id, in_sample: {...}, holdout: {...}|null, baseline: {...}|null, analysis_run_ids: <台帳から>, trial_count: <台帳の analyze_corr 呼出数>, backtest_call_count: <台帳の run_backtest 呼出数>, selection_rationale: <agent>, summary})`。**id・回数は agent 出力から取らない** (codex 1 周目 I7)。**`bless` は経由しない** (改善ループに自己承認経路は無い)
+6. **レポート (親だけが書く)**: `artifact.type=report`、およびゲート不合格・評価不能・observation・重複格下げのとき、`reports/improve-YYYY-MM-DD-<mission_id>.md` を親が整形して書く。**書き方**: `reports/` の dirfd に対し `openat(name, O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW)` — 既存パス (通常ファイルであれ symlink であれ) が在れば **fail closed** (activity + 通知、Mission 処理は続行。レポートは missions 行の transcript から復元可)。`reports/` は起動時に親が mkdir、gitignore 済み、**worker の rw には無い** (§2.1)。**agent の `body_md` は「提案本文」節に引用として入れる — 信用しない**
 7. **`improvement_runs.finish`**: `result='approval'` + `approval_id`、または `result='report'` + `report_path`。両方出た場合 (承認申請 + レポート) は `approval` を優先し `report_path` も埋める (列は両方ある)
-8. **掃除**: 承認申請を出した staging は残す。それ以外は削除
+8. **掃除**: 承認申請を出した staging は残す。それ以外は削除。台帳は 0 で保存済みなので破棄
 
-**失敗の隔離**: commit 相の例外は improve レーンで握り、activity + 通知 (`improve_commit_failed`)。取引レーン・core_lock・資金保護には波及しない。missions 行は必ず終端する (`finally`)。
+**失敗の隔離**: commit 相の例外は improve レーンで握り、activity + 通知 (`improve_commit_failed`)。取引レーン・core_lock・資金保護には波及しない。missions 行は必ず終端する (`finally`)。commit 相の transaction (0・2・5・7) は 1 つにまとめ、途中失敗はロールバック (staging は残り、Mission は failed)。
 
-**変異 (§4)**: worker の `self_test="passed"` を信じて 3c を省く (→ 「worker が passed と言い、親ゲートで落ちる」テスト) / 3c を Landlock 無しで回す (→ ゲート子プロセスから `data/` を読む fake test が通ってしまう pin。killer = ゲート pytest 内で `data/agentic.db` を open して失敗することを assert) / 30 未満を `rejected` にする (→ observation pin) / holdout 結果を Mission 出力や次回注入に含める (→ 遮断 8 pin) / バックログ上限を外す (→ 21 件投入テスト) / 重複解決を落とす (→ 二重承認申請テスト) / `bless` を呼ぶ (→ 承認申請が `pending` であることの pin) / commit 相の例外で missions 行が終端しない (→ CAS finalize pin) / staging を削除しない (→ 掃除テスト)。
+**変異 (§4)**: worker の `self_test="passed"` を信じて 3d を省く (→ 「worker が passed と言い、親ゲートで落ちる」テスト) / 3d を Landlock 無しで回す (→ ゲート子プロセスから `data/` を読む fake test が通ってしまう pin。killer = ゲート pytest 内で `data/agentic.db` を open して失敗することを assert) / **候補ディレクトリを rw で pytest に渡す・pytest 後に hash を取り直さない (killer = `test_plugin.py` が `plugin.py` を strategy 版に書き換えるテストで、承認申請が出ないこと)** / スナップショット検査を落とす (→ symlink を置いた候補が通る pin) / `name` の正規形検査を落とす (→ `../../docs/examples/plugins/rsi_indicator` が弾かれる pin) / 選択 UPDATE を無条件にする (→ 2 接続同時選択で二重承認申請) / 30 未満を `rejected` にする (→ observation pin) / holdout 結果を Mission 出力や次回注入に含める (→ 遮断 8 pin) / **agent 申告の analysis id / trial_count を payload に載せる (→ 偽装テスト: 台帳 100 件・申告 1 件で payload が 100)** / バックログ上限を外す (→ 21 件投入テスト) / `bless` を呼ぶ (→ 承認申請が `pending` であることの pin) / レポートを `open(..., "w")` で書く (→ 事前に symlink を置いた fake で fail closed になる pin) / commit 相の例外で missions 行が終端しない (→ CAS finalize pin) / staging を削除しない (→ 掃除テスト)。
 
 ---
 
-## 5. 承認時の入れ子 git 記録と昇格 (D6 の再収束) — 記録が先、昇格が後
+## 5. 承認時の入れ子 git 記録と昇格 (D6 の再収束) — 記録が先、切替は 1 rename
 
 ### 5.1 承認手順 (人間が `approve <id>` した瞬間。シェル / 起動時 reconcile / 将来の REST から。**scheduler スレッドでは決して実行しない**)
 
-**順序の原則: 履歴への記録が先、本番の場所への昇格は後。** git がどう失敗しても稼働中の旧版は消えない (§2.3 の「承認までは旧版が生き続ける」を承認処理の途中まで延長する)。
+**順序の原則: 履歴への記録が先、本番への切替は最後に 1 回の rename。** git がどう失敗しても稼働中の旧版は消えず、切替は原子的で「live が無い瞬間」が存在しない (codex 1 周目 I6)。
 
-1. **後発決定の確認 (ⓓ)**: 同一 plugin 名へのより新しい決定 (reject) があれば、この承認は失効 (`invalidated`) — 再試行で復活させない (D4 の順序規則)
-2. **ハッシュ再照合 (ⓐ)**: `payload.staging_path` の `content_hash` を再計算し `payload.content_hash` と一致しなければ承認は成立せず **pending のまま** + activity + 通知 (申請〜承認の間に書き換わった)
-3. **入れ子 git への記録 (ⓑ) — 候補置き場の内容から、`plugins/<name>/` のパスで**: 下記 5.2 の blob-level plumbing。ここで失敗 (git 不在 / detached / identity 無し / CAS 上限) → **pending のまま + 通知。本番の場所には一切触れていない**
-4. **昇格 (atomic swap)**: `plugins/<name>.promote-<approval_id>/` に staging をコピー → 既存 `plugins/<name>/` があれば `plugins/<name>.prev-<approval_id>/` に rename → 新を `plugins/<name>/` に rename → **`content_hash(plugins/<name>/)` を再計算し payload と一致することを確認** → `.prev` を削除。途中失敗・不一致は逆順に戻す (`.prev` があれば戻す) → pending のまま + 通知
-5. **`decide(status="approved")`**。ここで初めて `approved_plugins()` に載る (次回の再読込/起動から)
-6. staging を削除
+**レイアウト**: 承認済み内容は **版ディレクトリ `plugins/.versions/<name>/<content_hash>/`** に置く。稼働中の `plugins/<name>` は**その版ディレクトリを指す symlink** (相対リンク `.versions/<name>/<hash>`)。ロールバック = symlink を別の版へ向け直す。`plugin/loader.discover` と `content_hash(Path)` は symlink を辿って動く (`Path.resolve()`。既存のプレーンなディレクトリも辿らずに読めるので両形が共存できる)。`discover` は先頭 `.`/`_` を除外 (§2.3) するので `.versions/`・`.locks/` は列挙されない。
 
-**同一 plugin 名への承認は直列化 (ⓒ)** — plugin 名ごとの lock (`threading.Lock` の dict、承認スレッド内)。異なる plugin の並行承認は 5.2 の CAS が守る。
+1. **排他**: **`flock` を `plugins/.locks/<name>.lock` に取得** (プロセス間 — サービスの approve / 起動時 reconcile / 別プロセスの `afx plugin bless` が全て同じ lock を取る) + プロセス内は plugin 名ごとの `threading.Lock` (ⓒ)。異なる plugin の並行承認は 5.2 の CAS が守る
+2. **後発決定の確認 (ⓓ)**: 同一 plugin 名へのより新しい決定 (reject) があれば、この承認は失効 (`invalidated`) — 再試行で復活させない (D4 の順序規則)
+3. **ハッシュ再照合 (ⓐ)**: 候補 (staging) を §4-3a と同じスナップショット検査に通し `content_hash` を再計算、`payload.content_hash` と一致しなければ承認は成立せず **pending のまま** + activity + 通知 (申請〜承認の間に書き換わった)
+4. **版ディレクトリの作成**: `plugins/.versions/<name>/<hash>.tmp-<approval_id>/` に staging の 3 ファイルをコピー → 各ファイルとディレクトリを `fsync` → `rename` で `plugins/.versions/<name>/<hash>/` へ (既に同 hash の版があれば作らない = 冪等)。失敗 → pending + 通知。**本番 symlink には触れていない**
+5. **入れ子 git への記録 (ⓑ) — 版ディレクトリの内容から、`plugins/<name>/` のパスで**: 下記 5.2 の blob-level plumbing。失敗 (git 不在 / detached / identity 無し / CAS 上限) → **pending のまま + 通知。本番には一切触れていない**
+6. **切替 (1 rename)**: `plugins/.<name>.link-<approval_id>` に版ディレクトリへの symlink を作り、**`os.rename` で `plugins/<name>` に上書き** (symlink → symlink の rename は原子的。**旧 `plugins/<name>` がプレーンなディレクトリの場合** (bless 以前から在った手作り plugin) は rename できないので、先に `plugins/<name>` を `.versions/<name>/<旧 hash>/` へ移動 (これも rename) してから symlink を置く — この 2 段は「移動 → symlink 作成」の間だけ live が欠ける。**初回移行に限る**ため受容し、reconcile が中間状態を修復する (下記)) → `content_hash(plugins/<name>)` を再計算し payload と一致することを確認 (不一致 → 旧版へ向け直し pending)
+7. **`decide(status="approved")`**。ここで初めて `approved_plugins()` に載る (次回の再読込/起動から)
+8. staging を削除、lock 解放
 
-**却下・期限切れ・失効**: staging を削除するだけ。`plugins/<name>/` と履歴には触れない。
+**却下・期限切れ・失効**: staging を削除するだけ。`plugins/<name>`・版・履歴には触れない。
 
-**bless (人間が本番の場所を直接編集して即時承認)**: staging を経由せず `plugins/<name>/` の現物に対して 2 (in-place のハッシュ) → 3 (blob の出所が `plugins/<name>/` になるだけで同じ plumbing) → 5。昇格 (4) は無い。ゲート pytest は §4-3c の Landlock ヘルパ。
+**bless (人間が本番の場所を直接編集して即時承認)**: 同じ `flock` を取り、`plugins/<name>` の現物 (symlink なら辿った先、プレーンならそのディレクトリ) をスナップショット検査 → hash → **版ディレクトリへコピー** (4) → git 記録 (5、blob の出所が版ディレクトリになるだけ) → symlink 切替 (6。プレーンだった場合はここで初めて symlink 化される — 上記の初回移行) → decide (7)。ゲート pytest は §4-3d の Landlock ヘルパ。**既存のプレーンな `plugins/<name>/` は起動時 reconcile では触らない** — 次の承認/bless まではそのまま動く (discover は両形を読む)。
 
-### 5.2 記録手順 — 専用 index + blob-level plumbing (プラン 9 D6 の確定形を、出所が候補置き場である点に合わせて組み替え)
+### 5.2 記録手順 — 専用 index + blob-level plumbing (プラン 9 D6 の確定形を、出所が版ディレクトリである点に合わせて組み替え)
 
-- **初期化**: `plugins/.git` が無ければ親が `git init` (lazy)。親リポジトリとは独立、gitlink は発生しない (`.gitignore` の `/plugins/` で親から見えない)。**同時に `plugins/.git/info/exclude` に `_staging/` と `*.promote-*/` `*.prev-*/` を書く** — 候補置き場は入れ子リポジトリのワークツリー内にあるが**決して commit しない**。人間が `plugins/` で `git status` を打っても汚れて見えないようにする
-- **ポーセリン (`git add` / `git commit`) は使わない** — `git commit -- <path>` はワークツリー内容を取り直すので検証後の書き換えを拾い、pathspec 無しの commit は他 plugin の staged 差分を巻き込む (codex 4 周目 C1 / 3 周目 M1)。加えて本書では**記録時点で `plugins/<name>/` にはまだ新内容が無い** (昇格前) ので、ワークツリーは出所にならない。**blob を候補置き場のファイルから直接作り、専用 index に `plugins/<name>/` のパス名で置く**
+- **初期化**: `plugins/.git` が無ければ親が `git init` (lazy)。親リポジトリとは独立、gitlink は発生しない (`.gitignore` の `/plugins/` で親から見えない)。**同時に `plugins/.git/info/exclude` に `_staging/`・`.versions/`・`.locks/`・`.*.link-*` を書く** — これらは入れ子リポジトリのワークツリー内にあるが**決して commit しない**。人間が `plugins/` で `git status` を打っても汚れて見えないようにする
+- **ポーセリン (`git add` / `git commit`) は使わない** — `git commit -- <path>` はワークツリー内容を取り直すので検証後の書き換えを拾い、pathspec 無しの commit は他 plugin の staged 差分を巻き込む (codex 4 周目 C1 / 3 周目 M1)。加えて本書では**記録時点で `plugins/<name>` はまだ旧版を指している** (切替前) ので、ワークツリーは出所にならない。**blob を版ディレクトリのファイルから直接作り、専用 index に `<name>/<file>` のパス名で置く**
 
 ```
-src  = <staging>/<name>/            # bless では plugins/<name>/ (現物)
+src  = plugins/.versions/<name>/<hash>/
 ref  = git symbolic-ref HEAD        # unborn でも HEAD が指す ref 名は返る。init.defaultBranch に依存しない
 old  = git rev-parse --verify <ref> # 失敗 = unborn (初回)
 b_py = git hash-object -w <src>/plugin.py ; b_cfg = … config.yaml ; b_test = … test_plugin.py   # 3 blob を object DB へ
@@ -349,7 +375,7 @@ git commit-tree <tree> [-p <old>] -m "approve <name> <hash> (approval #id)"   # 
 git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。失敗したら頭からやり直し (有限回、超過は pending のまま)
 ```
 
-- **`_staging/` を stage する経路が構造的に無い** (`git add` を使わない。index に入るのは `update-index --cacheinfo` で明示した `<name>/<file>` の 3 本だけ)
+- **`_staging/` `.versions/` を stage する経路が構造的に無い** (`git add` を使わない。index に入るのは `update-index --cacheinfo` で明示した `<name>/<file>` の 3 本だけ)
 - **`symbolic-ref` の失敗は終了コードで区別**: 1 = detached HEAD (人間が履歴操作中 → 待てば直る) / 128 = リポジトリ障害 (運用者の対処が要る)。どちらも pending だが activity と通知の理由を分ける
 - **CAS 無しの `update-ref` は不可**。代替としてリポジトリ単位 lock で全 git 操作を直列化してもよい (実装はどちらでも)
 - **content_hash の bytes 版**: `plugin/loader.content_hash(Path)` を `content_hash_bytes(plugin_py: bytes, config_yaml: bytes)` の薄いラッパにする (定義 `sha256(b"plugin.py\0"+p+b"\0config.yaml\0"+c)` は不変)
@@ -359,49 +385,52 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 ### 5.3 git と SQLite は原子化できない — 収束性で担保 (codex I5)
 
 - 「approved になっている plugin は必ず commit 済み」の**一方向**だけを不変条件にする。逆は保証しない
-- **git の失敗は稼働中の版を決して壊さない** (記録が昇格に先行するため — 5.1 の順序の原則)。起こりうる中間状態は 2 つだけで、どちらも pending に統一される:
-  - **(a) commit 済み・未昇格・pending** (git は成功、昇格 4 で失敗または hash 不一致でロールバック): 旧版は無傷で `approved_plugins()` に載り続ける。再試行は 5.1 を頭から流す — git は tree 一致で no-op、昇格をやり直す
-  - **(b) 昇格済み・pending** (昇格まで成功、`decide` の DB 書込だけ失敗 — 窓は極小): 旧版は `plugins/<name>/` から消えており、再試行までは**新旧どちらも load されない**。旧版は入れ子 git の履歴から復元できる。再試行は hash 一致で昇格 no-op → decide のみ。起動時 reconcile (`approved_plugins()` より前) と次の承認操作が拾う
-- **再試行の 3 契機**: ①起動時 reconcile ②次の承認操作 ③シェル `approval retry <id>`。**scheduler tick にぶら下げない**。再試行は手順を頭から流す (ⓓ → ⓐ → git は tree 一致なら no-op → 昇格は hash 一致なら no-op → decide)
-- **起動時 reconcile の位置**: `init_db` と中断 Mission の回収より後、**`approved_plugins()` より前** (後だとその起動では復旧した承認がロードされない — codex 4 周目 I3)。同時に §2.3 の孤児 staging 掃除を行う。git 不在・reconcile 失敗はサービス起動を止めない (警告 + pending のまま)
+- **git の失敗・版作成の失敗は稼働中の版を決して壊さない** (どちらも切替に先行するため)。**切替は 1 rename** なので「live が無い瞬間」は無い (初回のプレーン→symlink 移行だけが例外 — 5.1-6)。起こりうる中間状態は次の 3 つで、いずれも pending に統一され、再試行で収束する:
+  - **(a) 版ディレクトリ作成済み・未記録・pending**: 旧版無傷。再試行は同 hash の版が在るので作り直さず、git から続く。`.tmp-*` の残骸は reconcile が削除
+  - **(b) 記録済み・未切替・pending**: 旧版無傷。再試行は git が tree 一致で no-op、切替をやり直す
+  - **(c) 切替済み・pending** (`decide` の DB 書込だけ失敗 — 窓は極小): live は新版を指すが approved でないため**新版は load されず、旧版も load されない** (旧版は `.versions/<name>/<旧 hash>/` と git 履歴に残る)。起動時 reconcile (`approved_plugins()` より前) と次の承認操作が拾って decide を完了させる。人間が急ぐなら symlink を旧版へ向け直す `plugin rollback <name>` (シェル。approved 済み hash の版にしか向けられない)
+- **再試行の 3 契機**: ①起動時 reconcile ②次の承認操作 ③シェル `approval retry <id>`。**scheduler tick にぶら下げない**。再試行は手順を頭から流す (lock → ⓓ → ⓐ → 版 (冪等) → git (tree 一致なら no-op) → 切替 (既に新版を指していれば no-op) → decide)
+- **起動時 reconcile の位置**: `init_db` と中断 Mission の回収より後、**`approved_plugins()` より前** (後だとその起動では復旧した承認がロードされない — codex 4 周目 I3)。同時に ①§2.3 の孤児 staging 掃除 ②`.versions/<name>/*.tmp-*` の削除 ③「どの approval も参照せず、どの symlink も指していない」版ディレクトリの削除 ④`.<name>.link-*` の残骸削除 ⑤`plugins/<name>` が dangling symlink なら activity ERROR (人間の操作を待つ。自動では向け直さない) を行う。git 不在・reconcile 失敗はサービス起動を止めない (警告 + pending のまま)
 - **git 不在**: 起動時検査で警告 (SQLite ≥3.35 assert と同じ扱い)。plugin 承認だけが成立せず、取引は動く
 
 ### 5.4 資金保護への非波及
 
 承認スレッド (シェル / 将来 API) と起動シーケンスでのみ実行。**scheduler スレッドから git サブプロセスが呼ばれないこと**を回帰テストで固定 (呼ばれたら fail するシーム — D3' の通知と同じ形。「lock 内か」でなく「どのスレッドか」で検査)。`core_lock` は触らない。
 
-**変異 (§5)**: 決定時ハッシュ再照合を削除 / 照合対象を index の blob から候補置き場のワークツリーへ戻す (TOCTOU 復活) / 専用 index をやめ共有 index + `git add` + `git commit -- <path>` (**killer = 検証後に staging の plugin.py を書き換えてから commit させ、commit 内容が検証済みの内容であることを assert**) / **git 記録より先に昇格する (killer = git 失敗を注入 (identity env 除去 / detached HEAD) して承認させ、`plugins/<name>/` の旧版が無傷で `approved_plugins()` に残ることを assert)** / **昇格後の hash 再検証を落とす (killer = swap 中に `plugins/<name>/plugin.py` を差し替え、ロールバックされ pending のままであること)** / `_staging/` が index に入る (→ 記録後の tree に `_staging` が無い pin) / 旧版の消えたファイルが index に残る (→ `git rm --cached` 落とし: 4 ファイル目を消した再承認で tree から消える pin) / 空 commit 判定を `git diff --cached` に戻す / commit と decide の順序を入れ替える / commit 失敗で承認を成立させる / 後発 reject の確認を削除 / 起動時 reconcile を `approved_plugins()` の後に置く / git を scheduler スレッドから呼ぶ / CAS 無し update-ref (→ 並行承認で先発 commit が消える) / 昇格失敗時に `.prev` を戻さない (→ 旧版消失テスト) / identity env を落とす (→ 空 git config 環境で永久 pending) / bless が Landlock ヘルパでなく `_default_pytest_runner` を使う (→ §4-3c の pin)。
+**変異 (§5)**: 決定時ハッシュ再照合を削除 / 照合対象を index の blob から候補置き場のワークツリーへ戻す (TOCTOU 復活) / 専用 index をやめ共有 index + `git add` + `git commit -- <path>` (**killer = 検証後に staging の plugin.py を書き換えてから commit させ、commit 内容が検証済みの内容であることを assert**) / **git 記録より先に切替する (killer = git 失敗を注入 (identity env 除去 / detached HEAD) して承認させ、`plugins/<name>` が旧版を指したまま `approved_plugins()` に残ることを assert)** / **切替を「旧を退避 → 新を置く」の 2 段 rename にする (killer = 1 段目の直後にプロセスを落とし、起動時に live が欠けている)** / **`flock` を落とす (killer = 別プロセスの bless と同時に走らせ、両者が互いの版を壊さないこと)** / 切替後の hash 再検証を落とす (killer = swap 中に版ディレクトリを差し替え、旧版へ戻され pending のままであること) / `_staging/` `.versions/` が index に入る (→ 記録後の tree に無い pin) / 旧版の消えたファイルが index に残る (→ `git rm --cached` 落とし: 4 ファイル目を消した再承認で tree から消える pin) / 空 commit 判定を `git diff --cached` に戻す / commit と decide の順序を入れ替える / commit 失敗で承認を成立させる / 後発 reject の確認を削除 / 起動時 reconcile を `approved_plugins()` の後に置く / reconcile が dangling symlink を勝手に向け直す (→ ERROR に留める pin) / git を scheduler スレッドから呼ぶ / CAS 無し update-ref (→ 並行承認で先発 commit が消える) / identity env を落とす (→ 空 git config 環境で永久 pending) / `fsync` を落とす (→ 実装計画の fault-injection、設計では要求のみ) / bless が Landlock ヘルパでなく `_default_pytest_runner` を使う (→ §4-3d の pin) / discover が symlink を辿らない (→ 承認直後に plugin が消える pin)。
 
 ---
 
-## 6. 外向きリクエストの予算 (研究ツールに閉じる) と egress の pin
+## 6. 外向きリクエストの予算 — 研究ツールの advisory 予算 (安全保証ではない)
 
-**全体設計 (Global Constraints 化・共通出口ラッパ・datafeed 4 経路の集約) は本プランではやらない — 起票のまま (§10)。** ここでは**本プランが新たに増やす外向き経路 (研究ツール・CLI 自身の通信) だけ**を律する。「今それが無事なのは設計のおかげか偶然か」の区別を、少なくとも新経路については設計で答える。
+**位置づけ (ユーザー裁定 2026-08-16、codex 1 周目 I5 を受けて)**: 本節の予算は **registry ツール (`web_search` / `fetch_article`) の契約**であり、**改善 worker からの外向き通信全体を律する安全保証ではない**。改善 profile は shell と python を持つ (§1.6・§2.1-5) ので、agent が `python -c` から直接 HTTP を投げれば予算は数えられない。これを塞ぐには network namespace か親の egress proxy への限定が要り、それは**外向きリクエスト予算の全体設計 (起票 §10)** の一部である。本プランでは:
 
-- **Mission ごとの予算** (`improve.research` config、`_Strict`):
-  - `max_searches` (既定 20) / `max_fetches` (既定 30) / `min_interval_sec` (既定 2.0) / `max_per_host` (既定 5) / `fetch_max_bytes` (既定 2 MiB) / `user_agent` (既定 `agentic-fx/<version> (+https://github.com/<repo>)` — 素性を名乗る)
-  - 予算は worker 内のツール実装が数える (Mission = プロセスなので状態はプロセス内で足りる)。使い切ったらツールは `{"error": "budget exhausted"}` を返し、Mission は続く
-  - **429 / 503 を受けたホストは同一 Mission 内で以後打ち切り** (再試行しない — 既に絞られた相手に重ねない)。他ホストは続行
-  - 既定は未設定でも安全側 (上記) で動く。設定し忘れが連射にならない
-- **CLI 自身の egress**: codex は `--disable plugins --disable remote_plugin --disable recommended_plugins --disable apps` を argv pin。claude は `--setting-sources ""` (plugin sync 等)。CLI が LLM エンドポイント以外へ出る通信をゼロにできる保証は無い (probe §5-②: `--disable apps` 未検証) — 実装計画で `strace -e trace=connect` 相当で観測し、残るものは文書化する
+- **prompt で禁じる** (§3.2 規律節): 「ネットワークアクセスはツール経由のみ。shell/python から直接 HTTP を投げない」。従わない agent を機構では止められないことを明記する
+- **registry ツールの Mission 予算** (`improve.research` config、`_Strict`): `max_searches` (既定 20) / `max_fetches` (既定 30) / `min_interval_sec` (既定 2.0) / `max_per_host` (既定 5) / `fetch_max_bytes` (既定 2 MiB) / `user_agent` (既定 `agentic-fx/<version> (+https://github.com/<repo>)` — 素性を名乗る)。予算は worker 内のツール実装が数える (Mission = プロセス)。使い切ったらツールは `{"error": "budget exhausted"}` を返し、Mission は続く。**429 / 503 を受けたホストは同一 Mission 内で以後打ち切り** (再試行しない)。既定は未設定でも安全側で動く
+- **CLI 自身の egress**: codex は `--disable plugins --disable remote_plugin --disable recommended_plugins` を argv pin (既知の 3 経路の退行防止)。`--disable apps` の効果は Task 13 で実測・記録 (§1.3、M2)。claude は `--setting-sources ""`。CLI が LLM エンドポイント以外へ出る通信をゼロにできる保証は無い — 観測して文書化する
 - **ネットワーク遮断はしない** (プラン 8 §4.5 の裁定どおり。改善 worker は LLM と研究に外へ出る必要がある)
 
-**変異 (§6)**: 予算カウンタを落とす (→ 21 回目の検索が通る pin) / 429 で再試行する (→ fake サーバで 2 回目のリクエストが飛ぶ pin) / UA を空にする / `--disable plugins` を落とす (§1 の pin と共有)。
+**変異 (§6 — ツール契約テストとして)**: 予算カウンタを落とす (→ 21 回目の検索が通る) / 429 で再試行する (→ fake サーバで 2 回目のリクエストが飛ぶ) / UA を空にする / `--disable plugins` を落とす (§1 の pin と共有)。**これらは安全保証の検証ではない**。
 
 ---
 
-## 7. 受入条件 (blocking)
+## 7. 受入条件
 
-**全部が緑になるまで改善ループは有効化しない** (`schedule.improve` の消費と `improve` コマンドは最後の task で配線する)。
+### 7.1 blocking (1〜7) — 全部が緑になるまで改善ループは有効化しない
 
-1. **遮断 8 項目の統合回帰** (改善 worker の**実プロセス**に対して。**improve registry の task 直後に red で書き始める** — 最後の E2E に置かない): ①`data/agentic.db` の絶対パス open / `data/` 列挙が失敗 ②`run_holdout_gate` を呼んでもデータ到達不能で失敗 ③`ohlcv_history` / `ohlcv_cache` を直読するツールが registry に無い + DB パスが handshake に無い ④**書き込み可能パスが staging・reports・workdir・`/dev` に閉じる** (リポジトリ本体・`plugins/<name>/`・`config/`・`policy/` への write が `EACCES`) ⑤plugin サンドボックスの入力 DataFrame はハーネスが与える (既存 pin 継続) ⑥`get_signals` を含む `IMPROVE_FORBIDDEN` + 取引 registry の全ツールが improve registry に**無い** ⑦`analyze_corr` / `run_backtest` の返却 schema に日時・期間端点・順序付き窓列・観測数が無い ⑧approval の結果として holdout の指標・baseline 差分・閾値別合否が Mission 出力・注入コンテキスト・RPC 返却のどこにも現れない
-2. **3 実装 (Local / Claude / Codex) が同一の契約テストスイートに合格** (fake CLI スクリプトで実 LLM を呼ばずに回す。運用で選ばれるのは 1 つ): 4 終端 / reason 安全化 / timeout 優先 (fake が sleep) / schema 不適合 → failed / **子 env に鍵の名前がゼロ・scratch home のみ** / claude の allowedTools が profile で固定 / codex は trade で拒否 / `max_turns` の runner 別セマンティクス
-3. **ゲート pytest が柵の中で動く**: ゲート子プロセスから `data/agentic.db` を open する fake test が `EACCES` で失敗する (変異 killer) / `submit_plugin` と `bless` が同じヘルパを通る (無隔離の `_default_pytest_runner` が呼ばれない pin)
-4. **D6 変異列** (§5) を全て殺す / **git サブプロセスが scheduler スレッドから呼ばれない**回帰テスト / 承認は git 記録成功後にしか `approved` にならない / **git 失敗を注入しても稼働中の旧版が消えない** (記録が昇格に先行)
-5. **改善レーンが取引レーンを塞がない**: 改善 Mission 実行中に `MissionSupervisor.try_submit("trade")` が受理される / 取引レーンの容量 1・直列性の既存 pin が不変
-6. **FakeRunner E2E**: 発見 → バックログ追加 (上限・重複) → 候補 → ゲート不合格でレポート止まり (承認申請なし) / ゲート合格で承認申請 (pending) → `approve` で git 記録 → 昇格 → approved (この順) / 30 未満 strategy が observation / 並行 2 Mission の重複選択が後着 observation
-7. `MissionResult.status` 4 値・決定論的コア (`risk_gate` / `paper_broker` / `transitions` / `executor` の判定) は diff ゼロ / 既存 2071 テストが壊れない / 新規 config キーは `settings.yaml.example` と同期 / migration (`improvement_backlog` の列追加) は空 DB・既存 DB で冪等
-8. **実機 E2E (実装計画の実測項目、blocking ではないが既定見直しの材料)**: 3 backend それぞれで「サンプル indicator plugin 1 本を候補置き場に実装し、親ゲートを通す」を実測。あわせて claude の rlimit 下 1 ターン / node ラッパ経由 codex / `--disable apps` の egress / `--setting-sources ""` 下の init イベント / auth ローテーション有無 を記録
+`schedule.improve` の消費と `improve` コマンドの配線は Task 12 で行い、**Task 12 の gate は本節 1〜7 の逐語**である (8 は含まない)。
+
+1. **遮断 8 項目の統合回帰** (改善 worker の**実プロセス**に対して。**improve registry の task 直後に red で書き始める** — 最後の E2E に置かない): ①`data/agentic.db` の絶対パス open / `data/` 列挙が失敗 ②`run_holdout_gate` を呼んでもデータ到達不能で失敗 ③`ohlcv_history` / `ohlcv_cache` を直読するツールが registry に無い + DB パスが handshake に無い ④**書き込み可能パスが staging・workdir・`/dev` に閉じる** (`reports/`・リポジトリ本体・`plugins/<name>`・`plugins/.versions`・`config/`・`policy/` への write が `EACCES`) ⑤plugin サンドボックスの入力 DataFrame はハーネスが与える (既存 pin 継続) ⑥`get_signals` を含む `IMPROVE_FORBIDDEN` + 取引 registry の全ツールが improve registry に**無い** ⑦`analyze_corr` / `run_backtest` の返却 schema に日時・期間端点・順序付き窓列・観測数が無い、**かつ RPC が DB に直接書かない** ⑧approval の結果として holdout の指標・baseline 差分・閾値別合否が Mission 出力・注入コンテキスト・RPC 返却のどこにも現れない、**かつ payload の analysis id / 回数は agent 出力からでなく RPC 台帳から来る**
+2. **3 実装 (Local / Claude / Codex) が同一の契約テストスイートに合格** (fake CLI スクリプトで実 LLM を呼ばずに回す。運用で選ばれるのは 1 つ): 4 終端 / reason 安全化 / timeout 優先 (fake が sleep) → CLI セッションが killpg され worker 自身は生きて `timeout` を返す / schema 不適合 → failed / **子 env に鍵の名前がゼロ・scratch home のみ** / claude の allowedTools が profile で固定 / codex は trade で拒否 / `max_turns` の runner 別セマンティクス / **exec closure の 1 要素 drop pin** (shell 系 backend で `/usr/bin` を落とすと fake shell 起動が `EACCES`)
+3. **ゲート pytest が柵の中で動き、候補は不変**: ゲート子プロセスから `data/agentic.db` を open する fake test が `EACCES` で失敗する / **`test_plugin.py` が `plugin.py` を書き換える fake で H_before ≠ H_after となり承認申請が出ない** / symlink・余分ファイルを含む候補がスナップショット検査で落ちる / `submit_plugin` と `bless` が同じヘルパを通る (無隔離の `_default_pytest_runner` が呼ばれない pin)
+4. **D6 変異列** (§5) を全て殺す / **git サブプロセスが scheduler スレッドから呼ばれない**回帰テスト / 承認は git 記録成功後にしか `approved` にならない / **git 失敗を注入しても稼働中の旧版が消えない** (記録が切替に先行) / **切替は 1 rename** (2 段化の killer) / **`flock` により別プロセス bless と競合しない**
+5. **改善レーンが取引レーンを塞がない**: 改善 Mission 実行中に `MissionSupervisor.try_submit("trade")` が受理される / 取引レーンの容量 1・直列性の既存 pin が不変 / **wave が `parallel=N` で N partition を全て担当する** / **backlog 選択の CAS** (2 接続同時で勝者 1) / shutdown が改善レーンの worker を全て回収する
+6. **FakeRunner E2E**: 発見 → バックログ追加 (上限・重複) → 候補 → ゲート不合格でレポート止まり (承認申請なし) / ゲート合格で承認申請 (pending) → `approve` で 版 → git 記録 → symlink 切替 → approved (この順) / 30 未満 strategy が observation / 並行 2 Mission の重複選択が後着 observation / **`artifact.name` に `../` や絶対パスを返す fake が failed** / **レポート先に symlink を事前に置くと fail closed** / **timeout した Mission の `backtest_runs` / `analysis_runs` が残らない**
+7. `MissionResult.status` 4 値・決定論的コア (`risk_gate` / `paper_broker` / `transitions` / `executor` の判定) は diff ゼロ / 既存 2071 テストが壊れない / 新規 config キーは `settings.yaml.example` と同期 / migration (`improvement_backlog` の列追加) は空 DB・既存 DB で冪等 / **`discover` が `_`/`.` 先頭ディレクトリを列挙せず、正規形外の名前を skip する pin**
+
+### 7.2 有効化後の実測 (8) — blocking ではない。既定見直しの材料
+
+8. **実機 E2E (Task 13)**: 3 backend それぞれで「サンプル indicator plugin 1 本を候補置き場に実装し、親ゲートを通す」を実測。あわせて claude の rlimit 下 1 ターン / node ラッパ経由 codex / **`--disable apps` の egress (`strace -e trace=connect` 相当で記録)** / `--setting-sources ""` 下の init イベント / auth ローテーション有無 / exec closure の実測 (1 要素 drop) を記録する。結果は §0.2 の既定見直しに使う
 
 ---
 
@@ -409,24 +438,35 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 
 | 束 | # | task | 由来 | 依存 |
 |---|---|---|---|---|
-| **A** (runner) | 1 | `CliRunner` 共通基盤 + factory + config schema (`^(local\|claude\|codex)$`, `runner.claude/codex`, trade=codex 拒否) + 起動時検査 | §1.1/1.4 | — |
+| **A** (runner) | 1 | `CliRunner` 共通基盤 (別セッション + PDEATHSIG + timeout/killpg) + factory + config schema (`^(local\|claude\|codex)$`, `runner.claude/codex`, trade=codex 拒否) + 起動時検査 (bin/--version/認証/shebang 解決) | §1.1/1.4 | — |
 | A | 2 | `ClaudeRunner` + fake CLI 契約テスト | §1.2 | 1 |
 | A | 3 | `CodexRunner` (provider 2 択) + fake CLI 契約テスト + argv pin | §1.3 | 1 |
 | A | 4 | MCP stdio シム + mission_worker 側 dispatcher (Unix socket) | §1.6 | 1 |
-| **B** (柵) | 5 | `landlock.execute_paths` + `_bootstrap_improve_profile` 拡張 (`/dev` rw, `/proc`, resolve, staging, reports) + assert 拡張 + env 追加 + `/dev/null` O_RDONLY | §2 | — |
-| B | 6 | Landlock ゲート pytest ヘルパ + `submit_plugin` / `bless` の置換 | §4-3c | 5 |
-| **C** (registry) | 7 | improve registry (研究ツール + 予算 / staging ファイル / `run_plugin_tests` / RPC 2 種) + **遮断 8 項目の統合回帰を red で開始** | §3.4/§6 | 5 |
-| C | 8 | バックログ拡張 (`observation` / attempts / last_result) + 注入コンテキスト生成 + prompt | §3.2/§4-2 | — |
-| **D** (loop) | 9 | `ImproveSupervisor` (N スロット) + scheduler 週次判定 + `improve` / `improve add` / `backlog` / `policy add` コマンド (配線は最後) | §3.1 | — |
-| D | 10 | `ImproveLoop` (三相 + commit 相ゲート + 承認申請 + レポート + improvement_runs) | §4 | 7, 8, 6 |
-| **E** (承認) | 11 | 入れ子 git 記録 (blob-level plumbing、staging 出所) → staging 昇格 (atomic swap + hash 再検証) + reconcile + `approval retry` + bless 経路 | §5 | 6 |
-| **F** | 12 | FakeRunner E2E + 遮断 8 項目の完了 + `schedule.improve` 配線 (有効化) | §7 | 全部 |
-| F | 13 | 実機 E2E (3 backend、実測項目) + 既定見直し提案 | §7-8 | 12 |
+| **B** (柵) | 5 | `landlock.execute_paths` + backend 別 exec closure + `_bootstrap_improve_profile` 拡張 (`/dev` rw, `/proc`, resolve, staging) + assert 拡張 + env 追加 + `/dev/null` O_RDONLY + **`discover` の `_`/`.` 除外と名前正規形** | §2 | — |
+| B | 6 | Landlock ゲート pytest ヘルパ (候補 ro・pyc prefix・スナップショット検査・H_before/H_after) + `submit_plugin` / `bless` の置換 | §4-3 | 5 |
+| **C** (registry) | 7 | improve registry (研究ツール + advisory 予算 / staging ファイル / `run_plugin_tests` / RPC 2 種 **+ RPC 台帳** + `analyze_for_agent`/`run_in_sample` の永続化分離) + **遮断 8 項目の統合回帰を red で開始** | §3.4/§6 | 5 |
+| C | 8 | バックログ拡張 (`observation` / attempts / last_result / **選択 CAS**) + 注入コンテキスト生成 + prompt | §3.2/§4-2 | — |
+| **D** (loop) | 9 | `ImproveSupervisor` (N スロット・wave・shutdown/join) + scheduler 週次判定 + `improve` / `improve add` / `backlog` / `policy add` / `approval retry` / `plugin rollback` コマンド (配線は最後) | §3.1 | — |
+| D | 10 | `ImproveLoop` (三相 + commit 相ゲート + 台帳永続化 + 承認申請 + レポート (O_EXCL\|O_NOFOLLOW) + improvement_runs) | §4 | 7, 8, 6 |
+| **E** (承認) | 11 | 版ディレクトリ + 入れ子 git 記録 (blob-level plumbing) → symlink 切替 (1 rename) + `flock` + reconcile (孤児 staging・tmp 版・未参照版・dangling) + bless 経路 (初回 symlink 化) | §5 | 6 |
+| **F** | 12 | FakeRunner E2E + 遮断 8 項目の完了 + `schedule.improve` 配線 (有効化 — **gate = §7.1 の 1〜7 逐語**) | §7.1 | 全部 |
+| F | 13 | 実機 E2E (3 backend、§7.2 の実測項目、`--disable apps` egress 記録) + 既定見直し提案 | §7.2 | 12 |
 
 - **A / B / C-8 / D-9 は worktree 並列**可。C-7 は B-5 の後。D-10 は C・B-6 の後。E-11 は B-6 の後 (A と並列可)。F は最後
-- ファイル競合: `mission_worker.py` (A-4 / B-5) は**同一ファイル** — A-4 を B-5 の後に直列 / `plugin/approval.py` (B-6 / E-11) は順序依存 / `store/db.py` は C-8 のみ / `service.py` (A-1 起動時検査 / D-9 / E-11 reconcile) はマージ順に注意
+- ファイル競合: `mission_worker.py` (A-4 / B-5) は**同一ファイル** — A-4 を B-5 の後に直列 / `plugin/approval.py` (B-6 / E-11) は順序依存 / `plugin/loader.py` (B-5 discover / E-11 symlink 追従) は順序依存 / `store/db.py` は C-8 のみ / `service.py` (A-1 起動時検査 / D-9 / E-11 reconcile) はマージ順に注意
 
----
+### 8.1 実装計画へ送る項目 (codex 1 周目の「実装計画へ送る項目」を要約)
+
+1. C1/C2/C3: dirfd 基準の `openat` / `O_NOFOLLOW|O_EXCL`、plugin 名 regex、3 本の不変マニフェスト、pytest 用 read-only スナップショットのヘルパと変異テストを具体化
+2. C4: exec closure を claude native / codex vendor native / nvm node ラッパの 3 形で採取し、`/bin/bash`・`/usr/bin/env`・node・pytest python・動的ローダの 1 要素 drop テストを作る
+3. I1: Mission ローカル RPC 台帳・commit 時の id 解決・failed/timeout 時破棄・RPC timeout 後のスレッド回収を protocol sequence と SQL transaction まで落とす
+4. I2: backlog の条件付き UPDATE と、勝者だけが approval/report の副作用を出す transaction 境界を SQL 単位で書く
+5. I3: wave id、M/k 予約、scheduler/manual 重複、部分 submit、shutdown 中の受付拒否を state machine と test matrix にする
+6. I4: pgid ベースの所有 (別セッション + PDEATHSIG) を、SIGTERM 無視 CLI・CLI→bash 生存中の kill・service SIGTERM・N=4 同時停止の実プロセステストにする (`setsid()` 孫の逃避は起票側の cgroup で扱う — テストは「逃げる」事実の記録まで)
+7. I5: advisory に縮めたので、受入条件と変異リストから安全保証の表現を外したことを実装計画でも維持 (proxy は起票)
+8. I6: `flock` ファイル名・版ディレクトリ・fsync/rename 順・各 rename/commit/decide 直後の crash に対する起動時 reconcile テスト
+9. I7: RPC 台帳から `analysis_run_ids` / trial count を生成する schema と、agent が id/count を偽装しても payload に反映されないテスト
+10. 実測 task (claude fsize 8MB / node ラッパ / `--disable apps` egress / claude init tools / auth rotation) + 全新規 `_Strict` config (`improve.parallel`、RPC timeout、research 予算、backlog 上限、`schedule.improve_at`、CLI grace 等) の `Settings`/example 同期 + **改善 N 並行中に取引 DB commit が busy timeout を踏まない負荷テスト**
 
 ## 9. 変えないもの
 
@@ -435,7 +475,8 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 - trade profile の権限境界 (RO DB + 資格情報 env。Landlock 任意) — ClaudeRunner を trade で選んでも MCP ツールのみ
 - `IMPROVE_FORBIDDEN` の pin / 遮断 8 項目の意味論 / holdout の所有 (ハーネス) / `backtest.holdout_months` はコア所有
 - plugin 機構の契約 (3 ファイル・純関数・AST allowlist・サンドボックス実行・content_hash の定義)
-- 改善ループの出力先が gitignore 領域 (`plugins/`・`reports/`) に閉じること (2026-08-08 裁定)
+- 改善ループの出力先が gitignore 領域 (`plugins/`・`reports/`) に閉じること (2026-08-08 裁定)。**worker が書くのは `plugins/_staging/` のみ、`reports/` は親が書く**
+- `RLIMIT_NPROC` を mission worker に掛けない現状 (変えない)
 - `Notifier.send` の握り潰し (起票のまま)
 
 ## 10. 起票 (本プランでは直さない)
@@ -443,10 +484,12 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 プラン 9 §6 から引き継ぎ: 外向きリクエスト予算の**全体**設計 (Global Constraints 化・共通出口・datafeed 4 経路・Discord) / `missions.failure_reason` / worker 診断タスク (result フレーム 5 箇所の `error` を親へ) / **improve モデルの `/models` 存在確認** (backend=local の improve が本プランで初めて実ツールを持つ — 実装計画で warn-only の扱いを決めてよい) / plugin `max_bars` × cache 保持期間 / SSE error event / `ohlcv_cache` の物理分離 / キャッシュ→履歴の昇格 / ヘッジ併存。プラン 9 束 D/E から: `Notifier.send` の成功戻り値契約 / `trade_intents` の保持・prune / `reject_category` の StrEnum 化 / db.py の table rebuild 骨格重複 / `_backup_before_migration` のログ文言。
 
 本プランで新規:
-- **代替ローカルハーネス候補 (Qwen Code / Aider / OpenCode / Goose)** — 「ローカル LLM でハーネスを回す」目的は codex+llama-swap で満たす方針だが、実機 E2E (§7-8) で codex+llama-swap の plugin 実装力が不足と出たら、Qwen Code (qwen3.x 系の本家ハーネス、モデル相性) / Aider (弱いモデル向けの編集形式で成熟) / OpenCode / Goose を **4 番目の backend 候補として実測**する。§1 の `CliRunner` は「CLI 起動 → JSON 回収」の共通基盤なので追加コストは argv・出力形式・認証の差分に限られる。版・機能・ライセンスは採用検討時に実測で確認 (2026-08-16 ユーザー希望で起票)
+- **代替ローカルハーネス候補 (Qwen Code / Aider / OpenCode / Goose)** — 「ローカル LLM でハーネスを回す」目的は codex+llama-swap で満たす方針だが、実機 E2E (§7.2) で codex+llama-swap の plugin 実装力が不足と出たら、Qwen Code (qwen3.x 系の本家ハーネス、モデル相性) / Aider (弱いモデル向けの編集形式で成熟) / OpenCode / Goose を **4 番目の backend 候補として実測**する。§1 の `CliRunner` は「CLI 起動 → JSON 回収」の共通基盤なので追加コストは argv・出力形式・認証の差分に限られる。版・機能・ライセンスは採用検討時に実測で確認 (2026-08-16 ユーザー希望で起票)
 - **claude → ローカル LLM 駆動** (R9): 要実測 (llama-swap が Anthropic 形式を受けるか) / 鍵契約の言い換え (「課金エンドポイントへの鍵は渡さない」) / 規約確認。E2E で codex+llama-swap が不足と分かったら再訪
-- `--disable apps` が codex の chatgpt.com egress を止めるかの検証 (止まらなければ config key を探す)
-- claude を本番 rlimit (`fsize 8MB`) 下で実ターン (probe 未測)
+- **codex `apps` egress の停止手段** — 検証・記録は本プラン Task 13 で行う (§1.3/§7.2)。`--disable apps` で止まらなかった場合の停止手段 (別 config key / proxy) はここに残る。argv pin は既知 3 経路の退行防止であり、この egress を「対処済み」にするものではない
+- **改善 worker のプロセス包含 (cgroup v2)** — 現状は pgid ベース (§1.1-4)。`setsid()` を呼ぶ孫は逃げる。完全な包含は Mission ごとの cgroup v2 (systemd --user scope) + `cgroup.kill`。`RLIMIT_NPROC` の適用も併せて検討
+- **改善 worker の egress を親の代理へ限定する (network namespace / egress proxy)** — 外向き予算の全体設計の一部。改善 worker からの AF_INET(6) を親の proxy 以外へ禁じ、LLM エンドポイントと研究 HTTP の双方で予算・レート・429 方針を強制する。これが入るまで §6 は advisory
+- claude の本番 rlimit (`fsize 8MB`) 超過時の扱い — 実測は Task 13 (§7.2)。超えた場合の improve 別 `child_fsize_mb` はここに残る
 - codex+llama-swap の schema 安定性 (フェンス付き応答。E2E で計測、`response_parser` で足りなければ再出力プロンプトを検討)
 - 認証ファイルのコピー・ドリフト (トークンリフレッシュが scratch 側だけに落ちる)。長期運用で「コピーが古くなる」方向。対処候補: 実ファイルの mtime 監視 / 期限切れ時の明示エラー
 - MCP シムのプロトコル版追随 (claude / codex が要求する MCP バージョン)
@@ -456,3 +499,9 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 ## 11. レビュー方針
 
 **設計レビューは codex 単独の反復**。新規設計を含む文書は 7 周を見込む (プラン 9 実績)。毎周「文書全体の自己矛盾の総ざらい」を依頼に含め、3 周目以降は指摘のあった節を通しで書き直す (パッチしない)。指摘がツールの実装詳細 (CLI の引数名・MCP のフィールド) に降りてきたら実装計画へ送る判断をレビュアーに併せて求める。実装計画のレビューは別途 (設計収束を計画の品質の根拠にしない)。
+
+## 12. レビュー履歴
+
+| 周 | 日付 | レビュアー | 結果 | 処置 |
+|---|---|---|---|---|
+| 1 | 2026-08-16 | codex (gpt-5.6-sol) | C4 / I7 / M3 = 14 件 | **全件採用** (`.superpowers/sdd/plan10-design/codex-round1.md`)。**C1 は事実誤り** — 「現行 rw マスクは `MAKE_SYM` を含む」は誤りで、`_READ_WRITE_ACCESS` (`landlock.py:111-114`) に `MAKE_SYM` は無く symlink 作成は Landlock で拒否される。**修正は別の理由 (所有境界の単純化 — 案 A で worker が `reports/` に書く必要が無い) で採用**し、親のレポート書込は `O_CREAT\|O_EXCL\|O_NOFOLLOW` とした。**I4 は部分採用** (ユーザー裁定 2026-08-16: 別セッション + PDEATHSIG + CLI セッション killpg。cgroup v2 は起票)。**I5 は advisory 裁定** (ユーザー裁定 2026-08-16: 研究ツール予算はツール契約、egress proxy は起票)。他 (C2 名前正規形 / C3 不変スナップショット + H_before/H_after / C4 exec closure / I1 RPC 台帳 / I2 backlog CAS / I3 wave / I6 版ディレクトリ + symlink 1 rename + flock / I7 台帳由来の id / M1 §7 分割 / M2 `--disable apps` の所在一本化 / M3 discover 除外を本プランで追加) は記述どおり採用。§2/§3/§4/§5/§6/§7/§8 を通しで書き直し |
