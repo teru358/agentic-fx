@@ -248,6 +248,18 @@ def test_real_improve_worker_reaches_ready(tmp_path):
     settings_path = (Path(__file__).resolve().parents[1] / "config"
                      / "settings.yaml.example")
     settings = load_settings(settings_path)
+    # **ネットワーク隔離** (2026-08-16, net-isolation-probe.md §5.4): この
+    # テストは実 mission_worker を直に Popen するため `tests/conftest.py` の
+    # `_forbid_worker_spawn_against_real_llama_swap` pin (WorkerRunner.run 経由
+    # の spawn しか見ない) は素通りする。`ready` フレーム受領直後に kill する
+    # ので現状 POST は出ないが、静かに漏れる穴を塞ぐため base_url をここでも
+    # 到達不能アドレスへ差し替えておく。
+    from tests.conftest import _LLAMA_SWAP_UNREACHABLE_URL
+
+    settings = settings.model_copy(update={
+        "llama_swap": settings.llama_swap.model_copy(
+            update={"base_url": _LLAMA_SWAP_UNREACHABLE_URL}),
+    })
     workdir = tmp_path / "workdir"
     workdir.mkdir()
 

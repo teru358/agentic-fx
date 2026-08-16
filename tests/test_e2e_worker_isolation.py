@@ -19,10 +19,15 @@ from agentic_fx.service import build_app, run_init
 from agentic_fx.store import orders as orders_store
 from agentic_fx.store import ohlcv as ohlcv_store
 
+from tests.conftest import _LLAMA_SWAP_UNREACHABLE
 from tests.store.test_rag import FakeEmbedding
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# 実 llama-swap の既定アドレス。差し替え先 (即 ECONNREFUSED) は
+# tests/conftest.py の共有定数を使う。
+_LLAMA_SWAP_REAL = 'base_url: "http://localhost:8080/v1"'
 
 
 def _install_settings(root: Path) -> None:
@@ -30,6 +35,19 @@ def _install_settings(root: Path) -> None:
     (root / "config").mkdir()
     src = (_REPO_ROOT / "config" / "settings.yaml.example").read_text(
         encoding="utf-8")
+    # **ネットワーク隔離** (2026-08-16 実測): `build_app` は `runner=` 未指定
+    # なら本物の `WorkerRunner` を作り、それを **TradeLoop と ReflectionCycle
+    # の両方**に注入する。テストが `app.trade_loop.runner` だけ差し替えても
+    # reflection は本物を握ったままなので、`scheduler.tick` が実 subprocess
+    # (`mission_worker`) を起動し、子は `llama_swap.base_url` = 実 llama-swap
+    # (`http://localhost:8080/v1`) へ本当に POST していた (journal 実測:
+    # 1 スイートあたり 1 件・約 28 秒・35B モデルのロードまで誘発)。
+    # 到達不能アドレスへ差し替えて即 ECONNREFUSED にする
+    # (`tests/runners/test_worker_runner.py` の実 subprocess E2E と同じ手)。
+    assert _LLAMA_SWAP_REAL in src, (
+        "settings.yaml.example の llama_swap.base_url 表記が変わった — "
+        "テストのネットワーク隔離が静かに外れる")
+    src = src.replace(_LLAMA_SWAP_REAL, _LLAMA_SWAP_UNREACHABLE)
     (root / "config" / "settings.yaml.example").write_text(
         src, encoding="utf-8")
     with patch("agentic_fx.service.PriceProvider") as provider, \
