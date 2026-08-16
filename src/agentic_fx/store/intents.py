@@ -6,20 +6,24 @@ from datetime import datetime
 
 
 def insert(conn: sqlite3.Connection, mission_id: int, payload: dict,
-           now: datetime) -> int:
+           now: datetime, *, action: str) -> int:
     cur = conn.execute(
-        "INSERT INTO trade_intents (mission_id, payload_json, created_at) "
-        "VALUES (?,?,?)",
-        (mission_id, json.dumps(payload, ensure_ascii=False), now.isoformat()))
+        "INSERT INTO trade_intents "
+        "(mission_id,payload_json,action,created_at) VALUES (?,?,?,?)",
+        (mission_id, json.dumps(payload, ensure_ascii=False),
+         action, now.isoformat()))
     conn.commit()
     return cur.lastrowid
 
 
 def set_gate_result(conn: sqlite3.Connection, intent_id: int, *,
-                    accepted: bool, reject_reason: str | None) -> None:
+                    accepted: bool, reject_reason: str | None,
+                    reject_category: str | None) -> None:
     conn.execute(
-        "UPDATE trade_intents SET gate_result=?, reject_reason=? WHERE id=?",
-        ("accepted" if accepted else "rejected", reject_reason, intent_id))
+        "UPDATE trade_intents SET gate_result=?,reject_reason=?,"
+        "reject_category=? WHERE id=?",
+        ("accepted" if accepted else "rejected", reject_reason,
+         reject_category, intent_id))
     conn.commit()
 
 

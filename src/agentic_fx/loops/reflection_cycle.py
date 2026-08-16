@@ -38,7 +38,7 @@ from agentic_fx.loops.mission_finalize import finalize_mission
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.prompts_loader import load_prompt
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
-from agentic_fx.store import missions, reflections
+from agentic_fx.store import missions, reflection_attempts, reflections
 from agentic_fx.store.rag import Rag
 
 _log = logging.getLogger("agentic_fx.reflection")
@@ -62,6 +62,30 @@ class ReflectionCycle:
         self._core_lock = core_lock
         self.watch = watch if watch is not None else MissionWatch()
 
+    def _consume_attempt(self, order_id: int, reason: str | None) -> None:
+        """失敗台帳を 1 消費し、上限到達なら abandon activity を書く
+        (レビュー 1 周目 F1)。挙動は Task 15 導入時の bump+abandon 3 箇所
+        と完全に同じ (この private メソッドはそれを 1 箇所へ集約しただけ)。
+        `core_lock` は呼び出し側で保持済みであること前提にはしない —
+        ここで取得する (呼び出し site はどこも既に lock 外から呼ぶため)。
+
+        (2 周目 /code-review G2) 判定は `>=` (`==` ではなく) — 抽出 SQL の
+        `attempts < :max` により通常は等価だが、`max_attempts` を運用中に
+        下げると、既に attempts ≥ 新 max の order は抽出から外れる
+        (abandoned activity は書かれない) — `reflect retry <id>` で復帰できる。"""
+        with self._core_lock:
+            attempts = reflection_attempts.bump(
+                self.conn, order_id, now=self.clock.now(), reason=reason)
+        if attempts >= self.settings.reflection.max_attempts:
+            try:
+                self.activity.write(
+                    Category.AGGREGATE, "reflection_abandoned",
+                    f"order_id={order_id} attempts={attempts}",
+                    ref_id=str(order_id))
+            except Exception:  # noqa: BLE001
+                _log.exception(
+                    "failed to record reflection_abandoned for #%s", order_id)
+
     def run_pending(self, max_items: int = 3) -> int:
         """Reflect on closed orders without reflection. Per-item isolation.
 
@@ -73,10 +97,17 @@ class ReflectionCycle:
         """
         with self._core_lock:
             rows = self.conn.execute(
-                "SELECT o.* FROM orders o LEFT JOIN reflections r "
-                "ON r.order_id = o.id WHERE o.status='closed' "
-                "AND r.order_id IS NULL ORDER BY o.id LIMIT ?",
-                (max_items,)).fetchall()
+                "SELECT o.* FROM orders o "
+                "LEFT JOIN reflections r ON r.order_id=o.id "
+                # `ORDER BY o.id` は設計書 D1 が明示的に据え置くと決めた条件。
+                # 変えないこと (着手前検証 2026-08-15: この削除変異は黒箱テストでは
+                # 殺せない — 順序は実行計画依存。規約としてここに残す)。
+                "LEFT JOIN reflection_attempts a ON a.order_id=o.id "
+                "WHERE o.status='closed' AND r.order_id IS NULL "
+                "AND (a.attempts IS NULL OR a.attempts < :max) "
+                "ORDER BY o.id LIMIT :limit",
+                {"max": self.settings.reflection.max_attempts, "limit": max_items},
+            ).fetchall()
         created = 0
         for row in rows:
             try:
@@ -184,6 +215,13 @@ class ReflectionCycle:
                     _log.exception(
                         "failed to record reflection_mission_failed for #%s",
                         row["id"])
+                # ↓ここから挿入 (プラン 9 Task 15、設計書 D1)
+                # 失敗を台帳へ刻む — `_consume_attempt` (レビュー 1 周目 F1)。
+                # ここは **Mission 自体の失敗**であり、`finalize_ok` の成否に
+                # 関係なく消費する (F2: completed かつ finalize 失敗の場合の
+                # み消費しない — 下の複合ガードはそのまま温存する)。
+                self._consume_attempt(row["id"], result.reason)
+                # ↑ここまで挿入
 
             if result.status != "completed" or not finalize_ok:
                 # finish 失敗時は監査未確定 (missions 行が running のまま) なので
@@ -191,10 +229,15 @@ class ReflectionCycle:
                 # 無いので次周期の run_pending が同じ order を再試行する
                 return False
 
-            if not isinstance(result.output, dict):
-                return False
-            content = result.output.get("content")
+            # ↓Task 15 検証 ③ (2026-08-15): 不正 output も試行を消費する。
+            # `completed` だが output が dict でない / content が str でない
+            # のは「使えない出力」であり、恒久的に同じ出力を返す runner /
+            # model の故障では無制限再試行が残る。上の 2 ガードを 1 本へ
+            # 併合し、bump site を 1 箇所に保つ。
+            content = (result.output.get("content")
+                       if isinstance(result.output, dict) else None)
             if not isinstance(content, str):
+                self._consume_attempt(row["id"], "malformed output")
                 return False
 
             # RAG → SQLite order (SQLite row is completion marker)。RAG 書込は
@@ -217,10 +260,17 @@ class ReflectionCycle:
                     _log.exception(
                         "failed to record reflection_rag_failed for #%s",
                         row["id"])
+                # ↓ここから挿入 (プラン 9 Task 15、設計書 D1)
+                # RAG 書込失敗も再試行を消費する (`_consume_attempt` —
+                # レビュー 1 周目 F1) — 「completed だから無料」にすると
+                # 恒久的な RAG 障害で無制限再試行が復活する。
+                self._consume_attempt(row["id"], "rag.add_reflection failed")
+                # ↑ここまで挿入
                 return False
 
             with self._core_lock:
                 reflections.save(self.conn, row["id"], content, now)
+                reflection_attempts.clear(self.conn, row["id"])
             try:
                 self.activity.write(
                     Category.AGGREGATE, "reflection_created",
@@ -231,10 +281,36 @@ class ReflectionCycle:
                                row["id"])
             return True
         finally:
-            # **(レビュー 1 周目 F1)** prepare 成功後 (`mid` 発行済み) の
-            # 想定外例外 (watch.begin/end 等) で mission が running のまま
-            # 残らないようにする (TradeLoop の finally と同じ形 — Task 15)。
-            if mid is not None and not finalized:
+            # (2 周目 /code-review G1) prepare 段 (payload_json の解釈・prompt
+            # 読込) の例外で mission 発行前に抜けた場合も試行を消費する —
+            # 消費しないと per-item isolation に握られて毎周期再抽出され、
+            # max_items 枠を永久占有する (LLM は呼ばれないが後続 order の
+            # starvation になる)。prompt ファイル欠落のような全 order 共通の
+            # 障害では max_attempts 周期で全 order が abandon される —
+            # 復旧後は `reflect retry <id>` で個別に戻す。
+            if mid is None:
+                try:
+                    self._consume_attempt(row["id"], "aborted in prepare")
+                except Exception:  # noqa: BLE001
+                    _log.exception(
+                        "failed to consume attempt for #%s", row["id"])
+            elif not finalized:
+                # **(レビュー 1 周目 F1)** prepare 成功後 (`mid` 発行済み) の
+                # 想定外例外 (watch.begin/end 等) で mission が running のまま
+                # 残らないようにする (TradeLoop の finally と同じ形 — Task 15)。
                 with self._core_lock:
                     finalize_mission(self.conn, self.activity, self.clock,
                                      mid, MissionResult("failed", None, []))
+                # (Task 15) 台帳へ刻む — `_consume_attempt`。想定外例外で
+                # finalize_mission に一度も到達しなかった経路 (watch.end が
+                # 例外を投げ続ける等) は、上の 3 箇所の bump がどれも通ら
+                # ないまま fail-closed で mission を終端するだけだった。
+                # 台帳が進まないと LLM 呼出しを伴う Mission が無制限に
+                # 再試行され続ける — 例外中なのでこの消費自体の失敗も
+                # 隔離する。
+                try:
+                    self._consume_attempt(row["id"], "aborted before finalize")
+                except Exception:  # noqa: BLE001
+                    _log.exception(
+                        "failed to consume attempt in outer finally for #%s",
+                        row["id"])

@@ -303,3 +303,67 @@ def test_cache_retention_days_defaults_to_30():
 def test_cache_retention_days_must_be_positive(tmp_path):
     with pytest.raises(ConfigError, match="cache_retention_days"):
         load_settings(_with_datafeed(tmp_path, cache_retention_days=0))
+
+
+def test_reflection_and_alert_defaults_from_example():
+    s = load_settings(EXAMPLE)
+    assert s.reflection.max_attempts == 2
+    assert s.alert.consecutive_gate_reject == 10
+
+
+def test_reflection_max_attempts_must_be_at_least_one():
+    """Task 15: `ge=1` を落とすと `max_attempts: 0` が通り、抽出条件
+    `a.attempts < 0` により **どの order も一度も振り返られなくなる**
+    (無効化キーが増える)。設計書 D1 は上限の下限を 1 に固定する。"""
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["reflection"] = {"max_attempts": 0}
+    with pytest.raises(ValidationError):
+        Settings.model_validate(raw)
+
+
+def test_alert_consecutive_gate_reject_must_be_at_least_one():
+    """Task 17: `ge=1` を落とすと `consecutive_gate_reject: 0` が通り、
+    却下が 1 本も無くても閾値を満たしてしまう (`count < 0` が常に偽) ため
+    **区間ごとに必ず 1 通の誤通知**が出る。`reflection.max_attempts` 側と
+    対称に下限を pin する (レビュー 1 周目 ローカル LLM)。"""
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["alert"] = {"consecutive_gate_reject": 0}
+    with pytest.raises(ValidationError):
+        Settings.model_validate(raw)
+
+
+@pytest.mark.parametrize("section,key", [
+    ("reflection", "max_attempts"), ("alert", "consecutive_gate_reject")])
+def test_nested_unknown_key_rejected(section, key):
+    """`ReflectionSettings` / `AlertSettings` の `_Strict` 継承の pin
+    (レビュー 1 周目 ローカル LLM)。`test_unknown_top_level_key_rejected` は
+    トップレベルしか見ないため、これらが `_Strict` を外しても生き残る。
+    外れると **設定キーの打ち間違いが黙って既定値で動く**。"""
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw[section] = {key: 2, "typo_key": 1}
+    with pytest.raises(ValidationError):
+        Settings.model_validate(raw)
+
+
+def test_every_nested_settings_type_forbids_unknown_keys():
+    """入れ子設定型の `_Strict` 継承の pin (レビュー 2 周目 ローカル LLM)。
+    `test_nested_unknown_key_rejected` は reflection / alert の 2 セクション
+    しか見ないため、**それ以外の設定型が `_Strict` を外しても** 全テストが
+    緑のまま通る (実測: `DatafeedSettings` / `ScheduleSettings` はフルスイート
+    2066 passed のまま生存)。外れると **設定キーの打ち間違いが黙って既定値で
+    動く** — 打ち間違えた側は「設定した」と思い込む。"""
+    import inspect
+
+    from pydantic import BaseModel
+
+    from agentic_fx import config as cfg
+
+    types = [o for _, o in inspect.getmembers(cfg, inspect.isclass)
+             if issubclass(o, BaseModel) and o.__module__ == cfg.__name__]
+    assert len(types) >= 10, types
+    loose = [t.__name__ for t in types
+             if t.model_config.get("extra") != "forbid"]
+    assert loose == [], f"未知キーを拒否しない設定型: {loose}"

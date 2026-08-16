@@ -99,3 +99,9 @@ worker:                        # mission worker (プラン8) の resource limit�
   rpc_timeout_sec: 15             # RAG RPC の親側応答待ち上限
   shutdown_join_timeout_sec: 30   # 停止シーケンスの join 上限
   snapshot_max_age_sec: 10        # commit-pre スナップショットの許容鮮度 (秒)。超過は発注拒否 (lock内再取得しない)
+
+reflection:                    # reflection cycle の再試行ポリシー (プラン9 Task15)。省略可
+  max_attempts: 2               # 同一 order の reflection 再試行上限。到達で abandon (reflect retry <id> で復帰)
+
+alert:                         # 運用アラート (プラン9 Task17)。省略可
+  consecutive_gate_reject: 10   # risk gate の連続 rejection がこの本数に達したら一度だけ通知

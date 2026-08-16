@@ -435,7 +435,8 @@ class Executor:
         """
         now = self.clock.now()
         iid = intents_store.insert(self.conn, mission_id,
-                                   _intent_payload(intent), now)
+                                   _intent_payload(intent), now,
+                                   action=intent.action.value)
         if intent.action is Action.HOLD:
             self.activity.write(Category.AGGREGATE, "hold",
                                 intent.reasoning[:120], ref_id=str(iid))
@@ -449,7 +450,8 @@ class Executor:
         if intent.origin is not Origin.SCHEDULER:
             reasons = ["origin rejected: only scheduler missions may trade"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason="; ".join(reasons))
+                                          reject_reason="; ".join(reasons),
+                                          reject_category="origin")
             self.activity.write(Category.TRADE, "origin_rejected",
                                 f"{intent.action.value} from {intent.origin.value}",
                                 ref_id=str(iid))
@@ -459,7 +461,8 @@ class Executor:
         if loop != "trade":
             reasons = [f"mission rejected: loop={loop!r} is not a trade mission"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason="; ".join(reasons))
+                                          reject_reason="; ".join(reasons),
+                                          reject_category="mission")
             self.activity.write(Category.TRADE, "mission_rejected",
                                 f"{intent.action.value} from mission "
                                 f"#{mission_id} (loop={loop!r})", ref_id=str(iid))
@@ -490,7 +493,8 @@ class Executor:
         if account is None:
             reasons = ["no fresh account snapshot (fail closed)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="risk_gate")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
@@ -507,7 +511,8 @@ class Executor:
         except DataUnhealthy as e:
             reasons = [f"conversion rate unavailable: {safe_error_text(e)}"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="risk_gate")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
@@ -532,7 +537,8 @@ class Executor:
         result = evaluate(intent, ctx, self.settings.risk)
         if not result.accepted:
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason="; ".join(result.reasons))
+                                          reject_reason="; ".join(result.reasons),
+                                          reject_category="risk_gate")
             if any("kill switch" in r and "latched" not in r
                    for r in result.reasons):
                 self.state.update(kill_switch_latched=True)
@@ -544,7 +550,8 @@ class Executor:
                     "reasons": result.reasons}
 
         intents_store.set_gate_result(self.conn, iid, accepted=True,
-                                      reject_reason=None)
+                                      reject_reason=None,
+                                      reject_category=None)
         is_market = intent.entry_type.value == "market"
         now = ctx.now
         oid = orders.insert(
@@ -698,7 +705,8 @@ class Executor:
                 f"{max_snapshot_age_sec}s) — rejecting rather than "
                 "re-fetching while holding core_lock (設計書 §3.1)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="execution")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
@@ -707,7 +715,8 @@ class Executor:
         if account is None:
             reasons = ["no fresh account snapshot (fail closed)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="risk_gate")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
@@ -721,7 +730,8 @@ class Executor:
             # した。lock 内で再取得せず intent 拒否 (次周期の判断へ送る)。
             reasons = [f"execution snapshot coverage error: {e}"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="execution")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
@@ -742,7 +752,8 @@ class Executor:
             reasons = [f"pair {intent.pair!r} is not covered by the execution "
                        "snapshot (N4-2)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="execution")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
@@ -755,7 +766,8 @@ class Executor:
             reasons = [f"currency for pair {intent.pair!r} is not covered "
                        "by the execution snapshot (N4-2)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="execution")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
@@ -829,13 +841,15 @@ class Executor:
         if row is None or row["status"] != S.OPEN.value:
             reasons = [f"order {intent.order_id} is not open"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="execution")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
                     "reasons": reasons}
         intents_store.set_gate_result(self.conn, iid, accepted=True,
-                                      reject_reason=None)
+                                      reject_reason=None,
+                                      reject_category=None)
         quote = self.quote_fn(row["pair"])
         price = quote.bid if row["direction"] == "long" else quote.ask
         final = self.close_order(row, price, reason="llm_close")
@@ -948,7 +962,8 @@ class Executor:
         if row is None or row["status"] != S.OPEN.value:
             reasons = [f"order {intent.order_id} is not open"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="execution")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
@@ -959,7 +974,8 @@ class Executor:
                 "commit-pre time) — rejecting rather than re-fetching "
                 "while holding core_lock (設計書 §3.1)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="execution")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
@@ -971,20 +987,23 @@ class Executor:
                 f"{max_snapshot_age_sec}s) — rejecting rather than "
                 "re-fetching while holding core_lock (設計書 §3.1)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="execution")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
                     "reasons": reasons}
         intents_store.set_gate_result(self.conn, iid, accepted=True,
-                                      reject_reason=None)
+                                      reject_reason=None,
+                                      reject_category=None)
         try:
             final = self.close_order_from_snapshot(row, snapshot, reason="llm_close")
         except SnapshotCoverageError as e:
             # A1: pair チェック失敗など、snapshot の同一性が確認できない
             reasons = [f"close snapshot coverage error: {e}"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="execution")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
@@ -1023,13 +1042,15 @@ class Executor:
         if row is None or row["status"] != S.PENDING_FILL.value:
             reasons = [f"order {intent.order_id} is not pending_fill"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0])
+                                          reject_reason=reasons[0],
+                                          reject_category="execution")
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": intent.order_id,
                     "reasons": reasons}
         intents_store.set_gate_result(self.conn, iid, accepted=True,
-                                      reject_reason=None)
+                                      reject_reason=None,
+                                      reject_category=None)
         final = self.cancel_order(row, reason="llm_cancel")
         result = "cancelled" if final == S.CANCELLED else "unknown"
         return {"result": result, "order_id": row["id"], "reasons": []}

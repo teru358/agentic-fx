@@ -88,7 +88,8 @@ def _start_trade_mission(conn) -> int:
 
 
 def _insert_intent(conn, mid: int, intent: TradeIntent) -> int:
-    return intents_store.insert(conn, mid, _intent_payload(intent), NOW)
+    return intents_store.insert(conn, mid, _intent_payload(intent), NOW,
+                                action=intent.action.value)
 
 
 def _open_intent(pair="USDJPY", origin=Origin.SCHEDULER, **over) -> TradeIntent:

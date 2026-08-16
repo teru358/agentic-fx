@@ -140,6 +140,14 @@ class DatafeedSettings(_Strict):
         return self
 
 
+class ReflectionSettings(_Strict):
+    max_attempts: int = Field(ge=1, default=2)
+
+
+class AlertSettings(_Strict):
+    consecutive_gate_reject: int = Field(ge=1, default=10)
+
+
 class NewsSettings(_Strict):
     cleanup_hours: int = Field(gt=0)
 
@@ -281,6 +289,8 @@ class Settings(_Strict):
     paper: PaperSettings
     plugin: PluginSettings = Field(default_factory=PluginSettings)
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
+    reflection: ReflectionSettings = Field(default_factory=ReflectionSettings)
+    alert: AlertSettings = Field(default_factory=AlertSettings)
 
     @field_validator("display_timezone")
     @classmethod

@@ -1,4 +1,4 @@
-"""SQLite 接続 + 15 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
+"""SQLite 接続 + 16 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
 `ohlcv` は含まない) — 設計書 §12。"""
 from __future__ import annotations
 
@@ -51,6 +51,43 @@ CREATE TABLE IF NOT EXISTS improvement_runs (
 );
 """
 
+# プラン 9 Task 17 (設計書 D3): `action` / `reject_category` を持つ
+# trade_intents。**fresh (_SCHEMA) と migration (rebuild) が同一本文を
+# 参照する** — 束 D (_SIGNALS_V2_DDL) と同じ規約。`name` / `ine` だけを
+# 差し替える。
+_TRADE_INTENTS_DDL = """
+CREATE TABLE {ine}{name} (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mission_id INTEGER NOT NULL REFERENCES missions(id),
+  payload_json TEXT NOT NULL,
+  action TEXT,                   -- open | close | cancel | hold (NULL = 移行前の行)
+  gate_result TEXT,              -- accepted | rejected (NULL = 未判定)
+  reject_reason TEXT,
+  reject_category TEXT,          -- risk_gate | origin | mission | execution
+  created_at TEXT NOT NULL,
+  -- `action IS NULL` は移行前の行を対象外にする意図の明示である。
+  -- **SQL の NULL 意味論により、この節が無くても legacy 行は通る**
+  -- (`reject_category` が NULL のとき `NULL IN (...)` は NULL、
+  --  SQLite は CHECK 結果が NULL の行を受理する — 着手前検証 2026-08-15 で
+  --  実測)。したがって「この節を外す」変異は**原理的に殺せない**が、
+  -- 契約の文書化として残す (Step 5 の変異表に「受容」と明記)。
+  --
+  -- **同じ NULL 意味論が rejected 枝にも効く (レビュー 1 周目 ローカル LLM
+  -- 3 モデル一致、2026-08-16 修正)。** `reject_category IS NOT NULL` を
+  -- 明示しないと `NULL IN (...)` が NULL を返し `TRUE AND NULL` も NULL
+  -- になるため、SQLite は CHECK 結果 NULL の行を受理し
+  -- `('rejected', NULL)` の組が素通りしてしまう。`action IS NULL` 節と
+  -- 同じ三値意味論 (NULL は TRUE でも FALSE でもない) が原因であり、
+  -- `IS NOT NULL` を足すと `FALSE AND NULL` = FALSE に確定して弾ける。
+  CHECK (action IS NULL
+         OR gate_result IS NULL
+         OR (gate_result='accepted' AND reject_category IS NULL)
+         OR (gate_result='rejected' AND reject_category IS NOT NULL
+             AND reject_category IN
+             ('risk_gate','origin','mission','execution')))
+);
+"""
+
 _OHLCV_CACHE_DDL = """
 CREATE TABLE IF NOT EXISTS ohlcv_cache (
   symbol TEXT NOT NULL, interval TEXT NOT NULL, bar_time TEXT NOT NULL,
@@ -81,14 +118,7 @@ CREATE TABLE IF NOT EXISTS missions (
   output_json TEXT, transcript_json TEXT,
   started_at TEXT NOT NULL, finished_at TEXT
 );
-CREATE TABLE IF NOT EXISTS trade_intents (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  mission_id INTEGER NOT NULL REFERENCES missions(id),
-  payload_json TEXT NOT NULL,
-  gate_result TEXT,              -- accepted | rejected (NULL = 未判定)
-  reject_reason TEXT,
-  created_at TEXT NOT NULL
-);
+""" + _TRADE_INTENTS_DDL.format(name="trade_intents", ine="IF NOT EXISTS ") + """
 CREATE TABLE IF NOT EXISTS orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   intent_id INTEGER REFERENCES trade_intents(id),
@@ -110,6 +140,17 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE TABLE IF NOT EXISTS reflections (
   order_id INTEGER PRIMARY KEY REFERENCES orders(id),
   content TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reflection_attempts (
+  order_id INTEGER PRIMARY KEY REFERENCES orders(id),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT NOT NULL,
+  last_reason TEXT
+);
+CREATE TABLE IF NOT EXISTS alert_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS account_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,7 +232,8 @@ TABLE_NAMES = frozenset({
     "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
-    "backtest_runs", "analysis_runs", "signals",
+    "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
+    "alert_state",
 })
 
 
@@ -755,6 +797,121 @@ def _migrate_improvement_runs_v2(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
+    """trade_intents に action / reject_category 列と CHECK を足す table
+    rebuild (設計書 D3、プラン9 Task 17)。
+
+    **`trade_intents` は `orders.intent_id` から参照される側**なので RENAME
+    先行は禁止 — SQLite は RENAME 時に `orders` の DDL 中の参照名まで書き換える
+    (実測: `REFERENCES "trade_intents_v1"(id)` になる)。順序は
+    「新名で CREATE → コピー → 旧表 DROP → 新表を本来名へ RENAME」。
+
+    **`PRAGMA foreign_keys=OFF` が必須である (着手前検証 2026-08-15 — 実測)**。
+    `orders` に子行が 1 件でもあると FK=ON 下の `DROP TABLE trade_intents` は
+    `IntegrityError: FOREIGN KEY constraint failed` で落ちる。トグルは
+    `BEGIN` の**外側**に置く (SQLite はトランザクション開始後の変更を無視する
+    — `_migrate_signals_fk` と同じ規約)。成功・失敗を問わず finally で ON へ
+    戻す。
+
+    束 D 規約に合わせ、冪等ガードを通過した (= 実際に rebuild が走る) 場合に
+    のみ `_backup_before_migration` でスナップショットを取り、行数一致ガードと
+    `PRAGMA foreign_key_check` (**DB 全体** — trade_intents は参照される側
+    なので自身の FK だけ見ても `orders.intent_id` の宙吊りを検出できない) を
+    かけてからコミットする。
+
+    **冪等ガードは 2 段**である (外側 early-return + BEGIN 内の再検査)。
+    2 回目の rebuild は `INSERT ... SELECT ... NULL AS action` なので、
+    ガードが効かないと**既に書かれた action / reject_category を全消去する**
+    (`test_repeated_init_db_does_not_wipe_action_and_category` が守る)。
+
+    **(レビュー 1 周目 F5)** 「rebuild が必要か」と「`trade_intents_new`
+    残骸が残っているか」は別の判定である。旧実装は 2 つを 1 つの bool へ
+    束ねていたため、**列は既に揃っているのに残骸だけが残っている**状態
+    (rebuild 済みの別接続がロールバック等で `trade_intents_new` を消し
+    忘れた場合) でも rebuild 分岐へ入ってしまい、`INSERT ... SELECT ...
+    NULL AS action` が**揃っている `action`/`reject_category` を NULL 化
+    する** (`test_leftover_new_table_does_not_trigger_destructive_rebuild`
+    が守る)。列が揃っている場合は残骸の `DROP TABLE` だけを行い、rebuild
+    へは進まない。外側・内側の 2 段ガードは同じ `_needs_rebuild()` /
+    `_has_leftover_new_table()` の組を使う。
+
+    **本修正 (2026-08-16、レビュー 1 周目) 以前に移行済みの DB は弱い
+    CHECK のまま残る**(冪等ガードは列の有無しか見ない)。`_needs_rebuild()`
+    は `{"action", "reject_category"} <= cols` しか見ないため、旧 CHECK
+    本文 (`reject_category IS NOT NULL` を欠く版) で一度 rebuild を通した
+    DB は外側 early-return で抜け、SQLite が表ごとに保存している旧 DDL
+    文字列をそのまま保持し続ける。Task 17 は本修正時点で未 merge のため
+    該当 DB は存在しない — 将来 CHECK 本文を変える場合は
+    `sqlite_master.sql` 判定で rebuild を強制する必要がある。
+    """
+    def _needs_rebuild() -> bool:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(trade_intents)")}
+        return not ({"action", "reject_category"} <= cols)
+
+    def _has_leftover_new_table() -> bool:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='trade_intents_new'").fetchone() is not None
+
+    if not _needs_rebuild() and not _has_leftover_new_table():
+        return
+
+    if not _needs_rebuild():
+        # 列は揃っているが `trade_intents_new` が残骸として残っている
+        # (レビュー 1 周目 F5) — rebuild はせず、残骸だけ DROP する。
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not _needs_rebuild() and _has_leftover_new_table():
+                conn.execute("DROP TABLE trade_intents_new")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return
+
+    _backup_before_migration(conn, ".bak-trade-intents-observability")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # ロック取得までの間に別接続が移行を完了させていないか再検査。
+            if not _needs_rebuild():
+                conn.commit()
+                return
+            if _has_leftover_new_table():
+                conn.execute("DROP TABLE trade_intents_new")
+            old_count = conn.execute(
+                "SELECT COUNT(*) c FROM trade_intents").fetchone()["c"]
+            # executescript は暗黙 commit し得るため migration transaction 内では使わない。
+            conn.execute(_TRADE_INTENTS_DDL.format(
+                name="trade_intents_new", ine=""))
+            conn.execute(
+                "INSERT INTO trade_intents_new "
+                "(id,mission_id,payload_json,action,gate_result,reject_reason,"
+                "reject_category,created_at) "
+                "SELECT id,mission_id,payload_json,NULL,gate_result,reject_reason,"
+                "NULL,created_at FROM trade_intents")
+            new_count = conn.execute(
+                "SELECT COUNT(*) c FROM trade_intents_new").fetchone()["c"]
+            if new_count != old_count:
+                raise RuntimeError(
+                    "trade_intents migration: 行数が一致しません "
+                    f"(旧={old_count}, 新={new_count})")
+            conn.execute("DROP TABLE trade_intents")
+            conn.execute("ALTER TABLE trade_intents_new RENAME TO trade_intents")
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(
+                    "trade_intents migration: 移行後に FK 違反が残っています "
+                    f"({len(violations)} 行): {[dict(v) for v in violations]}")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     if _ohlcv_legacy_exists(conn):
@@ -768,4 +925,5 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "missions", "trigger", "trigger TEXT")
     _migrate_signals_fk(conn)           # Task 13
     _migrate_improvement_runs_v2(conn)  # Task 19 (追加するのはこの 1 行だけ)
+    _migrate_trade_intents_observability(conn)   # Task 17
     conn.commit()

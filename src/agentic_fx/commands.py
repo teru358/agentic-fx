@@ -9,7 +9,8 @@ from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
-from agentic_fx.store import approvals, missions, orders
+from agentic_fx.store import (approvals, missions, orders,
+                              reflection_attempts, reflections)
 from agentic_fx.store.approvals import AlreadyDecidedError
 from agentic_fx.store.state import StateStore
 
@@ -20,6 +21,7 @@ _HELP = """コマンド一覧:
   ask <質問>                  臨時 Mission (回答専用 — 発注はしない)
   approve <id> / reject <id> [理由]   承認操作
   killswitch reset           kill switch ラッチの解除 (人間の明示操作)
+  reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
   stop                       graceful shutdown (シェルのみ)
 (Phase 2 で追加: policy add / improve / news / model / mode / autopilot)"""
 
@@ -75,6 +77,33 @@ class Commands:
                 self.activity.write(Category.SYSTEM, "kill_switch_reset",
                                     "human explicit reset via shell")
                 return "kill switch ラッチを解除しました"
+            if cmd == "reflect" and len(args) == 2 and args[0] == "retry":
+                order_id = int(args[1])
+                order = orders.get(self.conn, order_id)
+                if order is None:
+                    raise ValueError(f"order #{order_id} does not exist")
+                # F3 (レビュー 1 周目 codex Minor-3): 存在チェックだけでは、
+                # まだ open な order や既に reflection 済みの order にも
+                # 「戻しました」という誤った成功メッセージを返してしまう
+                # (どちらも run_pending の抽出対象外で、台帳を触っても
+                # 無意味)。
+                status = order["status"]
+                if status != "closed":
+                    raise ValueError(
+                        f"order #{order_id} は closed ではありません "
+                        f"(status={status})")
+                if reflections.get(self.conn, order_id) is not None:
+                    raise ValueError(
+                        f"order #{order_id} は既に reflection 済みです")
+                had_attempt = reflection_attempts.attempts_of(
+                    self.conn, order_id) > 0
+                reflection_attempts.clear(self.conn, order_id)
+                self.activity.write(Category.SYSTEM, "reflection_requeued",
+                                    f"order_id={order_id} via shell",
+                                    ref_id=str(order_id))
+                suffix = "" if had_attempt else " (台帳に試行記録なし)"
+                return (f"order #{order_id} を reflection 再試行対象へ"
+                       f"戻しました{suffix}")
         except AlreadyDecidedError:
             return "その approval は決定済みです"
         except (ValueError, KeyError) as e:
