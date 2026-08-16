@@ -1,7 +1,7 @@
 # Phase 2 プラン 10 設計書: ClaudeRunner + CodexRunner + 戦略改善 loop
 
 - 日付: 2026-08-16 (初版)
-- ステータス: **レビュー待ち** (CLAUDE.md 規約 — 了承を得てから実装計画の執筆に進む)
+- ステータス: **ユーザー承認済み (2026-08-16)、codex 設計レビュー反復中**
 - 準拠: 本体設計書 **改訂第 17 版** (`c2355e8`) / 分解書 `2026-08-01-phase2-decomposition.md` (2026-08-11 改訂) / プラン 9 設計書 `2026-08-11-phase2-9-foundation-design.md` §1 D6・§5
 - 前提: プラン 9 完了 + テスト isolation 遮断 (main `410501f`, 2071 passed / 1 deselected)
 - 実測入力: `.superpowers/sdd/plan10-design/probe-runner-feasibility-report.md` (2026-08-16、opus probe。以下「probe」)、`code-state-map.md` (同日のコード現状地図)
@@ -443,6 +443,7 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 プラン 9 §6 から引き継ぎ: 外向きリクエスト予算の**全体**設計 (Global Constraints 化・共通出口・datafeed 4 経路・Discord) / `missions.failure_reason` / worker 診断タスク (result フレーム 5 箇所の `error` を親へ) / **improve モデルの `/models` 存在確認** (backend=local の improve が本プランで初めて実ツールを持つ — 実装計画で warn-only の扱いを決めてよい) / plugin `max_bars` × cache 保持期間 / SSE error event / `ohlcv_cache` の物理分離 / キャッシュ→履歴の昇格 / ヘッジ併存。プラン 9 束 D/E から: `Notifier.send` の成功戻り値契約 / `trade_intents` の保持・prune / `reject_category` の StrEnum 化 / db.py の table rebuild 骨格重複 / `_backup_before_migration` のログ文言。
 
 本プランで新規:
+- **代替ローカルハーネス候補 (Qwen Code / Aider / OpenCode / Goose)** — 「ローカル LLM でハーネスを回す」目的は codex+llama-swap で満たす方針だが、実機 E2E (§7-8) で codex+llama-swap の plugin 実装力が不足と出たら、Qwen Code (qwen3.x 系の本家ハーネス、モデル相性) / Aider (弱いモデル向けの編集形式で成熟) / OpenCode / Goose を **4 番目の backend 候補として実測**する。§1 の `CliRunner` は「CLI 起動 → JSON 回収」の共通基盤なので追加コストは argv・出力形式・認証の差分に限られる。版・機能・ライセンスは採用検討時に実測で確認 (2026-08-16 ユーザー希望で起票)
 - **claude → ローカル LLM 駆動** (R9): 要実測 (llama-swap が Anthropic 形式を受けるか) / 鍵契約の言い換え (「課金エンドポイントへの鍵は渡さない」) / 規約確認。E2E で codex+llama-swap が不足と分かったら再訪
 - `--disable apps` が codex の chatgpt.com egress を止めるかの検証 (止まらなければ config key を探す)
 - claude を本番 rlimit (`fsize 8MB`) 下で実ターン (probe 未測)
