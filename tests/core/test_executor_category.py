@@ -325,3 +325,33 @@ def test_every_set_gate_result_site_persists_category(
     assert row is not None, f"{site} did not persist its intent"
     assert row["reject_category"] == expected
     assert row["gate_result"] == ("accepted" if expected is None else "rejected")
+
+
+def test_snapshot_at_exactly_max_age_is_not_stale(tmp_path):
+    """`age_sec > max_snapshot_age_sec` の**境界**の pin (レビュー 1 周目
+    ローカル LLM: 2 本一致)。既存の stale route は 999s vs 5s と離れており、
+    `>` → `>=` の反転が生き残る。境界を締める向きの変異は「まだ十分新しい
+    写し」を execution 却下にするため、鮮度予算の 1 tick 分を静かに失う。"""
+    for opener in (True, False):
+        ex = _make_executor(tmp_path / ("o" if opener else "c"))
+        mid = _start_trade_mission(ex.conn)
+        if opener:
+            intent = _open_intent()
+            iid = _insert_intent(ex.conn, mid, intent)
+            ex.open_from_snapshot(
+                intent, iid,
+                _open_snapshot(intent, captured_at=NOW - timedelta(seconds=5)),
+                max_snapshot_age_sec=5)
+        else:
+            row = _insert_open_order(ex.conn, "USDJPY")
+            intent = _close_intent(row["id"])
+            iid = _insert_intent(ex.conn, mid, intent)
+            ex.close_from_snapshot(
+                intent, iid,
+                _close_snapshot(row, captured_at=NOW - timedelta(seconds=5)),
+                max_snapshot_age_sec=5)
+        r = ex.conn.execute(
+            "SELECT gate_result,reject_category FROM trade_intents WHERE id=?",
+            (iid,)).fetchone()
+        assert r["gate_result"] == "accepted", f"opener={opener}: {dict(r)}"
+        assert r["reject_category"] is None

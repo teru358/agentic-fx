@@ -168,7 +168,12 @@ def test_killswitch_reset(tmp_path):
 
 def test_unknown_shows_help(tmp_path):
     _, _, _, cmds = _commands(tmp_path)
-    assert "status" in cmds.dispatch("nonsense")
+    out = cmds.dispatch("nonsense")
+    assert "status" in out
+    # help から行が落ちる退化の pin (レビュー 1 周目 ローカル LLM)。
+    # `reflect retry` は `reflection_abandoned` からの唯一の復帰手段なので、
+    # help に載っていないと運用者が辿り着けない。
+    assert "reflect retry" in out
 
 
 def test_transcript_json_not_leaked(tmp_path):
@@ -295,3 +300,38 @@ def test_reflect_retry_notes_when_no_attempt_row_existed(tmp_path):
     out = cmd.dispatch(f"reflect retry {oid}")
     assert out == (f"order #{oid} を reflection 再試行対象へ戻しました"
                    " (台帳に試行記録なし)")
+
+
+def test_reflect_retry_writes_activity(tmp_path):
+    """`reflect retry` の介入が activity に残ることの pin (レビュー 1 周目
+    ローカル LLM)。`activity.write` を消しても台帳削除の assert は通るため、
+    **人間の介入が監査に残らなくなる**変異が生き残っていた。"""
+    conn, _state, _activity, cmd = _commands(tmp_path)
+    now = cmd.clock.now()
+    conn.execute("INSERT INTO orders (pair,direction,entry_type,horizon,status,"
+                 "created_at,updated_at) VALUES ('USDJPY','long','market','day',"
+                 "'closed',?,?)", (now.isoformat(), now.isoformat()))
+    oid = conn.execute("SELECT id FROM orders").fetchone()[0]
+    from agentic_fx.store import reflection_attempts
+    reflection_attempts.bump(conn, oid, now=now, reason="boom")
+    cmd.dispatch(f"reflect retry {oid}")
+    lines = [ln for ln in (tmp_path / "logs" / "activity.log").read_text(
+        encoding="utf-8").splitlines() if "reflection_requeued" in ln]
+    assert len(lines) == 1
+    assert f"order_id={oid}" in lines[0]
+
+
+def test_reflect_retry_rejects_extra_arguments(tmp_path):
+    """`len(args) == 2` の pin (レビュー 1 周目 ローカル LLM)。`>= 2` へ
+    緩めると `reflect retry <id> <ゴミ>` を受理してしまい、打ち間違いが
+    黙って実行される。"""
+    conn, _state, _activity, cmd = _commands(tmp_path)
+    now = cmd.clock.now()
+    conn.execute("INSERT INTO orders (pair,direction,entry_type,horizon,status,"
+                 "created_at,updated_at) VALUES ('USDJPY','long','market','day',"
+                 "'closed',?,?)", (now.isoformat(), now.isoformat()))
+    oid = conn.execute("SELECT id FROM orders").fetchone()[0]
+    out = cmd.dispatch(f"reflect retry {oid} extra")
+    assert "再試行対象へ戻しました" not in out
+
+

@@ -71,10 +71,19 @@ CREATE TABLE {ine}{name} (
   --  SQLite は CHECK 結果が NULL の行を受理する — 着手前検証 2026-08-15 で
   --  実測)。したがって「この節を外す」変異は**原理的に殺せない**が、
   -- 契約の文書化として残す (Step 5 の変異表に「受容」と明記)。
+  --
+  -- **同じ NULL 意味論が rejected 枝にも効く (レビュー 1 周目 ローカル LLM
+  -- 3 モデル一致、2026-08-16 修正)。** `reject_category IS NOT NULL` を
+  -- 明示しないと `NULL IN (...)` が NULL を返し `TRUE AND NULL` も NULL
+  -- になるため、SQLite は CHECK 結果 NULL の行を受理し
+  -- `('rejected', NULL)` の組が素通りしてしまう。`action IS NULL` 節と
+  -- 同じ三値意味論 (NULL は TRUE でも FALSE でもない) が原因であり、
+  -- `IS NOT NULL` を足すと `FALSE AND NULL` = FALSE に確定して弾ける。
   CHECK (action IS NULL
          OR gate_result IS NULL
          OR (gate_result='accepted' AND reject_category IS NULL)
-         OR (gate_result='rejected' AND reject_category IN
+         OR (gate_result='rejected' AND reject_category IS NOT NULL
+             AND reject_category IN
              ('risk_gate','origin','mission','execution')))
 );
 """
@@ -825,6 +834,15 @@ def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
     が守る)。列が揃っている場合は残骸の `DROP TABLE` だけを行い、rebuild
     へは進まない。外側・内側の 2 段ガードは同じ `_needs_rebuild()` /
     `_has_leftover_new_table()` の組を使う。
+
+    **本修正 (2026-08-16、レビュー 1 周目) 以前に移行済みの DB は弱い
+    CHECK のまま残る**(冪等ガードは列の有無しか見ない)。`_needs_rebuild()`
+    は `{"action", "reject_category"} <= cols` しか見ないため、旧 CHECK
+    本文 (`reject_category IS NOT NULL` を欠く版) で一度 rebuild を通した
+    DB は外側 early-return で抜け、SQLite が表ごとに保存している旧 DDL
+    文字列をそのまま保持し続ける。Task 17 は本修正時点で未 merge のため
+    該当 DB は存在しない — 将来 CHECK 本文を変える場合は
+    `sqlite_master.sql` 判定で rebuild を強制する必要がある。
     """
     def _needs_rebuild() -> bool:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(trade_intents)")}

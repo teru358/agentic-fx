@@ -204,6 +204,22 @@ def test_trade_intents_check_rejects_invalid_gate_category_pair(tmp_path):
                   "(999,'{}','open','accepted','risk_gate','x')")
 
 
+def test_trade_intents_check_rejects_rejected_without_category(tmp_path):
+    """CHECK の rejected 枝が `reject_category IS NULL` を弾けていなかった
+    (レビュー 1 周目 ローカル LLM 3 モデル一致、§4.9)。`NULL IN (...)` は
+    NULL、`TRUE AND NULL` は NULL であり、SQLite は CHECK 結果 NULL の行を
+    受理するため、`reject_category IS NOT NULL` を明示しないと
+    `('rejected', NULL)` の組が通ってしまう。"""
+    c = connect(tmp_path / "db.sqlite")
+    init_db(c)
+    c.execute("INSERT INTO missions (id,loop,runner,model,status,started_at) "
+              "VALUES (999,'trade','local','m','completed','x')")
+    with pytest.raises(sqlite3.IntegrityError):
+        c.execute("INSERT INTO trade_intents (mission_id,payload_json,action,"
+                  "gate_result,reject_category,created_at) VALUES "
+                  "(999,'{}','open','rejected',NULL,'x')")
+
+
 def test_fresh_and_migrated_trade_intents_have_the_same_shape(tmp_path):
     """(着手前検証 2026-08-15 で追加) fresh の `_SCHEMA` 側と migration 側の
     DDL が同一契約であることの pin。**`sqlite_master.sql` の文字列比較にしては

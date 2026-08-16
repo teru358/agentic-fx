@@ -320,3 +320,29 @@ def test_reflection_max_attempts_must_be_at_least_one():
     raw["reflection"] = {"max_attempts": 0}
     with pytest.raises(ValidationError):
         Settings.model_validate(raw)
+
+
+def test_alert_consecutive_gate_reject_must_be_at_least_one():
+    """Task 17: `ge=1` を落とすと `consecutive_gate_reject: 0` が通り、
+    却下が 1 本も無くても閾値を満たしてしまう (`count < 0` が常に偽) ため
+    **区間ごとに必ず 1 通の誤通知**が出る。`reflection.max_attempts` 側と
+    対称に下限を pin する (レビュー 1 周目 ローカル LLM)。"""
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["alert"] = {"consecutive_gate_reject": 0}
+    with pytest.raises(ValidationError):
+        Settings.model_validate(raw)
+
+
+@pytest.mark.parametrize("section,key", [
+    ("reflection", "max_attempts"), ("alert", "consecutive_gate_reject")])
+def test_nested_unknown_key_rejected(section, key):
+    """`ReflectionSettings` / `AlertSettings` の `_Strict` 継承の pin
+    (レビュー 1 周目 ローカル LLM)。`test_unknown_top_level_key_rejected` は
+    トップレベルしか見ないため、これらが `_Strict` を外しても生き残る。
+    外れると **設定キーの打ち間違いが黙って既定値で動く**。"""
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw[section] = {key: 2, "typo_key": 1}
+    with pytest.raises(ValidationError):
+        Settings.model_validate(raw)

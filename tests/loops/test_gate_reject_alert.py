@@ -340,3 +340,31 @@ def test_commit_post_alert_exception_never_changes_finalized_mission_to_failed(
     _inject_alert_failure(loop, stage, monkeypatch)
     assert loop.run_once() == {"result": "hold", "order_id": None, "reasons": []}
     assert conn.execute("SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()[0] == "completed"
+
+
+def test_streak_anchor_and_dominant_ignore_non_open_intents(tmp_path):
+    """SQL ①③ の `action='open'` の pin (レビュー 1 周目 ローカル LLM)。
+    ① から落とすと **close/cancel の受理**が連続区間の起点になる
+    (executor は close/cancel でも `accepted` を書く) ため、まだ切れて
+    いない open の連続が切れたことにされ通知が止まる。③ から落とすと
+    close の却下分類が最多分類の投票に混ざり、通知文面が誤る。"""
+    c = _conn(tmp_path)
+    anchor = _intent(c, "open", "accepted", None)      # ① の正しい起点
+    _intent(c, "close", "accepted", None)              # ① が拾ってはいけない
+    _intent(c, "open", "rejected", "risk_gate")
+    _intent(c, "close", "rejected", "execution")       # ②③ が拾ってはいけない
+    assert gate_reject_streak(c) == (anchor, 1, "risk_gate")
+
+
+def test_streak_ignores_intents_without_a_gate_result(tmp_path):
+    """SQL ②③ の `gate_result='rejected'` の pin (レビュー 1 周目 ローカル LLM)。
+    落とすと **まだ判定されていない意図** (`gate_result IS NULL` — insert と
+    set_gate_result の間、および mission が落ちて判定に至らなかった行) が
+    却下として数えられ、連続却下の通知が誤爆する。③ から落とすと NULL の
+    分類が最多分類の投票に入り、文面の分類が壊れる。"""
+    c = _conn(tmp_path)
+    anchor = _intent(c, "open", "accepted", None)
+    mid = missions.start(c, "trade", "local", "test", NOW)
+    intents.insert(c, mid, {"action": "open"}, NOW, action="open")  # 未判定
+    _intent(c, "open", "rejected", "risk_gate")
+    assert gate_reject_streak(c) == (anchor, 1, "risk_gate")
