@@ -67,11 +67,16 @@ class ReflectionCycle:
         (レビュー 1 周目 F1)。挙動は Task 15 導入時の bump+abandon 3 箇所
         と完全に同じ (この private メソッドはそれを 1 箇所へ集約しただけ)。
         `core_lock` は呼び出し側で保持済みであること前提にはしない —
-        ここで取得する (呼び出し site はどこも既に lock 外から呼ぶため)。"""
+        ここで取得する (呼び出し site はどこも既に lock 外から呼ぶため)。
+
+        (2 周目 /code-review G2) 判定は `>=` (`==` ではなく) — 抽出 SQL の
+        `attempts < :max` により通常は等価だが、`max_attempts` を運用中に
+        下げると、既に attempts ≥ 新 max の order は抽出から外れる
+        (abandoned activity は書かれない) — `reflect retry <id>` で復帰できる。"""
         with self._core_lock:
             attempts = reflection_attempts.bump(
                 self.conn, order_id, now=self.clock.now(), reason=reason)
-        if attempts == self.settings.reflection.max_attempts:
+        if attempts >= self.settings.reflection.max_attempts:
             try:
                 self.activity.write(
                     Category.AGGREGATE, "reflection_abandoned",
@@ -276,10 +281,23 @@ class ReflectionCycle:
                                row["id"])
             return True
         finally:
-            # **(レビュー 1 周目 F1)** prepare 成功後 (`mid` 発行済み) の
-            # 想定外例外 (watch.begin/end 等) で mission が running のまま
-            # 残らないようにする (TradeLoop の finally と同じ形 — Task 15)。
-            if mid is not None and not finalized:
+            # (2 周目 /code-review G1) prepare 段 (payload_json の解釈・prompt
+            # 読込) の例外で mission 発行前に抜けた場合も試行を消費する —
+            # 消費しないと per-item isolation に握られて毎周期再抽出され、
+            # max_items 枠を永久占有する (LLM は呼ばれないが後続 order の
+            # starvation になる)。prompt ファイル欠落のような全 order 共通の
+            # 障害では max_attempts 周期で全 order が abandon される —
+            # 復旧後は `reflect retry <id>` で個別に戻す。
+            if mid is None:
+                try:
+                    self._consume_attempt(row["id"], "aborted in prepare")
+                except Exception:  # noqa: BLE001
+                    _log.exception(
+                        "failed to consume attempt for #%s", row["id"])
+            elif not finalized:
+                # **(レビュー 1 周目 F1)** prepare 成功後 (`mid` 発行済み) の
+                # 想定外例外 (watch.begin/end 等) で mission が running のまま
+                # 残らないようにする (TradeLoop の finally と同じ形 — Task 15)。
                 with self._core_lock:
                     finalize_mission(self.conn, self.activity, self.clock,
                                      mid, MissionResult("failed", None, []))

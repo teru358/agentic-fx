@@ -844,3 +844,72 @@ def test_malformed_output_consumes_an_attempt(tmp_path):
     ).fetchone()["c"] == 2
     text = (tmp_path / "a.log").read_text(encoding="utf-8")
     assert text.count("reflection_abandoned") == 1
+
+
+def test_prepare_failure_consumes_an_attempt(tmp_path, monkeypatch):
+    """G1 (2 周目 /code-review): payload_json の解釈や prompt 読込 (prepare 段)
+    の例外は mission 発行前 (missions.start より前) に発生するため、旧実装
+    では mid が None のまま外側 finally の `if mid is not None and not
+    finalized` に入らず、`_consume_attempt` が一度も呼ばれなかった。
+    per-item isolation (`run_pending`) がこの例外を握るので同じ order が
+    毎周期再抽出され、LLM は呼ばれないまま max_items 枠を永久占有する。"""
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [])
+    monkeypatch.setattr(
+        "agentic_fx.loops.reflection_cycle.load_prompt",
+        lambda name: (_ for _ in ()).throw(RuntimeError("prompt missing")))
+    oid = _closed_order(conn)
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert cyc.run_pending() == 0
+    assert reflection_attempts.attempts_of(conn, oid) == 2
+    text = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert text.count("reflection_abandoned") == 1
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM missions WHERE loop='reflection'"
+    ).fetchone()["c"] == 0
+
+
+def test_prepare_failure_releases_slot_for_later_orders(tmp_path):
+    """G1 (2 周目 /code-review): prepare 段の例外を消費しないと、
+    per-item isolation に握られて同じ order が毎周期再抽出され、
+    max_items 枠を永久占有して後続 order を starve させる。"""
+    from agentic_fx.store import reflection_attempts
+    conn, rag, cyc = _cycle(tmp_path, [
+        MissionResult("completed", {"content": "later"}, [])])
+    first = _closed_order(conn)
+    second = _closed_order(conn)
+    # first の intent_id を壊れた payload_json を持つ trade_intent へ向ける
+    mid = conn.execute(
+        "INSERT INTO missions (loop, runner, model, status, started_at) "
+        "VALUES ('trade', 'fake', 'fake', 'completed', ?) RETURNING id",
+        (NOW.isoformat(),)).fetchone()["id"]
+    intent_id = conn.execute(
+        "INSERT INTO trade_intents (mission_id, payload_json, created_at) "
+        "VALUES (?, '{', ?) RETURNING id",
+        (mid, NOW.isoformat())).fetchone()["id"]
+    conn.commit()
+    conn.execute("UPDATE orders SET intent_id=? WHERE id=?", (intent_id, first))
+    conn.commit()
+
+    assert cyc.run_pending(max_items=1) == 0
+    assert cyc.run_pending(max_items=1) == 0
+    assert cyc.run_pending(max_items=1) == 1
+    assert reflection_attempts.attempts_of(conn, first) == 2
+    assert reflections.get(conn, second)["content"] == "later"
+
+
+def test_consume_attempt_abandons_when_attempts_exceed_lowered_max(tmp_path):
+    """G2 (2 周目 /code-review): `_consume_attempt` の判定を `>=` にした
+    堅牢化のピン。max_attempts を運用中に下げた場合、既に attempts が
+    新 max 以上の order に対しても abandon activity が書かれることを保証
+    する (`==` のままだと通り過ぎて二度と書かれない)。"""
+    conn, rag, cyc = _cycle(tmp_path, [])
+    from agentic_fx.store import reflection_attempts
+    oid = _closed_order(conn)
+    for _ in range(3):
+        reflection_attempts.bump(conn, oid, now=NOW, reason="x")
+    assert reflection_attempts.attempts_of(conn, oid) == 3
+    cyc._consume_attempt(oid, "x")
+    text = (tmp_path / "a.log").read_text(encoding="utf-8")
+    assert text.count("reflection_abandoned") == 1
