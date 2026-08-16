@@ -346,3 +346,24 @@ def test_nested_unknown_key_rejected(section, key):
     raw[section] = {key: 2, "typo_key": 1}
     with pytest.raises(ValidationError):
         Settings.model_validate(raw)
+
+
+def test_every_nested_settings_type_forbids_unknown_keys():
+    """入れ子設定型の `_Strict` 継承の pin (レビュー 2 周目 ローカル LLM)。
+    `test_nested_unknown_key_rejected` は reflection / alert の 2 セクション
+    しか見ないため、**それ以外の設定型が `_Strict` を外しても** 全テストが
+    緑のまま通る (実測: `DatafeedSettings` / `ScheduleSettings` はフルスイート
+    2066 passed のまま生存)。外れると **設定キーの打ち間違いが黙って既定値で
+    動く** — 打ち間違えた側は「設定した」と思い込む。"""
+    import inspect
+
+    from pydantic import BaseModel
+
+    from agentic_fx import config as cfg
+
+    types = [o for _, o in inspect.getmembers(cfg, inspect.isclass)
+             if issubclass(o, BaseModel) and o.__module__ == cfg.__name__]
+    assert len(types) >= 10, types
+    loose = [t.__name__ for t in types
+             if t.model_config.get("extra") != "forbid"]
+    assert loose == [], f"未知キーを拒否しない設定型: {loose}"
