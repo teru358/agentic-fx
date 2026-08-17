@@ -1,7 +1,7 @@
 # Phase 2 プラン 10 設計書: ClaudeRunner + CodexRunner + 戦略改善 loop
 
 - 日付: 2026-08-16 (初版)
-- ステータス: **ユーザー承認済み (2026-08-16)、codex 設計レビュー 10 周 → R12 スコープ縮小反映 → 11 周目反映 (2026-08-17)、12 周目 (収束確認) 待ち**
+- ステータス: **ユーザー承認済み (2026-08-16)。codex 設計レビュー 13 周まで反映済み (2026-08-17、10 周目後に R12 でスコープ縮小)。13 周目は Critical 0 / Important 1 / Minor 3 まで収束。次: 14 周目で収束確認 → 実装計画 (writing-plans)**
 - 準拠: 本体設計書 **改訂第 17 版** (`c2355e8`) / 分解書 `2026-08-01-phase2-decomposition.md` (2026-08-11 改訂) / プラン 9 設計書 `2026-08-11-phase2-9-foundation-design.md` §1 D6・§5
 - 前提: プラン 9 完了 + テスト isolation 遮断 (main `410501f`, 2071 passed / 1 deselected)
 - 実測入力: `.superpowers/sdd/plan10-design/probe-runner-feasibility-report.md` (2026-08-16、opus probe。以下「probe」)、`code-state-map.md` (同日のコード現状地図)
