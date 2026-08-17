@@ -237,9 +237,9 @@ improve worker プロセスとその**全子孫** (claude / codex CLI・MCP シ�
 
 - worker が plugin を書ける唯一の場所は `plugins/_staging/<mission_id>/<name>/`。**稼働中の `plugins/` (live symlink・版・`.history.git`・他 Mission の staging) は worker から不可視** — 読めるのは親が prepare で作った承認済み 3 本の読取専用スナップショット (`source_snapshot_dir`、§2.2/§3.4) だけ (codex 4 周目 M1)
 - 根拠: 承認済み plugin をその場で書き換えると content_hash が承認済みハッシュと不一致になり、**承認が下りるまでその plugin は `approved_plugins()` から消える** — 週次の改善が稼働中の指標を止める。staging なら承認までは旧版が生き続ける
-- **plugin 名の正規形** (codex 1 周目 C2): `^[a-z][a-z0-9_]{0,63}$` — 単一パス成分。`.`・`..`・`/`・絶対パス・大文字・ハイフンを含まない。**出力 schema (§3.5) と親側 (§4.2-1) の両方で検証**する。候補パス `staging/<name>` と切替先 `plugins/<name>` の検査は **`resolve()` を使わない** (codex 2 周目 I1 — 承認済み plugin は symlink なので resolve すると `.versions/` 配下になり、二度と更新できなくなる): 字句上の単一成分検査 + それぞれの dirfd 基準の `lstat` / `openat(O_NOFOLLOW)` で、最終成分が **{不存在 / 通常ディレクトリ (プレーン、初回移行前) / 正規形の相対 symlink}** のどれかであることだけを見る。symlink の場合は**リンク先文字列**が `.versions/<name>/<artifact_hash>` の正規形 (`^\.versions/<同じ name>/[0-9a-f]{64}$`) に一致することを確認する (辿らない)。同じ正規形を `afx plugin bless` / `submit` の CLI と `plugin/loader.discover` にも適用する — **正規形に反する既存の plugin ディレクトリは discover が WARNING を出して skip する** (ロードされなくなる。移行は人間が rename)
+- **plugin 名の正規形** (codex 1 周目 C2): `^[a-z][a-z0-9_]{0,63}$` — 単一パス成分。`.`・`..`・`/`・絶対パス・大文字・ハイフンを含まない。**出力 schema (§3.5) と親側 (§4.2-1) の両方で検証**する。候補パス `staging/<name>` と切替先 `plugins/<name>` の検査は **`resolve()` を使わない** (codex 2 周目 I1 — 承認済み plugin は symlink なので resolve すると `.versions/` 配下になり、二度と更新できなくなる): 字句上の単一成分検査 + それぞれの dirfd 基準の `lstat` / `openat(O_NOFOLLOW)` で、最終成分が **{不存在 / 通常ディレクトリ (legacy plain) / 正規形の相対 symlink}** のどれかであることだけを見る。symlink の場合は**リンク先文字列**が `.versions/<name>/<artifact_hash>` の正規形 (`^\.versions/<同じ name>/[0-9a-f]{64}$`) に一致することを確認する (辿らない)。同じ正規形を `afx plugin bless` / `submit` の CLI と `plugin/loader.discover` にも適用する — **正規形に反する既存の plugin ディレクトリは discover が WARNING を出して skip する** (ロードされなくなる。移行は人間が rename)
 - **版ストア `plugins/.versions/` は不変** (codex 9 周目 I3): 親が作成時にディレクトリ 0500 / ファイル 0400 にする。人間が編集する場所ではない (運用ドキュメントに明記)。**discover は版ディレクトリ名 (= `artifact_hash`) と実計算の `artifact_hash` を照合し、不一致なら その版を拒否 + activity ERROR** (in-place 編集の検出。reconcile の入口でも同じ照合)
-- **人間が編集して承認したいとき (R12-(d))**: **live path `plugins/<name>` はプレーンでも symlink でも編集対象にしない**。`afx plugin materialize <name>` が live (版ディレクトリ、またはプレーン dir) を `plugins/_human/<name>/` へコピーする (既に在れば拒否。ディレクトリ 0700 / ファイル 0600。人間所有 — 自動削除しない)。編集後は `afx plugin submit --from _human <name>` (pending 承認申請) または `afx plugin bless --from _human <name>` (submit + 人間決定 approved) が**改善ループの候補と同じ経路** (§4.2-3/4 のゲート → pending 行 + 証跡 → §5 の版化・切替 → 決定) を通す。`bless <name>` (live を候補に取る形) は無い。`_human/` は `_` 先頭なので discover に列挙されず、worker の rw にも入らない。**本プラン以前の手作りプレーン plugin** も同じ: `materialize` → `_human` → `submit|bless --from _human`。初回の承認で live はプレーン dir から symlink に入れ替わり、旧 dir は `plugins/_retired/<name>-<ts>/` に退く (§5.1)
+- **人間が編集して承認したいとき (R12-(d))**: **live path `plugins/<name>` はプレーンでも symlink でも編集対象にしない**。`afx plugin materialize <name>` が live (版ディレクトリ、またはプレーン dir) を `plugins/_human/<name>/` へコピーする (既に在れば拒否。ディレクトリ 0700 / ファイル 0600。人間所有 — 自動削除しない)。編集後は `afx plugin submit --from _human <name>` (pending 承認申請) または `afx plugin bless --from _human <name>` (submit + 人間決定 approved) が**改善ループの候補と同じ経路** (§4.2-3/4 のゲート → pending 行 + 証跡 → §5 の版化・切替 → 決定) を通す。`bless <name>` (live を候補に取る形) は無い。`_human/` は `_` 先頭なので discover に列挙されず、worker の rw にも入らない。**本プラン以前の手作りプレーン plugin** も同じ: `materialize` → `_human` → `submit|bless --from _human`。ただし **live がプレーン dir のままの間は、同名候補の承認は版 + git 記録まで進んで理由 `legacy_plain_present` で pending に留まる** — 人間が `afx plugin retire <name>` を実行してから `approval retry <id>` を叩くと、切替が absent → symlink として完了する (§5.1)。**プレーン dir を自動で入れ替えることはしない** (codex 12 周目 I1)
 - **discovery は live symlink を辿った先の版ディレクトリを `PluginMeta.path` に固定し、`PluginMeta.artifact_hash` (3 本マニフェスト) も discover 時に計算して保持する** (codex 3 周目 I4 / 5 周目 M1 — source snapshot はこの `content_hash`/`artifact_hash` の両方と照合する): `discover` は `plugins/<name>` が正規形 symlink なら検証後に `.versions/<name>/<artifact_hash>` の実体パスを `PluginMeta.path` とする (プレーン dir はそのまま)。**稼働中のサービスは起動時に discover した版を再起動 (再読込) まで使い続ける** — approve による symlink 切替は**次回の起動/再読込にだけ**効く (hot reload はしない)。これにより切替中に実行中の plugin が壊れることも、`PluginMeta.path` が dangling になることも無い。pin: approve 後も起動済みサービスの sandbox が旧版パスを実行し続ける
 - **`plugin/loader.discover` の列挙条件に「先頭が `_` または `.` のディレクトリを除外」を追加する** (codex 1 周目 M3: 現行は全子ディレクトリを列挙し、3 ファイル欠落で**偶然** skip されているだけ。`_staging/`・`.versions/`・`.locks/` (§5) を予約する)。`_reject_unexpected_py_files` の走査も同様。**Task 5 の受入 pin**
 - ライフサイクル: 親が Mission 起動前に空 dir を作る → worker が書く → commit 相 (§4) でゲート (候補は**読取専用のスナップショット**として扱う) → 承認申請を出した候補は**決定まで残す** → 承認時に版ディレクトリ (`artifact_hash` キー) へコピー → git 記録 → symlink 切替 (§5、この順) → 決定 (approved / rejected / expired / invalidated) 時に削除。承認申請に至らなかった候補は commit 相の末尾で削除
@@ -264,12 +264,12 @@ improve worker プロセスとその**全子孫** (claude / codex CLI・MCP シ�
 ### 3.1 起動とレーン (R7) — 週期 1 wave・並行 N・専用接続
 
 - **起動契機と週期の CAS (codex 3 周目 I11 / 4 周目 I3・I4)**: `schedule.improve` (`weekly` / `daily`) と **`schedule.improve_at`** (`"<weekday> HH:MM"` = weekly / `"HH:MM"` = daily、表示 TZ `display_timezone`。既定 `"Sat 03:00"`)。scheduler tick は **`now` 以下で最新の scheduled occurrence** (weekly = 直近の該当曜日+時刻、daily = 直近の該当時刻。表示 TZ で計算) を求め、**その occurrence が属する period key** (weekly = occurrence の ISO 週 `YYYY-Www`、daily = occurrence の日付 `YYYY-MM-DD`) を CAS 対象にする — 「現在のカレンダー period」を先に選ばない。これにより**停止中に逃した period は起動後の最初の tick で 1 回だけ catch-up される** (最新の逃した occurrence のみ。それ以前は追わない)。**手動**: 対話シェル `improve` (M=1 の wave、**分担なし** = 全バックログを見る、period を消費しない、`improve_waves` に行を作らない)。どちらも missions 行 `loop='improve'`, `trigger` は NULL (設計書 §12 — trigger は trade 専用)
-- **wave と slot (codex 4 周目 I4 / 5 周目 I1 / 6 周目 I1 / 7 周目 I1・I2、R12 で再開機構を簡素化)**: 新テーブル `improve_waves(period_key TEXT PRIMARY KEY, created_at TEXT NOT NULL, expected INTEGER NOT NULL)` と **`improve_wave_slots(wave_period_key TEXT NOT NULL REFERENCES improve_waves(period_key), k INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('reserved','claimed','running','done','failed')), mission_id INTEGER, spawn_attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(wave_period_key, k))`**。**slot は帳簿であって再開の単位ではない** (R12-(c))。手順: ①`M = min(improve.parallel, 空きスロット数)`。**M=0 なら何も書かない** (period 非消費、次 tick で再試行) ②**1 つの短い tx** で `INSERT OR IGNORE INTO improve_waves(period_key, created_at, expected) VALUES (?, ?, M)` (`rowcount=1` = 起動権) + **同じ tx で slot 行 `k=0..M-1` を `reserved` で INSERT** — **wave 行が存在した時点で period は消費済み** (実行 0 件でも次 tick で再 CAS しない。取りこぼした period は人間の `improve` で補う) ③**3-way 起動 (7 周目 I1)**: `reserved → claimed` (§4.1 Tx-0 と同じ tx で CAS `UPDATE … SET status='claimed', mission_id=?, spawn_attempts=spawn_attempts+1 WHERE … AND status='reserved'`) → worker spawn → worker `ready` → **親が短い tx で `claimed→running` を commit** → **親が `go` フレームを送る** → worker が Mission を開始 (`go` 前は agent/ツール実行ゼロ。`go` が来なければ副作用ゼロで終了)。`running` の commit と `go` の間で親が落ちても、worker は `go` を待って終了し、slot は `running` のまま → 起動時回収で `failed` (再実行しない) — 「実行済み Mission の再実行」は起きない ④**分担は負荷分散のヒント**: 親は prepare で**そのときの** `open|observation` 集合から `id % M == k` で `allowed_backlog_ids` を計算し RunContext に入れる (**永続化しない** — codex 7 周目 I3、簡素化側)。正しさは §4.1 Tx-1 の CAS が担う (敗者 → observation)。**手動 M=1 は全 id** ⑤**終端の直積 (7 周目 I2)** — 下表 ⑥**pre-ready の失敗** (spawn 失敗 / `ready` 前 crash・timeout) は**同一プロセス内でのみ** slot を `reserved` に戻して再 claim、**`spawn_attempts` は claim ごとに +1、失敗時に `< 2` なら `reserved` (初回 + 再試行 1 回)、それ以外は `failed`** ⑦**再起動後は再開しない**: `status IN ('claimed','running')` の slot で mission が interrupted になるもの、および `reserved` のまま残った slot (`mission_id IS NULL`) は全て `failed` (period は消費済みのまま)。**`started_at`・「全 failed の wave を削除して period を返す」規則は持たない** (簡素化) ⑧`submitted` は列で持たず `status IN ('running','done','failed')` の slot 数から導出 ⑨**手動 `improve` は wave/slot 行を作らない**
+- **wave と slot (codex 4 周目 I4 / 5 周目 I1 / 6 周目 I1 / 7 周目 I1・I2、R12 で再開機構を簡素化)**: 新テーブル `improve_waves(period_key TEXT PRIMARY KEY, created_at TEXT NOT NULL, expected INTEGER NOT NULL)` と **`improve_wave_slots(wave_period_key TEXT NOT NULL REFERENCES improve_waves(period_key), k INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('reserved','claimed','running','done','failed')), mission_id INTEGER, spawn_attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(wave_period_key, k))`**。**slot は帳簿であって再開の単位ではない** (R12-(c))。手順: ①`M = min(improve.parallel, 空きスロット数)`。**M=0 なら何も書かない** (period 非消費、次 tick で再試行) ②**1 つの短い tx** で `INSERT OR IGNORE INTO improve_waves(period_key, created_at, expected) VALUES (?, ?, M)` (`rowcount=1` = 起動権) + **同じ tx で slot 行 `k=0..M-1` を `reserved` で INSERT** — **wave 行が存在した時点で period は消費済み** (実行 0 件でも次 tick で再 CAS しない。取りこぼした period は人間の `improve` で補う) ③**3-way 起動 (7 周目 I1)**: `reserved → claimed` (§4.1 Tx-0 と同じ tx で CAS `UPDATE … SET status='claimed', mission_id=?, spawn_attempts=spawn_attempts+1 WHERE … AND status='reserved'`) → worker spawn → worker `ready` → **親が短い tx で `claimed→running` を commit** → **親が `go` フレームを送る** → worker が Mission を開始 (`go` 前は agent/ツール実行ゼロ。`go` が来なければ副作用ゼロで終了)。`running` の commit と `go` の間で親が落ちても、worker は `go` を待って終了し、slot は `running` のまま → 起動時回収で `failed` (再実行しない) — 「実行済み Mission の再実行」は起きない ④**分担は負荷分散のヒント**: 親は prepare で**そのときの** `open|observation` 集合から `id % M == k` で `allowed_backlog_ids` を計算し RunContext に入れる (**永続化しない** — codex 7 周目 I3、簡素化側)。正しさは §4.1 Tx-1 の CAS が担う (敗者 → observation)。**手動 M=1 は全 id** ⑤**終端の直積 (7 周目 I2)** — 下表 ⑥**pre-ready の失敗** (spawn 失敗 / `ready` 前 crash・timeout) は**同一プロセス内でのみ** slot を `reserved` に戻して再 claim、**`spawn_attempts` は claim ごとに +1、失敗時に `< 2` なら `reserved` (初回 + 再試行 1 回)、それ以外は `failed`**。**`reserved` に戻すときは同じ tx で `mission_id=NULL` も戻す** (codex 12 周目 I3 — 戻した直後に crash すると ⑦ の起動時回収が assert する `mission_id IS NULL` を満たせず、slot が永久に非終端になる) ⑦**再起動後は再開しない**: `status IN ('claimed','running')` の slot で mission が interrupted になるもの、および `reserved` のまま残った slot (`mission_id IS NULL`) は全て `failed` (period は消費済みのまま)。**`started_at`・「全 failed の wave を削除して period を返す」規則は持たない** (簡素化) ⑧`submitted` は列で持たず `status IN ('running','done','failed')` の slot 数から導出 ⑨**手動 `improve` は wave/slot 行を作らない**
 
   | 事象 | slot | mission | run | 同一 tx か |
   |---|---|---|---|---|
   | Tx-0 (prepare) | reserved→claimed | INSERT (`running`) | INSERT (CREATED) | 1 tx |
-  | spawn 失敗 / `ready` 前 crash・timeout (同一プロセス内) | claimed→reserved (`spawn_attempts` < 2 = 初回のみ) または failed (再試行後) | `failed` | FINISHED (`result=NULL`) | 1 tx |
+  | spawn 失敗 / `ready` 前 crash・timeout (同一プロセス内) | claimed→reserved + **`mission_id=NULL`** (`spawn_attempts` < 2 = 初回のみ) または failed (再試行後) | `failed` | FINISHED (`result=NULL`) | 1 tx |
   | `ready` 受信 | claimed→running | — | — | 短い tx、その後 `go` |
   | `ready` 後の全終端 (completed / failed / timeout / max_turns / 親の出力検査不合格 / Tx-2 / Tx-2 補償 / shutdown) | running→done (completed かつ Tx-2 成功) または failed | 終端 status | FINISHED | **1 つの短い tx** — 全経路が単一ヘルパ **`finish_improve_mission(conn, *, mission_id, run_id, slot_key\|None, mission_status, run_result, backlog_transition, commit=False)`** を通る (Tx-2 本体の末尾、または補償 tx)。手動 one-shot は `slot_key=None` (codex 8 周目 I2) |
   | 起動時: `status IN ('claimed','running')` で mission が interrupted | → failed (再実行しない) | interrupted | FINISHED、backlog `observation:interrupted` (BOUND なら) | `recover_interrupted` と同一 tx |
@@ -434,7 +434,7 @@ status: `open | observation | selected | done | rejected` (`rejected` は人間�
 - 履歴は **bare リポジトリ `plugins/.history.git`** (`git init --bare` を lazy に。**ワークツリーを持たない** — codex 2 周目 I9)。人間の閲覧は `git --git-dir=plugins/.history.git log|show`。**記録されるのは approved になった artifact だけ**
 - `plugin/loader.discover` は先頭 `.`/`_` を除外 (§2.3) するので `.versions/`・`.locks/`・`.history.git/`・`_staging/`・`_human/`・`_retired/` は列挙されない
 
-**候補の入口は 2 つ、ライフサイクルは 1 つ (codex 9 周目 I1)**: ①改善ループの候補 (`plugins/_staging/<mission_id>/<name>/`、§4 の commit 相がゲートを通し pending 承認申請を作る) ②人間の候補 (`plugins/_human/<name>/`、`afx plugin submit --from _human <name>` がゲートを通し pending を作る / `afx plugin bless --from _human <name>` = submit + 直後に人間決定 `approved`)。**経路は 3 つ、語は全節で同じ (codex 11 周目 I3)**: **(P1) `submit`** (staging = 改善ループの commit 相 §4.2-5、または `submit --from _human`) = kind 別ゲート → **1 つの短い tx で pending approval 行 + ゲート証跡行 (`backtest_runs`)。ジャーナルは作らない**。**(P2) `approve <id>`** (人間、後日) = flock 下で `preparing` ジャーナルを短い tx で作る → 版 → git → 切替 → `apply_decision(approved)`。**(P3) `bless --from _human`** = kind 別ゲート → **1 つの短い tx で pending 行 + ゲート証跡行 + `preparing` ジャーナル** → 版 → git → 切替 → `apply_decision(approved)`。P1 の pending は P2 で完了する (P1+P2 = 改善ループと `submit --from _human` の正規経路)。live path (`plugins/<name>`) は**決して編集対象にしない** (プレーンでも symlink でも)。人間が承認済み plugin を改良するときは `afx plugin materialize <name>` (live の版ディレクトリまたはプレーン dir から `plugins/_human/<name>/` へコピー。既に在れば拒否。ディレクトリ 0700 / ファイル 0600。**自動削除しない** — 人間が消す) → 編集 → `submit|bless --from _human`。
+**候補の入口は 2 つ、ライフサイクルは 1 つ (codex 9 周目 I1)**: ①改善ループの候補 (`plugins/_staging/<mission_id>/<name>/`、§4 の commit 相がゲートを通し pending 承認申請を作る) ②人間の候補 (`plugins/_human/<name>/`、`afx plugin submit --from _human <name>` がゲートを通し pending を作る / `afx plugin bless --from _human <name>` = submit + 直後に人間決定 `approved`)。**経路は 3 つ、語は全節で同じ (codex 11 周目 I3)**: **(P1) `submit`** (staging = 改善ループの commit 相 §4.2-5、または `submit --from _human`) = kind 別ゲート → **1 つの短い tx で pending approval 行 + ゲート証跡行 (`backtest_runs`)。ジャーナルは作らない**。**(P2) `approve <id>`** (人間、後日) = flock 下で `preparing` ジャーナルを短い tx で作る → 版 → git → 切替 → `apply_decision(approved)`。**(P3) `bless --from _human`** = kind 別ゲート → **1 つの短い tx で pending 行 + ゲート証跡行 + `preparing` ジャーナル** → 版 → git → 切替 → `apply_decision(approved)`。**P3 は flock 下・ゲート後・最初の DB tx より前に live の形を確定して二分する (codex 12 周目 I2 — ジャーナルの `old_kind` は `absent`/`symlink` しか取れないので、プレーンのまま `preparing` を作ると CHECK 違反になる)**: live が **absent / symlink** なら上記どおり (pending + 証跡 + `preparing` を 1 tx) → 切替 → 即時決定。live が **プレーン dir** なら **pending + 証跡だけを 1 tx で作り (ジャーナル無し)**、版 + git まで進めて **`legacy_plain_present` で pending に留める** — P1+P2 と同じ終わり方で、人間の `retire` → `approval retry` (= P2) が完了させる。P1 の pending は P2 で完了する (P1+P2 = 改善ループと `submit --from _human` の正規経路)。live path (`plugins/<name>`) は**決して編集対象にしない** (プレーンでも symlink でも)。人間が承認済み plugin を改良するときは `afx plugin materialize <name>` (live の版ディレクトリまたはプレーン dir から `plugins/_human/<name>/` へコピー。既に在れば拒否。ディレクトリ 0700 / ファイル 0600。**自動削除しない** — 人間が消す) → 編集 → `submit|bless --from _human`。
 
 1. **排他 + switch ジャーナルの確認**: **`flock` を `plugins/.locks/<name>.lock` に取得** (プロセス間 — サービスの approve / **reject / expire / invalidate** / 起動時 reconcile / 別プロセスの `afx plugin bless` が**全て**同じ lock を取る、codex 4 周目 I5) + プロセス内は plugin 名ごとの `threading.Lock` (ⓒ、順序は flock → thread lock)。lock 取得後に approval が `pending` であること・後発決定・**同名 plugin に未完の switch ジャーナルが無いこと**を再確認してから FS 副作用に進む (未完があれば先に reconcile — 下記)。異なる plugin の並行承認は 5.2 の CAS が守る
    **switch ジャーナル `plugin_switch_journal` (codex 5 周目 I2 / 6 周目 I3・I4 / 7 周目 I4・I5 — `flock` は crash を越えない)**: 新テーブル `plugin_switch_journal(op_id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('approve','bless')), approval_id INTEGER NOT NULL, name TEXT NOT NULL, old_kind TEXT NOT NULL CHECK(old_kind IN ('absent','symlink')), old_target TEXT, temp_path TEXT NOT NULL, new_target TEXT NOT NULL, switch_required INTEGER NOT NULL, phase TEXT NOT NULL CHECK(phase IN ('preparing','versioned','recorded','switched','decided','reverted')), actor TEXT NOT NULL, updated_at TEXT NOT NULL)`。**行の INSERT が `op_id` を先に割り当てる (`phase='preparing'`、FS 効果ゼロの時点、codex 10 周目 I1)。`temp_path = plugins/.<name>.link-<op_id>` を最初の行に確定して書く** (codex 8 周目 I5)。**live がプレーン dir のときはジャーナル行を作らない** (承認は `legacy_plain_present` で pending — 上記レイアウト)。**`approval_id` は常に既知** (approve は pending 行、bless は同 tx で作った pending 行 — 9 周目 I1)。**`switch_required` は INSERT 時に確定** (旧の正規 target == 新の正規 target なら 0 → FS 切替を省略し `recorded` の後そのまま決定へ。`switched` の復旧規則は `switch_required=1` の行にだけ適用 — codex 8 周目 I6) + **部分 UNIQUE index: 非終端 phase (`decided`/`reverted` 以外) の行は `name` ごとに高々 1 件**。**旧状態 (kind / target) は行の INSERT 前に確定する**。以後 **各 phase の書込は次の FS 効果より先、lock 下の短い tx**:
@@ -442,7 +442,8 @@ status: `open | observation | selected | done | rejected` (`rejected` は人間�
    | 操作 | 行の INSERT (`preparing`) 前に済ませること | phase 列 | 終端 |
    |---|---|---|---|
    | approve (経路 P2 — 経路 P1 `submit` (staging / `_human`) が作った pending に対して) | 旧状態の確定 (`plugins/<name>` が absent / symlink のどちらか、symlink なら target 文字列。**plain なら版 + git を記録して `legacy_plain_present` pending、ジャーナル無し**) | preparing → versioned (新版作成) → recorded (git) → switched (切替直前) → decided | `apply_decision(approved)` と同一 tx |
-   | bless (`--from _human`、経路 P3) | 旧状態の確定 + **kind 別の全ゲート (§4.2-3・§4.2-4)** + **pending approval 行 + ゲート行 + ジャーナル行 (`preparing`) を同一 tx (FS 効果前)** | 同上 | `apply_decision(approved)` (approve と同一経路)、同一 tx |
+   | bless (`--from _human`、経路 P3、live が **absent / symlink**) | 旧状態の確定 + **kind 別の全ゲート (§4.2-3・§4.2-4)** + **pending approval 行 + ゲート行 + ジャーナル行 (`preparing`) を同一 tx (FS 効果前)** | 同上 | `apply_decision(approved)` (approve と同一経路)、同一 tx |
+   | bless (経路 P3、live が **プレーン dir**) | 旧状態の確定 + 全ゲート + **pending 行 + ゲート行だけを同一 tx (ジャーナル無し)** | — (ジャーナルを作らない) | 版 + git の後 **`legacy_plain_present` で pending**。`retire` → `approval retry` (P2) が完了させる |
 
    **収束規則**: ジャーナルが終端 ⇔ live symlink と DB (approval 決定) が一致。**`switched` で止まっていた行の復旧規則 (`switch_required=1` のみ)**: `live == new_target` → 完遂 (decide へ) / `live == old 状態` → 取消 (`reverted`) / どちらでもない → activity ERROR で人間待ち (触らない)。未完ジャーナルの扱い (同名の**全**操作 — approve/reject/expire/invalidate/bless — は lock 下でまずこれを収束させる): (a) **同じ操作の再試行 / 起動時 reconcile** は phase から再開して完了させる (hash がまだ一致し後発 reject が無ければ)。**再開前に参照物 (`new_target` の版・`old_target` の版・temp link) の存在と hash を再検証**し、新版が欠損なら**保持している staging / `_human` 候補から再作成**、無理なら `reverted` で閉じて activity ERROR (I4) (b) **それ以外の操作が来た**とき (reject/expire/invalidate/別 hash の approve) は、reconcile が**切替を巻き戻す**: `old_kind='symlink'` → symlink を `old_target` へ 1 rename で戻す / `old_kind='absent'` → live symlink を除去 → `reverted` (activity `switch_reverted`) → その後に本来の操作を適用する。**`GC_ROOTS` (唯一の定義、他節はこの名で参照)** = **approved な approval 行の payload が指す `artifact_hash` の版** ∪ **live symlink の指す先** ∪ **非終端ジャーナルが参照する `new_target`・`old_target` の版・`temp_path`** ∪ **`legacy_plain_present` で pending の approval が指す `artifact_hash` の版** (codex 7 周目 I4 / 8 周目 I4)。**この集合に無い版ディレクトリは孤児として起動時 reconcile が削除する** (簡素な規則。pending の approval が指す staging は §2.3 の規則で残る)
 2. **後発決定の確認 (ⓓ) — key は `(name, content_hash)`** (D4 と同じ。codex 4 周目 I9): **同じ `(name, content_hash)`** へのより新しい決定 (reject) があれば、この承認は失効 — `apply_decision(status='invalidated')` (§4.3。backlog も同 tx で `observation`)。**同名で content_hash が異なる approval 同士は独立** (C の reject は B の pending approve を失効させない)。plugin 名全体を revoke する操作は設けない (YAGNI)。再試行で復活させない (D4 の順序規則)
@@ -463,7 +464,7 @@ status: `open | observation | selected | done | rejected` (`rejected` は人間�
 
 **却下・期限切れ・失効**: 同じ plugin `flock` 下で、同名の未完 switch ジャーナルがあれば先に巻き戻し (1 の (b)) → `apply_decision` (backlog を `observation`) + staging 削除。ジャーナルが無ければ `plugins/<name>`・版・履歴には触れない。
 
-**bless (`afx plugin bless --from _human <name>`) — 経路 P3: 候補 → ゲート → 1 tx (pending 行 + 証跡 + `preparing` ジャーナル) → 版 → git → 切替 → `apply_decision(approved)`** (codex 9 周目 I1 / 11 周目 I3): 同じ `flock` を取り、同名の未完ジャーナルを収束 → 候補 `plugins/_human/<name>/` をスナップショット検査 → 両 hash → **kind 別の全ゲートを通常 submit と同じ経路で通す** (§4.2-3 のコードゲート = AST + Landlock pytest + hash 不変、**kind=strategy なら §4.2-4 の in-sample ≥ 30・固定 holdout・baseline 添付まで**。どれか欠ければ何も作らない — codex 7 周目 I7) → **FS 効果より前に 1 つの短い tx で**: pending の approval 行 (`kind=plugin`、payload はゲート行 id・baseline/holdout・settings hash を含む完全形、`candidate_origin='human'`, `candidate_path='plugins/_human/<name>'`) + ゲートの `backtest_runs` 行 + switch ジャーナル行 (`preparing`、`approval_id` は**この時点で既知**) を作る → 版ディレクトリへコピー (4) → 履歴記録 (5) → 切替 (6。live がプレーン dir なら `legacy_plain_present` で pending に留め、`retire` 後に `approval retry`) → 照合 → **その pending 行に `apply_decision(approved, decided_by=human_cli)`** (7、approve と同一経路)。**live path や symlink 版を候補に取る bless は無い** (`bless <name>` は `plugins/<name>` がプレーン dir でも拒否し、`materialize` を案内する — live は編集対象外)。
+**bless (`afx plugin bless --from _human <name>`) — 経路 P3: 候補 → ゲート → 1 tx (pending 行 + 証跡 + `preparing` ジャーナル) → 版 → git → 切替 → `apply_decision(approved)`** (codex 9 周目 I1 / 11 周目 I3): 同じ `flock` を取り、同名の未完ジャーナルを収束 → 候補 `plugins/_human/<name>/` をスナップショット検査 → 両 hash → **kind 別の全ゲートを通常 submit と同じ経路で通す** (§4.2-3 のコードゲート = AST + Landlock pytest + hash 不変、**kind=strategy なら §4.2-4 の in-sample ≥ 30・固定 holdout・baseline 添付まで**。どれか欠ければ何も作らない — codex 7 周目 I7) → **live の形を確定** (dirfd + lstat。absent / symlink / プレーン dir) → **FS 効果より前に 1 つの短い tx で**: pending の approval 行 (`kind=plugin`、payload はゲート行 id・baseline/holdout・settings hash を含む完全形、`candidate_origin='human'`, `candidate_path='plugins/_human/<name>'`) + ゲートの `backtest_runs` 行 + **live が absent / symlink のときだけ** switch ジャーナル行 (`preparing`、`approval_id` は**この時点で既知**) を作る (**プレーンのときはジャーナルを作らない** — codex 12 周目 I2) → 版ディレクトリへコピー (4) → 履歴記録 (5) → **live が absent / symlink なら**切替 (6) / **プレーンなら `legacy_plain_present` で pending に留めて終わり** (人間の `retire` → `approval retry` = P2 が完了させる) → 照合 → **その pending 行に `apply_decision(approved, decided_by=human_cli)`** (7、approve と同一経路)。**live path や symlink 版を候補に取る bless は無い** (`bless <name>` は `plugins/<name>` がプレーン dir でも拒否し、`materialize` を案内する — live は編集対象外)。
 
 
 ### 5.2 記録手順 — bare リポジトリ + 専用 index + blob-level plumbing (プラン 9 D6 の確定形を、bare + 版ディレクトリ出所に合わせて組み替え)
@@ -512,6 +513,20 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 **変異 (§5)**: 決定時ハッシュ再照合を削除 / 照合対象を index の blob から候補置き場のワークツリーへ戻す (TOCTOU 復活) / 専用 index をやめ `git add` + `git commit -- <path>` (**killer = 検証後に staging の plugin.py を書き換えてから commit させ、commit 内容が検証済みの内容であることを assert**) / **git 記録より先に切替する (killer = git 失敗を注入 (identity env 除去 / detached HEAD) して承認させ、`plugins/<name>` が旧版を指したまま `approved_plugins()` に残ることを assert)** / **live がプレーン dir のとき自動で入れ替える (killer = プレーン live への approve が `legacy_plain_present` pending に留まり、live が不変で、`retire` → `approval retry` 後に symlink になること)** / **`retire` が未完ジャーナルを無視する・flock を取らない (→ 拒否 pin)** / **`retire` が dir を削除する (killer = `plugins/_retired/<name>-*/` に旧内容が残ること)** / **版キーを `content_hash` にする (killer = code/config 同一・test 違いの 2 候補を順に承認し、履歴に 2 つの test が別 commit で残り、版ストアに 2 版が在ること)** / **`flock` を落とす (killer = 別プロセスの bless と同時に走らせ、両者が互いの版を壊さないこと)** / **履歴を非 bare にしてワークツリーを持つ (killer = 承認後に `git status` が clean であること / `git restore .` 相当の操作で live symlink が実 dir に置換されないこと)** / 切替後の hash 再検証を落とす (killer = swap 中に版ディレクトリを差し替え、旧状態へ戻され pending のままであること) / 切替先を `resolve()` で検査する (§4 と共有) / `_staging/` `.versions/` が index に入る (→ 記録後の tree に無い pin) / 旧版の消えたファイルが index に残る (→ `git rm --cached` 落とし) / 空 commit 判定を `git diff --cached` に戻す / commit と decide の順序を入れ替える / commit 失敗で承認を成立させる / 後発 reject の確認を削除 / 起動時 reconcile を `approved_plugins()` の後に置く / reconcile が dangling symlink を勝手に向け直す (→ ERROR に留める pin) / git を scheduler スレッドから呼ぶ / CAS 無し update-ref (→ 並行承認で先発 commit が消える) / identity env を落とす (→ 空 git config 環境で永久 pending) / `fsync` を落とす (→ 実装計画の fault-injection、設計では要求のみ) / bless が Landlock ヘルパでなく `_default_pytest_runner` を使う (→ §4.2-3d の pin) / discover が symlink を辿らない (→ 承認直後に plugin が消える pin) / approve 時に backlog を `done` にしない (→ §4.3 pin) / **ジャーナル行を FS 効果の後に INSERT する・`op_id` を temp 名より後に採番する (killer = `preparing` 行が版作成より先に在り、`temp_path` がその `op_id` から導出されていること)** / **`switched` の復旧を「常に完遂」にする (killer = live が old のまま落ちた行が `reverted` で閉じ、live が変わらないこと)** / **ジャーナル参照物を `GC_ROOTS` に含めない・掃除をジャーナル収束より先に行う (killer = `versioned` で落として起動後に new 版が消えず再開できること)** / **bless が strategy ゲートを飛ばす (killer = 取引 10 件の strategy 候補が `bless --from _human` で承認されないこと)** / **reject/expire が plugin flock を取らない (killer = approve の切替直後に reject を差し込み、DB rejected と live 新版が食い違わないこと = reject が lock 待ちで approve 完了後に `AlreadyDecidedError` になる)** / **後発決定 key を name だけにする (killer = 同名別 hash の C を reject しても B の pending approve が生きていること)** / **switch ジャーナルを書かずに切替する (killer = 切替直後にプロセスを落とし、別プロセスの reject を先に走らせても、起動後に live が旧状態に戻り DB が rejected で一致すること)** / **`old_kind` を持たず NULL で absent と symlink を混同する (killer = absent の巻き戻しで live が除去され、symlink では `old_target` へ戻ること)** / **submit (P1) がジャーナルを作る (→ P1 は pending + 証跡だけの pin)** / **payload に `staging_path` を持つ・`candidate_origin` を持たない (→ locator pin、`_human` の pending が approve で欠損扱いされないこと)** / **同名の未完ジャーナルを 2 件許す (killer = 別 hash の approve が先行 approve の切替を追い越さないこと)** / **bless が live path (`plugins/<name>`) を候補に取る (killer = プレーン live への `bless <name>` が拒否され `materialize` を案内すること)** / **materialize が既存 `_human/<name>` を上書きする (→ 拒否 pin)** / **版ストアのファイルを 0600 のまま置く (→ 0400/0500 pin、in-place 編集の discover 拒否と組)** / discovery が `PluginMeta.path` を symlink のまま持つ (→ approve 後に稼働中サービスの sandbox が旧版を実行し続ける pin)。
 
 
+### 5.5 既存 approval 行との互換 (プラン 10 導入時の migration、codex 12 周目 I4)
+
+本プランは plugin approval の payload に **`candidate_origin` / `candidate_path` / `artifact_hash`** を必須で加える (§4.2-5・§5.1-3)。**プラン 10 導入前に作られた行はこれらを持たない**ため、`init_db` の migration 段で**一度だけ**次の規則を適用する (以後の起動では該当行が無いので no-op = 冪等):
+
+| 対象 | 扱い |
+|---|---|
+| **pending** の `kind='plugin'` approval で 3 フィールドのいずれかを欠く行 | `apply_decision(status='invalidated', reason='legacy_payload_requires_resubmit')` + activity + 通知 (「`afx plugin materialize <name>` → 編集 → `submit\|bless --from _human` で出し直してください」)。**live からの候補推測はしない** (R12-(d) の「live は候補にしない」を破らないため) |
+| **終端済み** (`approved` / `rejected` / `expired` / `invalidated`) の行 | **そのまま保持**。D4 の admission (`(name, content_hash)` の最新決定) は既存フィールドだけで成立するので変更しない |
+| `artifact_hash` を持たない終端行 | **`GC_ROOTS` に寄与しない** (§5.1)。版ディレクトリはそもそも本プランで作った版しか無いので、保護対象が消えることはない |
+
+**この規則を適用する時点**: `init_db` のマイグレーション (起動時 reconcile より前)。**pending を自動で terminal 化する唯一の箇所**なので、ここ以外で legacy 行を触らない。
+
+**変異 (§5.5)**: legacy pending をそのまま approve 経路へ流す (killer = 3 フィールド欠損の pending 行を持つ DB で起動し、`approve <id>` が候補を探して失敗するのではなく、起動時に `invalidated(legacy_payload_requires_resubmit)` になっていること) / legacy 終端行まで invalidate する (killer = 既存 approved の plugin が起動後も `approved_plugins()` に載ること) / 欠損 payload を live から補完する (killer = `plugins/<name>` を候補として承認しないこと)。
+
 ## 6. 外向きリクエストの予算 — 研究ツールの advisory 予算 (安全保証ではない)
 
 **位置づけ (ユーザー裁定 2026-08-16、codex 1 周目 I5 を受けて)**: 本節の予算は **registry ツール (`web_search` / `fetch_article`) の契約**であり、**改善 worker からの外向き通信全体を律する安全保証ではない**。改善 profile は shell と python を持つ (§1.6・§2.1-5) ので、agent が `python -c` から直接 HTTP を投げれば予算は数えられない。これを塞ぐには network namespace か親の egress proxy への限定が要り、それは**外向きリクエスト予算の全体設計 (起票 §10)** の一部である。本プランでは:
@@ -537,7 +552,7 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 4. **D6 変異列** (§5) を全て殺す / **git サブプロセスが scheduler スレッドから呼ばれない**回帰テスト / 承認は git 記録成功後にしか `approved` にならない / **git 失敗を注入しても稼働中の旧版が消えない** (記録が切替に先行) / **切替は原子 (1 rename)** (2 段化の killer) / **live がプレーン dir の承認は版 + git 記録の後 `legacy_plain_present` で pending に留まり、`plugin retire <name>` (flock、未完ジャーナルで拒否、1 rename) → `approval retry` で absent → symlink として完了する。稼働中に plain を自動で入れ替えない** / **`flock` により別プロセス bless と競合しない** / **履歴は bare** (承認後に live symlink を壊す git 操作の面が無い) / **版キーは `artifact_hash`** (test 違いの版が区別される) / **承認済み symlink plugin を再改善できる** (`resolve()` 非依存) / **`PluginMeta.path` は版実体に固定され、approve は次回起動まで稼働中の plugin に影響しない** / **approval の全決定が `apply_decision` (1 tx: approval CAS + backlog 遷移 + ジャーナル終端) を通り、全 terminal decision が plugin flock を取る** / **後発決定 key は `(name, content_hash)`** / **`GC_ROOTS` (approved payload の版 ∪ live ∪ 未完ジャーナル参照物) に無い版だけが reconcile で消える** / **switch ジャーナル: 切替直後 crash → reject/別 hash approve が先に来ても live が旧状態 (symlink / absent) へ戻り DB と一致、同名の未完は 1 件、`preparing` 行が FS 効果より先** / **版ストアは不変 (0500/0400)、in-place 編集は discover のディレクトリ名 hash 照合で拒否、live への bless は無い → `materialize` → `_human` → 候補経路** / **bless (`--from _human`) は approve と同じライフサイクル (ゲート → pending 行 + 証跡 → ジャーナル付き昇格 → `apply_decision`) で、通常 submit と同じ kind 別ゲートを通る** / **journal-first・sweep-last の起動順序と `GC_ROOTS` (単一定義)** / **`plugin rollback` / `bless-version` コマンドが存在しない (R12 pin)** / **経路 P1 (submit) はジャーナルを作らず、P2 (approve) / P3 (bless) だけが `preparing` を作る** / **payload は `candidate_origin`+`candidate_path`、staging は終端決定で削除・human は残る、候補欠損は `candidate_missing` pending**
 5. **改善レーンが取引レーンを塞がない**: 改善 Mission 実行中に `MissionSupervisor.try_submit("trade")` が受理される / 取引レーンの容量 1・直列性の既存 pin が不変 / **wave が `parallel=N` で N partition を全て担当する** / **backlog 選択の CAS** (2 接続同時で勝者 1) / **backlog 状態機械** (approve → done、reject/expire → observation、report → done / report_failed → observation、失敗 → observation、**crash 後の起動時回収 → observation:interrupted**) / **台帳の凍結** (FROZEN 後の遅延 RPC が拒否され、payload `trial_count` が実 trial の総和) / **ヒント集合外の選択は activity のみ (CAS が正)** / **1 period 1 wave** (`improve_waves` + slot 行を同一 tx で作成 = period 消費、最新 occurrence の period key、停止中に逃した period を起動後 1 回 catch-up、M=0 は行を作らない、slot `reserved→claimed` が Tx-0 と同一 tx・`ready` → `running` commit → `go` の 3-way、`go` 前は副作用ゼロ、起動時に `claimed`/`running` で interrupted と、`reserved` のまま残った slot は failed で再実行しない (period は消費済みのまま)、spawn は同一プロセス内で初回 + 再試行 1 回 (`spawn_attempts`)、`ready` 後の全終端は `finish_improve_mission` の 1 tx で slot+mission+run+backlog) / **接続の所有** (slot = write、dispatcher = 自前 read-only、共有なし) / **run lifecycle** (全終端経路で run が FINISHED、dangling run 無し、Tx-0 は missions+run+slot の 1 tx、`mission_id` 一意) / **Tx-2 が missions.finish を含む** (commit 直後 crash で approval/backlog/run/mission が一致) / **接続は slot 専用** (N=4 同時 Tx で混線無し) / shutdown が改善レーンの worker と CLI pgid を全て回収する / **認証コピーは親が spawn 前に行い、worker は原本を読まない**
 6. **FakeRunner E2E**: 発見 → バックログ追加 (上限・重複) → 候補 → ゲート不合格でレポート止まり (承認申請なし) / ゲート合格で承認申請 (pending) → `approve` で 版 → git 記録 → symlink 切替 → approved (この順) / 30 未満 strategy が observation / 並行 2 Mission の重複選択が後着 observation / **`artifact.name` に `../` や絶対パスを返す fake が failed** / **レポート先に symlink を事前に置くと fail closed** / **timeout した Mission の `backtest_runs` / `analysis_runs` が残らない** / **レポート作成失敗時に `result=NULL`** / **`proposal_kind=risk_gate` の report は observation `unsupported_in_plan10` になり report ファイルが無い** / **strategy ゲートの baseline は live かつ D4-approved 同名 artifact、無ければ `no_strategy` 行 (null 無し)** / **report は `.tmp/*.part` → Tx-2 (`report_state=prepared`) → COMMIT 後に rename 公開 → `published`、公開失敗・`published` で最終欠損は `failed`+`result=NULL`+`done→observation`、rename 後にディレクトリ fsync、起動時 reconcile が `published ⇔ 最終存在` に収束させ孤児を消す** / **source snapshot と `_examples` は親コピーから読め、`plugins/`・`docs/` は EACCES**
-7. `MissionResult.status` 4 値・決定論的コア (`risk_gate` / `paper_broker` / `transitions` / `executor` の判定) は diff ゼロ / 既存 2071 テストが壊れない / 新規 config キーは `settings.yaml.example` と同期 / migration (`improvement_backlog` の列追加) は空 DB・既存 DB で冪等 / **`discover` が `_`/`.` 先頭ディレクトリを列挙せず、正規形外の名前を skip する pin**
+7. `MissionResult.status` 4 値・決定論的コア (`risk_gate` / `paper_broker` / `transitions` / `executor` の判定) は diff ゼロ / 既存 2071 テストが壊れない / **legacy payload の pending approval を持つ既存 DB から起動すると `invalidated(legacy_payload_requires_resubmit)` になり、終端行と `approved_plugins()` は不変 (§5.5)** / 新規 config キーは `settings.yaml.example` と同期 / migration (`improvement_backlog` の列追加) は空 DB・既存 DB で冪等 / **`discover` が `_`/`.` 先頭ディレクトリを列挙せず、正規形外の名前を skip する pin**
 
 ### 7.2 有効化後の実測 (8) — blocking ではない。既定見直しの材料
 
@@ -556,7 +571,7 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 | **B** (柵) | 5 | `landlock.execute_paths` + backend 別 exec closure + `_bootstrap_improve_profile` 拡張 (`/dev` rw, `/proc` (claude), resolve, **handshake `mission_id`/`staging_dir`/`source_snapshot_dir` の受領・相互照合・rw 化**) + assert 拡張 + env 追加 + `/dev/null` O_RDONLY + **`discover` の `_`/`.` 除外と名前正規形 + symlink 追従 + `PluginMeta.path` を版実体に固定 + `PluginMeta.artifact_hash`** | §2 | — |
 | B | 6 | Landlock ゲート pytest ヘルパ (launcher 経由・候補 ro・pyc prefix を env で・スナップショット検査・content/artifact hash before/after) + `submit_plugin` / `bless` の置換 | §4.2-3 | 1, 5 |
 | **C** (registry) | 7 | improve registry (研究ツール + advisory 予算 / **`staging_dir` を根とする** staging ファイル / `run_plugin_tests` / RPC 2 種 **+ RPC 台帳 (状態機械)** + `analyze_for_agent`/`run_in_sample` の non-committing 版) + **遮断 8 項目の統合回帰を red で開始** | §3.4/§6 | 5 |
-| C | 8 | バックログ拡張 (`observation` / attempts / last_result / **選択 CAS / 状態機械ヘルパ `apply_approval_outcome` / `approvals.apply_decision`** / `backlog reject\|reopen`) + `backtest_runs.variant/ref_plugin_ref/ref_content_hash` (`latest_in_sample_metrics` は candidate のみ) + `improvement_runs.mission_id` (部分 UNIQUE) + run lifecycle (Tx-0 = missions+run+slot の 1 tx / Tx-1 bind / 全終端で finish) + `improve_waves` + `improve_wave_slots` (reserved/claimed/running/done/failed、3-way 起動、終端直積表、再開なし) + **`finish_improve_mission` ヘルパ** + `improvement_runs.report_state` + `plugin_switch_journal` テーブル + 起動時回収 (interrupted → observation、`finished_at IS NULL` のみ、claimed/running+interrupted は failed、report_state の収束) + store helper の `commit=False` 変種 (`missions.start` / `decide` / `expire_due` / `missions.finish` 含む) + 注入コンテキスト生成 + prompt | §3.1/§3.2/§4.1/§4.3/§5.1 | — |
+| C | 8 | バックログ拡張 (`observation` / attempts / last_result / **選択 CAS / 状態機械ヘルパ `apply_approval_outcome` / `approvals.apply_decision`** / `backlog reject\|reopen`) + **既存 approval 行の互換 migration (§5.5)** + `backtest_runs.variant/ref_plugin_ref/ref_content_hash` (`latest_in_sample_metrics` は candidate のみ) + `improvement_runs.mission_id` (部分 UNIQUE) + run lifecycle (Tx-0 = missions+run+slot の 1 tx / Tx-1 bind / 全終端で finish) + `improve_waves` + `improve_wave_slots` (reserved/claimed/running/done/failed、3-way 起動、終端直積表、再開なし) + **`finish_improve_mission` ヘルパ** + `improvement_runs.report_state` + `plugin_switch_journal` テーブル + 起動時回収 (interrupted → observation、`finished_at IS NULL` のみ、claimed/running+interrupted は failed、report_state の収束) + store helper の `commit=False` 変種 (`missions.start` / `decide` / `expire_due` / `missions.finish` 含む) + 注入コンテキスト生成 + prompt | §3.1/§3.2/§4.1/§4.3/§5.1 | — |
 | **D** (loop) | 9 | `ImproveSupervisor` (N スロット・wave 状態機械・slot 専用 write 接続 / dispatcher 専用 RO 接続・shutdown/join + CLI pgid 回収) + scheduler の「最新 occurrence の period key」/ wave+slot 同一 tx 作成 / slot claim CAS + `ready`→`running`→`go` / spawn 初回 + 再試行 1 回 / partition ヒント再計算 / catch-up + `improve` / `improve add` / `backlog` / `policy add` コマンド (**`improve` の有効化配線は Task 12**) | §3.1 | 8 |
 | D | 10 | `ImproveLoop` (三相 + `ImproveRunContext` + source snapshot (固定 `PluginMeta.path` から、`_examples` 込み) + Tx-0/Tx-1/Tx-2 (missions.finish 込み) + 補償 tx + commit 相ゲート + partition ヒント外の activity 記録 + `proposal_kind=risk_gate` の `unsupported_in_plan10` 化 + 台帳永続化 + 承認申請 + レポート (`.tmp/*.part` → Tx-2 `prepared` → COMMIT 後 rename 公開 → `published`、失敗時 `failed`+result=NULL+`done→observation`、起動時 収束) + backlog 遷移) | §4 | 6, 7, 8 |
 | **E** (承認) | 11 | 版ディレクトリ (`artifact_hash`、不変 0500/0400) + bare 履歴 (blob-level plumbing) → symlink 切替 (1 rename。**live がプレーン dir なら `legacy_plain_present` pending、`plugin retire <name>` (flock・未完ジャーナル拒否・1 rename → `_retired/`) → `approval retry` で完了**) + 全 terminal decision の `flock` + **switch ジャーナル `plugin_switch_journal` (approve/bless 共通、`preparing` 先行、`op_id` 起点の `temp_path`、`switch_required`、`old_kind ∈ {absent, symlink}`、name ごと未完 1 件、phase 表・復旧規則・`GC_ROOTS`・journal-first 起動順)** + **3 経路 P1 submit (pending + 証跡、ジャーナル無し) / P2 approve (`preparing` → 版/git/切替 → `apply_decision`) / P3 bless (pending + 証跡 + `preparing` の 1 tx → 版/git/切替 → `apply_decision`)** + **`plugin materialize` / `_human/` 候補経路 / payload `candidate_origin`+`candidate_path` (locator 検証・掃除表・`candidate_missing`)** + reconcile (孤児 staging・tmp 版・`GC_ROOTS` 外の版・temp link・未完ジャーナル・dangling) + **`approval retry` / `plugin retire` の handler と配線** + 全決定経路の `apply_decision` 化 (key `(name, content_hash)`) | §5 | 6, 7, 8 |
@@ -566,164 +581,88 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 - **A-1〜3 / B-5 / C-8 は worktree 並列**可 (codex 4 周目 M4 / 5 周目 M2: **D-9 は C-8 の後、A-4 は A-1 と B-5 の merge 後** — どちらも並列集合から外す)。C-7 は B-5 の後。D-10 は B-6・C-7・C-8 の後。E-11 は B-6・C-7・C-8 の後 (A と並列可。codex 10 周目 M1: strategy bless の non-committing gate は C-7)。**F-12 は 1〜11 の後、F-13 は 12 の後**
 - ファイル競合: `mission_worker.py` (A-4 / B-5) は**同一ファイル** — A-4 を B-5 の後に直列 / `worker_runner.py` (A-1 認証コピー / B-5 handshake `staging_dir`) は同一ファイル — マージ順に注意 / `plugin/approval.py` (B-6 / E-11) は順序依存 / `plugin/loader.py` (B-5 discover / E-11) は順序依存 / `store/db.py` は C-8 のみ / `service.py` (A-1 起動時検査 / D-9 / E-11 reconcile) はマージ順に注意
 
-### 8.1 実装計画へ送る項目 (codex 各周の「実装計画へ送る項目」を要約)
+### 8.1 実装計画へ送る項目 (プラン 10 本体分、確定版)
 
-> **R12 注記**: 以下のうち rollback / bless-version / adopt / `plugin_versions` / in-place bless / risk_gate 評価 / slot 再開 (`started_at`) に触れる項目は **【R12: §A へ】** を付す。該当項目は本プランの実装計画には写さず、§A の起票と一緒に後続プランへ送る (項目番号は履歴として保持)。
+> codex 1〜12 周目の「実装計画へ送る項目」を**重複排除・領域別に整理した確定リスト**。R12 で外した機能 (rollback / bless-version / adopt / `plugin_versions` / in-place bless / risk_gate 親評価 / slot 再開) の申し送りは**このリストに含めず**、§A 末尾に別掲する。**このリストが実装計画への唯一の入力**とする (周ごとの原文は `.superpowers/sdd/plan10-design/codex-round*.md`)。
 
-1. C1/C2/C3: dirfd 基準の `openat` / `O_NOFOLLOW|O_EXCL`、plugin 名 regex、3 本の不変マニフェスト、pytest 用 read-only スナップショットのヘルパと変異テストを具体化
-2. C4: exec closure を claude native / codex vendor native の 2 形で採取し (nvm node ラッパは 3 周目 I8 で受理しない → 起票)、`/bin/bash`・`/usr/bin/env`・node・pytest python・動的ローダの 1 要素 drop テストを作る
-3. I1: Mission ローカル RPC 台帳・commit 時の id 解決・failed/timeout 時破棄・RPC timeout 後のスレッド回収を protocol sequence と SQL transaction まで落とす
-4. I2: backlog の条件付き UPDATE と、勝者だけが approval/report の副作用を出す transaction 境界を SQL 単位で書く
-5. I3: wave id、M/k 予約、scheduler/manual 重複、部分 submit、shutdown 中の受付拒否を state machine と test matrix にする
-6. I4: pgid ベースの所有 (別セッション + PDEATHSIG) を、SIGTERM 無視 CLI・CLI→bash 生存中の kill・service SIGTERM・N=4 同時停止の実プロセステストにする (`setsid()` 孫の逃避は起票側の cgroup で扱う — テストは「逃げる」事実の記録まで)
-7. I5: advisory に縮めたので、受入条件と変異リストから安全保証の表現を外したことを実装計画でも維持 (proxy は起票)
-8. I6: `flock` ファイル名・版ディレクトリ・fsync/rename 順・各 rename/commit/decide 直後の crash に対する起動時 reconcile テスト
-9. I7: RPC 台帳から `analysis_run_ids` / trial count を生成する schema と、agent が id/count を偽装しても payload に反映されないテスト
-10. 実測 task (claude fsize 8MB / `--disable apps` egress / claude init tools / auth rotation) + 全新規 `_Strict` config (`improve.parallel`、RPC timeout、research 予算、backlog 上限、`schedule.improve_at`、CLI grace 等) の `Settings`/example 同期 + **改善 N 並行中に取引 DB commit が busy timeout を踏まない負荷テスト**
+**A. Runner 層 (CliRunner / Claude / Codex / MCP シム)**
 
-**codex 2 周目から (要約)**:
+1. exec closure を claude native / codex vendor native の 2 形で採取し、`/bin/bash`・`/usr/bin/env`・動的ローダ・pytest python の **1 要素 drop テスト**を作る (node ラッパは受理しない = 起票)
+2. 共通 launcher (`python -c` + expected-parent 再照合 + PDEATHSIG + 絶対 argv + `execv`、gate では rlimit も) の実プロセステスト: SIGTERM 無視 CLI / CLI→bash 生存中の kill / worker 親死 / timeout / N=4 shutdown。multi-thread プロセスで `preexec_fn` を使わないことの構造 pin
+3. CLI の**全終端** (completed / failed / timeout / max_turns / worker EOF / shutdown) で同一 pgid を空にする ownership test。`setsid()` 逃避は事実記録に留める
+4. provider 別 credential matrix: claude・codex+chatgpt は認証ファイルのコピー、**codex+llama_swap は auth 無し** (空 `CODEX_HOME` + 非秘密 `env_key`) を fake + 実 1 ターンで固定。成立しなければ provider 固有 fail closed
+5. 親が auth と capability を準備する protocol sequence (workdir 0700 → 通常ファイル/所有者/mode/サイズ検査 → auth copy → handshake → 子の再検証 → Landlock → runner 起動) をフィールド単位で書く
+6. `ImproveRunContext` の生成〜破棄 (missions 行 → staging / source snapshot → auth copy → 台帳 / RPC handlers → handshake → freeze / persist / discard) の sequence と protocol test
+7. MCP stdio シムの JSON-RPC 3 メソッド・in-flight 1・`tools/call` の直列化・プロトコル版の実 CLI 突き合わせ。Claude の init event は許可 MCP server が exactly `afx`・未知 server 0
+8. 3 実装の同一契約テストスイート (fake CLI): 4 終端 / reason 安全化 / timeout 優先 / schema 不適合 → failed / 鍵の非継承 / `allowedTools` の profile 固定 / trade+codex 拒否 / `max_turns` の runner 別意味論
 
-11. C1/I7: 親が auth と `staging_dir` capability を準備する protocol sequence (mkdir 0700 → 通常ファイル/mode 検査 → auth copy → handshake → 子の再検証 → Landlock → runner 起動) をフィールド単位で書く
-12. C2: 長時間処理を全て transaction 外へ出し、Tx-1 (CAS) と Tx-2 (台帳/ゲート行/approval/improvement_run/backlog 遷移) の SQL sequence を書く。全 store helper の `commit=False` 変種を列挙する
-13. I4: `ImproveRpcLedger` の `OPEN/FROZEN/PERSISTED/DISCARDED`、in-flight counter、RPC timeout、Mission timeout、commit 同時発生の race matrix
-14. I5: 台帳 entry `{opaque_ref, params, result, trial_count}` → 保存後の id 群と `sum(trial_count)` を payload へ解決。call count は別名
-15. I1: plugin 名の字句検証、最終 symlink を辿らない dirfd API、許可する live 3 形 (absent / plain / canonical symlink) の test matrix
-16. I2: `content_hash` と 3 本 `artifact_hash` の分離。同 code/config・異 test の 2 版が保存・commit され版ストアに共存する pin (**本プランへ**)。両版へ rollback できる pin は【R12: §A へ】
-17. I3/I9: `RENAME_EXCHANGE` の ctypes 実装と非対応 FS の検出、crash point ごとの reconcile テスト、bare 履歴で `git status/restore` の面が無いことの pin 【RENAME_EXCHANGE 部分は R12: §A へ】
-18. I6: backlog × approval の状態直積から許可遷移と `last_result/attempts` 更新 transaction の表
-19. I8: launcher (`python -c` + PDEATHSIG + execv) の実プロセステスト: SIGTERM 無視 CLI・CLI→bash 生存中の kill・worker 親死・N=4 shutdown。`setsid()` 孫の逃避は記録のみ
-20. M1/M2: gate worker の Popen env に pycache prefix を入れる pin、report file 作成成功だけを `report_path` の成立条件にする fault-injection
-21. M3: Task 9/11/12 のコマンド所有と依存 (本書 §8 の表に反映済み) を実装計画でも維持
-22. 継続実測 (claude fsize、apps egress、claude init tools、auth rotation)、exec closure 1 要素 drop、SQLite trade/improve 同時 writer 負荷、初回移行の各 crash 点を blocking/non-blocking の該当節へ逐語対応
+**B. 権限境界 (Landlock / ゲート pytest / snapshot)**
 
-**codex 3 周目から (要約)**:
+9. dirfd 基準の `openat` / `O_NOFOLLOW|O_EXCL`、plugin 名 regex、3 本の不変マニフェスト、候補の read-only スナップショットのヘルパと変異テスト
+10. Landlock ゲート pytest: 候補 ro / `PYTHONPYCACHEPREFIX` を Popen env に置き `sys.pycache_prefix` を assert / ゲート内から `data/agentic.db` open が `EACCES` / Landlock 不可なら fail closed / `submit`・`bless` が同じヘルパを通る
+11. source snapshot は固定 `PluginMeta.path` からのみ作り、copy 中の live 切替・3 本混成・未承認版混入を fault injection で殺す。`docs/examples/plugins` は親が `source/_examples/` へコピー
+12. `_staging` / `_human` / `_retired` / `.versions` / `.locks` / `.history.git` が worker から不可視・非書込であることの実プロセス pin (書込可能パスは staging・workdir・`/dev` のみ)
 
-23. C1/R10: 非特権 PID+mount namespace (`unshare -Upfm --mount-proc` 相当) の claude launcher を実測 — `--version`・実 1 ターン・`/proc/<parent>/environ` 拒否・DNS/LLM 到達を同時に pin。動けば既定化して `/proc` を外す。動かなければ緩和策 3 点で運用
-24. `ImproveRunContext` の生成から破棄まで (missions 行 → staging/source snapshot → auth copy → ledger/RPC handlers → handshake → freeze/persist/discard) を sequence diagram とフィールド単位の protocol test に
-25. Tx-1 で run/backlog owner を durable に結び、Tx-1 直後・pytest 中・backtest 中・Tx-2 直前の各 crash から起動時 `observation:interrupted` へ戻る migration/回収 test
-26. `apply_decision` (approval CAS + backlog outcome) の caller-owned tx API、CAS 不一致、途中例外 rollback を SQL 単位で固定
-27. slot 専用 SQLite 接続 (生成・close) と N=4 の Tx-1/Tx-2 + 取引 writer 同時実行で例外・busy timeout・rollback 混線が無い test
-28. plain 初回移行の old/new artifact 版作成・bare commit (adopt)・exchange・旧 dir 照合/削除・decide の各 fault point と reconcile 期待状態の表 【R12: §A へ】
-29. loader が canonical symlink 検証後に `PluginMeta.path` を版実体へ固定する pin と、approve 中も起動済みサービスが旧版を実行し続ける検証 (**本プランへ**)。rollback 中の同検証は【R12: §A へ】
-30. 共通 launcher (expected-parent 再照合・PDEATHSIG・rlimit (gate)・絶対 argv・pgid 報告) の実プロセステスト: worker 親死・SIGKILL・CLI→bash 生存中・timeout・shutdown。`setsid()` 逃避は記録のみ
-31. codex vendor native の executable graph fixture、closure 1 要素 drop、子 PATH 非依存。node ラッパは起票 (受理しない)
-32. source snapshot と partition capability を親所有にし、他 Mission staging・未承認版を参照できない mutation test (担当外 backlog id は 7 周目 I3 で「activity のみ・CAS が正」に変更)
-33. daily/weekly period key・表示 TZ・missed tick catch-up・M=0・partial submit・manual overlap・restart の schedule transition matrix と `improve_waves` CAS test
-34. report write failure → `report_failed`、read-only mutation の主/副 pin、既存版ディレクトリの内容 hash 不一致、orphan report/version/temp link の fault injection、`improve.mission_max_turns/timeout_sec` を含む全 `_Strict` config と example 同期
+**C. improve registry / 外向き**
 
-**codex 4 周目から (要約)**:
+13. **遮断 8 項目の実プロセス統合回帰** (registry task の直後に red で書き始める)
+14. 研究ツールの **advisory 予算** (件数 / 最小間隔 / host 上限 / UA / 429・503 即中止) の**ツール契約テスト**。安全保証の表現は使わない (proxy は起票)
+15. RPC 台帳 `OPEN → FROZEN → PERSISTED|DISCARDED`、in-flight counter、RPC timeout、Mission timeout、commit 同時発生の race matrix
+16. 台帳から `analysis_run_ids` / `sum(trial_count)` / `analysis_call_count` を**親が**生成し、agent の申告が payload に反映されないテスト
 
-35. R11 (C1): 受容の記録として、契約テストは「課金鍵が env に無い」に留め、scratch 認証コピーが読めることを**受容済み事実**として E2E で 1 回観測・記録する (fail closed にしない)
-36. Tx-2 と `missions.finish` の線形化 SQL、Tx-2 commit 直前/直後・補償 tx の crash matrix
-37. run lifecycle `CREATED→BOUND→FINISHED` を pre-Tx-1 failure / 敗者 / Tx-2 rollback / interrupted の全経路で dangling run 無しの test に
-38. slot 所有 write 接続・dispatcher 所有 RO 接続・台帳 lock の ownership diagram と N=4 + 遅延 RPC test
-39. scheduler は「最新 scheduled occurrence」を入力に period key を作り、daily/weekly・restart・跨 period・DST の transition matrix
-40. `improve_waves` の reserved/running/completed、0/M・partial・crash recovery を SQL state machine に
-41. approve/reject/expire/invalidate/reconcile の全入口が同じ plugin `flock` を通ること、CAS 敗者が live を変更しないことを multi-process test で固定 (**本プランへ**)。rollback 入口分は【R12: §A へ】
-42. version GC root (→ 8 周目で `GC_ROOTS` に一本化: `plugin_versions` ∪ live symlink ∪ journal 参照物) を列挙し、旧 plain adopt 後の restart でも rollback 版が残る pin 【R12: §A へ】
-43. risk-gate report の proposal schema、in-sample/holdout (OOS)/baseline 添付、評価不能時 observation を本体設計書 §6 と逐語対応 (5 周目 I3 で holdout を含める形に更新) 【R12: §A へ】
-44. source snapshot は固定 `PluginMeta.path` だけから作り、copy 中の live symlink 切替・3 本混成・未承認版混入を fault injection で殺す
-45. D4 の key を `(name, content_hash)` に統一し、同名別 hash の approve/reject 並行 test
-46. `docs/examples/plugins` は親 snapshot (`source/_examples/`) へコピーし、worker が repo の `docs/` を読めないまま sample を読める pin
-47. Claude init event は許可 MCP server が exactly `afx`、未知 server 0 を実 CLI のフィールドに合わせて固定
-48. Task graph `D-9 after C-8` / `F-12 after 1..11` / `F-13 after 12` を実装計画の依存表・同一ファイル競合順と一致させる
-49. 実測継続: PID namespace、apps egress、Claude fsize/init/auth rotation、exec closure drop、trade/improve writer 負荷、power-loss 時の version/git/live durability。ツール引数・syscall wrapper の選択はここで具体化 (RENAME_EXCHANGE は R12 で §A へ)
+**D. wave / slot / Mission ライフサイクル**
 
-**codex 5 周目から (要約)**:
+17. scheduler は「`now` 以下で最新の scheduled occurrence」から period key を作る。weekly / daily / restart / 跨 period / DST / catch-up / M=0 / manual overlap の transition matrix と `improve_waves` CAS test
+18. wave + slot を 1 tx で作成 (= period 消費)、Tx-0 の claim CAS、`ready` → `running` commit → `go`、**`go` 前の tool/agent 実行ゼロ**の protocol test
+19. pre-ready 失敗は同一プロセス内で `claimed→reserved` + **`mission_id=NULL`** + `spawn_attempts` 保持 (初回 + 再試行 1 回)、枯渇で `failed`
+20. restart 時は**再開しない**: `reserved` (`mission_id IS NULL` を assert) / `claimed` / `running` (mission interrupted) を全て `failed` へ収束させる SQL・fault matrix。manual one-shot は slot 無し
+21. `finish_improve_mission` が slot + mission + run + backlog を**同一 tx**で更新する唯一の terminal helper であること (Tx-2 成功 / 補償 / 4 runner status / 出力不正 / shutdown)
+22. run lifecycle `CREATED → BOUND → FINISHED` が全経路で Mission と一対一・dangling 無し
 
-50. provider 別 credential matrix: `codex+llama_swap` は auth copy/auth 検査なし (空 `CODEX_HOME` + 非秘密 `env_key`) を fake + 実 1 ターンで固定。成立しなければ fail closed
-51. wave/slot の durable 状態機械: reserve・claim・spawn 前後・crash・restart の全 fault point で「0 件なら再開・1 件以上なら消費」を検証
-52. switch ジャーナル (5 周目 `plugin_promotions` → 6 周目 `plugin_switch_journal` に一般化) の DDL/phase と、切替直後 crash → reject/expire/reconcile の multi-process matrix。CAS 敗者は live を変えない
-53. risk-gate report の in-sample/OOS/baseline sink と payload を本体設計書 §6 に逐語対応、holdout 派生値が worker/次回注入/RPC に出ない pin 【R12: §A へ】
-54. Tx-0 = `missions.start(commit=False)` + run INSERT + slot claim の 1 tx、両 INSERT 間 crash/例外と `mission_id` 一意性の migration test
-55. rollback target = D4 admission が approved の版のみ (adopted 無承認・後発 reject 済み・同名別 hash・既存 approved の matrix) 【R12: §A へ】
-56. report の temp write/fsync/atomic publish (`RENAME_NOREPLACE`)/補償 unlink/起動時 orphan reconcile を fault-injection で固定
-57. `PluginMeta` の固定 manifest (`path/content_hash/artifact_hash`) と snapshot copy 前後照合を型・loader test に
-58. slot write 接続 / dispatcher RO 接続 / 台帳 lock / Tx-0/1/2 の thread ownership diagram と N=4 + 遅延 RPC + trade writer 負荷 test を維持
-59. run lifecycle: pre-Tx-1 failure / 敗者 / Tx-2 rollback / interrupted の全経路で FINISHED・Mission と一対一・dangling 無し
-60. Task graph `A-4 after A-1,B-5` / `D-9 after C-8` / `F-12 after 1..11` / `F-13 after 12` を同一ファイルの merge 順と一致させる
-61. 既存 blocking mutation 群 (候補 ro、dirfd/name、bare git、全 decision `flock`、固定 source snapshot、report 親専有) を crash matrix と分けずに転写 (RENAME_EXCHANGE は R12 で §A へ)
-62. 実測継続 (PID namespace、apps egress、Claude fsize/init/auth rotation、exec closure drop、writer 負荷、version/git/live/report の power-loss durability)。CLI 引数・MCP field・syscall wrapper はここで具体化 (RENAME_EXCHANGE は R12 で §A へ)
+**E. transaction / 接続**
 
-**codex 6 周目から (要約)**:
+23. Tx-0 = `missions.start(commit=False)` + run INSERT + slot claim の 1 tx。両 INSERT 間 crash と `improvement_runs.mission_id` 部分 UNIQUE の migration test
+24. Tx-1 の backlog CAS (`BEGIN IMMEDIATE` + 条件付き UPDATE + `rowcount`) が唯一の線形化点で、**勝者だけが副作用を出す** transaction 境界
+25. 長時間処理 (pytest / backtest / report 生成) が transaction の外であることと、Tx-2 に集約する SQL sequence。全 store helper の `commit=False` 変種の列挙 (`save_harness_run` / `approvals.create` / `apply_decision` / `expire_due` / `improve_runs.*` / `analysis_runs.save` / `backlog.*` / `missions.start|finish`)
+26. slot write 接続 / dispatcher RO 接続 / 台帳 lock の ownership diagram と、N=4 + 遅延 RPC + 取引 writer 同時負荷テスト (busy timeout・rollback 混線ゼロ)
+27. backlog × approval の状態直積から許可遷移と `last_result` / `attempts` 更新 transaction の表
 
-63. (89 に統合) wave slot `reserved/claimed/running/done/failed`: Tx-0 claim、`ready` → `running` commit → `go`、`started_at`、spawn 初回 + 再試行 1 回、crash、restart の各 fault point で「全 slot `started_at IS NULL` の wave だけ削除され period を消費しない・`ready` 後は再実行しない・`go` 前は副作用ゼロ」を固定 【R12: §A へ】
-64. report の `report_state` outbox と、temp-only / DB-only / final-only / DB+final の起動時収束表。post-COMMIT 公開失敗時の `done→observation`、`result/report_path` clear を同表に
-65. `plugin_switch_journal` の `old_kind` / old version identity / residue locator と、absent/symlink/plain × phase × approve/reject/expire/rollback/crash の matrix 【R12: §A へ】
-66. 同名 plugin の未完 switch を 1 件に制限する部分 UNIQUE と、同名別 hash の approve/reject/rollback が先行ジャーナルを必ず収束させる multi-process test 【R12: §A へ】
-67. adopted-only 版の fail closed 統一と、`plugin bless-version` (保管版の再ゲート → D4 approved decision) の API/CLI/test 【R12: §A へ】
-68. rollback switch ジャーナルの intent-before-FS・rename・activity 同 tx・起動時 complete/revert の fault-injection。approval 行を変えない pin 【R12: §A へ】
-69. risk-gate proposal の exact key/type/range/pair schema、`unsupported_param`、strategy×pair 単一再生、最低取引数の単位、`backtest_runs` identity を現行 holdout API/DB schema へ逐語対応 【R12: §A へ】
-70. §4 変異の Tx-0 run create / Tx-1 bind 分離、auth 無し llama-swap の provider 固有 blocking (`improve.llama_swap_verified`) を task graph に明記
-71. `plugin_versions` = 初回 provenance/GC root、switch ジャーナル/activity = rollback 履歴の所有分離。`INSERT OR IGNORE` で消える行を監査に使わない 【R12: §A へ】
-72. Tx-0/1/2・Mission/run/slot 終端・slot write/dispatcher RO/台帳 lock の ownership diagram と N=4 + 遅延 RPC + trade writer 負荷 test へ転写
-73. 既存 blocking mutation 群 (候補 ro、dirfd/name、bare git、全 decision flock、固定 source snapshot、report 親専有、OOS 非露出) を新 crash matrix と同じ計画で維持 (RENAME_EXCHANGE は R12 で §A へ)
-74. 実測継続 (auth 無し llama-swap、PID namespace、apps egress、Claude fsize/init/auth rotation、exec closure drop、writer 負荷、power-loss durability)。CLI 引数・MCP field・SQL helper・syscall wrapper はここで具体化 (RENAME_EXCHANGE は R12 で §A へ)
+**F. 承認ライフサイクル (3 経路・ジャーナル・版・git)**
 
-**codex 7 周目から (要約)**:
+28. 3 経路を別々の SQL sequence として固定: **P1 submit** (staging / `_human`、pending + 証跡のみ・ジャーナル無し) / **P2 approve** (`preparing` ジャーナル → 版 → git → 切替 → decide) / **P3 bless --from _human** (live の形で二分: absent・symlink は 1 tx で pending + 証跡 + ジャーナル、プレーンは pending + 証跡のみ → `legacy_plain_present`)
+29. `candidate_origin` / 正規形 `candidate_path` の payload validator、staging と human の掃除所有、retry / restart / reject / expire / `candidate_missing` の fixture
+30. ジャーナルは `old_kind ∈ {absent, symlink}` のみ。absent / symlink × phase × approve・bless・reject・expire・crash の matrix。`switch_required=0` は `recorded → decided`
+31. `op_id` 起点の `temp_path` locator、同名の非終端行を 1 件に限る部分 UNIQUE、`switched` の `live==new` / `live==old` 収束規則
+32. **全 terminal decision** (approve / reject / expire / invalidate / reconcile / bless) が同じ plugin `flock` を通り、CAS 敗者が live を変更しない multi-process test
+33. legacy plain: 版 + git 記録の後 `legacy_plain_present` pending → `afx plugin retire <name>` (flock・未完ジャーナルは拒否・1 rename → `_retired/`・activity) → `approval retry` で absent → symlink。**retire 前後の稼働 E2E** (再起動まで旧 `PluginMeta.path` を使う事実の確認)
+34. `GC_ROOTS` を単一 helper / query にし、**journal-first / sweep-last** の起動順序を版・temp・staging の crash matrix で固定
+35. bare git の unborn / detached / CAS 競合 / identity 欠如 / 空 tree、版 dir の fsync、**git 後・切替前**と**切替後・decide 前**の fault matrix
+36. `content_hash` (2 本) と `artifact_hash` (3 本) の分離。同 code/config・異 test の 2 版が版ストアと履歴に共存する pin。`PluginMeta` の固定マニフェストと snapshot 前後の照合
+37. 版ストア不変 pin (0400/0500) と `materialize` → `_human` → ゲート → `submit|bless --from _human` の CLI / E2E。ディレクトリ名と実 `artifact_hash` の不一致を loader / reconcile が拒否
+38. **既存 approval 行の互換 migration** (§5.5): 3 フィールドを欠く pending は `invalidated(legacy_payload_requires_resubmit)`、終端行は D4 用に保持、`artifact_hash` 欠損行は GC root を持たない。混在 DB・冪等起動の fixture
+39. D4 の key を `(name, content_hash)` に統一し、同名別 hash の approve / reject 並行テスト
 
-75. worker startup を `ready / running-CAS / go` の sequence diagram と protocol test にし、`go` 前の tool/agent 実行ゼロを固定
-76. wave/slot/Mission/run の全終端表 (pre-ready retry 枯渇、schema mismatch、4 status、Tx-2 補償、shutdown、restart、実行 0 件 wave の削除) を SQL transaction と fault point に
-77. partition ヒントは非永続・再計算 (I3 簡素化側)。再 claim 時の重複は Tx-1 CAS が解く — hint 外選択の activity と敗者 observation を test に
-78. switch ジャーナルの参照 path を `GC_ROOTS` に加え、journal-first / sweep-last の起動順序を version/temp/residue の crash matrix で固定 【R12: §A へ】
-79. approve/bless/bless-version/rollback の phase × live 形 × DB decision/activity の収束表 (`preserved` 先行、`switched` の live==new/old 規則) を fault injection 【R12: §A へ】
-80. adopted-only は直接 rollback 不可、`bless-version` の全ゲート + approved 決定後のみ可、を本文・mutation・blocking の同一文言でテストへ 【R12: §A へ】
-81. `bless` / `bless-version` の kind 別ゲートを通常 submit と共有し、strategy は最低 30 取引・固定 holdout・baseline を欠けば approval/切替を作らない pin 【R12: §A へ】
-82. risk proposal は `pair_rules.keys ⊆ proposal.pairs`、eligible cell、strategy ごとの最低取引数、deep-merge 全体 validation、baseline/candidate の settings hash 対応を exact schema/test に 【R12: §A へ】
-83. `afx improve verify-backend` を production enable と分離し、false のまま one-shot E2E、成功後の人間による true 設定、通常入口の fail closed を固定
-84. report publication は eventual invariant として temp-only / prepared+temp / prepared+final / published+final / published+missing / failed+residue の収束表と power-loss test
-85. `artifact.type` ごとの親出力検査を schema test にし、report/observation が plugin-only の name/path 検査を通らないことを固定
-86. Tx-0/1/2・slot write/dispatcher RO/台帳 lock・Mission/run 一対一を ownership diagram と N=4 + 遅延 RPC + trade writer 負荷 test に転写
-87. 既存 blocking mutation 群を新しい slot/journal matrix と同じ計画で維持
-88. 継続実測 (auth 無し llama-swap、PID namespace、apps egress、Claude fsize/init/auth rotation、exec closure drop、writer 負荷、power-loss durability)。CLI 引数・MCP field・SQL helper・syscall wrapper はここで具体化 (RENAME_EXCHANGE は R12 で §A へ)
+**G. ゲート / 成績行**
 
-**codex 8 周目から (要約)**:
+40. strategy ゲート: candidate / baseline / `no_strategy` の identity、pair・timeframe・scope・settings hash・row id と approval payload の一対一対応、`latest_in_sample_metrics` (variant='candidate') と in-sample view の query fixture、`EVALUABLE_MIN_TRADES` の集計単位 (meta.pairs 合計)
+41. `bless --from _human` も kind 別ゲートを通常 submit と共有し、strategy は最低取引数・固定 holdout・baseline を欠けば approval も切替も作らない pin
+42. `artifact.type` ごとの親出力検査を schema test にし、report / observation が plugin 専用の name / path 検査を通らないこと。`proposal_kind='risk_gate'` は `unsupported_in_plan10` observation (レポート無し)
 
-89. wave/slot/Mission/run の sequence と全終端表を、`ready/running/go`、`started_at`、pre-ready retry 枯渇、post-ready 4 status、shutdown、restart の SQL transaction/fault point に 【R12: §A へ】
-90. `finish_improve_mission` が slot+mission+run+backlog を同一 tx で更新し、手動 one-shot だけ slot 無しになる ownership diagram と test
-91. weekly/daily scheduled wave と manual one-shot の Tx-0 分岐、period key、DST/catch-up/M=0/N=4 の transition matrix
-92. `GC_ROOTS` を単一 helper/query にし、journal-first/sweep-last を version/temp/residue/staging の crash matrix で固定 【R12: §A へ】
-93. `op_id` 起点の temp/residue locator、`switch_required=0`、plain/symlink/absent × phase × live × DB decision/activity の表 【R12: §A へ】
-94. rollback の exact artifact approval query を same content/different test・adopted・bless-version・後発 reject の fixture で固定 【R12: §A へ】
-95. strategy baseline/candidate の identity、pair/timeframe、in-sample/holdout、settings_hash、新規 strategy の `no_strategy` baseline を payload 行へ一対一対応
-96. risk proposal の global/pair-scoped 混在 schema、導出 `affected_pairs`、baseline/候補双方の strategy ごと 30 件、0 cell、deep-merge を exact test に 【R12: §A へ】
-97. report outbox を temp-only / prepared+temp / prepared+final / published+final / published+missing / failed+residue の全状態表にし、補償 tx と directory fsync の fault test
-98. Tx-0/1/2・slot write/dispatcher RO/台帳 lock・Mission/run 一対一を N=4 + 遅延 RPC + trade writer 負荷 test へ転写
-99. 1・2 周目から維持する blocking mutation を新しい wave/journal matrix と同じ計画で維持
-100. `afx improve verify-backend` の one-shot protocol、成功 fingerprint、false→人間 true、通常入口 fail closed を CLI/E2E に
-101. 実測継続 (auth 無し llama_swap、PID namespace、apps egress、Claude fsize/init/auth rotation、exec closure drop、writer 負荷、power-loss durability) (RENAME_EXCHANGE は R12 で §A へ)
-102. CLI の正確な引数、MCP protocol field、SQL helper、dirfd/openat、renameat2/fsync wrapper、fault-injection harness の選択は設計の粒度を超える — 意味論を変えない範囲で実装計画に具体化
+**H. report outbox**
 
-**codex 9 周目から (要約)**:
+43. report outbox の全状態表 (temp-only / prepared+temp / prepared+final / published+final / published+missing / failed+residue) と、補償 tx・`reports/` と `reports/.tmp/` の directory fsync の fault injection
 
-103. bless / bless-version を「gate sink + pending approval + journal の先行 tx → version/git/switch → apply_decision」にした sequence と、各 commit/rename 直後 crash の recovery。version/link/residue temp は全て `op_id` 起点 【R12: §A へ】
-104. `switch_required=0` は approve/bless=`recorded→decided`、rollback=`preserved→completed` とし、plain/symlink/absent × phase × live × DB の fault matrix 【R12: §A へ】
-105. CLI の completed/failed/timeout/max_turns/worker EOF/shutdown の全終端で同一 pgid を空にする ownership test (`setsid()` 逃避は記録のみ)
-106. 版ストア不変 pin と、symlink live を in-place 編集せず `materialize` → `_human` → gate → `submit|bless --from _human` する CLI/E2E。ディレクトリ名と実 `artifact_hash` の不一致は loader/reconcile が拒否 (**本プランへ**)。rollback 入口の照合は【R12: §A へ】
-107. rollback query を D4 latest content decision + exact artifact approved row で固定し、same content/different test・adopted-only・bless-version 後・後発 reject・切替済み pending を fixture 化 【R12: §A へ】
-108. `backtest_runs` の candidate/baseline/no_strategy identity と payload の row-id 対応、settings hash、pair/timeframe、in-sample/holdout を migration と query 単位で
-109. risk proposal の `affected_strategies` 非空 intersection、global/pair-only/mixed、無関係 pair strategy、baseline/candidate 双方の strategy ごと 30 を exact fixture に 【R12: §A へ】
-110. `finish_improve_mission` を Tx-2 成功・補償・4 runner status・出力不正・shutdown・restart の唯一の terminal helper にし、`slot_key=None` は manual のみ、の SQL/fault matrix
-111. spawn は初回 + retry 1 回、period 非消費は `all started_at IS NULL` のみ、と weekly/daily/manual/DST/catch-up の transition matrix 【R12: §A へ】
-112. report outbox の全状態表 (temp-only / prepared+temp / prepared+final / published+final / published+missing / failed+residue) と補償 tx・両 directory fsync の fault test
-113. 1・2 周目から維持する blocking mutation (reports 親専有、name/dirfd、候補 ro、exec closure、RPC freeze、backlog CAS、bare git、launcher、pycache prefix、task ownership) を wave/journal/baseline matrix と同じ計画で維持
-114. 実測継続 (auth 無し llama_swap、PID namespace、apps egress、Claude fsize/init/auth rotation、exec closure drop、writer 負荷、power-loss durability) (RENAME_EXCHANGE は R12 で §A へ)
-115. CLI 引数・MCP field・SQL helper・dirfd/openat・renameat2/fsync wrapper・fault-injection harness の選択は設計の粒度を超える — 確定意味論を変えない範囲で実装計画に具体化
+**I. config / migration / 有効化**
 
-**codex 11 周目 (2026-08-17) の申し送り (要約)**:
+44. 全新規 `_Strict` config (`improve.parallel` / `mission_max_turns` / `mission_timeout_sec` / `backtest_rpc_timeout_sec` / `max_new_backlog_per_mission` / `research.*` / `llama_swap_verified` / `schedule.improve_at` / `runner.claude.*` / `runner.codex.*` / `cli_terminate_grace_sec`) の `Settings` と `config/settings.yaml.example` の同期、および `RunnerChoice.backend` 拡張と trade+codex 拒否 validator
+45. `afx improve verify-backend` の one-shot protocol・成功 fingerprint・`false` のまま実行できること・成功後に人間が `true` を設定・通常入口は `false` で fail closed
+46. task graph (`A-4 after A-1,B-5` / `C-7 after B-5` / `D-9 after C-8` / `E-11 after 6,7,8` / `F-12 after 1..11` / `F-13 after 12`) を実装計画の依存表・同一ファイル merge 順と一致させる
 
-116. legacy plain: 承認は版 + git 記録後 `legacy_plain_present` pending → `plugin retire` (flock・未完ジャーナル拒否・1 rename → `_retired/`) → `approval retry` で absent → symlink、の sequence と、稼働中 `PluginMeta.path` が retire まで不変であること・retire 後〜再起動の実行失敗が運用注記どおりであることの E2E
-117. ジャーナルは `old_kind ∈ {absent, symlink}` のみ。absent/symlink × phase × approve/reject/expire/crash の matrix (plain 分岐は §A)
-118. 3 経路 (P1 staging submit / P1 `_human` submit / P3 `_human` bless) を gate/pending/evidence/journal/FS/decision の SQL sequence として別々に固定 (P1 はジャーナル無し)
-119. `candidate_origin` / 正規形 `candidate_path` の payload validator、staging と human の掃除所有、retry/restart/reject/expire/`candidate_missing` fixture
-120. wave COMMIT→Tx-0 間の `reserved`、`claimed`、`running` を restart 時に再実行せず failed へ収束させる SQL/fault matrix。manual one-shot は slot 無しを維持
-121. `finish_improve_mission` と起動時 recovery を、Tx-2 成功・補償・4 runner status・出力不正・shutdown・reserved/claimed/running crash の唯一の更新集合として fixture 化
-122. candidate/baseline/no_strategy の pair/timeframe/scope/settings hash/row id と approval payload の一対一対応、`latest_in_sample_metrics` / in-sample view の query fixture
-123. report outbox の temp-only / prepared+temp / prepared+final / published+final / published+missing / failed+residue と、補償 tx・両 directory fsync の fault injection
-124. bare git の unborn/detached/CAS 競合/identity/空 tree、版 fsync、git 後・switch 前、switch 後・decide 前の fault matrix
-125. CLI の全終端で pgid を空にする実プロセス ownership test。`setsid()` 逃避は事実記録に留める
-126. dirfd/openat、Landlock gate、exec closure drop、RPC freeze、backlog CAS、source snapshot、N=4 + trade writer 負荷を、1・2 周目から維持する blocking mutation として転写
-127. 実機 E2E: auth 無し llama_swap、PID namespace、apps egress、Claude fsize/init/auth rotation、power-loss durability (RENAME_EXCHANGE は §A へ)。CLI 引数、MCP field、SQL helper、syscall/fsync wrapper、fault harness の選択は実装計画で具体化
+**J. 実測 (実機・環境依存)**
+
+47. 継続実測: auth 無し llama_swap の実 1 ターン (provider 固有 blocking) / 非特権 PID+mount namespace (`/proc` の恒久対処) / `--disable apps` の egress 観測 / claude の rlimit 下実ターン・init tools・auth rotation / exec closure 1 要素 drop / 取引・改善の同時 writer 負荷 / 版・git・live・report の power-loss durability
+48. 3 backend での実機 E2E (「サンプル indicator plugin 1 本を候補に実装し親ゲートを通す」) — 既定 backend 見直しの材料
+49. **CLI の正確な引数・MCP protocol field・SQL helper・dirfd/openat・fsync wrapper・fault-injection harness の選択は設計の粒度を超える** — 本書で確定した意味論を変えない範囲で実装計画に具体化する
 
 ## 9. 変えないもの
 
@@ -782,6 +721,7 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 | 9 | 2026-08-16 | codex (gpt-5.6-sol) | C0 / I6 / M6 = 12 件 (ユーザー裁定でフルスコープ継続) | **全件採用**。I1 bless / bless-version を approve と同一ライフサイクル (ゲート → pending 行 + ゲート行 + ジャーナル行を FS 前の 1 tx → 版/git/切替 → `apply_decision`)、temp は全て `tmp-<op_id>` / I2 `CliRunner` の `finally` で全終端に pgid を空にしてから返す / I3 版ストア不変 (0500/0400)、ディレクトリ名 hash 照合、symlink live への bless 拒否 → `materialize` → `_human/` 候補経路 / I4 `backtest_runs.variant` (candidate/baseline/no_strategy) + `ref_*`、`no_strategy` の identity、`latest_in_sample_metrics` は candidate のみ / I5 `affected_strategies` の定義 (非空 intersection、空は評価不能、`unaffected` 列挙) / I6 架空の `backtest.min_trades` を撤去し既存 `EVALUABLE_MIN_TRADES` を明示 / M1 Tx-2 の末尾は `finish_improve_mission` 1 回 / M2 §5.3(c)・§7.1-4 の旧文を訂正 / M3 §4.2 の report reconcile 再掲を §4.1 参照に / M4 §3 の旧 partition 変異を削除 / M5 `spawn_attempts` = 初回 + 再試行 1 回に統一 / M6 §8.1-63 を 89 に統合。旧前提の残骸を再掃除 |
 | 10 | 2026-08-16 | codex (gpt-5.6-sol) | C0 / I4 / M1 = 5 件 (由来: 前周修正 1 / 既存 3 / task 1)。**判定: 4 領域 ((a) rollback/bless-version/adopt (b) risk_gate 親評価 (c) slot 再開 (d) bless in-place) を起票/簡素化すれば設計レベル Critical/Important 0** | **ユーザー裁定 R12 (2026-08-17)**: (a)(b)(d) を起票 (§A に設計を保存)、(c) を簡素化。I1 (`op_id` 採番前の temp 名) は `preparing` phase の先行 INSERT で採用 / I2・I4 は (a)(d) の削除で消滅 / I3 (risk proposal の成績 identity) は (b) の削除で消滅 (`variant` は plugin admission 用だけ残す) / M1 E-11 の依存に C-7 を追加。§5 を縮小版で書き直し、§3.1 wave/slot・§4.2-6・§4.3・§7・§8・§9・§10 を整合。11 周目は縮小版の収束確認 |
 | 11 | 2026-08-17 | codex (gpt-5.6-sol) | C0 / I5 / M3 = 8 件 (縮小版 1 周目) | **全件採用**。**I1/I2 (legacy plain の稼働中切替と plain 復旧状態機械) は指揮者裁定でさらに簡素化**: plain live は自動で切り替えず、承認は版 + git 記録後 `legacy_plain_present` pending → 人間の `plugin retire <name>` (flock・未完ジャーナル拒否・1 rename → `_retired/`) → `approval retry` で absent → symlink。`RENAME_EXCHANGE`・`retired_path`・`old_kind='plain'` を撤去 (§A.1/§A.4 に保存、起票) / I3 3 経路 P1 submit (pending + 証跡、ジャーナル無し) / P2 approve (`preparing` → 版/git/切替 → decide) / P3 bless (1 tx で pending + 証跡 + `preparing`) を全節で同語に / I4 payload `candidate_origin`+`candidate_path`、locator 検証・掃除表・`candidate_missing` / I5 既存 wave の `reserved` slot も起動時 failed / M1 `status IN ('claimed','running') → failed` / M2 §10 は risk_gate 全体 `unsupported_in_plan10` / M3 §8.1 の混在項目を分割、report outbox の tag を外す |
+| 12 | 2026-08-17 | codex (gpt-5.6-sol) | C0 / I4 / M1 = 5 件 (11 周目 8 件の閉鎖判定: 閉じた 4 / 部分 4) | **全件採用** (`codex-round12.md`)。I1 §2.3 の legacy plain 自動切替の残骸を除去 / **I2 P3 (`bless --from _human`) を live の形で二分** (プレーンなら `preparing` ジャーナルを作らず `legacy_plain_present` pending — `old_kind` の CHECK と両立させる) / I3 pre-ready 再試行で `mission_id=NULL` も戻す / **I4 既存 approval 行の互換 migration を新 §5.5 に新設** / M1 **§8.1 をタグ無しの確定リストへ全面書き直し** (重複排除・領域別 49 項目、§A 分は §A 末尾へ別掲)。適用は fable のセッション上限により指揮者 (opus) が直接実施 |
 
 
 ---
@@ -909,3 +849,15 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 > - 巻き戻し: `old_kind='plain'` → `retired_path` のプレーン dir と temp symlink を再度 `RENAME_EXCHANGE` で入れ替えて戻す (`retired_path` が無ければ ERROR で人間待ち)
 > - `GC_ROOTS` に `retired_path` を含める
 > - codex 11 周目 I1/I2 の指摘: 稼働中に exchange すると `PluginMeta.path` (プレーンなら `plugins/<name>` そのもの) が退避先を指せず plugin が停止する / plain の `switched` phase は exchange 前後と retire 前後を表せず reject 復旧が旧 live を戻せない → 起動時 reconcile での切替 or plain 専用 phase (`exchanged` / `retired`) が要る。プラン 10 は人間の `retire` に倒した
+
+### A.5 §A の機能を実装するときの申し送り (プラン 10 の §8.1 からは外したもの)
+
+後続プランで (a)(b)(d)・slot 再開を実装する場合の、codex 1〜12 周目レビューで確定していた検証項目:
+
+1. `RENAME_EXCHANGE` の ctypes 実装と非対応 FS/kernel の検出、plain↔symlink 交換の各 crash point (交換直後・retire 前・decide 前) と reconcile の期待状態の表
+2. rollback の admission query を「D4 の最新 content decision が approved **かつ** 対象 `artifact_hash` を持つ approved approval 行が在る」で固定し、same content / different test・adopted-only・`bless-version` 後・後発 reject・切替済み pending を fixture 化
+3. `plugin bless-version <name> <artifact_hash>` (保管版の再ゲート → D4 approved decision) の API / CLI / test。adopted-only 版の直接 rollback は fail closed
+4. rollback 用 switch ジャーナル (intent-before-FS・rename・activity 同 tx・起動時 complete/revert) の fault injection と、approval 行を変えない pin
+5. `plugin_versions` = 初回 provenance / GC root、switch ジャーナル + activity = rollback 履歴、の所有分離 (`INSERT OR IGNORE` で消える行を監査に使わない)
+6. risk_gate proposal の exact key / type / range / pair schema、導出 `affected_pairs` と `affected_strategies`、strategy × pair の単一再生、baseline と candidate **双方**の strategy ごと最低取引数、deep-merge 後の全体 validation、`backtest_runs` の identity 対応
+7. wave slot の再開機構 (`started_at`・全 failed wave の削除で period を返す・`claimed→reserved` の同 period 再開) の SQL state machine と、wave 作成〜Tx-0〜spawn〜ready の各 crash fault point
