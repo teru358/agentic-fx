@@ -2420,6 +2420,18 @@ def test_build_runner_trade_profile_uses_trade_choice(tmp_path):
     settings = load_settings(EXAMPLE)  # trade.backend == local
     runner = build_runner("trade", settings, ToolRegistry(), workdir=tmp_path)
     assert isinstance(runner, LocalRunner)
+
+
+def test_build_runner_local_backend_forwards_on_message(tmp_path):
+    # 3 周目レビュー Important-1 の随伴修正: local backend でも on_message が
+    # LocalRunner まで配線されることを確認する (mission_worker からの
+    # transcript/event 転送が local backend だけ静かに欠落するのを防ぐ)。
+    settings = load_settings(EXAMPLE)  # 既定 improve.backend == local
+    received = []
+    runner = build_runner(
+        "improve", settings, ToolRegistry(), workdir=tmp_path,
+        on_message=received.append)
+    assert runner._on_message is received.append
 ```
 
 **注**: この Step は Task 2/3 (`ClaudeRunner`/`CodexRunner`) 完成後でないと green にならない — `factory.py` 自体は Task 1 で実装するが、`test_build_runner_claude_backend_*`/`test_build_runner_codex_backend_*` は Task 2/3 の完了後に green 化する (import エラーで collection failure になる間は `pytest.importorskip` で退避するか、Task 1 の完了条件からこの 2 本を除外し Task 2/3 の受入条件に含める — **実装計画の申し送り**: 依存グラフ上 Task 2/3 は Task 1 の後続なので、この 2 テストは Task 2/3 の Step としても再掲し、そちらで green を確認する)。
@@ -2463,7 +2475,8 @@ def build_runner(
     choice = getattr(settings.runner, profile)
     if choice.backend == "local":
         return LocalRunner(base_url=settings.llama_swap.base_url,
-                           model=choice.model, registry=registry)
+                           model=choice.model, registry=registry,
+                           on_message=on_message)
     if choice.backend == "claude":
         from agentic_fx.runners.claude_runner import ClaudeRunner
         return ClaudeRunner(
@@ -2504,6 +2517,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 |---|---|---|
 | M1 | `profile` を無視し常に `settings.runner.improve` を見る | `test_build_runner_trade_profile_uses_trade_choice` |
 | M2 | trade profile の `allowedTools` に `"Bash"` を混入させる | Task 2 の trade+claude allowedTools pin テストが殺す (相互参照 — 本 task では factory 単体の green で確認しきれないため、実装時に `test_build_runner_trade_claude_allowed_tools_excludes_bash` を factory テストにも追加する) |
+| M3 | `local` 分岐の `LocalRunner(...)` から `on_message=on_message` を落とす | `test_build_runner_local_backend_forwards_on_message` (3 周目レビュー Important-1 の随伴修正) |
 
 - [ ] **Step 30: コミット**
 
@@ -4279,10 +4293,11 @@ def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
 
     captured = {}
 
-    def spy(profile, settings, registry, *, workdir):
+    def spy(profile, settings, registry, *, workdir, on_message=None):
         captured["profile"] = profile
         captured["backend"] = getattr(
             getattr(settings.runner, profile, None), "backend", None)
+        captured["on_message"] = on_message
         # 実 CLI/実 LLM を起動しない fake を返す — 構築経路の到達のみ確認する。
         class _Fake:
             def run(self, mission):
@@ -4298,6 +4313,9 @@ def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
         profile="improve", settings=settings, workdir=tmp_path)
     assert captured["profile"] == "improve"
     assert captured["backend"] == backend
+    # 3 周目レビュー Important-1: on_message が callable として配線されている
+    # ことを assert する — 落とすと transcript/event 転送が全 backend で失われる。
+    assert callable(captured["on_message"])
 ```
 
 （`_settings_with_improve_backend` は `tests/test_mission_worker.py` の既存
@@ -4323,16 +4341,24 @@ runner = LocalRunner(...)
 from agentic_fx.runners import factory as runner_factory
 
 # 変更後 (該当関数内)
+on_message = _make_on_message(protocol_out, out_seq)
 runner = runner_factory.build_runner(
-    "improve", settings, registry, workdir=workdir)
+    "improve", settings, registry, workdir=workdir,
+    on_message=on_message)
 ```
 
 へ置換する (`factory.build_runner` のシグネチャは Task 1 の Interfaces 節を正とする —
-`profile`/`settings`/`registry`/`workdir` の 4 引数)。旧ガード (`RuntimeError`) は
-`factory.build_runner` 内の schema 検証 (`^(local|claude|codex)$`) と trade+codex
-拒否 validator (Task 1) に置き換わって消える。`import agentic_fx.mission_worker as mw_mod`
-経由で参照する `mw_mod.runner_factory` は、この module level import によって
-`mission_worker` モジュールの属性として存在する。
+`profile`/`settings`/`registry`/`workdir`/`on_message` の 5 引数)。旧ガード
+(`RuntimeError`) は `factory.build_runner` 内の schema 検証
+(`^(local|claude|codex)$`) と trade+codex 拒否 validator (Task 1) に置き換わって
+消える。`import agentic_fx.mission_worker as mw_mod` 経由で参照する
+`mw_mod.runner_factory` は、この module level import によって `mission_worker`
+モジュールの属性として存在する。現物 `mission_worker.py:409`
+(`on_message = _make_on_message(protocol_out, out_seq)`) は削除せず維持し、
+置換後の `build_runner` 呼び出しへそのまま渡す — これを落とすと
+`WorkerRunner._run_with_child` の `handle_event` (`worker_runner.py:105-114`)
+に `event` フレームが届かず、improve 全 backend の transcript が構造的に
+失われる (3 周目レビュー Important-1)。
 
 - [ ] **green を確認** — `uv run pytest tests/test_mission_worker.py -v -k builds_runner_via_factory`
 - [ ] **変異テスト**
@@ -4341,6 +4367,7 @@ runner = runner_factory.build_runner(
 |---|---|---|
 | M1 | `factory.build_runner` を呼ばず `backend != "local"` の旧ガードへ戻す | `test_mission_worker_builds_runner_via_factory_for_all_improve_backends[claude]`/`[codex]` |
 | M2 | `profile="improve"` を渡さず `"trade"` を渡す | 同上 (`captured["profile"]` の assert が落ちる) |
+| M3 | `on_message=on_message` を渡さず (または `on_message=None` に固定して) `build_runner` を呼ぶ | 同上 (`assert callable(captured["on_message"])` が落ちる — 3 周目レビュー Important-1) |
 
 - [ ] **コミット** — 束 B Task 5 の同一ファイル改修サイクルに合流させる (Step 7c と同じ理由)。
 
@@ -5312,7 +5339,10 @@ class WorkerRunner(AgentRunner):
                 ready = self._wait_with_stop(
                     ready_queue, timeout=w.worker_startup_timeout_sec)
                 if self._on_ready is not None:
-                    self._on_ready(ready)
+                    try:
+                        self._on_ready(ready)
+                    except Exception:  # noqa: BLE001
+                        _log.exception("on_ready callback failed")
                 if not ready.get("ok", False):
                     status = "failed"
                     return MissionResult(status, None, transcript)
@@ -8135,7 +8165,16 @@ from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.tools.registry import ToolDef
 
 _FORBIDDEN_KEYS = frozenset({
-    "period_start", "period_end", "start", "end", "window", "timestamps"})
+    "period_start", "period_end", "start", "end", "window", "timestamps",
+    # `period`/`now` (10.9 節 Step 11 追記): `_build_rpc_handlers` の
+    # run_backtest handler は `_run_scope` の save_kwargs (`period=
+    # (period_start, period_end)` タプル、`now` datetime) をそのまま
+    # 戻り値へ混ぜて ledger.record の result_summary に載せる (10.10 節
+    # `_persist_ledger_rows` が読むための契約)。この 2 キーを剥がさないと
+    # `period_start`/`period_end` という平坦キーは無くても `period` タプル
+    # 経由・`now` 経由で期間端点/日時が agent へ漏れ、遮断7 の趣旨
+    # (「返却 schema に日時・期間端点…が無い」) に反する。
+    "period", "now"})
 
 
 def _strip_forbidden(d: dict) -> dict:
@@ -9629,7 +9668,8 @@ def test_latest_in_sample_metrics_ignores_baseline_and_no_strategy_rows(
 def _insert(conn, *, scope, issued_by, plugin_ref, content_hash, kind, pair,
            timeframe, source, period, metrics, settings_hash, core_commit,
            initial_balance, now, variant="candidate",
-           ref_plugin_ref=None, ref_content_hash=None) -> int:
+           ref_plugin_ref=None, ref_content_hash=None,
+           commit: bool = True) -> int:
     ...  # 既存の日時検証等はそのまま
     cur = conn.execute(
         "INSERT INTO backtest_runs (plugin_ref, content_hash, kind, pair, "
@@ -9641,7 +9681,8 @@ def _insert(conn, *, scope, issued_by, plugin_ref, content_hash, kind, pair,
          start_utc.isoformat(), end_utc.isoformat(), scope, issued_by,
          metrics_json, settings_hash, core_commit, initial_balance,
          now_utc.isoformat(), variant, ref_plugin_ref, ref_content_hash))
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.lastrowid
 
 
@@ -9650,7 +9691,8 @@ def save_harness_run(conn, *, scope, plugin_ref, content_hash, kind, pair,
                      core_commit, initial_balance, now,
                      variant: str = "candidate",
                      ref_plugin_ref: str | None = None,
-                     ref_content_hash: str | None = None) -> int:
+                     ref_content_hash: str | None = None,
+                     commit: bool = True) -> int:
     if scope not in _HARNESS_SCOPES:
         raise ValueError(f"scope must be one of {sorted(_HARNESS_SCOPES)}: {scope!r}")
     if variant not in ("candidate", "baseline", "no_strategy"):
@@ -9661,7 +9703,8 @@ def save_harness_run(conn, *, scope, plugin_ref, content_hash, kind, pair,
         source=source, period=period, metrics=metrics,
         settings_hash=settings_hash, core_commit=core_commit,
         initial_balance=initial_balance, now=now, variant=variant,
-        ref_plugin_ref=ref_plugin_ref, ref_content_hash=ref_content_hash)
+        ref_plugin_ref=ref_plugin_ref, ref_content_hash=ref_content_hash,
+        commit=commit)
 
 
 def latest_in_sample_metrics(conn, content_hash: str, *, pair: str) -> dict | None:
@@ -9675,6 +9718,35 @@ def latest_in_sample_metrics(conn, content_hash: str, *, pair: str) -> dict | No
 
 `save_human_run` は `variant`/`ref_*` を持たない (人間発行の custom scope は baseline 対応の対象外 — 既存シグネチャ不変)。
 
+**直前修正の申し送り②**: `save_harness_run`/`_insert` に `commit: bool = True`
+を追加した (§8.1-25 の宣言 `store.backtest_runs.save_harness_run(conn, *, ...,
+commit=True) -> int` と一致させる — これが無いと 10.10 節
+`_persist_ledger_rows`/`_persist_gate_rows` の `save_harness_run(conn,
+commit=False, ...)` 呼び出しが `TypeError: unexpected keyword argument
+'commit'` で Tx-2 全体を落としていた)。既定 `True` のため既存呼び出し元
+(`save_human_run` を含む) は無変更のまま動く。
+
+```python
+def test_save_harness_run_commit_false_does_not_commit(tmp_path, seeded_conn):
+    """直前修正の申し送り②: commit=False は conn.commit() を呼ばない —
+    呼び出し元 (10.10節 Tx-2) が自分でロールバック可能な状態を保つ。"""
+    from agentic_fx.store.backtest_runs import save_harness_run
+    seeded_conn.execute("BEGIN IMMEDIATE")
+    run_id = save_harness_run(
+        seeded_conn, scope="in_sample", plugin_ref="p", content_hash="h",
+        kind="indicator", pair="USDJPY", timeframe="1h", source="test",
+        period=(PERIOD_START, PERIOD_END), metrics=METRICS,
+        settings_hash="s", core_commit="c", initial_balance=10000.0,
+        now=NOW, commit=False)
+    seeded_conn.rollback()
+    row = seeded_conn.execute(
+        "SELECT COUNT(*) c FROM backtest_runs WHERE id=?",
+        (run_id,)).fetchone()
+    assert row["c"] == 0   # rollback で消えている = commit されていなかった
+```
+
+(このテストは Step 1 の失敗テスト群へ追記する。)
+
 - [ ] **Step 4: 成功を確認 / Step 5: 変異テスト**
 
 | # | 変異 | 殺すテスト |
@@ -9682,6 +9754,7 @@ def latest_in_sample_metrics(conn, content_hash: str, *, pair: str) -> dict | No
 | M1 | `AND variant='candidate'` を `latest_in_sample_metrics` の SQL から削除する | `test_latest_in_sample_metrics_ignores_baseline_and_no_strategy_rows` |
 | M2 | `variant` の既定値を `"candidate"` から `None` にする | `test_save_harness_run_default_variant_is_candidate` |
 | M3 | `ref_plugin_ref`/`ref_content_hash` を INSERT 文から落とす | `test_save_harness_run_accepts_variant_and_ref_fields` |
+| M4 | `commit=False` を無視して常に `conn.commit()` する (10.10節 Tx-2 が早期 commit されロールバック不能になる) | `test_save_harness_run_commit_false_does_not_commit`。10.11 節 `test_finalize_success_persists_ledger_and_gate_rows_in_tx2` も間接的に検出しうる (`commit()` パラメータ欠落だと TypeError で red になるため) |
 
 - [ ] **Step 6: コミット**
 
@@ -13468,7 +13541,7 @@ class ImproveLoop:
             rpc_timeout_sec_by_kind={
                 "run_backtest": self._settings.improve.backtest_rpc_timeout_sec,
                 "analyze_corr": self._settings.improve.backtest_rpc_timeout_sec})
-        rpc_handlers = self._build_rpc_handlers(ledger)
+        rpc_handlers = self._build_rpc_handlers(ledger, staging_dir=staging_dir)
         ctx = ImproveRunContext(
             mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
             source_snapshot_dir=source_snapshot_dir,
@@ -13491,8 +13564,8 @@ class ImproveLoop:
     def _materialize_workspace(self, mission_id, allowed_ids):
         raise NotImplementedError  # 10.3 節
 
-    def _build_rpc_handlers(self, ledger):
-        raise NotImplementedError  # Task 7 依存分。10.9 節で配線
+    def _build_rpc_handlers(self, ledger, *, staging_dir: Path):
+        raise NotImplementedError  # Task 7 依存分。10.9 節 Step 11 で完全実装する
 
     def _build_worker_runner(self, ctx):
         raise NotImplementedError  # Task 1 (C3) 依存。10.9 節 Step 7 で
@@ -14395,17 +14468,42 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.strategy_gate import evaluate_strategy_adoption_gate
+
+_SETTINGS = MagicMock()  # run_in_sample/run_holdout_gate は monkeypatch で
+                         # 差し替えるため settings の中身は本節のテストでは
+                         # 参照されない (build_intent_source も同様に
+                         # monkeypatch する — 下記 `_meta`/`_fake_intent_source`)
+
+
+def _meta(name="myst", pairs=("USDJPY",), timeframe="1h",
+         content_hash="h1") -> PluginMeta:
+    """`build_intent_source` に渡す最小の `PluginMeta` (直前修正の申し送り④)。
+    `path`/`params`/`max_bars` はこの節のテストでは使われない (`build_intent_source`
+    自体を monkeypatch するため) — real 値は不要。"""
+    from pathlib import Path
+    return PluginMeta(name=name, kind="strategy", path=Path("/tmp/x"),
+                      params={}, timeframe=timeframe, pairs=tuple(pairs),
+                      max_bars=1000, content_hash=content_hash)
+
+
+def _fake_intent_source(monkeypatch):
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.strategy_adapter.build_intent_source",
+        lambda meta, **kw: MagicMock(close=lambda: None))
 
 
 def test_below_evaluable_min_trades_is_observation_not_rejected(monkeypatch):
     """合計取引数 < 30 → 承認申請を出さず observation (悪いとは記録しない)。"""
+    _fake_intent_source(monkeypatch)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
         lambda *a, **kw: {"trades": 10, "pf": 1.0})
     verdict = evaluate_strategy_adoption_gate(
         MagicMock(), name="myst", pairs=["USDJPY"], timeframe="1h",
-        content_hash="h1", now=datetime(2026, 8, 22))
+        content_hash="h1", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta())
     assert verdict.evaluable is False
     assert verdict.observation_reason.startswith("insufficient_trades")
 
@@ -14413,6 +14511,7 @@ def test_below_evaluable_min_trades_is_observation_not_rejected(monkeypatch):
 def test_evaluable_min_trades_is_sum_across_pairs(monkeypatch):
     """`EVALUABLE_MIN_TRADES` の集計単位は meta.pairs 合計 (単一 pair
     ではない)。2 pair × 16 trades = 32 >= 30 で evaluable。"""
+    _fake_intent_source(monkeypatch)
     calls = []
     def _fake_run_in_sample(*a, **kw):
         calls.append(kw.get("symbol"))
@@ -14425,24 +14524,42 @@ def test_evaluable_min_trades_is_sum_across_pairs(monkeypatch):
         lambda *a, **kw: {"trades": 16, "pf": 1.1})
     verdict = evaluate_strategy_adoption_gate(
         MagicMock(), name="myst", pairs=["USDJPY", "EURUSD"], timeframe="1h",
-        content_hash="h1", now=datetime(2026, 8, 22))
+        content_hash="h1", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(pairs=("USDJPY", "EURUSD")))
     assert verdict.evaluable is True
     assert calls == ["USDJPY", "EURUSD"]
 
 
 def test_baseline_uses_live_d4_approved_same_name_strategy(
         monkeypatch, conn_with_approved_strategy):
+    _fake_intent_source(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, **kw: {"trades": 30, "pf": 1.2})
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: {"trades": 30, "pf": 1.1})
     verdict = evaluate_strategy_adoption_gate(
         conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
-        timeframe="1h", content_hash="h2", now=datetime(2026, 8, 22))
+        timeframe="1h", content_hash="h2", now=datetime(2026, 8, 22),
+        settings=_SETTINGS, meta=_meta(content_hash="h2"))
     assert verdict.baseline_variant == "baseline"
     assert verdict.baseline_row["ref_plugin_ref"] == "plugins/myst"
 
 
-def test_baseline_falls_back_to_no_strategy_when_no_approved_same_name(conn):
+def test_baseline_falls_back_to_no_strategy_when_no_approved_same_name(
+        monkeypatch, conn):
+    _fake_intent_source(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, **kw: {"trades": 30, "pf": 1.2})
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: {"trades": 30, "pf": 1.1})
     verdict = evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
-        content_hash="h3", now=datetime(2026, 8, 22))
+        content_hash="h3", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", content_hash="h3"))
     assert verdict.baseline_variant == "no_strategy"
     assert verdict.baseline_row is not None  # 決して null にしない
     assert verdict.baseline_row["plugin_ref"] == "no_strategy:brand_new_strategy"
@@ -14451,8 +14568,66 @@ def test_baseline_falls_back_to_no_strategy_when_no_approved_same_name(conn):
 def test_indicator_and_signal_kinds_skip_this_gate_entirely():
     verdict = evaluate_strategy_adoption_gate(
         None, name="myind", pairs=[], timeframe="1h", content_hash="h4",
-        now=datetime(2026, 8, 22), kind="indicator")
+        now=datetime(2026, 8, 22), kind="indicator", settings=_SETTINGS,
+        meta=None)   # kind!="strategy" は meta を使う前に早期 return する
     assert verdict is None
+
+
+def test_record_fn_is_forwarded_to_run_in_sample_and_run_holdout(
+        monkeypatch, conn_with_approved_strategy):
+    """3 周目レビュー Important-2: `record_fn` を渡すと `run_in_sample`/
+    `run_holdout_gate` の両方へそのまま転送される — 転送されないと Tx-2 の
+    外で即時 commit されてしまい、`ImproveLoop.commit` 手順4〜7-9 で組み立てる
+    `gate_rows` が常に空になる。"""
+    _fake_intent_source(monkeypatch)
+    seen_record_fns = []
+
+    def _fake_run_in_sample(*a, record_fn=None, **kw):
+        seen_record_fns.append(("run_in_sample", record_fn))
+        return {"trades": 30, "pf": 1.2}  # >= EVALUABLE_MIN_TRADES (30) で
+                                          # run_holdout まで到達させる
+
+    def _fake_run_holdout(*a, record_fn=None, **kw):
+        seen_record_fns.append(("run_holdout", record_fn))
+        return {"trades": 30, "pf": 1.1}
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        _fake_run_in_sample)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        _fake_run_holdout)
+    sentinel = object()
+    evaluate_strategy_adoption_gate(
+        conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        timeframe="1h", content_hash="h5", now=datetime(2026, 8, 22),
+        settings=_SETTINGS, meta=_meta(content_hash="h5"), record_fn=sentinel)
+    assert seen_record_fns == [("run_in_sample", sentinel),
+                               ("run_holdout", sentinel)]
+
+
+def test_content_hash_argument_wins_over_meta_content_hash(
+        monkeypatch, conn_with_approved_strategy):
+    """直前修正の申し送り④: `meta` は `intent_source` 構築のためだけに使う —
+    identity/persist に使う `content_hash` は明示引数 (10.6 節の再計算値) が
+    常に正であり、`meta.content_hash` が食い違っていても引数側が勝つ。"""
+    _fake_intent_source(monkeypatch)
+    seen_content_hashes = []
+    def _fake_run_in_sample(*a, **kw):
+        seen_content_hashes.append(kw.get("content_hash"))
+        return {"trades": 30, "pf": 1.2}
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        _fake_run_in_sample)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: {"trades": 30, "pf": 1.1})
+    evaluate_strategy_adoption_gate(
+        conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        timeframe="1h", content_hash="recomputed-hash",
+        now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(content_hash="stale-meta-hash"))
+    assert seen_content_hashes == ["recomputed-hash"]
 ```
 
 `conn`/`conn_with_approved_strategy` fixture は `tests/plugin/` 配下の既存 fixture パターン (着手時に現物確認) に合わせて用意する。
@@ -14478,9 +14653,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Callable
 
 from agentic_fx.backtest import holdout
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
+from agentic_fx.plugin import strategy_adapter
+from agentic_fx.plugin.loader import PluginMeta
+
+# `plugin/approval.py` の `_EVAL_SOURCE`/`_EVAL_TIMEFRAME_OVERRIDE` と同じ値
+# (approval.py は改修しない — 出典が違う独立モジュールなので値だけ複製する)。
+_EVAL_SOURCE = "dukascopy"
+_EVAL_TIMEFRAME_OVERRIDE = {"1d": "24h"}
+
+
+def _eval_timeframe(meta_timeframe: str) -> str:
+    return _EVAL_TIMEFRAME_OVERRIDE.get(meta_timeframe, meta_timeframe)
 
 
 @dataclass(frozen=True)
@@ -14495,24 +14682,69 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
 
 def evaluate_strategy_adoption_gate(
     conn, *, name: str, pairs: list[str], timeframe: str, content_hash: str,
-    now: datetime, kind: str = "strategy",
+    now: datetime, settings: "Settings", meta: "PluginMeta | None",
+    kind: str = "strategy",
+    history_conn=None,
     run_in_sample_fn=None, run_holdout_gate_fn=None,
+    record_fn: "Callable[[dict], None] | None" = None,
 ) -> "StrategyGateVerdict | None":
     """candidate/baseline/no_strategy の identity と評価可能性。
     indicator/signal はこのゲートを課さない (None を返す)。
-    """
+
+    **直前修正の申し送り④ (`run_in_sample`/`run_holdout_gate` の欠落引数)**:
+    現物シグネチャ `run_in_sample(settings, *, history_conn, symbol, source,
+    intent_source, eval_timeframe, plugin_ref, content_hash, kind, now,
+    record_fn=None)` (7-D) は `settings`/`history_conn`/`intent_source` を
+    必須で要求する。`history_conn` は明示指定が無ければ `conn` を再利用する
+    (既存 `plugin/approval.py:_validate_strategy` と同じパターン — この
+    改善ループの DB は単一ファイルであり、`backtest_runs`/`approval_requests`
+    は同じ接続で読み書きできる)。`intent_source` は候補ごとに
+    `strategy_adapter.build_intent_source(meta, conn=conn, pair=pair,
+    source=_EVAL_SOURCE, settings=settings)` で組み立て、`_validate_strategy`
+    と同じ try/finally で `close()` する (サンドボックスプロセスのリーク防止) —
+    in-sample ループと holdout ループはそれぞれ独立に構築・close する
+    (閉じた intent_source は使い回せない)。
+
+    **`meta` は `intent_source` 構築のためだけに使う — identity/persist に
+    使う `content_hash`/`timeframe` は常に明示引数 (10.6 節が再計算した値)
+    が正**。`meta.content_hash`/`meta.timeframe` が引数と食い違っていても
+    引数側が勝つ (10.6 節のハッシュ再照合の意図を保つ)。`kind != "strategy"`
+    のときは `meta` を一切参照せず早期 return するため `meta=None` で呼べる。
+    `eval_timeframe` は `plugin/approval.py:_eval_timeframe` と同じ写像
+    (`"1d"` → `"24h"`) を明示引数 `timeframe` へ適用する — 適用しないと
+    `bless`/`_validate_strategy` が書く行と `timeframe` 列が食い違い、
+    §4.2-4 の baseline/candidate identity が崩れる。
+
+    `record_fn` は `holdout.run_in_sample`/`run_holdout_gate` の
+    non-committing sink (Task 7-D、`_run_scope` の `record_fn(save_kwargs)`
+    契約 — 単一の dict を位置引数で渡す形。`ImproveLoop.commit` 手順4は
+    ここへ `list.append` を渡し、蓄積した行を Tx-2 (`_persist_gate_rows`)
+    へ渡す (設計書 §4.1「long-running work is outside tx」、3 周目レビュー
+    Important-2)。`None` (既定) のときは `holdout` 側が即時 commit する
+    従来経路のまま (Task 11 の `bless --from _human` など Tx-2 の外から
+    呼ぶ経路はこちらを使う)。"""
     if kind != "strategy":
         return None
+    history_conn = conn if history_conn is None else history_conn
     run_in_sample = run_in_sample_fn or holdout.run_in_sample
     run_holdout = run_holdout_gate_fn or holdout.run_holdout_gate
     plugin_ref = f"plugins/{name}"
+    eval_timeframe = _eval_timeframe(timeframe)
 
     per_pair = {}
     for pair in pairs:
-        per_pair[pair] = run_in_sample(
-            symbol=pair, source="dukascopy", eval_timeframe=timeframe,
-            plugin_ref=plugin_ref, content_hash=content_hash, kind="strategy",
-            now=now)
+        intent_source = strategy_adapter.build_intent_source(
+            meta, conn=conn, pair=pair, source=_EVAL_SOURCE,
+            settings=settings)
+        try:
+            per_pair[pair] = run_in_sample(
+                settings, history_conn=history_conn, symbol=pair,
+                source=_EVAL_SOURCE, intent_source=intent_source,
+                eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
+                content_hash=content_hash, kind="strategy", now=now,
+                record_fn=record_fn)
+        finally:
+            intent_source.close()
     total_trades = sum(m["trades"] for m in per_pair.values())
     evaluable = total_trades >= EVALUABLE_MIN_TRADES
     if not evaluable:
@@ -14521,9 +14753,18 @@ def evaluate_strategy_adoption_gate(
             observation_reason=f"insufficient_trades:{total_trades}")
 
     for pair in pairs:
-        run_holdout(symbol=pair, source="dukascopy", eval_timeframe=timeframe,
-                    plugin_ref=plugin_ref, content_hash=content_hash,
-                    kind="strategy", now=now)
+        intent_source = strategy_adapter.build_intent_source(
+            meta, conn=conn, pair=pair, source=_EVAL_SOURCE,
+            settings=settings)
+        try:
+            run_holdout(
+                settings, history_conn=history_conn, symbol=pair,
+                source=_EVAL_SOURCE, intent_source=intent_source,
+                eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
+                content_hash=content_hash, kind="strategy", now=now,
+                record_fn=record_fn)
+        finally:
+            intent_source.close()
 
     approved_row = conn.execute(
         "SELECT payload_json FROM approval_requests WHERE kind='plugin' "
@@ -14554,11 +14795,15 @@ class ImproveLoop:
     ...
 
     def _run_strategy_gate(self, conn, *, name, pairs, timeframe, content_hash,
-                           now, kind="strategy"):
+                           now, meta, kind="strategy", record_fn=None):
         return evaluate_strategy_adoption_gate(
             conn, name=name, pairs=pairs, timeframe=timeframe,
-            content_hash=content_hash, now=now, kind=kind)
+            content_hash=content_hash, now=now, settings=self._settings,
+            meta=meta, kind=kind, record_fn=record_fn)
 ```
+
+`meta` (`PluginMeta`、`intent_source` 構築専用 — 直前修正の申し送り④) は
+呼び出し元 (`commit()` 手順4、10.11 節) が候補ディレクトリから読み込んで渡す。
 
 `baseline_row` の実クエリ (live D4-approved 同名 strategy を "現在 live" と判定する条件) は `approval_requests` の `status='approved'` 最新行で近似した — **稼働中に reject/expire された旧承認との区別、および `plugins/<name>` が現在も symlink として生きているか (Task 11 の retire 経路で live から外れている可能性)** は本節の実装だけでは完全に閉じない。**Task 11 完了時に、この baseline クエリが live symlink / `GC_ROOTS` と整合するかどうかを Task 11 の受入条件として確認する** (統合裁定 R-i12 — 本節はここまでの近似で確定し、Task 11 側の受入条件としてフォローアップする)。
 
@@ -14577,6 +14822,9 @@ uv run pytest tests/plugin/test_strategy_gate.py -v
 | M3 | `baseline_row` を `None` のまま返す経路を残す (no_strategy 未実装退行) | `test_baseline_falls_back_to_no_strategy_when_no_approved_same_name` |
 | M4 | `kind != "strategy"` の早期 return を削る (indicator/signal にもゲートを課す) | `test_indicator_and_signal_kinds_skip_this_gate_entirely` |
 | M5 | baseline クエリの `AND status='approved'` を落とす (pending/rejected も baseline に使う) | 実装者が pending 承認だけがある fixture で「baseline が no_strategy になる」ことを確認する追加テストを書くこと (下限リスト不足、申し送り) |
+| M6 | `run_in_sample`/`run_holdout` 呼び出しから `record_fn=record_fn` を落とす (Tx-2 の外で即時 commit されてしまう) | `test_record_fn_is_forwarded_to_run_in_sample_and_run_holdout` (3 周目レビュー Important-2) |
+| M7 | `content_hash=content_hash` を `content_hash=meta.content_hash` に差し替える (直前修正の申し送り④ の回帰 — 10.6 節のハッシュ再照合が無意味になる) | `test_content_hash_argument_wins_over_meta_content_hash` |
+| M8 | `eval_timeframe = _eval_timeframe(timeframe)` の正規化を削り生の `timeframe` をそのまま渡す | 実装者が `timeframe="1d"` の candidate で `run_in_sample` に渡る `eval_timeframe` が `"24h"` であることを確認する追加テストを書くこと (下限リスト不足、申し送り — `_validate_strategy` と同じ写像を適用しないと baseline/candidate の `timeframe` 列が食い違う) |
 
 - [ ] **Step 6: コミット**
 
@@ -14694,7 +14942,9 @@ class ImproveLoop:
             "in_sample": gate_metrics.get("in_sample"),
             "holdout": gate_metrics.get("holdout"),
             "baseline": gate_metrics.get("baseline"),
-            "analysis_run_ids": [],  # Tx-2 で実 id を解決してから埋める (10.9節)
+            "analysis_run_ids": [],  # Tx-2 で実 id を解決してから埋める
+                                     # (10.10 節 `_finalize_success` — 直前
+                                     # 修正の申し送り③)
             "trial_count": trial_count,
             "analysis_call_count": len(analysis_entries),
             "backtest_call_count": len(backtest_entries),
@@ -14762,9 +15012,12 @@ EOF
 suite を成功扱いにしてしまい、原子性退行を検出できない (レビュー1周目 I3)。
 
 本 Step (10.9 の先頭) で、上記 2 本から `xfail` マーカーを削除する
-(`_materialize_workspace`(10.3)・`_build_rpc_handlers`・`_build_worker_runner`
-(本節 Step 7) が出揃った時点でこの節に達しているため、素の green として通る
-はずである)。削除後、以下のいずれかで xfail が残っていないことを確認する:
+(`_materialize_workspace`(10.3)・`_build_worker_runner`(本節 Step 7)・
+`_build_rpc_handlers`(本節 Step 11) が出揃った時点でこの節に達しているため、
+素の green として通るはずである)。**このため、以下の xfail 残存確認コマンドは
+Step 11 完了後にはじめて実行できる** — 本 Step ではマーカー削除だけを行い、
+実行確認は Step 11 の Step 4 相当として繰り返す。削除後、以下のいずれかで
+xfail が残っていないことを確認する:
 
 ```bash
 grep -n "xfail" tests/loops/test_improve_loop_prepare.py   # 0 件になること
@@ -15118,6 +15371,284 @@ EOF
 )"
 ```
 
+- [ ] **Step 11 (直前修正の申し送り①): `_build_rpc_handlers` を完全実装する**
+
+10.2 節で `NotImplementedError` のまま置いた `ImproveLoop._build_rpc_handlers`
+(`loops/improve_loop.py`、コメント「Task 7 依存分。10.9 節 Step 11 で完全実装する」)
+を、Task 7-D が確定した non-committing 版 (`analyze_for_agent(persist=False)`/
+`holdout.run_in_sample(record_fn=...)`) を握る親側 handler 2 種の完全実装へ
+置き換える。**意味論**: `run_backtest` handler は RO 接続で `run_in_sample` を
+`record_fn=<capture>` 付きで実行し、`_run_scope` (7-D) が `record_fn` へ渡す
+store-ready な save_kwargs をそのまま戻り値へ混ぜて返す。`analyze_corr` handler
+は `analyze_for_agent(..., persist=False)` を実行しその戻り値 (`{**save_params,
+**payload_body}`、7-D で確定済み) をそのまま返す。**この戻り値が
+`agentic_fx.tools.improve_rpc_tools.build_improve_rpc_tooldefs` (7-D、既存実装・
+本節では変更しない) の `ledger.record(result_summary=<戻り値>)` へそのまま渡る
+契約**であり、これを満たさない限り 10.10 節の `_persist_ledger_rows` が
+`summary[k]` で `KeyError` を送出し fail-closed する (10.10 節の申し送りが
+明記した契約 — 本節で満たす)。
+
+**呼び出し元の配線**: `staging_dir` (RPC の対象 candidate を探す根) は Tx-0
+(10.2 節 `prepare()`) で `_materialize_workspace` の直後、`ImproveRunContext`
+構築より前に確定している (`ctx` はまだ無い) ため、10.2 節の呼び出しを
+`self._build_rpc_handlers(ledger, staging_dir=staging_dir)` へ改める (本節
+冒頭で既に適用済み — 10.2 節・`_build_rpc_handlers` シグネチャの `staging_dir`
+引数を参照)。
+
+- [ ] **Step 11-1: 失敗するテストを書く**
+
+```python
+# tests/loops/test_improve_loop_rpc_handlers.py (新規)
+"""ImproveLoop._build_rpc_handlers — run_backtest/analyze_corr の親側
+実装 (設計書 §3.4、Task 7-D の non-committing 版を握る。直前修正の
+申し送り①)。"""
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.tools.improve_rpc_tools import build_improve_rpc_tooldefs
+
+_SAVE_KWARGS = dict(
+    scope="in_sample", plugin_ref="plugins/_staging/x/myst",
+    content_hash="cand-hash", kind="strategy", pair="USDJPY",
+    timeframe="1h", source="dukascopy",
+    period=(datetime(2020, 1, 1), datetime(2026, 1, 1)),
+    metrics={"pf": 1.3, "trades": 40}, settings_hash="s",
+    core_commit="c", initial_balance=10000.0, now=datetime(2026, 8, 22))
+
+
+def _patch_strategy_lookup(monkeypatch):
+    """candidate meta 解決 (`plugin_loader._discover_one`) と
+    `strategy_adapter.build_intent_source` を fake する — 本節が検査するのは
+    RPC handler と台帳/persist の結線であり、実バックテスト実行ではない。"""
+    fake_meta = SimpleNamespace(
+        name="myst", kind="strategy", timeframe="1h",
+        content_hash="cand-hash", pairs=("USDJPY",))
+    monkeypatch.setattr(
+        "agentic_fx.plugin.loader._discover_one",
+        lambda path, name: fake_meta)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_adapter.build_intent_source",
+        lambda meta, **kw: SimpleNamespace(close=lambda: None))
+
+
+def _patch_run_in_sample(monkeypatch, save_kwargs=_SAVE_KWARGS):
+    def _fake_run_in_sample(*a, record_fn=None, **kw):
+        record_fn(save_kwargs)
+        return dict(save_kwargs["metrics"])
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        _fake_run_in_sample)
+
+
+def test_run_backtest_handler_hides_period_and_now_from_agent(
+        loop_full, tmp_path, monkeypatch):
+    """遮断7: `_FORBIDDEN_KEYS` に `period`/`now` を足さないと、save_kwargs
+    をそのまま返す run_backtest handler が期間端点/日時を agent へ漏らす。"""
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    handlers = loop_full._build_rpc_handlers(ledger, staging_dir=staging_dir)
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, run_backtest_handler=handlers["run_backtest"],
+        analyze_corr_handler=handlers["analyze_corr"])}
+
+    out = json.loads(tools["run_backtest"].func(name="myst", pair="USDJPY"))
+    assert "period" not in out and "now" not in out
+    assert "period_start" not in out and "period_end" not in out
+
+
+def test_run_backtest_handler_result_feeds_persist_ledger_rows(
+        loop_min, conn, tmp_path, monkeypatch):
+    """handler → ledger.record(result_summary=save_kwargs 込み) →
+    10.10 節 `_persist_ledger_rows` が `backtest_runs` へ実際に行を書く、
+    までの結線を確認する。"""
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    handlers = loop_min._build_rpc_handlers(ledger, staging_dir=staging_dir)
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, run_backtest_handler=handlers["run_backtest"],
+        analyze_corr_handler=handlers["analyze_corr"])}
+    tools["run_backtest"].func(name="myst", pair="USDJPY")
+    ledger.freeze()
+
+    before = conn.execute(
+        "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
+    loop_min._persist_ledger_rows(
+        conn, ledger_entries=ledger.entries(), now=datetime(2026, 8, 22))
+    conn.commit()
+    after = conn.execute(
+        "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
+    assert after == before + 1
+
+
+def test_persist_ledger_rows_fails_closed_when_handler_omits_save_kwargs(
+        loop_min, conn):
+    """10.10 節の契約 (申し送り): handler が save_kwargs を result_summary
+    へ混ぜ込み忘れると `_persist_ledger_rows` が `KeyError` で落ちる —
+    台帳データが永続化されないまま静かに完走しない、fail-closed の pin。"""
+    entries = [{"kind": "run_backtest",
+               "result_summary": {"metrics": {"pf": 1.0}}}]  # save_kwargs 欠落
+    with pytest.raises(KeyError):
+        loop_min._persist_ledger_rows(
+            conn, ledger_entries=entries, now=datetime(2026, 8, 22))
+
+
+def test_analyze_corr_handler_does_not_persist_before_tx2(loop_min, conn):
+    """analyze_corr handler は `persist=False` で呼ぶ — RPC 呼出し時点では
+    `analysis_runs` へ書かない (10.10 節の Tx-2 でのみ書く、7-D
+    `test_analyze_for_agent_persist_false_does_not_write_analysis_runs` と
+    同じ pin を `_build_rpc_handlers` 経由で確認する)。"""
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0})
+    handlers = loop_min._build_rpc_handlers(ledger, staging_dir=Path("/tmp/x"))
+    before = conn.execute(
+        "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
+    handlers["analyze_corr"]({"kind": "corr_matrix", "timeframe": "1h"})
+    after = conn.execute(
+        "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
+    assert after == before
+```
+
+(`loop_min`/`loop_full`/`conn` fixture は 10.4〜10.10 節の既存 fixture パターンを
+そのまま使う — 着手時に現物確認。`_db_readonly_conn_factory`/`conn` は同一
+test db ファイルを指す既存規約に従う。)
+
+- [ ] **Step 11-2: 失敗を確認**
+
+```bash
+uv run pytest tests/loops/test_improve_loop_rpc_handlers.py -v
+```
+
+- [ ] **Step 11-3: 最小実装**
+
+`src/agentic_fx/loops/improve_loop.py`:
+
+```python
+_EVAL_SOURCE = "dukascopy"   # 10.7 節と同じ裁定 — 新しい config key は作らない
+
+
+class ImproveLoop:
+    ...
+
+    def _build_rpc_handlers(self, ledger: "ImproveRpcLedger", *,
+                            staging_dir: Path) -> dict:
+        """設計書 §3.4: run_backtest/analyze_corr の親側実装。RO 接続で
+        Task 7-D の non-committing 版を実行し、store-ready な save_kwargs
+        (`_persist_ledger_rows` の `_BACKTEST_ROW_KEYS`/`_ANALYSIS_ROW_KEYS`
+        ホワイトリストと同じキー名、10.10 節) を戻り値へ含める。
+        `improve_rpc_tools.build_improve_rpc_tooldefs` (7-D、本節では
+        変更しない) がこの戻り値をそのまま `ledger.record(result_summary=
+        <戻り値>)` へ渡すため、ここで save_kwargs を混ぜ込むだけで
+        10.10 節の `_persist_ledger_rows` が Tx-2 で読める形になる。
+        agent への返却は `build_improve_rpc_tooldefs` 側の `_strip_forbidden`
+        が行う (`period`/`now` を含む拡張 `_FORBIDDEN_KEYS` — 本節で
+        `tools/improve_rpc_tools.py` の定義へ追記済み)。"""
+        from agentic_fx.backtest import holdout
+        from agentic_fx.backtest.analysis import analyze_for_agent
+        from agentic_fx.plugin import loader as plugin_loader
+        from agentic_fx.plugin import strategy_adapter
+
+        def run_backtest_handler(args: dict) -> dict:
+            candidate_dir = staging_dir / args["name"]
+            meta = plugin_loader._discover_one(candidate_dir, args["name"])
+            if meta is None or meta.kind != "strategy":
+                # run_backtest は kind=strategy の candidate のみ対応する
+                # (in-sample バックテストは strategy にのみ意味を持つ —
+                # indicator/signal の探索は analyze_corr が担う)。
+                raise ValueError(
+                    f"run_backtest requires a strategy candidate: "
+                    f"{args['name']!r}")
+            conn = self._db_readonly_conn_factory()
+            captured: list[dict] = []
+            intent_source = strategy_adapter.build_intent_source(
+                meta, conn=conn, pair=args["pair"], source=_EVAL_SOURCE,
+                settings=self._settings)
+            try:
+                holdout.run_in_sample(
+                    self._settings, history_conn=conn, symbol=args["pair"],
+                    source=_EVAL_SOURCE, intent_source=intent_source,
+                    eval_timeframe=meta.timeframe,
+                    plugin_ref=f"plugins/_staging/{staging_dir.name}/"
+                               f"{args['name']}",
+                    content_hash=meta.content_hash, kind="strategy",
+                    now=self._clock.now(), record_fn=captured.append)
+            finally:
+                intent_source.close()
+                conn.close()
+            save_kwargs = captured[0]   # `_run_scope` の record_fn 契約 (7-D)
+            return {**save_kwargs, "trial_count": 1}
+
+        def analyze_corr_handler(args: dict) -> dict:
+            conn = self._db_readonly_conn_factory()
+            try:
+                return analyze_for_agent(
+                    conn, self._settings, args, now=self._clock.now(),
+                    persist=False)
+            finally:
+                conn.close()
+
+        return {"run_backtest": run_backtest_handler,
+                "analyze_corr": analyze_corr_handler}
+```
+
+`src/agentic_fx/tools/improve_rpc_tools.py` (7-D、Step 群 7-D の `_FORBIDDEN_KEYS`
+定義) を以下へ改める — 遮断7 (「返却 schema に日時・期間端点…が無い」) は
+`period_start`/`period_end` の平坦キーだけでなく、save_kwargs がそのまま
+返る `period` タプル・`now` datetime も剥がさなければ閉じない:
+
+```python
+_FORBIDDEN_KEYS = frozenset({
+    "period_start", "period_end", "start", "end", "window", "timestamps",
+    "period", "now"})
+```
+
+- [ ] **Step 11-4: 成功を確認**
+
+```bash
+uv run pytest tests/loops/test_improve_loop_rpc_handlers.py -v
+uv run pytest tests/tools/test_improve_rpc_tools.py -v   # 7-D の既存回帰
+grep -n "xfail" tests/loops/test_improve_loop_prepare.py   # 0 件になること (10.9 Step 0 の確認を今ここで完了させる)
+uv run pytest tests/loops/test_improve_loop_prepare.py -v -k tx0 --runxfail
+```
+
+- [ ] **Step 11-5: 変異テスト**
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M8 | `_FORBIDDEN_KEYS` から `"period"`/`"now"` を落とす | `test_run_backtest_handler_hides_period_and_now_from_agent` |
+| M9 | `run_backtest_handler` が `save_kwargs` を戻り値へ混ぜず `{"metrics": ...}` だけ返す (record_fn 捕捉結果を握りつぶす) | `test_run_backtest_handler_result_feeds_persist_ledger_rows` (`_persist_ledger_rows` の `summary[k]` が `KeyError` で例外送出、テストが失敗系として検出) |
+| M10 | `analyze_corr_handler` が `persist=False` を渡し忘れる (既定 `persist=True` のまま) | `test_analyze_corr_handler_does_not_persist_before_tx2` (RPC 呼出し時点で `analysis_runs` へ書いてしまい `after == before` が崩れる) |
+| M11 | `meta.kind != "strategy"` の早期 `raise` を削り、indicator/signal でも `run_in_sample` を呼んでしまう | 実装者が `kind="indicator"` の candidate で `run_backtest_handler` を呼び `ValueError` を確認する追加テストを書くこと (下限リスト不足、申し送り) |
+
+- [ ] **Step 11-6: コミット**
+
+```bash
+git add src/agentic_fx/loops/improve_loop.py src/agentic_fx/tools/improve_rpc_tools.py \
+       tests/loops/test_improve_loop_rpc_handlers.py tests/loops/test_improve_loop_prepare.py
+git commit -m "$(cat <<'EOF'
+feat: ImproveLoop._build_rpc_handlers を完全実装 (run_backtest/analyze_corr) (プラン10 Task10-9)
+
+RO接続でrun_in_sample(record_fn=capture)/analyze_for_agent(persist=False)を実行し、
+save_kwargsをledgerへ記録。_FORBIDDEN_KEYSにperiod/nowを追加し遮断7を閉じる。
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
 ---
 
 ### 10.10 手順 7〜9: `improvement_runs.finish` + backlog 遷移 + `finish_improve_mission` (Tx-2 の組み立て、§8.1-23/24 の Tx-2 側)
@@ -15132,7 +15663,7 @@ EOF
 §4.1 Tx-2、プラン §8.1-21/23/24)。"""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -15227,10 +15758,26 @@ class ImproveLoop:
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                self._persist_ledger_rows(
+                analysis_run_ids = self._persist_ledger_rows(
                     conn, ledger_entries=ledger_entries, now=now)
                 self._persist_gate_rows(
                     conn, gate_rows=gate_rows, now=now)
+                # §8.1-16: agent の申告 (`_build_approval_payload` が置いた
+                # placeholder `analysis_run_ids: []`) を、台帳から今しがた
+                # 実際に永続化した analysis_runs の行 id で上書きする — この
+                # 上書きは必ず `approvals_store.create` より前 (直前修正の
+                # 申し送り③)。`analysis_call_count`/`trial_count` は
+                # `_build_approval_payload` (10.8 節) が同じ frozen ledger
+                # から既に正しく計算済みだが、台帳→実 id という一次ソースを
+                # 揃えるため同じ ledger_entries から再導出して上書きする
+                # (値は同じになる — idempotent な再導出であり、10.8 節の
+                # 値が誤っていたわけではない)。
+                approval_payload = dict(approval_payload)
+                approval_payload["analysis_run_ids"] = analysis_run_ids
+                approval_payload["analysis_call_count"] = sum(
+                    1 for e in ledger_entries if e["kind"] == "analyze_corr")
+                approval_payload["trial_count"] = sum(
+                    e["trial_count"] for e in ledger_entries)
                 approval_id = approvals_store.create(
                     conn, kind="plugin", payload=approval_payload, now=now,
                     commit=False)
@@ -15253,29 +15800,75 @@ class ImproveLoop:
                 conn, mission_id=mission_id, run_id=run_id,
                 backlog_id=backlog_id, slot_key=slot_key, now=now)
 
-    def _persist_ledger_rows(self, conn, *, ledger_entries, now) -> None:
+    # `analysis_runs.save`/`backtest_runs.save_harness_run` の kwargs 名の
+    # ホワイトリスト — 台帳 entry の `result_summary` はハンドラの戻り値
+    # (RPC 呼び出し元へも返る辞書) をそのまま乗せているため、store 呼び出しに
+    # 使わない余分なキー (`trades`/`pf` 等の agent 向けフィールド) を含み
+    # 得る。フィルタせず `**entry["result_summary"]` を渡すと
+    # `TypeError: unexpected keyword argument` で Tx-2 全体が落ちるため、
+    # 各 store 関数が実際に受け取る名前だけを転記する
+    # (3 周目レビュー Important-2)。
+    _BACKTEST_ROW_KEYS = (
+        "scope", "plugin_ref", "content_hash", "kind", "pair", "timeframe",
+        "source", "period", "metrics", "settings_hash", "core_commit",
+        "initial_balance", "now")
+    _ANALYSIS_ROW_KEYS = ("params", "trial_count", "source")
+
+    def _persist_ledger_rows(self, conn, *, ledger_entries, now) -> list[int]:
         """台帳 (`ImproveRpcLedger.entries()`) の analyze_corr/run_backtest
         呼出し実測値を `analysis_runs`/`backtest_runs` (variant='candidate')
         へ永続化する (設計書 §4.1 Tx-2 手順の「台帳の backtest_runs/
-        analysis_runs 行」)。本節時点では呼び出し元 (`_finalize_success`)
-        が `ledger_entries=()` の既定値で呼ぶため実質 no-op — 実データの
-        配線 (`ctx.ledger.entries()` から `entry["row_kwargs"]` を組み立てる
-        変換) は 10.11 節の統合スコープ外として申し送る。"""
+        analysis_runs 行」)。**戻り値**は永続化した `analysis_runs` 行の id
+        リスト (`analyze_corr` entry の登場順) — `_finalize_success` が
+        承認 payload の `analysis_run_ids` (§8.1-16、agent 申告ではなく親が
+        実際に書いた行 id) を上書きするために使う (直前修正の申し送り③)。
+
+        各 entry の `result_summary` は RPC handler (`_build_rpc_handlers`、
+        10.9 節 Step 11 で完全実装済み — 直前修正の申し送り①) の戻り値
+        である契約とする:
+        - `analyze_corr`: `analyze_for_agent(persist=False)` は既に
+          `{**save_params, **payload_body}` (`save_params` に `params`/
+          `trial_count`/`source` を含む) を返す (Task 7-D で完成済み)。
+          `_build_rpc_handlers` はこの戻り値をそのまま handler の戻り値に
+          転送する薄い実装であるため、この経路は成立する。
+        - `run_backtest`: `holdout.run_in_sample`/`run_holdout_gate` は
+          `dict(metrics)` だけを返し (Task 7-D)、`save_kwargs` は
+          `record_fn` 経由でしか渡らない。`_build_rpc_handlers` の
+          `run_backtest_handler` は `record_fn` で `save_kwargs` を捕捉し
+          `result_summary` (このメソッドが読む辞書) へ合成して返す**契約を
+          満たす** (10.9 節 Step 11) — 満たさない限り `summary[k]` が
+          `KeyError` を送出し、呼び出し元 `_finalize_success` の
+          `except Exception:` が捕捉して `_compensate_tx2_failure` へ
+          倒れる (mission `failed` + backlog `observation:commit_failed`)。
+          これは意図的な fail-closed — 台帳データが永続化されないまま
+          `missions.status='completed'` として静かに完走する (3 周目
+          レビュー Important-2 が指摘した状態) より、可視の失敗として
+          止まる方を選ぶ。"""
+        analysis_run_ids: list[int] = []
         for entry in ledger_entries:
+            summary = entry["result_summary"]
             if entry["kind"] == "run_backtest":
+                row_kwargs = {k: summary[k] for k in self._BACKTEST_ROW_KEYS}
                 backtest_runs_store.save_harness_run(
-                    conn, commit=False, variant="candidate",
-                    **entry["row_kwargs"])
+                    conn, commit=False, variant="candidate", **row_kwargs)
             elif entry["kind"] == "analyze_corr":
-                analysis_runs_store.save(
-                    conn, commit=False, now=now, **entry["row_kwargs"])
+                row_kwargs = {k: summary[k] for k in self._ANALYSIS_ROW_KEYS}
+                run_id = analysis_runs_store.save(
+                    conn, commit=False, now=now, **row_kwargs)
+                analysis_run_ids.append(run_id)
+        return analysis_run_ids
 
     def _persist_gate_rows(self, conn, *, gate_rows, now) -> None:
         """親ゲート (in-sample/holdout_gate) が実測した `backtest_runs` 行を
         永続化する (設計書 §4.1 Tx-2 手順の「親ゲートの backtest_runs 行」)。
-        本節時点では呼び出し元が `gate_rows=()` の既定値で呼ぶため実質
-        no-op — 実データの配線 (`_run_plugin_gate`/`_run_strategy_gate` の
-        実測行を集める変換) は 10.11 節の統合スコープ外として申し送る。"""
+        `gate_rows` は `ImproveLoop.commit` 手順4 が `_run_strategy_gate`
+        (10.7 節、`evaluate_strategy_adoption_gate` の `record_fn` sink 経由、
+        3 周目レビュー Important-2) から蓄積した `holdout._run_scope` の
+        `save_kwargs` (dict) のリストであり、`variant` を持たないため
+        `save_harness_run` の既定 `variant="candidate"` がそのまま使われる
+        (baseline 行はここでは書かない — `_build_approval_payload` が
+        `strategy_verdict.baseline_row` を承認 payload に埋め込むのみで、
+        baseline は既存承認済み行の参照であり新規 backtest 実行を伴わない)。"""
         for row in gate_rows:
             backtest_runs_store.save_harness_run(conn, commit=False, **row)
 
@@ -15302,12 +15895,15 @@ class ImproveLoop:
 
 **申し送り**: `_finalize_success` は Tx-2 本体の 4 seam (`_persist_ledger_rows` →
 `_persist_gate_rows` → `approvals_store.create` → `missions_store.finish_improve_mission`)
-を設計書 §4.1 Tx-2 の順序どおりに呼ぶ形まで本節で書く。ただし `ledger_entries`/
-`gate_rows` への実データ配線 (`ctx.ledger.entries()` や `_run_plugin_gate`/
-`_run_strategy_gate` の実測行から `row_kwargs` を組み立てる変換) と report
-準備 (`report_state='prepared'`) は本節では省く (既定値 `()` で呼ばれるため
-実質 no-op) — 実装時は 10.8/10.9 節で作った `_build_approval_payload`/
-`_write_report_part` の呼び出しと合わせてこの変換を完成させること。本節は
+を設計書 §4.1 Tx-2 の順序どおりに呼ぶ形まで本節で書く。`ledger_entries`/
+`gate_rows` への実データ配線 (`ctx.ledger.entries()` から `_persist_ledger_rows`
+が読む変換、`_run_strategy_gate` の `record_fn` sink から `_persist_gate_rows`
+が読む変換) は本節ですでに完成させた (上記 `_persist_ledger_rows`/
+`_persist_gate_rows` の実装 — 3 周目レビュー Important-2)。呼び出し元
+(`commit()` 本体) が `ledger_entries=`/`gate_rows=` に実引数を渡す配線は
+10.11 節で完成させる。report 準備 (`report_state='prepared'`) は本節では
+省く — 実装時は 10.8/10.9 節で作った `_build_approval_payload`/
+`_write_report_part` の呼び出しと合わせて完成させること。本節は
 ステップの粒度を保つため意図的に分割したが、**最終的な `commit()` メソッド
 本体はこの節までの全ての private メソッドを手順 0〜9 の順に呼ぶ 1 本の関数
 として統合する** (10.11 節)。Tx-2 **内部**の呼び出し列 (4 seam の順序) は
@@ -15327,6 +15923,8 @@ uv run pytest tests/loops/test_improve_loop_finalize.py -v
 | M1 | `_finalize_success` の `except Exception:` を削り例外を外へ漏らす (改善レーンの失敗が呼び出し元 — 取引レーン/service.py へ波及しうる) | `test_tx2_commit_failure_rolls_back_and_compensation_finalizes` (例外が伝播して pytest 自体が fail するので間接検出。実装者は明示的に「呼び出し元が例外を受け取らない」ことを assert する追加テストを書くこと — 下限リスト不足、申し送り) |
 | M2 | `_compensate_tx2_failure` が `slot_key` を渡さない (scheduler wave の slot が failed にならない) | `test_finish_improve_mission_is_the_only_terminal_path_for_slot_scheduler_wave` の失敗系変種を実装者が追加すること (下限リスト不足、申し送り) |
 | M3 | `finish_improve_mission` の呼び出しを個別 UPDATE (missions.finish 単体呼び出し) に分解する | `test_tx2_writes_ledger_rows_then_gate_rows_then_approval_then_finish` (個別呼び出しに分解すると `finish_improve_mission` の mock/monkeypatch 対象が外れ、テストの `monkeypatch.setattr` 先が呼ばれなくなるため red — Step 3 のコードでは `finish_improve_mission` を単一呼び出しにしているため、この変異は M1 のテストで検出される) |
+| M4 | `_persist_ledger_rows`/`_persist_gate_rows` の本体を再び no-op (`for entry in ledger_entries: pass` 等) に戻す | `test_finalize_success_persists_ledger_and_gate_rows_in_tx2` (10.11 節に追加。3 周目レビュー Important-2 — `backtest_runs`/`analysis_runs` の行数を assert しており no-op に戻すと 0 件のまま落ちる) |
+| M4b | `_finalize_success` が `approval_payload["analysis_run_ids"]` の上書きを削り、`_build_approval_payload` の placeholder `[]` のまま `approvals_store.create` へ渡す (直前修正の申し送り③の回帰) | `test_finalize_success_overwrites_payload_analysis_run_ids_with_real_ids` (`payload["analysis_run_ids"] == real_ids` が `[] == real_ids` で落ちる) |
 
 - [ ] **Step 6: コミット**
 
@@ -15538,6 +16136,107 @@ def test_finalize_success_tx2_internal_seams_run_ledger_then_gate_then_approval_
     ]
 
 
+def test_finalize_success_persists_ledger_and_gate_rows_in_tx2(
+        loop_min, conn, mission_and_run_fixture):
+    """3 周目レビュー Important-2: `ledger_entries`/`gate_rows` に実データを
+    渡すと `analysis_runs`/`backtest_runs` へ実際に行が保存されることを
+    確認する — これまでは両方とも既定値 `()` のまま呼ばれ、
+    `_persist_ledger_rows`/`_persist_gate_rows` は恒久的に no-op だった
+    (設計書 §4.1 Tx-2「台帳の backtest_runs/analysis_runs 行」「親ゲートの
+    backtest_runs 行」が実装されない欠落)。ここでは `_finalize_success` を
+    直接呼び、`ctx.ledger.entries()`/`_run_strategy_gate` の `record_fn`
+    sink が実運用で積む形と同じ shape の dict を渡す (`_build_rpc_handlers`
+    (10.9 節) が RPC handler の戻り値としてこの shape を返す契約 — 本テスト
+    はその契約に対する pin)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    in_sample_period = (datetime(2026, 1, 1, tzinfo=timezone.utc),
+                        datetime(2026, 2, 1, tzinfo=timezone.utc))
+    holdout_period = (datetime(2026, 2, 1, tzinfo=timezone.utc),
+                      datetime(2026, 3, 1, tzinfo=timezone.utc))
+    ledger_entries = (
+        {"opaque_ref": "run_backtest:myst:USDJPY", "kind": "run_backtest",
+         "params": {"name": "myst", "pair": "USDJPY"}, "trial_count": 1,
+         "result_summary": {
+             "scope": "in_sample", "plugin_ref": "plugins/myst",
+             "content_hash": "h1", "kind": "strategy", "pair": "USDJPY",
+             "timeframe": "1h", "source": "dukascopy", "period": in_sample_period,
+             "metrics": {"pf": 1.2}, "settings_hash": "sh1",
+             "core_commit": "c1", "initial_balance": 10000.0,
+             "now": in_sample_period[0]}},
+        {"opaque_ref": "analyze_corr:1", "kind": "analyze_corr",
+         "params": {"pairs": ["USDJPY"]}, "trial_count": 3,
+         "result_summary": {
+             "params": {"request": {"pairs": ["USDJPY"]}},
+             "trial_count": 3, "source": "improve_agent"}},
+    )
+    gate_rows = (
+        {"scope": "holdout_gate", "plugin_ref": "plugins/myst",
+         "content_hash": "h1", "kind": "strategy", "pair": "USDJPY",
+         "timeframe": "1h", "source": "dukascopy", "period": holdout_period,
+         "metrics": {"pf": 1.1}, "settings_hash": "sh1",
+         "core_commit": "c1", "initial_balance": 10000.0,
+         "now": holdout_period[1]},
+    )
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "myst", "kind": "strategy"},
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        ledger_entries=ledger_entries, gate_rows=gate_rows)
+
+    bt_rows = conn.execute(
+        "SELECT scope, pair, content_hash, variant FROM backtest_runs "
+        "ORDER BY id").fetchall()
+    assert [(r["scope"], r["pair"], r["content_hash"], r["variant"])
+            for r in bt_rows] == [
+        ("in_sample", "USDJPY", "h1", "candidate"),
+        ("holdout_gate", "USDJPY", "h1", "candidate")]
+    an_rows = conn.execute(
+        "SELECT trial_count, source FROM analysis_runs").fetchall()
+    assert [(r["trial_count"], r["source"]) for r in an_rows] == [
+        (3, "improve_agent")]
+
+
+def test_finalize_success_overwrites_payload_analysis_run_ids_with_real_ids(
+        loop_min, conn, mission_and_run_fixture):
+    """直前修正の申し送り③ (§8.1-16): `_build_approval_payload` (10.8節) が
+    置いた placeholder `analysis_run_ids: []` を、`_finalize_success` が
+    `_persist_ledger_rows` で実際に永続化した `analysis_runs` の行 id で
+    上書きしてから `approvals_store.create` へ渡すことを確認する — 2 件の
+    analyze_corr entry を渡し、payload の analysis_run_ids がその 2 件の
+    実 rowid と一致することを pin する。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    ledger_entries = (
+        {"opaque_ref": "analyze_corr:1", "kind": "analyze_corr",
+         "params": {}, "trial_count": 10,
+         "result_summary": {"params": {}, "trial_count": 10,
+                            "source": "improve_agent"}},
+        {"opaque_ref": "analyze_corr:2", "kind": "analyze_corr",
+         "params": {}, "trial_count": 5,
+         "result_summary": {"params": {}, "trial_count": 5,
+                            "source": "improve_agent"}},
+    )
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None,
+        approval_payload={"name": "myind", "kind": "indicator",
+                          "analysis_run_ids": []},
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        ledger_entries=ledger_entries)
+
+    real_ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM analysis_runs ORDER BY id").fetchall()]
+    assert len(real_ids) == 2
+    import json as _json
+    row = conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE kind='plugin' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    payload = _json.loads(row["payload_json"])
+    assert payload["analysis_run_ids"] == real_ids
+    assert payload["analysis_call_count"] == 2
+    assert payload["trial_count"] == 15
+
+
 def test_commit_terminates_scheduler_wave_slot_via_ctx_slot_key(
         loop_full, conn, mission_and_run_fixture_with_slot, tmp_path):
     """レビュー1周目 C2 の protocol test: scheduler wave 起動 (`ctx.slot_key`
@@ -15583,7 +16282,7 @@ def test_commit_terminates_scheduler_wave_slot_via_ctx_slot_key(
 - [ ] **Step 2: 失敗を確認**
 
 ```bash
-uv run pytest tests/loops/test_improve_loop_finalize.py -v -k "commit_runs_all_nine or commit_terminates_scheduler_wave_slot or commit_rolls_back_tx2_on_db_fault or finalize_success_tx2_internal_seams"
+uv run pytest tests/loops/test_improve_loop_finalize.py -v -k "commit_runs_all_nine or commit_terminates_scheduler_wave_slot or commit_rolls_back_tx2_on_db_fault or finalize_success_tx2_internal_seams or finalize_success_persists_ledger_and_gate_rows"
 ```
 
 - [ ] **Step 3: 最小実装 — `commit()` の統合本体**
@@ -15616,6 +16315,10 @@ class ImproveLoop:
             atype = artifact.get("type")
             gate_metrics: dict = {}
             approval_payload = None
+            gate_rows: list[dict] = []   # 3周目レビュー Important-2:
+                                          # _run_strategy_gate の record_fn
+                                          # sink が親ゲートの backtest_runs
+                                          # 行 (candidate) をここへ蓄積する
 
             if atype == "plugin":
                 candidate_dir = ctx.staging_dir / artifact["name"]
@@ -15629,12 +16332,19 @@ class ImproveLoop:
 
                 kind = self._read_candidate_kind(candidate_dir)
                 if kind == "strategy":
+                    from agentic_fx.plugin import loader as plugin_loader
+                    candidate_meta = plugin_loader._discover_one(
+                        candidate_dir, artifact["name"])   # 直前修正の
+                                          # 申し送り④: intent_source 構築
+                                          # 専用。identity は
+                                          # gate_verdict.content_hash が正
                     strategy_verdict = self._run_strategy_gate(         # 手順4
                         conn, name=artifact["name"],
                         pairs=self._read_candidate_pairs(candidate_dir),
                         timeframe=self._read_candidate_timeframe(candidate_dir),
                         content_hash=gate_verdict.content_hash, now=now,
-                        kind=kind)
+                        meta=candidate_meta, kind=kind,
+                        record_fn=gate_rows.append)
                     if not strategy_verdict.evaluable:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -15662,7 +16372,9 @@ class ImproveLoop:
                 self._finalize_success(                                 # 手順7-9
                     conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                     backlog_id=selection.backlog_id, slot_key=ctx.slot_key,
-                    approval_payload=approval_payload, now=now)
+                    approval_payload=approval_payload, now=now,
+                    ledger_entries=tuple(ctx.ledger.entries()),
+                    gate_rows=tuple(gate_rows))
             else:
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -15713,7 +16425,13 @@ def _run_scope(settings: Settings, *, scope: str,
         # non-committing: 呼び出し元 (ImproveLoop の Tx-2) が commit する
         # sink へ渡すだけ — ここでは DB に触れない (改善レーンの transaction
         # 越境を防ぐ、設計書 §4.1「long-running work is outside tx」)。
-        record_fn(**row_kwargs)
+        # dict を単一の位置引数で渡す (Task 7-D `_run_scope` — 本節と同じ
+        # holdout.py:112-187 を対象とする定義 — が確立した
+        # `record_fn(save_kwargs)` 契約と揃える。3 周目レビュー Important-2
+        # の `gate_rows`/`ledger_entries` 配線はこの契約 (dict 1 引数) を
+        # 前提に `list.append` を record_fn として渡す — `record_fn(**row_kwargs)`
+        # (kwargs 展開) のままだと `list.append` が TypeError で落ちる)。
+        record_fn(row_kwargs)
     else:
         save_harness_run(history_conn, **row_kwargs)
     return dict(metrics)
@@ -15799,17 +16517,22 @@ uv run pytest tests/backtest/ -v   # 既存回帰 (record_fn 未指定の全既�
 | M4 | `commit()` 内で `_build_approval_payload` を `_run_plugin_gate` より**前**に呼ぶ (ゲート不合格でも承認payloadを組み立ててしまう) | `test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin` (レビュー1周目 I4 — `call_order == _EXPECTED_ORDER` が順序不一致で落ちる) |
 | M5 | `_finalize_success` の Tx-2 本体で `approvals_store.create` を `missions_store.finish_improve_mission` より**後**に呼ぶ (成功時は結果同じだが、fault 注入時に partial commit の窓が生まれる) | `test_commit_rolls_back_tx2_on_db_fault_between_gate_rows_and_approval` (レビュー1周目 I4 — `approval_requests` が 0 件のまま `missions.status` だけ更新されてしまうと assert が落ちる) |
 | M6 | `_finalize_success` の Tx-2 本体で `approvals_store.create` を `_persist_gate_rows` (または `_persist_ledger_rows`) より**前**に呼ぶ (台帳→gate rows→approval→finish の順序退行、外側の期待列・最終状態は変わらないため他のテストでは検出できない) | `test_finalize_success_tx2_internal_seams_run_ledger_then_gate_then_approval_then_finish` (レビュー2周目 Important 2 — `call_order` が `["_persist_ledger_rows", "_persist_gate_rows", "approvals_store.create", "missions_store.finish_improve_mission"]` と不一致になり落ちる) |
+| M7 | `commit()` の `_finalize_success(...)` 呼び出しから `ledger_entries=tuple(ctx.ledger.entries())`/`gate_rows=tuple(gate_rows)` を落とし既定値 `()` に戻す | `test_finalize_success_persists_ledger_and_gate_rows_in_tx2` は `_finalize_success` を直接呼ぶため本変異を検出しない (`commit()` 経由の呼び出しを経ない)。`commit()` 経由・`kind="strategy"` の happy path で `backtest_runs`/`analysis_runs` の行数を assert する専用テストを実装者が追加すること (下限リスト不足、申し送り — 3 周目レビュー Important-2) |
 
 - [ ] **Step 6: コミット**
 
 ```bash
 git add src/agentic_fx/loops/improve_loop.py src/agentic_fx/backtest/holdout.py \
+       src/agentic_fx/plugin/strategy_gate.py \
        tests/loops/test_improve_loop_finalize.py tests/backtest/test_holdout_record_fn.py
 git commit -m "$(cat <<'EOF'
 feat: ImproveLoop.commit を手順0-9の1本に統合 + holdout.py record_fn (プラン10 Task10-11)
 
 happy path (plugin全通過) のe2eテストで手順順序を固定。record_fnは
 transaction外の非committing版としてnon-improve呼び出し元と共存する。
+strategy_gate.evaluate_strategy_adoption_gate に record_fn を通し、
+commit() 手順4〜7-9 で ledger_entries/gate_rows を _finalize_success へ
+実配線した (3周目レビュー Important-2)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
