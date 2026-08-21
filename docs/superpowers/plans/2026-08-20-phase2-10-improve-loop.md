@@ -714,6 +714,8 @@ class ImproveRunContext:
     staging_dir: Path
     source_snapshot_dir: Path
     allowed_backlog_ids: frozenset[int] | None    # ヒント。None = 手動 wave
+    slot_key: tuple[str, int] | None              # wave 起動なら (period_key, k)。
+                                                    # 手動 one-shot は None (レビュー1周目 C2)
     ledger: ImproveRpcLedger
     rpc_handlers: dict[str, Callable[[dict], dict]]   # "run_backtest" / "analyze_corr"
                                                         # → 読取専用接続ファクトリを内包
@@ -905,7 +907,7 @@ R-i10: 束別 task 執筆 (`tasks-{A,B,C,D,E,F}.md`) で新規に命名された
 - `_terminate_pgid` (`cli_runner.py`) — CLI の pgid を SIGTERM→grace→SIGKILL→空確認する内部ヘルパ
 - `_resolve_cli_bin` / `_check_cli_version` / `_check_credentials_file` / `_check_service_initial_env_has_no_secrets` / `_check_improve_backend` (`service.py`) — 起動時検査 ①〜⑤ の実体名
 - `_copy_credentials_file` / `_CredentialsCopyError` (`worker_runner.py`) — 親側の認証コピーと事前検査
-- `_mcp_tool_from_tooldef` / `_SUPPORTED_PROTOCOL_VERSION` (`mcp_shim.py`) — MCP tool 形式変換・protocolVersion 定数 (裁定 5 により実測後に値を差し替える)
+- `_mcp_tool_from_openai_tool` / `_SUPPORTED_PROTOCOL_VERSION` (`mcp_shim.py`) — MCP tool 形式変換・protocolVersion 定数 (裁定 5 により実測後に値を差し替える。**レビュー1周目 M1**: 統合裁定 R-i7 反映時に `_mcp_tool_from_tooldef` から改名済み — 引数が `ToolDef` でなく `ToolRegistry.openai_tools()` の返す openai 形式 dict になったため。本 Interfaces 節と Task 4 詳細節の記号を統一する)
 
 **束 B** (`plugin/loader.py`, `plugin/gate_pytest.py`):
 - `PluginMeta.artifact_hash: str | None`(既定 `None`) — `plugin/loader.py`。既存 23 箇所の直接構築を壊さないための非必須フィールド
@@ -2667,23 +2669,85 @@ def test_trade_worker_receives_data_provider_keys_via_handshake(monkeypatch, tmp
     runner.run(_mission())
     handshake = json.loads((tmp_path / "handshake.json").read_text())
     assert handshake["credentials"]["TWELVEDATA_API_KEY"] == "secret-td"
+
+
+def test_worker_runner_run_context_adds_three_handshake_keys(monkeypatch, tmp_path):
+    """レビュー1周目 C3: `run_context=` (`ImproveRunContext` 相当。ここでは
+    duck-typing で足りる最小オブジェクトを使う) が非 None のとき、
+    `mission_id`/`staging_dir`/`source_snapshot_dir` の 3 キーが
+    handshake フレームへ載る。"""
+    captured_handshake = {}
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        return orig_popen([sys.executable, "-c",
+                           "import sys, json\n"
+                           "line = sys.stdin.readline()\n"
+                           "open('%s', 'w').write(line)\n"
+                           "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
+                           % str(tmp_path / 'handshake.json')], **kw)
+    monkeypatch.setattr(subprocess, "Popen", spy)
+
+    class _FakeRunContext:
+        mission_id = 42
+        staging_dir = tmp_path / "staging"
+        source_snapshot_dir = tmp_path / "source"
+
+    runner = WorkerRunner(root=tmp_path, settings=_settings(), clock=_clock(),
+                          rag=_rag(), worker_profile="improve",
+                          run_context=_FakeRunContext())
+    runner.run(_mission())
+    handshake = json.loads((tmp_path / "handshake.json").read_text())
+    assert handshake["mission_id"] == 42
+    assert handshake["staging_dir"] == str(tmp_path / "staging")
+    assert handshake["source_snapshot_dir"] == str(tmp_path / "source")
+
+
+def test_worker_runner_run_context_none_omits_three_handshake_keys(
+        monkeypatch, tmp_path):
+    """`run_context=None` (既定、trade profile 等) のとき、3 キーは
+    handshake フレームに含まれない (未知キーの汚染防止)。"""
+    captured_handshake = {}
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        return orig_popen([sys.executable, "-c",
+                           "import sys, json\n"
+                           "line = sys.stdin.readline()\n"
+                           "open('%s', 'w').write(line)\n"
+                           "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
+                           % str(tmp_path / 'handshake.json')], **kw)
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    runner = WorkerRunner(root=tmp_path, settings=_settings(), clock=_clock(),
+                          rag=_rag(), worker_profile="trade")
+    runner.run(_mission())
+    handshake = json.loads((tmp_path / "handshake.json").read_text())
+    assert "mission_id" not in handshake
+    assert "staging_dir" not in handshake
+    assert "source_snapshot_dir" not in handshake
 ```
 
 **注**: 上記は `tests/runners/test_worker_runner.py` の既存 fixture 規約
 (`_settings()`/`_clock()`/`_rag()`/`_mission()` 等のヘルパ名) を仮定した
 形。実装者は既存ファイルの現物ヘルパを読み、シグネチャを合わせること
 (fixture 名の食い違いは「執筆時の申し送り」に該当しない — 通常のテスト
-実装作業)。`run_context=` 引数の受領 (束 B Task 5 が `staging_dir`/
-`source_snapshot_dir`/`mission_id` を追加する前提の構造) はここでは
-「未知キーでも壊れない」形の受け皿だけを作り、Task 5 が実値を積む。
+実装作業)。
+
+**`run_context=` の所有者確定 (レビュー1周目 C3)**: `WorkerRunner.__init__` の
+公開シグネチャへの `run_context: object | None = None` 追加と、handshake フレームへの
+3 キー付与は Task 1 (本節) が実装まで完結させる。「未知キーでも壊れない受け皿」
+ではなく、以下 Step 33 の完全実装まで含めてここで確定する。子側 (worker 内部)
+の受領・`mission_id`/`staging_dir`/`source_snapshot_dir` の相互照合は引き続き
+Task 5 の担当 (束 B 申し送り 5 — レビュー1周目 C3 で「Task 1 が親側配線を所有」
+へ更新済み)。
 
 - [ ] **Step 32: red を確認**
 
 ```bash
-uv run pytest tests/runners/test_worker_runner.py -v -k "workdir_with_mode or home_tmp_cfg or copies_claude_credentials or rejects_credentials or no_longer_receives or receives_data_provider_keys_via_handshake"
+uv run pytest tests/runners/test_worker_runner.py -v -k "workdir_with_mode or home_tmp_cfg or copies_claude_credentials or rejects_credentials or no_longer_receives or receives_data_provider_keys_via_handshake or run_context"
 ```
 
-期待失敗: workdir が `tempfile.TemporaryDirectory` 既定 mode (0700 のはずだが cfg/home/tmp が存在しない) で `AssertionError`。`test_trade_worker_no_longer_receives_data_provider_keys_via_env` は現状 `_mission_worker_env` が `TWELVEDATA_API_KEY` を env に入れるため red。
+期待失敗: workdir が `tempfile.TemporaryDirectory` 既定 mode (0700 のはずだが cfg/home/tmp が存在しない) で `AssertionError`。`test_trade_worker_no_longer_receives_data_provider_keys_via_env` は現状 `_mission_worker_env` が `TWELVEDATA_API_KEY` を env に入れるため red。`test_worker_runner_run_context_adds_three_handshake_keys` は現状 `WorkerRunner.__init__` に `run_context` キーワードが無いため `TypeError` で red。
 
 - [ ] **Step 33: 最小実装**
 
@@ -2736,6 +2800,30 @@ def stat_is_regular(st: os.stat_result) -> bool:
     return _stat.S_ISREG(st.st_mode)
 ```
 
+**`WorkerRunner.__init__` の公開シグネチャに `run_context` を追加する** (レビュー1周目 C3。
+`worker_runner.py:67-73` 該当箇所を全文置き換え):
+
+```python
+class WorkerRunner(AgentRunner):
+    def __init__(self, *, root: Path, settings, clock: Clock, rag: Rag,
+                worker_profile: str = "trade",
+                run_context: object | None = None,
+                on_rpc_leak: Callable[[], None] | None = None,
+                stop_event: threading.Event | None = None) -> None:
+        self._root = root
+        self._settings = settings
+        self._clock = clock
+        self._rag = rag
+        self._worker_profile = worker_profile
+        self._run_context = run_context
+        self._on_rpc_leak = on_rpc_leak
+        self._stop_event = stop_event
+```
+
+`run_context` は `object | None` で受ける (`ImproveRunContext` を import させて
+循環 import を招かないため — Task 10 の `ImproveRunContext` は duck-typing で
+`mission_id`/`staging_dir`/`source_snapshot_dir` 属性だけを読む)。
+
 `WorkerRunner.run` を以下へ書き換える (`tempfile.TemporaryDirectory` の代わりに
 明示 mkdir + finally cleanup で 0700 を保証する):
 
@@ -2777,6 +2865,21 @@ def stat_is_regular(st: os.stat_result) -> bool:
                         return MissionResult(
                             "failed", None, [],
                             reason="codex auth copy failed")
+```
+
+**`run_context` の 3 キーを handshake へ載せる (レビュー1周目 C3)**: `_run_with_child`
+呼び出しの直前で、`self._run_context` が非 `None` なら 3 属性を読んで handshake 用の
+追加 dict を組み立て、`_run_with_child` へ渡す:
+
+```python
+            run_context_fields: dict[str, object] = {}
+            if self._run_context is not None:
+                run_context_fields = {
+                    "mission_id": self._run_context.mission_id,
+                    "staging_dir": str(self._run_context.staging_dir),
+                    "source_snapshot_dir":
+                        str(self._run_context.source_snapshot_dir),
+                }
 
             proc = subprocess.Popen(
                 [sys.executable, "-m", "agentic_fx.mission_worker"],
@@ -2784,13 +2887,17 @@ def stat_is_regular(st: os.stat_result) -> bool:
                 stderr=subprocess.DEVNULL, cwd=str(workdir),
                 env=_mission_worker_env(self._worker_profile),
                 start_new_session=True)
-            return self._run_with_child(proc, mission, w, credentials=credentials)
+            return self._run_with_child(
+                proc, mission, w, credentials=credentials,
+                run_context_fields=run_context_fields)
 ```
 
-`_run_with_child` のシグネチャに `credentials: dict[str, str] | None = None` を追加し、
-handshake dict の組み立てへ `"credentials": credentials or {}` を追加する
-(`worker_runner.py:210-224` の handshake dict リテラルに 1 キー追加するだけ —
-`db_path`/`plugins_dir`/`settings`/`mission`/`worker_profile`/`now` は不変)。
+`_run_with_child` のシグネチャに `credentials: dict[str, str] | None = None` と
+`run_context_fields: dict[str, object] | None = None` の 2 つを追加し、handshake dict
+の組み立てへ `"credentials": credentials or {}` と `**(run_context_fields or {})`
+を追加・展開する (`worker_runner.py:210-224` の handshake dict リテラルへの追記のみ —
+既存 6 キー `db_path`/`plugins_dir`/`settings`/`mission`/`worker_profile`/`now` は
+不変。`run_context_fields` が空 dict なら handshake は現状どおり 3 キー増えない)。
 
 - [ ] **Step 34: green を確認**
 
@@ -2816,18 +2923,22 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M6 | `_mission_worker_env` に `_DATA_PROVIDER_ENV_ALLOWLIST` を復元する (env 経由に戻す) | `test_trade_worker_no_longer_receives_data_provider_keys_via_env` |
 | M7 | handshake dict へ `credentials` キーを追加しない | `test_trade_worker_receives_data_provider_keys_via_handshake` |
 | M8 | trade profile で `credentials` を空 dict のまま送る (収集ループを削除) | `test_trade_worker_receives_data_provider_keys_via_handshake` |
+| M9 | `run_context_fields` の組み立てを削除する (`run_context` を無視する) | `test_worker_runner_run_context_adds_three_handshake_keys` |
+| M10 | `run_context is None` でも `run_context_fields` に固定値を入れる (未知キー汚染) | `test_worker_runner_run_context_none_omits_three_handshake_keys` |
 
 - [ ] **Step 36: コミット**
 
 ```bash
 git add src/agentic_fx/runners/worker_runner.py tests/runners/test_worker_runner.py
 git commit -m "$(cat <<'EOF'
-feat: WorkerRunner 親側拡張 (workdir 0700 + home/tmp/cfg + 認証コピー + trade資格情報のhandshake化) (プラン10 Task1)
+feat: WorkerRunner 親側拡張 (workdir 0700 + home/tmp/cfg + 認証コピー + trade資格情報のhandshake化 + run_context 3キー) (プラン10 Task1)
 
 親 (Landlock 外) が spawn 前に認証ファイルを検査つきでコピーする。
 trade worker の TWELVEDATA_API_KEY/MT5_BRIDGE_API_KEY は env から
 handshake の credentials フィールドへ移す (R10-①、どの子プロセスの
-初期envにも秘密を置かない)。
+初期envにも秘密を置かない)。WorkerRunner.__init__ に run_context を
+追加し、非Noneのとき mission_id/staging_dir/source_snapshot_dirを
+handshakeへ載せる (レビュー1周目 C3、親側配線は Task 1 が所有)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -3712,8 +3823,8 @@ Step はシム自体の実装とプロトコルテストに閉じ、`mission_wor
 
 **Files:**
 - Create: `src/agentic_fx/tools/mcp_shim.py`
-- Modify: `src/agentic_fx/mission_worker.py` (improve 分岐に `McpShimDispatcher` を配線 — 束 B Task 5 の後)
-- Test: `tests/tools/test_mcp_shim.py` (新規)
+- Modify: `src/agentic_fx/mission_worker.py` (improve 分岐に `McpShimDispatcher` を配線 — 束 B Task 5 の後。**レビュー1周目 C4**: `mission_worker.py:396-418` の improve backend 分岐 (`local` 以外を拒否する旧ガード + `LocalRunner` 直接構築) を `factory.build_runner(...)` 呼び出しへ置換する — Step 7d)
+- Test: `tests/tools/test_mcp_shim.py` (新規)、`tests/test_mission_worker.py` (C4 の 3 backend 契約テスト追記)
 
 **Interfaces (骨格の逐語):**
 ```python
@@ -4144,6 +4255,103 @@ Task 1〜3 相当の Step 1〜6 のみで本ファイルの Task 4 レビュー�
 - [ ] **Step 7c**: 変異・commit は束 B Task 5 のレビューサイクルに合流させる
   (同一ファイルの連続改修を分割コミットしない — 骨格「同一ファイル merge
   順注記」の趣旨に沿う)。
+
+### Step 7d (レビュー1周目 C4、束 B Task 5 完了後に着手): `mission_worker.py` の improve backend 分岐を `factory.build_runner` へ置換
+
+**該当**: 現物 `src/agentic_fx/mission_worker.py:396-418`。improve backend が
+`local` 以外なら `RuntimeError` で拒否するガードと、その後に続く `LocalRunner` の
+直接構築が残ったままだと、`runner.improve.backend: claude` または `codex` を
+設定しても worker は必ず `RuntimeError` になり、Task 1 (factory) と Task 2/3
+(`ClaudeRunner`/`CodexRunner`) がいくら完成しても到達不能のままになる
+(claude/codex 経由の improve worker が構造的に起動できない)。
+
+- [ ] **失敗するテストを書く** — `tests/test_mission_worker.py` に追記
+
+```python
+@pytest.mark.parametrize("backend", ["local", "claude", "codex"])
+def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
+        monkeypatch, tmp_path, backend):
+    """レビュー1周目 C4: improve backend が claude/codex でも
+    `factory.build_runner` 経由で runner が構築されること (fake CLI、
+    実 LLM 不要)。旧ガード (`backend != "local"` で RuntimeError) が
+    残っていれば claude/codex パラメータで red になる。"""
+    import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.runners.factory import build_runner
+
+    captured = {}
+    orig_build_runner = build_runner
+
+    def spy(profile, settings, registry, *, workdir):
+        captured["profile"] = profile
+        captured["backend"] = getattr(
+            getattr(settings.runner, profile, None), "backend", None)
+        # 実 CLI/実 LLM を起動しない fake を返す — 構築経路の到達のみ確認する。
+        class _Fake:
+            def run(self, mission):
+                from agentic_fx.runners.base import MissionResult
+                return MissionResult("completed", {}, [])
+            def close(self):
+                pass
+        return _Fake()
+
+    monkeypatch.setattr(mw_mod.factory, "build_runner", spy)
+    settings = _settings_with_improve_backend(backend)  # 既存ヘルパを流用/新設
+    mw_mod._run_mission_with_backend(  # 実装時の現物関数名に合わせる
+        profile="improve", settings=settings, workdir=tmp_path)
+    assert captured["profile"] == "improve"
+    assert captured["backend"] == backend
+```
+
+（`_settings_with_improve_backend` は `tests/test_mission_worker.py` の既存
+`_settings()` 系ヘルパのパターンを踏襲した `# 新規命名`。`_run_mission_with_backend`
+は現物 `mission_worker.py:396-418` を包む関数の現物名に実装時点で合わせること —
+本書執筆時点では未確認のため仮称とする。）
+
+- [ ] **最小実装**: `mission_worker.py:396-418` の
+
+```python
+# 変更前 (現物)
+if settings.runner.improve.backend != "local":
+    raise RuntimeError(...)
+runner = LocalRunner(...)
+```
+
+を
+
+```python
+# 変更後
+from agentic_fx.runners import factory as runner_factory
+runner = runner_factory.build_runner(
+    "improve", settings, registry, workdir=workdir)
+```
+
+へ置換する (`factory.build_runner` のシグネチャは Task 1 の Interfaces 節を正とする —
+`profile`/`settings`/`registry`/`workdir` の 4 引数)。旧ガード (`RuntimeError`) は
+`factory.build_runner` 内の schema 検証 (`^(local|claude|codex)$`) と trade+codex
+拒否 validator (Task 1) に置き換わって消える。
+
+- [ ] **green を確認** — `uv run pytest tests/test_mission_worker.py -v -k builds_runner_via_factory`
+- [ ] **変異テスト**
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M1 | `factory.build_runner` を呼ばず `backend != "local"` の旧ガードへ戻す | `test_mission_worker_builds_runner_via_factory_for_all_improve_backends[claude]`/`[codex]` |
+| M2 | `profile="improve"` を渡さず `"trade"` を渡す | 同上 (`captured["profile"]` の assert が落ちる) |
+
+- [ ] **コミット** — 束 B Task 5 の同一ファイル改修サイクルに合流させる (Step 7c と同じ理由)。
+
+```bash
+git add src/agentic_fx/mission_worker.py tests/test_mission_worker.py
+git commit -m "$(cat <<'EOF'
+fix: mission_worker の improve backend 分岐を factory.build_runner 経由へ (プラン10 Task4, レビュー1周目 C4)
+
+local以外を拒否する旧ガード + LocalRunner直接構築を除去し、
+claude/codexもfactory経由で構築できるようにする。
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+EOF
+)"
+```
 
 ---
 
@@ -5045,7 +5253,47 @@ handshake = {
 
   移行後 `uv run pytest tests/test_improve_profile_isolation.py -v` が全件 green であることを確認する。
 
-- [ ] **Step 7: commit** — 5-B/5-C/5-D を統合。`landlock.execute_paths` + backend 別 exec closure + `_bootstrap_improve_profile` 拡張。既存 trade profile・既存テスト (`tests/test_improve_profile_isolation.py` 含む) は無変更の意味論のまま green。
+- [ ] **Step 6b (レビュー1周目 C3 で追加): 親 (`WorkerRunner(run_context=ctx)`) が送った 3 値を子が受け取る実プロセステスト**
+
+`:236-291` の `test_real_improve_worker_reaches_ready` は handshake dict を直接手組みしており、`WorkerRunner.__init__` の `run_context=` 経路 (Task 1 が実装) を経由しない。C3 は「親が送った 3 値を子が受け取る」ことを実プロセスで検証する 1 本を Task 5 側に要求しているため、`tests/test_improve_profile_isolation.py` に以下を追加する:
+
+```python
+def test_worker_runner_run_context_reaches_real_improve_worker(tmp_path):
+    """レビュー1周目 C3: `WorkerRunner(worker_profile="improve",
+    run_context=ctx)` (Task 1 実装) → 実 subprocess の mission_worker が
+    受け取った mission_id/staging_dir/source_snapshot_dir で 5-D の
+    Landlock 相互照合 (`staging_path.name == mission_id`) が通り、
+    'ready' へ到達することを実プロセスで確認する。ctx の値が正しく
+    handshake へ乗らなければ、この相互照合が RuntimeError で落ち
+    'ready' に到達しない — これが本テストの killer。"""
+    from agentic_fx.runners.worker_runner import WorkerRunner
+
+    mission_id = "c3-real-probe"
+    staging_dir = tmp_path / "staging" / mission_id
+    staging_dir.mkdir(parents=True, mode=0o700)
+    source_snapshot_dir = tmp_path / "source"
+    source_snapshot_dir.mkdir(mode=0o500)
+
+    class _RealRunContext:
+        def __init__(self, mission_id, staging_dir, source_snapshot_dir):
+            self.mission_id = mission_id
+            self.staging_dir = staging_dir
+            self.source_snapshot_dir = source_snapshot_dir
+
+    ctx = _RealRunContext(mission_id, staging_dir, source_snapshot_dir)
+    runner = WorkerRunner(
+        root=tmp_path, settings=_settings(), clock=_clock(), rag=_rag(),
+        worker_profile="improve", run_context=ctx)
+    result = runner.run(_mission())
+    # mismatch していれば 5-D の相互照合が RuntimeError を投げ 'failed' で
+    # 終端する (ready へ到達しない) — 一致していれば通常の mission 終端
+    # 契約 (completed/failed(mismatch以外の理由)/timeout/max_turns) に乗る。
+    assert result.status != "failed" or "mismatch" not in (result.reason or "")
+```
+
+(`_settings()`/`_clock()`/`_rag()`/`_mission()` は既存 `tests/runners/test_worker_runner.py` のヘルパを import して流用する。`tests/test_improve_profile_isolation.py` に無ければ import を追加する。)
+
+- [ ] **Step 7: commit** — 5-B/5-C/5-D/5-D(Step 6b) を統合。`landlock.execute_paths` + backend 別 exec closure + `_bootstrap_improve_profile` 拡張 + `WorkerRunner(run_context=ctx)` を経由した実プロセス受領テスト。既存 trade profile・既存テスト (`tests/test_improve_profile_isolation.py` 含む) は無変更の意味論のまま green。
 
 ---
 
@@ -6627,7 +6875,7 @@ PytestRunnerFn = Callable[[Path], GateResult]
 2. **`_assert_allowlist_excludes_data_dir` を `mission_worker.py` から `core/landlock.py` へ移設し、シグネチャに `guarded_data_dir: Path` を明示引数化した**(§5-B)。`_guarded_data_dir()`(座標の算出そのもの)は元の docstring の独立性要求どおり `mission_worker.py` に残した。骨格 Interfaces 節はこの移設先を landlock.py と明記しているが、`_guarded_data_dir()` の去就までは指定していない — 本書の判断を記録する。
 3. **`discover(plugins_dir: Path)` に `activity: ActivityLog | None = None` を追加した**(§5-F)。§2.3 は「拒否 + activity ERROR」と言うが `discover` に activity パラメータは元々無い。必須化すると trade 経路 (`mission_worker.py`)・CLI (`backtest/cli.py`)・`service.py` の全呼び出し元を書き換える必要が生じるため、オプション引数にした。呼び出し元を activity 付きに変える (改善ループの起動時 discover に activity を渡す) かどうかは Task 9/11 の実装計画で確定すること。
 4. **`_bootstrap_improve_profile` の呼び出しシグネチャを `backend`/`mission_id`/`staging_dir`/`source_snapshot_dir`/`claude_bin`/`codex_bin` の 6 キーワード引数に変えた**(§5-D)。`main()` からの呼び出しで `settings_dict["runner"]["claude"]["bin"]` 等を参照する箇所は、**Task 1 が確定する `RunnerSettings`/`ClaudeCliSettings`/`CodexCliSettings` のキー名と完全一致するか、Task 1 完了後に実装時点で再確認すること**(骨格の同一ファイル merge 順注記どおり、Task 5 の `mission_worker.py` 変更は Task 1 (A-1) と Task 4 (A-4) の間に挟まる — 本書は Task 1 が未確定な段階で書いているため、キー名は仮のものである可能性がある)。
-5. **`worker_runner.py` の handshake フィールド追加 (`mission_id`/`staging_dir`/`source_snapshot_dir`) は骨格の同一ファイル注記どおり A-1(認証コピー)と競合する**。本書は handshake の辞書リテラルに 3 キーを追加するところまでを Task 5 の担当分とし、`WorkerRunner.__init__`/`run` への実引数配線(呼び出し元がどうやって `staging_dir` の値を得るか)は Task 9/10(`ImproveLoop.prepare`)が担う — Task 5 単体では `self._staging_dir` 相当の属性はまだ存在せず、5-D の Step 3 のコード例は「型と配線の骨格」を示すに留める。**統合時、`WorkerRunner.__init__` にこれらの属性を追加する実引数は本書の範囲外**であることを明記する。
+5. **【レビュー1周目 C3 で更新】`worker_runner.py` の handshake フィールド追加 (`mission_id`/`staging_dir`/`source_snapshot_dir`) は骨格の同一ファイル注記どおり A-1(認証コピー)と競合する**。当初本書は handshake の辞書リテラルに 3 キーを追加するところまでを Task 5 の担当分とし、`WorkerRunner.__init__`/`run` への実引数配線は Task 9/10 が担うと想定していたが、**レビュー1周目 C3 でこの分担を確定し直した: `WorkerRunner.__init__` への `run_context: object | None = None` 追加と、`run_context` から 3 値を読んで handshake へ載せる完全実装は Task 1 が所有する** (Task 1 節 Step 33 で完結)。`ImproveLoop.prepare()` (Task 10) は `WorkerRunner(..., run_context=ctx)` の形でこの引数へ `ImproveRunContext` を渡すだけでよい。Task 5 が担当するのは、子側 (`mission_worker.py`/`_bootstrap_improve_profile`) が handshake で受け取った 3 値を Landlock 適用前に相互照合する経路のみ (5-D、変更なし)。親が送った値を子が正しく受け取ることを検証する実プロセステストを Task 5 側に 1 本追加すること (下記 5-D 節を参照)。
 6. **exec closure の 1 要素 drop 表は §5-G で課金不要の範囲 (`--version` exec・動的ローダ有無・`/proc` 有無) を実プロセスで書いた**。実 1 ターン完走 (`--output-schema` まで通す) での効果測定は §8.1-47 が「継続実測」として明記するとおり課金枠を要するため Task 13 の scope に残す。§5-G のテストは `shutil.which("claude"/"codex")` でホストに CLI が無ければ skip する — CI 環境に claude/codex CLI が導入されていない場合、この 5 本は skip されたまま Task 13 まで実測されない。Task 1 が `runner.claude.bin`/`runner.codex.bin` の config 経路を確定させたら、5-G のパス解決を `shutil.which` から設定値へ差し替えること。
 7. **Task 6 (gate_pytest) は A-1 (`agentic_fx.runners.launcher.build_launcher_argv`) に依存するが、本書の執筆時点で A-1 は未実装**。§6-B のコード例は骨格 Interfaces 節の `build_launcher_argv` シグネチャをそのまま呼ぶ形で書いたが、A-1 の実装が確定するまで 6-B の実プロセステストは red のまま進められない。統合順序は骨格の実行グラフ (`B-6 は A-1, B-5 の後`) のとおりに従うこと。
 8. **`plugin.pytest_timeout_sec` は Task 6 が新設した config フィールド**(§6-A)。設計書 §4.2-3d は既存キーであるかのように参照しているが、現物の `PluginSettings`(`config.py:188-222`)には無かった。既定値 `300.0` は既存 `approval.py` の `_PYTEST_TIMEOUT_SEC` 定数(削除対象)と同じ値を踏襲した。
@@ -6652,7 +6900,7 @@ PytestRunnerFn = Callable[[Path], GateResult]
     # 拡張する変更」または「ioctl を要する新規機能の追加」。
     ```
 13. **6-B′ が新設する `CandidateSnapshotError`/`check_candidate_snapshot`/`hashes_of` は骨格 Interfaces 節に名前が無い**(骨格は Task 6 の Interfaces 節で `GateResult`/`run_gate_pytest` のみを規定し、§8.1 項目 9 の「候補の read-only スナップショットのヘルパ」の具体名までは与えていない)。`# 新規命名` として本書がここで命名した — 既存コードの命名規約 (関数は snake_case、例外クラスは `<Noun>Error`)に合わせている。
-14. **`mission_worker.main()` の `if settings.runner.improve.backend != "local": raise RuntimeError(...)` (現行 `:398-402`) の除去は本書の scope 外**。5-D は `_bootstrap_improve_profile` に `backend` パラメータを追加し claude/codex 分岐の Landlock 配線を可能にするが、`main()` 側のこの fail-closed ガードは Task 2/3 (`ClaudeRunner`/`CodexRunner` の実装 task) が `factory.build_runner` 経由の分岐を組み込む際に外す(または `factory.build_runner` の呼び出しに置き換える)べきものであり、Task 5 では**意図的に触れない**(5-D の実プロセステストは `_bootstrap_improve_profile` を直接呼ぶため、このガードの存在有無に影響されない)。統合時、Task 5 完了時点でも `main()` は improve+claude/codex を `RuntimeError` で拒否したままであることを確認すること(意図した現状維持)。
+14. **【レビュー1周目 C4 で担当確定】`mission_worker.main()` の `if settings.runner.improve.backend != "local": raise RuntimeError(...)` (現行 `:398-402`) の除去は本書の scope 外**。5-D は `_bootstrap_improve_profile` に `backend` パラメータを追加し claude/codex 分岐の Landlock 配線を可能にするが、`main()` 側のこの fail-closed ガードと `LocalRunner` 直接構築を `factory.build_runner(...)` 呼び出しへ置換する専用 step は **Task 4 の Step 7d (レビュー1周目 C4) が所有する** (`factory.build_runner` 経由で 3 backend を worker から構築する契約テストも同 step に含む)。Task 5 では**意図的に触れない**(5-D の実プロセステストは `_bootstrap_improve_profile` を直接呼ぶため、このガードの存在有無に影響されない)。統合時、Task 5 完了時点では `main()` はまだ improve+claude/codex を `RuntimeError` で拒否したままで正しい (意図した現状維持) — Task 4 Step 7d 完了後にこのガードが `factory.build_runner` へ置き換わる。
 
 
 # プラン 10 実装計画 束 C: Task 7〜8 (improve registry + store 拡張)
@@ -8003,11 +8251,30 @@ _PROBE_SCRIPT = textwrap.dedent("""
     from pathlib import Path
     os.chdir(sys.argv[2])
     from agentic_fx.mission_worker import _bootstrap_improve_profile
-    _bootstrap_improve_profile()
 
     data_dir = Path(sys.argv[1])
     staging_dir = Path(sys.argv[3])
+    root_dir = Path(sys.argv[4])
+    source_snapshot_dir = root_dir / "source"
+    source_snapshot_dir.mkdir(parents=True, exist_ok=True)
+    # レビュー1周目 I1: Task 5 が `_bootstrap_improve_profile` を
+    # backend/mission_id/staging_dir/source_snapshot_dir/claude_bin/codex_bin
+    # の必須 keyword 6 個へ変更した (5-D)。5-D の相互照合は
+    # `staging_dir` の末尾成分が `mission_id` と一致することを要求するため
+    # `mission_id = staging_dir.name` を使う。
+    mission_id = staging_dir.name
     results = {}
+    try:
+        _bootstrap_improve_profile(
+            backend="local", mission_id=mission_id,
+            staging_dir=str(staging_dir),
+            source_snapshot_dir=str(source_snapshot_dir),
+            claude_bin=None, codex_bin=None)
+        results["bootstrap"] = "ok"
+    except Exception as e:
+        results["bootstrap"] = f"FAILED: {type(e).__name__}: {e}"
+        print(json.dumps(results))
+        sys.exit(0)
 
     # ①②③ (既存 probe と同型 — Task 5/7 時点で green)
     try:
@@ -8052,7 +8319,7 @@ _PROBE_SCRIPT = textwrap.dedent("""
     registry = mission_registry.build_mission_registry(
         "improve", sqlite3.connect(":memory:"), None, None, None,
         activity=None, staging_dir=staging_dir,
-        source_snapshot_dir=Path(sys.argv[4]) / "source",
+        source_snapshot_dir=source_snapshot_dir,
         ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
         rpc_handlers={"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}})
     names = set(registry.names())
@@ -8080,6 +8347,12 @@ def test_improve_worker_write_boundary_and_forbidden_tools(tmp_path):
         capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
     out = json.loads(result.stdout.strip().splitlines()[-1])
+    # レビュー1周目 I1: bootstrap 自体が失敗していないことを EACCES 検査より
+    # 先に明示 assert する — さもないと Task 5 が必須 keyword 6 個へ変更した
+    # `_bootstrap_improve_profile` の呼び出し形が壊れていても、この後続の
+    # `out["open_db"]` 等の KeyError/AssertionError だけが観測され、
+    # 「境界が壊れた」のか「bootstrap 自体に到達していない」のか区別できない。
+    assert out["bootstrap"] == "ok", out
     assert out["open_db"] == "blocked"
     assert out["list_data_dir"] == "blocked"
     assert out["write_reports"] == "blocked"
@@ -12816,6 +13089,8 @@ class ImproveRunContext:
     staging_dir: Path
     source_snapshot_dir: Path
     allowed_backlog_ids: frozenset[int] | None
+    slot_key: tuple[str, int] | None   # wave 起動なら (period_key, k)。手動は None
+                                        # (レビュー1周目 C2)
     ledger: ImproveRpcLedger
     rpc_handlers: dict[str, Callable[[dict], dict]]
 
@@ -12878,7 +13153,8 @@ def test_improve_run_context_is_frozen_dataclass():
     ctx = ImproveRunContext(
         mission_id=1, run_id=2, staging_dir=Path("/tmp/staging"),
         source_snapshot_dir=Path("/tmp/source"),
-        allowed_backlog_ids=frozenset({1, 2}), ledger=ledger, rpc_handlers={})
+        allowed_backlog_ids=frozenset({1, 2}), slot_key=("2026-W34", 0),
+        ledger=ledger, rpc_handlers={})
     assert ctx.mission_id == 1
     with pytest.raises(AttributeError):
         ctx.mission_id = 99  # frozen
@@ -12914,6 +13190,8 @@ class ImproveRunContext:
     staging_dir: Path
     source_snapshot_dir: Path
     allowed_backlog_ids: frozenset[int] | None
+    slot_key: tuple[str, int] | None   # wave 起動なら (period_key, k)。手動は None
+                                        # (レビュー1周目 C2)
     ledger: ImproveRpcLedger
     rpc_handlers: dict[str, Callable[[dict], dict]]
 ```
@@ -13109,7 +13387,7 @@ class ImproveLoop:
         ctx = ImproveRunContext(
             mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
             source_snapshot_dir=source_snapshot_dir,
-            allowed_backlog_ids=allowed_ids, ledger=ledger,
+            allowed_backlog_ids=allowed_ids, slot_key=slot_key, ledger=ledger,
             rpc_handlers=rpc_handlers)
 
         prompt = build_improve_context(
@@ -13132,7 +13410,8 @@ class ImproveLoop:
         raise NotImplementedError  # Task 7 依存分。10.9 節で配線
 
     def _build_worker_runner(self, ctx):
-        raise NotImplementedError  # Task 1/4/5 依存。10.9 節で配線
+        raise NotImplementedError  # Task 1 (C3) 依存。10.9 節 Step 7 で
+                                    # WorkerRunner(..., run_context=ctx) として完成
 
     def commit(self, *, mission, ctx, result, now):
         raise NotImplementedError  # 10.4〜10.11 節
@@ -14387,6 +14666,29 @@ EOF
 | published+missing | `published` | — | **なし** (削除/破損) | 同上 | 実パス (存在しない) | 公開後に外部要因でファイル消失 | 補償: `failed`+`result=NULL`+`report_path=NULL`+backlog `done→observation(report_failed:missing)` |
 | failed+residue | `failed` | 残存し得る | なし/一部 | `NULL` | `NULL` | 一時ファイル作成失敗、または公開失敗の補償後 | 命名規則一致・どの run からも参照されない一時/最終ファイルを削除 |
 
+- [ ] **Step 0 (レビュー1周目 I3): 10.2 節の `xfail(strict=False)` マーカーを外す**
+
+10.2 節 (Tx-0) は `_compute_partition_hint`/`_materialize_workspace`/`_build_rpc_handlers`/
+`_build_worker_runner` が本節・10.9 の後続 step まで `NotImplementedError` のままだった
+ため、`tests/loops/test_improve_loop_prepare.py` の `test_tx0_creates_mission_and_run_atomically_scheduler_wave`
+と `test_tx0_manual_one_shot_has_no_slot_claim` の 2 本に
+`@pytest.mark.xfail(reason="10.9節でrpc_handlers/worker_runner配線完了まで保留", strict=False)`
+を付けて保留していた (10.2 節)。`strict=False` は実装が完成して XPASS しても
+suite を成功扱いにしてしまい、原子性退行を検出できない (レビュー1周目 I3)。
+
+本 Step (10.9 の先頭) で、上記 2 本から `xfail` マーカーを削除する
+(`_materialize_workspace`(10.3)・`_build_rpc_handlers`・`_build_worker_runner`
+(本節 Step 7) が出揃った時点でこの節に達しているため、素の green として通る
+はずである)。削除後、以下のいずれかで xfail が残っていないことを確認する:
+
+```bash
+grep -n "xfail" tests/loops/test_improve_loop_prepare.py   # 0 件になること
+uv run pytest tests/loops/test_improve_loop_prepare.py -v -k tx0 --runxfail
+```
+
+(`--runxfail` は保険 — `grep` の 0 件確認を主、`--runxfail` 実行を副とする。
+どちらも本節の完了条件に含める。)
+
 - [ ] **Step 1: 失敗するテストを書く**
 
 ```python
@@ -14664,6 +14966,73 @@ EOF
 )"
 ```
 
+- [ ] **Step 7 (レビュー1周目 C3): `_build_worker_runner` を完全実装する**
+
+10.2 節で `NotImplementedError` のまま置いた `ImproveLoop._build_worker_runner` (`loops/improve_loop.py`) を、Task 1 (C3) が確定した `WorkerRunner(..., run_context=ctx)` 契約を使う完全実装へ置き換える:
+
+```python
+    def _build_worker_runner(self, ctx: ImproveRunContext) -> "WorkerRunner":
+        from agentic_fx.runners.worker_runner import WorkerRunner
+        from agentic_fx.store.rag import Rag
+
+        return WorkerRunner(
+            root=self._root, settings=self._settings, clock=self._clock,
+            rag=Rag(self._db_readonly_conn_factory), worker_profile="improve",
+            run_context=ctx)
+```
+
+`ImproveRunContext` (Task 10 が produce) をそのまま `run_context=` に渡すだけで、
+`WorkerRunner.__init__`/`run` (Task 1、束 A) が `ctx.mission_id`/`ctx.staging_dir`/
+`ctx.source_snapshot_dir` を duck-typing で読んで handshake の 3 キーへ載せる
+(Task 1 節 Step 33)。`Rag` の構築引数は既存 `WorkerRunner` 呼び出し元の規約に合わせる
+(現物 `service.py`/`mission_worker.py` の `Rag(...)` 呼び出し形を実装時に確認すること —
+本書は `db_readonly_conn_factory` を渡す形を仮定する)。
+
+- [ ] **Step 8: 契約テストを追加** — `tests/loops/test_improve_loop_prepare.py` に追記
+
+```python
+def test_build_worker_runner_passes_ctx_as_run_context(loop_full, conn):
+    """`_build_worker_runner` が `ImproveRunContext` をそのまま
+    `WorkerRunner(run_context=ctx)` へ渡すことの契約テスト (レビュー1周目 C3)。"""
+    from agentic_fx.loops.improve_run_context import ImproveRunContext
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+
+    ctx = ImproveRunContext(
+        mission_id=1, run_id=1, staging_dir=Path("/tmp/x"),
+        source_snapshot_dir=Path("/tmp/y"), allowed_backlog_ids=None,
+        slot_key=None, ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        rpc_handlers={})
+    runner = loop_full._build_worker_runner(ctx)
+    assert runner._run_context is ctx
+    assert runner._worker_profile == "improve"
+```
+
+```bash
+uv run pytest tests/loops/test_improve_loop_prepare.py -v -k build_worker_runner
+```
+
+- [ ] **Step 9: 変異テスト**
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M6 | `run_context=ctx` を渡さない (既定 `None` のまま) | `test_build_worker_runner_passes_ctx_as_run_context` |
+| M7 | `worker_profile="trade"` を渡す (improve worker が trade profile の Landlock/資格情報経路に落ちる) | `test_build_worker_runner_passes_ctx_as_run_context` |
+
+- [ ] **Step 10: コミット**
+
+```bash
+git add src/agentic_fx/loops/improve_loop.py tests/loops/test_improve_loop_prepare.py
+git commit -m "$(cat <<'EOF'
+feat: ImproveLoop._build_worker_runner を WorkerRunner(run_context=ctx) で完成 (プラン10 Task10-9)
+
+Task 1 (C3) が確定した run_context= 契約に ImproveRunContext を
+そのまま渡す。子側の受領・相互照合は Task 5 が担当 (別コミット済み)。
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
 ---
 
 ### 10.10 手順 7〜9: `improvement_runs.finish` + backlog 遷移 + `finish_improve_mission` (Tx-2 の組み立て、§8.1-23/24 の Tx-2 側)
@@ -14856,7 +15225,14 @@ def test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin(
     """End-to-end (fake CLI 出力を使う) — 発見→選択→plugin ゲート合格→
     承認申請→レポート準備→Tx-2→finish、の一連が 1 回の commit() 呼び出し
     で完了することを確認する (E2E は Task 12 で更に厚く検証されるが、
-    Task 10 単体でも happy path を通す)。"""
+    Task 10 単体でも happy path を通す)。
+
+    **レビュー1周目 I4**: 最終状態 (`missions.status`/`improvement_runs.result`)
+    だけを見る旧版は、`_freeze_ledger` を Tx-1 の後へ移す・approval を
+    gate row 保存前へ移す等の順序退行があっても最終 2 列が同じなら通って
+    しまう恒真に近いテストだった。以下は各 private step メソッドに
+    recorder を monkeypatch で注入し、呼び出し**順序**そのものを設計書
+    §4.2 の手順 0〜9 の期待列と完全一致で assert する。"""
     mission_id, run_id, backlog_id = mission_and_run_fixture
     staging_dir = tmp_path / "staging"
     _write_candidate(staging_dir, "myind")
@@ -14870,7 +15246,128 @@ def test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin(
     ctx = ImproveRunContext(
         mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
         source_snapshot_dir=tmp_path / "source",
-        allowed_backlog_ids=None, ledger=ledger, rpc_handlers={})
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    result = MissionResult(status="completed", output={
+        "discoveries": [], "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "artifact": {"type": "plugin", "name": "myind", "kind": "indicator",
+                    "self_test": "passed", "summary": "s"},
+        "selection_rationale": "r"}, transcript=[])
+
+    # §4.2 手順 0〜9 のうち happy path (plugin, indicator, ゲート全通過) が
+    # 実際に到達する private メソッド名の期待列 (手順4 の strategy ゲートは
+    # kind="indicator" なので到達しない — スキップは意図どおり)。
+    _EXPECTED_ORDER = [
+        "_freeze_ledger",        # 手順0
+        "_inspect_output",       # 手順1
+        "_select_and_bind",      # 手順2
+        "_run_plugin_gate",      # 手順3
+        "_build_approval_payload",  # 手順5
+        "_finalize_success",     # 手順7-9 (Tx-2 組み立て + finish_improve_mission)
+    ]
+    call_order: list[str] = []
+
+    def _make_recorder(name):
+        original = getattr(loop_full, name)
+
+        def _recorder(*a, **kw):
+            call_order.append(name)
+            return original(*a, **kw)
+        return _recorder
+
+    for name in _EXPECTED_ORDER:
+        monkeypatch.setattr(loop_full, name, _make_recorder(name))
+
+    loop_full.commit(mission=mission, ctx=ctx, result=result,
+                     now=datetime(2026, 8, 22))
+
+    assert call_order == _EXPECTED_ORDER
+
+    m = conn.execute("SELECT status FROM missions WHERE id=?",
+                     (mission_id,)).fetchone()
+    assert m["status"] == "completed"
+    r = conn.execute("SELECT result FROM improvement_runs WHERE id=?",
+                     (run_id,)).fetchone()
+    assert r["result"] == "approval"
+
+
+def test_commit_rolls_back_tx2_on_db_fault_between_gate_rows_and_approval(
+        loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """レビュー1周目 I4: `_finalize_success` の Tx-2 本体 (台帳→gate rows→
+    approval→finish の単一 commit) に DB fault を注入し、境界の一つでも
+    落ちれば同一 Tx-2 が丸ごと rollback することを確認する
+    (`test_tx2_commit_failure_rolls_back_and_compensation_finalizes`
+    (10.10 節) は `_finalize_success` を直接呼ぶ単体テストだったが、本テストは
+    `commit()` の統合本体を通した happy path 経路の途中で fault を注入する
+    ことで、境界の位置がずれても検出できることを狙う)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    _write_candidate(staging_dir, "myind")
+
+    from agentic_fx.loops.improve_run_context import ImproveRunContext
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+    from agentic_fx.runners.base import Mission, MissionResult
+    from agentic_fx.store import approvals as approvals_store
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    result = MissionResult(status="completed", output={
+        "discoveries": [], "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "artifact": {"type": "plugin", "name": "myind", "kind": "indicator",
+                    "self_test": "passed", "summary": "s"},
+        "selection_rationale": "r"}, transcript=[])
+
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated fault between gate rows and approval")
+    monkeypatch.setattr(approvals_store, "create", _boom)
+
+    loop_full.commit(mission=mission, ctx=ctx, result=result,
+                     now=datetime(2026, 8, 22))
+
+    # 補償側 (§4.2 の Tx-2 失敗時の意味論) — approval は作られておらず、
+    # mission/run は failed で終端する (10.10 節の補償経路と同じ契約)。
+    a = conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'"
+    ).fetchone()[0]
+    assert a == 0
+    m = conn.execute("SELECT status FROM missions WHERE id=?",
+                     (mission_id,)).fetchone()
+    assert m["status"] == "failed"
+
+
+def test_commit_terminates_scheduler_wave_slot_via_ctx_slot_key(
+        loop_full, conn, mission_and_run_fixture_with_slot, tmp_path):
+    """レビュー1周目 C2 の protocol test: scheduler wave 起動 (`ctx.slot_key`
+    が非 None) で prepare → commit を通したとき、`commit()` が固定の
+    `slot_key=None` にすり替えず `ctx.slot_key` をそのまま
+    `finish_improve_mission` へ運び、slot が `running→done` で終端する
+    ことを確認する (敗者経路のような失敗終端でも同じ配線で `failed` に
+    終端するのが本来の契約だが、本テストは happy path 成功終端のみを
+    固定する — 失敗系の変種は実装者が追加すること)。"""
+    mission_id, run_id, backlog_id, slot_key = mission_and_run_fixture_with_slot
+    staging_dir = tmp_path / "staging"
+    _write_candidate(staging_dir, "myind")
+
+    from agentic_fx.loops.improve_run_context import ImproveRunContext
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+    from agentic_fx.runners.base import Mission, MissionResult
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=slot_key, ledger=ledger,
+        rpc_handlers={})
     mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
                       timeout_sec=60)
     result = MissionResult(status="completed", output={
@@ -14882,18 +15379,17 @@ def test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin(
     loop_full.commit(mission=mission, ctx=ctx, result=result,
                      now=datetime(2026, 8, 22))
 
-    m = conn.execute("SELECT status FROM missions WHERE id=?",
-                     (mission_id,)).fetchone()
-    assert m["status"] == "completed"
-    r = conn.execute("SELECT result FROM improvement_runs WHERE id=?",
-                     (run_id,)).fetchone()
-    assert r["result"] == "approval"
+    period_key, k = slot_key
+    slot = conn.execute(
+        "SELECT status FROM improve_wave_slots WHERE wave_period_key=? "
+        "AND k=?", (period_key, k)).fetchone()
+    assert slot["status"] == "done"
 ```
 
 - [ ] **Step 2: 失敗を確認**
 
 ```bash
-uv run pytest tests/loops/test_improve_loop_finalize.py -v -k commit_runs_all_nine
+uv run pytest tests/loops/test_improve_loop_finalize.py -v -k "commit_runs_all_nine or commit_terminates_scheduler_wave_slot or commit_rolls_back_tx2_on_db_fault"
 ```
 
 - [ ] **Step 3: 最小実装 — `commit()` の統合本体**
@@ -14971,7 +15467,7 @@ class ImproveLoop:
             if approval_payload is not None:
                 self._finalize_success(                                 # 手順7-9
                     conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
-                    backlog_id=selection.backlog_id, slot_key=None,
+                    backlog_id=selection.backlog_id, slot_key=ctx.slot_key,
                     approval_payload=approval_payload, now=now)
             else:
                 self._finalize_report_or_observation(
@@ -14986,13 +15482,13 @@ class ImproveLoop:
                                           # みを示す)
 ```
 
-**申し送り**: 上記 `commit()` は 10.4〜10.10 節で作った private メソッドを設計書 §4.2 の手順番号順に呼ぶ**統合の骨格**である。以下のメソッドは骨格中に呼び出しがあるが、個別のサブタスクとしては未執筆 (実装時に追加すること — 手順の意味論は設計書 §4.2/§4.3 が正):
-- `_finalize_failed_mission` (timeout/failed/max_turns → §3.6 の失敗終端。RPC 台帳 `mark_discarded`、staging 削除)
-- `_finalize_output_invalid` (手順1 不合格 → Mission `failed`、staging 削除、台帳 `DISCARDED`)
-- `_finalize_loser` (敗者経路 → 「重複のため見送り」レポートと run finish のみ Tx-2 で書く。10.9 節の `_write_report_part`/`_publish_report` を呼ぶ)
-- `_finalize_gate_failed` (§4.3「ゲート不合格/評価不能」→ `observation`)
+**申し送り**: 上記 `commit()` は 10.4〜10.10 節で作った private メソッドを設計書 §4.2 の手順番号順に呼ぶ**統合の骨格**である。以下のメソッドは骨格中に呼び出しがあるが、個別のサブタスクとしては未執筆 (実装時に追加すること — 手順の意味論は設計書 §4.2/§4.3 が正)。**いずれも `ctx` を受け取るため `finish_improve_mission` を呼ぶ際は必ず固定値でなく `ctx.slot_key` を渡すこと (レビュー1周目 C2)** — これらは全て終端経路であり、scheduler wave 起動 (`ctx.slot_key` が非 None) のとき slot を `running→done|failed` に終端させる責務を持つ:
+- `_finalize_failed_mission` (timeout/failed/max_turns → §3.6 の失敗終端。RPC 台帳 `mark_discarded`、staging 削除。`finish_improve_mission(..., slot_key=ctx.slot_key, ...)`)
+- `_finalize_output_invalid` (手順1 不合格 → Mission `failed`、staging 削除、台帳 `DISCARDED`。`finish_improve_mission(..., slot_key=ctx.slot_key, ...)`)
+- `_finalize_loser` (敗者経路 → 「重複のため見送り」レポートと run finish のみ Tx-2 で書く。10.9 節の `_write_report_part`/`_publish_report` を呼ぶ。`finish_improve_mission(..., slot_key=ctx.slot_key, ...)`)
+- `_finalize_gate_failed` (§4.3「ゲート不合格/評価不能」→ `observation`。`finish_improve_mission(..., slot_key=ctx.slot_key, ...)`)
 - `_prepare_report_if_applicable` (`artifact.type=report` かつ `proposal_kind != risk_gate` のときだけ本文生成。`risk_gate` は report を書かず `unsupported_in_plan10` observation)
-- `_finalize_report_or_observation` (承認申請を出さない経路の Tx-2 + finish)
+- `_finalize_report_or_observation` (承認申請を出さない経路の Tx-2 + finish。`finish_improve_mission(..., slot_key=ctx.slot_key, ...)`)
 - `_read_candidate_kind`/`_read_candidate_pairs`/`_read_candidate_timeframe` (candidate の `config.yaml` を読む薄いヘルパ — `plugin/loader.py` の config 検証ロジックと重複させず、可能なら `plugin/loader._validate_config` 相当を再利用することを推奨する。**具体形は骨格に無い — 新規命名として申し送りに転記**)
 
 これらは 10.4〜10.10 節と同じ TDD 手順 (failing test → red → 実装 → green → 変異 → commit) をそれぞれ個別のコミットとして追加すること。**本節は「統合したときに手順の呼び出し順序が壊れていないか」を確認する e2e レベルの happy-path テスト 1 本を通すところまでを Step 3 の完了条件とする** — 上記の未執筆メソッドは happy path (`atype=="plugin"` かつゲート全通過) では通らないため、`test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin` は `_finalize_success` までのパスだけを通り green になる設計にした。
@@ -15106,6 +15602,8 @@ uv run pytest tests/backtest/ -v   # 既存回帰 (record_fn 未指定の全既�
 | M1 | `record_fn` が None でなくても `save_harness_run` を呼ぶ (二重書込) | `test_run_in_sample_with_record_fn_does_not_call_save_harness_run` |
 | M2 | `record_fn is None` の分岐で `save_harness_run` を呼ばない (既存呼び出し元が退行) | `test_run_in_sample_without_record_fn_still_calls_save_harness_run` |
 | M3 | `commit()` 統合本体で `_select_and_bind` の呼び出しを省き常に「勝者」扱いにする | `test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin` の変種 (敗者ケースを実装者が追加すること — 下限リスト不足、申し送り) |
+| M4 | `commit()` 内で `_build_approval_payload` を `_run_plugin_gate` より**前**に呼ぶ (ゲート不合格でも承認payloadを組み立ててしまう) | `test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin` (レビュー1周目 I4 — `call_order == _EXPECTED_ORDER` が順序不一致で落ちる) |
+| M5 | `_finalize_success` の Tx-2 本体で `approvals_store.create` を `missions_store.finish_improve_mission` より**後**に呼ぶ (成功時は結果同じだが、fault 注入時に partial commit の窓が生まれる) | `test_commit_rolls_back_tx2_on_db_fault_between_gate_rows_and_approval` (レビュー1周目 I4 — `approval_requests` が 0 件のまま `missions.status` だけ更新されてしまうと assert が落ちる) |
 
 - [ ] **Step 6: コミット**
 
@@ -15128,6 +15626,8 @@ EOF
 ### 10.12 `service.py`: `ImproveSupervisor._improve_loop` への最終配線
 
 **前提の整理 (統合裁定 R-i2)**: Tx-0 (mission 生成 + run 生成 + slot claim) の所有者は最初から `ImproveLoop.prepare` (10.2 節) であり、`ImproveSupervisor` (9.3/9.5 節) は `self._improve_loop.prepare(...)` を呼ぶだけで自分では `claim_slot` を行わない — この設計は 9.3/9.5 節を書いた時点で既に最終形として書かれている (二重の Tx-0 という設計矛盾は存在しない)。本節に残る作業は**配線のみ**: 9.5 節で `ImproveSupervisor.__init__` が用意した `self._improve_loop: "ImproveLoop | None" = None` というテストシームに、`build_app` の中で実 `ImproveLoop` インスタンスを注入する。
+
+**スコープの限定 (レビュー1周目 C1)**: 本節が行うのは `improve_supervisor._improve_loop = improve_loop` の注入のみである。Scheduler/Commands への活性化配線 (`on_improve_tick`/`improve_supervisor` に非 `None` 値を渡す配線) はここでは**行わない**。統合裁定 R-i9 のとおり、その配線は Task 12 の blocking gate (§7.1 の 1〜7 全緑確認) が成功した**後**の step にのみ置く — 本節完了時点では `Scheduler(..., on_improve_tick=None)` / `Commands(..., improve_supervisor=None)` のまま (9.x 節の既定値を変更しない)。
 
 - [ ] **Step 1〜6**: `src/agentic_fx/service.py` の `build_app` (9.8 節で追加した `ImproveSupervisor` 構築ブロックの直後) に以下を追記する:
 
@@ -15167,35 +15667,19 @@ EOF
 
 `submit_manual` (9.7 節) も同じ `self._improve_loop.prepare(slot_key=None, ...)` を直接呼ぶ形に実装する (`ImproveLoop.prepare` の `slot_key=None` 分岐は 10.2 節の `test_tx0_manual_one_shot_has_no_slot_claim` で既に固定済み)。
 
-**Scheduler/Commands への活性化配線もここで完成させる** (統合裁定 R-i9 — Task 9 が既定 None のまま残していたフックに、Task 10 完了後の本節で実値を渡す):
+**Scheduler/Commands への活性化配線はここでは行わない** (レビュー1周目 C1 / 統合裁定 R-i9): `on_improve_tick`/`improve_supervisor` に実値を渡す配線とそのテストは Task 12 (§7.1 の blocking 1〜7 全緑確認の後の step) の担当。本節完了時点でも `Scheduler(..., on_improve_tick=None)` / `Commands(..., improve_supervisor=None)` のままとし、improve レーンは無効のままにする。
 
-```python
-        # Scheduler(...) 構築 (9.1 節が用意した on_improve_tick フックへ
-        # の値渡し。Task 9 単独では None のままだった)
-        scheduler = Scheduler(
-            ...,  # 既存の引数群 (Task 9 の変更を含む)
-            on_improve_tick=improve_supervisor.tick,
-        )
-        # Commands(...) 構築 (9.7 節が用意した improve_supervisor フックへ
-        # の値渡し)
-        commands = Commands(
-            ...,  # 既存の引数群
-            improve_supervisor=improve_supervisor,
-            policy_path=root / "policy" / "directives.md",
-        )
-```
-
-- [ ] **Step 4〜6**: 配線後、9.5 節の N=4 テストと 10.11 節の happy-path テストを通しで実行し、統合コミットを 1 本作る:
+- [ ] **Step 4〜6**: 注入後、9.5 節の N=4 テストと 10.11 節の happy-path テストを通しで実行し、統合コミットを 1 本作る:
 
 ```bash
-uv run pytest tests/core/test_improve_wave_slot_protocol.py tests/loops/ tests/service/test_improve_wiring.py -v
+uv run pytest tests/core/test_improve_wave_slot_protocol.py tests/loops/ -v
 git add src/agentic_fx/service.py
 git commit -m "$(cat <<'EOF'
-feat: ImproveSupervisor/Scheduler/Commands への ImproveLoop 最終配線 (プラン10 Task10-12)
+feat: ImproveSupervisor._improve_loop への ImproveLoop 注入 (プラン10 Task10-12)
 
-build_appでImproveLoopを構築しImproveSupervisor._improve_loopへ注入。
-Scheduler.on_improve_tick/Commands.improve_supervisorの活性化配線 (R-i9) も
-ここで完成させる (9.x節のコードは変更しない)。
+build_appでImproveLoopを構築しImproveSupervisor._improve_loopへ注入する。
+Scheduler.on_improve_tick/Commands.improve_supervisorへの活性化配線は
+Task 12 の blocking gate 成功後の step へ委譲する (レビュー1周目 C1 / R-i9)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -15219,7 +15703,7 @@ EOF
 | 10.9 | commit 手順6 report outbox (全状態表・fsync fault injection) | 43 |
 | 10.10 | commit 手順7-9 (finish_improve_mission・補償tx) | 21, 23, 24 (参照) |
 | 10.11 | commit() 統合 + holdout.py record_fn | 23, 24 |
-| 10.12 | service.py 最終配線 (`ImproveSupervisor._improve_loop` 注入・Scheduler/Commands 活性化配線) | — |
+| 10.12 | service.py 最終配線 (`ImproveSupervisor._improve_loop` 注入のみ。Scheduler/Commands 活性化配線は Task 12 へ移動 — レビュー1周目 C1) | — |
 
 ---
 
@@ -15232,7 +15716,7 @@ EOF
 | `store/improve_waves.py` の `create_wave_and_slots`/`claim_slot`/`mark_running`/`revert_to_reserved`/`mark_slot_failed`/`count_open_slots` | 9.2/9.3/9.4節 | 骨格は Task 8 の DDL 骨子のみ示し関数名を与えていない。**確定は Task 8 の詳細節が正** — 命名が食い違えば Task 9/10 側がマージ時に追従する |
 | `improve_runs.bind_backlog` | 骨格に既出 (裁定7で明記済み、新規命名の宣言も骨格側にあり) | 参考として再掲 |
 | `ImproveSupervisor._spawn_slot_thread`/`_launch_lock`/`_active_threads`/`_improve_loop` (テストシーム属性) | 9.5節 | 骨格は接続所有モデルの意味論のみ規定し、スレッド管理・`ImproveLoop` 注入点の実装単位を指定していない |
-| `Scheduler.__init__` の `on_improve_tick` パラメータ / `Commands.__init__` の `improve_supervisor` パラメータ | 9.1/9.7節で導入 (統合裁定 R-i9 で活性化配線先として確定) | Task 9 は既定 None のフックを用意するだけで、実値を渡す配線 (`build_app` での結線) は 10.12 節 (Task 10 完了後) で行う |
+| `Scheduler.__init__` の `on_improve_tick` パラメータ / `Commands.__init__` の `improve_supervisor` パラメータ | 9.1/9.7節で導入 (統合裁定 R-i9 で活性化配線先として確定) | Task 9 は既定 None のフックを用意するだけで、実値を渡す配線 (`build_app` での結線) は **Task 12 の blocking gate 成功後の step** で行う (レビュー1周目 C1 で 10.12 節から Task 12 へ移動) |
 | `_inspect_output`/`_select_and_bind`/`_run_plugin_gate`/`_run_strategy_gate`/`_build_approval_payload`/`_write_report_part`/`_publish_report`/`_fail_report`/`reconcile_report_outbox`/`_finalize_success`/`_compensate_tx2_failure` (`ImproveLoop` 内部メソッド群) | 10.4〜10.10節 | 設計書 §4.2 の手順名から機械的に命名。呼び出し順序は §4.2 逐語 |
 | `evaluate_strategy_adoption_gate`/`StrategyGateVerdict` (`plugin/strategy_gate.py` のモジュール関数・dataclass) | 10.7節 | 統合裁定 R-i3 で配置確定 (`plugin/strategy_gate.py` — Task 11 の `bless --from _human` と共有、§8.1-41) |
 | `_InspectionVerdict`/`_SelectionOutcome`/`_PluginGateVerdict` (frozen dataclass) | 10.4/10.5/10.6節 | 内部データの受け渡し用。骨格に対応する型は無い |
@@ -15739,6 +16223,65 @@ def test_discover_rejects_version_dir_with_mismatched_artifact_hash(tmp_path):
 
 - [ ] **Step 5b: 失敗を確認**、**Step 5c: 実装** (`_discover_one` の symlink 分岐に `version_store.artifact_hash_bytes(...)` との照合を挿入 — Task 5 実装済みコードの file:line は着手時に確認)、**Step 5d: 成功を確認**。
 
+- [ ] **Step 5e (レビュー1周目 M2): `plugin/loader.py::content_hash` を `version_store.content_hash_bytes` の薄いラッパへ委譲する**
+
+設計書 §5.2 は `loader.content_hash` を `version_store.content_hash_bytes` の薄い
+ラッパにすることを要求する。現物 `src/agentic_fx/plugin/loader.py:94-104` は
+sha256 計算を自前で行っており、`version_store.content_hash_bytes` と同じ式が
+2 箇所に重複している (将来片方だけ修正すると承認 identity と版 identity が
+分岐する)。
+
+失敗するテストを `tests/plugin/test_loader.py` に追記する:
+
+```python
+def test_content_hash_delegates_to_version_store_content_hash_bytes(tmp_path):
+    """`loader.content_hash(plugin_dir)` は `version_store.content_hash_bytes`
+    の薄いラッパであり、同一 bytes に対して両 API が完全一致することを
+    pin する (レビュー1周目 M2、設計書 §5.2)。"""
+    from agentic_fx.plugin import loader, version_store
+
+    plugin_dir = tmp_path / "myind"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.py").write_bytes(b"# plugin body\n")
+    (plugin_dir / "config.yaml").write_bytes(b"kind: indicator\n")
+
+    via_loader = loader.content_hash(plugin_dir)
+    via_version_store = version_store.content_hash_bytes(
+        (plugin_dir / "plugin.py").read_bytes(),
+        (plugin_dir / "config.yaml").read_bytes())
+    assert via_loader == via_version_store
+```
+
+`uv run pytest tests/plugin/test_loader.py -v -k content_hash_delegates` で red を確認する
+(現物は自前の `hashlib.sha256(...)` 計算なので、この時点では両者の値は既に一致するはず —
+red になるのは「委譲していること」自体ではなく実装がまだ委譲経路を通っていない場合のみ。
+値が既に一致していても、実装を `content_hash_bytes` 呼び出しへ置換すること自体を本 step の
+完了条件とする — 重複実装の除去が目的であり、値の食い違いを検出することが目的ではない)。
+
+`src/agentic_fx/plugin/loader.py:94-104` を以下へ置換する:
+
+```python
+def content_hash(plugin_dir: Path) -> str:
+    """plugin.py + config.yaml の内容から sha256 を算出する (spec 逐語)。
+
+    署名対象は plugin.py と config.yaml のみ — test_plugin.py は含まない。
+    承認 (Task 6) と signals 書き込み (Task 7/8) はこの関数だけを呼ぶ。
+    `version_store.content_hash_bytes` の薄いラッパ (レビュー1周目 M2、設計書 §5.2) —
+    式の実体は `version_store` 側の 1 箇所にのみ存在する。
+    """
+    from agentic_fx.plugin import version_store
+    plugin_bytes = (plugin_dir / "plugin.py").read_bytes()
+    config_bytes = (plugin_dir / "config.yaml").read_bytes()
+    return version_store.content_hash_bytes(plugin_bytes, config_bytes)
+```
+
+(モジュールレベル import ではなく関数内 import にするのは `loader.py`→`version_store.py`
+の循環 import を避けるため — `version_store.py` が `loader.py` を import していないか
+着手時に確認し、していなければモジュールレベル import に単純化してよい。)
+
+`uv run pytest tests/plugin/test_loader.py tests/plugin/test_version_store.py -v` で
+green を確認する。
+
 - [ ] **Step 6: 変異テスト (11a)**
 
 ```bash
@@ -15754,6 +16297,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M5 | `_fsync_dir`/`os.fsync` 呼び出しを削除する | `test_create_version_dir_fsyncs_files_before_rename` |
 | M6 | 版ディレクトリ名 vs 実 artifact_hash の照合を discover から削除する | `test_discover_rejects_version_dir_with_mismatched_artifact_hash` |
 | M7 | 2 版が artifact_hash でなく content_hash をキーにする (`create_version_dir` の呼び出し側を content_hash に差し替える想定変異) | `test_two_versions_same_content_hash_different_artifact_hash_coexist` |
+| M8 | `loader.content_hash` を `version_store.content_hash_bytes` へ委譲せず自前の sha256 計算のまま残す (将来の分岐リスク) | `test_content_hash_delegates_to_version_store_content_hash_bytes` (レビュー1周目 M2 — この変異自体は値が一致するので直接には落ちないが、`version_store.content_hash_bytes` の式を変えたときに `loader.content_hash` が追随しないことを検出する対変異として、実装者は `content_hash_bytes` の区切り文字を変える変異と組み合わせて確認すること) |
 
 - [ ] **Step 7: commit**
 
@@ -15765,6 +16309,8 @@ feat: 版ストア (plugins/.versions) + content_hash/artifact_hash 分離 (プ�
 
 版ディレクトリの作成・0400/0500 不変化・冪等性、discover の版ディレクトリ名
 vs 実 artifact_hash 照合。gc_roots() はシグネチャのみ (11f で完成)。
+loader.content_hash は version_store.content_hash_bytes への薄いラッパに
+委譲し、重複実装を除去した (レビュー1周目 M2、設計書 §5.2)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -18402,7 +18948,7 @@ EOF
 1. ~~**骨格の「主な変更」表**~~ — **統合時に解決済み (R-i1)**。`src/agentic_fx/store/approvals.py` の担当分割を確定した: Task 8 は `apply_decision` 新設のみで既存 `decide` には触れない。呼び出し元置換・参照ゼロ grep pin・`decide` 関数定義の削除は Task 11 の受入条件 (11g の Files 節・Step 7・「Task 11 全体の受入条件」節に明記)。`decide` の `commit=False` 変種は作らない (裁定 1 どおり削除する対象のため)。骨格の「主な変更」表もこの分担 (Task 8 = 8、削除・grep-zero pin = 11) に修正済みの前提で本節を書いている。
 2. **`plugin/approval.py`/`plugin/loader.py` の file:line 記載**: 本節の file:line は 2026-08-20 HEAD `536de27` (Task 5/6 着手前) を指す。Task 5 (`loader.py` の symlink 追従・`artifact_hash` 追加) と Task 6 (`approval.py` の `pytest_runner`→`run_gate_pytest` 置換) が先に適用された後の実コードでは行番号が変わる — 本 task の実装者は着手時に現物を再確認すること (11d/11a の該当 step に明記済み)。
 3. **`tests/plugin/` の既存フィクスチャ規約**: `tests/plugin/test_approval.py` の冒頭 (`_REPO_ROOT`/`_EXAMPLE`/`_SMA_CROSS_DIR` 等) を読んだが、本節の骨子テストは簡略化した独自 fixture (`env` fixture で `load_settings(Path("config/settings.yaml.example"))` を直接呼ぶ形) を使っている。既存の `entry.main` 経由 CLI テストの規約 (service.run_service を patch する等) と完全に一致しない可能性がある — 11g の CLI E2E 節に注記済みだが、他の統合テスト (11d/11f) でも同様の確認が要る。
-4. **`plugin/loader.py::content_hash`**: 設計書 §5.2 は「`content_hash_bytes` の薄いラッパにする」と要求するが、本 task は `version_store.content_hash_bytes` を新設し `loader.content_hash` からの委譲は明記のみで実装 step を書いていない (11a は `version_store` 側の実装に留め、`loader.content_hash` のリファクタリングは Task 5 の担当範囲と解釈した — 骨格の「主な変更」表は `plugin/loader.py` の変更を Task 5・11 両方に割り当てているため、この委譲リファクタリングをどちらが行うかは実装計画で明確化すること)。
+4. ~~**`plugin/loader.py::content_hash`**~~ — **統合時に解決済み (レビュー1周目 M2)**。設計書 §5.2 の「`content_hash_bytes` の薄いラッパにする」要求を 11a に明示 step として追加した (下記「Step 6b: `loader.content_hash` を `version_store.content_hash_bytes` へ委譲する」)。`content_hash` 自体は Task 5 が既に触っているファイル (`loader.py`) に対する変更だが、リファクタリングの実体は `version_store.content_hash_bytes` の存在を前提とするため 11a (Task 11、`version_store.py` 完成直後) が担当し、同一 bytes に対する両 API 一致テストを追加する。
 
 ---
 
@@ -18436,7 +18982,8 @@ EOF
 ### Files
 
 - Create: `tests/loops/test_improve_e2e.py` (FakeRunner E2E、本 task の主要成果物)
-- Create: `tests/loops/test_improve_blocking_items.py` (遮断 8 項目の実プロセス統合回帰 — Task 7 で red 開始したファイルを引き継ぐ。**Task 7 が作った同名ファイルが既に存在する前提** — 存在しなければ本 task が新規作成し、以後は「引き継ぎ、完了させる」)
+- Modify: `tests/integration/test_improve_forbidden_regression.py` (**レビュー1周目 I2 で正式ファイルパスとして一本化**。Task 7 が red で開始した遮断 8 項目の実プロセス統合回帰の**正式ファイル**。⑦⑧の `xfail(strict=True)` マーカーを外して green 化するのは本 task の担当 — 下記 Step 3)
+- Create (任意、Task 12 独自の追加テスト): `tests/loops/test_improve_blocking_items.py` — ⑦⑧の完了判定には使わない (判定は上記 integration ファイルの xfail 除去で行う。作る場合も「Task 7 が作った同名ファイル」ではなく Task 12 が新規に書く別ファイルであることを明記する)
 - Modify: `src/agentic_fx/service.py` の `build_app()` 内 2 箇所のみ (下記 Step 4 で diff を確定)
 - Test: `tests/test_service_app.py` (有効化配線の回帰 — 既存 E2E が壊れないことの確認。新規テスト追加は最小限)
 - Test: 既存 `uv run pytest -q` 全体 (§7.1-7 の 2071+ 件が壊れないことの最終ゲート)
@@ -18467,6 +19014,7 @@ class ImproveRunContext:
     staging_dir: Path
     source_snapshot_dir: Path
     allowed_backlog_ids: frozenset[int] | None
+    slot_key: tuple[str, int] | None   # レビュー1周目 C2
     ledger: ImproveRpcLedger
     rpc_handlers: dict[str, Callable[[dict], dict]]
 
@@ -18530,7 +19078,7 @@ from agentic_fx.service import build_app, run_init
 
 | 条件 | 主な担保 task | 検証ファイル (Task 12 が実行して確認する対象) | Task 12 の役割 |
 |---|---|---|---|
-| 1 (遮断 8 項目) | Task 7 (§8.1-13 主担当) | `tests/loops/test_improve_blocking_items.py` | Task 7 が red で開始した 8 項目を green まで**完了させる** (下記 Step 3) |
+| 1 (遮断 8 項目) | Task 7 (§8.1-13 主担当) | `tests/integration/test_improve_forbidden_regression.py` (**レビュー1周目 I2 で正式ファイルとして一本化**。`tests/loops/test_improve_blocking_items.py` は Task 12 独自の追加テストであり⑦⑧の判定には使わない) | Task 7 が red で開始した 8 項目を green まで**完了させる** (下記 Step 3) |
 | 2 (3 backend 契約) | Task 2, 3 (参照 1) | `tests/runners/test_claude_runner_contract.py` / `tests/runners/test_codex_runner_contract.py` (Task 2/3 が作成) | 実行して green を確認するのみ (本 task では変更しない) |
 | 3 (ゲート pytest) | Task 6 | `tests/plugin/test_gate_pytest.py` (Task 6 が作成) | 同上 |
 | 4 (D6 変異列) | Task 11 (参照 6, 7, 8) | `tests/plugin/test_switch_journal.py` ほか (Task 11 が作成) | 同上 |
@@ -18888,12 +19436,21 @@ Task 1〜11 が完了していれば `ImproveLoop` / `approve_candidate` / `back
 
 - [ ] **Step 3: 遮断 8 項目 (§7.1-1) を完了させる**
 
-`tests/loops/test_improve_blocking_items.py` を開き (Task 7 が red で書き始めたファイル)、
+**レビュー1周目 I2 で正式ファイルパスを一本化**: `tests/integration/test_improve_forbidden_regression.py`
+を開き (Task 7 が red で書き始めた**正式ファイル** — 7-F 節の `_PROBE_SCRIPT`/
+`test_improve_worker_write_boundary_and_forbidden_tools` 等が定義されている)、
 ①〜⑧ の各アサーションが実プロセスに対して green であることを確認する。Task 7 完了時点で
-①〜⑦ は green のはずである (registry・handshake の権限境界は Task 5〜7 の責務)。
-⑧ (「payload の analysis id / 回数は agent 出力からでなく RPC 台帳から来る」) は
-Task 8 の `finish_improve_mission` payload 生成ロジックと Task 10 の commit 相が揃って
-初めて実プロセスで確認できるため、**本 task で以下のテストを追記して green にする**:
+①〜⑥ は green のはずである (registry・handshake の権限境界は Task 5〜7 の責務)。⑦⑧ は
+Task 7 が `pytest.mark.xfail(strict=True, ...)` を付けて red のまま残した 2 本
+(`test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly` /
+`test_holdout_and_analysis_ids_never_come_from_agent_output`) であり、**本 task で
+`xfail` マーカーを外し、`pytest.fail("Task 10 待ち...")` の本体を実アサーションへ
+書き換えて green にする**。⑧ (「payload の analysis id / 回数は agent 出力からでなく
+RPC 台帳から来る」) は Task 8 の `finish_improve_mission` payload 生成ロジックと
+Task 10 の commit 相が揃って初めて実プロセスで確認できるため、以下のテストを
+同ファイルへ追記する (⑦ も同様の要領で `run_backtest`/`analyze_corr` の実 RPC
+ハンドラを通す形へ書き換えること — 具体形は Task 7/10 の produce したシンボルに
+合わせて実装時点で確定する):
 
 ```python
 def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
@@ -18933,6 +19490,24 @@ def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
     assert "100000" not in payload
     assert '"trial_count": 0' in payload or "'trial_count': 0" in payload
 ```
+
+上記テストの追記に加え、`tests/integration/test_improve_forbidden_regression.py` の
+`test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly` /
+`test_holdout_and_analysis_ids_never_come_from_agent_output` から
+`@pytest.mark.xfail(strict=True, reason=...)` デコレータと `pytest.fail("Task 10 待ち...")`
+の本体を削除し、実アサーション (⑦は RPC 返却 schema に日時・期間端点・順序付き窓列・
+観測数が無く DB に直接書かないことの実プロセス確認、⑧は上記
+`test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim` 相当の確認) へ
+書き換える。
+
+**gate pin (レビュー1周目 I2)**: 本 Step の完了条件として、以下 2 点を両方満たすこと:
+(a) `uv run pytest tests/integration/test_improve_forbidden_regression.py -v` を明示的に
+単独実行し全件 green であることを確認する。(b)
+`grep -n "xfail\|Task 10 待ち" tests/integration/test_improve_forbidden_regression.py`
+の結果が 0 件であることを確認する (`tests/loops/test_improve_blocking_items.py` を
+作る場合でも、⑦⑧ の完了判定は上記 (a)(b) の integration ファイルでのみ行う —
+`test_improve_blocking_items.py` は Task 12 独自の追加テストとして存在してよいが、
+それが green であることは①〜⑧完了の代替証拠にはならない)。
 
 - [ ] **Step 3b: 条件 6 の残り 9 シナリオを完全コード化する (統合時追記、申し送り 8 の解消)**
 
@@ -19386,7 +19961,8 @@ def test_source_snapshot_dir_is_readonly_to_parent_after_prepare(
         improve_env):
     """§4 prepare: `source_snapshot_dir` は 0500 で作られる。worker 側
     (実サブプロセス) の `plugins/`/`docs/` EACCES 半分は
-    `tests/loops/test_improve_blocking_items.py` ⑨ (Task 7、実プロセス) が
+    `tests/integration/test_improve_forbidden_regression.py` (Task 7、
+    実プロセス、レビュー1周目 I2 で正式ファイルへ一本化) が
     担う — 本テストは FakeImproveWorkerRunner がサブプロセスを起こさない
     ため Landlock を経由しない、**親プロセス自身**が `source_snapshot_dir`
     へ書き込もうとしても `PermissionError` になることだけを pin する
@@ -19568,7 +20144,8 @@ green に戻す。
 - [ ] **Step 7: コミット**
 
 ```bash
-git add tests/loops/test_improve_e2e.py tests/loops/test_improve_blocking_items.py \
+git add tests/loops/test_improve_e2e.py \
+       tests/integration/test_improve_forbidden_regression.py \
        src/agentic_fx/service.py
 git commit -m "$(cat <<'EOF'
 feat: 改善ループ FakeRunner E2E + 遮断8項目完了 + 有効化配線 (プラン10 Task12)
@@ -19599,8 +20176,12 @@ EOF
 - Codex の `provider=chatgpt` は ChatGPT Plus サブスクリプション経由 (`~/.codex/auth.json`)。
   `OPENAI_API_KEY` も同様にどのプロセス環境にも設定しない
 - 検証専用入口 `afx improve verify-backend` を実行する人間は、実行前に
-  `env | grep -E "ANTHROPIC|OPENAI"` が**何も出力しないこと**を確認してから実行する
-  (手順書 Step 0 に明記)
+  `env | cut -d= -f1 | grep -E '^(ANTHROPIC|OPENAI)'` が**何も出力しないこと**を
+  確認してから実行する (手順書 Step 0 に明記)。**レビュー1周目 I5**: `env | grep -E
+  "ANTHROPIC|OPENAI"` (値込み) は使わない — 一致した環境変数を**値ごと**
+  端末・runbook へ出してしまい、CLAUDE.md が秘密情報を `.env` のみに限定する境界を
+  破る。`cut -d= -f1` で変数名だけを取り出してから照合し、値そのものは一切
+  stdout に出さない
 
 ### Files
 
@@ -19994,18 +20575,30 @@ EOF
 
 #### Step 0: 前提確認 (毎回、実行前に必ず)
 
-```bash
-# 1. 従量課金鍵が環境に無いことを確認する (Global Constraints 絶対制約)
-env | grep -E "ANTHROPIC|OPENAI" && echo "STOP: 鍵が環境にある。実行しないこと" || echo "OK: 鍵なし"
+**レビュー1周目 I5**: 値込みの `grep` (`env | grep -E "ANTHROPIC|OPENAI"` /
+`grep -E "ANTHROPIC|OPENAI" .env`) は、一致した環境変数・`.env` 行を**値ごと**
+端末・runbook へ出力してしまう。以下は変数名だけを検査し、**値そのものは
+一切 stdout に出さない** (CLAUDE.md の秘密情報境界 — `.env` のみに限定、値の
+転記はしない — を守る):
 
-# 2. .env にも無いことを確認する
-grep -E "ANTHROPIC|OPENAI" .env 2>/dev/null && echo "STOP" || echo "OK"
+```bash
+# 1. 従量課金鍵が環境に無いことを確認する (Global Constraints 絶対制約)。
+#    値は出さず変数名だけを検査する (レビュー1周目 I5)。
+env | cut -d= -f1 | grep -E '^(ANTHROPIC|OPENAI)' \
+  && echo "STOP: 鍵が環境にある。実行しないこと" || echo "OK: 鍵なし"
+
+# 2. .env にも無いことを確認する。値は出さずキー名だけを抽出する。
+grep -oE '^[A-Z_]+' .env 2>/dev/null | grep -E 'ANTHROPIC|OPENAI' \
+  && echo "STOP" || echo "OK"
 
 # 3. claude / codex のサブスク認証ファイルが存在することを確認する
 ls -la ~/.claude/.credentials.json ~/.codex/auth.json
 ```
 
 いずれかで STOP が出たら実行しない。原因を除去してから Step 0 を再実行する。
+**値を端末・runbook に出さないこと** — 上記コマンドはいずれも変数名/キー名
+のみを表示する設計であり、Step 0 の実行結果 (stdout) をそのまま runbook へ
+貼り付けても値の漏えいにはならない。手順書へ手動で値を書き写すことも禁止する。
 
 #### 実測回数の上限 (課金枠消費 — 厳守)
 
@@ -20146,7 +20739,8 @@ Claude サブスク) を消費する。
    (`record_fn`)」の正確なシグネチャは骨格 Interfaces に無い) ③⑨ (source snapshot)
    は `ctx.source_snapshot_dir` のパーミッションビット (0500) だけを親プロセス視点で
    pin し、worker 側の Landlock 越し EACCES (§7.1-1-⑨ の本体) は
-   `tests/loops/test_improve_blocking_items.py` (Task 7、実プロセス) が担う分業を
+   `tests/integration/test_improve_forbidden_regression.py` (Task 7、実プロセス、
+   レビュー1周目 I2 で正式ファイルへ一本化) が担う分業を
    前提にした — 骨格側にこの分業の明記は無い。齟齬があれば Task 10/7 の実装に
    合わせて Step 3b のコードを調整すること。
 
