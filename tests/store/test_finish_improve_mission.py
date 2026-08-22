@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -227,23 +227,37 @@ def test_recover_interrupted_ends_improve_run_and_backlog_observation(tmp_path):
 
 
 def test_recover_interrupted_leaves_finished_improve_runs_untouched(tmp_path):
-    """既に FINISHED (finished_at 非NULL) の run は起動時回収の対象外
-    (assert 対象: 「finished_at があるのに mission が running」は起きない
-    という不変条件と対になる — 正常終端済み run を触らないこと自体を
-    ここで確認する)。"""
+    """M6 pin: run が既に `finished_at` を持つ場合、**mission が running の
+    まま**残っていても (Tx-2 の run finish と mission finish が同一 tx で
+    ないため生じうる部分書き込み障害窓を模す) `recover_interrupted` は
+    その run にも紐づく backlog にも触れない — improve 拡張ブロックの
+    `AND finished_at IS NULL` フィルタそのものを検査する。
+
+    旧版はここで `finish_improve_mission` を呼んで mission を `completed`
+    にしていたため、improve 拡張ブロック (`loop_by_id.get(mid) ==
+    'improve'` は running missions のみを対象にする) へ一切到達せず、
+    フィルタの有無を区別できていなかった (プラン 10 Task 8 検収 m1)。"""
     c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "idea", "user", NOW)
     mid, rid = _prepare_scheduler_mission(c)
     improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
-    missions.finish_improve_mission(
-        c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
-        mission_status="completed", run_result=None, backlog_transition=None,
-        now=NOW, output=None, transcript=[])
-    before = c.execute("SELECT finished_at FROM improvement_runs WHERE id=?",
-                       (rid,)).fetchone()["finished_at"]
-    missions.recover_interrupted(c, now=NOW, max_requeue=3)
-    after = c.execute("SELECT finished_at FROM improvement_runs WHERE id=?",
-                      (rid,)).fetchone()["finished_at"]
-    assert before == after
+    backlog.select_for_mission(c, bid, now=NOW)
+    improve_runs.bind_backlog(c, rid, bid)
+    # run だけを直接終端させ、mission は running のまま残す (finish_
+    # improve_mission を通す通常経路では起きない、部分書き込み障害窓の模擬)。
+    improve_runs.finish(c, rid, result="report", now=NOW)
+    assert c.execute("SELECT status FROM missions WHERE id=?",
+                     (mid,)).fetchone()["status"] == "running"
+
+    later = NOW + timedelta(hours=1)
+    missions.recover_interrupted(c, now=later, max_requeue=3)
+
+    run_row = c.execute("SELECT finished_at FROM improvement_runs WHERE id=?",
+                        (rid,)).fetchone()
+    assert run_row["finished_at"] == NOW.isoformat()  # `later` で上書きされない
+    backlog_row = c.execute(
+        "SELECT status FROM improvement_backlog WHERE id=?", (bid,)).fetchone()
+    assert backlog_row["status"] == "selected"  # observation へ戻されない
 
 
 def test_recover_interrupted_trade_missions_unaffected_by_improve_extension(tmp_path):
