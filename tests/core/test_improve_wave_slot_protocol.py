@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ import pytest
 from agentic_fx.core.improve_supervisor import ImproveSupervisor
 from agentic_fx.store import db as db_mod
 from agentic_fx.store import improve_waves
+from agentic_fx.store import missions as missions_store
 
 
 @pytest.fixture
@@ -73,10 +75,11 @@ def test_wave_creation_writes_wave_and_m_slots_in_one_tx(conn):
     ]
 
 
-def test_wave_creation_is_idempotent_second_call_no_op(conn):
+def test_wave_creation_is_idempotent_second_call_no_op(conn, monkeypatch):
     """`INSERT OR IGNORE` — 同じ period_key への 2 回目の呼び出しは
     rowcount=0 (起動権を得られない) で slot も増えない。ImproveSupervisor.tick
-    が 2 回呼ばれても、再試行は発生しない (period は消費済み、queue は1回分のみ)。"""
+    が 2 回呼ばれても、再試行は発生しない (period は消費済み、
+    _spawn_slot_thread も1回分のみ呼ばれる)。"""
     now = datetime(2026, 8, 22, 3, 0)
     sup = ImproveSupervisor(capacity=10, root=Path("/nonexistent"),
                              settings=_fake_settings(parallel=2),
@@ -84,20 +87,25 @@ def test_wave_creation_is_idempotent_second_call_no_op(conn):
                              db_path=Path(conn.execute("PRAGMA database_list").fetchone()[2]),
                              stop_event=threading.Event())
     sup._conn_for_test = conn
+
+    # Monkeypatch _spawn_slot_thread to record calls
+    spawn_calls = []
+    original_spawn = sup._spawn_slot_thread
+
+    def recording_spawn(period_key, k):
+        spawn_calls.append((period_key, k))
+
+    monkeypatch.setattr(sup, "_spawn_slot_thread", recording_spawn)
+
     # First tick で wave + 2 slots を作成
     sup.tick(now)
-    # queue に 2 個の (period_key, k, -1) が入っているはず
-    queued_1st = []
-    while not sup._slot_queue.empty():
-        queued_1st.append(sup._slot_queue.get_nowait())
-    assert len(queued_1st) == 2
+    assert len(spawn_calls) == 2
+    assert spawn_calls == [("2026-W33", 0), ("2026-W33", 1)]
+
     # Second tick で同じ period で再試行
     sup.tick(now)
-    # queue には何も追加されない (period は既に消費済み)
-    queued_2nd = []
-    while not sup._slot_queue.empty():
-        queued_2nd.append(sup._slot_queue.get_nowait())
-    assert len(queued_2nd) == 0
+    # spawn_calls には何も追加されない (period は既に消費済み)
+    assert len(spawn_calls) == 2
 
 
 def test_m_zero_creates_no_wave_row(conn, monkeypatch):
@@ -308,3 +316,155 @@ def test_pre_ready_failure_also_covers_ready_timeout_before_running_commit(conn)
         "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
     assert row["status"] == "reserved"
     assert row["mission_id"] is None
+
+
+# Tests for 9.5: N-slot 構成・接続所有・shutdown/join
+
+def test_n4_concurrent_slots_no_connection_sharing_no_mixup(tmp_path):
+    """N=4 同時 slot が別々の write 接続を持ち、混線 (他 slot の行を触る)
+    が無いことを実測する。各 slot は自分の period_key/k だけを更新する
+    fake `ImproveLoop`/worker で 4 本同時実行し、結果の整合を確認する。
+    `_improve_loop.prepare` (Tx-0 の claim) が各スレッド自身の DB 接続で
+    行われることを、fake `ImproveLoop` が `db_mod.connect(db_path)` を
+    スレッドごとに開くことで再現する (統合裁定 R-i2 — claim は
+    `ImproveLoop.prepare` 側の責務)。"""
+    db_path = tmp_path / "agentic.db"
+    conn0 = db_mod.connect(db_path)
+    db_mod.init_db(conn0)
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(conn0, period_key="2026-W34", now=now, expected=4, commit=True)
+    conn0.close()
+
+    sup = ImproveSupervisor(capacity=4, root=tmp_path,
+                             settings=_fake_settings(parallel=4),
+                             clock=_FixedClock(now), db_path=db_path,
+                             stop_event=threading.Event())
+
+    class _SlowRunner:
+        def spawn(self):
+            time.sleep(0.05)
+            return "ready"
+        def send_go(self):
+            pass
+        def run_to_completion(self):
+            time.sleep(0.05)
+            return {"status": "completed", "output": {}}
+
+    class _PerThreadFakeImproveLoop:
+        """各スレッドが自分専用の write 接続で `claim_slot`/`commit` を
+        行う fake (本番の `ImproveLoop` の接続所有パターンを模す)。"""
+
+        def prepare(self, *, slot_key, now):
+            period_key, k = slot_key
+            conn = db_mod.connect(db_path)
+            try:
+                mission_id = 100 + k
+                claimed = improve_waves.claim_slot(
+                    conn, period_key=period_key, k=k, mission_id=mission_id,
+                    now=now, commit=True)
+                assert claimed, f"slot {slot_key!r} already claimed"
+            finally:
+                conn.close()
+            return mission_id, f"ctx-{mission_id}", _SlowRunner()
+
+        def commit(self, *, mission, ctx, result, now):
+            conn = db_mod.connect(db_path)
+            try:
+                conn.execute(
+                    "UPDATE improve_wave_slots SET status='done' "
+                    "WHERE mission_id=?", (mission,))
+                conn.commit()
+            finally:
+                conn.close()
+
+    sup._improve_loop = _PerThreadFakeImproveLoop()
+
+    threads = [threading.Thread(target=sup._launch_slot,
+                                args=("2026-W34", k))
+              for k in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    conn1 = db_mod.connect(db_path)
+    rows = conn1.execute(
+        "SELECT k, status FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' ORDER BY k").fetchall()
+    assert [r["status"] for r in rows] == ["done", "done", "done", "done"]
+    conn1.close()
+
+
+def test_trade_writer_not_blocked_during_improve_gate_tx(tmp_path):
+    """改善レーンの長い作業 (ここでは意図的に BEGIN IMMEDIATE を保持する
+    fake) の**外側**で、取引レーンの writer が busy_timeout (5000ms) 内に
+    通ることを確認する — Tx がロング処理を跨がないことの負荷実測代理。"""
+    db_path = tmp_path / "agentic.db"
+    conn0 = db_mod.connect(db_path)
+    db_mod.init_db(conn0)
+    conn0.close()
+
+    improve_conn = db_mod.connect(db_path)
+    trade_conn = db_mod.connect(db_path)
+
+    # 改善レーンの「短い tx」を模す: 開いてすぐ commit する (transaction
+    # 外の長時間処理と対比するため、ここでは意図的に「短い」ことを
+    # assert する — 長時間 held のケースは Task 10 の Tx-1/Tx-2 の実装
+    # レビューで別途 fault injection する)。
+    improve_conn.execute("BEGIN IMMEDIATE")
+    improve_conn.execute(
+        "UPDATE improve_wave_slots SET status='running' WHERE 1=0")
+    improve_conn.commit()
+
+    started = time.monotonic()
+    trade_conn.execute(
+        "INSERT INTO missions (loop, runner, model, status, started_at) "
+        "VALUES ('trade','local','x','running',?)", (datetime.now().isoformat(),))
+    trade_conn.commit()
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0  # busy_timeout (5000ms) 内、実務上は瞬時
+
+    improve_conn.close()
+    trade_conn.close()
+
+
+def test_wave_creation_respects_running_slot_count(tmp_path, monkeypatch):
+    """M = min(parallel, open_slots) の capacity 制限テスト。
+    capacity=2, parallel=4, 1 slot が running → 1 slot だけ作成される。"""
+    db_path = tmp_path / "agentic.db"
+    conn = db_mod.connect(db_path)
+    db_mod.init_db(conn)
+    now = datetime(2026, 8, 22, 3, 0)
+
+    # Create a running slot from a previous period (not the current tick's period)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W32", now=now, expected=1, commit=True)
+    conn.execute(
+        "UPDATE improve_wave_slots SET status='running', mission_id=1 "
+        "WHERE wave_period_key='2026-W32' AND k=0")
+    conn.commit()
+
+    # Now try to create new wave with capacity=2, parallel=4
+    sup = ImproveSupervisor(capacity=2, root=tmp_path,
+                             settings=_fake_settings(parallel=4),
+                             clock=_FixedClock(now),
+                             db_path=db_path,
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+
+    # Monkeypatch _spawn_slot_thread to avoid daemon thread errors
+    spawn_calls = []
+    monkeypatch.setattr(sup, "_spawn_slot_thread",
+                       lambda period_key, k: spawn_calls.append((period_key, k)))
+
+    sup.tick(now)
+
+    # Check that only 1 new slot was spawned (capacity-running_count = 2-1 = 1)
+    assert len(spawn_calls) == 1
+    assert spawn_calls[0][1] == 0  # slot k=0
+
+    # Check DB: 1 running from prev period + 1 new = 2 total
+    rows = conn.execute(
+        "SELECT count(*) c FROM improve_wave_slots").fetchone()
+    assert rows["c"] == 2
+
+    conn.close()

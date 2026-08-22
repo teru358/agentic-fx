@@ -1,9 +1,18 @@
 """ImproveSupervisor — 改善レーンの別スロット群 (設計書 §3.1、裁定6:
-MissionSupervisor の一般化ではなく別クラス)。"""
+MissionSupervisor の一般化ではなく別クラス)。
+
+接続所有 (ownership diagram はプラン文書 §9.5 参照):
+- Tx-0 (missions.start + improve_runs.start + slot claim) は
+  `self._improve_loop.prepare` (Task 10 の `ImproveLoop`) が専用接続で
+  行う。`ImproveSupervisor` はこの接続を持たない (R-i2)。
+- `_launch_slot` 自身は `mark_running` のときだけ自分専用の write 接続を
+  開き、`finally` で close する。スレッド間で共有しない。
+- RPC dispatcher (WorkerRunner 内、Task 4/7) は自スレッド内で読取専用
+  接続を開閉する。台帳 (`ImproveRpcLedger`) だけが両者の橋。
+"""
 from __future__ import annotations
 
 import logging
-import queue
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -38,21 +47,21 @@ class ImproveSupervisor:
         # AttributeError で失敗する — Task 9 単独では未配線が正しい状態。
         self._improve_loop: "ImproveLoop | None" = None
         self._conn_for_test = None  # pytest シーム。本番は常に None。
-        # 9.5 節で slot worker スレッド群を構築する。ここでは wave 作成
-        # だけを実装する (Step-by-step の意図的な最小実装)。
-        self._slot_queue: "queue.Queue[tuple[str, int, int] | None]" = \
-            queue.Queue()
-        self._workers: list[threading.Thread] = []
-        self._started = False
+        self._launch_lock = threading.Lock()
+        self._active_threads: list[threading.Thread] = []
+
+    # ---- 公開 API ----------------------------------------------------
 
     def tick(self, now: datetime) -> None:
+        if self._stop_event.is_set():
+            return
         s = self._settings.schedule
         occurrence = latest_scheduled_occurrence(
             now, cadence=s.improve, at=s.improve_at,
             display_timezone=self._settings.display_timezone)
         period_key = period_key_of(occurrence, cadence=s.improve)
         conn = self._conn()
-        owns = getattr(self, "_conn_for_test", None) is None
+        owns = self._conn_for_test is None
         try:
             open_slots = self._capacity - self._running_slot_count(conn)
             m = min(self._settings.improve.parallel, max(open_slots, 0))
@@ -61,36 +70,37 @@ class ImproveSupervisor:
             created = improve_waves.create_wave_and_slots(
                 conn, period_key=period_key, now=now, expected=m, commit=True)
             if not created:
-                return  # 既に消費済みの period (再 tick)
-            for k in range(m):
-                self._slot_queue.put((period_key, k, -1))  # mission_id は claim 時に確定
+                return
+            pending_ks = list(range(m))
         finally:
             if owns:
                 conn.close()
-
-    def _running_slot_count(self, conn) -> int:
-        row = conn.execute(
-            "SELECT count(*) c FROM improve_wave_slots "
-            "WHERE status IN ('claimed','running')").fetchone()
-        return row["c"]
-
-    def _conn(self):
-        # テストシーム: `_conn_for_test` が設定されていればそれを使う
-        # (Step 3 時点の暫定。9.5 節で正式な dispatcher/slot 接続分離に
-        # 置き換える)。
-        conn_for_test = getattr(self, "_conn_for_test", None)
-        if conn_for_test is not None:
-            return conn_for_test
-        return db_mod.connect(self._db_path)
+        for k in pending_ks:
+            self._spawn_slot_thread(period_key, k)
 
     def submit_manual(self) -> int:
+        """手動 one-shot。slot/wave 行を作らず `self._improve_loop.prepare`
+        を `slot_key=None` で直接呼ぶ (設計書 §3.1)。呼び出しは同期的 —
+        シェルコマンドから直接呼ばれる想定で、Mission 完了まで戻らない。
+        mission_id を返す。"""
         raise NotImplementedError  # 9.7 節で実装
 
     def shutdown(self) -> None:
-        raise NotImplementedError  # 9.5 節で実装
+        self._stop_event.set()
 
     def join(self, timeout: float) -> None:
-        raise NotImplementedError  # 9.5 節で実装
+        for t in list(self._active_threads):
+            t.join(timeout=timeout)
+
+    # ---- 内部 ---------------------------------------------------------
+
+    def _spawn_slot_thread(self, period_key: str, k: int) -> None:
+        t = threading.Thread(
+            target=self._launch_slot, args=(period_key, k), daemon=True,
+            name=f"afx-improve-slot-{period_key}-{k}")
+        with self._launch_lock:
+            self._active_threads.append(t)
+        t.start()
 
     def _launch_slot(self, period_key: str, k: int) -> None:
         # mission_id はまだ無い。Tx-0 (missions.start + improve_runs.start +
@@ -134,3 +144,16 @@ class ImproveSupervisor:
         finally:
             if owns:
                 conn.close()
+
+    def _running_slot_count(self, conn) -> int:
+        row = conn.execute(
+            "SELECT count(*) c FROM improve_wave_slots "
+            "WHERE status IN ('claimed','running')").fetchone()
+        return row["c"]
+
+    def _conn(self):
+        if self._conn_for_test is not None:
+            return self._conn_for_test
+        # 本番: slot ごとに専用接続 (共有しない)。close は呼び出し元の
+        # finally が行う。
+        return db_mod.connect(self._db_path)
