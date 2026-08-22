@@ -3582,6 +3582,15 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M9 | `run_context_fields` の組み立てを削除する (`run_context` を無視する) | `test_worker_runner_run_context_adds_three_handshake_keys` (mock 前提の parent 側 unit test)。**レビュー2周目 Important 3 で追加**: Task 5 「5-H: Task 5 統合 step」の Step 1 (旧 Step 6b) の `test_worker_runner_run_context_reaches_real_improve_worker` (`tests/test_improve_profile_isolation.py`) が同じ変異を実プロセス経由で独立に検出する — 子側が 3 値を受け取れず 5-D の相互照合が `RuntimeError` になり `ready` へ到達しない (`observed_ready` が空のまま `.get("ok")` が `None` になり assert が落ちる) |
 | M10 | `run_context is None` でも `run_context_fields` に固定値を入れる (未知キー汚染) | `test_worker_runner_run_context_none_omits_three_handshake_keys` |
 
+**実装時追記 (2026-08-22 検収 B2)**: `provider == "chatgpt"` 条件 (L3449-3450)
+を落とす変異が M1-M10 のいずれにも捕まらず全スイート (2273 本) green のまま
+生存 (SURVIVED) と判明。production コードはプラン記述とバイト一致で正しく、
+欠陥はこの Step の変異リストが provider 分岐の killer を欠いていたこと。
+M11 を追加し、`test_worker_runner_does_not_copy_auth_json_for_codex_llama_swap`
+/ 対の `test_worker_runner_copies_auth_json_for_codex_chatgpt` を追加 (`plan10/task3`)。
+
+| M11 | `provider == "chatgpt"` 条件を落とし、`choice.backend == "codex"` のみで常に `auth.json` をコピーする | `test_worker_runner_does_not_copy_auth_json_for_codex_llama_swap` |
+
 - [ ] **Step 36: コミット**
 
 ```bash
