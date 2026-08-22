@@ -42,24 +42,39 @@ def _runner(tmp_path, *, allowed_tools=None, behavior="success", **over):
     return r, workdir
 
 
+def _flag_value(argv, flag):
+    """`flag` の直後の要素を返す (隣接値の pin 用)。存在しなければ AssertionError。"""
+    idx = argv.index(flag)
+    assert idx + 1 < len(argv), f"{flag} has no adjacent value in argv"
+    return argv[idx + 1]
+
+
 def test_claude_argv_shape(tmp_path):
     """argv が骨格 §1.2 の形と一致する (`-p` プロンプト・--output-format
     stream-json --verbose・--json-schema・--setting-sources ""・
-    --strict-mcp-config・--mcp-config・--allowedTools・--max-turns・--model)。"""
+    --strict-mcp-config・--mcp-config・--allowedTools・--max-turns・--model)。
+    各フラグは値だけを落とす変異 (例: `--mcp-config` の値を消し、次のフラグが
+    値として食われる形) を殺すため、メンバシップではなく隣接値まで pin する。"""
+    mission = _mission()
     runner, workdir = _runner(tmp_path)
-    argv = runner._build_argv(_mission(), mcp_socket=workdir / "afx.sock")
-    assert "--output-format" in argv and "stream-json" in argv
+    mcp_socket = workdir / "afx.sock"
+    argv = runner._build_argv(mission, mcp_socket=mcp_socket)
+    mcp_config_path = workdir / "mcp.json"
+
+    assert argv[0] == str(runner._bin_path)
+    assert argv[1] == "-p"
+    assert argv[2] == mission.prompt
+
+    assert "--output-format" in argv
+    assert _flag_value(argv, "--output-format") == "stream-json"
     assert "--verbose" in argv
-    assert "--json-schema" in argv
-    assert "--setting-sources" in argv
-    idx = argv.index("--setting-sources")
-    assert argv[idx + 1] == ""
+    assert _flag_value(argv, "--json-schema") == json.dumps(mission.output_schema)
+    assert _flag_value(argv, "--setting-sources") == ""
     assert "--strict-mcp-config" in argv
-    assert "--mcp-config" in argv
-    assert "--allowedTools" in argv
-    assert "--max-turns" in argv
-    assert str(_mission().max_turns) in argv
-    assert "--model" in argv
+    assert _flag_value(argv, "--mcp-config") == str(mcp_config_path)
+    assert _flag_value(argv, "--allowedTools") == ",".join(runner._allowed_tools)
+    assert _flag_value(argv, "--max-turns") == str(mission.max_turns)
+    assert _flag_value(argv, "--model") == runner._model
 
 
 def test_claude_completed_terminal_status(tmp_path):
@@ -104,8 +119,11 @@ def test_claude_max_turns_semantics_is_passthrough(tmp_path):
     assert runner._max_turns_semantics() == "passthrough"
 
 
-def test_claude_env_has_no_anthropic_api_key(tmp_path):
-    """§1.1-3: 課金鍵は子 env に決して入れない。"""
+def test_claude_env_has_no_anthropic_api_key(tmp_path, monkeypatch):
+    """§1.1-3: 課金鍵は子 env に決して入れない。親 (pytest) 側に鍵を置いて
+    から検査する — 置かないと「無いものが無い」を assert するだけで
+    `_build_env` が親を継承する変異を捕まえられず空振りする (検収 B1)。"""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-sentinel")
     runner, workdir = _runner(tmp_path)
     env = runner._build_env(_mission())
     assert "ANTHROPIC_API_KEY" not in env
@@ -129,6 +147,32 @@ def test_claude_trade_profile_allowed_tools_excludes_bash(tmp_path):
     assert "Bash" not in allowed
     assert "Write" not in allowed
     assert "mcp__afx__*" in allowed
+
+
+_CLAUDE_ENV_ALLOWLIST = {
+    "PATH", "HOME", "TMPDIR", "CLAUDE_CONFIG_DIR", "PYTHONPATH", "PYTHONSAFEPATH",
+    # launcher.py (`os.execv` 経由の 2 段目) の CPython 起動時ロケール強制
+    # (PEP 538) がこの環境では `LC_CTYPE=C.UTF-8` を自動注入する。`_build_env`
+    # が渡す 6 キーには含まれないが、launcher ホップ自体の副作用でありシークレ
+    # ットではないため許容する (実測: `Popen(env={"PATH":...})` だけでも
+    # 同じ注入が再現する — `_build_env` の変異ではない)。
+    "LC_CTYPE",
+}
+
+
+def test_claude_child_env_excludes_parent_secrets_and_matches_allowlist(tmp_path, monkeypatch):
+    """§7.1-2: 「全 spawn の env に `*_API_KEY` が無い」を、鍵が実在する
+    親 env から fake CLI を実際に起動して観測する (`observed_env.json`)。
+    `_build_env()` の戻り値だけを見る検査は、pytest プロセスの env に
+    そもそも鍵が無いため「無いものが無い」を assert するだけで空振りする。"""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-sentinel")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-sentinel")
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "td-sentinel")
+    runner, workdir = _runner(tmp_path)
+    runner.run(_mission())
+    observed = json.loads((workdir / "observed_env.json").read_text())
+    assert not any("API_KEY" in k for k in observed)
+    assert set(observed) == _CLAUDE_ENV_ALLOWLIST
 
 
 def test_claude_reason_does_not_leak_stderr_body(tmp_path):
