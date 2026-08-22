@@ -16,6 +16,7 @@ from agentic_fx.store import improve_waves
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
     from agentic_fx.core.contracts import Clock
+    from agentic_fx.loops.improve_loop import ImproveLoop
 
 _log = logging.getLogger("agentic_fx.improve_supervisor")
 
@@ -32,6 +33,11 @@ class ImproveSupervisor:
         self._clock = clock
         self._db_path = db_path
         self._stop_event = stop_event
+        # `ImproveLoop` (Task 10 の産物)。build_app 配線時 (10.12 節) に
+        # 実インスタンスへ差し替える。None のままだと `_launch_slot` は
+        # AttributeError で失敗する — Task 9 単独では未配線が正しい状態。
+        self._improve_loop: "ImproveLoop | None" = None
+        self._conn_for_test = None  # pytest シーム。本番は常に None。
         # 9.5 節で slot worker スレッド群を構築する。ここでは wave 作成
         # だけを実装する (Step-by-step の意図的な最小実装)。
         self._slot_queue: "queue.Queue[tuple[str, int, int] | None]" = \
@@ -85,3 +91,46 @@ class ImproveSupervisor:
 
     def join(self, timeout: float) -> None:
         raise NotImplementedError  # 9.5 節で実装
+
+    def _launch_slot(self, period_key: str, k: int) -> None:
+        # mission_id はまだ無い。Tx-0 (missions.start + improve_runs.start +
+        # slot claim reserved→claimed) は self._improve_loop.prepare が
+        # 一体で行う (統合裁定 R-i2、Task 10 の 10.2 節が正)。
+        now = self._clock.now()
+        mission, ctx, runner = self._improve_loop.prepare(
+            slot_key=(period_key, k), now=now)
+        spawn_result = runner.spawn()
+        if spawn_result != "ready":
+            self._handle_pre_ready_failure(period_key, k)
+            return
+        conn = self._conn()
+        owns = self._conn_for_test is None
+        try:
+            improve_waves.mark_running(
+                conn, period_key=period_key, k=k, now=self._clock.now(), commit=True)
+        finally:
+            if owns:
+                conn.close()
+        runner.send_go()
+        result = runner.run_to_completion()
+        self._improve_loop.commit(mission=mission, ctx=ctx, result=result,
+                                  now=self._clock.now())
+
+    def _handle_pre_ready_failure(self, period_key: str, k: int) -> None:
+        conn = self._conn()
+        owns = self._conn_for_test is None
+        try:
+            now = self._clock.now()
+            row = conn.execute(
+                "SELECT spawn_attempts FROM improve_wave_slots "
+                "WHERE wave_period_key=? AND k=?", (period_key, k)).fetchone()
+            attempts = row["spawn_attempts"]
+            if attempts < _MAX_SPAWN_ATTEMPTS:
+                improve_waves.revert_to_reserved(
+                    conn, period_key=period_key, k=k, now=now, commit=True)
+            else:
+                improve_waves.mark_slot_failed(
+                    conn, period_key=period_key, k=k, now=now, commit=True)
+        finally:
+            if owns:
+                conn.close()

@@ -122,3 +122,108 @@ def test_m_zero_creates_no_wave_row(conn, monkeypatch):
     assert len(call_count) == 0, f"create_wave_and_slots should not be called when m=0, but was called {len(call_count)} times"
     n = conn.execute("SELECT count(*) c FROM improve_waves").fetchone()["c"]
     assert n == 0
+
+
+# Tests for 9.3: 3-way 起動プロトコル
+
+class _RecordingFakeWorkerRunner:
+    """WorkerRunner の代役。呼び出し順序だけを記録する (Task 1/4/5 の
+    実プロトコルはここでは検証しない — 骨格 Interfaces 節の
+    `WorkerRunner(..., worker_profile="improve", run_context=ctx)` の
+    構築タイミングのみを外形的に確認する)。"""
+
+    def __init__(self, events: list):
+        self._events = events
+
+    def spawn(self):
+        self._events.append("spawn")
+        return "ready"  # spawn 直後に ready を返す fake
+
+    def send_go(self):
+        self._events.append("go")
+
+    def run_to_completion(self):
+        self._events.append("run")
+        return {"status": "completed", "output": {}}
+
+
+class _FakeImproveLoop:
+    """ImproveLoop (Task 10) の代役。Tx-0 の slot claim は `prepare()` の
+    責務として fake でも忠実に再現する — `claim_slot` を実際に呼び
+    `reserved→claimed` を tx で確定させる (fake が本物の `improve_waves`
+    を呼ぶことで、Task 9 側は「claim は prepare の内側で起きる」という
+    契約だけを検証すればよい)。"""
+
+    def __init__(self, conn, worker_runner, *, mission_id=999):
+        self._conn = conn
+        self._worker_runner = worker_runner
+        self._mission_id = mission_id
+        self.committed: list[tuple] = []
+
+    def prepare(self, *, slot_key, now):
+        period_key, k = slot_key
+        claimed = improve_waves.claim_slot(
+            self._conn, period_key=period_key, k=k, mission_id=self._mission_id,
+            now=now, commit=True)
+        if not claimed:
+            raise RuntimeError(
+                f"slot claim failed for {slot_key!r} — "
+                "already claimed by a concurrent process")
+        return f"mission-{self._mission_id}", f"ctx-{self._mission_id}", \
+            self._worker_runner
+
+    def commit(self, *, mission, ctx, result, now):
+        self.committed.append((mission, ctx, result))
+
+
+def test_three_way_launch_order_prepare_then_spawn_then_ready_then_running_commit_then_go(
+        conn, monkeypatch):
+    """prepare(Tx-0, claim含む) → spawn → ready 受信 → running commit
+    (この時点でまだ go を送らない) → go → run → commit()、の順序を固定する。"""
+    events: list[str] = []
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
+
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+    fake_loop = _FakeImproveLoop(
+        conn, _RecordingFakeWorkerRunner(events))
+    sup._improve_loop = fake_loop
+    sup._launch_slot("2026-W34", 0)
+
+    row = conn.execute(
+        "SELECT status, mission_id FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "running"
+    assert row["mission_id"] == 999
+    assert events == ["spawn", "go", "run"]
+    assert len(fake_loop.committed) == 1
+
+
+def test_go_is_not_sent_before_running_commit(conn):
+    """running への commit が完了する前に go を送らないことを、send_go の
+    内部で slot 状態を読み返して確認する fake WorkerRunner 経由で確認する。
+    commit 前に go 呼び出しが記録されたら fail。"""
+    events: list[str] = []
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
+
+    class _OrderCheckingRunner(_RecordingFakeWorkerRunner):
+        def send_go(self):
+            row = conn.execute(
+                "SELECT status FROM improve_wave_slots "
+                "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+            assert row["status"] == "running", (
+                "go was sent before the running-commit was visible")
+            super().send_go()
+
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+    sup._improve_loop = _FakeImproveLoop(conn, _OrderCheckingRunner(events))
+    sup._launch_slot("2026-W34", 0)
