@@ -561,12 +561,16 @@ def test_run_improve_mission_binds_mcp_dispatcher_and_serves_registry_tool(
         monkeypatch, tmp_path):
     """B1 是正: mission_worker の improve 分岐が `workdir/afx.sock` を bind
     し、`mcp_shim` からの `tools/call` を注入された registry の実 tool へ
-    配線すること (`ToolRegistry.execute` まで到達すること) を実 socket で
-    確認する。`_build_improve_registry` を monkeypatch して非空 registry を
-    注入できることも同時に pin する (「空でない registry を注入できる
-    seam」— A-4 是正の要求)。"""
+    配線すること (`ToolRegistry.execute` まで到達すること) を、
+    `python -m agentic_fx.tools.mcp_shim <sock>` の**実プロセス**を fake
+    mcp_shim クライアントとして起動し確認する (プランの Step 7 文言
+    「fake mcp_shim クライアントが socket 経由で tools/call を投げ、
+    registry の fake tool が実行される」に合わせる — advisor 指摘 #4)。
+    `_build_improve_registry` を monkeypatch して非空 registry を注入
+    できることも同時に pin する (「空でない registry を注入できる seam」
+    — A-4 是正の要求)。"""
     import json
-    import socket as socket_mod
+    import subprocess as subprocess_mod
 
     import agentic_fx.mission_worker as mw_mod
     from agentic_fx.tools.registry import ToolDef, ToolRegistry
@@ -602,19 +606,23 @@ def test_run_improve_mission_binds_mcp_dispatcher_and_serves_registry_tool(
     sock_path = tmp_path / "afx.sock"
     assert sock_path.exists(), "afx.sock が bind されていない (B1)"
 
-    with socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM) as s:
-        s.connect(str(sock_path))
-        s.sendall((json.dumps({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "echo_tool", "arguments": {"x": 9}},
-        }) + "\n").encode())
-        buf = b""
-        while not buf.endswith(b"\n"):
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
-        resp = json.loads(buf.decode())
+    # fake mcp_shim クライアント = `run_mcp_shim` の実プロセス (CLI 側の
+    # 子プロセスエントリと同じ起動形)。stdin へ 1 行の JSON-RPC を書き、
+    # stdout から応答を読む (`test_run_mcp_shim_forwards_stdio_to_unix_socket`
+    # と同じパターン、Step 1 の契約済み実装をそのまま流用する)。
+    proc = subprocess_mod.Popen(
+        [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(sock_path)],
+        stdin=subprocess_mod.PIPE, stdout=subprocess_mod.PIPE, text=True)
+    try:
+        req = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "echo_tool", "arguments": {"x": 9}}}
+        proc.stdin.write(json.dumps(req) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        resp = json.loads(line)
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
     content = resp["result"]["content"]
     payload = json.loads(content[0]["text"])
     assert payload == {"echo": 9}
@@ -637,3 +645,21 @@ def test_run_improve_mission_claude_backend_workdir_matches_dispatcher_socket(
         settings=settings, workdir=tmp_path, protocol_out=None, out_seq=None)
     assert runner._workdir == tmp_path
     assert (tmp_path / "afx.sock").exists()
+
+
+def test_start_mcp_dispatcher_fails_closed_when_bind_fails(tmp_path):
+    """advisor 指摘 #1/#2 (A-4 検収是正): `McpShimDispatcher.serve_forever`
+    は daemon thread 内で走るため、`bind()` の例外は呼び出し元に伝わらない
+    (thread が黙って死ぬだけ)。`_start_mcp_dispatcher` はソケットが
+    実際に現れることを確認し、現れなければ fail closed で `RuntimeError`
+    を送出しなければならない — 黙って戻ると、CLI へ存在しない socket
+    path を渡し続け B1 (ツール 0 個) を再発させる。ここでは workdir の
+    親ディレクトリが存在しない状態を作り、bind (`ENOENT`) を確実に
+    失敗させて red/green を確認する。"""
+    import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.tools.registry import ToolRegistry
+
+    nonexistent_workdir = tmp_path / "does" / "not" / "exist"
+    with pytest.raises(RuntimeError, match="failed to bind"):
+        mw_mod._start_mcp_dispatcher(
+            workdir=nonexistent_workdir, registry=ToolRegistry())

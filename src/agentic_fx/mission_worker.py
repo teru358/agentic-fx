@@ -420,6 +420,16 @@ def _start_mcp_dispatcher(*, workdir: Path, registry: ToolRegistry) -> McpShimDi
     deadline = time.monotonic() + 3.0
     while not sock_path.exists() and time.monotonic() < deadline:
         time.sleep(0.02)
+    if not sock_path.exists():
+        # A-4 検収是正 (advisor 指摘): `serve_forever` は daemon thread 内で
+        # 走るため、`bind()` が例外 (Landlock 拒否等) で失敗しても呼び出し
+        # 元には伝わらない — 3 秒待っても socket が現れなければ fail
+        # closed で終了する。黙って見逃すと、bind に失敗した状態のまま
+        # CLI へ存在しない socket path を渡し続け、B1 (bind されない
+        # socket = ツール 0 個) と区別のつかない症状を再発させる。
+        raise RuntimeError(
+            f"MCP dispatcher failed to bind {sock_path} — refusing to "
+            "start (fail closed: CLI would run with 0 tools, 検収 B1)")
     return dispatcher
 
 

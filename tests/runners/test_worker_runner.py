@@ -2402,8 +2402,9 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
     **同一 pgid・PDEATHSIG 無し**の孫を spawn させ、mission_worker を
     SIGKILL した後にその孫が消えていることを assert する。
 
-    gcc 依存は撤去: `claude.bin` に `/usr/bin/dash` (既存の ELF、コンパイル
-    不要) を直接使う。`ClaudeRunner._build_argv` は mission_worker.py が
+    gcc 依存は撤去: `claude.bin` に POSIX sh の実体 (`os.path.realpath("/bin/sh")`
+    — このシステムでは dash だが、bash 環境でも同じ挙動、コンパイル不要) を
+    直接使う。`ClaudeRunner._build_argv` は mission_worker.py が
     real subprocess として実行するため **cross-process monkeypatch 不能**
     (別プロセスの `sys.modules` は独立) — 代わりに **実際の `_build_argv`
     が組み立てる argv をそのまま dash に解釈させる**: 実装は
@@ -2436,23 +2437,29 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
     # 書く。この孫が「回収されずに生き残る」かどうかが B2 の観測点。
     grandchild_marker = staging_dir / "fake_claude_grandchild_pid"
 
+    # advisor 指摘 #4: `/usr/bin/dash` のハードコードを撤去し、システムの
+    # POSIX sh 実体を `realpath` で解決する (bash 環境でも `-p <script>` は
+    # 同じ挙動 — M-2 の「gcc 不在で不正確な skip」と同種の環境依存を防ぐ)。
+    import shutil
+    sh_bin = os.path.realpath("/bin/sh")
+    sleep_bin = shutil.which("sleep") or "/usr/bin/sleep"
     driver_script = staging_dir / "fake_claude_driver.sh"
     driver_script.write_text(
         "trap '' TERM\n"
         f"echo $$ > {str(marker)!r}\n"
-        # 孫: 別プロセスとして `dash -c` を fork (setsid しないので同じ
-        # pgid に留まり、PDEATHSIG も継がない — 孫は自分で prctl を
-        # 呼んでいない)。孫自身も SIGTERM を無視し、SIGKILL への
-        # エスカレーションが実際に発火することを確認する観測対象にする。
-        f"/usr/bin/dash -c 'trap \"\" TERM; exec /usr/bin/sleep 600' &\n"
+        # 孫: 別プロセスとして sh を fork (setsid しないので同じ pgid に
+        # 留まり、PDEATHSIG も継がない — 孫は自分で prctl を呼んでいない)。
+        # 孫自身も SIGTERM を無視し、SIGKILL へのエスカレーションが実際に
+        # 発火することを確認する観測対象にする。
+        f"{sh_bin} -c 'trap \"\" TERM; exec {sleep_bin} 600' &\n"
         f"echo $! > {str(grandchild_marker)!r}\n"
         "wait\n")
     driver_script.chmod(0o500)
 
-    # claude.bin には既存の ELF (dash) を直接使う — gcc も shebang script
-    # も不要。dash に「-p <driver_script>」を渡すと script として実行する
+    # claude.bin には既存の ELF (sh) を直接使う — gcc も shebang script も
+    # 不要。sh に「-p <driver_script>」を渡すと script として実行する
     # (docstring 参照)。
-    fake_claude_bin = Path("/usr/bin/dash")
+    fake_claude_bin = Path(sh_bin)
 
     creds = tmp_path / ".credentials.json"
     creds.write_text('{"token":"x"}')
@@ -2464,6 +2471,13 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
                 update={"backend": "claude"}),
             "claude": SETTINGS.runner.claude.model_copy(update={
                 "bin": str(fake_claude_bin), "credentials_file": str(creds)}),
+            # advisor 指摘 #3: `_terminate_cli_pgid` (`worker_runner.py:429`)
+            # は `self._settings.runner.cli_terminate_grace_sec` を読む
+            # (`worker.worker_grace_sec` ではない — 別のフィールド)。
+            # 明示的に短く設定してテストを自己完結させ、
+            # `settings.yaml.example` の既定値が将来変わっても
+            # `thread.join(timeout=20.0)` を超えないようにする。
+            "cli_terminate_grace_sec": 2.0,
         }),
         "worker": SETTINGS.worker.model_copy(update={
             "worker_startup_timeout_sec": 10.0, "worker_grace_sec": 5.0}),
