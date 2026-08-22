@@ -480,8 +480,9 @@ def test_approved_plugins_expired_after_approve_does_not_revoke(tmp_path):
     **別の** 承認要求 (同じ name/content_hash) が発行され、それが期限切れ
     で expired になっても、先の承認は取り消され *ない* こと。
     `decide()` は expired を書けず (approved/rejected のみ)、
-    `expire_due()` は pending にしか触れないため、この経路だけが
-    「本物の expired 行」を作れる (raw SQL に頼らない)。"""
+    `expire_due()` は既定で kind='plugin' の pending に触れないため (R8)、
+    `apply_decision(status='expired')` を直接呼ぶ経路だけが「本物の
+    expired 行」を作れる (raw SQL に頼らない)。"""
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
     d = _write_plugin(plugins_dir, "expire_noop_ind")
@@ -490,11 +491,14 @@ def test_approved_plugins_expired_after_approve_does_not_revoke(tmp_path):
     h = ch(d)
     _decide(conn, "expire_noop_ind", h, status="approved", now=NOW)
     later = NOW + timedelta(minutes=1)
-    approvals.create(conn, "plugin",
-                     {"name": "expire_noop_ind", "content_hash": h}, later,
-                     expires_at=later + timedelta(minutes=15))
-    n = approvals.expire_due(conn, later + timedelta(minutes=16))
-    assert n == 1  # 前提: 2 件目の要求が確かに expired になった
+    aid = approvals.create(conn, "plugin",
+                           {"name": "expire_noop_ind", "content_hash": h}, later,
+                           expires_at=later + timedelta(minutes=15))
+    approvals.apply_decision(conn, aid, "expired", decided_by="system",
+                             now=later + timedelta(minutes=16))
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (aid,)).fetchone()
+    assert row["status"] == "expired"  # 前提: 2 件目の要求が確かに expired になった
 
     metas = plugin_loader.approved_plugins(conn, plugins_dir)
 
