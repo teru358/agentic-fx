@@ -1898,7 +1898,7 @@ def test_watchdog_tick_uses_mission_watch_time_fn(monkeypatch):
               provider=None, econ=None, collector=None, rag=None,
               trade_loop=None, reflection=None, scheduler=None,
               commands=None, registry=None, core_lock=None,
-              mission_watch=watch, notifier=FakeNotifier(), runner=None,
+              mission_watch=watch, improve_supervisor=None, notifier=FakeNotifier(), runner=None,
               owns_runner=False, clock=None, instance_lock=None,
               supervisor=None, conn_supervisor=None)
     _watchdog_tick(app)
@@ -1992,7 +1992,7 @@ def test_watchdog_tick_uses_mission_watch_time_fn_directly(tmp_path):
               provider=None, econ=None, collector=None, rag=None,
               trade_loop=None, reflection=None, scheduler=None,
               commands=None, registry=None, core_lock=None,
-              mission_watch=watch, notifier=FakeNotifier(), runner=None,
+              mission_watch=watch, improve_supervisor=None, notifier=FakeNotifier(), runner=None,
               owns_runner=False, clock=None, instance_lock=None,
               supervisor=None, conn_supervisor=None)
     _watchdog_tick(app)

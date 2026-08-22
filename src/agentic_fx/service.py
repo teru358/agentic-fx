@@ -464,6 +464,7 @@ class App:
     clock: object
     instance_lock: object
     supervisor: object
+    improve_supervisor: object
     conn_supervisor: object
     stop_event: threading.Event = field(default_factory=threading.Event)
     health_latch: HealthLatch = field(default_factory=HealthLatch)
@@ -860,6 +861,17 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         supervisor = MissionSupervisor(
             trade_fn=_trade_fn, reflection_fn=_reflection_fn, ask_fn=_ask_fn)
 
+        from agentic_fx.core.improve_supervisor import ImproveSupervisor
+        improve_supervisor = ImproveSupervisor(
+            capacity=settings.improve.parallel, root=root, settings=settings,
+            clock=clock, db_path=root / "data" / "agentic.db",
+            stop_event=stop_event)
+        # self._improve_loop への実 ImproveLoop 注入・Scheduler.on_improve_tick
+        # / Commands.improve_supervisor への値渡し (「有効化配線」) は
+        # Task 10 完了後、Task 12 が build_app の当該箇所で行う (統合裁定
+        # R-i9/R-i2)。本 task はここまで — Scheduler/Commands の構築呼び
+        # 出しには一切手を入れない。
+
         def on_trade_mission(trigger: str) -> bool:
             # trigger は scheduler._trade_mission_due() が返した起動理由。
             # supervisor.try_submit が受理すれば True (scheduler 側が cron
@@ -926,6 +938,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    mission_watch=mission_watch, notifier=notifier,
                    runner=runner, owns_runner=owns_runner, clock=clock,
                    instance_lock=instance_lock, supervisor=supervisor,
+                   improve_supervisor=improve_supervisor,
                    conn_supervisor=conn_supervisor, stop_event=stop_event,
                    health_latch=health_latch,
                    watchdog_heartbeat=watchdog_heartbeat,
@@ -1272,6 +1285,10 @@ def run_service(root: Path, *, daemon: bool = False,
                 drain_exc=RuntimeError("service shutting down"))
         except Exception:  # noqa: BLE001 — 停止シーケンスは必ず最後まで走らせる
             _log.exception("supervisor.shutdown() failed during shutdown")
+        try:
+            app.improve_supervisor.shutdown()
+        except Exception:  # noqa: BLE001
+            _log.exception("improve_supervisor.shutdown() failed during shutdown")
         # scheduler スレッドの終了を確認する。
         # **(レビュー 2 周目 codex D1 — この task が壊した前提の修復)**
         # 旧コメント「tick は core_lock 下で走るため join 完了 = 実行中
@@ -1302,6 +1319,7 @@ def run_service(root: Path, *, daemon: bool = False,
         supervisor_join_timeout_sec = dispatch_ceiling_sec
         app.supervisor.join(timeout=supervisor_join_timeout_sec)
         supervisor_still_busy = app.supervisor.is_alive()
+        app.improve_supervisor.join(timeout=supervisor_join_timeout_sec)
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
         # 行う。notifier は最大 10 秒ブロックしうるため、記録を先にすると
         # 「graceful」記録の後に watchdog がまだ activity へ書き込める窓が

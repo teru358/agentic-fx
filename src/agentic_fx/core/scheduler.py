@@ -48,6 +48,7 @@ class Scheduler:
                  on_econ_cycle: Callable[[], None],
                  on_signal_maintenance: Callable[[datetime], None] | None = None,
                  on_cache_maintenance: Callable[[datetime], None] | None = None,
+                 on_improve_tick: Callable[[datetime], None] | None = None,
                  signal_due_fn: Callable[[datetime], bool] | None = None,
                  stop_event: threading.Event | None = None) -> None:
         self.conn = conn
@@ -75,6 +76,10 @@ class Scheduler:
         # 既定 None = 機能無効 (既存テスト互換)。signal maintenance とは
         # 責務が異なるため専用フックにする (責務混在を避ける)。
         self.on_cache_maintenance = on_cache_maintenance
+        # プラン 10 Task 9: improve loop の tick 発火フック。既定 None =
+        # 機能無効 (Task 9 単独では未配線が正しい状態、Task 12 で活性化
+        # 配線)。on_improve_tick は core_lock の外で発火される (設計書 §3.1)。
+        self.on_improve_tick = on_improve_tick
         self.signal_due_fn = signal_due_fn
         self._stop_event = stop_event
         # 上書き 1 の改名: cron (1 時間毎) の締切だけを追跡する。signal
