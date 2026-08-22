@@ -19,6 +19,7 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
+from collections.abc import Sequence
 from pathlib import Path
 
 # x86_64 の landlock syscall 番号 (Linux 5.13+)。
@@ -113,6 +114,12 @@ _READ_WRITE_ACCESS = (
     _ACCESS_FS_MAKE_REG | _ACCESS_FS_REMOVE_FILE |
     _ACCESS_FS_MAKE_DIR | _ACCESS_FS_REMOVE_DIR | _ACCESS_FS_TRUNCATE)
 
+# プラン10 Task 5: execute パスの自己充足マスク。
+# EXECUTE | READ_FILE | READ_DIR の和で、同一 inode に対する ro ルールとの
+# 併合に依存しない。
+_EXECUTE_ACCESS = (
+    _ACCESS_FS_EXECUTE | _ACCESS_FS_READ_FILE | _ACCESS_FS_READ_DIR)
+
 _PR_SET_NO_NEW_PRIVS = 38
 
 
@@ -147,10 +154,15 @@ def is_available() -> bool:
 
 
 def restrict_to(*, read_only_paths: list[Path],
-                read_write_paths: list[Path]) -> None:
+                read_write_paths: list[Path],
+                execute_paths: Sequence[Path] = ()) -> None:
     """呼び出しプロセスを Landlock で FS allowlist に制限する
     (**不可逆 — プロセス生涯にわたって有効**、以後の子プロセスにも継承
     される)。利用不能なら `LandlockUnavailable`。
+
+    execute_paths は `_EXECUTE_ACCESS` (EXECUTE|READ_FILE|READ_DIR の自己充足
+    マスク) で許可する。同一 inode に対する read_only ルールとの併合には
+    依存しない (probe landlock_probe.py と同一設計)。
     """
     if not is_available():
         raise LandlockUnavailable(
@@ -172,7 +184,8 @@ def restrict_to(*, read_only_paths: list[Path],
     try:
         for path, access in (
                 *((p, _READ_ONLY_ACCESS) for p in read_only_paths),
-                *((p, _READ_WRITE_ACCESS) for p in read_write_paths)):
+                *((p, _READ_WRITE_ACCESS) for p in read_write_paths),
+                *((p, _EXECUTE_ACCESS) for p in execute_paths)):
             parent_fd = os.open(str(path), os.O_PATH | os.O_DIRECTORY)
             try:
                 rule_attr = _PathBeneathAttr(allowed_access=access,

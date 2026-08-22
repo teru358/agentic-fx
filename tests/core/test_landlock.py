@@ -269,6 +269,90 @@ def test_restrict_to_issues_syscalls_in_required_order(monkeypatch, tmp_path):
     assert libc.prctl_args[0][0] == 38   # PR_SET_NO_NEW_PRIVS
 
 
+# 5-A: execute_paths テスト (プラン10 Task 5)
+
+def test_create_ruleset_still_only_declares_truncate_and_execute_family(monkeypatch, tmp_path):
+    """execute_paths 追加後も handled_access_fs 自体は不変
+    (EXECUTE は元から ABI v1 に入っている — 新設は allowed_access 側のみ)。"""
+    import agentic_fx.core.landlock as landlock_mod  # Minor 3: 既存テストの規律 (関数内 import) に合わせる
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    rw = tmp_path / "rw"; rw.mkdir()
+    ex = tmp_path / "ex"; ex.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw], execute_paths=[ex])
+    create_attr = libc.syscall_args[1][1]
+    assert create_attr.handled_access_fs == landlock_mod._HANDLED_ACCESS_FS
+
+
+def test_restrict_to_adds_a_rule_for_each_execute_path(monkeypatch, tmp_path):
+    """execute_paths の各パスに対して landlock_add_rule (445) が 1 回ずつ
+    追加で発行され、allowed_access が `_EXECUTE_ACCESS` と厳密一致する
+    (multiplicity 1 の pin — execute_paths を渡しても ro/rw の呼出数が
+    変わらないことも同時に見る)。"""
+    import agentic_fx.core.landlock as landlock_mod
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    rw = tmp_path / "rw"; rw.mkdir()
+    ex = tmp_path / "ex"; ex.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw], execute_paths=[ex])
+    # 444(abi) 444(create) 445(ro) 445(rw) 445(execute) 446(restrict)
+    assert libc.syscall_numbers == [444, 444, 445, 445, 445, 446]
+    ex_attr = libc.syscall_args[4][3]
+    assert ex_attr.allowed_access == landlock_mod._EXECUTE_ACCESS
+
+
+def test_execute_access_mask_is_self_sufficient(monkeypatch, tmp_path):
+    """§2.2: `_EXECUTE_ACCESS` は EXECUTE|READ_FILE|READ_DIR の**和**で、
+    同一 inode に対する ro ルールとの併合に依存しない。execute_paths の
+    値を `_ACCESS_FS_EXECUTE` 単独に弱める変異は、read_only にも
+    同じパスを渡す既存テストでは検出できない — ここでは execute_paths
+    のパスを read_only にも read_write にも一切含めない状態で
+    allowed_access の READ_FILE/READ_DIR bit を直接検査する。"""
+    import agentic_fx.core.landlock as landlock_mod
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0])
+    _install(monkeypatch, libc)
+    ex = tmp_path / "exonly"; ex.mkdir()
+    restrict_to(read_only_paths=[], read_write_paths=[], execute_paths=[ex])
+    ex_attr = libc.syscall_args[2][3]
+    assert ex_attr.allowed_access & landlock_mod._ACCESS_FS_EXECUTE
+    assert ex_attr.allowed_access & landlock_mod._ACCESS_FS_READ_FILE
+    assert ex_attr.allowed_access & landlock_mod._ACCESS_FS_READ_DIR
+    assert not (ex_attr.allowed_access & landlock_mod._ACCESS_FS_WRITE_FILE)
+
+
+def test_read_write_access_still_excludes_make_char_and_make_sym(monkeypatch, tmp_path):
+    """§2.2 の `/dev` rw 脅威分析はこの不在だけに乗っている
+    (`_READ_WRITE_ACCESS` に `MAKE_CHAR`/`MAKE_SYM` が無いことでデバイス
+    ノード・symlink の新規作成ができない)。5-D で `/dev` を read_write に
+    昇格させる前に、この不在を直接 pin しておく — `_ACCESS_FS_MAKE_CHAR`/
+    `_ACCESS_FS_MAKE_SYM` を足す変異は既存の等価性 assert
+    (`test_create_ruleset_is_handed_the_truncate_bit`) でも検出できるが、
+    その等価性 assert 自体が定数と一緒に動く変異 (定数側に足す) では
+    落ちない — ここでは bit 単位で直接見る。"""
+    import agentic_fx.core.landlock as landlock_mod
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    rw = tmp_path / "rw"; rw.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw])
+    rw_attr = libc.syscall_args[3][3]
+    assert not (rw_attr.allowed_access & landlock_mod._ACCESS_FS_MAKE_CHAR)
+    assert not (rw_attr.allowed_access & landlock_mod._ACCESS_FS_MAKE_SYM)
+
+
+def test_execute_paths_default_is_empty(monkeypatch, tmp_path):
+    """`execute_paths` を渡さない既存呼び出し (trade profile) が無変更
+    のまま動く — 追加の add_rule 呼出しが発生しないことを pin する。"""
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    rw = tmp_path / "rw"; rw.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw])
+    assert libc.syscall_numbers == [444, 444, 445, 445, 446]
+
+
 _REAL_LANDLOCK_SCRIPT = textwrap.dedent("""
     import os
     import sys
