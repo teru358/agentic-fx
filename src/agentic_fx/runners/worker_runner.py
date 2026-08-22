@@ -34,37 +34,56 @@ import logging
 
 _log = logging.getLogger("agentic_fx.worker_runner")
 
-# IM-3/P8-03 対応 (裁定書 F-9): trade profile の子だけに渡すデータ
-# プロバイダ資格情報の明示 allowlist。
 _DATA_PROVIDER_ENV_ALLOWLIST = ("TWELVEDATA_API_KEY", "MT5_BRIDGE_API_KEY")
+_MAX_CREDENTIALS_FILE_BYTES = 64 * 1024
 
 
 def _mission_worker_env(worker_profile: str) -> dict[str, str]:
-    """mission worker 専用の env builder (IM-3/P8-03 対応、裁定書 F-9)。
+    """R10-①: trade 資格情報も env では渡さない。全 profile 共通で
+    `plugin/sandbox.py:_build_env()` の最小 env のみ返す。"""
+    return _build_env()
 
-    `plugin/sandbox.py:_build_env()` (`PATH`/`PYTHONPATH`/
-    `PYTHONSAFEPATH`/`_SINGLE_THREAD_ENV` のみの最小 env、`AFX_*` 等は
-    継承しない) をそのまま mission worker にも流用すると、
-    `price_provider.py`/`sources.py` が読む `TWELVEDATA_API_KEY`/
-    `MT5_BRIDGE_API_KEY` が子に渡らず、MT5/TwelveData を有効化した
-    構成で trade worker の市場データ取得ツールが恒常的に認証失敗する
-    (レビュー IM-3/P8-03)。`worker_profile == "trade"` のときだけ、
-    この 2 キーを親プロセスの環境から明示 allowlist で追加する。
-    `AFX_*`/`ANTHROPIC_*` 等は引き続き除外 (継承しない)。improve
-    profile では資格情報も渡さない (裁定書 F-9 — 遮断維持)。
-    """
-    env = _build_env()
-    if worker_profile == "trade":
-        for key in _DATA_PROVIDER_ENV_ALLOWLIST:
-            value = os.environ.get(key)
-            if value is not None:
-                env[key] = value
-    return env
+
+class _CredentialsCopyError(Exception):
+    pass
+
+
+def _copy_credentials_file(src_path: str, dest: Path) -> None:
+    """認証原本を検査してから `dest` へコピーする。通常ファイル
+    (symlink 不可)・所有者 == 実 uid・group/other に権限なし・
+    サイズ ≤ 64 KiB を満たさなければ `_CredentialsCopyError`。"""
+    src = Path(src_path).expanduser()
+    try:
+        fd = os.open(str(src), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise _CredentialsCopyError(f"cannot open credentials file: {e}") from e
+    try:
+        st = os.fstat(fd)
+        if not _stat_is_regular(st):
+            raise _CredentialsCopyError("credentials file is not a regular file")
+        if st.st_uid != os.getuid():
+            raise _CredentialsCopyError("credentials file is not owned by this uid")
+        if st.st_mode & 0o077:
+            raise _CredentialsCopyError(
+                "credentials file is readable/writable by group or other")
+        if st.st_size > _MAX_CREDENTIALS_FILE_BYTES:
+            raise _CredentialsCopyError("credentials file exceeds size limit")
+        data = os.read(fd, st.st_size + 1)
+    finally:
+        os.close(fd)
+    dest.write_bytes(data)
+    dest.chmod(0o600)
+
+
+def _stat_is_regular(st: os.stat_result) -> bool:
+    import stat as _stat
+    return _stat.S_ISREG(st.st_mode)
 
 
 class WorkerRunner(AgentRunner):
     def __init__(self, *, root: Path, settings, clock: Clock, rag: Rag,
                 worker_profile: str = "trade",
+                run_context: object | None = None,
                 on_rpc_leak: Callable[[], None] | None = None,
                 stop_event: threading.Event | None = None) -> None:
         self._root = root
@@ -72,6 +91,7 @@ class WorkerRunner(AgentRunner):
         self._clock = clock
         self._rag = rag
         self._worker_profile = worker_profile
+        self._run_context = run_context
         self._on_rpc_leak = on_rpc_leak
         self._stop_event = stop_event
 
@@ -81,18 +101,71 @@ class WorkerRunner(AgentRunner):
 
     def run(self, mission: Mission) -> MissionResult:
         w = self._settings.worker
-        with tempfile.TemporaryDirectory(prefix="afx-mission-") as workdir:
+        with tempfile.TemporaryDirectory(prefix="afx-mission-") as base:
+            workdir = Path(base)
+            (workdir / "home").mkdir(mode=0o700)
+            (workdir / "tmp").mkdir(mode=0o700)
+            (workdir / "cfg").mkdir(mode=0o700)
+
+            credentials: dict[str, str] = {}
+            if self._worker_profile == "trade":
+                for key in _DATA_PROVIDER_ENV_ALLOWLIST:
+                    value = os.environ.get(key)
+                    if value is not None:
+                        credentials[key] = value
+            elif self._worker_profile == "improve":
+                choice = getattr(self._settings.runner, "improve", None)
+                if choice is not None and choice.backend == "claude":
+                    try:
+                        _copy_credentials_file(
+                            self._settings.runner.claude.credentials_file,
+                            workdir / "cfg" / ".credentials.json")
+                    except _CredentialsCopyError:
+                        return MissionResult(
+                            "failed", None, [],
+                            reason="claude credentials copy failed "
+                                   "(参照: 起動時検査/認証原本の要件)")
+                elif (choice is not None and choice.backend == "codex"
+                      and self._settings.runner.codex.provider == "chatgpt"):
+                    try:
+                        _copy_credentials_file(
+                            self._settings.runner.codex.auth_file,
+                            workdir / "cfg" / "auth.json")
+                    except _CredentialsCopyError:
+                        return MissionResult(
+                            "failed", None, [],
+                            reason="codex auth copy failed")
+
+            run_context_fields: dict[str, object] = {}
+            if self._run_context is not None:
+                run_context_fields = {
+                    # precheck 2026-08-22 pass2: RB2 — mission_id は
+                    # ImproveRunContext 上は int が正 (missions_store.start
+                    # の戻り値)。子側 (mission_worker.py) は str 前提
+                    # (staging_dir の末尾成分と Path.name で比較するため、
+                    # Path.name は必ず str) なので、handshake 組み立てで
+                    # ここだけ str() を掛ける。
+                    "mission_id": str(self._run_context.mission_id),
+                    "staging_dir": str(self._run_context.staging_dir),
+                    "source_snapshot_dir":
+                        str(self._run_context.source_snapshot_dir),
+                }
+
             proc = subprocess.Popen(
                 [sys.executable, "-m", "agentic_fx.mission_worker"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, cwd=workdir,
+                stderr=subprocess.DEVNULL, cwd=str(workdir),
                 env=_mission_worker_env(self._worker_profile),
                 start_new_session=True)
-            return self._run_with_child(proc, mission, w)
+            return self._run_with_child(
+                proc, mission, w, credentials=credentials,
+                run_context_fields=run_context_fields)
 
     # ---- 内部 -------------------------------------------------------
 
-    def _run_with_child(self, proc, mission: Mission, w) -> MissionResult:
+    def _run_with_child(self, proc, mission: Mission, w,
+                        credentials: dict[str, str] | None = None,
+                        run_context_fields: dict[str, object] | None = None) -> MissionResult:
         stdin_lock = threading.Lock()
         stdin_state = {"closed": False}
         in_seq = SeqTracker()  # 子→親方向の受信検証
@@ -101,6 +174,7 @@ class WorkerRunner(AgentRunner):
         dispatch_queue: "queue.Queue[dict]" = queue.Queue()
         transcript: list[dict] = []
         state = {"bytes": 0, "truncated": False}
+        cli_pgid_holder: dict[str, int] = {}
 
         def handle_event(frame: dict) -> None:
             if state["truncated"]:
@@ -133,6 +207,10 @@ class WorkerRunner(AgentRunner):
                         ready_queue.put(frame)
                     elif ftype == "event":
                         handle_event(frame)
+                    elif ftype == "cli_started":
+                        pgid = frame.get("pgid")
+                        if isinstance(pgid, int):
+                            cli_pgid_holder["pgid"] = pgid
                     elif ftype == "tool_rpc":
                         dispatch_queue.put(frame)
                     elif ftype == "result":
@@ -221,6 +299,8 @@ class WorkerRunner(AgentRunner):
                        "timeout_sec": mission.timeout_sec},
             "worker_profile": self._worker_profile,
             "now": now.isoformat(),
+            "credentials": credentials or {},
+            **(run_context_fields or {}),
         }
         with stdin_lock:
             write_frame(proc.stdin, handshake)
@@ -258,6 +338,8 @@ class WorkerRunner(AgentRunner):
         finally:
             dispatch_queue.put(None)
             self._ensure_dead(proc, w)
+            if "pgid" in cli_pgid_holder:
+                self._terminate_cli_pgid(cli_pgid_holder["pgid"])
             reader.join(timeout=5.0)
             # IM-7 対応: dispatcher は `with stdin_lock: write_frame(proc.stdin,
             # ...)` を実行し得る (tool_rpc_result 応答の送出中)。ここで
@@ -326,4 +408,26 @@ class WorkerRunner(AgentRunner):
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            pass
+
+    def _terminate_cli_pgid(self, pgid: int) -> None:
+        """§7.1-2 の blocking 受入条件: worker が EOF/異常終了した後、
+        `cli_started` で得た CLI の pgid を `CliRunner._terminate_pgid` と
+        同じ規律 (SIGTERM→grace→SIGKILL) で回収する。mission_worker 自身の
+        pgid (`proc.pid`) とは別グループのため `_ensure_dead` では届かない。"""
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+        grace = getattr(self._settings.runner, "cli_terminate_grace_sec", 10.0)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.02)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
             pass
