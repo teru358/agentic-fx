@@ -2615,7 +2615,6 @@ def _find_vendor_codex_bin() -> str | None:
 def test_build_app_rejects_when_runner_bin_not_resolvable(tmp_path, monkeypatch):
     """①: `runner.improve.backend=claude` で `claude` が PATH 上に無く、
     かつ絶対パスでもなければ起動拒否 (fail closed)。"""
-    import sys
     root = _root_with_settings(tmp_path, runner={
         "improve": {"backend": "claude", "model": "m"},
         "claude": {"bin": "afx-nonexistent-claude-binary"}})
@@ -2629,7 +2628,6 @@ def test_build_app_rejects_when_trade_claude_bin_not_resolvable(tmp_path, monkey
     `_check_cli_backend` が呼ばれる (旧実装は improve しか見ておらず、
     trade+claude は起動時検査が一切走らないまま Mission 実行時に落ちて
     いた)。"""
-    import sys
     root = _root_with_settings(tmp_path, runner={
         "trade": {"backend": "claude", "model": "m"},
         "claude": {"bin": "afx-nonexistent-claude-binary"}})
@@ -2640,7 +2638,6 @@ def test_build_app_rejects_when_trade_claude_bin_not_resolvable(tmp_path, monkey
 
 def test_build_app_rejects_codex_node_wrapper(tmp_path):
     """①: codex は ELF (vendor native) を要求し node ラッパを拒否する。"""
-    import sys
     wrapper = tmp_path / "codex-wrapper.js"
     wrapper.write_text("#!/usr/bin/env node\nrequire('./cli')\n")
     wrapper.chmod(0o755)
@@ -2670,7 +2667,6 @@ def test_build_app_rejects_when_credentials_file_missing(tmp_path):
     """③: claude/codex+chatgpt は認証ファイル必須 (codex+llama_swap は要求しない)。
     codex+chatgpt を使うには①②を通す必要があるため vendor native codex を
     使う (無ければ skip — 裁定 R5)。"""
-    import sys
     vendor_codex = _find_vendor_codex_bin()
     if vendor_codex is None:
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
@@ -2687,7 +2683,6 @@ def test_build_app_does_not_require_credentials_for_codex_llama_swap(tmp_path):
     (§1.1-2「provider=llama_swap は空の scratch CODEX_HOME で起動」)。
     `improve.llama_swap_verified=true` も併せて上書きする (さもないと
     llama_swap 分岐自体が別理由で拒否する — 骨格 §1.1-2)。"""
-    import sys
     vendor_codex = _find_vendor_codex_bin()
     if vendor_codex is None:
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
@@ -2845,7 +2840,6 @@ def test_check_codex_subscription_expiry_missing_key_warns_and_does_not_raise(
 
 def test_build_app_rejects_llama_swap_when_not_verified(tmp_path):
     """M6: codex+llama_swap で llama_swap_verified=false なら拒否する。"""
-    import sys
     vendor_codex = _find_vendor_codex_bin()
     if vendor_codex is None:
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
@@ -2860,7 +2854,6 @@ def test_build_app_rejects_llama_swap_when_not_verified(tmp_path):
 
 def test_build_app_wires_codex_subscription_expiry_check(tmp_path, monkeypatch):
     """M13: codex+chatgpt のとき subscription expiry check が呼ばれる。"""
-    import sys
     import agentic_fx.service as service_mod
     
     call_count = [0]

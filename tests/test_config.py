@@ -433,3 +433,11 @@ def test_codex_settings_extra_forbid():
     from agentic_fx.config import CodexCliSettings
     with pytest.raises(ValidationError):
         CodexCliSettings(bin="/x/codex", unknown_key=1)
+
+
+def test_improve_mission_timeout_sec_minimum_is_60():
+    """Step 17 M5 killer: `ImproveSettings.mission_timeout_sec` は `ge=60`
+    で下限を強制する (骨格 §1.4 の既定 3600 と `ge=60` は設計書 §1.4 逐語)。"""
+    from agentic_fx.config import ImproveSettings
+    with pytest.raises(ValidationError):
+        ImproveSettings(mission_timeout_sec=59)

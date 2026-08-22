@@ -2150,6 +2150,115 @@ def test_worker_runner_reaps_cli_pgid_after_worker_is_sigkilled(monkeypatch, tmp
     assert not alive, "CLI の pgid が回収されず生存している"
 
 
+# 指揮者検収 (B-4, プラン10 Task1) — 台帳 36d M3 の再判定。
+# `_FAKE_CHILD_WITH_CLI_STARTED` の CLI は SIGTERM を無視しないため
+# `_terminate_cli_pgid` の SIGKILL 昇格は原理的に到達しない、という台帳の
+# 「観測不能」判定は誤りだった。SIGTERM を SIG_IGN する CLI
+# (`tests/runners/test_launcher.py` の `_IGNORE_SIGTERM_AND_TOUCH` と同じ手)
+# に差し替えると escalation は観測できる。
+_FAKE_CHILD_WITH_SIGTERM_IGNORING_CLI = (
+    "import json, subprocess, sys, time\n"
+    "marker_path = sys.argv[1]\n"
+    "sys.stdin.readline()\n"  # handshake を読み捨てる
+    "cli = subprocess.Popen([sys.executable, '-c',"
+    " 'import signal, sys, time;"
+    " signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+    " open(sys.argv[1], \"w\").write(\"ready\"); time.sleep(600)',"
+    " sys.argv[2]], start_new_session=True)\n"
+    "open(marker_path, 'w').write(str(cli.pid))\n"
+    "sys.stdout.write(json.dumps({'type': 'cli_started', 'seq': 1,"
+    " 'pgid': cli.pid}) + '\\n')\n"
+    "sys.stdout.flush()\n"
+    "sys.stdout.write(json.dumps({'type': 'ready', 'seq': 2,"
+    " 'ok': True}) + '\\n')\n"
+    "sys.stdout.flush()\n"
+    "time.sleep(600)\n"
+)
+
+
+def test_worker_runner_terminate_cli_pgid_escalates_to_sigkill_when_cli_ignores_sigterm(
+        monkeypatch, tmp_path):
+    """§7.1-2 の blocking 受入条件 (a) の変種: `cli_started` で得た CLI が
+    SIGTERM を無視しても、`_terminate_cli_pgid` は grace 経過後に SIGKILL
+    へ昇格して回収する (台帳 `tmp/mutation-ledger-task1.md` 36d M3 の
+    再判定 — SIGKILL 昇格を `return` に変えると本テストは完走せず、
+    孤児プロセスが残留する)。"""
+    root = _root(tmp_path)
+    marker = tmp_path / "cli_pid"
+    ready_marker = tmp_path / "cli_ready"
+    script = tmp_path / "fake_child.py"
+    script.write_text(_FAKE_CHILD_WITH_SIGTERM_IGNORING_CLI)
+
+    real_popen = subprocess.Popen
+    spawned: dict = {}
+
+    def fake_popen(cmd, **kwargs):
+        p = real_popen(
+            [sys.executable, str(script), str(marker), str(ready_marker)],
+            **kwargs)
+        spawned["proc"] = p
+        return p
+
+    monkeypatch.setattr("agentic_fx.runners.worker_runner.subprocess.Popen",
+                        fake_popen)
+    settings = _tiny_worker_settings(worker_startup_timeout_sec=5.0,
+                                     worker_grace_sec=5.0)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(
+            update={"cli_terminate_grace_sec": 0.5})})
+    runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve")
+
+    result_box: dict = {}
+    # daemon=True: 変異注入時 (SIGKILL 昇格が消えた版) は CLI が生存し続け、
+    # `proc.stdout` を読み中の reader スレッドと `finally` 節の
+    # `proc.stdout.close()` が同じ io ロックを奪い合って恒久的にブロック
+    # し得る (実測)。thread を daemon にしないとプロセス終了そのものが
+    # 巻き添えでブロックする — 変異の観測 (test failure) 自体はこの前に
+    # `thread.join(timeout=...)` のタイムアウトで確定するため daemon 化
+    # しても red/green の判定には影響しない。
+    thread = threading.Thread(
+        target=lambda: result_box.update(result=runner.run(_mission())),
+        daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5.0
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert marker.exists(), "fake CLI が cli_started を送る前にタイムアウトした"
+    cli_pid = int(marker.read_text())
+
+    # cli_pid が判明した以降は assert 失敗時にも必ず孤児回収まで到達させる
+    # (途中の assert で早期 return すると SIGTERM 無視プロセスが残留する
+    # ことを実測で確認したため try/finally で括る)。
+    try:
+        # SIGTERM ハンドラの設定完了 ("ready" marker) を待たないと race する。
+        deadline = time.monotonic() + 5.0
+        while not ready_marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready_marker.exists(), "SIGTERM 無視 CLI が準備を終える前にタイムアウトした"
+
+        os.kill(spawned["proc"].pid, signal.SIGKILL)  # mission_worker 相当を SIGKILL
+        thread.join(timeout=15.0)
+        assert not thread.is_alive(), "runner.run() が終わらない"
+
+        deadline = time.monotonic() + 3.0
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(cli_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            time.sleep(0.05)
+        assert not alive, "SIGTERM を無視する CLI の pgid が SIGKILL へ昇格せず生存している"
+    finally:
+        # テストが落ちても SIGTERM 無視プロセスを孤児として残さない。
+        try:
+            os.killpg(cli_pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
 def test_worker_runner_cli_started_never_sent_leaves_finally_a_no_op(
         tmp_path, monkeypatch):
     """§7.1-2 の blocking 受入条件 (b): `cli_started` が一度も来なければ、
