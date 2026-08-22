@@ -69,7 +69,7 @@
 | `landlock.restrict_to(*, read_only_paths: list[Path], read_write_paths: list[Path]) -> None`。**`execute_paths` 引数は現状存在しない** | `core/landlock.py:149-` | Task 5 で probe 実測 (`landlock_probe.py`) と同じ形 (`_EXECUTE_ACCESS = _ACCESS_FS_EXECUTE\|_ACCESS_FS_READ_FILE\|_ACCESS_FS_READ_DIR`、自己充足) を本番へ移植する。probe との差分は「(a) `execute_paths` 引数の有無、(b) 実行権マスクの自己充足」の 2 点のみ (probe 報告冒頭に明記) |
 | `_READ_WRITE_ACCESS` に `MAKE_CHAR`・`MAKE_SYM` は含まれない (`WRITE_FILE\|READ_FILE\|READ_DIR\|MAKE_REG\|REMOVE_FILE\|MAKE_DIR\|REMOVE_DIR\|TRUNCATE`) | `landlock.py:111-114` | `/dev` を rw に上げてもデバイスノード・symlink の新規作成はできない (設計書 §2.2 の脅威分析の前提が現物と一致する) |
 | `WorkerRunner.run` は `subprocess.Popen([sys.executable, "-m", "agentic_fx.mission_worker"], stdin=PIPE, stdout=PIPE, stderr=DEVNULL, cwd=workdir, env=_mission_worker_env(worker_profile), start_new_session=True)`。`preexec_fn` は使っていない | `worker_runner.py:82-91` | Task 1 の launcher 経由化は「mission_worker 自体の起動」ではなく「mission_worker が起動する CLI (claude/codex) の起動」に適用される。**mission_worker 自身の spawn は現状 `preexec_fn` 不使用のまま**であり、この点は変えない (設計書 §1.1-1 の対象は CLI 起動と gate pytest 起動) |
-| handshake フレーム (`worker_runner.py:209-224`) のキーは `type`/`seq=1`/`expected_parent_pid`/`db_path`/`plugins_dir`/`settings`/`mission`/`worker_profile`/`now`。**`staging_dir`/`source_snapshot_dir`/`mission_id`/`credentials` は現状存在しない** | 同上 | Task 1 (trade 資格情報の handshake 化) と Task 5 (`staging_dir`/`source_snapshot_dir`/`mission_id` 追加) の両方がこのフレームを拡張する。ファイル競合注記 (§8 末尾) のとおりマージ順に注意 |
+| handshake フレーム (`worker_runner.py:210-224`) のキーは `type`/`seq=1`/`expected_parent_pid`/`db_path`/`plugins_dir`/`settings`/`mission`/`worker_profile`/`now`。**`staging_dir`/`source_snapshot_dir`/`mission_id`/`credentials`/`cli_started` は現状存在しない** | 同上 | <!-- precheck 2026-08-22: T1-B12 --> **裁定 R6 で確定**: 親側 3 キー (`mission_id`/`staging_dir`/`source_snapshot_dir`) の追加は **Task 1 が単独で所有**する (`WorkerRunner.__init__` の `run_context=` 追加と合わせて Step 33 が実装まで完結させる — レビュー1周目 C3 の確定を踏襲)。Task 5 は子側 (`mission_worker.py`) の受領・相互照合のみを担当し、`worker_runner.py` の handshake dict リテラルには触れない (Task 5 節 Files の重複記述は Task 5 修正者が削除する)。`credentials` (trade 資格情報の handshake 化) と `cli_started` (CLI pgid 通知フレーム、子→親、既存フレーム送出経路に相乗り) も Task 1 が追加する。ファイル競合は解消済み — `worker_runner.py` は本 task のみが handshake dict を触る |
 | `_mission_worker_env` は trade profile にのみ `TWELVEDATA_API_KEY`/`MT5_BRIDGE_API_KEY` を env allowlist で渡す (`_DATA_PROVIDER_ENV_ALLOWLIST`)。**improve は現状すでに資格情報ゼロ** | `worker_runner.py:39-62`、`plugin/sandbox.py:245-264` | 設計書 R10-① (trade 資格情報を env → handshake へ) は Task 1 の作業。improve 側は「新たに秘密を持ち込まない」ことの維持が Task 5 の受入条件 |
 | `MissionResult` は `status: Literal["completed","failed","timeout","max_turns"]` / `output` / `transcript` / `reason` の 4+1 フィールドで**既に確定済み** (プラン 9 Task 1 で `reason` 追加済み) | `runners/base.py:38-47` | 本プランは `MissionResult` に新規フィールドを足さない (設計書 §1.5 の契約表どおり)。`AgentRunner` docstring (`base.py:60-66`) は既に「ClaudeRunner はプラン 10 スコープ」と明記しており、Task 2/3 はこの docstring の予告を実装するだけ |
 | `improvement_runs` の現行 DDL は `id, backlog_id, result CHECK(IN('approval','report')), approval_id, report_path, started_at, finished_at` (`pr_url` はプラン 9 Task 19 で削除済み) | `db.py:43-51` (`_IMPROVEMENT_RUNS_V2_DDL`) | Task 8 が `mission_id`(部分 UNIQUE)・`report_state CHECK(IN('none','prepared','published','failed'))` を `ensure_column` で追加する。`result` の CHECK 値集合は変えない (失敗は `NULL` のまま、設計書 §3.6) |
@@ -78,7 +78,7 @@
 | `PluginMeta` は `path` フィールドを持つが、現行 `discover` は symlink を辿らず**そのまま `entry` (= `plugins/<name>`) を `path` に入れる**想定 (symlink 解決の明示ロジックは無い) | `plugin/loader.py:83-91`、`_discover_one` | Task 5 が「symlink を辿った先の版ディレクトリを `PluginMeta.path` に固定」するロジックを新設する。既存プレーン plugin (symlink でない) は挙動不変 |
 | `submit_plugin`/`bless` の pytest 実行は `_default_pytest_runner` (`plugin/approval.py:149`) が**無隔離**でサブプロセスを回す (Landlock なし) | `plugin/approval.py:149`、docstring `:262-271` | Task 6 が `plugin/gate_pytest.py` を新設し、`submit_plugin`/`bless` 双方の `pytest_runner` 差し替え先とする。`_default_pytest_runner` は置換対象であり、削除するか呼ばれない状態にするかは実装計画で確定する (設計書は「置き換える」とのみ言う) |
 | `bless(conn, meta, *, settings, now, pytest_runner=None, sandbox_run=None, run_in_sample_fn=None) -> int` は「CLI (`afx plugin bless`) からのみ呼ぶこと」と docstring に明記され、`submit_plugin` + `decide(status="approved")` の 2 段構成 | `plugin/approval.py:225-228, 356-370` | Task 11 の `bless --from _human` はこの既存関数のシグネチャ・責務分割 (ゲート = submit 相当、決定 = 別呼び出し) を土台に、`candidate_origin`/switch ジャーナルを差し込む形で拡張する。**`bless <name>` (live 直接) の経路は廃止せず拒否に変える** (設計書 §2.3・§5.1) — 既存 CLI 引数の互換性は実装計画で決める |
-| `service.build_app` の起動時検査は `_check_llama_swap` の隣に `_assert_tools_registered(registry, _TRADE_TOOLS)` (`service.py:607`) がある。**improve backend の起動時検査 (①〜⑤、設計書 §1.4) は存在しない** | `service.py:443-619` (要 grep で正確な行を実装時に再確認) | Task 1 が `_check_llama_swap` と同等の位置に improve backend 検査を追加する。**⚠設計書との差ではない** — 設計書はこれを新設と明記しており齟齬なし |
+| `_check_llama_swap` の唯一の呼び出しは `service.py:249` (`run_init` の中)。`build_app`(`service.py:443-`) は `_check_llama_swap` を**呼ばない** — `build_app` 内の起動時検査は `_validate_startup(settings)`(`service.py:607`) と `_assert_tools_registered(registry, _TRADE_TOOLS)`(`service.py:608`) のみ。**improve backend の起動時検査 (①〜⑤、設計書 §1.4) は存在しない** | `service.py:443-619`、`_check_llama_swap` 呼び出しは `:249` | <!-- precheck 2026-08-22: T1-B2 --> Task 1 が `build_app` 内 `_validate_startup(settings)` の直後 (`:607` の次) に improve backend 検査を追加する (`_check_llama_swap` の隣ではない — `run_init` にしか呼ばれていないため build_app 経由では未到達になる、旧記述は誤り)。**⚠設計書との差ではない** — 設計書はこれを新設と明記しており齟齬なし |
 | `ScheduleSettings` は現行 `trade_interval_min: int` / `improve: str (pattern "^(weekly\|daily)$")` の 2 フィールドのみ。**`improve_at` は存在しない**。取引 cadence は `scheduler.py:261` にハードコード (`timedelta(hours=1)`)、`schedule.improve` は**どこからも読まれていない** (config には存在するが consumer が無い) | `config.py:154-157`、`code-state-map.md` §7 | Task 9 が `schedule.improve_at` を新設し、scheduler に「最新 occurrence の period key」計算を実装して初めて `schedule.improve` が consumer を持つ。⚠設計書との差ではない (設計書 §0.3・§3.1 が明記) |
 | `store/missions.py` に `start(conn, loop, runner, model, ...) -> int` / `finish(conn, mission_id, status, ...) -> None` / `recover_interrupted(conn, *, now, ...)` が既に存在。**`commit=False` 変種は無い** (`conn.commit()` を内部で呼ぶ) | `store/missions.py:14-, 23-, 47-` | Task 8 が `commit=False` オプション付き変種を追加する。既存呼び出し元 (trade レーン) は無変更のまま動く前提を守る (設計書 §4.1「現行の内部 `conn.commit()` はそのまま残し、他の呼び出し元は不変」) |
 | `store/approvals.py::decide` / `expire_due` / `create` はいずれも内部で `conn.commit()` を呼ぶ。**`AlreadyDecidedError` は expired 化のフォールバックまで内包**した既存の凝った実装 | `store/approvals.py:14-79` | Task 8/11 の `apply_decision`/`commit=False` 変種はこの既存の期限切れフォールバック挙動 (rowcount=0 時に expired へ確定させる) を壊さないこと。⚠ 設計書は「1 transaction 内で approval CAS + backlog 遷移 + ジャーナル終端」を要求するが、既存 `decide` の「rowcount=0 なら expired 化して commit してから例外」という 2 段 commit の形は commit=False 変種では 1 tx にまとめ直す必要がある — **実装計画で SQL を具体化する際に注意** (設計上の齟齬ではなく、既存関数の commit 分割を tx 統合する実装上の要検討点) |
@@ -171,7 +171,7 @@
 
 **同一ファイル merge 順注記** (設計書 §8 末尾を転記):
 - `mission_worker.py` (A-4 / B-5) は同一ファイル — **A-4 を B-5 の後に直列**
-- `worker_runner.py` (A-1 認証コピー / B-5 handshake `staging_dir`) は同一ファイル — マージ順に注意
+- `worker_runner.py`: <!-- precheck 2026-08-22: T1-B12 --> 裁定 R6 により handshake dict (親側 3 キー `mission_id`/`staging_dir`/`source_snapshot_dir`・`credentials`・`cli_started` 送出) は **A-1 (Task 1) が単独所有**。B-5 (Task 5) はこのファイルを触らない (子側 `mission_worker.py` の受領・相互照合のみ) — ファイル競合は解消済み
 - `plugin/approval.py` (B-6 / E-11) は順序依存
 - `plugin/loader.py` (B-5 discover / E-11) は順序依存
 - `store/db.py` は C-8 のみが触る
@@ -285,6 +285,8 @@ class CliRunner(AgentRunner):
                  cli_terminate_grace_sec: float,
                  registry: ToolRegistry,          # improve registry (MCP シム経由で公開)
                  on_message: Callable[[dict], None] | None = None,
+                 cli_started_sink: Callable[[int], None] | None = None,  # 子→親 cli_started フレーム送出点 (§7.1-2, B10)
+                 rlimits: dict[str, tuple[int, int]] | None = None,  # launcher へ素通し。Task 2/3 は既定 None (Minor 8)
                  launcher: Callable[..., list[str]] | None = None,  # test seam
                  popen: Callable[..., subprocess.Popen] | None = None) -> None: ...
 
@@ -905,7 +907,7 @@ R-i10: 束別 task 執筆 (`tasks-{A,B,C,D,E,F}.md`) で新規に命名された
 **束 A** (`runners/cli_runner.py`, `service.py`, `runners/worker_runner.py`, `tools/mcp_shim.py`):
 - `_normalize_reason` (`cli_runner.py`) — `LocalRunner._normalize_reason` と同名だが別モジュールの private 関数
 - `_terminate_pgid` (`cli_runner.py`) — CLI の pgid を SIGTERM→grace→SIGKILL→空確認する内部ヘルパ
-- `_resolve_cli_bin` / `_check_cli_version` / `_check_credentials_file` / `_check_service_initial_env_has_no_secrets` / `_check_improve_backend` (`service.py`) — 起動時検査 ①〜⑤ の実体名
+- `_resolve_cli_bin` / `_check_cli_version` / `_check_credentials_file` / `_check_service_initial_env_has_no_secrets` / `_read_proc_self_environ_names` / `_check_codex_subscription_expiry` / `_check_cli_backend` (`service.py`) — 起動時検査 ①〜⑤ の実体名。<!-- precheck 2026-08-22: T1-M14 --> `_check_cli_backend(settings, *, which="trade"|"improve")` は着手前検証 Minor 14 で `_check_improve_backend` から一般化 (`build_app` は trade/improve 双方に対して呼ぶ)
 - `_copy_credentials_file` / `_CredentialsCopyError` (`worker_runner.py`) — 親側の認証コピーと事前検査
 - `_mcp_tool_from_openai_tool` / `_SUPPORTED_PROTOCOL_VERSION` (`mcp_shim.py`) — MCP tool 形式変換・protocolVersion 定数 (裁定 5 により実測後に値を差し替える。**レビュー1周目 M1**: 統合裁定 R-i7 反映時に `_mcp_tool_from_tooldef` から改名済み — 引数が `ToolDef` でなく `ToolRegistry.openai_tools()` の返す openai 形式 dict になったため。本 Interfaces 節と Task 4 詳細節の記号を統一する)
 
@@ -980,19 +982,22 @@ R-i10: 束別 task 執筆 (`tasks-{A,B,C,D,E,F}.md`) で新規に命名された
 **由来**: 設計書 §1.1 / §1.4 / §2.2 の一部。担当 §8.1 項目: **2, 3, 4, 5, 44**。
 
 **Files:**
+<!-- precheck 2026-08-22: T1-B2/B3/B6/B10/B11/B13 -->
 - Create: `src/agentic_fx/runners/launcher.py`
 - Create: `src/agentic_fx/runners/cli_runner.py`
 - Create: `src/agentic_fx/runners/factory.py`
-- Modify: `src/agentic_fx/config.py:54-61` (`RunnerChoice`/`RunnerSettings`)、`:155-158` (`ScheduleSettings`)
+- Modify: `src/agentic_fx/config.py:54-61` (`RunnerChoice`/`RunnerSettings`)、`:155-157` (`ScheduleSettings`)
 - Modify: `config/settings.yaml.example:25-27`（`runner:`）、`:52-54`（`schedule:`）
-- Modify: `src/agentic_fx/service.py:136-` (`_check_llama_swap` の隣に improve backend 起動時検査を追加)、`:249` 付近 (`_validate_startup` 相当から呼ぶ)
-- Modify: `src/agentic_fx/runners/worker_runner.py:39-90` (`_mission_worker_env`・`WorkerRunner.run`)
+- Modify: `src/agentic_fx/service.py:136-` (`_check_llama_swap` と並ぶ位置に improve backend 起動時検査ヘルパ群を追加)、`:607` の直後 (`_validate_startup(settings)` の直後、`build_app` 内。**`_check_llama_swap` の呼び出しは `run_init`(`:249`) のみであり `build_app` は経由しない** — 旧記述の誤りを修正、B2)
+- Modify: `src/agentic_fx/runners/worker_runner.py:39-62`(`_mission_worker_env` 等モジュール関数)・`:66-76`(`WorkerRunner.__init__` に `run_context` 追加)・`:82-91`(`WorkerRunner.run`)・`:93-`(`_run_with_child` のシグネチャ・handshake dict・reader_loop・finally)。**`:78-80` の `close()` は変更しない** (B11 — 旧「39-90 全文置換」指示は `close()` を消していた)
+- Modify: `src/agentic_fx/mission_worker.py:428-442` 付近 (trade 分岐、`registry` 構築より前。handshake `credentials` の子側消費のみ追加 — B6/R2。Task 4/5 の improve 分岐・A-4 の担当範囲とは非重複)
 - Test: `tests/runners/test_launcher.py` (新規)
 - Test: `tests/runners/test_cli_runner.py` (新規)
 - Test: `tests/runners/test_factory.py` (新規)
 - Test: `tests/test_config.py` (追記)
 - Test: `tests/test_service_app.py` (追記 — improve backend 起動時検査)
-- Test: `tests/runners/test_worker_runner.py` (追記 — 認証コピー・workdir 0700・trade 資格情報の handshake 化)
+- Test: `tests/runners/test_worker_runner.py` (追記・一部改訂 — 認証コピー・workdir/home/tmp/cfg・trade 資格情報の handshake 化・`cli_started` pgid 回収。既存 2 本の改訂を含む — B4/B5)
+- Test: `tests/test_mission_worker_protocol.py` (追記 — handshake `credentials` の trade 分岐消費、B6/R2)
 
 **Interfaces (骨格の逐語):**
 - Produces (Task 2/3/4 と改善レーン全体が consume):
@@ -1019,6 +1024,8 @@ R-i10: 束別 task 執筆 (`tasks-{A,B,C,D,E,F}.md`) で新規に命名された
                    cli_terminate_grace_sec: float,
                    registry: ToolRegistry,
                    on_message: Callable[[dict], None] | None = None,
+                   cli_started_sink: Callable[[int], None] | None = None,  # <!-- precheck 2026-08-22: T1-B10 --> §7.1-2
+                   rlimits: dict[str, tuple[int, int]] | None = None,  # <!-- precheck 2026-08-22: T1-M8 --> launcher へ素通し、Task 2/3 は既定 None
                    launcher: Callable[..., list[str]] | None = None,
                    popen: Callable[..., subprocess.Popen] | None = None) -> None: ...
       def run(self, mission: Mission) -> MissionResult: ...
@@ -1169,9 +1176,13 @@ def _wait_for_file(path: Path, timeout: float = 5.0) -> None:
     raise TimeoutError(f"{path} did not appear within {timeout}s")
 
 
-def test_launcher_execs_target_and_target_receives_no_extra_fds(tmp_path):
-    """launcher が argv[0] を execv する — 素朴な `[python, target]` と
-    同じ実行結果になることを実プロセスで確認する。"""
+def test_launcher_execs_target_and_target_starts(tmp_path):
+    """<!-- precheck 2026-08-22: T1-M9 --> Minor 9 の再発防止 (旧名
+    `..._and_target_receives_no_extra_fds` は fd を一切検査していなかった
+    — 実態に合わせて改名): launcher が argv[0] を execv する — 素朴な
+    `[python, target]` と同じ実行結果になることを実プロセスで確認する。
+    fd 継承の検証は別 (`test_cli_runner_does_not_use_subprocess_devnull_for_stdin`
+    が `CliRunner` 層で個別に見る)。"""
     marker = tmp_path / "started"
     argv = build_launcher_argv(
         os.getpid(),
@@ -1240,7 +1251,11 @@ def test_launcher_child_ignoring_sigterm_still_dies_to_sigkill(tmp_path):
         time.sleep(0.3)
         assert proc.poll() is None, "SIGTERM を無視するはずが死んだ"
         os.killpg(proc.pid, signal.SIGKILL)
-        assert proc.wait(timeout=5) is not None
+        rc = proc.wait(timeout=5)
+        # Minor 10 の再発防止: `proc.wait()` は必ず int を返すため
+        # `is not None` は恒真。SIGKILL によるシグナル死 (負値) であることを
+        # 見る。
+        assert rc < 0, f"SIGKILL 後の returncode が負値でない: {rc}"
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -1381,7 +1396,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 |---|---|---|
 | M1 | `os.getppid() != expected_parent_pid` の再照合を削除する | `test_launcher_exits_immediately_when_expected_parent_pid_mismatches` |
 | M2 | `PR_SET_PDEATHSIG` 設定を削除する | `test_launcher_child_dies_when_parent_dies` |
-| M3 | `os.execv` を `subprocess.run` (fork ベース) に置き換える | `test_launcher_execs_target_and_target_receives_no_extra_fds` (プロセスが marker を書く前に launcher プロセス自体が残ってしまい pgid ownership 系のテスト (Step 後続・§8.1-3) が壊れる。単体では `test_build_launcher_argv_shape` の `argv[1]=="-c"` は変わらないため、この変異は `_LAUNCHER_SOURCE` 内部の書き換えとして注入し実プロセステストで検出する) |
+| M3 | `os.execv` を `subprocess.run` (fork ベース) に置き換える | `test_launcher_execs_target_and_target_starts` (プロセスが marker を書く前に launcher プロセス自体が残ってしまい pgid ownership 系のテスト (Step 後続・§8.1-3) が壊れる。単体では `test_build_launcher_argv_shape` の `argv[1]=="-c"` は変わらないため、この変異は `_LAUNCHER_SOURCE` 内部の書き換えとして注入し実プロセステストで検出する) |
 | M4 | rlimits の JSON デコードを削除し常に適用しない | `test_build_launcher_argv_encodes_rlimits_as_json` (構築側) — 適用側の実測は束 B Task 6 (gate pytest) で追加する |
 | M5 | `argv[0]` の絶対パス検証 (`is_absolute()`) を削除する | `test_build_launcher_argv_rejects_relative_argv` |
 | M6 | `CliRunner`/launcher モジュールに `preexec_fn=True` のダミー行を追加する | `test_launcher_module_does_not_use_preexec_fn` |
@@ -1515,13 +1530,18 @@ def _no_process_group_members(pgid: int) -> bool:
 
 
 def test_cli_runner_completed_leaves_no_pgid_survivors(tmp_path):
-    """§8.1-3: completed 終端で CLI の pgid が空になる。"""
+    """§8.1-3: completed 終端で CLI の pgid が空になる。
+
+    <!-- precheck 2026-08-22: T1-M15 --> Minor 15 の再発防止: 旧稿は
+    `spying_popen` を使わない `runner` (未使用) と `runner_with_spy` の
+    2 つを作っていた (実装者が迷う死んだコード)。`popen=spying_popen` を
+    渡す 1 つだけを作る。
+    """
     seen_pgid: dict[str, int] = {}
 
     def on_message(frame: dict) -> None:
         pass
 
-    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path, on_message=on_message)
     # pgid を観測するために popen をラップする
     real_popen = subprocess.Popen
 
@@ -1611,17 +1631,38 @@ def test_cli_runner_schema_mismatch_is_failed(tmp_path):
 def test_cli_runner_does_not_use_subprocess_devnull_for_stdin(tmp_path):
     """`subprocess.DEVNULL` は使わない (probe §5-③: Landlock 下で `/dev`
     が ro だと `O_RDWR` オープンが失敗する) — `open('/dev/null', O_RDONLY)`
-    相当の fd を渡すことを popen 呼び出しの kwargs で pin する。"""
+    相当の fd を渡すことを popen 呼び出しの kwargs で pin する。
+
+    <!-- precheck 2026-08-22: T1-M11 --> Minor 11 の再発防止: `!=
+    subprocess.DEVNULL` だけだと `stdin=None` (継承) へ変異しても green の
+    まま (弱い pin)。int fd であること・`O_RDONLY` で開かれた character
+    device であることまで見る。
+    """
+    import stat as _stat
+
     captured: dict[str, Any] = {}
     real_popen = subprocess.Popen
 
     def spying_popen(*a, **kw):
-        captured.update(kw)
+        # `CliRunner.run` は Popen 呼び出し直後の `finally` で自分の
+        # devnull fd を close する — fstat は fd がまだ有効なこの
+        # spy の内側で行う (B7 と同じ「観測は観測できる瞬間に行う」規律)。
+        stdin_fd = kw.get("stdin")
+        if isinstance(stdin_fd, int) and stdin_fd >= 0:
+            st = os.fstat(stdin_fd)
+            captured["stdin_is_chr"] = _stat.S_ISCHR(st.st_mode)
+        captured["stdin"] = stdin_fd
         return real_popen(*a, **kw)
 
     runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path, popen=spying_popen)
     runner.run(_mission())
-    assert captured.get("stdin") != subprocess.DEVNULL
+    stdin_fd = captured.get("stdin")
+    assert stdin_fd != subprocess.DEVNULL
+    assert isinstance(stdin_fd, int) and stdin_fd >= 0, (
+        f"stdin は継承 (None) でも DEVNULL でもなく明示 fd でなければ"
+        f"ならない: {stdin_fd!r}")
+    assert captured.get("stdin_is_chr") is True, (
+        "stdin fd が character device (/dev/null) でない")
 
 
 def test_cli_runner_env_is_fully_specified_no_secret_keys(tmp_path):
@@ -1665,6 +1706,45 @@ def test_cli_runner_uses_launcher_not_preexec_fn(tmp_path):
     runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path, popen=spying_popen)
     runner.run(_mission())
     assert "preexec_fn" not in captured or captured["preexec_fn"] is None
+
+
+def test_cli_runner_calls_cli_started_sink_with_cli_pgid(tmp_path):
+    """<!-- precheck 2026-08-22: T1-B10 --> §7.1-2 の blocking 受入条件の
+    送出側: Popen 直後に `cli_started_sink(pgid)` を 1 回呼ぶ (mission_worker
+    が out_seq 経由で `{"type":"cli_started","pgid":...}` を親へ転送する
+    送出点)。"""
+    seen: list[int] = []
+    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path,
+                         cli_started_sink=seen.append)
+    runner.run(_mission())
+    assert len(seen) == 1
+    assert isinstance(seen[0], int)
+
+
+def test_cli_runner_cli_started_sink_is_optional(tmp_path):
+    """`cli_started_sink=None` (既定) でも `run()` は例外を出さない。"""
+    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path)
+    result = runner.run(_mission())
+    assert result.status == "completed"
+
+
+def test_cli_runner_forwards_rlimits_to_launcher(tmp_path):
+    """<!-- precheck 2026-08-22: T1-M8 --> Minor 8: `rlimits=` はサブ
+    クラスから CLI 子プロセスへ rlimit を掛ける口として `launcher` seam へ
+    転送されるだけ (`CliRunner` 自身は解釈しない — 適用は
+    `runners.launcher.build_launcher_argv` の責務)。Task 2/3 は既定 `None`
+    のまま使う (CLI に rlimit は掛けない、裁定 Minor 8)。"""
+    captured: dict[str, Any] = {}
+
+    def fake_launcher(expected_parent_pid, argv, *, rlimits=None):
+        captured["rlimits"] = rlimits
+        return argv  # 素通し (実プロセスは launcher を経由せず直接 argv を exec)
+
+    want = {"RLIMIT_FSIZE": (1024, 1024)}
+    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path,
+                         rlimits=want, launcher=fake_launcher)
+    runner.run(_mission())
+    assert captured["rlimits"] == want
 ```
 
 - [ ] **Step 8: red を確認**
@@ -1705,7 +1785,6 @@ import jsonschema
 from agentic_fx._safe_error import safe_text
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
 from agentic_fx.runners.launcher import build_launcher_argv
-from agentic_fx.runners.response_parser import ParseError, parse_json_output
 from agentic_fx.tools.registry import ToolRegistry
 
 _MAX_REASON_CHARS = 500
@@ -1713,6 +1792,12 @@ _MAX_REASON_CHARS = 500
 
 @dataclass(frozen=True)
 class CliLaunchSpec:
+    """<!-- precheck 2026-08-22: T1-M2 --> Minor 2: `CliRunner.run()` は
+    この型を構築しない (現行実装は `_build_argv`/`_build_env` の戻り値を
+    直接使う) — 骨格 Interfaces が明示した形を保つための宣言のみで、
+    Task 2/3 が argv/env 組み立てのヘルパとして任意に使ってよい。lint が
+    未使用クラスを警告する場合は許容する (dataclass の型そのものが
+    contract のドキュメントを兼ねる)。"""
     argv: list[str]
     env: dict[str, str]
     cwd: Path
@@ -1734,6 +1819,8 @@ class CliRunner(AgentRunner):
                  cli_terminate_grace_sec: float,
                  registry: ToolRegistry,
                  on_message: Callable[[dict], None] | None = None,
+                 cli_started_sink: Callable[[int], None] | None = None,
+                 rlimits: dict[str, tuple[int, int]] | None = None,
                  launcher: Callable[..., list[str]] | None = None,
                  popen: Callable[..., subprocess.Popen] | None = None) -> None:
         self._bin_path = bin_path
@@ -1742,6 +1829,8 @@ class CliRunner(AgentRunner):
         self._cli_terminate_grace_sec = cli_terminate_grace_sec
         self._registry = registry
         self._on_message = on_message or (lambda frame: None)
+        self._cli_started_sink = cli_started_sink
+        self._rlimits = rlimits
         self._build_launcher_argv = launcher or build_launcher_argv
         self._popen = popen or subprocess.Popen
 
@@ -1761,7 +1850,8 @@ class CliRunner(AgentRunner):
         mcp_socket = self._workdir / "afx.sock"
         inner_argv = self._build_argv(mission, mcp_socket=mcp_socket)
         env = self._build_env(mission)
-        launcher_argv = self._build_launcher_argv(os.getpid(), inner_argv)
+        launcher_argv = self._build_launcher_argv(
+            os.getpid(), inner_argv, rlimits=self._rlimits)
 
         devnull_r = os.open(os.devnull, os.O_RDONLY)
         try:
@@ -1773,6 +1863,8 @@ class CliRunner(AgentRunner):
             os.close(devnull_r)
 
         pgid = os.getpgid(proc.pid)
+        if self._cli_started_sink is not None:
+            self._cli_started_sink(pgid)  # <!-- precheck 2026-08-22: T1-B10 --> §7.1-2
         stdout_lines: list[str] = []
         stderr_chunks: list[str] = []
         reader_done = threading.Event()
@@ -1805,10 +1897,10 @@ class CliRunner(AgentRunner):
 
         try:
             if timed_out or proc.poll() is None:
-                self._terminate_pgid(pgid)
+                self._terminate_pgid(pgid, proc)
                 timed_out = True
             else:
-                self._terminate_pgid(pgid)  # completed でも孫を確実に回収する (§1.1-4)
+                self._terminate_pgid(pgid, proc)  # completed でも孫を確実に回収する (§1.1-4)
         finally:
             t_out.join(timeout=5.0)
             t_err.join(timeout=5.0)
@@ -1835,13 +1927,21 @@ class CliRunner(AgentRunner):
                 reason=_normalize_reason(f"output_schema mismatch: {e.message}"))
         return MissionResult("completed", raw, [])
 
-    def _terminate_pgid(self, pgid: int) -> None:
+    def _terminate_pgid(self, pgid: int, proc: subprocess.Popen) -> None:
+        """<!-- precheck 2026-08-22: T1-B9 --> `proc` (CLI 自身、pgid の
+        グループリーダ) は SIGKILL 後も親 (このメソッドの呼び出し元) が
+        `wait()` するまで zombie として残り、zombie は `killpg(pgid, 0)`
+        に応答し続ける (`ESRCH` にならない) — これを reap せずに空判定
+        すると `timeout`/`ignoring_sigterm` の両経路が最大 5 秒の空待ちで
+        毎回タイムアウトする (実測: B9)。ループ中に非 blocking で
+        `proc.wait(timeout=0)` を試みてから空判定する。"""
         try:
             os.killpg(pgid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError):
             return
         deadline = time.monotonic() + self._cli_terminate_grace_sec
         while time.monotonic() < deadline:
+            self._reap(proc)
             try:
                 os.killpg(pgid, 0)
             except ProcessLookupError:
@@ -1851,13 +1951,25 @@ class CliRunner(AgentRunner):
             os.killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+        self._reap(proc)
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
+            self._reap(proc)
             try:
                 os.killpg(pgid, 0)
             except ProcessLookupError:
                 return
             time.sleep(0.02)
+
+    @staticmethod
+    def _reap(proc: subprocess.Popen) -> None:
+        """`proc` が既に死んでいれば非 blocking で `wait()` し zombie を
+        回収する。まだ生きていれば何もしない (`timeout=0` は即座に
+        `TimeoutExpired` を送出する — blocking しない)。"""
+        try:
+            proc.wait(timeout=0)
+        except subprocess.TimeoutExpired:
+            pass
 ```
 
 **注**: 上記 `run()` は Step 7 のテスト群を満たす最小実装。`reason` の
@@ -1866,7 +1978,11 @@ class CliRunner(AgentRunner):
 クラスの責務)。`output_schema` 不適合時の `failed` は骨格 §1.1-6 の契約
 どおり。`completed` 終端でも `_terminate_pgid` を呼ぶのは §1.1-4「finally
 節: CLI の pgid へ SIGTERM → grace → SIGKILL → pgid が空になるまで待って
-から MissionResult を返す」の pin。
+から MissionResult を返す」の pin。**B9 の再発防止**: `_terminate_pgid` は
+`proc` (CLI プロセス自身) を明示的に `wait()` で reap してから
+`killpg(pgid, 0)` の空判定に入る — reap しないと SIGKILL 後も `proc` 自身が
+zombie として pgid に残り続け、`_no_process_group_members` が恒常的に
+`False` を返す (timeout 経路が実測 5 秒超で毎回落ちる、B9)。
 
 - [ ] **Step 10: green を確認**
 
@@ -1892,8 +2008,11 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M6 | `stdin=devnull_r` を `subprocess.DEVNULL` に変える | `test_cli_runner_does_not_use_subprocess_devnull_for_stdin` |
 | M7 | `_normalize_reason` を呼ばず stderr 全文をそのまま `reason` にする | `test_cli_runner_reason_is_single_line_and_capped` |
 | M8 | env 構築に `os.environ` をベースにマージする (継承させる) | `test_cli_runner_env_is_fully_specified_no_secret_keys` (`_FakeCliRunner._build_env` は固定 dict を返すためこの変異は `CliRunner.run` 側で env をマージする形で注入し、テストの popen spy が捉える) |
+| M9 | <!-- precheck 2026-08-22: T1-B9 --> `_terminate_pgid` ループ内の `self._reap(proc)` 呼び出しを削除する (2 箇所とも) | `test_cli_runner_ignoring_sigterm_still_reaches_sigkill_and_empties_pgid` (`elapsed < 5.0` が red — zombie が空待ちを 5 秒食う、B9 実測どおり) |
+| M10 | <!-- precheck 2026-08-22: T1-B10 --> `cli_started_sink` の呼び出しを削除する | `test_cli_runner_calls_cli_started_sink_with_cli_pgid` |
+| M11 | <!-- precheck 2026-08-22: T1-M8 --> `self._build_launcher_argv(...)` の `rlimits=self._rlimits` を落とす (常に `None` を渡す) | `test_cli_runner_forwards_rlimits_to_launcher` |
 
-各変異注入後 `grep -n "start_new_session\|_terminate_pgid\|jsonschema.validate\|devnull_r\|_normalize_reason" src/agentic_fx/runners/cli_runner.py` で目視確認。
+各変異注入後 `grep -n "start_new_session\|_terminate_pgid\|jsonschema.validate\|devnull_r\|_normalize_reason\|_reap\|cli_started_sink" src/agentic_fx/runners/cli_runner.py` で目視確認。
 
 - [ ] **Step 12: コミット**
 
@@ -1910,6 +2029,16 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
 )"
 ```
+
+**スコープ境界の明記 (裁定 R1、担当表)**: `cli_started_sink` の受け口
+(`CliRunner.__init__`/`run()`) と `WorkerRunner` 側の回収機構 (Step 36a〜36d)
+は本 task (Task 1) が実装する。**mission_worker.py が実際に
+`ClaudeRunner`/`CodexRunner` を構築して `cli_started_sink=` に「out_seq 経由で
+`{"type":"cli_started","pgid":<int>}` を送る closure」を渡す配線は、
+mission_worker.py で `CliRunner` 系を初めてインスタンス化する task (Task 2/3、
+および `factory.build_runner` を mission_worker の improve/trade 分岐へ実際に
+差し込む後続 task) の受入条件に含める** — Task 1 は `mission_worker.py` を
+Files 節に挙げておらず (担当表参照)、ここでは受け口とテストのみを揃える。
 
 ---
 
@@ -2108,6 +2237,17 @@ improve:
 
 （`schedule.trade_interval_min`・既存キーの正確な現物値は実装時に `config/settings.yaml.example` を読んで維持すること — ここでは新規キーの位置と値のみ確定。）
 
+<!-- precheck 2026-08-22: T1-M7 -->
+**個人設定の同期 (Minor 7、CLAUDE.md の同期規約)**: `RunnerSettings.codex` は
+`bin` に既定が無く必須フィールドのため、`config/settings.yaml.example` だけ
+でなく実装者・レビュアー自身の **gitignore された個人 `config/settings.yaml`**
+にも同じ `runner.codex`/`runner.claude`/`schedule.improve_at`/`improve:` の
+3 セクションを追加しないと `load_settings` が `ConfigError` で落ち、
+`service.py` を経由するテスト (`_root()`/`_init()` 系ヘルパを含む) の実行や
+`uv run afx ...` の手動確認が壊れる。Step 16 の green 確認の**前**に、
+実装者は自分の `config/settings.yaml` を手で更新すること (git 管理対象外
+なのでこの Step の diff には現れない)。
+
 - [ ] **Step 16: green を確認**
 
 ```bash
@@ -2148,91 +2288,294 @@ EOF
 
 ### Step 19: 起動時検査 (`service.py`) — 失敗するテストを書く (§1.4 ①〜⑤)
 
-`tests/test_service_app.py` の末尾に追記する (実装時に既存 fixture — `_settings_from_example` 相当のヘルパの有無を確認し、あれば流用する。無ければ以下のとおり自前で組む):
+<!-- precheck 2026-08-22: T1-B1/B2/B3/B13 -->
+**現物確認 (着手前検証で裏取り済み)**: `build_app(root: Path, *, runner=None, clock=None,
+quote_fn=None, spec_fn=None, bars_fn=None, embedding_fn=None, provider=None,
+stop_event=None) -> App` に `settings=` 引数は無い — settings は
+`root/config/settings.yaml` から `build_app` 内部で読む
+(`load_settings(root / "config" / "settings.yaml")`)。既存 `tests/test_service_app.py`
+の `_init(tmp_path)` は `config/settings.yaml.example` を `tmp_path/config/` へコピーし
+`run_init(tmp_path)` (`config/settings.yaml.example` → `settings.yaml` にコピー +
+検証) を呼ぶ。`EXAMPLE`/`_settings_with_codex_bin`/`_settings_with_claude_credentials`/
+`_settings_with_codex_provider`/`_settings_with_improve_backend` はこのファイルに
+**いずれも存在しない** (旧 Step 19 の想定は誤り、B3)。以下は現物のヘルパ規約
+(`_init`/`build_app(tmp_path, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())`)
+に合わせて書き直した逐語である。
+
+`tests/test_service_app.py` の末尾に追記する:
 
 ```python
-def test_build_app_rejects_when_runner_bin_not_resolvable(tmp_path, monkeypatch):
-    """①: `runner.improve.backend=claude` で `claude` が PATH 上に無ければ
-    起動拒否 (fail closed)。"""
-    from agentic_fx.config import load_settings
-    from agentic_fx.service import build_app
+def _root_with_settings(tmp_path, **overrides):
+    """`_init(tmp_path)` 済みの root で `config/settings.yaml` を yaml 経由で
+    上書きする。`overrides` はトップレベルキーの部分辞書 (既存キーとの
+    深いマージ — 例 `runner={"improve": {"backend": "claude", "model": "m"}}`
+    は `runner.improve.model` 以外の既存フィールドを保持する)。"""
+    import yaml as _yaml
+    _init(tmp_path)
+    path = tmp_path / "config" / "settings.yaml"
+    raw = _yaml.safe_load(path.read_text(encoding="utf-8"))
 
-    settings = load_settings(EXAMPLE).model_copy(update={
-        "runner": load_settings(EXAMPLE).runner.model_copy(update={
-            "improve": load_settings(EXAMPLE).runner.improve.model_copy(
-                update={"backend": "claude"}),
-            "claude": load_settings(EXAMPLE).runner.claude.model_copy(
-                update={"bin": "afx-nonexistent-claude-binary"}),
-        }),
-    })
+    def _deep_update(d, u):
+        for k, v in u.items():
+            if isinstance(v, dict) and isinstance(d.get(k), dict):
+                _deep_update(d[k], v)
+            else:
+                d[k] = v
+
+    _deep_update(raw, overrides)
+    path.write_text(_yaml.safe_dump(raw), encoding="utf-8")
+    return tmp_path
+
+
+def _find_vendor_codex_bin() -> str | None:
+    """`codex` (node ラッパ) を PATH で解決し、その隣の vendor native
+    バイナリを探す (裁定 R5)。無ければ `None` (呼び出し側で skip)。"""
+    import shutil as _shutil
+
+    wrapper = _shutil.which("codex")
+    if wrapper is None:
+        return None
+    pkg_root = Path(wrapper).resolve().parent.parent  # .../@openai/codex
+    candidates = sorted(pkg_root.glob("node_modules/@openai/codex-*/vendor/*/bin/codex"))
+    return str(candidates[0]) if candidates else None
+
+
+def test_build_app_rejects_when_runner_bin_not_resolvable(tmp_path, monkeypatch):
+    """①: `runner.improve.backend=claude` で `claude` が PATH 上に無く、
+    かつ絶対パスでもなければ起動拒否 (fail closed)。"""
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "claude", "model": "m"},
+        "claude": {"bin": "afx-nonexistent-claude-binary"}})
     monkeypatch.setenv("PATH", "/nonexistent")
     with pytest.raises(RuntimeError, match="claude"):
-        build_app(tmp_path, ...)  # 実装時に既存 build_app のテスト呼び出し規約に合わせる
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
 
-def test_build_app_rejects_codex_node_wrapper(tmp_path, monkeypatch):
+def test_build_app_rejects_when_trade_claude_bin_not_resolvable(tmp_path, monkeypatch):
+    """Minor 14 の再発防止: `runner.trade.backend=claude` 構成でも
+    `_check_cli_backend` が呼ばれる (旧実装は improve しか見ておらず、
+    trade+claude は起動時検査が一切走らないまま Mission 実行時に落ちて
+    いた)。"""
+    root = _root_with_settings(tmp_path, runner={
+        "trade": {"backend": "claude", "model": "m"},
+        "claude": {"bin": "afx-nonexistent-claude-binary"}})
+    monkeypatch.setenv("PATH", "/nonexistent")
+    with pytest.raises(RuntimeError, match="claude"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+
+
+def test_build_app_rejects_codex_node_wrapper(tmp_path):
     """①: codex は ELF (vendor native) を要求し node ラッパを拒否する。"""
     wrapper = tmp_path / "codex-wrapper.js"
     wrapper.write_text("#!/usr/bin/env node\nrequire('./cli')\n")
     wrapper.chmod(0o755)
-    settings = _settings_with_codex_bin(str(wrapper))
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "codex", "model": "m"},
+        "codex": {"bin": str(wrapper)}})
     with pytest.raises(RuntimeError, match="ELF|vendor native"):
-        build_app(tmp_path, settings=settings)
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
 
-def test_build_app_rejects_when_version_check_fails(tmp_path, monkeypatch):
-    """②: `<bin> --version` が非 0 で返れば起動拒否。"""
-    fake_bin = tmp_path / "fake-codex"
+def test_build_app_rejects_when_version_check_fails(tmp_path):
+    """②: `<bin> --version` が非 0 で返れば起動拒否。ELF 要求 (①) と
+    独立に検証するため backend=claude (`require_elf=False`) を使う —
+    codex はバイナリが ELF でなければ①で先に拒否されるため②単体を
+    観測できない。"""
+    fake_bin = tmp_path / "fake-claude"
     fake_bin.write_text("#!/bin/sh\nexit 1\n")
     fake_bin.chmod(0o755)
-    settings = _settings_with_codex_bin(str(fake_bin))
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "claude", "model": "m"},
+        "claude": {"bin": str(fake_bin)}})
     with pytest.raises(RuntimeError, match="--version"):
-        build_app(tmp_path, settings=settings)
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
 
-def test_build_app_rejects_when_credentials_file_missing(tmp_path, monkeypatch):
-    """③: claude/codex+chatgpt は認証ファイル必須 (codex+llama_swap は要求しない)。"""
-    settings = _settings_with_claude_credentials(str(tmp_path / "no-such-file.json"))
+def test_build_app_rejects_when_credentials_file_missing(tmp_path):
+    """③: claude/codex+chatgpt は認証ファイル必須 (codex+llama_swap は要求しない)。
+    codex+chatgpt を使うには①②を通す必要があるため vendor native codex を
+    使う (無ければ skip — 裁定 R5)。"""
+    vendor_codex = _find_vendor_codex_bin()
+    if vendor_codex is None:
+        pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "codex", "model": "m"},
+        "codex": {"bin": vendor_codex, "provider": "chatgpt",
+                  "auth_file": str(tmp_path / "no-such-file.json")}})
     with pytest.raises(RuntimeError, match="credentials|auth"):
-        build_app(tmp_path, settings=settings)
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
 
 def test_build_app_does_not_require_credentials_for_codex_llama_swap(tmp_path):
     """③ の裏: provider=llama_swap は auth_file 欠落でも起動時検査を通る
-    (§1.1-2「provider=llama_swap は空の scratch CODEX_HOME で起動」)。"""
-    settings = _settings_with_codex_provider("llama_swap", auth_file=str(tmp_path / "absent"))
-    build_app(tmp_path, settings=settings)  # 例外を出さない
+    (§1.1-2「provider=llama_swap は空の scratch CODEX_HOME で起動」)。
+    `improve.llama_swap_verified=true` も併せて上書きする (さもないと
+    llama_swap 分岐自体が別理由で拒否する — 骨格 §1.1-2)。"""
+    vendor_codex = _find_vendor_codex_bin()
+    if vendor_codex is None:
+        pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "codex", "model": "m"},
+        "codex": {"bin": vendor_codex, "provider": "llama_swap",
+                  "auth_file": str(tmp_path / "absent")}},
+        improve={"llama_swap_verified": True})
+    build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())  # 例外を出さない
 
 
 def test_build_app_rejects_when_service_initial_env_has_secret_pattern(tmp_path, monkeypatch):
-    """⑤: improve+claude のとき、サービス自身の初期 env に秘密名パターン
-    があれば起動拒否 (R10)。"""
-    monkeypatch.setenv("SOME_SERVICE_API_KEY", "x")
-    settings = _settings_with_improve_backend("claude")
-    with pytest.raises(RuntimeError, match="API_KEY|secret"):
-        build_app(tmp_path, settings=settings)
+    """⑤ の配線: improve+claude のとき `_check_service_initial_env_has_no_secrets`
+    が呼ばれ、例外がそのまま `build_app` から伝播する。検査本体 (`/proc/self/environ`
+    の読み取り・パターン照合の正しさ) は `test_check_service_initial_env_has_no_secrets_*`
+    (下記) が別途 pin する — ここでは配線のみを見る (R3: `monkeypatch.setenv` は
+    `/proc/self/environ` を書き換えないため、実環境の秘密漏れに依存したテストは
+    書けない、B1 の再発防止)。"""
+    import agentic_fx.service as service_mod
+
+    def _raise(settings, *, read_initial_env_names=None):
+        raise RuntimeError("SOME_SERVICE_API_KEY leaked")
+
+    monkeypatch.setattr(service_mod, "_check_service_initial_env_has_no_secrets", _raise)
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "claude", "model": "m"}})
+    with pytest.raises(RuntimeError, match="API_KEY"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
 
 def test_build_app_does_not_check_secret_env_when_improve_backend_is_local(
         tmp_path, monkeypatch):
-    """⑤ の裏: backend=local の環境では一切走らない (骨格 §1.4)。"""
-    monkeypatch.setenv("SOME_SERVICE_API_KEY", "x")
-    settings = load_settings(EXAMPLE)  # improve.backend == "local"
-    build_app(tmp_path, settings=settings)  # 例外を出さない
+    """⑤ の裏: backend=local の環境では `_check_service_initial_env_has_no_secrets`
+    が一切呼ばれない (骨格 §1.4)。"""
+    import agentic_fx.service as service_mod
+
+    def _raise(settings, *, read_initial_env_names=None):
+        raise RuntimeError("must not be called for backend=local")
+
+    monkeypatch.setattr(service_mod, "_check_service_initial_env_has_no_secrets", _raise)
+    _init(tmp_path)  # improve.backend == "local" (example 既定)
+    build_app(tmp_path, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())  # 例外を出さない
+
+
+def test_check_service_initial_env_has_no_secrets_rejects_leaked_key_via_seam():
+    """⑤ 検査本体 (R3): seam に注入した名前集合に秘密パターンがあれば拒否する。
+    `settings` 引数は現状未使用 (呼び出し規約を `_check_cli_backend` と
+    揃えるために受け取るのみ) — ダミー値でよい。"""
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    with pytest.raises(RuntimeError, match="API_KEY|secret"):
+        _check_service_initial_env_has_no_secrets(
+            object(), read_initial_env_names=lambda: {"SOME_SERVICE_API_KEY", "HOME"})
+
+
+def test_check_service_initial_env_has_no_secrets_passes_when_seam_clean():
+    """⑤ の裏 (R3): 秘密パターンに一致する名前が無ければ何もしない。"""
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    _check_service_initial_env_has_no_secrets(
+        object(), read_initial_env_names=lambda: {"HOME", "PATH"})  # 例外を出さない
+
+
+def test_check_service_initial_env_has_no_secrets_default_seam_is_proc_self_environ():
+    """R3 の再発防止 pin (B1): 既定 seam が `_read_proc_self_environ_names`
+    (`/proc/self/environ` 読み取り) であること。`os.environ` ベースの reader に
+    すり替える変異はこの identity 比較で red になる — `os.environ` は
+    `.env`→`load_dotenv()` 由来のキーも含むため、そちらを既定にすると
+    「サービスは `.env` を使ってよい」という設計の前提 (§1.4-⑤) に反して
+    `.env` 運用が常に起動拒否になる (B1 の実際の欠陥)。"""
+    import inspect
+
+    from agentic_fx.service import (
+        _check_service_initial_env_has_no_secrets, _read_proc_self_environ_names,
+    )
+
+    sig = inspect.signature(_check_service_initial_env_has_no_secrets)
+    assert (sig.parameters["read_initial_env_names"].default
+            is _read_proc_self_environ_names)
+
+
+def test_read_proc_self_environ_names_reads_real_proc_self_environ():
+    """`_read_proc_self_environ_names` は実プロセスの `/proc/self/environ`
+    を読む (Linux 前提)。`HOME`/`PATH` は pytest プロセス自身に必ず存在する
+    ため実環境で検証できる。"""
+    from agentic_fx.service import _read_proc_self_environ_names
+
+    names = _read_proc_self_environ_names()
+    assert "PATH" in names
+
+
+def test_check_codex_subscription_expiry_rejects_when_expired(tmp_path):
+    """④ (設計書 §1.4、裁定 R4): `chatgpt_subscription_active_until` を
+    過ぎていれば起動拒否 (ERROR)。"""
+    from agentic_fx.service import _check_codex_subscription_expiry
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps(
+        {"chatgpt_subscription_active_until": "2020-01-01T00:00:00+00:00"}))
+    with pytest.raises(RuntimeError, match="expired"):
+        _check_codex_subscription_expiry(
+            str(auth), clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+
+def test_check_codex_subscription_expiry_warns_within_7_days(tmp_path, caplog):
+    """④ の境界: 期限まで 7 日以内なら WARNING のみ (起動は継続)。"""
+    import logging as _logging
+
+    from agentic_fx.service import _check_codex_subscription_expiry
+
+    active_until = datetime(2026, 1, 5, tzinfo=timezone.utc)
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps(
+        {"chatgpt_subscription_active_until": active_until.isoformat()}))
+    with caplog.at_level(_logging.WARNING, logger="agentic_fx.service"):
+        _check_codex_subscription_expiry(
+            str(auth), clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert any("expires soon" in r.message for r in caplog.records)
+
+
+def test_check_codex_subscription_expiry_passes_when_far_in_future(tmp_path, caplog):
+    """④ の裏: 期限まで 7 日超なら WARNING も ERROR も出さない。"""
+    import logging as _logging
+
+    from agentic_fx.service import _check_codex_subscription_expiry
+
+    active_until = datetime(2027, 1, 1, tzinfo=timezone.utc)
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps(
+        {"chatgpt_subscription_active_until": active_until.isoformat()}))
+    with caplog.at_level(_logging.WARNING, logger="agentic_fx.service"):
+        _check_codex_subscription_expiry(
+            str(auth), clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert caplog.records == []
+
+
+def test_check_codex_subscription_expiry_missing_key_warns_and_does_not_raise(
+        tmp_path, caplog):
+    """④: キー欠落は WARNING のみ (fail closed にしない — 形式未実測、裁定 R4)。"""
+    import logging as _logging
+
+    from agentic_fx.service import _check_codex_subscription_expiry
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({}))
+    with caplog.at_level(_logging.WARNING, logger="agentic_fx.service"):
+        _check_codex_subscription_expiry(str(auth))  # 例外を出さない
+    assert any("chatgpt_subscription_active_until" in r.message for r in caplog.records)
 ```
 
-（実装時の注記: `build_app` の既存シグネチャ・fixture ヘルパ (`_settings_with_*`) は本ファイル冒頭の他テストの規約に厳密に合わせて実装者が組み立てること — 上記は検査点の網羅リストであり、既存 `test_service_app.py` の呼び出し形と衝突する場合は既存形を正とする。）
+`tests/test_service_app.py` の import 節に `json` (未 import なら追加) と `NOW`
+(既存モジュール定数、`datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)`) を使う。
+`caplog` は pytest 標準 fixture。
 
 - [ ] **Step 20: red を確認**
 
 ```bash
-uv run pytest tests/test_service_app.py -v -k "runner_bin or codex_node_wrapper or version_check or credentials_file or llama_swap or secret_pattern or improve_backend_is_local"
+uv run pytest tests/test_service_app.py -v -k "runner_bin_not_resolvable or trade_claude_bin_not_resolvable or codex_node_wrapper or version_check_fails or credentials_file_missing or llama_swap or secret_pattern or improve_backend_is_local or check_service_initial_env or read_proc_self_environ or check_codex_subscription_expiry"
 ```
 
-期待失敗: 全件 `Failed: DID NOT RAISE <class 'RuntimeError'>` (起動時検査が未実装のため `build_app` が例外を出さず通ってしまう)。
+期待失敗: `build_app`/`_check_service_initial_env_has_no_secrets`/`_read_proc_self_environ_names`/`_check_codex_subscription_expiry` のいずれも起動時検査が未実装のため `RuntimeError`/`ImportError`/`AttributeError` で red。
 
 - [ ] **Step 21: 最小実装**
 
+<!-- precheck 2026-08-22: T1-B1/B2/B13 -->
 `src/agentic_fx/service.py:136` (`_check_llama_swap` の隣) に以下を追加する:
 
 ```python
@@ -2285,8 +2628,35 @@ def _check_credentials_file(path_str: str, *, label: str) -> None:
             "(run the CLI's login flow first)")
 
 
-def _check_service_initial_env_has_no_secrets() -> None:
-    leaked = [k for k in os.environ
+def _read_proc_self_environ_names() -> set[str]:
+    """`/proc/self/environ` (このプロセスの exec 時点の初期 env) のキー名
+    集合を返す (設計書 §1.4-⑤: `python-dotenv` の `load_dotenv()` は
+    `os.environ` に setenv するだけで `/proc/self/environ` には現れない —
+    B1 の再発防止。`monkeypatch.setenv`/`os.environ[...] = ...` もこの
+    ブロックを書き換えない、Linux 前提)。"""
+    with open("/proc/self/environ", "rb") as f:
+        raw = f.read()
+    names: set[str] = set()
+    for chunk in raw.split(b"\0"):
+        if not chunk:
+            continue
+        key, _sep, _value = chunk.partition(b"=")
+        names.add(key.decode("utf-8", errors="replace"))
+    return names
+
+
+def _check_service_initial_env_has_no_secrets(
+        settings, *,
+        read_initial_env_names=_read_proc_self_environ_names) -> None:
+    """検査⑤ (設計書 §1.4、裁定 R3): サービス自身の**初期 env**
+    (`/proc/self/environ` 相当。既定 seam = `_read_proc_self_environ_names`) に
+    秘密名パターンがあれば起動拒否する。`.env`→`load_dotenv()` で
+    `os.environ` にのみ現れるキーは対象外 (設計が明示的に許容している —
+    exported shell env にだけ秘密を置くな、という検査)。`settings` は
+    呼び出し規約を他の `_check_*` 検査と揃えるために受け取るのみで、
+    現状は未使用。"""
+    names = read_initial_env_names()
+    leaked = [k for k in names
               if any(pat in k for pat in _SECRET_ENV_PATTERNS)]
     if leaked:
         raise RuntimeError(
@@ -2296,10 +2666,63 @@ def _check_service_initial_env_has_no_secrets() -> None:
             "(R10). Put secrets in .env, not exported shell env.")
 
 
-def _check_improve_backend(settings) -> None:
-    """improve backend の起動時検査 ①〜⑤ (設計書 §1.4)。backend=local
-    の環境では一切走らない。"""
-    backend = settings.runner.improve.backend
+def _check_codex_subscription_expiry(auth_file: str, *, clock=None) -> None:
+    """検査④ (設計書 §1.4、裁定 R4): codex+chatgpt の `auth_file` 内
+    `chatgpt_subscription_active_until` を読み、期限切れなら起動拒否
+    (ERROR)、7 日以内なら WARNING ログのみで起動は継続する。キー欠落・
+    読み取り不能・形式不正は WARNING に留める (fail closed にしない —
+    `auth.json` の形式は実測できていないため、裁定 R4 に従い誤検出で
+    起動不能にしない)。`clock` はテスト注入用 (既定 `datetime.now(UTC)`)。"""
+    import json as _json
+
+    _logger = logging.getLogger("agentic_fx.service")
+    now = (clock or (lambda: datetime.now(timezone.utc)))()
+    path = Path(auth_file).expanduser()
+    try:
+        raw = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        _logger.warning(
+            "codex auth.json (%s) を読めない: %s — chatgpt_subscription_active_until "
+            "を検査できない (fail closed にしない、裁定 R4)", path, e)
+        return
+    value = raw.get("chatgpt_subscription_active_until") if isinstance(raw, dict) else None
+    if value is None:
+        _logger.warning(
+            "codex auth.json (%s) に chatgpt_subscription_active_until が無い "
+            "— サブスク期限を検査できない (形式未実測、裁定 R4)", path)
+        return
+    try:
+        active_until = datetime.fromisoformat(value)
+        if active_until.tzinfo is None:
+            active_until = active_until.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError) as e:
+        _logger.warning(
+            "chatgpt_subscription_active_until の形式が不正: %r (%s)", value, e)
+        return
+    if active_until <= now:
+        raise RuntimeError(
+            f"codex chatgpt subscription expired at {active_until.isoformat()} "
+            "— renew before starting improve+codex")
+    if active_until - now <= timedelta(days=7):
+        _logger.warning(
+            "codex chatgpt subscription expires soon: %s", active_until.isoformat())
+
+
+def _check_cli_backend(settings, *, which: str) -> None:
+    """<!-- precheck 2026-08-22: T1-M14 --> CLI backend 起動時検査 ①②③⑤
+    (設計書 §1.4)。`which` は `"trade"` か `"improve"` — `getattr(settings.runner,
+    which)` で対象の `RunnerChoice` を選ぶ。backend=local の環境では一切
+    走らない。④ (codex サブスク期限) は improve+codex+chatgpt のみ発火する
+    (trade+codex は `RunnerSettings._trade_backend_not_codex` が `Settings`
+    構築時点で拒否するため、trade 側でこの分岐に到達しない)。
+
+    **Minor 14 の再発防止**: 旧実装 (`_check_improve_backend`) は
+    `settings.runner.improve` しか見なかったため、`runner.trade.backend=claude`
+    構成では bin 解決も `--version` も認証ファイルもどれも未検査のまま
+    Mission 実行時に初めて失敗していた (config は `trade.backend: claude`
+    を許容する — trade+codex のみ拒否)。"""
+    choice = getattr(settings.runner, which)
+    backend = choice.backend
     if backend == "local":
         return
     if backend == "claude":
@@ -2307,13 +2730,14 @@ def _check_improve_backend(settings) -> None:
         _check_cli_version(bin_path)
         _check_credentials_file(settings.runner.claude.credentials_file,
                                 label="claude")
-        _check_service_initial_env_has_no_secrets()
+        _check_service_initial_env_has_no_secrets(settings)
     elif backend == "codex":
         bin_path = _resolve_cli_bin(settings.runner.codex.bin, require_elf=True)
         _check_cli_version(bin_path)
         if settings.runner.codex.provider == "chatgpt":
             _check_credentials_file(settings.runner.codex.auth_file,
                                     label="codex")
+            _check_codex_subscription_expiry(settings.runner.codex.auth_file)
         elif settings.runner.codex.provider == "llama_swap":
             if not settings.improve.llama_swap_verified:
                 raise RuntimeError(
@@ -2322,7 +2746,16 @@ def _check_improve_backend(settings) -> None:
                     "`afx improve verify-backend` passes — Task 13)")
 ```
 
-`build_app` (`service.py:443-` 付近、`_check_llama_swap(settings)` の呼び出し行 `:249` と同じ起動時検査ブロック) に `_check_improve_backend(settings)` の呼び出しを追加する。呼び出し位置は実装時に `_check_llama_swap` の直後 (既存の起動時検査の並びに揃える)。
+<!-- precheck 2026-08-22: T1-B2/M14 --> `build_app` (`service.py:443-`) に
+`_check_cli_backend(settings, which="trade")` と
+`_check_cli_backend(settings, which="improve")` の 2 呼び出しを追加する
+(順序は trade→improve のどちらでもよい — 独立した検査)。挿入位置は
+**`service.py:607` の `_validate_startup(settings)` 呼び出しの直後**
+(`_assert_tools_registered(registry, _TRADE_TOOLS)` の前でも後でもよい —
+どちらも fail-closed な起動時検査ブロックの一部)。**`_check_llama_swap`
+の隣ではない** — `_check_llama_swap` の唯一の呼び出しは `run_init`
+(`service.py:249`) の中にあり、`build_app` は経由しない (B2: 旧記述は
+`run_init` にしか入らない誤った指示だった)。
 
 - [ ] **Step 22: green を確認**
 
@@ -2344,17 +2777,34 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M4 | `_check_service_initial_env_has_no_secrets` 呼び出しを削除する | `test_build_app_rejects_when_service_initial_env_has_secret_pattern` |
 | M5 | `if backend == "local": return` の早期 return を削除する | `test_build_app_does_not_check_secret_env_when_improve_backend_is_local` |
 | M6 | `llama_swap_verified` の分岐条件を反転する (`not` を外す) | 実装時に `test_build_app_rejects_llama_swap_when_not_verified` を追加して殺す |
+| M7 | <!-- precheck 2026-08-22: T1-B1 --> `_check_service_initial_env_has_no_secrets` 内の `leaked` 判定 (`any(pat in k ...)`) を削除する | `test_check_service_initial_env_has_no_secrets_rejects_leaked_key_via_seam` |
+| M8 | `_check_service_initial_env_has_no_secrets` の既定 seam を `_read_proc_self_environ_names` から `lambda: set(os.environ)` 等へ差し替える | `test_check_service_initial_env_has_no_secrets_default_seam_is_proc_self_environ` |
+| M9 | `_read_proc_self_environ_names` の `\0` 分割・`=` partition を壊す (キー名を誤抽出する) | `test_read_proc_self_environ_names_reads_real_proc_self_environ` |
+| M10 | <!-- precheck 2026-08-22: T1-B13 --> `_check_codex_subscription_expiry` の `active_until <= now` (ERROR) 判定を削除する | `test_check_codex_subscription_expiry_rejects_when_expired` |
+| M11 | `timedelta(days=7)` の WARNING 判定を削除する | `test_check_codex_subscription_expiry_warns_within_7_days` (WARNING が出なくなる) |
+| M12 | キー欠落時に WARNING でなく無条件 `RuntimeError` にする (fail closed 化、裁定 R4 違反) | `test_check_codex_subscription_expiry_missing_key_warns_and_does_not_raise` |
+| M13 | `_check_cli_backend` の codex+chatgpt 分岐から `_check_codex_subscription_expiry` 呼び出しを削除する | 実装時に `test_build_app_wires_codex_subscription_expiry_check` (M4 と同じ monkeypatch 全体差し替えパターン) を追加して殺す |
+| M14 | <!-- precheck 2026-08-22: T1-M14 --> `build_app` の `_check_cli_backend(settings, which="trade")` 呼び出しを削除する (improve 側のみ検査) | 実装時に `test_build_app_rejects_when_trade_claude_bin_not_resolvable` を追加して殺す (`runner.trade.backend="claude"`・`runner.claude.bin` を未解決値に上書きし `build_app` が `RuntimeError` を出すことを見る — `_root_with_settings` で `runner={"trade": {"backend": "claude", "model": "m"}, "claude": {"bin": "afx-nonexistent"}}` を上書きし `PATH` を monkeypatch) |
+| M15 | `_check_cli_backend` の `getattr(settings.runner, which)` を常に `settings.runner.improve` に固定する (`which` を無視) | M14 と同じ新規テストが殺す (trade 側検査が improve の判定を見てしまい `backend=local` の improve 既定では早期 return して trade の未解決 bin を見逃す) |
 
 - [ ] **Step 24: コミット**
 
 ```bash
 git add src/agentic_fx/service.py tests/test_service_app.py
 git commit -m "$(cat <<'EOF'
-feat: improve backend 起動時検査 (bin 解決/ELF/--version/認証/秘密env) を追加 (プラン10 Task1)
+feat: CLI backend 起動時検査 (bin 解決/ELF/--version/認証/codexサブスク期限/秘密env) を trade/improve 双方に追加 (プラン10 Task1)
 
-_check_llama_swap の隣に fail closed な検査を追加。backend=local では
-一切走らない。llama_swap_verified=false のうちは provider=llama_swap
-を拒否 (実測合格まで通常入口を塞ぐ、設計書 §1.1-2/§1.4)。
+build_app 内 _validate_startup の直後に fail closed な検査を追加
+(_check_llama_swap は run_init 専用であり build_app は経由しないため
+隣には置かない — B2)。_check_cli_backend(settings, which="trade"|"improve")
+に一般化し、runner.trade.backend=claude 構成でも検査する (旧実装は
+improve しか見ておらず trade+claude が無検査だった — Minor 14)。
+backend=local では一切走らない。llama_swap_verified=false のうちは
+provider=llama_swap を拒否 (実測合格まで通常入口を塞ぐ、設計書
+§1.1-2/§1.4)。検査⑤は /proc/self/environ 由来の名前集合を既定 seam
+として読む (os.environ ベースだと .env 運用が常に起動拒否になる — B1)。
+検査④ (codex chatgpt サブスク期限) を新設し 7 日以内 WARNING / 経過
+ERROR とする (裁定 R4)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -2539,50 +2989,95 @@ EOF
 
 ### Step 31: `WorkerRunner` 親側拡張 (§8.1-5: auth/protocol sequence) — 失敗するテストを書く
 
+<!-- precheck 2026-08-22: T1-B7/B8/B11 -->
+**現物確認 (着手前検証で裏取り済み、Minor 5)**: 本ファイルの既存ヘルパは
+`SETTINGS` (モジュール定数、`config/settings.yaml.example` から
+`load_settings` 済み)・`_root(tmp_path)` (`tmp_path/root/config/settings.yaml`
++ `data/agentic.db` を用意して `root` パスを返す)・`_rag(tmp_path)`・
+`_mission()`・`FixedClock` (`agentic_fx.core.contracts` から import 済み) —
+`_settings()`/`_clock()` という名前のヘルパは**存在しない**。以下は現物の
+ヘルパ名に合わせて書き直した逐語である。**B7 の再発防止**: `workdir` は
+`with tempfile.TemporaryDirectory(...)` の context を抜けると消えるため、
+`runner.run(...)` の**後**に `Path(captured["cwd"])` を stat/`is_dir()` すると
+`FileNotFoundError`/`False` になる — 全テストで観測を `spy` (Popen 呼び出し
+時点、workdir がまだ存在する瞬間) の**内側**に移す。
+
 `tests/runners/test_worker_runner.py` の末尾に追記する:
 
 ```python
-def test_worker_runner_creates_workdir_with_mode_0700(monkeypatch, tmp_path):
-    """親側 protocol sequence 手順 1: workdir を 0700 で作る。"""
+def _worker_settings(*, claude_backend: bool = False,
+                     credentials_file: str | None = None):
+    """`SETTINGS` を deep copy し improve backend / claude credentials_file を
+    上書きするテスト専用ヘルパ (Minor 5: プラン旧稿の `_settings(...)` は
+    非実在だったため新規に書き起こす)。"""
+    runner_update: dict = {}
+    if claude_backend:
+        runner_update["improve"] = SETTINGS.runner.improve.model_copy(
+            update={"backend": "claude"})
+    if credentials_file is not None:
+        runner_update["claude"] = SETTINGS.runner.claude.model_copy(
+            update={"credentials_file": credentials_file})
+    if not runner_update:
+        return SETTINGS
+    return SETTINGS.model_copy(
+        update={"runner": SETTINGS.runner.model_copy(update=runner_update)})
+
+
+_READY_CHILD_SCRIPT = (
+    "import sys, json\n"
+    "sys.stdin.readline()\n"
+    "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
+    "sys.stdout.flush()\n"
+)
+
+
+def test_worker_runner_home_tmp_cfg_subdirs_are_mode_0700(monkeypatch, tmp_path):
+    """親側 protocol sequence 手順 1: `home`/`tmp`/`cfg` を 0700 で作る。
+
+    **B8 の再発防止**: workdir 自体 (`tempfile.TemporaryDirectory` 由来) は
+    Python が既定で 0700 を作るため、workdir 自身の mode を見る旧テストは
+    `workdir.chmod(0o700)` を削除しても恒真 (green のまま) だった。観測点を
+    「本 task が明示 `mkdir(mode=0o700)` で作る」 `home`/`tmp`/`cfg` の
+    3 subdir に移す。"""
     import stat
-    captured = {}
+    captured: dict = {}
     orig_popen = subprocess.Popen
 
     def spy(*a, **kw):
-        captured["cwd"] = kw["cwd"]
-        p = orig_popen([sys.executable, "-c",
-                        "import sys, json\n"
-                        "sys.stdin.readline()\n"
-                        "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
-                        "sys.stdout.flush()\n"], **{k: v for k, v in kw.items()})
-        return p
+        cwd = Path(kw["cwd"])
+        captured["modes"] = {
+            name: stat.S_IMODE(os.stat(cwd / name).st_mode)
+            for name in ("home", "tmp", "cfg")}
+        return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
+
     monkeypatch.setattr(subprocess, "Popen", spy)
-    runner = WorkerRunner(root=tmp_path, settings=_settings(), clock=_clock(),
-                          rag=_rag(), worker_profile="improve")
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve")
     runner.run(_mission())
-    mode = stat.S_IMODE(os.stat(captured["cwd"]).st_mode)
-    assert mode == 0o700
+    assert captured["modes"] == {"home": 0o700, "tmp": 0o700, "cfg": 0o700}
 
 
 def test_worker_runner_creates_home_tmp_cfg_subdirs(monkeypatch, tmp_path):
-    """親側 protocol sequence 手順 1: workdir 直下に home/tmp/cfg を作る。"""
-    captured = {}
+    """親側 protocol sequence 手順 1: workdir 直下に home/tmp/cfg を作る
+    (存在の検査 — mode の検査は上記と分離、B7 の再発防止で spy 内側観測)。"""
+    captured: dict = {}
     orig_popen = subprocess.Popen
 
     def spy(*a, **kw):
-        captured["cwd"] = kw["cwd"]
-        return orig_popen([sys.executable, "-c",
-                           "import sys, json\n"
-                           "sys.stdin.readline()\n"
-                           "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"], **kw)
+        cwd = Path(kw["cwd"])
+        captured["is_dir"] = {name: (cwd / name).is_dir()
+                              for name in ("home", "tmp", "cfg")}
+        return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
+
     monkeypatch.setattr(subprocess, "Popen", spy)
-    runner = WorkerRunner(root=tmp_path, settings=_settings(claude_backend=True),
-                          clock=_clock(), rag=_rag(), worker_profile="improve")
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root,
+                          settings=_worker_settings(claude_backend=True),
+                          clock=FixedClock(NOW), rag=_rag(tmp_path),
+                          worker_profile="improve")
     runner.run(_mission())
-    workdir = Path(captured["cwd"])
-    assert (workdir / "home").is_dir()
-    assert (workdir / "tmp").is_dir()
-    assert (workdir / "cfg").is_dir()
+    assert captured["is_dir"] == {"home": True, "tmp": True, "cfg": True}
 
 
 def test_worker_runner_copies_claude_credentials_before_spawn(monkeypatch, tmp_path):
@@ -2592,21 +3087,20 @@ def test_worker_runner_copies_claude_credentials_before_spawn(monkeypatch, tmp_p
     creds.parent.mkdir()
     creds.write_text('{"token":"x"}')
     creds.chmod(0o600)
-    captured = {}
+    captured: dict = {}
     orig_popen = subprocess.Popen
 
     def spy(*a, **kw):
         cfg_dir = Path(kw["cwd"]) / "cfg"
         captured["cfg_has_creds"] = (cfg_dir / ".credentials.json").is_file()
-        return orig_popen([sys.executable, "-c",
-                           "import sys, json\n"
-                           "sys.stdin.readline()\n"
-                           "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"], **kw)
+        return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
+
     monkeypatch.setattr(subprocess, "Popen", spy)
+    root = _root(tmp_path)
     runner = WorkerRunner(
-        root=tmp_path,
-        settings=_settings(claude_backend=True, credentials_file=str(creds)),
-        clock=_clock(), rag=_rag(), worker_profile="improve")
+        root=root,
+        settings=_worker_settings(claude_backend=True, credentials_file=str(creds)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
     runner.run(_mission())
     assert captured["cfg_has_creds"] is True
 
@@ -2618,10 +3112,11 @@ def test_worker_runner_rejects_credentials_file_that_is_a_symlink(tmp_path):
     real.chmod(0o600)
     link = tmp_path / "creds-link.json"
     link.symlink_to(real)
+    root = _root(tmp_path)
     runner = WorkerRunner(
-        root=tmp_path,
-        settings=_settings(claude_backend=True, credentials_file=str(link)),
-        clock=_clock(), rag=_rag(), worker_profile="improve")
+        root=root,
+        settings=_worker_settings(claude_backend=True, credentials_file=str(link)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
     result = runner.run(_mission())
     assert result.status == "failed"
 
@@ -2631,10 +3126,11 @@ def test_worker_runner_rejects_credentials_file_readable_by_group(tmp_path):
     creds = tmp_path / "creds.json"
     creds.write_text('{"token":"x"}')
     creds.chmod(0o644)
+    root = _root(tmp_path)
     runner = WorkerRunner(
-        root=tmp_path,
-        settings=_settings(claude_backend=True, credentials_file=str(creds)),
-        clock=_clock(), rag=_rag(), worker_profile="improve")
+        root=root,
+        settings=_worker_settings(claude_backend=True, credentials_file=str(creds)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
     result = runner.run(_mission())
     assert result.status == "failed"
 
@@ -2644,10 +3140,11 @@ def test_worker_runner_rejects_oversized_credentials_file(tmp_path):
     creds = tmp_path / "creds.json"
     creds.write_bytes(b"x" * (65 * 1024))
     creds.chmod(0o600)
+    root = _root(tmp_path)
     runner = WorkerRunner(
-        root=tmp_path,
-        settings=_settings(claude_backend=True, credentials_file=str(creds)),
-        clock=_clock(), rag=_rag(), worker_profile="improve")
+        root=root,
+        settings=_worker_settings(claude_backend=True, credentials_file=str(creds)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
     result = runner.run(_mission())
     assert result.status == "failed"
 
@@ -2666,20 +3163,20 @@ def test_trade_worker_receives_data_provider_keys_via_handshake(monkeypatch, tmp
     """R10-①: trade worker は handshake フレームの `credentials` フィールド
     (stdin) で資格情報を受け取る。"""
     monkeypatch.setenv("TWELVEDATA_API_KEY", "secret-td")
-    captured_handshake = {}
     orig_popen = subprocess.Popen
 
     def spy(*a, **kw):
-        p = orig_popen([sys.executable, "-c",
-                        "import sys, json\n"
-                        "line = sys.stdin.readline()\n"
-                        "open('%s', 'w').write(line)\n"
-                        "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
-                        % str(tmp_path / 'handshake.json')], **kw)
-        return p
+        return orig_popen([sys.executable, "-c",
+                           "import sys, json\n"
+                           "line = sys.stdin.readline()\n"
+                           "open('%s', 'w').write(line)\n"
+                           "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
+                           % str(tmp_path / 'handshake.json')], **kw)
+
     monkeypatch.setattr(subprocess, "Popen", spy)
-    runner = WorkerRunner(root=tmp_path, settings=_settings(), clock=_clock(),
-                          rag=_rag(), worker_profile="trade")
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="trade")
     runner.run(_mission())
     handshake = json.loads((tmp_path / "handshake.json").read_text())
     assert handshake["credentials"]["TWELVEDATA_API_KEY"] == "secret-td"
@@ -2690,7 +3187,6 @@ def test_worker_runner_run_context_adds_three_handshake_keys(monkeypatch, tmp_pa
     duck-typing で足りる最小オブジェクトを使う) が非 None のとき、
     `mission_id`/`staging_dir`/`source_snapshot_dir` の 3 キーが
     handshake フレームへ載る。"""
-    captured_handshake = {}
     orig_popen = subprocess.Popen
 
     def spy(*a, **kw):
@@ -2700,6 +3196,7 @@ def test_worker_runner_run_context_adds_three_handshake_keys(monkeypatch, tmp_pa
                            "open('%s', 'w').write(line)\n"
                            "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
                            % str(tmp_path / 'handshake.json')], **kw)
+
     monkeypatch.setattr(subprocess, "Popen", spy)
 
     class _FakeRunContext:
@@ -2707,8 +3204,9 @@ def test_worker_runner_run_context_adds_three_handshake_keys(monkeypatch, tmp_pa
         staging_dir = tmp_path / "staging"
         source_snapshot_dir = tmp_path / "source"
 
-    runner = WorkerRunner(root=tmp_path, settings=_settings(), clock=_clock(),
-                          rag=_rag(), worker_profile="improve",
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
                           run_context=_FakeRunContext())
     runner.run(_mission())
     handshake = json.loads((tmp_path / "handshake.json").read_text())
@@ -2721,7 +3219,6 @@ def test_worker_runner_run_context_none_omits_three_handshake_keys(
         monkeypatch, tmp_path):
     """`run_context=None` (既定、trade profile 等) のとき、3 キーは
     handshake フレームに含まれない (未知キーの汚染防止)。"""
-    captured_handshake = {}
     orig_popen = subprocess.Popen
 
     def spy(*a, **kw):
@@ -2731,9 +3228,11 @@ def test_worker_runner_run_context_none_omits_three_handshake_keys(
                            "open('%s', 'w').write(line)\n"
                            "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
                            % str(tmp_path / 'handshake.json')], **kw)
+
     monkeypatch.setattr(subprocess, "Popen", spy)
-    runner = WorkerRunner(root=tmp_path, settings=_settings(), clock=_clock(),
-                          rag=_rag(), worker_profile="trade")
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="trade")
     runner.run(_mission())
     handshake = json.loads((tmp_path / "handshake.json").read_text())
     assert "mission_id" not in handshake
@@ -2741,11 +3240,10 @@ def test_worker_runner_run_context_none_omits_three_handshake_keys(
     assert "source_snapshot_dir" not in handshake
 ```
 
-**注**: 上記は `tests/runners/test_worker_runner.py` の既存 fixture 規約
-(`_settings()`/`_clock()`/`_rag()`/`_mission()` 等のヘルパ名) を仮定した
-形。実装者は既存ファイルの現物ヘルパを読み、シグネチャを合わせること
-(fixture 名の食い違いは「執筆時の申し送り」に該当しない — 通常のテスト
-実装作業)。
+`NOW` は本ファイル冒頭に `NOW = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)`
+のようなモジュール定数として追加する (既存の各テストが個別に
+`FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))` を書いている箇所は
+そのままでよい — 新規 Step 31 テストのみこの定数を使う)。
 
 **`run_context=` の所有者確定 (レビュー1周目 C3)**: `WorkerRunner.__init__` の
 公開シグネチャへの `run_context: object | None = None` 追加と、handshake フレームへの
@@ -2758,14 +3256,26 @@ Task 5 の担当 (束 B 申し送り 5 — レビュー1周目 C3 で「Task 1 �
 - [ ] **Step 32: red を確認**
 
 ```bash
-uv run pytest tests/runners/test_worker_runner.py -v -k "workdir_with_mode or home_tmp_cfg or copies_claude_credentials or rejects_credentials or no_longer_receives or receives_data_provider_keys_via_handshake or run_context"
+uv run pytest tests/runners/test_worker_runner.py -v -k "home_tmp_cfg or copies_claude_credentials or rejects_credentials or no_longer_receives or receives_data_provider_keys_via_handshake or run_context"
 ```
 
-期待失敗: workdir が `tempfile.TemporaryDirectory` 既定 mode (0700 のはずだが cfg/home/tmp が存在しない) で `AssertionError`。`test_trade_worker_no_longer_receives_data_provider_keys_via_env` は現状 `_mission_worker_env` が `TWELVEDATA_API_KEY` を env に入れるため red。`test_worker_runner_run_context_adds_three_handshake_keys` は現状 `WorkerRunner.__init__` に `run_context` キーワードが無いため `TypeError` で red。
+期待失敗: `home`/`tmp`/`cfg` が存在しない (`FileNotFoundError`/`AssertionError`)。`test_trade_worker_no_longer_receives_data_provider_keys_via_env` は現状 `_mission_worker_env` が `TWELVEDATA_API_KEY` を env に入れるため red。`test_worker_runner_run_context_adds_three_handshake_keys` は現状 `WorkerRunner.__init__` に `run_context` キーワードが無いため `TypeError` で red。
 
 - [ ] **Step 33: 最小実装**
 
-`src/agentic_fx/runners/worker_runner.py:39-90` を以下の方針で書き換える (該当箇所を全文置き換え):
+<!-- precheck 2026-08-22: T1-B11 -->
+**B11 の再発防止**: 置換範囲を 3 つに分割する。`worker_runner.py:39-62`
+(モジュール関数 `_DATA_PROVIDER_ENV_ALLOWLIST`/`_mission_worker_env` のみ)・
+`:66-76` (`WorkerRunner.__init__` のみ)・`:82-91` (`WorkerRunner.run` のみ)。
+**`:78-80` の `WorkerRunner.close()` (LocalRunner との対称性のための
+no-op 実装) は変更しない** — 旧稿の「39-90 全文置換」指示は `close()` を
+巻き込んで消していた (実装者が逐語転写すると `service.py:308` の
+`hasattr(self.runner, "close")` ガードにより静かに no-op 化して気付かない)。
+
+**Minor 3**: モジュール公開関数 `stat_is_regular` は private 命名
+(`_stat_is_regular`) に変更する (`worker_runner.py` の public API を汚さない)。
+
+`src/agentic_fx/runners/worker_runner.py:39-62` を以下に置き換える:
 
 ```python
 _DATA_PROVIDER_ENV_ALLOWLIST = ("TWELVEDATA_API_KEY", "MT5_BRIDGE_API_KEY")
@@ -2793,7 +3303,7 @@ def _copy_credentials_file(src_path: str, dest: Path) -> None:
         raise _CredentialsCopyError(f"cannot open credentials file: {e}") from e
     try:
         st = os.fstat(fd)
-        if not stat_is_regular(st):
+        if not _stat_is_regular(st):
             raise _CredentialsCopyError("credentials file is not a regular file")
         if st.st_uid != os.getuid():
             raise _CredentialsCopyError("credentials file is not owned by this uid")
@@ -2809,13 +3319,14 @@ def _copy_credentials_file(src_path: str, dest: Path) -> None:
     dest.chmod(0o600)
 
 
-def stat_is_regular(st: os.stat_result) -> bool:
+def _stat_is_regular(st: os.stat_result) -> bool:
     import stat as _stat
     return _stat.S_ISREG(st.st_mode)
 ```
 
 **`WorkerRunner.__init__` の公開シグネチャに `run_context` を追加する** (レビュー1周目 C3。
-`worker_runner.py:67-73` 該当箇所を全文置き換え):
+`worker_runner.py:66-76` 該当箇所を全文置き換え。`close()`(`:78-80`) はこの直後に
+そのまま残る — 触らない):
 
 ```python
 class WorkerRunner(AgentRunner):
@@ -2838,15 +3349,19 @@ class WorkerRunner(AgentRunner):
 循環 import を招かないため — Task 10 の `ImproveRunContext` は duck-typing で
 `mission_id`/`staging_dir`/`source_snapshot_dir` 属性だけを読む)。
 
-`WorkerRunner.run` を以下へ書き換える (`tempfile.TemporaryDirectory` の代わりに
-明示 mkdir + finally cleanup で 0700 を保証する):
+`WorkerRunner.run` (`:82-91`) を以下へ書き換える。**B8 の再発防止**:
+`tempfile.TemporaryDirectory` はベース dir を CPython の実装で既に 0700 で
+作る (`workdir.chmod(0o700)` を追加で呼んでも検証しようがない恒真になる
+— 旧稿はこの冗長な呼び出しを残していた)。ベース dir 自体への明示 chmod は
+書かず、代わりに `home`/`tmp`/`cfg` の 3 subdir を**本 task が新設する
+明示 `mkdir(mode=0o700)`** で作る — mutation はここで初めて意味を持つ
+(Step 35 参照):
 
 ```python
     def run(self, mission: Mission) -> MissionResult:
         w = self._settings.worker
         with tempfile.TemporaryDirectory(prefix="afx-mission-") as base:
             workdir = Path(base)
-            workdir.chmod(0o700)
             (workdir / "home").mkdir(mode=0o700)
             (workdir / "tmp").mkdir(mode=0o700)
             (workdir / "cfg").mkdir(mode=0o700)
@@ -2868,7 +3383,7 @@ class WorkerRunner(AgentRunner):
                         return MissionResult(
                             "failed", None, [],
                             reason="claude credentials copy failed "
-                                   "(见 起動時検査/認証原本の要件)")
+                                   "(参照: 起動時検査/認証原本の要件)")
                 elif (choice is not None and choice.backend == "codex"
                       and self._settings.runner.codex.provider == "chatgpt"):
                     try:
@@ -2913,6 +3428,64 @@ class WorkerRunner(AgentRunner):
 既存 6 キー `db_path`/`plugins_dir`/`settings`/`mission`/`worker_profile`/`now` は
 不変。`run_context_fields` が空 dict なら handshake は現状どおり 3 キー増えない)。
 
+- [ ] **Step 33a: 既存テストの改訂 (B4/B5 — Step 33 の実装で確実に red になる 2 本)**
+
+<!-- precheck 2026-08-22: T1-B4/B5 -->
+**B5 — `tests/runners/test_worker_runner.py:79-92`
+(`test_mission_worker_env_includes_data_provider_credentials_for_trade`)**:
+Step 33 で `_mission_worker_env` が `return _build_env()` のみになる
+(R10-①、trade 資格情報も env では渡さない) ため、この既存テストは
+`env["TWELVEDATA_API_KEY"] == "td-secret"` を期待したまま確実に red になる。
+このテストを**削除**し、直後の `test_mission_worker_env_excludes_credentials_for_improve`
+(`:95`) の docstring に一文足す (検査目的「improve は資格情報を渡さない」は
+維持したまま、「trade も渡さなくなった」という設計変更の経緯を残す):
+
+```python
+def test_mission_worker_env_excludes_credentials_for_improve(monkeypatch):
+    """improve profile では資格情報も渡さない (裁定書 F-9 — 遮断維持)。
+
+    IM-3/P8-03 対応で trade profile にのみ env allowlist していたが、
+    プラン 10 (R10-①) で trade も env 経由をやめ handshake の
+    `credentials` フィールドへ移した — 現在はどの profile も
+    `_mission_worker_env` からは資格情報を受け取らない (旧
+    `test_mission_worker_env_includes_data_provider_credentials_for_trade`
+    は本変更で削除。trade 側の新しい契約は
+    `test_trade_worker_no_longer_receives_data_provider_keys_via_env` /
+    `test_trade_worker_receives_data_provider_keys_via_handshake` が持つ)。"""
+    from agentic_fx.runners.worker_runner import _mission_worker_env
+
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "td-secret")
+    monkeypatch.setenv("MT5_BRIDGE_API_KEY", "mt5-secret")
+
+    env = _mission_worker_env("improve")
+
+    assert "TWELVEDATA_API_KEY" not in env
+    assert "MT5_BRIDGE_API_KEY" not in env
+```
+
+`test_mission_worker_env_omits_unset_credentials` (`:108`) は無変更のまま
+green (「未設定なら含めない」という検査目的は trade でも improve でも
+変わらず成立する)。
+
+**B4 — `tests/runners/test_worker_runner.py:1555-1610`
+(`test_child_cwd_is_a_dedicated_dir_outside_the_repository`)**: Step 33 で
+`home`/`tmp`/`cfg` を Popen 呼び出し**前**に mkdir するため、末尾の
+`assert captured["cwd_entries"] == []` は `["cfg", "home", "tmp"]` を観測して
+red になる。検査目的 (「子がリポジトリ root を継承しない・`data/` を含まない」)
+は維持したまま、期待値を本 task が作る 3 subdir のみに更新する:
+
+```python
+    assert captured["cwd_entries"] == ["cfg", "home", "tmp"], (
+        f"子の workdir は {{'cfg', 'home', 'tmp'}} 以外を含んではならない "
+        f"(実際: {captured['cwd_entries']})")
+```
+
+(直前のコメント「workdir は `tempfile.TemporaryDirectory` の context を
+抜けた時点で消えるので、『空であること』はここ (子の起動時点) で見る」は
+「`home`/`tmp`/`cfg` の 3 つ以外が無いことをここで見る」に更新する。
+`assert cwd != data_dir and cwd not in data_dir.parents` の直前アサートは
+無変更。)
+
 - [ ] **Step 34: green を確認**
 
 ```bash
@@ -2929,7 +3502,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 
 | # | 変異 | 殺すテスト |
 |---|---|---|
-| M1 | `workdir.chmod(0o700)` を削除する | `test_worker_runner_creates_workdir_with_mode_0700` |
+| M1 | <!-- precheck 2026-08-22: T1-B8 --> `home`/`tmp`/`cfg` のいずれかの `mkdir(mode=0o700)` から `mode=` を落とす (3 通り、各 1 変異) | `test_worker_runner_home_tmp_cfg_subdirs_are_mode_0700` (旧 `test_worker_runner_creates_workdir_with_mode_0700` は `tempfile.TemporaryDirectory` が既定で 0700 を作るため恒真だった — 観測点を明示 mkdir 側へ移した、B8) |
 | M2 | `home`/`tmp`/`cfg` のいずれかの mkdir を削除する (3 通り、各 1 変異) | `test_worker_runner_creates_home_tmp_cfg_subdirs` |
 | M3 | `_copy_credentials_file` の `O_NOFOLLOW` を外す | `test_worker_runner_rejects_credentials_file_that_is_a_symlink` |
 | M4 | `st.st_mode & 0o077` 検査を削除する | `test_worker_runner_rejects_credentials_file_readable_by_group` |
@@ -2953,6 +3526,366 @@ handshake の credentials フィールドへ移す (R10-①、どの子プロセ
 初期envにも秘密を置かない)。WorkerRunner.__init__ に run_context を
 追加し、非Noneのとき mission_id/staging_dir/source_snapshot_dirを
 handshakeへ載せる (レビュー1周目 C3、親側配線は Task 1 が所有)。
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+### Step 36a: `WorkerRunner` の `cli_started` pgid 回収 — 失敗するテストを書く (§7.1-2 の blocking 受入条件)
+
+<!-- precheck 2026-08-22: T1-B10 -->
+**現物確認**: `_run_with_child` の `reader_loop`(`worker_runner.py:119-` 付近) は
+`frame.get("type")` で `ready`/`event`/`tool_rpc`/`result` を分岐し、未知の
+`type` は `protocol_error` として扱う (`done_queue` に積んで reader を終了させる)。
+`finally:` 節 (`:257-` 付近) は `dispatch_queue.put(None)` → `self._ensure_dead(proc, w)`
+→ `reader.join(...)` の順。`_ensure_dead`/`_kill` は `os.killpg(proc.pid, ...)` を
+呼ぶが、これは **mission_worker 自身の pgid** (`proc.pid` — `start_new_session=True`
+のためプロセスグループリーダ) であり、mission_worker が内部で spawn する CLI
+(`CliRunner`、Task 2/3) は**別 `start_new_session=True`** で自分専用の pgid に
+置かれる (骨格 §1.1-3)。したがって `_ensure_dead` は CLI の pgid には届かない
+— worker が EOF/異常終了したときに CLI (と孫) が孤立して残る (§7.1-2 の
+blocking 受入条件が現状未実装、B10)。
+
+`tests/runners/test_worker_runner.py` の末尾に追記する:
+
+```python
+_FAKE_CHILD_WITH_CLI_STARTED = (
+    "import json, subprocess, sys, time\n"
+    "marker_path = sys.argv[1]\n"
+    "sys.stdin.readline()\n"  # handshake を読み捨てる
+    "cli = subprocess.Popen([sys.executable, '-c',"
+    " 'import time; time.sleep(600)'], start_new_session=True)\n"
+    "open(marker_path, 'w').write(str(cli.pid))\n"
+    "sys.stdout.write(json.dumps({'type': 'cli_started', 'seq': 1,"
+    " 'pgid': cli.pid}) + '\\n')\n"
+    "sys.stdout.flush()\n"
+    "sys.stdout.write(json.dumps({'type': 'ready', 'seq': 2,"
+    " 'ok': True}) + '\\n')\n"
+    "sys.stdout.flush()\n"
+    "time.sleep(600)\n"
+)
+
+
+def test_worker_runner_reaps_cli_pgid_after_worker_is_sigkilled(monkeypatch, tmp_path):
+    """§7.1-2 の blocking 受入条件 (a): fake CLI (別 pgid) が sleep している
+    状態で mission_worker (子) を SIGKILL しても、親 (WorkerRunner) は
+    `cli_started` で得た CLI の pgid を回収し、生存プロセスを 0 にする。"""
+    root = _root(tmp_path)
+    marker = tmp_path / "cli_pid"
+    script = tmp_path / "fake_child.py"
+    script.write_text(_FAKE_CHILD_WITH_CLI_STARTED)
+
+    real_popen = subprocess.Popen
+    spawned: dict = {}
+
+    def fake_popen(cmd, **kwargs):
+        p = real_popen([sys.executable, str(script), str(marker)], **kwargs)
+        spawned["proc"] = p
+        return p
+
+    monkeypatch.setattr("agentic_fx.runners.worker_runner.subprocess.Popen",
+                        fake_popen)
+    settings = _tiny_worker_settings(worker_startup_timeout_sec=5.0,
+                                     worker_grace_sec=5.0)
+    runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve")
+
+    result_box: dict = {}
+    thread = threading.Thread(
+        target=lambda: result_box.update(result=runner.run(_mission())))
+    thread.start()
+    deadline = time.monotonic() + 5.0
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert marker.exists(), "fake CLI が cli_started を送る前にタイムアウトした"
+    cli_pid = int(marker.read_text())
+    os.kill(spawned["proc"].pid, signal.SIGKILL)  # mission_worker 相当を SIGKILL
+    thread.join(timeout=15.0)
+    assert not thread.is_alive(), "runner.run() が終わらない"
+
+    deadline = time.monotonic() + 3.0
+    alive = True
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(cli_pid, 0)
+        except ProcessLookupError:
+            alive = False
+            break
+        time.sleep(0.05)
+    assert not alive, "CLI の pgid が回収されず生存している"
+
+
+def test_worker_runner_cli_started_never_sent_leaves_finally_a_no_op(
+        tmp_path, monkeypatch):
+    """§7.1-2 の blocking 受入条件 (b): `cli_started` が一度も来なければ、
+    finally の CLI pgid 回収は no-op (架空の pgid へ killpg しない)。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(wr_mod.os, "killpg",
+                        lambda pid, sig: killpg_calls.append((pid, sig)))
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    # `_ensure_dead` は fake_proc.pid (= os.getpid()) への killpg のみ —
+    # cli_started 由来の追加 killpg 呼び出しは無い (架空 pgid への発砲防止)
+    assert all(pid == fake_proc.pid for pid, _sig in killpg_calls)
+```
+
+- [ ] **Step 36b: red を確認**
+
+```bash
+uv run pytest tests/runners/test_worker_runner.py -v -k "reaps_cli_pgid or cli_started_never_sent"
+```
+
+期待失敗: `test_worker_runner_reaps_cli_pgid_after_worker_is_sigkilled` は
+`assert not alive` が red (CLI pgid が回収されず生存し続ける)。
+`test_worker_runner_cli_started_never_sent_leaves_finally_a_no_op` は現状の
+実装でも green のはず (まだ `cli_started` 分岐が存在しないため — この時点
+では「red を確認」ではなく「現状すでに満たしている契約を先に固定する」
+回帰テストとして先に走らせておく)。
+
+- [ ] **Step 36c: 最小実装**
+
+`src/agentic_fx/runners/worker_runner.py` の `_run_with_child` 内
+`reader_loop` に `cli_started` 分岐を追加する。既存の `elif ftype == "tool_rpc":`
+の**前**に挿入する (アンカー付き挿入 — 既存の `ready`/`event`/`tool_rpc`/`result`
+分岐の並びと既存コメントは変更しない):
+
+```python
+                    elif ftype == "cli_started":
+                        pgid = frame.get("pgid")
+                        if isinstance(pgid, int):
+                            cli_pgid_holder["pgid"] = pgid
+                    elif ftype == "tool_rpc":
+```
+
+`reader_loop` 定義の直前 (`transcript`/`state` の宣言と同じスコープ) に
+`cli_pgid_holder: dict[str, int] = {}` を追加する。
+
+`finally:` 節 (`dispatch_queue.put(None)` → `self._ensure_dead(proc, w)` の
+直後) に以下を挿入する:
+
+```python
+            if "pgid" in cli_pgid_holder:
+                self._terminate_cli_pgid(cli_pgid_holder["pgid"])
+```
+
+`WorkerRunner` に以下のメソッドを追加する (`_ensure_dead`/`_kill` の隣):
+
+```python
+    def _terminate_cli_pgid(self, pgid: int) -> None:
+        """§7.1-2 の blocking 受入条件: worker が EOF/異常終了した後、
+        `cli_started` で得た CLI の pgid を `CliRunner._terminate_pgid` と
+        同じ規律 (SIGTERM→grace→SIGKILL) で回収する。mission_worker 自身の
+        pgid (`proc.pid`) とは別グループのため `_ensure_dead` では届かない。"""
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+        grace = getattr(self._settings.runner, "cli_terminate_grace_sec", 10.0)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.02)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+```
+
+- [ ] **Step 36d: green を確認 + 変異テスト + コミット**
+
+```bash
+uv run pytest tests/runners/test_worker_runner.py -v
+find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
+```
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M1 | `cli_started` 分岐を削除する (未知フレームとして `protocol_error` に落ちる) | `test_worker_runner_reaps_cli_pgid_after_worker_is_sigkilled` (pgid が記録されず回収もされない) |
+| M2 | `finally` の `_terminate_cli_pgid` 呼び出しを削除する | `test_worker_runner_reaps_cli_pgid_after_worker_is_sigkilled` |
+| M3 | `_terminate_cli_pgid` の SIGKILL エスカレーションを削除する | `test_worker_runner_reaps_cli_pgid_after_worker_is_sigkilled` (grace 経過後も生存し続け test が timeout) |
+| M4 | `"pgid" in cli_pgid_holder` 判定を外し常に `_terminate_cli_pgid` を呼ぶ (架空 pgid=0 相当への発砲) | `test_worker_runner_cli_started_never_sent_leaves_finally_a_no_op` |
+
+```bash
+git add src/agentic_fx/runners/worker_runner.py tests/runners/test_worker_runner.py
+git commit -m "$(cat <<'EOF'
+feat: WorkerRunner が cli_started フレームで CLI の pgid を回収する (プラン10 Task1, §7.1-2)
+
+mission_worker 自身の pgid と CLI (claude/codex) 専用 pgid は別グループ
+のため、worker の EOF/異常終了時に _ensure_dead だけでは CLI (と孫) が
+孤立して残っていた。reader_loop に cli_started 分岐を追加して pgid を
+記録し、finally で SIGTERM→grace→SIGKILL により回収する
+(CliRunner._terminate_pgid と同じ規律)。cli_started が一度も来なければ
+no-op (架空 pgid への発砲防止)。
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+### Step 36e: `mission_worker.py` の handshake `credentials` 子側消費 — 失敗するテストを書く (§2.2、裁定 R2/B6)
+
+<!-- precheck 2026-08-22: T1-B6 -->
+**欠陥の背景**: 設計書 §2.2 は「trade worker は handshake 読取後、datafeed
+コードが env を参照するなら `os.environ` に setenv する」と要求しているが、
+Step 33/36 までの時点では**親側 (`worker_runner.py`) が `credentials` を
+送るだけ**で、子側 (`mission_worker.py`) がそれを読んで `os.environ` に
+反映する箇所がどこにも無い。`datafeed/price_provider.py:89` の
+`os.environ.get("TWELVEDATA_API_KEY")`・`datafeed/sources.py:103` の
+`os.environ.get("MT5_BRIDGE_API_KEY")` は env を直接参照するため、この Step
+を実装しないと trade worker の市場データ取得が恒常的に認証失敗する
+(IM-3/P8-03 の再発、B6)。
+
+**現物確認**: `mission_worker.py:428-442` が trade 分岐の入口
+(`if worker_profile != "trade": raise ...` の直後から `settings.runner.trade.backend`
+検査まで)。`registry` 構築の import (`:444` `from agentic_fx.store.db import
+connect_readonly`) より**前**、`settings = Settings.model_validate(settings_dict)`
+の検査ブロック (`:437-442`) の**後**に挿入する。
+
+`tests/test_mission_worker_protocol.py` の末尾に追記する:
+
+```python
+def test_main_sets_os_environ_from_handshake_credentials_for_trade(
+        monkeypatch, tmp_path):
+    """R2/B6 (設計書 §2.2): trade 分岐は handshake の `credentials` を
+    `os.environ` へ setenv する — datafeed コードが env を直接参照する
+    ため (`price_provider.py`/`sources.py`)。"""
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    try:
+        _drive_main(monkeypatch, tmp_path,
+                    handshake_overrides={
+                        "credentials": {"TWELVEDATA_API_KEY": "secret-td"}})
+        assert os.environ["TWELVEDATA_API_KEY"] == "secret-td"
+    finally:
+        os.environ.pop("TWELVEDATA_API_KEY", None)
+
+
+def test_main_does_not_set_os_environ_from_handshake_credentials_for_improve(
+        monkeypatch, tmp_path):
+    """R2/B6 の裏: improve 分岐では `credentials` を setenv しない (data
+    provider 資格情報は trade worker 専用、裁定書 F-9 の遮断維持)。"""
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda: None)
+    try:
+        _drive_main(monkeypatch, tmp_path,
+                    handshake_overrides={
+                        "worker_profile": "improve", "db_path": None,
+                        "plugins_dir": None,
+                        "credentials": {"TWELVEDATA_API_KEY": "secret-td"}})
+        assert "TWELVEDATA_API_KEY" not in os.environ
+    finally:
+        os.environ.pop("TWELVEDATA_API_KEY", None)
+
+
+def test_main_handles_missing_credentials_key_in_handshake(monkeypatch, tmp_path):
+    """後方互換: `credentials` キー自体が無い handshake (旧親・テスト由来)
+    でも `KeyError` にならない。"""
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    frames, _, _ = _drive_main(monkeypatch, tmp_path)  # handshake_overrides 無し
+    assert frames[0]["type"] == "ready" and frames[0]["ok"] is True
+```
+
+- [ ] **Step 36f: red を確認**
+
+```bash
+uv run pytest tests/test_mission_worker_protocol.py -v -k "sets_os_environ_from_handshake_credentials or missing_credentials_key"
+```
+
+期待失敗: `test_main_sets_os_environ_from_handshake_credentials_for_trade` は
+`KeyError: 'TWELVEDATA_API_KEY'` (`os.environ["TWELVEDATA_API_KEY"]` が
+setenv されないため未設定)。他 2 本は現状すでに green の見込み (`credentials`
+キーが未消費のため何も起きない) — 消費の実装後も green のままであることを
+Step 36g で再確認する回帰テストとして先に固定する。
+
+- [ ] **Step 36g: 最小実装**
+
+`src/agentic_fx/mission_worker.py:428-442` (trade 分岐の入口ブロック、
+`settings.runner.trade.backend` 検査の直後) にアンカー付き挿入する:
+
+```python
+        if settings.runner.trade.backend != "local":
+            raise RuntimeError(
+                f"runner.trade.backend={settings.runner.trade.backend!r} is "
+                "not supported by mission_worker in this plan (ClaudeRunner "
+                "is Plan 9 scope) — fail closed")
+
+        # R2/B6 (設計書 §2.2): trade worker は handshake の credentials を
+        # os.environ へ setenv する — datafeed コード (price_provider.py/
+        # sources.py) が TWELVEDATA_API_KEY/MT5_BRIDGE_API_KEY を env
+        # 直接参照するため。improve 分岐では行わない (裁定書 F-9 の遮断維持)。
+        for _cred_key, _cred_value in (handshake.get("credentials") or {}).items():
+            os.environ[_cred_key] = _cred_value
+
+        from agentic_fx.store.db import connect_readonly
+```
+
+- [ ] **Step 36h: green を確認 + 変異テスト + コミット**
+
+```bash
+uv run pytest tests/test_mission_worker_protocol.py -v
+find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
+```
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M1 | `for` ループ (setenv) を削除する | `test_main_sets_os_environ_from_handshake_credentials_for_trade` |
+| M2 | 挿入位置を improve 分岐にも複製する (trade 専用の判定を外す) | `test_main_does_not_set_os_environ_from_handshake_credentials_for_improve` |
+| M3 | `handshake.get("credentials") or {}` を `handshake["credentials"]` に変える (キー欠落で `KeyError`) | `test_main_handles_missing_credentials_key_in_handshake` |
+
+```bash
+git add src/agentic_fx/mission_worker.py tests/test_mission_worker_protocol.py
+git commit -m "$(cat <<'EOF'
+feat: mission_worker の trade 分岐が handshake credentials を setenv する (プラン10 Task1, 設計書 §2.2)
+
+worker_runner.py (親) が送る handshake の credentials フィールドを、
+trade 分岐が registry 構築より前に os.environ へ反映する。datafeed
+コード (price_provider.py/sources.py) は env を直接参照するため、この
+消費が無いと trade worker のデータ取得資格情報が IM-3/P8-03 と同じ形で
+恒常失敗する (B6)。improve 分岐では行わない (裁定書 F-9)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -4397,8 +5330,12 @@ EOF
    - `_terminate_pgid` (`cli_runner.py`) — CLI の pgid を SIGTERM→grace→
      SIGKILL→空確認する内部ヘルパ。
    - `_resolve_cli_bin` / `_check_cli_version` / `_check_credentials_file` /
-     `_check_service_initial_env_has_no_secrets` / `_check_improve_backend`
-     (`service.py`) — 起動時検査 ①〜⑤ の実体名。
+     `_check_service_initial_env_has_no_secrets` / `_read_proc_self_environ_names` /
+     `_check_codex_subscription_expiry` / `_check_cli_backend`
+     (`service.py`) — 起動時検査 ①〜⑤ の実体名。<!-- precheck 2026-08-22: T1-M14 -->
+     `_check_cli_backend(settings, *, which="trade"|"improve")` は着手前
+     検証 Minor 14 で `_check_improve_backend` から一般化した (trade+claude
+     構成も検査対象に含める)。
    - `_copy_credentials_file` / `_CredentialsCopyError` (`worker_runner.py`)
      — 親側の認証コピー + 事前検査。
    - `_mcp_tool_from_openai_tool` / `_SUPPORTED_PROTOCOL_VERSION`
@@ -4441,12 +5378,14 @@ EOF
    `registry: ToolRegistry` はこの task では実際には使っていない
    (`_build_argv` は mcp_socket 経由の間接参照のみ) — 直接 `registry` を
    参照する必要が生じた場合も同様にこの実 API に合わせること。
-5. **Task 1 の起動時検査 (`_check_improve_backend`) の挿入位置**は
-   `service.py:249` 付近 (`_check_llama_swap(settings)` の呼び出し行) を
-   仮定した。実装時に `build_app`/`_validate_startup` 相当の現物の呼び出し
-   順序 (他の fail-closed 検査との並び) を確認し、Global Constraints の
-   「§7.1 の blocking 1〜7 が緑になるまで改善ループを有効化しない」と
-   矛盾しない位置 (=backend=local では未到達) に置くこと。
+5. <!-- precheck 2026-08-22: T1-B2 --> **Task 1 の起動時検査
+   (`_check_cli_backend`) の挿入位置は着手前検証で確定済み (B2)**:
+   `service.py:249` 付近 (`_check_llama_swap(settings)` の呼び出し行) と
+   いう旧仮定は**誤りだった** — `_check_llama_swap` の唯一の呼び出しは
+   `run_init`(`:249`) の中にあり、`build_app` は経由しない。現物確認の
+   結果、正しい挿入位置は **`service.py:607` の `_validate_startup(settings)`
+   呼び出しの直後** (`build_app` 内) であり、Step 21 の本文はこれに
+   合わせて確定済み。
 6. **`tests/runners/test_worker_runner.py` の fixture 名**
    (`_settings()`/`_clock()`/`_rag()`/`_mission()`) は仮定であり、既存
    ファイルの現物ヘルパ名と異なる場合は現物を正として実装者が読み替える
