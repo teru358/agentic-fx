@@ -327,3 +327,168 @@ def test_bootstrap_improve_profile_rejects_source_snapshot_dir_outside_workdir(
         workdir=l["workdir"])
     assert result.returncode != 0
     assert "SHOULD_NOT_REACH" not in result.stdout
+
+
+# --- Task 5 Section 5-G: exec closure 1 要素 drop 表 -----
+
+import shutil
+
+
+def _skip_unless_cli_installed(bin_name: str) -> str:
+    path = shutil.which(bin_name)
+    if path is None:
+        pytest.skip(f"{bin_name} not installed on this host — drop table "
+                    "row cannot be measured here (see probe report §7)")
+    return path
+
+
+def _resolve_codex_native_bin() -> str:
+    """(裁定 R5) `codex` 用の CLI 解決。`shutil.which("codex")` の結果を
+    ELF マジックバイトで判定し、Node シェバンラッパ (ELF でない) なら
+    同じ npm パッケージ配下の `codex-linux-x64/vendor/*/bin/codex`
+    (native, static-pie musl) を探索する。どちらも見つからなければ
+    skip する (`_skip_unless_cli_installed` と同じ規律)。Task 1 が
+    `runner.codex.bin` の config 経路を確定させたら、本関数は設定値の
+    検証 (ELF でなければ fail closed) に差し替えること (申し送り④)。"""
+    which_path = shutil.which("codex")
+    if which_path is None:
+        pytest.skip("codex not installed on this host — drop table row "
+                    "cannot be measured here (see probe report §7)")
+    resolved = Path(which_path).resolve()
+    with open(resolved, "rb") as f:
+        magic = f.read(4)
+    if magic == b"\x7fELF":
+        return str(resolved)
+    search_root = resolved
+    for _ in range(6):
+        search_root = search_root.parent
+        candidates = sorted(search_root.glob(
+            "**/codex-linux-x64/vendor/*/bin/codex"))
+        if candidates:
+            return str(candidates[0])
+    pytest.skip(f"codex vendor native binary not found by walking up from "
+                f"{resolved} — drop table row cannot be measured here "
+                "(裁定 R5, see probe report §2.1)")
+
+
+def _run_version_under_closure(bin_path: str, *, execute_paths: list[Path],
+                               read_only_paths: list[Path],
+                               read_write_paths: list[Path] = (),
+                               env: dict[str, str] | None = None
+                               ) -> subprocess.CompletedProcess:
+    """`<bin_path> --version` を、指定した exec closure だけを許可した
+    Landlock 下の子プロセスで実行する。rlimit は probe 実測の本番相当形
+    (`as_mb=4096, nofile=128, fsize_mb=8`) を使う。**`env` を明示しない
+    と実 `$HOME` を継承する** — claude の `--version` が `$HOME`/
+    `~/.claude` に触れる場合、それがどの allowlist にも入っていないため
+    無関係な理由で red になる (advisor 指摘)。呼び出し側は claude を
+    測るときは必ず scratch `HOME`/`CLAUDE_CONFIG_DIR` を `env=` で渡し、
+    その scratch dir を `read_write_paths`(または `read_only_paths`)に
+    含めること。"""
+    script = textwrap.dedent(f"""
+        import resource, sys
+        sys.path.insert(0, {str(_REPO_ROOT / "src")!r})
+        from pathlib import Path
+        from agentic_fx.core import landlock
+        resource.setrlimit(resource.RLIMIT_AS, (4096*1024*1024,)*2)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (8*1024*1024,)*2)
+        landlock.restrict_to(
+            read_only_paths=[Path(p) for p in {[str(p) for p in read_only_paths]!r}],
+            read_write_paths=[Path(p) for p in {[str(p) for p in read_write_paths]!r}],
+            execute_paths=[Path(p) for p in {[str(p) for p in execute_paths]!r}])
+        import os
+        try:
+            os.execv({bin_path!r}, [{bin_path!r}, "--version"])
+        except PermissionError as e:
+            print(f"EXEC_PERMISSION_ERROR errno={{e.errno}}")
+            raise SystemExit(0)
+    """)
+    run_env = {"PATH": "/usr/bin:/bin"}
+    run_env.update(env or {})
+    return subprocess.run([sys.executable, "-c", script], env=run_env,
+                          capture_output=True, text=True, timeout=15)
+
+
+def test_drop_codex_bin_parent_denies_exec():
+    codex_bin = _resolve_codex_native_bin()
+    result = _run_version_under_closure(
+        codex_bin, execute_paths=[], read_only_paths=[Path("/etc")])
+    assert "EXEC_PERMISSION_ERROR errno=13" in result.stdout
+
+
+def test_codex_bin_parent_alone_allows_exec():
+    """positive control: 親ディレクトリ 1 つを execute_paths に足すだけで
+    `--version` が通る (static-pie musl — ローダ不要、probe §2.1)。
+    codex は `$CODEX_HOME` が無くても `--version` が通ることを probe
+    §2.1 が前提にしている (認証を要さない経路)。**(着手前検証
+    Blocking 9)** `codex_bin` は `_resolve_codex_native_bin()` で解決した
+    native バイナリ (`which codex` の Node ラッパではない) — このホスト
+    ではローダ不要のため `execute_paths` は親ディレクトリ 1 つで足りる。"""
+    codex_bin = _resolve_codex_native_bin()
+    parent = Path(codex_bin).resolve().parent
+    result = _run_version_under_closure(
+        codex_bin, execute_paths=[parent], read_only_paths=[Path("/etc")])
+    assert "EXEC_PERMISSION_ERROR" not in result.stdout
+    assert result.returncode == 0, result.stderr
+
+
+def _claude_scratch_env(tmp_path: Path) -> tuple[dict[str, str], Path]:
+    """claude 系テスト共通: 実 `$HOME`/`~/.claude` に触れさせない scratch
+    env を作る (probe §4 と同じ最小構成)。戻り値はそのまま
+    `_run_version_under_closure(..., env=env, read_write_paths=[scratch])`
+    に渡す。"""
+    scratch = tmp_path / "claude_home"
+    scratch.mkdir()
+    (scratch / "cfg").mkdir()
+    env = {"HOME": str(scratch), "CLAUDE_CONFIG_DIR": str(scratch / "cfg")}
+    return env, scratch
+
+
+def test_drop_usr_lib_denies_claude_exec(tmp_path):
+    claude_bin = _skip_unless_cli_installed("claude")
+    parent = Path(claude_bin).resolve().parent
+    env, scratch = _claude_scratch_env(tmp_path)
+    result = _run_version_under_closure(
+        claude_bin, execute_paths=[parent], read_only_paths=[Path("/etc")],
+        read_write_paths=[scratch], env=env)
+    assert "EXEC_PERMISSION_ERROR errno=13" in result.stdout
+
+
+def test_usr_lib64_alone_is_insufficient_for_claude_exec(tmp_path):
+    """probe `logs/evi_claude_exec_lib64only.json` の回帰 pin — `/usr/lib64`
+    だけでは不十分、`/usr/lib` の併記が必須。"""
+    claude_bin = _skip_unless_cli_installed("claude")
+    parent = Path(claude_bin).resolve().parent
+    env, scratch = _claude_scratch_env(tmp_path)
+    result = _run_version_under_closure(
+        claude_bin, execute_paths=[parent, Path("/usr/lib64")],
+        read_only_paths=[Path("/etc")], read_write_paths=[scratch], env=env)
+    assert "EXEC_PERMISSION_ERROR errno=13" in result.stdout
+
+
+def test_usr_lib_and_bin_parent_together_allow_claude_exec(tmp_path):
+    """positive control: `/usr/lib` を併記すれば通る。**`env=` に scratch
+    `HOME`/`CLAUDE_CONFIG_DIR` を明示する** — 実 `$HOME` を継承すると、
+    `--version` が `~/.claude` に触れた場合 (未確認) allowlist 外への
+    アクセスで無関係な理由で red になり得るため (advisor 指摘)。もし
+    `--version` が `$HOME`/`CLAUDE_CONFIG_DIR` に一切触れないことが実装
+    時の実測で確認できれば、`read_write_paths=[scratch]` は
+    `read_only_paths` へ落としてよい — 実装者が実測して確定すること。
+
+    **(実装時の実測で追加、逸脱として申告)** `/dev` が allowlist に無いと
+    `claude --version` は `/dev/urandom` の open で `EACCES` になり、Bun
+    ランタイムが `SIGABRT` で panic する (`strace` で実測確認 —
+    `openat(AT_FDCWD, "/dev/urandom", O_RDONLY) = -1 EACCES`)。プラン記載の
+    コードブロックには `Path("/dev")` が無かった — 5-D の
+    `_bootstrap_improve_profile` が `/dev` を常に `read_write_paths` に
+    含めているのと同じ扱いをここでも行う。"""
+    claude_bin = _skip_unless_cli_installed("claude")
+    parent = Path(claude_bin).resolve().parent
+    env, scratch = _claude_scratch_env(tmp_path)
+    result = _run_version_under_closure(
+        claude_bin, execute_paths=[parent, Path("/usr/lib"), Path("/usr/lib64")],
+        read_only_paths=[Path("/etc"), Path("/proc")],
+        read_write_paths=[scratch, Path("/dev")], env=env)
+    assert "EXEC_PERMISSION_ERROR" not in result.stdout
+    assert result.returncode == 0, result.stderr
