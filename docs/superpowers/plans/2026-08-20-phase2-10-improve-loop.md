@@ -3521,7 +3521,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M6 | `_mission_worker_env` に `_DATA_PROVIDER_ENV_ALLOWLIST` を復元する (env 経由に戻す) | `test_trade_worker_no_longer_receives_data_provider_keys_via_env` |
 | M7 | handshake dict へ `credentials` キーを追加しない | `test_trade_worker_receives_data_provider_keys_via_handshake` |
 | M8 | trade profile で `credentials` を空 dict のまま送る (収集ループを削除) | `test_trade_worker_receives_data_provider_keys_via_handshake` |
-| M9 | `run_context_fields` の組み立てを削除する (`run_context` を無視する) | `test_worker_runner_run_context_adds_three_handshake_keys` (mock 前提の parent 側 unit test)。**レビュー2周目 Important 3 で追加**: Task 5 Step 6b の `test_worker_runner_run_context_reaches_real_improve_worker` (`tests/test_improve_profile_isolation.py`) が同じ変異を実プロセス経由で独立に検出する — 子側が 3 値を受け取れず 5-D の相互照合が `RuntimeError` になり `ready` へ到達しない (`observed_ready` が空のまま `.get("ok")` が `None` になり assert が落ちる) |
+| M9 | `run_context_fields` の組み立てを削除する (`run_context` を無視する) | `test_worker_runner_run_context_adds_three_handshake_keys` (mock 前提の parent 側 unit test)。**レビュー2周目 Important 3 で追加**: Task 5 「5-H: Task 5 統合 step」の Step 1 (旧 Step 6b) の `test_worker_runner_run_context_reaches_real_improve_worker` (`tests/test_improve_profile_isolation.py`) が同じ変異を実プロセス経由で独立に検出する — 子側が 3 値を受け取れず 5-D の相互照合が `RuntimeError` になり `ready` へ到達しない (`observed_ready` が空のまま `.get("ok")` が `None` になり assert が落ちる) |
 | M10 | `run_context is None` でも `run_context_fields` に固定値を入れる (未知キー汚染) | `test_worker_runner_run_context_none_omits_three_handshake_keys` |
 
 - [ ] **Step 36: コミット**
@@ -13071,7 +13071,7 @@ EOF
 
 13. **着手前検証 (2026-08-22、`report-task8.md`) 反映時の申し送り**: Blocking B1〜B13・Minor m1〜m14 を本節および 8-A〜8-J・Interfaces 節 (store 提供記号)・Task 9/10 の該当呼び出し行に反映した (`<!-- precheck 2026-08-22: T8-B<k> -->` を付した箇所)。以下は担当外につき本節では直接修正していない — 各担当者が反映すること:
     - **Task 5 修正者**: 8-B の `expire_due` 既定 `exclude_kinds=("plugin",)` 化に伴い `tests/tools/test_plugin_loader.py:477` を改訂した (8-B Step 5b)。Task 5 節 L6022 付近の受入条件「既存 `test_plugin_loader.py` も無変更で green」に「当該テストを除く」の但し書きを追加すること (裁定 R8)。
-    - **Task 12 修正者**: `finish_improve_mission` の逐語シグネチャ再掲 (Task 12 節内、`def finish_improve_mission(conn, *, mission_id, ...)`) が `now`/`approval_id`/`report_path`/`report_state` を欠いたまま残っている (Task 8 節・Task 9/10 節と同じ B1/B9 の欠落)。Task 12 修正者が同様に追随すること。
+    - ~~**Task 12 修正者**: `finish_improve_mission` の逐語シグネチャ再掲 (Task 12 節内) が `now`/`approval_id`/`report_path`/`report_state` を欠いたまま残っている~~ → **2026-08-22 の修正パス差分再検証で追随済み** (Task 12 Interfaces 節の Consumes ブロックを Task 8 8-G の確定形へ揃えた)。
     - **Task 10 修正者 (自身が確定させる箇所)**: `ImproveLoop.prepare` の `build_improve_context` 呼び出しに `root=self._root` を追加し、戻り値の `prompt["prompt_text"]` (非実在) を廃止して `self._render_improve_mission_prompt(ctx_data, ctx=ctx)` 呼び出しへ置き換えた (8-I の対応表を参照する実装)。**`_render_improve_mission_prompt` はまだ本文中に定義が無い** — Task 10 節の担当者が 8-I の対応表 (プレースホルダ⇔戻り値キー) に従って実装すること (本節の担当は「呼び出し行のみ」のため、レンダリング関数の本体実装は Task 10 の責務)。
 
 ## 最終報告 (執筆完了時点の自己申告)
@@ -21560,8 +21560,12 @@ class ImproveLoop:
 
 # Task 8 (store/*, loops/summary.py)
 IMPROVE_OUTPUT_SCHEMA: dict[str, Any]
+# precheck 2026-08-22: T8-B1 T8-B9 追随 (差分再検証) -- now/approval_id/
+# report_path/report_state が欠けたままだった。Task 8 8-G の確定形へ揃える。
 def finish_improve_mission(conn, *, mission_id, run_id, slot_key, mission_status,
-                            run_result, backlog_transition, commit=False) -> None: ...
+                            run_result, backlog_transition, now,
+                            approval_id=None, report_path=None,
+                            report_state="none", commit=False) -> None: ...
 def apply_decision(conn, approval_id, status, *, decided_by, now, reason=None,
                     commit=False) -> None: ...
 def apply_approval_outcome(conn, *, backlog_id, outcome, reason, now,
