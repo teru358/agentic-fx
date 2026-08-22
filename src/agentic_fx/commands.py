@@ -9,7 +9,7 @@ from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
-from agentic_fx.store import (approvals, missions, orders,
+from agentic_fx.store import (approvals, backlog, missions, orders,
                               reflection_attempts, reflections)
 from agentic_fx.store.approvals import AlreadyDecidedError
 from agentic_fx.store.state import StateStore
@@ -22,15 +22,21 @@ _HELP = """コマンド一覧:
   approve <id> / reject <id> [理由]   承認操作
   killswitch reset           kill switch ラッチの解除 (人間の明示操作)
   reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
+  improve                    手動 improve one-shot (全バックログ担当)
+  improve add <idea text>    バックログへ課題を追加
+  backlog reject <id> / reopen <id>   バックログの手動操作
+  policy add <text>          policy/directives.md へ追記
   stop                       graceful shutdown (シェルのみ)
-(Phase 2 で追加: policy add / improve / news / model / mode / autopilot)"""
+(Phase 2 で追加: news / model / mode / autopilot)"""
 
 
 class Commands:
     def __init__(self, *, conn: sqlite3.Connection, state_store: StateStore,
                  broker: PaperBroker, trade_loop, activity: ActivityLog,
                  log_dir: Path, clock: Clock,
-                 health_latch: HealthLatch | None = None) -> None:
+                 health_latch: HealthLatch | None = None,
+                 improve_supervisor: object | None = None,
+                 policy_path: Path | None = None) -> None:
         self.conn = conn
         self.state = state_store
         self.broker = broker
@@ -39,6 +45,8 @@ class Commands:
         self.log_dir = log_dir
         self.clock = clock
         self.health_latch = health_latch or HealthLatch()
+        self.improve_supervisor = improve_supervisor
+        self._policy_path = policy_path
 
     def dispatch(self, line: str) -> str:
         parts = line.strip().split()
@@ -104,6 +112,74 @@ class Commands:
                 suffix = "" if had_attempt else " (台帳に試行記録なし)"
                 return (f"order #{order_id} を reflection 再試行対象へ"
                        f"戻しました{suffix}")
+            if cmd == "improve" and not args:
+                if self.improve_supervisor is None:
+                    return "improve backend が未配線です"
+                mission_id = self.improve_supervisor.submit_manual()
+                return f"improve mission #{mission_id} を起動しました"
+            if cmd == "improve" and args and args[0] == "add":
+                text = " ".join(args[1:])
+                if not text:
+                    return "usage: improve add <idea text>"
+                bid = backlog.add(self.conn, idea=text, source="user",
+                                  now=self.clock.now())
+                self.activity.write(Category.IMPROVE, "backlog_added",
+                                    f"#{bid} via shell", ref_id=str(bid))
+                return f"backlog #{bid} を追加しました"
+            if cmd == "backlog" and len(args) == 2 and args[0] == "reject":
+                bid = int(args[1])
+                # 検収 B3 (2026-08-22): 設計書 §4.3 の状態機械 — reject は
+                # open|observation からのみ。`backlog.set_status` (Task 8)
+                # は `apply_approval_outcome` 用の汎用 setter でガードを
+                # 持たないため、人間操作の入口である commands.py 側で
+                # fail closed に検査する (現在の status も併せて未存在も
+                # 検出 — M-e 対応)。
+                row = self.conn.execute(
+                    "SELECT status FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+                if row is None:
+                    return f"backlog #{bid} は存在しません"
+                current_status = row["status"]
+                if current_status not in ("open", "observation"):
+                    return (f"backlog #{bid} は status={current_status} のため"
+                            f" reject できません (open|observation からのみ可)")
+                backlog.set_status(self.conn, bid, "rejected", self.clock.now(),
+                                   last_result="human_rejected", commit=True)
+                self.activity.write(Category.IMPROVE, "backlog_rejected",
+                                    f"#{bid} via shell", ref_id=str(bid))
+                return f"backlog #{bid} を rejected にしました"
+            if cmd == "backlog" and len(args) == 2 and args[0] == "reopen":
+                bid = int(args[1])
+                # 検収 B3: reopen は done|rejected (終端) からのみ。
+                # `selected` (Mission 実行中) から reopen を許すと
+                # 別 Mission の select_for_mission CAS が成功しうる
+                # (設計書 §4 が挙げる「二重承認申請」への到達経路)。
+                row = self.conn.execute(
+                    "SELECT status FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+                if row is None:
+                    return f"backlog #{bid} は存在しません"
+                current_status = row["status"]
+                if current_status not in ("done", "rejected"):
+                    return (f"backlog #{bid} は status={current_status} のため"
+                            f" reopen できません (done|rejected からのみ可)")
+                backlog.set_status(self.conn, bid, "open", self.clock.now(),
+                                   last_result="reopened", commit=True)
+                self.activity.write(Category.IMPROVE, "backlog_reopened",
+                                    f"#{bid} via shell", ref_id=str(bid))
+                return f"backlog #{bid} を open に戻しました"
+            if cmd == "policy" and args and args[0] == "add":
+                text = " ".join(args[1:])
+                if not text:
+                    return "usage: policy add <text>"
+                if self._policy_path is None:
+                    return "policy directives の path が未配線です"
+                self._policy_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._policy_path.open("a", encoding="utf-8") as f:
+                    f.write(f"\n- {text}\n")
+                self.activity.write(Category.SYSTEM, "policy_added",
+                                    text[:200])
+                return "policy に追記しました"
         except AlreadyDecidedError:
             return "その approval は決定済みです"
         except (ValueError, KeyError) as e:

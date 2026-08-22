@@ -323,3 +323,40 @@ def test_save_harness_run_full_argument_wiring(tmp_path, monkeypatch):
     assert row["initial_balance"] == SETTINGS.backtest.initial_balance
     assert row["created_at"] == now.isoformat()
     assert json.loads(row["metrics_json"]) == out
+
+
+def test_run_in_sample_record_fn_sink_does_not_write_backtest_runs(
+        tmp_path, monkeypatch):
+    """Task 7-D: record_fn 非 None のとき save_harness_run を呼ばず、
+    sink へ保存パラメータ辞書を渡す。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
+    sunk = []
+    result = run_in_sample(
+        SETTINGS, history_conn=hist, symbol="USDJPY", source="dukascopy",
+        intent_source=lambda b: None, eval_timeframe="1h", plugin_ref="p",
+        content_hash="h", kind="strategy", now=WED + timedelta(days=120),
+        record_fn=sunk.append)
+    count = hist.execute(
+        "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
+    assert count == 0
+    assert len(sunk) == 1
+    assert sunk[0]["scope"] == "in_sample"
+
+
+def test_run_in_sample_without_record_fn_keeps_existing_behavior(
+        tmp_path, monkeypatch):
+    """既定 (record_fn なし) は従来どおり save_harness_run で永続化する。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
+    run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
+                  source="dukascopy", intent_source=lambda b: None,
+                  eval_timeframe="1h", plugin_ref="p", content_hash="h",
+                  kind="strategy", now=WED + timedelta(days=120))
+    count = hist.execute(
+        "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
+    assert count == 1

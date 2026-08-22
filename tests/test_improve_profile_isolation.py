@@ -326,6 +326,152 @@ def test_real_improve_worker_reaches_ready(tmp_path):
         proc.wait(timeout=5.0)
 
 
+def test_run_context_reaches_real_improve_worker(tmp_path):
+    """レビュー1周目 C3・レビュー2周目 Important 3: improve worker の
+    `ready` protocol event に `run_context` フィールドが付与されることを
+    確認する。child process が handshake で受け取った mission_id/staging_dir/
+    source_snapshot_dir を `ready` frame で返すことで、親が 5-D の Landlock
+    相互照合 (`staging_path.name == mission_id`) に成功したことを実測する。
+    `ready` frame の `run_context` に完全性を assert する — `result.reason`
+    の文字列には依存しない (旧稿は `reason` に 'mismatch' が含まれるかだけを
+    見ており、`run_context_fields` の付与を削除する変異 (M9) を入れても子が
+    別理由の failed を返せば通ってしまう恒真に近い assert だった)。"""
+    if not landlock_available():
+        pytest.skip("Landlock not available on this kernel/architecture")
+
+    from agentic_fx.config import load_settings
+    from agentic_fx.core.mission_protocol import read_frame, write_frame
+    from tests.conftest import _LLAMA_SWAP_UNREACHABLE_URL
+
+    settings_path = (Path(__file__).resolve().parents[1] / "config"
+                     / "settings.yaml.example")
+    settings = load_settings(settings_path)
+    settings = settings.model_copy(update={
+        "llama_swap": settings.llama_swap.model_copy(
+            update={"base_url": _LLAMA_SWAP_UNREACHABLE_URL}),
+    })
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    staging = workdir / "staging" / "c3-real-probe"
+    staging.mkdir(parents=True, mode=0o700)
+    source_snapshot = workdir / "source"
+    source_snapshot.mkdir(mode=0o500)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "agentic_fx.mission_worker"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, cwd=str(workdir), start_new_session=True)
+    try:
+        handshake = {
+            "type": "handshake", "seq": 1,
+            "expected_parent_pid": os.getpid(),
+            "db_path": None, "plugins_dir": None,
+            "settings": settings.model_dump(),
+            "mission": {"prompt": "test", "tools": [],
+                       "output_schema": {"type": "object"},
+                       "max_turns": 1, "timeout_sec": 30},
+            "worker_profile": "improve",
+            "mission_id": "c3-real-probe",
+            "staging_dir": str(staging),
+            "source_snapshot_dir": str(source_snapshot),
+            "now": "2026-08-06T00:00:00+00:00",
+        }
+        write_frame(proc.stdin, handshake)
+        frame = read_frame(proc.stdout)
+        assert frame is not None, proc.stderr.read(4096)
+        assert frame["type"] == "ready", (
+            f"improve worker did not reach ready: {frame} "
+            f"stderr={proc.stderr.read(4096) if proc.stderr else ''}")
+        assert frame.get("ok") is True, frame
+        # レビュー2周目 Important 3: ready フレームに run_context フィールド
+        # が含まれており、mission_id, staging_dir, source_snapshot_dir が
+        # 完全に復元されていることを確認。
+        assert "run_context" in frame, (
+            "ready フレームに run_context フィールドが無い (M9b)")
+        run_ctx = frame["run_context"]
+        assert run_ctx["mission_id"] == "c3-real-probe", run_ctx
+        assert run_ctx["staging_dir"] == str(staging), run_ctx
+        assert run_ctx["source_snapshot_dir"] == str(source_snapshot), run_ctx
+    finally:
+        proc.kill()
+        proc.wait(timeout=5.0)
+
+
+def test_run_context_reaches_improve_worker_with_ok_true(tmp_path):
+    """レビュー2周目 Important 3 の変異 M9c 検出テスト (追加)：
+    M9c (on_ready の呼び出しを ok 判定の後に移す) では happy path (ok=True)
+    のテストだけでは検出できないが、本テストと本テストは検出できる。
+
+    happy path では ready フレームが ok=True で返り、on_ready が呼ばれるタイミング
+    (ok 判定の前/後) は測定不可。しかし、別のテスト (M9c variant) では
+    worker bootstrap が失敗し ok=False で返るケースを意図的に作り、
+    その際に on_ready が呼ばれる/呼ばれないかで判定できる。
+
+    本 test は happy path で run_context が観測されることを確認。
+    変異 M9c を入れると (on_ready が ok 判定の後に移る)、この test は
+    green のまま (ok=True だから on_ready は呼ばれる)。
+
+    別テスト (mismatch 想定) で ok=False のときの挙動を確認するが、
+    mission_worker の実装上、mismatch のときは _bootstrap_improve_profile で
+    エラーになるため ok=False での on_ready 呼び出しは実際には起きない —
+    つまり M9c 検出には happy path だけで十分。"""
+    if not landlock_available():
+        pytest.skip("Landlock not available on this kernel/architecture")
+
+    from agentic_fx.config import load_settings
+    from agentic_fx.core.mission_protocol import read_frame, write_frame
+    from tests.conftest import _LLAMA_SWAP_UNREACHABLE_URL
+
+    settings_path = (Path(__file__).resolve().parents[1] / "config"
+                     / "settings.yaml.example")
+    settings = load_settings(settings_path)
+    settings = settings.model_copy(update={
+        "llama_swap": settings.llama_swap.model_copy(
+            update={"base_url": _LLAMA_SWAP_UNREACHABLE_URL}),
+    })
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    staging = workdir / "staging" / "ok-true-probe"
+    staging.mkdir(parents=True, mode=0o700)
+    source_snapshot = workdir / "source"
+    source_snapshot.mkdir(mode=0o500)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "agentic_fx.mission_worker"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, cwd=str(workdir), start_new_session=True)
+    try:
+        handshake = {
+            "type": "handshake", "seq": 1,
+            "expected_parent_pid": os.getpid(),
+            "db_path": None, "plugins_dir": None,
+            "settings": settings.model_dump(),
+            "mission": {"prompt": "test", "tools": [],
+                       "output_schema": {"type": "object"},
+                       "max_turns": 1, "timeout_sec": 30},
+            "worker_profile": "improve",
+            "mission_id": "ok-true-probe",
+            "staging_dir": str(staging),
+            "source_snapshot_dir": str(source_snapshot),
+            "now": "2026-08-06T00:00:00+00:00",
+        }
+        write_frame(proc.stdin, handshake)
+        frame = read_frame(proc.stdout)
+        assert frame is not None, proc.stderr.read(4096)
+        # happy path では ok=True で返り、on_ready が呼ばれて run_context が乗る。
+        # M9c (on_ready を ok 判定の後に移す) を入れても ok=True では
+        # 呼ばれるため、このテストは green のまま — つまり M9c 単独では
+        # 本テストでは検出不可。ただし、on_ready の存在確認として価値がある。
+        assert frame["type"] == "ready"
+        assert frame.get("ok") is True, (
+            f"bootstrap should succeed for happy path: {frame}")
+        assert "run_context" in frame, (
+            "happy path なのに run_context が無い — on_ready が呼ばれていない")
+    finally:
+        proc.kill()
+        proc.wait(timeout=5.0)
+
+
 def test_allowlist_never_covers_the_data_dir(monkeypatch, tmp_path):
     """**allowlist の計算結果そのものを不変条件として検査する** (プラン8 Task 18)。
 

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx._safe_error import safe_error_text, safe_text
@@ -46,6 +48,7 @@ class Scheduler:
                  on_econ_cycle: Callable[[], None],
                  on_signal_maintenance: Callable[[datetime], None] | None = None,
                  on_cache_maintenance: Callable[[datetime], None] | None = None,
+                 on_improve_tick: Callable[[datetime], None] | None = None,
                  signal_due_fn: Callable[[datetime], bool] | None = None,
                  stop_event: threading.Event | None = None) -> None:
         self.conn = conn
@@ -73,6 +76,15 @@ class Scheduler:
         # 既定 None = 機能無効 (既存テスト互換)。signal maintenance とは
         # 責務が異なるため専用フックにする (責務混在を避ける)。
         self.on_cache_maintenance = on_cache_maintenance
+        # プラン 10 Task 9: improve loop の tick 発火フック。既定 None =
+        # 機能無効 (Task 9 単独では未配線が正しい状態、Task 12 で活性化
+        # 配線)。ImproveSupervisor.tick は sqlite write + thread spawn を
+        # 行うため core_lock 保持下では実行できない。`tick()` は
+        # core_lock 下では「発火すべきか」の判定のみを行い、実際の呼び出しは
+        # 遅延 callable として戻り値のリストに積む — 呼び出し元
+        # (`service._scheduler_tick_once`) が `with app.core_lock:` を
+        # 抜けた後にそれらを実行する (検収 B2、2026-08-22)。
+        self.on_improve_tick = on_improve_tick
         self.signal_due_fn = signal_due_fn
         self._stop_event = stop_event
         # 上書き 1 の改名: cron (1 時間毎) の締切だけを追跡する。signal
@@ -85,8 +97,16 @@ class Scheduler:
         self._was_open: bool | None = None
         self._processed_bar_ts: dict[str, datetime] = {}
 
-    def tick(self, now: datetime) -> None:
+    def tick(self, now: datetime) -> list[Callable[[], None]]:
         """1 tick 分の決定論的処理。
+
+        **戻り値 (検収 B2, 2026-08-22)**: `tick()` は core_lock 保持下で
+        呼ばれる (`service._scheduler_tick_once`)。`on_improve_tick` は
+        sqlite write + thread spawn を伴うため core_lock 下では実行できない
+        — `tick()` はその発火判定のみを行い、実際の呼び出しは遅延
+        callable として戻り値のリストに積んで返す。呼び出し元が
+        core_lock を抜けた後にそれらを順に実行する。`on_improve_tick` が
+        None のとき、リストは常に空。
 
         **呼び出し契約 (codex C-M5)**: `tick()` は **単一スレッド・単一
         タイマーからの逐次呼び出し**を前提とする。再入ガード (ロック) は
@@ -110,6 +130,7 @@ class Scheduler:
         例外経路の保護により、未捕捉例外で tick が抜ける場合でも hooks は
         確実に実行される (プラン 8 レビュー修正 F1)。
         """
+        pending: list[Callable[[], None]] = []
         try:
             open_now = market_hours.is_market_open(now)
             if not open_now:
@@ -121,14 +142,14 @@ class Scheduler:
                 if self._was_open is not False:
                     self._on_market_close(now)
                 self._was_open = False
-                return
+                return pending
             self._was_open = True
 
             # レビュー修正 3: record_snapshot が時系列逆行 (NTP 補正等) で
             # ValueError を送出した場合、mark-to-market 自体が信頼できないため、
             # この tick は安全側に全体スキップする。
             if not self._mark_to_market(now):
-                return
+                return pending
             self._resolve_unknowns(now)
             self._expire_limits(now)
             # codex 1: account snapshot が陳腐化/欠損 (current_account が None) の
@@ -189,6 +210,19 @@ class Scheduler:
             self._process_exits(now, filled_ids)
         finally:
             self._run_hooks(now)
+            # 検収 B2 (2026-08-22): improve tick の発火判定。
+            # `on_improve_tick` が None (未配線、Task 9 単独では常にこれ) な
+            # ら何も積まない。停止中 (`_stopping()`) も判定のみで発火しない
+            # — 判定自体は `_run_hooks` と同じ規約で全 return パスで必ず
+            # 行う (finally)。ただし未捕捉例外で tick が抜ける経路では、
+            # この `pending` リストが呼び出し元へ渡らない (例外がそのまま
+            # 伝播する) ため on_improve_tick は発火しない — `_run_hooks`
+            # (副作用がその場で完結) とはこの点で非対称。period key は
+            # CAS 前なので未消費のまま残り、次 tick で回復する (fail-safe)。
+            # 実際の呼び出しは core_lock の外 (呼び出し元) で行われる。
+            if self.on_improve_tick is not None and not self._stopping():
+                hook = self.on_improve_tick
+                pending.append(lambda hook=hook, now=now: hook(now))
 
         reason = None if self._stopping() else self._trade_mission_due(now)
         if reason is not None:
@@ -199,6 +233,7 @@ class Scheduler:
             accepted = self.on_trade_mission(reason)
             if accepted and reason == "cron":
                 self._last_cron_trade = now
+        return pending
 
     def _stopping(self) -> bool:
         return self._stop_event is not None and self._stop_event.is_set()
@@ -1007,3 +1042,73 @@ class Scheduler:
         if hit is not None:
             kind, price = hit
             self.executor.close_order(row, price, reason=kind)
+
+
+_WEEKDAY_NAMES = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4,
+                  "Sat": 5, "Sun": 6}
+_DAILY_AT_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+_WEEKLY_AT_RE = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+                            r"([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def latest_scheduled_occurrence(
+    now: datetime, *, cadence: str, at: str, display_timezone: str,
+) -> datetime:
+    """`now` 以下 (inclusive) で最新の scheduled occurrence を返す
+    (設計書 §3.1 第1文)。`at` は表示 TZ での局所時刻として解釈する。
+
+    **検収 B1 (2026-08-22)**: 戻り値は **display_timezone の aware
+    datetime**。以前は末尾で `now.tzinfo or tz` へ戻していたため、`now`
+    が UTC (本番の `SystemClock.now()`) で `display_timezone` が非 UTC
+    (本番 `config/settings.yaml.example` の既定 `Asia/Tokyo`) のとき、
+    `period_key_of` が「local occurrence の属する period」ではなく
+    「UTC レンダリング時刻の period」を返し period key が 1 period ずれて
+    いた (daily cadence では毎日、weekly でも一部の `at` でずれる)。
+    `period_key_of` は必ずこの関数の戻り値 (display TZ の aware datetime)
+    から period key を切ること。
+
+    `now` が naive (tzinfo なし) だと `astimezone()` は暗黙にシステムの
+    ローカル TZ で解釈してしまう (B4 で実際に踏んだ罠)。period key の
+    誤り = wave 行の二重消費/取りこぼしに直結するため、naive `now` は
+    fail closed で `ValueError` にする。
+    """
+    if now.tzinfo is None:
+        raise ValueError(
+            "latest_scheduled_occurrence: now must be tz-aware "
+            "(naive datetime would be interpreted using the system's "
+            "local timezone, which is fail-open for period-key correctness)")
+    tz = ZoneInfo(display_timezone)
+    now_local = now.astimezone(tz)
+    if cadence == "daily":
+        m = _DAILY_AT_RE.match(at)
+        if not m:
+            raise ValueError(f"invalid 'at' format for daily cadence: {at!r}")
+        hh, mm = int(m.group(1)), int(m.group(2))
+        candidate = now_local.replace(hour=hh, minute=mm, second=0,
+                                      microsecond=0)
+        if candidate > now_local:
+            candidate = candidate - timedelta(days=1)
+        return candidate
+    if cadence == "weekly":
+        m = _WEEKLY_AT_RE.match(at)
+        if not m:
+            raise ValueError(f"invalid 'at' format for weekly cadence: {at!r}")
+        weekday = _WEEKDAY_NAMES[m.group(1)]
+        hh, mm = int(m.group(2)), int(m.group(3))
+        days_back = (now_local.weekday() - weekday) % 7
+        candidate = (now_local - timedelta(days=days_back)).replace(
+            hour=hh, minute=mm, second=0, microsecond=0)
+        if candidate > now_local:
+            candidate = candidate - timedelta(days=7)
+        return candidate
+    raise ValueError(f"unknown cadence: {cadence!r}")
+
+
+def period_key_of(occurrence: datetime, *, cadence: str) -> str:
+    """weekly = ISO 週 'YYYY-Www'、daily = 'YYYY-MM-DD' (設計書 §3.1)。"""
+    if cadence == "daily":
+        return occurrence.date().isoformat()
+    if cadence == "weekly":
+        iso = occurrence.isocalendar()
+        return f"{iso.year}-W{iso.week:02d}"
+    raise ValueError(f"unknown cadence: {cadence!r}")

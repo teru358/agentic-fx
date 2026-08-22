@@ -441,7 +441,16 @@ def main() -> None:
                 model=settings.runner.improve.model, registry=registry,
                 on_message=on_message)
 
-            _send_frame(protocol_out, out_seq, {"type": "ready", "ok": True})
+            _send_frame(protocol_out, out_seq, {
+                "type": "ready", "ok": True,
+                # レビュー2周目 Important 3: 子が実際に受領・相互照合を通した3値を
+                # ready event へ乗せて返す (診断用途、trade profile では付与しない)。
+                "run_context": {
+                    "mission_id": handshake["mission_id"],
+                    "staging_dir": handshake["staging_dir"],
+                    "source_snapshot_dir": handshake["source_snapshot_dir"],
+                },
+            })
             ready_sent = True
             try:
                 result = runner.run(mission)

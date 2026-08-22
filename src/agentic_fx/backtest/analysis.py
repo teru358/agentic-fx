@@ -368,7 +368,7 @@ _REQUEST_SCHEMA = {
 
 
 def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
-                      request: dict, *, now: datetime) -> dict:
+                      request: dict, *, now: datetime, persist: bool = True) -> dict:
     """改善ループ (プラン 9) に露出する唯一の分析面。
 
     ``in_sample_until = holdout.in_sample_until(now, settings.backtest.
@@ -464,8 +464,10 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
         # 二重に塞ぐ)。
         return {"error": "insufficient_data"}
 
-    run_id = analysis_runs_store.save(
-        conn, params={"request": dict(request),
-                      "in_sample_until": in_sample_until.isoformat()},
-        trial_count=trial_count, source=ANALYSIS_SOURCE, now=now_utc)
-    return {"analysis_run_id": run_id, **payload_body}
+    save_params = {"params": {"request": dict(request),
+                              "in_sample_until": in_sample_until.isoformat()},
+                   "trial_count": trial_count, "source": ANALYSIS_SOURCE}
+    if persist:
+        run_id = analysis_runs_store.save(conn, now=now_utc, **save_params)
+        return {"analysis_run_id": run_id, **payload_body}
+    return {**save_params, **payload_body}

@@ -12,7 +12,7 @@ def _app():
                   registry=None, core_lock=None, mission_watch=None, notifier=None,
                   runner=MagicMock(), owns_runner=True, clock=None,
                   instance_lock=MagicMock(), supervisor=None,
-                  conn_supervisor=MagicMock())
+                  improve_supervisor=None, conn_supervisor=MagicMock())
     return App(**values)
 
 

@@ -13534,6 +13534,20 @@ def period_key_of(occurrence: datetime, *, cadence: Literal["weekly", "daily"]) 
 
 ### 9.1 `latest_scheduled_occurrence` / `period_key_of` — transition matrix (§8.1-17)
 
+> **実装時追記 (2026-08-22 検収 B1)**: `latest_scheduled_occurrence` は末尾で
+> `.astimezone(now.tzinfo or tz)` へ戻さず、**display_timezone の aware
+> datetime のまま返す**こと。下記コードブロックの記述 (`now.tzinfo or tz`
+> へ戻す) は、`now` (本番は aware UTC) と `display_timezone` (本番既定
+> `Asia/Tokyo`) が異なる本番構成で period key が 1 period ずれる欠陥を含む
+> (daily cadence では毎日ズレる)。`period_key_of` はこの関数の戻り値
+> (display TZ の aware datetime) からそのまま period key を切ること。
+> あわせて `now` が naive (tzinfo なし) のときは `ValueError` で fail
+> closed にする (naive は `astimezone()` が暗黙にシステムローカル TZ で
+> 解釈してしまうため — B4 の TZ 依存テストの根本原因でもある)。
+> 9.1 の transition matrix には `now=aware UTC × display_timezone=Asia/Tokyo`
+> のセルを daily `"08:00"` / weekly `"Mon 08:00"` で追加する (正解:
+> `"2026-08-25"` / `"2026-W35"`、いずれも `now=2026-08-25T10:00Z`)。
+
 設計書 §3.1 第 1 文の逐語実装。「`now` 以下で最新の scheduled occurrence」を先に求め、**その occurrence が属する period** を CAS 対象にする (「現在のカレンダー period」を先に選ばない — 両者は跨 period のケースでズレる)。
 
 #### 現状 (`src/agentic_fx/core/scheduler.py:1-27`)
@@ -14646,6 +14660,17 @@ class ImproveSupervisor:
 
 **申し送り**: `submit_manual` の実装 (9.7 節) と `self._improve_loop` への実インスタンス注入 (10.12 節) はいずれも Task 10 (`ImproveLoop`) の完成後に確定する。骨格 Interfaces 節にはこの分割単位の指定が無いため **新規命名**として扱い、末尾の申し送りに転記する。
 
+> **実装時追記 (2026-08-22 検収 M-a)**: `submit_manual` は Task 9 完了時点でも
+> `raise NotImplementedError` のまま (9.5 節の最終形コードブロックが
+> `# 9.7 節で実装` と書くが、9.7 Step 3 は `commands.py` しか示さず実装しない
+> — 9.5/9.7/末尾申し送りの三者が食い違っている)。転写自体は忠実なので
+> Task 9 の転写ブロッカーではないが、**Task 12 が `Commands.improve_supervisor`
+> に実値を渡した瞬間、`improve` (引数無し) が `NotImplementedError` を
+> 送出する** (`dispatch` の `except (ValueError, KeyError)` では捕まらず、
+> 最後の `except Exception` が拾ってエラーメッセージを返す — fail closed
+> ではあるがコマンドは常に失敗する)。**Task 10 完了後・Task 12 の配線 Step
+> の前に、`submit_manual` の実装を担う Step を明示的に起票すること。**
+
 - [ ] **Step 4: 成功を確認**
 
 ```bash
@@ -14983,6 +15008,30 @@ EOF
 
 ### 9.8 `service.py` 配線: 起動・shutdown/join・起動時回収・Scheduler への接続
 
+> **実装時追記 (2026-08-22 検収 B2)**: `Scheduler.tick()` 内に
+> `on_improve_tick` の呼び出し箇所が存在しない (9.1 の Step 3 コードブロック
+> には呼び出しの転写元が無く、実装者が補わなかった) ことが判明。
+> `service.py:988` の `with app.core_lock: app.scheduler.tick(...)` 構造
+> 上、`tick()` 内のどこに呼び出しを置いても `on_improve_tick`
+> (= `ImproveSupervisor.tick`、sqlite write + thread spawn を伴う) は
+> core_lock 保持下で発火してしまう。**遅延 callable 方式を採用する**:
+> `Scheduler.tick()` の戻り値を `list[Callable[[], None]]` にし、
+> core_lock 下では「発火すべきか」の判定のみを行って callable を積んで
+> 返す。`_scheduler_tick_once` は `with app.core_lock:` ブロックを抜けた
+> **後**に、返された callable を順に実行する。
+> **9.8-4 節 (下記) の「`_scheduler_tick_once` から
+> `app.improve_supervisor.tick(now)` を直接呼ぶ経路は採用しない」は
+> 撤回する** — 遅延 callable 方式は Task 9 の境界 (`on_improve_tick` は
+> 既定 None、実値配線は Task 12) を保ったまま、core_lock 外での発火を
+> 構造的に強制する。
+> **Task 12 への申し送り**: `Scheduler.tick()` の戻り値を無視している呼び
+> 出し元がもう 1 箇所ある — `src/agentic_fx/backtest/runner.py:241` の
+> `scheduler.tick(now)`。Task 9 単独では `on_improve_tick` が常に None な
+> ので無害だが、backtest レーンが将来 `on_improve_tick` を配線する場合、
+> 戻り値の callable を実行する経路を backtest 側にも用意しないと
+> 「配線済み・全緑・しかし improve レーンは起動しない」という B2 と
+> 同型の欠陥が別レーンで再発する。ここにも pin が無い。
+
 - [ ] **Step 1: 失敗するテストを書く**
 
 9.6 節で書いた `tests/service/test_improve_wiring.py` に、以下を追記する (9.6 節の 2 テストと合わせて本節で green にする):
@@ -15042,7 +15091,15 @@ uv run pytest tests/service/test_improve_wiring.py -v
 
 3. `App(...)` の構築引数 (`service.py:750-762`) に `improve_supervisor=improve_supervisor,` を追加。
 
-4. `Scheduler(...)` 構築 (`service.py:723-732`) と `Commands(...)` の構築呼び出しは**本 task では変更しない** — `on_improve_tick`/`improve_supervisor` はどちらも 9.1/9.7 節で追加した既定 None のパラメータのままであり、実値を渡す配線は Task 12 の担当 (統合裁定 R-i9)。`_scheduler_tick_once` も同様に**本 task では変更しない** (改善レーンの tick は `Scheduler.on_improve_tick` フック経由で発火する設計であり、`_scheduler_tick_once` から `app.improve_supervisor.tick(now)` を直接呼ぶ経路は採用しない)。
+4. `Scheduler(...)` 構築 (`service.py:723-732`) と `Commands(...)` の構築呼び出しは**本 task では変更しない** — `on_improve_tick`/`improve_supervisor` はどちらも 9.1/9.7 節で追加した既定 None のパラメータのままであり、実値を渡す配線は Task 12 の担当 (統合裁定 R-i9)。~~`_scheduler_tick_once` も同様に**本 task では変更しない** (改善レーンの tick は `Scheduler.on_improve_tick` フック経由で発火する設計であり、`_scheduler_tick_once` から `app.improve_supervisor.tick(now)` を直接呼ぶ経路は採用しない)。~~
+   **実装時追記 (2026-08-22 検収 B2)、上記「採用しない」は撤回**: 遅延
+   callable 方式の採用に伴い `_scheduler_tick_once` **は変更する** —
+   `app.scheduler.tick(app.clock.now())` の戻り値 (`list[Callable[[], None]]`)
+   を `with app.core_lock:` ブロックの外で順に実行するループを追加する。
+   ただし `_scheduler_tick_once` が `app.improve_supervisor.tick(now)` を
+   直接名指しで呼ぶことはない (`Scheduler.on_improve_tick` 経由でのみ
+   間接的に呼ばれる) ため、Task 9 の境界 (`on_improve_tick` は既定 None)
+   は保たれる。
 
 5. `run_service` の起動シーケンス (`service.py:1050` 付近、`app.supervisor.start()` の直後) — `ImproveSupervisor` は `MissionSupervisor` と異なり常駐スレッドを `start()` するのではなく `tick()` 呼び出しごとに slot スレッドを spawn する設計 (9.5 節) なので、明示的な `start()` は不要。ただし **起動時回収** (Task 8 拡張の `recover_interrupted`) の呼び出し位置がある箇所 (着手時に `service.py` を grep して現物確認 — 骨格・設計書とも呼び出し位置の正確な行を明示していない) に、改善レーンの回収が同一 tx で走ることを確認するコメントを追加する。
 
