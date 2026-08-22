@@ -17,6 +17,8 @@ from __future__ import annotations
 import ast
 import hashlib
 import logging
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,6 +91,22 @@ class PluginMeta:
     pairs: tuple[str, ...]
     max_bars: int
     content_hash: str
+    artifact_hash: str | None = None  # プラン10 Task 5 5-F (申し送り③)
+
+
+_PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SYMLINK_TARGET_RE_TMPL = r"^\.versions/{name}/[0-9a-f]{{64}}$"
+
+
+def artifact_hash_bytes(plugin_py: bytes, config_yaml: bytes,
+                        test_plugin: bytes) -> str:
+    """`plugin.py`+`config.yaml`+`test_plugin.py` の 3 本マニフェストから
+    sha256 を算出する (プラン10 Task 5 5-F、設計書 §2.3)。既存
+    `content_hash` (plugin.py+config.yaml の 2 本) とは別物 — 承認版の
+    実体固定に使う。"""
+    return hashlib.sha256(
+        b"plugin.py\0" + plugin_py + b"\0config.yaml\0" + config_yaml +
+        b"\0test_plugin.py\0" + test_plugin).hexdigest()
 
 
 def content_hash(plugin_dir: Path) -> str:
@@ -225,33 +243,90 @@ def _has_matching_function(plugin_py: Path, func_name: str,
     return False
 
 
-def discover(plugins_dir: Path) -> list[PluginMeta]:
+def _resolve_entity(plugins_dir: Path, name: str, activity=None) -> Path | None:
+    """`plugins_dir / name` が {プレーンディレクトリ / 正規形 symlink} の
+    いずれかであることを検査し、実体ディレクトリ (プレーンならそのまま、
+    symlink なら版ディレクトリ) を返す (プラン10 Task 5 5-F、設計書 §2.3)。
+
+    **`resolve()` の使い方に注意**: 妥当性の判定はリンク先の**文字列**
+    (`os.readlink` の戻り値) を正規表現で字句検証することのみで行う —
+    ここで `.match()` に失敗すれば `.resolve()` へは進まない。`.resolve()`
+    は**検証に通った後**、正規形だと確定済みの相対パスを絶対化するためだけ
+    に使う (§2.3 が禁じる「リンク先が正規形かどうかを `resolve()` の結果で
+    判定すること」という逆順の用法ではない)。
+    """
+    entry = plugins_dir / name
+    if entry.is_symlink():
+        target = os.readlink(entry)
+        pattern = re.compile(_SYMLINK_TARGET_RE_TMPL.format(name=re.escape(name)))
+        if not pattern.match(target):
+            _reject(name, f"symlink target does not match canonical form: {target!r}")
+            return None
+        version_dir = (plugins_dir / target).resolve()
+        if not version_dir.is_dir():
+            _reject(name, f"symlink target is not a directory: {version_dir}")
+            return None
+        return version_dir
+    return entry
+
+
+def discover(plugins_dir: Path, *, activity=None) -> list[PluginMeta]:
     """plugins_dir 直下のフラットなフォルダ群から plugin を検出する。
 
     1 plugin = 1 フォルダ。3 ファイル (plugin.py/config.yaml/test_plugin.py)
     のいずれか欠落 → skip + warning。config 不正・AST 不一致 → そのフォル
     ダのみ reject + warning (他フォルダには波及しない)。plugin コードは
     import/実行しない。
+
+    プラン10 Task 5 5-F (設計書 §2.3) — 先頭が `_`/`.` のディレクトリは
+    除外、名前は正規形 (`^[a-z][a-z0-9_]{0,63}$`) のみ受理、正規形の
+    相対 symlink (`plugins/<name>` → `.versions/<name>/<artifact_hash>`)
+    は版ディレクトリへ追従して `PluginMeta.path`/`artifact_hash` を
+    確定する。`activity` は不一致時の ERROR 記録用 (申し送り⑤、省略可)。
     """
     metas: list[PluginMeta] = []
-    for entry in sorted(p for p in plugins_dir.iterdir() if p.is_dir()):
+    for entry in sorted(p for p in plugins_dir.iterdir()
+                        if p.is_dir() or p.is_symlink()):
         name = entry.name
+        if name.startswith("_") or name.startswith("."):
+            continue
+        if not _PLUGIN_NAME_RE.match(name):
+            _reject(name, f"non-canonical plugin name: {name!r}")
+            continue
 
-        missing = [f for f in REQUIRED_FILES if not (entry / f).is_file()]
+        resolved = _resolve_entity(plugins_dir, name, activity=activity)
+        if resolved is None:
+            continue
+
+        missing = [f for f in REQUIRED_FILES if not (resolved / f).is_file()]
         if missing:
             _log.warning("plugin %s: missing %s — skipping", name, missing)
             continue
 
         try:
-            meta = _discover_one(entry, name)
+            meta = _discover_one(resolved, name)
         except OSError as exc:
             # C10: config 読み込み・AST 解析対象の stat/read・content_hash の
             # いずれで OSError が出ても、そのフォルダのみ reject して次へ
             # 進む (他フォルダの discovery を道連れにしない)。
             _reject(name, f"I/O error ({exc})")
             continue
-        if meta is not None:
-            metas.append(meta)
+        if meta is None:
+            continue
+
+        if entry.is_symlink():
+            expected_hash = resolved.name
+            if meta.artifact_hash != expected_hash:
+                _reject(name, f"version dir name {expected_hash!r} does not "
+                              f"match computed artifact_hash "
+                              f"{meta.artifact_hash!r} — rejecting (in-place "
+                              "edit detected)")
+                if activity is not None:
+                    activity.error("plugin_artifact_hash_mismatch",
+                                   {"name": name, "expected": expected_hash,
+                                    "computed": meta.artifact_hash})
+                continue
+        metas.append(meta)
 
     return metas
 
@@ -319,6 +394,10 @@ def _discover_one(entry: Path, name: str) -> PluginMeta | None:
                       f"{func_name}({', '.join(arg_names)})")
         return None
 
+    plugin_bytes = plugin_path.read_bytes()
+    config_bytes = config_path.read_bytes()
+    test_bytes = (entry / "test_plugin.py").read_bytes()
+
     return PluginMeta(
         name=name,
         kind=kind,
@@ -328,4 +407,5 @@ def _discover_one(entry: Path, name: str) -> PluginMeta | None:
         pairs=fields["pairs"],
         max_bars=fields["max_bars"],
         content_hash=content_hash(entry),
+        artifact_hash=artifact_hash_bytes(plugin_bytes, config_bytes, test_bytes),
     )
