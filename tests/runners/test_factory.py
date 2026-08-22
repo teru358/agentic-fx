@@ -79,3 +79,105 @@ def test_build_runner_accepts_on_message(tmp_path):
     runner = build_runner("improve", settings, registry, workdir=tmp_path,
                          on_message=seen.append)
     assert runner is not None
+
+
+# Step 25: Additional tests for comprehensive coverage
+
+def test_build_runner_local_backend_returns_local_runner(tmp_path):
+    """backend=local でも LocalRunner を返す。"""
+    from agentic_fx.config import load_settings
+    from agentic_fx.runners.local_runner import LocalRunner
+
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)  # 既定 improve.backend == local
+    runner = build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+    assert isinstance(runner, LocalRunner)
+
+
+def test_build_runner_claude_backend_returns_claude_runner(tmp_path):
+    """backend=claude を要求すると ClaudeRunner を返す (Task 2 が実装)。"""
+    pytest.importorskip("agentic_fx.runners.claude_runner")
+    from agentic_fx.config import load_settings
+    from agentic_fx.runners.cli_runner import CliRunner
+
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": "claude"})})})
+    runner = build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+    assert isinstance(runner, CliRunner)
+
+
+def test_build_runner_codex_backend_returns_codex_runner(tmp_path):
+    """backend=codex を要求すると CodexRunner を返す (Task 3 が実装)。"""
+    from agentic_fx.config import load_settings
+    from agentic_fx.runners.cli_runner import CliRunner
+
+    pytest.importorskip("agentic_fx.runners.codex_runner")
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": "codex"})})})
+    runner = build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+    assert isinstance(runner, CliRunner)
+
+
+def test_build_runner_trade_profile_uses_trade_choice(tmp_path):
+    """profile=trade のときは runner.trade を見る。"""
+    from agentic_fx.config import load_settings
+    from agentic_fx.runners.local_runner import LocalRunner
+
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)  # trade.backend == local
+    runner = build_runner("trade", settings, ToolRegistry(), workdir=tmp_path)
+    assert isinstance(runner, LocalRunner)
+
+
+def test_build_runner_local_backend_forwards_on_message(tmp_path):
+    """3 周目レビュー Important-1 の随伴修正: local backend でも on_message が
+    LocalRunner まで配線されることを確認する (mission_worker からの
+    transcript/event 転送が local backend だけ静かに欠落するのを防ぐ)。"""
+    from agentic_fx.config import load_settings
+    from agentic_fx.runners.local_runner import LocalRunner
+
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)  # 既定 improve.backend == local
+
+    # Use a custom callback object to avoid bound method identity issues
+    class Callback:
+        def __call__(self, msg):
+            pass
+
+    callback = Callback()
+    runner = build_runner(
+        "improve", settings, ToolRegistry(), workdir=tmp_path,
+        on_message=callback)
+    assert runner._on_message is callback
+
+
+def test_build_runner_forwards_cli_started_sink_to_claude_runner(tmp_path):
+    """(裁定 R1/RB3) build_runner が cli_started_sink= を受け取ったとき、
+    claude backend の CliRunner 系 (ClaudeRunner) の __init__ にそのまま
+    透過することの単体 pin。呼び出し元 (Task 4 Step 7d) が渡した closure
+    が確実に CliRunner まで届くことを、factory 単体で保証する。"""
+    from agentic_fx.config import load_settings
+    from agentic_fx.runners.cli_runner import CliRunner
+
+    pytest.importorskip("agentic_fx.runners.claude_runner")
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": "claude"})})})
+    sink_calls = []
+    runner = build_runner(
+        "improve", settings, ToolRegistry(), workdir=tmp_path,
+        cli_started_sink=sink_calls.append)
+    assert isinstance(runner, CliRunner)
+    assert runner._cli_started_sink is sink_calls.append
+
