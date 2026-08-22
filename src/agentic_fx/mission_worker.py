@@ -441,6 +441,13 @@ def main() -> None:
                 "not supported by mission_worker in this plan (ClaudeRunner "
                 "is Plan 9 scope) — fail closed")
 
+        # R2/B6 (設計書 §2.2): trade worker は handshake の credentials を
+        # os.environ へ setenv する — datafeed コード (price_provider.py/
+        # sources.py) が TWELVEDATA_API_KEY/MT5_BRIDGE_API_KEY を env
+        # 直接参照するため。improve 分岐では行わない (裁定書 F-9 の遮断維持)。
+        for _cred_key, _cred_value in (handshake.get("credentials") or {}).items():
+            os.environ[_cred_key] = _cred_value
+
         from agentic_fx.store.db import connect_readonly
         from agentic_fx.tools import plugin_loader
         from agentic_fx.tools.mission_registry import build_mission_registry

@@ -51,14 +51,36 @@ class RiskSettings(_Strict):
     pair_rules: dict[str, PairRule]
 
 
+class ClaudeCliSettings(_Strict):
+    bin: str = "claude"
+    credentials_file: str = "~/.claude/.credentials.json"
+
+
+class CodexCliSettings(_Strict):
+    bin: str
+    provider: str = Field(pattern="^(chatgpt|llama_swap)$", default="chatgpt")
+    auth_file: str = "~/.codex/auth.json"
+
+
 class RunnerChoice(_Strict):
-    backend: str = Field(pattern="^(local|claude)$")
+    backend: str = Field(pattern="^(local|claude|codex)$")
     model: str
 
 
 class RunnerSettings(_Strict):
     trade: RunnerChoice
     improve: RunnerChoice
+    claude: ClaudeCliSettings = Field(default_factory=ClaudeCliSettings)
+    codex: CodexCliSettings
+    cli_terminate_grace_sec: float = Field(gt=0, default=10.0)
+
+    @model_validator(mode="after")
+    def _trade_backend_not_codex(self) -> "RunnerSettings":
+        if self.trade.backend == "codex":
+            raise ValueError(
+                "runner.trade.backend='codex' is not allowed "
+                "(codex cannot drop shell; trade worker has no Landlock)")
+        return self
 
 
 class LlamaSwapSettings(_Strict):
@@ -152,9 +174,29 @@ class NewsSettings(_Strict):
     cleanup_hours: int = Field(gt=0)
 
 
+class ResearchSettings(_Strict):
+    max_searches: int = Field(ge=1, default=20)
+    max_fetches: int = Field(ge=1, default=30)
+    min_interval_sec: float = Field(gt=0, default=2.0)
+    max_per_host: int = Field(ge=1, default=5)
+    fetch_max_bytes: int = Field(ge=1, default=2_097_152)
+    user_agent: str = "agentic-fx/0.1 (+https://github.com/agentic-fx/agentic-fx)"
+
+
+class ImproveSettings(_Strict):
+    parallel: int = Field(ge=1, le=4, default=1)
+    mission_max_turns: int = Field(ge=1, default=200)
+    mission_timeout_sec: float = Field(ge=60, default=3600)
+    llama_swap_verified: bool = False
+    max_new_backlog_per_mission: int = Field(ge=1, default=20)
+    backtest_rpc_timeout_sec: float = Field(gt=0, default=600)
+    research: ResearchSettings = Field(default_factory=ResearchSettings)
+
+
 class ScheduleSettings(_Strict):
     trade_interval_min: int = Field(ge=1)
     improve: str = Field(pattern="^(weekly|daily)$")
+    improve_at: str = "Sat 03:00"
 
 
 class LoggingSettings(_Strict):
@@ -282,6 +324,7 @@ class Settings(_Strict):
     datafeed: DatafeedSettings
     news: NewsSettings
     schedule: ScheduleSettings
+    improve: ImproveSettings = Field(default_factory=ImproveSettings)
     logging: LoggingSettings
     api: ApiSettings
     discord: DiscordSettings
