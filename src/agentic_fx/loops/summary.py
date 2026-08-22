@@ -99,3 +99,69 @@ def build_state_summary(conn: sqlite3.Connection, broker: PaperBroker,
             stars = "★" * int(e["importance"] or 0)
             lines.append(f"  - {e['ts']} {e['country']} {e['name']} {stars}")
     return "\n".join(lines)
+
+
+IMPROVE_OUTPUT_SCHEMA: dict = {
+    "type": "object",
+    "required": ["discoveries", "selected", "artifact", "selection_rationale"],
+    "properties": {
+        "discoveries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["idea", "source", "evidence"],
+                "properties": {
+                    "idea": {"type": "string"},
+                    "source": {"type": "string", "enum": ["agent", "research"]},
+                    "evidence": {"type": "string"},
+                },
+            },
+        },
+        "selected": {
+            "type": "object",
+            "required": ["backlog_id", "idea"],
+            "properties": {
+                "backlog_id": {"type": ["integer", "null"]},
+                "idea": {"type": "string"},
+            },
+        },
+        "artifact": {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["type", "name", "kind", "self_test", "summary"],
+                    "properties": {
+                        "type": {"const": "plugin"},
+                        "name": {"type": "string",
+                                 "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+                        "kind": {"type": "string",
+                                "enum": ["indicator", "signal", "strategy"]},
+                        "self_test": {"type": "string",
+                                     "enum": ["passed", "failed", "not_run"]},
+                        "summary": {"type": "string"},
+                    },
+                },
+                {
+                    "type": "object",
+                    "required": ["type", "proposal_kind", "title", "body_md"],
+                    "properties": {
+                        "type": {"const": "report"},
+                        "proposal_kind": {"type": "string",
+                                         "enum": ["core", "risk_gate", "research"]},
+                        "title": {"type": "string"},
+                        "body_md": {"type": "string"},
+                    },
+                },
+                {
+                    "type": "object",
+                    "required": ["type", "reason"],
+                    "properties": {
+                        "type": {"const": "observation"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            ],
+        },
+        "selection_rationale": {"type": "string"},
+    },
+}
