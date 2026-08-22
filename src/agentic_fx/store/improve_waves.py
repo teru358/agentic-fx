@@ -17,6 +17,8 @@ def create_wave_and_slots(conn: sqlite3.Connection, *, period_key: str,
                           commit: bool = True) -> bool:
     """1 つの短い tx で wave 行 + slot 行 (reserved, k=0..expected-1) を
     作る。`expected=0` は何も書かない。戻り値は「この呼び出しが起動権を
+    得たか」(= period を消費したか)。"""
+    if expected == 0:
         return False
     now_iso = now.isoformat()
     cur = conn.execute(
