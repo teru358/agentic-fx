@@ -85,6 +85,7 @@ class WorkerRunner(AgentRunner):
                 worker_profile: str = "trade",
                 run_context: object | None = None,
                 on_rpc_leak: Callable[[], None] | None = None,
+                on_ready: Callable[[dict], None] | None = None,
                 stop_event: threading.Event | None = None) -> None:
         self._root = root
         self._settings = settings
@@ -93,6 +94,7 @@ class WorkerRunner(AgentRunner):
         self._worker_profile = worker_profile
         self._run_context = run_context
         self._on_rpc_leak = on_rpc_leak
+        self._on_ready = on_ready
         self._stop_event = stop_event
 
     def close(self) -> None:
@@ -311,6 +313,11 @@ class WorkerRunner(AgentRunner):
             try:
                 ready = self._wait_with_stop(
                     ready_queue, timeout=w.worker_startup_timeout_sec)
+                if self._on_ready is not None:
+                    try:
+                        self._on_ready(ready)
+                    except Exception:  # noqa: BLE001
+                        _log.exception("on_ready callback failed")
                 if not ready.get("ok", False):
                     status = "failed"
                     return MissionResult(status, None, transcript)
