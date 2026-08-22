@@ -11841,6 +11841,11 @@ EOF
 
 12. **統合時に解決済み (R-i14)**: `_current_inventory` (8-I 節) は引き続き `agentic_fx.tools.plugin_loader.approved_plugins(conn, plugins_dir)` を使うが、`plugins_dir` は `settings.paths.plugins_dir` のフォールバック分岐ではなく `build_improve_context` の新設引数 `root: Path` から `root / "plugins"` として導出する形に一本化した (`approved_plugins` 自身が `plugins_dir` 不在時に `[]` を返す既存の防御があるため、`try/except`・フォールバックの重ね掛けは不要と判断し撤去)。Task 5 が `PluginMeta.path`/discover を拡張した後の挙動 (symlink 追従・`_`/`.` 除外) との整合確認は Task 5 完了後に引き続き必要 (この点は変更なし)。
 
+13. **着手前検証 (2026-08-22、`report-task8.md`) 反映時の申し送り**: Blocking B1〜B13・Minor m1〜m14 を本節および 8-A〜8-J・Interfaces 節 (store 提供記号)・Task 9/10 の該当呼び出し行に反映した (`<!-- precheck 2026-08-22: T8-B<k> -->` を付した箇所)。以下は担当外につき本節では直接修正していない — 各担当者が反映すること:
+    - **Task 5 修正者**: 8-B の `expire_due` 既定 `exclude_kinds=("plugin",)` 化に伴い `tests/tools/test_plugin_loader.py:477` を改訂した (8-B Step 5b)。Task 5 節 L6022 付近の受入条件「既存 `test_plugin_loader.py` も無変更で green」に「当該テストを除く」の但し書きを追加すること (裁定 R8)。
+    - **Task 12 修正者**: `finish_improve_mission` の逐語シグネチャ再掲 (Task 12 節内、`def finish_improve_mission(conn, *, mission_id, ...)`) が `now`/`approval_id`/`report_path`/`report_state` を欠いたまま残っている (Task 8 節・Task 9/10 節と同じ B1/B9 の欠落)。Task 12 修正者が同様に追随すること。
+    - **Task 10 修正者 (自身が確定させる箇所)**: `ImproveLoop.prepare` の `build_improve_context` 呼び出しに `root=self._root` を追加し、戻り値の `prompt["prompt_text"]` (非実在) を廃止して `self._render_improve_mission_prompt(ctx_data, ctx=ctx)` 呼び出しへ置き換えた (8-I の対応表を参照する実装)。**`_render_improve_mission_prompt` はまだ本文中に定義が無い** — Task 10 節の担当者が 8-I の対応表 (プレースホルダ⇔戻り値キー) に従って実装すること (本節の担当は「呼び出し行のみ」のため、レンダリング関数の本体実装は Task 10 の責務)。
+
 ## 最終報告 (執筆完了時点の自己申告)
 
 - 書いた行数: 本ファイル全体で 4,286 行 (Task 7: 約 1,380 行 [7-A〜7-F]、Task 8: 約 2,760 行 [8-A〜8-J]、申し送り・最終報告節: 約 40 行)
