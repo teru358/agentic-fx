@@ -31,6 +31,8 @@ from datetime import datetime, timezone
 SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
 
+NOW = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+
 
 def _root(tmp_path):
     import shutil
@@ -76,33 +78,60 @@ def _mission():
                    max_turns=1, timeout_sec=5.0)
 
 
-def test_mission_worker_env_includes_data_provider_credentials_for_trade(monkeypatch):
-    """IM-3/P8-03 対応: trade profile は TWELVEDATA_API_KEY/
-    MT5_BRIDGE_API_KEY を明示 allowlist で子に渡す。AFX_* は継承しない。"""
-    from agentic_fx.runners.worker_runner import _mission_worker_env
-
-    monkeypatch.setenv("TWELVEDATA_API_KEY", "td-secret")
-    monkeypatch.setenv("MT5_BRIDGE_API_KEY", "mt5-secret")
-    monkeypatch.setenv("AFX_SOMETHING", "must-not-leak")
-
-    env = _mission_worker_env("trade")
-
-    assert env["TWELVEDATA_API_KEY"] == "td-secret"
-    assert env["MT5_BRIDGE_API_KEY"] == "mt5-secret"
-    assert "AFX_SOMETHING" not in env
+def _worker_settings(*, claude_backend: bool = False,
+                     credentials_file: str | None = None,
+                     codex_backend: bool = False,
+                     codex_provider: str | None = None,
+                     codex_auth_file: str | None = None):
+    """`SETTINGS` を deep copy し improve backend / claude credentials_file /
+    codex provider・auth_file を上書きするテスト専用ヘルパ (Minor 5:
+    プラン旧稿の `_settings(...)` は非実在だったため新規に書き起こす)。"""
+    runner_update: dict = {}
+    if claude_backend:
+        runner_update["improve"] = SETTINGS.runner.improve.model_copy(
+            update={"backend": "claude"})
+    if credentials_file is not None:
+        runner_update["claude"] = SETTINGS.runner.claude.model_copy(
+            update={"credentials_file": credentials_file})
+    if codex_backend:
+        runner_update["improve"] = SETTINGS.runner.improve.model_copy(
+            update={"backend": "codex"})
+    codex_update: dict = {}
+    if codex_provider is not None:
+        codex_update["provider"] = codex_provider
+    if codex_auth_file is not None:
+        codex_update["auth_file"] = codex_auth_file
+    if codex_update:
+        runner_update["codex"] = SETTINGS.runner.codex.model_copy(
+            update=codex_update)
+    if not runner_update:
+        return SETTINGS
+    return SETTINGS.model_copy(
+        update={"runner": SETTINGS.runner.model_copy(update=runner_update)})
 
 
 def test_mission_worker_env_excludes_credentials_for_improve(monkeypatch):
-    """improve profile では資格情報も渡さない (裁定書 F-9 — 遮断維持)。"""
+    """improve profile では資格情報も渡さない (裁定書 F-9 — 遮断維持)。
+
+    IM-3/P8-03 対応で trade profile にのみ env allowlist していたが、
+    プラン 10 (R10-①) で trade も env 経由をやめ handshake の
+    `credentials` フィールドへ移した — 現在はどの profile も
+    `_mission_worker_env` からは資格情報を受け取らない (旧
+    `test_mission_worker_env_includes_data_provider_credentials_for_trade`
+    は本変更で削除。trade 側の新しい契約は
+    `test_trade_worker_no_longer_receives_data_provider_keys_via_env` /
+    `test_trade_worker_receives_data_provider_keys_via_handshake` が持つ)。"""
     from agentic_fx.runners.worker_runner import _mission_worker_env
 
     monkeypatch.setenv("TWELVEDATA_API_KEY", "td-secret")
     monkeypatch.setenv("MT5_BRIDGE_API_KEY", "mt5-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")  # 5-E M4 killer (検収 B2)
 
     env = _mission_worker_env("improve")
 
     assert "TWELVEDATA_API_KEY" not in env
     assert "MT5_BRIDGE_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_mission_worker_env_omits_unset_credentials(monkeypatch):
@@ -1581,7 +1610,7 @@ def test_child_cwd_is_a_dedicated_dir_outside_the_repository(tmp_path, monkeypat
     def fake_popen(*args, **kwargs):
         captured.update(kwargs)
         # workdir は `tempfile.TemporaryDirectory` の context を抜けた時点で
-        # 消えるので、「空であること」はここ (子の起動時点) で見る。
+        # 消えるので、「`home`/`tmp`/`cfg` の 3 つ以外が無いこと」はここ (子の起動時点) で見る。
         if "cwd" in kwargs:
             captured["cwd_entries"] = sorted(p.name for p in
                                              Path(kwargs["cwd"]).iterdir())
@@ -1605,8 +1634,9 @@ def test_child_cwd_is_a_dedicated_dir_outside_the_repository(tmp_path, monkeypat
     data_dir = (root / "data").resolve()
     assert cwd != data_dir and cwd not in data_dir.parents, (
         f"子の cwd ({cwd}) が data/ ({data_dir}) を覆っている")
-    assert captured["cwd_entries"] == [], (
-        f"子の workdir は空でなければならない (実際: {captured['cwd_entries']})")
+    assert captured["cwd_entries"] == ["cfg", "home", "tmp"], (
+        f"子の workdir は {{'cfg', 'home', 'tmp'}} 以外を含んではならない "
+        f"(実際: {captured['cwd_entries']})")
 
 
 def test_worker_runner_reads_reason_from_result_frame(tmp_path, monkeypatch):
@@ -1834,3 +1864,520 @@ def test_worker_runner_preserves_empty_string_reason(tmp_path, monkeypatch):
     assert result.status == "failed"
     assert result.reason == ""
     assert result.reason is not None
+
+
+# Step 31: WorkerRunner 親側拡張テスト
+_READY_CHILD_SCRIPT = (
+    "import sys, json\n"
+    "sys.stdin.readline()\n"
+    "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
+    "sys.stdout.flush()\n"
+)
+
+
+def test_worker_runner_home_tmp_cfg_subdirs_are_mode_0700(monkeypatch, tmp_path):
+    """親側 protocol sequence 手順 1: `home`/`tmp`/`cfg` を 0700 で作る。
+
+    **B8 の再発防止**: workdir 自体 (`tempfile.TemporaryDirectory` 由来) は
+    Python が既定で 0700 を作るため、workdir 自身の mode を見る旧テストは
+    `workdir.chmod(0o700)` を削除しても恒真 (green のまま) だった。観測点を
+    「本 task が明示 `mkdir(mode=0o700)` で作る」 `home`/`tmp`/`cfg` の
+    3 subdir に移す。"""
+    import stat
+    captured: dict = {}
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        cwd = Path(kw["cwd"])
+        captured["modes"] = {
+            name: stat.S_IMODE(os.stat(cwd / name).st_mode)
+            for name in ("home", "tmp", "cfg")}
+        return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve")
+    runner.run(_mission())
+    assert captured["modes"] == {"home": 0o700, "tmp": 0o700, "cfg": 0o700}
+
+
+def test_worker_runner_creates_home_tmp_cfg_subdirs(monkeypatch, tmp_path):
+    """親側 protocol sequence 手順 1: workdir 直下に home/tmp/cfg を作る
+    (存在の検査 — mode の検査は上記と分離、B7 の再発防止で spy 内側観測)。"""
+    captured: dict = {}
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        cwd = Path(kw["cwd"])
+        captured["is_dir"] = {name: (cwd / name).is_dir()
+                              for name in ("home", "tmp", "cfg")}
+        return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root,
+                          settings=_worker_settings(claude_backend=True),
+                          clock=FixedClock(NOW), rag=_rag(tmp_path),
+                          worker_profile="improve")
+    runner.run(_mission())
+    assert captured["is_dir"] == {"home": True, "tmp": True, "cfg": True}
+
+
+def test_worker_runner_copies_claude_credentials_before_spawn(monkeypatch, tmp_path):
+    """親側 protocol sequence 手順: auth copy は spawn より前 (通常ファイル・
+    所有者・mode・サイズ検査つき)。"""
+    creds = tmp_path / "creds" / ".credentials.json"
+    creds.parent.mkdir()
+    creds.write_text('{"token":"x"}')
+    creds.chmod(0o600)
+    captured: dict = {}
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        cfg_dir = Path(kw["cwd"]) / "cfg"
+        captured["cfg_has_creds"] = (cfg_dir / ".credentials.json").is_file()
+        return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    root = _root(tmp_path)
+    runner = WorkerRunner(
+        root=root,
+        settings=_worker_settings(claude_backend=True, credentials_file=str(creds)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
+    runner.run(_mission())
+    assert captured["cfg_has_creds"] is True
+
+
+def test_worker_runner_does_not_copy_auth_json_for_codex_llama_swap(
+        monkeypatch, tmp_path):
+    """§7.1-2: `codex + provider=llama_swap` は ChatGPT サブスクの資格情報
+    (`auth.json`) をコピーせず、空の scratch `CODEX_HOME` で起動する
+    (指揮者検収 B2 — Task 1 差し戻し。base `dacb41d` の
+    `worker_runner.py` は既に `provider == "chatgpt"` で分岐しており
+    production は正しいが、これを殺すテストが存在しなかった)。"""
+    auth = tmp_path / "creds" / "auth.json"
+    auth.parent.mkdir()
+    auth.write_text('{"token":"chatgpt-subscription-secret"}')
+    auth.chmod(0o600)
+    captured: dict = {}
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        cfg_dir = Path(kw["cwd"]) / "cfg"
+        captured["cfg_has_auth"] = (cfg_dir / "auth.json").is_file()
+        return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    root = _root(tmp_path)
+    runner = WorkerRunner(
+        root=root,
+        settings=_worker_settings(codex_backend=True, codex_provider="llama_swap",
+                                  codex_auth_file=str(auth)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
+    runner.run(_mission())
+    assert captured["cfg_has_auth"] is False, (
+        "codex+llama_swap の scratch CODEX_HOME に auth.json をコピーしている "
+        "— ChatGPT サブスクの資格情報がローカル LLM 相手の mission に漏れる")
+
+
+def test_worker_runner_copies_auth_json_for_codex_chatgpt(monkeypatch, tmp_path):
+    """上記の対: `codex + provider=chatgpt` では `auth.json` を
+    コピーする (退行防止の対テスト)。"""
+    auth = tmp_path / "creds" / "auth.json"
+    auth.parent.mkdir()
+    auth.write_text('{"token":"chatgpt-subscription-secret"}')
+    auth.chmod(0o600)
+    captured: dict = {}
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        cfg_dir = Path(kw["cwd"]) / "cfg"
+        captured["cfg_has_auth"] = (cfg_dir / "auth.json").is_file()
+        return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    root = _root(tmp_path)
+    runner = WorkerRunner(
+        root=root,
+        settings=_worker_settings(codex_backend=True, codex_provider="chatgpt",
+                                  codex_auth_file=str(auth)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
+    runner.run(_mission())
+    assert captured["cfg_has_auth"] is True
+
+
+def test_worker_runner_rejects_credentials_file_that_is_a_symlink(monkeypatch, tmp_path):
+    """認証原本の事前検査: 通常ファイル (`O_NOFOLLOW`) を要求する。"""
+    # conftest の guard を通すため Popen をモック (実際には呼ばれない)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: None)
+
+    real = tmp_path / "real-creds.json"
+    real.write_text('{"token":"x"}')
+    real.chmod(0o600)
+    link = tmp_path / "creds-link.json"
+    link.symlink_to(real)
+    root = _root(tmp_path)
+    runner = WorkerRunner(
+        root=root,
+        settings=_worker_settings(claude_backend=True, credentials_file=str(link)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
+    result = runner.run(_mission())
+    assert result.status == "failed"
+
+
+def test_worker_runner_rejects_credentials_file_readable_by_group(monkeypatch, tmp_path):
+    """認証原本の事前検査: group/other に権限が無いこと (mode 0600 系)。"""
+    # conftest の guard を通すため Popen をモック (実際には呼ばれない)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: None)
+
+    creds = tmp_path / "creds.json"
+    creds.write_text('{"token":"x"}')
+    creds.chmod(0o644)
+    root = _root(tmp_path)
+    runner = WorkerRunner(
+        root=root,
+        settings=_worker_settings(claude_backend=True, credentials_file=str(creds)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
+    result = runner.run(_mission())
+    assert result.status == "failed"
+
+
+def test_worker_runner_rejects_oversized_credentials_file(monkeypatch, tmp_path):
+    """認証原本の事前検査: サイズ ≤ 64 KiB。"""
+    # conftest の guard を通すため Popen をモック (実際には呼ばれない)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: None)
+
+    creds = tmp_path / "creds.json"
+    creds.write_bytes(b"x" * (65 * 1024))
+    creds.chmod(0o600)
+    root = _root(tmp_path)
+    runner = WorkerRunner(
+        root=root,
+        settings=_worker_settings(claude_backend=True, credentials_file=str(creds)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
+    result = runner.run(_mission())
+    assert result.status == "failed"
+
+
+def test_trade_worker_no_longer_receives_data_provider_keys_via_env(monkeypatch):
+    """R10-①: trade 資格情報を env から handshake へ移す。`_mission_worker_env`
+    はどの profile にも資格情報を渡さない (env pin)。"""
+    from agentic_fx.runners.worker_runner import _mission_worker_env
+
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "secret-td")
+    monkeypatch.setenv("MT5_BRIDGE_API_KEY", "secret-mt5")
+    env = _mission_worker_env("trade")
+    assert "TWELVEDATA_API_KEY" not in env
+    assert "MT5_BRIDGE_API_KEY" not in env
+
+
+def test_trade_worker_receives_data_provider_keys_via_handshake(monkeypatch, tmp_path):
+    """R10-①: trade worker は handshake フレームの `credentials` フィールド
+    (stdin) で資格情報を受け取る。"""
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "secret-td")
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        return orig_popen([sys.executable, "-c",
+                           "import sys, json\n"
+                           "line = sys.stdin.readline()\n"
+                           "open('%s', 'w').write(line)\n"
+                           "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
+                           % str(tmp_path / 'handshake.json')], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="trade")
+    runner.run(_mission())
+    handshake = json.loads((tmp_path / "handshake.json").read_text())
+    assert handshake["credentials"]["TWELVEDATA_API_KEY"] == "secret-td"
+
+
+# precheck 2026-08-22 pass2: RB2
+def test_worker_runner_run_context_adds_three_handshake_keys(monkeypatch, tmp_path):
+    """レビュー1周目 C3: `run_context=` (`ImproveRunContext` 相当。ここでは
+    duck-typing で足りる最小オブジェクトを使う) が非 None のとき、
+    `mission_id`/`staging_dir`/`source_snapshot_dir` の 3 キーが
+    handshake フレームへ載る。(差分再検証 RB2) `mission_id` は
+    `ImproveRunContext` 上は int だが、handshake JSON へ載せる際に
+    `str()` される (子側は str 前提、`Path.name` との比較のため) — この
+    assert が `str(42)` を pin する。"""
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        return orig_popen([sys.executable, "-c",
+                           "import sys, json\n"
+                           "line = sys.stdin.readline()\n"
+                           "open('%s', 'w').write(line)\n"
+                           "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
+                           % str(tmp_path / 'handshake.json')], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+
+    class _FakeRunContext:
+        mission_id = 42
+        staging_dir = tmp_path / "staging"
+        source_snapshot_dir = tmp_path / "source"
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_FakeRunContext())
+    runner.run(_mission())
+    handshake = json.loads((tmp_path / "handshake.json").read_text())
+    assert handshake["mission_id"] == "42"  # precheck pass2 RB2: str() 化
+    assert handshake["staging_dir"] == str(tmp_path / "staging")
+    assert handshake["source_snapshot_dir"] == str(tmp_path / "source")
+
+
+def test_worker_runner_run_context_none_omits_three_handshake_keys(
+        monkeypatch, tmp_path):
+    """`run_context=None` (既定、trade profile 等) のとき、3 キーは
+    handshake フレームに含まれない (未知キーの汚染防止)。"""
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        return orig_popen([sys.executable, "-c",
+                           "import sys, json\n"
+                           "line = sys.stdin.readline()\n"
+                           "open('%s', 'w').write(line)\n"
+                           "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
+                           % str(tmp_path / 'handshake.json')], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="trade")
+    runner.run(_mission())
+    handshake = json.loads((tmp_path / "handshake.json").read_text())
+    assert "mission_id" not in handshake
+    assert "staging_dir" not in handshake
+    assert "source_snapshot_dir" not in handshake
+
+
+# Step 36a-36d: cli_started pgid recovery tests
+_FAKE_CHILD_WITH_CLI_STARTED = (
+    "import json, subprocess, sys, time\n"
+    "marker_path = sys.argv[1]\n"
+    "sys.stdin.readline()\n"  # handshake を読み捨てる
+    "cli = subprocess.Popen([sys.executable, '-c',"
+    " 'import time; time.sleep(600)'], start_new_session=True)\n"
+    "open(marker_path, 'w').write(str(cli.pid))\n"
+    "sys.stdout.write(json.dumps({'type': 'cli_started', 'seq': 1,"
+    " 'pgid': cli.pid}) + '\\n')\n"
+    "sys.stdout.flush()\n"
+    "sys.stdout.write(json.dumps({'type': 'ready', 'seq': 2,"
+    " 'ok': True}) + '\\n')\n"
+    "sys.stdout.flush()\n"
+    "time.sleep(600)\n"
+)
+
+
+def test_worker_runner_reaps_cli_pgid_after_worker_is_sigkilled(monkeypatch, tmp_path):
+    """§7.1-2 の blocking 受入条件 (a): fake CLI (別 pgid) が sleep している
+    状態で mission_worker (子) を SIGKILL しても、親 (WorkerRunner) は
+    `cli_started` で得た CLI の pgid を回収し、生存プロセスを 0 にする。"""
+    root = _root(tmp_path)
+    marker = tmp_path / "cli_pid"
+    script = tmp_path / "fake_child.py"
+    script.write_text(_FAKE_CHILD_WITH_CLI_STARTED)
+
+    real_popen = subprocess.Popen
+    spawned: dict = {}
+
+    def fake_popen(cmd, **kwargs):
+        p = real_popen([sys.executable, str(script), str(marker)], **kwargs)
+        spawned["proc"] = p
+        return p
+
+    monkeypatch.setattr("agentic_fx.runners.worker_runner.subprocess.Popen",
+                        fake_popen)
+    settings = _tiny_worker_settings(worker_startup_timeout_sec=5.0,
+                                     worker_grace_sec=5.0)
+    runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve")
+
+    result_box: dict = {}
+    thread = threading.Thread(
+        target=lambda: result_box.update(result=runner.run(_mission())))
+    thread.start()
+    deadline = time.monotonic() + 5.0
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert marker.exists(), "fake CLI が cli_started を送る前にタイムアウトした"
+    cli_pid = int(marker.read_text())
+    os.kill(spawned["proc"].pid, signal.SIGKILL)  # mission_worker 相当を SIGKILL
+    thread.join(timeout=15.0)
+    assert not thread.is_alive(), "runner.run() が終わらない"
+
+    deadline = time.monotonic() + 3.0
+    alive = True
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(cli_pid, 0)
+        except ProcessLookupError:
+            alive = False
+            break
+        time.sleep(0.05)
+    assert not alive, "CLI の pgid が回収されず生存している"
+
+
+# 指揮者検収 (B-4, プラン10 Task1) — 台帳 36d M3 の再判定。
+# `_FAKE_CHILD_WITH_CLI_STARTED` の CLI は SIGTERM を無視しないため
+# `_terminate_cli_pgid` の SIGKILL 昇格は原理的に到達しない、という台帳の
+# 「観測不能」判定は誤りだった。SIGTERM を SIG_IGN する CLI
+# (`tests/runners/test_launcher.py` の `_IGNORE_SIGTERM_AND_TOUCH` と同じ手)
+# に差し替えると escalation は観測できる。
+_FAKE_CHILD_WITH_SIGTERM_IGNORING_CLI = (
+    "import json, subprocess, sys, time\n"
+    "marker_path = sys.argv[1]\n"
+    "sys.stdin.readline()\n"  # handshake を読み捨てる
+    "cli = subprocess.Popen([sys.executable, '-c',"
+    " 'import signal, sys, time;"
+    " signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+    " open(sys.argv[1], \"w\").write(\"ready\"); time.sleep(600)',"
+    " sys.argv[2]], start_new_session=True)\n"
+    "open(marker_path, 'w').write(str(cli.pid))\n"
+    "sys.stdout.write(json.dumps({'type': 'cli_started', 'seq': 1,"
+    " 'pgid': cli.pid}) + '\\n')\n"
+    "sys.stdout.flush()\n"
+    "sys.stdout.write(json.dumps({'type': 'ready', 'seq': 2,"
+    " 'ok': True}) + '\\n')\n"
+    "sys.stdout.flush()\n"
+    "time.sleep(600)\n"
+)
+
+
+def test_worker_runner_terminate_cli_pgid_escalates_to_sigkill_when_cli_ignores_sigterm(
+        monkeypatch, tmp_path):
+    """§7.1-2 の blocking 受入条件 (a) の変種: `cli_started` で得た CLI が
+    SIGTERM を無視しても、`_terminate_cli_pgid` は grace 経過後に SIGKILL
+    へ昇格して回収する (台帳 `tmp/mutation-ledger-task1.md` 36d M3 の
+    再判定 — SIGKILL 昇格を `return` に変えると本テストは完走せず、
+    孤児プロセスが残留する)。"""
+    root = _root(tmp_path)
+    marker = tmp_path / "cli_pid"
+    ready_marker = tmp_path / "cli_ready"
+    script = tmp_path / "fake_child.py"
+    script.write_text(_FAKE_CHILD_WITH_SIGTERM_IGNORING_CLI)
+
+    real_popen = subprocess.Popen
+    spawned: dict = {}
+
+    def fake_popen(cmd, **kwargs):
+        p = real_popen(
+            [sys.executable, str(script), str(marker), str(ready_marker)],
+            **kwargs)
+        spawned["proc"] = p
+        return p
+
+    monkeypatch.setattr("agentic_fx.runners.worker_runner.subprocess.Popen",
+                        fake_popen)
+    settings = _tiny_worker_settings(worker_startup_timeout_sec=5.0,
+                                     worker_grace_sec=5.0)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(
+            update={"cli_terminate_grace_sec": 0.5})})
+    runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve")
+
+    result_box: dict = {}
+    # daemon=True: 変異注入時 (SIGKILL 昇格が消えた版) は CLI が生存し続け、
+    # `proc.stdout` を読み中の reader スレッドと `finally` 節の
+    # `proc.stdout.close()` が同じ io ロックを奪い合って恒久的にブロック
+    # し得る (実測)。thread を daemon にしないとプロセス終了そのものが
+    # 巻き添えでブロックする — 変異の観測 (test failure) 自体はこの前に
+    # `thread.join(timeout=...)` のタイムアウトで確定するため daemon 化
+    # しても red/green の判定には影響しない。
+    thread = threading.Thread(
+        target=lambda: result_box.update(result=runner.run(_mission())),
+        daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5.0
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert marker.exists(), "fake CLI が cli_started を送る前にタイムアウトした"
+    cli_pid = int(marker.read_text())
+
+    # cli_pid が判明した以降は assert 失敗時にも必ず孤児回収まで到達させる
+    # (途中の assert で早期 return すると SIGTERM 無視プロセスが残留する
+    # ことを実測で確認したため try/finally で括る)。
+    try:
+        # SIGTERM ハンドラの設定完了 ("ready" marker) を待たないと race する。
+        deadline = time.monotonic() + 5.0
+        while not ready_marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready_marker.exists(), "SIGTERM 無視 CLI が準備を終える前にタイムアウトした"
+
+        os.kill(spawned["proc"].pid, signal.SIGKILL)  # mission_worker 相当を SIGKILL
+        thread.join(timeout=15.0)
+        assert not thread.is_alive(), "runner.run() が終わらない"
+
+        deadline = time.monotonic() + 3.0
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(cli_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            time.sleep(0.05)
+        assert not alive, "SIGTERM を無視する CLI の pgid が SIGKILL へ昇格せず生存している"
+    finally:
+        # テストが落ちても SIGTERM 無視プロセスを孤児として残さない。
+        try:
+            os.killpg(cli_pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def test_worker_runner_cli_started_never_sent_leaves_finally_a_no_op(
+        tmp_path, monkeypatch):
+    """§7.1-2 の blocking 受入条件 (b): `cli_started` が一度も来なければ、
+    finally の CLI pgid 回収は no-op (架空の pgid へ killpg しない)。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(wr_mod.os, "killpg",
+                        lambda pid, sig: killpg_calls.append((pid, sig)))
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    # `_ensure_dead` は fake_proc.pid (= os.getpid()) への killpg のみ —
+    # cli_started 由来の追加 killpg 呼び出しは無い (架空 pgid への発砲防止)
+    assert all(pid == fake_proc.pid for pid, _sig in killpg_calls)

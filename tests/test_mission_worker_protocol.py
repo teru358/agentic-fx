@@ -1125,9 +1125,9 @@ def test_main_fails_closed_when_improve_backend_is_claude_without_bin_key(
 
     def to_claude(settings_dict):
         settings_dict["runner"]["improve"]["backend"] = "claude"
-        # 意図的に settings_dict["runner"]["claude"] を追加しない —
-        # キー欠落を再現する (現状の config schema には runner.claude が
-        # 存在しないため、何もしなくても欠落状態になる)。
+        # キー欠落を再現する — A-1 merge 後は config schema に runner.claude が
+        # 存在する (model_dump に載る) ため、明示的に落とす (検収 B1、2026-08-22)。
+        settings_dict["runner"].pop("claude", None)
 
     frames, _, _ = _drive_main(
         monkeypatch, tmp_path,
@@ -1140,3 +1140,57 @@ def test_main_fails_closed_when_improve_backend_is_claude_without_bin_key(
     frame = frames[-1]
     assert frame["type"] == "ready" and frame["ok"] is False, frame
     assert "KeyError" in frame["error"], frame
+
+# Step 36e-36h: mission_worker credentials consumption tests
+def test_main_sets_os_environ_from_handshake_credentials_for_trade(
+        monkeypatch, tmp_path):
+    """R2/B6 (設計書 §2.2): trade 分岐は handshake の `credentials` を
+    `os.environ` へ setenv する — datafeed コードが env を直接参照する
+    ため (`price_provider.py`/`sources.py`)。"""
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    try:
+        _drive_main(monkeypatch, tmp_path,
+                    handshake_overrides={
+                        "credentials": {"TWELVEDATA_API_KEY": "secret-td"}})
+        assert os.environ["TWELVEDATA_API_KEY"] == "secret-td"
+    finally:
+        os.environ.pop("TWELVEDATA_API_KEY", None)
+
+
+# precheck 2026-08-22 pass2: RB1
+def test_main_does_not_set_os_environ_from_handshake_credentials_for_improve(
+        monkeypatch, tmp_path):
+    """R2/B6 の裏: improve 分岐では `credentials` を setenv しない (data
+    provider 資格情報は trade worker 専用、裁定書 F-9 の遮断維持)。
+
+    (差分再検証 RB1) この時点 (Task 1) では `_bootstrap_improve_profile`
+    はまだ 0 引数だが、Task 5 5-D がこれを 6 キーワード引数化し `main()`
+    の improve 分岐で `handshake["mission_id"]`/`["staging_dir"]`/
+    `["source_snapshot_dir"]` を直接添字参照するようになる。この 3 本の
+    先付け改訂を Task 5 Step 6d に依存させると B-5 merge 後に確実に red
+    になる (未クローズだった検出漏れ)。ここで最初から `**kw` を受ける
+    lambda + handshake 3 キー付きで書き、Task 5 Step 6d の改訂対象から
+    除外する (改訂不要)。"""
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda **kw: None)
+    try:
+        _drive_main(monkeypatch, tmp_path,
+                    handshake_overrides={
+                        "worker_profile": "improve", "db_path": None,
+                        "plugins_dir": None,
+                        "mission_id": "m-credentials-improve-test",
+                        "staging_dir": str(tmp_path / "staging" / "m-credentials-improve-test"),
+                        "source_snapshot_dir": str(tmp_path / "source"),
+                        "credentials": {"TWELVEDATA_API_KEY": "secret-td"}})
+        assert "TWELVEDATA_API_KEY" not in os.environ
+    finally:
+        os.environ.pop("TWELVEDATA_API_KEY", None)
+
+
+def test_main_handles_missing_credentials_key_in_handshake(monkeypatch, tmp_path):
+    """後方互換: `credentials` キー自体が無い handshake (旧親・テスト由来)
+    でも `KeyError` にならない。"""
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    frames, _, _ = _drive_main(monkeypatch, tmp_path)  # handshake_overrides 無し
+    assert frames[0]["type"] == "ready" and frames[0]["ok"] is True

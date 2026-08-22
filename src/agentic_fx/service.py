@@ -196,6 +196,174 @@ def _check_llama_swap(settings) -> None:
         print(f"llama-swap OK (model '{trade_model}' loaded)")
 
 
+_SECRET_ENV_PATTERNS = ("_API_KEY", "TOKEN", "SECRET", "WEBHOOK",
+                        "ANTHROPIC_", "OPENAI_")
+
+
+def _resolve_cli_bin(bin_value: str, *, require_elf: bool) -> Path:
+    import shutil
+
+    resolved = shutil.which(bin_value) or (
+        bin_value if Path(bin_value).is_absolute() else None)
+    if resolved is None:
+        raise RuntimeError(
+            f"runner CLI bin {bin_value!r} not found on PATH nor an "
+            "absolute path")
+    path = Path(resolved).resolve()
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise RuntimeError(f"runner CLI bin {path} is not an executable file")
+    if require_elf:
+        with open(path, "rb") as f:
+            magic = f.read(4)
+        if magic != b"\x7fELF":
+            raise RuntimeError(
+                f"runner.codex.bin {path} is not an ELF binary (vendor "
+                "native required — node wrappers like 'codex.js' are "
+                "rejected; find the vendor bin under "
+                "'@openai/codex-linux-x64/vendor/.../bin/codex')")
+    return path
+
+
+def _check_cli_version(bin_path: Path) -> None:
+    import subprocess
+
+    try:
+        r = subprocess.run([str(bin_path), "--version"],
+                           capture_output=True, timeout=15,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"runner CLI --version check failed: {e}") from e
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"runner CLI --version exited {r.returncode} for {bin_path}")
+
+
+def _check_credentials_file(path_str: str, *, label: str) -> None:
+    path = Path(path_str).expanduser()
+    if not path.is_file():
+        raise RuntimeError(
+            f"{label} credentials file not found: {path} "
+            "(run the CLI's login flow first)")
+
+
+def _read_proc_self_environ_names() -> set[str]:
+    """`/proc/self/environ` (このプロセスの exec 時点の初期 env) のキー名
+    集合を返す (設計書 §1.4-⑤: `python-dotenv` の `load_dotenv()` は
+    `os.environ` に setenv するだけで `/proc/self/environ` には現れない —
+    B1 の再発防止。`monkeypatch.setenv`/`os.environ[...] = ...` もこの
+    ブロックを書き換えない、Linux 前提)。"""
+    with open("/proc/self/environ", "rb") as f:
+        raw = f.read()
+    names: set[str] = set()
+    for chunk in raw.split(b"\0"):
+        if not chunk:
+            continue
+        key, _sep, _value = chunk.partition(b"=")
+        names.add(key.decode("utf-8", errors="replace"))
+    return names
+
+
+def _check_service_initial_env_has_no_secrets(
+        settings, *,
+        read_initial_env_names=_read_proc_self_environ_names) -> None:
+    """検査⑤ (設計書 §1.4、裁定 R3): サービス自身の**初期 env**
+    (`/proc/self/environ` 相当。既定 seam = `_read_proc_self_environ_names`) に
+    秘密名パターンがあれば起動拒否する。`.env`→`load_dotenv()` で
+    `os.environ` にのみ現れるキーは対象外 (設計が明示的に許容している —
+    exported shell env にだけ秘密を置くな、という検査)。`settings` は
+    呼び出し規約を他の `_check_*` 検査と揃えるために受け取るのみで、
+    現状は未使用。"""
+    names = read_initial_env_names()
+    leaked = [k for k in names
+              if any(pat in k for pat in _SECRET_ENV_PATTERNS)]
+    if leaked:
+        raise RuntimeError(
+            "improve+claude backend refuses to start: service initial env "
+            f"contains secret-like variable name(s) {leaked!r} — improve "
+            "worker can read /proc/self/environ of same-UID processes "
+            "(R10). Put secrets in .env, not exported shell env.")
+
+
+def _check_codex_subscription_expiry(auth_file: str, *, clock=None) -> None:
+    """検査④ (設計書 §1.4、裁定 R4): codex+chatgpt の `auth_file` 内
+    `chatgpt_subscription_active_until` を読み、期限切れなら起動拒否
+    (ERROR)、7 日以内なら WARNING ログのみで起動は継続する。キー欠落・
+    読み取り不能・形式不正は WARNING に留める (fail closed にしない —
+    `auth.json` の形式は実測できていないため、裁定 R4 に従い誤検出で
+    起動不能にしない)。`clock` はテスト注入用 (既定 `datetime.now(UTC)`)。"""
+    import json as _json
+
+    _logger = logging.getLogger("agentic_fx.service")
+    now = (clock or (lambda: datetime.now(timezone.utc)))()
+    path = Path(auth_file).expanduser()
+    try:
+        raw = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        _logger.warning(
+            "codex auth.json (%s) を読めない: %s — chatgpt_subscription_active_until "
+            "を検査できない (fail closed にしない、裁定 R4)", path, e)
+        return
+    value = raw.get("chatgpt_subscription_active_until") if isinstance(raw, dict) else None
+    if value is None:
+        _logger.warning(
+            "codex auth.json (%s) に chatgpt_subscription_active_until が無い "
+            "— サブスク期限を検査できない (形式未実測、裁定 R4)", path)
+        return
+    try:
+        active_until = datetime.fromisoformat(value)
+        if active_until.tzinfo is None:
+            active_until = active_until.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError) as e:
+        _logger.warning(
+            "chatgpt_subscription_active_until の形式が不正: %r (%s)", value, e)
+        return
+    if active_until <= now:
+        raise RuntimeError(
+            f"codex chatgpt subscription expired at {active_until.isoformat()} "
+            "— renew before starting improve+codex")
+    if active_until - now <= timedelta(days=7):
+        _logger.warning(
+            "codex chatgpt subscription expires soon: %s", active_until.isoformat())
+
+
+def _check_cli_backend(settings, *, which: str) -> None:
+    """<!-- precheck 2026-08-22: T1-M14 --> CLI backend 起動時検査 ①②③⑤
+    (設計書 §1.4)。`which` は `"trade"` か `"improve"` — `getattr(settings.runner,
+    which)` で対象の `RunnerChoice` を選ぶ。backend=local の環境では一切
+    走らない。④ (codex サブスク期限) は improve+codex+chatgpt のみ発火する
+    (trade+codex は `RunnerSettings._trade_backend_not_codex` が `Settings`
+    構築時点で拒否するため、trade 側でこの分岐に到達しない)。
+
+    **Minor 14 の再発防止**: 旧実装 (`_check_improve_backend`) は
+    `settings.runner.improve` しか見なかったため、`runner.trade.backend=claude`
+    構成では bin 解決も `--version` も認証ファイルもどれも未検査のまま
+    Mission 実行時に初めて失敗していた (config は `trade.backend: claude`
+    を許容する — trade+codex のみ拒否)。"""
+    choice = getattr(settings.runner, which)
+    backend = choice.backend
+    if backend == "local":
+        return
+    if backend == "claude":
+        bin_path = _resolve_cli_bin(settings.runner.claude.bin, require_elf=False)
+        _check_cli_version(bin_path)
+        _check_credentials_file(settings.runner.claude.credentials_file,
+                                label="claude")
+        _check_service_initial_env_has_no_secrets(settings)
+    elif backend == "codex":
+        bin_path = _resolve_cli_bin(settings.runner.codex.bin, require_elf=True)
+        _check_cli_version(bin_path)
+        if settings.runner.codex.provider == "chatgpt":
+            _check_credentials_file(settings.runner.codex.auth_file,
+                                    label="codex")
+            _check_codex_subscription_expiry(settings.runner.codex.auth_file)
+        elif settings.runner.codex.provider == "llama_swap":
+            if not settings.improve.llama_swap_verified:
+                raise RuntimeError(
+                    "runner.codex.provider='llama_swap' requires "
+                    "improve.llama_swap_verified=true (set only after "
+                    "`afx improve verify-backend` passes — Task 13)")
+
+
 def run_init(root: Path) -> int:
     cfg_dir = root / "config"
     example = cfg_dir / "settings.yaml.example"
@@ -605,6 +773,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             indicator_plugins=approved, provider=provider)
         # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
         _validate_startup(settings)
+        _check_cli_backend(settings, which="trade")
+        _check_cli_backend(settings, which="improve")
         _assert_tools_registered(registry, _TRADE_TOOLS)
 
         owns_runner = runner is None

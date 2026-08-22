@@ -7,7 +7,7 @@ def test_subprocess_calls_explicitly_define_stdin_policy():
     src = Path(__file__).resolve().parents[1] / "src"
     # git rev-parse is a short-lived, non-interactive metadata query. It cannot
     # consume shell input, and changing this established helper is outside Task 19.
-    allowed = {("agentic_fx/store/backtest_runs.py", 235)}
+    allowed = {("agentic_fx/store/backtest_runs.py", 248)}
     missing = []
     seen_allowed = set()
     for path in src.rglob("*.py"):

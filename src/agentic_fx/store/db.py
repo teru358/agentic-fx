@@ -1,9 +1,11 @@
-"""SQLite 接続 + 16 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
+"""SQLite 接続 + 19 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
 `ohlcv` は含まない) — 設計書 §12。"""
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -106,6 +108,56 @@ CREATE TABLE IF NOT EXISTS ohlcv_history (
   source TEXT NOT NULL, spread REAL,
   PRIMARY KEY (symbol, interval, bar_time, source)
 );
+"""
+
+_IMPROVE_WAVES_DDL = """
+CREATE TABLE IF NOT EXISTS improve_waves (
+  period_key TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  expected INTEGER NOT NULL
+);
+"""
+
+_IMPROVE_WAVE_SLOTS_DDL = """
+CREATE TABLE IF NOT EXISTS improve_wave_slots (
+  wave_period_key TEXT NOT NULL REFERENCES improve_waves(period_key),
+  k INTEGER NOT NULL,
+  status TEXT NOT NULL
+    CHECK(status IN ('reserved','claimed','running','done','failed')),
+  mission_id INTEGER,
+  spawn_attempts INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY(wave_period_key, k)
+);
+"""
+
+_PLUGIN_SWITCH_JOURNAL_DDL = """
+CREATE TABLE IF NOT EXISTS plugin_switch_journal (
+  op_id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL CHECK(kind IN ('approve','bless')),
+  approval_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  old_kind TEXT NOT NULL CHECK(old_kind IN ('absent','symlink')),
+  old_target TEXT,
+  temp_path TEXT NOT NULL,
+  new_target TEXT NOT NULL,
+  switch_required INTEGER NOT NULL,
+  phase TEXT NOT NULL CHECK(phase IN
+    ('preparing','versioned','recorded','switched','decided','reverted')),
+  actor TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+"""
+
+_PLUGIN_SWITCH_JOURNAL_OPEN_UNIQUE_DDL = """
+CREATE UNIQUE INDEX IF NOT EXISTS ix_plugin_switch_journal_open_name
+  ON plugin_switch_journal(name)
+  WHERE phase NOT IN ('decided', 'reverted');
+"""
+
+_IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL = """
+CREATE UNIQUE INDEX IF NOT EXISTS ix_improvement_runs_mission_id
+  ON improvement_runs(mission_id)
+  WHERE mission_id IS NOT NULL;
 """
 
 _SCHEMA = _OHLCV_CACHE_DDL + _OHLCV_HISTORY_DDL + """
@@ -226,14 +278,14 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
 -- 書き込み側の劣化は実運用経路 (per-tick 4 bars upsert) で 30→33µs のノイズ。
 CREATE INDEX IF NOT EXISTS ix_ohlcv_cache_bar_time
   ON ohlcv_cache(bar_time);
-"""
+""" + _IMPROVE_WAVES_DDL + _IMPROVE_WAVE_SLOTS_DDL + _PLUGIN_SWITCH_JOURNAL_DDL + _PLUGIN_SWITCH_JOURNAL_OPEN_UNIQUE_DDL
 
 TABLE_NAMES = frozenset({
     "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
-    "alert_state",
+    "alert_state", "improve_waves", "improve_wave_slots", "plugin_switch_journal",
 })
 
 
@@ -912,6 +964,49 @@ def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _now_utc_isoformat() -> str:
+    """現在時刻を UTC ISO 形式で返す (§5.5 migration 内で時刻を自前生成するため)。"""
+    return datetime.now(timezone.utc).isoformat()
+
+
+_LEGACY_PLUGIN_APPROVAL_REQUIRED_KEYS = (
+    "candidate_origin", "candidate_path", "artifact_hash")
+
+
+def _migrate_legacy_plugin_approval_payloads(conn: sqlite3.Connection) -> None:
+    """§5.5: プラン10 導入前に作られた `kind='plugin'` の pending approval で
+    `candidate_origin`/`candidate_path`/`artifact_hash` のいずれかを欠く行を
+    `invalidated(legacy_payload_requires_resubmit)` に確定させる。
+
+    **pending を自動で terminal 化する唯一の箇所** (§5.5 逐語)。以後の
+    起動では対象行が status='pending' でなくなっているため冪等 (no-op)。
+    終端済み行・3 フィールド完備の pending 行・kind != 'plugin' の行には
+    触れない。live からの候補推測はしない (payload をそのまま invalidate
+    するのみ)。
+    """
+    rows = conn.execute(
+        "SELECT id, payload_json FROM approval_requests "
+        "WHERE kind='plugin' AND status='pending'").fetchall()
+    now_iso = _now_utc_isoformat()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            payload = {}
+        if all(k in payload for k in _LEGACY_PLUGIN_APPROVAL_REQUIRED_KEYS):
+            continue  # 新形式 (3 フィールド完備) — 対象外
+        conn.execute(
+            "UPDATE approval_requests SET status='invalidated', "
+            "decided_by='system:migration', decided_at=?, "
+            "reason='legacy_payload_requires_resubmit' WHERE id=?",
+            (now_iso, row["id"]))
+        # R10 (裁定): 対象行ごとに WARNING を出す
+        _log.warning(
+            "plugin approval id=%s invalidated by legacy-payload migration "
+            "(missing %s)", row["id"],
+            [k for k in _LEGACY_PLUGIN_APPROVAL_REQUIRED_KEYS if k not in payload])
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     if _ohlcv_legacy_exists(conn):
@@ -926,4 +1021,22 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_signals_fk(conn)           # Task 13
     _migrate_improvement_runs_v2(conn)  # Task 19 (追加するのはこの 1 行だけ)
     _migrate_trade_intents_observability(conn)   # Task 17
+    # --- プラン 10 Task 8 ここから ---
+    _ensure_column(conn, "improvement_backlog", "attempts",
+                   "attempts INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "improvement_backlog", "last_result", "last_result TEXT")
+    _ensure_column(conn, "improvement_runs", "mission_id", "mission_id INTEGER")
+    conn.execute(_IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL)
+    _ensure_column(
+        conn, "improvement_runs", "report_state",
+        "report_state TEXT NOT NULL DEFAULT 'none' "
+        "CHECK(report_state IN ('none','prepared','published','failed'))")
+    _ensure_column(
+        conn, "backtest_runs", "variant",
+        "variant TEXT NOT NULL DEFAULT 'candidate' "
+        "CHECK(variant IN ('candidate','baseline','no_strategy'))")
+    _ensure_column(conn, "backtest_runs", "ref_plugin_ref", "ref_plugin_ref TEXT")
+    _ensure_column(conn, "backtest_runs", "ref_content_hash", "ref_content_hash TEXT")
+    _migrate_legacy_plugin_approval_payloads(conn)   # §5.5 (8-C 節)
+    # --- プラン 10 Task 8 ここまで ---
     conn.commit()

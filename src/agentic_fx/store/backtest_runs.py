@@ -82,7 +82,9 @@ def _insert(conn: sqlite3.Connection, *, scope: str, issued_by: str,
             plugin_ref: str, content_hash: str, kind: str, pair: str,
             timeframe: str, source: str, period: tuple[datetime, datetime],
             metrics: dict, settings_hash: str, core_commit: str,
-            initial_balance: float, now: datetime) -> int:
+            initial_balance: float, now: datetime, variant: str = "candidate",
+            ref_plugin_ref: str | None = None, ref_content_hash: str | None = None,
+            commit: bool = True) -> int:
     start, end = period
     start_utc = _require_utc(start, "period[0]")
     end_utc = _require_utc(end, "period[1]")
@@ -92,12 +94,14 @@ def _insert(conn: sqlite3.Connection, *, scope: str, issued_by: str,
         "INSERT INTO backtest_runs (plugin_ref, content_hash, kind, pair, "
         "timeframe, source, period_start, period_end, scope, issued_by, "
         "metrics_json, settings_hash, core_commit, initial_balance, "
-        "created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "created_at, variant, ref_plugin_ref, ref_content_hash) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (plugin_ref, content_hash, kind, pair, timeframe, source,
          start_utc.isoformat(), end_utc.isoformat(), scope, issued_by,
          metrics_json, settings_hash, core_commit, initial_balance,
-         now_utc.isoformat()))
-    conn.commit()
+         now_utc.isoformat(), variant, ref_plugin_ref, ref_content_hash))
+    if commit:
+        conn.commit()
     return cur.lastrowid
 
 
@@ -105,7 +109,11 @@ def save_harness_run(conn: sqlite3.Connection, *, scope: str, plugin_ref: str,
                       content_hash: str, kind: str, pair: str, timeframe: str,
                       source: str, period: tuple[datetime, datetime],
                       metrics: dict, settings_hash: str, core_commit: str,
-                      initial_balance: float, now: datetime) -> int:
+                      initial_balance: float, now: datetime,
+                      variant: str = "candidate",
+                      ref_plugin_ref: str | None = None,
+                      ref_content_hash: str | None = None,
+                      commit: bool = True) -> int:
     """ハーネス発行 (issued_by='harness' 固定)。scope は in_sample/holdout_gate のみ。
 
     呼び出し元は Task 9 の run_in_sample / run_holdout_gate だけ (規約 —
@@ -114,12 +122,16 @@ def save_harness_run(conn: sqlite3.Connection, *, scope: str, plugin_ref: str,
     if scope not in _HARNESS_SCOPES:
         raise ValueError(
             f"scope must be one of {sorted(_HARNESS_SCOPES)}: {scope!r}")
+    if variant not in ("candidate", "baseline", "no_strategy"):
+        raise ValueError(f"variant must be candidate|baseline|no_strategy: {variant!r}")
     return _insert(
         conn, scope=scope, issued_by="harness", plugin_ref=plugin_ref,
         content_hash=content_hash, kind=kind, pair=pair, timeframe=timeframe,
         source=source, period=period, metrics=metrics,
         settings_hash=settings_hash, core_commit=core_commit,
-        initial_balance=initial_balance, now=now)
+        initial_balance=initial_balance, now=now, variant=variant,
+        ref_plugin_ref=ref_plugin_ref, ref_content_hash=ref_content_hash,
+        commit=commit)
 
 
 def save_human_run(conn: sqlite3.Connection, *, plugin_ref: str,
@@ -199,6 +211,7 @@ def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
     row = conn.execute(
         "SELECT metrics_json FROM backtest_runs WHERE scope='in_sample' "
         "AND issued_by='harness' AND content_hash=? AND pair=? "
+        "AND variant='candidate' "               # §8.1-40 挙動変更
         "ORDER BY id DESC LIMIT 1", (content_hash, pair)).fetchone()
     if row is None:
         return None

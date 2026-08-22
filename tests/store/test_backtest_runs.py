@@ -443,3 +443,75 @@ def test_latest_in_sample_metrics_malformed_json_returns_none_fail_open(tmp_path
                 "WHERE content_hash='h'")
     conn.commit()
     assert backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY") is None
+
+
+# ---- 8-D: variant/ref_* + latest_in_sample_metrics candidate 限定 --------
+
+def test_save_harness_run_accepts_variant_and_ref_fields(tmp_path):
+    """variant/ref_plugin_ref/ref_content_hash を明示指定できる (既定は
+    'candidate'/None/None — 既存呼び出しは無変更のまま動く)。"""
+    conn = _conn(tmp_path)
+    run_id = backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="no_strategy:rsi_v2",
+        content_hash="cand-hash", kind="strategy", pair="USDJPY",
+        timeframe="1h", source="test", period=(H, H),
+        metrics={"pf": 1.0}, settings_hash="s", core_commit="c",
+        initial_balance=10000.0, now=H,
+        variant="no_strategy", ref_plugin_ref=None, ref_content_hash=None)
+    row = conn.execute(
+        "SELECT variant, ref_plugin_ref, ref_content_hash FROM backtest_runs "
+        "WHERE id=?", (run_id,)).fetchone()
+    assert row["variant"] == "no_strategy"
+
+
+def test_save_harness_run_default_variant_is_candidate(tmp_path):
+    """既存呼び出し (variant を渡さない) は 'candidate' になる (回帰なし)。"""
+    conn = _conn(tmp_path)
+    run_id = backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="rsi_v2",
+        content_hash="h", kind="indicator", pair="USDJPY", timeframe="1h",
+        source="test", period=(H, H), metrics={"pf": 1.0},
+        settings_hash="s", core_commit="c", initial_balance=10000.0, now=H)
+    row = conn.execute("SELECT variant FROM backtest_runs WHERE id=?",
+                       (run_id,)).fetchone()
+    assert row["variant"] == "candidate"
+
+
+def test_latest_in_sample_metrics_ignores_baseline_and_no_strategy_rows(tmp_path):
+    """§8.1-40: latest_in_sample_metrics は variant='candidate' に絞る
+    (挙動変更、pin)。baseline 行が候補の content_hash と衝突しても無視する。"""
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="p", content_hash="h",
+        kind="strategy", pair="USDJPY", timeframe="1h", source="test",
+        period=(H, H), metrics={"pf": 9.9}, settings_hash="s",
+        core_commit="c", initial_balance=10000.0, now=H, variant="baseline",
+        ref_plugin_ref="p", ref_content_hash="h")  # 同じ content_hash で baseline 行
+    got = backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
+    assert got is None  # candidate 行が無いので None (baseline は無視)
+
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="p", content_hash="h",
+        kind="strategy", pair="USDJPY", timeframe="1h", source="test",
+        period=(H, H), metrics={"pf": 1.5}, settings_hash="s",
+        core_commit="c", initial_balance=10000.0, now=H, variant="candidate")
+    got2 = backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
+    assert got2["pf"] == 1.5  # candidate 行だけが返る
+
+
+def test_save_harness_run_commit_false_does_not_commit(tmp_path):
+    """直前修正の申し送り②: commit=False は conn.commit() を呼ばない —
+    呼び出し元 (10.10節 Tx-2) が自分でロールバック可能な状態を保つ。"""
+    conn = _conn(tmp_path)
+    conn.execute("BEGIN IMMEDIATE")
+    run_id = backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="p", content_hash="h",
+        kind="indicator", pair="USDJPY", timeframe="1h", source="test",
+        period=(H, H), metrics={"pf": 1.0},
+        settings_hash="s", core_commit="c", initial_balance=10000.0,
+        now=H, commit=False)
+    conn.rollback()
+    row = conn.execute(
+        "SELECT COUNT(*) c FROM backtest_runs WHERE id=?",
+        (run_id,)).fetchone()
+    assert row["c"] == 0   # rollback で消えている = commit されていなかった

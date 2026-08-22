@@ -367,3 +367,77 @@ def test_every_nested_settings_type_forbids_unknown_keys():
     loose = [t.__name__ for t in types
              if t.model_config.get("extra") != "forbid"]
     assert loose == [], f"未知キーを拒否しない設定型: {loose}"
+
+
+def test_settings_yaml_example_has_claude_and_codex_runner_settings():
+    s = load_settings(EXAMPLE)
+    assert s.runner.claude.bin == "claude"
+    assert s.runner.claude.credentials_file == "~/.claude/.credentials.json"
+    assert s.runner.codex.bin
+    assert s.runner.codex.provider in ("chatgpt", "llama_swap")
+    assert s.runner.cli_terminate_grace_sec > 0
+
+
+def test_settings_yaml_example_has_improve_settings():
+    s = load_settings(EXAMPLE)
+    assert s.improve.parallel >= 1
+    assert s.improve.mission_max_turns >= 1
+    assert s.improve.mission_timeout_sec >= 60
+    assert s.improve.llama_swap_verified is False
+    assert s.improve.max_new_backlog_per_mission >= 1
+    assert s.improve.backtest_rpc_timeout_sec > 0
+    assert s.improve.research.max_searches >= 1
+
+
+def test_settings_yaml_example_has_schedule_improve_at():
+    s = load_settings(EXAMPLE)
+    assert s.schedule.improve_at
+
+
+def test_runner_choice_backend_accepts_codex():
+    from agentic_fx.config import RunnerChoice
+    assert RunnerChoice(backend="codex", model="m").backend == "codex"
+
+
+def test_runner_choice_backend_rejects_unknown_value():
+    from agentic_fx.config import RunnerChoice
+    with pytest.raises(ValidationError):
+        RunnerChoice(backend="bogus", model="m")
+
+
+def test_trade_backend_codex_is_rejected(tmp_path):
+    """trade.backend=codex は起動時に拒否する (§1.4: codex は shell を
+    外せない。trade worker は Landlock 無し + データ資格情報を持つ)。"""
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["runner"]["trade"]["backend"] = "codex"
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError, match="codex"):
+        load_settings(p)
+
+
+def test_improve_backend_codex_is_accepted(tmp_path):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["runner"]["improve"]["backend"] = "codex"
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    s = load_settings(p)
+    assert s.runner.improve.backend == "codex"
+
+
+def test_codex_settings_extra_forbid():
+    """既存 `_Strict` 継承規約 (未知キー拒否) が新規 config クラスにも
+    適用されていることを pin する。"""
+    from agentic_fx.config import CodexCliSettings
+    with pytest.raises(ValidationError):
+        CodexCliSettings(bin="/x/codex", unknown_key=1)
+
+
+def test_improve_mission_timeout_sec_minimum_is_60():
+    """Step 17 M5 killer: `ImproveSettings.mission_timeout_sec` は `ge=60`
+    で下限を強制する (骨格 §1.4 の既定 3600 と `ge=60` は設計書 §1.4 逐語)。"""
+    from agentic_fx.config import ImproveSettings
+    with pytest.raises(ValidationError):
+        ImproveSettings(mission_timeout_sec=59)

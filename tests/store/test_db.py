@@ -12,11 +12,11 @@ EXPECTED = {
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
-    "alert_state",
+    "alert_state", "improve_waves", "improve_wave_slots", "plugin_switch_journal",
 }
 
 
-def test_init_creates_all_17_tables(tmp_path):
+def test_init_creates_all_20_tables(tmp_path):
     conn = connect(tmp_path / "agentic.db")
     init_db(conn)
     rows = conn.execute(

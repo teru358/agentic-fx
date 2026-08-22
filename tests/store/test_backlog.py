@@ -30,3 +30,148 @@ def test_finish_no_longer_accepts_pr_url(tmp_path):
     with pytest.raises(TypeError):
         improve_runs.finish(c, rid, result="report", now=NOW,
                             pr_url="https://example/pr/1")
+
+
+def test_select_for_mission_cas_winner_gets_true_and_transitions_to_selected(tmp_path):
+    """§4.1 Tx-1・裁定7: rowcount=1 の側が True。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "idea", "user", NOW)
+    ok = backlog.select_for_mission(c, bid, now=NOW)
+    assert ok is True
+    row = c.execute("SELECT status, attempts FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+    assert row["status"] == "selected"
+    assert row["attempts"] == 1
+
+
+def test_select_for_mission_cas_loser_gets_false_and_does_not_transition(tmp_path):
+    """2 接続同時選択で敗者は False・状態は変わらない (二重承認申請を防ぐ CAS の核)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "idea", "user", NOW)
+    assert backlog.select_for_mission(c, bid, now=NOW) is True
+    assert backlog.select_for_mission(c, bid, now=NOW) is False
+    row = c.execute("SELECT attempts FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+    assert row["attempts"] == 1  # 敗者側は attempts を増やさない
+
+
+def test_select_for_mission_accepts_open_and_observation_not_others(tmp_path):
+    """`open|observation` からのみ選択できる (§4.3 表の遷移元)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "idea", "user", NOW)
+    backlog.set_status(c, bid, "done", NOW)
+    assert backlog.select_for_mission(c, bid, now=NOW) is False
+
+
+def test_select_for_mission_from_observation_succeeds(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "idea", "user", NOW)
+    backlog.set_status(c, bid, "observation", NOW, last_result="mission_failed:timeout")
+    assert backlog.select_for_mission(c, bid, now=NOW) is True
+
+
+def test_list_open_includes_observation(tmp_path):
+    """`list_open` = `open|observation` (R8: 失敗を「悪い」と記録しない)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    b1 = backlog.add(c, "a", "user", NOW)
+    b2 = backlog.add(c, "b", "user", NOW)
+    backlog.set_status(c, b2, "observation", NOW, last_result="insufficient_trades:5")
+    ids = {r["id"] for r in backlog.list_open(c)}
+    assert ids == {b1, b2}
+
+
+def test_list_open_excludes_selected_done_rejected(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    b1 = backlog.add(c, "a", "user", NOW)
+    b2 = backlog.add(c, "b", "user", NOW)
+    b3 = backlog.add(c, "c", "user", NOW)
+    backlog.set_status(c, b1, "selected", NOW)
+    backlog.set_status(c, b2, "done", NOW, last_result="approved:1")
+    backlog.set_status(c, b3, "rejected", NOW, last_result="human_rejected")
+    assert backlog.list_open(c) == []
+
+
+def test_set_status_writes_last_result(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "a", "user", NOW)
+    backlog.set_status(c, bid, "observation", NOW, last_result="report_failed:disk_full")
+    row = c.execute("SELECT last_result FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+    assert row["last_result"] == "report_failed:disk_full"
+
+
+def test_set_status_commit_false_does_not_commit(tmp_path):
+    """`commit=False` は呼び出し側の tx に留める (Task 8 全体の設計不変条件)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "a", "user", NOW)
+    c.execute("BEGIN IMMEDIATE")
+    backlog.set_status(c, bid, "selected", NOW, commit=False)
+    c.rollback()
+    row = c.execute("SELECT status FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+    assert row["status"] == "open"  # rollback で巻き戻る = commit していなかった証拠
+
+
+@pytest.mark.parametrize("current,outcome,expected_status,expected_last_result_prefix", [
+    ("selected", "done", "done", "report:"),
+    ("selected", "report_failed", "observation", "report_failed:"),
+    ("selected", "gate_failed", "observation", "gate_failed:"),
+    ("selected", "insufficient_trades", "observation", "insufficient_trades:"),
+    ("selected", "unsupported_in_plan10", "observation", "unsupported_in_plan10:"),
+    ("selected", "approved", "done", "approved:"),
+    ("selected", "rejected", "observation", "rejected:"),
+    ("selected", "expired", "observation", "expired"),
+    ("selected", "invalidated", "observation", "invalidated"),
+    ("selected", "mission_failed", "observation", "mission_failed:"),
+    ("selected", "commit_failed", "observation", "commit_failed"),
+    ("selected", "interrupted", "observation", "interrupted"),
+])
+def test_apply_approval_outcome_state_machine_table(
+        tmp_path, current, outcome, expected_status, expected_last_result_prefix):
+    """§4.3 状態機械表を逐語でテーブル駆動テストにする (§8.1-27)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "a", "user", NOW)
+    backlog.set_status(c, bid, current, NOW)
+    backlog.apply_approval_outcome(c, backlog_id=bid, outcome=outcome,
+                                   reason=None, now=NOW)
+    row = c.execute("SELECT status, last_result FROM improvement_backlog "
+                    "WHERE id=?", (bid,)).fetchone()
+    assert row["status"] == expected_status
+    assert row["last_result"].startswith(expected_last_result_prefix)
+
+
+def test_apply_approval_outcome_done_to_observation_only_for_report_state_failed(tmp_path):
+    """§4.3: `done → observation` は `report_state` が `failed` に遷移する
+    ときだけ許す (codex 6 周目 I2)。ここでは outcome='report_publish_failed'
+    という専用 outcome 名で他の done→observation 遷移と区別する。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "a", "user", NOW)
+    backlog.set_status(c, bid, "done", NOW, last_result="report:reports/x.md")
+    backlog.apply_approval_outcome(c, backlog_id=bid,
+                                   outcome="report_publish_failed",
+                                   reason="disk_full", now=NOW)
+    row = c.execute("SELECT status, last_result FROM improvement_backlog "
+                    "WHERE id=?", (bid,)).fetchone()
+    assert row["status"] == "observation"
+    assert row["last_result"] == "report_failed:disk_full"
+
+
+def test_apply_approval_outcome_backlog_id_none_is_noop(tmp_path):
+    """legacy 行 (payload に backlog_id 無し) の invalidated 遷移は no-op。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    backlog.apply_approval_outcome(c, backlog_id=None, outcome="invalidated",
+                                   reason=None, now=NOW)  # 例外にならない
+
+
+def test_human_reject_and_reopen(tmp_path):
+    """人間操作: `observation/open → rejected`、`done/rejected → open`。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "a", "user", NOW)
+    backlog.set_status(c, bid, "rejected", NOW, last_result="human_rejected")
+    row = c.execute("SELECT status FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+    assert row["status"] == "rejected"
+    backlog.set_status(c, bid, "open", NOW, last_result="reopened")
+    row = c.execute("SELECT status FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+    assert row["status"] == "open"
