@@ -781,17 +781,27 @@ class ImproveRunContext:
                                                         # → 読取専用接続ファクトリを内包
 
 # src/agentic_fx/loops/improve_loop.py
+# precheck 2026-08-22 wave2: T10-B10 (rag 注入) / T10-B2・R-D1 (on_ready 方式)
 class ImproveLoop:
     def __init__(self, *, root: Path, settings: "Settings", clock: "Clock",
                  db_write_conn_factory: Callable[[], sqlite3.Connection],
                  db_readonly_conn_factory: Callable[[], sqlite3.Connection],
-                 activity: "ActivityLog") -> None: ...
+                 activity: "ActivityLog", rag: "Rag") -> None: ...
+        # rag: store/rag.py の Rag(data_dir, embedding_function=None, *,
+        # lock_timeout_sec=10.0) — 既存呼び出し元 (service.py) が構築済みの
+        # インスタンスを注入で受ける。ImproveLoop 自身は Rag(...) を new しない
+        # (旧稿 `Rag(self._db_readonly_conn_factory)` は非実在シグネチャだった)
 
-    def prepare(self, *, slot_key: tuple[str, int] | None,
-                now: datetime) -> tuple["Mission", ImproveRunContext, "WorkerRunner"]:
+    def prepare(self, *, slot_key: tuple[str, int] | None, now: datetime,
+                on_ready: Callable[[dict], None] | None = None,
+                ) -> tuple["Mission", ImproveRunContext, "WorkerRunner"]:
         """Tx-0 (missions.start + improve_runs.start + slot claim) → workdir/staging/
         source snapshot 作成 → 認証コピー → 注入コンテキスト → ImproveRunContext 構築 →
-        WorkerRunner(worker_profile="improve", run_context=ctx) 構築。"""
+        WorkerRunner(worker_profile="improve", run_context=ctx, rag=self._rag,
+        on_ready=on_ready, rpc_handlers=ctx.rpc_handlers) 構築 (R-D1/R-D2)。
+        `on_ready` は呼び出し元 (`ImproveSupervisor._launch_slot`, wave 起動)
+        が渡す — `runner.run(mission)` が子の `ready` フレーム受信直後に
+        呼ぶコールバック。手動 one-shot (`submit_manual`) は省略してよい。"""
         ...
 
     def commit(self, *, mission: "Mission", ctx: ImproveRunContext,
@@ -799,6 +809,49 @@ class ImproveLoop:
         """§4.2 の手順 0〜9 (台帳凍結 → 出力検査 → Tx-1 → plugin ゲート →
         戦略採用ゲート → 承認申請 → レポート → Tx-2 → finish_improve_mission)。"""
         ...
+
+
+# ============================================================
+# Task 1 が produces (Task 9/10 が consume) — R-D1/R-D2 実装時改訂 (2026-08-22)
+# src/agentic_fx/runners/worker_runner.py の WorkerRunner
+# ============================================================
+# precheck 2026-08-22 wave2: T10-B2 T10-B17 R-D1 R-D2
+#
+# 現物 (main) は既に on_ready パラメータを持つが、2 点が R-D1 の設計と
+# 食い違う (Task 1 側で実装時改訂が必要 — 本ブロックは Task 9/10 が依存する
+# 契約の記述であり、worker_runner.py 自体の編集は Task 1 の担当):
+#   (a) 現物は on_ready の例外を _log.exception で握り潰し、そのまま
+#       通常の実行 (ready.get("ok") 判定 → 以降のイベントループ) へ進む。
+#       R-D1 は「on_ready が例外を投げたら子を kill して failed を返す
+#       (pre-ready 失敗として扱う)」を要求する — except 節を「_terminate
+#       (kill pgid) → MissionResult('failed', None, transcript) を返して
+#       run() を抜ける」へ書き換える。
+#   (b) 現物は「go」フレームを子へ書かない (handshake 送出後、子は即座に
+#       実行を始める — 2 相ハンドシェイクが無い)。R-D1 の「on_ready から
+#       戻ったら自分で go フレームを書く」は、既存の一発 handshake 方式を
+#       維持したまま on_ready を「ready 直後のフック」として使うのであれば
+#       **不要な追加プロトコルフレームになる** — Task 1 は go フレームを
+#       新設せず、on_ready 完了後にそのまま既存の実行継続 (現物のロジック
+#       のまま) を行ってよい。「go を書く」という語は概念上の同期点を指す
+#       のであって、新規フレーム型の追加を必須にはしない。
+class WorkerRunner:
+    def __init__(self, *, root: Path, settings, clock, rag: "Rag",
+                worker_profile: str = "trade",
+                run_context: object | None = None,
+                on_rpc_leak: Callable[[], None] | None = None,
+                on_ready: Callable[[dict], None] | None = None,
+                rpc_handlers: dict[str, Callable[[dict], dict]] | None = None,
+                stop_event: threading.Event | None = None) -> None: ...
+        # rpc_handlers: R-D2。既定 None のとき、子からの `tool_rpc` フレーム
+        # (現物 `worker_runner.py:216` の ftype 分岐名 — R-D2 ルーリング文の
+        # 「rpc フレーム」は概念名、現物のフレーム型名は tool_rpc) は従来どおり
+        # `self._call_rag(name, args)` (`:387`) だけに dispatch する。
+        # rpc_handlers が渡された場合は「name が rpc_handlers にあれば
+        # rpc_handlers[name](args) を呼び、無ければ _call_rag へフォール
+        # バックする」— 既存の RAG 専用 dispatch を **一般化する。置き換
+        # えない** (trade 経路の既存動作を壊さないため)。
+
+    def run(self, mission: "Mission") -> "MissionResult": ...
 
 
 # ============================================================
@@ -14006,11 +14059,34 @@ EOF
 
 ---
 
-### 9.3 3-way 起動プロトコル: `prepare()`(Tx-0, ImproveLoop 側) → worker spawn → `ready` → `running` commit → `go` (§8.1-18)
+### 9.3 3-way 起動プロトコル: `prepare()`(Tx-0, ImproveLoop 側) → `WorkerRunner.run()` → `on_ready` (`running` commit) → 完走 (§8.1-18)
 
-**Tx-0 (mission 生成 + run 生成 + `reserved→claimed` slot claim) の所有者は `ImproveLoop.prepare` (Task 10, 10.2 節)** — `ImproveSupervisor` 自身は `claim_slot` を直接呼ばない (統合裁定 R-i2)。`ImproveSupervisor` が mission_id を持つのは `prepare()` が返した後であり、`_launch_slot` は「`self._improve_loop.prepare(...)` を呼ぶ → spawn → `ready` 受信 → `running` commit (`improve_waves.mark_running`、これは `ImproveSupervisor` 自身の tx) → `go` 送出 → 完了待ち → `self._improve_loop.commit(...)`」という順序だけを担う。
+<!-- precheck 2026-08-22 wave2: T10-B2 R-D1 実装時改訂 -->
+**実装時改訂 (2026-08-22 深夜裁定 R-D1)**: 本節の見出し・以下の Step 1 の
+`_RecordingFakeWorkerRunner`/`spawn()`/`send_go()`/`run_to_completion()` は
+**撤回**する。`WorkerRunner` に 3 相 API (`spawn`/`send_go`/`run_to_completion`)
+は存在しない (public API は `close()`/`run(mission)` のみ、B2)。3-way 起動は
+**`on_ready` 方式**に統一する — `WorkerRunner.run()` は子の `ready` フレーム
+受信直後に `on_ready(frame)` を呼び、`on_ready` が例外を投げたら子を kill
+して `MissionResult('failed', ...)` を返す (pre-ready 失敗)。正常時は
+`on_ready` から戻った後そのまま実行を継続し、完走の `MissionResult` を返す
+(新規の `go` フレームは追加しない — Interfaces 節「Task 1 が produces
+(R-D1/R-D2 実装時改訂)」ブロック参照)。
 
-**`go` 前は agent/ツール実行ゼロ。`go` が来なければ副作用ゼロで worker が終了する。** これは Task 1 の `WorkerRunner`/`mission_worker` の handshake プロトコルに依存する部分がある (`go` フレームの送出は WorkerRunner 側、Task 1/5 の産物) — 本 task は **ImproveSupervisor 側の呼び出し順序** (`prepare()` → spawn → `ready` 受信 → `running` commit → `go` 送出 → `commit()`) だけを実装・検証する。`go` を受け取った後の worker 内部動作 (実際に agent を起動しない限り副作用ゼロ、という保証自体) は Task 1/4/5 の受入条件であり、本節は **ImproveSupervisor が `go` を `running` の commit より前に送らないこと** の protocol test に限定する (fake `ImproveLoop`/`WorkerRunner` でシーケンスだけを検証する — 実 `ImproveLoop` は Task 10 の産物のため、本 task では `sup._improve_loop` にテストシームとして fake を注入する)。
+**具体的な逐語 Step (Task 10 節 10.12「`ImproveSupervisor._launch_slot`/
+`submit_manual` を R-D1 方式へ書き換える」が正)** を要約する:
+`_launch_slot` は `self._improve_loop.prepare(slot_key=(period_key, k),
+now=now, on_ready=lambda frame: self._mark_slot_running(period_key, k))`
+→ `runner.run(mission)` (1 回のブロッキング呼び出し) → `self._improve_loop.commit(...)`
+の直列呼び出しになる。`_mark_slot_running` が `improve_waves.mark_running`
+を呼ぶ (`ImproveSupervisor` 自身の write 接続・tx)。以下 Step 1〜N の本文・
+変異表は、この `_RecordingFakeWorkerRunner`/`run(mission)` 契約 (Task 10
+節 10.12 の「既存テスト改訂」ブロックが定義する新フェイク) に沿って
+実装時に書き直すこと — 旧稿の `spawn`/`send_go`/`run_to_completion` の
+呼び出し順序を検査する assert は「`prepare` → (`on_ready` 経由の)
+`mark_running` → `run` → `commit`」の順序 assert へ置き換える。
+
+**Tx-0 (mission 生成 + run 生成 + `reserved→claimed` slot claim) の所有者は `ImproveLoop.prepare` (Task 10, 10.2 節)** — `ImproveSupervisor` 自身は `claim_slot` を直接呼ばない (統合裁定 R-i2、不変)。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -14133,25 +14209,40 @@ uv run pytest tests/core/test_improve_wave_slot_protocol.py -v -k "three_way or 
 `improve_supervisor.py` に追加 (**これが最終形** — 9.5 節で N スロット構成に統合する際もこの `_launch_slot` の中身は変わらない):
 
 ```python
+    # precheck 2026-08-22 wave2: T10-B2 R-D1 実装時改訂 — 3相 API
+    # (spawn/send_go/run_to_completion、非実在) を on_ready 方式へ書き換え。
+    # `_handle_pre_ready_failure` (spawn_attempts による retry/failed 分岐、
+    # 9.4 節) の意味論はそのまま維持する — `runner.run()` が **on_ready が
+    # 一度も呼ばれずに** 完走以外の結果を返した場合 (pre-ready 失敗、子の
+    # spawn 自体が失敗) だけ retry 経路へ倒し、on_ready 到達後 (= 'running'
+    # へ遷移済み) の失敗は通常の `ImproveLoop.commit` 終端 (_finalize_failed_
+    # mission、slot を running→failed) へ渡す — 「実行が始まった後の失敗」
+    # を retry してしまうと二重実行になるため区別する。
     def _launch_slot(self, period_key: str, k: int) -> None:
         # mission_id はまだ無い。Tx-0 (missions.start + improve_runs.start +
         # slot claim reserved→claimed) は self._improve_loop.prepare が
         # 一体で行う (統合裁定 R-i2、Task 10 の 10.2 節が正)。
         now = self._clock.now()
+        reached_running = False
+
+        def _on_ready(frame: dict) -> None:
+            nonlocal reached_running
+            conn = self._conn()
+            try:
+                improve_waves.mark_running(
+                    conn, period_key=period_key, k=k, now=self._clock.now(),
+                    commit=True)
+            finally:
+                conn.close()
+            reached_running = True
+
         mission, ctx, runner = self._improve_loop.prepare(
-            slot_key=(period_key, k), now=now)
-        spawn_result = runner.spawn()
-        if spawn_result != "ready":
+            slot_key=(period_key, k), now=now, on_ready=_on_ready)
+        result = runner.run(mission)
+        if not reached_running and result.status != "completed":
+            # pre-ready 失敗 (on_ready 未到達) — Tx-0 で claim 済みの slot を
+            # spawn_attempts に応じて reserved へ戻すか failed にする。
             self._handle_pre_ready_failure(period_key, k)
-            return
-        conn = self._conn()
-        try:
-            improve_waves.mark_running(
-                conn, period_key=period_key, k=k, now=self._clock.now(), commit=True)
-        finally:
-            conn.close()
-        runner.send_go()
-        result = runner.run_to_completion()
         self._improve_loop.commit(mission=mission, ctx=ctx, result=result,
                                   now=self._clock.now())
 ```
@@ -14600,25 +14691,40 @@ class ImproveSupervisor:
             self._active_threads.append(t)
         t.start()
 
+    # precheck 2026-08-22 wave2: T10-B2 R-D1 実装時改訂 — 3相 API
+    # (spawn/send_go/run_to_completion、非実在) を on_ready 方式へ書き換え。
+    # `_handle_pre_ready_failure` (spawn_attempts による retry/failed 分岐、
+    # 9.4 節) の意味論はそのまま維持する — `runner.run()` が **on_ready が
+    # 一度も呼ばれずに** 完走以外の結果を返した場合 (pre-ready 失敗、子の
+    # spawn 自体が失敗) だけ retry 経路へ倒し、on_ready 到達後 (= 'running'
+    # へ遷移済み) の失敗は通常の `ImproveLoop.commit` 終端 (_finalize_failed_
+    # mission、slot を running→failed) へ渡す — 「実行が始まった後の失敗」
+    # を retry してしまうと二重実行になるため区別する。
     def _launch_slot(self, period_key: str, k: int) -> None:
         # mission_id はまだ無い。Tx-0 (missions.start + improve_runs.start +
         # slot claim reserved→claimed) は self._improve_loop.prepare が
         # 一体で行う (統合裁定 R-i2、Task 10 の 10.2 節が正)。
         now = self._clock.now()
+        reached_running = False
+
+        def _on_ready(frame: dict) -> None:
+            nonlocal reached_running
+            conn = self._conn()
+            try:
+                improve_waves.mark_running(
+                    conn, period_key=period_key, k=k, now=self._clock.now(),
+                    commit=True)
+            finally:
+                conn.close()
+            reached_running = True
+
         mission, ctx, runner = self._improve_loop.prepare(
-            slot_key=(period_key, k), now=now)
-        spawn_result = runner.spawn()
-        if spawn_result != "ready":
+            slot_key=(period_key, k), now=now, on_ready=_on_ready)
+        result = runner.run(mission)
+        if not reached_running and result.status != "completed":
+            # pre-ready 失敗 (on_ready 未到達) — Tx-0 で claim 済みの slot を
+            # spawn_attempts に応じて reserved へ戻すか failed にする。
             self._handle_pre_ready_failure(period_key, k)
-            return
-        conn = self._conn()
-        try:
-            improve_waves.mark_running(
-                conn, period_key=period_key, k=k, now=self._clock.now(), commit=True)
-        finally:
-            conn.close()
-        runner.send_go()
-        result = runner.run_to_completion()
         self._improve_loop.commit(mission=mission, ctx=ctx, result=result,
                                   now=self._clock.now())
 
@@ -15180,12 +15286,15 @@ EOF
 - `tests/loops/test_improve_loop_approval_and_ledger.py`
 - `tests/loops/test_improve_loop_report_outbox.py`
 - `tests/loops/test_improve_loop_finalize.py`
-- `tests/backtest/test_holdout_record_fn.py`
+- `tests/store/test_analysis_runs.py` への追記 (precheck 2026-08-22 wave2: T10-B1 — 既存ファイル、新規ではない)
 
+<!-- precheck 2026-08-22 wave2: T10-B15 T10-B16 T10-B2/R-D1 -->
 **Modify**:
-- `src/agentic_fx/backtest/holdout.py:112-187` (`_run_scope`/`run_in_sample`/`run_holdout_gate`) — `record_fn` の non-committing 版を追加
-- `src/agentic_fx/core/improve_supervisor.py` — `ImproveSupervisor.__init__` で `None` のまま残していた `self._improve_loop` に実 `ImproveLoop` インスタンスを注入する配線を `service.py` 側に追加する (10.12 節。`ImproveSupervisor` 自体のコードは 9.5 節の最終形から変更しない)
-- `src/agentic_fx/service.py` — `ImproveLoop` の構築と `ImproveSupervisor._improve_loop` への注入 (10.12 節)
+- `src/agentic_fx/store/analysis_runs.py` — `save` に `commit: bool = True` を追加 (T10-B1、10.10 節 Step 0)
+- `src/agentic_fx/core/improve_supervisor.py` — `ImproveSupervisor.__init__` で `None` のまま残していた `self._improve_loop` に実 `ImproveLoop` インスタンスを注入する配線を `service.py` 側に追加し、`_launch_slot`/`submit_manual` を R-D1 (on_ready 方式) へ書き換える (10.12 節。9.3/9.5 節の実装時改訂と対になる)
+- `src/agentic_fx/service.py` — `ImproveLoop` の構築 (`rag=` 込み) と `ImproveSupervisor._improve_loop` への注入 (10.12 節)
+- `src/agentic_fx/mission_worker.py` の `_build_improve_registry` (A-4 が用意した空 `ToolRegistry()` の seam、`agentic-fx-t4` 現物 `mission_worker.py:381-401`) — `build_mission_registry("improve", ...)` へ差し替える (10.9 節 Step 12、B17。**A-4 merge 後**に着手)
+- `src/agentic_fx/backtest/holdout.py` は**触らない** (B15 — Task 7-D で `record_fn` 実装済み。旧稿の Modify 記載を撤回)
 
 **Test (詳細)**: 上記 Create の各ファイル。fixture は `tests/loops/` 配下の既存 `TradeLoop` テスト (`tests/loops/test_trade_loop*.py` — 着手時に現物確認して fixture パターンを流用する) に合わせる。
 
@@ -15244,14 +15353,16 @@ class ImproveRunContext:
     rpc_handlers: dict[str, Callable[[dict], dict]]
 
 # src/agentic_fx/loops/improve_loop.py
+# precheck 2026-08-22 wave2: T10-B10 T10-B2/R-D1 — rag 注入・prepare の on_ready
 class ImproveLoop:
     def __init__(self, *, root: Path, settings: "Settings", clock: "Clock",
                  db_write_conn_factory: Callable[[], sqlite3.Connection],
                  db_readonly_conn_factory: Callable[[], sqlite3.Connection],
-                 activity: "ActivityLog") -> None: ...
+                 activity: "ActivityLog", rag: "Rag") -> None: ...
 
-    def prepare(self, *, slot_key: tuple[str, int] | None,
-                now: datetime) -> tuple["Mission", ImproveRunContext, "WorkerRunner"]: ...
+    def prepare(self, *, slot_key: tuple[str, int] | None, now: datetime,
+                on_ready: Callable[[dict], None] | None = None,
+                ) -> tuple["Mission", ImproveRunContext, "WorkerRunner"]: ...
 
     def commit(self, *, mission: "Mission", ctx: ImproveRunContext,
                result: "MissionResult", now: datetime) -> None: ...
@@ -15371,6 +15482,200 @@ EOF
 
 ---
 
+<!-- precheck 2026-08-22 wave2: T10-B3 -->
+### 10.1b `tests/loops/conftest.py` 新設 (B3 — 以降の全サブタスクが依存する共有 fixture)
+
+**欠陥**: `tests/loops/` に conftest は無い (`find tests -name conftest.py` は
+`tests/conftest.py` 1 本のみ、ネットワーク隔離の autouse fixture しか
+提供しない)。以降のサブタスクは `loop_min`/`loop_full`/`conn`/`_build_loop`/
+`mission_and_run_fixture`/`mission_and_run_fixture_with_slot` を**定義済み
+前提**で使う — このまま転記すると約 45 本が `fixture '...' not found` で
+collection error になる。ここで一括定義する。
+
+**`loop_min` と `loop_full` の差**: 本節では**同一の構築**にする — どちらも
+`_build_loop(conn)` (フル初期化された `ImproveLoop`) を返す。旧稿は両者を
+書き分ける想定だったが、書き分けを要求する具体的な違い (どの private
+メソッドまで実装済み前提か) はプラン中のどの Step にも明記されていない
+ため、恒等な別名として定義する (2 つの fixture 名を後続 Step がそのまま
+使えるようにするための互換シム)。実装時に片方だけ状態を変える必要が
+生じた場合は、その Step 側で個別に上書きすること。
+
+- [ ] **Step 1: `tests/loops/conftest.py` を新設する**
+
+```python
+# tests/loops/conftest.py (新規)
+"""tests/loops/test_improve_loop_*.py 共有 fixture (プラン10 Task10、B3)。
+
+`tests/loops/test_trade_loop.py` の `connect(tmp_path/"t.db")` +
+`init_db(conn)` パターンを踏襲する。"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from agentic_fx.activity import ActivityLog
+from agentic_fx.config import load_settings
+from agentic_fx.core.contracts import FixedClock
+from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.loops.improve_run_context import ImproveRunContext
+from agentic_fx.store import backlog as backlog_store
+from agentic_fx.store import improve_runs as improve_runs_store
+from agentic_fx.store import improve_waves
+from agentic_fx.store import missions as missions_store
+from agentic_fx.store.db import connect, init_db
+
+NOW = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+SETTINGS = load_settings(
+    Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+
+
+class _FakeRag:
+    """`ImproveLoop.__init__(rag=...)` (T10-B10) を満たすだけの no-op —
+    本節の private メソッドテストは Rag を経由しない (RAG ツールは
+    research_tools 経由、10.9 節 B17 の registry 配線テストで別途扱う)。"""
+
+
+@pytest.fixture
+def conn(tmp_path):
+    c = connect(tmp_path / "t.db")
+    init_db(c)
+    yield c
+    c.close()
+
+
+@pytest.fixture
+def clock():
+    return FixedClock(NOW)
+
+
+def _build_loop(conn, tmp_path, *, clock=None):
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    return ImproveLoop(
+        root=tmp_path, settings=SETTINGS, clock=clock or FixedClock(NOW),
+        db_write_conn_factory=lambda: conn,
+        db_readonly_conn_factory=lambda: conn,
+        activity=ActivityLog(tmp_path / "activity.log"), rag=_FakeRag())
+
+
+@pytest.fixture
+def loop_min(conn, tmp_path, clock):
+    return _build_loop(conn, tmp_path, clock=clock)
+
+
+@pytest.fixture
+def loop_full(conn, tmp_path, clock):
+    # precheck 2026-08-22 wave2: T10-B3 — loop_min と同一構築 (上記説明参照)
+    return _build_loop(conn, tmp_path, clock=clock)
+
+
+@pytest.fixture
+def loop_and_ctx(loop_min, conn, tmp_path):
+    """`ImproveRunContext` を直接構築する軽量 fixture — `prepare()` の
+    Tx-0/workdir 作成を経由せず、`commit()` 経由メソッド (`_select_and_bind`
+    等) の単体テストに使う。"""
+    staging_dir = tmp_path / "staging"
+    source_snapshot_dir = tmp_path / "source"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    source_snapshot_dir.mkdir(parents=True, exist_ok=True)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
+        "run_backtest": 600.0, "analyze_corr": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=1, run_id=1, staging_dir=staging_dir,
+        source_snapshot_dir=source_snapshot_dir, allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+    return loop_min, ctx
+
+
+@pytest.fixture
+def mission_and_run_fixture(conn, clock):
+    """`missions`+`improvement_backlog`+`improvement_runs` の最小行を作り
+    `(mission_id, run_id, backlog_id)` を返す (slot 無し = 手動 one-shot 相当)。"""
+    mission_id = missions_store.start(
+        conn, "improve", "codex", "gpt-5", clock.now(), commit=False)
+    backlog_id = backlog_store.add(conn, "idea", "user", clock.now())
+    run_id = improve_runs_store.start(
+        conn, None, clock.now(), mission_id=mission_id, commit=False)
+    conn.commit()
+    return mission_id, run_id, backlog_id
+
+
+@pytest.fixture
+def mission_and_run_fixture_with_slot(conn, clock):
+    """`mission_and_run_fixture` に加え、wave/slot を作って claim 済みに
+    した `(mission_id, run_id, backlog_id, slot_key)` を返す。"""
+    period_key = "2026-W34"
+    improve_waves.create_wave_and_slots(
+        conn, period_key=period_key, now=clock.now(), expected=1, commit=False)
+    mission_id = missions_store.start(
+        conn, "improve", "codex", "gpt-5", clock.now(), commit=False)
+    claimed = improve_waves.claim_slot(
+        conn, period_key=period_key, k=0, mission_id=mission_id,
+        now=clock.now(), commit=False)
+    assert claimed
+    backlog_id = backlog_store.add(conn, "idea", "user", clock.now())
+    run_id = improve_runs_store.start(
+        conn, None, clock.now(), mission_id=mission_id, commit=False)
+    conn.commit()
+    return mission_id, run_id, backlog_id, (period_key, 0)
+
+
+@pytest.fixture
+def conn_with_approved_strategy(conn, clock):
+    """10.7 節の baseline 照合 (`approval_requests.status='approved'` の
+    最新行での近似、統合裁定 R-i12) が読む承認済み plugin 行を 1 件作る。
+    `approvals` テーブルの列名は Task 8 の詳細節が正 — ここでは
+    `store/approvals.py::create` をそのまま使う。"""
+    from agentic_fx.store import approvals as approvals_store
+
+    approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "baseline_strategy", "kind": "strategy",
+                 "content_hash": "baseline-hash"},
+        now=clock.now(), commit=False)
+    conn.execute(
+        "UPDATE approval_requests SET status='approved' WHERE id="
+        "(SELECT id FROM approval_requests ORDER BY id DESC LIMIT 1)")
+    conn.commit()
+    return conn
+
+
+def _prepare_wave_slot(conn, *, period_key: str, k: int, now, expected: int = 1):
+    """wave+slot を `reserved` のまま用意する (claim 前状態が要るテスト用)。"""
+    improve_waves.create_wave_and_slots(
+        conn, period_key=period_key, now=now, expected=expected, commit=True)
+    return period_key, k
+```
+
+- [ ] **Step 2: 動作確認**
+
+```bash
+uv run pytest tests/loops/test_improve_loop_prepare.py -v --collect-only
+```
+
+`fixture '...' not found` が 0 件であること (この時点では各テスト本体は
+`NotImplementedError` 等で red のままでよい — collection が通ることのみ確認)。
+
+- [ ] **Step 3: コミット**
+
+```bash
+git add tests/loops/conftest.py
+git commit -m "$(cat <<'EOF'
+test: tests/loops/conftest.py 新設 (プラン10 Task10, B3)
+
+loop_min/loop_full/conn/_build_loop/mission_and_run_fixture(_with_slot)/
+loop_and_ctx/conn_with_approved_strategy/_prepare_wave_slot を一括定義し、
+以降の全サブタスクの fixture not found を解消する。
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
 ### 10.2 `prepare()`: Tx-0 (missions+run+slot の 1 tx) — 生成〜破棄 sequence protocol test (§8.1-6/23)
 
 設計書 §4.1 Tx-0: `BEGIN IMMEDIATE` → `missions.start(commit=False)` → `improvement_runs.start(mission_id, backlog_id=NULL, commit=False)` → (scheduler wave のときのみ) slot claim UPDATE → `COMMIT`。**run の生成は Mission と同時・原子的** — 出力不正・timeout・worker 異常死でも run は必ず残る。`improvement_runs.mission_id` は新規行について一意 (部分 UNIQUE、既存移行行の NULL は許す)。
@@ -15471,15 +15776,23 @@ uv run pytest tests/loops/test_improve_loop_prepare.py -v -k tx0
 def _sample_ctx_data():
     return {
         "performance_report": {
-            "window_days": 30, "win_rate": 0.5, "profit_factor": 1.2,
+            # precheck 2026-08-22 wave2: T10-M2 — improve_context.py:62 の
+            # 実shape は [30, 90] (複数窓)。単一 int ではない
+            "window_days": [30, 90], "win_rate": 0.5, "profit_factor": 1.2,
             "by_pair": {"USDJPY": 0.4}, "by_hour": {"9": 0.3},
             "reject_breakdown": {"spread": 2}, "hold_rate": 0.1},
         "improvement_history": {"recent_runs": [
             {"id": 1, "backlog_id": 2, "idea": "x", "result": "approved",
              "attempts": 1, "last_result": None}]},
-        "current_inventory": {"approved_plugins": ["p1"],
-                              "news_sources": ["s1"],
-                              "risk_gate": {"max_positions": 3}},
+        # precheck 2026-08-22 wave2: T10-B4 — improve_context.py:86-92 の
+        # 実shape (list[dict], list[str] ではない) に合わせる。文字列
+        # リストのままだと `", ".join(list[str])` は緑のまま通ってしまい
+        # 本番の `", ".join(list[dict])` (TypeError) を検出できない。
+        "current_inventory": {
+            "approved_plugins": [{"name": "p1", "kind": "indicator",
+                                  "pairs": ["USDJPY"]}],
+            "news_sources": [{"name": "s1", "enabled": True}],
+            "risk_gate": {"max_positions": 3}},
         "backlog": {"items": [
             {"id": 2, "idea": "x", "status": "open", "attempts": 1,
              "assigned": True}]},
@@ -15561,9 +15874,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from agentic_fx.activity import Category
+from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
+    # module-level で import する (関数内 import だと monkeypatch.setattr
+    # ("agentic_fx.loops.improve_loop.holdout.run_in_sample", ...) が
+    # 属性未定義で ImportError になり、足しても sys.modules から取り直す
+    # ため効かない)
 from agentic_fx.loops.improve_context import build_improve_context
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA  # precheck 2026-08-22 wave2: T10-B12
 from agentic_fx.runners.base import Mission
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
@@ -15574,24 +15893,34 @@ if TYPE_CHECKING:
     from agentic_fx.config import Settings
     from agentic_fx.core.contracts import Clock
     from agentic_fx.runners.worker_runner import WorkerRunner
+    from agentic_fx.store.rag import Rag  # precheck 2026-08-22 wave2: T10-B10
 
 _log = logging.getLogger("agentic_fx.improve_loop")
 
 
 class ImproveLoop:
+    # precheck 2026-08-22 wave2: T10-B10 — Rag はここで注入を受ける
+    # (`_build_worker_runner` が独自シグネチャで new しない)
     def __init__(self, *, root: Path, settings: "Settings", clock: "Clock",
                  db_write_conn_factory: Callable[[], sqlite3.Connection],
                  db_readonly_conn_factory: Callable[[], sqlite3.Connection],
-                 activity: "ActivityLog") -> None:
+                 activity: "ActivityLog", rag: "Rag") -> None:
         self._root = root
         self._settings = settings
         self._clock = clock
         self._db_write_conn_factory = db_write_conn_factory
         self._db_readonly_conn_factory = db_readonly_conn_factory
         self._activity = activity
+        self._rag = rag
 
-    def prepare(self, *, slot_key: tuple[str, int] | None,
-               now: datetime) -> tuple[Mission, ImproveRunContext, "WorkerRunner"]:
+    # precheck 2026-08-22 wave2: T10-B2/R-D1 — on_ready は
+    # `_build_worker_runner` を経由して `WorkerRunner(on_ready=...)` へ渡す。
+    # `ImproveSupervisor._launch_slot` (Task 9, on_ready で mark_running を
+    # 行う) が指定する。省略時は None (WorkerRunner 既定と同じ、手動
+    # one-shot=`submit_manual` は on_ready 不要なので省略する)
+    def prepare(self, *, slot_key: tuple[str, int] | None, now: datetime,
+               on_ready: Callable[[dict], None] | None = None,
+               ) -> tuple[Mission, ImproveRunContext, "WorkerRunner"]:
         conn = self._db_write_conn_factory()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -15644,10 +15973,18 @@ class ImproveLoop:
             conn, settings=self._settings, now=now, root=self._root,
             allowed_backlog_ids=allowed_ids)
         prompt_text = self._render_improve_mission_prompt(ctx_data, ctx=ctx)
-        mission = Mission(prompt=prompt_text, tools=[],
-                          output_schema={}, max_turns=self._settings.improve.mission_max_turns,
+        # precheck 2026-08-22 wave2: T10-B12/B17 — tools/output_schema は
+        # 10.9 節 Step 12 (`_build_mission_tools`) で完成させる。ここでは
+        # その呼び出しに置き換えるだけ (完全実装は 10.9 節参照)
+        mission_tools = self._build_mission_tools(
+            staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+            ledger=ledger, rpc_handlers=rpc_handlers)
+        mission = Mission(prompt=prompt_text, tools=mission_tools,
+                          output_schema=IMPROVE_OUTPUT_SCHEMA,
+                          max_turns=self._settings.improve.mission_max_turns,
                           timeout_sec=self._settings.improve.mission_timeout_sec)
-        runner = self._build_worker_runner(ctx)
+        # precheck 2026-08-22 wave2: T10-B2/R-D1
+        runner = self._build_worker_runner(ctx, on_ready=on_ready)
         conn.close()
         return mission, ctx, runner
 
@@ -15700,8 +16037,16 @@ class ImproveLoop:
             "reject_breakdown": _dict_to_line(perf["reject_breakdown"]),
             "hold_rate": perf["hold_rate"],
             "improvement_history_table": _history_table(hist["recent_runs"]),
-            "approved_plugins": ", ".join(inv["approved_plugins"]) or "(なし)",
-            "news_sources": ", ".join(inv["news_sources"]) or "(なし)",
+            # precheck 2026-08-22 wave2: T10-B4 — improve_context.py:86-92 は
+            # list[dict] (name/kind/pairs, name/enabled) を返す。list[str]
+            # 前提の `", ".join(list)` は本番で TypeError になるため、
+            # 辞書から name を取り出して結合する
+            "approved_plugins": (", ".join(
+                f"{p['name']}({p['kind']})" for p in inv["approved_plugins"])
+                or "(なし)"),
+            "news_sources": (", ".join(
+                f"{s['name']}({'on' if s['enabled'] else 'off'})"
+                for s in inv["news_sources"]) or "(なし)"),
             "risk_gate_summary": _dict_to_line(inv["risk_gate"]),
             "backlog_table": _backlog_table(bl["items"]),
             "user_policy_tail": policy["tail"],
@@ -15723,9 +16068,17 @@ class ImproveLoop:
     def _build_rpc_handlers(self, ledger, *, staging_dir: Path):
         raise NotImplementedError  # Task 7 依存分。10.9 節 Step 11 で完全実装する
 
-    def _build_worker_runner(self, ctx):
+    def _build_mission_tools(self, *, staging_dir, source_snapshot_dir,
+                             ledger, rpc_handlers):
+        raise NotImplementedError  # precheck 2026-08-22 wave2: T10-B12/B17
+                                    # 10.9 節 Step 12 で完全実装する
+
+    def _build_worker_runner(self, ctx, *,
+                             on_ready: Callable[[dict], None] | None = None):
         raise NotImplementedError  # Task 1 (C3) 依存。10.9 節 Step 7 で
-                                    # WorkerRunner(..., run_context=ctx) として完成
+                                    # WorkerRunner(..., run_context=ctx,
+                                    # on_ready=on_ready) として完成
+                                    # (precheck 2026-08-22 wave2: T10-B2/R-D1)
 
     def commit(self, *, mission, ctx, result, now):
         raise NotImplementedError  # 10.4〜10.11 節
@@ -16328,20 +16681,30 @@ class _SelectionOutcome:  # 新規命名
 class ImproveLoop:
     ...
 
+    # precheck 2026-08-22 wave2: T10-B5 T10-M10 T10-M11
     def _select_and_bind(self, conn, output: dict, ctx: ImproveRunContext,
                          *, now: datetime) -> _SelectionOutcome:
         conn.execute("BEGIN IMMEDIATE")
         try:
             limit = self._settings.improve.max_new_backlog_per_mission
+            inserted = 0  # precheck 2026-08-22 wave2: T10-M10 — 上限は挿入件数
+                          # で数える (enumerate インデックスは重複 skip の分だけ
+                          # ずれる)
             dropped = 0
-            for i, d in enumerate(output.get("discoveries", [])):
-                idea_norm = " ".join(d["idea"].split()).lower()
+
+            def _norm(idea: str) -> str:
+                # precheck 2026-08-22 wave2: T10-M11 — SQL 側 lower(trim(idea))
+                # と同じ「前後空白のみ除去」に揃える (内部空白は畳まない)
+                return idea.strip().lower()
+
+            for d in output.get("discoveries", []):
+                idea_norm = _norm(d["idea"])
                 dup = conn.execute(
                     "SELECT id FROM improvement_backlog WHERE "
                     "lower(trim(idea))=?", (idea_norm,)).fetchone()
                 if dup is not None:
                     continue
-                if i >= limit:
+                if inserted >= limit:
                     dropped += 1
                     continue
                 conn.execute(
@@ -16349,6 +16712,7 @@ class ImproveLoop:
                     "created_at, updated_at) VALUES (?,?,'open',?,?)",
                     (d["idea"], d.get("source", "agent"), now.isoformat(),
                      now.isoformat()))
+                inserted += 1
             if dropped:
                 self._activity.write(
                     Category.IMPROVE, "backlog_limit_exceeded",
@@ -16357,15 +16721,30 @@ class ImproveLoop:
             selected = output.get("selected", {})
             backlog_id = selected.get("backlog_id")
             if backlog_id is None:
-                idea_norm = " ".join(selected.get("idea", "").split()).lower()
+                selected_idea = selected.get("idea", "")
+                idea_norm = _norm(selected_idea)
                 row = conn.execute(
                     "SELECT id FROM improvement_backlog WHERE "
                     "lower(trim(idea))=? AND status IN ('open','observation')",
                     (idea_norm,)).fetchone()
                 if row is None:
-                    conn.commit()
-                    return _SelectionOutcome(won=False, backlog_id=None)
-                backlog_id = row["id"]
+                    # precheck 2026-08-22 wave2: T10-B5 — discoveries にも
+                    # 既存 backlog にも無い「新規 idea を選択」した場合は、
+                    # ここで improvement_backlog へ INSERT してから選ぶ
+                    # (docstring が謳う契約。test_new_idea_selected_creates_
+                    # and_binds_in_same_tx が要求する)。空文字は選択なしとして
+                    # 扱う (fail closed — 実在しない idea を勝者にしない)。
+                    if not selected_idea.strip():
+                        conn.commit()
+                        return _SelectionOutcome(won=False, backlog_id=None)
+                    cur = conn.execute(
+                        "INSERT INTO improvement_backlog (idea, source, status, "
+                        "created_at, updated_at) VALUES (?,?,'open',?,?)",
+                        (selected_idea, selected.get("source", "agent"),
+                         now.isoformat(), now.isoformat()))
+                    backlog_id = cur.lastrowid
+                else:
+                    backlog_id = row["id"]
 
             won = backlog_store.select_for_mission(
                 conn, backlog_id, now=now, commit=False)
@@ -16378,6 +16757,13 @@ class ImproveLoop:
             conn.rollback()
             raise
 ```
+
+**既存テスト改訂 (共通規約)**: `test_duplicate_idea_normalized_whitespace_and_case_is_deduped`
+(L16362 付近) は前後空白しか使わない構成のままだと M11 の是正 (内部空白を畳まなく
+した変更) を検出できない。同テストへ「内部に連続空白を含む idea」のケースを
+追加するのではなく、**このテストの意図 (前後の trim だけで正規化が揃うこと) は
+維持したまま assert を変えない** — 内部空白の非対称性は新規変異 M11' として
+Step 5 の変異表に追加する (下記)。
 
 - [ ] **Step 4: 成功を確認**
 
@@ -16392,8 +16778,10 @@ uv run pytest tests/loops/test_improve_loop_tx1_selection.py -v
 | M1 | `improve_runs_store.bind_backlog` の呼び出しを削る (勝者でも run が bind されない) | `test_winner_gets_backlog_bound_to_run` |
 | M2 | discoveries の INSERT を `if won:` の内側に移す (敗者で discoveries が消える) | `test_loser_run_stays_unbound_but_discoveries_persist` |
 | M3 | 重複判定の `lower(trim(...))` を削り大小文字/空白差異で別 idea 扱いにする | `test_duplicate_idea_normalized_whitespace_and_case_is_deduped` |
-| M4 | `if i >= limit: dropped += 1; continue` を削る (上限を守らない) | `test_new_backlog_over_limit_are_dropped_and_counted_in_activity` |
+| M4 | `if inserted >= limit: dropped += 1; continue` を削る (上限を守らない) | `test_new_backlog_over_limit_are_dropped_and_counted_in_activity` |
 | M5 | `backlog_store.select_for_mission` の呼び出しを無条件成功にする (CAS を無視) | 追加テスト「2 並行 Mission が本物の別接続で同時に selected を取り合い、片方だけが won になる」を実装者が追加すること (下限リスト不足、multi-connection レース再現が必要 — 申し送り) |
+| M6 (precheck 2026-08-22 wave2: T10-B5) | `row is None` のとき INSERT せず常に `won=False` を返す (新規 idea 選択が効かない退行) | `test_new_idea_selected_creates_and_binds_in_same_tx` (Step 1 で既存。B5 是正で green 化する対象そのもの) |
+| M7 (precheck 2026-08-22 wave2: T10-M11) | `_norm` を `" ".join(idea.split()).lower()` (内部空白も畳む) に戻す — SQL 側 `lower(trim(idea))` と不一致になり、内部に連続空白を持つ 2 idea が Python 側では重複扱いなのに SQL 側では別行として INSERT され得る | `test_python_and_sql_idea_normalization_agree_on_internal_whitespace` (新規、実装者が追加すること — 前後空白のみの idea 2 件と、内部に連続空白を持つ idea 2 件の両方を投入し、SQL 側 `SELECT` 件数と Python 側正規化後の重複判定が一致することを assert する) |
 
 - [ ] **Step 6: コミット**
 
@@ -16495,11 +16883,25 @@ uv run pytest tests/loops/test_improve_loop_plugin_gate.py -v
 
 - [ ] **Step 3: 最小実装**
 
-```python
-from agentic_fx.plugin.gate_pytest import run_gate_pytest
-from agentic_fx.plugin.sandbox import SandboxError, check_source
+<!-- precheck 2026-08-22 wave2: T10-B14 T10-M5 T10-M6 -->
+**前提**: 本 Step は B-6 (`agentic-fx-t6`) の `plugin/gate_pytest.py::check_candidate_snapshot`/
+`hashes_of`/`run_gate_pytest` が main へ merge された後に着手すること。B-6 未 merge の間は
+`ImportError` になる。
 
-_MAX_FILE_BYTES = 1_000_000  # settings 経由に置き換える (10.9節)
+`_run_plugin_gate` は自前で hash を計算しない。t6 の `gate_pytest.hashes_of()`
+(内部で `plugin/loader.content_hash`/`artifact_hash_bytes` を呼ぶ — 単一所有者)
+をそのまま使う。**スナップショット検査 (3 本ちょうど・symlink・`st_nlink!=1`・
+サイズ超過・`__pycache__`/`*.pyc`/`.pytest_cache` の無視) も `run_gate_pytest`
+内部の `check_candidate_snapshot` が既に行う** ため、本メソッドで再実装しない
+(M6 — 二重実装だと t6 側のスナップショット是正が親側コピーに反映されず、
+`PluginSession` 実行後の再ゲートが恒久的に失敗する不具合を再導入する):
+
+```python
+from agentic_fx.plugin.gate_pytest import (
+    CandidateSnapshotError, GateResult, check_candidate_snapshot, hashes_of,
+    run_gate_pytest,
+)
+from agentic_fx.plugin.sandbox import SandboxError, check_source
 
 
 @dataclass(frozen=True)
@@ -16515,32 +16917,13 @@ class ImproveLoop:
 
     def _run_plugin_gate(self, plugin_dir: Path, *,
                          name: str) -> _PluginGateVerdict:
-        entries = sorted(plugin_dir.iterdir())
-        required = {"plugin.py", "config.yaml", "test_plugin.py"}
-        names = {e.name for e in entries}
-        if names != required:
-            return _PluginGateVerdict(
-                passed=False, reason=f"expected exactly 3 files {required}, "
-                                     f"got {sorted(names)}")
-        for e in entries:
-            st = e.lstat()
-            if not stat.S_ISREG(st.st_mode):
-                return _PluginGateVerdict(
-                    passed=False, reason=f"{e.name} is not a regular file "
-                                        "(symlink/hardlink/other rejected)")
-            if st.st_nlink != 1:
-                return _PluginGateVerdict(
-                    passed=False, reason=f"{e.name} has st_nlink != 1 "
-                                        "(hardlink rejected)")
-            if st.st_size > _MAX_FILE_BYTES:
-                return _PluginGateVerdict(
-                    passed=False, reason=f"{e.name} exceeds max file size")
+        # precheck 2026-08-22 wave2: T10-B14 T10-M5 T10-M6 T10-M7
+        try:
+            check_candidate_snapshot(plugin_dir)
+        except CandidateSnapshotError as exc:
+            return _PluginGateVerdict(passed=False, reason=str(exc))
 
-        plugin_py = (plugin_dir / "plugin.py").read_bytes()
-        config_yaml = (plugin_dir / "config.yaml").read_bytes()
-        test_plugin = (plugin_dir / "test_plugin.py").read_bytes()
-        content_hash_before = hashlib.sha256(plugin_py + config_yaml).hexdigest()
-        artifact_hash_before = _artifact_hash_of(plugin_py, config_yaml, test_plugin)
+        content_hash_before, artifact_hash_before = hashes_of(plugin_dir)
 
         try:
             check_source(plugin_dir / "plugin.py")
@@ -16549,18 +16932,17 @@ class ImproveLoop:
         except SandboxError as exc:
             return _PluginGateVerdict(passed=False, reason=str(exc))
 
-        result = run_gate_pytest(plugin_dir, settings=self._settings)
+        try:
+            result = run_gate_pytest(plugin_dir, settings=self._settings)
+        except RuntimeError as exc:
+            # M7: Landlock 不可 (run_gate_pytest の fail-closed RuntimeError,
+            # 設計書 §4.2-3d) は commit() 全体を例外で抜けさせず gate 不合格に倒す
+            return _PluginGateVerdict(passed=False, reason=str(exc))
         if not result.passed:
             return _PluginGateVerdict(
                 passed=False, reason=f"pytest failed: {result.stdout_tail}")
 
-        plugin_py_after = (plugin_dir / "plugin.py").read_bytes()
-        config_yaml_after = (plugin_dir / "config.yaml").read_bytes()
-        test_plugin_after = (plugin_dir / "test_plugin.py").read_bytes()
-        content_hash_after = hashlib.sha256(
-            plugin_py_after + config_yaml_after).hexdigest()
-        artifact_hash_after = _artifact_hash_of(
-            plugin_py_after, config_yaml_after, test_plugin_after)
+        content_hash_after, artifact_hash_after = hashes_of(plugin_dir)
         if (content_hash_after != content_hash_before
                 or artifact_hash_after != artifact_hash_before):
             return _PluginGateVerdict(
@@ -16571,6 +16953,15 @@ class ImproveLoop:
             passed=True, content_hash=content_hash_before,
             artifact_hash=artifact_hash_before)
 ```
+
+`content_hash`/`artifact_hash` はこれで t6 の `hashes_of()` (= `loader.content_hash`/
+`loader.artifact_hash_bytes`) と常に同一の値になる (B14 が指摘した二重実装による
+identity 不一致 — `latest_in_sample_metrics` の 0 件ヒット、Task 11 の admit/
+`plugin_switch_journal`/signals の照合不成立 — を解消する)。`_artifact_hash_of`
+(本節旧稿の自前実装) は定義しない。10.6 の Step 1 (失敗するテスト) は
+`monkeypatch.setattr("agentic_fx.loops.improve_loop.run_gate_pytest", _fake_gate)`
+だけでなく `check_candidate_snapshot`/`hashes_of` も同様に monkeypatch する形へ
+改訂すること (差し替え対象が増えたため)。
 
 - [ ] **Step 4: 成功を確認**
 
@@ -17355,14 +17746,16 @@ class ImproveLoop:
 
     def _publish_report(self, conn, *, run_id: int, part_path: Path,
                         final_path: Path, now: datetime) -> None:
+        # precheck 2026-08-22 wave2: T10-B6 — os.rename は POSIX で既存
+        # ファイルを黙って上書きする。旧稿はリネーム**後**に
+        # `part_path.exists()` (常に False — リネームで消えている) を見て
+        # おり事後条件が恒偽だった。リネームの**前**に存在確認する
+        # (TOCTOU の窓は残る — 真の原子性には renameat2(RENAME_NOREPLACE)
+        # の ctypes 直叩きが要る、申し送り項目4に明記済み)。
         try:
-            os.rename(part_path, final_path)  # RENAME_NOREPLACE 相当は
-                                                # os.rename が既存を上書き
-                                                # しうるため、事前に存在
-                                                # 確認する (下の except で
-                                                # フォールバック検出)。
-            if final_path.exists() and part_path.exists():
+            if final_path.exists():
                 raise FileExistsError(final_path)
+            os.rename(part_path, final_path)
         except FileExistsError:
             self._fail_report(conn, run_id=run_id, now=now, reason="rename_conflict")
             return
@@ -17400,17 +17793,21 @@ class ImproveLoop:
 
     def reconcile_report_outbox(self, conn, *, reports_dir: Path,
                                 now: datetime) -> None:
+        # precheck 2026-08-22 wave2: T10-B7 — `_write_report_part` は
+        # `improve-{mission_id}.md.part` で書く (mission_id、run_id では
+        # ない)。旧稿はここで `row['id']` (= run_id) を使っており、
+        # `improvement_runs.mission_id IS NOT NULL` の部分 UNIQUE index が
+        # 保証する 1 run = 1 mission の対応を使わず**別の値**でファイルを
+        # 探すため常に見つからない。SELECT に `mission_id` を含める。
         rows = conn.execute(
-            "SELECT id, report_state, report_path FROM improvement_runs "
+            "SELECT id, mission_id, report_state, report_path "
+            "FROM improvement_runs "
             "WHERE report_state IN ('prepared','published')").fetchall()
         for row in rows:
             report_path = Path(row["report_path"]) if row["report_path"] else None
             if row["report_state"] == "prepared":
                 part_path = (reports_dir / ".tmp"
-                            / f"improve-{row['id']}.md.part")
-                # mission_id と run_id は今の実装では同一命名規則を仮定
-                # している (10.9節時点の簡略化 — 10.11節で mission_id を
-                # run 行から正しく引く形へ揃える)。
+                            / f"improve-{row['mission_id']}.md.part")
                 if part_path.exists() and report_path is not None:
                     self._publish_report(conn, run_id=row["id"],
                                         part_path=part_path,
@@ -17446,6 +17843,8 @@ uv run pytest tests/loops/test_improve_loop_report_outbox.py -v
 | M3 | `_publish_report` が `report_state='published'` の UPDATE を rename **前**に行う | `test_directory_fsync_called_after_rename` の変種として実装者が「rename が失敗したら published にならない」ケースを明示的に追加すること (下限リスト不足、申し送り) — 本節の `test_publish_failure_when_final_already_exists_triggers_compensation` は結果として検出できるが、意図は「rename 前に状態を書かない」という順序の直接 pin ではない |
 | M4 | `reconcile_report_outbox` の `published` 分岐で `report_path.exists()` チェックを削る | `test_reconcile_published_with_missing_final_fails_closed` |
 | M5 | `_fail_report` が `backlog_id` の分岐 (`AND status='done'`) を無条件 UPDATE にする (`selected`/`observation` からも遷移させてしまう) | 実装者が backlog `status='selected'` の状態で `_fail_report` を呼び、遷移しないことを確認する追加テストを書くこと (下限リスト不足、申し送り) |
+| M6 (precheck 2026-08-22 wave2: T10-B6) | `_publish_report` の `if final_path.exists(): raise FileExistsError(final_path)` を rename の**後**に戻す (旧稿の退行 — `part_path.exists()` は rename 成功後は常に False なので事後条件が恒偽になる) | `test_publish_failure_when_final_already_exists_triggers_compensation` |
+| M7 (precheck 2026-08-22 wave2: T10-B7) | `reconcile_report_outbox` の `part_path` 組み立てを `row['mission_id']` から `row['id']` (run_id) に戻す | `test_reconcile_prepared_with_part_publishes` |
 
 - [ ] **Step 6: コミット**
 
@@ -17619,7 +18018,11 @@ def test_run_backtest_handler_hides_period_and_now_from_agent(
         ledger=ledger, run_backtest_handler=handlers["run_backtest"],
         analyze_corr_handler=handlers["analyze_corr"])}
 
-    out = json.loads(tools["run_backtest"].func(name="myst", pair="USDJPY"))
+    # precheck 2026-08-22 wave2: T10-B19 — `ToolDef.func` は dict を返す
+    # (JSON 文字列化は `ToolRegistry.execute()` の責務、Task 7 検収で
+    # 二重エンコードが解消されている)。`json.loads(dict)` は TypeError
+    # になるため直接 dict として検査する。
+    out = tools["run_backtest"].func(name="myst", pair="USDJPY")
     assert "period" not in out and "now" not in out
     assert "period_start" not in out and "period_end" not in out
 
@@ -17713,7 +18116,10 @@ class ImproveLoop:
         agent への返却は `build_improve_rpc_tooldefs` 側の `_strip_forbidden`
         が行う (`period`/`now` を含む拡張 `_FORBIDDEN_KEYS` — 本節で
         `tools/improve_rpc_tools.py` の定義へ追記済み)。"""
-        from agentic_fx.backtest import holdout
+        # precheck 2026-08-22 wave2: 型6#5 — `holdout` はモジュール冒頭で
+        # import 済み (下の `holdout.run_in_sample` は module 属性を読む)。
+        # ここでの再 import は行わない (monkeypatch.setattr の対象が
+        # 関数ローカル変数だと sys.modules から取り直され効かなくなるため)。
         from agentic_fx.backtest.analysis import analyze_for_agent
         from agentic_fx.plugin import loader as plugin_loader
         from agentic_fx.plugin import strategy_adapter
@@ -17724,53 +18130,86 @@ class ImproveLoop:
             if meta is None or meta.kind != "strategy":
                 # run_backtest は kind=strategy の candidate のみ対応する
                 # (in-sample バックテストは strategy にのみ意味を持つ —
-                # indicator/signal の探索は analyze_corr が担う)。
+                # indicator/signal の探索は analyze_corr が担う)。M18: この
+                # 判定は self._db_readonly_conn_factory() を開く前・
+                # ledger.record の前に置く (接続リークも intent_source
+                # リークも起きず、台帳も汚さない)。渡す情報は agent 自身が
+                # 送った `name` のみなので M16 (下記) の畳み込み対象外
+                # (漏洩なし)。
                 raise ValueError(
                     f"run_backtest requires a strategy candidate: "
                     f"{args['name']!r}")
-            conn = self._db_readonly_conn_factory()
-            captured: list[dict] = []
-            intent_source = strategy_adapter.build_intent_source(
-                meta, conn=conn, pair=args["pair"], source=_EVAL_SOURCE,
-                settings=self._settings)
+            # precheck 2026-08-22 wave2: T10-M16 — handler 内の全例外は
+            # 固定コードへ畳む (Task 7 検収 M-6 の申し送りをここで適用する)。
+            # 生の例外文言 (`sqlite3.OperationalError: unable to open
+            # database file /home/.../data/agentic.db` 等、パスや日時を
+            # 含み得る) は `ToolRegistry.execute` の `safe_error_text` を
+            # 素通りし遮断⑦ の抜け道になるため、ここで畳んでから返す。
             try:
-                holdout.run_in_sample(
-                    self._settings, history_conn=conn, symbol=args["pair"],
-                    source=_EVAL_SOURCE, intent_source=intent_source,
-                    eval_timeframe=meta.timeframe,
-                    plugin_ref=f"plugins/_staging/{staging_dir.name}/"
-                               f"{args['name']}",
-                    content_hash=meta.content_hash, kind="strategy",
-                    now=self._clock.now(), record_fn=captured.append)
-            finally:
-                intent_source.close()
-                conn.close()
+                conn = self._db_readonly_conn_factory()
+                captured: list[dict] = []
+                intent_source = strategy_adapter.build_intent_source(
+                    meta, conn=conn, pair=args["pair"], source=_EVAL_SOURCE,
+                    settings=self._settings)
+                try:
+                    holdout.run_in_sample(
+                        self._settings, history_conn=conn, symbol=args["pair"],
+                        source=_EVAL_SOURCE, intent_source=intent_source,
+                        eval_timeframe=meta.timeframe,
+                        plugin_ref=f"plugins/_staging/{staging_dir.name}/"
+                                   f"{args['name']}",
+                        content_hash=meta.content_hash, kind="strategy",
+                        now=self._clock.now(), record_fn=captured.append)
+                finally:
+                    intent_source.close()
+                    conn.close()
+            except Exception:
+                _log.exception("run_backtest_handler failed for %r",
+                               args.get("name"))
+                return {"error": "backtest_failed"}
             save_kwargs = captured[0]   # `_run_scope` の record_fn 契約 (7-D)
             return {**save_kwargs, "trial_count": 1}
 
         def analyze_corr_handler(args: dict) -> dict:
-            conn = self._db_readonly_conn_factory()
+            # precheck 2026-08-22 wave2: T10-M16 — 同上、DB/接続系の例外は
+            # 固定コードへ畳む。`analyze_for_agent` 自身が返す正常な
+            # `{"error": "insufficient_data"}` はここでは変換しない
+            # (B20 が別途 `_persist_ledger_rows` 側で扱う正常応答)。
             try:
-                return analyze_for_agent(
-                    conn, self._settings, args, now=self._clock.now(),
-                    persist=False)
-            finally:
-                conn.close()
+                conn = self._db_readonly_conn_factory()
+                try:
+                    return analyze_for_agent(
+                        conn, self._settings, args, now=self._clock.now(),
+                        persist=False)
+                finally:
+                    conn.close()
+            except Exception:
+                _log.exception("analyze_corr_handler failed")
+                return {"error": "analyze_failed"}
 
         return {"run_backtest": run_backtest_handler,
                 "analyze_corr": analyze_corr_handler}
 ```
 
-`src/agentic_fx/tools/improve_rpc_tools.py` (7-D、Step 群 7-D の `_FORBIDDEN_KEYS`
-定義) を以下へ改める — 遮断7 (「返却 schema に日時・期間端点…が無い」) は
-`period_start`/`period_end` の平坦キーだけでなく、save_kwargs がそのまま
-返る `period` タプル・`now` datetime も剥がさなければ閉じない:
+<!-- precheck 2026-08-22 wave2: T10-B18 -->
+**撤回 (B18)**: 旧稿はここに `src/agentic_fx/tools/improve_rpc_tools.py` の
+`_FORBIDDEN_KEYS` を 8 キー frozenset へ**逐語置換**する指示を置いていたが、
+これは Task 7-D + その検収是正で**既に main に適用済み**の防御 (9 キー +
+`_strip_forbidden` の再帰化、`in_sample_until` の追加) を上書きし退行させる
+(実装者がプランを忠実に転記すれば `params.in_sample_until` 経由で in-sample
+境界が agent へ漏れる)。**本節はここで置換を行わない。**現物
+`src/agentic_fx/tools/improve_rpc_tools.py:10-49` (9 キー frozenset + 再帰
+`_strip_forbidden`) が正であることを確認するだけの Step にする:
 
-```python
-_FORBIDDEN_KEYS = frozenset({
-    "period_start", "period_end", "start", "end", "window", "timestamps",
-    "period", "now"})
+```bash
+grep -n '"in_sample_until"' src/agentic_fx/tools/improve_rpc_tools.py
+grep -n "def _strip_forbidden" -A 3 src/agentic_fx/tools/improve_rpc_tools.py
+# 上記 2 つが両方ヒットすることを確認する (ヒットしなければ Task 7-D の
+# 検収是正がまだ main に無い — その場合はこの Step を保留し先に取り込む)
 ```
+
+Step 11-6 の `git add` から `src/agentic_fx/tools/improve_rpc_tools.py` を外す
+(下記コミットブロックで反映済み)。
 
 - [ ] **Step 11-4: 成功を確認**
 
@@ -17785,7 +18224,7 @@ uv run pytest tests/loops/test_improve_loop_prepare.py -v -k tx0 --runxfail
 
 | # | 変異 | 殺すテスト |
 |---|---|---|
-| M8 | `_FORBIDDEN_KEYS` から `"period"`/`"now"` を落とす | `test_run_backtest_handler_hides_period_and_now_from_agent` |
+| M8 | (precheck 2026-08-22 wave2: T10-B18 — 現物 `_FORBIDDEN_KEYS` は Task 7-D 検収是正済みのため本節では変異させない。参考として保持: `_FORBIDDEN_KEYS` から `"period"`/`"now"` を落とすと) | `test_run_backtest_handler_hides_period_and_now_from_agent` (`tests/tools/test_improve_rpc_tools.py` 側の既存回帰が検出する。本節が新規に殺す変異ではない) |
 | M9 | `run_backtest_handler` が `save_kwargs` を戻り値へ混ぜず `{"metrics": ...}` だけ返す (record_fn 捕捉結果を握りつぶす) | `test_run_backtest_handler_result_feeds_persist_ledger_rows` (`_persist_ledger_rows` の `summary[k]` が `KeyError` で例外送出、テストが失敗系として検出) |
 | M10 | `analyze_corr_handler` が `persist=False` を渡し忘れる (既定 `persist=True` のまま) | `test_analyze_corr_handler_does_not_persist_before_tx2` (RPC 呼出し時点で `analysis_runs` へ書いてしまい `after == before` が崩れる) |
 | M11 | `meta.kind != "strategy"` の早期 `raise` を削り、indicator/signal でも `run_in_sample` を呼んでしまう | 実装者が `kind="indicator"` の candidate で `run_backtest_handler` を呼び `ValueError` を確認する追加テストを書くこと (下限リスト不足、申し送り) |
@@ -17793,13 +18232,212 @@ uv run pytest tests/loops/test_improve_loop_prepare.py -v -k tx0 --runxfail
 - [ ] **Step 11-6: コミット**
 
 ```bash
-git add src/agentic_fx/loops/improve_loop.py src/agentic_fx/tools/improve_rpc_tools.py \
+# precheck 2026-08-22 wave2: T10-B18 — improve_rpc_tools.py は現物のまま
+# (Task 7-D 検収是正済み)。本コミットの add からは外す。
+git add src/agentic_fx/loops/improve_loop.py \
        tests/loops/test_improve_loop_rpc_handlers.py tests/loops/test_improve_loop_prepare.py
 git commit -m "$(cat <<'EOF'
 feat: ImproveLoop._build_rpc_handlers を完全実装 (run_backtest/analyze_corr) (プラン10 Task10-9)
 
 RO接続でrun_in_sample(record_fn=capture)/analyze_for_agent(persist=False)を実行し、
-save_kwargsをledgerへ記録。_FORBIDDEN_KEYSにperiod/nowを追加し遮断7を閉じる。
+save_kwargsをledgerへ記録。_FORBIDDEN_KEYS (period/now/in_sample_until と再帰strip)
+はTask 7-D検収是正済みの現物のまま変更しない。
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+<!-- precheck 2026-08-22 wave2: T10-B12 T10-B17 R-D2 -->
+### 10.9b improve registry の配線 (B12/B17、統合裁定 R-D2)
+
+**欠陥**: `ImproveRunContext.rpc_handlers` は上記 Step 11 で作るが、それを
+消費する経路が現物に 1 本も無かった (B17)。`WorkerRunner` の dispatcher は
+RAG 専用 (`_call_rag`)、子 (`mission_worker.py`) の improve 分岐は空
+`ToolRegistry()`、`build_mission_registry("improve", …)` は実装済みだが
+呼び出し元ゼロ — agent が improve ツールを 1 本も呼べない状態だった。
+`Mission.tools`/`output_schema` も最後まで空のままだった (B12)。
+
+**裁定 R-D2 の適用**: improve registry は**子 (mission_worker) が組む**。
+A-4 (`agentic-fx-t4`) が用意した `_build_improve_registry(*, settings,
+workdir) -> ToolRegistry` (現物 `mission_worker.py:381-401`、docstring
+「本関数を『呼び出し口』として切り出す — Task 10 は `_run_improve_mission`
+側を変えず、この関数の中身だけを `build_mission_registry("improve", ...)`
+へ差し替えればよい」) が Task 10 のために用意した seam をそのまま使う。
+**A-4 merge 後**に着手すること (未 merge の間は `mission_worker.py` に
+この関数が存在しない)。
+
+**アーキテクチャ (3 層)**:
+1. **親 (`ImproveLoop`)**: `WorkerRunner(rpc_handlers=parent_rpc_handlers)`
+   (Interfaces 節、R-D2) — `parent_rpc_handlers` は本節 Step 11 で作った
+   `_build_rpc_handlers` の戻り値そのもの (DB 読取・`ctx.ledger.record` 込み
+   の**権威ある**実装)。`WorkerRunner` は子からの `tool_rpc` フレームを
+   name で `parent_rpc_handlers` へ dispatch し (無ければ既存の
+   `_call_rag` へフォールバック — Interfaces 節参照)、結果を
+   `tool_rpc_result` として子へ返す。**`ctx.ledger` の record は必ずここ
+   (親側 `_build_rpc_handlers`) で起きる** — Tx-2 の `_persist_ledger_rows`
+   が読む一次ソースはこの親側 ledger インスタンスであり、他のどこにも
+   ledger の複製を作らない。
+2. **子 (`mission_worker.py` の `_build_improve_registry`)**: 実行用の
+   `ToolRegistry` をここで組む (`afx.sock` 経由で CLI から `tools/call` を
+   受けるのはこの子プロセスのため — A-4 の `_start_mcp_dispatcher` が
+   `registry.execute()` を直接呼ぶ)。`build_mission_registry("improve",
+   ...)` の `ledger`/`rpc_handlers` は**必須パラメータ**だが、子はその値を
+   台帳の一次ソースとしては使わない (1. の親側が権威) — ここでの
+   `ledger`/`rpc_handlers` は「子ローカルの使い捨てインスタンス」であり、
+   実際のツール呼び出しは RPC クライアント (下記) 経由で親へ転送する。
+3. **親 (`ImproveLoop._build_mission_tools`)**: `Mission.tools`/
+   `output_schema` を埋めるためだけに、**同じ** `build_mission_registry`
+   をもう一度 (実行には使わない、名前列挙専用で) 呼ぶ。副作用が無い呼び
+   出しであることは improve 分岐の本体 (`mission_registry.py:75-102`) が
+   `conn`/`clock`/`rag`/`activity` を参照しないことで担保されている
+   (trade 専用引数)。
+
+- [ ] **Step 12-1: 親側 `_build_mission_tools` を完全実装する**
+
+```python
+    def _build_mission_tools(self, *, staging_dir, source_snapshot_dir,
+                             ledger, rpc_handlers) -> list[dict]:
+        """Mission.tools (CLI へ渡す openai_tools 形式) を、実行には使わない
+        `build_mission_registry("improve", ...)` インスタンスから列挙する
+        (B12)。子 (`mission_worker.py`) が独立に組む実行用 registry と
+        同じ構築関数を使うため、agent に見せるツール名・schema と、子側で
+        実際に呼べるツールは常に一致する。"""
+        from agentic_fx.tools.mission_registry import build_mission_registry
+
+        registry = build_mission_registry(
+            "improve", None, self._settings, None, None, activity=None,
+            staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+            ledger=ledger, rpc_handlers=rpc_handlers)
+        names = registry.names()
+        return registry.openai_tools(names)
+```
+
+- [ ] **Step 12-2: 契約テスト**
+
+```python
+# tests/loops/test_improve_loop_prepare.py に追記
+def test_build_mission_tools_matches_child_registry_names(loop_full, tmp_path):
+    """B12/B17: 親が Mission.tools へ埋める名前集合が、子
+    (`build_mission_registry("improve", ...)`) が実際に登録する名前集合と
+    一致する — 「エージェントに見せる」と「子で実行できる」の食い違いを
+    構造的に防ぐ pin。"""
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+    from agentic_fx.tools.mission_registry import build_mission_registry
+
+    staging_dir, source_snapshot_dir = tmp_path / "s", tmp_path / "src"
+    staging_dir.mkdir()
+    source_snapshot_dir.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 1.0,
+                                                        "analyze_corr": 1.0})
+    rpc_handlers = {"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}}
+
+    tools = loop_full._build_mission_tools(
+        staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+        ledger=ledger, rpc_handlers=rpc_handlers)
+    tool_names = {t["function"]["name"] for t in tools}
+
+    child_registry = build_mission_registry(
+        "improve", None, loop_full._settings, None, None, activity=None,
+        staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+        ledger=ledger, rpc_handlers=rpc_handlers)
+    assert tool_names == set(child_registry.names())
+
+    # signal_tools.IMPROVE_FORBIDDEN との非交差 (tests/loops/test_improve_forbidden.py
+    # と同型の pin — B17 申し送り)
+    from agentic_fx.tools import signal_tools
+    assert not (tool_names & signal_tools.IMPROVE_FORBIDDEN)
+```
+
+(`openai_tools` の戻り値形状 `{"type": "function", "function": {"name": ...,
+...}}` は現物 `tools/registry.py` を実装時に確認して assert を揃えること。)
+
+- [ ] **Step 12-3: 変異テスト**
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M1 | `_build_mission_tools` が常に `[]` を返す (旧稿の退行に戻る) | `test_build_mission_tools_matches_child_registry_names` (`tool_names == set()` だが `child_registry.names()` は非空) |
+| M2 | `Mission.output_schema` に `IMPROVE_OUTPUT_SCHEMA` の代わりに `{}` を渡す | 実装者が `test_prepare_mission_output_schema_is_improve_output_schema` を追加すること (下限リスト不足、申し送り — `prepare()` の戻り値 `mission.output_schema == IMPROVE_OUTPUT_SCHEMA` を assert) |
+
+- [ ] **Step 12-4: 子側配線 (Task 4/A-4 の `mission_worker.py` へ反映する実装時改訂)**
+
+**本 Step 自体は `mission_worker.py` を直接編集しない** (Task 10 の Files
+節は `src/` 側で `mission_worker.py` を対象に含めていない — A-4 merge 後、
+統合者/実装者が以下の逐語を `_build_improve_registry` の本体として適用する
+ことを申し送りとして記す):
+
+```python
+# src/agentic_fx/mission_worker.py — _build_improve_registry の本体差し替え
+# (A-4 の空 ToolRegistry() スタブから、precheck 2026-08-22 wave2: T10-B17)
+def _build_improve_registry(*, settings: Any, workdir: Path) -> ToolRegistry:
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+    from agentic_fx.tools.mission_registry import build_mission_registry
+
+    staging_dir = workdir / "staging"
+    source_snapshot_dir = workdir / "source"
+    # 子ローカルの使い捨て ledger — 台帳の一次ソースは親 (ImproveLoop)
+    # 側の _build_rpc_handlers/ctx.ledger であり、ここでの record は
+    # 子プロセス終了とともに破棄される (アーキテクチャ注記 2. 参照)。
+    child_ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
+        "run_backtest": settings.improve.backtest_rpc_timeout_sec,
+        "analyze_corr": settings.improve.backtest_rpc_timeout_sec})
+    rpc_client = _make_rpc_client()  # 新規命名 — 既存の tool_rpc フレーム
+        # 送出経路 (out_seq 採番、_send_frame) を使い、`{"type": "tool_rpc",
+        # "name": ..., "arguments": ...}` を親へ書いて対応する
+        # `tool_rpc_result` フレームをブロッキング待ちする RPC client
+        # closure。cli_started フレーム送出 (裁定 R1/RB3) と同じ
+        # out_seq/protocol_out を再利用する。具体形は Task 4 (A-4) 側の
+        # 既存フレーム送受信ヘルパに合わせて実装時に確定する。
+    return build_mission_registry(
+        "improve", None, settings, None, None, activity=None,
+        staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+        ledger=child_ledger,
+        rpc_handlers={"run_backtest": lambda a: rpc_client("run_backtest", a),
+                     "analyze_corr": lambda a: rpc_client("analyze_corr", a)})
+```
+
+**未解決のまま申し送る点 (共通規約「非実在ヘルパは Step 内で逐語定義する
+か現物に合わせる」— `_make_rpc_client` は Task 4/A-4 の既存フレーム送受信
+ヘルパの具体名に合わせて実装時に確定させる。本節では概念名のまま置く)**:
+`workdir / "staging"` / `workdir / "source"` の命名は M20/M3 (`_materialize_
+workspace` の本体が本プランのどこにも書かれていない) と同じ理由で
+仮置き — 10.3 節の `_materialize_workspace` が実際に作るディレクトリ名と
+一致させること (10.3 節 Step 実装時に本 Step の `staging_dir`/
+`source_snapshot_dir` を合わせて更新する)。
+
+- [ ] **Step 12-5: 7-F 遮断⑦⑧ の xfail を green 化する (B11)**
+
+```bash
+grep -n "xfail" tests/integration/test_improve_forbidden_regression.py
+# :157/:164 の @pytest.mark.xfail(strict=True, ...) を削り、pytest.fail(...)
+# の空実装を本物のアサーションへ置き換える
+```
+
+`tests/integration/test_improve_forbidden_regression.py:157-168` の 2 本
+(`test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly`
+/ `test_holdout_and_analysis_ids_never_come_from_agent_output`) は、本節
+(Step 11 の `_build_rpc_handlers` + Step 12 の registry 配線) が揃って
+初めて green 化できる — `xfail` マーカーを削り、テスト本体の
+`pytest.fail("Task 10 待ち — RunContext.rpc_handlers が未配線")` を、
+実際に `ImproveLoop._build_rpc_handlers`/`_build_mission_tools`/子側
+`_build_improve_registry` を経由したエンドツーエンドのアサーションへ
+書き換える (現物のテストファイルを着手時に読み、遮断⑦⑧ それぞれの
+具体的な検査項目に合わせて逐語化すること — 本節の受入条件として
+「該当 2 本が `xfail` 無しで green」を置く)。
+
+```bash
+uv run pytest tests/integration/test_improve_forbidden_regression.py -v
+git add src/agentic_fx/loops/improve_loop.py tests/loops/test_improve_loop_prepare.py \
+       tests/integration/test_improve_forbidden_regression.py
+git commit -m "$(cat <<'EOF'
+feat: improve registry の親/子配線 + Mission.tools/output_schema 実配線 (プラン10 Task10-9b, B12/B17/B11)
+
+R-D2: 子(mission_worker._build_improve_registry)がbuild_mission_registry("improve",...)
+を組み、tool_rpcはRPC client経由で親のWorkerRunner(rpc_handlers=)へ転送する。
+親は同じ構築関数を名前列挙専用で呼びMission.tools/output_schemaを実配線する。
+7-F遮断⑦⑧のxfailをgreen化。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -17811,6 +18449,90 @@ EOF
 ### 10.10 手順 7〜9: `improvement_runs.finish` + backlog 遷移 + `finish_improve_mission` (Tx-2 の組み立て、§8.1-23/24 の Tx-2 側)
 
 **Tx-2**: `BEGIN IMMEDIATE` → 台帳の `backtest_runs`/`analysis_runs` 行 → 親ゲートの `backtest_runs` 行 (in-sample/holdout_gate) → `approvals.create(commit=False)` → `finish_improve_mission(..., commit=False)` → `COMMIT` → レポート公開 (rename、Tx-2 の**外**) → 掃除。
+
+<!-- precheck 2026-08-22 wave2: T10-B1 -->
+- [ ] **Step 0: `store/analysis_runs.py::save` に `commit` パラメータを追加する (B1、Task 10 が store を拡張)**
+
+現物 `src/agentic_fx/store/analysis_runs.py:29` の `save(conn, *, params,
+trial_count, source, now) -> int` には `commit` kw が無く無条件 `conn.commit()`
+を呼ぶ。`_persist_ledger_rows` (本節の下記実装) は Tx-2 の途中で
+`analysis_runs_store.save(conn, commit=False, now=now, **row_kwargs)` を
+呼ぶ契約なので、このままでは `TypeError` になり、通っても無条件 commit が
+Tx-2 を「台帳→gate rows→approval→finish を単一 commit」(設計書 §4.1) の
+途中で割ってしまう。`store/backtest_runs.py:116 save_harness_run(...,
+commit: bool = True)` と同じ規約で揃える:
+
+```python
+# tests/store/test_analysis_runs.py に追記
+def test_save_commit_false_does_not_commit_transaction(conn):
+    from agentic_fx.store import analysis_runs
+
+    conn.execute("BEGIN IMMEDIATE")
+    run_id = analysis_runs.save(
+        conn, params={"request": {}}, trial_count=1, source="rpc",
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc), commit=False)
+    conn.rollback()
+    row = conn.execute(
+        "SELECT id FROM analysis_runs WHERE id=?", (run_id,)).fetchone()
+    assert row is None  # rollback で消えている == commit=False が効いた
+
+
+def test_save_default_commit_true_is_unchanged(conn):
+    """既存呼び出し元 (`backtest/analysis.py:471` の `persist=True` 経路)
+    が既定 `commit=True` のまま不変であることの回帰 pin。"""
+    from agentic_fx.store import analysis_runs
+
+    run_id = analysis_runs.save(
+        conn, params={"request": {}}, trial_count=1, source="rpc",
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc))
+    row = conn.execute(
+        "SELECT id FROM analysis_runs WHERE id=?", (run_id,)).fetchone()
+    assert row is not None  # commit していないと別接続からは見えない場合が
+                           # あるため同一 conn での存在確認に留める
+```
+
+実装 (`src/agentic_fx/store/analysis_runs.py:29` を全文置換):
+
+```python
+def save(conn: sqlite3.Connection, *, params: dict[str, Any], trial_count: int,
+         source: str, now: datetime, commit: bool = True) -> int:
+    """analysis_runs へ 1 行保存し、lastrowid (analysis_run_id) を返す。"""
+    if not isinstance(trial_count, int) or isinstance(trial_count, bool) \
+            or trial_count < 1:
+        raise ValueError(f"trial_count must be an int >= 1: {trial_count!r}")
+    now_utc = _require_utc(now, "now")
+    params_json = json.dumps(params, sort_keys=True)
+    cur = conn.execute(
+        "INSERT INTO analysis_runs (params_json, trial_count, source, "
+        "created_at) VALUES (?,?,?,?)",
+        (params_json, trial_count, source, now_utc.isoformat()))
+    if commit:
+        conn.commit()
+    return cur.lastrowid
+```
+
+変異: `if commit:` を削り常に commit する → `test_save_commit_false_does_not_commit_transaction` が red (rollback しても行が残る)。
+
+**`tests/test_subprocess_stdin_policy.py` への影響確認**: allowlist は
+`{("agentic_fx/store/backtest_runs.py", 248)}` の 1 件のみ。本 Step は
+`analysis_runs.py` を編集するが `subprocess.run|Popen` を追加しないため、
+行番号 pin の更新は不要 (確認コマンド: `grep -n "subprocess\." src/agentic_fx/store/analysis_runs.py` → 0 件)。
+
+```bash
+uv run pytest tests/store/test_analysis_runs.py -v
+git add src/agentic_fx/store/analysis_runs.py tests/store/test_analysis_runs.py
+git commit -m "$(cat <<'EOF'
+feat: analysis_runs.save に commit パラメータを追加 (プラン10 Task10-10, B1)
+
+Tx-2 (finalize_success) の途中でTx全体をcommitしてしまう不具合を解消。
+backtest_runs.save_harness_run(commit=)と同じ規約に揃える。
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -17845,8 +18567,20 @@ def test_tx2_writes_ledger_rows_then_gate_rows_then_approval_then_finish(
     a = conn.execute("SELECT status FROM approval_requests WHERE id=?",
                      (r["approval_id"],)).fetchone()
     assert a["status"] == "pending"
+```
 
+<!-- precheck 2026-08-22 wave2: T10-B8 既存テスト改訂 -->
+**既存テスト改訂 (共通規約、B8)**: 元稿はフォルト注入点に
+`missions_store.finish_improve_mission` を使っていたが、`_compensate_tx2_failure`
+(補償tx) も**同じ関数**を呼ぶため、Tx-2 本体と補償の両方が同時に壊れ
+`missions.status='failed'` へ到達できなくなる (B8 是正で `_finalize_success`
+の compensation 呼び出しを try/except で包んだことで、この場合は例外が
+握られ mission が非終端のまま残る — assert が失敗する)。フォルト注入点を
+`approvals_store.create` (Tx-2 本体だけが通る経路、補償 tx は
+`finish_improve_mission` しか呼ばないため無傷) へ変更する。**検査意図
+(Tx-2 rollback → 補償tx が mission を failed で終端する) は変わらない**:
 
+```python
 def test_tx2_commit_failure_rolls_back_and_compensation_finalizes(
         loop_min, conn, mission_and_run_fixture, monkeypatch):
     """Tx-2 が例外で rollback したら、補償 tx (finish_improve_mission 経由)
@@ -17856,9 +18590,11 @@ def test_tx2_commit_failure_rolls_back_and_compensation_finalizes(
 
     def _boom(*a, **kw):
         raise RuntimeError("simulated Tx-2 failure")
+    # precheck 2026-08-22 wave2: T10-B8 — フォルト注入点を
+    # approvals_store.create に変更 (finish_improve_mission だと補償txも
+    # 道連れで壊れるため)
     monkeypatch.setattr(
-        "agentic_fx.loops.improve_loop.missions_store.finish_improve_mission",
-        _boom)
+        "agentic_fx.loops.improve_loop.approvals_store.create", _boom)
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
@@ -17956,9 +18692,25 @@ class ImproveLoop:
         except Exception:
             _log.exception("Tx-2 failed for mission_id=%s — running "
                            "compensation", mission_id)
-            self._compensate_tx2_failure(
-                conn, mission_id=mission_id, run_id=run_id,
-                backlog_id=backlog_id, slot_key=slot_key, now=now)
+            # precheck 2026-08-22 wave2: T10-B8 — 補償tx自体が失敗しても
+            # (fault 注入点が `missions_store.finish_improve_mission` の
+            # 場合、補償経路の呼び出しも同じ関数を叩くため同じ原因で失敗
+            # し得る) 例外を `_launch_slot` の呼び出し元スレッドへ漏らさない。
+            # 改善レーンの障害を activity へ記録して握る (Global Constraint
+            # fail closed — 改善レーンは別レーンで隔離される、取引レーンへ
+            # 波及させない)。
+            try:
+                self._compensate_tx2_failure(
+                    conn, mission_id=mission_id, run_id=run_id,
+                    backlog_id=backlog_id, slot_key=slot_key, now=now)
+            except Exception:
+                _log.exception(
+                    "compensation itself failed for mission_id=%s — mission "
+                    "stays in a non-terminal state, will be picked up by "
+                    "startup reconcile", mission_id)
+                self._activity.write(
+                    Category.IMPROVE, "tx2_compensation_failed",
+                    f"mission_id={mission_id} run_id={run_id}")
 
     # `analysis_runs.save`/`backtest_runs.save_harness_run` の kwargs 名の
     # ホワイトリスト — 台帳 entry の `result_summary` はハンドラの戻り値
@@ -18004,9 +18756,24 @@ class ImproveLoop:
           `missions.status='completed'` として静かに完走する (3 周目
           レビュー Important-2 が指摘した状態) より、可視の失敗として
           止まる方を選ぶ。"""
+        # precheck 2026-08-22 wave2: T10-B20 — handler が正常応答として返す
+        # `{"error": ...}` (例: `analyze_for_agent` の `insufficient_data`、
+        # 上記 10.9 節 Step 11-3 で run_backtest/analyze_corr handler 自身が
+        # 例外を畳んで返す `{"error": "backtest_failed"}`/`{"error":
+        # "analyze_failed"}` も同型) は「handler が契約を満たさない」
+        # (`summary[k]` の KeyError) とは別物 — 正常な失敗応答であり、
+        # 稀な異常ではない (`insufficient_data` は履歴の薄い通貨ペア/短い
+        # timeframe で日常的に起きる)。これを Tx-2 全体の失敗にせず、
+        # 台帳から skip して observation に残す (fail closed の過剰側を
+        # 是正)。
         analysis_run_ids: list[int] = []
         for entry in ledger_entries:
             summary = entry["result_summary"]
+            if "error" in summary:
+                self._activity.write(
+                    Category.IMPROVE, "ledger_entry_skipped_error",
+                    f"kind={entry['kind']} error={summary['error']!r}")
+                continue
             if entry["kind"] == "run_backtest":
                 row_kwargs = {k: summary[k] for k in self._BACKTEST_ROW_KEYS}
                 backtest_runs_store.save_harness_run(
@@ -18083,10 +18850,12 @@ uv run pytest tests/loops/test_improve_loop_finalize.py -v
 | # | 変異 | 殺すテスト |
 |---|---|---|
 | M1 | `_finalize_success` の `except Exception:` を削り例外を外へ漏らす (改善レーンの失敗が呼び出し元 — 取引レーン/service.py へ波及しうる) | `test_tx2_commit_failure_rolls_back_and_compensation_finalizes` (例外が伝播して pytest 自体が fail するので間接検出。実装者は明示的に「呼び出し元が例外を受け取らない」ことを assert する追加テストを書くこと — 下限リスト不足、申し送り) |
+| M1b (precheck 2026-08-22 wave2: T10-B8) | 補償tx呼び出しを包む `try/except Exception:` を削る (`_compensate_tx2_failure` 自体が失敗すると例外が `_launch_slot` の呼び出し元スレッドへ漏れる) | `test_compensation_failure_does_not_propagate_to_caller` (新規、実装者が追加すること: `_compensate_tx2_failure` を monkeypatch で常に例外送出させ、`_finalize_success` の呼び出しが例外なく戻ることと `activity.write(..., "tx2_compensation_failed", ...)` が呼ばれたことを assert する) |
 | M2 | `_compensate_tx2_failure` が `slot_key` を渡さない (scheduler wave の slot が failed にならない) | `test_finish_improve_mission_is_the_only_terminal_path_for_slot_scheduler_wave` の失敗系変種を実装者が追加すること (下限リスト不足、申し送り) |
 | M3 | `finish_improve_mission` の呼び出しを個別 UPDATE (missions.finish 単体呼び出し) に分解する | `test_tx2_writes_ledger_rows_then_gate_rows_then_approval_then_finish` (個別呼び出しに分解すると `finish_improve_mission` の mock/monkeypatch 対象が外れ、テストの `monkeypatch.setattr` 先が呼ばれなくなるため red — Step 3 のコードでは `finish_improve_mission` を単一呼び出しにしているため、この変異は M1 のテストで検出される) |
 | M4 | `_persist_ledger_rows`/`_persist_gate_rows` の本体を再び no-op (`for entry in ledger_entries: pass` 等) に戻す | `test_finalize_success_persists_ledger_and_gate_rows_in_tx2` (10.11 節に追加。3 周目レビュー Important-2 — `backtest_runs`/`analysis_runs` の行数を assert しており no-op に戻すと 0 件のまま落ちる) |
 | M4b | `_finalize_success` が `approval_payload["analysis_run_ids"]` の上書きを削り、`_build_approval_payload` の placeholder `[]` のまま `approvals_store.create` へ渡す (直前修正の申し送り③の回帰) | `test_finalize_success_overwrites_payload_analysis_run_ids_with_real_ids` (`payload["analysis_run_ids"] == real_ids` が `[] == real_ids` で落ちる) |
+| M5 (precheck 2026-08-22 wave2: T10-B20) | `_persist_ledger_rows` の `if "error" in summary: continue` を削る — 正常な `{"error": "insufficient_data"}` 応答が `summary[k]` の `KeyError` を送出し、Mission 全体が `_compensate_tx2_failure` へ倒れる | `test_persist_ledger_rows_skips_error_entries` (新規、実装者が Step 1 で追加する: `ledger_entries` に `result_summary={"error": "insufficient_data"}` の analyze_corr entry を混ぜ、`_persist_ledger_rows` が `KeyError` を送出せず当該行を `analysis_runs`/`backtest_runs` に書かないことを assert する。既存 `test_persist_ledger_rows_fails_closed_when_handler_omits_save_kwargs` (10.9 節 L17655 付近) は「契約違反 (`summary` に必須キーが無い)」を検査するだけで「正常な `error` 応答」とは区別しないため代替にならない) |
 
 - [ ] **Step 6: コミット**
 
@@ -18543,11 +19312,24 @@ class ImproveLoop:
                     report_path=report_path, now=now)
         finally:
             conn.close()
-            ctx.ledger.mark_persisted()  # 例外系は各 _finalize_* 内で
-                                          # mark_discarded を呼ぶ (10.x節
-                                          # の各 _finalize_* に実装を追記
-                                          # する — 本節では統合の骨格の
-                                          # みを示す)
+            # precheck 2026-08-22 wave2: T10-B9 — 各 _finalize_* (失敗系:
+            # _finalize_failed_mission/_finalize_output_invalid/
+            # _finalize_gate_failed/_finalize_loser 等) は `ctx.ledger.
+            # mark_discarded()` を自分で呼んでから return する契約
+            # (state が既に DISCARDED になっている)。その状態でここが
+            # 無条件に `mark_persisted()` を呼ぶと `ImproveRpcLedger.
+            # mark_persisted` (loops/improve_rpc_ledger.py、Task 7 が所有 —
+            # 本節では変更しない) の事前条件 `state == "FROZEN"` に反し
+            # `RuntimeError` を送出する。この `finally` は例外を送出しては
+            # いけない場所 (`try` 節の本来の戻り値/例外を握りつぶすため) —
+            # 「既に DISCARDED 済みなら何もしない」を状態を問い合わせずに
+            # 表現するため、`mark_persisted()` の事前条件違反だけを狙って
+            # 握る (mark_discarded 側の異常な多重呼び出し等、他の
+            # RuntimeError まで隠さないよう、呼び出しはこの 1 箇所に限定する):
+            try:
+                ctx.ledger.mark_persisted()
+            except RuntimeError:
+                pass  # 既に mark_discarded 済み (失敗系 _finalize_* 内)
 ```
 
 **申し送り**: 上記 `commit()` は 10.4〜10.10 節で作った private メソッドを設計書 §4.2 の手順番号順に呼ぶ**統合の骨格**である。以下のメソッドは骨格中に呼び出しがあるが、個別のサブタスクとしては未執筆 (実装時に追加すること — 手順の意味論は設計書 §4.2/§4.3 が正)。**いずれも `ctx` を受け取るため `finish_improve_mission` を呼ぶ際は必ず固定値でなく `ctx.slot_key` を渡すこと (レビュー1周目 C2)** — これらは全て終端経路であり、scheduler wave 起動 (`ctx.slot_key` が非 None) のとき slot を `running→done|failed` に終端させる責務を持つ:
@@ -18561,120 +19343,143 @@ class ImproveLoop:
 
 これらは 10.4〜10.10 節と同じ TDD 手順 (failing test → red → 実装 → green → 変異 → commit) をそれぞれ個別のコミットとして追加すること。**本節は「統合したときに手順の呼び出し順序が壊れていないか」を確認する e2e レベルの happy-path テスト 1 本を通すところまでを Step 3 の完了条件とする** — 上記の未執筆メソッドは happy path (`atype=="plugin"` かつゲート全通過) では通らないため、`test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin` は `_finalize_success` までのパスだけを通り green になる設計にした。
 
-- [ ] **Step 3b: `backtest/holdout.py` の non-committing 版**
-
-`src/agentic_fx/backtest/holdout.py:112-187` を以下のように変更する:
-
-```python
-def _run_scope(settings: Settings, *, scope: str,
-              history_conn: sqlite3.Connection, symbol: str, source: str,
-              intent_source: IntentSource, eval_timeframe: str,
-              plugin_ref: str, content_hash: str, kind: str, now: datetime,
-              period_start: datetime, period_end: datetime,
-              record_fn: Callable[..., None] | None = None) -> dict:
-    result = run_replay(
-        settings, symbol=symbol, source=source, start=period_start,
-        end=period_end, intent_source=intent_source,
-        eval_timeframe=eval_timeframe, history_conn=history_conn)
-    metrics = compute_metrics(result)
-    row_kwargs = dict(
-        scope=scope, plugin_ref=plugin_ref, content_hash=content_hash,
-        kind=kind, pair=symbol, timeframe=eval_timeframe, source=source,
-        period=(period_start, period_end), metrics=metrics,
-        settings_hash=settings_snapshot_hash(settings), core_commit=core_commit(),
-        initial_balance=settings.backtest.initial_balance, now=now)
-    if record_fn is not None:
-        # non-committing: 呼び出し元 (ImproveLoop の Tx-2) が commit する
-        # sink へ渡すだけ — ここでは DB に触れない (改善レーンの transaction
-        # 越境を防ぐ、設計書 §4.1「long-running work is outside tx」)。
-        # dict を単一の位置引数で渡す (Task 7-D `_run_scope` — 本節と同じ
-        # holdout.py:112-187 を対象とする定義 — が確立した
-        # `record_fn(save_kwargs)` 契約と揃える。3 周目レビュー Important-2
-        # の `gate_rows`/`ledger_entries` 配線はこの契約 (dict 1 引数) を
-        # 前提に `list.append` を record_fn として渡す — `record_fn(**row_kwargs)`
-        # (kwargs 展開) のままだと `list.append` が TypeError で落ちる)。
-        record_fn(row_kwargs)
-    else:
-        save_harness_run(history_conn, **row_kwargs)
-    return dict(metrics)
-
-
-def run_in_sample(settings: Settings, *, history_conn: sqlite3.Connection,
-                  symbol: str, source: str, intent_source: IntentSource,
-                  eval_timeframe: str, plugin_ref: str, content_hash: str,
-                  kind: str, now: datetime,
-                  record_fn: Callable[..., None] | None = None) -> dict:
-    now_norm = _normalize_now(now)
-    boundary = in_sample_until(now_norm, settings.backtest.holdout_months)
-    start = _oldest_bar_start(history_conn, symbol, source)
-    if start >= boundary:
-        _log.warning(
-            "in-sample period is empty for symbol=%r source=%r: oldest bar "
-            "%s >= holdout boundary %s", symbol, source, start.isoformat(),
-            boundary.isoformat())
-        raise ValueError(
-            "in-sample period is empty (oldest bar >= holdout boundary)")
-    return _run_scope(
-        settings, scope="in_sample", history_conn=history_conn,
-        symbol=symbol, source=source, intent_source=intent_source,
-        eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
-        content_hash=content_hash, kind=kind, now=now_norm,
-        period_start=start, period_end=boundary, record_fn=record_fn)
-
-
-def run_holdout_gate(settings: Settings, *, history_conn: sqlite3.Connection,
-                     symbol: str, source: str, intent_source: IntentSource,
-                     eval_timeframe: str, plugin_ref: str, content_hash: str,
-                     kind: str, now: datetime,
-                     record_fn: Callable[..., None] | None = None) -> dict:
-    now_norm = _normalize_now(now)
-    boundary = in_sample_until(now_norm, settings.backtest.holdout_months)
-    return _run_scope(
-        settings, scope="holdout_gate", history_conn=history_conn,
-        symbol=symbol, source=source, intent_source=intent_source,
-        eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
-        content_hash=content_hash, kind=kind, now=now_norm,
-        period_start=boundary, period_end=now_norm, record_fn=record_fn)
-```
-
-`Callable` の import 追加が必要 (`from typing import Callable` — 現物のファイル冒頭 import を確認して揃える)。既存呼び出し元 (`plugin/approval.py` 他) は `record_fn` を渡さないため挙動不変。
-
-- [ ] **Step 3c: 対応する failing test → green (holdout.py)**
+<!-- precheck 2026-08-22 wave2: T10-B13 -->
+**B13 是正: `_prepare_report_if_applicable`/`_finalize_report_or_observation` の
+最小実装を追加する** (全状態表 `none→prepared→published` の `prepared` が
+これまで一度も DB に現れず、reconcile の `prepared` 分岐が到達不能だった
+欠陥の是正)。`_finalize_loser`/`_finalize_gate_failed`/`_finalize_output_invalid`/
+`_finalize_failed_mission` は上記のとおり「下限リスト不足」のまま (プラン
+規約どおり実装者が着手時に追加、ただし全て `finish_improve_mission(...,
+report_state='none')` の既定で終端するだけであり `prepared` 状態を経由
+しない — B13 の対象外):
 
 ```python
-# tests/backtest/test_holdout_record_fn.py (新規)
-def test_run_in_sample_with_record_fn_does_not_call_save_harness_run(
-        monkeypatch, ...):
-    calls = []
-    monkeypatch.setattr(
-        "agentic_fx.backtest.holdout.save_harness_run",
-        lambda *a, **kw: (_ for _ in ()).throw(AssertionError(
-            "save_harness_run must not be called when record_fn is given")))
-    holdout.run_in_sample(..., record_fn=lambda **kw: calls.append(kw))
-    assert len(calls) == 1
-    assert calls[0]["scope"] == "in_sample"
+    def _prepare_report_if_applicable(self, conn, *, ctx, artifact, output,
+                                      now) -> str | None:
+        """`artifact.type=='report'` かつ `proposal_kind != 'risk_gate'` の
+        ときだけ本文を `.tmp/*.part` へ書き、Tx-2 で `report_state=
+        'prepared'` + 予定パスを書く。それ以外 (report が無い/risk_gate)
+        は None を返す — 呼び出し元 (`commit()`) は None なら Tx-2 を
+        素通りし report 関連 4 列は既定値 (`none`/NULL) のままにする。"""
+        if artifact.get("type") != "report":
+            return None
+        if artifact.get("proposal_kind") == "risk_gate":
+            # risk_gate は report を書かず observation のみ (§4.3)。
+            # 呼び出し元の _finalize_report_or_observation が
+            # last_result='unsupported_in_plan10' を書く。
+            return None
+        reports_dir = self._root / "data" / "improve_reports"
+        (reports_dir / ".tmp").mkdir(parents=True, exist_ok=True)
+        body_md = artifact.get("body_md", "")
+        part_path = self._write_report_part(
+            reports_dir, mission_id=ctx.mission_id, body_md=body_md)
+        final_path = reports_dir / f"improve-{ctx.mission_id}.md"
+        conn.execute(
+            "UPDATE improvement_runs SET report_state='prepared', "
+            "report_path=? WHERE id=?", (str(final_path), ctx.run_id))
+        return str(final_path)
 
-
-def test_run_in_sample_without_record_fn_still_calls_save_harness_run(...):
-    # 既存呼び出し元の後方互換 pin
-    ...
+    def _finalize_report_or_observation(self, conn, *, ctx, backlog_id,
+                                        report_path, now) -> None:
+        """承認申請を出さない経路 (report / risk_gate observation) の
+        Tx-2 + finish。`report_path` が非 None なら Step 3 の
+        `_prepare_report_if_applicable` が既に `report_state='prepared'`
+        を書き終えている — ここでは `finish_improve_mission` を
+        `report_state='prepared'`/`report_path=` 付きで呼び、COMMIT 後に
+        `_publish_report` (rename、Tx-2 の外) を呼ぶ。"""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            missions_store.finish_improve_mission(
+                conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                slot_key=ctx.slot_key, mission_status="completed",
+                run_result=("report" if report_path is not None else None),
+                now=now,
+                report_path=report_path,
+                report_state=("prepared" if report_path is not None else "none"),
+                backlog_transition=(
+                    {"backlog_id": backlog_id, "status": "observation",
+                     "last_result": "unsupported_in_plan10"}
+                    if report_path is None and backlog_id is not None
+                    else ({"backlog_id": backlog_id, "status": "done",
+                          "last_result": "reported"}
+                          if backlog_id is not None else None)),
+                commit=False)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        if report_path is not None:
+            reports_dir = self._root / "data" / "improve_reports"
+            part_path = reports_dir / ".tmp" / f"improve-{ctx.mission_id}.md.part"
+            self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
+                                 final_path=Path(report_path), now=now)
 ```
 
-（具体的な fixture — `history_conn`/`intent_source` 構築 — は既存 `tests/backtest/test_holdout.py` の fixture パターンを流用する。着手時に現物確認。）
+`commit()` 本体 (手順6・7) の呼び出しを、この 2 メソッドの実引数と揃える:
+
+```python
+            report_path = self._prepare_report_if_applicable(       # 手順6
+                conn, ctx=ctx, artifact=artifact, output=output, now=now)
+            ...
+            else:
+                self._finalize_report_or_observation(
+                    conn, ctx=ctx, backlog_id=selection.backlog_id,
+                    report_path=report_path, now=now)
+```
+
+- [ ] **B13 変異テスト**
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M1 | `_prepare_report_if_applicable` が `report_state='prepared'` の UPDATE を落とす (report は書けるが state が `none` のまま) | 実装者が `test_prepare_report_sets_state_prepared_before_commit` を追加すること (下限リスト不足、申し送り — Tx-2 COMMIT 直後、rename 前の時点で `report_state=='prepared'` であることを assert) |
+| M2 | `_finalize_report_or_observation` が `_publish_report` の呼び出しを COMMIT の**前**に移す (§4.1 の「long-running/IO は tx の外」違反、部分書込中に他プロセスが `prepared` を reconcile してしまう競合窓が生まれる) | 実装者が呼び出し順 (`conn.commit()` → `_publish_report`) を pin する追加テストを書くこと (下限リスト不足、申し送り) |
+
+<!-- precheck 2026-08-22 wave2: T10-B15 -->
+- [ ] **Step 3b (撤回・確認のみ): `backtest/holdout.py` の `record_fn` は Task 7-D で実装済み**
+
+**撤回 (B15)**: 旧稿はここで `src/agentic_fx/backtest/holdout.py:112-187`
+(`_run_scope`/`run_in_sample`/`run_holdout_gate`) を全文置換していたが、これは
+main にとって「衝突」ではなく**退行**である — `record_fn: Callable[[dict], int]
+| None = None` は既に main `backtest/holdout.py:118` (`_run_scope`) /
+`:142`/`:177` (`run_in_sample`/`run_holdout_gate` からの受け渡し) に実装
+済みであり (Task 7-D)、既存 `tests/backtest/test_holdout.py:328`
+(`test_run_in_sample_record_fn_sink_does_not_write_backtest_runs`) /
+`:349` (`test_run_in_sample_without_record_fn_keeps_existing_behavior`)
+がこれを pin している。旧稿の逐語置換をそのまま適用すると型注釈
+(`Callable[[dict], int]`) を退行させ、上記 2 本と重複する
+`tests/backtest/test_holdout_record_fn.py` を新設してしまう。
+
+**本 Step は「呼ぶだけ」であることを確認するに留める**:
+
+```bash
+grep -n "record_fn" src/agentic_fx/backtest/holdout.py   # :118/:131-134/:142/:177 がヒットすること
+uv run pytest tests/backtest/test_holdout.py -k record_fn -v   # 既存 2 本が green であること
+```
+
+Task 10 (10.9 節 `_build_rpc_handlers`、10.7 節 `strategy_gate.py`) は
+`holdout.run_in_sample`/`run_holdout_gate` を `record_fn=` 付きで**呼ぶだけ**
+であり、`holdout.py` 自体を編集しない。**Files 節の Modify から
+`backtest/holdout.py:112-187` を、Create から `tests/backtest/test_holdout_record_fn.py`
+を外す** (下記 Files 節参照)。Step 3c は削除する (旧稿の
+`def test_run_in_sample_with_record_fn_does_not_call_save_harness_run(monkeypatch, ...):`
+は引数リストが `...` のまま未執筆で `ast.parse` 構文 NG だった — Step ごと
+削除することで解消する)。
 
 - [ ] **Step 4: 成功を確認**
 
 ```bash
-uv run pytest tests/loops/test_improve_loop_finalize.py tests/backtest/test_holdout_record_fn.py -v
-uv run pytest tests/backtest/ -v   # 既存回帰 (record_fn 未指定の全既存呼び出し)
+uv run pytest tests/loops/test_improve_loop_finalize.py -v
+# precheck 2026-08-22 wave2: T10-B15 — tests/backtest/test_holdout_record_fn.py
+# は新設しない。既存 record_fn 回帰は tests/backtest/test_holdout.py が持つ
+uv run pytest tests/backtest/test_holdout.py -v   # 既存回帰 (record_fn 含む)
 ```
 
 - [ ] **Step 5: 変異テスト**
 
 | # | 変異 | 殺すテスト |
 |---|---|---|
-| M1 | `record_fn` が None でなくても `save_harness_run` を呼ぶ (二重書込) | `test_run_in_sample_with_record_fn_does_not_call_save_harness_run` |
-| M2 | `record_fn is None` の分岐で `save_harness_run` を呼ばない (既存呼び出し元が退行) | `test_run_in_sample_without_record_fn_still_calls_save_harness_run` |
+| M1 (precheck 2026-08-22 wave2: T10-B15 — 参考: 既存 `tests/backtest/test_holdout.py` 側の pin であり本節が新規に殺す変異ではない) | `record_fn` が None でなくても `save_harness_run` を呼ぶ (二重書込) | `test_run_in_sample_record_fn_sink_does_not_write_backtest_runs` |
+| M2 (同上) | `record_fn is None` の分岐で `save_harness_run` を呼ばない (既存呼び出し元が退行) | `test_run_in_sample_without_record_fn_keeps_existing_behavior` |
 | M3 | `commit()` 統合本体で `_select_and_bind` の呼び出しを省き常に「勝者」扱いにする | `test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin` の変種 (敗者ケースを実装者が追加すること — 下限リスト不足、申し送り) |
 | M4 | `commit()` 内で `_build_approval_payload` を `_run_plugin_gate` より**前**に呼ぶ (ゲート不合格でも承認payloadを組み立ててしまう) | `test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin` (レビュー1周目 I4 — `call_order == _EXPECTED_ORDER` が順序不一致で落ちる) |
 | M5 | `_finalize_success` の Tx-2 本体で `approvals_store.create` を `missions_store.finish_improve_mission` より**後**に呼ぶ (成功時は結果同じだが、fault 注入時に partial commit の窓が生まれる) | `test_commit_rolls_back_tx2_on_db_fault_between_gate_rows_and_approval` (レビュー1周目 I4 — `approval_requests` が 0 件のまま `missions.status` だけ更新されてしまうと assert が落ちる) |
@@ -18684,14 +19489,16 @@ uv run pytest tests/backtest/ -v   # 既存回帰 (record_fn 未指定の全既�
 - [ ] **Step 6: コミット**
 
 ```bash
-git add src/agentic_fx/loops/improve_loop.py src/agentic_fx/backtest/holdout.py \
+# precheck 2026-08-22 wave2: T10-B15 — holdout.py/test_holdout_record_fn.py
+# は対象から外す (Task 7-D 実装済み、Task 10 は呼ぶだけ)
+git add src/agentic_fx/loops/improve_loop.py \
        src/agentic_fx/plugin/strategy_gate.py \
-       tests/loops/test_improve_loop_finalize.py tests/backtest/test_holdout_record_fn.py
+       tests/loops/test_improve_loop_finalize.py
 git commit -m "$(cat <<'EOF'
-feat: ImproveLoop.commit を手順0-9の1本に統合 + holdout.py record_fn (プラン10 Task10-11)
+feat: ImproveLoop.commit を手順0-9の1本に統合 (プラン10 Task10-11)
 
-happy path (plugin全通過) のe2eテストで手順順序を固定。record_fnは
-transaction外の非committing版としてnon-improve呼び出し元と共存する。
+happy path (plugin全通過) のe2eテストで手順順序を固定。holdout.pyの
+record_fnはTask 7-Dで実装済みのため呼ぶだけ (変更なし)。
 strategy_gate.evaluate_strategy_adoption_gate に record_fn を通し、
 commit() 手順4〜7-9 で ledger_entries/gate_rows を _finalize_success へ
 実配線した (3周目レビュー Important-2)。
@@ -18703,13 +19510,35 @@ EOF
 
 ---
 
-### 10.12 `service.py`: `ImproveSupervisor._improve_loop` への最終配線
+### 10.12 `service.py`: `ImproveSupervisor._improve_loop` への最終配線 + `submit_manual` 実装 (R-D1 on_ready 方式、B16)
 
-**前提の整理 (統合裁定 R-i2)**: Tx-0 (mission 生成 + run 生成 + slot claim) の所有者は最初から `ImproveLoop.prepare` (10.2 節) であり、`ImproveSupervisor` (9.3/9.5 節) は `self._improve_loop.prepare(...)` を呼ぶだけで自分では `claim_slot` を行わない — この設計は 9.3/9.5 節を書いた時点で既に最終形として書かれている (二重の Tx-0 という設計矛盾は存在しない)。本節に残る作業は**配線のみ**: 9.5 節で `ImproveSupervisor.__init__` が用意した `self._improve_loop: "ImproveLoop | None" = None` というテストシームに、`build_app` の中で実 `ImproveLoop` インスタンスを注入する。
+<!-- precheck 2026-08-22 wave2: T10-B2 T10-B16 T10-B10 R-D1 -->
+**撤回・書き直し (R-D1、2026-08-22 深夜裁定)**: 旧稿は `runner.spawn()` →
+`mark_running` → `runner.send_go()` → `runner.run_to_completion()` という
+3 相 API を前提にしていたが、`WorkerRunner` にこの 3 メソッドは存在せず
+(現物の public API は `close()`/`run(mission)` のみ)、`run()` は spawn〜
+result まで一気通貫のブロッキング呼び出しである (B2)。3-way 起動は
+**`on_ready` 方式**に統一する — `WorkerRunner.run()` は子の `ready` フレーム
+受信直後に `on_ready(frame)` を呼ぶ (現物に既にある `on_ready` パラメータ
+を流用する。Interfaces 節「Task 1 が produces (R-D1/R-D2 実装時改訂)」
+ブロック参照 — Task 1 側で例外伝播/kill の実装時改訂が必要)。
+`ImproveSupervisor._launch_slot`/`submit_manual` は `runner.run(mission)`
+を**1 回**呼ぶだけになり、`on_ready` コールバックの中で `mark_running`
+(wave 起動のみ) を行う。D-9 の `_RecordingFakeWorkerRunner` (`spawn`/
+`send_go`/`run_to_completion` を持つフェイク、`tests/core/
+test_improve_wave_slot_protocol.py:145`) はこの契約と食い違うため撤去し、
+`run(mission)` 契約のフェイクへ置き換える (下記「既存テスト改訂」)。
 
-**スコープの限定 (レビュー1周目 C1)**: 本節が行うのは `improve_supervisor._improve_loop = improve_loop` の注入のみである。Scheduler/Commands への活性化配線 (`on_improve_tick`/`improve_supervisor` に非 `None` 値を渡す配線) はここでは**行わない**。統合裁定 R-i9 のとおり、その配線は Task 12 の blocking gate (§7.1 の 1〜7 全緑確認) が成功した**後**の step にのみ置く — 本節完了時点では `Scheduler(..., on_improve_tick=None)` / `Commands(..., improve_supervisor=None)` のまま (9.x 節の既定値を変更しない)。
+**前提の整理 (統合裁定 R-i2、維持)**: Tx-0 (mission 生成 + run 生成 +
+slot claim) の所有者は `ImproveLoop.prepare` (10.2 節) — `run()` の**前**に
+完了する。`ImproveSupervisor` は自分で `claim_slot` を行わない。
 
-- [ ] **Step 1〜6**: `src/agentic_fx/service.py` の `build_app` (9.8 節で追加した `ImproveSupervisor` 構築ブロックの直後) に以下を追記する:
+**スコープの限定 (レビュー1周目 C1、維持)**: `service.py` 側の配線は
+`improve_supervisor._improve_loop = improve_loop` の注入のみ。
+Scheduler/Commands への活性化配線は Task 12 へ委譲する (`on_improve_tick=None`
+/ `improve_supervisor=None` のまま)。
+
+- [ ] **Step 1: `service.py` — `ImproveLoop` 構築 (`rag=` 込み、B10) を注入する**
 
 ```python
         from agentic_fx.loops.improve_loop import ImproveLoop
@@ -18718,48 +19547,215 @@ EOF
             db_write_conn_factory=lambda: db.connect(root / "data" / "agentic.db"),
             db_readonly_conn_factory=lambda: db.connect_readonly(
                 root / "data" / "agentic.db"),
-            activity=activity)
+            activity=activity, rag=rag)  # precheck 2026-08-22 wave2: T10-B10
+            # rag: build_app が既に構築済みの Rag インスタンス
+            # (service.py:751 Rag(root/"data"/"rag", embedding_function=...))
+            # をそのまま渡す。ImproveLoop 側で new しない
         improve_supervisor._improve_loop = improve_loop
 ```
 
-`ImproveSupervisor._launch_slot` (9.5 節、以下再掲・変更なし) はこの注入だけで動作するようになる:
+- [ ] **Step 2: `ImproveSupervisor._launch_slot` を R-D1 (on_ready 方式) へ書き換える (B2)**
+
+9.5 節の最終形 (旧稿) を以下へ**置換**する — `core/improve_supervisor.py`
+の当該メソッド全文を差し替える:
+
+**この Step のコードは 9.5 節で確定した最終形を正とする** (9.5 節「実装時
+改訂 (2026-08-22 R-D1)」ブロックに逐語あり — 本節では重複を避けるため
+再掲しない)。要点: `reached_running` フラグで on_ready 到達を追跡し、
+**on_ready が一度も呼ばれずに完走以外の結果**で終わった場合 (pre-ready
+失敗) だけ `_handle_pre_ready_failure` (9.4 節、`spawn_attempts` による
+retry/failed 分岐 — 既存メソッド、削除しない) を呼ぶ。on_ready 到達後
+(= slot が `running` へ遷移済み) の失敗は retry せず、`self._improve_loop.
+commit(...)` の `_finalize_failed_mission` (手順0) が slot を
+`running→failed` で終端させる — 実行が始まった後の失敗を retry すると
+二重実行になるため、両者を区別する必要がある (旧稿の初版はこの区別を
+落としていた。9.5 節の実装時改訂で修正済み)。
+
+- [ ] **Step 3: `submit_manual` の実体を実装する (B16)**
+
+現物 `core/improve_supervisor.py:82-87` は `raise NotImplementedError  #
+9.7 節で実装` のまま。9.7 節側も `commands.py` の呼び出しだけを示し、
+`submit_manual` 自体の Step が三者 (9.5/9.7/10.12) のどこにも無かった
+(B16 — `tmp/plan10-impl/acceptance-task9.md` M-a の申し送りがここで初めて
+反映される)。`ImproveSupervisor.submit_manual` の全文を以下へ置き換える:
 
 ```python
-    def _launch_slot(self, period_key: str, k: int) -> None:
+    def submit_manual(self) -> int:
+        """手動 one-shot。slot/wave 行を作らず M=1 で全バックログを担当
+        させる (§8.1-該当、9.7 節「improve」コマンドから呼ばれる)。
+        wave slot が無いため on_ready コールバックは不要 (mark_running する
+        対象が無い)。"""
         now = self._clock.now()
         mission, ctx, runner = self._improve_loop.prepare(
-            slot_key=(period_key, k), now=now)
-        spawn_result = runner.spawn()
-        if spawn_result != "ready":
-            self._handle_pre_ready_failure(period_key, k)
-            return
-        conn = self._conn()
-        try:
-            improve_waves.mark_running(
-                conn, period_key=period_key, k=k, now=self._clock.now(), commit=True)
-        finally:
-            conn.close()
-        runner.send_go()
-        result = runner.run_to_completion()
+            slot_key=None, now=now)
+        result = runner.run(mission)
         self._improve_loop.commit(mission=mission, ctx=ctx, result=result,
                                   now=self._clock.now())
+        return ctx.mission_id
 ```
 
-`submit_manual` (9.7 節) も同じ `self._improve_loop.prepare(slot_key=None, ...)` を直接呼ぶ形に実装する (`ImproveLoop.prepare` の `slot_key=None` 分岐は 10.2 節の `test_tx0_manual_one_shot_has_no_slot_claim` で既に固定済み)。
+`ImproveLoop.prepare` の `slot_key=None` 分岐は 10.2 節の
+`test_tx0_manual_one_shot_has_no_slot_claim` で既に固定済み。
 
-**Scheduler/Commands への活性化配線はここでは行わない** (レビュー1周目 C1 / 統合裁定 R-i9): `on_improve_tick`/`improve_supervisor` に実値を渡す配線とそのテストは Task 12 (§7.1 の blocking 1〜7 全緑確認の後の step) の担当。本節完了時点でも `Scheduler(..., on_improve_tick=None)` / `Commands(..., improve_supervisor=None)` のままとし、improve レーンは無効のままにする。
+**既存テスト改訂 (共通規約、必須)**: `tests/core/test_improve_wave_slot_protocol.py`
+の `_RecordingFakeWorkerRunner` (`:145-163`) は `spawn()`/`send_go()`/
+`run_to_completion()` を持つ旧 3 相フェイクであり、R-D1 の `run(mission)`
+単一呼び出し契約と食い違う。**フェイクを撤去し、`run(mission) ->
+MissionResult` 契約かつ `on_ready` を受け取れるフェイクへ書き換える**:
 
-- [ ] **Step 4〜6**: 注入後、9.5 節の N=4 テストと 10.11 節の happy-path テストを通しで実行し、統合コミットを 1 本作る:
+```python
+# tests/core/test_improve_wave_slot_protocol.py の _RecordingFakeWorkerRunner
+# を以下へ置換 (precheck 2026-08-22 wave2: T10-B2/R-D1)
+class _RecordingFakeWorkerRunner:
+    """R-D1: on_ready 方式の run(mission) 単一呼び出し契約を満たすフェイク。
+    `on_ready` は `prepare(on_ready=...)` 経由で `_build_worker_runner` に
+    渡ったものを `run()` 実行時に呼ぶ (本物の WorkerRunner.run() の挙動を
+    模す)。"""
+    def __init__(self, *, on_ready=None, result_status="completed",
+                on_ready_raises=False):
+        self.calls: list[str] = []
+        self._on_ready = on_ready
+        self._result_status = result_status
+        self._on_ready_raises = on_ready_raises
+
+    def run(self, mission):
+        self.calls.append("run")
+        if self._on_ready is not None:
+            if self._on_ready_raises:
+                # 本物の WorkerRunner.run() は on_ready が例外を投げたら
+                # 子を kill し 'failed' を返す (pre-ready 失敗)
+                return MissionResult("failed", None, [])
+            self._on_ready({"ok": True})
+        return MissionResult(self._result_status, {}, [])
+```
+
+`_FakeImproveLoop.prepare` (`:166-192`) が返す `runner` をこのフェイクの
+インスタンスへ差し替え、3-way 起動順序テスト群 (`spawn`/`send_go`/
+`run_to_completion` の呼び出し順序を assert していたもの) は「`prepare`
+→ (on_ready 経由の) `mark_running` → `run` → `commit`」の順序 assert へ
+書き換える (検査意図 — 「Tx-0 claim → running 遷移 → 実行 → 終端」の
+順序保証 — は維持する)。
+
+- [ ] **Step 4: 変異テスト**
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M1 | `_launch_slot` が `on_ready=` を渡さない (wave slot が `running` に遷移しない) | 実装者が `test_launch_slot_marks_slot_running_via_on_ready` を追加すること (下限リスト不足、申し送り — slot 起動テストで `improve_wave_slots.status` を assert) |
+| M2 (precheck 2026-08-22 wave2: T10-B16) | `submit_manual` が `NotImplementedError` のまま (旧稿の退行) | 実装者が `test_submit_manual_returns_mission_id_without_slot_claim` を追加すること (下限リスト不足、申し送り — `submit_manual()` の戻り値が `int` であり、`improve_wave_slots` に行が増えないことを assert) |
+
+- [ ] **Step 5: 統合コミット**
 
 ```bash
 uv run pytest tests/core/test_improve_wave_slot_protocol.py tests/loops/ -v
-git add src/agentic_fx/service.py
+git add src/agentic_fx/service.py src/agentic_fx/core/improve_supervisor.py \
+       tests/core/test_improve_wave_slot_protocol.py
 git commit -m "$(cat <<'EOF'
-feat: ImproveSupervisor._improve_loop への ImproveLoop 注入 (プラン10 Task10-12)
+feat: ImproveLoop注入 + on_ready方式への3-way起動書き換え + submit_manual実装 (プラン10 Task10-12, R-D1/B2/B16)
 
-build_appでImproveLoopを構築しImproveSupervisor._improve_loopへ注入する。
+WorkerRunner.spawn/send_go/run_to_completion (非実在) をrun(mission)単発呼び出しへ
+置換。on_readyコールバックでwave slotのmark_runningを行う。submit_manualは
+NotImplementedErrorのままだった空洞を埋め、slot claim無しでprepare/run/commit
+を直列に呼ぶ。_RecordingFakeWorkerRunnerを新契約へ改訂。
 Scheduler.on_improve_tick/Commands.improve_supervisorへの活性化配線は
-Task 12 の blocking gate 成功後の step へ委譲する (レビュー1周目 C1 / R-i9)。
+Task 12 の blocking gate 成功後の step へ委譲する (レビュー1周目 C1 / R-i9、不変)。
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+<!-- precheck 2026-08-22 wave2: 第2波裁定「Task 12 の依存」 -->
+### 10.13 `backtest_runs.mission_id` / `analysis_runs.mission_id` 列の追加 (Task 12 が依存する Step、Task 10 が所有)
+
+**背景**: 第2波裁定「Task 12 の依存」により、`backtest_runs.mission_id` /
+`analysis_runs.mission_id` 列は Task 10 が追加する (Task 12 の SQL が
+これに依存する)。現物 `src/agentic_fx/store/db.py:283-289` の
+`TABLE_NAMES` (17 項目、上記逐語) は新テーブルを追加しないため不変 —
+既存テーブルへの列追加のみ (`_ensure_column`、`db.py:343-351` 現物)。
+
+- [ ] **Step 1: 失敗するテストを書く**
+
+```python
+# tests/store/test_db_migrations.py に追記 (既存ファイル。無ければ
+# tests/store/test_db.py の migration テストパターンに合わせて新設)
+def test_backtest_runs_and_analysis_runs_have_mission_id_column(tmp_path):
+    from agentic_fx.store.db import connect, init_db
+
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    bt_cols = {r["name"] for r in conn.execute("PRAGMA table_info(backtest_runs)")}
+    an_cols = {r["name"] for r in conn.execute("PRAGMA table_info(analysis_runs)")}
+    assert "mission_id" in bt_cols
+    assert "mission_id" in an_cols
+
+
+def test_ensure_column_migration_is_idempotent_for_mission_id(tmp_path):
+    """2 回連続で init_db を呼んでも (再起動相当) ALTER TABLE が失敗しない。"""
+    from agentic_fx.store.db import connect, init_db
+
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    init_db(conn)  # 2 回目 — ALTER TABLE で例外が出たら red
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(backtest_runs)")}
+    assert "mission_id" in cols
+
+
+def test_table_names_unchanged_after_mission_id_columns_added():
+    """T10-13 は既存テーブルへの列追加のみであり、新テーブルは追加しない
+    — TABLE_NAMES (17 項目) が不変であることの pin。"""
+    from agentic_fx.store.db import TABLE_NAMES
+
+    assert TABLE_NAMES == frozenset({
+        "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
+        "reflections", "account_snapshots", "improvement_backlog",
+        "improvement_runs", "econ_events", "approval_requests", "news_sources",
+        "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
+        "alert_state", "improve_waves", "improve_wave_slots",
+        "plugin_switch_journal",
+    })
+```
+
+- [ ] **Step 2: 失敗を確認**
+
+```bash
+uv run pytest tests/store/test_db_migrations.py -v -k mission_id
+```
+
+- [ ] **Step 3: 最小実装** — `src/agentic_fx/store/db.py` の `init_db` 内、
+既存の `_ensure_column(conn, "improvement_runs", "mission_id", ...)` 呼び出し
+(現物 `db.py:1028` 付近) の**直後にアンカー付き挿入**する (既存の
+`_ensure_column` 呼び出し列を消さない):
+
+```python
+    _ensure_column(conn, "backtest_runs", "mission_id", "mission_id INTEGER")
+    _ensure_column(conn, "analysis_runs", "mission_id", "mission_id INTEGER")
+```
+
+- [ ] **Step 4: 成功を確認**
+
+```bash
+uv run pytest tests/store/test_db_migrations.py -v -k mission_id
+uv run pytest tests/store/ -v   # 既存 DDL/migration 回帰
+```
+
+- [ ] **Step 5: 変異テスト**
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M1 | `backtest_runs`/`analysis_runs` への `_ensure_column` 呼び出しを削る | `test_backtest_runs_and_analysis_runs_have_mission_id_column` |
+| M2 | 新テーブルを `CREATE TABLE` で追加してしまう (列追加でなくテーブル追加に変える誤実装) | `test_table_names_unchanged_after_mission_id_columns_added` |
+
+- [ ] **Step 6: コミット**
+
+```bash
+git add src/agentic_fx/store/db.py tests/store/test_db_migrations.py
+git commit -m "$(cat <<'EOF'
+feat: backtest_runs/analysis_runs に mission_id 列を追加 (プラン10 Task10-13)
+
+Task 12 のSQLが依存する列を先行追加する (第2波裁定)。_ensure_columnによる
+既存テーブルへの列追加のみでTABLE_NAMES (17項目) は不変。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -18773,6 +19769,7 @@ EOF
 | 節 | 実装物 | §8.1 項目 |
 |---|---|---|
 | 10.1 | `ImproveRunContext` dataclass | 6 |
+| 10.1b (precheck 2026-08-22 wave2: T10-B3) | `tests/loops/conftest.py` 新設 (共有 fixture) | — |
 | 10.2 | `prepare()` Tx-0 (missions+run+slot 1tx) | 6, 23 |
 | 10.3 | source snapshot (固定 `PluginMeta.path`・fault injection・`_examples`) | 11 |
 | 10.4 | commit 手順0-1 (台帳凍結・出力検査・`artifact.type` schema・`risk_gate`) | 42 |
@@ -18780,10 +19777,12 @@ EOF
 | 10.6 | commit 手順3 plugin ゲート (スナップショット・2hash・gate_pytest 呼出) | — (参照 9,10) |
 | 10.7 | commit 手順4 戦略採用ゲート (candidate/baseline/no_strategy、`plugin/strategy_gate.py` に配置・R-i3) | 40 |
 | 10.8 | commit 手順5 承認申請 (台帳由来 analysis_run_ids/trial_count) | 16 |
-| 10.9 | commit 手順6 report outbox (全状態表・fsync fault injection) | 43 |
-| 10.10 | commit 手順7-9 (finish_improve_mission・補償tx) | 21, 23, 24 (参照) |
-| 10.11 | commit() 統合 + holdout.py record_fn | 23, 24 |
-| 10.12 | service.py 最終配線 (`ImproveSupervisor._improve_loop` 注入のみ。Scheduler/Commands 活性化配線は Task 12 へ移動 — レビュー1周目 C1) | — |
+| 10.9 | commit 手順6 report outbox (全状態表・fsync fault injection) + `_build_rpc_handlers` 完全実装 | 43 |
+| 10.9b (precheck 2026-08-22 wave2: T10-B12/B17, R-D2) | improve registry の親/子配線 (`_build_mission_tools`・子側 `_build_improve_registry` 差し替え) + 7-F 遮断⑦⑧ green 化 (B11) | 43 (参照) |
+| 10.10 | commit 手順7-9 (finish_improve_mission・補償tx) + `analysis_runs.save(commit=)` 追加 (B1) | 21, 23, 24 (参照) |
+| 10.11 | commit() 統合 (holdout.py は Task 7-D 実装済み、呼ぶだけ — B15) | 23, 24 |
+| 10.12 | service.py 最終配線 + on_ready 方式への 3-way 起動書き換え (R-D1、B2) + `submit_manual` 実装 (B16) (`ImproveSupervisor._improve_loop` 注入含む。Scheduler/Commands 活性化配線は Task 12 へ移動 — レビュー1周目 C1) | — |
+| 10.13 (precheck 2026-08-22 wave2: 第2波裁定「Task 12 の依存」) | `backtest_runs`/`analysis_runs` への `mission_id` 列追加 (Task 12 の SQL が依存) | — |
 
 ---
 
@@ -18815,11 +19814,11 @@ EOF
 
 7. **`improvement_runs`/`improvement_backlog`/`improve_wave_slots` の正確なカラム名・型** (10.x節の SQL 文で使った `report_state`/`spawn_attempts`/`backlog_id`/`mission_id` 等) は骨格の DDL 骨子から転記したが、**Task 8 の実装が実際にこの通りの列名で作るかは Task 8 の詳細節が正**。本節の SQL は Task 8 完了後に列名の食い違いを実測で確認し修正すること。
 8. ~~`ActivityLog.write` の呼び出しシグネチャ~~ — **統合時に解決済み**。10.x節の `self._activity.write("IMPROVE", ...)` を `self._activity.write(Category.IMPROVE, ...)` へ統一し、`loops/improve_loop.py` の import ブロックに `from agentic_fx.activity import Category` を追加した (9.7節は元から `Category.IMPROVE` を正しく使用済み)。
-9. **`approvals_store.create` の `commit=False` シグネチャ** — 骨格は `commit=False` を明記するが、現物 `store/approvals.py::create` は本文書執筆時点で `commit` パラメータを持たない (既存シグネチャは `create(conn, kind, payload, now, *, expires_at=None)`)。Task 8 がこのシグネチャに `commit=False` を追加する前提で 10.10/10.11 節のコードを書いた。
+9. ~~`approvals_store.create` の `commit=False` シグネチャ~~ — **stale (precheck 2026-08-22 wave2 で削除)**。現物 `store/approvals.py:14` は既に `create(conn, kind, payload, now, expires_at=None, *, commit: bool = True)` を持つ (Task 8 実装済み)。10.10/10.11 節の `commit=False` 呼び出しは現物どおりで問題ない。
 
 ### D. 行数・件数サマリ
 
-- Task 数: 2 (Task 9: 8 サブタスク、Task 10: 12 サブタスク)
+- Task 数: 2 (Task 9: 8 サブタスク、Task 10: 15 サブタスク — precheck 2026-08-22 wave2 で 10.1b/10.9b/10.13 を新設)
 - 申し送り件数: 19 件 (新規命名 8 件、未解決の設計矛盾・分割 6 件のうち 3 件は統合時に解決済み、設計書と現物の食い違い 3 件のうち 1 件は統合時に解決済み、下限リスト不足の明示的指摘を 1 件として集約)
 
 
