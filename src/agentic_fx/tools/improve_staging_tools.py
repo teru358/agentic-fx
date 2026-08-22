@@ -80,7 +80,7 @@ def build_improve_staging_tooldefs(*, staging_dir: Path,
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:logging",
              str(base / "test_plugin.py")],
-            capture_output=True, text=True, timeout=120)
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
         return json.dumps({"passed": result.returncode == 0,
                            "stdout_tail": result.stdout[-2000:]})
 
