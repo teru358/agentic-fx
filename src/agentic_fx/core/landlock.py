@@ -153,6 +153,28 @@ def is_available() -> bool:
     return version >= _REQUIRED_ABI
 
 
+def _assert_allowlist_excludes_data_dir(
+    paths: list[Path], *, guarded_data_dir: Path,
+) -> None:
+    """allowlist のどの 1 パスも `guarded_data_dir` の祖先・一致・子孫で
+    ないことを確認し、違反したら fail closed する
+    (プラン8 Task 18 / プラン10 Task 5 で `core/landlock.py` へ移設)。
+    呼び出し側 (`mission_worker._bootstrap_improve_profile`) が
+    `guarded_data_dir` を自身の独立した式 (`__file__` 由来、`code_root`
+    からは導かない) で算出して渡す責務を持つ — このヘルパ自体は
+    「渡された値同士の包含関係」だけを機械的に見る。"""
+    for p in paths:
+        resolved = Path(p).resolve()
+        if (resolved == guarded_data_dir
+                or resolved in guarded_data_dir.parents
+                or guarded_data_dir in resolved.parents):
+            raise RuntimeError(
+                f"improve worker allowlist would expose the history data "
+                f"directory: {resolved} covers or lives under "
+                f"{guarded_data_dir} — refusing to start "
+                "(fail closed, 設計書 §2.1)")
+
+
 def restrict_to(*, read_only_paths: list[Path],
                 read_write_paths: list[Path],
                 execute_paths: Sequence[Path] = ()) -> None:

@@ -573,3 +573,44 @@ def test_real_landlock_enforces_read_only_read_write_and_blocked(tmp_path):
         capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "OK" in result.stdout
+
+
+# --- Task 5 Section 5-B: _assert_allowlist_excludes_data_dir -----
+
+def test_assert_allowlist_excludes_data_dir_lives_in_landlock_module():
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    assert _assert_allowlist_excludes_data_dir is not None
+
+
+def test_assert_allowlist_excludes_data_dir_passes_when_disjoint(tmp_path):
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    data_dir = tmp_path / "data"
+    ok = tmp_path / "code"
+    ok.mkdir()
+    _assert_allowlist_excludes_data_dir([ok], guarded_data_dir=data_dir)  # raise しない
+
+
+def test_assert_allowlist_excludes_data_dir_rejects_ancestor(tmp_path):
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    data_dir = tmp_path / "repo" / "data"
+    with pytest.raises(RuntimeError, match="history data"):
+        _assert_allowlist_excludes_data_dir([tmp_path / "repo"],
+                                            guarded_data_dir=data_dir)
+
+
+def test_assert_allowlist_excludes_data_dir_rejects_descendant(tmp_path):
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    child = data_dir / "sub"
+    child.mkdir()
+    with pytest.raises(RuntimeError, match="history data"):
+        _assert_allowlist_excludes_data_dir([child], guarded_data_dir=data_dir)
+
+
+def test_assert_allowlist_excludes_data_dir_rejects_exact_match(tmp_path):
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    with pytest.raises(RuntimeError, match="history data"):
+        _assert_allowlist_excludes_data_dir([data_dir], guarded_data_dir=data_dir)

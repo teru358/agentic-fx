@@ -90,7 +90,10 @@ def _set_resource_limits(*, as_mb: int, nofile: int, fsize_mb: int) -> None:
     resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_bytes, fsize_bytes))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
-def _bootstrap_improve_profile() -> None:
+def _bootstrap_improve_profile(
+    *, backend: str, mission_id: str, staging_dir: str,
+    source_snapshot_dir: str, claude_bin: str | None, codex_bin: str | None,
+) -> None:
     """improve worker profile の bootstrap (プラン8, 設計書 §4.6)。
 
     **⚠ CRITICAL: Landlock は不可逆。この関数を呼ぶプロセスの生涯全体が
@@ -108,13 +111,14 @@ def _bootstrap_improve_profile() -> None:
 
     **Landlock 利用不能な環境では improve worker は起動拒否 (fail
     closed)** — trade profile は Landlock を任意 (RO 接続が主防御) と
-    するが、improve profile は Landlock が唯一の FS 境界であるため必須。
+    するが, improve profile は Landlock が唯一の FS 境界であるため必須。
     """
     if not landlock.is_available():
         raise RuntimeError(
             "Landlock is not available on this kernel/architecture — "
             "improve worker profile refuses to start without it "
             "(fail closed, 設計書 §4.6)")
+
     code_root = Path(__file__).resolve().parents[1]
     workdir = Path.cwd()
     venv_root = Path(sys.prefix).resolve()
@@ -123,64 +127,53 @@ def _bootstrap_improve_profile() -> None:
     read_only = [code_root, venv_root, stdlib_root]
     if base_prefix != venv_root:
         read_only.append(base_prefix)
-    # venv/stdlib の外にある実行時依存。**allowlist は防御の質そのものなので
-    # 最小に保つ**が、**「起動できる (`ready` に到達する)」を基準に測っては
-    # いけない。「LLM エンドポイントへ到達できる」まで踏むこと** — `ready` は
-    # `runner.run` の 1 行手前で送出されるので、その先で初めて必要になる依存
-    # (名前解決など) の欠落を素通りさせる (2026-08-09 に実際にそれで `/etc` を
-    # 落とした。下記参照)。
-    #
-    # **実測が担保する範囲を正確に書く**: 下記の判定は
-    # `getaddrinfo` / `socket.create_connection` / `httpx.get("/v1/models")`
-    # → 200 までの**到達性**で測っている。**実 LLM 応答から `result` 送出まで
-    # の Mission 完走は測っていない** (llama-swap 実機と数百秒を要するため
-    # スイートに入れていない)。プラン 9 で改善ループに実ツールセットが入る際は
-    # 完走側の確認を E2E に置くこと:
-    #
-    #   /usr/lib             外すと `ImportError: libgcc_s.so.1: cannot open
-    #                        shared object file` で improve worker が起動不能
-    #   /usr/share/zoneinfo  タイムゾーンデータ。外すと起動不能
-    #   /dev                 `/dev/urandom` (乱数生成) のため。**ディレクトリ
-    #                        単位でしか許可できない** — `landlock.restrict_to`
-    #                        は対象を `O_PATH | O_DIRECTORY` で open するので
-    #                        単一ファイル (`/dev/urandom`) を渡すと
-    #                        `NotADirectoryError` になる (実測)
-    #   /etc                 **glibc の名前解決 (`/etc/nsswitch.conf`,
-    #                        `/etc/hosts`) に必要。** 外すと
-    #                        `socket.getaddrinfo("localhost", 8080)` が
-    #                        `gaierror: Temporary failure in name resolution`
-    #                        になり、既定の `llama_swap.base_url`
-    #                        (`http://localhost:8080/v1`) へ到達できず、
-    #                        **improve Mission が初回ターンで必ず failed に
-    #                        なる** (レビュー 2 周目 `/code-review` が検出)
-    #
-    # **`/etc` を一度削除した経緯 (同じ誤りを繰り返さないために残す)**:
-    # 指揮者の最初の最小化は「1 つずつ外して `test_real_improve_worker_
-    # reaches_ready` が red になるか」で測ったが、**この test は `ready`
-    # 送出までしか到達せず、その 1 行あとの `runner.run` (= 実際に LLM を
-    # 叩く経路) を通らない**。名前解決はその先で初めて必要になるので、
-    # 「外しても green」= 「不要」と読み違えた。いまは probe が
-    # `getaddrinfo` まで見る (`test_improve_profile_cannot_reach_data_dir`)。
-    #
-    # **既知の制約**: `/etc/resolv.conf` は `/run/systemd/resolve/...` への
-    # symlink なので、`/etc` を許可しても**外部ホスト名の DNS 解決はできない**
-    # (実測)。`localhost`/IP は `/etc/hosts` で解決するので既定構成では問題に
-    # ならない。`llama_swap.base_url` を外部ホスト名にする場合は allowlist の
-    # 追加が要る。
-    #
-    # 外しても **HTTP 到達性 (`/v1/models` → 200) に影響が無かった**ため削除
-    # したもの: `/lib`・`/lib64` (どちらも `/usr/lib`・`/usr/lib64` への
-    # symlink)、`/usr/lib64`。
-    # 残した 4 つはいずれも `data/` の祖先ではないため、設計書 §4.6 の
-    # 「`data/` の絶対パスアクセスを OS レベルで遮断する」意味論は保たれる
-    # (`test_improve_profile_cannot_reach_data_dir` が毎回それを実測する)。
-    for sys_path in [Path("/usr/lib"), Path("/usr/share/zoneinfo"),
-                     Path("/dev"), Path("/etc")]:
+    for sys_path in [Path("/usr/lib"), Path("/usr/share/zoneinfo"), Path("/etc")]:
         if sys_path.exists():
             read_only.append(sys_path)
-    _assert_allowlist_excludes_data_dir(read_only + [workdir])
+    if Path("/run/systemd/resolve").exists():
+        read_only.append(Path("/run/systemd/resolve"))
+    if backend == "claude":
+        read_only.append(Path("/proc"))
+
+    # staging_dir の相互照合 (§2.2): 末尾成分が mission_id と一致するか。
+    # dirfd で開き所有者/mode/種別を再検証してから rw に加える。
+    staging_path = Path(staging_dir).resolve()
+    if staging_path.name != mission_id:
+        raise RuntimeError(
+            f"staging_dir {staging_path} does not match mission_id "
+            f"{mission_id!r} — refusing to start (fail closed, 設計書 §2.2)")
+    fd = os.open(str(staging_path), os.O_DIRECTORY | os.O_PATH)
     try:
-        landlock.restrict_to(read_only_paths=read_only, read_write_paths=[workdir])
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or (st.st_mode & 0o777) != 0o700:
+            raise RuntimeError(
+                f"staging_dir {staging_path} failed re-verification "
+                f"(uid/mode) — refusing to start (fail closed)")
+    finally:
+        os.close(fd)
+
+    # source_snapshot_dir verification (Blocking 10)
+    source_snapshot_path = Path(source_snapshot_dir).resolve()
+    if (not source_snapshot_path.is_dir()
+            or workdir.resolve() not in source_snapshot_path.parents
+            and source_snapshot_path != workdir.resolve()):
+        raise RuntimeError(
+            f"source_snapshot_dir {source_snapshot_path} is not a real "
+            f"directory under workdir {workdir} — refusing to start "
+            "(fail closed, 設計書 §2.2)")
+
+    execute = _exec_closure_for(
+        backend, claude_bin=Path(claude_bin) if claude_bin else None,
+        codex_bin=Path(codex_bin) if codex_bin else None, venv_root=venv_root)
+
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir as _assert_allowlist_excludes_data_dir_impl
+    _assert_allowlist_excludes_data_dir_impl(
+        read_only + [workdir, staging_path] + execute, guarded_data_dir=_guarded_data_dir())
+    try:
+        landlock.restrict_to(
+            read_only_paths=read_only, read_write_paths=[workdir, staging_path,
+                                                          Path("/dev")],
+            execute_paths=execute)
     except landlock.LandlockUnavailable as e:
         raise RuntimeError(
             f"Landlock restriction failed (syscall error): {e} "
@@ -204,6 +197,27 @@ def _guarded_data_dir() -> Path:
     意図的に独立の式で、`__file__` という同じ 1 点からそれぞれ導く。
     """
     return Path(__file__).resolve().parents[2] / "data"
+
+
+def _exec_closure_for(backend: str, *, claude_bin: Path | None,
+                      codex_bin: Path | None, venv_root: Path) -> list[Path]:
+    """§2.2 の表: 共通 = venv_root(+base_prefix は呼び出し側で合成)。
+    shell 系 (claude/codex) は /usr/bin (+実ディレクトリの /bin) を追加。
+    claude/codex はそれぞれのバイナリの親ディレクトリを追加。
+    local は共通のみ。"""
+    closure = [venv_root]
+    for p in (Path("/usr/lib"), Path("/usr/lib64")):
+        if p.exists():
+            closure.append(p)
+    if backend in ("claude", "codex"):
+        closure.append(Path("/usr/bin"))
+        if Path("/bin").is_dir() and not Path("/bin").is_symlink():
+            closure.append(Path("/bin"))
+    if backend == "claude" and claude_bin is not None:
+        closure.append(claude_bin.resolve().parent)
+    if backend == "codex" and codex_bin is not None:
+        closure.append(codex_bin.resolve().parent)
+    return closure
 
 
 def _assert_allowlist_excludes_data_dir(paths: list[Path]) -> None:
@@ -388,7 +402,22 @@ def main() -> None:
         settings_dict = handshake["settings"]
         worker_profile = handshake["worker_profile"]
         if worker_profile == "improve":
-            _bootstrap_improve_profile()
+            improve_backend = settings_dict["runner"]["improve"]["backend"]
+            if improve_backend == "claude":
+                claude_bin = settings_dict["runner"]["claude"]["bin"]
+                codex_bin = None
+            elif improve_backend == "codex":
+                claude_bin = None
+                codex_bin = settings_dict["runner"]["codex"]["bin"]
+            else:
+                claude_bin = None
+                codex_bin = None
+            _bootstrap_improve_profile(
+                backend=improve_backend,
+                mission_id=handshake["mission_id"],
+                staging_dir=handshake["staging_dir"],
+                source_snapshot_dir=handshake["source_snapshot_dir"],
+                claude_bin=claude_bin, codex_bin=codex_bin)
             _set_resource_limits(
                 as_mb=settings_dict["worker"]["child_as_mb"],
                 nofile=settings_dict["worker"]["child_nofile"],

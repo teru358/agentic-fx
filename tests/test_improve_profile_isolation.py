@@ -262,6 +262,10 @@ def test_real_improve_worker_reaches_ready(tmp_path):
     })
     workdir = tmp_path / "workdir"
     workdir.mkdir()
+    staging = workdir / "staging" / "iso-ready-probe"
+    staging.mkdir(parents=True, mode=0o700)
+    source_snapshot = workdir / "source"
+    source_snapshot.mkdir(mode=0o500)
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "agentic_fx.mission_worker"],
@@ -277,6 +281,9 @@ def test_real_improve_worker_reaches_ready(tmp_path):
                        "output_schema": {"type": "object"},
                        "max_turns": 1, "timeout_sec": 30},
             "worker_profile": "improve",
+            "mission_id": "iso-ready-probe",
+            "staging_dir": str(staging),
+            "source_snapshot_dir": str(source_snapshot),
             "now": "2026-08-06T00:00:00+00:00",
         }
         write_frame(proc.stdin, handshake)
@@ -316,10 +323,21 @@ def test_allowlist_never_covers_the_data_dir(monkeypatch, tmp_path):
                         lambda **kw: captured.update(kw))
     monkeypatch.chdir(tmp_path)
 
-    mw_mod._bootstrap_improve_profile()
+    # Create staging and source_snapshot dirs for new signature
+    staging = tmp_path / "staging" / "m-test"
+    staging.mkdir(parents=True, mode=0o700)
+    source = tmp_path / "source"
+    source.mkdir(mode=0o500)
+
+    mw_mod._bootstrap_improve_profile(
+        backend="local", mission_id="m-test",
+        staging_dir=str(staging),
+        source_snapshot_dir=str(source),
+        claude_bin=None, codex_bin=None)
 
     data_dir = mw_mod._guarded_data_dir()
-    allowed = list(captured["read_only_paths"]) + list(captured["read_write_paths"])
+    allowed = (list(captured["read_only_paths"]) + list(captured["read_write_paths"])
+              + list(captured.get("execute_paths", [])))
     assert allowed, "allowlist が空 — restrict_to の呼び出しを捕まえられていない"
     for p in allowed:
         resolved = Path(p).resolve()
@@ -339,7 +357,7 @@ def test_allowlist_never_covers_the_data_dir(monkeypatch, tmp_path):
         "専用 workdir (cwd) が read_write allowlist に入っていない"
 
 
-def test_bootstrap_fails_closed_when_cwd_would_expose_data_dir(monkeypatch):
+def test_bootstrap_fails_closed_when_cwd_would_expose_data_dir(monkeypatch, tmp_path):
     """`Popen(cwd=...)` が専用 workdir でなくリポジトリ root になった場合
     (= codex 1周目 #1 の変異)、**起動を拒否する**ことを pin する。
 
@@ -355,8 +373,18 @@ def test_bootstrap_fails_closed_when_cwd_would_expose_data_dir(monkeypatch):
                             "data/ を覆う allowlist で restrict_to を呼んでいる"))
     monkeypatch.chdir(repo_root)
 
+    # Create staging and source_snapshot dirs
+    # Note: workdir=cwd=repo_root (sibling to data/ — this should trigger allowlist error)
+    staging = repo_root / "staging" / "m-test"
+    staging.mkdir(parents=True, mode=0o700, exist_ok=True)
+    source = repo_root  # source is workdir itself
+
     with pytest.raises(RuntimeError, match="would expose the history data"):
-        mw_mod._bootstrap_improve_profile()
+        mw_mod._bootstrap_improve_profile(
+            backend="local", mission_id="m-test",
+            staging_dir=str(staging),
+            source_snapshot_dir=str(source),
+            claude_bin=None, codex_bin=None)
 
 
 def test_run_holdout_gate_requires_history_conn_keyword():
@@ -393,10 +421,14 @@ def test_guard_rejects_allowlist_paths_under_the_data_dir():
     を変えたときに効く最後の網なので、退行を検出できる形にしておく。
     """
     import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
 
     inside = mw_mod._guarded_data_dir() / "sub"
     with pytest.raises(RuntimeError, match="would expose the history data"):
-        mw_mod._assert_allowlist_excludes_data_dir([inside])
+        _assert_allowlist_excludes_data_dir(
+            [inside], guarded_data_dir=mw_mod._guarded_data_dir())
+    _assert_allowlist_excludes_data_dir(
+        [Path("/usr/lib")], guarded_data_dir=mw_mod._guarded_data_dir())
 
     # 対称の確認: 無関係なパスは通る (上の raise が恒真でないこと)
     mw_mod._assert_allowlist_excludes_data_dir([Path("/usr/lib")])
