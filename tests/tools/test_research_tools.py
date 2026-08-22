@@ -94,6 +94,21 @@ def test_web_search_min_interval_sec_enforced():
     assert len(backend.calls) == 1
 
 
+def test_fetch_article_min_interval_sec_enforced():
+    """M-1 (検収 Minor): 間隔ゲートは web_search 専用ではない — §6 は
+    6 軸を web_search/fetch_article の Mission 予算としてまとめて列挙する。
+    間隔未満の 2 回目の fetch は backend を呼ばず error。"""
+    clock_values = iter([0.0, 0.5])  # 0.5 < min_interval_sec=2.0
+    tools, _, backend = _build(
+        _settings(min_interval_sec=2.0, max_fetches=10),
+        clock=clock_values)
+    out1 = tools["fetch_article"].func(url="https://a.example/1")
+    assert "error" not in out1
+    out2 = tools["fetch_article"].func(url="https://a.example/2")
+    assert out2 == {"error": "budget exhausted"}
+    assert len(backend.calls) == 1
+
+
 def test_fetch_article_max_per_host_enforced():
     """軸: host 上限。同一 host への 6 回目 (上限 5) は error。"""
     tools, _, backend = _build(
@@ -126,6 +141,39 @@ def test_fetch_article_sends_configured_user_agent():
         fetch_backend=_UACapturingBackend())
     tools["fetch_article"].func(url="https://a.example/1")
     assert seen_ua == ["agentic-fx/9.9 (+https://x/y)"]
+
+
+def test_default_fetch_backend_actually_sends_configured_user_agent(monkeypatch):
+    """B3 (検収 Blocking): `test_fetch_article_sends_configured_user_agent`
+    は fake backend に対して「呼び出し側が UA を渡したか」しか見ておらず、
+    本番 `_default_fetch_backend()` (trafilatura) が実際に UA を運ぶかは
+    検査していなかった (モックが潰した次元)。
+
+    ここでは fake ではなく本番 `_default_fetch_backend()` の構築物を使う —
+    実ネットワークに出さないため `trafilatura.fetch_url` だけを monkeypatch
+    し、そこに渡された `config` (ConfigParser) から実際に導出されるヘッダ
+    (`trafilatura.downloads._determine_headers`) に settings の UA 文字列が
+    現れることを見る。"""
+    import trafilatura
+    from trafilatura.downloads import _determine_headers
+
+    from agentic_fx.tools.research_tools import _default_fetch_backend
+
+    captured: dict = {}
+
+    def _fake_fetch_url(url, config=None, **kwargs):
+        captured["config"] = config
+        return None
+
+    monkeypatch.setattr(trafilatura, "fetch_url", _fake_fetch_url)
+
+    backend = _default_fetch_backend()
+    backend.fetch("https://example.invalid/a",
+                  user_agent="agentic-fx/9.9 (+https://x/y)")
+
+    assert "config" in captured, "trafilatura.fetch_url に config が渡っていない"
+    headers = _determine_headers(captured["config"])
+    assert headers["User-Agent"] == "agentic-fx/9.9 (+https://x/y)"
 
 
 def test_fetch_article_429_aborts_host_for_rest_of_mission():

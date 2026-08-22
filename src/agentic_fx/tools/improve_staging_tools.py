@@ -7,7 +7,6 @@ LocalRunner (worker 内 in-process) 用の防御** — claude/codex はネイテ
 """
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 import sys
@@ -39,50 +38,50 @@ def _safe_join(root: Path, name: str, rel: str | None = None) -> Path | None:
 
 def build_improve_staging_tooldefs(*, staging_dir: Path,
                                     source_snapshot_dir: Path) -> list[ToolDef]:
-    def list_staging() -> str:
+    def list_staging() -> dict:
         candidates = []
         for d in sorted(p for p in staging_dir.iterdir() if p.is_dir()):
             files = sorted(f.name for f in d.iterdir() if f.is_file())
             candidates.append({"name": d.name, "files": files})
-        return json.dumps({"candidates": candidates})
+        return {"candidates": candidates}
 
-    def read_staging_file(name: str, rel: str) -> str:
+    def read_staging_file(name: str, rel: str) -> dict:
         path = _safe_join(staging_dir, name, rel)
         if path is None or not path.is_file():
-            return json.dumps({"error": "not found"})
-        return json.dumps({"content": path.read_text(encoding="utf-8")})
+            return {"error": "not found"}
+        return {"content": path.read_text(encoding="utf-8")}
 
-    def write_staging_file(name: str, rel: str, content: str) -> str:
+    def write_staging_file(name: str, rel: str, content: str) -> dict:
         path = _safe_join(staging_dir, name, rel)
         if path is None:
-            return json.dumps({"error": "invalid name or rel"})
+            return {"error": "invalid name or rel"}
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        return json.dumps({"ok": True})
+        return {"ok": True}
 
-    def read_plugin_source(name: str) -> str:
+    def read_plugin_source(name: str) -> dict:
         base = _safe_join(source_snapshot_dir, name)
         if base is None or not base.is_dir():
-            return json.dumps({"error": "not found"})
+            return {"error": "not found"}
         out = {}
         for rel in sorted(_ALLOWED_REL):
             p = base / rel
             if p.is_file():
                 out[rel] = p.read_text(encoding="utf-8")
         if not out:
-            return json.dumps({"error": "not found"})
-        return json.dumps(out)
+            return {"error": "not found"}
+        return out
 
-    def run_plugin_tests(name: str) -> str:
+    def run_plugin_tests(name: str) -> dict:
         base = _safe_join(staging_dir, name)
         if base is None or not (base / "test_plugin.py").is_file():
-            return json.dumps({"error": "not found"})
+            return {"error": "not found"}
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:logging",
              str(base / "test_plugin.py")],
             capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
-        return json.dumps({"passed": result.returncode == 0,
-                           "stdout_tail": result.stdout[-2000:]})
+        return {"passed": result.returncode == 0,
+                "stdout_tail": result.stdout[-2000:]}
 
     return [
         ToolDef(name="list_staging", description="候補置き場の一覧。",

@@ -18,11 +18,34 @@ _FORBIDDEN_KEYS = frozenset({
     # `period_start`/`period_end` という平坦キーは無くても `period` タプル
     # 経由・`now` 経由で期間端点/日時が agent へ漏れ、遮断7 の趣旨
     # (「返却 schema に日時・期間端点…が無い」) に反する。
-    "period", "now"})
+    "period", "now",
+    # `in_sample_until` (Task 7 検収 B2 是正): `analyze_for_agent(persist=
+    # False)` (`backtest/analysis.py`) は `save_params = {"params": {
+    # "request": ..., "in_sample_until": <ISO 文字列>}, "trial_count": ...,
+    # "source": ...}` をそのまま `payload_body` にマージして返す
+    # (`persist=False` の分岐)。`params` はトップレベルの禁止キーではなく、
+    # `in_sample_until` はその**入れ子**にしか現れないため、剥がすキーの
+    # 集合を平坦に列挙するだけでは足りない — `_strip_forbidden` 自体を
+    # 再帰化し、`in_sample_until` を禁止キーに加える。
+    "in_sample_until"})
 
 
-def _strip_forbidden(d: dict) -> dict:
-    return {k: v for k, v in d.items() if k not in _FORBIDDEN_KEYS}
+def _strip_forbidden(value: object) -> object:
+    """§遮断7: 禁止キーを dict/list の任意の深さから剥がして投影する
+    (Task 7 検収 B2 是正 — 元は浅い (トップレベルのみ) 実装で、
+    `analyze_corr` (persist=False 経路) の `params.in_sample_until` を
+    見落としていた)。
+
+    **台帳は痩せない**: `build_improve_rpc_tooldefs` 内の `ledger.record`
+    呼び出しは strip **前**の `result` をそのまま渡す (10.10 節
+    `_persist_ledger_rows` の契約) — ここでの再帰化は agent への戻り値の
+    投影にのみ影響し、台帳の記録内容は変えない。"""
+    if isinstance(value, dict):
+        return {k: _strip_forbidden(v) for k, v in value.items()
+                if k not in _FORBIDDEN_KEYS}
+    if isinstance(value, list):
+        return [_strip_forbidden(v) for v in value]
+    return value
 
 
 def build_improve_rpc_tooldefs(

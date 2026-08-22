@@ -220,6 +220,36 @@ def test_build_mission_registry_improve_has_research_and_staging_and_rpc_tools(t
             "run_backtest", "analyze_corr"} <= names
 
 
+def test_build_mission_registry_improve_rejects_trade_only_kwargs(tmp_path):
+    """M-4 (検収是正): improve 分岐は provider/readonly/indicator_plugins/
+    sandbox_run (trade 専用の注入 seam) を無言で捨てていた — trade 分岐の
+    `provider is not None and readonly` ガードより前に return するため、
+    誤配線が検出されなかった。fail closed に倒す (ValueError)。"""
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    staging_dir = tmp_path / "staging"
+    source_snapshot_dir = tmp_path / "source"
+    staging_dir.mkdir()
+    source_snapshot_dir.mkdir()
+    kwargs = dict(
+        loop="improve", conn=conn, settings=SETTINGS, clock=_clock(), rag=rag,
+        activity=activity, staging_dir=staging_dir,
+        source_snapshot_dir=source_snapshot_dir,
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        rpc_handlers={"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}})
+
+    with pytest.raises(ValueError, match="provider/readonly"):
+        build_mission_registry(**{**kwargs, "readonly": True})
+    with pytest.raises(ValueError, match="provider/readonly"):
+        build_mission_registry(**{**kwargs, "indicator_plugins": []})
+    with pytest.raises(ValueError, match="provider/readonly"):
+        build_mission_registry(**{**kwargs, "sandbox_run": lambda *a, **kw: None})
+
+
 def test_build_mission_registry_trade_unaffected_by_improve_branch(tmp_path):
     """既存の trade 分岐が improve 分岐の追加で壊れていないことの回帰。"""
     conn = connect(tmp_path / "x.db")

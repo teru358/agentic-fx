@@ -33,7 +33,18 @@ def _default_fetch_backend() -> _FetchBackend:
     class _TrafilaturaBackend:
         def fetch(self, url: str, *, user_agent: str | None = None) -> tuple[int, str]:
             import trafilatura
-            downloaded = trafilatura.fetch_url(url)
+            from trafilatura.settings import use_config
+
+            # B3 (検収 Blocking): trafilatura.fetch_url に user_agent を渡す
+            # 直接の引数は無い — `config` (ConfigParser) の `USER_AGENTS`
+            # (`DEFAULT` セクション、改行区切りで複数可、`_determine_headers`
+            # が `random.choice` する) を経由するのが実装済みの面 (実 API を
+            # 確認して選定、trafilatura==2.1.0)。素性を名乗る UA を実際に
+            # 送るため、`settings.user_agent` を単独候補として設定する。
+            config = use_config()
+            if user_agent:
+                config.set("DEFAULT", "USER_AGENTS", user_agent)
+            downloaded = trafilatura.fetch_url(url, config=config)
             if downloaded is None:
                 return 599, ""
             text = trafilatura.extract(downloaded) or ""
@@ -54,6 +65,10 @@ def build_research_tooldefs(
     state = {
         "search_count": 0, "fetch_count": 0,
         "last_search_at": None,
+        # M-1 (検収 Minor): §6 は 6 軸を web_search/fetch_article の
+        # Mission 予算としてまとめて列挙している — min_interval_sec は
+        # search 専用ではないので fetch 側にも独立のゲートを持たせる。
+        "last_fetch_at": None,
         "per_host_count": {},        # host -> int
         "aborted_hosts": set(),      # 429/503 を受けた host
     }
@@ -78,8 +93,13 @@ def build_research_tooldefs(
             return {"error": "budget exhausted"}
         if state["per_host_count"].get(host, 0) >= settings.max_per_host:
             return {"error": "budget exhausted"}
+        now = monotonic()
+        last = state["last_fetch_at"]
+        if last is not None and (now - last) < settings.min_interval_sec:
+            return {"error": "budget exhausted"}
         state["fetch_count"] += 1
         state["per_host_count"][host] = state["per_host_count"].get(host, 0) + 1
+        state["last_fetch_at"] = now
         status, text = fetch_backend.fetch(url, user_agent=settings.user_agent)
         if status in (429, 503):
             state["aborted_hosts"].add(host)
