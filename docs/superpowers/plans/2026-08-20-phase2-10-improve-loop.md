@@ -869,11 +869,16 @@ def advance_switch_journal(                         # 新規命名
     now: datetime, commit: bool = False,
 ) -> None: ...
 
+# precheck 2026-08-22 wave2: T11-B1
 def reconcile_switch_journals(conn: sqlite3.Connection, *,
-                               plugins_root: Path, now: datetime) -> None:
+                               plugins_root: Path, now: datetime,
+                               settings: "Settings",
+                               force_revert_op_id: int | None = None) -> None:
     """起動時 reconcile。§5.1-1 の収束規則 (再開 / 巻き戻し) を非終端行に適用する。
     起動時 reconcile の他の掃除 (孤児 staging / tmp 版 / GC_ROOTS 外の版 / temp link /
-    dangling symlink) より前に呼ぶこと (journal-first・sweep-last)。"""
+    dangling symlink) より前に呼ぶこと (journal-first・sweep-last)。`settings` は
+    B-1 是正で `retry_approval`/`approve_candidate` への委譲 (switched かつ
+    live==new_target の完遂ケース) に必要になったため追加。"""
     ...
 
 def process_expired_approvals(conn: sqlite3.Connection, *,
@@ -908,12 +913,17 @@ def submit_candidate(                               # 新規命名 = P1
     ジャーナルは作らない。"""
     ...
 
-def approve_candidate(                               # 新規命名 = P2
+# precheck 2026-08-22 wave2: T11-B1
+def approve_candidate(                               # 新規命名 = P2 (B-1 是正: plugins_root/settings を追加)
     conn: sqlite3.Connection, approval_id: int, *,
-    decided_by: str, now: datetime,
+    decided_by: str, now: datetime, plugins_root: Path, settings: "Settings",
 ) -> None:
     """flock 下で preparing ジャーナル → 版 → git → 切替 → apply_decision(approved)。
-    live がプレーン dir なら legacy_plain_present pending に留めて return。"""
+    live がプレーン dir なら legacy_plain_present pending に留めて return。
+    `plugins_root` は FS 操作 (版・git・切替) の起点として必須 —
+    `submit_candidate`/`bless_candidate` と異なり候補ロケータ (staging_dir/
+    human_dir) を受け取らないため逆算できない (B-1)。`settings` は
+    retry_approval/reconcile 経由の呼び出しと引数構成を揃えるために渡す。"""
     ...
 
 def bless_candidate(                                 # 新規命名 = P3
@@ -987,8 +997,9 @@ R-i10: 束別 task 執筆 (`tasks-{A,B,C,D,E,F}.md`) で新規に命名された
 **束 E** (`plugin/version_store.py`, `plugin/switch.py`, `plugin/history_git.py`, `plugin/approval.py`):
 - `version_store.create_version_dir(..., op_identity: str)` — 骨格が引数名を与えていなかった箇所の命名
 - `switch.UnresolvedJournalError` / `switch.CandidateMissingError`
-- `switch.retry_approval(conn, approval_id, *, decided_by, now)` — `approval retry <id>` シェルコマンドの実体、内部は `approve_candidate` を呼ぶ
-- `switch.reject_candidate(conn, approval_id, *, decided_by, reason, now)` — reject 経路も `apply_decision` + plugin flock を要するための新設
+<!-- precheck 2026-08-22 wave2: T11-B1 -->
+- `switch.retry_approval(conn, approval_id, *, decided_by, now, plugins_root, settings)` — `approval retry <id>` シェルコマンドの実体、内部は `approve_candidate` を呼ぶだけ (B-1 是正で plugins_root/settings を追加)
+- `switch.reject_candidate(conn, approval_id, *, decided_by, reason, now, plugins_root)` — reject 経路も `apply_decision` + plugin flock を要するための新設 (flock ファイルの所在特定に plugins_root が必須)
 - `switch.sweep_orphans(conn, *, plugins_root, now)` — `reconcile_switch_journals` (journal-first) と分離した掃除処理
 - `switch.process_expired_approvals(conn, *, plugins_root, now)` — R-i8 で Interfaces 本体に既出 (上記参照)。束 E ではこの記号名を新規命名として報告。付随して `store/approvals.py` に `list_due_for_expiry(conn, *, now, kind=None)` (列挙のみ) と `expire_due(conn, now, *, exclude_kinds=("plugin",), commit=True)` (除外つき直接 expired 化) — Task 8 が実装 (束 C 8-B に反映済み)
 - `history_git.HistoryGitError` / `HistoryGitDetachedError` / `HistoryGitCasConflictError` / `SchedulerThreadForbiddenError`
@@ -19137,6 +19148,35 @@ def test_create_version_dir_fsyncs_files_before_rename(tmp_path, monkeypatch):
         tmp_path, "sma", a, plugin_py=PLUGIN_PY, config_yaml=CONFIG_YAML,
         test_plugin=TEST_PY, op_identity="1")
     assert len(calls) >= 4
+
+
+def test_create_version_dir_rename_onto_nonempty_final_dir_is_idempotent(tmp_path):
+    """M-2 是正の pin: 実測で非空ディレクトリへの os.rename は
+    OSError errno ENOTEMPTY (39) であり FileExistsError (EEXIST=17) では
+    ない。final_dir は常に 3 ファイルを持つ非空ディレクトリなので、並行
+    create_version_dir の「先着者を採用する」冪等分岐は ENOTEMPTY を
+    捕えられなければ機能しない (except FileExistsError のままだと本テストは
+    無関係な OSError で red になる)。"""
+    a = version_store.artifact_hash_bytes(PLUGIN_PY, CONFIG_YAML, TEST_PY)
+    d1 = version_store.create_version_dir(
+        tmp_path, "sma", a, plugin_py=PLUGIN_PY, config_yaml=CONFIG_YAML,
+        test_plugin=TEST_PY, op_identity="1")
+    # 別プロセスが同じ artifact_hash を並行して作ろうとした状況を模す:
+    # final_dir は既に存在 (非空) — create_version_dir は早期 return する
+    # 経路 (final_dir.is_dir()) を通るため、ENOTEMPTY 分岐そのものは
+    # os.rename を直接叩いて再現する。
+    tmp_dir = tmp_path / ".versions" / "sma" / f"{a}.tmp-2"
+    tmp_dir.mkdir(mode=0o700)
+    (tmp_dir / "x").write_bytes(b"x")
+    import pytest
+    import errno
+    with pytest.raises(OSError) as exc_info:
+        import os
+        os.rename(tmp_dir, d1)
+    assert exc_info.value.errno == errno.ENOTEMPTY
+    # 掃除 (tmp_path の後始末)
+    import shutil
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 ```
 
 - [ ] **Step 2: 失敗を確認**
@@ -19164,6 +19204,7 @@ uv run pytest tests/plugin/test_version_store.py -v
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import sqlite3
@@ -19225,6 +19266,7 @@ def create_version_dir(root: Path, name: str, artifact_hash: str, *,
         # 内容を作り直す (中途半端な内容の可能性があるため削除してやり直す)
         import shutil
         shutil.rmtree(tmp_dir)
+# precheck 2026-08-22 wave2: T11-M2
     tmp_dir.mkdir(mode=0o700)
     try:
         _write_ro_file(tmp_dir / "plugin.py", plugin_py)
@@ -19234,7 +19276,16 @@ def create_version_dir(root: Path, name: str, artifact_hash: str, *,
         os.chmod(tmp_dir, 0o500)
         try:
             os.rename(tmp_dir, final_dir)
-        except FileExistsError:
+        except OSError as e:
+            # M-2 是正 (実測): 非空ディレクトリへの os.rename は
+            # OSError errno 39 (ENOTEMPTY) であり FileExistsError (EEXIST)
+            # ではない — final_dir は常に 3 ファイルを持つ非空ディレクトリ
+            # なので、並行プロセスが先に同じ artifact_hash を作った場合は
+            # 必ず ENOTEMPTY になる。EEXIST/ENOTEMPTY のどちらでも「並行
+            # プロセスが先着した」ことの表明として冪等に扱い、それ以外の
+            # errno は fail closed で再送出する。
+            if e.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                raise
             # 並行プロセスが先に同じ artifact_hash を作った (冪等) —
             # 自分の tmp を掃除して既存版を採用する
             os.chmod(tmp_dir, 0o700)
@@ -19246,6 +19297,8 @@ def create_version_dir(root: Path, name: str, artifact_hash: str, *,
     except BaseException:
         # 失敗時は tmp を残す (reconcile が §5.1 手順 4 の「tmp-* の残骸は
         # reconcile が削除する」規則で掃除する) — ここでは削除しない
+        # (M-3: 素の再送出だが、コメントが「delete しない」という意図を
+        # 明示する役割を持つため保持する)
         raise
 
 
@@ -19267,9 +19320,10 @@ uv run pytest tests/plugin/test_version_store.py -v
 
 `test_create_version_dir_is_idempotent_*` と `test_two_versions_*` を含む全件 green。
 
-- [ ] **Step 5: `plugin/loader.py` の版ディレクトリ名 vs 実 artifact_hash 照合**
+<!-- precheck 2026-08-22 wave2: T11-M4 -->
+- [ ] **Step 5: `plugin/loader.py` の版ディレクトリ名 vs 実 artifact_hash 照合 (M-4: 既に実装済みであることを確認し、テストのみ追加する)**
 
-`plugin/loader.py` (Task 5 が symlink 追従・`PluginMeta.artifact_hash` を追加した後の状態) に、discover が symlink 先の版ディレクトリを読んだとき、ディレクトリ名 (`artifact_hash`) と実際に 3 本から計算した `artifact_hash` を照合し、不一致なら reject + activity ERROR を追加する。
+**M-4 是正**: `plugin/loader.py` の discover は **B-5 (`loader.py:317-328`) が既に本照合を実装済み** — 「不一致なら reject + activity ERROR」の挙動は本 Step の実装を待たずに存在する。したがって Step 5b の「失敗を確認」は red にならず (`version_store` 作成後は既に green)、Step 5c の「`_discover_one` の symlink 分岐に挿入」という指示は実際の実装位置 (`discover` 関数内) と食い違うため二重チェックを生む。本 Step は **「照合が既に実装されていることを着手時に確認し、pin テストだけを追加する」** に読み替える (新規実装は行わない):
 
 - [ ] **Step 5a: 失敗するテストを書く**
 
@@ -19301,7 +19355,7 @@ def test_discover_rejects_version_dir_with_mismatched_artifact_hash(tmp_path):
     assert not any(m.name == "sma" for m in metas)
 ```
 
-- [ ] **Step 5b: 失敗を確認**、**Step 5c: 実装** (`_discover_one` の symlink 分岐に `version_store.artifact_hash_bytes(...)` との照合を挿入 — Task 5 実装済みコードの file:line は着手時に確認)、**Step 5d: 成功を確認**。
+- [ ] **Step 5b (M-4 是正): pin テストの実行を確認 (実装は追加しない)** — `uv run pytest tests/plugin/test_loader.py -k mismatched_artifact_hash -v` を実行する。B-5 (`loader.py:317-328`、`discover` 関数内) が既に照合を実装済みのため、この時点で **green のはず** (旧稿は「失敗を確認」としていたが、実装済みのため red にならない)。もし red なら B-5 の実装が現物から失われている異常事態なので、実装を追加するのではなくまず B-5 の現物 (`loader.py:317-328` 付近) を着手時に再確認すること。**Step 5c: (実装は不要 — 既存確認のみ)**、**Step 5d: 成功を確認**。
 
 - [ ] **Step 5e (レビュー1周目 M2): `plugin/loader.py::content_hash` を `version_store.content_hash_bytes` の薄いラッパへ委譲する**
 
@@ -19362,6 +19416,34 @@ def content_hash(plugin_dir: Path) -> str:
 `uv run pytest tests/plugin/test_loader.py tests/plugin/test_version_store.py -v` で
 green を確認する。
 
+<!-- precheck 2026-08-22 wave2: T11-B5 -->
+- [ ] **Step 5f (B-5 是正): `plugin/loader.py::artifact_hash_bytes` も `version_store.artifact_hash_bytes` への委譲に置換する**
+
+B-5: 設計書 §5.2 の「二重実装しない」原則に対し、`artifact_hash_bytes` は既に `plugin/loader.py:101-109` (B-5=5-H worktree の産物、`gate_pytest.py` がそれを import している) に定義がある。Step 5e (`content_hash` の委譲) だけでは `artifact_hash_bytes` が `loader.py` と `version_store.py` の 2 箇所に重複したまま残る。着手時に `loader.py` の現物 (B-5=5-H マージ後) を確認し、`content_hash` と同じ要領で薄いラッパへ置換する:
+
+```python
+def artifact_hash_bytes(plugin_py: bytes, config_yaml: bytes,
+                        test_plugin: bytes) -> str:
+    """3 本全体の sha256 (版ストアのキー)。`version_store.artifact_hash_bytes`
+    の薄いラッパ (B-5 是正、設計書 §5.2) — 式の実体は version_store 側の
+    1 箇所にのみ存在する。"""
+    from agentic_fx.plugin import version_store
+    return version_store.artifact_hash_bytes(plugin_py, config_yaml, test_plugin)
+```
+
+失敗するテストを `tests/plugin/test_loader.py` に追記する (Step 5e と対の形):
+
+```python
+def test_artifact_hash_bytes_delegates_to_version_store(tmp_path):
+    """B-5 是正: loader.artifact_hash_bytes は version_store.artifact_hash_bytes
+    の薄いラッパ (同一 bytes に対する両 API 一致 pin)。"""
+    from agentic_fx.plugin import loader, version_store
+    p, c, t = b"plugin body", b"kind: indicator\n", b"def test_x():\n    pass\n"
+    assert loader.artifact_hash_bytes(p, c, t) == version_store.artifact_hash_bytes(p, c, t)
+```
+
+`uv run pytest tests/plugin/test_loader.py tests/plugin/test_version_store.py -v` で green を確認する。
+
 - [ ] **Step 6: 変異テスト (11a)**
 
 ```bash
@@ -19378,6 +19460,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M6 | 版ディレクトリ名 vs 実 artifact_hash の照合を discover から削除する | `test_discover_rejects_version_dir_with_mismatched_artifact_hash` |
 | M7 | 2 版が artifact_hash でなく content_hash をキーにする (`create_version_dir` の呼び出し側を content_hash に差し替える想定変異) | `test_two_versions_same_content_hash_different_artifact_hash_coexist` |
 | M8 | `loader.content_hash` を `version_store.content_hash_bytes` へ委譲せず自前の sha256 計算のまま残す (将来の分岐リスク) | `test_content_hash_delegates_to_version_store_content_hash_bytes` (レビュー1周目 M2 — この変異自体は値が一致するので直接には落ちないが、`version_store.content_hash_bytes` の式を変えたときに `loader.content_hash` が追随しないことを検出する対変異として、実装者は `content_hash_bytes` の区切り文字を変える変異と組み合わせて確認すること) |
+| M9 | `loader.artifact_hash_bytes` を `version_store.artifact_hash_bytes` へ委譲せず二重実装のまま残す (B-5 是正) | `test_artifact_hash_bytes_delegates_to_version_store` |
 
 - [ ] **Step 7: commit**
 
@@ -19447,25 +19530,49 @@ class HistoryGitCasConflictError(HistoryGitError):
     """update-ref の CAS 失敗 (並行 commit)。呼び出し元は頭から再試行する。"""
 
 
+# precheck 2026-08-22 wave2: T11-B9 / T11-B10
 def _env(history_git_dir: Path) -> dict[str, str]:
-    env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""),
-           "GIT_DIR": str(history_git_dir)}
+    # B-10: HOME をそのまま子へ渡すと `~/.gitconfig` の global identity が
+    # commit-tree の失敗テストを無効化してしまう (この環境で実測: global
+    # user.name/user.email が設定済みのため raise しない)。HOME を落とし
+    # GIT_CONFIG_GLOBAL/GIT_CONFIG_NOSYSTEM で外部設定の混入を遮断する
+    # (本番でもユーザ設定 (core.hooksPath 等) の混入を防ぐ意味で正しい)。
+    env = {"PATH": os.environ.get("PATH", ""),
+           "GIT_DIR": str(history_git_dir),
+           "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_CONFIG_NOSYSTEM": "1"}
     env.update(_IDENTITY_ENV)
     return env
 
 
 def _run(args: list[str], *, env: dict[str, str],
          check: bool = True) -> subprocess.CompletedProcess:
+    # B-9: `tests/test_subprocess_stdin_policy.py` は src/**/*.py の
+    # subprocess.run|Popen 呼び出し全数に stdin= を要求する (fd 0 継承防止の
+    # リポジトリ規約)。allowlist は backtest_runs.py の 1 件のみ。
     return subprocess.run(["git", *args], env=env, capture_output=True,
-                          text=True, check=check)
+                          text=True, check=check, stdin=subprocess.DEVNULL)
 
 
+# precheck 2026-08-22 wave2: T11-B11
 def ensure_bare_repo(history_git_dir: Path) -> None:
-    """`git init --bare` を lazy に (§5.2 初期化)。"""
+    """`git init --bare` を lazy に (§5.2 初期化)。
+
+    B-11: 親ディレクトリが書込不能 (0500 等) の場合 `mkdir` は
+    `PermissionError` (OSError) を送出する。`HistoryGitError` 系だけを
+    捕える呼び出し元 (11d/11g) にとって OSError は素通りしてしまうため、
+    ここで `HistoryGitError` に変換し fail closed の意味論を統一する。
+    """
     if not history_git_dir.is_dir():
-        history_git_dir.mkdir(parents=True)
-        subprocess.run(["git", "init", "--bare", "-q", str(history_git_dir)],
-                       check=True, capture_output=True, text=True)
+        try:
+            history_git_dir.mkdir(parents=True)
+            subprocess.run(["git", "init", "--bare", "-q", str(history_git_dir)],
+                           check=True, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)  # B-9: stdin ポリシー規約
+        except OSError as exc:
+            raise HistoryGitError(
+                f"plugins/.history.git: failed to initialize bare repo at "
+                f"{history_git_dir}: {exc}") from exc
 
 
 def record_version(history_git_dir: Path, *, name: str, artifact_hash: str,
@@ -19682,24 +19789,35 @@ def test_record_version_missing_identity_env_raises(tmp_path, monkeypatch):
                                    content_hash=c, approval_id=1, version_dir=d)
 
 
+# precheck 2026-08-22 wave2: T11-B12
 def test_record_version_cas_conflict_raises_distinct_error(tmp_path, monkeypatch):
     """update-ref の CAS 失敗 (並行 commit で old が古い) は
-    HistoryGitCasConflictError — 呼び出し元が頭から再試行する対象。"""
+    HistoryGitCasConflictError — 呼び出し元が頭から再試行する対象。
+
+    B-12 是正: 旧稿の `racing_run` は `args[:2] == ["update-ref", env.get(...)[:0]]`
+    という常に False の比較で何もしておらず、ref も進めていなかった (書き損じ、
+    実測で CAS は成功し例外が上がらないことを確認済み)。正しい注入は、実際の
+    `update-ref <ref> <new> <old>` 呼び出しの直前に**無関係な commit で ref を
+    横から進める** (well-known な空 tree sha を使い、`old` から生やして
+    force update する) — これにより実呼び出しの `<old>` が既に古くなり
+    CAS が確実に失敗する。ref 名はハードコードせず `symbolic-ref HEAD` の
+    実測値 (`args[1]`) をそのまま使う。"""
     history_dir = tmp_path / "plugins" / ".history.git"
     d, a, c = _make_version(tmp_path / "plugins", "sma")
     history_git.record_version(history_dir, name="sma", artifact_hash=a,
                                content_hash=c, approval_id=1, version_dir=d)
-    # 別プロセスが割り込んで ref を進めたことを模すため、_run の update-ref
-    # 呼び出し直前に ref を横から進める
     real_run = history_git._run
+    _EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # git の空 tree の既知 sha (全 git 共通の定数)
 
     def racing_run(args, *, env, check=True):
-        if args[:2] == ["update-ref", env.get("GIT_DIR", "")[:0]]:
-            pass
-        if args and args[0] == "update-ref":
-            subprocess.run(["git", "--git-dir", str(history_dir), "update-ref",
-                           "refs/heads/master", "HEAD"], check=False)
-        return real_run(args, env=env, check=False if args and args[0] == "update-ref" else check)
+        if args and args[0] == "update-ref" and len(args) >= 4:
+            ref, old = args[1], args[3]
+            intruder = real_run(
+                ["commit-tree", _EMPTY_TREE, "-p", old, "-m", "intruder"],
+                env=env, check=True).stdout.strip()
+            real_run(["update-ref", ref, intruder, old], env=env, check=True)
+            return real_run(args, env=env, check=False)
+        return real_run(args, env=env, check=check)
 
     monkeypatch.setattr(history_git, "_run", racing_run)
     d2, a2, c2 = _make_version(tmp_path / "plugins", "sma", TEST_PY + b"#v2\n")
@@ -19879,10 +19997,13 @@ from pathlib import Path
 
 import pytest
 
+# precheck 2026-08-22 wave2: T11-B1
+from agentic_fx.config import load_settings
 from agentic_fx.plugin import switch
 from agentic_fx.store import db as db_store
 
 NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
+SETTINGS = load_settings(Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")  # B-1: reconcile_switch_journals が settings を要求する
 
 
 @pytest.fixture
@@ -19973,10 +20094,10 @@ def test_switched_recovery_live_equals_new_target_delegates_to_retry_approval(
     # 11e 完了後に本テストを再実行すると raising=False が無くても通る)。
     monkeypatch.setattr(
         switch, "retry_approval",
-        lambda c, approval_id, *, decided_by, now: calls.append(
-            (approval_id, decided_by)), raising=False)
+        lambda c, approval_id, *, decided_by, now, plugins_root, settings: calls.append(
+            (approval_id, decided_by)), raising=False)  # B-1: plugins_root/settings も受ける
 
-    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW)
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS)
 
     assert calls == [(1, "system_reconcile")]
     # reconcile 自身は phase を書き換えない (decided への遷移は
@@ -19997,7 +20118,7 @@ def test_switched_recovery_live_equals_old_target_reverts_symlink(tmp_path, conn
         actor="human", now=NOW, commit=True)
     switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
 
-    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW)
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS)
     row = conn.execute("SELECT phase FROM plugin_switch_journal WHERE op_id=?",
                        (op_id,)).fetchone()
     assert row["phase"] == "reverted"
@@ -20016,7 +20137,7 @@ def test_switched_recovery_neither_target_is_error_and_untouched(tmp_path, conn,
         switch_required=True, actor="human", now=NOW, commit=True)
     switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
 
-    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW)
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS)
     row = conn.execute("SELECT phase FROM plugin_switch_journal WHERE op_id=?",
                        (op_id,)).fetchone()
     assert row["phase"] == "switched"  # 触らない (非終端のまま)
@@ -20050,7 +20171,7 @@ def test_interrupt_reverts_absent_by_removing_live_symlink(tmp_path, conn):
         actor="human", now=NOW, commit=True)
     switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
     # 割込: reject が別プロセスから来た想定 (reconcile が先に巻き戻す)
-    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW,
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS,
                                      force_revert_op_id=op_id)
     assert not (root / "sma").exists()
 
@@ -20065,7 +20186,7 @@ def test_interrupt_reverts_symlink_by_restoring_old_target(tmp_path, conn):
         old_target=old_rel, new_target=new_rel, switch_required=True,
         actor="human", now=NOW, commit=True)
     switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
-    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW,
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS,
                                      force_revert_op_id=op_id)
     assert Path(root / "sma").readlink().as_posix() == old_rel
 ```
@@ -20091,23 +20212,39 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from agentic_fx.activity import ActivityLog, Category  # B-2: journal_store 層に activity を書かせない
+from agentic_fx.plugin.gate_pytest import run_gate_pytest  # M-8: モジュールレベル import (11d/11e/11g の monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", ...) seam が効くために必須)
+from agentic_fx.plugin import strategy_gate  # M-8: `strategy_gate.evaluate_strategy_adoption_gate(...)` の形で呼ぶ (from...import で束縛すると monkeypatch.setattr("agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate", ...) の patch が効かない)
 from agentic_fx.store import plugin_switch_journal as journal_store  # Task 8 produces
 
 _PHASE_ORDER = ["preparing", "versioned", "recorded", "switched", "decided", "reverted"]
 
 
+# precheck 2026-08-22 wave2: T11-B2 / T11-B3 / T11-B1
 def begin_switch_journal(
     conn: sqlite3.Connection, *, kind: Literal["approve", "bless"],
     approval_id: int, name: str, old_kind: Literal["absent", "symlink"],
     old_target: str | None, new_target: str, switch_required: bool,
     actor: str, now: datetime, commit: bool = False,
 ) -> int:
-    op_id = journal_store.insert_preparing(
+    """B-2 是正: `store/plugin_switch_journal.py` (Task 8 現物) が公開するのは
+    `insert`/`get`/`set_phase`/`get_open_by_name`/`list_non_terminal` の 5 本
+    のみ (`insert_preparing`/`update_phase`/`list_non_terminal_for_name` は
+    非実在)。`insert` は DDL `temp_path TEXT NOT NULL` により INSERT 時の
+    必須引数だが、temp_path は採番される op_id から導出する値なので、
+    `insert(..., temp_path=<placeholder>)` でひとまず空文字を書き、確定した
+    op_id で `set_temp_path` により正しい値へ UPDATE する 2 段構成にする。
+    `set_temp_path(conn, op_id, temp_path) -> None` は本 task (Task 11) が
+    `store/plugin_switch_journal.py` に**追加**する (Task 8 のシグネチャは
+    変えない、追加のみ — 統合裁定 R-i4)。DDL 上 `temp_path` は NOT NULL だが
+    空文字は許容される (CHECK 制約は無い) ため placeholder 挿入は安全。"""
+    op_id = journal_store.insert(
         conn, kind=kind, approval_id=approval_id, name=name, old_kind=old_kind,
         old_target=old_target, new_target=new_target,
-        switch_required=switch_required, actor=actor, now=now)
+        switch_required=switch_required, actor=actor, now=now,
+        temp_path="")  # placeholder — 直後に set_temp_path で確定値へ更新
     temp_path = f"plugins/.{name}.link-{op_id}"
-    journal_store.set_temp_path(conn, op_id, temp_path)
+    journal_store.set_temp_path(conn, op_id, temp_path)  # Task 11 が追加する新関数
     if commit:
         conn.commit()
     return op_id
@@ -20123,7 +20260,7 @@ def advance_switch_journal(
         raise ValueError(
             f"op_id={op_id}: switch_required=0 の行は 'switched' phase を "
             "経ない (recorded から直接 decided へ進む — §5.1 手順 1)")
-    journal_store.update_phase(conn, op_id, phase=phase, now=now)
+    journal_store.set_phase(conn, op_id, phase=phase, now=now)  # B-2: Task 8 現物名
     if commit:
         conn.commit()
 
@@ -20140,7 +20277,7 @@ def switch_live(plugins_root: Path, name: str, *, new_target: str,
 
 
 def _revert_one(conn: sqlite3.Connection, row: dict, *, plugins_root: Path,
-                now: datetime) -> None:
+                now: datetime, activity: "ActivityLog | None" = None) -> None:
     live = plugins_root / row["name"]
     if row["phase"] == "switched" and row["switch_required"]:
         if row["old_kind"] == "absent":
@@ -20152,15 +20289,36 @@ def _revert_one(conn: sqlite3.Connection, row: dict, *, plugins_root: Path,
                 temp.unlink()
             temp.symlink_to(row["old_target"])
             os.rename(temp, live)
-    journal_store.update_phase(conn, row["op_id"], phase="reverted", now=now)
+    journal_store.set_phase(conn, row["op_id"], phase="reverted", now=now)  # B-2
+    if activity is not None:
+        activity.write(Category.APPROVAL, "switch_reverted",
+                       f"name={row['name']} op_id={row['op_id']}")
 
 
 def reconcile_switch_journals(conn: sqlite3.Connection, *,
                               plugins_root: Path, now: datetime,
+                              settings: "Settings",
+                              activity: "ActivityLog | None" = None,
                               force_revert_op_id: int | None = None) -> None:
-    """起動時 reconcile。非終端行に §5.1-1 の収束規則を適用する。"""
+    """起動時 reconcile。非終端行に §5.1-1 の収束規則を適用する。
+
+    B-3 是正: `force_revert_op_id` が指定された行は phase に依らず
+    `_revert_one` を通す (= 割込操作の巻き戻しは switched の収束規則
+    (live_target 判定) より優先する、表 2 の意味論)。旧稿は switched かつ
+    force_revert_op_id 指定の行でも `live_target == new_norm` 判定に落ちて
+    未定義の `retry_approval` を呼んでしまい (11c 単体では NameError)、
+    巻き戻しが一切起きなかった — `test_interrupt_reverts_absent_by_removing_live_symlink`
+    / `test_interrupt_reverts_symlink_by_restoring_old_target` が red のまま
+    実装完了に至れない自己矛盾があった (B-3)。
+    """
     for row in journal_store.list_non_terminal(conn):
         if force_revert_op_id is not None and row["op_id"] != force_revert_op_id:
+            continue
+        if force_revert_op_id is not None:
+            # 割込操作の巻き戻しは収束規則より優先する (B-3)。phase が
+            # switched でなくても _revert_one は非 FS 操作 (phase="reverted"
+            # への書き換えのみ) に閉じるので安全。
+            _revert_one(conn, row, plugins_root=plugins_root, now=now, activity=activity)
             continue
         if row["phase"] != "switched":
             # preparing/versioned/recorded: 「同じ操作の再試行」は 11d の
@@ -20168,45 +20326,35 @@ def reconcile_switch_journals(conn: sqlite3.Connection, *,
             # 冪等に再実行する。ここ (起動時 reconcile) では FS 効果が
             # まだ無いので触らずスキップ — 実際の完了は次回の approve/
             # approval retry が担う (§5.1-1 (a))。
-            if force_revert_op_id is not None:
-                _revert_one(conn, row, plugins_root=plugins_root, now=now)
             continue
         live = plugins_root / row["name"]
         live_target = live.readlink().as_posix() if live.is_symlink() else None
         new_norm = row["new_target"]
         old_norm = row["old_target"]
         if live_target == new_norm:
-            # switched は完遂しているが decided への遷移は apply_decision と
-            # 同一 tx で行う契約 (§4.3) — ここでは phase を書き換えず、
-            # 11d/11e の再試行入口 (retry_approval → approve_candidate) に
-            # 委譲する (下記「最終形」注記を参照。旧骨子の直接 update_phase
-            # 呼び出しは撤回済み)。
-            retry_approval(conn, row["approval_id"], decided_by="system_reconcile",
-                            now=now)
-        elif live_target == old_norm or (row["old_kind"] == "absent" and live_target is None):
-            _revert_one(conn, row, plugins_root=plugins_root, now=now)
-        else:
-            # 第三者に触られた — activity ERROR、人間待ち。触らない。
-            journal_store.record_activity_error(
-                conn, op_id=row["op_id"], name=row["name"],
-                reason="switch_reconcile_unrecognized_live_target")
-```
-
-**最終形 (統合裁定、簡略化 2 の解消)**: 上記骨子コードの `reconcile_switch_journals` 内、`live_target == new_norm` 判定の分岐にあった `journal_store.update_phase(conn, row["op_id"], phase="decided", now=now)` の直接呼び出しは**削除する**。`decided` phase への遷移は常に `apply_decision` (Task 8) と同一 tx で行う契約 (§4.3) を守るため、`reconcile_switch_journals` は当該分岐で以下を呼ぶ:
-
-```python
-        if live_target == new_norm:
             # switched は完遂しているが、decided への遷移は apply_decision と
             # 同一 tx で行う契約 (§4.3) — reconcile 自身は phase を書き換え
-            # ない。11d/11g の再試行入口 (approve_candidate が内部で使う
-            # kind 別の retry) にそのまま委譲する。kind='bless' の行も
-            # retry_approval が approve_candidate へ委譲するので同じ入口で
-            # 良い (11e 新規命名の retry_approval を参照)。
+            # ない。11d/11g の再試行入口 (retry_approval → approve_candidate)
+            # にそのまま委譲する (B-1 是正: plugins_root/settings を渡す)。
+            # kind='bless' の行も retry_approval が approve_candidate へ
+            # 委譲するので同じ入口で良い (11e 新規命名の retry_approval)。
             retry_approval(conn, row["approval_id"], decided_by="system_reconcile",
-                            now=now)
+                            now=now, plugins_root=plugins_root, settings=settings)
+        elif live_target == old_norm or (row["old_kind"] == "absent" and live_target is None):
+            _revert_one(conn, row, plugins_root=plugins_root, now=now, activity=activity)
+        else:
+            # 第三者に触られた — activity ERROR、人間待ち。触らない。
+            # B-2: journal_store 層に activity を書かせない (層違反) —
+            # 呼び出し元がここで直接 activity.write する。
+            if activity is not None:
+                activity.write(Category.APPROVAL,
+                               "switch_reconcile_unrecognized_live_target",
+                               f"name={row['name']} op_id={row['op_id']}")
 ```
 
-`retry_approval`/`approve_candidate` (11d/11e) 側は、ステップ 0d (「同名 plugin の未完 switch ジャーナル確認」) で **既存の非終端ジャーナルの phase が既に `switched` かつ `live` が `new_target` と一致するケース**を検出したら、ステップ 1〜8 (候補再検証・版・git・切替) をすべてスキップし、ステップ 9 (`BEGIN IMMEDIATE` → `apply_decision(status="approved", commit=False)` → `COMMIT`、switch_required なので同一 tx でジャーナルも `decided` になる) だけを実行する early-exit を持つ — この early-exit は 11d の実装に明記する (下記「11d: 3 経路」の SQL sequence 表・Step 3 実装に追記済み)。これにより `reconcile_switch_journals` は「事実の記帳 (versioned/recorded/reverted など FS 効果に追従するだけの phase 更新)」に閉じ、「決定を確定させる (decided への遷移)」は常に `apply_decision` 経由という不変条件が保たれる。**プレースホルダはプランに残さない** (旧骨子の `phase="decided"` 直接呼び出しコードは撤回)。
+**最終形はこの入力上の骨子コードに既に反映済み** (統合裁定、簡略化 2 の解消・B-1・B-2・B-3 是正)。`decided` phase への遷移は常に `apply_decision` (Task 8) と同一 tx で行う契約 (§4.3) を守るため `reconcile_switch_journals` は `phase="decided"` を直接書かず `retry_approval` に委譲する (プレースホルダはプランに残さない)。
+
+`retry_approval`/`approve_candidate` (11d/11e) 側は、ステップ 0d (「同名 plugin の未完 switch ジャーナル確認」) で **既存の非終端ジャーナルの phase が既に `switched` かつ `live` が `new_target` と一致するケース**を検出したら、ステップ 1〜8 (候補再検証・版・git・切替) をすべてスキップし、ステップ 9 (`BEGIN IMMEDIATE` → `apply_decision(status="approved", commit=False)` → `COMMIT`、switch_required なので同一 tx でジャーナルも `decided` になる) だけを実行する early-exit を持つ — この early-exit は 11d の実装に明記する (下記「11d: 3 経路」の SQL sequence 表・Step 3 実装に追記済み)。これにより `reconcile_switch_journals` は「事実の記帳 (versioned/recorded/reverted など FS 効果に追従するだけの phase 更新)」に閉じ、「決定を確定させる (decided への遷移)」は常に `apply_decision` 経由という不変条件が保たれる。
 
 - [ ] **Step 4: 成功を確認**
 
@@ -20263,11 +20411,12 @@ EOF
 | # | 操作 | 種別 | tx 境界 | crash point での状態 |
 |---|---|---|---|---|
 | 1 | `flock plugins/.locks/<name>.lock` 取得 | FS | tx 外 | lock 未取得 → 何も起きていない (再試行で再取得) |
-| 2 | 候補スナップショット検査 (§4.2-3a: 3 本の通常ファイルのみ・dirfd+O_NOFOLLOW) | FS 読取 | tx 外 | 副作用なし |
-| 3 | `content_hash`(2 本)・`artifact_hash`(3 本) を計算 | 計算 | tx 外 | 副作用なし |
+<!-- precheck 2026-08-22 wave2: T11-B5 -->
+| 2 | 候補スナップショット検査 (`gate_pytest.check_candidate_snapshot(plugin_dir)` — B-6 の産物を名指し再利用、3 本の通常ファイルのみ・dirfd+O_NOFOLLOW・nlink/サイズ検査。§4.2-3a) | FS 読取 | tx 外 | 副作用なし |
+| 3 | `content_hash`(2 本)・`artifact_hash`(3 本) を計算 (`gate_pytest.hashes_of(plugin_dir) -> (content_hash, artifact_hash)` — B-6 の産物を名指し再利用) | 計算 | tx 外 | 副作用なし |
 | 4 | `check_source(plugin.py)` / `check_source(test_plugin.py)` (AST ゲート) | 計算 | tx 外 | 副作用なし |
-| 5 | `run_gate_pytest(plugin_dir, settings=settings)` (Task 6、Landlock 隔離) | サブプロセス | tx 外 | 候補は read-only のまま (子は書けない) |
-| 6 | hash 再計算 (H_after ≠ H_before なら不合格、§4.2-3e) | 計算 | tx 外 | 副作用なし |
+| 5 | `run_gate_pytest(plugin_dir, settings=settings)` (Task 6、Landlock 隔離。**内部で手順 2/3 相当の pytest 前後照合を既に実行している** — B-5 是正: 本 P1 手順 2/3/6 は `run_gate_pytest` が持つ検査と重複させず `gate_pytest.check_candidate_snapshot`/`hashes_of` を直接呼ぶだけに閉じる) | サブプロセス | tx 外 | 候補は read-only のまま (子は書けない) |
+| 6 | hash 再計算 (`gate_pytest.hashes_of(plugin_dir)` を再度呼び H_after ≠ H_before なら不合格、§4.2-3e。B-5: 新規に sha256 計算を書き起こさない) | 計算 | tx 外 | 副作用なし |
 | 7 | (kind=strategy のみ) `strategy_gate.evaluate_strategy_adoption_gate(...)` (Task 10 新設 `plugin/strategy_gate.py`、統合裁定 R-i3) — 内部で `run_in_sample`/`run_holdout_gate` (§4.2-4) を **§4.1 の non-committing 版 `record_fn=<sink>`** で呼ぶ | 計算+DB読取専用 | tx 外 (sink はメモリに蓄積するだけ) | 副作用なし |
 | 8 | **`BEGIN IMMEDIATE`** | tx 開始 | — | — |
 | 9 | `save_harness_run(commit=False)` × sink 行数 (in-sample/holdout の証跡 `backtest_runs`) | DB 書込 | 同一 tx | ロールバック可能 (COMMIT 前) |
@@ -20287,9 +20436,10 @@ EOF
 | 0b | `flock plugins/.locks/<name>.lock` 取得 | FS | tx 外 | 未取得 → 何も起きていない |
 | 0c | pending 再確認・後発決定確認 (ⓓ、key=`(name, content_hash)`) — 新しい決定があれば `apply_decision(status="invalidated")` して終了 | DB 読取+書込 (短い tx) | 単独 tx | invalidated 済みなら以降のステップに進まない |
 | 0d | 同名 plugin の未完 switch ジャーナル確認 — あれば `reconcile_switch_journals` (11c) を先に実行してから続行 | DB+FS | 11c の tx 群 | 収束済みの状態から続行 |
-| 1 | ハッシュ再照合 (ⓐ): `candidate_origin`/`candidate_path` の正規形検証 → 候補スナップショット再検査 → `content_hash`/`artifact_hash` 再計算し payload と一致確認。不一致・候補無し (`candidate_missing`) → pending のまま + activity + return | FS 読取+計算 | tx 外 | 副作用なし |
+<!-- precheck 2026-08-22 wave2: T11-B5 / T11-B6 -->
+| 1 | ハッシュ再照合 (ⓐ): `candidate_origin`/`candidate_path` の正規形検証 → `gate_pytest.check_candidate_snapshot(plugin_dir)` で候補スナップショット再検査 (B-5: 名指し再利用) → `gate_pytest.hashes_of(plugin_dir)` で `content_hash`/`artifact_hash` 再計算し payload と一致確認。不一致・候補無し (`candidate_missing`) → pending のまま + activity + return | FS 読取+計算 | tx 外 | 副作用なし |
 | 2 | `plugins/<name>` の形を dirfd+lstat で確認: **absent / symlink / プレーン dir** | FS 読取 | tx 外 | 副作用なし |
-| 2a | **live=プレーン dir のとき**: 5〜7 (版+git) まで進め、`legacy_plain_present` で pending に留めて **8 (切替) と 9 (decide) はスキップ** — 下記「plain 分岐」参照 | — | — | — |
+| 2a | **live=プレーン dir のとき**: 5〜7 (版+git) まで進め、`approvals_store.set_reason(conn, approval_id, "legacy_plain_present", commit=True)` (B-6: 本 task が `store/approvals.py` に追加する新関数、単独の短い tx) を呼んで pending 行の `reason` 列に厳密一致で書き込み、**8 (切替) と 9 (decide) はスキップ** — 下記「plain 分岐」参照 | — | — | — |
 | 3 | (live=absent/symlink のみ) `switch_required` を確定 (旧の正規 target == 新の正規 target なら False) | 計算 | tx 外 | 副作用なし |
 | 4 | (live=absent/symlink のみ) `begin_switch_journal(kind="approve", ..., commit=True)` — 単独の短い tx (phase='preparing') | DB 書込 | 単独 tx | ジャーナル行が durable。以降は §5.1-1 の収束規則で再開可能 |
 | 5 | `create_version_dir(...)` (冪等、11a) | FS | tx 外 | tmp-* 残骸が残り得る (reconcile が掃除) |
@@ -20303,7 +20453,23 @@ EOF
 | 10 | `candidate_origin='staging'` なら候補削除。`human` は削除しない | FS | tx 外 | — |
 | 11 | `flock` 解放 | FS | tx 外 | — |
 
-**plain 分岐 (live=プレーン dir)**: 手順 3〜4・7〜9 をスキップし、手順 5・6 (版+git) の後に **`apply_decision` を呼ばず** `legacy_plain_present` を理由に pending へ留めて手順 10 相当 (候補は消さない — pending のまま) → `flock` 解放。**版 temp の identity は `<artifact_hash>.tmp-approval-<approval_id>`** (`op_identity` に `f"approval-{approval_id}"` を渡す。11a の `create_version_dir` シグネチャがそのまま使える) — **phase 更新は一切行わない** (ジャーナル行自体が存在しない)。
+<!-- precheck 2026-08-22 wave2: T11-B6 -->
+**plain 分岐 (live=プレーン dir)**: 手順 3〜4・7〜9 をスキップし、手順 5・6 (版+git) の後に **`apply_decision` を呼ばず** `approvals_store.set_reason(conn, approval_id, "legacy_plain_present", commit=True)` (B-6 是正: `reason` 列への厳密一致書き込み。単独の短い tx) を呼んで pending へ留めて手順 10 相当 (候補は消さない — pending のまま) → `flock` 解放。**版 temp の identity は `<artifact_hash>.tmp-approval-<approval_id>`** (`op_identity` に `f"approval-{approval_id}"` を渡す。11a の `create_version_dir` シグネチャがそのまま使える) — **phase 更新は一切行わない** (ジャーナル行自体が存在しない)。
+
+**B-6 是正: `store/approvals.py` に `set_reason` を追加する**。現物 `approvals.create(conn, kind, payload, now, expires_at=None, *, commit=True)` に `reason` 引数は無く、`apply_decision` は決定時にしか `reason` を書かない — pending 行の `reason` 列に書く経路がどの Step にも定義されていなかった (この列に文字列が入らないと `gc_roots` ② の完全一致 WHERE 句にヒットせず、legacy plain 承認で作った版が sweep で削除されてしまう)。Task 11 (11a、`plugin/version_store.py` と同じ着手順序) が `store/approvals.py` へ以下を**追加のみ**で足す (Task 8 の既存関数のシグネチャは変えない):
+
+```python
+def set_reason(conn: sqlite3.Connection, approval_id: int, reason: str, *,
+               commit: bool = True) -> None:
+    """pending 行の reason 列を厳密一致の文字列で更新する (B-6、gc_roots ②
+    /11e の `assert "legacy_plain_present" in (row["reason"] or "")` /
+    M2 変異と三者を完全一致で揃える契約)。"""
+    conn.execute(
+        "UPDATE approval_requests SET reason=? WHERE id=? AND status='pending'",
+        (reason, approval_id))
+    if commit:
+        conn.commit()
+```
 
 ### P3 (bless --from _human) の SQL sequence — 別表
 
@@ -20325,7 +20491,7 @@ EOF
 | 4B | **`BEGIN IMMEDIATE`** → `approvals.create(commit=False)` (pending) → `save_harness_run(commit=False)` (ゲート証跡) → **`COMMIT`** (**ジャーナル無し** — §5.1 表の bless プレーン行) | DB 書込 | **1 tx** | — |
 | 5B | `create_version_dir(..., op_identity=f"approval-{approval_id}")` (版) | FS | tx 外 | — |
 | 6B | `history_git.record_version(...)` (git) | サブプロセス | tx 外 | — |
-| 7B | `legacy_plain_present` で pending に留める。`apply_decision` は呼ばない | — | — | — |
+| 7B | `approvals_store.set_reason(conn, approval_id, "legacy_plain_present", commit=True)` (B-6) で pending に留める。`apply_decision` は呼ばない | DB 書込 | 単独 tx | — |
 | 8B | `flock` 解放 | FS | tx 外 | — |
 
 ### journal-less プレーン経路の crash point → fault matrix
@@ -20338,7 +20504,7 @@ P2/P3-B 共通 (§8.1-28 の pin 対象):
 | `fsync` 後・`rename` 前 | `os.rename` を monkeypatch で例外にする | tmp は 0500/0400 化済みだが最終名にはなっていない。再試行で `final_dir.is_dir()` が False のため rename をやり直す |
 | `rename` 直後 (版は完成、git 未実行) | `history_git.record_version` 呼び出し直前で例外 | 版は完成 (冪等 — 再実行時 `create_version_dir` は早期 return)。git から続く |
 | git 実行中 (identity 欠如などで例外) | 11b の `_IDENTITY_ENV` 空注入 | pending のまま、版のみ完成。再試行で git のみやり直し |
-| git 成功後・`legacy_plain_present` 記帳前 (pending のまま留める処理自体は tx を持たない — payload の `reason` フィールド等を書く実装なら) | 該当 UPDATE 直前で例外 | pending 行は既に存在 (P1/P3-B の tx で作成済み)。`reason` 表示が無いだけで再試行は無害 (`legacy_plain_present` かどうかは live の形を毎回再確認するため冪等) |
+| git 成功後・`set_reason` 呼び出し前 (B-6: `approvals_store.set_reason` は単独の短い tx) | `set_reason` 呼び出し直前で例外 | pending 行は既に存在 (P1/P3-B の tx で作成済み)。`reason` 列が空のままだが再試行は無害 (`legacy_plain_present` かどうかは live の形を毎回再確認するため冪等 — 再試行で `set_reason` が呼ばれ直す) |
 | approval が pending の間に別プロセスが同じ tmp に触る (二重承認申請の競合) | `flock` 未取得のまま呼ぶ変異 (テストのみ・本番は必ず flock 経由) | `flock` により構造的に排除 — 11g の multi-process test で検証 |
 
 ### `candidate_origin`/`candidate_path` payload validator (§8.1-29)
@@ -20424,7 +20590,7 @@ def env(tmp_path):
     (plugins_dir / ".locks").mkdir()
     conn = db_store.connect(root / "agentic.db")
     db_store.init_db(conn)
-    settings = load_settings(Path("config/settings.yaml.example"))
+    settings = load_settings(Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
     return root, plugins_dir, conn, settings
 
 
@@ -20498,7 +20664,7 @@ def test_approve_live_absent_creates_version_git_and_switches(env, monkeypatch):
         candidate_origin="staging", mission_id=1, backlog_id=None,
         settings=settings, now=NOW)
 
-    switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW)
+    switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW, plugins_root=plugins_dir, settings=settings)  # B-1
 
     row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
                        (approval_id,)).fetchone()
@@ -20516,6 +20682,7 @@ def test_approve_live_absent_creates_version_git_and_switches(env, monkeypatch):
 
 # --- P2: approve, live=plain (legacy) ---
 
+# precheck 2026-08-22 wave2: T11-B6 / T11-M9
 def test_approve_live_plain_stays_pending_with_legacy_reason(env, monkeypatch):
     root, plugins_dir, conn, settings = env
     _write_candidate(plugins_dir / "sma")  # legacy plain live
@@ -20526,15 +20693,16 @@ def test_approve_live_plain_stays_pending_with_legacy_reason(env, monkeypatch):
         candidate_origin="staging", mission_id=1, backlog_id=None,
         settings=settings, now=NOW)
 
-    switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW)
+    switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW, plugins_root=plugins_dir, settings=settings)  # B-1
 
-    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+    row = conn.execute("SELECT status, reason FROM approval_requests WHERE id=?",
                        (approval_id,)).fetchone()
     assert row["status"] == "pending"  # 決定しない
+    assert row["reason"] == "legacy_plain_present"  # B-6: 厳密一致で書かれること
     assert (plugins_dir / "sma").is_dir() and not (plugins_dir / "sma").is_symlink()
-    # 版は作られている (git まで進める)
+    # 版は作られている (git まで進める) — M-9 是正: 意味不明な式を「非空」に書き直す
     version_dirs = list((plugins_dir / ".versions" / "sma").glob("*"))
-    assert any(not d.name.endswith(tuple("0123456789")) is False for d in version_dirs) or version_dirs
+    assert version_dirs != []
     journal_rows = conn.execute("SELECT COUNT(*) c FROM plugin_switch_journal").fetchone()
     assert journal_rows["c"] == 0  # ジャーナルは作らない
 
@@ -20654,7 +20822,7 @@ def test_approve_candidate_missing_stays_pending(env, monkeypatch):
     import shutil
     shutil.rmtree(plugins_dir / "_staging" / "1" / "sma")
 
-    switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW)
+    switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW, plugins_root=plugins_dir, settings=settings)  # B-1
 
     row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
                        (approval_id,)).fetchone()
@@ -20669,6 +20837,43 @@ uv run pytest tests/plugin/test_switch_paths.py -v
 ```
 
 - [ ] **Step 3: 実装**
+
+<!-- precheck 2026-08-22 wave2: T11-B1 -->
+**B-1 是正 (骨格 Interfaces 節を更新): `approve_candidate` のシグネチャを `plugins_root`/`settings` 込みで確定する。**
+P2 の SQL sequence (手順 5 `create_version_dir(root, ...)` / 手順 6 `history_git.record_version(...)` /
+手順 8 `switch_live(plugins_root, ...)`) は `plugins_root` が無ければ FS 操作の起点を得られず、
+`submit_candidate`/`bless_candidate` と違い `approve_candidate` は `staging_dir`/`human_dir` のような
+候補ロケータを受け取らないため `plugins_root` を逆算する術も無い。骨格 Interfaces 節の
+`approve_candidate` シグネチャを次へ更新する (統合裁定 R-i5 で `retire_plugin` に `conn` を
+足したのと同型の裁定):
+
+```python
+def approve_candidate(
+    conn: sqlite3.Connection, approval_id: int, *,
+    decided_by: str, now: datetime, plugins_root: Path, settings: "Settings",
+) -> None:
+    """P2 (approve) の入口。plugins_root は FS 操作 (版・git・切替) の起点、
+    settings は将来のゲート再検証・kind 別分岐のために渡す (現行 P2 手順は
+    gate を再実行しないが、シグネチャで揃えておくことで retry_approval/
+    reconcile 経由の呼び出しと submit_candidate/bless_candidate の引数構成
+    を統一する)。"""
+```
+
+この拡張は以下へ機械的に波及させる (全て本 Step の一部として実施する):
+
+- `switch.retry_approval(conn, approval_id, *, decided_by, now, plugins_root, settings)` (11e) —
+  内部で `approve_candidate(conn, approval_id, decided_by=decided_by, now=now, plugins_root=plugins_root, settings=settings)` を呼ぶだけ (11e 該当 Step の骨子コードを更新)。
+- `switch.reconcile_switch_journals(conn, *, plugins_root, now, settings, force_revert_op_id=None)` (11c) —
+  `retry_approval` へ委譲する箇所 (「最終形」注記のコード) に `plugins_root=plugins_root, settings=settings` を追加する。
+- `switch.reject_candidate(conn, approval_id, *, decided_by, reason, now, plugins_root)` (11g、新規命名) —
+  flock ファイル (`plugins/.locks/<name>.lock`) の場所と未完ジャーナル収束のために `plugins_root` を要する
+  (`settings` は gate を呼ばないため不要)。
+- `tests/plugin/_flock_worker.py` (11g) — argv[2] で受け取っている `plugins_root` を実際に
+  `approve_candidate`/`reject_candidate` へ渡す (これまで一度も使っていなかった症状の解消)。
+  `settings` は worker 内で `load_settings(Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")` を呼んで作る (M-7: cwd 非依存の既存規約 `tests/test_config.py:9` に合わせる)。
+- 11c/11d/11e/11g の全テスト呼び出し (`switch.approve_candidate(...)` / `switch.retry_approval(...)` /
+  `switch.reconcile_switch_journals(...)`) に `plugins_root=plugins_dir` (または `root`) / `settings=settings`
+  を追加する (各節の該当箇所に `<!-- precheck 2026-08-22 wave2: T11-B1 -->` を付して反映済み — 下記参照)。
 
 `switch.py` に `submit_candidate`/`approve_candidate`/`bless_candidate`/`resolve_candidate_dir`/`CandidateMissingError` を追記 (骨子は上記 Interfaces 節 + SQL sequence 表のとおり)。**`plugin/approval.py` の既存 `submit_plugin`/`bless` を分解**: ゲート本体 (`_validate_kind`・`check_source`・`run_gate_pytest` 呼び出し・hash 再計算) を `switch.py` から呼べる形の関数 (例 `approval.run_kind_gate(conn, meta, *, settings, now, run_in_sample_fn=None) -> tuple[dict, bool]`) として public 化する — **既存 `_validate_kind` を rename/export するだけで、検証ロジックは一切変えない** (§8.1-41 の「通常 submit と共有」を満たす)。**裁定 3**: `backtest/cli.py` の `afx plugin bless <name>` (`--from` なし) は常に次のエラーを出す:
 
@@ -20782,7 +20987,7 @@ def env(tmp_path):
     (plugins_dir / ".locks").mkdir()
     conn = db_store.connect(tmp_path / "agentic.db")
     db_store.init_db(conn)
-    settings = load_settings(Path("config/settings.yaml.example"))
+    settings = load_settings(Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
     return tmp_path, plugins_dir, conn, settings
 
 
@@ -20930,7 +21135,8 @@ def test_legacy_plain_e2e_pending_retire_retry_completes_switch(env, monkeypatch
     # ことの構造的確認 (§5.1 の pin)。
     assert not meta_mid.path.exists()
 
-    switch.retry_approval(conn, approval_id, decided_by="human", now=NOW)
+    switch.retry_approval(conn, approval_id, decided_by="human", now=NOW,
+                          plugins_root=plugins_dir, settings=settings)  # B-1
 
     row2 = conn.execute("SELECT status FROM approval_requests WHERE id=?",
                         (approval_id,)).fetchone()
@@ -20976,6 +21182,7 @@ def materialize_plugin(root: Path, name: str) -> Path:
     return dest
 
 
+# precheck 2026-08-22 wave2: T11-B2
 def retire_plugin(conn: sqlite3.Connection, root: Path, name: str, *,
                   now: datetime) -> None:
     """統合裁定 R-i5 で骨格 Interfaces 節が `conn` 必須へ更新済み
@@ -20986,11 +21193,13 @@ def retire_plugin(conn: sqlite3.Connection, root: Path, name: str, *,
     with open(lock_path, "w") as lockf:
         fcntl.flock(lockf, fcntl.LOCK_EX)
         try:
-            unresolved = journal_store.list_non_terminal_for_name(conn, name)
-            if unresolved:
+            # B-2: 現物名は `get_open_by_name` (単一行 dict | None を返す —
+            # 非実在の `list_non_terminal_for_name` からの置換)
+            unresolved = journal_store.get_open_by_name(conn, name)
+            if unresolved is not None:
                 raise UnresolvedJournalError(
                     f"plugin {name!r} has an unresolved switch journal "
-                    f"(op_id={unresolved[0]['op_id']}) — resolve it first "
+                    f"(op_id={unresolved['op_id']}) — resolve it first "
                     "(reconcile or approval retry)")
             live = root / name
             if not live.is_dir() or live.is_symlink():
@@ -21007,12 +21216,17 @@ def retire_plugin(conn: sqlite3.Connection, root: Path, name: str, *,
             fcntl.flock(lockf, fcntl.LOCK_UN)
 
 
+# precheck 2026-08-22 wave2: T11-B1
 def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
-                   decided_by: str, now: datetime) -> None:
+                   decided_by: str, now: datetime, plugins_root: Path,
+                   settings: "Settings") -> None:
     """§5.3 契機③: 手順を頭から流す (lock → plain 検出 → ⓓ → ⓐ → 版(冪等) →
     git(no-op) → 切替(no-op なら済み) → apply_decision)。approve_candidate と
-    同じ実装を呼ぶだけ (retry は「approve をもう一度呼ぶ」と同義 — §5.3 本文)。"""
-    approve_candidate(conn, approval_id, decided_by=decided_by, now=now)
+    同じ実装を呼ぶだけ (retry は「approve をもう一度呼ぶ」と同義 — §5.3 本文)。
+    B-1 是正で plugins_root/settings を追加した (approve_candidate へそのまま
+    透過する)。"""
+    approve_candidate(conn, approval_id, decided_by=decided_by, now=now,
+                      plugins_root=plugins_root, settings=settings)
 ```
 
 **申し送り (統合裁定 R-i5 で骨格確定済み)**: `retire_plugin` の骨子コード内 `_conn_placeholder` はプレースホルダ — 実装は `retire_plugin(conn, root, name, *, now)` と `conn` を第一引数に加える。これは「骨格との差分」ではなく、統合裁定 R-i5 により**骨格 Interfaces 節のシグネチャ自体が `retire_plugin(conn, root, name, *, now) -> None` へ更新済み**(未完ジャーナルの確認に DB 接続が要るため)。同様に activity ログへの `plugin_retired` 記録も呼び出し元 (`commands.py`) の責務に移すか `retire_plugin` に `activity` 引数を足すかは実装計画で確定する。
@@ -21023,9 +21237,38 @@ def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
 uv run pytest tests/plugin/test_materialize_retire.py -v
 ```
 
-- [ ] **Step 5: CLI/シェル配線**
+<!-- precheck 2026-08-22 wave2: T11-B8 -->
+- [ ] **Step 5: CLI/シェル配線 (B-8 是正: dispatch を subcommand 名で明示分岐させる)**
 
-`backtest/cli.py`: `afx plugin materialize <name>` / `afx plugin retire <name>` の subparser 追加 (既存 `plugin_sub.add_parser` と同じ形)。`commands.py`: シェル `approval retry <id>` ハンドラ (既存 `approve`/`reject` ハンドラと同じ形で `switch.retry_approval` を呼ぶ)。
+`backtest/cli.py`: `afx plugin materialize <name>` / `afx plugin retire <name>` の subparser 追加 (既存 `plugin_sub.add_parser` と同じ形)。
+
+**B-8**: 現物 `src/agentic_fx/backtest/cli.py:464-467` の dispatch はフォールスルーで書かれている:
+
+```python
+            if args.command == "plugin":
+                if args.plugin_command == "submit":
+                    return _plugin_submit(conn, settings, args, root)
+                return _plugin_bless(conn, settings, args, root)
+```
+
+subparser を追加しただけでは `materialize`/`retire` も `_plugin_bless` に流れ込み、11d 裁定 3 の「常に拒否」エラーが誤って返ってしまう。dispatch を **`args.plugin_command` の値で明示的に 4 分岐** させる:
+
+```python
+            if args.command == "plugin":
+                if args.plugin_command == "submit":
+                    return _plugin_submit(conn, settings, args, root)
+                if args.plugin_command == "materialize":
+                    return _plugin_materialize(conn, settings, args, root)
+                if args.plugin_command == "retire":
+                    return _plugin_retire(conn, settings, args, root)
+                if args.plugin_command == "bless":
+                    return _plugin_bless(conn, settings, args, root)
+                raise ValueError(f"unknown plugin subcommand: {args.plugin_command!r}")
+```
+
+`_plugin_materialize`/`_plugin_retire` は新規ハンドラ (既存 `_plugin_submit`/`_plugin_bless` と同じ形 — `conn, settings, args, root` を受け `switch.materialize_plugin`/`switch.retire_plugin` を呼ぶ)。`_plugin_submit`/`_plugin_bless` は 11d 裁定 3・`--from _human` 分岐 (11d) をこの Step で合わせて実装する (submit の `--from` 引数で `candidate_origin` を切替、bless は `--from _human` 無しなら常に拒否)。
+
+`commands.py`: シェル `approval retry <id>` ハンドラ (既存 `approve`/`reject` ハンドラと同じ形で `switch.retry_approval(conn, approval_id, decided_by=actor, now=now, plugins_root=plugins_root, settings=settings)` を呼ぶ — B-1 是正で `plugins_root`/`settings` が必須になったことに追随)。
 
 - [ ] **Step 6: 変異テスト (11e)**
 
@@ -21135,8 +21378,9 @@ init_db(conn)                                    # migration (§5.5 の legacy i
 missions.recover_interrupted(conn, ...)          # 既存
 # ここから改善ループの起動時処理 (Task 8/9 が別途追加する improve_waves の
 # 回収は Task 8 の範囲 — 本 task は plugin 承認の reconcile のみ配線する)
-switch.reconcile_switch_journals(conn, plugins_root=plugins_dir, now=clock.now())  # ⓪ journal-first
-switch.sweep_orphans(conn, plugins_root=plugins_dir, now=clock.now())             # ①〜⑦ sweep-last
+switch.reconcile_switch_journals(conn, plugins_root=plugins_dir, now=clock.now(), settings=settings, activity=activity)  # ⓪ journal-first
+switch.sweep_orphans(conn, plugins_root=plugins_dir, now=clock.now(), activity=activity)             # ①〜⑦ sweep-last
+switch.process_expired_approvals(conn, plugins_root=plugins_dir, now=clock.now())  # B-7: 起動時 reconcile の直後 (裁定1)
 approved = plugin_loader.approved_plugins(conn_core, plugins_dir)                  # 既存 (line 591)
 ```
 
@@ -21145,12 +21389,13 @@ approved = plugin_loader.approved_plugins(conn_core, plugins_dir)               
 
 **crash matrix**: 「reconcile 未実行のまま `approved_plugins()` を呼んでしまう」「sweep が journal より先に走る」の 2 大失敗モードを固定する。
 
+<!-- precheck 2026-08-22 wave2: T11-B15 / T11-B16 -->
 | 起動シーケンス変異 | 起きる問題 | pin テスト |
 |---|---|---|
-| 正順 (journal-first → sweep-last → approved_plugins) | (正常) | `test_reconcile_runs_before_sweep_and_both_before_approved_plugins` |
-| sweep が journal-first より先に走る | ⓪ が未完了のうちに③の孤児版削除が走り、**再開に必要な新版 (`versioned` phase で止まっている版) を消してしまう** — killer: `versioned` で crash → 起動 → sweep 先行なら新版が消え再開不能 | `test_sweep_before_journal_would_delete_reopenable_version` (意図的に順序を逆にした変異版ヘルパを直接呼び、削除されてしまうことを示す — 「もし順序を間違えたら」を可視化する回帰) |
-| `approved_plugins()` が reconcile より先に呼ばれる | 復旧した承認 (switched→decided で完了したもの) がその起動ではロードされない | `test_approved_plugins_called_after_reconcile_pin` (`service.build_app` を通した統合テスト。呼び出し順序を `unittest.mock.call_args_list` の順序で assert) |
-| reconcile が例外を出す | サービス起動を止めない (git 不在等は警告に留める、§5.3) | `test_reconcile_failure_does_not_block_startup` |
+| 正順 (journal-first → sweep-last → process_expired_approvals → approved_plugins) | (正常) | `test_service_startup_calls_reconcile_sweep_expire_then_approved_plugins_in_order` (Step 5、実配線 pin — B-15 是正: 旧稿の同名テストは fake を自作し自分で assert するだけで `service.py` を読まなかったため置換) |
+| sweep が journal-first より先に走る | ⓪ が未完了のうちに③の孤児版削除が走り、**再開に必要な新版 (`versioned` phase で止まっている版) を消してしまう** 可能性がある (`gc_roots` ④ が非終端ジャーナル参照を含むため、現行実装では実際には消えない — 安全側の性質として `test_sweep_alone_does_not_delete_version_referenced_by_open_journal` (11f 単体テスト、B-16 是正で名前と本体を一致させた) が確認する) | `test_sweep_alone_does_not_delete_version_referenced_by_open_journal` + `test_service_startup_calls_reconcile_sweep_expire_then_approved_plugins_in_order` (順序契約そのもの) |
+| `approved_plugins()` が reconcile より先に呼ばれる | 復旧した承認 (switched→decided で完了したもの) がその起動ではロードされない | `test_service_startup_calls_reconcile_sweep_expire_then_approved_plugins_in_order` (Step 5) |
+| reconcile が例外を出す | サービス起動を止めない (git 不在等は警告に留める、§5.3) | `test_service_startup_reconcile_failure_does_not_block_startup` (Step 5、実配線 pin — B-15 是正で `service.py` の try/except を実際に通す形へ置換) |
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -21260,34 +21505,25 @@ def test_sweep_orphans_preserves_gc_root_version(env):
     assert d1.exists()
 
 
-def test_reconcile_runs_before_sweep_and_both_before_approved_plugins():
-    """`service.build_app` 相当の呼び出し順序 pin。実際の service.py 配線は
-    Step 5 の統合テストで assert する (ここでは順序の契約をユニットレベルで
-    固定する — 呼び出し順序を記録する fake を注入)。"""
-    calls = []
-
-    def fake_reconcile(conn, *, plugins_root, now):
-        calls.append("reconcile")
-
-    def fake_sweep(conn, *, plugins_root, now):
-        calls.append("sweep")
-
-    def fake_approved_plugins(conn, plugins_dir):
-        calls.append("approved_plugins")
-        return []
-
-    # 実装計画: service.py がこの 3 関数をこの順で呼ぶことをコード上で保証する。
-    # ここでは順序契約そのものをテスト化する (呼び出し元スタブ)。
-    fake_reconcile(None, plugins_root=Path("."), now=NOW)
-    fake_sweep(None, plugins_root=Path("."), now=NOW)
-    fake_approved_plugins(None, Path("."))
-    assert calls == ["reconcile", "sweep", "approved_plugins"]
+# precheck 2026-08-22 wave2: T11-B15 / T11-B16
+# B-15 是正: `test_reconcile_runs_before_sweep_and_both_before_approved_plugins`
+# と `test_reconcile_failure_does_not_block_startup` は自作 fake を自分で
+# 順に呼んで自分で assert するだけで `service.py` を一切読まない (型 3、
+# 何を壊しても緑のまま) ため削除した。実配線の順序 pin と失敗非伝播 pin は
+# Step 5 (`tests/test_service_app.py`、`unittest.mock.patch` で実関数を
+# spy に差し替え `call_args_list`/spy 呼び出しを assert する) に一本化する。
 
 
-def test_sweep_before_journal_would_delete_reopenable_version(env):
-    """順序を意図的に逆にした場合に何が起きるかを示す回帰の裏付け:
-    `versioned` phase で止まっているジャーナルの新版を、reconcile 前に
-    sweep すると消えてしまう (= 順序が重要である根拠)。"""
+def test_sweep_alone_does_not_delete_version_referenced_by_open_journal(env):
+    """B-16 是正: 旧テスト名は「sweep を journal より先に走らせると消える」
+    だったが、本体は `assert d3.exists()` (= 消えない) で名前と逆のことを
+    検証しており、かつ「消えるはずの危険」を再現してもいなかった。
+    `gc_roots` ④ (非終端ジャーナルの new_target/old_target/temp_path) は
+    reconcile の実行有無に関わらず参照されるため、sweep 単体を
+    reconcile より先に呼んでも journal が参照する版は削除されない、という
+    **安全側の性質**として正しく命名し直す。順序 (journal-first/sweep-last)
+    そのものの必要性は `test_reconcile_runs_before_sweep_and_both_before_approved_plugins`
+    (Step 5、実配線 pin) が別途担保する。"""
     tmp_path, plugins_dir, conn = env
     d3, a3 = _make_version(plugins_dir, "mid_flight", b"v-mid\n")
     switch.begin_switch_journal(
@@ -21295,31 +21531,10 @@ def test_sweep_before_journal_would_delete_reopenable_version(env):
         old_kind="absent", old_target=None,
         new_target=f".versions/mid_flight/{a3}", switch_required=True,
         actor="human", now=NOW, commit=True)
-    # 誤った順序: reconcile を呼ばずに sweep だけ呼ぶ
+    # reconcile を呼ばずに sweep だけ呼ぶ (journal-first を経ない順序)
     switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
-    # gc_roots は非終端ジャーナルの new_target を含むため、正しい実装なら
-    # 消えない — この assert は「sweep 単体が journal を読んでいる限り安全」
-    # であることの確認であり、journal-first の必要性は
-    # test_reconcile_runs_before_sweep_and_both_before_approved_plugins の
-    # 呼び出し順序契約とあわせて担保する (sweep が gc_roots 経由で journal
-    # を見るため、単体では消えないが、journal 収束 (reconcile) を経ないと
-    # 「versioned で止まった行が古い new_target のまま」という別の不整合が
-    # 残る — 申し送り: 本テストは順序問題の片側面のみを検証する簡略版)。
+    # gc_roots ④ が非終端ジャーナルの new_target を含むため消えない
     assert d3.exists()
-
-
-def test_reconcile_failure_does_not_block_startup(env, monkeypatch, caplog):
-    tmp_path, plugins_dir, conn = env
-
-    def _raise(*a, **k):
-        raise RuntimeError("git not found")
-
-    monkeypatch.setattr(switch, "reconcile_switch_journals", _raise)
-    # service.py 配線相当: reconcile は try/except で握り警告に留める
-    try:
-        switch.reconcile_switch_journals(conn, plugins_root=plugins_dir, now=NOW)
-    except RuntimeError:
-        pass  # 呼び出し元 (service.py) がこの形で握ることの pin
 ```
 
 - [ ] **Step 2: 失敗を確認**
@@ -21332,10 +21547,15 @@ uv run pytest tests/plugin/test_reconcile.py -v
 
 `version_store.gc_roots` (上記コード) と `switch.sweep_orphans` を実装:
 
+<!-- precheck 2026-08-22 wave2: T11-B2 -->
 ```python
-def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path,
-                  now: datetime) -> None:
-    """§5.3 起動時 reconcile ①〜⑦ (journal-first の後に呼ぶこと)。"""
+def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime,
+                  activity: "ActivityLog | None" = None) -> None:
+    """§5.3 起動時 reconcile ①〜⑦ (journal-first の後に呼ぶこと)。B-2 是正:
+    activity 記録は journal_store 層 (非実在の `record_activity_error`) では
+    なく、呼び出し元であるこの関数が直接 `activity.write` する (層違反の
+    解消)。M-10 是正: tmp スキップ条件は 1 桁の op_identity にしか一致しない
+    バグがあったため `".tmp-" in name` の部分一致に変える。"""
     roots = version_store.gc_roots(conn, plugins_root=plugins_root)
 
     # ① 孤児 staging (対応する pending approval_request の候補パスが無いもの)
@@ -21365,7 +21585,7 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path,
         # ③ gc_roots に含まれない版ディレクトリの削除
         for name_dir in versions_root.iterdir():
             for version_dir in name_dir.iterdir():
-                if version_dir.name.endswith(tuple(f".tmp-{i}" for i in range(10))):
+                if ".tmp-" in version_dir.name:  # M-10: 部分一致 (② が既に消しているが、②③の順序が入れ替わっても安全にする)
                     continue
                 if version_dir.resolve() not in roots:
                     import shutil
@@ -21376,30 +21596,52 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path,
         if entry.resolve() not in roots:
             entry.unlink(missing_ok=True)
 
-    # ⑤ dangling symlink は activity ERROR に留める (触らない)
+    # ⑤ dangling symlink は activity ERROR に留める (触らない) — B-2: 直接 activity.write
     for entry in plugins_root.iterdir():
         if entry.name.startswith((".", "_")):
             continue
         if entry.is_symlink() and not entry.exists():
-            journal_store.record_activity_error(
-                conn, op_id=None, name=entry.name, reason="dangling_live_symlink")
+            if activity is not None:
+                activity.write(Category.APPROVAL, "dangling_live_symlink",
+                               f"name={entry.name}")
 
     # ⑥ _retired/_human には触れない (何もしない)
-    # ⑦ legacy_plain_present の件数を activity へ (再試行はしない)
+    # ⑦ legacy_plain_present の件数を activity へ (再試行はしない) — B-2: 直接 activity.write
+    if activity is not None:
+        legacy_count = conn.execute(
+            "SELECT COUNT(*) c FROM approval_requests "
+            "WHERE kind='plugin' AND status='pending' "
+            "AND reason='legacy_plain_present'").fetchone()["c"]
+        if legacy_count:
+            activity.write(Category.APPROVAL, "legacy_plain_present_pending_count",
+                           f"count={legacy_count}")
 ```
 
-`service.py:500-591` に呼び出しを挿入 (`missions.recover_interrupted` (line 508) の後、`approved_plugins()` (line 591) の前):
+<!-- precheck 2026-08-22 wave2: T11-B1 / T11-B7 -->
+`service.py:669-767` (現物 HEAD の実位置。骨格記載の `500-591` は D-9 が約 180 行を挿入する前の陳腐化した行番号 — M-1) に呼び出しを挿入 (`missions.recover_interrupted` (line 682) の後、`approved_plugins()` (line 767) の前。**B-7**: `process_expired_approvals` (裁定 1) もここに配線する — reconcile/sweep の直後):
 
 ```python
         try:
             switch.reconcile_switch_journals(
-                conn_core, plugins_root=root / "plugins", now=clock.now())
+                conn_core, plugins_root=root / "plugins", now=clock.now(),
+                settings=settings, activity=activity)
             switch.sweep_orphans(
+                conn_core, plugins_root=root / "plugins", now=clock.now(),
+                activity=activity)
+            switch.process_expired_approvals(  # B-7: 唯一の呼び出し元だった裁定1が本番で1度も動かない欠落を解消
                 conn_core, plugins_root=root / "plugins", now=clock.now())
         except Exception as exc:
-            activity.write("plugin_reconcile_failed",
-                           {"reason": safe_error_text(exc)})
+            activity.write(Category.APPROVAL, "plugin_reconcile_failed",
+                           safe_error_text(exc))
             # サービス起動は止めない (§5.3 — plugin 承認だけが成立せず取引は動く)
+```
+
+<!-- precheck 2026-08-22 wave2: T11-M6 -->
+**M-6 是正**: `history_git._assert_not_scheduler_thread` (11b) は `threading.current_thread().name.startswith("scheduler")` で判定するが、現物 `service.py:1256` の `threading.Thread(target=scheduler_thread, daemon=True)` は名前を付けていない (既定名 `Thread-N`) — このままでは本番のガードが永久に発火しない。本 Step で `service.py:1256-1257` に `name=` を追加する:
+
+```python
+    th = threading.Thread(target=scheduler_thread, daemon=True, name="scheduler")
+    wd = threading.Thread(target=watchdog_thread, daemon=True, name="watchdog")
 ```
 
 - [ ] **Step 4: 成功を確認**
@@ -21408,9 +21650,51 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path,
 uv run pytest tests/plugin/test_reconcile.py -v
 ```
 
-- [ ] **Step 5: 起動シーケンスの統合テスト (`service.py` 配線)**
+- [ ] **Step 5: 起動シーケンスの統合テスト (`service.py` 配線) + B-7 配線 pin**
 
-`tests/test_service.py` (既存ファイル、末尾に追記想定) — `build_app` の呼び出し順序を `unittest.mock.patch` の `call_args_list` で assert する 1 本 (`switch.reconcile_switch_journals` → `switch.sweep_orphans` → `plugin_loader.approved_plugins` の順)。**申し送り**: `tests/test_service.py` の既存フィクスチャ規約 (DB tmp_path、settings 構築) は着手時に現物を読んで合わせること — 本節の骨子コードは新規発見した順序契約のみを示す。
+`tests/test_service_app.py` (**B-群B追加是正**: 骨格記載の `tests/test_service.py` は非実在 — 現物ファイル名は `tests/test_service_app.py`、既存ファイルへ追記する) へ以下 2 本を追記する (**B-15 是正**: 11f 単体の自作 fake テストではなく、`build_app` を実際に通す配線 pin):
+
+```python
+def test_service_startup_calls_reconcile_sweep_expire_then_approved_plugins_in_order(
+        tmp_path, monkeypatch):
+    """B-15/M6 の killer: build_app が switch.reconcile_switch_journals →
+    switch.sweep_orphans → switch.process_expired_approvals →
+    plugin_loader.approved_plugins の順で呼ぶことを、実際の service.py の
+    呼び出し経路 (unittest.mock.patch) で確認する。"""
+    import unittest.mock as mock
+    from agentic_fx.plugin import switch
+    from agentic_fx.tools import plugin_loader as plugin_loader_mod  # 現物の import 元は着手時に確認
+
+    with mock.patch.object(switch, "reconcile_switch_journals") as m_reconcile, \
+         mock.patch.object(switch, "sweep_orphans") as m_sweep, \
+         mock.patch.object(switch, "process_expired_approvals") as m_expire, \
+         mock.patch.object(plugin_loader_mod, "approved_plugins", return_value=[]) as m_approved:
+        # build_app(...) の既存フィクスチャ規約 (settings/tmp_path 構築) に
+        # 合わせて呼ぶ — 着手時に既存 test_service_app.py の規約を確認
+        ...  # build_app(...) を呼ぶ
+        manager = mock.MagicMock()
+        manager.attach_mock(m_reconcile, "reconcile")
+        manager.attach_mock(m_sweep, "sweep")
+        manager.attach_mock(m_expire, "expire")
+        manager.attach_mock(m_approved, "approved")
+        call_names = [c[0] for c in manager.mock_calls]
+        assert call_names == ["reconcile", "sweep", "expire", "approved"]
+
+
+def test_service_startup_reconcile_failure_does_not_block_startup(tmp_path, monkeypatch):
+    """B-15/M7 の killer: reconcile が例外を出しても build_app が完走する
+    (try/except を実際に通す — service.py を実行して確認する)。"""
+    import unittest.mock as mock
+    from agentic_fx.plugin import switch
+
+    with mock.patch.object(switch, "reconcile_switch_journals",
+                           side_effect=RuntimeError("git not found")):
+        # build_app(...) の既存フィクスチャ規約に合わせて呼ぶ — 例外が
+        # 伝播せず app が返ることを assert する
+        ...  # app = build_app(...); assert app is not None
+```
+
+同ファイルへ **B-7 の配線 pin** も追記する: `switch.process_expired_approvals` を `unittest.mock.patch` で spy に差し替え、`build_app(...)` 呼び出し後に `spy.assert_called_once()` を確認する (呼ばれなければ裁定 1 が本番で 1 度も動かない、という B-7 の症状そのものを検出する — 上記 1 本目のテストがこれを兼ねる)。**申し送り**: `tests/test_service_app.py` の既存フィクスチャ規約 (DB tmp_path、settings 構築、`build_app` の実引数) は着手時に現物を読んで合わせること — 本節の骨子コードは新規発見した順序契約のみを示す (`plugin_loader` の import 元モジュール名も着手時に確認すること)。
 
 - [ ] **Step 6: 変異テスト (11f)**
 
@@ -21425,8 +21709,8 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M3 | `gc_roots` から④(非終端ジャーナル参照)を落とす | 同上 |
 | M4 | `sweep_orphans` が `gc_roots` を呼ばず全版を無条件削除 | `test_sweep_orphans_preserves_gc_root_version` |
 | M5 | `sweep_orphans` が孤児版を削除しない (③ のループを削除) | `test_sweep_orphans_deletes_version_not_in_gc_roots` |
-| M6 | `service.py` の呼び出し順序を `approved_plugins` → `reconcile` に入れ替える | Step 5 の順序 pin テスト |
-| M7 | reconcile 失敗を握らず伝播させ起動を止める | `test_reconcile_failure_does_not_block_startup` |
+| M6 | `service.py` の呼び出し順序を `approved_plugins` → `reconcile` に入れ替える | `test_service_startup_calls_reconcile_sweep_expire_then_approved_plugins_in_order` (Step 5、B-15 是正) |
+| M7 | reconcile 失敗を握らず伝播させ起動を止める | `test_service_startup_reconcile_failure_does_not_block_startup` (Step 5、B-15 是正) |
 
 - [ ] **Step 7: commit**
 
@@ -21465,7 +21749,8 @@ EOF
 grep -rn "approvals_store\.decide(\|approvals\.decide(\|\.decide(conn" src/agentic_fx/ | grep -v "def decide"
 ```
 
-期待: 出力ゼロ行 (`store/approvals.py` に `decide` の**定義**が残っていても呼び出し側からの参照はゼロ — Task 8 が `decide` を削除するか、本 task が削除後の呼び出し元だけを検査するかは Task 8/Task 11 の file 所有境界による。**本 task は自分の変更範囲 (`switch.py`/`approval.py`) からの `decide` 参照ゼロを保証する** — 関数自体の削除有無は Task 8 の受入条件)。
+<!-- precheck 2026-08-22 wave2: T11-B4 -->
+期待: 出力ゼロ行 (`src/agentic_fx/` 配下の全呼び出し側 — `switch.py`/`approval.py`/`commands.py` を含む — からの `decide` 参照ゼロ)。**B-4 是正: 「関数自体の削除有無は Task 8 の受入条件」という記述は誤りのため削除する** — 「Task 11 全体の受入条件」節が既に明記するとおり、`decide()` **関数定義自体の削除は Task 11 の受入条件**であり (Task 8 は `apply_decision` 併設までで `decide` を残す)、本節末尾の grep-zero pin もこの節の記述と矛盾しないよう揃える。
 
 - [ ] **Step 1: 失敗するテストを書く (grep pin)**
 
@@ -21473,24 +21758,70 @@ grep -rn "approvals_store\.decide(\|approvals\.decide(\|\.decide(conn" src/agent
 
 ```python
 def test_no_direct_decide_calls_in_plugin_module(tmp_path):
-    """裁定1: switch.py/approval.py は approvals_store.decide を直接呼ばない
-    (apply_decision を経由する — grep-zero pin)。"""
+    """裁定1: switch.py/approval.py/commands.py は approvals_store.decide を
+    直接呼ばない (apply_decision を経由する — grep-zero pin、B-4 是正で
+    commands.py を対象に追加)。"""
     import subprocess
     result = subprocess.run(
         ["grep", "-rn", r"approvals_store\.decide(\|approvals\.decide(",
-         "src/agentic_fx/plugin/switch.py", "src/agentic_fx/plugin/approval.py"],
+         "src/agentic_fx/plugin/switch.py", "src/agentic_fx/plugin/approval.py",
+         "src/agentic_fx/commands.py"],
         capture_output=True, text=True)
     assert result.stdout == "", f"unexpected decide() call sites:\n{result.stdout}"
 ```
+
+<!-- precheck 2026-08-22 wave2: T11-B4 -->
+- [ ] **Step 1b (B-4 是正): `commands.py` の approve/reject ハンドラを `apply_decision` へ置換**
+
+現物 `src/agentic_fx/commands.py:70,77` の approve/reject シェルハンドラが `approvals_store.decide(...)` を直接呼んでいる。これを `apply_decision` へ置換する (`decide` の CAS 条件 `WHERE status='pending'` は `apply_decision` も同一に保つ — Task 8 の実装を確認して合わせる):
+
+```python
+# commands.py:70 (approve ハンドラ) — 置換前後の型は同一 (status, approval_id) -> str
+# 変更前: approvals_store.decide(conn, approval_id, status="approved", decided_by=actor, now=now)
+# 変更後:
+approvals_store.apply_decision(
+    conn, approval_id, status="approved", decided_by=actor, now=now, commit=True)
+# commands.py:77 (reject ハンドラ)
+# 変更前: approvals_store.decide(conn, approval_id, status="rejected", decided_by=actor, now=now)
+# 変更後:
+approvals_store.apply_decision(
+    conn, approval_id, status="rejected", decided_by=actor, now=now, commit=True)
+```
+
+**着手時に `commands.py:70,77` の現物 (D-9 マージ後の実引数名・呼び出し規約) を確認し、`apply_decision` の実シグネチャ (Task 8 現物、C-8) に合わせて機械的に置換すること** — plugin kind の approve/reject がシェル経由で来た場合、`apply_decision` は plugin flock を経由しないため、既存の plugin 専用フロー (`switch.approve_candidate`/`switch.reject_candidate`) との二重経路にならないよう、`commands.py` のディスパッチが `kind == "plugin"` のときは `switch.approve_candidate`/`switch.reject_candidate` (flock 経由) を、それ以外は `apply_decision` を直接呼ぶ分岐を維持すること (既存 `decide` 呼び出しが plugin/非 plugin を区別していたかどうかを着手時に確認し、区別が無ければ本 Step で追加する)。
+
+- [ ] **Step 1c (B-4 是正): `decide` 削除で落ちる既存テスト 11 箇所を書き換える**
+
+`decide()` を削除すると `grep -rn "\.decide(" src/ tests/` が拾う以下の既存呼び出しが落ちる (着手時に同じ grep で全数を再確認すること — 行番号はドリフトし得る):
+
+| ファイル | 行 (目安、着手時に grep で再確認) | 対応 |
+|---|---|---|
+| `tests/store/test_approvals.py` | 22, 29, 32, 57, 67, 76, 89 | `decide(...)` → `apply_decision(...)` へ機械置換。**57/67 (期限切れ時の 2 段 commit 挙動)** は `apply_decision` の CAS 述語 (`expires_at >=` は `approved|rejected` のときだけ付く、C-8 実装) に合わせて意味論を検証し直す — 期限切れ pending への決定は fail closed で拒否されることを assert するテストへ書き換える |
+| `tests/tools/test_plugin_loader.py` | 72, 143, 438 | `decide(...)` → `apply_decision(...)` へ機械置換 (approved/rejected な approval を作るヘルパとしての使用) |
+| `tests/test_e2e_plugin_signal.py` | 119 | `decide(...)` → `apply_decision(...)` へ機械置換 |
+
+置換後 `uv run pytest tests/store/test_approvals.py tests/tools/test_plugin_loader.py tests/test_e2e_plugin_signal.py -v` が green であることを確認する。
 
 ### multi-process flock test (§8.1-32) — 実プロセス 2 本
 
 `tests/plugin/_flock_worker.py` (子プロセスエントリ、テストヘルパ):
 
+<!-- precheck 2026-08-22 wave2: T11-B1 / T11-B13 -->
 ```python
 """multi-process flock test の子プロセスエントリ (テストヘルパ、src/ には
 置かない — pytest 収集対象外)。sys.argv: [db_path, plugins_root, role,
-approval_id, barrier_file]"""
+approval_id, barrier_file]
+
+B-13 是正: 旧稿は approve が「barrier 書込 → sleep(0.3) → approve_candidate 呼出」
+の順で、sleep 中は flock をまだ取っていなかった。reject は barrier を見た
+瞬間に reject_candidate を呼ぶため、sleep の 0.3 秒の間に reject が先に
+flock を取って先に決定してしまい (競合の向きが逆)、期待 (reject が
+AlreadyDecidedError になる) と逆の結果になっていた。是正: sleep ベースの
+順序仮定をやめ、reject 側が `plugins/.locks/<name>.lock` への
+`LOCK_EX|LOCK_NB` 試行が失敗すること (= approve が実際に flock を握った
+こと) を実測してから reject_candidate (本物のブロッキング flock) を呼ぶ。
+"""
+import fcntl
 import sys
 import time
 from datetime import datetime, timezone
@@ -21498,6 +21829,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+from agentic_fx.config import load_settings
 from agentic_fx.plugin import switch
 from agentic_fx.store import db as db_store
 
@@ -21506,25 +21838,38 @@ NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
 
 def main() -> None:
     db_path, plugins_root, role, approval_id, barrier_file = sys.argv[1:6]
+    plugins_root = Path(plugins_root)
+    settings = load_settings(Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
     conn = db_store.connect(Path(db_path))
     approval_id = int(approval_id)
 
     if role == "approve":
-        Path(barrier_file).write_text("approve_started")
-        # reject プロセスが flock 待ちであることを確認するため一呼吸置く
-        # (approve_candidate 内で switch_live 直後に短い sleep を注入する
-        # test seam — 実装計画では monkeypatch でなく本物の flock 保持時間
-        # を使うため、ここでは approve_candidate 呼び出し前に明示 sleep する)
-        time.sleep(0.3)
-        switch.approve_candidate(conn, approval_id, decided_by="p1", now=NOW)
+        # B-1 是正: argv[2] で受け取っていた plugins_root を実際に使う
+        # (旧稿は一度も使っていなかった症状の解消)
+        switch.approve_candidate(conn, approval_id, decided_by="p1", now=NOW,
+                                 plugins_root=plugins_root, settings=settings)
         Path(barrier_file).write_text("approve_done")
     elif role == "reject":
-        # approve が flock を握るまで待つ
-        while Path(barrier_file).read_text() != "approve_started":
+        # B-13 是正: approve が実際に plugin flock を握るまで non-blocking
+        # trylock のポーリングで待つ (barrier ファイルのタイミングではなく
+        # flock の実状態で同期する)
+        lock_path = plugins_root / ".locks" / "sma.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            probe = open(lock_path, "a+")
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(probe, fcntl.LOCK_UN)
+            except BlockingIOError:
+                probe.close()
+                break  # approve が flock を握った — reject を投入してよい
+            probe.close()
             time.sleep(0.01)
         try:
             switch.reject_candidate(conn, approval_id, decided_by="p2",
-                                    reason="race_test", now=NOW)
+                                    reason="race_test", now=NOW,
+                                    plugins_root=plugins_root)
         except Exception as exc:  # AlreadyDecidedError 等
             Path(barrier_file + ".reject_result").write_text(type(exc).__name__)
         else:
@@ -21584,7 +21929,7 @@ def test_reject_waits_for_approve_flock_and_then_gets_already_decided(tmp_path, 
     approval_id = switch.submit_candidate(
         conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
         candidate_origin="staging", mission_id=1, backlog_id=None,
-        settings=load_settings(Path("config/settings.yaml.example")), now=NOW)
+        settings=load_settings(Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"), now=NOW)
     conn.close()
 
     barrier_file = tmp_path / "barrier"
@@ -21651,7 +21996,7 @@ def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
         with open(lock_path, "w") as lockf:
             fcntl.flock(lockf, fcntl.LOCK_EX)
             try:
-                if journal_store.list_non_terminal_for_name(conn, name):
+                if journal_store.get_open_by_name(conn, name) is not None:  # B-2: 現物名
                     # 未完ジャーナルあり → 今回はスキップ、次回再試行
                     continue
                 # 他プロセスが flock 待ちの間に既に決定済みかもしれない
@@ -21764,7 +22109,20 @@ uv run pytest tests/plugin/test_flock_multiprocess.py tests/plugin/test_apply_de
 
 - [ ] **Step 3: 実装**
 
-`switch.py` に `reject_candidate` を追記 (flock → 未完ジャーナル収束 → `apply_decision(status="rejected")`)。`approval.py` の `bless()` を次のように縮退:
+<!-- precheck 2026-08-22 wave2: T11-B1 -->
+`switch.py` に `reject_candidate` を追記 (flock → 未完ジャーナル収束 → `apply_decision(status="rejected")`)。シグネチャ (B-1 是正で `plugins_root` を追加 — flock ファイルの所在特定に必須):
+
+```python
+def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
+                     decided_by: str, reason: str, now: datetime,
+                     plugins_root: Path) -> None:
+    """§8.1-32: 全 terminal decision と同じ plugin flock を通る。name は
+    approval payload から取得する (submit/bless が payload に name を含める
+    契約 — 11d 参照)。"""
+    ...
+```
+
+`approval.py` の `bless()` を次のように縮退:
 
 ```python
 def bless(conn, meta, *, settings, now, pytest_runner=None, sandbox_run=None,
@@ -21783,10 +22141,18 @@ def bless(conn, meta, *, settings, now, pytest_runner=None, sandbox_run=None,
 
 `tests/plugin/test_cli_e2e.py`:
 
+<!-- precheck 2026-08-22 wave2: T11-B14 -->
 ```python
 """materialize → _human 編集 → submit|bless --from _human の CLI E2E
 (プラン 10 Task 11g、§8.1-37)。entry.main([...]) 経由 (既存 test_approval.py
-の CLI 配線テストと同じ規約)。"""
+の CLI 配線テストと同じ規約)。
+
+B-14 是正: `run_gate_pytest` (B-6) は冒頭で `landlock.is_available()` を
+確認し、非対応環境では `RuntimeError` で fail closed する。B-6 自身の
+テスト規約 (`pytest.mark.skipif(not is_available(), ...)`) と同じ扱いを
+このモジュールにも適用しつつ、CLI E2E は「配線」の確認が目的で実
+Landlock 実行のコストを払う必要が無いため、既定は `run_gate_pytest` を
+monkeypatch する (B-6/11d/11e の他テストと同じ規約)。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -21794,6 +22160,11 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.entry import main
+from agentic_fx.plugin.gate_pytest import GateResult
+
+
+def _fake_pytest_ok(plugin_dir, *, settings):
+    return GateResult(passed=True, returncode=0, stdout_tail="1 passed", duration_sec=0.1)
 
 
 def test_materialize_then_submit_from_human_cli_e2e(tmp_path, monkeypatch, capsys):
@@ -21810,6 +22181,7 @@ def test_materialize_then_submit_from_human_cli_e2e(tmp_path, monkeypatch, capsy
         Path("config/settings.yaml.example").read_bytes())
     (root / "data").mkdir()
 
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
     monkeypatch.chdir(root)
     rc = main(["plugin", "materialize", "sma"])
     assert rc == 0
@@ -21872,7 +22244,7 @@ def test_same_name_different_content_hash_approvals_are_independent(tmp_path, mo
     db_path = tmp_path / "agentic.db"
     conn = db_store.connect(db_path)
     db_store.init_db(conn)
-    settings = load_settings(Path("config/settings.yaml.example"))
+    settings = load_settings(Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
     monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
 
     # B: plugin.py の中身 v1 (content_hash=h1)
@@ -21909,7 +22281,8 @@ def test_same_name_different_content_hash_approvals_are_independent(tmp_path, mo
     assert hash_b != hash_c  # 前提: 別 content_hash であること
 
     switch.reject_candidate(conn, approval_c, decided_by="human",
-                            reason="not needed", now=NOW)
+                            reason="not needed", now=NOW,
+                            plugins_root=plugins_dir)  # B-1
 
     status_b = conn.execute("SELECT status FROM approval_requests WHERE id=?",
                             (approval_b,)).fetchone()["status"]
@@ -21935,6 +22308,49 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M6 | `process_expired_approvals` が未完ジャーナルの確認を省いて即 expired にする | `test_expired_plugin_pending_with_unfinished_journal_is_skipped` |
 | M7 | `process_expired_approvals` が plugin kind でも flock を取らず `apply_decision` を呼ぶ | `test_expired_plugin_pending_without_journal_becomes_expired` (multi-process 拡張は今後の課題として残す — 単体では flock 有無を直接は検出しないため、本 M7 は「未完ジャーナル確認を flock 内で行っている」構造をコードレビューで確認する運用 pin。実装時に `fcntl.flock` 呼び出し箇所を変えないこと) |
 | M8 | `process_expired_approvals` が非 plugin kind にも plugin flock を要求してしまう (性能劣化・意味論違反) | `test_expired_non_plugin_kind_uses_direct_expire_due_path` |
+| M9 | `ImproveSupervisor.tick` が `process_expired_approvals` を呼ばない (B-7 配線が欠落する) | `test_improve_supervisor_tick_calls_process_expired_approvals` (Step 6b) |
+
+<!-- precheck 2026-08-22 wave2: T11-B7 -->
+- [ ] **Step 6b (B-7 是正): `ImproveSupervisor.tick` の冒頭 (lock 外) に `process_expired_approvals` を配線する**
+
+`process_expired_approvals` (裁定 1 = R-i8) の呼び出し元は **(a) `service.py` 起動時 reconcile** (Step 3 で配線済み) **と (b) `ImproveSupervisor.tick` の冒頭** の 2 箇所 — plugin approval の期限切れは 1 時間毎の取引判断 loop とは独立に、週次の改善 loop の tick サイクルでも定期的に処理される必要がある (改善 loop が長時間止まっている間に溜まった期限切れ pending を取りこぼさないため)。現物 `src/agentic_fx/core/improve_supervisor.py` (Task 9、マージ済み) の `tick(self, now: datetime) -> None` は次の形 (`self._stop_event.is_set()` チェックの直後、`self._launch_lock` を取る前 = lock 外):
+
+```python
+    def tick(self, now: datetime) -> None:
+        if self._stop_event.is_set():
+            return
+        # B-7 (裁定1): plugin approval の期限切れ処理は lock 外・毎 tick 実行
+        from agentic_fx.plugin import switch
+        expire_conn = db_mod.connect(self._db_path)
+        try:
+            switch.process_expired_approvals(
+                expire_conn, plugins_root=self._root / "plugins", now=now)
+        finally:
+            expire_conn.close()
+        s = self._settings.schedule
+        ...  # 以下既存
+```
+
+失敗するテストを `tests/core/test_improve_supervisor.py` (既存ファイル、着手時に実ファイル名・フィクスチャ規約を確認) へ追記する:
+
+```python
+def test_improve_supervisor_tick_calls_process_expired_approvals(monkeypatch, tmp_path):
+    """B-7: tick() が process_expired_approvals を呼ぶことの配線 pin
+    (M9 の killer)。"""
+    from agentic_fx.plugin import switch
+    calls = []
+    monkeypatch.setattr(
+        switch, "process_expired_approvals",
+        lambda conn, *, plugins_root, now: calls.append((plugins_root, now)))
+    # 既存の ImproveSupervisor fixture 構築規約に合わせて sup を作る
+    # (self._improve_loop は None のままでよい — capacity 0 or stop_event
+    # を使い spawn まで進めないように既存テストの規約と揃える)
+    ...
+    sup.tick(NOW)
+    assert len(calls) == 1
+```
+
+**申し送り**: 本 Step は `src/agentic_fx/core/improve_supervisor.py` (Task 9 の所有ファイル) を編集する — Task 11 の Files 節には元々列挙されていないが、裁定 R-i8/B-7 が明示的に Task 11 へ割り当てた配線であるため本節に記載する。Task 9 は既にマージ済み (`186a5b1` 時点) なので実装上の衝突は無い。
 
 - [ ] **Step 7: task 全体の受入確認 + 最終 commit**
 
@@ -21973,9 +22389,13 @@ R-i8 (裁定 1 の `process_expired_approvals`) は `test_process_expired_approv
 ```bash
 git add src/agentic_fx/store/approvals.py \
         src/agentic_fx/plugin/switch.py src/agentic_fx/plugin/approval.py \
+        src/agentic_fx/commands.py src/agentic_fx/core/improve_supervisor.py \
+        src/agentic_fx/service.py \
         tests/plugin/test_flock_multiprocess.py tests/plugin/_flock_worker.py \
         tests/plugin/test_cli_e2e.py tests/plugin/test_apply_decision_migration.py \
-        tests/plugin/test_process_expired_approvals.py
+        tests/plugin/test_process_expired_approvals.py tests/core/test_improve_supervisor.py \
+        tests/store/test_approvals.py tests/tools/test_plugin_loader.py \
+        tests/test_e2e_plugin_signal.py
 git commit -m "$(cat <<'EOF'
 feat: apply_decision 全経路統一 + multi-process flock test + CLI E2E (プラン10 Task11g)
 
@@ -22004,8 +22424,8 @@ EOF
 
 1. `version_store.create_version_dir(..., op_identity: str)` — 骨格の型注記は `<op-identity>` のみで引数名を与えていない。`op_identity` として文字列 (`str(op_id)` または `f"approval-{approval_id}"`) を受ける形にした (11a)。
 2. `switch.UnresolvedJournalError` / `switch.CandidateMissingError` (`plugin/switch.py`) — 例外クラス名は骨格に無い (11c/11d/11e)。
-3. `switch.retry_approval(conn, approval_id, *, decided_by, now)` — 骨格に無い。`approval retry <id>` シェルコマンドの実体として新設 (11e)。内部実装は `approve_candidate` を呼ぶだけ (§5.3 「retry は手順を頭から流す」に対応)。
-4. `switch.reject_candidate(conn, approval_id, *, decided_by, reason, now)` — 骨格に無い (submit/approve/bless の 3 関数しか列挙されていないが、reject 経路も `apply_decision` を通り plugin flock を取る必要があるため新設 — 11g)。
+3. `switch.retry_approval(conn, approval_id, *, decided_by, now, plugins_root, settings)` — 骨格に無い。`approval retry <id>` シェルコマンドの実体として新設 (11e)。内部実装は `approve_candidate` を呼ぶだけ (§5.3 「retry は手順を頭から流す」に対応)。**B-1 是正**で `plugins_root`/`settings` を追加した (`approve_candidate` の拡張に追随)。
+4. `switch.reject_candidate(conn, approval_id, *, decided_by, reason, now, plugins_root)` — 骨格に無い (submit/approve/bless の 3 関数しか列挙されていないが、reject 経路も `apply_decision` を通り plugin flock を取る必要があるため新設 — 11g)。flock ファイルの所在特定に `plugins_root` が必須。
 5. `switch.sweep_orphans(conn, *, plugins_root, now)` — 骨格に無い。`reconcile_switch_journals` (journal-first) と分離するために新設 (§5.3 の①〜⑦、11f)。
 6. `switch.process_expired_approvals(conn, *, plugins_root, now)` — 骨格に無い。裁定 1 (統合裁定 R-i8) の `expire_due` と、plugin kind の期限切れ行が flock を取って `apply_decision` を通す経路の橋渡しとして 11g で**完全実装**した (骨格シグネチャに `plugins_root` を追加 — flock ファイルの場所を特定するため必須)。`store/approvals.py` 側に新規命名した `list_due_for_expiry(conn, *, now, kind=None)` (列挙のみ変種) と `expire_due(conn, *, now, exclude_kinds=())` (kind 除外つき直接 expired 化変種) も本項目に付随する新規命名 (Task 8 との協調が必要 — 上記 Consumes 節に明記)。
 7. `history_git.HistoryGitError` / `HistoryGitDetachedError` / `HistoryGitCasConflictError` / `SchedulerThreadForbiddenError` — 骨格は `record_version` の戻り値/例外仕様を「git 不在・detached・identity 欠如は例外」としか言っていない。例外クラスの分割は本 task の新規命名 (11b)。
