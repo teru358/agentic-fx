@@ -1,0 +1,184 @@
+"""MCP stdio シム — JSON-RPC 3 メソッドの契約テスト (設計書 §1.6、§8.1-7)。
+
+`McpShimDispatcher` は mission_worker 側 (Unix socket サーバ)。`run_mcp_shim`
+は CLI 側の子プロセスエントリ (stdin/stdout の JSON-RPC を socket 越しに
+転送するだけ)。ここでは両者を実プロセス/実 socket で結線し、in-flight 1・
+直列化・fail closed を実測する。
+"""
+from __future__ import annotations
+
+import json
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from agentic_fx.tools.mcp_shim import McpShimDispatcher
+from agentic_fx.tools.registry import ToolDef, ToolRegistry
+
+
+def _slow_tool(x: int) -> dict:
+    # ToolRegistry.execute は `tool.func(**arguments)` で呼ぶ (実 API、統合
+    # 裁定 R-i7)。schema の properties 名に対応するキーワード引数を取る。
+    time.sleep(0.3)
+    return {"echo": x}
+
+
+def _never_allowed_tool() -> dict:
+    return {"unreachable": True}
+
+
+def _make_registry() -> ToolRegistry:
+    reg = ToolRegistry()
+    reg.register(ToolDef(
+        name="slow_echo",
+        description="echoes x after a delay",
+        parameters={"type": "object", "properties": {"x": {"type": "integer"}}},
+        func=_slow_tool))
+    # 登録済みだが allowed には入れない — allowed フィルタの観測点
+    # (openai_tools の allowed 引数の出所を pin する)。
+    reg.register(ToolDef(
+        name="never_allowed",
+        description="registered but never in allowed",
+        parameters={"type": "object"},
+        func=_never_allowed_tool))
+    return reg
+
+
+def _start_dispatcher(tmp_path) -> tuple[McpShimDispatcher, Path, threading.Thread]:
+    sock_path = tmp_path / "afx.sock"
+    dispatcher = McpShimDispatcher(sock_path=sock_path, registry=_make_registry(),
+                                   allowed=["slow_echo"])
+    t = threading.Thread(target=dispatcher.serve_forever, daemon=True)
+    t.start()
+    deadline = time.monotonic() + 3.0
+    while not sock_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return dispatcher, sock_path, t
+
+
+def _rpc(sock_path: Path, payload: dict) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.connect(str(sock_path))
+        s.sendall((json.dumps(payload) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf.decode())
+
+
+def test_initialize_returns_protocol_version_and_capabilities(tmp_path):
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": {"protocolVersion": dispatcher.protocol_version}})
+    assert resp["result"]["protocolVersion"] == dispatcher.protocol_version
+    assert "tools" in resp["result"]["capabilities"]
+    assert "serverInfo" in resp["result"]
+
+
+def test_initialize_rejects_unknown_protocol_version(tmp_path):
+    """裁定 5: 未知の版要求には結果を返さず JSON-RPC error (fail closed)。"""
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": {"protocolVersion": "9999-99-99"}})
+    assert "error" in resp
+    assert "result" not in resp
+
+
+def test_tools_list_returns_registered_tools_only_from_allowed(tmp_path):
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                            "params": {}})
+    names = [t["name"] for t in resp["result"]["tools"]]
+    assert names == ["slow_echo"]
+
+
+def test_tools_call_executes_registered_handler(tmp_path):
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                            "params": {"name": "slow_echo", "arguments": {"x": 7}}})
+    content = resp["result"]["content"]
+    assert content[0]["type"] == "text"
+    payload = json.loads(content[0]["text"])
+    assert payload == {"echo": 7}
+
+
+def test_tools_call_rejects_disallowed_tool(tmp_path):
+    """`never_allowed` は登録済みだが `_start_dispatcher` の allowed には
+    入っていない (`_make_registry` 参照) — 「allowed が空」ではなく「allowed
+    は非空だがこのツールだけ許可されていない」という現実的なケースを踏む。
+    `"result" not in resp` により、dispatcher の事前検査が JSON-RPC トップ
+    レベルの error を返すこと (`registry.execute` 内部の allowed 検査が返す
+    `result.content` 内の JSON エラー文字列ではないこと) を明示的に pin する。"""
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                            "params": {"name": "never_allowed", "arguments": {}}})
+    assert "error" in resp
+    assert "result" not in resp
+
+
+def test_tools_call_is_serialized_in_flight_one(tmp_path):
+    """§1.6: `tool_rpc` パイプの in-flight 1 はシム経由でも保たれる
+    (mission_worker 側で lock を取って直列化する)。2 本を同時に投げ、
+    実行区間が重ならないことをタイムスタンプで確認する。"""
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    spans: list[tuple[float, float]] = []
+    lock = threading.Lock()
+
+    def timed_tool() -> dict:
+        # arguments={} → execute は `tool.func()` (kwargs 展開が空) で呼ぶ。
+        start = time.monotonic()
+        time.sleep(0.2)
+        end = time.monotonic()
+        with lock:
+            spans.append((start, end))
+        return {"ok": True}
+
+    dispatcher._registry.register(ToolDef(  # register() は ToolRegistry の公開 API
+        name="timed", description="d", parameters={"type": "object"},
+        func=timed_tool))
+    dispatcher._allowed.append("timed")
+
+    results = []
+
+    def call():
+        results.append(_rpc(sock_path, {"jsonrpc": "2.0", "id": 5,
+                                        "method": "tools/call",
+                                        "params": {"name": "timed", "arguments": {}}}))
+
+    t1 = threading.Thread(target=call)
+    t2 = threading.Thread(target=call)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+    assert len(spans) == 2
+    (s1, e1), (s2, e2) = spans
+    assert e1 <= s2 or e2 <= s1, f"overlapping spans (not serialized): {spans}"
+
+
+def test_run_mcp_shim_forwards_stdio_to_unix_socket(tmp_path):
+    """CLI 側の子プロセスエントリ (`python -m agentic_fx.tools.mcp_shim
+    <sock>`) が stdin の JSON-RPC 行を socket へ転送し、応答を stdout へ
+    書き戻すことを実プロセスで確認する。"""
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(sock_path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        req = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+        proc.stdin.write(json.dumps(req) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        resp = json.loads(line)
+        assert [t["name"] for t in resp["result"]["tools"]] == ["slow_echo"]
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
