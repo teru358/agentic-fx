@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from agentic_fx.runners.base import AgentRunner
-from agentic_fx.runners.local_runner import LocalRunner
 from agentic_fx.tools.registry import ToolRegistry
 
 
@@ -27,6 +26,7 @@ def build_runner(
 ) -> AgentRunner:
     choice = getattr(settings.runner, profile)
     if choice.backend == "local":
+        from agentic_fx.runners.local_runner import LocalRunner
         return LocalRunner(base_url=settings.llama_swap.base_url,
                            model=choice.model, registry=registry,
                            on_message=on_message)

@@ -492,3 +492,64 @@ def test_usr_lib_and_bin_parent_together_allow_claude_exec(tmp_path):
         read_write_paths=[scratch, Path("/dev")], env=env)
     assert "EXEC_PERMISSION_ERROR" not in result.stdout
     assert result.returncode == 0, result.stderr
+
+
+# --- Task 4 Step 7d: factory.build_runner via dispatcher -----
+
+def _settings_with_improve_backend(backend):
+    """プラン10 Task4, Step 7d の test helper: improve backend を
+    指定した Settings を返す。"""
+    from agentic_fx.config import load_settings
+    settings = load_settings(
+        Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example")
+    return settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": backend}),
+        }),
+    })
+
+
+def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
+        monkeypatch, tmp_path):
+    """レビュー1周目 C4: improve backend が claude/codex でも
+    `factory.build_runner` 経由で runner が構築されること (fake CLI、
+    実 LLM 不要)。旧ガード (`backend != "local"` で RuntimeError) が
+    残っていれば claude/codex パラメータで red になる。"""
+    import agentic_fx.mission_worker as mw_mod
+
+    captured = {}
+
+    def spy(profile, settings, registry, *, workdir, on_message=None,
+            cli_started_sink=None):
+        captured["profile"] = profile
+        captured["backend"] = getattr(
+            getattr(settings.runner, profile, None), "backend", None)
+        captured["on_message"] = on_message
+        # precheck 2026-08-22 pass2: RB3 — cli_started_sink= が
+        # build_runner まで届いていることを pin する。
+        captured["cli_started_sink"] = cli_started_sink
+        # 実 CLI/実 LLM を起動しない fake を返す — 構築経路の到達のみ確認する。
+        class _Fake:
+            def run(self, mission):
+                from agentic_fx.runners.base import MissionResult
+                return MissionResult("completed", {}, [])
+            def close(self):
+                pass
+        return _Fake()
+
+    monkeypatch.setattr(mw_mod.runner_factory, "build_runner", spy)
+    
+    for backend in ["local", "claude", "codex"]:
+        captured.clear()
+        settings = _settings_with_improve_backend(backend)
+        mw_mod._run_improve_mission(
+            settings=settings, workdir=tmp_path, protocol_out=None, out_seq=None)
+        assert captured["profile"] == "improve", f"backend={backend}"
+        assert captured["backend"] == backend, f"backend={backend}"
+        # 3 周目レビュー Important-1: on_message が callable として配線されている
+        # ことを assert する — 落とすと transcript/event 転送が全 backend で失われる。
+        assert callable(captured["on_message"]), f"backend={backend}"
+        # precheck 2026-08-22 pass2: RB3 — cli_started_sink も callable として
+        # 配線されていることを assert する (§7.1-2 の受入条件、裁定 R1)。
+        assert callable(captured["cli_started_sink"]), f"backend={backend}"

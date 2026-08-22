@@ -59,6 +59,10 @@ from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
 from agentic_fx.core.mission_protocol import (
     ProtocolError, SeqTracker, encode_frame, read_frame,
 )
+# precheck 2026-08-22 pass2: RB3 (Step 7d) — factory.build_runner への
+# monkeypatch を可能にするため module level import (test 側から
+# `mw_mod.runner_factory` として属性差し替え)。
+from agentic_fx.runners import factory as runner_factory
 
 if TYPE_CHECKING:
     from agentic_fx.core.contracts import Clock
@@ -366,6 +370,39 @@ def _protect_protocol_stdout() -> Any:
     return protocol_out
 
 
+def _run_improve_mission(
+    *, settings: Any, workdir: Path,
+    protocol_out: Any = None, out_seq: Any = None
+) -> Any:
+    """improve profile での runner 構築・Mission 実行 (Step 7d)。
+
+    factory.build_runner 経由で backend (local/claude/codex) を選択し、
+    runner を構築する。unit test は protocol_out/out_seq をデフォルト
+    None で呼び出し、monkeypatch で factory.build_runner を spy する。
+    main() は実際の値を渡し、返された runner を run する。
+
+    :param settings: Settings インスタンス
+    :param workdir: Mission 実行用 workdir (Landlock rw 許可範囲)
+    :param protocol_out: stdout プロトコル出力 (main で生成、フレーム送信用)
+    :param out_seq: SeqTracker インスタンス (protocol_out 送信時に採番用)
+    :return: AgentRunner インスタンス
+    """
+    from agentic_fx.tools.registry import ToolRegistry
+
+    registry = ToolRegistry()
+    on_message = _make_on_message(protocol_out, out_seq)
+    runner = runner_factory.build_runner(
+        "improve", settings, registry, workdir=workdir,
+        on_message=on_message,
+        # precheck 2026-08-22 pass2: RB3 (裁定 R1 の 2 段配線のうち後段) — CLI
+        # (claude/codex) が spawn した子の pgid を、既存の out_seq フレーム
+        # 送出経路 (_send_frame) に相乗りさせて親 (WorkerRunner) へ通知する。
+        # local backend では build_runner がこの引数を無視するため無害。
+        cli_started_sink=lambda pgid: _send_frame(
+            protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}))
+    return runner
+
+
 def main() -> None:
     protocol_out = _protect_protocol_stdout()
 
@@ -424,22 +461,13 @@ def main() -> None:
                 fsize_mb=settings_dict["worker"]["child_fsize_mb"])
             from agentic_fx.config import Settings
             settings = Settings.model_validate(settings_dict)
-            if settings.runner.improve.backend != "local":
-                raise RuntimeError(
-                    f"runner.improve.backend={settings.runner.improve.backend!r} "
-                    "is not supported by mission_worker in this plan "
-                    "(ClaudeRunner is Plan 9 scope) — fail closed")
             from agentic_fx.runners.base import Mission
-            from agentic_fx.runners.local_runner import LocalRunner
-            from agentic_fx.tools.registry import ToolRegistry
 
-            registry = ToolRegistry()
+            workdir = Path.cwd()
             mission = Mission(**handshake["mission"])
-            on_message = _make_on_message(protocol_out, out_seq)
-            runner = LocalRunner(
-                base_url=settings.llama_swap.base_url,
-                model=settings.runner.improve.model, registry=registry,
-                on_message=on_message)
+            runner = _run_improve_mission(
+                settings=settings, workdir=workdir,
+                protocol_out=protocol_out, out_seq=out_seq)
 
             _send_frame(protocol_out, out_seq, {
                 "type": "ready", "ok": True,

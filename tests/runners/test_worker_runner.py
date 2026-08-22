@@ -2381,3 +2381,130 @@ def test_worker_runner_cli_started_never_sent_leaves_finally_a_no_op(
     # `_ensure_dead` は fake_proc.pid (= os.getpid()) への killpg のみ —
     # cli_started 由来の追加 killpg 呼び出しは無い (架空 pgid への発砲防止)
     assert all(pid == fake_proc.pid for pid, _sig in killpg_calls)
+
+
+def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
+        monkeypatch, tmp_path):
+    """(裁定 R1/RB3、§7.1-2 の blocking 受入条件) Task 4 Step 7d の配線
+    (factory.build_runner 経由で cli_started_sink= に mission_worker の
+    _send_frame closure を渡す) が実際に機能し、fake CLI (claude backend)
+    が sleep 中に mission_worker (子、real subprocess) を SIGKILL しても、
+    親 WorkerRunner が CLI の pgid を回収し生存者 0 になることを確認する。
+    fake CLI は SIGTERM を無視するため、SIGKILL エスカレーションまで
+    実際に発火することも同時に確認する。"""
+    import agentic_fx.runners.worker_runner as wr_mod
+
+    root = _root(tmp_path)
+    mission_id = "m-t4-cli-started"
+    staging_dir = tmp_path / "staging" / mission_id
+    staging_dir.mkdir(parents=True, mode=0o700)
+    # source_snapshot_dir は staging_dir 配下に置く (bootstrap 検証ルール)
+    source_snapshot_dir = staging_dir / "source"
+    source_snapshot_dir.mkdir(mode=0o500)
+
+    # marker は staging_dir に置く (Landlock で tmp_path がアクセス不可)
+    marker = staging_dir / "fake_claude_pid"
+    # fake_claude: tiny C program that ignores SIGTERM and sleeps
+    # これは ELF バイナリなので PT_INTERP 検証を通る
+    fake_claude = staging_dir / "fake_claude"
+
+    # C code for fake CLI
+    c_code = f"""
+#include <stdio.h>
+#include <signal.h>
+#include <unistd.h>
+#include <stdlib.h>
+
+int main() {{
+    signal(SIGTERM, SIG_IGN);
+    FILE *f = fopen("{marker}", "w");
+    fprintf(f, "%d\\n", getpid());
+    fclose(f);
+    sleep(600);
+    return 0;
+}}
+"""
+
+    # Compile C code to ELF binary
+    c_source = staging_dir / "fake_claude.c"
+    c_source.write_text(c_code)
+    import subprocess as subprocess_module
+    result = subprocess_module.run(
+        ["gcc", "-O2", "-o", str(fake_claude), str(c_source)],
+        capture_output=True, timeout=10)
+    if result.returncode != 0:
+        pytest.skip(f"gcc not available or compilation failed: {result.stderr.decode()}")
+    c_source.unlink()  # Remove source file
+
+    creds = tmp_path / ".credentials.json"
+    creds.write_text('{"token":"x"}')
+    creds.chmod(0o600)
+
+    settings = SETTINGS.model_copy(update={
+        "runner": SETTINGS.runner.model_copy(update={
+            "improve": SETTINGS.runner.improve.model_copy(
+                update={"backend": "claude"}),
+            "claude": SETTINGS.runner.claude.model_copy(update={
+                "bin": str(fake_claude), "credentials_file": str(creds)}),
+        }),
+        "worker": SETTINGS.worker.model_copy(update={
+            "worker_startup_timeout_sec": 10.0, "worker_grace_sec": 5.0}),
+    })
+
+    class _RunContext:
+        def __init__(self):
+            self.mission_id = mission_id
+            self.staging_dir = staging_dir
+            # source_snapshot_dir は相対パス "." を使う — 子プロセスの cwd=workdir
+            # なので、Path(".") は workdir に resolve される (bootstrap 検証をクリア)
+            self.source_snapshot_dir = "."
+
+    real_popen = subprocess.Popen
+    spawned: dict = {}
+
+    def spy_popen(*a, **kw):
+        p = real_popen(*a, **kw)
+        spawned["proc"] = p
+        return p
+
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", spy_popen)
+
+    runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_RunContext())
+    mission = Mission(prompt="p", tools=[], output_schema={"type": "object"},
+                      max_turns=1, timeout_sec=120.0)
+
+    thread = threading.Thread(target=lambda: runner.run(mission))
+    thread.start()
+    deadline = time.monotonic() + 20.0
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.exists(), (
+        "fake claude CLI が起動しなかった "
+        "(cli_started 配線が mission_worker.py に届いていない可能性)")
+    cli_pid = int(marker.read_text())
+
+    # cli_pid が判明した以降は assert 失敗時にも必ず孤児回収まで到達させる。
+    try:
+        # SIGTERM ハンドラ設定完了を待つ必要はない (fake_claude は SIGTERM 無視)。
+        os.kill(spawned["proc"].pid, signal.SIGKILL)  # mission_worker を SIGKILL
+        thread.join(timeout=20.0)
+        assert not thread.is_alive(), "runner.run() が終わらない"
+
+        deadline = time.monotonic() + 8.0
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(cli_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            time.sleep(0.05)
+        assert not alive, "fake claude CLI の pgid が SIGKILL へ昇格して回収されず生存している"
+    finally:
+        # テストが落ちても SIGTERM 無視プロセスを孤児として残さない。
+        try:
+            os.killpg(cli_pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
