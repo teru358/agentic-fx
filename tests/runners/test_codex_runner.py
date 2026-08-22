@@ -134,7 +134,40 @@ def test_codex_argv_does_not_pass_max_turns_flag(tmp_path):
     assert "--max-turns" not in argv
 
 
-def test_codex_env_has_no_openai_api_key(tmp_path):
+_CODEX_ENV_ALLOWLIST = {
+    "PATH", "HOME", "TMPDIR", "CODEX_HOME", "PYTHONPATH", "PYTHONSAFEPATH",
+    # launcher.py (`os.execv` 経由の 2 段目) の CPython 起動時ロケール強制
+    # (PEP 538) がこの環境では `LC_CTYPE=C.UTF-8` を自動注入する。`_build_env`
+    # が渡す 6 キーには含まれないが、launcher ホップ自体の副作用でありシークレ
+    # ットではないため許容する (実測: `Popen(env={"PATH":...})` だけでも
+    # 同じ注入が再現する — `_build_env` の変異ではない)。
+    "LC_CTYPE",
+}
+
+
+def test_codex_child_env_excludes_parent_secrets_and_matches_allowlist(tmp_path, monkeypatch):
+    """§7.1-2: 「全 spawn の env に `*_API_KEY` が無い」を、鍵が実在する
+    親 env から fake CLI を実際に起動して観測する (`observed_env.json`)。
+    `_build_env()` の戻り値だけを見る検査は、pytest プロセスの env に
+    そもそも鍵が無いため「無いものが無い」を assert するだけで空振りする。
+    behavior="success" (既定) を使うため `_run_with_fake_env` は使わない —
+    それは `FAKE_CODEX_BEHAVIOR` キーを env に載せてしまい、この allowlist
+    照合を汚染する (m3 参照)。"""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-sentinel")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-sentinel")
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "td-sentinel")
+    runner, workdir, _ = _runner(tmp_path)
+    runner.run(_mission())
+    observed = json.loads((workdir / "observed_env.json").read_text())
+    assert not any("API_KEY" in k for k in observed)
+    assert set(observed) == _CODEX_ENV_ALLOWLIST
+
+
+def test_codex_env_has_no_openai_api_key(tmp_path, monkeypatch):
+    """親 (pytest) 側に鍵を置いてから検査する — 置かないと「無いものが無い」
+    を assert するだけで `_build_env` が親を継承する変異を捕まえられず
+    空振りする (検収 B1)。"""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-sentinel")
     runner, workdir, _ = _runner(tmp_path)
     env = runner._build_env(_mission())
     assert "OPENAI_API_KEY" not in env
