@@ -170,3 +170,64 @@ def test_build_mission_registry_provider_and_readonly_guard(tmp_path):
         "trade", conn, SETTINGS, _clock(), rag,
         activity=activity, provider=injected_provider, readonly=False)
     assert "get_ohlcv" in registry_rw.names()
+
+
+def test_build_mission_registry_improve_excludes_all_trade_tools(tmp_path):
+    """improve registry には取引 registry のツールが 1 つも無い (§3.4 表「無いもの」)。"""
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    staging_dir = tmp_path / "staging"
+    source_snapshot_dir = tmp_path / "source"
+    staging_dir.mkdir()
+    source_snapshot_dir.mkdir()
+
+    registry = build_mission_registry(
+        "improve", conn, SETTINGS, _clock(), rag, activity=activity,
+        staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        rpc_handlers={"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}})
+    names = set(registry.names())
+    forbidden = {"get_ohlcv", "get_indicators", "get_signals", "get_econ_calendar",
+                 "place_intent", "bless"}
+    assert names & forbidden == set()
+
+
+def test_build_mission_registry_improve_has_research_and_staging_and_rpc_tools(tmp_path):
+    """improve registry に research/staging/RPC tools が揃っている。"""
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    staging_dir = tmp_path / "staging"
+    source_snapshot_dir = tmp_path / "source"
+    staging_dir.mkdir()
+    source_snapshot_dir.mkdir()
+
+    registry = build_mission_registry(
+        "improve", conn, SETTINGS, _clock(), rag, activity=activity,
+        staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        rpc_handlers={"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}})
+    names = set(registry.names())
+    assert {"web_search", "fetch_article", "list_staging", "read_staging_file",
+            "write_staging_file", "read_plugin_source", "run_plugin_tests",
+            "run_backtest", "analyze_corr"} <= names
+
+
+def test_build_mission_registry_trade_unaffected_by_improve_branch(tmp_path):
+    """既存の trade 分岐が improve 分岐の追加で壊れていないことの回帰。"""
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+
+    registry = build_mission_registry(
+        "trade", conn, SETTINGS, _clock(), rag, activity=activity)
+    assert "get_ohlcv" in registry.names()
+    assert "web_search" not in registry.names()
