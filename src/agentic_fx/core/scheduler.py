@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx._safe_error import safe_error_text, safe_text
@@ -1007,3 +1009,52 @@ class Scheduler:
         if hit is not None:
             kind, price = hit
             self.executor.close_order(row, price, reason=kind)
+
+
+_WEEKDAY_NAMES = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4,
+                  "Sat": 5, "Sun": 6}
+_DAILY_AT_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+_WEEKLY_AT_RE = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+                            r"([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def latest_scheduled_occurrence(
+    now: datetime, *, cadence: str, at: str, display_timezone: str,
+) -> datetime:
+    """`now` 以下 (inclusive) で最新の scheduled occurrence を返す
+    (設計書 §3.1 第1文)。`at` は表示 TZ での局所時刻として解釈する。"""
+    tz = ZoneInfo(display_timezone)
+    now_local = now.astimezone(tz)
+    if cadence == "daily":
+        m = _DAILY_AT_RE.match(at)
+        if not m:
+            raise ValueError(f"invalid 'at' format for daily cadence: {at!r}")
+        hh, mm = int(m.group(1)), int(m.group(2))
+        candidate = now_local.replace(hour=hh, minute=mm, second=0,
+                                      microsecond=0)
+        if candidate > now_local:
+            candidate = candidate - timedelta(days=1)
+        return candidate.astimezone(now.tzinfo or tz)
+    if cadence == "weekly":
+        m = _WEEKLY_AT_RE.match(at)
+        if not m:
+            raise ValueError(f"invalid 'at' format for weekly cadence: {at!r}")
+        weekday = _WEEKDAY_NAMES[m.group(1)]
+        hh, mm = int(m.group(2)), int(m.group(3))
+        days_back = (now_local.weekday() - weekday) % 7
+        candidate = (now_local - timedelta(days=days_back)).replace(
+            hour=hh, minute=mm, second=0, microsecond=0)
+        if candidate > now_local:
+            candidate = candidate - timedelta(days=7)
+        return candidate.astimezone(now.tzinfo or tz)
+    raise ValueError(f"unknown cadence: {cadence!r}")
+
+
+def period_key_of(occurrence: datetime, *, cadence: str) -> str:
+    """weekly = ISO 週 'YYYY-Www'、daily = 'YYYY-MM-DD' (設計書 §3.1)。"""
+    if cadence == "daily":
+        return occurrence.date().isoformat()
+    if cadence == "weekly":
+        iso = occurrence.isocalendar()
+        return f"{iso.year}-W{iso.week:02d}"
+    raise ValueError(f"unknown cadence: {cadence!r}")
