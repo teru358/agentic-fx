@@ -610,12 +610,15 @@ def test_main_applies_landlock_bootstrap_before_running_improve_mission(
     calls: list[int] = []
     monkeypatch.setattr(
         mission_worker, "_bootstrap_improve_profile",
-        lambda: calls.append(len(_FakeLocalRunner.instances)))
+        lambda **kw: calls.append(len(_FakeLocalRunner.instances)))
 
     frames, _, registry_calls = _drive_main(
         monkeypatch, tmp_path,
         handshake_overrides={"worker_profile": "improve",
-                             "db_path": None, "plugins_dir": None})
+                             "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-proto-test",
+                             "staging_dir": str(tmp_path / "staging" / "m-proto-test"),
+                             "source_snapshot_dir": str(tmp_path / "source")})
 
     assert calls, ("main() の improve 分岐が _bootstrap_improve_profile を"
                    "呼んでいない — Landlock 無しで improve worker が走る")
@@ -1043,7 +1046,10 @@ def test_main_puts_reason_in_result_frame_for_improve_profile(
     frames, _, _ = _drive_main(
         monkeypatch, tmp_path,
         handshake_overrides={"worker_profile": "improve",
-                             "db_path": None, "plugins_dir": None},
+                             "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-proto-test",
+                             "staging_dir": str(tmp_path / "staging" / "m-proto-test"),
+                             "source_snapshot_dir": str(tmp_path / "source")},
         settings_mutator=settings_mutator,
         runner_cls=_FakeLocalRunnerWithReason)
     result_frame = frames[-1]
@@ -1086,9 +1092,51 @@ def test_result_frame_carries_null_reason_for_improve_profile(
     frames, _, _ = _drive_main(
         monkeypatch, tmp_path,
         handshake_overrides={"worker_profile": "improve",
-                             "db_path": None, "plugins_dir": None},
+                             "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-proto-test",
+                             "staging_dir": str(tmp_path / "staging" / "m-proto-test"),
+                             "source_snapshot_dir": str(tmp_path / "source")},
         settings_mutator=settings_mutator)
     result_frame = frames[-1]
     assert result_frame["type"] == "result"
     assert "reason" in result_frame
     assert result_frame["reason"] is None
+
+
+def test_main_fails_closed_when_improve_backend_is_claude_without_bin_key(
+        monkeypatch, tmp_path):
+    """(着手前検証 Blocking 8) improve backend=claude で settings_dict
+    に runner.claude.bin キーが無いと KeyError で fail closed する
+    (.get() チェーンに戻す変異 M9 の killer)。_bootstrap_improve_profile
+    は監視対象外なので直前で止める fake に差し替える。
+
+    **逸脱 (プラン記述からの調整、実装時確認)**: プラン本文のひな型は
+    `with pytest.raises(KeyError): _drive_main(...)` を使うが、`main()` は
+    `try/except Exception` で全例外を握りつぶし `ready: ok=False` または
+    `result: status=failed` フレームへ正規化する契約であり (`_drive_main`
+    はその `main()` を呼ぶだけで自身は例外を再送出しない) — 実測すると
+    `_drive_main` から KeyError は伝播しない。プラン本文が用意した代替
+    (「`_drive_main` 内部で例外を捕捉せず再送出する経路を使うか、`main()`
+    自体を直接呼ぶ形にテストを調整すること」) に従い、ここでは送出された
+    `ready: ok=False` フレームの `error` 文言に `KeyError` が含まれることで
+    fail closed を確認する。"""
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda **kw: None)
+
+    def to_claude(settings_dict):
+        settings_dict["runner"]["improve"]["backend"] = "claude"
+        # 意図的に settings_dict["runner"]["claude"] を追加しない —
+        # キー欠落を再現する (現状の config schema には runner.claude が
+        # 存在しないため、何もしなくても欠落状態になる)。
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve",
+                             "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-claude-missing-bin",
+                             "staging_dir": str(tmp_path / "staging" / "m-claude-missing-bin"),
+                             "source_snapshot_dir": str(tmp_path / "source")},
+        settings_mutator=to_claude)
+    frame = frames[-1]
+    assert frame["type"] == "ready" and frame["ok"] is False, frame
+    assert "KeyError" in frame["error"], frame

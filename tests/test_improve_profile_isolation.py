@@ -19,7 +19,11 @@ def test_bootstrap_improve_profile_raises_when_landlock_unavailable(monkeypatch,
     monkeypatch.setattr(mw_mod.landlock, "is_available", lambda: False)
     monkeypatch.chdir(tmp_path)
     with pytest.raises(RuntimeError, match="Landlock"):
-        mw_mod._bootstrap_improve_profile()
+        mw_mod._bootstrap_improve_profile(
+            backend="local", mission_id="m-001",
+            staging_dir=str(tmp_path / "m-001"),
+            source_snapshot_dir=str(tmp_path / "src"),
+            claude_bin=None, codex_bin=None)
 
 
 def test_bootstrap_does_not_call_restrict_to_when_unavailable(monkeypatch, tmp_path):
@@ -45,7 +49,11 @@ def test_bootstrap_does_not_call_restrict_to_when_unavailable(monkeypatch, tmp_p
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(RuntimeError, match="Landlock"):
-        mw_mod._bootstrap_improve_profile()
+        mw_mod._bootstrap_improve_profile(
+            backend="local", mission_id="m-001",
+            staging_dir=str(tmp_path / "m-001"),
+            source_snapshot_dir=str(tmp_path / "src"),
+            claude_bin=None, codex_bin=None)
 
     assert calls == [], (
         "is_available() が False なのに restrict_to を呼んでいる — "
@@ -73,8 +81,21 @@ def test_bootstrap_normalizes_landlock_unavailable_from_restrict_to(monkeypatch,
     monkeypatch.setattr(mw_mod.landlock, "restrict_to", boom)
     monkeypatch.chdir(tmp_path)
 
+    # (逸脱: プラン本文は「作成不要 — 到達前に例外になる経路」と書くが、
+    # 5-D 実装では staging_dir の dirfd 再検証と source_snapshot_dir の
+    # 実在確認が `restrict_to` 呼び出しより**前**にあるため、実際に到達
+    # させるにはこの 2 つのディレクトリが存在している必要がある。ここで
+    # は `restrict_to` の LandlockUnavailable → RuntimeError 正規化だけを
+    # 検査したいので、staging_dir は再検証を通す 0700 で作る。)
+    (tmp_path / "m-001").mkdir(mode=0o700)
+    (tmp_path / "src").mkdir()
+
     with pytest.raises(RuntimeError, match="Landlock restriction failed") as exc:
-        mw_mod._bootstrap_improve_profile()
+        mw_mod._bootstrap_improve_profile(
+            backend="local", mission_id="m-001",
+            staging_dir=str(tmp_path / "m-001"),
+            source_snapshot_dir=str(tmp_path / "src"),
+            claude_bin=None, codex_bin=None)
 
     assert isinstance(exc.value.__cause__, LandlockUnavailable)
 
@@ -83,8 +104,15 @@ _ISOLATION_PROBE_SCRIPT = textwrap.dedent("""
     import os, sqlite3, sys
     from pathlib import Path
     os.chdir(sys.argv[2])  # WorkerRunner が cwd= に渡す専用空 workdir を模す
+    mission_id = "iso-probe"
+    staging = Path(sys.argv[2]) / "staging" / mission_id
+    staging.mkdir(parents=True, mode=0o700)
+    source_snapshot = Path(sys.argv[2]) / "source"
+    source_snapshot.mkdir(mode=0o500)
     from agentic_fx.mission_worker import _bootstrap_improve_profile
-    _bootstrap_improve_profile()
+    _bootstrap_improve_profile(
+        backend="local", mission_id=mission_id, staging_dir=str(staging),
+        source_snapshot_dir=str(source_snapshot), claude_bin=None, codex_bin=None)
 
     data_dir = Path(sys.argv[1])
     workdir = Path(sys.argv[2])
@@ -429,6 +457,3 @@ def test_guard_rejects_allowlist_paths_under_the_data_dir():
             [inside], guarded_data_dir=mw_mod._guarded_data_dir())
     _assert_allowlist_excludes_data_dir(
         [Path("/usr/lib")], guarded_data_dir=mw_mod._guarded_data_dir())
-
-    # 対称の確認: 無関係なパスは通る (上の raise が恒真でないこと)
-    mw_mod._assert_allowlist_excludes_data_dir([Path("/usr/lib")])

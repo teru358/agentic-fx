@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from agentic_fx.core import landlock
+from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
 from agentic_fx.core.mission_protocol import (
     ProtocolError, SeqTracker, encode_frame, read_frame,
 )
@@ -165,9 +166,15 @@ def _bootstrap_improve_profile(
     execute = _exec_closure_for(
         backend, claude_bin=Path(claude_bin) if claude_bin else None,
         codex_bin=Path(codex_bin) if codex_bin else None, venv_root=venv_root)
+    # `_exec_closure_for` の docstring どおり base_prefix は呼び出し側
+    # (このモジュール) が合成する — venv の `sys.executable` が指す実体
+    # (base_prefix 配下の実 python) を exec できないと venv 内 python の
+    # 自己 exec が PermissionError になる (5-C 申し送り、Task 6
+    # gate_pytest_worker.py の同型パターンと同じ)。
+    if base_prefix != venv_root:
+        execute.append(base_prefix)
 
-    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir as _assert_allowlist_excludes_data_dir_impl
-    _assert_allowlist_excludes_data_dir_impl(
+    _assert_allowlist_excludes_data_dir(
         read_only + [workdir, staging_path] + execute, guarded_data_dir=_guarded_data_dir())
     try:
         landlock.restrict_to(
@@ -218,49 +225,6 @@ def _exec_closure_for(backend: str, *, claude_bin: Path | None,
     if backend == "codex" and codex_bin is not None:
         closure.append(codex_bin.resolve().parent)
     return closure
-
-
-def _assert_allowlist_excludes_data_dir(paths: list[Path]) -> None:
-    """allowlist のどれ 1 つも `data/` の祖先 (または `data/` 自身) でない
-    ことを確認し、違反したら **fail closed** する (プラン8 Task 18)。
-
-    **なぜ必要か (段0 変異スイープで実測した 2 つの生存変異)**:
-
-    - `WorkerRunner` の `Popen(..., cwd=workdir)` から `cwd=` を落とすと、子の
-      cwd は親の cwd (= リポジトリ root) になり、`Path.cwd()` が
-      **read-write** allowlist に入って `data/` が書込可能になる。
-      フルスイート 1683 件は全 green のままだった
-    - `code_root` を `parents[1]` (= `src/`) から `parents[2]` (= リポジトリ
-      root) に広げると `data/` が読取可能になる。これも全 green のままだった
-
-    どちらも「allowlist の計算を間違えた」という同じ形の事故なので、**計算
-    結果そのものを不変条件として検査する**のがテストより確実な防御になる。
-    テスト側 (`test_allowlist_never_covers_the_data_dir`) はこの検査自体が
-    消されないことを pin する。
-
-    **これは best-effort の第 2 層であり、第 1 層の代わりにはならない**
-    (レビュー 2 周目 `/code-review` の指摘): 本番の data root は
-    **サービスプロセスの cwd** (`entry.py` の `root = Path.cwd()`) であって
-    このモジュールの配置ではない。`afx` は console script なのでリポジトリ
-    外から起動する運用も正当で、そのとき `_guarded_data_dir()` は実在しない
-    `<repo>/data` を指し、**この検査は素通りする**。非 editable install
-    (wheel 配置) でも `parents[2]` は site-packages の親になる。
-    したがって「子の cwd が専用 workdir であること」は**親側で保証する**のが
-    本筋で (`WorkerRunner.run` の `Popen(cwd=...)` と
-    `test_child_cwd_is_a_dedicated_dir_outside_the_repository`)、この検査は
-    その配線が壊れたときに**運が良ければ捕まえる**最後の網に留まる。
-    """
-    data_dir = _guarded_data_dir()
-    for p in paths:
-        resolved = Path(p).resolve()
-        # 祖先・一致に加えて**子孫も弾く** (`data/` 配下を workdir にする
-        # 経路。レビュー 2 周目 `/code-review` の指摘)。
-        if (resolved == data_dir or resolved in data_dir.parents
-                or data_dir in resolved.parents):
-            raise RuntimeError(
-                f"improve worker allowlist would expose the history data "
-                f"directory: {resolved} covers or lives under {data_dir} — "
-                "refusing to start (fail closed, 設計書 §4.6)")
 
 
 class _RagRpcProxy:
