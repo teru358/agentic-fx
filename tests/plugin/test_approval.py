@@ -14,6 +14,7 @@ from __future__ import annotations
 import signal
 import sqlite3
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ import pytest
 
 from agentic_fx.backtest.holdout import holdout_boundary
 from agentic_fx.config import load_settings
+from agentic_fx import entry
 from agentic_fx.entry import main
 from agentic_fx.plugin import approval
 from agentic_fx.plugin.gate_pytest import GateResult
