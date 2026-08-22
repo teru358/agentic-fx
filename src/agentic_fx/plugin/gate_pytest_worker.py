@@ -26,7 +26,7 @@ def main() -> None:
     stdlib_root = Path(sysconfig.get_paths()["stdlib"]).resolve()
     base_prefix = Path(sys.base_prefix).resolve()
 
-    read_only = [code_root, venv_root, stdlib_root]
+    read_only = [code_root, venv_root, stdlib_root, plugin_dir]
     if base_prefix != venv_root:
         read_only.append(base_prefix)
     for p in (Path("/usr/lib"), Path("/usr/share/zoneinfo"), Path("/etc"), Path("/tmp")):
@@ -45,7 +45,7 @@ def main() -> None:
                 landlock.interpreter_files_for([python_at_base]))
 
     landlock.restrict_to(read_only_paths=read_only,
-                         read_write_paths=[workdir, plugin_dir, Path("/dev")],
+                         read_write_paths=[workdir, Path("/dev")],
                          execute_file_paths=execute_file_paths)
 
     import pytest

@@ -54,6 +54,7 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
         env = {"PATH": "/usr/bin:/bin",
               "PYTHONPYCACHEPREFIX": str(pyc_dir)}
         proc = subprocess.Popen(argv, cwd=str(workdir), env=env,
+                                stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, start_new_session=True)
         try:
