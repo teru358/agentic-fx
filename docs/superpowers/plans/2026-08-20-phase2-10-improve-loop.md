@@ -589,6 +589,9 @@ def finish_improve_mission(
     run_result: Literal["approval", "report"] | None,
     backlog_transition: dict | None,         # {"backlog_id": int, "status": str, "last_result": str} | None
     now: datetime,
+    approval_id: int | None = None,
+    report_path: str | None = None,
+    report_state: str = "none",
     output: dict | None = None,
     transcript: list | None = None,
     commit: bool = False,
@@ -597,9 +600,12 @@ def finish_improve_mission(
     Tx-2 の末尾、または補償 tx から呼ばれる。missions.finish の CAS
     (WHERE id=? AND status='running') が rowcount=0 なら例外 (呼び出し元がロールバック)。
     `now` は必須 kw (内部で missions.finish/improve_runs.finish/backlog.set_status
-    に時刻を渡すため)。`output`/`transcript` は missions.finish の必須引数を満たす
+    に時刻を渡すため)。`approval_id`/`report_path`/`report_state` は
+    `improve_runs.finish` へそのまま転送する独立 kw であり `backlog_transition`
+    からは拾わない (B9)。`output`/`transcript` は missions.finish の必須引数を満たす
     ための任意 kw (R-i6)。"""
     ...
+    # precheck 2026-08-22: T8-B1 T8-B9 (R11: Interfaces へ記号追加)
 
 # --- commit=False 変種の列挙 (§8.1-25) ---
 # missions.start(conn, loop, runner, model, *, now, commit=False) -> int
@@ -8573,7 +8579,8 @@ EOF
 - `src/agentic_fx/loops/summary.py` (無ければ新設) — `IMPROVE_OUTPUT_SCHEMA`
 - `config/settings.yaml.example` — Task 1 が新設した `improve.*`/`schedule.improve_at` キーの同期 (Task 8 が使う値の反映漏れが無いことの確認のみ。キー自体は Task 1 の責務)
 
-**Test:** 上記 Create の 6 ファイル + `tests/store/test_backlog.py`・`tests/store/test_improve_runs.py`・`tests/store/test_missions.py`・`tests/store/test_missions_cas.py`・`tests/store/test_approvals.py`・`tests/store/test_backtest_runs.py`・`tests/store/test_db.py` への追記。
+<!-- precheck 2026-08-22: T8-B5 -->
+**Test:** 上記 Create の 6 ファイル + `tests/store/test_backlog.py`・`tests/store/test_improve_runs.py`・`tests/store/test_missions.py`・`tests/store/test_missions_cas.py`・`tests/store/test_approvals.py`・`tests/store/test_backtest_runs.py`・`tests/store/test_db.py`・`tests/tools/test_plugin_loader.py` (B5 — `expire_due` 既定変更に伴う既存テスト改訂 1 本、8-B Step 5b) への追記。
 
 ### Interfaces
 
@@ -8639,7 +8646,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_improvement_runs_mission_id
 """
 ```
 
-これらは `_SCHEMA` 文字列の末尾 (既存 `ix_ohlcv_cache_bar_time` インデックスの後) に連結する。`TABLE_NAMES` に `"improve_waves"`, `"improve_wave_slots"`, `"plugin_switch_journal"` を追加する。
+<!-- precheck 2026-08-22: T8-B6 -->
+`_IMPROVE_WAVES_DDL` / `_IMPROVE_WAVE_SLOTS_DDL` / `_PLUGIN_SWITCH_JOURNAL_DDL` / `_PLUGIN_SWITCH_JOURNAL_OPEN_UNIQUE_DDL` の **4 つだけ**を `_SCHEMA` 文字列の末尾 (既存 `ix_ohlcv_cache_bar_time` インデックスの後) に連結する。**`_IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL` は `_SCHEMA` に連結しない** — `improvement_runs` は `_SCHEMA` 内の `_IMPROVEMENT_RUNS_V2_DDL` (`mission_id` 列を持たない) で作られるため、同じ `executescript(_SCHEMA)` 内で `mission_id` に index を張ると空 DB でも `no such column: mission_id` になる。この DDL は下記 `_ensure_column` ブロックの `mission_id` 列追加**直後**の `conn.execute(...)` 一箇所だけで実行する (二重定義しない)。`TABLE_NAMES` に `"improve_waves"`, `"improve_wave_slots"`, `"plugin_switch_journal"` を追加する。
 
 #### `_ensure_column` 追加 (`init_db` 内、`_migrate_trade_intents_observability(conn)` の後に追記)
 
@@ -8675,16 +8683,30 @@ def finish_improve_mission(
     mission_status: Literal["completed", "failed", "timeout", "max_turns"],
     run_result: Literal["approval", "report"] | None,
     backlog_transition: dict | None,         # {"backlog_id": int, "status": str, "last_result": str} | None
+    now: datetime,
+    approval_id: int | None = None,
+    report_path: str | None = None,
+    report_state: str = "none",
+    output: dict | None = None,
+    transcript: list | None = None,
     commit: bool = False,
 ) -> None:
     """slot(あれば) + mission + run + backlog を単一 tx で終端する唯一のヘルパ。
     Tx-2 の末尾、または補償 tx から呼ばれる。missions.finish の CAS
-    (WHERE id=? AND status='running') が rowcount=0 なら例外 (呼び出し元がロールバック)。"""
+    (WHERE id=? AND status='running') が rowcount=0 なら例外 (呼び出し元がロールバック)。
+    `now` は必須 kw (内部で missions.finish/improve_runs.finish/backlog.set_status
+    に時刻を渡すため)。`approval_id`/`report_path`/`report_state` は
+    `improve_runs.finish` へそのまま転送する独立 kw (`backlog_transition` から
+    拾わない — B9)。`output`/`transcript` は missions.finish の必須引数を満たす
+    ための任意 kw (申し送り④)。"""
 ```
-
-呼び出し元 (Task 10) は `output`/`transcript` を別途 `missions.finish` 相当の引数として渡す必要があるため、実際のシグネチャは骨格の型を保ったまま `output: dict | None = None, transcript: list | None = None` を追加する (骨格には無いが `missions.finish` の必須引数を満たすために必要 — 申し送り④)。
+<!-- precheck 2026-08-22: T8-B1 T8-B9 -->
+呼び出し元 (Task 10) は `output`/`transcript` を別途 `missions.finish` 相当の引数として渡す必要があるため、実際のシグネチャは骨格の型を保ったまま `output: dict | None = None, transcript: list | None = None` を追加する (骨格には無いが `missions.finish` の必須引数を満たすために必要 — 申し送り④)。`now`/`approval_id`/`report_path`/`report_state` も同様に骨格 (L582-602) の必須引数を満たすための独立 kw として追加する。
 
 #### `commit=False` 変種の一覧 (§8.1-25、裁定 7 を反映)
+
+<!-- precheck 2026-08-22: T8-m9 (型6 対応) -->
+**疑似コード (列挙) — 実コードではない。実装者はこの形のまま転記しないこと。**
 
 ```python
 missions.start(conn, loop, runner, model, *, now, trigger=None, commit=True) -> int
@@ -8945,6 +8967,10 @@ def list_open(conn: sqlite3.Connection) -> list[dict]:
 def set_status(conn: sqlite3.Connection, backlog_id: int, status: str,
                now: datetime, *, last_result: str | None = None,
                commit: bool = True) -> None:
+    """m1: `last_result` は常に上書きする (既定 `None`)。`last_result` を
+    渡さない呼び出しは既存の `last_result` を NULL でクリアする —
+    `select_for_mission` (下記) は `last_result` に触れないため非対称
+    (意図的: 「試行開始」は結果を持たないが「終端」は必ず結果を書く)。"""
     conn.execute(
         "UPDATE improvement_backlog SET status=?, last_result=?, updated_at=? "
         "WHERE id=?", (status, last_result, now.isoformat(), backlog_id))
@@ -9009,7 +9035,10 @@ def apply_approval_outcome(
 uv run pytest tests/store/test_backlog.py -v
 ```
 
-既存 `test_backlog_and_run` (`improve_runs.start(c, bid, NOW)`) は Task 8 の `improve_runs.start` シグネチャ変更 (8-E 節) で `mission_id` がキーワード専用・既定 `None` になるため、無変更のまま動く。8-E 節の変更が先に入っていない場合は一時的に `TypeError` になりうる — **8-A〜8-J は同一ファイル (`store/db.py` 以外) を跨ぐ変更が少ないため、実装順序は本節の記載順で問題ないが、`store/improve_runs.py` (8-E) は `store/backlog.py` (8-A) と独立に進めてよい (worktree 並列可)**。
+既存 `test_backlog_and_run` (`improve_runs.start(c, bid, NOW)`) は Task 8 の `improve_runs.start` シグネチャ変更 (8-E 節) で `mission_id` がキーワード専用・既定 `None` になるため、無変更のまま動く。8-E 節の変更が先に入っていない場合は一時的に `TypeError` になりうる。
+
+<!-- precheck 2026-08-22: T8-B10 -->
+**実装順序 (訂正)**: **8-C (`store/db.py` — 新規テーブル 3 種の DDL 連結・`TABLE_NAMES` 更新・`_ensure_column` 7 本・§5.5 migration・`tests/store/test_db.py` 改訂) を全ての節より先に実施する。** 8-A (`attempts`/`last_result` 列)・8-B (`expire_due`/`apply_decision`)・8-D (`backtest_runs` 列)・8-F (`improve_waves`/`improve_wave_slots` テーブル)・8-H (`plugin_switch_journal` テーブル) はいずれも 8-C が足す列・テーブルに依存するため、8-C 抜きでは Step 4 (`uv run pytest`) が `sqlite3.OperationalError: no such column` / `no such table` で全 red になる。**旧記述「8-A〜8-J は同一ファイルを跨ぐ変更が少ないため実装順序は本節の記載順で問題ない」は誤りであり撤回する。** 正しい実施順序: **8-C → 8-A → 8-B → 8-D → 8-E → 8-F → 8-G → 8-H → 8-I → 8-J**。`store/improve_runs.py` (8-E) は `store/backlog.py` (8-A) と独立に進めてよい (8-C の後であれば worktree 並列可)。
 
 - [ ] **Step 5: 変異テスト**
 
@@ -9055,6 +9084,13 @@ grep -rn "approvals\.decide(" src/agentic_fx tests
 （着手前検証時点で `commands.py:62,69`・`tests/store/test_approvals.py`・`tests/tools/test_plugin_loader.py` がヒット済み。**`apply_decision` は `kind='plugin'` の承認決定専用として実装し、`decide` は他 kind (`tech_plugin`/`news_source`/`live_trade`) にも使われ続ける** ため、Task 8 では両者を共存させる。）
 
 - [ ] **Step 1: 失敗するテストを書く (`tests/store/test_approvals.py` に追記)**
+
+<!-- precheck 2026-08-22: T8-m2 -->
+現物 `tests/store/test_approvals.py:1-7` の import は `from agentic_fx.store
+import approvals` のみで `backlog` を import していない (m2)。下記テストは
+`backlog.add`/`backlog.select_for_mission` を使うため、ファイル冒頭の import
+に `from agentic_fx.store import approvals, backlog` (または追加行
+`from agentic_fx.store import backlog`) を足す。
 
 ```python
 def test_apply_decision_approved_cas_and_backlog_transition(tmp_path):
@@ -9145,7 +9181,7 @@ def test_expire_due_commit_false_expires_non_plugin_kind_individually(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
     aid1 = approvals.create(c, "tech_plugin", {"x": 1}, NOW, expires_at=NOW)
     aid2 = approvals.create(c, "news_source", {"x": 2}, NOW, expires_at=NOW)
-    later = NOW.replace(hour=NOW.hour + 1) if NOW.hour < 23 else NOW
+    later = NOW + timedelta(hours=1)  # m4: fragile hour-wrap pattern を timedelta に統一
     n = approvals.expire_due(c, later, commit=False)
     c.commit()
     assert n == 2
@@ -9161,12 +9197,41 @@ def test_list_due_for_expiry_enumerates_without_state_change(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
     approvals.create(c, "plugin", {"name": "x"}, NOW, expires_at=NOW)
     approvals.create(c, "tech_plugin", {"x": 1}, NOW, expires_at=NOW)
-    later = NOW.replace(hour=NOW.hour + 1) if NOW.hour < 23 else NOW
+    later = NOW + timedelta(hours=1)  # m4: fragile hour-wrap pattern を timedelta に統一
     rows = approvals.list_due_for_expiry(c, now=later, kind="plugin")
     assert [r["kind"] for r in rows] == ["plugin"]
     statuses = {r["status"] for r in c.execute(
         "SELECT status FROM approval_requests").fetchall()}
     assert statuses == {"pending"}   # 状態は一切変わらない
+
+
+# precheck 2026-08-22: T8-B11 (R9)
+def test_apply_decision_approve_on_expired_pending_is_rejected(tmp_path):
+    """R9: 既存 decide の expires_at 述語を維持する (fail closed)。期限切れ
+    pending への approve/reject は AlreadyDecidedError で拒否し、副作用ゼロ
+    (status は pending のまま — apply_decision 自身は expired 化しない)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    aid = approvals.create(c, "plugin", {"name": "x"}, NOW, expires_at=NOW)
+    later = NOW + timedelta(hours=1)  # m4: fragile hour-wrap pattern を timedelta に統一
+    with pytest.raises(AlreadyDecidedError):
+        approvals.apply_decision(c, aid, "approved", decided_by="shell", now=later)
+    row = c.execute("SELECT status FROM approval_requests WHERE id=?",
+                    (aid,)).fetchone()
+    assert row["status"] == "pending"
+
+
+def test_apply_decision_status_expired_succeeds_on_already_expired_pending(tmp_path):
+    """`status='expired'` はクローズ系の遷移であり expires_at 述語の対象外
+    (B5): 期限切れ pending でも apply_decision(status='expired') は成功する
+    — Task 11 process_expired_approvals がこの経路で「本物の expired 行」を
+    作る唯一の手段になる。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    aid = approvals.create(c, "plugin", {"name": "x"}, NOW, expires_at=NOW)
+    later = NOW + timedelta(hours=1)  # m4: fragile hour-wrap pattern を timedelta に統一
+    approvals.apply_decision(c, aid, "expired", decided_by="system", now=later)
+    row = c.execute("SELECT status FROM approval_requests WHERE id=?",
+                    (aid,)).fetchone()
+    assert row["status"] == "expired"
 
 
 def test_expire_due_skips_plugin_kind_pending_rows(tmp_path):
@@ -9178,7 +9243,7 @@ def test_expire_due_skips_plugin_kind_pending_rows(tmp_path):
     次回再試行のためスキップされる) の責務。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     aid = approvals.create(c, "plugin", {"name": "x"}, NOW, expires_at=NOW)
-    later = NOW.replace(hour=NOW.hour + 1) if NOW.hour < 23 else NOW
+    later = NOW + timedelta(hours=1)  # m4: fragile hour-wrap pattern を timedelta に統一
     n = approvals.expire_due(c, later, commit=False)
     c.commit()
     assert n == 0
@@ -9255,28 +9320,53 @@ def apply_decision(
         commit: bool = True) -> None:
     """§4.3 単一 API: approval 行の CAS + backlog 遷移を 1 tx で行う。
 
+    m10: 許容 status は `approved|rejected|invalidated|expired` の 4 値。
+    既存 `decide` (`approvals.py:26`) は `approved|rejected` の 2 値のみ。
+    Task 8〜11 の間、同じ `approval_requests` テーブルに対して許容集合の
+    異なる 2 つの決定 API (`decide`/`apply_decision`) が共存する (裁定1・
+    申し送り③ — `decide` の削除は Task 11 の受入条件)。
+
     裁定1: CAS (`WHERE id=? AND status='pending'`) が rowcount=0 なら
     **副作用ゼロ**で `AlreadyDecidedError`。期限切れのフォールバック確定
     (旧 `decide` の 2 段 commit 挙動) はここでは行わない — 呼び出し元が
     決定 tx に入る前に `expire_due(commit=True)` を単独 tx で呼ぶ運用
     (骨格 裁定1 逐語)。
+    CAS には既存 `decide` (`approvals.py:34`) と同じ `expires_at` 述語
+    (`expires_at IS NULL OR expires_at >= ?`) を **`status in ("approved",
+    "rejected")` のときだけ** 追加する (R9 — fail closed の維持: 期限切れ
+    pending への approve/reject を拒否する)。`status in ("invalidated",
+    "expired")` はクローズ系の遷移であり期限切れ行そのものを確定させる
+    ための呼び出しなので、この述語を適用しない (適用すると
+    `apply_decision(status='expired')` で「期限切れ pending を expired に
+    する」こと自体ができなくなってしまう — Task 11 の
+    `process_expired_approvals` が使う経路)。`expire_due` の既定
+    `exclude_kinds=("plugin",)` により plugin kind は `expire_due` 側で
+    expired 化されないため、この述語が唯一の「期限切れ pending への
+    approve/reject を通さない」防御になる。
     """
     if status not in ("approved", "rejected", "invalidated", "expired"):
         raise ValueError(f"unsupported status for apply_decision: {status!r}")
     now_iso = now.isoformat()
-    cur = conn.execute(
-        "UPDATE approval_requests SET status=?, decided_by=?, decided_at=?, "
-        "reason=? WHERE id=? AND status='pending'",
-        (status, decided_by, now_iso, reason, approval_id))
+    if status in ("approved", "rejected"):
+        cur = conn.execute(
+            "UPDATE approval_requests SET status=?, decided_by=?, decided_at=?, "
+            "reason=? WHERE id=? AND status='pending' "
+            "AND (expires_at IS NULL OR expires_at >= ?)",
+            (status, decided_by, now_iso, reason, approval_id, now_iso))
+    else:
+        cur = conn.execute(
+            "UPDATE approval_requests SET status=?, decided_by=?, decided_at=?, "
+            "reason=? WHERE id=? AND status='pending'",
+            (status, decided_by, now_iso, reason, approval_id))
     if cur.rowcount == 0:
-        if commit:
-            conn.commit()
+        # m3: 副作用ゼロを謳うため commit せずに raise する (呼び出し元の
+        # 同一 tx で先に書いた行を巻き込んで確定させない)。
         raise AlreadyDecidedError(f"approval {approval_id} is not pending")
     row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
                        (approval_id,)).fetchone()
     payload = json.loads(row["payload_json"]) if row is not None else {}
     backlog_id = payload.get("backlog_id")
-    outcome = status if status in ("approved", "rejected") else status
+    outcome = status  # m13: 旧 `status if status in (...) else status` は恒真式だったため簡約
     from agentic_fx.store import backlog as backlog_mod
     backlog_mod.apply_approval_outcome(
         conn, backlog_id=backlog_id, outcome=outcome,
@@ -9307,11 +9397,64 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M5 | `expire_due(commit=False)` の一括版に戻す (呼び出し元 tx を分断する) — pin は「呼び出し元が `c.commit()` するまで行が反映されないこと」 | `test_expire_due_commit_false_expires_non_plugin_kind_individually` |
 | M6 | `if row["kind"] in exclude_kinds: continue` の分岐を削除する (plugin kind も直接 expired 化してしまう — R-i8 違反) | `test_expire_due_skips_plugin_kind_pending_rows` |
 | M7 | `list_due_for_expiry` が SELECT の代わりに expired 化 UPDATE を発行する (列挙のみ契約の破壊) | `test_list_due_for_expiry_enumerates_without_state_change` |
+| M8 | `apply_decision` の approved/rejected 分岐から `expires_at` 述語を落とす | `test_apply_decision_approve_on_expired_pending_is_rejected` |
+| M9 | `status in ("approved", "rejected")` の分岐条件を反転させる (expired/invalidated にまで述語を適用してしまう) | `test_apply_decision_status_expired_succeeds_on_already_expired_pending` |
+
+<!-- precheck 2026-08-22: T8-B5 (R8) -->
+- [ ] **Step 5b: 既存テスト改訂 (`tests/tools/test_plugin_loader.py:477`) — R8**
+
+`expire_due` の既定を `exclude_kinds=("plugin",)` にしたため、現物
+`tests/tools/test_plugin_loader.py:477-500`
+(`test_approved_plugins_expired_after_approve_does_not_revoke`) の
+`n = approvals.expire_due(conn, later + timedelta(minutes=16))` /
+`assert n == 1` は `kind='plugin'` の pending を expired 化しなくなり
+`n == 0` で fail する。**検査目的 (D4 が必須とする「expired は決定として
+数えない」肯定検査、かつ「この経路だけが本物の expired 行を作れる」)は
+不変のまま維持する** — `expire_due` の代わりに `apply_decision(status=
+'expired')` (8-B で新設、期限切れ pending でも成功する — B11 の分岐) で
+同じ 2 件目の行を expired 化する形に書き換える:
+
+```python
+def test_approved_plugins_expired_after_approve_does_not_revoke(tmp_path):
+    """D4 が必須とする肯定検査: expired は決定として数えない。承認後に
+    **別の** 承認要求 (同じ name/content_hash) が発行され、それが期限切れ
+    で expired になっても、先の承認は取り消され *ない* こと。
+    `decide()` は expired を書けず (approved/rejected のみ)、
+    `expire_due()` は既定で kind='plugin' の pending に触れないため (R8)、
+    `apply_decision(status='expired')` を直接呼ぶ経路だけが「本物の
+    expired 行」を作れる (raw SQL に頼らない)。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    d = _write_plugin(plugins_dir, "expire_noop_ind")
+    conn = _conn(tmp_path)
+    from agentic_fx.plugin.loader import content_hash as ch
+    h = ch(d)
+    _decide(conn, "expire_noop_ind", h, status="approved", now=NOW)
+    later = NOW + timedelta(minutes=1)
+    aid = approvals.create(conn, "plugin",
+                           {"name": "expire_noop_ind", "content_hash": h}, later,
+                           expires_at=later + timedelta(minutes=15))
+    approvals.apply_decision(conn, aid, "expired", decided_by="system",
+                             now=later + timedelta(minutes=16))
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (aid,)).fetchone()
+    assert row["status"] == "expired"  # 前提: 2 件目の要求が確かに expired になった
+
+    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+
+    assert len(metas) == 1 and metas[0].name == "expire_noop_ind"
+```
+
+**このファイルは Task 5 (B-5) の受入条件 L6022「既存 `test_plugin_loader.py`
+も無変更で green であることを確認」と矛盾する可能性がある — Task 5
+修正者がその受入条件に「当該テストを除く」の但し書きを追記する
+(裁定 R8。担当外のため本節では文言修正しない — 束 C 申し送りに記載)。**
 
 - [ ] **Step 6: コミット**
 
 ```bash
-git add src/agentic_fx/store/approvals.py tests/store/test_approvals.py
+git add src/agentic_fx/store/approvals.py tests/store/test_approvals.py \
+       tests/tools/test_plugin_loader.py
 git commit -m "$(cat <<'EOF'
 feat(improve): approvals.apply_decision 単一 API + commit=False 変種 (Task 8-B, 裁定1)
 
@@ -9325,6 +9468,17 @@ EOF
 ### 8-C: 既存 approval 行との互換 migration (§5.5、§8.1-38)
 
 **設計根拠**: §5.5 全文 (逐語)。`init_db` の migration 段で一度だけ適用し、以後は該当行が無いので no-op (冪等)。
+
+<!-- precheck 2026-08-22: T8-B12 (R10) -->
+**既知の過渡的退行 (受容、R10)**: `_migrate_legacy_plugin_approval_payloads`
+はプラン10 導入前の legacy 行だけでなく、**Task 8〜Task 11 の間** (改善
+ループがまだ無効で `candidate_origin`/`candidate_path`/`artifact_hash` を
+payload に入れる Task 11 の `submit_candidate` が存在しない期間) に人間が
+手動で `afx plugin submit` して作った pending 承認も、同じ理由 (3
+フィールド欠損) で再起動のたびに `invalidated` にしてしまう。**Task 12
+の有効化ゲートまで改善ループの自動生成 pending は発生しないため実害は
+無いと判断し、この退行を受容する** (指揮者裁定 R10)。migration は対象行
+ごとに `_log.warning(...)` を出す (下記実装)。
 
 - [ ] **Step 1: 失敗するテストを書く (`tests/store/test_db_migration_approval_legacy.py`)**
 
@@ -9527,6 +9681,16 @@ def _migrate_legacy_plugin_approval_payloads(conn: sqlite3.Connection) -> None:
             "decided_by='system:migration', decided_at=?, "
             "reason='legacy_payload_requires_resubmit' WHERE id=?",
             (now_iso, row["id"]))
+        # R10 (裁定): 対象行ごとに WARNING を出す — この migration は
+        # プラン10 導入前の legacy 行だけでなく、Task 8〜11 の間 (改善
+        # ループがまだ無効で人間が手動 `afx plugin submit` した) の
+        # pending も同じ理由 (3 フィールド欠損) で invalidated にしてしまう
+        # 既知の過渡的退行 (受容 — Task 12 の有効化ゲートまで改善ループの
+        # 自動生成 pending は存在しないため実害なし)。
+        _log.warning(
+            "plugin approval id=%s invalidated by legacy-payload migration "
+            "(missing %s)", row["id"],
+            [k for k in _LEGACY_PLUGIN_APPROVAL_REQUIRED_KEYS if k not in payload])
 ```
 
 `json` の import は `db.py` 先頭に追加する。`_now_utc_isoformat` は `datetime.now(timezone.utc).isoformat()` を返す最小ヘルパとして同じく `db.py` に追加する (`db.py` は他の関数でも `now` を呼び出し元から受け取る慣例だが、`init_db(conn)` は `now` 引数を持たない既存シグネチャのため、migration 内で時刻を自前生成する — 申し送り⑥)。`init_db` 本体の末尾:
@@ -9561,11 +9725,49 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 ```
 
+<!-- precheck 2026-08-22: T8-B10 -->
+- [ ] **Step 3b: `_SCHEMA` への新規テーブル DDL 連結 + `TABLE_NAMES` 更新 (`src/agentic_fx/store/db.py`)**
+
+`_IMPROVE_WAVES_DDL` / `_IMPROVE_WAVE_SLOTS_DDL` / `_PLUGIN_SWITCH_JOURNAL_DDL` / `_PLUGIN_SWITCH_JOURNAL_OPEN_UNIQUE_DDL` (本節冒頭 Interfaces の DDL ブロックを参照 — L8595 付近) を `_SCHEMA` 文字列の末尾 (既存 `ix_ohlcv_cache_bar_time` インデックスの後) に連結する。**`_IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL` は `_SCHEMA` に含めない** (Step 3 の `init_db` 内 `conn.execute(_IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL)` が唯一の実行箇所 — B6)。`TABLE_NAMES` の定義に `"improve_waves"`, `"improve_wave_slots"`, `"plugin_switch_journal"` を追加する:
+
+```python
+TABLE_NAMES = frozenset({
+    # ...既存の全項目はそのまま維持...
+    "improve_waves", "improve_wave_slots", "plugin_switch_journal",
+})
+```
+
+- [ ] **Step 3c: 既存テスト改訂 (`tests/store/test_db.py`) — B4**
+
+現物 `tests/store/test_db.py:10-26` の `EXPECTED` は 17 テーブルを列挙し、`test_init_creates_all_17_tables` がそれを pin している。3 テーブル追加後は 20 テーブルになるため、この既存テストを次のとおり改訂する (検査目的は不変 — `init_db` が作る全テーブル名の完全一致):
+
+```python
+EXPECTED = {
+    "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
+    "reflections", "account_snapshots", "improvement_backlog",
+    "improvement_runs", "econ_events", "approval_requests", "news_sources",
+    "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
+    "alert_state", "improve_waves", "improve_wave_slots", "plugin_switch_journal",
+}
+
+
+def test_init_creates_all_20_tables(tmp_path):
+    conn = connect(tmp_path / "agentic.db")
+    init_db(conn)
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%'").fetchall()
+    assert {r["name"] for r in rows} == EXPECTED
+    assert TABLE_NAMES == frozenset(EXPECTED)
+```
+
+`test_init_creates_all_17_tables` という関数名は `test_init_creates_all_20_tables` に改名する (他の参照は無い — grep 済み)。
+
 - [ ] **Step 4: 成功を確認**
 
 ```bash
 uv run pytest tests/store/test_db_migration_approval_legacy.py -v
-uv run pytest tests/store/test_db.py -v   # 既存 migration が壊れていないこと
+uv run pytest tests/store/test_db.py -v   # 既存 migration + 20 テーブル pin が壊れていないこと
 ```
 
 - [ ] **Step 5: 変異テスト**
@@ -9585,9 +9787,10 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 - [ ] **Step 6: コミット**
 
 ```bash
-git add src/agentic_fx/store/db.py tests/store/test_db_migration_approval_legacy.py
+git add src/agentic_fx/store/db.py tests/store/test_db_migration_approval_legacy.py \
+       tests/store/test_db.py
 git commit -m "$(cat <<'EOF'
-feat(improve): 既存 approval 行の互換 migration §5.5 (Task 8-C, §8.1-38)
+feat(improve): 既存 approval 行の互換 migration §5.5 + 新規テーブル DDL/TABLE_NAMES (Task 8-C, §8.1-38, B4/B6/B10)
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -9602,63 +9805,73 @@ EOF
 
 - [ ] **Step 1: 失敗するテストを書く (`tests/store/test_backtest_runs.py` に追記)**
 
+<!-- precheck 2026-08-22: T8-B2 -->
+現物 `tests/store/test_backtest_runs.py:1-27` には `seeded_conn`/`PERIOD_START`/
+`PERIOD_END`/`METRICS`/`NOW` の fixture・定数は存在しない (`grep -c
+"seeded_conn\|PERIOD_START\|METRICS" tests/store/test_backtest_runs.py` → 0)。
+既存の慣例 (`_conn(tmp_path)` ローカルヘルパ + `tests.backtest.factories.H`
+を period/now 両方に使う) に合わせて以下のとおり書く:
+
 ```python
-def test_save_harness_run_accepts_variant_and_ref_fields(tmp_path, seeded_conn):
+from tests.backtest.factories import H
+
+
+def test_save_harness_run_accepts_variant_and_ref_fields(tmp_path):
     """variant/ref_plugin_ref/ref_content_hash を明示指定できる (既定は
     'candidate'/None/None — 既存呼び出しは無変更のまま動く)。"""
     from agentic_fx.store.backtest_runs import save_harness_run
+    conn = _conn(tmp_path)
     run_id = save_harness_run(
-        seeded_conn, scope="in_sample", plugin_ref="no_strategy:rsi_v2",
+        conn, scope="in_sample", plugin_ref="no_strategy:rsi_v2",
         content_hash="cand-hash", kind="strategy", pair="USDJPY",
-        timeframe="1h", source="test", period=(PERIOD_START, PERIOD_END),
-        metrics=METRICS, settings_hash="s", core_commit="c",
-        initial_balance=10000.0, now=NOW,
+        timeframe="1h", source="test", period=(H, H),
+        metrics={"pf": 1.0}, settings_hash="s", core_commit="c",
+        initial_balance=10000.0, now=H,
         variant="no_strategy", ref_plugin_ref=None, ref_content_hash=None)
-    row = seeded_conn.execute(
+    row = conn.execute(
         "SELECT variant, ref_plugin_ref, ref_content_hash FROM backtest_runs "
         "WHERE id=?", (run_id,)).fetchone()
     assert row["variant"] == "no_strategy"
 
 
-def test_save_harness_run_default_variant_is_candidate(tmp_path, seeded_conn):
+def test_save_harness_run_default_variant_is_candidate(tmp_path):
     """既存呼び出し (variant を渡さない) は 'candidate' になる (回帰なし)。"""
     from agentic_fx.store.backtest_runs import save_harness_run
+    conn = _conn(tmp_path)
     run_id = save_harness_run(
-        seeded_conn, scope="in_sample", plugin_ref="rsi_v2",
+        conn, scope="in_sample", plugin_ref="rsi_v2",
         content_hash="h", kind="indicator", pair="USDJPY", timeframe="1h",
-        source="test", period=(PERIOD_START, PERIOD_END), metrics=METRICS,
-        settings_hash="s", core_commit="c", initial_balance=10000.0, now=NOW)
-    row = seeded_conn.execute("SELECT variant FROM backtest_runs WHERE id=?",
-                              (run_id,)).fetchone()
+        source="test", period=(H, H), metrics={"pf": 1.0},
+        settings_hash="s", core_commit="c", initial_balance=10000.0, now=H)
+    row = conn.execute("SELECT variant FROM backtest_runs WHERE id=?",
+                       (run_id,)).fetchone()
     assert row["variant"] == "candidate"
 
 
-def test_latest_in_sample_metrics_ignores_baseline_and_no_strategy_rows(
-        tmp_path, seeded_conn):
+def test_latest_in_sample_metrics_ignores_baseline_and_no_strategy_rows(tmp_path):
     """§8.1-40: latest_in_sample_metrics は variant='candidate' に絞る
     (挙動変更、pin)。baseline 行が候補の content_hash と衝突しても無視する。"""
     from agentic_fx.store.backtest_runs import (
         latest_in_sample_metrics, save_harness_run,
     )
+    conn = _conn(tmp_path)
     save_harness_run(
-        seeded_conn, scope="in_sample", plugin_ref="p", content_hash="h",
+        conn, scope="in_sample", plugin_ref="p", content_hash="h",
         kind="strategy", pair="USDJPY", timeframe="1h", source="test",
-        period=(PERIOD_START, PERIOD_END), metrics={"pf": 9.9}, settings_hash="s",
-        core_commit="c", initial_balance=10000.0, now=NOW, variant="baseline",
+        period=(H, H), metrics={"pf": 9.9}, settings_hash="s",
+        core_commit="c", initial_balance=10000.0, now=H, variant="baseline",
         ref_plugin_ref="p", ref_content_hash="h")  # 同じ content_hash で baseline 行
-    got = latest_in_sample_metrics(seeded_conn, "h", pair="USDJPY")
+    got = latest_in_sample_metrics(conn, "h", pair="USDJPY")
     assert got is None  # candidate 行が無いので None (baseline は無視)
 
     save_harness_run(
-        seeded_conn, scope="in_sample", plugin_ref="p", content_hash="h",
+        conn, scope="in_sample", plugin_ref="p", content_hash="h",
         kind="strategy", pair="USDJPY", timeframe="1h", source="test",
-        period=(PERIOD_START, PERIOD_END), metrics={"pf": 1.5}, settings_hash="s",
-        core_commit="c", initial_balance=10000.0, now=NOW, variant="candidate")
-    got2 = latest_in_sample_metrics(seeded_conn, "h", pair="USDJPY")
+        period=(H, H), metrics={"pf": 1.5}, settings_hash="s",
+        core_commit="c", initial_balance=10000.0, now=H, variant="candidate")
+    got2 = latest_in_sample_metrics(conn, "h", pair="USDJPY")
     assert got2["pf"] == 1.5  # candidate 行だけが返る
 ```
-
-(`seeded_conn`/`PERIOD_START`/`PERIOD_END`/`METRICS`/`NOW` は既存 `tests/store/test_backtest_runs.py` の fixture・定数をそのまま使う — 実装時に既存ファイル冒頭から逐語コピーする。)
 
 - [ ] **Step 2: 失敗を確認 → Step 3: 最小実装**
 
@@ -9718,6 +9931,15 @@ def latest_in_sample_metrics(conn, content_hash: str, *, pair: str) -> dict | No
 
 `save_human_run` は `variant`/`ref_*` を持たない (人間発行の custom scope は baseline 対応の対象外 — 既存シグネチャ不変)。
 
+<!-- precheck 2026-08-22: T8-m5 -->
+**m5 (設計意図の明示)**: `in_sample_view` は `variant` で絞らない — baseline/
+no_strategy 行も候補行と同じ画面に混ぜて返す (人間が横並びで比較できるよう
+意図的に絞らない)。`latest_in_sample_metrics` だけが `variant='candidate'`
+に絞る (§8.1-40、strategy 採用ゲートが候補以外の行を誤って拾わないための
+仕様)。「改善ループが読む唯一の成績面」という `in_sample_view` の
+docstring は変えない — 絞り込みが必要なのは呼び出し元 (Task 10 の
+build_improve_context/成績集計) 側の責務とする。
+
 **直前修正の申し送り②**: `save_harness_run`/`_insert` に `commit: bool = True`
 を追加した (§8.1-25 の宣言 `store.backtest_runs.save_harness_run(conn, *, ...,
 commit=True) -> int` と一致させる — これが無いと 10.10 節
@@ -9727,19 +9949,20 @@ commit=False, ...)` 呼び出しが `TypeError: unexpected keyword argument
 (`save_human_run` を含む) は無変更のまま動く。
 
 ```python
-def test_save_harness_run_commit_false_does_not_commit(tmp_path, seeded_conn):
+def test_save_harness_run_commit_false_does_not_commit(tmp_path):
     """直前修正の申し送り②: commit=False は conn.commit() を呼ばない —
     呼び出し元 (10.10節 Tx-2) が自分でロールバック可能な状態を保つ。"""
     from agentic_fx.store.backtest_runs import save_harness_run
-    seeded_conn.execute("BEGIN IMMEDIATE")
+    conn = _conn(tmp_path)
+    conn.execute("BEGIN IMMEDIATE")
     run_id = save_harness_run(
-        seeded_conn, scope="in_sample", plugin_ref="p", content_hash="h",
+        conn, scope="in_sample", plugin_ref="p", content_hash="h",
         kind="indicator", pair="USDJPY", timeframe="1h", source="test",
-        period=(PERIOD_START, PERIOD_END), metrics=METRICS,
+        period=(H, H), metrics={"pf": 1.0},
         settings_hash="s", core_commit="c", initial_balance=10000.0,
-        now=NOW, commit=False)
-    seeded_conn.rollback()
-    row = seeded_conn.execute(
+        now=H, commit=False)
+    conn.rollback()
+    row = conn.execute(
         "SELECT COUNT(*) c FROM backtest_runs WHERE id=?",
         (run_id,)).fetchone()
     assert row["c"] == 0   # rollback で消えている = commit されていなかった
@@ -9872,6 +10095,30 @@ def test_start_commit_false_leaves_transaction_open(tmp_path):
     c.rollback()
     row = c.execute("SELECT * FROM improvement_runs WHERE id=?", (rid,)).fetchone()
     assert row is None
+
+
+# precheck 2026-08-22: T8-m11 -- set_report_state was untested. Add a minimal pin.
+def test_set_report_state_updates_state_and_path(tmp_path):
+    """report_path is updated together with report_state when given."""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    rid = improve_runs.start(c, None, now=NOW)
+    improve_runs.set_report_state(c, rid, "published", report_path="reports/x.md")
+    row = c.execute("SELECT report_state, report_path FROM improvement_runs "
+                    "WHERE id=?", (rid,)).fetchone()
+    assert row["report_state"] == "published"
+    assert row["report_path"] == "reports/x.md"
+
+
+def test_set_report_state_failed_clears_report_path_even_when_not_passed(tmp_path):
+    """report_state='failed' updates even without an explicit report_path."""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    rid = improve_runs.start(c, None, now=NOW)
+    improve_runs.set_report_state(c, rid, "prepared", report_path="reports/x.md")
+    improve_runs.set_report_state(c, rid, "failed")
+    row = c.execute("SELECT report_state, report_path FROM improvement_runs "
+                    "WHERE id=?", (rid,)).fetchone()
+    assert row["report_state"] == "failed"
+    assert row["report_path"] is None
 ```
 
 - [ ] **Step 2: 失敗を確認 → Step 3: 最小実装 (`src/agentic_fx/store/improve_runs.py` 全面書き換え)**
@@ -9949,6 +10196,8 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M3 | `report_state` の既定を `"none"` から `"prepared"` にする | `test_finish_default_report_state_is_none` |
 | M4 | `start` が `commit` を無視する | `test_start_commit_false_leaves_transaction_open` |
 | M5 | `_IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL` の `WHERE mission_id IS NOT NULL` を落とす (NULL 複数行が弾かれてしまう) | `test_multiple_null_mission_id_rows_allowed` |
+| M6 | `set_report_state` が `report_path` を更新しない | `test_set_report_state_updates_state_and_path` |
+| M7 | `report_path is not None or report_state == "failed"` の `or` 節を削る (failed でも report_path 未指定なら更新されない) | `test_set_report_state_failed_clears_report_path_even_when_not_passed` |
 
 - [ ] **Step 6: コミット**
 
@@ -10055,32 +10304,58 @@ def test_mark_running_cas_claimed_to_running(tmp_path):
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "running"
 
 
-def test_reset_to_reserved_on_pre_ready_failure_clears_mission_id(tmp_path):
-    """§3.1⑥・codex 12周目I3: 戻すときは同じ tx で mission_id=NULL も戻す。"""
+# precheck 2026-08-22: T8-B7 — reset_to_reserved_or_fail を revert_to_reserved /
+# mark_slot_failed の 2 プリミティブへ分割する (骨格 Interfaces L919-920 / L11542-11547
+# が正。再試行上限判定は Task 9 の所有物 — `core/improve_supervisor.py`
+# `_handle_pre_ready_failure` が spawn_attempts を読んで呼び分ける。Task 8 は
+# 無条件の状態遷移だけを提供する)。
+
+
+def test_revert_to_reserved_on_pre_ready_failure_clears_mission_id(tmp_path):
+    """§3.1⑥・codex 12周目I3: 戻すときは同じ tx で mission_id=NULL も戻す。
+    再試行上限の判定は Task 9 が行う (`revert_to_reserved` は無条件遷移)。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
     improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
-    improve_waves.reset_to_reserved_or_fail(c, period_key="2026-W34", k=0, now=NOW,
-                                            max_spawn_attempts=2)
+    improve_waves.revert_to_reserved(c, period_key="2026-W34", k=0, now=NOW)
     slot = improve_waves.get_slot(c, period_key="2026-W34", k=0)
     assert slot["status"] == "reserved"
     assert slot["mission_id"] is None
-    assert slot["spawn_attempts"] == 1  # claim 時の +1 のみ (reset 自体は増やさない)
+    assert slot["spawn_attempts"] == 1  # claim 時の +1 のみ (revert 自体は増やさない)
 
 
-def test_reset_to_reserved_or_fail_exhausts_after_two_attempts(tmp_path):
-    """spawn_attempts < 2 なら reserved (初回 + 再試行 1 回)、それ以外は failed。"""
+def test_revert_to_reserved_fails_on_non_claimed(tmp_path):
+    """CAS: claimed 以外からは遷移しない (rowcount=0)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
+    ok = improve_waves.revert_to_reserved(c, period_key="2026-W34", k=0, now=NOW)
+    assert ok is False
+    assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "reserved"
+
+
+def test_mark_slot_failed_after_attempts_exhausted(tmp_path):
+    """Task 9 が spawn_attempts >= max と判定した後に呼ぶ想定の無条件 failed 遷移。
+    claimed からでも running からでも failed へ落とし mission_id を NULL に戻す。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
     improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
-    improve_waves.reset_to_reserved_or_fail(c, period_key="2026-W34", k=0, now=NOW,
-                                            max_spawn_attempts=2)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=102, now=NOW)  # 失敗 (reserved でない) — 無視
+    improve_waves.revert_to_reserved(c, period_key="2026-W34", k=0, now=NOW)
     improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=102, now=NOW)
-    improve_waves.reset_to_reserved_or_fail(c, period_key="2026-W34", k=0, now=NOW,
-                                            max_spawn_attempts=2)
+    improve_waves.mark_slot_failed(c, period_key="2026-W34", k=0, now=NOW)
     slot = improve_waves.get_slot(c, period_key="2026-W34", k=0)
     assert slot["status"] == "failed"
     assert slot["mission_id"] is None
+
+
+def test_count_open_slots_counts_reserved_only(tmp_path):
+    """`count_open_slots` は `reserved` の数を返す (claimed/running/done/failed は含まない)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=3)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
+    assert improve_waves.count_open_slots(c, period_key="2026-W34") == 2
+    improve_waves.claim_slot(c, period_key="2026-W34", k=1, mission_id=102, now=NOW)
+    assert improve_waves.count_open_slots(c, period_key="2026-W34") == 1
 
 
 def test_mark_terminal_running_to_done(tmp_path):
@@ -10092,10 +10367,16 @@ def test_mark_terminal_running_to_done(tmp_path):
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "done"
 
 
+# precheck 2026-08-22: T8-m6 — parametrize が本体で未使用だった (2 回とも同じ検査)。
+# `terminal_status` を実際に使い、有効な終端状態を経由してから無効値を渡す形に直す。
 @pytest.mark.parametrize("terminal_status", ["done", "failed"])
 def test_mark_terminal_rejects_invalid_status(tmp_path, terminal_status):
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
+    improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
+    improve_waves.mark_terminal(c, period_key="2026-W34", k=0,
+                                status=terminal_status, now=NOW)
     with pytest.raises(ValueError):
         improve_waves.mark_terminal(c, period_key="2026-W34", k=0,
                                     status="not_a_status", now=NOW)
@@ -10210,26 +10491,42 @@ def mark_running(conn: sqlite3.Connection, *, period_key: str, k: int,
     return cur.rowcount == 1
 
 
-def reset_to_reserved_or_fail(conn: sqlite3.Connection, *, period_key: str,
-                              k: int, now: datetime, max_spawn_attempts: int,
-                              commit: bool = True) -> str:
-    """pre-ready 失敗 (spawn 失敗 / ready 前 crash・timeout) の巻き戻し。
-    `spawn_attempts < max_spawn_attempts` なら reserved (+ mission_id=NULL、
-    同じ tx)、それ以外は failed。戻り値は遷移後の status。"""
-    row = conn.execute(
-        "SELECT spawn_attempts FROM improve_wave_slots "
-        "WHERE wave_period_key=? AND k=?", (period_key, k)).fetchone()
-    if row is None:
-        raise ValueError(f"no such slot: {period_key}/{k}")
-    next_status = "reserved" if row["spawn_attempts"] < max_spawn_attempts else "failed"
-    mission_id_clause = ", mission_id=NULL" if next_status == "reserved" else ""
-    conn.execute(
-        f"UPDATE improve_wave_slots SET status=?{mission_id_clause}, "
-        "updated_at=? WHERE wave_period_key=? AND k=?",
-        (next_status, now.isoformat(), period_key, k))
+# precheck 2026-08-22: T8-B7 — reset_to_reserved_or_fail (attempts 判定を内蔵)
+# を revert_to_reserved / mark_slot_failed の 2 プリミティブへ分割。
+# 再試行上限の判定は Task 9 (`core/improve_supervisor.py`) が spawn_attempts
+# を読んで呼び分ける (骨格 Interfaces L919-920・L11542-11547 が正)。
+def revert_to_reserved(conn: sqlite3.Connection, *, period_key: str, k: int,
+                       now: datetime, commit: bool = True) -> bool:
+    """pre-ready 失敗の巻き戻し (CAS: claimed -> reserved、同じ tx で
+    mission_id=NULL も戻す)。呼び出し元 (Task 9) が再試行上限未達と判定
+    した場合にのみ呼ぶ。戻り値は CAS 成功可否。"""
+    cur = conn.execute(
+        "UPDATE improve_wave_slots SET status='reserved', mission_id=NULL, "
+        "updated_at=? WHERE wave_period_key=? AND k=? AND status='claimed'",
+        (now.isoformat(), period_key, k))
     if commit:
         conn.commit()
-    return next_status
+    return cur.rowcount == 1
+
+
+def mark_slot_failed(conn: sqlite3.Connection, *, period_key: str, k: int,
+                     now: datetime, commit: bool = True) -> None:
+    """再試行上限に達した slot を無条件で failed へ落とす (mission_id も
+    NULL に戻す)。呼び出し元 (Task 9) が再試行上限到達と判定した場合に呼ぶ。"""
+    conn.execute(
+        "UPDATE improve_wave_slots SET status='failed', mission_id=NULL, "
+        "updated_at=? WHERE wave_period_key=? AND k=?",
+        (now.isoformat(), period_key, k))
+    if commit:
+        conn.commit()
+
+
+def count_open_slots(conn: sqlite3.Connection, *, period_key: str) -> int:
+    """`reserved` 状態の slot 数を返す (§8.1-19 の空き数照会)。"""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM improve_wave_slots "
+        "WHERE wave_period_key=? AND status='reserved'", (period_key,)).fetchone()
+    return row["n"]
 
 
 def mark_terminal(conn: sqlite3.Connection, *, period_key: str, k: int,
@@ -10269,8 +10566,10 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M1 | `expected == 0` の early return を削除する | `test_create_wave_and_slots_m_zero_writes_nothing` |
 | M2 | `INSERT OR IGNORE` を無条件 `INSERT` にする (2 回目呼び出しで例外 — 冪等性喪失) | `test_create_wave_and_slots_second_call_is_noop_period_already_consumed` |
 | M3 | `claim_slot` の `WHERE ... status='reserved'` を落とす | `test_claim_slot_cas_fails_on_non_reserved` |
-| M4 | `reset_to_reserved_or_fail` の `mission_id_clause` を常に空にする (NULL に戻さない) | `test_reset_to_reserved_or_fail_exhausts_after_two_attempts` の中間状態、および `test_reset_to_reserved_on_pre_ready_failure_clears_mission_id` |
-| M5 | `max_spawn_attempts` 比較を `<=` にする (再試行が 1 回多くなる) | `test_reset_to_reserved_or_fail_exhausts_after_two_attempts` |
+| M4 | `revert_to_reserved` の `mission_id=NULL` を落とす | `test_revert_to_reserved_on_pre_ready_failure_clears_mission_id` |
+| M5 | `revert_to_reserved` の `WHERE ... status='claimed'` を落とす | `test_revert_to_reserved_fails_on_non_claimed` |
+| M5b | `mark_slot_failed` の `mission_id=NULL` を落とす | `test_mark_slot_failed_after_attempts_exhausted` |
+| M5c | `count_open_slots` の `status='reserved'` を落とす (全件カウント) | `test_count_open_slots_counts_reserved_only` |
 | M6 | `mark_terminal` の status 検査を削除する | `test_mark_terminal_rejects_invalid_status[done]` |
 | M7 | `recover_stale_slots` の `WHERE` から `'reserved'` を落とす | `test_recover_stale_slots_fails_reserved_claimed_running` (k=2 のケースで検出) |
 | M8 | `recover_stale_slots` が `'done'`/`'failed'` も対象にしてしまう (`WHERE` を全件にする) | `test_recover_stale_slots_leaves_done_and_failed_untouched` |
@@ -10300,6 +10599,7 @@ EOF
 唯一の terminal helper (設計書 §4.1、§8.1-21/22)。"""
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
@@ -10331,6 +10631,31 @@ def test_tx0_missions_run_slot_created_in_one_tx(tmp_path):
     assert slot["status"] == "claimed" and slot["mission_id"] == mid
 
 
+# precheck 2026-08-22: T8-m12 -- the previous version only asserted 3 rows
+# exist, which stays green even if each helper commits individually. Force a
+# real mid-transaction failure and assert nothing survives the rollback.
+def test_tx0_rolls_back_atomically_on_mid_failure(tmp_path):
+    """§8.1-23 の否定側: Tx-0 の 3 ステップの途中で例外が起きたら
+    wave/slot も mission も一切残らないこと (`commit=False` を使わず
+    個別に commit していたら、この test は wave/slot だけ残ってしまう)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW,
+                                        expected=1, commit=False)
+    mid = missions.start(c, "improve", "local", "m", now=NOW, commit=False)
+    improve_runs.start(c, None, now=NOW, mission_id=mid, commit=False)
+    with pytest.raises(sqlite3.IntegrityError):
+        # 同一 mission_id で 2 件目の run を作ろうとする — 部分 UNIQUE
+        # (ix_improvement_runs_mission_id) が衝突し、tx を巻き込む。
+        improve_runs.start(c, None, now=NOW, mission_id=mid, commit=False)
+    c.rollback()
+    assert c.execute("SELECT 1 FROM missions WHERE id=?", (mid,)).fetchone() is None
+    assert c.execute(
+        "SELECT 1 FROM improve_waves WHERE period_key='2026-W34'").fetchone() is None
+    assert c.execute(
+        "SELECT 1 FROM improve_wave_slots WHERE wave_period_key='2026-W34'"
+    ).fetchone() is None
+
+
 def test_finish_improve_mission_success_path_updates_all_four(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
     bid = backlog.add(c, "idea", "user", NOW)
@@ -10344,7 +10669,7 @@ def test_finish_improve_mission_success_path_updates_all_four(tmp_path):
         mission_status="completed", run_result="report",
         backlog_transition={"backlog_id": bid, "status": "done",
                             "last_result": "report:reports/x.md"},
-        output={"ok": True}, transcript=[])
+        now=NOW, output={"ok": True}, transcript=[])
 
     assert c.execute("SELECT status FROM missions WHERE id=?", (mid,)).fetchone()["status"] == "completed"
     run = c.execute("SELECT finished_at, result FROM improvement_runs WHERE id=?",
@@ -10353,6 +10678,29 @@ def test_finish_improve_mission_success_path_updates_all_four(tmp_path):
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "done"
     bl = c.execute("SELECT status FROM improvement_backlog WHERE id=?", (bid,)).fetchone()
     assert bl["status"] == "done"
+
+
+# precheck 2026-08-22: T8-B9 -- approval_id/report_path/report_state must
+# actually land in improvement_runs via independent kw (not backlog_transition).
+def test_finish_improve_mission_approval_path_persists_approval_id(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "idea", "user", NOW)
+    mid, rid = _prepare_scheduler_mission(c)
+    improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
+    backlog.select_for_mission(c, bid, now=NOW)
+    improve_runs.bind_backlog(c, rid, bid)
+
+    missions.finish_improve_mission(
+        c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
+        mission_status="completed", run_result="approval",
+        backlog_transition={"backlog_id": bid, "status": "done",
+                            "last_result": "approval:42"},
+        now=NOW, approval_id=42, output=None, transcript=[])
+
+    run = c.execute("SELECT result, approval_id FROM improvement_runs WHERE id=?",
+                    (rid,)).fetchone()
+    assert run["result"] == "approval"
+    assert run["approval_id"] == 42
 
 
 @pytest.mark.parametrize("mission_status", ["failed", "timeout", "max_turns"])
@@ -10365,7 +10713,7 @@ def test_finish_improve_mission_non_completed_marks_slot_failed(tmp_path, missio
     missions.finish_improve_mission(
         c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status=mission_status, run_result=None,
-        backlog_transition=None, output=None, transcript=[])
+        backlog_transition=None, now=NOW, output=None, transcript=[])
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "failed"
     run = c.execute("SELECT result, finished_at FROM improvement_runs WHERE id=?",
                     (rid,)).fetchone()
@@ -10382,7 +10730,7 @@ def test_finish_improve_mission_output_invalid_treated_as_failed(tmp_path):
     missions.finish_improve_mission(
         c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="failed", run_result=None, backlog_transition=None,
-        output=None, transcript=[])
+        now=NOW, output=None, transcript=[])
     assert c.execute("SELECT status FROM missions WHERE id=?", (mid,)).fetchone()["status"] == "failed"
 
 
@@ -10394,7 +10742,7 @@ def test_finish_improve_mission_shutdown_path_same_helper(tmp_path):
     missions.finish_improve_mission(
         c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="timeout", run_result=None, backlog_transition=None,
-        output=None, transcript=[])
+        now=NOW, output=None, transcript=[])
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "failed"
 
 
@@ -10407,7 +10755,7 @@ def test_finish_improve_mission_manual_one_shot_slot_key_none(tmp_path):
     missions.finish_improve_mission(
         c, mission_id=mid, run_id=rid, slot_key=None,
         mission_status="completed", run_result=None, backlog_transition=None,
-        output=None, transcript=[])
+        now=NOW, output=None, transcript=[])
     assert c.execute("SELECT status FROM missions WHERE id=?", (mid,)).fetchone()["status"] == "completed"
 
 
@@ -10425,12 +10773,12 @@ def test_finish_improve_mission_cas_zero_rowcount_raises_and_rolls_back(tmp_path
         mission_status="completed", run_result="report",
         backlog_transition={"backlog_id": bid, "status": "done",
                             "last_result": "x"},
-        output=None, transcript=[])
+        now=NOW, output=None, transcript=[])
     with pytest.raises(Exception):
         missions.finish_improve_mission(
             c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
             mission_status="failed", run_result=None, backlog_transition=None,
-            output=None, transcript=[])
+            now=NOW, output=None, transcript=[])
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "done"  # 変化なし
 
 
@@ -10450,7 +10798,7 @@ def test_run_lifecycle_created_bound_finished_no_dangling(tmp_path):
     missions.finish_improve_mission(
         c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="completed", run_result=None, backlog_transition=None,
-        output=None, transcript=[])
+        now=NOW, output=None, transcript=[])
     run2 = c.execute("SELECT finished_at FROM improvement_runs WHERE id=?",
                      (rid,)).fetchone()
     assert run2["finished_at"] is not None  # FINISHED
@@ -10491,7 +10839,7 @@ def test_recover_interrupted_leaves_finished_improve_runs_untouched(tmp_path):
     missions.finish_improve_mission(
         c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="completed", run_result=None, backlog_transition=None,
-        output=None, transcript=[])
+        now=NOW, output=None, transcript=[])
     before = c.execute("SELECT finished_at FROM improvement_runs WHERE id=?",
                        (rid,)).fetchone()["finished_at"]
     missions.recover_interrupted(c, now=NOW, max_requeue=3)
@@ -10539,45 +10887,43 @@ def test_recover_interrupted_does_not_reopen_backlog_already_terminal(tmp_path):
 
 - [ ] **Step 2: 失敗を確認**
 
-- [ ] **Step 3: 最小実装 (`src/agentic_fx/store/missions.py` 改修)**
+<!-- precheck 2026-08-22: T8-B13 -->
+- [ ] **Step 3: 最小実装 (`src/agentic_fx/store/missions.py` 改修) — アンカー付き編集**
+
+**既存 docstring は 1 行も削らず保持する** (B13)。現物 `missions.py:14-45`
+の `start`/`finish` には防御根拠 (§4.7 codex C-4)・CAS の意味論・呼び出し
+元への契約が書かれた docstring がある。以下は**置換ではなくアンカー付き
+編集**として適用する:
+
+- `start` (現物 L14-19): シグネチャ末尾に `*, commit: bool = True` を追加
+  し、本体の無条件 `conn.commit()` を `if commit: conn.commit()` に変える
+  だけ。既存 docstring は無い (この関数は元々 docstring を持たない) の
+  で変更なし。
+- `finish` (現物 L23-45、10 行の docstring あり): シグネチャ末尾に
+  `*, commit: bool = True` を追加し、本体末尾の無条件 `conn.commit()` を
+  `if commit: conn.commit()` に変える**だけ**。docstring・他の行は
+  一字も変えない。
+- `finish_improve_mission` (新設、既存コードなし — 全文を新規追加してよい):
 
 ```python
-def start(conn: sqlite3.Connection, loop: str, runner: str, model: str,
-          now: datetime, trigger: str | None = None, *,
-          commit: bool = True) -> int:
-    cur = conn.execute(
-        "INSERT INTO missions (loop, runner, model, status, started_at, trigger) "
-        "VALUES (?,?,?,'running',?,?)", (loop, runner, model, now.isoformat(), trigger))
-    if commit:
-        conn.commit()
-    return cur.lastrowid
-
-
-def finish(conn: sqlite3.Connection, mission_id: int, status: str,
-           output: dict | None, transcript: list, now: datetime, *,
-           commit: bool = True) -> bool:
-    cur = conn.execute(
-        "UPDATE missions SET status=?, output_json=?, transcript_json=?, "
-        "finished_at=? WHERE id=? AND status='running'",
-        (status,
-         json.dumps(output, ensure_ascii=False) if output is not None else None,
-         json.dumps(transcript, ensure_ascii=False),
-         now.isoformat(), mission_id))
-    if commit:
-        conn.commit()
-    return cur.rowcount > 0
-
-
 def finish_improve_mission(
         conn: sqlite3.Connection, *, mission_id: int, run_id: int,
         slot_key: tuple[str, int] | None,
         mission_status: str, run_result: str | None,
         backlog_transition: dict | None,
+        now: datetime,
+        approval_id: int | None = None,
+        report_path: str | None = None,
+        report_state: str = "none",
         output: dict | None = None, transcript: list | None = None,
         commit: bool = True) -> None:
     """slot(あれば) + mission + run + backlog を単一 tx で終端する唯一の
     ヘルパ (§4.1、§8.1-21)。CAS (`missions.finish` の `WHERE status=
-    'running'`) が rowcount=0 なら例外 (呼び出し元がロールバック)。"""
+    'running'`) が rowcount=0 なら例外 (呼び出し元がロールバック)。
+    `approval_id`/`report_path`/`report_state` は `improve_runs.finish`
+    へそのまま転送する独立 kw であり `backlog_transition` からは拾わない
+    (B9 — backlog_transition は `{"backlog_id","status","last_result"}`
+    の 3 キーのみで承認/レポート情報を持たない)。"""
     from agentic_fx.store import backlog as backlog_mod
     from agentic_fx.store import improve_runs as improve_runs_mod
     from agentic_fx.store import improve_waves as improve_waves_mod
@@ -10590,10 +10936,8 @@ def finish_improve_mission(
             "(already terminal — CAS rowcount=0)")
     improve_runs_mod.finish(
         conn, run_id, result=run_result, now=now,
-        approval_id=(backlog_transition or {}).get("approval_id"),
-        report_path=(backlog_transition or {}).get("report_path"),
-        report_state=(backlog_transition or {}).get("report_state", "none"),
-        commit=False)
+        approval_id=approval_id, report_path=report_path,
+        report_state=report_state, commit=False)
     if backlog_transition is not None:
         backlog_mod.set_status(
             conn, backlog_transition["backlog_id"], backlog_transition["status"],
@@ -10608,34 +10952,15 @@ def finish_improve_mission(
         conn.commit()
 ```
 
-`now` 引数が上記関数本体で使われているが骨格シグネチャに無いため、実装時は `finish_improve_mission` に `now: datetime` を明示引数として追加する (骨格の型シグネチャは `commit: bool = False` までを列挙しているが `now` の欠落は明らかな脱字 — 申し送り⑦)。
-
-`recover_interrupted` の改修 (既存関数の末尾、`signals` requeue の直後に改善レーン向け処理を追加する):
+<!-- precheck 2026-08-22: T8-B13 T8-m8 T8-m9 -->
+`recover_interrupted` の改修は**アンカー付き追記のみ** (B13 — 現物
+`missions.py:47-70` の 22 行 docstring は 1 行も変えない。lease ベース
+回収では拾われない不整合窓の説明・`'interrupted'` が `MissionResult` の
+4 値契約に現れないこと・`signals.reclaim_expired` を呼べない理由は既存の
+まま保持する)。**挿入位置**: 既存の `for row in claimed_rows: ...  # 既存
+のまま` ループの直後、`conn.commit()` の直前に以下を挿入する:
 
 ```python
-def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
-                        max_requeue: int) -> dict:
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        running_ids = [r["id"] for r in conn.execute(
-            "SELECT id FROM missions WHERE status='running'").fetchall()]
-        loop_by_id = {r["id"]: r["loop"] for r in conn.execute(
-            "SELECT id, loop FROM missions WHERE status='running'").fetchall()}
-        for mid in running_ids:
-            conn.execute(
-                "UPDATE missions SET status='interrupted', finished_at=? "
-                "WHERE id=?", (now.isoformat(), mid))
-
-        signals_requeued = signals_abandoned = 0
-        if running_ids:
-            placeholders = ",".join("?" * len(running_ids))
-            claimed_rows = conn.execute(
-                "SELECT id, requeue_count FROM signals WHERE status='claimed' "
-                f"AND claimed_by_mission_id IN ({placeholders})",
-                running_ids).fetchall()
-            for row in claimed_rows:
-                ...  # 既存のまま
-
         # --- プラン 10 Task 8: improve レーンの起動時回収 (§4.1) ---
         improve_mission_ids = [mid for mid in running_ids
                                if loop_by_id.get(mid) == "improve"]
@@ -10646,8 +10971,11 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
                 f"WHERE mission_id IN ({placeholders2}) "
                 "AND finished_at IS NULL", improve_mission_ids).fetchall()
             for run_row in run_rows:
+                # m8: result は元々 NULL のまま (finish_improve_mission を
+                # 経由していない run なので上書きの必要が無い) — SET は
+                # finished_at のみに限定し、不要な破壊的 SET を避ける。
                 conn.execute(
-                    "UPDATE improvement_runs SET result=NULL, finished_at=? "
+                    "UPDATE improvement_runs SET finished_at=? "
                     "WHERE id=?", (now.isoformat(), run_row["id"]))
                 if run_row["backlog_id"] is not None:
                     conn.execute(
@@ -10655,20 +10983,17 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
                         "last_result='interrupted', updated_at=? WHERE id=? "
                         "AND status='selected'",
                         (now.isoformat(), run_row["backlog_id"]))
-        conn.execute(
-            "UPDATE improve_wave_slots SET status='failed', updated_at=? "
-            "WHERE status IN ('reserved','claimed','running')", (now.isoformat(),))
-
-        conn.commit()
-        return {"missions_recovered": len(running_ids),
-                "signals_requeued": signals_requeued,
-                "signals_abandoned": signals_abandoned}
-    except BaseException:
-        conn.rollback()
-        raise
+        # m9: recover_stale_slots (8-F) に一本化する — inline SQL の重複定義を
+        # 廃止 (同一 BEGIN IMMEDIATE 内から commit=False で呼べる)。
+        from agentic_fx.store import improve_waves as improve_waves_mod
+        improve_waves_mod.recover_stale_slots(conn, now=now, commit=False)
 ```
 
-（`improve_wave_slots` の収束は `improve_waves.recover_stale_slots` を直接呼ばず、同一 `BEGIN IMMEDIATE` の中に SQL を inline する — `recover_stale_slots` 単体はデフォルト `commit=True` のため、同一 tx から呼ぶには `commit=False` を明示する必要があり、可読性のため inline にした。呼び出し可能な形にしたい場合は `improve_waves.recover_stale_slots(conn, now=now, commit=False)` を代わりに呼んでもよい — **実装者の裁量**、意味論は同じ。）
+`loop_by_id` の算出 (`SELECT id, loop FROM missions WHERE status='running'`)
+は上記挿入ブロックより前、`running_ids` 算出の直後に追加する (既存の
+`running_ids` 算出行のすぐ下)。`from agentic_fx.store import improve_waves
+as improve_waves_mod` は関数内 import (循環 import 回避、他の store
+モジュールと同じ慣例)。
 
 - [ ] **Step 4: 成功を確認**
 
@@ -10685,6 +11010,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | # | 変異 | 殺すテスト |
 |---|---|---|
 | M1 | `finish_improve_mission` が `finish(...)` の戻り値 (`ok`) を無視する | `test_finish_improve_mission_cas_zero_rowcount_raises_and_rolls_back` |
+| M0 | m12: なし (この test 自体は実装への変異ではなく `_prepare_scheduler_mission` の `commit=False` 一貫性を守る回帰テスト。3 呼び出しのいずれかが `commit=True`/既定になっていると red になる) | `test_tx0_rolls_back_atomically_on_mid_failure` |
 | M2 | `slot_status = "done" if mission_status == "completed" else "failed"` を常に `"done"` にする | `test_finish_improve_mission_non_completed_marks_slot_failed[failed]` (他 2 パラメータも) |
 | M3 | `backlog_transition is not None` の分岐を削除する | `test_finish_improve_mission_success_path_updates_all_four` |
 | M4 | `slot_key is not None` の分岐を無視して常に slot 更新を試みる (manual one-shot で例外) | `test_finish_improve_mission_manual_one_shot_slot_key_none` |
@@ -10692,6 +11018,7 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M6 | improve 拡張ブロックの `WHERE finished_at IS NULL` を落とす | `test_recover_interrupted_leaves_finished_improve_runs_untouched` |
 | M7 | improve 拡張ブロックの `AND status='selected'` を落とす (done な backlog まで observation に戻してしまう) | `test_recover_interrupted_does_not_reopen_backlog_already_terminal` (申し送り⑧を統合時に解決) |
 | M8 | `improve_wave_slots` の収束 UPDATE を削除する | `test_recover_interrupted_ends_improve_run_and_backlog_observation` (slot 側の assert) |
+| M9 | `finish_improve_mission` が `approval_id` を `improve_runs.finish` へ渡さない (常に None) | `test_finish_improve_mission_approval_path_persists_approval_id` |
 
 - [ ] **Step 6: コミット**
 
@@ -10934,85 +11261,94 @@ EOF
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
+from agentic_fx.config import load_settings
 from agentic_fx.loops.improve_context import build_improve_context
 from agentic_fx.store import backlog
 from agentic_fx.store.db import connect, init_db
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+# precheck 2026-08-22: T8-B3 -- `settings` fixture does not exist anywhere in
+# the repo (tests/conftest.py has no `def settings`, and tests/loops/ has no
+# conftest.py). Follow the existing convention in
+# tests/loops/test_improve_forbidden.py:29 -- a module-level constant loaded
+# from the example settings file -- instead of a nonexistent fixture.
+SETTINGS = load_settings(
+    Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
 
 
-def test_context_has_all_top_level_sections(tmp_path, settings):
+def test_context_has_all_top_level_sections(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
-    ctx = build_improve_context(c, settings=settings, now=NOW, root=tmp_path,
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=None)
     assert set(ctx.keys()) >= {
         "performance_report", "improvement_history", "current_inventory",
         "backlog", "user_policy", "references"}
 
 
-def test_backlog_section_marks_partition_when_hint_given(tmp_path, settings):
+def test_backlog_section_marks_partition_when_hint_given(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
     b1 = backlog.add(c, "idea1", "user", NOW)
     b2 = backlog.add(c, "idea2", "user", NOW)
-    ctx = build_improve_context(c, settings=settings, now=NOW, root=tmp_path,
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=frozenset({b1}))
     items = {i["id"]: i for i in ctx["backlog"]["items"]}
     assert items[b1]["assigned"] is True
     assert items[b2]["assigned"] is False
 
 
-def test_backlog_section_no_partition_mark_for_manual_wave(tmp_path, settings):
+def test_backlog_section_no_partition_mark_for_manual_wave(tmp_path):
     """手動 wave (allowed_backlog_ids=None) は印を付けない (§3.2 表)。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     b1 = backlog.add(c, "idea1", "user", NOW)
-    ctx = build_improve_context(c, settings=settings, now=NOW, root=tmp_path,
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=None)
     item = next(i for i in ctx["backlog"]["items"] if i["id"] == b1)
     assert "assigned" not in item
 
 
-def test_backlog_section_includes_attempts_and_trial_count(tmp_path, settings):
+def test_backlog_section_includes_attempts_and_trial_count(tmp_path):
     """§3.2「各バックログ課題の試行回数と、strategy なら標本 (取引数) を
     添える (R8)」。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     bid = backlog.add(c, "idea", "user", NOW)
     backlog.select_for_mission(c, bid, now=NOW)
     backlog.set_status(c, bid, "observation", NOW, last_result="insufficient_trades:5")
-    ctx = build_improve_context(c, settings=settings, now=NOW, root=tmp_path,
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=None)
     item = next(i for i in ctx["backlog"]["items"] if i["id"] == bid)
     assert item["attempts"] == 1
     assert item["last_result"] == "insufficient_trades:5"
 
 
-def test_user_policy_section_is_tail_4000_chars(tmp_path, settings):
+def test_user_policy_section_is_tail_4000_chars(tmp_path):
     policy_path = tmp_path / "policy" / "directives.md"
     policy_path.parent.mkdir(parents=True)
     policy_path.write_text("x" * 5000)
     c = connect(tmp_path / "t.db"); init_db(c)
-    ctx = build_improve_context(c, settings=settings, now=NOW, root=tmp_path,
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=None)
     assert len(ctx["user_policy"]["tail"]) == 4000
 
 
-def test_references_section_has_staging_and_naming_convention(tmp_path, settings):
+def test_references_section_has_staging_and_naming_convention(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
-    ctx = build_improve_context(c, settings=settings, now=NOW, root=tmp_path,
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=None)
     assert "plugin_name_pattern" in ctx["references"]
     assert ctx["references"]["plugin_name_pattern"] == "^[a-z][a-z0-9_]{0,63}$"
 
 
-def test_performance_report_has_win_rate_and_pf_keys(tmp_path, settings):
+def test_performance_report_has_win_rate_and_pf_keys(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
-    ctx = build_improve_context(c, settings=settings, now=NOW, root=tmp_path,
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=None)
     assert {"win_rate", "profit_factor", "by_pair", "by_hour", "reject_breakdown",
            "hold_rate"} <= set(ctx["performance_report"].keys())
 ```
 
-(`settings` fixture は既存 `tests/conftest.py` の設定 fixture を使う。R-i14 (統合裁定): `Settings` に `paths` サブモデルは存在しない — plugins/policy のパスは `settings` からではなく `build_improve_context` の `root: Path` キーワード引数から `root / "plugins"` / `root / "policy" / "directives.md"` として導出する (`service.py:590` の現物パターンに合わせる)。上記テストが `root=tmp_path` を渡しているのはこのため。)
+(`SETTINGS` はファイル冒頭のモジュール定数 (B3、上記参照)。R-i14 (統合裁定): `Settings` に `paths` サブモデルは存在しない — plugins/policy のパスは `settings` からではなく `build_improve_context` の `root: Path` キーワード引数から `root / "plugins"` / `root / "policy" / "directives.md"` として導出する (`service.py:590` の現物パターンに合わせる)。上記テストが `root=tmp_path` を渡しているのはこのため。)
 
 - [ ] **Step 2: 失敗を確認**
 
@@ -11030,7 +11366,7 @@ improvement_backlog、ユーザー方針 = Policy.tail、参照 = RunContext
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -11046,7 +11382,8 @@ _PLUGIN_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 
 
 def _performance_report(conn: "sqlite3.Connection", now: datetime) -> dict:
-    since_30 = (now - timedelta(days=30)).isoformat()
+    # precheck 2026-08-22: T8-m7 -- 未使用の `timezone` import / `since_30`
+    # ローカル変数を削除 (window_days=[30, 90] の表示のみで実集計は 90 日窓)。
     since_90 = (now - timedelta(days=90)).isoformat()
     rows_90 = conn.execute(
         "SELECT payload_json, action, gate_result, reject_category, "
@@ -11226,7 +11563,30 @@ open / observation の課題一覧です。担当分担がある場合は印が�
    生成します)。
 ```
 
-`build_improve_context` の戻り値をこのテンプレートへ差し込む整形処理 (辞書 → Markdown テーブル文字列化等) は Task 10 の `ImproveLoop.prepare` が担う (`build_improve_context` は生データの辞書を返すだけ — テンプレートの `.format()`/レンダリングは commit 相の上位が行う。骨格 Interfaces 節の `build_improve_context` シグネチャに「テンプレートへ差し込む辞書を返す」とあるとおり、本節ではテンプレートのプレースホルダ名と `build_improve_context` の戻り値キーの対応表だけを固定する)。
+<!-- precheck 2026-08-22: T8-B8 T8-m14 -->
+`build_improve_context` の戻り値をこのテンプレートへ差し込む整形処理 (辞書 → Markdown テーブル文字列化等) は Task 10 の `ImproveLoop.prepare` が担う (`build_improve_context` は生データの辞書を返すだけ — テンプレートの `.format()`/レンダリングは commit 相の上位が行う)。**プレースホルダ⇔戻り値キーの対応表 (B8):**
+
+| テンプレートのプレースホルダ | 供給元 | 備考 |
+|---|---|---|
+| `{performance_window_days}` | `ctx["performance_report"]["window_days"]` | `[30, 90]` のうち表示用に選ぶ (Task 10 の裁量) |
+| `{win_rate}` | `ctx["performance_report"]["win_rate"]` | |
+| `{profit_factor}` | `ctx["performance_report"]["profit_factor"]` | |
+| `{by_pair}` | `ctx["performance_report"]["by_pair"]` | 辞書 → Markdown 化は Task 10 |
+| `{by_hour}` | `ctx["performance_report"]["by_hour"]` | 同上 |
+| `{reject_breakdown}` | `ctx["performance_report"]["reject_breakdown"]` | 同上 |
+| `{hold_rate}` | `ctx["performance_report"]["hold_rate"]` | |
+| `{improvement_history_table}` | `ctx["improvement_history"]["recent_runs"]` | m14: `_improvement_history` は**生の dict 列** (直近50件) を返すだけで Markdown 化しない — Task 10 が表 (id/backlog/idea/result/attempts/last_result) へレンダリングする |
+| `{approved_plugins}` | `ctx["current_inventory"]["approved_plugins"]` | |
+| `{news_sources}` | `ctx["current_inventory"]["news_sources"]` | |
+| `{risk_gate_summary}` | `ctx["current_inventory"]["risk_gate"]` | |
+| `{backlog_table}` | `ctx["backlog"]["items"]` | Task 10 が表へレンダリング (`assigned` の印含む) |
+| `{user_policy_tail}` | `ctx["user_policy"]["tail"]` | |
+| `{plugin_name_pattern}` | `ctx["references"]["plugin_name_pattern"]` | |
+| `{plugin_contract_summary}` | `ctx["references"]["plugin_contract_summary"]` | |
+| `{staging_dir}` | **`build_improve_context` の戻り値に無い** | Task 10 が `ImproveRunContext`/`ctx`(RunContext) 側から直接補う (`build_improve_context` は RunContext を知らない) |
+| `{source_snapshot_dir}` | **`build_improve_context` の戻り値に無い** | 同上 (Task 10 が RunContext から補う) |
+
+`prompt_text` というキーは `build_improve_context` の戻り値に存在しない (旧 Task 10 呼び出しの誤り — Task 10 節側の呼び出しコードを修正する、下記参照)。
 
 - [ ] **Step 5: 成功を確認 / Step 6: 変異テスト**
 
@@ -11532,24 +11892,25 @@ EOF
 **Consumes** (Task 8 が produce — 骨格 Interfaces 節を逐語):
 ```python
 # src/agentic_fx/store/improve_waves.py (Task 8 produces)
-# 骨格に明示の関数シグネチャは無い。本 task は DDL (骨格 §Task8 の DDL 骨子)
-# に対して直接 SQL を発行するのではなく、以下の Task 8 産出ヘルパを使う
-# (存在しない場合は Task 9 実装者が Task 8 の成果物を読み、命名を合わせて
-# 呼ぶ — 具体形は Task 8 の詳細節が正):
-#   improve_waves.create_wave_and_slots(conn, period_key, expected, now,
-#                                        commit=False) -> bool  # rowcount>0
-#   improve_waves.claim_slot(conn, period_key, k, mission_id, now,
-#                             commit=False) -> bool             # reserved->claimed CAS
-#   improve_waves.mark_running(conn, period_key, k, now, commit=False) -> None
-#   improve_waves.revert_to_reserved(conn, period_key, k, now,
-#                                     commit=False) -> None      # claimed->reserved, mission_id=NULL
-#   improve_waves.mark_slot_failed(conn, period_key, k, now, commit=False) -> None
-#   improve_waves.count_open_slots(conn, period_key) -> int      # reserved 数
+# precheck 2026-08-22: T8-B7 追随 -- 全関数が kw 専用 (R11)。位置引数の
+# 疑似コードを Task 8 8-F の確定シグネチャに合わせて修正する:
+#   improve_waves.create_wave_and_slots(conn, *, period_key, now, expected,
+#                                        commit=True) -> bool  # rowcount>0
+#   improve_waves.claim_slot(conn, *, period_key, k, mission_id, now,
+#                             commit=True) -> bool             # reserved->claimed CAS
+#   improve_waves.mark_running(conn, *, period_key, k, now, commit=True) -> bool
+#   improve_waves.revert_to_reserved(conn, *, period_key, k, now,
+#                                     commit=True) -> bool       # claimed->reserved, mission_id=NULL
+#   improve_waves.mark_slot_failed(conn, *, period_key, k, now, commit=True) -> None
+#   improve_waves.count_open_slots(conn, *, period_key) -> int   # reserved 数
 
 # src/agentic_fx/store/missions.py (Task 8 が commit=False 変種を追加)
+# precheck 2026-08-22: T8-B1 T8-B9 追随
 def start(conn, loop, runner, model, *, now, commit=False) -> int: ...
 def finish_improve_mission(conn, *, mission_id, run_id, slot_key, mission_status,
-                            run_result, backlog_transition, commit=False) -> None: ...
+                            run_result, backlog_transition, now,
+                            approval_id=None, report_path=None,
+                            report_state="none", commit=False) -> None: ...
 
 # src/agentic_fx/store/improve_runs.py (Task 8 produces)
 def start(conn, backlog_id, *, mission_id, now, commit=False) -> int: ...
@@ -11884,7 +12245,7 @@ def test_wave_creation_writes_wave_and_m_slots_in_one_tx(conn, monkeypatch):
     """M = min(parallel, 空き) 個の reserved slot が wave 行と**同じ commit**
     で現れる (part-way な状態が外部から観測できない — 単一 tx pin)。"""
     now = datetime(2026, 8, 22, 3, 0)
-    ok = improve_waves.create_wave_and_slots(conn, "2026-W34", 2, now, commit=True)
+    ok = improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=2, commit=True)
     assert ok is True
     wave = conn.execute(
         "SELECT * FROM improve_waves WHERE period_key='2026-W34'").fetchone()
@@ -11902,8 +12263,8 @@ def test_wave_creation_is_idempotent_second_call_no_op(conn):
     """`INSERT OR IGNORE` — 同じ period_key への 2 回目の呼び出しは
     rowcount=0 (起動権を得られない) で slot も増えない。"""
     now = datetime(2026, 8, 22, 3, 0)
-    first = improve_waves.create_wave_and_slots(conn, "2026-W34", 2, now, commit=True)
-    second = improve_waves.create_wave_and_slots(conn, "2026-W34", 2, now, commit=True)
+    first = improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=2, commit=True)
+    second = improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=2, commit=True)
     assert first is True
     assert second is False
     n = conn.execute(
@@ -11998,7 +12359,7 @@ class ImproveSupervisor:
             if m == 0:
                 return
             created = improve_waves.create_wave_and_slots(
-                conn, period_key, m, now, commit=True)
+                conn, period_key=period_key, now=now, expected=m, commit=True)
             if not created:
                 return  # 既に消費済みの period (再 tick)
             for k in range(m):
@@ -12111,7 +12472,8 @@ class _FakeImproveLoop:
     def prepare(self, *, slot_key, now):
         period_key, k = slot_key
         claimed = improve_waves.claim_slot(
-            self._conn, period_key, k, self._mission_id, now, commit=True)
+            self._conn, period_key=period_key, k=k, mission_id=self._mission_id,
+            now=now, commit=True)
         if not claimed:
             raise RuntimeError(
                 f"slot claim failed for {slot_key!r} — "
@@ -12129,7 +12491,7 @@ def test_three_way_launch_order_prepare_then_spawn_then_ready_then_running_commi
     (この時点でまだ go を送らない) → go → run → commit()、の順序を固定する。"""
     events: list[str] = []
     now = datetime(2026, 8, 22, 3, 0)
-    improve_waves.create_wave_and_slots(conn, "2026-W34", 1, now, commit=True)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
 
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
@@ -12156,7 +12518,7 @@ def test_go_is_not_sent_before_running_commit(conn):
     commit 前に go 呼び出しが記録されたら fail。"""
     events: list[str] = []
     now = datetime(2026, 8, 22, 3, 0)
-    improve_waves.create_wave_and_slots(conn, "2026-W34", 1, now, commit=True)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
 
     class _OrderCheckingRunner(_RecordingFakeWorkerRunner):
         def send_go(self):
@@ -12203,7 +12565,7 @@ uv run pytest tests/core/test_improve_wave_slot_protocol.py -v -k "three_way or 
         conn = self._conn()
         try:
             improve_waves.mark_running(
-                conn, period_key, k, self._clock.now(), commit=True)
+                conn, period_key=period_key, k=k, now=self._clock.now(), commit=True)
         finally:
             conn.close()
         runner.send_go()
@@ -12254,7 +12616,7 @@ EOF
 ```python
 def test_pre_ready_failure_reverts_to_reserved_with_mission_id_null(conn):
     now = datetime(2026, 8, 22, 3, 0)
-    improve_waves.create_wave_and_slots(conn, "2026-W34", 1, now, commit=True)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
                              clock=_FixedClock(now), db_path=Path("x"),
@@ -12280,7 +12642,7 @@ def test_pre_ready_failure_reverts_to_reserved_with_mission_id_null(conn):
 def test_pre_ready_failure_second_attempt_goes_to_failed(conn):
     """spawn_attempts が 2 に達したら (初回 + 再試行 1 回) failed へ収束する。"""
     now = datetime(2026, 8, 22, 3, 0)
-    improve_waves.create_wave_and_slots(conn, "2026-W34", 1, now, commit=True)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
                              clock=_FixedClock(now), db_path=Path("x"),
@@ -12310,7 +12672,7 @@ def test_pre_ready_failure_also_covers_ready_timeout_before_running_commit(conn)
     """`ready` 受信前の timeout も pre-ready 失敗と同じ経路 (spawn 成功後、
     ready が来ない/timeout するケース)。"""
     now = datetime(2026, 8, 22, 3, 0)
-    improve_waves.create_wave_and_slots(conn, "2026-W34", 1, now, commit=True)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
                              clock=_FixedClock(now), db_path=Path("x"),
@@ -12352,10 +12714,10 @@ uv run pytest tests/core/test_improve_wave_slot_protocol.py -v -k "pre_ready"
             attempts = row["spawn_attempts"]
             if attempts < _MAX_SPAWN_ATTEMPTS:
                 improve_waves.revert_to_reserved(
-                    conn, period_key, k, now, commit=True)
+                    conn, period_key=period_key, k=k, now=now, commit=True)
             else:
                 improve_waves.mark_slot_failed(
-                    conn, period_key, k, now, commit=True)
+                    conn, period_key=period_key, k=k, now=now, commit=True)
         finally:
             conn.close()
 ```
@@ -12451,7 +12813,7 @@ def test_n4_concurrent_slots_no_connection_sharing_no_mixup(tmp_path):
     conn0 = db_mod.connect(db_path)
     db_mod.init_db(conn0)
     now = datetime(2026, 8, 22, 3, 0)
-    improve_waves.create_wave_and_slots(conn0, "2026-W34", 4, now, commit=True)
+    improve_waves.create_wave_and_slots(conn0, period_key="2026-W34", now=now, expected=4, commit=True)
     conn0.close()
 
     sup = ImproveSupervisor(capacity=4, root=tmp_path,
@@ -12479,7 +12841,8 @@ def test_n4_concurrent_slots_no_connection_sharing_no_mixup(tmp_path):
             try:
                 mission_id = 100 + k
                 claimed = improve_waves.claim_slot(
-                    conn, period_key, k, mission_id, now, commit=True)
+                    conn, period_key=period_key, k=k, mission_id=mission_id,
+                    now=now, commit=True)
                 assert claimed, f"slot {slot_key!r} already claimed"
             finally:
                 conn.close()
@@ -12622,7 +12985,7 @@ class ImproveSupervisor:
             if m == 0:
                 return
             created = improve_waves.create_wave_and_slots(
-                conn, period_key, m, now, commit=True)
+                conn, period_key=period_key, now=now, expected=m, commit=True)
             if not created:
                 return
             pending_ks = list(range(m))
@@ -12669,7 +13032,7 @@ class ImproveSupervisor:
         conn = self._conn()
         try:
             improve_waves.mark_running(
-                conn, period_key, k, self._clock.now(), commit=True)
+                conn, period_key=period_key, k=k, now=self._clock.now(), commit=True)
         finally:
             conn.close()
         runner.send_go()
@@ -12687,10 +13050,10 @@ class ImproveSupervisor:
             attempts = row["spawn_attempts"]
             if attempts < _MAX_SPAWN_ATTEMPTS:
                 improve_waves.revert_to_reserved(
-                    conn, period_key, k, now, commit=True)
+                    conn, period_key=period_key, k=k, now=now, commit=True)
             else:
                 improve_waves.mark_slot_failed(
-                    conn, period_key, k, now, commit=True)
+                    conn, period_key=period_key, k=k, now=now, commit=True)
         finally:
             conn.close()
 
@@ -13225,8 +13588,11 @@ class ImproveRpcLedger:
     def mark_discarded(self) -> None: ...
 
 # Task 8: store 層 (骨格 Interfaces を逐語)
+# precheck 2026-08-22: T8-B1 T8-B9 追随
 def finish_improve_mission(conn, *, mission_id, run_id, slot_key, mission_status,
-                            run_result, backlog_transition, commit=False) -> None: ...
+                            run_result, backlog_transition, now,
+                            approval_id=None, report_path=None,
+                            report_state="none", commit=False) -> None: ...
 def apply_approval_outcome(conn, *, backlog_id, outcome, reason, now, commit=False) -> None: ...
 # commit=False 変種一覧 (骨格 §Task8):
 #   missions.start / missions.finish / save_harness_run / approvals.create /
@@ -13520,7 +13886,8 @@ class ImproveLoop:
                 if slot_key is not None:
                     period_key, k = slot_key
                     claimed = improve_waves.claim_slot(
-                        conn, period_key, k, mission_id, now, commit=False)
+                        conn, period_key=period_key, k=k, mission_id=mission_id,
+                        now=now, commit=False)
                     if not claimed:
                         raise RuntimeError(
                             f"slot claim failed for {slot_key!r} — "
@@ -13548,10 +13915,17 @@ class ImproveLoop:
             allowed_backlog_ids=allowed_ids, slot_key=slot_key, ledger=ledger,
             rpc_handlers=rpc_handlers)
 
-        prompt = build_improve_context(
-            conn, settings=self._settings, now=now,
+        # precheck 2026-08-22: T8-B8 追随 -- root= が欠落し戻り値キー
+        # `prompt_text` も非実在だった (build_improve_context は
+        # performance_report/improvement_history/current_inventory/backlog/
+        # user_policy/references の 6 キーの生データ辞書を返すのみ)。
+        # レンダリング (テンプレート .format()) は本メソッドの責務 —
+        # 8-I の対応表 (プレースホルダ⇔戻り値キー) に従って組み立てる。
+        ctx_data = build_improve_context(
+            conn, settings=self._settings, now=now, root=self._root,
             allowed_backlog_ids=allowed_ids)
-        mission = Mission(prompt=prompt["prompt_text"], tools=[],
+        prompt_text = self._render_improve_mission_prompt(ctx_data, ctx=ctx)
+        mission = Mission(prompt=prompt_text, tools=[],
                           output_schema={}, max_turns=self._settings.improve.mission_max_turns,
                           timeout_sec=self._settings.improve.mission_timeout_sec)
         runner = self._build_worker_runner(ctx)
@@ -15781,10 +16155,13 @@ class ImproveLoop:
                 approval_id = approvals_store.create(
                     conn, kind="plugin", payload=approval_payload, now=now,
                     commit=False)
+                # precheck 2026-08-22: T8-B1 T8-B9 追随 -- now= が欠落し、
+                # approval_id も backlog_transition からは拾われない
+                # (finish_improve_mission は独立 kw で受け取る — B9)。
                 missions_store.finish_improve_mission(
                     conn, mission_id=mission_id, run_id=run_id,
                     slot_key=slot_key, mission_status="completed",
-                    run_result="approval",
+                    run_result="approval", now=now, approval_id=approval_id,
                     backlog_transition={
                         "backlog_id": backlog_id, "status": "selected",
                         "last_result": f"approval_pending:{approval_id}"},
@@ -15876,9 +16253,11 @@ class ImproveLoop:
                                 backlog_id, slot_key, now) -> None:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # precheck 2026-08-22: T8-B1 追随 -- now= が欠落していた。
             missions_store.finish_improve_mission(
                 conn, mission_id=mission_id, run_id=run_id,
                 slot_key=slot_key, mission_status="failed", run_result=None,
+                now=now,
                 backlog_transition=(
                     {"backlog_id": backlog_id, "status": "observation",
                      "last_result": "commit_failed"}
@@ -16574,7 +16953,7 @@ EOF
         conn = self._conn()
         try:
             improve_waves.mark_running(
-                conn, period_key, k, self._clock.now(), commit=True)
+                conn, period_key=period_key, k=k, now=self._clock.now(), commit=True)
         finally:
             conn.close()
         runner.send_go()
