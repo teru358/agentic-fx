@@ -12,16 +12,18 @@ if TYPE_CHECKING:
 
 
 def start(conn: sqlite3.Connection, loop: str, runner: str, model: str,
-          now: datetime, trigger: str | None = None) -> int:
+          now: datetime, trigger: str | None = None, *, commit: bool = True) -> int:
     cur = conn.execute(
         "INSERT INTO missions (loop, runner, model, status, started_at, trigger) "
         "VALUES (?,?,?,'running',?,?)", (loop, runner, model, now.isoformat(), trigger))
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.lastrowid
 
 
 def finish(conn: sqlite3.Connection, mission_id: int, status: str,
-           output: dict | None, transcript: list, now: datetime) -> bool:
+           output: dict | None, transcript: list, now: datetime,
+           *, commit: bool = True) -> bool:
     """missions 行を終端状態へ CAS 更新する (設計書 §4.7 codex C-4)。
 
     `WHERE status='running'` を満たさない (= 既に終端済み) 場合は影響行数
@@ -40,8 +42,55 @@ def finish(conn: sqlite3.Connection, mission_id: int, status: str,
          json.dumps(output, ensure_ascii=False) if output is not None else None,
          json.dumps(transcript, ensure_ascii=False),
          now.isoformat(), mission_id))
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.rowcount > 0
+
+
+def finish_improve_mission(
+        conn: sqlite3.Connection, *, mission_id: int, run_id: int,
+        slot_key: tuple[str, int] | None,
+        mission_status: str, run_result: str | None,
+        backlog_transition: dict | None,
+        now: datetime,
+        approval_id: int | None = None,
+        report_path: str | None = None,
+        report_state: str = "none",
+        output: dict | None = None, transcript: list | None = None,
+        commit: bool = True) -> None:
+    """slot(あれば) + mission + run + backlog を単一 tx で終端する唯一の
+    ヘルパ (§4.1、§8.1-21)。CAS (`missions.finish` の `WHERE status=
+    'running'`) が rowcount=0 なら例外 (呼び出し元がロールバック)。
+    `approval_id`/`report_path`/`report_state` は `improve_runs.finish`
+    へそのまま転送する独立 kw であり `backlog_transition` からは拾わない
+    (B9 — backlog_transition は `{"backlog_id","status","last_result"}`
+    の 3 キーのみで承認/レポート情報を持たない)。"""
+    from agentic_fx.store import backlog as backlog_mod
+    from agentic_fx.store import improve_runs as improve_runs_mod
+    from agentic_fx.store import improve_waves as improve_waves_mod
+
+    ok = finish(conn, mission_id, mission_status, output, transcript or [], now,
+               commit=False)
+    if not ok:
+        raise RuntimeError(
+            f"finish_improve_mission: mission {mission_id} is not 'running' "
+            "(already terminal — CAS rowcount=0)")
+    improve_runs_mod.finish(
+        conn, run_id, result=run_result, now=now,
+        approval_id=approval_id, report_path=report_path,
+        report_state=report_state, commit=False)
+    if backlog_transition is not None:
+        backlog_mod.set_status(
+            conn, backlog_transition["backlog_id"], backlog_transition["status"],
+            now, last_result=backlog_transition.get("last_result"), commit=False)
+    if slot_key is not None:
+        period_key, k = slot_key
+        slot_status = "done" if mission_status == "completed" else "failed"
+        improve_waves_mod.mark_terminal(
+            conn, period_key=period_key, k=k, status=slot_status, now=now,
+            commit=False)
+    if commit:
+        conn.commit()
 
 
 def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
@@ -72,6 +121,8 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
     try:
         running_ids = [r["id"] for r in conn.execute(
             "SELECT id FROM missions WHERE status='running'").fetchall()]
+        loop_by_id = {r["id"]: r["loop"] for r in conn.execute(
+            "SELECT id, loop FROM missions WHERE status='running'").fetchall()}
         for mid in running_ids:
             conn.execute(
                 "UPDATE missions SET status='interrupted', finished_at=? "
@@ -98,6 +149,29 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
                         "claimed_by_mission_id=NULL, claimed_at=NULL "
                         "WHERE id=?", (row["id"],))
                     signals_requeued += 1
+
+        # --- プラン 10 Task 8: improve レーンの起動時回収 (§4.1) ---
+        improve_mission_ids = [mid for mid in running_ids
+                               if loop_by_id.get(mid) == "improve"]
+        if improve_mission_ids:
+            placeholders2 = ",".join("?" * len(improve_mission_ids))
+            run_rows = conn.execute(
+                "SELECT id, backlog_id FROM improvement_runs "
+                f"WHERE mission_id IN ({placeholders2}) "
+                "AND finished_at IS NULL", improve_mission_ids).fetchall()
+            for run_row in run_rows:
+                conn.execute(
+                    "UPDATE improvement_runs SET finished_at=? "
+                    "WHERE id=?", (now.isoformat(), run_row["id"]))
+                if run_row["backlog_id"] is not None:
+                    conn.execute(
+                        "UPDATE improvement_backlog SET status='observation', "
+                        "last_result='interrupted', updated_at=? WHERE id=? "
+                        "AND status='selected'",
+                        (now.isoformat(), run_row["backlog_id"]))
+        from agentic_fx.store import improve_waves as improve_waves_mod
+        improve_waves_mod.recover_stale_slots(conn, now=now, commit=False)
+
         conn.commit()
         return {"missions_recovered": len(running_ids),
                 "signals_requeued": signals_requeued,
