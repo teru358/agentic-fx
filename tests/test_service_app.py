@@ -2571,3 +2571,312 @@ def test_build_app_close_gather_is_not_degraded(tmp_path):
         assert snapshot.rate is not None and snapshot.rate.value == 1.0
     finally:
         app.close()
+
+
+# ============================================================================
+# Step 19-24: Startup checks for CLI backends (プラン10 Task1)
+# ============================================================================
+
+def _root_with_settings(tmp_path, **overrides):
+    """`_init(tmp_path)` 済みの root で `config/settings.yaml` を yaml 経由で
+    上書きする。`overrides` はトップレベルキーの部分辞書 (既存キーとの
+    深いマージ — 例 `runner={"improve": {"backend": "claude", "model": "m"}}`
+    は `runner.improve.model` 以外の既存フィールドを保持する)。"""
+    import yaml as _yaml
+    _init(tmp_path)
+    path = tmp_path / "config" / "settings.yaml"
+    raw = _yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    def _deep_update(d, u):
+        for k, v in u.items():
+            if isinstance(v, dict) and isinstance(d.get(k), dict):
+                _deep_update(d[k], v)
+            else:
+                d[k] = v
+
+    _deep_update(raw, overrides)
+    path.write_text(_yaml.safe_dump(raw), encoding="utf-8")
+    return tmp_path
+
+
+def _find_vendor_codex_bin() -> str | None:
+    """`codex` (node ラッパ) を PATH で解決し、その隣の vendor native
+    バイナリを探す (裁定 R5)。無ければ `None` (呼び出し側で skip)。"""
+    import shutil as _shutil
+
+    wrapper = _shutil.which("codex")
+    if wrapper is None:
+        return None
+    pkg_root = Path(wrapper).resolve().parent.parent  # .../@openai/codex
+    candidates = sorted(pkg_root.glob("node_modules/@openai/codex-*/vendor/*/bin/codex"))
+    return str(candidates[0]) if candidates else None
+
+
+def test_build_app_rejects_when_runner_bin_not_resolvable(tmp_path, monkeypatch):
+    """①: `runner.improve.backend=claude` で `claude` が PATH 上に無く、
+    かつ絶対パスでもなければ起動拒否 (fail closed)。"""
+    import sys
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "claude", "model": "m"},
+        "claude": {"bin": "afx-nonexistent-claude-binary"}})
+    monkeypatch.setenv("PATH", "/nonexistent")
+    with pytest.raises(RuntimeError, match="claude"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+
+
+def test_build_app_rejects_when_trade_claude_bin_not_resolvable(tmp_path, monkeypatch):
+    """Minor 14 の再発防止: `runner.trade.backend=claude` 構成でも
+    `_check_cli_backend` が呼ばれる (旧実装は improve しか見ておらず、
+    trade+claude は起動時検査が一切走らないまま Mission 実行時に落ちて
+    いた)。"""
+    import sys
+    root = _root_with_settings(tmp_path, runner={
+        "trade": {"backend": "claude", "model": "m"},
+        "claude": {"bin": "afx-nonexistent-claude-binary"}})
+    monkeypatch.setenv("PATH", "/nonexistent")
+    with pytest.raises(RuntimeError, match="claude"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+
+
+def test_build_app_rejects_codex_node_wrapper(tmp_path):
+    """①: codex は ELF (vendor native) を要求し node ラッパを拒否する。"""
+    import sys
+    wrapper = tmp_path / "codex-wrapper.js"
+    wrapper.write_text("#!/usr/bin/env node\nrequire('./cli')\n")
+    wrapper.chmod(0o755)
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "codex", "model": "m"},
+        "codex": {"bin": str(wrapper)}})
+    with pytest.raises(RuntimeError, match="ELF|vendor native"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+
+
+def test_build_app_rejects_when_version_check_fails(tmp_path):
+    """②: `<bin> --version` が非 0 で返れば起動拒否。ELF 要求 (①) と
+    独立に検証するため backend=claude (`require_elf=False`) を使う —
+    codex はバイナリが ELF でなければ①で先に拒否されるため②単体を
+    観測できない。"""
+    fake_bin = tmp_path / "fake-claude"
+    fake_bin.write_text("#!/bin/sh\nexit 1\n")
+    fake_bin.chmod(0o755)
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "claude", "model": "m"},
+        "claude": {"bin": str(fake_bin)}})
+    with pytest.raises(RuntimeError, match="--version"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+
+
+def test_build_app_rejects_when_credentials_file_missing(tmp_path):
+    """③: claude/codex+chatgpt は認証ファイル必須 (codex+llama_swap は要求しない)。
+    codex+chatgpt を使うには①②を通す必要があるため vendor native codex を
+    使う (無ければ skip — 裁定 R5)。"""
+    import sys
+    vendor_codex = _find_vendor_codex_bin()
+    if vendor_codex is None:
+        pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "codex", "model": "m"},
+        "codex": {"bin": vendor_codex, "provider": "chatgpt",
+                  "auth_file": str(tmp_path / "no-such-file.json")}})
+    with pytest.raises(RuntimeError, match="credentials|auth"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+
+
+def test_build_app_does_not_require_credentials_for_codex_llama_swap(tmp_path):
+    """③ の裏: provider=llama_swap は auth_file 欠落でも起動時検査を通る
+    (§1.1-2「provider=llama_swap は空の scratch CODEX_HOME で起動」)。
+    `improve.llama_swap_verified=true` も併せて上書きする (さもないと
+    llama_swap 分岐自体が別理由で拒否する — 骨格 §1.1-2)。"""
+    import sys
+    vendor_codex = _find_vendor_codex_bin()
+    if vendor_codex is None:
+        pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "codex", "model": "m"},
+        "codex": {"bin": vendor_codex, "provider": "llama_swap",
+                  "auth_file": str(tmp_path / "absent")}},
+        improve={"llama_swap_verified": True})
+    build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())  # 例外を出さない
+
+
+def test_build_app_rejects_when_service_initial_env_has_secret_pattern(tmp_path, monkeypatch):
+    """⑤ の配線: improve+claude のとき `_check_service_initial_env_has_no_secrets`
+    が呼ばれ、例外がそのまま `build_app` から伝播する。検査本体 (`/proc/self/environ`
+    の読み取り・パターン照合の正しさ) は `test_check_service_initial_env_has_no_secrets_*`
+    (下記) が別途 pin する — ここでは配線のみを見る (R3: `monkeypatch.setenv` は
+    `/proc/self/environ` を書き換えないため、実環境の秘密漏れに依存したテストは
+    書けない、B1 の再発防止)。"""
+    import sys
+    import agentic_fx.service as service_mod
+
+    def _raise(settings, *, read_initial_env_names=None):
+        raise RuntimeError("SOME_SERVICE_API_KEY leaked")
+
+    monkeypatch.setattr(service_mod, "_check_service_initial_env_has_no_secrets", _raise)
+    creds_file = tmp_path / ".credentials.json"
+    creds_file.write_text('{"token":"x"}')
+    creds_file.chmod(0o600)
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "claude", "model": "m"},
+        "claude": {"bin": sys.executable, "credentials_file": str(creds_file)}})
+    with pytest.raises(RuntimeError, match="API_KEY"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+
+
+def test_build_app_does_not_check_secret_env_when_improve_backend_is_local(
+        tmp_path, monkeypatch):
+    """⑤ の裏: backend=local の環境では `_check_service_initial_env_has_no_secrets`
+    が一切呼ばれない (骨格 §1.4)。"""
+    import agentic_fx.service as service_mod
+
+    def _raise(settings, *, read_initial_env_names=None):
+        raise RuntimeError("must not be called for backend=local")
+
+    monkeypatch.setattr(service_mod, "_check_service_initial_env_has_no_secrets", _raise)
+    _init(tmp_path)  # improve.backend == "local" (example 既定)
+    build_app(tmp_path, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())  # 例外を出さない
+
+
+def test_check_service_initial_env_has_no_secrets_rejects_leaked_key_via_seam():
+    """⑤ 検査本体 (R3): seam に注入した名前集合に秘密パターンがあれば拒否する。
+    `settings` 引数は現状未使用 (呼び出し規約を `_check_cli_backend` と
+    揃えるために受け取るのみ) — ダミー値でよい。"""
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    with pytest.raises(RuntimeError, match="API_KEY|secret"):
+        _check_service_initial_env_has_no_secrets(
+            object(), read_initial_env_names=lambda: {"SOME_SERVICE_API_KEY", "HOME"})
+
+
+def test_check_service_initial_env_has_no_secrets_passes_when_seam_clean():
+    """⑤ の裏 (R3): 秘密パターンに一致する名前が無ければ何もしない。"""
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    _check_service_initial_env_has_no_secrets(
+        object(), read_initial_env_names=lambda: {"HOME", "PATH"})  # 例外を出さない
+
+
+def test_check_service_initial_env_has_no_secrets_default_seam_is_proc_self_environ():
+    """R3 の再発防止 pin (B1): 既定 seam が `_read_proc_self_environ_names`
+    (`/proc/self/environ` 読み取り) であること。`os.environ` ベースの reader に
+    すり替える変異はこの identity 比較で red になる — `os.environ` は
+    `.env`→`load_dotenv()` 由来のキーも含むため、そちらを既定にすると
+    「サービスは `.env` を使ってよい」という設計の前提 (§1.4-⑤) に反して
+    `.env` 運用が常に起動拒否になる (B1 の実際の欠陥)。"""
+    import inspect
+
+    from agentic_fx.service import (
+        _check_service_initial_env_has_no_secrets, _read_proc_self_environ_names,
+    )
+
+    sig = inspect.signature(_check_service_initial_env_has_no_secrets)
+    assert (sig.parameters["read_initial_env_names"].default
+            is _read_proc_self_environ_names)
+
+
+def test_read_proc_self_environ_names_reads_real_proc_self_environ():
+    """`_read_proc_self_environ_names` は実プロセスの `/proc/self/environ`
+    を読む (Linux 前提)。`HOME`/`PATH` は pytest プロセス自身に必ず存在する
+    ため実環境で検証できる。"""
+    from agentic_fx.service import _read_proc_self_environ_names
+
+    names = _read_proc_self_environ_names()
+    assert "PATH" in names
+
+
+def test_check_codex_subscription_expiry_rejects_when_expired(tmp_path):
+    """④ (設計書 §1.4、裁定 R4): `chatgpt_subscription_active_until` を
+    過ぎていれば起動拒否 (ERROR)。"""
+    from agentic_fx.service import _check_codex_subscription_expiry
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps(
+        {"chatgpt_subscription_active_until": "2020-01-01T00:00:00+00:00"}))
+    with pytest.raises(RuntimeError, match="expired"):
+        _check_codex_subscription_expiry(
+            str(auth), clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+
+def test_check_codex_subscription_expiry_warns_within_7_days(tmp_path, caplog):
+    """④ の境界: 期限まで 7 日以内なら WARNING のみ (起動は継続)。"""
+    import logging as _logging
+
+    from agentic_fx.service import _check_codex_subscription_expiry
+
+    active_until = datetime(2026, 1, 5, tzinfo=timezone.utc)
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps(
+        {"chatgpt_subscription_active_until": active_until.isoformat()}))
+    with caplog.at_level(_logging.WARNING, logger="agentic_fx.service"):
+        _check_codex_subscription_expiry(
+            str(auth), clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert any("expires soon" in r.message for r in caplog.records)
+
+
+def test_check_codex_subscription_expiry_passes_when_far_in_future(tmp_path, caplog):
+    """④ の裏: 期限まで 7 日超なら WARNING も ERROR も出さない。"""
+    import logging as _logging
+
+    from agentic_fx.service import _check_codex_subscription_expiry
+
+    active_until = datetime(2027, 1, 1, tzinfo=timezone.utc)
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps(
+        {"chatgpt_subscription_active_until": active_until.isoformat()}))
+    with caplog.at_level(_logging.WARNING, logger="agentic_fx.service"):
+        _check_codex_subscription_expiry(
+            str(auth), clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert caplog.records == []
+
+
+def test_check_codex_subscription_expiry_missing_key_warns_and_does_not_raise(
+        tmp_path, caplog):
+    """④: キー欠落は WARNING のみ (fail closed にしない — 形式未実測、裁定 R4)。"""
+    import logging as _logging
+
+    from agentic_fx.service import _check_codex_subscription_expiry
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({}))
+    with caplog.at_level(_logging.WARNING, logger="agentic_fx.service"):
+        _check_codex_subscription_expiry(str(auth))  # 例外を出さない
+    assert any("chatgpt_subscription_active_until" in r.message for r in caplog.records)
+
+
+def test_build_app_rejects_llama_swap_when_not_verified(tmp_path):
+    """M6: codex+llama_swap で llama_swap_verified=false なら拒否する。"""
+    import sys
+    vendor_codex = _find_vendor_codex_bin()
+    if vendor_codex is None:
+        pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
+    # llama_swap_verified は既定で False
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "codex", "model": "m"},
+        "codex": {"bin": vendor_codex, "provider": "llama_swap",
+                  "auth_file": str(tmp_path / "absent")}})
+    with pytest.raises(RuntimeError, match="llama_swap_verified"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+
+
+def test_build_app_wires_codex_subscription_expiry_check(tmp_path, monkeypatch):
+    """M13: codex+chatgpt のとき subscription expiry check が呼ばれる。"""
+    import sys
+    import agentic_fx.service as service_mod
+    
+    call_count = [0]
+    
+    def _check_expiry(auth_file, *, clock=None):
+        call_count[0] += 1
+    
+    monkeypatch.setattr(service_mod, "_check_codex_subscription_expiry", _check_expiry)
+    vendor_codex = _find_vendor_codex_bin()
+    if vendor_codex is None:
+        pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({"chatgpt_subscription_active_until": "2027-01-01T00:00:00+00:00"}))
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "codex", "model": "m"},
+        "codex": {"bin": vendor_codex, "provider": "chatgpt", "auth_file": str(auth)}})
+    build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    assert call_count[0] > 0, "_check_codex_subscription_expiry が呼ばれていない"
+
