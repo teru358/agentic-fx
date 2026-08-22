@@ -25,6 +25,7 @@ import calendar
 import logging
 import sqlite3
 from datetime import datetime, timezone
+from typing import Callable
 
 from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.runner import IntentSource, run_replay
@@ -113,27 +114,32 @@ def _run_scope(settings: Settings, *, scope: str,
               history_conn: sqlite3.Connection, symbol: str, source: str,
               intent_source: IntentSource, eval_timeframe: str,
               plugin_ref: str, content_hash: str, kind: str, now: datetime,
-              period_start: datetime, period_end: datetime) -> dict:
+              period_start: datetime, period_end: datetime,
+              record_fn: "Callable[[dict], int] | None" = None) -> dict:
     result = run_replay(
         settings, symbol=symbol, source=source, start=period_start,
         end=period_end, intent_source=intent_source,
         eval_timeframe=eval_timeframe, history_conn=history_conn)
     metrics = compute_metrics(result)
-    save_harness_run(
-        history_conn, scope=scope, plugin_ref=plugin_ref,
-        content_hash=content_hash, kind=kind, pair=symbol,
-        timeframe=eval_timeframe, source=source,
+    save_kwargs = dict(
+        scope=scope, plugin_ref=plugin_ref, content_hash=content_hash,
+        kind=kind, pair=symbol, timeframe=eval_timeframe, source=source,
         period=(period_start, period_end), metrics=metrics,
         settings_hash=settings_snapshot_hash(settings),
         core_commit=core_commit(),
         initial_balance=settings.backtest.initial_balance, now=now)
+    if record_fn is not None:
+        record_fn(save_kwargs)
+    else:
+        save_harness_run(history_conn, **save_kwargs)
     return dict(metrics)
 
 
 def run_in_sample(settings: Settings, *, history_conn: sqlite3.Connection,
                   symbol: str, source: str, intent_source: IntentSource,
                   eval_timeframe: str, plugin_ref: str, content_hash: str,
-                  kind: str, now: datetime) -> dict:
+                  kind: str, now: datetime,
+                  record_fn: "Callable[[dict], int] | None" = None) -> dict:
     """in-sample 期間 (source の最古バー, ``holdout_boundary(now)``) を再生し、
     ``backtest_runs.save_harness_run(scope="in_sample")`` に保存する。
 
@@ -161,13 +167,14 @@ def run_in_sample(settings: Settings, *, history_conn: sqlite3.Connection,
         symbol=symbol, source=source, intent_source=intent_source,
         eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
         content_hash=content_hash, kind=kind, now=now_norm,
-        period_start=start, period_end=boundary)
+        period_start=start, period_end=boundary, record_fn=record_fn)
 
 
 def run_holdout_gate(settings: Settings, *, history_conn: sqlite3.Connection,
                      symbol: str, source: str, intent_source: IntentSource,
                      eval_timeframe: str, plugin_ref: str, content_hash: str,
-                     kind: str, now: datetime) -> dict:
+                     kind: str, now: datetime,
+                     record_fn: "Callable[[dict], int] | None" = None) -> dict:
     """holdout 期間 (``holdout_boundary(now)``, now) を再生し、
     ``backtest_runs.save_harness_run(scope="holdout_gate")`` に保存する。
 
@@ -183,4 +190,4 @@ def run_holdout_gate(settings: Settings, *, history_conn: sqlite3.Connection,
         symbol=symbol, source=source, intent_source=intent_source,
         eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
         content_hash=content_hash, kind=kind, now=now_norm,
-        period_start=boundary, period_end=now_norm)
+        period_start=boundary, period_end=now_norm, record_fn=record_fn)

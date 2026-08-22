@@ -676,3 +676,32 @@ def test_corr_matrix_perfect_positive_and_negative_correlation(tmp_path):
                     source="dukascopy", in_sample_until=FAR_FUTURE)
     assert m[("AAA", "BBB")] == pytest.approx(1.0, abs=1e-9)
     assert m[("AAA", "CCC")] == pytest.approx(-1.0, abs=1e-9)
+
+
+def test_analyze_for_agent_persist_false_does_not_write_analysis_runs(tmp_path):
+    """Task 7-D: persist=False は analysis_runs へ書かず、保存パラメータ
+    (params/trial_count/source) を返す。"""
+    conn = _conn(tmp_path)
+    _seed_two_series(conn, start=BEFORE_BOUNDARY)
+    before = conn.execute(
+        "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
+    result = analyze_for_agent(conn, _settings_watch_eurusd(),
+                               {"kind": "corr_matrix", "timeframe": "1h"},
+                               now=NOW, persist=False)
+    after = conn.execute(
+        "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
+    assert after == before
+    assert "params" in result and "trial_count" in result and "source" in result
+
+
+def test_analyze_for_agent_persist_true_keeps_existing_behavior(tmp_path):
+    """既定 persist=True は従来どおり analysis_runs へ書く (回帰なし)。"""
+    conn = _conn(tmp_path)
+    _seed_two_series(conn, start=BEFORE_BOUNDARY)
+    before = conn.execute(
+        "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
+    analyze_for_agent(conn, _settings_watch_eurusd(),
+                      {"kind": "corr_matrix", "timeframe": "1h"}, now=NOW)
+    after = conn.execute(
+        "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
+    assert after == before + 1
