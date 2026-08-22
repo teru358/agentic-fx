@@ -25,6 +25,7 @@ from agentic_fx.backtest.holdout import holdout_boundary
 from agentic_fx.config import load_settings
 from agentic_fx.entry import main
 from agentic_fx.plugin import approval
+from agentic_fx.plugin.gate_pytest import GateResult
 from agentic_fx.plugin.loader import PluginMeta, content_hash as real_content_hash
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import ohlcv as ohlcv_store
@@ -106,12 +107,14 @@ def _signal_meta(d: Path, *, name: str = "sig") -> PluginMeta:
                       content_hash=real_content_hash(d))
 
 
-def _ok_pytest_runner(_path: Path) -> dict:
-    return {"returncode": 0, "stdout": "1 passed in 0.01s"}
+def _ok_pytest_runner(_path: Path) -> GateResult:
+    return GateResult(passed=True, returncode=0,
+                      stdout_tail="1 passed in 0.01s", duration_sec=0.01)
 
 
-def _fail_pytest_runner(_path: Path) -> dict:
-    return {"returncode": 1, "stdout": "1 failed in 0.01s"}
+def _fail_pytest_runner(_path: Path) -> GateResult:
+    return GateResult(passed=False, returncode=1,
+                      stdout_tail="1 failed in 0.01s", duration_sec=0.01)
 
 
 def _count_rows(conn: sqlite3.Connection) -> int:
@@ -230,7 +233,7 @@ def test_content_hash_tampered_during_verification_raises_value_error(
     meta = _indicator_meta(d, name="ind_toctou")
     conn = _conn(tmp_path)
 
-    def tampering_pytest_runner(path: Path) -> dict:
+    def tampering_pytest_runner(path: Path) -> GateResult:
         # 検証 (pytest 実行) のタイミングで plugin.py の内容を変える —
         # check_source/pytest はこの変更後の内容に対して実行される (=
         # 「良性版に差し替えて検証を通す」の代わりに単に内容を変えるだけ
@@ -304,7 +307,7 @@ def test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
 
     pytest_calls: list[Path] = []
 
-    def counting_ok_runner(path: Path) -> dict:
+    def counting_ok_runner(path: Path) -> GateResult:
         pytest_calls.append(path)
         return _ok_pytest_runner(path)
 
@@ -605,82 +608,6 @@ def test_plugin_py_check_source_runs_before_pytest(tmp_path, settings):
         approval.submit_plugin(conn, meta, settings=settings, now=NOW,
                                pytest_runner=spy_runner)
     assert called == []
-
-
-# --- F4 (レビュー fix round 1, codex Important): pytest プロセスグループ回収 -
-
-
-def test_default_pytest_runner_starts_new_session(tmp_path):
-    """F4: `_default_pytest_runner` が `start_new_session=True` で起動
-    すること (孫プロセスの孤児化を防ぐための前提条件) を、実サブプロセス
-    を起動せず fake `Popen` で確認する。"""
-    fake_proc = MagicMock()
-    fake_proc.communicate.return_value = ("1 passed", "")
-    fake_proc.returncode = 0
-
-    with patch("agentic_fx.plugin.approval.subprocess.Popen",
-               return_value=fake_proc) as popen_mock:
-        result = approval._default_pytest_runner(tmp_path / "test_plugin.py")
-
-    assert result == {"returncode": 0, "stdout": "1 passed", "stderr": ""}
-    _, kwargs = popen_mock.call_args
-    assert kwargs.get("start_new_session") is True
-
-
-# --- 最終レビュー F4 (F3 の重ね、多層防御): --noconftest ------------------
-
-
-def test_default_pytest_runner_passes_noconftest(tmp_path):
-    """`_default_pytest_runner` が pytest_sandbox_entry 経由で spawn する
-    こと（プラン 8 B 束）。F3 (loader.py の discover reject) は plugin
-    フォルダ**直下**の conftest.py しか塞げない — 親ディレクトリ側に置かれた
-    conftest.py を pytest が自動収集する経路への多層防御として、
-    pytest_sandbox_entry が内部で pytest.main() に --noconftest を渡す
-    （pytest 起動をこのモジュール経由に変更したため、argv 検査から
-    モジュール名検査に切り替え）。"""
-    fake_proc = MagicMock()
-    fake_proc.communicate.return_value = ("1 passed", "")
-    fake_proc.returncode = 0
-
-    with patch("agentic_fx.plugin.approval.subprocess.Popen",
-               return_value=fake_proc) as popen_mock:
-        approval._default_pytest_runner(tmp_path / "test_plugin.py")
-
-    (argv,), _ = popen_mock.call_args
-    # プラン 8 B 束: pytest 直接ではなく pytest_sandbox_entry 経由
-    assert argv[2] == "agentic_fx.plugin.pytest_sandbox_entry"
-
-
-def test_default_pytest_runner_kills_process_group_on_timeout(tmp_path):
-    """F4: timeout 発生時、直接の子だけでなくプロセスグループ全体を
-    `os.killpg` で回収すること (孫プロセスの孤児化防止)。実タイムアウトは
-    起こさず (実スリープ禁止)、`communicate()` が `TimeoutExpired` を
-    送出するケースを fake で再現する。"""
-    fake_proc = MagicMock()
-    fake_proc.pid = 12345
-    fake_proc.communicate.side_effect = subprocess.TimeoutExpired(
-        cmd="pytest", timeout=approval._PYTEST_TIMEOUT_SEC)
-
-    with patch("agentic_fx.plugin.approval.subprocess.Popen",
-               return_value=fake_proc), \
-         patch("agentic_fx.plugin.approval.os.getpgid",
-               return_value=999) as getpgid_mock, \
-         patch("agentic_fx.plugin.approval.os.killpg") as killpg_mock:
-        with pytest.raises(ValueError, match="timed out"):
-            approval._default_pytest_runner(tmp_path / "test_plugin.py")
-
-    getpgid_mock.assert_called_once_with(12345)
-    killpg_mock.assert_called_once_with(999, signal.SIGKILL)
-    fake_proc.wait.assert_called_once()
-
-
-def test_pytest_sandbox_entry_passes_noconftest_to_pytest_main():
-    """pytest_sandbox_entry.main() が pytest.main() に
-    '--noconftest' を含むargv で呼び出すことを直接ピンする (CRITICAL)。
-    --noconftest を削除する変異は本テストで赤になることを確認。"""
-    from agentic_fx.plugin import pytest_sandbox_entry as entry
-    import sys
-
     captured = {}
 
     def fake_main(args):
@@ -733,9 +660,14 @@ def test_pytest_sandbox_entry_calls_poison_before_pytest():
         "Both poison and pytest must be called exactly once each"
 
 
-# --- 統合テスト①: 既定 pytest_runner の実サブプロセス実行 ---------------
+# --- 統合テスト①: 既定 pytest_runner が run_gate_pytest に置き替わったこと ---
 
-def test_integration_default_pytest_runner_real_subprocess(tmp_path, settings):
+def test_integration_submit_plugin_uses_gate_pytest_by_default(tmp_path, settings):
+    """既定 pytest_runner が `run_gate_pytest`(Landlock 実プロセス)に
+    差し替わっていること — pytest_runner を渡さず submit_plugin を呼ぶ。"""
+    from agentic_fx.core.landlock import is_available
+    if not is_available():
+        pytest.skip("Landlock not available on this kernel/architecture")
     d = _write_plugin(tmp_path, "ind_real", kind="indicator",
                       plugin_py=INDICATOR_PY, config_yaml="kind: indicator\n")
     meta = _indicator_meta(d, name="ind_real")
@@ -744,13 +676,44 @@ def test_integration_default_pytest_runner_real_subprocess(tmp_path, settings):
     started = time.perf_counter()
     approval_id = approval.submit_plugin(conn, meta, settings=settings, now=NOW)
     elapsed = time.perf_counter() - started
-    print(f"\n[Task 6 実測] indicator submit (実 pytest subprocess): "
+    print(f"\n[Task 6 実測] indicator submit (gate pytest, Landlock 実プロセス): "
          f"{elapsed:.3f}s")
 
     row = conn.execute(
         "SELECT status FROM approval_requests WHERE id=?",
         (approval_id,)).fetchone()
     assert row["status"] == "pending"
+
+
+def test_default_pytest_runner_is_removed():
+    """裁定2: `_default_pytest_runner` は削除され参照ゼロ (grep pin)。"""
+    from agentic_fx.plugin import approval
+    assert not hasattr(approval, "_default_pytest_runner")
+
+
+def test_pytest_runner_receives_plugin_directory_not_file_path(tmp_path, settings):
+    """`pytest_runner` は plugin ディレクトリを受け取る (6-C 契約変更)。
+    ファイルパスを渡していた旧実装に戻す変異を kill するテスト。"""
+    d = _write_plugin(tmp_path, "ind_dir_check", kind="indicator",
+                      plugin_py=INDICATOR_PY, config_yaml="kind: indicator\n")
+    meta = _indicator_meta(d, name="ind_dir_check")
+    conn = _conn(tmp_path)
+
+    received_path = None
+
+    def spy_runner(path):
+        nonlocal received_path
+        received_path = path
+        return _ok_pytest_runner(path)
+
+    approval_id = approval.submit_plugin(
+        conn, meta, settings=settings, now=NOW, pytest_runner=spy_runner)
+
+    # pytest_runner は meta.path (ディレクトリ) を受け取るべき、
+    # test_plugin.py (ファイル) ではない
+    assert received_path == meta.path
+    assert received_path.is_dir()
+    assert (received_path / "test_plugin.py").is_file()
 
 
 # --- 統合テスト②: strategy 経路の実 PluginSession + 実 run_in_sample -----
@@ -881,74 +844,3 @@ def test_entry_plugin_submit_validation_failure_rc1(tmp_path, monkeypatch, capsy
     assert rc == 1
     run_service.assert_not_called()
     assert "エラー" in capsys.readouterr().err
-
-# --- プラン 8 Task 2: pytest サンドボックス増強 (env/rlimit/poison) ---
-
-
-def test_pytest_rlimit_preexec_sets_expected_limits(monkeypatch):
-    """approval._pytest_rlimit_preexec が返す関数が正しい rlimit 呼び出しをする。"""
-    import resource
-
-    from agentic_fx.plugin import approval
-
-    calls: list[tuple[int, tuple[int, int]]] = []
-    monkeypatch.setattr(
-        approval.resource, "setrlimit",
-        lambda which, limits: calls.append((which, limits)))
-
-    fn = approval._pytest_rlimit_preexec(memory_mb=256, nofile=64, fsize_mb=4)
-    fn()
-
-    kinds = {w: v for w, v in calls}
-    assert kinds[resource.RLIMIT_AS] == (256 * 1024 * 1024, 256 * 1024 * 1024)
-    assert kinds[resource.RLIMIT_NOFILE] == (64, 64)
-    assert kinds[resource.RLIMIT_FSIZE] == (4 * 1024 * 1024, 4 * 1024 * 1024)
-
-
-def test_default_pytest_runner_uses_minimal_env(monkeypatch, tmp_path):
-    """_default_pytest_runner が subprocess.Popen に最小 env を渡す
-    (AFX_* 等の秘密が子へ伝播しない)。"""
-    from agentic_fx.plugin import approval
-
-    captured: dict = {}
-
-    class FakeProc:
-        returncode = 0
-
-        def communicate(self, timeout):
-            return "1 passed", ""
-
-    def fake_popen(args, **kwargs):
-        captured["args"] = args
-        captured["env"] = kwargs.get("env")
-        captured["preexec_fn"] = kwargs.get("preexec_fn")
-        return FakeProc()
-
-    monkeypatch.setenv("AFX_SECRET_TOKEN", "must-not-leak")
-    monkeypatch.setattr(approval.subprocess, "Popen", fake_popen)
-
-    test_plugin_path = tmp_path / "test_plugin.py"
-    test_plugin_path.write_text("def test_x():\n    assert True\n")
-    approval._default_pytest_runner(test_plugin_path)
-
-    assert "AFX_SECRET_TOKEN" not in captured["env"]
-    assert captured["env"]["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
-    assert captured["args"][:3] == [
-        approval.sys.executable, "-m", "agentic_fx.plugin.pytest_sandbox_entry"]
-    assert captured["preexec_fn"] is not None
-
-
-def test_default_pytest_runner_real_subprocess_exits_zero_after_poison(tmp_path):
-    """モックなしで `_default_pytest_runner` を実行し、ネットワーク毒入れ後
-    でも pytest が実際に収集・実行を完了して exit=0 を返すことを確認する
-    (FC-3: poison 後に entry-point プラグインの socket import で exit=1
-    になっていた回帰の実測ピン)。"""
-    from agentic_fx.plugin import approval
-
-    test_plugin_path = tmp_path / "test_plugin.py"
-    test_plugin_path.write_text("def test_x():\n    assert True\n")
-
-    result = approval._default_pytest_runner(test_plugin_path)
-
-    assert result["returncode"] == 0, result["stdout"] + result["stderr"]
-    assert "1 passed" in result["stdout"]

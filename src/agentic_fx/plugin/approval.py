@@ -66,6 +66,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from agentic_fx.backtest import holdout
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
 from agentic_fx.plugin import strategy_adapter
+from agentic_fx.plugin.gate_pytest import GateResult, run_gate_pytest
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.loader import content_hash as _recompute_content_hash
 from agentic_fx.plugin.sandbox import SandboxError, check_source
@@ -73,11 +74,10 @@ from agentic_fx.plugin.signal_eval import SandboxRunFn, evaluate_detection
 from agentic_fx.store import approvals as approvals_store
 
 if TYPE_CHECKING:
-    from agentic_fx.config import PluginSettings, Settings
+    from agentic_fx.config import Settings
 
-# pytest_runner 注入シームの型: test_plugin.py の絶対パス → 少なくとも
-# {"returncode": int, "stdout": str} を持つ dict。
-PytestRunnerFn = Callable[[Path], dict[str, Any]]
+# pytest_runner 注入シームの型: plugin ディレクトリ → GateResult。
+PytestRunnerFn = Callable[[Path], GateResult]
 
 # run_in_sample_fn 注入シームの型: holdout.run_in_sample と同じキーワード
 # 専用シグネチャで呼ばれる (settings は位置引数)。
@@ -89,13 +89,6 @@ _NOTE = "バックテスト成績は実運用成績の予測値ではない (足
 # "24h" へ写像する (runner.parse_timeframe が "1d" を受理しないため)。
 _EVAL_TIMEFRAME_OVERRIDE = {"1d": "24h"}
 
-# 既定 pytest 実行の待ち上限。sandbox.py の call() 用 sandbox_timeout_sec
-# (既定 10s) とは別枠 — こちらは test_plugin.py 一式 (pandas import 含む)
-# を実行するため、暴走 test_plugin.py に対する独自のタイムアウト防御を持つ
-# (`_STARTUP_TIMEOUT_SEC` 同様の「別の関心事には別の定数」原則)。
-_PYTEST_TIMEOUT_SEC = 300.0
-
-
 def _eval_timeframe(meta_timeframe: str) -> str:
     return _EVAL_TIMEFRAME_OVERRIDE.get(meta_timeframe, meta_timeframe)
 
@@ -104,98 +97,6 @@ def _pytest_summary(stdout_text: str) -> str:
     """pytest の出力から末尾の非空行 (概ね summary 行) だけを抜き出す。"""
     lines = [line for line in stdout_text.splitlines() if line.strip()]
     return lines[-1] if lines else ""
-
-
-def _kill_process_group(proc: "subprocess.Popen") -> None:
-    """`proc` が属するプロセスグループごと SIGKILL する
-    (`sandbox.py` の `PluginSession._kill` と同じパターン)。
-
-    F4 (codex Important レビュー fix round 1): `subprocess.run(timeout=...)`
-    は直接の子プロセスだけを kill する — test_plugin.py がサンドボックス外
-    で実行される都合上 (`check_source` の denylist はあるが worker.py の
-    resource limit は掛からない)、test_plugin.py 自身がさらに子プロセスを
-    起動して固まった場合、直接の子を kill しても孫プロセスが孤児のまま残
-    る。`start_new_session=True` でプロセスグループリーダーとして起動し、
-    timeout 時は `os.killpg` でグループ全体を回収する。
-    """
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
-
-
-def _pytest_rlimit_preexec(memory_mb: int, nofile: int,
-                            fsize_mb: int) -> Callable[[], None]:
-    """`subprocess.Popen(preexec_fn=...)` に渡す純関数ファクトリ。
-
-    fork 直後・exec 直前に子プロセス側で実行される (Unix 専用 API —
-    本プロジェクトの動作環境は Linux 前提)。plugin worker (worker.py の
-    `_set_resource_limits`) と同じ 2 値 (settings.plugin.sandbox_nofile/
-    sandbox_fsize_mb) を pytest サブプロセスにも適用する。
-    """
-    def _fn() -> None:
-        mem_bytes = int(memory_mb) * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (int(nofile), int(nofile)))
-        fsize_bytes = int(fsize_mb) * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_bytes, fsize_bytes))
-    return _fn
-
-
-def _default_pytest_runner(test_plugin_path: Path, *,
-                            settings: "PluginSettings | None" = None,
-                            ) -> dict[str, Any]:
-    """既定の pytest 実行シーム。
-
-    **1 plugin につき 1 サブプロセス** で実行する (サンプル test_plugin.py
-    のモジュール名衝突回避)。`agentic_fx.plugin.pytest_sandbox_entry`
-    経由で spawn する (ネットワーク毒入れを pytest のテスト収集より前に
-    適用するため — モジュール docstring 参照)。**最小 env** (`sandbox.
-    _build_env()` を再利用 — `AFX_*` 等の秘密を含む親 env を継承しない)
-    + **resource limit** (`_pytest_rlimit_preexec`) を適用する。
-
-    `settings` が None の場合は plugin サンドボックスの既定値
-    (`PluginSettings()` のデフォルト) を使う — 呼び出し元 (`submit_plugin`)
-    は実際の `settings.plugin` を渡す。
-
-    timeout 発生時は `_kill_process_group` でプロセスグループごと回収する。
-    """
-    from agentic_fx.plugin.sandbox import _build_env
-    from agentic_fx.config import PluginSettings
-    eff_settings = settings if settings is not None else PluginSettings()
-    env = _build_env()
-    # FC-3 対応: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` はサードパーティ
-    # プラグインの setuptools entry-point 自動読込のみを止める (pytest
-    # 本体に同梱される builtin プラグインは対象外で、通常の収集・実行は
-    # 引き続き機能する)。これが無いと `anyio` 等の entry-point プラグイン
-    # が pytest.main() 実行中に (毒入れ済みの) `socket` を import しようと
-    # して `ImportError` になり、poison 後は毎回 exit=1 で test_plugin.py
-    # の承認が全滅する (実測で確認済み — poison を pytest 起動前に適用する
-    # 設計上、entry-point プラグインの自動読込そのものを止める以外に
-    # 安全な回避策が無い)。
-    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "agentic_fx.plugin.pytest_sandbox_entry",
-         str(test_plugin_path)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        start_new_session=True, env=env,
-        preexec_fn=_pytest_rlimit_preexec(
-            memory_mb=eff_settings.sandbox_memory_mb,
-            nofile=eff_settings.sandbox_nofile,
-            fsize_mb=eff_settings.sandbox_fsize_mb))
-    try:
-        stdout, stderr = proc.communicate(timeout=_PYTEST_TIMEOUT_SEC)
-    except subprocess.TimeoutExpired as exc:
-        _kill_process_group(proc)
-        raise ValueError(
-            f"test_plugin.py timed out after {_PYTEST_TIMEOUT_SEC}s "
-            f"({test_plugin_path})") from exc
-    return {"returncode": proc.returncode, "stdout": stdout, "stderr": stderr}
 
 
 def _validate_strategy(conn: sqlite3.Connection, meta: PluginMeta, *,
@@ -301,13 +202,13 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
         check_source(test_plugin_path, extra_allowed=frozenset({"pytest", "plugin"}))
 
         runner = (pytest_runner if pytest_runner is not None
-                  else lambda p: _default_pytest_runner(p, settings=settings.plugin))
-        pytest_result = runner(test_plugin_path)
-        if pytest_result["returncode"] != 0:
+                  else lambda d: run_gate_pytest(d, settings=settings))
+        pytest_result = runner(meta.path)
+        if pytest_result.returncode != 0:
             raise ValueError(
                 f"plugin {meta.name!r}: test_plugin.py failed pytest "
-                f"(returncode={pytest_result['returncode']}): "
-                f"{_pytest_summary(pytest_result.get('stdout', ''))}")
+                f"(returncode={pytest_result.returncode}): "
+                f"{_pytest_summary(pytest_result.stdout_tail)}")
 
         metrics, evaluable = _validate_kind(
             conn, meta, settings=settings, now=now, sandbox_run=sandbox_run,
@@ -338,8 +239,8 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
         "kind": meta.kind,
         "content_hash": meta.content_hash,
         "test_file_hash": test_file_hash,
-        "pytest": {"returncode": pytest_result["returncode"],
-                   "summary": _pytest_summary(pytest_result.get("stdout", ""))},
+        "pytest": {"returncode": pytest_result.returncode,
+                   "summary": _pytest_summary(pytest_result.stdout_tail)},
         "metrics": metrics,
         "evaluable": evaluable,
         "eval_source": _EVAL_SOURCE,
