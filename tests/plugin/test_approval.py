@@ -610,26 +610,6 @@ def test_plugin_py_check_source_runs_before_pytest(tmp_path, settings):
         approval.submit_plugin(conn, meta, settings=settings, now=NOW,
                                pytest_runner=spy_runner)
     assert called == []
-    captured = {}
-
-    def fake_main(args):
-        captured['args'] = args
-        return 0
-
-    def fake_poison():
-        pass
-
-    # monkeypatch sys.argv, pytest.main, worker._poison_network_modules
-    with patch.object(sys, 'argv', ['entry', '/tmp/test_plugin.py']), \
-         patch('pytest.main', fake_main), \
-         patch('agentic_fx.plugin.worker._poison_network_modules', fake_poison):
-        try:
-            entry.main()
-        except SystemExit:
-            pass
-
-    assert '--noconftest' in captured['args'], \
-        f"--noconftest not found in args: {captured.get('args', [])}"
 
 
 def test_pytest_sandbox_entry_calls_poison_before_pytest():

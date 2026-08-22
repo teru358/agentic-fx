@@ -17,6 +17,7 @@ from agentic_fx.plugin.loader import (
     REQUIRED_FILES, artifact_hash_bytes, content_hash as _content_hash,
 )
 from agentic_fx.plugin.loader import _MAX_FILE_BYTES
+from agentic_fx.plugin.sandbox import _SINGLE_THREAD_ENV
 from agentic_fx.runners.launcher import build_launcher_argv
 
 if TYPE_CHECKING:
@@ -110,6 +111,15 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
         workdir = Path(workdir_s)
         pyc_dir = workdir / "pyc"
         pyc_dir.mkdir()
+        basetemp_dir = workdir / "basetemp"
+        basetemp_dir.mkdir()
+        # gate worker がリポジトリの pyproject.toml を config-file 探索で
+        # 開こうとして EACCES になるのを避けるため、空の ini を workdir
+        # (read_write allowlist 内) に置いて `-c` で明示指定する — これで
+        # pytest の implicit inifile 探索 (親ディレクトリを辿って
+        # pyproject.toml/setup.cfg/tox.ini を探す) 自体を止める。
+        ini_path = workdir / "pytest.ini"
+        ini_path.write_text("[pytest]\n")
         rlimits = {
             "RLIMIT_AS": (settings.plugin.sandbox_memory_mb * 1024 * 1024,) * 2,
             "RLIMIT_NOFILE": (settings.plugin.sandbox_nofile,) * 2,
@@ -120,8 +130,20 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
             [sys.executable, "-m", "agentic_fx.plugin.gate_pytest_worker",
              str(plugin_dir), str(workdir)],
             rlimits=rlimits)
+        # TMPDIR を gate workdir へ向ける — WorkerRunner の workdir
+        # (認証コピーを含む) は tempfile.TemporaryDirectory = /tmp 配下
+        # なので、同 uid のゲート worker に /tmp を read させると他
+        # Mission の資格情報が読めてしまう。gate worker からは /tmp を
+        # 一切 allowlist しない (前任の逸脱を撤回)。
+        # BLAS/OpenMP のマルチスレッド初期化は RLIMIT_AS (仮想アドレス
+        # 空間) をコア数分事前確保して食い潰す — `sandbox.py` の
+        # `_SINGLE_THREAD_ENV` と同じ理由・同じ値で固定する (実測: これが
+        # 無いと `import pandas` 自体が RLIMIT_AS=512MB を超えて失敗する
+        # — マルチコア機で再現、CPU 台数非依存にするため固定で潰す)。
         env = {"PATH": "/usr/bin:/bin",
-              "PYTHONPYCACHEPREFIX": str(pyc_dir)}
+              "PYTHONPYCACHEPREFIX": str(pyc_dir),
+              "TMPDIR": str(workdir),
+              **_SINGLE_THREAD_ENV}
         proc = subprocess.Popen(argv, cwd=str(workdir), env=env,
                                 stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

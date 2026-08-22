@@ -29,7 +29,7 @@ def main() -> None:
     read_only = [code_root, venv_root, stdlib_root, plugin_dir]
     if base_prefix != venv_root:
         read_only.append(base_prefix)
-    for p in (Path("/usr/lib"), Path("/usr/share/zoneinfo"), Path("/etc"), Path("/tmp")):
+    for p in (Path("/usr/lib"), Path("/usr/share/zoneinfo"), Path("/etc")):
         if p.exists():
             read_only.append(p)
 
@@ -49,8 +49,26 @@ def main() -> None:
                          execute_file_paths=execute_file_paths)
 
     import pytest
+    # `-c <workdir>/pytest.ini`: implicit inifile 探索 (親ディレクトリを
+    # 辿って pyproject.toml/setup.cfg/tox.ini を探す) を止める — 親
+    # (gate_pytest.run_gate_pytest) が workdir に空 ini を用意済み。
+    # `--basetemp`: tmp_path 系フィクスチャや pytest 内部の一時領域を
+    # workdir 配下に固定し、/tmp への到達を発生させない (/tmp は
+    # allowlist に含めない — 前任の逸脱を撤回)。
+    # `--confcutdir <plugin_dir>`: `-c` で inifile を workdir 配下に固定
+    # したことで pytest の既定 confcutdir 算出 (`inipath.parent`、つまり
+    # workdir) が plugin_dir の祖先と無関係な木になり、`Session.collect`
+    # (`_pytest/main.py` の `_is_in_confcutdir`) が plugin_dir の祖先
+    # ディレクトリ (`/home` 等、allowlist 外) を辿って `Dir` collector を
+    # 作ろうとし EACCES になる (実測で確認済み — 2026-08-22 検収)。
+    # confcutdir を plugin_dir 自身に固定することで、この祖先ディレクトリ
+    # 探索を argpath の直上で打ち切らせる。
     rc = pytest.main(["-q", "-p", "no:logging", "-p", "no:cacheprovider",
-                      "--rootdir", str(workdir), str(plugin_dir)])
+                      "--rootdir", str(workdir),
+                      "-c", str(workdir / "pytest.ini"),
+                      "--confcutdir", str(plugin_dir),
+                      "--basetemp", str(workdir / "basetemp"),
+                      str(plugin_dir)])
     raise SystemExit(int(rc))
 
 

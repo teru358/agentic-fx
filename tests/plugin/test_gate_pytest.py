@@ -224,6 +224,34 @@ def test_run_gate_pytest_cannot_open_agentic_db(tmp_path, settings, monkeypatch)
             db_dir.rmdir()
 
 
+def test_run_gate_pytest_cannot_read_unrelated_tmp_file(tmp_path, settings):
+    """`/tmp` 配下の gate workdir 以外のファイルは EACCES であること
+    (2026-08-22 検収: 前任が read_only allowlist へ `/tmp` を丸ごと追加
+    していた逸脱の撤回 pin)。`WorkerRunner` の workdir (認証コピーを含む)
+    も `tempfile.TemporaryDirectory` = `/tmp` 配下なので、同 uid のゲート
+    worker に `/tmp` を read させると他 Mission の資格情報が読めてしまう
+    — gate worker は自分の gate workdir (`--basetemp`/`TMPDIR` で明示的に
+    渡された領域) 以外の `/tmp` 配下に到達できないことを実プロセスで
+    確認する。"""
+    _skip_if_no_landlock()
+    import tempfile
+    outside_dir = tempfile.mkdtemp(prefix="afx-outside-gate-")
+    outside_file = Path(outside_dir) / "secret.txt"
+    outside_file.write_text("other mission's credentials")
+    try:
+        check_tmp_access = (
+            "def test_unrelated_tmp_file_is_eacces():\n"
+            f"    import pytest\n"
+            f"    with pytest.raises((PermissionError, FileNotFoundError)):\n"
+            f"        open({str(outside_file)!r}, 'rb')\n")
+        d = _write_candidate(tmp_path, test_py=check_tmp_access)
+        result = run_gate_pytest(d, settings=settings)
+        assert result.passed is True, result.stdout_tail
+    finally:
+        outside_file.unlink(missing_ok=True)
+        os.rmdir(outside_dir)
+
+
 def test_run_gate_pytest_asserts_pycache_prefix(tmp_path, settings):
     """gate worker が起動直後に `sys.pycache_prefix` を assert する —
     `PYTHONPYCACHEPREFIX` を Popen env に置かない変異は red になる。"""

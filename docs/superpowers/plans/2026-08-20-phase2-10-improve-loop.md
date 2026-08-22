@@ -8123,6 +8123,8 @@ def test_gate_pytest_does_not_use_preexec_fn():
 
 - [ ] **Step 6: commit** — `plugin/gate_pytest.py` + `gate_pytest_worker.py` 新設。
 
+**実装時追記 (2026-08-22 検収)**: 上記スケッチの `pytest.main([... "--rootdir", str(workdir), str(plugin_dir)])` は実測で red — `plugin_dir` がリポジトリ配下 (`plugins/<name>`) の場合、`-c` 追加後も pytest の `_pytest.config._is_in_confcutdir` が `workdir`(inifile の親)基準で confcutdir を算出し、`plugin_dir` の祖先 (`/home` 等、allowlist 外) まで遡って `Dir` collector を作ろうとし EACCES になる。**対処**: `--confcutdir <plugin_dir>` を明示して祖先探索を argpath 直上で打ち切らせた (allowlist は plugin_dir のみのまま拡張しない)。あわせて `-c <workdir>/pytest.ini`(空 ini、implicit inifile 探索で repo root の `pyproject.toml` を開こうとして EACCES になるのを防ぐ)と `--basetemp <workdir>/basetemp` を追加。前任が read_only allowlist に `/tmp` を丸ごと追加していた逸脱は撤回した (`WorkerRunner` の workdir も `/tmp` 配下のため、gate worker に `/tmp` を read させると他 Mission の資格情報が漏れる) — 代わりに子 env の `TMPDIR` を gate workdir へ向けている。加えて `sandbox.py` の `_SINGLE_THREAD_ENV`(`OPENBLAS_NUM_THREADS=1` 等)を子 env に足した — 無いとマルチコア機で `import pandas` が `RLIMIT_AS=512MB` を超えて失敗する (実測)。
+
 ---
 
 ### 6-B′: 候補スナップショット検査 + `content_hash`/`artifact_hash` の pytest 前後照合(§8.1 項目 9)
