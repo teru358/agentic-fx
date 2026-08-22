@@ -102,39 +102,70 @@ def test_backlog_reopen_returns_done_to_open(commands):
 
 
 def test_backlog_reopen_rejects_from_non_terminal_status(commands):
-    """§4.3 の「done/rejected → open」制約の pin。
-    backlog.set_status は transition guard を持たないため、Commands.dispatch
-    内でも guard が無い場合、open 状態から reopen しても状態は変わらない
-    (ただしこれは command の guard 不在による偶然の一致ではなく
-    set_status が無条件で新しい status を書くため)。
-
-    M3 mutation は「reopen が open から遷移を許す」という guard 不在を検出
-    する intended test だが、set_status 自体に guard が無いため、現在の
-    実装では「mutation を注入してもテストが死なない」という虚偽な状態
-    (vacuous mutation) になっている。プラン L14887 の M3 は
-    「変異注入対象が存在しない — set_status に transition guard が無い」として
-    ledger に記録すること (プラン記述と実装の矛盾)。"""
+    """検収 B3 (2026-08-22): §4.3 の「done/rejected → open のみ」制約を
+    commands.py 側の遷移ガードで強制する (反転 — 旧テストはガード不在を
+    assert していた)。`selected` (Mission 実行中の行) から reopen を打つと
+    `open` に落ち、別 Mission の `select_for_mission` CAS が成功しうる
+    (§4 が挙げる二重承認申請への到達経路)。ガードは拒否メッセージを返し、
+    status/last_result を不変に保つこと。"""
     cmds, conn, _ = commands
     bid = backlog.add(conn, idea="test idea 3", source="user",
                       now=datetime(2026, 8, 22))
-    # 初期状態は 'open'。last_result は NULL
+    ok = backlog.select_for_mission(conn, bid, now=datetime(2026, 8, 22),
+                                    commit=True)
+    assert ok
     row_before = dict(conn.execute(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?", (bid,)
     ).fetchone())
-    assert row_before["status"] == "open"
-    assert row_before["last_result"] is None
+    assert row_before["status"] == "selected"
 
-    # reopen を呼ぶ
     out = cmds.dispatch(f"backlog reopen {bid}")
 
-    # open のままなので status は変わらない (guard が無いため状態遷移しない)
+    assert "selected" in out
     row_after = dict(conn.execute(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?", (bid,)
     ).fetchone())
-    assert row_after["status"] == "open"
-    # set_status は last_result を常に上書きするため "reopened" になる
-    # （この挙動自体が M3 をvacuous にしている）
-    assert row_after["last_result"] == "reopened"
+    assert row_after["status"] == "selected"
+    assert row_after["last_result"] == row_before["last_result"]
+
+
+def test_backlog_reject_rejects_from_non_terminal_status(commands):
+    """検収 B3: reject 側の同型テスト。`selected` からの reject を拒否し
+    status/last_result を不変に保つ (§4.3: reject は open|observation
+    からのみ)。"""
+    cmds, conn, _ = commands
+    bid = backlog.add(conn, idea="test idea 4", source="user",
+                      now=datetime(2026, 8, 22))
+    ok = backlog.select_for_mission(conn, bid, now=datetime(2026, 8, 22),
+                                    commit=True)
+    assert ok
+    row_before = dict(conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?", (bid,)
+    ).fetchone())
+    assert row_before["status"] == "selected"
+
+    out = cmds.dispatch(f"backlog reject {bid}")
+
+    assert "selected" in out
+    row_after = dict(conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?", (bid,)
+    ).fetchone())
+    assert row_after["status"] == "selected"
+    assert row_after["last_result"] == row_before["last_result"]
+
+
+def test_backlog_reject_unknown_id_returns_not_found(commands):
+    """検収 M-e: 存在しない id への reject/reopen が成功メッセージを返す
+    (rowcount を見ない fail-open) のを閉じる。"""
+    cmds, _, _ = commands
+    out = cmds.dispatch("backlog reject 99999")
+    assert "存在しません" in out
+
+
+def test_backlog_reopen_unknown_id_returns_not_found(commands):
+    cmds, _, _ = commands
+    out = cmds.dispatch("backlog reopen 99999")
+    assert "存在しません" in out
 
 
 def test_policy_add_appends_to_directives_file(commands):

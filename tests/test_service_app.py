@@ -1960,7 +1960,15 @@ def test_scheduler_tick_once_uses_app_clock(tmp_path):
     _init(tmp_path)
     app = build_app(tmp_path, runner=FakeRunner([]), clock=fixed)
     seen: list = []
-    app.scheduler.tick = lambda now: seen.append(now)
+
+    def _fake_tick(now):
+        # 検収 B2 (2026-08-22): `Scheduler.tick()` は `list[Callable[[], None]]`
+        # を返す契約になった (improve tick を core_lock の外で遅延発火する
+        # ため)。このスタブも契約に合わせて空リストを返す。
+        seen.append(now)
+        return []
+
+    app.scheduler.tick = _fake_tick
     _scheduler_tick_once(app)
     assert seen == [fixed.now()]
 

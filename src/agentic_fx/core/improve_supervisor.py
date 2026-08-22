@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -89,8 +90,24 @@ class ImproveSupervisor:
         self._stop_event.set()
 
     def join(self, timeout: float) -> None:
-        for t in list(self._active_threads):
-            t.join(timeout=timeout)
+        """検収 B5 (2026-08-22): 全スレッドで**共有する 1 つの deadline**
+        (`monotonic() + timeout`) を切り、残余時間を各スレッドへ配る。
+        修正前は各スレッドへ `timeout` を丸ごと渡していたため、最悪
+        `len(_active_threads) × timeout` を消費しえた
+        (`service.py:1203-1209` の I-3 不変条件 — join budget は
+        watchdog ceiling と同じ値を共有する構造でなければならない — に
+        抵触する)。あわせて `_active_threads` から終了済みスレッドを
+        prune する (tick 時 `_spawn_slot_thread` でも行うが、join 時にも
+        念のため行う — 単調増加を防ぐ)。"""
+        deadline = time.monotonic() + timeout
+        with self._launch_lock:
+            threads = list(self._active_threads)
+        for t in threads:
+            remaining = deadline - time.monotonic()
+            t.join(timeout=max(remaining, 0.0))
+        with self._launch_lock:
+            self._active_threads = [
+                t for t in self._active_threads if t.is_alive()]
 
     # ---- 内部 ---------------------------------------------------------
 
@@ -99,6 +116,10 @@ class ImproveSupervisor:
             target=self._launch_slot, args=(period_key, k), daemon=True,
             name=f"afx-improve-slot-{period_key}-{k}")
         with self._launch_lock:
+            # 検収 B5: tick 時にも終了済みスレッドを prune し、
+            # `_active_threads` が単調増加しないようにする。
+            self._active_threads = [
+                s for s in self._active_threads if s.is_alive()]
             self._active_threads.append(t)
         t.start()
 

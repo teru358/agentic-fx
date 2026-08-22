@@ -17,7 +17,8 @@ from unittest.mock import patch, MagicMock
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.improve_supervisor import ImproveSupervisor
 from agentic_fx.runners.fake_runner import FakeRunner
-from agentic_fx.service import build_app, run_init, run_service
+from agentic_fx.service import (build_app, run_init, run_service,
+                                _scheduler_tick_once)
 
 NOW = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
 
@@ -122,3 +123,46 @@ def test_run_service_calls_improve_supervisor_shutdown_and_join(tmp_path):
 
         # Exit code should be 0 (graceful shutdown)
         assert exit_code == 0
+
+
+def test_scheduler_tick_returns_empty_list_when_on_improve_tick_is_none(tmp_path):
+    """検収 B2 (2026-08-22): `on_improve_tick` が None (Task 9 単独では常に
+    これ) のとき、`Scheduler.tick()` の戻り値は常に空リスト。"""
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        assert app.scheduler.on_improve_tick is None
+        pending = app.scheduler.tick(NOW)
+        assert pending == []
+    finally:
+        app.close()
+
+
+def test_on_improve_tick_fires_outside_core_lock(tmp_path):
+    """検収 B2: `on_improve_tick` は core_lock 保持下では**判定のみ**され、
+    実際の発火は `_scheduler_tick_once` が `with app.core_lock:` を抜けた
+    後に行われる。`ImproveSupervisor.tick` は sqlite write + thread spawn
+    を伴うため core_lock 保持下では実行できない — hook 内で
+    `app.core_lock.acquire(blocking=False)` が True (= lock が空いている
+    = lock 外での発火) を確認する。"""
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        fired = []
+
+        def fake_on_improve_tick(now):
+            acquired = app.core_lock.acquire(blocking=False)
+            if acquired:
+                app.core_lock.release()
+            fired.append((now, acquired))
+
+        app.scheduler.on_improve_tick = fake_on_improve_tick
+        _scheduler_tick_once(app)
+
+        assert len(fired) == 1
+        now_seen, acquired = fired[0]
+        assert acquired is True, (
+            "on_improve_tick fired while app.core_lock was still held "
+            "(must fire after _scheduler_tick_once releases core_lock)")
+    finally:
+        app.close()

@@ -672,6 +672,13 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # 既存の signals.reclaim_expired (403-407 行付近、lease ベースの
         # 一般的な回収) より前に置く — running mission の signal は claimed_at
         # が直近であり得るため lease ベースでは長時間拾われない。
+        # プラン 10 Task 9 (9.8 Step 5, M-d): `missions.recover_interrupted`
+        # は `missions.loop` を問わず status='running' の行を対象にするため、
+        # improve レーン (`loop='improve'`) の起動時回収 (§3.1 手順⑦: 再起動
+        # 後は再開しない — claimed/running は failed、reserved かつ
+        # mission_id IS NULL のスロットも failed) も trade Mission の回収と
+        # **同一トランザクション**で行われる。改善レーン専用の別呼び出しは
+        # 存在しない (存在させると trade/improve の回収が非アトミックになる)。
         missions.recover_interrupted(
             conn_core, now=clock.now(),
             max_requeue=settings.plugin.signal_requeue_max)
@@ -984,9 +991,17 @@ def _scheduler_tick_once(app: App) -> None:
     """scheduler_thread の 1 tick 分 (抽出 — 単体テスト用シーム)。
 
     app.clock.now() を読んで scheduler に渡すことを固定する。
+
+    検収 B2 (2026-08-22): `Scheduler.tick()` は core_lock 保持下では
+    improve tick の発火判定のみを行い、実際の呼び出しは遅延 callable の
+    リストとして返す (`on_improve_tick` が sqlite write + thread spawn を
+    伴うため core_lock 下では実行できない)。`with app.core_lock:` ブロック
+    を抜けた**後**にそれらを順に実行する。
     """
     with app.core_lock:
-        app.scheduler.tick(app.clock.now())
+        pending = app.scheduler.tick(app.clock.now())
+    for hook in pending:
+        hook()
 
 
 def _watchdog_tick(app: App) -> None:
@@ -1317,9 +1332,11 @@ def run_service(root: Path, *, daemon: bool = False,
         # main が先に join を諦め、watchdog の `busy_since` 軸が構造的に
         # 到達不能になり `fatal_reason` がその経路で永久にラッチしない。
         supervisor_join_timeout_sec = dispatch_ceiling_sec
+        # 検収 B5 (2026-08-22): プラン 9.8-7 の指定位置 (`th.join(timeout=30)`
+        # と `app.supervisor.join(...)` の間) へ戻す。
+        app.improve_supervisor.join(timeout=supervisor_join_timeout_sec)
         app.supervisor.join(timeout=supervisor_join_timeout_sec)
         supervisor_still_busy = app.supervisor.is_alive()
-        app.improve_supervisor.join(timeout=supervisor_join_timeout_sec)
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
         # 行う。notifier は最大 10 秒ブロックしうるため、記録を先にすると
         # 「graceful」記録の後に watchdog がまだ activity へ書き込める窓が

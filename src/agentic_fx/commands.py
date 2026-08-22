@@ -128,6 +128,21 @@ class Commands:
                 return f"backlog #{bid} を追加しました"
             if cmd == "backlog" and len(args) == 2 and args[0] == "reject":
                 bid = int(args[1])
+                # 検収 B3 (2026-08-22): 設計書 §4.3 の状態機械 — reject は
+                # open|observation からのみ。`backlog.set_status` (Task 8)
+                # は `apply_approval_outcome` 用の汎用 setter でガードを
+                # 持たないため、人間操作の入口である commands.py 側で
+                # fail closed に検査する (現在の status も併せて未存在も
+                # 検出 — M-e 対応)。
+                row = self.conn.execute(
+                    "SELECT status FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+                if row is None:
+                    return f"backlog #{bid} は存在しません"
+                current_status = row["status"]
+                if current_status not in ("open", "observation"):
+                    return (f"backlog #{bid} は status={current_status} のため"
+                            f" reject できません (open|observation からのみ可)")
                 backlog.set_status(self.conn, bid, "rejected", self.clock.now(),
                                    last_result="human_rejected", commit=True)
                 self.activity.write(Category.IMPROVE, "backlog_rejected",
@@ -135,6 +150,19 @@ class Commands:
                 return f"backlog #{bid} を rejected にしました"
             if cmd == "backlog" and len(args) == 2 and args[0] == "reopen":
                 bid = int(args[1])
+                # 検収 B3: reopen は done|rejected (終端) からのみ。
+                # `selected` (Mission 実行中) から reopen を許すと
+                # 別 Mission の select_for_mission CAS が成功しうる
+                # (設計書 §4 が挙げる「二重承認申請」への到達経路)。
+                row = self.conn.execute(
+                    "SELECT status FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+                if row is None:
+                    return f"backlog #{bid} は存在しません"
+                current_status = row["status"]
+                if current_status not in ("done", "rejected"):
+                    return (f"backlog #{bid} は status={current_status} のため"
+                            f" reopen できません (done|rejected からのみ可)")
                 backlog.set_status(self.conn, bid, "open", self.clock.now(),
                                    last_result="reopened", commit=True)
                 self.activity.write(Category.IMPROVE, "backlog_reopened",

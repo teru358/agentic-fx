@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -79,8 +79,16 @@ def test_wave_creation_is_idempotent_second_call_no_op(conn, monkeypatch):
     """`INSERT OR IGNORE` — 同じ period_key への 2 回目の呼び出しは
     rowcount=0 (起動権を得られない) で slot も増えない。ImproveSupervisor.tick
     が 2 回呼ばれても、再試行は発生しない (period は消費済み、
-    _spawn_slot_thread も1回分のみ呼ばれる)。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    _spawn_slot_thread も1回分のみ呼ばれる)。
+
+    検収 B4 (2026-08-22): `now` は tz-aware UTC。naive datetime は
+    `latest_scheduled_occurrence` がシステムローカル TZ で暗黙解釈して
+    しまう (fail-open) ため B1 の修正で `ValueError` になった —
+    naive では TZ=UTC 環境と開発機既定 (JST) で period key が食い違い、
+    このテストがマシンのローカル TZ に依存していた。期待値
+    '2026-W34' は B1 着地後の実装から実測導出
+    (`display_timezone='UTC'` なので `now` の週がそのまま period key)。"""
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     sup = ImproveSupervisor(capacity=10, root=Path("/nonexistent"),
                              settings=_fake_settings(parallel=2),
                              clock=_FixedClock(now),
@@ -100,7 +108,7 @@ def test_wave_creation_is_idempotent_second_call_no_op(conn, monkeypatch):
     # First tick で wave + 2 slots を作成
     sup.tick(now)
     assert len(spawn_calls) == 2
-    assert spawn_calls == [("2026-W33", 0), ("2026-W33", 1)]
+    assert spawn_calls == [("2026-W34", 0), ("2026-W34", 1)]
 
     # Second tick で同じ period で再試行
     sup.tick(now)
@@ -121,11 +129,11 @@ def test_m_zero_creates_no_wave_row(conn, monkeypatch):
 
     sup = ImproveSupervisor(capacity=0, root=Path("/nonexistent"),
                              settings=_fake_settings(parallel=1),
-                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0)),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)),
                              db_path=Path(conn.execute("PRAGMA database_list").fetchone()[2]),
                              stop_event=threading.Event())
     sup._conn_for_test = conn  # テストシーム
-    sup.tick(datetime(2026, 8, 22, 3, 0))
+    sup.tick(datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc))
     # M3 mutation check: create_wave_and_slots should not be called when m=0
     assert len(call_count) == 0, f"create_wave_and_slots should not be called when m=0, but was called {len(call_count)} times"
     n = conn.execute("SELECT count(*) c FROM improve_waves").fetchone()["c"]
@@ -434,7 +442,7 @@ def test_wave_creation_respects_running_slot_count(tmp_path, monkeypatch):
     db_path = tmp_path / "agentic.db"
     conn = db_mod.connect(db_path)
     db_mod.init_db(conn)
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
 
     # Create a running slot from a previous period (not the current tick's period)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W32", now=now, expected=1, commit=True)
@@ -468,3 +476,57 @@ def test_wave_creation_respects_running_slot_count(tmp_path, monkeypatch):
     assert rows["c"] == 2
 
     conn.close()
+
+
+# Tests for B5 (検収 2026-08-22): join budget は全体で 1 つの deadline
+
+def test_join_budget_is_shared_not_multiplied_by_thread_count(tmp_path):
+    """`ImproveSupervisor.join(timeout)` は N 個のスレッドが**全部**
+    timeout しても、消費時間が `timeout × N` に膨らんではならない —
+    全体で 1 つの deadline (`monotonic() + timeout`) を共有し、残余を
+    各スレッドへ配る形であること。N=3、timeout=0.2s で検証: 修正前の
+    実装 (各スレッドへ timeout をまるごと渡す) だと最悪 0.6s 消費するが、
+    修正後は 0.2s 前後で返ること。"""
+    sup = ImproveSupervisor(capacity=3, root=tmp_path,
+                             settings=_fake_settings(parallel=3),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0,
+                                                        tzinfo=timezone.utc)),
+                             db_path=tmp_path / "unused.db",
+                             stop_event=threading.Event())
+    never_done = threading.Event()  # 一度も set しない = スレッドは join を
+                                     # 常に timeout させる
+    threads = [threading.Thread(target=never_done.wait, daemon=True)
+               for _ in range(3)]
+    for t in threads:
+        t.start()
+    sup._active_threads = list(threads)
+
+    timeout = 0.2
+    start = time.monotonic()
+    sup.join(timeout=timeout)
+    elapsed = time.monotonic() - start
+
+    # 修正前 (各スレッドへ timeout をまるごと渡す) なら 3*0.2=0.6s 消費する。
+    # 修正後は共有 deadline なので 1*timeout + 小さな余裕に収まる。
+    assert elapsed < timeout * 2, (
+        f"join budget appears multiplied by thread count: "
+        f"elapsed={elapsed:.3f}s, timeout={timeout}s, N=3")
+
+
+def test_join_prunes_finished_threads(tmp_path):
+    """`join()` 後、終了済みスレッドは `_active_threads` から取り除かれる
+    (検収 B5 — tick を重ねても単調増加しない)。"""
+    sup = ImproveSupervisor(capacity=1, root=tmp_path,
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0,
+                                                        tzinfo=timezone.utc)),
+                             db_path=tmp_path / "unused.db",
+                             stop_event=threading.Event())
+    t = threading.Thread(target=lambda: None, daemon=True)
+    t.start()
+    t.join()  # スレッドは既に終了済み
+    sup._active_threads = [t]
+
+    sup.join(timeout=1.0)
+
+    assert sup._active_threads == []

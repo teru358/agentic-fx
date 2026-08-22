@@ -126,3 +126,37 @@ def test_invalid_at_format_raises(at):
             datetime(2026, 8, 22, 10, 0, tzinfo=_UTC),
             cadence="weekly" if " " in at else "daily", at=at,
             display_timezone="UTC")
+
+
+def test_naive_now_raises_value_error():
+    """検収 B1/B4: naive `now` は暗黙のシステム TZ 解釈に落ちず fail
+    closed で ValueError にする。"""
+    with pytest.raises(ValueError, match="tz-aware"):
+        latest_scheduled_occurrence(
+            datetime(2026, 8, 22, 3, 0),  # naive
+            cadence="weekly", at="Sat 03:00", display_timezone="UTC")
+
+
+def test_now_aware_utc_display_timezone_asia_tokyo_daily():
+    """検収 B1: 本番構成 (aware UTC clock × display_timezone=Asia/Tokyo)。
+    period key は display TZ の occurrence から切ること — now (UTC
+    レンダリング時刻) の TZ から切ると 1 日ズレる (実測: 修正前は
+    '2026-08-24' を返していた)。"""
+    now = datetime(2026, 8, 25, 10, 0, tzinfo=_UTC)
+    occ = latest_scheduled_occurrence(now, cadence="daily", at="08:00",
+                                       display_timezone="Asia/Tokyo")
+    assert occ.astimezone(ZoneInfo("Asia/Tokyo")) == datetime(
+        2026, 8, 25, 8, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+    assert period_key_of(occ, cadence="daily") == "2026-08-25"
+
+
+def test_now_aware_utc_display_timezone_asia_tokyo_weekly():
+    """検収 B1 (かつ 9.1 M4 の killer): 本番構成 (aware UTC × Asia/Tokyo)、
+    weekly at='Mon 08:00'。修正前は '2026-W34' を返していた
+    (正: '2026-W35')。"""
+    now = datetime(2026, 8, 25, 10, 0, tzinfo=_UTC)
+    occ = latest_scheduled_occurrence(now, cadence="weekly", at="Mon 08:00",
+                                       display_timezone="Asia/Tokyo")
+    assert occ.astimezone(ZoneInfo("Asia/Tokyo")) == datetime(
+        2026, 8, 24, 8, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+    assert period_key_of(occ, cadence="weekly") == "2026-W35"
