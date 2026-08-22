@@ -22064,8 +22064,10 @@ EOF
 - Create: `tests/loops/test_improve_e2e.py` (FakeRunner E2E、本 task の主要成果物)
 - Modify: `tests/integration/test_improve_forbidden_regression.py` (**レビュー1周目 I2 で正式ファイルパスとして一本化**。Task 7 が red で開始した遮断 8 項目の実プロセス統合回帰の**正式ファイル**。⑦⑧の `xfail(strict=True)` マーカーを外して green 化するのは本 task の担当 — 下記 Step 3)
 - Create (任意、Task 12 独自の追加テスト): `tests/loops/test_improve_blocking_items.py` — ⑦⑧の完了判定には使わない (判定は上記 integration ファイルの xfail 除去で行う。作る場合も「Task 7 が作った同名ファイル」ではなく Task 12 が新規に書く別ファイルであることを明記する)
-- Modify: `src/agentic_fx/service.py` の `build_app()` 内 2 箇所のみ (下記 Step 4 で diff を確定)
+- Modify: `src/agentic_fx/service.py` の `build_app()` 内 2 箇所のみ (下記 Step 4 で 1 行挿入 2 箇所として確定)
 - Test: `tests/test_service_app.py` (有効化配線の回帰 — 既存 E2E が壊れないことの確認。新規テスト追加は最小限)
+<!-- precheck 2026-08-22 wave2: T12-B14 -->
+- Modify: `tests/service/test_improve_wiring.py` (Task 9 = D-9 が作成。Step 4 の配線で赤化する 3 本を Task 12 後の期待値へ書き換える — 下記 Step 4b)
 - Test: 既存 `uv run pytest -q` 全体 (§7.1-7 の 2071+ 件が壊れないことの最終ゲート)
 
 ### Interfaces
@@ -22148,11 +22150,12 @@ from agentic_fx.service import build_app, run_init
 設計書 `2026-08-16-phase2-10-improve-loop-design.md` §7.1 の 1〜7 を逐語転記する。
 **Task 12 の gate はこの 1〜7 の全項目が緑であること** (8 = §7.2 実機 E2E は含まない)。
 
+<!-- precheck 2026-08-22 wave2: T12-B15 -->
 > 1. **遮断 8 項目の統合回帰** (`staging_dir` / `source_snapshot_dir` は handshake から導かれる — root/DB は渡さない。worker は `plugins/` 本体を読めない) (改善 worker の**実プロセス**に対して。**improve registry の task 直後に red で書き始める** — 最後の E2E に置かない): ①`data/agentic.db` の絶対パス open / `data/` 列挙が失敗 ②`run_holdout_gate` を呼んでもデータ到達不能で失敗 ③`ohlcv_history` / `ohlcv_cache` を直読するツールが registry に無い + DB パスが handshake に無い ④**書き込み可能パスが staging・workdir・`/dev` に閉じる** (`reports/`・リポジトリ本体・`plugins/<name>`・`plugins/.versions`・`plugins/_human`・`plugins/_retired`・`config/`・`policy/` への write が `EACCES`) ⑤plugin サンドボックスの入力 DataFrame はハーネスが与える (既存 pin 継続) ⑥`get_signals` を含む `IMPROVE_FORBIDDEN` + 取引 registry の全ツールが improve registry に**無い** ⑦`analyze_corr` / `run_backtest` の返却 schema に日時・期間端点・順序付き窓列・観測数が無い、**かつ RPC が DB に直接書かない** ⑧approval の結果として holdout の指標・baseline 差分・閾値別合否が Mission 出力・注入コンテキスト・RPC 返却のどこにも現れない、**かつ payload の analysis id / 回数は agent 出力からでなく RPC 台帳から来る**
-> 2. **3 実装 (Local / Claude / Codex) が同一の契約テストスイートに合格** (fake CLI スクリプトで実 LLM を呼ばずに回す。運用で選ばれるのは 1 つ): 4 終端 / reason 安全化 / timeout 優先 (fake が sleep) → CLI セッションが killpg され worker 自身は生きて `timeout` を返す / schema 不適合 → failed / **子 env に鍵の名前がゼロ・scratch home のみ** / claude の allowedTools が profile で固定 / codex は trade で拒否 / `max_turns` の runner 別セマンティクス / **exec closure の 1 要素 drop pin** / **子の argv が絶対パスのみ・codex に node ラッパを指すと起動拒否** / **全 spawn の env に `*_API_KEY` が無い (trade 資格情報は handshake)** / **サービス初期 env に秘密名があると improve+claude が起動拒否** / **launcher の expected-parent 再照合 + `cli_started` pgid で worker 異常死時に CLI が回収される** / **`improve.mission_max_turns/timeout_sec` の写像** / **claude init の MCP server 集合が profile の `afx` ちょうど 1 つ・未知 0** / **サブスク認証コピーが agent から可読であることは受容 (R11)** / **codex+llama_swap は auth.json をコピーせず空の scratch `CODEX_HOME` で起動する** + **`improve.llama_swap_verified` が false のとき通常入口は `provider=llama_swap` を起動拒否**
-> 3. **ゲート pytest が柵の中で動き、候補は不変**: ゲート子プロセスから `data/agentic.db` を open する fake test が `EACCES` で失敗する / **主 pin: `test_plugin.py` が `plugin.py` へ書こうとすると `EACCES`、hash 不変、承認申請なし。副 pin: 親側 fault injection で hash を変えると承認申請が出ない** / symlink・余分ファイルを含む候補がスナップショット検査で落ちる / `sys.pycache_prefix` が tmp を指す / ゲートも launcher 経由 / `submit_plugin` と `bless` が同じヘルパを通る / **transaction が pytest / バックテストを跨がない**
-> 4. **D6 変異列** (§5) を全て殺す / **経路 P3 は live の形で二分** / **git サブプロセスが scheduler スレッドから呼ばれない** / 承認は git 記録成功後にしか `approved` にならない / **git 失敗を注入しても稼働中の旧版が消えない** / **切替は原子 (1 rename)** / **live がプレーン dir の承認は `legacy_plain_present` → `plugin retire` → `approval retry`** / **`flock` により別プロセス bless と競合しない** / **履歴は bare** / **版キーは `artifact_hash`** / **承認済み symlink plugin を再改善できる** / **`PluginMeta.path` は版実体に固定** / **approval の全決定が `apply_decision` を通り、全 terminal decision が plugin flock を取る** / **後発決定 key は `(name, content_hash)`** / **`GC_ROOTS` は §5.1 の唯一の定義に従う**。**その集合に無い版だけが reconcile で消える** / **switch ジャーナルの収束規則** / **版ストアは不変 (0500/0400)** / **`plugin rollback` / `bless-version` コマンドが存在しない (R12 pin)** / **経路 P1 はジャーナルを作らない。P2/P3 は §5.1 の P3 表どおり** / **payload は `candidate_origin`+`candidate_path`**
-> 5. **改善レーンが取引レーンを塞がない**: 改善 Mission 実行中に `MissionSupervisor.try_submit("trade")` が受理される / 取引レーンの容量 1・直列性の既存 pin が不変 / **wave が `parallel=N` で N partition を全て担当する** / **backlog 選択の CAS** / **backlog 状態機械** / **台帳の凍結** / **ヒント集合外の選択は activity のみ** / **1 period 1 wave** / **接続の所有** / **run lifecycle** / **Tx-2 が missions.finish を含む** / **接続は slot 専用** / shutdown が改善レーンの worker と CLI pgid を全て回収する / **認証コピーは親が spawn 前に行い、worker は原本を読まない**
+> 2. **3 実装 (Local / Claude / Codex) が同一の契約テストスイートに合格** (fake CLI スクリプトで実 LLM を呼ばずに回す。運用で選ばれるのは 1 つ): 4 終端 / reason 安全化 / timeout 優先 (fake が sleep) → CLI セッションが killpg され worker 自身は生きて `timeout` を返す / schema 不適合 → failed / **子 env に鍵の名前がゼロ・scratch home のみ** / claude の allowedTools が profile で固定 / codex は trade で拒否 / `max_turns` の runner 別セマンティクス / **exec closure の 1 要素 drop pin** (shell 系 backend で `/usr/bin` を落とすと fake shell 起動が `EACCES`) / **子の argv が絶対パスのみ・codex に node ラッパを指すと起動拒否** / **全 spawn の env に `*_API_KEY` が無い (trade 資格情報は handshake)** / **サービス初期 env に秘密名があると improve+claude が起動拒否** / **launcher の expected-parent 再照合 + `cli_started` pgid で worker 異常死時に CLI が回収される** / **`improve.mission_max_turns/timeout_sec` の写像** (Codex は turns 無視) / **claude init の MCP server 集合が profile の `afx` ちょうど 1 つ・未知 0** / **サブスク認証コピーが agent から可読であることは受容 (R11、fail closed にしない) — 契約テストは「課金鍵が env に無い」に留める** / **codex+llama_swap は auth.json をコピーせず空の scratch `CODEX_HOME` で起動する** (fake pin、全体 blocking) + **`improve.llama_swap_verified` が false のとき通常入口は `provider=llama_swap` を起動拒否** (他 backend は影響なし。実ターンの実測は §7.2 の検証専用入口 `afx improve verify-backend`)
+> 3. **ゲート pytest が柵の中で動き、候補は不変**: ゲート子プロセスから `data/agentic.db` を open する fake test が `EACCES` で失敗する / **主 pin: `test_plugin.py` が `plugin.py` へ書こうとすると `EACCES` (pytest 非ゼロ)、hash 不変、承認申請なし。副 pin: 親側 fault injection で hash を変えると承認申請が出ない** (codex 3 周目 M2) / symlink・余分ファイルを含む候補がスナップショット検査で落ちる / `sys.pycache_prefix` が tmp を指す / ゲートも launcher 経由 (`preexec_fn` 不使用) / `submit_plugin` と `bless` が同じヘルパを通る (無隔離の `_default_pytest_runner` が呼ばれない pin) / **transaction が pytest / バックテストを跨がない** (ゲート中に別接続の writer が `busy_timeout` 内に通る)
+> 4. **D6 変異列** (§5) を全て殺す / **経路 P3 (`bless --from _human`) は live の形で二分** (absent / symlink = pending + 証跡 + `preparing` ジャーナルを 1 tx → 切替 → approved / **プレーン = pending + 証跡のみ、ジャーナルも切替も決定も作らず `legacy_plain_present` pending**、codex 13 周目 M1) / **git サブプロセスが scheduler スレッドから呼ばれない**回帰テスト / 承認は git 記録成功後にしか `approved` にならない / **git 失敗を注入しても稼働中の旧版が消えない** (記録が切替に先行) / **切替は原子 (1 rename)** (2 段化の killer) / **live がプレーン dir の承認は版 + git 記録の後 `legacy_plain_present` で pending に留まり、`plugin retire <name>` (flock、未完ジャーナルで拒否、1 rename) → `approval retry` で absent → symlink として完了する。稼働中に plain を自動で入れ替えない** / **`flock` により別プロセス bless と競合しない** / **履歴は bare** (承認後に live symlink を壊す git 操作の面が無い) / **版キーは `artifact_hash`** (test 違いの版が区別される) / **承認済み symlink plugin を再改善できる** (`resolve()` 非依存) / **`PluginMeta.path` は版実体に固定され、approve は次回起動まで稼働中の plugin に影響しない** / **approval の全決定が `apply_decision` (1 tx: approval CAS + backlog 遷移 + ジャーナル終端) を通り、全 terminal decision が plugin flock を取る** / **後発決定 key は `(name, content_hash)`** / **`GC_ROOTS` は §5.1 の唯一の定義に従う** (ここで集合を再展開しない — codex 14 周目 M1。`legacy_plain_present` pending の版も root に含まれる)。**その集合に無い版だけが reconcile で消える** / **switch ジャーナル: 切替直後 crash → reject/別 hash approve が先に来ても live が旧状態 (symlink / absent) へ戻り DB と一致、同名の未完は 1 件、`preparing` 行が FS 効果より先** / **版ストアは不変 (0500/0400)、in-place 編集は discover のディレクトリ名 hash 照合で拒否、live への bless は無い → `materialize` → `_human` → 候補経路** / **bless (`--from _human`) は approve と同じライフサイクル (ゲート → pending 行 + 証跡 → 昇格 → `apply_decision`) で、通常 submit と同じ kind 別ゲートを通る。ジャーナルの有無と切替の要否は §5.1 の P3 表 (live の形で二分) に従う** (ここで無条件に「ジャーナル付き」と書かない — codex 14 周目 M1) / **journal-first・sweep-last の起動順序と `GC_ROOTS` (単一定義)** / **`plugin rollback` / `bless-version` コマンドが存在しない (R12 pin)** / **経路 P1 (submit) はジャーナルを作らない。P2 (approve) と P3 (bless) は §5.1 の P3 表どおり — live が absent / symlink のときだけ `preparing` を作り、プレーンのときは作らない** (codex 14 周目 M1) / **payload は `candidate_origin`+`candidate_path`、staging は終端決定で削除・human は残る、候補欠損は `candidate_missing` pending**
+> 5. **改善レーンが取引レーンを塞がない**: 改善 Mission 実行中に `MissionSupervisor.try_submit("trade")` が受理される / 取引レーンの容量 1・直列性の既存 pin が不変 / **wave が `parallel=N` で N partition を全て担当する** / **backlog 選択の CAS** (2 接続同時で勝者 1) / **backlog 状態機械** (approve → done、reject/expire → observation、report → done / report_failed → observation、失敗 → observation、**crash 後の起動時回収 → observation:interrupted**) / **台帳の凍結** (FROZEN 後の遅延 RPC が拒否され、payload `trial_count` が実 trial の総和) / **ヒント集合外の選択は activity のみ (CAS が正)** / **1 period 1 wave** (`improve_waves` + slot 行を同一 tx で作成 = period 消費、最新 occurrence の period key、停止中に逃した period を起動後 1 回 catch-up、M=0 は行を作らない、slot `reserved→claimed` が Tx-0 と同一 tx・`ready` → `running` commit → `go` の 3-way、`go` 前は副作用ゼロ、起動時に `claimed`/`running` で interrupted と、`reserved` のまま残った slot は failed で再実行しない (period は消費済みのまま)、spawn は同一プロセス内で初回 + 再試行 1 回 (`spawn_attempts`)、`ready` 後の全終端は `finish_improve_mission` の 1 tx で slot+mission+run+backlog) / **接続の所有** (slot = write、dispatcher = 自前 read-only、共有なし) / **run lifecycle** (全終端経路で run が FINISHED、dangling run 無し、Tx-0 は missions+run+slot の 1 tx、`mission_id` 一意) / **Tx-2 が missions.finish を含む** (commit 直後 crash で approval/backlog/run/mission が一致) / **接続は slot 専用** (N=4 同時 Tx で混線無し) / shutdown が改善レーンの worker と CLI pgid を全て回収する / **認証コピーは親が spawn 前に行い、worker は原本を読まない**
 > 6. **FakeRunner E2E**: 発見 → バックログ追加 (上限・重複) → 候補 → ゲート不合格でレポート止まり (承認申請なし) / ゲート合格で承認申請 (pending) → `approve` で 版 → git 記録 → symlink 切替 → approved (この順) / 30 未満 strategy が observation / 並行 2 Mission の重複選択が後着 observation / **`artifact.name` に `../` や絶対パスを返す fake が failed** / **レポート先に symlink を事前に置くと fail closed** / **timeout した Mission の `backtest_runs` / `analysis_runs` が残らない** / **レポート作成失敗時に `result=NULL`** / **`proposal_kind=risk_gate` の report は observation `unsupported_in_plan10` になり report ファイルが無い** / **strategy ゲートの baseline は live かつ D4-approved 同名 artifact、無ければ `no_strategy` 行 (null 無し)** / **report は `.tmp/*.part` → Tx-2 (`report_state=prepared`) → COMMIT 後に rename 公開 → `published`、公開失敗・`published` で最終欠損は `failed`+`result=NULL`+`done→observation`、rename 後にディレクトリ fsync、起動時 reconcile が `published ⇔ 最終存在` に収束させ孤児を消す** / **source snapshot と `_examples` は親コピーから読め、`plugins/`・`docs/` は EACCES**
 > 7. `MissionResult.status` 4 値・決定論的コア (`risk_gate` / `paper_broker` / `transitions` / `executor` の判定) は diff ゼロ / 既存 2071 テストが壊れない / **legacy payload の pending approval を持つ既存 DB から起動すると `invalidated(legacy_payload_requires_resubmit)` になり、終端行と `approved_plugins()` は不変 (§5.5)** / 新規 config キーは `settings.yaml.example` と同期 / migration (`improvement_backlog` の列追加) は空 DB・既存 DB で冪等 / **`discover` が `_`/`.` 先頭ディレクトリを列挙せず、正規形外の名前を skip する pin**
 
@@ -22163,12 +22166,13 @@ from agentic_fx.service import build_app, run_init
 | 条件 | 主な担保 task | 検証ファイル (Task 12 が実行して確認する対象) | Task 12 の役割 |
 |---|---|---|---|
 | 1 (遮断 8 項目) | Task 7 (§8.1-13 主担当) | `tests/integration/test_improve_forbidden_regression.py` (**レビュー1周目 I2 で正式ファイルとして一本化**。`tests/loops/test_improve_blocking_items.py` は Task 12 独自の追加テストであり⑦⑧の判定には使わない) | Task 7 が red で開始した 8 項目を green まで**完了させる** (下記 Step 3) |
-| 2 (3 backend 契約) | Task 2, 3 (参照 1) | `tests/runners/test_claude_runner_contract.py` / `tests/runners/test_codex_runner_contract.py` (Task 2/3 が作成) | 実行して green を確認するのみ (本 task では変更しない) |
+<!-- precheck 2026-08-22 wave2: T12-B16 -->
+| 2 (3 backend 契約) | Task 2, 3 (参照 1) | `tests/runners/test_claude_runner.py` / `tests/runners/test_codex_runner.py` (Task 2/3 が作成。現物確認: main `00c33e6` 時点で実在) | 実行して green を確認するのみ (本 task では変更しない) |
 | 3 (ゲート pytest) | Task 6 | `tests/plugin/test_gate_pytest.py` (Task 6 が作成) | 同上 |
 | 4 (D6 変異列) | Task 11 (参照 6, 7, 8) | `tests/plugin/test_switch_journal.py` ほか (Task 11 が作成) | 同上 |
-| 5 (改善レーンが取引を塞がない) | Task 9 (参照 4, 7, 8) | `tests/core/test_improve_supervisor.py` (Task 9 が作成) | 同上 |
+| 5 (改善レーンが取引を塞がない) | Task 9 (参照 4, 7, 8) | `tests/core/test_improve_wave_slot_protocol.py` / `tests/service/test_improve_wiring.py` (Task 9 が作成。D-9 実装で名前が確定 — 骨格記載の `test_improve_supervisor.py` という同名ファイルは存在しない) | 同上 |
 | 6 (FakeRunner E2E) | **Task 12 (本 task)** | `tests/loops/test_improve_e2e.py` | **本 task が新規に書く** (Step 1) |
-| 7 (4 値・diff ゼロ・2071 件・migration 冪等・example 同期・discover pin) | 全 task 横断 | `uv run pytest -q` 全体 + `git diff` (コア 4 ファイル) + `uv run pytest tests/store/test_db_migration.py` | 本 task が**最終ゲートとして再実行し確認する** (Step 5) |
+| 7 (4 値・diff ゼロ・既存件数不変・migration 冪等・example 同期・discover pin) | 全 task 横断 | `uv run pytest -q` 全体 + `git diff` (コア 4 ファイル) + `uv run pytest tests/store/test_db_migration.py` | 本 task が**最終ゲートとして再実行し確認する** (Step 5。基準件数は Step 5 実測時に控える — M-7) |
 
 **有効化配線の gate**: 上表の全行が緑であることを確認したうえでのみ Step 4 (有効化配線) を実施する。
 1 行でも赤があれば Step 4 は行わない — 骨格 Global Constraints「§7.1 の blocking 受入条件 1〜7 が
@@ -22201,12 +22205,11 @@ WorkerRunner (実サブプロセス) は monkeypatch で FakeImproveWorkerRunner
 差し替える — Landlock/実 CLI の検証は Task 1〜6 の実プロセステストが担う。
 ここでは ImproveLoop の commit 相 (親側ロジック) を対象にする。
 """
+# precheck 2026-08-22 wave2: T12-B1 T12-B2 T12-M4
 from __future__ import annotations
 
 import os
-import shutil
 import sqlite3
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -22215,15 +22218,15 @@ import pytest
 
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
-from agentic_fx.core.improve_supervisor import ImproveSupervisor
 from agentic_fx.loops.improve_loop import ImproveLoop
-from agentic_fx.plugin import approval as plugin_approval
+from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.runners.base import Mission, MissionResult
+from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.service import build_app, run_init
 from agentic_fx.store import backlog as backlog_store
-from agentic_fx.store import improve_runs as improve_runs_store
-from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.db import connect, connect_readonly
 
+from tests.store.test_rag import FakeEmbedding
 from tests.test_service_app import _no_real_network
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -22327,16 +22330,20 @@ def _install(root: Path) -> None:
         run_init(root)
 
 
+# precheck 2026-08-22 wave2: T12-B6 T12-B8 T12-B9 T12-M1
 @pytest.fixture
 def improve_env(tmp_path):
     """`build_app` を組み立て、improve レーンを FakeImproveWorkerRunner で
     駆動できる状態にする。取引レーンは本テストの関心外なので `_no_real_network`
-    で固定する。"""
+    で固定する。`embedding_fn=FakeEmbedding()` / `runner=FakeRunner([])` は
+    `tests/test_service_app.py:43-50` の既存 `_seam_app` と同じ規律
+    (chromadb のモデル DL を避ける — Task 0)。"""
     _install(tmp_path)
-    with _no_real_network(tmp_path):
-        app = build_app(tmp_path, clock=FixedClock(NOW))
+    with _no_real_network():
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
         yield app, tmp_path
-        app.supervisor.shutdown(wait=False)
+        app.close()
 
 
 def test_full_cycle_discovery_to_backlog_transition(improve_env):
@@ -22355,8 +22362,8 @@ def test_full_cycle_discovery_to_backlog_transition(improve_env):
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
 
@@ -22388,8 +22395,8 @@ def test_full_cycle_discovery_to_backlog_transition(improve_env):
     assert backlog_row[1].startswith("approval_pending:")
 
     # 人間が approve する (P2 経路)
-    plugin_approval.approve_candidate(conn, approval_id, decided_by="shell",
-                                      now=NOW)
+    plugin_switch.approve_candidate(conn, approval_id, decided_by="shell",
+                                    now=NOW)
 
     approved_row = conn.execute(
         "SELECT status FROM approvals WHERE id=?", (approval_id,)).fetchone()
@@ -22422,8 +22429,8 @@ def test_gate_failure_stops_at_report_no_approval_request(improve_env):
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
@@ -22453,10 +22460,18 @@ def test_gate_failure_stops_at_report_no_approval_request(improve_env):
     assert not live.exists()
 
 
+# precheck 2026-08-22 wave2: T12-M2
 def test_concurrent_duplicate_selection_loser_becomes_observation(improve_env):
     """2 Mission が同じ backlog id を同時に選択したとき、Tx-1 の CAS に
     負けた側 (後着) が observation に落ち、勝者だけがゲートへ進む
-    (§4.1 Tx-1、§8.1-24)。"""
+    (§4.1 Tx-1、§8.1-24)。M-2 (report-task12.md): 旧版は同一接続で逐次 2 回
+    `loop.prepare`/`commit` を呼ぶだけで「並行」を名乗っておらず、
+    `backlog_row` を fetch しても未使用のまま、killer は目視確認頼みだった。
+    ここでは 2 スレッド + 別接続 (`db_write_conn_factory` が呼び出しごとに
+    新しい接続を作る現物契約を利用) を使い、`loop.commit()` 呼び出し直前で
+    `threading.Barrier(2)` により実際に競合させる。"""
+    import threading
+
     app, root = improve_env
     conn = app.conn_core
 
@@ -22467,40 +22482,58 @@ def test_concurrent_duplicate_selection_loser_becomes_observation(improve_env):
         out["selected"] = {"backlog_id": backlog_id, "idea": "shared idea"}
         return out
 
-    loop = ImproveLoop(
-        root=root, settings=app.settings, clock=FixedClock(NOW),
-        db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
-        activity=app.activity,
-    )
+    barrier = threading.Barrier(2)
+    mission_ids: dict[str, int] = {}
+    errors: list[BaseException] = []
 
-    results = []
-    for name in ("winner_e2e", "loser_e2e"):
-        result = MissionResult(status="completed",
-                              output=_selected_output(name), transcript=[])
-        with patch("agentic_fx.loops.improve_loop.WorkerRunner",
-                   lambda _result=result, **kw: FakeImproveWorkerRunner(
-                       result=_result, **kw)):
-            mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
-            _write_staging_plugin(
-                root, ctx.mission_id, name,
-                _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
-                _PASSING_INDICATOR_TEST)
-            mission_result = worker.run(mission)
-            loop.commit(mission=mission, ctx=ctx, result=mission_result,
-                       now=NOW)
-            results.append((name, ctx.mission_id))
+    def _run_one(name: str) -> None:
+        try:
+            loop = ImproveLoop(
+                root=root, settings=app.settings, clock=FixedClock(NOW),
+                db_write_conn_factory=lambda: connect(
+                    root / "data" / "agentic.db"),
+                db_readonly_conn_factory=lambda: connect_readonly(
+                    root / "data" / "agentic.db"),
+                activity=app.activity,
+            )
+            result = MissionResult(status="completed",
+                                  output=_selected_output(name), transcript=[])
+            with patch("agentic_fx.loops.improve_loop.WorkerRunner",
+                       lambda **kw: FakeImproveWorkerRunner(
+                           result=result, **kw)):
+                mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+                _write_staging_plugin(
+                    root, ctx.mission_id, name,
+                    _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
+                    _PASSING_INDICATOR_TEST)
+                mission_ids[name] = ctx.mission_id
+                mission_result = worker.run(mission)
+                barrier.wait(timeout=10)  # 両スレッドの commit を競合させる
+                loop.commit(mission=mission, ctx=ctx, result=mission_result,
+                           now=NOW)
+        except BaseException as exc:  # noqa: BLE001 — スレッド内例外を回収
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_run_one, args=(name,))
+              for name in ("winner_e2e", "loser_e2e")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert errors == [], f"thread(s) raised: {errors!r}"
 
     backlog_row = conn.execute(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
         (backlog_id,)).fetchone()
-    # 勝者 (先着 winner_e2e) がゲートを通していれば selected→(observation か
-    # done) のどちらかに進んでいる。敗者は「同じ backlog を選ぶ遷移が起きて
-    # いない」ことだけを確認する — 二重の承認申請が無いことが本テストの killer。
+    # 二重の承認申請が無いことが本テストの主 killer。
     approval_count = conn.execute(
         "SELECT COUNT(*) FROM approvals WHERE kind='plugin'").fetchone()[0]
     assert approval_count <= 1
+    # M-2 で未使用のまま残っていた backlog_row を実際に使う: CAS に負けた
+    # 側の遷移が必ず記録され「selected」のまま止まらないことを確認する
+    # (`selected` のまま = どちらの CAS も成功しておらず状態機械が壊れている)。
+    assert backlog_row[0] != "selected"
+    assert backlog_row[1] is not None
 ```
 
 `_no_real_network` / `FixedClock` / `build_app` は既存 (`tests/test_service_app.py`,
@@ -22520,6 +22553,7 @@ Task 1〜11 が完了していれば `ImproveLoop` / `approve_candidate` / `back
 
 - [ ] **Step 3: 遮断 8 項目 (§7.1-1) を完了させる**
 
+<!-- precheck 2026-08-22 wave2: T12-B13 -->
 **レビュー1周目 I2 で正式ファイルパスを一本化**: `tests/integration/test_improve_forbidden_regression.py`
 を開き (Task 7 が red で書き始めた**正式ファイル** — 7-F 節の `_PROBE_SCRIPT`/
 `test_improve_worker_write_boundary_and_forbidden_tools` 等が定義されている)、
@@ -22529,14 +22563,30 @@ Task 7 が `pytest.mark.xfail(strict=True, ...)` を付けて red のまま残�
 (`test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly` /
 `test_holdout_and_analysis_ids_never_come_from_agent_output`) であり、**本 task で
 `xfail` マーカーを外し、`pytest.fail("Task 10 待ち...")` の本体を実アサーションへ
-書き換えて green にする**。⑧ (「payload の analysis id / 回数は agent 出力からでなく
-RPC 台帳から来る」) は Task 8 の `finish_improve_mission` payload 生成ロジックと
-Task 10 の commit 相が揃って初めて実プロセスで確認できるため、以下のテストを
-同ファイルへ追記する (⑦ も同様の要領で `run_backtest`/`analyze_corr` の実 RPC
-ハンドラを通す形へ書き換えること — 具体形は Task 7/10 の produce したシンボルに
-合わせて実装時点で確定する):
+書き換えて green にする**。⑦⑧ は §7.1-1 が「改善 worker の**実プロセス**に対して」と
+定めているため、書き換え後の本体は `tests/integration/test_improve_forbidden_regression.py`
+内の他のテストと同じ `_PROBE_SCRIPT`/実 `WorkerRunner`/実 Landlock 機構 (7-F 節) を
+使い、`run_backtest`/`analyze_corr` の実 RPC ハンドラと `finish_improve_mission` の
+payload 生成ロジックを実プロセス越しに通す形へ書き換えること (具体形は Task 7/10 の
+produce したシンボルに合わせて実装時点で確定する — これが⑦⑧の**完了判定**そのもの)。
+
+**report-task12.md B-13 で判明した欠陥**: 以前の版は下記のテストを「同ファイル
+(`test_improve_forbidden_regression.py`) へ追記する」としていたが、このテストは
+`improve_env` fixture と `_plugin_artifact`/`_write_staging_plugin`/
+`FakeImproveWorkerRunner`/`ImproveLoop`/`connect` を使う — これらは
+`tests/loops/test_improve_e2e.py` 側の定義であり、追記先の integration ファイルからは
+`fixture 'improve_env' not found` になる。加えて `FakeImproveWorkerRunner` は
+サブプロセスを起こさないため、§7.1-1 の「実プロセス」要件そのものを満たさない
+(⑦⑧の完了判定には使えない — 上記段落の実プロセス書き換えのみが判定材料)。
+**したがって以下のテストは `tests/integration/test_improve_forbidden_regression.py`
+ではなく `tests/loops/test_improve_e2e.py` (Step 1 の `improve_env` fixture と
+ヘルパを流用できるファイル) へ、⑦⑧ の完了判定を**補助**する pin として追記する**
+(payload の analysis id / 回数が agent の虚偽申告に影響されないことの commit 相ロジック
+pin — commit 相は fake WorkerRunner でも検査できる。⑦⑧ 本体の実プロセス判定は
+上記段落のとおり integration ファイル側で行う):
 
 ```python
+# tests/loops/test_improve_e2e.py (Step 1 と同一ファイル) へ追記 — 補助 pin
 def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
         improve_env):
     """agent が selection_rationale に虚偽の analysis id / 回数を書いても、
@@ -22552,8 +22602,8 @@ def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
@@ -22597,8 +22647,8 @@ def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
 
 以下の 9 本を `tests/loops/test_improve_e2e.py` (同一ファイル、`improve_env` fixture と
 `_plugin_artifact`/`_report_artifact`/`_write_staging_plugin` ヘルパを流用) へ追記する。
-①⑦は `agentic_fx.loops.improve_loop.run_in_sample` /
-`agentic_fx.loops.improve_loop.run_holdout_gate` を `WorkerRunner` と同じ要領で
+①⑦は `agentic_fx.plugin.strategy_gate.holdout.run_in_sample` /
+`agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate` を `WorkerRunner` と同じ要領で
 モジュールレベル `patch` する — この monkeypatch 対象名・`record_fn` の正確な
 シグネチャは骨格 Interfaces に無い新規の前提であり、**申し送り 9 に記載する**
 (申し送り 8 は「9 シナリオを完全コード化したか」の観点でのみ解決済みとする)。
@@ -22607,26 +22657,56 @@ def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
 _MISSION_MAX_TURNS_ATTR = "improve.mission_max_turns"  # 参考: §7.1-2 対応表脚注
 
 
+# precheck 2026-08-22 wave2: T12-B4
+def _fake_record_kwargs(*, settings, trades: int, **overrides) -> dict:
+    """現物 `src/agentic_fx/backtest/holdout.py:113-133` `_run_scope` が
+    `record_fn(save_kwargs)` へ渡す `save_kwargs` (= `save_harness_run` の
+    kwargs) の形を組み立てる。`variant` キーは現物 `save_kwargs` に含まれない
+    — trades 数は `metrics` に埋める (§4.2-4 の evaluable 判定は呼び出し側の
+    `trades >= EVALUABLE_MIN_TRADES` が別途行うため、`metrics` の内容自体は
+    このテストの関心外)。呼び出し側 (`run_in_sample`/`run_holdout_gate` の実
+    引数) から `plugin_ref`/`content_hash`/`kind`/`pair`/`eval_timeframe`/
+    `source`/`period_start`/`period_end`/`now` が渡ってくる想定だが、Task 10
+    未実装の本ファイル執筆時点では正確な呼び出しシグネチャが確定していない
+    ため `overrides` (fake `_run` が受け取った **kwargs から抽出した値) で
+    上書きしつつ、欠けている項目には安全なデフォルトを補う (申し送り 9②)。"""
+    return dict(
+        scope=overrides.get("scope", "in_sample"),
+        plugin_ref=overrides.get("plugin_ref", "unknown:unknown"),
+        content_hash=overrides.get("content_hash", "0" * 64),
+        kind=overrides.get("kind", "strategy"),
+        pair=overrides.get("pair", "USDJPY"),
+        timeframe=overrides.get("eval_timeframe", overrides.get("timeframe", "1h")),
+        source=overrides.get("source", "yfinance"),
+        period=(overrides.get("period_start", NOW), overrides.get("period_end", NOW)),
+        metrics={"trades": trades},
+        settings_hash="fake-settings-hash",
+        core_commit="fake-core-commit",
+        initial_balance=settings.backtest.initial_balance,
+        now=overrides.get("now", NOW),
+    )
+
+
 def _fake_in_sample_metrics(trades: int):
     """`run_in_sample(settings, *, history_conn, record_fn, ...)` の
-    fake。実装時に record_fn の正確な引数形が骨格と異なる場合は本関数を
-    合わせて調整すること (申し送り 9)。§4.2-4 の evaluable 判定
-    (`trades >= EVALUABLE_MIN_TRADES`, 既存 `backtest/metrics.py`) に合わせ、
-    `record_fn` へ `variant='candidate'` の行を 1 つ積んでから
-    `{"trades": trades, "evaluable": trades >= 30, ...}` を返す。"""
+    fake。§4.2-4 の evaluable 判定 (`trades >= EVALUABLE_MIN_TRADES`, 既存
+    `backtest/metrics.py`) に合わせ、`record_fn` へ現物 `save_kwargs` 形の
+    in_sample 行を 1 つ積んでから `{"trades": trades, "evaluable": trades >=
+    30}` を返す。"""
     def _run(settings, *, history_conn, record_fn, **kwargs):
-        record_fn({"variant": "candidate", "trades": trades,
-                  "evaluable": trades >= 30})
+        record_fn(_fake_record_kwargs(settings=settings, trades=trades,
+                                      scope="in_sample", **kwargs))
         return {"trades": trades, "evaluable": trades >= 30}
     return _run
 
 
 def _fake_holdout_metrics():
-    """`run_holdout_gate` の fake。`record_fn` へ `variant='candidate'` の
+    """`run_holdout_gate` の fake。`record_fn` へ現物 `save_kwargs` 形の
     holdout 行を積む。①のシナリオ (trades<30) では呼ばれない想定 —
     呼ばれたら §4.2-4 の evaluable ゲートが壊れている。"""
     def _run(settings, *, history_conn, record_fn, **kwargs):
-        record_fn({"variant": "candidate", "trades": 40, "evaluable": True})
+        record_fn(_fake_record_kwargs(settings=settings, trades=40,
+                                      scope="holdout_gate", **kwargs))
         return {"trades": 40, "evaluable": True}
     return _run
 
@@ -22645,8 +22725,8 @@ def test_strategy_below_evaluable_min_trades_becomes_observation(improve_env):
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
     holdout_calls: list[bool] = []
@@ -22658,9 +22738,9 @@ def test_strategy_below_evaluable_min_trades_becomes_observation(improve_env):
 
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)), \
-         patch("agentic_fx.loops.improve_loop.run_in_sample",
+         patch("agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
                _fake_in_sample_metrics(29)), \
-         patch("agentic_fx.loops.improve_loop.run_holdout_gate",
+         patch("agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
                _holdout_should_not_be_called):
         mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
@@ -22696,8 +22776,8 @@ def test_artifact_name_traversal_fails_mission(improve_env):
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
@@ -22746,8 +22826,8 @@ def test_report_tmp_symlink_fails_closed(improve_env):
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
@@ -22782,6 +22862,7 @@ def test_report_tmp_symlink_fails_closed(improve_env):
     assert backlog_row[1].startswith("report_failed:")
 
 
+# precheck 2026-08-22 wave2: T12-B5 T12-M3
 def test_timeout_mission_leaves_no_backtest_or_analysis_run_rows(
         improve_env):
     """§3.6: timeout した Mission は `finish_improve_mission` の 1 tx で
@@ -22789,7 +22870,12 @@ def test_timeout_mission_leaves_no_backtest_or_analysis_run_rows(
     残らない)。台帳を実際に使わせてから timeout させる — 未使用の台帳に
     対する不在確認は空洞テストになるため、`rpc_handlers` 経由で
     `run_backtest`/`analyze_corr` を最低 1 回ずつ呼んでから timeout を
-    返す。"""
+    返す。**`backtest_runs.mission_id`/`analysis_runs.mission_id` 列は
+    Task 10 が追加する** (第 2 波裁定「Task 12 (report-task12.md B-1〜B-17)」
+    節: 列そのものは Task 10 の 8-C 相当 Step が `_ensure_column` で追加する
+    — 本ファイルの SQL はその追加に依存する。Task 10 完了前にこの Step だけを
+    先行実行すると `sqlite3.OperationalError: no such column: mission_id` に
+    なる)。"""
     app, root = improve_env
     conn = app.conn_core
 
@@ -22800,8 +22886,8 @@ def test_timeout_mission_leaves_no_backtest_or_analysis_run_rows(
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
@@ -22821,6 +22907,12 @@ def test_timeout_mission_leaves_no_backtest_or_analysis_run_rows(
                 pass
         mission_result = worker.run(mission)
         loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
+
+    # M-3 (report-task12.md): except: pass のせいで台帳に 1 件も積まれない
+    # まま「0 行」が別の理由 (呼出し自体が失敗) で通ってしまう空洞化を防ぐ —
+    # `ImproveRpcLedger.entries()` は freeze() 後 (= commit 相突入後) のみ
+    # 呼べる (骨格 Interfaces) ため、ここ (commit 完了後) で読む。
+    assert len(ctx.ledger.entries()) >= 1
 
     backtest_rows = conn.execute(
         "SELECT COUNT(*) FROM backtest_runs WHERE mission_id=?",
@@ -22854,8 +22946,8 @@ def test_report_creation_failure_leaves_result_null(improve_env):
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
     tmp_dir = root / "reports" / ".tmp"
@@ -22895,8 +22987,8 @@ def test_risk_gate_proposal_becomes_unsupported_observation(improve_env):
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
@@ -22915,12 +23007,16 @@ def test_risk_gate_proposal_becomes_unsupported_observation(improve_env):
     assert report_files == []
 
 
+# precheck 2026-08-22 wave2: T12-B5
 def test_strategy_baseline_falls_back_to_no_strategy_row(improve_env):
     """§4.2-4: 合計取引数 ≥30 (評価可能) かつ同名の live/D4-approved strategy
     が存在しないとき、baseline は `variant='no_strategy'` の明示行になる
     (null にしない)。`run_holdout_gate` の fake も呼び出し、holdout 側にも
     baseline 行が要ることを確認する必要はここでは問わない (in-sample の
-    baseline 行だけを pin する — holdout 側は別途骨格実装時に追加検討)。"""
+    baseline 行だけを pin する — holdout 側は別途骨格実装時に追加検討)。
+    `backtest_runs.mission_id` 列は Task 10 が追加する (本ファイル冒頭の
+    `test_timeout_mission_leaves_no_backtest_or_analysis_run_rows` の
+    docstring 参照)。"""
     app, root = improve_env
     conn = app.conn_core
 
@@ -22930,15 +23026,15 @@ def test_strategy_baseline_falls_back_to_no_strategy_row(improve_env):
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)), \
-         patch("agentic_fx.loops.improve_loop.run_in_sample",
+         patch("agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
                _fake_in_sample_metrics(40)), \
-         patch("agentic_fx.loops.improve_loop.run_holdout_gate",
+         patch("agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
                _fake_holdout_metrics()):
         mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
@@ -22979,8 +23075,8 @@ def test_report_outbox_state_transitions_published_then_rename_failure(
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
 
@@ -23056,8 +23152,8 @@ def test_source_snapshot_dir_is_readonly_to_parent_after_prepare(
     loop = ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
-        db_readonly_conn_factory=lambda: connect(
-            root / "data" / "agentic.db", readonly=True),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
         activity=app.activity,
     )
     result = MissionResult(status="completed",
@@ -23080,6 +23176,7 @@ def test_source_snapshot_dir_is_readonly_to_parent_after_prepare(
 
 - [ ] **Step 4: 有効化配線 (`schedule.improve` の消費と `improve` コマンドの有効化のみ)**
 
+<!-- precheck 2026-08-22 wave2: T12-B11 T12-B12 T12-M8 -->
 **gate**: 上記対応表の 7 行 (条件 1〜7) が全て緑であることを、この Step の直前に
 `uv run pytest -q` で確認してから着手する。
 
@@ -23087,57 +23184,42 @@ def test_source_snapshot_dir_is_readonly_to_parent_after_prepare(
 shutdown/join まで配線するが、(a) `Scheduler` の構築呼び出しに improve 用の tick
 コールバックを渡さない、(b) `Commands` の構築呼び出しに `improve_supervisor` を渡さない
 —— の 2 点を意図的に外して「配線されているが到達不能」の状態で止める (§8.1-46 の
-task graph 前提を満たすための分割)。本 Step はこの 2 箇所**だけ**を変更する。
+task graph 前提を満たすための分割)。**Task 10 §10.12 が同じ `build_app()` の末尾に
+`ImproveSupervisor._improve_loop = improve_loop` の注入を追加する (Task 10 の担当。
+プラン L18786) ため、本 Step 着手時点で `Scheduler(...)`/`Commands(...)` 呼び出しの
+直前に Task 10 が挿入した行が既にあるはずである。着手前に必ず現物の
+`src/agentic_fx/service.py` を読み、以下の「変更前」全文を再現しようとせず**
+（report-task12.md B-11/B-12 — 全文の逐語置換は Task 9/10 完了後の現物にある
+`signal_due_fn=`/`stop_event=`/`shell_broker`/`_SupervisorAsk` 等の既存引数を
+消してしまう）**、次の 2 箇所へそれぞれ 1 行だけ挿入する形で行う:**
 
-`src/agentic_fx/service.py` の `Scheduler(...)` 呼び出し (Task 9 時点、`service.py` の
-`scheduler = Scheduler(conn=conn_core, executor=executor, settings=settings, ...)` 付近):
-
+1. `Scheduler(...)` 呼び出しの **`on_cache_maintenance=on_cache_maintenance,` の次行**
+   (Task 9 時点の現物 `service.py:912-921` — `conn=conn_core, executor=executor,
+   settings=settings, state_store=state, activity=activity, bars_fn=bars_fn,
+   on_trade_mission=on_trade_mission, on_news_cycle=collector.collect,
+   on_econ_cycle=econ.refresh, on_signal_maintenance=on_signal_maintenance,
+   on_cache_maintenance=on_cache_maintenance, signal_due_fn=signal_due_fn,
+   stop_event=stop_event` の 12 引数が既にある — Task 9 完了時点で `on_improve_tick`
+   は渡されていない) へ、以下の 1 行を追加する:
 ```python
-# 変更前 (Task 9 完了時点)
-scheduler = Scheduler(conn=conn_core, executor=executor,
-                      settings=settings, state_store=state,
-                      activity=activity, bars_fn=bars_fn,
-                      on_trade_mission=on_trade_mission,
-                      on_news_cycle=collector.collect,
-                      on_econ_cycle=econ.refresh,
-                      on_signal_maintenance=on_signal_maintenance,
-                      on_cache_maintenance=on_cache_maintenance,
-                      # on_improve_tick は渡さない (既定 None → 消費されない)
-                      )
-
-# 変更後 (Task 12)
-scheduler = Scheduler(conn=conn_core, executor=executor,
-                      settings=settings, state_store=state,
-                      activity=activity, bars_fn=bars_fn,
-                      on_trade_mission=on_trade_mission,
-                      on_news_cycle=collector.collect,
-                      on_econ_cycle=econ.refresh,
-                      on_signal_maintenance=on_signal_maintenance,
-                      on_cache_maintenance=on_cache_maintenance,
-                      on_improve_tick=improve_supervisor.tick,
-                      )
+on_improve_tick=improve_supervisor.tick,
+```
+2. `Commands(...)` 呼び出し (Task 9 時点の現物 `service.py:934-938` —
+   `conn=conn_shell, state_store=state, broker=shell_broker,
+   trade_loop=_SupervisorAsk(supervisor, ask_wait_timeout_sec), activity=activity,
+   log_dir=root / "logs", clock=clock, health_latch=health_latch` の 8 引数。
+   `broker`/`trade_loop` は取引レーンの `conn_core` 束縛 broker ではなく
+   **`conn_shell` 束縛の `shell_broker`** と **`_SupervisorAsk` ラップ**である
+   ことに注意 — この 2 引数を書き換えないこと) の **`health_latch=health_latch,`
+   の次行**へ、以下の 1 行を追加する:
+```python
+improve_supervisor=improve_supervisor,
 ```
 
-`src/agentic_fx/service.py` の `Commands(...)` 呼び出し:
-
-```python
-# 変更前 (Task 9 完了時点)
-commands = Commands(conn=conn_shell, state_store=state, broker=broker,
-                    trade_loop=trade_loop, activity=activity,
-                    log_dir=root / "logs", clock=clock,
-                    health_latch=health_latch,
-                    # improve_supervisor は渡さない (既定 None →
-                    # `improve`/`improve add` は「改善ループは無効です」を返す)
-                    )
-
-# 変更後 (Task 12)
-commands = Commands(conn=conn_shell, state_store=state, broker=broker,
-                    trade_loop=trade_loop, activity=activity,
-                    log_dir=root / "logs", clock=clock,
-                    health_latch=health_latch,
-                    improve_supervisor=improve_supervisor,
-                    )
-```
+いずれも「1 行挿入」であって、既存引数の全文を書き直す操作ではない。実装者は
+`grep -n "on_cache_maintenance=on_cache_maintenance," src/agentic_fx/service.py`
+/ `grep -n "health_latch=health_latch," src/agentic_fx/service.py` で挿入位置を
+特定してから 1 行だけ足すこと。
 
 **Task 9 の `Scheduler.__init__`/`Commands.__init__` に `on_improve_tick` /
 `improve_supervisor` という既定 `None` のキーワード引数が既に存在することを前提にする**
@@ -23147,38 +23229,106 @@ Callable | None = None` / `Commands.improve_supervisor: ImproveSupervisor | None
 = None` の既定 `None` フックを用意するだけ、値を渡す配線は本 Task 12 のみ)。
 
 **配線スモークテスト (Step 6 M1/M2 の killer、`tests/test_service_app.py` へ追記)**:
-`build_app` は `App` dataclass (`src/agentic_fx/service.py:274`) を返し、
-`App.scheduler` / `App.commands` は現物確認済み (同ファイル `return App(...,
-scheduler=scheduler, commands=commands, ...)`)。この Step の diff 適用直後に
-以下を追記する:
+<!-- precheck 2026-08-22 wave2: T12-B7 T12-B9 T12-B10 -->
+`build_app` は `App` dataclass (`src/agentic_fx/service.py:442`) を返し、
+`App.scheduler` / `App.commands` / `App.improve_supervisor` は現物確認済み
+(同ファイル `return App(..., scheduler=scheduler, commands=commands,
+improve_supervisor=improve_supervisor, ...)`)。改善レーンの `ImproveSupervisor` は
+**`App.improve_supervisor`** に格納される (`App.supervisor` は取引レーンの
+`MissionSupervisor` — 別クラスで `tick`/`submit_manual` を持たない。report-task12.md
+B-8/B-9 で判明した誤参照)。「hook が実際に発火する」ことを検査する (B-10:
+`is not None` や恒真 `or callable(...)` では、束縛先オブジェクトを取り違えても
+検出できない — D-9 検収と同じ欠陥の再発を防ぐ) — `ImproveSupervisor.tick` を
+spy 化して `_scheduler_tick_once` (`service.py:990-1004`、core_lock を抜けた後に
+遅延 callable を実行する既存のシーム) を実際に駆動し、呼ばれることを確認する。
+`Commands.dispatch("improve")` が `submit_manual` に到達することも同様に検査する。
+この Step の diff 適用直後に以下を追記する:
 
 ```python
 # tests/test_service_app.py に追記
 def test_improve_tick_and_supervisor_wired_after_task12(tmp_path):
     """R-i9 の分担 (Task 9 = 既定 None フック、Task 12 = 値の配線) が
-    Step 4 の diff で実際に満たされていることの軽量スモーク。
-    on_improve_tick を外す変異 (M1) / improve_supervisor を外す変異 (M2) の
-    killer。"""
-    _install_settings(tmp_path)
-    with _no_real_network(tmp_path):
-        app = build_app(tmp_path, clock=FixedClock(NOW))
+    Step 4 の diff で実際に満たされていることの検査。B-10 (report-task12.md):
+    hook が『渡されている』ではなく『実際に発火する』ことを、
+    `Scheduler.tick()` が返す遅延 callable 経由の実行と `improve` コマンドの
+    到達の両方で確認する (M1/M2 の真の killer)。"""
+    from unittest.mock import patch as _patch
+    from agentic_fx.core.improve_supervisor import ImproveSupervisor
+    from agentic_fx.service import _scheduler_tick_once
+    _init(tmp_path)
+    with _no_real_network():
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
         try:
-            assert app.scheduler.on_improve_tick is not None
-            assert app.scheduler.on_improve_tick == app.supervisor.tick \
-                or callable(app.scheduler.on_improve_tick)
-            assert app.commands.improve_supervisor is not None
-            assert app.commands.improve_supervisor is app.supervisor
+            # M1 の真の killer: on_improve_tick が正しいオブジェクトへ束縛
+            # されているか (恒真 assert を避ける — B-10 型 3)。
+            assert app.scheduler.on_improve_tick.__self__ is \
+                app.improve_supervisor
+            # 発火経路の実測: core_lock 保持中は遅延 callable として返り、
+            # `_scheduler_tick_once` が lock を抜けてから実行する
+            # (`service.py:990-1004`)。ここで実際に `ImproveSupervisor.tick`
+            # が呼ばれることを spy で確認する。
+            with _patch.object(ImproveSupervisor, "tick") as spy:
+                _scheduler_tick_once(app)
+                spy.assert_called_once_with(NOW)
+            # M2 の真の killer: `improve` コマンドが submit_manual に到達する。
+            with _patch.object(ImproveSupervisor, "submit_manual",
+                               return_value=42):
+                assert "42" in app.commands.dispatch("improve")
         finally:
-            app.supervisor.shutdown(wait=False)
+            app.close()
 ```
 
-`_install_settings` / `_no_real_network` / `NOW` / `FixedClock` は
-`tests/test_service_app.py` の既存定義をそのまま使う (無ければ本ファイル冒頭の
-`_install` 相当を流用する)。`app.supervisor` が `ImproveSupervisor` インスタンスで
-あることは Task 9 の Interfaces (`ImproveSupervisor.tick`) 前提 — `build_app` が
-`ImproveSupervisor` を `app.supervisor` として保持することは Task 9 の骨格記述
-(§8.1「有効化配線」由来) に依拠する。属性名が異なれば実装時にこのテストの
-参照先を合わせること。
+`_init` / `_no_real_network` / `NOW` / `FixedClock` / `FakeRunner` / `FakeEmbedding`
+は `tests/test_service_app.py` の既存定義・既存 import をそのまま使う
+(report-task12.md B-7: `_install_settings` は非実在、`tests/test_service_app.py`
+の実在ヘルパは `_init(tmp_path)`)。`app.improve_supervisor` が `ImproveSupervisor`
+インスタンスであることは Task 9 の Interfaces (`ImproveSupervisor.tick`/
+`submit_manual`) と `App` dataclass の `improve_supervisor` フィールド
+(`service.py:467`) に依拠する — いずれも現物確認済み。
+
+- [ ] **Step 4b: 既存テスト `tests/service/test_improve_wiring.py` の 3 本を Task 12 後の期待値へ書き換える**
+
+<!-- precheck 2026-08-22 wave2: T12-B14 -->
+Step 4 の diff (`on_improve_tick`/`improve_supervisor` を非 None にする配線) は
+`tests/service/test_improve_wiring.py` (Task 9 = D-9 が作成、現物確認済み) の以下
+3 本を必ず赤化する — report-task12.md B-14 で判明した欠陥。Files 節にこのファイルを
+Modify として追加し、以下のとおり書き換える:
+
+1. `test_scheduler_on_improve_tick_is_none_at_task9` (現物 L62-70、
+   `assert app.scheduler.on_improve_tick is None`) →
+   `assert app.scheduler.on_improve_tick.__self__ is app.improve_supervisor`
+   に置換し、テスト名を `test_scheduler_on_improve_tick_is_wired_after_task12`
+   へ改名する (docstring も「Task 9 の時点では None」から「Task 12 の配線後は
+   improve_supervisor.tick に束縛される」へ更新)。
+2. `test_commands_improve_supervisor_is_none_at_task9` (現物 L73-81、
+   `assert app.commands.improve_supervisor is None`) →
+   `assert app.commands.improve_supervisor is app.improve_supervisor` に置換し、
+   テスト名を `test_commands_improve_supervisor_is_wired_after_task12` へ改名する。
+3. `test_scheduler_tick_returns_empty_list_when_on_improve_tick_is_none`
+   (現物 L127-137) は「`on_improve_tick` が None のとき `tick()` は空リストを
+   返す」という **Scheduler 自体の契約** (Task 9 が実装した不変条件) を検査して
+   おり、Task 12 後もこの契約自体は保たれるべきなので削除しない。Task 12 配線後は
+   `build_app` が作る `app.scheduler.on_improve_tick` が非 None になるため、
+   テスト本体で `on_improve_tick` を一時的に `None` へ差し替えてから `tick()` を
+   呼ぶ形に書き換える:
+```python
+def test_scheduler_tick_returns_empty_list_when_on_improve_tick_is_none(
+        tmp_path):
+    """`on_improve_tick` が None のとき `Scheduler.tick()` の戻り値は常に
+    空リスト (Scheduler 自体の契約 — Task 12 配線後も保たれる)。"""
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        app.scheduler.on_improve_tick = None
+        pending = app.scheduler.tick(NOW)
+        assert pending == []
+    finally:
+        app.close()
+```
+
+この 3 本の書き換えを Step 4 の diff 適用と同一コミットで行う (Step 7 の `git add`
+対象に `tests/service/test_improve_wiring.py` を追加すること)。
 
 - [ ] **Step 5: 全体 green の確認 (§7.1-7 の最終ゲート)**
 
@@ -23188,8 +23338,17 @@ uv run pytest -q --collect-only 2>/dev/null | tail -3
 uv run pytest -q
 ```
 
-期待: 収集件数が「プラン 10 開始時点 2071 passed / 1 deselected」から本プランで追加した
-件数だけ増えており、既存 2071 件が 1 件も壊れていない。加えて:
+<!-- precheck 2026-08-22 wave2: T12-M7 -->
+期待: 「プラン 10 開始時点 2071 passed / 1 deselected」(§7.1-7 逐語、骨格 Global
+Constraints の引用そのものは変更しない) という基準は、本 Task 12 が実際に着手する
+時点では Task 1〜11 が積んだテストの分だけ増加しているため字面どおりの数として
+使わない。**Step 5 の判定は「本 Step 直前の `git log` で Task 1〜11 の最後のコミットに
+対して `uv run pytest -q --collect-only` を実行し、その件数を基準値として控えてから
+本 Step のコミット後に再実行し、基準値以下に減っていないこと」で行う**
+(report-task12.md M-7: 着手前検証時点の実測は main `00c33e6` で 2468/2469 tests
+collected, 1 deselected — この具体数値も Task 12 着手時点ではさらに増えている
+はずなので固定値として使わない。既存件数が 1 件も壊れていないことだけを確認する)。
+加えて:
 
 ```bash
 git diff --stat -- src/agentic_fx/core/risk_gate.py src/agentic_fx/core/paper_broker.py \
@@ -23216,11 +23375,11 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 
 | # | 変異 | 殺すテスト |
 |---|---|---|
-| M1 | `Scheduler(...)` から `on_improve_tick=improve_supervisor.tick` を外す (既定 None に戻す) | `tests/test_service_app.py::test_improve_tick_and_supervisor_wired_after_task12` (Step 4 で追加済み。`app.scheduler.on_improve_tick is not None` が落ちる) |
-| M2 | `Commands(...)` から `improve_supervisor=improve_supervisor` を外す | 同上 `test_improve_tick_and_supervisor_wired_after_task12` (`app.commands.improve_supervisor is not None` が落ちる) |
+| M1 | `Scheduler(...)` から `on_improve_tick=improve_supervisor.tick` を外す (既定 None に戻す) | `tests/test_service_app.py::test_improve_tick_and_supervisor_wired_after_task12` (Step 4 で追加済み。`app.scheduler.on_improve_tick.__self__ is app.improve_supervisor` の判定前に `AttributeError` (None に `__self__` は無い) で落ちる) |
+| M2 | `Commands(...)` から `improve_supervisor=improve_supervisor` を外す | 同上 `test_improve_tick_and_supervisor_wired_after_task12` (`app.commands.dispatch("improve")` が `improve_supervisor is None` の分岐に落ち `"42" in ...` が真にならない) |
 | M3 | `test_full_cycle_...` の `approve_candidate` 呼び出しを削除し `apply_decision` を直接呼ぶ | 承認決定は `apply_decision` を経由する pin (Task 11 側のテストと重複するが、本 E2E でも `live.is_symlink()` の assert が symlink 化されず落ちる) |
 | M4 | `_write_staging_plugin` の `test_plugin.py` を常に `_PASSING_INDICATOR_TEST` にする (`_FAILING_INDICATOR_TEST` を使わない) | `test_gate_failure_stops_at_report_no_approval_request` (承認申請が 0 件のはずが 1 件になり落ちる) |
-| M5 | `test_concurrent_duplicate_selection_...` で 2 回目の `loop.prepare` に**別の** `backlog_id` を使わせる (共有させない) | `approval_count <= 1` の assert が意味を失う (2 件出ても通ってしまう) — 変異注入で `approval_count == 2` になることを目視確認してから元に戻す |
+| M5 | `test_concurrent_duplicate_selection_...` (M-2 是正版) で `barrier.wait` を削除し 2 スレッドを完全逐次化する | `assert backlog_row[0] != "selected"` は残るが、`threading.Barrier` を削除すると「並行」の実質が失われる — 実装者は `_run_one` に一時的な `time.sleep` を挿入し 2 回目の `commit` が先着より確実に後着になる形に固定した上で、`approval_count <= 1` が変異前後で不変であることを確認し、続けて `backlog_id` を**別の** id に差し替える変異 (共有させない) を注入して `approval_count == 2` になり red 化することを実測してから revert する |
 
 各変異は `grep -n` で改変箇所を確認してから対象テストのみ実行し red を確認、revert して
 green に戻す。
@@ -23230,6 +23389,8 @@ green に戻す。
 ```bash
 git add tests/loops/test_improve_e2e.py \
        tests/integration/test_improve_forbidden_regression.py \
+       tests/service/test_improve_wiring.py \
+       tests/test_service_app.py \
        src/agentic_fx/service.py
 git commit -m "$(cat <<'EOF'
 feat: 改善ループ FakeRunner E2E + 遮断8項目完了 + 有効化配線 (プラン10 Task12)
@@ -23811,18 +23972,51 @@ Claude サブスク) を消費する。
    `test_risk_gate_proposal_becomes_unsupported_observation` /
    `test_strategy_baseline_falls_back_to_no_strategy_row` /
    `test_report_outbox_state_transitions_published_then_rename_failure` /
-   `test_source_snapshot_dir_is_readonly_to_parent_after_prepare`。合計 13 本で
-   条件 6 の逐語ブレットを網羅する。**この項目はカバレッジの観点でのみ解決済み**
-   — Step 3b が新規に前提化した記号 (下記 9) は未解決のまま残る。
-9. **(新規) Step 3b が新規に前提化した記号**: ①`agentic_fx.loops.improve_loop.
-   run_in_sample` / `agentic_fx.loops.improve_loop.run_holdout_gate` を
-   `WorkerRunner` と同じ要領でモジュールレベル `patch` できる (別名 import・
-   関数内 import の場合は Task 10 実装時に patch 対象を合わせること) ②これらが
-   受け取る `record_fn` の正確な引数形 (本ファイルは `record_fn(dict)` で
-   `variant`/`trades`/`evaluable` を渡す形を仮定した — §4.1 の「caller-owned sink
-   (`record_fn`)」の正確なシグネチャは骨格 Interfaces に無い) ③⑨ (source snapshot)
-   は `ctx.source_snapshot_dir` のパーミッションビット (0500) だけを親プロセス視点で
-   pin し、worker 側の Landlock 越し EACCES (§7.1-1-⑨ の本体) は
+   `test_source_snapshot_dir_is_readonly_to_parent_after_prepare`。合計 13 本を
+   Step 1/Step 3/Step 3b で完全なテスト関数として書き切った。
+   <!-- precheck 2026-08-22 wave2: T12-B17 --> **着手前検証 (2026-08-22 第 2 波、
+   report-task12.md B-17) で「網羅済み」の自認が誤りと判定された**: §7.1-6 の
+   逐語ブレットのうち以下 5 点はこの 13 本でカバーされていない。担当を条件番号
+   ごとに切り分けて対応する:
+   - バックログ追加の**上限・重複**は §7.1-6 のブレットではあるが実装・単体
+     テストは Task 10 側 (`improve.max_new_backlog_per_mission`、
+     `test_new_backlog_over_limit_are_dropped_and_counted_in_activity`) —
+     本ファイルには追加しない (Task 10 の実装計画が該当テストを持つ前提。
+     無ければ Task 10 の実装者へ差し戻す)。
+   - approve → 版 → **git 記録 → symlink 切替 → approved (この順)** は
+     §5 D6 変異列の「git 記録より先に切替する」killer (設計書 §5「変異」節、
+     `git 失敗を注入して承認させ、plugins/<name> が旧版を指したまま
+     approved_plugins() に残ることを assert`) として**既に条件 4 に属し**、
+     Task 12 の対応表で「Task 11 (`tests/plugin/test_switch_journal.py`) が
+     作成 → Task 12 は実行して green を確認するのみ」と明記済み — Task 12 が
+     重複してこの pin を E2E に追加する必要は無い (対応表の条件 4 行を参照)。
+   - 並行 2 Mission の重複選択が**後着 observation**であることは §7.1-6 の
+     条件 6 (Task 12 自身の担当) に属するため、Step 3b の
+     `test_concurrent_duplicate_selection_loser_becomes_observation` を
+     M-2 是正 (上記コード、`threading.Barrier` による真の並行化 +
+     `backlog_row[0] != "selected"` の非恒真 assert) で強化し、この項目の
+     E2E カバレッジとする。
+   - strategy ゲート baseline の **live かつ D4-approved 同名 artifact** の
+     正例と、rename 後の **ディレクトリ fsync / 起動時 reconcile** は
+     Task 10/11 側の担当として明記し本ファイルでは追加しない (Task 10/11 の
+     実装計画が該当 Step を持つ前提。無ければ Task 10/11 の実装者へ
+     差し戻す)。
+9. **(新規) Step 3b が前提化した記号 (統合時に解決済み)**: ①`agentic_fx.
+   plugin.strategy_gate.holdout.run_in_sample` / `agentic_fx.plugin.
+   strategy_gate.holdout.run_holdout_gate` をモジュールレベル `patch` する
+   (統合裁定 R-i3 により strategy ゲートは `plugin/strategy_gate.py` に置かれ、
+   そこが `backtest/holdout.py` を `holdout.run_in_sample` の形で呼ぶ —
+   `agentic_fx.loops.improve_loop.run_in_sample` という当初の patch 対象は
+   非実在だった。着手前検証 report-task12.md B-3 で判明、修正済み) ②`record_fn`
+   の引数形は現物 `src/agentic_fx/backtest/holdout.py:113-133` の `_run_scope` を
+   統合時に確認した: `record_fn(save_kwargs)` 形で `save_kwargs` は
+   `scope`/`plugin_ref`/`content_hash`/`kind`/`pair`/`timeframe`/`source`/
+   `period`/`metrics`/`settings_hash`/`core_commit`/`initial_balance`/`now`
+   (= `save_harness_run` の kwargs)。`variant` キーは含まれない — Step 3b の
+   fake は下記のとおり現物形に合わせて書き直した (report-task12.md B-4 で
+   判明、修正済み) ③⑨ (source snapshot) は `ctx.source_snapshot_dir` の
+   パーミッションビット (0500) だけを親プロセス視点で pin し、worker 側の
+   Landlock 越し EACCES (§7.1-1-⑨ の本体) は
    `tests/integration/test_improve_forbidden_regression.py` (Task 7、実プロセス、
    レビュー1周目 I2 で正式ファイルへ一本化) が担う分業を
    前提にした — 骨格側にこの分業の明記は無い。齟齬があれば Task 10/7 の実装に
