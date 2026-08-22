@@ -109,6 +109,80 @@ def test_check_candidate_snapshot_missing_file_is_rejected(tmp_path):
         check_candidate_snapshot(d)
 
 
+# <!-- precheck 2026-08-22: T6-B2 --> `check_candidate_snapshot` の無視
+# リスト (`__pycache__/`, `*.pyc`, `.pytest_cache/`) — `submit_plugin` の
+# 後段 (`_validate_kind` → `sandbox.PluginSession`) が候補ディレクトリを
+# cwd に plugin.py を import すると `__pycache__` が残り、無視リストが
+# 無いと以後その plugin の submit/bless が恒久的に失敗していた (検収
+# Blocking B2)。
+
+
+def test_check_candidate_snapshot_ignores_pycache_dir(tmp_path):
+    d = tmp_path / "cand"; _write_manifest(d)
+    (d / "__pycache__").mkdir()
+    (d / "__pycache__" / "plugin.cpython-313.pyc").write_bytes(b"\x00")
+    check_candidate_snapshot(d)  # raise しない
+
+
+def test_check_candidate_snapshot_ignores_pytest_cache_dir(tmp_path):
+    d = tmp_path / "cand"; _write_manifest(d)
+    (d / ".pytest_cache").mkdir()
+    check_candidate_snapshot(d)  # raise しない
+
+
+def test_check_candidate_snapshot_ignores_top_level_pyc_file(tmp_path):
+    d = tmp_path / "cand"; _write_manifest(d)
+    (d / "plugin.pyc").write_bytes(b"\x00")
+    check_candidate_snapshot(d)  # raise しない
+
+
+def test_check_candidate_snapshot_rejects_pycache_that_is_not_a_directory(tmp_path):
+    """`__pycache__` という名前の**通常ファイル**は無視リスト対象では
+    ない (ディレクトリであることを確認したうえでのみ無視する) — 無視
+    リストを名前だけで判定する変異を殺す。"""
+    d = tmp_path / "cand"; _write_manifest(d)
+    (d / "__pycache__").write_text("not a directory")
+    with pytest.raises(CandidateSnapshotError, match="unexpected"):
+        check_candidate_snapshot(d)
+
+
+def test_check_candidate_snapshot_still_rejects_unrelated_extra_file_alongside_pycache(
+        tmp_path):
+    """無視リストは無条件の免除ではない — `__pycache__` があっても、
+    無視リスト外の余分ファイル (`conftest.py`) は依然拒否される。"""
+    d = tmp_path / "cand"; _write_manifest(d)
+    (d / "__pycache__").mkdir()
+    (d / "conftest.py").write_text("x")
+    with pytest.raises(CandidateSnapshotError, match="unexpected"):
+        check_candidate_snapshot(d)
+
+
+def test_check_candidate_snapshot_passes_after_plugin_session_execution(
+        tmp_path, settings):
+    """主 pin: `submit_plugin` の後段が使う `sandbox.PluginSession` を
+    実際に起動すると、worker (`agentic_fx.plugin.worker._import_plugin`)
+    の `importlib.util.spec_from_file_location` が候補ディレクトリに
+    `__pycache__` を書く (`sandbox._build_env` は
+    `PYTHONDONTWRITEBYTECODE`/`PYTHONPYCACHEPREFIX` を設定しないため)。
+    是正前はこの後の再ゲートが `CandidateSnapshotError` で恒久的に
+    失敗していた (検収 Blocking B2) — 是正後は通ることを確認する。"""
+    from agentic_fx.plugin.loader import PluginMeta, content_hash as real_content_hash
+    from agentic_fx.plugin.sandbox import PluginSession
+
+    d = _write_candidate(tmp_path, test_py=_PASSING_TEST)
+    check_candidate_snapshot(d)  # 実行前: 3 本ちょうど、通る
+
+    meta = PluginMeta(name="ind", kind="indicator", path=d, params={},
+                      timeframe=None, pairs=(), max_bars=200,
+                      content_hash=real_content_hash(d))
+    with PluginSession(meta, settings=settings.plugin):
+        pass  # __enter__ が plugin.py を import させ __pycache__ を作る
+
+    assert (d / "__pycache__").is_dir(), \
+        "前提: PluginSession 実行後は __pycache__ が生成される"
+    check_candidate_snapshot(d)  # 再ゲート: __pycache__ があっても通る (B2 是正)
+
+
 def test_hashes_of_returns_content_and_artifact_hash(tmp_path):
     d = tmp_path / "cand"; _write_manifest(d, plugin_py="p", config_yaml="c", test_py="t")
     content_hash, artifact_hash = hashes_of(d)

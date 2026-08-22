@@ -185,6 +185,73 @@ def test_pytest_failure_creates_no_approval_row(tmp_path, settings):
     assert _count_rows(conn) == 0
 
 
+# <!-- precheck 2026-08-22: T6-B1 --> fail closed: `GateResult.passed` を
+# 読む (旧実装は `returncode` しか見ず、hash 不一致・timeout でも
+# `returncode == 0` なら承認申請行を作っていた — fail open)。
+
+
+def test_gate_hash_mismatch_creates_no_approval_row_even_when_returncode_zero(
+        tmp_path, settings):
+    """`run_gate_pytest` は候補 hash 不一致のとき `GateResult(passed=False,
+    returncode=<pytest の実 returncode>)` を返す — テスト自体が緑なら
+    returncode は 0。`submit_plugin` が `returncode` だけを見ていると
+    この分岐を見落として承認申請行を作ってしまう (fail open) — 直接
+    `passed=False, returncode=0` を注入して確認する (B1 主 pin)。"""
+    d = _write_plugin(tmp_path, "ind", kind="indicator", plugin_py=INDICATOR_PY,
+                      config_yaml="kind: indicator\n")
+    meta = _indicator_meta(d)
+    conn = _conn(tmp_path)
+
+    def hash_mismatch_runner(_path: Path) -> GateResult:
+        return GateResult(passed=False, returncode=0,
+                          stdout_tail="1 passed in 0.01s\n[gate_pytest] "
+                                      "candidate content changed during "
+                                      "test run (hash mismatch) — rejecting",
+                          duration_sec=0.01)
+
+    with pytest.raises(ValueError, match="failed pytest"):
+        approval.submit_plugin(conn, meta, settings=settings, now=NOW,
+                               pytest_runner=hash_mismatch_runner)
+    assert _count_rows(conn) == 0
+
+
+def test_gate_hash_mismatch_fault_injection_via_default_runner_creates_no_row(
+        tmp_path, settings, monkeypatch):
+    """B1 副 killer (統合): 既定 pytest_runner (`run_gate_pytest`、実
+    Landlock プロセス) を使い、`hashes_of` を fault injection して pytest
+    実行の間に候補が改ざんされた状態を再現する (6-B′ の
+    `test_run_gate_pytest_fails_when_hash_changes_between_before_and_after`
+    と同じ手法)。`submit_plugin` を通したときに承認申請行が **0 件**の
+    ままであること — `GateResult.passed` が本番経路 (`submit_plugin`)
+    まで届いていることを検証する。"""
+    from agentic_fx.core.landlock import is_available
+    if not is_available():
+        pytest.skip("Landlock not available on this kernel/architecture")
+
+    d = _write_plugin(tmp_path, "ind_tamper", kind="indicator",
+                      plugin_py=INDICATOR_PY, config_yaml="kind: indicator\n")
+    meta = _indicator_meta(d, name="ind_tamper")
+    conn = _conn(tmp_path)
+
+    import agentic_fx.plugin.gate_pytest as gate_mod
+    real_hashes_of = gate_mod.hashes_of
+    call_count = {"n": 0}
+
+    def tampering_hashes_of(plugin_dir):
+        call_count["n"] += 1
+        if call_count["n"] == 2:  # after 呼び出しのタイミングで改ざんする
+            (plugin_dir / "test_plugin.py").write_text(
+                "def test_placeholder():\n    pass\n# tampered\n")
+        return real_hashes_of(plugin_dir)
+
+    monkeypatch.setattr(gate_mod, "hashes_of", tampering_hashes_of)
+
+    with pytest.raises(ValueError, match="failed pytest"):
+        approval.submit_plugin(conn, meta, settings=settings, now=NOW)
+    assert _count_rows(conn) == 0, \
+        "FAIL-OPEN: row created despite gate hash mismatch"
+
+
 # --- ② indicator 成功で行 + content_hash/test_file_hash ---------------
 
 def test_indicator_success_creates_row_with_expected_payload(tmp_path, settings):

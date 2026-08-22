@@ -30,10 +30,37 @@ class CandidateSnapshotError(ValueError):
     pass
 
 
+# <!-- precheck 2026-08-22: T6-B2 --> 無視リスト: `submit_plugin` の後段
+# (`_validate_kind` → kind=strategy/signal で `sandbox.PluginSession` が
+# 候補ディレクトリを cwd に plugin.py を import する — `sandbox._build_env`
+# は `PYTHONDONTWRITEBYTECODE`/`PYTHONPYCACHEPREFIX` を設定しないため
+# `__pycache__/*.pyc` が候補ディレクトリに残る) 由来で生じ得る、承認判断に
+# 無関係な副産物のみを許容する。REQUIRED_FILES の完全性検査 (symlink・
+# hardlink・サイズ) はこれらのエントリには一切適用しない (無条件に無視
+# するだけで「信頼する」わけではない)。
+_IGNORED_DIR_NAMES = frozenset({"__pycache__", ".pytest_cache"})
+
+
+def _is_ignored_entry(name: str, dir_fd: int) -> bool:
+    if name.endswith(".pyc"):
+        return True
+    if name in _IGNORED_DIR_NAMES:
+        try:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            return False
+        return stat.S_ISDIR(st.st_mode)
+    return False
+
+
 def check_candidate_snapshot(plugin_dir: Path) -> None:
     """`plugin_dir` 直下がちょうど 3 本の通常ファイル (REQUIRED_FILES) で
     あることを dirfd + O_NOFOLLOW で検査する。サブディレクトリ・symlink・
-    hardlink (`st_nlink != 1`)・サイズ超過・欠落は全て拒否。
+    hardlink (`st_nlink != 1`)・サイズ超過・欠落は全て拒否。ただし
+    `__pycache__/`・`*.pyc`・`.pytest_cache/` (`_IGNORED_DIR_NAMES` 判定は
+    ディレクトリであることを確認したうえで無視する) は判定対象から除く
+    (2026-08-22 検収是正 T6-B2 — `PluginSession` 実行後の再ゲートが
+    恒久的に失敗する不具合の修正)。
 
     **`dir_fd` は `O_DIRECTORY | O_RDONLY` で開く — `O_PATH` ではない。**
     `O_PATH` fd は `openat` 系の `dir_fd=` 引数としては使えるが、
@@ -44,11 +71,12 @@ def check_candidate_snapshot(plugin_dir: Path) -> None:
     dir_fd = os.open(str(plugin_dir), os.O_DIRECTORY | os.O_RDONLY)
     try:
         names = os.listdir(dir_fd)
-        unexpected = sorted(set(names) - set(REQUIRED_FILES))
+        relevant_names = {n for n in names if not _is_ignored_entry(n, dir_fd)}
+        unexpected = sorted(relevant_names - set(REQUIRED_FILES))
         if unexpected:
             raise CandidateSnapshotError(
                 f"unexpected entries in candidate dir: {unexpected}")
-        missing = sorted(set(REQUIRED_FILES) - set(names))
+        missing = sorted(set(REQUIRED_FILES) - relevant_names)
         if missing:
             raise CandidateSnapshotError(f"missing required files: {missing}")
         for name in REQUIRED_FILES:

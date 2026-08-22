@@ -53,11 +53,6 @@ submit/bless する運用は想定していない (悪意ある入力に対す�
 from __future__ import annotations
 
 import hashlib
-import os
-import resource
-import signal
-import subprocess
-import sys
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -88,6 +83,7 @@ _NOTE = "バックテスト成績は実運用成績の予測値ではない (足
 # D5: plugin 宣言 timeframe → run_in_sample に渡す eval_timeframe。"1d" だけ
 # "24h" へ写像する (runner.parse_timeframe が "1d" を受理しないため)。
 _EVAL_TIMEFRAME_OVERRIDE = {"1d": "24h"}
+
 
 def _eval_timeframe(meta_timeframe: str) -> str:
     return _EVAL_TIMEFRAME_OVERRIDE.get(meta_timeframe, meta_timeframe)
@@ -204,7 +200,14 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
         runner = (pytest_runner if pytest_runner is not None
                   else lambda d: run_gate_pytest(d, settings=settings))
         pytest_result = runner(meta.path)
-        if pytest_result.returncode != 0:
+        # <!-- precheck 2026-08-22: T6-B1 --> fail closed: `passed` を正
+        # として読む (`returncode` だけを見ると、`run_gate_pytest` が
+        # 候補 hash 不一致で返す `GateResult(passed=False,
+        # returncode=<pytest の実 returncode>)` — テスト自体は緑なら
+        # returncode は 0 — や timeout (returncode=-1 の場合はこれまでも
+        # 検出できていたが、たまたま returncode=0 が返る変異形では検出
+        # できない) を見落とし、承認申請行を作ってしまう (fail open))。
+        if not pytest_result.passed:
             raise ValueError(
                 f"plugin {meta.name!r}: test_plugin.py failed pytest "
                 f"(returncode={pytest_result.returncode}): "

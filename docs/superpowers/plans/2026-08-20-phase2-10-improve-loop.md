@@ -8372,6 +8372,8 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
 
 - [ ] **Step 6: commit** — 候補スナップショット検査 + hash before/after 照合(§8.1 項目 9)。
 
+**実装時追記 (2026-08-22 検収)**: `check_candidate_snapshot` の「3 本ちょうど」判定は、`submit_plugin` の後段 (`_validate_kind` → kind=strategy/signal で `sandbox.PluginSession` を起動) が候補ディレクトリを cwd に `plugin.py` を import する副作用 (`sandbox._build_env` が `PYTHONDONTWRITEBYTECODE`/`PYTHONPYCACHEPREFIX` を設定しないため `__pycache__` が残る) と両立せず、以後その plugin の submit/bless が `CandidateSnapshotError` で恒久的に失敗する検収 Blocking (B2) が見つかった。是正: `__pycache__/`・`*.pyc`・`.pytest_cache/` を無視リストとして「不変条件の判定対象から除く」(ディレクトリであることを確認したうえで無視 — 名前だけで無条件に免除しない)。REQUIRED_FILES 3 本の完全性検査 (symlink/hardlink/サイズ) には一切影響しない。pin: `PluginSession` を実際に起動して `__pycache__` を発生させた直後の再ゲートが通ることを確認するテストを追加 (`tests/plugin/test_gate_pytest.py::test_check_candidate_snapshot_passes_after_plugin_session_execution`)。
+
 ---
 
 ### 6-C: `submit_plugin`/`bless` の `pytest_runner` 置換 + `_default_pytest_runner` 削除(裁定2)
@@ -8551,6 +8553,7 @@ PytestRunnerFn = Callable[[Path], GateResult]
 13. **6-B′ が新設する `CandidateSnapshotError`/`check_candidate_snapshot`/`hashes_of` は骨格 Interfaces 節に名前が無い**(骨格は Task 6 の Interfaces 節で `GateResult`/`run_gate_pytest` のみを規定し、§8.1 項目 9 の「候補の read-only スナップショットのヘルパ」の具体名までは与えていない)。`# 新規命名` として本書がここで命名した — 既存コードの命名規約 (関数は snake_case、例外クラスは `<Noun>Error`)に合わせている。
 14. **【レビュー1周目 C4 で担当確定】`mission_worker.main()` の `if settings.runner.improve.backend != "local": raise RuntimeError(...)` (現行 `:398-402`) の除去は本書の scope 外**。5-D は `_bootstrap_improve_profile` に `backend` パラメータを追加し claude/codex 分岐の Landlock 配線を可能にするが、`main()` 側のこの fail-closed ガードと `LocalRunner` 直接構築を `factory.build_runner(...)` 呼び出しへ置換する専用 step は **Task 4 の Step 7d (レビュー1周目 C4) が所有する** (`factory.build_runner` 経由で 3 backend を worker から構築する契約テストも同 step に含む)。Task 5 では**意図的に触れない**(5-D の実プロセステストは `_bootstrap_improve_profile` を直接呼ぶため、このガードの存在有無に影響されない)。統合時、Task 5 完了時点では `main()` はまだ improve+claude/codex を `RuntimeError` で拒否したままで正しい (意図した現状維持) — Task 4 Step 7d 完了後にこのガードが `factory.build_runner` へ置き換わる。
 
+**実装時追記 (2026-08-22 検収)**: `submit_plugin` の pytest 判定は `pytest_result.returncode != 0` ではなく **`not pytest_result.passed` を見る** (`GateResult.passed` を正とする)。旧実装は `returncode` しか見ておらず、`run_gate_pytest` が候補 hash 不一致で返す `GateResult(passed=False, returncode=<pytest の実 returncode>)`(pytest 自体が緑なら returncode は 0)を見落として承認申請行を作ってしまう fail open が検収 Blocking (B1) として見つかった。`passed` は returncode==0 の場合も hash 不一致の場合も一貫して正を表すため、判定をこの 1 属性に一本化する。pin: 直接 `GateResult(passed=False, returncode=0)` を注入する単体 pin と、既定 pytest_runner (`run_gate_pytest` 実 Landlock プロセス) を `hashes_of` fault injection で hash 不一致にした統合 pin の 2 本を `tests/plugin/test_approval.py` に追加。
 
 # プラン 10 実装計画 束 C: Task 7〜8 (improve registry + store 拡張)
 
