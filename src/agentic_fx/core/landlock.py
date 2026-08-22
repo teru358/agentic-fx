@@ -19,6 +19,9 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
+import stat as _stat
+import struct
+from collections.abc import Sequence
 from pathlib import Path
 
 # x86_64 の landlock syscall 番号 (Linux 5.13+)。
@@ -113,6 +116,20 @@ _READ_WRITE_ACCESS = (
     _ACCESS_FS_MAKE_REG | _ACCESS_FS_REMOVE_FILE |
     _ACCESS_FS_MAKE_DIR | _ACCESS_FS_REMOVE_DIR | _ACCESS_FS_TRUNCATE)
 
+# プラン10 Task 5: execute パスの自己充足マスク。
+# EXECUTE | READ_FILE | READ_DIR の和で、同一 inode に対する ro ルールとの
+# 併合に依存しない。
+_EXECUTE_ACCESS = (
+    _ACCESS_FS_EXECUTE | _ACCESS_FS_READ_FILE | _ACCESS_FS_READ_DIR)
+
+# プラン10 Task 5 5-C 改訂 (2026-08-22, 裁定 A): ファイル (通常ファイル) 単位
+# の EXECUTE マスク。**READ_DIR を含めてはならない** — 通常ファイルの fd に
+# READ_DIR を含む allowed_access を渡すと landlock_add_rule が EINVAL を返す
+# (probe 実測)。ディレクトリ単位の `_EXECUTE_ACCESS` とは別のマスクにするのは
+# 意図的 — 「ディレクトリ単位の EXECUTE」と「ファイル単位の EXECUTE」という
+# セキュリティ上の差異を型 (mask) に残す。
+_EXECUTE_FILE_ACCESS = _ACCESS_FS_EXECUTE | _ACCESS_FS_READ_FILE
+
 _PR_SET_NO_NEW_PRIVS = 38
 
 
@@ -146,11 +163,92 @@ def is_available() -> bool:
     return version >= _REQUIRED_ABI
 
 
+def _assert_allowlist_excludes_data_dir(
+    paths: list[Path], *, guarded_data_dir: Path,
+) -> None:
+    """allowlist のどの 1 パスも `guarded_data_dir` の祖先・一致・子孫で
+    ないことを確認し、違反したら fail closed する
+    (プラン8 Task 18 / プラン10 Task 5 で `core/landlock.py` へ移設)。
+    呼び出し側 (`mission_worker._bootstrap_improve_profile`) が
+    `guarded_data_dir` を自身の独立した式 (`__file__` 由来、`code_root`
+    からは導かない) で算出して渡す責務を持つ — このヘルパ自体は
+    「渡された値同士の包含関係」だけを機械的に見る。"""
+    for p in paths:
+        resolved = Path(p).resolve()
+        if (resolved == guarded_data_dir
+                or resolved in guarded_data_dir.parents
+                or guarded_data_dir in resolved.parents):
+            raise RuntimeError(
+                f"improve worker allowlist would expose the history data "
+                f"directory: {resolved} covers or lives under "
+                f"{guarded_data_dir} — refusing to start "
+                "(fail closed, 設計書 §2.1)")
+
+
+def elf_interpreter(path: Path) -> Path | None:
+    """`path` の ELF PT_INTERP を読み、interpreter の実体パスを返す。
+    static / static-pie (PT_INTERP 無し) なら None。
+    **Landlock 適用前に呼ぶこと** (適用後は読めない場合がある)。
+
+    非 ELF・読取不能は `RuntimeError` (fail closed)。呼び出し側が
+    `#!/usr/bin/env node` 型のシェバンラッパを誤って渡した場合、黙って
+    None を返すと後段で理由の分からない exec 失敗になるため
+    (プラン10 Task 5 5-C 改訂, 2026-08-22, 裁定 A)。
+    """
+    with open(path, "rb") as f:
+        head = f.read(64)
+        if len(head) < 64 or head[:4] != b"\x7fELF":
+            raise RuntimeError(
+                f"{path} is not an ELF executable — cannot determine its "
+                "dynamic loader (improve worker refuses to start, fail closed)")
+        e_phoff, = struct.unpack_from("<Q", head, 0x20)
+        e_phentsize, = struct.unpack_from("<H", head, 0x36)
+        e_phnum, = struct.unpack_from("<H", head, 0x38)
+        f.seek(e_phoff)
+        ph = f.read(e_phentsize * e_phnum)
+    for i in range(e_phnum):
+        o = i * e_phentsize
+        if struct.unpack_from("<I", ph, o)[0] != 3:   # PT_INTERP
+            continue
+        p_offset, = struct.unpack_from("<Q", ph, o + 8)
+        p_filesz, = struct.unpack_from("<Q", ph, o + 32)
+        with open(path, "rb") as f:
+            f.seek(p_offset)
+            raw = f.read(p_filesz)
+        interp = raw.split(b"\x00")[0].decode()
+        return Path(interp).resolve()
+    return None
+
+
+def interpreter_files_for(exec_targets: Sequence[Path]) -> list[Path]:
+    """exec 対象群が要する動的ローダの実ファイル集合 (重複除去、実在のみ)。"""
+    out: list[Path] = []
+    for t in exec_targets:
+        interp = elf_interpreter(Path(t).resolve())
+        if interp is not None and interp.is_file() and interp not in out:
+            out.append(interp)
+    return out
+
+
 def restrict_to(*, read_only_paths: list[Path],
-                read_write_paths: list[Path]) -> None:
+                read_write_paths: list[Path],
+                execute_paths: Sequence[Path] = (),
+                execute_file_paths: Sequence[Path] = ()) -> None:
     """呼び出しプロセスを Landlock で FS allowlist に制限する
     (**不可逆 — プロセス生涯にわたって有効**、以後の子プロセスにも継承
     される)。利用不能なら `LandlockUnavailable`。
+
+    execute_paths は `_EXECUTE_ACCESS` (EXECUTE|READ_FILE|READ_DIR の自己充足
+    マスク) で許可する。同一 inode に対する read_only ルールとの併合には
+    依存しない (probe landlock_probe.py と同一設計)。
+
+    execute_file_paths は**通常ファイル単位**で `_EXECUTE_FILE_ACCESS`
+    (EXECUTE|READ_FILE、READ_DIR を含まない) を許可する — ディレクトリ単位の
+    `execute_paths` とは異なり `O_PATH` のみで開く (`O_DIRECTORY` を付けない)。
+    ディレクトリが渡された場合は `S_ISREG` 検査で拒否する (プラン10 Task 5
+    5-C 改訂, 2026-08-22, 裁定 A — カーネルはディレクトリ fd +
+    EXECUTE|READ_FILE を黙って受理してしまうため、呼び出し側のミスを
+    ここで fail closed にする)。
     """
     if not is_available():
         raise LandlockUnavailable(
@@ -170,10 +268,20 @@ def restrict_to(*, read_only_paths: list[Path],
             f"landlock_create_ruleset failed: {os.strerror(errno)}")
 
     try:
-        for path, access in (
-                *((p, _READ_ONLY_ACCESS) for p in read_only_paths),
-                *((p, _READ_WRITE_ACCESS) for p in read_write_paths)):
-            parent_fd = os.open(str(path), os.O_PATH | os.O_DIRECTORY)
+        for path, access, is_dir in (
+                *((p, _READ_ONLY_ACCESS, True) for p in read_only_paths),
+                *((p, _READ_WRITE_ACCESS, True) for p in read_write_paths),
+                *((p, _EXECUTE_ACCESS, True) for p in execute_paths),
+                *((p, _EXECUTE_FILE_ACCESS, False) for p in execute_file_paths)):
+            if not is_dir and not _stat.S_ISREG(os.stat(str(path)).st_mode):
+                # カーネルは dir fd + (EXECUTE|READ_FILE) を**黙って受理する**
+                # (probe 実測 rc=0)。READ_DIR 無しの再帰付与という壊れた
+                # ルールが無検出で入るため、呼び出し側のミスをここで
+                # fail closed する。
+                raise LandlockUnavailable(
+                    f"execute_file_paths entry is not a regular file: {path}")
+            parent_fd = os.open(str(path),
+                                os.O_PATH | (os.O_DIRECTORY if is_dir else 0))
             try:
                 rule_attr = _PathBeneathAttr(allowed_access=access,
                                              parent_fd=parent_fd)

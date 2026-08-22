@@ -7,6 +7,7 @@ fake ctypes.CDLL によるロジック検証 (このプロセス自身は制限�
 from __future__ import annotations
 
 import os
+import struct
 import subprocess
 import sys
 import textwrap
@@ -269,6 +270,185 @@ def test_restrict_to_issues_syscalls_in_required_order(monkeypatch, tmp_path):
     assert libc.prctl_args[0][0] == 38   # PR_SET_NO_NEW_PRIVS
 
 
+# 5-A: execute_paths テスト (プラン10 Task 5)
+
+def test_create_ruleset_still_only_declares_truncate_and_execute_family(monkeypatch, tmp_path):
+    """execute_paths 追加後も handled_access_fs 自体は不変
+    (EXECUTE は元から ABI v1 に入っている — 新設は allowed_access 側のみ)。"""
+    import agentic_fx.core.landlock as landlock_mod  # Minor 3: 既存テストの規律 (関数内 import) に合わせる
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    rw = tmp_path / "rw"; rw.mkdir()
+    ex = tmp_path / "ex"; ex.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw], execute_paths=[ex])
+    create_attr = libc.syscall_args[1][1]
+    assert create_attr.handled_access_fs == landlock_mod._HANDLED_ACCESS_FS
+
+
+def test_restrict_to_adds_a_rule_for_each_execute_path(monkeypatch, tmp_path):
+    """execute_paths の各パスに対して landlock_add_rule (445) が 1 回ずつ
+    追加で発行され、allowed_access が `_EXECUTE_ACCESS` と厳密一致する
+    (multiplicity 1 の pin — execute_paths を渡しても ro/rw の呼出数が
+    変わらないことも同時に見る)。"""
+    import agentic_fx.core.landlock as landlock_mod
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    rw = tmp_path / "rw"; rw.mkdir()
+    ex = tmp_path / "ex"; ex.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw], execute_paths=[ex])
+    # 444(abi) 444(create) 445(ro) 445(rw) 445(execute) 446(restrict)
+    assert libc.syscall_numbers == [444, 444, 445, 445, 445, 446]
+    ex_attr = libc.syscall_args[4][3]
+    assert ex_attr.allowed_access == landlock_mod._EXECUTE_ACCESS
+
+
+def test_execute_access_mask_is_self_sufficient(monkeypatch, tmp_path):
+    """§2.2: `_EXECUTE_ACCESS` は EXECUTE|READ_FILE|READ_DIR の**和**で、
+    同一 inode に対する ro ルールとの併合に依存しない。execute_paths の
+    値を `_ACCESS_FS_EXECUTE` 単独に弱める変異は、read_only にも
+    同じパスを渡す既存テストでは検出できない — ここでは execute_paths
+    のパスを read_only にも read_write にも一切含めない状態で
+    allowed_access の READ_FILE/READ_DIR bit を直接検査する。"""
+    import agentic_fx.core.landlock as landlock_mod
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0])
+    _install(monkeypatch, libc)
+    ex = tmp_path / "exonly"; ex.mkdir()
+    restrict_to(read_only_paths=[], read_write_paths=[], execute_paths=[ex])
+    ex_attr = libc.syscall_args[2][3]
+    assert ex_attr.allowed_access & landlock_mod._ACCESS_FS_EXECUTE
+    assert ex_attr.allowed_access & landlock_mod._ACCESS_FS_READ_FILE
+    assert ex_attr.allowed_access & landlock_mod._ACCESS_FS_READ_DIR
+    assert not (ex_attr.allowed_access & landlock_mod._ACCESS_FS_WRITE_FILE)
+
+
+def test_read_write_access_still_excludes_make_char_and_make_sym(monkeypatch, tmp_path):
+    """§2.2 の `/dev` rw 脅威分析はこの不在だけに乗っている
+    (`_READ_WRITE_ACCESS` に `MAKE_CHAR`/`MAKE_SYM` が無いことでデバイス
+    ノード・symlink の新規作成ができない)。5-D で `/dev` を read_write に
+    昇格させる前に、この不在を直接 pin しておく — `_ACCESS_FS_MAKE_CHAR`/
+    `_ACCESS_FS_MAKE_SYM` を足す変異は既存の等価性 assert
+    (`test_create_ruleset_is_handed_the_truncate_bit`) でも検出できるが、
+    その等価性 assert 自体が定数と一緒に動く変異 (定数側に足す) では
+    落ちない — ここでは bit 単位で直接見る。"""
+    import agentic_fx.core.landlock as landlock_mod
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    rw = tmp_path / "rw"; rw.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw])
+    rw_attr = libc.syscall_args[3][3]
+    assert not (rw_attr.allowed_access & landlock_mod._ACCESS_FS_MAKE_CHAR)
+    assert not (rw_attr.allowed_access & landlock_mod._ACCESS_FS_MAKE_SYM)
+
+
+def test_execute_paths_default_is_empty(monkeypatch, tmp_path):
+    """`execute_paths` を渡さない既存呼び出し (trade profile) が無変更
+    のまま動く — 追加の add_rule 呼出しが発生しないことを pin する。"""
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    rw = tmp_path / "rw"; rw.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw])
+    assert libc.syscall_numbers == [444, 444, 445, 445, 446]
+
+
+# --- 5-C 改訂 (2026-08-22, 裁定 A): execute_file_paths / elf_interpreter ----
+
+def test_restrict_to_adds_a_rule_for_each_execute_file_path(monkeypatch, tmp_path):
+    """execute_file_paths の各エントリに landlock_add_rule (445) が発行され、
+    allowed_access が `_EXECUTE_FILE_ACCESS` (EXECUTE|READ_FILE、**READ_DIR
+    を含まない**) と厳密一致する。ファイルは `O_PATH` のみ (`O_DIRECTORY`
+    無し) で開かれる — ディレクトリ向け open と区別する。"""
+    import agentic_fx.core.landlock as landlock_mod
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0])
+    _install(monkeypatch, libc)
+    loader = tmp_path / "ld.so"; loader.write_text("x")
+    restrict_to(read_only_paths=[], read_write_paths=[],
+               execute_file_paths=[loader])
+    assert libc.syscall_numbers == [444, 444, 445, 446]
+    file_attr = libc.syscall_args[2][3]
+    assert file_attr.allowed_access == landlock_mod._EXECUTE_FILE_ACCESS
+    assert file_attr.allowed_access & landlock_mod._ACCESS_FS_EXECUTE
+    assert file_attr.allowed_access & landlock_mod._ACCESS_FS_READ_FILE
+    assert not (file_attr.allowed_access & landlock_mod._ACCESS_FS_READ_DIR)
+
+
+def test_restrict_to_rejects_a_directory_in_execute_file_paths(monkeypatch, tmp_path):
+    """カーネルは dir fd + (EXECUTE|READ_FILE) を**黙って受理する**
+    (probe 実測: rc=0) ため、READ_DIR 無しの再帰付与という壊れたルールが
+    無検出で入る。呼び出し側のミスをここで fail closed にする
+    (probe-execute-closure.md §1 改修 C)。"""
+    libc = _ScriptedLibc(syscall_results=[8, 4242])
+    _install(monkeypatch, libc)
+    not_a_file = tmp_path / "a_directory"; not_a_file.mkdir()
+    with pytest.raises(LandlockUnavailable, match="not a regular file"):
+        restrict_to(read_only_paths=[], read_write_paths=[],
+                   execute_file_paths=[not_a_file])
+
+
+def test_execute_file_paths_default_is_empty(monkeypatch, tmp_path):
+    """`execute_file_paths` を渡さない既存呼び出しは無変更のまま動く。"""
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    rw = tmp_path / "rw"; rw.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw])
+    assert libc.syscall_numbers == [444, 444, 445, 445, 446]
+
+
+def test_elf_interpreter_rejects_non_elf(tmp_path):
+    """シェバンラッパ (`#!/usr/bin/env node`) を渡したら fail closed
+    (プラン R5 のとおり `which codex` は Node ラッパを返し得る)。"""
+    from agentic_fx.core.landlock import elf_interpreter
+    p = tmp_path / "shim"; p.write_text("#!/usr/bin/env node\n")
+    with pytest.raises(RuntimeError, match="not an ELF"):
+        elf_interpreter(p)
+
+
+def test_elf_interpreter_returns_none_for_a_statically_linked_elf(tmp_path):
+    """static-pie (例: codex native) は PT_INTERP を持たない — None を返す。
+    実バイナリは環境依存のため、最小 ELF ヘッダ (e_phnum=0) を合成する。"""
+    from agentic_fx.core.landlock import elf_interpreter
+    head = bytearray(64)
+    head[0:4] = b"\x7fELF"
+    struct.pack_into("<Q", head, 0x20, 64)   # e_phoff (e_phnum=0 のため未使用)
+    struct.pack_into("<H", head, 0x36, 56)   # e_phentsize
+    struct.pack_into("<H", head, 0x38, 0)    # e_phnum = 0 (PT_INTERP なし)
+    p = tmp_path / "static_pie"
+    p.write_bytes(bytes(head))
+    assert elf_interpreter(p) is None
+
+
+def test_elf_interpreter_resolves_the_running_pythons_dynamic_loader():
+    """§2 の実測: venv python は PT_INTERP を持ち、動的ローダの実体
+    パスを返す (probe-execute-closure.md §2)。"""
+    from agentic_fx.core.landlock import elf_interpreter
+    interp = elf_interpreter(Path(sys.executable).resolve())
+    assert interp is not None
+    assert interp.is_file()
+
+
+def test_interpreter_files_for_dedupes_and_skips_static_targets(tmp_path):
+    """`interpreter_files_for` は実行中の python 由来のローダを 1 個に
+    重複除去し、PT_INTERP を持たない対象 (static-pie) は寄与しない。"""
+    from agentic_fx.core.landlock import interpreter_files_for
+    exe = Path(sys.executable).resolve()
+
+    head = bytearray(64)
+    head[0:4] = b"\x7fELF"
+    struct.pack_into("<Q", head, 0x20, 64)
+    struct.pack_into("<H", head, 0x36, 56)
+    struct.pack_into("<H", head, 0x38, 0)
+    static_target = tmp_path / "static_pie"
+    static_target.write_bytes(bytes(head))
+
+    files = interpreter_files_for([exe, exe, static_target])
+    assert len(files) == 1
+    assert files[0].is_file()
+
+
 _REAL_LANDLOCK_SCRIPT = textwrap.dedent("""
     import os
     import sys
@@ -489,3 +669,44 @@ def test_real_landlock_enforces_read_only_read_write_and_blocked(tmp_path):
         capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "OK" in result.stdout
+
+
+# --- Task 5 Section 5-B: _assert_allowlist_excludes_data_dir -----
+
+def test_assert_allowlist_excludes_data_dir_lives_in_landlock_module():
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    assert _assert_allowlist_excludes_data_dir is not None
+
+
+def test_assert_allowlist_excludes_data_dir_passes_when_disjoint(tmp_path):
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    data_dir = tmp_path / "data"
+    ok = tmp_path / "code"
+    ok.mkdir()
+    _assert_allowlist_excludes_data_dir([ok], guarded_data_dir=data_dir)  # raise しない
+
+
+def test_assert_allowlist_excludes_data_dir_rejects_ancestor(tmp_path):
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    data_dir = tmp_path / "repo" / "data"
+    with pytest.raises(RuntimeError, match="history data"):
+        _assert_allowlist_excludes_data_dir([tmp_path / "repo"],
+                                            guarded_data_dir=data_dir)
+
+
+def test_assert_allowlist_excludes_data_dir_rejects_descendant(tmp_path):
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    child = data_dir / "sub"
+    child.mkdir()
+    with pytest.raises(RuntimeError, match="history data"):
+        _assert_allowlist_excludes_data_dir([child], guarded_data_dir=data_dir)
+
+
+def test_assert_allowlist_excludes_data_dir_rejects_exact_match(tmp_path):
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    with pytest.raises(RuntimeError, match="history data"):
+        _assert_allowlist_excludes_data_dir([data_dir], guarded_data_dir=data_dir)

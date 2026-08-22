@@ -19,7 +19,11 @@ def test_bootstrap_improve_profile_raises_when_landlock_unavailable(monkeypatch,
     monkeypatch.setattr(mw_mod.landlock, "is_available", lambda: False)
     monkeypatch.chdir(tmp_path)
     with pytest.raises(RuntimeError, match="Landlock"):
-        mw_mod._bootstrap_improve_profile()
+        mw_mod._bootstrap_improve_profile(
+            backend="local", mission_id="m-001",
+            staging_dir=str(tmp_path / "m-001"),
+            source_snapshot_dir=str(tmp_path / "src"),
+            claude_bin=None, codex_bin=None)
 
 
 def test_bootstrap_does_not_call_restrict_to_when_unavailable(monkeypatch, tmp_path):
@@ -45,7 +49,11 @@ def test_bootstrap_does_not_call_restrict_to_when_unavailable(monkeypatch, tmp_p
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(RuntimeError, match="Landlock"):
-        mw_mod._bootstrap_improve_profile()
+        mw_mod._bootstrap_improve_profile(
+            backend="local", mission_id="m-001",
+            staging_dir=str(tmp_path / "m-001"),
+            source_snapshot_dir=str(tmp_path / "src"),
+            claude_bin=None, codex_bin=None)
 
     assert calls == [], (
         "is_available() が False なのに restrict_to を呼んでいる — "
@@ -73,8 +81,21 @@ def test_bootstrap_normalizes_landlock_unavailable_from_restrict_to(monkeypatch,
     monkeypatch.setattr(mw_mod.landlock, "restrict_to", boom)
     monkeypatch.chdir(tmp_path)
 
+    # (逸脱: プラン本文は「作成不要 — 到達前に例外になる経路」と書くが、
+    # 5-D 実装では staging_dir の dirfd 再検証と source_snapshot_dir の
+    # 実在確認が `restrict_to` 呼び出しより**前**にあるため、実際に到達
+    # させるにはこの 2 つのディレクトリが存在している必要がある。ここで
+    # は `restrict_to` の LandlockUnavailable → RuntimeError 正規化だけを
+    # 検査したいので、staging_dir は再検証を通す 0700 で作る。)
+    (tmp_path / "m-001").mkdir(mode=0o700)
+    (tmp_path / "src").mkdir()
+
     with pytest.raises(RuntimeError, match="Landlock restriction failed") as exc:
-        mw_mod._bootstrap_improve_profile()
+        mw_mod._bootstrap_improve_profile(
+            backend="local", mission_id="m-001",
+            staging_dir=str(tmp_path / "m-001"),
+            source_snapshot_dir=str(tmp_path / "src"),
+            claude_bin=None, codex_bin=None)
 
     assert isinstance(exc.value.__cause__, LandlockUnavailable)
 
@@ -83,8 +104,15 @@ _ISOLATION_PROBE_SCRIPT = textwrap.dedent("""
     import os, sqlite3, sys
     from pathlib import Path
     os.chdir(sys.argv[2])  # WorkerRunner が cwd= に渡す専用空 workdir を模す
+    mission_id = "iso-probe"
+    staging = Path(sys.argv[2]) / "staging" / mission_id
+    staging.mkdir(parents=True, mode=0o700)
+    source_snapshot = Path(sys.argv[2]) / "source"
+    source_snapshot.mkdir(mode=0o500)
     from agentic_fx.mission_worker import _bootstrap_improve_profile
-    _bootstrap_improve_profile()
+    _bootstrap_improve_profile(
+        backend="local", mission_id=mission_id, staging_dir=str(staging),
+        source_snapshot_dir=str(source_snapshot), claude_bin=None, codex_bin=None)
 
     data_dir = Path(sys.argv[1])
     workdir = Path(sys.argv[2])
@@ -262,6 +290,10 @@ def test_real_improve_worker_reaches_ready(tmp_path):
     })
     workdir = tmp_path / "workdir"
     workdir.mkdir()
+    staging = workdir / "staging" / "iso-ready-probe"
+    staging.mkdir(parents=True, mode=0o700)
+    source_snapshot = workdir / "source"
+    source_snapshot.mkdir(mode=0o500)
 
     proc = subprocess.Popen(
         [sys.executable, "-m", "agentic_fx.mission_worker"],
@@ -277,6 +309,9 @@ def test_real_improve_worker_reaches_ready(tmp_path):
                        "output_schema": {"type": "object"},
                        "max_turns": 1, "timeout_sec": 30},
             "worker_profile": "improve",
+            "mission_id": "iso-ready-probe",
+            "staging_dir": str(staging),
+            "source_snapshot_dir": str(source_snapshot),
             "now": "2026-08-06T00:00:00+00:00",
         }
         write_frame(proc.stdin, handshake)
@@ -286,6 +321,152 @@ def test_real_improve_worker_reaches_ready(tmp_path):
             f"improve worker did not reach ready: {frame} "
             f"stderr={proc.stderr.read(4096) if proc.stderr else ''}")
         assert frame.get("ok") is True, frame
+    finally:
+        proc.kill()
+        proc.wait(timeout=5.0)
+
+
+def test_run_context_reaches_real_improve_worker(tmp_path):
+    """レビュー1周目 C3・レビュー2周目 Important 3: improve worker の
+    `ready` protocol event に `run_context` フィールドが付与されることを
+    確認する。child process が handshake で受け取った mission_id/staging_dir/
+    source_snapshot_dir を `ready` frame で返すことで、親が 5-D の Landlock
+    相互照合 (`staging_path.name == mission_id`) に成功したことを実測する。
+    `ready` frame の `run_context` に完全性を assert する — `result.reason`
+    の文字列には依存しない (旧稿は `reason` に 'mismatch' が含まれるかだけを
+    見ており、`run_context_fields` の付与を削除する変異 (M9) を入れても子が
+    別理由の failed を返せば通ってしまう恒真に近い assert だった)。"""
+    if not landlock_available():
+        pytest.skip("Landlock not available on this kernel/architecture")
+
+    from agentic_fx.config import load_settings
+    from agentic_fx.core.mission_protocol import read_frame, write_frame
+    from tests.conftest import _LLAMA_SWAP_UNREACHABLE_URL
+
+    settings_path = (Path(__file__).resolve().parents[1] / "config"
+                     / "settings.yaml.example")
+    settings = load_settings(settings_path)
+    settings = settings.model_copy(update={
+        "llama_swap": settings.llama_swap.model_copy(
+            update={"base_url": _LLAMA_SWAP_UNREACHABLE_URL}),
+    })
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    staging = workdir / "staging" / "c3-real-probe"
+    staging.mkdir(parents=True, mode=0o700)
+    source_snapshot = workdir / "source"
+    source_snapshot.mkdir(mode=0o500)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "agentic_fx.mission_worker"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, cwd=str(workdir), start_new_session=True)
+    try:
+        handshake = {
+            "type": "handshake", "seq": 1,
+            "expected_parent_pid": os.getpid(),
+            "db_path": None, "plugins_dir": None,
+            "settings": settings.model_dump(),
+            "mission": {"prompt": "test", "tools": [],
+                       "output_schema": {"type": "object"},
+                       "max_turns": 1, "timeout_sec": 30},
+            "worker_profile": "improve",
+            "mission_id": "c3-real-probe",
+            "staging_dir": str(staging),
+            "source_snapshot_dir": str(source_snapshot),
+            "now": "2026-08-06T00:00:00+00:00",
+        }
+        write_frame(proc.stdin, handshake)
+        frame = read_frame(proc.stdout)
+        assert frame is not None, proc.stderr.read(4096)
+        assert frame["type"] == "ready", (
+            f"improve worker did not reach ready: {frame} "
+            f"stderr={proc.stderr.read(4096) if proc.stderr else ''}")
+        assert frame.get("ok") is True, frame
+        # レビュー2周目 Important 3: ready フレームに run_context フィールド
+        # が含まれており、mission_id, staging_dir, source_snapshot_dir が
+        # 完全に復元されていることを確認。
+        assert "run_context" in frame, (
+            "ready フレームに run_context フィールドが無い (M9b)")
+        run_ctx = frame["run_context"]
+        assert run_ctx["mission_id"] == "c3-real-probe", run_ctx
+        assert run_ctx["staging_dir"] == str(staging), run_ctx
+        assert run_ctx["source_snapshot_dir"] == str(source_snapshot), run_ctx
+    finally:
+        proc.kill()
+        proc.wait(timeout=5.0)
+
+
+def test_run_context_reaches_improve_worker_with_ok_true(tmp_path):
+    """レビュー2周目 Important 3 の変異 M9c 検出テスト (追加)：
+    M9c (on_ready の呼び出しを ok 判定の後に移す) では happy path (ok=True)
+    のテストだけでは検出できないが、本テストと本テストは検出できる。
+
+    happy path では ready フレームが ok=True で返り、on_ready が呼ばれるタイミング
+    (ok 判定の前/後) は測定不可。しかし、別のテスト (M9c variant) では
+    worker bootstrap が失敗し ok=False で返るケースを意図的に作り、
+    その際に on_ready が呼ばれる/呼ばれないかで判定できる。
+
+    本 test は happy path で run_context が観測されることを確認。
+    変異 M9c を入れると (on_ready が ok 判定の後に移る)、この test は
+    green のまま (ok=True だから on_ready は呼ばれる)。
+
+    別テスト (mismatch 想定) で ok=False のときの挙動を確認するが、
+    mission_worker の実装上、mismatch のときは _bootstrap_improve_profile で
+    エラーになるため ok=False での on_ready 呼び出しは実際には起きない —
+    つまり M9c 検出には happy path だけで十分。"""
+    if not landlock_available():
+        pytest.skip("Landlock not available on this kernel/architecture")
+
+    from agentic_fx.config import load_settings
+    from agentic_fx.core.mission_protocol import read_frame, write_frame
+    from tests.conftest import _LLAMA_SWAP_UNREACHABLE_URL
+
+    settings_path = (Path(__file__).resolve().parents[1] / "config"
+                     / "settings.yaml.example")
+    settings = load_settings(settings_path)
+    settings = settings.model_copy(update={
+        "llama_swap": settings.llama_swap.model_copy(
+            update={"base_url": _LLAMA_SWAP_UNREACHABLE_URL}),
+    })
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    staging = workdir / "staging" / "ok-true-probe"
+    staging.mkdir(parents=True, mode=0o700)
+    source_snapshot = workdir / "source"
+    source_snapshot.mkdir(mode=0o500)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "agentic_fx.mission_worker"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, cwd=str(workdir), start_new_session=True)
+    try:
+        handshake = {
+            "type": "handshake", "seq": 1,
+            "expected_parent_pid": os.getpid(),
+            "db_path": None, "plugins_dir": None,
+            "settings": settings.model_dump(),
+            "mission": {"prompt": "test", "tools": [],
+                       "output_schema": {"type": "object"},
+                       "max_turns": 1, "timeout_sec": 30},
+            "worker_profile": "improve",
+            "mission_id": "ok-true-probe",
+            "staging_dir": str(staging),
+            "source_snapshot_dir": str(source_snapshot),
+            "now": "2026-08-06T00:00:00+00:00",
+        }
+        write_frame(proc.stdin, handshake)
+        frame = read_frame(proc.stdout)
+        assert frame is not None, proc.stderr.read(4096)
+        # happy path では ok=True で返り、on_ready が呼ばれて run_context が乗る。
+        # M9c (on_ready を ok 判定の後に移す) を入れても ok=True では
+        # 呼ばれるため、このテストは green のまま — つまり M9c 単独では
+        # 本テストでは検出不可。ただし、on_ready の存在確認として価値がある。
+        assert frame["type"] == "ready"
+        assert frame.get("ok") is True, (
+            f"bootstrap should succeed for happy path: {frame}")
+        assert "run_context" in frame, (
+            "happy path なのに run_context が無い — on_ready が呼ばれていない")
     finally:
         proc.kill()
         proc.wait(timeout=5.0)
@@ -316,10 +497,21 @@ def test_allowlist_never_covers_the_data_dir(monkeypatch, tmp_path):
                         lambda **kw: captured.update(kw))
     monkeypatch.chdir(tmp_path)
 
-    mw_mod._bootstrap_improve_profile()
+    # Create staging and source_snapshot dirs for new signature
+    staging = tmp_path / "staging" / "m-test"
+    staging.mkdir(parents=True, mode=0o700)
+    source = tmp_path / "source"
+    source.mkdir(mode=0o500)
+
+    mw_mod._bootstrap_improve_profile(
+        backend="local", mission_id="m-test",
+        staging_dir=str(staging),
+        source_snapshot_dir=str(source),
+        claude_bin=None, codex_bin=None)
 
     data_dir = mw_mod._guarded_data_dir()
-    allowed = list(captured["read_only_paths"]) + list(captured["read_write_paths"])
+    allowed = (list(captured["read_only_paths"]) + list(captured["read_write_paths"])
+              + list(captured.get("execute_paths", [])))
     assert allowed, "allowlist が空 — restrict_to の呼び出しを捕まえられていない"
     for p in allowed:
         resolved = Path(p).resolve()
@@ -339,7 +531,7 @@ def test_allowlist_never_covers_the_data_dir(monkeypatch, tmp_path):
         "専用 workdir (cwd) が read_write allowlist に入っていない"
 
 
-def test_bootstrap_fails_closed_when_cwd_would_expose_data_dir(monkeypatch):
+def test_bootstrap_fails_closed_when_cwd_would_expose_data_dir(monkeypatch, tmp_path):
     """`Popen(cwd=...)` が専用 workdir でなくリポジトリ root になった場合
     (= codex 1周目 #1 の変異)、**起動を拒否する**ことを pin する。
 
@@ -355,8 +547,18 @@ def test_bootstrap_fails_closed_when_cwd_would_expose_data_dir(monkeypatch):
                             "data/ を覆う allowlist で restrict_to を呼んでいる"))
     monkeypatch.chdir(repo_root)
 
+    # Create staging and source_snapshot dirs
+    # Note: workdir=cwd=repo_root (sibling to data/ — this should trigger allowlist error)
+    staging = repo_root / "staging" / "m-test"
+    staging.mkdir(parents=True, mode=0o700, exist_ok=True)
+    source = repo_root  # source is workdir itself
+
     with pytest.raises(RuntimeError, match="would expose the history data"):
-        mw_mod._bootstrap_improve_profile()
+        mw_mod._bootstrap_improve_profile(
+            backend="local", mission_id="m-test",
+            staging_dir=str(staging),
+            source_snapshot_dir=str(source),
+            claude_bin=None, codex_bin=None)
 
 
 def test_run_holdout_gate_requires_history_conn_keyword():
@@ -393,10 +595,11 @@ def test_guard_rejects_allowlist_paths_under_the_data_dir():
     を変えたときに効く最後の網なので、退行を検出できる形にしておく。
     """
     import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
 
     inside = mw_mod._guarded_data_dir() / "sub"
     with pytest.raises(RuntimeError, match="would expose the history data"):
-        mw_mod._assert_allowlist_excludes_data_dir([inside])
-
-    # 対称の確認: 無関係なパスは通る (上の raise が恒真でないこと)
-    mw_mod._assert_allowlist_excludes_data_dir([Path("/usr/lib")])
+        _assert_allowlist_excludes_data_dir(
+            [inside], guarded_data_dir=mw_mod._guarded_data_dir())
+    _assert_allowlist_excludes_data_dir(
+        [Path("/usr/lib")], guarded_data_dir=mw_mod._guarded_data_dir())

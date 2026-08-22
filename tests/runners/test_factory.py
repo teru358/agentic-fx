@@ -216,3 +216,19 @@ def test_build_runner_trade_claude_allowed_tools_excludes_bash(tmp_path, monkeyp
     assert captured["allowed_tools"] == ["mcp__afx__*"]
     assert "Bash" not in captured["allowed_tools"]
 
+
+def test_build_runner_returns_real_claude_runner_class(tmp_path):
+    """Task 2 完了後の real-class pin (束 A 申し送り item 7):
+    build_runner(backend=claude) が実 ClaudeRunner クラスを返すことを確認。"""
+    from agentic_fx.config import load_settings
+    from agentic_fx.runners.claude_runner import ClaudeRunner
+
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": "claude"})})})
+    runner = build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+    assert isinstance(runner, ClaudeRunner)
+

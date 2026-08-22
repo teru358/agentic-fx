@@ -79,10 +79,13 @@ def _mission():
 
 
 def _worker_settings(*, claude_backend: bool = False,
-                     credentials_file: str | None = None):
-    """`SETTINGS` を deep copy し improve backend / claude credentials_file を
-    上書きするテスト専用ヘルパ (Minor 5: プラン旧稿の `_settings(...)` は
-    非実在だったため新規に書き起こす)。"""
+                     credentials_file: str | None = None,
+                     codex_backend: bool = False,
+                     codex_provider: str | None = None,
+                     codex_auth_file: str | None = None):
+    """`SETTINGS` を deep copy し improve backend / claude credentials_file /
+    codex provider・auth_file を上書きするテスト専用ヘルパ (Minor 5:
+    プラン旧稿の `_settings(...)` は非実在だったため新規に書き起こす)。"""
     runner_update: dict = {}
     if claude_backend:
         runner_update["improve"] = SETTINGS.runner.improve.model_copy(
@@ -90,6 +93,17 @@ def _worker_settings(*, claude_backend: bool = False,
     if credentials_file is not None:
         runner_update["claude"] = SETTINGS.runner.claude.model_copy(
             update={"credentials_file": credentials_file})
+    if codex_backend:
+        runner_update["improve"] = SETTINGS.runner.improve.model_copy(
+            update={"backend": "codex"})
+    codex_update: dict = {}
+    if codex_provider is not None:
+        codex_update["provider"] = codex_provider
+    if codex_auth_file is not None:
+        codex_update["auth_file"] = codex_auth_file
+    if codex_update:
+        runner_update["codex"] = SETTINGS.runner.codex.model_copy(
+            update=codex_update)
     if not runner_update:
         return SETTINGS
     return SETTINGS.model_copy(
@@ -111,11 +125,13 @@ def test_mission_worker_env_excludes_credentials_for_improve(monkeypatch):
 
     monkeypatch.setenv("TWELVEDATA_API_KEY", "td-secret")
     monkeypatch.setenv("MT5_BRIDGE_API_KEY", "mt5-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")  # 5-E M4 killer (検収 B2)
 
     env = _mission_worker_env("improve")
 
     assert "TWELVEDATA_API_KEY" not in env
     assert "MT5_BRIDGE_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_mission_worker_env_omits_unset_credentials(monkeypatch):
@@ -1931,6 +1947,64 @@ def test_worker_runner_copies_claude_credentials_before_spawn(monkeypatch, tmp_p
         clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
     runner.run(_mission())
     assert captured["cfg_has_creds"] is True
+
+
+def test_worker_runner_does_not_copy_auth_json_for_codex_llama_swap(
+        monkeypatch, tmp_path):
+    """§7.1-2: `codex + provider=llama_swap` は ChatGPT サブスクの資格情報
+    (`auth.json`) をコピーせず、空の scratch `CODEX_HOME` で起動する
+    (指揮者検収 B2 — Task 1 差し戻し。base `dacb41d` の
+    `worker_runner.py` は既に `provider == "chatgpt"` で分岐しており
+    production は正しいが、これを殺すテストが存在しなかった)。"""
+    auth = tmp_path / "creds" / "auth.json"
+    auth.parent.mkdir()
+    auth.write_text('{"token":"chatgpt-subscription-secret"}')
+    auth.chmod(0o600)
+    captured: dict = {}
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        cfg_dir = Path(kw["cwd"]) / "cfg"
+        captured["cfg_has_auth"] = (cfg_dir / "auth.json").is_file()
+        return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    root = _root(tmp_path)
+    runner = WorkerRunner(
+        root=root,
+        settings=_worker_settings(codex_backend=True, codex_provider="llama_swap",
+                                  codex_auth_file=str(auth)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
+    runner.run(_mission())
+    assert captured["cfg_has_auth"] is False, (
+        "codex+llama_swap の scratch CODEX_HOME に auth.json をコピーしている "
+        "— ChatGPT サブスクの資格情報がローカル LLM 相手の mission に漏れる")
+
+
+def test_worker_runner_copies_auth_json_for_codex_chatgpt(monkeypatch, tmp_path):
+    """上記の対: `codex + provider=chatgpt` では `auth.json` を
+    コピーする (退行防止の対テスト)。"""
+    auth = tmp_path / "creds" / "auth.json"
+    auth.parent.mkdir()
+    auth.write_text('{"token":"chatgpt-subscription-secret"}')
+    auth.chmod(0o600)
+    captured: dict = {}
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        cfg_dir = Path(kw["cwd"]) / "cfg"
+        captured["cfg_has_auth"] = (cfg_dir / "auth.json").is_file()
+        return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    root = _root(tmp_path)
+    runner = WorkerRunner(
+        root=root,
+        settings=_worker_settings(codex_backend=True, codex_provider="chatgpt",
+                                  codex_auth_file=str(auth)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
+    runner.run(_mission())
+    assert captured["cfg_has_auth"] is True
 
 
 def test_worker_runner_rejects_credentials_file_that_is_a_symlink(monkeypatch, tmp_path):

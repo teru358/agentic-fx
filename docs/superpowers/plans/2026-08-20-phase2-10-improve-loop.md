@@ -442,17 +442,27 @@ class McpShimDispatcher:                          # 新規命名
 # src/agentic_fx/core/landlock.py の拡張
 # ============================================================
 
-_EXECUTE_ACCESS = _ACCESS_FS_EXECUTE | _ACCESS_FS_READ_FILE | _ACCESS_FS_READ_DIR  # 自己充足
+_EXECUTE_ACCESS = _ACCESS_FS_EXECUTE | _ACCESS_FS_READ_FILE | _ACCESS_FS_READ_DIR  # 自己充足 (ディレクトリ単位)
+_EXECUTE_FILE_ACCESS = _ACCESS_FS_EXECUTE | _ACCESS_FS_READ_FILE  # 自己充足 (ファイル単位、READ_DIR を含まない — 5-C 実装時改訂)
 
 def restrict_to(*, read_only_paths: list[Path], read_write_paths: list[Path],
-                execute_paths: "Sequence[Path]" = ()) -> None:
-    """既存シグネチャに `execute_paths` を追加 (probe の landlock_probe.py と同一マスク)。
-    `_HANDLED_ACCESS_FS` は不変 (EXECUTE は元から handled)。
+                execute_paths: "Sequence[Path]" = (),
+                execute_file_paths: "Sequence[Path]" = ()) -> None:
+    """既存シグネチャに `execute_paths` (ディレクトリ単位) を追加 (probe の
+    landlock_probe.py と同一マスク)。`_HANDLED_ACCESS_FS` は不変 (EXECUTE は
+    元から handled)。
 
     (Minor 2) 型注釈は `Sequence[Path]`(`typing.Sequence` を import) にし、
     既定値 `()` (空タプル、イミュータブル) と整合させる — `list[Path]` の
     まま `= ()` にすると型注釈と既定値の型が食い違う (動作はするが
-    mypy 等の静的検査で警告になり得る)。"""
+    mypy 等の静的検査で警告になり得る)。
+
+    **`execute_file_paths` (5-C 実装時改訂, 2026-08-22, 裁定 A)**:
+    通常ファイル単位で `_EXECUTE_FILE_ACCESS` を許可する。`O_PATH` のみで
+    開く (`O_DIRECTORY` を付けない)。ディレクトリが渡された場合は
+    `S_ISREG` 検査で `LandlockUnavailable` を送出する — カーネルは
+    ディレクトリ fd + `EXECUTE|READ_FILE` を黙って受理してしまう
+    (READ_DIR 無しの再帰付与という壊れたルールが無検出で入る) ため。"""
     ...
 
 def _assert_allowlist_excludes_data_dir(
@@ -462,13 +472,35 @@ def _assert_allowlist_excludes_data_dir(
     呼び出し側 (mission_worker.py) が execute_paths を渡すよう変更する。"""
     ...
 
+# 5-C 実装時改訂 (2026-08-22、裁定 A) — PT_INTERP 方式 + ExecClosure 化。
+# 旧シグネチャ (list[Path] を返す版) は着手前検証で保留になった local
+# backend の shell 遮断の穴を塞ぐため置き換えた。詳細は Task 5 節
+# 「5-C 実装時改訂」参照。
+
+class ExecClosure(NamedTuple):                    # 新規命名 (mission_worker.py)
+    dirs: list[Path]      # ディレクトリ単位で EXECUTE を与える対象
+    targets: list[Path]   # exec される実ファイル (PT_INTERP 解決の入力)
+
 # backend 別 exec closure (# 新規命名。mission_worker._bootstrap_improve_profile 内のローカル関数として実装してよい)
 def _exec_closure_for(backend: Literal["local", "claude", "codex"],
                        *, claude_bin: Path | None, codex_bin: Path | None,
-                       venv_root: Path) -> list[Path]:
-    """§2.2 の表 (共通 = sys.prefix/base_prefix + /usr/lib + /usr/lib64,
-    shell 系 (claude/codex) = /usr/bin (+ /bin が実ディレクトリなら /bin),
-    claude = claude_bin の親, codex = codex_bin の親, local = 共通のみ) を返す。"""
+                       venv_root: Path) -> ExecClosure:
+    """§2.2 の表 (共通 = venv_root、shell 系 (claude/codex) のみ /usr/bin
+    (+ /bin が実ディレクトリなら /bin) + /usr/lib + /usr/lib64、
+    claude = claude_bin の親、codex = codex_bin の親、
+    **local には /usr/lib/usr/lib64 をディレクトリ単位で与えない** (裁定4)。
+    targets には実行中の python (+claude/codex バイナリ実体) が入る —
+    PT_INTERP 解決の入力。I/O はしない (純関数)。"""
+    ...
+
+def elf_interpreter(path: Path) -> Path | None:    # core/landlock.py
+    """`path` の ELF PT_INTERP を読み interpreter の実体パスを返す。
+    static/static-pie なら None。非 ELF は RuntimeError (fail closed)。
+    Landlock 適用前に呼ぶこと。"""
+    ...
+
+def interpreter_files_for(exec_targets: "Sequence[Path]") -> list[Path]:  # core/landlock.py
+    """exec 対象群が要する動的ローダの実ファイル集合 (重複除去、実在のみ)。"""
     ...
 
 
@@ -3582,6 +3614,15 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 | M9 | `run_context_fields` の組み立てを削除する (`run_context` を無視する) | `test_worker_runner_run_context_adds_three_handshake_keys` (mock 前提の parent 側 unit test)。**レビュー2周目 Important 3 で追加**: Task 5 「5-H: Task 5 統合 step」の Step 1 (旧 Step 6b) の `test_worker_runner_run_context_reaches_real_improve_worker` (`tests/test_improve_profile_isolation.py`) が同じ変異を実プロセス経由で独立に検出する — 子側が 3 値を受け取れず 5-D の相互照合が `RuntimeError` になり `ready` へ到達しない (`observed_ready` が空のまま `.get("ok")` が `None` になり assert が落ちる) |
 | M10 | `run_context is None` でも `run_context_fields` に固定値を入れる (未知キー汚染) | `test_worker_runner_run_context_none_omits_three_handshake_keys` |
 
+**実装時追記 (2026-08-22 検収 B2)**: `provider == "chatgpt"` 条件 (L3449-3450)
+を落とす変異が M1-M10 のいずれにも捕まらず全スイート (2273 本) green のまま
+生存 (SURVIVED) と判明。production コードはプラン記述とバイト一致で正しく、
+欠陥はこの Step の変異リストが provider 分岐の killer を欠いていたこと。
+M11 を追加し、`test_worker_runner_does_not_copy_auth_json_for_codex_llama_swap`
+/ 対の `test_worker_runner_copies_auth_json_for_codex_chatgpt` を追加 (`plan10/task3`)。
+
+| M11 | `provider == "chatgpt"` 条件を落とし、`choice.backend == "codex"` のみで常に `auth.json` をコピーする | `test_worker_runner_does_not_copy_auth_json_for_codex_llama_swap` |
+
 - [ ] **Step 36: コミット**
 
 ```bash
@@ -6575,6 +6616,36 @@ Files 節・移行 Step のどちらにも記載が無かったが、5-D の `_b
 <!-- precheck 2026-08-22: T5-B1 T5-B2 T5-B3 -->
 - [ ] **Step 7: commit** — 5-B/5-C/5-D (Step 6d 含む) を統合。`landlock.execute_paths` + backend 別 exec closure + `_bootstrap_improve_profile` 拡張 (staging/source_snapshot 相互照合、fail closed な claude/codex bin 解決)。`worker_runner.py`/`run_context`/`on_ready` 付与は Task 5 本体の commit には**含まない** (裁定 R6 — 本節末尾の「Task 5 統合 step」で別途扱う)。既存 trade profile・既存テスト (`tests/test_improve_profile_isolation.py`・`tests/test_mission_worker_protocol.py` 含む) は無変更の意味論のまま green。
 
+### 5-C 実装時改訂 (2026-08-22、裁定 A)
+
+**この改訂内容が正である** — 上記 5-C/5-D 節本文 (旧稿) の `_exec_closure_for` の実装スケッチ (ディレクトリ単位で `/usr/lib`/`/usr/lib64` を全 backend に一律付与する形) は、着手前検証で保留になっていた `test_bootstrap_improve_profile_local_backend_has_no_shell_execute` の red を解消するため、指揮者裁定 (`tmp/plan10-impl/probe-execute-closure.md` §9) に基づき以下のとおり改訂して実装した。
+
+**背景**: このホスト (uutils coreutils を cargo 経由で導入) では `/usr/bin/env` の実体が `/usr/lib/cargo/bin/coreutils/env` にあり、Landlock は最終 dentry (実 inode) で許可を判定するため、動的リンクローダのために `/usr/lib` へディレクトリ単位で EXECUTE を与えると `/usr/bin` を exec dir から外していても `/usr/bin/env` が exec できてしまっていた (旧稿のまま実装すると local backend の shell 遮断が意図どおりに機能しない)。
+
+**裁定内容 (4 件)**:
+1. **PT_INTERP 方式を採用**: `core/landlock.py` に `elf_interpreter(path) -> Path | None` (ELF の PT_INTERP を読み動的ローダの実体パスを返す。static/static-pie なら None) と `interpreter_files_for(exec_targets) -> list[Path]` (重複除去) を追加。非 ELF (シェバンラッパ等) は `RuntimeError` で fail closed。**Landlock 適用前に呼ぶ** (`_bootstrap_improve_profile` 側)。
+2. ro `/usr/lib` の絞り込みは **Task 5 に入れない** (5-D の `read_only` リストは無変更)。
+3. **`ExecClosure(dirs, targets)` を `NamedTuple` として `mission_worker.py` に新設**: `dirs` はディレクトリ単位で EXECUTE を与える対象、`targets` は exec される実ファイル (PT_INTERP 解決の入力)。`_exec_closure_for` はこれを返す純関数のまま (I/O はしない — ELF 読取は呼び出し側)。
+4. **適用範囲は local backend のみ**: `_exec_closure_for` の `dirs` 組立で、local backend には `/usr/lib`/`/usr/lib64` をディレクトリ単位で**与えない** (動的ローダは `execute_file_paths` でファイル単位に絞る)。**claude/codex backend は現行どおり `/usr/lib`/`/usr/lib64` を `dirs` に含める** (実測: 落とすと `git submodule` 等 `/usr/lib/git-core/` 配下のヘルパ dispatch が壊れる一方、claude/codex は元々 `/usr/bin` + shell を意図的に許可しているため得られる安全性がほぼ無い)。
+
+**`core/landlock.py` の変更**:
+- `_EXECUTE_FILE_ACCESS = _ACCESS_FS_EXECUTE | _ACCESS_FS_READ_FILE` (READ_DIR を含めない自己充足マスク) を追加。
+- `restrict_to` に `execute_file_paths: Sequence[Path] = ()` 引数を追加。ファイル用の open は `os.O_PATH` のみ (`O_DIRECTORY` を付けない)。渡されたパスが通常ファイルでない場合 (`stat.S_ISREG` で検査) は `LandlockUnavailable` で拒否する — カーネルはディレクトリ fd + `EXECUTE|READ_FILE` を黙って受理してしまう (`READ_DIR` 無しの再帰付与という壊れたルールが無検出で入る) ため。
+- `elf_interpreter`/`interpreter_files_for` を追加 (上記)。
+
+**`mission_worker.py` の変更**:
+- `class ExecClosure(NamedTuple): dirs: list[Path]; targets: list[Path]` を新設。
+- `_exec_closure_for(backend, *, claude_bin, codex_bin, venv_root) -> ExecClosure` に改訂。`dirs = [venv_root]` + (claude/codex のみ) `/usr/bin` + `/bin` (実ディレクトリのみ) + `/usr/lib`/`/usr/lib64` (存在するもののみ) + 各 backend のバイナリ親ディレクトリ。`targets = [Path(sys.executable).resolve()]` + claude/codex のバイナリ実体。
+- `_bootstrap_improve_profile` は `closure = _exec_closure_for(...)` → `execute_dirs = list(closure.dirs)` (+ `base_prefix` を必要なら呼び出し側で合成、旧稿と同じ) → `execute_files = landlock.interpreter_files_for(closure.targets)` (Landlock 適用前・この境界で PT_INTERP を解決) → `_assert_allowlist_excludes_data_dir` に `execute_dirs + execute_files` を含めて渡す → `landlock.restrict_to(..., execute_paths=execute_dirs, execute_file_paths=execute_files)`。
+
+**テスト変更 (5 本の機械的書き換え + 差し替え 1 本 + 新設)**:
+- `tests/test_mission_worker.py`: `test_exec_closure_local_has_no_shell_or_cli_dirs`/`test_exec_closure_claude_includes_usr_bin_and_bin_parent`/`test_exec_closure_codex_includes_usr_bin_and_bin_parent`/`test_exec_closure_local_excludes_claude_and_codex_bin_dirs` は `X in closure` → `X in closure.dirs` に機械的書き換え。
+- `test_exec_closure_includes_usr_lib_family_for_all_backends` (旧) を **削除**し、`test_exec_closure_local_does_not_grant_usr_lib_as_an_exec_dir` (local の `dirs` に `/usr/lib`/`/usr/lib64` が無いことを pin) と `test_exec_closure_targets_include_the_running_python_for_all_backends` (`targets` に実行中の python が全 backend で入ることを pin) の 2 本に差し替えた。
+- `test_bootstrap_improve_profile_local_backend_has_no_shell_execute` の docstring を「local backend の exec closure に `/usr/bin` が無い — PATH 経由・直接 exec のどちらでも `/usr/bin/env` は `PermissionError`。明示的な動的ローダ起動 (`ld.so <path>`) による残余経路は本テストの対象外 (FS allowlist は execve を跨いで継承されるため `data/` 到達不能は別途保たれる)」の水準に改めた (probe §5.2)。アサーション自体は無変更。
+- `tests/core/test_landlock.py`: `execute_file_paths` の add_rule / マスク / default-empty の pin 3 本、`S_ISREG` 拒否の pin 1 本、`elf_interpreter` (非 ELF 拒否・static-pie で None・実行中 python のローダ解決) 3 本、`interpreter_files_for` (重複除去) 1 本を新設。
+
+**変異 (実測、mutation ledger 5-C 改訂節・5-D M6 再測定節を参照)**: M11 (local dirs に `/usr/lib` 再追加)、M12 (`_EXECUTE_FILE_ACCESS` を `_EXECUTE_ACCESS` に戻す)、M13 (claude/codex から `/usr/lib` を落とす = ruling A を全 backend に広げる)、M14 (`S_ISREG` 検査を落とす) の 4 件すべて KILLED。旧稿で UNMEASURABLE だった 5-D M6 (`_exec_closure_for` の backend 分岐を無視) も本改訂後に KILLED として再測定できた。
+
 ---
 
 ### 5-E: 4 不変条件の実プロセス pin + 項目 12 (`_staging`/`_human`/`_retired`/`.versions`/`.locks`/`.history.git` 不可視・非書込)
@@ -7947,6 +8018,8 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 ```
+
+**Task 5 からの申し送り (5-C 実装時改訂, 2026-08-22, 裁定 A)**: 上記スケッチの `execute = [venv_root] + [base_prefix?] + [/usr/lib, /usr/lib64]` (存在するもののみ) は、Task 5 5-C で local backend 相当 (gate worker は backend の区別を持たないため local 相当) について**同じ穴**を出荷することが実測で判明済み — このホストでは `/usr/bin/env` の実体が `/usr/lib/cargo/bin/coreutils/env` にあり、`/usr/lib` へディレクトリ単位で EXECUTE を与えると、候補ディレクトリ以外の任意の `/usr/lib` 配下の実行ファイルが exec 可能になる。**本 Step の実装時には** `execute` のディレクトリ単位付与から `/usr/lib`/`/usr/lib64` を外し、`landlock.interpreter_files_for([sys.executable] + ([base_prefix の実 python] があれば追加))` で得たローダの実ファイルを `restrict_to(..., execute_file_paths=...)` として渡すこと (`core/landlock.py` の `elf_interpreter`/`interpreter_files_for`/`execute_file_paths` は Task 5 で追加済み — 詳細は 5-C 節「5-C 実装時改訂 (2026-08-22、裁定 A)」を参照)。`read_only` の `/usr/lib` は無変更 (共有ライブラリの mmap(PROT_EXEC) に EXECUTE は不要)。
 
 `src/agentic_fx/plugin/gate_pytest.py`(新規):
 
