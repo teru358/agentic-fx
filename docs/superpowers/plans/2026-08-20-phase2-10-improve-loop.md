@@ -14582,6 +14582,17 @@ class ImproveSupervisor:
 
 **申し送り**: `submit_manual` の実装 (9.7 節) と `self._improve_loop` への実インスタンス注入 (10.12 節) はいずれも Task 10 (`ImproveLoop`) の完成後に確定する。骨格 Interfaces 節にはこの分割単位の指定が無いため **新規命名**として扱い、末尾の申し送りに転記する。
 
+> **実装時追記 (2026-08-22 検収 M-a)**: `submit_manual` は Task 9 完了時点でも
+> `raise NotImplementedError` のまま (9.5 節の最終形コードブロックが
+> `# 9.7 節で実装` と書くが、9.7 Step 3 は `commands.py` しか示さず実装しない
+> — 9.5/9.7/末尾申し送りの三者が食い違っている)。転写自体は忠実なので
+> Task 9 の転写ブロッカーではないが、**Task 12 が `Commands.improve_supervisor`
+> に実値を渡した瞬間、`improve` (引数無し) が `NotImplementedError` を
+> 送出する** (`dispatch` の `except (ValueError, KeyError)` では捕まらず、
+> 最後の `except Exception` が拾ってエラーメッセージを返す — fail closed
+> ではあるがコマンドは常に失敗する)。**Task 10 完了後・Task 12 の配線 Step
+> の前に、`submit_manual` の実装を担う Step を明示的に起票すること。**
+
 - [ ] **Step 4: 成功を確認**
 
 ```bash
@@ -14935,6 +14946,13 @@ EOF
 > 撤回する** — 遅延 callable 方式は Task 9 の境界 (`on_improve_tick` は
 > 既定 None、実値配線は Task 12) を保ったまま、core_lock 外での発火を
 > 構造的に強制する。
+> **Task 12 への申し送り**: `Scheduler.tick()` の戻り値を無視している呼び
+> 出し元がもう 1 箇所ある — `src/agentic_fx/backtest/runner.py:241` の
+> `scheduler.tick(now)`。Task 9 単独では `on_improve_tick` が常に None な
+> ので無害だが、backtest レーンが将来 `on_improve_tick` を配線する場合、
+> 戻り値の callable を実行する経路を backtest 側にも用意しないと
+> 「配線済み・全緑・しかし improve レーンは起動しない」という B2 と
+> 同型の欠陥が別レーンで再発する。ここにも pin が無い。
 
 - [ ] **Step 1: 失敗するテストを書く**
 

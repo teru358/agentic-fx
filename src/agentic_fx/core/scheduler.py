@@ -213,9 +213,13 @@ class Scheduler:
             # 検収 B2 (2026-08-22): improve tick の発火判定。
             # `on_improve_tick` が None (未配線、Task 9 単独では常にこれ) な
             # ら何も積まない。停止中 (`_stopping()`) も判定のみで発火しない
-            # — `_run_hooks` と同じ規約 (finally = 全 return パス・未捕捉
-            # 例外経路でも判定は必ず行う)。実際の呼び出しは core_lock の外
-            # (呼び出し元) で行われる。
+            # — 判定自体は `_run_hooks` と同じ規約で全 return パスで必ず
+            # 行う (finally)。ただし未捕捉例外で tick が抜ける経路では、
+            # この `pending` リストが呼び出し元へ渡らない (例外がそのまま
+            # 伝播する) ため on_improve_tick は発火しない — `_run_hooks`
+            # (副作用がその場で完結) とはこの点で非対称。period key は
+            # CAS 前なので未消費のまま残り、次 tick で回復する (fail-safe)。
+            # 実際の呼び出しは core_lock の外 (呼び出し元) で行われる。
             if self.on_improve_tick is not None and not self._stopping():
                 hook = self.on_improve_tick
                 pending.append(lambda hook=hook, now=now: hook(now))
