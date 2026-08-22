@@ -439,9 +439,14 @@ class McpShimDispatcher:                          # 新規命名
 _EXECUTE_ACCESS = _ACCESS_FS_EXECUTE | _ACCESS_FS_READ_FILE | _ACCESS_FS_READ_DIR  # 自己充足
 
 def restrict_to(*, read_only_paths: list[Path], read_write_paths: list[Path],
-                execute_paths: list[Path] = ()) -> None:
+                execute_paths: "Sequence[Path]" = ()) -> None:
     """既存シグネチャに `execute_paths` を追加 (probe の landlock_probe.py と同一マスク)。
-    `_HANDLED_ACCESS_FS` は不変 (EXECUTE は元から handled)。"""
+    `_HANDLED_ACCESS_FS` は不変 (EXECUTE は元から handled)。
+
+    (Minor 2) 型注釈は `Sequence[Path]`(`typing.Sequence` を import) にし、
+    既定値 `()` (空タプル、イミュータブル) と整合させる — `list[Path]` の
+    まま `= ()` にすると型注釈と既定値の型が食い違う (動作はするが
+    mypy 等の静的検査で警告になり得る)。"""
     ...
 
 def _assert_allowlist_excludes_data_dir(
@@ -5434,18 +5439,24 @@ EOF
 
 **由来**: 設計書 §2 全体、§8.1 項目 1 (exec closure 1 要素 drop) / 9 (dirfd・regex・snapshot ヘルパ) / 12 (`_staging`/`_human`/`_retired`/`.versions`/`.locks`/`.history.git` 不可視・非書込 pin)。
 
+<!-- precheck 2026-08-22: T5-M1 T5-M2 T5-M11 T5-M12 T5-M13 T5-M15 -->
 ### Files
 
-- Modify: `src/agentic_fx/core/landlock.py:32-114`(定数)、`:149-205`(`restrict_to`)。新設 `_assert_allowlist_excludes_data_dir`
+- Modify: `src/agentic_fx/core/landlock.py:32-114`(定数)、`:149-204`(`restrict_to`)。新設 `_assert_allowlist_excludes_data_dir`
 - Modify: `src/agentic_fx/mission_worker.py:93-250`(`_bootstrap_improve_profile`・`_guarded_data_dir`・旧 `_assert_allowlist_excludes_data_dir` の削除・呼び出し側書き換え)
-- Modify: `src/agentic_fx/runners/worker_runner.py:210-224`(handshake フレームに `mission_id`/`staging_dir`/`source_snapshot_dir` を追加。**A-1 の認証コピー配線と同一ファイル — マージ順注記どおり A-1 を後で当てる**)
+<!-- precheck 2026-08-22: T5-B1 -->
+- **`src/agentic_fx/runners/worker_runner.py` は Task 5 の担当外**(裁定 R6)。handshake の親側 3 キー (`mission_id`/`staging_dir`/`source_snapshot_dir`)・`WorkerRunner.__init__` の `run_context` 引数は **Task 1 Step 33 が所有**する (レビュー1周目 C3 で確定済み、申し送り⑤参照)。Task 5 が `worker_runner.py` に加える変更は、下記「Task 5 統合 step (A-1 マージ後)」の `on_ready` コールバックのみであり、B-5 本体 (5-A〜5-G) では一切触れない
 - Modify: `src/agentic_fx/plugin/loader.py:82-91`(`PluginMeta.artifact_hash` 追加)、`:228-256`(`discover` の `_`/`.` 除外・正規形検査・symlink 追従)
 - Modify: `tests/test_improve_profile_isolation.py`(**既存ファイル — 実測確認済み、全文 402 行**。`_bootstrap_improve_profile()` を無引数で呼ぶ 6 本 (:22, :48, :77, :87(`_ISOLATION_PROBE_SCRIPT` 内), :319, :359) と、`_assert_allowlist_excludes_data_dir` を旧シグネチャで直接呼ぶ 2 本 (:399, :402) が新シグネチャで壊れる。5-D の専用 Step で書き換える)
-- Test: `tests/core/test_landlock.py`(追記)、`tests/test_mission_worker.py`(新規または既存への追記 — `grep -rn "_bootstrap_improve_profile\|_assert_allowlist_excludes_data_dir" tests/` で既存位置を実装時に確認する)、`tests/plugin/test_plugin_loader_discover_staging.py`(新規)、`tests/integration/test_improve_worker_permission_boundary.py`(新規、実プロセス統合)
+- Modify: `tests/test_mission_worker_protocol.py`(**既存ファイル。プランの旧稿は未記載だったが実際には必須 — 着手前検証 B3**。5-D が `_bootstrap_improve_profile` を 6 キーワード引数化し、`main()` の improve 分岐が `handshake["mission_id"]` 等を直接添字参照するため、既存 3 本が壊れる。5-D Step 6d (新設) で関数単位の改訂を行う。ファイル全体の置換はしない)
+- Test: `tests/core/test_landlock.py`(追記)、`tests/test_mission_worker.py`(**新規作成 — 実測確認済み、現物に存在しない**。Minor 8)、`tests/plugin/test_plugin_loader_discover_staging.py`(新規)、`tests/integration/test_improve_worker_permission_boundary.py`(新規、実プロセス統合)
+<!-- precheck 2026-08-22: T5-M8 T5-M9 -->
+- **(Minor 8/9)** `tests/test_mission_worker.py`・`tests/integration/` はいずれも現物に存在しない (実測確認済み)。`tests/` 配下は `tests/__init__.py`・`tests/core/__init__.py`・`tests/plugin/__init__.py` 等パッケージ形式で統一されている — `tests/integration/__init__.py` を同時に作成しないと pytest collection が壊れる。5-D Step 1・5-E Step 1 の着手時にそれぞれ `tests/test_mission_worker.py`(トップレベルなので `__init__.py` 不要、`tests/test_*.py` は既存も同様)、`tests/integration/__init__.py`(新規、空ファイル)を作成すること。
 
 ### Interfaces
 
-**Consumes**: なし (束 B は最初の並列束。§8 実行グラフで `A-1〜3 / B-5 / C-8` は並列)。
+<!-- precheck 2026-08-22: T5-B2 -->
+**Consumes**: なし (束 B は最初の並列束。§8 実行グラフで `A-1〜3 / B-5 / C-8` は並列)。**例外 1 点 (裁定 R6)**: 本節末尾の「Task 5 統合 step (A-1 マージ後)」のみ Task 1 の `WorkerRunner.__init__(..., run_context=...)` (Task 1 Step 33 が確定させるシグネチャ) を Consume する。この 1 step は B-5 本体の受入条件に含めず、§8 実行グラフの「A-4 レーン着手前」に置く別ステップとして扱う — B-5 本体 (5-A〜5-G) は Task 1 完了前でも worktree 単独で red→green を完結できる。
 
 **Produces** (骨格 Interfaces 節、逐語):
 
@@ -5454,7 +5465,7 @@ EOF
 _EXECUTE_ACCESS = _ACCESS_FS_EXECUTE | _ACCESS_FS_READ_FILE | _ACCESS_FS_READ_DIR  # 自己充足
 
 def restrict_to(*, read_only_paths: list[Path], read_write_paths: list[Path],
-                execute_paths: list[Path] = ()) -> None: ...
+                execute_paths: "Sequence[Path]" = ()) -> None: ...  # Minor 2: Sequence[Path] で既定値 () と型を揃える
 
 def _assert_allowlist_excludes_data_dir(
     paths: list[Path], *, guarded_data_dir: Path,
@@ -5482,10 +5493,13 @@ def restrict_to(*, read_only_paths: list[Path],
 
 - [ ] **Step 1: 失敗するテストを書く** — `tests/core/test_landlock.py` に追記
 
+<!-- precheck 2026-08-22: T5-M3 -->
+
 ```python
 def test_create_ruleset_still_only_declares_truncate_and_execute_family(monkeypatch, tmp_path):
     """execute_paths 追加後も handled_access_fs 自体は不変
     (EXECUTE は元から ABI v1 に入っている — 新設は allowed_access 側のみ)。"""
+    import agentic_fx.core.landlock as landlock_mod  # Minor 3: 既存テストの規律 (関数内 import) に合わせる
     libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0, 0])
     _install(monkeypatch, libc)
     ro = tmp_path / "ro"; ro.mkdir()
@@ -5564,6 +5578,12 @@ def test_execute_paths_default_is_empty(monkeypatch, tmp_path):
     assert libc.syscall_numbers == [444, 444, 445, 445, 446]
 ```
 
+<!-- precheck 2026-08-22: T5-M4 -->
+**(Minor 4)** `test_execute_paths_default_is_empty` の syscall 列 assert は既存 `tests/core/test_landlock.py:256` `test_restrict_to_issues_syscalls_in_required_order` と偶然ほぼ同一の値 (`[444, 444, 445, 445, 446]`) になる。**重複を許容する** — 既存テストは「syscall の順序」を、新設テストは「`execute_paths` 省略時に追加呼出しが発生しないこと」を pin しており、目的が異なるため既存を拡張せず両立させる (どちらか片方だけを削って変異を通す事故を避ける)。
+
+<!-- precheck 2026-08-22: T5-M5 -->
+**(Minor 5)** 下記変異表 M5 (execute ループを read_only ループの前に置く) の killer は「新規順序 pin を追記してよい／落ちなければ削除可」という運用時裁量になっている。既存 `:256` の順序 pin (`prctl` と `landlock_restrict_self` の順序) とは別物 — M5 は execute_paths 追加ループの**内部**での順序であり、`:256` は `restrict_to` 全体の syscall 順序 (`prctl(NO_NEW_PRIVS)` と `landlock_restrict_self`) を見ている。両者は独立した pin であり、M5 用の新規テストを `:256` の代わりに削ってはいけない。
+
 - [ ] **Step 2: red を確認** — `uv run pytest tests/core/test_landlock.py -k "execute" -v`(`TypeError: restrict_to() got an unexpected keyword argument 'execute_paths'`)
 - [ ] **Step 3: 最小実装** — `landlock.py:32` 付近と `:149-176` を書き換え
 
@@ -5576,8 +5596,10 @@ _EXECUTE_ACCESS = (
 
 def restrict_to(*, read_only_paths: list[Path],
                 read_write_paths: list[Path],
-                execute_paths: list[Path] = ()) -> None:
-    """... (既存 docstring に追記) execute_paths は `_EXECUTE_ACCESS`
+                execute_paths: "Sequence[Path]" = ()) -> None:
+    """(Minor 2) 型注釈は `Sequence[Path]`(`from typing import Sequence`
+    を import に追加)にし、既定値 `()` と型を揃える。... (既存 docstring
+    に追記) execute_paths は `_EXECUTE_ACCESS`
     (EXECUTE|READ_FILE|READ_DIR の自己充足マスク) で許可する。同一 inode
     に対する read_only ルールとの併合には依存しない (probe
     landlock_probe.py と同一設計)。
@@ -5713,7 +5735,7 @@ _assert_allowlist_excludes_data_dir_impl(
 
 **根拠**: 設計書 §2.2 の表、probe §2.1/§2.2。**claude/codex バイナリの realpath とその親を渡す** — probe 実測 (P2) は「バイナリを含むディレクトリ 1 つ」で足りることを確認済み (codex は static-pie musl でローダ不要、claude は動的リンクだが `/usr/lib` 側でローダを賄う)。
 
-- [ ] **Step 1: 失敗するテストを書く** — `tests/core/test_landlock.py` に追記(`mission_worker` からの import になるため、5-D 実装後にモジュールが存在する前提。**この関数は `mission_worker.py` 内のローカル関数として実装してよい**(骨格 Interfaces 節の注記どおり)。テストは `tests/test_mission_worker.py` に置く)
+- [ ] **Step 1: 失敗するテストを書く** — **(Minor 7 修正) テストは `tests/test_mission_worker.py` に置く**(`_exec_closure_for` は `mission_worker.py` 内のローカル関数として実装するため — 骨格 Interfaces 節の注記どおり。旧稿は導入文で「`tests/core/test_landlock.py` に追記」、括弧内で「`tests/test_mission_worker.py` に置く」と自己矛盾していた。`mission_worker` からの import になるため、5-D 実装後にモジュールが存在する前提)
 
 ```python
 # tests/test_mission_worker.py に追記
@@ -5827,7 +5849,8 @@ def _exec_closure_for(backend: str, *, claude_bin: Path | None,
 
 現状 (`mission_worker.py:93-188`、全文は既知事実表参照): backend 別引数なし、staging なし、`/dev` は ro、`/proc` なし。
 
-- [ ] **Step 1: 失敗するテストを書く** — `tests/test_mission_worker.py` に追記(いずれも `subprocess` 経由の実プロセステスト。**Landlock は不可逆 — 各テストは子プロセス 1 個**)
+<!-- precheck 2026-08-22: T5-B7 -->
+- [ ] **Step 1: 失敗するテストを書く** — `tests/test_mission_worker.py` に追記(いずれも `subprocess` 経由の実プロセステスト。**Landlock は不可逆 — 各テストは子プロセス 1 個**。着手前検証 Blocking 7 の修正を `test_bootstrap_improve_profile_grants_execute_on_venv` の docstring 内に反映済み)
 
 ```python
 import json
@@ -5889,15 +5912,26 @@ def improve_worker_layout(tmp_path):
 
 
 def test_bootstrap_improve_profile_grants_execute_on_venv(improve_worker_layout):
-    """execute_paths に venv_root が入り、python 自体を exec できる
-    (self-referential — 起動できていること自体が exec 権の証拠)。"""
+    """execute_paths に venv_root が入り、python 自体を **exec できる**
+    (着手前検証 Blocking 7 修正: 旧稿は「起動できていること自体が exec
+    権の証拠」としていたが、python は Landlock 適用の**前**に exec 済み
+    であり、bootstrap 後に何も exec しない `print('BOOTSTRAP_OK')` は
+    `execute_paths=[]` にしても green のままだった (恒真)。ここでは
+    bootstrap **後**に `os.execv(sys.executable, ...)` で venv 内の
+    python 自身を明示的に再 exec し、それが通ることを確認する
+    (5-G の `_run_version_under_closure` と同型の self-exec probe)。"""
     l = improve_worker_layout
+    script = """
+    import os, sys
+    os.execv(sys.executable, [sys.executable, "-c", "print('VENV_EXEC_OK')"])
+    print('SHOULD_NOT_REACH')
+    """
     result = _run_bootstrap_probe(
-        "print('BOOTSTRAP_OK')",
-        staging_dir=l["staging_dir"], mission_id=l["mission_id"],
+        script, staging_dir=l["staging_dir"], mission_id=l["mission_id"],
         source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"])
     assert result.returncode == 0, result.stderr
-    assert "BOOTSTRAP_OK" in result.stdout
+    assert "VENV_EXEC_OK" in result.stdout
+    assert "SHOULD_NOT_REACH" not in result.stdout
 
 
 def test_bootstrap_improve_profile_dev_is_read_write(improve_worker_layout):
@@ -6015,8 +6049,7 @@ def test_bootstrap_improve_profile_proc_readable_only_for_claude(
     assert "PROC_READABLE" in result_claude.stdout, result_claude.stderr
 
 
-def test_bootstrap_improve_profile_home_env_is_scratch_dir(improve_worker_layout,
-                                                            monkeypatch):
+def test_bootstrap_improve_profile_home_env_is_scratch_dir(improve_worker_layout):
     """不変条件 4 (§2.1): `HOME` が実ホームでなく workdir/home に固定
     される (env は呼び出し側で設定するため、ここでは
     `_bootstrap_improve_profile` が **env 自体を書き換えない** ことと、
@@ -6024,6 +6057,7 @@ def test_bootstrap_improve_profile_home_env_is_scratch_dir(improve_worker_layout
     本 step の対象は Landlock 配線のみ。env 構築は A-1/A-2 の責務。
     ここでは `_bootstrap_improve_profile` が `HOME` を検査・変更しない
     (env 非依存で Landlock だけを張る) ことだけを pin する。"""
+    # (Minor 6) 旧稿は monkeypatch 引数を取っていたが未使用だったため削除した。
     l = improve_worker_layout
     script = "import os; print('HOME=' + os.environ.get('HOME', '<unset>'))"
     result = _run_bootstrap_probe(
@@ -6113,35 +6147,51 @@ def _bootstrap_improve_profile(
 
 呼び出し元 (`main()`、`mission_worker.py:390-391`) も handshake の新フィールドを渡すよう書き換える:
 
+<!-- precheck 2026-08-22: T5-B8 -->
+**(Blocking 8 修正)** 現物 `src/agentic_fx/config.py:54-61` の `RunnerChoice`/`RunnerSettings` には `runner.claude`/`runner.codex`/`.bin` は存在しない。`.get()` チェーンは KeyError にならず静かに `None` を返すため、Task 1 の config schema 確定前に本 step を実装すると **claude/codex backend が exec closure 無しで起動してしまう (fail open)**。Global Constraints の fail closed 方針に反するため、`.get()` チェーンではなく `dict["runner"]["improve"]["backend"]` と同じ **添字アクセス (KeyError = fail closed)** にする。キー自体が Task 1 未確定の間は、`backend` が `"claude"`/`"codex"` のときだけ bin を要求し、`"local"` のときは参照しない形にして早期の import エラーを避ける:
+
 ```python
 if worker_profile == "improve":
+    improve_backend = settings_dict["runner"]["improve"]["backend"]
+    if improve_backend == "claude":
+        claude_bin = settings_dict["runner"]["claude"]["bin"]
+        codex_bin = None
+    elif improve_backend == "codex":
+        claude_bin = None
+        codex_bin = settings_dict["runner"]["codex"]["bin"]
+    else:
+        claude_bin = None
+        codex_bin = None
     _bootstrap_improve_profile(
-        backend=settings_dict["runner"]["improve"]["backend"],
+        backend=improve_backend,
         mission_id=handshake["mission_id"],
         staging_dir=handshake["staging_dir"],
         source_snapshot_dir=handshake["source_snapshot_dir"],
-        claude_bin=settings_dict.get("runner", {}).get("claude", {}).get("bin"),
-        codex_bin=settings_dict.get("runner", {}).get("codex", {}).get("bin"))
+        claude_bin=claude_bin, codex_bin=codex_bin)
 ```
 
-(claude_bin/codex_bin の settings 経路は Task 1 の `RunnerSettings` 拡張が確定させる — 本 task では `settings_dict` の dict アクセスに留め、Task 1 の config schema 確定後にキー名を実装時点で再確認すること。**未決事項として申し送りに記載**)
+(`runner.claude`/`runner.codex` のキー名自体は Task 1 の `RunnerSettings` 拡張が確定させる — 本 task は「backend に対応する bin キーが settings_dict に存在しなければ `KeyError` で起動失敗する」fail closed の形にとどめ、Task 1 の config schema 確定後にキー名を実装時点で再確認すること。**未決事項として申し送りに記載** (申し送り④、下記で更新))
 
-`worker_runner.py:210-224` の handshake 組み立てに 3 フィールドを追加 (improve のときのみ非 None、trade は None のまま):
+<!-- precheck 2026-08-22: T5-B10 -->
+**(Blocking 10 修正、裁定 R7)** `source_snapshot_dir` は handshake から受け取るだけで検証していなかった (見出し・骨格 L158 の「相互照合」が未実装)。`_bootstrap_improve_profile` の staging dirfd 再検証の直後に、`source_snapshot_dir` が実在するディレクトリであり、かつ `workdir` 配下 (resolve 後の prefix 一致) であることを fail closed で検査する:
 
 ```python
-handshake = {
-    ...
-    "mission_id": (str(mission_id) if self._worker_profile == "improve" else None),
-    "staging_dir": (str(staging_dir) if self._worker_profile == "improve" else None),
-    "source_snapshot_dir": (str(source_snapshot_dir)
-                            if self._worker_profile == "improve" else None),
-    ...
-}
+    source_snapshot_path = Path(source_snapshot_dir).resolve()
+    if (not source_snapshot_path.is_dir()
+            or workdir.resolve() not in source_snapshot_path.parents
+            and source_snapshot_path != workdir.resolve()):
+        raise RuntimeError(
+            f"source_snapshot_dir {source_snapshot_path} is not a real "
+            f"directory under workdir {workdir} — refusing to start "
+            "(fail closed, 設計書 §2.2)")
 ```
 
-(`mission_id`/`staging_dir`/`source_snapshot_dir` の実引数配線は A-1/D-10 が `WorkerRunner.__init__`/`run` に渡す — **本 task は handshake フィールドの追加とキー名の確定のみ**を担当する。5-D 時点では `WorkerRunner` に未配線のプレースホルダを置き、参照ゼロで壊れないことを既存の `test_worker_runner*.py` フルパスで確認する)
+(設計書 §2.2 のとおり、`source_snapshot_dir` は既に read_only/read_write いずれの対象にも入っている `workdir` の子であるため、この検査は **追加の Landlock ルールを必要としない** — 誤っていたのは「相互照合する」という見出しの主張の実装が欠けていた点のみ)
 
-- [ ] **Step 4: green を確認** — `uv run pytest tests/test_mission_worker.py tests/runners/test_worker_runner*.py tests/core/test_landlock.py -v`
+<!-- precheck 2026-08-22: T5-B1 -->
+**(Blocking 1 修正、裁定 R6)** `worker_runner.py` の handshake 組み立てへの変更は**削除**する。親側の handshake 3 キー (`mission_id`/`staging_dir`/`source_snapshot_dir`、キー不在 vs `None` の表現含む) と `WorkerRunner.__init__` への `run_context` 追加は **Task 1 Step 33 が所有**する (レビュー1周目 C3 で確定済み — 申し送り⑤参照)。Task 5 は子側 (`mission_worker.py`) が handshake で受領した 3 値を Landlock 適用前に相互照合する経路 (上記) のみを担当し、`worker_runner.py` には一切触れない。親→子の実引数配線を検証する実プロセステストは、本節末尾の「Task 5 統合 step (A-1 マージ後)」で扱う (B-5 本体の受入条件には含めない)。
+
+- [ ] **Step 4: green を確認** — `uv run pytest tests/test_mission_worker.py tests/core/test_landlock.py -v`(`worker_runner.py` は Task 5 が触らないため `tests/runners/test_worker_runner*.py` は本 step の green 確認対象に含めない — Task 1 側の担当)
 - [ ] **Step 5: 変異テスト**
 
 | # | 変異 | 殺すテスト |
@@ -6154,6 +6204,26 @@ handshake = {
 | M6 | `_exec_closure_for` の backend 分岐を無視し常に claude 相当を渡す | `test_bootstrap_improve_profile_local_backend_has_no_shell_execute` |
 | M7 | staging dirfd 再検証 (uid/mode) を削除 | `test_bootstrap_improve_profile_rejects_when_staging_dir_mode_is_not_0700` |
 | M8 | `guarded_data_dir=_guarded_data_dir()` を `guarded_data_dir=code_root`(または `code_root.parent`)に差し替える(5-B の申し送りどおり、移設後の新しい主 killer) | `tests/test_improve_profile_isolation.py::test_allowlist_never_covers_the_data_dir`(5-D の Step 7 で新シグネチャへ移行して存置。`code_root` を `parents[1]` から `parents[2]` に広げる既存の変異 M(旧稿)と同じ仕組みで、`_guarded_data_dir()` の戻り値と `code_root` は異なる式なので誤って後者を渡すと即座に検出される) |
+| M9 (Blocking 8) | `settings_dict["runner"]["claude"]["bin"]` の添字アクセスを `.get()` チェーンに戻す (fail open へ後退) | `test_main_fails_closed_when_improve_backend_is_claude_without_bin_key`(下記 5-D Step 6d で追加、`tests/test_mission_worker_protocol.py`。`runner.claude.bin` キーを欠いた `settings_dict` を渡すと `KeyError` になることを `_drive_main` 経由で直接 pin する) |
+| M10 (Blocking 10) | `source_snapshot_dir` の実在・`workdir` 配下チェックを削除 | `test_bootstrap_improve_profile_rejects_source_snapshot_dir_outside_workdir`(下記 5-D Step 1 に追加。`workdir` の外を指す `source_snapshot_dir` を渡すと拒否されることを pin する) |
+
+<!-- precheck 2026-08-22: T5-B8 T5-B10 -->
+**(Step 1 への追加テスト、Blocking 8/10)** M9 (Blocking 8) の killer は `_bootstrap_improve_profile` 単体ではなく `main()` の improve 分岐 (`settings_dict["runner"]["claude"]["bin"]` の添字アクセス) を通した契約なので、`tests/test_mission_worker_protocol.py` 側 (下記 5-D Step 6d) で `_drive_main` を使って pin する — この Step には置かない。M10 (Blocking 10) の killer として、`improve_worker_layout` フィクスチャを使う以下の 1 本を Step 1 のテストブロックへ追加する:
+
+```python
+def test_bootstrap_improve_profile_rejects_source_snapshot_dir_outside_workdir(
+        improve_worker_layout):
+    """(Blocking 10) source_snapshot_dir が workdir の外を指すと拒否される。"""
+    l = improve_worker_layout
+    outside = l["workdir"].parent / "not-workdir"
+    outside.mkdir(mode=0o500)
+    result = _run_bootstrap_probe(
+        "print('SHOULD_NOT_REACH')", staging_dir=l["staging_dir"],
+        mission_id=l["mission_id"], source_snapshot_dir=outside,
+        workdir=l["workdir"])
+    assert result.returncode != 0
+    assert "SHOULD_NOT_REACH" not in result.stdout
+```
 
 - [ ] **Step 6: 既存テスト `tests/test_improve_profile_isolation.py` を新シグネチャへ移行**(全 402 行、実測確認済み。5-A〜5-D のどの新設テストとも重複しない既存の回帰資産であり、削除ではなく更新する)
 
@@ -6223,131 +6293,67 @@ handshake = {
 
   移行後 `uv run pytest tests/test_improve_profile_isolation.py -v` が全件 green であることを確認する。
 
-- [ ] **Step 6b (レビュー1周目 C3 で追加、レビュー2周目 Important 3 で修正): 親 (`WorkerRunner(run_context=ctx)`) が送った 3 値を子が受け取る実プロセステスト**
+<!-- precheck 2026-08-22: T5-B3 -->
+- [ ] **Step 6d (着手前検証 Blocking 3): 既存テスト `tests/test_mission_worker_protocol.py` の関数単位改訂**
 
-`:236-291` の `test_real_improve_worker_reaches_ready` は handshake dict を直接手組みしており、`WorkerRunner.__init__` の `run_context=` 経路 (Task 1 が実装) を経由しない。C3 は「親が送った 3 値を子が受け取る」ことを実プロセスで検証する 1 本を Task 5 側に要求している。
+Files 節・移行 Step のどちらにも記載が無かったが、5-D の `_bootstrap_improve_profile` 6 キーワード引数化と `main()` improve 分岐の `handshake["mission_id"]`/`handshake["staging_dir"]`/`handshake["source_snapshot_dir"]` 直接添字参照により、以下 3 本が壊れる (実測確認済み、行番号は現 HEAD `2a2b2a7`)。**Task 1 が同ファイルに R2 (`credentials` handshake) のテスト 2 本を追加するため、ファイル全体を置換せず、以下の関数単位でのみ改訂する**:
 
-**レビュー2周目 Important 3**: 旧稿は `assert result.status != "failed" or "mismatch" not in (result.reason or "")` という弱い assert だった。`run_context_fields` の付与 (Task 1, M9) を削除する変異を入れて子が必須 handshake key 欠落で `KeyError`/bootstrap error/protocol error 等の別理由で `failed` を返しても、`reason` に文字列 `"mismatch"` が含まれなければこの assert は通ってしまい、C3 の欠陥注入を確実には殺せなかった。以下は `reason` 文字列に依存せず、子が実際に受け取った 3 値を **`ready` protocol event で観測**し、親側で完全一致 + `ready` 到達を直接 assert する形へ書き換える。
+  - `:610-612` `test_main_applies_landlock_bootstrap_before_running_improve_mission` — `monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile", lambda: calls.append(...))` の **0 引数 lambda** を、5-D の 6 キーワード引数呼び出しを受け止められる形に改訂する:
+    ```python
+    # 改訂前 (:610-612)
+    monkeypatch.setattr(
+        mission_worker, "_bootstrap_improve_profile",
+        lambda: calls.append(len(_FakeLocalRunner.instances)))
+    # 改訂後
+    monkeypatch.setattr(
+        mission_worker, "_bootstrap_improve_profile",
+        lambda **kw: calls.append(len(_FakeLocalRunner.instances)))
+    ```
+    assert 側 (`assert calls[0] == 0` 等) は無変更 — 検査目的 (`_bootstrap_improve_profile` が `LocalRunner` 構築より前に呼ばれること) は維持される。
+  - 同テストの `:617` `handshake_overrides={"worker_profile": "improve", "db_path": None, "plugins_dir": None}` に `mission_id`/`staging_dir`/`source_snapshot_dir` の 3 キーを追加する (`main()` の改訂後の improve 分岐がこれらを直接添字参照するため、無ければ `KeyError` で `_bootstrap_improve_profile` 呼び出しに到達する前に落ちる — この 3 本は「bootstrap が呼ばれるか」を検査したいのであって「handshake key 欠落時の挙動」は検査対象ではないため、値そのものは検査対象外・実在パスである必要もない):
+    ```python
+    handshake_overrides={"worker_profile": "improve",
+                         "db_path": None, "plugins_dir": None,
+                         "mission_id": "m-proto-test",
+                         "staging_dir": str(tmp_path / "staging" / "m-proto-test"),
+                         "source_snapshot_dir": str(tmp_path / "source")}
+    ```
+  - `:1029-1058` `test_main_puts_reason_in_result_frame_for_improve_profile` — `:1037-1038` の `lambda *args, **kwargs: None` は既に可変引数なので無改訂。`:1045` の `handshake_overrides` に同じ 3 キーを追加する。
+  - `:1074-1095` `test_result_frame_carries_null_reason_for_improve_profile` — `:1080-1081` の `lambda *args, **kwargs: None` は無改訂。`:1088` の `handshake_overrides` に同じ 3 キーを追加する。
 
-まず `src/agentic_fx/mission_worker.py` の improve 分岐 (`main()`、5-D で `_bootstrap_improve_profile(...)` を呼ぶ箇所の直後) を、`ready` frame へ受領した 3 値を乗せる形に変更する:
+  **改訂しない**: `assert` 文・docstring・検査目的はいずれの 3 本も変更しない (「`_bootstrap_improve_profile` が正しいタイミングで呼ばれる」「`result` frame の `reason` が正しく伝播する」という既存の検査目的はそのまま維持される — 3 キー追加は `main()` の新しい前提条件を満たすためだけの最小差分)。
 
-```python
-# mission_worker.py: main() の improve 分岐、_bootstrap_improve_profile(...)
-# 呼び出し (5-D) が成功した直後・ready 送出の直前
-_send_frame(protocol_out, out_seq, {
-    "type": "ready", "ok": True,
-    # レビュー2周目 Important 3: 子が実際に受領・相互照合を通した3値を
-    # ready event へ乗せて返す (診断用途、trade profile では付与しない)。
-    "run_context": {
-        "mission_id": handshake["mission_id"],
-        "staging_dir": handshake["staging_dir"],
-        "source_snapshot_dir": handshake["source_snapshot_dir"],
-    },
-})
-ready_sent = True
-```
+  **Blocking 8 (M9) の killer をここに置く** — `settings_dict["runner"]["claude"]["bin"]` の添字アクセスへの fail closed 化 (上記 5-D 実装) を殺す変異 (`.get()` チェーンへ戻す) の検出用に、新規テストを 1 本追加する:
+    ```python
+    def test_main_fails_closed_when_improve_backend_is_claude_without_bin_key(
+            monkeypatch, tmp_path):
+        """(着手前検証 Blocking 8) improve backend=claude で settings_dict
+        に runner.claude.bin キーが無いと KeyError で fail closed する
+        (.get() チェーンに戻す変異 M9 の killer)。_bootstrap_improve_profile
+        は監視対象外なので直前で止める fake に差し替える。"""
+        monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                            lambda **kw: None)
 
-次に `src/agentic_fx/runners/worker_runner.py` の `WorkerRunner.__init__` (Task 1 が
-確定させた `run_context` 付きシグネチャ、本節冒頭の `worker_runner.py:67-73` 該当箇所)
-に、テスト観測用の `on_ready` コールバックを追加する (既存の `on_rpc_leak` と同じ形の
-任意コールバック — 本番経路では未使用、`None` のまま):
+        def to_claude(d):
+            d["runner"]["improve"]["backend"] = "claude"
+            # 意図的に d["runner"]["claude"] を追加しない — キー欠落を再現する
 
-```python
-class WorkerRunner(AgentRunner):
-    def __init__(self, *, root: Path, settings, clock: Clock, rag: Rag,
-                worker_profile: str = "trade",
-                run_context: object | None = None,
-                on_rpc_leak: Callable[[], None] | None = None,
-                on_ready: Callable[[dict], None] | None = None,
-                stop_event: threading.Event | None = None) -> None:
-        self._root = root
-        self._settings = settings
-        self._clock = clock
-        self._rag = rag
-        self._worker_profile = worker_profile
-        self._run_context = run_context
-        self._on_rpc_leak = on_rpc_leak
-        self._on_ready = on_ready
-        self._stop_event = stop_event
-```
+        with pytest.raises(KeyError):
+            _drive_main(
+                monkeypatch, tmp_path,
+                handshake_overrides={"worker_profile": "improve",
+                                     "db_path": None, "plugins_dir": None,
+                                     "mission_id": "m-claude-missing-bin",
+                                     "staging_dir": str(tmp_path / "staging" / "m-claude-missing-bin"),
+                                     "source_snapshot_dir": str(tmp_path / "source")},
+                settings_mutator=to_claude)
+    ```
+    (`_drive_main` が例外を伝播させない実装であれば、実装者は `_drive_main` 内部で例外を捕捉せず再送出する経路を使うか、`main()` 自体を直接呼ぶ形にテストを調整すること — 既存の `_drive_main` の例外伝播仕様を実装時に確認する)
 
-`_run_with_child` の `ready = self._wait_with_stop(ready_queue, ...)` (現物 `worker_runner.py:232`) の直後、`ok` 判定より前に呼ぶ:
+- [ ] **Step 6b/6c は Task 5 本体から分離した (裁定 R6)** — 「Task 1 Step 33 の `WorkerRunner(run_context=ctx)`」に依存する実プロセステストのため、本節末尾の「Task 5 統合 step (A-1 マージ後)」として書く (逐語は下記「5-H: Task 5 統合 step」節を参照)。B-5 本体の受入条件には含めない。
 
-```python
-            try:
-                ready = self._wait_with_stop(
-                    ready_queue, timeout=w.worker_startup_timeout_sec)
-                if self._on_ready is not None:
-                    try:
-                        self._on_ready(ready)
-                    except Exception:  # noqa: BLE001
-                        _log.exception("on_ready callback failed")
-                if not ready.get("ok", False):
-                    status = "failed"
-                    return MissionResult(status, None, transcript)
-```
-
-これで `tests/test_improve_profile_isolation.py` の実プロセステストを以下へ書き換える:
-
-```python
-def test_worker_runner_run_context_reaches_real_improve_worker(tmp_path):
-    """レビュー1周目 C3・レビュー2周目 Important 3: `WorkerRunner(
-    worker_profile="improve", run_context=ctx)` (Task 1 実装) → 実
-    subprocess の mission_worker が受け取った mission_id/staging_dir/
-    source_snapshot_dir で 5-D の Landlock 相互照合
-    (`staging_path.name == mission_id`) が通り、'ready' へ到達すること
-    を実プロセスで確認する。`on_ready` で観測した `ready` protocol event
-    の `run_context` フィールドを ctx の 3 値と完全一致で assert する —
-    `result.reason` の文字列には依存しない (旧稿は `reason` に
-    'mismatch' が含まれるかだけを見ており、`run_context_fields` の付与を
-    削除する変異 (M9) を入れても子が別理由の failed を返せば通ってしまう
-    恒真に近い assert だった)。"""
-    from agentic_fx.runners.worker_runner import WorkerRunner
-
-    mission_id = "c3-real-probe"
-    staging_dir = tmp_path / "staging" / mission_id
-    staging_dir.mkdir(parents=True, mode=0o700)
-    source_snapshot_dir = tmp_path / "source"
-    source_snapshot_dir.mkdir(mode=0o500)
-
-    class _RealRunContext:
-        def __init__(self, mission_id, staging_dir, source_snapshot_dir):
-            self.mission_id = mission_id
-            self.staging_dir = staging_dir
-            self.source_snapshot_dir = source_snapshot_dir
-
-    ctx = _RealRunContext(mission_id, staging_dir, source_snapshot_dir)
-    observed_ready: dict = {}
-
-    def _on_ready(frame):
-        observed_ready.update(frame)
-
-    runner = WorkerRunner(
-        root=tmp_path, settings=_settings(), clock=_clock(), rag=_rag(),
-        worker_profile="improve", run_context=ctx, on_ready=_on_ready)
-    runner.run(_mission())
-
-    # ready protocol event に直接到達したこと自体を assert する
-    # (`observed_ready` が空のままなら `ready` timeout/protocol_error で
-    # `on_ready` が一度も呼ばれていない — ready 未到達の直接証拠)。
-    assert observed_ready.get("ok") is True
-    assert observed_ready["run_context"] == {
-        "mission_id": mission_id,
-        "staging_dir": str(staging_dir),
-        "source_snapshot_dir": str(source_snapshot_dir),
-    }
-```
-
-(`_settings()`/`_clock()`/`_rag()`/`_mission()` は既存 `tests/runners/test_worker_runner.py` のヘルパを import して流用する。`tests/test_improve_profile_isolation.py` に無ければ import を追加する。)
-
-- [ ] **Step 6c: 変異テスト追加**
-
-| # | 変異 | 殺すテスト |
-|---|---|---|
-| M9b | `mission_worker.py` の improve 分岐で `ready` frame へ `run_context` を乗せない (診断フィールドの欠落) | `test_worker_runner_run_context_reaches_real_improve_worker` (`observed_ready["run_context"]` の参照で `KeyError` になり落ちる) |
-| M9c | `_on_ready` の呼び出しを `ok` 判定の**後**に移し、`ok=False` (mismatch 等) のときは `on_ready` が呼ばれない経路にする | `test_worker_runner_run_context_reaches_real_improve_worker` (mismatch させる変種を実装者が追加すること — 下限リスト不足、申し送り。happy path 単体では `ok=True` なので本変異は本テストでは検出されないが、`observed_ready` が空にならないことは変わらないため実害は失敗系変種でのみ顕在化する) |
-
-- [ ] **Step 7: commit** — 5-B/5-C/5-D/5-D(Step 6b) を統合。`landlock.execute_paths` + backend 別 exec closure + `_bootstrap_improve_profile` 拡張 + `WorkerRunner(run_context=ctx)` を経由した実プロセス受領テスト。`src/agentic_fx/mission_worker.py` (`ready` frame への `run_context` 付与) と `src/agentic_fx/runners/worker_runner.py` (`on_ready` コールバック追加、Important 3) も本コミットに含める。既存 trade profile・既存テスト (`tests/test_improve_profile_isolation.py` 含む) は無変更の意味論のまま green。
+<!-- precheck 2026-08-22: T5-B1 T5-B2 T5-B3 -->
+- [ ] **Step 7: commit** — 5-B/5-C/5-D (Step 6d 含む) を統合。`landlock.execute_paths` + backend 別 exec closure + `_bootstrap_improve_profile` 拡張 (staging/source_snapshot 相互照合、fail closed な claude/codex bin 解決)。`worker_runner.py`/`run_context`/`on_ready` 付与は Task 5 本体の commit には**含まない** (裁定 R6 — 本節末尾の「Task 5 統合 step」で別途扱う)。既存 trade profile・既存テスト (`tests/test_improve_profile_isolation.py`・`tests/test_mission_worker_protocol.py` 含む) は無変更の意味論のまま green。
 
 ---
 
@@ -6383,7 +6389,18 @@ def _mk_repo_layout(tmp_path: Path) -> dict:
     cwd にしていたため、`_bootstrap_improve_profile` が `Path.cwd()` を
     rw allowlist に加える際に **`plugins/` 全体が書込可能になり**、
     `test_invariant2_cannot_listdir_plugins_root` を含む項目 12 の
-    全テストが誤った理由で red/false-green になっていた)。"""
+    全テストが誤った理由で red/false-green になっていた)。
+
+    **(Minor 16)** ここで作る `root / "data"` は `tmp_path` 配下の
+    使い捨てディレクトリであり、`_guarded_data_dir()` が守る**実
+    リポジトリ**の `data/` (`__file__` から `parents[2] / "data"` で
+    導く固定座標) とは別物 — 本ファイルの不変条件 1 系テスト
+    (`test_invariant1_*`) が測っているのは「(手組みの) allowlist に
+    無いパスは EACCES になる」という Landlock 一般の挙動であって、
+    `_assert_allowlist_excludes_data_dir` の防御 (allowlist の計算が
+    実 `data/` を含んでしまう事故) を検査しているわけではない —
+    その役目は既存 `tests/test_improve_profile_isolation.py::
+    test_allowlist_never_covers_the_data_dir` が持つ。"""
     root = tmp_path / "repo"
     (root / "data").mkdir(parents=True)
     (root / "data" / "agentic.db").write_text("SQLITE-FAKE")
@@ -6562,7 +6579,20 @@ def test_invariant3_no_billing_keys_in_environ(tmp_path):
     """`os.environ` 自体を子の中で検査する (`/proc` 経由ではない —
     `/proc` は claude backend のときしか allowlist に無いため、
     `/proc/self/environ` を読む形で書くと codex/local では検査自体が
-    vacuously pass してしまう)。"""
+    vacuously pass してしまう)。
+
+    **(着手前検証 Blocking 6 修正) 撤回する主張**: このテストは
+    「不変条件 3 を pin する」とは言えない — `_run_probe` が渡す `env`
+    はこのテストファイル自身が組み立てた辞書 (`{"PATH": ..., "HOME":
+    ...}`) であり、本番の env builder
+    (`worker_runner._mission_worker_env`/A-1 の scratch env) を一切
+    通らない。ここで確認しているのは「テストが渡さなかったキーは
+    `os.environ` に出てこない (Landlock 越しに親の env が漏れて増える
+    ことはない) こと」に限られる smoke であり、production の
+    allowlist に `ANTHROPIC_API_KEY` を混入させる変異はこのテストでは
+    検出できない (その killer は `tests/runners/test_worker_runner.py::
+    test_mission_worker_env_excludes_credentials_for_improve` — Task 1
+    の担当 — が持つ)。"""
     layout = _mk_repo_layout(tmp_path)
     script = """
     import os
@@ -6583,6 +6613,15 @@ def test_invariant3_no_billing_keys_in_environ(tmp_path):
 # --- 不変条件 4: 個人設定を継承しない -----------------------------------
 
 def test_invariant4_home_is_scratch_not_real_home(tmp_path):
+    """**(着手前検証 Blocking 6 修正) 撤回する主張**: 同じ理由 (上記
+    `test_invariant3_no_billing_keys_in_environ` 参照) で、この
+    テストが渡す `HOME` はテスト自身が組み立てた値であり、production
+    の HOME 決定ロジック (§2.2 — A-1/D-10 の親側 env 構築責務) を
+    通らない。ここで確認しているのは「`_bootstrap_improve_profile` が
+    `HOME` を検査・書き換えない (env 非依存で Landlock だけを張る) 」
+    ことに限られる smoke — `test_bootstrap_improve_profile_home_env_
+    is_scratch_dir` (5-D) と同じ性質の重複であり、本番で実ホームが
+    渡ってしまう変異はここでは検出できない。"""
     layout = _mk_repo_layout(tmp_path)
     scratch_home = layout["workdir"] / "home"
     scratch_home.mkdir(exist_ok=True)
@@ -6668,15 +6707,16 @@ Landlock 未対応環境向けの skip は各テストの冒頭で `is_available
 - [ ] **Step 2: red を確認** — `_bootstrap_improve_profile` が 5-D の実装を持つ前提で red になる項目は無い想定 (5-D が済んでいれば大半は green のはず)。**red を確認すべきは 5-D 実装前**の状態、または 5-D 実装後に「staging を Mission id で分けない」実装ミスを意図的に入れて red を作る手順を実装者が踏むこと。**この Step 2 は「5-D 実装前に本 5-E のテストを先に書き、5-D と 5-E を交互に driven する」運用でもよい**(TDD の原則どおり)。
 - [ ] **Step 3: 最小実装** — 5-D の実装がそのまま満たす。追加が必要なのは、5-D の allowlist に `plugins/` 自体を一切含めないことの確認のみ(5-D の実装は staging_dir 単体を rw に加えるだけであり、`plugins/` を含めていない — 実装済み)。
 - [ ] **Step 4: green を確認** — `uv run pytest tests/integration/test_improve_worker_permission_boundary.py -v`
-- [ ] **Step 5: 変異テスト**
+<!-- precheck 2026-08-22: T5-B6 -->
+- [ ] **Step 5: 変異テスト** (M4/M5 は着手前検証 Blocking 6 により再割当— 下表参照)
 
 | # | 変異 | 殺すテスト |
 |---|---|---|
 | M1 | `read_write_paths` に `plugins_root`(staging の親)を渡す | `test_invariant2_cannot_listdir_plugins_root` |
 | M2 | staging を `plugins/_staging/`(mission_id 抜き)で共有する | `test_invariant2_other_missions_staging_is_unreachable` |
 | M3 | `read_only` に `reports/` を混入させる | `test_invariant2_reports_dir_is_unreachable` |
-| M4 | env allowlist に `ANTHROPIC_API_KEY` を混入させる (A-1 との統合回帰) | `test_invariant3_no_billing_keys_in_environ` |
-| M5 | `HOME` を実ホームのまま渡す | `test_invariant4_home_is_scratch_not_real_home` |
+| M4 | env allowlist に `ANTHROPIC_API_KEY` を混入させる (A-1 との統合回帰) | **(着手前検証 Blocking 6 修正) 再割当**: `test_invariant3_no_billing_keys_in_environ` は恒真 (テスト自身が env を組み立てるため、production の env builder を経由しない) — 主 killer は `tests/runners/test_worker_runner.py::test_mission_worker_env_excludes_credentials_for_improve` (Task 1 担当) に移す。改善ループ実ツールセット導入後は、本節末尾「5-H: Task 5 統合 step」の `on_ready` 観測経路 (`WorkerRunner(run_context=ctx)` 経由の実プロセステスト) が副次的な統合 pin になり得る (実装時に追加を検討) |
+| M5 | `HOME` を実ホームのまま渡す | **(着手前検証 Blocking 6 修正) 再割当**: `test_invariant4_home_is_scratch_not_real_home` は恒真 (同上)。主 killer は A-1/D-10 が実装する親側 env 構築 (`HOME=<workdir>/home`) のテスト (Task 1 担当、5-H 統合 step の `WorkerRunner(run_context=ctx)` 実プロセス経路が最終的な裏取りになる) に移す。本テストは「`_bootstrap_improve_profile` が env を書き換えない」ことの smoke としてのみ残す |
 | M6 | `.versions`/`.locks`/`.history.git` のいずれかを誤って read_only allowlist に含める | 対応する `test_item12_privileged_plugin_subdirs_are_unreachable[...]` |
 | M7 | `_run_probe` の `cwd` を `workdir` でなく `staging_dir` の祖先 (`repo/plugins`) に戻す (以前の稿で実在したバグと同型) | `test_invariant2_cannot_listdir_plugins_root`(cwd が rw allowlist に混ざり `plugins/` が listdir 可能になる → `OK: plugins/ EACCES` が出ず fail) |
 
@@ -6699,7 +6739,8 @@ Landlock 未対応環境向けの skip は各テストの冒頭で `is_available
 
 **申し送り⑤ (discover の activity 引数)**: §2.3 は不一致時「拒否 + activity ERROR」と言うが、`discover(plugins_dir: Path) -> list[PluginMeta]` に `activity` パラメータは無い。**`discover` にオプション引数 `activity: ActivityLog | None = None` を追加する**(必須化すると全呼び出し元 — CLI・service.py・mission_worker.py の trade 経路 — の書き換えが要る)。渡されなければ既存の `_log.warning`/`_reject` のみ(ログレベルは reject と同じ `WARNING` に統一し、`ERROR` 専用の activity 記録は `activity` が渡されたときだけ行う)。
 
-- [ ] **Step 1: 失敗するテストを書く** — `tests/plugin/test_plugin_loader_discover_staging.py`(新規)
+<!-- precheck 2026-08-22: T5-B4 T5-B5 T5-B11 -->
+- [ ] **Step 1: 失敗するテストを書く** — `tests/plugin/test_plugin_loader_discover_staging.py`(新規、以下のテスト本体には着手前検証 Blocking 4/5/11 の修正を反映済み — 各テストの docstring 内に個別注記)
 
 ```python
 """discover の `_`/`.` 除外・名前正規形・symlink 追従・artifact_hash
@@ -6734,17 +6775,37 @@ def _artifact_hash(plugin_py: str, config_yaml: str, test_py: str) -> str:
 
 
 def test_discover_skips_underscore_prefixed_dirs(tmp_path):
+    """(着手前検証 Blocking 4 修正) 現行 `discover` は `plugins_dir.iterdir()`
+    の**直下**しか見ない — 旧稿は `_staging/m-001/cand/` (2 階層下) に
+    3 ファイルを置いており、現行コードでも `_staging` 直下には 3 ファイル
+    が無い (`missing [...] — skipping` で偶然 skip) ため新設フィルタを
+    一切 pin していなかった。3 ファイルを `_staging` **直下**に置き、
+    新設フィルタが無ければ検出されてしまう (= 現行コードなら拾われる)
+    配置にする。"""
     plugins_dir = tmp_path / "plugins"
-    _write_plugin_files(plugins_dir / "_staging" / "m-001" / "cand")
+    _write_plugin_files(plugins_dir / "_staging")
     metas = discover(plugins_dir)
     assert metas == []
 
 
 def test_discover_skips_dot_prefixed_dirs(tmp_path):
+    """(着手前検証 Blocking 4 修正) 同上 — `.versions` 直下に 3 ファイルを
+    置く (旧稿の `foo/deadbeef` という 2 階層下ではなく)。"""
     plugins_dir = tmp_path / "plugins"
-    _write_plugin_files(plugins_dir / ".versions" / "foo" / "deadbeef")
+    _write_plugin_files(plugins_dir / ".versions")
     metas = discover(plugins_dir)
     assert metas == []
+
+
+def test_discover_does_not_skip_a_normally_named_dir_with_the_same_files(tmp_path):
+    """(着手前検証 Blocking 4、対照テスト) 上記 2 本と全く同じ 3 ファイルを
+    正規形の名前 `staging_like` に置くと 1 件検出される — フィルタが
+    「名前の先頭文字」だけを見ていて、ファイル内容やディレクトリ深さでは
+    ないことを固定する。"""
+    plugins_dir = tmp_path / "plugins"
+    _write_plugin_files(plugins_dir / "staging_like")
+    metas = discover(plugins_dir)
+    assert [m.name for m in metas] == ["staging_like"]
 
 
 def test_discover_rejects_non_canonical_name(tmp_path):
@@ -6773,13 +6834,22 @@ def test_discover_computes_artifact_hash_for_plain_dir(tmp_path):
 def test_discover_follows_canonical_symlink_and_fixes_path_to_version_dir(tmp_path):
     """live symlink `plugins/<name>` → `.versions/<name>/<artifact_hash>` を
     追従し、`PluginMeta.path` を版ディレクトリの実体に固定する
-    (resolve() は使わない — リンク先文字列を字句検証)。"""
+    (resolve() は使わない — リンク先文字列を字句検証)。
+
+    **(着手前検証 Blocking 5 修正)** 版ディレクトリ名は **実際の
+    artifact_hash** (`_artifact_hash(INDICATOR_PY, CONFIG_YAML,
+    TEST_PY)`) にする — 旧稿は `"a"*64` という任意値を使っており、
+    discover 実装 (Step 3) はディレクトリ名と実計算 hash の不一致を
+    reject するため、正常系のはずのこのテストが必ず `metas == []` に
+    落ちて `test_discover_rejects_directory_name_artifact_hash_mismatch`
+    (`"f"*64` で同じ `[]` を期待) と矛盾していた。"""
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
-    version_dir = plugins_dir / ".versions" / "ind" / ("a" * 64)
+    real_hash = _artifact_hash(INDICATOR_PY, CONFIG_YAML, TEST_PY)
+    version_dir = plugins_dir / ".versions" / "ind" / real_hash
     _write_plugin_files(version_dir)
     (plugins_dir / "ind").symlink_to(
-        Path(".versions") / "ind" / ("a" * 64), target_is_directory=True)
+        Path(".versions") / "ind" / real_hash, target_is_directory=True)
     metas = discover(plugins_dir)
     assert len(metas) == 1
     assert metas[0].name == "ind"
@@ -6800,7 +6870,12 @@ def test_discover_rejects_symlink_pointing_outside_versions_dir(tmp_path):
 
 def test_discover_rejects_symlink_with_mismatched_name_in_target(tmp_path):
     """リンク先の `<name>` 成分が symlink 自身の名前と食い違う
-    (`plugins/ind` → `.versions/other/<hash>`)。"""
+    (`plugins/ind` → `.versions/other/<hash>`)。**(着手前検証 Blocking 5
+    確認)** 版ディレクトリ名 `"b"*64` は実 artifact_hash と一致しない
+    任意値のままでよい — このテストが reject を検出する理由は「name
+    不一致」であり、hash 照合まで到達する前に落ちるため hash の正誤は
+    無関係 (`test_discover_follows_canonical_symlink_and_fixes_path_to_
+    version_dir` とは異なり、ここでは意図的に区別している)。"""
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir()
     version_dir = plugins_dir / ".versions" / "other" / ("b" * 64)
@@ -6832,9 +6907,35 @@ def test_discover_plain_dir_still_works_unchanged(tmp_path):
     metas = discover(plugins_dir)
     assert len(metas) == 1
     assert metas[0].path == plugins_dir / "legacy_plain"
+
+
+def test_discover_rejects_symlink_with_valid_hash_name_pointing_outside_versions_dir(
+        tmp_path):
+    """(着手前検証 Blocking 11) 設計書 §2.3 が明示的に禁じる形 —
+    「リンク先が正規形かどうかを `resolve()` の結果で判定する」実装への
+    劣化 (変異 M6) を殺す。`test_discover_rejects_symlink_pointing_
+    outside_versions_dir` は `outside` という**絶対パス**を使うため、
+    symlink 追従後 `entry.is_symlink()` は True だが hash 照合
+    (`resolved.name == "outside"` が実 hash と不一致) の方で reject
+    される — 字句検証を削除しても hash 照合が偶然カバーしてしまい、
+    M6 は生存したまま (実測で確認済み)。ここでは **`.versions` の外だが
+    正しい 64hex artifact_hash という名前を持つディレクトリ**
+    (`plugins/elsewhere/<正しい hash>/`) を用意し、`plugins/ind` から
+    `../elsewhere/<同じ hash>` へ symlink する — hash 照合は通ってしまう
+    ため、字句検証 (`pattern.match(target)`) だけが reject の唯一の
+    根拠になる。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    real_hash = _artifact_hash(INDICATOR_PY, CONFIG_YAML, TEST_PY)
+    elsewhere_dir = plugins_dir / "elsewhere" / real_hash
+    _write_plugin_files(elsewhere_dir)
+    (plugins_dir / "ind").symlink_to(
+        Path("..") / "plugins" / "elsewhere" / real_hash, target_is_directory=True)
+    metas = discover(plugins_dir)
+    assert metas == []
 ```
 
-- [ ] **Step 2: red を確認** — 現状 `discover` は `_`/`.` を除外しない (`test_discover_skips_underscore_prefixed_dirs`/`_dot_prefixed_dirs` が fail — 3 ファイル欠如で偶然 skip されるケースはここでは 3 ファイル完備で置いているため確実に red)。`artifact_hash` フィールド自体が無いため他のテストは `AttributeError` で fail。
+- [ ] **Step 2: red を確認** — 現状 `discover` は `_`/`.` を除外しない (`test_discover_skips_underscore_prefixed_dirs`/`_dot_prefixed_dirs` が fail — 5-F 実装前は 3 ファイル完備 (Blocking 4 修正後の配置) で置いているため確実に red)。`artifact_hash` フィールド自体が無いため他のテストは `AttributeError` で fail。
 - [ ] **Step 3: 最小実装** — `loader.py` を以下の方針で拡張
 
 ```python
@@ -6958,7 +7059,9 @@ def discover(plugins_dir: Path, *, activity=None) -> list[PluginMeta]:
 
 `os`/`re` の import を追加。
 
-- [ ] **Step 4: green を確認** — `uv run pytest tests/plugin/test_plugin_loader_discover_staging.py tests/tools/test_plugin_loader.py -v`(既存 `test_plugin_loader.py` も無変更で green であることを確認)
+<!-- precheck 2026-08-22: T5-M10 -->
+- [ ] **Step 4: green を確認** — `uv run pytest tests/plugin/test_plugin_loader_discover_staging.py tests/tools/test_plugin_loader.py tests/plugin/test_loader.py -v`(Minor 10: `discover` の既存単体テストは `tests/plugin/test_loader.py` にあり旧稿の確認コマンドから漏れていた。既存 `test_plugin_loader.py`/`test_loader.py` も無変更で green であることを確認。ただし裁定 R8 のとおり `tests/tools/test_plugin_loader.py` の `expire_due` 系 1 本は C-8 (Task 8) が別途改訂するため、そのテストのみ本 step の対象外)
+<!-- precheck 2026-08-22: T5-B11 -->
 - [ ] **Step 5: 変異テスト**
 
 | # | 変異 | 殺すテスト |
@@ -6968,7 +7071,7 @@ def discover(plugins_dir: Path, *, activity=None) -> list[PluginMeta]:
 | M3 | symlink target の正規形チェックを削除 (どんな文字列でも版扱いにする) | `test_discover_rejects_symlink_pointing_outside_versions_dir` |
 | M4 | symlink target の `<name>` 一致検査を落とす | `test_discover_rejects_symlink_with_mismatched_name_in_target` |
 | M5 | `expected_hash != meta.artifact_hash` の照合を削除 | `test_discover_rejects_directory_name_artifact_hash_mismatch` |
-| M6 | 字句検証 (`pattern.match(target)`) を**削除**し、`(plugins_dir / target).resolve()` の存在確認だけで正規形判定を代替する (禁じられた「`resolve()` の結果で判定する」形へ倒す変異) | `test_discover_rejects_symlink_pointing_outside_versions_dir`(字句検証を外すと `../../outside` も `resolve()` 後にディレクトリとして存在するため通ってしまう — このテストが直接検出する) |
+| M6 | 字句検証 (`pattern.match(target)`) を**削除**し、`(plugins_dir / target).resolve()` の存在確認だけで正規形判定を代替する (禁じられた「`resolve()` の結果で判定する」形へ倒す変異) | **(着手前検証 Blocking 11 修正)** `test_discover_rejects_symlink_pointing_outside_versions_dir` は主張どおりには機能しない — `outside` (絶対パス) は artifact_hash 照合の方で reject されるため、字句検証を削除しても hash 照合が偶然カバーし M6 は生存する (実測確認済み)。主 killer を `test_discover_rejects_symlink_with_valid_hash_name_pointing_outside_versions_dir` (新設、上記) に差し替える — hash 名は正しい値にし、`.versions` の外を指すことだけを唯一の reject 根拠にする |
 | M7 | プレーン dir 経路 (`entry.is_symlink()` が False の分岐) を壊す | `test_discover_plain_dir_still_works_unchanged` |
 | M8 | `artifact_hash_bytes` の 3 本目 (`test_plugin.py`) を計算に含めない | `test_discover_computes_artifact_hash_for_plain_dir`(既存の `content_hash` と値が変わらなくなる — 期待値と食い違う) |
 
@@ -6997,6 +7100,9 @@ def discover(plugins_dir: Path, *, activity=None) -> list[PluginMeta]:
 
 - [ ] **Step 1: 失敗するテストを書く** — `tests/test_mission_worker.py` に追記。**実インストール済み CLI が無いホストでは `shutil.which` で skip する**(Task 1 が確定する `runner.claude.bin`/`runner.codex.bin` の実パスは未定なので、本 step は `shutil.which("claude")`/`codex` 相当のシステム PATH 探索に留める — Task 1 完了後に設定経由のパス解決へ差し替えることを申し送りに記す)
 
+<!-- precheck 2026-08-22: T5-B9 -->
+**(着手前検証 Blocking 9 修正、裁定 R5)** `settings.runner.codex.bin` は **native バイナリ** (`.../@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex`、static-pie musl — ローダ不要) を指す契約であり、`shutil.which("codex")` が返す npm の Node シェバンラッパ (`#!/usr/bin/env node`) ではない。このホストの実測: `which codex` → `~/.nvm/versions/node/v24.18.0/bin/codex` → `readlink -f` → `.../lib/node_modules/@openai/codex/bin/codex.js` (`file -L` = `Node.js script executable, ASCII text`)。旧稿の `_skip_unless_cli_installed("codex")` をそのまま使うと `positive control` の `test_codex_bin_parent_alone_allows_exec` はこのホストで失敗する (`execute_paths` に `codex.js` の親を足しても、シェバンの `/usr/bin/env`・`node` 自体が closure に無いため exec できない)。`codex` 専用の解決関数を新設し、`shutil.which` の結果が ELF でなければ同じ npm パッケージ配下の vendor native ディレクトリを探索する:
+
 ```python
 import shutil
 
@@ -7007,6 +7113,35 @@ def _skip_unless_cli_installed(bin_name: str) -> str:
         pytest.skip(f"{bin_name} not installed on this host — drop table "
                     "row cannot be measured here (see probe report §7)")
     return path
+
+
+def _resolve_codex_native_bin() -> str:
+    """(裁定 R5) `codex` 用の CLI 解決。`shutil.which("codex")` の結果を
+    ELF マジックバイトで判定し、Node シェバンラッパ (ELF でない) なら
+    同じ npm パッケージ配下の `codex-linux-x64/vendor/*/bin/codex`
+    (native, static-pie musl) を探索する。どちらも見つからなければ
+    skip する (`_skip_unless_cli_installed` と同じ規律)。Task 1 が
+    `runner.codex.bin` の config 経路を確定させたら、本関数は設定値の
+    検証 (ELF でなければ fail closed) に差し替えること (申し送り④)。"""
+    which_path = shutil.which("codex")
+    if which_path is None:
+        pytest.skip("codex not installed on this host — drop table row "
+                    "cannot be measured here (see probe report §7)")
+    resolved = Path(which_path).resolve()
+    with open(resolved, "rb") as f:
+        magic = f.read(4)
+    if magic == b"\x7fELF":
+        return str(resolved)
+    search_root = resolved
+    for _ in range(6):
+        search_root = search_root.parent
+        candidates = sorted(search_root.glob(
+            "**/codex-linux-x64/vendor/*/bin/codex"))
+        if candidates:
+            return str(candidates[0])
+    pytest.skip(f"codex vendor native binary not found by walking up from "
+                f"{resolved} — drop table row cannot be measured here "
+                "(裁定 R5, see probe report §2.1)")
 
 
 def _run_version_under_closure(bin_path: str, *, execute_paths: list[Path],
@@ -7049,7 +7184,7 @@ def _run_version_under_closure(bin_path: str, *, execute_paths: list[Path],
 
 
 def test_drop_codex_bin_parent_denies_exec():
-    codex_bin = _skip_unless_cli_installed("codex")
+    codex_bin = _resolve_codex_native_bin()
     result = _run_version_under_closure(
         codex_bin, execute_paths=[], read_only_paths=[Path("/etc")])
     assert "EXEC_PERMISSION_ERROR errno=13" in result.stdout
@@ -7059,8 +7194,11 @@ def test_codex_bin_parent_alone_allows_exec():
     """positive control: 親ディレクトリ 1 つを execute_paths に足すだけで
     `--version` が通る (static-pie musl — ローダ不要、probe §2.1)。
     codex は `$CODEX_HOME` が無くても `--version` が通ることを probe
-    §2.1 が前提にしている (認証を要さない経路)。"""
-    codex_bin = _skip_unless_cli_installed("codex")
+    §2.1 が前提にしている (認証を要さない経路)。**(着手前検証
+    Blocking 9)** `codex_bin` は `_resolve_codex_native_bin()` で解決した
+    native バイナリ (`which codex` の Node ラッパではない) — このホスト
+    ではローダ不要のため `execute_paths` は親ディレクトリ 1 つで足りる。"""
+    codex_bin = _resolve_codex_native_bin()
     parent = Path(codex_bin).resolve().parent
     result = _run_version_under_closure(
         codex_bin, execute_paths=[parent], read_only_paths=[Path("/etc")])
@@ -7122,10 +7260,145 @@ def test_usr_lib_and_bin_parent_together_allow_claude_exec(tmp_path):
 ```
 
 - [ ] **Step 2: red を確認**(ホストに `claude`/`codex` がインストール済みであれば、drop 系は `EXEC_PERMISSION_ERROR` が出ずに素通りするため red。インストールされていなければ全件 skip — この場合は CI 環境で `claude`/`codex` を導入するまで本 5-G は skip され続ける旨を実装時のログに残すこと)
+
+**(Minor 13)** `os.execv(bin_path, …)` は `shutil.which`/`_resolve_codex_native_bin` が返す**未解決パス**をそのまま渡す一方、`execute_paths` には `.resolve().parent` (シンボリックリンク解決後) を渡している。Landlock は最終 dentry (実ファイル) で許可判定するため通る見込みだが**未検証**。実装者は Step 3 着手時にまず 1 回実測し、通らなければ `os.execv` 側も `.resolve()` した絶対パスに揃えること。
+
 - [ ] **Step 3: 実装** — 本 step group は `_exec_closure_for`(5-C)・`landlock.restrict_to`(5-A)を消費するだけで新規実装コードは追加しない(既存実装で満たされることを確認する検証専用 step)
+
+**(Minor 15、未検証)** 「Landlock 未対応環境向け skip」経路 (5-E で言及) は、このホストが ABI 8 であるため**一度も通らない**。skip 経路自体の正しさ (`is_available()` が False を返すホストでの動作) は本プランの実測範囲では観測できていない — CI/別ホストで確認する機会があれば実装者が裏取りすること。
 - [ ] **Step 4: green を確認**
 - [ ] **Step 5: 変異テスト** — 本 step group は実装コードを追加しないため変異表は無い。**5-C の変異表 (M1〜M5) がこの実プロセス測定によって独立に裏取りされる**ことを指揮者が確認する。
 - [ ] **Step 6: commit** — exec closure 1 要素 drop 表(課金不要分)。§8.1-47(実 1 ターンでの完走測定)は Task 13 へ引き継ぐ旨を PR 説明に明記する。
+
+---
+
+<!-- precheck 2026-08-22: T5-B2 T5-B1 -->
+### 5-H: Task 5 統合 step (裁定 R6 — A-1 マージ後、A-4 レーン着手前に実施。**B-5 本体の受入条件には含めない**)
+
+**位置づけ**: 本 step は Task 1 Step 33 が確定させる `WorkerRunner(run_context=ctx)` (親側 handshake 3 キーの所有・`run_context` 引数) に依存する。5-A〜5-G (B-5 本体) は Task 1 の完了を待たずに worktree 単独で red→green を完結できるが、本 step だけは A-1 のマージ後、§8 実行グラフの A-4 レーン着手前に実施する統合作業として分離する (旧稿 Step 6b/6c、レビュー1周目 C3・レビュー2周目 Important 3 を継承)。
+
+- [ ] **Step 1 (旧 Step 6b): 親 (`WorkerRunner(run_context=ctx)`) が送った 3 値を子が受け取る実プロセステスト**
+
+`tests/test_improve_profile_isolation.py` の `test_real_improve_worker_reaches_ready` は handshake dict を直接手組みしており、`WorkerRunner.__init__` の `run_context=` 経路 (Task 1 が実装) を経由しない。C3 は「親が送った 3 値を子が受け取る」ことを実プロセスで検証する 1 本を Task 5 側に要求している。
+
+**レビュー2周目 Important 3**: 旧稿は `assert result.status != "failed" or "mismatch" not in (result.reason or "")` という弱い assert だった。`run_context_fields` の付与 (Task 1, M9) を削除する変異を入れて子が必須 handshake key 欠落で `KeyError`/bootstrap error/protocol error 等の別理由で `failed` を返しても、`reason` に文字列 `"mismatch"` が含まれなければこの assert は通ってしまい、C3 の欠陥注入を確実には殺せなかった。以下は `reason` 文字列に依存せず、子が実際に受け取った 3 値を **`ready` protocol event で観測**し、親側で完全一致 + `ready` 到達を直接 assert する形へ書き換える。
+
+まず `src/agentic_fx/mission_worker.py` の improve 分岐 (`main()`、5-D の `_bootstrap_improve_profile(...)` 呼び出しが成功した直後・`ready` 送出の直前) を、`ready` frame へ受領した 3 値を乗せる形に変更する:
+
+```python
+# mission_worker.py: main() の improve 分岐、_bootstrap_improve_profile(...)
+# 呼び出し (5-D) が成功した直後・ready 送出の直前
+_send_frame(protocol_out, out_seq, {
+    "type": "ready", "ok": True,
+    # レビュー2周目 Important 3: 子が実際に受領・相互照合を通した3値を
+    # ready event へ乗せて返す (診断用途、trade profile では付与しない)。
+    "run_context": {
+        "mission_id": handshake["mission_id"],
+        "staging_dir": handshake["staging_dir"],
+        "source_snapshot_dir": handshake["source_snapshot_dir"],
+    },
+})
+ready_sent = True
+```
+
+次に `src/agentic_fx/runners/worker_runner.py` の `WorkerRunner.__init__` (Task 1 が A-1 で確定させた `run_context` 付きシグネチャ) に、テスト観測用の `on_ready` コールバックを追加する (既存の `on_rpc_leak` と同じ形の任意コールバック — 本番経路では未使用、`None` のまま。**この 2 引数の追加は本統合 step の scope であり、Task 1 の `run_context` 本体とは別に本 step が足す**):
+
+```python
+class WorkerRunner(AgentRunner):
+    def __init__(self, *, root: Path, settings, clock: Clock, rag: Rag,
+                worker_profile: str = "trade",
+                run_context: object | None = None,
+                on_rpc_leak: Callable[[], None] | None = None,
+                on_ready: Callable[[dict], None] | None = None,
+                stop_event: threading.Event | None = None) -> None:
+        self._root = root
+        self._settings = settings
+        self._clock = clock
+        self._rag = rag
+        self._worker_profile = worker_profile
+        self._run_context = run_context
+        self._on_rpc_leak = on_rpc_leak
+        self._on_ready = on_ready
+        self._stop_event = stop_event
+```
+
+`_run_with_child` の `ready = self._wait_with_stop(ready_queue, ...)` (A-1 マージ後の現物で行番号を実装時に確認する) の直後、`ok` 判定より前に呼ぶ:
+
+```python
+            try:
+                ready = self._wait_with_stop(
+                    ready_queue, timeout=w.worker_startup_timeout_sec)
+                if self._on_ready is not None:
+                    try:
+                        self._on_ready(ready)
+                    except Exception:  # noqa: BLE001
+                        _log.exception("on_ready callback failed")
+                if not ready.get("ok", False):
+                    status = "failed"
+                    return MissionResult(status, None, transcript)
+```
+
+これで `tests/test_improve_profile_isolation.py` の実プロセステストを以下へ書き換える:
+
+```python
+def test_worker_runner_run_context_reaches_real_improve_worker(tmp_path):
+    """レビュー1周目 C3・レビュー2周目 Important 3: `WorkerRunner(
+    worker_profile="improve", run_context=ctx)` (Task 1 実装) → 実
+    subprocess の mission_worker が受け取った mission_id/staging_dir/
+    source_snapshot_dir で 5-D の Landlock 相互照合
+    (`staging_path.name == mission_id`) が通り、'ready' へ到達すること
+    を実プロセスで確認する。`on_ready` で観測した `ready` protocol event
+    の `run_context` フィールドを ctx の 3 値と完全一致で assert する —
+    `result.reason` の文字列には依存しない (旧稿は `reason` に
+    'mismatch' が含まれるかだけを見ており、`run_context_fields` の付与を
+    削除する変異 (M9) を入れても子が別理由の failed を返せば通ってしまう
+    恒真に近い assert だった)。"""
+    from agentic_fx.runners.worker_runner import WorkerRunner
+
+    mission_id = "c3-real-probe"
+    staging_dir = tmp_path / "staging" / mission_id
+    staging_dir.mkdir(parents=True, mode=0o700)
+    source_snapshot_dir = tmp_path / "source"
+    source_snapshot_dir.mkdir(mode=0o500)
+
+    class _RealRunContext:
+        def __init__(self, mission_id, staging_dir, source_snapshot_dir):
+            self.mission_id = mission_id
+            self.staging_dir = staging_dir
+            self.source_snapshot_dir = source_snapshot_dir
+
+    ctx = _RealRunContext(mission_id, staging_dir, source_snapshot_dir)
+    observed_ready: dict = {}
+
+    def _on_ready(frame):
+        observed_ready.update(frame)
+
+    runner = WorkerRunner(
+        root=tmp_path, settings=_settings(), clock=_clock(), rag=_rag(),
+        worker_profile="improve", run_context=ctx, on_ready=_on_ready)
+    runner.run(_mission())
+
+    # ready protocol event に直接到達したこと自体を assert する
+    # (`observed_ready` が空のままなら `ready` timeout/protocol_error で
+    # `on_ready` が一度も呼ばれていない — ready 未到達の直接証拠)。
+    assert observed_ready.get("ok") is True
+    assert observed_ready["run_context"] == {
+        "mission_id": mission_id,
+        "staging_dir": str(staging_dir),
+        "source_snapshot_dir": str(source_snapshot_dir),
+    }
+```
+
+(`_settings()`/`_clock()`/`_rag()`/`_mission()` は既存 `tests/runners/test_worker_runner.py` のヘルパを import して流用する。`tests/test_improve_profile_isolation.py` に無ければ import を追加する。)
+
+- [ ] **Step 2 (旧 Step 6c): 変異テスト追加**
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M9b | `mission_worker.py` の improve 分岐で `ready` frame へ `run_context` を乗せない (診断フィールドの欠落) | `test_worker_runner_run_context_reaches_real_improve_worker` (`observed_ready["run_context"]` の参照で `KeyError` になり落ちる) |
+| M9c | `_on_ready` の呼び出しを `ok` 判定の**後**に移し、`ok=False` (mismatch 等) のときは `on_ready` が呼ばれない経路にする | `test_worker_runner_run_context_reaches_real_improve_worker` (mismatch させる変種を実装者が追加すること — 下限リスト不足、申し送り。happy path 単体では `ok=True` なので本変異は本テストでは検出されないが、`observed_ready` が空にならないことは変わらないため実害は失敗系変種でのみ顕在化する) |
+
+- [ ] **Step 3: commit** — `WorkerRunner(run_context=ctx)` を経由した実プロセス受領テスト。`src/agentic_fx/mission_worker.py` (`ready` frame への `run_context` 付与) と `src/agentic_fx/runners/worker_runner.py` (`on_ready` コールバック追加、Important 3) を本コミットに含める。A-1 (Task 1) マージ後の統合作業であることを PR 説明に明記する。
 
 ---
 
@@ -7135,6 +7408,10 @@ def test_usr_lib_and_bin_parent_together_allow_claude_exec(tmp_path):
 - [ ] `find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +` 後に再実行し green
 - [ ] 5-A〜5-G の全変異表を通し、殺し漏れが無いことを指揮者が抜き取り 2〜3 件で裏取り
 - [ ] **exec closure 1 要素 drop 表は 5-G が課金不要の範囲(`--version` exec・動的ローダ・`/proc`)を担い、実 1 ターン完走での効果測定は §8.1-47 のとおり Task 13 の継続実測 scope に残す**(申し送り⑥、更新)
+<!-- precheck 2026-08-22: T5-M10 -->
+- [ ] `uv run pytest tests/plugin/test_plugin_loader_discover_staging.py tests/tools/test_plugin_loader.py tests/plugin/test_loader.py -v`(Minor 10 — `discover` の既存単体テストは `tests/plugin/test_loader.py` にあり、5-F の green 確認コマンドから漏れていた。実測では既存テストが作る plugin ディレクトリ名 76 種は全て `^[a-z][a-z0-9_]{0,63}$` に適合するため名前正規形フィルタによる破壊は無い見込み — 本 step でそれを裏取りする)
+<!-- precheck 2026-08-22: T5-R8 -->
+- [ ] **裁定 R8**: `tests/tools/test_plugin_loader.py` の受入条件は「無変更で green」ではなく「**`:496` 付近の `expire_due` テスト 1 本を除いて無変更で green**」に読み替える — Task 8 (C-8) が同ファイルの当該テストを `exclude_kinds=("plugin",)` の新仕様 (plugin kind は `expire_due` で期限切れにならず `list_due_for_expiry` に現れる) に合わせて改訂する。Task 5 はこの 1 本には触れない (担当外)
 
 ---
 ---
@@ -7925,12 +8202,12 @@ PytestRunnerFn = Callable[[Path], GateResult]
 
 ## 執筆時の申し送り (統合者へ)
 
-1. **`PluginMeta.artifact_hash` は既定 `None` の非必須フィールド**(§5-F)。`frozen=True, slots=True` dataclass への既存 23 箇所の直接構築 (`src/agentic_fx/plugin/loader.py` 以外はすべてテスト) を壊さないための選択。Task 11 (承認・版ストア) が `artifact_hash` を必須で消費する箇所は、discover 経由の `PluginMeta` のみを前提にすること。
+1. **`PluginMeta.artifact_hash` は既定 `None` の非必須フィールド**(§5-F)。`frozen=True, slots=True` dataclass への既存 23 箇所の直接構築 (`src/agentic_fx/plugin/loader.py` 以外はすべてテスト) を壊さないための選択。Task 11 (承認・版ストア) が `artifact_hash` を必須で消費する箇所は、discover 経由の `PluginMeta` のみを前提にすること。**(Minor 11)** `PluginMeta.path` の「版実体固定」に依存する呼び出し元は少なく、リスクは低い — 実測: `src/agentic_fx/plugin/approval.py:273,300,327`・`sandbox.py:355,361,365,367`・`signal_eval.py:144`・`backtest/cli.py:322` はいずれも `meta.path` を「3 ファイルが入っているディレクトリ」として扱うだけで `plugins/<name>` であることに依存しない。`tests/` 側で `meta.path` に書き込むのは `tests/plugin/test_sandbox.py:466`(自作 `PluginMeta`)のみ。**(Minor 12)** `artifact_hash` は Task 5 では計算のみで消費者ゼロ。変異 M8 の killer (`test_discover_computes_artifact_hash_for_plain_dir`) はテスト側で同じ式を再実装しているため、実装とテストが同時にずれる変異には無力 — Task 11 が消費側を作るまで実質未検証であることを申し送る。
 2. **`_assert_allowlist_excludes_data_dir` を `mission_worker.py` から `core/landlock.py` へ移設し、シグネチャに `guarded_data_dir: Path` を明示引数化した**(§5-B)。`_guarded_data_dir()`(座標の算出そのもの)は元の docstring の独立性要求どおり `mission_worker.py` に残した。骨格 Interfaces 節はこの移設先を landlock.py と明記しているが、`_guarded_data_dir()` の去就までは指定していない — 本書の判断を記録する。
 3. **`discover(plugins_dir: Path)` に `activity: ActivityLog | None = None` を追加した**(§5-F)。§2.3 は「拒否 + activity ERROR」と言うが `discover` に activity パラメータは元々無い。必須化すると trade 経路 (`mission_worker.py`)・CLI (`backtest/cli.py`)・`service.py` の全呼び出し元を書き換える必要が生じるため、オプション引数にした。呼び出し元を activity 付きに変える (改善ループの起動時 discover に activity を渡す) かどうかは Task 9/11 の実装計画で確定すること。
-4. **`_bootstrap_improve_profile` の呼び出しシグネチャを `backend`/`mission_id`/`staging_dir`/`source_snapshot_dir`/`claude_bin`/`codex_bin` の 6 キーワード引数に変えた**(§5-D)。`main()` からの呼び出しで `settings_dict["runner"]["claude"]["bin"]` 等を参照する箇所は、**Task 1 が確定する `RunnerSettings`/`ClaudeCliSettings`/`CodexCliSettings` のキー名と完全一致するか、Task 1 完了後に実装時点で再確認すること**(骨格の同一ファイル merge 順注記どおり、Task 5 の `mission_worker.py` 変更は Task 1 (A-1) と Task 4 (A-4) の間に挟まる — 本書は Task 1 が未確定な段階で書いているため、キー名は仮のものである可能性がある)。
-5. **【レビュー1周目 C3 で更新】`worker_runner.py` の handshake フィールド追加 (`mission_id`/`staging_dir`/`source_snapshot_dir`) は骨格の同一ファイル注記どおり A-1(認証コピー)と競合する**。当初本書は handshake の辞書リテラルに 3 キーを追加するところまでを Task 5 の担当分とし、`WorkerRunner.__init__`/`run` への実引数配線は Task 9/10 が担うと想定していたが、**レビュー1周目 C3 でこの分担を確定し直した: `WorkerRunner.__init__` への `run_context: object | None = None` 追加と、`run_context` から 3 値を読んで handshake へ載せる完全実装は Task 1 が所有する** (Task 1 節 Step 33 で完結)。`ImproveLoop.prepare()` (Task 10) は `WorkerRunner(..., run_context=ctx)` の形でこの引数へ `ImproveRunContext` を渡すだけでよい。Task 5 が担当するのは、子側 (`mission_worker.py`/`_bootstrap_improve_profile`) が handshake で受け取った 3 値を Landlock 適用前に相互照合する経路のみ (5-D、変更なし)。親が送った値を子が正しく受け取ることを検証する実プロセステストを Task 5 側に 1 本追加すること (下記 5-D 節を参照)。
-6. **exec closure の 1 要素 drop 表は §5-G で課金不要の範囲 (`--version` exec・動的ローダ有無・`/proc` 有無) を実プロセスで書いた**。実 1 ターン完走 (`--output-schema` まで通す) での効果測定は §8.1-47 が「継続実測」として明記するとおり課金枠を要するため Task 13 の scope に残す。§5-G のテストは `shutil.which("claude"/"codex")` でホストに CLI が無ければ skip する — CI 環境に claude/codex CLI が導入されていない場合、この 5 本は skip されたまま Task 13 まで実測されない。Task 1 が `runner.claude.bin`/`runner.codex.bin` の config 経路を確定させたら、5-G のパス解決を `shutil.which` から設定値へ差し替えること。
+4. **`_bootstrap_improve_profile` の呼び出しシグネチャを `backend`/`mission_id`/`staging_dir`/`source_snapshot_dir`/`claude_bin`/`codex_bin` の 6 キーワード引数に変えた**(§5-D)。`main()` からの呼び出しで `settings_dict["runner"]["claude"]["bin"]` 等を参照する箇所は、**Task 1 が確定する `RunnerSettings`/`ClaudeCliSettings`/`CodexCliSettings` のキー名と完全一致するか、Task 1 完了後に実装時点で再確認すること**(骨格の同一ファイル merge 順注記どおり、Task 5 の `mission_worker.py` 変更は Task 1 (A-1) と Task 4 (A-4) の間に挟まる — 本書は Task 1 が未確定な段階で書いているため、キー名は仮のものである可能性がある)。**【着手前検証 Blocking 8 で更新】** 現物 `RunnerChoice`/`RunnerSettings` (`config.py:54-61`) には `runner.claude`/`runner.codex`/`.bin` が存在せず、旧稿の `.get()` チェーンは fail open (キー欠落時に静かに `None`) になっていた。**未決事項の間は fail closed 側に倒す** — `.get()` チェーンではなく添字アクセス (`KeyError` = fail closed) に変更した (5-D 参照)。
+5. **【レビュー1周目 C3 で更新、着手前検証 R6 で再確定】`worker_runner.py` の handshake フィールド追加 (`mission_id`/`staging_dir`/`source_snapshot_dir`) は骨格の同一ファイル注記どおり A-1(認証コピー)と競合する**。当初本書は handshake の辞書リテラルに 3 キーを追加するところまでを Task 5 の担当分とし、`WorkerRunner.__init__`/`run` への実引数配線は Task 9/10 が担うと想定していたが、**レビュー1周目 C3 でこの分担を確定し直した: `WorkerRunner.__init__` への `run_context: object | None = None` 追加と、`run_context` から 3 値を読んで handshake へ載せる完全実装は Task 1 が所有する** (Task 1 節 Step 33 で完結)。`ImproveLoop.prepare()` (Task 10) は `WorkerRunner(..., run_context=ctx)` の形でこの引数へ `ImproveRunContext` を渡すだけでよい。Task 5 が担当するのは、子側 (`mission_worker.py`/`_bootstrap_improve_profile`) が handshake で受け取った 3 値を Landlock 適用前に相互照合する経路のみ (5-D、変更なし)。**【着手前検証 Blocking 1/2 で再確定 (裁定 R6)】** 旧稿は 5-D Step 3 に `worker_runner.py:210-224` の handshake dict 断片を逐語で残しており、キー不在 vs `None` の表現で Task 1 のテストと正面衝突していた (未定義名の `NameError` も伴う)。この逐語ブロックは削除し、親が送った値を子が正しく受け取ることを検証する実プロセステストは本節末尾「5-H: Task 5 統合 step」(A-1 マージ後、B-5 本体の受入条件には含めない) へ分離した。
+6. **exec closure の 1 要素 drop 表は §5-G で課金不要の範囲 (`--version` exec・動的ローダ有無・`/proc` 有無) を実プロセスで書いた**。実 1 ターン完走 (`--output-schema` まで通す) での効果測定は §8.1-47 が「継続実測」として明記するとおり課金枠を要するため Task 13 の scope に残す。§5-G のテストは `shutil.which("claude")` でホストに CLI が無ければ skip する — CI 環境に claude/codex CLI が導入されていない場合、この 5 本は skip されたまま Task 13 まで実測されない。**【着手前検証 Blocking 9 で更新、裁定 R5】** codex は `shutil.which("codex")` 単独では実測環境で誤ったバイナリ (npm の Node シェバンラッパ) を指すことが判明した — `runner.codex.bin` は **native バイナリ** (`.../@openai/codex-linux-x64/vendor/*/bin/codex`) を指す契約であり、5-G は `_resolve_codex_native_bin()` で ELF 判定つきの解決を行う。Task 1 が `runner.claude.bin`/`runner.codex.bin` の config 経路を確定させたら、5-G のパス解決を `shutil.which`/`_resolve_codex_native_bin` から設定値へ差し替えること。
 7. **Task 6 (gate_pytest) は A-1 (`agentic_fx.runners.launcher.build_launcher_argv`) に依存するが、本書の執筆時点で A-1 は未実装**。§6-B のコード例は骨格 Interfaces 節の `build_launcher_argv` シグネチャをそのまま呼ぶ形で書いたが、A-1 の実装が確定するまで 6-B の実プロセステストは red のまま進められない。統合順序は骨格の実行グラフ (`B-6 は A-1, B-5 の後`) のとおりに従うこと。
 8. **`plugin.pytest_timeout_sec` は Task 6 が新設した config フィールド**(§6-A)。設計書 §4.2-3d は既存キーであるかのように参照しているが、現物の `PluginSettings`(`config.py:188-222`)には無かった。既定値 `300.0` は既存 `approval.py` の `_PYTEST_TIMEOUT_SEC` 定数(削除対象)と同じ値を踏襲した。
 9. **gate worker の `data/agentic.db` EACCES 確認は、親が絶対パスを argv/test 経由で子へ明示的に渡し、それでも開けないことを確認する非対称設計**(§6-B)。「知らないから開けない」のではなく「知っていても allowlist に無いから開けない」ことを pin する意図であり、統合時にこの経路を親切に allowlist へ足さないよう注意。
@@ -7952,6 +8229,18 @@ PytestRunnerFn = Callable[[Path], GateResult]
     # 塞がれている (`test_read_write_access_still_excludes_make_char_and_make_sym`
     # で pin 済み — 5-A)。次の再評価トリガーは「`/dev` 配下の書込先を
     # 拡張する変更」または「ioctl を要する新規機能の追加」。
+    ```
+    **(Minor 14)** `mission_worker.py:143-147` の巨大な allowlist 解説コメント内の `/dev` の説明 (「`/dev/urandom` のため read-only 許可」) も、上記 landlock.py 側の更新と同時に以下へ書き換える (5-D 実装時、`_bootstrap_improve_profile` の allowlist ループを新設・書き換える箇所と同じ差分で):
+    ```
+    #   /dev                 `/dev/urandom` (乱数生成) と `subprocess.DEVNULL`
+    #                        相当の `/dev/null` 書込オープン (§2.2) のため。
+    #                        **プラン10 Task 5 で read_only → read_write へ
+    #                        昇格した** (`landlock.py:80-94` の再評価コメント
+    #                        参照)。ディレクトリ単位でしか許可できない —
+    #                        `landlock.restrict_to` は対象を `O_PATH |
+    #                        O_DIRECTORY` で open するので単一ファイル
+    #                        (`/dev/urandom`) を渡すと `NotADirectoryError`
+    #                        になる (実測)
     ```
 13. **6-B′ が新設する `CandidateSnapshotError`/`check_candidate_snapshot`/`hashes_of` は骨格 Interfaces 節に名前が無い**(骨格は Task 6 の Interfaces 節で `GateResult`/`run_gate_pytest` のみを規定し、§8.1 項目 9 の「候補の read-only スナップショットのヘルパ」の具体名までは与えていない)。`# 新規命名` として本書がここで命名した — 既存コードの命名規約 (関数は snake_case、例外クラスは `<Noun>Error`)に合わせている。
 14. **【レビュー1周目 C4 で担当確定】`mission_worker.main()` の `if settings.runner.improve.backend != "local": raise RuntimeError(...)` (現行 `:398-402`) の除去は本書の scope 外**。5-D は `_bootstrap_improve_profile` に `backend` パラメータを追加し claude/codex 分岐の Landlock 配線を可能にするが、`main()` 側のこの fail-closed ガードと `LocalRunner` 直接構築を `factory.build_runner(...)` 呼び出しへ置換する専用 step は **Task 4 の Step 7d (レビュー1周目 C4) が所有する** (`factory.build_runner` 経由で 3 backend を worker から構築する契約テストも同 step に含む)。Task 5 では**意図的に触れない**(5-D の実プロセステストは `_bootstrap_improve_profile` を直接呼ぶため、このガードの存在有無に影響されない)。統合時、Task 5 完了時点では `main()` はまだ improve+claude/codex を `RuntimeError` で拒否したままで正しい (意図した現状維持) — Task 4 Step 7d 完了後にこのガードが `factory.build_runner` へ置き換わる。
