@@ -52,7 +52,7 @@ import signal
 import sys
 import sysconfig
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
 from agentic_fx.core import landlock
 from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
@@ -163,24 +163,32 @@ def _bootstrap_improve_profile(
             f"directory under workdir {workdir} — refusing to start "
             "(fail closed, 設計書 §2.2)")
 
-    execute = _exec_closure_for(
+    closure = _exec_closure_for(
         backend, claude_bin=Path(claude_bin) if claude_bin else None,
         codex_bin=Path(codex_bin) if codex_bin else None, venv_root=venv_root)
+    execute_dirs = list(closure.dirs)
     # `_exec_closure_for` の docstring どおり base_prefix は呼び出し側
     # (このモジュール) が合成する — venv の `sys.executable` が指す実体
     # (base_prefix 配下の実 python) を exec できないと venv 内 python の
     # 自己 exec が PermissionError になる (5-C 申し送り、Task 6
     # gate_pytest_worker.py の同型パターンと同じ)。
     if base_prefix != venv_root:
-        execute.append(base_prefix)
+        execute_dirs.append(base_prefix)
+
+    # PT_INTERP 解決は **Landlock 適用前・この境界で** 行う (5-C 改訂
+    # 2026-08-22, 裁定 A)。非 ELF (`#!/usr/bin/env node` 型のシェバン
+    # ラッパ等) は RuntimeError で fail closed — staging の uid/mode
+    # 検証と同じ扱い。
+    execute_files = landlock.interpreter_files_for(closure.targets)
 
     _assert_allowlist_excludes_data_dir(
-        read_only + [workdir, staging_path] + execute, guarded_data_dir=_guarded_data_dir())
+        read_only + [workdir, staging_path] + execute_dirs + execute_files,
+        guarded_data_dir=_guarded_data_dir())
     try:
         landlock.restrict_to(
             read_only_paths=read_only, read_write_paths=[workdir, staging_path,
                                                           Path("/dev")],
-            execute_paths=execute)
+            execute_paths=execute_dirs, execute_file_paths=execute_files)
     except landlock.LandlockUnavailable as e:
         raise RuntimeError(
             f"Landlock restriction failed (syscall error): {e} "
@@ -206,25 +214,53 @@ def _guarded_data_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "data"
 
 
+class ExecClosure(NamedTuple):
+    """`_exec_closure_for` の返り値 (プラン10 Task 5 5-C 改訂, 2026-08-22,
+    裁定 A)。`dirs` はディレクトリ単位で EXECUTE を与える対象、`targets` は
+    exec される実ファイル (PT_INTERP 解決の入力) — 「ディレクトリ単位の
+    EXECUTE」と「ファイル単位の EXECUTE」というマスク差 (= セキュリティ上の
+    差異) を型に残す。PT_INTERP 解決 (I/O) は `_bootstrap_improve_profile`
+    側で行う (`_exec_closure_for` 自身は I/O をしない純関数のまま)。"""
+    dirs: list[Path]
+    targets: list[Path]
+
+
 def _exec_closure_for(backend: str, *, claude_bin: Path | None,
-                      codex_bin: Path | None, venv_root: Path) -> list[Path]:
-    """§2.2 の表: 共通 = venv_root(+base_prefix は呼び出し側で合成)。
-    shell 系 (claude/codex) は /usr/bin (+実ディレクトリの /bin) を追加。
-    claude/codex はそれぞれのバイナリの親ディレクトリを追加。
-    local は共通のみ。"""
-    closure = [venv_root]
-    for p in (Path("/usr/lib"), Path("/usr/lib64")):
-        if p.exists():
-            closure.append(p)
+                      codex_bin: Path | None, venv_root: Path) -> ExecClosure:
+    """§2.2 の表。**local backend には EXECUTE をディレクトリ単位で `/usr/lib`
+    に与えない** — 与えると `/usr/lib` 配下に実体を持つ実行ファイル
+    (uutils coreutils 等) がすべて exec 可能になり、shell 遮断が無効化される
+    (実測、5-C 改訂 2026-08-22)。動的ローダは**実ファイル 1 個**を
+    `execute_file_paths` で付与する (呼び出し側が `targets` から
+    `landlock.interpreter_files_for` で解決する)。共有ライブラリの
+    mmap(PROT_EXEC) に EXECUTE は不要 (READ_FILE で足りる — `/usr/lib` は
+    read_only 側に残す)。
+
+    **claude/codex は従来どおり `/usr/lib` を含む** (裁定 4) — これらは
+    §2.1-5 により `/usr/bin` + shell を意図的に許可しており、`/usr/lib` を
+    落とすと `git submodule` (`/usr/lib/git-core/`) 等が壊れる一方、
+    得られる安全性はほぼ無い。
+
+    I/O はしない (PT_INTERP 解決は呼び出し側)。
+    """
+    dirs: list[Path] = [venv_root]                     # base_prefix は呼び出し側で合成
+    targets: list[Path] = [Path(sys.executable).resolve()]
     if backend in ("claude", "codex"):
-        closure.append(Path("/usr/bin"))
+        dirs.append(Path("/usr/bin"))
         if Path("/bin").is_dir() and not Path("/bin").is_symlink():
-            closure.append(Path("/bin"))
+            dirs.append(Path("/bin"))
+        for p in (Path("/usr/lib"), Path("/usr/lib64")):
+            if p.exists():
+                dirs.append(p)
     if backend == "claude" and claude_bin is not None:
-        closure.append(claude_bin.resolve().parent)
+        real = claude_bin.resolve()
+        dirs.append(real.parent)
+        targets.append(real)
     if backend == "codex" and codex_bin is not None:
-        closure.append(codex_bin.resolve().parent)
-    return closure
+        real = codex_bin.resolve()
+        dirs.append(real.parent)
+        targets.append(real)
+    return ExecClosure(dirs=dirs, targets=targets)
 
 
 class _RagRpcProxy:

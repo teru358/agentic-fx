@@ -19,8 +19,8 @@ def test_exec_closure_local_has_no_shell_or_cli_dirs(tmp_path):
     venv = tmp_path / "venv"; venv.mkdir()
     closure = _exec_closure_for("local", claude_bin=None, codex_bin=None,
                                 venv_root=venv)
-    assert Path("/usr/bin") not in closure
-    assert venv in closure
+    assert Path("/usr/bin") not in closure.dirs
+    assert venv in closure.dirs
 
 
 def test_exec_closure_claude_includes_usr_bin_and_bin_parent(tmp_path):
@@ -31,8 +31,8 @@ def test_exec_closure_claude_includes_usr_bin_and_bin_parent(tmp_path):
     fake_claude.write_text("")
     closure = _exec_closure_for("claude", claude_bin=fake_claude,
                                codex_bin=None, venv_root=venv)
-    assert Path("/usr/bin") in closure
-    assert fake_claude.parent in closure
+    assert Path("/usr/bin") in closure.dirs
+    assert fake_claude.parent in closure.dirs
 
 
 def test_exec_closure_codex_includes_usr_bin_and_bin_parent(tmp_path):
@@ -43,8 +43,8 @@ def test_exec_closure_codex_includes_usr_bin_and_bin_parent(tmp_path):
     fake_codex.write_text("")
     closure = _exec_closure_for("codex", claude_bin=None, codex_bin=fake_codex,
                                venv_root=venv)
-    assert Path("/usr/bin") in closure
-    assert fake_codex.parent in closure
+    assert Path("/usr/bin") in closure.dirs
+    assert fake_codex.parent in closure.dirs
 
 
 def test_exec_closure_local_excludes_claude_and_codex_bin_dirs(tmp_path):
@@ -56,16 +56,35 @@ def test_exec_closure_local_excludes_claude_and_codex_bin_dirs(tmp_path):
     fake_claude.parent.mkdir(parents=True); fake_claude.write_text("")
     closure = _exec_closure_for("local", claude_bin=fake_claude,
                                codex_bin=None, venv_root=venv)
-    assert fake_claude.parent not in closure
+    assert fake_claude.parent not in closure.dirs
 
 
-def test_exec_closure_includes_usr_lib_family_for_all_backends():
+def test_exec_closure_local_does_not_grant_usr_lib_as_an_exec_dir():
+    """5-C 改訂 (2026-08-22, 裁定 A): 旧
+    `test_exec_closure_includes_usr_lib_family_for_all_backends` の置き換え。
+    `/usr/lib` をディレクトリ単位で exec 許可すると、実体が `/usr/lib` 配下
+    にある実行ファイル (uutils coreutils 等) が芋づるで exec 可能になり
+    local backend の shell 遮断が壊れる (probe-execute-closure.md §4)。
+    **local に限った主張である** — claude/codex は §2.1-5 により `/usr/bin`
+    + shell を意図的に許可しており、`/usr/lib` を落とすと `git submodule`
+    (`/usr/lib/git-core/`) 等が壊れる (裁定 4、claude/codex は現行どおり
+    `/usr/lib` を含む)。"""
     from agentic_fx.mission_worker import _exec_closure_for
-    from pathlib import Path
+    closure = _exec_closure_for("local", claude_bin=None, codex_bin=None,
+                                venv_root=Path("/nonexistent-venv"))
+    assert Path("/usr/lib") not in closure.dirs
+    assert Path("/usr/lib64") not in closure.dirs
+
+
+def test_exec_closure_targets_include_the_running_python_for_all_backends():
+    """PT_INTERP 解決の入力 (`targets`) に必ず実行中の python が入る —
+    ここが空だとローダのファイルルールが 1 本も張られず、bootstrap 後の
+    自己 exec が `PermissionError` になる (probe 3-i-control)。"""
+    from agentic_fx.mission_worker import _exec_closure_for
     for backend in ("local", "claude", "codex"):
         closure = _exec_closure_for(backend, claude_bin=None, codex_bin=None,
                                     venv_root=Path("/nonexistent-venv"))
-        assert Path("/usr/lib") in closure
+        assert Path(sys.executable).resolve() in closure.targets
 
 
 # --- Task 5 Section 5-D: _bootstrap_improve_profile expansion -----
@@ -188,8 +207,16 @@ def test_bootstrap_improve_profile_rejects_staging_dir_mission_id_mismatch(
 
 def test_bootstrap_improve_profile_local_backend_has_no_shell_execute(
         improve_worker_layout):
-    """local backend の exec closure に `/usr/bin` が無い —
-    `/usr/bin/env` を exec しようとすると `PermissionError`。"""
+    """local backend の exec closure に `/usr/bin` が無い — **PATH 経由・
+    直接 exec のどちらでも** `/usr/bin/env` は `PermissionError`。
+
+    5-C 改訂 (2026-08-22, probe-execute-closure.md §5.2): **明示的な動的
+    ローダ起動 (`ld.so <path>`) による残余経路は本テストの対象外**
+    (§5.1 のとおり FS allowlist は execve を跨いで継承されるため
+    `data/` 到達不能は別途保たれる — この残余は FS 境界の脱出ではない)。
+    このテストは「PATH 経由・直接 exec のどちらでも shell/CLI を起動
+    できない」という水準の主張であり、「local backend は shell execute を
+    一切持たない」という、より強い主張の証拠として引用してはならない。"""
     l = improve_worker_layout
     script = """
     import os
