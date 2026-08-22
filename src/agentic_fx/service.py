@@ -229,7 +229,8 @@ def _check_cli_version(bin_path: Path) -> None:
 
     try:
         r = subprocess.run([str(bin_path), "--version"],
-                           capture_output=True, timeout=15)
+                           capture_output=True, timeout=15,
+                           stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RuntimeError(f"runner CLI --version check failed: {e}") from e
     if r.returncode != 0:
