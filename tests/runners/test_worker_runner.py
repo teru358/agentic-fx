@@ -2385,13 +2385,38 @@ def test_worker_runner_cli_started_never_sent_leaves_finally_a_no_op(
 
 def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
         monkeypatch, tmp_path):
-    """(裁定 R1/RB3、§7.1-2 の blocking 受入条件) Task 4 Step 7d の配線
-    (factory.build_runner 経由で cli_started_sink= に mission_worker の
-    _send_frame closure を渡す) が実際に機能し、fake CLI (claude backend)
-    が sleep 中に mission_worker (子、real subprocess) を SIGKILL しても、
-    親 WorkerRunner が CLI の pgid を回収し生存者 0 になることを確認する。
-    fake CLI は SIGTERM を無視するため、SIGKILL エスカレーションまで
-    実際に発火することも同時に確認する。"""
+    """(裁定 R1/RB3、§7.1-2 の blocking 受入条件、A-4 検収是正 B2)
+    Task 4 Step 7d の配線 (factory.build_runner 経由で cli_started_sink=
+    に mission_worker の _send_frame closure を渡す) が実際に機能し、
+    親 WorkerRunner が **CLI 自身の SIGKILL 死亡 (`PR_SET_PDEATHSIG`) を
+    生き延びる孫プロセス**を `_terminate_cli_pgid` で回収することを確認する。
+
+    B2 是正 (A-4 検収): 旧版は fake CLI (直接の子) 自身をマーカーの対象
+    にしていたが、launcher が設定する `PR_SET_PDEATHSIG=SIGKILL` は
+    execv を越えて残るため、mission_worker (子, real subprocess) が
+    SIGKILL された瞬間に **カーネルが fake CLI を直接 SIGKILL** してしまい、
+    `WorkerRunner._terminate_cli_pgid` を一切経由せずに旧テストが green に
+    なっていた (空振り)。`_terminate_cli_pgid` が存在する理由そのものが
+    **孫プロセスの回収** (孫は PDEATHSIG を継がない) であるため、本テストは
+    fake CLI (`fake_claude_driver.py`) 自身の直接の子プロセスとして
+    **同一 pgid・PDEATHSIG 無し**の孫を spawn させ、mission_worker を
+    SIGKILL した後にその孫が消えていることを assert する。
+
+    gcc 依存は撤去: `claude.bin` に `/usr/bin/dash` (既存の ELF、コンパイル
+    不要) を直接使う。`ClaudeRunner._build_argv` は mission_worker.py が
+    real subprocess として実行するため **cross-process monkeypatch 不能**
+    (別プロセスの `sys.modules` は独立) — 代わりに **実際の `_build_argv`
+    が組み立てる argv をそのまま dash に解釈させる**: 実装は
+    `[bin_path, "-p", mission.prompt, "--output-format", ...]` を返す
+    (`claude_runner.py:38-45`)。dash は `-p` (privileged, no-op) を自分の
+    起動オプションとして消費した後、**次の非オプション引数を「実行す
+    べきスクリプトファイル」として open+読み込みする** (`sh script
+    [args...]`, POSIX 仕様) ため、`mission.prompt` に driver スクリプトの
+    パスを仕込めば、以降の `--output-format stream-json ...` 等は単なる
+    `$1 $2 ...` の位置パラメータとして無視される (dash 自身はそれらを
+    オプションとして再解釈しない — 実測: `/bin/sh -p <file>` で確認済み)。
+    driver スクリプトは `mission.output_schema`/`--mcp-config` 等の内容を
+    一切読まない — argv の中身に依存しない。"""
     import agentic_fx.runners.worker_runner as wr_mod
 
     root = _root(tmp_path)
@@ -2402,39 +2427,32 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
     source_snapshot_dir = staging_dir / "source"
     source_snapshot_dir.mkdir(mode=0o500)
 
-    # marker は staging_dir に置く (Landlock で tmp_path がアクセス不可)
+    # marker: fake CLI (driver, 直接の子) 自身の pid を記録する
+    # (`assert marker.exists()` は「CLI が起動したか」だけを見る — B2
+    # 是正前と同じ意味論。pgid == driver の pid (session leader、
+    # `CliRunner.run()` が `start_new_session=True` で spawn するため))。
     marker = staging_dir / "fake_claude_pid"
-    # fake_claude: tiny C program that ignores SIGTERM and sleeps
-    # これは ELF バイナリなので PT_INTERP 検証を通る
-    fake_claude = staging_dir / "fake_claude"
+    # grandchild_marker: PDEATHSIG を持たない孫プロセスが自身の pid を
+    # 書く。この孫が「回収されずに生き残る」かどうかが B2 の観測点。
+    grandchild_marker = staging_dir / "fake_claude_grandchild_pid"
 
-    # C code for fake CLI
-    c_code = f"""
-#include <stdio.h>
-#include <signal.h>
-#include <unistd.h>
-#include <stdlib.h>
+    driver_script = staging_dir / "fake_claude_driver.sh"
+    driver_script.write_text(
+        "trap '' TERM\n"
+        f"echo $$ > {str(marker)!r}\n"
+        # 孫: 別プロセスとして `dash -c` を fork (setsid しないので同じ
+        # pgid に留まり、PDEATHSIG も継がない — 孫は自分で prctl を
+        # 呼んでいない)。孫自身も SIGTERM を無視し、SIGKILL への
+        # エスカレーションが実際に発火することを確認する観測対象にする。
+        f"/usr/bin/dash -c 'trap \"\" TERM; exec /usr/bin/sleep 600' &\n"
+        f"echo $! > {str(grandchild_marker)!r}\n"
+        "wait\n")
+    driver_script.chmod(0o500)
 
-int main() {{
-    signal(SIGTERM, SIG_IGN);
-    FILE *f = fopen("{marker}", "w");
-    fprintf(f, "%d\\n", getpid());
-    fclose(f);
-    sleep(600);
-    return 0;
-}}
-"""
-
-    # Compile C code to ELF binary
-    c_source = staging_dir / "fake_claude.c"
-    c_source.write_text(c_code)
-    import subprocess as subprocess_module
-    result = subprocess_module.run(
-        ["gcc", "-O2", "-o", str(fake_claude), str(c_source)],
-        capture_output=True, timeout=10)
-    if result.returncode != 0:
-        pytest.skip(f"gcc not available or compilation failed: {result.stderr.decode()}")
-    c_source.unlink()  # Remove source file
+    # claude.bin には既存の ELF (dash) を直接使う — gcc も shebang script
+    # も不要。dash に「-p <driver_script>」を渡すと script として実行する
+    # (docstring 参照)。
+    fake_claude_bin = Path("/usr/bin/dash")
 
     creds = tmp_path / ".credentials.json"
     creds.write_text('{"token":"x"}')
@@ -2445,7 +2463,7 @@ int main() {{
             "improve": SETTINGS.runner.improve.model_copy(
                 update={"backend": "claude"}),
             "claude": SETTINGS.runner.claude.model_copy(update={
-                "bin": str(fake_claude), "credentials_file": str(creds)}),
+                "bin": str(fake_claude_bin), "credentials_file": str(creds)}),
         }),
         "worker": SETTINGS.worker.model_copy(update={
             "worker_startup_timeout_sec": 10.0, "worker_grace_sec": 5.0}),
@@ -2472,7 +2490,11 @@ int main() {{
     runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
                           rag=_rag(tmp_path), worker_profile="improve",
                           run_context=_RunContext())
-    mission = Mission(prompt="p", tools=[], output_schema={"type": "object"},
+    # `mission.prompt` は `_build_argv` によって `["-p", mission.prompt, ...]`
+    # として argv に載る — dash はこれを「実行すべきスクリプトファイル」
+    # として open する (docstring 参照)。
+    mission = Mission(prompt=str(driver_script), tools=[],
+                      output_schema={"type": "object"},
                       max_turns=1, timeout_sec=120.0)
 
     thread = threading.Thread(target=lambda: runner.run(mission))
@@ -2485,6 +2507,13 @@ int main() {{
         "(cli_started 配線が mission_worker.py に届いていない可能性)")
     cli_pid = int(marker.read_text())
 
+    # 孫プロセスが実際に起動 (自身の pid を書く) するまで待つ — これが
+    # 出現していないと「孫が生き残った」ことの検査自体が成立しない。
+    deadline = time.monotonic() + 20.0
+    while not grandchild_marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert grandchild_marker.exists(), "孫プロセスが起動しなかった"
+
     # cli_pid が判明した以降は assert 失敗時にも必ず孤児回収まで到達させる。
     try:
         # SIGTERM ハンドラ設定完了を待つ必要はない (fake_claude は SIGTERM 無視)。
@@ -2492,6 +2521,9 @@ int main() {{
         thread.join(timeout=20.0)
         assert not thread.is_alive(), "runner.run() が終わらない"
 
+        # PDEATHSIG は fake CLI 自身 (直接の子) には即座に届く — ここでは
+        # 孫の生死だけを観測点にする (B2: 孫の回収は
+        # `_terminate_cli_pgid` の killpg(pgid) を経由しないと起きない)。
         deadline = time.monotonic() + 8.0
         alive = True
         while time.monotonic() < deadline:
@@ -2501,7 +2533,9 @@ int main() {{
                 alive = False
                 break
             time.sleep(0.05)
-        assert not alive, "fake claude CLI の pgid が SIGKILL へ昇格して回収されず生存している"
+        assert not alive, (
+            "fake claude CLI の pgid (孫プロセス含む) が SIGKILL へ昇格して"
+            "回収されず生存している (B2)")
     finally:
         # テストが落ちても SIGTERM 無視プロセスを孤児として残さない。
         try:

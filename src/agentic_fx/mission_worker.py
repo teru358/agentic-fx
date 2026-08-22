@@ -51,6 +51,8 @@ import os
 import signal
 import sys
 import sysconfig
+import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
@@ -63,6 +65,12 @@ from agentic_fx.core.mission_protocol import (
 # monkeypatch を可能にするため module level import (test 側から
 # `mw_mod.runner_factory` として属性差し替え)。
 from agentic_fx.runners import factory as runner_factory
+# A-4 検収是正 (2026-08-22, B1): McpShimDispatcher の module level import。
+# `_start_mcp_dispatcher` から使う。ToolRegistry も同様に module level へ
+# 上げる (`_build_improve_registry` の型注釈・既定実装で使うため — 従来
+# `_run_improve_mission` 内の関数内 import だったものを引き上げた)。
+from agentic_fx.tools.mcp_shim import McpShimDispatcher
+from agentic_fx.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from agentic_fx.core.contracts import Clock
@@ -370,16 +378,64 @@ def _protect_protocol_stdout() -> Any:
     return protocol_out
 
 
+def _build_improve_registry(*, settings: Any, workdir: Path) -> ToolRegistry:
+    """improve profile 用 `ToolRegistry` の構築 seam (A-4 検収是正、裁定 R-D2)。
+
+    本来の構築は `build_mission_registry("improve", staging_dir=...,
+    source_snapshot_dir=..., rpc=<親への RPC client>)` (R-D2) — RPC client
+    経由で `run_backtest`/`analyze_corr` 等 (C-7) を親へ委譲する形になる。
+    その拡張シグネチャと RPC client の配線は **Task 10 の担当**であり、
+    Task 4 (A-4) の時点ではまだ揃っていない (`build_mission_registry` の
+    現物シグネチャは `conn`/`rag`/`activity` 等 trade 専用の必須引数を
+    要求し、improve 子プロセスはそれらを持たない — 防御層① 接続情報の
+    非提供、モジュール冒頭の docstring 参照)。
+
+    そのため本関数を「呼び出し口」として切り出す — Task 10 は
+    `_run_improve_mission` 側を変えず、この関数の中身だけを
+    `build_mission_registry("improve", ...)` へ差し替えればよい。
+    Task 4 時点では最小の空 `ToolRegistry()` を返す (「空でない registry を
+    注入できる seam」— テストは本関数を monkeypatch して非空 registry を
+    注入できる、既定は空)。
+    """
+    return ToolRegistry()
+
+
+def _start_mcp_dispatcher(*, workdir: Path, registry: ToolRegistry) -> McpShimDispatcher:
+    """improve worker 側の Unix socket dispatcher を起動する
+    (A-4 検収是正 Step 7a/7b、設計書 §1.6)。
+
+    `sock_path` は `workdir / "afx.sock"` — CLI 側 (`CliRunner.run` /
+    `cli_runner.py:88`) が `self._workdir / "afx.sock"` として**同じ
+    `workdir` から独立に**導出するパスと、両者が同じ `workdir` を共有する
+    ことで一致する (B1 是正: どちらの式も `<workdir>/afx.sock` であり、
+    `workdir` は `factory.build_runner(..., workdir=workdir)` 経由で
+    `_run_improve_mission` と `CliRunner.__init__` の両方に同一の値が渡る
+    — 引数として明示的に転送する経路は無いが、式の一致で保証される)。
+    """
+    sock_path = workdir / "afx.sock"
+    dispatcher = McpShimDispatcher(
+        sock_path=sock_path, registry=registry, allowed=registry.names())
+    thread = threading.Thread(target=dispatcher.serve_forever, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 3.0
+    while not sock_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return dispatcher
+
+
 def _run_improve_mission(
     *, settings: Any, workdir: Path,
     protocol_out: Any = None, out_seq: Any = None
 ) -> Any:
-    """improve profile での runner 構築・Mission 実行 (Step 7d)。
+    """improve profile での runner 構築・Mission 実行 (Step 7d + A-4 検収
+    是正 Step 7a/7b)。
 
-    factory.build_runner 経由で backend (local/claude/codex) を選択し、
-    runner を構築する。unit test は protocol_out/out_seq をデフォルト
-    None で呼び出し、monkeypatch で factory.build_runner を spy する。
-    main() は実際の値を渡し、返された runner を run する。
+    `_build_improve_registry` で registry を組み立て、`_start_mcp_dispatcher`
+    で同じ `workdir` に `afx.sock` を bind してから、factory.build_runner
+    経由で backend (local/claude/codex) を選択し runner を構築する。
+    unit test は protocol_out/out_seq をデフォルト None で呼び出し、
+    monkeypatch で factory.build_runner (と必要なら `_build_improve_registry`)
+    を spy/差し替えする。main() は実際の値を渡し、返された runner を run する。
 
     :param settings: Settings インスタンス
     :param workdir: Mission 実行用 workdir (Landlock rw 許可範囲)
@@ -387,9 +443,8 @@ def _run_improve_mission(
     :param out_seq: SeqTracker インスタンス (protocol_out 送信時に採番用)
     :return: AgentRunner インスタンス
     """
-    from agentic_fx.tools.registry import ToolRegistry
-
-    registry = ToolRegistry()
+    registry = _build_improve_registry(settings=settings, workdir=workdir)
+    _start_mcp_dispatcher(workdir=workdir, registry=registry)
     on_message = _make_on_message(protocol_out, out_seq)
     runner = runner_factory.build_runner(
         "improve", settings, registry, workdir=workdir,

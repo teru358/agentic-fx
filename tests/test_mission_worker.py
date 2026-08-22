@@ -553,3 +553,87 @@ def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
         # precheck 2026-08-22 pass2: RB3 — cli_started_sink も callable として
         # 配線されていることを assert する (§7.1-2 の受入条件、裁定 R1)。
         assert callable(captured["cli_started_sink"]), f"backend={backend}"
+
+
+# --- A-4 検収是正 (2026-08-22, B1): Step 7 Unix socket dispatcher -----
+
+def test_run_improve_mission_binds_mcp_dispatcher_and_serves_registry_tool(
+        monkeypatch, tmp_path):
+    """B1 是正: mission_worker の improve 分岐が `workdir/afx.sock` を bind
+    し、`mcp_shim` からの `tools/call` を注入された registry の実 tool へ
+    配線すること (`ToolRegistry.execute` まで到達すること) を実 socket で
+    確認する。`_build_improve_registry` を monkeypatch して非空 registry を
+    注入できることも同時に pin する (「空でない registry を注入できる
+    seam」— A-4 是正の要求)。"""
+    import json
+    import socket as socket_mod
+
+    import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.tools.registry import ToolDef, ToolRegistry
+
+    def _echo(x: int) -> dict:
+        return {"echo": x}
+
+    fake_registry = ToolRegistry()
+    fake_registry.register(ToolDef(
+        name="echo_tool", description="d",
+        parameters={"type": "object", "properties": {"x": {"type": "integer"}}},
+        func=_echo))
+
+    monkeypatch.setattr(
+        mw_mod, "_build_improve_registry",
+        lambda *, settings, workdir: fake_registry)
+
+    class _Fake:
+        def run(self, mission):
+            from agentic_fx.runners.base import MissionResult
+            return MissionResult("completed", {}, [])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mw_mod.runner_factory, "build_runner",
+                        lambda *a, **kw: _Fake())
+
+    settings = _settings_with_improve_backend("local")
+    mw_mod._run_improve_mission(
+        settings=settings, workdir=tmp_path, protocol_out=None, out_seq=None)
+
+    sock_path = tmp_path / "afx.sock"
+    assert sock_path.exists(), "afx.sock が bind されていない (B1)"
+
+    with socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM) as s:
+        s.connect(str(sock_path))
+        s.sendall((json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "echo_tool", "arguments": {"x": 9}},
+        }) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        resp = json.loads(buf.decode())
+    content = resp["result"]["content"]
+    payload = json.loads(content[0]["text"])
+    assert payload == {"echo": 9}
+
+
+def test_run_improve_mission_claude_backend_workdir_matches_dispatcher_socket(
+        tmp_path):
+    """Step 7b: `CliRunner._build_argv` が使う `mcp_socket`
+    (`self._workdir / "afx.sock"`, `cli_runner.py:88`) と mission_worker が
+    bind したパス (`_start_mcp_dispatcher` の `workdir / "afx.sock"`) が、
+    同一の `workdir` から独立に導出されて一致することを pin する。backend
+    を `claude` にして `factory.build_runner` を実際に通し (mock しない)、
+    構築された `ClaudeRunner` (`CliRunner` の `_workdir` を保持) が呼び出し
+    元と同じ `workdir` を持つこと、かつ dispatcher が同じ場所へ bind 済み
+    であることを確認する (実 CLI は起動しない — `.run()` は呼ばない)。"""
+    import agentic_fx.mission_worker as mw_mod
+
+    settings = _settings_with_improve_backend("claude")
+    runner = mw_mod._run_improve_mission(
+        settings=settings, workdir=tmp_path, protocol_out=None, out_seq=None)
+    assert runner._workdir == tmp_path
+    assert (tmp_path / "afx.sock").exists()
