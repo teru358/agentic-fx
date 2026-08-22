@@ -14,7 +14,12 @@ from pathlib import Path
 
 import pytest
 
+from agentic_fx.core.landlock import is_available
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+pytestmark = pytest.mark.skipif(
+    not is_available(), reason="Landlock not available on this kernel/architecture")
 
 
 def _mk_repo_layout(tmp_path: Path) -> dict:
@@ -100,8 +105,6 @@ def _run_probe(script: str, *, staging_dir: Path, mission_id: str,
 # Landlock は存在を隠さない (ENOENT にはならない) — 拒否は常に EACCES(13)。
 
 def test_invariant1_cannot_open_agentic_db(tmp_path):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     layout = _mk_repo_layout(tmp_path)
     db_path = layout["root"] / "data" / "agentic.db"
     script = f"""
@@ -116,8 +119,6 @@ def test_invariant1_cannot_open_agentic_db(tmp_path):
 
 
 def test_invariant1_cannot_listdir_data(tmp_path):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     layout = _mk_repo_layout(tmp_path)
     data_dir = layout["root"] / "data"
     script = f"""
@@ -133,8 +134,6 @@ def test_invariant1_cannot_listdir_data(tmp_path):
 
 
 def test_invariant1_cannot_truncate_agentic_db(tmp_path):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     layout = _mk_repo_layout(tmp_path)
     db_path = layout["root"] / "data" / "agentic.db"
     script = f"""
@@ -152,8 +151,6 @@ def test_invariant1_cannot_truncate_agentic_db(tmp_path):
 # --- 不変条件 2: 書込可能パスは staging/workdir/dev のみ --------------------
 
 def test_invariant2_cannot_listdir_plugins_root(tmp_path):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     """`plugins/` 自体は worker から不可視 — 最強の単一 assertion
     (どの allowlist にも `plugins/` 自体は入らない、§2.3)。"""
     layout = _mk_repo_layout(tmp_path)
@@ -171,8 +168,6 @@ def test_invariant2_cannot_listdir_plugins_root(tmp_path):
 
 
 def test_invariant2_own_staging_is_writable(tmp_path):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     """positive control: 自分の staging には書ける。"""
     layout = _mk_repo_layout(tmp_path)
     script = f"""
@@ -188,8 +183,6 @@ def test_invariant2_own_staging_is_writable(tmp_path):
 
 
 def test_invariant2_other_missions_staging_is_unreachable(tmp_path):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     """他 Mission の staging (`_staging/m-002/`) には到達できない —
     staging を Mission id で分けず共有にする変異の killer (§2 変異表)。"""
     layout = _mk_repo_layout(tmp_path)
@@ -206,8 +199,6 @@ def test_invariant2_other_missions_staging_is_unreachable(tmp_path):
 
 
 def test_invariant2_reports_dir_is_unreachable(tmp_path):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     layout = _mk_repo_layout(tmp_path)
     script = f"""
     import os
@@ -224,8 +215,6 @@ def test_invariant2_reports_dir_is_unreachable(tmp_path):
 # --- 不変条件 3: 従量課金経路が無い (env に鍵が無い) -------------------------
 
 def test_invariant3_no_billing_keys_in_environ(tmp_path):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     """`os.environ` 自体を子の中で検査する (`/proc` 経由ではない —
     `/proc` は claude backend のときしか allowlist に無いため、
     `/proc/self/environ` を読む形で書くと codex/local では検査自体が
@@ -263,8 +252,6 @@ def test_invariant3_no_billing_keys_in_environ(tmp_path):
 # --- 不変条件 4: 個人設定を継承しない -----------------------------------
 
 def test_invariant4_home_is_scratch_not_real_home(tmp_path):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     """**(着手前検証 Blocking 6 修正) 撤回する主張**: 同じ理由 (上記
     `test_invariant3_no_billing_keys_in_environ` 参照) で、この
     テストが渡す `HOME` はテスト自身が組み立てた値であり、production
@@ -290,8 +277,6 @@ def test_invariant4_home_is_scratch_not_real_home(tmp_path):
 
 
 def test_invariant4_real_claude_home_is_unreachable(tmp_path):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     layout = _mk_repo_layout(tmp_path)
     real_home = Path.home()
     if not (real_home / ".claude").exists():
@@ -319,8 +304,6 @@ def test_invariant4_real_claude_home_is_unreachable(tmp_path):
     ".history.git",
 ])
 def test_item12_privileged_plugin_subdirs_are_unreachable(tmp_path, subpath):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     layout = _mk_repo_layout(tmp_path)
     target = layout["root"] / "plugins" / subpath
     script = f"""
@@ -340,8 +323,6 @@ def test_item12_privileged_plugin_subdirs_are_unreachable(tmp_path, subpath):
     ".locks", ".history.git", "approved_indicator",
 ])
 def test_item12_privileged_plugin_subdirs_are_not_writable(tmp_path, subpath):
-    pytest.importorskip("agentic_fx.core.landlock").is_available() or pytest.skip(
-        "Landlock not available")
     """非可視だけでなく非書込であることも別軸で pin する
     (readdir を拒否されても write が別経路で通る実装ミスを検出)。"""
     layout = _mk_repo_layout(tmp_path)

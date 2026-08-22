@@ -141,6 +141,28 @@ def test_discover_rejects_symlink_with_mismatched_name_in_target(tmp_path):
     assert metas == []
 
 
+def test_discover_rejects_symlink_whose_target_name_differs_even_when_hash_is_correct(
+        tmp_path):
+    """(実装時追加、変異表は下限 — mutation-ledger-task5.md 5-F M4 参照)
+    `test_discover_rejects_symlink_with_mismatched_name_in_target` は版
+    ディレクトリ名を `"b"*64`(実 hash と不一致)にしているため、`<name>`
+    一致検査を削除する変異 (M4) を注入しても hash 照合が独立に reject して
+    しまい、当該テストは生存判定できない (実測確認済み)。ここでは
+    版ディレクトリ名を**正しい** artifact_hash にし、`<name>` 成分だけを
+    symlink 自身の名前と食い違わせる — hash 照合を通過させ、`<name>` 一致
+    検査だけを唯一の reject 根拠にする (Blocking 11 が M3→M6 に施した
+    修正と同型)。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    real_hash = _artifact_hash(INDICATOR_PY, CONFIG_YAML, TEST_PY)
+    version_dir = plugins_dir / ".versions" / "other" / real_hash
+    _write_plugin_files(version_dir)
+    (plugins_dir / "ind").symlink_to(
+        Path(".versions") / "other" / real_hash, target_is_directory=True)
+    metas = discover(plugins_dir)
+    assert metas == []
+
+
 def test_discover_rejects_directory_name_artifact_hash_mismatch(tmp_path):
     """版ディレクトリ名 (= artifact_hash) と実計算が不一致なら拒否
     (in-place 編集の検出)。"""
