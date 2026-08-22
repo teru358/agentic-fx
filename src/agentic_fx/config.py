@@ -280,6 +280,10 @@ class PluginSettings(_Strict):
     # since_hours はこの値を超えてはならない (ToolDef スキーマの maximum
     # + 関数側クランプの二重防御 — 詳細は tools/signal_tools.py)。
     signals_max_lookback_hours: int = Field(ge=1, default=24)
+    # gate pytest (プラン10 Task 6) の待ち上限。既存 approval.py の
+    # `_PYTEST_TIMEOUT_SEC = 300.0` と同じ既定値を config 化する
+    # (submit/bless の pytest 実行と改善ループの候補ゲートが共有)。
+    pytest_timeout_sec: float = Field(gt=0, default=300.0)
 
 
 class WorkerSettings(_Strict):
