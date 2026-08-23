@@ -25,6 +25,7 @@ from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA  # precheck 2026-08-22 wave2: T10-B12
 from agentic_fx.runners.base import Mission
+from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
 from agentic_fx.store import missions as missions_store
@@ -47,6 +48,12 @@ class _InspectionVerdict:  # 新規命名
     reason: str = ""
     out_of_partition: bool = False
     risk_gate_unsupported: bool = False
+
+
+@dataclass(frozen=True)
+class _SelectionOutcome:  # 新規命名
+    won: bool
+    backlog_id: int | None
 
 
 def _artifact_hash_of(plugin_py: bytes, config_yaml: bytes,
@@ -368,6 +375,82 @@ class ImproveLoop:
                 risk_gate_unsupported=True)
 
         return _InspectionVerdict(ok=True, out_of_partition=out_of_partition)
+
+    # precheck 2026-08-22 wave2: T10-B5 T10-M10 T10-M11
+    def _select_and_bind(self, conn, output: dict, ctx: ImproveRunContext,
+                         *, now: datetime) -> _SelectionOutcome:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            limit = self._settings.improve.max_new_backlog_per_mission
+            inserted = 0  # precheck 2026-08-22 wave2: T10-M10 — 上限は挿入件数
+                          # で数える (enumerate インデックスは重複 skip の分だけ
+                          # ずれる)
+            dropped = 0
+
+            def _norm(idea: str) -> str:
+                # precheck 2026-08-22 wave2: T10-M11 — SQL 側 lower(trim(idea))
+                # と同じ「前後空白のみ除去」に揃える (内部空白は畳まない)
+                return idea.strip().lower()
+
+            for d in output.get("discoveries", []):
+                idea_norm = _norm(d["idea"])
+                dup = conn.execute(
+                    "SELECT id FROM improvement_backlog WHERE "
+                    "lower(trim(idea))=?", (idea_norm,)).fetchone()
+                if dup is not None:
+                    continue
+                if inserted >= limit:
+                    dropped += 1
+                    continue
+                conn.execute(
+                    "INSERT INTO improvement_backlog (idea, source, status, "
+                    "created_at, updated_at) VALUES (?,?,'open',?,?)",
+                    (d["idea"], d.get("source", "agent"), now.isoformat(),
+                     now.isoformat()))
+                inserted += 1
+            if dropped:
+                self._activity.write(
+                    Category.IMPROVE, "backlog_limit_exceeded",
+                    f"mission={ctx.mission_id} dropped={dropped}")
+
+            selected = output.get("selected", {})
+            backlog_id = selected.get("backlog_id")
+            if backlog_id is None:
+                selected_idea = selected.get("idea", "")
+                idea_norm = _norm(selected_idea)
+                row = conn.execute(
+                    "SELECT id FROM improvement_backlog WHERE "
+                    "lower(trim(idea))=? AND status IN ('open','observation')",
+                    (idea_norm,)).fetchone()
+                if row is None:
+                    # precheck 2026-08-22 wave2: T10-B5 — discoveries にも
+                    # 既存 backlog にも無い「新規 idea を選択」した場合は、
+                    # ここで improvement_backlog へ INSERT してから選ぶ
+                    # (docstring が謳う契約。test_new_idea_selected_creates_
+                    # and_binds_in_same_tx が要求する)。空文字は選択なしとして
+                    # 扱う (fail closed — 実在しない idea を勝者にしない)。
+                    if not selected_idea.strip():
+                        conn.commit()
+                        return _SelectionOutcome(won=False, backlog_id=None)
+                    cur = conn.execute(
+                        "INSERT INTO improvement_backlog (idea, source, status, "
+                        "created_at, updated_at) VALUES (?,?,'open',?,?)",
+                        (selected_idea, selected.get("source", "agent"),
+                         now.isoformat(), now.isoformat()))
+                    backlog_id = cur.lastrowid
+                else:
+                    backlog_id = row["id"]
+
+            won = backlog_store.select_for_mission(
+                conn, backlog_id, now=now, commit=False)
+            if won:
+                improve_runs_store.bind_backlog(
+                    conn, ctx.run_id, backlog_id, commit=False)
+            conn.commit()
+            return _SelectionOutcome(won=won, backlog_id=backlog_id if won else None)
+        except BaseException:
+            conn.rollback()
+            raise
 
     def commit(self, *, mission, ctx, result, now):
         raise NotImplementedError  # 10.4〜10.11 節

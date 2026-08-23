@@ -99,6 +99,41 @@ def loop_and_ctx(loop_min, conn, tmp_path):
 
 
 @pytest.fixture
+def loop_and_ctx_with_open_backlog(loop_min, conn, tmp_path, clock):
+    """`loop_and_ctx` を拡張し、open status の backlog 行と実際の run 行を
+    1 件ずつ作成して返す (10.5 の _select_and_bind テスト用)。"""
+    staging_dir = tmp_path / "staging"
+    source_snapshot_dir = tmp_path / "source"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    source_snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    # backlog 行を複数作成 (パターンマッチに引っかからないもので準備)
+    conn.execute(
+        "INSERT INTO improvement_backlog (id, idea, source, status, created_at, "
+        "updated_at) VALUES (999, 'out-of-partition-idea', 'user', 'open', ?, ?)",
+        (NOW.isoformat(),) * 2)
+    # open status の backlog を 1 件追加 (テスト用に使う)
+    backlog_id = backlog_store.add(conn, "selectable-idea", "user", NOW)
+
+    # 実際の mission/run を作成
+    mission_id = missions_store.start(
+        conn, "improve", loop_min._settings.runner.improve.backend,
+        loop_min._settings.runner.improve.model, now=NOW, commit=False)
+    run_id = improve_runs_store.start(
+        conn, backlog_id=None, mission_id=mission_id, now=NOW, commit=False)
+    conn.commit()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
+        "run_backtest": 600.0, "analyze_corr": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=source_snapshot_dir,
+        allowed_backlog_ids=frozenset({1, 2}),
+        slot_key=None, ledger=ledger, rpc_handlers={})
+    return loop_min, ctx, conn, backlog_id
+
+
+@pytest.fixture
 def mission_and_run_fixture(conn, clock):
     """`missions`+`improvement_backlog`+`improvement_runs` の最小行を作り
     `(mission_id, run_id, backlog_id)` を返す (slot 無し = 手動 one-shot 相当)。"""
