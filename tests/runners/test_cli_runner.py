@@ -67,6 +67,11 @@ _SLEEP_AND_SPAWN_GRANDCHILD = (
     "time.sleep(600)\n"
 )
 _PRINT_ANSWER_AND_EXIT = "import json\nprint(json.dumps({'answer': 4}))\n"
+_SPAWN_GRANDCHILD_THEN_ANSWER = (
+    "import json, subprocess, sys\n"
+    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+    "print(json.dumps({'answer': 4}))\n"
+)
 _IGNORE_SIGTERM_SLEEP = (
     "import signal, time\n"
     "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
@@ -127,6 +132,47 @@ def test_cli_runner_completed_leaves_no_pgid_survivors(tmp_path):
     assert result.output == {"answer": 4}
     assert "pgid" in seen_pgid
     assert _no_process_group_members(seen_pgid["pgid"])
+
+
+def test_cli_runner_completed_with_grandchild_still_reaps_pgid_quickly(tmp_path):
+    """段 0 M2 pin: `proc.poll()` (`cli_runner.py:142`) が completed 経路で
+    CLI 自身を先に reap しても、`_terminate_pgid` は `killpg(pgid, ...)` で
+    グループ全体 (孫を含む) を回収する — `proc` の生死を経由しない。CLI
+    自身は即座に exit するが、孫 (同じ pgid で背景に残る sleep) を
+    spawn してから answer を print する fake CLI で completed 経路を踏む。
+
+    段 0 変異スイープ (stage0-bundle-A.md §2.1) の指摘: 既存の
+    `test_cli_runner_completed_leaves_no_pgid_survivors` は孫を作らない
+    fake CLI しか使っておらず、「completed でも孫を確実に回収する」という
+    `cli_runner.py:146` のコメントの主張を検証できていなかった。`_terminate_pgid`
+    の `os.killpg(pgid, signal.SIGTERM)` を `os.kill(proc.pid, signal.SIGTERM)`
+    (シグナル送出先をプロセス単体に落とす変異) に変えると、`proc` は
+    `proc.poll()` で既に reap 済みのため `ProcessLookupError` → 早期
+    `return` に落ち、孫が回収されずに `t_out.join(5.0)`/`t_err.join(5.0)`
+    まで待たされる (約 10 秒) — 変異ありなしの両方で `status == "completed"`
+    のまま区別が付かないため、`elapsed` と孫の生存有無の両方を assert する。
+    """
+    seen_pgid: dict[str, int] = {}
+    real_popen = subprocess.Popen
+
+    def spying_popen(*a, **kw):
+        p = real_popen(*a, **kw)
+        seen_pgid["pgid"] = os.getpgid(p.pid)
+        return p
+
+    runner = _new_runner(
+        _SPAWN_GRANDCHILD_THEN_ANSWER, tmp_path, popen=spying_popen)
+    start = time.monotonic()
+    result = runner.run(_mission())
+    elapsed = time.monotonic() - start
+    assert result.status == "completed"
+    assert result.output == {"answer": 4}
+    assert "pgid" in seen_pgid
+    assert _no_process_group_members(seen_pgid["pgid"]), (
+        "completed 経路で孫プロセスが pgid に生存している (M2)")
+    assert elapsed < 2.0, (
+        f"孫の回収が早期 return で skip され reader thread の join(5.0)×2 "
+        f"待ちに落ちている (実測 {elapsed:.2f}s)")
 
 
 def test_cli_runner_timeout_kills_pgid_including_grandchildren(tmp_path):

@@ -1,6 +1,7 @@
 """Mission worker child process tests (プラン10 Task 5)."""
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
@@ -492,3 +493,286 @@ def test_usr_lib_and_bin_parent_together_allow_claude_exec(tmp_path):
         read_write_paths=[scratch, Path("/dev")], env=env)
     assert "EXEC_PERMISSION_ERROR" not in result.stdout
     assert result.returncode == 0, result.stderr
+
+
+# --- Task 4 Step 7d: factory.build_runner via dispatcher -----
+
+def _settings_with_improve_backend(backend):
+    """プラン10 Task4, Step 7d の test helper: improve backend を
+    指定した Settings を返す。"""
+    from agentic_fx.config import load_settings
+    settings = load_settings(
+        Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example")
+    return settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": backend}),
+        }),
+    })
+
+
+def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
+        monkeypatch, tmp_path):
+    """レビュー1周目 C4: improve backend が claude/codex でも
+    `factory.build_runner` 経由で runner が構築されること (fake CLI、
+    実 LLM 不要)。旧ガード (`backend != "local"` で RuntimeError) が
+    残っていれば claude/codex パラメータで red になる。"""
+    import agentic_fx.mission_worker as mw_mod
+
+    captured = {}
+
+    def spy(profile, settings, registry, *, workdir, on_message=None,
+            cli_started_sink=None):
+        captured["profile"] = profile
+        captured["backend"] = getattr(
+            getattr(settings.runner, profile, None), "backend", None)
+        captured["on_message"] = on_message
+        # precheck 2026-08-22 pass2: RB3 — cli_started_sink= が
+        # build_runner まで届いていることを pin する。
+        captured["cli_started_sink"] = cli_started_sink
+        # 実 CLI/実 LLM を起動しない fake を返す — 構築経路の到達のみ確認する。
+        class _Fake:
+            def run(self, mission):
+                from agentic_fx.runners.base import MissionResult
+                return MissionResult("completed", {}, [])
+            def close(self):
+                pass
+        return _Fake()
+
+    monkeypatch.setattr(mw_mod.runner_factory, "build_runner", spy)
+    
+    for backend in ["local", "claude", "codex"]:
+        captured.clear()
+        settings = _settings_with_improve_backend(backend)
+        mw_mod._run_improve_mission(
+            settings=settings, workdir=tmp_path, protocol_out=None, out_seq=None)
+        assert captured["profile"] == "improve", f"backend={backend}"
+        assert captured["backend"] == backend, f"backend={backend}"
+        # 3 周目レビュー Important-1: on_message が callable として配線されている
+        # ことを assert する — 落とすと transcript/event 転送が全 backend で失われる。
+        assert callable(captured["on_message"]), f"backend={backend}"
+        # precheck 2026-08-22 pass2: RB3 — cli_started_sink も callable として
+        # 配線されていることを assert する (§7.1-2 の受入条件、裁定 R1)。
+        assert callable(captured["cli_started_sink"]), f"backend={backend}"
+
+
+# --- A-4 検収是正 (2026-08-22, B1): Step 7 Unix socket dispatcher -----
+
+def test_run_improve_mission_binds_mcp_dispatcher_and_serves_registry_tool(
+        monkeypatch, tmp_path):
+    """B1 是正: mission_worker の improve 分岐が `workdir/afx.sock` を bind
+    し、`mcp_shim` からの `tools/call` を注入された registry の実 tool へ
+    配線すること (`ToolRegistry.execute` まで到達すること) を、
+    `python -m agentic_fx.tools.mcp_shim <sock>` の**実プロセス**を fake
+    mcp_shim クライアントとして起動し確認する (プランの Step 7 文言
+    「fake mcp_shim クライアントが socket 経由で tools/call を投げ、
+    registry の fake tool が実行される」に合わせる — advisor 指摘 #4)。
+    `_build_improve_registry` を monkeypatch して非空 registry を注入
+    できることも同時に pin する (「空でない registry を注入できる seam」
+    — A-4 是正の要求)。"""
+    import json
+    import subprocess as subprocess_mod
+
+    import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.tools.registry import ToolDef, ToolRegistry
+
+    def _echo(x: int) -> dict:
+        return {"echo": x}
+
+    fake_registry = ToolRegistry()
+    fake_registry.register(ToolDef(
+        name="echo_tool", description="d",
+        parameters={"type": "object", "properties": {"x": {"type": "integer"}}},
+        func=_echo))
+
+    monkeypatch.setattr(
+        mw_mod, "_build_improve_registry",
+        lambda *, settings, workdir: fake_registry)
+
+    class _Fake:
+        def run(self, mission):
+            from agentic_fx.runners.base import MissionResult
+            return MissionResult("completed", {}, [])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mw_mod.runner_factory, "build_runner",
+                        lambda *a, **kw: _Fake())
+
+    settings = _settings_with_improve_backend("local")
+    mw_mod._run_improve_mission(
+        settings=settings, workdir=tmp_path, protocol_out=None, out_seq=None)
+
+    sock_path = tmp_path / "afx.sock"
+    assert sock_path.exists(), "afx.sock が bind されていない (B1)"
+
+    # fake mcp_shim クライアント = `run_mcp_shim` の実プロセス (CLI 側の
+    # 子プロセスエントリと同じ起動形)。stdin へ 1 行の JSON-RPC を書き、
+    # stdout から応答を読む (`test_run_mcp_shim_forwards_stdio_to_unix_socket`
+    # と同じパターン、Step 1 の契約済み実装をそのまま流用する)。
+    proc = subprocess_mod.Popen(
+        [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(sock_path)],
+        stdin=subprocess_mod.PIPE, stdout=subprocess_mod.PIPE, text=True)
+    try:
+        req = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "echo_tool", "arguments": {"x": 9}}}
+        proc.stdin.write(json.dumps(req) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        resp = json.loads(line)
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+    content = resp["result"]["content"]
+    payload = json.loads(content[0]["text"])
+    assert payload == {"echo": 9}
+
+
+def test_run_improve_mission_claude_backend_workdir_matches_dispatcher_socket(
+        monkeypatch, tmp_path):
+    """Step 7b + B2-r2 是正: `CliRunner.run()` が実際に子プロセスへ渡す
+    `--mcp-config` の socket パスと、mission_worker が bind したパス
+    (`_start_mcp_dispatcher` → `mcp_socket_path(workdir)`) が一致することを
+    **実プロセス**で pin する。
+
+    前回是正 (r2 以前) は `runner._workdir == tmp_path` と
+    `(tmp_path / "afx.sock").exists()` の 2 本の assert しかなく、
+    `cli_runner.py:88` の `mcp_socket = self._workdir / "afx.sock"` を
+    別名 (`afx_MUTATED.sock`) へ変異させても検出できなかった
+    (検収 B2-r2: 全スイートで Survived) — その式は `_build_argv` へ渡す
+    値の由来を検査しておらず、2 つの独立したリテラルの偶然の一致に
+    頼っていたため。
+
+    ここでは `settings.runner.claude.bin` を fake claude CLI (Python
+    script) に差し替え、`ClaudeRunner.run()` を実際に呼び出す —
+    `cli_runner.py:88` (現在は `mcp_socket_path(self._workdir)` 呼び出し)
+    がその実行経路に必ず含まれる。fake CLI は `--mcp-config` の JSON から
+    `mcpServers.afx.command`/`args` (= `[sys.executable, "-m",
+    "agentic_fx.tools.mcp_shim", <mcp_socket>]`) を読み、実際にそれを
+    Popen して `tools/list` を JSON-RPC で投げる — fake mcp_shim が argv の
+    socket パスへ接続でき、mission_worker が bind した dispatcher から
+    登録済みツールの一覧が返ってくることを確認する。"""
+    import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.runners.base import Mission
+    from agentic_fx.tools.registry import ToolDef, ToolRegistry
+
+    def _echo(x: int) -> dict:
+        return {"echo": x}
+
+    fake_registry = ToolRegistry()
+    fake_registry.register(ToolDef(
+        name="probe_tool", description="d",
+        parameters={"type": "object", "properties": {"x": {"type": "integer"}}},
+        func=_echo))
+
+    fake_bin = tmp_path / "fake_claude.py"
+    fake_bin.write_text(
+        f"#!{sys.executable}\n"
+        "import json, subprocess, sys\n"
+        "argv = sys.argv[1:]\n"
+        "mcp_config_path = argv[argv.index('--mcp-config') + 1]\n"
+        "cfg = json.loads(open(mcp_config_path).read())\n"
+        "server = cfg['mcpServers']['afx']\n"
+        "cmd = [server['command']] + server['args']\n"
+        "proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, "
+        "stdout=subprocess.PIPE, text=True)\n"
+        "req = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}\n"
+        "proc.stdin.write(json.dumps(req) + chr(10))\n"
+        "proc.stdin.flush()\n"
+        "line = proc.stdout.readline()\n"
+        "proc.kill()\n"
+        "proc.wait(timeout=5)\n"
+        "with open(mcp_config_path + '.probe_response', 'w') as f:\n"
+        "    f.write(line)\n"
+        "print(json.dumps({'type': 'result', 'result': '{}'}))\n"
+        "sys.exit(0)\n"
+    )
+    fake_bin.chmod(0o755)
+
+    settings = _settings_with_improve_backend("claude")
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "claude": settings.runner.claude.model_copy(
+                update={"bin": str(fake_bin)}),
+        }),
+    })
+
+    monkeypatch.setattr(
+        mw_mod, "_build_improve_registry",
+        lambda *, settings, workdir: fake_registry)
+    # `ClaudeRunner.run()` は `cli_started_sink` 経由で実際に `cli_started`
+    # フレームを送出する (`_make_on_message`/`_send_frame` 配線) — 実プロセス
+    # を起動するこのテストではその配線を素通りさせるため、
+    # protocol_out/out_seq に実物 (in-memory stream + SeqTracker) を渡す。
+    from agentic_fx.core.mission_protocol import SeqTracker
+    protocol_out = io.BytesIO()
+    out_seq = SeqTracker()
+    runner = mw_mod._run_improve_mission(
+        settings=settings, workdir=tmp_path,
+        protocol_out=protocol_out, out_seq=out_seq)
+
+    sock_path = mw_mod.mcp_socket_path(tmp_path)
+    assert runner._workdir == tmp_path
+    assert sock_path.exists(), "dispatcher が bind されていない"
+
+    mission = Mission(prompt="probe", tools=[], output_schema={"type": "object"},
+                      max_turns=1, timeout_sec=10.0)
+    runner.run(mission)
+
+    probe_path = tmp_path / "mcp.json.probe_response"
+    # fake claude CLI は接続の成否に関わらず probe ファイルを作る (接続
+    # 失敗時は `readline()` が `''` を返し、空ファイルが書かれる) —
+    # `exists()` だけでは「空ファイルが書かれた」ケースを「接続できた」と
+    # 誤読しうる (`json.loads("")` の `JSONDecodeError` に落ちるだけの、
+    # 意図と無関係な理由での fail)。中身が非空であることを明示的に
+    # assert してから decode する。
+    raw = probe_path.read_text() if probe_path.exists() else ""
+    assert raw.strip(), (
+        "fake claude CLI が argv の --mcp-config が指す socket パスへ "
+        "接続できなかった (bind パスと argv パスの不一致、B2-r2)")
+    resp = json.loads(raw)
+    tool_names = {t["name"] for t in resp["result"]["tools"]}
+    assert tool_names == {"probe_tool"}, (
+        "argv の socket パス経由で mission_worker が bind した dispatcher "
+        "に到達できなかった")
+
+
+def test_start_mcp_dispatcher_fails_closed_when_bind_fails(tmp_path):
+    """`_start_mcp_dispatcher` は `McpShimDispatcher.bind()` を呼び出し
+    スレッドで同期実行する (B1-r2 是正) — bind の例外はそのまま伝播し、
+    `_start_mcp_dispatcher` は `RuntimeError` を送出して fail closed に
+    なる。黙って戻ると、CLI へ存在しない socket path を渡し続け B1
+    (ツール 0 個) を再発させる。ここでは workdir の親ディレクトリが
+    存在しない状態を作り、bind (`ENOENT`) を確実に失敗させて
+    red/green を確認する。"""
+    import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.tools.registry import ToolRegistry
+
+    nonexistent_workdir = tmp_path / "does" / "not" / "exist"
+    with pytest.raises(RuntimeError, match="failed to bind"):
+        mw_mod._start_mcp_dispatcher(
+            workdir=nonexistent_workdir, registry=ToolRegistry())
+
+
+def test_start_mcp_dispatcher_fails_closed_when_socket_path_is_masked_by_directory(
+        tmp_path):
+    """B1-r2 是正の回帰テスト (検収 B1-r2 (a) の決定的 masking probe)。
+
+    旧実装 (`sock_path.exists()` を 3 秒ポーリングして bind 成否を判定) は
+    「そのパスに何か在るか」という代理観測でしかなく、bind 前から
+    `workdir/afx.sock` が (例えばディレクトリとして) 既に存在していると
+    `unlink()` が `IsADirectoryError` (OSError のサブクラス) で失敗して
+    bind が絶対に成功しないにもかかわらず、`ready: ok=True` を返していた
+    — B1 (ツール 0 個) と区別のつかない症状を黙って再導入する。
+    ここでは `afx.sock` を先にディレクトリとして作っておき、
+    `_start_mcp_dispatcher` が `RuntimeError` で fail closed することを
+    pin する (旧 `exists()` ポーリング実装ではこのケースを検出できない
+    — ENOENT だけを見るテストが偶然正しい代理になっていた唯一のケース
+    だったため)。"""
+    import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.tools.registry import ToolRegistry
+
+    (tmp_path / "afx.sock").mkdir()
+    with pytest.raises(RuntimeError, match="failed to bind"):
+        mw_mod._start_mcp_dispatcher(workdir=tmp_path, registry=ToolRegistry())

@@ -111,10 +111,20 @@ _READ_ONLY_ACCESS = _ACCESS_FS_READ_FILE | _ACCESS_FS_READ_DIR
 # ツールには `uv run pytest` 実行と `gh` による PR 作成が含まれるため、
 # **Task 18 で実行権の与え方 (専用の exec_paths を設けるか、実行を親 RPC に
 # 限定するか) を裁定する必要がある**。本 task では判断しない。
+# **`MAKE_SOCK`** (A-4 検収是正 2026-08-22, advisor 指摘): `mission_worker.py`
+# の improve 分岐 (`_start_mcp_dispatcher`) は `workdir/afx.sock` に
+# `AF_UNIX` の `bind()` を行う (プラン10 Task4 Step 7)。Landlock は
+# `bind(2)` を `LANDLOCK_ACCESS_FS_MAKE_SOCK` で制御するため、これを
+# 欠くと workdir 配下であっても bind が `PermissionError` (EACCES 相当)
+# になる — 実測: この 1 行を追加する前は
+# `test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring`
+# (実 Landlock を踏む) が `_start_mcp_dispatcher` の fail-closed raise
+# 経由で `ready: ok=False` になり timeout で red になっていた。
 _READ_WRITE_ACCESS = (
     _ACCESS_FS_READ_FILE | _ACCESS_FS_READ_DIR | _ACCESS_FS_WRITE_FILE |
     _ACCESS_FS_MAKE_REG | _ACCESS_FS_REMOVE_FILE |
-    _ACCESS_FS_MAKE_DIR | _ACCESS_FS_REMOVE_DIR | _ACCESS_FS_TRUNCATE)
+    _ACCESS_FS_MAKE_DIR | _ACCESS_FS_REMOVE_DIR | _ACCESS_FS_TRUNCATE |
+    _ACCESS_FS_MAKE_SOCK)
 
 # プラン10 Task 5: execute パスの自己充足マスク。
 # EXECUTE | READ_FILE | READ_DIR の和で、同一 inode に対する ro ルールとの

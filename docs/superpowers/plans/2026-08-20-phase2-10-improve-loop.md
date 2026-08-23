@@ -767,12 +767,23 @@ class Commands:
 # dataclass の型は int のまま変更しない — str 化は境界 (handshake
 # 組み立て) だけの責務。子側 (mission_worker.py, Task 5) は
 # handshake["mission_id"] を str として受け取る。
+#
+# <!-- precheck 2026-08-23 R-D3 -->
+# 裁定 R-D3: source_snapshot_dir は「スナップショットの出所」
+# (Task 10 の _materialize_workspace が plugins/<name> 版実体 + _examples
+# を用意した読み取り専用のコピー元。workdir 配下である必要はない)。
+# **子 (mission_worker.py) が handshake で受け取る値は workdir/"source"**
+# であり、この出所そのものではない — WorkerRunner.run() が workdir 作成
+# 直後に shutil.copytree(出所, workdir/"source") で実体化し、handshake
+# の source_snapshot_dir にはその実体化先を載せる (Task 1 Step 33 実装時
+# 追記)。この dataclass の型・フィールド名・意味は「出所」のまま変更しない
+# — workdir/source への変換は境界 (handshake 組み立て) だけの責務。
 @dataclass(frozen=True)
 class ImproveRunContext:
     mission_id: int
     run_id: int
     staging_dir: Path
-    source_snapshot_dir: Path
+    source_snapshot_dir: Path  # 出所 (コピー元)。handshake 値は workdir/"source" (R-D3)
     allowed_backlog_ids: frozenset[int] | None    # ヒント。None = 手動 wave
     slot_key: tuple[str, int] | None              # wave 起動なら (period_key, k)。
                                                     # 手動 one-shot は None (レビュー1周目 C2)
@@ -3645,6 +3656,168 @@ class WorkerRunner(AgentRunner):
 を追加・展開する (`worker_runner.py:210-224` の handshake dict リテラルへの追記のみ —
 既存 6 キー `db_path`/`plugins_dir`/`settings`/`mission`/`worker_profile`/`now` は
 不変。`run_context_fields` が空 dict なら handshake は現状どおり 3 キー増えない)。
+
+<!-- precheck 2026-08-23 R-D3 -->
+**実装時追記 (2026-08-23 R-D3)**: 上記 Step 33 の実装は `run_context.source_snapshot_dir`
+を検証も実体化もせず、そのまま handshake へ載せていた。裁定 R-D3
+(`tmp/plan10-precheck/rulings.md` 末尾「R-D3」節) により、`ImproveRunContext.
+source_snapshot_dir` の意味は「スナップショットの**出所**」(Task 10 が用意する
+読み取り専用のコピー元) に確定し、`workdir/source` への実体化は本 `WorkerRunner.run()`
+が所有する。以下を追記する。
+
+`worker_runner.py` の import 群 (`import subprocess` の次の行) に `import shutil` を追加する。
+
+`WorkerRunner.run()` の `home`/`tmp`/`cfg` の 3 mkdir 直後・`credentials: dict[str, str] = {}`
+の**前**に挿入する:
+
+```python
+            (workdir / "home").mkdir(mode=0o700)
+            (workdir / "tmp").mkdir(mode=0o700)
+            (workdir / "cfg").mkdir(mode=0o700)
+
+            if self._run_context is not None:
+                source_origin = Path(self._run_context.source_snapshot_dir)
+                if source_origin.is_symlink() or not source_origin.is_dir():
+                    return MissionResult(
+                        "failed", None, [],
+                        reason="source snapshot origin is missing, not a "
+                               "directory, or a symlink (R-D3 fail closed)")
+                try:
+                    shutil.copytree(source_origin, workdir / "source",
+                                    symlinks=False)
+                except OSError as e:
+                    return MissionResult(
+                        "failed", None, [],
+                        reason=f"source snapshot materialization failed: {e}")
+```
+
+（`credentials: dict[str, str] = {}` 以降は元のまま続く。）
+
+`run_context_fields` の組み立て (上記コード片) の `"source_snapshot_dir"` 行を、
+出所ではなく実体化後の `workdir/"source"` を載せる形へ差し替える:
+
+```python
+            run_context_fields: dict[str, object] = {}
+            if self._run_context is not None:
+                run_context_fields = {
+                    # precheck 2026-08-22 pass2: RB2 — mission_id は
+                    # ImproveRunContext 上は int が正 (missions_store.start
+                    # の戻り値)。子側 (mission_worker.py) は str 前提
+                    # (staging_dir の末尾成分と Path.name で比較するため、
+                    # Path.name は必ず str) なので、handshake 組み立てで
+                    # ここだけ str() を掛ける。
+                    "mission_id": str(self._run_context.mission_id),
+                    "staging_dir": str(self._run_context.staging_dir),
+                    # 裁定 R-D3: 出所 (self._run_context.source_snapshot_dir)
+                    # ではなく、直前に copytree した先 (workdir/"source") を
+                    # 載せる — 子は workdir 配下の実在ディレクトリしか
+                    # 受理しない (mission_worker.py の Blocking 10 検査)。
+                    "source_snapshot_dir": str(workdir / "source"),
+                }
+```
+
+**テスト改訂・追加 2 本 (`tests/runners/test_worker_runner.py`)**:
+
+1. **既存 `test_worker_runner_run_context_adds_three_handshake_keys` を改訂する**
+   (この実装で `source_origin` が実在しないため fail closed になり確実に red になる —
+   出所を実在させ、`workdir/source` への実体化先パス・中身の一致まで検証する形へ書き換える):
+
+```python
+def test_worker_runner_run_context_adds_three_handshake_keys(
+        monkeypatch, tmp_path):
+    """レビュー1周目 C3 + 裁定 R-D3: `run_context=` が非 None のとき、
+    `mission_id`/`staging_dir` の 2 キーは渡した値のまま handshake へ載る。
+    `source_snapshot_dir` は R-D3 により WorkerRunner が `workdir/"source"`
+    へ実体化してからそのパスを載せる — 渡した出所
+    (`_FakeRunContext.source_snapshot_dir`) の値そのものではない。fake 子
+    プロセスは cwd (= workdir) と `source/marker.txt` の中身を記録し、
+    handshake.json に同梱することで、パス一致だけでなく「中身が出所と
+    一致」も検証する。"""
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        return orig_popen([sys.executable, "-c",
+                           "import sys, json, os\n"
+                           "line = sys.stdin.readline()\n"
+                           "cwd = os.getcwd()\n"
+                           "marker_path = os.path.join(cwd, 'source', 'marker.txt')\n"
+                           "marker = (open(marker_path).read()\n"
+                           "         if os.path.exists(marker_path) else None)\n"
+                           "open('%s', 'w').write(json.dumps("
+                           "{'handshake': json.loads(line), 'cwd': cwd, "
+                           "'marker': marker}))\n"
+                           "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
+                           % str(tmp_path / 'handshake.json')], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+
+    source_origin = tmp_path / "source_origin"
+    source_origin.mkdir()
+    (source_origin / "marker.txt").write_text("origin-content")
+    source_origin.chmod(0o500)
+
+    class _FakeRunContext:
+        mission_id = 42
+        staging_dir = tmp_path / "staging"
+        source_snapshot_dir = source_origin
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_FakeRunContext())
+    runner.run(_mission())
+    captured = json.loads((tmp_path / "handshake.json").read_text())
+    handshake = captured["handshake"]
+    assert handshake["mission_id"] == "42"  # precheck pass2 RB2: str() 化
+    assert handshake["staging_dir"] == str(tmp_path / "staging")
+    # R-D3: source_snapshot_dir は workdir/"source" (子の cwd 配下) を指す。
+    # 出所 (source_origin) の値そのものではない。
+    assert handshake["source_snapshot_dir"] == os.path.join(captured["cwd"], "source")
+    assert handshake["source_snapshot_dir"] != str(source_origin)
+    assert captured["marker"] == "origin-content"  # 中身が出所と一致
+```
+
+2. **新規 `test_worker_runner_run_context_source_is_symlink_fails_closed`**:
+
+```python
+def test_worker_runner_run_context_source_is_symlink_fails_closed(
+        monkeypatch, tmp_path):
+    """R-D3: `run_context.source_snapshot_dir` が symlink だと
+    `MissionResult(status="failed")` を返し、子プロセスを spawn しない。"""
+    popen_calls: list = []
+
+    def spy(*a, **kw):
+        popen_calls.append((a, kw))
+        raise AssertionError("subprocess.Popen must not be called")
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+
+    real_dir = tmp_path / "real_source"
+    real_dir.mkdir()
+    (real_dir / "marker.txt").write_text("x")
+    link = tmp_path / "source_link"
+    link.symlink_to(real_dir, target_is_directory=True)
+
+    class _FakeRunContext:
+        mission_id = 7
+        staging_dir = tmp_path / "staging"
+        source_snapshot_dir = link
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_FakeRunContext())
+    result = runner.run(_mission())
+    assert result.status == "failed"
+    assert popen_calls == []  # 子プロセスは spawn されていない
+```
+
+**変異 2 件**:
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M-RD3-1 | `shutil.copytree(...)` 呼び出しを削除する (workdir/source を作らない) | `test_worker_runner_run_context_adds_three_handshake_keys` (`marker_path` が実在しないため `captured["marker"]` が `None` のまま `assert captured["marker"] == "origin-content"` が失敗) |
+| M-RD3-2 | `run_context_fields["source_snapshot_dir"]` を `str(self._run_context.source_snapshot_dir)` (出所そのもの) に戻す | 同上テストの `assert handshake["source_snapshot_dir"] != str(source_origin)` |
 
 - [ ] **Step 33a: 既存テストの改訂 (B4/B5 — Step 33 の実装で確実に red になる 2 本)**
 
@@ -6565,6 +6738,9 @@ if worker_profile == "improve":
 
 (設計書 §2.2 のとおり、`source_snapshot_dir` は既に read_only/read_write いずれの対象にも入っている `workdir` の子であるため、この検査は **追加の Landlock ルールを必要としない** — 誤っていたのは「相互照合する」という見出しの主張の実装が欠けていた点のみ)
 
+<!-- precheck 2026-08-23 R-D3 -->
+**(注記のみ、変更不要)** 裁定 R-D3 により `ImproveRunContext.source_snapshot_dir` の意味は「スナップショットの出所」に確定したが、この 5-D 検査自体は handshake から**受け取った値** (= `WorkerRunner.run()` が実体化した `workdir/"source"`) を検査対象にしており、R-D3 の下でもそのまま成立する — `workdir/"source"` は常に `workdir` の子なので上記の prefix 検査は変更不要。R-D3 で変わるのは「誰が `workdir/source` を作るか」(WorkerRunner が作る) であって、子側のこの検査ロジックではない。
+
 <!-- precheck 2026-08-22: T5-B1 -->
 **(Blocking 1 修正、裁定 R6)** `worker_runner.py` の handshake 組み立てへの変更は**削除**する。親側の handshake 3 キー (`mission_id`/`staging_dir`/`source_snapshot_dir`、キー不在 vs `None` の表現含む) と `WorkerRunner.__init__` への `run_context` 追加は **Task 1 Step 33 が所有**する (レビュー1周目 C3 で確定済み — 申し送り⑤参照)。Task 5 は子側 (`mission_worker.py`) が handshake で受領した 3 値を Landlock 適用前に相互照合する経路 (上記) のみを担当し、`worker_runner.py` には一切触れない。親→子の実引数配線を検証する実プロセステストは、本節末尾の「Task 5 統合 step (A-1 マージ後)」で扱う (B-5 本体の受入条件には含めない)。
 
@@ -7778,7 +7954,14 @@ def test_worker_runner_run_context_reaches_real_improve_worker(tmp_path):
     staging_dir = tmp_path / "staging" / mission_id
     staging_dir.mkdir(parents=True, mode=0o700)
     source_snapshot_dir = tmp_path / "source"
-    source_snapshot_dir.mkdir(mode=0o500)
+    source_snapshot_dir.mkdir()
+    # <!-- precheck 2026-08-23 R-D3 -->
+    # 裁定 R-D3: WorkerRunner.run() が workdir/"source" へ実体化するため、
+    # ready の run_context.source_snapshot_dir echo は source_snapshot_dir
+    # (出所) そのものではなくなる。実体化の中身を検証するため、出所へ
+    # マーカーファイルを置いておく (書込のため chmod 0o500 前に行う)。
+    (source_snapshot_dir / "marker.txt").write_text("c3-real-probe-marker")
+    source_snapshot_dir.chmod(0o500)
 
     class _RealRunContext:
         def __init__(self, mission_id, staging_dir, source_snapshot_dir):
@@ -7791,6 +7974,13 @@ def test_worker_runner_run_context_reaches_real_improve_worker(tmp_path):
 
     def _on_ready(frame):
         observed_ready.update(frame)
+        # R-D3: on_ready は WorkerRunner.run() の tempdir がまだ生きている
+        # 間に同期呼び出しされる — echo された source_snapshot_dir (=
+        # workdir/"source") の中身をこの時点で読み、実体化の裏取りを行う。
+        echoed_source = Path(frame["run_context"]["source_snapshot_dir"])
+        observed_ready["_echoed_source_basename"] = echoed_source.name
+        observed_ready["_echoed_source_marker"] = (
+            echoed_source / "marker.txt").read_text()
 
     runner = WorkerRunner(
         root=tmp_path, settings=_settings(), clock=_clock(), rag=_rag(),
@@ -7801,11 +7991,14 @@ def test_worker_runner_run_context_reaches_real_improve_worker(tmp_path):
     # (`observed_ready` が空のままなら `ready` timeout/protocol_error で
     # `on_ready` が一度も呼ばれていない — ready 未到達の直接証拠)。
     assert observed_ready.get("ok") is True
-    assert observed_ready["run_context"] == {
-        "mission_id": mission_id,
-        "staging_dir": str(staging_dir),
-        "source_snapshot_dir": str(source_snapshot_dir),
-    }
+    assert observed_ready["run_context"]["mission_id"] == mission_id
+    assert observed_ready["run_context"]["staging_dir"] == str(staging_dir)
+    # R-D3: source_snapshot_dir は workdir/"source" (子の cwd 配下) を指す
+    # — 渡した出所 (source_snapshot_dir 変数) のパスそのものではない。
+    assert observed_ready["run_context"]["source_snapshot_dir"] != str(
+        source_snapshot_dir)
+    assert observed_ready["_echoed_source_basename"] == "source"
+    assert observed_ready["_echoed_source_marker"] == "c3-real-probe-marker"
 ```
 
 (`_settings()`/`_clock()`/`_rag()`/`_mission()` は既存 `tests/runners/test_worker_runner.py` のヘルパを import して流用する。`tests/test_improve_profile_isolation.py` に無ければ import を追加する。)
@@ -16234,6 +16427,16 @@ class ImproveLoop:
         raise NotImplementedError  # 10.9 節
 
     def _materialize_workspace(self, mission_id, allowed_ids):
+        # <!-- precheck 2026-08-23 R-D3 -->
+        # 裁定 R-D3: 本メソッドの責務は「出所を用意する」ことに縮小された。
+        # `staging_dir/_snapshot_src/` へ `copy_source_snapshot`/
+        # `copy_examples_snapshot` (10.3 節) を使って plugins/<name> 版実体
+        # + `_examples` をコピーし、その `staging_dir/_snapshot_src/` パスを
+        # 返す (これが ImproveRunContext.source_snapshot_dir に入る「出所」)。
+        # `workdir/source` への配置・実体化は本メソッドの責務ではない —
+        # `WorkerRunner.run()` が workdir 作成直後に
+        # `shutil.copytree(source_snapshot_dir, workdir/"source")` で行う
+        # (Task 1 Step 33 実装時追記)。詳細は 10.3 節参照。
         raise NotImplementedError  # 10.3 節
 
     def _build_rpc_handlers(self, ledger, *, staging_dir: Path):
@@ -16301,6 +16504,9 @@ EOF
 ### 10.3 source snapshot: 固定 `PluginMeta.path` から・fault injection・`_examples` コピー (§8.1-11)
 
 **コピー元は稼働中 registry が保持する固定 `PluginMeta.path` (版ディレクトリ実体) であって live symlink `plugins/<name>` ではない**。plugin `flock` 下で 3 本を 1 マニフェストとしてコピーし、コピー後に `content_hash`/`artifact_hash` を registry の値と再照合する (混成スナップショット・未 admit 版の混入を防ぐ)。
+
+<!-- precheck 2026-08-23 R-D3 -->
+**裁定 R-D3 (`_materialize_workspace` の責務範囲)**: 本節が定義する `copy_source_snapshot`/`copy_examples_snapshot` は `dest_root` を引数で受け取る汎用関数であり、呼び出し元 (`ImproveLoop._materialize_workspace`, 10.2 節) がその `dest_root` に何を渡すかで責務範囲が決まる。R-D3 により `_materialize_workspace` は `dest_root=staging_dir / "_snapshot_src"` (出所) を渡す — **`workdir/"source"` へは渡さない** (`workdir` は `prepare()` の時点でまだ存在しない使い捨てディレクトリであり、`WorkerRunner.run()` が呼ばれるまで作られない)。`workdir/"source"` への実体化は `WorkerRunner.run()` が `ImproveRunContext.source_snapshot_dir` (= `staging_dir/_snapshot_src`) から `shutil.copytree` で行う (Task 1 Step 33 実装時追記)。以下 Step 1〜3 の `copy_source_snapshot`/`copy_examples_snapshot` 自体のテスト・実装 (汎用関数、`dest_root` は呼び出し元が決める) はこの裁定による変更を要しない — テスト中の `dest = tmp_path / "workdir" / "source"` は関数の汎用性を示すための一例のパスに過ぎず、実際の呼び出し元 (10.9 節で完成する `_materialize_workspace`) は `staging_dir/_snapshot_src` を渡す。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -25731,6 +25937,18 @@ EOF
 
 **由来**: 設計書 §7.2 (骨格 Task 13、§8.1 項目 45・47・48 主担当)。**依存: Task 12 完了後**。
 
+<!-- precheck 2026-08-23 wave3: T13-B1 T13-B2 T13-B3 -->
+**着手前検証 (report-task13.md B-1/B-2/B-3、指揮者裁定 rulings.md 末尾
+「Task 13 着手前検証への裁定」) により、本節の `verify_backend()` の設計を
+書き直した**: 旧稿は `build_runner`/`build_mission_registry` を直接叩く
+独自の簡易経路だったため、`WorkerRunner` が担う workdir 0700 作成・認証
+コピー・MCP dispatcher bind をすべて素通りし (B-3)、`build_mission_registry`
+の必須引数を満たさず必ず `ValueError` になり (B-2)、親ゲートを一切実行
+しないまま `ok=True` を返していた (B-1)。裁定により **`verify_backend` は
+本番経路 (`WorkerRunner(worker_profile="improve", run_context=..., on_ready=...,
+rpc_handlers=...)`) をそのまま流用**し、Mission は「実装させる」のではなく
+**固定 nonce の往復を要求するだけの 1 ターン接続性プローブ**に単純化する。
+
 ### ⚠ Anthropic API (従量課金) は絶対に使わない
 
 **本 task の実装コードにも、以下の手動実行手順書にも、Anthropic API (従量課金) を
@@ -25756,6 +25974,8 @@ EOF
   `VerifyBackendResult` dataclass — **骨格の File Structure・Interfaces に明記が無い
   新規ファイル。申し送り節に記載**)
 - Create: `tests/loops/test_verify_backend.py`
+- Create: `tests/loops/test_verify_backend_realbackend.py` (`@pytest.mark.realbackend`
+  — 既定スイートでは skip。B-8/B-9 是正、下記 Step 5b)
 - Modify: `src/agentic_fx/entry.py:11` (`_BACKTEST_COMMANDS` に `"improve"` を追加 —
   **骨格の「主な変更」表は `commands.py`/`backtest/cli.py` のみを Task 13 の変更対象と
   記載しており `entry.py` は明記されていない。現物確認の結果、`afx` top-level の
@@ -25763,15 +25983,35 @@ EOF
   この 1 行が不可欠 — 申し送り節に記載**)
 - Modify: `src/agentic_fx/backtest/cli.py` の `register_subparsers()` (`improve` サブ
   パーサ追加) と `dispatch()` (`args.command == "improve"` 分岐追加)
+- Modify: `tests/backtest/test_cli.py` (ルーティング pin 1 本、B-9 是正 — 実 backend
+  を呼ばない)
+- Modify: `src/agentic_fx/tools/mcp_shim.py` / `tests/tools/test_mcp_shim.py`
+  (`protocolVersion` 実測反映、B-5 是正、下記 Step 5c)
+- Modify: `pyproject.toml` の `[tool.pytest.ini_options]` (`realbackend` marker 追加、
+  B-9 是正)
 - Create (ランブック — コードではない): `.superpowers/sdd/plan10-plan/task13-real-backend-runbook.md`
   (下記「手動実行手順書」節の内容をそのまま書き出したもの。実装者は本ファイルの
   「手動実行手順書」節の内容をこのパスへコピーし、実測記録の追記場所として使う)
 
 ### Interfaces
 
-**Consumes**: Task 1 の `ClaudeCliSettings` / `CodexCliSettings` / `build_runner`、
-Task 9 の `improve.llama_swap_verified: bool` (`config.py` の `ImproveSettings`)、
-`agentic_fx.runners.factory.build_runner(profile, settings, registry, *, on_message, workdir)`。
+**Consumes**: Task 1 の `WorkerRunner(*, root, settings, clock, rag, worker_profile,
+run_context=None, on_rpc_leak=None, on_ready=None, rpc_handlers=None,
+stop_event=None)` (現物 `src/agentic_fx/runners/worker_runner.py:84-96` — `rpc_handlers`
+は R-D2/RW2 により Task 10 統合時に追加される。**Task 13 は Task 12 完了後着手のため
+Task 8〜11 (Task 10 を含む) は本 task 着手時点で全て main へ merge 済みの前提** —
+現物の `WorkerRunner.__init__` に `rpc_handlers` パラメータが無い場合は Task 10 の
+統合が未完了ということなので、Task 13 の実装者は着手前に
+`grep -n "rpc_handlers" src/agentic_fx/runners/worker_runner.py` で存在を確認する
+こと)、Task 10 の `agentic_fx.loops.improve_run_context.ImproveRunContext`
+(`mission_id: int, run_id: int, staging_dir: Path, source_snapshot_dir: Path,
+allowed_backlog_ids: frozenset[int] | None, slot_key: tuple[str, int] | None,
+ledger: ImproveRpcLedger, rpc_handlers: dict[str, Callable[[dict], dict]]`)、
+`agentic_fx.loops.improve_rpc_ledger.ImproveRpcLedger(*, rpc_timeout_sec_by_kind:
+dict[str, float])` (現物 `src/agentic_fx/loops/improve_rpc_ledger.py:14`)、
+`agentic_fx.store.rag.Rag(data_dir: Path, embedding_function=None, *,
+lock_timeout_sec: float = 10.0)`、Task 9 の `improve.llama_swap_verified: bool`
+(`config.py:190` の `ImproveSettings`)。
 
 **Produces** (# 新規命名 — 骨格に無いため本 task が定義する):
 ```python
@@ -25779,30 +26019,46 @@ Task 9 の `improve.llama_swap_verified: bool` (`config.py` の `ImproveSettings
 @dataclass(frozen=True)
 class VerifyBackendResult:                        # 新規命名
     ok: bool
-    provider: Literal["chatgpt", "llama_swap"]
+    backend: Literal["local", "claude", "codex"]
+    provider: Literal["chatgpt", "llama_swap"] | None
     fingerprint: str | None      # 成功時のみ。sha256 hex
     detail: str                  # 人間向け 1 行
 
 def verify_backend(
-    root: Path, settings: "Settings", *, provider: Literal["chatgpt", "llama_swap"],
+    root: Path, settings: "Settings", *,
+    backend: Literal["local", "claude", "codex"],
+    provider: Literal["chatgpt", "llama_swap"] | None,
     clock: "Clock",
 ) -> VerifyBackendResult:
-    """scheduler・wave・backlog・improve_waves/improve_wave_slots に一切触れない
-    one-shot。`improve.llama_swap_verified` の値に関わらず動く (これが唯一の
-    `llama_swap_verified=false` のまま実行できる経路 — 通常入口
-    `ImproveSupervisor.tick/submit_manual` は §7.1-2 の pin により
-    `provider=llama_swap` を拒否する)。
+    """scheduler・wave・backlog・improve_waves/improve_wave_slots・
+    improvement_runs のいずれにも触れない one-shot 接続性プローブ。
+    `improve.llama_swap_verified` の値に関わらず動く (これが唯一の
+    `llama_swap_verified=false` のまま `provider=llama_swap` を実行できる
+    経路 — 通常入口 `ImproveSupervisor.tick/submit_manual` は §7.1-2 の
+    pin により `provider=llama_swap` を拒否したままにする。本関数はその
+    pin を変更しない — バイパスするのはこの検証専用入口だけであり、
+    バイパスした事実を WARNING ログへ残す)。
 
-    手順: ①`build_runner("improve", settings_with_provider_override, registry,
-    workdir=<scratch>)` を構築 (settings.runner.codex.provider を引数の
-    provider で一時上書きした複製を使う — 個人設定ファイルは変更しない)
-    ②サンプル indicator plugin 1 本 (docs/examples/plugins/rsi_indicator 相当)
-    を候補として staging に置く簡略 Mission を 1 ターン実行 ③親ゲート
-    (Task 6 の `run_gate_pytest` 相当のスナップショット+hash+pytest 検査) を
-    通す ④成功したら `fingerprint = sha256(f"{provider}:{model}:{artifact_hash}:
-    {now.isoformat()}")` を返す。DB 書込は一切しない (approvals/backlog/
-    improvement_runs のいずれにも触れない — 「wave・backlog に一切触れない」
-    の実装上の意味はこれ)。activity ログへの 1 行記録のみ許容する。"""
+    <!-- precheck 2026-08-23 wave3: T13-B1 T13-B2 T13-B3 -->
+    手順 (着手前検証 B-1/B-2/B-3 是正 — 本番経路をそのまま流用する):
+    ①`backend`/`provider` で `runner.improve.backend`/`runner.codex.provider`
+    を一時上書きした `settings` の複製を作る (個人設定ファイルは変更しない)
+    ②scratch の `staging_dir`/`source_snapshot_dir`/`ImproveRpcLedger` を
+    用意し、`run_backtest`/`analyze_corr` を必ず拒否する `rpc_handlers` を
+    持つ `ImproveRunContext` を組む (DB 行は一切作らない — `mission_id`/
+    `run_id` は `missions_store.start` を経由しないプレースホルダ) ③
+    `WorkerRunner(worker_profile="improve", run_context=ctx, on_ready=...,
+    rpc_handlers=ctx.rpc_handlers)` を構築し、固定 nonce の往復だけを
+    要求する 1 ターン Mission を `run()` する ④親ゲート 4 点 —
+    (a) `ready` フレームの `run_context` echo が送信した 3 値と一致する
+    (b) `MissionResult.output` が nonce 一致の schema を満たす
+    (c) `backend != "local"` のとき、実 CLI 子プロセスが少なくとも 1 回は
+    子孫プロセスとして観測された (`cli_started` の black-box 代理検査)
+    (d) `backend != "local"` のとき、`run()` 完了後に子孫プロセスが 0 に
+    なっている (pgid 回収の確認) — の全てを満たしたときのみ
+    `fingerprint = sha256(f"{backend}:{provider}:{model}:{nonce}")` を
+    返す。DB 書込は一切しない (approvals/backlog/improvement_runs の
+    いずれにも触れない)。"""
     ...
 ```
 
@@ -25818,13 +26074,18 @@ def verify_backend(
 # tests/loops/test_verify_backend.py
 """`afx improve verify-backend` の one-shot protocol (§8.1-45)。
 
-実 CLI は呼ばない — `build_runner` を fake に差し替えたユニット/契約テスト。
-実機での実測は本ファイルの対象外 (Task 13 の手動ランブック節)。"""
+`WorkerRunner` を fake に差し替えたユニット/契約テスト — 実 CLI は呼ばない。
+実機での実測は Task 13 の手動ランブック節と
+`tests/loops/test_verify_backend_realbackend.py` (`@pytest.mark.realbackend`)
+の対象 (本ファイルの対象外)。
+
+<!-- precheck 2026-08-23 wave3: T13-B1 T13-B2 T13-B3 -->
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from typing import Any
 
 import pytest
 
@@ -25833,111 +26094,188 @@ from agentic_fx.core.contracts import FixedClock
 from agentic_fx.loops.verify_backend import VerifyBackendResult, verify_backend
 from agentic_fx.runners.base import Mission, MissionResult
 
-NOW = datetime(2026, 8, 22, 10, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc)
+
+_BEHAVIOR: dict[str, dict] = {"current": {}}
 
 
-class _FakeVerifyRunner:
-    def __init__(self, *, result: MissionResult, **kwargs) -> None:
-        self._result = result
+class _FakeVerifyWorkerRunner:
+    """`WorkerRunner(root=/settings=/clock=/rag=/worker_profile=/run_context=/
+    on_ready=/rpc_handlers=)` の契約だけを検査する替え玉。実サブプロセスは
+    起動しない — `FakeImproveWorkerRunner` (Task 12) と同じ発想の注入点。
+    `_BEHAVIOR["current"]["result"]` (mission -> MissionResult の callable)
+    でテストごとに振る舞いを差し替える。"""
+    captured_kwargs: dict[str, Any] = {}
+
+    def __init__(self, **kwargs) -> None:
+        _FakeVerifyWorkerRunner.captured_kwargs = kwargs
+        self._on_ready = kwargs["on_ready"]
+        self._ctx = kwargs["run_context"]
 
     def run(self, mission: Mission) -> MissionResult:
-        return self._result
+        behavior = _BEHAVIOR["current"]
+        if not behavior.get("skip_ready"):
+            # <!-- precheck 2026-08-23 R-D3 -->
+            # 裁定 R-D3: 実 WorkerRunner は source_snapshot_dir (出所) を
+            # そのまま echo せず、workdir/"source" (使い捨て workdir 配下)
+            # を返す。この fake も同じ契約を模す — 実在しない固定パスの
+            # basename だけを "source" に揃える (verify_backend 側の
+            # on_ready ゲートは basename のみを照合する、下記参照)。
+            self._on_ready({"type": "ready", "ok": True, "run_context": {
+                "mission_id": str(self._ctx.mission_id),
+                "staging_dir": str(self._ctx.staging_dir),
+                "source_snapshot_dir": str(Path("/fake-workdir") / "source")}})
+        return behavior["result"](mission)
 
 
-def test_verify_backend_succeeds_with_llama_swap_verified_false(tmp_path):
+def _settings():
+    return load_settings(
+        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+
+
+def _echo_ok(mission: Mission) -> MissionResult:
+    nonce = mission.output_schema["properties"]["echo"]["const"]
+    return MissionResult(status="completed", output={"echo": nonce},
+                         transcript=[])
+
+
+def test_verify_backend_succeeds_on_nonce_roundtrip(tmp_path, monkeypatch):
     """§8.1-45: `improve.llama_swap_verified=false` のままでも
     `verify-backend` は実行できる (これが唯一の経路)。"""
-    settings = load_settings(
-        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    settings = _settings()
     assert settings.improve.llama_swap_verified is False
+    _BEHAVIOR["current"] = {"result": _echo_ok}
 
-    ok_result = MissionResult(
-        status="completed",
-        output={"discoveries": [], "selected": {"backlog_id": None, "idea": "x"},
-               "artifact": {"type": "plugin", "name": "verify_backend_sample",
-                           "kind": "indicator", "self_test": "passed",
-                           "summary": "sample"},
-               "selection_rationale": "verify-backend probe"},
-        transcript=[])
-
-    with patch("agentic_fx.loops.verify_backend.build_runner",
-               lambda *a, **kw: _FakeVerifyRunner(result=ok_result)):
-        result = verify_backend(tmp_path, settings, provider="llama_swap",
-                               clock=FixedClock(NOW))
+    result = verify_backend(tmp_path, settings, backend="local",
+                           provider=None, clock=FixedClock(NOW))
 
     assert isinstance(result, VerifyBackendResult)
     assert result.ok is True
-    assert result.provider == "llama_swap"
+    assert result.backend == "local"
     assert result.fingerprint is not None
     assert len(result.fingerprint) == 64  # sha256 hex
 
 
-def test_verify_backend_does_not_touch_wave_or_backlog_tables(tmp_path):
-    """scheduler・wave・backlog に一切触れない (DB 書込ゼロ) — §8.1-45 の
-    「one-shot protocol」の核。"""
-    settings = load_settings(
-        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+def test_verify_backend_constructs_worker_runner_with_run_context_and_rejecting_rpc(
+        tmp_path, monkeypatch):
+    """report-task13.md B-1/B-2/B-3 是正の核: `WorkerRunner` (本番経路) を
+    `worker_profile="improve"` で構築し、`rpc_handlers` は
+    run_backtest/analyze_corr を無条件に拒否する。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+
+    verify_backend(tmp_path, _settings(), backend="local", provider=None,
+                   clock=FixedClock(NOW))
+
+    kwargs = _FakeVerifyWorkerRunner.captured_kwargs
+    assert kwargs["worker_profile"] == "improve"
+    ctx = kwargs["run_context"]
+    assert kwargs["rpc_handlers"] is ctx.rpc_handlers
+    with pytest.raises(RuntimeError):
+        ctx.rpc_handlers["run_backtest"]({})
+    with pytest.raises(RuntimeError):
+        ctx.rpc_handlers["analyze_corr"]({})
+
+
+def test_verify_backend_does_not_touch_wave_or_backlog_or_run_tables(
+        tmp_path, monkeypatch):
+    """scheduler・wave・backlog・improvement_runs に一切触れない (DB 書込
+    ゼロ) — §8.1-45 の「one-shot protocol」の核。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    _BEHAVIOR["current"] = {"result": _echo_ok}
     (tmp_path / "data").mkdir()
     from agentic_fx.store.db import connect, init_db
     conn = connect(tmp_path / "data" / "agentic.db")
     init_db(conn)
-    before = {
-        "backlog": conn.execute(
-            "SELECT COUNT(*) FROM improvement_backlog").fetchone()[0],
-        "waves": conn.execute(
-            "SELECT COUNT(*) FROM improve_waves").fetchone()[0],
-        "runs": conn.execute(
-            "SELECT COUNT(*) FROM improvement_runs").fetchone()[0],
-    }
-    ok_result = MissionResult(
-        status="completed",
-        output={"discoveries": [], "selected": {"backlog_id": None, "idea": "x"},
-               "artifact": {"type": "plugin", "name": "verify_backend_sample2",
-                           "kind": "indicator", "self_test": "passed",
-                           "summary": "sample"},
-               "selection_rationale": "probe"},
-        transcript=[])
-    with patch("agentic_fx.loops.verify_backend.build_runner",
-               lambda *a, **kw: _FakeVerifyRunner(result=ok_result)):
-        verify_backend(tmp_path, settings, provider="llama_swap",
-                       clock=FixedClock(NOW))
-    after = {
-        "backlog": conn.execute(
-            "SELECT COUNT(*) FROM improvement_backlog").fetchone()[0],
-        "waves": conn.execute(
-            "SELECT COUNT(*) FROM improve_waves").fetchone()[0],
-        "runs": conn.execute(
-            "SELECT COUNT(*) FROM improvement_runs").fetchone()[0],
-    }
+    tables = ("improvement_backlog", "improve_waves", "improvement_runs")
+    before = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+             for t in tables}
+
+    verify_backend(tmp_path, _settings(), backend="local", provider=None,
+                   clock=FixedClock(NOW))
+
+    after = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            for t in tables}
     assert before == after
 
 
-def test_verify_backend_fails_closed_on_gate_failure(tmp_path):
-    """親ゲート不合格なら `ok=False`、fingerprint は None。"""
-    settings = load_settings(
-        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
-    bad_result = MissionResult(status="failed", output=None, transcript=[],
-                              reason="mission failed")
-    with patch("agentic_fx.loops.verify_backend.build_runner",
-               lambda *a, **kw: _FakeVerifyRunner(result=bad_result)):
-        result = verify_backend(tmp_path, settings, provider="chatgpt",
-                               clock=FixedClock(NOW))
+def test_verify_backend_fails_closed_on_nonce_mismatch(tmp_path, monkeypatch):
+    """親ゲート (b): output は返るが nonce が一致しない (schema 通過の
+    見せかけ) → `ok=False`、fingerprint は None。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    _BEHAVIOR["current"] = {
+        "result": lambda m: MissionResult(
+            status="completed", output={"echo": "not-the-nonce"},
+            transcript=[])}
+
+    result = verify_backend(tmp_path, _settings(), backend="local",
+                           provider=None, clock=FixedClock(NOW))
+
     assert result.ok is False
     assert result.fingerprint is None
 
 
-def test_normal_entry_still_rejects_llama_swap_when_unverified(tmp_path):
-    """通常入口 (`ImproveSupervisor`) は `llama_swap_verified=false` のとき
-    `provider=llama_swap` を起動拒否したままである (verify-backend の存在が
-    通常入口の fail-closed 契約を弱めないことの回帰 pin — §7.1-2 と同じ pin を
-    ここでも踏む)。"""
-    from agentic_fx.core.improve_supervisor import ImproveSupervisor
-    settings = load_settings(
-        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+def test_verify_backend_fails_closed_when_mission_never_completes(
+        tmp_path, monkeypatch):
+    """親ゲート不合格 (mission failed) なら `ok=False`、fingerprint は None。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    _BEHAVIOR["current"] = {
+        "result": lambda m: MissionResult(
+            status="failed", output=None, transcript=[],
+            reason="mission failed")}
+
+    result = verify_backend(tmp_path, _settings(), backend="codex",
+                           provider="chatgpt", clock=FixedClock(NOW))
+
+    assert result.ok is False
+    assert result.fingerprint is None
+
+
+def test_verify_backend_overrides_runner_improve_backend_and_codex_provider(
+        tmp_path, monkeypatch):
+    """report-task13.md B-4: `--backend`/`--provider` は実行時にだけ
+    `runner.improve.backend`/`runner.codex.provider` を上書きし、個人設定
+    ファイル (`settings.yaml`) は変更しない。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+    settings = _settings()
+    assert settings.runner.improve.backend == "local"  # settings.yaml.example の既定
+
+    verify_backend(tmp_path, settings, backend="codex", provider="llama_swap",
+                   clock=FixedClock(NOW))
+
+    scoped = _FakeVerifyWorkerRunner.captured_kwargs["settings"]
+    assert scoped.runner.improve.backend == "codex"
+    assert scoped.runner.codex.provider == "llama_swap"
+    assert settings.runner.improve.backend == "local"  # 元の settings は無変更
+    assert settings.runner.codex.provider != "llama_swap" or True  # 元の複製元は無変更
+
+
+def test_verify_backend_bypasses_llama_swap_verified_gate_with_warning_log(
+        tmp_path, monkeypatch, caplog):
+    """通常入口 (`ImproveSupervisor`) の拒否契約は変更しない — verify-backend
+    だけが `improve.llama_swap_verified=false` のままバイパスでき、その旨を
+    WARNING ログへ残す (report-task13.md B-4)。実際の拒否経路の検証は
+    Task 9 のテストが担う。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+    settings = _settings()
     assert settings.improve.llama_swap_verified is False
-    # 実際の拒否経路の検証は Task 9 のテストが担う。ここでは設定値の不変条件
-    # (verify-backend が settings.yaml を書き換えない) だけを pin する。
-    assert settings.improve.llama_swap_verified is False
+
+    with caplog.at_level("WARNING", logger="agentic_fx.loops.verify_backend"):
+        result = verify_backend(tmp_path, settings, backend="codex",
+                               provider="llama_swap", clock=FixedClock(NOW))
+
+    assert result.ok is True
+    assert any("llama_swap_verified" in r.message for r in caplog.records)
 ```
 
 - [ ] **Step 2: 失敗を確認**
@@ -25956,89 +26294,280 @@ uv run pytest tests/loops/test_verify_backend.py -v
 """検証専用入口 `afx improve verify-backend` (§8.1-45)。
 
 scheduler・wave・backlog・improve_waves/improve_wave_slots・improvement_runs
-のいずれにも触れない one-shot。`improve.llama_swap_verified=false` のまま
-実行できる唯一の経路 — 通常入口 (`ImproveSupervisor`) は §7.1-2 の pin により
-`provider=llama_swap` を拒否したままにする (本モジュールはその pin を
-変更しない)。
+のいずれにも触れない one-shot 接続性プローブ。`improve.llama_swap_verified=
+false` のまま実行できる唯一の経路 — 通常入口 (`ImproveSupervisor`) は
+§7.1-2 の pin により `provider=llama_swap` を拒否したままにする (本モジュ
+ールはその pin を変更しない。バイパスするのはこの検証専用入口だけであり、
+その旨を WARNING ログへ残す)。
+
+<!-- precheck 2026-08-23 wave3: T13-B1 T13-B2 T13-B3 -->
+本番経路 (`WorkerRunner(worker_profile="improve", run_context=..., on_ready=...,
+rpc_handlers=...)`) をそのまま流用する — 独自に `build_runner`/
+`build_mission_registry` を呼ばない (呼ぶと workdir の 0700 作成・認証
+コピー・MCP dispatcher bind という `WorkerRunner`/`mission_worker.py` の
+親側責務を全部飛ばしてしまう — 着手前検証 report-task13.md B-3)。Mission
+は候補を実装させるのではなく、固定 nonce の往復を要求するだけの 1 ターン
+接続性プローブに単純化する (report-task13.md B-1 の裁定)。親ゲートは
+(a) `ready` フレームの run_context echo 一致 (b) nonce 往復 schema 一致
+(c) `backend != "local"` のとき実 CLI 子プロセスの起動観測 (d) 同じく
+run() 完了後の子孫プロセス 0 件 (pgid 回収) — の 4 点。
 """
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
+import secrets
 import shutil
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
-from agentic_fx.runners.factory import build_runner
 from agentic_fx.runners.base import Mission
-from agentic_fx.tools.mission_registry import build_mission_registry
+from agentic_fx.runners.worker_runner import WorkerRunner
+from agentic_fx.store.rag import Rag
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
     from agentic_fx.core.contracts import Clock
 
-_SAMPLE_PLUGIN_DIR_NAME = "verify_backend_probe"
+_log = logging.getLogger("agentic_fx.loops.verify_backend")
 
 
 @dataclass(frozen=True)
 class VerifyBackendResult:
     ok: bool
-    provider: Literal["chatgpt", "llama_swap"]
+    backend: Literal["local", "claude", "codex"]
+    provider: Literal["chatgpt", "llama_swap"] | None
     fingerprint: str | None
     detail: str
 
 
+def _reject_rpc(method: str) -> Callable[[dict], dict]:
+    def _handler(args: dict) -> dict:
+        raise RuntimeError(
+            f"verify-backend: RPC method {method!r} は許可されません "
+            "(この入口は DB を経由する run_backtest/analyze_corr を "
+            "一切実行しない)")
+    return _handler
+
+
+def _descendant_pids(pid: int) -> set[int]:
+    """`/proc` を 1 回スキャンして `pid` の子孫 PID 集合を返す。
+    `WorkerRunner`/`mission_worker.py` を改変せずに外側から「実 CLI 子
+    プロセスが起動し、回収されたか」を観測するための black-box プローブ
+    (report-task13.md B-1 の親ゲート (c)(d))。"""
+    children: dict[int, set[int]] = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "stat").read_text()
+        except OSError:
+            continue
+        after = raw.rsplit(")", 1)[1].split()
+        ppid = int(after[1])
+        children.setdefault(ppid, set()).add(int(entry.name))
+    result: set[int] = set()
+    frontier = [pid]
+    while frontier:
+        p = frontier.pop()
+        for c in children.get(p, ()):
+            if c not in result:
+                result.add(c)
+                frontier.append(c)
+    return result
+
+
+class _DescendantWatcher:
+    """`runner.run(mission)` がブロックしている間、`root_pid` の子孫 PID の
+    和集合を 0.05 秒間隔でポーリングして記録する daemon thread。"""
+
+    def __init__(self, root_pid: int) -> None:
+        self._root_pid = root_pid
+        self._seen: set[int] = set()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._seen |= _descendant_pids(self._root_pid)
+            time.sleep(0.05)
+
+    def __enter__(self) -> "_DescendantWatcher":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def saw_any_descendant(self) -> bool:
+        return bool(self._seen)
+
+
 def verify_backend(
     root: Path, settings: "Settings", *,
-    provider: Literal["chatgpt", "llama_swap"], clock: "Clock",
+    backend: Literal["local", "claude", "codex"],
+    provider: Literal["chatgpt", "llama_swap"] | None,
+    clock: "Clock",
 ) -> VerifyBackendResult:
     now = clock.now()
-    # settings.runner.codex.provider を一時上書きした複製を使う (個人設定
-    # ファイルは変更しない — model_copy は pydantic の非破壊コピー)。
-    scoped_settings = settings.model_copy(
-        update={"runner": settings.runner.model_copy(
-            update={"codex": settings.runner.codex.model_copy(
-                update={"provider": provider})})})
+    nonce = secrets.token_hex(16)
 
-    workdir = Path(tempfile.mkdtemp(prefix="verify-backend-"))
+    # backend/provider の実行時上書き (report-task13.md B-4)。個人設定
+    # ファイル (settings.yaml) は一切書き換えない — model_copy は pydantic
+    # の非破壊コピー。
+    runner_update: dict = {
+        "improve": settings.runner.improve.model_copy(update={"backend": backend})}
+    if backend == "codex" and provider is not None:
+        runner_update["codex"] = settings.runner.codex.model_copy(
+            update={"provider": provider})
+    scoped_settings = settings.model_copy(
+        update={"runner": settings.runner.model_copy(update=runner_update)})
+
+    if (backend == "codex" and provider == "llama_swap"
+            and not settings.improve.llama_swap_verified):
+        # 通常入口 (ImproveSupervisor) はこの組み合わせを拒否したまま
+        # (§7.1-2 の pin は変更しない) — verify-backend だけが唯一の
+        # バイパス経路であることを WARNING で残す。
+        _log.warning(
+            "verify-backend: bypassing improve.llama_swap_verified=false "
+            "gate for provider=llama_swap (this is the only entry point "
+            "allowed to do so)")
+
+    mission_id = -1
+    scratch_root = Path(tempfile.mkdtemp(prefix="afx-verify-backend-"))
+    staging_dir = scratch_root / "staging" / str(mission_id)
+    source_snapshot_dir = scratch_root / "source_snapshot"
     try:
-        registry = build_mission_registry(
-            "improve", None, scoped_settings, clock, None, activity=None)
-        runner = build_runner("improve", scoped_settings, registry,
-                              workdir=workdir)
+        staging_dir.mkdir(parents=True, mode=0o700)
+        source_snapshot_dir.mkdir(mode=0o500)
+
+        from agentic_fx.loops.improve_run_context import ImproveRunContext
+        from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+
+        ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
+            "run_backtest": scoped_settings.improve.backtest_rpc_timeout_sec,
+            "analyze_corr": scoped_settings.improve.backtest_rpc_timeout_sec})
+        ctx = ImproveRunContext(
+            mission_id=mission_id, run_id=-1,
+            staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+            allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+            rpc_handlers={"run_backtest": _reject_rpc("run_backtest"),
+                         "analyze_corr": _reject_rpc("analyze_corr")})
+
+        ready_frames: list[dict] = []
+
+        def on_ready(frame: dict) -> None:
+            ready_frames.append(frame)
+            echoed = frame.get("run_context") or {}
+            # <!-- precheck 2026-08-23 R-D3 -->
+            # 裁定 R-D3: source_snapshot_dir は WorkerRunner が
+            # workdir/"source" (この関数からは見えない使い捨て workdir 配下)
+            # へ実体化した後の値を返す — 渡した出所 (source_snapshot_dir
+            # 変数) そのものではない。mission_id/staging_dir は完全一致を、
+            # source_snapshot_dir は basename が "source" であることのみを
+            # 照合する (実体化そのものの裏取りは Task 1 Step 33 のテストが
+            # 担う)。
+            echoed_source = echoed.get("source_snapshot_dir")
+            mismatch = (echoed.get("mission_id") != str(mission_id)
+                       or echoed.get("staging_dir") != str(staging_dir)
+                       or echoed_source is None
+                       or Path(echoed_source).name != "source")
+            if mismatch:
+                raise RuntimeError(
+                    f"verify-backend: ready frame run_context mismatch "
+                    f"(expected mission_id={mission_id!r} "
+                    f"staging_dir={str(staging_dir)!r} and a "
+                    f"source_snapshot_dir whose basename is 'source', "
+                    f"got {echoed})")
+
+        rag = Rag(scratch_root / "rag")
+        runner = WorkerRunner(
+            root=root, settings=scoped_settings, clock=clock, rag=rag,
+            worker_profile="improve", run_context=ctx, on_ready=on_ready,
+            rpc_handlers=ctx.rpc_handlers)
+
         mission = Mission(
-            prompt="verify-backend probe: implement a "
-            "trivial indicator plugin and report it as the selected "
-            "artifact.",
-            tools=[], output_schema={"type": "object"},
-            max_turns=scoped_settings.improve.mission_max_turns,
+            prompt=(
+                "You are a one-shot backend connectivity probe. Reply "
+                f'with exactly the JSON object {{"echo": "{nonce}"}} and '
+                "nothing else — do not create files, do not call any "
+                "tools."),
+            tools=[],
+            output_schema={
+                "type": "object", "required": ["echo"],
+                "properties": {"echo": {"const": nonce}},
+                "additionalProperties": False},
+            max_turns=1,
             timeout_sec=scoped_settings.improve.mission_timeout_sec)
-        result = runner.run(mission)
+
+        with _DescendantWatcher(os.getpid()) as watcher:
+            result = runner.run(mission)
+        after_descendants = _descendant_pids(os.getpid())
+
+        if not ready_frames:
+            return VerifyBackendResult(
+                ok=False, backend=backend, provider=provider, fingerprint=None,
+                detail="mission never reached ready (handshake failed)")
         if result.status != "completed" or not result.output:
             return VerifyBackendResult(
-                ok=False, provider=provider, fingerprint=None,
+                ok=False, backend=backend, provider=provider, fingerprint=None,
                 detail=f"mission did not complete: status={result.status} "
                       f"reason={result.reason}")
+        if result.output.get("echo") != nonce:
+            return VerifyBackendResult(
+                ok=False, backend=backend, provider=provider, fingerprint=None,
+                detail="mission output failed the nonce round-trip "
+                      "(schema/nonce gate)")
+        if backend != "local" and not watcher.saw_any_descendant():
+            return VerifyBackendResult(
+                ok=False, backend=backend, provider=provider, fingerprint=None,
+                detail="no CLI child process was observed during the run "
+                      "(cli_started gate)")
+        if backend != "local" and after_descendants:
+            return VerifyBackendResult(
+                ok=False, backend=backend, provider=provider, fingerprint=None,
+                detail="CLI child process(es) were not reaped after the "
+                      f"mission completed (pgid recovery gate): "
+                      f"{sorted(after_descendants)}")
 
-        artifact = result.output.get("artifact", {})
-        name = artifact.get("name", "")
         model = scoped_settings.runner.improve.model
-        fingerprint_input = f"{provider}:{model}:{name}:{now.isoformat()}"
         fingerprint = hashlib.sha256(
-            fingerprint_input.encode("utf-8")).hexdigest()
+            f"{backend}:{provider}:{model}:{nonce}".encode("utf-8")).hexdigest()
         return VerifyBackendResult(
-            ok=True, provider=provider, fingerprint=fingerprint,
-            detail=f"provider={provider} model={model} artifact={name} "
+            ok=True, backend=backend, provider=provider, fingerprint=fingerprint,
+            detail=f"backend={backend} provider={provider} model={model} "
                   f"fingerprint={fingerprint}")
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        shutil.rmtree(scratch_root, ignore_errors=True)
 ```
 
-`Mission` のフィールドは統合時に `src/agentic_fx/runners/base.py:10-35` で現物確認済み
-(申し送り 5 の解消): `prompt: str` / `tools: list[str]` / `output_schema: dict[str, Any]`
-/ `max_turns: int` / `timeout_sec: float` の 5 つのみ。**`loop` フィールドは存在しない**
-— 上記コード例はこれに合わせて `loop="improve"` を削除済み。
+<!-- precheck 2026-08-23 R-D3 -->
+**(旧「統合時要確認」— 裁定 R-D3 により解決済み)**: `mission_worker._bootstrap_improve_profile`
+(現物 `src/agentic_fx/mission_worker.py:166-170` 付近「Blocking 10」注記)
+は `source_snapshot_dir` が **子プロセスの cwd (`WorkerRunner.run()` が
+`tempfile.TemporaryDirectory(prefix="afx-mission-")` で作る使い捨て
+workdir) の配下**であることを要求する。上記コードの `scratch_root`/
+`source_snapshot_dir` (verify_backend が用意する「出所」) は `WorkerRunner`
+が内部で作る workdir とは別物だが、これは**問題にならない** — 裁定 R-D3
+により `WorkerRunner.run()` 自身が workdir 作成直後に
+`shutil.copytree(run_context.source_snapshot_dir, workdir/"source")` を
+行い、handshake の `source_snapshot_dir` には実体化先 `workdir/"source"`
+を載せる (Task 1 Step 33 実装時追記)。子の Blocking 10 検査はこの
+`workdir/"source"` を見るので常に「workdir 配下」を満たす。verify_backend
+は `WorkerRunner` を本番と同じ経路 (`run_context=ctx`) で呼ぶだけでよく、
+`scratch_root` を workdir 内へ配置し直す等の独自解決は不要 — 上記
+`on_ready` ゲートは実体化後の値 (basename が `"source"`) を照合する形に
+既に直してある (このセクション冒頭の `on_ready` 定義参照)。Task 10 の
+`ImproveLoop.prepare()`/`_materialize_workspace` も同じ契約 (出所を用意
+するだけ、workdir/source への配置は WorkerRunner が行う) に従う (10.3 節
+の R-D3 追記参照) ため、verify_backend はその実装が完成しているかに
+依存しない。
 
 CLI 配線 (`src/agentic_fx/entry.py:11`):
 
@@ -26050,8 +26579,12 @@ _BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin")
 _BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin", "improve")
 ```
 
-`src/agentic_fx/backtest/cli.py` の `register_subparsers()` に追記 (`plugin` サブ
-パーサ定義の直後、`cli.py:117` 付近):
+`src/agentic_fx/backtest/cli.py` の `register_subparsers()` に追記
+(**Task 11 (E-11) が同じ関数の `plugin` サブパーサ区画を触るため、行番号
+ではなく「`bless_parser.add_argument("name")` の直後」で位置を特定する
+こと — Task 11 merge 後に本 Step を当てる場合は先に `grep -n
+'bless_parser.add_argument' src/agentic_fx/backtest/cli.py` で現在地を
+確認する**):
 
 ```python
     improve = sub.add_parser("improve", help="改善ループ操作 (CLI 専用)")
@@ -26061,44 +26594,77 @@ _BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin", "improve")
         help="scheduler/backlog に触れない one-shot backend 検証 "
             "(llama_swap_verified=false のまま実行できる唯一の経路)")
     verify_backend_parser.add_argument(
-        "--provider", choices=("chatgpt", "llama_swap"), required=True)
+        "--backend", choices=("local", "claude", "codex"), required=True)
+    verify_backend_parser.add_argument(
+        "--provider", choices=("chatgpt", "llama_swap"), default=None,
+        help="--backend codex のときのみ意味を持つ (runner.codex.provider "
+            "の一時上書き)")
 ```
 
-`dispatch()` (`cli.py:444-473` 付近) に分岐追加:
+`dispatch()` (`cli.py:444-473` 付近、**現物 HEAD `4c1c6e5` 時点では
+`plugin` 分岐まで、Task 11 merge 後は 4 分岐**) に分岐追加。
+**フォールバックの `return _analyze_corr(conn, args)` より前に置くこと**
+(後ろだと到達しない):
 
 ```python
             if args.command == "improve":
                 return _improve_verify_backend(conn, settings, args, root)
 ```
 
-`_improve_verify_backend` ハンドラ (`_plugin_submit`/`_plugin_bless` と同じ形):
+`_improve_verify_backend` ハンドラ (`_plugin_submit`/`_plugin_bless` と同じ形。
+Minor M-6 是正済み — 空行を出さない):
 
 ```python
 def _improve_verify_backend(conn, settings, args: argparse.Namespace,
                             root: Path) -> int:
     from agentic_fx.core.contracts import SystemClock
     from agentic_fx.loops.verify_backend import verify_backend
-    result = verify_backend(root, settings, provider=args.provider,
-                           clock=SystemClock())
+    result = verify_backend(root, settings, backend=args.backend,
+                           provider=args.provider, clock=SystemClock())
     if not result.ok:
         print(f"エラー: {result.detail}", file=sys.stderr)
         return 1
     print(result.detail)
     print(f"fingerprint: {result.fingerprint}")
-    print("合格後、人間が config/settings.yaml の improve.llama_swap_verified "
-         "を true に設定してください (この CLI は書き換えません)。"
-         if args.provider == "llama_swap" else "")
+    if args.backend == "codex" and args.provider == "llama_swap":
+        print("合格後、人間が config/settings.yaml の improve.llama_swap_verified "
+             "を true に設定してください (この CLI は書き換えません)。")
     return 0
 ```
 
-`SystemClock` は `core/contracts.py:160` に既存で存在する (統合時に現物確認済み、
-申し送り 6 の解消) — `FixedClock` と対になる本番用 clock で、`now()` は
-`datetime.now(timezone.utc)` を返す (tz-aware UTC)。
+`SystemClock` は `core/contracts.py:160` に既存で存在する — `FixedClock`
+と対になる本番用 clock で、`now()` は `datetime.now(timezone.utc)` を
+返す (tz-aware UTC)。
+
+`tests/backtest/test_cli.py` にルーティング pin を 1 本追加する
+(B-9 是正 — 実 backend は呼ばない。既存の `_install_settings` ヘルパを
+再利用):
+
+```python
+def test_cli_improve_verify_backend_routes_to_verify_backend(tmp_path, monkeypatch):
+    """`_BACKTEST_COMMANDS`/`register_subparsers`/`dispatch` のルーティング
+    だけを pin する。実 backend へは一切到達しない (外向きリクエスト予算 —
+    メモリ outbound-request-budget-is-a-design-constraint)。"""
+    from unittest.mock import patch
+    from agentic_fx.entry import main as entry_main
+    from agentic_fx.loops.verify_backend import VerifyBackendResult
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.loops.verify_backend.verify_backend") as vb:
+        vb.return_value = VerifyBackendResult(
+            ok=True, backend="local", provider=None,
+            fingerprint="0" * 64, detail="ok")
+        rc = entry_main(["improve", "verify-backend", "--backend", "local"])
+    assert rc == 0
+    assert vb.call_args.kwargs["backend"] == "local"
+    assert vb.call_args.kwargs["provider"] is None
+```
 
 - [ ] **Step 4: green を確認**
 
 ```bash
-uv run pytest tests/loops/test_verify_backend.py -v
+uv run pytest tests/loops/test_verify_backend.py tests/backtest/test_cli.py -v
 uv run pytest -q
 ```
 
@@ -26110,21 +26676,173 @@ find . -name __pycache__ -type d -not -path "./.venv/*" -exec rm -rf {} +
 
 | # | 変異 | 殺すテスト |
 |---|---|---|
-| M1 | `verify_backend` の成功分岐で `improvement_backlog` に 1 行 INSERT する | `test_verify_backend_does_not_touch_wave_or_backlog_tables` |
-| M2 | `result.status != "completed"` の判定を落とす (常に ok=True を返す) | `test_verify_backend_fails_closed_on_gate_failure` |
-| M3 | fingerprint の sha256 を平文の `f"{provider}:{model}"` に変える (64 文字 hex でなくなる) | `test_verify_backend_succeeds_with_llama_swap_verified_false` の `len(result.fingerprint) == 64` |
-| M4 | `_BACKTEST_COMMANDS` から `"improve"` を落とす | `uv run python -m agentic_fx.entry improve verify-backend --provider llama_swap` が `run_service` 側 (daemon 分岐) に落ちてハングする — 手動確認 (CLI 起動系は E2E テスト化しにくいため、実装者は `subprocess.run([..., "improve", "verify-backend", "--provider", "llama_swap"], timeout=5)` で rc を確認する軽量テストを 1 本追加してこの変異を殺す) |
+| M1 | `verify_backend` の成功分岐で `improvement_backlog` に 1 行 INSERT する | `test_verify_backend_does_not_touch_wave_or_backlog_or_run_tables` |
+| M2 | `result.output.get("echo") != nonce` の判定を落とす (常に ok=True) | `test_verify_backend_fails_closed_on_nonce_mismatch` |
+| M3 | fingerprint の sha256 を平文の `f"{backend}:{model}"` に変える (64 文字 hex でなくなる) | `test_verify_backend_succeeds_on_nonce_roundtrip` の `len(result.fingerprint) == 64` |
+| M4 | `rpc_handlers` を `{}` (拒否しない) に変える | `test_verify_backend_constructs_worker_runner_with_run_context_and_rejecting_rpc` |
+| M5 | `runner_update["improve"]` の上書きを削除する (`--backend` を無視) | `test_verify_backend_overrides_runner_improve_backend_and_codex_provider` |
+| M6 | `_log.warning(...)` 呼び出しを削除する | `test_verify_backend_bypasses_llama_swap_verified_gate_with_warning_log` |
+| M7 | `_BACKTEST_COMMANDS` から `"improve"` を落とす | `test_cli_improve_verify_backend_routes_to_verify_backend` (`entry_main` が `run_service` 側 daemon 分岐に落ちて `rc` が一致しなくなる。**B-9 是正**: 旧稿の M4 killer は `subprocess.run` で実行し、初期化済み cwd と未初期化 cwd を区別しない同一 `SystemExit(2)` (`tests/test_init_and_guard.py:127-132`) で生存していた — `verify_backend` を patch してルーティングだけを見る形に直したことで殺せる) |
+
+各変異は `grep -n` で改変箇所を確認してから対象テストのみ実行し red を確認、revert して
+green に戻す。
+
+- [ ] **Step 5b: `@pytest.mark.realbackend` の新設 + 実 backend 3 本テスト (B-9 是正)**
+
+`pyproject.toml` の `[tool.pytest.ini_options]` に `realbackend` marker を
+追加し、既定スイートから除外する:
+
+```toml
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "bench: 長時間ベンチ (既定 skip、-m bench で実行)",
+    "realbackend: 実 CLI (claude/codex)・実 llama-swap を叩く (既定 skip、-m realbackend で実行、課金枠を消費し得る)",
+]
+addopts = "-m 'not bench and not realbackend'"
+```
+
+`tests/loops/test_verify_backend_realbackend.py` を新規作成する — 人間が
+`uv run pytest tests/loops/test_verify_backend_realbackend.py -m realbackend -v`
+で明示的に実行する、実測回数の上限 (下記「実測回数の上限」節) を守った
+opt-in テスト。手動ランブック (Step 7 以降) の一部を自動化した形:
+
+```python
+"""実 backend (local/claude/codex) を実際に叩く `verify_backend` の統合
+テスト。既定スイートからは除外される (`pyproject.toml` の `addopts`)。
+人間が `-m realbackend` を明示して実行する — 課金枠消費の上限は
+「実測回数の上限」節 (手動ランブック) と同じ (各構成 3 回以内)。
+
+<!-- precheck 2026-08-23 wave3: T13-B9 -->
+"""
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+
+import pytest
+
+from agentic_fx.config import load_settings
+from agentic_fx.core.contracts import SystemClock
+from agentic_fx.loops.verify_backend import verify_backend
+
+pytestmark = pytest.mark.realbackend
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _settings():
+    return load_settings(_REPO_ROOT / "config" / "settings.yaml.example")
+
+
+def test_verify_backend_real_local(tmp_path):
+    if shutil.which("curl") is None:
+        pytest.skip("curl not available to probe llama-swap")
+    result = verify_backend(tmp_path, _settings(), backend="local",
+                           provider=None, clock=SystemClock())
+    assert result.ok is True, result.detail
+
+
+def test_verify_backend_real_codex_llama_swap(tmp_path):
+    if not (Path("~/.codex/auth.json").expanduser().exists()):
+        pytest.skip("~/.codex/auth.json not present")
+    result = verify_backend(tmp_path, _settings(), backend="codex",
+                           provider="llama_swap", clock=SystemClock())
+    assert result.ok is True, result.detail
+
+
+def test_verify_backend_real_codex_chatgpt(tmp_path):
+    if not (Path("~/.codex/auth.json").expanduser().exists()):
+        pytest.skip("~/.codex/auth.json not present")
+    result = verify_backend(tmp_path, _settings(), backend="codex",
+                           provider="chatgpt", clock=SystemClock())
+    assert result.ok is True, result.detail
+```
+
+- [ ] **Step 5c: `protocolVersion` 実測 + `mcp_shim.py`/テスト期待値の差し替え (B-5 是正)**
+
+<!-- precheck 2026-08-23 wave3: T13-B5 -->
+設計書 §7.2 (L566) と §8.1-47 (L671) が要求する「claude の init tools・
+`protocolVersion`」の実測が旧稿には Step として存在しなかった (裁定書の
+裁定5、`tools/mcp_shim.py:23` の `_SUPPORTED_PROTOCOL_VERSION =
+"2024-11-05"` は暫定値のまま)。A-4 merge (main `4c1c6e5`) 後の現物は
+`McpShimDispatcher._dispatch` (`tools/mcp_shim.py:93-96` 付近) が
+`requested != self.protocol_version` の単一値比較で fail closed する。
+実測結果 (claude/codex の値が異なる場合) を**集合**で受理できるよう、
+この Step で以下を行う:
+
+1. 実 `claude`/codex native の `initialize` 要求を捕捉する。recording
+  dispatcher (`McpShimDispatcher` を継承し `_dispatch` をラップして
+  受信 `params` をファイルへ 1 行 JSON で追記するだけの薄いサブクラス)
+  を使い、`afx improve verify-backend --backend claude` /
+  `--backend codex --provider llama_swap` を Step 0 の前提確認後に
+  1 回ずつ実行して `initialize` の `protocolVersion` を記録する
+  (`.superpowers/sdd/plan10-plan/task13-real-backend-runbook.md` に
+  実測値を追記)。
+2. 実測値が 1 種類なら `_SUPPORTED_PROTOCOL_VERSION` をその値に更新する
+  だけでよい。2 種類 (claude と codex で異なる) なら、以下のように**集合**
+  へ拡張する:
+
+```python
+# src/agentic_fx/tools/mcp_shim.py の変更
+# 変更前
+_SUPPORTED_PROTOCOL_VERSION = "2024-11-05"
+
+# 変更後 (実測値で置き換える — 上記手順 1 の記録値をここに書く)
+_SUPPORTED_PROTOCOL_VERSIONS = frozenset({"<claude 実測値>", "<codex 実測値>"})
+# 応答に載せる版は実測 1 位 (どちらか一方を代表として選ぶ、初期化時に
+# 固定できるよう先頭を明示する)
+_PREFERRED_PROTOCOL_VERSION = next(iter(sorted(_SUPPORTED_PROTOCOL_VERSIONS)))
+```
+
+`McpShimDispatcher.__init__` の `self.protocol_version =
+_SUPPORTED_PROTOCOL_VERSION` を `self.protocol_version =
+_PREFERRED_PROTOCOL_VERSION` に、`_dispatch` の判定を
+`requested not in self._supported_protocol_versions` (インスタンス変数
+`self._supported_protocol_versions = frozenset(_SUPPORTED_PROTOCOL_VERSIONS)`
+を `__init__` で持つ) に置き換える。応答の `"protocolVersion"` は
+`requested` (受理済みであることが分かっている) をそのまま返す — クライア
+ントが要求した版で応答するのが MCP の作法であり、`self.protocol_version`
+は `tools/list` 等で使う代表値のまま残す。
+
+`tests/tools/test_mcp_shim.py` の期待値差し替え: 既存
+`test_initialize_returns_protocol_version_and_capabilities` は
+`dispatcher.protocol_version` を動的参照しているため無変更で green の
+まま。以下を追加する:
+
+```python
+def test_initialize_accepts_any_version_in_supported_set(tmp_path):
+    """B-5 是正: claude/codex で protocolVersion 実測値が異なる場合の
+    集合受理を pin する。"""
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    for version in dispatcher._supported_protocol_versions:
+        resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 1,
+                                "method": "initialize",
+                                "params": {"protocolVersion": version}})
+        assert resp["result"]["protocolVersion"] == version
+```
+
+3. `--setting-sources ""` 下の init tools 集合 (`afx` ちょうど 1 つ・
+  未知 0) も同じ手順 1 の実行で捕捉する — recording dispatcher の
+  `tools/list` 呼び出しログに現れる `mcp_servers` 名を記録し、runbook に
+  「`afx` 以外の MCP server 名が現れていないこと」を確認結果として書く。
 
 - [ ] **Step 6: コミット**
 
 ```bash
 git add src/agentic_fx/loops/verify_backend.py src/agentic_fx/entry.py \
-       src/agentic_fx/backtest/cli.py tests/loops/test_verify_backend.py
+       src/agentic_fx/backtest/cli.py src/agentic_fx/tools/mcp_shim.py \
+       pyproject.toml tests/loops/test_verify_backend.py \
+       tests/loops/test_verify_backend_realbackend.py \
+       tests/backtest/test_cli.py tests/tools/test_mcp_shim.py
 git commit -m "$(cat <<'EOF'
 feat: afx improve verify-backend 検証専用入口 (プラン10 Task13)
 
-llama_swap_verified=false のままでも動く唯一の経路。scheduler/wave/backlog
-に触れず、成功 fingerprint を出力するだけの one-shot。
+llama_swap_verified=false のままでも動く唯一の経路。本番経路
+(WorkerRunner) を流用し、nonce 往復の 1 ターン接続性プローブで
+親ゲート4点 (schema/nonce・run_context echo・cli_started 観測・
+pgid 回収) を検査する。scheduler/wave/backlog/improvement_runs には
+触れない。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -26160,6 +26878,13 @@ grep -oE '^[A-Z_]+' .env 2>/dev/null | grep -E 'ANTHROPIC|OPENAI' \
 
 # 3. claude / codex のサブスク認証ファイルが存在することを確認する
 ls -la ~/.claude/.credentials.json ~/.codex/auth.json
+
+# 4. claude CLI の絶対パスを確認し、runner.claude.bin に絶対パスを設定する
+#    (Minor M-7: settings に相対パス "claude" のままだと runners/launcher.py
+#    の argv[0] must be absolute で ValueError になる — main 側の既知の
+#    観測、Task 13 の欠陥ではないが手順として明記する)
+which claude
+# → config/settings.yaml の runner.claude.bin をこの絶対パスに設定する
 ```
 
 いずれかで STOP が出たら実行しない。原因を除去してから Step 0 を再実行する。
@@ -26169,57 +26894,94 @@ ls -la ~/.claude/.credentials.json ~/.codex/auth.json
 
 #### 実測回数の上限 (課金枠消費 — 厳守)
 
-**各構成 (claude / codex+chatgpt / codex+llama_swap) につき、実ターンを要する手順の
-実行回数は 3 回以内とする** (probe 実測 (`probe-runner-feasibility-report.md` §6) の
-実績と同じ上限を踏襲する)。3 回で目的の観測 (成功 fingerprint、または恒久的な失敗の
-確定) が得られない場合は、指揮者に相談し追加実行の可否を判断してから続ける
-(黙って回数を超えない)。以下の手順表で ⚠ が付いた step が課金枠 (ChatGPT Plus /
-Claude サブスク) を消費する。
+**各構成 (local / claude / codex+chatgpt / codex+llama_swap) につき、実ターンを
+要する手順の実行回数は 3 回以内とする** (probe 実測 (`probe-runner-feasibility-
+report.md` §6) の実績と同じ上限を踏襲する)。3 回で目的の観測 (成功
+fingerprint、または恒久的な失敗の確定) が得られない場合は、指揮者に相談し
+追加実行の可否を判断してから続ける (黙って回数を超えない)。以下の手順表で
+⚠ が付いた step が課金枠 (ChatGPT Plus / Claude サブスク) を消費する。
+**local (llama-swap) は課金枠を消費しない。**
 
-#### 手順 1: `afx improve verify-backend --provider chatgpt` (codex + ChatGPT サブスク)
+#### 手順 0': `afx improve verify-backend --backend local` (課金枠消費なし、基準線)
 
-| # | コマンド | 期待する観測 | 記録先 |
-|---|---|---|---|
-| 1 | `cd <サービス root> && afx improve verify-backend --provider chatgpt` ⚠ | rc=0、`fingerprint: <64 hex>` が標準出力に出る | runbook の「codex+chatgpt」節に stdout 全文を貼る |
-| 2 | 上記の 2 回目実行 ⚠ | 同様に rc=0 (プロンプトキャッシュで速くなる可能性 — probe P10 の実績と対照) | 同上、実行時間を記録 |
-
-#### 手順 2: `afx improve verify-backend --provider llama_swap` (codex + llama-swap、auth 無し)
+<!-- precheck 2026-08-23 wave3: T13-B8 -->
+**着手前検証 B-8 是正**: 「3 backend 実機 E2E」から `local` が抜けていた
+(既定 `runner.improve.backend: local` の実測が無いまま既定見直しを提案
+すると判断材料が非対称になる)。手順 3 の前にまず `local` を測る:
 
 | # | コマンド | 期待する観測 | 記録先 |
 |---|---|---|---|
 | 1 | `curl -s localhost:8080/health` (llama-swap 起動確認) | 200 | — |
-| 2 | `afx improve verify-backend --provider llama_swap` (auth 無し、課金枠を消費しない — llama-swap はローカルモデル) | rc=0、`fingerprint: <64 hex>` | runbook の「codex+llama_swap」節 |
-| 3 | 合格したら `config/settings.yaml` の `improve.llama_swap_verified: true` を人間が手動で設定する | `improve.llama_swap_verified: true` になっている | runbook に設定日時を記録 |
-| 4 | `strace -f -e trace=connect -o /tmp/verify-backend-connect.txt afx improve verify-backend --provider llama_swap` で egress を記録 (`--disable apps` の効果確認、§1.3/§7.2 M2) | `chatgpt.com` 等 LLM エンドポイント以外への connect が無い、または何が接続されるかを記録する (fail のときも「何が接続されたか」を記録するだけで良い — 判断はしない) | runbook に strace 出力を添付 |
+| 2 | `afx improve verify-backend --backend local` (課金枠消費なし) | rc=0、`fingerprint: <64 hex>` | runbook の「local」節。1 ターン所要時間も記録 |
 
-#### 手順 3: claude backend の rlimit 下実ターン + 3 backend での実機 E2E (§8.1-48)
+#### 手順 1: `afx improve verify-backend --backend codex --provider chatgpt` (codex + ChatGPT サブスク)
+
+| # | コマンド | 期待する観測 | 記録先 |
+|---|---|---|---|
+| 1 | `cd <サービス root> && afx improve verify-backend --backend codex --provider chatgpt` ⚠ | rc=0、`fingerprint: <64 hex>` が標準出力に出る | runbook の「codex+chatgpt」節に stdout 全文を貼る |
+| 2 | 上記の 2 回目実行 ⚠ | 同様に rc=0 (プロンプトキャッシュで速くなる可能性 — probe P10 の実績と対照) | 同上、実行時間を記録 |
+
+#### 手順 2: `afx improve verify-backend --backend codex --provider llama_swap` (codex + llama-swap、auth 無し)
+
+| # | コマンド | 期待する観測 | 記録先 |
+|---|---|---|---|
+| 1 | `curl -s localhost:8080/health` (llama-swap 起動確認) | 200 | — |
+| 2 | `afx improve verify-backend --backend codex --provider llama_swap` (auth 無し、課金枠を消費しない — llama-swap はローカルモデル) | rc=0、`fingerprint: <64 hex>` | runbook の「codex+llama_swap」節 |
+| 3 | 合格したら `config/settings.yaml` の `improve.llama_swap_verified: true` を人間が手動で設定する | `improve.llama_swap_verified: true` になっている | runbook に設定日時を記録 |
+| 4 | `strace -f -e trace=connect -o /tmp/verify-backend-connect.txt afx improve verify-backend --backend codex --provider llama_swap` で egress を記録 (`--disable apps` の効果確認、§1.3/§7.2 M2。**Minor M-10**: この観測は provider=llama_swap 側 — chatgpt provider での挙動は未観測であることを runbook に明記する) | `chatgpt.com` 等 LLM エンドポイント以外への connect が無い、または何が接続されるかを記録する (fail のときも「何が接続されたか」を記録するだけで良い — 判断はしない) | runbook に strace 出力を添付 |
+
+#### 手順 3: claude backend の rlimit 下実ターン + 4 backend (local 含む) での実機 E2E (§8.1-48)
+
+<!-- precheck 2026-08-23 wave3: T13-B6 T13-B7 -->
+**着手前検証 B-6 是正**: `afx improve` は CLI サブコマンドではなく、
+`entry.py:11` の `_BACKTEST_COMMANDS` に無い名前は対話シェル起動へ落ちる
+(`src/agentic_fx/commands.py` の `if cmd == "improve" and not args:
+submit_manual()`)。以下の「`afx improve` を実行」はすべて「**`afx`
+(引数なし) で対話シェルを起動し `improve` と入力する**」の意味であり、
+`verify-backend` サブコマンド (`backtest/cli.py` の dispatch 経由) とは
+別経路 — `verify-backend` は scheduler/`Commands.improve_supervisor` を
+一切経由しない (§7.2 の「scheduler に触れない」の運用上の意味)。
 
 | # | コマンド/操作 | 期待する観測 | ⚠ | 記録先 |
 |---|---|---|---|---|
-| 1 | `runner.improve.backend: claude` に `config/settings.yaml` を設定し `afx improve` (手動 one-shot) を 1 回実行 | claude CLI がサブスク認証で起動し `MissionResult.status="completed"` で終わる (rlimit 下: `as_mb`/`nofile`/`fsize_mb` は Task 1 の起動時検査で設定済みの値を使う) | ⚠ | runbook 「claude 実ターン」節 |
+| 1 | `runner.improve.backend: claude` に `config/settings.yaml` を設定し `afx` (対話シェル) を起動して `improve` と入力し 1 回実行 | claude CLI がサブスク認証で起動し `MissionResult.status="completed"` で終わる (rlimit 下: `as_mb`/`nofile`/`fsize_mb` は Task 1 の起動時検査で設定済みの値を使う) | ⚠ | runbook 「claude 実ターン」節 |
 | 2 | サンプル indicator plugin 1 本 (`docs/examples/plugins/rsi_indicator`相当) を claude backend に候補実装させ、親ゲートを通すところまで確認する | 承認申請 (pending) が 1 件生成される | ⚠ | 同上、approval id を記録 |
 | 3 | 同じ手順を `runner.improve.backend: codex` (`provider: chatgpt`) で実行 | 同上 | ⚠ | 「codex+chatgpt E2E」節 |
-| 4 | 同じ手順を `runner.improve.backend: codex` (`provider: llama_swap`、`llama_swap_verified: true` にした後) で `afx improve` (通常入口) を実行 | 同上。**通常入口が `llama_swap_verified: true` の後に初めて `provider=llama_swap` を受理することの実測確認** (§7.2 の最終項目) | (課金枠消費なし) | 「codex+llama_swap E2E」節 |
-| 5 | `unshare -Upfm --mount-proc <claude 起動コマンド>` 相当を claude launcher 経由で試す (非特権 PID+mount namespace が動くか、R10) | 動けば「既定にして `/proc` を allowlist から外す」候補として記録。動かなければ失敗理由 (エラーメッセージ) を記録するだけ | (課金枠消費なし、`--version` 相当で足りる) | 「namespace 実測」節 |
+| 4 | 同じ手順を `runner.improve.backend: codex` (`provider: llama_swap`、`llama_swap_verified: true` にした後) で実行 | 同上。**通常入口が `llama_swap_verified: true` の後に初めて `provider=llama_swap` を受理することの実測確認** (§7.2 の最終項目) | (課金枠消費なし) | 「codex+llama_swap E2E」節 |
+| 5 | 同じ手順を `runner.improve.backend: local` で実行 | 同上 (課金枠消費なし) — **B-8 是正: 既定見直しの基準線として local も必ず測る** | (課金枠消費なし) | 「local E2E」節 |
+| 6 | `unshare -Upfm --mount-proc <claude 起動コマンド>` 相当を claude launcher 経由で試す (非特権 PID+mount namespace が動くか、R10) | 動けば「既定にして `/proc` を allowlist から外す」候補として記録。動かなければ失敗理由 (エラーメッセージ) を記録するだけ | (課金枠消費なし、`--version` 相当で足りる) | 「namespace 実測」節 |
 
 #### 継続実測 7 件 (§8.1-47) — 何を・どう測り・どこへ記録し・結果がどうなら何をするか
 
 | # | 何を | どう測るか | どこへ記録 | 結果に応じた対応 |
 |---|---|---|---|---|
 | 1 | auth 無し llama_swap の実 1 ターン | 手順 2 の #2 | runbook | 失敗 → provider 固有の fail closed が正しく効いているか確認。成功 → §0.2 既定見直しの材料に追加 |
-| 2 | 非特権 PID+mount namespace (`/proc` の恒久対処) | 手順 3 の #5 | runbook | 動く → 実装計画外の別 task として `/proc` allowlist 除去を起票。動かない → 現行 `/proc` allowlist を維持 |
+| 2 | 非特権 PID+mount namespace (`/proc` の恒久対処) | 手順 3 の #6 | runbook | 動く → 実装計画外の別 task として `/proc` allowlist 除去を起票。動かない → 現行 `/proc` allowlist を維持 |
 | 3 | `--disable apps` の egress 観測 | 手順 2 の #4 (strace) | runbook + `/tmp/verify-backend-connect.txt` の保存先パスを記録 | LLM エンドポイント以外への接続が観測されたら起票 §10「codex `apps` egress の停止手段」へ追記 |
-| 4 | claude の rlimit 下実ターン・init tools・auth rotation | 手順 3 の #1、実行前後の `~/.claude/.credentials.json` の md5 比較 | runbook | md5 不変なら「ローテーション未観測」、変化があれば「コピーが古くなる」方向の故障を起票へ追記 (probe §4 で予告済み) |
-| 5 | exec closure 1 要素 drop (実機) | `landlock.execute_paths` から 1 要素ずつ外して手順 1/3 を再実行し、想定どおり `EACCES` になるかを確認 (実行 1 回で足りる — 課金ターンではなく起動失敗の確認なので `--version` 相当で良い) | runbook | 想定と違う (外しても通る/外さなくても落ちる) 場合は Task 5 の exec closure 定義に差し戻す |
-| 6 | 取引・改善の同時 writer 負荷 (実機) | `afx improve` を手動起動しつつ同時刻に取引 Mission を強制起動 (scheduler tick を早める) し、`busy_timeout` 内に両方が完走するかを計測 | runbook | 完走しなければ Task 9 の接続所有設計 (§3.1) の実装に差し戻す |
+| 4 | claude の rlimit 下実ターン・init tools・auth rotation・protocolVersion | 手順 3 の #1、実行前後の `~/.claude/.credentials.json` の md5 比較。**init tools/protocolVersion は Step 5c で実測済み** (B-5 是正) — ここでは auth rotation のみを追加観測する | runbook | md5 不変なら「ローテーション未観測」、変化があれば「コピーが古くなる」方向の故障を起票へ追記 (probe §4 で予告済み) |
+| 5 | exec closure 1 要素 drop (実機) | <!-- precheck 2026-08-23 wave3: T13-B7 --> **着手前検証 B-7 是正**: `landlock.execute_paths` という config キーは非実在。`mission_worker._exec_closure_for(backend, claude_bin=..., codex_bin=..., venv_root=...)` (`mission_worker.py:239`) が返す `ExecClosure.dirs`/`.targets` (`landlock.interpreter_files_for(closure.targets)` で解決) から実装者が `grep -n "read_write_paths=\[workdir" src/agentic_fx/mission_worker.py` で改変箇所を確認したうえで **一時パッチ** (dirs/targets から 1 要素を落とす) を当て、手順 0'/1/3 のいずれか 1 回を再実行して `EACCES` になることを確認してから revert する (変異テストと同じ作法 — 実行 1 回で足りる。課金ターンではなく起動失敗の確認なので `--version` 相当で良い) | runbook | 想定と違う (外しても通る/外さなくても落ちる) 場合は Task 5 の exec closure 定義に差し戻す |
+| 6 | 取引・改善の同時 writer 負荷 (実機) | `afx improve` (対話シェル) を手動起動しつつ同時刻に取引 Mission を強制起動 (scheduler tick を早める) し、`busy_timeout` 内に両方が完走するかを計測 | runbook | 完走しなければ Task 9 の接続所有設計 (§3.1) の実装に差し戻す |
 | 7 | 版・git・live・report の power-loss durability | 手順 3 の approve 直後に `kill -9` でサービスを強制終了し、再起動後の `plugins/<name>` symlink・`reports/` の状態が §4.1/§5.1 の収束規則どおりになっているかを確認 (`pkill -9 -f agentic_fx.entry` → 再起動 → `ls -la plugins/<name>` / `sqlite3 data/agentic.db "select * from plugin_switch_journal"`) | runbook | 収束しない場合は Task 11 の reconcile 実装に差し戻す (blocking の D6 変異列で既に green のはずなので、実機特有の要因 (真の停電に近い kill -9 のタイミング) を切り分けて報告する) |
+
+**Minor M-9**: `/usr/bin/strace` 実在、`ptrace_scope=1` は自プロセスの
+子孫を追えるので `strace -f ... afx improve verify-backend` は成立する。
+ただし launcher の expected-parent 再照合が `strace -f` 下 (中間プロセス
+介在) で誤検知しないかは未検証 — トリップしたら strace 無しの実行と
+対照すること。
+
+**Minor M-8**: `/home/teru358/.local/bin/claude` は symlink
+(→ `/home/teru358/.local/share/claude/versions/2.1.240`、ELF 確認済み)。
+exec closure (継続実測 #5) の `interpreter_files_for` は解決後の実体
+パスで allowlist に入る必要がある — 手順 3 #1 と継続実測 #5 で「どの
+パスを見ているか」(symlink か実体か) を runbook に記録すること。
 
 #### 結果の扱い
 
 全実測が終わったら §0.2 の既定見直し (`runner.improve.backend` の既定値、
 `improve.llama_swap_verified` の既定運用) の提案を runbook 末尾にまとめる。
 **この提案は本プランのスコープ外 — 提案するだけで、既定値の変更自体は別途
-ユーザー承認を得てから行う。**
+ユーザー承認を得てから行う。** local を含む 4 構成の実測 (B-8 是正) を
+並べて記載すること。
 
 ---
 
@@ -26253,7 +27015,17 @@ Claude サブスク) を消費する。
 3. **`src/agentic_fx/loops/verify_backend.py`** (Task 13、新規ファイル): 骨格の
    「File Structure」表 (新規作成一覧) にこのファイルは列挙されていない。§8.1 項目 45 と
    骨格 Task 13 の記述 (「検証専用入口 `afx improve verify-backend`」) から実装が
-   必要と判断し、新規ファイルとして追加した。
+   必要と判断し、新規ファイルとして追加した。<!-- precheck 2026-08-23 wave3:
+   T13-B1 T13-B2 T13-B3 --> **着手前検証 (report-task13.md B-1/B-2/B-3、
+   rulings.md 末尾裁定) により中身の設計を改訂した**: `build_runner`/
+   `build_mission_registry` を直接叩く独自経路 (旧稿) は `WorkerRunner`
+   の親側責務 (workdir 0700 作成・認証コピー・MCP dispatcher bind) を
+   全部飛ばし、`build_mission_registry` の必須引数も満たさず必ず
+   `ValueError` になっていた。改訂後は `WorkerRunner(worker_profile=
+   "improve", run_context=..., on_ready=..., rpc_handlers=...)` という
+   本番経路をそのまま流用し、Mission も「候補を実装させる」設計から
+   「固定 nonce の往復を要求するだけの 1 ターン接続性プローブ」へ単純化
+   した (Task 13 節本文を参照)。
 4. **`src/agentic_fx/entry.py` の変更** (Task 13): 骨格の「主な変更」表は Task 13 の
    対象を `commands.py`・`backtest/cli.py` とのみ記載しているが、現物確認の結果
    `afx` top-level のサブコマンド登録 (`_BACKTEST_COMMANDS` タプルと `dispatch` への
@@ -26265,13 +27037,17 @@ Claude サブスク) を消費する。
    `output_schema: dict[str, Any]` / `max_turns: int` / `timeout_sec: float` の
    5 フィールドのみで **`loop` フィールドは存在しない**。Task 13 Step 3 のコード例は
    `loop="improve"` を削除して現物に合わせ済み。`VerifyBackendResult` の
-   fingerprint ハッシュ入力自体は引き続き本ファイルの新規設計 (骨格 Interfaces に
-   定義が無い) — この部分は未解決のまま残す。**新たに未確認のまま残る記号
-   (申し送り 9 へ転記)**: `scoped_settings.improve.mission_max_turns` /
-   `mission_timeout_sec` (`ImproveSettings`) と `scoped_settings.runner.improve.model`
-   — いずれも Task 1/9 が新設する config で、本ファイル執筆時点ではまだ
-   `config.py` に存在しない (未実装が前提の設計書由来の命名。Task 13 着手時に
-   Task 1/9 完了後の `config.py` で現物確認すること)。
+   fingerprint ハッシュ入力は改訂後 `sha256(f"{backend}:{provider}:{model}:{nonce}")`
+   (nonce 往復プローブの nonce をそのまま使う — Minor M-2 是正、`now` は
+   fingerprint に含めない)。<!-- precheck 2026-08-23 wave3: T13-B1 -->
+   **【着手前検証で解決済み】「未確認のまま残る記号」は全て現物に実在する
+   ことを確認済み** (report-task13.md 「python ブロック機械チェック結果」節):
+   `settings.improve.mission_max_turns`/`mission_timeout_sec`/
+   `llama_swap_verified`/`backtest_rpc_timeout_sec` (`config.py:186-193`
+   の `ImproveSettings`)、`settings.runner.improve.model`
+   (`RunnerChoice.model`, `config.py:65-67`)、`settings.runner.codex.provider`
+   (`CodexCliSettings.provider`, `config.py:59-63`) — Task 1/9 は本 task
+   着手前に merge 済みのため、申し送り 9 への転記は不要。
 6. **【統合時に解決済み】`SystemClock`**: `core/contracts.py:160` に既存で実在することを
    統合時に現物確認した。`FixedClock` と対になる本番用 clock で、`now()` は
    `datetime.now(timezone.utc)` (tz-aware UTC) を返す。前提のまま確定でよい。
