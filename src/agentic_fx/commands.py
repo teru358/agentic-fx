@@ -20,6 +20,7 @@ _HELP = """コマンド一覧:
   activity [n] [カテゴリ]     activity ログ (NEWS/TECH/AGGREGATE/TRADE/IMPROVE/APPROVAL/SYSTEM)
   ask <質問>                  臨時 Mission (回答専用 — 発注はしない)
   approve <id> / reject <id> [理由]   承認操作
+  approval retry <id>        承認手順を頭から再試行 (§5.3 契機③)
   killswitch reset           kill switch ラッチの解除 (人間の明示操作)
   reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
   improve                    手動 improve one-shot (全バックログ担当)
@@ -36,7 +37,9 @@ class Commands:
                  log_dir: Path, clock: Clock,
                  health_latch: HealthLatch | None = None,
                  improve_supervisor: object | None = None,
-                 policy_path: Path | None = None) -> None:
+                 policy_path: Path | None = None,
+                 plugins_root: Path | None = None,
+                 settings: object | None = None) -> None:
         self.conn = conn
         self.state = state_store
         self.broker = broker
@@ -47,6 +50,11 @@ class Commands:
         self.health_latch = health_latch or HealthLatch()
         self.improve_supervisor = improve_supervisor
         self._policy_path = policy_path
+        # プラン10 Task11e/11g: `approval retry <id>` シェルコマンド、および
+        # kind="plugin" の approve/reject を switch.py (plugin flock 経由)
+        # へ振り分けるために必要 (B-1 是正)。
+        self.plugins_root = plugins_root
+        self.settings = settings
 
     def dispatch(self, line: str) -> str:
         parts = line.strip().split()
@@ -80,6 +88,20 @@ class Commands:
                 self.activity.write(Category.APPROVAL, "rejected",
                                     f"#{args[0]} via shell", ref_id=args[0])
                 return f"approval #{args[0]} rejected"
+            if cmd == "approval" and len(args) == 2 and args[0] == "retry":
+                # §5.3 契機③ (11e 新規命名): 手順を頭から再試行する。
+                # plugin flock を経由する switch.retry_approval を呼ぶため
+                # plugins_root/settings の配線が必須 (B-1 是正)。
+                if self.plugins_root is None or self.settings is None:
+                    return "approval retry backend (plugins_root/settings) が未配線です"
+                from agentic_fx.plugin import switch as plugin_switch
+                approval_id = int(args[1])
+                plugin_switch.retry_approval(
+                    self.conn, approval_id, decided_by="shell", now=self.clock.now(),
+                    plugins_root=self.plugins_root, settings=self.settings)
+                self.activity.write(Category.APPROVAL, "retry",
+                                    f"#{approval_id} via shell", ref_id=str(approval_id))
+                return f"approval #{approval_id} を再試行しました"
             if cmd == "killswitch" and args and args[0] == "reset":
                 self.state.update(kill_switch_latched=False)
                 self.activity.write(Category.SYSTEM, "kill_switch_reset",

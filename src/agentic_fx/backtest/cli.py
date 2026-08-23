@@ -31,6 +31,7 @@ from agentic_fx.plugin import approval as plugin_approval
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin import strategy_adapter
+from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.service import ensure_initialized
 from agentic_fx.store import backtest_runs, ohlcv
 from agentic_fx.store.db import connect, init_db
@@ -112,9 +113,24 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     submit = plugin_sub.add_parser(
         "submit", help="plugin を検証し承認申請 (pending) 行を作る")
     submit.add_argument("name")
+    submit.add_argument(
+        "--from", dest="from_kind", choices=["_human"], default=None,
+        help="'_human' なら plugins/_human/<name> の候補を submit する "
+             "(P1 candidate_origin=human、プラン10 Task11)")
     bless_parser = plugin_sub.add_parser(
         "bless", help="plugin を検証し即時承認する (人間 CLI 専用)")
     bless_parser.add_argument("name")
+    bless_parser.add_argument(
+        "--from", dest="from_kind", choices=["_human"], default=None,
+        help="'_human' 必須 (裁定3: 指定なしは常に拒否 — materialize を案内)")
+    materialize_parser = plugin_sub.add_parser(
+        "materialize", help="live plain plugin を plugins/_human/<name> へ"
+                            "読み取り専用コピーする (0700/0600)")
+    materialize_parser.add_argument("name")
+    retire_parser = plugin_sub.add_parser(
+        "retire", help="legacy plain live plugin を plugins/_retired/ へ退避する"
+                       " (flock、未完ジャーナルは拒否)")
+    retire_parser.add_argument("name")
 
 
 # ---- history import ------------------------------------------------------
@@ -404,7 +420,30 @@ def _find_plugin_meta(root: Path, name: str):
     return plugins_dir, next((m for m in metas if m.name == name), None)
 
 
+# 裁定3 (11d/11e): `afx plugin bless <name>` (--from なし) は常に拒否する。
+_BLESS_NO_FROM_ERROR = (
+    "afx plugin bless <name> は廃止されました。"
+    "'afx plugin materialize <name>' で候補を書き出し、編集してから "
+    "'afx plugin bless --from _human <name>' を実行してください。")
+
+
 def _plugin_submit(conn, settings, args: argparse.Namespace, root: Path) -> int:
+    if getattr(args, "from_kind", None) == "_human":
+        # 11d/11e: --from _human は switch.submit_candidate (P1) を通す
+        # (candidate_origin="human" — plugins/_human/<name> を候補にする)
+        plugins_dir = root / "plugins"
+        try:
+            approval_id = plugin_switch.submit_candidate(
+                conn, name=args.name, staging_dir=plugins_dir / "_human",
+                candidate_origin="human", mission_id=None, backlog_id=None,
+                settings=settings, now=datetime.now(timezone.utc))
+        except (ValueError, plugin_sandbox.SandboxError,
+                plugin_switch.CandidateMissingError) as e:
+            print(f"エラー: {e}", file=sys.stderr)
+            return 1
+        print(f"承認申請 id={approval_id} (pending)")
+        return 0
+
     plugins_dir, meta = _find_plugin_meta(root, args.name)
     if meta is None:
         print(f"エラー: plugin '{args.name}' が {plugins_dir} に見つかりません "
@@ -422,19 +461,43 @@ def _plugin_submit(conn, settings, args: argparse.Namespace, root: Path) -> int:
 
 
 def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
-    plugins_dir, meta = _find_plugin_meta(root, args.name)
-    if meta is None:
-        print(f"エラー: plugin '{args.name}' が {plugins_dir} に見つかりません "
-             "(discover で検出できる 3 ファイル構成か確認してください)",
-             file=sys.stderr)
+    # 裁定3: --from _human 無しは常に拒否 (materialize を案内)。
+    if getattr(args, "from_kind", None) != "_human":
+        print(_BLESS_NO_FROM_ERROR)
         return 1
+    plugins_dir = root / "plugins"
+    human_dir = plugins_dir / "_human" / args.name
     try:
-        approval_id = plugin_approval.bless(
-            conn, meta, settings=settings, now=datetime.now(timezone.utc))
+        approval_id = plugin_switch.bless_candidate(
+            conn, name=args.name, human_dir=human_dir, settings=settings,
+            now=datetime.now(timezone.utc), decided_by="human_cli")
     except (ValueError, plugin_sandbox.SandboxError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
-    print(f"approval id={approval_id} (approved)")
+    print(f"approval id={approval_id}")
+    return 0
+
+
+def _plugin_materialize(conn, settings, args: argparse.Namespace, root: Path) -> int:
+    plugins_dir = root / "plugins"
+    try:
+        dest = plugin_switch.materialize_plugin(plugins_dir, args.name)
+    except (FileExistsError, FileNotFoundError, OSError) as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        return 1
+    print(f"materialize: {dest}")
+    return 0
+
+
+def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
+    plugins_dir = root / "plugins"
+    try:
+        plugin_switch.retire_plugin(
+            conn, plugins_dir, args.name, now=datetime.now(timezone.utc))
+    except (plugin_switch.UnresolvedJournalError, ValueError, OSError) as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        return 1
+    print(f"plugin {args.name!r} を retire しました")
     return 0
 
 
@@ -464,7 +527,13 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
             if args.command == "plugin":
                 if args.plugin_command == "submit":
                     return _plugin_submit(conn, settings, args, root)
-                return _plugin_bless(conn, settings, args, root)
+                if args.plugin_command == "materialize":
+                    return _plugin_materialize(conn, settings, args, root)
+                if args.plugin_command == "retire":
+                    return _plugin_retire(conn, settings, args, root)
+                if args.plugin_command == "bless":
+                    return _plugin_bless(conn, settings, args, root)
+                raise ValueError(f"unknown plugin subcommand: {args.plugin_command!r}")
             return _analyze_corr(conn, args)
         finally:
             conn.close()

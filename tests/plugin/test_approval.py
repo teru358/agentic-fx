@@ -845,8 +845,14 @@ def test_entry_plugin_submit_dispatches_to_approval_submit_plugin(
     assert "42" in capsys.readouterr().out
 
 
-def test_entry_plugin_bless_dispatches_to_approval_bless(
+def test_entry_plugin_bless_without_from_is_always_rejected(
         tmp_path, monkeypatch, capsys):
+    """プラン10 Task11 裁定3是正: `afx plugin bless <name>` (--from なし) は
+    もはや `approval.bless` へ dispatch しない — 常に拒否し
+    'afx plugin materialize' を案内する (旧テスト
+    `test_entry_plugin_bless_dispatches_to_approval_bless` を置換。11e Step5
+    の CLI 配線変更に伴う既存テスト書き換え — 逐語の 11 箇所リストには
+    無いが、裁定3 の直接の帰結として最終報告の「逸脱」に明記する)。"""
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
     _write_cli_indicator_plugin(tmp_path / "plugins", "ind")
@@ -854,15 +860,12 @@ def test_entry_plugin_bless_dispatches_to_approval_bless(
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
          patch("agentic_fx.entry.service.run_service") as run_service, \
          patch("agentic_fx.plugin.approval.bless") as bless_mock:
-        bless_mock.return_value = 7
         rc = main(["plugin", "bless", "ind"])
 
-    assert rc == 0
+    assert rc != 0
     run_service.assert_not_called()
-    assert bless_mock.called
-    args, kwargs = bless_mock.call_args
-    assert args[1].name == "ind"
-    assert "7" in capsys.readouterr().out
+    assert not bless_mock.called
+    assert "materialize" in capsys.readouterr().out
 
 
 def test_entry_plugin_submit_not_found_rc1(tmp_path, monkeypatch, capsys):

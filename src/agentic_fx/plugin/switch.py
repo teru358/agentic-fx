@@ -525,6 +525,74 @@ def approve_candidate(
             shutil.rmtree(candidate_dir, ignore_errors=True)
 
 
+class UnresolvedJournalError(Exception):
+    """retire は未完 switch ジャーナルがあれば拒否する (§5.1)。"""
+
+
+def materialize_plugin(root: Path, name: str) -> Path:
+    live = root / name
+    dest = root / "_human" / name
+    if dest.exists():
+        raise FileExistsError(f"plugins/_human/{name} already exists — refusing "
+                              "to overwrite (human-owned, auto-delete しない)")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if live.is_symlink():
+        src = (live.parent / live.readlink()).resolve()
+    else:
+        src = live
+    shutil.copytree(src, dest)
+    dest.chmod(0o700)
+    for f in dest.iterdir():
+        f.chmod(0o600)
+    return dest
+
+
+# precheck 2026-08-22 wave2: T11-B2
+def retire_plugin(conn: sqlite3.Connection, root: Path, name: str, *,
+                  now: datetime) -> None:
+    """統合裁定 R-i5 で骨格 Interfaces 節が `conn` 必須へ更新済み
+    (未完ジャーナルの確認に DB 接続が要るため)。"""
+    lock_path = root / ".locks" / f"{name}.lock"
+    lock_path.parent.mkdir(exist_ok=True)
+    with open(lock_path, "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            # B-2: 現物名は `get_open_by_name` (単一行 dict | None を返す —
+            # 非実在の `list_non_terminal_for_name` からの置換)
+            unresolved = journal_store.get_open_by_name(conn, name)
+            if unresolved is not None:
+                raise UnresolvedJournalError(
+                    f"plugin {name!r} has an unresolved switch journal "
+                    f"(op_id={unresolved['op_id']}) — resolve it first "
+                    "(reconcile or approval retry)")
+            live = root / name
+            if not live.is_dir() or live.is_symlink():
+                raise ValueError(f"plugins/{name} is not a plain directory "
+                                 "(retire only applies to legacy plain live)")
+            ts = now.strftime("%Y%m%dT%H%M%SZ")
+            dest = root / "_retired" / f"{name}-{ts}"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(live, dest)
+            # activity plugin_retired — 呼び出し元 (commands.py) が activity
+            # インスタンスを渡す形にする (本関数は FS 操作のみに閉じる、実装
+            # 計画で activity 引数を追加すること — 申し送り)
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+
+
+# precheck 2026-08-22 wave2: T11-B1
+def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
+                   decided_by: str, now: datetime, plugins_root: Path,
+                   settings: "Settings") -> None:
+    """§5.3 契機③: 手順を頭から流す (lock → plain 検出 → ⓓ → ⓐ → 版(冪等) →
+    git(no-op) → 切替(no-op なら済み) → apply_decision)。approve_candidate と
+    同じ実装を呼ぶだけ (retry は「approve をもう一度呼ぶ」と同義 — §5.3 本文)。
+    B-1 是正で plugins_root/settings を追加した (approve_candidate へそのまま
+    透過する)。"""
+    approve_candidate(conn, approval_id, decided_by=decided_by, now=now,
+                      plugins_root=plugins_root, settings=settings)
+
+
 def bless_candidate(
     conn: sqlite3.Connection, *, name: str, human_dir: Path,
     settings, now: datetime, decided_by: str,

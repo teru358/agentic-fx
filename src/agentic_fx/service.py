@@ -935,7 +935,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                             broker=shell_broker,
                             trade_loop=_SupervisorAsk(supervisor, ask_wait_timeout_sec),
                             activity=activity, log_dir=root / "logs", clock=clock,
-                            health_latch=health_latch)
+                            health_latch=health_latch,
+                            plugins_root=plugins_dir, settings=settings)
         return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
                    executor=executor, provider=provider, econ=econ,
