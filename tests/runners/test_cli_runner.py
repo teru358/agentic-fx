@@ -211,6 +211,40 @@ def test_cli_runner_ignoring_sigterm_still_reaches_sigkill_and_empties_pgid(tmp_
     assert _no_process_group_members(seen_pgid["pgid"])
 
 
+def test_cli_runner_terminate_pgid_sends_sigterm_before_sigkill(tmp_path):
+    """#15 (`verified-round1.md` 1-A): `_terminate_pgid` は SIGKILL 到達前に
+    まず SIGTERM を送る。現行の 3 本 (completed/timeout 系) は「最終的に
+    pgid が空になる」ことしか見ないため、`_terminate_pgid` 冒頭の
+    `try: os.killpg(pgid, SIGTERM) except ...: return` を削除して
+    SIGKILL のみにする変異でも SURVIVED する (実測: `stage0`/`round1`)。
+    SIGTERM を捕捉して marker ファイルを書いてから自発終了する fake CLI
+    を使い、「SIGKILL に到達する前に SIGTERM で終わった」ことを marker の
+    存在で観測する (grace を長めに取り、marker が grace 内に現れることを
+    elapsed で確認する = 順序 pin)。"""
+    marker = tmp_path / "sigterm_marker"
+    script = (
+        "import signal, sys, time\n"
+        f"MARKER = {str(marker)!r}\n"
+        "def _h(signum, frame):\n"
+        "    open(MARKER, 'w').write('term')\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, _h)\n"
+        "time.sleep(600)\n"
+    )
+    runner = _new_runner(script, tmp_path, cli_terminate_grace_sec=5.0)
+    start = time.monotonic()
+    result = runner.run(_mission(timeout_sec=0.3))
+    elapsed = time.monotonic() - start
+    assert result.status == "timeout"
+    assert marker.is_file(), (
+        "SIGTERM ハンドラが marker を書く前に終端している — SIGKILL が "
+        "SIGTERM より先/代わりに送られている可能性")
+    assert marker.read_text() == "term"
+    assert elapsed < 5.0, (
+        "grace (5.0s) の SIGKILL タイムアウトまで待たされている — "
+        "SIGTERM で早期終了できていない")
+
+
 def test_cli_runner_cli_pgid_differs_from_worker_process_group(tmp_path):
     """CLI は自分専用の pgid に置かれる (`start_new_session=True`) —
     `killpg` が mission_worker 自身 (このテストプロセス) を殺さない。"""
@@ -267,6 +301,11 @@ def test_cli_runner_does_not_use_subprocess_devnull_for_stdin(tmp_path):
         if isinstance(stdin_fd, int) and stdin_fd >= 0:
             st = os.fstat(stdin_fd)
             captured["stdin_is_chr"] = _stat.S_ISCHR(st.st_mode)
+            # #22 (`verified-round1.md` 1-B): 「character device かつ
+            # O_RDONLY」までは character device であれば任意 (`/dev/zero`
+            # 等) でも通っていた。fd の実体が `/dev/null` そのものであること
+            # まで見る。
+            captured["stdin_target"] = os.readlink(f"/proc/self/fd/{stdin_fd}")
         captured["stdin"] = stdin_fd
         return real_popen(*a, **kw)
 
@@ -279,6 +318,8 @@ def test_cli_runner_does_not_use_subprocess_devnull_for_stdin(tmp_path):
         f"ならない: {stdin_fd!r}")
     assert captured.get("stdin_is_chr") is True, (
         "stdin fd が character device (/dev/null) でない")
+    assert captured.get("stdin_target") == "/dev/null", (
+        f"stdin fd の実体が /dev/null ではない: {captured.get('stdin_target')!r}")
 
 
 def test_cli_runner_env_is_fully_specified_no_secret_keys(tmp_path):
@@ -295,6 +336,12 @@ def test_cli_runner_env_is_fully_specified_no_secret_keys(tmp_path):
     env = captured["env"]
     assert all("API_KEY" not in k and "ANTHROPIC" not in k and "OPENAI" not in k
                for k in env)
+    # #17 (`verified-round1.md` 1-B): キー名部分一致だけだと値に秘密を
+    # 入れる変異・新しい秘密名 (`*_TOKEN` 等) が素通りする。
+    # `_CLAUDE/_CODEX_ENV_ALLOWLIST` と同じ**集合一致**形に寄せる
+    # (`_FakeCliRunner._build_env` は `{"PATH": "/usr/bin:/bin"}` のみ)。
+    assert set(env) == {"PATH"}
+    assert env["PATH"] == "/usr/bin:/bin"
 
 
 def test_cli_runner_reason_is_single_line_and_capped(tmp_path):
@@ -328,13 +375,27 @@ def test_cli_runner_calls_cli_started_sink_with_cli_pgid(tmp_path):
     """<!-- precheck 2026-08-22: T1-B10 --> §7.1-2 の blocking 受入条件の
     送出側: Popen 直後に `cli_started_sink(pgid)` を 1 回呼ぶ (mission_worker
     が out_seq 経由で `{"type":"cli_started","pgid":...}` を親へ転送する
-    送出点)。"""
+    送出点)。
+
+    #19 (`verified-round1.md` 1-B): `cli_started_sink(pgid)` を
+    `cli_started_sink(proc.pid)` に変えても通っていた (`start_new_session=True`
+    により両者は一致するため実害は無いが、その前提が pin されていなかった)。
+    spy で `proc.pid` を捕らえ、`seen[0] == os.getpgid(proc.pid)` を assert する。"""
     seen: list[int] = []
+    seen_pgid: dict[str, int] = {}
+    real_popen = subprocess.Popen
+
+    def spying_popen(*a, **kw):
+        p = real_popen(*a, **kw)
+        seen_pgid["pgid"] = os.getpgid(p.pid)  # spy 時点 (プロセス生存中) で観測
+        return p
+
     runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path,
-                         cli_started_sink=seen.append)
+                         cli_started_sink=seen.append, popen=spying_popen)
     runner.run(_mission())
     assert len(seen) == 1
     assert isinstance(seen[0], int)
+    assert seen[0] == seen_pgid["pgid"]
 
 
 def test_cli_runner_cli_started_sink_is_optional(tmp_path):

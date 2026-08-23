@@ -237,6 +237,119 @@ def test_worker_runner_completes_mission_via_pipes(tmp_path, monkeypatch):
     assert {"role": "user", "content": "hi"} in result.transcript
 
 
+def test_worker_runner_ensure_dead_is_noop_when_child_already_terminated(
+        tmp_path, monkeypatch):
+    """#78 (`verified-round1.md` 1-A): `_ensure_dead` の
+    `if proc.poll() is None:` ガードを削除して無条件に `_kill` を呼ぶ変異は、
+    子が finally 到達時点で既に終了している (`poll()` が非 None を返す)
+    正常系だけでは検出できない — `_kill` 自体は `ProcessLookupError` を
+    握るため結果に差が出ない。`poll()` が終了コードを返す FakeProc で
+    `os.killpg` (=`_kill` 経由の呼び出し) が 0 回であることを直接 assert
+    する。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {"x": 1}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = 0
+
+        def poll(self):
+            return 0  # 既に終了済み (finally 到達時点で reap 不要)
+
+        def wait(self, timeout=None):
+            return 0
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(wr_mod.os, "killpg",
+                        lambda pid, sig: killpg_calls.append((pid, sig)))
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert killpg_calls == [], (
+        "既に終了済みの子に対して _kill (killpg) が呼ばれている — "
+        "_ensure_dead の poll() ガードが無い")
+
+
+def test_worker_runner_kill_swallows_wait_timeout_expired(tmp_path, monkeypatch):
+    """#79 (`verified-round1.md` 1-A): `_kill` の `try: proc.wait(timeout=5)
+    except TimeoutExpired: pass` を素の `proc.wait(timeout=5)` に変える
+    (except 節を削除する) 変異は、`wait()` が実際に `TimeoutExpired` を
+    送出する fake proc が無いと検出できない。`_ensure_dead` → `_kill` が
+    呼ばれる経路 (poll() が None のまま = 生存中) で `wait()` が
+    `subprocess.TimeoutExpired` を送出する FakeProc を使い、`run()` が
+    例外を伝播させず `MissionResult` を返すことを assert する。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {"x": 1}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None  # 常に生存中 → finally で _kill が呼ばれる
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(wr_mod.os, "killpg",
+                        lambda pid, sig: killpg_calls.append((pid, sig)))
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())  # TimeoutExpired が伝播すると例外で落ちる
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert killpg_calls, "_kill (killpg) が呼ばれていない"
+
+
 def test_worker_runner_startup_timeout_kills_child(tmp_path, monkeypatch):
     """`ready` を送らないまま `worker_startup_timeout_sec` を超過させ、
     `_escalate_kill` が呼ばれ `status == "failed"` になることを確認。"""
