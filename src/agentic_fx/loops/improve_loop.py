@@ -21,14 +21,15 @@ from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # 属性未定義で ImportError になり、足しても sys.modules から取り直す
     # ため効かない)
 from agentic_fx.loops.improve_context import build_improve_context
+from agentic_fx.loops.improve_run_context import ImproveRunContext
+from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA  # precheck 2026-08-22 wave2: T10-B12
 from agentic_fx.plugin.gate_pytest import (
     CandidateSnapshotError, check_candidate_snapshot, hashes_of,
     run_gate_pytest,
 )
 from agentic_fx.plugin.sandbox import SandboxError, check_source
-from agentic_fx.loops.improve_run_context import ImproveRunContext
-from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
-from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA  # precheck 2026-08-22 wave2: T10-B12
+from agentic_fx.plugin.strategy_gate import evaluate_strategy_adoption_gate
 from agentic_fx.runners.base import Mission
 from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
@@ -502,6 +503,13 @@ class ImproveLoop:
         return _PluginGateVerdict(
             passed=True, content_hash=content_hash_before,
             artifact_hash=artifact_hash_before)
+
+    def _run_strategy_gate(self, conn, *, name, pairs, timeframe, content_hash,
+                           now, meta, kind="strategy", record_fn=None):
+        return evaluate_strategy_adoption_gate(
+            conn, name=name, pairs=pairs, timeframe=timeframe,
+            content_hash=content_hash, now=now, settings=self._settings,
+            meta=meta, kind=kind, record_fn=record_fn)
 
     def commit(self, *, mission, ctx, result, now):
         raise NotImplementedError  # 10.4〜10.11 節
