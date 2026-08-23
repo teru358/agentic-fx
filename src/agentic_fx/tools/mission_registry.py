@@ -11,7 +11,8 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 
 from agentic_fx.activity import ActivityLog
 from agentic_fx.core.contracts import Clock
@@ -21,12 +22,13 @@ from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.store.rag import Rag
 from agentic_fx.tools import (
     account_tools, market_tools, news_tools, reflection_tools,
-    signal_tools,
+    signal_tools, improve_rpc_tools, improve_staging_tools, research_tools,
 )
 from agentic_fx.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
     from agentic_fx.plugin.loader import PluginMeta
 
 
@@ -35,12 +37,19 @@ def build_mission_registry(
         clock: Clock, rag: Rag, *, activity: ActivityLog,
         indicator_plugins: "list[PluginMeta] | None" = None,
         sandbox_run=None, readonly: bool = False,
-        provider: PriceProvider | None = None) -> ToolRegistry:
-    """`loop` は本プランでは配線を分岐しない (常に同じ全ツール集合を
-    構築する) — forward-compat 引数。どのツールを実際に Mission に
-    見せるかは呼び出し側の `Mission.tools` リスト (`_TRADE_TOOLS` 等) が
-    決める。将来の improve 系 registry 分岐 (プラン 9) で `loop` を
-    使い始める想定。
+        provider: PriceProvider | None = None,
+        staging_dir: "Path | None" = None,
+        source_snapshot_dir: "Path | None" = None,
+        ledger: "ImproveRpcLedger | None" = None,
+        rpc_handlers: "dict[str, Callable[[dict], dict]] | None" = None,
+        ) -> ToolRegistry:
+    """`loop == "improve"` は 7-E (プラン10 Task 7) で分岐するようになった
+    (M-3, 検収是正 — 旧 docstring は「本プランでは分岐しない」としていたが
+    実装と矛盾していた): improve 分岐は research/staging/rpc ツールだけの
+    独立 registry を組み、trade 分岐 (`provider`/`indicator_plugins`/
+    `sandbox_run`/`readonly` を使う既存経路) には落ちない。`loop` 以外の
+    trade/ask 経路では、どのツールを実際に Mission に見せるかは呼び出し側の
+    `Mission.tools` リスト (`_TRADE_TOOLS` 等) が決める (ここは無変更)。
 
     `readonly` (CR-4 対応、裁定書 F-5): 子プロセス (`mission_worker.py`)
     は `conn` に `db.connect_readonly` (SQLite `mode=ro`) を渡すため、
@@ -64,6 +73,35 @@ def build_mission_registry(
     (実プロバイダまたはテスト注入プロバイダ) で渡され、子 (mission_worker.py)
     からは常に None で渡される (readonly=True で内部構築) 想定である。
     """
+    if loop == "improve":
+        # M-4 (検収是正): improve 分岐は trade 専用の注入 seam
+        # (provider/readonly/indicator_plugins/sandbox_run) を使わない。
+        # trade 分岐には `provider is not None and readonly` の誤配線
+        # ガードがあるが、improve はそれより前に return するため、
+        # 誤って trade 引数を伴って呼ばれても無言で捨てていた。fail closed
+        # にする — 誤配線 (例: 子プロセスから trade 用引数のまま呼んだ) を
+        # 検出可能にする。
+        if provider is not None or readonly or indicator_plugins is not None \
+                or sandbox_run is not None:
+            raise ValueError(
+                "loop='improve' は provider/readonly/indicator_plugins/"
+                "sandbox_run を受け付けません (trade 専用の注入 seam)")
+        if staging_dir is None or source_snapshot_dir is None or ledger is None \
+                or rpc_handlers is None:
+            raise ValueError(
+                "loop='improve' には staging_dir/source_snapshot_dir/ledger/"
+                "rpc_handlers が必須です")
+        registry = ToolRegistry()
+        registry.register_all(research_tools.build_research_tooldefs(
+            settings=settings.improve.research))
+        registry.register_all(improve_staging_tools.build_improve_staging_tooldefs(
+            staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir))
+        registry.register_all(improve_rpc_tools.build_improve_rpc_tooldefs(
+            ledger=ledger, run_backtest_handler=rpc_handlers["run_backtest"],
+            analyze_corr_handler=rpc_handlers["analyze_corr"]))
+        return registry
+
+    # --- 既存 trade/ask 分岐 (無変更) ---
     # provider と readonly=True の併用は禁止: provider が指定されると readonly
     # は無視される。子プロセス (mission_worker.py) から呼ぶ場合は provider を
     # 渡さないこと。親は provider を渡す (readonly=False)、子は provider を渡さない

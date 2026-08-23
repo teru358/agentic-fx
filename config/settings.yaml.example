@@ -110,6 +110,7 @@ plugin:                        # plugin サンドボックス (プラン 7 Task 
   signal_min_interval_min: 10    # signal トリガー取引判断 Mission の最短起動間隔 (分)
   signal_daily_max: 12           # signal トリガー取引判断 Mission の日次上限
   signals_max_lookback_hours: 24 # get_signals ツールの since_hours 上限 (プラン 7 Task 9)
+  pytest_timeout_sec: 300        # submit/bless/改善ループ候補ゲートの pytest 実行タイムアウト (プラン10 Task 6)
 
 worker:                        # mission worker (プラン8) の resource limit・preemption・IPC 設定。省略可
   child_as_mb: 4096             # RLIMIT_AS (MiB): 実測 VmPeak 1.65GB (32コア環境) の約2.4倍の余裕。多コア機では要再実測 (IM-9)

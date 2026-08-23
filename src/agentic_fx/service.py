@@ -464,6 +464,7 @@ class App:
     clock: object
     instance_lock: object
     supervisor: object
+    improve_supervisor: object
     conn_supervisor: object
     stop_event: threading.Event = field(default_factory=threading.Event)
     health_latch: HealthLatch = field(default_factory=HealthLatch)
@@ -671,6 +672,13 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # 既存の signals.reclaim_expired (403-407 行付近、lease ベースの
         # 一般的な回収) より前に置く — running mission の signal は claimed_at
         # が直近であり得るため lease ベースでは長時間拾われない。
+        # プラン 10 Task 9 (9.8 Step 5, M-d): `missions.recover_interrupted`
+        # は `missions.loop` を問わず status='running' の行を対象にするため、
+        # improve レーン (`loop='improve'`) の起動時回収 (§3.1 手順⑦: 再起動
+        # 後は再開しない — claimed/running は failed、reserved かつ
+        # mission_id IS NULL のスロットも failed) も trade Mission の回収と
+        # **同一トランザクション**で行われる。改善レーン専用の別呼び出しは
+        # 存在しない (存在させると trade/improve の回収が非アトミックになる)。
         missions.recover_interrupted(
             conn_core, now=clock.now(),
             max_requeue=settings.plugin.signal_requeue_max)
@@ -860,6 +868,17 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         supervisor = MissionSupervisor(
             trade_fn=_trade_fn, reflection_fn=_reflection_fn, ask_fn=_ask_fn)
 
+        from agentic_fx.core.improve_supervisor import ImproveSupervisor
+        improve_supervisor = ImproveSupervisor(
+            capacity=settings.improve.parallel, root=root, settings=settings,
+            clock=clock, db_path=root / "data" / "agentic.db",
+            stop_event=stop_event)
+        # self._improve_loop への実 ImproveLoop 注入・Scheduler.on_improve_tick
+        # / Commands.improve_supervisor への値渡し (「有効化配線」) は
+        # Task 10 完了後、Task 12 が build_app の当該箇所で行う (統合裁定
+        # R-i9/R-i2)。本 task はここまで — Scheduler/Commands の構築呼び
+        # 出しには一切手を入れない。
+
         def on_trade_mission(trigger: str) -> bool:
             # trigger は scheduler._trade_mission_due() が返した起動理由。
             # supervisor.try_submit が受理すれば True (scheduler 側が cron
@@ -926,6 +945,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    mission_watch=mission_watch, notifier=notifier,
                    runner=runner, owns_runner=owns_runner, clock=clock,
                    instance_lock=instance_lock, supervisor=supervisor,
+                   improve_supervisor=improve_supervisor,
                    conn_supervisor=conn_supervisor, stop_event=stop_event,
                    health_latch=health_latch,
                    watchdog_heartbeat=watchdog_heartbeat,
@@ -971,9 +991,17 @@ def _scheduler_tick_once(app: App) -> None:
     """scheduler_thread の 1 tick 分 (抽出 — 単体テスト用シーム)。
 
     app.clock.now() を読んで scheduler に渡すことを固定する。
+
+    検収 B2 (2026-08-22): `Scheduler.tick()` は core_lock 保持下では
+    improve tick の発火判定のみを行い、実際の呼び出しは遅延 callable の
+    リストとして返す (`on_improve_tick` が sqlite write + thread spawn を
+    伴うため core_lock 下では実行できない)。`with app.core_lock:` ブロック
+    を抜けた**後**にそれらを順に実行する。
     """
     with app.core_lock:
-        app.scheduler.tick(app.clock.now())
+        pending = app.scheduler.tick(app.clock.now())
+    for hook in pending:
+        hook()
 
 
 def _watchdog_tick(app: App) -> None:
@@ -1272,6 +1300,10 @@ def run_service(root: Path, *, daemon: bool = False,
                 drain_exc=RuntimeError("service shutting down"))
         except Exception:  # noqa: BLE001 — 停止シーケンスは必ず最後まで走らせる
             _log.exception("supervisor.shutdown() failed during shutdown")
+        try:
+            app.improve_supervisor.shutdown()
+        except Exception:  # noqa: BLE001
+            _log.exception("improve_supervisor.shutdown() failed during shutdown")
         # scheduler スレッドの終了を確認する。
         # **(レビュー 2 周目 codex D1 — この task が壊した前提の修復)**
         # 旧コメント「tick は core_lock 下で走るため join 完了 = 実行中
@@ -1300,6 +1332,9 @@ def run_service(root: Path, *, daemon: bool = False,
         # main が先に join を諦め、watchdog の `busy_since` 軸が構造的に
         # 到達不能になり `fatal_reason` がその経路で永久にラッチしない。
         supervisor_join_timeout_sec = dispatch_ceiling_sec
+        # 検収 B5 (2026-08-22): プラン 9.8-7 の指定位置 (`th.join(timeout=30)`
+        # と `app.supervisor.join(...)` の間) へ戻す。
+        app.improve_supervisor.join(timeout=supervisor_join_timeout_sec)
         app.supervisor.join(timeout=supervisor_join_timeout_sec)
         supervisor_still_busy = app.supervisor.is_alive()
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に

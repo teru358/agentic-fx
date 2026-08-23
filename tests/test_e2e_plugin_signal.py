@@ -37,6 +37,7 @@ from unittest.mock import patch
 
 from agentic_fx.core.contracts import Bar, FixedClock, InstrumentSpec, Quote
 from agentic_fx.plugin import approval
+from agentic_fx.plugin.gate_pytest import GateResult
 from agentic_fx.plugin.loader import discover
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
@@ -81,8 +82,9 @@ def _write_plugin(root: Path) -> Path:
     return d
 
 
-def _ok_pytest_runner(_path: Path) -> dict:
-    return {"returncode": 0, "stdout": "4 passed"}
+def _ok_pytest_runner(_path: Path) -> GateResult:
+    return GateResult(passed=True, returncode=0, stdout_tail="4 passed",
+                      duration_sec=0.01)
 
 
 def _fake_run_in_sample(settings_arg, **kwargs) -> dict:

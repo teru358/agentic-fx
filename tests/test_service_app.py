@@ -1898,7 +1898,7 @@ def test_watchdog_tick_uses_mission_watch_time_fn(monkeypatch):
               provider=None, econ=None, collector=None, rag=None,
               trade_loop=None, reflection=None, scheduler=None,
               commands=None, registry=None, core_lock=None,
-              mission_watch=watch, notifier=FakeNotifier(), runner=None,
+              mission_watch=watch, improve_supervisor=None, notifier=FakeNotifier(), runner=None,
               owns_runner=False, clock=None, instance_lock=None,
               supervisor=None, conn_supervisor=None)
     _watchdog_tick(app)
@@ -1960,7 +1960,15 @@ def test_scheduler_tick_once_uses_app_clock(tmp_path):
     _init(tmp_path)
     app = build_app(tmp_path, runner=FakeRunner([]), clock=fixed)
     seen: list = []
-    app.scheduler.tick = lambda now: seen.append(now)
+
+    def _fake_tick(now):
+        # 検収 B2 (2026-08-22): `Scheduler.tick()` は `list[Callable[[], None]]`
+        # を返す契約になった (improve tick を core_lock の外で遅延発火する
+        # ため)。このスタブも契約に合わせて空リストを返す。
+        seen.append(now)
+        return []
+
+    app.scheduler.tick = _fake_tick
     _scheduler_tick_once(app)
     assert seen == [fixed.now()]
 
@@ -1992,7 +2000,7 @@ def test_watchdog_tick_uses_mission_watch_time_fn_directly(tmp_path):
               provider=None, econ=None, collector=None, rag=None,
               trade_loop=None, reflection=None, scheduler=None,
               commands=None, registry=None, core_lock=None,
-              mission_watch=watch, notifier=FakeNotifier(), runner=None,
+              mission_watch=watch, improve_supervisor=None, notifier=FakeNotifier(), runner=None,
               owns_runner=False, clock=None, instance_lock=None,
               supervisor=None, conn_supervisor=None)
     _watchdog_tick(app)

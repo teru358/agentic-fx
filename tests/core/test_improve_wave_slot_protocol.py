@@ -1,0 +1,532 @@
+"""ImproveSupervisor の wave/slot 状態機械 (設計書 §3.1、プラン §8.1-17〜19/26)。"""
+from __future__ import annotations
+
+import sqlite3
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from agentic_fx.core.improve_supervisor import ImproveSupervisor
+from agentic_fx.store import db as db_mod
+from agentic_fx.store import improve_waves
+from agentic_fx.store import missions as missions_store
+
+
+@pytest.fixture
+def conn(tmp_path: Path) -> sqlite3.Connection:
+    path = tmp_path / "agentic.db"
+    c = db_mod.connect(path)
+    db_mod.init_db(c)
+    return c
+
+
+# Test helpers for 9.2 (and later sections)
+class _FixedClock:
+    """Fixed clock for testing."""
+    def __init__(self, now: datetime) -> None:
+        self._now = now
+
+    def now(self) -> datetime:
+        return self._now
+
+
+def _fake_settings(parallel: int) -> Any:
+    """Minimal fake Settings for 9.2 wave creation testing.
+    Real Settings consumer path (config.py ScheduleSettings) not yet in scope.
+    """
+    class _Cadence:
+        improve = "weekly"
+        improve_at = "Sat 03:00"
+
+    class _Improve:
+        def __init__(self, p: int) -> None:
+            self.parallel = p
+
+    class _FakeSettings:
+        def __init__(self) -> None:
+            self.schedule = _Cadence()
+            self.improve = _Improve(parallel)
+            self.display_timezone = "UTC"
+
+    return _FakeSettings()
+
+
+# Tests for 9.2: wave + slot Tx-0 creation + M=0
+
+def test_wave_creation_writes_wave_and_m_slots_in_one_tx(conn):
+    """M = min(parallel, 空き) 個の reserved slot が wave 行と**同じ commit**
+    で現れる (part-way な状態が外部から観測できない — 単一 tx pin)。"""
+    now = datetime(2026, 8, 22, 3, 0)
+    ok = improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=2, commit=True)
+    assert ok is True
+    wave = conn.execute(
+        "SELECT * FROM improve_waves WHERE period_key='2026-W34'").fetchone()
+    assert wave["expected"] == 2
+    slots = conn.execute(
+        "SELECT k, status, mission_id FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' ORDER BY k").fetchall()
+    assert [dict(s) for s in slots] == [
+        {"k": 0, "status": "reserved", "mission_id": None},
+        {"k": 1, "status": "reserved", "mission_id": None},
+    ]
+
+
+def test_wave_creation_is_idempotent_second_call_no_op(conn, monkeypatch):
+    """`INSERT OR IGNORE` — 同じ period_key への 2 回目の呼び出しは
+    rowcount=0 (起動権を得られない) で slot も増えない。ImproveSupervisor.tick
+    が 2 回呼ばれても、再試行は発生しない (period は消費済み、
+    _spawn_slot_thread も1回分のみ呼ばれる)。
+
+    検収 B4 (2026-08-22): `now` は tz-aware UTC。naive datetime は
+    `latest_scheduled_occurrence` がシステムローカル TZ で暗黙解釈して
+    しまう (fail-open) ため B1 の修正で `ValueError` になった —
+    naive では TZ=UTC 環境と開発機既定 (JST) で period key が食い違い、
+    このテストがマシンのローカル TZ に依存していた。期待値
+    '2026-W34' は B1 着地後の実装から実測導出
+    (`display_timezone='UTC'` なので `now` の週がそのまま period key)。"""
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
+    sup = ImproveSupervisor(capacity=10, root=Path("/nonexistent"),
+                             settings=_fake_settings(parallel=2),
+                             clock=_FixedClock(now),
+                             db_path=Path(conn.execute("PRAGMA database_list").fetchone()[2]),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+
+    # Monkeypatch _spawn_slot_thread to record calls
+    spawn_calls = []
+    original_spawn = sup._spawn_slot_thread
+
+    def recording_spawn(period_key, k):
+        spawn_calls.append((period_key, k))
+
+    monkeypatch.setattr(sup, "_spawn_slot_thread", recording_spawn)
+
+    # First tick で wave + 2 slots を作成
+    sup.tick(now)
+    assert len(spawn_calls) == 2
+    assert spawn_calls == [("2026-W34", 0), ("2026-W34", 1)]
+
+    # Second tick で同じ period で再試行
+    sup.tick(now)
+    # spawn_calls には何も追加されない (period は既に消費済み)
+    assert len(spawn_calls) == 2
+
+
+def test_m_zero_creates_no_wave_row(conn, monkeypatch):
+    """M=0 (空きスロット無し) は何も書かない — 次 tick で再試行できる
+    (period 非消費)。ImproveSupervisor.tick が M を計算して 0 なら
+    何もしないこと — create_wave_and_slots を呼ばず、queue も populate しない。"""
+    call_count = []
+    original_create = improve_waves.create_wave_and_slots
+    def spy_create(*args, **kwargs):
+        call_count.append(1)
+        return original_create(*args, **kwargs)
+    monkeypatch.setattr(improve_waves, "create_wave_and_slots", spy_create)
+
+    sup = ImproveSupervisor(capacity=0, root=Path("/nonexistent"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)),
+                             db_path=Path(conn.execute("PRAGMA database_list").fetchone()[2]),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn  # テストシーム
+    sup.tick(datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc))
+    # M3 mutation check: create_wave_and_slots should not be called when m=0
+    assert len(call_count) == 0, f"create_wave_and_slots should not be called when m=0, but was called {len(call_count)} times"
+    n = conn.execute("SELECT count(*) c FROM improve_waves").fetchone()["c"]
+    assert n == 0
+
+
+# Tests for 9.3: 3-way 起動プロトコル
+
+class _RecordingFakeWorkerRunner:
+    """WorkerRunner の代役。呼び出し順序だけを記録する (Task 1/4/5 の
+    実プロトコルはここでは検証しない — 骨格 Interfaces 節の
+    `WorkerRunner(..., worker_profile="improve", run_context=ctx)` の
+    構築タイミングのみを外形的に確認する)。"""
+
+    def __init__(self, events: list):
+        self._events = events
+
+    def spawn(self):
+        self._events.append("spawn")
+        return "ready"  # spawn 直後に ready を返す fake
+
+    def send_go(self):
+        self._events.append("go")
+
+    def run_to_completion(self):
+        self._events.append("run")
+        return {"status": "completed", "output": {}}
+
+
+class _FakeImproveLoop:
+    """ImproveLoop (Task 10) の代役。Tx-0 の slot claim は `prepare()` の
+    責務として fake でも忠実に再現する — `claim_slot` を実際に呼び
+    `reserved→claimed` を tx で確定させる (fake が本物の `improve_waves`
+    を呼ぶことで、Task 9 側は「claim は prepare の内側で起きる」という
+    契約だけを検証すればよい)。"""
+
+    def __init__(self, conn, worker_runner, *, mission_id=999):
+        self._conn = conn
+        self._worker_runner = worker_runner
+        self._mission_id = mission_id
+        self.committed: list[tuple] = []
+
+    def prepare(self, *, slot_key, now):
+        period_key, k = slot_key
+        claimed = improve_waves.claim_slot(
+            self._conn, period_key=period_key, k=k, mission_id=self._mission_id,
+            now=now, commit=True)
+        if not claimed:
+            raise RuntimeError(
+                f"slot claim failed for {slot_key!r} — "
+                "already claimed by a concurrent process")
+        return f"mission-{self._mission_id}", f"ctx-{self._mission_id}", \
+            self._worker_runner
+
+    def commit(self, *, mission, ctx, result, now):
+        self.committed.append((mission, ctx, result))
+
+
+def test_three_way_launch_order_prepare_then_spawn_then_ready_then_running_commit_then_go(
+        conn, monkeypatch):
+    """prepare(Tx-0, claim含む) → spawn → ready 受信 → running commit
+    (この時点でまだ go を送らない) → go → run → commit()、の順序を固定する。"""
+    events: list[str] = []
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
+
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+    fake_loop = _FakeImproveLoop(
+        conn, _RecordingFakeWorkerRunner(events))
+    sup._improve_loop = fake_loop
+    sup._launch_slot("2026-W34", 0)
+
+    row = conn.execute(
+        "SELECT status, mission_id FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "running"
+    assert row["mission_id"] == 999
+    assert events == ["spawn", "go", "run"]
+    assert len(fake_loop.committed) == 1
+
+
+def test_go_is_not_sent_before_running_commit(conn):
+    """running への commit が完了する前に go を送らないことを、send_go の
+    内部で slot 状態を読み返して確認する fake WorkerRunner 経由で確認する。
+    commit 前に go 呼び出しが記録されたら fail。"""
+    events: list[str] = []
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
+
+    class _OrderCheckingRunner(_RecordingFakeWorkerRunner):
+        def send_go(self):
+            row = conn.execute(
+                "SELECT status FROM improve_wave_slots "
+                "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+            assert row["status"] == "running", (
+                "go was sent before the running-commit was visible")
+            super().send_go()
+
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+    sup._improve_loop = _FakeImproveLoop(conn, _OrderCheckingRunner(events))
+    sup._launch_slot("2026-W34", 0)
+
+
+# Tests for 9.4: pre-ready 失敗
+
+def test_pre_ready_failure_reverts_to_reserved_with_mission_id_null(conn):
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+
+    class _SpawnFailsRunner:
+        def spawn(self):
+            return "spawn_failed"
+
+    sup._improve_loop = _FakeImproveLoop(conn, _SpawnFailsRunner(),
+                                         mission_id=111)
+    sup._launch_slot("2026-W34", 0)
+
+    row = conn.execute(
+        "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "reserved"
+    assert row["mission_id"] is None
+    assert row["spawn_attempts"] == 1
+
+
+def test_pre_ready_failure_second_attempt_goes_to_failed(conn):
+    """spawn_attempts が 2 に達したら (初回 + 再試行 1 回) failed へ収束する。"""
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+
+    class _SpawnFailsRunner:
+        def spawn(self):
+            return "spawn_failed"
+
+    sup._improve_loop = _FakeImproveLoop(conn, _SpawnFailsRunner(),
+                                         mission_id=111)
+    sup._launch_slot("2026-W34", 0)  # 1 回目 → reserved
+
+    sup._improve_loop = _FakeImproveLoop(conn, _SpawnFailsRunner(),
+                                         mission_id=222)
+    sup._launch_slot("2026-W34", 0)  # 2 回目 → failed
+
+    row = conn.execute(
+        "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "failed"
+    assert row["spawn_attempts"] == 2
+
+
+def test_pre_ready_failure_also_covers_ready_timeout_before_running_commit(conn):
+    """`ready` 受信前の timeout も pre-ready 失敗と同じ経路 (spawn 成功後、
+    ready が来ない/timeout するケース)。"""
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+
+    class _ReadyTimeoutRunner:
+        def spawn(self):
+            return "timeout"  # ready を待てなかった
+
+    sup._improve_loop = _FakeImproveLoop(conn, _ReadyTimeoutRunner(),
+                                         mission_id=111)
+    sup._launch_slot("2026-W34", 0)
+    row = conn.execute(
+        "SELECT status, mission_id FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "reserved"
+    assert row["mission_id"] is None
+
+
+# Tests for 9.5: N-slot 構成・接続所有・shutdown/join
+
+def test_n4_concurrent_slots_no_connection_sharing_no_mixup(tmp_path):
+    """N=4 同時 slot が別々の write 接続を持ち、混線 (他 slot の行を触る)
+    が無いことを実測する。各 slot は自分の period_key/k だけを更新する
+    fake `ImproveLoop`/worker で 4 本同時実行し、結果の整合を確認する。
+    `_improve_loop.prepare` (Tx-0 の claim) が各スレッド自身の DB 接続で
+    行われることを、fake `ImproveLoop` が `db_mod.connect(db_path)` を
+    スレッドごとに開くことで再現する (統合裁定 R-i2 — claim は
+    `ImproveLoop.prepare` 側の責務)。"""
+    db_path = tmp_path / "agentic.db"
+    conn0 = db_mod.connect(db_path)
+    db_mod.init_db(conn0)
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(conn0, period_key="2026-W34", now=now, expected=4, commit=True)
+    conn0.close()
+
+    sup = ImproveSupervisor(capacity=4, root=tmp_path,
+                             settings=_fake_settings(parallel=4),
+                             clock=_FixedClock(now), db_path=db_path,
+                             stop_event=threading.Event())
+
+    class _SlowRunner:
+        def spawn(self):
+            time.sleep(0.05)
+            return "ready"
+        def send_go(self):
+            pass
+        def run_to_completion(self):
+            time.sleep(0.05)
+            return {"status": "completed", "output": {}}
+
+    class _PerThreadFakeImproveLoop:
+        """各スレッドが自分専用の write 接続で `claim_slot`/`commit` を
+        行う fake (本番の `ImproveLoop` の接続所有パターンを模す)。"""
+
+        def prepare(self, *, slot_key, now):
+            period_key, k = slot_key
+            conn = db_mod.connect(db_path)
+            try:
+                mission_id = 100 + k
+                claimed = improve_waves.claim_slot(
+                    conn, period_key=period_key, k=k, mission_id=mission_id,
+                    now=now, commit=True)
+                assert claimed, f"slot {slot_key!r} already claimed"
+            finally:
+                conn.close()
+            return mission_id, f"ctx-{mission_id}", _SlowRunner()
+
+        def commit(self, *, mission, ctx, result, now):
+            conn = db_mod.connect(db_path)
+            try:
+                conn.execute(
+                    "UPDATE improve_wave_slots SET status='done' "
+                    "WHERE mission_id=?", (mission,))
+                conn.commit()
+            finally:
+                conn.close()
+
+    sup._improve_loop = _PerThreadFakeImproveLoop()
+
+    threads = [threading.Thread(target=sup._launch_slot,
+                                args=("2026-W34", k))
+              for k in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    conn1 = db_mod.connect(db_path)
+    rows = conn1.execute(
+        "SELECT k, status FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' ORDER BY k").fetchall()
+    assert [r["status"] for r in rows] == ["done", "done", "done", "done"]
+    conn1.close()
+
+
+def test_trade_writer_not_blocked_during_improve_gate_tx(tmp_path):
+    """改善レーンの長い作業 (ここでは意図的に BEGIN IMMEDIATE を保持する
+    fake) の**外側**で、取引レーンの writer が busy_timeout (5000ms) 内に
+    通ることを確認する — Tx がロング処理を跨がないことの負荷実測代理。"""
+    db_path = tmp_path / "agentic.db"
+    conn0 = db_mod.connect(db_path)
+    db_mod.init_db(conn0)
+    conn0.close()
+
+    improve_conn = db_mod.connect(db_path)
+    trade_conn = db_mod.connect(db_path)
+
+    # 改善レーンの「短い tx」を模す: 開いてすぐ commit する (transaction
+    # 外の長時間処理と対比するため、ここでは意図的に「短い」ことを
+    # assert する — 長時間 held のケースは Task 10 の Tx-1/Tx-2 の実装
+    # レビューで別途 fault injection する)。
+    improve_conn.execute("BEGIN IMMEDIATE")
+    improve_conn.execute(
+        "UPDATE improve_wave_slots SET status='running' WHERE 1=0")
+    improve_conn.commit()
+
+    started = time.monotonic()
+    trade_conn.execute(
+        "INSERT INTO missions (loop, runner, model, status, started_at) "
+        "VALUES ('trade','local','x','running',?)", (datetime.now().isoformat(),))
+    trade_conn.commit()
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0  # busy_timeout (5000ms) 内、実務上は瞬時
+
+    improve_conn.close()
+    trade_conn.close()
+
+
+def test_wave_creation_respects_running_slot_count(tmp_path, monkeypatch):
+    """M = min(parallel, open_slots) の capacity 制限テスト。
+    capacity=2, parallel=4, 1 slot が running → 1 slot だけ作成される。"""
+    db_path = tmp_path / "agentic.db"
+    conn = db_mod.connect(db_path)
+    db_mod.init_db(conn)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
+
+    # Create a running slot from a previous period (not the current tick's period)
+    improve_waves.create_wave_and_slots(conn, period_key="2026-W32", now=now, expected=1, commit=True)
+    conn.execute(
+        "UPDATE improve_wave_slots SET status='running', mission_id=1 "
+        "WHERE wave_period_key='2026-W32' AND k=0")
+    conn.commit()
+
+    # Now try to create new wave with capacity=2, parallel=4
+    sup = ImproveSupervisor(capacity=2, root=tmp_path,
+                             settings=_fake_settings(parallel=4),
+                             clock=_FixedClock(now),
+                             db_path=db_path,
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+
+    # Monkeypatch _spawn_slot_thread to avoid daemon thread errors
+    spawn_calls = []
+    monkeypatch.setattr(sup, "_spawn_slot_thread",
+                       lambda period_key, k: spawn_calls.append((period_key, k)))
+
+    sup.tick(now)
+
+    # Check that only 1 new slot was spawned (capacity-running_count = 2-1 = 1)
+    assert len(spawn_calls) == 1
+    assert spawn_calls[0][1] == 0  # slot k=0
+
+    # Check DB: 1 running from prev period + 1 new = 2 total
+    rows = conn.execute(
+        "SELECT count(*) c FROM improve_wave_slots").fetchone()
+    assert rows["c"] == 2
+
+    conn.close()
+
+
+# Tests for B5 (検収 2026-08-22): join budget は全体で 1 つの deadline
+
+def test_join_budget_is_shared_not_multiplied_by_thread_count(tmp_path):
+    """`ImproveSupervisor.join(timeout)` は N 個のスレッドが**全部**
+    timeout しても、消費時間が `timeout × N` に膨らんではならない —
+    全体で 1 つの deadline (`monotonic() + timeout`) を共有し、残余を
+    各スレッドへ配る形であること。N=3、timeout=0.2s で検証: 修正前の
+    実装 (各スレッドへ timeout をまるごと渡す) だと最悪 0.6s 消費するが、
+    修正後は 0.2s 前後で返ること。"""
+    sup = ImproveSupervisor(capacity=3, root=tmp_path,
+                             settings=_fake_settings(parallel=3),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0,
+                                                        tzinfo=timezone.utc)),
+                             db_path=tmp_path / "unused.db",
+                             stop_event=threading.Event())
+    never_done = threading.Event()  # 一度も set しない = スレッドは join を
+                                     # 常に timeout させる
+    threads = [threading.Thread(target=never_done.wait, daemon=True)
+               for _ in range(3)]
+    for t in threads:
+        t.start()
+    sup._active_threads = list(threads)
+
+    timeout = 0.2
+    start = time.monotonic()
+    sup.join(timeout=timeout)
+    elapsed = time.monotonic() - start
+
+    # 修正前 (各スレッドへ timeout をまるごと渡す) なら 3*0.2=0.6s 消費する。
+    # 修正後は共有 deadline なので 1*timeout + 小さな余裕に収まる。
+    assert elapsed < timeout * 2, (
+        f"join budget appears multiplied by thread count: "
+        f"elapsed={elapsed:.3f}s, timeout={timeout}s, N=3")
+
+
+def test_join_prunes_finished_threads(tmp_path):
+    """`join()` 後、終了済みスレッドは `_active_threads` から取り除かれる
+    (検収 B5 — tick を重ねても単調増加しない)。"""
+    sup = ImproveSupervisor(capacity=1, root=tmp_path,
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0,
+                                                        tzinfo=timezone.utc)),
+                             db_path=tmp_path / "unused.db",
+                             stop_event=threading.Event())
+    t = threading.Thread(target=lambda: None, daemon=True)
+    t.start()
+    t.join()  # スレッドは既に終了済み
+    sup._active_threads = [t]
+
+    sup.join(timeout=1.0)
+
+    assert sup._active_threads == []

@@ -441,3 +441,23 @@ def test_improve_mission_timeout_sec_minimum_is_60():
     from agentic_fx.config import ImproveSettings
     with pytest.raises(ValidationError):
         ImproveSettings(mission_timeout_sec=59)
+
+
+def test_plugin_settings_pytest_timeout_sec_default():
+    """6-A Step 1: pytest_timeout_sec の既定値が 300.0 であること。"""
+    from agentic_fx.config import PluginSettings
+    assert PluginSettings().pytest_timeout_sec == 300.0
+
+
+def test_plugin_settings_pytest_timeout_sec_overridable():
+    """6-A Step 1: pytest_timeout_sec がオーバーライド可能であること。"""
+    from agentic_fx.config import PluginSettings
+    assert PluginSettings(pytest_timeout_sec=60.0).pytest_timeout_sec == 60.0
+
+
+def test_settings_yaml_example_has_pytest_timeout_sec():
+    """6-A Step 1: settings.yaml.example に pytest_timeout_sec キーが含まれ、
+    値が 300.0 であること。"""
+    from agentic_fx.config import load_settings
+    settings = load_settings(EXAMPLE)
+    assert settings.plugin.pytest_timeout_sec == 300.0
