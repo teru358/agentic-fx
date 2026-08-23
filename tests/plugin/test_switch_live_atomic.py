@@ -90,3 +90,77 @@ def test_switch_live_from_absent_is_also_a_single_rename(tmp_path, monkeypatch):
     temp_path_str = str(plugins_root / f".{name}.link-7")
     assert rename_calls == [(temp_path_str, str(live))]
     assert live.is_symlink()
+
+
+def test_revert_one_symlink_restore_is_a_single_atomic_rename_with_no_live_unlink(
+        tmp_path, monkeypatch):
+    """段 0 M10 の killer: 検収 B1 の原子性 pin (上の 2 本) は `switch_live`
+    にしか無く、まったく同じ temp symlink + 1 rename パターンを持つ
+    `_revert_one` の symlink 復元分岐 (`old_kind == "symlink"`) には pin が
+    無かった。`_revert_one` を直接呼び、`os.rename` がちょうど 1 回・
+    `(temp_path, live_path)` の引数で呼ばれること、live パス自身への
+    `unlink` が一切発生しないことを、上の `switch_live` テストと同じ手法で
+    確かめる (実害は switch_live の原子性欠落より重い — `_revert_one` は
+    「切替失敗後の後始末」なので、非 atomic な 2 段化の途中で落ちると live
+    が存在しない状態が残り、かつ phase を書く**前**に FS を触るため中断時の
+    ジャーナルは 'switched' のまま・live は absent という自動収束しない
+    終状態になる)。"""
+    from datetime import datetime, timezone
+
+    from agentic_fx.store import db as db_store
+    from agentic_fx.store import plugin_switch_journal as journal_store
+
+    plugins_root = tmp_path / "plugins"
+    plugins_root.mkdir()
+    name = "sma"
+    old_hash = "a" * 64
+    new_hash = "b" * 64
+    (plugins_root / ".versions" / name / old_hash).mkdir(parents=True)
+    (plugins_root / ".versions" / name / new_hash).mkdir(parents=True)
+    old_rel = f".versions/{name}/{old_hash}"
+    new_rel = f".versions/{name}/{new_hash}"
+    live = plugins_root / name
+    live.symlink_to(new_rel)  # 切替 (rename) は完了しているが decide はまだ
+
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    now = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name=name, old_kind="symlink",
+        old_target=old_rel, new_target=new_rel, switch_required=True,
+        actor="human", now=now, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="versioned", now=now, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="recorded", now=now, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="switched", now=now, commit=True)
+    row = journal_store.get(conn, op_id)
+
+    rename_calls = []
+    real_rename = os.rename
+
+    def spy_rename(src, dst, *a, **kw):
+        rename_calls.append((os.fspath(src), os.fspath(dst)))
+        return real_rename(src, dst, *a, **kw)
+
+    unlink_calls = []
+    real_unlink = Path.unlink
+
+    def spy_unlink(self, *a, **kw):
+        unlink_calls.append(str(self))
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(switch.os, "rename", spy_rename)
+    monkeypatch.setattr(Path, "unlink", spy_unlink)
+
+    switch._revert_one(conn, row, plugins_root=plugins_root, now=now)
+
+    assert live.is_symlink()
+    assert live.readlink().as_posix() == old_rel
+
+    temp_path_str = str(plugins_root / f".{name}.link-{op_id}")
+    assert rename_calls == [(temp_path_str, str(live))], (
+        "_revert_one の symlink 復元は switch_live と同じ temp symlink → "
+        "os.rename の 1 rename だけで行うこと (段 0 M10: unlink→symlink_to の "
+        "非 atomic 2 段化するとこの形の rename 呼び出しが消える)")
+    assert str(live) not in unlink_calls, (
+        "live パス自身への unlink が発生した — 「live が無い瞬間」が生じる "
+        "非 atomic な復元 (段 0 M10)")

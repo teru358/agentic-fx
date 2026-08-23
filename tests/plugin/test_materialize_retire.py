@@ -71,6 +71,27 @@ def test_retire_rejects_when_unresolved_journal_exists(env):
         switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
 
 
+def test_retire_rejects_when_live_is_a_symlink(env):
+    """段 0 M15 の killer: `retire_plugin` のガード
+    (`if not live.is_dir() or live.is_symlink():`) から `or
+    live.is_symlink()` を落とすと、正規管理下 (live symlink) の plugin を
+    `plugin retire` が例外なく `_retired/` へ動かせてしまう — `_retired/`
+    に移るのは版ストアを指す dangling symlink 本体なので、後続の
+    `sweep_orphans` ③ で参照元 (live) を失った版が GC されうる復旧不能な
+    状態になる (retire は legacy plain live にのみ適用される、§5.1)。"""
+    tmp_path, plugins_dir, conn, settings = env
+    (plugins_dir / ".versions" / "sma" / ("a" * 64)).mkdir(parents=True)
+    live = plugins_dir / "sma"
+    live.symlink_to(f".versions/sma/{'a' * 64}")
+
+    with pytest.raises(ValueError, match="not a plain directory"):
+        switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
+
+    assert live.is_symlink()
+    assert live.readlink().as_posix() == f".versions/sma/{'a' * 64}"
+    assert not (plugins_dir / "_retired").exists()
+
+
 def test_retire_renames_plain_dir_to_retired_with_timestamp(env):
     tmp_path, plugins_dir, conn, settings = env
     _write(plugins_dir / "sma")
