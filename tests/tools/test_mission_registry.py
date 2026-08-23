@@ -220,6 +220,34 @@ def test_build_mission_registry_improve_has_research_and_staging_and_rpc_tools(t
             "run_backtest", "analyze_corr"} <= names
 
 
+def test_build_mission_registry_improve_wires_rpc_handlers_by_tool_not_swapped(tmp_path):
+    """M11 (段 0 Important): improve 分岐で `run_backtest_handler` と
+    `analyze_corr_handler` を入れ替える変異が red になる pin —
+    `test_..._has_research_and_staging_and_rpc_tools` はツール名の存在
+    しか見ておらず配線 (どのツールがどの handler を呼ぶか) を検証して
+    いなかった。区別可能な戻り値を持つ 2 handler を渡し、各ツール名から
+    呼んだときに対応する handler の結果が返ることを見る。"""
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    staging_dir = tmp_path / "staging"
+    source_snapshot_dir = tmp_path / "source"
+    staging_dir.mkdir()
+    source_snapshot_dir.mkdir()
+
+    registry = build_mission_registry(
+        "improve", conn, SETTINGS, _clock(), rag, activity=activity,
+        staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        rpc_handlers={"run_backtest": lambda a: {"who": "bt"},
+                      "analyze_corr": lambda a: {"who": "ac"}})
+    assert registry.func("run_backtest")(name="n", pair="USDJPY")["who"] == "bt"
+    assert registry.func("analyze_corr")(request={})["who"] == "ac"
+
+
 def test_build_mission_registry_improve_rejects_trade_only_kwargs(tmp_path):
     """M-4 (検収是正): improve 分岐は provider/readonly/indicator_plugins/
     sandbox_run (trade 専用の注入 seam) を無言で捨てていた — trade 分岐の

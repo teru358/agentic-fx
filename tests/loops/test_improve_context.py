@@ -2,7 +2,7 @@
 集計されることを節ごとに検証する。"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agentic_fx.config import load_settings
@@ -88,3 +88,24 @@ def test_performance_report_has_win_rate_and_pf_keys(tmp_path):
                                 allowed_backlog_ids=None)
     assert {"win_rate", "profit_factor", "by_pair", "by_hour", "reject_breakdown",
            "hold_rate"} <= set(ctx["performance_report"].keys())
+
+
+def test_performance_report_window_is_90_days_not_30(tmp_path):
+    """M16 (段 0 Minor): 集計窓 `timedelta(days=90)` を `days=30` にする
+    変異が red になる pin — §3.2 の `window_days: [30, 90]` 表示は
+    30/90 の両方を対応窓として謳うが、実集計窓は 90 日。60 日前 (30 日
+    窓なら圏外、90 日窓なら圏内) の closed order を仕込み、by_pair の
+    件数がそれを拾うことを見る。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    old = NOW - timedelta(days=60)   # 30 日窓なら圏外、90 日窓なら圏内
+    recent = NOW - timedelta(days=10)
+    for created_at in (old, recent):
+        c.execute(
+            "INSERT INTO orders (pair,direction,entry_type,horizon,status,"
+            "realized_pnl,created_at,updated_at) VALUES "
+            "('USDJPY','long','market','day','closed',1.0,?,?)",
+            (created_at.isoformat(), created_at.isoformat()))
+    c.commit()
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
+                                allowed_backlog_ids=None)
+    assert ctx["performance_report"]["by_pair"]["USDJPY"]["count"] == 2

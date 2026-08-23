@@ -100,6 +100,20 @@ def test_set_status_writes_last_result(tmp_path):
     assert row["last_result"] == "report_failed:disk_full"
 
 
+def test_set_status_without_last_result_clears_existing_value(tmp_path):
+    """M14 (段 0 Minor): `last_result=?` を `COALESCE(?, last_result)` に
+    する変異 (None なら据え置き) が red になる pin — docstring m1 が明記
+    する「常に上書きする。渡さない呼び出しは NULL でクリアする」非対称
+    契約そのものを見る。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "a", "user", NOW)
+    backlog.set_status(c, bid, "observation", NOW, last_result="report_failed:disk_full")
+    backlog.set_status(c, bid, "open", NOW)  # last_result 未指定 (既定 None)
+    row = c.execute("SELECT last_result FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+    assert row["last_result"] is None
+
+
 def test_set_status_commit_false_does_not_commit(tmp_path):
     """`commit=False` は呼び出し側の tx に留める (Task 8 全体の設計不変条件)。"""
     c = connect(tmp_path / "t.db"); init_db(c)

@@ -9,6 +9,8 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
+import pytest
+
 from agentic_fx.store.db import connect, init_db
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
@@ -63,6 +65,34 @@ def test_legacy_pending_missing_only_artifact_hash_also_invalidated(tmp_path):
         (json.dumps({"name": "partial", "candidate_origin": "staging",
                     "candidate_path": "plugins/_staging/1/partial"}),  # artifact_hash 欠損
          NOW.isoformat()))
+    conn.commit()
+    conn.close()
+    conn2 = connect(db_path)
+    init_db(conn2)
+    row = conn2.execute(
+        "SELECT status FROM approval_requests WHERE "
+        "json_extract(payload_json, '$.name')='partial'").fetchone()
+    assert row["status"] == "invalidated"
+
+
+@pytest.mark.parametrize("missing_key", [
+    "candidate_origin", "candidate_path", "artifact_hash"])
+def test_legacy_pending_missing_single_required_key_invalidated(tmp_path, missing_key):
+    """M15 (段 0 Important): `_LEGACY_PLUGIN_APPROVAL_REQUIRED_KEYS` の
+    必須キー 3 種から**どれか 1 つ**を落とす変異が red になる pin — 既存
+    テストは `artifact_hash` 欠落のみを踏んでいたため、
+    `candidate_origin`/`candidate_path` 単独欠落の変異は生存していた。"""
+    db_path = tmp_path / "t.db"
+    conn = _seed_legacy_schema(db_path)
+    all_fields = {"candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/1/partial",
+                 "artifact_hash": "f" * 64}
+    payload = {"name": "partial", **{k: v for k, v in all_fields.items()
+                                     if k != missing_key}}
+    conn.execute(
+        "INSERT INTO approval_requests (kind, payload_json, status, created_at) "
+        "VALUES ('plugin', ?, 'pending', ?)",
+        (json.dumps(payload), NOW.isoformat()))
     conn.commit()
     conn.close()
     conn2 = connect(db_path)

@@ -8,10 +8,15 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
+
+import pytest
 
 from agentic_fx.backtest.analysis import analyze_for_agent
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
-from agentic_fx.tools.improve_rpc_tools import _FORBIDDEN_KEYS, build_improve_rpc_tooldefs
+from agentic_fx.tools.improve_rpc_tools import (
+    _FORBIDDEN_KEYS, _strip_forbidden, build_improve_rpc_tooldefs,
+)
 
 from tests.backtest.factories import _conn
 from tests.backtest.test_analysis import (
@@ -80,6 +85,77 @@ def test_run_backtest_does_not_expose_period_or_datetime_keys():
         analyze_corr_handler=lambda a: {})}
     out = tools["run_backtest"].func(name="x", pair="USDJPY")
     assert "period_start" not in out and "period_end" not in out
+
+
+# M07 pin: この一覧は **`_FORBIDDEN_KEYS` からは import しない、文字列
+# 直書きの固定リスト**にする。`@pytest.mark.parametrize` の引数を
+# `_FORBIDDEN_KEYS` から動的に作ると、収集はテスト実行**前** (import 時) に
+# 走るため、キーを 1 つ外す変異は該当キーの parametrize ケースそのものを
+# 静かに消してしまい (収集数が 1 減るだけ)、red にならず殺せない
+# ([[mutation-testing]] のパラメトライズ罠と同型)。固定リストなら、
+# 変異後もそのキーのケースは必ず収集され、strip されずに残ったことを
+# 直接検出できる。
+_EXPECTED_FORBIDDEN_KEYS = (
+    "period_start", "period_end", "start", "end", "window", "timestamps",
+    "period", "now", "in_sample_until")
+
+
+def test_forbidden_keys_literal_matches_source_set():
+    """`_EXPECTED_FORBIDDEN_KEYS` (固定リスト) と実 `_FORBIDDEN_KEYS` が
+    一致することを別途確認する — 固定リストが陳腐化した場合に気づける
+    ようにするための対。"""
+    assert set(_EXPECTED_FORBIDDEN_KEYS) == set(_FORBIDDEN_KEYS)
+
+
+@pytest.mark.parametrize("forbidden_key", _EXPECTED_FORBIDDEN_KEYS)
+def test_run_backtest_strips_each_forbidden_key_individually(forbidden_key):
+    """M07 (段 0 致命): `_FORBIDDEN_KEYS` の各キーを 1 つずつ外す変異が
+    red になる pin — トップレベルと入れ子の両方に全キーを仕込んだ dict を
+    通し、strip 後にそのキーが (再帰的に) どこにも残っていないことを見る。"""
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    poisoned = {k: f"leak:{k}" for k in _EXPECTED_FORBIDDEN_KEYS}
+    poisoned["now"] = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    handler_result = {
+        "metrics": {"pf": 1.0}, "trial_count": 1,
+        **poisoned,
+        "nested": dict(poisoned),
+    }
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, run_backtest_handler=lambda a: handler_result,
+        analyze_corr_handler=lambda a: {})}
+    out = tools["run_backtest"].func(name="x", pair="USDJPY")
+    assert forbidden_key not in out
+    assert forbidden_key not in out["nested"]
+
+
+def test_strip_forbidden_recurses_through_lists_of_dicts():
+    """M08 (段 0 Important): list 分岐が再帰しない変異 (`return list(value)`)
+    が red になる pin — dict を含む list を通し、剥がれることを見る。"""
+    poisoned = [{"period": ("2020-01-01", "2020-06-01"), "ok": 1},
+                {"nested": [{"now": "2020-01-01T00:00:00"}]}]
+    out = _strip_forbidden({"items": poisoned})
+    keys, leaves = _walk_leaves(out)
+    assert _FORBIDDEN_KEYS.isdisjoint(set(keys))
+    assert out["items"][0]["ok"] == 1  # 非禁止キーは残る
+
+
+def test_ledger_result_summary_keeps_forbidden_keys_stripped_agent_return_does_not():
+    """M09 (段 0 Important): `_strip_forbidden(result)` を台帳へ渡すよう
+    差し替える変異が red になる pin — docstring が明示する「台帳は痩せ
+    ない」契約 (`_persist_ledger_rows` が `period`/`now` を読む) を、
+    台帳側に残る/agent 戻り値からは消えるの対で 1 本にまとめて見る。"""
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    handler_result = {"metrics": {"pf": 1.0}, "trial_count": 1,
+                      "period": ("2020-01-01", "2020-06-01"), "now": "2020-01-01T00:00:00"}
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, run_backtest_handler=lambda a: handler_result,
+        analyze_corr_handler=lambda a: {})}
+    out = tools["run_backtest"].func(name="x", pair="USDJPY")
+    assert "period" not in out and "now" not in out
+    ledger.freeze()
+    stored = ledger.entries()[0]["result_summary"]
+    assert stored["period"] == ("2020-01-01", "2020-06-01")
+    assert stored["now"] == "2020-01-01T00:00:00"
 
 
 def test_analyze_corr_recursively_strips_nested_period_endpoints(tmp_path):

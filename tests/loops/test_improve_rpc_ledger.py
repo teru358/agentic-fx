@@ -93,6 +93,21 @@ def test_trial_count_is_summed_not_call_count():
     assert entries[0]["trial_count"] == 25
 
 
+def test_entries_returns_independent_copy_not_internal_list():
+    """M10 (段 0 Minor): `entries()` が内部 list を別名で返す変異
+    (`return self._entries`) が red になる pin — 呼び出し側が返り値の
+    list を変更しても内部状態 (次回 `entries()` の結果) に影響しないこと。
+    FROZEN 後の不変性は `_lock` では守れない次元 (別名参照を渡さないこと
+    そのものを見る)。"""
+    ledger = _ledger()
+    ledger.record(opaque_ref="a", kind="run_backtest", params={},
+                  result_summary={}, trial_count=1)
+    ledger.freeze()
+    e = ledger.entries()
+    e.append({"opaque_ref": "injected"})
+    assert len(ledger.entries()) == 1
+
+
 def test_concurrent_record_and_freeze_race_matrix():
     """race matrix: record 実行中に freeze が割り込んでも lock により
     「freeze 前に完了した record は必ず記録され、freeze 後の record は

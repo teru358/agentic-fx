@@ -8,6 +8,7 @@ import json
 import pytest
 
 from agentic_fx.config import ResearchSettings
+from agentic_fx.tools.registry import ToolRegistry
 from agentic_fx.tools.research_tools import build_research_tooldefs
 
 
@@ -199,6 +200,68 @@ def test_fetch_article_503_aborts_host_for_rest_of_mission():
     second = tools["fetch_article"].func(url="https://y.example/2")
     assert second == {"error": "host aborted (429/503)"}
     assert len(backend.calls) == 1
+
+
+def test_web_search_max_results_clamp_enforced_via_registry_execute():
+    """M02 (段 0 Important): `max_results` の schema `maximum: 20` は
+    飾りではなく `ToolRegistry.execute` の `jsonschema.validate` が実行経路
+    上で効かせている実効ガード。`ToolDef.func` を直接呼ぶ既存テストは
+    この門を一切通らないため、ここでは registry 越しに呼ぶ。"""
+    backend = _FakeSearchBackend()
+    tools, _, _ = _build(_settings(min_interval_sec=0.01), search_backend=backend)
+    registry = ToolRegistry()
+    registry.register_all(list(tools.values()))
+    out = registry.execute(
+        "web_search", {"query": "q", "max_results": 21}, ["web_search"])
+    assert "invalid arguments" in out
+    assert backend.calls == []
+
+
+class _AlwaysRaisingFetchBackend:
+    """M01 (段 0 致命): 呼ばれるたびに例外を投げる backend。予算カウンタが
+    backend 呼び出しの**前**に加算されることの pin — 後に加算する変異では
+    例外側の分岐で加算がスキップされ、予算が無制限になる。"""
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def fetch(self, url: str, *, user_agent: str | None = None) -> tuple[int, str]:
+        self.calls.append(url)
+        raise ConnectionError("boom")
+
+
+def test_fetch_article_max_fetches_budget_consumed_even_when_backend_raises():
+    """M01 killer: 例外を投げる backend に対しても max_fetches は消費される
+    — 2 回目 (max_fetches=2) までは backend に到達 (して例外が伝播せず
+    `ToolRegistry.execute` 相当の握り潰しは無いのでここでは例外がそのまま
+    伝播することを確認しつつ)、3 回目以降は backend に到達せず
+    `budget exhausted` を返す。"""
+    backend = _AlwaysRaisingFetchBackend()
+    tools, _, _ = _build(
+        _settings(max_fetches=2, min_interval_sec=0.01), fetch_backend=backend)
+    for i in range(2):
+        with pytest.raises(ConnectionError):
+            tools["fetch_article"].func(url=f"https://a.example/{i}")
+    assert len(backend.calls) == 2
+    out = tools["fetch_article"].func(url="https://a.example/3rd")
+    assert out == {"error": "budget exhausted"}
+    assert len(backend.calls) == 2  # 3 回目は backend に到達しない
+
+
+def test_fetch_article_max_per_host_budget_consumed_even_when_backend_raises():
+    """M01 killer (host 軸): 同一 host への呼び出しが例外を投げても
+    per_host_count は消費され、上限超過後は backend に到達しない。"""
+    backend = _AlwaysRaisingFetchBackend()
+    tools, _, _ = _build(
+        _settings(max_per_host=2, max_fetches=100, min_interval_sec=0.01),
+        fetch_backend=backend)
+    for i in range(2):
+        with pytest.raises(ConnectionError):
+            tools["fetch_article"].func(url=f"https://same.example/{i}")
+    assert len(backend.calls) == 2
+    out = tools["fetch_article"].func(url="https://same.example/3rd")
+    assert out == {"error": "budget exhausted"}
+    assert len(backend.calls) == 2
 
 
 def test_fetch_article_truncates_at_fetch_max_bytes():
