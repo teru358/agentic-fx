@@ -767,12 +767,23 @@ class Commands:
 # dataclass の型は int のまま変更しない — str 化は境界 (handshake
 # 組み立て) だけの責務。子側 (mission_worker.py, Task 5) は
 # handshake["mission_id"] を str として受け取る。
+#
+# <!-- precheck 2026-08-23 R-D3 -->
+# 裁定 R-D3: source_snapshot_dir は「スナップショットの出所」
+# (Task 10 の _materialize_workspace が plugins/<name> 版実体 + _examples
+# を用意した読み取り専用のコピー元。workdir 配下である必要はない)。
+# **子 (mission_worker.py) が handshake で受け取る値は workdir/"source"**
+# であり、この出所そのものではない — WorkerRunner.run() が workdir 作成
+# 直後に shutil.copytree(出所, workdir/"source") で実体化し、handshake
+# の source_snapshot_dir にはその実体化先を載せる (Task 1 Step 33 実装時
+# 追記)。この dataclass の型・フィールド名・意味は「出所」のまま変更しない
+# — workdir/source への変換は境界 (handshake 組み立て) だけの責務。
 @dataclass(frozen=True)
 class ImproveRunContext:
     mission_id: int
     run_id: int
     staging_dir: Path
-    source_snapshot_dir: Path
+    source_snapshot_dir: Path  # 出所 (コピー元)。handshake 値は workdir/"source" (R-D3)
     allowed_backlog_ids: frozenset[int] | None    # ヒント。None = 手動 wave
     slot_key: tuple[str, int] | None              # wave 起動なら (period_key, k)。
                                                     # 手動 one-shot は None (レビュー1周目 C2)
@@ -3645,6 +3656,168 @@ class WorkerRunner(AgentRunner):
 を追加・展開する (`worker_runner.py:210-224` の handshake dict リテラルへの追記のみ —
 既存 6 キー `db_path`/`plugins_dir`/`settings`/`mission`/`worker_profile`/`now` は
 不変。`run_context_fields` が空 dict なら handshake は現状どおり 3 キー増えない)。
+
+<!-- precheck 2026-08-23 R-D3 -->
+**実装時追記 (2026-08-23 R-D3)**: 上記 Step 33 の実装は `run_context.source_snapshot_dir`
+を検証も実体化もせず、そのまま handshake へ載せていた。裁定 R-D3
+(`tmp/plan10-precheck/rulings.md` 末尾「R-D3」節) により、`ImproveRunContext.
+source_snapshot_dir` の意味は「スナップショットの**出所**」(Task 10 が用意する
+読み取り専用のコピー元) に確定し、`workdir/source` への実体化は本 `WorkerRunner.run()`
+が所有する。以下を追記する。
+
+`worker_runner.py` の import 群 (`import subprocess` の次の行) に `import shutil` を追加する。
+
+`WorkerRunner.run()` の `home`/`tmp`/`cfg` の 3 mkdir 直後・`credentials: dict[str, str] = {}`
+の**前**に挿入する:
+
+```python
+            (workdir / "home").mkdir(mode=0o700)
+            (workdir / "tmp").mkdir(mode=0o700)
+            (workdir / "cfg").mkdir(mode=0o700)
+
+            if self._run_context is not None:
+                source_origin = Path(self._run_context.source_snapshot_dir)
+                if source_origin.is_symlink() or not source_origin.is_dir():
+                    return MissionResult(
+                        "failed", None, [],
+                        reason="source snapshot origin is missing, not a "
+                               "directory, or a symlink (R-D3 fail closed)")
+                try:
+                    shutil.copytree(source_origin, workdir / "source",
+                                    symlinks=False)
+                except OSError as e:
+                    return MissionResult(
+                        "failed", None, [],
+                        reason=f"source snapshot materialization failed: {e}")
+```
+
+（`credentials: dict[str, str] = {}` 以降は元のまま続く。）
+
+`run_context_fields` の組み立て (上記コード片) の `"source_snapshot_dir"` 行を、
+出所ではなく実体化後の `workdir/"source"` を載せる形へ差し替える:
+
+```python
+            run_context_fields: dict[str, object] = {}
+            if self._run_context is not None:
+                run_context_fields = {
+                    # precheck 2026-08-22 pass2: RB2 — mission_id は
+                    # ImproveRunContext 上は int が正 (missions_store.start
+                    # の戻り値)。子側 (mission_worker.py) は str 前提
+                    # (staging_dir の末尾成分と Path.name で比較するため、
+                    # Path.name は必ず str) なので、handshake 組み立てで
+                    # ここだけ str() を掛ける。
+                    "mission_id": str(self._run_context.mission_id),
+                    "staging_dir": str(self._run_context.staging_dir),
+                    # 裁定 R-D3: 出所 (self._run_context.source_snapshot_dir)
+                    # ではなく、直前に copytree した先 (workdir/"source") を
+                    # 載せる — 子は workdir 配下の実在ディレクトリしか
+                    # 受理しない (mission_worker.py の Blocking 10 検査)。
+                    "source_snapshot_dir": str(workdir / "source"),
+                }
+```
+
+**テスト改訂・追加 2 本 (`tests/runners/test_worker_runner.py`)**:
+
+1. **既存 `test_worker_runner_run_context_adds_three_handshake_keys` を改訂する**
+   (この実装で `source_origin` が実在しないため fail closed になり確実に red になる —
+   出所を実在させ、`workdir/source` への実体化先パス・中身の一致まで検証する形へ書き換える):
+
+```python
+def test_worker_runner_run_context_adds_three_handshake_keys(
+        monkeypatch, tmp_path):
+    """レビュー1周目 C3 + 裁定 R-D3: `run_context=` が非 None のとき、
+    `mission_id`/`staging_dir` の 2 キーは渡した値のまま handshake へ載る。
+    `source_snapshot_dir` は R-D3 により WorkerRunner が `workdir/"source"`
+    へ実体化してからそのパスを載せる — 渡した出所
+    (`_FakeRunContext.source_snapshot_dir`) の値そのものではない。fake 子
+    プロセスは cwd (= workdir) と `source/marker.txt` の中身を記録し、
+    handshake.json に同梱することで、パス一致だけでなく「中身が出所と
+    一致」も検証する。"""
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        return orig_popen([sys.executable, "-c",
+                           "import sys, json, os\n"
+                           "line = sys.stdin.readline()\n"
+                           "cwd = os.getcwd()\n"
+                           "marker_path = os.path.join(cwd, 'source', 'marker.txt')\n"
+                           "marker = (open(marker_path).read()\n"
+                           "         if os.path.exists(marker_path) else None)\n"
+                           "open('%s', 'w').write(json.dumps("
+                           "{'handshake': json.loads(line), 'cwd': cwd, "
+                           "'marker': marker}))\n"
+                           "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
+                           % str(tmp_path / 'handshake.json')], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+
+    source_origin = tmp_path / "source_origin"
+    source_origin.mkdir()
+    (source_origin / "marker.txt").write_text("origin-content")
+    source_origin.chmod(0o500)
+
+    class _FakeRunContext:
+        mission_id = 42
+        staging_dir = tmp_path / "staging"
+        source_snapshot_dir = source_origin
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_FakeRunContext())
+    runner.run(_mission())
+    captured = json.loads((tmp_path / "handshake.json").read_text())
+    handshake = captured["handshake"]
+    assert handshake["mission_id"] == "42"  # precheck pass2 RB2: str() 化
+    assert handshake["staging_dir"] == str(tmp_path / "staging")
+    # R-D3: source_snapshot_dir は workdir/"source" (子の cwd 配下) を指す。
+    # 出所 (source_origin) の値そのものではない。
+    assert handshake["source_snapshot_dir"] == os.path.join(captured["cwd"], "source")
+    assert handshake["source_snapshot_dir"] != str(source_origin)
+    assert captured["marker"] == "origin-content"  # 中身が出所と一致
+```
+
+2. **新規 `test_worker_runner_run_context_source_is_symlink_fails_closed`**:
+
+```python
+def test_worker_runner_run_context_source_is_symlink_fails_closed(
+        monkeypatch, tmp_path):
+    """R-D3: `run_context.source_snapshot_dir` が symlink だと
+    `MissionResult(status="failed")` を返し、子プロセスを spawn しない。"""
+    popen_calls: list = []
+
+    def spy(*a, **kw):
+        popen_calls.append((a, kw))
+        raise AssertionError("subprocess.Popen must not be called")
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+
+    real_dir = tmp_path / "real_source"
+    real_dir.mkdir()
+    (real_dir / "marker.txt").write_text("x")
+    link = tmp_path / "source_link"
+    link.symlink_to(real_dir, target_is_directory=True)
+
+    class _FakeRunContext:
+        mission_id = 7
+        staging_dir = tmp_path / "staging"
+        source_snapshot_dir = link
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_FakeRunContext())
+    result = runner.run(_mission())
+    assert result.status == "failed"
+    assert popen_calls == []  # 子プロセスは spawn されていない
+```
+
+**変異 2 件**:
+
+| # | 変異 | 殺すテスト |
+|---|---|---|
+| M-RD3-1 | `shutil.copytree(...)` 呼び出しを削除する (workdir/source を作らない) | `test_worker_runner_run_context_adds_three_handshake_keys` (`marker_path` が実在しないため `captured["marker"]` が `None` のまま `assert captured["marker"] == "origin-content"` が失敗) |
+| M-RD3-2 | `run_context_fields["source_snapshot_dir"]` を `str(self._run_context.source_snapshot_dir)` (出所そのもの) に戻す | 同上テストの `assert handshake["source_snapshot_dir"] != str(source_origin)` |
 
 - [ ] **Step 33a: 既存テストの改訂 (B4/B5 — Step 33 の実装で確実に red になる 2 本)**
 
@@ -6565,6 +6738,9 @@ if worker_profile == "improve":
 
 (設計書 §2.2 のとおり、`source_snapshot_dir` は既に read_only/read_write いずれの対象にも入っている `workdir` の子であるため、この検査は **追加の Landlock ルールを必要としない** — 誤っていたのは「相互照合する」という見出しの主張の実装が欠けていた点のみ)
 
+<!-- precheck 2026-08-23 R-D3 -->
+**(注記のみ、変更不要)** 裁定 R-D3 により `ImproveRunContext.source_snapshot_dir` の意味は「スナップショットの出所」に確定したが、この 5-D 検査自体は handshake から**受け取った値** (= `WorkerRunner.run()` が実体化した `workdir/"source"`) を検査対象にしており、R-D3 の下でもそのまま成立する — `workdir/"source"` は常に `workdir` の子なので上記の prefix 検査は変更不要。R-D3 で変わるのは「誰が `workdir/source` を作るか」(WorkerRunner が作る) であって、子側のこの検査ロジックではない。
+
 <!-- precheck 2026-08-22: T5-B1 -->
 **(Blocking 1 修正、裁定 R6)** `worker_runner.py` の handshake 組み立てへの変更は**削除**する。親側の handshake 3 キー (`mission_id`/`staging_dir`/`source_snapshot_dir`、キー不在 vs `None` の表現含む) と `WorkerRunner.__init__` への `run_context` 追加は **Task 1 Step 33 が所有**する (レビュー1周目 C3 で確定済み — 申し送り⑤参照)。Task 5 は子側 (`mission_worker.py`) が handshake で受領した 3 値を Landlock 適用前に相互照合する経路 (上記) のみを担当し、`worker_runner.py` には一切触れない。親→子の実引数配線を検証する実プロセステストは、本節末尾の「Task 5 統合 step (A-1 マージ後)」で扱う (B-5 本体の受入条件には含めない)。
 
@@ -7778,7 +7954,14 @@ def test_worker_runner_run_context_reaches_real_improve_worker(tmp_path):
     staging_dir = tmp_path / "staging" / mission_id
     staging_dir.mkdir(parents=True, mode=0o700)
     source_snapshot_dir = tmp_path / "source"
-    source_snapshot_dir.mkdir(mode=0o500)
+    source_snapshot_dir.mkdir()
+    # <!-- precheck 2026-08-23 R-D3 -->
+    # 裁定 R-D3: WorkerRunner.run() が workdir/"source" へ実体化するため、
+    # ready の run_context.source_snapshot_dir echo は source_snapshot_dir
+    # (出所) そのものではなくなる。実体化の中身を検証するため、出所へ
+    # マーカーファイルを置いておく (書込のため chmod 0o500 前に行う)。
+    (source_snapshot_dir / "marker.txt").write_text("c3-real-probe-marker")
+    source_snapshot_dir.chmod(0o500)
 
     class _RealRunContext:
         def __init__(self, mission_id, staging_dir, source_snapshot_dir):
@@ -7791,6 +7974,13 @@ def test_worker_runner_run_context_reaches_real_improve_worker(tmp_path):
 
     def _on_ready(frame):
         observed_ready.update(frame)
+        # R-D3: on_ready は WorkerRunner.run() の tempdir がまだ生きている
+        # 間に同期呼び出しされる — echo された source_snapshot_dir (=
+        # workdir/"source") の中身をこの時点で読み、実体化の裏取りを行う。
+        echoed_source = Path(frame["run_context"]["source_snapshot_dir"])
+        observed_ready["_echoed_source_basename"] = echoed_source.name
+        observed_ready["_echoed_source_marker"] = (
+            echoed_source / "marker.txt").read_text()
 
     runner = WorkerRunner(
         root=tmp_path, settings=_settings(), clock=_clock(), rag=_rag(),
@@ -7801,11 +7991,14 @@ def test_worker_runner_run_context_reaches_real_improve_worker(tmp_path):
     # (`observed_ready` が空のままなら `ready` timeout/protocol_error で
     # `on_ready` が一度も呼ばれていない — ready 未到達の直接証拠)。
     assert observed_ready.get("ok") is True
-    assert observed_ready["run_context"] == {
-        "mission_id": mission_id,
-        "staging_dir": str(staging_dir),
-        "source_snapshot_dir": str(source_snapshot_dir),
-    }
+    assert observed_ready["run_context"]["mission_id"] == mission_id
+    assert observed_ready["run_context"]["staging_dir"] == str(staging_dir)
+    # R-D3: source_snapshot_dir は workdir/"source" (子の cwd 配下) を指す
+    # — 渡した出所 (source_snapshot_dir 変数) のパスそのものではない。
+    assert observed_ready["run_context"]["source_snapshot_dir"] != str(
+        source_snapshot_dir)
+    assert observed_ready["_echoed_source_basename"] == "source"
+    assert observed_ready["_echoed_source_marker"] == "c3-real-probe-marker"
 ```
 
 (`_settings()`/`_clock()`/`_rag()`/`_mission()` は既存 `tests/runners/test_worker_runner.py` のヘルパを import して流用する。`tests/test_improve_profile_isolation.py` に無ければ import を追加する。)
@@ -16234,6 +16427,16 @@ class ImproveLoop:
         raise NotImplementedError  # 10.9 節
 
     def _materialize_workspace(self, mission_id, allowed_ids):
+        # <!-- precheck 2026-08-23 R-D3 -->
+        # 裁定 R-D3: 本メソッドの責務は「出所を用意する」ことに縮小された。
+        # `staging_dir/_snapshot_src/` へ `copy_source_snapshot`/
+        # `copy_examples_snapshot` (10.3 節) を使って plugins/<name> 版実体
+        # + `_examples` をコピーし、その `staging_dir/_snapshot_src/` パスを
+        # 返す (これが ImproveRunContext.source_snapshot_dir に入る「出所」)。
+        # `workdir/source` への配置・実体化は本メソッドの責務ではない —
+        # `WorkerRunner.run()` が workdir 作成直後に
+        # `shutil.copytree(source_snapshot_dir, workdir/"source")` で行う
+        # (Task 1 Step 33 実装時追記)。詳細は 10.3 節参照。
         raise NotImplementedError  # 10.3 節
 
     def _build_rpc_handlers(self, ledger, *, staging_dir: Path):
@@ -16301,6 +16504,9 @@ EOF
 ### 10.3 source snapshot: 固定 `PluginMeta.path` から・fault injection・`_examples` コピー (§8.1-11)
 
 **コピー元は稼働中 registry が保持する固定 `PluginMeta.path` (版ディレクトリ実体) であって live symlink `plugins/<name>` ではない**。plugin `flock` 下で 3 本を 1 マニフェストとしてコピーし、コピー後に `content_hash`/`artifact_hash` を registry の値と再照合する (混成スナップショット・未 admit 版の混入を防ぐ)。
+
+<!-- precheck 2026-08-23 R-D3 -->
+**裁定 R-D3 (`_materialize_workspace` の責務範囲)**: 本節が定義する `copy_source_snapshot`/`copy_examples_snapshot` は `dest_root` を引数で受け取る汎用関数であり、呼び出し元 (`ImproveLoop._materialize_workspace`, 10.2 節) がその `dest_root` に何を渡すかで責務範囲が決まる。R-D3 により `_materialize_workspace` は `dest_root=staging_dir / "_snapshot_src"` (出所) を渡す — **`workdir/"source"` へは渡さない** (`workdir` は `prepare()` の時点でまだ存在しない使い捨てディレクトリであり、`WorkerRunner.run()` が呼ばれるまで作られない)。`workdir/"source"` への実体化は `WorkerRunner.run()` が `ImproveRunContext.source_snapshot_dir` (= `staging_dir/_snapshot_src`) から `shutil.copytree` で行う (Task 1 Step 33 実装時追記)。以下 Step 1〜3 の `copy_source_snapshot`/`copy_examples_snapshot` 自体のテスト・実装 (汎用関数、`dest_root` は呼び出し元が決める) はこの裁定による変更を要しない — テスト中の `dest = tmp_path / "workdir" / "source"` は関数の汎用性を示すための一例のパスに過ぎず、実際の呼び出し元 (10.9 節で完成する `_materialize_workspace`) は `staging_dir/_snapshot_src` を渡す。
 
 - [ ] **Step 1: 失敗するテストを書く**
 
@@ -25909,10 +26115,16 @@ class _FakeVerifyWorkerRunner:
     def run(self, mission: Mission) -> MissionResult:
         behavior = _BEHAVIOR["current"]
         if not behavior.get("skip_ready"):
+            # <!-- precheck 2026-08-23 R-D3 -->
+            # 裁定 R-D3: 実 WorkerRunner は source_snapshot_dir (出所) を
+            # そのまま echo せず、workdir/"source" (使い捨て workdir 配下)
+            # を返す。この fake も同じ契約を模す — 実在しない固定パスの
+            # basename だけを "source" に揃える (verify_backend 側の
+            # on_ready ゲートは basename のみを照合する、下記参照)。
             self._on_ready({"type": "ready", "ok": True, "run_context": {
                 "mission_id": str(self._ctx.mission_id),
                 "staging_dir": str(self._ctx.staging_dir),
-                "source_snapshot_dir": str(self._ctx.source_snapshot_dir)}})
+                "source_snapshot_dir": str(Path("/fake-workdir") / "source")}})
         return behavior["result"](mission)
 
 
@@ -26253,13 +26465,26 @@ def verify_backend(
         def on_ready(frame: dict) -> None:
             ready_frames.append(frame)
             echoed = frame.get("run_context") or {}
-            expected = {"mission_id": str(mission_id),
-                       "staging_dir": str(staging_dir),
-                       "source_snapshot_dir": str(source_snapshot_dir)}
-            if echoed != expected:
+            # <!-- precheck 2026-08-23 R-D3 -->
+            # 裁定 R-D3: source_snapshot_dir は WorkerRunner が
+            # workdir/"source" (この関数からは見えない使い捨て workdir 配下)
+            # へ実体化した後の値を返す — 渡した出所 (source_snapshot_dir
+            # 変数) そのものではない。mission_id/staging_dir は完全一致を、
+            # source_snapshot_dir は basename が "source" であることのみを
+            # 照合する (実体化そのものの裏取りは Task 1 Step 33 のテストが
+            # 担う)。
+            echoed_source = echoed.get("source_snapshot_dir")
+            mismatch = (echoed.get("mission_id") != str(mission_id)
+                       or echoed.get("staging_dir") != str(staging_dir)
+                       or echoed_source is None
+                       or Path(echoed_source).name != "source")
+            if mismatch:
                 raise RuntimeError(
                     f"verify-backend: ready frame run_context mismatch "
-                    f"(expected {expected}, got {echoed})")
+                    f"(expected mission_id={mission_id!r} "
+                    f"staging_dir={str(staging_dir)!r} and a "
+                    f"source_snapshot_dir whose basename is 'source', "
+                    f"got {echoed})")
 
         rag = Rag(scratch_root / "rag")
         runner = WorkerRunner(
@@ -26322,18 +26547,27 @@ def verify_backend(
         shutil.rmtree(scratch_root, ignore_errors=True)
 ```
 
-**統合時要確認 (Task 1/5/10 との結合点、Task 13 の実装者は着手時にこの
-注記の妥当性を現物で再確認すること)**: `mission_worker._bootstrap_improve_profile`
+<!-- precheck 2026-08-23 R-D3 -->
+**(旧「統合時要確認」— 裁定 R-D3 により解決済み)**: `mission_worker._bootstrap_improve_profile`
 (現物 `src/agentic_fx/mission_worker.py:166-170` 付近「Blocking 10」注記)
 は `source_snapshot_dir` が **子プロセスの cwd (`WorkerRunner.run()` が
 `tempfile.TemporaryDirectory(prefix="afx-mission-")` で作る使い捨て
-workdir) の配下**であることを要求する。上記コードの `scratch_root` は
-`WorkerRunner` が内部で作る workdir とは別物であり、この検査が現物のまま
-なら `source_snapshot_dir` の配置方法は Task 10 の `ImproveLoop.prepare()`
-が実際にどう満たしているかに合わせて調整が要る (例: `WorkerRunner` 側に
-workdir 内へ `source_snapshot_dir` をコピー/バインドする経路が追加されて
-いる可能性がある)。Task 13 独自の解決を発明せず、`ImproveLoop.prepare()`
-の現物実装と同じ方式を踏襲すること。
+workdir) の配下**であることを要求する。上記コードの `scratch_root`/
+`source_snapshot_dir` (verify_backend が用意する「出所」) は `WorkerRunner`
+が内部で作る workdir とは別物だが、これは**問題にならない** — 裁定 R-D3
+により `WorkerRunner.run()` 自身が workdir 作成直後に
+`shutil.copytree(run_context.source_snapshot_dir, workdir/"source")` を
+行い、handshake の `source_snapshot_dir` には実体化先 `workdir/"source"`
+を載せる (Task 1 Step 33 実装時追記)。子の Blocking 10 検査はこの
+`workdir/"source"` を見るので常に「workdir 配下」を満たす。verify_backend
+は `WorkerRunner` を本番と同じ経路 (`run_context=ctx`) で呼ぶだけでよく、
+`scratch_root` を workdir 内へ配置し直す等の独自解決は不要 — 上記
+`on_ready` ゲートは実体化後の値 (basename が `"source"`) を照合する形に
+既に直してある (このセクション冒頭の `on_ready` 定義参照)。Task 10 の
+`ImproveLoop.prepare()`/`_materialize_workspace` も同じ契約 (出所を用意
+するだけ、workdir/source への配置は WorkerRunner が行う) に従う (10.3 節
+の R-D3 追記参照) ため、verify_backend はその実装が完成しているかに
+依存しない。
 
 CLI 配線 (`src/agentic_fx/entry.py:11`):
 
