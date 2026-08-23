@@ -172,6 +172,18 @@ def list_due_for_expiry(conn: sqlite3.Connection, *, now: datetime,
     return conn.execute(sql, params).fetchall()
 
 
+def set_reason(conn: sqlite3.Connection, approval_id: int, reason: str, *,
+               commit: bool = True) -> None:
+    """pending 行の reason 列を厳密一致の文字列で更新する (B-6、gc_roots ②
+    /11e の `assert "legacy_plain_present" in (row["reason"] or "")` /
+    M2 変異と三者を完全一致で揃える契約)。"""
+    conn.execute(
+        "UPDATE approval_requests SET reason=? WHERE id=? AND status='pending'",
+        (reason, approval_id))
+    if commit:
+        conn.commit()
+
+
 def set_message_id(conn: sqlite3.Connection, approval_id: int,
                    message_id: str) -> None:
     conn.execute("UPDATE approval_requests SET message_id=? WHERE id=?",
