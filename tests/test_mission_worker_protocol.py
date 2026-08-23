@@ -421,13 +421,20 @@ class _FakeLocalRunner:
 def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
                 settings_mutator=None, runner_raises=False,
                 raw_stdin=None, out_stream=None, resource_limits_raise=False,
-                runner_cls=None):
+                runner_cls=None, send_go=True):
     """`main()` をインプロセスで駆動し、送出フレーム列と観測点を返す。
 
     `raw_stdin`: handshake の JSON 化を飛ばして生バイト列を stdin に流す
     (不正 JSON の検証用)。`out_stream`: `_protect_protocol_stdout` の戻り値を
     差し替える (送出失敗の注入用)。`resource_limits_raise`:
     `_set_resource_limits` を例外送出する fake にする (fail closed の検証用)。
+    `send_go`: worker_profile="improve" のとき、handshake に続けて
+    `go` フレーム (seq=2) を stdin に足す (裁定 RW1/RW6 — improve 分岐は
+    `ready` 送出後に `go` を待ってから Mission を実行する)。既定 True
+    (go 到達を前提とする既存テストの挙動を変えない)。`False` にすると
+    `go` を送らない — 「`go` が来なければ副作用ゼロで終了する」ケースの
+    検証に使う (`raw_stdin` 指定時は無視される — 呼び出し元が stdin
+    全体を制御する)。
     """
     import io as _io
 
@@ -454,8 +461,13 @@ def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
     }
     handshake.update(handshake_overrides or {})
 
-    stdin_bytes = (raw_stdin if raw_stdin is not None
-                   else json.dumps(handshake).encode() + b"\n")
+    if raw_stdin is not None:
+        stdin_bytes = raw_stdin
+    else:
+        stdin_bytes = json.dumps(handshake).encode() + b"\n"
+        if send_go and handshake.get("worker_profile") == "improve":
+            go_frame = {"type": "go", "seq": 2}
+            stdin_bytes += json.dumps(go_frame).encode() + b"\n"
     monkeypatch.setattr(
         mission_worker.sys, "stdin",
         type("S", (), {"buffer": _io.BytesIO(stdin_bytes)})())
@@ -500,6 +512,79 @@ def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
            else captured.getvalue())
     frames = [json.loads(l) for l in raw.splitlines()]
     return frames, rlimit_calls, registry_calls
+
+
+class _CountingFakeLocalRunner(_FakeLocalRunner):
+    """`_FakeLocalRunner` の `.run()` 呼び出し回数を数える (RW1/RW6 pin —
+    `go` を送らないと Mission/LLM が一切起動しないことの検証には、
+    `LocalRunner` のインスタンス化 (build_runner が `ready` 送出前に必ず
+    行う) ではなく `.run()` の呼び出し回数を見る必要がある)。"""
+
+    run_call_count = 0
+
+    def run(self, mission):
+        type(self).run_call_count += 1
+        return super().run(mission)
+
+
+def _improve_handshake_overrides(tmp_path, mission_id="m-go-test"):
+    return {"worker_profile": "improve", "db_path": None, "plugins_dir": None,
+            "mission_id": mission_id,
+            "staging_dir": str(tmp_path / "staging" / mission_id),
+            "source_snapshot_dir": str(tmp_path / "source")}
+
+
+def test_main_does_not_start_llm_or_send_result_without_go_frame(
+        monkeypatch, tmp_path):
+    """裁定 RW1/RW6 の必須 protocol test (プラン §8.1-18):「`go` を送らないと
+    子は LLM を起動しない」。`go` 前は副作用ゼロ — `LocalRunner.run()` の
+    呼び出し回数は 0 のまま、`result` フレームも送らずに子が終了する
+    (`worker_startup_timeout_sec` 超過後、静かに `main()` から return する)。
+    タイムアウトを短く設定して実測を高速化する。"""
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda **kw: None)
+    _CountingFakeLocalRunner.run_call_count = 0
+
+    def settings_mutator(settings_dict):
+        settings_dict["worker"]["worker_startup_timeout_sec"] = 0.2
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides=_improve_handshake_overrides(tmp_path),
+        settings_mutator=settings_mutator,
+        runner_cls=_CountingFakeLocalRunner,
+        send_go=False)
+
+    assert _CountingFakeLocalRunner.run_call_count == 0, (
+        "go を送らなかったのに LLM (LocalRunner.run) が起動した")
+    assert len(frames) == 1 and frames[0]["type"] == "ready", (
+        "go を送らなかったのに result フレームが送出された — "
+        f"frames={frames!r}")
+
+
+def test_main_runs_llm_and_sends_result_when_go_frame_arrives(
+        monkeypatch, tmp_path):
+    """上のテストの裏 — `go` フレームが届けば (`send_go=True`、既定)
+    `LocalRunner.run()` が 1 回呼ばれ、`result` フレームが送出される
+    (submit_manual 経路 = `on_ready` を渡さない呼び出しに相当。`_drive_main`
+    は `on_ready` を持たないため、これは「on_ready の有無に関わらず
+    profile 判定だけで go を消費できる子側実装」の pin — 親側
+    `on_ready=None` でも `go` が送られることは
+    `tests/runners/test_worker_runner.py` 側が実測する)。"""
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda **kw: None)
+    _CountingFakeLocalRunner.run_call_count = 0
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides=_improve_handshake_overrides(
+            tmp_path, mission_id="m-go-test-2"),
+        runner_cls=_CountingFakeLocalRunner,
+        send_go=True)
+
+    assert _CountingFakeLocalRunner.run_call_count == 1
+    assert frames[-1]["type"] == "result"
+    assert frames[-1]["status"] == "completed"
 
 
 def test_main_happy_path_emits_ready_event_result_in_one_seq_sequence(

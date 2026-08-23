@@ -21,6 +21,7 @@ import pytest
 
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
+from agentic_fx.core.landlock import is_available as landlock_available
 from agentic_fx.core.mission_protocol import write_frame
 from agentic_fx.runners.base import Mission
 from agentic_fx.runners.worker_runner import WorkerRunner
@@ -2103,10 +2104,18 @@ def test_worker_runner_run_context_adds_three_handshake_keys(monkeypatch, tmp_pa
     handshake フレームへ載る。(差分再検証 RB2) `mission_id` は
     `ImproveRunContext` 上は int だが、handshake JSON へ載せる際に
     `str()` される (子側は str 前提、`Path.name` との比較のため) — この
-    assert が `str(42)` を pin する。"""
+    assert が `str(42)` を pin する。
+
+    裁定 R-D3: `source_snapshot_dir` は「出所」であり、`WorkerRunner.run()`
+    が `workdir/source` へ実体化してから handshake へ載せる。ここでは
+    `_FakeRunContext.source_snapshot_dir` に実在する dir (出所) を渡し、
+    handshake の値は出所そのものではなく `workdir/source` (`spy` が捕捉した
+    `cwd` の子) になることを assert する。"""
     orig_popen = subprocess.Popen
+    captured: dict[str, object] = {}
 
     def spy(*a, **kw):
+        captured["cwd"] = kw.get("cwd")
         return orig_popen([sys.executable, "-c",
                            "import sys, json\n"
                            "line = sys.stdin.readline()\n"
@@ -2116,10 +2125,13 @@ def test_worker_runner_run_context_adds_three_handshake_keys(monkeypatch, tmp_pa
 
     monkeypatch.setattr(subprocess, "Popen", spy)
 
+    source_origin = tmp_path / "source_origin"
+    source_origin.mkdir(mode=0o500)
+
     class _FakeRunContext:
         mission_id = 42
         staging_dir = tmp_path / "staging"
-        source_snapshot_dir = tmp_path / "source"
+        source_snapshot_dir = source_origin
 
     root = _root(tmp_path)
     runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
@@ -2129,7 +2141,8 @@ def test_worker_runner_run_context_adds_three_handshake_keys(monkeypatch, tmp_pa
     handshake = json.loads((tmp_path / "handshake.json").read_text())
     assert handshake["mission_id"] == "42"  # precheck pass2 RB2: str() 化
     assert handshake["staging_dir"] == str(tmp_path / "staging")
-    assert handshake["source_snapshot_dir"] == str(tmp_path / "source")
+    assert captured["cwd"] is not None
+    assert handshake["source_snapshot_dir"] == str(Path(captured["cwd"]) / "source")
 
 
 def test_worker_runner_run_context_none_omits_three_handshake_keys(
@@ -2383,6 +2396,540 @@ def test_worker_runner_cli_started_never_sent_leaves_finally_a_no_op(
     assert all(pid == fake_proc.pid for pid, _sig in killpg_calls)
 
 
+# ---------------------------------------------------------------------------
+# 裁定 R-D1 (プラン10 Task 9 再工事): `WorkerRunner.run()` は子の `ready`
+# フレーム受信直後に `on_ready(frame)` を呼び、例外なく戻ったらそのまま
+# 実行を継続する。新規プロトコルフレーム (`go` 等) は追加しない — 既存の
+# 一発 handshake 方式のまま、`on_ready` を「ready 直後のフック」として
+# 使うだけ (プラン 9.3 節「実装時改訂 (2026-08-22 深夜裁定 R-D1)」参照)。
+# `on_ready` が例外を投げたら子を kill して `MissionResult('failed', ...)`
+# を返す (pre-ready 失敗)。
+# ---------------------------------------------------------------------------
+
+
+def _fake_improve_proc(r, w, w2, r2):
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    return FakeProc()
+
+
+def test_on_ready_called_before_result_and_mission_completes_normally(
+        tmp_path, monkeypatch):
+    """`on_ready` が例外なく戻ったら、`run()` は新規フレームを挟まず
+    そのまま `result` まで読み進め、通常どおり完走する (裁定 R-D1 —
+    新規の `go` フレームは追加しない)。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    events: list[str] = []
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake (seq=1)
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        # R-D1: 新規フレームを待たず、ready 送出直後に直接 result を返す
+        # (現物の実行継続ロジックのまま)。
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+    fake_proc = _fake_improve_proc(r, w, w2, r2)
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    def _on_ready(frame):
+        events.append(f"on_ready:{frame['ok']}")
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          on_ready=_on_ready)
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert events == ["on_ready:True"], (
+        "on_ready が呼ばれていない、または期待どおりの frame を受け取って"
+        "いない")
+
+
+def test_on_ready_exception_kills_child_and_returns_failed(tmp_path, monkeypatch):
+    """`on_ready` が例外を投げたら、子を SIGTERM→SIGKILL で止め、
+    `MissionResult(status='failed', reason=...)` を返す (裁定 R-D1 —
+    pre-ready 失敗として `ImproveSupervisor` が扱えるようにする)。新規
+    フレームは無いので、子は「親が次に何も書いてこない (stdin が閉じられ
+    EOF になる)」ことでこの失敗を観測する。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    child_saw_eof = threading.Event()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        line = child_in.readline()  # 次のフレームを待つ — 来ないはず
+        if line == b"":
+            child_saw_eof.set()
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+    fake_proc = _fake_improve_proc(r, w, w2, r2)
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(wr_mod.os, "killpg",
+                        lambda pid, sig: killpg_calls.append((pid, sig)))
+
+    def _boom(frame):
+        raise RuntimeError("on_ready boom")
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=_tiny_worker_settings(),
+                          clock=FixedClock(NOW), rag=_rag(tmp_path),
+                          worker_profile="improve", on_ready=_boom)
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "failed"
+    assert result.reason is not None and "on_ready failed" in result.reason
+    assert child_saw_eof.is_set(), (
+        "on_ready 失敗後も親が何か書き込んでいる (kill されていない疑い)")
+    assert any(sig == signal.SIGTERM for _pid, sig in killpg_calls), (
+        "on_ready 失敗時に子が SIGTERM されていない")
+
+
+def test_on_ready_called_for_trade_profile_too(tmp_path, monkeypatch):
+    """`on_ready` は worker_profile に関わらず ready 直後に呼ばれる —
+    trade profile 用の分岐は無い (R-D1 は新規フレームを追加しないため、
+    improve/trade で `run()` の実行継続ロジックに差は生まれない)。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+    fake_proc = _fake_improve_proc(r, w, w2, r2)
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    on_ready_calls: list[dict] = []
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="trade",
+                          on_ready=on_ready_calls.append)
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert len(on_ready_calls) == 1
+
+
+def test_go_frame_is_written_as_real_frame_only_after_on_ready_returns(
+        tmp_path, monkeypatch):
+    """裁定 RW1 追補 pin (b): `on_ready` が例外なく戻った**後**にだけ、
+    `WorkerRunner.run()` が `core/mission_protocol.py` の
+    `FRAME_TYPES_PARENT_TO_CHILD` の一員である `go` を**実フレーム**
+    (`{"type": "go", "seq": <int>}`) として子へ書く。
+
+    `on_ready` を意図的に `_ON_READY_DELAY_SEC` だけ遅延させ (`mark_running`
+    commit の I/O を模す)、子は `ready` 送出直後から `select.select` で
+    **ノンブロッキングに** 短い間隔でポーリングする — `on_ready` の遅延窓の
+    **内側**で `go` が読めてしまったら、それは `on_ready` 完了を待たずに
+    書かれた証拠になる (子スレッドのスケジューリング遅延に依存する素朴な
+    `events` 追記順の比較は、`go` を先に書いても子が読み取る前に親側の
+    `on_ready` 完了ログの方が先に記録され得るため red にならない — レース
+    に依存しない検査に置き換える)。"""
+    _ON_READY_DELAY_SEC = 0.3
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    observed: dict[str, object] = {"seen_within_delay": False}
+
+    def child_thread_fn():
+        import select
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake (seq=1)
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        deadline = time.monotonic() + _ON_READY_DELAY_SEC - 0.05
+        while time.monotonic() < deadline:
+            ready_fds, _, _ = select.select(
+                [child_in], [], [], max(0.0, deadline - time.monotonic()))
+            if ready_fds:
+                observed["seen_within_delay"] = True
+                break
+        line = child_in.readline()
+        go_frame = json.loads(line)
+        observed["go_frame"] = go_frame
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+    fake_proc = _fake_improve_proc(r, w, w2, r2)
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    def _on_ready(frame):
+        time.sleep(_ON_READY_DELAY_SEC)
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          on_ready=_on_ready)
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert observed["seen_within_delay"] is False, (
+        "on_ready の遅延窓の内側で go フレームが読めてしまった — "
+        "on_ready 完了前に go が書かれている疑い")
+    assert observed.get("go_frame") == {"type": "go", "seq": 2}, observed
+
+
+def test_go_frame_is_sent_for_improve_profile_even_when_on_ready_is_none(
+        tmp_path, monkeypatch):
+    """裁定 RW1 追補 pin (d): `submit_manual` (手動 one-shot、10.12 節) は
+    `on_ready=None` のまま `WorkerRunner(worker_profile="improve", ...)`
+    を構築する。`go` の送出条件は `on_ready is not None` ではなく
+    `worker_profile == "improve"` そのものであるため、`on_ready=None` でも
+    `go` フレームが送られることを確認する (子側 `_wait_for_go` は
+    wave 起動か手動かを知らず常に `go` を待つため、この非対称を作ると
+    手動 one-shot が毎回 timeout する)。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    received: dict = {}
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake (seq=1)
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        line = child_in.readline()
+        received["frame"] = json.loads(line)
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+    fake_proc = _fake_improve_proc(r, w, w2, r2)
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          on_ready=None)
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert received.get("frame", {}).get("type") == "go", (
+        "on_ready=None でも improve profile なら go フレームが送られる"
+        f"はず: {received!r}")
+
+
+# ---------------------------------------------------------------------------
+# 裁定 R-D3 (プラン10 Task 9 再工事の追補): `run_context.source_snapshot_dir`
+# は「スナップショットの出所」を指すに留まる。`WorkerRunner.run()` は
+# workdir 作成直後にこの出所を `workdir/source` へ実体化
+# (`shutil.copytree(..., symlinks=False)`) し、handshake の
+# `source_snapshot_dir` にはこの実体化先を載せる。出所が無い/symlink なら
+# fail closed。
+# ---------------------------------------------------------------------------
+
+
+def test_handshake_source_snapshot_dir_is_workdir_source_with_matching_content(
+        tmp_path, monkeypatch):
+    """R-D3 pin: handshake の `source_snapshot_dir` は `workdir/source`
+    (basename が `source`、`home`/`tmp`/`cfg` と同じ workdir の直下) であり、
+    その中身 (ファイル content) が出所と一致する。"""
+    origin = tmp_path / "origin_src"
+    origin.mkdir(mode=0o500)
+    # mode=0o500 の dir 内にファイルを作るには一旦書込可能にする必要がある。
+    origin.chmod(0o700)
+    (origin / "nested").mkdir()
+    (origin / "hello.txt").write_text("beacon-content", encoding="utf-8")
+    (origin / "nested" / "inner.txt").write_text("inner-content", encoding="utf-8")
+
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    observed: dict = {}
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())  # handshake (seq=1)
+        observed["handshake"] = handshake
+        source_dir = Path(handshake["source_snapshot_dir"])
+        # run() がまだ TemporaryDirectory の `with` を抜けていない (child
+        # からの応答待ち) 間に、workdir/source の実体を検査する。
+        observed["basename"] = source_dir.name
+        observed["parent_has_home_tmp_cfg"] = (
+            (source_dir.parent / "home").is_dir()
+            and (source_dir.parent / "tmp").is_dir()
+            and (source_dir.parent / "cfg").is_dir())
+        observed["hello_content"] = (
+            (source_dir / "hello.txt").read_text(encoding="utf-8")
+            if (source_dir / "hello.txt").exists() else None)
+        observed["inner_content"] = (
+            (source_dir / "nested" / "inner.txt").read_text(encoding="utf-8")
+            if (source_dir / "nested" / "inner.txt").exists() else None)
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        line = child_in.readline()
+        json.loads(line)  # go
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+    fake_proc = _fake_improve_proc(r, w, w2, r2)
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    class _RunContext:
+        mission_id = "rd3-content-test"
+        staging_dir = tmp_path / "staging" / "rd3-content-test"
+        source_snapshot_dir = origin
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_RunContext(), on_ready=None)
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert observed.get("basename") == "source", observed
+    assert observed.get("parent_has_home_tmp_cfg") is True, observed
+    assert observed.get("hello_content") == "beacon-content", observed
+    assert observed.get("inner_content") == "inner-content", observed
+
+
+def test_source_snapshot_dir_origin_missing_is_fail_closed(tmp_path, monkeypatch):
+    """R-D3 pin: 出所 (`run_context.source_snapshot_dir`) が実在しなければ
+    子プロセスを spawn せず `MissionResult('failed', ...)` を返す。"""
+    import agentic_fx.runners.worker_runner as wr_mod
+    popen_calls: list = []
+    monkeypatch.setattr(wr_mod.subprocess, "Popen",
+                        lambda *a, **k: popen_calls.append((a, k)))
+
+    class _RunContext:
+        mission_id = "rd3-missing-test"
+        staging_dir = tmp_path / "staging" / "rd3-missing-test"
+        source_snapshot_dir = tmp_path / "does-not-exist"
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_RunContext(), on_ready=None)
+    result = runner.run(_mission())
+
+    assert result.status == "failed", result
+    assert popen_calls == [], (
+        "出所が無いのに子プロセスを spawn した — fail closed していない")
+
+
+def test_source_snapshot_dir_origin_symlink_is_fail_closed(tmp_path, monkeypatch):
+    """R-D3 pin: 出所が symlink (実在ディレクトリを指す symlink であって
+    も) だと fail closed する。`Path.is_dir()` は symlink を辿って解決する
+    ため、symlink 検査を独立して行わない実装だとこの変異は生存する。"""
+    import agentic_fx.runners.worker_runner as wr_mod
+    popen_calls: list = []
+    monkeypatch.setattr(wr_mod.subprocess, "Popen",
+                        lambda *a, **k: popen_calls.append((a, k)))
+
+    real_dir = tmp_path / "real_origin"
+    real_dir.mkdir(mode=0o500)
+    symlink_origin = tmp_path / "symlink_origin"
+    symlink_origin.symlink_to(real_dir, target_is_directory=True)
+
+    class _RunContext:
+        mission_id = "rd3-symlink-test"
+        staging_dir = tmp_path / "staging" / "rd3-symlink-test"
+        source_snapshot_dir = symlink_origin
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_RunContext(), on_ready=None)
+    result = runner.run(_mission())
+
+    assert result.status == "failed", result
+    assert popen_calls == [], (
+        "出所が symlink なのに子プロセスを spawn した — fail closed して"
+        "いない")
+
+
+def test_real_improve_worker_ready_then_on_ready_then_result_ordering(tmp_path):
+    """R-D1/RW1 pin (c): 実プロセスの `mission_worker.py` (improve profile) を
+    本物の `WorkerRunner` で起動し、`ready` → `on_ready` → `go` (実フレーム、
+    親側 `WorkerRunner.run()` が on_ready 完了直後に送出) → `result` の
+    順序を実測する。llama-swap への接続先は到達不能
+    アドレスへ差し替えているため `LocalRunner.run()` は速やかに失敗する
+    が、それでも `on_ready` が呼ばれ、mission がタイムアウトいっぱいまで
+    待たされずに `failed` で返ることを確認する — 子がフレームを待たず
+    ready 直後に実行を継続していることの間接証拠。"""
+    if not landlock_available():
+        pytest.skip("Landlock not available on this kernel/architecture")
+    from tests.conftest import _LLAMA_SWAP_UNREACHABLE_URL
+
+    root = _root(tmp_path)
+    settings = SETTINGS.model_copy(update={
+        "llama_swap": SETTINGS.llama_swap.model_copy(
+            update={"base_url": _LLAMA_SWAP_UNREACHABLE_URL, "timeout_sec": 1}),
+        "worker": SETTINGS.worker.model_copy(
+            update={"worker_startup_timeout_sec": 15.0,
+                    "worker_grace_sec": 5.0,
+                    "worker_terminate_grace_sec": 2.0})})
+
+    staging = tmp_path / "staging" / "rd1-real-probe"
+    staging.mkdir(parents=True, mode=0o700)
+    source_snapshot = tmp_path / "source"
+    source_snapshot.mkdir(mode=0o500)
+
+    class _RunContext:
+        mission_id = "rd1-real-probe"
+        staging_dir = staging
+        source_snapshot_dir = source_snapshot
+
+    events: list[str] = []
+
+    def _on_ready(frame):
+        events.append("on_ready")
+        assert frame.get("ok") is True, frame
+
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=settings, clock=clock,
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_RunContext(), on_ready=_on_ready)
+    mission = Mission(prompt="hi", tools=[], output_schema={"type": "object"},
+                      max_turns=1, timeout_sec=20.0)
+    started = time.monotonic()
+    result = runner.run(mission)
+    elapsed = time.monotonic() - started
+
+    assert events == ["on_ready"], (
+        "on_ready が呼ばれていない、または複数回呼ばれた")
+    assert result.status == "failed", result
+    # `go` を送らない変異では、子は `_wait_for_go` で
+    # `worker_startup_timeout_sec` (15s) いっぱいまで待ってから `result`
+    # フレームを送らずに終了する — 親は EOF を受けて `reason=None` の
+    # `failed` を返す (elapsed ≈ 15s)。`go` が実際に送られた場合は子が
+    # 即座に `LocalRunner.run()` へ進み、到達不能な llama-swap への
+    # 接続失敗を `MissionResult(reason=...)` として明示的に返す (elapsed
+    # は数秒以内) — この 2 点 (reason の有無 / elapsed の桁) で
+    # discriminate する。「elapsed < mission.timeout_sec (20s)」だけの
+    # 比較は「go を送らない」変異でも 15s < 20s で偽陰性になる (advisor
+    # 指摘)。
+    assert result.reason is not None, (
+        "result.reason が None — LocalRunner.run() まで進まず、go 未着の"
+        f"まま EOF で終端した疑い: {result!r}")
+    assert elapsed < 8.0, (
+        f"mission timeout いっぱい (worker_startup_timeout_sec=15s) 近くまで"
+        f"待たされた (go が届いていない疑い): elapsed={elapsed:.2f}s")
+
+
+def test_real_improve_worker_on_ready_exception_leaves_no_surviving_child(
+        tmp_path, monkeypatch):
+    """R-D1 pin (b) の「子が残らない」を実プロセスで実測する。
+    `test_on_ready_exception_kills_child_and_returns_failed` は
+    `os.killpg` を monkeypatch した fake 子 (プロセスとして実在しない)
+    で `killpg` の呼び出しだけを確認するため、実際に子が死ぬところまでは
+    見ていない — ここでは本物の `mission_worker.py` 子プロセスを起動し、
+    `on_ready` が例外を投げた後、実際の pid が `poll()` で非 None (終了
+    済み) になることを確認する。子は on_ready 例外と競合して
+    `LocalRunner.run()` (llama-swap への実リクエスト) へ進みうる — 到達
+    不能アドレスへ差し替え、実サーバへリクエストを飛ばさない
+    (`test_real_improve_worker_ready_then_on_ready_then_result_ordering`
+    と同じ規律)。"""
+    if not landlock_available():
+        pytest.skip("Landlock not available on this kernel/architecture")
+    from tests.conftest import _LLAMA_SWAP_UNREACHABLE_URL
+
+    root = _root(tmp_path)
+    settings = SETTINGS.model_copy(update={
+        "llama_swap": SETTINGS.llama_swap.model_copy(
+            update={"base_url": _LLAMA_SWAP_UNREACHABLE_URL, "timeout_sec": 1}),
+        "worker": SETTINGS.worker.model_copy(
+            update={"worker_startup_timeout_sec": 15.0,
+                    "worker_grace_sec": 5.0,
+                    "worker_terminate_grace_sec": 2.0})})
+
+    staging = tmp_path / "staging" / "rd1-real-kill-probe"
+    staging.mkdir(parents=True, mode=0o700)
+    source_snapshot = tmp_path / "source"
+    source_snapshot.mkdir(mode=0o500)
+
+    class _RunContext:
+        mission_id = "rd1-real-kill-probe"
+        staging_dir = staging
+        source_snapshot_dir = source_snapshot
+
+    captured: dict[str, object] = {}
+    import agentic_fx.runners.worker_runner as wr_mod
+    real_popen = wr_mod.subprocess.Popen
+
+    def _capture(*a, **k):
+        p = real_popen(*a, **k)
+        captured["proc"] = p
+        return p
+
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", _capture)
+
+    def _boom(frame):
+        raise RuntimeError("on_ready boom (real process probe)")
+
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=settings, clock=clock,
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_RunContext(), on_ready=_boom)
+    mission = Mission(prompt="hi", tools=[], output_schema={"type": "object"},
+                      max_turns=1, timeout_sec=20.0)
+    result = runner.run(mission)
+
+    assert result.status == "failed"
+    assert result.reason is not None and "on_ready failed" in result.reason
+    proc = captured["proc"]
+    assert proc.poll() is not None, (
+        "on_ready 失敗後も子プロセスが生きている (kill されていない疑い)")
+
+
 def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
         monkeypatch, tmp_path):
     """(裁定 R1/RB3、§7.1-2 の blocking 受入条件、A-4 検収是正 B2)
@@ -2487,9 +3034,16 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
         def __init__(self):
             self.mission_id = mission_id
             self.staging_dir = staging_dir
-            # source_snapshot_dir は相対パス "." を使う — 子プロセスの cwd=workdir
-            # なので、Path(".") は workdir に resolve される (bootstrap 検証をクリア)
-            self.source_snapshot_dir = "."
+            # 裁定 R-D3: source_snapshot_dir は「出所」として親プロセス
+            # (`WorkerRunner.run()`) 自身が `Path(...).is_dir()` を検査し、
+            # `workdir/source` へ `shutil.copytree` する。旧稿の相対パス
+            # "." は「子プロセスの cwd=workdir で解決される」という R-D3
+            # 以前の前提に依存していたが、R-D3 以降は親プロセスの cwd
+            # (pytest 実行時のリポジトリルート) で解決されてしまい、
+            # リポジトリ全体を誤って copytree する事故になる — 冒頭で
+            # 用意済みの `source_snapshot_dir` (staging_dir 配下の空 dir)
+            # を出所として使う。
+            self.source_snapshot_dir = source_snapshot_dir
 
     real_popen = subprocess.Popen
     spawned: dict = {}

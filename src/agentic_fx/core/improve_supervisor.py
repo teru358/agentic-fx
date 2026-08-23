@@ -134,27 +134,42 @@ class ImproveSupervisor:
             self._active_threads.append(t)
         t.start()
 
+    # precheck 2026-08-22 wave2: T10-B2 R-D1 実装時改訂 — 3相 API
+    # (spawn/send_go/run_to_completion、非実在) を on_ready 方式へ書き換え。
+    # `_handle_pre_ready_failure` (spawn_attempts による retry/failed 分岐、
+    # 9.4 節) の意味論はそのまま維持する — `runner.run()` が **on_ready が
+    # 一度も呼ばれずに** 完走以外の結果を返した場合 (pre-ready 失敗、子の
+    # spawn 自体が失敗) だけ retry 経路へ倒し、on_ready 到達後 (= 'running'
+    # へ遷移済み) の失敗は通常の `ImproveLoop.commit` 終端 (_finalize_failed_
+    # mission、slot を running→failed) へ渡す — 「実行が始まった後の失敗」
+    # を retry してしまうと二重実行になるため区別する。
     def _launch_slot(self, period_key: str, k: int) -> None:
         # mission_id はまだ無い。Tx-0 (missions.start + improve_runs.start +
         # slot claim reserved→claimed) は self._improve_loop.prepare が
         # 一体で行う (統合裁定 R-i2、Task 10 の 10.2 節が正)。
         now = self._clock.now()
+        reached_running = False
+
+        def _on_ready(frame: dict) -> None:
+            nonlocal reached_running
+            conn = self._conn()
+            owns = self._conn_for_test is None
+            try:
+                improve_waves.mark_running(
+                    conn, period_key=period_key, k=k, now=self._clock.now(),
+                    commit=True)
+            finally:
+                if owns:
+                    conn.close()
+            reached_running = True
+
         mission, ctx, runner = self._improve_loop.prepare(
-            slot_key=(period_key, k), now=now)
-        spawn_result = runner.spawn()
-        if spawn_result != "ready":
+            slot_key=(period_key, k), now=now, on_ready=_on_ready)
+        result = runner.run(mission)
+        if not reached_running and result.status != "completed":
+            # pre-ready 失敗 (on_ready 未到達) — Tx-0 で claim 済みの slot を
+            # spawn_attempts に応じて reserved へ戻すか failed にする。
             self._handle_pre_ready_failure(period_key, k)
-            return
-        conn = self._conn()
-        owns = self._conn_for_test is None
-        try:
-            improve_waves.mark_running(
-                conn, period_key=period_key, k=k, now=self._clock.now(), commit=True)
-        finally:
-            if owns:
-                conn.close()
-        runner.send_go()
-        result = runner.run_to_completion()
         self._improve_loop.commit(mission=mission, ctx=ctx, result=result,
                                   now=self._clock.now())
 

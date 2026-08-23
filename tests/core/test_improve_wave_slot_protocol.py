@@ -143,24 +143,53 @@ def test_m_zero_creates_no_wave_row(conn, monkeypatch):
 # Tests for 9.3: 3-way 起動プロトコル
 
 class _RecordingFakeWorkerRunner:
-    """WorkerRunner の代役。呼び出し順序だけを記録する (Task 1/4/5 の
-    実プロトコルはここでは検証しない — 骨格 Interfaces 節の
-    `WorkerRunner(..., worker_profile="improve", run_context=ctx)` の
-    構築タイミングのみを外形的に確認する)。"""
+    """WorkerRunner の代役 (裁定 R-D1)。公開 API は `run(mission)` のみ
+    (`on_ready` は本物と同じ公開属性)。`run()` 内部で「ready 受信 →
+    on_ready 呼び出し → (例外なく戻れば) そのまま mission 実行を継続」
+    という本物 `WorkerRunner.run()` の順序を模す — 新規プロトコルフレーム
+    (`go` 等) は追加しない (プラン 9.3 節「実装時改訂 R-D1」)。本物の
+    ワイヤプロトコル (JSON フレーム・子プロセス) はここでは検証しない —
+    骨格 Interfaces 節の `WorkerRunner(..., worker_profile="improve",
+    run_context=ctx)` の構築タイミングと `on_ready` 完了後に実行が続く
+    順序だけを外形的に確認する (実プロセスでの実測は
+    `tests/runners/test_worker_runner.py` の R-D1 統合テストが担う)。"""
 
-    def __init__(self, events: list):
+    def __init__(self, events: list, *, on_ready=None, ready_ok: bool = True):
         self._events = events
+        self.on_ready = on_ready
+        self._ready_ok = ready_ok
 
-    def spawn(self):
-        self._events.append("spawn")
-        return "ready"  # spawn 直後に ready を返す fake
-
-    def send_go(self):
-        self._events.append("go")
-
-    def run_to_completion(self):
+    def run(self, mission):
+        ready_frame = {"type": "ready", "ok": self._ready_ok}
+        if self.on_ready is not None:
+            try:
+                self.on_ready(ready_frame)
+            except Exception as e:  # noqa: BLE001 — 本物の WorkerRunner.run()
+                # と同じ規律: on_ready の例外は failed に正規化する
+                # (呼び出し元へ伝播させない)。
+                return _FakeMissionResult(
+                    "failed", None, reason=f"on_ready failed: {e}")
+        if not self._ready_ok:
+            return _FakeMissionResult("failed", None)
+        self._after_on_ready()
         self._events.append("run")
-        return {"status": "completed", "output": {}}
+        return _FakeMissionResult("completed", {})
+
+    def _after_on_ready(self) -> None:
+        """on_ready が例外なく戻った後、mission 実行を継続する直前のフック
+        — サブクラスがここをオーバーライドして、この時点での状態 (DB 等)
+        を検査できるようにする (本物の `WorkerRunner.run()` が on_ready
+        完了後にそのまま実行を継続するタイミングと対応。新規フレームは
+        無いため、送出ではなく「継続する直前」を切り出す)。"""
+
+
+class _FakeMissionResult:
+    """`runners.base.MissionResult` の代役 (属性アクセスのみ使う最小形)。"""
+
+    def __init__(self, status, output, *, reason=None):
+        self.status = status
+        self.output = output
+        self.reason = reason
 
 
 class _FakeImproveLoop:
@@ -176,7 +205,7 @@ class _FakeImproveLoop:
         self._mission_id = mission_id
         self.committed: list[tuple] = []
 
-    def prepare(self, *, slot_key, now):
+    def prepare(self, *, slot_key, now, on_ready=None):
         period_key, k = slot_key
         claimed = improve_waves.claim_slot(
             self._conn, period_key=period_key, k=k, mission_id=self._mission_id,
@@ -185,6 +214,11 @@ class _FakeImproveLoop:
             raise RuntimeError(
                 f"slot claim failed for {slot_key!r} — "
                 "already claimed by a concurrent process")
+        # R-D1: 本物の ImproveLoop.prepare() は on_ready を WorkerRunner の
+        # 構築に渡す (Task 10 の責務) — fake でも同じ契約を模し、
+        # _launch_slot が渡した on_ready を fake runner へ配線する。
+        if on_ready is not None:
+            self._worker_runner.on_ready = on_ready
         return f"mission-{self._mission_id}", f"ctx-{self._mission_id}", \
             self._worker_runner
 
@@ -192,10 +226,12 @@ class _FakeImproveLoop:
         self.committed.append((mission, ctx, result))
 
 
-def test_three_way_launch_order_prepare_then_spawn_then_ready_then_running_commit_then_go(
+def test_three_way_launch_order_prepare_then_ready_then_running_commit_then_run(
         conn, monkeypatch):
-    """prepare(Tx-0, claim含む) → spawn → ready 受信 → running commit
-    (この時点でまだ go を送らない) → go → run → commit()、の順序を固定する。"""
+    """prepare (Tx-0, claim 含む) → runner.run() 内部で ready 受信 →
+    on_ready (= running commit) → run → commit()、の順序を固定する
+    (裁定 R-D1: spawn/send_go/run_to_completion の 3 相 API は撤去。新規
+    プロトコルフレームは追加しない)。"""
     events: list[str] = []
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
@@ -215,26 +251,28 @@ def test_three_way_launch_order_prepare_then_spawn_then_ready_then_running_commi
         "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
     assert row["status"] == "running"
     assert row["mission_id"] == 999
-    assert events == ["spawn", "go", "run"]
+    assert events == ["run"]
     assert len(fake_loop.committed) == 1
 
 
-def test_go_is_not_sent_before_running_commit(conn):
-    """running への commit が完了する前に go を送らないことを、send_go の
-    内部で slot 状態を読み返して確認する fake WorkerRunner 経由で確認する。
-    commit 前に go 呼び出しが記録されたら fail。"""
+def test_mission_body_not_continued_before_running_commit(conn):
+    """running への commit が完了する前に mission 本体の実行を継続しない
+    ことを、`_after_on_ready` の内部で slot 状態を読み返して確認する
+    fake WorkerRunner 経由で確認する。commit 前に継続が記録されたら
+    fail (裁定 R-D1: 新規フレームは無いので、継続そのものが同期点)。"""
     events: list[str] = []
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
 
     class _OrderCheckingRunner(_RecordingFakeWorkerRunner):
-        def send_go(self):
+        def _after_on_ready(self):
             row = conn.execute(
                 "SELECT status FROM improve_wave_slots "
                 "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
             assert row["status"] == "running", (
-                "go was sent before the running-commit was visible")
-            super().send_go()
+                "mission body continued before the running-commit was "
+                "visible")
+            super()._after_on_ready()
 
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
@@ -243,6 +281,50 @@ def test_go_is_not_sent_before_running_commit(conn):
     sup._conn_for_test = conn
     sup._improve_loop = _FakeImproveLoop(conn, _OrderCheckingRunner(events))
     sup._launch_slot("2026-W34", 0)
+
+
+def test_on_ready_exception_reverts_to_reserved_then_failed(conn, monkeypatch):
+    """on_ready (= `_launch_slot` が組む mark_running クロージャ) が例外を
+    投げたら、pre-ready 失敗と同じ経路 (spawn_attempts に応じて
+    reserved→failed) を辿る。run は一度も記録されない (fake
+    `WorkerRunner.run()` は本物と同じく on_ready の例外を実行継続の
+    **前**で捕捉し failed に正規化する)。"""
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W34", now=now, expected=1, commit=True)
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+
+    def _boom(*a, **k):
+        raise RuntimeError("mark_running boom")
+    monkeypatch.setattr(improve_waves, "mark_running", _boom)
+
+    events: list[str] = []
+    sup._improve_loop = _FakeImproveLoop(
+        conn, _RecordingFakeWorkerRunner(events), mission_id=111)
+    sup._launch_slot("2026-W34", 0)  # 1 回目 → reserved
+
+    row = conn.execute(
+        "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "reserved"
+    assert row["mission_id"] is None
+    assert row["spawn_attempts"] == 1
+    assert events == []
+
+    sup._improve_loop = _FakeImproveLoop(
+        conn, _RecordingFakeWorkerRunner(events), mission_id=222)
+    sup._launch_slot("2026-W34", 0)  # 2 回目 → failed
+
+    row = conn.execute(
+        "SELECT status, spawn_attempts FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "failed"
+    assert row["spawn_attempts"] == 2
+    assert events == []
 
 
 # Tests for 9.4: pre-ready 失敗
@@ -256,12 +338,19 @@ def test_pre_ready_failure_reverts_to_reserved_with_mission_id_null(conn):
                              stop_event=threading.Event())
     sup._conn_for_test = conn
 
-    class _SpawnFailsRunner:
-        def spawn(self):
-            return "spawn_failed"
+    class _PreReadyFailsRunner:
+        """裁定 R-D1: ready に一度も到達しない (credentials copy 失敗 /
+        `queue.Empty` timeout 相当) を模す。`on_ready` を一度も呼ばずに
+        failed を返す — 本物の `WorkerRunner.run()` がこれらの経路で
+        `on_ready` を呼ばずに `MissionResult('failed', ...)` を返すのと
+        同じ外形。"""
+        on_ready = None
 
-    sup._improve_loop = _FakeImproveLoop(conn, _SpawnFailsRunner(),
-                                         mission_id=111)
+        def run(self, mission):
+            return _FakeMissionResult("failed", None, reason="pre-ready failure")
+
+    fake_loop = _FakeImproveLoop(conn, _PreReadyFailsRunner(), mission_id=111)
+    sup._improve_loop = fake_loop
     sup._launch_slot("2026-W34", 0)
 
     row = conn.execute(
@@ -270,6 +359,11 @@ def test_pre_ready_failure_reverts_to_reserved_with_mission_id_null(conn):
     assert row["status"] == "reserved"
     assert row["mission_id"] is None
     assert row["spawn_attempts"] == 1
+    # プラン 9.3/9.5 節「最終形」の pin: pre-ready 失敗でも
+    # `_handle_pre_ready_failure` の後、必ず `self._improve_loop.commit(...)`
+    # を呼ぶ (早期 return しない) — commit しないと Tx-0 で作った mission/
+    # improve_runs 行が終端しないまま残る。
+    assert len(fake_loop.committed) == 1
 
 
 def test_pre_ready_failure_second_attempt_goes_to_failed(conn):
@@ -282,15 +376,17 @@ def test_pre_ready_failure_second_attempt_goes_to_failed(conn):
                              stop_event=threading.Event())
     sup._conn_for_test = conn
 
-    class _SpawnFailsRunner:
-        def spawn(self):
-            return "spawn_failed"
+    class _PreReadyFailsRunner:
+        on_ready = None
 
-    sup._improve_loop = _FakeImproveLoop(conn, _SpawnFailsRunner(),
+        def run(self, mission):
+            return _FakeMissionResult("failed", None, reason="pre-ready failure")
+
+    sup._improve_loop = _FakeImproveLoop(conn, _PreReadyFailsRunner(),
                                          mission_id=111)
     sup._launch_slot("2026-W34", 0)  # 1 回目 → reserved
 
-    sup._improve_loop = _FakeImproveLoop(conn, _SpawnFailsRunner(),
+    sup._improve_loop = _FakeImproveLoop(conn, _PreReadyFailsRunner(),
                                          mission_id=222)
     sup._launch_slot("2026-W34", 0)  # 2 回目 → failed
 
@@ -303,7 +399,8 @@ def test_pre_ready_failure_second_attempt_goes_to_failed(conn):
 
 def test_pre_ready_failure_also_covers_ready_timeout_before_running_commit(conn):
     """`ready` 受信前の timeout も pre-ready 失敗と同じ経路 (spawn 成功後、
-    ready が来ない/timeout するケース)。"""
+    ready が来ない/timeout するケース) — `on_ready` を一度も呼ばずに
+    failed を返す fake で模す。"""
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
@@ -313,8 +410,10 @@ def test_pre_ready_failure_also_covers_ready_timeout_before_running_commit(conn)
     sup._conn_for_test = conn
 
     class _ReadyTimeoutRunner:
-        def spawn(self):
-            return "timeout"  # ready を待てなかった
+        on_ready = None
+
+        def run(self, mission):
+            return _FakeMissionResult("failed", None, reason="ready timeout")
 
     sup._improve_loop = _FakeImproveLoop(conn, _ReadyTimeoutRunner(),
                                          mission_id=111)
@@ -349,20 +448,20 @@ def test_n4_concurrent_slots_no_connection_sharing_no_mixup(tmp_path):
                              stop_event=threading.Event())
 
     class _SlowRunner:
-        def spawn(self):
+        on_ready = None
+
+        def run(self, mission):
             time.sleep(0.05)
-            return "ready"
-        def send_go(self):
-            pass
-        def run_to_completion(self):
+            if self.on_ready is not None:
+                self.on_ready({"type": "ready", "ok": True})
             time.sleep(0.05)
-            return {"status": "completed", "output": {}}
+            return _FakeMissionResult("completed", {})
 
     class _PerThreadFakeImproveLoop:
         """各スレッドが自分専用の write 接続で `claim_slot`/`commit` を
         行う fake (本番の `ImproveLoop` の接続所有パターンを模す)。"""
 
-        def prepare(self, *, slot_key, now):
+        def prepare(self, *, slot_key, now, on_ready=None):
             period_key, k = slot_key
             conn = db_mod.connect(db_path)
             try:
@@ -373,7 +472,9 @@ def test_n4_concurrent_slots_no_connection_sharing_no_mixup(tmp_path):
                 assert claimed, f"slot {slot_key!r} already claimed"
             finally:
                 conn.close()
-            return mission_id, f"ctx-{mission_id}", _SlowRunner()
+            runner = _SlowRunner()
+            runner.on_ready = on_ready
+            return mission_id, f"ctx-{mission_id}", runner
 
         def commit(self, *, mission, ctx, result, now):
             conn = db_mod.connect(db_path)
