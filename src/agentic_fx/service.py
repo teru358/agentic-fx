@@ -326,7 +326,7 @@ def _check_codex_subscription_expiry(auth_file: str, *, clock=None) -> None:
             "codex chatgpt subscription expires soon: %s", active_until.isoformat())
 
 
-def _check_cli_backend(settings, *, which: str) -> None:
+def _check_cli_backend(settings, *, which: str):
     """<!-- precheck 2026-08-22: T1-M14 --> CLI backend 起動時検査 ①②③⑤
     (設計書 §1.4)。`which` は `"trade"` か `"improve"` — `getattr(settings.runner,
     which)` で対象の `RunnerChoice` を選ぶ。backend=local の環境では一切
@@ -338,17 +338,37 @@ def _check_cli_backend(settings, *, which: str) -> None:
     `settings.runner.improve` しか見なかったため、`runner.trade.backend=claude`
     構成では bin 解決も `--version` も認証ファイルもどれも未検査のまま
     Mission 実行時に初めて失敗していた (config は `trade.backend: claude`
-    を許容する — trade+codex のみ拒否)。"""
+    を許容する — trade+codex のみ拒否)。
+
+    **段 0 F1 是正**: `_resolve_cli_bin` が解決した絶対パスを、検証済みの
+    `settings` (`model_copy` で差し替えた新インスタンス) として呼び出し元へ
+    返す — 呼び出し元 (`build_app`) はこの戻り値で自身の `settings` を
+    差し替えること。旧実装は解決結果を捨てて `None` を返していたため、
+    `factory.build_runner`/`mission_worker._exec_closure_for` は生の
+    (相対のことがある) 設定値をそのまま使い続けていた。既定 config
+    (`runner.claude.bin: "claude"`、相対) では `launcher.build_launcher_argv`
+    が `ValueError` で拒否するのが Mission 実行時になって初めて判明する
+    (起動時検査①②③⑤は `shutil.which` 解決後の絶対パスで通ってしまうため
+    検出できない)。
+
+    検査⑤ (`_check_service_initial_env_has_no_secrets`) は claude/codex
+    共通 (backend=local を除く全 CLI backend) で 1 回だけ呼ぶ — 段 0 申し送り
+    1: 旧実装は claude 分岐でしか呼んでいなかったが、improve worker は
+    codex 分岐 (chatgpt/llama_swap とも) でも同 UID で `/proc/<pid>/environ`
+    を読めるため脅威モデルは同一。"""
     choice = getattr(settings.runner, which)
     backend = choice.backend
     if backend == "local":
-        return
+        return settings
     if backend == "claude":
         bin_path = _resolve_cli_bin(settings.runner.claude.bin, require_elf=False)
         _check_cli_version(bin_path)
         _check_credentials_file(settings.runner.claude.credentials_file,
                                 label="claude")
-        _check_service_initial_env_has_no_secrets(settings)
+        settings = settings.model_copy(update={
+            "runner": settings.runner.model_copy(update={
+                "claude": settings.runner.claude.model_copy(
+                    update={"bin": str(bin_path)})})})
     elif backend == "codex":
         bin_path = _resolve_cli_bin(settings.runner.codex.bin, require_elf=True)
         _check_cli_version(bin_path)
@@ -362,6 +382,12 @@ def _check_cli_backend(settings, *, which: str) -> None:
                     "runner.codex.provider='llama_swap' requires "
                     "improve.llama_swap_verified=true (set only after "
                     "`afx improve verify-backend` passes — Task 13)")
+        settings = settings.model_copy(update={
+            "runner": settings.runner.model_copy(update={
+                "codex": settings.runner.codex.model_copy(
+                    update={"bin": str(bin_path)})})})
+    _check_service_initial_env_has_no_secrets(settings)
+    return settings
 
 
 def run_init(root: Path) -> int:
@@ -781,8 +807,11 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             indicator_plugins=approved, provider=provider)
         # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
         _validate_startup(settings)
-        _check_cli_backend(settings, which="trade")
-        _check_cli_backend(settings, which="improve")
+        # 段 0 F1 是正: 戻り値 (bin を解決済み絶対パスへ書き戻した settings)
+        # で差し替える。この後に構築する WorkerRunner/registry が絶対パスの
+        # settings を受け取るようにするため、必ず WorkerRunner 構築より前に置く。
+        settings = _check_cli_backend(settings, which="trade")
+        settings = _check_cli_backend(settings, which="improve")
         _assert_tools_registered(registry, _TRADE_TOOLS)
 
         owns_runner = runner is None

@@ -466,14 +466,24 @@ def _run_improve_mission(
     monkeypatch で factory.build_runner (と必要なら `_build_improve_registry`)
     を spy/差し替えする。main() は実際の値を渡し、返された runner を run する。
 
+    段 0 申し送り 2: `_start_mcp_dispatcher` の戻り値 (dispatcher) を
+    `runner` に紐づけて呼び出し元へ返す — `_run_improve_mission` 自身は
+    Mission を実行しない (呼び出し元の `main()` が `runner.run(mission)`
+    する) ため、dispatcher の close は呼び出し元の責務。旧実装は戻り値を
+    破棄しており、参照が `serve_forever` の daemon thread (bound method)
+    だけになるため、GC のタイミングに socket の生死が暗黙に依存していた。
+    `runner._afx_mcp_dispatcher` に保持することで、既存の `runner = ...`
+    呼び出し側 (テスト含む) の呼び出し形は変えずに済む。
+
     :param settings: Settings インスタンス
     :param workdir: Mission 実行用 workdir (Landlock rw 許可範囲)
     :param protocol_out: stdout プロトコル出力 (main で生成、フレーム送信用)
     :param out_seq: SeqTracker インスタンス (protocol_out 送信時に採番用)
-    :return: AgentRunner インスタンス
+    :return: AgentRunner インスタンス (`_afx_mcp_dispatcher` 属性に
+        `McpShimDispatcher` を保持する)
     """
     registry = _build_improve_registry(settings=settings, workdir=workdir)
-    _start_mcp_dispatcher(workdir=workdir, registry=registry)
+    dispatcher = _start_mcp_dispatcher(workdir=workdir, registry=registry)
     on_message = _make_on_message(protocol_out, out_seq)
     runner = runner_factory.build_runner(
         "improve", settings, registry, workdir=workdir,
@@ -484,6 +494,7 @@ def _run_improve_mission(
         # local backend では build_runner がこの引数を無視するため無害。
         cli_started_sink=lambda pgid: _send_frame(
             protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}))
+    runner._afx_mcp_dispatcher = dispatcher
     return runner
 
 
@@ -565,15 +576,26 @@ def main() -> None:
             })
             ready_sent = True
             try:
-                result = runner.run(mission)
-                _send_frame(protocol_out, out_seq, {
-                    "type": "result",
-                    "status": result.status, "output": result.output,
-                    "reason": result.reason})
-            except Exception as exc:  # noqa: BLE001
-                _send_frame(protocol_out, out_seq, {
-                    "type": "result", "status": "failed", "output": None,
-                    "error": f"{type(exc).__name__}: {exc}"})
+                try:
+                    result = runner.run(mission)
+                    _send_frame(protocol_out, out_seq, {
+                        "type": "result",
+                        "status": result.status, "output": result.output,
+                        "reason": result.reason})
+                except Exception as exc:  # noqa: BLE001
+                    _send_frame(protocol_out, out_seq, {
+                        "type": "result", "status": "failed", "output": None,
+                        "error": f"{type(exc).__name__}: {exc}"})
+            finally:
+                # 段 0 申し送り 2: `_run_improve_mission` が保持した
+                # dispatcher を Mission 終了時 (成功/失敗いずれの経路でも)
+                # に close する。`ready` 前後の送出順序はここでは一切
+                # 触れない — bind→ready→go の順序 (RW6) は
+                # `_start_mcp_dispatcher`/上の `_send_frame` 呼び出し順の
+                # ままで、close は `runner.run()` 完了後の後始末のみ。
+                dispatcher = getattr(runner, "_afx_mcp_dispatcher", None)
+                if dispatcher is not None:
+                    dispatcher.close()
             return
         if worker_profile != "trade":
             raise RuntimeError(
