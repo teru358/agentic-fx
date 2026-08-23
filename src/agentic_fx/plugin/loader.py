@@ -100,13 +100,11 @@ _SYMLINK_TARGET_RE_TMPL = r"^\.versions/{name}/[0-9a-f]{{64}}$"
 
 def artifact_hash_bytes(plugin_py: bytes, config_yaml: bytes,
                         test_plugin: bytes) -> str:
-    """`plugin.py`+`config.yaml`+`test_plugin.py` の 3 本マニフェストから
-    sha256 を算出する (プラン10 Task 5 5-F、設計書 §2.3)。既存
-    `content_hash` (plugin.py+config.yaml の 2 本) とは別物 — 承認版の
-    実体固定に使う。"""
-    return hashlib.sha256(
-        b"plugin.py\0" + plugin_py + b"\0config.yaml\0" + config_yaml +
-        b"\0test_plugin.py\0" + test_plugin).hexdigest()
+    """3 本全体の sha256 (版ストアのキー)。`version_store.artifact_hash_bytes`
+    の薄いラッパ (B-5 是正、設計書 §5.2) — 式の実体は version_store 側の
+    1 箇所にのみ存在する。"""
+    from agentic_fx.plugin import version_store
+    return version_store.artifact_hash_bytes(plugin_py, config_yaml, test_plugin)
 
 
 def content_hash(plugin_dir: Path) -> str:
@@ -114,12 +112,13 @@ def content_hash(plugin_dir: Path) -> str:
 
     署名対象は plugin.py と config.yaml のみ — test_plugin.py は含まない。
     承認 (Task 6) と signals 書き込み (Task 7/8) はこの関数だけを呼ぶ。
+    `version_store.content_hash_bytes` の薄いラッパ (レビュー1周目 M2、設計書 §5.2) —
+    式の実体は `version_store` 側の 1 箇所にのみ存在する。
     """
+    from agentic_fx.plugin import version_store
     plugin_bytes = (plugin_dir / "plugin.py").read_bytes()
     config_bytes = (plugin_dir / "config.yaml").read_bytes()
-    return hashlib.sha256(
-        b"plugin.py\0" + plugin_bytes + b"\0config.yaml\0" + config_bytes
-    ).hexdigest()
+    return version_store.content_hash_bytes(plugin_bytes, config_bytes)
 
 
 def _reject(name: str, reason: str) -> None:

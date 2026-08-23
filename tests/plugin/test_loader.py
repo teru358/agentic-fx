@@ -693,3 +693,54 @@ def test_discover_sample_plugins_directory_not_rejected():
     metas = discover(samples_dir)
     names = {m.name for m in metas}
     assert {"rsi_indicator", "sma_cross"} <= names
+
+
+def test_discover_rejects_version_dir_with_mismatched_artifact_hash(tmp_path):
+    """§2.3: discover は版ディレクトリ名 (= artifact_hash) と実計算の
+    artifact_hash を照合し、不一致なら在版を拒否する (in-place 編集の検出)。
+    """
+    from agentic_fx.plugin import version_store
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    real_hash = version_store.artifact_hash_bytes(
+        b"def compute(df, params):\n    return {}\n", b"kind: indicator\n",
+        b"def test_x():\n    pass\n")
+    version_dir = version_store.create_version_dir(
+        plugins_dir, "sma", real_hash,
+        plugin_py=b"def compute(df, params):\n    return {}\n",
+        config_yaml=b"kind: indicator\n",
+        test_plugin=b"def test_x():\n    pass\n", op_identity="1")
+    # ディレクトリを不一致な hash 名へ rename (in-place 編集を模す)
+    wrong_dir = version_dir.parent / ("f" * 64)
+    version_dir.rename(wrong_dir)
+    (plugins_dir / "sma").symlink_to(f".versions/sma/{'f' * 64}")
+
+    metas = discover(plugins_dir)
+    assert not any(m.name == "sma" for m in metas)
+
+
+def test_content_hash_delegates_to_version_store_content_hash_bytes(tmp_path):
+    """`loader.content_hash(plugin_dir)` は `version_store.content_hash_bytes`
+    の薄いラッパであり、同一 bytes に対して両 API が完全一致することを
+    pin する (レビュー1周目 M2、設計書 §5.2)。"""
+    from agentic_fx.plugin import loader, version_store
+
+    plugin_dir = tmp_path / "myind"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.py").write_bytes(b"# plugin body\n")
+    (plugin_dir / "config.yaml").write_bytes(b"kind: indicator\n")
+
+    via_loader = loader.content_hash(plugin_dir)
+    via_version_store = version_store.content_hash_bytes(
+        (plugin_dir / "plugin.py").read_bytes(),
+        (plugin_dir / "config.yaml").read_bytes())
+    assert via_loader == via_version_store
+
+
+def test_artifact_hash_bytes_delegates_to_version_store(tmp_path):
+    """B-5 是正: loader.artifact_hash_bytes は version_store.artifact_hash_bytes
+    の薄いラッパ (同一 bytes に対する両 API 一致 pin)。"""
+    from agentic_fx.plugin import loader, version_store
+    p, c, t = b"plugin body", b"kind: indicator\n", b"def test_x():\n    pass\n"
+    assert loader.artifact_hash_bytes(p, c, t) == version_store.artifact_hash_bytes(p, c, t)
