@@ -639,7 +639,7 @@ def finish_improve_mission(
     report_state: str = "none",
     output: dict | None = None,
     transcript: list | None = None,
-    commit: bool = False,
+    commit: bool = True,  # wave2-recheck: 現物の既定は commit=True
 ) -> None:
     """slot(あれば) + mission + run + backlog を単一 tx で終端する唯一のヘルパ。
     Tx-2 の末尾、または補償 tx から呼ばれる。missions.finish の CAS
@@ -675,7 +675,7 @@ def finish_improve_mission(
 def apply_decision(
     conn: sqlite3.Connection, approval_id: int, status: str, *,
     decided_by: str, now: datetime, reason: str | None = None,
-    commit: bool = False,
+    commit: bool = True,  # wave2-recheck: 現物の既定は commit=True
 ) -> None:
     """approval 行の CAS (WHERE id=? AND status='pending' AND (expires_at IS NULL
     OR expires_at > ?)、既存 `decide` の `expires_at` 述語を維持 — 裁定 R9、
@@ -687,7 +687,7 @@ def apply_decision(
 
 def apply_approval_outcome(                       # 新規命名
     conn: sqlite3.Connection, *, backlog_id: int, outcome: str,
-    reason: str | None, now: datetime, commit: bool = False,
+    reason: str | None, now: datetime, commit: bool = True,  # wave2-recheck: 現物の既定は commit=True
 ) -> None:
     """§4.3 の状態機械表に従って backlog.status + last_result を更新する。"""
     ...
@@ -879,7 +879,8 @@ def content_hash_bytes(plugin_py: bytes, config_yaml: bytes) -> str: ...   # 既
 def artifact_hash_bytes(plugin_py: bytes, config_yaml: bytes, test_plugin: bytes) -> str: ...  # 新設
 
 def create_version_dir(root: Path, name: str, artifact_hash: str, *,
-                        plugin_py: bytes, config_yaml: bytes, test_plugin: bytes) -> Path:
+                        plugin_py: bytes, config_yaml: bytes, test_plugin: bytes,
+                        op_identity: str) -> Path:   # wave2-recheck: 11a と同形
     """`plugins/.versions/<name>/<artifact_hash>.tmp-<op_identity>/` へ書き fsync し、
     0400/0500 に落として rename。冪等 (既に同 artifact_hash の版があれば作らない)。"""
     ...
@@ -10284,7 +10285,7 @@ def finish_improve_mission(
     report_state: str = "none",
     output: dict | None = None,
     transcript: list | None = None,
-    commit: bool = False,
+    commit: bool = True,  # wave2-recheck: 現物の既定は commit=True
 ) -> None:
     """slot(あれば) + mission + run + backlog を単一 tx で終端する唯一のヘルパ。
     Tx-2 の末尾、または補償 tx から呼ばれる。missions.finish の CAS
@@ -13547,7 +13548,9 @@ def start(conn, loop, runner, model, *, now, commit=False) -> int: ...
 def finish_improve_mission(conn, *, mission_id, run_id, slot_key, mission_status,
                             run_result, backlog_transition, now,
                             approval_id=None, report_path=None,
-                            report_state="none", commit=False) -> None: ...
+                            report_state="none", commit=True) -> None: ...
+#   ^ wave2-recheck: 現物 store/missions.py:60 の既定は commit=True。Tx-2 の
+#     呼び出しは全て commit=False を明示している (10.10/10.11 節)
 
 # src/agentic_fx/store/improve_runs.py (Task 8 produces)
 def start(conn, backlog_id, *, mission_id, now, commit=False) -> int: ...
@@ -15342,8 +15345,10 @@ class ImproveRpcLedger:
 def finish_improve_mission(conn, *, mission_id, run_id, slot_key, mission_status,
                             run_result, backlog_transition, now,
                             approval_id=None, report_path=None,
-                            report_state="none", commit=False) -> None: ...
-def apply_approval_outcome(conn, *, backlog_id, outcome, reason, now, commit=False) -> None: ...
+                            report_state="none", commit=True) -> None: ...
+#   ^ wave2-recheck: 現物 store/missions.py:60 の既定は commit=True。Tx-2 の
+#     呼び出しは全て commit=False を明示している (10.10/10.11 節)
+def apply_approval_outcome(conn, *, backlog_id, outcome, reason, now, commit=True) -> None: ...  # wave2-recheck: 現物の既定は commit=True
 # commit=False 変種一覧 (骨格 §Task8):
 #   missions.start / missions.finish / save_harness_run / approvals.create /
 #   approvals.apply_decision / approvals.expire_due / improve_runs.start /
@@ -19688,7 +19693,9 @@ EOF
 **背景**: 第2波裁定「Task 12 の依存」により、`backtest_runs.mission_id` /
 `analysis_runs.mission_id` 列は Task 10 が追加する (Task 12 の SQL が
 これに依存する)。現物 `src/agentic_fx/store/db.py:283-289` の
-`TABLE_NAMES` (17 項目、上記逐語) は新テーブルを追加しないため不変 —
+`TABLE_NAMES` (現物 20 項目 — Task 8 が improve_waves/improve_wave_slots/
+plugin_switch_journal を追加済み。`db.py:283-289` 逐語) は新テーブルを
+追加しないため不変 —
 既存テーブルへの列追加のみ (`_ensure_column`、`db.py:343-351` 現物)。
 
 - [ ] **Step 1: 失敗するテストを書く**
@@ -19720,7 +19727,7 @@ def test_ensure_column_migration_is_idempotent_for_mission_id(tmp_path):
 
 def test_table_names_unchanged_after_mission_id_columns_added():
     """T10-13 は既存テーブルへの列追加のみであり、新テーブルは追加しない
-    — TABLE_NAMES (17 項目) が不変であることの pin。"""
+    — TABLE_NAMES (現物 20 項目) が不変であることの pin。"""
     from agentic_fx.store.db import TABLE_NAMES
 
     assert TABLE_NAMES == frozenset({
@@ -19945,7 +19952,10 @@ def advance_switch_journal(                         # 新規命名
 ) -> None: ...
 
 def reconcile_switch_journals(conn: sqlite3.Connection, *,
-                               plugins_root: Path, now: datetime) -> None:
+                               plugins_root: Path, now: datetime,
+                               settings: "Settings",
+                               force_revert_op_id: int | None = None) -> None:
+    # wave2-recheck: T11-B1 追随 (骨格 Interfaces と同形)
     """起動時 reconcile。§5.1-1 の収束規則 (再開 / 巻き戻し) を非終端行に適用する。
     起動時 reconcile の他の掃除 (孤児 staging / tmp 版 / GC_ROOTS 外の版 / temp link /
     未完ジャーナル / dangling symlink) より前に呼ぶこと (journal-first・sweep-last)。"""
@@ -19963,8 +19973,8 @@ def submit_candidate(                               # 新規命名 = P1
 
 def approve_candidate(                               # 新規命名 = P2
     conn: sqlite3.Connection, approval_id: int, *,
-    decided_by: str, now: datetime,
-) -> None:
+    decided_by: str, now: datetime, plugins_root: Path, settings: "Settings",
+) -> None:                                           # wave2-recheck: T11-B1 追随
     """flock 下で preparing ジャーナル → 版 → git → 切替 → apply_decision(approved)。
     live がプレーン dir なら legacy_plain_present pending に留めて return。"""
     ...
@@ -23528,9 +23538,12 @@ class ImproveLoop:
     def __init__(self, *, root: Path, settings: "Settings", clock: "Clock",
                  db_write_conn_factory: Callable[[], sqlite3.Connection],
                  db_readonly_conn_factory: Callable[[], sqlite3.Connection],
-                 activity: "ActivityLog") -> None: ...
-    def prepare(self, *, slot_key: tuple[str, int] | None,
-                now: datetime) -> tuple["Mission", ImproveRunContext, "WorkerRunner"]: ...
+                 activity: "ActivityLog", rag: "Rag") -> None: ...
+                 # wave2-recheck: T10-B10 追随 (rag は必須 kw)
+    def prepare(self, *, slot_key: tuple[str, int] | None, now: datetime,
+                on_ready: Callable[[dict], None] | None = None,
+                ) -> tuple["Mission", ImproveRunContext, "WorkerRunner"]: ...
+                # wave2-recheck: T10-B2/R-D1 追随
     def commit(self, *, mission: "Mission", ctx: ImproveRunContext,
                result: "MissionResult", now: datetime) -> None: ...
 
@@ -23541,16 +23554,19 @@ IMPROVE_OUTPUT_SCHEMA: dict[str, Any]
 def finish_improve_mission(conn, *, mission_id, run_id, slot_key, mission_status,
                             run_result, backlog_transition, now,
                             approval_id=None, report_path=None,
-                            report_state="none", commit=False) -> None: ...
+                            report_state="none", commit=True) -> None: ...
+#   ^ wave2-recheck: 現物 store/missions.py:60 の既定は commit=True。Tx-2 の
+#     呼び出しは全て commit=False を明示している (10.10/10.11 節)
 def apply_decision(conn, approval_id, status, *, decided_by, now, reason=None,
-                    commit=False) -> None: ...
+                    commit=True) -> None: ...  # wave2-recheck: 現物の既定は commit=True
 def apply_approval_outcome(conn, *, backlog_id, outcome, reason, now,
-                            commit=False) -> None: ...
+                            commit=True) -> None: ...  # wave2-recheck: 現物の既定は commit=True
 
 # Task 11 (plugin/switch.py, plugin/version_store.py)
 def submit_candidate(conn, *, name, staging_dir, candidate_origin, mission_id,
                       backlog_id, settings, now) -> int: ...
-def approve_candidate(conn, approval_id, *, decided_by, now) -> None: ...
+def approve_candidate(conn, approval_id, *, decided_by, now, plugins_root,
+                       settings) -> None: ...  # wave2-recheck: T11-B1 追随
 def bless_candidate(conn, *, name, human_dir, settings, now, decided_by) -> int: ...
 def gc_roots(conn, *, plugins_root) -> frozenset[Path]: ...
 
@@ -23788,7 +23804,7 @@ def test_full_cycle_discovery_to_backlog_transition(improve_env):
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
 
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
@@ -23803,7 +23819,7 @@ def test_full_cycle_discovery_to_backlog_transition(improve_env):
 
     # 承認申請 (pending) が 1 件、payload に candidate_origin/candidate_path
     row = conn.execute(
-        "SELECT id, status, payload FROM approvals WHERE kind='plugin'"
+        "SELECT id, status, payload_json FROM approval_requests WHERE kind='plugin'"
     ).fetchone()
     assert row is not None
     approval_id, status, payload_json = row
@@ -23820,10 +23836,11 @@ def test_full_cycle_discovery_to_backlog_transition(improve_env):
 
     # 人間が approve する (P2 経路)
     plugin_switch.approve_candidate(conn, approval_id, decided_by="shell",
-                                    now=NOW)
+                                    now=NOW, plugins_root=root / "plugins",
+                                    settings=app.settings)  # wave2-recheck: T11-B1
 
     approved_row = conn.execute(
-        "SELECT status FROM approvals WHERE id=?", (approval_id,)).fetchone()
+        "SELECT status FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
     assert approved_row[0] == "approved"
 
     live = root / "plugins" / "rsi_gate_e2e"
@@ -23855,7 +23872,7 @@ def test_gate_failure_stops_at_report_no_approval_request(improve_env):
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
@@ -23868,7 +23885,7 @@ def test_gate_failure_stops_at_report_no_approval_request(improve_env):
         loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
 
     approval_count = conn.execute(
-        "SELECT COUNT(*) FROM approvals WHERE kind='plugin'").fetchone()[0]
+        "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'").fetchone()[0]
     assert approval_count == 0
 
     backlog_row = conn.execute(
@@ -23918,7 +23935,7 @@ def test_concurrent_duplicate_selection_loser_becomes_observation(improve_env):
                     root / "data" / "agentic.db"),
                 db_readonly_conn_factory=lambda: connect_readonly(
                     root / "data" / "agentic.db"),
-                activity=app.activity,
+                activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
             )
             result = MissionResult(status="completed",
                                   output=_selected_output(name), transcript=[])
@@ -23951,7 +23968,7 @@ def test_concurrent_duplicate_selection_loser_becomes_observation(improve_env):
         (backlog_id,)).fetchone()
     # 二重の承認申請が無いことが本テストの主 killer。
     approval_count = conn.execute(
-        "SELECT COUNT(*) FROM approvals WHERE kind='plugin'").fetchone()[0]
+        "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'").fetchone()[0]
     assert approval_count <= 1
     # M-2 で未使用のまま残っていた backlog_row を実際に使う: CAS に負けた
     # 側の遷移が必ず記録され「selected」のまま止まらないことを確認する
@@ -24028,7 +24045,7 @@ def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
@@ -24043,7 +24060,7 @@ def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
         loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
 
     payload = conn.execute(
-        "SELECT payload FROM approvals WHERE kind='plugin'").fetchone()[0]
+        "SELECT payload_json FROM approval_requests WHERE kind='plugin'").fetchone()[0]
     assert "9999" not in payload
     assert "100000" not in payload
     assert '"trial_count": 0' in payload or "'trial_count': 0" in payload
@@ -24151,7 +24168,7 @@ def test_strategy_below_evaluable_min_trades_becomes_observation(improve_env):
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
     holdout_calls: list[bool] = []
 
@@ -24176,7 +24193,7 @@ def test_strategy_below_evaluable_min_trades_becomes_observation(improve_env):
 
     assert holdout_calls == []
     approval_count = conn.execute(
-        "SELECT COUNT(*) FROM approvals WHERE kind='plugin'").fetchone()[0]
+        "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'").fetchone()[0]
     assert approval_count == 0
 
     backlog_row = conn.execute(
@@ -24202,7 +24219,7 @@ def test_artifact_name_traversal_fails_mission(improve_env):
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
@@ -24222,7 +24239,7 @@ def test_artifact_name_traversal_fails_mission(improve_env):
     assert backlog_count == 0
 
     approval_count = conn.execute(
-        "SELECT COUNT(*) FROM approvals WHERE kind='plugin'").fetchone()[0]
+        "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'").fetchone()[0]
     assert approval_count == 0
 
     run_row = conn.execute(
@@ -24252,7 +24269,7 @@ def test_report_tmp_symlink_fails_closed(improve_env):
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
@@ -24312,7 +24329,7 @@ def test_timeout_mission_leaves_no_backtest_or_analysis_run_rows(
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
@@ -24372,7 +24389,7 @@ def test_report_creation_failure_leaves_result_null(improve_env):
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
     tmp_dir = root / "reports" / ".tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -24413,7 +24430,7 @@ def test_risk_gate_proposal_becomes_unsupported_observation(improve_env):
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
@@ -24452,7 +24469,7 @@ def test_strategy_baseline_falls_back_to_no_strategy_row(improve_env):
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
     with patch("agentic_fx.loops.improve_loop.WorkerRunner",
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)), \
@@ -24501,7 +24518,7 @@ def test_report_outbox_state_transitions_published_then_rename_failure(
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
 
     # --- 1 本目: 正常系 (ゲート不合格 → レポートのみ経路で published まで) ---
@@ -24578,7 +24595,7 @@ def test_source_snapshot_dir_is_readonly_to_parent_after_prepare(
         db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
         db_readonly_conn_factory=lambda: connect_readonly(
             root / "data" / "agentic.db"),
-        activity=app.activity,
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
     result = MissionResult(status="completed",
                           output=_plugin_artifact("snapshot_ro_e2e"),
