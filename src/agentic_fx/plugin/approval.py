@@ -283,16 +283,12 @@ def bless(conn: sqlite3.Connection, meta: PluginMeta, *, settings: "Settings",
          now: datetime, pytest_runner: PytestRunnerFn | None = None,
          sandbox_run: SandboxRunFn | None = None,
          run_in_sample_fn: RunInSampleFn | None = None) -> int:
-    """`submit_plugin` と同一の検証を実行し、成功したら即座に承認する
-    (D3)。検証失敗時は `submit_plugin` の例外がそのまま伝播し、
-    `approval_requests` 行は作らない (`decide` にも到達しない)。
-
-    CLI (`afx plugin bless`) からのみ呼ぶこと — 改善ループの tool 定義に
-    は絶対に載せない。
-    """
-    approval_id = submit_plugin(
-        conn, meta, settings=settings, now=now, pytest_runner=pytest_runner,
-        sandbox_run=sandbox_run, run_in_sample_fn=run_in_sample_fn)
-    approvals_store.decide(conn, approval_id, status="approved",
-                           decided_by="human_cli", now=now)
-    return approval_id
+    """裁定3 (プラン10 Task11g): live path (`plugins/<name>`) を候補に取る
+    bless は廃止された。live/plain の版ではなく `plugins/_human/<name>` を
+    候補に取る `switch.bless_candidate` (P3、`afx plugin bless --from _human`
+    経由) が唯一の bless 経路 — この旧 API は常に拒否する (materialize +
+    `bless --from _human` を案内するエラー)。"""
+    raise ValueError(
+        "afx plugin bless <name> は廃止されました。"
+        "'afx plugin materialize <name>' で候補を書き出し、編集してから "
+        "'afx plugin bless --from _human <name>' を実行してください。")

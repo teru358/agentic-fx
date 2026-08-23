@@ -75,16 +75,47 @@ class Commands:
                     return "usage: ask <質問>"
                 return self.trade_loop.ask_once(" ".join(args))
             if cmd == "approve" and args:
-                approvals.decide(self.conn, int(args[0]), status="approved",
-                                 decided_by="shell", now=self.clock.now())
+                approval_id = int(args[0])
+                # 裁定1 (11g Step1b): decide() 全廃。kind="plugin" は
+                # plugin flock を経由する switch.approve_candidate を、
+                # それ以外は apply_decision を直接通す (二重経路にしない)。
+                row = self.conn.execute(
+                    "SELECT kind FROM approval_requests WHERE id=?",
+                    (approval_id,)).fetchone()
+                if row is not None and row["kind"] == "plugin":
+                    if self.plugins_root is None or self.settings is None:
+                        return ("plugin approval backend "
+                               "(plugins_root/settings) が未配線です")
+                    from agentic_fx.plugin import switch as plugin_switch
+                    plugin_switch.approve_candidate(
+                        self.conn, approval_id, decided_by="shell",
+                        now=self.clock.now(), plugins_root=self.plugins_root,
+                        settings=self.settings)
+                else:
+                    approvals.apply_decision(
+                        self.conn, approval_id, "approved", decided_by="shell",
+                        now=self.clock.now(), commit=True)
                 self.activity.write(Category.APPROVAL, "approved",
                                     f"#{args[0]} via shell", ref_id=args[0])
                 return f"approval #{args[0]} approved"
             if cmd == "reject" and args:
+                approval_id = int(args[0])
                 reason = " ".join(args[1:]) or None
-                approvals.decide(self.conn, int(args[0]), status="rejected",
-                                 decided_by="shell", now=self.clock.now(),
-                                 reason=reason)
+                row = self.conn.execute(
+                    "SELECT kind FROM approval_requests WHERE id=?",
+                    (approval_id,)).fetchone()
+                if row is not None and row["kind"] == "plugin":
+                    if self.plugins_root is None:
+                        return "plugin approval backend (plugins_root) が未配線です"
+                    from agentic_fx.plugin import switch as plugin_switch
+                    plugin_switch.reject_candidate(
+                        self.conn, approval_id, decided_by="shell",
+                        reason=reason or "", now=self.clock.now(),
+                        plugins_root=self.plugins_root)
+                else:
+                    approvals.apply_decision(
+                        self.conn, approval_id, "rejected", decided_by="shell",
+                        now=self.clock.now(), reason=reason, commit=True)
                 self.activity.write(Category.APPROVAL, "rejected",
                                     f"#{args[0]} via shell", ref_id=args[0])
                 return f"approval #{args[0]} rejected"

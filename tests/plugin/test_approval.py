@@ -625,32 +625,37 @@ def test_plugin_py_rejected_source_creates_no_row(tmp_path, settings):
     assert _count_rows(conn) == 0
 
 
-# --- ⑥ bless 成功で approved 行 / 検証失敗で何も作らない -----------------
+# --- ⑥ bless (旧 API) は裁定3で常に拒否・何も作らない -------------------
+# プラン10 Task11g 裁定3: live path (plugins/<name>) を候補に取る旧
+# `approval.bless()` は廃止され常に拒否する (materialize + `bless --from
+# _human` を案内するエラー)。以下 2 本は旧テスト
+# `test_bless_success_creates_approved_row`/`test_bless_validation_failure_
+# creates_no_row` を置換 (逐語の11箇所リストに無い既存テスト破壊 — 裁定3の
+# 直接の帰結、最終報告の「逸脱」に明記)。
 
-def test_bless_success_creates_approved_row(tmp_path, settings):
+
+def test_bless_legacy_api_always_rejected_creates_no_row(tmp_path, settings):
     d = _write_plugin(tmp_path, "ind", kind="indicator", plugin_py=INDICATOR_PY,
                       config_yaml="kind: indicator\n")
     meta = _indicator_meta(d)
     conn = _conn(tmp_path)
 
-    approval_id = approval.bless(conn, meta, settings=settings, now=NOW,
-                                 pytest_runner=_ok_pytest_runner)
-
-    row = conn.execute(
-        "SELECT status, decided_by FROM approval_requests WHERE id=?",
-        (approval_id,)).fetchone()
-    assert row["status"] == "approved"
-    assert row["decided_by"] == "human_cli"
-    assert approvals_store.pending(conn) == []  # もう pending ではない
+    with pytest.raises(ValueError, match="materialize"):
+        approval.bless(conn, meta, settings=settings, now=NOW,
+                       pytest_runner=_ok_pytest_runner)
+    assert _count_rows(conn) == 0
+    assert approvals_store.pending(conn) == []
 
 
-def test_bless_validation_failure_creates_no_row(tmp_path, settings):
+def test_bless_legacy_api_rejected_even_when_gate_would_have_failed(tmp_path, settings):
+    """検証が失敗するはずの入力でも、bless(旧API) は検証に到達する前に
+    拒否する (裁定3のエラーが検証結果より優先する)。"""
     d = _write_plugin(tmp_path, "ind", kind="indicator", plugin_py=INDICATOR_PY,
                       config_yaml="kind: indicator\n")
     meta = _indicator_meta(d)
     conn = _conn(tmp_path)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="materialize"):
         approval.bless(conn, meta, settings=settings, now=NOW,
                        pytest_runner=_fail_pytest_runner)
     assert _count_rows(conn) == 0

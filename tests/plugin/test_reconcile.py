@@ -37,6 +37,17 @@ def _make_version(plugins_dir, name, test_bytes=b"def test_x():\n    pass\n"):
 
 
 def test_gc_roots_includes_approved_symlink_and_journal_and_legacy_plain(env):
+    """R-i12 (統合裁定): Task 10 の strategy baseline 判定は「approved な
+    approval の最新 payload が指す artifact_hash 版」を参照する。本テストの
+    `d1 in roots` の assertion は、その版が `gc_roots()` ①集合 (approved
+    payload の artifact_hash 版) に常に含まれ sweep で削除されないことを
+    直接確認する — baseline が指す版と gc_roots ①が同じクエリ形状
+    (`kind='plugin' AND status='approved'` の payload の `artifact_hash`)
+    から導出されるため整合する。旧い approved 行の版が sweep で消えても
+    baseline 自体は最新行 (= 常に gc_roots に含まれる行) を指すため問題ない
+    という非対称性は、baseline 判定側 (Task 10、strategy_gate.py 相当、この
+    worktree には未実装) が「最新の approved 行」を採る設計であることに
+    依存する — Task 10 実装後に本コメントの前提を再確認すること。"""
     tmp_path, plugins_dir, conn = env
     d1, a1 = _make_version(plugins_dir, "approved_plugin")
     approvals_store.create(

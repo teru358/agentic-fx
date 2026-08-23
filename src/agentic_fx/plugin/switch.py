@@ -667,6 +667,46 @@ def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
                       plugins_root=plugins_root, settings=settings)
 
 
+def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
+                     decided_by: str, reason: str, now: datetime,
+                     plugins_root: Path) -> None:
+    """§8.1-32: 全 terminal decision (approve/reject/expire/reconcile) が
+    同じ plugin flock を通る。本 task (11g) が新規命名 (骨格 Interfaces 節
+    に無い — submit/approve/bless の 3 関数しか列挙されていないが、reject
+    経路も `apply_decision` を通り plugin flock を取る必要があるため新設)。
+    name は approval payload から取得する (submit/bless が payload に name
+    を含める契約 — 11d 参照)。"""
+    row = conn.execute(
+        "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
+    if row is None:
+        raise approvals_store.AlreadyDecidedError(
+            f"approval {approval_id} is not pending")
+    payload = json.loads(row["payload_json"])
+    name = payload.get("name")
+    if name is None:
+        # payload に name が無い (plugin kind の契約違反) — flock を取る
+        # 対象が特定できないので apply_decision のみ直接通す。
+        approvals_store.apply_decision(
+            conn, approval_id, "rejected", decided_by=decided_by, now=now,
+            reason=reason, commit=True)
+        return
+
+    with _plugin_lock(plugins_root, name):
+        # 未完ジャーナル収束: この approval 自身の未完ジャーナルが残って
+        # いれば (preparing 等で中断した再試行分) reject 前に巻き戻す
+        # (§5.1-1 の収束規則と同じ精神 — reject は「この承認を成立させ
+        # ない」決定なので、途中まで進んだ switch 効果を戻してから decide
+        # する)。
+        existing_journal = journal_store.get_open_by_name(conn, name)
+        if existing_journal is not None and existing_journal["approval_id"] == approval_id:
+            _revert_one(conn, existing_journal, plugins_root=plugins_root, now=now)
+            conn.commit()
+
+        approvals_store.apply_decision(
+            conn, approval_id, "rejected", decided_by=decided_by, now=now,
+            reason=reason, commit=True)
+
+
 def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
                               now: datetime) -> None:
     """裁定 1 (統合裁定 R-i8) の意味論を実装する (プラン10 Task11g、11f の

@@ -297,3 +297,16 @@ def test_approve_candidate_missing_stays_pending(env, monkeypatch):
                        (approval_id,)).fetchone()
     assert row["status"] == "pending"
     assert not (plugins_dir / "sma").exists()
+
+
+def test_no_direct_decide_calls_in_plugin_module(tmp_path):
+    """裁定1: switch.py/approval.py/commands.py は approvals_store.decide を
+    直接呼ばない (apply_decision を経由する — grep-zero pin、B-4 是正で
+    commands.py を対象に追加)。"""
+    import subprocess
+    result = subprocess.run(
+        ["grep", "-rn", r"approvals_store\.decide(\|approvals\.decide(",
+         "src/agentic_fx/plugin/switch.py", "src/agentic_fx/plugin/approval.py",
+         "src/agentic_fx/commands.py"],
+        capture_output=True, text=True)
+    assert result.stdout == "", f"unexpected decide() call sites:\n{result.stdout}"
