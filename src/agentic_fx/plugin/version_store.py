@@ -109,8 +109,58 @@ def create_version_dir(root: Path, name: str, artifact_hash: str, *,
 
 
 def gc_roots(conn: sqlite3.Connection, *, plugins_root: Path) -> frozenset[Path]:
-    """§5.1 の唯一の定義 (実装は 11f で完成させる — ここでは骨格のみ書き、
-    11f が journal/legacy_plain_present の集合を追加する)。他節はこの関数の
-    結果だけを参照し、集合をその場で再展開しない (codex 14 周目 M1)。
+    """§5.1: approved な approval payload の artifact_hash 版
+    ∪ live symlink の指す先
+    ∪ 非終端ジャーナルが参照する new_target/old_target/temp_path
+    ∪ legacy_plain_present pending の artifact_hash 版。
+
+    他節はこの関数の結果だけを参照し、集合をその場で再展開しない
+    (codex 14 周目 M1)。
     """
-    raise NotImplementedError("11f で実装する — 4 集合の union")
+    import json as _json
+
+    from agentic_fx.store import plugin_switch_journal as journal_store
+
+    roots: set[Path] = set()
+
+    # ① approved な approval payload の artifact_hash 版
+    for row in conn.execute(
+            "SELECT payload_json FROM approval_requests "
+            "WHERE kind='plugin' AND status='approved'"):
+        payload = _json.loads(row["payload_json"])
+        ah = payload.get("artifact_hash")
+        name = payload.get("name")
+        if ah and name:
+            roots.add(plugins_root / ".versions" / name / ah)
+
+    # ② legacy_plain_present pending の artifact_hash 版
+    for row in conn.execute(
+            "SELECT payload_json, reason FROM approval_requests "
+            "WHERE kind='plugin' AND status='pending' "
+            "AND reason='legacy_plain_present'"):
+        payload = _json.loads(row["payload_json"])
+        ah = payload.get("artifact_hash")
+        name = payload.get("name")
+        if ah and name:
+            roots.add(plugins_root / ".versions" / name / ah)
+
+    # ③ live symlink の指す先
+    if plugins_root.is_dir():
+        for entry in plugins_root.iterdir():
+            if entry.name.startswith((".", "_")):
+                continue
+            if entry.is_symlink():
+                target = (entry.parent / entry.readlink()).resolve()
+                roots.add(target)
+
+    # ④ 非終端ジャーナルが参照する new_target・old_target・temp_path
+    for row in journal_store.list_non_terminal(conn):
+        for key in ("new_target", "old_target"):
+            val = row.get(key)
+            if val:
+                roots.add((plugins_root / val).resolve())
+        temp_path = row.get("temp_path")
+        if temp_path:
+            roots.add((plugins_root.parent / temp_path).resolve())
+
+    return frozenset(p.resolve() for p in roots)

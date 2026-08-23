@@ -42,6 +42,7 @@ from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
 from agentic_fx.loops.trade_loop import _TRADE_TOOLS, TradeLoop
+from agentic_fx.plugin import switch
 from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner
@@ -760,10 +761,33 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                             notifier=notifier, clock=clock,
                             quote_fn=quote_fn, spec_fn=spec_fn, rate_fn=rate_fn)
 
+        plugins_dir = root / "plugins"
+
+        # プラン 10 Task 11f: 起動時 reconcile (journal-first) → 孤児掃除
+        # (sweep-last) → 期限切れ承認処理 (B-7: 裁定1の唯一の呼び出し元)。
+        # `missions.recover_interrupted` (上記) より後・`approved_plugins()`
+        # (直後) より前に配線する — reconcile 未実行のまま approved_plugins
+        # を呼ぶと、復旧した承認 (switched→decided で完了したもの) がその
+        # 起動ではロードされない (crash matrix、§8.1-34)。reconcile/sweep/
+        # expire のいずれかが例外を出してもサービス起動は止めない (§5.3 —
+        # plugin 承認だけが成立せず取引は動く)。
+        try:
+            switch.reconcile_switch_journals(
+                conn_core, plugins_root=plugins_dir, now=clock.now(),
+                settings=settings, activity=activity)
+            switch.sweep_orphans(
+                conn_core, plugins_root=plugins_dir, now=clock.now(),
+                activity=activity)
+            switch.process_expired_approvals(  # B-7: 唯一の呼び出し元だった裁定1が本番で1度も動かない欠落を解消
+                conn_core, plugins_root=plugins_dir, now=clock.now())
+        except Exception as exc:
+            activity.write(Category.APPROVAL, "plugin_reconcile_failed",
+                           safe_error_text(exc))
+            # サービス起動は止めない (§5.3 — plugin 承認だけが成立せず取引は動く)
+
         # プラン 7 Task 3: plugins/ 直下の承認済み plugin をロードする。反映は
         # 次回起動時のみ (hot reload しない — YAGNI)。plugins/ が存在しない環境
         # (未使用のデフォルト) でも approved_plugins は [] を返し起動を妨げない。
-        plugins_dir = root / "plugins"
         approved = plugin_loader.approved_plugins(conn_core, plugins_dir)
 
         # プラン 7 Task 8: signal producer (承認済み signal/strategy plugin の
@@ -1254,8 +1278,8 @@ def run_service(root: Path, *, daemon: bool = False,
     # 未起動の watchdog を見る) が開くだけだった (レビュー2周目 codex)。
     # 構築を両方先に済ませるのは `scheduler_thread` が参照する `wd` を
     # 束縛しておくため。
-    th = threading.Thread(target=scheduler_thread, daemon=True)
-    wd = threading.Thread(target=watchdog_thread, daemon=True)
+    th = threading.Thread(target=scheduler_thread, daemon=True, name="scheduler")
+    wd = threading.Thread(target=watchdog_thread, daemon=True, name="watchdog")
     th.start()
     wd.start()
 

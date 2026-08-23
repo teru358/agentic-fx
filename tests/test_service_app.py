@@ -2881,3 +2881,59 @@ def test_build_app_wires_codex_subscription_expiry_check(tmp_path, monkeypatch):
     build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
     assert call_count[0] > 0, "_check_codex_subscription_expiry が呼ばれていない"
 
+
+
+# --- プラン10 Task11f: 起動時 reconcile 配線 pin (B-15/B-7/M6 是正) --------
+
+
+def test_service_startup_calls_reconcile_sweep_expire_then_approved_plugins_in_order(
+        tmp_path, monkeypatch):
+    """B-15/M6 の killer: build_app が switch.reconcile_switch_journals →
+    switch.sweep_orphans → switch.process_expired_approvals →
+    plugin_loader.approved_plugins の順で呼ぶことを、実際の service.py の
+    呼び出し経路 (unittest.mock.patch) で確認する。"""
+    import unittest.mock as mock
+    from agentic_fx.plugin import switch
+    from agentic_fx.tools import plugin_loader as plugin_loader_mod
+
+    _init(tmp_path)
+    fake = FakeRunner([MissionResult("completed",
+                                     {"action": "hold", "reasoning": "w"},
+                                     [])])
+    with mock.patch.object(switch, "reconcile_switch_journals") as m_reconcile, \
+         mock.patch.object(switch, "sweep_orphans") as m_sweep, \
+         mock.patch.object(switch, "process_expired_approvals") as m_expire, \
+         mock.patch.object(plugin_loader_mod, "approved_plugins", return_value=[]) as m_approved:
+        # 逸脱 (11f 実装時の実測): `manager.attach_mock` は「以後の」呼び出し
+        # しか `manager.mock_calls` へ記録しない (attach 前の呼び出しは
+        # 遡って記録されない) — `unittest.mock` の実装上の性質。プラン骨子は
+        # `build_app(...)` の後に `manager.attach_mock` する順で書かれていた
+        # ため、そのままでは `call_names == []` になり test 自体が常に失敗
+        # する (実測で確認、殺したいはずの M6/M7 変異を注入しなくても red)。
+        # `attach_mock` を `build_app` 呼び出し**前**に行う順序へ入れ替えた。
+        manager = mock.MagicMock()
+        manager.attach_mock(m_reconcile, "reconcile")
+        manager.attach_mock(m_sweep, "sweep")
+        manager.attach_mock(m_expire, "expire")
+        manager.attach_mock(m_approved, "approved")
+        build_app(tmp_path, runner=fake, clock=FixedClock(NOW),
+                  embedding_fn=FakeEmbedding())
+        call_names = [c[0] for c in manager.mock_calls]
+        assert call_names == ["reconcile", "sweep", "expire", "approved"]
+
+
+def test_service_startup_reconcile_failure_does_not_block_startup(tmp_path, monkeypatch):
+    """B-15/M7 の killer: reconcile が例外を出しても build_app が完走する
+    (try/except を実際に通す — service.py を実行して確認する)。"""
+    import unittest.mock as mock
+    from agentic_fx.plugin import switch
+
+    _init(tmp_path)
+    fake = FakeRunner([MissionResult("completed",
+                                     {"action": "hold", "reasoning": "w"},
+                                     [])])
+    with mock.patch.object(switch, "reconcile_switch_journals",
+                           side_effect=RuntimeError("git not found")):
+        app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    assert app is not None

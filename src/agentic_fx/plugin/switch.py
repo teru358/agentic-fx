@@ -159,6 +159,80 @@ def reconcile_switch_journals(conn: sqlite3.Connection, *,
                                f"name={row['name']} op_id={row['op_id']}")
 
 
+# precheck 2026-08-22 wave2: T11-B2
+def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime,
+                  activity: "ActivityLog | None" = None) -> None:
+    """§5.3 起動時 reconcile ①〜⑦ (journal-first の後に呼ぶこと)。B-2 是正:
+    activity 記録は journal_store 層 (非実在の `record_activity_error`) では
+    なく、呼び出し元であるこの関数が直接 `activity.write` する (層違反の
+    解消)。M-10 是正: tmp スキップ条件は 1 桁の op_identity にしか一致しない
+    バグがあったため `".tmp-" in name` の部分一致に変える。"""
+    roots = version_store.gc_roots(conn, plugins_root=plugins_root)
+
+    # ① 孤児 staging (対応する pending approval_request の候補パスが無いもの)
+    staging_root = plugins_root / "_staging"
+    if staging_root.is_dir():
+        referenced = {
+            json.loads(r["payload_json"]).get("candidate_path")
+            for r in conn.execute(
+                "SELECT payload_json FROM approval_requests "
+                "WHERE kind='plugin' AND status='pending'")
+        }
+        for mission_dir in staging_root.iterdir():
+            for candidate in mission_dir.iterdir():
+                rel = f"plugins/_staging/{mission_dir.name}/{candidate.name}"
+                if rel not in referenced:
+                    shutil.rmtree(candidate, ignore_errors=True)
+
+    # ② tmp-* の削除 (どの版にも成長していない残骸)
+    versions_root = plugins_root / ".versions"
+    if versions_root.is_dir():
+        for name_dir in versions_root.iterdir():
+            for tmp in name_dir.glob("*.tmp-*"):
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        # ③ gc_roots に含まれない版ディレクトリの削除
+        for name_dir in versions_root.iterdir():
+            for version_dir in name_dir.iterdir():
+                if ".tmp-" in version_dir.name:  # M-10: 部分一致 (② が既に消しているが、②③の順序が入れ替わっても安全にする)
+                    continue
+                if version_dir.resolve() not in roots:
+                    # 版ストアは不変 (0500/0400、version_store.create_version_dir)
+                    # のため、削除前に書き込み可能へ chmod し直す必要がある
+                    # (プラン骨子の素の `shutil.rmtree(..., ignore_errors=True)`
+                    # のままだと権限不足で silently 残ってしまう — 実測で
+                    # 判明した逸脱、11f 実装時に追加)。
+                    for f in version_dir.iterdir():
+                        f.chmod(0o600)
+                    version_dir.chmod(0o700)
+                    shutil.rmtree(version_dir, ignore_errors=True)
+
+    # ④ temp link の残骸削除 (gc_roots の temp_path は除く)
+    for entry in plugins_root.glob(".*.link-*"):
+        if entry.resolve() not in roots:
+            entry.unlink(missing_ok=True)
+
+    # ⑤ dangling symlink は activity ERROR に留める (触らない) — B-2: 直接 activity.write
+    for entry in plugins_root.iterdir():
+        if entry.name.startswith((".", "_")):
+            continue
+        if entry.is_symlink() and not entry.exists():
+            if activity is not None:
+                activity.write(Category.APPROVAL, "dangling_live_symlink",
+                               f"name={entry.name}")
+
+    # ⑥ _retired/_human には触れない (何もしない)
+    # ⑦ legacy_plain_present の件数を activity へ (再試行はしない) — B-2: 直接 activity.write
+    if activity is not None:
+        legacy_count = conn.execute(
+            "SELECT COUNT(*) c FROM approval_requests "
+            "WHERE kind='plugin' AND status='pending' "
+            "AND reason='legacy_plain_present'").fetchone()["c"]
+        if legacy_count:
+            activity.write(Category.APPROVAL, "legacy_plain_present_pending_count",
+                           f"count={legacy_count}")
+
+
 # ============================================================
 # candidate_origin/candidate_path payload validator (§8.1-29、プラン10 Task 11d 逐語)
 # ============================================================
@@ -591,6 +665,54 @@ def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
     透過する)。"""
     approve_candidate(conn, approval_id, decided_by=decided_by, now=now,
                       plugins_root=plugins_root, settings=settings)
+
+
+def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
+                              now: datetime) -> None:
+    """裁定 1 (統合裁定 R-i8) の意味論を実装する (プラン10 Task11g、11f の
+    service.py 起動時 reconcile 配線が本関数の存在に依存するため実装を前倒し
+    — 最終報告の「逸脱」に明記):
+    - 非 plugin kind: `approvals_store.expire_due` の直接 expired 化変種を
+      そのまま使う (FS 副作用を持たない決定 — flock 不要)。
+    - plugin kind: `approvals_store.list_due_for_expiry` (列挙のみ、状態を
+      変えない) で期限到来 pending 行を洗い出し、行ごとに name の plugin
+      flock 下で「未完 switch ジャーナルが無い」ことを確認してから
+      `apply_decision(status="expired")` を呼ぶ。未完ジャーナルがある行は
+      スキップし、次回の呼び出し (または起動時 reconcile 後の再試行) に
+      委ねる。
+    """
+    # ① 非 plugin kind は従来どおり一括で直接 expired 化 (flock 不要)
+    approvals_store.expire_due(conn, now=now, exclude_kinds=("plugin",))
+
+    # ② plugin kind は列挙のみ (状態を変えない) — 行ごとに flock 下で処理
+    due_rows = approvals_store.list_due_for_expiry(conn, now=now, kind="plugin")
+    for row in due_rows:
+        payload = json.loads(row["payload_json"])
+        name = payload.get("name")
+        if not name:
+            continue
+        lock_path = plugins_root / ".locks" / f"{name}.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "w") as lockf:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+            try:
+                if journal_store.get_open_by_name(conn, name) is not None:  # B-2: 現物名
+                    # 未完ジャーナルあり → 今回はスキップ、次回再試行
+                    continue
+                # 他プロセスが flock 待ちの間に既に決定済みかもしれない
+                # (二重呼び出し・並行 approve など) — 再確認してから決定する
+                current = conn.execute(
+                    "SELECT status, expires_at FROM approval_requests WHERE id=?",
+                    (row["id"],)).fetchone()
+                if current is None or current["status"] != "pending":
+                    continue
+                if current["expires_at"] is None or current["expires_at"] >= now.isoformat():
+                    continue  # 期限が (並行更新等で) もはや到来していない
+                approvals_store.apply_decision(
+                    conn, row["id"], status="expired", decided_by="system",
+                    now=now, reason="expired", commit=True)
+            finally:
+                fcntl.flock(lockf, fcntl.LOCK_UN)
 
 
 def bless_candidate(
