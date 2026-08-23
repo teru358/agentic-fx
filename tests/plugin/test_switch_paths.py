@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_settings
 from agentic_fx.plugin import switch
 from agentic_fx.store import approvals as approvals_store
@@ -277,6 +278,37 @@ def test_bless_strategy_below_min_trades_creates_nothing(env, monkeypatch):
     assert journal_rows["c"] == 0
 
 
+# --- 検収 m6: 未完ジャーナル (別 approval_id) は UnresolvedJournalError ---
+
+def test_approve_raises_unresolved_journal_error_for_different_approval_id(env):
+    """検収 m6 是正: 同名で別 approval_id の未完ジャーナルが在るとき、
+    `approve_candidate` は bare `ValueError` ではなく `UnresolvedJournalError`
+    を送出する (`retire_plugin` と同じ型に統一 — CLI `_plugin_retire` が
+    catch する型と揃える)。"""
+    root, plugins_dir, conn, settings = env
+    approval_1 = approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "h1", "artifact_hash": "a1",
+                 "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/1/sma"},
+        now=NOW)
+    switch.begin_switch_journal(
+        conn, kind="approve", approval_id=approval_1, name="sma",
+        old_kind="absent", old_target=None,
+        new_target=f".versions/sma/{'a' * 64}", switch_required=True,
+        actor="human", now=NOW, commit=True)
+    approval_2 = approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "h2", "artifact_hash": "a2",
+                 "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/2/sma"},
+        now=NOW)
+
+    with pytest.raises(switch.UnresolvedJournalError):
+        switch.approve_candidate(conn, approval_2, decided_by="human", now=NOW,
+                                 plugins_root=plugins_dir, settings=settings)
+
+
 # --- §8.1-29: candidate_missing ---
 
 def test_approve_candidate_missing_stays_pending(env, monkeypatch):
@@ -310,3 +342,131 @@ def test_no_direct_decide_calls_in_plugin_module(tmp_path):
          "src/agentic_fx/commands.py"],
         capture_output=True, text=True)
     assert result.stdout == "", f"unexpected decide() call sites:\n{result.stdout}"
+
+
+# --- 検収 B3: 0d early-exit の再開前再検証 (設計書 §5.1-1 (a)) ---
+#
+# 「switched まで進んだ後に crash → 再起動/再試行」を、approve_candidate を
+# 一度 `_finalize_decision` の直前で意図的に止めて再現する (crash probe
+# C-HEALTHY と同じ形: journal は phase='switched' まで commit 済み・
+# approval はまだ pending)。旧稿 (0d early-exit) はここから直接
+# `_finalize_decision` へ進み、新版の存在/hash を一切確かめずに
+# approved へ確定してしまっていた (acceptance-task11.md B3)。
+
+
+def _simulate_crash_after_switch_before_decide(root, plugins_dir, conn, settings,
+                                               monkeypatch, *, name="sma"):
+    """approve_candidate を「switch_live 完了直後、_finalize_decision の
+    直前」で止め、journal を phase='switched' のまま・approval を pending
+    のまま残す。戻り値は (approval_id, artifact_hash)。"""
+    _write_candidate(plugins_dir / "_staging" / "1" / name)
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    approval_id = switch.submit_candidate(
+        conn, name=name, staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+    row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    import json
+    artifact_hash = json.loads(row["payload_json"])["artifact_hash"]
+
+    def _crash(*a, **kw):
+        raise RuntimeError("simulated crash before decide")
+
+    monkeypatch.setattr("agentic_fx.plugin.switch._finalize_decision", _crash)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW,
+                                 plugins_root=plugins_dir, settings=settings)
+    monkeypatch.undo()  # _finalize_decision と run_gate_pytest の両方を戻す
+
+    journal_row = conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE approval_id=?",
+        (approval_id,)).fetchone()
+    assert journal_row["phase"] == "switched"  # 前提の確認
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending"  # 前提の確認
+    return approval_id, artifact_hash
+
+
+def test_switched_journal_reverify_recreates_missing_version_from_staging_candidate(
+        env, monkeypatch):
+    """新版が欠損していても、pending の間残る staging 候補から冪等に
+    再作成できれば再開は完了する (設計 §5.1-1 (a) 「新版が欠損なら保持
+    している staging/_human 候補から再作成」)。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    approval_id, artifact_hash = _simulate_crash_after_switch_before_decide(
+        root, plugins_dir, conn, settings, monkeypatch)
+
+    # 新版ディレクトリを丸ごと消す (crash 後に版ストアが壊れた/掃除された想定)
+    import shutil
+    import stat
+    version_dir = plugins_dir / ".versions" / "sma" / artifact_hash
+    version_dir.chmod(0o700)
+    shutil.rmtree(version_dir)
+    assert not version_dir.exists()
+    # staging 候補はまだ残っている (pending の間は削除されない — §2.3)
+    assert (plugins_dir / "_staging" / "1" / "sma" / "plugin.py").exists()
+
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    switch.retry_approval(conn, approval_id, decided_by="human", now=NOW,
+                          plugins_root=plugins_dir, settings=settings)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "approved"
+    journal_row = conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE approval_id=?",
+        (approval_id,)).fetchone()
+    assert journal_row["phase"] == "decided"
+    assert version_dir.is_dir()  # 再作成された
+    live = plugins_dir / "sma"
+    assert live.is_symlink()
+    assert live.readlink().as_posix() == f".versions/sma/{artifact_hash}"
+
+
+def test_switched_journal_reverify_fails_closed_when_version_and_candidate_missing(
+        env, monkeypatch):
+    """検収 B3 の中核 pin: 新版が欠損し、再作成材料の候補も消えている
+    (=「保持している候補」が無い) 場合、0d early-exit は無条件に
+    approved へ進んではならない — journal を 'reverted' で閉じ、live を
+    旧状態 (absent) へ戻し、approval は pending のまま、activity ERROR
+    (`switch_reverify_failed`) を書くこと。
+
+    旧稿 (再検証なしの 0d early-exit) はここで `_finalize_decision` を
+    直接呼び 'approved'+'decided' へ確定してしまう — これが acceptance
+    B3 の実測 (「8a が検出した不整合は次回起動で自動的に approve に化ける」)
+    そのもの。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    approval_id, artifact_hash = _simulate_crash_after_switch_before_decide(
+        root, plugins_dir, conn, settings, monkeypatch)
+
+    import shutil
+    version_dir = plugins_dir / ".versions" / "sma" / artifact_hash
+    version_dir.chmod(0o700)
+    shutil.rmtree(version_dir)
+    # 再作成材料の候補も消す (mission の掃除が先に走った/人間が消した想定)
+    shutil.rmtree(plugins_dir / "_staging" / "1" / "sma")
+
+    activity = ActivityLog(root / "logs" / "activity.log")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    switch.retry_approval(conn, approval_id, decided_by="human", now=NOW,
+                          plugins_root=plugins_dir, settings=settings,
+                          activity=activity)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending", (
+        "再検証に失敗したのに approved へ確定してしまった (B3 の欠陥)")
+    journal_row = conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE approval_id=?",
+        (approval_id,)).fetchone()
+    assert journal_row["phase"] == "reverted"
+    live = plugins_dir / "sma"
+    assert not live.exists() and not live.is_symlink()  # old_kind=absent へ復帰
+
+    log_text = (root / "logs" / "activity.log").read_text()
+    assert "switch_reverify_failed" in log_text
+    assert Category.APPROVAL.value in log_text

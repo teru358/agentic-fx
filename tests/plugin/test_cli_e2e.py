@@ -78,5 +78,6 @@ def test_bless_without_from_human_is_always_rejected(tmp_path, monkeypatch, caps
          patch("agentic_fx.entry.service.run_service"):
         rc = main(["plugin", "bless", "sma"])  # --from なし
         assert rc != 0
-        out = capsys.readouterr().out
-        assert "materialize" in out
+        # 検収 m9 是正: 他の全 CLI エラーと同じく stderr へ統一 (旧稿は stdout)
+        err = capsys.readouterr().err
+        assert "materialize" in err

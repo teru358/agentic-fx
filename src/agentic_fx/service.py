@@ -771,19 +771,35 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # 起動ではロードされない (crash matrix、§8.1-34)。reconcile/sweep/
         # expire のいずれかが例外を出してもサービス起動は止めない (§5.3 —
         # plugin 承認だけが成立せず取引は動く)。
+        #
+        # 検収 m10 是正: 旧稿は 3 呼び出しを単一 try で括っていたため、
+        # reconcile が 1 行で落ちると同じ起動で sweep も expire も走らない
+        # (毎起動で再現し、人間が該当ジャーナル行を手で片付けるまで恒久的に
+        # 続く欠陥)。§5.1-1 の収束規則は「どちらでもない → ERROR で人間待ち」
+        # を行ごとの規則として書いており、reconcile 自身の per-row 分離
+        # (switch.py 側で実施済み) と対で、3 呼び出しも互いに独立させる —
+        # 呼び出し順序 (reconcile → sweep → expire) 自体は変えない。
         try:
             switch.reconcile_switch_journals(
                 conn_core, plugins_root=plugins_dir, now=clock.now(),
                 settings=settings, activity=activity)
-            switch.sweep_orphans(
-                conn_core, plugins_root=plugins_dir, now=clock.now(),
-                activity=activity)
-            switch.process_expired_approvals(  # B-7: 唯一の呼び出し元だった裁定1が本番で1度も動かない欠落を解消
-                conn_core, plugins_root=plugins_dir, now=clock.now())
         except Exception as exc:
             activity.write(Category.APPROVAL, "plugin_reconcile_failed",
                            safe_error_text(exc))
             # サービス起動は止めない (§5.3 — plugin 承認だけが成立せず取引は動く)
+        try:
+            switch.sweep_orphans(
+                conn_core, plugins_root=plugins_dir, now=clock.now(),
+                activity=activity)
+        except Exception as exc:
+            activity.write(Category.APPROVAL, "plugin_sweep_failed",
+                           safe_error_text(exc))
+        try:
+            switch.process_expired_approvals(  # B-7: 唯一の呼び出し元だった裁定1が本番で1度も動かない欠落を解消
+                conn_core, plugins_root=plugins_dir, now=clock.now())
+        except Exception as exc:
+            activity.write(Category.APPROVAL, "plugin_expire_failed",
+                           safe_error_text(exc))
 
         # プラン 7 Task 3: plugins/ 直下の承認済み plugin をロードする。反映は
         # 次回起動時のみ (hot reload しない — YAGNI)。plugins/ が存在しない環境

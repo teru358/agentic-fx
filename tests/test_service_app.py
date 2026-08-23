@@ -2937,3 +2937,27 @@ def test_service_startup_reconcile_failure_does_not_block_startup(tmp_path, monk
         app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW),
                         embedding_fn=FakeEmbedding())
     assert app is not None
+
+
+def test_service_startup_reconcile_failure_still_runs_sweep_and_expire(tmp_path, monkeypatch):
+    """検収 m10 の pin: 旧稿は reconcile/sweep/expire を単一 try で括って
+    いたため、reconcile が例外を出すと同じ起動で sweep も expire も走らな
+    かった (acceptance-task11.md m10)。3 呼び出しを別々の try で分離した
+    後は、reconcile が失敗しても sweep/expire は独立して実行されること。"""
+    import unittest.mock as mock
+    from agentic_fx.plugin import switch
+
+    _init(tmp_path)
+    fake = FakeRunner([MissionResult("completed",
+                                     {"action": "hold", "reasoning": "w"},
+                                     [])])
+    with mock.patch.object(switch, "reconcile_switch_journals",
+                           side_effect=RuntimeError("git not found")) as m_reconcile, \
+         mock.patch.object(switch, "sweep_orphans") as m_sweep, \
+         mock.patch.object(switch, "process_expired_approvals") as m_expire:
+        app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    assert app is not None
+    assert m_reconcile.called
+    assert m_sweep.called, "reconcile の失敗で sweep_orphans が道連れになった (m10 の欠陥)"
+    assert m_expire.called, "reconcile の失敗で process_expired_approvals が道連れになった (m10 の欠陥)"

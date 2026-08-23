@@ -113,6 +113,39 @@ def test_approve(tmp_path):
     assert any("approved" in r for r in records)
 
 
+def test_approve_plugin_kind_reports_actual_outcome_not_always_approved(tmp_path):
+    """検収 m5 の pin: kind='plugin' の approve は `switch.approve_candidate`
+    を呼ぶが、同関数は非 pending / 後発失効 / 候補欠損 / hash 不一致 /
+    legacy_plain_present などの正常な到達状態でも例外を出さず pending の
+    まま return する。旧稿の shell handler はこれを確認せず無条件に
+    activity `approved` を書き `"approval #N approved"` を返していた
+    (acceptance-task11.md m5)。ここでは候補が存在しない
+    (candidate_missing) 状態を作り、承認が実際には成立しなかったことが
+    報告に反映されることを確認する。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / ".locks").mkdir()
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "h1", "artifact_hash": "a1",
+                 "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/1/sma"},
+        now=NOW)  # candidate_path のディレクトリを作らない → candidate_missing
+
+    out = cmds.dispatch(f"approve {approval_id}")
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending", (
+        "candidate_missing で承認は成立しないはず (テスト前提の確認)")
+    assert out != f"approval #{approval_id} approved", (
+        "実際には approved になっていないのに『approved』と報告した (m5 の欠陥)")
+    assert "pending" in out
+
+
 def test_reject(tmp_path):
     """F2: reject は理由を保存し activity に記録。"""
     conn, _, activity, cmds = _commands(tmp_path)

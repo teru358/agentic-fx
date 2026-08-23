@@ -870,7 +870,8 @@ def test_entry_plugin_bless_without_from_is_always_rejected(
     assert rc != 0
     run_service.assert_not_called()
     assert not bless_mock.called
-    assert "materialize" in capsys.readouterr().out
+    # 検収 m9 是正: 他の全 CLI エラーと同じく stderr へ統一 (旧稿は stdout)
+    assert "materialize" in capsys.readouterr().err
 
 
 def test_entry_plugin_submit_not_found_rc1(tmp_path, monkeypatch, capsys):

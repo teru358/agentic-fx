@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_settings
 from agentic_fx.plugin import loader, switch
 from agentic_fx.store import approvals as approvals_store
@@ -91,6 +92,36 @@ def test_retire_does_not_delete_content(env):
     retired_dir = next((plugins_dir / "_retired").iterdir())
     assert (retired_dir / "config.yaml").exists()
     assert (retired_dir / "test_plugin.py").exists()
+
+
+def test_retire_writes_plugin_retired_activity(env):
+    """検収 B2 の pin: 設計書 §5.1 手順 0 / §5.1-1 は `plugin retire` に
+    activity `plugin_retired` を要求する (旧稿は `switch.py` にコメントの
+    みで未実装だった)。activity インスタンスを渡すと、event=`plugin_retired`
+    の行が書かれ、name と retired_path を含むことを確認する。"""
+    tmp_path, plugins_dir, conn, settings = env
+    _write(plugins_dir / "sma")
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+
+    switch.retire_plugin(conn, plugins_dir, "sma", now=NOW, activity=activity)
+
+    lines = (tmp_path / "logs" / "activity.log").read_text().splitlines()
+    assert len(lines) == 1
+    ts, category, event, summary, ref_id = lines[0].split("\t")
+    assert category == Category.APPROVAL.value
+    assert event == "plugin_retired"
+    assert "name=sma" in summary
+    retired_dir = next((plugins_dir / "_retired").iterdir())
+    assert f"retired_path={retired_dir}" in summary
+
+
+def test_retire_without_activity_arg_still_succeeds(env):
+    """`activity=None` (既定値) の後方互換 pin — CLI 以外の呼び出し元
+    (テスト等) が activity を渡さなくても retire は成立する。"""
+    tmp_path, plugins_dir, conn, settings = env
+    _write(plugins_dir / "sma")
+    switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
+    assert not (plugins_dir / "sma").exists()
 
 
 def test_retire_plugin_takes_plugin_flock_and_blocks_until_released(env):

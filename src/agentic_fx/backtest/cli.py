@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agentic_fx._safe_error import safe_error_text
+from agentic_fx.activity import ActivityLog
 from agentic_fx.backtest.analysis import coverage_report, corr_matrix
 from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
@@ -462,8 +463,10 @@ def _plugin_submit(conn, settings, args: argparse.Namespace, root: Path) -> int:
 
 def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
     # 裁定3: --from _human 無しは常に拒否 (materialize を案内)。
+    # 検収 m9 是正: 他の全エラーと同じく stderr へ (旧稿は stdout へ print
+    # していて統一が取れていなかった)。
     if getattr(args, "from_kind", None) != "_human":
-        print(_BLESS_NO_FROM_ERROR)
+        print(_BLESS_NO_FROM_ERROR, file=sys.stderr)
         return 1
     plugins_dir = root / "plugins"
     human_dir = plugins_dir / "_human" / args.name
@@ -491,9 +494,11 @@ def _plugin_materialize(conn, settings, args: argparse.Namespace, root: Path) ->
 
 def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
     plugins_dir = root / "plugins"
+    activity = ActivityLog(root / "logs" / "activity.log")
     try:
         plugin_switch.retire_plugin(
-            conn, plugins_dir, args.name, now=datetime.now(timezone.utc))
+            conn, plugins_dir, args.name, now=datetime.now(timezone.utc),
+            activity=activity)
     except (plugin_switch.UnresolvedJournalError, ValueError, OSError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1

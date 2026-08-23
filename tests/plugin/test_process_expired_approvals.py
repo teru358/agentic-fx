@@ -65,6 +65,58 @@ def test_expired_plugin_pending_without_journal_becomes_expired(env):
     assert row["status"] == "expired"
 
 
+def test_process_expired_approvals_takes_plugin_flock_and_blocks_until_released(env):
+    """検収 m2: 11g 台帳は M7 (`process_expired_approvals` が flock を
+    取らない) を「単体テストでは検出不能」として survived で確定していたが、
+    `test_retire_plugin_takes_plugin_flock_and_blocks_until_released` (11e)
+    とまったく同じ in-process パターンが効く — 別 fd で
+    `plugins/.locks/<name>.lock` を先に握っておくと `process_expired_approvals`
+    はブロックし、解放後に完了する。"""
+    import fcntl
+    import threading
+    import time
+
+    tmp_path, plugins_dir, conn = env
+    approval_id = approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "h1", "artifact_hash": "a1",
+                 "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/1/sma"},
+        now=PAST, expires_at=PAST)
+
+    lock_path = plugins_dir / ".locks" / "sma.lock"
+    lock_path.parent.mkdir(exist_ok=True)
+    holder = open(lock_path, "w")
+    fcntl.flock(holder, fcntl.LOCK_EX)  # 先に flock を握る
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def _run():
+        started.set()
+        switch.process_expired_approvals(conn, plugins_root=plugins_dir, now=NOW)
+        finished.set()
+
+    t = threading.Thread(target=_run)
+    t.start()
+    started.wait(timeout=2)
+    time.sleep(0.4)  # flock を取っていればここではまだブロック中
+    assert not finished.is_set(), (
+        "process_expired_approvals が flock を取らずに進んだ (M7 の変異が生きている)")
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending"
+
+    fcntl.flock(holder, fcntl.LOCK_UN)  # 解放すると進む
+    holder.close()
+    t.join(timeout=2)
+    assert finished.is_set()
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "expired"
+
+
 def test_expired_non_plugin_kind_uses_direct_expire_due_path(env):
     """非 plugin kind (例: mission) は flock を経由せず、従来どおり
     `expire_due` の直接 expired 化で処理される。"""

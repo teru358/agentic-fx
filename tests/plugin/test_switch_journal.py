@@ -104,8 +104,9 @@ def test_switched_recovery_live_equals_new_target_delegates_to_retry_approval(
     # 11e 完了後に本テストを再実行すると raising=False が無くても通る)。
     monkeypatch.setattr(
         switch, "retry_approval",
-        lambda c, approval_id, *, decided_by, now, plugins_root, settings: calls.append(
-            (approval_id, decided_by)), raising=False)  # B-1: plugins_root/settings も受ける
+        lambda c, approval_id, *, decided_by, now, plugins_root, settings,
+               activity=None: calls.append(
+            (approval_id, decided_by)), raising=False)  # B-1: plugins_root/settings も受ける。B3: activity も透過される
 
     switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS)
 
@@ -152,6 +153,60 @@ def test_switched_recovery_neither_target_is_error_and_untouched(tmp_path, conn,
                        (op_id,)).fetchone()
     assert row["phase"] == "switched"  # 触らない (非終端のまま)
     assert Path(root / "sma").readlink().as_posix() == third_party
+
+
+def test_reconcile_one_row_failure_does_not_block_other_rows(tmp_path, conn, monkeypatch):
+    """検収 m10 の pin: `reconcile_switch_journals` は per-row try/except を
+    持たなければならない — §5.1-1 の収束規則は「行ごとの規則」であり、1 行
+    (name='sma') の異常が別の name ('wma') の収束を止めてはならない。
+    旧稿はループに try/except が無く、1 行の例外がループ全体を中断させて
+    いた (acceptance-task11.md m10 の実測)。"""
+    root = _plugins_root(tmp_path)
+
+    # 行 1 (sma): live==new_target → retry_approval へ委譲する分岐だが、
+    # ここを monkeypatch で例外送出させ「異常のある行」を模す。
+    new_rel = f".versions/sma/{'n' * 64}"
+    (root / "sma").symlink_to(new_rel)
+    op_id_1 = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="absent",
+        old_target=None, new_target=new_rel, switch_required=True,
+        actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id_1, phase="switched", now=NOW, commit=True)
+
+    # 行 2 (wma): live==old_target → revert 分岐 (異常なし、正常に収束すべき)
+    old_rel = f".versions/wma/{'o' * 64}"
+    (root / "wma").symlink_to(old_rel)
+    op_id_2 = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=2, name="wma", old_kind="symlink",
+        old_target=old_rel, new_target=f".versions/wma/{'w' * 64}",
+        switch_required=True, actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id_2, phase="switched", now=NOW, commit=True)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated per-row failure (sma)")
+
+    monkeypatch.setattr(switch, "retry_approval", _boom)
+
+    from agentic_fx.activity import ActivityLog
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW,
+                                     settings=SETTINGS, activity=activity)
+
+    row_1 = conn.execute("SELECT phase FROM plugin_switch_journal WHERE op_id=?",
+                         (op_id_1,)).fetchone()
+    row_2 = conn.execute("SELECT phase FROM plugin_switch_journal WHERE op_id=?",
+                         (op_id_2,)).fetchone()
+    # 行 1 は例外を吸収され非終端のまま残る (次回 reconcile が再試行)
+    assert row_1["phase"] == "switched"
+    # 行 2 (異常の無い行) は行 1 の異常に巻き込まれずに正常収束する — これが
+    # m10 の中核 pin (旧稿では per-row try/except が無いため、行 1 の例外が
+    # ループを中断し行 2 が 'switched' のまま放置されていた)
+    assert row_2["phase"] == "reverted"
+    assert Path(root / "wma").readlink().as_posix() == old_rel
+
+    log_text = (tmp_path / "logs" / "activity.log").read_text()
+    assert "switch_reconcile_row_failed" in log_text
+    assert "sma" in log_text
 
 
 # --- 表 3: switch_required=0 は switched を経ない ---

@@ -90,7 +90,21 @@ class Commands:
                     plugin_switch.approve_candidate(
                         self.conn, approval_id, decided_by="shell",
                         now=self.clock.now(), plugins_root=self.plugins_root,
-                        settings=self.settings)
+                        settings=self.settings, activity=self.activity)
+                    # 検収 m5 是正: `approve_candidate` は正常な主要経路として
+                    # non-pending 以外にも pending 留置で return しうる
+                    # (§5.1: legacy_plain_present / candidate_missing /
+                    # hash 不一致 / 未完ジャーナル)。旧稿は結果を確認せず
+                    # 無条件に「approved」と報告していた — 実際の到達状態を
+                    # 読み直して報告する。
+                    outcome = self.conn.execute(
+                        "SELECT status, reason FROM approval_requests WHERE id=?",
+                        (approval_id,)).fetchone()
+                    if outcome is None or outcome["status"] != "approved":
+                        status = outcome["status"] if outcome else "不明"
+                        reason = (outcome["reason"] if outcome else None) or "-"
+                        return (f"approval #{args[0]} は approved になりません"
+                               f"でした (status={status}, reason={reason})")
                 else:
                     approvals.apply_decision(
                         self.conn, approval_id, "approved", decided_by="shell",
@@ -129,7 +143,8 @@ class Commands:
                 approval_id = int(args[1])
                 plugin_switch.retry_approval(
                     self.conn, approval_id, decided_by="shell", now=self.clock.now(),
-                    plugins_root=self.plugins_root, settings=self.settings)
+                    plugins_root=self.plugins_root, settings=self.settings,
+                    activity=self.activity)
                 self.activity.write(Category.APPROVAL, "retry",
                                     f"#{approval_id} via shell", ref_id=str(approval_id))
                 return f"approval #{approval_id} を再試行しました"
