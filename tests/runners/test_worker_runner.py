@@ -1936,8 +1936,9 @@ def test_worker_runner_copies_claude_credentials_before_spawn(monkeypatch, tmp_p
     orig_popen = subprocess.Popen
 
     def spy(*a, **kw):
-        cfg_dir = Path(kw["cwd"]) / "cfg"
-        captured["cfg_has_creds"] = (cfg_dir / ".credentials.json").is_file()
+        cfg_creds = Path(kw["cwd"]) / "cfg" / ".credentials.json"
+        captured["cfg_creds_content"] = (
+            cfg_creds.read_text() if cfg_creds.is_file() else None)
         return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
 
     monkeypatch.setattr(subprocess, "Popen", spy)
@@ -1947,7 +1948,9 @@ def test_worker_runner_copies_claude_credentials_before_spawn(monkeypatch, tmp_p
         settings=_worker_settings(claude_backend=True, credentials_file=str(creds)),
         clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
     runner.run(_mission())
-    assert captured["cfg_has_creds"] is True
+    # M18 是正 (`verified-round1.md` 2.3): `.is_file()` だけでは
+    # 「コピーせず空スタブを置く」変異を殺せない — 原本と内容一致まで見る。
+    assert captured["cfg_creds_content"] == creds.read_text()
 
 
 def test_worker_runner_does_not_copy_auth_json_for_codex_llama_swap(
@@ -1993,8 +1996,9 @@ def test_worker_runner_copies_auth_json_for_codex_chatgpt(monkeypatch, tmp_path)
     orig_popen = subprocess.Popen
 
     def spy(*a, **kw):
-        cfg_dir = Path(kw["cwd"]) / "cfg"
-        captured["cfg_has_auth"] = (cfg_dir / "auth.json").is_file()
+        cfg_auth = Path(kw["cwd"]) / "cfg" / "auth.json"
+        captured["cfg_auth_content"] = (
+            cfg_auth.read_text() if cfg_auth.is_file() else None)
         return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
 
     monkeypatch.setattr(subprocess, "Popen", spy)
@@ -2005,7 +2009,9 @@ def test_worker_runner_copies_auth_json_for_codex_chatgpt(monkeypatch, tmp_path)
                                   codex_auth_file=str(auth)),
         clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
     runner.run(_mission())
-    assert captured["cfg_has_auth"] is True
+    # M18 是正 (`verified-round1.md` 2.3): `.is_file()` だけでは
+    # 「コピーせず空スタブを置く」変異を殺せない — 原本と内容一致まで見る。
+    assert captured["cfg_auth_content"] == auth.read_text()
 
 
 def test_worker_runner_rejects_credentials_file_that_is_a_symlink(monkeypatch, tmp_path):
@@ -2042,6 +2048,25 @@ def test_worker_runner_rejects_credentials_file_readable_by_group(monkeypatch, t
         clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
     result = runner.run(_mission())
     assert result.status == "failed"
+
+
+def test_copy_credentials_file_accepts_exactly_max_size(tmp_path):
+    """#66 (`verified-round1.md` 1-A): `st.st_size > _MAX_CREDENTIALS_FILE_BYTES`
+    の境界。ちょうど 64 KiB (65536 バイト) はサイズ超過ではない
+    (`>=` に緩める変異はこの境界を踏まない — 既存の 65 KiB/32 バイトの
+    2 点しか実測していない)。"""
+    from agentic_fx.runners.worker_runner import (
+        _MAX_CREDENTIALS_FILE_BYTES, _copy_credentials_file,
+    )
+
+    src = tmp_path / "creds.json"
+    src.write_bytes(b"x" * _MAX_CREDENTIALS_FILE_BYTES)
+    src.chmod(0o600)
+    dest = tmp_path / "dest.json"
+
+    _copy_credentials_file(str(src), dest)  # 例外を出さない (境界ちょうど)
+
+    assert dest.read_bytes() == src.read_bytes()
 
 
 def test_worker_runner_rejects_oversized_credentials_file(monkeypatch, tmp_path):
@@ -2225,6 +2250,22 @@ def test_worker_runner_reaps_cli_pgid_after_worker_is_sigkilled(monkeypatch, tmp
     thread.join(timeout=15.0)
     assert not thread.is_alive(), "runner.run() が終わらない"
 
+    # #77 是正 (verified-round1.md 最優先): `result_box` はスレッド内で
+    # 埋めていながら一度も読んでいなかった — `_terminate_cli_pgid` の
+    # grace 待機ループ中に CLI が (SIGTERM を無視せず) 自発終了すると
+    # `os.killpg(pgid, 0)` が `ProcessLookupError` を送出する。これは
+    # 「CLI が grace 中に死ぬ」正常な回収経路そのものであり、ガードが
+    # 無いと `run()` が `MissionResult` を返さず例外を送出する
+    # (`ImproveSupervisor` は終端 status を受け取れない)。この test は
+    # `run()` がスレッド内で呼ばれるため、素の例外は
+    # `PytestUnhandledThreadExceptionWarning` に化けるだけで red に
+    # ならない — `result_box` に実際に `MissionResult` が入っていること
+    # (= 例外を送出せず正常に return したこと) を明示的に見る。
+    assert "result" in result_box, (
+        "runner.run() が MissionResult を返さず例外を送出した疑い "
+        "(#77: _terminate_cli_pgid の ProcessLookupError ガード欠落)")
+    assert result_box["result"].status in ("failed", "timeout")
+
     deadline = time.monotonic() + 3.0
     alive = True
     while time.monotonic() < deadline:
@@ -2344,6 +2385,58 @@ def test_worker_runner_terminate_cli_pgid_escalates_to_sigkill_when_cli_ignores_
             os.killpg(cli_pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+
+
+def test_worker_runner_cli_started_non_int_pgid_is_ignored(tmp_path, monkeypatch):
+    """#75 (`verified-round1.md` 1-A): `reader_loop` の `cli_started` 処理
+    (`isinstance(pgid, int)` ガード) を `cli_pgid_holder["pgid"] =
+    frame.get("pgid")` (無条件代入) に潰すと、非 int (`"abc"` 等) の
+    `pgid` を `_terminate_cli_pgid(pgid)` → `os.killpg(pgid, SIGTERM)` へ
+    渡してしまい `TypeError` (`finally` 節から送出、`run()` が
+    `MissionResult` を一切返さない) になる — この pin は `run()` が
+    正常に `MissionResult` を返すことで検出する。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake
+        write_frame(child_out, {"type": "cli_started", "seq": 1,
+                                "pgid": "not-an-int"})
+        write_frame(child_out, {"type": "ready", "seq": 2, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 3,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed", (
+        f"非 int pgid の cli_started で run() が MissionResult を返さなかった "
+        f"疑い (#75): {result!r}")
 
 
 def test_worker_runner_cli_started_never_sent_leaves_finally_a_no_op(
@@ -3110,3 +3203,107 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
             os.killpg(cli_pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+
+
+FAKE_CLAUDE_TRADE_DRIVER = (
+    Path(__file__).resolve().parent / "fixtures" / "fake_claude_trade_driver.py")
+
+
+def test_trade_claude_real_process_completes_via_factory_build_runner(
+        monkeypatch, tmp_path):
+    """I-1 是正の実プロセス pin (`verified-round1.md` §4 修正範囲 4)。
+
+    `trade.backend = "claude"` で実 `WorkerRunner → mission_worker →
+    runner_factory.build_runner → ClaudeRunner` を通し、以下をすべて
+    実プロセス/実ファイル/実ソケットで観測する:
+    (a) `status == "completed"`
+    (b) scratch `cfg/.credentials.json` が実在する (認証コピーが
+        profile 不問・backend 条件で走った)
+    (c) CLI が受け取った `--allowedTools` が `mcp__afx__*` ちょうど
+        (trade 用 allowed_tools、`factory.py:38` の完全一致)
+    (d) `afx.sock` が CLI 起動時点で bind されている — fake CLI が
+        `--mcp-config` の指す socket へ直接接続し `initialize`/
+        `tools/list` を発行できることで実測する (trade 分岐にも
+        dispatcher を配線した是正そのものの killer)
+    """
+    root = _root(tmp_path)
+
+    creds = tmp_path / ".credentials.json"
+    creds.write_text('{"token":"trade-claude-secret"}')
+    creds.chmod(0o600)
+
+    settings = SETTINGS.model_copy(update={
+        "runner": SETTINGS.runner.model_copy(update={
+            "trade": SETTINGS.runner.trade.model_copy(
+                update={"backend": "claude"}),
+            "claude": SETTINGS.runner.claude.model_copy(update={
+                "bin": str(FAKE_CLAUDE_TRADE_DRIVER),
+                "credentials_file": str(creds)}),
+            "cli_terminate_grace_sec": 5.0,
+        }),
+        "worker": SETTINGS.worker.model_copy(update={
+            "worker_startup_timeout_sec": 15.0, "worker_grace_sec": 5.0}),
+    })
+
+    captured_cwd: dict[str, object] = {}
+    real_popen = subprocess.Popen
+
+    def spy_popen(*a, **kw):
+        captured_cwd["cwd"] = kw.get("cwd")
+        return real_popen(*a, **kw)
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", spy_popen)
+
+    # `WorkerRunner.run()` の `with tempfile.TemporaryDirectory(...)` は
+    # `return` の評価直後 (関数が実際に呼び出し元へ戻るより前) に workdir
+    # を rmtree する。assert 側は `runner.run()` が返ってから workdir の
+    # 中身 (認証コピー・observed_*.json) を検査したいため、cleanup だけ
+    # 無効化した TemporaryDirectory 差し替えを使う (workdir は test 終了時
+    # に明示的に消す)。
+    class _NoCleanupTempDir(wr_mod.tempfile.TemporaryDirectory):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            # `TemporaryDirectory` は `weakref.finalize` でも cleanup を
+            # 登録する (`with` を抜けてインスタンス参照が無くなった時点で
+            # GC 経由で発火する) — `__exit__` の無効化だけでは防げないため
+            # finalizer 自体を detach する。
+            self._finalizer.detach()
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return None  # cleanup をスキップ (workdir を残す)
+
+    monkeypatch.setattr(wr_mod.tempfile, "TemporaryDirectory", _NoCleanupTempDir)
+
+    runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="trade")
+    mission = Mission(prompt="hi", tools=[], output_schema={},
+                      max_turns=1, timeout_sec=30.0)
+    try:
+        result = runner.run(mission)
+
+        assert result.status == "completed", (
+            f"trade+claude が完了しなかった: {result!r}")
+
+        mission_workdir = Path(captured_cwd["cwd"])
+        assert (mission_workdir / "cfg" / ".credentials.json").is_file(), (
+            "trade+claude で認証原本がコピーされていない (I-1 是正)")
+        assert (mission_workdir / "cfg" / ".credentials.json").read_text() == \
+            creds.read_text()
+
+        observed_argv = json.loads(
+            (mission_workdir / "observed_argv.json").read_text())
+        idx = observed_argv.index("--allowedTools")
+        assert observed_argv[idx + 1] == "mcp__afx__*"
+
+        observed_tools = json.loads(
+            (mission_workdir / "observed_tools.json").read_text())
+        assert observed_tools["initialize_ok"] is True
+        assert observed_tools["tool_names"], (
+            "afx.sock 経由の tools/list が空 — dispatcher が trade 分岐に"
+            "配線されていない疑い (段 0 検収 B1 と同型の欠落)")
+    finally:
+        import shutil as _shutil
+        cwd = captured_cwd.get("cwd")
+        if cwd is not None:
+            _shutil.rmtree(cwd, ignore_errors=True)

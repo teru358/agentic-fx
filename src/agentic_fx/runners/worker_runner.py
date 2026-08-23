@@ -137,28 +137,31 @@ class WorkerRunner(AgentRunner):
                     value = os.environ.get(key)
                     if value is not None:
                         credentials[key] = value
-            elif self._worker_profile == "improve":
-                choice = getattr(self._settings.runner, "improve", None)
-                if choice is not None and choice.backend == "claude":
-                    try:
-                        _copy_credentials_file(
-                            self._settings.runner.claude.credentials_file,
-                            workdir / "cfg" / ".credentials.json")
-                    except _CredentialsCopyError:
-                        return MissionResult(
-                            "failed", None, [],
-                            reason="claude credentials copy failed "
-                                   "(参照: 起動時検査/認証原本の要件)")
-                elif (choice is not None and choice.backend == "codex"
-                      and self._settings.runner.codex.provider == "chatgpt"):
-                    try:
-                        _copy_credentials_file(
-                            self._settings.runner.codex.auth_file,
-                            workdir / "cfg" / "auth.json")
-                    except _CredentialsCopyError:
-                        return MissionResult(
-                            "failed", None, [],
-                            reason="codex auth copy failed")
+
+            # I-1 是正: 認証ファイルのコピーは worker_profile ではなく
+            # backend で条件化する (profile 不問)。trade+claude/codex も
+            # improve と同じ CLI 認証を必要とするため。
+            choice = getattr(self._settings.runner, self._worker_profile, None)
+            if choice is not None and choice.backend == "claude":
+                try:
+                    _copy_credentials_file(
+                        self._settings.runner.claude.credentials_file,
+                        workdir / "cfg" / ".credentials.json")
+                except _CredentialsCopyError:
+                    return MissionResult(
+                        "failed", None, [],
+                        reason="claude credentials copy failed "
+                               "(参照: 起動時検査/認証原本の要件)")
+            elif (choice is not None and choice.backend == "codex"
+                  and self._settings.runner.codex.provider == "chatgpt"):
+                try:
+                    _copy_credentials_file(
+                        self._settings.runner.codex.auth_file,
+                        workdir / "cfg" / "auth.json")
+                except _CredentialsCopyError:
+                    return MissionResult(
+                        "failed", None, [],
+                        reason="codex auth copy failed")
 
             run_context_fields: dict[str, object] = {}
             if self._run_context is not None:

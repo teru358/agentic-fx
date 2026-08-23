@@ -139,6 +139,46 @@ def test_build_runner_codex_backend_returns_codex_runner(tmp_path, monkeypatch):
     assert isinstance(runner, FakeCodexRunner)
 
 
+def test_build_runner_codex_llama_swap_forwards_base_url(tmp_path, monkeypatch):
+    """#11 (`verified-round1.md` 1-A): `llama_swap_base_url=` は
+    `codex_settings.provider == "llama_swap"` のときだけ `settings.llama_swap.base_url`
+    を渡し、`chatgpt` のときは `None` を渡す (`factory.py:51-53`)。この条件式
+    ごと `None` に潰す変異は、`captured` を assert しない既存テストでは
+    生存する。"""
+    from agentic_fx.config import load_settings
+
+    FakeCodexRunner, captured = _install_fake_cli_runner_module(
+        monkeypatch, "agentic_fx.runners.codex_runner", "CodexRunner")
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": "codex"}),
+            "codex": settings.runner.codex.model_copy(
+                update={"provider": "llama_swap"})})})
+    build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+    assert captured["llama_swap_base_url"] == settings.llama_swap.base_url
+
+
+def test_build_runner_codex_chatgpt_omits_llama_swap_base_url(tmp_path, monkeypatch):
+    """対: `provider == "chatgpt"` のときは `llama_swap_base_url=None`。"""
+    from agentic_fx.config import load_settings
+
+    FakeCodexRunner, captured = _install_fake_cli_runner_module(
+        monkeypatch, "agentic_fx.runners.codex_runner", "CodexRunner")
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": "codex"}),
+            "codex": settings.runner.codex.model_copy(
+                update={"provider": "chatgpt"})})})
+    build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+    assert captured["llama_swap_base_url"] is None
+
+
 def test_build_runner_trade_profile_uses_trade_choice(tmp_path):
     """profile=trade のときは runner.trade を見る。"""
     from agentic_fx.config import load_settings

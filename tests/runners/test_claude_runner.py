@@ -49,6 +49,19 @@ def _flag_value(argv, flag):
     return argv[idx + 1]
 
 
+def test_claude_runner_rejects_empty_allowed_tools(tmp_path):
+    """#26 (`verified-round1.md` 1-B): `allowed_tools=[]` は
+    `--allowedTools ""` になり、claude CLI の意味論では「制限なし」に
+    近い挙動になりうる — 構築時点で fail closed する。"""
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    with pytest.raises(ValueError, match="allowed_tools"):
+        ClaudeRunner(bin_path=FAKE_CLAUDE, model="claude-haiku-4-5",
+                    workdir=workdir, credentials_file_copied=True,
+                    allowed_tools=[], cli_terminate_grace_sec=0.3,
+                    registry=ToolRegistry())
+
+
 def test_claude_argv_shape(tmp_path):
     """argv が骨格 §1.2 の形と一致する (`-p` プロンプト・--output-format
     stream-json --verbose・--json-schema・--setting-sources ""・

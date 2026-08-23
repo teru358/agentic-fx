@@ -42,6 +42,14 @@ def test_build_launcher_argv_encodes_rlimits_as_json():
     assert decoded == {"RLIMIT_FSIZE": [8388608, 8388608]}
 
 
+def test_build_launcher_argv_rejects_empty_argv():
+    """#2 (`verified-round1.md` 1-A): `if not argv: raise ValueError` が
+    無いと `argv[0]` の直後 IndexError になり、契約 (`ValueError`) が
+    変わる。"""
+    with pytest.raises(ValueError, match="empty"):
+        build_launcher_argv(1, [])
+
+
 def test_build_launcher_argv_rejects_relative_argv():
     """launcher へ渡す argv は起動時検査が解決した絶対パスのみ
     (§1.1-1「argv は解決済み絶対パスのみ」)。相対パスは呼び出し側の誤りであり

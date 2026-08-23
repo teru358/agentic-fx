@@ -715,20 +715,61 @@ def test_main_applies_landlock_bootstrap_before_running_improve_mission(
     assert registry_calls == []
 
 
-def test_main_fails_closed_when_runner_backend_is_claude(monkeypatch, tmp_path):
-    """**Global Constraints の強制点**: Anthropic API (従量課金) は使用不可で
-    `ClaudeRunner` は本プラン未実装。`runner.trade.backend == "claude"` を子が
-    検出したら `RuntimeError` で fail closed する (Mission を実行しない)。"""
+def test_main_routes_trade_claude_backend_through_factory_build_runner(
+        monkeypatch, tmp_path):
+    """I-1 是正 (`tmp/review-bundleA/verified-round1.md` §4): 旧
+    `test_main_fails_closed_when_runner_backend_is_claude` は「ClaudeRunner
+    は本プラン未実装」という旧前提を固定していたが、Minor 14 で trade+claude
+    の起動時検査 (`service._check_cli_backend`) を追加した以上、実 Mission
+    経路 (`mission_worker.py`) も通す必要がある (codex I-1)。
+
+    Anthropic API 従量課金を使わないという Global Constraints の強制点は
+    `RuntimeError` fail closed ではなく `_build_env` が `ANTHROPIC_API_KEY`
+    等を CLI env に一切載せないこと (`test_claude_runner.py:122`) が別途
+    担保する — claude はサブスクリプション認証 (`.credentials.json`) のみで
+    起動する。
+
+    ここでは `main()` の trade 分岐が実際に `runner_factory.build_runner`
+    を `profile="trade"` で呼ぶ**配線**を in-process で pin する。実
+    プロセス (fake claude CLI + 0600 credentials + allowed_tools 完全一致
+    + `afx.sock` bind 実測) の pin は
+    `tests/runners/test_worker_runner.py::
+    test_trade_claude_real_process_completes_via_factory_build_runner`。"""
+    monkeypatch.chdir(tmp_path)
+
+    build_calls: list[tuple] = []
+
+    class _FakeClaudeRunner:
+        def __init__(self):
+            self._afx_mcp_dispatcher = None
+
+        def run(self, mission):
+            from agentic_fx.runners.base import MissionResult
+            return MissionResult("completed", {"action": "no_trade"}, [],
+                                 reason=None)
+
+    def fake_build_runner(profile, settings, registry, *, workdir,
+                          on_message=None, cli_started_sink=None):
+        build_calls.append((profile, settings.runner.trade.backend))
+        return _FakeClaudeRunner()
+
+    monkeypatch.setattr(mission_worker.runner_factory, "build_runner",
+                        fake_build_runner)
+
     def to_claude(d):
         d["runner"]["trade"]["backend"] = "claude"
 
     frames, _, registry_calls = _drive_main(
         monkeypatch, tmp_path, settings_mutator=to_claude)
 
-    assert len(frames) == 1
-    assert frames[0]["type"] == "ready" and frames[0]["ok"] is False
-    assert "claude" in frames[0]["error"].lower()
-    assert registry_calls == []
+    assert build_calls == [("trade", "claude")], (
+        "trade+claude が runner_factory.build_runner(profile='trade') を "
+        "経由していない (I-1)")
+    assert frames[-1]["type"] == "result"
+    assert frames[-1]["status"] == "completed"
+    assert registry_calls != [], (
+        "trade+claude でも build_mission_registry('trade', ...) が呼ばれる"
+        "はず (registry 構築を経由しない変異への pin)")
 
 
 def test_set_resource_limits_sets_all_four_limits(monkeypatch):

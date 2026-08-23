@@ -275,8 +275,11 @@ def _check_service_initial_env_has_no_secrets(
     呼び出し規約を他の `_check_*` 検査と揃えるために受け取るのみで、
     現状は未使用。"""
     names = read_initial_env_names()
+    # #94 (verified-round1.md 1-B): `_SECRET_ENV_PATTERNS` は大文字のみ
+    # なので、照合前に `k.upper()` を掛けて小文字/混在の env 名 (`my_api_key`
+    # 等) も検出する。
     leaked = [k for k in names
-              if any(pat in k for pat in _SECRET_ENV_PATTERNS)]
+              if any(pat in k.upper() for pat in _SECRET_ENV_PATTERNS)]
     if leaked:
         raise RuntimeError(
             "improve+claude backend refuses to start: service initial env "

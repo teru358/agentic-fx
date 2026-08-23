@@ -21,6 +21,12 @@ class ClaudeRunner(CliRunner):
                  registry: ToolRegistry,
                  on_message: Callable[[dict], None] | None = None,
                  cli_started_sink: Callable[[int], None] | None = None) -> None:
+        # #26 (`verified-round1.md` 1-B): `--allowedTools ""` (空リスト) は
+        # claude CLI の意味論では「制限なし」に近い挙動になりうる —
+        # 空リストを渡す変異/設定ミスを fail closed で拒否する (production
+        # では `factory.py` が非空の固定リストしか渡さない)。
+        if not allowed_tools:
+            raise ValueError("ClaudeRunner requires a non-empty allowed_tools list")
         self._allowed_tools = allowed_tools
         super().__init__(bin_path=bin_path, model=model, workdir=workdir,
                          cli_terminate_grace_sec=cli_terminate_grace_sec,

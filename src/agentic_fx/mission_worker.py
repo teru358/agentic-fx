@@ -31,9 +31,11 @@
 `_bootstrap_improve_profile()` で Landlock を適用してから、空の `ToolRegistry()`
 で `LocalRunner` を組む (改善ループの実ツールセットはプラン 9)。
 
-`settings.runner.<profile>.backend` が "local" 以外 (= "claude") の場合は
-`RuntimeError` で fail closed する (ClaudeRunner は本プランでは実装しない —
-Global Constraints)。trade は `runner.trade.backend`、improve は
+`settings.runner.<profile>.backend` は `runner_factory.build_runner()` が
+選ぶ (local/claude/codex、trade は codex を `config.py` の
+`_trade_backend_not_codex` が起動前に拒否済み — I-1 是正)。CLI backend
+(claude/codex) のときは `_start_mcp_dispatcher` で `afx.sock` を `ready`
+送出前に bind する。trade は `runner.trade.backend`、improve は
 `runner.improve.backend` をそれぞれ見る。
 
 **I4 対応 (実時計)**: 子は Mission 実行中の鮮度判定 (`get_signals` 等)
@@ -647,11 +649,6 @@ def main() -> None:
 
         from agentic_fx.config import Settings
         settings = Settings.model_validate(settings_dict)
-        if settings.runner.trade.backend != "local":
-            raise RuntimeError(
-                f"runner.trade.backend={settings.runner.trade.backend!r} is "
-                "not supported by mission_worker in this plan (ClaudeRunner "
-                "is Plan 9 scope) — fail closed")
 
         # R2/B6 (設計書 §2.2): trade worker は handshake の credentials を
         # os.environ へ setenv する — datafeed コード (price_provider.py/
@@ -692,30 +689,48 @@ def main() -> None:
             activity=activity, indicator_plugins=approved, readonly=True)
 
         from agentic_fx.runners.base import Mission
-        from agentic_fx.runners.local_runner import LocalRunner
 
         mission = Mission(**handshake["mission"])
 
         on_message = _make_on_message(protocol_out, out_seq)
 
-        runner = LocalRunner(
-            base_url=settings.llama_swap.base_url,
-            model=settings.runner.trade.model, registry=registry,
-            on_message=on_message)
+        # I-1 是正: trade も improve と同じ factory.build_runner 経由で
+        # backend (local/claude) を選ぶ (config.py の
+        # `_trade_backend_not_codex` が codex を既に拒否済み)。CLI
+        # backend (claude) のときは improve と同形で `afx.sock` を
+        # `ready` 送出前に bind する — CLI に渡す `--mcp-config` の
+        # socket が bind 済みであることを保証するため (段 0 検収の
+        # 「ツール 0 個で走る」欠落の是正)。
+        trade_dispatcher = None
+        if settings.runner.trade.backend != "local":
+            trade_dispatcher = _start_mcp_dispatcher(
+                workdir=Path.cwd(), registry=registry)
+        runner = runner_factory.build_runner(
+            "trade", settings, registry, workdir=Path.cwd(),
+            on_message=on_message,
+            cli_started_sink=lambda pgid: _send_frame(
+                protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}))
+        if trade_dispatcher is not None:
+            runner._afx_mcp_dispatcher = trade_dispatcher
 
         _send_frame(protocol_out, out_seq, {"type": "ready", "ok": True})
         ready_sent = True
 
         try:
-            result = runner.run(mission)
-            _send_frame(protocol_out, out_seq, {
-                "type": "result",
-                "status": result.status, "output": result.output,
-                "reason": result.reason})
-        except Exception as exc:  # noqa: BLE001 — 必ず result を送る
-            _send_frame(protocol_out, out_seq, {
-                "type": "result", "status": "failed", "output": None,
-                "error": f"{type(exc).__name__}: {exc}"})
+            try:
+                result = runner.run(mission)
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result",
+                    "status": result.status, "output": result.output,
+                    "reason": result.reason})
+            except Exception as exc:  # noqa: BLE001 — 必ず result を送る
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result", "status": "failed", "output": None,
+                    "error": f"{type(exc).__name__}: {exc}"})
+        finally:
+            dispatcher = getattr(runner, "_afx_mcp_dispatcher", None)
+            if dispatcher is not None:
+                dispatcher.close()
     except Exception as exc:  # noqa: BLE001 — ready 送出前の失敗も報告する
         try:
             # レビュー 1 周目 (codex I-2): 旧実装は無条件に
