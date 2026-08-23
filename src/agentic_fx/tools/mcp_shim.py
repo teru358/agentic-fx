@@ -17,9 +17,9 @@ from pathlib import Path
 
 from agentic_fx.tools.registry import ToolRegistry
 
-# 裁定 5: 実装計画で実 CLI 2 種の initialize 要求を実測して確定する。
-# 未実測のため暫定値を置く — 実測後にこの定数を更新し、コミットメッセージ
-# に実測ログの参照先を残すこと。
+# 裁定 5: 実装計画で実 CLI 2 種の initialize 要求を実測して確定する
+# (Task 13 が担当、A-4 検収是正 m-4)。未実測のため暫定値を置く — 実測後に
+# この定数を更新し、コミットメッセージに実測ログの参照先を残すこと。
 _SUPPORTED_PROTOCOL_VERSION = "2024-11-05"
 
 
@@ -37,13 +37,37 @@ class McpShimDispatcher:
         self._allowed = list(allowed)
         self._call_lock = threading.Lock()
         self.protocol_version = _SUPPORTED_PROTOCOL_VERSION
+        # A-4 検収是正 (r2, B1-r2): bind 済み server socket。`bind()` が
+        # 呼び出しスレッドで同期実行され、`self._server` が設定された時点で
+        # bind 成否が確定する — `serve_forever` 側の非同期 accept ループと
+        # 分離することで、呼び出し元が bind の成否を直接 (例外として)
+        # 観測できるようにする。
+        self._server: socket.socket | None = None
 
-    def serve_forever(self) -> None:
+    def bind(self) -> None:
+        """`sock_path` へ同期で bind+listen する (B1-r2 是正)。
+
+        例外 (`OSError` とそのサブクラス — `unlink()` の `IsADirectoryError`
+        や `bind()` の `FileNotFoundError`/`PermissionError` 等) はそのまま
+        呼び出し元へ伝播させる。旧実装は `serve_forever` を daemon thread に
+        投げてから `sock_path.exists()` を 3 秒ポーリングする**代理観測**で
+        bind 成否を判定していたため、bind 前に何らかのエントリが同名で
+        存在すると (例: 他プロセスの残骸、または `sock_path` が既に
+        ディレクトリ) 誤って成功と判定していた (検収 B1-r2 の masking
+        probe)。`bind()` を同期実行し例外をそのまま伝播させることで、
+        代理観測を排除し真の fail closed にする。
+        """
         if self._sock_path.exists():
             self._sock_path.unlink()
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(self._sock_path))
         server.listen(8)
+        self._server = server
+
+    def serve_forever(self) -> None:
+        if self._server is None:
+            self.bind()
+        server = self._server
         try:
             while True:
                 conn, _ = server.accept()

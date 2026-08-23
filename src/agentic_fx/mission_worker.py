@@ -52,7 +52,6 @@ import signal
 import sys
 import sysconfig
 import threading
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
@@ -400,36 +399,56 @@ def _build_improve_registry(*, settings: Any, workdir: Path) -> ToolRegistry:
     return ToolRegistry()
 
 
+def mcp_socket_path(workdir: Path) -> Path:
+    """improve worker の MCP dispatcher socket パス (A-4 検収是正 r2、B2-r2)。
+
+    `_start_mcp_dispatcher` が bind するパスと、CLI 側
+    (`CliRunner.run`) が `_build_argv` へ渡す `mcp_socket` は、**この関数
+    1 本**から導出する。前回是正 (r2 以前) は両者が独立した
+    `workdir / "afx.sock"` リテラルとして別々の場所に書かれており、
+    `cli_runner.py` 側のパス式のみを変異させても検出できなかった
+    (検収 B2-r2: 全スイートで Survived)。式を 1 本に統合することで、
+    どちら側の呼び出しを変異させても不一致が実プロセス経由で検出できる。
+    """
+    return workdir / "afx.sock"
+
+
 def _start_mcp_dispatcher(*, workdir: Path, registry: ToolRegistry) -> McpShimDispatcher:
     """improve worker 側の Unix socket dispatcher を起動する
-    (A-4 検収是正 Step 7a/7b、設計書 §1.6)。
+    (A-4 検収是正 Step 7a/7b、設計書 §1.6、r2 是正 B1-r2/RW6)。
 
-    `sock_path` は `workdir / "afx.sock"` — CLI 側 (`CliRunner.run` /
-    `cli_runner.py:88`) が `self._workdir / "afx.sock"` として**同じ
-    `workdir` から独立に**導出するパスと、両者が同じ `workdir` を共有する
-    ことで一致する (B1 是正: どちらの式も `<workdir>/afx.sock` であり、
-    `workdir` は `factory.build_runner(..., workdir=workdir)` 経由で
-    `_run_improve_mission` と `CliRunner.__init__` の両方に同一の値が渡る
-    — 引数として明示的に転送する経路は無いが、式の一致で保証される)。
+    `McpShimDispatcher.bind()` を**呼び出しスレッドで同期実行**する —
+    bind の成否をそのまま例外として受け取れるため、以前の実装
+    (`serve_forever` を daemon thread へ投げてから `sock_path.exists()` を
+    3 秒ポーリングする代理観測) が持っていた 2 つの欠陥が同時に消える:
+    (a) 代理観測は「そのパスに何か在るか」しか見ておらず、bind 前から
+    別エントリ (他プロセスの残骸やディレクトリ) が同名で存在すると
+    誤って成功と判定していた (masking probe、検収 B1-r2 (a))。
+    (b) daemon thread の非同期 bind がテスト間で cwd を共有する
+    in-process 呼び出し (`main()` を直接駆動する improve profile テスト)
+    と競合し、全スイートを flaky にしていた (検収 B1-r2 (b))。
+    同期 bind によりポーリング・3 秒 deadline は不要になる。
+
+    bind (+ registry 構築) が完了してからこの関数が返ることで、呼び出し元
+    (`_run_improve_mission` → `main()`) が `ready` フレームを送出する時点
+    では既に dispatcher が accept 可能な状態にある (RW6: 子は
+    「bind + registry 構築 → ready 送出 → go 待ち」の順)。
     """
-    sock_path = workdir / "afx.sock"
+    sock_path = mcp_socket_path(workdir)
     dispatcher = McpShimDispatcher(
         sock_path=sock_path, registry=registry, allowed=registry.names())
-    thread = threading.Thread(target=dispatcher.serve_forever, daemon=True)
-    thread.start()
-    deadline = time.monotonic() + 3.0
-    while not sock_path.exists() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    if not sock_path.exists():
-        # A-4 検収是正 (advisor 指摘): `serve_forever` は daemon thread 内で
-        # 走るため、`bind()` が例外 (Landlock 拒否等) で失敗しても呼び出し
-        # 元には伝わらない — 3 秒待っても socket が現れなければ fail
-        # closed で終了する。黙って見逃すと、bind に失敗した状態のまま
+    try:
+        dispatcher.bind()
+    except OSError as e:
+        # bind の失敗 (Landlock 拒否、ENOENT、既存エントリがディレクトリ
+        # 等) をそのまま呼び出し元へ fail closed で伝える。黙って見逃すと
         # CLI へ存在しない socket path を渡し続け、B1 (bind されない
-        # socket = ツール 0 個) と区別のつかない症状を再発させる。
+        # socket = ツール 0 個) を再発させる。
         raise RuntimeError(
             f"MCP dispatcher failed to bind {sock_path} — refusing to "
-            "start (fail closed: CLI would run with 0 tools, 検収 B1)")
+            "start (fail closed: CLI would run with 0 tools, 検収 B1)") from e
+    thread = threading.Thread(target=dispatcher.serve_forever, daemon=True)
+    thread.start()
     return dispatcher
 
 

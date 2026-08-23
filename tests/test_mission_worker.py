@@ -1,6 +1,7 @@
 """Mission worker child process tests (プラン10 Task 5)."""
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
@@ -629,33 +630,122 @@ def test_run_improve_mission_binds_mcp_dispatcher_and_serves_registry_tool(
 
 
 def test_run_improve_mission_claude_backend_workdir_matches_dispatcher_socket(
-        tmp_path):
-    """Step 7b: `CliRunner._build_argv` が使う `mcp_socket`
-    (`self._workdir / "afx.sock"`, `cli_runner.py:88`) と mission_worker が
-    bind したパス (`_start_mcp_dispatcher` の `workdir / "afx.sock"`) が、
-    同一の `workdir` から独立に導出されて一致することを pin する。backend
-    を `claude` にして `factory.build_runner` を実際に通し (mock しない)、
-    構築された `ClaudeRunner` (`CliRunner` の `_workdir` を保持) が呼び出し
-    元と同じ `workdir` を持つこと、かつ dispatcher が同じ場所へ bind 済み
-    であることを確認する (実 CLI は起動しない — `.run()` は呼ばない)。"""
+        monkeypatch, tmp_path):
+    """Step 7b + B2-r2 是正: `CliRunner.run()` が実際に子プロセスへ渡す
+    `--mcp-config` の socket パスと、mission_worker が bind したパス
+    (`_start_mcp_dispatcher` → `mcp_socket_path(workdir)`) が一致することを
+    **実プロセス**で pin する。
+
+    前回是正 (r2 以前) は `runner._workdir == tmp_path` と
+    `(tmp_path / "afx.sock").exists()` の 2 本の assert しかなく、
+    `cli_runner.py:88` の `mcp_socket = self._workdir / "afx.sock"` を
+    別名 (`afx_MUTATED.sock`) へ変異させても検出できなかった
+    (検収 B2-r2: 全スイートで Survived) — その式は `_build_argv` へ渡す
+    値の由来を検査しておらず、2 つの独立したリテラルの偶然の一致に
+    頼っていたため。
+
+    ここでは `settings.runner.claude.bin` を fake claude CLI (Python
+    script) に差し替え、`ClaudeRunner.run()` を実際に呼び出す —
+    `cli_runner.py:88` (現在は `mcp_socket_path(self._workdir)` 呼び出し)
+    がその実行経路に必ず含まれる。fake CLI は `--mcp-config` の JSON から
+    `mcpServers.afx.command`/`args` (= `[sys.executable, "-m",
+    "agentic_fx.tools.mcp_shim", <mcp_socket>]`) を読み、実際にそれを
+    Popen して `tools/list` を JSON-RPC で投げる — fake mcp_shim が argv の
+    socket パスへ接続でき、mission_worker が bind した dispatcher から
+    登録済みツールの一覧が返ってくることを確認する。"""
     import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.runners.base import Mission
+    from agentic_fx.tools.registry import ToolDef, ToolRegistry
+
+    def _echo(x: int) -> dict:
+        return {"echo": x}
+
+    fake_registry = ToolRegistry()
+    fake_registry.register(ToolDef(
+        name="probe_tool", description="d",
+        parameters={"type": "object", "properties": {"x": {"type": "integer"}}},
+        func=_echo))
+
+    fake_bin = tmp_path / "fake_claude.py"
+    fake_bin.write_text(
+        f"#!{sys.executable}\n"
+        "import json, subprocess, sys\n"
+        "argv = sys.argv[1:]\n"
+        "mcp_config_path = argv[argv.index('--mcp-config') + 1]\n"
+        "cfg = json.loads(open(mcp_config_path).read())\n"
+        "server = cfg['mcpServers']['afx']\n"
+        "cmd = [server['command']] + server['args']\n"
+        "proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, "
+        "stdout=subprocess.PIPE, text=True)\n"
+        "req = {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}\n"
+        "proc.stdin.write(json.dumps(req) + chr(10))\n"
+        "proc.stdin.flush()\n"
+        "line = proc.stdout.readline()\n"
+        "proc.kill()\n"
+        "proc.wait(timeout=5)\n"
+        "with open(mcp_config_path + '.probe_response', 'w') as f:\n"
+        "    f.write(line)\n"
+        "print(json.dumps({'type': 'result', 'result': '{}'}))\n"
+        "sys.exit(0)\n"
+    )
+    fake_bin.chmod(0o755)
 
     settings = _settings_with_improve_backend("claude")
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "claude": settings.runner.claude.model_copy(
+                update={"bin": str(fake_bin)}),
+        }),
+    })
+
+    monkeypatch.setattr(
+        mw_mod, "_build_improve_registry",
+        lambda *, settings, workdir: fake_registry)
+    # `ClaudeRunner.run()` は `cli_started_sink` 経由で実際に `cli_started`
+    # フレームを送出する (`_make_on_message`/`_send_frame` 配線) — 実プロセス
+    # を起動するこのテストではその配線を素通りさせるため、
+    # protocol_out/out_seq に実物 (in-memory stream + SeqTracker) を渡す。
+    from agentic_fx.core.mission_protocol import SeqTracker
+    protocol_out = io.BytesIO()
+    out_seq = SeqTracker()
     runner = mw_mod._run_improve_mission(
-        settings=settings, workdir=tmp_path, protocol_out=None, out_seq=None)
+        settings=settings, workdir=tmp_path,
+        protocol_out=protocol_out, out_seq=out_seq)
+
+    sock_path = mw_mod.mcp_socket_path(tmp_path)
     assert runner._workdir == tmp_path
-    assert (tmp_path / "afx.sock").exists()
+    assert sock_path.exists(), "dispatcher が bind されていない"
+
+    mission = Mission(prompt="probe", tools=[], output_schema={"type": "object"},
+                      max_turns=1, timeout_sec=10.0)
+    runner.run(mission)
+
+    probe_path = tmp_path / "mcp.json.probe_response"
+    # fake claude CLI は接続の成否に関わらず probe ファイルを作る (接続
+    # 失敗時は `readline()` が `''` を返し、空ファイルが書かれる) —
+    # `exists()` だけでは「空ファイルが書かれた」ケースを「接続できた」と
+    # 誤読しうる (`json.loads("")` の `JSONDecodeError` に落ちるだけの、
+    # 意図と無関係な理由での fail)。中身が非空であることを明示的に
+    # assert してから decode する。
+    raw = probe_path.read_text() if probe_path.exists() else ""
+    assert raw.strip(), (
+        "fake claude CLI が argv の --mcp-config が指す socket パスへ "
+        "接続できなかった (bind パスと argv パスの不一致、B2-r2)")
+    resp = json.loads(raw)
+    tool_names = {t["name"] for t in resp["result"]["tools"]}
+    assert tool_names == {"probe_tool"}, (
+        "argv の socket パス経由で mission_worker が bind した dispatcher "
+        "に到達できなかった")
 
 
 def test_start_mcp_dispatcher_fails_closed_when_bind_fails(tmp_path):
-    """advisor 指摘 #1/#2 (A-4 検収是正): `McpShimDispatcher.serve_forever`
-    は daemon thread 内で走るため、`bind()` の例外は呼び出し元に伝わらない
-    (thread が黙って死ぬだけ)。`_start_mcp_dispatcher` はソケットが
-    実際に現れることを確認し、現れなければ fail closed で `RuntimeError`
-    を送出しなければならない — 黙って戻ると、CLI へ存在しない socket
-    path を渡し続け B1 (ツール 0 個) を再発させる。ここでは workdir の
-    親ディレクトリが存在しない状態を作り、bind (`ENOENT`) を確実に
-    失敗させて red/green を確認する。"""
+    """`_start_mcp_dispatcher` は `McpShimDispatcher.bind()` を呼び出し
+    スレッドで同期実行する (B1-r2 是正) — bind の例外はそのまま伝播し、
+    `_start_mcp_dispatcher` は `RuntimeError` を送出して fail closed に
+    なる。黙って戻ると、CLI へ存在しない socket path を渡し続け B1
+    (ツール 0 個) を再発させる。ここでは workdir の親ディレクトリが
+    存在しない状態を作り、bind (`ENOENT`) を確実に失敗させて
+    red/green を確認する。"""
     import agentic_fx.mission_worker as mw_mod
     from agentic_fx.tools.registry import ToolRegistry
 
@@ -663,3 +753,26 @@ def test_start_mcp_dispatcher_fails_closed_when_bind_fails(tmp_path):
     with pytest.raises(RuntimeError, match="failed to bind"):
         mw_mod._start_mcp_dispatcher(
             workdir=nonexistent_workdir, registry=ToolRegistry())
+
+
+def test_start_mcp_dispatcher_fails_closed_when_socket_path_is_masked_by_directory(
+        tmp_path):
+    """B1-r2 是正の回帰テスト (検収 B1-r2 (a) の決定的 masking probe)。
+
+    旧実装 (`sock_path.exists()` を 3 秒ポーリングして bind 成否を判定) は
+    「そのパスに何か在るか」という代理観測でしかなく、bind 前から
+    `workdir/afx.sock` が (例えばディレクトリとして) 既に存在していると
+    `unlink()` が `IsADirectoryError` (OSError のサブクラス) で失敗して
+    bind が絶対に成功しないにもかかわらず、`ready: ok=True` を返していた
+    — B1 (ツール 0 個) と区別のつかない症状を黙って再導入する。
+    ここでは `afx.sock` を先にディレクトリとして作っておき、
+    `_start_mcp_dispatcher` が `RuntimeError` で fail closed することを
+    pin する (旧 `exists()` ポーリング実装ではこのケースを検出できない
+    — ENOENT だけを見るテストが偶然正しい代理になっていた唯一のケース
+    だったため)。"""
+    import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.tools.registry import ToolRegistry
+
+    (tmp_path / "afx.sock").mkdir()
+    with pytest.raises(RuntimeError, match="failed to bind"):
+        mw_mod._start_mcp_dispatcher(workdir=tmp_path, registry=ToolRegistry())

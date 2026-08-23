@@ -85,7 +85,12 @@ class CliRunner(AgentRunner):
     def _max_turns_semantics(self) -> Literal["passthrough", "ignored"]: ...
 
     def run(self, mission: Mission) -> MissionResult:
-        mcp_socket = self._workdir / "afx.sock"
+        # B2-r2 是正: bind 側 (`mission_worker._start_mcp_dispatcher`) と
+        # 同じ `mcp_socket_path()` から導出する — 独立したリテラルの
+        # 偶然の一致に頼らない (検収 B2-r2、`cli_runner.py:88` のパス
+        # 変異が全スイートを生き延びた指摘への対応)。
+        from agentic_fx.mission_worker import mcp_socket_path
+        mcp_socket = mcp_socket_path(self._workdir)
         inner_argv = self._build_argv(mission, mcp_socket=mcp_socket)
         env = self._build_env(mission)
         launcher_argv = self._build_launcher_argv(

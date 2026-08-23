@@ -1103,6 +1103,64 @@ def test_result_frame_carries_null_reason_for_improve_profile(
     assert result_frame["reason"] is None
 
 
+def test_ready_is_sent_only_after_mcp_dispatcher_socket_is_bound_for_improve_profile(
+        monkeypatch, tmp_path):
+    """RW6 是正 pin (プラン10 着手前検証 rulings 末尾): improve worker は
+    「`afx.sock` bind + registry 構築 → `ready` 送出 → `go` 待ち」の順で
+    動く — `go` 待ち自体は Task 9 再工事 (t9b) が配線するためここでは
+    触れないが、「`ready` の前に dispatcher が上がっている」ことは本是正
+    (r2) の責務であり pin する。
+
+    `_send_frame` を monkeypatch でラップし、`type="ready"` のフレームが
+    実際に送出される**直前**の時点で `workdir/afx.sock` が存在し、
+    実際に `connect()` できることを観測する (親の `on_ready` コールバック
+    が読む時点に相当)。`_start_mcp_dispatcher` (bind を含む) の呼び出しを
+    `ready` 送出の後へ移す変異は、この時点でまだ socket が存在しないため
+    red になる。"""
+    import socket as socket_mod
+
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda *args, **kwargs: None)
+    monkeypatch.chdir(tmp_path)
+
+    observed: dict = {}
+    orig_send_frame = mission_worker._send_frame
+
+    def spy_send_frame(protocol_out, out_seq, frame):
+        if frame.get("type") == "ready" and "sock_exists" not in observed:
+            sock_path = tmp_path / "afx.sock"
+            observed["sock_exists"] = sock_path.exists()
+            if observed["sock_exists"]:
+                try:
+                    with socket_mod.socket(socket_mod.AF_UNIX,
+                                           socket_mod.SOCK_STREAM) as s:
+                        s.connect(str(sock_path))
+                    observed["sock_connect_ok"] = True
+                except OSError:
+                    observed["sock_connect_ok"] = False
+        return orig_send_frame(protocol_out, out_seq, frame)
+
+    monkeypatch.setattr(mission_worker, "_send_frame", spy_send_frame)
+
+    def settings_mutator(settings_dict):
+        pass  # improve は既定 settings のまま (backend=local)
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve",
+                             "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-rw6-test",
+                             "staging_dir": str(tmp_path / "staging" / "m-rw6-test"),
+                             "source_snapshot_dir": str(tmp_path / "source")},
+        settings_mutator=settings_mutator)
+
+    assert frames[0]["type"] == "ready"
+    assert observed.get("sock_exists") is True, (
+        "ready 送出時点で afx.sock が bind されていない (RW6)")
+    assert observed.get("sock_connect_ok") is True, (
+        "ready 送出時点で afx.sock へ接続できない (RW6)")
+
+
 def test_main_fails_closed_when_improve_backend_is_claude_without_bin_key(
         monkeypatch, tmp_path):
     """(着手前検証 Blocking 8) improve backend=claude で settings_dict
