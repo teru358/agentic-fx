@@ -313,16 +313,30 @@ class WorkerRunner(AgentRunner):
             try:
                 ready = self._wait_with_stop(
                     ready_queue, timeout=w.worker_startup_timeout_sec)
-                if self._on_ready is not None:
-                    try:
-                        self._on_ready(ready)
-                    except Exception:  # noqa: BLE001
-                        _log.exception("on_ready callback failed")
-                if not ready.get("ok", False):
-                    status = "failed"
-                    return MissionResult(status, None, transcript)
             except queue.Empty:
                 self._escalate_kill(proc, w)
+                return MissionResult("failed", None, transcript)
+
+            if self._on_ready is not None:
+                try:
+                    self._on_ready(ready)
+                except Exception as e:  # noqa: BLE001 — 裁定 R-D1: pre-ready
+                    # 失敗として扱う。呼び出し元 (ImproveSupervisor) が
+                    # commit 前 (mark_running 前) の失敗と区別できるよう、
+                    # 子を SIGTERM→SIGKILL で kill して即 failed を返す
+                    # (子は ready 送出直後に実行を継続する実装のままなので、
+                    # ここで kill しない限り commit していない slot に紐付く
+                    # 実行が走り続けてしまう — 裁定 R-D1 は「on_ready が
+                    # 例外を投げたら子を kill して failed を返す」ことだけを
+                    # 要求し、新規プロトコルフレームの追加は明示的に不要と
+                    # している。設計書 プラン 9.3 節「実装時改訂 R-D1」参照)。
+                    _log.exception("on_ready callback failed")
+                    self._escalate_kill(proc, w)
+                    return MissionResult(
+                        "failed", None, transcript,
+                        reason=f"on_ready failed: {type(e).__name__}: {e}")
+
+            if not ready.get("ok", False):
                 return MissionResult("failed", None, transcript)
 
             deadline_budget = mission.timeout_sec + w.worker_grace_sec
