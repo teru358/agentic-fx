@@ -151,6 +151,28 @@ def _validate_kind(conn: sqlite3.Connection, meta: PluginMeta, *,
     raise ValueError(f"plugin {meta.name!r}: unsupported kind {meta.kind!r}")
 
 
+# precheck 2026-08-22 wave2: T11-B-11d
+def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
+                  settings: "Settings", now: datetime,
+                  sandbox_run: SandboxRunFn | None = None,
+                  run_in_sample_fn: RunInSampleFn | None = None,
+                  ) -> tuple[dict, bool]:
+    """`_validate_kind` の public 名称 (11d §8.1-41 是正: `switch.py` の
+    `submit_candidate`/`bless_candidate` から共有呼び出しできるよう rename/
+    export するだけで、検証ロジックは一切変えない — 二重実装しない)。
+
+    R-i3 (統合裁定) は kind=strategy のとき `plugin/strategy_gate.py::
+    evaluate_strategy_adoption_gate` 経由での評価を求めるが、当該モジュール
+    は プラン10 Task 10 の産物でありこの worktree にはまだ存在しない
+    (この Step の指示どおり `_validate_kind` を改変せず rename/export に
+    留めているため、strategy kind は従来どおり `_validate_strategy` →
+    `holdout.run_in_sample` の直接呼び出しのまま — Task 10 実装後の
+    追随課題として残る。11d 最終報告の「逸脱」に明記する)。
+    """
+    return _validate_kind(conn, meta, settings=settings, now=now,
+                          sandbox_run=sandbox_run, run_in_sample_fn=run_in_sample_fn)
+
+
 def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
                   settings: "Settings", now: datetime,
                   pytest_runner: PytestRunnerFn | None = None,
@@ -261,16 +283,12 @@ def bless(conn: sqlite3.Connection, meta: PluginMeta, *, settings: "Settings",
          now: datetime, pytest_runner: PytestRunnerFn | None = None,
          sandbox_run: SandboxRunFn | None = None,
          run_in_sample_fn: RunInSampleFn | None = None) -> int:
-    """`submit_plugin` と同一の検証を実行し、成功したら即座に承認する
-    (D3)。検証失敗時は `submit_plugin` の例外がそのまま伝播し、
-    `approval_requests` 行は作らない (`decide` にも到達しない)。
-
-    CLI (`afx plugin bless`) からのみ呼ぶこと — 改善ループの tool 定義に
-    は絶対に載せない。
-    """
-    approval_id = submit_plugin(
-        conn, meta, settings=settings, now=now, pytest_runner=pytest_runner,
-        sandbox_run=sandbox_run, run_in_sample_fn=run_in_sample_fn)
-    approvals_store.decide(conn, approval_id, status="approved",
-                           decided_by="human_cli", now=now)
-    return approval_id
+    """裁定3 (プラン10 Task11g): live path (`plugins/<name>`) を候補に取る
+    bless は廃止された。live/plain の版ではなく `plugins/_human/<name>` を
+    候補に取る `switch.bless_candidate` (P3、`afx plugin bless --from _human`
+    経由) が唯一の bless 経路 — この旧 API は常に拒否する (materialize +
+    `bless --from _human` を案内するエラー)。"""
+    raise ValueError(
+        "afx plugin bless <name> は廃止されました。"
+        "'afx plugin materialize <name>' で候補を書き出し、編集してから "
+        "'afx plugin bless --from _human <name>' を実行してください。")

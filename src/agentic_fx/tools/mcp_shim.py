@@ -43,6 +43,14 @@ class McpShimDispatcher:
         # 分離することで、呼び出し元が bind の成否を直接 (例外として)
         # 観測できるようにする。
         self._server: socket.socket | None = None
+        # 段 0 申し送り 2: `close()` が意図的に呼ばれたことを示すフラグ。
+        # `serve_forever` の accept ループが `close()` 起因の `OSError`
+        # (Bad file descriptor 等) を「意図的な停止」として区別するため
+        # に使う — フラグを見ずに `except OSError: return` にすると、
+        # RLIMIT_NOFILE 枯渇 (EMFILE/ENFILE) 等の**意図しない** accept 失敗
+        # まで静かに dispatcher を止めてしまい、CLI 側は以降のツール呼び
+        # 出しが connection-refused になるだけで診断情報が残らない。
+        self._closing = False
 
     def bind(self) -> None:
         """`sock_path` へ同期で bind+listen する (B1-r2 是正)。
@@ -64,13 +72,48 @@ class McpShimDispatcher:
         server.listen(8)
         self._server = server
 
+    def close(self) -> None:
+        """dispatcher を停止する (段 0 申し送り 2)。
+
+        `server.close()` で `serve_forever` の `accept()` を脱出させ
+        (accept 中のブロッキング呼び出しは close 後に `OSError` を送出する
+        ため、`serve_forever` の `finally: server.close()` が二重 close に
+        なるが `socket.close()` は冪等なので害はない)、bind した
+        socket ファイルを削除する。呼び出し元 (`_run_improve_mission` の
+        戻り値を保持する `main()`) が Mission 終了時に呼ぶ想定 —
+        `bind()` していない (= `_server is None`) 状態での呼び出しは
+        no-op。"""
+        self._closing = True
+        if self._server is not None:
+            try:
+                self._server.close()
+            except OSError:
+                pass
+        try:
+            self._sock_path.unlink()
+        except FileNotFoundError:
+            pass
+
     def serve_forever(self) -> None:
         if self._server is None:
             self.bind()
         server = self._server
         try:
             while True:
-                conn, _ = server.accept()
+                try:
+                    conn, _ = server.accept()
+                except OSError:
+                    if self._closing:
+                        # `close()` が呼び出しスレッドから `server.close()`
+                        # した結果の `OSError` (Bad file descriptor 等) —
+                        # 意図的な停止なので、スレッドの未処理例外として
+                        # pytest/ログに漏らさず静かにループを抜ける。
+                        return
+                    # `close()` が呼ばれていない accept 失敗 (RLIMIT_NOFILE
+                    # 枯渇による EMFILE/ENFILE 等) は意図しない異常なので
+                    # 握りつぶさず再送出する — 診断情報 (thread traceback)
+                    # を残す。
+                    raise
                 threading.Thread(target=self._handle_conn, args=(conn,),
                                  daemon=True).start()
         finally:

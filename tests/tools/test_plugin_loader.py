@@ -69,7 +69,7 @@ def _write_plugin(base: Path, name: str, *, plugin_py: str = INDICATOR_PY,
 def _approve(conn, name: str, content_hash: str) -> int:
     aid = approvals.create(conn, "plugin",
                            {"name": name, "content_hash": content_hash}, NOW)
-    approvals.decide(conn, aid, status="approved", decided_by="shell", now=NOW)
+    approvals.apply_decision(conn, aid, status="approved", decided_by="shell", now=NOW)
     return aid
 
 
@@ -140,7 +140,7 @@ def test_approved_plugins_excludes_rejected_only(tmp_path, caplog):
     from agentic_fx.plugin.loader import content_hash
     aid = approvals.create(conn, "plugin",
                            {"name": "rejected_ind", "content_hash": content_hash(d)}, NOW)
-    approvals.decide(conn, aid, status="rejected", decided_by="shell", now=NOW,
+    approvals.apply_decision(conn, aid, status="rejected", decided_by="shell", now=NOW,
                      reason="quality")
 
     with caplog.at_level(logging.WARNING):
@@ -435,7 +435,7 @@ def _decide(conn, name: str, content_hash: str, *, status: str,
     approved 固定のヘルパとして残す (既存テストの呼び出しを変えない)。"""
     aid = approvals.create(conn, "plugin",
                            {"name": name, "content_hash": content_hash}, now)
-    approvals.decide(conn, aid, status=status, decided_by="shell", now=now)
+    approvals.apply_decision(conn, aid, status=status, decided_by="shell", now=now)
     return aid
 
 

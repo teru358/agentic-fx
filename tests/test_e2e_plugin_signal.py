@@ -118,7 +118,7 @@ def _submit_and_approve(root: Path) -> None:
     approval_id = approval.submit_plugin(
         conn, meta, settings=settings, now=H, pytest_runner=_ok_pytest_runner,
         run_in_sample_fn=_fake_run_in_sample)
-    approvals_store.decide(conn, approval_id, status="approved",
+    approvals_store.apply_decision(conn, approval_id, status="approved",
                            decided_by="human_reviewer", now=H)
     conn.close()
 

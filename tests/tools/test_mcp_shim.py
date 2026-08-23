@@ -92,6 +92,67 @@ def test_initialize_rejects_unknown_protocol_version(tmp_path):
     assert "result" not in resp
 
 
+def test_initialize_rejects_missing_protocol_version_key(tmp_path):
+    """段 0 M15 pin: `params` は在るが `protocolVersion` キーが無いケース
+    (メモリ 6.6 の 3 値問題 — 非空値/不一致値の他に「欠落」を渡す)。
+    `requested = (params or {}).get("protocolVersion")` は `None` になり、
+    `None != self.protocol_version` で不一致 → fail closed が正。変異
+    (`requested is not None and requested != self.protocol_version` に
+    書き換えて None を素通しする) だとこのケースだけ `result` が返る。"""
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": {}})
+    assert "error" in resp
+    assert "result" not in resp
+
+
+def test_initialize_rejects_missing_params_key(tmp_path):
+    """段 0 M15 pin: `params` 自体が無いケース (`req.get("params") or {}`
+    で `{}` に落ちる) でも `protocolVersion` 欠落として fail closed。"""
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+    assert "error" in resp
+    assert "result" not in resp
+
+
+def test_tools_call_passes_allowed_list_not_all_registry_names_to_execute(tmp_path):
+    """段 0 M14 pin: `tools/call` の内側防御 — `registry.execute` の第 3
+    引数は `self._allowed` そのものでなければならず、`self._registry.names()`
+    (登録済み全ツール名) にすり替えてはならない。今日の配線 (
+    `_start_mcp_dispatcher` は `allowed=registry.names()` を渡す) では
+    外側の `name not in self._allowed` 検査が先に落とすため機能的には
+    等価だが (stage0-bundle-A.md §2.4)、`allowed` を第 3 引数として実際に
+    渡していることを spy で確認しておけば、将来 allowed が names() の
+    真部分集合になっても (Task 10) 内側防御が生きたまま保たれる。"""
+    reg = _make_registry()
+    captured: dict = {}
+    orig_execute = reg.execute
+
+    def spy_execute(name, arguments, allowed):
+        captured["allowed"] = list(allowed)
+        return orig_execute(name, arguments, allowed)
+
+    reg.execute = spy_execute
+
+    sock_path = tmp_path / "afx.sock"
+    dispatcher = McpShimDispatcher(sock_path=sock_path, registry=reg,
+                                   allowed=["slow_echo"])
+    t = threading.Thread(target=dispatcher.serve_forever, daemon=True)
+    t.start()
+    deadline = time.monotonic() + 3.0
+    while not sock_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                            "params": {"name": "slow_echo", "arguments": {"x": 1}}})
+    assert "result" in resp
+    assert captured.get("allowed") == ["slow_echo"], (
+        "registry.execute へ渡った allowed が self._allowed と一致しない (M14)")
+    assert captured["allowed"] != reg.names(), (
+        "registry.execute へ registry.names() (全ツール名) が渡っている — "
+        "self._allowed とのすり替えが疑われる (M14)")
+
+
 def test_tools_list_returns_registered_tools_only_from_allowed(tmp_path):
     dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
     resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 2, "method": "tools/list",

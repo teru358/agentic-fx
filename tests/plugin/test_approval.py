@@ -625,32 +625,37 @@ def test_plugin_py_rejected_source_creates_no_row(tmp_path, settings):
     assert _count_rows(conn) == 0
 
 
-# --- ⑥ bless 成功で approved 行 / 検証失敗で何も作らない -----------------
+# --- ⑥ bless (旧 API) は裁定3で常に拒否・何も作らない -------------------
+# プラン10 Task11g 裁定3: live path (plugins/<name>) を候補に取る旧
+# `approval.bless()` は廃止され常に拒否する (materialize + `bless --from
+# _human` を案内するエラー)。以下 2 本は旧テスト
+# `test_bless_success_creates_approved_row`/`test_bless_validation_failure_
+# creates_no_row` を置換 (逐語の11箇所リストに無い既存テスト破壊 — 裁定3の
+# 直接の帰結、最終報告の「逸脱」に明記)。
 
-def test_bless_success_creates_approved_row(tmp_path, settings):
+
+def test_bless_legacy_api_always_rejected_creates_no_row(tmp_path, settings):
     d = _write_plugin(tmp_path, "ind", kind="indicator", plugin_py=INDICATOR_PY,
                       config_yaml="kind: indicator\n")
     meta = _indicator_meta(d)
     conn = _conn(tmp_path)
 
-    approval_id = approval.bless(conn, meta, settings=settings, now=NOW,
-                                 pytest_runner=_ok_pytest_runner)
-
-    row = conn.execute(
-        "SELECT status, decided_by FROM approval_requests WHERE id=?",
-        (approval_id,)).fetchone()
-    assert row["status"] == "approved"
-    assert row["decided_by"] == "human_cli"
-    assert approvals_store.pending(conn) == []  # もう pending ではない
+    with pytest.raises(ValueError, match="materialize"):
+        approval.bless(conn, meta, settings=settings, now=NOW,
+                       pytest_runner=_ok_pytest_runner)
+    assert _count_rows(conn) == 0
+    assert approvals_store.pending(conn) == []
 
 
-def test_bless_validation_failure_creates_no_row(tmp_path, settings):
+def test_bless_legacy_api_rejected_even_when_gate_would_have_failed(tmp_path, settings):
+    """検証が失敗するはずの入力でも、bless(旧API) は検証に到達する前に
+    拒否する (裁定3のエラーが検証結果より優先する)。"""
     d = _write_plugin(tmp_path, "ind", kind="indicator", plugin_py=INDICATOR_PY,
                       config_yaml="kind: indicator\n")
     meta = _indicator_meta(d)
     conn = _conn(tmp_path)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="materialize"):
         approval.bless(conn, meta, settings=settings, now=NOW,
                        pytest_runner=_fail_pytest_runner)
     assert _count_rows(conn) == 0
@@ -845,8 +850,14 @@ def test_entry_plugin_submit_dispatches_to_approval_submit_plugin(
     assert "42" in capsys.readouterr().out
 
 
-def test_entry_plugin_bless_dispatches_to_approval_bless(
+def test_entry_plugin_bless_without_from_is_always_rejected(
         tmp_path, monkeypatch, capsys):
+    """プラン10 Task11 裁定3是正: `afx plugin bless <name>` (--from なし) は
+    もはや `approval.bless` へ dispatch しない — 常に拒否し
+    'afx plugin materialize' を案内する (旧テスト
+    `test_entry_plugin_bless_dispatches_to_approval_bless` を置換。11e Step5
+    の CLI 配線変更に伴う既存テスト書き換え — 逐語の 11 箇所リストには
+    無いが、裁定3 の直接の帰結として最終報告の「逸脱」に明記する)。"""
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
     _write_cli_indicator_plugin(tmp_path / "plugins", "ind")
@@ -854,15 +865,13 @@ def test_entry_plugin_bless_dispatches_to_approval_bless(
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
          patch("agentic_fx.entry.service.run_service") as run_service, \
          patch("agentic_fx.plugin.approval.bless") as bless_mock:
-        bless_mock.return_value = 7
         rc = main(["plugin", "bless", "ind"])
 
-    assert rc == 0
+    assert rc != 0
     run_service.assert_not_called()
-    assert bless_mock.called
-    args, kwargs = bless_mock.call_args
-    assert args[1].name == "ind"
-    assert "7" in capsys.readouterr().out
+    assert not bless_mock.called
+    # 検収 m9 是正: 他の全 CLI エラーと同じく stderr へ統一 (旧稿は stdout)
+    assert "materialize" in capsys.readouterr().err
 
 
 def test_entry_plugin_submit_not_found_rc1(tmp_path, monkeypatch, capsys):

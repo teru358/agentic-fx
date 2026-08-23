@@ -15,21 +15,22 @@ def _conn(tmp_path):
     return c
 
 
-def test_create_and_decide(tmp_path):
+def test_create_and_apply_decision(tmp_path):
+    """decide() 削除 (裁定1、Task11): apply_decision へ機械置換。"""
     c = _conn(tmp_path)
     aid = approvals.create(c, "tech_plugin", {"path": "plugins/tech/rsi"}, NOW)
     assert len(approvals.pending(c)) == 1
-    approvals.decide(c, aid, status="approved", decided_by="shell", now=NOW)
+    approvals.apply_decision(c, aid, "approved", decided_by="shell", now=NOW)
     assert approvals.pending(c) == []
 
 
-def test_double_decide_rejected(tmp_path):
+def test_double_apply_decision_rejected(tmp_path):
     c = _conn(tmp_path)
     aid = approvals.create(c, "news_source", {"url": "https://x"}, NOW)
-    approvals.decide(c, aid, status="rejected", decided_by="shell", now=NOW,
-                     reason="低品質")
+    approvals.apply_decision(c, aid, "rejected", decided_by="shell", now=NOW,
+                             reason="低品質")
     with pytest.raises(AlreadyDecidedError):
-        approvals.decide(c, aid, status="approved", decided_by="shell", now=NOW)
+        approvals.apply_decision(c, aid, "approved", decided_by="shell", now=NOW)
 
 
 def test_expire_due(tmp_path):
@@ -48,32 +49,39 @@ def test_pending_filter_by_kind(tmp_path):
     assert len(approvals.pending(c, kind="tech_plugin")) == 1
 
 
-def test_decide_rejects_expired_approval_and_marks_expired(tmp_path):
+def test_apply_decision_approve_on_expired_pending_leaves_status_pending(tmp_path):
+    """裁定1・プラン11の意味論書き換え (旧 `test_decide_rejects_expired_
+    approval_and_marks_expired` を置換): `decide()` は rowcount=0 のとき
+    期限切れ行をこの場で expired 確定して commit する 2 段 commit 挙動を
+    持っていたが、`apply_decision` は副作用ゼロで `AlreadyDecidedError` を
+    送出するだけ (期限切れ pending は pending のまま残る — 本物の expired
+    化は `process_expired_approvals`/`apply_decision(status='expired')` の
+    責務、§4.3/裁定1)。"""
     c = _conn(tmp_path)
     aid = approvals.create(c, "live_trade", {"pair": "USDJPY"}, NOW,
                            expires_at=NOW + timedelta(minutes=15))
     later = NOW + timedelta(minutes=16)
     with pytest.raises(AlreadyDecidedError):
-        approvals.decide(c, aid, status="approved", decided_by="shell", now=later)
+        approvals.apply_decision(c, aid, "approved", decided_by="shell", now=later)
     row = c.execute("SELECT status FROM approval_requests WHERE id=?", (aid,)).fetchone()
-    assert row["status"] == "expired"
+    assert row["status"] == "pending"
 
 
-def test_decide_boundary_expires_at_equal_now_is_still_valid(tmp_path):
+def test_apply_decision_boundary_expires_at_equal_now_is_still_valid(tmp_path):
     c = _conn(tmp_path)
     aid = approvals.create(c, "live_trade", {"pair": "USDJPY"}, NOW,
                            expires_at=NOW + timedelta(minutes=15))
     boundary = NOW + timedelta(minutes=15)
-    approvals.decide(c, aid, status="approved", decided_by="shell", now=boundary)
+    approvals.apply_decision(c, aid, "approved", decided_by="shell", now=boundary)
     row = c.execute("SELECT status FROM approval_requests WHERE id=?", (aid,)).fetchone()
     assert row["status"] == "approved"
 
 
-def test_decide_rejects_pending_status_value(tmp_path):
+def test_apply_decision_rejects_pending_status_value(tmp_path):
     c = _conn(tmp_path)
     aid = approvals.create(c, "tech_plugin", {"path": "x"}, NOW)
     with pytest.raises(ValueError):
-        approvals.decide(c, aid, status="pending", decided_by="shell", now=NOW)
+        approvals.apply_decision(c, aid, "pending", decided_by="shell", now=NOW)
     row = c.execute(
         "SELECT status, decided_by, decided_at FROM approval_requests WHERE id=?",
         (aid,)).fetchone()
@@ -82,11 +90,16 @@ def test_decide_rejects_pending_status_value(tmp_path):
     assert row["decided_at"] is None
 
 
-def test_decide_rejects_unknown_status_value(tmp_path):
+def test_apply_decision_rejects_unknown_status_value(tmp_path):
+    """旧 `test_decide_rejects_unknown_status_value` は `status="invalidated"`
+    を「未知」として拒否させていたが、`apply_decision` は
+    `approved|rejected|invalidated|expired` の 4 値を許容するため
+    `"invalidated"` はもはや未知ではない (意味論の差異) — 真に未対応の値
+    (`"bogus"`) へ差し替える。"""
     c = _conn(tmp_path)
     aid = approvals.create(c, "tech_plugin", {"path": "x"}, NOW)
     with pytest.raises(ValueError):
-        approvals.decide(c, aid, status="invalidated", decided_by="shell", now=NOW)
+        approvals.apply_decision(c, aid, "bogus", decided_by="shell", now=NOW)
     row = c.execute("SELECT status FROM approval_requests WHERE id=?", (aid,)).fetchone()
     assert row["status"] == "pending"
 

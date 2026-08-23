@@ -217,6 +217,34 @@ def test_build_runner_trade_claude_allowed_tools_excludes_bash(tmp_path, monkeyp
     assert "Bash" not in captured["allowed_tools"]
 
 
+def test_build_runner_improve_claude_allowed_tools_includes_edit_tools(
+        tmp_path, monkeypatch):
+    """段 0 M17 pin: profile=improve + backend=claude のとき `allowed_tools`
+    が trade と異なり `Bash`/`Read`/`Write`/`Edit`/`Glob`/`Grep` を含む
+    **完全一致**であること (§1.6: 改善ループは `plugins/` を編集できる必要が
+    ある)。`in` 判定だけでは 1 要素の欠落を取り逃す (メモリ 6.8) ため、
+    リスト全体を等値比較する — 段 0 変異スイープ M17: `build_runner` の
+    `allowed_tools=(... if profile == "trade" else [...])` の条件式ごと
+    trade 側 (`["mcp__afx__*"]`) に潰す変異が、この pin が無い状態では
+    全スイート green のまま生存した (improve の Mission が Bash 系ツールを
+    一つも持たずに起動し、改善ループの存在理由そのものを失う致命的な
+    退行)。`test_build_runner_trade_claude_allowed_tools_excludes_bash`
+    と対で置く。"""
+    from agentic_fx.config import load_settings
+
+    FakeClaudeRunner, captured = _install_fake_cli_runner_module(
+        monkeypatch, "agentic_fx.runners.claude_runner", "ClaudeRunner")
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": "claude"})})})
+    build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+    assert captured["allowed_tools"] == [
+        "mcp__afx__*", "Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+
+
 def test_build_runner_returns_real_claude_runner_class(tmp_path):
     """Task 2 完了後の real-class pin (束 A 申し送り item 7):
     build_runner(backend=claude) が実 ClaudeRunner クラスを返すことを確認。"""

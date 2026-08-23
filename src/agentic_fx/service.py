@@ -42,6 +42,7 @@ from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
 from agentic_fx.loops.trade_loop import _TRADE_TOOLS, TradeLoop
+from agentic_fx.plugin import switch
 from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner
@@ -326,7 +327,7 @@ def _check_codex_subscription_expiry(auth_file: str, *, clock=None) -> None:
             "codex chatgpt subscription expires soon: %s", active_until.isoformat())
 
 
-def _check_cli_backend(settings, *, which: str) -> None:
+def _check_cli_backend(settings, *, which: str):
     """<!-- precheck 2026-08-22: T1-M14 --> CLI backend 起動時検査 ①②③⑤
     (設計書 §1.4)。`which` は `"trade"` か `"improve"` — `getattr(settings.runner,
     which)` で対象の `RunnerChoice` を選ぶ。backend=local の環境では一切
@@ -338,17 +339,37 @@ def _check_cli_backend(settings, *, which: str) -> None:
     `settings.runner.improve` しか見なかったため、`runner.trade.backend=claude`
     構成では bin 解決も `--version` も認証ファイルもどれも未検査のまま
     Mission 実行時に初めて失敗していた (config は `trade.backend: claude`
-    を許容する — trade+codex のみ拒否)。"""
+    を許容する — trade+codex のみ拒否)。
+
+    **段 0 F1 是正**: `_resolve_cli_bin` が解決した絶対パスを、検証済みの
+    `settings` (`model_copy` で差し替えた新インスタンス) として呼び出し元へ
+    返す — 呼び出し元 (`build_app`) はこの戻り値で自身の `settings` を
+    差し替えること。旧実装は解決結果を捨てて `None` を返していたため、
+    `factory.build_runner`/`mission_worker._exec_closure_for` は生の
+    (相対のことがある) 設定値をそのまま使い続けていた。既定 config
+    (`runner.claude.bin: "claude"`、相対) では `launcher.build_launcher_argv`
+    が `ValueError` で拒否するのが Mission 実行時になって初めて判明する
+    (起動時検査①②③⑤は `shutil.which` 解決後の絶対パスで通ってしまうため
+    検出できない)。
+
+    検査⑤ (`_check_service_initial_env_has_no_secrets`) は claude/codex
+    共通 (backend=local を除く全 CLI backend) で 1 回だけ呼ぶ — 段 0 申し送り
+    1: 旧実装は claude 分岐でしか呼んでいなかったが、improve worker は
+    codex 分岐 (chatgpt/llama_swap とも) でも同 UID で `/proc/<pid>/environ`
+    を読めるため脅威モデルは同一。"""
     choice = getattr(settings.runner, which)
     backend = choice.backend
     if backend == "local":
-        return
+        return settings
     if backend == "claude":
         bin_path = _resolve_cli_bin(settings.runner.claude.bin, require_elf=False)
         _check_cli_version(bin_path)
         _check_credentials_file(settings.runner.claude.credentials_file,
                                 label="claude")
-        _check_service_initial_env_has_no_secrets(settings)
+        settings = settings.model_copy(update={
+            "runner": settings.runner.model_copy(update={
+                "claude": settings.runner.claude.model_copy(
+                    update={"bin": str(bin_path)})})})
     elif backend == "codex":
         bin_path = _resolve_cli_bin(settings.runner.codex.bin, require_elf=True)
         _check_cli_version(bin_path)
@@ -362,6 +383,12 @@ def _check_cli_backend(settings, *, which: str) -> None:
                     "runner.codex.provider='llama_swap' requires "
                     "improve.llama_swap_verified=true (set only after "
                     "`afx improve verify-backend` passes — Task 13)")
+        settings = settings.model_copy(update={
+            "runner": settings.runner.model_copy(update={
+                "codex": settings.runner.codex.model_copy(
+                    update={"bin": str(bin_path)})})})
+    _check_service_initial_env_has_no_secrets(settings)
+    return settings
 
 
 def run_init(root: Path) -> int:
@@ -760,10 +787,49 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                             notifier=notifier, clock=clock,
                             quote_fn=quote_fn, spec_fn=spec_fn, rate_fn=rate_fn)
 
+        plugins_dir = root / "plugins"
+
+        # プラン 10 Task 11f: 起動時 reconcile (journal-first) → 孤児掃除
+        # (sweep-last) → 期限切れ承認処理 (B-7: 裁定1の唯一の呼び出し元)。
+        # `missions.recover_interrupted` (上記) より後・`approved_plugins()`
+        # (直後) より前に配線する — reconcile 未実行のまま approved_plugins
+        # を呼ぶと、復旧した承認 (switched→decided で完了したもの) がその
+        # 起動ではロードされない (crash matrix、§8.1-34)。reconcile/sweep/
+        # expire のいずれかが例外を出してもサービス起動は止めない (§5.3 —
+        # plugin 承認だけが成立せず取引は動く)。
+        #
+        # 検収 m10 是正: 旧稿は 3 呼び出しを単一 try で括っていたため、
+        # reconcile が 1 行で落ちると同じ起動で sweep も expire も走らない
+        # (毎起動で再現し、人間が該当ジャーナル行を手で片付けるまで恒久的に
+        # 続く欠陥)。§5.1-1 の収束規則は「どちらでもない → ERROR で人間待ち」
+        # を行ごとの規則として書いており、reconcile 自身の per-row 分離
+        # (switch.py 側で実施済み) と対で、3 呼び出しも互いに独立させる —
+        # 呼び出し順序 (reconcile → sweep → expire) 自体は変えない。
+        try:
+            switch.reconcile_switch_journals(
+                conn_core, plugins_root=plugins_dir, now=clock.now(),
+                settings=settings, activity=activity)
+        except Exception as exc:
+            activity.write(Category.APPROVAL, "plugin_reconcile_failed",
+                           safe_error_text(exc))
+            # サービス起動は止めない (§5.3 — plugin 承認だけが成立せず取引は動く)
+        try:
+            switch.sweep_orphans(
+                conn_core, plugins_root=plugins_dir, now=clock.now(),
+                activity=activity)
+        except Exception as exc:
+            activity.write(Category.APPROVAL, "plugin_sweep_failed",
+                           safe_error_text(exc))
+        try:
+            switch.process_expired_approvals(  # B-7: 唯一の呼び出し元だった裁定1が本番で1度も動かない欠落を解消
+                conn_core, plugins_root=plugins_dir, now=clock.now())
+        except Exception as exc:
+            activity.write(Category.APPROVAL, "plugin_expire_failed",
+                           safe_error_text(exc))
+
         # プラン 7 Task 3: plugins/ 直下の承認済み plugin をロードする。反映は
         # 次回起動時のみ (hot reload しない — YAGNI)。plugins/ が存在しない環境
         # (未使用のデフォルト) でも approved_plugins は [] を返し起動を妨げない。
-        plugins_dir = root / "plugins"
         approved = plugin_loader.approved_plugins(conn_core, plugins_dir)
 
         # プラン 7 Task 8: signal producer (承認済み signal/strategy plugin の
@@ -781,8 +847,11 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             indicator_plugins=approved, provider=provider)
         # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
         _validate_startup(settings)
-        _check_cli_backend(settings, which="trade")
-        _check_cli_backend(settings, which="improve")
+        # 段 0 F1 是正: 戻り値 (bin を解決済み絶対パスへ書き戻した settings)
+        # で差し替える。この後に構築する WorkerRunner/registry が絶対パスの
+        # settings を受け取るようにするため、必ず WorkerRunner 構築より前に置く。
+        settings = _check_cli_backend(settings, which="trade")
+        settings = _check_cli_backend(settings, which="improve")
         _assert_tools_registered(registry, _TRADE_TOOLS)
 
         owns_runner = runner is None
@@ -935,7 +1004,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                             broker=shell_broker,
                             trade_loop=_SupervisorAsk(supervisor, ask_wait_timeout_sec),
                             activity=activity, log_dir=root / "logs", clock=clock,
-                            health_latch=health_latch)
+                            health_latch=health_latch,
+                            plugins_root=plugins_dir, settings=settings)
         return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
                    executor=executor, provider=provider, econ=econ,
@@ -1253,8 +1323,8 @@ def run_service(root: Path, *, daemon: bool = False,
     # 未起動の watchdog を見る) が開くだけだった (レビュー2周目 codex)。
     # 構築を両方先に済ませるのは `scheduler_thread` が参照する `wd` を
     # 束縛しておくため。
-    th = threading.Thread(target=scheduler_thread, daemon=True)
-    wd = threading.Thread(target=watchdog_thread, daemon=True)
+    th = threading.Thread(target=scheduler_thread, daemon=True, name="scheduler")
+    wd = threading.Thread(target=watchdog_thread, daemon=True, name="watchdog")
     th.start()
     wd.start()
 

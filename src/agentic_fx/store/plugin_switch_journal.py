@@ -55,3 +55,14 @@ def list_non_terminal(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in conn.execute(
         "SELECT * FROM plugin_switch_journal WHERE phase NOT IN "
         "('decided','reverted') ORDER BY op_id")]
+
+
+def set_temp_path(conn: sqlite3.Connection, op_id: int, temp_path: str) -> None:
+    """確定した op_id から導出した temp_path で UPDATE する (Task 11 が追加)。
+
+    begin_switch_journal は insert() で op_id を先に割り当て、その直後に
+    この関数で正しい temp_path 値を UPDATE する 2 段構成。
+    """
+    conn.execute(
+        "UPDATE plugin_switch_journal SET temp_path=? WHERE op_id=?",
+        (temp_path, op_id))

@@ -2686,11 +2686,25 @@ def test_build_app_rejects_when_credentials_file_missing(tmp_path):
         build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
 
-def test_build_app_does_not_require_credentials_for_codex_llama_swap(tmp_path):
+def test_build_app_does_not_require_credentials_for_codex_llama_swap(
+        tmp_path, monkeypatch):
     """③ の裏: provider=llama_swap は auth_file 欠落でも起動時検査を通る
     (§1.1-2「provider=llama_swap は空の scratch CODEX_HOME で起動」)。
     `improve.llama_swap_verified=true` も併せて上書きする (さもないと
-    llama_swap 分岐自体が別理由で拒否する — 骨格 §1.1-2)。"""
+    llama_swap 分岐自体が別理由で拒否する — 骨格 §1.1-2)。
+
+    段 0 申し送り 1 是正 (検査⑤を codex 分岐でも呼ぶ) により
+    `_check_service_initial_env_has_no_secrets` がこの codex 経路でも
+    呼ばれるようになった。本テストは③ (認証ファイル必須の裏) だけを
+    見るため、実行環境自身の env (pytest 実行元の Claude Code セッションが
+    `CLAUDE_CODE_*TOKEN*` 等を export していることがある) に検査結果が
+    左右されないよう検査⑤を no-op にする — 検査⑤本体は別テスト
+    (`test_check_service_initial_env_has_no_secrets_*`) が pin 済み。"""
+    import agentic_fx.service as service_mod
+
+    monkeypatch.setattr(
+        service_mod, "_check_service_initial_env_has_no_secrets",
+        lambda settings, *, read_initial_env_names=None: None)
     vendor_codex = _find_vendor_codex_bin()
     if vendor_codex is None:
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
@@ -2860,15 +2874,155 @@ def test_build_app_rejects_llama_swap_when_not_verified(tmp_path):
         build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
 
-def test_build_app_wires_codex_subscription_expiry_check(tmp_path, monkeypatch):
-    """M13: codex+chatgpt のとき subscription expiry check が呼ばれる。"""
+# ============================================================================
+# 段 0 F1: 相対 CLI bin の絶対化書き戻し
+# ============================================================================
+
+def test_build_app_rewrites_relative_claude_bin_to_absolute_path(tmp_path, monkeypatch):
+    """F1: `runner.claude.bin: "claude"` (相対、config の既定値) でも
+    `build_app` 後は `app.settings.runner.claude.bin` が絶対パスに
+    書き戻されており、`launcher.build_launcher_argv` がその値を
+    argv[0] として受理する (相対パスは `ValueError` で拒否される —
+    `runners/launcher.py`)。
+
+    fake ELF (`\\x7fELF` マジックバイトのみの実行可能ファイル) を
+    `afx-fake-claude` という名前で PATH 上に置き、`_resolve_cli_bin` の
+    `shutil.which` 解決対象にする。`_check_cli_version` は `--version` を
+    実行するため、fake は shebang 付きシェルスクリプトとして書く
+    (ELF マジックはバイナリ判定に使われるのは codex 分岐の
+    `require_elf=True` のみ — claude は `require_elf=False` なので実行
+    できるファイルであれば足りる)。
+
+    このテストは F1 (書き戻し) だけを見るため、検査⑤
+    (`_check_service_initial_env_has_no_secrets`) を no-op にする — 実行
+    環境自身 (pytest を起動した Claude Code セッション) が
+    `CLAUDE_CODE_*TOKEN*` 等の秘密名パターンに一致する env を export して
+    いることがあり、検査⑤本体は実環境に依存させたくない
+    (検査⑤本体は別テストが pin 済み)。"""
+    import stat
+
     import agentic_fx.service as service_mod
-    
+    from agentic_fx.runners.launcher import build_launcher_argv
+
+    monkeypatch.setattr(
+        service_mod, "_check_service_initial_env_has_no_secrets",
+        lambda settings, *, read_initial_env_names=None: None)
+
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    fake_claude = bin_dir / "afx-fake-claude"
+    fake_claude.write_text("#!/bin/sh\nexit 0\n")
+    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IEXEC | 0o700)
+
+    import os as _os
+    old_path = _os.environ.get("PATH", "")
+
+    import pytest as _pytest
+    mp = _pytest.MonkeyPatch()
+    try:
+        mp.setenv("PATH", f"{bin_dir}:{old_path}")
+        root = _root_with_settings(tmp_path, runner={
+            "improve": {"backend": "claude", "model": "m"},
+            "claude": {"bin": "afx-fake-claude"}})
+        app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+        try:
+            resolved = app.settings.runner.claude.bin
+            assert Path(resolved).is_absolute(), (
+                f"F1 是正が効いていない — settings.runner.claude.bin が"
+                f"相対のまま: {resolved!r}")
+            # build_launcher_argv が拒否しない (ValueError を出さない) こと
+            argv = build_launcher_argv(_os.getpid(), [resolved])
+            assert argv[-1] == resolved
+        finally:
+            app.close()
+    finally:
+        mp.undo()
+
+
+def test_build_app_rewrites_relative_codex_bin_to_absolute_path(tmp_path, monkeypatch):
+    """F1 の裏 (codex 分岐): `runner.codex.bin` が相対 (PATH 解決) でも
+    書き戻し後は絶対パスになる。ELF 必須 (`require_elf=True`) なので
+    vendor native codex バイナリを使う (裁定 R5、無ければ skip)。相対値を
+    PATH 経由で解決させるため、vendor バイナリへの symlink を専用の
+    fake bin dir に置いて PATH の先頭に足す。検査⑤の no-op 理由は
+    `test_build_app_rewrites_relative_claude_bin_to_absolute_path` と同じ。"""
+    import agentic_fx.service as service_mod
+
+    monkeypatch.setattr(
+        service_mod, "_check_service_initial_env_has_no_secrets",
+        lambda settings, *, read_initial_env_names=None: None)
+
+    vendor_codex = _find_vendor_codex_bin()
+    if vendor_codex is None:
+        pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    link = bin_dir / "afx-fake-codex"
+    link.symlink_to(vendor_codex)
+
+    import os as _os
+    old_path = _os.environ.get("PATH", "")
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setenv("PATH", f"{bin_dir}:{old_path}")
+        root = _root_with_settings(tmp_path, runner={
+            "improve": {"backend": "codex", "model": "m"},
+            "codex": {"bin": "afx-fake-codex", "provider": "llama_swap",
+                      "auth_file": str(tmp_path / "absent")}},
+            improve={"llama_swap_verified": True})
+        app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+        try:
+            resolved = app.settings.runner.codex.bin
+            assert Path(resolved).is_absolute(), (
+                f"F1 是正が効いていない (codex) — settings.runner.codex.bin が"
+                f"相対のまま: {resolved!r}")
+        finally:
+            app.close()
+    finally:
+        mp.undo()
+
+
+def test_check_service_initial_env_has_no_secrets_is_called_for_codex_backend(
+        tmp_path, monkeypatch):
+    """段 0 申し送り 1: 検査⑤ (`_check_service_initial_env_has_no_secrets`)
+    は claude 分岐だけでなく codex 分岐でも呼ばれる (旧実装は claude 分岐
+    でしか呼んでいなかった — improve worker は codex 分岐でも同 UID で
+    `/proc/<pid>/environ` を読めるため脅威モデルは同じ)。"""
+    import agentic_fx.service as service_mod
+
+    def _raise(settings, *, read_initial_env_names=None):
+        raise RuntimeError("SOME_SERVICE_API_KEY leaked (codex branch)")
+
+    monkeypatch.setattr(service_mod, "_check_service_initial_env_has_no_secrets", _raise)
+    vendor_codex = _find_vendor_codex_bin()
+    if vendor_codex is None:
+        pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "codex", "model": "m"},
+        "codex": {"bin": vendor_codex, "provider": "llama_swap",
+                  "auth_file": str(tmp_path / "absent")}},
+        improve={"llama_swap_verified": True})
+    with pytest.raises(RuntimeError, match="API_KEY"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+
+
+def test_build_app_wires_codex_subscription_expiry_check(tmp_path, monkeypatch):
+    """M13: codex+chatgpt のとき subscription expiry check が呼ばれる。
+
+    段 0 申し送り 1 是正の理由で `_check_service_initial_env_has_no_secrets`
+    を no-op にする (上の `test_build_app_does_not_require_credentials_for_codex_llama_swap`
+    と同じ理由 — このテストは④の配線だけを見る)。"""
+    import agentic_fx.service as service_mod
+
+    monkeypatch.setattr(
+        service_mod, "_check_service_initial_env_has_no_secrets",
+        lambda settings, *, read_initial_env_names=None: None)
+
     call_count = [0]
-    
+
     def _check_expiry(auth_file, *, clock=None):
         call_count[0] += 1
-    
+
     monkeypatch.setattr(service_mod, "_check_codex_subscription_expiry", _check_expiry)
     vendor_codex = _find_vendor_codex_bin()
     if vendor_codex is None:
@@ -2881,3 +3035,83 @@ def test_build_app_wires_codex_subscription_expiry_check(tmp_path, monkeypatch):
     build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
     assert call_count[0] > 0, "_check_codex_subscription_expiry が呼ばれていない"
 
+
+
+# --- プラン10 Task11f: 起動時 reconcile 配線 pin (B-15/B-7/M6 是正) --------
+
+
+def test_service_startup_calls_reconcile_sweep_expire_then_approved_plugins_in_order(
+        tmp_path, monkeypatch):
+    """B-15/M6 の killer: build_app が switch.reconcile_switch_journals →
+    switch.sweep_orphans → switch.process_expired_approvals →
+    plugin_loader.approved_plugins の順で呼ぶことを、実際の service.py の
+    呼び出し経路 (unittest.mock.patch) で確認する。"""
+    import unittest.mock as mock
+    from agentic_fx.plugin import switch
+    from agentic_fx.tools import plugin_loader as plugin_loader_mod
+
+    _init(tmp_path)
+    fake = FakeRunner([MissionResult("completed",
+                                     {"action": "hold", "reasoning": "w"},
+                                     [])])
+    with mock.patch.object(switch, "reconcile_switch_journals") as m_reconcile, \
+         mock.patch.object(switch, "sweep_orphans") as m_sweep, \
+         mock.patch.object(switch, "process_expired_approvals") as m_expire, \
+         mock.patch.object(plugin_loader_mod, "approved_plugins", return_value=[]) as m_approved:
+        # 逸脱 (11f 実装時の実測): `manager.attach_mock` は「以後の」呼び出し
+        # しか `manager.mock_calls` へ記録しない (attach 前の呼び出しは
+        # 遡って記録されない) — `unittest.mock` の実装上の性質。プラン骨子は
+        # `build_app(...)` の後に `manager.attach_mock` する順で書かれていた
+        # ため、そのままでは `call_names == []` になり test 自体が常に失敗
+        # する (実測で確認、殺したいはずの M6/M7 変異を注入しなくても red)。
+        # `attach_mock` を `build_app` 呼び出し**前**に行う順序へ入れ替えた。
+        manager = mock.MagicMock()
+        manager.attach_mock(m_reconcile, "reconcile")
+        manager.attach_mock(m_sweep, "sweep")
+        manager.attach_mock(m_expire, "expire")
+        manager.attach_mock(m_approved, "approved")
+        build_app(tmp_path, runner=fake, clock=FixedClock(NOW),
+                  embedding_fn=FakeEmbedding())
+        call_names = [c[0] for c in manager.mock_calls]
+        assert call_names == ["reconcile", "sweep", "expire", "approved"]
+
+
+def test_service_startup_reconcile_failure_does_not_block_startup(tmp_path, monkeypatch):
+    """B-15/M7 の killer: reconcile が例外を出しても build_app が完走する
+    (try/except を実際に通す — service.py を実行して確認する)。"""
+    import unittest.mock as mock
+    from agentic_fx.plugin import switch
+
+    _init(tmp_path)
+    fake = FakeRunner([MissionResult("completed",
+                                     {"action": "hold", "reasoning": "w"},
+                                     [])])
+    with mock.patch.object(switch, "reconcile_switch_journals",
+                           side_effect=RuntimeError("git not found")):
+        app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    assert app is not None
+
+
+def test_service_startup_reconcile_failure_still_runs_sweep_and_expire(tmp_path, monkeypatch):
+    """検収 m10 の pin: 旧稿は reconcile/sweep/expire を単一 try で括って
+    いたため、reconcile が例外を出すと同じ起動で sweep も expire も走らな
+    かった (acceptance-task11.md m10)。3 呼び出しを別々の try で分離した
+    後は、reconcile が失敗しても sweep/expire は独立して実行されること。"""
+    import unittest.mock as mock
+    from agentic_fx.plugin import switch
+
+    _init(tmp_path)
+    fake = FakeRunner([MissionResult("completed",
+                                     {"action": "hold", "reasoning": "w"},
+                                     [])])
+    with mock.patch.object(switch, "reconcile_switch_journals",
+                           side_effect=RuntimeError("git not found")) as m_reconcile, \
+         mock.patch.object(switch, "sweep_orphans") as m_sweep, \
+         mock.patch.object(switch, "process_expired_approvals") as m_expire:
+        app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    assert app is not None
+    assert m_reconcile.called
+    assert m_sweep.called, "reconcile の失敗で sweep_orphans が道連れになった (m10 の欠陥)"
+    assert m_expire.called, "reconcile の失敗で process_expired_approvals が道連れになった (m10 の欠陥)"

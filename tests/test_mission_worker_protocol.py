@@ -1246,6 +1246,39 @@ def test_ready_is_sent_only_after_mcp_dispatcher_socket_is_bound_for_improve_pro
         "ready 送出時点で afx.sock へ接続できない (RW6)")
 
 
+def test_mcp_dispatcher_socket_is_closed_after_improve_mission_completes(
+        monkeypatch, tmp_path):
+    """段 0 申し送り 2 pin: `_run_improve_mission` が保持した dispatcher を
+    `main()` の improve 分岐が Mission 終了時に close する。旧実装は
+    `_start_mcp_dispatcher(...)` の戻り値を捨てており、参照が
+    `serve_forever` の daemon thread だけになるため socket の生死が
+    暗黙に GC タイミングへ依存していた — この pin は「`result` フレーム
+    送出後に `afx.sock` が unlink されている」ことを実ファイルで観測する
+    (`ready`/`go` の送出順序は上の RW6 テストが別途固定しており、ここでは
+    触れない)。"""
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda *args, **kwargs: None)
+    monkeypatch.chdir(tmp_path)
+
+    def settings_mutator(settings_dict):
+        pass  # improve は既定 settings のまま (backend=local)
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve",
+                             "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-close-test",
+                             "staging_dir": str(tmp_path / "staging" / "m-close-test"),
+                             "source_snapshot_dir": str(tmp_path / "source")},
+        settings_mutator=settings_mutator)
+
+    assert frames[-1]["type"] == "result"
+    sock_path = tmp_path / "afx.sock"
+    assert not sock_path.exists(), (
+        "Mission 終了後も afx.sock が残っている — dispatcher が close "
+        "されていない (段 0 申し送り 2)")
+
+
 def test_main_fails_closed_when_improve_backend_is_claude_without_bin_key(
         monkeypatch, tmp_path):
     """(着手前検証 Blocking 8) improve backend=claude で settings_dict

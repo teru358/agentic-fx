@@ -56,6 +56,17 @@ class ImproveSupervisor:
     def tick(self, now: datetime) -> None:
         if self._stop_event.is_set():
             return
+        # B-7 (裁定1): plugin approval の期限切れ処理は lock 外・毎 tick 実行
+        # (プラン10 Task11g Step6b — 改善 loop が長時間止まっている間に溜まった
+        # 期限切れ pending を取りこぼさないため、service.py 起動時 reconcile
+        # とは独立にここでも process_expired_approvals を呼ぶ)。
+        from agentic_fx.plugin import switch
+        expire_conn = db_mod.connect(self._db_path)
+        try:
+            switch.process_expired_approvals(
+                expire_conn, plugins_root=self._root / "plugins", now=now)
+        finally:
+            expire_conn.close()
         s = self._settings.schedule
         occurrence = latest_scheduled_occurrence(
             now, cadence=s.improve, at=s.improve_at,
