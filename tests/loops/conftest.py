@@ -74,13 +74,28 @@ def loop_and_ctx(loop_min, conn, tmp_path):
     source_snapshot_dir = tmp_path / "source"
     staging_dir.mkdir(parents=True, exist_ok=True)
     source_snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    # 10.4+ 節のテスト用に backlog 行を作っておく
+    # (test_out_of_partition_selection_is_not_rejected_only_logged が需要)
+    # ID 1, 2 は allowed_backlog_ids に含まれる
+    # ID 999 は存在するがまたれる allowed_backlog_ids に含まれない (out_of_partition 用)
+    backlog_store.add(conn, "idea-1", "user", NOW)
+    backlog_store.add(conn, "idea-2", "user", NOW)
+    # sqlite3 の AUTOINCREMENT は挙動が複雑なため、999 を直接挿入
+    conn.execute(
+        "INSERT INTO improvement_backlog (id, idea, source, status, created_at, "
+        "updated_at) VALUES (999, 'out-of-partition-idea', 'user', 'open', ?, ?)",
+        (NOW.isoformat(),) * 2)
+    conn.commit()
+
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
         "run_backtest": 600.0, "analyze_corr": 600.0})
     ctx = ImproveRunContext(
         mission_id=1, run_id=1, staging_dir=staging_dir,
-        source_snapshot_dir=source_snapshot_dir, allowed_backlog_ids=None,
+        source_snapshot_dir=source_snapshot_dir,
+        allowed_backlog_ids=frozenset({1, 2}),  # 10.4 用に設定
         slot_key=None, ledger=ledger, rpc_handlers={})
-    return loop_min, ctx
+    return loop_min, ctx, conn
 
 
 @pytest.fixture

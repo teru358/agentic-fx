@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import sqlite3
 import stat
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -35,6 +37,16 @@ if TYPE_CHECKING:
     from agentic_fx.store.rag import Rag  # precheck 2026-08-22 wave2: T10-B10
 
 _log = logging.getLogger("agentic_fx.improve_loop")
+
+_PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+@dataclass(frozen=True)
+class _InspectionVerdict:  # 新規命名
+    ok: bool
+    reason: str = ""
+    out_of_partition: bool = False
+    risk_gate_unsupported: bool = False
 
 
 def _artifact_hash_of(plugin_py: bytes, config_yaml: bytes,
@@ -314,6 +326,48 @@ class ImproveLoop:
                                     # WorkerRunner(..., run_context=ctx,
                                     # on_ready=on_ready) として完成
                                     # (precheck 2026-08-22 wave2: T10-B2/R-D1)
+
+    def _freeze_ledger(self, ctx: ImproveRunContext) -> None:
+        ctx.ledger.freeze()
+
+    def _inspect_output(self, output: dict, ctx: ImproveRunContext,
+                        conn=None) -> _InspectionVerdict:
+        artifact = output.get("artifact", {})
+        atype = artifact.get("type")
+        out_of_partition = False
+        selected_id = output.get("selected", {}).get("backlog_id")
+        if selected_id is not None:
+            if conn is not None:
+                row = conn.execute(
+                    "SELECT id FROM improvement_backlog WHERE id=?",
+                    (selected_id,)).fetchone()
+                if row is None:
+                    return _InspectionVerdict(
+                        ok=False, reason=f"selected.backlog_id {selected_id} "
+                                        "does not exist")
+            if (ctx.allowed_backlog_ids is not None
+                    and selected_id not in ctx.allowed_backlog_ids):
+                out_of_partition = True
+                self._activity.write(
+                    Category.IMPROVE, "out_of_partition",
+                    f"mission={ctx.mission_id} backlog_id={selected_id}")
+
+        if atype == "plugin":
+            name = artifact.get("name", "")
+            if not _PLUGIN_NAME_RE.match(name):
+                return _InspectionVerdict(
+                    ok=False, reason=f"artifact.name {name!r} is not in "
+                                    "canonical form", out_of_partition=out_of_partition)
+            # staging_dir/<name> の dirfd+lstat 検査は 10.6 節 (plugin ゲート)
+            # で実装する — ここでは name 正規形のみ (手順1の範囲)。
+            return _InspectionVerdict(ok=True, out_of_partition=out_of_partition)
+
+        if atype == "report" and artifact.get("proposal_kind") == "risk_gate":
+            return _InspectionVerdict(
+                ok=True, out_of_partition=out_of_partition,
+                risk_gate_unsupported=True)
+
+        return _InspectionVerdict(ok=True, out_of_partition=out_of_partition)
 
     def commit(self, *, mission, ctx, result, now):
         raise NotImplementedError  # 10.4〜10.11 節
