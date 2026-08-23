@@ -2606,12 +2606,19 @@ def test_real_improve_worker_on_ready_exception_leaves_no_surviving_child(
     で `killpg` の呼び出しだけを確認するため、実際に子が死ぬところまでは
     見ていない — ここでは本物の `mission_worker.py` 子プロセスを起動し、
     `on_ready` が例外を投げた後、実際の pid が `poll()` で非 None (終了
-    済み) になることを確認する。"""
+    済み) になることを確認する。子は on_ready 例外と競合して
+    `LocalRunner.run()` (llama-swap への実リクエスト) へ進みうる — 到達
+    不能アドレスへ差し替え、実サーバへリクエストを飛ばさない
+    (`test_real_improve_worker_ready_then_on_ready_then_result_ordering`
+    と同じ規律)。"""
     if not landlock_available():
         pytest.skip("Landlock not available on this kernel/architecture")
+    from tests.conftest import _LLAMA_SWAP_UNREACHABLE_URL
 
     root = _root(tmp_path)
     settings = SETTINGS.model_copy(update={
+        "llama_swap": SETTINGS.llama_swap.model_copy(
+            update={"base_url": _LLAMA_SWAP_UNREACHABLE_URL, "timeout_sec": 1}),
         "worker": SETTINGS.worker.model_copy(
             update={"worker_startup_timeout_sec": 15.0,
                     "worker_grace_sec": 5.0,
