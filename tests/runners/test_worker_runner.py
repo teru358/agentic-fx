@@ -1939,6 +1939,8 @@ def test_worker_runner_copies_claude_credentials_before_spawn(monkeypatch, tmp_p
         cfg_creds = Path(kw["cwd"]) / "cfg" / ".credentials.json"
         captured["cfg_creds_content"] = (
             cfg_creds.read_text() if cfg_creds.is_file() else None)
+        captured["cfg_creds_mode"] = (
+            cfg_creds.stat().st_mode & 0o777 if cfg_creds.is_file() else None)
         return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
 
     monkeypatch.setattr(subprocess, "Popen", spy)
@@ -1951,6 +1953,9 @@ def test_worker_runner_copies_claude_credentials_before_spawn(monkeypatch, tmp_p
     # M18 是正 (`verified-round1.md` 2.3): `.is_file()` だけでは
     # 「コピーせず空スタブを置く」変異を殺せない — 原本と内容一致まで見る。
     assert captured["cfg_creds_content"] == creds.read_text()
+    # M6 是正 (`stage0-bundle-A.md`): コピー先の mode が 0600 であることも
+    # 見る (`dest.chmod(0o600)` の削除への pin)。
+    assert captured["cfg_creds_mode"] == 0o600
 
 
 def test_worker_runner_does_not_copy_auth_json_for_codex_llama_swap(
@@ -1999,6 +2004,8 @@ def test_worker_runner_copies_auth_json_for_codex_chatgpt(monkeypatch, tmp_path)
         cfg_auth = Path(kw["cwd"]) / "cfg" / "auth.json"
         captured["cfg_auth_content"] = (
             cfg_auth.read_text() if cfg_auth.is_file() else None)
+        captured["cfg_auth_mode"] = (
+            cfg_auth.stat().st_mode & 0o777 if cfg_auth.is_file() else None)
         return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
 
     monkeypatch.setattr(subprocess, "Popen", spy)
@@ -2012,6 +2019,9 @@ def test_worker_runner_copies_auth_json_for_codex_chatgpt(monkeypatch, tmp_path)
     # M18 是正 (`verified-round1.md` 2.3): `.is_file()` だけでは
     # 「コピーせず空スタブを置く」変異を殺せない — 原本と内容一致まで見る。
     assert captured["cfg_auth_content"] == auth.read_text()
+    # M6 是正 (`stage0-bundle-A.md`): コピー先の mode が 0600 であることも
+    # 見る (`dest.chmod(0o600)` の削除への pin)。
+    assert captured["cfg_auth_mode"] == 0o600
 
 
 def test_worker_runner_rejects_credentials_file_that_is_a_symlink(monkeypatch, tmp_path):
@@ -3261,9 +3271,17 @@ def test_trade_claude_real_process_completes_via_factory_build_runner(
     # 中身 (認証コピー・observed_*.json) を検査したいため、cleanup だけ
     # 無効化した TemporaryDirectory 差し替えを使う (workdir は test 終了時
     # に明示的に消す)。
+    created_tempdirs: list[str] = []
+
     class _NoCleanupTempDir(wr_mod.tempfile.TemporaryDirectory):
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
+            # `captured_cwd["cwd"]` は `subprocess.Popen` の呼び出しに
+            # 依存する (認証コピー失敗等で早期 return すると Popen が
+            # 呼ばれず、生成した tempdir が /tmp にリークしたまま検知
+            # されない) — `TemporaryDirectory.__init__` の時点で name を
+            # 記録し、`finally` で確実に掃除する。
+            created_tempdirs.append(self.name)
             # `TemporaryDirectory` は `weakref.finalize` でも cleanup を
             # 登録する (`with` を抜けてインスタンス参照が無くなった時点で
             # GC 経由で発火する) — `__exit__` の無効化だけでは防げないため
@@ -3304,6 +3322,5 @@ def test_trade_claude_real_process_completes_via_factory_build_runner(
             "配線されていない疑い (段 0 検収 B1 と同型の欠落)")
     finally:
         import shutil as _shutil
-        cwd = captured_cwd.get("cwd")
-        if cwd is not None:
-            _shutil.rmtree(cwd, ignore_errors=True)
+        for d in created_tempdirs:
+            _shutil.rmtree(d, ignore_errors=True)

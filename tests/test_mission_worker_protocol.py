@@ -772,6 +772,125 @@ def test_main_routes_trade_claude_backend_through_factory_build_runner(
         "はず (registry 構築を経由しない変異への pin)")
 
 
+def test_main_trade_local_backend_does_not_bind_mcp_dispatcher(
+        monkeypatch, tmp_path):
+    """I-1 是正の条件化そのものの pin (`verified-round1.md` §4 修正範囲 1
+    「条件化するならその分岐自体を pin すること」)。trade.backend=local の
+    ときは CLI を経由しないため `afx.sock` を bind する必要が無い —
+    `_start_mcp_dispatcher` を無条件化する変異、または local でも bind
+    してしまう変異への pin。"""
+    monkeypatch.chdir(tmp_path)
+
+    dispatcher_calls: list[object] = []
+    orig_start = mission_worker._start_mcp_dispatcher
+
+    def spy_start(**kw):
+        dispatcher_calls.append(kw)
+        return orig_start(**kw)
+
+    monkeypatch.setattr(mission_worker, "_start_mcp_dispatcher", spy_start)
+
+    # 既定 (settings_mutator 無し) は trade.backend == "local"。
+    frames, _, _ = _drive_main(monkeypatch, tmp_path)
+
+    assert frames[-1]["type"] == "result"
+    assert frames[-1]["status"] == "completed"
+    assert dispatcher_calls == [], (
+        "trade+local でも _start_mcp_dispatcher が呼ばれている — "
+        "afx.sock を不要に bind している (I-1 条件化の pin)")
+    assert not (tmp_path / "afx.sock").exists()
+
+
+def test_main_trade_claude_backend_binds_mcp_dispatcher_before_ready(
+        monkeypatch, tmp_path):
+    """I-1 是正 codex 指摘 (d) の直接 pin: 「`ready` 受信時点で `afx.sock`
+    が bind されている」を、実プロセスの CLI 接続 (`test_worker_runner.py`
+    の実測は `runner.run()` = `go` 受領後まで進んで初めて CLI が socket に
+    触れるため、この性質そのものは検証していない) ではなく、`ready`
+    フレーム送出の**直前**の時点で socket が実在し `connect()` できることを
+    `_send_frame` spy で観測する (`test_ready_is_sent_only_after_mcp_dispatcher_socket_is_bound_for_improve_profile`
+    の trade 版)。"""
+    import socket as socket_mod
+
+    monkeypatch.chdir(tmp_path)
+
+    observed: dict = {}
+    orig_send_frame = mission_worker._send_frame
+
+    def spy_send_frame(protocol_out, out_seq, frame):
+        if frame.get("type") == "ready" and "sock_exists" not in observed:
+            sock_path = tmp_path / "afx.sock"
+            observed["sock_exists"] = sock_path.exists()
+            if observed["sock_exists"]:
+                try:
+                    with socket_mod.socket(socket_mod.AF_UNIX,
+                                           socket_mod.SOCK_STREAM) as s:
+                        s.connect(str(sock_path))
+                    observed["sock_connect_ok"] = True
+                except OSError:
+                    observed["sock_connect_ok"] = False
+        return orig_send_frame(protocol_out, out_seq, frame)
+
+    monkeypatch.setattr(mission_worker, "_send_frame", spy_send_frame)
+
+    class _FakeClaudeRunner:
+        def __init__(self):
+            self._afx_mcp_dispatcher = None
+
+        def run(self, mission):
+            from agentic_fx.runners.base import MissionResult
+            return MissionResult("completed", {"action": "no_trade"}, [],
+                                 reason=None)
+
+    monkeypatch.setattr(
+        mission_worker.runner_factory, "build_runner",
+        lambda *a, **kw: _FakeClaudeRunner())
+
+    def to_claude(d):
+        d["runner"]["trade"]["backend"] = "claude"
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path, settings_mutator=to_claude)
+
+    assert frames[0]["type"] == "ready"
+    assert observed.get("sock_exists") is True, (
+        "trade+claude で ready 送出時点で afx.sock が bind されていない")
+    assert observed.get("sock_connect_ok") is True, (
+        "trade+claude で ready 送出時点で afx.sock へ接続できない")
+
+
+def test_main_trade_claude_closes_mcp_dispatcher_after_mission_completes(
+        monkeypatch, tmp_path):
+    """trade+claude 版の段 0 申し送り 2 pin
+    (`test_mcp_dispatcher_socket_is_closed_after_improve_mission_completes`
+    の trade 版): Mission 終了後に `afx.sock` が unlink されている。"""
+    monkeypatch.chdir(tmp_path)
+
+    class _FakeClaudeRunner:
+        def __init__(self):
+            self._afx_mcp_dispatcher = None
+
+        def run(self, mission):
+            from agentic_fx.runners.base import MissionResult
+            return MissionResult("completed", {"action": "no_trade"}, [],
+                                 reason=None)
+
+    monkeypatch.setattr(
+        mission_worker.runner_factory, "build_runner",
+        lambda *a, **kw: _FakeClaudeRunner())
+
+    def to_claude(d):
+        d["runner"]["trade"]["backend"] = "claude"
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path, settings_mutator=to_claude)
+
+    assert frames[-1]["type"] == "result"
+    sock_path = tmp_path / "afx.sock"
+    assert not sock_path.exists(), (
+        "trade+claude の Mission 終了後も afx.sock が残っている")
+
+
 def test_set_resource_limits_sets_all_four_limits(monkeypatch):
     """`_set_resource_limits` が RLIMIT_AS/NOFILE/FSIZE/CORE の 4 本すべてを
     指定値ちょうどで設定する (実プロセスへ適用すると pytest 自体を壊すため
