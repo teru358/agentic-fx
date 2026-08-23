@@ -780,6 +780,29 @@ class ImproveRunContext:
     rpc_handlers: dict[str, Callable[[dict], dict]]   # "run_backtest" / "analyze_corr"
                                                         # → 読取専用接続ファクトリを内包
 
+# ============================================================
+# Task 1 が produces (Task 9/10 が consume) — go 実フレームの復元
+# src/agentic_fx/core/mission_protocol.py
+# ============================================================
+# <!-- precheck 2026-08-23 wave3: RW1 -->
+# 第2波再検証 BL-1 は「新規の go フレームは追加しない」判断を設計書
+# §1/§3.1/§7.1-5/§8.1-18 (「go 前は agent/ツール実行ゼロ」「go が来なければ
+# 副作用ゼロで終了」の protocol test を必須項目として明記) に反すると指摘し、
+# 指揮者裁定 RW1 (rulings.md) は「go は seq 付きの実フレーム」を正とした。
+# 骨格 Interfaces 節 L818-840 (旧稿)・9.3 冒頭・10.12 冒頭の「新設しない」
+# 記述は本改訂で撤回する。
+#
+# `FRAME_TYPES_PARENT_TO_CHILD` に "go" を追加する (現物は
+# `frozenset({"handshake", "tool_rpc_result"})` — Task 1 がこの frozenset
+# リテラルを `frozenset({"handshake", "tool_rpc_result", "go"})` へ置換する。
+# `FRAME_TYPES_CHILD_TO_PARENT` は変更なし)。`go` フレームは
+# `{"type": "go", "seq": <int>}` — 他の親→子フレームと同じ `seq` 単調増加
+# 系列 (handshake=1, 以降は `tool_rpc_result` と共有する 1 起点カウンタ、
+# 現物 `worker_runner.py` の `out_seq_holder`) に相乗りする。ペイロードは
+# 型名のみで足りる (子は `go` を受けたら即座に Mission を開始してよく、
+# 追加情報を必要としない)。
+FRAME_TYPES_PARENT_TO_CHILD = frozenset({"handshake", "tool_rpc_result", "go"})
+
 # src/agentic_fx/loops/improve_loop.py
 # precheck 2026-08-22 wave2: T10-B10 (rag 注入) / T10-B2・R-D1 (on_ready 方式)
 class ImproveLoop:
@@ -816,8 +839,9 @@ class ImproveLoop:
 # src/agentic_fx/runners/worker_runner.py の WorkerRunner
 # ============================================================
 # precheck 2026-08-22 wave2: T10-B2 T10-B17 R-D1 R-D2
+# <!-- precheck 2026-08-23 wave3: RW1 (b) を撤回・書き直し -->
 #
-# 現物 (main) は既に on_ready パラメータを持つが、2 点が R-D1 の設計と
+# 現物 (main) は既に on_ready パラメータを持つが、2 点が R-D1/RW1 の設計と
 # 食い違う (Task 1 側で実装時改訂が必要 — 本ブロックは Task 9/10 が依存する
 # 契約の記述であり、worker_runner.py 自体の編集は Task 1 の担当):
 #   (a) 現物は on_ready の例外を _log.exception で握り潰し、そのまま
@@ -826,14 +850,42 @@ class ImproveLoop:
 #       (pre-ready 失敗として扱う)」を要求する — except 節を「_terminate
 #       (kill pgid) → MissionResult('failed', None, transcript) を返して
 #       run() を抜ける」へ書き換える。
-#   (b) 現物は「go」フレームを子へ書かない (handshake 送出後、子は即座に
-#       実行を始める — 2 相ハンドシェイクが無い)。R-D1 の「on_ready から
-#       戻ったら自分で go フレームを書く」は、既存の一発 handshake 方式を
-#       維持したまま on_ready を「ready 直後のフック」として使うのであれば
-#       **不要な追加プロトコルフレームになる** — Task 1 は go フレームを
-#       新設せず、on_ready 完了後にそのまま既存の実行継続 (現物のロジック
-#       のまま) を行ってよい。「go を書く」という語は概念上の同期点を指す
-#       のであって、新規フレーム型の追加を必須にはしない。
+#   (b) 【RW1 で撤回・書き直し】現物は「go」フレームを子へ書かない
+#       (handshake 送出後、子は ready 直後に即座に実行を始める — 2 相
+#       ハンドシェイクが無い)。旧稿はここで「go フレームを新設せず、
+#       on_ready 完了後にそのまま既存の実行継続を行ってよい」と書いていたが、
+#       これは設計書 §1/§3.1/§7.1-5/§8.1-18 (「`go` 前は agent/ツール実行
+#       ゼロ」「`worker_startup_timeout_sec` 内に `go` が来なければ副作用
+#       ゼロで終了」を必須の protocol test として明記) に反する — 概念上の
+#       同期点では、この不変条件を子に強制することも検査することもできない
+#       (待つフレームが無ければ子は `ready` 送出直後に走り出す)。指揮者
+#       裁定 RW1 (rulings.md) によりこの判断は撤回する。**`go` は
+#       `core/mission_protocol.py` の `FRAME_TYPES_PARENT_TO_CHILD` に
+#       追加した実フレーム** (前ブロック参照) であり、`WorkerRunner.run()`
+#       は `on_ready` が設定されていれば `on_ready(ready)` を呼び、例外を
+#       投げずに戻った (もしくは `on_ready` が `None` で何もしなかった)
+#       直後、**`self._worker_profile == "improve"` のときだけ**
+#       `_run_with_child` の `dispatcher_loop` が `tool_rpc_result` の
+#       送出に使うのと**同じ `stdin_lock`/`out_seq_holder`** を使って
+#       `write_frame(proc.stdin, {"type": "go", "seq": out_seq_holder["n"] + 1})`
+#       を書いてから、既存の実行継続 (`ready.get("ok")` 判定 → 以降の
+#       イベントループ) へ進む。**`go` の送出条件は `on_ready is not None`
+#       ではなく `worker_profile == "improve"` そのもの** — `on_ready` は
+#       wave 起動 (`ImproveSupervisor._launch_slot`) だけが渡すコールバック
+#       であり、手動 one-shot (`submit_manual`、10.12 節) は `on_ready=None`
+#       のまま `WorkerRunner(worker_profile="improve", ...)` を構築する。
+#       子 (improve 分岐) は wave 起動か手動かを知らず**常に** `go` を待つ
+#       (§10.9b Step 12-4b/RW6) ため、`on_ready` の有無で `go` の送出可否を
+#       決めると手動 one-shot の子が `go` を永久に受け取れず
+#       `worker_startup_timeout_sec` で毎回 timeout する — この非対称を
+#       避けるため、`go` の送出は profile 判定のみに依存させる。trade
+#       profile (`worker_profile != "improve"`) では `go` を一切送らない
+#       (trade 子は `go` を待たない旧来のプロトコルを維持する — 未読の
+#       `go` フレームが後続の `tool_rpc_result` 読取と seq 衝突するのを
+#       防ぐ)。`on_ready` が例外を投げた場合 ((a) の kill 経路) は
+#       profile に関わらず `go` を書かずに子を kill する (pre-ready 失敗、
+#       `go` 前に副作用が発生していないことを子の `worker_startup_timeout_sec`
+#       側 timeout が独立に保証する — 二重の安全弁)。
 class WorkerRunner:
     def __init__(self, *, root: Path, settings, clock, rag: "Rag",
                 worker_profile: str = "trade",
@@ -14081,29 +14133,44 @@ EOF
 ### 9.3 3-way 起動プロトコル: `prepare()`(Tx-0, ImproveLoop 側) → `WorkerRunner.run()` → `on_ready` (`running` commit) → 完走 (§8.1-18)
 
 <!-- precheck 2026-08-22 wave2: T10-B2 R-D1 実装時改訂 -->
-**実装時改訂 (2026-08-22 深夜裁定 R-D1)**: 本節の見出し・以下の Step 1 の
-`_RecordingFakeWorkerRunner`/`spawn()`/`send_go()`/`run_to_completion()` は
-**撤回**する。`WorkerRunner` に 3 相 API (`spawn`/`send_go`/`run_to_completion`)
-は存在しない (public API は `close()`/`run(mission)` のみ、B2)。3-way 起動は
-**`on_ready` 方式**に統一する — `WorkerRunner.run()` は子の `ready` フレーム
+<!-- precheck 2026-08-23 wave3: RW1 — 「新規の go フレームは追加しない」を撤回 -->
+**実装時改訂 (2026-08-22 深夜裁定 R-D1、2026-08-23 裁定 RW1 で go の扱いを訂正)**:
+本節の見出し・以下の Step 1 の `_RecordingFakeWorkerRunner`/`spawn()`/
+`send_go()`/`run_to_completion()` は**撤回**する。`WorkerRunner` に 3 相 API
+(`spawn`/`send_go`/`run_to_completion`) は存在しない (public API は
+`close()`/`run(mission)` のみ、B2)。3-way 起動は **`on_ready` + `go` 実
+フレーム方式**に統一する — `WorkerRunner.run()` は子の `ready` フレーム
 受信直後に `on_ready(frame)` を呼び、`on_ready` が例外を投げたら子を kill
 して `MissionResult('failed', ...)` を返す (pre-ready 失敗)。正常時は
-`on_ready` から戻った後そのまま実行を継続し、完走の `MissionResult` を返す
-(新規の `go` フレームは追加しない — Interfaces 節「Task 1 が produces
-(R-D1/R-D2 実装時改訂)」ブロック参照)。
+`on_ready` から戻った直後に `go` フレーム (`core/mission_protocol.py` に
+`FRAME_TYPES_PARENT_TO_CHILD` の一員として追加、Interfaces 節「Task 1 が
+produces — go 実フレームの復元」ブロック参照) を子へ書いてから、既存の
+実行継続 (`ready.get("ok")` 判定 → 以降のイベントループ) へ進む。
+
+**旧稿の撤回理由 (RW1)**: 「新規フレーム型の追加を必須にしない」という
+旧稿の判断は、設計書 §1/§3.1/§7.1-5/§8.1-18 が要求する「`go` 前は
+agent/ツール実行ゼロ」「`worker_startup_timeout_sec` 内に `go` が来なければ
+副作用ゼロで終了」の protocol test と両立しない — 待つべきフレームが
+無ければ、子は `ready` 送出直後に走り出してしまい、この不変条件を子に
+強制することも検査することもできない。指揮者裁定 RW1 (rulings.md) は
+この判断を撤回し、`go` を実フレームとして復元することを正とした。子側
+(`mission_worker.py` improve 分岐) が `ready` 送出後に `go` を待つ実装は
+§10.9b Step 12-4b (RW6) が持つ。
 
 **具体的な逐語 Step (Task 10 節 10.12「`ImproveSupervisor._launch_slot`/
 `submit_manual` を R-D1 方式へ書き換える」が正)** を要約する:
 `_launch_slot` は `self._improve_loop.prepare(slot_key=(period_key, k),
-now=now, on_ready=lambda frame: self._mark_slot_running(period_key, k))`
-→ `runner.run(mission)` (1 回のブロッキング呼び出し) → `self._improve_loop.commit(...)`
-の直列呼び出しになる。`_mark_slot_running` が `improve_waves.mark_running`
-を呼ぶ (`ImproveSupervisor` 自身の write 接続・tx)。以下 Step 1〜N の本文・
-変異表は、この `_RecordingFakeWorkerRunner`/`run(mission)` 契約 (Task 10
-節 10.12 の「既存テスト改訂」ブロックが定義する新フェイク) に沿って
-実装時に書き直すこと — 旧稿の `spawn`/`send_go`/`run_to_completion` の
-呼び出し順序を検査する assert は「`prepare` → (`on_ready` 経由の)
-`mark_running` → `run` → `commit`」の順序 assert へ置き換える。
+now=now, on_ready=_on_ready)` (`_on_ready` は `improve_waves.mark_running`
+を呼ぶ内部クロージャ、下記 Step 3) → `runner.run(mission)` (1 回のブロッキング
+呼び出し — この内部で `WorkerRunner` が `on_ready` を呼び、戻ったら自分で
+`go` を書き、子の完走まで待つ) → `self._improve_loop.commit(...)` (**無条件**
+— RW3 改訂、9.5/10.10 節参照) の直列呼び出しになる。`go` フレームそのものの
+送出は `WorkerRunner` (Task 1) の内部でだけ起き、`ImproveSupervisor`/
+`ImproveLoop` からは見えない — 本節のフェイクは「`on_ready` が `run()` の
+内側で呼ばれ、`run()` が戻るまでに `go` に相当する内部同期点を経ている」
+ことを外形的に確認するに留め、`mission_protocol.py` のワイヤ形式そのもの
+(`seq` 検証・`stdin_lock`) は検証しない (それは Task 1 の worker_runner
+契約テストが実子プロセス相手に行う)。
 
 **Tx-0 (mission 生成 + run 生成 + `reserved→claimed` slot claim) の所有者は `ImproveLoop.prepare` (Task 10, 10.2 節)** — `ImproveSupervisor` 自身は `claim_slot` を直接呼ばない (統合裁定 R-i2、不変)。
 
@@ -14113,24 +14180,43 @@ now=now, on_ready=lambda frame: self._mark_slot_running(period_key, k))`
 
 ```python
 class _RecordingFakeWorkerRunner:
-    """WorkerRunner の代役。呼び出し順序だけを記録する (Task 1/4/5 の
-    実プロトコルはここでは検証しない — 骨格 Interfaces 節の
-    `WorkerRunner(..., worker_profile="improve", run_context=ctx)` の
-    構築タイミングのみを外形的に確認する)。"""
+    """WorkerRunner (Task 1) の代役。`run(mission)` 単発呼び出し契約
+    (R-D1) を満たす。`on_ready` はコンストラクタで受け取り (本物は
+    `ImproveLoop.prepare` が `WorkerRunner(..., on_ready=on_ready)` として
+    渡す — RW2 改訂)、`run()` の内側で呼ぶ。呼び出し後、実 WorkerRunner が
+    `on_ready` から戻った直後に書く `go` フレーム (RW1) の**外形的な代理**
+    として `events` に `"go"` を追記する — 実プロトコルの `go` フレーム
+    そのもの (`mission_protocol.py` の frame 型・`seq` 検証・
+    `stdin_lock`/`out_seq_holder` 共有) はここでは検証しない。それは
+    Task 1 の worker_runner 契約テストが実子プロセス相手に行う
+    (Interfaces 節「Task 1 が produces — go 実フレームの復元」ブロック
+    参照)。**単純化の注記**: 本物の `go` 送出条件は `on_ready is not None`
+    ではなく `worker_profile == "improve"` そのもの (submit_manual は
+    `on_ready=None` でも `go` を受け取る、10.12 節 RW1/RW2 改訂 参照) —
+    この fake は wave 起動 (`_launch_slot`、常に `on_ready` を渡す) だけを
+    対象にするため `on_ready is not None` を代理条件として使ってよい。"""
 
-    def __init__(self, events: list):
-        self._events = events
+    def __init__(self, events: list, *, on_ready=None,
+                result_status: str = "completed",
+                on_ready_raises: bool = False):
+        self.calls: list[str] = []
+        self._events = events if events is not None else self.calls
+        self._on_ready = on_ready
+        self._result_status = result_status
+        self._on_ready_raises = on_ready_raises
 
-    def spawn(self):
-        self._events.append("spawn")
-        return "ready"  # spawn 直後に ready を返す fake
-
-    def send_go(self):
-        self._events.append("go")
-
-    def run_to_completion(self):
-        self._events.append("run")
-        return {"status": "completed", "output": {}}
+    def run(self, mission):
+        self._events.append("run_start")
+        if self._on_ready is not None:
+            if self._on_ready_raises:
+                # 本物の WorkerRunner.run() は on_ready が例外を投げたら
+                # 子を kill し 'failed' を返す (pre-ready 失敗、R-D1) —
+                # go は書かない。
+                return MissionResult("failed", None, [])
+            self._on_ready({"ok": True})
+            self._events.append("go")
+        self._events.append("run_end")
+        return MissionResult(self._result_status, {}, [])
 
 
 class _FakeImproveLoop:
@@ -14138,15 +14224,24 @@ class _FakeImproveLoop:
     責務として fake でも忠実に再現する — `claim_slot` を実際に呼び
     `reserved→claimed` を tx で確定させる (fake が本物の `improve_waves`
     を呼ぶことで、Task 9 側は「claim は prepare の内側で起きる」という
-    契約だけを検証すればよい)。"""
+    契約だけを検証すればよい)。`prepare()` は本物 (`ImproveLoop.prepare`)
+    と同じ `on_ready=` kwarg を受け取り (RW2 改訂)、`_RecordingFakeWorkerRunner`
+    のコンストラクタへそのまま転送する — `ImproveSupervisor` が直接
+    `on_ready` を worker runner に渡すことはない (`prepare` の内側で
+    `WorkerRunner(..., on_ready=on_ready)` を組むのは `ImproveLoop` 側の
+    責務、10.2 節)。"""
 
-    def __init__(self, conn, worker_runner, *, mission_id=999):
+    def __init__(self, conn, events, *, mission_id=999,
+                on_ready_raises: bool = False,
+                result_status: str = "completed"):
         self._conn = conn
-        self._worker_runner = worker_runner
+        self._events = events
         self._mission_id = mission_id
+        self._on_ready_raises = on_ready_raises
+        self._result_status = result_status
         self.committed: list[tuple] = []
 
-    def prepare(self, *, slot_key, now):
+    def prepare(self, *, slot_key, now, on_ready=None):
         period_key, k = slot_key
         claimed = improve_waves.claim_slot(
             self._conn, period_key=period_key, k=k, mission_id=self._mission_id,
@@ -14155,17 +14250,22 @@ class _FakeImproveLoop:
             raise RuntimeError(
                 f"slot claim failed for {slot_key!r} — "
                 "already claimed by a concurrent process")
-        return f"mission-{self._mission_id}", f"ctx-{self._mission_id}", \
-            self._worker_runner
+        runner = _RecordingFakeWorkerRunner(
+            self._events, on_ready=on_ready,
+            result_status=self._result_status,
+            on_ready_raises=self._on_ready_raises)
+        return f"mission-{self._mission_id}", f"ctx-{self._mission_id}", runner
 
     def commit(self, *, mission, ctx, result, now):
         self.committed.append((mission, ctx, result))
 
 
-def test_three_way_launch_order_prepare_then_spawn_then_ready_then_running_commit_then_go(
-        conn, monkeypatch):
-    """prepare(Tx-0, claim含む) → spawn → ready 受信 → running commit
-    (この時点でまだ go を送らない) → go → run → commit()、の順序を固定する。"""
+def test_three_way_launch_order_prepare_then_ready_then_running_commit_then_go_then_run(
+        conn):
+    """prepare (Tx-0, claim 込み) → run() 呼び出し → (run 内で) on_ready
+    (= running commit) → go 相当の内部同期点 → 完走 → commit()、の順序を
+    固定する (RW1: go は実フレームだが、`ImproveSupervisor` 視点では
+    `runner.run(mission)` 1 回のブロッキング呼び出しの内側に隠れる)。"""
     events: list[str] = []
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
@@ -14175,8 +14275,7 @@ def test_three_way_launch_order_prepare_then_spawn_then_ready_then_running_commi
                              clock=_FixedClock(now), db_path=Path("x"),
                              stop_event=threading.Event())
     sup._conn_for_test = conn
-    fake_loop = _FakeImproveLoop(
-        conn, _RecordingFakeWorkerRunner(events))
+    fake_loop = _FakeImproveLoop(conn, events, mission_id=999)
     sup._improve_loop = fake_loop
     sup._launch_slot("2026-W34", 0)
 
@@ -14185,33 +14284,48 @@ def test_three_way_launch_order_prepare_then_spawn_then_ready_then_running_commi
         "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
     assert row["status"] == "running"
     assert row["mission_id"] == 999
-    assert events == ["spawn", "go", "run"]
+    assert events == ["run_start", "go", "run_end"]
     assert len(fake_loop.committed) == 1
 
 
 def test_go_is_not_sent_before_running_commit(conn):
-    """running への commit が完了する前に go を送らないことを、send_go の
-    内部で slot 状態を読み返して確認する fake WorkerRunner 経由で確認する。
-    commit 前に go 呼び出しが記録されたら fail。"""
+    """`go` に相当する内部同期点 (fake では on_ready 呼び出し直後に
+    追記される `"go"` イベント) が、running への commit が可視化された
+    **後**にしか記録されないことを、`_on_ready` の内部で slot 状態を
+    読み返して確認する fake WorkerRunner 経由で確認する。"""
     events: list[str] = []
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
 
-    class _OrderCheckingRunner(_RecordingFakeWorkerRunner):
-        def send_go(self):
+    class _OrderCheckingWorkerRunner(_RecordingFakeWorkerRunner):
+        def run(self, mission):
+            self._events.append("run_start")
+            self._on_ready({"ok": True})
             row = conn.execute(
                 "SELECT status FROM improve_wave_slots "
                 "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
             assert row["status"] == "running", (
-                "go was sent before the running-commit was visible")
-            super().send_go()
+                "go was written before the running-commit was visible")
+            self._events.append("go")
+            self._events.append("run_end")
+            return MissionResult("completed", {}, [])
+
+    class _OrderCheckingImproveLoop(_FakeImproveLoop):
+        def prepare(self, *, slot_key, now, on_ready=None):
+            period_key, k = slot_key
+            claimed = improve_waves.claim_slot(
+                self._conn, period_key=period_key, k=k,
+                mission_id=self._mission_id, now=now, commit=True)
+            assert claimed
+            runner = _OrderCheckingWorkerRunner(self._events, on_ready=on_ready)
+            return f"mission-{self._mission_id}", f"ctx-{self._mission_id}", runner
 
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
                              clock=_FixedClock(now), db_path=Path("x"),
                              stop_event=threading.Event())
     sup._conn_for_test = conn
-    sup._improve_loop = _FakeImproveLoop(conn, _OrderCheckingRunner(events))
+    sup._improve_loop = _OrderCheckingImproveLoop(conn, events, mission_id=999)
     sup._launch_slot("2026-W34", 0)
 ```
 
@@ -14230,13 +14344,19 @@ uv run pytest tests/core/test_improve_wave_slot_protocol.py -v -k "three_way or 
 ```python
     # precheck 2026-08-22 wave2: T10-B2 R-D1 実装時改訂 — 3相 API
     # (spawn/send_go/run_to_completion、非実在) を on_ready 方式へ書き換え。
+    # <!-- precheck 2026-08-23 wave3: RW3 改訂 — commit は無条件 -->
     # `_handle_pre_ready_failure` (spawn_attempts による retry/failed 分岐、
     # 9.4 節) の意味論はそのまま維持する — `runner.run()` が **on_ready が
     # 一度も呼ばれずに** 完走以外の結果を返した場合 (pre-ready 失敗、子の
     # spawn 自体が失敗) だけ retry 経路へ倒し、on_ready 到達後 (= 'running'
     # へ遷移済み) の失敗は通常の `ImproveLoop.commit` 終端 (_finalize_failed_
     # mission、slot を running→failed) へ渡す — 「実行が始まった後の失敗」
-    # を retry してしまうと二重実行になるため区別する。
+    # を retry してしまうと二重実行になるため区別する。**`self._improve_loop.
+    # commit(...)` は pre-ready 失敗時も含め常に (無条件に) 呼ぶ** — RW3
+    # 改訂: pre-ready 失敗の run/mission 終端化は `commit()` の内部
+    # (`reached_running=False` かつ `result.status != "completed"` の分岐、
+    # 10.10/10.11 節) が担い、`_launch_slot` 側で early return しない
+    # (`abort_pre_ready` のような別ヘルパは新設しない)。
     def _launch_slot(self, period_key: str, k: int) -> None:
         # mission_id はまだ無い。Tx-0 (missions.start + improve_runs.start +
         # slot claim reserved→claimed) は self._improve_loop.prepare が
@@ -14247,12 +14367,14 @@ uv run pytest tests/core/test_improve_wave_slot_protocol.py -v -k "three_way or 
         def _on_ready(frame: dict) -> None:
             nonlocal reached_running
             conn = self._conn()
+            owns = self._conn_for_test is None
             try:
                 improve_waves.mark_running(
                     conn, period_key=period_key, k=k, now=self._clock.now(),
                     commit=True)
             finally:
-                conn.close()
+                if owns:
+                    conn.close()
             reached_running = True
 
         mission, ctx, runner = self._improve_loop.prepare(
@@ -14266,7 +14388,22 @@ uv run pytest tests/core/test_improve_wave_slot_protocol.py -v -k "three_way or 
                                   now=self._clock.now())
 ```
 
-`_handle_pre_ready_failure` は 9.4 節で実装する。`self._improve_loop` は `ImproveSupervisor.__init__` の末尾で `self._improve_loop: object | None = None` として既定 None のテストシーム属性を用意し (9.5 節で確定)、`build_app` 配線時 (10.12 節) に実 `ImproveLoop` インスタンスへ差し替える。本節では**テストシーム** (`self._improve_loop` を上書き可能にすること自体) を pin する — 実 `ImproveLoop.prepare` が Tx-0 内で `RuntimeError` を送出するケース (`claim_slot` が False を返す、10.2 節) は、この呼び出し元では意図的に捕捉しない (発生すれば slot は `reserved` のまま次 tick で再試行される — `ImproveSupervisor` が生成直後の `reserved` slot だけを spawn 対象にする 9.2/9.5 節の設計上、通常経路では起きないため、`_launch_slot` 自身をクラッシュさせて技術ログに残す方が安全側)。
+`_handle_pre_ready_failure` は 9.4 節で実装する。`owns = self._conn_for_test
+is None` は本節の `_conn()` の既存規約 (9.5 節「接続の所有」参照) と揃える
+— pytest が `sup._conn_for_test` に接続を注入するときは呼び出し元がその
+接続の寿命を管理するため、`_on_ready` 側で無条件に `close()` すると
+テストの接続を握り潰してしまう (旧稿の逐語はこの `owns` ガードを欠いて
+いた、precheck 2026-08-23 wave3)。`self._improve_loop` は
+`ImproveSupervisor.__init__` の末尾で `self._improve_loop: object | None = None`
+として既定 None のテストシーム属性を用意し (9.5 節で確定)、`build_app`
+配線時 (10.12 節) に実 `ImproveLoop` インスタンスへ差し替える。本節では
+**テストシーム** (`self._improve_loop` を上書き可能にすること自体) を
+pin する — 実 `ImproveLoop.prepare` が Tx-0 内で `RuntimeError` を送出する
+ケース (`claim_slot` が False を返す、10.2 節) は、この呼び出し元では
+意図的に捕捉しない (発生すれば slot は `reserved` のまま次 tick で再試行
+される — `ImproveSupervisor` が生成直後の `reserved` slot だけを spawn
+対象にする 9.2/9.5 節の設計上、通常経路では起きないため、`_launch_slot`
+自身をクラッシュさせて技術ログに残す方が安全側)。
 
 - [ ] **Step 4: 成功を確認**
 
@@ -14278,19 +14415,20 @@ uv run pytest tests/core/test_improve_wave_slot_protocol.py -v -k "three_way or 
 
 | # | 変異 | 殺すテスト |
 |---|---|---|
-| M1 | `runner.send_go()` を `mark_running` の**前**に呼ぶ | `test_go_is_not_sent_before_running_commit` |
-| M2 | `self._improve_loop.prepare(...)` の呼び出しを削り、mission_id を無条件にダミー値へ差し替えて spawn する (Tx-0 を経由しない) | `test_three_way_launch_order_prepare_then_spawn_then_ready_then_running_commit_then_go` (slot が `claimed`/`running` へ遷移しない — claim 自体が fake `prepare` の内部でのみ起きるため) |
-| M3 | `spawn_result != "ready"` の分岐を削る (pre-ready 失敗を無視して常に running へ進む) | 9.4 節の `test_pre_ready_failure_reverts_to_reserved_with_mission_id_null` |
+| M1 | fake `_RecordingFakeWorkerRunner.run()` の `"go"` イベント追記を `on_ready` 呼び出しの**前**へ移す (WorkerRunner が `go` を `on_ready` 完了より前に書いてしまう変異の代理) | `test_go_is_not_sent_before_running_commit` |
+| M2 | fake `run()` が `"go"` イベントを一切追記しない (実 WorkerRunner が `on_ready` 完了後に `go` フレームを書き忘れる変異の代理) | `test_three_way_launch_order_prepare_then_ready_then_running_commit_then_go_then_run` (`events == ["run_start", "go", "run_end"]` の `assert` が `["run_start", "run_end"]` で fail) |
+| M3 | `on_ready` 内の例外を `_launch_slot` が握りつぶし (`try/except: pass`)、`_handle_pre_ready_failure` を呼ばずに素通りで `commit` へ直行する | 9.4 節の `test_pre_ready_failure_reverts_to_reserved_with_mission_id_null` (`on_ready_raises=True` の fake で `result.status == "failed"` かつ `reached_running=False` になるケースを追加検証すること — 9.4 節の申し送りに転記) |
 
 - [ ] **Step 6: コミット**
 
 ```bash
 git add src/agentic_fx/core/improve_supervisor.py tests/core/test_improve_wave_slot_protocol.py
 git commit -m "$(cat <<'EOF'
-feat: ImproveSupervisor の 3-way 起動 (prepare→spawn→ready→running→go→commit) (プラン10 Task9-3)
+feat: ImproveSupervisor の 3-way 起動 (prepare→ready→running commit→go→run→commit) (プラン10 Task9-3, RW1)
 
-Tx-0のslot claimはImproveLoop.prepare側の責務 (R-i2)。running commitがgo送出
-より先に完了することをprotocol testで固定。
+goを概念上の同期点から実フレーム (mission_protocol.py FRAME_TYPES_PARENT_TO_CHILD)
+へ復元。Tx-0のslot claimはImproveLoop.prepare側の責務 (R-i2)。running commitが
+go送出より先に完了することをprotocol testで固定。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -14671,6 +14809,7 @@ class ImproveSupervisor:
             display_timezone=self._settings.display_timezone)
         period_key = period_key_of(occurrence, cadence=s.improve)
         conn = self._conn()
+        owns = self._conn_for_test is None
         try:
             open_slots = self._capacity - self._running_slot_count(conn)
             m = min(self._settings.improve.parallel, max(open_slots, 0))
@@ -14682,7 +14821,8 @@ class ImproveSupervisor:
                 return
             pending_ks = list(range(m))
         finally:
-            conn.close()
+            if owns:
+                conn.close()
         for k in pending_ks:
             self._spawn_slot_thread(period_key, k)
 
@@ -14712,13 +14852,19 @@ class ImproveSupervisor:
 
     # precheck 2026-08-22 wave2: T10-B2 R-D1 実装時改訂 — 3相 API
     # (spawn/send_go/run_to_completion、非実在) を on_ready 方式へ書き換え。
+    # <!-- precheck 2026-08-23 wave3: RW3 改訂 — commit は無条件 -->
     # `_handle_pre_ready_failure` (spawn_attempts による retry/failed 分岐、
     # 9.4 節) の意味論はそのまま維持する — `runner.run()` が **on_ready が
     # 一度も呼ばれずに** 完走以外の結果を返した場合 (pre-ready 失敗、子の
     # spawn 自体が失敗) だけ retry 経路へ倒し、on_ready 到達後 (= 'running'
     # へ遷移済み) の失敗は通常の `ImproveLoop.commit` 終端 (_finalize_failed_
     # mission、slot を running→failed) へ渡す — 「実行が始まった後の失敗」
-    # を retry してしまうと二重実行になるため区別する。
+    # を retry してしまうと二重実行になるため区別する。**`self._improve_loop.
+    # commit(...)` は pre-ready 失敗時も含め常に (無条件に) 呼ぶ** — RW3
+    # 改訂: pre-ready 失敗の run/mission 終端化は `commit()` の内部
+    # (`reached_running=False` かつ `result.status != "completed"` の分岐、
+    # 10.10/10.11 節) が担い、`_launch_slot` 側で early return しない
+    # (`abort_pre_ready` のような別ヘルパは新設しない)。
     def _launch_slot(self, period_key: str, k: int) -> None:
         # mission_id はまだ無い。Tx-0 (missions.start + improve_runs.start +
         # slot claim reserved→claimed) は self._improve_loop.prepare が
@@ -14729,12 +14875,14 @@ class ImproveSupervisor:
         def _on_ready(frame: dict) -> None:
             nonlocal reached_running
             conn = self._conn()
+            owns = self._conn_for_test is None
             try:
                 improve_waves.mark_running(
                     conn, period_key=period_key, k=k, now=self._clock.now(),
                     commit=True)
             finally:
-                conn.close()
+                if owns:
+                    conn.close()
             reached_running = True
 
         mission, ctx, runner = self._improve_loop.prepare(
@@ -14749,6 +14897,7 @@ class ImproveSupervisor:
 
     def _handle_pre_ready_failure(self, period_key: str, k: int) -> None:
         conn = self._conn()
+        owns = self._conn_for_test is None
         try:
             now = self._clock.now()
             row = conn.execute(
@@ -14762,7 +14911,8 @@ class ImproveSupervisor:
                 improve_waves.mark_slot_failed(
                     conn, period_key=period_key, k=k, now=now, commit=True)
         finally:
-            conn.close()
+            if owns:
+                conn.close()
 
     def _running_slot_count(self, conn) -> int:
         row = conn.execute(
@@ -18517,6 +18667,124 @@ def _run_improve_mission(
 は不要 — `_send_frame`/`read_frame`/`SeqTracker`/`ProtocolError` は本
 ファイル冒頭で既に import 済み。)
 
+- [ ] **Step 12-4b: 子側の `go` 待ち受け配線 (RW1/RW6 — bind→ready→go の順序、`go` 前は副作用ゼロ)**
+
+<!-- precheck 2026-08-23 wave3: RW6 -->
+
+**本 Step も 12-4 と同様、`mission_worker.py` を直接編集しない** — A-4
+merge 後、統合者/実装者が以下の逐語を `_run_improve_mission` 呼び出し
+(12-4 で改訂済み) の**直後**、`runner.run(mission)` の**直前**に適用する。
+
+**順序 (RW6 裁定)**: 子は **`afx.sock` bind + registry 構築 → `ready` 送出
+→ `go` 待ち** の順。`_start_mcp_dispatcher` (Step 12-4 が呼ぶ
+`_run_improve_mission` の内部、A-4 現物 `mission_worker.py:403-` — 
+`sock_path.exists()` になるまで `serve_forever` の bind 完了を待ってから
+戻る) は `ready` 送出より**前**に完了しているため、「`ready` 受信時点で
+`afx.sock` が既に存在する」は現物の呼び出し順序 (registry 構築 →
+dispatcher bind → `_send_frame({"type":"ready", ...})`) だけで自動的に
+満たされる — **`go` は LLM 起動 (`runner.run(mission)`) だけをゲートする**
+(BL-7 の裁定: dispatcher の bind/registry 構築は `go` 前に起きてよい副
+作用—「`go` 前は副作用ゼロ」の対象は LLM 起動・staging 書込・RPC のみ)。
+
+```python
+# src/agentic_fx/mission_worker.py — module 冒頭の import に追加
+# (precheck 2026-08-23 wave3: RW6)
+import queue
+```
+
+```python
+# src/agentic_fx/mission_worker.py — _wait_for_go 新設
+# (precheck 2026-08-23 wave3: RW6, main() の他ヘルパ関数群の近くに置く)
+def _wait_for_go(in_seq: "SeqTracker", timeout_sec: float) -> bool:
+    """`ready` 送出後、`go` フレーム (RW1) を受信するまで待つ。
+    `worker_startup_timeout_sec` 内に届かなければ False を返す — 呼び出し
+    元 (`main()`) はこの場合 Mission もツールも実行せず、`result` フレーム
+    も送らずに終了する (`go` 前は副作用ゼロ、設計書 §1)。
+
+    `sys.stdin.buffer` の `readline()` はブロッキングであり、かつ
+    `BufferedReader` の内部先読みが `select()` の fd 監視をすり抜けうる
+    (`go` が届いた時点で既に内部バッファへ読み込まれている可能性がある)
+    ため、`select`/`signal.alarm` ではなく**別スレッド + `queue.Queue`**
+    でタイムアウトを実装する (`worker_runner.py` の `_wait_with_stop` と
+    同じ発想 — daemon thread がタイムアウト後もブロックし続けても、
+    プロセス終了時に道連れで消える、FC-1 と同型の許容)。"""
+    result_queue: "queue.Queue[dict | None]" = queue.Queue(maxsize=1)
+
+    def _reader() -> None:
+        try:
+            frame = read_frame(sys.stdin.buffer)
+        except ProtocolError:
+            frame = None
+        result_queue.put(frame)
+
+    threading.Thread(target=_reader, daemon=True,
+                     name="afx-mission-go-waiter").start()
+    try:
+        frame = result_queue.get(timeout=timeout_sec)
+    except queue.Empty:
+        return False  # worker_startup_timeout_sec 超過 — 副作用ゼロで終了
+    if frame is None or frame.get("type") != "go":
+        return False  # EOF (親が落ちた) / 不正フレーム — fail closed
+    in_seq.check(frame.get("seq"))
+    return True
+```
+
+`main()` improve 分岐の呼び出し箇所 (Step 12-4 改訂後の形、置換前 → 置換後):
+
+```python
+            ready_sent = True
+            try:
+                result = runner.run(mission)
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result",
+                    "status": result.status, "output": result.output,
+                    "reason": result.reason})
+            except Exception as exc:  # noqa: BLE001
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result", "status": "failed", "output": None,
+                    "error": f"{type(exc).__name__}: {exc}"})
+            return
+```
+
+```python
+            ready_sent = True
+            # precheck 2026-08-23 wave3: RW1/RW6 — go 前は副作用ゼロ。
+            # runner.run(mission) (= LLM 起動) は go を受けてから呼ぶ。
+            if not _wait_for_go(
+                    in_seq, settings.worker.worker_startup_timeout_sec):
+                return  # timeout/EOF/不正フレーム — result も送らず終了
+            try:
+                result = runner.run(mission)
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result",
+                    "status": result.status, "output": result.output,
+                    "reason": result.reason})
+            except Exception as exc:  # noqa: BLE001
+                _send_frame(protocol_out, out_seq, {
+                    "type": "result", "status": "failed", "output": None,
+                    "error": f"{type(exc).__name__}: {exc}"})
+            return
+```
+
+（`worker_startup_timeout_sec` は親側 `WorkerRunner` が `ready` を待つのに
+使うのと**同じ設定値** `config.py:301` を子側が再利用する — 親が `ready`
+を待つ予算と、子が `go` を待つ予算を別々の設定キーにしない。trade 分岐
+(`worker_profile != "improve"`) はこの待ちを行わない — `go` は improve
+分岐だけが消費する。）
+
+**protocol test (Task 1 が所有する `tests/test_mission_worker_protocol.py`
+— R2 と同じ子プロセス・fake stdin/stdout 方式。本節は Task 10 の担当外
+ファイルへの申し送りとして記す)**:
+1. `go` フレームを送った場合のみ、fake LocalRunner (registry に仕込んだ
+   spy) の呼び出し回数が 1 になる — `go` を送らないケースでは呼び出し
+   回数 0 のまま子プロセスが `worker_startup_timeout_sec` 経過後に (result
+   フレームを送らず) 終了することを assert する (「`go` を送らないと子は
+   LLM を起動しない」pin、設計書 §8.1-18 が要求する必須 protocol test)。
+2. `ready` フレーム送出時点で `workdir/afx.sock` が存在することを assert
+   する (RW6 「`ready` 受信時点で `afx.sock` が存在する」pin)。
+3. 変異: `_wait_for_go` の呼び出しを削って `runner.run(mission)` へ直行
+   する変異 → 上記 1 が red で殺す。
+
 - [ ] **Step 12-5: 7-F 遮断⑦⑧ の xfail を green 化する (B11)**
 
 ```bash
@@ -18730,7 +18998,9 @@ feat: improve registry の親/子配線 + Mission.tools/output_schema 実配線 
 R-D2: 子(mission_worker._build_improve_registry)がbuild_mission_registry("improve",...)
 を組み、tool_rpcはRPC client経由で親のWorkerRunner(rpc_handlers=)へ転送する。
 親は同じ構築関数を名前列挙専用で呼びMission.tools/output_schemaを実配線する。
-7-F遮断⑦⑧のxfailをgreen化。
+7-F遮断⑦⑧のxfailをgreen化。子側はbind(afx.sock)→ready→go待ちの順序 (RW6) で
+LLM起動(runner.run)をgoフレーム到着までゲートする (RW1、実装はA-4 merge後に
+mission_worker.pyへ適用)。
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 EOF
@@ -19806,21 +20076,35 @@ EOF
 ### 10.12 `service.py`: `ImproveSupervisor._improve_loop` への最終配線 + `submit_manual` 実装 (R-D1 on_ready 方式、B16)
 
 <!-- precheck 2026-08-22 wave2: T10-B2 T10-B16 T10-B10 R-D1 -->
-**撤回・書き直し (R-D1、2026-08-22 深夜裁定)**: 旧稿は `runner.spawn()` →
+<!-- precheck 2026-08-23 wave3: RW1/RW2 改訂 -->
+**撤回・書き直し (R-D1、2026-08-22 深夜裁定。2026-08-23 裁定 RW1/RW2 で
+go の扱い・on_ready の渡し方を訂正)**: 旧稿は `runner.spawn()` →
 `mark_running` → `runner.send_go()` → `runner.run_to_completion()` という
 3 相 API を前提にしていたが、`WorkerRunner` にこの 3 メソッドは存在せず
 (現物の public API は `close()`/`run(mission)` のみ)、`run()` は spawn〜
 result まで一気通貫のブロッキング呼び出しである (B2)。3-way 起動は
-**`on_ready` 方式**に統一する — `WorkerRunner.run()` は子の `ready` フレーム
-受信直後に `on_ready(frame)` を呼ぶ (現物に既にある `on_ready` パラメータ
-を流用する。Interfaces 節「Task 1 が produces (R-D1/R-D2 実装時改訂)」
-ブロック参照 — Task 1 側で例外伝播/kill の実装時改訂が必要)。
+**`on_ready` + `go` 実フレーム方式**に統一する — `WorkerRunner.run()` は
+子の `ready` フレーム受信直後に `on_ready(frame)` を呼び (現物に既にある
+`on_ready` パラメータを流用する)、戻ったら**`worker_profile=="improve"`
+のときだけ** `go` フレーム (`core/mission_protocol.py` に追加、RW1) を
+子へ書く (Interfaces 節「Task 1 が produces — go 実フレームの復元」
+ブロック参照 — Task 1 側で例外伝播/kill/go 送出の実装時改訂が必要)。
+`on_ready` は **`ImproveLoop.prepare(slot_key=, now=, on_ready=)` に渡され、
+`prepare` の内部で `WorkerRunner(..., on_ready=on_ready)` を構築する**
+(RW2 改訂 — `_launch_slot` が `WorkerRunner` を直接組み立てることはない。
+骨格 Interfaces 節 L795 の `prepare` シグネチャが正)。
 `ImproveSupervisor._launch_slot`/`submit_manual` は `runner.run(mission)`
 を**1 回**呼ぶだけになり、`on_ready` コールバックの中で `mark_running`
-(wave 起動のみ) を行う。D-9 の `_RecordingFakeWorkerRunner` (`spawn`/
-`send_go`/`run_to_completion` を持つフェイク、`tests/core/
-test_improve_wave_slot_protocol.py:145`) はこの契約と食い違うため撤去し、
-`run(mission)` 契約のフェイクへ置き換える (下記「既存テスト改訂」)。
+(wave 起動のみ) を行う。**`go` の送出条件は `on_ready is not None` ではなく
+`worker_profile` そのもの** — `submit_manual` (下記 Step 3) は `on_ready`
+を渡さない (`mark_running` する slot が無いため) が、子は wave 起動と手動
+one-shot の区別なく常に `go` を待つ (§10.9b Step 12-4b/RW6) ので、`go` は
+`on_ready` の有無に関わらず improve profile なら送られる。D-9 の
+`_RecordingFakeWorkerRunner` (`spawn`/`send_go`/`run_to_completion` を持つ
+フェイク、`tests/core/test_improve_wave_slot_protocol.py:145`) はこの契約
+と食い違うため撤去し、`run(mission)` 契約のフェイクへ置き換える — **その
+フェイクは 9.3 節が既に定義済み** (下記「既存テスト改訂」参照、再定義
+しない)。
 
 **前提の整理 (統合裁定 R-i2、維持)**: Tx-0 (mission 生成 + run 生成 +
 slot claim) の所有者は `ImproveLoop.prepare` (10.2 節) — `run()` の**前**に
@@ -19877,7 +20161,13 @@ commit(...)` の `_finalize_failed_mission` (手順0) が slot を
         """手動 one-shot。slot/wave 行を作らず M=1 で全バックログを担当
         させる (§8.1-該当、9.7 節「improve」コマンドから呼ばれる)。
         wave slot が無いため on_ready コールバックは不要 (mark_running する
-        対象が無い)。"""
+        対象が無い) — `prepare(on_ready=)` を省略すると既定 `None` になる。
+        # precheck 2026-08-23 wave3: RW1/RW2 改訂 — `on_ready=None` でも
+        # 子は go を待つ (§10.9b Step 12-4b/RW6)。WorkerRunner が go を
+        # 送る条件は `on_ready is not None` ではなく `worker_profile`
+        # そのものなので (Interfaces 節「Task 1 が produces」ブロック参照)、
+        # ここで on_ready を渡さなくても子は正しく go を受け取って進む。
+        """
         now = self._clock.now()
         mission, ctx, runner = self._improve_loop.prepare(
             slot_key=None, now=now)
@@ -19890,44 +20180,22 @@ commit(...)` の `_finalize_failed_mission` (手順0) が slot を
 `ImproveLoop.prepare` の `slot_key=None` 分岐は 10.2 節の
 `test_tx0_manual_one_shot_has_no_slot_claim` で既に固定済み。
 
-**既存テスト改訂 (共通規約、必須)**: `tests/core/test_improve_wave_slot_protocol.py`
+**既存テスト改訂 (共通規約、必須。precheck 2026-08-23 wave3: RW1/RW2 改訂
+— 9.3 節と重複する再定義を撤回)**: `tests/core/test_improve_wave_slot_protocol.py`
 の `_RecordingFakeWorkerRunner` (`:145-163`) は `spawn()`/`send_go()`/
 `run_to_completion()` を持つ旧 3 相フェイクであり、R-D1 の `run(mission)`
-単一呼び出し契約と食い違う。**フェイクを撤去し、`run(mission) ->
-MissionResult` 契約かつ `on_ready` を受け取れるフェイクへ書き換える**:
-
-```python
-# tests/core/test_improve_wave_slot_protocol.py の _RecordingFakeWorkerRunner
-# を以下へ置換 (precheck 2026-08-22 wave2: T10-B2/R-D1)
-class _RecordingFakeWorkerRunner:
-    """R-D1: on_ready 方式の run(mission) 単一呼び出し契約を満たすフェイク。
-    `on_ready` は `prepare(on_ready=...)` 経由で `_build_worker_runner` に
-    渡ったものを `run()` 実行時に呼ぶ (本物の WorkerRunner.run() の挙動を
-    模す)。"""
-    def __init__(self, *, on_ready=None, result_status="completed",
-                on_ready_raises=False):
-        self.calls: list[str] = []
-        self._on_ready = on_ready
-        self._result_status = result_status
-        self._on_ready_raises = on_ready_raises
-
-    def run(self, mission):
-        self.calls.append("run")
-        if self._on_ready is not None:
-            if self._on_ready_raises:
-                # 本物の WorkerRunner.run() は on_ready が例外を投げたら
-                # 子を kill し 'failed' を返す (pre-ready 失敗)
-                return MissionResult("failed", None, [])
-            self._on_ready({"ok": True})
-        return MissionResult(self._result_status, {}, [])
-```
-
-`_FakeImproveLoop.prepare` (`:166-192`) が返す `runner` をこのフェイクの
-インスタンスへ差し替え、3-way 起動順序テスト群 (`spawn`/`send_go`/
-`run_to_completion` の呼び出し順序を assert していたもの) は「`prepare`
-→ (on_ready 経由の) `mark_running` → `run` → `commit`」の順序 assert へ
-書き換える (検査意図 — 「Tx-0 claim → running 遷移 → 実行 → 終端」の
-順序保証 — は維持する)。
+単一呼び出し契約と食い違う。**フェイクの撤去・置換は 9.3 節が既に行って
+いる** (9.3 節「Step 1: 失敗するテストを書く」の `_RecordingFakeWorkerRunner`/
+`_FakeImproveLoop` が最終形 — 本節では再定義しない。旧稿はここで独立に
+`_RecordingFakeWorkerRunner` を再定義していたが、9.3 節の定義と地の文が
+微妙に食い違う二重定義になっていたため撤回する)。`submit_manual` のテスト
+(下記 M2) は 9.3 節の `_FakeImproveLoop`/`_RecordingFakeWorkerRunner` を
+そのまま使い、`prepare(slot_key=None, now=..., on_ready=None)` （デフォルト
+省略でも可）を経由させて `runner.run(mission)` が `on_ready=None` でも
+正常に完走を返すこと (9.3 節の `run()` 実装は `self._on_ready is not None`
+のときだけ呼ぶため、`None` の場合は素通りする) を確認すればよい。3-way
+起動順序テスト群の意図 (「Tx-0 claim → running 遷移 → 実行 → 終端」の
+順序保証) は 9.3 節側で既に固定済み。
 
 - [ ] **Step 4: 変異テスト**
 
