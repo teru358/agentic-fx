@@ -511,5 +511,33 @@ class ImproveLoop:
             content_hash=content_hash, now=now, settings=self._settings,
             meta=meta, kind=kind, record_fn=record_fn)
 
+    def _build_approval_payload(self, conn, *, name, kind, content_hash,
+                                artifact_hash, ctx_ledger, mission_id,
+                                backlog_id, candidate_origin, candidate_path,
+                                gate_metrics, output, now) -> dict:
+        entries = ctx_ledger.entries()
+        analysis_entries = [e for e in entries if e["kind"] == "analyze_corr"]
+        backtest_entries = [e for e in entries if e["kind"] == "run_backtest"]
+        trial_count = sum(e["trial_count"] for e in entries)
+        return {
+            "name": name, "kind": kind,
+            "candidate_origin": candidate_origin,
+            "candidate_path": candidate_path,
+            "content_hash": content_hash, "artifact_hash": artifact_hash,
+            "mission_id": mission_id, "backlog_id": backlog_id,
+            "in_sample": gate_metrics.get("in_sample"),
+            "holdout": gate_metrics.get("holdout"),
+            "baseline": gate_metrics.get("baseline"),
+            "analysis_run_ids": [],  # Tx-2 で実 id を解決してから埋める
+                                     # (10.10 節 `_finalize_success` — 直前
+                                     # 修正の申し送り③)
+            "trial_count": trial_count,
+            "analysis_call_count": len(analysis_entries),
+            "backtest_call_count": len(backtest_entries),
+            "selection_rationale": output.get("selection_rationale", ""),
+            "summary": output.get("artifact", {}).get("summary", ""),
+            "audit_note": "RPC timeout した呼出しは数えていない",
+        }
+
     def commit(self, *, mission, ctx, result, now):
         raise NotImplementedError  # 10.4〜10.11 節
