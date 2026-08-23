@@ -1,0 +1,201 @@
+"""plugin_switch_journal の phase 遷移・収束規則 (プラン 10 Task 11c、
+設計書 §5.1-1・§8.1-30・§8.1-31)。"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+# precheck 2026-08-22 wave2: T11-B1
+from agentic_fx.config import load_settings
+from agentic_fx.plugin import switch
+from agentic_fx.store import db as db_store
+
+NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
+SETTINGS = load_settings(Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")  # B-1: reconcile_switch_journals が settings を要求する
+
+
+@pytest.fixture
+def conn(tmp_path):
+    c = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(c)
+    return c
+
+
+def _plugins_root(tmp_path) -> Path:
+    root = tmp_path / "plugins"
+    root.mkdir(exist_ok=True)
+    return root
+
+
+# --- 表 1: preparing の temp_path locator (§8.1-31) ---
+
+def test_begin_switch_journal_derives_temp_path_from_op_id(conn):
+    """temp_path は 'plugins/.<name>.link-<op_id>' として INSERT 時に確定
+    (op_id 起点の locator、§5.1 手順 1・§8.1-31)。"""
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="absent",
+        old_target=None, new_target=".versions/sma/" + "a" * 64,
+        switch_required=True, actor="human", now=NOW, commit=True)
+    row = conn.execute(
+        "SELECT temp_path, phase FROM plugin_switch_journal WHERE op_id=?",
+        (op_id,)).fetchone()
+    assert row["temp_path"] == f"plugins/.sma.link-{op_id}"
+    assert row["phase"] == "preparing"
+
+
+def test_non_terminal_journal_rows_limited_to_one_per_name(conn):
+    """部分 UNIQUE index: 非終端 phase (decided/reverted 以外) は name ごとに
+    高々 1 件 (§8.1-31)。"""
+    switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="absent",
+        old_target=None, new_target=".versions/sma/" + "a" * 64,
+        switch_required=True, actor="human", now=NOW, commit=True)
+    with pytest.raises(Exception):  # sqlite3.IntegrityError
+        switch.begin_switch_journal(
+            conn, kind="approve", approval_id=2, name="sma", old_kind="absent",
+            old_target=None, new_target=".versions/sma/" + "b" * 64,
+            switch_required=True, actor="human", now=NOW, commit=True)
+
+
+def test_decided_and_reverted_rows_do_not_count_toward_unique(conn):
+    """decided/reverted (終端) は部分 UNIQUE の対象外 — 同名で新しい非終端行
+    を作れる。"""
+    op1 = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="absent",
+        old_target=None, new_target=".versions/sma/" + "a" * 64,
+        switch_required=True, actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op1, phase="versioned", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op1, phase="recorded", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op1, phase="switched", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op1, phase="decided", now=NOW, commit=True)
+    op2 = switch.begin_switch_journal(  # 例外にならない
+        conn, kind="approve", approval_id=2, name="sma", old_kind="symlink",
+        old_target=".versions/sma/" + "a" * 64,
+        new_target=".versions/sma/" + "b" * 64,
+        switch_required=True, actor="human", now=NOW, commit=True)
+    assert op2 != op1
+
+
+# --- 表 1: switched の収束規則 (3 分岐、old_kind ごと) ---
+
+def test_switched_recovery_live_equals_new_target_delegates_to_retry_approval(
+        tmp_path, conn, monkeypatch):
+    """switched かつ live==new_target の完遂は reconcile 自身が phase を
+    'decided' に書き換えるのではなく、retry_approval (11e、内部で
+    approve_candidate → apply_decision の同一 tx) に委譲する (統合裁定、
+    簡略化 2 の解消)。11c 単体では approve_candidate の全機構 (gate/版/git)
+    は未定義のため、ここでは委譲そのものを spy で確認し、実際に
+    phase='decided' へ進むことの確認は 11d/11e の統合テストに任せる。"""
+    root = _plugins_root(tmp_path)
+    new_rel = f".versions/sma/{'a' * 64}"
+    (root / "sma").symlink_to(new_rel)
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="absent",
+        old_target=None, new_target=new_rel, switch_required=True,
+        actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
+
+    calls = []
+    # raising=False: retry_approval は 11e で switch.py に追記される名前。
+    # 11c 単体の実装段階ではまだモジュールに存在しないため raising=False で
+    # 差し替える (同一ファイル switch.py を 11c→11d→11e の順で継ぎ足す構造 —
+    # 11e 完了後に本テストを再実行すると raising=False が無くても通る)。
+    monkeypatch.setattr(
+        switch, "retry_approval",
+        lambda c, approval_id, *, decided_by, now, plugins_root, settings: calls.append(
+            (approval_id, decided_by)), raising=False)  # B-1: plugins_root/settings も受ける
+
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS)
+
+    assert calls == [(1, "system_reconcile")]
+    # reconcile 自身は phase を書き換えない (decided への遷移は
+    # apply_decision と同一 tx でしか起きない契約)
+    row = conn.execute("SELECT phase FROM plugin_switch_journal WHERE op_id=?",
+                       (op_id,)).fetchone()
+    assert row["phase"] == "switched"
+
+
+def test_switched_recovery_live_equals_old_target_reverts_symlink(tmp_path, conn):
+    root = _plugins_root(tmp_path)
+    old_rel = f".versions/sma/{'o' * 64}"
+    (root / "sma").symlink_to(old_rel)  # rename が実は起きていなかった
+    new_rel = f".versions/sma/{'n' * 64}"
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="symlink",
+        old_target=old_rel, new_target=new_rel, switch_required=True,
+        actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
+
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS)
+    row = conn.execute("SELECT phase FROM plugin_switch_journal WHERE op_id=?",
+                       (op_id,)).fetchone()
+    assert row["phase"] == "reverted"
+    assert Path(root / "sma").readlink().as_posix() == old_rel
+
+
+def test_switched_recovery_neither_target_is_error_and_untouched(tmp_path, conn, caplog):
+    """live が old でも new でもない (第三者が触った) → activity ERROR で
+    人間待ち、live には触らない。"""
+    root = _plugins_root(tmp_path)
+    third_party = f".versions/sma/{'z' * 64}"
+    (root / "sma").symlink_to(third_party)
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="absent",
+        old_target=None, new_target=f".versions/sma/{'n' * 64}",
+        switch_required=True, actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
+
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS)
+    row = conn.execute("SELECT phase FROM plugin_switch_journal WHERE op_id=?",
+                       (op_id,)).fetchone()
+    assert row["phase"] == "switched"  # 触らない (非終端のまま)
+    assert Path(root / "sma").readlink().as_posix() == third_party
+
+
+# --- 表 3: switch_required=0 は switched を経ない ---
+
+def test_switch_required_false_skips_switched_phase(conn):
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="symlink",
+        old_target=f".versions/sma/{'a' * 64}",
+        new_target=f".versions/sma/{'a' * 64}",  # 旧新同一
+        switch_required=False, actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="versioned", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="recorded", now=NOW, commit=True)
+    with pytest.raises(ValueError, match="switch_required=0"):
+        switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="decided", now=NOW, commit=True)  # OK
+
+
+# --- 表 2: 割込操作の巻き戻し (old_kind ごと) ---
+
+def test_interrupt_reverts_absent_by_removing_live_symlink(tmp_path, conn):
+    root = _plugins_root(tmp_path)
+    new_rel = f".versions/sma/{'a' * 64}"
+    (root / "sma").symlink_to(new_rel)
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="absent",
+        old_target=None, new_target=new_rel, switch_required=True,
+        actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
+    # 割込: reject が別プロセスから来た想定 (reconcile が先に巻き戻す)
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS,
+                                     force_revert_op_id=op_id)
+    assert not (root / "sma").exists()
+
+
+def test_interrupt_reverts_symlink_by_restoring_old_target(tmp_path, conn):
+    root = _plugins_root(tmp_path)
+    old_rel = f".versions/sma/{'o' * 64}"
+    new_rel = f".versions/sma/{'n' * 64}"
+    (root / "sma").symlink_to(new_rel)
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="symlink",
+        old_target=old_rel, new_target=new_rel, switch_required=True,
+        actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS,
+                                     force_revert_op_id=op_id)
+    assert Path(root / "sma").readlink().as_posix() == old_rel
