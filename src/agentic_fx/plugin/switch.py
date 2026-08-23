@@ -435,6 +435,22 @@ def approve_candidate(
                 _finalize_decision(conn, approval_id, op_id=op_id,
                                    decided_by=decided_by, now=now)
                 return
+        elif existing_journal is not None:
+            # 別 approval_id の未完ジャーナルが同名に存在する場合、この
+            # approve は進められない — `plugin_switch_journal` の部分
+            # UNIQUE index (name ごとに非終端 1 件、11c) に反して
+            # `begin_switch_journal` を呼ぶと生の `sqlite3.IntegrityError`
+            # が漏れてしまう (11e が定義予定の `switch.UnresolvedJournalError`
+            # と統一する余地があるが、本 task はそのクラスを新設しない —
+            # 逸脱として最終報告に明記)。ここでは呼び出し元が
+            # `reconcile_switch_journals`/`approval retry` で先に収束させる
+            # ことを期待し、明示的な `ValueError` で fail closed にする。
+            raise ValueError(
+                f"plugin {name!r}: an unresolved switch journal "
+                f"(op_id={existing_journal['op_id']}, "
+                f"approval_id={existing_journal['approval_id']}) blocks "
+                f"approval {approval_id} — resolve it first (reconcile or "
+                "approval retry)")
 
         candidate_origin = payload["candidate_origin"]
         candidate_path = payload["candidate_path"]
@@ -448,7 +464,17 @@ def approve_candidate(
         try:
             check_candidate_snapshot(candidate_dir)
             content_hash, artifact_hash = hashes_of(candidate_dir)
-        except (OSError, ValueError):
+        except ValueError:
+            # `CandidateSnapshotError` は `ValueError` のサブクラス
+            # (gate_pytest.py) — スナップショット不正はここで fail closed
+            # に pending 留置する。`OSError` はこの try からは意図的に
+            # 除外する: `resolve_candidate_dir` が既に存在確認を済ませて
+            # いるため、ここでの `OSError` は「確認直後に候補が消えた」
+            # ような予期しない事象であり、`CandidateMissingError` の
+            # fail-closed 経路と取り違えない (M7 是正 — `OSError` を握り
+            # つぶすと `candidate_missing` 検出そのものを削る変異が
+            # `test_approve_candidate_missing_stays_pending` で red に
+            # ならず survive してしまう)。
             return  # 候補が壊れている/検査失敗 → pending のまま
         if (content_hash != payload["content_hash"]
                 or artifact_hash != payload["artifact_hash"]):
