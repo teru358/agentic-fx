@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import signal
 import subprocess
 import sys
@@ -109,6 +110,27 @@ class WorkerRunner(AgentRunner):
             (workdir / "tmp").mkdir(mode=0o700)
             (workdir / "cfg").mkdir(mode=0o700)
 
+            # 裁定 R-D3: `run_context.source_snapshot_dir` は「スナップ
+            # ショットの出所」を指すに留まる (Task 10 が用意する)。子側
+            # (`_bootstrap_improve_profile`, R7) は「workdir 配下の実在
+            # dir」を要求するため、出所をそのまま handshake へ載せると
+            # 本物の run_context では常に fail closed する。workdir 作成
+            # 直後に出所を `workdir/source` へ実体化し、handshake には
+            # この実体化先を載せる (`ready` の `run_context` 反射も同値)。
+            materialized_source: Path | None = None
+            if self._run_context is not None:
+                origin = Path(str(self._run_context.source_snapshot_dir))
+                # `Path.is_dir()` は symlink を辿って解決するため、
+                # symlink かどうかは先に独立して検査する (辿った先が実在
+                # ディレクトリだと `is_dir()` 単独では symlink を見逃す)。
+                if origin.is_symlink() or not origin.is_dir():
+                    return MissionResult(
+                        "failed", None, [],
+                        reason="source_snapshot_dir origin is missing or "
+                               "is a symlink (R-D3 fail closed)")
+                materialized_source = workdir / "source"
+                shutil.copytree(origin, materialized_source, symlinks=False)
+
             credentials: dict[str, str] = {}
             if self._worker_profile == "trade":
                 for key in _DATA_PROVIDER_ENV_ALLOWLIST:
@@ -149,8 +171,9 @@ class WorkerRunner(AgentRunner):
                     # ここだけ str() を掛ける。
                     "mission_id": str(self._run_context.mission_id),
                     "staging_dir": str(self._run_context.staging_dir),
-                    "source_snapshot_dir":
-                        str(self._run_context.source_snapshot_dir),
+                    # 裁定 R-D3: 出所ではなく実体化先 (workdir/source) を
+                    # 載せる。
+                    "source_snapshot_dir": str(materialized_source),
                 }
 
             proc = subprocess.Popen(
@@ -170,6 +193,10 @@ class WorkerRunner(AgentRunner):
                         run_context_fields: dict[str, object] | None = None) -> MissionResult:
         stdin_lock = threading.Lock()
         stdin_state = {"closed": False}
+        # 裁定 RW1: `go` フレームの送出 (on_ready 完了後) と
+        # `tool_rpc_result` の送出 (dispatcher_loop) は同じ親→子 seq 系列
+        # (handshake=1 起点) に相乗りするため、カウンタを共有する。
+        out_seq_holder = {"n": 0}
         in_seq = SeqTracker()  # 子→親方向の受信検証
         ready_queue: "queue.Queue[dict]" = queue.Queue(maxsize=1)
         done_queue: "queue.Queue[tuple[str, object]]" = queue.Queue(maxsize=1)
@@ -226,7 +253,6 @@ class WorkerRunner(AgentRunner):
                 done_queue.put(("error", str(e)))
 
         def dispatcher_loop() -> None:
-            out_seq_holder = {"n": 0}
             while True:
                 frame = dispatch_queue.get()
                 if frame is None:  # shutdown 合図
@@ -335,6 +361,24 @@ class WorkerRunner(AgentRunner):
                     return MissionResult(
                         "failed", None, transcript,
                         reason=f"on_ready failed: {type(e).__name__}: {e}")
+
+            # 裁定 RW1/RW6: `on_ready` が例外なく戻った直後、
+            # `worker_profile == "improve"` のときだけ `go` 実フレームを
+            # 子へ書く (`on_ready is not None` ではなく profile 判定のみに
+            # 依存させる — `submit_manual` (on_ready=None) の子も `go` を
+            # 待つため、この非対称を避ける。trade profile は `go` を
+            # 待たない旧来のプロトコルを維持するため一切送らない)。
+            if self._worker_profile == "improve":
+                out_seq_holder["n"] += 1
+                try:
+                    with stdin_lock:
+                        if not stdin_state["closed"]:
+                            write_frame(proc.stdin, {
+                                "type": "go",
+                                "seq": out_seq_holder["n"] + 1,
+                            })
+                except (BrokenPipeError, OSError):
+                    pass  # 子が既に死んでいる — 以降の done_queue 待ちが検知する
 
             if not ready.get("ok", False):
                 return MissionResult("failed", None, transcript)

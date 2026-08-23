@@ -48,6 +48,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import queue
 import signal
 import sys
 import sysconfig
@@ -452,6 +453,40 @@ def _start_mcp_dispatcher(*, workdir: Path, registry: ToolRegistry) -> McpShimDi
     return dispatcher
 
 
+def _wait_for_go(in_seq: "SeqTracker", timeout_sec: float) -> bool:
+    """`ready` 送出後、`go` フレーム (裁定 RW1) を受信するまで待つ。
+    `worker_startup_timeout_sec` 内に届かなければ False を返す — 呼び出し
+    元 (`main()`) はこの場合 Mission もツールも実行せず、`result` フレーム
+    も送らずに終了する (`go` 前は副作用ゼロ、設計書 §1)。
+
+    `sys.stdin.buffer` の `readline()` はブロッキングであり、かつ
+    `BufferedReader` の内部先読みが `select()` の fd 監視をすり抜けうる
+    (`go` が届いた時点で既に内部バッファへ読み込まれている可能性がある)
+    ため、`select`/`signal.alarm` ではなく**別スレッド + `queue.Queue`**
+    でタイムアウトを実装する (`worker_runner.py` の `_wait_with_stop` と
+    同じ発想 — daemon thread がタイムアウト後もブロックし続けても、
+    プロセス終了時に道連れで消える、FC-1 と同型の許容)。"""
+    result_queue: "queue.Queue[dict | None]" = queue.Queue(maxsize=1)
+
+    def _reader() -> None:
+        try:
+            frame = read_frame(sys.stdin.buffer)
+        except ProtocolError:
+            frame = None
+        result_queue.put(frame)
+
+    threading.Thread(target=_reader, daemon=True,
+                     name="afx-mission-go-waiter").start()
+    try:
+        frame = result_queue.get(timeout=timeout_sec)
+    except queue.Empty:
+        return False  # worker_startup_timeout_sec 超過 — 副作用ゼロで終了
+    if frame is None or frame.get("type") != "go":
+        return False  # EOF (親が落ちた) / 不正フレーム — fail closed
+    in_seq.check(frame.get("seq"))
+    return True
+
+
 def _run_improve_mission(
     *, settings: Any, workdir: Path,
     protocol_out: Any = None, out_seq: Any = None
@@ -564,6 +599,11 @@ def main() -> None:
                 },
             })
             ready_sent = True
+            # precheck 2026-08-23 wave3: RW1/RW6 — go 前は副作用ゼロ。
+            # runner.run(mission) (= LLM 起動) は go を受けてから呼ぶ。
+            if not _wait_for_go(
+                    in_seq, settings.worker.worker_startup_timeout_sec):
+                return  # timeout/EOF/不正フレーム — result も送らず終了
             try:
                 result = runner.run(mission)
                 _send_frame(protocol_out, out_seq, {

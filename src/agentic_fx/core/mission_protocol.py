@@ -8,7 +8,9 @@
 
 フレーム型 (全フレームに `seq` を付す。方向別に 1 起点の単調増加 —
 codex M2-1):
-- 親→子: `handshake` (起動時 1 回) / `tool_rpc_result`
+- 親→子: `handshake` (起動時 1 回) / `tool_rpc_result` / `go` (裁定 RW1 —
+  `on_ready` 完了後に親が送る実フレーム。improve profile のみ使用。子は
+  `go` を受けるまで Mission/LLM を起動しない — 「`go` 前は副作用ゼロ」)
 - 子→親: `ready` (起動応答) / `event` (transcript メッセージ 1 件) /
   `tool_rpc` (RPC 要求) / `result` (最終ステータス、正常終端で 1 回)
 """
@@ -24,7 +26,7 @@ class ProtocolError(Exception):
     違反を検出したらセッションは即座に死んだものとして扱う)。"""
 
 
-FRAME_TYPES_PARENT_TO_CHILD = frozenset({"handshake", "tool_rpc_result"})
+FRAME_TYPES_PARENT_TO_CHILD = frozenset({"handshake", "tool_rpc_result", "go"})
 FRAME_TYPES_CHILD_TO_PARENT = frozenset({"ready", "event", "tool_rpc", "result"})
 
 
