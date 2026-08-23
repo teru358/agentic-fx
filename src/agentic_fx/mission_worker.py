@@ -51,6 +51,7 @@ import os
 import signal
 import sys
 import sysconfig
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
@@ -59,6 +60,16 @@ from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
 from agentic_fx.core.mission_protocol import (
     ProtocolError, SeqTracker, encode_frame, read_frame,
 )
+# precheck 2026-08-22 pass2: RB3 (Step 7d) — factory.build_runner への
+# monkeypatch を可能にするため module level import (test 側から
+# `mw_mod.runner_factory` として属性差し替え)。
+from agentic_fx.runners import factory as runner_factory
+# A-4 検収是正 (2026-08-22, B1): McpShimDispatcher の module level import。
+# `_start_mcp_dispatcher` から使う。ToolRegistry も同様に module level へ
+# 上げる (`_build_improve_registry` の型注釈・既定実装で使うため — 従来
+# `_run_improve_mission` 内の関数内 import だったものを引き上げた)。
+from agentic_fx.tools.mcp_shim import McpShimDispatcher
+from agentic_fx.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from agentic_fx.core.contracts import Clock
@@ -366,6 +377,116 @@ def _protect_protocol_stdout() -> Any:
     return protocol_out
 
 
+def _build_improve_registry(*, settings: Any, workdir: Path) -> ToolRegistry:
+    """improve profile 用 `ToolRegistry` の構築 seam (A-4 検収是正、裁定 R-D2)。
+
+    本来の構築は `build_mission_registry("improve", staging_dir=...,
+    source_snapshot_dir=..., rpc=<親への RPC client>)` (R-D2) — RPC client
+    経由で `run_backtest`/`analyze_corr` 等 (C-7) を親へ委譲する形になる。
+    その拡張シグネチャと RPC client の配線は **Task 10 の担当**であり、
+    Task 4 (A-4) の時点ではまだ揃っていない (`build_mission_registry` の
+    現物シグネチャは `conn`/`rag`/`activity` 等 trade 専用の必須引数を
+    要求し、improve 子プロセスはそれらを持たない — 防御層① 接続情報の
+    非提供、モジュール冒頭の docstring 参照)。
+
+    そのため本関数を「呼び出し口」として切り出す — Task 10 は
+    `_run_improve_mission` 側を変えず、この関数の中身だけを
+    `build_mission_registry("improve", ...)` へ差し替えればよい。
+    Task 4 時点では最小の空 `ToolRegistry()` を返す (「空でない registry を
+    注入できる seam」— テストは本関数を monkeypatch して非空 registry を
+    注入できる、既定は空)。
+    """
+    return ToolRegistry()
+
+
+def mcp_socket_path(workdir: Path) -> Path:
+    """improve worker の MCP dispatcher socket パス (A-4 検収是正 r2、B2-r2)。
+
+    `_start_mcp_dispatcher` が bind するパスと、CLI 側
+    (`CliRunner.run`) が `_build_argv` へ渡す `mcp_socket` は、**この関数
+    1 本**から導出する。前回是正 (r2 以前) は両者が独立した
+    `workdir / "afx.sock"` リテラルとして別々の場所に書かれており、
+    `cli_runner.py` 側のパス式のみを変異させても検出できなかった
+    (検収 B2-r2: 全スイートで Survived)。式を 1 本に統合することで、
+    どちら側の呼び出しを変異させても不一致が実プロセス経由で検出できる。
+    """
+    return workdir / "afx.sock"
+
+
+def _start_mcp_dispatcher(*, workdir: Path, registry: ToolRegistry) -> McpShimDispatcher:
+    """improve worker 側の Unix socket dispatcher を起動する
+    (A-4 検収是正 Step 7a/7b、設計書 §1.6、r2 是正 B1-r2/RW6)。
+
+    `McpShimDispatcher.bind()` を**呼び出しスレッドで同期実行**する —
+    bind の成否をそのまま例外として受け取れるため、以前の実装
+    (`serve_forever` を daemon thread へ投げてから `sock_path.exists()` を
+    3 秒ポーリングする代理観測) が持っていた 2 つの欠陥が同時に消える:
+    (a) 代理観測は「そのパスに何か在るか」しか見ておらず、bind 前から
+    別エントリ (他プロセスの残骸やディレクトリ) が同名で存在すると
+    誤って成功と判定していた (masking probe、検収 B1-r2 (a))。
+    (b) daemon thread の非同期 bind がテスト間で cwd を共有する
+    in-process 呼び出し (`main()` を直接駆動する improve profile テスト)
+    と競合し、全スイートを flaky にしていた (検収 B1-r2 (b))。
+    同期 bind によりポーリング・3 秒 deadline は不要になる。
+
+    bind (+ registry 構築) が完了してからこの関数が返ることで、呼び出し元
+    (`_run_improve_mission` → `main()`) が `ready` フレームを送出する時点
+    では既に dispatcher が accept 可能な状態にある (RW6: 子は
+    「bind + registry 構築 → ready 送出 → go 待ち」の順)。
+    """
+    sock_path = mcp_socket_path(workdir)
+    dispatcher = McpShimDispatcher(
+        sock_path=sock_path, registry=registry, allowed=registry.names())
+    try:
+        dispatcher.bind()
+    except OSError as e:
+        # bind の失敗 (Landlock 拒否、ENOENT、既存エントリがディレクトリ
+        # 等) をそのまま呼び出し元へ fail closed で伝える。黙って見逃すと
+        # CLI へ存在しない socket path を渡し続け、B1 (bind されない
+        # socket = ツール 0 個) を再発させる。
+        raise RuntimeError(
+            f"MCP dispatcher failed to bind {sock_path} — refusing to "
+            "start (fail closed: CLI would run with 0 tools, 検収 B1)") from e
+    thread = threading.Thread(target=dispatcher.serve_forever, daemon=True)
+    thread.start()
+    return dispatcher
+
+
+def _run_improve_mission(
+    *, settings: Any, workdir: Path,
+    protocol_out: Any = None, out_seq: Any = None
+) -> Any:
+    """improve profile での runner 構築・Mission 実行 (Step 7d + A-4 検収
+    是正 Step 7a/7b)。
+
+    `_build_improve_registry` で registry を組み立て、`_start_mcp_dispatcher`
+    で同じ `workdir` に `afx.sock` を bind してから、factory.build_runner
+    経由で backend (local/claude/codex) を選択し runner を構築する。
+    unit test は protocol_out/out_seq をデフォルト None で呼び出し、
+    monkeypatch で factory.build_runner (と必要なら `_build_improve_registry`)
+    を spy/差し替えする。main() は実際の値を渡し、返された runner を run する。
+
+    :param settings: Settings インスタンス
+    :param workdir: Mission 実行用 workdir (Landlock rw 許可範囲)
+    :param protocol_out: stdout プロトコル出力 (main で生成、フレーム送信用)
+    :param out_seq: SeqTracker インスタンス (protocol_out 送信時に採番用)
+    :return: AgentRunner インスタンス
+    """
+    registry = _build_improve_registry(settings=settings, workdir=workdir)
+    _start_mcp_dispatcher(workdir=workdir, registry=registry)
+    on_message = _make_on_message(protocol_out, out_seq)
+    runner = runner_factory.build_runner(
+        "improve", settings, registry, workdir=workdir,
+        on_message=on_message,
+        # precheck 2026-08-22 pass2: RB3 (裁定 R1 の 2 段配線のうち後段) — CLI
+        # (claude/codex) が spawn した子の pgid を、既存の out_seq フレーム
+        # 送出経路 (_send_frame) に相乗りさせて親 (WorkerRunner) へ通知する。
+        # local backend では build_runner がこの引数を無視するため無害。
+        cli_started_sink=lambda pgid: _send_frame(
+            protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}))
+    return runner
+
+
 def main() -> None:
     protocol_out = _protect_protocol_stdout()
 
@@ -424,22 +545,13 @@ def main() -> None:
                 fsize_mb=settings_dict["worker"]["child_fsize_mb"])
             from agentic_fx.config import Settings
             settings = Settings.model_validate(settings_dict)
-            if settings.runner.improve.backend != "local":
-                raise RuntimeError(
-                    f"runner.improve.backend={settings.runner.improve.backend!r} "
-                    "is not supported by mission_worker in this plan "
-                    "(ClaudeRunner is Plan 9 scope) — fail closed")
             from agentic_fx.runners.base import Mission
-            from agentic_fx.runners.local_runner import LocalRunner
-            from agentic_fx.tools.registry import ToolRegistry
 
-            registry = ToolRegistry()
+            workdir = Path.cwd()
             mission = Mission(**handshake["mission"])
-            on_message = _make_on_message(protocol_out, out_seq)
-            runner = LocalRunner(
-                base_url=settings.llama_swap.base_url,
-                model=settings.runner.improve.model, registry=registry,
-                on_message=on_message)
+            runner = _run_improve_mission(
+                settings=settings, workdir=workdir,
+                protocol_out=protocol_out, out_seq=out_seq)
 
             _send_frame(protocol_out, out_seq, {
                 "type": "ready", "ok": True,
