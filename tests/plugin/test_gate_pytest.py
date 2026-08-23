@@ -214,6 +214,57 @@ def test_run_gate_pytest_rejects_when_candidate_mutates_itself(tmp_path, setting
     assert after_artifact == before_artifact
 
 
+def test_run_gate_pytest_checks_candidate_snapshot_before_spawning_pytest(
+        tmp_path, settings, monkeypatch):
+    """B6 (段 0 束 B 致命、`stage0-bundle-B.md`): `check_candidate_snapshot`
+    は候補ディレクトリの完全性検査であり、これを pytest 実行 (収集を含む)
+    の**前**に行うことが「候補のサブディレクトリに置かれた任意コードが
+    収集時に import される」経路 (`loader._reject_unexpected_py_files` は
+    直下のファイルのみを見るため) を止める唯一の防御になっている。
+
+    既存の台帳 pin (6-B′ M7) は `grep -n "check_candidate_snapshot"` の
+    **静的検査**であり、呼び出しの実行**順序**を入れ替える変異
+    (`check_candidate_snapshot` の呼び出しを pytest 実行の**後**へ移す)
+    に対して構造的に盲目 (呼び出しは残っているので grep は通る)。
+
+    `check_candidate_snapshot` と `subprocess.Popen` の両方を、呼ばれた
+    順に自分の名前を記録してから本体へ委譲するラッパで monkeypatch し、
+    正常な候補に対して `run_gate_pytest` を 1 回走らせて
+    `calls == ["check_candidate_snapshot", "Popen"]` であることを assert
+    する。Landlock も FS 側チャネルも使わない、順序だけを見る pin
+    (是正時の判断: report が「採ってはいけない案」として明示的に棄却した
+    「候補の sub/conftest.py が痕跡を残さないことを assert する」形の
+    振る舞い pin は使わない — 候補 dir は gate 内で ro、workdir は
+    `TemporaryDirectory` で `with` を抜けると消え、永続する側チャネルが
+    無いため原理的に効かない)。"""
+    _skip_if_no_landlock()
+    d = _write_candidate(tmp_path, test_py=_PASSING_TEST)
+
+    import agentic_fx.plugin.gate_pytest as gate_mod
+
+    calls: list[str] = []
+    real_check = gate_mod.check_candidate_snapshot
+    real_popen = gate_mod.subprocess.Popen
+
+    def spy_check(plugin_dir):
+        calls.append("check_candidate_snapshot")
+        return real_check(plugin_dir)
+
+    def spy_popen(*a, **kw):
+        calls.append("Popen")
+        return real_popen(*a, **kw)
+
+    monkeypatch.setattr(gate_mod, "check_candidate_snapshot", spy_check)
+    monkeypatch.setattr(gate_mod.subprocess, "Popen", spy_popen)
+
+    result = run_gate_pytest(d, settings=settings)
+
+    assert result.passed is True, result.stdout_tail
+    assert calls == ["check_candidate_snapshot", "Popen"], (
+        f"check_candidate_snapshot が pytest 実行 (Popen) より前に呼ばれて"
+        f"いない (B6): {calls!r}")
+
+
 def test_run_gate_pytest_fails_when_hash_changes_between_before_and_after(
         tmp_path, settings, monkeypatch):
     """副 pin (fault injection): 親側の hash 再計算そのものが機能して
