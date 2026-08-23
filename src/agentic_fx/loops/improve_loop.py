@@ -2,8 +2,12 @@
 (設計書 §4、プラン §8.1-6/11/16/23/24/40/42/43)。"""
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import sqlite3
+import stat
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -31,6 +35,77 @@ if TYPE_CHECKING:
     from agentic_fx.store.rag import Rag  # precheck 2026-08-22 wave2: T10-B10
 
 _log = logging.getLogger("agentic_fx.improve_loop")
+
+
+def _artifact_hash_of(plugin_py: bytes, config_yaml: bytes,
+                      test_plugin: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b"plugin.py\0" + plugin_py + b"\0config.yaml\0" + config_yaml
+             + b"\0test_plugin.py\0" + test_plugin)
+    return h.hexdigest()
+
+
+def copy_source_snapshot(metas: list, *, dest_root: Path,
+                         plugin_lock: threading.Lock) -> list[str]:
+    """稼働中 registry の固定 `PluginMeta.path` (版ディレクトリ実体) から
+    承認済み plugin 3 本を読取専用スナップショットへコピーする
+    (設計書 §3.4/§4 冒頭、プラン §8.1-11)。**live symlink `plugins/<name>`
+    は一切参照しない** — `meta.path` は discover 時点で symlink 解決済みの
+    実体パスとして registry が既に保持している (Task 5 の産物)。
+
+    コピー完了後に 3 本から再計算した artifact_hash を `meta.artifact_hash`
+    と照合する — 不一致ならコピー中の版切替 (live 差し替え) か 3 本混成を
+    示すので `ValueError` で fail closed にする。
+    """
+    dest_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    copied_names: list[str] = []
+    with plugin_lock:
+        for meta in metas:
+            plugin_py = (meta.path / "plugin.py").read_bytes()
+            config_yaml = (meta.path / "config.yaml").read_bytes()
+            test_plugin = (meta.path / "test_plugin.py").read_bytes()
+            recomputed = _artifact_hash_of(plugin_py, config_yaml, test_plugin)
+            if recomputed != meta.artifact_hash:
+                raise ValueError(
+                    f"plugin {meta.name!r}: artifact_hash mismatch after "
+                    "copy (expected "
+                    f"{meta.artifact_hash}, got {recomputed}) — live version "
+                    "may have switched mid-copy or files came from mixed "
+                    "versions")
+            target = dest_root / meta.name
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "plugin.py").write_bytes(plugin_py)
+            (target / "config.yaml").write_bytes(config_yaml)
+            (target / "test_plugin.py").write_bytes(test_plugin)
+            copied_names.append(meta.name)
+    _chmod_tree_readonly(dest_root)
+    return copied_names
+
+
+def copy_examples_snapshot(examples_root: Path, *, dest_root: Path) -> None:
+    """`docs/examples/plugins/*` を `source/_examples/<name>/` へ読取専用
+    コピーする (worker は repo の `docs/` を Landlock で読めない — Task 5)。
+    """
+    dest_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not examples_root.exists():
+        return
+    for entry in sorted(examples_root.iterdir()):
+        if not entry.is_dir():
+            continue
+        target = dest_root / entry.name
+        for fname in ("plugin.py", "config.yaml", "test_plugin.py"):
+            src_file = entry / fname
+            if src_file.exists():
+                target.mkdir(parents=True, exist_ok=True)
+                (target / fname).write_bytes(src_file.read_bytes())
+    _chmod_tree_readonly(dest_root)
+
+
+def _chmod_tree_readonly(root: Path) -> None:
+    for dirpath, dirnames, filenames in os.walk(root):
+        for fname in filenames:
+            os.chmod(os.path.join(dirpath, fname), 0o400)
+        os.chmod(dirpath, 0o500)
 
 
 class ImproveLoop:
@@ -208,7 +283,22 @@ class ImproveLoop:
         # `WorkerRunner.run()` が workdir 作成直後に
         # `shutil.copytree(source_snapshot_dir, workdir/"source")` で行う
         # (Task 1 Step 33 実装時追記)。詳細は 10.3 節参照。
-        raise NotImplementedError  # 10.3 節
+        staging_dir = self._root / f"improve-staging-{mission_id}"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+
+        source_snapshot_root = staging_dir / "_snapshot_src"
+
+        # copy_examples_snapshot を先に実行し、その後 copy_source_snapshot を実行する
+        # (R-D3 による権限管理: _snapshot_src が 0o500 になる前に _examples も配置)
+        examples_root = Path(self._settings.data_root) / "docs" / "examples" / "plugins"
+        copy_examples_snapshot(examples_root, dest_root=source_snapshot_root / "_examples")
+
+        # Discover 済みの plugin metas をここでコピーする実装は後続節に任せる (10.3 節の stub)
+        # とりあえず空の出所を用意する
+        copy_source_snapshot([], dest_root=source_snapshot_root,
+                            plugin_lock=threading.Lock())
+
+        return staging_dir, source_snapshot_root
 
     def _build_rpc_handlers(self, ledger, *, staging_dir: Path):
         raise NotImplementedError  # Task 7 依存分。10.9 節 Step 11 で完全実装する
