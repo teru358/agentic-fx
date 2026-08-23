@@ -21,6 +21,11 @@ from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # 属性未定義で ImportError になり、足しても sys.modules から取り直す
     # ため効かない)
 from agentic_fx.loops.improve_context import build_improve_context
+from agentic_fx.plugin.gate_pytest import (
+    CandidateSnapshotError, check_candidate_snapshot, hashes_of,
+    run_gate_pytest,
+)
+from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA  # precheck 2026-08-22 wave2: T10-B12
@@ -54,6 +59,14 @@ class _InspectionVerdict:  # 新規命名
 class _SelectionOutcome:  # 新規命名
     won: bool
     backlog_id: int | None
+
+
+@dataclass(frozen=True)
+class _PluginGateVerdict:  # 新規命名
+    passed: bool
+    reason: str = ""
+    content_hash: str | None = None
+    artifact_hash: str | None = None
 
 
 def _artifact_hash_of(plugin_py: bytes, config_yaml: bytes,
@@ -451,6 +464,44 @@ class ImproveLoop:
         except BaseException:
             conn.rollback()
             raise
+
+    def _run_plugin_gate(self, plugin_dir: Path, *,
+                         name: str) -> _PluginGateVerdict:
+        # precheck 2026-08-22 wave2: T10-B14 T10-M5 T10-M6 T10-M7
+        try:
+            check_candidate_snapshot(plugin_dir)
+        except CandidateSnapshotError as exc:
+            return _PluginGateVerdict(passed=False, reason=str(exc))
+
+        content_hash_before, artifact_hash_before = hashes_of(plugin_dir)
+
+        try:
+            check_source(plugin_dir / "plugin.py")
+            check_source(plugin_dir / "test_plugin.py",
+                        extra_allowed=frozenset({"pytest", "plugin"}))
+        except SandboxError as exc:
+            return _PluginGateVerdict(passed=False, reason=str(exc))
+
+        try:
+            result = run_gate_pytest(plugin_dir, settings=self._settings)
+        except RuntimeError as exc:
+            # M7: Landlock 不可 (run_gate_pytest の fail-closed RuntimeError,
+            # 設計書 §4.2-3d) は commit() 全体を例外で抜けさせず gate 不合格に倒す
+            return _PluginGateVerdict(passed=False, reason=str(exc))
+        if not result.passed:
+            return _PluginGateVerdict(
+                passed=False, reason=f"pytest failed: {result.stdout_tail}")
+
+        content_hash_after, artifact_hash_after = hashes_of(plugin_dir)
+        if (content_hash_after != content_hash_before
+                or artifact_hash_after != artifact_hash_before):
+            return _PluginGateVerdict(
+                passed=False, reason="hash changed after pytest execution "
+                                     "(candidate was mutated by its own test)")
+
+        return _PluginGateVerdict(
+            passed=True, content_hash=content_hash_before,
+            artifact_hash=artifact_hash_before)
 
     def commit(self, *, mission, ctx, result, now):
         raise NotImplementedError  # 10.4〜10.11 節
