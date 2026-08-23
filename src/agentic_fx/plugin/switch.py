@@ -62,6 +62,21 @@ def advance_switch_journal(
     now: datetime, commit: bool = False,
 ) -> None:
     row = journal_store.get(conn, op_id)
+    # 段 0 独立発見 (1) 是正: `_PHASE_ORDER` は定義行以外に参照が無い死に
+    # コードだった。ここで単調性を実行時に強制する — 既に到達済みの phase
+    # より前 (または同じ) へ `advance` しようとすると ValueError (fail
+    # closed)。`_advance_to_decided` の 0d 再試行 (preparing/versioned/
+    # recorded で止まったジャーナルを頭から再実行する経路) はこの関数を
+    # 呼ぶ前に到達済み phase をスキップするガードを自前で持つ (呼び出し元
+    # 側の責務 — この関数は「呼ばれたら必ず前進でなければならない」という
+    # 単純な不変条件だけを守る)。
+    current_idx = _PHASE_ORDER.index(row["phase"])
+    new_idx = _PHASE_ORDER.index(phase)
+    if new_idx <= current_idx:
+        raise ValueError(
+            f"op_id={op_id}: phase order violation ({row['phase']!r} -> "
+            f"{phase!r}) — _PHASE_ORDER requires strictly forward progress "
+            "(設計 §5.1 phase 表)")
     if phase == "switched" and not row["switch_required"]:
         raise ValueError(
             f"op_id={op_id}: switch_required=0 の行は 'switched' phase を "
@@ -75,11 +90,23 @@ def switch_live(plugins_root: Path, name: str, *, new_target: str,
                op_id: int) -> None:
     """temp symlink 経由の 1 rename。live がプレーン dir ならこの関数を
     呼ばない (呼び出し元が事前に absent/symlink であることを確認する)。"""
-    temp = plugins_root / f".{name}.link-{op_id}"
+    _atomic_symlink_swap(plugins_root, plugins_root / name, target=new_target,
+                         temp_name=f".{name}.link-{op_id}")
+
+
+def _atomic_symlink_swap(plugins_root: Path, live: Path, *, target: str,
+                        temp_name: str) -> None:
+    """`live` を `target` へ 1 rename で切り替える (§5.1 手順 6 の原子性)。
+    `switch_live`/`_revert_one` の共通経路 — 段 0 M10 是正: 原子性 pin
+    (検収 B1) が `switch_live` にしか無く、鏡像の `_revert_one` の symlink
+    復元が非 atomic 2 段 (unlink→symlink_to) になり得た欠陥を、実装を
+    1 本化することで再発させない形にする。`live` への `unlink` は一切
+    行わない (「live が無い瞬間」を作らない)。"""
+    temp = plugins_root / temp_name
     if temp.exists() or temp.is_symlink():
         temp.unlink()
-    temp.symlink_to(new_target)
-    os.rename(temp, plugins_root / name)
+    temp.symlink_to(target)
+    os.rename(temp, live)
 
 
 def _revert_one(conn: sqlite3.Connection, row: dict, *, plugins_root: Path,
@@ -90,11 +117,8 @@ def _revert_one(conn: sqlite3.Connection, row: dict, *, plugins_root: Path,
             if live.is_symlink():
                 live.unlink()
         else:  # symlink
-            temp = plugins_root / f".{row['name']}.link-{row['op_id']}"
-            if temp.exists() or temp.is_symlink():
-                temp.unlink()
-            temp.symlink_to(row["old_target"])
-            os.rename(temp, live)
+            _atomic_symlink_swap(plugins_root, live, target=row["old_target"],
+                                temp_name=f".{row['name']}.link-{row['op_id']}")
     journal_store.set_phase(conn, row["op_id"], phase="reverted", now=now, commit=False)  # B-2
     if activity is not None:
         activity.write(Category.APPROVAL, "switch_reverted",
@@ -454,22 +478,37 @@ def _advance_to_decided(
     artifact_hash: str, switch_required: bool, decided_by: str, now: datetime,
 ) -> None:
     """preparing 済みジャーナルを versioned → recorded → (switched →
-    切替) → decided まで進める (P2 手順 5〜9 / P3 手順 6A〜11A の共有部)。"""
+    切替) → decided まで進める (P2 手順 5〜9 / P3 手順 6A〜11A の共有部)。
+
+    段 0 独立発見 (1) 是正: 0d の「この approval 自身の再試行」経路は、
+    'versioned'/'recorded' まで進んだジャーナルを頭から再実行するために
+    この関数を再度呼ぶ (create_version_dir/record_version はどちらも
+    冪等)。`advance_switch_journal` は段 0 で単調性チェックを獲得したため、
+    既に到達済みの phase へ**後方**の advance を投げると ValueError になる
+    — ここで到達済み phase をスキップするガードを持ち、その後方 advance
+    自体を発生させない (§5.1-1 (a) の再試行冪等性を壊さない)。"""
+    current_idx = _PHASE_ORDER.index(journal_store.get(conn, op_id)["phase"])
+
     version_dir = version_store.create_version_dir(
         plugins_root, name, artifact_hash,
         plugin_py=(candidate_dir / "plugin.py").read_bytes(),
         config_yaml=(candidate_dir / "config.yaml").read_bytes(),
         test_plugin=(candidate_dir / "test_plugin.py").read_bytes(),
         op_identity=str(op_id))
-    advance_switch_journal(conn, op_id, phase="versioned", now=now, commit=True)
+    if current_idx < _PHASE_ORDER.index("versioned"):
+        advance_switch_journal(conn, op_id, phase="versioned", now=now, commit=True)
+        current_idx = _PHASE_ORDER.index("versioned")
 
     history_git.record_version(
         plugins_root / ".history.git", name=name, artifact_hash=artifact_hash,
         content_hash=content_hash, approval_id=approval_id, version_dir=version_dir)
-    advance_switch_journal(conn, op_id, phase="recorded", now=now, commit=True)
+    if current_idx < _PHASE_ORDER.index("recorded"):
+        advance_switch_journal(conn, op_id, phase="recorded", now=now, commit=True)
+        current_idx = _PHASE_ORDER.index("recorded")
 
     if switch_required:
-        advance_switch_journal(conn, op_id, phase="switched", now=now, commit=True)
+        if current_idx < _PHASE_ORDER.index("switched"):
+            advance_switch_journal(conn, op_id, phase="switched", now=now, commit=True)
         new_target = f".versions/{name}/{artifact_hash}"
         switch_live(plugins_root, name, new_target=new_target, op_id=op_id)
         # 手順 8a: 切替後の再照合 (fail closed — 自動巻き戻しは

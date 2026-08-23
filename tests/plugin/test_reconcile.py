@@ -91,6 +91,44 @@ def test_gc_roots_excludes_unreferenced_version(env):
     assert d_orphan.resolve() not in roots
 
 
+def test_gc_roots_includes_manually_placed_live_symlink_without_approval_row(env):
+    """段 0 M04 の killer: `gc_roots` ③ (live symlink の指す先) を丸ごと
+    無効化しても緑になった。既存の
+    `test_gc_roots_includes_approved_symlink_and_journal_and_legacy_plain`
+    は symlink 先を ① (approved payload の artifact_hash) 経由でも満たせて
+    しまう恒真テストなので、本テストは対応する approval 行 (approved でも
+    legacy_plain_present pending でも) を一切持たない live symlink (DB
+    移行後・手動配置想定) だけを作り、①②④ のいずれも満たさない構成で
+    ③ 単独の効果を確かめる。"""
+    tmp_path, plugins_dir, conn = env
+    d, a = _make_version(plugins_dir, "manual")
+    (plugins_dir / "manual").symlink_to(f".versions/manual/{a}")
+
+    roots = version_store.gc_roots(conn, plugins_root=plugins_dir)
+
+    assert d.resolve() in roots
+
+
+def test_gc_roots_includes_temp_link_path_itself(env):
+    """段 0 M05 の killer: `gc_roots` ④ のうち `temp_path` の項
+    (`if temp_path: roots.add(...)`) だけを落としても緑になった。temp
+    symlink 自体のパス (`plugins/.<name>.link-<op_id>`) は
+    new_target/old_target からは導出できない別のパスであり、これを ④ が
+    個別に root 集合へ含めることを直接確かめる (temp link を実際には disk
+    に作らないことで、new_target/old_target 経由の `.resolve()` に巻き
+    込まれて偶然一致する恒真化を避ける)。"""
+    tmp_path, plugins_dir, conn = env
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="tmp_only", old_kind="absent",
+        old_target=None, new_target=f".versions/tmp_only/{'a' * 64}",
+        switch_required=True, actor="human", now=NOW, commit=True)
+
+    roots = version_store.gc_roots(conn, plugins_root=plugins_dir)
+
+    expected = (plugins_dir / f".tmp_only.link-{op_id}").resolve()
+    assert expected in roots
+
+
 def test_sweep_orphans_deletes_version_not_in_gc_roots(env):
     tmp_path, plugins_dir, conn = env
     d_orphan, _ = _make_version(plugins_dir, "orphan")

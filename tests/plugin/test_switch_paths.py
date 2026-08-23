@@ -331,6 +331,145 @@ def test_approve_candidate_missing_stays_pending(env, monkeypatch):
     assert not (plugins_dir / "sma").exists()
 
 
+# --- 段 0 M12: P2 が「稼働中 live symlink を新版へ差し替える」本命経路 ---
+
+def _write_candidate_v(dirpath: Path, v: float) -> None:
+    """`_write_candidate` の内容を可変にした版 (段 0 probe 転用)。同一内容
+    だと content_hash が一致して switch_required が正典でも 0 になり
+    恒真化するため、2 つの候補の内容を必ず変えること。"""
+    dirpath.mkdir(parents=True)
+    (dirpath / "plugin.py").write_text(
+        f"def compute(df, params):\n    return {{'v': {v}}}\n")
+    (dirpath / "config.yaml").write_text(CONFIG_YAML)
+    (dirpath / "test_plugin.py").write_text(TEST_PY_OK)
+
+
+def test_approve_upgrades_live_symlink_to_the_new_version(env, monkeypatch):
+    """段 0 M12 の killer: `switch_required` の算出から `old_target ==
+    new_target` の項を落とすと、稼働中 (live symlink 有り) の名前を別の版へ
+    アップグレードする P2 の本命経路が無検証のまま緑になる — この経路を
+    直接踏む。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    _write_candidate_v(plugins_dir / "_staging" / "1" / "sma", 1.0)
+    a1 = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+    switch.approve_candidate(conn, a1, decided_by="h", now=NOW,
+                             plugins_root=plugins_dir, settings=settings)
+    live = plugins_dir / "sma"
+    assert live.is_symlink()
+    old_target = live.readlink().as_posix()
+
+    _write_candidate_v(plugins_dir / "_staging" / "2" / "sma", 2.0)  # 別内容
+    a2 = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "2",
+        candidate_origin="staging", mission_id=2, backlog_id=None,
+        settings=settings, now=NOW)
+    import json
+    ah2 = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (a2,)).fetchone()["payload_json"])["artifact_hash"]
+    switch.approve_candidate(conn, a2, decided_by="h", now=NOW,
+                             plugins_root=plugins_dir, settings=settings)
+
+    row2 = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                        (a2,)).fetchone()
+    assert row2["status"] == "approved"
+    assert live.readlink().as_posix() == f".versions/sma/{ah2}"
+    assert live.readlink().as_posix() != old_target
+    j = conn.execute("SELECT phase, switch_required FROM plugin_switch_journal "
+                     "WHERE approval_id=?", (a2,)).fetchone()
+    assert (j["phase"], j["switch_required"]) == ("decided", 1)
+
+
+def test_approve_upgrade_reverifies_content_hash_after_switch(env, monkeypatch):
+    """§5.1 手順 8a の pin: switch_required=1 の経路は切替直後に
+    content_hash を再照合する。M12 (switch_required の誤算出で 0 になる)
+    は `if switch_required:` ブロック自体を丸ごとスキップさせるため、8a の
+    再照合コードも一緒に実行されなくなる — 実際に不一致を強制して
+    RuntimeError が上がることを直接確かめ、8a が「アップグレード」経路で
+    実行されることを pin する (living-target の一致だけでは 8a が走った
+    ことの証明にならない)。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    _write_candidate_v(plugins_dir / "_staging" / "1" / "sma", 1.0)
+    a1 = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+    switch.approve_candidate(conn, a1, decided_by="h", now=NOW,
+                             plugins_root=plugins_dir, settings=settings)
+
+    _write_candidate_v(plugins_dir / "_staging" / "2" / "sma", 2.0)
+    a2 = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "2",
+        candidate_origin="staging", mission_id=2, backlog_id=None,
+        settings=settings, now=NOW)
+
+    monkeypatch.setattr("agentic_fx.plugin.switch.loader.content_hash",
+                        lambda p: "0" * 64)
+    with pytest.raises(RuntimeError, match="content_hash mismatch"):
+        switch.approve_candidate(conn, a2, decided_by="h", now=NOW,
+                                 plugins_root=plugins_dir, settings=settings)
+
+    row2 = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                        (a2,)).fetchone()
+    assert row2["status"] == "pending"
+
+
+# --- 段 0 非致命 4 ---
+
+def test_is_superseded_key_requires_content_hash_match_not_name_alone(env, monkeypatch):
+    """段 0 M13 の killer: `_is_superseded` の後発決定 key を `(name,
+    content_hash)` から `name` 単独に落としても緑になった。同名・**同一**
+    content_hash の approved 決定 B (B.id > A.id) が既にあっても、A は
+    陳腐化しない (invalidated にならない) こと — key に content_hash が
+    効いていることを直接 pin する (§8.1-39 D4)。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma")
+    a = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+    import json
+    content_hash = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (a,)).fetchone()["payload_json"])["content_hash"]
+
+    # 同名・同一 content_hash の approved 決定 B を手作りする (id は a より
+    # 後 = B.id > A.id — 手作りなので b の candidate は実在しなくてよい)
+    b = approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": content_hash,
+                 "artifact_hash": "b" * 64, "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/2/sma"}, now=NOW)
+    conn.execute("UPDATE approval_requests SET status='approved' WHERE id=?", (b,))
+    conn.commit()
+    assert b > a
+
+    switch.approve_candidate(conn, a, decided_by="h", now=NOW,
+                             plugins_root=plugins_dir, settings=settings)
+
+    row_a = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                         (a,)).fetchone()
+    assert row_a["status"] == "approved"  # invalidated にならない
+
+
+def test_resolve_candidate_dir_rejects_name_mismatch_in_canonical_path(env):
+    """段 0 M21 の killer: `resolve_candidate_dir` の正規形検査から
+    `m.group(m.lastindex) != name` の項を落としても緑になった。
+    candidate_path の末尾セグメントと `name` が一致しない locator を直接
+    `ValueError` で拒否することを pin する (§8.1-29)。"""
+    root, plugins_dir, conn, settings = env
+    with pytest.raises(ValueError, match="does not match the canonical form"):
+        switch.resolve_candidate_dir(
+            plugins_dir, candidate_origin="human",
+            candidate_path="plugins/_human/other", name="sma")
+
+
 def test_no_direct_decide_calls_in_plugin_module(tmp_path):
     """裁定1: switch.py/approval.py/commands.py は approvals_store.decide を
     直接呼ばない (apply_decision を経由する — grep-zero pin、B-4 是正で
@@ -342,6 +481,98 @@ def test_no_direct_decide_calls_in_plugin_module(tmp_path):
          "src/agentic_fx/commands.py"],
         capture_output=True, text=True)
     assert result.stdout == "", f"unexpected decide() call sites:\n{result.stdout}"
+
+
+# --- 段 0 M09: write-ahead 不変条件 (switched は switch_live の前に commit) ---
+
+def test_switch_live_runs_after_switched_phase_is_committed(env, monkeypatch):
+    """段 0 M09 の killer: `advance_switch_journal(phase="switched")` を
+    `switch_live` の後へ移す変異は、既存の crash probe
+    (`_simulate_crash_after_switch_before_decide`、`_finalize_decision` を
+    落とす) では判別できない — その注入点は switch_live と phase 書込みの
+    どちらが先でも `phase=='switched'` に見えてしまう。判別できる唯一の
+    シームは「switch_live の**間**で落とす」ことなので、本物の switch_live
+    を呼んだ直後に raise するラッパへ差し替えて crash を再現し、crash 時点
+    で journal の phase が既に 'switched' へ commit 済みであることを直接
+    確かめる (設計 §5.1 の phase 表: 「切替 (FS 効果) の前に switched を
+    commit する」)。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma")
+    approval_id = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    real_switch_live = switch.switch_live
+
+    def _crash_after_switch_live(*a, **kw):
+        real_switch_live(*a, **kw)
+        raise RuntimeError("simulated crash after switch_live")
+
+    monkeypatch.setattr(switch, "switch_live", _crash_after_switch_live)
+
+    with pytest.raises(RuntimeError, match="simulated crash after switch_live"):
+        switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW,
+                                 plugins_root=plugins_dir, settings=settings)
+
+    journal_row = conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE approval_id=?",
+        (approval_id,)).fetchone()
+    assert journal_row["phase"] == "switched", (
+        "write-ahead 不変条件違反: switch_live 完了時点で phase が既に "
+        "'switched' へ commit 済みでなければならない (M09)")
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending"
+
+
+def test_retry_from_recorded_phase_completes_without_order_violation(env, monkeypatch):
+    """`_PHASE_ORDER` の実行時強制 (M09 独立発見 (1)) の回帰ガード: 0d の
+    「この approval 自身の再試行」経路は、既存ジャーナルが 'preparing'/
+    'versioned'/'recorded' で止まっていても `_advance_to_decided` を頭から
+    もう一度呼ぶ (§5.1-1 (a))。この再実行は `advance_switch_journal` へ
+    'versioned'→'recorded' の**後方**移動を要求することになるため、単調性
+    強制を素朴に実装すると (_advance_to_decided 側にスキップガードを
+    足さずに advance_switch_journal だけを直そうとすると) この正当な再試行
+    経路まで ValueError にしてしまう。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma")
+    approval_id = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    real_advance = switch.advance_switch_journal
+
+    def _crash_on_switched(conn_, op_id, *, phase, now, commit=False):
+        if phase == "switched":
+            raise RuntimeError("simulated crash before switched")
+        return real_advance(conn_, op_id, phase=phase, now=now, commit=commit)
+
+    monkeypatch.setattr(switch, "advance_switch_journal", _crash_on_switched)
+    with pytest.raises(RuntimeError, match="simulated crash before switched"):
+        switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW,
+                                 plugins_root=plugins_dir, settings=settings)
+    monkeypatch.undo()
+
+    journal_row = conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE approval_id=?",
+        (approval_id,)).fetchone()
+    assert journal_row["phase"] == "recorded"  # 前提の確認
+
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    switch.retry_approval(conn, approval_id, decided_by="human", now=NOW,
+                          plugins_root=plugins_dir, settings=settings)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "approved"
+    journal_row2 = conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE approval_id=?",
+        (approval_id,)).fetchone()
+    assert journal_row2["phase"] == "decided"
 
 
 # --- 検収 B3: 0d early-exit の再開前再検証 (設計書 §5.1-1 (a)) ---
