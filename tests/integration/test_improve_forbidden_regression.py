@@ -1,12 +1,15 @@
 """遮断 8 項目の実プロセス統合回帰 (設計書 §7.1-1、§8.1-13)。
 
-**このファイルは Task 7 で red のまま書き始める** — ①②③ は既存
-`tests/test_improve_profile_isolation.py` の probe と同じ手法で Task 7
-時点で green にできるが、④〜⑧ は Task 8/10 が実装するまで存在しない
-経路 (RPC ツール未配線・`ImproveLoop` 未実装) を検査するため red のまま
-残る。**どの task が何を green にするかは末尾の表で管理する** — 各
-`pytest.mark.xfail(strict=True, reason=...)` に担当 task を明記し、
-green 化した task が `xfail` マーカーを外す。
+Task 12 完了時点での状態:
+- ①②④⑥: test_improve_worker_write_boundary_and_forbidden_tools で検査
+  (①②④④: Landlock/権限境界、⑥: forbidden tool registry)
+- ③: tests/test_improve_profile_isolation.py::test_improve_profile_cannot_reach_data_dir
+- ⑤: tests/test_improve_profile_isolation.py::test_run_holdout_gate_requires_history_conn_keyword
+- ⑦⑧: 下記の 2 本のテスト (Task 10 の RPC ハンドラ実装・commit 相ロジック依存)
+  - test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly (⑦: 禁止キー除去)
+  - test_holdout_and_analysis_ids_never_come_from_agent_output (⑧: 台帳台帳導出)
+
+すべて green のため xfail マーカーは 0 件。
 """
 from __future__ import annotations
 
