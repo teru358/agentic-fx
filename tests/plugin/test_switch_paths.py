@@ -1142,3 +1142,43 @@ def test_advance_to_decided_refuses_when_candidate_changes_during_full_gate(env,
             mission_id=1, backlog_id=None, settings=settings, now=NOW)
 
     assert approvals_store.pending(conn, kind="plugin") == []
+
+
+def test_advance_to_decided_detects_in_place_tamper_of_artifact_hash_only(env, monkeypatch):
+    """確定-7: `_advance_to_decided` の切替後再照合 (手順 8a) は
+    content_hash だけでなく artifact_hash とディレクトリ名も照合する
+    (`_reverify_switched_journal._new_target_hash_ok` と実装共有 —
+    `_version_dir_hashes_ok`)。版ディレクトリの test_plugin.py だけを
+    record_version 直後 (切替前) に改竄すると content_hash
+    (plugin.py+config.yaml のみ) は変わらないが artifact_hash は変わる
+    — 旧実装 (content_hash のみ照合) はこれを見逃して approved へ進んで
+    しまっていた。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma")
+    aid = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    from agentic_fx.plugin import history_git as history_git_mod
+    real_record_version = history_git_mod.record_version
+
+    def _record_then_tamper(*a, **kw):
+        result = real_record_version(*a, **kw)
+        version_dir = kw["version_dir"]
+        version_dir.chmod(0o700)
+        (version_dir / "test_plugin.py").chmod(0o600)
+        (version_dir / "test_plugin.py").write_text("import os\n# TAMPERED\n")
+        version_dir.chmod(0o500)
+        return result
+    monkeypatch.setattr("agentic_fx.plugin.switch.history_git.record_version",
+                        _record_then_tamper)
+
+    with pytest.raises(RuntimeError, match="content_hash mismatch"):
+        switch.approve_candidate(conn, aid, decided_by="human", now=NOW,
+                                 plugins_root=plugins_dir, settings=settings)
+
+    status = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                          (aid,)).fetchone()["status"]
+    assert status == "pending"

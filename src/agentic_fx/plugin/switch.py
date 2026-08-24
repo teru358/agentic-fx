@@ -545,15 +545,56 @@ def _advance_to_decided(
         switch_live(plugins_root, name, new_target=new_target, op_id=op_id)
         # 手順 8a: 切替後の再照合 (fail closed — 自動巻き戻しは
         # reconcile_switch_journals の switched 収束規則に委ねる。ここでは
-        # 例外を送出して手順 9 (decide) へ進ませない)
+        # 例外を送出して手順 9 (decide) へ進ませない)。確定-7: 旧稿は
+        # content_hash のみを見ており、resume 経路
+        # (`_reverify_switched_journal._new_target_hash_ok`) が持つ
+        # artifact_hash 照合 + ディレクトリ名照合 (in-place 編集検出) が
+        # 無かった (経路の非対称) — `_version_dir_hashes_ok` を共有する形へ
+        # 揃える。
         resolved_after = (plugins_root / new_target).resolve()
-        after_hash = loader.content_hash(resolved_after)
-        if after_hash != content_hash:
+        if not _version_dir_hashes_ok(
+                resolved_after, content_hash=content_hash, artifact_hash=artifact_hash):
+            # メッセージ中の "content_hash mismatch" 部分文字列は既存テスト
+            # `test_approve_upgrade_reverifies_content_hash_after_switch`
+            # の `pytest.raises(match=...)` が pin している (既存テスト
+            # 書き換え禁止のため文言を維持)。
             raise RuntimeError(
                 f"plugin {name!r}: live content_hash mismatch after switch "
-                f"(expected {content_hash}, got {after_hash})")
+                f"(expected content_hash={content_hash} "
+                f"artifact_hash={artifact_hash})")
 
     _finalize_decision(conn, approval_id, op_id=op_id, decided_by=decided_by, now=now)
+
+
+def _version_dir_hashes_ok(version_dir: Path, *, content_hash: str | None,
+                          artifact_hash: str | None) -> bool:
+    """確定-7: 版ディレクトリの内容が期待する `(content_hash, artifact_hash)`
+    と一致し、かつディレクトリ名自体も `artifact_hash` と一致することを
+    確認する (in-place 編集の検出 — §2.3・§7.1-37)。
+    `_reverify_switched_journal` (resume 経路) と `_advance_to_decided`
+    (fresh approve 経路) の切替後再照合が同じ規則を共有する
+    (確定-7: 旧稿は fresh 経路が content_hash 1 値しか見ておらず、
+    resume 経路だけが artifact_hash 2 値 + dir 名照合を持つ非対称だった)。"""
+    if not version_dir.is_dir():
+        return False
+    try:
+        # `loader.content_hash` (モジュール属性参照) を直接呼ぶ — 旧稿の
+        # `_advance_to_decided` が `loader.content_hash(resolved_after)` を
+        # 直呼びしていたのと同じ経路にする (`test_approve_upgrade_
+        # reverifies_content_hash_after_switch` が `monkeypatch.setattr(
+        # "agentic_fx.plugin.switch.loader.content_hash", ...)` でこの
+        # 経路を差し替える契約を持つ — `gate_pytest.hashes_of` 内部の
+        # `_content_hash` は import 時に束縛済みでこの monkeypatch の対象
+        # にならない)。
+        actual_content = loader.content_hash(version_dir)
+        plugin_py = (version_dir / "plugin.py").read_bytes()
+        config_yaml = (version_dir / "config.yaml").read_bytes()
+        test_plugin = (version_dir / "test_plugin.py").read_bytes()
+        actual_artifact = loader.artifact_hash_bytes(plugin_py, config_yaml, test_plugin)
+    except OSError:
+        return False
+    return (actual_content == content_hash and actual_artifact == artifact_hash
+            and version_dir.name == artifact_hash)
 
 
 def _reverify_switched_journal(
@@ -581,21 +622,15 @@ def _reverify_switched_journal(
     expected_artifact_hash = payload.get("artifact_hash")
 
     def _new_target_hash_ok() -> bool:
-        version_dir = plugins_root / new_target
-        if not version_dir.is_dir():
-            return False
-        try:
-            content, artifact = hashes_of(version_dir)
-        except OSError:
-            return False
         # I3 是正 (verified-codex-round1.md / 設計 §2.3・§7.1-37): reconcile
         # も loader と同じ規則で「版ディレクトリ名 == 実 artifact_hash」を
         # 照合する (in-place 編集の検出)。content_hash (2 本) だけでは
         # test_plugin.py だけの改変を見逃し、approved だが起動時ロード
-        # 不能という不収束状態を作れた。
-        return (content == expected_content_hash
-                and artifact == expected_artifact_hash
-                and version_dir.name == artifact)
+        # 不能という不収束状態を作れた。確定-7: `_advance_to_decided` と
+        # 実装を共有する (`_version_dir_hashes_ok`)。
+        return _version_dir_hashes_ok(
+            plugins_root / new_target, content_hash=expected_content_hash,
+            artifact_hash=expected_artifact_hash)
 
     if _new_target_hash_ok():
         return True
