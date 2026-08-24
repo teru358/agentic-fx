@@ -31,6 +31,7 @@ from agentic_fx.plugin.gate_pytest import (
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.strategy_gate import evaluate_strategy_adoption_gate
 from agentic_fx.runners.base import Mission
+from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
