@@ -11,16 +11,18 @@ green 化した task が `xfail` マーカーを外す。
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 import textwrap
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from agentic_fx.activity import ActivityLog
+from agentic_fx.backtest.timeframes import TF_MINUTES
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.landlock import is_available as landlock_available
@@ -28,8 +30,26 @@ from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import missions as missions_store
+from agentic_fx.store import ohlcv
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.tools.improve_rpc_tools import build_improve_rpc_tooldefs
+
+_RW7_BEFORE_BOUNDARY = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def _rw7_sine(n, *, phase=0):
+    """`tests/backtest/test_analysis.py::_sine` と同型の決定的疑似価格列。"""
+    return [100 + math.sin((i + phase) / 5.0) for i in range(n)]
+
+
+def _rw7_seed_series(conn, symbol, values, *, start, timeframe="1h"):
+    """`tests/backtest/test_analysis.py::_series` と同型 (D-14 是正、検収
+    R2)。"""
+    step = timedelta(minutes=TF_MINUTES[timeframe])
+    rows = [(symbol, "1m", (start + i * step).isoformat(),
+             v, v + 0.05, v - 0.05, v, 1.0, 0.01)
+            for i, v in enumerate(values)]
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
 
 pytestmark = pytest.mark.skipif(
     not landlock_available(), reason="Landlock not available on this kernel/architecture")
@@ -237,6 +257,21 @@ def test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly(
     conn = connect(tmp_path / "t.db")
     init_db(conn)
     loop = _rw7_build_improve_loop(tmp_path, conn)
+    # D-14 是正 (検収 R2, 10.9 M10): `_RW7_SETTINGS` は既定どおり
+    # pairs=["USDJPY"]/watch_symbols=[] なので corr_matrix の candidates が
+    # 1 件のみで trial_count が常に 0 (insufficient_data 確定) になり、
+    # `persist` の値によらず analysis_runs の行数が変化しない — この
+    # assert は `persist=True` への変異を殺せない空洞だった。EURUSD を
+    # watch_symbols に足して 2 候補にし、holdout boundary より確実に前の
+    # 2 通貨ペア系列を投入して analyze_corr が実際に成功する経路へ倒す。
+    monkeypatch.setattr(loop, "_settings", loop._settings.model_copy(
+        update={"datafeed": loop._settings.datafeed.model_copy(
+            update={"watch_symbols": ["EURUSD"]})}))
+    _rw7_seed_series(conn, "USDJPY", _rw7_sine(200, phase=0),
+                     start=_RW7_BEFORE_BOUNDARY)
+    _rw7_seed_series(conn, "EURUSD", _rw7_sine(200, phase=1),
+                     start=_RW7_BEFORE_BOUNDARY)
+    conn.commit()
 
     fake_meta = SimpleNamespace(
         name="myst", kind="strategy", timeframe="1h",
@@ -289,11 +324,17 @@ def test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly(
     # (禁止キー無しの dict に禁止キーが無いのは当然)。ここで
     # `analyze_failed` (= handler 内で例外を握り潰した印) ではないこと
     # を明示的に検査し、遮断⑦の analyze_corr 側が偽 green にならない
-    # ようにする。空 DB での正当な `insufficient_data` は許容する
-    # (handler 自体は最後まで実行されている)。 -->
+    # ようにする。 -->
     assert an_out.get("error") != "analyze_failed", (
         f"analyze_corr_handler が例外を握り潰した (readonly conn が閉じて"
         f"いる等) 可能性: {an_out!r}")
+    # D-14 是正 (検収 R2): 上のデータ投入で candidates が実在するので
+    # `insufficient_data` にも倒れないはず — 倒れていたら fixture が
+    # 空洞化している (before_an/after_an の比較が persist=True への変異を
+    # 殺せなくなる)。
+    assert "error" not in an_out, (
+        f"analyze_corr が insufficient_data 等に倒れた (fixture が空洞): "
+        f"{an_out!r}")
 
     after_bt = conn.execute(
         "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]

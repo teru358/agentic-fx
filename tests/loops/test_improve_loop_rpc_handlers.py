@@ -10,17 +10,37 @@ tz-aware に揃える)。
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from agentic_fx.backtest.timeframes import TF_MINUTES
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.store import ohlcv
 from agentic_fx.store.db import connect_readonly
 from agentic_fx.tools.improve_rpc_tools import build_improve_rpc_tooldefs
 
 _NOW = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+_BEFORE_BOUNDARY = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def _sine(n, *, phase=0):
+    """三角関数の決定的疑似価格列 (`tests/backtest/test_analysis.py::_sine`
+    と同型)。"""
+    return [100 + math.sin((i + phase) / 5.0) for i in range(n)]
+
+
+def _seed_series(conn, symbol, values, *, start, timeframe="1h"):
+    """`tests/backtest/test_analysis.py::_series` と同型 — timeframe 幅
+    刻みの 1m バーとして投入する (分析面は 1m 行を読み取り時リサンプル)。"""
+    step = timedelta(minutes=TF_MINUTES[timeframe])
+    rows = [(symbol, "1m", (start + i * step).isoformat(),
+             v, v + 0.05, v - 0.05, v, 1.0, 0.01)
+            for i, v in enumerate(values)]
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
 
 _SAVE_KWARGS = dict(
     scope="in_sample", plugin_ref="plugins/_staging/x/myst",
@@ -136,15 +156,38 @@ def test_analyze_corr_handler_does_not_persist_before_tx2(
     同じ pin を `_build_rpc_handlers` 経由で確認する)。
 
     未申告の適応 (D-4 是正時に検出、上記テストと同型の理由): 共有 conn の
-    close 罠を避けるため readonly factory を差し替える。"""
+    close 罠を避けるため readonly factory を差し替える。
+
+    D-14 是正 (検収 R2): 元の fixture は空 DB だったため
+    `analyze_for_agent` が実データに到達する前に `insufficient_data` へ
+    倒れ、`persist` の値によらず行数が変化しない — `persist=True` への
+    変異が SURVIVED する空洞だった (10.9 M10)。`tests/backtest/
+    test_analysis.py::_seed_two_series` と同型のデータ (holdout boundary
+    より確実に前の 2 通貨ペア系列) を投入し、`analyze_corr` が実際に
+    corr_matrix を計算する経路まで到達させる。"""
     monkeypatch.setattr(
         loop_min, "_db_readonly_conn_factory",
         lambda: connect_readonly(tmp_path / "t.db"))
+    # settings.pairs=["USDJPY"]/watch_symbols=[] のままでは corr_matrix の
+    # candidates が 1 件のみで trial_count が常に 0 (insufficient_data
+    # 確定) になる — EURUSD を watch_symbols に足して 2 候補にする。
+    monkeypatch.setattr(loop_min, "_settings", loop_min._settings.model_copy(
+        update={"datafeed": loop_min._settings.datafeed.model_copy(
+            update={"watch_symbols": ["EURUSD"]})}))
+    _seed_series(conn, "USDJPY", _sine(200, phase=0), start=_BEFORE_BOUNDARY)
+    _seed_series(conn, "EURUSD", _sine(200, phase=1), start=_BEFORE_BOUNDARY)
+    conn.commit()
+
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0})
     handlers = loop_min._build_rpc_handlers(ledger, staging_dir=Path("/tmp/x"))
     before = conn.execute(
         "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
-    handlers["analyze_corr"]({"kind": "corr_matrix", "timeframe": "1h"})
+    result = handlers["analyze_corr"]({"kind": "corr_matrix", "timeframe": "1h"})
+    # fixture 自体が空洞化していないことの前提確認: 実際に相関が計算できて
+    # いる (insufficient_data に倒れていない)。
+    assert "error" not in result, (
+        f"analyze_corr が insufficient_data 等に倒れた (fixture が空洞): "
+        f"{result!r}")
     after = conn.execute(
         "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
     assert after == before
