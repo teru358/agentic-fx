@@ -77,18 +77,19 @@ def _report_artifact(proposal_kind: str, *, title: str = "test proposal",
     }
 
 
-def _write_staging_plugin(root: Path, mission_id: int, name: str,
+def _write_staging_plugin(staging_dir: Path, name: str,
                           plugin_py: str, config_yaml: str,
                           test_plugin: str) -> Path:
     """FakeImproveWorkerRunner はサブプロセスを起こさないため、`prepare()` が
     作った staging_dir へ候補 3 本を直接置く (worker が書くはずの内容を
-    テストが代理で書く)。"""
-    staging = root / "plugins" / "_staging" / str(mission_id) / name
-    staging.mkdir(parents=True)
-    (staging / "plugin.py").write_text(plugin_py, encoding="utf-8")
-    (staging / "config.yaml").write_text(config_yaml, encoding="utf-8")
-    (staging / "test_plugin.py").write_text(test_plugin, encoding="utf-8")
-    return staging
+    テストが代理で書く)。Task 10 では staging_dir は
+    root/improve-staging-<mission_id> である。"""
+    candidate = staging_dir / name
+    candidate.mkdir(parents=True)
+    (candidate / "plugin.py").write_text(plugin_py, encoding="utf-8")
+    (candidate / "config.yaml").write_text(config_yaml, encoding="utf-8")
+    (candidate / "test_plugin.py").write_text(test_plugin, encoding="utf-8")
+    return candidate
 
 
 _PASSING_INDICATOR_PY = """
@@ -171,7 +172,7 @@ def test_full_cycle_discovery_to_backlog_transition(improve_env):
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
         mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
-            root, ctx.mission_id, "rsi_gate_e2e",
+            ctx.staging_dir, "rsi_gate_e2e",
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _PASSING_INDICATOR_TEST)
         mission_result = worker.run(mission)
@@ -238,7 +239,7 @@ def test_gate_failure_stops_at_report_no_approval_request(improve_env):
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
         mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
-            root, ctx.mission_id, "bad_gate_e2e",
+            ctx.staging_dir, "bad_gate_e2e",
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _FAILING_INDICATOR_TEST)
         mission_result = worker.run(mission)
@@ -304,7 +305,7 @@ def test_concurrent_duplicate_selection_loser_becomes_observation(improve_env):
                            result=result, **kw)):
                 mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
                 _write_staging_plugin(
-                    root, ctx.mission_id, name,
+                    ctx.staging_dir, name,
                     _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
                     _PASSING_INDICATOR_TEST)
                 mission_ids[name] = ctx.mission_id
@@ -417,7 +418,7 @@ def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
         mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
-            root, ctx.mission_id, "ledger_pin_e2e",
+            ctx.staging_dir, "ledger_pin_e2e",
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _PASSING_INDICATOR_TEST)
         # 台帳に RPC 呼出しを一切積まない (analyze_corr/run_backtest を
@@ -465,7 +466,7 @@ def test_strategy_below_evaluable_min_trades_becomes_observation(improve_env):
                _holdout_should_not_be_called):
         mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
-            root, ctx.mission_id, "low_trades_strategy_e2e",
+            ctx.staging_dir, "low_trades_strategy_e2e",
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _PASSING_INDICATOR_TEST)
         mission_result = worker.run(mission)
@@ -555,7 +556,7 @@ def test_report_tmp_symlink_fails_closed(improve_env):
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
         mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
-            root, ctx.mission_id, "bad_gate_symlink_e2e",
+            ctx.staging_dir, "bad_gate_symlink_e2e",
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _FAILING_INDICATOR_TEST)  # ゲート不合格 → レポート経路へ入る
         tmp_dir = root / "reports" / ".tmp"
@@ -679,7 +680,7 @@ def test_report_creation_failure_leaves_result_null(improve_env):
                    lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
             mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
             _write_staging_plugin(
-                root, ctx.mission_id, "report_write_fails_e2e",
+                ctx.staging_dir, "report_write_fails_e2e",
                 _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
                 _FAILING_INDICATOR_TEST)
             mission_result = worker.run(mission)
@@ -759,7 +760,7 @@ def test_strategy_baseline_falls_back_to_no_strategy_row(improve_env):
                _fake_holdout_metrics()):
         mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
-            root, ctx.mission_id, "no_baseline_strategy_e2e",
+            ctx.staging_dir, "no_baseline_strategy_e2e",
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _PASSING_INDICATOR_TEST)
         mission_result = worker.run(mission)
@@ -808,7 +809,7 @@ def test_report_outbox_state_transitions_published_then_rename_failure(
                lambda **kw: FakeImproveWorkerRunner(result=result1, **kw)):
         mission1, ctx1, worker1 = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
-            root, ctx1.mission_id, "outbox_ok_e2e",
+            ctx1.staging_dir, "outbox_ok_e2e",
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _FAILING_INDICATOR_TEST)
         mission_result1 = worker1.run(mission1)
@@ -831,7 +832,7 @@ def test_report_outbox_state_transitions_published_then_rename_failure(
                lambda **kw: FakeImproveWorkerRunner(result=result2, **kw)):
         mission2, ctx2, worker2 = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
-            root, ctx2.mission_id, "outbox_fail_e2e",
+            ctx2.staging_dir, "outbox_fail_e2e",
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _FAILING_INDICATOR_TEST)
         expected_final = root / "reports" / f"improve-{NOW:%Y-%m-%d}-{ctx2.mission_id}.md"
