@@ -246,3 +246,32 @@ def test_legacy_plain_e2e_pending_retire_retry_completes_switch(env, monkeypatch
     meta_after = next(m for m in loader.discover(plugins_dir) if m.name == "sma")
     assert meta_after.path != meta_before.path
     assert meta_after.path.is_relative_to(plugins_dir / ".versions" / "sma")
+
+
+def test_materialize_copies_live_symlink_target_to_human(env):
+    """B-20: `materialize_plugin` は live が symlink (approved 済み plugin)
+    のケースでも版ディレクトリの実体を `_human/<name>` へコピーする
+    (旧稿は plain live のケースしかテストされておらず、symlink 追従経路が
+    0 本だった)。"""
+    tmp_path, plugins_dir, conn, settings = env
+    version_dir = plugins_dir / ".versions" / "sma" / ("a" * 64)
+    _write(version_dir)
+    (plugins_dir / "sma").symlink_to(
+        Path(".versions") / "sma" / ("a" * 64), target_is_directory=True)
+
+    dest = switch.materialize_plugin(plugins_dir, "sma")
+
+    assert dest == plugins_dir / "_human" / "sma"
+    assert (dest / "plugin.py").read_text() == INDICATOR_PY
+
+
+def test_materialize_rejects_live_symlink_escaping_plugins_root(env):
+    """E3 裁定 (2026-08-25、B-20): live symlink の実体が `plugins_root` の
+    外に出る場合は拒否する (containment 検査)。"""
+    tmp_path, plugins_dir, conn, settings = env
+    outside = tmp_path / "outside"
+    _write(outside)
+    (plugins_dir / "sma").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="escapes plugins_root"):
+        switch.materialize_plugin(plugins_dir, "sma")

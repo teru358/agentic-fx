@@ -879,6 +879,16 @@ def materialize_plugin(root: Path, name: str) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if live.is_symlink():
         src = (live.parent / live.readlink()).resolve()
+        # E3 裁定 (2026-08-25、B-20): live symlink の実体が `root` (=
+        # plugins_root) の外に出る場合は拒否する (containment 検査 —
+        # loader._resolve_entity の同じ軸の是正と対称)。
+        root_real = root.resolve()
+        try:
+            src.relative_to(root_real)
+        except ValueError:
+            raise ValueError(
+                f"materialize_plugin: live symlink target escapes "
+                f"plugins_root: {src}") from None
     else:
         src = live
     shutil.copytree(src, dest)
