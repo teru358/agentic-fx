@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import Category
 from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # module-level で import する (関数内 import だと monkeypatch.setattr
@@ -352,8 +353,27 @@ class ImproveLoop:
         # `WorkerRunner.run()` が workdir 作成直後に
         # `shutil.copytree(source_snapshot_dir, workdir/"source")` で行う
         # (Task 1 Step 33 実装時追記)。詳細は 10.3 節参照。
-        staging_dir = self._root / f"improve-staging-{mission_id}"
+        # D-15 是正 (着手前検証): 設計書 §2.2/§2.3/§4.2-5 の正規形は
+        # `<root>/plugins/_staging/<mission_id>/` (worker が rw で書ける
+        # 唯一の場所、`switch.py::_CANDIDATE_PATH_RE["staging"]` の regex、
+        # 起動時孤児 reconcile (`switch.py:215` の `plugins_root/"_staging"`
+        # 走査)、`mission_worker.py:155-159` の dirfd 再検証 (`staging_path.
+        # name == mission_id` かつ mode 0700) の 3 者が収束してこの形を
+        # 前提にする。旧実装は `<root>/improve-staging-<mission_id>` という
+        # 別系統の名前・default mode を使っており、`commit()` が記録する
+        # `candidate_path` (`plugins/_staging/<mission_id>/<name>`) と実体
+        # パスが一致せず承認時に恒久 `CandidateMissingError` pending になる
+        # 上、`mission_worker.py` の名前照合も `"improve-staging-5" != "5"`
+        # で必ず fail closed する実バグだった。実 subprocess 経路のテスト
+        # (`tests/test_improve_profile_isolation.py`) は `prepare()` を
+        # 経由せず自前で正規形の `staging_dir` を組むため、この不一致は
+        # これまで一度も実行されたことがなかった。
+        staging_dir = self._root / "plugins" / "_staging" / str(mission_id)
         staging_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(staging_dir, 0o700)  # mkdir は umask で masked、exist_ok
+                                       # だと既存 dir を re-mode しないため
+                                       # 明示 chmod する (mission_worker.py
+                                       # の dirfd 再検証が mode 0700 を要求)
 
         source_snapshot_root = staging_dir / "_snapshot_src"
 
@@ -720,9 +740,23 @@ class ImproveLoop:
                 "SELECT backlog_id FROM improvement_runs WHERE id=?",
                 (run_id,)).fetchone()
             if run is not None and run["backlog_id"] is not None:
+                # D-15 是正: 元の CAS guard は `status='done'` のみ許可して
+                # おり、「report artifact 成功 → done」の分岐しか想定して
+                # いなかった。`_finalize_gate_failed` (D-15 是正で report
+                # 生成を追加) は Tx-2 の時点で既に backlog を `observation`
+                # へ遷移させてから report を publish するため、公開失敗時の
+                # 補償も `observation` からの上書きを許す必要がある
+                # (`tests/loops/test_improve_e2e.py::
+                # test_report_outbox_state_transitions_published_then_rename_failure`
+                # の 2 本目、gate_failed 経路での rename 衝突)。backlog_id
+                # は Tx-1 CAS で単一 mission だけが占有するため、
+                # `done`/`observation` 以外に居るのは無関係な mission
+                # (`selected`/`open` 等) のときだけであり、それを誤って
+                # 上書きする心配はない。
                 conn.execute(
                     "UPDATE improvement_backlog SET status='observation', "
-                    "last_result=?, updated_at=? WHERE id=? AND status='done'",
+                    "last_result=?, updated_at=? WHERE id=? "
+                    "AND status IN ('done', 'observation')",
                     (f"report_failed:{reason}", now.isoformat(),
                      run["backlog_id"]))
             conn.commit()
@@ -1008,7 +1042,11 @@ class ImproveLoop:
                 report_state=("prepared" if report_path is not None else "none"),
                 backlog_transition=(
                     {"backlog_id": backlog_id, "status": "observation",
-                     "last_result": "unsupported_in_plan10"}
+                     # D-15 是正: 設計書 §4.3 状態表の逐語は
+                     # `unsupported_in_plan10:risk_gate` (reason 接尾辞を
+                     # 含む) — 現状この分岐は risk_gate 提案の未対応にしか
+                     # 到達しないため、そのまま付与する。
+                     "last_result": "unsupported_in_plan10:risk_gate"}
                     if report_path is None and backlog_id is not None
                     else ({"backlog_id": backlog_id, "status": "done",
                           "last_result": "reported"}
@@ -1050,8 +1088,22 @@ class ImproveLoop:
     def _delete_staging(self, ctx: ImproveRunContext) -> None:
         """§4.2 手順9: 「承認申請を出した staging は残す。それ以外は削除」
         — 非承認の全終端経路 (failed/output_invalid/loser/gate_failed) が
-        呼ぶ。存在しない/既に消えている場合も無害 (`ignore_errors=True`)。"""
+        呼ぶ。存在しない/既に消えている場合も無害 (`ignore_errors=True`)。
+
+        D-15 是正 (着手前検証): `staging_dir/_snapshot_src/` は
+        `_chmod_tree_readonly` (§4/10.3 節) でディレクトリ 0500・ファイル
+        0400 に固めてある。`shutil.rmtree` は削除対象の各ディレクトリに
+        書込権限が要る (`unlink`/`rmdir` は親エントリの書込権限で決まる)
+        ため、`ignore_errors=True` だけでは読取専用ツリーの削除に失敗して
+        `_snapshot_src` 配下がディスクに残り続ける (実測: `improve-staging-
+        <mission_id>` 命名時代は削除先が `plugins/_staging/<mission_id>`
+        と別パスだったため検査対象自体が常に存在せずこの欠陥が検出
+        されなかった)。削除前にツリー全体を書込可能に戻す。"""
         import shutil
+        for dirpath, dirnames, filenames in os.walk(ctx.staging_dir):
+            for fname in filenames:
+                os.chmod(os.path.join(dirpath, fname), 0o600)
+            os.chmod(dirpath, 0o700)
         shutil.rmtree(ctx.staging_dir, ignore_errors=True)
 
     def _finalize_failed_mission(self, conn, *, ctx, result, now) -> None:
@@ -1138,17 +1190,67 @@ class ImproveLoop:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
         `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
-        渡す)。承認申請は出さないため mission は `completed`/
-        `improvement_runs.result=NULL` で終端 (取引は止めない — R8)。
-        staging を削除し、台帳は `DISCARDED`。"""
+        渡す)。承認申請は出さないため mission は `completed` で終端
+        (取引は止めない — R8)。staging を削除し、台帳は `DISCARDED`。
+
+        D-15 是正 (着手前検証): 設計書 §4.2 手順6「ゲート不合格・評価不能・
+        observation・敗者のとき、reports に書く」に従い、`_finalize_loser`
+        と**全く同じ既存の outbox 規約** (`data/improve_reports/
+        improve-<mission_id>.md`) でレポートを書く — 新しい命名は導入
+        しない。旧実装は report を一切書かず `run_result=None`/
+        `report_state='none'` のまま終端していた
+        (`tests/loops/test_improve_e2e.py::
+        test_gate_failure_stops_at_report_no_approval_request` が期待する
+        レポートファイルに届かなかった)。"""
         ctx.ledger.mark_discarded()
         self._delete_staging(ctx)
+        body_md = (
+            f"# Improve Mission {ctx.mission_id} — gate failed\n\n"
+            f"reason: `{reason}`\n\nNo approval request was produced by "
+            "this mission.\n")
+        reports_dir = self._root / "data" / "improve_reports"
+        (reports_dir / ".tmp").mkdir(parents=True, exist_ok=True)
+        # D-15 是正: 設計書 §4.2 手順6/7「一時ファイル作成に失敗していたら
+        # result=NULL, report_state='failed'」/ §4.3 状態表「selected →
+        # レポートの一時ファイル作成に失敗 → observation
+        # (report_failed:<safe_reason>)」。旧実装 (3 箇所とも) は
+        # `_write_report_part` の `O_EXCL|O_NOFOLLOW` 書込失敗 (symlink 罠
+        # 等) を一切捕まえておらず、`OSError` が `commit()` を突き抜けて
+        # Mission が非終端のまま落ちていた
+        # (`tests/loops/test_improve_e2e.py::
+        # test_report_tmp_symlink_fails_closed`)。ここで捕まえて fail
+        # closed の終端 tx へ倒す。
+        try:
+            part_path = self._write_report_part(
+                reports_dir, mission_id=ctx.mission_id, body_md=body_md)
+        except OSError as exc:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                missions_store.finish_improve_mission(
+                    conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                    slot_key=ctx.slot_key, mission_status="completed",
+                    run_result=None, now=now,
+                    report_state="failed",
+                    backlog_transition=(
+                        {"backlog_id": backlog_id, "status": "observation",
+                         "last_result":
+                             f"report_failed:{safe_error_text(exc)}"}
+                        if backlog_id is not None else None),
+                    commit=False)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            return
+        final_path = reports_dir / f"improve-{ctx.mission_id}.md"
+
         conn.execute("BEGIN IMMEDIATE")
         try:
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="completed",
-                run_result=None, now=now,
+                run_result="report", now=now,
+                report_path=str(final_path), report_state="prepared",
                 backlog_transition=(
                     {"backlog_id": backlog_id, "status": "observation",
                      "last_result": reason}
@@ -1158,3 +1260,5 @@ class ImproveLoop:
         except BaseException:
             conn.rollback()
             raise
+        self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
+                             final_path=final_path, now=now)
