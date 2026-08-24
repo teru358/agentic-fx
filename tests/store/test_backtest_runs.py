@@ -515,3 +515,34 @@ def test_save_harness_run_commit_false_does_not_commit(tmp_path):
         "SELECT COUNT(*) c FROM backtest_runs WHERE id=?",
         (run_id,)).fetchone()
     assert row["c"] == 0   # rollback で消えている = commit されていなかった
+
+
+def test_save_harness_run_accepts_mission_id_kw_and_persists_it(tmp_path):
+    """プラン10 Task10-13 Step7 (RW4): Task 12 の `WHERE mission_id=?`
+    assert が成立するための書込経路。"""
+    conn = _conn(tmp_path)
+    run_id = backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="p", content_hash="h" * 8,
+        kind="indicator", pair="USDJPY", timeframe="1h", source="dukascopy",
+        period=(datetime(2026, 1, 1, tzinfo=timezone.utc),
+                datetime(2026, 1, 2, tzinfo=timezone.utc)),
+        metrics={}, settings_hash="s", core_commit="c",
+        initial_balance=10000.0, now=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        mission_id=42)
+    row = conn.execute(
+        "SELECT mission_id FROM backtest_runs WHERE id=?", (run_id,)).fetchone()
+    assert row["mission_id"] == 42
+
+
+def test_save_harness_run_mission_id_defaults_to_null(tmp_path):
+    conn = _conn(tmp_path)
+    run_id = backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="p", content_hash="h" * 8,
+        kind="indicator", pair="USDJPY", timeframe="1h", source="dukascopy",
+        period=(datetime(2026, 1, 1, tzinfo=timezone.utc),
+                datetime(2026, 1, 2, tzinfo=timezone.utc)),
+        metrics={}, settings_hash="s", core_commit="c",
+        initial_balance=10000.0, now=datetime(2026, 8, 22, tzinfo=timezone.utc))
+    row = conn.execute(
+        "SELECT mission_id FROM backtest_runs WHERE id=?", (run_id,)).fetchone()
+    assert row["mission_id"] is None

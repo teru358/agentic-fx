@@ -705,7 +705,8 @@ class ImproveLoop:
         "initial_balance", "now")
     _ANALYSIS_ROW_KEYS = ("params", "trial_count", "source")
 
-    def _persist_ledger_rows(self, conn, *, ledger_entries, now) -> list[int]:
+    def _persist_ledger_rows(self, conn, *, ledger_entries, now,
+                             mission_id: int | None = None) -> list[int]:
         """10.10 Step 3: 台帳から analysis_runs/backtest_runs へ永続化。"""
         from agentic_fx.store import analysis_runs as analysis_runs_store
         from agentic_fx.store import backtest_runs as backtest_runs_store
@@ -721,20 +722,24 @@ class ImproveLoop:
             if entry["kind"] == "run_backtest":
                 row_kwargs = {k: summary[k] for k in self._BACKTEST_ROW_KEYS}
                 backtest_runs_store.save_harness_run(
-                    conn, commit=False, variant="candidate", **row_kwargs)
+                    conn, commit=False, variant="candidate",
+                    mission_id=mission_id, **row_kwargs)
             elif entry["kind"] == "analyze_corr":
                 row_kwargs = {k: summary[k] for k in self._ANALYSIS_ROW_KEYS}
                 run_id = analysis_runs_store.save(
-                    conn, commit=False, now=now, **row_kwargs)
+                    conn, commit=False, now=now, mission_id=mission_id,
+                    **row_kwargs)
                 analysis_run_ids.append(run_id)
         return analysis_run_ids
 
-    def _persist_gate_rows(self, conn, *, gate_rows, now) -> None:
+    def _persist_gate_rows(self, conn, *, gate_rows, now,
+                           mission_id: int | None = None) -> None:
         """10.10 Step 3: 親ゲート行を永続化。"""
         from agentic_fx.store import backtest_runs as backtest_runs_store
 
         for row in gate_rows:
-            backtest_runs_store.save_harness_run(conn, commit=False, **row)
+            backtest_runs_store.save_harness_run(
+                conn, commit=False, mission_id=mission_id, **row)
 
     def _compensate_tx2_failure(self, conn, *, mission_id, run_id,
                                 backlog_id, slot_key, now) -> None:
@@ -768,10 +773,14 @@ class ImproveLoop:
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # precheck 2026-08-23 wave3: RW4 — mission_id (= ctx.mission_id、
+                # commit() が渡すローカル引数) を台帳/親ゲート両方の永続化へ
+                # 転送する。Task 12 の `WHERE mission_id=?` assert が読む列。
                 analysis_run_ids = self._persist_ledger_rows(
-                    conn, ledger_entries=ledger_entries, now=now)
+                    conn, ledger_entries=ledger_entries, now=now,
+                    mission_id=mission_id)
                 self._persist_gate_rows(
-                    conn, gate_rows=gate_rows, now=now)
+                    conn, gate_rows=gate_rows, now=now, mission_id=mission_id)
                 approval_payload = dict(approval_payload)
                 approval_payload["analysis_run_ids"] = analysis_run_ids
                 approval_payload["analysis_call_count"] = sum(

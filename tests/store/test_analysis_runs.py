@@ -75,3 +75,15 @@ def test_save_multiple_rows_get_distinct_ids(tmp_path):
     assert id1 != id2
     assert conn.execute(
         "SELECT COUNT(*) FROM analysis_runs").fetchone()[0] == 2
+
+
+def test_save_accepts_mission_id_kw_and_persists_it(tmp_path):
+    """プラン10 Task10-13 Step7 (RW4): Task 12 の `WHERE mission_id=?`
+    assert が成立するための書込経路。"""
+    conn = _conn(tmp_path)
+    run_id = analysis_runs.save(
+        conn, params={"request": {}}, trial_count=1, source="rpc",
+        now=H, mission_id=42)
+    row = conn.execute(
+        "SELECT mission_id FROM analysis_runs WHERE id=?", (run_id,)).fetchone()
+    assert row["mission_id"] == 42

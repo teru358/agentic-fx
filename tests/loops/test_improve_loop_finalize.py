@@ -560,3 +560,41 @@ def test_finalize_gate_failed_terminates_scheduler_wave_slot_as_done(
         "SELECT status FROM improve_wave_slots WHERE wave_period_key=? "
         "AND k=?", (period_key, k)).fetchone()
     assert slot["status"] == "done"
+
+
+def test_finalize_success_writes_mission_id_on_ledger_and_gate_rows(
+        loop_min, conn, mission_and_run_fixture):
+    """RW4 pin — Task 12 の `SELECT ... WHERE mission_id=?` assert が成立
+    するための検査。台帳 (`ledger_entries`) 由来の `analysis_runs` 行と、
+    親ゲート (`gate_rows`) 由来の `backtest_runs` 行 (no_strategy baseline
+    等) の**両方**に `mission_id` が書かれることを確認する
+    (`test_strategy_baseline_falls_back_to_no_strategy_row` (Task 12) の
+    baseline 行は gate_rows 経由で書かれるため、`_persist_ledger_rows` だけ
+    直しても不十分)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    now = datetime(2026, 8, 22, tzinfo=timezone.utc)
+    period = (datetime(2026, 1, 1, tzinfo=timezone.utc),
+              datetime(2026, 1, 2, tzinfo=timezone.utc))
+    ledger_entries = [{"kind": "analyze_corr", "trial_count": 1,
+                       "result_summary": {"params": {}, "trial_count": 1,
+                                         "source": "rpc"}}]
+    gate_rows = [{
+        "scope": "in_sample", "plugin_ref": "no_strategy:x",
+        "content_hash": "h" * 8, "kind": "strategy", "pair": "USDJPY",
+        "timeframe": "1h", "source": "dukascopy", "period": period,
+        "metrics": {}, "settings_hash": "s", "core_commit": "c",
+        "initial_balance": 10000.0, "now": now, "variant": "no_strategy"}]
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        now=now, ledger_entries=ledger_entries, gate_rows=gate_rows)
+
+    an_row = conn.execute(
+        "SELECT mission_id FROM analysis_runs WHERE mission_id=?",
+        (mission_id,)).fetchone()
+    assert an_row is not None
+    bt_row = conn.execute(
+        "SELECT mission_id FROM backtest_runs WHERE mission_id=? "
+        "AND variant='no_strategy'", (mission_id,)).fetchone()
+    assert bt_row is not None
