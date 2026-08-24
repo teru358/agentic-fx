@@ -119,6 +119,25 @@ def _app_with_threshold(tmp_path, threshold):
         run_init(root)
         app = build_app(root, runner=FakeRunner([]), clock=FixedClock(NOW),
                         embedding_fn=FakeEmbedding())
+    # 分離方式 (着手前検証、1815 errors の根本原因): このファイルは
+    # gate-reject-alert / 取引レーンのテストであり improve レーンは関心外
+    # だが、`app.scheduler.tick(...)` を実配線のまま呼ぶテスト
+    # (`_scheduler_tick_once` 経由) があり、Scheduler の catch-up 起動判定
+    # (`latest_scheduled_occurrence`) は**常に**直近の過去 occurrence を
+    # 見つける (改善スケジュールの特定時刻に一致させる必要はない — 初回
+    # tick は必ず 1 回 catch-up する設計、設計書 §3.1) ため、
+    # `ImproveSupervisor.tick` が実発火し実 WorkerRunner (実 subprocess・
+    # 実 llama-swap 接続) を spawn していた。`schedule.improve_at` を
+    # 動かしてテストを黙らせる対処 (231a485、本 Task で revert 済み) は
+    # 出荷既定を汚すため却下 — かわりにこのファイル固有のテストヘルパで
+    # `on_improve_tick` を無効化し、improve を実際に試すテスト
+    # (`tests/loops/test_improve_e2e.py`, `tests/service/
+    # test_improve_wiring.py` 等) だけが明示的に有効化する。
+    # `on_improve_tick=None` のときの `Scheduler.tick()` の契約 (空リスト
+    # を返す) 自体は `test_scheduler_tick_returns_empty_list_when_on_
+    # improve_tick_is_none` (tests/service/test_improve_wiring.py) が
+    # 別途 pin している。
+    app.scheduler.on_improve_tick = None
     app.settings = _settings_with_threshold(app.settings, threshold)
     app.trade_loop.settings = app.settings
     app.executor.settings = app.settings

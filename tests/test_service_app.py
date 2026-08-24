@@ -44,10 +44,28 @@ def _seam_app(tmp_path, runner):
 
     FakeEmbedding を注入することで chromadb のモデル DL を避け、
     テスト高速化を実現する (Task 0)。
+
+    分離方式 (着手前検証、1815 errors の根本原因の一部):
+    `run_service`/`_scheduler_tick_once` を実際に走らせるテストがこの
+    ヘルパを広く共有しているが、improve レーンは大半のテストの関心外。
+    Scheduler の catch-up 起動判定 (`latest_scheduled_occurrence`) は
+    **常に**直近の過去 occurrence を見つける (改善スケジュールの特定
+    時刻に一致させる必要はない — 初回 tick は必ず 1 回 catch-up する
+    設計、設計書 §3.1) ため、`ImproveSupervisor.tick` が実発火し実
+    WorkerRunner (実 subprocess・実 llama-swap 接続) を spawn していた
+    (`tests/loops/test_gate_reject_alert.py::_app_with_threshold` と
+    同じ根本原因)。`schedule.improve_at` を動かしてテストを黙らせる
+    対処 (231a485、本 Task で revert 済み) は出荷既定を汚すため却下 —
+    かわりにこのヘルパで `on_improve_tick` を無効化し、improve を実際に
+    試すテスト (`test_improve_tick_and_supervisor_wired_after_task12` 等、
+    `_seam_app` を経由せず `_init`+`build_app` を直接使う) だけが明示的に
+    有効化する。
     """
     _init(tmp_path)
-    return build_app(tmp_path, runner=runner, clock=FixedClock(NOW),
-                     embedding_fn=FakeEmbedding())
+    app = build_app(tmp_path, runner=runner, clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    app.scheduler.on_improve_tick = None
+    return app
 
 
 @contextmanager
