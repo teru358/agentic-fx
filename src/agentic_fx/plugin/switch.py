@@ -614,6 +614,16 @@ def _reverify_switched_journal(
         # いる場合のみなので、候補から再作成する前に stale な版を掃除する。
         version_dir = plugins_root / new_target
         if version_dir.is_dir():
+            # advisor 指摘: in-place 編集の検出は設計 §2.3 が loader 側に
+            # 要求する `plugin_artifact_hash_mismatch` ERROR と対称の記録を
+            # 要する — ここで無言で差し替えると tampering の痕跡が残らない。
+            if activity is not None:
+                activity.write(
+                    Category.APPROVAL, "switch_reverify_version_mismatch",
+                    f"name={name} op_id={journal_row['op_id']} "
+                    f"version_dir={version_dir} expected_artifact_hash="
+                    f"{expected_artifact_hash} — 版ディレクトリの内容が "
+                    "in-place 編集されていた可能性 (candidate から再構築する)")
             os.chmod(version_dir, 0o700)
             for f in version_dir.iterdir():
                 os.chmod(f, 0o600)

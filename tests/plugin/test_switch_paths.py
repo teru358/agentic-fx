@@ -877,9 +877,11 @@ def test_switched_journal_reverify_rejects_version_dir_with_tampered_test_plugin
     # 候補 (staging) は pending の間は残っているので健全なまま
     assert (plugins_dir / "_staging" / "1" / "sma" / "plugin.py").exists()
 
+    activity = ActivityLog(root / "logs" / "activity.log")
     monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
     switch.retry_approval(conn, approval_id, decided_by="human", now=NOW,
-                          plugins_root=plugins_dir, settings=settings)
+                          plugins_root=plugins_dir, settings=settings,
+                          activity=activity)
 
     row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
                        (approval_id,)).fetchone()
@@ -900,6 +902,14 @@ def test_switched_journal_reverify_rejects_version_dir_with_tampered_test_plugin
     assert (version_dir / "test_plugin.py").read_text() == TEST_PY_OK  # 候補内容に戻った
     live = plugins_dir / "sma"
     assert live.readlink().as_posix() == f".versions/sma/{recomputed_artifact}"
+
+    # I3 是正 (advisor 指摘): in-place 編集を検出して版を差し替えたことを
+    # activity ERROR に残す (設計 §2.3 は loader 側の同種検出に
+    # `plugin_artifact_hash_mismatch` の activity ERROR を要求しており、
+    # reconcile 側の検出も無言で直してはならない)。
+    log_text = (root / "logs" / "activity.log").read_text()
+    assert "switch_reverify_version_mismatch" in log_text
+    assert f"name=sma" in log_text
 
 
 def test_switched_journal_reverify_reverts_when_version_tampered_and_candidate_missing(
