@@ -118,6 +118,28 @@ def test_submit_gate_failure_creates_no_approval_row(env, monkeypatch):
 
 # --- P2: approve, live=absent ---
 
+def test_approve_expires_due_non_plugin_approvals_at_entry(env, monkeypatch):
+    """確定-16 (B-33 と対称、approve 側): `approve_candidate` の 0a
+    (`expire_due(commit=True)`) への entry test が無かった。"""
+    root, plugins_dir, conn, settings = env
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    approval_id = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+    stale_id = approvals_store.create(
+        conn, "tech_plugin", {"path": "x"}, NOW,
+        expires_at=NOW - timedelta(minutes=1))
+
+    switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW,
+                             plugins_root=plugins_dir, settings=settings)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (stale_id,)).fetchone()
+    assert row["status"] == "expired"
+
+
 def test_approve_live_absent_creates_version_git_and_switches(env, monkeypatch):
     root, plugins_dir, conn, settings = env
     _write_candidate(plugins_dir / "_staging" / "1" / "sma")
