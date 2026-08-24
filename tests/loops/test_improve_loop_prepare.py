@@ -9,6 +9,7 @@ import pytest
 
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.store.db import connect_readonly
 
 from tests.loops.conftest import _prepare_wave_slot
 
@@ -25,7 +26,8 @@ def test_improve_run_context_is_frozen_dataclass():
         ctx.mission_id = 99  # frozen
 
 
-def test_tx0_creates_mission_and_run_atomically_scheduler_wave(loop_full, conn, clock):
+def test_tx0_creates_mission_and_run_atomically_scheduler_wave(
+        loop_full, conn, clock, tmp_path):
     """scheduler wave (slot_key あり) のとき、missions/run/slot が
     1 commit で現れる (部分状態が観測できない)。
 
@@ -35,23 +37,40 @@ def test_tx0_creates_mission_and_run_atomically_scheduler_wave(loop_full, conn, 
     と一致しないため、共有 fixture `loop_full` (= `_conn_for_test` シーム
     付き。D-10 是正で `prepare()` にもこのシームを対称実装したため、
     `prepare()` 完了後も同一 `conn` で状態確認できる) を使う。
-    `_prepare_wave_slot` はキーワード専用シグネチャに合わせて呼ぶ。"""
+    `_prepare_wave_slot` はキーワード専用シグネチャに合わせて呼ぶ。
+
+    D-2b 是正 (検収 R2): `loop_full` の write/readonly 両 factory は
+    同一 `conn` オブジェクトを返すため、`prepare()` が返った後に**同じ
+    `conn`** で読むと「commit 済み」と「同一 tx 内で書いただけ」を区別
+    できない (`conn.commit()` を除去する変異が SURVIVED — killer は
+    D-9 の `tests/test_service_app.py::
+    test_submit_manual_with_real_improve_loop_prepares_without_notimplementederror`
+    (別接続で DB を読む) が担っていた)。ここでは `tmp_path/"t.db"` へ
+    **別の readonly 接続**を新規に開いて読み、Tx-0 が実際にディスクへ
+    commit されたことをこのテスト自身で検証する。"""
     now = clock.now()
     _prepare_wave_slot(conn, period_key="2026-W34", k=0, now=now)
 
     mission, ctx, runner = loop_full.prepare(slot_key=("2026-W34", 0), now=now)
 
-    m = conn.execute("SELECT * FROM missions WHERE id=?", (ctx.mission_id,)).fetchone()
-    assert m["status"] == "running"
-    assert m["loop"] == "improve"
-    r = conn.execute("SELECT * FROM improvement_runs WHERE id=?", (ctx.run_id,)).fetchone()
-    assert r["backlog_id"] is None
-    assert r["mission_id"] == ctx.mission_id
-    slot = conn.execute(
-        "SELECT status, mission_id FROM improve_wave_slots "
-        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
-    assert slot["status"] == "claimed"
-    assert slot["mission_id"] == ctx.mission_id
+    fresh = connect_readonly(tmp_path / "t.db")
+    try:
+        m = fresh.execute(
+            "SELECT * FROM missions WHERE id=?", (ctx.mission_id,)).fetchone()
+        assert m["status"] == "running"
+        assert m["loop"] == "improve"
+        r = fresh.execute(
+            "SELECT * FROM improvement_runs WHERE id=?",
+            (ctx.run_id,)).fetchone()
+        assert r["backlog_id"] is None
+        assert r["mission_id"] == ctx.mission_id
+        slot = fresh.execute(
+            "SELECT status, mission_id FROM improve_wave_slots "
+            "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+        assert slot["status"] == "claimed"
+        assert slot["mission_id"] == ctx.mission_id
+    finally:
+        fresh.close()
 
 
 def test_tx0_manual_one_shot_has_no_slot_claim(loop_full, conn, clock):
@@ -351,5 +370,11 @@ def test_build_worker_runner_passes_ctx_as_run_context(loop_full, conn):
     runner = loop_full._build_worker_runner(ctx)
     assert runner._run_context is ctx
     assert runner._worker_profile == "improve"
+    # D-13 是正 (検収 R2): `rag=self._rag` (逸脱申告 (4)) の pin。
+    # `rag=None` への変異は上記 2 assert では SURVIVED していた —
+    # `_build_worker_runner` が `Rag(self._db_readonly_conn_factory)` を
+    # 独自シグネチャで new せず、`ImproveLoop.__init__` が受け取った
+    # `self._rag` をそのまま WorkerRunner へ渡すことを確認する。
+    assert runner._rag is loop_full._rag
 
 
