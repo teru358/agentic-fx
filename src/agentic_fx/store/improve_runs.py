@@ -26,13 +26,16 @@ def bind_backlog(conn: sqlite3.Connection, run_id: int, backlog_id: int, *,
 def finish(conn: sqlite3.Connection, run_id: int, *, result: str | None,
            now: datetime, approval_id: int | None = None,
            report_path: str | None = None, report_state: str = "none",
-           commit: bool = True) -> None:
-    conn.execute(
+           commit: bool = True) -> bool:
+    """戻り値: `True` = この呼び出しが対象行を更新した。`False` = `run_id`
+    に該当する行が存在しなかった (rowcount=0、fail-open 防止)。"""
+    cur = conn.execute(
         "UPDATE improvement_runs SET result=?, approval_id=?, "
         "report_path=?, report_state=?, finished_at=? WHERE id=?",
         (result, approval_id, report_path, report_state, now.isoformat(), run_id))
     if commit:
         conn.commit()
+    return cur.rowcount == 1
 
 
 def set_report_state(conn: sqlite3.Connection, run_id: int, report_state: str,

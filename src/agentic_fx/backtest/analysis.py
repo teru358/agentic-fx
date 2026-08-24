@@ -19,6 +19,7 @@ opus I-1) を適用することで期間の所有をこのモジュールに一�
 """
 from __future__ import annotations
 
+import logging
 import math
 import sqlite3
 import statistics
@@ -31,6 +32,8 @@ from agentic_fx.config import Settings
 from agentic_fx.core.market_hours import is_market_open
 from agentic_fx.core.timeutil import as_utc
 from agentic_fx.store import analysis_runs as analysis_runs_store
+
+_log = logging.getLogger("agentic_fx.backtest.analysis")
 
 # パラメータは列挙制 (§6) — 自由な数値は受けない。
 TIMEFRAMES = ("15m", "1h", "4h", "1d")
@@ -462,6 +465,16 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
         # OverflowError は防御の深層 (`_load_returns` の正値ガードが主防御
         # だが、想定外経路からの到達に備えて改善ループ面への生例外漏洩を
         # 二重に塞ぐ)。
+        #
+        # 裁定 D4 (2026-08-24): agent への応答は insufficient_data のまま
+        # (サイドチャネル遮断は維持) だが、内部ログには例外種別 +
+        # traceback を残し観測可能にする (except ハンドラの故障源共有 —
+        # [[except-handler-shares-failure-source]] — を運用面で緩和する。
+        # ログは agent への応答経路とは別チャネルであり内容は漏れない)。
+        _log.warning(
+            "analyze_for_agent: correlation計算で例外を握り潰し "
+            "insufficient_data を返す (故障源: 標本不足 / ゼロ除算 / "
+            "オーバーフローのいずれか)", exc_info=True)
         return {"error": "insufficient_data"}
 
     save_params = {"params": {"request": dict(request),

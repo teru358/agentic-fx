@@ -53,6 +53,23 @@ CREATE TABLE IF NOT EXISTS improvement_runs (
 );
 """
 
+# 裁定 D1 (2026-08-24): improvement_runs.mission_id に missions(id) への FK
+# を追加する rebuild 用 DDL。この rebuild は「mission_id 列は既にあるが
+# FK が無い」DB (プラン10 Task 8 で `_ensure_column` により無 FK で追加
+# された既存 DB) 専用であり、その時点で他の追加列 (report_state 等) は
+# init_db の呼び出し順序上まだ追加されていないため v2 の列 + mission_id
+# のみで足りる。
+_IMPROVEMENT_RUNS_MISSION_ID_FK_DDL = """
+CREATE TABLE IF NOT EXISTS improvement_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  backlog_id INTEGER REFERENCES improvement_backlog(id),
+  result TEXT CHECK (result IN ('approval','report')),
+  approval_id INTEGER, report_path TEXT,
+  mission_id INTEGER REFERENCES missions(id),
+  started_at TEXT NOT NULL, finished_at TEXT
+);
+"""
+
 # プラン 9 Task 17 (設計書 D3): `action` / `reject_category` を持つ
 # trade_intents。**fresh (_SCHEMA) と migration (rebuild) が同一本文を
 # 参照する** — 束 D (_SIGNALS_V2_DDL) と同じ規約。`name` / `ine` だけを
@@ -124,7 +141,7 @@ CREATE TABLE IF NOT EXISTS improve_wave_slots (
   k INTEGER NOT NULL,
   status TEXT NOT NULL
     CHECK(status IN ('reserved','claimed','running','done','failed')),
-  mission_id INTEGER,
+  mission_id INTEGER REFERENCES missions(id),
   spawn_attempts INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   PRIMARY KEY(wave_period_key, k)
@@ -849,6 +866,188 @@ def _migrate_improvement_runs_v2(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_improvement_runs_mission_id_fk(conn: sqlite3.Connection) -> None:
+    """裁定 D1 (2026-08-24): `improvement_runs.mission_id` に
+    `missions(id)` への FK を追加する。
+
+    2 経路: (a) `mission_id` 列がまだ無い DB (新規インストール含む) は
+    `ALTER TABLE ADD COLUMN ... REFERENCES` で足りる (SQLite は新規列への
+    REFERENCES 付与を許す — `tmp/review-bundleC/probe/probe_i1_fk.py` で
+    実測確認済み)。(b) 列は既にあるが FK が無い DB (本裁定より前に
+    `_ensure_column` で無 FK 追加された DB) は table rebuild が要る
+    (`_migrate_signals_fk`/`_migrate_improvement_runs_v2` と同じ規約:
+    FK トグルは BEGIN の外側・backup・行数一致ガード・
+    `PRAGMA foreign_key_check`)。
+    """
+    fk_present = any(
+        fk["table"] == "missions" and fk["from"] == "mission_id"
+        for fk in conn.execute("PRAGMA foreign_key_list(improvement_runs)"))
+    if fk_present:
+        return
+    cols = {r["name"] for r in
+           conn.execute("PRAGMA table_info(improvement_runs)")}
+    if "mission_id" not in cols:
+        conn.execute(
+            "ALTER TABLE improvement_runs ADD COLUMN "
+            "mission_id INTEGER REFERENCES missions(id)")
+        return
+
+    v1_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='improvement_runs_v1'").fetchone() is not None
+    if v1_exists:
+        raise RuntimeError(
+            "improvement_runs migration (mission_id FK, D1): 前回の移行が"
+            "中断した痕跡 improvement_runs_v1 が残っています。手動で内容を"
+            "確認し、退避または削除してから再実行してください。")
+
+    _backup_before_migration(conn, ".bak-improvement-runs-mission-fk")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            fk_present2 = any(
+                fk["table"] == "missions" and fk["from"] == "mission_id"
+                for fk in conn.execute(
+                    "PRAGMA foreign_key_list(improvement_runs)"))
+            if fk_present2:
+                conn.commit()
+                return
+
+            bad_rows = conn.execute(
+                "SELECT id FROM improvement_runs WHERE mission_id IS NOT NULL "
+                "AND mission_id NOT IN (SELECT id FROM missions)").fetchall()
+            if bad_rows:
+                ids = ", ".join(str(r["id"]) for r in bad_rows)
+                raise RuntimeError(
+                    "improvement_runs migration (mission_id FK, D1): "
+                    f"参照先の missions 行が無い mission_id を持つ行があります "
+                    f"(id={ids})。手動で調査・退避してから再実行してください。")
+
+            conn.execute(
+                "ALTER TABLE improvement_runs RENAME TO improvement_runs_v1")
+            conn.execute(_IMPROVEMENT_RUNS_MISSION_ID_FK_DDL)
+            conn.execute(
+                "INSERT OR IGNORE INTO improvement_runs "
+                "(id, backlog_id, result, approval_id, report_path, "
+                "mission_id, started_at, finished_at) "
+                "SELECT id, backlog_id, result, approval_id, report_path, "
+                "mission_id, started_at, finished_at "
+                "FROM improvement_runs_v1")
+
+            copied = conn.execute(
+                "SELECT COUNT(*) c FROM improvement_runs").fetchone()["c"]
+            original = conn.execute(
+                "SELECT COUNT(*) c FROM improvement_runs_v1").fetchone()["c"]
+            if copied != original:
+                raise RuntimeError(
+                    "improvement_runs migration (mission_id FK, D1): "
+                    f"行数が一致しません (improvement_runs_v1={original}, "
+                    f"improvement_runs={copied})。OR IGNORE が想定外の重複と"
+                    "衝突した可能性があります。")
+
+            violations = conn.execute(
+                "PRAGMA foreign_key_check(improvement_runs)").fetchall()
+            if violations:
+                raise RuntimeError(
+                    "improvement_runs migration (mission_id FK, D1): "
+                    f"修復後も FK 違反が残っています ({len(violations)} 行): "
+                    f"{[dict(v) for v in violations]}")
+
+            conn.execute("DROP TABLE improvement_runs_v1")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_improve_wave_slots_mission_id_fk(conn: sqlite3.Connection) -> None:
+    """裁定 D1 (2026-08-24): `improve_wave_slots.mission_id` に
+    `missions(id)` への FK を追加する (`_migrate_improvement_runs_mission_id_fk`
+    と同じ規約)。この表は `_SCHEMA` の直書き DDL でのみ作られる (`_ensure_column`
+    経路が無い) ため、既存 DB は「列はあるが FK が無い」状態のみが起こり得る
+    — rebuild 1 経路のみで足りる。"""
+    fk_present = any(
+        fk["table"] == "missions" and fk["from"] == "mission_id"
+        for fk in conn.execute("PRAGMA foreign_key_list(improve_wave_slots)"))
+    if fk_present:
+        return
+
+    v1_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='improve_wave_slots_v1'").fetchone() is not None
+    if v1_exists:
+        raise RuntimeError(
+            "improve_wave_slots migration (mission_id FK, D1): 前回の移行が"
+            "中断した痕跡 improve_wave_slots_v1 が残っています。手動で内容を"
+            "確認し、退避または削除してから再実行してください。")
+
+    _backup_before_migration(conn, ".bak-improve-wave-slots-mission-fk")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            fk_present2 = any(
+                fk["table"] == "missions" and fk["from"] == "mission_id"
+                for fk in conn.execute(
+                    "PRAGMA foreign_key_list(improve_wave_slots)"))
+            if fk_present2:
+                conn.commit()
+                return
+
+            bad_rows = conn.execute(
+                "SELECT wave_period_key, k FROM improve_wave_slots "
+                "WHERE mission_id IS NOT NULL "
+                "AND mission_id NOT IN (SELECT id FROM missions)").fetchall()
+            if bad_rows:
+                ids = ", ".join(f"({r['wave_period_key']},{r['k']})"
+                                for r in bad_rows)
+                raise RuntimeError(
+                    "improve_wave_slots migration (mission_id FK, D1): "
+                    f"参照先の missions 行が無い mission_id を持つ slot があり"
+                    f"ます ({ids})。手動で調査・退避してから再実行してください。")
+
+            conn.execute(
+                "ALTER TABLE improve_wave_slots RENAME TO improve_wave_slots_v1")
+            conn.execute(_IMPROVE_WAVE_SLOTS_DDL)
+            conn.execute(
+                "INSERT OR IGNORE INTO improve_wave_slots "
+                "(wave_period_key, k, status, mission_id, spawn_attempts, "
+                "created_at, updated_at) "
+                "SELECT wave_period_key, k, status, mission_id, "
+                "spawn_attempts, created_at, updated_at "
+                "FROM improve_wave_slots_v1")
+
+            copied = conn.execute(
+                "SELECT COUNT(*) c FROM improve_wave_slots").fetchone()["c"]
+            original = conn.execute(
+                "SELECT COUNT(*) c FROM improve_wave_slots_v1").fetchone()["c"]
+            if copied != original:
+                raise RuntimeError(
+                    "improve_wave_slots migration (mission_id FK, D1): "
+                    f"行数が一致しません (improve_wave_slots_v1={original}, "
+                    f"improve_wave_slots={copied})。OR IGNORE が想定外の"
+                    "重複と衝突した可能性があります。")
+
+            violations = conn.execute(
+                "PRAGMA foreign_key_check(improve_wave_slots)").fetchall()
+            if violations:
+                raise RuntimeError(
+                    "improve_wave_slots migration (mission_id FK, D1): "
+                    f"修復後も FK 違反が残っています ({len(violations)} 行): "
+                    f"{[dict(v) for v in violations]}")
+
+            conn.execute("DROP TABLE improve_wave_slots_v1")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
     """trade_intents に action / reject_category 列と CHECK を足す table
     rebuild (設計書 D3、プラン9 Task 17)。
@@ -983,28 +1182,43 @@ def _migrate_legacy_plugin_approval_payloads(conn: sqlite3.Connection) -> None:
     終端済み行・3 フィールド完備の pending 行・kind != 'plugin' の行には
     触れない。live からの候補推測はしない (payload をそのまま invalidate
     するのみ)。
+
+    **codex I4 是正 (2026-08-24)**: 設計書 §5.5 逐語どおり、単一 API
+    `approvals.apply_decision(status='invalidated', reason=
+    'legacy_payload_requires_resubmit')` を経由する — 直打ち UPDATE を
+    やめる。これにより payload に `backlog_id` を含む legacy 行は
+    `apply_approval_outcome` を通じて backlog も同一 tx で `observation`/
+    `last_result='invalidated'` に収束する (legacy_id 無し payload は
+    `apply_decision` 内の no-op 経路のまま — 今日時点では空振りだが、単一
+    API 規律を守ることで将来 backlog_id 付き legacy payload が現れても
+    正しく遷移する)。activity/通知の追加は `init_db` が activity・通知
+    seam を受け取らないため設計裁定待ち (D の対象外、別途起票)。
     """
+    from agentic_fx.store import approvals as approvals_mod
+
     rows = conn.execute(
         "SELECT id, payload_json FROM approval_requests "
         "WHERE kind='plugin' AND status='pending'").fetchall()
-    now_iso = _now_utc_isoformat()
+    now_dt = datetime.now(timezone.utc)
     for row in rows:
         try:
             payload = json.loads(row["payload_json"])
         except (TypeError, ValueError):
             payload = {}
-        if all(k in payload for k in _LEGACY_PLUGIN_APPROVAL_REQUIRED_KEYS):
+        # L43: `k in payload` は存在のみを見るため、空文字のような偽値を
+        # 新形式と誤認してしまう — 真値判定 (`payload.get(k)`) に直す。
+        if all(payload.get(k) for k in _LEGACY_PLUGIN_APPROVAL_REQUIRED_KEYS):
             continue  # 新形式 (3 フィールド完備) — 対象外
-        conn.execute(
-            "UPDATE approval_requests SET status='invalidated', "
-            "decided_by='system:migration', decided_at=?, "
-            "reason='legacy_payload_requires_resubmit' WHERE id=?",
-            (now_iso, row["id"]))
+        approvals_mod.apply_decision(
+            conn, row["id"], "invalidated", decided_by="system:migration",
+            now=now_dt, reason="legacy_payload_requires_resubmit",
+            commit=False)
         # R10 (裁定): 対象行ごとに WARNING を出す
         _log.warning(
             "plugin approval id=%s invalidated by legacy-payload migration "
             "(missing %s)", row["id"],
-            [k for k in _LEGACY_PLUGIN_APPROVAL_REQUIRED_KEYS if k not in payload])
+            [k for k in _LEGACY_PLUGIN_APPROVAL_REQUIRED_KEYS
+             if not payload.get(k)])
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -1025,8 +1239,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "improvement_backlog", "attempts",
                    "attempts INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "improvement_backlog", "last_result", "last_result TEXT")
-    _ensure_column(conn, "improvement_runs", "mission_id", "mission_id INTEGER")
+    _migrate_improvement_runs_mission_id_fk(conn)   # 裁定 D1 (2026-08-24)
     conn.execute(_IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL)
+    _migrate_improve_wave_slots_mission_id_fk(conn)  # 裁定 D1 (2026-08-24)
     _ensure_column(
         conn, "improvement_runs", "report_state",
         "report_state TEXT NOT NULL DEFAULT 'none' "
