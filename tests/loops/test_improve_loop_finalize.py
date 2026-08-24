@@ -598,3 +598,93 @@ def test_finalize_success_writes_mission_id_on_ledger_and_gate_rows(
         "SELECT mission_id FROM backtest_runs WHERE mission_id=? "
         "AND variant='no_strategy'", (mission_id,)).fetchone()
     assert bt_row is not None
+
+
+def test_persist_ledger_rows_skips_error_entries(loop_min, conn):
+    """D-11 (検収 R2、プラン L19627、10.11 節 M5 / T10-B20、実装者が Step 1
+    で追加することが明示指定されていたが未執筆だった): `_persist_ledger_rows`
+    の `if "error" in summary: continue` (improve_loop.py:778-782) を削ると、
+    正常な `{"error": "insufficient_data"}` 応答が `summary[k]` の
+    `KeyError` を送出し Mission 全体が補償 tx へ倒れる — 既存
+    `test_persist_ledger_rows_fails_closed_when_handler_omits_save_kwargs`
+    は「契約違反 (save_kwargs 欠落)」を検査するだけで「正常な error 応答」
+    とは区別しないため代替にならない (プランの指摘どおり)。
+
+    `ledger_entries` に `result_summary={"error": "insufficient_data"}` の
+    analyze_corr entry を混ぜ、`_persist_ledger_rows` が `KeyError` を送出
+    せず当該行を `analysis_runs`/`backtest_runs` に書かないことを assert
+    する。"""
+    now = datetime(2026, 8, 22, tzinfo=timezone.utc)
+    period = (datetime(2026, 1, 1, tzinfo=timezone.utc),
+             datetime(2026, 1, 2, tzinfo=timezone.utc))
+    ledger_entries = [
+        {"kind": "run_backtest", "trial_count": 1,
+         "result_summary": {
+             "scope": "in_sample", "plugin_ref": "plugins/myst",
+             "content_hash": "h1", "kind": "strategy", "pair": "USDJPY",
+             "timeframe": "1h", "source": "dukascopy", "period": period,
+             "metrics": {"pf": 1.2}, "settings_hash": "sh1",
+             "core_commit": "c1", "initial_balance": 10000.0, "now": now}},
+        # 正常な error 応答 (`analyze_corr_handler` が insufficient_data を
+        # 返した場合の shape — 契約違反ではない)。
+        {"kind": "analyze_corr", "trial_count": 0,
+         "result_summary": {"error": "insufficient_data"}},
+    ]
+
+    before_bt = conn.execute(
+        "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
+    before_an = conn.execute(
+        "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
+
+    analysis_run_ids = loop_min._persist_ledger_rows(
+        conn, ledger_entries=ledger_entries, now=now)
+
+    after_bt = conn.execute(
+        "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
+    after_an = conn.execute(
+        "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
+    # run_backtest entry (error 無し) だけが書かれる。
+    assert after_bt == before_bt + 1
+    # error 応答の analyze_corr entry は書かれず、id も積まれない。
+    assert after_an == before_an
+    assert analysis_run_ids == []
+
+
+def test_compensation_failure_does_not_propagate_to_caller(
+        loop_min, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """D-11 (検収 R2、プラン L19622、10.11 節 M1b / 実装本体は
+    improve_loop.py:873-877 に既にあるが killer が未執筆だった):
+    補償 tx (`_compensate_tx2_failure`) 自体が失敗しても、その例外を
+    `_finalize_success` の外側 (`_launch_slot` の呼び出し元スレッド) へ
+    漏らしてはならない — 二重障害 (Tx-2 失敗 + 補償失敗) でも Mission
+    worker スレッドを巻き込んで落とさず、`tx2_compensation_failed`
+    activity を書いて非終端のまま残す (次回起動時の reconcile 任せ)。
+
+    `_compensate_tx2_failure` を monkeypatch で常に例外送出させ、
+    `_finalize_success` の呼び出しが例外なく戻ることと
+    `activity.write(..., "tx2_compensation_failed", ...)` が呼ばれた
+    ことを assert する。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+
+    # Tx-2 本体を必ず失敗させる (approvals_store.create で fault 注入 —
+    # test_commit_rolls_back_tx2_on_db_fault_between_gate_rows_and_approval
+    # と同じ手法)。
+    from agentic_fx.store import approvals as approvals_store
+
+    def _tx2_boom(*a, **kw):
+        raise RuntimeError("simulated Tx-2 fault")
+    monkeypatch.setattr(approvals_store, "create", _tx2_boom)
+
+    def _compensation_boom(*a, **kw):
+        raise RuntimeError("simulated compensation fault")
+    monkeypatch.setattr(loop_min, "_compensate_tx2_failure", _compensation_boom)
+
+    # 例外なく戻ることそのものが pin (送出されればテストは失敗する)。
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "myst", "kind": "strategy"},
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc))
+
+    activity_text = (tmp_path / "activity.log").read_text()
+    assert "tx2_compensation_failed" in activity_text
+    assert f"mission_id={mission_id} run_id={run_id}" in activity_text
