@@ -846,7 +846,7 @@ class ImproveLoop:
                 if not gate_verdict.passed:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason=gate_verdict.reason, now=now)
+                        reason=f"gate_failed:{gate_verdict.reason}", now=now)
                     return
 
                 kind = self._read_candidate_kind(candidate_dir)
@@ -977,43 +977,114 @@ class ImproveLoop:
         config = yaml.safe_load(config_path.read_text())
         return config.get("timeframe", "1h")
 
+    def _delete_staging(self, ctx: ImproveRunContext) -> None:
+        """§4.2 手順9: 「承認申請を出した staging は残す。それ以外は削除」
+        — 非承認の全終端経路 (failed/output_invalid/loser/gate_failed) が
+        呼ぶ。存在しない/既に消えている場合も無害 (`ignore_errors=True`)。"""
+        import shutil
+        shutil.rmtree(ctx.staging_dir, ignore_errors=True)
+
     def _finalize_failed_mission(self, conn, *, ctx, result, now) -> None:
-        """timeout/failed/max_turns 処理。プラン実装時に申し送り条件参照。"""
-        from agentic_fx.store import missions as missions_store
+        """§3.6: timeout/failed/max_turns → missions を `failed` で終端。
+        `improvement_runs.result` は CHECK (`approval`/`report` のみ) の
+        制約上 NULL のまま (`result.status` の文字列をそのまま渡すと
+        IntegrityError になる)。backlog は未選択 (Tx-1 未到達) のため
+        遷移なし。staging を削除し、台帳は `DISCARDED` (呼び出し元
+        `commit()` の手順0で既に FROZEN、ここで確定させる)。"""
         ctx.ledger.mark_discarded()
-        missions_store.finish_improve_mission(
-            conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
-            slot_key=ctx.slot_key, mission_status="failed",
-            run_result="failed", now=now, commit=True)
-
-    def _finalize_output_invalid(self, conn, *, ctx, reason, now) -> None:
-        """手順1 不合格。プラン実装時に申し送り条件参照。"""
-        from agentic_fx.store import missions as missions_store
-        ctx.ledger.mark_discarded()
-        missions_store.finish_improve_mission(
-            conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
-            slot_key=ctx.slot_key, mission_status="failed",
-            run_result="failed", now=now, commit=True)
-
-    def _finalize_loser(self, conn, *, ctx, output, now) -> None:
-        """敗者経路。プラン実装時に申し送り条件参照。"""
-        from agentic_fx.store import missions as missions_store
+        self._delete_staging(ctx)
         conn.execute("BEGIN IMMEDIATE")
         try:
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
-                slot_key=ctx.slot_key, mission_status="completed",
-                run_result="duplicate", now=now, commit=False)
+                slot_key=ctx.slot_key, mission_status="failed",
+                run_result=None, now=now, backlog_transition=None,
+                commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
 
-    def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now) -> None:
-        """ゲート不合格。プラン実装時に申し送り条件参照。"""
-        from agentic_fx.store import missions as missions_store
+    def _finalize_output_invalid(self, conn, *, ctx, reason, now) -> None:
+        """§4.2 手順1 不合格 (schema 不整合・`artifact.name` 非正規形・
+        `staging_dir/<name>` 異常等) → Mission `failed`、
+        `improvement_runs.result` は NULL のまま、staging 削除、
+        台帳 `DISCARDED`。backlog は Tx-1 未到達のため遷移なし。"""
         ctx.ledger.mark_discarded()
-        missions_store.finish_improve_mission(
-            conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
-            slot_key=ctx.slot_key, mission_status="completed",
-            run_result="observation", now=now, commit=True)
+        self._delete_staging(ctx)
+        self._activity.write(
+            Category.IMPROVE, "output_invalid",
+            f"mission={ctx.mission_id} reason={reason}")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            missions_store.finish_improve_mission(
+                conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                slot_key=ctx.slot_key, mission_status="failed",
+                run_result=None, now=now, backlog_transition=None,
+                commit=False)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    def _finalize_loser(self, conn, *, ctx, output, now) -> None:
+        """§4.2 手順2 敗者経路 (Tx-1 の選択 CAS で rowcount=0):
+        backlog は一切遷移しない (自分は選択に負けただけで、勝者側の状態を
+        壊さない — §4.3「遷移は起きない」)。親が「重複のため見送り」の
+        自動レポートを 10.9 節の outbox ヘルパ (`_write_report_part`/
+        `_publish_report`) で書き、run を `result='report'` で終端する
+        (プラン10 Task10-11 申し送り)。staging は残す候補が無いため削除、
+        台帳はこの Mission の RPC 結果を一切永続化しないため `DISCARDED`。"""
+        ctx.ledger.mark_discarded()
+        self._delete_staging(ctx)
+        idea = output.get("selected", {}).get("idea", "")
+        body_md = (
+            f"# Improve Mission {ctx.mission_id} — skipped (duplicate)\n\n"
+            f"Selected backlog idea `{idea!r}` was already claimed by a "
+            "concurrent mission before this mission's Tx-1 CAS. No "
+            "candidate was produced by this mission.\n")
+        reports_dir = self._root / "data" / "improve_reports"
+        (reports_dir / ".tmp").mkdir(parents=True, exist_ok=True)
+        part_path = self._write_report_part(
+            reports_dir, mission_id=ctx.mission_id, body_md=body_md)
+        final_path = reports_dir / f"improve-{ctx.mission_id}.md"
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            missions_store.finish_improve_mission(
+                conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                slot_key=ctx.slot_key, mission_status="completed",
+                run_result="report", now=now,
+                report_path=str(final_path), report_state="prepared",
+                backlog_transition=None, commit=False)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
+                             final_path=final_path, now=now)
+
+    def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now) -> None:
+        """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
+        (`last_result` は呼び出し元が組み立てた `reason` そのまま —
+        `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
+        渡す)。承認申請は出さないため mission は `completed`/
+        `improvement_runs.result=NULL` で終端 (取引は止めない — R8)。
+        staging を削除し、台帳は `DISCARDED`。"""
+        ctx.ledger.mark_discarded()
+        self._delete_staging(ctx)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            missions_store.finish_improve_mission(
+                conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                slot_key=ctx.slot_key, mission_status="completed",
+                run_result=None, now=now,
+                backlog_transition=(
+                    {"backlog_id": backlog_id, "status": "observation",
+                     "last_result": reason}
+                    if backlog_id is not None else None),
+                commit=False)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise

@@ -346,3 +346,217 @@ def test_commit_terminates_scheduler_wave_slot_via_ctx_slot_key(
         "SELECT status FROM improve_wave_slots WHERE wave_period_key=? "
         "AND k=?", (period_key, k)).fetchone()
     assert slot["status"] == "done"
+
+
+# --- 10.11 節「未執筆メソッド」の回収 (前任 haiku が stub のまま残した
+# _finalize_failed_mission/_finalize_output_invalid/_finalize_loser/
+# _finalize_gate_failed の TDD 実装) ---
+# 前任 stub は `run_result="failed"`/`"observation"`/`"duplicate"` を
+# `finish_improve_mission` へ渡していたが、`improvement_runs.result` は
+# `CHECK (result IN ('approval','report'))` (db.py:50) — NULL 以外の
+# 未知値は sqlite3.IntegrityError で red になる。以下はこの契約を pin する。
+
+
+def test_finalize_failed_mission_terminates_failed_with_null_result_and_deletes_staging(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """§3.6: timeout/failed/max_turns → missions は failed、
+    improvement_runs.result は NULL のまま (CHECK は approval|report のみ
+    許す)、staging は削除、台帳は DISCARDED。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    (staging_dir / "marker").write_text("x")
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    result = MissionResult(status="timeout", output=None, transcript=[])
+
+    loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
+                                      now=datetime(2026, 8, 22))
+
+    m = conn.execute("SELECT status FROM missions WHERE id=?",
+                     (mission_id,)).fetchone()
+    assert m["status"] == "failed"
+    r = conn.execute("SELECT result FROM improvement_runs WHERE id=?",
+                     (run_id,)).fetchone()
+    assert r["result"] is None
+    assert not staging_dir.exists()
+    assert ledger._state == "DISCARDED"
+
+
+def test_finalize_failed_mission_terminates_scheduler_wave_slot_as_failed(
+        loop_min, conn, mission_and_run_fixture_with_slot, tmp_path):
+    """レビュー1周目 C2 と同型の pin: 失敗系終端でも `ctx.slot_key` を
+    固定値にすり替えず運び、slot が `running→failed` で終端すること。"""
+    mission_id, run_id, backlog_id, slot_key = mission_and_run_fixture_with_slot
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=slot_key, ledger=ledger,
+        rpc_handlers={})
+    result = MissionResult(status="failed", output=None, transcript=[])
+
+    loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
+                                      now=datetime(2026, 8, 22))
+
+    period_key, k = slot_key
+    slot = conn.execute(
+        "SELECT status FROM improve_wave_slots WHERE wave_period_key=? "
+        "AND k=?", (period_key, k)).fetchone()
+    assert slot["status"] == "failed"
+
+
+def test_finalize_output_invalid_terminates_failed_with_null_result_and_deletes_staging(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """§4.2 手順1 不合格: Mission failed、improvement_runs.result は NULL、
+    staging 削除、台帳 DISCARDED。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+
+    loop_min._finalize_output_invalid(
+        conn, ctx=ctx, reason="artifact.name is not canonical",
+        now=datetime(2026, 8, 22))
+
+    m = conn.execute("SELECT status FROM missions WHERE id=?",
+                     (mission_id,)).fetchone()
+    assert m["status"] == "failed"
+    r = conn.execute("SELECT result FROM improvement_runs WHERE id=?",
+                     (run_id,)).fetchone()
+    assert r["result"] is None
+    assert not staging_dir.exists()
+    assert ledger._state == "DISCARDED"
+
+
+def test_finalize_loser_writes_skip_report_and_finishes_run_as_report(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """§4.2 手順2 敗者経路: backlog は遷移せず (Tx-1 CAS rowcount=0)、
+    親が「重複のため見送り」レポートを自前で書き run を `result='report'`
+    で終端する (10.9 節の outbox ヘルパを再利用、プラン10 Task10-11
+    申し送り)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    output = {"selected": {"idea": "dup idea"}}
+
+    loop_min._finalize_loser(conn, ctx=ctx, output=output,
+                             now=datetime(2026, 8, 22))
+
+    m = conn.execute("SELECT status FROM missions WHERE id=?",
+                     (mission_id,)).fetchone()
+    assert m["status"] == "completed"
+    r = conn.execute(
+        "SELECT result, report_state, report_path FROM improvement_runs "
+        "WHERE id=?", (run_id,)).fetchone()
+    assert r["result"] == "report"
+    assert r["report_state"] == "published"
+    assert r["report_path"] is not None
+    assert Path(r["report_path"]).exists()
+    assert not staging_dir.exists()
+    assert ledger._state == "DISCARDED"
+    b = conn.execute(
+        "SELECT status FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert b["status"] == "open"  # 敗者経路は backlog を一切遷移させない
+
+
+def test_finalize_gate_failed_sets_backlog_observation_with_reason(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """§4.3: ゲート不合格/評価不能 → backlog は `observation`、
+    `last_result` は呼び出し元が渡した reason そのまま。承認申請は出さず
+    mission は `completed`/`result=NULL` で終端 (取引を止めない — R8)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    from agentic_fx.store import backlog as backlog_store
+    backlog_store.select_for_mission(conn, backlog_id,
+                                     now=datetime(2026, 8, 22), commit=True)
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id,
+        reason="gate_failed:pytest failed: boom", now=datetime(2026, 8, 22))
+
+    m = conn.execute("SELECT status FROM missions WHERE id=?",
+                     (mission_id,)).fetchone()
+    assert m["status"] == "completed"
+    r = conn.execute("SELECT result FROM improvement_runs WHERE id=?",
+                     (run_id,)).fetchone()
+    assert r["result"] is None
+    b = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert b["status"] == "observation"
+    assert b["last_result"] == "gate_failed:pytest failed: boom"
+    assert not staging_dir.exists()
+    assert ledger._state == "DISCARDED"
+
+
+def test_finalize_gate_failed_terminates_scheduler_wave_slot_as_done(
+        loop_min, conn, mission_and_run_fixture_with_slot, tmp_path):
+    """ゲート不合格は Mission としては `completed` (承認申請は出さないが
+    Mission 自体は正常終了) — slot は `done` で終端する (§4.3 の
+    `mission_status="completed"` と揃える)。"""
+    mission_id, run_id, backlog_id, slot_key = mission_and_run_fixture_with_slot
+    from agentic_fx.store import backlog as backlog_store
+    backlog_store.select_for_mission(conn, backlog_id,
+                                     now=datetime(2026, 8, 22), commit=True)
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=slot_key, ledger=ledger,
+        rpc_handlers={})
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id,
+        reason="insufficient_trades:5", now=datetime(2026, 8, 22))
+
+    period_key, k = slot_key
+    slot = conn.execute(
+        "SELECT status FROM improve_wave_slots WHERE wave_period_key=? "
+        "AND k=?", (period_key, k)).fetchone()
+    assert slot["status"] == "done"
