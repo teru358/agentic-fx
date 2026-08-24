@@ -1328,7 +1328,18 @@ def test_main_puts_reason_in_result_frame_for_improve_profile(
     frames, _, registry_calls = _drive_main(
         monkeypatch, tmp_path,
         handshake_overrides={"worker_profile": "improve",
-                             "db_path": None, "plugins_dir": None,
+                             # #62 是正 (advisor 指摘): `db_path` を意図的に
+                             # None のままにしない — improve 分岐が万一
+                             # trade 専用ブロックへ fall-through しても
+                             # `connect_readonly(Path(None))` の早期
+                             # crash に隠れず `build_mission_registry`
+                             # まで到達できるようにし、直後の
+                             # `registry_calls == []` を非恒真にする
+                             # (`_drive_main` が用意する実 db をそのまま
+                             # 使う — main() の improve 分岐は
+                             # handshake["db_path"] を一切参照しない設計
+                             # なので実害は無い)。
+                             "plugins_dir": None,
                              "mission_id": "m-proto-test",
                              "staging_dir": str(tmp_path / "staging" / "m-proto-test"),
                              "source_snapshot_dir": str(tmp_path / "source")},
@@ -1557,7 +1568,11 @@ def test_main_does_not_set_os_environ_from_handshake_credentials_for_improve(
         _, _, registry_calls = _drive_main(
             monkeypatch, tmp_path,
             handshake_overrides={
-                "worker_profile": "improve", "db_path": None,
+                "worker_profile": "improve",
+                # #62 是正 (advisor 指摘): 上のテストと同じ理由で
+                # `db_path` を None に潰さない — 実 db (`_drive_main` が
+                # 用意) を使うことで、fall-through 変異下でも
+                # `registry_calls == []` が非恒真になる。
                 "plugins_dir": None,
                 "mission_id": "m-credentials-improve-test",
                 "staging_dir": str(tmp_path / "staging" / "m-credentials-improve-test"),
