@@ -737,6 +737,23 @@ def approve_candidate(
                 f"approval {approval_id} — resolve it first (reconcile or "
                 "approval retry)")
 
+        def _close_own_unfinished_journal_if_any() -> None:
+            # 確定-1 (Critical): この approval 自身の未完ジャーナル
+            # (preparing/versioned/recorded — switched はここに来ない、上の
+            # 0d 分岐で先に処理・return 済み) が残っていれば、候補が壊れて
+            # pending 留置する前に `_revert_one` で閉じる。閉じないと name が
+            # 永久に `UnresolvedJournalError` で封鎖される
+            # (verified-local-round1.md 確定-1)。`_revert_one` は非 switched
+            # 行に対して FS 副作用を一切持たない (`switch.py:156-158` と
+            # 同じ論拠 — 安全)。
+            if op_id is None:
+                return
+            journal_row = journal_store.get(conn, op_id)
+            if journal_row is not None and journal_row["phase"] != "switched":
+                _revert_one(conn, journal_row, plugins_root=plugins_root,
+                           now=now, activity=activity)
+                conn.commit()
+
         candidate_origin = payload["candidate_origin"]
         candidate_path = payload["candidate_path"]
         try:
@@ -744,6 +761,7 @@ def approve_candidate(
                 plugins_root, candidate_origin=candidate_origin,
                 candidate_path=candidate_path, name=name)
         except CandidateMissingError:
+            _close_own_unfinished_journal_if_any()
             return  # pending のまま (§8.1-29)
 
         try:
@@ -760,9 +778,12 @@ def approve_candidate(
             # つぶすと `candidate_missing` 検出そのものを削る変異が
             # `test_approve_candidate_missing_stays_pending` で red に
             # ならず survive してしまう)。
+            _close_own_unfinished_journal_if_any()
             return  # 候補が壊れている/検査失敗 → pending のまま
         if (content_hash != payload["content_hash"]
                 or artifact_hash != payload["artifact_hash"]):
+            # 確定-1: ⓐ 不一致でも同様に自分の未完ジャーナルを閉じる。
+            _close_own_unfinished_journal_if_any()
             return  # ⓐ 不一致 → pending のまま
 
         live = plugins_root / name
@@ -995,6 +1016,18 @@ def bless_candidate(
     approvals_store.expire_due(conn, now, commit=True)  # 0a
 
     with _plugin_lock(plugins_root, name):  # 0b
+        # 確定-2: `approve_candidate` (switch.py:728-733) と同じガードを
+        # `bless_candidate` にも置く。無ければ `begin_switch_journal` が
+        # 部分 UNIQUE index に当たり、生の `sqlite3.IntegrityError` が
+        # catch サイト (CLI) を素通りしてしまう。
+        existing_journal = journal_store.get_open_by_name(conn, name)
+        if existing_journal is not None:
+            raise UnresolvedJournalError(
+                f"plugin {name!r}: an unresolved switch journal "
+                f"(op_id={existing_journal['op_id']}, "
+                f"approval_id={existing_journal['approval_id']}) blocks "
+                f"bless — resolve it first (reconcile or approval retry)")
+
         meta, content_hash, artifact_hash, metrics, evaluable = _run_full_gate(
             conn, human_dir, name=name, settings=settings, now=now)
 
