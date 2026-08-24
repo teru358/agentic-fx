@@ -302,3 +302,18 @@ def test_build_mission_tools_matches_child_registry_names(loop_full, tmp_path):
     assert not (tool_names & signal_tools.IMPROVE_FORBIDDEN)
 
 
+def test_build_worker_runner_passes_ctx_as_run_context(loop_full, conn):
+    """`_build_worker_runner` が `ImproveRunContext` をそのまま
+    `WorkerRunner(run_context=ctx)` へ渡すことの契約テスト (D-4 是正、
+    プラン L18265 逐語 — 検収で「欠落 (10.9 Step7 M6/M7 を殺す唯一の
+    pin)」と指摘された)。"""
+    ctx = ImproveRunContext(
+        mission_id=1, run_id=1, staging_dir=Path("/tmp/x"),
+        source_snapshot_dir=Path("/tmp/y"), allowed_backlog_ids=None,
+        slot_key=None, ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        rpc_handlers={})
+    runner = loop_full._build_worker_runner(ctx)
+    assert runner._run_context is ctx
+    assert runner._worker_profile == "improve"
+
+
