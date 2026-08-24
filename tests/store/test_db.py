@@ -1810,6 +1810,35 @@ def test_init_db_migrates_legacy_improvement_runs_adds_mission_fk(tmp_path):
     assert "improvement_runs_v1" not in names
 
 
+def test_init_db_migrates_legacy_improvement_runs_rebuild_keeps_unique_index(
+        tmp_path):
+    """advisor 指摘: rebuild は `DROP TABLE improvement_runs_v1` で索引ごと
+    落とすため、`init_db` 内で `_IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL` が
+    `_migrate_improvement_runs_mission_id_fk` の**後**に実行される順序に
+    正しさが全面的に依存している。呼び出し順が入れ替わると rebuild 済み
+    DB でだけ一意制約が消え、fresh DB 側の L55 テストは (rebuild を通らない
+    ため) 検出できない。ここで rebuild 経路そのものに対して一意制約が
+    生きていることを直接確認する。"""
+    conn = _legacy_improvement_runs_mission_fk_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+        "VALUES (1, 'improve', 'local', 'm', 'running', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO improvement_runs (mission_id, result, started_at) "
+        "VALUES (1, 'report', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+
+    with pytest.raises(sqlite3.IntegrityError,
+                       match="UNIQUE constraint failed: "
+                             "improvement_runs.mission_id"):
+        conn.execute(
+            "INSERT INTO improvement_runs (mission_id, result, started_at) "
+            "VALUES (1, 'report', '2026-08-11T10:00:00+00:00')")
+
+
 def test_improvement_runs_mission_fk_migration_preserves_report_state(tmp_path):
     """着手前検証で発見: rebuild DDL に report_state を含めないと、
     後続の `_ensure_column` がデフォルト 'none' で再作成し、既存の
@@ -1866,6 +1895,30 @@ def test_improvement_runs_mission_fk_migration_is_idempotent(tmp_path):
     assert "improvement_runs_v1" not in names
     assert conn.execute(
         "SELECT COUNT(*) c FROM improvement_runs").fetchone()["c"] == 1
+
+
+def test_improvement_runs_mission_fk_migration_defaults_report_state_when_absent(
+        tmp_path):
+    """`_legacy_improvement_runs_mission_fk_conn(with_report_state=False)`
+    経路の pin — report_state 列が v1 に無い (report_state 追加より前で
+    落ちた仮想的な中間状態) 場合でも、rebuild 先 DDL の
+    `NOT NULL DEFAULT 'none'` により例外にならず 'none' で埋まること。"""
+    conn = _legacy_improvement_runs_mission_fk_conn(
+        tmp_path, with_report_state=False)
+    conn.execute(
+        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+        "VALUES (1, 'improve', 'local', 'm', 'running', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO improvement_runs (mission_id, result, started_at) "
+        "VALUES (1, 'report', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT report_state FROM improvement_runs").fetchone()
+    assert row["report_state"] == "none"
 
 
 def _legacy_improve_wave_slots_mission_fk_conn(tmp_path):
@@ -1959,3 +2012,52 @@ def test_improve_wave_slots_mission_fk_migration_is_idempotent(tmp_path):
     assert "improve_wave_slots_v1" not in names
     assert conn.execute(
         "SELECT COUNT(*) c FROM improve_wave_slots").fetchone()["c"] == 1
+
+
+# --- 現行流儀: 他の rebuild (`_migrate_signals_fk` 等) と同じく
+# backup-suffix / skip-backup-when-already-migrated の対を持たせる ---
+
+def test_migrate_improvement_runs_mission_fk_backup_uses_expected_suffix(
+        tmp_path):
+    conn = _legacy_improvement_runs_mission_fk_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+        "VALUES (1, 'improve', 'local', 'm', 'running', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+
+    assert (tmp_path / "legacy.db.bak-improvement-runs-mission-fk").exists()
+
+
+def test_migrate_improvement_runs_mission_fk_skips_backup_when_already_migrated(
+        tmp_path):
+    """冪等ガード (fk_present) で抜ける通常起動ではバックアップを取らない
+    こと — 位置がガードより前にずれると毎起動で DB 全体のコピーコストが
+    乗る (`_migrate_signals_fk` と同じ懸念)。"""
+    conn = connect(tmp_path / "fresh.db")
+    init_db(conn)  # fresh は _SCHEMA/ALTER 経路 → rebuild 不要
+    assert not (
+        tmp_path / "fresh.db.bak-improvement-runs-mission-fk").exists()
+
+
+def test_migrate_improve_wave_slots_mission_fk_backup_uses_expected_suffix(
+        tmp_path):
+    conn = _legacy_improve_wave_slots_mission_fk_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improve_waves (period_key, created_at, expected) "
+        "VALUES ('w1', '2026-08-11T09:00:00+00:00', 1)")
+    conn.commit()
+
+    init_db(conn)
+
+    assert (tmp_path / "legacy.db.bak-improve-wave-slots-mission-fk").exists()
+
+
+def test_migrate_improve_wave_slots_mission_fk_skips_backup_when_already_migrated(
+        tmp_path):
+    conn = connect(tmp_path / "fresh.db")
+    init_db(conn)  # fresh は _SCHEMA が FK 付きで作るため rebuild 不要
+    assert not (
+        tmp_path / "fresh.db.bak-improve-wave-slots-mission-fk").exists()
