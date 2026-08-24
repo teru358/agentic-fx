@@ -164,7 +164,15 @@ def test_analyze_corr_handler_does_not_persist_before_tx2(
     変異が SURVIVED する空洞だった (10.9 M10)。`tests/backtest/
     test_analysis.py::_seed_two_series` と同型のデータ (holdout boundary
     より確実に前の 2 通貨ペア系列) を投入し、`analyze_corr` が実際に
-    corr_matrix を計算する経路まで到達させる。"""
+    corr_matrix を計算する経路まで到達させる。
+
+    実測した kill の経路 (readonly conn を使う本番相当の fixture の
+    帰結): `persist=True` 変異下では readonly conn への書込みが
+    `sqlite3.OperationalError: attempt to write a readonly database` で
+    失敗し、`analyze_corr_handler` の外側 except がこれを握って
+    `{"error": "analyze_failed"}` を返す — 下記の `assert "error" not in
+    result` がこれを検出する (row-count assert `after == before` はこの
+    変異下でも変わらず通り、killer ではない)。"""
     monkeypatch.setattr(
         loop_min, "_db_readonly_conn_factory",
         lambda: connect_readonly(tmp_path / "t.db"))

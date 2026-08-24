@@ -264,6 +264,12 @@ def test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly(
     # assert は `persist=True` への変異を殺せない空洞だった。EURUSD を
     # watch_symbols に足して 2 候補にし、holdout boundary より確実に前の
     # 2 通貨ペア系列を投入して analyze_corr が実際に成功する経路へ倒す。
+    # 実測した kill の経路: readonly conn の下で `persist=True` は
+    # `sqlite3.OperationalError: attempt to write a readonly database` で
+    # 失敗し `{"error": "analyze_failed"}` を返す — 下の
+    # `assert "error" not in an_out` (D-14 是正で新設) がこれを検出する
+    # (row-count assert `after_an == before_an` はこの変異下でも変わらず
+    # 通り、killer ではない)。
     monkeypatch.setattr(loop, "_settings", loop._settings.model_copy(
         update={"datafeed": loop._settings.datafeed.model_copy(
             update={"watch_symbols": ["EURUSD"]})}))
