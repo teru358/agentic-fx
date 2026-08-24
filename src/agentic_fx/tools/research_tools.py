@@ -86,7 +86,12 @@ def build_research_tooldefs(
         return {"results": results}
 
     def fetch_article(url: str) -> dict:
-        host = urlparse(url).netloc
+        # L01: `netloc` の生値 (大文字小文字・port・userinfo を含む) を
+        # そのまま host キーにすると `max_per_host`/429 遮断を表記違いで
+        # 回避できる ([[outbound-request-budget-is-a-design-constraint]])。
+        # `hostname` (userinfo/port 除去済み) を小文字化して正規化する。
+        # 副作用は意図的: port 違いは同一 host として合算される。
+        host = (urlparse(url).hostname or "").lower()
         if host in state["aborted_hosts"]:
             return {"error": "host aborted (429/503)"}
         if state["fetch_count"] >= settings.max_fetches:

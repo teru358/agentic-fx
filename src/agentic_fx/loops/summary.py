@@ -104,12 +104,17 @@ def build_state_summary(conn: sqlite3.Connection, broker: PaperBroker,
 IMPROVE_OUTPUT_SCHEMA: dict = {
     "type": "object",
     "required": ["discoveries", "selected", "artifact", "selection_rationale"],
+    # I3: `additionalProperties: false` — §3.5「analysis ID・回数を agent
+    # に申告させない」を schema 境界として強制する (未知キーの列挙・混入
+    # を top-level・discoveries[]・selected・artifact の全 5 object で拒否)。
+    "additionalProperties": False,
     "properties": {
         "discoveries": {
             "type": "array",
             "items": {
                 "type": "object",
                 "required": ["idea", "source", "evidence"],
+                "additionalProperties": False,
                 "properties": {
                     "idea": {"type": "string"},
                     "source": {"type": "string", "enum": ["agent", "research"]},
@@ -120,6 +125,7 @@ IMPROVE_OUTPUT_SCHEMA: dict = {
         "selected": {
             "type": "object",
             "required": ["backlog_id", "idea"],
+            "additionalProperties": False,
             "properties": {
                 "backlog_id": {"type": ["integer", "null"]},
                 "idea": {"type": "string"},
@@ -130,6 +136,7 @@ IMPROVE_OUTPUT_SCHEMA: dict = {
                 {
                     "type": "object",
                     "required": ["type", "name", "kind", "self_test", "summary"],
+                    "additionalProperties": False,
                     "properties": {
                         "type": {"const": "plugin"},
                         "name": {"type": "string",
@@ -144,6 +151,7 @@ IMPROVE_OUTPUT_SCHEMA: dict = {
                 {
                     "type": "object",
                     "required": ["type", "proposal_kind", "title", "body_md"],
+                    "additionalProperties": False,
                     "properties": {
                         "type": {"const": "report"},
                         "proposal_kind": {"type": "string",
@@ -155,6 +163,7 @@ IMPROVE_OUTPUT_SCHEMA: dict = {
                 {
                     "type": "object",
                     "required": ["type", "reason"],
+                    "additionalProperties": False,
                     "properties": {
                         "type": {"const": "observation"},
                         "reason": {"type": "string"},

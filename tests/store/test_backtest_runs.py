@@ -213,6 +213,20 @@ def test_naive_now_rejected(tmp_path):
         backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
 
 
+def test_reversed_period_rejected(tmp_path):
+    """裁定 D3① (2026-08-24): `period[0] > period[1]` (期間逆転) を
+    fail-closed で拒否する。`period[0] == period[1]` (既存テスト群が使う
+    ゼロ幅期間) は引き続き許容する。"""
+    from datetime import timedelta
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H - timedelta(hours=1)), metrics={}, settings_hash="s",
+              core_commit="c", initial_balance=1e6, now=H)
+    with pytest.raises(ValueError, match="period"):
+        backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+
+
 def test_settings_snapshot_hash_stable_and_sensitive_to_risk(tmp_path):
     from agentic_fx.config import load_settings
     from pathlib import Path
@@ -445,11 +459,34 @@ def test_latest_in_sample_metrics_malformed_json_returns_none_fail_open(tmp_path
     assert backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY") is None
 
 
+def test_latest_in_sample_metrics_malformed_json_logs_warning(tmp_path, caplog):
+    """裁定 D3② (2026-08-24): fail-open の挙動 (None 返却) は維持しつつ、
+    内部で何が起きたかを WARNING ログで観測可能にする — 既に実装済みの
+    ログを直接 pin する (`caplog` で `_log.warning` 呼び出しを観測)。"""
+    import logging
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              period=(H, H), metrics={"trades": 1}, settings_hash="s",
+              core_commit="c", initial_balance=1e6, now=H)
+    backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+    conn.execute("UPDATE backtest_runs SET metrics_json='not json' "
+                "WHERE content_hash='h'")
+    conn.commit()
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.store.backtest_runs"):
+        backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
+    assert any("decode failed" in r.message for r in caplog.records)
+
+
 # ---- 8-D: variant/ref_* + latest_in_sample_metrics candidate 限定 --------
 
 def test_save_harness_run_accepts_variant_and_ref_fields(tmp_path):
     """variant/ref_plugin_ref/ref_content_hash を明示指定できる (既定は
-    'candidate'/None/None — 既存呼び出しは無変更のまま動く)。"""
+    'candidate'/None/None — 既存呼び出しは無変更のまま動く)。
+
+    L52 (8-D M3): 従来は ref_plugin_ref/ref_content_hash に None を渡し
+    variant しか読み戻さなかったため、両列が INSERT から落ちても green
+    だった。非 None 値を渡して読み戻す。"""
     conn = _conn(tmp_path)
     run_id = backtest_runs.save_harness_run(
         conn, scope="in_sample", plugin_ref="no_strategy:rsi_v2",
@@ -457,11 +494,13 @@ def test_save_harness_run_accepts_variant_and_ref_fields(tmp_path):
         timeframe="1h", source="test", period=(H, H),
         metrics={"pf": 1.0}, settings_hash="s", core_commit="c",
         initial_balance=10000.0, now=H,
-        variant="no_strategy", ref_plugin_ref=None, ref_content_hash=None)
+        variant="no_strategy", ref_plugin_ref="p.py", ref_content_hash="h")
     row = conn.execute(
         "SELECT variant, ref_plugin_ref, ref_content_hash FROM backtest_runs "
         "WHERE id=?", (run_id,)).fetchone()
     assert row["variant"] == "no_strategy"
+    assert row["ref_plugin_ref"] == "p.py"
+    assert row["ref_content_hash"] == "h"
 
 
 def test_save_harness_run_default_variant_is_candidate(tmp_path):

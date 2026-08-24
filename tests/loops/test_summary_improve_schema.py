@@ -52,14 +52,86 @@ def test_schema_has_no_analysis_run_ids_or_trial_count_property():
 
 
 @pytest.mark.parametrize("bad_name", [
-    "../evil", "a/b", "Rsi_V2", "_leading_underscore", "with space", ""])
+    "../evil", "a/b", "Rsi_V2", "_leading_underscore", "with space", "",
+    "a" * 65,  # L30: 名前長境界 (64 は許容、65 は拒否)
+    "rsi.v2",  # L32: ドットは pattern から禁止されている
+])
 def test_artifact_plugin_name_rejects_non_canonical_form(bad_name):
     """申し送り⑩の解決 (M4 pin): `artifact.name` の `pattern` が
     `^[a-z][a-z0-9_]{0,63}$` から外れる非正規形 (パストラバーサル・区切り
-    文字混入・大文字・先頭 `_`・空白・空文字) を拒否することを schema
-    単体で確認する。§4.2-1 の親側検査と二重防御になる箇所であり、
-    `pattern` が削除される変異 (M4) を schema 単体で確実に殺す。"""
+    文字混入・大文字・先頭 `_`・空白・空文字・65 文字超・ドット) を拒否
+    することを schema 単体で確認する。§4.2-1 の親側検査と二重防御になる
+    箇所であり、`pattern` が削除される変異 (M4) を schema 単体で確実に
+    殺す。"""
     out = _valid_plugin_output()
     out["artifact"]["name"] = bad_name
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
+def test_artifact_plugin_name_length_64_is_accepted():
+    """L30: 境界の反対側 — 64 文字ちょうどは許容する。"""
+    out = _valid_plugin_output()
+    out["artifact"]["name"] = "a" + "b" * 63
+    jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
+# --- I3 / L31: additionalProperties: false (未知キー拒否) ---
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d.update(analysis_run_ids=[999], trial_count=1),
+    lambda d: d["discoveries"][0].__setitem__("analysis_run_ids", [1]),
+    lambda d: d["selected"].__setitem__("trial_count", 7),
+    lambda d: d["artifact"].__setitem__("trial_count", 7),
+], ids=["top_level", "discoveries_item", "selected", "artifact_plugin"])
+def test_unknown_keys_are_rejected(mutate):
+    """codex I3 killer: `analysis_run_ids`/`trial_count` を含む任意の未知
+    キーは、挿入位置 (top-level / discoveries[] / selected / artifact) を
+    問わず schema が拒否すること (§3.5: agent に分析 ID・回数を申告させ
+    ない設計意図の schema 境界強制)。"""
+    out = _valid_plugin_output()
+    mutate(out)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
+def test_artifact_plugin_variant_rejects_report_only_key():
+    """c08#4: `additionalProperties: false` により plugin variant に
+    report 専用の `proposal_kind` を混入すると oneOf 全 variant が非適合
+    になり拒否される (排他性の副次的強化)。"""
+    out = _valid_plugin_output()
+    out["artifact"]["proposal_kind"] = "core"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
+# --- L05: サブオブジェクトの required / enum 否定テスト ---
+
+def test_discoveries_item_missing_evidence_is_rejected():
+    out = _valid_plugin_output()
+    del out["discoveries"][0]["evidence"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
+def test_selected_missing_backlog_id_is_rejected():
+    out = _valid_plugin_output()
+    del out["selected"]["backlog_id"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("kind", "bogus"), ("self_test", "bogus")])
+def test_artifact_plugin_enum_fields_reject_out_of_enum(field, value):
+    out = _valid_plugin_output()
+    out["artifact"][field] = value
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
+def test_discoveries_item_source_enum_rejects_out_of_enum():
+    out = _valid_plugin_output()
+    out["discoveries"][0]["source"] = "bogus"
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)

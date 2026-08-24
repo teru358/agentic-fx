@@ -29,16 +29,20 @@ def list_open(conn: sqlite3.Connection) -> list[dict]:
 
 def set_status(conn: sqlite3.Connection, backlog_id: int, status: str,
                now: datetime, *, last_result: str | None = None,
-               commit: bool = True) -> None:
+               commit: bool = True) -> bool:
     """m1: `last_result` は常に上書きする (既定 `None`)。`last_result` を
     渡さない呼び出しは既存の `last_result` を NULL でクリアする —
     `select_for_mission` (下記) は `last_result` に触れないため非対称
-    (意図的: 「試行開始」は結果を持たないが「終端」は必ず結果を書く)。"""
-    conn.execute(
+    (意図的: 「試行開始」は結果を持たないが「終端」は必ず結果を書く)。
+
+    戻り値: `True` = `backlog_id` に該当する行を更新した。`False` = 該当行
+    が存在しなかった (rowcount=0、fail-open 防止)。"""
+    cur = conn.execute(
         "UPDATE improvement_backlog SET status=?, last_result=?, updated_at=? "
         "WHERE id=?", (status, last_result, now.isoformat(), backlog_id))
     if commit:
         conn.commit()
+    return cur.rowcount == 1
 
 
 def select_for_mission(conn: sqlite3.Connection, backlog_id: int, *,

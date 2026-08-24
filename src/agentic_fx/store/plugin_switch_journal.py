@@ -36,25 +36,34 @@ def get(conn: sqlite3.Connection, op_id: int) -> dict | None:
 
 
 def set_phase(conn: sqlite3.Connection, op_id: int, phase: str, *,
-             now: datetime, commit: bool = True) -> None:
-    conn.execute(
+             now: datetime, commit: bool = True) -> bool:
+    """戻り値: `True` = `op_id` に該当する行を更新した。`False` = 該当行
+    が存在しなかった (rowcount=0、fail-open 防止)。"""
+    cur = conn.execute(
         "UPDATE plugin_switch_journal SET phase=?, updated_at=? WHERE op_id=?",
         (phase, now.isoformat(), op_id))
     if commit:
         conn.commit()
+    return cur.rowcount == 1
+
+
+def _non_terminal_placeholders() -> str:
+    return ",".join("?" * len(_TERMINAL_PHASES))
 
 
 def get_open_by_name(conn: sqlite3.Connection, name: str) -> dict | None:
     row = conn.execute(
         "SELECT * FROM plugin_switch_journal WHERE name=? "
-        "AND phase NOT IN ('decided','reverted')", (name,)).fetchone()
+        f"AND phase NOT IN ({_non_terminal_placeholders()})",
+        (name, *_TERMINAL_PHASES)).fetchone()
     return dict(row) if row is not None else None
 
 
 def list_non_terminal(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in conn.execute(
         "SELECT * FROM plugin_switch_journal WHERE phase NOT IN "
-        "('decided','reverted') ORDER BY op_id")]
+        f"({_non_terminal_placeholders()}) ORDER BY op_id",
+        tuple(_TERMINAL_PHASES))]
 
 
 def set_temp_path(conn: sqlite3.Connection, op_id: int, temp_path: str) -> None:

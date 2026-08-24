@@ -52,6 +52,24 @@ def test_bind_backlog_sets_backlog_id_on_run(tmp_path):
     assert row["backlog_id"] == bid
 
 
+def test_bind_backlog_only_affects_targeted_run(tmp_path):
+    """L07: `bind_backlog` の `WHERE id=?` を `WHERE 1=1` にしても検出
+    されない — 既存テスト群は全て 1 DB あたり run を 1 本しか作らない。
+    ここでは run を 2 本作り、片方だけ bind してもう片方の backlog_id が
+    None のままであることを確認する。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "idea", "user", NOW)
+    rid1 = improve_runs.start(c, None, now=NOW)
+    rid2 = improve_runs.start(c, None, now=NOW)
+    improve_runs.bind_backlog(c, rid1, bid)
+    row1 = c.execute("SELECT backlog_id FROM improvement_runs WHERE id=?",
+                     (rid1,)).fetchone()
+    row2 = c.execute("SELECT backlog_id FROM improvement_runs WHERE id=?",
+                     (rid2,)).fetchone()
+    assert row1["backlog_id"] == bid
+    assert row2["backlog_id"] is None
+
+
 def test_bind_backlog_commit_false_leaves_transaction_open(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
     bid = backlog.add(c, "idea", "user", NOW)

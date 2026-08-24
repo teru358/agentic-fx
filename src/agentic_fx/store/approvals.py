@@ -72,7 +72,14 @@ def apply_decision(
         raise AlreadyDecidedError(f"approval {approval_id} is not pending")
     row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
                        (approval_id,)).fetchone()
-    payload = json.loads(row["payload_json"]) if row is not None else {}
+    try:
+        payload = json.loads(row["payload_json"]) if row is not None else {}
+    except (TypeError, ValueError):
+        # I4 是正で §5.5 migration がこの API を経由するようになった
+        # ため、legacy 行の壊れた payload_json (json.loads 失敗) も
+        # fail-safe に扱う必要がある — db.py の legacy migration と
+        # 同じ流儀 (payload = {} フォールバック、backlog_id=None → no-op)。
+        payload = {}
     backlog_id = payload.get("backlog_id")
     outcome = status  # m13: 旧 `status if status in (...) else status` は恒真式だったため簡約
     from agentic_fx.store import backlog as backlog_mod
@@ -153,10 +160,3 @@ def set_reason(conn: sqlite3.Connection, approval_id: int, reason: str, *,
         (reason, approval_id))
     if commit:
         conn.commit()
-
-
-def set_message_id(conn: sqlite3.Connection, approval_id: int,
-                   message_id: str) -> None:
-    conn.execute("UPDATE approval_requests SET message_id=? WHERE id=?",
-                 (message_id, approval_id))
-    conn.commit()
