@@ -125,7 +125,7 @@ class Commands:
                     plugin_switch.reject_candidate(
                         self.conn, approval_id, decided_by="shell",
                         reason=reason or "", now=self.clock.now(),
-                        plugins_root=self.plugins_root)
+                        plugins_root=self.plugins_root, activity=self.activity)
                 else:
                     approvals.apply_decision(
                         self.conn, approval_id, "rejected", decided_by="shell",

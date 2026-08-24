@@ -825,7 +825,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                            safe_error_text(exc))
         try:
             switch.process_expired_approvals(  # B-7: 唯一の呼び出し元だった裁定1が本番で1度も動かない欠落を解消
-                conn_core, plugins_root=plugins_dir, now=clock.now())
+                conn_core, plugins_root=plugins_dir, now=clock.now(),
+                activity=activity)
         except Exception as exc:
             activity.write(Category.APPROVAL, "plugin_expire_failed",
                            safe_error_text(exc))

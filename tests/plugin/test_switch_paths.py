@@ -789,6 +789,61 @@ def test_reject_nonexistent_approval_id_raises_approval_not_found_error(env):
                                 now=NOW, plugins_root=plugins_dir)
 
 
+def test_reject_payload_missing_name_stays_pending_with_activity_error(env):
+    """E4 裁定 (2026-08-25、確定-14): plugin payload に `name` が無い
+    (契約違反) approval は `reject` しても決定させず pending に留め置き、
+    activity ERROR を記録する。旧実装は flock を取らずに `apply_decision`
+    のみ直接通し、staging 候補の掃除もされないまま rejected へ確定させて
+    いた。"""
+    root, plugins_dir, conn, settings = env
+    activity = ActivityLog(root / "logs" / "activity.log")
+    aid = approvals_store.create(
+        conn, kind="plugin",
+        payload={"candidate_origin": "staging",
+                "candidate_path": "plugins/_staging/1/sma"},
+        now=NOW)
+
+    switch.reject_candidate(conn, aid, decided_by="human", reason="no",
+                            now=NOW, plugins_root=plugins_dir, activity=activity)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (aid,)).fetchone()
+    assert row["status"] == "pending"
+    log_text = (root / "logs" / "activity.log").read_text()
+    assert "reject_rejected_payload_missing_name" in log_text
+
+
+def test_drop_staging_candidate_contract_violation_writes_activity_error(env):
+    """E4 裁定 (確定-12): `_drop_staging_candidate` の `candidate_path` が
+    正規形違反 (ValueError) の場合、黙って進まず activity ERROR
+    (`staging_drop_skipped`) を残す。`CandidateMissingError` (候補が単に
+    存在しない正常系) との違いを pin する。"""
+    root, plugins_dir, conn, settings = env
+    activity = ActivityLog(root / "logs" / "activity.log")
+    payload = {"candidate_origin": "staging",
+              "candidate_path": "not-a-canonical-path", "name": "sma"}
+
+    switch._drop_staging_candidate(plugins_dir, payload, activity=activity)
+
+    log_text = (root / "logs" / "activity.log").read_text()
+    assert "staging_drop_skipped" in log_text
+
+
+def test_drop_staging_candidate_missing_candidate_is_silent(env):
+    """確定-12 の対称側: 候補が単に既に無い (`CandidateMissingError`) は
+    正常系であり activity 記録は書かれない (契約違反と混同しない)。"""
+    root, plugins_dir, conn, settings = env
+    activity = ActivityLog(root / "logs" / "activity.log")
+    payload = {"candidate_origin": "staging",
+              "candidate_path": "plugins/_staging/1/sma", "name": "sma"}
+
+    switch._drop_staging_candidate(plugins_dir, payload, activity=activity)
+
+    log_path = root / "logs" / "activity.log"
+    log_text = log_path.read_text() if log_path.exists() else ""
+    assert "staging_drop_skipped" not in log_text
+
+
 def test_invalidated_by_superseding_decision_deletes_staging_candidate(env, monkeypatch):
     """同名別 content_hash の後発 approved 決定により invalidated へ落ちる
     経路 (0c) でも、staging 候補が直後に削除されること。"""

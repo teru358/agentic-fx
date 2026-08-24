@@ -338,17 +338,30 @@ def resolve_candidate_dir(plugins_root: Path, *, candidate_origin: str,
     return candidate_dir
 
 
-def _drop_staging_candidate(plugins_root: Path, payload: dict) -> None:
+def _drop_staging_candidate(plugins_root: Path, payload: dict, *,
+                            activity: "ActivityLog | None" = None) -> None:
     """終端決定 (approved/rejected/expired/invalidated) の tx 直後に staging
     候補を削除する (§5.1 手順 3 の掃除所有表、verified-codex-round1.md I1)。
-    `candidate_origin='human'` は人間所有なので触らない (自動削除しない)。"""
+    `candidate_origin='human'` は人間所有なので触らない (自動削除しない)。
+
+    E4/確定-12 裁定 (2026-08-25): `CandidateMissingError` (候補が既に無い
+    — 正常系、記録不要) と `ValueError`/`KeyError` (payload の正規形違反・
+    必須キー欠落 = 契約違反) を分ける。後者は黙って進まず activity ERROR
+    (`staging_drop_skipped`) を残す — この関数は既に終端決定の後に呼ばれる
+    掃除ステップなので、決定そのものを pending 留置に戻すことはできない
+    (掃除が漏れたことの可視化のみ)。"""
     if payload.get("candidate_origin") != "staging":
         return
     try:
         candidate_dir = resolve_candidate_dir(
             plugins_root, candidate_origin="staging",
             candidate_path=payload["candidate_path"], name=payload["name"])
-    except (CandidateMissingError, ValueError, KeyError):
+    except CandidateMissingError:
+        return
+    except (ValueError, KeyError) as exc:
+        if activity is not None:
+            activity.write(Category.APPROVAL, "staging_drop_skipped",
+                           f"payload contract violation: {safe_error_text(exc)}")
         return
     shutil.rmtree(candidate_dir, ignore_errors=True)
 
@@ -727,7 +740,7 @@ def approve_candidate(
                 raise
             # I1 是正: 終端決定 (invalidated) の tx 直後に staging 候補を
             # 削除する (§5.1 手順 3)。
-            _drop_staging_candidate(plugins_root, payload)
+            _drop_staging_candidate(plugins_root, payload, activity=activity)
             return
 
         # 0d: 同名の未完ジャーナルが「この approval 自身の再試行」であれば
@@ -953,7 +966,8 @@ def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
 
 def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
                      decided_by: str, reason: str, now: datetime,
-                     plugins_root: Path) -> None:
+                     plugins_root: Path,
+                     activity: "ActivityLog | None" = None) -> None:
     """§8.1-32: 全 terminal decision (approve/reject/expire/reconcile) が
     同じ plugin flock を通る。本 task (11g) が新規命名 (骨格 Interfaces 節
     に無い — submit/approve/bless の 3 関数しか列挙されていないが、reject
@@ -971,11 +985,17 @@ def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
     payload = json.loads(row["payload_json"])
     name = payload.get("name")
     if name is None:
-        # payload に name が無い (plugin kind の契約違反) — flock を取る
-        # 対象が特定できないので apply_decision のみ直接通す。
-        approvals_store.apply_decision(
-            conn, approval_id, "rejected", decided_by=decided_by, now=now,
-            reason=reason, commit=True)
+        # E4 裁定 (2026-08-25、確定-14): payload に name が無いのは plugin
+        # kind の契約違反。旧稿は flock を取る対象が特定できないとして
+        # `apply_decision` のみ直接通し reject を成立させていたが、これは
+        # staging 候補を掃除しないまま決定を確定させてしまう (掃除漏れが
+        # 無言のまま)。E4 の方針に合わせ、契約違反行は activity ERROR を
+        # 残した上で **決定させず pending 留置**にする。
+        if activity is not None:
+            activity.write(
+                Category.APPROVAL, "reject_rejected_payload_missing_name",
+                f"approval_id={approval_id}: plugin payload に name が無く "
+                "契約違反のため reject を実行せず pending 留置")
         return
 
     with _plugin_lock(plugins_root, name):
@@ -994,11 +1014,12 @@ def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
             reason=reason, commit=True)
         # I1 是正: 終端決定 (rejected) の tx 直後に staging 候補を削除する
         # (§5.1 手順 3)。
-        _drop_staging_candidate(plugins_root, payload)
+        _drop_staging_candidate(plugins_root, payload, activity=activity)
 
 
 def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
-                              now: datetime) -> None:
+                              now: datetime,
+                              activity: "ActivityLog | None" = None) -> None:
     """裁定 1 (統合裁定 R-i8) の意味論を実装する (プラン10 Task11g、11f の
     service.py 起動時 reconcile 配線が本関数の存在に依存するため実装を前倒し
     — 最終報告の「逸脱」に明記):
@@ -1020,6 +1041,16 @@ def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
         payload = json.loads(row["payload_json"])
         name = payload.get("name")
         if not name:
+            # E4 裁定 (2026-08-25、確定-14 と同じ軸): payload に name が
+            # 無いのは plugin kind の契約違反。flock を取る対象が特定
+            # できないので処理をスキップする (= pending 留置のまま) が、
+            # 黙って進まず activity ERROR を残す。
+            if activity is not None:
+                activity.write(
+                    Category.APPROVAL,
+                    "expire_skipped_payload_missing_name",
+                    f"approval_id={row['id']}: plugin payload に name が "
+                    "無く契約違反のため expire を実行せず pending 留置")
             continue
         lock_path = plugins_root / ".locks" / f"{name}.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1043,7 +1074,7 @@ def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
                     now=now, reason="expired", commit=True)
                 # I1 是正: 終端決定 (expired) の tx 直後に staging 候補を
                 # 削除する (§5.1 手順 3)。
-                _drop_staging_candidate(plugins_root, payload)
+                _drop_staging_candidate(plugins_root, payload, activity=activity)
             finally:
                 fcntl.flock(lockf, fcntl.LOCK_UN)
 
