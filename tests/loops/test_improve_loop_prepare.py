@@ -95,6 +95,35 @@ def test_materialize_workspace_copies_approved_plugin_source_into_snapshot(
     assert (copied / "plugin.py").read_text() == "def compute(df, params):\n    return {}\n"
 
 
+def test_materialize_workspace_copies_examples_from_self_root_docs_examples_plugins(
+        loop_min, conn):
+    """D-12 pin (検収 R2): `_materialize_workspace` が `copy_examples_snapshot`
+    へ渡す `examples_root` (`improve_loop.py:369`
+    ``self._root / "docs" / "examples" / "plugins"``) を破壊する変異
+    (宛先を間違えるパス退行) が 921 本 SURVIVED していた — `copy_examples_snapshot`
+    は不在ディレクトリで黙って return する fail-open (improve_loop.py:125)
+    なので、宛先を間違えても誰も気づかない。`loop_min._root` (= tmp_path)
+    配下に `docs/examples/plugins/<name>/plugin.py` を実際に作り、
+    `_materialize_workspace` の戻り値 `source_snapshot_dir` (=
+    `staging_dir/_snapshot_src`) の `_examples/<name>/plugin.py` へ実在の
+    サンプル plugin が届くことを直接観測する (プラン §7.1 条件 6 /
+    L163 の要求)。"""
+    examples_root = loop_min._root / "docs" / "examples" / "plugins"
+    example_dir = examples_root / "sma_cross"
+    example_dir.mkdir(parents=True)
+    (example_dir / "plugin.py").write_text(
+        "def compute(df, params):\n    return {}\n")
+    (example_dir / "config.yaml").write_text("kind: indicator\n")
+
+    staging_dir, source_snapshot_dir = loop_min._materialize_workspace(
+        conn, 43, None)
+
+    copied = source_snapshot_dir / "_examples" / "sma_cross"
+    assert (copied / "plugin.py").is_file()
+    assert (copied / "config.yaml").is_file()
+    assert (copied / "plugin.py").read_text() == "def compute(df, params):\n    return {}\n"
+
+
 def test_compute_partition_hint_disjoint_covers_open_backlog_across_slots(
         loop_min, conn, clock):
     """D-1 pin: scheduler wave (expected=2) は open backlog を
