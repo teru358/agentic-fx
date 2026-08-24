@@ -49,6 +49,19 @@ def _flag_value(argv, flag):
     return argv[idx + 1]
 
 
+def test_claude_runner_rejects_empty_allowed_tools(tmp_path):
+    """#26 (`verified-round1.md` 1-B): `allowed_tools=[]` は
+    `--allowedTools ""` になり、claude CLI の意味論では「制限なし」に
+    近い挙動になりうる — 構築時点で fail closed する。"""
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    with pytest.raises(ValueError, match="allowed_tools"):
+        ClaudeRunner(bin_path=FAKE_CLAUDE, model="claude-haiku-4-5",
+                    workdir=workdir, credentials_file_copied=True,
+                    allowed_tools=[], cli_terminate_grace_sec=0.3,
+                    registry=ToolRegistry())
+
+
 def test_claude_argv_shape(tmp_path):
     """argv が骨格 §1.2 の形と一致する (`-p` プロンプト・--output-format
     stream-json --verbose・--json-schema・--setting-sources ""・
@@ -75,6 +88,26 @@ def test_claude_argv_shape(tmp_path):
     assert _flag_value(argv, "--allowedTools") == ",".join(runner._allowed_tools)
     assert _flag_value(argv, "--max-turns") == str(mission.max_turns)
     assert _flag_value(argv, "--model") == runner._model
+    # #34 (`verified-round1.md` 1-B): 各フラグの隣接値は pin 済みだが、
+    # argv の長さ (= 余分なフラグが無いこと) は未検査だった。
+    assert len(argv) == 19, (
+        f"argv に既知フラグ以外の要素が混入している (len={len(argv)}): {argv!r}")
+
+
+def test_claude_argv_does_not_leak_parent_secrets(tmp_path, monkeypatch):
+    """#30 (`verified-round1.md` 1-B): argv 全体への秘密混入検査が無い —
+    `_build_argv` は `mission.prompt`/`allowed_tools`/`model` しか触らない
+    はずだが、それを pin するテストが無かった。親 (pytest) 側の秘密が
+    argv に混入していないことを、fake CLI が書く `observed_argv.json` で
+    実プロセス実行して確認する (§4「安価な観測点が既にある」の消化)。"""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-sentinel-argv")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-sentinel-argv")
+    runner, workdir = _runner(tmp_path)
+    runner.run(_mission())
+    observed_argv = json.loads((workdir / "observed_argv.json").read_text())
+    joined = " ".join(observed_argv)
+    assert "sk-ant-sentinel-argv" not in joined
+    assert "sk-sentinel-argv" not in joined
 
 
 def test_claude_completed_terminal_status(tmp_path):
@@ -173,6 +206,12 @@ def test_claude_child_env_excludes_parent_secrets_and_matches_allowlist(tmp_path
     observed = json.loads((workdir / "observed_env.json").read_text())
     assert not any("API_KEY" in k for k in observed)
     assert set(observed) == _CLAUDE_ENV_ALLOWLIST
+    # #32 (`verified-round1.md` 1-B): キー名集合の一致だけでは PATH/TMPDIR/
+    # PYTHONPATH/PYTHONSAFEPATH の**値**が未 pin。
+    assert observed["PATH"] == "/usr/bin:/bin"
+    assert observed["TMPDIR"] == str(workdir / "tmp")
+    assert observed["PYTHONPATH"] == ""
+    assert observed["PYTHONSAFEPATH"] == "1"
 
 
 def test_claude_reason_does_not_leak_stderr_body(tmp_path):

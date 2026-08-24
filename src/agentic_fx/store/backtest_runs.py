@@ -90,6 +90,12 @@ def _insert(conn: sqlite3.Connection, *, scope: str, issued_by: str,
     start_utc = _require_utc(start, "period[0]")
     end_utc = _require_utc(end, "period[1]")
     now_utc = _require_utc(now, "now")
+    # 裁定 D3① (2026-08-24): 期間逆転 (period[0] > period[1]) を fail-closed
+    # で拒否する。等しい (ゼロ幅) 期間は許容する (既存呼び出しが使う)。
+    if start_utc > end_utc:
+        raise ValueError(
+            f"period is reversed: period[0]={start_utc.isoformat()} > "
+            f"period[1]={end_utc.isoformat()}")
     metrics_json = json.dumps(metrics, sort_keys=True)
     cur = conn.execute(
         "INSERT INTO backtest_runs (plugin_ref, content_hash, kind, pair, "

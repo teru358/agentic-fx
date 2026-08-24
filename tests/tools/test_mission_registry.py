@@ -276,6 +276,38 @@ def test_build_mission_registry_improve_rejects_trade_only_kwargs(tmp_path):
         build_mission_registry(**{**kwargs, "indicator_plugins": []})
     with pytest.raises(ValueError, match="provider/readonly"):
         build_mission_registry(**{**kwargs, "sandbox_run": lambda *a, **kw: None})
+    with pytest.raises(ValueError, match="provider/readonly"):
+        build_mission_registry(**{**kwargs, "provider": object()})  # L04
+
+
+@pytest.mark.parametrize("missing_kwarg", [
+    "staging_dir", "source_snapshot_dir", "ledger", "rpc_handlers"])
+def test_build_mission_registry_improve_rejects_missing_required_kwarg(
+        tmp_path, missing_kwarg):
+    """L03: improve 分岐の 4 kwargs (staging_dir/source_snapshot_dir/
+    ledger/rpc_handlers) の None ガードに個別テストが無かった。各 kwarg
+    を単独で None にし、`ValueError` になることを確認する (ガードを
+    消すと呼出時まで遅延して TypeError になる — fail-open)。"""
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    staging_dir = tmp_path / "staging"
+    source_snapshot_dir = tmp_path / "source"
+    staging_dir.mkdir()
+    source_snapshot_dir.mkdir()
+    kwargs = dict(
+        loop="improve", conn=conn, settings=SETTINGS, clock=_clock(), rag=rag,
+        activity=activity, staging_dir=staging_dir,
+        source_snapshot_dir=source_snapshot_dir,
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        rpc_handlers={"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}})
+    kwargs[missing_kwarg] = None
+    with pytest.raises(ValueError,
+                       match="staging_dir/source_snapshot_dir/ledger/"):
+        build_mission_registry(**kwargs)
 
 
 def test_build_mission_registry_trade_unaffected_by_improve_branch(tmp_path):

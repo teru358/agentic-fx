@@ -71,25 +71,14 @@ def test_build_runner_returns_claude_runner_for_claude_backend(tmp_path, monkeyp
     assert isinstance(runner, FakeClaudeRunner)
 
 
-def test_build_runner_forwards_settings_to_runner(tmp_path):
-    """設定値が runner に渡される (seam で検証)。"""
-    settings = _settings_with_backend(improve_backend="local")
-    registry = ToolRegistry()
-
-    # LocalRunner は model を使わない (Task 2/3 の CLI runner が使う)
-    runner = build_runner("improve", settings, registry, workdir=tmp_path)
-    assert runner is not None
-
-
-def test_build_runner_accepts_on_message(tmp_path):
-    """on_message コールバックも受け取れる。"""
-    settings = _settings_with_backend(improve_backend="local")
-    registry = ToolRegistry()
-    seen = []
-
-    runner = build_runner("improve", settings, registry, workdir=tmp_path,
-                         on_message=seen.append)
-    assert runner is not None
+# 段 0 是正 #12 (`verified-round1.md` 1-A): `test_build_runner_forwards_
+# settings_to_runner` / `test_build_runner_accepts_on_message` は
+# `assert runner is not None` のみの恒真テストだった (どちらも常に真になる
+# — `build_runner` が None を返すことは無い)。前者は
+# `test_build_runner_returns_local_runner_for_local_backend` (:54, isinstance
+# 完全一致) と、後者は `test_build_runner_local_backend_forwards_on_message`
+# (:193, `runner._on_message is callback` 完全一致) と等価かつ厳密上位互換
+# のため削除する (代替テストは既存)。
 
 
 # Step 25: Additional tests for comprehensive coverage
@@ -137,6 +126,46 @@ def test_build_runner_codex_backend_returns_codex_runner(tmp_path, monkeypatch):
                 update={"backend": "codex"})})})
     runner = build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
     assert isinstance(runner, FakeCodexRunner)
+
+
+def test_build_runner_codex_llama_swap_forwards_base_url(tmp_path, monkeypatch):
+    """#11 (`verified-round1.md` 1-A): `llama_swap_base_url=` は
+    `codex_settings.provider == "llama_swap"` のときだけ `settings.llama_swap.base_url`
+    を渡し、`chatgpt` のときは `None` を渡す (`factory.py:51-53`)。この条件式
+    ごと `None` に潰す変異は、`captured` を assert しない既存テストでは
+    生存する。"""
+    from agentic_fx.config import load_settings
+
+    FakeCodexRunner, captured = _install_fake_cli_runner_module(
+        monkeypatch, "agentic_fx.runners.codex_runner", "CodexRunner")
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": "codex"}),
+            "codex": settings.runner.codex.model_copy(
+                update={"provider": "llama_swap"})})})
+    build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+    assert captured["llama_swap_base_url"] == settings.llama_swap.base_url
+
+
+def test_build_runner_codex_chatgpt_omits_llama_swap_base_url(tmp_path, monkeypatch):
+    """対: `provider == "chatgpt"` のときは `llama_swap_base_url=None`。"""
+    from agentic_fx.config import load_settings
+
+    FakeCodexRunner, captured = _install_fake_cli_runner_module(
+        monkeypatch, "agentic_fx.runners.codex_runner", "CodexRunner")
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": "codex"}),
+            "codex": settings.runner.codex.model_copy(
+                update={"provider": "chatgpt"})})})
+    build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+    assert captured["llama_swap_base_url"] is None
 
 
 def test_build_runner_trade_profile_uses_trade_choice(tmp_path):

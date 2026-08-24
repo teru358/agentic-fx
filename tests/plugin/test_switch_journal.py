@@ -209,6 +209,28 @@ def test_reconcile_one_row_failure_does_not_block_other_rows(tmp_path, conn, mon
     assert "sma" in log_text
 
 
+# --- 段 0 独立発見 (1): `_PHASE_ORDER` の実行時強制 ---
+
+def test_advance_switch_journal_raises_on_backward_phase_move(conn):
+    """`_PHASE_ORDER` (preparing→versioned→recorded→switched→decided→
+    reverted) は段 0 変異スイープの時点で定義行以外に参照が無い死にコード
+    だった。`advance_switch_journal` はここで初めて単調性を実行時に検査
+    する: 既に到達した phase より前の phase へ `advance` しようとすると
+    `ValueError`。"""
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="absent",
+        old_target=None, new_target=f".versions/sma/{'a' * 64}",
+        switch_required=True, actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="versioned", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="recorded", now=NOW, commit=True)
+    with pytest.raises(ValueError, match="order violation"):
+        switch.advance_switch_journal(conn, op_id, phase="versioned", now=NOW, commit=True)
+    # 後方移動を試みても現在の phase は変わっていない
+    row = conn.execute("SELECT phase FROM plugin_switch_journal WHERE op_id=?",
+                       (op_id,)).fetchone()
+    assert row["phase"] == "recorded"
+
+
 # --- 表 3: switch_required=0 は switched を経ない ---
 
 def test_switch_required_false_skips_switched_phase(conn):

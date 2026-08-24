@@ -161,6 +161,13 @@ def test_codex_child_env_excludes_parent_secrets_and_matches_allowlist(tmp_path,
     observed = json.loads((workdir / "observed_env.json").read_text())
     assert not any("API_KEY" in k for k in observed)
     assert set(observed) == _CODEX_ENV_ALLOWLIST
+    # #36 (`verified-round1.md` 1-B): キー名集合の一致だけでは PATH/TMPDIR/
+    # PYTHONPATH/PYTHONSAFEPATH の**値**が未 pin (CODEX_HOME/HOME は
+    # 別テストが値まで見る)。
+    assert observed["PATH"] == "/usr/bin:/bin"
+    assert observed["TMPDIR"] == str(workdir / "tmp")
+    assert observed["PYTHONPATH"] == ""
+    assert observed["PYTHONSAFEPATH"] == "1"
 
 
 def test_codex_env_has_no_openai_api_key(tmp_path, monkeypatch):

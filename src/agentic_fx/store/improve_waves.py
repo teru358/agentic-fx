@@ -91,15 +91,22 @@ def revert_to_reserved(conn: sqlite3.Connection, *, period_key: str, k: int,
 
 
 def mark_slot_failed(conn: sqlite3.Connection, *, period_key: str, k: int,
-                     now: datetime, commit: bool = True) -> None:
-    """再試行上限に達した slot を無条件で failed へ落とす (mission_id も
-    NULL に戻す)。呼び出し元 (Task 9) が再試行上限到達と判定した場合に呼ぶ。"""
-    conn.execute(
+                     now: datetime, commit: bool = True) -> bool:
+    """再試行上限に達した slot を failed へ落とす (mission_id も NULL に
+    戻す)。呼び出し元 (Task 9) が再試行上限到達と判定した場合に呼ぶ。
+
+    **裁定 D2 (2026-08-24)**: `reserved`/`claimed`/`running` からの CAS。
+    既に終端済み (`done`/`failed`) の slot は上書きしない — 終端の直積
+    (設計 §3.1⑤) を守る。戻り値: `True` = CAS 成功、`False` = 対象 slot
+    が非終端状態でなかった (既に終端済み、または存在しない)。"""
+    cur = conn.execute(
         "UPDATE improve_wave_slots SET status='failed', mission_id=NULL, "
-        "updated_at=? WHERE wave_period_key=? AND k=?",
+        "updated_at=? WHERE wave_period_key=? AND k=? "
+        "AND status IN ('reserved','claimed','running')",
         (now.isoformat(), period_key, k))
     if commit:
         conn.commit()
+    return cur.rowcount == 1
 
 
 def count_open_slots(conn: sqlite3.Connection, *, period_key: str) -> int:
@@ -111,14 +118,17 @@ def count_open_slots(conn: sqlite3.Connection, *, period_key: str) -> int:
 
 
 def mark_terminal(conn: sqlite3.Connection, *, period_key: str, k: int,
-                  status: str, now: datetime, commit: bool = True) -> None:
+                  status: str, now: datetime, commit: bool = True) -> bool:
+    """戻り値: `True` = 対象 slot を更新した。`False` = `(period_key, k)`
+    に該当する slot が存在しなかった (rowcount=0、fail-open 防止)。"""
     if status not in _TERMINAL_STATUSES:
         raise ValueError(f"status must be done|failed: {status!r}")
-    conn.execute(
+    cur = conn.execute(
         "UPDATE improve_wave_slots SET status=?, updated_at=? "
         "WHERE wave_period_key=? AND k=?", (status, now.isoformat(), period_key, k))
     if commit:
         conn.commit()
+    return cur.rowcount == 1
 
 
 def recover_stale_slots(conn: sqlite3.Connection, *, now: datetime,
@@ -126,10 +136,17 @@ def recover_stale_slots(conn: sqlite3.Connection, *, now: datetime,
     """§8.1-20: 起動時、`reserved`/`claimed`/`running` の全 slot を `failed`
     へ収束する (再開しない。period は消費済みのまま — wave 行は残す)。
     手動 one-shot は slot を持たないため対象外 (このクエリの対象は
-    improve_wave_slots のみ)。"""
+    improve_wave_slots のみ)。
+
+    **L58 是正 (2026-08-24)**: `mark_slot_failed` と同様に `mission_id`
+    を NULL に戻す — `mission_id` を読む呼び出し元が無いことを確認済み
+    (`grep -rn mission_id src/agentic_fx/core/improve_supervisor.py`)。
+    §3.1⑦ の「`reserved` slot の前提として `mission_id IS NULL`」との
+    非対称を解消する。"""
     cur = conn.execute(
-        "UPDATE improve_wave_slots SET status='failed', updated_at=? "
-        "WHERE status IN ('reserved','claimed','running')", (now.isoformat(),))
+        "UPDATE improve_wave_slots SET status='failed', mission_id=NULL, "
+        "updated_at=? WHERE status IN ('reserved','claimed','running')",
+        (now.isoformat(),))
     if commit:
         conn.commit()
     return cur.rowcount

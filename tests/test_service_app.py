@@ -2861,6 +2861,32 @@ def test_read_proc_self_environ_names_reads_real_proc_self_environ():
     assert "PATH" in names
 
 
+@pytest.mark.parametrize("leaked_name", [
+    "ANTHROPIC_FOO", "MY_TOKEN_X", "SECRETSTUFF", "WEBHOOK_URL", "OPENAI_BASE",
+])
+def test_check_service_initial_env_has_no_secrets_rejects_each_pattern(leaked_name):
+    """#89 (`verified-round1.md` 1-A): `any(pat in k for pat in
+    _SECRET_ENV_PATTERNS)` を `any(k.endswith(pat) ...)` に緩める変異は、
+    既存 pin が `SOME_SERVICE_API_KEY` (末尾一致) 1 本しか踏まないため
+    生存する。前方一致パターン (`ANTHROPIC_`/`OPENAI_`) を含む全 6 パターン
+    を個別に踏む。"""
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    with pytest.raises(RuntimeError, match="secret"):
+        _check_service_initial_env_has_no_secrets(
+            object(), read_initial_env_names=lambda: {leaked_name, "HOME"})
+
+
+def test_check_service_initial_env_has_no_secrets_rejects_lowercase_name():
+    """#94 (`verified-round1.md` 1-B): `_SECRET_ENV_PATTERNS` は大文字のみ —
+    小文字 env 名 (`my_api_key`) が漏れないよう `k.upper()` で照合する。"""
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    with pytest.raises(RuntimeError, match="secret"):
+        _check_service_initial_env_has_no_secrets(
+            object(), read_initial_env_names=lambda: {"my_api_key", "HOME"})
+
+
 def test_check_codex_subscription_expiry_rejects_when_expired(tmp_path):
     """④ (設計書 §1.4、裁定 R4): `chatgpt_subscription_active_until` を
     過ぎていれば起動拒否 (ERROR)。"""
@@ -2918,6 +2944,93 @@ def test_check_codex_subscription_expiry_missing_key_warns_and_does_not_raise(
     with caplog.at_level(_logging.WARNING, logger="agentic_fx.service"):
         _check_codex_subscription_expiry(str(auth))  # 例外を出さない
     assert any("chatgpt_subscription_active_until" in r.message for r in caplog.records)
+
+
+def test_check_codex_subscription_expiry_rejects_at_exact_boundary(tmp_path):
+    """#90 (`verified-round1.md` 1-A): `active_until <= now` の境界。
+    `active_until == now` ちょうどで期限切れ (`<` に緩める変異は
+    既存の 4 日差テストだけでは検出できない)。"""
+    from agentic_fx.service import _check_codex_subscription_expiry
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps(
+        {"chatgpt_subscription_active_until": now.isoformat()}))
+    with pytest.raises(RuntimeError, match="expired"):
+        _check_codex_subscription_expiry(str(auth), clock=lambda: now)
+
+
+def test_check_codex_subscription_expiry_warns_at_exact_7_day_boundary(
+        tmp_path, caplog):
+    """#91 (`verified-round1.md` 1-A): `active_until - now <= timedelta(days=7)`
+    の境界。差がちょうど 7 日で WARNING が出る (`<` に緩める変異は既存の
+    4 日差テストだけでは検出できない)。"""
+    import logging as _logging
+
+    from agentic_fx.service import _check_codex_subscription_expiry
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    active_until = now + timedelta(days=7)
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps(
+        {"chatgpt_subscription_active_until": active_until.isoformat()}))
+    with caplog.at_level(_logging.WARNING, logger="agentic_fx.service"):
+        _check_codex_subscription_expiry(str(auth), clock=lambda: now)
+    assert any("expires soon" in r.message for r in caplog.records)
+
+
+def test_check_codex_subscription_expiry_non_string_value_warns(tmp_path, caplog):
+    """#95 (`verified-round1.md` 1-B): `chatgpt_subscription_active_until`
+    が数値等の不正型のとき `except (TypeError, ValueError)` 経路で
+    WARNING に留める (fail closed にしない、裁定 R4)。"""
+    import logging as _logging
+
+    from agentic_fx.service import _check_codex_subscription_expiry
+
+    auth = tmp_path / "auth.json"
+    auth.write_text(json.dumps({"chatgpt_subscription_active_until": 123}))
+    with caplog.at_level(_logging.WARNING, logger="agentic_fx.service"):
+        _check_codex_subscription_expiry(
+            str(auth), clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert any("不正" in r.message for r in caplog.records)
+
+
+def test_check_cli_version_rejects_when_binary_cannot_be_executed(tmp_path):
+    """#84 (`verified-round1.md` 1-A): `except (OSError, TimeoutExpired)`
+    経路は `returncode != 0` の 1 例しか実測されていなかった。実行不能な
+    bin (存在しないファイル) を渡すと `subprocess.run` が `OSError` を
+    送出し、`RuntimeError` に変換されることを pin する。"""
+    from agentic_fx.service import _check_cli_version
+
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(RuntimeError, match="version check failed"):
+        _check_cli_version(missing)
+
+
+def test_check_cli_version_rejects_when_binary_times_out(tmp_path, monkeypatch):
+    """#84 (`verified-round1.md` 1-A): `subprocess.TimeoutExpired` 経路
+    (`timeout=15` の削除は既存 pin では検出されない) — sleep する bin を
+    渡し、`_check_cli_version` が呼ぶ `subprocess.run` の `timeout=` 引数を
+    強制的に短くする spy で実測する (`_check_cli_version` は関数内
+    `import subprocess` で標準 `subprocess` モジュールを束縛するため、
+    グローバルな `subprocess.run` を差し替えれば効く)。"""
+    import subprocess as _subprocess
+
+    from agentic_fx.service import _check_cli_version
+
+    sleeper = tmp_path / "sleeper.sh"
+    sleeper.write_text("#!/bin/sh\nsleep 5\n")
+    sleeper.chmod(0o700)
+
+    orig_run = _subprocess.run
+
+    def short_timeout_run(argv, **kwargs):
+        kwargs["timeout"] = 0.2
+        return orig_run(argv, **kwargs)
+
+    monkeypatch.setattr(_subprocess, "run", short_timeout_run)
+    with pytest.raises(RuntimeError, match="version check failed"):
+        _check_cli_version(sleeper)
 
 
 def test_build_app_rejects_llama_swap_when_not_verified(tmp_path):
@@ -2990,6 +3103,13 @@ def test_build_app_rewrites_relative_claude_bin_to_absolute_path(tmp_path, monke
             assert Path(resolved).is_absolute(), (
                 f"F1 是正が効いていない — settings.runner.claude.bin が"
                 f"相対のまま: {resolved!r}")
+            # #86 (`verified-round1.md` 1-A): `.is_absolute()` のみでは
+            # 「意図した bin に解決されたか」を見ていない (別の絶対パスに
+            # すり替わっても通る) — 実際に PATH 解決したはずの fake_claude
+            # 自身に一致することまで pin する。
+            assert resolved == str(fake_claude.resolve()), (
+                f"意図しない bin に解決されている: {resolved!r} != "
+                f"{fake_claude.resolve()!r}")
             # build_launcher_argv が拒否しない (ValueError を出さない) こと
             argv = build_launcher_argv(_os.getpid(), [resolved])
             assert argv[-1] == resolved

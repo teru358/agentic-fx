@@ -110,6 +110,21 @@ def test_fetch_article_min_interval_sec_enforced():
     assert len(backend.calls) == 1
 
 
+def test_web_search_min_interval_sec_boundary_equal_is_allowed():
+    """L13: `now - last == min_interval_sec` ちょうどの境界が未検証
+    (既存は 0.5 vs 2.0)。`<` → `<=` 変異が生存する — 境界ちょうどでは
+    成功することを pin する。"""
+    clock_values = iter([0.0, 2.0])  # delta == min_interval_sec ちょうど
+    tools, backend, _ = _build(
+        _settings(min_interval_sec=2.0, max_searches=10),
+        clock=clock_values)
+    out1 = tools["web_search"].func(query="q", max_results=1)
+    assert "error" not in out1
+    out2 = tools["web_search"].func(query="q", max_results=1)
+    assert "error" not in out2
+    assert len(backend.calls) == 2
+
+
 def test_fetch_article_max_per_host_enforced():
     """軸: host 上限。同一 host への 6 回目 (上限 5) は error。"""
     tools, _, backend = _build(
@@ -191,6 +206,20 @@ def test_fetch_article_429_aborts_host_for_rest_of_mission():
     assert len(backend.calls) == 1  # 2 回目は backend に到達しない
 
 
+def test_fetch_article_429_abort_is_host_independent():
+    """L14: 429 遮断の host 独立性が未検証 (既存は単一 host のみ)。
+    `aborted_hosts` を bool フラグにする変異が生存する — 別 host への
+    呼び出しは影響を受けないことを確認する。"""
+    tools, _, backend = _build(
+        _settings(min_interval_sec=0.01, max_fetches=100),
+        fetch_backend=_FakeFetchBackend(status_by_call=[429, 200]))
+    first = tools["fetch_article"].func(url="https://blocked.example/1")
+    assert first == {"error": "fetch failed: 429"}
+    second = tools["fetch_article"].func(url="https://other.example/1")
+    assert second == {"text": "article body"}
+    assert len(backend.calls) == 2
+
+
 def test_fetch_article_503_aborts_host_for_rest_of_mission():
     """軸: 429/503 即中止 (503 も同じ規律)。"""
     tools, _, backend = _build(
@@ -215,6 +244,43 @@ def test_web_search_max_results_clamp_enforced_via_registry_execute():
         "web_search", {"query": "q", "max_results": 21}, ["web_search"])
     assert "invalid arguments" in out
     assert backend.calls == []
+
+
+class _AlwaysRaisingSearchBackend:
+    """L02 killer: `web_search` 側にも段 0 M01 と同型の pin を足す。
+    呼ばれるたびに例外を投げ、予算カウンタが backend 呼び出しの前に
+    加算されることを確認する。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def text(self, query: str, max_results: int) -> list[dict]:
+        self.calls += 1
+        raise ConnectionError("boom")
+
+
+def test_web_search_max_searches_budget_consumed_even_when_backend_raises():
+    backend = _AlwaysRaisingSearchBackend()
+    tools, _, _ = _build(
+        _settings(max_searches=2, min_interval_sec=0.01), search_backend=backend)
+    for i in range(2):
+        with pytest.raises(ConnectionError):
+            tools["web_search"].func(query=f"q{i}", max_results=1)
+    assert backend.calls == 2
+    out = tools["web_search"].func(query="q3", max_results=1)
+    assert out == {"error": "budget exhausted"}
+    assert backend.calls == 2
+
+
+class _AlwaysCountingFetchBackend:
+    """L01: 200 を返し続けて到達回数だけ数える fake。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def fetch(self, url: str, *, user_agent: str | None = None) -> tuple[int, str]:
+        self.calls += 1
+        return 200, "body"
 
 
 class _AlwaysRaisingFetchBackend:
@@ -273,3 +339,88 @@ def test_fetch_article_truncates_at_fetch_max_bytes():
         fetch_backend=_FakeFetchBackend(body=long_body))
     out = tools["fetch_article"].func(url="https://a.example/1")
     assert len(out["text"].encode("utf-8")) <= 10
+
+
+def test_fetch_article_non_2xx_non_429_503_status_is_error():
+    """L15: `_FakeFetchBackend` が 200/429/503 以外を返さないため、
+    `status != 200` を緩める変異 (例: `status not in (429, 503)`) が生存
+    する。404 で明示的に error を pin する。"""
+    tools, _, _ = _build(
+        _settings(min_interval_sec=0.01),
+        fetch_backend=_FakeFetchBackend(status_by_call=[404]))
+    out = tools["fetch_article"].func(url="https://a.example/1")
+    assert out == {"error": "fetch failed: 404"}
+
+
+def test_fetch_article_truncates_multibyte_char_boundary():
+    """L16: 切り詰め (`encoded[:max_bytes].decode(errors="ignore")`) の
+    マルチバイト境界が未検証 (既存は ASCII のみ)。日本語本文で境界を
+    またぐケースを確認する — 不正なバイト列にならず有効な UTF-8 文字列
+    として返ることを見る。"""
+    # "あ" は UTF-8 で 3 バイト。max_bytes=5 だと 1 文字目 (3B) は収まり、
+    # 2 文字目 (3B) は境界をまたいで 2B しか入らない (不正シーケンス)。
+    body = "あああ"
+    tools, _, _ = _build(
+        _settings(fetch_max_bytes=5, min_interval_sec=0.01),
+        fetch_backend=_FakeFetchBackend(body=body))
+    out = tools["fetch_article"].func(url="https://a.example/1")
+    assert len(out["text"].encode("utf-8")) <= 5
+    # errors="ignore" で不正末尾バイトが破棄され、有効な UTF-8 のみが残る
+    assert out["text"].encode("utf-8").decode("utf-8") == out["text"]
+    assert out["text"] == "あ"  # 3B のみ収まり、境界をまたぐ 2 文字目は破棄される
+
+
+# --- L01: host キー正規化 (`max_per_host` / 429 遮断の表記違い回避) ---
+
+def test_fetch_article_max_per_host_normalizes_case_port_and_userinfo():
+    """L01 killer: `urlparse(url).netloc` の生値を host キーに使うと、
+    大文字化・ポート付与・userinfo 付与のいずれでも別 host 扱いになり
+    `max_per_host` を回避できる。host は
+    `(urlparse(url).hostname or "").lower()` で正規化すること。"""
+    backend = _AlwaysCountingFetchBackend()
+    tools, _, _ = _build(
+        _settings(max_per_host=2, max_fetches=100, min_interval_sec=0.01),
+        fetch_backend=backend)
+    urls = [
+        "https://ex.example/1",
+        "https://EX.example/2",
+        "https://ex.example:443/3",
+        "https://u@ex.example/4",
+        "https://ex.example/5",
+    ]
+    outs = [tools["fetch_article"].func(url=u) for u in urls]
+    assert backend.calls == 2, (
+        f"host 正規化が効いていれば backend 到達は 2 回のみ (実測 {backend.calls})")
+    assert outs[2:] == [{"error": "budget exhausted"}] * 3
+
+
+def test_fetch_article_429_host_abort_survives_case_and_port_variants():
+    """L01 killer (429 側): 429 で遮断された host を大文字表記・ポート付き
+    で再訪しても backend に到達しないこと。"""
+    backend = _FakeFetchBackend(status_by_call=[429])
+    tools, _, _ = _build(
+        _settings(min_interval_sec=0.01, max_fetches=100),
+        fetch_backend=backend)
+    first = tools["fetch_article"].func(url="https://z.example/1")
+    assert first == {"error": "fetch failed: 429"}
+    for u in ["https://Z.example/2", "https://z.example:443/3",
+              "https://u@z.example/4"]:
+        out = tools["fetch_article"].func(url=u)
+        assert out == {"error": "host aborted (429/503)"}
+    assert len(backend.calls) == 1
+
+
+def test_fetch_article_max_per_host_normalizes_via_registry_execute():
+    """L01 killer (実経路): `fetch_article` の schema には `format`/
+    `pattern` が無く `ToolRegistry.execute` の jsonschema 検査は素通りする
+    ため、正規化は関数本体で効いている必要がある。"""
+    backend = _AlwaysCountingFetchBackend()
+    tools, _, _ = _build(
+        _settings(max_per_host=2, max_fetches=100, min_interval_sec=0.01),
+        fetch_backend=backend)
+    registry = ToolRegistry()
+    registry.register_all(list(tools.values()))
+    for u in ["https://r.example/1", "https://R.example/2",
+              "https://r.example:443/3", "https://r.example/4"]:
+        registry.execute("fetch_article", {"url": u}, ["fetch_article"])
+    assert backend.calls == 2

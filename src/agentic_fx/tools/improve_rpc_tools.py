@@ -43,8 +43,10 @@ def _strip_forbidden(value: object) -> object:
     if isinstance(value, dict):
         return {k: _strip_forbidden(v) for k, v in value.items()
                 if k not in _FORBIDDEN_KEYS}
-    if isinstance(value, list):
-        return [_strip_forbidden(v) for v in value]
+    if isinstance(value, (list, tuple)):
+        # L21: tuple 要素も list と同じく再帰する (型は保存する)。
+        stripped = [_strip_forbidden(v) for v in value]
+        return tuple(stripped) if isinstance(value, tuple) else stripped
     return value
 
 

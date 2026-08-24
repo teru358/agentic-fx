@@ -574,6 +574,20 @@ def test_main_runs_llm_and_sends_result_when_go_frame_arrives(
     monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
                         lambda **kw: None)
     _CountingFakeLocalRunner.run_call_count = 0
+    # #56 (`verified-round1.md` 1-B): `_drive_main` は
+    # `agentic_fx.runners.local_runner.LocalRunner` クラスを差し替えるため、
+    # improve 分岐が `runner_factory.build_runner` を経由するという**経路**
+    # は pin されていなかった (直接 `LocalRunner(...)` 構築に変えても通る)。
+    # `runner_factory.build_runner` を spy して 1 回呼ばれることを assert する。
+    build_runner_calls: list[tuple] = []
+    orig_build_runner = mission_worker.runner_factory.build_runner
+
+    def spying_build_runner(*a, **kw):
+        build_runner_calls.append((a, kw))
+        return orig_build_runner(*a, **kw)
+
+    monkeypatch.setattr(mission_worker.runner_factory, "build_runner",
+                        spying_build_runner)
 
     frames, _, _ = _drive_main(
         monkeypatch, tmp_path,
@@ -585,6 +599,10 @@ def test_main_runs_llm_and_sends_result_when_go_frame_arrives(
     assert _CountingFakeLocalRunner.run_call_count == 1
     assert frames[-1]["type"] == "result"
     assert frames[-1]["status"] == "completed"
+    assert len(build_runner_calls) == 1, (
+        "improve 分岐が runner_factory.build_runner を経由していない")
+    assert build_runner_calls[0][0][0] == "improve", (
+        "runner_factory.build_runner の第 1 引数 (profile) が improve でない")
 
 
 def test_main_happy_path_emits_ready_event_result_in_one_seq_sequence(
@@ -660,6 +678,23 @@ def test_main_exits_without_ready_when_reparented(monkeypatch, tmp_path):
     assert registry_calls == []
 
 
+@pytest.mark.parametrize("bad_pid", [str(os.getpid()), None])
+def test_main_exits_without_ready_when_expected_parent_pid_type_is_malformed(
+        monkeypatch, tmp_path, bad_pid):
+    """#63 (`verified-round1.md` 1-A): `expected_parent_pid` の型崩れ
+    (`str`/`None`) は正常系の `+1` (値の不一致) しかテストされていなかった。
+    `os.getppid() != expected_parent_pid` は型が違えば必ず不一致になり
+    fail closed (ready を送らず終了) するのが安全側の挙動 — これを pin する
+    (`==` へ緩めて型を無視する変異等を防ぐ)。"""
+    frames, rlimit_calls, registry_calls = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"expected_parent_pid": bad_pid})
+
+    assert frames == []
+    assert rlimit_calls == []
+    assert registry_calls == []
+
+
 def test_main_rejects_unsupported_worker_profile(monkeypatch, tmp_path):
     """本プランのスコープは `worker_profile="trade"` と Task 18 で実装した
     `worker_profile="improve"` のみ。それ以外（例: bogus）は ready を送る前に
@@ -717,20 +752,182 @@ def test_main_applies_landlock_bootstrap_before_running_improve_mission(
     assert len(registry_calls) == 1  # _build_improve_registry から 1 呼び出し
 
 
-def test_main_fails_closed_when_runner_backend_is_claude(monkeypatch, tmp_path):
-    """**Global Constraints の強制点**: Anthropic API (従量課金) は使用不可で
-    `ClaudeRunner` は本プラン未実装。`runner.trade.backend == "claude"` を子が
-    検出したら `RuntimeError` で fail closed する (Mission を実行しない)。"""
+def test_main_routes_trade_claude_backend_through_factory_build_runner(
+        monkeypatch, tmp_path):
+    """I-1 是正 (`tmp/review-bundleA/verified-round1.md` §4): 旧
+    `test_main_fails_closed_when_runner_backend_is_claude` は「ClaudeRunner
+    は本プラン未実装」という旧前提を固定していたが、Minor 14 で trade+claude
+    の起動時検査 (`service._check_cli_backend`) を追加した以上、実 Mission
+    経路 (`mission_worker.py`) も通す必要がある (codex I-1)。
+
+    Anthropic API 従量課金を使わないという Global Constraints の強制点は
+    `RuntimeError` fail closed ではなく `_build_env` が `ANTHROPIC_API_KEY`
+    等を CLI env に一切載せないこと (`test_claude_runner.py:122`) が別途
+    担保する — claude はサブスクリプション認証 (`.credentials.json`) のみで
+    起動する。
+
+    ここでは `main()` の trade 分岐が実際に `runner_factory.build_runner`
+    を `profile="trade"` で呼ぶ**配線**を in-process で pin する。実
+    プロセス (fake claude CLI + 0600 credentials + allowed_tools 完全一致
+    + `afx.sock` bind 実測) の pin は
+    `tests/runners/test_worker_runner.py::
+    test_trade_claude_real_process_completes_via_factory_build_runner`。"""
+    monkeypatch.chdir(tmp_path)
+
+    build_calls: list[tuple] = []
+
+    class _FakeClaudeRunner:
+        def __init__(self):
+            self._afx_mcp_dispatcher = None
+
+        def run(self, mission):
+            from agentic_fx.runners.base import MissionResult
+            return MissionResult("completed", {"action": "no_trade"}, [],
+                                 reason=None)
+
+    def fake_build_runner(profile, settings, registry, *, workdir,
+                          on_message=None, cli_started_sink=None):
+        build_calls.append((profile, settings.runner.trade.backend))
+        return _FakeClaudeRunner()
+
+    monkeypatch.setattr(mission_worker.runner_factory, "build_runner",
+                        fake_build_runner)
+
     def to_claude(d):
         d["runner"]["trade"]["backend"] = "claude"
 
     frames, _, registry_calls = _drive_main(
         monkeypatch, tmp_path, settings_mutator=to_claude)
 
-    assert len(frames) == 1
-    assert frames[0]["type"] == "ready" and frames[0]["ok"] is False
-    assert "claude" in frames[0]["error"].lower()
-    assert registry_calls == []
+    assert build_calls == [("trade", "claude")], (
+        "trade+claude が runner_factory.build_runner(profile='trade') を "
+        "経由していない (I-1)")
+    assert frames[-1]["type"] == "result"
+    assert frames[-1]["status"] == "completed"
+    assert registry_calls != [], (
+        "trade+claude でも build_mission_registry('trade', ...) が呼ばれる"
+        "はず (registry 構築を経由しない変異への pin)")
+
+
+def test_main_trade_local_backend_does_not_bind_mcp_dispatcher(
+        monkeypatch, tmp_path):
+    """I-1 是正の条件化そのものの pin (`verified-round1.md` §4 修正範囲 1
+    「条件化するならその分岐自体を pin すること」)。trade.backend=local の
+    ときは CLI を経由しないため `afx.sock` を bind する必要が無い —
+    `_start_mcp_dispatcher` を無条件化する変異、または local でも bind
+    してしまう変異への pin。"""
+    monkeypatch.chdir(tmp_path)
+
+    dispatcher_calls: list[object] = []
+    orig_start = mission_worker._start_mcp_dispatcher
+
+    def spy_start(**kw):
+        dispatcher_calls.append(kw)
+        return orig_start(**kw)
+
+    monkeypatch.setattr(mission_worker, "_start_mcp_dispatcher", spy_start)
+
+    # 既定 (settings_mutator 無し) は trade.backend == "local"。
+    frames, _, _ = _drive_main(monkeypatch, tmp_path)
+
+    assert frames[-1]["type"] == "result"
+    assert frames[-1]["status"] == "completed"
+    assert dispatcher_calls == [], (
+        "trade+local でも _start_mcp_dispatcher が呼ばれている — "
+        "afx.sock を不要に bind している (I-1 条件化の pin)")
+    assert not (tmp_path / "afx.sock").exists()
+
+
+def test_main_trade_claude_backend_binds_mcp_dispatcher_before_ready(
+        monkeypatch, tmp_path):
+    """I-1 是正 codex 指摘 (d) の直接 pin: 「`ready` 受信時点で `afx.sock`
+    が bind されている」を、実プロセスの CLI 接続 (`test_worker_runner.py`
+    の実測は `runner.run()` = `go` 受領後まで進んで初めて CLI が socket に
+    触れるため、この性質そのものは検証していない) ではなく、`ready`
+    フレーム送出の**直前**の時点で socket が実在し `connect()` できることを
+    `_send_frame` spy で観測する (`test_ready_is_sent_only_after_mcp_dispatcher_socket_is_bound_for_improve_profile`
+    の trade 版)。"""
+    import socket as socket_mod
+
+    monkeypatch.chdir(tmp_path)
+
+    observed: dict = {}
+    orig_send_frame = mission_worker._send_frame
+
+    def spy_send_frame(protocol_out, out_seq, frame):
+        if frame.get("type") == "ready" and "sock_exists" not in observed:
+            sock_path = tmp_path / "afx.sock"
+            observed["sock_exists"] = sock_path.exists()
+            if observed["sock_exists"]:
+                try:
+                    with socket_mod.socket(socket_mod.AF_UNIX,
+                                           socket_mod.SOCK_STREAM) as s:
+                        s.connect(str(sock_path))
+                    observed["sock_connect_ok"] = True
+                except OSError:
+                    observed["sock_connect_ok"] = False
+        return orig_send_frame(protocol_out, out_seq, frame)
+
+    monkeypatch.setattr(mission_worker, "_send_frame", spy_send_frame)
+
+    class _FakeClaudeRunner:
+        def __init__(self):
+            self._afx_mcp_dispatcher = None
+
+        def run(self, mission):
+            from agentic_fx.runners.base import MissionResult
+            return MissionResult("completed", {"action": "no_trade"}, [],
+                                 reason=None)
+
+    monkeypatch.setattr(
+        mission_worker.runner_factory, "build_runner",
+        lambda *a, **kw: _FakeClaudeRunner())
+
+    def to_claude(d):
+        d["runner"]["trade"]["backend"] = "claude"
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path, settings_mutator=to_claude)
+
+    assert frames[0]["type"] == "ready"
+    # #54 (`verified-round1.md` 1-B): `ok is True` も見る (未検証だった)。
+    assert frames[0]["ok"] is True
+    assert observed.get("sock_exists") is True, (
+        "trade+claude で ready 送出時点で afx.sock が bind されていない")
+    assert observed.get("sock_connect_ok") is True, (
+        "trade+claude で ready 送出時点で afx.sock へ接続できない")
+
+
+def test_main_trade_claude_closes_mcp_dispatcher_after_mission_completes(
+        monkeypatch, tmp_path):
+    """trade+claude 版の段 0 申し送り 2 pin
+    (`test_mcp_dispatcher_socket_is_closed_after_improve_mission_completes`
+    の trade 版): Mission 終了後に `afx.sock` が unlink されている。"""
+    monkeypatch.chdir(tmp_path)
+
+    class _FakeClaudeRunner:
+        def __init__(self):
+            self._afx_mcp_dispatcher = None
+
+        def run(self, mission):
+            from agentic_fx.runners.base import MissionResult
+            return MissionResult("completed", {"action": "no_trade"}, [],
+                                 reason=None)
+
+    monkeypatch.setattr(
+        mission_worker.runner_factory, "build_runner",
+        lambda *a, **kw: _FakeClaudeRunner())
+
+    def to_claude(d):
+        d["runner"]["trade"]["backend"] = "claude"
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path, settings_mutator=to_claude)
+
+    assert frames[-1]["type"] == "result"
+    sock_path = tmp_path / "afx.sock"
+    assert not sock_path.exists(), (
+        "trade+claude の Mission 終了後も afx.sock が残っている")
 
 
 def test_set_resource_limits_sets_all_four_limits(monkeypatch):
@@ -1130,15 +1327,38 @@ def test_main_puts_reason_in_result_frame_for_improve_profile(
     def settings_mutator(settings_dict):
         pass  # improve は既定 settings のまま (backend=local)
 
-    frames, _, _ = _drive_main(
+    frames, _, registry_calls = _drive_main(
         monkeypatch, tmp_path,
         handshake_overrides={"worker_profile": "improve",
-                             "db_path": None, "plugins_dir": None,
+                             # #62 是正 (advisor 指摘): `db_path` を意図的に
+                             # None のままにしない — improve 分岐が万一
+                             # trade 専用ブロックへ fall-through しても
+                             # `connect_readonly(Path(None))` の早期
+                             # crash に隠れず `build_mission_registry`
+                             # まで到達できるようにし、直後の
+                             # `registry_calls == []` を非恒真にする
+                             # (`_drive_main` が用意する実 db をそのまま
+                             # 使う — main() の improve 分岐は
+                             # handshake["db_path"] を一切参照しない設計
+                             # なので実害は無い)。
+                             "plugins_dir": None,
                              "mission_id": "m-proto-test",
                              "staging_dir": str(tmp_path / "staging" / "m-proto-test"),
                              "source_snapshot_dir": str(tmp_path / "source")},
         settings_mutator=settings_mutator,
         runner_cls=_FakeLocalRunnerWithReason)
+    # #62 (`verified-round1.md` 1-A): improve profile では trade 専用の
+    # build_mission_registry("trade", ...) ブロックが実行されないことを
+    # pin する (credentials 系の 1 本以外にも踏ませる)。
+    # merge (main 649a811 → プラン10 Task10, 2026-08-24): Task 10 が
+    # `_build_improve_registry` を実配線したため、improve profile でも
+    # `build_mission_registry("improve", ...)` が呼ばれるようになった
+    # (main 単独の時点では rpc_client が無く常に空 ToolRegistry() だった)。
+    # #62 の意図 (trade 専用ブロックが improve では実行されない) を保ちつつ
+    # 実配線を許容するため、"trade" 呼び出しの不在だけを見る。
+    assert all(call[0][0] != "trade" for call in registry_calls), (
+        "improve profile で build_mission_registry('trade', ...) が"
+        "呼ばれている")
     result_frame = frames[-1]
     assert result_frame["type"] == "result"
     assert result_frame["reason"] == (
@@ -1242,6 +1462,8 @@ def test_ready_is_sent_only_after_mcp_dispatcher_socket_is_bound_for_improve_pro
         settings_mutator=settings_mutator)
 
     assert frames[0]["type"] == "ready"
+    # #54 (`verified-round1.md` 1-B): `ok is True` も見る (未検証だった)。
+    assert frames[0]["ok"] is True
     assert observed.get("sock_exists") is True, (
         "ready 送出時点で afx.sock が bind されていない (RW6)")
     assert observed.get("sock_connect_ok") is True, (
@@ -1353,15 +1575,29 @@ def test_main_does_not_set_os_environ_from_handshake_credentials_for_improve(
     monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
                         lambda **kw: None)
     try:
-        _drive_main(monkeypatch, tmp_path,
-                    handshake_overrides={
-                        "worker_profile": "improve", "db_path": None,
-                        "plugins_dir": None,
-                        "mission_id": "m-credentials-improve-test",
-                        "staging_dir": str(tmp_path / "staging" / "m-credentials-improve-test"),
-                        "source_snapshot_dir": str(tmp_path / "source"),
-                        "credentials": {"TWELVEDATA_API_KEY": "secret-td"}})
+        _, _, registry_calls = _drive_main(
+            monkeypatch, tmp_path,
+            handshake_overrides={
+                "worker_profile": "improve",
+                # #62 是正 (advisor 指摘): 上のテストと同じ理由で
+                # `db_path` を None に潰さない — 実 db (`_drive_main` が
+                # 用意) を使うことで、fall-through 変異下でも
+                # `registry_calls == []` が非恒真になる。
+                "plugins_dir": None,
+                "mission_id": "m-credentials-improve-test",
+                "staging_dir": str(tmp_path / "staging" / "m-credentials-improve-test"),
+                "source_snapshot_dir": str(tmp_path / "source"),
+                "credentials": {"TWELVEDATA_API_KEY": "secret-td"}})
         assert "TWELVEDATA_API_KEY" not in os.environ
+        # #62 (`verified-round1.md` 1-A): trade 専用ブロック
+        # (build_mission_registry("trade", ...)) が improve では実行され
+        # ないことも同じテストで pin する。
+        # merge (main 649a811 → プラン10 Task10, 2026-08-24): 上のテストと
+        # 同じ理由 (`_build_improve_registry` の実配線) で "trade" 呼び出し
+        # の不在だけを見る。
+        assert all(call[0][0] != "trade" for call in registry_calls), (
+            "improve profile で build_mission_registry('trade', ...) が"
+            "呼ばれている")
     finally:
         os.environ.pop("TWELVEDATA_API_KEY", None)
 
@@ -1372,3 +1608,37 @@ def test_main_handles_missing_credentials_key_in_handshake(monkeypatch, tmp_path
     monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
     frames, _, _ = _drive_main(monkeypatch, tmp_path)  # handshake_overrides 無し
     assert frames[0]["type"] == "ready" and frames[0]["ok"] is True
+
+
+@pytest.mark.parametrize("credentials_value", [{}, None])
+def test_main_handles_empty_or_none_credentials_in_handshake(
+        monkeypatch, tmp_path, credentials_value):
+    """#61 (`verified-round1.md` 1-A): `credentials` の境界は「有効 1 キー」
+    「キー欠落」の 2 例のみだった — 空 dict / `None` を明示的に渡した場合も
+    `(handshake.get("credentials") or {}).items()` が空ループになり
+    KeyError/TypeError にならないことを pin する。"""
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"credentials": credentials_value})
+    assert frames[0]["type"] == "ready" and frames[0]["ok"] is True
+    assert "TWELVEDATA_API_KEY" not in os.environ
+
+
+def test_main_sets_os_environ_for_multiple_credentials_keys(monkeypatch, tmp_path):
+    """#61 (`verified-round1.md` 1-A): `credentials` が複数キーのとき、
+    ループが最初の 1 件だけで打ち切られる変異 (`break` 混入等) を殺す —
+    2 キーとも env に反映されることを pin する。"""
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPHAVANTAGE_API_KEY", raising=False)
+    try:
+        _drive_main(
+            monkeypatch, tmp_path,
+            handshake_overrides={"credentials": {
+                "TWELVEDATA_API_KEY": "secret-td",
+                "ALPHAVANTAGE_API_KEY": "secret-av"}})
+        assert os.environ["TWELVEDATA_API_KEY"] == "secret-td"
+        assert os.environ["ALPHAVANTAGE_API_KEY"] == "secret-av"
+    finally:
+        os.environ.pop("TWELVEDATA_API_KEY", None)
+        os.environ.pop("ALPHAVANTAGE_API_KEY", None)

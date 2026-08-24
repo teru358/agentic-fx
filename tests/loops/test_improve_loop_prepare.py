@@ -124,15 +124,22 @@ def test_compute_partition_hint_disjoint_covers_open_backlog_across_slots(
 def test_tx0_mission_id_unique_partial_index_on_improvement_runs(conn):
     """`improvement_runs.mission_id` に対する部分 UNIQUE の migration が
     効いていること (2 回目の INSERT が同じ mission_id を指せば
-    IntegrityError)。新規行についてのみ強制 — 既存 NULL 行は許容する。"""
+    IntegrityError)。新規行についてのみ強制 — 既存 NULL 行は許容する。
+    merge (main 649a811 束 C 裁定 D1) が improvement_runs.mission_id に
+    FK を付けたため、実在しない mission_id の直挿しは FK 違反で拒否される。
+    UNIQUE 索引を検証するには実在する mission 行を先に作る必要がある。"""
     now = datetime(2026, 8, 22, 3, 0)
+    mission_id = conn.execute(
+        "INSERT INTO missions (loop, runner, model, status, started_at) "
+        "VALUES ('improve', 'local', 'x', 'running', ?)",
+        (now.isoformat(),)).lastrowid
     conn.execute(
         "INSERT INTO improvement_runs (backlog_id, mission_id, started_at) "
-        "VALUES (NULL, 555, ?)", (now.isoformat(),))
+        "VALUES (NULL, ?, ?)", (mission_id, now.isoformat()))
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
             "INSERT INTO improvement_runs (backlog_id, mission_id, started_at) "
-            "VALUES (NULL, 555, ?)", (now.isoformat(),))
+            "VALUES (NULL, ?, ?)", (mission_id, now.isoformat()))
 
 
 def test_tx0_crash_between_mission_insert_and_run_insert_leaves_no_orphan(

@@ -75,20 +75,33 @@ def finish_improve_mission(
         raise RuntimeError(
             f"finish_improve_mission: mission {mission_id} is not 'running' "
             "(already terminal — CAS rowcount=0)")
-    improve_runs_mod.finish(
+    run_ok = improve_runs_mod.finish(
         conn, run_id, result=run_result, now=now,
         approval_id=approval_id, report_path=report_path,
         report_state=report_state, commit=False)
+    if not run_ok:
+        raise RuntimeError(
+            f"finish_improve_mission: run {run_id} does not exist "
+            "(rowcount=0, refusing silent no-op)")
     if backlog_transition is not None:
-        backlog_mod.set_status(
+        backlog_ok = backlog_mod.set_status(
             conn, backlog_transition["backlog_id"], backlog_transition["status"],
             now, last_result=backlog_transition.get("last_result"), commit=False)
+        if not backlog_ok:
+            raise RuntimeError(
+                f"finish_improve_mission: backlog "
+                f"{backlog_transition['backlog_id']} does not exist "
+                "(rowcount=0, refusing silent no-op)")
     if slot_key is not None:
         period_key, k = slot_key
         slot_status = "done" if mission_status == "completed" else "failed"
-        improve_waves_mod.mark_terminal(
+        slot_ok = improve_waves_mod.mark_terminal(
             conn, period_key=period_key, k=k, status=slot_status, now=now,
             commit=False)
+        if not slot_ok:
+            raise RuntimeError(
+                f"finish_improve_mission: slot {slot_key} does not exist "
+                "(rowcount=0, refusing silent no-op)")
     if commit:
         conn.commit()
 
