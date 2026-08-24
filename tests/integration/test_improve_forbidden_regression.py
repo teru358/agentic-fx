@@ -14,14 +14,73 @@ import json
 import subprocess
 import sys
 import textwrap
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from agentic_fx.activity import ActivityLog
+from agentic_fx.config import load_settings
+from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.landlock import is_available as landlock_available
+from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.store import backlog as backlog_store
+from agentic_fx.store import improve_runs as improve_runs_store
+from agentic_fx.store import missions as missions_store
+from agentic_fx.store.db import connect, init_db
+from agentic_fx.tools.improve_rpc_tools import build_improve_rpc_tooldefs
 
 pytestmark = pytest.mark.skipif(
     not landlock_available(), reason="Landlock not available on this kernel/architecture")
+
+# precheck 2026-08-23 wave3: RW7 — Step 12-5 のための定数と helper 関数
+_RW7_NOW = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+_RW7_SETTINGS = load_settings(
+    Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+# `_ANALYSIS_ROW_KEYS`/`_BACKTEST_ROW_KEYS` (10.10節) が読む形と同じ
+# save_kwargs (`holdout.run_in_sample` の record_fn 契約、7-D)
+_RW7_SAVE_KWARGS = dict(
+    scope="in_sample", plugin_ref="plugins/_staging/x/myst",
+    content_hash="cand-hash", kind="strategy", pair="USDJPY",
+    timeframe="1h", source="dukascopy",
+    period=(datetime(2020, 1, 1, tzinfo=timezone.utc),
+            datetime(2026, 1, 1, tzinfo=timezone.utc)),
+    metrics={"pf": 1.3, "trades": 40}, settings_hash="s",
+    core_commit="c", initial_balance=10000.0, now=_RW7_NOW)
+# 遮断7 の禁止キー集合 (`tools/improve_rpc_tools.py::_FORBIDDEN_KEYS` と
+# 一致させる — 現物が正、ここでは pin 用に転記するだけで置換はしない)
+_RW7_FORBIDDEN_KEYS = {
+    "period_start", "period_end", "period", "now", "start", "end",
+    "window", "timestamps", "in_sample_until"}
+
+
+def _rw7_assert_no_forbidden_keys(value, path="$"):
+    """`_FORBIDDEN_KEYS` の全キーが dict/list の任意の深さにも現れない
+    ことを再帰的に確認する (`_strip_forbidden` の再帰化、Task 7 検収 B2
+    是正の pin)。"""
+    if isinstance(value, dict):
+        hit = _RW7_FORBIDDEN_KEYS & set(value.keys())
+        assert not hit, f"{path} が禁止キーを含む: {hit}"
+        for k, v in value.items():
+            _rw7_assert_no_forbidden_keys(v, f"{path}.{k}")
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            _rw7_assert_no_forbidden_keys(v, f"{path}[{i}]")
+
+
+def _rw7_build_improve_loop(tmp_path, conn):
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    class _FakeRag:
+        pass
+
+    return ImproveLoop(
+        root=tmp_path, settings=_RW7_SETTINGS, clock=FixedClock(_RW7_NOW),
+        db_write_conn_factory=lambda: conn,
+        db_readonly_conn_factory=lambda: conn,
+        activity=ActivityLog(tmp_path / "activity.log"), rag=_FakeRag())
+
 
 _PROBE_SCRIPT = textwrap.dedent("""
     import json, os, sqlite3, sys
@@ -154,16 +213,102 @@ def test_improve_worker_write_boundary_and_forbidden_tools(tmp_path):
     assert out["forbidden_tools_present"] == "none"
 
 
-@pytest.mark.xfail(strict=True, reason=
-    "遮断⑦: run_backtest/analyze_corr の RPC ハンドラは Task 10 の "
-    "ImproveRunContext.rpc_handlers 配線が無いと呼べない。Task 10 で green 化。")
-def test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly():
-    pytest.fail("Task 10 待ち — RunContext.rpc_handlers が未配線")
+def test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly(
+        tmp_path, monkeypatch):
+    """遮断⑦: `ImproveLoop._build_rpc_handlers` → `build_improve_rpc_tooldefs`
+    を経由した RPC ツールの agent 向け戻り値に period_start/period_end/
+    period/now/in_sample_until が**再帰的な深さでも**含まれないこと
+    (`_strip_forbidden` の再帰化、Task 7 検収 B2 是正)、かつ RPC handler の
+    呼び出しそのものが `backtest_runs`/`analysis_runs` へ直接行を書かない
+    (commit 前の DB 書込は Tx-2 の `_persist_ledger_rows`/
+    `_persist_gate_rows` 経由のみ、10.10 節) ことを end-to-end で検査する。"""
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    loop = _rw7_build_improve_loop(tmp_path, conn)
+
+    fake_meta = SimpleNamespace(
+        name="myst", kind="strategy", timeframe="1h",
+        content_hash="cand-hash", pairs=("USDJPY",))
+    monkeypatch.setattr(
+        "agentic_fx.plugin.loader._discover_one",
+        lambda path, name: fake_meta)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_adapter.build_intent_source",
+        lambda meta, **kw: SimpleNamespace(close=lambda: None))
+
+    def _fake_run_in_sample(*a, record_fn=None, **kw):
+        record_fn(_RW7_SAVE_KWARGS)
+        return dict(_RW7_SAVE_KWARGS["metrics"])
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        _fake_run_in_sample)
+
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
+        "run_backtest": 600.0, "analyze_corr": 60.0})
+    handlers = loop._build_rpc_handlers(ledger, staging_dir=staging_dir)
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, run_backtest_handler=handlers["run_backtest"],
+        analyze_corr_handler=handlers["analyze_corr"])}
+
+    # period_start/period_end/period/now/in_sample_until が無いことを確認
+    bt_out = tools["run_backtest"].func(name="myst", pair="USDJPY")
+    _rw7_assert_no_forbidden_keys(bt_out)
+
+    # analyze_corr の結果も同様
+    an_out = tools["analyze_corr"].func(
+        request={"kind": "corr_matrix", "timeframe": "1h"})
+    _rw7_assert_no_forbidden_keys(an_out)
 
 
-@pytest.mark.xfail(strict=True, reason=
-    "遮断⑧: holdout 指標・baseline 差分・閾値別合否は ImproveLoop の commit 相 "
-    "(Task 10) が生成する。payload の analysis id/回数が RPC 台帳由来である "
-    "ことも Task 10 の finish_improve_mission 経由でしか検証できない。")
-def test_holdout_and_analysis_ids_never_come_from_agent_output():
-    pytest.fail("Task 10 待ち — commit 相未実装")
+def test_holdout_and_analysis_ids_never_come_from_agent_output(tmp_path):
+    """遮断⑧: 承認申請の `analysis_run_ids` は agent の自己申告
+    (`_build_approval_payload` が置く placeholder) ではなく、
+    `_finalize_success` が Tx-2 内で `_persist_ledger_rows` の戻り値
+    (実際に `analysis_runs` へ永続化した行 id) で必ず上書きする
+    (10.10 節 `_finalize_success` の申し送り③)。ここでは agent が偽装した
+    placeholder (`[9999]`) を `approval_payload` に混入させた状態で
+    `_finalize_success` を直接呼び、承認行の `payload_json` に書かれる
+    `analysis_run_ids`/`analysis_call_count`/`trial_count` が偽装値では
+    なく台帳から実際に導出した値であることを検査する。"""
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    loop = _rw7_build_improve_loop(tmp_path, conn)
+
+    mission_id = missions_store.start(
+        conn, "improve", "codex", "gpt-5", _RW7_NOW, commit=False)
+    backlog_id = backlog_store.add(conn, "idea", "user", _RW7_NOW)
+    run_id = improve_runs_store.start(
+        conn, None, _RW7_NOW, mission_id=mission_id, commit=False)
+    conn.commit()
+
+    forged_payload = {
+        "name": "x", "kind": "indicator",
+        # agent が自己申告した偽の analysis_run_ids/回数/trial_count —
+        # `_finalize_success` はこれを無視して台帳由来の実値で上書きする
+        # 契約 (10.10 節)。
+        "analysis_run_ids": [9999], "analysis_call_count": 99,
+        "trial_count": 99999}
+    ledger_entries = [{"kind": "analyze_corr", "trial_count": 1,
+                       "result_summary": {
+                           "params": {"request": {"kind": "corr_matrix"}},
+                           "trial_count": 1, "source": "dukascopy"}}]
+
+    loop._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload=forged_payload, now=_RW7_NOW,
+        ledger_entries=ledger_entries, gate_rows=())
+
+    real_analysis_id = conn.execute(
+        "SELECT id FROM analysis_runs ORDER BY id DESC LIMIT 1").fetchone()[0]
+    approval_row = conn.execute(
+        "SELECT payload_json FROM approval_requests ORDER BY id DESC "
+        "LIMIT 1").fetchone()
+    payload = json.loads(approval_row["payload_json"])
+    assert payload["analysis_run_ids"] == [real_analysis_id]
+    assert payload["analysis_run_ids"] != [9999]
+    assert payload["analysis_call_count"] == 1
+    assert payload["trial_count"] == 1
+    conn.close()

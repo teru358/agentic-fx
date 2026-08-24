@@ -171,3 +171,44 @@ def test_tx0_mutation_M3_null_mission_id_rows_allowed(conn):
     rows = conn.execute("SELECT count(*) c FROM improvement_runs "
                         "WHERE mission_id IS NULL").fetchone()["c"]
     assert rows == 3
+
+
+def test_build_mission_tools_matches_child_registry_names(loop_full, tmp_path):
+    """B12/B17: 親が Mission.tools へ埋める名前集合が、子
+    (`build_mission_registry("improve", ...)`) が実際に登録する名前集合と
+    一致する — 「エージェントに見せる」と「子で実行できる」の食い違いを
+    構造的に防ぐ pin。"""
+    from agentic_fx.tools.mission_registry import build_mission_registry
+
+    staging_dir, source_snapshot_dir = tmp_path / "s", tmp_path / "src"
+    staging_dir.mkdir()
+    source_snapshot_dir.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 1.0,
+                                                        "analyze_corr": 1.0})
+    rpc_handlers = {"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}}
+
+    tools = loop_full._build_mission_tools(
+        staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+        ledger=ledger, rpc_handlers=rpc_handlers)
+    tool_names = {t["function"]["name"] for t in tools}
+
+    child_registry = build_mission_registry(
+        "improve", None, loop_full._settings, None, None, activity=None,
+        staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+        ledger=ledger, rpc_handlers=rpc_handlers)
+    assert tool_names == set(child_registry.names())
+
+    # signal_tools.IMPROVE_FORBIDDEN との非交差 (tests/loops/test_improve_forbidden.py
+    # と同型の pin — B17 申し送り)
+    from agentic_fx.tools import signal_tools
+    assert not (tool_names & signal_tools.IMPROVE_FORBIDDEN)
+
+
+def test_prepare_mission_output_schema_is_improve_output_schema(loop_min, tmp_path):
+    """Step 12-3 M2: `prepare()` の戻り値 `mission.output_schema` が
+    `IMPROVE_OUTPUT_SCHEMA` であることを確認する (下限リスト不足、申し送り)。"""
+    from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA
+
+    now = datetime(2026, 8, 22, 3, 0)
+    mission = loop_min.prepare(slot_key=None, now=now)
+    assert mission.output_schema == IMPROVE_OUTPUT_SCHEMA
