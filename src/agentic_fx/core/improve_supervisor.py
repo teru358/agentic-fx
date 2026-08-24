@@ -91,11 +91,23 @@ class ImproveSupervisor:
             self._spawn_slot_thread(period_key, k)
 
     def submit_manual(self) -> int:
-        """手動 one-shot。slot/wave 行を作らず `self._improve_loop.prepare`
-        を `slot_key=None` で直接呼ぶ (設計書 §3.1)。呼び出しは同期的 —
-        シェルコマンドから直接呼ばれる想定で、Mission 完了まで戻らない。
-        mission_id を返す。"""
-        raise NotImplementedError  # 9.7 節で実装
+        """手動 one-shot。slot/wave 行を作らず M=1 で全バックログを担当
+        させる (§8.1-該当、9.7 節「improve」コマンドから呼ばれる)。
+        wave slot が無いため on_ready コールバックは不要 (mark_running する
+        対象が無い) — `prepare(on_ready=)` を省略すると既定 `None` になる。
+        # precheck 2026-08-23 wave3: RW1/RW2 改訂 — `on_ready=None` でも
+        # 子は go を待つ (§10.9b Step 12-4b/RW6)。WorkerRunner が go を
+        # 送る条件は `on_ready is not None` ではなく `worker_profile`
+        # そのものなので (Interfaces 節「Task 1 が produces」ブロック参照)、
+        # ここで on_ready を渡さなくても子は正しく go を受け取って進む。
+        """
+        now = self._clock.now()
+        mission, ctx, runner = self._improve_loop.prepare(
+            slot_key=None, now=now)
+        result = runner.run(mission)
+        self._improve_loop.commit(mission=mission, ctx=ctx, result=result,
+                                  now=self._clock.now())
+        return ctx.mission_id
 
     def shutdown(self) -> None:
         self._stop_event.set()

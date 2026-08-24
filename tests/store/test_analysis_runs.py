@@ -75,3 +75,45 @@ def test_save_multiple_rows_get_distinct_ids(tmp_path):
     assert id1 != id2
     assert conn.execute(
         "SELECT COUNT(*) FROM analysis_runs").fetchone()[0] == 2
+
+
+def test_save_accepts_mission_id_kw_and_persists_it(tmp_path):
+    """プラン10 Task10-13 Step7 (RW4): Task 12 の `WHERE mission_id=?`
+    assert が成立するための書込経路。"""
+    conn = _conn(tmp_path)
+    run_id = analysis_runs.save(
+        conn, params={"request": {}}, trial_count=1, source="rpc",
+        now=H, mission_id=42)
+    row = conn.execute(
+        "SELECT mission_id FROM analysis_runs WHERE id=?", (run_id,)).fetchone()
+    assert row["mission_id"] == 42
+
+
+def test_save_commit_false_does_not_commit_transaction(tmp_path):
+    """D-4 是正 (プラン L19236 逐語)。未申告の適応: 本ファイルには
+    `conn` fixture が無い規約 (冒頭 docstring 参照) — `_conn(tmp_path)`
+    ローカルヘルパで代替する。10.10 節 Step 0 (B1): `_persist_ledger_rows`
+    が Tx-2 の途中で `commit=False` を渡す契約のための pin — 無条件
+    commit へ戻す退行は Tx-2 (台帳→gate rows→approval→finish の単一
+    commit) を割ってしまう。"""
+    conn = _conn(tmp_path)
+    conn.execute("BEGIN IMMEDIATE")
+    run_id = analysis_runs.save(
+        conn, params={"request": {}}, trial_count=1, source="rpc",
+        now=H, commit=False)
+    conn.rollback()
+    row = conn.execute(
+        "SELECT id FROM analysis_runs WHERE id=?", (run_id,)).fetchone()
+    assert row is None  # rollback で消えている == commit=False が効いた
+
+
+def test_save_default_commit_true_is_unchanged(tmp_path):
+    """既存呼び出し元 (`backtest/analysis.py` の `persist=True` 経路) が
+    既定 `commit=True` のまま不変であることの回帰 pin (D-4 是正、
+    プラン L19249 逐語)。"""
+    conn = _conn(tmp_path)
+    run_id = analysis_runs.save(
+        conn, params={"request": {}}, trial_count=1, source="rpc", now=H)
+    row = conn.execute(
+        "SELECT id FROM analysis_runs WHERE id=?", (run_id,)).fetchone()
+    assert row is not None

@@ -650,3 +650,80 @@ def test_join_prunes_finished_threads(tmp_path):
     sup.join(timeout=1.0)
 
     assert sup._active_threads == []
+
+
+# --- 10.12 節 Step 3: submit_manual (B16 — 9.5/9.7/10.12 のどこにも Step
+# が無かった空洞の回収)。9.3 節の _RecordingFakeWorkerRunner をそのまま
+# 使う (再定義しない — RW1/RW2)。`_FakeImproveLoop` は `prepare()` の
+# 戻り値 `ctx` に文字列プレースホルダを使う (`_launch_slot` は `ctx` の
+# 属性へ触れないため十分) が、`submit_manual` は `ctx.mission_id` を
+# 読むため、本節専用に `.mission_id` を持つ最小 ctx を返すサブクラスを
+# 用意する (新規命名、逸脱として申告)。
+
+class _MissionIdCtx:
+    def __init__(self, mission_id: int) -> None:
+        self.mission_id = mission_id
+
+
+class _ManualFakeImproveLoop(_FakeImproveLoop):
+    """`submit_manual` 用の `_FakeImproveLoop` — `prepare()` の呼び出し
+    引数 (`slot_key`/`on_ready`) を記録しつつ、`ctx.mission_id` を持つ
+    ctx を返す。Tx-0 の slot claim は行わない (slot_key=None の契約どおり
+    slot 行を一切作らない — 本物 `ImproveLoop.prepare` の `slot_key is
+    None` 分岐 (10.2 節) をそのまま模す)。"""
+
+    def __init__(self, conn, worker_runner, *, mission_id=999):
+        super().__init__(conn, worker_runner, mission_id=mission_id)
+        self.prepare_calls: list[dict] = []
+
+    def prepare(self, *, slot_key, now, on_ready=None):
+        self.prepare_calls.append({"slot_key": slot_key, "on_ready": on_ready})
+        if on_ready is not None:
+            self._worker_runner.on_ready = on_ready
+        return (f"mission-{self._mission_id}",
+                _MissionIdCtx(self._mission_id), self._worker_runner)
+
+
+def test_submit_manual_returns_mission_id_without_slot_claim(conn):
+    """B16 pin: 前任スタブは `raise NotImplementedError` のままだった。
+    `submit_manual()` は `slot_key=None` で `prepare→run→commit` を直列に
+    1 回ずつ呼び、`improve_wave_slots` に一切行を増やさず、戻り値は
+    `prepare()` が払い出した mission_id (int) と一致する。"""
+    events: list[str] = []
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0)),
+                             db_path=Path("x"), stop_event=threading.Event())
+    sup._conn_for_test = conn
+    fake_loop = _ManualFakeImproveLoop(
+        conn, _RecordingFakeWorkerRunner(events), mission_id=777)
+    sup._improve_loop = fake_loop
+
+    mission_id = sup.submit_manual()
+
+    assert mission_id == 777
+    assert isinstance(mission_id, int)
+    assert events == ["run"]
+    assert len(fake_loop.committed) == 1
+    n_slots = conn.execute(
+        "SELECT count(*) c FROM improve_wave_slots").fetchone()["c"]
+    assert n_slots == 0
+
+
+def test_submit_manual_prepares_with_slot_key_none_and_no_on_ready(conn):
+    """R-D1/RW2: `submit_manual` は wave slot を持たないため
+    `prepare(slot_key=None)` を呼び、`on_ready` は既定 (省略=None) の
+    ままであることを確認する — mark_running する対象が無いことの pin。"""
+    events: list[str] = []
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0)),
+                             db_path=Path("x"), stop_event=threading.Event())
+    sup._conn_for_test = conn
+    fake_loop = _ManualFakeImproveLoop(
+        conn, _RecordingFakeWorkerRunner(events), mission_id=42)
+    sup._improve_loop = fake_loop
+
+    sup.submit_manual()
+
+    assert fake_loop.prepare_calls == [{"slot_key": None, "on_ready": None}]

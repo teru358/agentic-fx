@@ -1670,6 +1670,66 @@ def test_build_app_accepts_embedding_fn(tmp_path):
     assert calls  # embedding function が呼ばれた
 
 
+# ---- プラン10 Task10-12 Step1: ImproveLoop 注入 --------------------------
+
+def test_build_app_injects_real_improve_loop_into_supervisor(tmp_path):
+    """`build_app` が `ImproveSupervisor._improve_loop` へ実 `ImproveLoop`
+    を注入すること (旧稿は `None` のまま — Task 10 完了後に Task 12 が
+    行う統合裁定 R-i9/R-i2)。rag は `build_app` が構築済みの単一インスタンス
+    をそのまま渡す (new しない、T10-B10) ことも合わせて確認する。"""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    assert isinstance(app.improve_supervisor._improve_loop, ImproveLoop)
+    assert app.improve_supervisor._improve_loop._rag is app.rag
+
+
+def test_submit_manual_with_real_improve_loop_prepares_without_notimplementederror(
+        tmp_path, monkeypatch):
+    """D-10 是正 (D-9): 検収が指摘した「実 ImproveLoop と繋いだ契約テストが
+    0 本」の穴を埋める — `build_app` が注入する**本物の** `ImproveLoop`
+    (D-1/D-8 で実装した `_compute_partition_hint`/`_materialize_workspace`
+    を含む) を `submit_manual()` 経由で一周させ、`prepare()` が
+    `NotImplementedError` を出さずに `ctx` (mission_id を持つ実 DB 行) を
+    返すところまでを検証する。既存の `_FakeImproveLoop` を使うテスト
+    (`tests/core/test_improve_wave_slot_protocol.py`) は D-1 のような
+    本体側の空洞を構造的に検出できない (検収 D-9)。
+
+    fake にするのは runner 境界のみ (`_build_worker_runner` の戻り値) —
+    実プロセスの spawn (WorkerRunner.run) だけを避け、
+    `_compute_partition_hint`/`_materialize_workspace`/`_build_rpc_handlers`/
+    `_build_mission_tools`/prompt レンダリングはすべて実物を通す。"""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+
+    captured_ctx: dict = {}
+
+    def _fake_build_worker_runner(self, ctx, *, on_ready=None):
+        captured_ctx["ctx"] = ctx
+        return FakeRunner([MissionResult(status="failed", output=None)])
+
+    monkeypatch.setattr(
+        ImproveLoop, "_build_worker_runner", _fake_build_worker_runner)
+
+    mission_id = app.improve_supervisor.submit_manual()
+
+    assert isinstance(mission_id, int)
+    assert captured_ctx["ctx"].mission_id == mission_id
+    # allowed_backlog_ids=None (手動 one-shot、印なし) まで
+    # `_compute_partition_hint` が実際に評価された証跡
+    assert captured_ctx["ctx"].allowed_backlog_ids is None
+
+    conn = sqlite3.connect(tmp_path / "data" / "agentic.db")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT status, loop FROM missions WHERE id=?", (mission_id,)).fetchone()
+    conn.close()
+    assert row["loop"] == "improve"
+    # submit_manual は commit() まで一周する — failed 結果なので終端は失敗
+    assert row["status"] == "failed"
+
+
 # ---- Task 3: B 束小口 6 項目 (maintenance 順序) ---------------------------------
 
 def test_signal_maintenance_reclaims_before_expiring(monkeypatch):

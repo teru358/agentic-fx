@@ -84,6 +84,7 @@ def _insert(conn: sqlite3.Connection, *, scope: str, issued_by: str,
             metrics: dict, settings_hash: str, core_commit: str,
             initial_balance: float, now: datetime, variant: str = "candidate",
             ref_plugin_ref: str | None = None, ref_content_hash: str | None = None,
+            mission_id: int | None = None,
             commit: bool = True) -> int:
     start, end = period
     start_utc = _require_utc(start, "period[0]")
@@ -100,12 +101,13 @@ def _insert(conn: sqlite3.Connection, *, scope: str, issued_by: str,
         "INSERT INTO backtest_runs (plugin_ref, content_hash, kind, pair, "
         "timeframe, source, period_start, period_end, scope, issued_by, "
         "metrics_json, settings_hash, core_commit, initial_balance, "
-        "created_at, variant, ref_plugin_ref, ref_content_hash) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "created_at, variant, ref_plugin_ref, ref_content_hash, mission_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (plugin_ref, content_hash, kind, pair, timeframe, source,
          start_utc.isoformat(), end_utc.isoformat(), scope, issued_by,
          metrics_json, settings_hash, core_commit, initial_balance,
-         now_utc.isoformat(), variant, ref_plugin_ref, ref_content_hash))
+         now_utc.isoformat(), variant, ref_plugin_ref, ref_content_hash,
+         mission_id))
     if commit:
         conn.commit()
     return cur.lastrowid
@@ -119,6 +121,7 @@ def save_harness_run(conn: sqlite3.Connection, *, scope: str, plugin_ref: str,
                       variant: str = "candidate",
                       ref_plugin_ref: str | None = None,
                       ref_content_hash: str | None = None,
+                      mission_id: int | None = None,
                       commit: bool = True) -> int:
     """ハーネス発行 (issued_by='harness' 固定)。scope は in_sample/holdout_gate のみ。
 
@@ -137,7 +140,7 @@ def save_harness_run(conn: sqlite3.Connection, *, scope: str, plugin_ref: str,
         settings_hash=settings_hash, core_commit=core_commit,
         initial_balance=initial_balance, now=now, variant=variant,
         ref_plugin_ref=ref_plugin_ref, ref_content_hash=ref_content_hash,
-        commit=commit)
+        mission_id=mission_id, commit=commit)
 
 
 def save_human_run(conn: sqlite3.Connection, *, plugin_ref: str,

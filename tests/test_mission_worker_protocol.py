@@ -746,8 +746,10 @@ def test_main_applies_landlock_bootstrap_before_running_improve_mission(
                            "より後に呼ばれている (Landlock 適用前に依存を"
                            "読み込む順序になっている)")
     assert frames[0]["type"] == "ready" and frames[0]["ok"] is True
-    # improve profile は trade の registry を組まない (DB 非参照の構造的成立)
-    assert registry_calls == []
+    # improve profile は Task 10 以後、child-side で build_mission_registry を
+    # 呼ぶようになった (Step 12-4)。正確には _build_improve_registry 内で
+    # build_mission_registry を 1 度呼ぶ。
+    assert len(registry_calls) == 1  # _build_improve_registry から 1 呼び出し
 
 
 def test_main_routes_trade_claude_backend_through_factory_build_runner(
@@ -1348,7 +1350,15 @@ def test_main_puts_reason_in_result_frame_for_improve_profile(
     # #62 (`verified-round1.md` 1-A): improve profile では trade 専用の
     # build_mission_registry("trade", ...) ブロックが実行されないことを
     # pin する (credentials 系の 1 本以外にも踏ませる)。
-    assert registry_calls == []
+    # merge (main 649a811 → プラン10 Task10, 2026-08-24): Task 10 が
+    # `_build_improve_registry` を実配線したため、improve profile でも
+    # `build_mission_registry("improve", ...)` が呼ばれるようになった
+    # (main 単独の時点では rpc_client が無く常に空 ToolRegistry() だった)。
+    # #62 の意図 (trade 専用ブロックが improve では実行されない) を保ちつつ
+    # 実配線を許容するため、"trade" 呼び出しの不在だけを見る。
+    assert all(call[0][0] != "trade" for call in registry_calls), (
+        "improve profile で build_mission_registry('trade', ...) が"
+        "呼ばれている")
     result_frame = frames[-1]
     assert result_frame["type"] == "result"
     assert result_frame["reason"] == (
@@ -1582,7 +1592,12 @@ def test_main_does_not_set_os_environ_from_handshake_credentials_for_improve(
         # #62 (`verified-round1.md` 1-A): trade 専用ブロック
         # (build_mission_registry("trade", ...)) が improve では実行され
         # ないことも同じテストで pin する。
-        assert registry_calls == []
+        # merge (main 649a811 → プラン10 Task10, 2026-08-24): 上のテストと
+        # 同じ理由 (`_build_improve_registry` の実配線) で "trade" 呼び出し
+        # の不在だけを見る。
+        assert all(call[0][0] != "trade" for call in registry_calls), (
+            "improve profile で build_mission_registry('trade', ...) が"
+            "呼ばれている")
     finally:
         os.environ.pop("TWELVEDATA_API_KEY", None)
 

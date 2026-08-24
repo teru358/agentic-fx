@@ -380,26 +380,67 @@ def _protect_protocol_stdout() -> Any:
     return protocol_out
 
 
-def _build_improve_registry(*, settings: Any, workdir: Path) -> ToolRegistry:
+def _make_rpc_client(protocol_out: Any, out_seq: SeqTracker,
+                     in_seq: SeqTracker) -> Callable[[str, dict], Any]:
+    """`run_backtest`/`analyze_corr` の親呼び出し RPC client。フレーム
+    送受信の規律 (rpc_id 採番・seq 検証・エラー伝播) は `_RagRpcProxy._call`
+    (:307-330) と一字一句同じにする。呼び出し元
+    (`_build_improve_registry` が組む registry の `rpc_handlers`) は
+    `McpShimDispatcher._call_lock` (`tools/mcp_shim.py:38`) 経由で常に
+    同時 1 件以下しか呼ばれない — `_RagRpcProxy` が単一の
+    `sys.stdin.buffer` 読取を安全に共有できているのと同じ前提。"""
+    rpc_counter = {"n": 0}
+
+    def call(name: str, args: dict) -> Any:
+        rpc_counter["n"] += 1
+        rpc_id = str(rpc_counter["n"])
+        seq = out_seq._expected  # noqa: SLF001 — 送出側は採番に使う
+        _send_frame(protocol_out, out_seq,
+                   {"type": "tool_rpc", "rpc_id": rpc_id, "name": name,
+                    "args": args})
+        response = read_frame(sys.stdin.buffer)
+        if response is None:
+            raise RuntimeError(
+                "parent closed the pipe while awaiting tool_rpc_result")
+        if response.get("type") != "tool_rpc_result":
+            raise ProtocolError(
+                f"expected tool_rpc_result, got {response.get('type')!r}")
+        in_seq.check(response.get("seq"))
+        if response.get("rpc_id") != rpc_id:
+            raise RuntimeError(
+                f"tool_rpc_result rpc_id mismatch: expected {rpc_id}, "
+                f"got {response.get('rpc_id')!r}")
+        if not response.get("ok"):
+            raise RuntimeError(str(response.get("error", "rpc failed")))
+        return response.get("result")
+    return call
+
+
+def _build_improve_registry(*, settings: Any, workdir: Path, staging_dir: Path,
+                            source_snapshot_dir: Path,
+                            rpc_client: Callable[[str, dict], Any] | None = None
+                            ) -> ToolRegistry:
     """improve profile 用 `ToolRegistry` の構築 seam (A-4 検収是正、裁定 R-D2)。
 
-    本来の構築は `build_mission_registry("improve", staging_dir=...,
-    source_snapshot_dir=..., rpc=<親への RPC client>)` (R-D2) — RPC client
-    経由で `run_backtest`/`analyze_corr` 等 (C-7) を親へ委譲する形になる。
-    その拡張シグネチャと RPC client の配線は **Task 10 の担当**であり、
-    Task 4 (A-4) の時点ではまだ揃っていない (`build_mission_registry` の
-    現物シグネチャは `conn`/`rag`/`activity` 等 trade 専用の必須引数を
-    要求し、improve 子プロセスはそれらを持たない — 防御層① 接続情報の
-    非提供、モジュール冒頭の docstring 参照)。
+    rpc_client が渡されない場合は空 ToolRegistry() を返す (Task 4/A-4 段階)。
+    Task 10 で rpc_client が渡されるようになり、
+    `build_mission_registry("improve", staging_dir=...,
+    source_snapshot_dir=..., rpc_handlers=...)` が呼ばれる。"""
+    if rpc_client is None:
+        return ToolRegistry()
 
-    そのため本関数を「呼び出し口」として切り出す — Task 10 は
-    `_run_improve_mission` 側を変えず、この関数の中身だけを
-    `build_mission_registry("improve", ...)` へ差し替えればよい。
-    Task 4 時点では最小の空 `ToolRegistry()` を返す (「空でない registry を
-    注入できる seam」— テストは本関数を monkeypatch して非空 registry を
-    注入できる、既定は空)。
-    """
-    return ToolRegistry()
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+    from agentic_fx.tools.mission_registry import build_mission_registry
+
+    child_ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
+        "run_backtest": settings.improve.backtest_rpc_timeout_sec,
+        "analyze_corr": settings.improve.backtest_rpc_timeout_sec})
+    return build_mission_registry(
+        "improve", None, settings, None, None, activity=None,
+        staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+        ledger=child_ledger,
+        rpc_handlers={"run_backtest": lambda a: rpc_client("run_backtest", a),
+                     "analyze_corr": lambda a: rpc_client("analyze_corr", a)})
 
 
 def mcp_socket_path(workdir: Path) -> Path:
@@ -490,8 +531,9 @@ def _wait_for_go(in_seq: "SeqTracker", timeout_sec: float) -> bool:
 
 
 def _run_improve_mission(
-    *, settings: Any, workdir: Path,
-    protocol_out: Any = None, out_seq: Any = None
+    *, settings: Any, workdir: Path, staging_dir: str,
+    source_snapshot_dir: str, protocol_out: Any = None, out_seq: Any = None,
+    in_seq: Any = None
 ) -> Any:
     """improve profile での runner 構築・Mission 実行 (Step 7d + A-4 検収
     是正 Step 7a/7b)。
@@ -519,7 +561,10 @@ def _run_improve_mission(
     :return: AgentRunner インスタンス (`_afx_mcp_dispatcher` 属性に
         `McpShimDispatcher` を保持する)
     """
-    registry = _build_improve_registry(settings=settings, workdir=workdir)
+    rpc_client = _make_rpc_client(protocol_out, out_seq, in_seq)
+    registry = _build_improve_registry(
+        settings=settings, workdir=workdir, staging_dir=Path(staging_dir),
+        source_snapshot_dir=Path(source_snapshot_dir), rpc_client=rpc_client)
     dispatcher = _start_mcp_dispatcher(workdir=workdir, registry=registry)
     on_message = _make_on_message(protocol_out, out_seq)
     runner = runner_factory.build_runner(
@@ -533,6 +578,40 @@ def _run_improve_mission(
             protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}))
     runner._afx_mcp_dispatcher = dispatcher
     return runner
+
+
+def _wait_for_go(in_seq: "SeqTracker", timeout_sec: float) -> bool:
+    """`ready` 送出後、`go` フレーム (RW1) を受信するまで待つ。
+    `worker_startup_timeout_sec` 内に届かなければ False を返す — 呼び出し
+    元 (`main()`) はこの場合 Mission もツールも実行せず、`result` フレーム
+    も送らずに終了する (`go` 前は副作用ゼロ、設計書 §1)。
+
+    `sys.stdin.buffer` の `readline()` はブロッキングであり、かつ
+    `BufferedReader` の内部先読みが `select()` の fd 監視をすり抜けうる
+    (`go` が届いた時点で既に内部バッファへ読み込まれている可能性がある)
+    ため、`select`/`signal.alarm` ではなく**別スレッド + `queue.Queue`**
+    でタイムアウトを実装する (`worker_runner.py` の `_wait_with_stop` と
+    同じ発想 — daemon thread がタイムアウト後もブロックし続けても、
+    プロセス終了時に道連れで消える、FC-1 と同型の許容)。"""
+    result_queue: "queue.Queue[dict | None]" = queue.Queue(maxsize=1)
+
+    def _reader() -> None:
+        try:
+            frame = read_frame(sys.stdin.buffer)
+        except ProtocolError:
+            frame = None
+        result_queue.put(frame)
+
+    threading.Thread(target=_reader, daemon=True,
+                     name="afx-mission-go-waiter").start()
+    try:
+        frame = result_queue.get(timeout=timeout_sec)
+    except queue.Empty:
+        return False  # worker_startup_timeout_sec 超過 — 副作用ゼロで終了
+    if frame is None or frame.get("type") != "go":
+        return False  # EOF (親が落ちた) / 不正フレーム — fail closed
+    in_seq.check(frame.get("seq"))
+    return True
 
 
 def main() -> None:
@@ -599,7 +678,9 @@ def main() -> None:
             mission = Mission(**handshake["mission"])
             runner = _run_improve_mission(
                 settings=settings, workdir=workdir,
-                protocol_out=protocol_out, out_seq=out_seq)
+                staging_dir=handshake["staging_dir"],
+                source_snapshot_dir=handshake["source_snapshot_dir"],
+                protocol_out=protocol_out, out_seq=out_seq, in_seq=in_seq)
 
             _send_frame(protocol_out, out_seq, {
                 "type": "ready", "ok": True,

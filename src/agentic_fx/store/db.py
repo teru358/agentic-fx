@@ -1268,6 +1268,8 @@ def init_db(conn: sqlite3.Connection) -> None:
                    "attempts INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "improvement_backlog", "last_result", "last_result TEXT")
     _migrate_improvement_runs_mission_id_fk(conn)   # 裁定 D1 (2026-08-24)
+    _ensure_column(conn, "backtest_runs", "mission_id", "mission_id INTEGER")
+    _ensure_column(conn, "analysis_runs", "mission_id", "mission_id INTEGER")
     conn.execute(_IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL)
     _migrate_improve_wave_slots_mission_id_fk(conn)  # 裁定 D1 (2026-08-24)
     _ensure_column(

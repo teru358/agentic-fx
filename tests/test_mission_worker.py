@@ -597,12 +597,19 @@ def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
         return _Fake()
 
     monkeypatch.setattr(mw_mod.runner_factory, "build_runner", spy)
-    
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    source_snapshot_dir = tmp_path / "source"
+    source_snapshot_dir.mkdir()
+
     for backend in ["local", "claude", "codex"]:
         captured.clear()
         settings = _settings_with_improve_backend(backend)
         mw_mod._run_improve_mission(
-            settings=settings, workdir=tmp_path, protocol_out=None, out_seq=None)
+            settings=settings, workdir=tmp_path, staging_dir=str(staging_dir),
+            source_snapshot_dir=str(source_snapshot_dir),
+            protocol_out=None, out_seq=None, in_seq=None)
         assert captured["profile"] == "improve", f"backend={backend}"
         assert captured["backend"] == backend, f"backend={backend}"
         # 3 周目レビュー Important-1: on_message が callable として配線されている
@@ -644,7 +651,7 @@ def test_run_improve_mission_binds_mcp_dispatcher_and_serves_registry_tool(
 
     monkeypatch.setattr(
         mw_mod, "_build_improve_registry",
-        lambda *, settings, workdir: fake_registry)
+        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client=None: fake_registry)
 
     class _Fake:
         def run(self, mission):
@@ -657,9 +664,16 @@ def test_run_improve_mission_binds_mcp_dispatcher_and_serves_registry_tool(
     monkeypatch.setattr(mw_mod.runner_factory, "build_runner",
                         lambda *a, **kw: _Fake())
 
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    source_snapshot_dir = tmp_path / "source"
+    source_snapshot_dir.mkdir()
+
     settings = _settings_with_improve_backend("local")
     mw_mod._run_improve_mission(
-        settings=settings, workdir=tmp_path, protocol_out=None, out_seq=None)
+        settings=settings, workdir=tmp_path, staging_dir=str(staging_dir),
+        source_snapshot_dir=str(source_snapshot_dir),
+        protocol_out=None, out_seq=None, in_seq=None)
 
     sock_path = tmp_path / "afx.sock"
     assert sock_path.exists(), "afx.sock が bind されていない (B1)"
@@ -757,7 +771,7 @@ def test_run_improve_mission_claude_backend_workdir_matches_dispatcher_socket(
 
     monkeypatch.setattr(
         mw_mod, "_build_improve_registry",
-        lambda *, settings, workdir: fake_registry)
+        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client=None: fake_registry)
     # `ClaudeRunner.run()` は `cli_started_sink` 経由で実際に `cli_started`
     # フレームを送出する (`_make_on_message`/`_send_frame` 配線) — 実プロセス
     # を起動するこのテストではその配線を素通りさせるため、
@@ -765,9 +779,15 @@ def test_run_improve_mission_claude_backend_workdir_matches_dispatcher_socket(
     from agentic_fx.core.mission_protocol import SeqTracker
     protocol_out = io.BytesIO()
     out_seq = SeqTracker()
+    in_seq = SeqTracker()
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    source_snapshot_dir = tmp_path / "source"
+    source_snapshot_dir.mkdir()
     runner = mw_mod._run_improve_mission(
-        settings=settings, workdir=tmp_path,
-        protocol_out=protocol_out, out_seq=out_seq)
+        settings=settings, workdir=tmp_path, staging_dir=str(staging_dir),
+        source_snapshot_dir=str(source_snapshot_dir),
+        protocol_out=protocol_out, out_seq=out_seq, in_seq=in_seq)
 
     sock_path = mw_mod.mcp_socket_path(tmp_path)
     assert runner._workdir == tmp_path
