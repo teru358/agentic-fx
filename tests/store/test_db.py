@@ -1744,3 +1744,218 @@ def test_reflection_attempts_migration_is_idempotent(tmp_path):
     assert conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
         "AND name='reflection_attempts'").fetchone()[0] == 1
+
+
+# --- 裁定 D1 (2026-08-24): mission_id FK rebuild 経路のテスト ---
+#
+# 着手前検証で判明: 上の全テストは「mission_id 列が未作成の新規 DB」
+# (`_ensure_column` 相当の ALTER ADD COLUMN 経路) しか通らない。プラン10
+# Task 8 を D1 より前に 1 度でも通過した実 DB (= mission_id 列はあるが FK が
+# 無い状態) が rebuild 経路を通るかは一切検証されていなかった。
+
+def _legacy_improvement_runs_mission_fk_conn(tmp_path, *, with_report_state=True):
+    """D1 より前の Task 8 通過後の状態を模した improvement_runs
+    (`mission_id INTEGER` 列はあるが FK が無い) を持つ接続を返す。
+
+    `with_report_state=True` (既定) が Task 8 を実際に通過した実 DB の状態
+    (`_ensure_column` は同じ init_db 呼び出し内で mission_id の直後に
+    report_state を追加する)。`False` は report_state 追加より前に落ちた
+    仮想的な中間状態の網羅用。
+    """
+    from agentic_fx.store import db as db_module
+
+    cols = ("id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "backlog_id INTEGER REFERENCES improvement_backlog(id),"
+            "result TEXT CHECK (result IN ('approval','report')),"
+            "approval_id INTEGER, report_path TEXT,"
+            "mission_id INTEGER,"
+            "started_at TEXT NOT NULL, finished_at TEXT")
+    if with_report_state:
+        cols += (",report_state TEXT NOT NULL DEFAULT 'none' "
+                 "CHECK(report_state IN "
+                 "('none','prepared','published','failed'))")
+    conn = connect(tmp_path / "legacy.db")
+    conn.execute(f"CREATE TABLE improvement_runs ({cols})")
+    conn.commit()
+    conn.executescript(db_module._SCHEMA)
+    return conn
+
+
+def test_init_db_migrates_legacy_improvement_runs_adds_mission_fk(tmp_path):
+    """D1: mission_id 列はあるが FK が無い実 DB を rebuild 経路が通り、
+    FK が張られること。"""
+    from agentic_fx.store import db as db_module
+
+    conn = _legacy_improvement_runs_mission_fk_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+        "VALUES (1, 'improve', 'local', 'm', 'running', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO improvement_runs (mission_id, result, started_at) "
+        "VALUES (1, 'report', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+
+    fk_present = any(
+        fk["table"] == "missions" and fk["from"] == "mission_id"
+        for fk in conn.execute("PRAGMA foreign_key_list(improvement_runs)"))
+    assert fk_present
+    row = conn.execute(
+        "SELECT mission_id FROM improvement_runs").fetchone()
+    assert row["mission_id"] == 1
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "improvement_runs_v1" not in names
+
+
+def test_improvement_runs_mission_fk_migration_preserves_report_state(tmp_path):
+    """着手前検証で発見: rebuild DDL に report_state を含めないと、
+    後続の `_ensure_column` がデフォルト 'none' で再作成し、既存の
+    report_state 値 (例 'published') が黙って失われる。この pin は
+    その値の保持を直接見る。"""
+    conn = _legacy_improvement_runs_mission_fk_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+        "VALUES (1, 'improve', 'local', 'm', 'running', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO improvement_runs "
+        "(mission_id, result, started_at, report_state) "
+        "VALUES (1, 'report', '2026-08-11T09:00:00+00:00', 'published')")
+    conn.commit()
+
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT report_state FROM improvement_runs").fetchone()
+    assert row["report_state"] == "published"
+
+
+def test_improvement_runs_mission_fk_migration_aborts_on_dangling_mission_id(
+        tmp_path):
+    """存在しない missions.id を指す mission_id を持つ行があると中断する
+    (「黙って捨てない」— 変異ノート #7 の理念)。"""
+    conn = _legacy_improvement_runs_mission_fk_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improvement_runs (mission_id, result, started_at) "
+        "VALUES (999, 'report', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="参照先の missions 行が無い"):
+        init_db(conn)
+
+
+def test_improvement_runs_mission_fk_migration_is_idempotent(tmp_path):
+    conn = _legacy_improvement_runs_mission_fk_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+        "VALUES (1, 'improve', 'local', 'm', 'running', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO improvement_runs (mission_id, result, started_at) "
+        "VALUES (1, 'report', '2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+    init_db(conn)  # 2 回目でも例外なし
+
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "improvement_runs_v1" not in names
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM improvement_runs").fetchone()["c"] == 1
+
+
+def _legacy_improve_wave_slots_mission_fk_conn(tmp_path):
+    """D1 より前の状態 (`improve_wave_slots.mission_id` に FK が無い) を
+    模した接続を返す — この表は `_ensure_column` 経路を持たないため、
+    FK 無しの `CREATE TABLE` をそのまま `_SCHEMA` 実行前に作って
+    `IF NOT EXISTS` を素通りさせる。"""
+    from agentic_fx.store import db as db_module
+
+    conn = connect(tmp_path / "legacy.db")
+    conn.executescript(db_module._SCHEMA)  # missions/improve_waves 等を先に用意
+    conn.execute("DROP TABLE improve_wave_slots")
+    conn.execute(
+        "CREATE TABLE improve_wave_slots ("
+        "wave_period_key TEXT NOT NULL REFERENCES improve_waves(period_key),"
+        "k INTEGER NOT NULL,"
+        "status TEXT NOT NULL "
+        "CHECK(status IN ('reserved','claimed','running','done','failed')),"
+        "mission_id INTEGER,"
+        "spawn_attempts INTEGER NOT NULL DEFAULT 0,"
+        "created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+        "PRIMARY KEY(wave_period_key, k))")
+    conn.commit()
+    return conn
+
+
+def test_init_db_migrates_legacy_improve_wave_slots_adds_mission_fk(tmp_path):
+    conn = _legacy_improve_wave_slots_mission_fk_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+        "VALUES (1, 'improve', 'local', 'm', 'running', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO improve_waves (period_key, created_at, expected) "
+        "VALUES ('w1', '2026-08-11T09:00:00+00:00', 1)")
+    conn.execute(
+        "INSERT INTO improve_wave_slots "
+        "(wave_period_key, k, status, mission_id, created_at, updated_at) "
+        "VALUES ('w1', 0, 'running', 1, '2026-08-11T09:00:00+00:00', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+
+    fk_present = any(
+        fk["table"] == "missions" and fk["from"] == "mission_id"
+        for fk in conn.execute("PRAGMA foreign_key_list(improve_wave_slots)"))
+    assert fk_present
+    row = conn.execute(
+        "SELECT mission_id FROM improve_wave_slots").fetchone()
+    assert row["mission_id"] == 1
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "improve_wave_slots_v1" not in names
+
+
+def test_improve_wave_slots_mission_fk_migration_aborts_on_dangling_mission_id(
+        tmp_path):
+    conn = _legacy_improve_wave_slots_mission_fk_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improve_waves (period_key, created_at, expected) "
+        "VALUES ('w1', '2026-08-11T09:00:00+00:00', 1)")
+    conn.execute(
+        "INSERT INTO improve_wave_slots "
+        "(wave_period_key, k, status, mission_id, created_at, updated_at) "
+        "VALUES ('w1', 0, 'running', 999, '2026-08-11T09:00:00+00:00', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    with pytest.raises(RuntimeError, match="参照先の missions 行が無い"):
+        init_db(conn)
+
+
+def test_improve_wave_slots_mission_fk_migration_is_idempotent(tmp_path):
+    conn = _legacy_improve_wave_slots_mission_fk_conn(tmp_path)
+    conn.execute(
+        "INSERT INTO improve_waves (period_key, created_at, expected) "
+        "VALUES ('w1', '2026-08-11T09:00:00+00:00', 1)")
+    conn.execute(
+        "INSERT INTO improve_wave_slots "
+        "(wave_period_key, k, status, created_at, updated_at) "
+        "VALUES ('w1', 0, 'reserved', '2026-08-11T09:00:00+00:00', "
+        "'2026-08-11T09:00:00+00:00')")
+    conn.commit()
+
+    init_db(conn)
+    init_db(conn)  # 2 回目でも例外なし
+
+    names = {r["name"] for r in
+             conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "improve_wave_slots_v1" not in names
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM improve_wave_slots").fetchone()["c"] == 1

@@ -56,9 +56,19 @@ CREATE TABLE IF NOT EXISTS improvement_runs (
 # 裁定 D1 (2026-08-24): improvement_runs.mission_id に missions(id) への FK
 # を追加する rebuild 用 DDL。この rebuild は「mission_id 列は既にあるが
 # FK が無い」DB (プラン10 Task 8 で `_ensure_column` により無 FK で追加
-# された既存 DB) 専用であり、その時点で他の追加列 (report_state 等) は
-# init_db の呼び出し順序上まだ追加されていないため v2 の列 + mission_id
-# のみで足りる。
+# された既存 DB) 専用。
+#
+# **着手前検証で修正**: 当初「report_state 等の追加列は init_db の呼び出し
+# 順序上まだ追加されていない」と想定していたが誤り — report_state を追加
+# する `_ensure_column` は Task 8 導入時からこの rebuild と同じ init_db 内で
+# 先に (旧コードでは同じ位置で) 実行されていたため、Task 8 を 1 度でも
+# 通過した実 DB は既に report_state 列を持つ。この DDL に report_state を
+# 含めず INSERT からも外すと、rebuild が report_state の値を黙って捨て、
+# 直後の `_ensure_column` がデフォルト 'none' で再作成してしまう
+# (データ消失、着手前検証で発見)。そのため DDL 自体に report_state を含め、
+# 移行関数側は v1 に report_state が実在する場合のみコピーする
+# (無い場合は DEFAULT 'none' に委ねる — 新規どちらの状態でも `_ensure_column`
+# 側の呼び出しは冪等に no-op する)。
 _IMPROVEMENT_RUNS_MISSION_ID_FK_DDL = """
 CREATE TABLE IF NOT EXISTS improvement_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,7 +76,9 @@ CREATE TABLE IF NOT EXISTS improvement_runs (
   result TEXT CHECK (result IN ('approval','report')),
   approval_id INTEGER, report_path TEXT,
   mission_id INTEGER REFERENCES missions(id),
-  started_at TEXT NOT NULL, finished_at TEXT
+  started_at TEXT NOT NULL, finished_at TEXT,
+  report_state TEXT NOT NULL DEFAULT 'none'
+    CHECK(report_state IN ('none','prepared','published','failed'))
 );
 """
 
@@ -878,6 +890,20 @@ def _migrate_improvement_runs_mission_id_fk(conn: sqlite3.Connection) -> None:
     (`_migrate_signals_fk`/`_migrate_improvement_runs_v2` と同じ規約:
     FK トグルは BEGIN の外側・backup・行数一致ガード・
     `PRAGMA foreign_key_check`)。
+
+    **中断 (abort) を選ぶ理由 — `_migrate_signals_fk` の「修復して続行」
+    とは非対称。** signals の宙吊り行は `claimed`→`abandoned` 等、単一の
+    決定論的な状態遷移規則で機械的に修復できる (どう直すべきかが自明)。
+    一方 mission_id が宙吊りの `improvement_runs`/`improve_wave_slots` 行は
+    「どの mission に紐付いていたか」という履歴情報そのものが失われている
+    状態であり、機械的に選べる正しい修復先が無い (NULL に落とすと所属
+    mission の追跡ができなくなり、D1 が塞ごうとした「所有者不明の行を
+    静かに許す」問題を form を変えて再導入する)。判断が要る事項は人に
+    委ねる方針 (`_migrate_improvement_runs_v2` と同じ理念) を踏襲し、
+    中断してエラーメッセージで対象行を名指しする。
+    `probe_i1_fk.py` は D1 適用前の環境で実際に宙吊り mission_id が
+    作成できることを実測済みなので、この中断経路は実際のアップグレード
+    パスで到達し得る (仮想的なコーナーケースではない)。
     """
     fk_present = any(
         fk["table"] == "missions" and fk["from"] == "mission_id"
@@ -927,13 +953,20 @@ def _migrate_improvement_runs_mission_id_fk(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE improvement_runs RENAME TO improvement_runs_v1")
             conn.execute(_IMPROVEMENT_RUNS_MISSION_ID_FK_DDL)
+            # report_state (Task 8) は本 rebuild より前に追加され得る列 —
+            # v1 に実在する場合のみコピーし、値を保持する (上の DDL コメント
+            # 参照。無ければ DEFAULT 'none' に委ねる)。
+            v1_cols = {r["name"] for r in
+                      conn.execute("PRAGMA table_info(improvement_runs_v1)")}
+            copy_cols = ["id", "backlog_id", "result", "approval_id",
+                        "report_path", "mission_id", "started_at",
+                        "finished_at"]
+            if "report_state" in v1_cols:
+                copy_cols.append("report_state")
+            cols_sql = ", ".join(copy_cols)
             conn.execute(
-                "INSERT OR IGNORE INTO improvement_runs "
-                "(id, backlog_id, result, approval_id, report_path, "
-                "mission_id, started_at, finished_at) "
-                "SELECT id, backlog_id, result, approval_id, report_path, "
-                "mission_id, started_at, finished_at "
-                "FROM improvement_runs_v1")
+                f"INSERT OR IGNORE INTO improvement_runs ({cols_sql}) "
+                f"SELECT {cols_sql} FROM improvement_runs_v1")
 
             copied = conn.execute(
                 "SELECT COUNT(*) c FROM improvement_runs").fetchone()["c"]
@@ -1161,11 +1194,6 @@ def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
             raise
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
-
-
-def _now_utc_isoformat() -> str:
-    """現在時刻を UTC ISO 形式で返す (§5.5 migration 内で時刻を自前生成するため)。"""
-    return datetime.now(timezone.utc).isoformat()
 
 
 _LEGACY_PLUGIN_APPROVAL_REQUIRED_KEYS = (

@@ -315,7 +315,8 @@ def test_legacy_migration_warning_count_matches_invalidated_rows(tmp_path, caplo
 
 
 def test_legacy_migration_decided_at_is_utc_aware(tmp_path):
-    """L46: `decided_at` (`_now_utc_isoformat`) が未検証。"""
+    """L46: `decided_at` (I4 是正後は `apply_decision` 経由で
+    `datetime.now(timezone.utc)` から生成される) が未検証。"""
     db_path = tmp_path / "t.db"
     conn = _seed_legacy_schema(db_path)
     conn.execute(
