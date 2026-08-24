@@ -34,7 +34,7 @@ def _require_utc(dt: datetime, what: str) -> datetime:
 
 
 def save(conn: sqlite3.Connection, *, params: dict[str, Any], trial_count: int,
-         source: str, now: datetime) -> int:
+         source: str, now: datetime, commit: bool = True) -> int:
     """analysis_runs へ 1 行保存し、lastrowid (analysis_run_id) を返す。"""
     if not isinstance(trial_count, int) or isinstance(trial_count, bool) \
             or trial_count < 1:
@@ -45,5 +45,6 @@ def save(conn: sqlite3.Connection, *, params: dict[str, Any], trial_count: int,
         "INSERT INTO analysis_runs (params_json, trial_count, source, "
         "created_at) VALUES (?,?,?,?)",
         (params_json, trial_count, source, now_utc.isoformat()))
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.lastrowid

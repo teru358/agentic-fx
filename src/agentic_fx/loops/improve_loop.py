@@ -333,20 +333,85 @@ class ImproveLoop:
 
         return staging_dir, source_snapshot_root
 
-    def _build_rpc_handlers(self, ledger, *, staging_dir: Path):
-        raise NotImplementedError  # Task 7 依存分。10.9 節 Step 11 で完全実装する
+    _EVAL_SOURCE = "dukascopy"
+
+    def _build_rpc_handlers(self, ledger: "ImproveRpcLedger", *,
+                            staging_dir: Path) -> dict:
+        """10.9 Step 11: run_backtest/analyze_corr の親側実装。"""
+        from agentic_fx.backtest.analysis import analyze_for_agent
+        from agentic_fx.plugin import loader as plugin_loader
+        from agentic_fx.plugin import strategy_adapter
+
+        def run_backtest_handler(args: dict) -> dict:
+            candidate_dir = staging_dir / args["name"]
+            meta = plugin_loader._discover_one(candidate_dir, args["name"])
+            if meta is None or meta.kind != "strategy":
+                raise ValueError(
+                    f"run_backtest requires a strategy candidate: "
+                    f"{args['name']!r}")
+            try:
+                conn = self._db_readonly_conn_factory()
+                captured: list[dict] = []
+                intent_source = strategy_adapter.build_intent_source(
+                    meta, conn=conn, pair=args["pair"], source=self._EVAL_SOURCE,
+                    settings=self._settings)
+                try:
+                    holdout.run_in_sample(
+                        self._settings, history_conn=conn, symbol=args["pair"],
+                        source=self._EVAL_SOURCE, intent_source=intent_source,
+                        eval_timeframe=meta.timeframe,
+                        plugin_ref=f"plugins/_staging/{staging_dir.name}/"
+                                   f"{args['name']}",
+                        content_hash=meta.content_hash, kind="strategy",
+                        now=self._clock.now(), record_fn=captured.append)
+                finally:
+                    intent_source.close()
+                    conn.close()
+            except Exception:
+                _log.exception("run_backtest_handler failed for %r",
+                               args.get("name"))
+                return {"error": "backtest_failed"}
+            save_kwargs = captured[0]
+            return {**save_kwargs, "trial_count": 1}
+
+        def analyze_corr_handler(args: dict) -> dict:
+            try:
+                conn = self._db_readonly_conn_factory()
+                try:
+                    return analyze_for_agent(
+                        conn, self._settings, args, now=self._clock.now(),
+                        persist=False)
+                finally:
+                    conn.close()
+            except Exception:
+                _log.exception("analyze_corr_handler failed")
+                return {"error": "analyze_failed"}
+
+        return {"run_backtest": run_backtest_handler,
+                "analyze_corr": analyze_corr_handler}
 
     def _build_mission_tools(self, *, staging_dir, source_snapshot_dir,
-                             ledger, rpc_handlers):
-        raise NotImplementedError  # precheck 2026-08-22 wave2: T10-B12/B17
-                                    # 10.9 節 Step 12 で完全実装する
+                             ledger, rpc_handlers) -> list[dict]:
+        """10.9b Step 12-1: Mission.tools を名前列挙専用の registry から取得。"""
+        from agentic_fx.tools.mission_registry import build_mission_registry
 
-    def _build_worker_runner(self, ctx, *,
-                             on_ready: Callable[[dict], None] | None = None):
-        raise NotImplementedError  # Task 1 (C3) 依存。10.9 節 Step 7 で
-                                    # WorkerRunner(..., run_context=ctx,
-                                    # on_ready=on_ready) として完成
-                                    # (precheck 2026-08-22 wave2: T10-B2/R-D1)
+        registry = build_mission_registry(
+            "improve", None, self._settings, None, None, activity=None,
+            staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+            ledger=ledger, rpc_handlers=rpc_handlers)
+        names = registry.names()
+        return registry.openai_tools(names)
+
+    def _build_worker_runner(self, ctx: ImproveRunContext, *,
+                             on_ready: Callable[[dict], None] | None = None) -> "WorkerRunner":
+        """10.9 Step 7: ImproveRunContext を WorkerRunner へ渡す。"""
+        from agentic_fx.runners.worker_runner import WorkerRunner
+        from agentic_fx.store.rag import Rag
+
+        return WorkerRunner(
+            root=self._root, settings=self._settings, clock=self._clock,
+            rag=Rag(self._db_readonly_conn_factory), worker_profile="improve",
+            run_context=ctx, on_ready=on_ready)
 
     def _freeze_ledger(self, ctx: ImproveRunContext) -> None:
         ctx.ledger.freeze()
@@ -538,6 +603,210 @@ class ImproveLoop:
             "summary": output.get("artifact", {}).get("summary", ""),
             "audit_note": "RPC timeout した呼出しは数えていない",
         }
+
+    def _write_report_part(self, reports_dir: Path, *, mission_id: int,
+                           body_md: str) -> Path:
+        """report outbox — 一時ファイルを O_EXCL + fsync で書く。"""
+        part_path = reports_dir / ".tmp" / f"improve-{mission_id}.md.part"
+        fd = os.open(str(part_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, body_md.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return part_path
+
+    def _fsync_dir(self, dirpath: Path) -> None:
+        """report outbox — ディレクトリの fsync。"""
+        fd = os.open(str(dirpath), os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _publish_report(self, conn, *, run_id: int, part_path: Path,
+                        final_path: Path, now: datetime) -> None:
+        """report outbox — rename 後に published へ遷移、fsync。"""
+        try:
+            if final_path.exists():
+                raise FileExistsError(final_path)
+            os.rename(part_path, final_path)
+        except FileExistsError:
+            self._fail_report(conn, run_id=run_id, now=now, reason="rename_conflict")
+            return
+        except OSError as exc:
+            self._fail_report(conn, run_id=run_id, now=now,
+                              reason=f"rename_failed:{exc}")
+            return
+        self._fsync_dir(final_path.parent)
+        self._fsync_dir(part_path.parent)
+        conn.execute(
+            "UPDATE improvement_runs SET report_state='published' "
+            "WHERE id=?", (run_id,))
+        conn.commit()
+
+    def _fail_report(self, conn, *, run_id: int, now: datetime,
+                     reason: str) -> None:
+        """report outbox — 報告失敗の補償 tx。"""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE improvement_runs SET report_state='failed', "
+                "result=NULL, report_path=NULL WHERE id=?", (run_id,))
+            run = conn.execute(
+                "SELECT backlog_id FROM improvement_runs WHERE id=?",
+                (run_id,)).fetchone()
+            if run is not None and run["backlog_id"] is not None:
+                conn.execute(
+                    "UPDATE improvement_backlog SET status='observation', "
+                    "last_result=?, updated_at=? WHERE id=? AND status='done'",
+                    (f"report_failed:{reason}", now.isoformat(),
+                     run["backlog_id"]))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    def reconcile_report_outbox(self, conn, *, reports_dir: Path,
+                                now: datetime) -> None:
+        """report outbox — 起動時 reconcile。"""
+        rows = conn.execute(
+            "SELECT id, mission_id, report_state, report_path "
+            "FROM improvement_runs "
+            "WHERE report_state IN ('prepared','published')").fetchall()
+        for row in rows:
+            report_path = Path(row["report_path"]) if row["report_path"] else None
+            if row["report_state"] == "prepared":
+                part_path = (reports_dir / ".tmp"
+                            / f"improve-{row['mission_id']}.md.part")
+                if part_path.exists() and report_path is not None:
+                    self._publish_report(conn, run_id=row["id"],
+                                        part_path=part_path,
+                                        final_path=report_path, now=now)
+                elif report_path is not None and report_path.exists():
+                    conn.execute(
+                        "UPDATE improvement_runs SET report_state='published' "
+                        "WHERE id=?", (row["id"],))
+                    conn.commit()
+                else:
+                    self._fail_report(conn, run_id=row["id"], now=now,
+                                      reason="missing_temp_and_final")
+            elif row["report_state"] == "published":
+                if report_path is None or not report_path.exists():
+                    self._fail_report(conn, run_id=row["id"], now=now,
+                                      reason="missing:published_final_absent")
+
+    # 10.10 節キーホワイトリスト
+    _BACKTEST_ROW_KEYS = (
+        "scope", "plugin_ref", "content_hash", "kind", "pair", "timeframe",
+        "source", "period", "metrics", "settings_hash", "core_commit",
+        "initial_balance", "now")
+    _ANALYSIS_ROW_KEYS = ("params", "trial_count", "source")
+
+    def _persist_ledger_rows(self, conn, *, ledger_entries, now) -> list[int]:
+        """10.10 Step 3: 台帳から analysis_runs/backtest_runs へ永続化。"""
+        from agentic_fx.store import analysis_runs as analysis_runs_store
+        from agentic_fx.store import backtest_runs as backtest_runs_store
+
+        analysis_run_ids: list[int] = []
+        for entry in ledger_entries:
+            summary = entry["result_summary"]
+            if "error" in summary:
+                self._activity.write(
+                    Category.IMPROVE, "ledger_entry_skipped_error",
+                    f"kind={entry['kind']} error={summary['error']!r}")
+                continue
+            if entry["kind"] == "run_backtest":
+                row_kwargs = {k: summary[k] for k in self._BACKTEST_ROW_KEYS}
+                backtest_runs_store.save_harness_run(
+                    conn, commit=False, variant="candidate", **row_kwargs)
+            elif entry["kind"] == "analyze_corr":
+                row_kwargs = {k: summary[k] for k in self._ANALYSIS_ROW_KEYS}
+                run_id = analysis_runs_store.save(
+                    conn, commit=False, now=now, **row_kwargs)
+                analysis_run_ids.append(run_id)
+        return analysis_run_ids
+
+    def _persist_gate_rows(self, conn, *, gate_rows, now) -> None:
+        """10.10 Step 3: 親ゲート行を永続化。"""
+        from agentic_fx.store import backtest_runs as backtest_runs_store
+
+        for row in gate_rows:
+            backtest_runs_store.save_harness_run(conn, commit=False, **row)
+
+    def _compensate_tx2_failure(self, conn, *, mission_id, run_id,
+                                backlog_id, slot_key, now) -> None:
+        """10.10 Step 3: Tx-2 失敗時の補償 tx。"""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            missions_store.finish_improve_mission(
+                conn, mission_id=mission_id, run_id=run_id,
+                slot_key=slot_key, mission_status="failed", run_result=None,
+                now=now,
+                backlog_transition=(
+                    {"backlog_id": backlog_id, "status": "observation",
+                     "last_result": "commit_failed"}
+                    if backlog_id is not None else None),
+                commit=False)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        self._activity.write(
+            Category.IMPROVE, "improve_commit_failed",
+            f"mission_id={mission_id} run_id={run_id}")
+
+    def _finalize_success(self, conn, *, mission_id, run_id, backlog_id,
+                          slot_key, approval_payload, now,
+                          ledger_entries=(), gate_rows=()) -> None:
+        """10.10 Step 3: Tx-2 本体 (台帳→gate→approval→finish)。"""
+        from agentic_fx.store import approvals as approvals_store
+        from agentic_fx.store import missions as missions_store
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                analysis_run_ids = self._persist_ledger_rows(
+                    conn, ledger_entries=ledger_entries, now=now)
+                self._persist_gate_rows(
+                    conn, gate_rows=gate_rows, now=now)
+                approval_payload = dict(approval_payload)
+                approval_payload["analysis_run_ids"] = analysis_run_ids
+                approval_payload["analysis_call_count"] = sum(
+                    1 for e in ledger_entries if e["kind"] == "analyze_corr")
+                approval_payload["trial_count"] = sum(
+                    e["trial_count"] for e in ledger_entries)
+                approval_id = approvals_store.create(
+                    conn, kind="plugin", payload=approval_payload, now=now,
+                    commit=False)
+                missions_store.finish_improve_mission(
+                    conn, mission_id=mission_id, run_id=run_id,
+                    slot_key=slot_key, mission_status="completed",
+                    run_result="approval", now=now, approval_id=approval_id,
+                    backlog_transition={
+                        "backlog_id": backlog_id, "status": "selected",
+                        "last_result": f"approval_pending:{approval_id}"},
+                    commit=False)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        except Exception:
+            _log.exception("Tx-2 failed for mission_id=%s — running "
+                           "compensation", mission_id)
+            try:
+                self._compensate_tx2_failure(
+                    conn, mission_id=mission_id, run_id=run_id,
+                    backlog_id=backlog_id, slot_key=slot_key, now=now)
+            except Exception:
+                _log.exception(
+                    "compensation itself failed for mission_id=%s — mission "
+                    "stays in a non-terminal state, will be picked up by "
+                    "startup reconcile", mission_id)
+                self._activity.write(
+                    Category.IMPROVE, "tx2_compensation_failed",
+                    f"mission_id={mission_id} run_id={run_id}")
 
     def commit(self, *, mission, ctx, result, now):
         raise NotImplementedError  # 10.4〜10.11 節
