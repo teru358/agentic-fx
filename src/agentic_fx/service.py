@@ -942,11 +942,24 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             capacity=settings.improve.parallel, root=root, settings=settings,
             clock=clock, db_path=root / "data" / "agentic.db",
             stop_event=stop_event)
-        # self._improve_loop への実 ImproveLoop 注入・Scheduler.on_improve_tick
-        # / Commands.improve_supervisor への値渡し (「有効化配線」) は
-        # Task 10 完了後、Task 12 が build_app の当該箇所で行う (統合裁定
-        # R-i9/R-i2)。本 task はここまで — Scheduler/Commands の構築呼び
-        # 出しには一切手を入れない。
+        # プラン10 Task10-12 Step1: ImproveLoop を構築し
+        # `improve_supervisor._improve_loop` へ注入する (R-i2 — Tx-0 の
+        # slot claim は ImproveLoop.prepare の責務、ImproveSupervisor は
+        # 自分で claim_slot しない)。rag は上で構築済みの単一インスタンス
+        # (778 行) をそのまま渡す (T10-B10 — ここで new しない)。
+        # Scheduler.on_improve_tick / Commands.improve_supervisor への値渡し
+        # (「有効化配線」) は Task 10 完了後、Task 12 が build_app の当該
+        # 箇所で行う (統合裁定 R-i9/R-i2、レビュー1周目 C1) — 本 task は
+        # ここまで、Scheduler/Commands の構築呼び出しには一切手を入れない。
+        from agentic_fx.loops.improve_loop import ImproveLoop
+        improve_loop = ImproveLoop(
+            root=root, settings=settings, clock=clock,
+            db_write_conn_factory=lambda: connect(
+                root / "data" / "agentic.db"),
+            db_readonly_conn_factory=lambda: connect_readonly(
+                root / "data" / "agentic.db"),
+            activity=activity, rag=rag)
+        improve_supervisor._improve_loop = improve_loop
 
         def on_trade_mission(trigger: str) -> bool:
             # trigger は scheduler._trade_mission_due() が返した起動理由。

@@ -1670,6 +1670,20 @@ def test_build_app_accepts_embedding_fn(tmp_path):
     assert calls  # embedding function が呼ばれた
 
 
+# ---- プラン10 Task10-12 Step1: ImproveLoop 注入 --------------------------
+
+def test_build_app_injects_real_improve_loop_into_supervisor(tmp_path):
+    """`build_app` が `ImproveSupervisor._improve_loop` へ実 `ImproveLoop`
+    を注入すること (旧稿は `None` のまま — Task 10 完了後に Task 12 が
+    行う統合裁定 R-i9/R-i2)。rag は `build_app` が構築済みの単一インスタンス
+    をそのまま渡す (new しない、T10-B10) ことも合わせて確認する。"""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    assert isinstance(app.improve_supervisor._improve_loop, ImproveLoop)
+    assert app.improve_supervisor._improve_loop._rag is app.rag
+
+
 # ---- Task 3: B 束小口 6 項目 (maintenance 順序) ---------------------------------
 
 def test_signal_maintenance_reclaims_before_expiring(monkeypatch):
