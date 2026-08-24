@@ -265,6 +265,19 @@ def _resolve_entity(plugins_dir: Path, name: str, activity=None) -> Path | None:
         if not version_dir.is_dir():
             _reject(name, f"symlink target is not a directory: {version_dir}")
             return None
+        # E3 裁定 (2026-08-25、A16 + B-20): 字句正規形検査 (上の
+        # `pattern.match`) を通っても、`.versions/<name>` 自体が symlink で
+        # 実体が `plugins_dir` の外に出る形は拒否する — `resolve()` は
+        # 「正規形と確定した後の絶対化」にのみ使う (docstring どおり)、
+        # ここで足すのは resolve 後の containment 検査のみで正規形判定を
+        # resolve() に委ねるわけではない。
+        plugins_root_real = plugins_dir.resolve()
+        try:
+            version_dir.relative_to(plugins_root_real)
+        except ValueError:
+            _reject(name, f"symlink target escapes plugins_root after "
+                          f"resolving intermediate symlinks: {version_dir}")
+            return None
         return version_dir
     return entry
 

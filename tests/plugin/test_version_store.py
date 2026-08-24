@@ -112,6 +112,32 @@ def test_create_version_dir_fsyncs_files_before_rename(tmp_path, monkeypatch):
     assert len(calls) >= 4
 
 
+def test_create_version_dir_fsyncs_tmp_dir_itself_before_rename(tmp_path, monkeypatch):
+    """確定-16 (B-2): `os.fsync` の呼び出し回数 (`>= 4`) だけを見る既存
+    pin は弱い — tmp_dir 用の `_fsync_dir(tmp_dir)` (rename 前) を削除する
+    変異 (`b2_src_drop_dir_fsync`) でも、rename 後の `_fsync_dir(name_dir)`
+    が残るため呼び出し回数は変わらず SURVIVED する。`_fsync_dir` 自体を
+    spy し、tmp_dir を対象にした呼び出しが rename 前に発生することを直接
+    確認する。"""
+    calls = []
+    real_fsync_dir = version_store._fsync_dir
+
+    def spy(path):
+        calls.append(Path(path))
+        return real_fsync_dir(path)
+
+    monkeypatch.setattr(version_store, "_fsync_dir", spy)
+    a = version_store.artifact_hash_bytes(PLUGIN_PY, CONFIG_YAML, TEST_PY)
+    version_store.create_version_dir(
+        tmp_path, "sma", a, plugin_py=PLUGIN_PY, config_yaml=CONFIG_YAML,
+        test_plugin=TEST_PY, op_identity="1")
+
+    tmp_dir_calls = [p for p in calls if ".tmp-" in p.name]
+    assert tmp_dir_calls, (
+        "tmp_dir 自身に対する _fsync_dir 呼び出しが無い "
+        "(b2_src_drop_dir_fsync の欠陥)")
+
+
 def test_create_version_dir_rename_onto_nonempty_final_dir_is_idempotent(tmp_path):
     """M-2 是正の pin: 実測で非空ディレクトリへの os.rename は
     OSError errno ENOTEMPTY (39) であり FileExistsError (EEXIST=17) では

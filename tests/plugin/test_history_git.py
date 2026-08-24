@@ -51,6 +51,29 @@ def test_record_version_no_op_when_tree_unchanged(tmp_path):
     assert sha2 is None
 
 
+def test_record_version_refuses_when_version_dir_content_does_not_match_payload_hashes(
+        tmp_path):
+    """確定-6: `record_version` の recompute ガード
+    (`recomputed_content != content_hash or recomputed_artifact !=
+    artifact_hash`) が、payload と実ディスク内容の食い違いを検出して
+    `HistoryGitError` で拒否することを直接 pin する。このガードは
+    `create_version_dir` の冪等早期 return (中身を検証しない) と
+    `_advance_to_decided` の切替後再照合の間で **唯一** in-place 改竄を
+    捕まえる防御であり (verified-local-round1.md 確定-6)、旧稿はこれを
+    直接検証するテストが無かった。"""
+    history_dir = tmp_path / "plugins" / ".history.git"
+    d, a, c = _make_version(tmp_path / "plugins", "sma")
+    d.chmod(0o700)
+    (d / "test_plugin.py").chmod(0o600)
+    (d / "test_plugin.py").write_text("import os\n# TAMPERED\n")
+    d.chmod(0o500)
+
+    with pytest.raises(history_git.HistoryGitError, match="index blob hash mismatch"):
+        history_git.record_version(
+            history_dir, name="sma", artifact_hash=a, content_hash=c,
+            approval_id=1, version_dir=d)
+
+
 def test_record_version_second_version_replaces_prefix_entries(tmp_path):
     """新版の記録が旧版の同 prefix エントリを index から外す (`git rm --cached`)。
     tree に旧 test_plugin.py の内容が残らないこと。"""
@@ -91,6 +114,38 @@ def test_record_version_detached_head_raises_distinct_error(tmp_path):
     with pytest.raises(history_git.HistoryGitDetachedError):
         history_git.record_version(history_dir, name="sma", artifact_hash=a2,
                                    content_hash=c2, approval_id=2, version_dir=d2)
+
+
+def test_record_version_detached_head_detected_via_returncode_alone(tmp_path, monkeypatch):
+    """確定-16 (B-5): detached 判定
+    `ref_proc.returncode == 1 or "not a symbolic ref" in ref_proc.stderr`
+    の前半 (returncode==1 側) 単独での検出が未 pin だった (実際の git
+    detached HEAD は returncode==1 かつ stderr に "not a symbolic ref" を
+    含むため、既存の e2e テストは両方の条件が同時に成立するケースしか
+    通さず、`or` の左側だけを残す変異 (`b5_src_stderr_only` — 右側の
+    stderr 判定だけを残す) が SURVIVED していた)。`_run` を monkeypatch
+    し、symbolic-ref 呼び出しだけ returncode=1 だが stderr に
+    "not a symbolic ref" を含まない CompletedProcess を返すことで、
+    returncode 側の判定単独で `HistoryGitDetachedError` になることを
+    確認する。"""
+    import subprocess as _subprocess
+    history_dir = tmp_path / "plugins" / ".history.git"
+    d, a, c = _make_version(tmp_path / "plugins", "sma")
+
+    real_run = history_git._run
+
+    def fake_run(args, *, env, check=True):
+        if args[:2] == ["symbolic-ref", "HEAD"]:
+            return _subprocess.CompletedProcess(
+                args, returncode=1, stdout="", stderr="fatal: some other reason\n")
+        return real_run(args, env=env, check=check)
+
+    monkeypatch.setattr(history_git, "_run", fake_run)
+
+    with pytest.raises(history_git.HistoryGitDetachedError):
+        history_git.record_version(
+            history_dir, name="sma", artifact_hash=a, content_hash=c,
+            approval_id=1, version_dir=d)
 
 
 def test_record_version_missing_repo_dir_is_not_a_repository_error(tmp_path):
@@ -170,13 +225,23 @@ def test_history_git_worktree_stays_clean_no_porcelain_used(tmp_path):
         or "this operation must be run in a work tree" in (status.stderr + status.stdout).lower()
 
 
-def test_git_never_called_from_scheduler_thread(monkeypatch, tmp_path):
+@pytest.mark.parametrize("thread_name", ["scheduler", "scheduler-thread"])
+def test_git_never_called_from_scheduler_thread(monkeypatch, tmp_path, thread_name):
     """§5.4: scheduler スレッドから git サブプロセスが呼ばれないこと。
     `record_version` 内部の `subprocess.run` 呼び出しを検査し、呼び出し元
     スレッド名が 'scheduler' なら AssertionError にするテスト用フック
     (実装は `history_git._assert_not_scheduler_thread()` を record_version
-    冒頭に置き、テストはスレッド名 'scheduler-thread' から呼んで例外を
-    assert する)。"""
+    冒頭に置き、テストはスレッド名から呼んで例外を assert する)。
+
+    確定-8 是正 (2026-08-25、verified-local-round1.md): 旧稿は
+    `'scheduler-thread'` という `startswith('scheduler')` にのみ引っかかる
+    テスト用の名前でしか検証しておらず、本番の実スレッド名 `'scheduler'`
+    (`service.py:1342` `threading.Thread(..., name="scheduler")`) を
+    `_assert_not_scheduler_thread` の `startswith` から `==
+    'scheduler-thread'` へ退行させる変異 (`a15_src_exact`) が SURVIVED
+    だった (=「テストが通る最小実装」に退行させると本番のガードが完全に
+    無効化される)。本番名を必ず parametrize に含める形に是正する
+    (既存テストの修正だが、これは欠陥の是正 — 確定-8 の申告どおり)。"""
     d, a, c = _make_version(tmp_path / "plugins", "sma")
     errors = []
 
@@ -188,7 +253,7 @@ def test_git_never_called_from_scheduler_thread(monkeypatch, tmp_path):
         except history_git.SchedulerThreadForbiddenError as e:
             errors.append(e)
 
-    t = threading.Thread(target=run_as_scheduler, name="scheduler-thread")
+    t = threading.Thread(target=run_as_scheduler, name=thread_name)
     t.start()
     t.join()
     assert len(errors) == 1

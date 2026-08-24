@@ -24,6 +24,7 @@ from agentic_fx.store import db as db_mod
 from agentic_fx.store import improve_waves
 
 if TYPE_CHECKING:
+    from agentic_fx.activity import ActivityLog
     from agentic_fx.config import Settings
     from agentic_fx.core.contracts import Clock
     from agentic_fx.loops.improve_loop import ImproveLoop
@@ -36,13 +37,19 @@ _MAX_SPAWN_ATTEMPTS = 2  # 初回 + 再試行 1 回 (設計書 §3.1 手順⑥)
 class ImproveSupervisor:
     def __init__(self, *, capacity: int, root: Path, settings: "Settings",
                  clock: "Clock", db_path: Path,
-                 stop_event: threading.Event) -> None:
+                 stop_event: threading.Event,
+                 activity: "ActivityLog | None" = None) -> None:
         self._capacity = capacity
         self._root = root
         self._settings = settings
         self._clock = clock
         self._db_path = db_path
         self._stop_event = stop_event
+        # E4 裁定 (2026-08-25): `process_expired_approvals` の name 欠落
+        # payload に対する activity ERROR 記録を、tick() 経由の呼び出し
+        # (service.py 起動時 reconcile とは独立に毎 tick 実行) でも書ける
+        # ようにする (既定 None — 既存呼び出し元との後方互換)。
+        self._activity = activity
         # `ImproveLoop` (Task 10 の産物)。build_app 配線時 (10.12 節) に
         # 実インスタンスへ差し替える。None のままだと `_launch_slot` は
         # AttributeError で失敗する — Task 9 単独では未配線が正しい状態。
@@ -64,7 +71,8 @@ class ImproveSupervisor:
         expire_conn = db_mod.connect(self._db_path)
         try:
             switch.process_expired_approvals(
-                expire_conn, plugins_root=self._root / "plugins", now=now)
+                expire_conn, plugins_root=self._root / "plugins", now=now,
+                activity=self._activity)
         finally:
             expire_conn.close()
         s = self._settings.schedule

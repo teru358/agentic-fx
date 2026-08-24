@@ -175,12 +175,20 @@ def test_approve_already_decided(tmp_path):
 
 
 def test_approve_nonexistent(tmp_path):
-    """F2: 存在しない id への approve は例外でなくメッセージを返す。"""
+    """F2: 存在しない id への approve は例外でなくメッセージを返す。
+
+    E1 裁定 (2026-08-25、確定-8 と同じ軸の欠陥の是正): この assertion は
+    元々「決定済み」という文言を pin していたが、それは E1 是正前の
+    `apply_decision` が「ID 不存在」と「CAS 失敗 (決定済み)」を同一例外に
+    混同していた頃の副産物だった。存在しない approval を「決定済み」と
+    報告するのは E1 が正そうとしている混同そのものであるため、期待する
+    文言を「存在しません」に書き換える (既存テスト書き換え禁止の例外 —
+    欠陥の是正として申告)。"""
     _, _, _, cmds = _commands(tmp_path)
     out = cmds.dispatch("approve 9999")
-    # 例外を投げずに文字列を返すこと（AlreadyDecidedError でメッセージが返される）
+    # 例外を投げずに文字列を返すこと
     assert isinstance(out, str)
-    assert "決定済み" in out
+    assert "存在しません" in out
 
 
 def test_killswitch_reset(tmp_path):
@@ -368,3 +376,119 @@ def test_reflect_retry_rejects_extra_arguments(tmp_path):
     assert "再試行対象へ戻しました" not in out
 
 
+
+
+def test_reject_plugin_kind_routes_through_switch_reject_candidate(tmp_path):
+    """確定-3: `reject` の kind='plugin' 分岐は `switch.reject_candidate`
+    (plugin flock 経由) を通る。staging 候補が削除される (=
+    `_drop_staging_candidate` を通った証跡) ことで配線を pin する
+    (SURVIVED 変異 c21_reject_drop_plugin_dispatch の killer)。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / ".locks").mkdir()
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    candidate_dir = plugins_dir / "_staging" / "1" / "sma"
+    candidate_dir.mkdir(parents=True)
+    (candidate_dir / "plugin.py").write_text("x")
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "h1", "artifact_hash": "a1",
+                 "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/1/sma"},
+        now=NOW)
+
+    out = cmds.dispatch(f"reject {approval_id} no good")
+
+    assert "rejected" in out
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "rejected"
+    assert not candidate_dir.exists(), (
+        "plugin flock 経由の reject_candidate (staging 掃除を含む) を "
+        "通っていない (c21_reject_drop_plugin_dispatch の欠陥)")
+
+
+def test_reject_plugin_kind_without_plugins_root_reports_unwired(tmp_path):
+    """確定-3: `plugins_root` 未配線時、plugin kind の reject は例外でなく
+    「未配線」文言を返す (SURVIVED 変異 c21_reject_drop_wiring_guard の
+    killer)。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    assert cmds.plugins_root is None
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "h1", "artifact_hash": "a1",
+                 "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/1/sma"},
+        now=NOW)
+
+    out = cmds.dispatch(f"reject {approval_id} no good")
+
+    assert "未配線" in out
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending"
+
+
+def test_approval_retry_dispatches_to_switch_retry_approval(tmp_path, monkeypatch):
+    """確定-3: `approval retry <id>` は `switch.retry_approval` を呼び、
+    activity `retry` を記録する (SURVIVED 変異 c21_retry_drop_branch の
+    killer)。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / ".locks").mkdir()
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+
+    calls = []
+
+    def _spy(conn_, approval_id, *, decided_by, now, plugins_root, settings,
+            activity=None):
+        calls.append((approval_id, decided_by))
+
+    monkeypatch.setattr("agentic_fx.plugin.switch.retry_approval", _spy)
+
+    out = cmds.dispatch("approval retry 42")
+
+    assert calls == [(42, "shell")]
+    assert "再試行" in out
+    records = activity.tail(10, Category.APPROVAL)
+    assert any("retry" in r for r in records)
+
+
+def test_approval_retry_without_plugins_root_reports_unwired(tmp_path):
+    """確定-3: `approval retry` は `plugins_root`/`settings` 未配線時に
+    例外でなく「未配線」文言を返す。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    assert cmds.plugins_root is None
+
+    out = cmds.dispatch("approval retry 42")
+
+    assert "未配線" in out
+
+
+def test_policy_add_without_policy_path_reports_unwired(tmp_path):
+    """確定-3: `policy add` は `_policy_path` 未配線時に例外でなく
+    「未配線」文言を返す (SURVIVED 変異 c21_policy_drop_wiring_guard の
+    killer)。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    assert cmds._policy_path is None
+
+    out = cmds.dispatch("policy add テスト方針")
+
+    assert "未配線" in out
+
+
+def test_policy_add_appends_to_policy_path(tmp_path):
+    """確定-3 の正常系対: `_policy_path` が配線されていれば追記される
+    (未配線ガードだけが正常系を潰していないことの回帰 pin)。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    policy_path = tmp_path / "policy" / "directives.md"
+    cmds._policy_path = policy_path
+
+    out = cmds.dispatch("policy add テスト方針")
+
+    assert "policy" in out
+    assert "テスト方針" in policy_path.read_text(encoding="utf-8")

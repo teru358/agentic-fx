@@ -825,7 +825,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                            safe_error_text(exc))
         try:
             switch.process_expired_approvals(  # B-7: 唯一の呼び出し元だった裁定1が本番で1度も動かない欠落を解消
-                conn_core, plugins_root=plugins_dir, now=clock.now())
+                conn_core, plugins_root=plugins_dir, now=clock.now(),
+                activity=activity)
         except Exception as exc:
             activity.write(Category.APPROVAL, "plugin_expire_failed",
                            safe_error_text(exc))
@@ -944,7 +945,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         improve_supervisor = ImproveSupervisor(
             capacity=settings.improve.parallel, root=root, settings=settings,
             clock=clock, db_path=root / "data" / "agentic.db",
-            stop_event=stop_event)
+            stop_event=stop_event, activity=activity)
         # プラン10 Task10-12 Step1: ImproveLoop を構築し
         # `improve_supervisor._improve_loop` へ注入する (R-i2 — Tx-0 の
         # slot claim は ImproveLoop.prepare の責務、ImproveSupervisor は

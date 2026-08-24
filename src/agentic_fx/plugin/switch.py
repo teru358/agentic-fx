@@ -63,6 +63,11 @@ def advance_switch_journal(
     now: datetime, commit: bool = False,
 ) -> None:
     row = journal_store.get(conn, op_id)
+    if row is None:
+        # E2 裁定 (2026-08-25): 全呼び出し元は同一 tx 内で存在確認済みの
+        # op_id を渡すため通常到達しないが、`row["phase"]` の不透明な
+        # TypeError より明示的な fail closed を選ぶ。
+        raise ValueError(f"op_id={op_id} not found")
     # 段 0 独立発見 (1) 是正: `_PHASE_ORDER` は定義行以外に参照が無い死に
     # コードだった。ここで単調性を実行時に強制する — 既に到達済みの phase
     # より前 (または同じ) へ `advance` しようとすると ValueError (fail
@@ -333,17 +338,30 @@ def resolve_candidate_dir(plugins_root: Path, *, candidate_origin: str,
     return candidate_dir
 
 
-def _drop_staging_candidate(plugins_root: Path, payload: dict) -> None:
+def _drop_staging_candidate(plugins_root: Path, payload: dict, *,
+                            activity: "ActivityLog | None" = None) -> None:
     """終端決定 (approved/rejected/expired/invalidated) の tx 直後に staging
     候補を削除する (§5.1 手順 3 の掃除所有表、verified-codex-round1.md I1)。
-    `candidate_origin='human'` は人間所有なので触らない (自動削除しない)。"""
+    `candidate_origin='human'` は人間所有なので触らない (自動削除しない)。
+
+    E4/確定-12 裁定 (2026-08-25): `CandidateMissingError` (候補が既に無い
+    — 正常系、記録不要) と `ValueError`/`KeyError` (payload の正規形違反・
+    必須キー欠落 = 契約違反) を分ける。後者は黙って進まず activity ERROR
+    (`staging_drop_skipped`) を残す — この関数は既に終端決定の後に呼ばれる
+    掃除ステップなので、決定そのものを pending 留置に戻すことはできない
+    (掃除が漏れたことの可視化のみ)。"""
     if payload.get("candidate_origin") != "staging":
         return
     try:
         candidate_dir = resolve_candidate_dir(
             plugins_root, candidate_origin="staging",
             candidate_path=payload["candidate_path"], name=payload["name"])
-    except (CandidateMissingError, ValueError, KeyError):
+    except CandidateMissingError:
+        return
+    except (ValueError, KeyError) as exc:
+        if activity is not None:
+            activity.write(Category.APPROVAL, "staging_drop_skipped",
+                           f"payload contract violation: {safe_error_text(exc)}")
         return
     shutil.rmtree(candidate_dir, ignore_errors=True)
 
@@ -540,15 +558,56 @@ def _advance_to_decided(
         switch_live(plugins_root, name, new_target=new_target, op_id=op_id)
         # 手順 8a: 切替後の再照合 (fail closed — 自動巻き戻しは
         # reconcile_switch_journals の switched 収束規則に委ねる。ここでは
-        # 例外を送出して手順 9 (decide) へ進ませない)
+        # 例外を送出して手順 9 (decide) へ進ませない)。確定-7: 旧稿は
+        # content_hash のみを見ており、resume 経路
+        # (`_reverify_switched_journal._new_target_hash_ok`) が持つ
+        # artifact_hash 照合 + ディレクトリ名照合 (in-place 編集検出) が
+        # 無かった (経路の非対称) — `_version_dir_hashes_ok` を共有する形へ
+        # 揃える。
         resolved_after = (plugins_root / new_target).resolve()
-        after_hash = loader.content_hash(resolved_after)
-        if after_hash != content_hash:
+        if not _version_dir_hashes_ok(
+                resolved_after, content_hash=content_hash, artifact_hash=artifact_hash):
+            # メッセージ中の "content_hash mismatch" 部分文字列は既存テスト
+            # `test_approve_upgrade_reverifies_content_hash_after_switch`
+            # の `pytest.raises(match=...)` が pin している (既存テスト
+            # 書き換え禁止のため文言を維持)。
             raise RuntimeError(
                 f"plugin {name!r}: live content_hash mismatch after switch "
-                f"(expected {content_hash}, got {after_hash})")
+                f"(expected content_hash={content_hash} "
+                f"artifact_hash={artifact_hash})")
 
     _finalize_decision(conn, approval_id, op_id=op_id, decided_by=decided_by, now=now)
+
+
+def _version_dir_hashes_ok(version_dir: Path, *, content_hash: str | None,
+                          artifact_hash: str | None) -> bool:
+    """確定-7: 版ディレクトリの内容が期待する `(content_hash, artifact_hash)`
+    と一致し、かつディレクトリ名自体も `artifact_hash` と一致することを
+    確認する (in-place 編集の検出 — §2.3・§7.1-37)。
+    `_reverify_switched_journal` (resume 経路) と `_advance_to_decided`
+    (fresh approve 経路) の切替後再照合が同じ規則を共有する
+    (確定-7: 旧稿は fresh 経路が content_hash 1 値しか見ておらず、
+    resume 経路だけが artifact_hash 2 値 + dir 名照合を持つ非対称だった)。"""
+    if not version_dir.is_dir():
+        return False
+    try:
+        # `loader.content_hash` (モジュール属性参照) を直接呼ぶ — 旧稿の
+        # `_advance_to_decided` が `loader.content_hash(resolved_after)` を
+        # 直呼びしていたのと同じ経路にする (`test_approve_upgrade_
+        # reverifies_content_hash_after_switch` が `monkeypatch.setattr(
+        # "agentic_fx.plugin.switch.loader.content_hash", ...)` でこの
+        # 経路を差し替える契約を持つ — `gate_pytest.hashes_of` 内部の
+        # `_content_hash` は import 時に束縛済みでこの monkeypatch の対象
+        # にならない)。
+        actual_content = loader.content_hash(version_dir)
+        plugin_py = (version_dir / "plugin.py").read_bytes()
+        config_yaml = (version_dir / "config.yaml").read_bytes()
+        test_plugin = (version_dir / "test_plugin.py").read_bytes()
+        actual_artifact = loader.artifact_hash_bytes(plugin_py, config_yaml, test_plugin)
+    except OSError:
+        return False
+    return (actual_content == content_hash and actual_artifact == artifact_hash
+            and version_dir.name == artifact_hash)
 
 
 def _reverify_switched_journal(
@@ -576,21 +635,15 @@ def _reverify_switched_journal(
     expected_artifact_hash = payload.get("artifact_hash")
 
     def _new_target_hash_ok() -> bool:
-        version_dir = plugins_root / new_target
-        if not version_dir.is_dir():
-            return False
-        try:
-            content, artifact = hashes_of(version_dir)
-        except OSError:
-            return False
         # I3 是正 (verified-codex-round1.md / 設計 §2.3・§7.1-37): reconcile
         # も loader と同じ規則で「版ディレクトリ名 == 実 artifact_hash」を
         # 照合する (in-place 編集の検出)。content_hash (2 本) だけでは
         # test_plugin.py だけの改変を見逃し、approved だが起動時ロード
-        # 不能という不収束状態を作れた。
-        return (content == expected_content_hash
-                and artifact == expected_artifact_hash
-                and version_dir.name == artifact)
+        # 不能という不収束状態を作れた。確定-7: `_advance_to_decided` と
+        # 実装を共有する (`_version_dir_hashes_ok`)。
+        return _version_dir_hashes_ok(
+            plugins_root / new_target, content_hash=expected_content_hash,
+            artifact_hash=expected_artifact_hash)
 
     if _new_target_hash_ok():
         return True
@@ -687,7 +740,7 @@ def approve_candidate(
                 raise
             # I1 是正: 終端決定 (invalidated) の tx 直後に staging 候補を
             # 削除する (§5.1 手順 3)。
-            _drop_staging_candidate(plugins_root, payload)
+            _drop_staging_candidate(plugins_root, payload, activity=activity)
             return
 
         # 0d: 同名の未完ジャーナルが「この approval 自身の再試行」であれば
@@ -732,6 +785,23 @@ def approve_candidate(
                 f"approval {approval_id} — resolve it first (reconcile or "
                 "approval retry)")
 
+        def _close_own_unfinished_journal_if_any() -> None:
+            # 確定-1 (Critical): この approval 自身の未完ジャーナル
+            # (preparing/versioned/recorded — switched はここに来ない、上の
+            # 0d 分岐で先に処理・return 済み) が残っていれば、候補が壊れて
+            # pending 留置する前に `_revert_one` で閉じる。閉じないと name が
+            # 永久に `UnresolvedJournalError` で封鎖される
+            # (verified-local-round1.md 確定-1)。`_revert_one` は非 switched
+            # 行に対して FS 副作用を一切持たない (`switch.py:156-158` と
+            # 同じ論拠 — 安全)。
+            if op_id is None:
+                return
+            journal_row = journal_store.get(conn, op_id)
+            if journal_row is not None and journal_row["phase"] != "switched":
+                _revert_one(conn, journal_row, plugins_root=plugins_root,
+                           now=now, activity=activity)
+                conn.commit()
+
         candidate_origin = payload["candidate_origin"]
         candidate_path = payload["candidate_path"]
         try:
@@ -739,6 +809,7 @@ def approve_candidate(
                 plugins_root, candidate_origin=candidate_origin,
                 candidate_path=candidate_path, name=name)
         except CandidateMissingError:
+            _close_own_unfinished_journal_if_any()
             return  # pending のまま (§8.1-29)
 
         try:
@@ -755,9 +826,12 @@ def approve_candidate(
             # つぶすと `candidate_missing` 検出そのものを削る変異が
             # `test_approve_candidate_missing_stays_pending` で red に
             # ならず survive してしまう)。
+            _close_own_unfinished_journal_if_any()
             return  # 候補が壊れている/検査失敗 → pending のまま
         if (content_hash != payload["content_hash"]
                 or artifact_hash != payload["artifact_hash"]):
+            # 確定-1: ⓐ 不一致でも同様に自分の未完ジャーナルを閉じる。
+            _close_own_unfinished_journal_if_any()
             return  # ⓐ 不一致 → pending のまま
 
         live = plugins_root / name
@@ -818,6 +892,16 @@ def materialize_plugin(root: Path, name: str) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if live.is_symlink():
         src = (live.parent / live.readlink()).resolve()
+        # E3 裁定 (2026-08-25、B-20): live symlink の実体が `root` (=
+        # plugins_root) の外に出る場合は拒否する (containment 検査 —
+        # loader._resolve_entity の同じ軸の是正と対称)。
+        root_real = root.resolve()
+        try:
+            src.relative_to(root_real)
+        except ValueError:
+            raise ValueError(
+                f"materialize_plugin: live symlink target escapes "
+                f"plugins_root: {src}") from None
     else:
         src = live
     shutil.copytree(src, dest)
@@ -882,7 +966,8 @@ def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
 
 def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
                      decided_by: str, reason: str, now: datetime,
-                     plugins_root: Path) -> None:
+                     plugins_root: Path,
+                     activity: "ActivityLog | None" = None) -> None:
     """§8.1-32: 全 terminal decision (approve/reject/expire/reconcile) が
     同じ plugin flock を通る。本 task (11g) が新規命名 (骨格 Interfaces 節
     に無い — submit/approve/bless の 3 関数しか列挙されていないが、reject
@@ -892,16 +977,25 @@ def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
     row = conn.execute(
         "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
     if row is None:
-        raise approvals_store.AlreadyDecidedError(
-            f"approval {approval_id} is not pending")
+        # E1 裁定 (2026-08-25): 「ID 不存在」は「CAS 失敗 (決定済み)」と
+        # 別例外にする — `ApprovalNotFoundError` は `AlreadyDecidedError`
+        # のサブクラスなので既存の broad catch との後方互換を保つ。
+        raise approvals_store.ApprovalNotFoundError(
+            f"approval {approval_id} not found")
     payload = json.loads(row["payload_json"])
     name = payload.get("name")
     if name is None:
-        # payload に name が無い (plugin kind の契約違反) — flock を取る
-        # 対象が特定できないので apply_decision のみ直接通す。
-        approvals_store.apply_decision(
-            conn, approval_id, "rejected", decided_by=decided_by, now=now,
-            reason=reason, commit=True)
+        # E4 裁定 (2026-08-25、確定-14): payload に name が無いのは plugin
+        # kind の契約違反。旧稿は flock を取る対象が特定できないとして
+        # `apply_decision` のみ直接通し reject を成立させていたが、これは
+        # staging 候補を掃除しないまま決定を確定させてしまう (掃除漏れが
+        # 無言のまま)。E4 の方針に合わせ、契約違反行は activity ERROR を
+        # 残した上で **決定させず pending 留置**にする。
+        if activity is not None:
+            activity.write(
+                Category.APPROVAL, "reject_rejected_payload_missing_name",
+                f"approval_id={approval_id}: plugin payload に name が無く "
+                "契約違反のため reject を実行せず pending 留置")
         return
 
     with _plugin_lock(plugins_root, name):
@@ -920,11 +1014,12 @@ def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
             reason=reason, commit=True)
         # I1 是正: 終端決定 (rejected) の tx 直後に staging 候補を削除する
         # (§5.1 手順 3)。
-        _drop_staging_candidate(plugins_root, payload)
+        _drop_staging_candidate(plugins_root, payload, activity=activity)
 
 
 def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
-                              now: datetime) -> None:
+                              now: datetime,
+                              activity: "ActivityLog | None" = None) -> None:
     """裁定 1 (統合裁定 R-i8) の意味論を実装する (プラン10 Task11g、11f の
     service.py 起動時 reconcile 配線が本関数の存在に依存するため実装を前倒し
     — 最終報告の「逸脱」に明記):
@@ -946,6 +1041,16 @@ def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
         payload = json.loads(row["payload_json"])
         name = payload.get("name")
         if not name:
+            # E4 裁定 (2026-08-25、確定-14 と同じ軸): payload に name が
+            # 無いのは plugin kind の契約違反。flock を取る対象が特定
+            # できないので処理をスキップする (= pending 留置のまま) が、
+            # 黙って進まず activity ERROR を残す。
+            if activity is not None:
+                activity.write(
+                    Category.APPROVAL,
+                    "expire_skipped_payload_missing_name",
+                    f"approval_id={row['id']}: plugin payload に name が "
+                    "無く契約違反のため expire を実行せず pending 留置")
             continue
         lock_path = plugins_root / ".locks" / f"{name}.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -969,7 +1074,7 @@ def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
                     now=now, reason="expired", commit=True)
                 # I1 是正: 終端決定 (expired) の tx 直後に staging 候補を
                 # 削除する (§5.1 手順 3)。
-                _drop_staging_candidate(plugins_root, payload)
+                _drop_staging_candidate(plugins_root, payload, activity=activity)
             finally:
                 fcntl.flock(lockf, fcntl.LOCK_UN)
 
@@ -987,6 +1092,18 @@ def bless_candidate(
     approvals_store.expire_due(conn, now, commit=True)  # 0a
 
     with _plugin_lock(plugins_root, name):  # 0b
+        # 確定-2: `approve_candidate` (switch.py:728-733) と同じガードを
+        # `bless_candidate` にも置く。無ければ `begin_switch_journal` が
+        # 部分 UNIQUE index に当たり、生の `sqlite3.IntegrityError` が
+        # catch サイト (CLI) を素通りしてしまう。
+        existing_journal = journal_store.get_open_by_name(conn, name)
+        if existing_journal is not None:
+            raise UnresolvedJournalError(
+                f"plugin {name!r}: an unresolved switch journal "
+                f"(op_id={existing_journal['op_id']}, "
+                f"approval_id={existing_journal['approval_id']}) blocks "
+                f"bless — resolve it first (reconcile or approval retry)")
+
         meta, content_hash, artifact_hash, metrics, evaluable = _run_full_gate(
             conn, human_dir, name=name, settings=settings, now=now)
 

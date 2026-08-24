@@ -2,16 +2,18 @@
 設計書 §5.1・§8.1-28・§8.1-29・§8.1-41)。"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_settings
-from agentic_fx.plugin import switch
+from agentic_fx.plugin import switch, version_store
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import db as db_store
+from agentic_fx.store import plugin_switch_journal as journal_store
 
 NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
 
@@ -116,6 +118,28 @@ def test_submit_gate_failure_creates_no_approval_row(env, monkeypatch):
 
 # --- P2: approve, live=absent ---
 
+def test_approve_expires_due_non_plugin_approvals_at_entry(env, monkeypatch):
+    """確定-16 (B-33 と対称、approve 側): `approve_candidate` の 0a
+    (`expire_due(commit=True)`) への entry test が無かった。"""
+    root, plugins_dir, conn, settings = env
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    approval_id = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+    stale_id = approvals_store.create(
+        conn, "tech_plugin", {"path": "x"}, NOW,
+        expires_at=NOW - timedelta(minutes=1))
+
+    switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW,
+                             plugins_root=plugins_dir, settings=settings)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (stale_id,)).fetchone()
+    assert row["status"] == "expired"
+
+
 def test_approve_live_absent_creates_version_git_and_switches(env, monkeypatch):
     root, plugins_dir, conn, settings = env
     _write_candidate(plugins_dir / "_staging" / "1" / "sma")
@@ -187,6 +211,25 @@ def test_bless_human_live_absent_single_tx_creates_pending_plus_journal(env, mon
     assert (plugins_dir / "_human" / "sma").is_dir()
 
 
+def test_bless_expires_due_non_plugin_approvals_at_entry(env, monkeypatch):
+    """確定-16 (B-33): `bless_candidate` の 0a (`expire_due(commit=True)`)
+    への entry test が無かった。期限到来済みの非 plugin kind pending 行が
+    bless 呼び出しの副作用として expired 化されることを直接確認する。"""
+    root, plugins_dir, conn, settings = env
+    _write_candidate(plugins_dir / "_human" / "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    stale_id = approvals_store.create(
+        conn, "tech_plugin", {"path": "x"}, NOW,
+        expires_at=NOW - timedelta(minutes=1))
+
+    switch.bless_candidate(conn, name="sma", human_dir=plugins_dir / "_human" / "sma",
+                           settings=settings, now=NOW, decided_by="human_cli")
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (stale_id,)).fetchone()
+    assert row["status"] == "expired"
+
+
 # --- P3: bless, live=plain ---
 
 def test_bless_human_live_plain_no_journal_stays_pending(env, monkeypatch):
@@ -204,6 +247,36 @@ def test_bless_human_live_plain_no_journal_stays_pending(env, monkeypatch):
     assert row["status"] == "pending"
     journal_rows = conn.execute("SELECT COUNT(*) c FROM plugin_switch_journal").fetchone()
     assert journal_rows["c"] == 0
+
+
+def test_bless_plain_creates_version_and_history_even_without_switch(env, monkeypatch):
+    """確定-15: `bless_candidate` の plain 分岐 (3-B) は switch/journal を
+    経ないが、版ディレクトリ + git 記録は作る (`test_bless_human_live_
+    plain_no_journal_stays_pending` は journal が無いことしか見ておらず、
+    版 + git の副作用が丸ごと消えても緑だった — approve_candidate の
+    対称な plain 分岐は `test_approve_live_plain_stays_pending_with_
+    legacy_reason` で pin されているのに bless 側だけ非対称だった)。"""
+    root, plugins_dir, conn, settings = env
+    _write_candidate(plugins_dir / "sma")  # legacy plain live
+    _write_candidate(plugins_dir / "_human" / "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+
+    approval_id = switch.bless_candidate(
+        conn, name="sma", human_dir=plugins_dir / "_human" / "sma",
+        settings=settings, now=NOW, decided_by="human_cli")
+
+    row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    import json as _json
+    artifact_hash = _json.loads(row["payload_json"])["artifact_hash"]
+    version_dir = plugins_dir / ".versions" / "sma" / artifact_hash
+    assert version_dir.is_dir()
+    assert (version_dir / "plugin.py").is_file()
+
+    log = subprocess.run(
+        ["git", "--git-dir", str(plugins_dir / ".history.git"), "log", "--oneline"],
+        capture_output=True, text=True, check=True)
+    assert "sma" in log.stdout
 
 
 def test_bless_absent_symlink_single_tx_rolls_back_atomically_on_journal_failure(
@@ -778,6 +851,71 @@ def test_reject_deletes_staging_candidate_immediately(env, monkeypatch):
     assert not (plugins_dir / "_staging" / "1" / "sma").exists()
 
 
+def test_reject_nonexistent_approval_id_raises_approval_not_found_error(env):
+    """E1 裁定 (2026-08-25): `reject_candidate` の `row is None` 分岐は
+    `ApprovalNotFoundError` (AlreadyDecidedError のサブクラス) を送出する
+    — 「決定済み」文言のまま「ID 不存在」を誤って報告しない。"""
+    root, plugins_dir, conn, settings = env
+    with pytest.raises(approvals_store.ApprovalNotFoundError):
+        switch.reject_candidate(conn, 999999, decided_by="human", reason="no",
+                                now=NOW, plugins_root=plugins_dir)
+
+
+def test_reject_payload_missing_name_stays_pending_with_activity_error(env):
+    """E4 裁定 (2026-08-25、確定-14): plugin payload に `name` が無い
+    (契約違反) approval は `reject` しても決定させず pending に留め置き、
+    activity ERROR を記録する。旧実装は flock を取らずに `apply_decision`
+    のみ直接通し、staging 候補の掃除もされないまま rejected へ確定させて
+    いた。"""
+    root, plugins_dir, conn, settings = env
+    activity = ActivityLog(root / "logs" / "activity.log")
+    aid = approvals_store.create(
+        conn, kind="plugin",
+        payload={"candidate_origin": "staging",
+                "candidate_path": "plugins/_staging/1/sma"},
+        now=NOW)
+
+    switch.reject_candidate(conn, aid, decided_by="human", reason="no",
+                            now=NOW, plugins_root=plugins_dir, activity=activity)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (aid,)).fetchone()
+    assert row["status"] == "pending"
+    log_text = (root / "logs" / "activity.log").read_text()
+    assert "reject_rejected_payload_missing_name" in log_text
+
+
+def test_drop_staging_candidate_contract_violation_writes_activity_error(env):
+    """E4 裁定 (確定-12): `_drop_staging_candidate` の `candidate_path` が
+    正規形違反 (ValueError) の場合、黙って進まず activity ERROR
+    (`staging_drop_skipped`) を残す。`CandidateMissingError` (候補が単に
+    存在しない正常系) との違いを pin する。"""
+    root, plugins_dir, conn, settings = env
+    activity = ActivityLog(root / "logs" / "activity.log")
+    payload = {"candidate_origin": "staging",
+              "candidate_path": "not-a-canonical-path", "name": "sma"}
+
+    switch._drop_staging_candidate(plugins_dir, payload, activity=activity)
+
+    log_text = (root / "logs" / "activity.log").read_text()
+    assert "staging_drop_skipped" in log_text
+
+
+def test_drop_staging_candidate_missing_candidate_is_silent(env):
+    """確定-12 の対称側: 候補が単に既に無い (`CandidateMissingError`) は
+    正常系であり activity 記録は書かれない (契約違反と混同しない)。"""
+    root, plugins_dir, conn, settings = env
+    activity = ActivityLog(root / "logs" / "activity.log")
+    payload = {"candidate_origin": "staging",
+              "candidate_path": "plugins/_staging/1/sma", "name": "sma"}
+
+    switch._drop_staging_candidate(plugins_dir, payload, activity=activity)
+
+    log_path = root / "logs" / "activity.log"
+    log_text = log_path.read_text() if log_path.exists() else ""
+    assert "staging_drop_skipped" not in log_text
+
+
 def test_invalidated_by_superseding_decision_deletes_staging_candidate(env, monkeypatch):
     """同名別 content_hash の後発 approved 決定により invalidated へ落ちる
     経路 (0c) でも、staging 候補が直後に削除されること。"""
@@ -948,3 +1086,226 @@ def test_switched_journal_reverify_reverts_when_version_tampered_and_candidate_m
 
     log_text = (root / "logs" / "activity.log").read_text()
     assert "switch_reverify_failed" in log_text
+
+
+# ============================================================
+# 束 E ローカルレビュー是正 (2026-08-25 裁定) — 確定-1/確定-2/確定-4/確定-5
+# ============================================================
+
+def test_stuck_preparing_journal_is_closed_when_candidate_no_longer_matches(env, monkeypatch):
+    """確定-1 (Critical): `approve_candidate` の pending 留置 2 経路が、
+    自分の未完ジャーナル (preparing/versioned/recorded) を `_revert_one` で
+    閉じてから return する。旧実装は journal に一切触れず、以後 name が
+    永久に `UnresolvedJournalError` で封鎖されていた
+    (verified-local-round1.md 確定-1)。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    candidate_dir = plugins_dir / "_staging" / "1" / "sma"
+    _write_candidate(candidate_dir)
+    approval_id = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    def _boom(*a, **kw):
+        raise OSError("simulated crash during create_version_dir")
+    monkeypatch.setattr(version_store, "create_version_dir", _boom)
+    with pytest.raises(OSError):
+        switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW,
+                                 plugins_root=plugins_dir, settings=settings)
+    monkeypatch.undo()
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+
+    j = journal_store.get_open_by_name(conn, "sma")
+    assert j is not None and j["phase"] == "preparing"
+
+    # 候補が改変された (人間の編集想定) — hash 不一致で pending 留置経路へ
+    (candidate_dir / "plugin.py").write_text(
+        "def compute(df, params):\n    return {'v': 2.0}\n")
+
+    switch.retry_approval(conn, approval_id, decided_by="human", now=NOW,
+                          plugins_root=plugins_dir, settings=settings)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending"
+    assert journal_store.get_open_by_name(conn, "sma") is None, (
+        "自分の未完ジャーナルが閉じられず name が永久封鎖された (確定-1 の欠陥)")
+
+
+def test_stuck_preparing_journal_is_closed_when_candidate_goes_missing(env, monkeypatch):
+    """確定-1 の CandidateMissingError 経路側 (switch.py:741-742) も同様に
+    自分の未完ジャーナルを閉じることを確認する。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    candidate_dir = plugins_dir / "_staging" / "1" / "sma"
+    _write_candidate(candidate_dir)
+    approval_id = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    def _boom(*a, **kw):
+        raise OSError("simulated crash during create_version_dir")
+    monkeypatch.setattr(version_store, "create_version_dir", _boom)
+    with pytest.raises(OSError):
+        switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW,
+                                 plugins_root=plugins_dir, settings=settings)
+    monkeypatch.undo()
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+
+    assert journal_store.get_open_by_name(conn, "sma")["phase"] == "preparing"
+
+    import shutil
+    shutil.rmtree(candidate_dir)  # 候補が外部から消えた想定
+
+    switch.retry_approval(conn, approval_id, decided_by="human", now=NOW,
+                          plugins_root=plugins_dir, settings=settings)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending"
+    assert journal_store.get_open_by_name(conn, "sma") is None
+
+
+def test_bless_raises_unresolved_journal_error_when_open_journal_exists(env, monkeypatch):
+    """確定-2: `bless_candidate` は `approve_candidate` と同様に未完
+    ジャーナルガードを持ち、`UnresolvedJournalError` を送出する (旧実装は
+    生の `sqlite3.IntegrityError` を漏らしていた)。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    # 別 approval (name="sma") の未完ジャーナルを preparing のまま残す
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="absent",
+        old_target=None, new_target=f".versions/sma/{'a' * 64}",
+        switch_required=True, actor="human", now=NOW, commit=True)
+    assert journal_store.get(conn, op_id)["phase"] == "preparing"
+
+    human_dir = plugins_dir / "_human" / "sma"
+    _write_candidate(human_dir)
+
+    with pytest.raises(switch.UnresolvedJournalError):
+        switch.bless_candidate(conn, name="sma", human_dir=human_dir,
+                               settings=settings, now=NOW, decided_by="human")
+
+
+def test_approve_rejects_when_only_artifact_hash_differs(env, monkeypatch):
+    """確定-4: ⓐ hash 照合の artifact_hash 側だけが不一致でも pending
+    留置になる (payload の artifact_hash を人為的に改変して検証)。"""
+    root, plugins_dir, conn, settings = env
+    aid, candidate_dir = _submit_helper(env, monkeypatch, name="sma")
+
+    row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
+                       (aid,)).fetchone()
+    import json as _json
+    payload = _json.loads(row["payload_json"])
+    payload["artifact_hash"] = "0" * 64  # 実際の候補ハッシュと不一致にする
+    conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?",
+                (_json.dumps(payload), aid))
+    conn.commit()
+
+    switch.approve_candidate(conn, aid, decided_by="human", now=NOW,
+                             plugins_root=plugins_dir, settings=settings)
+
+    status = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                          (aid,)).fetchone()["status"]
+    assert status == "pending"
+
+
+def test_approve_rejects_when_only_content_hash_differs(env, monkeypatch):
+    """確定-4: content_hash 側だけが不一致でも pending 留置になる。"""
+    root, plugins_dir, conn, settings = env
+    aid, candidate_dir = _submit_helper(env, monkeypatch, name="sma")
+
+    row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
+                       (aid,)).fetchone()
+    import json as _json
+    payload = _json.loads(row["payload_json"])
+    payload["content_hash"] = "0" * 64
+    conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?",
+                (_json.dumps(payload), aid))
+    conn.commit()
+
+    switch.approve_candidate(conn, aid, decided_by="human", now=NOW,
+                             plugins_root=plugins_dir, settings=settings)
+
+    status = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                          (aid,)).fetchone()["status"]
+    assert status == "pending"
+
+
+def _submit_helper(env, monkeypatch, name="sma", mission_id=1):
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    staging = plugins_dir / "_staging" / str(mission_id)
+    candidate_dir = staging / name
+    _write_candidate(candidate_dir)
+    aid = switch.submit_candidate(
+        conn, name=name, staging_dir=staging, candidate_origin="staging",
+        mission_id=mission_id, backlog_id=None, settings=settings, now=NOW)
+    return aid, candidate_dir
+
+
+def test_advance_to_decided_refuses_when_candidate_changes_during_full_gate(env, monkeypatch):
+    """確定-5: `_run_full_gate` の手順 6 再照合 (ゲート実行中の候補改変検出)
+    が生きていることを、ゲート実行の途中で候補を書き換える fake を使って
+    確認する。"""
+    root, plugins_dir, conn, settings = env
+    staging = plugins_dir / "_staging" / "1"
+    candidate_dir = staging / "sma"
+    _write_candidate(candidate_dir)
+
+    def _tamper_during_gate(plugin_dir, *, settings):
+        (plugin_dir / "plugin.py").write_text(
+            "def compute(df, params):\n    return {'v': 999.0}\n")
+        from agentic_fx.plugin.gate_pytest import GateResult
+        return GateResult(passed=True, returncode=0, stdout_tail="1 passed",
+                          duration_sec=0.1)
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _tamper_during_gate)
+
+    with pytest.raises(ValueError, match="content changed during gate"):
+        switch.submit_candidate(
+            conn, name="sma", staging_dir=staging, candidate_origin="staging",
+            mission_id=1, backlog_id=None, settings=settings, now=NOW)
+
+    assert approvals_store.pending(conn, kind="plugin") == []
+
+
+def test_advance_to_decided_detects_in_place_tamper_of_artifact_hash_only(env, monkeypatch):
+    """確定-7: `_advance_to_decided` の切替後再照合 (手順 8a) は
+    content_hash だけでなく artifact_hash とディレクトリ名も照合する
+    (`_reverify_switched_journal._new_target_hash_ok` と実装共有 —
+    `_version_dir_hashes_ok`)。版ディレクトリの test_plugin.py だけを
+    record_version 直後 (切替前) に改竄すると content_hash
+    (plugin.py+config.yaml のみ) は変わらないが artifact_hash は変わる
+    — 旧実装 (content_hash のみ照合) はこれを見逃して approved へ進んで
+    しまっていた。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma")
+    aid = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    from agentic_fx.plugin import history_git as history_git_mod
+    real_record_version = history_git_mod.record_version
+
+    def _record_then_tamper(*a, **kw):
+        result = real_record_version(*a, **kw)
+        version_dir = kw["version_dir"]
+        version_dir.chmod(0o700)
+        (version_dir / "test_plugin.py").chmod(0o600)
+        (version_dir / "test_plugin.py").write_text("import os\n# TAMPERED\n")
+        version_dir.chmod(0o500)
+        return result
+    monkeypatch.setattr("agentic_fx.plugin.switch.history_git.record_version",
+                        _record_then_tamper)
+
+    with pytest.raises(RuntimeError, match="content_hash mismatch"):
+        switch.approve_candidate(conn, aid, decided_by="human", now=NOW,
+                                 plugins_root=plugins_dir, settings=settings)
+
+    status = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                          (aid,)).fetchone()["status"]
+    assert status == "pending"

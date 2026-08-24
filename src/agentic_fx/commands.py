@@ -11,7 +11,7 @@ from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.store import (approvals, backlog, missions, orders,
                               reflection_attempts, reflections)
-from agentic_fx.store.approvals import AlreadyDecidedError
+from agentic_fx.store.approvals import AlreadyDecidedError, ApprovalNotFoundError
 from agentic_fx.store.state import StateStore
 
 _HELP = """コマンド一覧:
@@ -125,7 +125,7 @@ class Commands:
                     plugin_switch.reject_candidate(
                         self.conn, approval_id, decided_by="shell",
                         reason=reason or "", now=self.clock.now(),
-                        plugins_root=self.plugins_root)
+                        plugins_root=self.plugins_root, activity=self.activity)
                 else:
                     approvals.apply_decision(
                         self.conn, approval_id, "rejected", decided_by="shell",
@@ -248,6 +248,16 @@ class Commands:
                 self.activity.write(Category.SYSTEM, "policy_added",
                                     text[:200])
                 return "policy に追記しました"
+        except ApprovalNotFoundError:
+            # E1 裁定 (2026-08-25): 「ID 不存在」は「CAS 失敗 (決定済み)」と
+            # 文言を分ける。既存の `test_approve_nonexistent` が pin して
+            # いた「決定済み」という文言は、E1 是正前の apply_decision が
+            # 両ケースを同一例外に混同していた頃の副産物であり、そのまま
+            # 残すと「存在しない approval を決定済み扱いにした」という
+            # E1 が正そうとしている混同そのものを再生産してしまう。
+            # 確定-8 と同じ「欠陥の是正」として既存テストのアサーションも
+            # 書き換える (最終報告の逸脱に明記)。
+            return f"approval #{approval_id} は存在しません"
         except AlreadyDecidedError:
             return "その approval は決定済みです"
         except (ValueError, KeyError) as e:

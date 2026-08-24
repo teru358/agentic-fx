@@ -210,3 +210,26 @@ def test_discover_rejects_symlink_with_valid_hash_name_pointing_outside_versions
         Path("..") / "plugins" / "elsewhere" / real_hash, target_is_directory=True)
     metas = discover(plugins_dir)
     assert metas == []
+
+
+def test_discover_rejects_symlink_when_versions_name_dir_is_itself_a_symlink_escaping_plugins_root(
+        tmp_path):
+    """E3 裁定 (2026-08-25、A16 + B-20): 字句正規形検査を通っても、
+    `.versions/<name>` **自体**が symlink で実体が `plugins/` 外に出る形は
+    拒否する (containment 検査)。`plugins/ind` → `.versions/ind/<hash>`
+    という文字列は正規形どおりだが、`.versions/ind` そのものを
+    `plugins/` 外の外部ディレクトリへの symlink にすり替えると、
+    字句検証だけでは検出できない (`resolve()` した実体が plugins_root の
+    外に出る)。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    real_hash = _artifact_hash(INDICATOR_PY, CONFIG_YAML, TEST_PY)
+    outside_root = tmp_path / "outside_versions"
+    _write_plugin_files(outside_root / "ind" / real_hash)
+    (plugins_dir / ".versions").mkdir()
+    (plugins_dir / ".versions" / "ind").symlink_to(
+        outside_root / "ind", target_is_directory=True)
+    (plugins_dir / "ind").symlink_to(
+        Path(".versions") / "ind" / real_hash, target_is_directory=True)
+    metas = discover(plugins_dir)
+    assert metas == []
