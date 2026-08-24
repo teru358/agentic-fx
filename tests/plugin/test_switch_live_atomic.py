@@ -164,3 +164,30 @@ def test_revert_one_symlink_restore_is_a_single_atomic_rename_with_no_live_unlin
     assert str(live) not in unlink_calls, (
         "live パス自身への unlink が発生した — 「live が無い瞬間」が生じる "
         "非 atomic な復元 (段 0 M10)")
+
+
+def test_switch_live_replaces_stale_dangling_temp_symlink(tmp_path):
+    """確定-9: temp 後始末ガード (`temp.exists() or temp.is_symlink()`) は
+    dangling symlink (`symlink_to` 直後・rename 直前のクラッシュで残った
+    temp) を検出して消してから作り直す必要がある。`temp.exists()` だけ
+    (`or temp.is_symlink()` が無い) だと dangling symlink には False を
+    返すため、`temp.symlink_to(target)` が `FileExistsError` で恒久失敗
+    する (verified-local-round1.md 確定-9)。"""
+    plugins_root = tmp_path / "plugins"
+    plugins_root.mkdir()
+    name = "sma"
+    new_hash = "d" * 64
+    (plugins_root / ".versions" / name / new_hash).mkdir(parents=True)
+
+    # 前回のクラッシュで残った dangling temp symlink (symlink_to 直後・
+    # rename 直前で落ちた想定 — リンク先が存在しない)。
+    temp_path = plugins_root / f".{name}.link-9"
+    temp_path.symlink_to(".versions/sma/" + "0" * 64)  # 存在しない target
+    assert temp_path.is_symlink() and not temp_path.exists()
+
+    new_target = f".versions/{name}/{new_hash}"
+    switch.switch_live(plugins_root, name, new_target=new_target, op_id=9)
+
+    live = plugins_root / name
+    assert live.is_symlink()
+    assert live.readlink().as_posix() == new_target
