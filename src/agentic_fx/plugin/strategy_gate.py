@@ -34,8 +34,9 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
 
 
 def evaluate_strategy_adoption_gate(
-    conn, *, name: str, pairs: list[str], timeframe: str, content_hash: str,
-    now: datetime, settings: "Settings", meta: "PluginMeta | None",
+    conn, *, meta: "PluginMeta | None", now: datetime, settings: "Settings",
+    name: str | None = None, pairs: "list[str] | None" = None,
+    timeframe: str | None = None, content_hash: str | None = None,
     kind: str = "strategy",
     history_conn=None,
     run_in_sample_fn=None, run_holdout_gate_fn=None,
@@ -78,6 +79,17 @@ def evaluate_strategy_adoption_gate(
     呼ぶ経路はこちらを使う)。"""
     if kind != "strategy":
         return None
+    # R-i3 追随 (プラン10 Task 11): `plugin/approval.py::run_kind_gate` は
+    # 検証済みの `meta` (PluginMeta) だけを持って呼ぶ (switch.py の候補は
+    # 直前に discover した鮮度の高い meta なので name/pairs/timeframe/
+    # content_hash は meta 由来で正しい — 10.6 節の「明示引数が正」の懸念は
+    # ImproveLoop.commit のように meta が使い回されて古くなり得る経路の話
+    # であり、switch.py の一発ゲートには当てはまらない)。明示引数が渡され
+    # ればそちらを常に優先する (10.6 節の契約は維持)。
+    name = meta.name if name is None else name
+    pairs = list(meta.pairs) if pairs is None else pairs
+    timeframe = meta.timeframe if timeframe is None else timeframe
+    content_hash = meta.content_hash if content_hash is None else content_hash
     history_conn = conn if history_conn is None else history_conn
     run_in_sample = run_in_sample_fn or holdout.run_in_sample
     run_holdout = run_holdout_gate_fn or holdout.run_holdout_gate

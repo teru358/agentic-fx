@@ -60,7 +60,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from agentic_fx.backtest import holdout
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
-from agentic_fx.plugin import strategy_adapter
+from agentic_fx.plugin import strategy_adapter, strategy_gate
 from agentic_fx.plugin.gate_pytest import GateResult, run_gate_pytest
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.loader import content_hash as _recompute_content_hash
@@ -157,18 +157,45 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
                   sandbox_run: SandboxRunFn | None = None,
                   run_in_sample_fn: RunInSampleFn | None = None,
                   ) -> tuple[dict, bool]:
-    """`_validate_kind` の public 名称 (11d §8.1-41 是正: `switch.py` の
-    `submit_candidate`/`bless_candidate` から共有呼び出しできるよう rename/
-    export するだけで、検証ロジックは一切変えない — 二重実装しない)。
+    """`switch.py` の `submit_candidate`/`bless_candidate` (`_run_full_gate`
+    手順 7) から共有呼び出しされる kind 別検証の入口。indicator/signal は
+    `_validate_kind` (= `submit_plugin` の旧 kind="plugin" 直接申請 API と
+    共有する検証ロジック) にそのまま委譲する — その経路は不変。
 
-    R-i3 (統合裁定) は kind=strategy のとき `plugin/strategy_gate.py::
-    evaluate_strategy_adoption_gate` 経由での評価を求めるが、当該モジュール
-    は プラン10 Task 10 の産物でありこの worktree にはまだ存在しない
-    (この Step の指示どおり `_validate_kind` を改変せず rename/export に
-    留めているため、strategy kind は従来どおり `_validate_strategy` →
-    `holdout.run_in_sample` の直接呼び出しのまま — Task 10 実装後の
-    追随課題として残る。11d 最終報告の「逸脱」に明記する)。
+    kind=strategy だけは R-i3 (統合裁定) どおり `plugin/strategy_gate.py::
+    evaluate_strategy_adoption_gate` を**唯一の実装**として import 共有する
+    (`_validate_kind`/`_validate_strategy` の `holdout.run_in_sample` 直呼び
+    経路は使わない — `_validate_strategy` 自体は `submit_plugin`
+    (`backtest/cli.py` の `afx plugin submit` が使う旧 kind="plugin" API、
+    switch.py の候補フローとは別corridor) からまだ直接使われているため削除
+    しない。二重実装ではなく、2 つの独立した corridor がそれぞれ自分の
+    ゲート実装を持っている — switch.py 側は本関数経由で必ず
+    `evaluate_strategy_adoption_gate` を通る、というのがここでの pin)。
+
+    `evaluate_strategy_adoption_gate` へは検証済みの `meta` だけを渡す —
+    name/pairs/timeframe/content_hash は明示せず `meta` 由来のデフォルトに
+    委ねる (switch.py 側は `_run_full_gate` が直前に discover した鮮度の
+    高い meta を渡すため、10.6 節が懸念する staleness は生じない)。
+    `evaluable=False` (閾値未満) は §8.1-41 pin どおり approval 行を一切
+    作らせないため、ここで fail closed に ValueError へ倒す (verdict が
+    そのまま `ValueError` を送出する場合 — 例えば history 不足 — はそれを
+    そのまま伝播させる、二重に包まない)。`run_in_sample_fn` seam は
+    switch.py 側にまだ注入経路が無い (既存テストは `submit_plugin`/
+    `_validate_kind` 経由の corridor でしか使っていない — `grep -rn
+    run_in_sample_fn tests/` で確認済み) ため、`evaluate_strategy_adoption_
+    gate` の `run_in_sample_fn` 引数へは転送しない (シグネチャの
+    `run_in_sample_fn` 仮引数は `_validate_kind` 経由の indicator/signal/
+    非-strategy 呼び出しとの互換のためだけに残す)。
     """
+    if meta.kind == "strategy":
+        verdict = strategy_gate.evaluate_strategy_adoption_gate(
+            conn, meta=meta, settings=settings, now=now)
+        if verdict is None or not verdict.evaluable:
+            reason = verdict.observation_reason if verdict is not None else ""
+            raise ValueError(
+                f"plugin {meta.name!r}: strategy not evaluable "
+                f"({reason})")
+        return (verdict.candidate_metrics or {}), verdict.evaluable
     return _validate_kind(conn, meta, settings=settings, now=now,
                           sandbox_run=sandbox_run, run_in_sample_fn=run_in_sample_fn)
 
