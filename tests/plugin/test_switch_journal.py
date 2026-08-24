@@ -209,6 +209,44 @@ def test_reconcile_one_row_failure_does_not_block_other_rows(tmp_path, conn, mon
     assert "sma" in log_text
 
 
+def test_switched_recovery_absent_old_kind_with_no_live_reverts(tmp_path, conn):
+    """確定-13: reconcile の「old_kind=absent かつ live 不在」復帰分岐
+    (`row["old_kind"] == "absent" and live_target is None`) が未 pin
+    だった (findings.json #234)。既存の switched 収束テスト 3 本はいずれも
+    live symlink が存在する状態しか作らない。この分岐が無いと「absent から
+    切替中に落ち、live がまだ作られていない」行が else (第三者改変扱い) に
+    落ちて非終端のまま残り、確定-1 の閉塞に合流する。"""
+    root = _plugins_root(tmp_path)
+    new_rel = f".versions/sma/{'a' * 64}"
+    # old_kind="absent" の通常呼び出し元 (approve_candidate) は必ず
+    # old_target=None を渡すため、`live_target == old_norm` (disjunct 1)
+    # だけで `None == None` が成立し disjunct 2 は実質到達不能になって
+    # しまう (実測で確認済み — mutation b34_drop_absent_disjunct はこの
+    # シナリオでは無効変異になる)。disjunct 2 が実際にコード上に存在する
+    # 意味を確かめるため、ここでは begin_switch_journal を直接呼び
+    # old_target に非 None 値を持つ absent 行を作る (§5.1 の型ヒントは
+    # old_kind=absent なら old_target=None を期待するが、journal_store 層
+    # は DB カラムとして両者を独立に受け付ける — 分岐そのものを exercise する)。
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="absent",
+        old_target="bogus-stale-old-target", new_target=new_rel,
+        switch_required=True, actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
+    # live symlink をまだ作っていない (switched マーク直後・切替直前で
+    # クラッシュした想定) — force_revert_op_id は使わず通常の起動時
+    # reconcile 経路を通す。
+    assert not (root / "sma").exists()
+
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS)
+
+    row = conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE op_id=?", (op_id,)).fetchone()
+    assert row["phase"] == "reverted", (
+        "old_kind=absent かつ live 不在の switched 行が収束せず非終端のまま "
+        "残った (確定-13 の欠陥)")
+    assert not (root / "sma").exists()
+
+
 # --- 段 0 独立発見 (1): `_PHASE_ORDER` の実行時強制 ---
 
 def test_advance_switch_journal_raises_on_backward_phase_move(conn):
