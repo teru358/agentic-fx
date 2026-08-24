@@ -310,6 +310,17 @@ def test_list_due_for_expiry_kind_none_returns_all_kinds(tmp_path):
     assert {r["kind"] for r in rows} == {"plugin", "tech_plugin"}
 
 
+def test_list_due_for_expiry_excludes_exact_boundary_not_yet_due(tmp_path):
+    """確定-16 (A10): `list_due_for_expiry` の下側境界 (`expires_at < now`)
+    が未 pin だった。`expires_at == now` (ちょうど境界) はまだ期限到来して
+    いない (厳密未満) — `a10_list_due_le` (`<` → `<=`) はこの境界行を
+    誤って含めてしまう。"""
+    c = _conn(tmp_path)
+    approvals.create(c, "plugin", {"name": "x"}, NOW, expires_at=NOW)
+    rows = approvals.list_due_for_expiry(c, now=NOW, kind="plugin")
+    assert rows == []
+
+
 # precheck 2026-08-22: T8-B11 (R9)
 def test_apply_decision_approve_on_expired_pending_is_rejected(tmp_path):
     """R9: 既存 decide の expires_at 述語を維持する (fail closed)。期限切れ

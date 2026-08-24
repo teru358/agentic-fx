@@ -155,6 +155,32 @@ def test_switched_recovery_neither_target_is_error_and_untouched(tmp_path, conn,
     assert Path(root / "sma").readlink().as_posix() == third_party
 
 
+def test_switched_recovery_neither_target_writes_unrecognized_live_target_activity(
+        tmp_path, conn):
+    """確定-16 (B-16): else 分岐 (第三者に触られた) の activity 記録は
+    `test_switched_recovery_neither_target_is_error_and_untouched` が
+    phase の未変化だけを見ており、activity へ渡す文字列そのものは
+    pin していなかった (`b16_src_drop_else_activity` が文字列だけを
+    差し替えても SURVIVED)。"""
+    from agentic_fx.activity import ActivityLog
+
+    root = _plugins_root(tmp_path)
+    third_party = f".versions/sma/{'z' * 64}"
+    (root / "sma").symlink_to(third_party)
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="sma", old_kind="absent",
+        old_target=None, new_target=f".versions/sma/{'n' * 64}",
+        switch_required=True, actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id, phase="switched", now=NOW, commit=True)
+
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS,
+                                     activity=activity)
+
+    log_text = (tmp_path / "logs" / "activity.log").read_text()
+    assert "switch_reconcile_unrecognized_live_target" in log_text
+
+
 def test_reconcile_one_row_failure_does_not_block_other_rows(tmp_path, conn, monkeypatch):
     """検収 m10 の pin: `reconcile_switch_journals` は per-row try/except を
     持たなければならない — §5.1-1 の収束規則は「行ごとの規則」であり、1 行
