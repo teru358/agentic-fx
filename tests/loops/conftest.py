@@ -138,7 +138,17 @@ def loop_and_ctx_with_open_backlog(loop_min, conn, tmp_path, clock):
 @pytest.fixture
 def mission_and_run_fixture(conn, clock):
     """`missions`+`improvement_backlog`+`improvement_runs` の最小行を作り
-    `(mission_id, run_id, backlog_id)` を返す (slot 無し = 手動 one-shot 相当)。"""
+    `(mission_id, run_id, backlog_id)` を返す (slot 無し = 手動 one-shot 相当)。
+
+    D-10 是正 (M7 pin 案、検収 3-b): 素朴に 1 件ずつ作ると
+    `mission_id == run_id == 1` に縮退し、`reconcile_report_outbox` の
+    part path キーが `row['mission_id']` か `row['id']` (run id) かを
+    区別できなくなる (10.9 M7 が SURVIVED した根本原因)。捨て mission を
+    1 件先に `missions` へ挿入して mission_id をずらす —
+    `improvement_runs` は別テーブルの自動採番なので run_id には影響しない
+    (`mission_id=2, run_id=1` になる)。"""
+    _ = missions_store.start(
+        conn, "improve", "codex", "gpt-5", clock.now(), commit=False)
     mission_id = missions_store.start(
         conn, "improve", "codex", "gpt-5", clock.now(), commit=False)
     backlog_id = backlog_store.add(conn, "idea", "user", clock.now())
