@@ -2,6 +2,7 @@
 設計書 §5.1・§8.1-28・§8.1-29・§8.1-41)。"""
 from __future__ import annotations
 
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -205,6 +206,36 @@ def test_bless_human_live_plain_no_journal_stays_pending(env, monkeypatch):
     assert row["status"] == "pending"
     journal_rows = conn.execute("SELECT COUNT(*) c FROM plugin_switch_journal").fetchone()
     assert journal_rows["c"] == 0
+
+
+def test_bless_plain_creates_version_and_history_even_without_switch(env, monkeypatch):
+    """確定-15: `bless_candidate` の plain 分岐 (3-B) は switch/journal を
+    経ないが、版ディレクトリ + git 記録は作る (`test_bless_human_live_
+    plain_no_journal_stays_pending` は journal が無いことしか見ておらず、
+    版 + git の副作用が丸ごと消えても緑だった — approve_candidate の
+    対称な plain 分岐は `test_approve_live_plain_stays_pending_with_
+    legacy_reason` で pin されているのに bless 側だけ非対称だった)。"""
+    root, plugins_dir, conn, settings = env
+    _write_candidate(plugins_dir / "sma")  # legacy plain live
+    _write_candidate(plugins_dir / "_human" / "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+
+    approval_id = switch.bless_candidate(
+        conn, name="sma", human_dir=plugins_dir / "_human" / "sma",
+        settings=settings, now=NOW, decided_by="human_cli")
+
+    row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    import json as _json
+    artifact_hash = _json.loads(row["payload_json"])["artifact_hash"]
+    version_dir = plugins_dir / ".versions" / "sma" / artifact_hash
+    assert version_dir.is_dir()
+    assert (version_dir / "plugin.py").is_file()
+
+    log = subprocess.run(
+        ["git", "--git-dir", str(plugins_dir / ".history.git"), "log", "--oneline"],
+        capture_output=True, text=True, check=True)
+    assert "sma" in log.stdout
 
 
 def test_bless_absent_symlink_single_tx_rolls_back_atomically_on_journal_failure(
