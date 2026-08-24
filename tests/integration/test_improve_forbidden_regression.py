@@ -69,16 +69,28 @@ def _rw7_assert_no_forbidden_keys(value, path="$"):
             _rw7_assert_no_forbidden_keys(v, f"{path}[{i}]")
 
 
-def _rw7_build_improve_loop(tmp_path, conn):
+def _rw7_build_improve_loop(tmp_path, conn, *, db_path=None):
     from agentic_fx.loops.improve_loop import ImproveLoop
+    from agentic_fx.store.db import connect_readonly
 
     class _FakeRag:
         pass
 
+    # <!-- precheck 2026-08-24 D-10 是正 (D-3): 未申告かつ有害な改変の復旧 -->
+    # readonly factory が write と同じ `conn` オブジェクトを返すと、
+    # `_build_rpc_handlers.run_backtest_handler` の `finally: conn.close()`
+    # が共有 conn を閉じてしまい、後続の `analyze_corr_handler` が
+    # 閉じた接続を掴んで無条件に例外へ落ちる (検収 D-3 が実測した
+    # `sqlite3.ProgrammingError: Cannot operate on a closed database`)。
+    # 本番 (`service.py:955-960`) は呼び出しごとに新規接続を返すため、
+    # ここでも同じ形にする — フィクスチャ由来の欠陥であり production
+    # コードは変更しない。
+    if db_path is None:
+        db_path = tmp_path / "t.db"
     return ImproveLoop(
         root=tmp_path, settings=_RW7_SETTINGS, clock=FixedClock(_RW7_NOW),
         db_write_conn_factory=lambda: conn,
-        db_readonly_conn_factory=lambda: conn,
+        db_readonly_conn_factory=lambda: connect_readonly(db_path),
         activity=ActivityLog(tmp_path / "activity.log"), rag=_FakeRag())
 
 
@@ -246,6 +258,13 @@ def test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly(
     staging_dir = tmp_path / "staging"
     (staging_dir / "myst").mkdir(parents=True)
 
+    # <!-- precheck 2026-08-24 D-10 是正 (D-3): プラン L19112-19136 逐語の
+    # 前後行数 assert を復元 (未申告で削除されていた — 検収 D-3)。 -->
+    before_bt = conn.execute(
+        "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
+    before_an = conn.execute(
+        "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
+
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
         "run_backtest": 600.0, "analyze_corr": 60.0})
     handlers = loop._build_rpc_handlers(ledger, staging_dir=staging_dir)
@@ -261,6 +280,27 @@ def test_rpc_tools_return_no_period_endpoints_and_do_not_write_db_directly(
     an_out = tools["analyze_corr"].func(
         request={"kind": "corr_matrix", "timeframe": "1h"})
     _rw7_assert_no_forbidden_keys(an_out)
+
+    # <!-- precheck 2026-08-24 是正 (D-3): analyze_corr_handler が実際に
+    # 実行されたことの検査。検収 D-3 が指摘したとおり、
+    # `analyze_corr_handler` は例外を握って `{"error": "analyze_failed"}`
+    # を返すため、これだけだと readonly conn が閉じていて処理が一切
+    # 走らなくても `_rw7_assert_no_forbidden_keys` は自明に通ってしまう
+    # (禁止キー無しの dict に禁止キーが無いのは当然)。ここで
+    # `analyze_failed` (= handler 内で例外を握り潰した印) ではないこと
+    # を明示的に検査し、遮断⑦の analyze_corr 側が偽 green にならない
+    # ようにする。空 DB での正当な `insufficient_data` は許容する
+    # (handler 自体は最後まで実行されている)。 -->
+    assert an_out.get("error") != "analyze_failed", (
+        f"analyze_corr_handler が例外を握り潰した (readonly conn が閉じて"
+        f"いる等) 可能性: {an_out!r}")
+
+    after_bt = conn.execute(
+        "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
+    after_an = conn.execute(
+        "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
+    assert after_bt == before_bt
+    assert after_an == before_an
 
 
 def test_holdout_and_analysis_ids_never_come_from_agent_output(tmp_path):
