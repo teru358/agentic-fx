@@ -168,10 +168,33 @@ def test_apply_decision_non_pending_cas_rowcount_zero_raises_with_zero_side_effe
 
 def test_apply_decision_unknown_id_raises_already_decided(tmp_path):
     """L36: `rowcount == 0` は「既に決定済み」と「ID 不存在」を区別しない
-    — 存在しない approval_id への `apply_decision` を直接確認する。"""
+    — 存在しない approval_id への `apply_decision` を直接確認する。
+    E1 裁定後は `ApprovalNotFoundError` (AlreadyDecidedError のサブクラス)
+    が上がるため、既存の broad catch は変更なしで通る。"""
     c = _conn(tmp_path)
     with pytest.raises(AlreadyDecidedError):
         approvals.apply_decision(c, 999999, "approved", decided_by="shell", now=NOW)
+
+
+def test_apply_decision_unknown_id_raises_approval_not_found_error(tmp_path):
+    """E1 裁定 (2026-08-25): 「ID 不存在」と「CAS 失敗 (決定済み/期限切れ)」
+    を別例外に分ける。`ApprovalNotFoundError` は `AlreadyDecidedError` の
+    サブクラス (既存の broad catch との後方互換)。"""
+    c = _conn(tmp_path)
+    with pytest.raises(approvals.ApprovalNotFoundError):
+        approvals.apply_decision(c, 999999, "approved", decided_by="shell", now=NOW)
+
+
+def test_apply_decision_already_decided_is_not_approval_not_found_error(tmp_path):
+    """E1 裁定: CAS 失敗 (存在するが pending でない) は `ApprovalNotFoundError`
+    ではない — 2 つの例外を取り違えていないことを pin する。"""
+    c = _conn(tmp_path)
+    aid = approvals.create(c, "news_source", {"url": "https://x"}, NOW)
+    approvals.apply_decision(c, aid, "rejected", decided_by="shell", now=NOW,
+                             reason="低品質")
+    with pytest.raises(AlreadyDecidedError) as exc_info:
+        approvals.apply_decision(c, aid, "approved", decided_by="shell", now=NOW)
+    assert not isinstance(exc_info.value, approvals.ApprovalNotFoundError)
 
 
 def test_set_reason_on_terminal_row_is_noop(tmp_path):

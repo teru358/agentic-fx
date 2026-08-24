@@ -11,7 +11,7 @@ from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.store import (approvals, backlog, missions, orders,
                               reflection_attempts, reflections)
-from agentic_fx.store.approvals import AlreadyDecidedError
+from agentic_fx.store.approvals import AlreadyDecidedError, ApprovalNotFoundError
 from agentic_fx.store.state import StateStore
 
 _HELP = """コマンド一覧:
@@ -248,6 +248,13 @@ class Commands:
                 self.activity.write(Category.SYSTEM, "policy_added",
                                     text[:200])
                 return "policy に追記しました"
+        except ApprovalNotFoundError:
+            # E1 裁定 (2026-08-25): 「ID 不存在」は「CAS 失敗 (決定済み)」と
+            # 文言を分ける。既存の `test_approve_nonexistent` は「決定済み」
+            # という語が出力に含まれることを pin しているため (既存テスト
+            # 書き換え禁止)、より具体的な文言に「決定済み」を包含させる
+            # 形で両立させる (逸脱として最終報告に明記)。
+            return "その approval は存在しません（決定済み扱いとして拒否）"
         except AlreadyDecidedError:
             return "その approval は決定済みです"
         except (ValueError, KeyError) as e:

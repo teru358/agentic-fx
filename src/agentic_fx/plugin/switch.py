@@ -63,6 +63,11 @@ def advance_switch_journal(
     now: datetime, commit: bool = False,
 ) -> None:
     row = journal_store.get(conn, op_id)
+    if row is None:
+        # E2 裁定 (2026-08-25): 全呼び出し元は同一 tx 内で存在確認済みの
+        # op_id を渡すため通常到達しないが、`row["phase"]` の不透明な
+        # TypeError より明示的な fail closed を選ぶ。
+        raise ValueError(f"op_id={op_id} not found")
     # 段 0 独立発見 (1) 是正: `_PHASE_ORDER` は定義行以外に参照が無い死に
     # コードだった。ここで単調性を実行時に強制する — 既に到達済みの phase
     # より前 (または同じ) へ `advance` しようとすると ValueError (fail
@@ -892,8 +897,11 @@ def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
     row = conn.execute(
         "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
     if row is None:
-        raise approvals_store.AlreadyDecidedError(
-            f"approval {approval_id} is not pending")
+        # E1 裁定 (2026-08-25): 「ID 不存在」は「CAS 失敗 (決定済み)」と
+        # 別例外にする — `ApprovalNotFoundError` は `AlreadyDecidedError`
+        # のサブクラスなので既存の broad catch との後方互換を保つ。
+        raise approvals_store.ApprovalNotFoundError(
+            f"approval {approval_id} not found")
     payload = json.loads(row["payload_json"])
     name = payload.get("name")
     if name is None:

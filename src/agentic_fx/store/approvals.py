@@ -7,6 +7,15 @@ from datetime import datetime
 
 
 class AlreadyDecidedError(Exception):
+    """CAS 失敗 (approval は存在するが既に決定済み/期限切れ) の基底例外。"""
+    pass
+
+
+class ApprovalNotFoundError(AlreadyDecidedError):
+    """E1 裁定 (2026-08-25): approval_id がそもそも存在しない場合の細分化した
+    例外。`AlreadyDecidedError` のサブクラスにすることで、既存の broad
+    `except AlreadyDecidedError` (commands.py 等) を変更せずに後方互換を
+    保つ。"""
     pass
 
 
@@ -69,6 +78,11 @@ def apply_decision(
     if cur.rowcount == 0:
         # m3: 副作用ゼロを謳うため commit せずに raise する (呼び出し元の
         # 同一 tx で先に書いた行を巻き込んで確定させない)。
+        # E1 裁定: 「ID 不存在」と「CAS 失敗 (決定済み/期限切れ)」を区別する。
+        exists = conn.execute(
+            "SELECT 1 FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
+        if exists is None:
+            raise ApprovalNotFoundError(f"approval {approval_id} not found")
         raise AlreadyDecidedError(f"approval {approval_id} is not pending")
     row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
                        (approval_id,)).fetchone()

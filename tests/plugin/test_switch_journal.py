@@ -231,6 +231,14 @@ def test_advance_switch_journal_raises_on_backward_phase_move(conn):
     assert row["phase"] == "recorded"
 
 
+def test_advance_switch_journal_raises_value_error_on_unknown_op_id(conn):
+    """E2 裁定 (2026-08-25): 存在しない op_id への `advance_switch_journal`
+    は `row["phase"]` の `TypeError`(不透明) ではなく明示的な
+    `ValueError(f"op_id={op_id} not found")` を送出する。"""
+    with pytest.raises(ValueError, match=r"op_id=999999 not found"):
+        switch.advance_switch_journal(conn, 999999, phase="versioned", now=NOW, commit=True)
+
+
 # --- 表 3: switch_required=0 は switched を経ない ---
 
 def test_switch_required_false_skips_switched_phase(conn):

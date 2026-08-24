@@ -778,6 +778,16 @@ def test_reject_deletes_staging_candidate_immediately(env, monkeypatch):
     assert not (plugins_dir / "_staging" / "1" / "sma").exists()
 
 
+def test_reject_nonexistent_approval_id_raises_approval_not_found_error(env):
+    """E1 裁定 (2026-08-25): `reject_candidate` の `row is None` 分岐は
+    `ApprovalNotFoundError` (AlreadyDecidedError のサブクラス) を送出する
+    — 「決定済み」文言のまま「ID 不存在」を誤って報告しない。"""
+    root, plugins_dir, conn, settings = env
+    with pytest.raises(approvals_store.ApprovalNotFoundError):
+        switch.reject_candidate(conn, 999999, decided_by="human", reason="no",
+                                now=NOW, plugins_root=plugins_dir)
+
+
 def test_invalidated_by_superseding_decision_deletes_staging_candidate(env, monkeypatch):
     """同名別 content_hash の後発 approved 決定により invalidated へ落ちる
     経路 (0c) でも、staging 候補が直後に削除されること。"""
