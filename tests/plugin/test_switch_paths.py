@@ -701,3 +701,94 @@ def test_switched_journal_reverify_fails_closed_when_version_and_candidate_missi
     log_text = (root / "logs" / "activity.log").read_text()
     assert "switch_reverify_failed" in log_text
     assert Category.APPROVAL.value in log_text
+
+
+# --- codex 1 周目是正 I3: switched 再開時の版再検証が artifact_hash を見ない ---
+#
+# `_new_target_hash_ok` は content_hash (2 本) しか見ておらず、
+# test_plugin.py だけが版ディレクトリ内で改変されても「健全」と誤判定
+# する (verified-codex-round1.md I3)。候補が健全なら候補から再構築して
+# approved に進めるべきで、候補も欠損していれば reverted + pending に
+# 落ちるべき。
+
+
+def test_switched_journal_reverify_rejects_version_dir_with_tampered_test_plugin(
+        env, monkeypatch):
+    """版ディレクトリの test_plugin.py だけが改変されていても
+    (plugin.py / config.yaml は不変 = content_hash は一致する)、
+    artifact_hash 不一致 + ディレクトリ名不一致を検出し、候補が健全なので
+    候補から版を再構築したうえで approved に進むこと。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    approval_id, artifact_hash = _simulate_crash_after_switch_before_decide(
+        root, plugins_dir, conn, settings, monkeypatch)
+
+    version_dir = plugins_dir / ".versions" / "sma" / artifact_hash
+    version_dir.chmod(0o700)
+    (version_dir / "test_plugin.py").chmod(0o600)
+    (version_dir / "test_plugin.py").write_text("def test_tampered():\n    pass\n")
+    version_dir.chmod(0o500)
+    # 候補 (staging) は pending の間は残っているので健全なまま
+    assert (plugins_dir / "_staging" / "1" / "sma" / "plugin.py").exists()
+
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    switch.retry_approval(conn, approval_id, decided_by="human", now=NOW,
+                          plugins_root=plugins_dir, settings=settings)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "approved", (
+        "test_plugin.py だけの改変を検出できず、候補からの再構築に進めなかった")
+    journal_row = conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE approval_id=?",
+        (approval_id,)).fetchone()
+    assert journal_row["phase"] == "decided"
+
+    from agentic_fx.plugin import version_store
+    version_dir.chmod(0o700)
+    recomputed_artifact = version_store.artifact_hash_bytes(
+        (version_dir / "plugin.py").read_bytes(),
+        (version_dir / "config.yaml").read_bytes(),
+        (version_dir / "test_plugin.py").read_bytes())
+    assert version_dir.name == recomputed_artifact  # ディレクトリ名 == 実 artifact_hash
+    assert (version_dir / "test_plugin.py").read_text() == TEST_PY_OK  # 候補内容に戻った
+    live = plugins_dir / "sma"
+    assert live.readlink().as_posix() == f".versions/sma/{recomputed_artifact}"
+
+
+def test_switched_journal_reverify_reverts_when_version_tampered_and_candidate_missing(
+        env, monkeypatch):
+    """版ディレクトリの test_plugin.py が改変され、かつ候補も欠損していれば
+    健全判定してはならない — reverted + pending + activity ERROR に
+    落ちること (これが I3 の本命の killer: 現行実装は artifact_hash を
+    見ないため candidate 側を一切確認せずに approved へ進んでしまう)。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    approval_id, artifact_hash = _simulate_crash_after_switch_before_decide(
+        root, plugins_dir, conn, settings, monkeypatch)
+
+    version_dir = plugins_dir / ".versions" / "sma" / artifact_hash
+    version_dir.chmod(0o700)
+    (version_dir / "test_plugin.py").chmod(0o600)
+    (version_dir / "test_plugin.py").write_text("def test_tampered():\n    pass\n")
+    version_dir.chmod(0o500)
+    import shutil
+    shutil.rmtree(plugins_dir / "_staging" / "1" / "sma")  # 候補も消す
+
+    activity = ActivityLog(root / "logs" / "activity.log")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    switch.retry_approval(conn, approval_id, decided_by="human", now=NOW,
+                          plugins_root=plugins_dir, settings=settings,
+                          activity=activity)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending", (
+        "改変された版を健全と誤判定して approved へ確定してしまった (I3 の欠陥)")
+    journal_row = conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE approval_id=?",
+        (approval_id,)).fetchone()
+    assert journal_row["phase"] == "reverted"
+
+    log_text = (root / "logs" / "activity.log").read_text()
+    assert "switch_reverify_failed" in log_text

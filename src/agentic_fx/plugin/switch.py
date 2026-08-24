@@ -546,15 +546,24 @@ def _reverify_switched_journal(
     name = journal_row["name"]
     new_target = journal_row["new_target"]
     expected_content_hash = payload.get("content_hash")
+    expected_artifact_hash = payload.get("artifact_hash")
 
     def _new_target_hash_ok() -> bool:
         version_dir = plugins_root / new_target
         if not version_dir.is_dir():
             return False
         try:
-            return loader.content_hash(version_dir) == expected_content_hash
+            content, artifact = hashes_of(version_dir)
         except OSError:
             return False
+        # I3 是正 (verified-codex-round1.md / 設計 §2.3・§7.1-37): reconcile
+        # も loader と同じ規則で「版ディレクトリ名 == 実 artifact_hash」を
+        # 照合する (in-place 編集の検出)。content_hash (2 本) だけでは
+        # test_plugin.py だけの改変を見逃し、approved だが起動時ロード
+        # 不能という不収束状態を作れた。
+        return (content == expected_content_hash
+                and artifact == expected_artifact_hash
+                and version_dir.name == artifact)
 
     if _new_target_hash_ok():
         return True
@@ -570,6 +579,18 @@ def _reverify_switched_journal(
             raise ValueError(
                 f"plugin {name!r}: candidate hash no longer matches payload "
                 "during switched-journal reverify")
+        # I3 是正: version_dir が既に new_target の名前 (=artifact_hash) で
+        # 存在するが中身が改変されている場合、`create_version_dir` は
+        # 冪等の早期 return (`final_dir.is_dir(): return final_dir`) で
+        # 上書きしない (版ストア不変の設計と整合)。ここまで到達したのは
+        # `_new_target_hash_ok()` が False (中身が壊れている) と分かって
+        # いる場合のみなので、候補から再作成する前に stale な版を掃除する。
+        version_dir = plugins_root / new_target
+        if version_dir.is_dir():
+            os.chmod(version_dir, 0o700)
+            for f in version_dir.iterdir():
+                os.chmod(f, 0o600)
+            shutil.rmtree(version_dir)
         version_store.create_version_dir(
             plugins_root, name, artifact_hash,
             plugin_py=(candidate_dir / "plugin.py").read_bytes(),
