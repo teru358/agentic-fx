@@ -31,6 +31,7 @@ from agentic_fx.plugin.gate_pytest import (
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.strategy_gate import evaluate_strategy_adoption_gate
 from agentic_fx.runners.base import Mission
+from agentic_fx.tools.plugin_loader import approved_plugins
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
@@ -195,7 +196,7 @@ class ImproveLoop:
 
         allowed_ids = self._compute_partition_hint(conn, slot_key)
         staging_dir, source_snapshot_dir = self._materialize_workspace(
-            mission_id, allowed_ids)
+            conn, mission_id, allowed_ids)
         ledger = ImproveRpcLedger(
             rpc_timeout_sec_by_kind={
                 "run_backtest": self._settings.improve.backtest_rpc_timeout_sec,
@@ -229,7 +230,17 @@ class ImproveLoop:
                           timeout_sec=self._settings.improve.mission_timeout_sec)
         # precheck 2026-08-22 wave2: T10-B2/R-D1
         runner = self._build_worker_runner(ctx, on_ready=on_ready)
-        conn.close()
+        # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
+        # `commit()` (10.11 節) は `_conn_for_test` シームがあれば close
+        # しない (テスト共有 conn を守る)。`prepare()` にはこの対称が無く
+        # 無条件 close だった — production では factory が呼び出しごとに
+        # 新規接続を返すため実害は無いが、テスト用に同一 conn を返す
+        # factory (tests/loops/conftest.py) では `prepare()` が返した後に
+        # 呼び出し元が同じ `conn` で状態確認できなくなる。commit() と同じ
+        # シームで対称化する (プラン L16312-16314 のコメント「ここで
+        # close しない」の意図とも整合)。
+        if getattr(self, "_conn_for_test", None) is None:
+            conn.close()
         return mission, ctx, runner
 
     # precheck 2026-08-22 pass2: RB4 — Step 2a で定義した失敗するテストへの
@@ -304,9 +315,33 @@ class ImproveLoop:
         return template_path.read_text().format(**render_map)
 
     def _compute_partition_hint(self, conn, slot_key) -> frozenset[int] | None:
-        raise NotImplementedError  # 10.9 節
+        # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
+        # プラン L15634-20876 に `_compute_partition_hint` の具体形が無い
+        # (grep 4 ヒット全て骨格スタブ/xfail 注記のみ、検収 D-1 参照)。
+        # 設計書 §6「注入コンテキスト」/ まとめ表の「wave が parallel=N で
+        # N partition を全て担当する」(L24685) から最小実装する:
+        # `slot_key=None` (手動 one-shot) は全バックログ担当 = None (印なし、
+        # プラン L16077 の既存 pin と一致)。scheduler wave は
+        # `improve_wave_slots` の実 slot 数 (= wave の `expected`) を N とし、
+        # open|observation な backlog id を `id % N == k` で互いに素な
+        # N 分割にする — `list_open` は `select_for_mission` の CAS 対象
+        # (open|observation) と同じ集合なので、ヒントと実際に選べる範囲が
+        # 一致する。
+        if slot_key is None:
+            return None
+        period_key, k = slot_key
+        slots = improve_waves.list_slots(conn, period_key=period_key)
+        expected = len(slots)
+        if expected <= 0:
+            # fail-open (None = 全担当) にしない — 呼び出し元は
+            # claim_slot 済みのはずで、対応する wave が無いのは矛盾。
+            raise RuntimeError(
+                f"_compute_partition_hint: no wave slots for "
+                f"period_key={period_key!r} — cannot derive a partition")
+        open_ids = sorted(row["id"] for row in backlog_store.list_open(conn))
+        return frozenset(i for i in open_ids if i % expected == k)
 
-    def _materialize_workspace(self, mission_id, allowed_ids):
+    def _materialize_workspace(self, conn, mission_id, allowed_ids):
         # <!-- precheck 2026-08-23 R-D3 -->
         # 裁定 R-D3: 本メソッドの責務は「出所を用意する」ことに縮小された。
         # `staging_dir/_snapshot_src/` へ `copy_source_snapshot`/
@@ -324,12 +359,30 @@ class ImproveLoop:
 
         # copy_examples_snapshot を先に実行し、その後 copy_source_snapshot を実行する
         # (R-D3 による権限管理: _snapshot_src が 0o500 になる前に _examples も配置)
-        examples_root = Path(self._settings.data_root) / "docs" / "examples" / "plugins"
+        # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
+        # 元コードは `self._settings.data_root` を参照していたが
+        # `Settings` に `data_root` フィールドは存在しない
+        # (`AttributeError`、prepare() が一度も最後まで到達しなかった
+        # ため未検出だった)。`service.py:956` の `ImproveLoop(root=root, ...)`
+        # と同じ `root` (リポジトリ root) を使う — `docs/examples/plugins`
+        # は設計書 §6 の記載どおりリポジトリ直下に存在する。
+        examples_root = self._root / "docs" / "examples" / "plugins"
         copy_examples_snapshot(examples_root, dest_root=source_snapshot_root / "_examples")
 
-        # Discover 済みの plugin metas をここでコピーする実装は後続節に任せる (10.3 節の stub)
-        # とりあえず空の出所を用意する
-        copy_source_snapshot([], dest_root=source_snapshot_root,
+        # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
+        # R-D3「discover 済みの plugin metas をここでコピーする」の実装。
+        # 取得元は `build_improve_context`/`_current_inventory` と同一の
+        # `tools.plugin_loader.approved_plugins` (承認済みのみ、二重実装
+        # しない)。`conn` は prepare() の Tx-0 完了後 (COMMIT 済み) の
+        # 同一接続を再利用する — 新規に readonly factory を開いて close
+        # すると、テスト fixture (tests/loops/conftest.py) では
+        # write/readonly が同一 conn オブジェクトを指すため、この中で
+        # close すると呼び出し元 prepare() が続けて使う conn まで壊れる
+        # (D-3 が突き止めた「テスト factory が共有 conn を返すと閉じた
+        # 接続を掴む」と同じ罠を作らない)。
+        plugins_dir = self._root / "plugins"
+        metas = approved_plugins(conn, plugins_dir)
+        copy_source_snapshot(metas, dest_root=source_snapshot_root,
                             plugin_lock=threading.Lock())
 
         return staging_dir, source_snapshot_root
@@ -407,11 +460,19 @@ class ImproveLoop:
                              on_ready: Callable[[dict], None] | None = None) -> "WorkerRunner":
         """10.9 Step 7: ImproveRunContext を WorkerRunner へ渡す。"""
         from agentic_fx.runners.worker_runner import WorkerRunner
-        from agentic_fx.store.rag import Rag
 
+        # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
+        # 元コードは `Rag(self._db_readonly_conn_factory)` — `Rag.__init__`
+        # の第 1 引数は `data_dir: Path` であり、conn factory (callable) を
+        # 渡すのは型不一致 (str(factory) が chroma の永続化先パスに解釈され、
+        # `<function ...>/` という実在しないディレクトリを cwd に作ってしまう
+        # 実害を確認)。クラス docstring 冒頭のコメント (T10-B10:
+        # 「Rag はここで注入を受ける (`_build_worker_runner` が独自
+        # シグネチャで new しない)」) が既に意図を明記しており、
+        # `__init__` で受け取り済みの `self._rag` を使うのが正しい実装。
         return WorkerRunner(
             root=self._root, settings=self._settings, clock=self._clock,
-            rag=Rag(self._db_readonly_conn_factory), worker_profile="improve",
+            rag=self._rag, worker_profile="improve",
             run_context=ctx, on_ready=on_ready)
 
     def _freeze_ledger(self, ctx: ImproveRunContext) -> None:

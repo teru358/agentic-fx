@@ -10,6 +10,8 @@ import pytest
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 
+from tests.loops.conftest import _prepare_wave_slot
+
 
 def test_improve_run_context_is_frozen_dataclass():
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
@@ -21,6 +23,102 @@ def test_improve_run_context_is_frozen_dataclass():
     assert ctx.mission_id == 1
     with pytest.raises(AttributeError):
         ctx.mission_id = 99  # frozen
+
+
+def test_tx0_creates_mission_and_run_atomically_scheduler_wave(loop_full, conn, clock):
+    """scheduler wave (slot_key あり) のとき、missions/run/slot が
+    1 commit で現れる (部分状態が観測できない)。
+
+    プラン L16050-16069 の逐語 (D-2)。**未申告の適応**: `_build_loop(conn)`
+    (プランの想定シグネチャ、tmp_path/clock 引数なし) は現物の
+    `tests/loops/conftest.py::_build_loop(conn, tmp_path, *, clock=None)`
+    と一致しないため、共有 fixture `loop_full` (= `_conn_for_test` シーム
+    付き。D-10 是正で `prepare()` にもこのシームを対称実装したため、
+    `prepare()` 完了後も同一 `conn` で状態確認できる) を使う。
+    `_prepare_wave_slot` はキーワード専用シグネチャに合わせて呼ぶ。"""
+    now = clock.now()
+    _prepare_wave_slot(conn, period_key="2026-W34", k=0, now=now)
+
+    mission, ctx, runner = loop_full.prepare(slot_key=("2026-W34", 0), now=now)
+
+    m = conn.execute("SELECT * FROM missions WHERE id=?", (ctx.mission_id,)).fetchone()
+    assert m["status"] == "running"
+    assert m["loop"] == "improve"
+    r = conn.execute("SELECT * FROM improvement_runs WHERE id=?", (ctx.run_id,)).fetchone()
+    assert r["backlog_id"] is None
+    assert r["mission_id"] == ctx.mission_id
+    slot = conn.execute(
+        "SELECT status, mission_id FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert slot["status"] == "claimed"
+    assert slot["mission_id"] == ctx.mission_id
+
+
+def test_tx0_manual_one_shot_has_no_slot_claim(loop_full, conn, clock):
+    """手動 one-shot (slot_key=None) は slot claim を行わない。
+
+    プラン L16072-16079 の逐語 (D-2)。適応は上記と同様 (`loop_full` を使う)。"""
+    now = clock.now()
+    mission, ctx, runner = loop_full.prepare(slot_key=None, now=now)
+    assert ctx.allowed_backlog_ids is None  # 全バックログ担当 (印なし)
+    n = conn.execute("SELECT count(*) c FROM improve_wave_slots").fetchone()["c"]
+    assert n == 0
+
+
+def test_materialize_workspace_copies_approved_plugin_source_into_snapshot(
+        loop_min, conn, clock):
+    """D-8 pin: `_materialize_workspace` は R-D3 が要求する
+    「discover 済み plugin metas をコピーする」を満たす — 空リストへ
+    `copy_source_snapshot([])` の退行 (検収 D-8 で検出) を検出する。"""
+    from agentic_fx.plugin.loader import content_hash
+    from agentic_fx.store import approvals as approvals_store
+
+    plugins_dir = loop_min._root / "plugins"
+    plugin_dir = plugins_dir / "sample_ind"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.py").write_text("def compute(df, params):\n    return {}\n")
+    (plugin_dir / "config.yaml").write_text("kind: indicator\n")
+    (plugin_dir / "test_plugin.py").write_text("def test_x():\n    pass\n")
+    ch = content_hash(plugin_dir)
+    aid = approvals_store.create(
+        conn, "plugin", {"name": "sample_ind", "content_hash": ch}, clock.now())
+    approvals_store.apply_decision(
+        conn, aid, status="approved", decided_by="test", now=clock.now())
+
+    staging_dir, source_snapshot_dir = loop_min._materialize_workspace(
+        conn, 42, None)
+
+    copied = source_snapshot_dir / "sample_ind"
+    assert (copied / "plugin.py").is_file()
+    assert (copied / "config.yaml").is_file()
+    assert (copied / "test_plugin.py").is_file()
+    assert (copied / "plugin.py").read_text() == "def compute(df, params):\n    return {}\n"
+
+
+def test_compute_partition_hint_disjoint_covers_open_backlog_across_slots(
+        loop_min, conn, clock):
+    """D-1 pin: scheduler wave (expected=2) は open backlog を
+    `id % expected == k` で互いに素な分割にする — `_compute_partition_hint`
+    が常に `None` (全担当) を返す退行や `%`/`==` の演算子退行を検出する。"""
+    from agentic_fx.store import backlog as backlog_store
+    from agentic_fx.store import improve_waves
+
+    ids = [backlog_store.add(conn, f"idea-{i}", "user", clock.now())
+          for i in range(4)]
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W40", now=clock.now(), expected=2)
+
+    hint0 = loop_min._compute_partition_hint(conn, ("2026-W40", 0))
+    hint1 = loop_min._compute_partition_hint(conn, ("2026-W40", 1))
+
+    assert hint0 == frozenset(i for i in ids if i % 2 == 0)
+    assert hint1 == frozenset(i for i in ids if i % 2 == 1)
+    # 全体をちょうど 1 回ずつ担当する (互いに素・網羅)
+    assert hint0 | hint1 == frozenset(ids)
+    assert hint0 & hint1 == frozenset()
+
+    # slot_key=None は全バックログ担当 (印なし)
+    assert loop_min._compute_partition_hint(conn, None) is None
 
 
 def test_tx0_mission_id_unique_partial_index_on_improvement_runs(conn):
