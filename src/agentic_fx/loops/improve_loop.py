@@ -808,5 +808,211 @@ class ImproveLoop:
                     Category.IMPROVE, "tx2_compensation_failed",
                     f"mission_id={mission_id} run_id={run_id}")
 
-    def commit(self, *, mission, ctx, result, now):
-        raise NotImplementedError  # 10.4〜10.11 節
+    def commit(self, *, mission, ctx, result, now) -> None:
+        owns_conn = False
+        conn = getattr(self, "_conn_for_test", None)
+        if conn is None:
+            conn = self._db_write_conn_factory()
+            owns_conn = True
+        try:
+            self._freeze_ledger(ctx)                                  # 手順0
+
+            if result.status != "completed":
+                self._finalize_failed_mission(conn, ctx=ctx, result=result, now=now)
+                return
+
+            output = result.output or {}
+            verdict = self._inspect_output(output, ctx, conn=conn)     # 手順1
+            if not verdict.ok:
+                self._finalize_output_invalid(conn, ctx=ctx, reason=verdict.reason, now=now)
+                return
+
+            selection = self._select_and_bind(conn, output, ctx, now=now)  # 手順2
+            if not selection.won:
+                self._finalize_loser(conn, ctx=ctx, output=output, now=now)
+                return
+
+            artifact = output.get("artifact", {})
+            atype = artifact.get("type")
+            gate_metrics: dict = {}
+            approval_payload = None
+            gate_rows: list[dict] = []
+
+            if atype == "plugin":
+                candidate_dir = ctx.staging_dir / artifact["name"]
+                gate_verdict = self._run_plugin_gate(                  # 手順3
+                    candidate_dir, name=artifact["name"])
+                if not gate_verdict.passed:
+                    self._finalize_gate_failed(
+                        conn, ctx=ctx, backlog_id=selection.backlog_id,
+                        reason=gate_verdict.reason, now=now)
+                    return
+
+                kind = self._read_candidate_kind(candidate_dir)
+                if kind == "strategy":
+                    from agentic_fx.plugin import loader as plugin_loader
+                    candidate_meta = plugin_loader._discover_one(
+                        candidate_dir, artifact["name"])
+                    strategy_verdict = self._run_strategy_gate(         # 手順4
+                        conn, name=artifact["name"],
+                        pairs=self._read_candidate_pairs(candidate_dir),
+                        timeframe=self._read_candidate_timeframe(candidate_dir),
+                        content_hash=gate_verdict.content_hash, now=now,
+                        meta=candidate_meta, kind=kind,
+                        record_fn=gate_rows.append)
+                    if not strategy_verdict.evaluable:
+                        self._finalize_gate_failed(
+                            conn, ctx=ctx, backlog_id=selection.backlog_id,
+                            reason=strategy_verdict.observation_reason, now=now)
+                        return
+                    gate_metrics["baseline"] = strategy_verdict.baseline_row
+
+                candidate_path = (f"plugins/_staging/{ctx.mission_id}/"
+                                  f"{artifact['name']}")
+                approval_payload = self._build_approval_payload(        # 手順5
+                    conn, name=artifact["name"], kind=kind,
+                    content_hash=gate_verdict.content_hash,
+                    artifact_hash=gate_verdict.artifact_hash,
+                    ctx_ledger=ctx.ledger, mission_id=ctx.mission_id,
+                    backlog_id=selection.backlog_id,
+                    candidate_origin="staging", candidate_path=candidate_path,
+                    gate_metrics=gate_metrics, output=output, now=now)
+
+            report_path = None
+            if approval_payload is None:
+                report_path = self._prepare_report_if_applicable(       # 手順6
+                    conn, ctx=ctx, artifact=artifact, output=output, now=now)
+
+            if approval_payload is not None:
+                self._finalize_success(                                 # 手順7-9
+                    conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                    backlog_id=selection.backlog_id, slot_key=ctx.slot_key,
+                    approval_payload=approval_payload, now=now,
+                    ledger_entries=tuple(ctx.ledger.entries()),
+                    gate_rows=tuple(gate_rows))
+            else:
+                self._finalize_report_or_observation(
+                    conn, ctx=ctx, backlog_id=selection.backlog_id,
+                    report_path=report_path, now=now)
+        finally:
+            if owns_conn:
+                conn.close()
+            try:
+                ctx.ledger.mark_persisted()
+            except RuntimeError:
+                pass
+
+    def _prepare_report_if_applicable(self, conn, *, ctx, artifact, output,
+                                      now) -> str | None:
+        """`artifact.type=='report'` かつ `proposal_kind != 'risk_gate'` の
+        ときだけ本文を `.tmp/*.part` へ書き、Tx-2 で `report_state=
+        'prepared'` + 予定パスを書く。"""
+        if artifact.get("type") != "report":
+            return None
+        if artifact.get("proposal_kind") == "risk_gate":
+            return None
+        reports_dir = self._root / "data" / "improve_reports"
+        (reports_dir / ".tmp").mkdir(parents=True, exist_ok=True)
+        body_md = artifact.get("body_md", "")
+        part_path = self._write_report_part(
+            reports_dir, mission_id=ctx.mission_id, body_md=body_md)
+        final_path = reports_dir / f"improve-{ctx.mission_id}.md"
+        conn.execute(
+            "UPDATE improvement_runs SET report_state='prepared', "
+            "report_path=? WHERE id=?", (str(final_path), ctx.run_id))
+        return str(final_path)
+
+    def _finalize_report_or_observation(self, conn, *, ctx, backlog_id,
+                                        report_path, now) -> None:
+        """承認申請を出さない経路の Tx-2 + finish。"""
+        from agentic_fx.store import missions as missions_store
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            missions_store.finish_improve_mission(
+                conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                slot_key=ctx.slot_key, mission_status="completed",
+                run_result=("report" if report_path is not None else None),
+                now=now,
+                report_path=report_path,
+                report_state=("prepared" if report_path is not None else "none"),
+                backlog_transition=(
+                    {"backlog_id": backlog_id, "status": "observation",
+                     "last_result": "unsupported_in_plan10"}
+                    if report_path is None and backlog_id is not None
+                    else ({"backlog_id": backlog_id, "status": "done",
+                          "last_result": "reported"}
+                          if backlog_id is not None else None)),
+                commit=False)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        if report_path is not None:
+            reports_dir = self._root / "data" / "improve_reports"
+            part_path = reports_dir / ".tmp" / f"improve-{ctx.mission_id}.md.part"
+            self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
+                                 final_path=Path(report_path), now=now)
+
+    def _read_candidate_kind(self, candidate_dir: Path) -> str:
+        """candidate の config.yaml から kind (indicator/strategy) を読む。"""
+        import yaml
+        config_path = candidate_dir / "config.yaml"
+        if not config_path.exists():
+            raise FileNotFoundError(f"config.yaml not found: {config_path}")
+        config = yaml.safe_load(config_path.read_text())
+        return config.get("kind", "indicator")
+
+    def _read_candidate_pairs(self, candidate_dir: Path) -> list[str]:
+        """candidate の config.yaml から pairs リストを読む。"""
+        import yaml
+        config_path = candidate_dir / "config.yaml"
+        config = yaml.safe_load(config_path.read_text())
+        return config.get("pairs", [])
+
+    def _read_candidate_timeframe(self, candidate_dir: Path) -> str:
+        """candidate の config.yaml から timeframe (1h/4h/1d など) を読む。"""
+        import yaml
+        config_path = candidate_dir / "config.yaml"
+        config = yaml.safe_load(config_path.read_text())
+        return config.get("timeframe", "1h")
+
+    def _finalize_failed_mission(self, conn, *, ctx, result, now) -> None:
+        """timeout/failed/max_turns 処理。プラン実装時に申し送り条件参照。"""
+        from agentic_fx.store import missions as missions_store
+        ctx.ledger.mark_discarded()
+        missions_store.finish_improve_mission(
+            conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+            slot_key=ctx.slot_key, mission_status="failed",
+            run_result="failed", now=now, commit=True)
+
+    def _finalize_output_invalid(self, conn, *, ctx, reason, now) -> None:
+        """手順1 不合格。プラン実装時に申し送り条件参照。"""
+        from agentic_fx.store import missions as missions_store
+        ctx.ledger.mark_discarded()
+        missions_store.finish_improve_mission(
+            conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+            slot_key=ctx.slot_key, mission_status="failed",
+            run_result="failed", now=now, commit=True)
+
+    def _finalize_loser(self, conn, *, ctx, output, now) -> None:
+        """敗者経路。プラン実装時に申し送り条件参照。"""
+        from agentic_fx.store import missions as missions_store
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            missions_store.finish_improve_mission(
+                conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                slot_key=ctx.slot_key, mission_status="completed",
+                run_result="duplicate", now=now, commit=False)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now) -> None:
+        """ゲート不合格。プラン実装時に申し送り条件参照。"""
+        from agentic_fx.store import missions as missions_store
+        ctx.ledger.mark_discarded()
+        missions_store.finish_improve_mission(
+            conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+            slot_key=ctx.slot_key, mission_status="completed",
+            run_result="observation", now=now, commit=True)

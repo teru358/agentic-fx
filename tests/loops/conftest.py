@@ -62,7 +62,9 @@ def loop_min(conn, tmp_path, clock):
 @pytest.fixture
 def loop_full(conn, tmp_path, clock):
     # precheck 2026-08-22 wave2: T10-B3 — loop_min と同一構築 (上記説明参照)
-    return _build_loop(conn, tmp_path, clock=clock)
+    loop = _build_loop(conn, tmp_path, clock=clock)
+    loop._conn_for_test = conn  # テストシーム：conn close を回避
+    return loop
 
 
 @pytest.fixture
