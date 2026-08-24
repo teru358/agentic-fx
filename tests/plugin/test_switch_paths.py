@@ -703,6 +703,102 @@ def test_switched_journal_reverify_fails_closed_when_version_and_candidate_missi
     assert Category.APPROVAL.value in log_text
 
 
+# --- codex 1 周目是正 I1: staging 候補が終端決定 (reject/expired/invalidated)
+#     直後に削除されない (verified-codex-round1.md I1) ---
+
+
+def test_reject_deletes_staging_candidate_immediately(env, monkeypatch):
+    """§5.1 手順 3 の掃除所有表: staging 候補は終端決定 (rejected 含む) の
+    tx 直後に削除される。sweep_orphans (起動時) を呼ばずに直後の削除を
+    pin する。"""
+    root, plugins_dir, conn, settings = env
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    approval_id = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    switch.reject_candidate(conn, approval_id, decided_by="human", reason="no good",
+                            now=NOW, plugins_root=plugins_dir)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "rejected"
+    assert not (plugins_dir / "_staging" / "1" / "sma").exists()
+
+
+def test_invalidated_by_superseding_decision_deletes_staging_candidate(env, monkeypatch):
+    """同名別 content_hash の後発 approved 決定により invalidated へ落ちる
+    経路 (0c) でも、staging 候補が直後に削除されること。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma")
+    a = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    # 同名・別 content_hash の approved 決定 B (id > a) を手作りする
+    b = approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "different-hash",
+                 "artifact_hash": "b" * 64, "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/2/sma"}, now=NOW)
+    conn.execute("UPDATE approval_requests SET status='approved' WHERE id=?", (b,))
+    conn.commit()
+    assert b > a
+
+    switch.approve_candidate(conn, a, decided_by="h", now=NOW,
+                             plugins_root=plugins_dir, settings=settings)
+
+    row_a = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                         (a,)).fetchone()
+    assert row_a["status"] == "invalidated"
+    assert not (plugins_dir / "_staging" / "1" / "sma").exists()
+
+
+def test_human_candidate_survives_reject_and_invalidated_decisions(env, monkeypatch):
+    """§5.1 手順 3 の掃除所有表: candidate_origin='human' は自動削除しない
+    (人間所有)。reject と invalidated の両経路で `_human/sma` が残ることを
+    対照として pin する (process_expired_approvals 側は別ファイルで確認)。"""
+    root, plugins_dir, conn, settings = env
+    _write_candidate(plugins_dir / "_human" / "sma")
+
+    payload_reject = {
+        "name": "sma", "kind": "indicator",
+        "candidate_origin": "human", "candidate_path": "plugins/_human/sma",
+        "content_hash": "h1", "artifact_hash": "a1",
+        "metrics": {}, "evaluable": True,
+        "mission_id": None, "backlog_id": None,
+    }
+    approval_id = approvals_store.create(conn, kind="plugin", payload=payload_reject, now=NOW)
+    switch.reject_candidate(conn, approval_id, decided_by="human", reason="no",
+                            now=NOW, plugins_root=plugins_dir)
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "rejected"
+    assert (plugins_dir / "_human" / "sma" / "plugin.py").exists()
+
+    payload_a2 = dict(payload_reject, content_hash="h2")
+    approval_id2 = approvals_store.create(conn, kind="plugin", payload=payload_a2, now=NOW)
+    b = approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "h3", "artifact_hash": "b" * 64,
+                 "candidate_origin": "human", "candidate_path": "plugins/_human/sma"},
+        now=NOW)
+    conn.execute("UPDATE approval_requests SET status='approved' WHERE id=?", (b,))
+    conn.commit()
+    assert b > approval_id2
+
+    switch.approve_candidate(conn, approval_id2, decided_by="h", now=NOW,
+                             plugins_root=plugins_dir, settings=settings)
+    row2 = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                        (approval_id2,)).fetchone()
+    assert row2["status"] == "invalidated"
+    assert (plugins_dir / "_human" / "sma" / "plugin.py").exists()
+
+
 # --- codex 1 周目是正 I3: switched 再開時の版再検証が artifact_hash を見ない ---
 #
 # `_new_target_hash_ok` は content_hash (2 本) しか見ておらず、

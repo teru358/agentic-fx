@@ -117,6 +117,52 @@ def test_process_expired_approvals_takes_plugin_flock_and_blocks_until_released(
     assert row["status"] == "expired"
 
 
+def test_expired_plugin_approval_deletes_staging_candidate_immediately(env):
+    """codex 1 周目是正 I1 (verified-codex-round1.md): staging 候補は
+    expired 化の tx 直後に削除される (§5.1 手順 3 の掃除所有表)。"""
+    tmp_path, plugins_dir, conn = env
+    candidate_dir = plugins_dir / "_staging" / "1" / "sma"
+    candidate_dir.mkdir(parents=True)
+    (candidate_dir / "plugin.py").write_text("x")
+    (candidate_dir / "config.yaml").write_text("kind: indicator\n")
+    (candidate_dir / "test_plugin.py").write_text("def test_x():\n    pass\n")
+    approval_id = approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "h1", "artifact_hash": "a1",
+                 "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/1/sma"},
+        now=PAST, expires_at=PAST)
+
+    switch.process_expired_approvals(conn, plugins_root=plugins_dir, now=NOW)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "expired"
+    assert not candidate_dir.exists()
+
+
+def test_expired_plugin_approval_with_human_candidate_survives(env):
+    """対照 pin: `candidate_origin='human'` は expired 化後も自動削除
+    しない (人間所有 — §5.1 手順 3)。"""
+    tmp_path, plugins_dir, conn = env
+    candidate_dir = plugins_dir / "_human" / "sma"
+    candidate_dir.mkdir(parents=True)
+    (candidate_dir / "plugin.py").write_text("x")
+    approval_id = approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "h1", "artifact_hash": "a1",
+                 "candidate_origin": "human",
+                 "candidate_path": "plugins/_human/sma"},
+        now=PAST, expires_at=PAST)
+
+    switch.process_expired_approvals(conn, plugins_root=plugins_dir, now=NOW)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "expired"
+    assert (candidate_dir / "plugin.py").exists()
+
+
 def test_expired_non_plugin_kind_uses_direct_expire_due_path(env):
     """非 plugin kind (例: mission) は flock を経由せず、従来どおり
     `expire_due` の直接 expired 化で処理される。"""

@@ -321,6 +321,21 @@ def resolve_candidate_dir(plugins_root: Path, *, candidate_origin: str,
     return candidate_dir
 
 
+def _drop_staging_candidate(plugins_root: Path, payload: dict) -> None:
+    """終端決定 (approved/rejected/expired/invalidated) の tx 直後に staging
+    候補を削除する (§5.1 手順 3 の掃除所有表、verified-codex-round1.md I1)。
+    `candidate_origin='human'` は人間所有なので触らない (自動削除しない)。"""
+    if payload.get("candidate_origin") != "staging":
+        return
+    try:
+        candidate_dir = resolve_candidate_dir(
+            plugins_root, candidate_origin="staging",
+            candidate_path=payload["candidate_path"], name=payload["name"])
+    except (CandidateMissingError, ValueError, KeyError):
+        return
+    shutil.rmtree(candidate_dir, ignore_errors=True)
+
+
 # ============================================================
 # 承認 3 経路 (P1 submit / P2 approve / P3 bless) — §5.1
 # ============================================================
@@ -648,6 +663,9 @@ def approve_candidate(
             except BaseException:
                 conn.rollback()
                 raise
+            # I1 是正: 終端決定 (invalidated) の tx 直後に staging 候補を
+            # 削除する (§5.1 手順 3)。
+            _drop_staging_candidate(plugins_root, payload)
             return
 
         # 0d: 同名の未完ジャーナルが「この approval 自身の再試行」であれば
@@ -878,6 +896,9 @@ def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
         approvals_store.apply_decision(
             conn, approval_id, "rejected", decided_by=decided_by, now=now,
             reason=reason, commit=True)
+        # I1 是正: 終端決定 (rejected) の tx 直後に staging 候補を削除する
+        # (§5.1 手順 3)。
+        _drop_staging_candidate(plugins_root, payload)
 
 
 def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
@@ -924,6 +945,9 @@ def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
                 approvals_store.apply_decision(
                     conn, row["id"], status="expired", decided_by="system",
                     now=now, reason="expired", commit=True)
+                # I1 是正: 終端決定 (expired) の tx 直後に staging 候補を
+                # 削除する (§5.1 手順 3)。
+                _drop_staging_candidate(plugins_root, payload)
             finally:
                 fcntl.flock(lockf, fcntl.LOCK_UN)
 
