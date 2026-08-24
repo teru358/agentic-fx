@@ -102,6 +102,30 @@ def test_launcher_execs_target_and_target_starts(tmp_path):
         proc.wait(timeout=5)
 
 
+_TOUCH_AND_EXIT = (
+    "import pathlib, sys\n"
+    "pathlib.Path(sys.argv[1]).write_text('started')\n"
+    "sys.exit(42)\n"
+)
+
+
+def test_launcher_execv_preserves_target_exit_code(tmp_path):
+    """#7 (`verified-round1.md` 1-A): marker ファイルの存在のみを見る既存
+    テストは launcher プロセスが exit code を伝播するかを見ていない
+    (`os.execv` を `subprocess.run` 相当の子プロセス起動に緩める変異でも、
+    marker さえ書かれれば通ってしまう)。`os.execv` は現プロセスをターゲット
+    で置き換えるため、launcher プロセス自身の終了コードがターゲットの
+    `sys.exit(42)` と一致するはずであることを実プロセスで pin する。"""
+    marker = tmp_path / "started-exit"
+    argv = build_launcher_argv(
+        os.getpid(),
+        [sys.executable, "-c", _TOUCH_AND_EXIT, str(marker)])
+    proc = subprocess.Popen(argv, start_new_session=True)
+    proc.wait(timeout=5)
+    assert marker.exists()
+    assert proc.returncode == 42
+
+
 def test_launcher_child_dies_when_parent_dies(tmp_path):
     """§8.1-2「worker 親死」: PDEATHSIG により、expected_parent_pid の
     プロセスが死ぬと launcher (と execv した CLI) も自動終了する。
@@ -155,8 +179,13 @@ def test_launcher_child_ignoring_sigterm_still_dies_to_sigkill(tmp_path):
     try:
         _wait_for_file(marker)
         os.killpg(proc.pid, signal.SIGTERM)
-        time.sleep(0.3)
-        assert proc.poll() is None, "SIGTERM を無視するはずが死んだ"
+        # #8 (`verified-round1.md` 1-A): 単発の `time.sleep(0.3)` → 1 回
+        # だけの `poll()` は負荷時に振れる (非決定)。窓の間ポーリングで
+        # 継続的に確認する — 早期に死んだ場合も window 内で検出できる。
+        deadline = time.monotonic() + 0.3
+        while time.monotonic() < deadline:
+            assert proc.poll() is None, "SIGTERM を無視するはずが死んだ"
+            time.sleep(0.02)
         os.killpg(proc.pid, signal.SIGKILL)
         rc = proc.wait(timeout=5)
         # Minor 10 の再発防止: `proc.wait()` は必ず int を返すため

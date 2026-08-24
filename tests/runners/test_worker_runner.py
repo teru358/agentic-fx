@@ -148,6 +148,19 @@ def test_mission_worker_env_omits_unset_credentials(monkeypatch):
     assert "MT5_BRIDGE_API_KEY" not in env
 
 
+def test_mission_worker_env_delegates_entirely_to_build_env():
+    """#71 (`verified-round1.md` 1-A): `_mission_worker_env` の pin は
+    「特定 3 キーが無い」ことしか見ていない — 委譲先の `_build_env()` が
+    全 env (`os.environ` 丸ごと等) を返す実装に変わっても既存 pin は通る。
+    `set(_mission_worker_env(profile)) == set(_build_env())` で委譲が
+    集合一致であることを直接見る。"""
+    from agentic_fx.plugin.sandbox import _build_env
+    from agentic_fx.runners.worker_runner import _mission_worker_env
+
+    for profile in ("trade", "improve"):
+        assert set(_mission_worker_env(profile)) == set(_build_env())
+
+
 class _FakeChildScript:
     """テストが `subprocess.Popen` の代わりに使う擬似子プロセス。実
     プロセスは起動しない — 親側 (WorkerRunner) が書く stdin をこのスレッドが

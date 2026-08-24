@@ -574,6 +574,20 @@ def test_main_runs_llm_and_sends_result_when_go_frame_arrives(
     monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
                         lambda **kw: None)
     _CountingFakeLocalRunner.run_call_count = 0
+    # #56 (`verified-round1.md` 1-B): `_drive_main` は
+    # `agentic_fx.runners.local_runner.LocalRunner` クラスを差し替えるため、
+    # improve 分岐が `runner_factory.build_runner` を経由するという**経路**
+    # は pin されていなかった (直接 `LocalRunner(...)` 構築に変えても通る)。
+    # `runner_factory.build_runner` を spy して 1 回呼ばれることを assert する。
+    build_runner_calls: list[tuple] = []
+    orig_build_runner = mission_worker.runner_factory.build_runner
+
+    def spying_build_runner(*a, **kw):
+        build_runner_calls.append((a, kw))
+        return orig_build_runner(*a, **kw)
+
+    monkeypatch.setattr(mission_worker.runner_factory, "build_runner",
+                        spying_build_runner)
 
     frames, _, _ = _drive_main(
         monkeypatch, tmp_path,
@@ -585,6 +599,10 @@ def test_main_runs_llm_and_sends_result_when_go_frame_arrives(
     assert _CountingFakeLocalRunner.run_call_count == 1
     assert frames[-1]["type"] == "result"
     assert frames[-1]["status"] == "completed"
+    assert len(build_runner_calls) == 1, (
+        "improve 分岐が runner_factory.build_runner を経由していない")
+    assert build_runner_calls[0][0][0] == "improve", (
+        "runner_factory.build_runner の第 1 引数 (profile) が improve でない")
 
 
 def test_main_happy_path_emits_ready_event_result_in_one_seq_sequence(
@@ -654,6 +672,23 @@ def test_main_exits_without_ready_when_reparented(monkeypatch, tmp_path):
     frames, rlimit_calls, registry_calls = _drive_main(
         monkeypatch, tmp_path,
         handshake_overrides={"expected_parent_pid": os.getppid() + 1})
+
+    assert frames == []
+    assert rlimit_calls == []
+    assert registry_calls == []
+
+
+@pytest.mark.parametrize("bad_pid", [str(os.getpid()), None])
+def test_main_exits_without_ready_when_expected_parent_pid_type_is_malformed(
+        monkeypatch, tmp_path, bad_pid):
+    """#63 (`verified-round1.md` 1-A): `expected_parent_pid` の型崩れ
+    (`str`/`None`) は正常系の `+1` (値の不一致) しかテストされていなかった。
+    `os.getppid() != expected_parent_pid` は型が違えば必ず不一致になり
+    fail closed (ready を送らず終了) するのが安全側の挙動 — これを pin する
+    (`==` へ緩めて型を無視する変異等を防ぐ)。"""
+    frames, rlimit_calls, registry_calls = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"expected_parent_pid": bad_pid})
 
     assert frames == []
     assert rlimit_calls == []
@@ -853,6 +888,8 @@ def test_main_trade_claude_backend_binds_mcp_dispatcher_before_ready(
         monkeypatch, tmp_path, settings_mutator=to_claude)
 
     assert frames[0]["type"] == "ready"
+    # #54 (`verified-round1.md` 1-B): `ok is True` も見る (未検証だった)。
+    assert frames[0]["ok"] is True
     assert observed.get("sock_exists") is True, (
         "trade+claude で ready 送出時点で afx.sock が bind されていない")
     assert observed.get("sock_connect_ok") is True, (
@@ -1288,7 +1325,7 @@ def test_main_puts_reason_in_result_frame_for_improve_profile(
     def settings_mutator(settings_dict):
         pass  # improve は既定 settings のまま (backend=local)
 
-    frames, _, _ = _drive_main(
+    frames, _, registry_calls = _drive_main(
         monkeypatch, tmp_path,
         handshake_overrides={"worker_profile": "improve",
                              "db_path": None, "plugins_dir": None,
@@ -1297,6 +1334,10 @@ def test_main_puts_reason_in_result_frame_for_improve_profile(
                              "source_snapshot_dir": str(tmp_path / "source")},
         settings_mutator=settings_mutator,
         runner_cls=_FakeLocalRunnerWithReason)
+    # #62 (`verified-round1.md` 1-A): improve profile では trade 専用の
+    # build_mission_registry("trade", ...) ブロックが実行されないことを
+    # pin する (credentials 系の 1 本以外にも踏ませる)。
+    assert registry_calls == []
     result_frame = frames[-1]
     assert result_frame["type"] == "result"
     assert result_frame["reason"] == (
@@ -1400,6 +1441,8 @@ def test_ready_is_sent_only_after_mcp_dispatcher_socket_is_bound_for_improve_pro
         settings_mutator=settings_mutator)
 
     assert frames[0]["type"] == "ready"
+    # #54 (`verified-round1.md` 1-B): `ok is True` も見る (未検証だった)。
+    assert frames[0]["ok"] is True
     assert observed.get("sock_exists") is True, (
         "ready 送出時点で afx.sock が bind されていない (RW6)")
     assert observed.get("sock_connect_ok") is True, (
@@ -1511,15 +1554,20 @@ def test_main_does_not_set_os_environ_from_handshake_credentials_for_improve(
     monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
                         lambda **kw: None)
     try:
-        _drive_main(monkeypatch, tmp_path,
-                    handshake_overrides={
-                        "worker_profile": "improve", "db_path": None,
-                        "plugins_dir": None,
-                        "mission_id": "m-credentials-improve-test",
-                        "staging_dir": str(tmp_path / "staging" / "m-credentials-improve-test"),
-                        "source_snapshot_dir": str(tmp_path / "source"),
-                        "credentials": {"TWELVEDATA_API_KEY": "secret-td"}})
+        _, _, registry_calls = _drive_main(
+            monkeypatch, tmp_path,
+            handshake_overrides={
+                "worker_profile": "improve", "db_path": None,
+                "plugins_dir": None,
+                "mission_id": "m-credentials-improve-test",
+                "staging_dir": str(tmp_path / "staging" / "m-credentials-improve-test"),
+                "source_snapshot_dir": str(tmp_path / "source"),
+                "credentials": {"TWELVEDATA_API_KEY": "secret-td"}})
         assert "TWELVEDATA_API_KEY" not in os.environ
+        # #62 (`verified-round1.md` 1-A): trade 専用ブロック
+        # (build_mission_registry("trade", ...)) が improve では実行され
+        # ないことも同じテストで pin する。
+        assert registry_calls == []
     finally:
         os.environ.pop("TWELVEDATA_API_KEY", None)
 
@@ -1530,3 +1578,37 @@ def test_main_handles_missing_credentials_key_in_handshake(monkeypatch, tmp_path
     monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
     frames, _, _ = _drive_main(monkeypatch, tmp_path)  # handshake_overrides 無し
     assert frames[0]["type"] == "ready" and frames[0]["ok"] is True
+
+
+@pytest.mark.parametrize("credentials_value", [{}, None])
+def test_main_handles_empty_or_none_credentials_in_handshake(
+        monkeypatch, tmp_path, credentials_value):
+    """#61 (`verified-round1.md` 1-A): `credentials` の境界は「有効 1 キー」
+    「キー欠落」の 2 例のみだった — 空 dict / `None` を明示的に渡した場合も
+    `(handshake.get("credentials") or {}).items()` が空ループになり
+    KeyError/TypeError にならないことを pin する。"""
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"credentials": credentials_value})
+    assert frames[0]["type"] == "ready" and frames[0]["ok"] is True
+    assert "TWELVEDATA_API_KEY" not in os.environ
+
+
+def test_main_sets_os_environ_for_multiple_credentials_keys(monkeypatch, tmp_path):
+    """#61 (`verified-round1.md` 1-A): `credentials` が複数キーのとき、
+    ループが最初の 1 件だけで打ち切られる変異 (`break` 混入等) を殺す —
+    2 キーとも env に反映されることを pin する。"""
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPHAVANTAGE_API_KEY", raising=False)
+    try:
+        _drive_main(
+            monkeypatch, tmp_path,
+            handshake_overrides={"credentials": {
+                "TWELVEDATA_API_KEY": "secret-td",
+                "ALPHAVANTAGE_API_KEY": "secret-av"}})
+        assert os.environ["TWELVEDATA_API_KEY"] == "secret-td"
+        assert os.environ["ALPHAVANTAGE_API_KEY"] == "secret-av"
+    finally:
+        os.environ.pop("TWELVEDATA_API_KEY", None)
+        os.environ.pop("ALPHAVANTAGE_API_KEY", None)

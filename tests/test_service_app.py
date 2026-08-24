@@ -2935,6 +2935,44 @@ def test_check_codex_subscription_expiry_non_string_value_warns(tmp_path, caplog
     assert any("不正" in r.message for r in caplog.records)
 
 
+def test_check_cli_version_rejects_when_binary_cannot_be_executed(tmp_path):
+    """#84 (`verified-round1.md` 1-A): `except (OSError, TimeoutExpired)`
+    経路は `returncode != 0` の 1 例しか実測されていなかった。実行不能な
+    bin (存在しないファイル) を渡すと `subprocess.run` が `OSError` を
+    送出し、`RuntimeError` に変換されることを pin する。"""
+    from agentic_fx.service import _check_cli_version
+
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(RuntimeError, match="version check failed"):
+        _check_cli_version(missing)
+
+
+def test_check_cli_version_rejects_when_binary_times_out(tmp_path, monkeypatch):
+    """#84 (`verified-round1.md` 1-A): `subprocess.TimeoutExpired` 経路
+    (`timeout=15` の削除は既存 pin では検出されない) — sleep する bin を
+    渡し、`_check_cli_version` が呼ぶ `subprocess.run` の `timeout=` 引数を
+    強制的に短くする spy で実測する (`_check_cli_version` は関数内
+    `import subprocess` で標準 `subprocess` モジュールを束縛するため、
+    グローバルな `subprocess.run` を差し替えれば効く)。"""
+    import subprocess as _subprocess
+
+    from agentic_fx.service import _check_cli_version
+
+    sleeper = tmp_path / "sleeper.sh"
+    sleeper.write_text("#!/bin/sh\nsleep 5\n")
+    sleeper.chmod(0o700)
+
+    orig_run = _subprocess.run
+
+    def short_timeout_run(argv, **kwargs):
+        kwargs["timeout"] = 0.2
+        return orig_run(argv, **kwargs)
+
+    monkeypatch.setattr(_subprocess, "run", short_timeout_run)
+    with pytest.raises(RuntimeError, match="version check failed"):
+        _check_cli_version(sleeper)
+
+
 def test_build_app_rejects_llama_swap_when_not_verified(tmp_path):
     """M6: codex+llama_swap で llama_swap_verified=false なら拒否する。"""
     vendor_codex = _find_vendor_codex_bin()
@@ -3005,6 +3043,13 @@ def test_build_app_rewrites_relative_claude_bin_to_absolute_path(tmp_path, monke
             assert Path(resolved).is_absolute(), (
                 f"F1 是正が効いていない — settings.runner.claude.bin が"
                 f"相対のまま: {resolved!r}")
+            # #86 (`verified-round1.md` 1-A): `.is_absolute()` のみでは
+            # 「意図した bin に解決されたか」を見ていない (別の絶対パスに
+            # すり替わっても通る) — 実際に PATH 解決したはずの fake_claude
+            # 自身に一致することまで pin する。
+            assert resolved == str(fake_claude.resolve()), (
+                f"意図しない bin に解決されている: {resolved!r} != "
+                f"{fake_claude.resolve()!r}")
             # build_launcher_argv が拒否しない (ValueError を出さない) こと
             argv = build_launcher_argv(_os.getpid(), [resolved])
             assert argv[-1] == resolved
