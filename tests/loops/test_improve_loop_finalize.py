@@ -494,7 +494,18 @@ def test_finalize_gate_failed_sets_backlog_observation_with_reason(
         loop_min, conn, mission_and_run_fixture, tmp_path):
     """§4.3: ゲート不合格/評価不能 → backlog は `observation`、
     `last_result` は呼び出し元が渡した reason そのまま。承認申請は出さず
-    mission は `completed`/`result=NULL` で終端 (取引を止めない — R8)。"""
+    mission は `completed` で終端 (取引を止めない — R8)。
+
+    逐語乖離の申告 (着手前検証、D-15 是正): 旧稿は `improvement_runs.
+    result IS NULL` (report を一切書かない) を pin していたが、これは
+    Task 10 の未完成時点の実装をそのまま固定した stale pin だった。
+    設計書 §4.2 手順6「ゲート不合格・評価不能・observation・敗者のとき、
+    reports に書く」および `tests/loops/test_improve_e2e.py` の複数の
+    E2E (`test_gate_failure_stops_at_report_no_approval_request` 等、
+    `_finalize_loser` と同じ outbox 経路を前提にしている) と整合させ、
+    `_finalize_gate_failed` にもレポート生成を追加した (D-15 是正)。
+    ここでは `result='report'`/`report_state` が `prepared`/`published`
+    のいずれかになることを検証する形に更新する。"""
     mission_id, run_id, backlog_id = mission_and_run_fixture
     from agentic_fx.store import backlog as backlog_store
     backlog_store.select_for_mission(conn, backlog_id,
@@ -518,9 +529,11 @@ def test_finalize_gate_failed_sets_backlog_observation_with_reason(
     m = conn.execute("SELECT status FROM missions WHERE id=?",
                      (mission_id,)).fetchone()
     assert m["status"] == "completed"
-    r = conn.execute("SELECT result FROM improvement_runs WHERE id=?",
-                     (run_id,)).fetchone()
-    assert r["result"] is None
+    r = conn.execute(
+        "SELECT result, report_state FROM improvement_runs WHERE id=?",
+        (run_id,)).fetchone()
+    assert r["result"] == "report"
+    assert r["report_state"] in ("prepared", "published")
     b = conn.execute(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
         (backlog_id,)).fetchone()

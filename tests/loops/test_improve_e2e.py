@@ -8,6 +8,7 @@ WorkerRunner (実サブプロセス) は monkeypatch で FakeImproveWorkerRunner
 # precheck 2026-08-22 wave2: T12-B1 T12-B2 T12-M4
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -82,8 +83,8 @@ def _write_staging_plugin(staging_dir: Path, name: str,
                           test_plugin: str) -> Path:
     """FakeImproveWorkerRunner はサブプロセスを起こさないため、`prepare()` が
     作った staging_dir へ候補 3 本を直接置く (worker が書くはずの内容を
-    テストが代理で書く)。Task 10 では staging_dir は
-    root/improve-staging-<mission_id> である。"""
+    テストが代理で書く)。staging_dir は正規形
+    `plugins/_staging/<mission_id>` (D-15 是正、設計書 §2.2/§2.3) である。"""
     candidate = staging_dir / name
     candidate.mkdir(parents=True)
     (candidate / "plugin.py").write_text(plugin_py, encoding="utf-8")
@@ -108,6 +109,35 @@ def test_compute_returns_value():
     from plugin import compute
     df = pd.DataFrame({"close": [1.0, 2.0, 3.0]})
     assert compute(df, {})["value"] == 3.0
+"""
+
+# strategy kind 用の候補 3 本 (D-15 是正: `test_strategy_below_evaluable_
+# min_trades_becomes_observation`/`test_strategy_baseline_falls_back_to_
+# no_strategy_row` は `_plugin_artifact(..., kind="strategy")` で agent の
+# 申告を strategy にしていたが、実際に staging へ書く候補は
+# `_PASSING_INDICATOR_CONFIG` (`kind: indicator`) のままだった — 実装は
+# `config.yaml` の `kind` (agent の申告ではなく実体) で strategy ゲートを
+# 出し分ける (`_read_candidate_kind`) ため、この乖離により strategy 採用
+# ゲート自体が一度も発火せず素通りしていた (逐語乖離の申告)。
+# `plugin/loader._KIND_FUNCS["strategy"]` が要求する
+# `evaluate(df, indicators, signals, params)` を実装する最小候補。
+_PASSING_STRATEGY_PY = """
+def evaluate(df, indicators, signals, params):
+    return {"action": "hold", "rationale": "e2e fixture always holds"}
+"""
+_PASSING_STRATEGY_CONFIG = """
+kind: strategy
+pairs: [USDJPY]
+timeframe: 1h
+exit_mode: levels
+params: {}
+"""
+_PASSING_STRATEGY_TEST = """
+def test_evaluate_returns_hold():
+    import pandas as pd
+    from plugin import evaluate
+    df = pd.DataFrame({"close": [1.0, 2.0, 3.0]})
+    assert evaluate(df, {}, [], {})["action"] == "hold"
 """
 
 # test_plugin.py が plugin.py の書き換えを試みる不合格候補 (§4.2-3e の主 pin と
@@ -219,7 +249,16 @@ def test_full_cycle_discovery_to_backlog_transition(improve_env):
 
 def test_gate_failure_stops_at_report_no_approval_request(improve_env):
     """候補がゲート不合格 (test_plugin.py が plugin.py を書き換えようとする)
-    のとき、承認申請は出ず、レポートのみで backlog が observation に落ちる。"""
+    のとき、承認申請は出ず、レポートのみで backlog が observation に落ちる。
+
+    逐語乖離の申告 (着手前検証): `_finalize_gate_failed` は report を
+    一切書かずに終端していた (`run_result=None`/`report_state='none'`
+    のまま)。`_finalize_loser`/`_prepare_report_if_applicable` は既に
+    `<root>/data/improve_reports/improve-<mission_id>.md` へ書く実装が
+    3 箇所で揃っている (プラン本文 L20140 の逐語もこの形) ため、D-15 是正
+    は `_finalize_gate_failed` にも**同じ既存の規約**でレポート生成を
+    追加する — 新しい命名 (`root/"reports"` や日付入りファイル名) は
+    導入しない。テスト側のパスをこの既存規約に合わせて直す。"""
     app, root = improve_env
     conn = app.conn_core
 
@@ -255,7 +294,7 @@ def test_gate_failure_stops_at_report_no_approval_request(improve_env):
     assert backlog_row[0] == "observation"
     assert backlog_row[1].startswith("gate_failed:")
 
-    report_files = list((root / "reports").glob("improve-*.md"))
+    report_files = list((root / "data" / "improve_reports").glob("improve-*.md"))
     assert len(report_files) == 1
 
     live = root / "plugins" / "bad_gate_e2e"
@@ -271,7 +310,24 @@ def test_concurrent_duplicate_selection_loser_becomes_observation(improve_env):
     `backlog_row` を fetch しても未使用のまま、killer は目視確認頼みだった。
     ここでは 2 スレッド + 別接続 (`db_write_conn_factory` が呼び出しごとに
     新しい接続を作る現物契約を利用) を使い、`loop.commit()` 呼び出し直前で
-    `threading.Barrier(2)` により実際に競合させる。"""
+    `threading.Barrier(2)` により実際に競合させる。
+
+    着手前検証で発見した実バグの是正 (1815 errors の根本原因): 旧版は
+    `unittest.mock.patch("…WorkerRunner", …)` を**各スレッドの内側**で
+    個別に `with` していた。`patch.__enter__`/`__exit__` は同一ターゲット
+    への並行呼び出しに対して原子的でない (各スレッドが `__enter__` 時点の
+    値を「元の値」として捕まえ、`__exit__` で早く終わった方がそれを書き
+    戻すため、遅い方の `__exit__` が最終的にどちらか一方のスレッド用
+    lambda を `agentic_fx.runners.worker_runner.WorkerRunner` に永久に
+    書き戻してしまう)。この 1 テストの実行だけで `WorkerRunner` が
+    プロセス終了までクラス→関数に化け、以降の**全テスト**の
+    `tests/conftest.py::_forbid_worker_spawn_against_real_llama_swap`
+    autouse fixture が `WorkerRunner.run` の属性アクセスで
+    `AttributeError` になり、スイート全体が芋づる式に ERROR になっていた
+    (`pytest tests/loops/test_improve_e2e.py::test_concurrent_duplicate_selection_loser_becomes_observation
+    tests/tools/test_registry.py::test_register_and_names` で単独再現・
+    確認済み)。patch はメインスレッドで**両スレッドの起動〜join を囲む
+    1 回だけ**に統一し、結果はスレッド名で振り分ける。"""
     import threading
 
     app, root = improve_env
@@ -284,9 +340,22 @@ def test_concurrent_duplicate_selection_loser_becomes_observation(improve_env):
         out["selected"] = {"backlog_id": backlog_id, "idea": "shared idea"}
         return out
 
+    results = {
+        name: MissionResult(status="completed",
+                            output=_selected_output(name), transcript=[])
+        for name in ("winner_e2e", "loser_e2e")
+    }
+
     barrier = threading.Barrier(2)
     mission_ids: dict[str, int] = {}
     errors: list[BaseException] = []
+
+    def _worker_runner_factory(**kw):
+        # スレッド名で対応する fake 結果を振り分ける (Thread(name=...) で
+        # 設定する)。単一 patch を両スレッドで共有するため、ここは
+        # 読取専用の dict 参照だけで完結し競合しない。
+        name = threading.current_thread().name
+        return FakeImproveWorkerRunner(result=results[name], **kw)
 
     def _run_one(name: str) -> None:
         try:
@@ -298,44 +367,69 @@ def test_concurrent_duplicate_selection_loser_becomes_observation(improve_env):
                     root / "data" / "agentic.db"),
                 activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
             )
-            result = MissionResult(status="completed",
-                                  output=_selected_output(name), transcript=[])
-            with patch("agentic_fx.runners.worker_runner.WorkerRunner",
-                       lambda **kw: FakeImproveWorkerRunner(
-                           result=result, **kw)):
-                mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
-                _write_staging_plugin(
-                    ctx.staging_dir, name,
-                    _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
-                    _PASSING_INDICATOR_TEST)
-                mission_ids[name] = ctx.mission_id
-                mission_result = worker.run(mission)
-                barrier.wait(timeout=10)  # 両スレッドの commit を競合させる
-                loop.commit(mission=mission, ctx=ctx, result=mission_result,
-                           now=NOW)
+            mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+            _write_staging_plugin(
+                ctx.staging_dir, name,
+                _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
+                _PASSING_INDICATOR_TEST)
+            mission_ids[name] = ctx.mission_id
+            mission_result = worker.run(mission)
+            barrier.wait(timeout=10)  # 両スレッドの commit を競合させる
+            loop.commit(mission=mission, ctx=ctx, result=mission_result,
+                       now=NOW)
         except BaseException as exc:  # noqa: BLE001 — スレッド内例外を回収
             errors.append(exc)
 
-    threads = [threading.Thread(target=_run_one, args=(name,))
-              for name in ("winner_e2e", "loser_e2e")]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30)
+    threads = [threading.Thread(target=_run_one, args=(name,), name=name)
+              for name in results]
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               _worker_runner_factory):
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
     assert errors == [], f"thread(s) raised: {errors!r}"
 
     backlog_row = conn.execute(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
         (backlog_id,)).fetchone()
-    # 二重の承認申請が無いことが本テストの主 killer。
+    # 二重の承認申請が無いことが本テストの主 killer。3(iii) 是正: 旧稿は
+    # `<= 1` だったため両スレッドが失敗して 0 件でも素で pass する弱い
+    # assert だった (CAS 敗者経路を実際に検証していない)。勝者は必ず
+    # ゲートを通って承認申請を 1 件出すはずなので `== 1` に強化する。
     approval_count = conn.execute(
         "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'").fetchone()[0]
-    assert approval_count <= 1
-    # M-2 で未使用のまま残っていた backlog_row を実際に使う: CAS に負けた
-    # 側の遷移が必ず記録され「selected」のまま止まらないことを確認する
-    # (`selected` のまま = どちらの CAS も成功しておらず状態機械が壊れている)。
-    assert backlog_row[0] != "selected"
+    assert approval_count == 1
+    # M-2 で未使用のまま残っていた backlog_row を実際に使う。逐語乖離の
+    # 申告 (着手前検証): 旧稿は「`selected` のまま止まらないこと」を
+    # 期待していたが、これは §4.3 状態表と矛盾する — 勝者がゲートを通り
+    # 承認申請 (pending) を出す経路は「selected (据え置き)」が正しい遷移
+    # であり (`_finalize_success` の `backlog_transition`)、敗者は backlog
+    # に一切触れない (`_finalize_loser` の docstring 参照)。実際に競合が
+    # 起きた/起きなかったの判定基準は「selected かどうか」ではなく
+    # `last_result` が `approval_pending:<id>` になっているか (= 勝者の
+    # Tx-2 が実行された証跡) で行う。
+    assert backlog_row[0] == "selected"
     assert backlog_row[1] is not None
+    assert backlog_row[1].startswith("approval_pending:")
+
+    # 3(iii) 是正: 勝者・敗者それぞれの mission が実際に別の終端状態へ
+    # 落ちたことを直接確認する (CAS 敗者経路そのものの実測)。勝者は
+    # ゲート通過 (approval_pending)、敗者は Tx-1 CAS 負けの「重複のため
+    # 見送り」レポート終端 (`result='report'`) — どちらの mission_id が
+    # 勝者/敗者になるかは Barrier のタイミング依存で非決定なので、
+    # 集合として検証する。
+    run_rows = {
+        name: conn.execute(
+            "SELECT result FROM improvement_runs WHERE mission_id=?",
+            (mission_ids[name],)).fetchone()
+        for name in results
+    }
+    run_results = sorted(row["result"] for row in run_rows.values())
+    assert run_results == ["approval", "report"], (
+        "勝者 (承認申請発行, result='approval') と敗者 "
+        "(重複見送りレポート, result='report') の 1 組にならなかった: "
+        f"{run_results!r}")
 
 
 _MISSION_MAX_TURNS_ATTR = "improve.mission_max_turns"  # 参考: §7.1-2 対応表脚注
@@ -426,18 +520,40 @@ def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
         mission_result = worker.run(mission)
         loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
 
-    payload = conn.execute(
+    payload_json = conn.execute(
         "SELECT payload_json FROM approval_requests WHERE kind='plugin'").fetchone()[0]
-    assert "9999" not in payload
-    assert "100000" not in payload
-    assert '"trial_count": 0' in payload or "'trial_count': 0" in payload
+    payload = json.loads(payload_json)
+    # 逐語乖離の申告 (着手前検証): 旧稿は payload の JSON 文字列全体に
+    # "9999"/"100000" が含まれないことを assert していたが、設計書
+    # §4.2-5 は `selection_rationale: <agent>` を**そのまま**保存すると
+    # 明記している — 本テストが agent 出力として与えた
+    # `selection_rationale` 自体に "9999"/"100000" の文字列を含むため、
+    # 文字列全体を見る assert は「保護されているべきでないフィールド」
+    # まで検査してしまい、実装が正しくてもほぼ確実に落ちる (実際に
+    # 落ちた)。台帳由来であるべきフィールド (`analysis_run_ids`/
+    # `trial_count`) だけを個別に検査する形に直す。
+    assert payload["analysis_run_ids"] == []
+    assert payload["trial_count"] == 0
+    assert payload["analysis_call_count"] == 0
+    assert payload["selection_rationale"] == (
+        "used analysis_run_ids=[9999,9998] trial_count=100000")
 
 
 def test_strategy_below_evaluable_min_trades_becomes_observation(improve_env):
     """§4.2-4: strategy artifact の合計取引数が `EVALUABLE_MIN_TRADES` (=30)
     未満なら承認申請を出さず observation に落ちる (`insufficient_trades:<n>`)。
     `run_holdout_gate` は呼ばれない (評価不能で holdout に進まないこと自体が
-    このテストの killer)。"""
+    このテストの killer)。
+
+    逐語乖離の申告 (着手前検証): 旧稿は `_plugin_artifact(..., kind=
+    "strategy")` で agent の申告を strategy にしていたが、実際に staging
+    へ書く候補は `_PASSING_INDICATOR_CONFIG` (`kind: indicator`) のまま
+    だった。strategy 採用ゲートの発火可否は `_read_candidate_kind` が
+    config.yaml の実体を読んで決める (agent の申告は信用しない、§4.2-1)
+    ため、この乖離により strategy ゲート自体が一度も発火せず素通りして
+    いた (approval_count が 0 でなく 1 になっていた)。`_PASSING_STRATEGY_*`
+    (`evaluate(df, indicators, signals, params)` を実装、`kind: strategy`)
+    に差し替える。"""
     app, root = improve_env
     conn = app.conn_core
 
@@ -467,8 +583,8 @@ def test_strategy_below_evaluable_min_trades_becomes_observation(improve_env):
         mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
             ctx.staging_dir, "low_trades_strategy_e2e",
-            _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
-            _PASSING_INDICATOR_TEST)
+            _PASSING_STRATEGY_PY, _PASSING_STRATEGY_CONFIG,
+            _PASSING_STRATEGY_TEST)
         mission_result = worker.run(mission)
         loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
 
@@ -559,9 +675,12 @@ def test_report_tmp_symlink_fails_closed(improve_env):
             ctx.staging_dir, "bad_gate_symlink_e2e",
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _FAILING_INDICATOR_TEST)  # ゲート不合格 → レポート経路へ入る
-        tmp_dir = root / "reports" / ".tmp"
+        # 逐語乖離の申告 (着手前検証): outbox の実パスは
+        # `data/improve_reports` (`test_gate_failure_stops_at_report_
+        # no_approval_request` のコメント参照、`root/"reports"` ではない)。
+        tmp_dir = root / "data" / "improve_reports" / ".tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        evil_target = root / "reports" / ".tmp" / "evil-target.md"
+        evil_target = tmp_dir / "evil-target.md"
         evil_target.write_text("should never be reached", encoding="utf-8")
         (tmp_dir / f"improve-{ctx.mission_id}.md.part").symlink_to(
             evil_target)
@@ -615,18 +734,40 @@ def test_timeout_mission_leaves_no_backtest_or_analysis_run_rows(
     with patch("agentic_fx.runners.worker_runner.WorkerRunner",
                lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
         mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
-        # ctx.rpc_handlers を実際に叩いてから timeout を確定させる —
-        # 台帳に entries が積まれた状態でも DISCARD されることを確認する。
-        if "run_backtest" in ctx.rpc_handlers:
-            try:
-                ctx.rpc_handlers["run_backtest"]({"pair": "USDJPY"})
-            except Exception:
-                pass  # fake 引数が不正でも呼出し自体が台帳へ積まれれば良い
-        if "analyze_corr" in ctx.rpc_handlers:
-            try:
-                ctx.rpc_handlers["analyze_corr"]({"pairs": ["USDJPY"]})
-            except Exception:
-                pass
+        # `run_backtest_handler` は `plugin_loader._discover_one` を
+        # try/except の外で呼ぶため、候補ディレクトリ自体が存在しないと
+        # (`FileNotFoundError`) ここで直接クラッシュする — 台帳記録に
+        # 到達させるため実在する strategy 候補を置く (中身の合否は
+        # 本テストの関心外、`_discover_one` が発見できればよい)。
+        _write_staging_plugin(
+            ctx.staging_dir, "ledger_probe_e2e",
+            _PASSING_STRATEGY_PY, _PASSING_STRATEGY_CONFIG,
+            _PASSING_STRATEGY_TEST)
+        # 逐語乖離の申告 (着手前検証): `ctx.rpc_handlers` は台帳記録の
+        # **前段** (`_build_rpc_handlers` の生 handler) であり、
+        # `ledger.record(...)` の呼出しは 1 段上の
+        # `agentic_fx.tools.improve_rpc_tools.build_improve_rpc_tooldefs`
+        # が返す tool 関数の中にある (handler の戻り値をラップして
+        # record してから strip する)。旧稿は生 handler を直接呼んでいた
+        # ため台帳には一切積まれず (かつ引数に `name` が無いため
+        # `KeyError` で即例外)、`except: pass` に飲まれて空洞化していた
+        # (M-3 コメントが警告していた欠陥そのもの)。実際に呼ばれる経路
+        # (tool 関数) を通す形に直す。
+        from agentic_fx.tools.improve_rpc_tools import (
+            build_improve_rpc_tooldefs,
+        )
+        tooldefs = {
+            td.name: td.func for td in build_improve_rpc_tooldefs(
+                ledger=ctx.ledger,
+                run_backtest_handler=ctx.rpc_handlers["run_backtest"],
+                analyze_corr_handler=ctx.rpc_handlers["analyze_corr"])
+        }
+        # `run_backtest` は staging に候補が無いため内部で失敗するが、
+        # handler 自身が例外を飲んで `{"error": "backtest_failed"}` を
+        # 返す設計 (`_build_rpc_handlers.run_backtest_handler`) なので
+        # tool 関数は正常終了し `ledger.record` まで到達する。
+        tooldefs["run_backtest"](name="ledger_probe_e2e", pair="USDJPY")
+        tooldefs["analyze_corr"](request={"pairs": ["USDJPY"]})
         mission_result = worker.run(mission)
         loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
 
@@ -672,7 +813,10 @@ def test_report_creation_failure_leaves_result_null(improve_env):
             root / "data" / "agentic.db"),
         activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
     )
-    tmp_dir = root / "reports" / ".tmp"
+    # 逐語乖離の申告 (着手前検証): outbox の実パスは `data/improve_reports`
+    # (`test_gate_failure_stops_at_report_no_approval_request` のコメント
+    # 参照、`root/"reports"` ではない)。
+    tmp_dir = root / "data" / "improve_reports" / ".tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir.chmod(0o500)  # 書込不可 (自分の書込みビットだけ落とす)
     try:
@@ -738,7 +882,12 @@ def test_strategy_baseline_falls_back_to_no_strategy_row(improve_env):
     baseline 行だけを pin する — holdout 側は別途骨格実装時に追加検討)。
     `backtest_runs.mission_id` 列は Task 10 が追加する (本ファイル冒頭の
     `test_timeout_mission_leaves_no_backtest_or_analysis_run_rows` の
-    docstring 参照)。"""
+    docstring 参照)。
+
+    逐語乖離の申告 (着手前検証): `test_strategy_below_evaluable_min_
+    trades_becomes_observation` と同じ乖離 — 実際に staging へ書く候補が
+    `_PASSING_INDICATOR_CONFIG` (`kind: indicator`) のままで strategy
+    ゲートが発火しなかった。`_PASSING_STRATEGY_*` に差し替える。"""
     app, root = improve_env
     conn = app.conn_core
 
@@ -761,8 +910,8 @@ def test_strategy_baseline_falls_back_to_no_strategy_row(improve_env):
         mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
         _write_staging_plugin(
             ctx.staging_dir, "no_baseline_strategy_e2e",
-            _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
-            _PASSING_INDICATOR_TEST)
+            _PASSING_STRATEGY_PY, _PASSING_STRATEGY_CONFIG,
+            _PASSING_STRATEGY_TEST)
         mission_result = worker.run(mission)
         loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
 
@@ -822,7 +971,12 @@ def test_report_outbox_state_transitions_published_then_rename_failure(
     assert run1[0] == "published"
     final_path1 = root / run1[1]
     assert final_path1.exists()
-    assert not (root / "reports" / ".tmp" /
+    # 逐語乖離の申告 (着手前検証): 実装の outbox 規約は
+    # `data/improve_reports/improve-<mission_id>.md` (3 箇所の既存実装
+    # ・プラン本文 L20140 と一致、`root/"reports"`/日付入りファイル名は
+    # 導入しない — 詳細は `test_gate_failure_stops_at_report_no_approval_
+    # request` のコメント参照)。テスト側のパスをこれに合わせる。
+    assert not (root / "data" / "improve_reports" / ".tmp" /
                f"improve-{ctx1.mission_id}.md.part").exists()
 
     # --- 2 本目: 最終名を先取りして rename 公開を失敗させる ---
@@ -835,7 +989,8 @@ def test_report_outbox_state_transitions_published_then_rename_failure(
             ctx2.staging_dir, "outbox_fail_e2e",
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _FAILING_INDICATOR_TEST)
-        expected_final = root / "reports" / f"improve-{NOW:%Y-%m-%d}-{ctx2.mission_id}.md"
+        expected_final = (root / "data" / "improve_reports" /
+                          f"improve-{ctx2.mission_id}.md")
         expected_final.parent.mkdir(parents=True, exist_ok=True)
         expected_final.write_text("pre-existing, blocks RENAME_NOREPLACE",
                                   encoding="utf-8")
