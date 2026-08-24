@@ -945,7 +945,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         improve_supervisor = ImproveSupervisor(
             capacity=settings.improve.parallel, root=root, settings=settings,
             clock=clock, db_path=root / "data" / "agentic.db",
-            stop_event=stop_event)
+            stop_event=stop_event, activity=activity)
         # プラン10 Task10-12 Step1: ImproveLoop を構築し
         # `improve_supervisor._improve_loop` へ注入する (R-i2 — Tx-0 の
         # slot claim は ImproveLoop.prepare の責務、ImproveSupervisor は

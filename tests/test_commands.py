@@ -175,12 +175,20 @@ def test_approve_already_decided(tmp_path):
 
 
 def test_approve_nonexistent(tmp_path):
-    """F2: 存在しない id への approve は例外でなくメッセージを返す。"""
+    """F2: 存在しない id への approve は例外でなくメッセージを返す。
+
+    E1 裁定 (2026-08-25、確定-8 と同じ軸の欠陥の是正): この assertion は
+    元々「決定済み」という文言を pin していたが、それは E1 是正前の
+    `apply_decision` が「ID 不存在」と「CAS 失敗 (決定済み)」を同一例外に
+    混同していた頃の副産物だった。存在しない approval を「決定済み」と
+    報告するのは E1 が正そうとしている混同そのものであるため、期待する
+    文言を「存在しません」に書き換える (既存テスト書き換え禁止の例外 —
+    欠陥の是正として申告)。"""
     _, _, _, cmds = _commands(tmp_path)
     out = cmds.dispatch("approve 9999")
-    # 例外を投げずに文字列を返すこと（AlreadyDecidedError でメッセージが返される）
+    # 例外を投げずに文字列を返すこと
     assert isinstance(out, str)
-    assert "決定済み" in out
+    assert "存在しません" in out
 
 
 def test_killswitch_reset(tmp_path):

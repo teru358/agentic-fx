@@ -250,11 +250,14 @@ class Commands:
                 return "policy に追記しました"
         except ApprovalNotFoundError:
             # E1 裁定 (2026-08-25): 「ID 不存在」は「CAS 失敗 (決定済み)」と
-            # 文言を分ける。既存の `test_approve_nonexistent` は「決定済み」
-            # という語が出力に含まれることを pin しているため (既存テスト
-            # 書き換え禁止)、より具体的な文言に「決定済み」を包含させる
-            # 形で両立させる (逸脱として最終報告に明記)。
-            return "その approval は存在しません（決定済み扱いとして拒否）"
+            # 文言を分ける。既存の `test_approve_nonexistent` が pin して
+            # いた「決定済み」という文言は、E1 是正前の apply_decision が
+            # 両ケースを同一例外に混同していた頃の副産物であり、そのまま
+            # 残すと「存在しない approval を決定済み扱いにした」という
+            # E1 が正そうとしている混同そのものを再生産してしまう。
+            # 確定-8 と同じ「欠陥の是正」として既存テストのアサーションも
+            # 書き換える (最終報告の逸脱に明記)。
+            return f"approval #{approval_id} は存在しません"
         except AlreadyDecidedError:
             return "その approval は決定済みです"
         except (ValueError, KeyError) as e:
