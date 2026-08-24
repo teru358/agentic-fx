@@ -170,13 +170,23 @@ def test_history_git_worktree_stays_clean_no_porcelain_used(tmp_path):
         or "this operation must be run in a work tree" in (status.stderr + status.stdout).lower()
 
 
-def test_git_never_called_from_scheduler_thread(monkeypatch, tmp_path):
+@pytest.mark.parametrize("thread_name", ["scheduler", "scheduler-thread"])
+def test_git_never_called_from_scheduler_thread(monkeypatch, tmp_path, thread_name):
     """§5.4: scheduler スレッドから git サブプロセスが呼ばれないこと。
     `record_version` 内部の `subprocess.run` 呼び出しを検査し、呼び出し元
     スレッド名が 'scheduler' なら AssertionError にするテスト用フック
     (実装は `history_git._assert_not_scheduler_thread()` を record_version
-    冒頭に置き、テストはスレッド名 'scheduler-thread' から呼んで例外を
-    assert する)。"""
+    冒頭に置き、テストはスレッド名から呼んで例外を assert する)。
+
+    確定-8 是正 (2026-08-25、verified-local-round1.md): 旧稿は
+    `'scheduler-thread'` という `startswith('scheduler')` にのみ引っかかる
+    テスト用の名前でしか検証しておらず、本番の実スレッド名 `'scheduler'`
+    (`service.py:1342` `threading.Thread(..., name="scheduler")`) を
+    `_assert_not_scheduler_thread` の `startswith` から `==
+    'scheduler-thread'` へ退行させる変異 (`a15_src_exact`) が SURVIVED
+    だった (=「テストが通る最小実装」に退行させると本番のガードが完全に
+    無効化される)。本番名を必ず parametrize に含める形に是正する
+    (既存テストの修正だが、これは欠陥の是正 — 確定-8 の申告どおり)。"""
     d, a, c = _make_version(tmp_path / "plugins", "sma")
     errors = []
 
@@ -188,7 +198,7 @@ def test_git_never_called_from_scheduler_thread(monkeypatch, tmp_path):
         except history_git.SchedulerThreadForbiddenError as e:
             errors.append(e)
 
-    t = threading.Thread(target=run_as_scheduler, name="scheduler-thread")
+    t = threading.Thread(target=run_as_scheduler, name=thread_name)
     t.start()
     t.join()
     assert len(errors) == 1
