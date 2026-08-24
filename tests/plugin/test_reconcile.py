@@ -180,3 +180,57 @@ def test_sweep_alone_does_not_delete_version_referenced_by_open_journal(env):
     switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
     # gc_roots ④ が非終端ジャーナルの new_target を含むため消えない
     assert d3.exists()
+
+
+def test_sweep_orphans_deletes_staging_candidate_without_pending_approval(env):
+    """確定-10: `sweep_orphans` ① (孤児 staging 削除) には既存テストが
+    1 本も無かった (`tests/plugin/test_reconcile.py` の sweep テストは
+    版ディレクトリ ②③ だけを扱う)。対応する pending approval_request の
+    候補パスが無い staging 候補は削除される。"""
+    tmp_path, plugins_dir, conn = env
+    candidate_dir = plugins_dir / "_staging" / "1" / "orphan"
+    candidate_dir.mkdir(parents=True)
+    (candidate_dir / "plugin.py").write_text("x")
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+
+    assert not candidate_dir.exists()
+
+
+def test_sweep_orphans_preserves_staging_candidate_referenced_by_pending_approval(env):
+    """確定-10 の対称側: pending approval が参照している staging 候補は
+    削除されない。"""
+    tmp_path, plugins_dir, conn = env
+    candidate_dir = plugins_dir / "_staging" / "1" / "kept"
+    candidate_dir.mkdir(parents=True)
+    (candidate_dir / "plugin.py").write_text("x")
+    approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "kept", "artifact_hash": "a" * 64, "content_hash": "x",
+                 "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/1/kept"}, now=NOW)
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+
+    assert candidate_dir.exists()
+
+
+def test_sweep_orphans_preserves_temp_link_of_open_journal(env):
+    """確定-11: `sweep_orphans` ④ の `gc_roots` 除外が pin されていな
+    かった (`test_gc_roots_includes_temp_link_path_itself` は gc_roots の
+    戻り値しか見ておらず、sweep_orphans がそれを尊重するかを見ていない)。
+    非終端ジャーナルの temp link は gc_roots に含まれるため sweep で
+    消えないことを直接確認する。"""
+    tmp_path, plugins_dir, conn = env
+    op_id = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="mid", old_kind="absent",
+        old_target=None, new_target=f".versions/mid/{'a' * 64}",
+        switch_required=True, actor="human", now=NOW, commit=True)
+    temp_path = plugins_dir / f".mid.link-{op_id}"
+    temp_path.symlink_to(".versions/mid/" + "a" * 64)  # 実体は無くて良い (dangling)
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+
+    assert temp_path.is_symlink(), (
+        "非終端ジャーナルが参照する temp link が sweep_orphans ④ で "
+        "消されてしまった (確定-11 の欠陥)")
