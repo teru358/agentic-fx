@@ -393,6 +393,60 @@ def test_run_gate_pytest_cannot_read_unrelated_tmp_file(tmp_path, settings):
         os.rmdir(outside_dir)
 
 
+def test_run_gate_pytest_candidate_can_use_tmp_path_fixture(tmp_path, settings):
+    """B2/3 (`stage0-bundle-B.md` Minor) 再実測メモ: 既存の
+    `cannot_read_unrelated_tmp_file` は候補が「明示的に外部の tmp file
+    を開く」経路のみを見ており、`TMPDIR`/`--basetemp` の配線そのもの
+    (候補が pytest 標準の `tmp_path` フィクスチャを使う経路) を一度も
+    踏んでいなかった。単独再実測 (`TMPDIR` の env 追加と `--basetemp`
+    引数の両方を削る変異を注入): この pin も含めフルスイートは緑のまま
+    ——**真の SURVIVED を再確認した**が、実測の結果 `TMPDIR`/`--basetemp`
+    を落としても `/tmp`/`/var/tmp`/`/usr/tmp` は Landlock の read_write
+    allowlist に無いため書込が EACCES になり、CPython
+    `tempfile._get_default_tempdir()` は候補リストの最後の要素である
+    `os.getcwd()` (= gate worker の `cwd=workdir`) へ自動的にフォール
+    バックする — 結果として `TMPDIR`/`--basetemp` が無くても tmp_path は
+    依然として gate workdir 配下に閉じ込められる (Landlock 自体が既に
+    fail closed で、`stage0-bundle-B.md` の「docstring 過大主張」という
+    評価どおり)。したがって本テストは退行防止としては有用だが、
+    `TMPDIR`/`--basetemp` 削除変異を殺すテストとしては機能しない
+    (この環境では経験的に kill 不能) — 追加の pin は見送り、この事実を
+    記録するに留める (`measurement-is-environment-bound`)。"""
+    _skip_if_no_landlock()
+    use_tmp_path_fixture = (
+        "def test_uses_tmp_path_fixture(tmp_path):\n"
+        "    (tmp_path / 'x.txt').write_text('ok')\n"
+        "    assert (tmp_path / 'x.txt').read_text() == 'ok'\n")
+    d = _write_candidate(tmp_path, test_py=use_tmp_path_fixture)
+    result = run_gate_pytest(d, settings=settings)
+    assert result.passed is True, result.stdout_tail
+
+
+def test_gate_pytest_worker_argv_pins_cacheprovider_and_rootdir():
+    """B4a/B4b (`stage0-bundle-B.md` Minor): `-p no:cacheprovider` の削除
+    (単独)、および削除 + `--rootdir` を `workdir` → `plugin_dir` に差し
+    替える変異は、いずれも実プロセスの振る舞い pin ではフルスイート緑の
+    まま生存する (候補 dir が ro のため `.cache` 書込は他の理由で
+    fail closed し、`--rootdir` の変更も収集結果を変えない — 台帳 6-B
+    M7 / 是正 C4 の「M7 は恒久的に unkillable」を裏取り済み)。振る舞いで
+    殺せない「無いと壊れるが、あっても観測されない」ハードニングは、
+    `stage0-bundle-B.md` §台帳へのフィードバック 6 が推奨するとおり
+    argv の**静的 pin** (ソース文字列上に期待する引数が存在すること) に
+    置き換える。"""
+    worker_src = (
+        Path(__file__).resolve().parents[2] / "src" / "agentic_fx"
+        / "plugin" / "gate_pytest_worker.py").read_text()
+    call_start = worker_src.index("rc = pytest.main([")
+    call_end = worker_src.index("])", call_start) + 2
+    argv_literal = worker_src[call_start:call_end]
+    assert '"-p", "no:cacheprovider"' in argv_literal, (
+        "gate_pytest_worker.py の pytest.main argv から "
+        "'-p', 'no:cacheprovider' が消えている")
+    assert '"--rootdir", str(workdir)' in argv_literal, (
+        "--rootdir の値が workdir でなくなっている "
+        "(plugin_dir 等へのすり替えを検出)")
+
+
 def test_run_gate_pytest_asserts_pycache_prefix(tmp_path, settings):
     """gate worker が起動直後に `sys.pycache_prefix` を assert する —
     `PYTHONPYCACHEPREFIX` を Popen env に置かない変異は red になる。"""

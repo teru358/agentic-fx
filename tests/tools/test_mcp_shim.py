@@ -81,6 +81,9 @@ def test_initialize_returns_protocol_version_and_capabilities(tmp_path):
     assert resp["result"]["protocolVersion"] == dispatcher.protocol_version
     assert "tools" in resp["result"]["capabilities"]
     assert "serverInfo" in resp["result"]
+    # #47 (`verified-round1.md` 1-B): 中身 (`{"name":"afx","version":"1"}`)
+    # まで見る。
+    assert resp["result"]["serverInfo"] == {"name": "afx", "version": "1"}
 
 
 def test_initialize_rejects_unknown_protocol_version(tmp_path):
@@ -90,6 +93,9 @@ def test_initialize_rejects_unknown_protocol_version(tmp_path):
                             "params": {"protocolVersion": "9999-99-99"}})
     assert "error" in resp
     assert "result" not in resp
+    # #43 (`verified-round1.md` 1-B): code/id の保持まで見る。
+    assert resp["error"]["code"] == -32600
+    assert resp["id"] == 1
 
 
 def test_initialize_rejects_missing_protocol_version_key(tmp_path):
@@ -104,6 +110,9 @@ def test_initialize_rejects_missing_protocol_version_key(tmp_path):
                             "params": {}})
     assert "error" in resp
     assert "result" not in resp
+    # #43 (`verified-round1.md` 1-B): code/id の保持まで見る。
+    assert resp["error"]["code"] == -32600
+    assert resp["id"] == 1
 
 
 def test_initialize_rejects_missing_params_key(tmp_path):
@@ -113,6 +122,9 @@ def test_initialize_rejects_missing_params_key(tmp_path):
     resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 1, "method": "initialize"})
     assert "error" in resp
     assert "result" not in resp
+    # #43 (`verified-round1.md` 1-B): code/id の保持まで見る。
+    assert resp["error"]["code"] == -32600
+    assert resp["id"] == 1
 
 
 def test_tools_call_passes_allowed_list_not_all_registry_names_to_execute(tmp_path):
@@ -171,6 +183,25 @@ def test_tools_call_executes_registered_handler(tmp_path):
     assert payload == {"echo": 7}
 
 
+def test_tools_call_null_arguments_falls_back_to_empty_dict(tmp_path):
+    """#49 (`verified-round1.md` 1-B): `params.get("arguments") or {}` の
+    `arguments: null` 経路 (キーは在るが値が JSON null) が未テスト。
+    `or {}` を落とす変異は `arguments=None` のまま `registry.execute` に
+    渡し、`jsonschema.validate(None, schema)` が型不一致で
+    `"invalid arguments: ..."` を返す。`or {}` が効いていれば `{}` として
+    schema (properties のみ・required 無し) を通過し、`slow_echo(**{})` の
+    `TypeError` (必須位置引数 `x` 欠落) に化ける — このメッセージの違いで
+    区別する。"""
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                            "params": {"name": "slow_echo", "arguments": None}})
+    content = resp["result"]["content"]
+    payload = json.loads(content[0]["text"])
+    assert "error" in payload
+    assert "invalid arguments" not in payload["error"], (
+        f"arguments=null が {{}} にフォールバックしていない: {payload!r}")
+
+
 def test_tools_call_rejects_disallowed_tool(tmp_path):
     """`never_allowed` は登録済みだが `_start_dispatcher` の allowed には
     入っていない (`_make_registry` 参照) — 「allowed が空」ではなく「allowed
@@ -188,8 +219,12 @@ def test_tools_call_rejects_disallowed_tool(tmp_path):
 def test_tools_call_is_serialized_in_flight_one(tmp_path):
     """§1.6: `tool_rpc` パイプの in-flight 1 はシム経由でも保たれる
     (mission_worker 側で lock を取って直列化する)。2 本を同時に投げ、
-    実行区間が重ならないことをタイムスタンプで確認する。"""
-    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    実行区間が重ならないことをタイムスタンプで確認する。
+
+    #50 (`verified-round1.md` 1-B): `dispatcher._allowed.append` は private
+    属性への直接操作 (`_registry.register` は public API なので問題無い)。
+    `allowed=` を渡し直して dispatcher を作り直す形に変更する — `timed`
+    ツールを allowed に含めた状態で `McpShimDispatcher` を構築する。"""
     spans: list[tuple[float, float]] = []
     lock = threading.Lock()
 
@@ -202,10 +237,18 @@ def test_tools_call_is_serialized_in_flight_one(tmp_path):
             spans.append((start, end))
         return {"ok": True}
 
-    dispatcher._registry.register(ToolDef(  # register() は ToolRegistry の公開 API
+    registry = _make_registry()
+    registry.register(ToolDef(  # register() は ToolRegistry の公開 API
         name="timed", description="d", parameters={"type": "object"},
         func=timed_tool))
-    dispatcher._allowed.append("timed")
+    sock_path = tmp_path / "afx.sock"
+    dispatcher = McpShimDispatcher(sock_path=sock_path, registry=registry,
+                                   allowed=["slow_echo", "timed"])
+    t = threading.Thread(target=dispatcher.serve_forever, daemon=True)
+    t.start()
+    deadline = time.monotonic() + 3.0
+    while not sock_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
 
     results = []
 
@@ -214,15 +257,20 @@ def test_tools_call_is_serialized_in_flight_one(tmp_path):
                                         "method": "tools/call",
                                         "params": {"name": "timed", "arguments": {}}}))
 
-    t1 = threading.Thread(target=call)
-    t2 = threading.Thread(target=call)
-    t1.start()
-    t2.start()
-    t1.join(timeout=5)
-    t2.join(timeout=5)
-    assert len(spans) == 2
-    (s1, e1), (s2, e2) = spans
-    assert e1 <= s2 or e2 <= s1, f"overlapping spans (not serialized): {spans}"
+    # #46 (`verified-round1.md` 1-B): 2 本だけだと `sleep(0.2)` の粒度に
+    # 依存し `with self._call_lock:` を外した変異でもタイミング次第で
+    # 通ってしまう余地が残る。3 本に増やしペアワイズ全数で非重複を見る。
+    threads = [threading.Thread(target=call) for _ in range(3)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=5)
+    assert len(spans) == 3
+    for i in range(len(spans)):
+        for j in range(i + 1, len(spans)):
+            (s_i, e_i), (s_j, e_j) = spans[i], spans[j]
+            assert e_i <= s_j or e_j <= s_i, (
+                f"overlapping spans (not serialized): {spans}")
 
 
 def test_run_mcp_shim_forwards_stdio_to_unix_socket(tmp_path):

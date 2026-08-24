@@ -710,3 +710,32 @@ def test_assert_allowlist_excludes_data_dir_rejects_exact_match(tmp_path):
     data_dir.mkdir()
     with pytest.raises(RuntimeError, match="history data"):
         _assert_allowlist_excludes_data_dir([data_dir], guarded_data_dir=data_dir)
+
+
+def test_assert_allowlist_excludes_data_dir_rejects_symlink_to_data_dir(tmp_path):
+    """A3 (`stage0-bundle-B.md` Important): ガードは `Path(p).resolve()`
+    (正規化) に依存している — `resolve()` を外す変異は symlink 越しの
+    到達を素通りさせる。`allowlist` に `data_dir` への symlink を入れても
+    fail closed することを pin する。"""
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    link = tmp_path / "link_to_data"
+    link.symlink_to(data_dir)
+    with pytest.raises(RuntimeError, match="history data"):
+        _assert_allowlist_excludes_data_dir([link], guarded_data_dir=data_dir)
+
+
+def test_assert_allowlist_excludes_data_dir_rejects_relative_path_to_data_dir(
+        tmp_path, monkeypatch):
+    """A3 の相対パス版: `../data` のような未正規化の相対パスも
+    `resolve()` を経て `data_dir` と一致すれば fail closed する。"""
+    from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    with pytest.raises(RuntimeError, match="history data"):
+        _assert_allowlist_excludes_data_dir(
+            [Path("../data")], guarded_data_dir=data_dir)

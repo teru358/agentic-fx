@@ -720,6 +720,54 @@ def test_discover_rejects_version_dir_with_mismatched_artifact_hash(tmp_path):
     assert not any(m.name == "sma" for m in metas)
 
 
+def test_discover_logs_symlink_target_not_a_directory_reason(tmp_path, caplog):
+    """A9 (`stage0-bundle-B.md` Minor) 再実測: `_resolve_entity` の
+    `if not version_dir.is_dir(): _reject(...)` を単純に削除しても、
+    `discover` の直後の `REQUIRED_FILES` 欠落検査が同じ「discover から
+    消える」という見かけの結果を返す (別経路で fail closed、§6.7 型) —
+    単独再実測で SURVIVED を再確認した。この 2 つの経路は**診断メッセージ
+    が異なる**ため (B1 と同じパターン: 結果でなくメッセージで区別する)、
+    symlink target を「ディレクトリではない実ファイル」にして
+    `_reject` の "is not a directory" という固有の理由文言が出ることを
+    pin する — `is_dir()` 検査を落とす変異は `missing [...]` という別の
+    警告文言に変わるため red になる。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    versions_dir = plugins_dir / ".versions" / "sma"
+    versions_dir.mkdir(parents=True)
+    fake_hash = "a" * 64
+    # ディレクトリではなく通常ファイルを symlink target に置く
+    (versions_dir / fake_hash).write_text("not a directory")
+    (plugins_dir / "sma").symlink_to(f".versions/sma/{fake_hash}")
+
+    with caplog.at_level(logging.WARNING):
+        metas = discover(plugins_dir)
+    assert not any(m.name == "sma" for m in metas)
+    assert "is not a directory" in caplog.text, caplog.text
+
+
+def test_symlink_target_regex_rejects_trailing_traversal_via_missing_anchor():
+    """A10 (`stage0-bundle-B.md` Minor): `_SYMLINK_TARGET_RE_TMPL` の末尾
+    `$` アンカーを落とすと、`.versions/<name>/<hash>` に続けて
+    `/../..` のような追加パス要素を持つ symlink target も `.match()` を
+    通ってしまう (`re.match` は先頭固定・末尾不問のため)。`discover` 経由
+    の実プロセス/多層防御を介さず、正規表現そのものを直接 unit で pin
+    する (単独再実測で確認した SURVIVED — `resolve()` 後の
+    `artifact_hash` 照合という別の層は残るが、この字句検証の層自体は
+    無検証だった)。"""
+    import re
+
+    from agentic_fx.plugin.loader import _SYMLINK_TARGET_RE_TMPL
+
+    pattern = re.compile(_SYMLINK_TARGET_RE_TMPL.format(name=re.escape("sma")))
+    valid = ".versions/sma/" + "a" * 64
+    assert pattern.match(valid) is not None
+    traversal = valid + "/../.."
+    assert pattern.match(traversal) is None, (
+        "末尾 $ アンカーが欠けており、追加のパス要素を持つ symlink "
+        "target が字句検証を素通りしている")
+
+
 def test_content_hash_delegates_to_version_store_content_hash_bytes(tmp_path):
     """`loader.content_hash(plugin_dir)` は `version_store.content_hash_bytes`
     の薄いラッパであり、同一 bytes に対して両 API が完全一致することを

@@ -71,25 +71,14 @@ def test_build_runner_returns_claude_runner_for_claude_backend(tmp_path, monkeyp
     assert isinstance(runner, FakeClaudeRunner)
 
 
-def test_build_runner_forwards_settings_to_runner(tmp_path):
-    """設定値が runner に渡される (seam で検証)。"""
-    settings = _settings_with_backend(improve_backend="local")
-    registry = ToolRegistry()
-
-    # LocalRunner は model を使わない (Task 2/3 の CLI runner が使う)
-    runner = build_runner("improve", settings, registry, workdir=tmp_path)
-    assert runner is not None
-
-
-def test_build_runner_accepts_on_message(tmp_path):
-    """on_message コールバックも受け取れる。"""
-    settings = _settings_with_backend(improve_backend="local")
-    registry = ToolRegistry()
-    seen = []
-
-    runner = build_runner("improve", settings, registry, workdir=tmp_path,
-                         on_message=seen.append)
-    assert runner is not None
+# 段 0 是正 #12 (`verified-round1.md` 1-A): `test_build_runner_forwards_
+# settings_to_runner` / `test_build_runner_accepts_on_message` は
+# `assert runner is not None` のみの恒真テストだった (どちらも常に真になる
+# — `build_runner` が None を返すことは無い)。前者は
+# `test_build_runner_returns_local_runner_for_local_backend` (:54, isinstance
+# 完全一致) と、後者は `test_build_runner_local_backend_forwards_on_message`
+# (:193, `runner._on_message is callback` 完全一致) と等価かつ厳密上位互換
+# のため削除する (代替テストは既存)。
 
 
 # Step 25: Additional tests for comprehensive coverage
