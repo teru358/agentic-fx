@@ -81,6 +81,22 @@ def test_check_candidate_snapshot_rejects_symlink_member(tmp_path):
         check_candidate_snapshot(d)
 
 
+def test_check_candidate_snapshot_rejects_symlinked_candidate_dir(tmp_path):
+    """codex 1 周目是正 I2 (verified-codex-round1.md): 候補ディレクトリ
+    自身が外部ディレクトリへの symlink の場合、`os.open(..., O_NOFOLLOW)`
+    で追従を拒否すること。errno は環境依存 (ENOTDIR/ELOOP どちらもあり得る
+    — O_DIRECTORY|O_NOFOLLOW をシンボリックリンクへ当てると実測では
+    ENOTDIR) なので `match=` をそれに依存させない。"""
+    outside = tmp_path / "outside"
+    _write_manifest(outside)
+    link = tmp_path / "cand_link"
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(CandidateSnapshotError):
+        check_candidate_snapshot(link)
+    # 対照: 通常ディレクトリは受理される
+    check_candidate_snapshot(outside)  # raise しない
+
+
 def test_check_candidate_snapshot_rejects_hardlink_member(tmp_path):
     """`st_nlink == 1` の検査 — hardlink で候補外の実体を共有していないこと。"""
     d = tmp_path / "cand"; _write_manifest(d)

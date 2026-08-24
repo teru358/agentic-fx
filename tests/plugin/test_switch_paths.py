@@ -470,6 +470,56 @@ def test_resolve_candidate_dir_rejects_name_mismatch_in_canonical_path(env):
             candidate_path="plugins/_human/other", name="sma")
 
 
+# --- codex 1 周目是正 I2: 候補ディレクトリ自身が symlink でも locator 検査
+#     とスナップショット検査を通ってしまう (verified-codex-round1.md I2) ---
+
+
+def test_resolve_candidate_dir_rejects_toplevel_symlink_candidate(env, tmp_path):
+    """候補ディレクトリの最終成分自身が外部ディレクトリへの symlink の場合、
+    `resolve_candidate_dir` は追従せず `ValueError` で拒否する (§2.3:
+    dirfd 基準の lstat で {不存在/通常ディレクトリ/正規形相対symlink}
+    以外は拒否)。対照に通常ディレクトリの `ema` は正常に返ることを assert。"""
+    root, plugins_dir, conn, settings = env
+    outside = tmp_path / "outside_evil"
+    _write_candidate(outside)
+    staging_root = plugins_dir / "_staging" / "1"
+    staging_root.mkdir(parents=True)
+    (staging_root / "sma").symlink_to(outside, target_is_directory=True)
+    _write_candidate(staging_root / "ema")
+
+    with pytest.raises(ValueError):
+        switch.resolve_candidate_dir(
+            plugins_dir, candidate_origin="staging",
+            candidate_path="plugins/_staging/1/sma", name="sma")
+
+    # 対照: 通常ディレクトリは正常に受理される
+    result = switch.resolve_candidate_dir(
+        plugins_dir, candidate_origin="staging",
+        candidate_path="plugins/_staging/1/ema", name="ema")
+    assert result == staging_root / "ema"
+
+
+def test_submit_candidate_refuses_symlinked_staging_dir(env, tmp_path, monkeypatch):
+    """統合 pin: `submit_candidate` を symlink 候補で呼ぶと例外が上がり、
+    かつ `approval_requests` に行が 1 件も作られないこと (承認台帳の汚染
+    阻止が本命)。"""
+    root, plugins_dir, conn, settings = env
+    outside = tmp_path / "outside_evil2"
+    _write_candidate(outside)
+    staging_root = plugins_dir / "_staging" / "1"
+    staging_root.mkdir(parents=True)
+    (staging_root / "sma").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+
+    with pytest.raises(ValueError):
+        switch.submit_candidate(
+            conn, name="sma", staging_dir=staging_root,
+            candidate_origin="staging", mission_id=1, backlog_id=None,
+            settings=settings, now=NOW)
+
+    assert approvals_store.pending(conn, kind="plugin") == []
+
+
 def test_no_direct_decide_calls_in_plugin_module(tmp_path):
     """裁定1: switch.py/approval.py/commands.py は approvals_store.decide を
     直接呼ばない (apply_decision を経由する — grep-zero pin、B-4 是正で

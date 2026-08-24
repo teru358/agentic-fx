@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -312,12 +313,23 @@ def resolve_candidate_dir(plugins_root: Path, *, candidate_origin: str,
             f"canonical form for candidate_origin={candidate_origin!r} "
             f"and name={name!r}")
     candidate_dir = plugins_root.parent / candidate_path  # candidate_path は "plugins/..." 形 (root 相対)
+    # I2 是正 (verified-codex-round1.md / 設計 §2.3): `Path.is_dir()` は
+    # symlink を追従するため、候補ディレクトリ自身が外部ディレクトリへの
+    # symlink でも通ってしまっていた。`os.lstat` + `S_ISDIR` で symlink を
+    # 追従せず「通常ディレクトリか」だけを見る (最終成分は
+    # {不存在/通常ディレクトリ/正規形相対symlink} のいずれかに限る — ここは
+    # 「正規形相対symlink」を許さない候補パスの検査なので通常ディレクトリ
+    # のみを受理する)。
     try:
-        if not candidate_dir.is_dir():
-            raise CandidateMissingError(
-                f"candidate not found: {candidate_path} (origin={candidate_origin})")
+        st = os.lstat(candidate_dir)
     except OSError as exc:
-        raise CandidateMissingError(str(exc)) from exc
+        raise CandidateMissingError(
+            f"candidate not found: {candidate_path} (origin={candidate_origin})"
+        ) from exc
+    if not stat.S_ISDIR(st.st_mode):
+        raise ValueError(
+            f"candidate path {candidate_path!r} is not a regular directory "
+            "(symlink/file are rejected — §2.3)")
     return candidate_dir
 
 

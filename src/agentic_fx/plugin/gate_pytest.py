@@ -68,7 +68,18 @@ def check_candidate_snapshot(plugin_dir: Path) -> None:
     (EBADF)` になる (5-D の staging dirfd 検査は `fstat` だけを呼ぶので
     `O_PATH` のままでよいが、ここは `listdir` も要るため区別する)。
     """
-    dir_fd = os.open(str(plugin_dir), os.O_DIRECTORY | os.O_RDONLY)
+    # I2 是正 (verified-codex-round1.md / 設計 §2.3): 候補ディレクトリ自身が
+    # 外部ディレクトリへの symlink の場合、`O_NOFOLLOW` 無しでは追従して
+    # しまう。`O_DIRECTORY | O_NOFOLLOW` を symlink に当てたときの errno は
+    # 実測では ENOTDIR (ELOOP ではない) — 呼び出し元の `match=` は
+    # errno 文字列に依存させないこと。
+    try:
+        dir_fd = os.open(str(plugin_dir),
+                         os.O_DIRECTORY | os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise CandidateSnapshotError(
+            f"candidate dir is not a regular directory: {plugin_dir} ({exc})"
+        ) from exc
     try:
         names = os.listdir(dir_fd)
         relevant_names = {n for n in names if not _is_ignored_entry(n, dir_fd)}
