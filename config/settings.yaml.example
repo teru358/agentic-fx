@@ -59,8 +59,8 @@ news:
 
 schedule:
   trade_interval_min: 60
-  improve: weekly             # weekly | daily
-  improve_at: "Sat 03:00"     # weekly は "<weekday> HH:MM"、daily は "HH:MM" (表示 TZ)
+  improve: weekly             # weekly | daily (§7.1 gate まで無効化の検討を予定)
+  improve_at: "Sun 23:00"     # weekly は "<weekday> HH:MM"、daily は "HH:MM" (表示 TZ) — tests は 2026-08-22 Sat UTC を使うため競合回避
 
 improve:
   parallel: 1
