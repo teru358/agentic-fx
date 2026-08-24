@@ -74,6 +74,19 @@ def test_analyze_corr_records_trial_count_from_handler():
     assert ledger.entries()[0]["trial_count"] == 25
 
 
+def test_run_backtest_defaults_trial_count_to_one_when_handler_omits_it():
+    """L22: `result.get("trial_count", 1)` の既定値 1 を見るテストが無い
+    — trial_count を返さない handler を据え、台帳の trial_count==1 を
+    確認する。"""
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, run_backtest_handler=lambda a: {"metrics": {"pf": 1.0}},
+        analyze_corr_handler=lambda a: {})}
+    tools["run_backtest"].func(name="x", pair="USDJPY")
+    ledger.freeze()
+    assert ledger.entries()[0]["trial_count"] == 1
+
+
 def test_run_backtest_does_not_expose_period_or_datetime_keys():
     """遮断 7: analyze_corr/run_backtest の返却 schema に日時・期間端点が無い。"""
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
@@ -137,6 +150,17 @@ def test_strip_forbidden_recurses_through_lists_of_dicts():
     keys, leaves = _walk_leaves(out)
     assert _FORBIDDEN_KEYS.isdisjoint(set(keys))
     assert out["items"][0]["ok"] == 1  # 非禁止キーは残る
+
+
+def test_strip_forbidden_recurses_through_tuples():
+    """L21: `_strip_forbidden` は dict/list しか再帰せず tuple 要素が
+    素通りする (`improve_rpc_tools.py:43-48`)。tuple 要素を含む構造を
+    通し、剥がれることを確認する。"""
+    poisoned = {"items": ({"now": "2020-01-01T00:00:00", "ok": 1},)}
+    out = _strip_forbidden(poisoned)
+    keys, leaves = _walk_leaves(out)
+    assert _FORBIDDEN_KEYS.isdisjoint(set(keys))
+    assert out["items"][0]["ok"] == 1
 
 
 def test_ledger_result_summary_keeps_forbidden_keys_stripped_agent_return_does_not():

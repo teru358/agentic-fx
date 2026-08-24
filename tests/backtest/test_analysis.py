@@ -44,6 +44,24 @@ def _settings_watch_eurusd():
             update={"watch_symbols": ["EURUSD"]})})
 
 
+def test_analyze_for_agent_rejects_candidate_count_exceeding_max(tmp_path):
+    """L11: `max_candidates` 超過ガード (analysis.py:398-402、実行時再検証)
+    にテストが 1 本も無かった。`model_copy` は pydantic のバリデータを
+    再実行しないため、`Settings.model_validate` レベルの
+    `watch_symbols > max_watch_symbols` チェック (config.py:361) を経由
+    せず watch_symbols を上限超過にできる — これで実行時再検証だけが
+    唯一のガードになる状態を作る。"""
+    conn = _conn(tmp_path)
+    too_many = [f"SYM{i}" for i in range(SETTINGS.analysis.max_watch_symbols + 1)]
+    settings = SETTINGS.model_copy(update={
+        "datafeed": SETTINGS.datafeed.model_copy(
+            update={"watch_symbols": too_many})})
+    with pytest.raises(ValueError, match="candidate symbol count"):
+        analyze_for_agent(conn, settings,
+                          {"kind": "lead_lag", "a": "USDJPY", "b": "SYM0",
+                           "timeframe": "1h"}, now=NOW)
+
+
 def _series(conn, symbol, values, *, start, timeframe="1h"):
     """決定的な close 列を、timeframe 幅 (既定 1h) 刻みの **1m** バーとして
     投入する (乱数・実時刻不使用)。
@@ -226,6 +244,28 @@ def test_error_shape_is_boundary_independent_partial_vs_empty_in_sample(
         now=NOW)
 
     assert out_partial == out_empty == {"error": "insufficient_data"}
+
+
+def test_insufficient_data_error_response_does_not_leak_exception_detail(
+        tmp_path, caplog):
+    """裁定 D4 (2026-08-24): agent への応答は `{"error": "insufficient_data"}`
+    のまま (サイドチャネル遮断は維持) だが、内部ログには例外の観測可能性を
+    持たせる — 応答文字列に例外種別名やメッセージが漏れないことと、
+    ログには残ることの両方を確認する。"""
+    import logging
+    conn_empty = _conn(tmp_path / "empty2")
+    holdout_only_start = NOW - timedelta(days=10)
+    _series(conn_empty, "USDJPY", _sine(20, phase=0), start=holdout_only_start)
+    _series(conn_empty, "EURUSD", _sine(20, phase=1), start=holdout_only_start)
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.backtest.analysis"):
+        out = analyze_for_agent(
+            conn_empty, _settings_watch_eurusd(),
+            {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD", "timeframe": "1h"},
+            now=NOW)
+    assert out == {"error": "insufficient_data"}
+    assert "ValueError" not in str(out) and "Traceback" not in str(out)
+    assert any(r.exc_info is not None for r in caplog.records), (
+        "内部ログに traceback (exc_info) が残っていない")
 
 
 def test_agent_handles_non_positive_close_without_raising(tmp_path):

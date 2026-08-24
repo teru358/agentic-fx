@@ -11,10 +11,16 @@ from datetime import datetime, timezone
 
 import pytest
 
-from agentic_fx.store import improve_waves
+from agentic_fx.store import improve_waves, missions
 from agentic_fx.store.db import connect, init_db
 
 NOW = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)  # Sat 03:00
+
+
+def _mission(c):
+    """裁定 D1: `improve_wave_slots.mission_id` に FK が付いたため、
+    実在する missions 行の id を使う必要がある。"""
+    return missions.start(c, "improve", "local", "m", now=NOW)
 
 
 def test_create_wave_and_slots_in_one_tx_rowcount_one_means_authority(tmp_path):
@@ -56,19 +62,20 @@ def test_claim_slot_cas_reserved_to_claimed_with_mission_id(tmp_path):
     """Tx-0 と同じ tx で呼ばれる CAS: reserved -> claimed。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
-    ok = improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
+    mid = _mission(c)
+    ok = improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=mid, now=NOW)
     assert ok is True
     slot = improve_waves.get_slot(c, period_key="2026-W34", k=0)
     assert slot["status"] == "claimed"
-    assert slot["mission_id"] == 101
+    assert slot["mission_id"] == mid
     assert slot["spawn_attempts"] == 1
 
 
 def test_claim_slot_cas_fails_on_non_reserved(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
-    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
-    ok = improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=202, now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=_mission(c), now=NOW)
+    ok = improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=_mission(c), now=NOW)
     assert ok is False
 
 
@@ -76,7 +83,7 @@ def test_mark_running_cas_claimed_to_running(tmp_path):
     """`ready` 受信後、親が短い tx で claimed->running を commit する。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
-    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=_mission(c), now=NOW)
     ok = improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
     assert ok is True
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "running"
@@ -87,7 +94,7 @@ def test_revert_to_reserved_on_pre_ready_failure_clears_mission_id(tmp_path):
     再試行上限の判定は Task 9 が行う (`revert_to_reserved` は無条件遷移)。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
-    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=_mission(c), now=NOW)
     improve_waves.revert_to_reserved(c, period_key="2026-W34", k=0, now=NOW)
     slot = improve_waves.get_slot(c, period_key="2026-W34", k=0)
     assert slot["status"] == "reserved"
@@ -105,34 +112,55 @@ def test_revert_to_reserved_fails_on_non_claimed(tmp_path):
 
 
 def test_mark_slot_failed_after_attempts_exhausted(tmp_path):
-    """Task 9 が spawn_attempts >= max と判定した後に呼ぶ想定の無条件 failed 遷移。
-    claimed からでも running からでも failed へ落とし mission_id を NULL に戻す。"""
+    """Task 9 が spawn_attempts >= max と判定した後に呼ぶ想定の failed 遷移。
+    claimed からでも running からでも failed へ落とし mission_id を NULL に戻す。
+    **裁定 D2 (2026-08-24)**: `reserved`/`claimed`/`running` からの CAS
+    (以前の「無条件」ではない — `test_mark_slot_failed_does_not_overwrite_done_slot`
+    参照)。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
-    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
-    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=102, now=NOW)  # 失敗 (reserved でない) — 無視
+    m1, m2 = _mission(c), _mission(c)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=m1, now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=m2, now=NOW)  # 失敗 (reserved でない) — 無視
     improve_waves.revert_to_reserved(c, period_key="2026-W34", k=0, now=NOW)
-    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=102, now=NOW)
-    improve_waves.mark_slot_failed(c, period_key="2026-W34", k=0, now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=m2, now=NOW)
+    slot_before_fail = improve_waves.get_slot(c, period_key="2026-W34", k=0)
+    assert slot_before_fail["spawn_attempts"] == 2  # L08: 定数化変異 (=1) の pin
+    ok = improve_waves.mark_slot_failed(c, period_key="2026-W34", k=0, now=NOW)
+    assert ok is True
     slot = improve_waves.get_slot(c, period_key="2026-W34", k=0)
     assert slot["status"] == "failed"
     assert slot["mission_id"] is None
+
+
+def test_mark_slot_failed_does_not_overwrite_done_slot(tmp_path):
+    """裁定 D2 (2026-08-24) killer: 終端済み (`done`) の slot に
+    `mark_slot_failed` を当てても上書きされない (CAS `False`)。
+    以前の「無条件」実装なら `done -> failed` に書き換わっていた。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=_mission(c), now=NOW)
+    improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
+    improve_waves.mark_terminal(c, period_key="2026-W34", k=0, status="done", now=NOW)
+    ok = improve_waves.mark_slot_failed(c, period_key="2026-W34", k=0, now=NOW)
+    assert ok is False
+    assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "done"
 
 
 def test_count_open_slots_counts_reserved_only(tmp_path):
     """`count_open_slots` は `reserved` の数を返す (claimed/running/done/failed は含まない)。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=3)
-    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=_mission(c), now=NOW)
     assert improve_waves.count_open_slots(c, period_key="2026-W34") == 2
-    improve_waves.claim_slot(c, period_key="2026-W34", k=1, mission_id=102, now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=1, mission_id=_mission(c), now=NOW)
     assert improve_waves.count_open_slots(c, period_key="2026-W34") == 1
 
 
 def test_mark_terminal_running_to_done(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
-    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=_mission(c), now=NOW)
     improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
     improve_waves.mark_terminal(c, period_key="2026-W34", k=0, status="done", now=NOW)
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "done"
@@ -144,7 +172,7 @@ def test_mark_terminal_running_to_done(tmp_path):
 def test_mark_terminal_rejects_invalid_status(tmp_path, terminal_status):
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
-    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=_mission(c), now=NOW)
     improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
     improve_waves.mark_terminal(c, period_key="2026-W34", k=0,
                                 status=terminal_status, now=NOW)
@@ -158,8 +186,8 @@ def test_recover_stale_slots_fails_reserved_claimed_running(tmp_path):
     running を全て failed へ収束する SQL。手動 one-shot (slot 無し) は対象外。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=3)
-    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)  # claimed
-    improve_waves.claim_slot(c, period_key="2026-W34", k=1, mission_id=102, now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=_mission(c), now=NOW)  # claimed
+    improve_waves.claim_slot(c, period_key="2026-W34", k=1, mission_id=_mission(c), now=NOW)
     improve_waves.mark_running(c, period_key="2026-W34", k=1, now=NOW)                # running
     # k=2 は reserved のまま (mission_id IS NULL)
 
@@ -173,7 +201,7 @@ def test_recover_stale_slots_fails_reserved_claimed_running(tmp_path):
 def test_recover_stale_slots_leaves_done_and_failed_untouched(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
     improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
-    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=101, now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=_mission(c), now=NOW)
     improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
     improve_waves.mark_terminal(c, period_key="2026-W34", k=0, status="done", now=NOW)
     n = improve_waves.recover_stale_slots(c, now=NOW)

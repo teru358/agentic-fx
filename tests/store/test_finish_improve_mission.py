@@ -180,12 +180,64 @@ def test_finish_improve_mission_cas_zero_rowcount_raises_and_rolls_back(tmp_path
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "done"  # 変化なし
 
 
+def test_finish_improve_mission_mid_call_exception_rolls_back_all_four_rows(
+        tmp_path, monkeypatch):
+    """L12: 途中 (`improve_waves.mark_terminal`) で例外が起きたとき、既に
+    この呼び出し内で書いた mission/run/backlog も同じ tx の一部として巻き
+    戻ることを検証する。既存の唯一のロールバックテスト (`_cas_zero_rowcount
+    _raises_and_rolls_back`) は最初の CAS で落ちるケースなので、部分コミッ
+    トの検出力が無かった (mission/run/backlog の書き込みが未着手のまま
+    落ちるため、それらが「書かれなかった」のか「書かれてから戻った」のか
+    区別できない)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "idea", "user", NOW)
+    mid, rid = _prepare_scheduler_mission(c)
+    improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
+    backlog.select_for_mission(c, bid, now=NOW)
+    improve_runs.bind_backlog(c, rid, bid)
+
+    def _boom(*a, **k):
+        raise RuntimeError("mark_terminal boom")
+    monkeypatch.setattr(improve_waves, "mark_terminal", _boom)
+
+    with pytest.raises(RuntimeError, match="mark_terminal boom"):
+        missions.finish_improve_mission(
+            c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
+            mission_status="completed", run_result="report",
+            backlog_transition={"backlog_id": bid, "status": "done",
+                                "last_result": "x"},
+            now=NOW, output=None, transcript=[])
+    c.rollback()
+
+    mission = c.execute("SELECT status FROM missions WHERE id=?", (mid,)).fetchone()
+    run = c.execute("SELECT finished_at FROM improvement_runs WHERE id=?",
+                    (rid,)).fetchone()
+    backlog_row = c.execute("SELECT status FROM improvement_backlog WHERE id=?",
+                            (bid,)).fetchone()
+    slot = improve_waves.get_slot(c, period_key="2026-W34", k=0)
+    assert mission["status"] == "running"       # 未終端のまま
+    assert run["finished_at"] is None            # 未終端のまま
+    assert backlog_row["status"] == "selected"   # 未終端のまま
+    assert slot["status"] == "running"           # 未終端のまま
+
+
 def test_run_lifecycle_created_bound_finished_no_dangling(tmp_path):
     """§8.1-22: 全経路で run は CREATED (start) -> BOUND (bind_backlog、
     任意) -> FINISHED (finish_improve_mission) の一対一。dangling
-    (started_at はあるが Mission が無い run) が生まれないことを、
-    Tx-0 の 1 tx 性から間接的に確認する — Mission INSERT が無い run は
-    そもそも作れない (呼び出しの形自体がそれを強制する)。"""
+    (started_at はあるが Mission が無い run) が生まれないことを確認する。
+
+    **裁定 D1 (2026-08-24) 以前の記述は偽だった**: 「Mission INSERT が
+    無い run はそもそも作れない (呼び出しの形自体がそれを強制する)」は
+    誤り — `improve_runs.start(mission_id=<存在しない id>)` は、
+    `mission_id` に FK が無かった間は素通りしていた (Tx-0 の 1 tx 性は
+    「単一 tx で書く」ことしか強制せず、「存在する行を参照する」ことは
+    強制しない)。裁定 D1 で `improvement_runs.mission_id` /
+    `improve_wave_slots.mission_id` に `REFERENCES missions(id)` を追加
+    したことで、dangling mission_id は `sqlite3.IntegrityError` になる
+    (`test_start_with_nonexistent_mission_id_raises_integrity_error` /
+    `test_claim_slot_with_nonexistent_mission_id_raises_integrity_error`
+    が pin する)。ここではその上で「正常な単一 tx 経路に dangling が
+    生まれない」ことを確認する。"""
     c = connect(tmp_path / "t.db"); init_db(c)
     mid, rid = _prepare_scheduler_mission(c)
     run = c.execute("SELECT mission_id, started_at, finished_at FROM "
@@ -200,6 +252,24 @@ def test_run_lifecycle_created_bound_finished_no_dangling(tmp_path):
     run2 = c.execute("SELECT finished_at FROM improvement_runs WHERE id=?",
                      (rid,)).fetchone()
     assert run2["finished_at"] is not None  # FINISHED
+
+
+def test_start_with_nonexistent_mission_id_raises_integrity_error(tmp_path):
+    """裁定 D1 killer: `improvement_runs.mission_id` の FK が実効している
+    ことを直接確認する (codex I1)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        improve_runs.start(c, None, now=NOW, mission_id=999999)
+
+
+def test_claim_slot_with_nonexistent_mission_id_raises_integrity_error(tmp_path):
+    """裁定 D1 killer: `improve_wave_slots.mission_id` の FK が実効して
+    いることを直接確認する (codex I1)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        improve_waves.claim_slot(c, period_key="2026-W34", k=0,
+                                 mission_id=999999, now=NOW)
 
 
 def test_recover_interrupted_ends_improve_run_and_backlog_observation(tmp_path):

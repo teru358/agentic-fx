@@ -42,6 +42,23 @@ def test_expire_due(tmp_path):
     assert approvals.pending(c) == []
 
 
+def test_expire_due_boundary_expires_at_equal_now_is_not_yet_expired(tmp_path):
+    """L06: `expires_at < now` の境界 (`== now`) が未検証だった。
+    `apply_decision` 側は `expires_at >= now` を有効と扱う (境界テスト
+    あり) ので、`<` を `<=` にする変異が入ると同じ瞬間が「有効」かつ
+    「期限切れ」の両方になってしまう — ここでは `expire_due` 側を
+    ちょうど境界の瞬間で呼び、期限切れ扱いにならないことを pin する。"""
+    c = _conn(tmp_path)
+    boundary = NOW + timedelta(minutes=15)
+    aid = approvals.create(c, "live_trade", {"pair": "USDJPY"}, NOW,
+                           expires_at=boundary)
+    n = approvals.expire_due(c, boundary)
+    assert n == 0
+    row = c.execute("SELECT status FROM approval_requests WHERE id=?",
+                    (aid,)).fetchone()
+    assert row["status"] == "pending"
+
+
 def test_pending_filter_by_kind(tmp_path):
     c = _conn(tmp_path)
     approvals.create(c, "tech_plugin", {}, NOW)
@@ -80,7 +97,7 @@ def test_apply_decision_boundary_expires_at_equal_now_is_still_valid(tmp_path):
 def test_apply_decision_rejects_pending_status_value(tmp_path):
     c = _conn(tmp_path)
     aid = approvals.create(c, "tech_plugin", {"path": "x"}, NOW)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unsupported status"):
         approvals.apply_decision(c, aid, "pending", decided_by="shell", now=NOW)
     row = c.execute(
         "SELECT status, decided_by, decided_at FROM approval_requests WHERE id=?",
@@ -98,7 +115,7 @@ def test_apply_decision_rejects_unknown_status_value(tmp_path):
     (`"bogus"`) へ差し替える。"""
     c = _conn(tmp_path)
     aid = approvals.create(c, "tech_plugin", {"path": "x"}, NOW)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="unsupported status"):
         approvals.apply_decision(c, aid, "bogus", decided_by="shell", now=NOW)
     row = c.execute("SELECT status FROM approval_requests WHERE id=?", (aid,)).fetchone()
     assert row["status"] == "pending"
@@ -149,15 +166,47 @@ def test_apply_decision_non_pending_cas_rowcount_zero_raises_with_zero_side_effe
     assert row["status"] == "done"
 
 
+def test_apply_decision_unknown_id_raises_already_decided(tmp_path):
+    """L36: `rowcount == 0` は「既に決定済み」と「ID 不存在」を区別しない
+    — 存在しない approval_id への `apply_decision` を直接確認する。"""
+    c = _conn(tmp_path)
+    with pytest.raises(AlreadyDecidedError):
+        approvals.apply_decision(c, 999999, "approved", decided_by="shell", now=NOW)
+
+
+def test_set_reason_on_terminal_row_is_noop(tmp_path):
+    """L39: `set_reason` の `WHERE id=? AND status='pending'` ガードを
+    直接検証するテストが無かった (E2E は結果の文字列を見るだけ)。終端済み
+    (approved) 行に当てても reason が変わらないことを pin する。"""
+    c = _conn(tmp_path)
+    aid = approvals.create(c, "tech_plugin", {"path": "x"}, NOW)
+    approvals.apply_decision(c, aid, "approved", decided_by="shell", now=NOW,
+                             reason="original")
+    approvals.set_reason(c, aid, "hijacked")
+    row = c.execute("SELECT reason FROM approval_requests WHERE id=?",
+                    (aid,)).fetchone()
+    assert row["reason"] == "original"
+
+
 def test_apply_decision_backlog_id_absent_from_payload_is_noop_for_backlog(tmp_path):
     """payload に backlog_id が無い承認 (legacy 行・非 plugin kind 由来) は
-    approval CAS だけ成立し backlog には触れない。"""
+    approval CAS だけ成立し backlog には触れない。
+
+    L37: 従来はこの直接観測 (backlog 行を実際に作って不変を assert) を
+    していなかった — backlog 行が無いまま `approval["status"]` だけを
+    見ても「backlog に一切触れない」ことは検証できていない。"""
     c = _conn(tmp_path)
+    bid = backlog.add(c, "unrelated idea", "user", NOW)  # 承認とは無関係の backlog 行
     aid = approvals.create(c, "plugin", {"name": "x"}, NOW)  # backlog_id なし
     approvals.apply_decision(c, aid, "approved", decided_by="shell", now=NOW)
     approval = c.execute("SELECT status FROM approval_requests WHERE id=?",
                          (aid,)).fetchone()
     assert approval["status"] == "approved"
+    backlog_row = c.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (bid,)).fetchone()
+    assert backlog_row["status"] == "open"
+    assert backlog_row["last_result"] is None
 
 
 def test_apply_decision_commit_false_leaves_transaction_open(tmp_path):
@@ -193,13 +242,22 @@ def test_expire_due_commit_false_expires_non_plugin_kind_individually(tmp_path):
     aid1 = approvals.create(c, "tech_plugin", {"x": 1}, NOW, expires_at=NOW)
     aid2 = approvals.create(c, "news_source", {"x": 2}, NOW, expires_at=NOW)
     later = NOW + timedelta(hours=1)  # m4: fragile hour-wrap pattern を timedelta に統一
+    c.execute("BEGIN IMMEDIATE")
     n = approvals.expire_due(c, later, commit=False)
-    c.commit()
     assert n == 2
     for aid in (aid1, aid2):
         row = c.execute("SELECT status FROM approval_requests WHERE id=?",
                         (aid,)).fetchone()
-        assert row["status"] == "expired"
+        assert row["status"] == "expired"  # 同一接続内では見える (rollback 前)
+    # 8-B M5 (合流): `commit=False` を無視して commit する変異を検出する
+    # ため、直後に commit するのではなく rollback して未確定であることを
+    # 見る (旧テストは直後に `c.commit()` していたため commit 無視は検出
+    # できなかった)。
+    c.rollback()
+    for aid in (aid1, aid2):
+        row = c.execute("SELECT status FROM approval_requests WHERE id=?",
+                        (aid,)).fetchone()
+        assert row["status"] == "pending"
 
 
 def test_list_due_for_expiry_enumerates_without_state_change(tmp_path):
@@ -214,6 +272,19 @@ def test_list_due_for_expiry_enumerates_without_state_change(tmp_path):
     statuses = {r["status"] for r in c.execute(
         "SELECT status FROM approval_requests").fetchall()}
     assert statuses == {"pending"}   # 状態は一切変わらない
+
+
+def test_list_due_for_expiry_kind_none_returns_all_kinds(tmp_path):
+    """L41: `kind=None` (既定) 経路が未テストだった。「kind を無視して
+    全件返す」変異は既存 assert (kind="plugin" 指定時に絞られること) が
+    殺すが、「`kind is None` のとき空を返す」変異は生存する — ここでは
+    `kind` 省略で期限到来の全 kind が返ることを直接確認する。"""
+    c = _conn(tmp_path)
+    approvals.create(c, "plugin", {"name": "x"}, NOW, expires_at=NOW)
+    approvals.create(c, "tech_plugin", {"x": 1}, NOW, expires_at=NOW)
+    later = NOW + timedelta(hours=1)
+    rows = approvals.list_due_for_expiry(c, now=later)
+    assert {r["kind"] for r in rows} == {"plugin", "tech_plugin"}
 
 
 # precheck 2026-08-22: T8-B11 (R9)

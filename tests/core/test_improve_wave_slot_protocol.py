@@ -204,6 +204,16 @@ class _FakeImproveLoop:
         self._worker_runner = worker_runner
         self._mission_id = mission_id
         self.committed: list[tuple] = []
+        # 裁定 D1: improve_wave_slots.mission_id に FK が付いたため、claim
+        # 対象の mission_id は実在する missions 行でなければならない。
+        # テストは特定の literal id (999/111/222 等) を assert しているため、
+        # id を明示指定した INSERT で実在させる (無ければ作る)。
+        conn.execute(
+            "INSERT OR IGNORE INTO missions "
+            "(id, loop, runner, model, status, started_at) "
+            "VALUES (?, 'improve', 'local', 'm', 'running', ?)",
+            (mission_id, "2026-08-22T03:00:00"))
+        conn.commit()
 
     def prepare(self, *, slot_key, now, on_ready=None):
         period_key, k = slot_key
@@ -440,6 +450,14 @@ def test_n4_concurrent_slots_no_connection_sharing_no_mixup(tmp_path):
     db_mod.init_db(conn0)
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(conn0, period_key="2026-W34", now=now, expected=4, commit=True)
+    # 裁定 D1: mission_id=100+k (k=0..3) が claim 対象。FK のため事前に
+    # 実在させる (id を明示指定した INSERT)。
+    for k in range(4):
+        conn0.execute(
+            "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+            "VALUES (?, 'improve', 'local', 'm', 'running', ?)",
+            (100 + k, now.isoformat()))
+    conn0.commit()
     conn0.close()
 
     sup = ImproveSupervisor(capacity=4, root=tmp_path,
@@ -547,9 +565,10 @@ def test_wave_creation_respects_running_slot_count(tmp_path, monkeypatch):
 
     # Create a running slot from a previous period (not the current tick's period)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W32", now=now, expected=1, commit=True)
+    mid = missions_store.start(conn, "improve", "local", "m", now=now)
     conn.execute(
-        "UPDATE improve_wave_slots SET status='running', mission_id=1 "
-        "WHERE wave_period_key='2026-W32' AND k=0")
+        "UPDATE improve_wave_slots SET status='running', mission_id=? "
+        "WHERE wave_period_key='2026-W32' AND k=0", (mid,))
     conn.commit()
 
     # Now try to create new wave with capacity=2, parallel=4
