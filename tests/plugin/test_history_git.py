@@ -116,6 +116,38 @@ def test_record_version_detached_head_raises_distinct_error(tmp_path):
                                    content_hash=c2, approval_id=2, version_dir=d2)
 
 
+def test_record_version_detached_head_detected_via_returncode_alone(tmp_path, monkeypatch):
+    """確定-16 (B-5): detached 判定
+    `ref_proc.returncode == 1 or "not a symbolic ref" in ref_proc.stderr`
+    の前半 (returncode==1 側) 単独での検出が未 pin だった (実際の git
+    detached HEAD は returncode==1 かつ stderr に "not a symbolic ref" を
+    含むため、既存の e2e テストは両方の条件が同時に成立するケースしか
+    通さず、`or` の左側だけを残す変異 (`b5_src_stderr_only` — 右側の
+    stderr 判定だけを残す) が SURVIVED していた)。`_run` を monkeypatch
+    し、symbolic-ref 呼び出しだけ returncode=1 だが stderr に
+    "not a symbolic ref" を含まない CompletedProcess を返すことで、
+    returncode 側の判定単独で `HistoryGitDetachedError` になることを
+    確認する。"""
+    import subprocess as _subprocess
+    history_dir = tmp_path / "plugins" / ".history.git"
+    d, a, c = _make_version(tmp_path / "plugins", "sma")
+
+    real_run = history_git._run
+
+    def fake_run(args, *, env, check=True):
+        if args[:2] == ["symbolic-ref", "HEAD"]:
+            return _subprocess.CompletedProcess(
+                args, returncode=1, stdout="", stderr="fatal: some other reason\n")
+        return real_run(args, env=env, check=check)
+
+    monkeypatch.setattr(history_git, "_run", fake_run)
+
+    with pytest.raises(history_git.HistoryGitDetachedError):
+        history_git.record_version(
+            history_dir, name="sma", artifact_hash=a, content_hash=c,
+            approval_id=1, version_dir=d)
+
+
 def test_record_version_missing_repo_dir_is_not_a_repository_error(tmp_path):
     """git 不在 (`GIT_DIR` が git リポジトリでない — init が壊れた/権限で
     書けない環境) は HistoryGitError で fail closed。"""
