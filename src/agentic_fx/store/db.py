@@ -1026,6 +1026,8 @@ def init_db(conn: sqlite3.Connection) -> None:
                    "attempts INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "improvement_backlog", "last_result", "last_result TEXT")
     _ensure_column(conn, "improvement_runs", "mission_id", "mission_id INTEGER")
+    _ensure_column(conn, "backtest_runs", "mission_id", "mission_id INTEGER")
+    _ensure_column(conn, "analysis_runs", "mission_id", "mission_id INTEGER")
     conn.execute(_IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL)
     _ensure_column(
         conn, "improvement_runs", "report_state",
