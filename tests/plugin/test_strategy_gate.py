@@ -169,3 +169,57 @@ def test_content_hash_argument_wins_over_meta_content_hash(
         now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(content_hash="stale-meta-hash"))
     assert seen_content_hashes == ["recomputed-hash"]
+
+
+def test_pending_only_approval_does_not_count_as_baseline(
+        monkeypatch, conn_with_pending_strategy):
+    """D-6 是正 (プラン申し送り B.6、10.7 M5 の killer pin): 同名 strategy の
+    承認 *申請* が存在するだけ (`status='pending'`、未承認) では baseline
+    として扱わない — `AND status='approved'` を落とす退行を殺す。行が
+    0 件のケース (`test_baseline_falls_back_to_no_strategy_when_no_approved_
+    same_name`) だけでは `WHERE` 句ごと消えても結果が変わらず退行を
+    検出できない。"""
+    _fake_intent_source(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, **kw: {"trades": 30, "pf": 1.2})
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: {"trades": 30, "pf": 1.1})
+    verdict = evaluate_strategy_adoption_gate(
+        conn_with_pending_strategy, name="myst", pairs=["USDJPY"],
+        timeframe="1h", content_hash="h2", now=datetime(2026, 8, 22),
+        settings=_SETTINGS, meta=_meta(content_hash="h2"))
+    assert verdict.baseline_variant == "no_strategy"
+    assert verdict.baseline_row["plugin_ref"] == "no_strategy:myst"
+
+
+def test_eval_timeframe_normalizes_1d_to_24h_for_run_in_sample_and_holdout(
+        monkeypatch, conn_with_approved_strategy):
+    """D-6 是正 (プラン申し送り B.6、10.7 M8 の killer pin):
+    `meta.timeframe="1d"` は `_eval_timeframe` により `eval_timeframe="24h"`
+    へ正規化されて `run_in_sample`/`run_holdout_gate` の両方に渡る —
+    正規化を削る退行を検出する。"""
+    _fake_intent_source(monkeypatch)
+    seen_eval_timeframes = []
+
+    def _fake_run_in_sample(*a, **kw):
+        seen_eval_timeframes.append(("run_in_sample", kw.get("eval_timeframe")))
+        return {"trades": 30, "pf": 1.2}
+
+    def _fake_run_holdout(*a, **kw):
+        seen_eval_timeframes.append(("run_holdout", kw.get("eval_timeframe")))
+        return {"trades": 30, "pf": 1.1}
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        _fake_run_in_sample)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        _fake_run_holdout)
+    evaluate_strategy_adoption_gate(
+        conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        timeframe="1d", content_hash="h6", now=datetime(2026, 8, 22),
+        settings=_SETTINGS, meta=_meta(timeframe="1d", content_hash="h6"))
+    assert seen_eval_timeframes == [("run_in_sample", "24h"),
+                                    ("run_holdout", "24h")]

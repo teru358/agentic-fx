@@ -38,3 +38,19 @@ def conn_with_approved_strategy(conn):
         "(SELECT id FROM approval_requests ORDER BY id DESC LIMIT 1)")
     conn.commit()
     return conn
+
+
+@pytest.fixture
+def conn_with_pending_strategy(conn):
+    """D-6 是正 (プラン申し送り B.6・10.7 M5 の pin 用)。
+    `conn_with_approved_strategy` と同じ `name="myst"` の承認行を作るが
+    `status` は `create()` の既定 (`pending`) のまま — `approved` へ更新
+    しない。`AND status='approved'` を落とす退行 (10.7 M5) を殺すには
+    「承認済みは 0 件だが承認 *申請* は存在する」状態が要る (行が 0 件だと
+    WHERE 句を丸ごと消しても結果は変わらず退行を検出できない)。"""
+    approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "myst", "kind": "strategy",
+                 "content_hash": "baseline-hash"},
+        now=NOW, commit=True)
+    return conn
