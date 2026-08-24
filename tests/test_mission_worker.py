@@ -206,6 +206,63 @@ def test_bootstrap_improve_profile_rejects_staging_dir_mission_id_mismatch(
     assert "SHOULD_NOT_REACH" not in result.stdout
 
 
+def test_bootstrap_improve_profile_rejects_staging_dir_forward_matching_mission_id(
+        improve_worker_layout, tmp_path):
+    """N1 (`stage0-bundle-B.md` Important): 既存の mismatch pin
+    (`..._mismatch`) は「完全不一致」の 1 ケースのみで、`staging_path.name
+    != mission_id` を `not staging_path.name.startswith(mission_id)` に
+    緩める変異 (前方一致を許す) を殺せない。`mission_id="m-001"` に対し
+    `staging_dir` の末尾成分を `"m-0011"` (前方一致するが不一致) にした
+    ケースを 1 本足す — fail closed (非 0 終了) することを assert する。"""
+    l = improve_worker_layout
+    repo_plugins = tmp_path / "repo2" / "plugins"
+    repo_plugins.mkdir(parents=True)
+    forward_matching_staging = repo_plugins / "_staging" / "m-0011"
+    forward_matching_staging.mkdir(parents=True, mode=0o700)
+    result = _run_bootstrap_probe(
+        "print('SHOULD_NOT_REACH')",
+        staging_dir=forward_matching_staging, mission_id=l["mission_id"],
+        source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"])
+    assert result.returncode != 0
+    assert "SHOULD_NOT_REACH" not in result.stdout
+
+
+def test_bootstrap_improve_profile_fails_closed_when_exec_closure_dirs_reach_data(
+        improve_worker_layout):
+    """A1 (`stage0-bundle-B.md` Important): `_assert_allowlist_excludes_
+    data_dir(read_only + [workdir, staging_path] + execute_dirs +
+    execute_files, ...)` から `+ execute_dirs + execute_files` を落として
+    も既存テストは全緑 — 「どの allowlist 群を検査に掛けるか」自体が
+    無検証だった。`_exec_closure_for` を monkeypatch して `dirs` に
+    `_guarded_data_dir().parent` を返させ、`_bootstrap_improve_profile`
+    が fail closed (非 0 終了) することを子プロセスで確認する。"""
+    l = improve_worker_layout
+    full_script = textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {str(_REPO_ROOT / "src")!r})
+        from agentic_fx import mission_worker
+        from agentic_fx.mission_worker import (
+            ExecClosure, _guarded_data_dir)
+
+        def _fake_exec_closure_for(backend, *, claude_bin, codex_bin, venv_root):
+            return ExecClosure(dirs=[_guarded_data_dir().parent], targets=[])
+
+        mission_worker._exec_closure_for = _fake_exec_closure_for
+        mission_worker._bootstrap_improve_profile(
+            backend={"local"!r}, mission_id={l["mission_id"]!r},
+            staging_dir={str(l["staging_dir"])!r},
+            source_snapshot_dir={str(l["source_snapshot_dir"])!r},
+            claude_bin=None, codex_bin=None)
+        print('SHOULD_NOT_REACH')
+    """)
+    env = {"PATH": "/usr/bin:/bin"}
+    result = subprocess.run([sys.executable, "-c", full_script],
+                            cwd=str(l["workdir"]), env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0
+    assert "SHOULD_NOT_REACH" not in result.stdout
+
+
 def test_bootstrap_improve_profile_local_backend_has_no_shell_execute(
         improve_worker_layout):
     """local backend の exec closure に `/usr/bin` が無い — **PATH 経由・
