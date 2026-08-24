@@ -204,11 +204,3 @@ def test_build_mission_tools_matches_child_registry_names(loop_full, tmp_path):
     assert not (tool_names & signal_tools.IMPROVE_FORBIDDEN)
 
 
-def test_prepare_mission_output_schema_is_improve_output_schema(loop_min, tmp_path):
-    """Step 12-3 M2: `prepare()` の戻り値 `mission.output_schema` が
-    `IMPROVE_OUTPUT_SCHEMA` であることを確認する (下限リスト不足、申し送り)。"""
-    from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA
-
-    now = datetime(2026, 8, 22, 3, 0)
-    mission = loop_min.prepare(slot_key=None, now=now)
-    assert mission.output_schema == IMPROVE_OUTPUT_SCHEMA

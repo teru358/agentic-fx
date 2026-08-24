@@ -711,8 +711,10 @@ def test_main_applies_landlock_bootstrap_before_running_improve_mission(
                            "より後に呼ばれている (Landlock 適用前に依存を"
                            "読み込む順序になっている)")
     assert frames[0]["type"] == "ready" and frames[0]["ok"] is True
-    # improve profile は trade の registry を組まない (DB 非参照の構造的成立)
-    assert registry_calls == []
+    # improve profile は Task 10 以後、child-side で build_mission_registry を
+    # 呼ぶようになった (Step 12-4)。正確には _build_improve_registry 内で
+    # build_mission_registry を 1 度呼ぶ。
+    assert len(registry_calls) == 1  # _build_improve_registry から 1 呼び出し
 
 
 def test_main_fails_closed_when_runner_backend_is_claude(monkeypatch, tmp_path):
