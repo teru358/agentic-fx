@@ -59,24 +59,24 @@ def test_build_app_improve_supervisor_shares_stop_event(tmp_path):
         app.close()
 
 
-def test_scheduler_on_improve_tick_is_none_at_task9(tmp_path):
-    """Task 9 の時点では Scheduler.on_improve_tick は None のままであること。
-    活性化配線 (実値の関数を渡す) は Task 12 の担当 (統合裁定 R-i9)。"""
+def test_scheduler_on_improve_tick_is_wired_after_task12(tmp_path):
+    """Task 12 の活性化配線後、Scheduler.on_improve_tick は
+    improve_supervisor.tick に束縛される (統合裁定 R-i9)。"""
     _init(tmp_path)
     app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
     try:
-        assert app.scheduler.on_improve_tick is None
+        assert app.scheduler.on_improve_tick.__self__ is app.improve_supervisor
     finally:
         app.close()
 
 
-def test_commands_improve_supervisor_is_none_at_task9(tmp_path):
-    """Task 9 の時点では Commands.improve_supervisor は None のままであること。
-    活性化配線は Task 12 の担当 (統合裁定 R-i9)。"""
+def test_commands_improve_supervisor_is_wired_after_task12(tmp_path):
+    """Task 12 の活性化配線後、Commands.improve_supervisor は
+    app.improve_supervisor と同一インスタンスになる (統合裁定 R-i9)。"""
     _init(tmp_path)
     app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
     try:
-        assert app.commands.improve_supervisor is None
+        assert app.commands.improve_supervisor is app.improve_supervisor
     finally:
         app.close()
 
@@ -126,12 +126,12 @@ def test_run_service_calls_improve_supervisor_shutdown_and_join(tmp_path):
 
 
 def test_scheduler_tick_returns_empty_list_when_on_improve_tick_is_none(tmp_path):
-    """検収 B2 (2026-08-22): `on_improve_tick` が None (Task 9 単独では常に
-    これ) のとき、`Scheduler.tick()` の戻り値は常に空リスト。"""
+    """`on_improve_tick` が None のとき `Scheduler.tick()` の戻り値は常に
+    空リスト (Scheduler 自体の契約 — Task 12 配線後も保たれる)。"""
     _init(tmp_path)
     app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
     try:
-        assert app.scheduler.on_improve_tick is None
+        app.scheduler.on_improve_tick = None
         pending = app.scheduler.tick(NOW)
         assert pending == []
     finally:

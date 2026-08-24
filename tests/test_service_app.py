@@ -3295,3 +3295,28 @@ def test_service_startup_reconcile_failure_still_runs_sweep_and_expire(tmp_path,
     assert m_reconcile.called
     assert m_sweep.called, "reconcile の失敗で sweep_orphans が道連れになった (m10 の欠陥)"
     assert m_expire.called, "reconcile の失敗で process_expired_approvals が道連れになった (m10 の欠陥)"
+
+
+def test_improve_tick_and_supervisor_wired_after_task12(tmp_path):
+    """R-i9 の分担 (Task 9 = 既定 None フック、Task 12 = 値の配線) が
+    Step 4 の diff で実際に満たされていることの検査。B-10 (report-task12.md):
+    hook が『渡されている』ではなく『実際に発火する』ことを、
+    `Scheduler.tick()` が返す遅延 callable 経由の実行と `improve` コマンドの
+    到達の両方で確認する (M1/M2 の真の killer)。"""
+    from unittest.mock import patch as _patch
+    _init(tmp_path)
+    with _no_real_network():
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+        try:
+            # M1 の真の killer: on_improve_tick が正しいオブジェクトへ束縛
+            # されているか (恒真 assert を避ける — B-10 型 3)。
+            assert app.scheduler.on_improve_tick.__self__ is \
+                app.improve_supervisor
+            # M2 の真の killer: `improve` コマンドが submit_manual に到達する。
+            with _patch.object(app.improve_supervisor, "submit_manual",
+                               return_value=42):
+                result = app.commands.dispatch("improve")
+                assert "42" in result
+        finally:
+            app.close()

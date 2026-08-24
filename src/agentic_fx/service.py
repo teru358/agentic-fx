@@ -1002,6 +1002,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                               on_econ_cycle=econ.refresh,
                               on_signal_maintenance=on_signal_maintenance,
                               on_cache_maintenance=on_cache_maintenance,
+                              on_improve_tick=improve_supervisor.tick,
                               signal_due_fn=signal_due_fn,
                               stop_event=stop_event)
 
@@ -1021,6 +1022,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                             trade_loop=_SupervisorAsk(supervisor, ask_wait_timeout_sec),
                             activity=activity, log_dir=root / "logs", clock=clock,
                             health_latch=health_latch,
+                            improve_supervisor=improve_supervisor,
                             plugins_root=plugins_dir, settings=settings)
         return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
