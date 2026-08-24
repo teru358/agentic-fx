@@ -189,6 +189,25 @@ def test_bless_human_live_absent_single_tx_creates_pending_plus_journal(env, mon
     assert (plugins_dir / "_human" / "sma").is_dir()
 
 
+def test_bless_expires_due_non_plugin_approvals_at_entry(env, monkeypatch):
+    """確定-16 (B-33): `bless_candidate` の 0a (`expire_due(commit=True)`)
+    への entry test が無かった。期限到来済みの非 plugin kind pending 行が
+    bless 呼び出しの副作用として expired 化されることを直接確認する。"""
+    root, plugins_dir, conn, settings = env
+    _write_candidate(plugins_dir / "_human" / "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    stale_id = approvals_store.create(
+        conn, "tech_plugin", {"path": "x"}, NOW,
+        expires_at=NOW - timedelta(minutes=1))
+
+    switch.bless_candidate(conn, name="sma", human_dir=plugins_dir / "_human" / "sma",
+                           settings=settings, now=NOW, decided_by="human_cli")
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (stale_id,)).fetchone()
+    assert row["status"] == "expired"
+
+
 # --- P3: bless, live=plain ---
 
 def test_bless_human_live_plain_no_journal_stays_pending(env, monkeypatch):
