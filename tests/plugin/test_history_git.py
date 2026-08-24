@@ -51,6 +51,29 @@ def test_record_version_no_op_when_tree_unchanged(tmp_path):
     assert sha2 is None
 
 
+def test_record_version_refuses_when_version_dir_content_does_not_match_payload_hashes(
+        tmp_path):
+    """確定-6: `record_version` の recompute ガード
+    (`recomputed_content != content_hash or recomputed_artifact !=
+    artifact_hash`) が、payload と実ディスク内容の食い違いを検出して
+    `HistoryGitError` で拒否することを直接 pin する。このガードは
+    `create_version_dir` の冪等早期 return (中身を検証しない) と
+    `_advance_to_decided` の切替後再照合の間で **唯一** in-place 改竄を
+    捕まえる防御であり (verified-local-round1.md 確定-6)、旧稿はこれを
+    直接検証するテストが無かった。"""
+    history_dir = tmp_path / "plugins" / ".history.git"
+    d, a, c = _make_version(tmp_path / "plugins", "sma")
+    d.chmod(0o700)
+    (d / "test_plugin.py").chmod(0o600)
+    (d / "test_plugin.py").write_text("import os\n# TAMPERED\n")
+    d.chmod(0o500)
+
+    with pytest.raises(history_git.HistoryGitError, match="index blob hash mismatch"):
+        history_git.record_version(
+            history_dir, name="sma", artifact_hash=a, content_hash=c,
+            approval_id=1, version_dir=d)
+
+
 def test_record_version_second_version_replaces_prefix_entries(tmp_path):
     """新版の記録が旧版の同 prefix エントリを index から外す (`git rm --cached`)。
     tree に旧 test_plugin.py の内容が残らないこと。"""
