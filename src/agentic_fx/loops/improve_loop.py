@@ -144,6 +144,13 @@ def _chmod_tree_readonly(root: Path) -> None:
         os.chmod(dirpath, 0o500)
 
 
+# Task 12 Step3: `_prepare_report_if_applicable` が OSError を捕まえて
+# その場で Mission を終端させたことを `commit()` に伝えるための sentinel
+# (`None` は「report 対象外 (indicator/plugin や risk_gate)」の既存の
+# 正常値なので流用できない)。
+_REPORT_WRITE_FAILED = object()
+
+
 class ImproveLoop:
     # precheck 2026-08-22 wave2: T10-B10 — Rag はここで注入を受ける
     # (`_build_worker_runner` が独自シグネチャで new しない)
@@ -986,7 +993,12 @@ class ImproveLoop:
             report_path = None
             if approval_payload is None:
                 report_path = self._prepare_report_if_applicable(       # 手順6
-                    conn, ctx=ctx, artifact=artifact, output=output, now=now)
+                    conn, ctx=ctx, artifact=artifact, output=output, now=now,
+                    backlog_id=selection.backlog_id)
+                if report_path is _REPORT_WRITE_FAILED:
+                    # OSError を _prepare_report_if_applicable 自身が Tx-2
+                    # で終端済み — 二重終端を避けてここで抜ける。
+                    return
 
             if approval_payload is not None:
                 self._finalize_success(                                 # 手順7-9
@@ -1008,10 +1020,18 @@ class ImproveLoop:
                 pass
 
     def _prepare_report_if_applicable(self, conn, *, ctx, artifact, output,
-                                      now) -> str | None:
+                                      now, backlog_id=None) -> str | None:
         """`artifact.type=='report'` かつ `proposal_kind != 'risk_gate'` の
         ときだけ本文を `.tmp/*.part` へ書き、Tx-2 で `report_state=
-        'prepared'` + 予定パスを書く。"""
+        'prepared'` + 予定パスを書く。
+
+        Task 12 Step3: `_finalize_gate_failed` と同じ扱いに揃える —
+        `_write_report_part` の OSError (symlink 罠等) を捕まえず突き抜けると
+        Mission が非終端のまま落ちる。ここで捕まえたときは、この関数自身が
+        Tx-2 で Mission を `report_state='failed'`/`run_result=None` に
+        終端し、呼び出し元 (`commit()`) には `_REPORT_WRITE_FAILED`
+        sentinel を返して以降の `_finalize_report_or_observation` 呼び出し
+        (= 二重終端) を止めさせる。"""
         if artifact.get("type") != "report":
             return None
         if artifact.get("proposal_kind") == "risk_gate":
@@ -1019,8 +1039,28 @@ class ImproveLoop:
         reports_dir = self._root / "data" / "improve_reports"
         (reports_dir / ".tmp").mkdir(parents=True, exist_ok=True)
         body_md = artifact.get("body_md", "")
-        part_path = self._write_report_part(
-            reports_dir, mission_id=ctx.mission_id, body_md=body_md)
+        try:
+            part_path = self._write_report_part(
+                reports_dir, mission_id=ctx.mission_id, body_md=body_md)
+        except OSError as exc:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                missions_store.finish_improve_mission(
+                    conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                    slot_key=ctx.slot_key, mission_status="completed",
+                    run_result=None, now=now,
+                    report_state="failed",
+                    backlog_transition=(
+                        {"backlog_id": backlog_id, "status": "observation",
+                         "last_result":
+                             f"report_failed:{safe_error_text(exc)}"}
+                        if backlog_id is not None else None),
+                    commit=False)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            return _REPORT_WRITE_FAILED
         final_path = reports_dir / f"improve-{ctx.mission_id}.md"
         conn.execute(
             "UPDATE improvement_runs SET report_state='prepared', "
@@ -1167,8 +1207,28 @@ class ImproveLoop:
             "candidate was produced by this mission.\n")
         reports_dir = self._root / "data" / "improve_reports"
         (reports_dir / ".tmp").mkdir(parents=True, exist_ok=True)
-        part_path = self._write_report_part(
-            reports_dir, mission_id=ctx.mission_id, body_md=body_md)
+        # Task 12 Step3: `_finalize_gate_failed` と同じ扱いに揃える —
+        # `_write_report_part` の O_EXCL|O_NOFOLLOW 書込失敗 (symlink 罠等)
+        # を捕まえず OSError が commit() を突き抜けると Mission が非終端の
+        # まま落ちる。ここで捕まえて fail closed の終端 tx へ倒す
+        # (backlog は敗者経路なので触らない — 本メソッドの docstring 参照)。
+        try:
+            part_path = self._write_report_part(
+                reports_dir, mission_id=ctx.mission_id, body_md=body_md)
+        except OSError:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                missions_store.finish_improve_mission(
+                    conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                    slot_key=ctx.slot_key, mission_status="completed",
+                    run_result=None, now=now,
+                    report_state="failed",
+                    backlog_transition=None, commit=False)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            return
         final_path = reports_dir / f"improve-{ctx.mission_id}.md"
 
         conn.execute("BEGIN IMMEDIATE")

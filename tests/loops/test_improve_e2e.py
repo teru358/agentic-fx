@@ -703,6 +703,119 @@ def test_report_tmp_symlink_fails_closed(improve_env):
     assert backlog_row[1].startswith("report_failed:")
 
 
+# プラン10 Task12 Step3: `_finalize_loser` の OSError 未捕捉是正 pin
+def test_finalize_loser_report_tmp_symlink_fails_closed(improve_env):
+    """§4.2 手順2 敗者経路 (`_finalize_loser`) も `_finalize_gate_failed`
+    と同じ扱いに揃える — 敗者用の自動レポート `.tmp/*.part` へ事前に
+    symlink を置くと `_write_report_part` が OSError を投げるが、旧実装は
+    捕まえずに突き抜けて `commit()` が非終端のまま落ちていた。ここでは
+    2 度目の `_select_and_bind` の CAS を確実に負けさせるため、backlog を
+    先に 'selected' へ固定してから (`backlog_store.select_for_mission` で
+    1 回目の CAS を先取り消費する) 同じ backlog id を選ぶ 2 本目の
+    mission を流す — スレッド競合を作らずとも `won=False` を決定的に
+    再現できる (`test_concurrent_duplicate_selection_loser_becomes_
+    observation` は「実際の並行性」の検証が主眼、本 pin は OSError 分岐
+    だけを狙うためあえて逐次呼び出しにする)。backlog は敗者経路では
+    一切遷移しない (`_finalize_loser` の docstring 参照) ため、既に
+    'selected' のままであることも確認する。"""
+    app, root = improve_env
+    conn = app.conn_core
+
+    backlog_id = backlog_store.add(conn, "loser symlink idea", "user", NOW)
+    won = backlog_store.select_for_mission(conn, backlog_id, now=NOW)
+    assert won is True  # 先取りして CAS を消費済みにする
+
+    output = _plugin_artifact("loser_symlink_e2e")
+    output["selected"] = {"backlog_id": backlog_id, "idea": "loser symlink idea"}
+    result = MissionResult(status="completed", output=output, transcript=[])
+
+    loop = ImproveLoop(
+        root=root, settings=app.settings, clock=FixedClock(NOW),
+        db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
+    )
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
+        mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+        _write_staging_plugin(
+            ctx.staging_dir, "loser_symlink_e2e",
+            _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
+            _PASSING_INDICATOR_TEST)
+        tmp_dir = root / "data" / "improve_reports" / ".tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        evil_target = tmp_dir / "evil-loser-target.md"
+        evil_target.write_text("should never be reached", encoding="utf-8")
+        (tmp_dir / f"improve-{ctx.mission_id}.md.part").symlink_to(
+            evil_target)
+        mission_result = worker.run(mission)
+        loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
+
+    assert evil_target.read_text(encoding="utf-8") == \
+        "should never be reached"
+
+    run_row = conn.execute(
+        "SELECT result, report_state FROM improvement_runs WHERE id=?",
+        (ctx.run_id,)).fetchone()
+    assert run_row[0] is None
+    assert run_row[1] == "failed"
+
+    backlog_row = conn.execute(
+        "SELECT status FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert backlog_row[0] == "selected"  # 敗者経路は backlog に触れない
+
+
+# プラン10 Task12 Step3: `_prepare_report_if_applicable` の OSError
+# 未捕捉是正 pin
+def test_prepare_report_if_applicable_symlink_fails_closed(improve_env):
+    """§3.5/§4.2 手順6 (`artifact.type=='report'`) も `_finalize_gate_failed`
+    と同じ扱いに揃える — 承認申請を出さない `report` artifact 経路
+    (`proposal_kind != 'risk_gate'`) で `.tmp/*.part` へ事前に symlink を
+    置くと `_write_report_part` が OSError を投げるが、旧実装は捕まえずに
+    突き抜けて `commit()` が非終端のまま落ちていた。"""
+    app, root = improve_env
+    conn = app.conn_core
+
+    output = _report_artifact("core", title="prepare report symlink")
+    result = MissionResult(status="completed", output=output, transcript=[])
+
+    loop = ImproveLoop(
+        root=root, settings=app.settings, clock=FixedClock(NOW),
+        db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
+        activity=app.activity, rag=app.rag,  # wave2-recheck: T10-B10
+    )
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
+        mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+        tmp_dir = root / "data" / "improve_reports" / ".tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        evil_target = tmp_dir / "evil-prepare-target.md"
+        evil_target.write_text("should never be reached", encoding="utf-8")
+        (tmp_dir / f"improve-{ctx.mission_id}.md.part").symlink_to(
+            evil_target)
+        mission_result = worker.run(mission)
+        loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
+
+    assert evil_target.read_text(encoding="utf-8") == \
+        "should never be reached"
+
+    run_row = conn.execute(
+        "SELECT result, report_state FROM improvement_runs WHERE id=?",
+        (ctx.run_id,)).fetchone()
+    assert run_row[0] is None
+    assert run_row[1] == "failed"
+
+    backlog_row = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert backlog_row[0] == "observation"
+    assert backlog_row[1].startswith("report_failed:")
+
+
 # precheck 2026-08-22 wave2: T12-B5 T12-M3
 def test_timeout_mission_leaves_no_backtest_or_analysis_run_rows(
         improve_env):
