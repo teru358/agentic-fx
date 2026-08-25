@@ -96,6 +96,41 @@ def evaluate_strategy_adoption_gate(
     plugin_ref = f"plugins/{name}"
     eval_timeframe = _eval_timeframe(timeframe)
 
+    # baseline の要否 (approved 同名 strategy の有無) は per_pair の結果に
+    # 依存しない純粋な参照なので、in-sample ループより前に確定できる。
+    # ここで確定させておくことで、no_strategy になる場合だけ record_fn を
+    # 捕捉ラッパーへ差し替える (approved-baseline のときは呼び出し元の
+    # record_fn をそのまま転送する既存契約を保つ — 3 周目レビュー
+    # Important-2 の pin `test_record_fn_is_forwarded_to_run_in_sample_
+    # and_run_holdout` が「record_fn はそのまま転送される」ことを要求する
+    # ため)。
+    approved_row = conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE kind='plugin' "
+        "AND status='approved' AND json_extract(payload_json,'$.name')=? "
+        "AND json_extract(payload_json,'$.kind')='strategy' "
+        "ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+
+    from agentic_fx.store import backtest_runs as backtest_runs_store
+
+    # no_strategy baseline (§4.2-4): 候補の in-sample 行 (pair ごと) の
+    # identity (period/settings_hash/core_commit/initial_balance/source/
+    # timeframe) をそのまま複製し、plugin_ref/variant/metrics だけ
+    # no_strategy 用に差し替えて record_fn/Tx-2 の既存経路 (record_fn is
+    # None のときは即時 save、`holdout._run_scope` と同じ形) へ流す。
+    # `baseline_row` (approval payload 添付用の JSON-safe 4 key dict) とは
+    # 別物 — `period` に datetime を含む行を payload に混ぜると
+    # `approvals_store.create` の json.dumps で TypeError になる。
+    in_sample_rows: list[dict] = []
+    if approved_row is None:
+        def _in_sample_record_fn(row: dict) -> None:
+            in_sample_rows.append(row)
+            if record_fn is not None:
+                record_fn(row)
+            else:
+                backtest_runs_store.save_harness_run(history_conn, **row)
+    else:
+        _in_sample_record_fn = record_fn
+
     per_pair = {}
     for pair in pairs:
         intent_source = strategy_adapter.build_intent_source(
@@ -107,7 +142,7 @@ def evaluate_strategy_adoption_gate(
                 source=_EVAL_SOURCE, intent_source=intent_source,
                 eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
                 content_hash=content_hash, kind="strategy", now=now,
-                record_fn=record_fn)
+                record_fn=_in_sample_record_fn)
         finally:
             intent_source.close()
     total_trades = sum(m["trades"] for m in per_pair.values())
@@ -131,16 +166,25 @@ def evaluate_strategy_adoption_gate(
         finally:
             intent_source.close()
 
-    approved_row = conn.execute(
-        "SELECT payload_json FROM approval_requests WHERE kind='plugin' "
-        "AND status='approved' AND json_extract(payload_json,'$.name')=? "
-        "AND json_extract(payload_json,'$.kind')='strategy' "
-        "ORDER BY id DESC LIMIT 1", (name,)).fetchone()
     if approved_row is not None:
         baseline_row = {"ref_plugin_ref": plugin_ref, "variant": "baseline"}
         return StrategyGateVerdict(
             evaluable=True, baseline_variant="baseline",
             baseline_row=baseline_row, candidate_metrics=per_pair)
+
+    for row in in_sample_rows:
+        no_strategy_row = dict(row)
+        no_strategy_row["plugin_ref"] = f"no_strategy:{name}"
+        no_strategy_row["variant"] = "no_strategy"
+        no_strategy_row["metrics"] = {
+            "trades": 0, "pf": None, "win_rate": None, "avg_r": None,
+            "max_drawdown": 0.0, "total_pnl": 0.0, "evaluable": False,
+            "fallback_spread_used": False}
+        if record_fn is not None:
+            record_fn(no_strategy_row)
+        else:
+            backtest_runs_store.save_harness_run(
+                history_conn, **no_strategy_row)
 
     baseline_row = {"plugin_ref": f"no_strategy:{name}",
                     "content_hash": content_hash, "kind": "strategy",
