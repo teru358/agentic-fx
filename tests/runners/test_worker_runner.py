@@ -3159,6 +3159,136 @@ def test_real_improve_worker_on_ready_exception_leaves_no_surviving_child(
         "on_ready 失敗後も子プロセスが生きている (kill されていない疑い)")
 
 
+def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
+        tmp_path, monkeypatch):
+    """R-D2 実プロセス回帰ピン (プラン10 Task13 Step0): 親 WorkerRunner の
+    dispatcher_loop は tool_rpc フレームを常に `self._call_rag(name, args)`
+    (`self._rag` への `getattr`) にルーティングしていた — improve profile
+    用に構築時に渡した `rpc_handlers` (run_backtest/analyze_corr) は
+    `self._rpc_handlers` に格納されるだけで dispatcher_loop から一度も
+    参照されなかった (haiku が Step 3 で param を追加した際に消費側の
+    配線を書き忘れた)。
+
+    実 `mission_worker.py` 子プロセスを spawn し、子の `afx.sock`
+    (MCP dispatcher, `_start_mcp_dispatcher`) へ `tools/call(run_backtest)`
+    を直接投げて子→親の `tool_rpc`/`tool_rpc_result` 往復を実測する。
+    修正前は `self._rag` に `run_backtest` 属性が無いため
+    `AttributeError` が握り潰されて `{"error": ...}` が返り、修正後は
+    このテストが渡した `rpc_handlers["run_backtest"]` が呼ばれてその
+    返り値がそのまま通る。"""
+    if not landlock_available():
+        pytest.skip("Landlock not available on this kernel/architecture")
+    import socket as socket_mod
+    import agentic_fx.runners.worker_runner as wr_mod
+
+    # `tests/conftest._LLAMA_SWAP_UNREACHABLE_URL` (127.0.0.1:1) は
+    # ECONNREFUSED を即座に返す — LocalRunner がミリ秒未満で mission を
+    # 終端させてしまい、本テストの RPC プローブ (別スレッド、`go` 消費後
+    # まで少し待ってから接続する) が間に合わない。TEST-NET-1
+    # (RFC 5737, 192.0.2.0/24) は経路制御表に存在しないため connect()
+    # がタイムアウトまで応答なしでブロックする — `llama_swap.timeout_sec`
+    # 分の猶予をプローブに与えられる。
+    root = _root(tmp_path)
+    settings = SETTINGS.model_copy(update={
+        "llama_swap": SETTINGS.llama_swap.model_copy(
+            update={"base_url": "http://192.0.2.1:1/v1", "timeout_sec": 5}),
+        "worker": SETTINGS.worker.model_copy(
+            update={"worker_startup_timeout_sec": 15.0,
+                    "worker_grace_sec": 2.0,
+                    "worker_terminate_grace_sec": 2.0})})
+
+    staging = tmp_path / "staging" / "rd2-real-probe"
+    staging.mkdir(parents=True, mode=0o700)
+    source_snapshot = tmp_path / "source"
+    source_snapshot.mkdir(mode=0o500)
+
+    class _RunContext:
+        mission_id = "rd2-real-probe"
+        staging_dir = staging
+        source_snapshot_dir = source_snapshot
+
+    handler_calls: list[dict] = []
+
+    def run_backtest_handler(args: dict) -> dict:
+        handler_calls.append(args)
+        return {"trial_count": 1, "probe": "parent-rpc-handler"}
+
+    def analyze_corr_handler(args: dict) -> dict:
+        return {"trial_count": 1, "probe": "parent-rpc-handler"}
+
+    real_popen = wr_mod.subprocess.Popen
+    captured: dict[str, object] = {}
+
+    def _capture(*a, **k):
+        captured["cwd"] = k["cwd"]
+        return real_popen(*a, **k)
+
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", _capture)
+
+    responses: dict[str, object] = {}
+    probe_done = threading.Event()
+
+    def _probe() -> None:
+        # `on_ready` が戻るまで (= 親が "go" フレームを子へ送るまで)
+        # 待つ。子側は ready 送出直後、`go` を受け取るまで別スレッドで
+        # `sys.stdin.buffer` を読み続けている (`_wait_for_go`) — RPC
+        # client (`_make_rpc_client`) も同じ `sys.stdin.buffer` を読む
+        # ため、`go` 到着前に RPC を投げると 2 スレッドが同じ
+        # BufferedReader を取り合い、子が `go` を tool_rpc_result と
+        # 取り違えて即終了する (このテスト特有のセットアップ上の競合—
+        # `_wait_for_go` スレッドが確実に抜けた後に投げれば避けられる)。
+        time.sleep(0.5)
+        sock_path = Path(str(captured["cwd"])) / "afx.sock"
+        deadline = time.monotonic() + 10.0
+        while not sock_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        try:
+            with socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM) as s:
+                s.settimeout(10.0)
+                s.connect(str(sock_path))
+                req = (json.dumps({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "run_backtest",
+                              "arguments": {"name": "x", "pair": "USDJPY"}},
+                }) + "\n").encode()
+                s.sendall(req)
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+            if buf:
+                responses["run_backtest"] = json.loads(buf.decode())
+        finally:
+            probe_done.set()
+
+    def _on_ready(frame):
+        assert frame.get("ok") is True, frame
+        threading.Thread(target=_probe, daemon=True,
+                         name="afx-rd2-probe").start()
+
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(
+        root=root, settings=settings, clock=clock, rag=_rag(tmp_path),
+        worker_profile="improve", run_context=_RunContext(),
+        on_ready=_on_ready,
+        rpc_handlers={"run_backtest": run_backtest_handler,
+                     "analyze_corr": analyze_corr_handler})
+    mission = Mission(prompt="hi", tools=[], output_schema={"type": "object"},
+                      max_turns=1, timeout_sec=20.0)
+    runner.run(mission)
+    probe_done.wait(timeout=15.0)
+
+    assert "run_backtest" in responses, "on_ready 経由の tools/call が失敗した"
+    content = responses["run_backtest"]["result"]["content"][0]["text"]
+    payload = json.loads(content)
+    assert payload == {"trial_count": 1, "probe": "parent-rpc-handler"}, (
+        "親の dispatcher_loop が rpc_handlers を無視して self._rag へ "
+        f"ルーティングした疑い (R-D2 dead code): {payload!r}")
+    assert handler_calls == [{"name": "x", "pair": "USDJPY"}]
+
+
 def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
         monkeypatch, tmp_path):
     """(裁定 R1/RB3、§7.1-2 の blocking 受入条件、A-4 検収是正 B2)

@@ -505,10 +505,16 @@ class ImproveLoop:
         # 「Rag はここで注入を受ける (`_build_worker_runner` が独自
         # シグネチャで new しない)」) が既に意図を明記しており、
         # `__init__` で受け取り済みの `self._rag` を使うのが正しい実装。
+        # precheck 2026-08-27 Task13 Step0 是正 (R-D2 dead code): 子
+        # (mission_worker.py) の run_backtest/analyze_corr RPC を親側で
+        # 消費するには WorkerRunner に rpc_handlers を渡す必要がある。
+        # 以前はここで省略されており (rpc_handlers=None のまま)、
+        # WorkerRunner.__init__ が受け取って格納するだけで
+        # dispatcher_loop から一度も参照されなかった。
         return WorkerRunner(
             root=self._root, settings=self._settings, clock=self._clock,
             rag=self._rag, worker_profile="improve",
-            run_context=ctx, on_ready=on_ready)
+            run_context=ctx, on_ready=on_ready, rpc_handlers=ctx.rpc_handlers)
 
     def _freeze_ledger(self, ctx: ImproveRunContext) -> None:
         ctx.ledger.freeze()

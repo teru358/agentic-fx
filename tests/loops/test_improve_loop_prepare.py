@@ -376,5 +376,13 @@ def test_build_worker_runner_passes_ctx_as_run_context(loop_full, conn):
     # 独自シグネチャで new せず、`ImproveLoop.__init__` が受け取った
     # `self._rag` をそのまま WorkerRunner へ渡すことを確認する。
     assert runner._rag is loop_full._rag
+    # precheck 2026-08-27 Task13 Step0 是正 (R-D2 dead code): `_build_worker_runner`
+    # は `ctx.rpc_handlers` を `WorkerRunner(rpc_handlers=...)` へ渡す必要が
+    # ある — 省略すると WorkerRunner.dispatcher_loop は improve profile の
+    # run_backtest/analyze_corr RPC を握り潰して self._rag への
+    # AttributeError に化ける (実プロセス回帰ピン:
+    # tests/runners/test_worker_runner.py::
+    # test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag)。
+    assert runner._rpc_handlers is ctx.rpc_handlers
 
 

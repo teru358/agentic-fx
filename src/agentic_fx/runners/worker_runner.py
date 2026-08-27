@@ -275,7 +275,7 @@ class WorkerRunner(AgentRunner):
 
                 def _rpc_worker(name=frame["name"], args=frame["args"]) -> None:
                     try:
-                        result_queue.put((True, self._call_rag(name, args)))
+                        result_queue.put((True, self._dispatch_rpc(name, args)))
                     except Exception as e:  # noqa: BLE001 — 子へ tool error として返す
                         result_queue.put((False, str(e)))
 
@@ -450,6 +450,31 @@ class WorkerRunner(AgentRunner):
     def _call_rag(self, name: str, args: dict):
         method = getattr(self._rag, name)
         return method(**args)
+
+    def _dispatch_rpc(self, name: str, args: dict):
+        """裁定 R-D2: `worker_profile="improve"` 用に構築時へ渡された
+        `rpc_handlers` (run_backtest/analyze_corr) をここで初めて消費する。
+        `__init__` は受け取って `self._rpc_handlers` へ格納するだけで、
+        以前の `dispatcher_loop` は `tool_rpc` フレームを常に
+        `_call_rag` (trade profile の RAG 呼び出し専用) へルーティング
+        しており、improve 側の RPC は握り潰されて `self._rag` への
+        `AttributeError` に化けていた (実プロセス回帰ピン:
+        `tests/runners/test_worker_runner.py::
+        test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag`)。
+
+        `rpc_handlers` が構築時に渡されていれば (None ではなく dict なら、
+        空 dict も含む — `verify_backend.py` は全 RPC を明示的に拒否する
+        ための `_reject_rpc` ハンドラだけの dict を渡す) 名前で dispatch
+        し、未登録名は `KeyError` で fail closed する。`rpc_handlers` が
+        渡されていない (None、trade profile の既定) 場合のみ、既存の
+        RAG 呼び出し経路 (`self._rag` への `getattr`) へフォールバック
+        する — trade profile の挙動は変えない。"""
+        if self._rpc_handlers is not None:
+            handler = self._rpc_handlers.get(name)
+            if handler is None:
+                raise KeyError(f"no rpc handler registered for {name!r}")
+            return handler(args)
+        return self._call_rag(name, args)
 
     def _escalate_kill(self, proc, w) -> None:
         """SIGTERM → `worker_terminate_grace_sec` → SIGKILL (設計書 §4.7)。"""
