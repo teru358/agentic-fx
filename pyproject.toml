@@ -36,5 +36,8 @@ packages = ["src/agentic_fx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["bench: 長時間ベンチ (既定 skip、-m bench で実行)"]
-addopts = "-m 'not bench'"
+markers = [
+    "bench: 長時間ベンチ (既定 skip、-m bench で実行)",
+    "realbackend: 実 CLI (claude/codex)・実 llama-swap を叩く (既定 skip、-m realbackend で実行、課金枠を消費し得る)",
+]
+addopts = "-m 'not bench and not realbackend'"

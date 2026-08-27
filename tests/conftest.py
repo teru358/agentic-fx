@@ -70,7 +70,17 @@ _FORBIDDEN_PORTS = frozenset(_FORBIDDEN_PORTS)
 
 
 @pytest.fixture(autouse=True)
-def _forbid_worker_spawn_against_real_llama_swap(monkeypatch):
+def _forbid_worker_spawn_against_real_llama_swap(request, monkeypatch):
+    # Task13 Step5b (`@pytest.mark.realbackend`): この marker が付いた
+    # テストは「実 llama-swap を意図的に叩く」ことそのものが目的の opt-in
+    # テストであり (既定スイートからは `pyproject.toml` の addopts で除外
+    # 済み、人間が `-m realbackend` を明示しない限り走らない)、この pin を
+    # 適用すると本来の目的を達成できない。marker があるテストだけこの
+    # autouse ガードを素通りさせる。
+    if request.node.get_closest_marker("realbackend") is not None:
+        yield
+        return
+
     import subprocess
 
     from agentic_fx.runners import worker_runner as wr_mod
