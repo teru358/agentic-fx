@@ -924,3 +924,23 @@ def test_analyze_corr_rejects_live_source(tmp_path, monkeypatch, capsys):
              "--timeframe", "1h", "--source", "twelvedata"])
     assert exc.value.code == 2
     assert "invalid choice" in capsys.readouterr().err
+
+
+def test_cli_improve_verify_backend_routes_to_verify_backend(tmp_path, monkeypatch):
+    """`_BACKTEST_COMMANDS`/`register_subparsers`/`dispatch` のルーティング
+    だけを pin する。実 backend へは一切到達しない (外向きリクエスト予算 —
+    メモリ outbound-request-budget-is-a-design-constraint)。"""
+    from unittest.mock import patch
+    from agentic_fx.entry import main as entry_main
+    from agentic_fx.loops.verify_backend import VerifyBackendResult
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.loops.verify_backend.verify_backend") as vb:
+        vb.return_value = VerifyBackendResult(
+            ok=True, backend="local", provider=None,
+            fingerprint="0" * 64, detail="ok")
+        rc = entry_main(["improve", "verify-backend", "--backend", "local"])
+    assert rc == 0
+    assert vb.call_args.kwargs["backend"] == "local"
+    assert vb.call_args.kwargs["provider"] is None

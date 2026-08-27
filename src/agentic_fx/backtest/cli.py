@@ -133,6 +133,19 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
                        " (flock、未完ジャーナルは拒否)")
     retire_parser.add_argument("name")
 
+    improve = sub.add_parser("improve", help="改善ループ操作 (CLI 専用)")
+    improve_sub = improve.add_subparsers(dest="improve_command", required=True)
+    verify_backend_parser = improve_sub.add_parser(
+        "verify-backend",
+        help="scheduler/backlog に触れない one-shot backend 検証 "
+            "(llama_swap_verified=false のまま実行できる唯一の経路)")
+    verify_backend_parser.add_argument(
+        "--backend", choices=("local", "claude", "codex"), required=True)
+    verify_backend_parser.add_argument(
+        "--provider", choices=("chatgpt", "llama_swap"), default=None,
+        help="--backend codex のときのみ意味を持つ (runner.codex.provider "
+            "の一時上書き)")
+
 
 # ---- history import ------------------------------------------------------
 
@@ -506,6 +519,23 @@ def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
     return 0
 
 
+def _improve_verify_backend(conn, settings, args: argparse.Namespace,
+                            root: Path) -> int:
+    from agentic_fx.core.contracts import SystemClock
+    from agentic_fx.loops.verify_backend import verify_backend
+    result = verify_backend(root, settings, backend=args.backend,
+                           provider=args.provider, clock=SystemClock())
+    if not result.ok:
+        print(f"エラー: {result.detail}", file=sys.stderr)
+        return 1
+    print(result.detail)
+    print(f"fingerprint: {result.fingerprint}")
+    if args.backend == "codex" and args.provider == "llama_swap":
+        print("合格後、人間が config/settings.yaml の improve.llama_swap_verified "
+             "を true に設定してください (この CLI は書き換えません)。")
+    return 0
+
+
 # ---- dispatch ---------------------------------------------------------------
 
 
@@ -539,6 +569,8 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
                 if args.plugin_command == "bless":
                     return _plugin_bless(conn, settings, args, root)
                 raise ValueError(f"unknown plugin subcommand: {args.plugin_command!r}")
+            if args.command == "improve":
+                return _improve_verify_backend(conn, settings, args, root)
             return _analyze_corr(conn, args)
         finally:
             conn.close()

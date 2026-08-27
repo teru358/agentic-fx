@@ -87,6 +87,7 @@ class WorkerRunner(AgentRunner):
                 run_context: object | None = None,
                 on_rpc_leak: Callable[[], None] | None = None,
                 on_ready: Callable[[dict], None] | None = None,
+                rpc_handlers: dict[str, Callable] | None = None,
                 stop_event: threading.Event | None = None) -> None:
         self._root = root
         self._settings = settings
@@ -96,6 +97,7 @@ class WorkerRunner(AgentRunner):
         self._run_context = run_context
         self._on_rpc_leak = on_rpc_leak
         self._on_ready = on_ready
+        self._rpc_handlers = rpc_handlers
         self._stop_event = stop_event
 
     def close(self) -> None:
