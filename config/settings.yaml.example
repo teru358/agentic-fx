@@ -24,12 +24,12 @@ risk:
 
 runner:
   trade:   {backend: local, model: qwen3.6-35b-a3b_Q4}   # backend: local | claude   (codex は拒否)
-  improve: {backend: local, model: qwen3.6-35b-a3b_Q4}   # backend: local | claude | codex
+  improve: {backend: local, model: qwen3-coder-30b-a3b-instruct}   # backend: local | claude | codex — F-4 是正 (2026-08-27): qwen3.6-35b-a3b_Q4 は llama-swap から撤去済み (`curl localhost:8080/v1/models` で不在を実測)。現行一覧の a3b MoE 系統 (旧モデルの直系) を既定に採用 — 個人 settings.yaml の値も同期すること
   claude:
     bin: claude
     credentials_file: ~/.claude/.credentials.json
   codex:
-    bin: /path/to/vendor/x86_64-unknown-linux-musl/bin/codex   # vendor native バイナリを直指定 (node ラッパは拒否)
+    bin: /path/to/vendor/x86_64-unknown-linux-musl/bin/codex   # プレースホルダのまま (未設定) — codex backend を使うには実バイナリの絶対パスへ書き換えが必須。個人 settings.yaml でこの値を実パスに置き換えないと codex backend は起動できない
     provider: chatgpt   # chatgpt | llama_swap
     auth_file: ~/.codex/auth.json
   cli_terminate_grace_sec: 10.0
