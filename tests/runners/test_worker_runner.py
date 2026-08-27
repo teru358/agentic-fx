@@ -679,6 +679,83 @@ def test_worker_runner_rag_rpc_dispatches_to_rag_and_responds(
     assert result.status == "completed"
 
 
+def test_worker_runner_empty_rpc_handlers_dict_fails_closed_not_rag_fallback(
+        tmp_path, monkeypatch):
+    """F-1 是正 (プラン10 Task13 検収): `rpc_handlers={}` (空 dict、`None` では
+    ない) を渡した場合も `_dispatch_rpc` は fail closed (`KeyError` →
+    `tool_rpc_result{ok:false}`) しなければならず、trade profile 用の
+    `_call_rag` フォールバックへ落ちてはいけない (`verify_backend.py` の
+    docstring が「空 dict も含む」と明記している契約)。
+
+    `if self._rpc_handlers is not None:` を `if self._rpc_handlers:`
+    (truthiness) に変異させると、空 dict は falsy になり `_call_rag` 経路
+    (`getattr(self._rag, name)(**args)`) へ落ちる — その場合エラー文言が
+    `AttributeError` 由来のものに変わるため、本テストは fail closed の
+    `KeyError` 文言 (`"no rpc handler registered for"`) をピンポイントで
+    assert して区別する。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    captured_rpc_result: list[dict] = []
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "tool_rpc", "seq": 2, "rpc_id": "1",
+                                "name": "search_news",
+                                "args": {"query": "q", "n": 5}})
+        # 検証は run() が戻ったあとテスト本体側で行う (子スレッド内で
+        # assert すると mismatch 時にスレッドが `result` フレームを書かず
+        # 死に、親が mission timeout までハングして red が出力行として
+        # 読めなくなる)。
+        captured_rpc_result.append(json.loads(child_in.readline()))
+        write_frame(child_out, {"type": "result", "seq": 3,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    rag = _rag(tmp_path)
+    rag_calls: list[str] = []
+    rag.search_news = lambda query, n=5: rag_calls.append("called")
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock, rag=rag,
+                          rpc_handlers={})
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert rag_calls == [], (
+        "rpc_handlers={} (空 dict) が _call_rag へフォールバックした — "
+        "fail closed していない")
+    assert len(captured_rpc_result) == 1, "tool_rpc_result フレームが届かなかった"
+    rpc_result = captured_rpc_result[0]
+    assert rpc_result["type"] == "tool_rpc_result"
+    assert rpc_result.get("ok") is False
+    assert "no rpc handler registered for" in rpc_result.get("error", ""), rpc_result
+
+
 def test_worker_runner_rag_rpc_leak_calls_on_rpc_leak(tmp_path, monkeypatch):
     """fake `Rag.search_news` を `rpc_timeout_sec` より長くブロックする
     関数に差し替え、`on_rpc_leak` コールバックが呼ばれることを確認

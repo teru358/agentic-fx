@@ -217,3 +217,72 @@ def test_verify_backend_bypasses_llama_swap_verified_gate_with_warning_log(
 
     assert result.ok is True
     assert any("llama_swap_verified" in r.message for r in caplog.records)
+
+
+class _FixedWatcher:
+    """F-2 是正 (プラン10 Task13 検収): 親ゲート (c)/(d) を `ok=False` 側から
+    踏むための固定応答 watcher。`saw_any_descendant()` の戻り値を注入する
+    (既存の `test_..._bypasses_llama_swap_verified_gate_with_warning_log`
+    と同じ発想の monkeypatch — `_DescendantWatcher` はモジュール直下の
+    グローバル参照なので、生成時ではなく呼び出し時に解決される。よって
+    monkeypatch だけで注入可能であり、`verify_backend.py` 本体の改修は
+    不要)。"""
+
+    def __init__(self, saw: bool) -> None:
+        self._saw = saw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+    def saw_any_descendant(self) -> bool:
+        return self._saw
+
+
+def test_verify_backend_fails_closed_when_no_cli_descendant_is_observed(
+        tmp_path, monkeypatch):
+    """F-2 是正: 親ゲート (c) — `backend != "local"` なのに `_DescendantWatcher`
+    が子孫プロセスを 1 件も観測しなかった場合、`ok=False` かつ detail に
+    `cli_started gate` を含む (実 CLI が起動していないのに `ok=True` を
+    返してしまう欠陥の pin)。gate (d) (`after_descendants`) 側の
+    `_descendant_pids` も併せて空集合へ固定し、gate (d) 側の判定に
+    フォールスルーして偶然 ok=False になる形 (テストの偽陽性) を防ぐ。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._DescendantWatcher",
+                        lambda pid: _FixedWatcher(saw=False))
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._descendant_pids",
+                        lambda pid: set())
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+
+    result = verify_backend(tmp_path, _settings(), backend="codex",
+                           provider="chatgpt", clock=FixedClock(NOW))
+
+    assert result.ok is False
+    assert result.fingerprint is None
+    assert "cli_started gate" in result.detail
+
+
+def test_verify_backend_fails_closed_when_descendants_are_not_reaped(
+        tmp_path, monkeypatch):
+    """F-2 是正: 親ゲート (d) — mission 完了後も子孫プロセスが残っている
+    (pgid 回収漏れ) 場合、`ok=False` かつ detail に `pgid recovery gate`
+    を含む。gate (c) 側は素通りさせるため watcher は観測ありに固定する
+    (gate (c) が先に落ちて (d) を通らないままテストが偶然 pass する形の
+    偽陽性を防ぐ)。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._DescendantWatcher",
+                        lambda pid: _FixedWatcher(saw=True))
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._descendant_pids",
+                        lambda pid: {999999})
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+
+    result = verify_backend(tmp_path, _settings(), backend="codex",
+                           provider="chatgpt", clock=FixedClock(NOW))
+
+    assert result.ok is False
+    assert result.fingerprint is None
+    assert "pgid recovery gate" in result.detail
