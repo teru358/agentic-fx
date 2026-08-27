@@ -166,3 +166,42 @@ def test_on_improve_tick_fires_outside_core_lock(tmp_path):
             "(must fire after _scheduler_tick_once releases core_lock)")
     finally:
         app.close()
+
+
+def test_build_app_reconciles_report_outbox_at_startup(tmp_path):
+    """F-1 是正 (検収 task12、§7.1-6): build_app の起動シーケンスが
+    `ImproveLoop.reconcile_report_outbox` を呼ぶこと。「起動時 reconcile が
+    published ⇔ 最終存在に収束させ孤児を消す」の production 配線が
+    存在することの pin (`reconcile_report_outbox` を消す変異、または呼び
+    出しを外す変異で red になるべき)。
+
+    plugin switch の reconcile/sweep/expire と同じ並びに置く — その 3 本の
+    呼び出し確認テスト (`test_service_startup_calls_reconcile_sweep_expire_
+    then_approved_plugins_in_order`, tests/test_service_app.py) と対になる。
+    """
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    _init(tmp_path)
+    with patch.object(ImproveLoop, "reconcile_report_outbox") as m_reconcile:
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+        try:
+            m_reconcile.assert_called_once()
+            _, kwargs = m_reconcile.call_args
+            assert kwargs["reports_dir"] == tmp_path / "data" / "improve_reports"
+            assert kwargs["now"] == NOW
+        finally:
+            app.close()
+
+
+def test_build_app_startup_survives_report_outbox_reconcile_failure(tmp_path):
+    """F-1 是正: `reconcile_report_outbox` が例外を出しても build_app は
+    完走する (§5.3 と同じ規約 — 改善レーンの report 整合だけが成立せず
+    取引は動く)。"""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    _init(tmp_path)
+    with patch.object(ImproveLoop, "reconcile_report_outbox",
+                      side_effect=RuntimeError("db locked")):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    assert app is not None
+    app.close()
