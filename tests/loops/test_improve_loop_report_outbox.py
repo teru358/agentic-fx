@@ -21,6 +21,23 @@ def test_write_report_uses_o_excl_and_fsyncs_before_tx2(tmp_path, loop_min):
         loop_min._write_report_part(reports_dir, mission_id=7, body_md="x")
 
 
+def test_final_report_path_includes_date_and_avoids_collision_on_mission_id_reuse(
+        tmp_path, loop_min):
+    """F-3 是正 (検収 task12、設計書 §4.2 改訂): 最終レポート名は
+    `improve-YYYY-MM-DD-<mission_id>.md`。日付が無いと、DB 再構築などで
+    mission_id が再利用された場合に別日の成果物が同じ最終名へ収束し
+    上書き/衝突しうる (acceptance-task12.md F-3)。同一 mission_id・別日
+    (`now`) が別ファイルへ解決されることを pin する。"""
+    reports_dir = tmp_path / "reports"
+    p1 = loop_min._final_report_path(
+        reports_dir, mission_id=7, now=datetime(2026, 8, 22))
+    p2 = loop_min._final_report_path(
+        reports_dir, mission_id=7, now=datetime(2026, 8, 23))
+    assert p1.name == "improve-2026-08-22-7.md"
+    assert p2.name == "improve-2026-08-23-7.md"
+    assert p1 != p2
+
+
 def test_publish_renames_after_commit_not_before(tmp_path, loop_min, conn, mission_and_run_fixture):
     mission_id, run_id, backlog_id = mission_and_run_fixture
     reports_dir = tmp_path / "reports"

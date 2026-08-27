@@ -1084,11 +1084,11 @@ def test_report_outbox_state_transitions_published_then_rename_failure(
     assert run1[0] == "published"
     final_path1 = root / run1[1]
     assert final_path1.exists()
-    # 逐語乖離の申告 (着手前検証): 実装の outbox 規約は
-    # `data/improve_reports/improve-<mission_id>.md` (3 箇所の既存実装
-    # ・プラン本文 L20140 と一致、`root/"reports"`/日付入りファイル名は
-    # 導入しない — 詳細は `test_gate_failure_stops_at_report_no_approval_
-    # request` のコメント参照)。テスト側のパスをこれに合わせる。
+    # F-3 是正 (検収 task12 2026-08-27): outbox 規約は
+    # `data/improve_reports/improve-YYYY-MM-DD-<mission_id>.md`
+    # (ディレクトリは 3 箇所の既存実装・プラン本文 L20140 と一致、
+    # 最終名のみ日付を追加 — 設計書 §4.2 逐語どおり)。
+    assert final_path1.name == f"improve-{NOW:%Y-%m-%d}-{ctx1.mission_id}.md"
     assert not (root / "data" / "improve_reports" / ".tmp" /
                f"improve-{ctx1.mission_id}.md.part").exists()
 
@@ -1103,7 +1103,7 @@ def test_report_outbox_state_transitions_published_then_rename_failure(
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _FAILING_INDICATOR_TEST)
         expected_final = (root / "data" / "improve_reports" /
-                          f"improve-{ctx2.mission_id}.md")
+                          f"improve-{NOW:%Y-%m-%d}-{ctx2.mission_id}.md")
         expected_final.parent.mkdir(parents=True, exist_ok=True)
         expected_final.write_text("pre-existing, blocks RENAME_NOREPLACE",
                                   encoding="utf-8")

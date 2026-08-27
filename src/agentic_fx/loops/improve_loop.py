@@ -693,6 +693,19 @@ class ImproveLoop:
             "audit_note": "RPC timeout した呼出しは数えていない",
         }
 
+    def _final_report_path(self, reports_dir: Path, *, mission_id: int,
+                           now: datetime) -> Path:
+        """F-3 是正 (検収 task12、設計書 §4.2 改訂): 最終レポート名は
+        `improve-YYYY-MM-DD-<mission_id>.md`。日付を省くと mission_id が
+        DB 再構築後などに再利用された場合、最終名が衝突しうる
+        (acceptance-task12.md F-3)。`now` は各終端メソッドが Mission の
+        決定論的時刻としてすでに受け取っている引数を使う — 壁時計を
+        直接読まない現行流儀 (`Clock` 注入) に従う。一時 `.tmp/*.part`
+        側は `_write_report_part` が `mission_id` のみで命名する
+        (同時に 1 mission につき 1 tmp ファイルしか存在せず、公開後は
+        消えるため衝突しない)。"""
+        return reports_dir / f"improve-{now:%Y-%m-%d}-{mission_id}.md"
+
     def _write_report_part(self, reports_dir: Path, *, mission_id: int,
                            body_md: str) -> Path:
         """report outbox — 一時ファイルを O_EXCL + fsync で書く。"""
@@ -1061,7 +1074,8 @@ class ImproveLoop:
                 conn.rollback()
                 raise
             return _REPORT_WRITE_FAILED
-        final_path = reports_dir / f"improve-{ctx.mission_id}.md"
+        final_path = self._final_report_path(
+            reports_dir, mission_id=ctx.mission_id, now=now)
         conn.execute(
             "UPDATE improvement_runs SET report_state='prepared', "
             "report_path=? WHERE id=?", (str(final_path), ctx.run_id))
@@ -1229,7 +1243,8 @@ class ImproveLoop:
                 conn.rollback()
                 raise
             return
-        final_path = reports_dir / f"improve-{ctx.mission_id}.md"
+        final_path = self._final_report_path(
+            reports_dir, mission_id=ctx.mission_id, now=now)
 
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1256,8 +1271,9 @@ class ImproveLoop:
         D-15 是正 (着手前検証): 設計書 §4.2 手順6「ゲート不合格・評価不能・
         observation・敗者のとき、reports に書く」に従い、`_finalize_loser`
         と**全く同じ既存の outbox 規約** (`data/improve_reports/
-        improve-<mission_id>.md`) でレポートを書く — 新しい命名は導入
-        しない。旧実装は report を一切書かず `run_result=None`/
+        improve-YYYY-MM-DD-<mission_id>.md` — F-3 是正 (検収 task12
+        2026-08-27) で日付を追加) でレポートを書く。旧実装は report を
+        一切書かず `run_result=None`/
         `report_state='none'` のまま終端していた
         (`tests/loops/test_improve_e2e.py::
         test_gate_failure_stops_at_report_no_approval_request` が期待する
@@ -1302,7 +1318,8 @@ class ImproveLoop:
                 conn.rollback()
                 raise
             return
-        final_path = reports_dir / f"improve-{ctx.mission_id}.md"
+        final_path = self._final_report_path(
+            reports_dir, mission_id=ctx.mission_id, now=now)
 
         conn.execute("BEGIN IMMEDIATE")
         try:
