@@ -792,22 +792,6 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
         plugins_dir = root / "plugins"
 
-        # F-1 是正 (検収 task12): ImproveLoop の構築をここまで前倒しする。
-        # `__init__` は参照を保持するだけで I/O を行わない (下記
-        # `reconcile_report_outbox` を起動時 reconcile 経路 — switch の
-        # reconcile/sweep/expire と同じ並び — に組み込むために、
-        # ImproveSupervisor 構築 (旧位置) より前にインスタンスが要る)。
-        # `improve_supervisor._improve_loop = improve_loop` の代入は
-        # ImproveSupervisor 構築後 (旧位置のまま) で行う。
-        from agentic_fx.loops.improve_loop import ImproveLoop
-        improve_loop = ImproveLoop(
-            root=root, settings=settings, clock=clock,
-            db_write_conn_factory=lambda: connect(
-                root / "data" / "agentic.db"),
-            db_readonly_conn_factory=lambda: connect_readonly(
-                root / "data" / "agentic.db"),
-            activity=activity, rag=rag)
-
         # プラン 10 Task 11f: 起動時 reconcile (journal-first) → 孤児掃除
         # (sweep-last) → 期限切れ承認処理 (B-7: 裁定1の唯一の呼び出し元)。
         # `missions.recover_interrupted` (上記) より後・`approved_plugins()`
@@ -845,23 +829,6 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 activity=activity)
         except Exception as exc:
             activity.write(Category.APPROVAL, "plugin_expire_failed",
-                           safe_error_text(exc))
-        # F-1 是正 (検収 task12、§7.1-6): 改善レーンの report outbox 版
-        # reconcile。plugin switch の reconcile/sweep/expire と同じ「起動時
-        # に published ⇔ 最終存在へ収束させ孤児を消す」役割を、report outbox
-        # (`improvement_runs.report_state`) についても果たす — これが無いと
-        # crash で `prepared` のまま残った run や `.tmp/*.part` 孤児が
-        # 永久に残る。他の 3 呼び出しと同じく独立 try で包み、例外が出ても
-        # サービス起動は止めない (§5.3 と同じ規約 — 改善レーンの report
-        # 整合だけが成立せず取引は動く)。reports_dir は `_publish_report` /
-        # `_finalize_*` が実際に書き込む先 (`data/improve_reports`、F-3 で
-        # 統一) と一致させる。
-        try:
-            improve_loop.reconcile_report_outbox(
-                conn_core, reports_dir=root / "data" / "improve_reports",
-                now=clock.now())
-        except Exception as exc:
-            activity.write(Category.IMPROVE, "improve_report_reconcile_failed",
                            safe_error_text(exc))
 
         # プラン 7 Task 3: plugins/ 直下の承認済み plugin をロードする。反映は
@@ -979,16 +946,56 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             capacity=settings.improve.parallel, root=root, settings=settings,
             clock=clock, db_path=root / "data" / "agentic.db",
             stop_event=stop_event, activity=activity)
-        # プラン10 Task10-12 Step1: `improve_loop` は F-1 是正 (検収
-        # task12) で reconcile 経路配線のため前倒し構築済み (上記
-        # `plugins_dir` 直後)。ここではそれを `improve_supervisor._improve_loop`
-        # へ注入するだけ (R-i2 — Tx-0 の slot claim は ImproveLoop.prepare
-        # の責務、ImproveSupervisor は自分で claim_slot しない)。
+        # プラン10 Task10-12 Step1: ImproveLoop を構築し
+        # `improve_supervisor._improve_loop` へ注入する (R-i2 — Tx-0 の
+        # slot claim は ImproveLoop.prepare の責務、ImproveSupervisor は
+        # 自分で claim_slot しない)。rag は上で構築済みの単一インスタンス
+        # をそのまま渡す (T10-B10 — ここで new しない)。**この位置を
+        # `plugins_dir` 直後 (switch reconcile/sweep/expire と同じ並び) へ
+        # 前倒ししない** — ここで使う `settings` は `_check_cli_backend`
+        # (段 0 F1 是正、上記 857/858 行) が `bin` を絶対パスへ解決した
+        # **戻り値の新インスタンス** (`model_copy`) であり、前倒しすると
+        # `improve_loop._settings` が未解決 (相対 bin) のまま固定され、
+        # 実 backend (claude/codex) で `_build_worker_runner` が起動時検査
+        # 済みの絶対パスでなく生の設定値を使う退行になる (advisor 指摘、
+        # 検収 task12 F-1 是正の 2 回目レビューで発見)。
         # Scheduler.on_improve_tick / Commands.improve_supervisor への値渡し
         # (「有効化配線」) は Task 10 完了後、Task 12 が build_app の当該
         # 箇所で行う (統合裁定 R-i9/R-i2、レビュー1周目 C1) — 本 task は
         # ここまで、Scheduler/Commands の構築呼び出しには一切手を入れない。
+        from agentic_fx.loops.improve_loop import ImproveLoop
+        improve_loop = ImproveLoop(
+            root=root, settings=settings, clock=clock,
+            db_write_conn_factory=lambda: connect(
+                root / "data" / "agentic.db"),
+            db_readonly_conn_factory=lambda: connect_readonly(
+                root / "data" / "agentic.db"),
+            activity=activity, rag=rag)
         improve_supervisor._improve_loop = improve_loop
+
+        # F-1 是正 (検収 task12、§7.1-6): 改善レーンの report outbox 版
+        # reconcile。plugin switch の reconcile/sweep/expire (`plugins_dir`
+        # 直後、上記) と同じ「起動時に published ⇔ 最終存在へ収束させ
+        # 孤児を消す」役割を、report outbox (`improvement_runs.report_state`)
+        # についても果たす — これが無いと crash で `prepared` のまま
+        # 残った run や `.tmp/*.part` 孤児が永久に残る (§7.1-6)。switch の
+        # 3 呼び出しと隣接させず、`improve_loop` (解決済み settings で構築
+        # 済み) の直後・`Scheduler`/`run_service` のスレッド起動より前に
+        # 置く — reconcile は report outbox の整合だけが目的で
+        # `approved_plugins()` の読込順序とは無関係 (switch reconcile の
+        # 隣接要件はそちらの pin 済み担保。ここは「改善レーンが新しい run
+        # を作る前に済ませる」ことだけが要件)。他の 3 呼び出しと同じく
+        # 独立 try で包み、例外が出てもサービス起動は止めない (§5.3 と
+        # 同じ規約 — 改善レーンの report 整合だけが成立せず取引は動く)。
+        # reports_dir は `_publish_report`/`_finalize_*` が実際に書き込む先
+        # (`data/improve_reports`、F-3 で統一) と一致させる。
+        try:
+            improve_loop.reconcile_report_outbox(
+                conn_core, reports_dir=root / "data" / "improve_reports",
+                now=clock.now())
+        except Exception as exc:
+            activity.write(Category.IMPROVE, "improve_report_reconcile_failed",
+                           safe_error_text(exc))
 
         def on_trade_mission(trigger: str) -> bool:
             # trigger は scheduler._trade_mission_due() が返した起動理由。

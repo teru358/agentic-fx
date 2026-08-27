@@ -3137,6 +3137,58 @@ def test_build_app_rewrites_relative_claude_bin_to_absolute_path(tmp_path, monke
         mp.undo()
 
 
+def test_improve_loop_receives_settings_with_resolved_cli_bin(tmp_path, monkeypatch):
+    """F-1 是正 (検収 task12) の再発防止 pin (advisor 指摘): `ImproveLoop`
+    の構築は `_check_cli_backend` (段 0 F1 是正) が `bin` を絶対パスへ
+    書き戻した**後**の `settings` (`model_copy` による新インスタンス) を
+    使わなければならない。`ImproveLoop.reconcile_report_outbox` を起動時
+    reconcile 経路へ配線する際、構築位置を `plugins_dir` 直後
+    (switch reconcile/sweep/expire と同じ並び) へ前倒しする変更を最初に
+    試みたが、その位置は `_check_cli_backend` より**前**であり、
+    `improve_loop._settings` が未解決 (相対 bin) のまま固定される退行を
+    作っていた (`_build_worker_runner` が起動時検査済みの絶対パスでなく
+    生の設定値を使う) — 単体テストは FakeRunner/WorkerRunner の patch で
+    実 bin 解決を経由しないため検出できなかった。本テストは
+    `app.improve_supervisor._improve_loop._settings` が
+    `app.settings` (解決済み) と同一の絶対パスを持つことを直接確認する。"""
+    import agentic_fx.service as service_mod
+
+    monkeypatch.setattr(
+        service_mod, "_check_service_initial_env_has_no_secrets",
+        lambda settings, *, read_initial_env_names=None: None)
+
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    fake_claude = bin_dir / "afx-fake-claude"
+    fake_claude.write_text("#!/bin/sh\nexit 0\n")
+    import stat as _stat
+    fake_claude.chmod(fake_claude.stat().st_mode | _stat.S_IEXEC | 0o700)
+
+    import os as _os
+    old_path = _os.environ.get("PATH", "")
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setenv("PATH", f"{bin_dir}:{old_path}")
+        root = _root_with_settings(tmp_path, runner={
+            "improve": {"backend": "claude", "model": "m"},
+            "claude": {"bin": "afx-fake-claude"}})
+        app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+        try:
+            improve_loop = app.improve_supervisor._improve_loop
+            resolved_on_app = app.settings.runner.claude.bin
+            resolved_on_improve_loop = improve_loop._settings.runner.claude.bin
+            assert Path(resolved_on_improve_loop).is_absolute(), (
+                f"improve_loop._settings.runner.claude.bin が相対のまま: "
+                f"{resolved_on_improve_loop!r} — ImproveLoop が "
+                f"_check_cli_backend 前の settings で構築されている")
+            assert resolved_on_improve_loop == resolved_on_app == \
+                str(fake_claude.resolve())
+        finally:
+            app.close()
+    finally:
+        mp.undo()
+
+
 def test_build_app_rewrites_relative_codex_bin_to_absolute_path(tmp_path, monkeypatch):
     """F1 の裏 (codex 分岐): `runner.codex.bin` が相対 (PATH 解決) でも
     書き戻し後は絶対パスになる。ELF 必須 (`require_elf=True`) なので
