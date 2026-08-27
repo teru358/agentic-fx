@@ -3322,6 +3322,8 @@ def test_improve_tick_and_supervisor_wired_after_task12(tmp_path):
     `Scheduler.tick()` が返す遅延 callable 経由の実行と `improve` コマンドの
     到達の両方で確認する (M1/M2 の真の killer)。"""
     from unittest.mock import patch as _patch
+    from agentic_fx.service import _scheduler_tick_once
+
     _init(tmp_path)
     with _no_real_network():
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
@@ -3331,6 +3333,22 @@ def test_improve_tick_and_supervisor_wired_after_task12(tmp_path):
             # されているか (恒真 assert を避ける — B-10 型 3)。
             assert app.scheduler.on_improve_tick.__self__ is \
                 app.improve_supervisor
+            # F-5 是正: M1 の真の killer (実発火) を復元する。`on_improve_tick`
+            # が単に束縛されているだけでなく、`Scheduler.tick()` が返す遅延
+            # callable 経由で実際に呼ばれることを確認する (プラン Step 4 原文、
+            # 検収 task12 F-5 で無申告削除が指摘された)。
+            #
+            # 逸脱 (実測): プラン原文は `_patch.object(ImproveSupervisor,
+            # "tick")` (クラス属性) だが、`app.scheduler.on_improve_tick` は
+            # build_app 時点で `improve_supervisor.tick` を束縛済みの bound
+            # method — クラス属性を後から差し替えても、既に取得済みの bound
+            # method は元の未パッチ関数を指したままで patch が効かない
+            # (実測: call_count 0 で red)。`app.scheduler.on_improve_tick`
+            # 自体を差し替える形へ変更した (ImproveSupervisor は未使用のため
+            # import も削除)。
+            with _patch.object(app.scheduler, "on_improve_tick") as spy:
+                _scheduler_tick_once(app)
+                spy.assert_called_once_with(NOW)
             # M2 の真の killer: `improve` コマンドが submit_manual に到達する。
             with _patch.object(app.improve_supervisor, "submit_manual",
                                return_value=42):

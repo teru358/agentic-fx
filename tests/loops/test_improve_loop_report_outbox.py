@@ -73,6 +73,87 @@ def test_publish_failure_when_final_already_exists_triggers_compensation(
     assert row["report_path"] is None
 
 
+def test_rename_no_replace_renames_and_reports_true_on_success(tmp_path, loop_min):
+    """F-6 是正 (検収 task12): `_rename_no_replace` が実際に
+    `renameat2(RENAME_NOREPLACE)` 経由でリネームし (この環境は Linux —
+    実 syscall を通す)、成功したことを True で返す。"""
+    src = tmp_path / "src.part"
+    dst = tmp_path / "dst.md"
+    src.write_text("body")
+    used_renameat2 = loop_min._rename_no_replace(src, dst)
+    assert used_renameat2 is True
+    assert dst.read_text() == "body"
+    assert not src.exists()
+
+
+def test_rename_no_replace_raises_file_exists_without_toctou_window(
+        tmp_path, loop_min):
+    """F-6 是正: dst が既に存在するとき `_rename_no_replace` は
+    `FileExistsError` を送出する。これはカーネルが `RENAME_NOREPLACE`
+    フラグで検出した EEXIST であって、`exists()` チェックと `os.rename`
+    の間に別プロセスが割り込める旧来の TOCTOU 窓は無い (このテストは
+    衝突の**検出**を pin する — 窓の不在自体は `_rename_no_replace` が
+    check-then-act を一切行わない実装であることで担保される)。"""
+    src = tmp_path / "src.part"
+    dst = tmp_path / "dst.md"
+    src.write_text("body")
+    dst.write_text("already here")
+    with pytest.raises(FileExistsError):
+        loop_min._rename_no_replace(src, dst)
+    # EEXIST では rename が行われない (src はそのまま残る)。
+    assert src.exists()
+    assert dst.read_text() == "already here"
+
+
+def test_publish_report_falls_back_to_exists_rename_when_renameat2_unavailable(
+        tmp_path, loop_min, conn, mission_and_run_fixture, monkeypatch):
+    """F-6 是正: `_rename_no_replace` が False (非対応環境の合図) を
+    返したとき、`_publish_report` は旧来の exists+rename フォールバックで
+    published まで到達できる (renameat2 非対応環境でも機能を失わない)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    reports_dir = tmp_path / "reports"
+    (reports_dir / ".tmp").mkdir(parents=True)
+    part = loop_min._write_report_part(reports_dir, mission_id=mission_id, body_md="x")
+    final_path = reports_dir / "improve-2026-08-22-{}.md".format(mission_id)
+
+    monkeypatch.setattr(loop_min, "_rename_no_replace", lambda src, dst: False)
+    loop_min._publish_report(conn, run_id=run_id, part_path=part,
+                             final_path=final_path, now=datetime(2026, 8, 22))
+    assert final_path.exists()
+    assert not part.exists()
+    row = conn.execute(
+        "SELECT report_state FROM improvement_runs WHERE id=?", (run_id,)).fetchone()
+    assert row["report_state"] == "published"
+
+
+def test_publish_report_calls_rename_no_replace_not_bare_os_rename(
+        tmp_path, loop_min, conn, mission_and_run_fixture, monkeypatch):
+    """F-6 是正の配線 pin: `_publish_report` が `_rename_no_replace` を
+    呼ぶこと自体を確認する (`_rename_no_replace` を呼ばずに旧来の
+    exists+rename だけへ戻す変異で red になるべき — 直前 2 本の
+    フォールバック/EEXIST テストは `_rename_no_replace` 単体の契約しか
+    見ておらず、`_publish_report` が実際にそれを経由することまでは
+    pin していなかった)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    reports_dir = tmp_path / "reports"
+    (reports_dir / ".tmp").mkdir(parents=True)
+    part = loop_min._write_report_part(reports_dir, mission_id=mission_id, body_md="x")
+    final_path = reports_dir / "improve-2026-08-22-{}.md".format(mission_id)
+
+    calls = []
+    real = loop_min._rename_no_replace
+
+    def _spy(src, dst):
+        calls.append((src, dst))
+        return real(src, dst)
+
+    monkeypatch.setattr(loop_min, "_rename_no_replace", _spy)
+    loop_min._publish_report(conn, run_id=run_id, part_path=part,
+                             final_path=final_path, now=datetime(2026, 8, 22))
+    assert calls == [(part, final_path)]
+    assert final_path.exists()
+
+
 def test_reconcile_prepared_with_part_publishes(tmp_path, loop_min, conn, mission_and_run_fixture):
     """起動時 reconcile: `prepared` かつ `.part` あり → 今公開して `published`。"""
     mission_id, run_id, backlog_id = mission_and_run_fixture

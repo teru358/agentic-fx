@@ -2,17 +2,25 @@
 (設計書 §4、プラン §8.1-6/11/16/23/24/40/42/43)。"""
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import logging
 import os
 import re
 import sqlite3
 import stat
+import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
+
+# F-6 是正 (検収 task12): renameat2(2) の AT_FDCWD / RENAME_NOREPLACE。
+# x86_64 Linux の値 (Linux 3.15+ の ABI、glibc 2.28+ が libc wrapper を持つ)。
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import Category
@@ -727,13 +735,65 @@ class ImproveLoop:
         finally:
             os.close(fd)
 
+    def _rename_no_replace(self, src: Path, dst: Path) -> bool:
+        """F-6 是正 (検収 task12、設計書 §4.2 L389 の `RENAME_NOREPLACE`
+        要求): `renameat2(2)` (Linux 3.15+, glibc 2.28+ に libc wrapper
+        あり) で `RENAME_NOREPLACE` フラグを使い、rename を「既存 dst が
+        無いときだけ」カーネルに原子的に行わせる。旧実装は
+        `if final_path.exists(): raise ... ; os.rename(...)` という
+        check-then-act (TOCTOU) — exists() チェックと os.rename の間に
+        別プロセスが同名ファイルを作ると `os.rename` は POSIX 上それを
+        黙って上書きする (exists+rename 版は「renameat2 の近似」に過ぎず、
+        本物の排他ではなかった)。
+
+        戻り値: `renameat2` で原子的にリネームできたら True。**非対応
+        環境 (非 Linux / 古いカーネルの ENOSYS・一部 FS の EINVAL) では
+        False を返し**、呼び出し元 (`_publish_report`) が旧来の
+        exists+rename (TOCTOU 近似) にフォールバックする。**dst が既に
+        存在する衝突 (`EEXIST`) は非対応の合図ではない** — `FileExistsError`
+        をそのまま送出し、呼び出し元の `_fail_report` 補償 tx へ倒す
+        (fallback は行わない — フォールバックしてしまうと `RENAME_NOREPLACE`
+        が検出した衝突を exists+rename が再チェックする間に別プロセスが
+        入れ替わる余地を新たに作ってしまう)。"""
+        if not sys.platform.startswith("linux"):
+            return False
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            renameat2 = libc.renameat2
+        except AttributeError:
+            return False
+        renameat2.restype = ctypes.c_long
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                              ctypes.c_char_p, ctypes.c_uint]
+        ctypes.set_errno(0)
+        rc = renameat2(_AT_FDCWD, os.fsencode(str(src)), _AT_FDCWD,
+                       os.fsencode(str(dst)), _RENAME_NOREPLACE)
+        if rc == 0:
+            return True
+        err = ctypes.get_errno()
+        if err == errno.EEXIST:
+            raise FileExistsError(errno.EEXIST, os.strerror(err), str(dst))
+        if err in (errno.ENOSYS, errno.EINVAL):
+            return False
+        raise OSError(err, os.strerror(err), str(dst))
+
     def _publish_report(self, conn, *, run_id: int, part_path: Path,
                         final_path: Path, now: datetime) -> None:
-        """report outbox — rename 後に published へ遷移、fsync。"""
+        """report outbox — rename 後に published へ遷移、fsync。
+
+        F-6 是正 (検収 task12、設計書 §4.2 L389): 最終名への rename は
+        `renameat2(RENAME_NOREPLACE)` で行う (`_rename_no_replace` 参照)。
+        非対応環境 (非 Linux・古いカーネル) のみ、旧来の
+        exists+rename (TOCTOU 近似) にフォールバックする。"""
         try:
-            if final_path.exists():
-                raise FileExistsError(final_path)
-            os.rename(part_path, final_path)
+            if not self._rename_no_replace(part_path, final_path):
+                # renameat2 非対応環境向けフォールバック (TOCTOU 近似 —
+                # `_rename_no_replace` 自身が返す False はこの経路でしか
+                # 起きない。EEXIST は `_rename_no_replace` が直接
+                # FileExistsError を送出する — ここでは再チェックしない)。
+                if final_path.exists():
+                    raise FileExistsError(final_path)
+                os.rename(part_path, final_path)
         except FileExistsError:
             self._fail_report(conn, run_id=run_id, now=now, reason="rename_conflict")
             return
