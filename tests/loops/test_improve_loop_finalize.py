@@ -787,3 +787,36 @@ def test_compensation_failure_does_not_propagate_to_caller(
     activity_text = (tmp_path / "activity.log").read_text()
     assert "tx2_compensation_failed" in activity_text
     assert f"mission_id={mission_id} run_id={run_id}" in activity_text
+
+
+def test_compensate_tx2_failure_actually_writes_failed_mission_and_observation(
+        loop_min, conn, mission_and_run_fixture, monkeypatch):
+    """A10 是正 (束D検収, verified-local-round1.md §11 #8):
+    `test_compensation_failure_does_not_propagate_to_caller` は
+    `_compensate_tx2_failure` **自体**を monkeypatch で例外送出に
+    置き換えるため、実 `_compensate_tx2_failure` の本体 (mission
+    `failed` / backlog `observation` / `last_result='commit_failed'`
+    への遷移) は 1 行も実行されない。ここでは `_compensate_tx2_failure`
+    には触れず、Tx-2 本体 (`approvals_store.create`) だけを失敗させて
+    実補償 tx を走らせ、3 列が実際に書かれることを assert する。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+
+    from agentic_fx.store import approvals as approvals_store
+
+    def _tx2_boom(*a, **kw):
+        raise RuntimeError("simulated Tx-2 fault")
+    monkeypatch.setattr(approvals_store, "create", _tx2_boom)
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "myst", "kind": "strategy"},
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc))
+
+    mission = conn.execute(
+        "SELECT status FROM missions WHERE id=?", (mission_id,)).fetchone()
+    assert mission["status"] == "failed"
+    backlog = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert backlog["status"] == "observation"
+    assert backlog["last_result"] == "commit_failed"
