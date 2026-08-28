@@ -98,29 +98,84 @@ def test_examples_are_copied_from_docs_examples_plugins(tmp_path, monkeypatch):
     assert (dest / "rsi_indicator" / "plugin.py").exists()
 
 
-def test_concurrent_write_to_version_dir_is_detected(tmp_path):
-    """M2: コピー中に別スレッドが同じ版ディレクトリへ書き込もうとしても、
-    plugin_lock の排他でそれが発生しない (lock 無しなら race が起きる)。
-    ここでは lock 付きで安全なことを確認する。"""
-    import os
-    import stat as stat_module
+def test_concurrent_copy_calls_sharing_plugin_lock_are_mutually_exclusive(
+        tmp_path, monkeypatch):
+    """A4 是正 (束D検収, verified-local-round1.md §11 #9): 元の
+    `test_concurrent_write_to_version_dir_is_detected` は名前が
+    「並行書込みを検出する」と謳いながら、実際には**別スレッドを 1 本も
+    起動せず** lock 付きの成功パスを 1 回踏むだけだった (`with plugin_lock:`
+    (`improve_loop.py:106`) を除去しても実測 SURVIVED — 全スイート
+    `2924 passed`)。ここでは実 2 スレッドが**同一 `plugin_lock`** を共有して
+    `copy_source_snapshot` を並行に呼び、各呼出しの「読取クリティカル
+    セクション」の時間区間が重ならないこと (相互排他) を直接観測する
+    (`Path.read_bytes` に細工した遅延を挟み、区間の start/end を記録する)。"""
+    meta_a_dir = tmp_path / "cand-a"
+    meta_b_dir = tmp_path / "cand-b"
+    _write_plugin(meta_a_dir, plugin_py=b"A")
+    _write_plugin(meta_b_dir, plugin_py=b"B")
 
-    src = tmp_path / "candidate"
-    _write_plugin(src, plugin_py=b"A")
-
-    class _FakeMeta:
-        name = "x"
-        path = src
+    class _MetaA:
+        name = "plugin-a"
+        path = meta_a_dir
         content_hash = "irrelevant"
         artifact_hash = _artifact_hash(b"A", b"c", b"t")
 
-    dest = tmp_path / "dest"
+    class _MetaB:
+        name = "plugin-b"
+        path = meta_b_dir
+        content_hash = "irrelevant"
+        artifact_hash = _artifact_hash(b"B", b"c", b"t")
+
+    # 別々の dest_root にする (`copy_source_snapshot` は末尾で
+    # `_chmod_tree_readonly(dest_root)` を呼ぶため、共有 dest だと
+    # 先に終わった側が dest を読取専用化して他方の mkdir を壊す —
+    # ここで検証したい plugin_lock の相互排他とは無関係な副作用)。
+    dest_a = tmp_path / "dest-a"
+    dest_b = tmp_path / "dest-b"
     lock = threading.Lock()
 
-    # lock を使ってコピーする場合、成功する
-    result = copy_source_snapshot([_FakeMeta()], dest_root=dest, plugin_lock=lock)
-    assert result == ["x"]
-    assert (dest / "x" / "plugin.py").exists()
+    import time
+    from pathlib import Path as PathClass
+
+    real_read_bytes = PathClass.read_bytes
+    intervals: list[tuple[str, float, float]] = []
+    intervals_guard = threading.Lock()
+
+    def _slow_read_bytes(self):
+        if self.name == "plugin.py":
+            label = self.parent.name  # "cand-a" or "cand-b"
+            t0 = time.monotonic()
+            time.sleep(0.05)
+            data = real_read_bytes(self)
+            t1 = time.monotonic()
+            with intervals_guard:
+                intervals.append((label, t0, t1))
+            return data
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(PathClass, "read_bytes", _slow_read_bytes)
+
+    results: dict[str, list] = {}
+
+    def _run(key, meta, dest):
+        results[key] = copy_source_snapshot(
+            [meta], dest_root=dest, plugin_lock=lock)
+
+    t1 = threading.Thread(target=_run, args=("a", _MetaA(), dest_a))
+    t2 = threading.Thread(target=_run, args=("b", _MetaB(), dest_b))
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert results["a"] == ["plugin-a"]
+    assert results["b"] == ["plugin-b"]
+    assert len(intervals) == 2, intervals
+    (_, a_start, a_end), (_, b_start, b_end) = intervals
+    # 相互排他: 一方の区間が他方の開始前に終わっているか、他方の終了後に
+    # 始まっているかのどちらか (重ならない)。
+    assert a_end <= b_start or b_end <= a_start, (
+        f"plugin_lock で保護されているはずの区間が重なった: {intervals}")
 
 
 def test_copied_files_are_readonly_after_copy(tmp_path):
