@@ -169,6 +169,18 @@ def test_compute_partition_hint_disjoint_covers_open_backlog_across_slots(
     assert loop_min._compute_partition_hint(conn, None) is None
 
 
+def test_compute_partition_hint_raises_when_wave_has_no_slots(loop_min, conn):
+    """D09 是正 (段0 致命2): `slot_key` が非 None なのに対応する wave の
+    slot が 1 件も無いのは矛盾 (呼び出し元は claim_slot 済みのはず) —
+    fail-open (`None` = 全担当) にせず `RuntimeError` で落とす、という
+    コード自身のコメントが明記する契約を pin する。`return None` に
+    落ちると、wave slot が引けない異常時に全 slot が全バックログを
+    担当してしまう (N 個の Mission が同じ backlog を取り合い、
+    CLI 実行が丸ごと無駄になる)。"""
+    with pytest.raises(RuntimeError, match="no wave slots"):
+        loop_min._compute_partition_hint(conn, ("2026-W99", 0))
+
+
 def test_tx0_mission_id_unique_partial_index_on_improvement_runs(conn):
     """`improvement_runs.mission_id` に対する部分 UNIQUE の migration が
     効いていること (2 回目の INSERT が同じ mission_id を指せば

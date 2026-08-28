@@ -301,6 +301,63 @@ def test_gate_failure_stops_at_report_no_approval_request(improve_env):
     assert not live.exists()
 
 
+def test_landlock_unavailable_produces_gate_failure_not_approval(
+        improve_env, monkeypatch):
+    """D20 是正 (段0 致命3): `run_gate_pytest` が Landlock 不可の
+    fail-closed `RuntimeError` (設計書 §4.2-3d) を投げたとき、candidate の
+    pytest は一度も実行されなかったにもかかわらず `passed=True` へ化けて
+    approval_requests に承認待ちとして載ってはならない
+    (CLAUDE.md「テスト不合格の変更は approval_request 化禁止」)。
+
+    候補自体は `test_full_cycle_discovery_to_backlog_transition` と同じ
+    正常系の内容 (gate に通れば approval まで進む形) にし、
+    `run_gate_pytest` だけを RuntimeError で差し替える —
+    `_run_plugin_gate` の戻り値だけでなく `commit()` を最後まで通して
+    `approval_requests` の件数まで踏む (§ 採ってはいけない案 の回避)。"""
+    app, root = improve_env
+    conn = app.conn_core
+
+    result = MissionResult(
+        status="completed",
+        output=_plugin_artifact("landlock_gate_e2e"),
+        transcript=[],
+    )
+    loop = ImproveLoop(
+        root=root, settings=app.settings, clock=FixedClock(NOW),
+        db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
+        activity=app.activity, rag=app.rag,
+    )
+
+    def _raise_landlock_unavailable(plugin_dir, *, settings):
+        raise RuntimeError("landlock unavailable")
+
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.run_gate_pytest",
+        _raise_landlock_unavailable)
+
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
+        mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+        _write_staging_plugin(
+            ctx.staging_dir, "landlock_gate_e2e",
+            _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
+            _PASSING_INDICATOR_TEST)
+        mission_result = worker.run(mission)
+        loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
+
+    approval_count = conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'").fetchone()[0]
+    assert approval_count == 0
+
+    backlog_row = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert backlog_row[0] == "observation"
+    assert backlog_row[1].startswith("gate_failed:")
+
+
 # precheck 2026-08-22 wave2: T12-M2
 def test_concurrent_duplicate_selection_loser_becomes_observation(improve_env):
     """2 Mission が同じ backlog id を同時に選択したとき、Tx-1 の CAS に

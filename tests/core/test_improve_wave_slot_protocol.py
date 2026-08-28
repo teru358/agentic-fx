@@ -337,6 +337,67 @@ def test_on_ready_exception_reverts_to_reserved_then_failed(conn, monkeypatch):
     assert events == []
 
 
+def test_failure_after_running_does_not_retry_the_slot(conn):
+    """D03 是正 (段0 致命1): `not reached_running` の判別が外れると、
+    on_ready 到達後 (= slot が `running` へ遷移済み) の失敗まで
+    `_handle_pre_ready_failure` の retry 経路に乗ってしまい、二重実行に
+    つながる。コード自身のコメント (改訂履歴の直上) が「実行が始まった
+    後の失敗を retry してしまうと二重実行になるため区別する」と明記する
+    防御を pin する。
+
+    1 回目: on_ready へ一度も到達せず failed (pre-ready 失敗) —
+    正規の revert_to_reserved で `reserved` に戻る (spawn_attempts=1)。
+    2 回目: on_ready へ到達してから ("running" へ遷移済み) failed を返す
+    — `not reached_running` が効いていれば `_handle_pre_ready_failure` は
+    呼ばれず、slot は `running` のまま (commit() 側の通常終端に委ねる)。
+    変異 (`not reached_running and ...` → `...`) が入ると、2 回目の
+    attempts=2 (>= _MAX_SPAWN_ATTEMPTS) で `mark_slot_failed` が呼ばれ、
+    その CAS は `running` も受理するため実行中の slot が
+    `failed` + `mission_id=NULL` に落ちる (§6.7 — 1 attempt 目だけを見る
+    形だと `revert_to_reserved` の CAS が `claimed` 限定で no-op になり
+    観測結果が無変異時と一致してしまうため、2 attempt 目まで踏む)。"""
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W34", now=now, expected=1, commit=True)
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+
+    class _PreReadyFailsRunner:
+        on_ready = None
+
+        def run(self, mission):
+            return _FakeMissionResult("failed", None, reason="pre-ready failure")
+
+    sup._improve_loop = _FakeImproveLoop(
+        conn, _PreReadyFailsRunner(), mission_id=111)
+    sup._launch_slot("2026-W34", 0)  # 1 回目 → reserved (spawn_attempts=1)
+
+    row = conn.execute(
+        "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "reserved"
+    assert row["mission_id"] is None
+    assert row["spawn_attempts"] == 1
+
+    events: list[str] = []
+    sup._improve_loop = _FakeImproveLoop(
+        conn, _RecordingFakeWorkerRunner(events, ready_ok=False), mission_id=222)
+    sup._launch_slot("2026-W34", 0)  # 2 回目 → on_ready 到達後に failed
+
+    row = conn.execute(
+        "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "running", (
+        "on_ready 到達後 (running へ遷移済み) の失敗が retry 経路 "
+        "(_handle_pre_ready_failure) に乗り、実行中の slot が終端されて "
+        "しまっている — 二重実行の危険がある")
+    assert row["mission_id"] == 222
+    assert row["spawn_attempts"] == 2
+
+
 # Tests for 9.4: pre-ready 失敗
 
 def test_pre_ready_failure_reverts_to_reserved_with_mission_id_null(conn):
