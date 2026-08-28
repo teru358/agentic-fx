@@ -114,6 +114,26 @@ def test_materialize_workspace_copies_approved_plugin_source_into_snapshot(
     assert (copied / "plugin.py").read_text() == "def compute(df, params):\n    return {}\n"
 
 
+def test_materialize_workspace_creates_staging_dir_with_mode_0700(
+        loop_min, conn):
+    """D13 是正 (段0 非致命だが本番破壊): `mission_worker.py` の dirfd
+    再検証が mode 0700 を要求するため、`_materialize_workspace` が作る
+    `staging_dir` の mode が 0700 でないと**すべての improve Mission が
+    子側で起動拒否**になる (実 subprocess 経路のテストは `prepare()` を
+    経由せず自前で staging を組むため、この mode は一度も実行経路に
+    乗っていなかった)。`umask(0o022)` 下でも成立することを見る —
+    mkdir の umask マスクがこの `chmod` の存在理由なので、umask を
+    触らないと恒真になりうる。"""
+    import os
+    old_umask = os.umask(0o022)
+    try:
+        staging_dir, _source_snapshot_dir = loop_min._materialize_workspace(
+            conn, 44, None)
+    finally:
+        os.umask(old_umask)
+    assert (staging_dir.stat().st_mode & 0o777) == 0o700
+
+
 def test_materialize_workspace_copies_examples_from_self_root_docs_examples_plugins(
         loop_min, conn):
     """D-12 pin (検収 R2): `_materialize_workspace` が `copy_examples_snapshot`

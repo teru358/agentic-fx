@@ -2935,13 +2935,29 @@ def test_go_frame_is_sent_for_improve_profile_even_when_on_ready_is_none(
     r2, w2 = os.pipe()
     received: dict = {}
 
+    # D29 是正 (段0 pin 形状是正、[[mutation-testing]] 3.10): `go` を
+    # `child_in.readline()` で無条件にブロッキング待ちすると、
+    # `profile == "improve"` → `on_ready is not None` の変異下で `go` が
+    # 一度も送られず 300 秒超のハング (フルスイート全体の driver timeout
+    # を焼く) になる — 検出はできる (緑にならない) が pin の形として
+    # 不良。`go` を待つ前にバックストップ `select.select` タイムアウトを
+    # 張り、タイムアウトしたら `received["frame"] = None` を入れて
+    # `result` フレームを書いて抜けることで、変異下でも必ず**有限時間で
+    # red** に倒す。
+    _BACKSTOP_SEC = 3.0
+
     def child_thread_fn():
+        import select
         child_in = os.fdopen(r2, "rb")
         child_out = os.fdopen(w, "wb")
         json.loads(child_in.readline())  # handshake (seq=1)
         write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
-        line = child_in.readline()
-        received["frame"] = json.loads(line)
+        ready_fds, _, _ = select.select([child_in], [], [], _BACKSTOP_SEC)
+        if ready_fds:
+            line = child_in.readline()
+            received["frame"] = json.loads(line)
+        else:
+            received["frame"] = None  # backstop: go は届かなかった
         write_frame(child_out, {"type": "result", "seq": 2,
                                 "status": "completed", "output": {}})
         child_out.close()
@@ -2959,10 +2975,10 @@ def test_go_frame_is_sent_for_improve_profile_even_when_on_ready_is_none(
                           on_ready=None)
     t.start()
     result = runner.run(_mission())
-    t.join(timeout=2.0)
+    t.join(timeout=_BACKSTOP_SEC + 2.0)
 
     assert result.status == "completed"
-    assert received.get("frame", {}).get("type") == "go", (
+    assert (received.get("frame") or {}).get("type") == "go", (
         "on_ready=None でも improve profile なら go フレームが送られる"
         f"はず: {received!r}")
 
