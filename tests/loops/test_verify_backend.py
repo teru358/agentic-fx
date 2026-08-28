@@ -218,7 +218,11 @@ def test_verify_backend_overrides_runner_improve_backend_and_codex_provider(
     assert scoped.runner.improve.backend == "codex"
     assert scoped.runner.codex.provider == "llama_swap"
     assert settings.runner.improve.backend == "local"  # 元の settings は無変更
-    assert settings.runner.codex.provider != "llama_swap" or True  # 元の複製元は無変更
+    # C1 是正 (束D検収, verified-local-round1.md §11 #19): 元は
+    # `or True` が付いており恒真 assert だった (settings.yaml.example の
+    # 既定 codex.provider は "llama_swap" ではないため、`or True` を
+    # 落とすと有意な assert になる)。
+    assert settings.runner.codex.provider != "llama_swap"  # 元の複製元は無変更
 
 
 def test_verify_backend_bypasses_llama_swap_verified_gate_with_warning_log(

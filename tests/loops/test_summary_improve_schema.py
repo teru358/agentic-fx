@@ -43,6 +43,22 @@ def test_missing_required_top_level_key_fails(missing_key):
         jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
 
 
+@pytest.mark.parametrize("missing_key", ["proposal_kind", "title", "body_md"])
+def test_report_variant_missing_required_key_fails(missing_key):
+    """C13 是正 (束D検収, verified-local-round1.md §11 #18):
+    report variant の `required` から `body_md` を外しても実測 SURVIVED
+    (全スイート 2924 passed) だった — `test_valid_report_output_passes`
+    が唯一の report ケースで、`body_md` を常に含んでいたため missing-key
+    の否定側が未踏だった。`proposal_kind`/`title`/`body_md` の 3 値
+    parametrize で report variant の required 全項目を pin する。"""
+    out = _valid_plugin_output()
+    out["artifact"] = {"type": "report", "proposal_kind": "core",
+                       "title": "t", "body_md": "b"}
+    del out["artifact"][missing_key]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
 def test_schema_has_no_analysis_run_ids_or_trial_count_property():
     """§3.5: analysis_run_ids/trial_count は出力 schema に無い (agent に
     数えさせない — 親が RPC 台帳から作る)。"""
