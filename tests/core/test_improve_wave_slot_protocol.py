@@ -616,20 +616,33 @@ def test_trade_writer_not_blocked_during_improve_gate_tx(tmp_path):
     trade_conn.close()
 
 
-def test_wave_creation_respects_running_slot_count(tmp_path, monkeypatch):
+@pytest.mark.parametrize("occupied_status", ["claimed", "running"])
+def test_wave_creation_respects_running_slot_count(
+        tmp_path, monkeypatch, occupied_status):
     """M = min(parallel, open_slots) の capacity 制限テスト。
-    capacity=2, parallel=4, 1 slot が running → 1 slot だけ作成される。"""
+    capacity=2, parallel=4, 1 slot が occupied (`claimed`/`running`) →
+    1 slot だけ作成される。
+
+    D02 是正 (段0 準致命): `claimed` は Tx-0 完了・ready 未到達 =
+    既に子プロセスを起こしにいっている slot。数え落とすと `open_slots`
+    が過大になり capacity を超えて wave/slot を作り CLI 子プロセスを
+    余分に起動する。以前は `running` のみを踏んでおり、`_running_slot_
+    count` の `IN ('claimed','running')` → `IN ('running')` という
+    「占有中の数え落とし」変異を検出できていなかった (§6.11)。占有状態を
+    固定リテラル `["claimed", "running"]` で parametrize し、両方を
+    踏ませる — 本番の集合を parametrize に渡す形は 2026-08-23 束 C の
+    教訓 (変異が自分のテストケースを静かに消す) により採らない。"""
     db_path = tmp_path / "agentic.db"
     conn = db_mod.connect(db_path)
     db_mod.init_db(conn)
     now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
 
-    # Create a running slot from a previous period (not the current tick's period)
+    # Create an occupied slot from a previous period (not the current tick's period)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W32", now=now, expected=1, commit=True)
     mid = missions_store.start(conn, "improve", "local", "m", now=now)
     conn.execute(
-        "UPDATE improve_wave_slots SET status='running', mission_id=? "
-        "WHERE wave_period_key='2026-W32' AND k=0", (mid,))
+        "UPDATE improve_wave_slots SET status=?, mission_id=? "
+        "WHERE wave_period_key='2026-W32' AND k=0", (occupied_status, mid))
     conn.commit()
 
     # Now try to create new wave with capacity=2, parallel=4

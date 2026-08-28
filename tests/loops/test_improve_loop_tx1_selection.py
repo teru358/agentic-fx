@@ -89,6 +89,39 @@ def test_new_backlog_over_limit_are_dropped_and_counted_in_activity(
     assert n == 2
 
 
+@pytest.mark.parametrize("selected", [
+    {"backlog_id": None},
+    {"backlog_id": None, "idea": ""},
+    {"backlog_id": None, "idea": "   "},
+], ids=["idea_key_missing", "idea_empty_string", "idea_whitespace_only"])
+def test_empty_selected_idea_is_not_bound_and_creates_no_backlog_row(
+        loop_and_ctx_with_open_backlog, selected):
+    """D18 是正 (段0 準致命): 空文字は選択なしとして扱う (fail closed —
+    実在しない idea を勝者にしない)、というコード自身のコメントが明記
+    する契約を pin する。`idea` キー欠落 / `""` / `"   "` の 3 値で撃つ
+    (§6.6) — 非空値しか渡さないと `or ""` 型の退行が丸ごと残る。変異
+    (`if not selected_idea.strip(): ... → if False: ...`) が入ると、
+    空の idea が `improvement_backlog` へ INSERT され Tx-1 CAS で選択
+    されて `run` に bind されてしまう。"""
+    loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
+    before = conn.execute(
+        "SELECT count(*) c FROM improvement_backlog").fetchone()["c"]
+
+    output = {"discoveries": [], "selected": selected,
+              "artifact": {"type": "observation", "reason": "x"},
+              "selection_rationale": "x"}
+    outcome = loop._select_and_bind(conn, output, ctx, now=datetime(2026, 8, 22))
+
+    assert outcome.won is False
+    assert outcome.backlog_id is None
+    after = conn.execute(
+        "SELECT count(*) c FROM improvement_backlog").fetchone()["c"]
+    assert after == before
+    run = conn.execute("SELECT backlog_id FROM improvement_runs WHERE id=?",
+                       (ctx.run_id,)).fetchone()
+    assert run["backlog_id"] is None
+
+
 def test_new_idea_selected_creates_and_binds_in_same_tx(loop_and_ctx_with_open_backlog):
     """新規 idea が selected の場合、INSERT → UPDATE(select) → bind が
     同じ tx で連鎖する。"""
