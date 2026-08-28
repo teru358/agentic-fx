@@ -24,6 +24,7 @@ from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.landlock import is_available as landlock_available
 from agentic_fx.core.mission_protocol import write_frame
 from agentic_fx.runners.base import Mission
+from agentic_fx.runners import worker_runner as wr_mod
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.rag import Rag
@@ -2254,6 +2255,30 @@ def test_worker_runner_rejects_credentials_file_readable_by_group(monkeypatch, t
     creds = tmp_path / "creds.json"
     creds.write_text('{"token":"x"}')
     creds.chmod(0o644)
+    root = _root(tmp_path)
+    runner = WorkerRunner(
+        root=root,
+        settings=_worker_settings(claude_backend=True, credentials_file=str(creds)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
+    result = runner.run(_mission())
+    assert result.status == "failed"
+
+
+def test_worker_runner_rejects_credentials_file_owned_by_other_uid(monkeypatch, tmp_path):
+    """認証原本の事前検査: 所有者 == 実 uid (C5 是正 — 束D検収 verified-local-round1.md
+    §10 #1)。UID 検査 (`worker_runner.py:65`) は round1 まで無 pin で、
+    `st.st_uid != os.getuid()` を `False` に潰しても全スイート緑だった。"""
+    # conftest の guard を通すため Popen をモック (実際には呼ばれない)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: None)
+
+    creds = tmp_path / "creds.json"
+    creds.write_text('{"token":"x"}')
+    creds.chmod(0o600)
+    st = creds.stat()
+    # 実ファイルの所有者は変えられない (root 権限が要る) ので、
+    # 検査対象の `os.getuid()` の側を「所有者ではない値」へ差し替える。
+    monkeypatch.setattr(wr_mod.os, "getuid", lambda: st.st_uid + 1)
+
     root = _root(tmp_path)
     runner = WorkerRunner(
         root=root,

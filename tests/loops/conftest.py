@@ -18,7 +18,7 @@ from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
 from agentic_fx.store import missions as missions_store
-from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.db import connect, connect_readonly, init_db
 
 NOW = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
 SETTINGS = load_settings(
@@ -65,6 +65,31 @@ def loop_full(conn, tmp_path, clock):
     loop = _build_loop(conn, tmp_path, clock=clock)
     loop._conn_for_test = conn  # テストシーム：conn close を回避
     return loop
+
+
+@pytest.fixture
+def loop_no_seam(tmp_path, clock):
+    """束D検収是正 (verified-local-round1.md §11 #3, A20/A35/L-B7/ACC-B2):
+    `loop_min`/`loop_full` は write/readonly 両 factory に**同一 conn**
+    (`loop_min`) または `_conn_for_test` seam (`loop_full`) を立てるため、
+    Tx-0 の原子性 (別接続からの durable commit 確認)・Tx-1 の真の CAS
+    競合・`prepare()` の本番 conn 経路 (`_conn_for_test` 無し = 呼出ごとに
+    close する側) が構造的に検証できない。この fixture は **seam を
+    一切立てず**、`db_write_conn_factory`/`db_readonly_conn_factory` を
+    本番 (`service.py:969`) と同型の「毎回 `db_path` へ新規接続」にする。
+    既存の `loop_min`/`loop_full` は他テストの回帰を避けるため残す。"""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    db_path = tmp_path / "t.db"
+    bootstrap = connect(db_path)
+    init_db(bootstrap)
+    bootstrap.close()
+    loop = ImproveLoop(
+        root=tmp_path, settings=SETTINGS, clock=clock,
+        db_write_conn_factory=lambda: connect(db_path),
+        db_readonly_conn_factory=lambda: connect_readonly(db_path),
+        activity=ActivityLog(tmp_path / "activity.log"), rag=_FakeRag())
+    return loop, db_path
 
 
 @pytest.fixture

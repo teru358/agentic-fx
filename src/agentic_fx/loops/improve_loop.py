@@ -205,10 +205,22 @@ class ImproveLoop:
             except BaseException:
                 conn.rollback()
                 raise
-        finally:
-            pass  # write 接続は commit 相 (10.11 節) の同一接続を使い回す —
-                   # ここで close しない (呼び出し元が prepare→run→commit を
-                   # 通して所有する。10.9 節で最終形に確定する)
+        except BaseException:
+            # ACC-B1 是正 (束D検収、verified-local-round1.md §11 #1):
+            # Tx-0 *自体*の失敗 (`claim_slot` の CAS 失敗を含む) は
+            # rollback 済みでもこの経路のまま prepare() を抜けると、
+            # post-Tx0 失敗経路 (下の except BaseException: @227-)
+            # の対称 close には到達しない — write conn が漏れる
+            # (`probe_leakrate.py` 実測: 1 回につき厳密に 2 fd、retry
+            # loop 導入で `_launch_slot` 1 回あたりの露出が 2 倍)。
+            # 成功時は下の finally 相当の close 判断 (line ~283) が
+            # 別途処理するので、ここでは失敗時のみ close する。
+            if getattr(self, "_conn_for_test", None) is None:
+                conn.close()
+            raise
+        # write 接続は commit 相 (10.11 節) の同一接続を使い回す — Tx-0
+        # 成功時はここで close しない (呼び出し元が prepare→run→commit
+        # を通して所有する。10.9 節で最終形に確定する)
 
         # I3 是正 (プラン10 束D round1、ユーザー裁定 D②、2026-08-28):
         # Tx-0 は上で durable commit 済み。ここから先 (workspace/context/

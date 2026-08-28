@@ -7,11 +7,13 @@ from pathlib import Path
 
 import pytest
 
+from agentic_fx.activity import ActivityLog
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
-from agentic_fx.store.db import connect_readonly
+from agentic_fx.store import improve_waves
+from agentic_fx.store.db import connect, connect_readonly, init_db
 
-from tests.loops.conftest import _prepare_wave_slot
+from tests.loops.conftest import SETTINGS, _FakeRag, _prepare_wave_slot
 
 
 def test_improve_run_context_is_frozen_dataclass():
@@ -223,9 +225,15 @@ def test_tx0_mission_id_unique_partial_index_on_improvement_runs(conn):
 
 
 def test_tx0_crash_between_mission_insert_and_run_insert_leaves_no_orphan(
-        loop_min, conn, monkeypatch):
+        loop_full, conn, monkeypatch):
     """Tx-0 の途中 (missions INSERT 後・run INSERT 前) で例外が起きたら
-    ロールバックし、mission 行も残らない (単一 tx pin)。"""
+    ロールバックし、mission 行も残らない (単一 tx pin)。
+
+    ACC-B1 是正 (束D検収): Tx-0 自体の失敗は `_conn_for_test` が無ければ
+    prepare() が write conn を close するようになったため (漏れ修正)、
+    是正後もテスト自身の `conn` で状態確認できる `loop_full` (シーム有り)
+    を使う (`loop_min` は write conn = 検証用 `conn` そのものなので、
+    是正後は prepare() 内で close されてしまい検証不能になる)。"""
     now = datetime(2026, 8, 22, 3, 0)
 
     from agentic_fx.store import improve_runs as improve_runs_store
@@ -236,7 +244,7 @@ def test_tx0_crash_between_mission_insert_and_run_insert_leaves_no_orphan(
     monkeypatch.setattr(improve_runs_store, "start", _boom)
 
     with pytest.raises(RuntimeError):
-        loop_min.prepare(slot_key=None, now=now)
+        loop_full.prepare(slot_key=None, now=now)
 
     n = conn.execute("SELECT count(*) c FROM missions").fetchone()["c"]
     assert n == 0
@@ -318,9 +326,13 @@ def test_render_improve_mission_prompt_fails_closed_on_missing_key(tmp_path):
         loop._render_improve_mission_prompt(bad_ctx_data, ctx=ctx)
 
 
-def test_tx0_mutation_M2_system_exit_without_rollback(loop_min, conn, monkeypatch):
+def test_tx0_mutation_M2_system_exit_without_rollback(loop_full, conn, monkeypatch):
     """M2: BaseException ではなく Exception を catch することで、
-    SystemExit でロールバックしない退行を検出する。"""
+    SystemExit でロールバックしない退行を検出する。
+
+    ACC-B1 是正で `loop_min` → `loop_full` に適応 (理由は
+    `test_tx0_crash_between_mission_insert_and_run_insert_leaves_no_orphan`
+    の docstring 参照)。"""
     now = datetime(2026, 8, 22, 3, 0)
     from agentic_fx.store import improve_runs as improve_runs_store
 
@@ -330,7 +342,7 @@ def test_tx0_mutation_M2_system_exit_without_rollback(loop_min, conn, monkeypatc
     monkeypatch.setattr(improve_runs_store, "start", _sys_exit)
 
     with pytest.raises(SystemExit):
-        loop_min.prepare(slot_key=None, now=now)
+        loop_full.prepare(slot_key=None, now=now)
 
     # SystemExit が正しくロールバックされれば、mission 行は 0 件
     n = conn.execute("SELECT count(*) c FROM missions").fetchone()["c"]
@@ -459,6 +471,180 @@ def test_prepare_failure_after_tx0_manual_one_shot_has_no_slot_to_terminalize(
     r = conn.execute("SELECT count(*) c FROM improvement_runs "
                      "WHERE finished_at IS NULL").fetchone()["c"]
     assert r == 0
+
+
+def test_prepare_seamless_tx0_durable_commit_and_closes_write_conn(
+        loop_no_seam, clock):
+    """束D検収是正 (verified-local-round1.md §11 #3, A20/A35/L-B7/ACC-B2):
+    `loop_full`/`loop_min` は write/readonly 両 factory に同一 conn を
+    返す (または `_conn_for_test` シームを立てる) ため、Tx-0 の durable
+    commit と本番 conn 経路 (`_conn_for_test` 無し = prepare() 内で自前の
+    write conn を close する側) が構造的に未検証だった。`loop_no_seam`
+    (毎回新規接続、`_conn_for_test` 属性なし) で実測する。"""
+    loop, db_path = loop_no_seam
+    now = clock.now()
+    _prepare_wave_slot(conn := connect(db_path), period_key="2026-W34", k=0, now=now)
+    conn.close()
+
+    captured = []
+    real_factory = loop._db_write_conn_factory
+
+    def _spy():
+        c = real_factory()
+        captured.append(c)
+        return c
+
+    loop._db_write_conn_factory = _spy
+
+    mission, ctx, runner = loop.prepare(slot_key=("2026-W34", 0), now=now)
+
+    # (a) 別接続から見て commit 済み (Tx-0 の原子性)
+    fresh = connect_readonly(db_path)
+    try:
+        m = fresh.execute(
+            "SELECT status FROM missions WHERE id=?", (ctx.mission_id,)).fetchone()
+        assert m["status"] == "running"
+        slot = fresh.execute(
+            "SELECT status, mission_id FROM improve_wave_slots "
+            "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+        assert slot["status"] == "claimed"
+        assert slot["mission_id"] == ctx.mission_id
+    finally:
+        fresh.close()
+
+    # (b) 本番経路 (`_conn_for_test` 無し) の write conn は prepare() が
+    # 自前で close する (D-10 是正の対称、`improve_loop.py:283-284`)。
+    assert len(captured) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        captured[0].execute("SELECT 1")
+
+
+def test_prepare_real_concurrent_cas_only_one_winner(tmp_path, clock):
+    """束D検収是正 (verified-local-round1.md §11 #3, A20/A35/L-B7/ACC-B2 (b)):
+    Tx-1 CAS (`claim_slot`) の敗者テストは従来「事前 UPDATE で slot を
+    先に埋めてから prepare を呼ぶ」形で、真の並行 CAS 競合を再現して
+    いなかった。ここでは実 2 スレッド + 実 2 接続 (別々の `ImproveLoop`
+    インスタンス、それぞれ自前の write_conn_factory) で同一 slot を
+    同時に `prepare()` させ、勝者 1・敗者 1 になることを実測する。"""
+    import threading
+
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    db_path = tmp_path / "t.db"
+    bootstrap = connect(db_path)
+    init_db(bootstrap)
+    now = clock.now()
+    _prepare_wave_slot(bootstrap, period_key="2026-W60", k=0, now=now)
+    bootstrap.close()
+
+    def _make_loop(root):
+        root.mkdir(parents=True, exist_ok=True)
+        return ImproveLoop(
+            root=root, settings=SETTINGS, clock=clock,
+            db_write_conn_factory=lambda: connect(db_path),
+            db_readonly_conn_factory=lambda: connect_readonly(db_path),
+            activity=ActivityLog(root / "activity.log"), rag=_FakeRag())
+
+    loop_a = _make_loop(tmp_path / "a")
+    loop_b = _make_loop(tmp_path / "b")
+
+    results = {}
+
+    def _run(name, loop):
+        try:
+            loop.prepare(slot_key=("2026-W60", 0), now=now)
+            results[name] = "ok"
+        except RuntimeError as e:
+            results[name] = str(e)
+
+    t1 = threading.Thread(target=_run, args=("a", loop_a))
+    t2 = threading.Thread(target=_run, args=("b", loop_b))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    outcomes = list(results.values())
+    winners = [v for v in outcomes if v == "ok"]
+    losers = [v for v in outcomes if "slot claim failed" in v]
+    assert len(winners) == 1, results
+    assert len(losers) == 1, results
+
+    fresh = connect_readonly(db_path)
+    try:
+        slot = fresh.execute(
+            "SELECT status, spawn_attempts FROM improve_wave_slots "
+            "WHERE wave_period_key='2026-W60' AND k=0").fetchone()
+        assert slot["status"] == "claimed"
+        # 敗者の CAS は rowcount=0 で spawn_attempts を増やさない -> 1
+        assert slot["spawn_attempts"] == 1
+        m = fresh.execute(
+            "SELECT count(*) c FROM missions WHERE status='running'").fetchone()
+        assert m["c"] == 1, "敗者側の Tx-0 は rollback され dangling mission が残らない"
+    finally:
+        fresh.close()
+
+
+def test_prepare_tx0_own_cas_failure_closes_write_conn_no_dangling_rows(
+        loop_no_seam, clock):
+    """束D検収是正 (ACC-B1 + A21、verified-local-round1.md §11 #1/#4):
+    Tx-0 *自体*の失敗 (`claim_slot` の CAS 失敗) は `except BaseException:
+    conn.rollback(); raise` の後 `finally: pass` (是正前の
+    `improve_loop.py:205-209`) を通り、post-Tx0 失敗経路
+    (`except BaseException:` @227-273、`_conn_for_test` が None なら
+    close する) には**到達しない**まま prepare() を抜けていたため write
+    conn が漏れていた (`probe_leakrate.py` 実測: 1 回につき厳密に 2 fd)。
+    是正後は Tx-0 自体の失敗でも write conn が close されることと、
+    `if not claimed: raise RuntimeError` (A21) がバックストップとして
+    機能し、mission/run が dangling で残らないことを一本で実測する。"""
+    loop, db_path = loop_no_seam
+    now = clock.now()
+    setup = connect(db_path)
+    _prepare_wave_slot(setup, period_key="2026-W61", k=0, now=now)
+    # 先に別 mission で claim 済みにしておき、slot を 'reserved' 以外へ
+    # 動かす (= 次の CAS は必ず rowcount=0 で失敗する)。mission_id は
+    # FK 制約があるため実在させる。
+    setup.execute(
+        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+        "VALUES (999, 'improve', 'local', 'm', 'running', ?)",
+        (now.isoformat(),))
+    claimed = improve_waves.claim_slot(
+        setup, period_key="2026-W61", k=0, mission_id=999, now=now)
+    assert claimed
+    setup.close()
+
+    captured = []
+    real_factory = loop._db_write_conn_factory
+
+    def _spy():
+        c = real_factory()
+        captured.append(c)
+        return c
+
+    loop._db_write_conn_factory = _spy
+
+    with pytest.raises(RuntimeError, match="slot claim failed"):
+        loop.prepare(slot_key=("2026-W61", 0), now=now)
+
+    assert len(captured) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        captured[0].execute("SELECT 1")
+
+    fresh = connect_readonly(db_path)
+    try:
+        # id=999 は setup 用の他 mission (claim 済みにするため事前挿入)。
+        # prepare() が Tx-0 自体の失敗で自作した mission (id != 999) が
+        # dangling で残っていないことを見る。
+        m = fresh.execute(
+            "SELECT count(*) c FROM missions WHERE status='running' "
+            "AND id != 999").fetchone()
+        assert m["c"] == 0, "Tx-0 自体の失敗で dangling running mission が残ってはいけない"
+        r = fresh.execute(
+            "SELECT count(*) c FROM improvement_runs "
+            "WHERE finished_at IS NULL").fetchone()
+        assert r["c"] == 0, "Tx-0 自体の失敗で dangling unfinished run が残ってはいけない"
+    finally:
+        fresh.close()
 
 
 def test_build_worker_runner_passes_ctx_as_run_context(loop_full, conn):
