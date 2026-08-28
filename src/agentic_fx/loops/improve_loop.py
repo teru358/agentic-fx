@@ -210,42 +210,67 @@ class ImproveLoop:
                    # ここで close しない (呼び出し元が prepare→run→commit を
                    # 通して所有する。10.9 節で最終形に確定する)
 
-        allowed_ids = self._compute_partition_hint(conn, slot_key)
-        staging_dir, source_snapshot_dir = self._materialize_workspace(
-            conn, mission_id, allowed_ids)
-        ledger = ImproveRpcLedger(
-            rpc_timeout_sec_by_kind={
-                "run_backtest": self._settings.improve.backtest_rpc_timeout_sec,
-                "analyze_corr": self._settings.improve.backtest_rpc_timeout_sec})
-        rpc_handlers = self._build_rpc_handlers(ledger, staging_dir=staging_dir)
-        ctx = ImproveRunContext(
-            mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
-            source_snapshot_dir=source_snapshot_dir,
-            allowed_backlog_ids=allowed_ids, slot_key=slot_key, ledger=ledger,
-            rpc_handlers=rpc_handlers)
+        # I3 是正 (プラン10 束D round1、ユーザー裁定 D②、2026-08-28):
+        # Tx-0 は上で durable commit 済み。ここから先 (workspace/context/
+        # tools/runner 構築) は try/except を持たなかったため、例外が
+        # 起きると Tx-0 で作った mission(running)/run(未終端)/slot(claimed)
+        # が dangling のまま残っていた。主害は dangling そのものより
+        # `ImproveSupervisor._running_slot_count`
+        # (`WHERE status IN ('claimed','running')`) が容量を恒久的に
+        # 食い潰すこと — 既定 `improve.parallel=1` では改善ループが
+        # 再起動まで完全停止する (`service.py:946` の
+        # `capacity=settings.improve.parallel`、`config.py:187` の
+        # `default=1`)。`prepare()` 内部で自作の mission/run/slot を
+        # 1 tx で終端化してから re-raise する — mission_id/run_id を
+        # 知る唯一の点が `prepare()` 内部であるため (`_compensate_tx2_
+        # failure`、10.10 節と同型)。
+        try:
+            allowed_ids = self._compute_partition_hint(conn, slot_key)
+            staging_dir, source_snapshot_dir = self._materialize_workspace(
+                conn, mission_id, allowed_ids)
+            ledger = ImproveRpcLedger(
+                rpc_timeout_sec_by_kind={
+                    "run_backtest": self._settings.improve.backtest_rpc_timeout_sec,
+                    "analyze_corr": self._settings.improve.backtest_rpc_timeout_sec})
+            rpc_handlers = self._build_rpc_handlers(ledger, staging_dir=staging_dir)
+            ctx = ImproveRunContext(
+                mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+                source_snapshot_dir=source_snapshot_dir,
+                allowed_backlog_ids=allowed_ids, slot_key=slot_key, ledger=ledger,
+                rpc_handlers=rpc_handlers)
 
-        # precheck 2026-08-22: T8-B8 追随 -- root= が欠落し戻り値キー
-        # `prompt_text` も非実在だった (build_improve_context は
-        # performance_report/improvement_history/current_inventory/backlog/
-        # user_policy/references の 6 キーの生データ辞書を返すのみ)。
-        # レンダリング (テンプレート .format()) は本メソッドの責務 —
-        # 8-I の対応表 (プレースホルダ⇔戻り値キー) に従って組み立てる。
-        ctx_data = build_improve_context(
-            conn, settings=self._settings, now=now, root=self._root,
-            allowed_backlog_ids=allowed_ids)
-        prompt_text = self._render_improve_mission_prompt(ctx_data, ctx=ctx)
-        # precheck 2026-08-22 wave2: T10-B12/B17 — tools/output_schema は
-        # 10.9 節 Step 12 (`_build_mission_tools`) で完成させる。ここでは
-        # その呼び出しに置き換えるだけ (完全実装は 10.9 節参照)
-        mission_tools = self._build_mission_tools(
-            staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
-            ledger=ledger, rpc_handlers=rpc_handlers)
-        mission = Mission(prompt=prompt_text, tools=mission_tools,
-                          output_schema=IMPROVE_OUTPUT_SCHEMA,
-                          max_turns=self._settings.improve.mission_max_turns,
-                          timeout_sec=self._settings.improve.mission_timeout_sec)
-        # precheck 2026-08-22 wave2: T10-B2/R-D1
-        runner = self._build_worker_runner(ctx, on_ready=on_ready)
+            # precheck 2026-08-22: T8-B8 追随 -- root= が欠落し戻り値キー
+            # `prompt_text` も非実在だった (build_improve_context は
+            # performance_report/improvement_history/current_inventory/backlog/
+            # user_policy/references の 6 キーの生データ辞書を返すのみ)。
+            # レンダリング (テンプレート .format()) は本メソッドの責務 —
+            # 8-I の対応表 (プレースホルダ⇔戻り値キー) に従って組み立てる。
+            ctx_data = build_improve_context(
+                conn, settings=self._settings, now=now, root=self._root,
+                allowed_backlog_ids=allowed_ids)
+            prompt_text = self._render_improve_mission_prompt(ctx_data, ctx=ctx)
+            # precheck 2026-08-22 wave2: T10-B12/B17 — tools/output_schema は
+            # 10.9 節 Step 12 (`_build_mission_tools`) で完成させる。ここでは
+            # その呼び出しに置き換えるだけ (完全実装は 10.9 節参照)
+            mission_tools = self._build_mission_tools(
+                staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+                ledger=ledger, rpc_handlers=rpc_handlers)
+            mission = Mission(prompt=prompt_text, tools=mission_tools,
+                              output_schema=IMPROVE_OUTPUT_SCHEMA,
+                              max_turns=self._settings.improve.mission_max_turns,
+                              timeout_sec=self._settings.improve.mission_timeout_sec)
+            # precheck 2026-08-22 wave2: T10-B2/R-D1
+            runner = self._build_worker_runner(ctx, on_ready=on_ready)
+        except BaseException:
+            _log.exception(
+                "improve prepare failed after Tx-0 for mission_id=%s "
+                "slot_key=%r", mission_id, slot_key)
+            self._compensate_prepare_failure(
+                conn, mission_id=mission_id, run_id=run_id,
+                slot_key=slot_key, now=now)
+            if getattr(self, "_conn_for_test", None) is None:
+                conn.close()
+            raise
         # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
         # `commit()` (10.11 節) は `_conn_for_test` シームがあれば close
         # しない (テスト共有 conn を守る)。`prepare()` にはこの対称が無く
@@ -258,6 +283,35 @@ class ImproveLoop:
         if getattr(self, "_conn_for_test", None) is None:
             conn.close()
         return mission, ctx, runner
+
+    def _compensate_prepare_failure(self, conn, *, mission_id, run_id,
+                                    slot_key, now) -> None:
+        """I3 是正 (プラン10 束D round1、ユーザー裁定 D②、2026-08-28):
+        Tx-0 commit 後の `prepare()` 例外を、自作の mission/run/(あれば)
+        slot に限って 1 tx で終端化する (`_compensate_tx2_failure`、
+        10.10 節と同型)。`slot_key=None` (手動 one-shot、`submit_manual`)
+        のときは slot が存在しないので `finish_improve_mission
+        (slot_key=None, ...)` で mission/run だけ終端化する。"""
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                missions_store.finish_improve_mission(
+                    conn, mission_id=mission_id, run_id=run_id,
+                    slot_key=slot_key, mission_status="failed",
+                    run_result=None, backlog_transition=None, now=now,
+                    commit=False)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        except Exception:
+            _log.exception(
+                "compensation itself failed for mission_id=%s — mission "
+                "stays in a non-terminal state, will be picked up by "
+                "startup reconcile", mission_id)
+            self._activity.write(
+                Category.IMPROVE, "prepare_compensation_failed",
+                f"mission_id={mission_id} run_id={run_id}")
 
     # precheck 2026-08-22 pass2: RB4 — Step 2a で定義した失敗するテストへの
     # 最小実装。8-I 節「プレースホルダ⇔戻り値キーの対応表 (B8)」の 17 項目

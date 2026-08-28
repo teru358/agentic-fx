@@ -389,6 +389,78 @@ def test_build_mission_tools_matches_child_registry_names(loop_full, tmp_path):
     assert not (tool_names & signal_tools.IMPROVE_FORBIDDEN)
 
 
+@pytest.mark.parametrize("injection_point", [
+    "_materialize_workspace",
+    "build_improve_context",
+    "_build_worker_runner",
+])
+def test_prepare_failure_after_tx0_leaves_no_dangling_rows(
+        loop_full, conn, clock, monkeypatch, injection_point):
+    """I3 是正 (プラン10 束D round1 I3、ユーザー裁定 D②、2026-08-28):
+    Tx-0 commit 後 (workspace/context/runner 構築) の例外は `prepare()`
+    内部で自作の mission/run/slot を 1 tx で終端化してから再送出する —
+    dangling `missions.status='running'` / `improvement_runs.finished_at
+    IS NULL` / slot `claimed` を残さない。主害は dangling そのものより
+    `_running_slot_count` (`WHERE status IN ('claimed','running')`) が
+    容量を恒久的に食い潰すこと (既定 `improve.parallel=1` では改善ループ
+    全停止) — fault matrix の各ケースで容量が 0 に戻ることを直接見る。"""
+    from agentic_fx.loops import improve_loop as improve_loop_mod
+
+    now = clock.now()
+    _prepare_wave_slot(conn, period_key="2026-W50", k=0, now=now)
+
+    def _boom(*a, **kw):
+        raise OSError(f"simulated {injection_point} failure")
+
+    if injection_point == "build_improve_context":
+        monkeypatch.setattr(improve_loop_mod, "build_improve_context", _boom)
+    else:
+        monkeypatch.setattr(loop_full, injection_point, _boom)
+
+    with pytest.raises(OSError, match=injection_point):
+        loop_full.prepare(slot_key=("2026-W50", 0), now=now)
+
+    m = conn.execute("SELECT count(*) c FROM missions "
+                     "WHERE status='running'").fetchone()["c"]
+    assert m == 0, "dangling running mission after prepare failure"
+    r = conn.execute("SELECT count(*) c FROM improvement_runs "
+                     "WHERE finished_at IS NULL").fetchone()["c"]
+    assert r == 0, "dangling unfinished run after prepare failure"
+    slot = conn.execute(
+        "SELECT status FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W50' AND k=0").fetchone()
+    assert slot["status"] == "failed"
+    running = conn.execute(
+        "SELECT count(*) c FROM improve_wave_slots "
+        "WHERE status IN ('claimed','running')").fetchone()["c"]
+    assert running == 0, "capacity must recover (I3 主害: capacity 恒久消費)"
+
+
+def test_prepare_failure_after_tx0_manual_one_shot_has_no_slot_to_terminalize(
+        loop_full, conn, clock, monkeypatch):
+    """I3 是正、`slot_key=None` (手動 one-shot、`submit_manual`) の枝:
+    slot が存在しないので `finish_improve_mission(slot_key=None, ...)`
+    で mission/run だけ終端化する — slot 前提のコードが無条件に
+    `slot_key` を要求すると `submit_manual` 経由の prepare 失敗で
+    (別の) 例外に化けて補償自体が失敗する。"""
+    now = clock.now()
+
+    def _boom(*a, **kw):
+        raise OSError("simulated _materialize_workspace failure")
+
+    monkeypatch.setattr(loop_full, "_materialize_workspace", _boom)
+
+    with pytest.raises(OSError, match="_materialize_workspace"):
+        loop_full.prepare(slot_key=None, now=now)
+
+    m = conn.execute("SELECT count(*) c FROM missions "
+                     "WHERE status='running'").fetchone()["c"]
+    assert m == 0
+    r = conn.execute("SELECT count(*) c FROM improvement_runs "
+                     "WHERE finished_at IS NULL").fetchone()["c"]
+    assert r == 0
+
+
 def test_build_worker_runner_passes_ctx_as_run_context(loop_full, conn):
     """`_build_worker_runner` が `ImproveRunContext` をそのまま
     `WorkerRunner(run_context=ctx)` へ渡すことの契約テスト (D-4 是正、
