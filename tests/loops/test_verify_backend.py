@@ -9,6 +9,9 @@
 """
 from __future__ import annotations
 
+import os
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -320,3 +323,55 @@ def test_verify_backend_fails_closed_when_descendants_are_not_reaped(
     assert result.ok is False
     assert result.fingerprint is None
     assert "pgid recovery gate" in result.detail
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="/proc 依存 (verify_backend._descendant_pids)")
+def test_descendant_pids_recurses_into_grandchildren(tmp_path):
+    """A18 後半/L-B17 是正 (束D検収, verified-local-round1.md §11 #11):
+    実 `_DescendantWatcher`/実 `_descendant_pids` は既定スイートで一度も
+    実行されていなかった (F-2 の pin は両方とも fake/monkeypatch で
+    差し替えられ、`test_verify_backend_realbackend.py` は
+    `addopts = -m 'not bench and not realbackend'` で既定 deselect)。
+    ここでは実子プロセス (`sh -c "sleep 5 & wait"` — 孫として `sleep` を
+    起こす) を実際に起動し、`_descendant_pids` が孫まで再帰的に拾うこと
+    を実測する (`realbackend` マーカーは不要 — CLI backend を一切使わない
+    純粋な `/proc` 走査プローブ)。"""
+    import subprocess
+
+    from agentic_fx.loops.verify_backend import _descendant_pids
+
+    proc = subprocess.Popen(["sh", "-c", "sleep 5 & wait"])
+    try:
+        deadline = time.monotonic() + 3
+        descendants: set[int] = set()
+        while time.monotonic() < deadline:
+            descendants = _descendant_pids(os.getpid())
+            if len(descendants) >= 2:
+                break
+            time.sleep(0.05)
+        assert proc.pid in descendants, (
+            f"直接の子 (sh) が見つからない: {descendants}")
+        assert len(descendants) >= 2, (
+            f"孫 (sleep) まで再帰的に拾えていない: {descendants}")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="/proc 依存 (verify_backend._DescendantWatcher)")
+def test_descendant_watcher_observes_a_real_child_process(tmp_path):
+    """A18 後半/L-B17 是正 (束D検収, verified-local-round1.md §11 #11):
+    実 `_DescendantWatcher` (`__enter__`/`__exit__` の間、0.05s 間隔で
+    ポーリングする daemon thread) を実子プロセスで駆動し、
+    `saw_any_descendant()` が True になることを実測する。"""
+    import subprocess
+
+    from agentic_fx.loops.verify_backend import _DescendantWatcher
+
+    with _DescendantWatcher(os.getpid()) as watcher:
+        proc = subprocess.Popen(["sleep", "0.3"])
+        proc.wait(timeout=5)
+
+    assert watcher.saw_any_descendant() is True
