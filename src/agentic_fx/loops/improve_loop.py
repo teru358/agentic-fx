@@ -435,7 +435,20 @@ class ImproveLoop:
                 f"_compute_partition_hint: no wave slots for "
                 f"period_key={period_key!r} — cannot derive a partition")
         open_ids = sorted(row["id"] for row in backlog_store.list_open(conn))
-        return frozenset(i for i in open_ids if i % expected == k)
+        partition = frozenset(i for i in open_ids if i % expected == k)
+        if not partition:
+            # L-B13 裁定 (2026-08-28、束D検収 verified-local-round1.md §7):
+            # 空集合 (`frozenset()`) を「担当ゼロ」として黙って返すと、
+            # `None` (印なし = 全担当) との区別が呼び出し元に伝わらない
+            # (`_inspect_output` は空集合下で全 selected が
+            # out_of_partition になる — fail-open ではないが無音)。
+            # 明示的に raise し、呼び出し元 (`prepare()`) の post-Tx0
+            # 失敗補償 (`_compensate_prepare_failure`) へ委ねる。
+            raise RuntimeError(
+                f"_compute_partition_hint: empty partition for "
+                f"period_key={period_key!r} k={k} expected={expected} "
+                "(no open backlog id maps to this slot)")
+        return partition
 
     def _materialize_workspace(self, conn, mission_id, allowed_ids):
         # <!-- precheck 2026-08-23 R-D3 -->

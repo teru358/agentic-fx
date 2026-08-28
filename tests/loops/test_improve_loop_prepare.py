@@ -10,6 +10,7 @@ import pytest
 from agentic_fx.activity import ActivityLog
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_waves
 from agentic_fx.store.db import connect, connect_readonly, init_db
 
@@ -52,6 +53,11 @@ def test_tx0_creates_mission_and_run_atomically_scheduler_wave(
     commit されたことをこのテスト自身で検証する。"""
     now = clock.now()
     _prepare_wave_slot(conn, period_key="2026-W34", k=0, now=now)
+    # L-B13 裁定是正: expected=1 の scheduler wave は空 partition だと
+    # `_compute_partition_hint` が raise するようになった。open backlog
+    # を 1 件用意する (expected=1 なので id % 1 == 0 == k は常に成立)。
+    backlog_store.add(conn, "idea-for-partition", "user", now)
+    conn.commit()
 
     mission, ctx, runner = loop_full.prepare(slot_key=("2026-W34", 0), now=now)
 
@@ -201,6 +207,19 @@ def test_compute_partition_hint_raises_when_wave_has_no_slots(loop_min, conn):
     CLI 実行が丸ごと無駄になる)。"""
     with pytest.raises(RuntimeError, match="no wave slots"):
         loop_min._compute_partition_hint(conn, ("2026-W99", 0))
+
+
+def test_compute_partition_hint_raises_when_partition_would_be_empty(
+        loop_min, conn, clock):
+    """L-B13 裁定 (2026-08-28、束D検収 verified-local-round1.md §7):
+    空集合 partition (open backlog が無い、または `id % expected == k` に
+    一致する id が無い) は `_compute_partition_hint` で `raise` する —
+    `None` (印なし = 全担当) との区別を呼び出し元に無音で失わせない。"""
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W41", now=clock.now(), expected=1)
+    # open backlog を 1 件も作らない → partition は必ず空集合
+    with pytest.raises(RuntimeError, match="empty partition"):
+        loop_min._compute_partition_hint(conn, ("2026-W41", 0))
 
 
 def test_tx0_mission_id_unique_partial_index_on_improvement_runs(conn):
@@ -420,6 +439,12 @@ def test_prepare_failure_after_tx0_leaves_no_dangling_rows(
 
     now = clock.now()
     _prepare_wave_slot(conn, period_key="2026-W50", k=0, now=now)
+    # L-B13 裁定是正: 空 partition で _compute_partition_hint が raise
+    # するようになった。partition 計算より前に fault を注入するケース
+    # (injection_point の 3 種はいずれも partition 計算の後段) のみ影響
+    # するので、open backlog を 1 件用意しておく。
+    backlog_store.add(conn, "idea-for-partition", "user", now)
+    conn.commit()
 
     def _boom(*a, **kw):
         raise OSError(f"simulated {injection_point} failure")
@@ -484,6 +509,10 @@ def test_prepare_seamless_tx0_durable_commit_and_closes_write_conn(
     loop, db_path = loop_no_seam
     now = clock.now()
     _prepare_wave_slot(conn := connect(db_path), period_key="2026-W34", k=0, now=now)
+    # L-B13 裁定是正: 空 partition で raise するようになったため open
+    # backlog を 1 件用意する。
+    backlog_store.add(conn, "idea-for-partition", "user", now)
+    conn.commit()
     conn.close()
 
     captured = []
@@ -535,6 +564,10 @@ def test_prepare_real_concurrent_cas_only_one_winner(tmp_path, clock):
     init_db(bootstrap)
     now = clock.now()
     _prepare_wave_slot(bootstrap, period_key="2026-W60", k=0, now=now)
+    # L-B13 裁定是正: 空 partition で raise するようになったため、勝者側
+    # (post-Tx0 の partition 計算まで進む) 用に open backlog を用意する。
+    backlog_store.add(bootstrap, "idea-for-partition", "user", now)
+    bootstrap.commit()
     bootstrap.close()
 
     def _make_loop(root):

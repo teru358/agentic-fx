@@ -821,6 +821,14 @@ def test_pre_ready_failure_keeps_slot_reserved_through_real_wiring(tmp_path):
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(
         bootstrap, period_key="2026-W34", now=now, expected=1, commit=True)
+    # L-B13 裁定是正 (束D検収 verified-local-round1.md §7): 空 partition
+    # で `_compute_partition_hint` が raise するようになったため open
+    # backlog を 1 件用意する (expected=1 の wave では id % 1 == 0 == k
+    # が常に成立するので、両 attempt とも同じ 1 件で足りる — mission は
+    # pre-ready 失敗のままなので backlog は消費されず残る)。
+    from agentic_fx.store import backlog as backlog_store
+    backlog_store.add(bootstrap, "idea-for-partition", "user", now)
+    bootstrap.commit()
     bootstrap.close()
 
     from agentic_fx.activity import ActivityLog
