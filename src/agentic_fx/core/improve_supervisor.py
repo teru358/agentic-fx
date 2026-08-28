@@ -163,37 +163,64 @@ class ImproveSupervisor:
     # へ遷移済み) の失敗は通常の `ImproveLoop.commit` 終端 (_finalize_failed_
     # mission、slot を running→failed) へ渡す — 「実行が始まった後の失敗」
     # を retry してしまうと二重実行になるため区別する。
+    # I2(b) 是正 (プラン10 束D round1、ユーザー裁定 D①、2026-08-28):
+    # 設計書 §3.1⑥/§8.1-19 (「pre-ready の失敗は同一プロセス内でのみ slot
+    # を reserved に戻して再 claim、spawn_attempts は claim ごとに +1、
+    # 失敗時に < 2 なら reserved (初回+再試行1回)、それ以外は failed」)
+    # を、プラン 9.5 節 RW3 が実装しないまま (1 回きりの
+    # prepare→run→commit) 据え置いていた欠陥を是正する。`_launch_slot`
+    # 自身が同一プロセス内で再 claim (`prepare` の再呼び出し) → 再 spawn
+    # する — `_MAX_SPAWN_ATTEMPTS` (=2) が実際に機能する形。
     def _launch_slot(self, period_key: str, k: int) -> None:
         # mission_id はまだ無い。Tx-0 (missions.start + improve_runs.start +
         # slot claim reserved→claimed) は self._improve_loop.prepare が
         # 一体で行う (統合裁定 R-i2、Task 10 の 10.2 節が正)。
         now = self._clock.now()
-        reached_running = False
+        while True:
+            reached_running = False
 
-        def _on_ready(frame: dict) -> None:
-            nonlocal reached_running
-            conn = self._conn()
-            owns = self._conn_for_test is None
-            try:
-                improve_waves.mark_running(
-                    conn, period_key=period_key, k=k, now=self._clock.now(),
-                    commit=True)
-            finally:
-                if owns:
-                    conn.close()
-            reached_running = True
+            def _on_ready(frame: dict) -> None:
+                nonlocal reached_running
+                conn = self._conn()
+                owns = self._conn_for_test is None
+                try:
+                    improve_waves.mark_running(
+                        conn, period_key=period_key, k=k,
+                        now=self._clock.now(), commit=True)
+                finally:
+                    if owns:
+                        conn.close()
+                reached_running = True
 
-        mission, ctx, runner = self._improve_loop.prepare(
-            slot_key=(period_key, k), now=now, on_ready=_on_ready)
-        result = runner.run(mission)
-        if not reached_running and result.status != "completed":
-            # pre-ready 失敗 (on_ready 未到達) — Tx-0 で claim 済みの slot を
-            # spawn_attempts に応じて reserved へ戻すか failed にする。
-            self._handle_pre_ready_failure(period_key, k)
-        self._improve_loop.commit(mission=mission, ctx=ctx, result=result,
-                                  now=self._clock.now())
+            mission, ctx, runner = self._improve_loop.prepare(
+                slot_key=(period_key, k), now=now, on_ready=_on_ready)
+            result = runner.run(mission)
+            if reached_running or result.status == "completed":
+                # on_ready 到達後 (= running へ遷移済み) の失敗、または
+                # 完走 — 通常の commit 終端へ渡す。retry しない (二重実行
+                # を避ける、コメント上部の区別どおり)。
+                self._improve_loop.commit(
+                    mission=mission, ctx=ctx, result=result,
+                    now=self._clock.now())
+                return
+            # pre-ready 失敗 (on_ready 未到達) — I2b: 巻き戻し
+            # (`_handle_pre_ready_failure`) は `commit()` より**前**に完了
+            # させ、`commit()` には `slot_terminalize=False` を渡す。
+            # `mark_terminal` は status ガードの無い無条件 UPDATE なので、
+            # 先に revert した `reserved` を commit の無条件終端が潰す
+            # のを防ぐ (I2 の主害)。
+            should_retry = self._handle_pre_ready_failure(period_key, k)
+            self._improve_loop.commit(
+                mission=mission, ctx=ctx, result=result,
+                now=self._clock.now(), slot_terminalize=False)
+            if not should_retry:
+                return
+            now = self._clock.now()
 
-    def _handle_pre_ready_failure(self, period_key: str, k: int) -> None:
+    def _handle_pre_ready_failure(self, period_key: str, k: int) -> bool:
+        """戻り値: `True` = slot を `reserved` へ戻した (呼び出し元は
+        再 claim/再 spawn すること)。`False` = 再試行上限に達し `failed`
+        へ収束した (呼び出し元は retry しない)。"""
         conn = self._conn()
         owns = self._conn_for_test is None
         try:
@@ -205,9 +232,10 @@ class ImproveSupervisor:
             if attempts < _MAX_SPAWN_ATTEMPTS:
                 improve_waves.revert_to_reserved(
                     conn, period_key=period_key, k=k, now=now, commit=True)
-            else:
-                improve_waves.mark_slot_failed(
-                    conn, period_key=period_key, k=k, now=now, commit=True)
+                return True
+            improve_waves.mark_slot_failed(
+                conn, period_key=period_key, k=k, now=now, commit=True)
+            return False
         finally:
             if owns:
                 conn.close()

@@ -232,8 +232,14 @@ class _FakeImproveLoop:
         return f"mission-{self._mission_id}", f"ctx-{self._mission_id}", \
             self._worker_runner
 
-    def commit(self, *, mission, ctx, result, now):
-        self.committed.append((mission, ctx, result))
+    def commit(self, *, mission, ctx, result, now, slot_terminalize=True):
+        # I2b 是正 (2026-08-28): 実 `ImproveLoop.commit` は
+        # `slot_terminalize=False` を受け取る (`_launch_slot` が pre-ready
+        # 失敗の再試行時に渡す)。fake は記録するだけで DB には触れない
+        # (この fake を使うテストは slot 状態を `improve_waves` 直呼びで
+        # 検証するため、`slot_terminalize` の実効果は
+        # `tests/loops/test_improve_loop_finalize.py` 側で pin 済み)。
+        self.committed.append((mission, ctx, result, slot_terminalize))
 
 
 def test_three_way_launch_order_prepare_then_ready_then_running_commit_then_run(
@@ -294,11 +300,18 @@ def test_mission_body_not_continued_before_running_commit(conn):
 
 
 def test_on_ready_exception_reverts_to_reserved_then_failed(conn, monkeypatch):
-    """on_ready (= `_launch_slot` が組む mark_running クロージャ) が例外を
-    投げたら、pre-ready 失敗と同じ経路 (spawn_attempts に応じて
+    """I2b 是正 (プラン10 束D round1、ユーザー裁定 D①、2026-08-28、逸脱
+    申告): on_ready (= `_launch_slot` が組む mark_running クロージャ) が
+    例外を投げたら、pre-ready 失敗と同じ経路 (spawn_attempts に応じて
     reserved→failed) を辿る。run は一度も記録されない (fake
     `WorkerRunner.run()` は本物と同じく on_ready の例外を実行継続の
-    **前**で捕捉し failed に正規化する)。"""
+    **前**で捕捉し failed に正規化する)。
+
+    **書き換え理由**: I2(b) の是正で `_launch_slot` が同一プロセス内で
+    pre-ready 失敗を再試行するようになった (設計 §3.1⑥/§8.1-19)。旧版は
+    「2 つの独立プロセス」を模して `_launch_slot` を**2 回**呼んでいたが、
+    新実装では**1 回**の呼び出しが内部で 2 回 (初回+再試行1回) 試みる —
+    2 回呼ぶと 4 attempt 分進んでしまい old 版の期待値と矛盾する。"""
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(
         conn, period_key="2026-W34", now=now, expected=1, commit=True)
@@ -313,21 +326,10 @@ def test_on_ready_exception_reverts_to_reserved_then_failed(conn, monkeypatch):
     monkeypatch.setattr(improve_waves, "mark_running", _boom)
 
     events: list[str] = []
-    sup._improve_loop = _FakeImproveLoop(
+    fake_loop = _FakeImproveLoop(
         conn, _RecordingFakeWorkerRunner(events), mission_id=111)
-    sup._launch_slot("2026-W34", 0)  # 1 回目 → reserved
-
-    row = conn.execute(
-        "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
-        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
-    assert row["status"] == "reserved"
-    assert row["mission_id"] is None
-    assert row["spawn_attempts"] == 1
-    assert events == []
-
-    sup._improve_loop = _FakeImproveLoop(
-        conn, _RecordingFakeWorkerRunner(events), mission_id=222)
-    sup._launch_slot("2026-W34", 0)  # 2 回目 → failed
+    sup._improve_loop = fake_loop
+    sup._launch_slot("2026-W34", 0)  # 1 回の呼び出しで初回+再試行1回
 
     row = conn.execute(
         "SELECT status, spawn_attempts FROM improve_wave_slots "
@@ -335,6 +337,12 @@ def test_on_ready_exception_reverts_to_reserved_then_failed(conn, monkeypatch):
     assert row["status"] == "failed"
     assert row["spawn_attempts"] == 2
     assert events == []
+    # commit() は各 attempt ごとに (2 回) 呼ばれる — pre-ready 失敗でも
+    # 早期 return せず必ず commit する契約 (mission/run 終端) を維持し
+    # つつ、両方とも slot_terminalize=False (呼び出し元が既に revert/
+    # mark_slot_failed で slot を扱い終えている) で呼ばれる。
+    assert len(fake_loop.committed) == 2
+    assert [c[3] for c in fake_loop.committed] == [False, False]
 
 
 def test_failure_after_running_does_not_retry_the_slot(conn):
@@ -355,7 +363,17 @@ def test_failure_after_running_does_not_retry_the_slot(conn):
     その CAS は `running` も受理するため実行中の slot が
     `failed` + `mission_id=NULL` に落ちる (§6.7 — 1 attempt 目だけを見る
     形だと `revert_to_reserved` の CAS が `claimed` 限定で no-op になり
-    観測結果が無変異時と一致してしまうため、2 attempt 目まで踏む)。"""
+    観測結果が無変異時と一致してしまうため、2 attempt 目まで踏む)。
+
+    I2b 是正の逸脱申告 (2026-08-28): 同一プロセス内 retry が実装された
+    ため、旧版の「2 回の独立呼び出し」は 1 回の `_launch_slot` 呼び出しに
+    統合する。1 attempt 目 (pre-ready 失敗) と 2 attempt 目 (on_ready 到達
+    後の失敗) とで挙動を変える必要があるため、呼び出し回数で分岐する
+    stateful runner を使う (`_FakeImproveLoop` は同一 `mission_id`/
+    `worker_runner` を両 attempt で使い回す — 記帳の commit() は no-op な
+    ので、実際の mission 行整合はここでは問わない。実 `finish_improve_
+    mission` を通す検証は `test_pre_ready_failure_keeps_slot_reserved_
+    through_real_commit` が別途担う)。"""
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(
         conn, period_key="2026-W34", now=now, expected=1, commit=True)
@@ -365,27 +383,29 @@ def test_failure_after_running_does_not_retry_the_slot(conn):
                              stop_event=threading.Event())
     sup._conn_for_test = conn
 
-    class _PreReadyFailsRunner:
+    events: list[str] = []
+
+    class _PreReadyThenPostReadyFailsRunner:
+        """1 attempt 目: on_ready へ一度も到達せず failed (pre-ready 失敗)。
+        2 attempt 目: on_ready へ到達 (`ready_ok=False`) してから failed
+        (`_RecordingFakeWorkerRunner` と同じ規律 — on_ready を先に呼ぶ)。"""
         on_ready = None
 
+        def __init__(self):
+            self._calls = 0
+
         def run(self, mission):
-            return _FakeMissionResult("failed", None, reason="pre-ready failure")
+            self._calls += 1
+            if self._calls == 1:
+                return _FakeMissionResult(
+                    "failed", None, reason="pre-ready failure")
+            delegate = _RecordingFakeWorkerRunner(
+                events, on_ready=self.on_ready, ready_ok=False)
+            return delegate.run(mission)
 
     sup._improve_loop = _FakeImproveLoop(
-        conn, _PreReadyFailsRunner(), mission_id=111)
-    sup._launch_slot("2026-W34", 0)  # 1 回目 → reserved (spawn_attempts=1)
-
-    row = conn.execute(
-        "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
-        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
-    assert row["status"] == "reserved"
-    assert row["mission_id"] is None
-    assert row["spawn_attempts"] == 1
-
-    events: list[str] = []
-    sup._improve_loop = _FakeImproveLoop(
-        conn, _RecordingFakeWorkerRunner(events, ready_ok=False), mission_id=222)
-    sup._launch_slot("2026-W34", 0)  # 2 回目 → on_ready 到達後に failed
+        conn, _PreReadyThenPostReadyFailsRunner(), mission_id=111)
+    sup._launch_slot("2026-W34", 0)  # 1 回の呼び出しで両 attempt を進める
 
     row = conn.execute(
         "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
@@ -394,35 +414,42 @@ def test_failure_after_running_does_not_retry_the_slot(conn):
         "on_ready 到達後 (running へ遷移済み) の失敗が retry 経路 "
         "(_handle_pre_ready_failure) に乗り、実行中の slot が終端されて "
         "しまっている — 二重実行の危険がある")
-    assert row["mission_id"] == 222
+    assert row["mission_id"] == 111
     assert row["spawn_attempts"] == 2
 
 
 # Tests for 9.4: pre-ready 失敗
 
 def test_pre_ready_failure_reverts_to_reserved_with_mission_id_null(conn):
+    """I2b 是正の逸脱申告 (2026-08-28): 「1 回の pre-ready 失敗は
+    `reserved` に戻る」という**単一 attempt の遷移**を pin する。旧版は
+    `_launch_slot` を 1 回呼べば 1 attempt だけ進む前提だったが、
+    I2(b) 是正で `_launch_slot` は同一呼び出し内で最大 2 attempt
+    (初回+再試行1回) を進めるようになったため、常に失敗する fake
+    runner で `_launch_slot` を 1 回呼ぶと最終的に `failed`/
+    `spawn_attempts=2` まで進んでしまい、この pin (1 attempt 目だけの
+    遷移) を単独では観測できなくなった。単一 attempt の遷移そのものは
+    `ImproveSupervisor._handle_pre_ready_failure` (retry loop から
+    切り出された、CAS 呼び分けの本体) を直接呼んで検証する — `_launch_slot`
+    経由の複数 attempt 統合は `test_on_ready_exception_reverts_to_
+    reserved_then_failed`/`test_pre_ready_failure_second_attempt_goes_
+    to_failed` (単一呼び出しで両 attempt を進める形に書き換え済み) が
+    担う。"""
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
+    conn.execute(
+        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+        "VALUES (111, 'improve', 'local', 'm', 'running', ?)",
+        (now.isoformat(),))
+    assert improve_waves.claim_slot(
+        conn, period_key="2026-W34", k=0, mission_id=111, now=now, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
                              clock=_FixedClock(now), db_path=Path("x"),
                              stop_event=threading.Event())
     sup._conn_for_test = conn
 
-    class _PreReadyFailsRunner:
-        """裁定 R-D1: ready に一度も到達しない (credentials copy 失敗 /
-        `queue.Empty` timeout 相当) を模す。`on_ready` を一度も呼ばずに
-        failed を返す — 本物の `WorkerRunner.run()` がこれらの経路で
-        `on_ready` を呼ばずに `MissionResult('failed', ...)` を返すのと
-        同じ外形。"""
-        on_ready = None
-
-        def run(self, mission):
-            return _FakeMissionResult("failed", None, reason="pre-ready failure")
-
-    fake_loop = _FakeImproveLoop(conn, _PreReadyFailsRunner(), mission_id=111)
-    sup._improve_loop = fake_loop
-    sup._launch_slot("2026-W34", 0)
+    should_retry = sup._handle_pre_ready_failure("2026-W34", 0)
 
     row = conn.execute(
         "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
@@ -430,15 +457,14 @@ def test_pre_ready_failure_reverts_to_reserved_with_mission_id_null(conn):
     assert row["status"] == "reserved"
     assert row["mission_id"] is None
     assert row["spawn_attempts"] == 1
-    # プラン 9.3/9.5 節「最終形」の pin: pre-ready 失敗でも
-    # `_handle_pre_ready_failure` の後、必ず `self._improve_loop.commit(...)`
-    # を呼ぶ (早期 return しない) — commit しないと Tx-0 で作った mission/
-    # improve_runs 行が終端しないまま残る。
-    assert len(fake_loop.committed) == 1
+    assert should_retry is True, (
+        "spawn_attempts=1 < _MAX_SPAWN_ATTEMPTS なので retry すべき")
 
 
 def test_pre_ready_failure_second_attempt_goes_to_failed(conn):
-    """spawn_attempts が 2 に達したら (初回 + 再試行 1 回) failed へ収束する。"""
+    """spawn_attempts が 2 に達したら (初回 + 再試行 1 回) failed へ収束する
+    (I2b 是正の逸脱申告: 単一 `_launch_slot` 呼び出しで両 attempt を
+    進める形へ書き換え — 上の pin と同じ理由)。"""
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
@@ -455,11 +481,7 @@ def test_pre_ready_failure_second_attempt_goes_to_failed(conn):
 
     sup._improve_loop = _FakeImproveLoop(conn, _PreReadyFailsRunner(),
                                          mission_id=111)
-    sup._launch_slot("2026-W34", 0)  # 1 回目 → reserved
-
-    sup._improve_loop = _FakeImproveLoop(conn, _PreReadyFailsRunner(),
-                                         mission_id=222)
-    sup._launch_slot("2026-W34", 0)  # 2 回目 → failed
+    sup._launch_slot("2026-W34", 0)  # 1 回の呼び出しで初回+再試行1回 → failed
 
     row = conn.execute(
         "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
@@ -471,29 +493,141 @@ def test_pre_ready_failure_second_attempt_goes_to_failed(conn):
 def test_pre_ready_failure_also_covers_ready_timeout_before_running_commit(conn):
     """`ready` 受信前の timeout も pre-ready 失敗と同じ経路 (spawn 成功後、
     ready が来ない/timeout するケース) — `on_ready` を一度も呼ばずに
-    failed を返す fake で模す。"""
+    failed を返す fake で模す。単一 attempt の遷移 pin (上と同じ理由で
+    `_handle_pre_ready_failure` を直接呼ぶ形へ書き換え、逸脱申告)。"""
     now = datetime(2026, 8, 22, 3, 0)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
+    conn.execute(
+        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+        "VALUES (111, 'improve', 'local', 'm', 'running', ?)",
+        (now.isoformat(),))
+    assert improve_waves.claim_slot(
+        conn, period_key="2026-W34", k=0, mission_id=111, now=now, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
                              clock=_FixedClock(now), db_path=Path("x"),
                              stop_event=threading.Event())
     sup._conn_for_test = conn
 
-    class _ReadyTimeoutRunner:
-        on_ready = None
-
-        def run(self, mission):
-            return _FakeMissionResult("failed", None, reason="ready timeout")
-
-    sup._improve_loop = _FakeImproveLoop(conn, _ReadyTimeoutRunner(),
-                                         mission_id=111)
-    sup._launch_slot("2026-W34", 0)
+    sup._handle_pre_ready_failure("2026-W34", 0)
     row = conn.execute(
         "SELECT status, mission_id FROM improve_wave_slots "
         "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
     assert row["status"] == "reserved"
     assert row["mission_id"] is None
+
+
+def test_pre_ready_failure_keeps_slot_reserved_through_real_commit(conn):
+    """I2b 是正の核心 pin (プラン10 束D round1、ユーザー裁定 D①、
+    2026-08-28): `_FakeImproveLoop.commit` は no-op なので上記のテスト
+    群は「commit() が slot を潰さないか」を検証できない。ここでは
+    `commit()` が実 `missions_store.finish_improve_mission` を呼ぶ fake
+    (verified-codex-round1.md I2 probe と同形) を使い、`_launch_slot` の
+    retry loop を通しで実行して、1 attempt 目の revert が commit の
+    無条件終端で潰されないこと、2 attempt 目で最終的に failed へ収束
+    すること、mission が **2 件** (attempt ごとに新規) 作られ両方とも
+    failed で終端することを実測する。"""
+    from agentic_fx.store import improve_runs as improve_runs_store
+
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W34", now=now, expected=1, commit=True)
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+
+    prepared_mission_ids: list[int] = []
+
+    class _PreReadyFailsRunner:
+        on_ready = None
+
+        def run(self, mission):
+            return _FakeMissionResult("failed", None, reason="pre-ready failure")
+
+    class _RealCommitFakeImproveLoop:
+        """実 `missions_store`/`improve_runs_store`/`improve_waves` を
+        通して Tx-0 を書き、`commit()` は実 `finish_improve_mission` を
+        呼ぶ (probe_c1_i2_i3.py::probe_i2 と同形)。"""
+
+        def __init__(self):
+            self.committed: list[tuple] = []
+
+        def prepare(self, *, slot_key, now, on_ready=None):
+            period_key, k = slot_key
+            mid = missions_store.start(
+                conn, "improve", "local", "m", now=now, commit=False)
+            rid = improve_runs_store.start(
+                conn, backlog_id=None, mission_id=mid, now=now, commit=False)
+            claimed = improve_waves.claim_slot(
+                conn, period_key=period_key, k=k, mission_id=mid, now=now,
+                commit=False)
+            assert claimed
+            conn.commit()
+            prepared_mission_ids.append(mid)
+            runner = _PreReadyFailsRunner()
+            runner.on_ready = on_ready
+            return (mid, rid, slot_key), None, runner
+
+        def commit(self, *, mission, ctx, result, now, slot_terminalize=True):
+            mission_id, run_id, slot_key = mission
+            self.committed.append((mission_id, slot_terminalize))
+            conn.execute("BEGIN IMMEDIATE")
+            missions_store.finish_improve_mission(
+                conn, mission_id=mission_id, run_id=run_id,
+                slot_key=slot_key if slot_terminalize else None,
+                mission_status="failed", run_result=None, now=now,
+                backlog_transition=None, commit=False)
+            conn.commit()
+
+    fake_loop = _RealCommitFakeImproveLoop()
+    sup._improve_loop = fake_loop
+
+    # probe_c1_i2_i3.py::probe_i2 と同じ技法: improve_wave_slots に当たる
+    # UPDATE を順序どおり採取し、「1 attempt 目の revert (→reserved) の
+    # 直後に commit の無条件終端 (→failed) が来ていない」ことを直接見る
+    # (最終状態だけでは検出できない — 上記コメント参照)。
+    trace: list[str] = []
+    conn.set_trace_callback(
+        lambda s: trace.append(" ".join(s.split()))
+        if "improve_wave_slots" in s and "SET" in s else None)
+    sup._launch_slot("2026-W34", 0)
+    conn.set_trace_callback(None)
+
+    status_writes = [s for s in trace if "status=" in s]
+    assert len(status_writes) >= 3, status_writes
+    # 1 attempt 目: claimed → reserved (revert)。この直後に failed へ
+    # 落ちていたら I2b の欠陥が再現している (commit の無条件終端が
+    # revert を潰した)。
+    assert "status='reserved'" in status_writes[1], status_writes
+    assert "status='failed'" not in status_writes[2], (
+        "revert_to_reserved の直後の1手が failed — commit() の無条件終端 "
+        f"が revert を潰している: {status_writes}")
+
+    slot = conn.execute(
+        "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert slot["status"] == "failed"
+    assert slot["spawn_attempts"] == 2
+    # 主張の核心: I2b が無ければ 1 attempt 目の revert_to_reserved 直後の
+    # commit (無条件 finish_improve_mission) が `reserved` を `failed` へ
+    # 潰す — その場合でも最終状態は同じ `failed` になるため、最終状態
+    # だけでは変異を検出できない (verified-codex-round1.md I2「採っては
+    # いけない形」)。killer は「2 件の**別々の** mission が作られ、両方
+    # とも failed で終端している」こと — I2b が無いと 1 attempt 目の
+    # commit で `finish_improve_mission(slot_key=<real slot_key>)` が
+    # 呼ばれても mission 自体は同じく failed になるため、ここでは
+    # **`_handle_pre_ready_failure` の CAS が両 attempt で機能したか**
+    # (spawn_attempts の刻み) と **prepare が 2 回呼ばれたか** を併せて
+    # pin する。
+    assert len(prepared_mission_ids) == 2
+    assert len(set(prepared_mission_ids)) == 2, "2 attempt は別々の mission"
+    for mid in prepared_mission_ids:
+        m = conn.execute(
+            "SELECT status FROM missions WHERE id=?", (mid,)).fetchone()
+        assert m["status"] == "failed"
+    assert [c[1] for c in fake_loop.committed] == [False, False]
 
 
 # Tests for 9.5: N-slot 構成・接続所有・shutdown/join

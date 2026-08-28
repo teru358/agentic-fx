@@ -14550,6 +14550,25 @@ uv run pytest tests/core/test_improve_wave_slot_protocol.py -v -k "three_way or 
     # (`reached_running=False` かつ `result.status != "completed"` の分岐、
     # 10.10/10.11 節) が担い、`_launch_slot` 側で early return しない
     # (`abort_pre_ready` のような別ヘルパは新設しない)。
+    #
+    # <!-- 裁定注記 (プラン10 束D round1、ユーザー裁定 2026-08-28、
+    # verified-codex-round1.md I2 是正): 上記 RW3 改訂コメントが指す
+    # 「commit() 内部の reached_running=False 分岐」は実在しない —
+    # `ImproveLoop.commit(self, *, mission, ctx, result, now)` は
+    # `reached_running` を受け取らず、10.10/10.11 節にも該当 Step が
+    # 無い (現物と裏取り済み)。実装は `commit()` に `slot_terminalize:
+    # bool = True` 引数を追加する形で行った — pre-ready 失敗の再試行時
+    # (`_handle_pre_ready_failure` で `revert_to_reserved` 済み) だけ
+    # `slot_terminalize=False` を渡し、`_finalize_failed_mission` は
+    # `finish_improve_mission(slot_key=None, ...)` で mission/run のみ
+    # 終端して slot には触れない (`mark_terminal` の無条件 UPDATE が
+    # revert 済みの `reserved` を潰すのを防ぐ)。あわせて `_launch_slot`
+    # は設計書 §3.1⑥/§8.1-19 どおり同一プロセス内で再 claim → 再 spawn
+    # する `while True` ループへ改訂した (`_MAX_SPAWN_ATTEMPTS` が実際に
+    # 機能する形)。詳細は `src/agentic_fx/core/improve_supervisor.py`
+    # `_launch_slot`/`_handle_pre_ready_failure` と
+    # `src/agentic_fx/loops/improve_loop.py` `commit`/
+    # `_finalize_failed_mission` の実装コメントを正とする。 -->
     def _launch_slot(self, period_key: str, k: int) -> None:
         # mission_id はまだ無い。Tx-0 (missions.start + improve_runs.start +
         # slot claim reserved→claimed) は self._improve_loop.prepare が
@@ -15058,6 +15077,25 @@ class ImproveSupervisor:
     # (`reached_running=False` かつ `result.status != "completed"` の分岐、
     # 10.10/10.11 節) が担い、`_launch_slot` 側で early return しない
     # (`abort_pre_ready` のような別ヘルパは新設しない)。
+    #
+    # <!-- 裁定注記 (プラン10 束D round1、ユーザー裁定 2026-08-28、
+    # verified-codex-round1.md I2 是正): 上記 RW3 改訂コメントが指す
+    # 「commit() 内部の reached_running=False 分岐」は実在しない —
+    # `ImproveLoop.commit(self, *, mission, ctx, result, now)` は
+    # `reached_running` を受け取らず、10.10/10.11 節にも該当 Step が
+    # 無い (現物と裏取り済み)。実装は `commit()` に `slot_terminalize:
+    # bool = True` 引数を追加する形で行った — pre-ready 失敗の再試行時
+    # (`_handle_pre_ready_failure` で `revert_to_reserved` 済み) だけ
+    # `slot_terminalize=False` を渡し、`_finalize_failed_mission` は
+    # `finish_improve_mission(slot_key=None, ...)` で mission/run のみ
+    # 終端して slot には触れない (`mark_terminal` の無条件 UPDATE が
+    # revert 済みの `reserved` を潰すのを防ぐ)。あわせて `_launch_slot`
+    # は設計書 §3.1⑥/§8.1-19 どおり同一プロセス内で再 claim → 再 spawn
+    # する `while True` ループへ改訂した (`_MAX_SPAWN_ATTEMPTS` が実際に
+    # 機能する形)。詳細は `src/agentic_fx/core/improve_supervisor.py`
+    # `_launch_slot`/`_handle_pre_ready_failure` と
+    # `src/agentic_fx/loops/improve_loop.py` `commit`/
+    # `_finalize_failed_mission` の実装コメントを正とする。 -->
     def _launch_slot(self, period_key: str, k: int) -> None:
         # mission_id はまだ無い。Tx-0 (missions.start + improve_runs.start +
         # slot claim reserved→claimed) は self._improve_loop.prepare が

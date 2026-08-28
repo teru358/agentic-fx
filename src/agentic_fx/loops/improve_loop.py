@@ -1053,7 +1053,20 @@ class ImproveLoop:
                     Category.IMPROVE, "tx2_compensation_failed",
                     f"mission_id={mission_id} run_id={run_id}")
 
-    def commit(self, *, mission, ctx, result, now) -> None:
+    def commit(self, *, mission, ctx, result, now,
+              slot_terminalize: bool = True) -> None:
+        """`slot_terminalize` (I2b 是正、プラン10 束D round1、ユーザー裁定
+        D①、2026-08-28): pre-ready 失敗の巻き戻し (`_handle_pre_ready_
+        failure` の `revert_to_reserved`) は `commit()` が呼ばれる**前**に
+        完了している。既定 `True` (従来どおり無条件に slot も終端) の
+        まま `finish_improve_mission(slot_key=ctx.slot_key, ...)` を呼ぶと、
+        `mark_terminal` が status ガード無しの無条件 UPDATE なので、直前
+        に revert した `reserved` slot を即座に `failed` へ潰してしまう
+        (プラン 9.5 節 RW3 が指した「commit() 内部の reached_running 分岐」
+        は実在しなかった — 訂正はプラン文書側で行う)。呼び出し元
+        (`ImproveSupervisor._launch_slot`) は pre-ready 失敗を再試行する
+        ときだけ `slot_terminalize=False` を渡し、mission/run のみを
+        終端して slot には触れない。"""
         owns_conn = False
         conn = getattr(self, "_conn_for_test", None)
         if conn is None:
@@ -1063,7 +1076,9 @@ class ImproveLoop:
             self._freeze_ledger(ctx)                                  # 手順0
 
             if result.status != "completed":
-                self._finalize_failed_mission(conn, ctx=ctx, result=result, now=now)
+                self._finalize_failed_mission(
+                    conn, ctx=ctx, result=result, now=now,
+                    slot_terminalize=slot_terminalize)
                 return
 
             output = result.output or {}
@@ -1280,20 +1295,28 @@ class ImproveLoop:
             os.chmod(dirpath, 0o700)
         shutil.rmtree(ctx.staging_dir, ignore_errors=True)
 
-    def _finalize_failed_mission(self, conn, *, ctx, result, now) -> None:
+    def _finalize_failed_mission(self, conn, *, ctx, result, now,
+                                 slot_terminalize: bool = True) -> None:
         """§3.6: timeout/failed/max_turns → missions を `failed` で終端。
         `improvement_runs.result` は CHECK (`approval`/`report` のみ) の
         制約上 NULL のまま (`result.status` の文字列をそのまま渡すと
         IntegrityError になる)。backlog は未選択 (Tx-1 未到達) のため
         遷移なし。staging を削除し、台帳は `DISCARDED` (呼び出し元
-        `commit()` の手順0で既に FROZEN、ここで確定させる)。"""
+        `commit()` の手順0で既に FROZEN、ここで確定させる)。
+
+        `slot_terminalize=False` (I2b 是正、ユーザー裁定 D①、2026-08-28):
+        pre-ready 失敗の巻き戻し (呼び出し元が既に `revert_to_reserved`
+        済み) では `slot_key=None` を `finish_improve_mission` へ渡し、
+        mission/run のみ終端して slot には触れない (`mark_terminal` の
+        無条件 UPDATE が巻き戻した `reserved` を潰すのを防ぐ)。"""
         ctx.ledger.mark_discarded()
         self._delete_staging(ctx)
         conn.execute("BEGIN IMMEDIATE")
         try:
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
-                slot_key=ctx.slot_key, mission_status="failed",
+                slot_key=ctx.slot_key if slot_terminalize else None,
+                mission_status="failed",
                 run_result=None, now=now, backlog_transition=None,
                 commit=False)
             conn.commit()

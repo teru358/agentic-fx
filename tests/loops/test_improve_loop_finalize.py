@@ -418,6 +418,92 @@ def test_finalize_failed_mission_terminates_scheduler_wave_slot_as_failed(
     assert slot["status"] == "failed"
 
 
+def test_finalize_failed_mission_slot_terminalize_false_leaves_slot_untouched(
+        loop_min, conn, mission_and_run_fixture_with_slot, tmp_path):
+    """I2b 是正 (プラン10 束D round1、ユーザー裁定 D①、2026-08-28):
+    pre-ready 失敗の巻き戻し (`_handle_pre_ready_failure` の
+    `revert_to_reserved`) は `_launch_slot` が `commit()` を呼ぶより前に
+    完了している。`commit()`/`_finalize_failed_mission` が無条件に
+    `finish_improve_mission(slot_key=ctx.slot_key, ...)` を呼ぶと、
+    `mark_terminal` の status ガード無し無条件 UPDATE が、直前に revert
+    した `reserved` slot を即座に `failed` へ潰す (プラン 9.5 節 RW3 が
+    「commit() 内部の reached_running 分岐」を指していたが、その分岐は
+    実在しなかった — プラン文書側は本 round で訂正)。
+    `slot_terminalize=False` は mission/run のみ終端し、slot には
+    触れないことを pin する。"""
+    from agentic_fx.store import improve_waves
+
+    mission_id, run_id, backlog_id, slot_key = mission_and_run_fixture_with_slot
+    period_key, k = slot_key
+    # `_launch_slot` の pre-ready 失敗巻き戻しを模す (revert_to_reserved 済み)
+    reverted = improve_waves.revert_to_reserved(
+        conn, period_key=period_key, k=k, now=datetime(2026, 8, 22),
+        commit=True)
+    assert reverted
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=slot_key, ledger=ledger,
+        rpc_handlers={})
+    result = MissionResult(status="failed", output=None, transcript=[])
+
+    loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
+                                      now=datetime(2026, 8, 22),
+                                      slot_terminalize=False)
+
+    m = conn.execute("SELECT status FROM missions WHERE id=?",
+                     (mission_id,)).fetchone()
+    assert m["status"] == "failed"
+    slot = conn.execute(
+        "SELECT status FROM improve_wave_slots WHERE wave_period_key=? "
+        "AND k=?", (period_key, k)).fetchone()
+    assert slot["status"] == "reserved", (
+        "slot_terminalize=False は revert 済み slot を終端してはならない")
+
+
+def test_commit_slot_terminalize_false_propagates_to_finalize_failed_mission(
+        loop_full, conn, mission_and_run_fixture_with_slot, tmp_path):
+    """`ImproveLoop.commit(..., slot_terminalize=False)` の公開 API から
+    `_finalize_failed_mission` へ実際に配線されることを pin する
+    (`_finalize_failed_mission` 単体呼び出しの上のテストとは別に、
+    `commit()` の分岐そのものを通す)。"""
+    from agentic_fx.store import improve_waves
+
+    mission_id, run_id, backlog_id, slot_key = mission_and_run_fixture_with_slot
+    period_key, k = slot_key
+    assert improve_waves.revert_to_reserved(
+        conn, period_key=period_key, k=k, now=datetime(2026, 8, 22),
+        commit=True)
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=slot_key, ledger=ledger,
+        rpc_handlers={})
+    result = MissionResult(status="failed", output=None, transcript=[])
+
+    loop_full.commit(mission="m", ctx=ctx, result=result,
+                     now=datetime(2026, 8, 22), slot_terminalize=False)
+
+    slot = conn.execute(
+        "SELECT status FROM improve_wave_slots WHERE wave_period_key=? "
+        "AND k=?", (period_key, k)).fetchone()
+    assert slot["status"] == "reserved"
+    m = conn.execute("SELECT status FROM missions WHERE id=?",
+                     (mission_id,)).fetchone()
+    assert m["status"] == "failed"
+
+
 def test_finalize_output_invalid_terminates_failed_with_null_result_and_deletes_staging(
         loop_min, conn, mission_and_run_fixture, tmp_path):
     """§4.2 手順1 不合格: Mission failed、improvement_runs.result は NULL、
