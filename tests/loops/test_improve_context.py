@@ -109,3 +109,25 @@ def test_performance_report_window_is_90_days_not_30(tmp_path):
     ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=None)
     assert ctx["performance_report"]["by_pair"]["USDJPY"]["count"] == 2
+
+
+def test_performance_report_window_boundary_narrows_to_90_days_not_61(tmp_path):
+    """A23 是正 (束D検収, verified-local-round1.md §11 #16):
+    上のテストは `-60d`/`-10d` の 2 点しか実測しておらず、窓が
+    `(60, 90]` の範囲では無防備だった (`days=90→61` の変異は両方が窓内
+    のまま SURVIVED、`days=45`/`30` は `-60d` が外れて KILLED — 詳細は
+    verified-local-round1.md §1)。`-85d` (90 日窓なら圏内、61 日窓なら
+    圏外) の closed order を 1 本足し、`days=61` への変異も red にする。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    old = NOW - timedelta(days=85)   # 61 日窓なら圏外、90 日窓なら圏内
+    recent = NOW - timedelta(days=10)
+    for created_at in (old, recent):
+        c.execute(
+            "INSERT INTO orders (pair,direction,entry_type,horizon,status,"
+            "realized_pnl,created_at,updated_at) VALUES "
+            "('USDJPY','long','market','day','closed',1.0,?,?)",
+            (created_at.isoformat(), created_at.isoformat()))
+    c.commit()
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
+                                allowed_backlog_ids=None)
+    assert ctx["performance_report"]["by_pair"]["USDJPY"]["count"] == 2

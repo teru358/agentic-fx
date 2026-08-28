@@ -55,6 +55,10 @@ def test_schema_has_no_analysis_run_ids_or_trial_count_property():
     "../evil", "a/b", "Rsi_V2", "_leading_underscore", "with space", "",
     "a" * 65,  # L30: 名前長境界 (64 は許容、65 は拒否)
     "rsi.v2",  # L32: ドットは pattern から禁止されている
+    "1rsi",  # A25 是正 (束D検収, verified-local-round1.md §11 #17):
+             # 数字始まりは `^[a-z]...` (先頭は文字必須) で拒否される。
+             # `pattern` を `^[a-z0-9]` へ緩める変異はこのケースが無いと
+             # 実測 SURVIVED になる (全スイート 2924 passed だった)。
 ])
 def test_artifact_plugin_name_rejects_non_canonical_form(bad_name):
     """申し送り⑩の解決 (M4 pin): `artifact.name` の `pattern` が
