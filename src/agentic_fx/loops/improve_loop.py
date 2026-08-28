@@ -97,9 +97,13 @@ def copy_source_snapshot(metas: list, *, dest_root: Path,
     は一切参照しない** — `meta.path` は discover 時点で symlink 解決済みの
     実体パスとして registry が既に保持している (Task 5 の産物)。
 
-    コピー完了後に 3 本から再計算した artifact_hash を `meta.artifact_hash`
-    と照合する — 不一致ならコピー中の版切替 (live 差し替え) か 3 本混成を
-    示すので `ValueError` で fail closed にする。
+    C2 是正 (束D検収, verified-local-round1.md §11 #20): **読み取ったバイト
+    列に対して** hash を照合してから書き込む (`read_bytes()` → hash 再計算
+    → 一致確認 → その後 `write_bytes()` の順)。以前の docstring は
+    「コピー完了後に再計算」と書いていたが実装は逆順 — ただし防御の実効
+    (混成版/版切替の検出) は変わらない: 書き込むバイト列は hash を取った
+    バイト列そのものなので、`meta.artifact_hash` との不一致は書き込み前に
+    確実に検出される。
     """
     dest_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     copied_names: list[str] = []
