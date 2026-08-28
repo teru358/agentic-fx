@@ -234,6 +234,17 @@ class ImproveSupervisor:
                 now=self._clock.now(), slot_terminalize=False)
             if not should_retry:
                 return
+            if self._stop_event.is_set():
+                # advisor 指摘是正 (プラン10 束D round1、2026-08-28):
+                # shutdown 中に再 spawn (新しい子プロセス + `worker_
+                # startup_timeout_sec` の新しい待ち) を始めない —
+                # `join()` docstring が引く `service.py:1203-1209` の
+                # I-3 不変条件 (join budget は watchdog ceiling と同じ値
+                # を共有する) に、retry loop 導入で 1 スレッドが最大 2 回
+                # 分の spawn/待ちを行いうるようになったことが抵触する。
+                # slot は既に `_handle_pre_ready_failure` が `reserved`
+                # へ戻し終えている (次回起動時の reconcile/tick が拾う)。
+                return
             now = self._clock.now()
 
     def _handle_pre_ready_failure(self, period_key: str, k: int) -> bool:

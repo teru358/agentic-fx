@@ -216,6 +216,7 @@ class _FakeImproveLoop:
         self._worker_runner = worker_runner
         self._mission_id = mission_id
         self.committed: list[tuple] = []
+        self.prepare_call_count = 0
         # 裁定 D1: improve_wave_slots.mission_id に FK が付いたため、claim
         # 対象の mission_id は実在する missions 行でなければならない。
         # テストは特定の literal id (999/111/222 等) を assert しているため、
@@ -228,6 +229,7 @@ class _FakeImproveLoop:
         conn.commit()
 
     def prepare(self, *, slot_key, now, on_ready=None):
+        self.prepare_call_count += 1
         period_key, k = slot_key
         claimed = improve_waves.claim_slot(
             self._conn, period_key=period_key, k=k, mission_id=self._mission_id,
@@ -595,6 +597,51 @@ def test_pre_ready_failure_second_attempt_goes_to_failed(conn):
         "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
     assert row["status"] == "failed"
     assert row["spawn_attempts"] == 2
+
+
+def test_launch_slot_retry_loop_does_not_respawn_after_shutdown(conn):
+    """advisor 指摘の是正 (プラン10 束D round1、2026-08-28): I2(b) で
+    `_launch_slot` が同一プロセス内 retry loop になったため、1 attempt
+    目の pre-ready 失敗直後に `shutdown()` (= `stop_event.set()`) が
+    呼ばれても、`_stop_event` を見ないまま 2 attempt 目 (新しい子プロセス
+    の spawn + `worker_startup_timeout_sec` の新しい待ち) を始めてしまう
+    退行を防ぐ。`join()` の I-3 不変条件 (join budget は watchdog
+    ceiling と同じ値を共有する) は「1 スレッドが最大 1 回分の spawn/待ち
+    しかしない」ことを前提にしていたが、retry loop 導入でこの前提が
+    崩れていた。1 attempt 目の `run()` の中で `stop_event.set()` してから
+    pre-ready 失敗を返し、`prepare()` が**1 回しか呼ばれない**こと
+    (= 2 attempt 目が始まらない) を pin する。"""
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W34", now=now, expected=1, commit=True)
+    stop_event = threading.Event()
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=stop_event)
+    sup._conn_for_test = conn
+
+    class _PreReadyFailsThenSetsStop:
+        on_ready = None
+
+        def run(self, mission):
+            stop_event.set()  # 1 attempt 目の実行中に shutdown が要求される
+            return _FakeMissionResult("failed", None, reason="pre-ready failure")
+
+    fake_loop = _FakeImproveLoop(
+        conn, _PreReadyFailsThenSetsStop(), mission_id=111)
+    sup._improve_loop = fake_loop
+    sup._launch_slot("2026-W34", 0)
+
+    assert fake_loop.prepare_call_count == 1, (
+        "shutdown 要求後に再 spawn (2 attempt 目) してしまっている")
+    row = conn.execute(
+        "SELECT status, spawn_attempts FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "reserved", (
+        "1 attempt 目の revert 済み状態のまま — 次回起動時の reconcile/"
+        "tick が拾う")
+    assert row["spawn_attempts"] == 1
 
 
 def test_pre_ready_failure_also_covers_ready_timeout_before_running_commit(conn):

@@ -14357,7 +14357,11 @@ now=now, on_ready=_on_ready)` (`_on_ready` は `improve_waves.mark_running`
 を呼ぶ内部クロージャ、下記 Step 3) → `runner.run(mission)` (1 回のブロッキング
 呼び出し — この内部で `WorkerRunner` が `on_ready` を呼び、戻ったら自分で
 `go` を書き、子の完走まで待つ) → `self._improve_loop.commit(...)` (**無条件**
-— RW3 改訂、9.5/10.10 節参照) の直列呼び出しになる。`go` フレームそのものの
+— RW3 改訂、9.5/10.10 節参照 [裁定注記 (プラン10 束D round1、
+ユーザー裁定 2026-08-28): commit() は今も無条件に呼ばれるが、9.5 節が
+指す「commit() 内部の reached_running 分岐」自体は実在しない — 実装は
+`slot_terminalize` 引数で行った。9.5 節/10.12 節の裁定注記を正とする])
+の直列呼び出しになる。`go` フレームそのものの
 送出は `WorkerRunner` (Task 1) の内部でだけ起き、`ImproveSupervisor`/
 `ImproveLoop` からは見えない — 本節のフェイクは「`on_ready` が `run()` の
 内側で呼ばれ、`run()` が戻るまでに `go` に相当する内部同期点を経ている」
