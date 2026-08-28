@@ -120,7 +120,23 @@ def count_open_slots(conn: sqlite3.Connection, *, period_key: str) -> int:
 def mark_terminal(conn: sqlite3.Connection, *, period_key: str, k: int,
                   status: str, now: datetime, commit: bool = True) -> bool:
     """戻り値: `True` = 対象 slot を更新した。`False` = `(period_key, k)`
-    に該当する slot が存在しなかった (rowcount=0、fail-open 防止)。"""
+    に該当する slot が存在しなかった (rowcount=0、fail-open 防止)。
+
+    L-B1 裁定 (2026-08-28、束D検収 verified-local-round1.md §7、現状維持):
+    このクエリは **前状態ガード無しの無条件 UPDATE** (`status=?` のみで
+    絞り、`WHERE status IN (...)` のような遷移元ガードを持たない) —
+    `claimed`/`running` はもちろん、既に `done`/`failed` の終端済み slot
+    も無条件に上書きできる。`ImproveSupervisor._launch_slot` の retry
+    loop (I2b 是正) は、この無条件性を**前提として**
+    `commit(slot_terminalize=False)` という迂回を採用している:
+    1 attempt 目の pre-ready 失敗を `revert_to_reserved` で `reserved` に
+    戻した直後、`commit()` の無条件終端がそれを `failed`/`done` へ潰さない
+    よう、`slot_terminalize=False` で `mark_terminal` 自体を呼ばせない
+    (`slot_key=None` を `finish_improve_mission` へ渡す) 形で防いでいる。
+    CAS 化 (前状態ガードを足す) すれば迂回は不要になるが、その場合
+    `_finalize_*` 群の全経路が「終端できないことがある」を扱う必要が
+    出るため、**現状維持** (無条件 UPDATE のまま、`slot_terminalize` 迂回
+    を正とする) を裁定とする。"""
     if status not in _TERMINAL_STATUSES:
         raise ValueError(f"status must be done|failed: {status!r}")
     cur = conn.execute(

@@ -524,6 +524,17 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 | 採用ゲート | ハーネス内部呼び出し (holdout 評価) | ハーネスが決める |
 | 人間 | CLI サブコマンド | 自由 (人間は遮断の対象外) |
 
+**実装上の層分担 (A34 裁定、2026-08-28、束D検収 verified-local-round1.md
+§7、規約として明文化)**: 「期間・端点を返さない」の実施箇所は
+親側 RPC handler (`ImproveLoop._build_rpc_handlers`) ではなく、その
+戻り値を agent へ返す直前の RPC tooldef 層
+(`tools/improve_rpc_tools.py::build_improve_rpc_tooldefs` の
+`_strip_forbidden`)。handler 自体は台帳記録用に `period`/`now` を含む
+生の save_kwargs を返し (`backtest_runs`/`analysis_runs` の再現性列に
+必要)、tooldef 層がそれを剥がしてから agent へ渡す。**handler を
+tooldef を経由せず直接 agent 側へ晒す経路を新設してはならない** —
+遮断7 (期間・端点を返さない) がその経路だけ抜ける。
+
 #### spread・手数料・スリッページ
 
 - 執行モデルは現行ペーパー broker と完全同一 (half-spread 判定・limit は価格保証・SL は不利方向判定)。バックテスト専用の執行仮定を作らない

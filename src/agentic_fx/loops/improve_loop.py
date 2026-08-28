@@ -325,6 +325,14 @@ class ImproveLoop:
             except BaseException:
                 conn.rollback()
                 raise
+        # C6 裁定 (2026-08-28、束D検収 verified-local-round1.md §7、
+        # 現状維持): 内側 tx は `except BaseException:` だが、この外側
+        # (補償 tx 自体の失敗を握る経路) は意図的に `except Exception:` —
+        # `KeyboardInterrupt`/`SystemExit` (shutdown) はここを通らず、
+        # 補償を試みずに呼び出し元 (`prepare()`) へそのまま伝播する。
+        # shutdown 時に「元例外の後始末」としての補償 tx を新規に開始
+        # するより、即座に終了する方が安全という判断 (mission は
+        # 非終端のまま残るが、起動時 reconcile が拾う設計)。
         except Exception:
             _log.exception(
                 "compensation itself failed for mission_id=%s — mission "
@@ -524,7 +532,21 @@ class ImproveLoop:
 
     def _build_rpc_handlers(self, ledger: "ImproveRpcLedger", *,
                             staging_dir: Path) -> dict:
-        """10.9 Step 11: run_backtest/analyze_corr の親側実装。"""
+        """10.9 Step 11: run_backtest/analyze_corr の親側実装。
+
+        A34 裁定 (2026-08-28、束D検収 verified-local-round1.md §7、
+        規約として明文化): 戻り値の `period`/`now` 除去 (遮断7) は**この
+        handler の責務ではない** — `tools/improve_rpc_tools.py::
+        build_improve_rpc_tooldefs` の `_strip_forbidden` (tooldef 層)
+        が担う。`run_backtest_handler`/`analyze_corr_handler` は
+        save_kwargs をそのまま返す (`_persist_ledger_rows` が読む契約、
+        10.10 節) — ここで剥がすと台帳の記録内容まで痩せてしまう
+        (`_strip_forbidden` の docstring 「台帳は痩せない」参照)。
+        **この handler をここで返す辞書以外の経路 (tooldef を経由しない
+        直接呼び出し) で agent へ晒してはならない** — 遮断7 が抜ける。
+        `_build_rpc_handlers` の戻り値は必ず
+        `build_improve_rpc_tooldefs(run_backtest_handler=...,
+        analyze_corr_handler=...)` を経由させること (設計書 §6 注記)。"""
         from agentic_fx.backtest.analysis import analyze_for_agent
         from agentic_fx.plugin import loader as plugin_loader
         from agentic_fx.plugin import strategy_adapter
@@ -1080,6 +1102,15 @@ class ImproveLoop:
             except BaseException:
                 conn.rollback()
                 raise
+        # C6 裁定 (2026-08-28、束D検収 verified-local-round1.md §7、
+        # 現状維持): 内側 tx は `except BaseException:` (rollback して
+        # 必ず re-raise) だが、この外側の補償トリガーは意図的に
+        # `except Exception:` — `KeyboardInterrupt`/`SystemExit`
+        # (shutdown) はここを通らず補償 tx を走らせずに呼び出し元へ
+        # 素通りする。shutdown 中に新たな tx (補償) を開始するより、
+        # 補償を諦めて即座に終了する方が安全という判断 (起動時
+        # reconcile が非終端 mission を拾う)。`_compensate_prepare_
+        # failure` の外側にも同じ非対称がある (下記参照)。
         except Exception:
             _log.exception("Tx-2 failed for mission_id=%s — running "
                            "compensation", mission_id)
