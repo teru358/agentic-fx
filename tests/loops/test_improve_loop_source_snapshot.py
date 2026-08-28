@@ -27,15 +27,26 @@ def _artifact_hash(plugin_py, config_yaml, test_plugin) -> str:
 
 def test_copies_from_fixed_plugin_meta_path_not_live_symlink(tmp_path, monkeypatch):
     """live symlink を別版に切替えても、既に registry が保持する固定
-    PluginMeta.path から読む (symlink 追従しない)。"""
+    PluginMeta.path から読む (symlink 追従しない)。
+
+    L-B22 是正 (束D検収, verified-local-round1.md §11 #21): 元のテストは
+    live symlink `plugins/<name>` を**一度も作らない**まま `meta.path`
+    (固定パス) から読むだけの自明テストだった (「symlink を追従しない」
+    という表題の契約を実際には踏んでいなかった)。ここでは
+    `plugins/rsi_indicator` を実際に**別版** (NEW) を指す symlink として
+    作り、それでも `meta.path` (OLD 版) の内容がコピーされることを見る。"""
     versions_root = tmp_path / "plugins" / ".versions" / "rsi_indicator"
     old_version = versions_root / ("aaa" * 16)  # ダミーの64桁hash風
+    new_version = versions_root / ("bbb" * 16)
     _write_plugin(old_version, plugin_py=b"OLD")
+    _write_plugin(new_version, plugin_py=b"NEW")
+    live_symlink = tmp_path / "plugins" / "rsi_indicator"
+    live_symlink.symlink_to(new_version)
     dest = tmp_path / "workdir" / "source"
 
     class _FakeMeta:
         name = "rsi_indicator"
-        path = old_version
+        path = old_version  # registry が discover 時点で保持する固定パス
         content_hash = "irrelevant-for-this-test"
         artifact_hash = _artifact_hash(b"OLD", b"c", b"t")
 

@@ -645,30 +645,46 @@ def test_launch_slot_retry_loop_does_not_respawn_after_shutdown(conn):
 
 
 def test_pre_ready_failure_also_covers_ready_timeout_before_running_commit(conn):
-    """`ready` 受信前の timeout も pre-ready 失敗と同じ経路 (spawn 成功後、
-    ready が来ない/timeout するケース) — `on_ready` を一度も呼ばずに
-    failed を返す fake で模す。単一 attempt の遷移 pin (上と同じ理由で
-    `_handle_pre_ready_failure` を直接呼ぶ形へ書き換え、逸脱申告)。"""
+    """ACC-B5 是正 (束D検収, acceptance-round1.md B-5 /
+    verified-local-round1.md §11 #15): 書き換え後 (`_handle_pre_ready_
+    failure` を直接呼ぶ形) は
+    `test_pre_ready_failure_reverts_to_reserved_with_mission_id_null`
+    と本文がほぼ同一になり、assert がその**真部分集合**に退化していた
+    (「`ready` timeout も pre-ready 経路に乗る」という `_launch_slot` を
+    通した外形は誰も踏まなくなっていた — テスト名と中身の乖離)。ここでは
+    `_launch_slot` を実際に通し、`on_ready` を一度も呼ばずに `failed` を
+    返す fake runner (ready 受信前 timeout を模す) で、`prepare` が
+    2 回呼ばれること (初回+再試行1回) と、最終的に slot が
+    `failed`/`spawn_attempts=2` へ収束することを実測する。"""
     now = datetime(2026, 8, 22, 3, 0)
-    improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
-    conn.execute(
-        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
-        "VALUES (111, 'improve', 'local', 'm', 'running', ?)",
-        (now.isoformat(),))
-    assert improve_waves.claim_slot(
-        conn, period_key="2026-W34", k=0, mission_id=111, now=now, commit=True)
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
                              clock=_FixedClock(now), db_path=Path("x"),
                              stop_event=threading.Event())
     sup._conn_for_test = conn
 
-    sup._handle_pre_ready_failure("2026-W34", 0)
+    class _ReadyTimeoutRunner:
+        """spawn は成功するが `ready` フレームが来ない (on_ready 未到達)
+        まま timeout し `failed` を返す — pre-ready 失敗と同じ帰結。"""
+        on_ready = None
+
+        def run(self, mission):
+            return _FakeMissionResult(
+                "failed", None, reason="ready timeout")
+
+    fake_loop = _FakeImproveLoop(conn, _ReadyTimeoutRunner(), mission_id=111)
+    sup._improve_loop = fake_loop
+    sup._launch_slot("2026-W34", 0)  # 1 回の呼び出しで初回+再試行1回 → failed
+
+    assert fake_loop.prepare_call_count == 2
     row = conn.execute(
-        "SELECT status, mission_id FROM improve_wave_slots "
+        "SELECT status, mission_id, spawn_attempts FROM improve_wave_slots "
         "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
-    assert row["status"] == "reserved"
+    assert row["status"] == "failed"
     assert row["mission_id"] is None
+    assert row["spawn_attempts"] == 2
 
 
 def test_pre_ready_failure_keeps_slot_reserved_through_real_commit(conn):

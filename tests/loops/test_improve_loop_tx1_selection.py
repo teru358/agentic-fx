@@ -73,7 +73,12 @@ def test_duplicate_idea_normalized_whitespace_and_case_is_deduped(
 
 
 def test_new_backlog_over_limit_are_dropped_and_counted_in_activity(
-        loop_and_ctx_with_open_backlog, monkeypatch):
+        loop_and_ctx_with_open_backlog, monkeypatch, tmp_path):
+    """L-B30 是正 (束D検収, verified-local-round1.md §11 #21): テスト名は
+    「activity に dropped 件数が記録されること」を謳うが、本体は挿入件数
+    (`n == 2`) しか assert しておらず、テスト名が謳う activity の
+    `dropped=3` も `inserted + dropped == len(discoveries)` も見ていなかった。
+    両方を追加で assert する。"""
     loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
     monkeypatch.setattr(loop._settings.improve, "max_new_backlog_per_mission", 2)
     discoveries = [{"idea": f"idea-{i}", "source": "agent", "evidence": "e"}
@@ -87,6 +92,9 @@ def test_new_backlog_over_limit_are_dropped_and_counted_in_activity(
         "SELECT count(*) c FROM improvement_backlog WHERE idea LIKE 'idea-%'"
     ).fetchone()["c"]
     assert n == 2
+    assert n + 3 == len(discoveries)  # inserted + dropped == len(discoveries)
+    activity_text = (tmp_path / "activity.log").read_text()
+    assert f"mission={ctx.mission_id} dropped=3" in activity_text
 
 
 @pytest.mark.parametrize("selected", [

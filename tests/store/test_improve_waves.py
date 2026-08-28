@@ -199,11 +199,18 @@ def test_recover_stale_slots_fails_reserved_claimed_running(tmp_path):
 
 
 def test_recover_stale_slots_leaves_done_and_failed_untouched(tmp_path):
+    """L-B3 是正 (束D検収, verified-local-round1.md §11 #21): テスト名は
+    「done と failed の両方を untouched のまま残す」を謳うが、本体は
+    `done` しか作っていなかった。`failed` slot を追加で作り、両方が
+    `recover_stale_slots` の対象外のまま残ることを実測する。"""
     c = connect(tmp_path / "t.db"); init_db(c)
-    improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=1)
+    improve_waves.create_wave_and_slots(c, period_key="2026-W34", now=NOW, expected=2)
     improve_waves.claim_slot(c, period_key="2026-W34", k=0, mission_id=_mission(c), now=NOW)
     improve_waves.mark_running(c, period_key="2026-W34", k=0, now=NOW)
     improve_waves.mark_terminal(c, period_key="2026-W34", k=0, status="done", now=NOW)
+    improve_waves.claim_slot(c, period_key="2026-W34", k=1, mission_id=_mission(c), now=NOW)
+    improve_waves.mark_terminal(c, period_key="2026-W34", k=1, status="failed", now=NOW)
     n = improve_waves.recover_stale_slots(c, now=NOW)
     assert n == 0
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "done"
+    assert improve_waves.get_slot(c, period_key="2026-W34", k=1)["status"] == "failed"
