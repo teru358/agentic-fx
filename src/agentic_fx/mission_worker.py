@@ -418,17 +418,18 @@ def _make_rpc_client(protocol_out: Any, out_seq: SeqTracker,
 
 def _build_improve_registry(*, settings: Any, workdir: Path, staging_dir: Path,
                             source_snapshot_dir: Path,
-                            rpc_client: Callable[[str, dict], Any] | None = None
+                            rpc_client: Callable[[str, dict], Any]
                             ) -> ToolRegistry:
-    """improve profile 用 `ToolRegistry` の構築 seam (A-4 検収是正、裁定 R-D2)。
+    """improve profile 用 `ToolRegistry` の構築 (A-4 検収是正、裁定 R-D2)。
 
-    rpc_client が渡されない場合は空 ToolRegistry() を返す (Task 4/A-4 段階)。
-    Task 10 で rpc_client が渡されるようになり、
-    `build_mission_registry("improve", staging_dir=...,
-    source_snapshot_dir=..., rpc_handlers=...)` が呼ばれる。"""
-    if rpc_client is None:
-        return ToolRegistry()
-
+    A14 裁定 (2026-08-28、束D検収 verified-local-round1.md §7):
+    `rpc_client` を必須引数化した。旧実装は `rpc_client=None` の既定値で
+    空 `ToolRegistry()` を返す fail-open 経路を持っていた (Task 4/A-4 段階
+    の互換 seam) が、対して `tools/mission_registry.py::build_mission_
+    registry` は `rpc_handlers is None` で `ValueError` を送出する
+    (fail closed) — 非対称だった。本番の唯一の呼び出し
+    (`_run_improve_mission`) は常に `_make_rpc_client(...)` の戻り値を
+    渡すため実害は無かったが、既定値を消して呼び出し元に明示させる。"""
     from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
     from agentic_fx.tools.mission_registry import build_mission_registry
 

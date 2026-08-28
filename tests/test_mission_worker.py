@@ -620,6 +620,29 @@ def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
         assert callable(captured["cli_started_sink"]), f"backend={backend}"
 
 
+def test_build_improve_registry_requires_rpc_client(tmp_path):
+    """A14 裁定 (2026-08-28、束D検収 verified-local-round1.md §7):
+    `_build_improve_registry` は `rpc_client` を必須引数化した — 旧実装は
+    `rpc_client=None` の既定値で空 `ToolRegistry()` を返す fail-open
+    経路を持っていたが (`tools/mission_registry.py::build_mission_registry`
+    は `rpc_handlers is None` で `ValueError` を送出する fail closed との
+    非対称)、既定値を消して呼び出し元に明示させる。呼び出し側が
+    `rpc_client` を渡し忘れると `TypeError` (missing required keyword
+    argument) になることを pin する。"""
+    import agentic_fx.mission_worker as mw_mod
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    source_snapshot_dir = tmp_path / "source"
+    source_snapshot_dir.mkdir()
+    settings = _settings_with_improve_backend("local")
+
+    with pytest.raises(TypeError, match="rpc_client"):
+        mw_mod._build_improve_registry(
+            settings=settings, workdir=tmp_path, staging_dir=staging_dir,
+            source_snapshot_dir=source_snapshot_dir)
+
+
 # --- A-4 検収是正 (2026-08-22, B1): Step 7 Unix socket dispatcher -----
 
 def test_run_improve_mission_binds_mcp_dispatcher_and_serves_registry_tool(
@@ -651,7 +674,7 @@ def test_run_improve_mission_binds_mcp_dispatcher_and_serves_registry_tool(
 
     monkeypatch.setattr(
         mw_mod, "_build_improve_registry",
-        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client=None: fake_registry)
+        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client: fake_registry)
 
     class _Fake:
         def run(self, mission):
@@ -771,7 +794,7 @@ def test_run_improve_mission_claude_backend_workdir_matches_dispatcher_socket(
 
     monkeypatch.setattr(
         mw_mod, "_build_improve_registry",
-        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client=None: fake_registry)
+        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client: fake_registry)
     # `ClaudeRunner.run()` は `cli_started_sink` 経由で実際に `cli_started`
     # フレームを送出する (`_make_on_message`/`_send_frame` 配線) — 実プロセス
     # を起動するこのテストではその配線を素通りさせるため、
