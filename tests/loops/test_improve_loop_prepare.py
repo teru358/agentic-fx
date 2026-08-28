@@ -647,6 +647,47 @@ def test_prepare_tx0_own_cas_failure_closes_write_conn_no_dangling_rows(
         fresh.close()
 
 
+def test_prepare_compensation_failure_with_activity_none_preserves_original_exception(
+        tmp_path, clock, monkeypatch):
+    """ACC-B3 是正 (束D検収, acceptance-round1.md B-3 /
+    verified-local-round1.md §11 #14): `_compensate_prepare_failure` の
+    外側 `except Exception:` ハンドラ内の `self._activity.write(...)` が
+    無ガードだった。`activity=None` で構築した `ImproveLoop` かつ補償 tx
+    自体も失敗する二重障害では、`AttributeError` が元例外 (Tx-0 後の
+    実失敗、ここでは OSError) を置換していた。ここでは
+    `_materialize_workspace` を失敗させ (post-Tx0 失敗)、かつ
+    `missions_store.finish_improve_mission` (補償 tx 本体) も失敗させて
+    二重障害を再現し、`prepare()` から**元の OSError** が送出されること
+    (AttributeError に置換されないこと) を assert する。"""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    from tests.loops.conftest import SETTINGS, _FakeRag
+
+    db_path = tmp_path / "t.db"
+    bootstrap = connect(db_path)
+    init_db(bootstrap)
+    bootstrap.close()
+    loop = ImproveLoop(
+        root=tmp_path, settings=SETTINGS, clock=clock,
+        db_write_conn_factory=lambda: connect(db_path),
+        db_readonly_conn_factory=lambda: connect_readonly(db_path),
+        activity=None, rag=_FakeRag())
+
+    def _boom_materialize(*a, **kw):
+        raise OSError("simulated _materialize_workspace failure")
+    monkeypatch.setattr(loop, "_materialize_workspace", _boom_materialize)
+
+    from agentic_fx.loops import improve_loop as improve_loop_mod
+
+    def _boom_compensation(*a, **kw):
+        raise RuntimeError("simulated compensation tx failure")
+    monkeypatch.setattr(
+        improve_loop_mod.missions_store, "finish_improve_mission",
+        _boom_compensation)
+
+    with pytest.raises(OSError, match="_materialize_workspace"):
+        loop.prepare(slot_key=None, now=clock.now())
+
+
 def test_build_worker_runner_passes_ctx_as_run_context(loop_full, conn):
     """`_build_worker_runner` が `ImproveRunContext` をそのまま
     `WorkerRunner(run_context=ctx)` へ渡すことの契約テスト (D-4 是正、

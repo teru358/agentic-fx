@@ -325,6 +325,16 @@ class ImproveLoop:
                 "compensation itself failed for mission_id=%s — mission "
                 "stays in a non-terminal state, will be picked up by "
                 "startup reconcile", mission_id)
+            # ACC-B3 是正 (束D検収, verified-local-round1.md §11 #14):
+            # `activity=None` で構築された `ImproveLoop` では、無条件の
+            # `self._activity.write(...)` が `AttributeError` を送出し、
+            # 呼び出し元 (`prepare()`) が re-raise しようとしていた元例外
+            # (Tx-0 後の実失敗) を置換した上、`conn.close()` も飛ばして
+            # いた (fd 漏れが復活する)。本番 (`service.py:967`) は実
+            # `ActivityLog` を渡すため到達しない経路だが、テスト/将来の
+            # 呼び出し元での既定引数省略に備えてガードする。
+            if self._activity is None:
+                return
             self._activity.write(
                 Category.IMPROVE, "prepare_compensation_failed",
                 f"mission_id={mission_id} run_id={run_id}")
