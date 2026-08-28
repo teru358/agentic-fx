@@ -676,3 +676,37 @@ def test_build_worker_runner_passes_ctx_as_run_context(loop_full, conn):
     assert runner._rpc_handlers is ctx.rpc_handlers
 
 
+def test_read_candidate_kind_defaults_to_indicator_when_key_omitted(
+        loop_min, tmp_path):
+    """A5(a) 是正 (束D検収, verified-local-round1.md §11 #13):
+    `_read_candidate_kind` の既定値 `"indicator"` (config.yaml に `kind`
+    キーが無いとき) を変える変異 (`indicator`→`strategy`) が実測 SURVIVED
+    (全スイート 2924 passed) だった — 全 fixture が config.yaml に `kind`
+    を明示指定しており、既定値パス自体が未踏だった。"""
+    candidate_dir = tmp_path / "candidate"
+    candidate_dir.mkdir()
+    (candidate_dir / "config.yaml").write_text("pairs: [USDJPY]\n")  # kind 省略
+
+    assert loop_min._read_candidate_kind(candidate_dir) == "indicator"
+
+
+def test_read_candidate_pairs_defaults_to_empty_list_when_key_omitted(
+        loop_min, tmp_path):
+    """A5(b) 是正: `_read_candidate_pairs` の既定値 `[]` (実測 SURVIVED)。"""
+    candidate_dir = tmp_path / "candidate"
+    candidate_dir.mkdir()
+    (candidate_dir / "config.yaml").write_text("kind: indicator\n")  # pairs 省略
+
+    assert loop_min._read_candidate_pairs(candidate_dir) == []
+
+
+def test_read_candidate_timeframe_defaults_to_1h_when_key_omitted(
+        loop_min, tmp_path):
+    """A5(c) 是正: `_read_candidate_timeframe` の既定値 `"1h"` (実測 SURVIVED)。"""
+    candidate_dir = tmp_path / "candidate"
+    candidate_dir.mkdir()
+    (candidate_dir / "config.yaml").write_text("kind: indicator\n")  # timeframe 省略
+
+    assert loop_min._read_candidate_timeframe(candidate_dir) == "1h"
+
+
