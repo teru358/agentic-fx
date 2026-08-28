@@ -2984,6 +2984,74 @@ def test_go_frame_is_sent_for_improve_profile_even_when_on_ready_is_none(
 
 
 # ---------------------------------------------------------------------------
+# I1 是正 (プラン10 束D round1、verified-codex-round1.md、2026-08-28):
+# `ready.ok=false` は「子が Mission を開始していない」ことの明示 (子側
+# bootstrap 失敗、mission_worker.py の handshake 検証/Landlock bind 等)。
+# 従来は `ok` の検査が `on_ready` 呼び出し・`go` 送出より**後**に来ていた
+# ため、pre-ready 失敗が `_on_ready` 経由で running commit を伴う
+# post-ready 失敗として誤分類され、`ImproveSupervisor` の spawn_attempts
+# retry 分岐 (設計 §3.1⑥/§8.1-19) に到達しなかった。`ok` 検査を
+# `on_ready`/`go` より前へ移し、`ok=false` を明示的に `_escalate_kill`
+# する。
+# ---------------------------------------------------------------------------
+
+
+def test_improve_ready_ok_false_does_not_call_on_ready_or_send_go(
+        tmp_path, monkeypatch):
+    """`ready(ok=False)` を受信したら、`on_ready` を呼ばず・`go` も送らず
+    即座に `MissionResult('failed', ...)` を返し、子を kill する。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    received: dict = {}
+    _BACKSTOP_SEC = 3.0
+
+    def child_thread_fn():
+        import select
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake (seq=1)
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": False,
+                                "error": "bootstrap failed"})
+        # go フレームが (誤って) 送られてこないか、有限時間だけ確認する
+        # (D29 是正と同じ規律: 変異下でも無限待ちにしない)。
+        ready_fds, _, _ = select.select([child_in], [], [], _BACKSTOP_SEC)
+        if ready_fds:
+            line = child_in.readline()
+            received["frame"] = json.loads(line) if line else None
+        else:
+            received["frame"] = None
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+    fake_proc = _fake_improve_proc(r, w, w2, r2)
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(wr_mod.os, "killpg",
+                        lambda pid, sig: killpg_calls.append((pid, sig)))
+
+    on_ready_calls: list[dict] = []
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=_tiny_worker_settings(),
+                          clock=FixedClock(NOW), rag=_rag(tmp_path),
+                          worker_profile="improve",
+                          on_ready=on_ready_calls.append)
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=_BACKSTOP_SEC + 2.0)
+
+    assert result.status == "failed"
+    assert on_ready_calls == [], (
+        "ready.ok=false なのに on_ready が呼ばれている — pre-ready 失敗が "
+        "post-ready 失敗として誤分類される")
+    assert received.get("frame") is None, (
+        f"ready.ok=false なのに go フレームが送られている: {received!r}")
+    assert any(pid == fake_proc.pid for pid, _sig in killpg_calls), (
+        "ready.ok=false のとき子が明示的に kill されていない")
+
+
+# ---------------------------------------------------------------------------
 # 裁定 R-D3 (プラン10 Task 9 再工事の追補): `run_context.source_snapshot_dir`
 # は「スナップショットの出所」を指すに留まる。`WorkerRunner.run()` は
 # workdir 作成直後にこの出所を `workdir/source` へ実体化

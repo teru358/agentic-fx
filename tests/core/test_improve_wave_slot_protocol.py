@@ -143,23 +143,36 @@ def test_m_zero_creates_no_wave_row(conn, monkeypatch):
 # Tests for 9.3: 3-way 起動プロトコル
 
 class _RecordingFakeWorkerRunner:
-    """WorkerRunner の代役 (裁定 R-D1)。公開 API は `run(mission)` のみ
-    (`on_ready` は本物と同じ公開属性)。`run()` 内部で「ready 受信 →
-    on_ready 呼び出し → (例外なく戻れば) そのまま mission 実行を継続」
-    という本物 `WorkerRunner.run()` の順序を模す — 新規プロトコルフレーム
-    (`go` 等) は追加しない (プラン 9.3 節「実装時改訂 R-D1」)。本物の
+    """WorkerRunner の代役 (裁定 R-D1、I1 是正で ok 検査順を本物に合わせて
+    改訂 — プラン10 束D round1、verified-codex-round1.md、2026-08-28)。
+    公開 API は `run(mission)` のみ (`on_ready` は本物と同じ公開属性)。
+    `run()` 内部で「ready 受信 → **`ok` 検査 (false なら on_ready を
+    呼ばず即 failed)** → on_ready 呼び出し → (例外なく戻れば) そのまま
+    mission 実行を継続」という本物 `WorkerRunner.run()` の順序を模す —
+    新規プロトコルフレーム (`go` 等) は追加しない (プラン 9.3 節
+    「実装時改訂 R-D1」)。`ready_ok=False` は「子が Mission を一度も
+    開始していない」(pre-ready 失敗) を表すため on_ready を呼ばない —
+    「on_ready 到達後 (running 到達後) に失敗する」ケースは
+    `body_status="failed"` (既定 `"completed"`) で表す。本物の
     ワイヤプロトコル (JSON フレーム・子プロセス) はここでは検証しない —
     骨格 Interfaces 節の `WorkerRunner(..., worker_profile="improve",
     run_context=ctx)` の構築タイミングと `on_ready` 完了後に実行が続く
     順序だけを外形的に確認する (実プロセスでの実測は
-    `tests/runners/test_worker_runner.py` の R-D1 統合テストが担う)。"""
+    `tests/runners/test_worker_runner.py` の R-D1/I1 統合テストが担う)。"""
 
-    def __init__(self, events: list, *, on_ready=None, ready_ok: bool = True):
+    def __init__(self, events: list, *, on_ready=None, ready_ok: bool = True,
+                body_status: str = "completed"):
         self._events = events
         self.on_ready = on_ready
         self._ready_ok = ready_ok
+        self._body_status = body_status
 
     def run(self, mission):
+        # I1: 本物と同じ順序 — `ok` 検査が on_ready より先。ok=False は
+        # on_ready を呼ばずに即 failed (pre-ready 失敗)。
+        if not self._ready_ok:
+            return _FakeMissionResult(
+                "failed", None, reason="child ready ok=false")
         ready_frame = {"type": "ready", "ok": self._ready_ok}
         if self.on_ready is not None:
             try:
@@ -169,11 +182,10 @@ class _RecordingFakeWorkerRunner:
                 # (呼び出し元へ伝播させない)。
                 return _FakeMissionResult(
                     "failed", None, reason=f"on_ready failed: {e}")
-        if not self._ready_ok:
-            return _FakeMissionResult("failed", None)
         self._after_on_ready()
         self._events.append("run")
-        return _FakeMissionResult("completed", {})
+        return _FakeMissionResult(
+            self._body_status, {} if self._body_status == "completed" else None)
 
     def _after_on_ready(self) -> None:
         """on_ready が例外なく戻った後、mission 実行を継続する直前のフック
@@ -299,6 +311,96 @@ def test_mission_body_not_continued_before_running_commit(conn):
     sup._launch_slot("2026-W34", 0)
 
 
+def test_mark_running_cas_failure_does_not_authorize_the_child(conn):
+    """C1 是正 (プラン10 束D round1、verified-codex-round1.md、
+    2026-08-28): `mark_running` の CAS が rowcount=0 (slot が既に
+    `claimed` でなくなっていた — 並行プロセスの起動時 reconcile 等) でも
+    `_on_ready` が無条件に `reached_running = True` としていたため、
+    親が `running` を durable commit できていないのに子の Mission 本体が
+    実行されていた (設計 §3.1③ authorization 順序の破れ)。fake runner が
+    `on_ready` 呼び出しの**直前**に slot を他経路で `failed` へ終端させ、
+    CAS を確実に失敗させる (probe_c1_i2_i3.py::probe_c1 と同形)。"""
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W34", now=now, expected=1, commit=True)
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+
+    events: list[str] = []
+
+    class _CasRacingRunner(_RecordingFakeWorkerRunner):
+        def run(self, mission):
+            # 親が mark_running を打つ直前に slot を他経路で終端したことに
+            # する (= CAS `AND status='claimed'` が当たらず rowcount=0)。
+            conn.execute(
+                "UPDATE improve_wave_slots SET status='failed' "
+                "WHERE wave_period_key='2026-W34' AND k=0")
+            conn.commit()
+            return super().run(mission)
+
+    fake_loop = _FakeImproveLoop(conn, _CasRacingRunner(events), mission_id=333)
+    sup._improve_loop = fake_loop
+    sup._launch_slot("2026-W34", 0)
+
+    # (a) on_ready の例外で fake runner が failed へ正規化し、mission 本体
+    # (events への "run" 追記) は一度も実行されない。
+    assert events == []
+    # (c) `_handle_pre_ready_failure` は CAS 失敗 (slot は既に 'failed'
+    # で 'claimed' ではない) を検出して retry しない — commit() は 1 回
+    # だけ呼ばれる (retry すると 2 回目の `prepare()`/`claim_slot` が
+    # 'failed' slot に対して失敗し、別の例外に化けていたはず)。
+    assert len(fake_loop.committed) == 1
+    assert fake_loop.committed[0][2].status == "failed"
+    row = conn.execute(
+        "SELECT status FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "failed"
+
+
+def test_handle_pre_ready_failure_revert_cas_failure_does_not_retry(conn):
+    """C1 是正の付随: `_handle_pre_ready_failure` 自身が
+    `revert_to_reserved`/`mark_slot_failed` の CAS 戻り値を消費すること
+    を単体で pin する (`acceptance-task10-r2.md:304` の記録 —
+    `_handle_pre_ready_failure:198-202` の bool 無視)。slot が既に
+    (他経路で) `failed` に終端済みのとき、`revert_to_reserved` の CAS
+    (`WHERE status='claimed'`) は当たらない — bool を無視すると
+    「reserved に戻した」と誤認して呼び出し元に retry (=再 claim) を
+    促してしまう。"""
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W34", now=now, expected=1, commit=True)
+    conn.execute(
+        "INSERT INTO missions (id, loop, runner, model, status, started_at) "
+        "VALUES (444, 'improve', 'local', 'm', 'running', ?)",
+        (now.isoformat(),))
+    assert improve_waves.claim_slot(
+        conn, period_key="2026-W34", k=0, mission_id=444, now=now, commit=True)
+    # spawn_attempts=1 (< _MAX_SPAWN_ATTEMPTS) の状態で、slot を他経路で
+    # 'failed' へ終端させる (revert_to_reserved の CAS を確実に外す)。
+    conn.execute(
+        "UPDATE improve_wave_slots SET status='failed' "
+        "WHERE wave_period_key='2026-W34' AND k=0")
+    conn.commit()
+
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(now), db_path=Path("x"),
+                             stop_event=threading.Event())
+    sup._conn_for_test = conn
+
+    should_retry = sup._handle_pre_ready_failure("2026-W34", 0)
+
+    assert should_retry is False, (
+        "revert_to_reserved の CAS が失敗しているのに retry を促している")
+    row = conn.execute(
+        "SELECT status FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert row["status"] == "failed", "CAS 失敗時に他経路の状態を上書きしない"
+
+
 def test_on_ready_exception_reverts_to_reserved_then_failed(conn, monkeypatch):
     """I2b 是正 (プラン10 束D round1、ユーザー裁定 D①、2026-08-28、逸脱
     申告): on_ready (= `_launch_slot` が組む mark_running クロージャ) が
@@ -387,8 +489,12 @@ def test_failure_after_running_does_not_retry_the_slot(conn):
 
     class _PreReadyThenPostReadyFailsRunner:
         """1 attempt 目: on_ready へ一度も到達せず failed (pre-ready 失敗)。
-        2 attempt 目: on_ready へ到達 (`ready_ok=False`) してから failed
-        (`_RecordingFakeWorkerRunner` と同じ規律 — on_ready を先に呼ぶ)。"""
+        2 attempt 目: on_ready へ到達 (`ready_ok=True`) して running へ
+        遷移した**後**に mission 本体が failed で終わる (I1 是正後の
+        `_RecordingFakeWorkerRunner` は `ready_ok=False` で on_ready を
+        呼ばなくなったため、post-ready 失敗は `body_status="failed"` で
+        表す — on_ready 自体は呼ばれ reached_running=True になる点が
+        pre-ready 失敗との違い)。"""
         on_ready = None
 
         def __init__(self):
@@ -400,7 +506,8 @@ def test_failure_after_running_does_not_retry_the_slot(conn):
                 return _FakeMissionResult(
                     "failed", None, reason="pre-ready failure")
             delegate = _RecordingFakeWorkerRunner(
-                events, on_ready=self.on_ready, ready_ok=False)
+                events, on_ready=self.on_ready, ready_ok=True,
+                body_status="failed")
             return delegate.run(mission)
 
     sup._improve_loop = _FakeImproveLoop(

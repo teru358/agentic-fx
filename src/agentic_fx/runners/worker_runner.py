@@ -348,6 +348,23 @@ class WorkerRunner(AgentRunner):
                 self._escalate_kill(proc, w)
                 return MissionResult("failed", None, transcript)
 
+            # I1 是正 (プラン10 束D round1、verified-codex-round1.md、
+            # 2026-08-28): `ok` の検査を `on_ready`/`go` より**前**へ移す。
+            # `ok=false` は子が Mission を一度も開始していないことの明示
+            # (mission_worker.py の bootstrap 失敗 — Landlock bind /
+            # registry 構築 / handshake 検証の失敗) — これは pre-ready
+            # 失敗そのものなので、`_on_ready` を呼んで
+            # `ImproveSupervisor` に running commit させてはならない
+            # (呼ぶと pre-ready 失敗が post-ready 失敗として誤分類され、
+            # 設計 §3.1⑥/§8.1-19 の spawn_attempts retry 分岐に到達しなく
+            # なる)。子を明示的に `_escalate_kill` する (旧来は `finally`
+            # の `_ensure_dead` に依存していたが、意図を明示する)。
+            if not ready.get("ok", False):
+                self._escalate_kill(proc, w)
+                return MissionResult(
+                    "failed", None, transcript,
+                    reason=f"child ready ok=false: {ready.get('error')}")
+
             if self._on_ready is not None:
                 try:
                     self._on_ready(ready)
@@ -384,9 +401,6 @@ class WorkerRunner(AgentRunner):
                             })
                 except (BrokenPipeError, OSError):
                     pass  # 子が既に死んでいる — 以降の done_queue 待ちが検知する
-
-            if not ready.get("ok", False):
-                return MissionResult("failed", None, transcript)
 
             deadline_budget = mission.timeout_sec + w.worker_grace_sec
             try:

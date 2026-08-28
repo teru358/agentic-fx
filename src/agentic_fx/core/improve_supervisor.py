@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from agentic_fx.activity import Category
 from agentic_fx.core.scheduler import latest_scheduled_occurrence, period_key_of
 from agentic_fx.store import db as db_mod
 from agentic_fx.store import improve_waves
@@ -180,16 +181,34 @@ class ImproveSupervisor:
             reached_running = False
 
             def _on_ready(frame: dict) -> None:
+                # C1 是正 (プラン10 束D round1、verified-codex-round1.md、
+                # 2026-08-28): `mark_running` の CAS 戻り値を消費する —
+                # 従来は無条件に `reached_running = True` としていたため、
+                # CAS が rowcount=0 (slot が既に `claimed` でなくなって
+                # いた) でも「親が running を commit した」ことにして子の
+                # 実行を承認していた (設計 §3.1③ の authorization 順序の
+                # 破れ)。in-process の再現経路は無いが (段0 D03/D09/D20 と
+                # 同じクラス、fail-open ガードの欠落)、修正コストが極小
+                # なので塞ぐ。CAS 失敗時は例外で fail closed する —
+                # `WorkerRunner` は `on_ready` の例外を子の `_escalate_kill`
+                # + `failed` 正規化として扱う
+                # (`test_on_ready_exception_reverts_to_reserved_then_failed`
+                # が既に踏んでいる経路)。
                 nonlocal reached_running
                 conn = self._conn()
                 owns = self._conn_for_test is None
                 try:
-                    improve_waves.mark_running(
+                    ok = improve_waves.mark_running(
                         conn, period_key=period_key, k=k,
                         now=self._clock.now(), commit=True)
                 finally:
                     if owns:
                         conn.close()
+                if not ok:
+                    raise RuntimeError(
+                        f"mark_running CAS failed for slot "
+                        f"({period_key!r},{k}) — slot is not 'claimed' any "
+                        "more; refusing to authorize the child")
                 reached_running = True
 
             mission, ctx, runner = self._improve_loop.prepare(
@@ -220,7 +239,19 @@ class ImproveSupervisor:
     def _handle_pre_ready_failure(self, period_key: str, k: int) -> bool:
         """戻り値: `True` = slot を `reserved` へ戻した (呼び出し元は
         再 claim/再 spawn すること)。`False` = 再試行上限に達し `failed`
-        へ収束した (呼び出し元は retry しない)。"""
+        へ収束した、または CAS 自体が失敗した (呼び出し元は retry しない)。
+
+        C1 是正 (プラン10 束D round1、verified-codex-round1.md、
+        2026-08-26 acceptance-task10-r2.md:304 の記録、2026-08-28):
+        `revert_to_reserved`/`mark_slot_failed` の CAS 戻り値を消費する —
+        従来は bool を無視していたため、CAS が rowcount=0 (slot が既に
+        `claimed`/非終端でなくなっていた — 並行プロセスの回収等) でも
+        呼び出し元は「意図どおり遷移した」ことにして retry/収束を続けて
+        いた。CAS 失敗は「この slot はもう自分のものではない」ことの
+        signal なので fail closed で `False` (retry しない) を返し、
+        activity へ記録する — 呼び出し元 `_launch_slot` の `commit(...,
+        slot_terminalize=False)` が mission/run だけを終端し、slot は
+        (誰か他が既に扱った状態の) ままにする。"""
         conn = self._conn()
         owns = self._conn_for_test is None
         try:
@@ -230,11 +261,29 @@ class ImproveSupervisor:
                 "WHERE wave_period_key=? AND k=?", (period_key, k)).fetchone()
             attempts = row["spawn_attempts"]
             if attempts < _MAX_SPAWN_ATTEMPTS:
-                improve_waves.revert_to_reserved(
+                ok = improve_waves.revert_to_reserved(
                     conn, period_key=period_key, k=k, now=now, commit=True)
+                if not ok:
+                    _log.warning(
+                        "revert_to_reserved CAS failed for slot "
+                        "(%s,%s) — slot no longer 'claimed', not retrying",
+                        period_key, k)
+                    if self._activity is not None:
+                        self._activity.write(
+                            Category.IMPROVE, "revert_to_reserved_cas_failed",
+                            f"period_key={period_key} k={k}")
+                    return False
                 return True
-            improve_waves.mark_slot_failed(
+            ok = improve_waves.mark_slot_failed(
                 conn, period_key=period_key, k=k, now=now, commit=True)
+            if not ok:
+                _log.warning(
+                    "mark_slot_failed CAS failed for slot (%s,%s) — slot "
+                    "already terminal or missing", period_key, k)
+                if self._activity is not None:
+                    self._activity.write(
+                        Category.IMPROVE, "mark_slot_failed_cas_failed",
+                        f"period_key={period_key} k={k}")
             return False
         finally:
             if owns:
