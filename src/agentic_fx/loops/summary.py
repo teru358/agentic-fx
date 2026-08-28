@@ -128,7 +128,13 @@ IMPROVE_OUTPUT_SCHEMA: dict = {
             "additionalProperties": False,
             "properties": {
                 "backlog_id": {"type": ["integer", "null"]},
-                "idea": {"type": "string"},
+                # C14 裁定 (2026-08-28、束D検収 verified-local-round1.md §7):
+                # 空文字は schema 層でも拒否する。空白のみ ("   ") は
+                # `minLength` では捕まえられない — コード層 (D18 是正、
+                # `_select_and_bind` の `.strip()` fail closed) が引き続き
+                # 担う。2 層の防御を意図的に重ねる (schema 層は明白な空、
+                # コード層は空白のみも含めた広い判定)。
+                "idea": {"type": "string", "minLength": 1},
             },
         },
         "artifact": {

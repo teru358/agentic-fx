@@ -141,6 +141,16 @@ def test_selected_missing_backlog_id_is_rejected():
         jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
 
 
+def test_selected_empty_idea_is_rejected_by_schema():
+    """C14 裁定 (2026-08-28、束D検収 verified-local-round1.md §7):
+    `selected.idea` に `minLength: 1` を足す — 空文字は schema 層でも
+    拒否する (2 層防御。空白のみはコード層 D18 是正が引き続き担う)。"""
+    out = _valid_plugin_output()
+    out["selected"]["idea"] = ""
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
 @pytest.mark.parametrize("field,value", [
     ("kind", "bogus"), ("self_test", "bogus")])
 def test_artifact_plugin_enum_fields_reject_out_of_enum(field, value):
