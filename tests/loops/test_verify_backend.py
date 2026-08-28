@@ -47,10 +47,23 @@ class _FakeVerifyWorkerRunner:
             # を返す。この fake も同じ契約を模す — 実在しない固定パスの
             # basename だけを "source" に揃える (verify_backend 側の
             # on_ready ゲートは basename のみを照合する、下記参照)。
-            self._on_ready({"type": "ready", "ok": True, "run_context": {
+            run_context = {
                 "mission_id": str(self._ctx.mission_id),
                 "staging_dir": str(self._ctx.staging_dir),
-                "source_snapshot_dir": str(Path("/fake-workdir") / "source")}})
+                "source_snapshot_dir": str(Path("/fake-workdir") / "source")}
+            # A17 是正 (束D検収, verified-local-round1.md §11 #6): 親ゲート
+            # (a) の否定側 (mismatch) を注入できる seam。`bad_ready` に
+            # フィールド名を渡すと、そのフィールドだけ壊れた値で echo する。
+            bad_field = behavior.get("bad_ready")
+            if bad_field == "mission_id":
+                run_context["mission_id"] = "not-the-mission-id"
+            elif bad_field == "staging_dir":
+                run_context["staging_dir"] = "/not/the/staging/dir"
+            elif bad_field == "source_snapshot_dir_basename":
+                run_context["source_snapshot_dir"] = str(
+                    Path("/fake-workdir") / "not-source")
+            self._on_ready({"type": "ready", "ok": True,
+                            "run_context": run_context})
         return behavior["result"](mission)
 
 
@@ -144,6 +157,27 @@ def test_verify_backend_fails_closed_on_nonce_mismatch(tmp_path, monkeypatch):
 
     assert result.ok is False
     assert result.fingerprint is None
+
+
+@pytest.mark.parametrize("bad_field", [
+    "mission_id", "staging_dir", "source_snapshot_dir_basename"])
+def test_verify_backend_fails_closed_on_ready_run_context_mismatch(
+        tmp_path, monkeypatch, bad_field):
+    """A17 是正 (束D検収, verified-local-round1.md §11 #6): 親ゲート (a)
+    (`on_ready` の run_context 照合 3 条件) は、`_FakeVerifyWorkerRunner`
+    が常に正しい frame を返していたため、どの否定側 (mismatch) も
+    スイート内で踏まれていなかった (`grep -rn "run context mismatch"
+    tests/` = 0 件)。3 値 parametrize で mismatch を注入し、
+    `verify_backend` 内の `on_ready` が RuntimeError を送出することを
+    要求する (verify_backend はこの例外を `ok=False` へ変換せず、呼び
+    出し元へそのまま伝播させる — フェイルクローズの一形態)。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    _BEHAVIOR["current"] = {"result": _echo_ok, "bad_ready": bad_field}
+
+    with pytest.raises(RuntimeError, match="run_context mismatch"):
+        verify_backend(tmp_path, _settings(), backend="local",
+                       provider=None, clock=FixedClock(NOW))
 
 
 def test_verify_backend_fails_closed_when_mission_never_completes(
