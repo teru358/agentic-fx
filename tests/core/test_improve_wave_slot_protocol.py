@@ -784,6 +784,81 @@ def test_pre_ready_failure_keeps_slot_reserved_through_real_commit(conn):
     assert [c[1] for c in fake_loop.committed] == [False, False]
 
 
+def test_pre_ready_failure_keeps_slot_reserved_through_real_wiring(tmp_path):
+    """ACC-B4 是正 (束D検収, `acceptance-round1.md` B-4 /
+    verified-local-round1.md §11 #5): 上のテストの `_RealCommitFakeImproveLoop
+    .commit` は `slot_key if slot_terminalize else None` を**自前で
+    再実装**しているため、実 `_finalize_failed_mission`/実 `ImproveLoop.
+    commit` を変異させても green のままだった (M-C 実測)。ここでは
+    seam を一切立てず、実 `ImproveLoop` (Tx-0/`_materialize_workspace`/
+    `commit`/`_finalize_failed_mission` すべて本物) を実 `ImproveSupervisor
+    ._launch_slot` に配線する。差し替えるのは `_build_worker_runner`
+    (実子プロセスを起こさず pre-ready 失敗を返す) だけ。"""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    from agentic_fx.store import improve_runs as improve_runs_store  # noqa: F401 (再エクスポート確認)
+
+    from tests.loops.conftest import SETTINGS, _FakeRag
+
+    db_path = tmp_path / "real_wiring.db"
+    bootstrap = db_mod.connect(db_path)
+    db_mod.init_db(bootstrap)
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(
+        bootstrap, period_key="2026-W34", now=now, expected=1, commit=True)
+    bootstrap.close()
+
+    from agentic_fx.activity import ActivityLog
+
+    loop = ImproveLoop(
+        root=tmp_path, settings=SETTINGS, clock=_FixedClock(now),
+        db_write_conn_factory=lambda: db_mod.connect(db_path),
+        db_readonly_conn_factory=lambda: db_mod.connect_readonly(db_path),
+        activity=ActivityLog(tmp_path / "activity.log"), rag=_FakeRag())
+
+    class _FakeMissionResultB4:
+        def __init__(self):
+            self.status = "failed"
+            self.output = None
+            self.reason = "pre-ready failure"
+
+    class _PreReadyFailsRunner:
+        on_ready = None
+
+        def run(self, mission):
+            return _FakeMissionResultB4()
+
+    def _fake_build_worker_runner(self, ctx, *, on_ready=None):
+        runner = _PreReadyFailsRunner()
+        runner.on_ready = on_ready  # 本物同様に受け取るが呼ばない (pre-ready 失敗)
+        return runner
+
+    loop._build_worker_runner = _fake_build_worker_runner.__get__(loop, ImproveLoop)
+
+    sup = ImproveSupervisor(capacity=1, root=tmp_path, settings=SETTINGS,
+                             clock=_FixedClock(now), db_path=db_path,
+                             stop_event=threading.Event())
+    sup._improve_loop = loop
+    # `_conn_for_test` は立てない (`sup._conn_for_test` は __init__ で
+    # None のまま) — 本番同様に毎回新規接続する経路を通す。
+
+    sup._launch_slot("2026-W34", 0)
+
+    check = db_mod.connect(db_path)
+    try:
+        slot = check.execute(
+            "SELECT status, spawn_attempts FROM improve_wave_slots "
+            "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+        assert slot["status"] == "failed"
+        assert slot["spawn_attempts"] == 2
+        missions = check.execute(
+            "SELECT id, status FROM missions ORDER BY id").fetchall()
+        assert len(missions) == 2, "2 attempt は別々の mission (実 prepare が 2 回)"
+        for m in missions:
+            assert m["status"] == "failed"
+    finally:
+        check.close()
+
+
 # Tests for 9.5: N-slot 構成・接続所有・shutdown/join
 
 def test_n4_concurrent_slots_no_connection_sharing_no_mixup(tmp_path):
