@@ -56,16 +56,25 @@ def test_risk_gate_report_is_flagged_unsupported_in_plan10(loop_and_ctx):
     assert verdict.risk_gate_unsupported is True
 
 
-def test_out_of_partition_selection_is_not_rejected_only_logged(loop_and_ctx):
+def test_out_of_partition_selection_is_not_rejected_only_logged(
+        loop_and_ctx, tmp_path):
     """ヒント集合外の selected.backlog_id は拒否しない — activity に
-    out_of_partition を記録して続行する (CAS が正)。"""
+    out_of_partition を記録して続行する (CAS が正)。
+
+    A36 裁定 (2026-08-28、束D検収 verified-local-round1.md §7):
+    `_InspectionVerdict.out_of_partition` field は撤去した (`commit()`
+    が一度も読まない dead field だったため)。実質の産物である activity
+    ログ 1 行が唯一の観測点になったので、これを直接 assert する
+    (L-B28 が指摘していた「唯一の産物が無 pin」も併せて解消)。"""
     loop, ctx, conn = loop_and_ctx  # ctx.allowed_backlog_ids = frozenset({1,2}) 前提の fixture
     output = {"artifact": {"type": "observation", "reason": "x"},
               "selected": {"backlog_id": 999, "idea": "x"},
               "discoveries": [], "selection_rationale": "x"}
     verdict = loop._inspect_output(output, ctx, conn=conn)
     assert verdict.ok is True
-    assert verdict.out_of_partition is True
+    activity_text = (tmp_path / "activity.log").read_text()
+    assert f"mission={ctx.mission_id} backlog_id=999" in activity_text
+    assert "out_of_partition" in activity_text
 
 
 def test_selected_backlog_id_must_exist_in_db(loop_and_ctx):

@@ -63,8 +63,13 @@ _PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 class _InspectionVerdict:  # 新規命名
     ok: bool
     reason: str = ""
-    out_of_partition: bool = False
     risk_gate_unsupported: bool = False
+    # A36 裁定 (2026-08-28、束D検収 verified-local-round1.md §7):
+    # `out_of_partition` field を撤去した — `commit()` はこの値を一度も
+    # 読まなかった (dead field、`grep -n "\.out_of_partition" src/` で
+    # `_inspect_output` 内の代入以外にヒット無し)。実質の産物は
+    # activity ログ 1 行 (`_inspect_output` 内、下記) のみで、それは
+    # 維持する。
 
 
 @dataclass(frozen=True)
@@ -616,7 +621,6 @@ class ImproveLoop:
                         conn=None) -> _InspectionVerdict:
         artifact = output.get("artifact", {})
         atype = artifact.get("type")
-        out_of_partition = False
         selected_id = output.get("selected", {}).get("backlog_id")
         if selected_id is not None:
             if conn is not None:
@@ -629,7 +633,9 @@ class ImproveLoop:
                                         "does not exist")
             if (ctx.allowed_backlog_ids is not None
                     and selected_id not in ctx.allowed_backlog_ids):
-                out_of_partition = True
+                # A36 裁定: out_of_partition の選択は拒否せず、activity
+                # ログ 1 行だけ残して続行する (CAS が正)。field としては
+                # 撤去済み — この activity 行が唯一の観測点。
                 self._activity.write(
                     Category.IMPROVE, "out_of_partition",
                     f"mission={ctx.mission_id} backlog_id={selected_id}")
@@ -639,17 +645,15 @@ class ImproveLoop:
             if not _PLUGIN_NAME_RE.match(name):
                 return _InspectionVerdict(
                     ok=False, reason=f"artifact.name {name!r} is not in "
-                                    "canonical form", out_of_partition=out_of_partition)
+                                    "canonical form")
             # staging_dir/<name> の dirfd+lstat 検査は 10.6 節 (plugin ゲート)
             # で実装する — ここでは name 正規形のみ (手順1の範囲)。
-            return _InspectionVerdict(ok=True, out_of_partition=out_of_partition)
+            return _InspectionVerdict(ok=True)
 
         if atype == "report" and artifact.get("proposal_kind") == "risk_gate":
-            return _InspectionVerdict(
-                ok=True, out_of_partition=out_of_partition,
-                risk_gate_unsupported=True)
+            return _InspectionVerdict(ok=True, risk_gate_unsupported=True)
 
-        return _InspectionVerdict(ok=True, out_of_partition=out_of_partition)
+        return _InspectionVerdict(ok=True)
 
     # precheck 2026-08-22 wave2: T10-B5 T10-M10 T10-M11
     def _select_and_bind(self, conn, output: dict, ctx: ImproveRunContext,
