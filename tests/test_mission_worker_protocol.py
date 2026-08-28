@@ -148,6 +148,78 @@ def test_rag_rpc_proxy_rejects_seq_gap():
         proxy.search_news("q")
 
 
+# A13/L-B42 是正 (束D検収, verified-local-round1.md §11 #7):
+# `_make_rpc_client` は `_RagRpcProxy._call` と「一字一句同じにする」
+# 契約 (docstring) だが、`grep -rn "_make_rpc_client" tests/` はスイート
+# 内で 0 件だった (protocol テスト 12 本は全て `_RagRpcProxy` を駆動)。
+# type/seq/rpc_id/ok の 4 本を `_make_rpc_client` 版へ複製する。
+
+def _rpc_client(monkeypatch, *, read_response):
+    """`_make_rpc_client` を組み立てる — `protocol_out` は実バイト列を
+    受け取る `io.BytesIO`、`read_frame` は `mission_worker.read_frame` を
+    monkeypatch して固定応答を返す (実 stdin を使わない)。"""
+    from agentic_fx.core.mission_protocol import SeqTracker
+
+    outbound = io.BytesIO()
+    out_seq = SeqTracker()
+    in_seq = SeqTracker()
+    monkeypatch.setattr(mission_worker, "read_frame", lambda stream: read_response)
+    call = mission_worker._make_rpc_client(outbound, out_seq, in_seq)
+    return call, outbound
+
+
+def test_make_rpc_client_run_backtest_round_trip(monkeypatch):
+    """tool_rpc → tool_rpc_result の同期往復 (`_RagRpcProxy` と同型)。"""
+    call, outbound = _rpc_client(monkeypatch, read_response={
+        "type": "tool_rpc_result", "seq": 1, "rpc_id": "1", "ok": True,
+        "result": {"trades": 30}})
+
+    result = call("run_backtest", {"plugin_ref": "p1"})
+
+    assert result == {"trades": 30}
+    outbound.seek(0)
+    sent = json.loads(outbound.getvalue().splitlines()[0])
+    assert sent["type"] == "tool_rpc"
+    assert sent["seq"] == 1
+    assert sent["name"] == "run_backtest"
+    assert sent["args"] == {"plugin_ref": "p1"}
+
+
+def test_make_rpc_client_propagates_error(monkeypatch):
+    call, _ = _rpc_client(monkeypatch, read_response={
+        "type": "tool_rpc_result", "seq": 1, "rpc_id": "1", "ok": False,
+        "error": "backtest failed"})
+    with pytest.raises(RuntimeError, match="backtest failed"):
+        call("run_backtest", {})
+
+
+def test_make_rpc_client_rejects_wrong_frame_type(monkeypatch):
+    """I2 対応と同型: 親→子方向 (tool_rpc_result) の type 検証。"""
+    from agentic_fx.core.mission_protocol import ProtocolError
+    call, _ = _rpc_client(monkeypatch, read_response={
+        "type": "event", "seq": 1, "rpc_id": "1", "ok": True, "result": {}})
+    with pytest.raises(ProtocolError, match="tool_rpc_result"):
+        call("run_backtest", {})
+
+
+def test_make_rpc_client_rejects_seq_gap(monkeypatch):
+    """I2 対応と同型: 親→子方向の seq 検証。"""
+    from agentic_fx.core.mission_protocol import ProtocolError
+    call, _ = _rpc_client(monkeypatch, read_response={
+        "type": "tool_rpc_result", "seq": 5, "rpc_id": "1", "ok": True,
+        "result": {}})
+    with pytest.raises(ProtocolError, match="seq"):
+        call("run_backtest", {})
+
+
+def test_make_rpc_client_rejects_rpc_id_mismatch(monkeypatch):
+    call, _ = _rpc_client(monkeypatch, read_response={
+        "type": "tool_rpc_result", "seq": 1, "rpc_id": "not-1", "ok": True,
+        "result": {}})
+    with pytest.raises(RuntimeError, match="rpc_id mismatch"):
+        call("run_backtest", {})
+
+
 def test_on_message_exits_process_on_serialize_failure(monkeypatch):
     """I6 対応: event フレームを送れなかったら `os._exit(1)` で即座に
     プロセスを終了する (`LocalRunner._sink` の fail-soft に頼って継続
