@@ -154,6 +154,35 @@ def test_publish_report_calls_rename_no_replace_not_bare_os_rename(
     assert final_path.exists()
 
 
+def test_publish_report_fallback_fails_closed_on_pre_existing_final_path(
+        tmp_path, loop_min, conn, mission_and_run_fixture, monkeypatch):
+    """A8 是正 (束D検収, verified-local-round1.md §11 #10): 非対応環境
+    フォールバック内の `if final_path.exists(): raise FileExistsError`
+    (`improve_loop.py:866-867`) に pin が無かった (実測 SURVIVED —
+    全スイート 2924 passed)。`_rename_no_replace` を `False` へ monkeypatch
+    (フォールバック経路を選ばせる) し、`final_path` を先に作ってから
+    `_publish_report` を呼ぶ — `report_state='failed'` になること、かつ
+    **final の中身が上書きされていない**ことを assert する。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    reports_dir = tmp_path / "reports"
+    (reports_dir / ".tmp").mkdir(parents=True)
+    part = loop_min._write_report_part(
+        reports_dir, mission_id=mission_id, body_md="new-content")
+    final_path = reports_dir / "improve-2026-08-22-{}.md".format(mission_id)
+    final_path.write_text("pre-existing-content")
+
+    monkeypatch.setattr(loop_min, "_rename_no_replace", lambda src, dst: False)
+    loop_min._publish_report(conn, run_id=run_id, part_path=part,
+                             final_path=final_path, now=datetime(2026, 8, 22))
+
+    row = conn.execute(
+        "SELECT report_state FROM improvement_runs WHERE id=?",
+        (run_id,)).fetchone()
+    assert row["report_state"] == "failed"
+    assert final_path.read_text() == "pre-existing-content", (
+        "衝突検出前に final が上書きされてはいけない")
+
+
 def test_reconcile_prepared_with_part_publishes(tmp_path, loop_min, conn, mission_and_run_fixture):
     """起動時 reconcile: `prepared` かつ `.part` あり → 今公開して `published`。"""
     mission_id, run_id, backlog_id = mission_and_run_fixture
