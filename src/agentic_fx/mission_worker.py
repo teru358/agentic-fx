@@ -580,38 +580,11 @@ def _run_improve_mission(
     return runner
 
 
-def _wait_for_go(in_seq: "SeqTracker", timeout_sec: float) -> bool:
-    """`ready` 送出後、`go` フレーム (RW1) を受信するまで待つ。
-    `worker_startup_timeout_sec` 内に届かなければ False を返す — 呼び出し
-    元 (`main()`) はこの場合 Mission もツールも実行せず、`result` フレーム
-    も送らずに終了する (`go` 前は副作用ゼロ、設計書 §1)。
-
-    `sys.stdin.buffer` の `readline()` はブロッキングであり、かつ
-    `BufferedReader` の内部先読みが `select()` の fd 監視をすり抜けうる
-    (`go` が届いた時点で既に内部バッファへ読み込まれている可能性がある)
-    ため、`select`/`signal.alarm` ではなく**別スレッド + `queue.Queue`**
-    でタイムアウトを実装する (`worker_runner.py` の `_wait_with_stop` と
-    同じ発想 — daemon thread がタイムアウト後もブロックし続けても、
-    プロセス終了時に道連れで消える、FC-1 と同型の許容)。"""
-    result_queue: "queue.Queue[dict | None]" = queue.Queue(maxsize=1)
-
-    def _reader() -> None:
-        try:
-            frame = read_frame(sys.stdin.buffer)
-        except ProtocolError:
-            frame = None
-        result_queue.put(frame)
-
-    threading.Thread(target=_reader, daemon=True,
-                     name="afx-mission-go-waiter").start()
-    try:
-        frame = result_queue.get(timeout=timeout_sec)
-    except queue.Empty:
-        return False  # worker_startup_timeout_sec 超過 — 副作用ゼロで終了
-    if frame is None or frame.get("type") != "go":
-        return False  # EOF (親が落ちた) / 不正フレーム — fail closed
-    in_seq.check(frame.get("seq"))
-    return True
+# M1 是正 (プラン10 束D round1、verified-codex-round1.md、2026-08-28):
+# `_wait_for_go` の完全重複定義 (`656a5dc` での再転写混入、`5723ad8` の
+# 初出が正) をここで削除した。使用点 (`main()`) は前方の定義 (裁定名
+# 「RW1」を明記した docstring の方) を束縛する。挙動・テストとも不変
+# (本文は完全同一、差分は docstring 1 行のみだった)。
 
 
 def main() -> None:
