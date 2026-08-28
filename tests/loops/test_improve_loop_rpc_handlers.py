@@ -199,3 +199,103 @@ def test_analyze_corr_handler_does_not_persist_before_tx2(
     after = conn.execute(
         "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
     assert after == before
+
+
+def test_run_backtest_handler_rejects_non_strategy_candidate(
+        loop_min, tmp_path, monkeypatch):
+    """C25 是正 (束D検収, verified-local-round1.md §11 #12):
+    `run_backtest_handler` の `if meta is None or meta.kind != "strategy":
+    raise ValueError(...)` を踏むテストが 0 件だった
+    (`grep -rn "requires a strategy" tests/` = 0 件)。全 fixture が
+    `_patch_strategy_lookup` (常に `kind="strategy"` の meta を返す) を
+    使うため未踏だった。ここでは `kind="indicator"` の meta を返す fixture
+    で `ValueError` (親 try/except の**外側**、fail closed) を要求する。"""
+    from types import SimpleNamespace
+
+    fake_meta = SimpleNamespace(
+        name="myst", kind="indicator", timeframe="1h",
+        content_hash="cand-hash", pairs=("USDJPY",))
+    monkeypatch.setattr(
+        "agentic_fx.plugin.loader._discover_one",
+        lambda path, name: fake_meta)
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    handlers = loop_min._build_rpc_handlers(ledger, staging_dir=staging_dir)
+
+    with pytest.raises(ValueError, match="requires a strategy"):
+        handlers["run_backtest"]({"name": "myst", "pair": "USDJPY"})
+
+
+def test_run_backtest_handler_returns_error_dict_and_closes_conn_on_failure(
+        loop_min, tmp_path, monkeypatch):
+    """L-B27 是正 (束D検収, verified-local-round1.md §11 #8):
+    `{"error": "backtest_failed"}` を**返すこと**を assert するテストが
+    0 件だった (既存の grep ヒットは全て「error が出ていないこと」の
+    否定 assert)。`holdout.run_in_sample` を例外送出に monkeypatch し、
+    戻り値と `intent_source.close()`/`conn.close()` (spy) を assert する。"""
+    _patch_strategy_lookup(monkeypatch)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated backtest failure")
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample", _boom)
+
+    closed = {"intent_source": False, "conn": False}
+    real_readonly_factory = loop_min._db_readonly_conn_factory
+
+    class _ConnSpy:
+        def __init__(self, real_conn):
+            self._real = real_conn
+
+        def close(self):
+            closed["conn"] = True
+            self._real.close()
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(
+        loop_min, "_db_readonly_conn_factory",
+        lambda: _ConnSpy(real_readonly_factory()))
+
+    class _IntentSourceSpy:
+        def close(self):
+            closed["intent_source"] = True
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_adapter.build_intent_source",
+        lambda meta, **kw: _IntentSourceSpy())
+
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    handlers = loop_min._build_rpc_handlers(ledger, staging_dir=staging_dir)
+
+    result = handlers["run_backtest"]({"name": "myst", "pair": "USDJPY"})
+
+    assert result == {"error": "backtest_failed"}
+    assert closed["intent_source"] is True
+    assert closed["conn"] is True
+
+
+def test_analyze_corr_handler_returns_error_dict_on_failure(
+        loop_min, tmp_path, monkeypatch):
+    """L-B27 是正 (束D検収, verified-local-round1.md §11 #8):
+    `analyze_corr_handler` の `{"error": "analyze_failed"}` を**返すこと**
+    を assert するテストが 0 件だった。`analyze_for_agent` を例外送出に
+    monkeypatch する。"""
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated analyze failure")
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.analyze_for_agent", _boom, raising=False)
+    monkeypatch.setattr(
+        "agentic_fx.backtest.analysis.analyze_for_agent", _boom)
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0})
+    handlers = loop_min._build_rpc_handlers(ledger, staging_dir=tmp_path)
+
+    result = handlers["analyze_corr"]({"kind": "corr_matrix", "timeframe": "1h"})
+
+    assert result == {"error": "analyze_failed"}
