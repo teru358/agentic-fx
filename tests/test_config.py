@@ -438,7 +438,10 @@ def test_settings_yaml_example_has_schedule_improve_at():
 # round2 #3 是正 (2026-08-29、verified-round2.md #3): `schedule.improve_at`
 # に形式検証が無いと ImproveSupervisor.tick が毎tick ValueError を投げ、
 # scheduler_thread の except Exception: が飲んで改善ループが恒久沈黙する。
-@pytest.mark.parametrize("value", ["Saturday 03:00", "03:00"])
+# 裁定E (round2 最終是正、2026-08-29): `config._check_improve_at` は
+# `fullmatch` で末尾改行付き入力を拒否する (M1 是正) が、その規約自体は
+# 未 pin だった。"Sat 03:00\n" は `.match()` なら通ってしまう値。
+@pytest.mark.parametrize("value", ["Saturday 03:00", "03:00", "Sat 03:00\n"])
 def test_improve_at_is_validated_against_cadence_weekly(tmp_path, value):
     import yaml
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))

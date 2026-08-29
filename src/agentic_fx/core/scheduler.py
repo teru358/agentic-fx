@@ -1080,7 +1080,7 @@ def latest_scheduled_occurrence(
     tz = ZoneInfo(display_timezone)
     now_local = now.astimezone(tz)
     if cadence == "daily":
-        m = _DAILY_AT_RE.match(at)
+        m = _DAILY_AT_RE.fullmatch(at)
         if not m:
             raise ValueError(f"invalid 'at' format for daily cadence: {at!r}")
         hh, mm = int(m.group(1)), int(m.group(2))
@@ -1090,7 +1090,7 @@ def latest_scheduled_occurrence(
             candidate = candidate - timedelta(days=1)
         return candidate
     if cadence == "weekly":
-        m = _WEEKLY_AT_RE.match(at)
+        m = _WEEKLY_AT_RE.fullmatch(at)
         if not m:
             raise ValueError(f"invalid 'at' format for weekly cadence: {at!r}")
         weekday = _WEEKDAY_NAMES[m.group(1)]

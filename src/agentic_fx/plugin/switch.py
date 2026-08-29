@@ -293,8 +293,8 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
 # ============================================================
 
 _CANDIDATE_PATH_RE = {
-    "staging": re.compile(r"^plugins/_staging/(\d+)/([a-z][a-z0-9_]{0,63})$"),
-    "human": re.compile(r"^plugins/_human/([a-z][a-z0-9_]{0,63})$"),
+    "staging": re.compile(r"^plugins/_staging/(\d+)/(?P<name>[a-z][a-z0-9_]{0,63})$"),
+    "human": re.compile(r"^plugins/_human/(?P<name>[a-z][a-z0-9_]{0,63})$"),
 }
 
 
@@ -317,8 +317,13 @@ def resolve_candidate_dir(plugins_root: Path, *, candidate_origin: str,
     # (`m.group(...) != name`) で fail closed する — この関数は「後段は
     # fail closed」の実例。fullmatch にしても意味論は変わらず、コード層
     # 全体で規約を揃える)。
+    # round2 最終是正 裁定D (2026-08-29): `m.group(m.lastindex)` は
+    # 「最後にマッチしたグループが name」という前提に依存し、将来
+    # オプショナルなグループが増えると lastindex がずれる脆さがある。
+    # 名前付きグループ (`?P<name>`) + `m.group("name")` に置き換え、
+    # 挙動は不変のまま前提を明示する。
     m = pattern.fullmatch(candidate_path)
-    if m is None or m.group(m.lastindex) != name:
+    if m is None or m.group("name") != name:
         raise ValueError(
             f"candidate_path {candidate_path!r} does not match the "
             f"canonical form for candidate_origin={candidate_origin!r} "

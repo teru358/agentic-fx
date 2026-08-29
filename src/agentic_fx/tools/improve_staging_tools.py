@@ -31,8 +31,6 @@ def _safe_join(root: Path, name: str, rel: str | None = None) -> Path | None:
         resolved = candidate.resolve()
     except (OSError, RuntimeError):
         return None
-    if resolved_root not in resolved.parents and resolved != resolved_root:
-        return None
     if resolved_root not in (resolved, *resolved.parents):
         return None
     return candidate
