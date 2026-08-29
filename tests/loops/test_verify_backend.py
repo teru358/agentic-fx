@@ -120,6 +120,11 @@ def test_verify_backend_constructs_worker_runner_with_run_context_and_rejecting_
         ctx.rpc_handlers["run_backtest"]({})
     with pytest.raises(RuntimeError):
         ctx.rpc_handlers["analyze_corr"]({})
+    # F-V6 是正 (段0 F 診断4): 検証入口は「実在しない mission id」を使う
+    # 規約 (実 improve の mission id (>=1、autoincrement) と名前空間が
+    # 衝突しないため -1 固定)。`mission_id = -1` → `1` の変異はこれまで
+    # 未検出だった (`mission_id` の値そのものを見る assert が無かった)。
+    assert ctx.mission_id == -1
 
 
 def test_verify_backend_does_not_touch_wave_or_backlog_or_run_tables(
@@ -215,6 +220,76 @@ def test_verify_backend_fails_closed_when_status_is_not_completed_but_output_is_
     assert result.ok is False
     assert result.fingerprint is None
     assert f"status={status}" in result.detail
+
+
+def test_verify_backend_mission_is_a_one_shot_toolless_strict_probe(
+        tmp_path, monkeypatch):
+    """F-V4/F-V5/F-V8 是正 (段0「観測点不在」): `_FakeVerifyWorkerRunner`
+    は `mission` を nonce 読み出し以外に一切使わないため、
+    `max_turns`/`tools`/`output_schema["additionalProperties"]` を変えても
+    どの振る舞い assert にも到達しない (モックがこれらの次元を丸ごと
+    捨てている — メモリ §6.12)。Mission 本体を捕獲し、組で完全一致を取る
+    (メモリ §6.10)。"""
+    captured: dict[str, Mission] = {}
+
+    class _Capture(_FakeVerifyWorkerRunner):
+        def run(self, mission: Mission) -> MissionResult:
+            captured["m"] = mission
+            return super().run(mission)
+
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner", _Capture)
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+
+    verify_backend(tmp_path, _settings(), backend="local", provider=None,
+                   clock=FixedClock(NOW))
+
+    m = captured["m"]
+    assert (m.max_turns, m.tools, m.output_schema["additionalProperties"],
+            m.output_schema["required"]) == (1, [], False, ["echo"])
+
+
+def test_verify_backend_fails_closed_when_handshake_never_reaches_ready(
+        tmp_path, monkeypatch):
+    """F-V7 是正 (段0「観測点不在」): 親ゲート (a) の**存在**判定
+    (`if not ready_frames:`) は、`_FakeVerifyWorkerRunner` が
+    (`skip_ready` を指定しない限り) 常に正しい ready frame を送るため、
+    どの既存テストからも否定側 (ready を一度も受けない) が踏まれていな
+    かった (`grep -rn "skip_ready" tests/` = 定義 1 件のみ、消費側は本
+    テストが初)。`if not ready_frames:` → `if False:` の変異はこの分岐
+    そのものを消すため、ready を一度も受けなくても後続 (nonce 一致) だけ
+    で `ok=True` になってしまう。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    _BEHAVIOR["current"] = {"result": _echo_ok, "skip_ready": True}
+
+    result = verify_backend(tmp_path, _settings(), backend="local",
+                           provider=None, clock=FixedClock(NOW))
+
+    assert result.ok is False
+    assert result.fingerprint is None
+    assert "handshake failed" in result.detail
+
+
+def test_verify_backend_fingerprint_changes_across_runs_with_identical_config(
+        tmp_path, monkeypatch):
+    """F-V3 是正 (段0 診断4): fingerprint 原像から `:{nonce}` を落とす変異
+    は既存 pin (`len(result.fingerprint) == 64` のみ) では検出できない
+    (メモリ §6.8「部分一致 assert」)。同一 backend/provider/model の
+    2 回の検証で fingerprint が異なることを見て、「fingerprint は構成では
+    なくこの実行の往復を表す」契約そのものを固定する (nonce を落とす変異
+    の下では、他の全条件が同一なら 2 回とも同じ fingerprint になる)。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+    settings = _settings()
+
+    result1 = verify_backend(tmp_path, settings, backend="local",
+                             provider=None, clock=FixedClock(NOW))
+    result2 = verify_backend(tmp_path, settings, backend="local",
+                             provider=None, clock=FixedClock(NOW))
+
+    assert result1.ok is True and result2.ok is True
+    assert result1.fingerprint != result2.fingerprint
 
 
 def test_verify_backend_fails_closed_when_mission_never_completes(

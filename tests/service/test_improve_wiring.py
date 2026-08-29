@@ -196,7 +196,14 @@ def test_build_app_reconciles_report_outbox_at_startup(tmp_path):
 def test_build_app_startup_survives_report_outbox_reconcile_failure(tmp_path):
     """F-1 是正: `reconcile_report_outbox` が例外を出しても build_app は
     完走する (§5.3 と同じ規約 — 改善レーンの report 整合だけが成立せず
-    取引は動く)。"""
+    取引は動く)。
+
+    F-S11 是正 (段0 診断4): 旧 assert は `app is not None` しか見ておらず、
+    `service.py:997` の except 節 (`activity.write(Category.IMPROVE,
+    "improve_report_reconcile_failed", ...)` → `pass`) を落とす変異が
+    生存していた — 「起動時に reconcile が黙って失敗する」ことそのものは
+    通っても、失敗が記録されたか (診断の帰属) を見ていなかった
+    (メモリ §6.13 と同型)。`app.activity.tail` で記録を確認する。"""
     from agentic_fx.loops.improve_loop import ImproveLoop
 
     _init(tmp_path)
@@ -204,4 +211,8 @@ def test_build_app_startup_survives_report_outbox_reconcile_failure(tmp_path):
                       side_effect=RuntimeError("db locked")):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
     assert app is not None
+    tail = app.activity.tail(50)
+    assert any("improve_report_reconcile_failed" in line for line in tail), (
+        "reconcile 失敗が activity へ記録されていない (F-S11 の穴): "
+        f"{tail!r}")
     app.close()

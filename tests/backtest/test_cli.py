@@ -946,6 +946,31 @@ def test_cli_improve_verify_backend_routes_to_verify_backend(tmp_path, monkeypat
     assert vb.call_args.kwargs["provider"] is None
 
 
+def test_cli_improve_verify_backend_routes_provider_through_to_verify_backend(
+        tmp_path, monkeypatch):
+    """F-C3 是正 (段0 診断4): 上の routing テストは `--backend local`
+    (provider 未指定) の 1 ケースしか流していなかったため、
+    `provider=args.provider` → `provider=None` の変異 (`--provider` を
+    黙って無視する) に対して既存 assert (`kwargs["provider"] is None`)
+    が恒真になっていた (メモリ §6.5)。`--provider llama_swap` を渡す
+    ケースを足し、`verify_backend` へ実際に届くことを見る。"""
+    from unittest.mock import patch
+    from agentic_fx.entry import main as entry_main
+    from agentic_fx.loops.verify_backend import VerifyBackendResult
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.loops.verify_backend.verify_backend") as vb:
+        vb.return_value = VerifyBackendResult(
+            ok=True, backend="codex", provider="llama_swap",
+            fingerprint="0" * 64, detail="ok")
+        rc = entry_main(["improve", "verify-backend", "--backend", "codex",
+                        "--provider", "llama_swap"])
+    assert rc == 0
+    assert vb.call_args.kwargs["backend"] == "codex"
+    assert vb.call_args.kwargs["provider"] == "llama_swap"
+
+
 def test_cli_improve_verify_backend_returns_1_when_verification_fails(
         tmp_path, monkeypatch, capsys):
     """F-C1 是正 (段0 致命2、最重要): `if not result.ok: ... return 1` の
@@ -968,3 +993,19 @@ def test_cli_improve_verify_backend_returns_1_when_verification_fails(
         rc = entry_main(["improve", "verify-backend", "--backend", "local"])
     assert rc == 1
     assert "mission did not complete: status=failed" in capsys.readouterr().err
+
+
+def test_cli_improve_verify_backend_requires_backend_argument(
+        tmp_path, monkeypatch, capsys):
+    """F-C2 是正 (段0 診断4): `--backend` の `required=True` → `False` の
+    変異は、既存テストが `--backend` を常に渡していたため生存していた。
+    `--backend` を省略すると argparse が rc=2 で拒否することを固定する
+    (省略時に `backend=None` が `verify_backend` へ渡り、Literal 契約
+    違反が `build_launcher_argv` まで落ちてから初めて死ぬ退行を防ぐ)。"""
+    from agentic_fx.entry import main as entry_main
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        entry_main(["improve", "verify-backend"])
+    assert exc.value.code == 2
+    assert "--backend" in capsys.readouterr().err
