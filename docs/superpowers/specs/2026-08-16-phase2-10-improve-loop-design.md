@@ -546,7 +546,31 @@ git update-ref <ref> <new> <old>        # CAS。unborn は <old> = 空文字。�
 
 **変異 (§6 — ツール契約テストとして)**: 予算カウンタを落とす (→ 21 回目の検索が通る) / 429 で再試行する (→ fake サーバで 2 回目のリクエストが飛ぶ) / UA を空にする / `--disable plugins` を落とす (§1 の pin と共有)。**これらは安全保証の検証ではない**。
 
----
+### 6.1 改善ループの DB 読み予算 (内向き、裁定注記 2026-08-29)
+
+**裁定 (プラン10 2周目是正 #9、ユーザー裁定 2026-08-29、選択肢ⓐ採用)**: 上記
+§6 は **外向き**リクエスト (`web_search`/`fetch_article`) の advisory 予算
+であり、`analyze_for_agent` (`corr_matrix`/`rolling_corr_summary`/
+`lead_lag`) が行う DB 読み (`ohlcv_history`/`ohlcv_cache` からの内向き・
+自傷性の読み取り) はこの節の対象外だった (§10 起票リストにも
+`plugin max_bars × cache 保持期間` のみで analyze の読み窓は存在しない)。
+`[[outbound-request-budget-is-a-design-constraint]]` の論点 (公開リポジトリ
+で他人に損害を与える) はここには当たらない — 自機の DB 走査であり、害は
+改善ループ自身の遅延と I/O であって外部への損害ではない。
+
+`_REQUEST_SCHEMA` (agent が指定できるキー集合) は**変更しない** — agent が
+読み窓を広げる手段を新設しない。代わりに `analyze_for_agent` の実装内部で
+`since` を強制する: **`in_sample_until` (= `holdout.in_sample_until(now,
+...)`、決定論的 now から導出済みの境界) から遡って既定 90 日**
+(`since = in_sample_until - timedelta(days=90)`) を全 3 関数
+(`corr_matrix`/`rolling_corr_summary`/`lead_lag`) の `_load_returns`
+呼び出しへ一律に渡す。壁時計 (`datetime.now()`) を直読みしない現行流儀
+(§4 の Clock 注入規約) を踏襲し、`now` (呼び出し元が渡す決定論的な現在時刻)
+から導出した `in_sample_until` を起点に窓を計算する。
+
+**変異 (§6.1 追加)**: `since` の算出を削除する / 窓幅を 0 または負にする →
+`in_sample_until` 直前の窓しか読めなくなり `insufficient_data` に固定される
+ことをテストで確認する (= 窓が実際に効いていることの pin)。
 
 ## 7. 受入条件
 

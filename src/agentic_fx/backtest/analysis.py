@@ -96,8 +96,11 @@ def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
 
     ``since`` (Task 11 上書き節 E の最小追加): 指定時は
     ``load_resampled_frame`` の ``since`` (= since 以降に開始する完成
-    バケットのみ) として渡す。既定 None は従来どおり全履歴 (改善ループ
-    ``analyze_for_agent`` は since を渡さない — 挙動不変)。
+    バケットのみ) として渡す。既定 None は全履歴 (人間 CLI の低レベル API
+    呼び出し用)。**round2 #9 是正 (設計書 §6.1 裁定注記、2026-08-29):
+    改善ループ ``analyze_for_agent`` は内部で ``in_sample_until`` から
+    遡る既定 90 日窓 (`_DB_READ_WINDOW_DAYS`) を計算し、この `since` へ
+    渡す** (agent が広げられる手段は無い — `_REQUEST_SCHEMA` は変更しない)。
 
     F1 (Fix Round 1, codex Important-1 = sonnet Minor-2): ohlcv.close に
     正値制約は無く (REAL NOT NULL のみ)、close<=0 のバーが混入すると
@@ -216,14 +219,15 @@ def corr_matrix(conn: sqlite3.Connection, symbols: list[str], *,
 def _rolling_corr_summary_impl(conn: sqlite3.Connection, a: str, b: str, *,
                                timeframe: str, window: int, source: str,
                                in_sample_until: datetime,
+                               since: datetime | None = None,
                                ) -> tuple[dict[str, float], int]:
     _validate_timeframe(timeframe)
     if window not in WINDOWS:
         raise ValueError("window is not one of the enumerated values")
     ret_a = _load_returns(conn, a, timeframe, source=source,
-                          in_sample_until=in_sample_until)
+                          in_sample_until=in_sample_until, since=since)
     ret_b = _load_returns(conn, b, timeframe, source=source,
-                          in_sample_until=in_sample_until)
+                          in_sample_until=in_sample_until, since=since)
     xs, ys = _align_same_time(ret_a, ret_b)
     if len(xs) < MIN_COMMON_OBS:
         raise ValueError("insufficient aligned observations for correlation")
@@ -243,25 +247,31 @@ def _rolling_corr_summary_impl(conn: sqlite3.Connection, a: str, b: str, *,
 
 def rolling_corr_summary(conn: sqlite3.Connection, a: str, b: str, *,
                          timeframe: str, window: int, source: str,
-                         in_sample_until: datetime) -> dict[str, float]:
+                         in_sample_until: datetime,
+                         since: datetime | None = None) -> dict[str, float]:
     """整列済み観測対列上の連続 window 対のスライド窓ごとに pearson を計算し、
     その系列の固定 4 統計のみを返す (``{mean, std, min, max}`` — 窓系列・
-    件数・日時は返さない — §6 出力契約)。"""
+    件数・日時は返さない — §6 出力契約)。
+
+    ``since`` (裁定注記 §6.1、round2 #9): 指定時は ``since <= bar_time`` に
+    限定する (人間 CLI 用・既定 None = 従来どおり全履歴。
+    ``analyze_for_agent`` はここに内部窓を強制する)。"""
     result, _ = _rolling_corr_summary_impl(
         conn, a, b, timeframe=timeframe, window=window, source=source,
-        in_sample_until=in_sample_until)
+        in_sample_until=in_sample_until, since=since)
     return result
 
 
 def _lead_lag_impl(conn: sqlite3.Connection, a: str, b: str, *,
                    timeframe: str, source: str, in_sample_until: datetime,
+                   since: datetime | None = None,
                    ) -> tuple[dict[str, float], int]:
     _validate_timeframe(timeframe)
     width = _TF_MINUTES[timeframe]
     ret_a = _load_returns(conn, a, timeframe, source=source,
-                          in_sample_until=in_sample_until)
+                          in_sample_until=in_sample_until, since=since)
     ret_b = _load_returns(conn, b, timeframe, source=source,
-                          in_sample_until=in_sample_until)
+                          in_sample_until=in_sample_until, since=since)
     corrs: dict[int, float] = {}
     for k in LAGS:
         xs, ys = _align_lagged(ret_a, ret_b, lag_bars=k, width_minutes=width)
@@ -272,15 +282,20 @@ def _lead_lag_impl(conn: sqlite3.Connection, a: str, b: str, *,
 
 
 def lead_lag(conn: sqlite3.Connection, a: str, b: str, *, timeframe: str,
-            source: str, in_sample_until: datetime) -> dict[str, float]:
+            source: str, in_sample_until: datetime,
+            since: datetime | None = None) -> dict[str, float]:
     """各 ``k ∈ LAGS`` について ``pearson(a_ret[t + k*width], b_ret[t])`` を
     計算し、符号付き最大の ``k`` (peak_lag) とその相関 (peak_corr) を返す。
 
     正の ``peak_lag`` = b が a に先行する (b の動きが a より早い) ことを
     意味する。返り値は ``{peak_lag, peak_corr}`` のみ。
+
+    ``since`` (裁定注記 §6.1、round2 #9): 指定時は ``since <= bar_time`` に
+    限定する (人間 CLI 用・既定 None = 従来どおり全履歴。
+    ``analyze_for_agent`` はここに内部窓を強制する)。
     """
     result, _ = _lead_lag_impl(conn, a, b, timeframe=timeframe, source=source,
-                               in_sample_until=in_sample_until)
+                               in_sample_until=in_sample_until, since=since)
     return result
 
 
@@ -369,6 +384,15 @@ _REQUEST_SCHEMA = {
     "lead_lag": {"kind", "a", "b", "timeframe"},
 }
 
+# 裁定 A / round2 #9 是正 (2026-08-29、設計書 §6.1 裁定注記): 改善ループの
+# DB 読みに窓が無く、`_load_returns` が `max_bars` 無しで全履歴を読んでいた
+# (改善ループ自身の遅延と I/O の自傷。外部への損害ではないため §6 の
+# 外向きリクエスト予算とは別枠)。`_REQUEST_SCHEMA` は変更せず (agent は窓を
+# 広げられない)、`analyze_for_agent` の実装内部で in_sample_until から
+# 遡る既定 90 日窓を強制する (壁時計直読み禁止の現行流儀どおり、決定論的
+# `now` から導出した `in_sample_until` を起点にする)。
+_DB_READ_WINDOW_DAYS = 90
+
 
 def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
                       request: dict, *, now: datetime, persist: bool = True) -> dict:
@@ -376,7 +400,11 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
 
     ``in_sample_until = holdout.in_sample_until(now, settings.backtest.
     holdout_months)`` (F1, 最終レビュー opus I-1 — UTC 正規化 + 分格子切り
-    捨て込みの境界算術の単一所有者) を内部で適用する。symbols は
+    捨て込みの境界算術の単一所有者) を内部で適用する。**round2 #9 是正
+    (設計書 §6.1 裁定注記): ``in_sample_until`` から遡る既定 90 日の DB 読み
+    窓 (`since`) も内部で強制する** (agent 側から広げる手段は無い — 内向き・
+    自傷性の DB 読みに予算が無かったことの是正、外向きリクエスト予算
+    (§6 本体) とは別枠)。symbols は
     ``settings.pairs + settings.datafeed.
     watch_symbols`` 内に限定 (重複除去・順序維持)。実行毎に
     ``analysis_runs.save`` し、返り値に ``analysis_run_id`` を含める
@@ -436,12 +464,16 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
     # 同じ経路で境界を得ることで、同じ now に対する境界のずれを無くす)。
     in_sample_until = _in_sample_until(now_utc,
                                        settings.backtest.holdout_months)
+    # 裁定A / round2 #9 是正 (§6.1): 決定論的な in_sample_until から遡る
+    # 既定 90 日窓を内部で強制する。`_REQUEST_SCHEMA` にキーは無いので
+    # agent 側からこの窓を広げる手段は無い。
+    since = in_sample_until - timedelta(days=_DB_READ_WINDOW_DAYS)
 
     try:
         if kind == "corr_matrix":
             result, trial_count = _corr_matrix_impl(
                 conn, candidates, timeframe=timeframe, source=ANALYSIS_SOURCE,
-                in_sample_until=in_sample_until)
+                in_sample_until=in_sample_until, since=since)
             if trial_count == 0:
                 # 候補が 2 未満、またはペアが計算できなかった —
                 # 計算対象そのものが無いので insufficient_data 扱い。
@@ -451,12 +483,13 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
         elif kind == "rolling_corr_summary":
             result, trial_count = _rolling_corr_summary_impl(
                 conn, a, b, timeframe=timeframe, window=window,
-                source=ANALYSIS_SOURCE, in_sample_until=in_sample_until)
+                source=ANALYSIS_SOURCE, in_sample_until=in_sample_until,
+                since=since)
             payload_body = dict(result)
         else:  # lead_lag
             result, trial_count = _lead_lag_impl(
                 conn, a, b, timeframe=timeframe, source=ANALYSIS_SOURCE,
-                in_sample_until=in_sample_until)
+                in_sample_until=in_sample_until, since=since)
             payload_body = dict(result)
     except (ValueError, ArithmeticError):
         # データ不足 (相関計算に必要な共通観測が閾値未満) は in-sample 境界

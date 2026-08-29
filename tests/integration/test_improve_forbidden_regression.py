@@ -37,7 +37,12 @@ from agentic_fx.store import ohlcv
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.tools.improve_rpc_tools import build_improve_rpc_tooldefs
 
-_RW7_BEFORE_BOUNDARY = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+# round2 #9 是正 (2026-08-29、設計書 §6.1 裁定注記): analyze_for_agent は
+# 内部で in_sample_until (≈2026-05-22) から遡る既定90日窓 (since≈
+# 2026-02-21) を強制するようになった。旧 2026-01-01 はこの窓の外側
+# だったため、窓の内側かつ boundary より確実に前の日付へ更新する
+# (200本の1hバー=約8.3日分なので boundary は跨がない)。
+_RW7_BEFORE_BOUNDARY = datetime(2026, 3, 15, 12, 0, tzinfo=timezone.utc)
 
 
 def _rw7_sine(n, *, phase=0):

@@ -12,6 +12,13 @@ brief (task-10-brief.md Step 1) のテストを、上書き節 A (コントロ�
   holdout boundary (2026-05-01, holdout_months=3) より後なので、
   analyze_for_agent の成功系テスト (no_leak / records_trials) では
   boundary より確実に前の start で明示的にシードする。
+- round2 #9 是正 (2026-08-29、設計書 §6.1 裁定注記): `analyze_for_agent` は
+  内部で `in_sample_until` (≈2026-05-01) から遡る既定 90 日窓 (`since`≈
+  2026-01-31) を強制するようになった。旧 `BEFORE_BOUNDARY`
+  (2026-01-01 12:00) はこの窓のわずかに外側 (=insufficient_data になる)
+  だったため、窓の内側かつ boundary より確実に前の日付へ更新する
+  (`_seed_two_series` は既定 200 本の 1h バー = 約 8.3 日分なので、
+  start をこの日付にしても boundary を跨がない)。
 """
 from __future__ import annotations
 
@@ -34,7 +41,7 @@ from tests.backtest.factories import H, SETTINGS, _conn
 
 FAR_FUTURE = datetime(2030, 1, 1, tzinfo=timezone.utc)
 NOW = datetime(2026, 8, 1, tzinfo=timezone.utc)
-BEFORE_BOUNDARY = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+BEFORE_BOUNDARY = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
 
 
 def _settings_watch_eurusd():
@@ -475,6 +482,39 @@ def test_analyze_for_agent_error_response_has_no_extra_keys(tmp_path):
     conn = _conn(tmp_path)
     out = analyze_for_agent(conn, SETTINGS, {"kind": "bogus"}, now=NOW)
     assert set(out.keys()) == {"error"}
+
+
+# 裁定A / round2 #9 是正 (2026-08-29、設計書 §6.1 裁定注記): analyze_for_agent
+# は内部で in_sample_until から遡る既定90日窓 (`since`) を強制する。
+# `_REQUEST_SCHEMA` は変更していない (agent 側から窓を外す手段は無い) の
+# で、窓の外側にしかデータが無い候補は insufficient_data になることを
+# 直接 assert する — 「窓を外す変異で red になる pin」。
+OUTSIDE_DB_READ_WINDOW = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def test_analyze_for_agent_ignores_data_outside_the_internal_db_read_window(
+        tmp_path):
+    """OUTSIDE_DB_READ_WINDOW (in_sample_until - 90日 の窓より前) にしか
+    データが無い場合は insufficient_data になること。対照として同じ
+    シェイプのデータを窓の内側 (BEFORE_BOUNDARY) に置くと成功することを
+    同じテスト内で確認する — 片方だけだと `since` の算出を削る変異
+    (常に None を渡す = 従来の全履歴読み) を殺せない。"""
+    conn = _conn(tmp_path)
+    _seed_two_series(conn, start=OUTSIDE_DB_READ_WINDOW)
+    out_outside = analyze_for_agent(conn, _settings_watch_eurusd(),
+                                    {"kind": "corr_matrix", "timeframe": "1h"},
+                                    now=NOW)
+    assert out_outside == {"error": "insufficient_data"}
+
+    in_window_dir = tmp_path / "in_window"
+    in_window_dir.mkdir()
+    conn2 = _conn(in_window_dir)
+    _seed_two_series(conn2, start=BEFORE_BOUNDARY)
+    out_inside = analyze_for_agent(conn2, _settings_watch_eurusd(),
+                                   {"kind": "corr_matrix", "timeframe": "1h"},
+                                   now=NOW)
+    assert "error" not in out_inside
+    assert "USDJPY/EURUSD" in out_inside["pairs"]
 
 
 def test_analyze_for_agent_success_saves_run_and_returns_flat_shape(tmp_path):
