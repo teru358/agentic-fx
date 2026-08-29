@@ -301,6 +301,80 @@ def test_gate_failure_stops_at_report_no_approval_request(improve_env):
     assert not live.exists()
 
 
+def test_gate_failure_stops_before_any_further_candidate_processing(
+        improve_env, monkeypatch):
+    """F-E1 是正 (段0 最優先申し送り): `improve_loop.py:1179-1183`
+    (`if not gate_verdict.passed: self._finalize_gate_failed(...); return`)
+    の早期 `return` を削除する変異は `test_gate_failure_stops_at_report_
+    no_approval_request` で KILLED になっていたが、実測 (`--tb=line`) では
+    6 件全てが `_finalize_gate_failed` 先頭の `self._delete_staging(ctx)`
+    で staging が消えた直後、後続へ流れた `self._read_candidate_kind`
+    (`improve_loop.py:1333`) の `FileNotFoundError` という**巻き添え**で
+    落ちていた — 遮断そのものの assert には一度も到達していない
+    (メモリ「『死ぬ理由が他にある』と pin は恒真になる」2026-08-22 A-4)。
+
+    着手前検証: 当初 `_delete_staging` を no-op にして
+    `approval_count == 0` を見る形を試みたが、実測すると
+    `_finalize_success` 側の `finish_improve_mission` が「既に
+    `_finalize_gate_failed` で終端済みの mission/run」に対して二重に
+    終端しようとして Tx-2 が失敗 → 内側 tx が rollback → 一度挿入された
+    approval_requests 行ごと巻き戻る、という**別の巻き添え** (二重終端の
+    tx 補償) 経由で偶然 `approval_count == 0` のまま緑になることが分かった
+    (状態ベースの assert はこの種の間接効果を区別できない)。
+
+    そこで手段を変え、「ゲート不合格の直後は後続の候補処理
+    (`_read_candidate_kind` 以降) に一切進まないこと」そのものを spy で
+    直接固定する — `_delete_staging`/Tx-2 のどちらの巻き添えにも依存しない。
+    早期 `return` が削除されると `_read_candidate_kind` が (staging の
+    生死に関わらず) 呼ばれてしまうため、この spy は単独で red になる。"""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    called = {"read_candidate_kind": False}
+    orig_read_candidate_kind = ImproveLoop._read_candidate_kind
+
+    def _spy_read_candidate_kind(self, candidate_dir):
+        called["read_candidate_kind"] = True
+        return orig_read_candidate_kind(self, candidate_dir)
+
+    monkeypatch.setattr(ImproveLoop, "_read_candidate_kind",
+                        _spy_read_candidate_kind)
+
+    app, root = improve_env
+    conn = app.conn_core
+
+    result = MissionResult(
+        status="completed",
+        output=_plugin_artifact("bad_gate_e2e_no_further_processing"),
+        transcript=[],
+    )
+    loop = ImproveLoop(
+        root=root, settings=app.settings, clock=FixedClock(NOW),
+        db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
+        activity=app.activity, rag=app.rag,
+    )
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
+        mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+        _write_staging_plugin(
+            ctx.staging_dir, "bad_gate_e2e_no_further_processing",
+            _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
+            _FAILING_INDICATOR_TEST)
+        mission_result = worker.run(mission)
+        loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
+
+    assert called["read_candidate_kind"] is False, (
+        "gate 不合格の直後に候補処理 (_read_candidate_kind 以降) が進んだ "
+        "(F-E1 の早期 return が崩れている)")
+
+    approval_count = conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'").fetchone()[0]
+    assert approval_count == 0, (
+        "gate 不合格の候補から approval_request が作られた (F-E1 の遮断が "
+        "崩れている)")
+
+
 def test_landlock_unavailable_produces_gate_failure_not_approval(
         improve_env, monkeypatch):
     """D20 是正 (段0 致命3): `run_gate_pytest` が Landlock 不可の
