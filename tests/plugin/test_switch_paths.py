@@ -531,6 +531,19 @@ def test_is_superseded_key_requires_content_hash_match_not_name_alone(env, monke
     assert row_a["status"] == "approved"  # invalidated にならない
 
 
+# round2 M1 是正 (2026-08-29、verified-round2.md M1): `.match()` を
+# `.fullmatch()` に揃えた後も `resolve_candidate_dir` はこの pin どおり
+# 拒否すること (fullmatch 化の前後どちらの実装でも拒否されるのが正しい
+# — 末尾改行付き candidate_path は capture group が name と一致せず
+# 後段の等値検査でも fail closed するため、二重の防御になる)。
+def test_resolve_candidate_dir_rejects_trailing_newline_in_candidate_path(env):
+    root, plugins_dir, conn, settings = env
+    with pytest.raises(ValueError, match="does not match the canonical form"):
+        switch.resolve_candidate_dir(
+            plugins_dir, candidate_origin="human",
+            candidate_path="plugins/_human/sma\n", name="sma")
+
+
 def test_resolve_candidate_dir_rejects_name_mismatch_in_canonical_path(env):
     """段 0 M21 の killer: `resolve_candidate_dir` の正規形検査から
     `m.group(m.lastindex) != name` の項を落としても緑になった。

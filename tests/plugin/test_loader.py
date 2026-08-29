@@ -145,6 +145,23 @@ def test_discover_normal_indicator_plugin_defaults(tmp_path):
     assert meta.max_bars == 200  # 既定値
 
 
+# round2 M1 是正 (2026-08-29、verified-round2.md M1): 名前正規形の検査が
+# `.match()` + `$` だと末尾改行 1 個を受理してしまう (probe 実測:
+# `_PLUGIN_NAME_RE.match('foo\n')` は match するが `.fullmatch('foo\n')` は
+# しない)。ディレクトリ名は '\n' を含みうる (Linux では NUL と '/' 以外
+# 任意のバイトが有効) — `discover()` はこの名前を非正規形として reject
+# すること。
+def test_discover_rejects_directory_name_with_trailing_newline(tmp_path, caplog):
+    _write_plugin(tmp_path, "sma\n", plugin_py=INDICATOR_PY,
+                  config_yaml=INDICATOR_CONFIG)
+
+    with caplog.at_level(logging.WARNING):
+        metas = discover(tmp_path)
+
+    assert metas == []
+    assert any("non-canonical" in r.message for r in caplog.records)
+
+
 def test_discover_normal_signal_plugin(tmp_path):
     _write_plugin(tmp_path, "rsi_signal", plugin_py=SIGNAL_PY,
                   config_yaml=SIGNAL_CONFIG)

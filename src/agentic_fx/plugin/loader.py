@@ -258,7 +258,9 @@ def _resolve_entity(plugins_dir: Path, name: str, activity=None) -> Path | None:
     if entry.is_symlink():
         target = os.readlink(entry)
         pattern = re.compile(_SYMLINK_TARGET_RE_TMPL.format(name=re.escape(name)))
-        if not pattern.match(target):
+        # round2 M1 是正 (2026-08-29、verified-round2.md M1): fullmatch に
+        # 揃える (`.match()` + `$` は末尾改行を受理する — probe 実測)。
+        if not pattern.fullmatch(target):
             _reject(name, f"symlink target does not match canonical form: {target!r}")
             return None
         version_dir = (plugins_dir / target).resolve()
@@ -302,7 +304,9 @@ def discover(plugins_dir: Path, *, activity=None) -> list[PluginMeta]:
         name = entry.name
         if name.startswith("_") or name.startswith("."):
             continue
-        if not _PLUGIN_NAME_RE.match(name):
+        # round2 M1 是正 (2026-08-29、verified-round2.md M1): fullmatch に
+        # 揃える (`.match()` + `$` は末尾改行を受理する — probe 実測)。
+        if not _PLUGIN_NAME_RE.fullmatch(name):
             _reject(name, f"non-canonical plugin name: {name!r}")
             continue
 

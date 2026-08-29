@@ -311,7 +311,13 @@ def resolve_candidate_dir(plugins_root: Path, *, candidate_origin: str,
     pattern = _CANDIDATE_PATH_RE.get(candidate_origin)
     if pattern is None:
         raise ValueError(f"unknown candidate_origin: {candidate_origin!r}")
-    m = pattern.match(candidate_path)
+    # round2 M1 是正 (2026-08-29、verified-round2.md M1): fullmatch に揃える
+    # (`.match()` + `$` は末尾改行を受理する穴があるが、末尾改行付き
+    # candidate_path は capture group が name と一致せず後段の等値検査
+    # (`m.group(...) != name`) で fail closed する — この関数は「後段は
+    # fail closed」の実例。fullmatch にしても意味論は変わらず、コード層
+    # 全体で規約を揃える)。
+    m = pattern.fullmatch(candidate_path)
     if m is None or m.group(m.lastindex) != name:
         raise ValueError(
             f"candidate_path {candidate_path!r} does not match the "

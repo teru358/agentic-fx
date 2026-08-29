@@ -19,7 +19,9 @@ _ALLOWED_REL = frozenset({"plugin.py", "config.yaml", "test_plugin.py"})
 
 
 def _safe_join(root: Path, name: str, rel: str | None = None) -> Path | None:
-    if not _NAME_RE.match(name):
+    # round2 M1 是正 (2026-08-29、verified-round2.md M1): fullmatch に揃える
+    # (`.match()` + `$` は末尾改行を受理する — probe 実測)。
+    if not _NAME_RE.fullmatch(name):
         return None
     if rel is not None and rel not in _ALLOWED_REL:
         return None

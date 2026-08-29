@@ -683,7 +683,10 @@ class ImproveLoop:
 
         if atype == "plugin":
             name = artifact.get("name", "")
-            if not _PLUGIN_NAME_RE.match(name):
+            # round2 M1 是正 (2026-08-29、verified-round2.md M1): `.match()`
+            # + `$` は末尾改行を受理する穴がある (`'foo\n'` が match する —
+            # probe 実測)。`fullmatch` に揃える。
+            if not _PLUGIN_NAME_RE.fullmatch(name):
                 return _InspectionVerdict(
                     ok=False, reason=f"artifact.name {name!r} is not in "
                                     "canonical form")
