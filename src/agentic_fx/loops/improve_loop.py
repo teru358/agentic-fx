@@ -1251,7 +1251,7 @@ class ImproveLoop:
             else:
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
-                    report_path=report_path, now=now)
+                    report_path=report_path, artifact=artifact, now=now)
         finally:
             if owns_conn:
                 conn.close()
@@ -1310,9 +1310,31 @@ class ImproveLoop:
         return str(final_path)
 
     def _finalize_report_or_observation(self, conn, *, ctx, backlog_id,
-                                        report_path, now) -> None:
-        """承認申請を出さない経路の Tx-2 + finish。"""
+                                        report_path, artifact, now) -> None:
+        """承認申請を出さない経路の Tx-2 + finish。
+
+        round2 #6 是正 (2026-08-29、verified-round2.md #6、設計逐語違反):
+        `report_path is None` になる分岐は 2 つある —
+        `artifact.type != 'report'` (= observation、`IMPROVE_OUTPUT_SCHEMA`
+        の正規出力) と `proposal_kind == 'risk_gate'` (本プラン未対応)。
+        従来はどちらも `unsupported_in_plan10:risk_gate` を無条件に書いて
+        いたが、設計書 §4.3 状態機械表は `artifact=observation →
+        observation:<reason>` の逐語行を持つ。`artifact["reason"]` は
+        LLM 由来 (次 Mission の context に注入される backlog history) の
+        ため `safe_text` でサニタイズする (`safe_error_text` は
+        `BaseException` 前提で `type(e).__name__: ` 接頭辞を足すため、
+        素の文字列である `reason` には型名の無い `safe_text` を使う —
+        どちらも同じ `_URL_RE`/`_SECRET_RE` 抑止を共有する)。"""
         from agentic_fx.store import missions as missions_store
+        if report_path is None and artifact.get("type") == "observation":
+            from agentic_fx._safe_error import safe_text
+            observation_last_result = (
+                f"observation:{safe_text(str(artifact.get('reason', '')))}")
+        else:
+            # D-15 是正: 設計書 §4.3 状態表の逐語は
+            # `unsupported_in_plan10:risk_gate` — `proposal_kind=='risk_gate'`
+            # (本プラン未対応) のときの正規ラベル。
+            observation_last_result = "unsupported_in_plan10:risk_gate"
         conn.execute("BEGIN IMMEDIATE")
         try:
             missions_store.finish_improve_mission(
@@ -1324,11 +1346,7 @@ class ImproveLoop:
                 report_state=("prepared" if report_path is not None else "none"),
                 backlog_transition=(
                     {"backlog_id": backlog_id, "status": "observation",
-                     # D-15 是正: 設計書 §4.3 状態表の逐語は
-                     # `unsupported_in_plan10:risk_gate` (reason 接尾辞を
-                     # 含む) — 現状この分岐は risk_gate 提案の未対応にしか
-                     # 到達しないため、そのまま付与する。
-                     "last_result": "unsupported_in_plan10:risk_gate"}
+                     "last_result": observation_last_result}
                     if report_path is None and backlog_id is not None
                     else ({"backlog_id": backlog_id, "status": "done",
                           "last_result": "reported"}
@@ -1343,6 +1361,20 @@ class ImproveLoop:
             part_path = reports_dir / ".tmp" / f"improve-{ctx.mission_id}.md.part"
             self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
                                  final_path=Path(report_path), now=now)
+        # round2 #7 是正 (2026-08-29、verified-round2.md #7、設計逐語違反):
+        # 設計 §4.2 手順9「承認申請を出した staging は残す。それ以外は
+        # 削除。」— report/observation 経路は承認申請を出さないため、
+        # 他 4 経路 (gate_failed/output_invalid/failed/loser) と同じく
+        # staging を削除する (公開の後)。従来は漏れており、`_snapshot_src`
+        # が 0500/0400 の readonly tree のまま `sweep_orphans` の
+        # rmtree(ignore_errors=True) では消えず、report を出す Mission
+        # 1 本につき永久に積んでいた。`mark_discarded()` を先に呼ぶことで
+        # `finally` 節の無条件 `mark_persisted()` は (既に DISCARDED のため)
+        # RuntimeError → 既存の `except RuntimeError: pass` に吸われる
+        # (この経路の台帳エントリは実際には永続化されていないため、
+        # mark_persisted は元々誤り — 副次的に解消する)。
+        ctx.ledger.mark_discarded()
+        self._delete_staging(ctx)
 
     def _read_candidate_kind(self, candidate_dir: Path) -> str:
         """candidate の config.yaml から kind (indicator/strategy) を読む。"""

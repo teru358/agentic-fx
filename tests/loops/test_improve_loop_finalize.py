@@ -820,3 +820,111 @@ def test_compensate_tx2_failure_actually_writes_failed_mission_and_observation(
         (backlog_id,)).fetchone()
     assert backlog["status"] == "observation"
     assert backlog["last_result"] == "commit_failed"
+
+
+# round2 #6/#7 是正 (2026-08-29、verified-round2.md、設計逐語違反):
+# `_finalize_report_or_observation` (report_path is None の経路) は
+# (a) artifact=observation のとき偽ラベル `unsupported_in_plan10:risk_gate`
+#     を書いていた (設計 §4.3 の `observation:<reason>` 逐語違反)
+# (b) staging を削除していなかった (設計 §4.2 手順9 逐語違反 — 他 4 終端
+#     経路と非対称)。
+
+def _finalize_report_or_observation_ctx(staging_dir, *, mission_id, run_id):
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    return ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=staging_dir / "_snapshot_src",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+
+
+def test_observation_artifact_records_reason_not_risk_gate_label(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    ctx = _finalize_report_or_observation_ctx(
+        staging_dir, mission_id=mission_id, run_id=run_id)
+
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
+        artifact={"type": "observation", "reason": "insufficient data"},
+        now=datetime(2026, 8, 22))
+
+    backlog = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert backlog["status"] == "observation"
+    assert backlog["last_result"] == "observation:insufficient data"
+    run = conn.execute(
+        "SELECT result, report_state FROM improvement_runs WHERE id=?",
+        (run_id,)).fetchone()
+    assert run["result"] is None
+    assert run["report_state"] == "none"
+
+
+def test_risk_gate_report_artifact_keeps_unsupported_label(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """対照: §4.3 表の別の行 (`proposal_kind=risk_gate`) は従来どおり
+    `unsupported_in_plan10:risk_gate` のままであること — 片方だけだと
+    分岐を丸ごと消す変異 (常に observation ラベルにする等) を殺せない。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    ctx = _finalize_report_or_observation_ctx(
+        staging_dir, mission_id=mission_id, run_id=run_id)
+
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
+        artifact={"type": "report", "proposal_kind": "risk_gate"},
+        now=datetime(2026, 8, 22))
+
+    backlog = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert backlog["status"] == "observation"
+    assert backlog["last_result"] == "unsupported_in_plan10:risk_gate"
+
+
+def test_report_path_deletes_staging_including_readonly_snapshot(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """殺すテスト案: 0500/0400 の readonly tree を実際に作ってから回す
+    (0700 のままだと `_delete_staging` を消す変異を rmtree の成否では
+    殺せない)。"""
+    import os
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    snapshot_dir = staging_dir / "_snapshot_src"
+    snapshot_dir.mkdir()
+    plugin_file = snapshot_dir / "plugin.py"
+    plugin_file.write_text("x = 1\n")
+    os.chmod(plugin_file, 0o400)
+    os.chmod(snapshot_dir, 0o500)
+    ctx = _finalize_report_or_observation_ctx(
+        staging_dir, mission_id=mission_id, run_id=run_id)
+    report_path = tmp_path / "report.md"
+    report_path.write_text("# report\n")
+    part_dir = tmp_path / ".tmp"
+    # _publish_report は run_id 由来の part_path
+    # (reports_dir/.tmp/improve-<mission_id>.md.part) を rename するため、
+    # _root を tmp_path に固定し、その配置に実体を用意する。
+    loop_min._root = tmp_path
+    reports_dir = tmp_path / "data" / "improve_reports"
+    (reports_dir / ".tmp").mkdir(parents=True)
+    part_path = reports_dir / ".tmp" / f"improve-{mission_id}.md.part"
+    part_path.write_text("# report\n")
+    final_path = reports_dir / f"improve-{mission_id}.md"
+
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
+        artifact={"type": "report"}, now=datetime(2026, 8, 22))
+
+    assert not staging_dir.exists()
+    run = conn.execute(
+        "SELECT result, report_state FROM improvement_runs WHERE id=?",
+        (run_id,)).fetchone()
+    assert run["result"] == "report"
+    assert run["report_state"] == "published"
