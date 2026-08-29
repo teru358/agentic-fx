@@ -183,6 +183,40 @@ def test_verify_backend_fails_closed_on_ready_run_context_mismatch(
                        provider=None, clock=FixedClock(NOW))
 
 
+@pytest.mark.parametrize("status", ["failed", "timeout", "max_turns"])
+def test_verify_backend_fails_closed_when_status_is_not_completed_but_output_is_valid(
+        tmp_path, monkeypatch, status):
+    """F-V1 是正 (段0 致命1、最重要): 親ゲート — `result.status` と
+    `result.output` の整合は `verify_backend` のこの 1 行だけが強制する
+    (`WorkerRunner:421` は子が送ってきた status/output をそのまま透過する
+    構造であり、`status != "completed"` かつ `output` が非空という組を
+    拒否しているのはここだけ)。`if result.status != "completed" or not
+    result.output:` を `if not result.output:` へ弱める変異 (段0 F-V1) は
+    status を一切見なくなるため、`status="failed"`/`"timeout"`/
+    `"max_turns"` でも nonce が一致する `output` さえ返れば `ok=True` と
+    有効な fingerprint を発行してしまう。3 値 parametrize で
+    `!= "completed"` を `== "failed"` へ狭める変異 (メモリ §6.7 と同型)
+    まで一緒に取る。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+
+    def _not_completed_but_echoing(mission: Mission) -> MissionResult:
+        nonce = mission.output_schema["properties"]["echo"]["const"]
+        return MissionResult(status=status, output={"echo": nonce},
+                             transcript=[], reason="cli " + status)
+    _BEHAVIOR["current"] = {"result": _not_completed_but_echoing}
+
+    result = verify_backend(tmp_path, _settings(), backend="local",
+                           provider=None, clock=FixedClock(NOW))
+
+    # 遷移を見る形: 同じ output (nonce 一致) でも status が "completed" で
+    # なければ ok=True になってはならない (test_verify_backend_succeeds_on_
+    # nonce_roundtrip の completed 側と対にして踏む)。
+    assert result.ok is False
+    assert result.fingerprint is None
+    assert f"status={status}" in result.detail
+
+
 def test_verify_backend_fails_closed_when_mission_never_completes(
         tmp_path, monkeypatch):
     """親ゲート不合格 (mission failed) なら `ok=False`、fingerprint は None。"""

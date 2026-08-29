@@ -3069,7 +3069,9 @@ def test_build_app_rejects_llama_swap_when_not_verified(tmp_path):
 # 段 0 F1: 相対 CLI bin の絶対化書き戻し
 # ============================================================================
 
-def test_build_app_rewrites_relative_claude_bin_to_absolute_path(tmp_path, monkeypatch):
+@pytest.mark.parametrize("which_runner", ["trade", "improve"])
+def test_build_app_rewrites_relative_claude_bin_to_absolute_path(
+        tmp_path, monkeypatch, which_runner):
     """F1: `runner.claude.bin: "claude"` (相対、config の既定値) でも
     `build_app` 後は `app.settings.runner.claude.bin` が絶対パスに
     書き戻されており、`launcher.build_launcher_argv` がその値を
@@ -3089,7 +3091,15 @@ def test_build_app_rewrites_relative_claude_bin_to_absolute_path(tmp_path, monke
     環境自身 (pytest を起動した Claude Code セッション) が
     `CLAUDE_CODE_*TOKEN*` 等の秘密名パターンに一致する env を export して
     いることがあり、検査⑤本体は実環境に依存させたくない
-    (検査⑤本体は別テストが pin 済み)。"""
+    (検査⑤本体は別テストが pin 済み)。
+
+    F-S4 是正 (段0 致命3): `which_runner` で trade/improve の両方を
+    parametrize する。旧テストは `runner.improve.backend=claude` のみを
+    見ており、`service.py:857` (`settings = _check_cli_backend(settings,
+    which="trade")` の代入を落とす変異) は無防備だった —
+    `runner.trade.backend=claude` かつ `runner.improve.backend != claude`
+    の構成でのみ表面化する非対称 (同じ防御の improve 側だけに pin が
+    付いていた、メモリ §3.8)。"""
     import stat
 
     import agentic_fx.service as service_mod
@@ -3109,11 +3119,13 @@ def test_build_app_rewrites_relative_claude_bin_to_absolute_path(tmp_path, monke
     old_path = _os.environ.get("PATH", "")
 
     import pytest as _pytest
+    other_runner = "improve" if which_runner == "trade" else "trade"
     mp = _pytest.MonkeyPatch()
     try:
         mp.setenv("PATH", f"{bin_dir}:{old_path}")
         root = _root_with_settings(tmp_path, runner={
-            "improve": {"backend": "claude", "model": "m"},
+            which_runner: {"backend": "claude", "model": "m"},
+            other_runner: {"backend": "local"},
             "claude": {"bin": "afx-fake-claude"}})
         app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
         try:

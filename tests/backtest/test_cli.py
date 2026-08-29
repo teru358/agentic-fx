@@ -944,3 +944,27 @@ def test_cli_improve_verify_backend_routes_to_verify_backend(tmp_path, monkeypat
     assert rc == 0
     assert vb.call_args.kwargs["backend"] == "local"
     assert vb.call_args.kwargs["provider"] is None
+
+
+def test_cli_improve_verify_backend_returns_1_when_verification_fails(
+        tmp_path, monkeypatch, capsys):
+    """F-C1 是正 (段0 致命2、最重要): `if not result.ok: ... return 1` の
+    `return 1` を `return 0` に変える変異は、既存 routing テストが
+    `ok=True` の 1 ケースしか流していなかったため生存していた
+    (メモリ §6.11「fixture が一様だと条件分岐の片側が一度も踏まれない」)。
+    検証専用 CLI の終了コードは契約そのもの (runbook 側は
+    `afx improve verify-backend ... && ...` の形で判定する) — `ok=False`
+    側で `rc == 1` かつ stderr に `result.detail` が出ることを固定する。"""
+    from unittest.mock import patch
+    from agentic_fx.entry import main as entry_main
+    from agentic_fx.loops.verify_backend import VerifyBackendResult
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.loops.verify_backend.verify_backend") as vb:
+        vb.return_value = VerifyBackendResult(
+            ok=False, backend="local", provider=None,
+            fingerprint=None, detail="mission did not complete: status=failed")
+        rc = entry_main(["improve", "verify-backend", "--backend", "local"])
+    assert rc == 1
+    assert "mission did not complete: status=failed" in capsys.readouterr().err
