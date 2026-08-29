@@ -530,7 +530,11 @@ def _improve_verify_backend(conn, settings, args: argparse.Namespace,
         return 1
     print(result.detail)
     print(f"fingerprint: {result.fingerprint}")
-    if args.backend == "codex" and args.provider == "llama_swap":
+    # I1 是正 (codex 1周目 verified-codex-round1.md cli.py:533 脚):
+    # `--provider` を省略しても実効 provider が llama_swap なら案内を出す
+    # 必要がある。`args.provider` (常に None のことがある) ではなく
+    # `result.provider` (verify_backend が解決した実効値) を見る。
+    if result.backend == "codex" and result.provider == "llama_swap":
         print("合格後、人間が config/settings.yaml の improve.llama_swap_verified "
              "を true に設定してください (この CLI は書き換えません)。")
     return 0

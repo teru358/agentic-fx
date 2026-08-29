@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import sys
 import time
@@ -73,6 +75,16 @@ class _FakeVerifyWorkerRunner:
 def _settings():
     return load_settings(
         Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+
+
+def _settings_with_codex_provider(provider: str):
+    """I1 是正: `settings.runner.codex.provider` を上書きした settings
+    (`--provider` を省略したときに verify_backend が何を実効値として使う
+    かを確かめるための土台)。"""
+    s = _settings()
+    return s.model_copy(update={"runner": s.runner.model_copy(
+        update={"codex": s.runner.codex.model_copy(
+            update={"provider": provider})})})
 
 
 def _echo_ok(mission: Mission) -> MissionResult:
@@ -367,6 +379,65 @@ def test_verify_backend_bypasses_llama_swap_verified_gate_with_warning_log(
 
     assert result.ok is True
     assert any("llama_swap_verified" in r.message for r in caplog.records)
+
+
+def test_verify_backend_reports_settings_provider_when_provider_arg_is_omitted(
+        tmp_path, monkeypatch, caplog):
+    """I1 是正 (codex 1周目, verified-codex-round1.md): `--provider` を
+    省略しても `backend="codex"` かつ `settings.runner.codex.provider` が
+    設定されているなら、実際に走る provider (WorkerRunner に渡る値) と
+    `result.provider`/fingerprint 原像/バイパス WARNING の判定が一致する。
+    是正前は `provider=None` がそのまま `VerifyBackendResult.provider` へ
+    透過し、fingerprint 原像も `f"codex:None:..."` になっていた。"""
+    class _Capture(_FakeVerifyWorkerRunner):
+        def run(self, mission):
+            captured_mission["m"] = mission
+            return super().run(mission)
+    captured_mission: dict = {}
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner", _Capture)
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._DescendantWatcher",
+                        lambda pid: _FixedWatcher(saw=True))
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._descendant_pids",
+                        lambda pid: set())
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+    settings = _settings_with_codex_provider("llama_swap")
+    assert settings.improve.llama_swap_verified is False
+
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.loops.verify_backend"):
+        result = verify_backend(tmp_path, settings, backend="codex",
+                               provider=None, clock=FixedClock(NOW))
+
+    eff = _FakeVerifyWorkerRunner.captured_kwargs["settings"].runner.codex.provider
+    eff_model = _FakeVerifyWorkerRunner.captured_kwargs["settings"].runner.improve.model
+    nonce = captured_mission["m"].output_schema["properties"]["echo"]["const"]
+    assert eff == "llama_swap"
+    assert result.provider == "llama_swap"
+    assert "provider=llama_swap" in result.detail
+    assert any("llama_swap_verified" in r.message for r in caplog.records)
+    assert result.fingerprint == hashlib.sha256(
+        f"codex:llama_swap:{eff_model}:{nonce}".encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize("backend", ["local", "claude"])
+def test_verify_backend_does_not_leak_codex_provider_into_non_codex_backends(
+        tmp_path, monkeypatch, backend):
+    """I1 是正の負の脚: `backend="local"`/`"claude"` では
+    `settings.runner.codex.provider` が `result.provider` へ漏れない
+    (effective_provider の計算を `backend == "codex"` で条件付けない回帰
+    を防ぐ)。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._DescendantWatcher",
+                        lambda pid: _FixedWatcher(saw=True))
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._descendant_pids",
+                        lambda pid: set())
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+    settings = _settings_with_codex_provider("llama_swap")
+
+    result = verify_backend(tmp_path, settings, backend=backend,
+                           provider=None, clock=FixedClock(NOW))
+
+    assert result.provider is None
 
 
 class _FixedWatcher:

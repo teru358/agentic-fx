@@ -971,6 +971,28 @@ def test_cli_improve_verify_backend_routes_provider_through_to_verify_backend(
     assert vb.call_args.kwargs["provider"] == "llama_swap"
 
 
+def test_cli_verify_backend_prints_enable_guidance_from_result_provider(
+        tmp_path, monkeypatch, capsys):
+    """I1 是正 (codex 1周目, verified-codex-round1.md `cli.py:533` 脚):
+    `--provider` を省略しても、`verify_backend` が実効値 (settings 由来) を
+    `result.provider` として返していれば、有効化案内が出る。是正前は
+    `args.provider` (常に None) を見ていたため、案内が一切出なかった。"""
+    from unittest.mock import patch
+    from agentic_fx.entry import main as entry_main
+    from agentic_fx.loops.verify_backend import VerifyBackendResult
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.loops.verify_backend.verify_backend") as vb:
+        vb.return_value = VerifyBackendResult(
+            ok=True, backend="codex", provider="llama_swap",
+            fingerprint="0" * 64, detail="ok")
+        rc = entry_main(["improve", "verify-backend", "--backend", "codex"])
+    assert rc == 0
+    assert vb.call_args.kwargs["provider"] is None
+    assert "llama_swap_verified" in capsys.readouterr().out
+
+
 def test_cli_improve_verify_backend_returns_1_when_verification_fails(
         tmp_path, monkeypatch, capsys):
     """F-C1 是正 (段0 致命2、最重要): `if not result.ok: ... return 1` の

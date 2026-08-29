@@ -136,7 +136,19 @@ def verify_backend(
     scoped_settings = settings.model_copy(
         update={"runner": settings.runner.model_copy(update=runner_update)})
 
-    if (backend == "codex" and provider == "llama_swap"
+    # I1 是正 (codex 1周目 verified-codex-round1.md): `--provider` 省略時は
+    # `settings.runner.codex.provider` がそのまま `scoped_settings` に残り、
+    # 実際に走る provider になる (runners/factory.py:49,
+    # worker_runner.py:158 も scoped_settings 経由)。以降はこの 1 値
+    # (`effective_provider`) だけを使い、引数 `provider` を直接見ない —
+    # 結果 (`VerifyBackendResult.provider`)・バイパス WARNING 判定・
+    # fingerprint 原像・detail の 4 箇所すべてが実効値と一致する。
+    # `backend == "codex"` で条件付けないと、`backend=local`/`claude` の
+    # 結果に settings 由来の provider が漏れる (回帰点、負のテストで pin)。
+    effective_provider = (
+        scoped_settings.runner.codex.provider if backend == "codex" else None)
+
+    if (backend == "codex" and effective_provider == "llama_swap"
             and not settings.improve.llama_swap_verified):
         # 通常入口 (ImproveSupervisor) はこの組み合わせを拒否したまま
         # (§7.1-2 の pin は変更しない) — verify-backend だけが唯一の
@@ -219,36 +231,38 @@ def verify_backend(
 
         if not ready_frames:
             return VerifyBackendResult(
-                ok=False, backend=backend, provider=provider, fingerprint=None,
+                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail="mission never reached ready (handshake failed)")
         if result.status != "completed" or not result.output:
             return VerifyBackendResult(
-                ok=False, backend=backend, provider=provider, fingerprint=None,
+                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail=f"mission did not complete: status={result.status} "
                       f"reason={result.reason}")
         if result.output.get("echo") != nonce:
             return VerifyBackendResult(
-                ok=False, backend=backend, provider=provider, fingerprint=None,
+                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail="mission output failed the nonce round-trip "
                       "(schema/nonce gate)")
         if backend != "local" and not watcher.saw_any_descendant():
             return VerifyBackendResult(
-                ok=False, backend=backend, provider=provider, fingerprint=None,
+                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail="no CLI child process was observed during the run "
                       "(cli_started gate)")
         if backend != "local" and after_descendants:
             return VerifyBackendResult(
-                ok=False, backend=backend, provider=provider, fingerprint=None,
+                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail="CLI child process(es) were not reaped after the "
                       f"mission completed (pgid recovery gate): "
                       f"{sorted(after_descendants)}")
 
         model = scoped_settings.runner.improve.model
         fingerprint = hashlib.sha256(
-            f"{backend}:{provider}:{model}:{nonce}".encode("utf-8")).hexdigest()
+            f"{backend}:{effective_provider}:{model}:{nonce}".encode("utf-8")
+        ).hexdigest()
         return VerifyBackendResult(
-            ok=True, backend=backend, provider=provider, fingerprint=fingerprint,
-            detail=f"backend={backend} provider={provider} model={model} "
-                  f"fingerprint={fingerprint}")
+            ok=True, backend=backend, provider=effective_provider,
+            fingerprint=fingerprint,
+            detail=f"backend={backend} provider={effective_provider} "
+                  f"model={model} fingerprint={fingerprint}")
     finally:
         shutil.rmtree(scratch_root, ignore_errors=True)
