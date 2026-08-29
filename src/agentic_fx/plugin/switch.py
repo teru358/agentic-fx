@@ -420,6 +420,14 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
                 f"plugin {name!r}: candidate content changed during gate "
                 "(hash mismatch) — refusing")
 
+        # round2 #2 是正 (2026-08-29、verified-round2.md #2): F1 の
+        # max_bars_limit ゲートは `approval.submit_plugin` にしか付かず、
+        # プラン10で新設された本 corridor には無かった
+        # (`grep -rn max_bars switch.py` → 0 件だった)。手順 7 の直前に置く
+        # — 手順 7 (run_kind_gate、strategy は run_in_sample を呼ぶ) の
+        # 前で fail closed する。
+        approval.assert_max_bars_within_limit(meta, settings=settings)
+
         metrics, evaluable = approval.run_kind_gate(  # 手順 7
             conn, meta, settings=settings, now=now)
     except SandboxError as exc:

@@ -89,6 +89,23 @@ def _eval_timeframe(meta_timeframe: str) -> str:
     return _EVAL_TIMEFRAME_OVERRIDE.get(meta_timeframe, meta_timeframe)
 
 
+def assert_max_bars_within_limit(meta: PluginMeta, *, settings: "Settings") -> None:
+    """round2 #2 是正 (2026-08-29、verified-round2.md #2): F1 (最終レビュー)
+    が `submit_plugin` に足した `max_bars_limit` ゲートを、プラン10で
+    新設された 2 本目の承認 corridor `switch._run_full_gate` (P1 submit /
+    P3 bless の共有ゲート本体) からも呼べるよう括り出す。F1 当時
+    `submit_plugin` が唯一の承認 corridor だったため後発 corridor に
+    ゲートが付かなかった (F1 のスコープ漏れではなく、F1 の後に増えた
+    corridor に同じゲートが付かなかった)。既存 pin
+    (`tests/plugin/test_approval.py`) はメッセージ中の部分文字列
+    `max_bars_limit` と `>` (厳密超過、`max_bars == limit` は許容) の
+    境界だけを見ているため、この括り出しでもそのまま通る。"""
+    if meta.max_bars > settings.plugin.max_bars_limit:
+        raise ValueError(
+            f"plugin {meta.name!r}: max_bars {meta.max_bars} exceeds "
+            f"settings.plugin.max_bars_limit {settings.plugin.max_bars_limit}")
+
+
 def _pytest_summary(stdout_text: str) -> str:
     """pytest の出力から末尾の非空行 (概ね summary 行) だけを抜き出す。"""
     lines = [line for line in stdout_text.splitlines() if line.strip()]
@@ -238,10 +255,7 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
         # ここで検証ゲート冒頭に一律 fail closed で置くことで、bless は
         # submit 経由なので自動的に守られ、producer は承認済み plugin しか
         # 受け付けないため承認のこの 1 点だけで律速できる。
-        if meta.max_bars > settings.plugin.max_bars_limit:
-            raise ValueError(
-                f"plugin {meta.name!r}: max_bars {meta.max_bars} exceeds "
-                f"settings.plugin.max_bars_limit {settings.plugin.max_bars_limit}")
+        assert_max_bars_within_limit(meta, settings=settings)
 
         check_source(meta.path / "plugin.py")
         check_source(test_plugin_path, extra_allowed=frozenset({"pytest", "plugin"}))
