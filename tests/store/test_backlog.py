@@ -20,6 +20,20 @@ def test_backlog_and_run(tmp_path):
                         report_path="reports/improve-2026-07-26.md")
 
 
+# round2 最終是正 A6 (2026-08-29、verified-local-round2.md A6): #8 是正の
+# 「正規化は Python 側 1 箇所、全 INSERT 経路が idea_norm を書く」の
+# うち CLI/手動追加経路 (`backlog.add`) だけが観測されていなかった。
+def test_add_writes_python_normalized_idea_norm(tmp_path):
+    c = connect(tmp_path / "t.db")
+    init_db(c)
+    bid = backlog.add(c, "  IMPROVE X\n", "cli", NOW)
+    row = c.execute(
+        "SELECT idea, idea_norm FROM improvement_backlog WHERE id=?",
+        (bid,)).fetchone()
+    assert row["idea"] == "  IMPROVE X\n"      # 原文は保持
+    assert row["idea_norm"] == "improve x"     # 正規形は Python 側と同一
+
+
 def test_finish_no_longer_accepts_pr_url(tmp_path):
     """Task 19: pr_url は improvement_runs から落ちたため finish() の
     引数からも外れている (渡すと TypeError)。"""

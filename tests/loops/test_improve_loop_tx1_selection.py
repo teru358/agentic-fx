@@ -2,9 +2,11 @@
 プラン §8.1-24)。"""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
+
+_NOW_ISO = datetime(2026, 8, 22, tzinfo=timezone.utc).isoformat()
 
 
 def test_winner_gets_backlog_bound_to_run(loop_and_ctx_with_open_backlog):
@@ -214,6 +216,40 @@ def test_new_idea_selected_creates_and_binds_in_same_tx(loop_and_ctx_with_open_b
         "SELECT status FROM improvement_backlog WHERE idea='brand new idea'"
     ).fetchone()
     assert row["status"] == "selected"
+
+
+# round2 最終是正 A8 (2026-08-29、verified-local-round2.md A8):
+# `"idea_norm=? AND status IN ('open','observation')"` フィルタが未 pin
+# だった (`status IN (...)` を落とす変異が生存)。`status='done'` の同一
+# idea 行を置いた状態で新規 idea を selected に流し、既存 done 行を巻き
+# 戻さずに新規行が作られて won=True になることを固定する。
+def test_new_idea_selected_ignores_done_row_with_same_idea_norm(
+        loop_and_ctx_with_open_backlog):
+    loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
+    conn.execute(
+        "INSERT INTO improvement_backlog (idea, source, status, created_at, "
+        "updated_at, idea_norm) VALUES (?,?,'done',?,?,?)",
+        ("brand new idea", "user", _NOW_ISO, _NOW_ISO, "brand new idea"))
+    conn.commit()
+    done_row = conn.execute(
+        "SELECT id FROM improvement_backlog WHERE idea='brand new idea' "
+        "AND status='done'").fetchone()
+
+    output = {"discoveries": [],
+              "selected": {"backlog_id": None, "idea": "brand new idea"},
+              "artifact": {"type": "observation", "reason": "x"},
+              "selection_rationale": "x"}
+    outcome = loop._select_and_bind(conn, output, ctx, now=datetime(2026, 8, 22))
+
+    assert outcome.won is True
+    rows = conn.execute(
+        "SELECT id, status FROM improvement_backlog WHERE idea='brand new idea'"
+    ).fetchall()
+    assert len(rows) == 2  # 既存 done 行 + 新規 selected 行
+    by_id = {r["id"]: r["status"] for r in rows}
+    assert by_id[done_row["id"]] == "done"  # 既存 done 行は触られない
+    new_row_id = next(rid for rid in by_id if rid != done_row["id"])
+    assert by_id[new_row_id] == "selected"
 
 
 def test_python_and_sql_idea_normalization_agree_on_internal_whitespace(

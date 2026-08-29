@@ -115,6 +115,15 @@ def test_drawdown_kill_pct_le_100_latches_at_equity_zero(tmp_path):
     assert drawdown_pct(equity=0.0, hwm=1000.0) == 100.0
     assert drawdown_pct(equity=0.0, hwm=1000.0) >= s.risk.drawdown_kill_pct
 
+    # round2 最終是正 A5 (2026-08-29、verified-local-round2.md A5): `le=100`
+    # の**値**が未 pin だった (`le=200` への変異が生存する)。100 を 1 でも
+    # 超えたら拒否されることを直接固定する。
+    raw["risk"]["drawdown_kill_pct"] = 100.1
+    p2 = tmp_path / "s2.yaml"
+    p2.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError):
+        load_settings(p2)
+
 
 def test_drawdown_kill_pct_above_threshold_warns_at_startup(tmp_path, caplog):
     import logging
@@ -126,6 +135,25 @@ def test_drawdown_kill_pct_above_threshold_warns_at_startup(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="agentic_fx.config"):
         load_settings(p)
     assert any("drawdown_kill_pct" in r.message for r in caplog.records)
+
+
+# round2 最終是正 A4 (2026-08-29、verified-local-round2.md A4): 上のテストは
+# `99.0` (= どの変異 (`>`→`>=`、しきい値 20→21/20→98) でも WARN 側に落ちる
+# 値) だけを流しているため、しきい値そのものが未 pin だった。境界 2 値
+# (`20.0`=WARN 無し、`20.1`=WARN 有り) を直接固定する。
+@pytest.mark.parametrize("value,expect_warn", [(20.0, False), (20.1, True)])
+def test_drawdown_kill_pct_warn_threshold_boundary(tmp_path, caplog, value,
+                                                    expect_warn):
+    import logging
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["risk"]["drawdown_kill_pct"] = value
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.config"):
+        load_settings(p)
+    assert any("drawdown_kill_pct" in r.message
+              for r in caplog.records) is expect_warn
 
 
 def test_unknown_top_level_key_rejected(tmp_path):

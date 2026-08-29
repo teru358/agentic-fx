@@ -112,4 +112,22 @@ def test_idea_norm_backfill_normalizes_existing_rows_and_keeps_dedup_consistent(
         "ORDER BY id", ("improve x",)).fetchall()
     assert len(hit) == 2  # 旧行 (backfill) + 新規行の両方が同じ基準で当たる
     assert {r["idea"] for r in hit} == {"IMPROVE X\n", "improve x"}
+
+    # round2 最終是正 A7 (2026-08-29、verified-local-round2.md A7):
+    # `WHERE idea_norm IS NULL` → `WHERE 1=1` の変異は backfill が冪等
+    # (idea_norm が既に埋まっている行は再計算しても同じ値) なので観測点に
+    # 差が出ない。既存 idea_norm を手で壊した状態で 2 回目の init_db
+    # (= 再起動相当) を通し、上書きされないことを直接固定する
+    # (O-3b: init_db 2 回起動の冪等 pin も同時に閉じる)。
+    row = conn.execute(
+        "SELECT id FROM improvement_backlog WHERE idea='IMPROVE X\n'"
+    ).fetchone()
+    conn.execute(
+        "UPDATE improvement_backlog SET idea_norm='sentinel' WHERE id=?",
+        (row["id"],))
+    conn.commit()
+    init_db(conn)  # 2 回目の起動 (冪等 pin も兼ねる)
+    assert conn.execute(
+        "SELECT idea_norm FROM improvement_backlog WHERE id=?",
+        (row["id"],)).fetchone()["idea_norm"] == "sentinel"  # 既存値を上書きしない
     conn.close()

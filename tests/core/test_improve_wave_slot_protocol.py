@@ -1327,9 +1327,23 @@ def test_spawn_slot_thread_crash_is_recorded_in_activity(conn, tmp_path):
     sup._conn_for_test = conn
     sup._improve_loop = fake_loop
 
+    # round2 最終是正 A2 (2026-08-29、verified-local-round2.md A2): except 節の
+    # activity 1行だけでは「launch が走って落ちた」と「launch が一度も
+    # 呼ばれない」を区別できない (`_launch_slot` 呼び出し自体を丸ごと
+    # `raise` に置き換える変異が生存していた)。呼び出しの観測点を足す。
+    calls: list[tuple[str, int]] = []
+    orig_launch_slot = sup._launch_slot
+
+    def _spy(period_key: str, k: int) -> None:
+        calls.append((period_key, k))
+        return orig_launch_slot(period_key, k)
+
+    sup._launch_slot = _spy
+
     sup._spawn_slot_thread("2026-W35", 0)
     sup.join(timeout=5.0)
 
+    assert calls == [("2026-W35", 0)]
     text = (tmp_path / "activity.tsv").read_text()
     assert "improve_slot_thread_crashed" in text
     assert Category.IMPROVE.value in text

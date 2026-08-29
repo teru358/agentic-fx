@@ -807,6 +807,14 @@ def test_compute_db_read_window_days_derives_bars_from_window_and_timeframe():
     (日数と直結する簡単なケースで導出式そのものを照合する)。"""
     assert _compute_db_read_window_days("1d", 120) == 120 * 2
     assert _compute_db_read_window_days("1d", 60) == 60 * 2
+    # round2 最終是正 A1 (2026-08-29、verified-local-round2.md A1): 上の 2 本
+    # は 1d のケースで `required_bars * bar_minutes / 1440` が常に整数になり
+    # `bar_minutes` が約分で消えるため、`math.ceil` を floor/int/round に
+    # 変えても `bar_minutes` をハードコードしても生存する。非 1d かつ
+    # 非整数日になる入力で ceil と bar_minutes を同時に固定する。
+    # 15m × 5000 bars: 5000*2*15/1440 = 104.166… → 切り上げ 105
+    # (floor/int/round はいずれも 104 になる)。
+    assert _compute_db_read_window_days("15m", 5000) == 105
 
 
 def test_compute_db_read_window_days_floors_small_derivations_at_90():

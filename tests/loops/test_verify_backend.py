@@ -68,6 +68,12 @@ class _FakeVerifyWorkerRunner:
             elif bad_field == "source_snapshot_dir_basename":
                 run_context["source_snapshot_dir"] = str(
                     Path("/fake-workdir") / "not-source")
+            elif bad_field == "source_snapshot_dir_missing":
+                # round2 最終是正 A9 (2026-08-29、verified-local-round2.md
+                # A9): `or echoed_source is None` を落とす変異は、値が違う
+                # (basename mismatch) frame しか流していない既存 parametrize
+                # では殺せない — キー自体が無い frame を注入する。
+                del run_context["source_snapshot_dir"]
             self._on_ready({"type": "ready", "ok": True,
                             "run_context": run_context})
         return behavior["result"](mission)
@@ -181,7 +187,8 @@ def test_verify_backend_fails_closed_on_nonce_mismatch(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("bad_field", [
-    "mission_id", "staging_dir", "source_snapshot_dir_basename"])
+    "mission_id", "staging_dir", "source_snapshot_dir_basename",
+    "source_snapshot_dir_missing"])
 def test_verify_backend_fails_closed_on_ready_run_context_mismatch(
         tmp_path, monkeypatch, bad_field):
     """A17 是正 (束D検収, verified-local-round1.md §11 #6): 親ゲート (a)

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.config import load_settings
-from agentic_fx.plugin import switch
+from agentic_fx.plugin import approval, switch
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import db as db_store
 
@@ -85,3 +85,31 @@ def test_full_gate_accepts_max_bars_within_limit(env, monkeypatch):
 
     assert approval_id is not None
     assert len(approvals_store.pending(conn, kind="plugin")) == 1
+
+
+# round2 最終是正 A3 (2026-08-29、verified-local-round2.md A3):
+# `test_full_gate_rejects_oversized_max_bars` の `backtest_runs == 0` は
+# `kind: indicator` しか流していないため、順序 (`assert_max_bars_within_limit`
+# を `run_kind_gate` より前に置く) を壊す変異を殺せない — indicator は
+# `run_kind_gate` 自体がバックテストを走らせないので、順序を壊しても
+# `backtest_runs == 0` は成立してしまう。`run_kind_gate` に spy を挟み、
+# 手順7 に一切入らないことを直接固定する (strategy 候補を作る必要はない —
+# spy を挟んだ時点で kind は結論に効かない)。
+def test_full_gate_rejects_oversized_max_bars_before_the_kind_gate(env, monkeypatch):
+    root, plugins_dir, conn, settings = env
+    assert settings.plugin.max_bars_limit < 500000
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma", max_bars=500000)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    calls: list[int] = []
+    monkeypatch.setattr(
+        approval, "run_kind_gate",
+        lambda *a, **kw: (calls.append(1), ({}, True))[1])
+
+    with pytest.raises(ValueError, match="max_bars_limit"):
+        switch.submit_candidate(
+            conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+            candidate_origin="staging", mission_id=1, backlog_id=None,
+            settings=settings, now=NOW)
+
+    assert calls == []  # ← 手順7 (run_kind_gate) に一切入らない = 移動変異を殺す
