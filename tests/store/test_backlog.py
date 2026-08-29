@@ -177,6 +177,59 @@ def test_apply_approval_outcome_backlog_id_none_is_noop(tmp_path):
                                    reason=None, now=NOW)  # 例外にならない
 
 
+# round2 #10 是正 (2026-08-29、verified-round2.md #10): `apply_approval_
+# outcome` が `set_status` の bool (fail-open 防止) を捨てていた。
+# `backlog.set_status` の docstring が自ら宣言する契約 (False=該当行が
+# 存在しなかった) を可視化する — raise はしない (採らない形: raise だと
+# apply_decision の1txがrollbackし、expire/invalidate経路まで
+# pendingに固着する durable stuck を新設してしまう)。
+def test_apply_approval_outcome_logs_when_backlog_row_missing(tmp_path, caplog):
+    import logging
+    from agentic_fx.store import approvals
+
+    c = connect(tmp_path / "t.db")
+    init_db(c)
+    missing_backlog_id = 999999
+    approval_id = approvals.create(
+        c, kind="plugin", payload={"backlog_id": missing_backlog_id}, now=NOW)
+
+    with caplog.at_level(logging.ERROR, logger="agentic_fx.store.backlog"):
+        approvals.apply_decision(
+            c, approval_id, "approved", decided_by="human", now=NOW)
+
+    assert any(str(missing_backlog_id) in r.message for r in caplog.records)
+    row = c.execute(
+        "SELECT status FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()
+    # 決定は止まらない (= #4 型の固着を新設していないことを固定する)。
+    assert row["status"] == "approved"
+
+
+def test_apply_approval_outcome_no_error_log_for_existing_backlog_row(
+        tmp_path, caplog):
+    import logging
+    from agentic_fx.store import approvals
+
+    c = connect(tmp_path / "t.db")
+    init_db(c)
+    bid = backlog.add(c, "a", "user", NOW)
+    approval_id = approvals.create(
+        c, kind="plugin", payload={"backlog_id": bid}, now=NOW)
+
+    with caplog.at_level(logging.ERROR, logger="agentic_fx.store.backlog"):
+        approvals.apply_decision(
+            c, approval_id, "approved", decided_by="human", now=NOW)
+
+    assert caplog.records == []
+    row = c.execute(
+        "SELECT status FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()
+    assert row["status"] == "approved"
+    b = c.execute(
+        "SELECT status FROM improvement_backlog WHERE id=?", (bid,)).fetchone()
+    assert b["status"] == "done"
+
+
 def test_human_reject_and_reopen(tmp_path):
     """人間操作: `observation/open → rejected`、`done/rejected → open`。"""
     c = connect(tmp_path / "t.db"); init_db(c)

@@ -9,8 +9,11 @@ status 値の追加に migration は不要 (設計書 §4.3 逐語)。
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime
+
+_log = logging.getLogger("agentic_fx.store.backlog")
 
 
 def add(conn: sqlite3.Connection, idea: str, source: str, now: datetime) -> int:
@@ -99,5 +102,24 @@ def apply_approval_outcome(
         raise ValueError(f"unknown outcome: {outcome!r}")
     status, template = _OUTCOME_TABLE[outcome]
     last_result = template.format(reason=reason) if "{reason}" in template else template
-    set_status(conn, backlog_id, status, now, last_result=last_result,
-              commit=commit)
+    # round2 #10 是正 (2026-08-29、verified-round2.md #10): `set_status` の
+    # docstring は戻り値の意味を「True=更新した。False=該当行が存在
+    # しなかった (fail-open 防止)」と自ら宣言しているが、従来ここでは
+    # 戻り値を捨てていた — 兄弟の `missions.finish_improve_mission` は
+    # `backlog_ok = backlog_mod.set_status(...)` を消費して RuntimeError
+    # を raise する非対称があった (同一 store 内)。ここで raise すると
+    # `apply_decision` (approvals.py) の 1 tx が rollback し、backlog 行を
+    # 失った approval は approve/reject/expire のいずれもできず pending に
+    # 固着する (#4 で「durable stuck」として認定した状態と同型を新設して
+    # しまう) — 到達性は限定的 (backlog_id は payload_json 内で FK が無く、
+    # 手動 DB 手術後にしか通常起きない) なので、raise せず「決定は止めない」
+    # まま可視化のみ行う (fail closed にしたい場合は store 層ではなく
+    # 呼び出し元だけが raise する形を取ること — expire/invalidate 経路は
+    # raise させないこと)。
+    ok = set_status(conn, backlog_id, status, now, last_result=last_result,
+                    commit=commit)
+    if not ok:
+        _log.error(
+            "apply_approval_outcome: improvement_backlog row %s not found "
+            "— approval decision committed with a no-op backlog transition "
+            "(audit trails have diverged)", backlog_id)
