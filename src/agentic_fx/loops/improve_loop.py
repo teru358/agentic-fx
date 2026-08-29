@@ -362,6 +362,25 @@ class ImproveLoop:
     # を自前で開く — prepare() が close した後の呼び出しのため)。
     def compensate_launch_failure(self, *, ctx: "ImproveRunContext",
                                   now: datetime) -> None:
+        # R5 是正 (2026-08-30): launch failure で DB 行 (mission/run/slot) を
+        # 終端化するだけでなく、staging ディレクトリ
+        # (`plugins/_staging/<mission_id>/`) も削除する。`_snapshot_src` 配下は
+        # `_chmod_tree_readonly` (§4/10.3 節) でディレクトリ 0500・ファイル
+        # 0400 の readonly tree になっているため、後段の `sweep_orphans` の
+        # `rmtree(ignore_errors=True)` では消えず恒久的に残る (D-15 是正と
+        # 同一の欠陥を launch failure 経路が抱えていた)。既存の
+        # `_delete_staging` (readonly を書込可に戻してから削除する実装) を
+        # 呼ぶ。staging 削除は DB 終端化より先に、例外を握って行う —
+        # staging 削除の失敗 (OSError 等) が DB 終端化 (`_compensate_prepare_
+        # failure`) を妨げると、mission/run/slot が dangling のまま残る
+        # (I3 と同じ主害: `_running_slot_count` が容量を恒久的に食い潰す)。
+        try:
+            self._delete_staging(ctx)
+        except Exception:
+            _log.exception(
+                "staging deletion failed during compensate_launch_failure "
+                "for mission_id=%s — continuing with DB terminalization",
+                ctx.mission_id)
         conn = self._db_write_conn_factory()
         try:
             self._compensate_prepare_failure(

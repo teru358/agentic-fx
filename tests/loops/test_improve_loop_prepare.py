@@ -856,3 +856,60 @@ def test_compensate_launch_failure_terminalizes_mission_run_and_slot_via_fresh_c
         fresh.close()
 
 
+def test_compensate_launch_failure_deletes_readonly_staging_dir(loop_no_seam):
+    """R5 是正: `compensate_launch_failure` は DB 行 (mission/run/slot) を
+    終端するだけでなく、staging ディレクトリ
+    (`plugins/_staging/<mission_id>/`) も削除しなければならない。
+    `_snapshot_src` 配下は `_chmod_tree_readonly` でディレクトリ 0500・
+    ファイル 0400 の readonly tree になっているため、後段の
+    `sweep_orphans` の `rmtree(ignore_errors=True)` では消えず恒久的に
+    残る (D-15 是正と同一の欠陥を launch failure 経路が抱えていた)。
+    既存の compensate 系テストと同型で、本番メソッドを実 DB 上で直接呼び、
+    readonly `_snapshot_src` を含む staging を事前に作ったうえで、実行後
+    に staging ディレクトリが存在しないことを確認する。"""
+    import os
+
+    loop, db_path = loop_no_seam
+    now = datetime(2026, 8, 22, 12, 0)
+    later = datetime(2026, 8, 22, 12, 5)
+
+    seed = connect(db_path)
+    try:
+        improve_waves.create_wave_and_slots(
+            seed, period_key="2026-W34", now=now, expected=1, commit=False)
+        mission_id = missions_store.start(
+            seed, "improve", "local", "m", now=now, commit=False)
+        run_id = improve_runs_store.start(
+            seed, backlog_id=None, mission_id=mission_id, now=now,
+            commit=False)
+        assert improve_waves.claim_slot(
+            seed, period_key="2026-W34", k=0, mission_id=mission_id,
+            now=now, commit=False)
+        seed.commit()
+    finally:
+        seed.close()
+
+    staging_dir = loop._root / "plugins" / "_staging" / str(mission_id)
+    snapshot_src = staging_dir / "_snapshot_src"
+    (snapshot_src).mkdir(parents=True)
+    (snapshot_src / "plugin.py").write_text("def compute(df, params):\n    return {}\n")
+    # `_chmod_tree_readonly` と同じくディレクトリ 0500・ファイル 0400 で固める
+    os.chmod(snapshot_src / "plugin.py", 0o400)
+    os.chmod(snapshot_src, 0o500)
+    os.chmod(staging_dir, 0o500)
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id,
+        staging_dir=staging_dir, source_snapshot_dir=snapshot_src,
+        allowed_backlog_ids=None, slot_key=("2026-W34", 0), ledger=ledger,
+        rpc_handlers={})
+
+    loop.compensate_launch_failure(ctx=ctx, now=later)
+
+    assert not staging_dir.exists(), (
+        "compensate_launch_failure が readonly staging ディレクトリを"
+        "削除していない")
+
+
+
