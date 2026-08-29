@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from agentic_fx.config import ConfigError, Settings, load_settings
+from agentic_fx.core.accounting import drawdown_pct
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example"
 
@@ -85,6 +86,46 @@ def test_kill_switch_cannot_be_disabled(tmp_path):
     p.write_text(yaml.safe_dump(raw))
     with pytest.raises(ConfigError, match="kill_switch_enabled"):
         load_settings(p)
+
+
+# round2 #1 是正 (裁定B、2026-08-29): `drawdown_kill_pct` に上限が無いと
+# `9999`/`1e9` を受理し、drawdown kill switch (CLAUDE.md 絶対制約) が
+# de facto 無効化できてしまう (probe 実測)。
+def test_drawdown_kill_pct_rejects_unreachable_values(tmp_path):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["risk"]["drawdown_kill_pct"] = 9999
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError):
+        load_settings(p)
+
+
+def test_drawdown_kill_pct_le_100_latches_at_equity_zero(tmp_path):
+    # 上限値自体が「到達可能性の保証」であることを固定する — `le=1e9` への
+    # 変異では `9999` 拒否テストだけでは殺せない (equity=0 が
+    # drawdown_pct の最大到達値 100.0 であることまで見る)。
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["risk"]["drawdown_kill_pct"] = 100.0
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    s = load_settings(p)
+    assert s.risk.drawdown_kill_pct == 100.0
+    assert drawdown_pct(equity=0.0, hwm=1000.0) == 100.0
+    assert drawdown_pct(equity=0.0, hwm=1000.0) >= s.risk.drawdown_kill_pct
+
+
+def test_drawdown_kill_pct_above_threshold_warns_at_startup(tmp_path, caplog):
+    import logging
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["risk"]["drawdown_kill_pct"] = 99.0
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.config"):
+        load_settings(p)
+    assert any("drawdown_kill_pct" in r.message for r in caplog.records)
 
 
 def test_unknown_top_level_key_rejected(tmp_path):

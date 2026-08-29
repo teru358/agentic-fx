@@ -1,6 +1,7 @@
 """settings.yaml のロードと検証 (1 ファイル、3 分割しない — 設計書 §12)。"""
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -10,6 +11,14 @@ from pydantic import (
     BaseModel, ConfigDict, Field, ValidationError, field_validator,
     model_validator,
 )
+
+_log = logging.getLogger("agentic_fx.config")
+
+# round2 裁定B (2026-08-29): drawdown_kill_pct > この値は「到達可能性は
+# あるが常識的な運用値ではない」ことの起動時 WARN しきい値。上限
+# (le=100、下記 RiskSettings) と役割が違う — le=100 は「equity>=0 の全域で
+# ラッチ可能」という穴塞ぎ (到達可能性の保証)、20 超 WARN は妥当性の可視化。
+_DRAWDOWN_KILL_PCT_WARN_THRESHOLD = 20
 
 
 class ConfigError(Exception):
@@ -40,7 +49,13 @@ class RiskSettings(_Strict):
     max_total_risk_pct: float = Field(gt=0)
     max_leverage: float = Field(gt=0)
     daily_loss_limit_pct: float = Field(gt=0)
-    drawdown_kill_pct: float = Field(gt=0)
+    # round2 #1 是正 (裁定B、2026-08-29): 上限が無いと `9999`/`1e9` 等の
+    # 到達不能な値を `Settings.model_validate` が受理し、drawdown kill
+    # switch (CLAUDE.md 絶対制約) が de facto 無効化できてしまう
+    # (probe 実測)。`accounting.drawdown_pct` は `max(0, (hwm-equity)/hwm*100)`
+    # で equity<0 のとき 100 を超えうるため equity>=0 の全域を境界にする
+    # には `le=100` が要る (equity=0 で drawdown_pct==100.0)。
+    drawdown_kill_pct: float = Field(gt=0, le=100)
     limit_deviation_pct: float = Field(gt=0)
     limit_expiry_max_h: float = Field(gt=0, le=24)
     max_slippage_pct: float = Field(gt=0)
@@ -362,6 +377,19 @@ class Settings(_Strict):
             raise ValueError(
                 f"datafeed.watch_symbols ({len(self.datafeed.watch_symbols)}) "
                 f"exceeds analysis.max_watch_symbols ({self.analysis.max_watch_symbols})")
+        return self
+
+    @model_validator(mode="after")
+    def _warn_high_drawdown_kill_pct(self) -> "Settings":
+        # round2 #1 残余 (裁定B): `le=100` は到達可能性の保証止まりで、
+        # `99.99` のような「実質無効化」に近い値は妥当。raise しない
+        # (config で無効化不可の絶対制約は上限で担保済み、ここは可観測性)。
+        if self.risk.drawdown_kill_pct > _DRAWDOWN_KILL_PCT_WARN_THRESHOLD:
+            _log.warning(
+                "risk.drawdown_kill_pct=%s is above the sanity threshold "
+                "(%s%%) — the drawdown kill switch may rarely or never "
+                "latch in practice",
+                self.risk.drawdown_kill_pct, _DRAWDOWN_KILL_PCT_WARN_THRESHOLD)
         return self
 
 
