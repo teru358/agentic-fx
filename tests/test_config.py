@@ -435,6 +435,51 @@ def test_settings_yaml_example_has_schedule_improve_at():
     assert s.schedule.improve_at
 
 
+# round2 #3 是正 (2026-08-29、verified-round2.md #3): `schedule.improve_at`
+# に形式検証が無いと ImproveSupervisor.tick が毎tick ValueError を投げ、
+# scheduler_thread の except Exception: が飲んで改善ループが恒久沈黙する。
+@pytest.mark.parametrize("value", ["Saturday 03:00", "03:00"])
+def test_improve_at_is_validated_against_cadence_weekly(tmp_path, value):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["schedule"]["improve"] = "weekly"
+    raw["schedule"]["improve_at"] = value
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError):
+        load_settings(p)
+
+
+def test_improve_at_is_validated_against_cadence_daily(tmp_path):
+    # cadence と組で見ることを固定する — 片方の正規表現だけ見る変異
+    # (例えば常に _WEEKLY_AT_RE を使う) を殺す。"Sat 03:00" は
+    # weekly の形式であって daily としては不正。
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["schedule"]["improve"] = "daily"
+    raw["schedule"]["improve_at"] = "Sat 03:00"
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError):
+        load_settings(p)
+
+
+def test_improve_at_valid_values_pass_for_each_cadence(tmp_path):
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["schedule"]["improve"] = "weekly"
+    raw["schedule"]["improve_at"] = "Sat 03:00"
+    p1 = tmp_path / "s1.yaml"
+    p1.write_text(yaml.safe_dump(raw))
+    assert load_settings(p1).schedule.improve_at == "Sat 03:00"
+
+    raw["schedule"]["improve"] = "daily"
+    raw["schedule"]["improve_at"] = "03:00"
+    p2 = tmp_path / "s2.yaml"
+    p2.write_text(yaml.safe_dump(raw))
+    assert load_settings(p2).schedule.improve_at == "03:00"
+
+
 def test_runner_choice_backend_accepts_codex():
     from agentic_fx.config import RunnerChoice
     assert RunnerChoice(backend="codex", model="m").backend == "codex"

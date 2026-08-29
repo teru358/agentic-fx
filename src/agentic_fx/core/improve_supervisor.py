@@ -77,9 +77,24 @@ class ImproveSupervisor:
         finally:
             expire_conn.close()
         s = self._settings.schedule
-        occurrence = latest_scheduled_occurrence(
-            now, cadence=s.improve, at=s.improve_at,
-            display_timezone=self._settings.display_timezone)
+        # round2 #3 追加 pin (2026-08-29、verified-round2.md #3): 設定検証
+        # (config.py の ScheduleSettings._check_improve_at) を入れても
+        # 「tick が例外で黙って死ぬ」構造自体は残る (scheduler_thread の
+        # `except Exception: _log.exception("tick failed")` は技術ログのみ
+        # で activity/notifier には出ない)。ここで一度だけ activity へ
+        # 1 行残してから re-raise する (呼び出し元の技術ログ記録は妨げない)。
+        try:
+            occurrence = latest_scheduled_occurrence(
+                now, cadence=s.improve, at=s.improve_at,
+                display_timezone=self._settings.display_timezone)
+        except Exception:
+            _log.exception("ImproveSupervisor.tick: latest_scheduled_occurrence "
+                           "failed for cadence=%r at=%r", s.improve, s.improve_at)
+            if self._activity is not None:
+                self._activity.write(
+                    Category.IMPROVE, "improve_tick_schedule_error",
+                    f"cadence={s.improve} at={s.improve_at!r}")
+            raise
         period_key = period_key_of(occurrence, cadence=s.improve)
         conn = self._conn()
         owns = self._conn_for_test is None

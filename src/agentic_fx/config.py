@@ -213,6 +213,27 @@ class ScheduleSettings(_Strict):
     improve: str = Field(pattern="^(weekly|daily)$")
     improve_at: str = "Sat 03:00"
 
+    # round2 #3 是正 (2026-08-29、verified-round2.md #3): `improve_at` に
+    # 形式検証が無いと (probe 実測: `"Saturday 03:00"`/`""`/`"xx"`/
+    # `"Sat 25:00"` を全て受理)、`ImproveSupervisor.tick` が毎 tick
+    # `latest_scheduled_occurrence` → `ValueError` (scheduler.py) を投げ、
+    # `scheduler_thread` の `except Exception: _log.exception("tick failed")`
+    # に飲まれる — activity にも notifier にも出ないまま改善ループが
+    # 恒久沈黙する (取引レーンは影響を受けない)。`improve` の値に応じて
+    # 既存の `_DAILY_AT_RE`/`_WEEKLY_AT_RE` (scheduler.py — 正規表現を
+    # ここに複製しない) で照合する。`fullmatch` を使う (M1 是正と同じ
+    # 末尾改行の穴を新設しない — `$` は MULTILINE 無しでも文字列末尾の
+    # 直前の改行にマッチしうるため `.match`/`$` だけでは不十分)。
+    @model_validator(mode="after")
+    def _check_improve_at(self) -> "ScheduleSettings":
+        from agentic_fx.core.scheduler import _DAILY_AT_RE, _WEEKLY_AT_RE
+        rx = _DAILY_AT_RE if self.improve == "daily" else _WEEKLY_AT_RE
+        if not rx.fullmatch(self.improve_at):
+            raise ValueError(
+                f"invalid improve_at for cadence {self.improve!r}: "
+                f"{self.improve_at!r}")
+        return self
+
 
 class LoggingSettings(_Strict):
     level: str = "INFO"

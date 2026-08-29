@@ -1333,3 +1333,39 @@ def test_spawn_slot_thread_crash_is_recorded_in_activity(conn, tmp_path):
     text = (tmp_path / "activity.tsv").read_text()
     assert "improve_slot_thread_crashed" in text
     assert Category.IMPROVE.value in text
+
+
+# round2 #3 追加 pin (2026-08-29、verified-round2.md #3): 設定検証を入れても
+# 「tick が例外で黙って死ぬ」構造自体は残るため、ImproveSupervisor.tick の
+# scheduler 例外が activity に1行残ることを固定する。
+def test_tick_schedule_error_is_recorded_in_activity(conn, tmp_path):
+    activity = ActivityLog(tmp_path / "activity.tsv")
+
+    class _BrokenCadence:
+        improve = "weekly"
+        improve_at = "not a valid at string"
+
+    class _Improve:
+        parallel = 1
+
+    class _BrokenSettings:
+        schedule = _BrokenCadence()
+        improve = _Improve()
+        display_timezone = "UTC"
+
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_BrokenSettings(),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0,
+                                                        tzinfo=timezone.utc)),
+                             db_path=Path(conn.execute(
+                                 "PRAGMA database_list").fetchone()[2]),
+                             stop_event=threading.Event(),
+                             activity=activity)
+    sup._conn_for_test = conn
+
+    with pytest.raises(ValueError):
+        sup.tick(datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc))
+
+    text = (tmp_path / "activity.tsv").read_text()
+    assert "improve_tick_schedule_error" in text
+    assert Category.IMPROVE.value in text
