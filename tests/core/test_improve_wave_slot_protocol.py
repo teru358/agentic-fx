@@ -10,8 +10,10 @@ from typing import Any
 
 import pytest
 
+from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.improve_supervisor import ImproveSupervisor
 from agentic_fx.store import db as db_mod
+from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
 from agentic_fx.store import missions as missions_store
 
@@ -1188,3 +1190,146 @@ def test_submit_manual_prepares_with_slot_key_none_and_no_on_ready(conn):
     sup.submit_manual()
 
     assert fake_loop.prepare_calls == [{"slot_key": None, "on_ready": None}]
+
+
+# round2 #5: `_launch_slot` の `runner.run` 例外で capacity を恒久喪失
+# (verified-round2.md #5、最優先是正)。round1 の I3/I2(b)/C1 のどれとも
+# 別の窓 — prepare() 成功後 (Tx-0 commit 済み) に runner.run() 自体が
+# 例外を投げるケース。
+
+class _Round2FakeRunner:
+    def __init__(self, *, raises: BaseException | None = None):
+        self._raises = raises
+        self.on_ready = None
+        self.run_calls = 0
+
+    def run(self, mission):
+        self.run_calls += 1
+        if self._raises is not None:
+            raise self._raises
+        raise AssertionError("test must set raises=")
+
+
+class _Round2FakeCtx:
+    def __init__(self, *, mission_id, run_id, slot_key):
+        self.mission_id = mission_id
+        self.run_id = run_id
+        self.slot_key = slot_key
+
+
+class _Round2FakeImproveLoop:
+    """probe_4_5.py::probe5 と同形: `prepare` が実 Tx-0 (missions.start +
+    improve_runs.start + improve_waves.claim_slot) を 1 つの conn 上で
+    行い commit する。`compensate_launch_failure` は本物の
+    `ImproveLoop.compensate_launch_failure` と同じ契約
+    (mission/run/slot を 1 tx で終端する) を最小実装で模す — ここを
+    fake にするのは、round2 #5 是正の主張が「`_launch_slot` 側が
+    prepare() 後の runner.run() 例外を必ず補償に回す」という**呼び出し
+    配線**であって、`ImproveLoop` 内部の補償ロジックの再検証ではない
+    ため (補償ロジック自体は I3 で既に pin 済み)。"""
+
+    def __init__(self, conn, runner):
+        self._conn = conn
+        self._runner = runner
+        self.committed: list[str] = []
+        self.compensate_calls: list[dict] = []
+
+    def prepare(self, *, slot_key, now, on_ready=None):
+        period_key, k = slot_key
+        mission_id = missions_store.start(
+            self._conn, "improve", "local", "m", now=now, commit=False)
+        run_id = improve_runs_store.start(
+            self._conn, backlog_id=None, mission_id=mission_id, now=now,
+            commit=False)
+        assert improve_waves.claim_slot(
+            self._conn, period_key=period_key, k=k, mission_id=mission_id,
+            now=now, commit=False)
+        self._conn.commit()
+        self._runner.on_ready = on_ready
+        ctx = _Round2FakeCtx(mission_id=mission_id, run_id=run_id,
+                             slot_key=slot_key)
+        return "mission", ctx, self._runner
+
+    def commit(self, *, mission, ctx, result, now, slot_terminalize=True):
+        self.committed.append(result.status)
+
+    def compensate_launch_failure(self, *, ctx, now):
+        self.compensate_calls.append(
+            {"mission_id": ctx.mission_id, "run_id": ctx.run_id,
+             "slot_key": ctx.slot_key})
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            missions_store.finish_improve_mission(
+                self._conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                slot_key=ctx.slot_key, mission_status="failed",
+                run_result=None, backlog_transition=None, now=now,
+                commit=False)
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
+
+
+def test_runner_run_exception_does_not_burn_capacity(conn):
+    """殺すテスト案どおり: 例外の伝播だけでなく容量
+    (`_running_slot_count`) が実際に 0 に戻ることを assert する
+    (伝播だけの assert は無変異でも通ってしまうため採らない)。"""
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W34", now=datetime(2026, 8, 22, 3, 0),
+        expected=1, commit=True)
+    runner = _Round2FakeRunner(raises=OSError("simulated ENOSPC"))
+    fake_loop = _Round2FakeImproveLoop(conn, runner)
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0)),
+                             db_path=Path("x"), stop_event=threading.Event())
+    sup._conn_for_test = conn
+    sup._improve_loop = fake_loop
+
+    with pytest.raises(OSError):
+        sup._launch_slot("2026-W34", 0)
+
+    assert fake_loop.committed == []
+    assert len(fake_loop.compensate_calls) == 1
+    assert sup._running_slot_count(conn) == 0
+    mission_id = fake_loop.compensate_calls[0]["mission_id"]
+    run_id = fake_loop.compensate_calls[0]["run_id"]
+    mission_row = conn.execute(
+        "SELECT status, finished_at FROM missions WHERE id=?",
+        (mission_id,)).fetchone()
+    assert mission_row["status"] == "failed"
+    assert mission_row["finished_at"] is not None
+    run_row = conn.execute(
+        "SELECT finished_at FROM improvement_runs WHERE id=?",
+        (run_id,)).fetchone()
+    assert run_row["finished_at"] is not None
+    slot_row = conn.execute(
+        "SELECT status FROM improve_wave_slots "
+        "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+    assert slot_row["status"] != "claimed"
+
+
+def test_spawn_slot_thread_crash_is_recorded_in_activity(conn, tmp_path):
+    """追加 pin: `_spawn_slot_thread` の target (`_launch_slot`) が例外を
+    投げても daemon thread の default excepthook (stderr のみ) に飲まれず、
+    activity へ 1 行残ること。"""
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W35", now=datetime(2026, 8, 22, 3, 0),
+        expected=1, commit=True)
+    runner = _Round2FakeRunner(raises=OSError("simulated EMFILE"))
+    fake_loop = _Round2FakeImproveLoop(conn, runner)
+    activity = ActivityLog(tmp_path / "activity.tsv")
+    sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
+                             settings=_fake_settings(parallel=1),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0)),
+                             db_path=Path("x"), stop_event=threading.Event(),
+                             activity=activity)
+    sup._conn_for_test = conn
+    sup._improve_loop = fake_loop
+
+    sup._spawn_slot_thread("2026-W35", 0)
+    sup.join(timeout=5.0)
+
+    text = (tmp_path / "activity.tsv").read_text()
+    assert "improve_slot_thread_crashed" in text
+    assert Category.IMPROVE.value in text

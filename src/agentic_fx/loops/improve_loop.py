@@ -352,6 +352,25 @@ class ImproveLoop:
                 Category.IMPROVE, "prepare_compensation_failed",
                 f"mission_id={mission_id} run_id={run_id}")
 
+    # round2 #5 是正 (2026-08-29): `prepare()` は Tx-0 を完走・close 済みで
+    # 呼び出し元 (`ImproveSupervisor._launch_slot`) に mission/run/slot を
+    # 渡す。その後 `runner.run(mission)` 自体が例外を投げる窓は I3
+    # (`_compensate_prepare_failure`、prepare() 内部の例外) にも I2(b)
+    # (pre-ready 失敗を runner が値で返す窓) にも属さない第 4 の窓 —
+    # verified-round2.md #5。`_compensate_prepare_failure` と同型の
+    # 1 tx 終端を、`_launch_slot` から呼べる形で公開する (新規 write conn
+    # を自前で開く — prepare() が close した後の呼び出しのため)。
+    def compensate_launch_failure(self, *, ctx: "ImproveRunContext",
+                                  now: datetime) -> None:
+        conn = self._db_write_conn_factory()
+        try:
+            self._compensate_prepare_failure(
+                conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                slot_key=ctx.slot_key, now=now)
+        finally:
+            if getattr(self, "_conn_for_test", None) is None:
+                conn.close()
+
     # precheck 2026-08-22 pass2: RB4 — Step 2a で定義した失敗するテストへの
     # 最小実装。8-I 節「プレースホルダ⇔戻り値キーの対応表 (B8)」の 17 項目
     # をそのまま埋める。self の属性には依存しない (Step 2a のテストが

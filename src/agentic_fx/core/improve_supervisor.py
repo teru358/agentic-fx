@@ -143,9 +143,25 @@ class ImproveSupervisor:
 
     # ---- 内部 ---------------------------------------------------------
 
+    def _run_slot_thread(self, period_key: str, k: int) -> None:
+        # round2 #5 是正: `_launch_slot` が re-raise した後の default
+        # excepthook (stderr のみ) では activity にも notifier にも残らない。
+        # `MissionSupervisor._run` (兄弟) が持つ try/except と対称にする —
+        # 本体の補償 (`compensate_launch_failure`) は既に `_launch_slot`
+        # 側で行っているので、ここは observability のためだけの 1 行。
+        try:
+            self._launch_slot(period_key, k)
+        except BaseException:
+            _log.exception(
+                "improve slot thread crashed for %s/%s", period_key, k)
+            if self._activity is not None:
+                self._activity.write(
+                    Category.IMPROVE, "improve_slot_thread_crashed",
+                    f"period_key={period_key} k={k}")
+
     def _spawn_slot_thread(self, period_key: str, k: int) -> None:
         t = threading.Thread(
-            target=self._launch_slot, args=(period_key, k), daemon=True,
+            target=self._run_slot_thread, args=(period_key, k), daemon=True,
             name=f"afx-improve-slot-{period_key}-{k}")
         with self._launch_lock:
             # 検収 B5: tick 時にも終了済みスレッドを prune し、
@@ -213,7 +229,25 @@ class ImproveSupervisor:
 
             mission, ctx, runner = self._improve_loop.prepare(
                 slot_key=(period_key, k), now=now, on_ready=_on_ready)
-            result = runner.run(mission)
+            # round2 #5 是正 (2026-08-29): I3/I2(b)/C1 のどの窓にも属さない
+            # 「prepare() 成功後、runner.run() 自体が例外を投げる」第 4 の窓
+            # (verified-round2.md #5)。WorkerRunner.run は shutil.copytree /
+            # subprocess.Popen を try/except 無しで実行するため ENOSPC /
+            # EMFILE 等が直撃しうる。無ガードだと mission(running)/
+            # run(未終端)/slot(claimed) が dangling のまま残り、
+            # `_running_slot_count` が容量を恒久的に食い潰す
+            # (既定 improve.parallel=1 では改善ループが再起動まで停止する)。
+            # I3 と同じ所有者 (mission_id/run_id/slot_key を知る `ctx`) から
+            # 1 tx で終端化してから re-raise する。
+            try:
+                result = runner.run(mission)
+            except BaseException:
+                _log.exception(
+                    "improve runner.run raised for slot %s/%s — "
+                    "compensating (capacity leak guard)", period_key, k)
+                self._improve_loop.compensate_launch_failure(
+                    ctx=ctx, now=self._clock.now())
+                raise
             if reached_running or result.status == "completed":
                 # on_ready 到達後 (= running へ遷移済み) の失敗、または
                 # 完走 — 通常の commit 終端へ渡す。retry しない (二重実行
