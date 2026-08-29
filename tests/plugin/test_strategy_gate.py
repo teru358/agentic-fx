@@ -223,3 +223,188 @@ def test_eval_timeframe_normalizes_1d_to_24h_for_run_in_sample_and_holdout(
         settings=_SETTINGS, meta=_meta(timeframe="1d", content_hash="h6"))
     assert seen_eval_timeframes == [("run_in_sample", "24h"),
                                     ("run_holdout", "24h")]
+
+
+# round2 O1/O2/O3 是正 (2026-08-29、verified-round2.md、pin のみ — 実装は
+# 触らない): `record_fn=None` の即時 save 経路 (`switch._run_full_gate`
+# = P1 submit / P3 bless の本番経路。改善ループ側は `record_fn=gate_rows.
+# append` を渡すため到達しない) の観測点が無かった。
+
+def _no_strategy_row_kwargs(*, pair="USDJPY"):
+    """`holdout.run_in_sample` が `record_fn` へ渡す実 kwargs 形
+    (`backtest_runs_store.save_harness_run` の必須引数一式) を模す。"""
+    from datetime import timezone
+    return {
+        "scope": "in_sample", "plugin_ref": "plugins/brand_new_strategy",
+        "content_hash": "h3", "kind": "strategy", "pair": pair,
+        "timeframe": "1h", "source": "dukascopy",
+        "period": (datetime(2026, 1, 1, tzinfo=timezone.utc),
+                  datetime(2026, 2, 1, tzinfo=timezone.utc)),
+        "metrics": {"trades": 30, "pf": 1.2, "win_rate": 0.5, "avg_r": 0.1,
+                    "max_drawdown": -0.1, "total_pnl": 100.0,
+                    "evaluable": True, "fallback_spread_used": False},
+        "settings_hash": "sh1", "core_commit": "cc1",
+        "initial_balance": 10000.0,
+        "now": datetime(2026, 8, 22, tzinfo=timezone.utc),
+        "variant": "candidate"}
+
+
+def test_no_strategy_row_is_saved_immediately_when_record_fn_is_none(
+        monkeypatch, conn):
+    """O1 pin: `record_fn` 省略 (=None、`switch._run_full_gate` の本番経路)
+    でも no_strategy 行が `backtest_runs` へ即時 save されること。
+    `fake run_in_sample` は `record_fn(row)` を実際に呼ぶ形にする
+    (呼ばないと `in_sample_rows` が空で no_strategy 行が 0 件になり、
+    テストが「実装が動いた」ことを見誤る)。"""
+    _fake_intent_source(monkeypatch)
+
+    def _fake_run_in_sample(*a, record_fn=None, **kw):
+        row = _no_strategy_row_kwargs(pair=kw.get("symbol", "USDJPY"))
+        if record_fn is not None:
+            record_fn(row)
+        return {"trades": 30, "pf": 1.2}
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        _fake_run_in_sample)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: {"trades": 30, "pf": 1.1})
+
+    verdict = evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        content_hash="h3", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", content_hash="h3"))
+    assert verdict.baseline_variant == "no_strategy"
+
+    rows = conn.execute(
+        "SELECT plugin_ref, variant FROM backtest_runs "
+        "WHERE plugin_ref='no_strategy:brand_new_strategy' "
+        "AND variant='no_strategy'").fetchall()
+    assert len(rows) == 1
+
+
+def test_no_strategy_path_wraps_record_fn_for_run_in_sample_only(
+        monkeypatch, conn):
+    """O2 pin: no_strategy 経路 (承認行なし) では `run_in_sample` へ渡る
+    record_fn は捕捉用のラッパー (sentinel そのものではない) だが、
+    `run_holdout_gate` へは sentinel がそのまま転送される
+    (`evaluate_strategy_adoption_gate:165` 付近 — 素通し)。この非対称を
+    固定する。"""
+    _fake_intent_source(monkeypatch)
+    seen = []
+
+    def _fake_run_in_sample(*a, record_fn=None, **kw):
+        seen.append(("run_in_sample", record_fn))
+        return {"trades": 30, "pf": 1.2}
+
+    def _fake_run_holdout(*a, record_fn=None, **kw):
+        seen.append(("run_holdout", record_fn))
+        return {"trades": 30, "pf": 1.1}
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        _fake_run_in_sample)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        _fake_run_holdout)
+    sentinel = object()
+
+    evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        content_hash="h3", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", content_hash="h3"),
+        record_fn=sentinel)
+
+    assert len(seen) == 2
+    in_sample_call, holdout_call = seen
+    assert in_sample_call[0] == "run_in_sample"
+    assert in_sample_call[1] is not sentinel  # ラッパーに差し替えられる
+    assert holdout_call == ("run_holdout", sentinel)  # sentinel がそのまま転送
+
+    # そのラッパーを直接呼ぶと (a) sentinel (呼び出し可能な fake) へ転送
+    # され (b) in_sample_rows に積まれる、の両立を確認する。
+    wrapper = in_sample_call[1]
+    forwarded_to_sentinel = []
+
+    def _callable_sentinel(row):
+        forwarded_to_sentinel.append(row)
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, record_fn=None, **kw: (
+            record_fn(_no_strategy_row_kwargs()),
+            {"trades": 30, "pf": 1.2})[1])
+    # wrapper は `evaluate_strategy_adoption_gate` の閉じたクロージャ内で
+    # `in_sample_rows.append(row)` と `record_fn(row)` (呼び出し元の
+    # record_fn=None のときは即時 save) の両方を行う。ここでは呼び出し元
+    # の record_fn を実際に呼び出し可能な fake に差し替えて再実行し、
+    # wrapper が (a) sentinel へ転送する (b) in_sample_rows へ積む の
+    # 両方を行うことを確認する。
+    evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy2", pairs=["USDJPY"], timeframe="1h",
+        content_hash="h3b", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy2", content_hash="h3b"),
+        record_fn=_callable_sentinel)
+    # (a) wrapper が転送する: in-sample の生 row (1回目) と、末尾ループが
+    # 組み立てる no_strategy 行 (2回目、plugin_ref が no_strategy: 接頭辞)
+    # の 2 回、record_fn へ届くこと。
+    assert len(forwarded_to_sentinel) == 2
+    assert forwarded_to_sentinel[0]["plugin_ref"] == "plugins/brand_new_strategy"
+    assert forwarded_to_sentinel[1]["plugin_ref"] == "no_strategy:brand_new_strategy2"
+    rows = conn.execute(
+        "SELECT plugin_ref FROM backtest_runs WHERE "
+        "plugin_ref='no_strategy:brand_new_strategy2'").fetchall()
+    assert len(rows) == 0  # (b) record_fn 指定時は即時 save しない (呼び出し
+                           # 元の record_fn 経由でのみ蓄積される — Tx-2 側の
+                           # 責務であって wrapper 自身は DB に書かない)
+
+
+def test_no_strategy_row_copies_identity_and_replaces_metrics_only(
+        monkeypatch, conn):
+    """O3 pin: no_strategy 行が candidate 行の identity 列
+    (period/settings_hash/core_commit/initial_balance/source/timeframe/
+    content_hash/kind/scope) をそのまま複製し、plugin_ref/variant/metrics
+    だけ差し替えることを固定する。`dict(row)` の shallow copy を消す変異
+    は candidate 行の dict も書き換えてしまう (nested な metrics 自体は
+    丸ごと置換なので nested 破壊は起きないが、plugin_ref の破壊は起きる)。"""
+    _fake_intent_source(monkeypatch)
+    captured_rows: list[dict] = []
+
+    def _fake_run_in_sample(*a, record_fn=None, **kw):
+        row = _no_strategy_row_kwargs(pair=kw.get("symbol", "USDJPY"))
+        if record_fn is not None:
+            record_fn(row)
+        captured_rows.append(row)
+        return {"trades": 30, "pf": 1.2}
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        _fake_run_in_sample)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: {"trades": 30, "pf": 1.1})
+
+    evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        content_hash="h3", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", content_hash="h3"))
+
+    candidate_row = captured_rows[0]
+    row = conn.execute(
+        "SELECT * FROM backtest_runs WHERE plugin_ref="
+        "'no_strategy:brand_new_strategy' AND variant='no_strategy'"
+    ).fetchone()
+    assert row is not None
+    assert row["settings_hash"] == candidate_row["settings_hash"]
+    assert row["core_commit"] == candidate_row["core_commit"]
+    assert row["initial_balance"] == candidate_row["initial_balance"]
+    assert row["source"] == candidate_row["source"]
+    assert row["timeframe"] == candidate_row["timeframe"]
+    assert row["content_hash"] == candidate_row["content_hash"]
+    assert row["kind"] == candidate_row["kind"]
+    assert row["scope"] == candidate_row["scope"]
+    assert row["plugin_ref"] == "no_strategy:brand_new_strategy"
+    assert row["variant"] == "no_strategy"
+    # candidate 行の dict 自体は破壊されていないこと (shallow copy pin)
+    assert candidate_row["plugin_ref"] == "plugins/brand_new_strategy"
