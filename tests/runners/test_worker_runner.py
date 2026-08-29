@@ -2194,6 +2194,40 @@ def test_worker_runner_does_not_copy_auth_json_for_codex_llama_swap(
         "— ChatGPT サブスクの資格情報がローカル LLM 相手の mission に漏れる")
 
 
+def test_worker_runner_starts_codex_llama_swap_with_absent_auth_file(
+        monkeypatch, tmp_path):
+    """I2 是正 (codex 1周目, verified-codex-round1.md 是正5): 設計 §1.1-2
+    逐語「`provider=llama_swap` は空の scratch `CODEX_HOME` (auth.json 無し)
+    で起動する」を、`auth_file` が**そもそも実在しない**構成で確かめる
+    (既存 `test_worker_runner_does_not_copy_auth_json_for_codex_llama_swap`
+    は auth.json が実在するのにコピーされないことしか見ておらず、
+    「auth_file が無いと spawn できない」退行は fake 層で一度も pin
+    されていなかった)。"""
+    absent_auth = tmp_path / "creds" / "definitely-absent-auth.json"
+    captured: dict = {}
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        cfg_dir = Path(kw["cwd"]) / "cfg"
+        captured["cfg_has_auth"] = (cfg_dir / "auth.json").is_file()
+        return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    root = _root(tmp_path)
+    runner = WorkerRunner(
+        root=root,
+        settings=_worker_settings(codex_backend=True, codex_provider="llama_swap",
+                                  codex_auth_file=str(absent_auth)),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve")
+    runner.run(_mission())
+    # spy が呼ばれた (= Popen まで到達した) ことは `captured` へのキー設定で
+    # 確認済み (未設定なら KeyError で本テストが落ちる) — auth_file の
+    # 存在確認で spawn 前に例外になる退行が無いことの pin。他の spawn 系
+    # pin (上記) と同様、`_READY_CHILD_SCRIPT` は ready フレーム止まりの
+    # ため mission 自体は completed にならない — ここでは見ない。
+    assert captured["cfg_has_auth"] is False
+
+
 def test_worker_runner_copies_auth_json_for_codex_chatgpt(monkeypatch, tmp_path):
     """上記の対: `codex + provider=chatgpt` では `auth.json` を
     コピーする (退行防止の対テスト)。"""
