@@ -1017,6 +1017,33 @@ def test_cli_improve_verify_backend_returns_1_when_verification_fails(
     assert "mission did not complete: status=failed" in capsys.readouterr().err
 
 
+def test_cli_verify_backend_reports_ready_mismatch_as_rc1_not_traceback(
+        tmp_path, monkeypatch, capsys):
+    """L-F1/L-F14 是正 (verified-local-round1.md §1【1】【8】、裁定 C 案):
+    親ゲート (a) (`on_ready` の run_context mismatch) は他の 3 ゲート
+    (b)(c)(d) と異なり `VerifyBackendResult(ok=False, ...)` を返さず
+    生の `RuntimeError` を送出していたため、`dispatch` の統一エラー境界
+    (`except (ValueError, KeyError, OSError, sqlite3.Error)`) を素通りして
+    人間に生 traceback が出ていた。専用例外 `VerifyBackendGateError` へ
+    変え、`dispatch` の except にその型を足したことで、他の 3 ゲート同様
+    `エラー: ...` + rc=1 に畳まれることを固定する。"""
+    from unittest.mock import patch
+    from agentic_fx.entry import main as entry_main
+    from agentic_fx.loops.verify_backend import VerifyBackendGateError
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.loops.verify_backend.verify_backend") as vb:
+        vb.side_effect = VerifyBackendGateError(
+            "verify-backend: ready frame run_context mismatch (expected "
+            "mission_id=-1 ...)")
+        rc = entry_main(["improve", "verify-backend", "--backend", "local"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "run_context mismatch" in err
+    assert "Traceback" not in err
+
+
 def test_cli_improve_verify_backend_requires_backend_argument(
         tmp_path, monkeypatch, capsys):
     """F-C2 是正 (段0 診断4): `--backend` の `required=True` → `False` の

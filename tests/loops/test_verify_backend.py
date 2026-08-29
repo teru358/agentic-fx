@@ -22,7 +22,8 @@ import pytest
 
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
-from agentic_fx.loops.verify_backend import VerifyBackendResult, verify_backend
+from agentic_fx.loops.verify_backend import (
+    VerifyBackendGateError, VerifyBackendResult, verify_backend)
 from agentic_fx.runners.base import Mission, MissionResult
 
 NOW = datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc)
@@ -190,12 +191,18 @@ def test_verify_backend_fails_closed_on_ready_run_context_mismatch(
     tests/` = 0 件)。3 値 parametrize で mismatch を注入し、
     `verify_backend` 内の `on_ready` が RuntimeError を送出することを
     要求する (verify_backend はこの例外を `ok=False` へ変換せず、呼び
-    出し元へそのまま伝播させる — フェイルクローズの一形態)。"""
+    出し元へそのまま伝播させる — フェイルクローズの一形態)。
+
+    束F検収 L-F1/L-F14 是正 (裁定 C 案) により、送出型は汎用
+    `RuntimeError` から専用 `VerifyBackendGateError` (`RuntimeError` の
+    サブクラスではない) へ変わった — `backtest/cli.py::dispatch` の統一
+    エラー境界がこの型だけを個別に catch して `エラー: ...` + rc=1 に
+    畳むため (他の `RuntimeError` を握り潰す範囲は広げない)。"""
     monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
                         _FakeVerifyWorkerRunner)
     _BEHAVIOR["current"] = {"result": _echo_ok, "bad_ready": bad_field}
 
-    with pytest.raises(RuntimeError, match="run_context mismatch"):
+    with pytest.raises(VerifyBackendGateError, match="run_context mismatch"):
         verify_backend(tmp_path, _settings(), backend="local",
                        provider=None, clock=FixedClock(NOW))
 

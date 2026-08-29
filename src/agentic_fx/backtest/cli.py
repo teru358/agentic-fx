@@ -28,6 +28,7 @@ from agentic_fx.backtest.mt5_import import compare_sources, import_mt5
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
+from agentic_fx.loops.verify_backend import VerifyBackendGateError
 from agentic_fx.plugin import approval as plugin_approval
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin import sandbox as plugin_sandbox
@@ -578,6 +579,7 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
             return _analyze_corr(conn, args)
         finally:
             conn.close()
-    except (ValueError, KeyError, OSError, sqlite3.Error) as e:
+    except (ValueError, KeyError, OSError, sqlite3.Error,
+           VerifyBackendGateError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1

@@ -44,6 +44,18 @@ if TYPE_CHECKING:
 _log = logging.getLogger("agentic_fx.loops.verify_backend")
 
 
+class VerifyBackendGateError(Exception):
+    """親ゲート (a) (`on_ready` の run_context echo 照合) の mismatch 専用
+    例外 (束F検収 L-F1/L-F14 是正、裁定 C 案)。`RuntimeError` は
+    `_check_cli_backend`/`_validate_startup` 等、本リポジトリで「配線
+    ミスを起動時に殺す」用途にも広く使われているため、CLI の統一エラー
+    境界 (`backtest/cli.py::dispatch`) で一律 catch すると診断が落ちる
+    懸念があった。この専用型だけを `dispatch` の except に足すことで、
+    握り潰す範囲を広げずに他ゲート (b)(c)(d) と同じ `エラー: ...` + rc=1
+    の UX に揃える (fail-closed 性は維持 — mismatch のまま mission を
+    続行させない)。"""
+
+
 @dataclass(frozen=True)
 class VerifyBackendResult:
     ok: bool
@@ -198,7 +210,7 @@ def verify_backend(
                        or echoed_source is None
                        or Path(echoed_source).name != "source")
             if mismatch:
-                raise RuntimeError(
+                raise VerifyBackendGateError(
                     f"verify-backend: ready frame run_context mismatch "
                     f"(expected mission_id={mission_id!r} "
                     f"staging_dir={str(staging_dir)!r} and a "
