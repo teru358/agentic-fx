@@ -23,6 +23,24 @@ def test_plugin_artifact_requires_name_and_staging_checks(loop_and_ctx):
     assert "name" in verdict.reason
 
 
+def test_plugin_artifact_name_with_trailing_newline_is_rejected(loop_and_ctx):
+    """round2 D3 是正 (検収 acceptance-round2.md D3): `_inspect_output`
+    (improve_loop.py:689) の `artifact.name` 検査が `.fullmatch()` に
+    揃っていることの pin。既存の `test_plugin_artifact_requires_name_
+    and_staging_checks` は `"../evil"` (パス走査) しか通っておらず、
+    `.fullmatch`→`.match` に戻す変異 (末尾改行1個を受理してしまう) を
+    実測で殺せなかった (台帳の「同型なので機構的に同じ効果」は誤り —
+    acceptance-round2.md D3 参照)。"""
+    loop, ctx, conn = loop_and_ctx
+    output = {"artifact": {"type": "plugin", "name": "sma\n", "kind": "indicator",
+                           "self_test": "passed", "summary": "x"},
+              "selected": {"backlog_id": None, "idea": "x"},
+              "discoveries": [], "selection_rationale": "x"}
+    verdict = loop._inspect_output(output, ctx, conn=conn)
+    assert verdict.ok is False
+    assert "canonical form" in verdict.reason
+
+
 def test_report_artifact_skips_plugin_specific_checks(loop_and_ctx):
     """report / observation artifact には name/path 検査を掛けない
     (設計書 §4.2-1「report / observation の artifact にはこれらの検査を

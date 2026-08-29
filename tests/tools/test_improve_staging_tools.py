@@ -64,6 +64,21 @@ def test_safe_join_rejects_circular_symlink(tmp_path):
     assert "error" in out
 
 
+def test_safe_join_rejects_name_with_trailing_newline(tmp_path):
+    """round2 D3 是正 (検収 acceptance-round2.md D3): `_safe_join`
+    (improve_staging_tools.py:24) の `.fullmatch()` 化が実際にツール経由で
+    観測されていなかった (`.match` へ戻す変異が全スイート生存)。
+    末尾改行付きの name (`.match()` + `$` は受理してしまう — probe 実測と
+    同型) を `write_staging_file`/`read_staging_file` へ渡し、reject
+    されることを確認する。"""
+    tools, staging_dir, _ = _build(tmp_path)
+    out = tools["write_staging_file"].func(
+        name="rsi_v2\n", rel="plugin.py", content="x = 1\n")
+    assert "error" in out
+    # 正規形でない名前のディレクトリが staging_dir 配下に作られていないこと
+    assert not any(p.name.endswith("\n") for p in staging_dir.iterdir())
+
+
 def test_write_staging_file_rejects_rel_outside_allowed_set(tmp_path):
     tools, _, _ = _build(tmp_path)
     out = tools["write_staging_file"].func(

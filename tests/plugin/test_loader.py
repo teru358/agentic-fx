@@ -763,6 +763,37 @@ def test_discover_logs_symlink_target_not_a_directory_reason(tmp_path, caplog):
     assert "is not a directory" in caplog.text, caplog.text
 
 
+def test_discover_rejects_symlink_target_with_trailing_newline(tmp_path, caplog):
+    """round2 D3 是正 (検収 acceptance-round2.md D3):
+    `_resolve_entity` の symlink target 検査 (loader.py:263) が
+    `.fullmatch()` に揃っていることの実行時 pin。`test_symlink_target_regex_
+    rejects_trailing_traversal_via_missing_anchor` は `_SYMLINK_TARGET_RE_TMPL`
+    を直接 unit で叩くだけで `discover()` 経由の `.fullmatch()` 呼び出し
+    自体には触れておらず (`.match()` へ変異を戻しても全スイート生存が
+    実測された — 台帳の「同型なので機構的に同じ効果」は誤り)、
+    `test_discover_rejects_directory_name_with_trailing_newline` は
+    プレーンディレクトリ名 (loader.py:309 の `_PLUGIN_NAME_RE`) を叩くだけ
+    で symlink target 側 (loader.py:263) は別の正規表現・別の呼び出し site
+    なので識別しない。symlink target に末尾改行を持たせ、`discover()` が
+    reject することを直接叩いて確認する (`.fullmatch`→`.match` に戻す
+    変異は末尾改行を受理してしまい red になる)。"""
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    versions_dir = plugins_dir / ".versions" / "sma"
+    versions_dir.mkdir(parents=True)
+    fake_hash = "a" * 64
+    (versions_dir / fake_hash).mkdir()
+    # symlink target 文字列に末尾改行を 1 個持たせる (os.symlink は '\n' を
+    # 含む target 文字列を許容する — NUL と '/' 以外は任意のバイトが有効)。
+    os.symlink(f".versions/sma/{fake_hash}\n", plugins_dir / "sma")
+
+    with caplog.at_level(logging.WARNING):
+        metas = discover(plugins_dir)
+
+    assert not any(m.name == "sma" for m in metas)
+    assert "does not match canonical form" in caplog.text, caplog.text
+
+
 def test_symlink_target_regex_rejects_trailing_traversal_via_missing_anchor():
     """A10 (`stage0-bundle-B.md` Minor): `_SYMLINK_TARGET_RE_TMPL` の末尾
     `$` アンカーを落とすと、`.versions/<name>/<hash>` に続けて

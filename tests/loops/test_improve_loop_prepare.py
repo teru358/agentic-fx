@@ -11,7 +11,9 @@ from agentic_fx.activity import ActivityLog
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.store import backlog as backlog_store
+from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
+from agentic_fx.store import missions as missions_store
 from agentic_fx.store.db import connect, connect_readonly, init_db
 
 from tests.loops.conftest import SETTINGS, _FakeRag, _prepare_wave_slot
@@ -782,5 +784,75 @@ def test_read_candidate_timeframe_defaults_to_1h_when_key_omitted(
     (candidate_dir / "config.yaml").write_text("kind: indicator\n")  # timeframe 省略
 
     assert loop_min._read_candidate_timeframe(candidate_dir) == "1h"
+
+
+# --- round2 D2 是正 (検収 acceptance-round2.md D2): 本番
+# `ImproveLoop.compensate_launch_failure` を直接叩く killer -------------
+#
+# D2 の指摘: `test_runner_run_exception_does_not_burn_capacity`
+# (tests/core/test_improve_wave_slot_protocol.py) は `_Round2FakeImproveLoop.
+# compensate_launch_failure` (テスト内で終端化を再実装した fake) しか叩か
+# ず、本番 `ImproveLoop.compensate_launch_failure` の本体 (新規 write conn
+# の取得 / `_compensate_prepare_failure` への委譲 / `_conn_for_test` シーム
+# での close) には一度も到達していなかった。ここでは `loop_no_seam`
+# (write/readonly とも「毎回 db_path へ新規接続」— 本番 service.py と同型)
+# を使い、①本番メソッドを直接呼ぶ ②結果は呼び出しに使った conn ではなく
+# **別の readonly 接続**で読み直す (同一 conn で読むと「commit 済み」と
+# 「同一 tx 内で書いただけ」を区別できない — D-2b の教訓と同型) ことで
+# 本体を pin する。
+
+def test_compensate_launch_failure_terminalizes_mission_run_and_slot_via_fresh_conn(
+        loop_no_seam):
+    """本番 `ImproveLoop.compensate_launch_failure` を実 DB 上で直接呼び、
+    mission/run/slot が failed 終端になったことを**別接続**で確認する。
+    本体を `return` に置換する変異 (D2) は、mission/run が非終端
+    (`status='running'`/`finished_at IS NULL`) のまま・slot が `claimed`
+    のままになるため red になる。"""
+    loop, db_path = loop_no_seam
+    now = datetime(2026, 8, 22, 12, 0)
+    later = datetime(2026, 8, 22, 12, 5)
+
+    seed = connect(db_path)
+    try:
+        improve_waves.create_wave_and_slots(
+            seed, period_key="2026-W34", now=now, expected=1, commit=False)
+        mission_id = missions_store.start(
+            seed, "improve", "local", "m", now=now, commit=False)
+        run_id = improve_runs_store.start(
+            seed, backlog_id=None, mission_id=mission_id, now=now,
+            commit=False)
+        assert improve_waves.claim_slot(
+            seed, period_key="2026-W34", k=0, mission_id=mission_id,
+            now=now, commit=False)
+        seed.commit()
+    finally:
+        seed.close()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id,
+        staging_dir=Path("/tmp/staging"), source_snapshot_dir=Path("/tmp/src"),
+        allowed_backlog_ids=None, slot_key=("2026-W34", 0), ledger=ledger,
+        rpc_handlers={})
+
+    loop.compensate_launch_failure(ctx=ctx, now=later)
+
+    fresh = connect_readonly(db_path)
+    try:
+        m = fresh.execute(
+            "SELECT status, finished_at FROM missions WHERE id=?",
+            (mission_id,)).fetchone()
+        assert m["status"] == "failed"
+        assert m["finished_at"] is not None
+        r = fresh.execute(
+            "SELECT finished_at FROM improvement_runs WHERE id=?",
+            (run_id,)).fetchone()
+        assert r["finished_at"] is not None
+        slot = fresh.execute(
+            "SELECT status FROM improve_wave_slots "
+            "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+        assert slot["status"] != "claimed"
+    finally:
+        fresh.close()
 
 
