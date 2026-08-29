@@ -885,6 +885,125 @@ def test_pre_ready_failure_keeps_slot_reserved_through_real_wiring(tmp_path):
         check.close()
 
 
+def test_real_wiring_runner_run_exception_terminalizes_via_real_compensate(tmp_path):
+    """runner.run 例外も実 loop/store を通して failed に終端する。"""
+    from agentic_fx.activity import ActivityLog
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    from tests.loops.conftest import SETTINGS, _FakeRag
+
+    db_path = tmp_path / "real_wiring_runner_exception.db"
+    bootstrap = db_mod.connect(db_path)
+    db_mod.init_db(bootstrap)
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(
+        bootstrap, period_key="2026-W34", now=now, expected=1, commit=True)
+    from agentic_fx.store import backlog as backlog_store
+    backlog_store.add(bootstrap, "idea-for-partition", "user", now)
+    bootstrap.commit()
+    bootstrap.close()
+
+    loop = ImproveLoop(
+        root=tmp_path, settings=SETTINGS, clock=_FixedClock(now),
+        db_write_conn_factory=lambda: db_mod.connect(db_path),
+        db_readonly_conn_factory=lambda: db_mod.connect_readonly(db_path),
+        activity=ActivityLog(tmp_path / "activity.log"), rag=_FakeRag())
+
+    class _RaisingRunner:
+        on_ready = None
+        def run(self, mission):
+            raise OSError("simulated ENOSPC")
+
+    def _build_raising_runner(self, ctx, *, on_ready=None):
+        runner = _RaisingRunner()
+        runner.on_ready = on_ready
+        return runner
+
+    loop._build_worker_runner = _build_raising_runner.__get__(loop, ImproveLoop)
+    sup = ImproveSupervisor(capacity=1, root=tmp_path, settings=SETTINGS,
+                             clock=_FixedClock(now), db_path=db_path,
+                             stop_event=threading.Event())
+    sup._improve_loop = loop
+    with pytest.raises(OSError, match="simulated ENOSPC"):
+        sup._launch_slot("2026-W34", 0)
+
+    check = db_mod.connect(db_path)
+    try:
+        slot = check.execute(
+            "SELECT status FROM improve_wave_slots WHERE wave_period_key='2026-W34' AND k=0"
+        ).fetchone()
+        missions = check.execute(
+            "SELECT status, finished_at FROM missions ORDER BY id").fetchall()
+        assert slot["status"] == "failed"
+        assert len(missions) == 1
+        assert missions[0]["status"] == "failed"
+        assert missions[0]["finished_at"] is not None
+    finally:
+        check.close()
+
+
+def test_mixed_failure_windows_real_wiring_preserves_two_spawn_attempts(tmp_path):
+    """pre-ready 失敗の retry 後の run 例外も実 loop/store で終端する。"""
+    from agentic_fx.activity import ActivityLog
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    from agentic_fx.store import backlog as backlog_store
+    from tests.loops.conftest import SETTINGS, _FakeRag
+
+    db_path = tmp_path / "mixed_windows.db"
+    bootstrap = db_mod.connect(db_path)
+    db_mod.init_db(bootstrap)
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(
+        bootstrap, period_key="2026-W34", now=now, expected=1, commit=True)
+    backlog_store.add(bootstrap, "idea-for-partition", "user", now)
+    bootstrap.commit()
+    bootstrap.close()
+    loop = ImproveLoop(
+        root=tmp_path, settings=SETTINGS, clock=_FixedClock(now),
+        db_write_conn_factory=lambda: db_mod.connect(db_path),
+        db_readonly_conn_factory=lambda: db_mod.connect_readonly(db_path),
+        activity=ActivityLog(tmp_path / "activity.log"), rag=_FakeRag())
+    calls = {"count": 0}
+
+    class _MixedRunner:
+        on_ready = None
+        def run(self, mission):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return type("Result", (), {
+                    "status": "failed", "output": None,
+                    "reason": "pre-ready failure"})()
+            raise OSError("simulated ENOSPC on attempt 2")
+
+    def _build_mixed_runner(self, ctx, *, on_ready=None):
+        runner = _MixedRunner()
+        runner.on_ready = on_ready
+        return runner
+
+    loop._build_worker_runner = _build_mixed_runner.__get__(loop, ImproveLoop)
+    sup = ImproveSupervisor(capacity=1, root=tmp_path, settings=SETTINGS,
+                             clock=_FixedClock(now), db_path=db_path,
+                             stop_event=threading.Event())
+    sup._improve_loop = loop
+    with pytest.raises(OSError, match="attempt 2"):
+        sup._launch_slot("2026-W34", 0)
+    assert calls["count"] == 2
+
+    check = db_mod.connect(db_path)
+    try:
+        slot = check.execute(
+            "SELECT status, spawn_attempts FROM improve_wave_slots WHERE wave_period_key='2026-W34' AND k=0"
+        ).fetchone()
+        missions = check.execute(
+            "SELECT status, finished_at FROM missions ORDER BY id").fetchall()
+        assert slot["status"] == "failed"
+        assert slot["spawn_attempts"] == 2
+        assert len(missions) == 2
+        assert all(m["status"] == "failed" and m["finished_at"] is not None
+                   for m in missions)
+    finally:
+        check.close()
+
+
 # Tests for 9.5: N-slot 構成・接続所有・shutdown/join
 
 def test_n4_concurrent_slots_no_connection_sharing_no_mixup(tmp_path):

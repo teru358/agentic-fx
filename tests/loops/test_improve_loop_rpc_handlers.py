@@ -154,6 +154,24 @@ def test_persist_ledger_rows_fails_closed_when_handler_omits_save_kwargs(
             conn, ledger_entries=entries, now=_NOW)
 
 
+def test_persist_ledger_error_activity_includes_mission_id(loop_min, conn, tmp_path):
+    """並列 mission の ledger skip 行にも発生元 mission を残す。"""
+    loop_min._persist_ledger_rows(
+        conn,
+        ledger_entries=[{
+            "kind": "run_backtest",
+            "result_summary": {"error": "backtest_failed"},
+            "trial_count": 1,
+        }],
+        now=_NOW,
+        mission_id=424242,
+    )
+
+    activity_text = (tmp_path / "activity.log").read_text()
+    assert "ledger_entry_skipped_error" in activity_text
+    assert "mission=424242" in activity_text
+
+
 def test_analyze_corr_handler_does_not_persist_before_tx2(
         loop_min, conn, tmp_path, monkeypatch):
     """analyze_corr handler は `persist=False` で呼ぶ — RPC 呼出し時点では

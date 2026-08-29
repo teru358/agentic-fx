@@ -706,8 +706,9 @@ class ImproveLoop:
             # + `$` は末尾改行を受理する穴がある (`'foo\n'` が match する —
             # probe 実測)。`fullmatch` に揃える。
             if not _PLUGIN_NAME_RE.fullmatch(name):
+                display_name = name[:120] + ("…" if len(name) > 120 else "")
                 return _InspectionVerdict(
-                    ok=False, reason=f"artifact.name {name!r} is not in "
+                    ok=False, reason=f"artifact.name {display_name!r} is not in "
                                     "canonical form")
             # staging_dir/<name> の dirfd+lstat 検査は 10.6 節 (plugin ゲート)
             # で実装する — ここでは name 正規形のみ (手順1の範囲)。
@@ -1066,7 +1067,8 @@ class ImproveLoop:
             if "error" in summary:
                 self._activity.write(
                     Category.IMPROVE, "ledger_entry_skipped_error",
-                    f"kind={entry['kind']} error={summary['error']!r}")
+                    f"mission={mission_id} kind={entry['kind']} "
+                    f"error={summary['error']!r}")
                 continue
             if entry["kind"] == "run_backtest":
                 row_kwargs = {k: summary[k] for k in self._BACKTEST_ROW_KEYS}
@@ -1231,11 +1233,21 @@ class ImproveLoop:
                         reason=f"gate_failed:{gate_verdict.reason}", now=now)
                     return
 
+                from agentic_fx.plugin import approval
+                from agentic_fx.plugin import loader as plugin_loader
+                candidate_meta = plugin_loader._discover_one(
+                    candidate_dir, artifact["name"])
+                try:
+                    approval.assert_max_bars_within_limit(
+                        candidate_meta, settings=self._settings)
+                except ValueError as exc:
+                    self._finalize_gate_failed(
+                        conn, ctx=ctx, backlog_id=selection.backlog_id,
+                        reason=f"gate_failed:max_bars_limit:{exc}", now=now)
+                    return
+
                 kind = self._read_candidate_kind(candidate_dir)
                 if kind == "strategy":
-                    from agentic_fx.plugin import loader as plugin_loader
-                    candidate_meta = plugin_loader._discover_one(
-                        candidate_dir, artifact["name"])
                     strategy_verdict = self._run_strategy_gate(         # 手順4
                         conn, name=artifact["name"],
                         pairs=self._read_candidate_pairs(candidate_dir),
@@ -1578,6 +1590,9 @@ class ImproveLoop:
         レポートファイルに届かなかった)。"""
         ctx.ledger.mark_discarded()
         self._delete_staging(ctx)
+        self._activity.write(
+            Category.IMPROVE, "gate_failed",
+            f"mission={ctx.mission_id} reason={reason}")
         body_md = (
             f"# Improve Mission {ctx.mission_id} — gate failed\n\n"
             f"reason: `{reason}`\n\nNo approval request was produced by "

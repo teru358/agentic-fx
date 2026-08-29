@@ -41,6 +41,25 @@ def test_plugin_artifact_name_with_trailing_newline_is_rejected(loop_and_ctx):
     assert "canonical form" in verdict.reason
 
 
+def test_noncanonical_artifact_name_is_capped_before_activity_echo(loop_and_ctx, tmp_path):
+    """agent 由来 name は output-invalid activity を肥大化させない。"""
+    loop, ctx, conn = loop_and_ctx
+    huge_name = "x" * 200_001
+    output = {"artifact": {"type": "plugin", "name": huge_name},
+              "selected": {"backlog_id": None, "idea": "x"},
+              "discoveries": [], "selection_rationale": "x"}
+    verdict = loop._inspect_output(output, ctx, conn=conn)
+    assert verdict.ok is False
+    loop._activity.write(
+        __import__("agentic_fx.activity", fromlist=["Category"]).Category.IMPROVE,
+        "output_invalid", f"mission={ctx.mission_id} reason={verdict.reason}")
+
+    line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
+                if "output_invalid" in line)
+    assert len(line) < 500
+    assert "is not in canonical form" in line
+
+
 def test_report_artifact_skips_plugin_specific_checks(loop_and_ctx):
     """report / observation artifact には name/path 検査を掛けない
     (設計書 §4.2-1「report / observation の artifact にはこれらの検査を

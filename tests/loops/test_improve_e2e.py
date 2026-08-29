@@ -247,6 +247,58 @@ def test_full_cycle_discovery_to_backlog_transition(improve_env):
     assert backlog_after[1] == f"approved:{approval_id}"
 
 
+def test_oversized_max_bars_becomes_gate_failed_before_strategy_gate(
+        improve_env, monkeypatch):
+    """改善 loop 固有の承認 corridor も max_bars 上限で fail closed する。
+
+    正常範囲の候補は上の全周テストが pending approval まで進むことで対照を
+    固定する。ここでは strategy 候補を使い、strategy gate に届く前に拒否
+    されることを直接観測する。
+    """
+    app, root = improve_env
+    conn = app.conn_core
+    result = MissionResult(
+        status="completed",
+        output=_plugin_artifact("oversized_strategy_bars", kind="strategy"),
+        transcript=[],
+    )
+    loop = ImproveLoop(
+        root=root, settings=app.settings, clock=FixedClock(NOW),
+        db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
+        activity=app.activity, rag=app.rag,
+    )
+
+    def _strategy_gate_must_not_run(*args, **kwargs):
+        pytest.fail("max_bars_limit rejection reached the strategy gate")
+
+    monkeypatch.setattr(loop, "_run_strategy_gate", _strategy_gate_must_not_run)
+    oversized_config = _PASSING_STRATEGY_CONFIG.replace(
+        "params: {}", "max_bars: 999999\nparams: {}")
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
+        mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+        staging_dir = ctx.staging_dir
+        _write_staging_plugin(
+            staging_dir, "oversized_strategy_bars", _PASSING_STRATEGY_PY,
+            oversized_config, _PASSING_STRATEGY_TEST)
+        loop.commit(mission=mission, ctx=ctx, result=worker.run(mission), now=NOW)
+
+    approval_count = conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'").fetchone()[0]
+    assert approval_count == 0
+    backlog = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert backlog[0] == "observation"
+    assert "max_bars_limit" in backlog[1]
+    assert not staging_dir.exists()
+    activity_text = (root / "logs" / "activity.log").read_text()
+    assert "max_bars_limit" in activity_text
+    assert conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == 0
+
+
 def test_gate_failure_stops_at_report_no_approval_request(improve_env):
     """候補がゲート不合格 (test_plugin.py が plugin.py を書き換えようとする)
     のとき、承認申請は出ず、レポートのみで backlog が observation に落ちる。
