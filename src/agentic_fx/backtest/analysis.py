@@ -97,10 +97,12 @@ def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
     ``since`` (Task 11 上書き節 E の最小追加): 指定時は
     ``load_resampled_frame`` の ``since`` (= since 以降に開始する完成
     バケットのみ) として渡す。既定 None は全履歴 (人間 CLI の低レベル API
-    呼び出し用)。**round2 #9 是正 (設計書 §6.1 裁定注記、2026-08-29):
-    改善ループ ``analyze_for_agent`` は内部で ``in_sample_until`` から
-    遡る既定 90 日窓 (`_DB_READ_WINDOW_DAYS`) を計算し、この `since` へ
-    渡す** (agent が広げられる手段は無い — `_REQUEST_SCHEMA` は変更しない)。
+    呼び出し用)。**round2 #9 是正・裁定A改訂 (D1 是正) (設計書 §6.1 裁定
+    注記、2026-08-29): 改善ループ ``analyze_for_agent`` は内部で
+    ``in_sample_until`` から遡る窓 (`_compute_db_read_window_days` —
+    window/timeframe から導出、下限90日・上限730日) を計算し、この
+    `since` へ渡す** (agent が広げられる手段は無い — `_REQUEST_SCHEMA` は
+    変更しない)。
 
     F1 (Fix Round 1, codex Important-1 = sonnet Minor-2): ohlcv.close に
     正値制約は無く (REAL NOT NULL のみ)、close<=0 のバーが混入すると
@@ -384,14 +386,44 @@ _REQUEST_SCHEMA = {
     "lead_lag": {"kind", "a", "b", "timeframe"},
 }
 
-# 裁定 A / round2 #9 是正 (2026-08-29、設計書 §6.1 裁定注記): 改善ループの
-# DB 読みに窓が無く、`_load_returns` が `max_bars` 無しで全履歴を読んでいた
-# (改善ループ自身の遅延と I/O の自傷。外部への損害ではないため §6 の
-# 外向きリクエスト予算とは別枠)。`_REQUEST_SCHEMA` は変更せず (agent は窓を
-# 広げられない)、`analyze_for_agent` の実装内部で in_sample_until から
-# 遡る既定 90 日窓を強制する (壁時計直読み禁止の現行流儀どおり、決定論的
-# `now` から導出した `in_sample_until` を起点にする)。
-_DB_READ_WINDOW_DAYS = 90
+# 裁定 A / round2 #9 是正 (2026-08-29、設計書 §6.1 裁定注記)、
+# 裁定 A 改訂 (round2 D1 是正、2026-08-29): 改善ループの DB 読みに窓が無く、
+# `_load_returns` が `max_bars` 無しで全履歴を読んでいた (改善ループ自身の
+# 遅延と I/O の自傷。外部への損害ではないため §6 の外向きリクエスト予算とは
+# 別枠)。`_REQUEST_SCHEMA` は変更せず (agent は窓を広げられない)、
+# `analyze_for_agent` の実装内部で in_sample_until から遡る窓を強制する
+# (壁時計直読み禁止の現行流儀どおり、決定論的 `now` から導出した
+# `in_sample_until` を起点にする)。
+#
+# 固定 90 日窓は機能退行だった (round2 検収 D1): `timeframe='1d'` は 90 日
+# 窓に最大 90-91 本の 1d バーしか入らず、`rolling_corr_summary` の
+# `window=120` (WINDOWS の正規の列挙値) が恒久的に insufficient_data になる
+# — schema が受理する合法な要求を窓が殺していた。改訂裁定: 窓の日数は
+# **要求の window/timeframe から必要バー数を導出**する (係数 2 — 窓 1 個の
+# 成立に足りるだけでなく、営業日ギャップ・複数窓の余裕を見込む)。window が
+# 無い kind (`corr_matrix`/`lead_lag`) は `MIN_COMMON_OBS` を基準バー数と
+# する。導出結果は**下限 90 日・上限 730 日**でクリップする (下限は従来の
+# 既定を割らない安全側、上限は将来 `WINDOWS`/`TIMEFRAMES` が広がっても
+# 内向き DB 走査量に上限を保つための多層防御)。
+_DB_READ_WINDOW_DAYS_FLOOR = 90
+_DB_READ_WINDOW_DAYS_CAP = 730
+_DB_READ_WINDOW_COEFFICIENT = 2
+
+
+def _compute_db_read_window_days(timeframe: str, window: int | None) -> int:
+    """`analyze_for_agent` が DB から遡って読む日数を導出する (裁定A改訂)。
+
+    ``window`` は ``rolling_corr_summary`` のみが持つ (バー数)。他の kind
+    (``corr_matrix``/``lead_lag``) は ``None`` を渡し、``MIN_COMMON_OBS`` を
+    基準バー数として使う (§ の「窓 1 個あたり」ではなく「整列済みリターン
+    系列全体の長さ」に適用する規約 — 上のコメント参照)。
+    """
+    bar_minutes = _TF_MINUTES[timeframe]
+    base_bars = window if window is not None else MIN_COMMON_OBS
+    required_bars = base_bars * _DB_READ_WINDOW_COEFFICIENT
+    required_days = math.ceil(required_bars * bar_minutes / 1440)
+    return max(_DB_READ_WINDOW_DAYS_FLOOR,
+               min(_DB_READ_WINDOW_DAYS_CAP, required_days))
 
 
 def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
@@ -400,11 +432,12 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
 
     ``in_sample_until = holdout.in_sample_until(now, settings.backtest.
     holdout_months)`` (F1, 最終レビュー opus I-1 — UTC 正規化 + 分格子切り
-    捨て込みの境界算術の単一所有者) を内部で適用する。**round2 #9 是正
-    (設計書 §6.1 裁定注記): ``in_sample_until`` から遡る既定 90 日の DB 読み
-    窓 (`since`) も内部で強制する** (agent 側から広げる手段は無い — 内向き・
-    自傷性の DB 読みに予算が無かったことの是正、外向きリクエスト予算
-    (§6 本体) とは別枠)。symbols は
+    捨て込みの境界算術の単一所有者) を内部で適用する。**round2 #9 是正・
+    裁定A改訂 (D1 是正) (設計書 §6.1 裁定注記): ``in_sample_until`` から
+    遡る DB 読み窓 (`since`、`_compute_db_read_window_days` — window/
+    timeframe から導出、下限90日・上限730日) も内部で強制する** (agent
+    側から広げる手段は無い — 内向き・自傷性の DB 読みに予算が無かった
+    ことの是正、外向きリクエスト予算 (§6 本体) とは別枠)。symbols は
     ``settings.pairs + settings.datafeed.
     watch_symbols`` 内に限定 (重複除去・順序維持)。実行毎に
     ``analysis_runs.save`` し、返り値に ``analysis_run_id`` を含める
@@ -464,10 +497,12 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
     # 同じ経路で境界を得ることで、同じ now に対する境界のずれを無くす)。
     in_sample_until = _in_sample_until(now_utc,
                                        settings.backtest.holdout_months)
-    # 裁定A / round2 #9 是正 (§6.1): 決定論的な in_sample_until から遡る
-    # 既定 90 日窓を内部で強制する。`_REQUEST_SCHEMA` にキーは無いので
+    # 裁定A / round2 #9 是正、裁定A改訂 (D1 是正、§6.1): 決定論的な
+    # in_sample_until から遡る窓 (window/timeframe から導出、下限90日・
+    # 上限730日) を内部で強制する。`_REQUEST_SCHEMA` にキーは無いので
     # agent 側からこの窓を広げる手段は無い。
-    since = in_sample_until - timedelta(days=_DB_READ_WINDOW_DAYS)
+    since = in_sample_until - timedelta(
+        days=_compute_db_read_window_days(timeframe, window))
 
     try:
         if kind == "corr_matrix":

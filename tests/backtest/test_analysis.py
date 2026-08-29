@@ -785,3 +785,96 @@ def test_analyze_for_agent_persist_true_keeps_existing_behavior(tmp_path):
     after = conn.execute(
         "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
     assert after == before + 1
+
+
+# --- round2 D1 是正 (裁定A改訂、2026-08-29): DB 読み窓の導出 -------------
+#
+# 検収 (acceptance-round2.md D1): 固定90日窓では `timeframe='1d'` の窓内に
+# 1d バーが最大90-91本しか入らず、`rolling_corr_summary` の `window=120`
+# (WINDOWS の正規の列挙値) が恒久的に insufficient_data になっていた。
+# 改訂裁定は窓日数を window/timeframe から導出する (係数2、下限90日・
+# 上限730日)。以下は導出関数そのものの pin (a: 導出ロジック、床・天井は
+# 現行の合法な入力集合からは到達不能なので直接呼び出しで pin する) と、
+# 実際に `window=120, timeframe='1d'` が成功するようになったことの pin
+# (b: 退行の再発防止) の 2 段。
+
+from agentic_fx.backtest.analysis import _compute_db_read_window_days  # noqa: E402
+
+
+def test_compute_db_read_window_days_derives_bars_from_window_and_timeframe():
+    """window/timeframe から必要バー数 (係数2) → 日数を導出する基本形。
+    1d は 1 バー=1440分なので `required_bars * 1440 / 1440 = required_bars`
+    (日数と直結する簡単なケースで導出式そのものを照合する)。"""
+    assert _compute_db_read_window_days("1d", 120) == 120 * 2
+    assert _compute_db_read_window_days("1d", 60) == 60 * 2
+
+
+def test_compute_db_read_window_days_floors_small_derivations_at_90():
+    """derived が90日未満 (intraday timeframe、または window=None で
+    MIN_COMMON_OBS を基準にした場合) は下限90日でクリップする — 旧既定を
+    割らない安全側。現行の合法な入力集合 (TIMEFRAMES×WINDOWS、または
+    window=None の corr_matrix/lead_lag) はすべてこの分岐に落ちる。"""
+    assert _compute_db_read_window_days("15m", 20) == 90
+    assert _compute_db_read_window_days("1h", 20) == 90
+    assert _compute_db_read_window_days("1d", 20) == 90
+    assert _compute_db_read_window_days("1h", None) == 90
+    assert _compute_db_read_window_days("1d", None) == 90
+
+
+def test_compute_db_read_window_days_caps_large_derivations_at_730():
+    """derived が730日を超える場合は上限でクリップする。現行の
+    TIMEFRAMES×WINDOWS の合法な組では到達しない (最大は 1d×120=240日) —
+    将来 WINDOWS/TIMEFRAMES が広がっても内向き DB 走査量に上限を保つ
+    多層防御なので、列挙外の値を直接渡して境界そのものを pin する
+    (`min(730, ...)` を消す変異、または下限が誤って上限側を覆う変異は
+    ここでしか観測できない)。"""
+    assert _compute_db_read_window_days("1d", 10_000) == 730
+    assert _compute_db_read_window_days("4h", 100_000) == 730
+
+
+def _seed_two_series_weekdays_1d(conn, *, until, n_bars):
+    """[until - n_bars 営業日, until) の直前 `n_bars` 本の**営業日のみ**の
+    1d バーを USDJPY/EURUSD (EURUSD が 1 バー先行) に投入する。`until` は
+    1d バケット境界 (UTC 00:00) に揃っている必要がある。
+
+    本番の dukascopy 1d バーは週末に立たない (acceptance-round2.md D1:
+    「400日連続」の合成データは窓内密度を 7/5 過大評価する) ので、D1 の
+    退行 pin は営業日のみのバーで再現する — 週末ギャップは
+    `_load_returns` の「ギャップを跨ぐリターンは作らない」規約により
+    週明け 1 本分のリターンを毎週失わせる、より厳しい (=退行が起きやすい)
+    形になる。
+    """
+    days = []
+    d = until - timedelta(days=1)
+    while len(days) < n_bars:
+        if d.weekday() < 5:
+            days.append(d)
+        d -= timedelta(days=1)
+    days.reverse()
+    a_vals = _sine(len(days), phase=0)
+    b_vals = _sine(len(days), phase=1)
+    a_rows = [("USDJPY", "1m", day.isoformat(), v, v + 0.05, v - 0.05, v,
+               1.0, 0.01) for day, v in zip(days, a_vals)]
+    b_rows = [("EURUSD", "1m", day.isoformat(), v, v + 0.05, v - 0.05, v,
+               1.0, 0.01) for day, v in zip(days, b_vals)]
+    ohlcv.import_history_bars(conn, a_rows + b_rows, source="dukascopy")
+
+
+def test_analyze_for_agent_rolling_corr_summary_1d_window_120_succeeds(
+        tmp_path):
+    """D1 killer: `timeframe='1d', window=120` は WINDOWS の正規の列挙値
+    であり、固定90日窓の下では ``insufficient_data`` に恒久的に固定されて
+    いた (acceptance-round2.md D1)。`_compute_db_read_window_days` を旧
+    実装 (`return 90` 固定) へ戻す変異、または係数/床上限の算出を壊す変異
+    はいずれもこのテストを red にする。"""
+    conn = _conn(tmp_path)
+    in_sample_until = datetime(2026, 5, 1, tzinfo=timezone.utc)  # NOW=2026-08-01, holdout_months=3 と同じ境界
+    # derived window (1d, window=120) = 240日。営業日のみで 200 本投入し
+    # window+1=121 本を大きく上回らせる (週末ギャップでの目減りを吸収)。
+    _seed_two_series_weekdays_1d(conn, until=in_sample_until, n_bars=200)
+    out = analyze_for_agent(
+        conn, _settings_watch_eurusd(),
+        {"kind": "rolling_corr_summary", "a": "USDJPY", "b": "EURUSD",
+         "timeframe": "1d", "window": 120}, now=NOW)
+    assert "error" not in out, out
+    assert set(out.keys()) == {"analysis_run_id", "mean", "std", "min", "max"}
