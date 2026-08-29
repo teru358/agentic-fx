@@ -447,6 +447,66 @@ def test_verify_backend_does_not_leak_codex_provider_into_non_codex_backends(
     assert result.provider is None
 
 
+def test_verify_backend_watches_this_process_as_watcher_root(
+        tmp_path, monkeypatch):
+    """L-F2 是正 (verified-local-round1.md §1【2】): `_DescendantWatcher` は
+    自プロセス (`os.getpid()`) を root にして生成される — 配線が
+    `_DescendantWatcher(1)` 等の恒真値 (全プロセスを拾う PID) に壊れても
+    既定スイートは検知していなかった (判定側は `_FixedWatcher` で pin
+    済みだが、`_DescendantWatcher(...)` へ渡る実引数そのものは未 pin)。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    seen: list[int] = []
+
+    def _spy_watcher(pid):
+        seen.append(pid)
+        return _FixedWatcher(saw=True)
+
+    monkeypatch.setattr(
+        "agentic_fx.loops.verify_backend._DescendantWatcher", _spy_watcher)
+    monkeypatch.setattr(
+        "agentic_fx.loops.verify_backend._descendant_pids", lambda pid: set())
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+
+    verify_backend(tmp_path, _settings(), backend="codex",
+                   provider="chatgpt", clock=FixedClock(NOW))
+
+    assert seen == [os.getpid()]
+
+
+def test_verify_backend_scratch_dirs_have_expected_modes_and_are_removed(
+        tmp_path, monkeypatch):
+    """L-F7/L-F8 是正 (verified-local-round1.md §1【9】【10】): `verify_backend`
+    が自分で作る scratch (`staging_dir`/`source_snapshot_dir`) の権限
+    (0o700/0o500) と、`finally: shutil.rmtree(scratch_root, ...)` による
+    後始末は既定スイートで一度も pin されていなかった (grep 全数確認済み
+    — `0o500`/`afx-verify-backend` を検査する既存テストは 0 件)。
+    `tempfile.mkdtemp()` は `/tmp` に作るため、後始末漏れは
+    `afx-verify-backend-*` の恒久残留になる (検証入口は人間が繰り返し
+    叩く前提のため蓄積する)。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    seen: dict[str, object] = {}
+
+    def _capture(mission: Mission) -> MissionResult:
+        ctx = _FakeVerifyWorkerRunner.captured_kwargs["run_context"]
+        seen["staging_mode"] = ctx.staging_dir.stat().st_mode & 0o777
+        seen["source_mode"] = ctx.source_snapshot_dir.stat().st_mode & 0o777
+        seen["scratch_root"] = ctx.staging_dir.parent.parent
+        return _echo_ok(mission)
+
+    _BEHAVIOR["current"] = {"result": _capture}
+
+    verify_backend(tmp_path, _settings(), backend="local", provider=None,
+                   clock=FixedClock(NOW))
+
+    assert seen["staging_mode"] == 0o700
+    assert seen["source_mode"] == 0o500
+    assert not seen["scratch_root"].exists(), (
+        "verify_backend の finally が scratch_root を削除していない "
+        "(afx-verify-backend-* の /tmp 残留)")
+
+
 class _FixedWatcher:
     """F-2 是正 (プラン10 Task13 検収): 親ゲート (c)/(d) を `ok=False` 側から
     踏むための固定応答 watcher。`saw_any_descendant()` の戻り値を注入する

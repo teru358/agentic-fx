@@ -121,6 +121,14 @@ def test_run_service_calls_improve_supervisor_shutdown_and_join(tmp_path):
         # Verify supervisor was also shut down (sanity check)
         mock_app.supervisor.shutdown.assert_called_once()
 
+        # L-F23 是正 (verified-local-round1.md §1【4】): shutdown() は
+        # join() より前に呼ばれる (順序そのものは仕様 — 検収 B5 が join の
+        # 位置を明示指定している)。上の assert_called_once() を 2 つ並べる
+        # だけでは順序を見ていなかった (assert_called_once は呼び出し回数
+        # だけを見る、順序非依存)。
+        names = [c[0] for c in mock_app.improve_supervisor.mock_calls]
+        assert names.index("shutdown") < names.index("join")
+
         # Exit code should be 0 (graceful shutdown)
         assert exit_code == 0
 
@@ -186,7 +194,13 @@ def test_build_app_reconciles_report_outbox_at_startup(tmp_path):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
         try:
             m_reconcile.assert_called_once()
-            _, kwargs = m_reconcile.call_args
+            args, kwargs = m_reconcile.call_args
+            # L-F22 是正 (verified-local-round1.md §1【6】): 第 1 引数
+            # (位置引数) は conn_core (Commands は conn_shell 束縛の broker
+            # を持つ — シェルスレッドから conn_core を触らない設計意図の
+            # 裏返し)。旧 assert は `_, kwargs = ...` で位置引数を丸ごと
+            # 捨てており、conn_shell へ差し替える変異が無防備だった。
+            assert args and args[0] is app.conn_core
             assert kwargs["reports_dir"] == tmp_path / "data" / "improve_reports"
             assert kwargs["now"] == NOW
         finally:

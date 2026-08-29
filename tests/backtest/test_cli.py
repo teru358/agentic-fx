@@ -993,6 +993,32 @@ def test_cli_verify_backend_prints_enable_guidance_from_result_provider(
     assert "llama_swap_verified" in capsys.readouterr().out
 
 
+def test_cli_verify_backend_prints_detail_and_fingerprint_on_success(
+        tmp_path, monkeypatch, capsys):
+    """L-F13 是正 (verified-local-round1.md §1【7】): 設計 §7.2「成功時に
+    fingerprint を出力し、それが人間の llama_swap_verified 判断の根拠に
+    なる」という因果の pin。`print(result.detail)` /
+    `print(f"fingerprint: {result.fingerprint}")` を丸ごと消す変異が
+    既定スイートで無防備だった (`grep -rn 'fingerprint:' tests/` = 0 件)。"""
+    from unittest.mock import patch
+    from agentic_fx.entry import main as entry_main
+    from agentic_fx.loops.verify_backend import VerifyBackendResult
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    fp = "a" * 64
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.loops.verify_backend.verify_backend") as vb:
+        vb.return_value = VerifyBackendResult(
+            ok=True, backend="codex", provider="chatgpt",
+            fingerprint=fp, detail="backend=codex provider=chatgpt model=m")
+        rc = entry_main(["improve", "verify-backend", "--backend", "codex",
+                        "--provider", "chatgpt"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "backend=codex provider=chatgpt model=m" in out
+    assert f"fingerprint: {fp}" in out
+
+
 def test_cli_improve_verify_backend_returns_1_when_verification_fails(
         tmp_path, monkeypatch, capsys):
     """F-C1 是正 (段0 致命2、最重要): `if not result.ok: ... return 1` の

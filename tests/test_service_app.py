@@ -2764,6 +2764,24 @@ def test_build_app_rejects_when_credentials_file_missing(tmp_path):
         build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
 
+def test_build_app_rejects_when_claude_credentials_file_missing(tmp_path):
+    """L-F18 是正 (verified-local-round1.md §1【3】): ③ の claude 脚。
+    既存 `test_build_app_rejects_when_credentials_file_missing` は
+    codex+chatgpt 構成のみを踏んでおり (docstring 自身が「codex+chatgpt
+    を使うには①②を通す必要があるため vendor native codex を使う」と
+    明言)、claude 側の `credentials_file` 欠落検査は既定スイートで
+    一度も踏まれていなかった。`sys.executable` は `--version` を受け付ける
+    ので①②を通す (`test_build_app_rejects_when_service_initial_env_has_secret_pattern`
+    と同じ手)。"""
+    import sys
+    root = _root_with_settings(tmp_path, runner={
+        "improve": {"backend": "claude", "model": "m"},
+        "claude": {"bin": sys.executable,
+                  "credentials_file": str(tmp_path / "no-such-creds.json")}})
+    with pytest.raises(RuntimeError, match="credentials"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+
+
 def test_build_app_does_not_require_credentials_for_codex_llama_swap(
         tmp_path, monkeypatch):
     """③ の裏: provider=llama_swap は auth_file 欠落でも起動時検査を通る
@@ -3377,6 +3395,57 @@ def test_service_startup_reconcile_failure_still_runs_sweep_and_expire(tmp_path,
     assert m_reconcile.called
     assert m_sweep.called, "reconcile の失敗で sweep_orphans が道連れになった (m10 の欠陥)"
     assert m_expire.called, "reconcile の失敗で process_expired_approvals が道連れになった (m10 の欠陥)"
+
+
+def test_service_startup_sweep_failure_still_runs_expire(tmp_path, monkeypatch):
+    """L-F21 是正 (verified-local-round1.md §1【5】): m10 是正 (3 呼び出し
+    の相互独立) の sweep 脚。reconcile 脚は既存
+    `test_service_startup_reconcile_failure_still_runs_sweep_and_expire`
+    が pin しているが、sweep 自身が落ちたときに expire が独立して走るかは
+    未 pin だった (sweep/expire を単一 try へ束ねる = 検収 m10 が是正した
+    のと同型の退行が無防備)。activity への記録まで見る (F-S11 型の穴を
+    避けるため — 失敗が記録されたかという診断の帰属も確認する)。"""
+    import unittest.mock as mock
+    from agentic_fx.plugin import switch
+
+    _init(tmp_path)
+    fake = FakeRunner([MissionResult("completed",
+                                     {"action": "hold", "reasoning": "w"},
+                                     [])])
+    with mock.patch.object(switch, "reconcile_switch_journals"), \
+         mock.patch.object(switch, "sweep_orphans",
+                           side_effect=RuntimeError("boom")) as m_sweep, \
+         mock.patch.object(switch, "process_expired_approvals") as m_expire:
+        app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    assert app is not None
+    assert m_sweep.called
+    assert m_expire.called, "sweep の失敗で process_expired_approvals が道連れになった"
+    assert any("plugin_sweep_failed" in line for line in app.activity.tail(50))
+
+
+def test_service_startup_expire_failure_still_completes_startup(tmp_path, monkeypatch):
+    """L-F21 是正: expire 脚。process_expired_approvals が落ちても build_app
+    は完走し、失敗が activity へ記録される (sweep が既に完走した後の
+    最終呼び出しなので「道連れ」の相手がいないぶん reconcile/sweep 脚より
+    見落としやすい)。"""
+    import unittest.mock as mock
+    from agentic_fx.plugin import switch
+
+    _init(tmp_path)
+    fake = FakeRunner([MissionResult("completed",
+                                     {"action": "hold", "reasoning": "w"},
+                                     [])])
+    with mock.patch.object(switch, "reconcile_switch_journals"), \
+         mock.patch.object(switch, "sweep_orphans") as m_sweep, \
+         mock.patch.object(switch, "process_expired_approvals",
+                           side_effect=RuntimeError("boom")) as m_expire:
+        app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    assert app is not None
+    assert m_sweep.called
+    assert m_expire.called
+    assert any("plugin_expire_failed" in line for line in app.activity.tail(50))
 
 
 def test_improve_tick_and_supervisor_wired_after_task12(tmp_path):
