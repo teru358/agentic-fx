@@ -62,6 +62,22 @@ def _run(args: list[str], *, env: dict[str, str],
                           text=True, check=check, stdin=subprocess.DEVNULL)
 
 
+def _run_bytes(args: list[str], *, env: dict[str, str]) -> bytes:
+    """round2 #4 是正 (2026-08-29、verified-round2.md #4): `_run` は
+    `text=True` で subprocess の stdout をロケール既定 (実質 UTF-8) で
+    decode してから返す。`cat-file blob` の 3 呼び出し (`:name/plugin.py`
+    等) はそのバイト列を再 `.encode()` して content_hash/artifact_hash を
+    取り直す検証に使うため、text 経由の往復は非可逆 — CRLF は
+    `HistoryGitError: index blob hash mismatch` (probe 実測)、非 UTF-8 は
+    `UnicodeDecodeError` が subprocess の decode 段で未捕捉のまま漏れる
+    (probe 実測、`except subprocess.CalledProcessError` を素通りする)。
+    `cat-file blob` の 3 回だけをバイナリで走らせる専用ヘルパ
+    (`_run` 全体を binary 化すると `.strip()` している呼び出し元を
+    全部触ることになるため最小形にする)。stdin= 規約は維持する。"""
+    return subprocess.run(["git", *args], env=env, capture_output=True,
+                          check=True, stdin=subprocess.DEVNULL).stdout
+
+
 def _assert_not_scheduler_thread() -> None:
     if threading.current_thread().name.startswith("scheduler"):
         raise SchedulerThreadForbiddenError(
@@ -140,12 +156,14 @@ def record_version(history_git_dir: Path, *, name: str, artifact_hash: str,
                      f"100644,{blob},{name}/{relpath}"], env=idx_env)
 
             # 検証: index の blob から hash を取り直し、payload と一致することを確認
-            py_bytes = _run(["cat-file", "blob", f":{name}/plugin.py"],
-                            env=idx_env).stdout.encode()
-            cfg_bytes = _run(["cat-file", "blob", f":{name}/config.yaml"],
-                             env=idx_env).stdout.encode()
-            test_bytes = _run(["cat-file", "blob", f":{name}/test_plugin.py"],
-                              env=idx_env).stdout.encode()
+            # round2 #4 是正: text=True 往復での CRLF 破壊/UnicodeDecodeError
+            # を避けるため、この 3 回だけバイナリで読む (_run_bytes)。
+            py_bytes = _run_bytes(["cat-file", "blob", f":{name}/plugin.py"],
+                                  env=idx_env)
+            cfg_bytes = _run_bytes(["cat-file", "blob", f":{name}/config.yaml"],
+                                   env=idx_env)
+            test_bytes = _run_bytes(["cat-file", "blob", f":{name}/test_plugin.py"],
+                                    env=idx_env)
             recomputed_content = content_hash_bytes(py_bytes, cfg_bytes)
             recomputed_artifact = artifact_hash_bytes(py_bytes, cfg_bytes, test_bytes)
             if recomputed_content != content_hash or recomputed_artifact != artifact_hash:

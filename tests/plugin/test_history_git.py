@@ -97,6 +97,50 @@ def test_record_version_second_version_replaces_prefix_entries(tmp_path):
     assert len(log.stdout.strip().splitlines()) == 2
 
 
+# round2 #4 是正 (2026-08-29、verified-round2.md #4): `_run` (`text=True`)
+# の stdout 再エンコード往復は非可逆。CRLF は index blob hash mismatch、
+# 非 UTF-8 は UnicodeDecodeError が subprocess の decode 段で未捕捉のまま
+# 漏れる (probe 実測)。`cat-file blob` の 3 回だけを `_run_bytes` (バイナリ)
+# に切り替えて往復可逆にする。
+def test_record_version_accepts_crlf_and_non_utf8_plugin(tmp_path):
+    from agentic_fx.plugin import version_store
+
+    plugins_root = tmp_path / "plugins"
+    history_dir = plugins_root / ".history.git"
+
+    crlf_py = b"def compute(df, params):\r\n    return {}\r\n"
+    a1 = version_store.artifact_hash_bytes(crlf_py, CONFIG_YAML, TEST_PY)
+    d1 = version_store.create_version_dir(
+        plugins_root, "crlfname", a1, plugin_py=crlf_py,
+        config_yaml=CONFIG_YAML, test_plugin=TEST_PY, op_identity="1")
+    c1 = version_store.content_hash_bytes(crlf_py, CONFIG_YAML)
+    sha1 = history_git.record_version(
+        history_dir, name="crlfname", artifact_hash=a1, content_hash=c1,
+        approval_id=1, version_dir=d1)
+    assert sha1 is not None
+    show1 = subprocess.run(
+        ["git", "--git-dir", str(history_dir), "cat-file", "blob",
+         "HEAD:crlfname/plugin.py"],
+        capture_output=True, check=True)
+    assert show1.stdout == crlf_py
+
+    non_utf8_py = b"# \xff\xfe binary\n"
+    a2 = version_store.artifact_hash_bytes(non_utf8_py, CONFIG_YAML, TEST_PY)
+    d2 = version_store.create_version_dir(
+        plugins_root, "binname", a2, plugin_py=non_utf8_py,
+        config_yaml=CONFIG_YAML, test_plugin=TEST_PY, op_identity="1")
+    c2 = version_store.content_hash_bytes(non_utf8_py, CONFIG_YAML)
+    sha2 = history_git.record_version(
+        history_dir, name="binname", artifact_hash=a2, content_hash=c2,
+        approval_id=2, version_dir=d2)
+    assert sha2 is not None
+    show2 = subprocess.run(
+        ["git", "--git-dir", str(history_dir), "cat-file", "blob",
+         "HEAD:binname/plugin.py"],
+        capture_output=True, check=True)
+    assert show2.stdout == non_utf8_py
+
+
 def test_record_version_detached_head_raises_distinct_error(tmp_path):
     """symbolic-ref exit 1 (detached) は HistoryGitDetachedError — リポジトリ
     障害 (128) とは区別する (activity/通知の理由分け)。"""
