@@ -14,9 +14,16 @@ from datetime import datetime
 
 
 def add(conn: sqlite3.Connection, idea: str, source: str, now: datetime) -> int:
+    # round2 #8 是正 (2026-08-29、verified-round2.md #8): 正規化は
+    # improve_loop._select_and_bind と同じ Python 側 1 箇所
+    # (`idea.strip().lower()`) に閉じる — この CLI/手動追加経路でも
+    # `idea_norm` を書いておかないと、discovery/selected 側の
+    # `idea_norm=?` 重複検出がこの行を見つけられない。
+    idea_norm = idea.strip().lower()
     cur = conn.execute(
-        "INSERT INTO improvement_backlog (idea, source, created_at, updated_at) "
-        "VALUES (?,?,?,?)", (idea, source, now.isoformat(), now.isoformat()))
+        "INSERT INTO improvement_backlog (idea, source, created_at, updated_at, "
+        "idea_norm) VALUES (?,?,?,?,?)",
+        (idea, source, now.isoformat(), now.isoformat(), idea_norm))
     conn.commit()
     return cur.lastrowid
 

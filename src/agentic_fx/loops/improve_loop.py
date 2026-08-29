@@ -708,15 +708,21 @@ class ImproveLoop:
             dropped = 0
 
             def _norm(idea: str) -> str:
-                # precheck 2026-08-22 wave2: T10-M11 — SQL 側 lower(trim(idea))
-                # と同じ「前後空白のみ除去」に揃える (内部空白は畳まない)
+                # round2 #8 是正 (2026-08-29、verified-round2.md #8): 正規化
+                # は Python 側のこの 1 箇所に閉じる。SQL 側は INSERT 時に
+                # ここで作った正規形を `idea_norm` 列へ書き、以降の重複検出
+                # は `idea_norm=?` の等値比較のみで行う (SQL の
+                # lower(trim(idea)) は SQLite 既定で ASCII 空白の trim・
+                # ASCII のみの lower のため、`'improve X\n'`/`'IMPROVE Ä'`
+                # のような idea で Python 側正規形と食い違い、重複行が
+                # 生まれていた — probe 実測)。
                 return idea.strip().lower()
 
             for d in output.get("discoveries", []):
                 idea_norm = _norm(d["idea"])
                 dup = conn.execute(
                     "SELECT id FROM improvement_backlog WHERE "
-                    "lower(trim(idea))=?", (idea_norm,)).fetchone()
+                    "idea_norm=?", (idea_norm,)).fetchone()
                 if dup is not None:
                     continue
                 if inserted >= limit:
@@ -724,9 +730,10 @@ class ImproveLoop:
                     continue
                 conn.execute(
                     "INSERT INTO improvement_backlog (idea, source, status, "
-                    "created_at, updated_at) VALUES (?,?,'open',?,?)",
+                    "created_at, updated_at, idea_norm) VALUES "
+                    "(?,?,'open',?,?,?)",
                     (d["idea"], d.get("source", "agent"), now.isoformat(),
-                     now.isoformat()))
+                     now.isoformat(), idea_norm))
                 inserted += 1
             if dropped:
                 self._activity.write(
@@ -740,7 +747,7 @@ class ImproveLoop:
                 idea_norm = _norm(selected_idea)
                 row = conn.execute(
                     "SELECT id FROM improvement_backlog WHERE "
-                    "lower(trim(idea))=? AND status IN ('open','observation')",
+                    "idea_norm=? AND status IN ('open','observation')",
                     (idea_norm,)).fetchone()
                 if row is None:
                     # precheck 2026-08-22 wave2: T10-B5 — discoveries にも
@@ -754,9 +761,10 @@ class ImproveLoop:
                         return _SelectionOutcome(won=False, backlog_id=None)
                     cur = conn.execute(
                         "INSERT INTO improvement_backlog (idea, source, status, "
-                        "created_at, updated_at) VALUES (?,?,'open',?,?)",
+                        "created_at, updated_at, idea_norm) VALUES "
+                        "(?,?,'open',?,?,?)",
                         (selected_idea, selected.get("source", "agent"),
-                         now.isoformat(), now.isoformat()))
+                         now.isoformat(), now.isoformat(), idea_norm))
                     backlog_id = cur.lastrowid
                 else:
                     backlog_id = row["id"]

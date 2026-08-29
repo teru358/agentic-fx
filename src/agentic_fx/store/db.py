@@ -1284,4 +1284,25 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "backtest_runs", "ref_content_hash", "ref_content_hash TEXT")
     _migrate_legacy_plugin_approval_payloads(conn)   # §5.5 (8-C 節)
     # --- プラン 10 Task 8 ここまで ---
+    # round2 #8 是正 (2026-08-29、verified-round2.md #8): 重複検出を Python
+    # 側の正規化 (idea.strip().lower()、全 Unicode 空白/大小文字) に 1 箇所
+    # 寄せる。SQL 側の `lower(trim(idea))` は SQLite 既定で ASCII 空白の
+    # trim・ASCII のみの lower のため、`'improve X\n'`/`'IMPROVE Ä'` のような
+    # idea は Python 側正規形と食い違い重複行が生まれていた (probe 実測)。
+    _ensure_column(conn, "improvement_backlog", "idea_norm", "idea_norm TEXT")
+    _backfill_improvement_backlog_idea_norm(conn)
     conn.commit()
+
+
+def _backfill_improvement_backlog_idea_norm(conn: sqlite3.Connection) -> None:
+    """既存行 (`idea_norm IS NULL`) だけを Python の `str.strip().lower()`
+    で埋める。SQL の `create_function` は readonly 接続を含む全接続へ
+    登録する必要があり脆いため採らない (verified-round2.md #8 「より小さい
+    代替」の議論どおり、正規化は Python 側 1 箇所に閉じる)。"""
+    rows = conn.execute(
+        "SELECT id, idea FROM improvement_backlog "
+        "WHERE idea_norm IS NULL").fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE improvement_backlog SET idea_norm=? WHERE id=?",
+            (row["idea"].strip().lower(), row["id"]))

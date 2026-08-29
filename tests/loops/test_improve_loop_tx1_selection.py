@@ -53,9 +53,15 @@ def test_duplicate_idea_normalized_whitespace_and_case_is_deduped(
         loop_and_ctx_with_open_backlog):
     loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
     # 大文字小文字が混在した既存 idea を作成
+    # round2 #8 是正 (2026-08-29): 正規化は Python 側の idea_norm 列に
+    # 一本化した (verified-round2.md #8)。本番の書き込み経路
+    # (backlog.add / _select_and_bind の INSERT) はすべて idea_norm を
+    # 書くため、ここも揃える (SQL 側 lower(trim(idea)) はもう重複検出に
+    # 使われない)。
     conn.execute(
         "INSERT INTO improvement_backlog (idea, source, status, created_at, "
-        "updated_at) VALUES ('RSI Divergence', 'agent', 'open', ?, ?)",
+        "updated_at, idea_norm) VALUES ('RSI Divergence', 'agent', 'open', "
+        "?, ?, 'rsi divergence')",
         (datetime(2026, 8, 1).isoformat(),) * 2)
     conn.commit()
     # 別の大文字小文字 + 前後空白の discovery を投入
@@ -68,8 +74,72 @@ def test_duplicate_idea_normalized_whitespace_and_case_is_deduped(
     # 前後空白と大文字小文字の違いのみで、正規化後は重複として扱われる
     n = conn.execute(
         "SELECT count(*) c FROM improvement_backlog WHERE "
-        "lower(trim(idea))='rsi divergence'").fetchone()["c"]
+        "idea_norm='rsi divergence'").fetchone()["c"]
     assert n == 1  # 重複が追加されていない
+
+
+def test_discovery_dedup_normalizes_unicode_whitespace_and_trailing_newline(
+        loop_and_ctx_with_open_backlog):
+    """round2 #8 是正 (2026-08-29、verified-round2.md #8): SQLite の
+    lower(trim(idea)) は ASCII のみの trim/lower — `'improve X\\n'` は
+    trim されず、`'IMPROVE Ä'` は非 ASCII 大文字が小文字化されない
+    (probe 実測: `'improve X\\n'`→sql='improve x\\n' py='improve x'、
+    `'IMPROVE Ä'`→sql='improve Ä' py='improve ä')。Python 側 `idea_norm`
+    列への一本化でこの穴を塞ぐ。ASCII 空白だけの対では現行実装でも通って
+    しまい変異を殺せないため、末尾改行と非 ASCII 大文字を使う。"""
+    loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
+
+    # Mission A: 末尾改行付きの discovery を投入
+    output_a = {"discoveries": [{"idea": "improve X\n", "source": "agent",
+                                 "evidence": "e"}],
+               "selected": {"backlog_id": backlog_id, "idea": "x"},
+               "artifact": {"type": "observation", "reason": "x"},
+               "selection_rationale": "x"}
+    loop._select_and_bind(conn, output_a, ctx, now=datetime(2026, 8, 22))
+
+    # Mission B: 改行の無い同一 idea を投入 — 正規化後は重複
+    output_b = {"discoveries": [{"idea": "improve X", "source": "agent",
+                                 "evidence": "e"}],
+               "selected": {"backlog_id": backlog_id, "idea": "x"},
+               "artifact": {"type": "observation", "reason": "x"},
+               "selection_rationale": "x"}
+    loop._select_and_bind(conn, output_b, ctx, now=datetime(2026, 8, 22))
+
+    n = conn.execute(
+        "SELECT count(*) c FROM improvement_backlog WHERE "
+        "idea_norm='improve x'").fetchone()["c"]
+    assert n == 1
+
+    # 非ASCII 大文字版も同じテスト内で確認する
+    output_c = {"discoveries": [{"idea": "IMPROVE Ä", "source": "agent",
+                                 "evidence": "e"}],
+               "selected": {"backlog_id": backlog_id, "idea": "x"},
+               "artifact": {"type": "observation", "reason": "x"},
+               "selection_rationale": "x"}
+    loop._select_and_bind(conn, output_c, ctx, now=datetime(2026, 8, 22))
+    output_d = {"discoveries": [{"idea": "improve ä", "source": "agent",
+                                 "evidence": "e"}],
+               "selected": {"backlog_id": backlog_id, "idea": "x"},
+               "artifact": {"type": "observation", "reason": "x"},
+               "selection_rationale": "x"}
+    loop._select_and_bind(conn, output_d, ctx, now=datetime(2026, 8, 22))
+
+    n2 = conn.execute(
+        "SELECT count(*) c FROM improvement_backlog WHERE "
+        "idea_norm='improve ä'").fetchone()["c"]
+    assert n2 == 1
+
+    # selected.idea の binding も同じ正規形で当たること (backlog_id=None
+    # のときに idea_norm で既存行を見つけて再利用する経路)。
+    output_e = {"discoveries": [],
+               "selected": {"backlog_id": None, "idea": "improve X\n"},
+               "artifact": {"type": "observation", "reason": "x"},
+               "selection_rationale": "x"}
+    outcome = loop._select_and_bind(conn, output_e, ctx, now=datetime(2026, 8, 22))
+    n3 = conn.execute(
+        "SELECT count(*) c FROM improvement_backlog WHERE "
+        "idea_norm='improve x'").fetchone()["c"]
+    assert n3 == 1  # selected 側でも新規行を作らず既存行へ束ねる
 
 
 def test_new_backlog_over_limit_are_dropped_and_counted_in_activity(
@@ -148,21 +218,29 @@ def test_new_idea_selected_creates_and_binds_in_same_tx(loop_and_ctx_with_open_b
 
 def test_python_and_sql_idea_normalization_agree_on_internal_whitespace(
         loop_and_ctx_with_open_backlog):
-    """M7: Python 側 `_norm` と SQL 側 `lower(trim(idea))` が内部空白処理で
-    一致していることを verify する (内部空白を畳む vs 畳まない)。
-    前後空白のみ除去する正規化で両者が一致。"""
+    """M7: 内部空白を畳まない正規化 (前後空白のみ除去) の pin。
+
+    round2 #8 是正 (2026-08-29): 正規化は Python 側の `idea_norm` 列に
+    一本化した (SQL の lower(trim(idea)) はもう重複検出に使われない —
+    verified-round2.md #8、SQLite の lower()/trim() は ASCII のみで
+    Python の str.strip().lower() と非 ASCII 空白/大文字で食い違うため)。
+    このテスト自体の主張 (前後空白のみ除去・内部空白は畳まない) は
+    Python 側 `_norm` 一本になっても変わらないので、fixture 行にも
+    本番の書き込み経路と同じ `idea_norm` を持たせて揃える。"""
     loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
 
     # 両側空白あり
     conn.execute(
         "INSERT INTO improvement_backlog (idea, source, status, created_at, "
-        "updated_at) VALUES ('  with  spaces  ', 'agent', 'open', ?, ?)",
+        "updated_at, idea_norm) VALUES ('  with  spaces  ', 'agent', 'open', "
+        "?, ?, 'with  spaces')",
         (datetime(2026, 8, 1).isoformat(),) * 2)
 
     # 内部に連続空白
     conn.execute(
         "INSERT INTO improvement_backlog (idea, source, status, created_at, "
-        "updated_at) VALUES ('internal   multiple', 'agent', 'open', ?, ?)",
+        "updated_at, idea_norm) VALUES ('internal   multiple', 'agent', "
+        "'open', ?, ?, 'internal   multiple')",
         (datetime(2026, 8, 1).isoformat(),) * 2)
     conn.commit()
 
@@ -179,12 +257,12 @@ def test_python_and_sql_idea_normalization_agree_on_internal_whitespace(
     # 前後空白のみ異なるものは重複として扱われ、追加されていない
     with_spaces_count = conn.execute(
         "SELECT count(*) c FROM improvement_backlog WHERE "
-        "lower(trim(idea))='with  spaces'"  # 内部空白は畳まない
+        "idea_norm='with  spaces'"  # 内部空白は畳まない
     ).fetchone()["c"]
     assert with_spaces_count == 1
 
     internal_multiple_count = conn.execute(
         "SELECT count(*) c FROM improvement_backlog WHERE "
-        "lower(trim(idea))='internal   multiple'"
+        "idea_norm='internal   multiple'"
     ).fetchone()["c"]
     assert internal_multiple_count == 1
