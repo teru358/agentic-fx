@@ -633,3 +633,26 @@ def test_descendant_watcher_observes_a_real_child_process(tmp_path):
         proc.wait(timeout=5)
 
     assert watcher.saw_any_descendant() is True
+
+
+def test_verify_backend_output_schema_every_property_has_type_key(
+        tmp_path, monkeypatch):
+    """実機 E2E (2026-08-30): ChatGPT backend は output_schema の全 property に
+    "type" キーを要求する (無いと 400 `Invalid schema for response_format` —
+    llama-swap は非厳格で素通りするため fake/local では見えない)。"""
+    captured = {}
+
+    class _CapturingRunner(_FakeVerifyWorkerRunner):
+        def run(self, mission):
+            captured["schema"] = mission.output_schema
+            return super().run(mission)
+
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _CapturingRunner)
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+
+    verify_backend(tmp_path, _settings(), backend="local",
+                   provider=None, clock=FixedClock(NOW))
+
+    for name, prop in captured["schema"]["properties"].items():
+        assert "type" in prop, f"property {name!r} lacks 'type'"

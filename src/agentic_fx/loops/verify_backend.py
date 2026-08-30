@@ -232,7 +232,9 @@ def verify_backend(
             tools=[],
             output_schema={
                 "type": "object", "required": ["echo"],
-                "properties": {"echo": {"const": nonce}},
+                # "type" は必須 — ChatGPT backend は type 無しの property を
+                # 400 (Invalid schema for response_format) で拒否する (実機実測)
+                "properties": {"echo": {"type": "string", "const": nonce}},
                 "additionalProperties": False},
             max_turns=1,
             timeout_sec=scoped_settings.improve.mission_timeout_sec)
