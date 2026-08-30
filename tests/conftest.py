@@ -69,6 +69,35 @@ except Exception:  # noqa: BLE001 — 導出できなければ {"8080"} のみ�
 _FORBIDDEN_PORTS = frozenset(_FORBIDDEN_PORTS)
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _guard_real_data_dir_is_never_touched():
+    """実機 E2E (2026-08-30) の事故 pin: `test_run_gate_pytest_cannot_open_
+    agentic_db` (旧実装) が実リポジトリの `data/agentic.db` を上書き→unlink
+    し、フルスイートを repo cwd で回すたびに実 DB (取引・承認・mission の
+    全履歴) が消えていた。テストが実 `data/` を絶対座標で触る事故は
+    どのテストからでも起こりうるので、session 全体を挟んで (inode, size,
+    mtime) の不変を検査する。変化していたら「どのテスト群を疑うか」を
+    添えて session 終端で落とす。"""
+    real_db = Path(__file__).resolve().parents[1] / "data" / "agentic.db"
+
+    def _sig():
+        try:
+            st = real_db.stat()
+            return (st.st_ino, st.st_size, st.st_mtime_ns)
+        except FileNotFoundError:
+            return None
+
+    before = _sig()
+    yield
+    after = _sig()
+    if before != after:
+        pytest.fail(
+            f"実 data/agentic.db がテスト実行中に変更された: {before} -> {after}。"
+            "テストが実リポジトリの data/ を絶対座標で触っている "
+            "(2026-08-30 の gate_pytest 事故の再演)。tmp_path / mkdtemp へ隔離すること。",
+            pytrace=False)
+
+
 @pytest.fixture(autouse=True)
 def _forbid_worker_spawn_against_real_llama_swap(request, monkeypatch):
     # Task13 Step5b (`@pytest.mark.realbackend`): この marker が付いた

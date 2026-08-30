@@ -344,10 +344,17 @@ def test_run_gate_pytest_cannot_open_agentic_db(tmp_path, settings, monkeypatch)
     確認する非対称設計 (申し送り⑨) — repo 直下の実 `data/agentic.db`
     ではなく、gate worker が受け取る argv 経由のパスを使う。"""
     _skip_if_no_landlock()
-    # data/agentic.db が存在しない場合は作成
-    db_dir = _REPO_ROOT / "data"
-    db_dir.mkdir(exist_ok=True)
-    probe_db = db_dir / "agentic.db"
+    # 実機 E2E (2026-08-30) で発覚した実データ破壊の是正: 旧実装は
+    # `_REPO_ROOT / "data" / "agentic.db"` を存在チェックなしで
+    # `write_bytes(b"test")` 上書きし finally で unlink していた —
+    # **フルスイートを repo cwd で回すたびに実 DB が消える**。
+    # テスト意図 (argv で明示的に渡された絶対パスでも gate worker からは
+    # EACCES) は probe パスが gate allowlist 外でありさえすれば成立するので、
+    # 隣の test_run_gate_pytest_cannot_read_unrelated_tmp_file と同じく
+    # 使い捨ての外部ディレクトリに probe を置く。実 data/ には触れない。
+    import tempfile
+    probe_dir = tempfile.mkdtemp(prefix="afx-probe-db-")
+    probe_db = Path(probe_dir) / "agentic.db"
     probe_db.write_bytes(b"test")
     try:
         check_db_access = (
@@ -359,10 +366,8 @@ def test_run_gate_pytest_cannot_open_agentic_db(tmp_path, settings, monkeypatch)
         result = run_gate_pytest(d, settings=settings)
         assert result.passed is True, result.stdout_tail
     finally:
-        if probe_db.exists():
-            probe_db.unlink()
-        if db_dir.exists() and not any(db_dir.iterdir()):
-            db_dir.rmdir()
+        import shutil as _shutil
+        _shutil.rmtree(probe_dir, ignore_errors=True)
 
 
 def test_run_gate_pytest_cannot_read_unrelated_tmp_file(tmp_path, settings):
