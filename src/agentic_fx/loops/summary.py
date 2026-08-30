@@ -138,13 +138,16 @@ IMPROVE_OUTPUT_SCHEMA: dict = {
             },
         },
         "artifact": {
-            "oneOf": [
+            # 実機実測 (2026-08-30, runbook): ChatGPT structured outputs は
+            # oneOf 不許可 + 全 property に type 必須。3 variant は const 判別で
+            # 排他なので anyOf は oneOf と同値。
+            "anyOf": [
                 {
                     "type": "object",
                     "required": ["type", "name", "kind", "self_test", "summary"],
                     "additionalProperties": False,
                     "properties": {
-                        "type": {"const": "plugin"},
+                        "type": {"type": "string", "const": "plugin"},
                         "name": {"type": "string",
                                  "pattern": "^[a-z][a-z0-9_]{0,63}$"},
                         "kind": {"type": "string",
@@ -159,7 +162,7 @@ IMPROVE_OUTPUT_SCHEMA: dict = {
                     "required": ["type", "proposal_kind", "title", "body_md"],
                     "additionalProperties": False,
                     "properties": {
-                        "type": {"const": "report"},
+                        "type": {"type": "string", "const": "report"},
                         "proposal_kind": {"type": "string",
                                          "enum": ["core", "risk_gate", "research"]},
                         "title": {"type": "string"},
@@ -171,7 +174,7 @@ IMPROVE_OUTPUT_SCHEMA: dict = {
                     "required": ["type", "reason"],
                     "additionalProperties": False,
                     "properties": {
-                        "type": {"const": "observation"},
+                        "type": {"type": "string", "const": "observation"},
                         "reason": {"type": "string"},
                     },
                 },

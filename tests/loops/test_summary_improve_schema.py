@@ -165,3 +165,24 @@ def test_discoveries_item_source_enum_rejects_out_of_enum():
     out["discoveries"][0]["source"] = "bogus"
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
+def test_schema_is_chatgpt_structured_outputs_compatible():
+    """実機 E2E 実測 (2026-08-30、runbook): ChatGPT structured outputs は
+    (a) `oneOf` を不許可 (`'oneOf' is not permitted`)、(b) 全 property に
+    "type" キーを要求する。artifact の 3 variant は const 判別で排他なので
+    anyOf は oneOf と同値。退行すると codex+chatgpt E2E が 400 で構造的に
+    落ちる。"""
+    def walk(node):
+        if isinstance(node, dict):
+            assert "oneOf" not in node, "oneOf は ChatGPT で不許可"
+            if "const" in node or "properties" in node or "enum" in node \
+                    or "anyOf" in node:
+                if "anyOf" not in node and "properties" not in node:
+                    assert "type" in node, f"type キー欠落: {node}"
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+    walk(IMPROVE_OUTPUT_SCHEMA)
