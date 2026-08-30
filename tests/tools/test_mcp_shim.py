@@ -86,6 +86,17 @@ def test_initialize_returns_protocol_version_and_capabilities(tmp_path):
     assert resp["result"]["serverInfo"] == {"name": "afx", "version": "1"}
 
 
+def test_initialize_accepts_measured_claude_protocol_version(tmp_path):
+    """[T13-5c] 実機実測 (2026-08-30): claude CLI 2.1.251 は
+    protocolVersion "2025-11-25" を送る。allowlist に含め、応答は要求版を
+    echo する (単一固定だと backend 間で版が割れた時に片方が必ず落ちる)。"""
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    resp = _rpc(sock_path, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": {"protocolVersion": "2025-11-25"}})
+    assert resp["result"]["protocolVersion"] == "2025-11-25"
+    assert resp["result"]["serverInfo"] == {"name": "afx", "version": "1"}
+
+
 def test_initialize_rejects_unknown_protocol_version(tmp_path):
     """裁定 5: 未知の版要求には結果を返さず JSON-RPC error (fail closed)。"""
     dispatcher, sock_path, _ = _start_dispatcher(tmp_path)

@@ -17,10 +17,13 @@ from pathlib import Path
 
 from agentic_fx.tools.registry import ToolRegistry
 
-# 裁定 5: 実装計画で実 CLI 2 種の initialize 要求を実測して確定する
-# (Task 13 が担当、A-4 検収是正 m-4)。未実測のため暫定値を置く — 実測後に
-# この定数を更新し、コミットメッセージに実測ログの参照先を残すこと。
-_SUPPORTED_PROTOCOL_VERSION = "2024-11-05"
+# 裁定 5: 実 CLI の initialize 要求を実測して確定する (Task 13 → [T13-5c])。
+# 実測 (2026-08-30、runbook「claude 実ターン」節): claude CLI 2.1.251 は
+# "2025-11-25" を送る。単一固定だと backend 間で版が割れた時に片方が必ず
+# 落ちるため、実測済み版の allowlist + 要求版 echo とする。codex の実測版は
+# 取得後にここへ追加する。未実測の版は従来どおり -32600 で fail closed。
+_SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-11-25")
+_SUPPORTED_PROTOCOL_VERSION = _SUPPORTED_PROTOCOL_VERSIONS[0]
 
 
 def _mcp_tool_from_openai_tool(openai_tool: dict) -> dict:
@@ -138,12 +141,12 @@ class McpShimDispatcher:
         method = req.get("method")
         if method == "initialize":
             requested = (req.get("params") or {}).get("protocolVersion")
-            if requested != self.protocol_version:
+            if requested not in _SUPPORTED_PROTOCOL_VERSIONS:
                 return {"jsonrpc": "2.0", "id": rpc_id,
                         "error": {"code": -32600,
                                  "message": f"unsupported protocolVersion {requested!r}"}}
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {
-                "protocolVersion": self.protocol_version,
+                "protocolVersion": requested,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "afx", "version": "1"}}}
         if method == "tools/list":
