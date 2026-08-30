@@ -2782,7 +2782,7 @@ def test_build_app_rejects_when_claude_credentials_file_missing(tmp_path):
         build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
 
-def test_build_app_does_not_require_credentials_for_codex_llama_swap(
+def test_build_app_opencode_does_not_require_credentials(
         tmp_path, monkeypatch):
     """③ の裏: provider=llama_swap は auth_file 欠落でも起動時検査を通る
     (§1.1-2「provider=llama_swap は空の scratch CODEX_HOME で起動」)。
@@ -2805,9 +2805,8 @@ def test_build_app_does_not_require_credentials_for_codex_llama_swap(
     if vendor_codex is None:
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
     root = _root_with_settings(tmp_path, runner={
-        "improve": {"backend": "codex", "model": "m"},
-        "codex": {"bin": vendor_codex, "provider": "llama_swap",
-                  "auth_file": str(tmp_path / "absent")}},
+        "improve": {"backend": "opencode", "model": "m"},
+        "opencode": {"bin": vendor_codex}},
         improve={"llama_swap_verified": True})
     build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())  # 例外を出さない
 
@@ -3069,16 +3068,15 @@ def test_check_cli_version_rejects_when_binary_times_out(tmp_path, monkeypatch):
         _check_cli_version(sleeper)
 
 
-def test_build_app_rejects_llama_swap_when_not_verified(tmp_path):
-    """M6: codex+llama_swap で llama_swap_verified=false なら拒否する。"""
+def test_build_app_rejects_opencode_when_not_verified(tmp_path):
+    """opencode の verify gate を外す変異では、未検証 llama-swap へ通常
+    improve を接続してしまうため起動時拒否を pin する。"""
     vendor_codex = _find_vendor_codex_bin()
     if vendor_codex is None:
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
-    # llama_swap_verified は既定で False
     root = _root_with_settings(tmp_path, runner={
-        "improve": {"backend": "codex", "model": "m"},
-        "codex": {"bin": vendor_codex, "provider": "llama_swap",
-                  "auth_file": str(tmp_path / "absent")}})
+        "improve": {"backend": "opencode", "model": "m"},
+        "opencode": {"bin": vendor_codex}})
     with pytest.raises(RuntimeError, match="llama_swap_verified"):
         build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
@@ -3246,9 +3244,8 @@ def test_build_app_rewrites_relative_codex_bin_to_absolute_path(tmp_path, monkey
     try:
         mp.setenv("PATH", f"{bin_dir}:{old_path}")
         root = _root_with_settings(tmp_path, runner={
-            "improve": {"backend": "codex", "model": "m"},
-            "codex": {"bin": "afx-fake-codex", "provider": "llama_swap",
-                      "auth_file": str(tmp_path / "absent")}},
+            "improve": {"backend": "opencode", "model": "m"},
+            "opencode": {"bin": "afx-fake-codex"}},
             improve={"llama_swap_verified": True})
         app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
         try:
@@ -3262,7 +3259,7 @@ def test_build_app_rewrites_relative_codex_bin_to_absolute_path(tmp_path, monkey
         mp.undo()
 
 
-def test_check_service_initial_env_has_no_secrets_is_called_for_codex_backend(
+def test_check_service_initial_env_has_no_secrets_is_called_for_opencode_backend(
         tmp_path, monkeypatch):
     """段 0 申し送り 1: 検査⑤ (`_check_service_initial_env_has_no_secrets`)
     は claude 分岐だけでなく codex 分岐でも呼ばれる (旧実装は claude 分岐
@@ -3278,9 +3275,8 @@ def test_check_service_initial_env_has_no_secrets_is_called_for_codex_backend(
     if vendor_codex is None:
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
     root = _root_with_settings(tmp_path, runner={
-        "improve": {"backend": "codex", "model": "m"},
-        "codex": {"bin": vendor_codex, "provider": "llama_swap",
-                  "auth_file": str(tmp_path / "absent")}},
+        "improve": {"backend": "opencode", "model": "m"},
+        "opencode": {"bin": vendor_codex}},
         improve={"llama_swap_verified": True})
     with pytest.raises(RuntimeError, match="API_KEY"):
         build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())

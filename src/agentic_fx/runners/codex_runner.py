@@ -26,14 +26,12 @@ class CodexRunner(CliRunner):
     # precheck 2026-08-22 pass2: RB3 追随 (build_runner から cli_started_sink=
     # を透過するため、__init__ シグネチャと super().__init__() 呼び出しに追加)
     def __init__(self, *, bin_path: Path, model: str, workdir: Path,
-                 provider: Literal["chatgpt", "llama_swap"],
-                 llama_swap_base_url: str | None,
+                 provider: Literal["chatgpt"],
                  cli_terminate_grace_sec: float,
                  registry: ToolRegistry,
                  on_message: Callable[[dict], None] | None = None,
                  cli_started_sink: Callable[[int], None] | None = None) -> None:
         self._provider = provider
-        self._llama_swap_base_url = llama_swap_base_url
         super().__init__(bin_path=bin_path, model=model, workdir=workdir,
                          cli_terminate_grace_sec=cli_terminate_grace_sec,
                          registry=registry, on_message=on_message,
@@ -58,14 +56,6 @@ class CodexRunner(CliRunner):
             "-c", "mcp_servers.afx.args=[\"-m\",\"agentic_fx.tools.mcp_shim\","
                   f"\"{mcp_socket}\"]",
         ]
-        if self._provider == "llama_swap":
-            argv += [
-                # codex 0.150.x は name 欠落を config エラー (rc=1) にする
-                "-c", "model_providers.llamaswap.name=llamaswap",
-                "-c", f"model_providers.llamaswap.base_url={self._llama_swap_base_url}",
-                "-c", "model_providers.llamaswap.wire_api=responses",
-                "-c", "model_provider=llamaswap",
-            ]
         argv += ["-m", self._model]
         return argv
 

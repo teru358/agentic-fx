@@ -128,12 +128,9 @@ def test_build_runner_codex_backend_returns_codex_runner(tmp_path, monkeypatch):
     assert isinstance(runner, FakeCodexRunner)
 
 
-def test_build_runner_codex_llama_swap_forwards_base_url(tmp_path, monkeypatch):
-    """#11 (`verified-round1.md` 1-A): `llama_swap_base_url=` は
-    `codex_settings.provider == "llama_swap"` のときだけ `settings.llama_swap.base_url`
-    を渡し、`chatgpt` のときは `None` を渡す (`factory.py:51-53`)。この条件式
-    ごと `None` に潰す変異は、`captured` を assert しない既存テストでは
-    生存する。"""
+def test_build_runner_codex_is_chatgpt_only(tmp_path, monkeypatch):
+    """codex に llama_swap_base_url を再配線する変異を防ぐ。ローカル LLM
+    は OpencodeRunner にだけ渡される。"""
     from agentic_fx.config import load_settings
 
     FakeCodexRunner, captured = _install_fake_cli_runner_module(
@@ -143,29 +140,31 @@ def test_build_runner_codex_llama_swap_forwards_base_url(tmp_path, monkeypatch):
     settings = settings.model_copy(update={
         "runner": settings.runner.model_copy(update={
             "improve": settings.runner.improve.model_copy(
-                update={"backend": "codex"}),
-            "codex": settings.runner.codex.model_copy(
-                update={"provider": "llama_swap"})})})
+                update={"backend": "codex"})})})
+    build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+    assert captured["provider"] == "chatgpt"
+    assert "llama_swap_base_url" not in captured
+
+
+def test_build_runner_opencode_forwards_base_url(tmp_path, monkeypatch):
+    """opencode 分岐から llama_swap の base URL を落とす変異を pin する。"""
+    from agentic_fx.config import load_settings
+
+    FakeCodexRunner, captured = _install_fake_cli_runner_module(
+        monkeypatch, "agentic_fx.runners.opencode_runner", "OpencodeRunner")
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                    update={"backend": "opencode"})})})
     build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
     assert captured["llama_swap_base_url"] == settings.llama_swap.base_url
-
-
-def test_build_runner_codex_chatgpt_omits_llama_swap_base_url(tmp_path, monkeypatch):
-    """対: `provider == "chatgpt"` のときは `llama_swap_base_url=None`。"""
-    from agentic_fx.config import load_settings
-
-    FakeCodexRunner, captured = _install_fake_cli_runner_module(
-        monkeypatch, "agentic_fx.runners.codex_runner", "CodexRunner")
-    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
-    settings = load_settings(EXAMPLE)
-    settings = settings.model_copy(update={
-        "runner": settings.runner.model_copy(update={
-            "improve": settings.runner.improve.model_copy(
-                update={"backend": "codex"}),
-            "codex": settings.runner.codex.model_copy(
-                update={"provider": "chatgpt"})})})
-    build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
-    assert captured["llama_swap_base_url"] is None
+    # 検収実測 (2026-08-30): 既定 bin "~/.opencode/bin/opencode" のチルダを
+    # 展開せず渡すと launcher の絶対パス検査で即死 (handshake failed)。
+    # factory が expanduser 済みの絶対パスを渡すことを pin する。
+    assert "~" not in str(captured["bin_path"])
+    assert Path(captured["bin_path"]).is_absolute()
 
 
 def test_build_runner_trade_profile_uses_trade_choice(tmp_path):
@@ -288,4 +287,3 @@ def test_build_runner_returns_real_claude_runner_class(tmp_path):
                 update={"backend": "claude"})})})
     runner = build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
     assert isinstance(runner, ClaudeRunner)
-

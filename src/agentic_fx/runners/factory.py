@@ -46,11 +46,20 @@ def build_runner(
         codex_settings = settings.runner.codex
         return CodexRunner(
             bin_path=Path(codex_settings.bin), model=choice.model,
-            workdir=workdir, provider=codex_settings.provider,
+            workdir=workdir, provider="chatgpt",
             cli_started_sink=cli_started_sink,
-            llama_swap_base_url=(settings.llama_swap.base_url
-                                 if codex_settings.provider == "llama_swap"
-                                 else None),
             cli_terminate_grace_sec=settings.runner.cli_terminate_grace_sec,
             registry=registry, on_message=on_message)
+    if choice.backend == "opencode":
+        from agentic_fx.runners.opencode_runner import OpencodeRunner
+        return OpencodeRunner(
+            # 既定値が "~/.opencode/bin/opencode" (チルダ入り) のため展開が
+            # 必須 — launcher は argv[0] が絶対パスでないと拒否する (検収
+            # 実測 2026-08-30: 未展開だと handshake failed で即死)
+            bin_path=Path(settings.runner.opencode.bin).expanduser(),
+            model=choice.model,
+            workdir=workdir, llama_swap_base_url=settings.llama_swap.base_url,
+            cli_terminate_grace_sec=settings.runner.cli_terminate_grace_sec,
+            registry=registry, on_message=on_message,
+            cli_started_sink=cli_started_sink)
     raise ValueError(f"unknown runner backend: {choice.backend!r}")

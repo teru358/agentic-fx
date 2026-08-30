@@ -946,14 +946,12 @@ def test_cli_improve_verify_backend_routes_to_verify_backend(tmp_path, monkeypat
     assert vb.call_args.kwargs["provider"] is None
 
 
-def test_cli_improve_verify_backend_routes_provider_through_to_verify_backend(
+def test_cli_improve_verify_backend_routes_opencode_through_to_verify_backend(
         tmp_path, monkeypatch):
     """F-C3 是正 (段0 診断4): 上の routing テストは `--backend local`
     (provider 未指定) の 1 ケースしか流していなかったため、
-    `provider=args.provider` → `provider=None` の変異 (`--provider` を
-    黙って無視する) に対して既存 assert (`kwargs["provider"] is None`)
-    が恒真になっていた (メモリ §6.5)。`--provider llama_swap` を渡す
-    ケースを足し、`verify_backend` へ実際に届くことを見る。"""
+    backend を codex 固定にする変異を防ぐため、opencode が
+    `verify_backend` へ実際に届くことを見る。"""
     from unittest.mock import patch
     from agentic_fx.entry import main as entry_main
     from agentic_fx.loops.verify_backend import VerifyBackendResult
@@ -962,21 +960,18 @@ def test_cli_improve_verify_backend_routes_provider_through_to_verify_backend(
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
          patch("agentic_fx.loops.verify_backend.verify_backend") as vb:
         vb.return_value = VerifyBackendResult(
-            ok=True, backend="codex", provider="llama_swap",
+            ok=True, backend="opencode", provider=None,
             fingerprint="0" * 64, detail="ok")
-        rc = entry_main(["improve", "verify-backend", "--backend", "codex",
-                        "--provider", "llama_swap"])
+        rc = entry_main(["improve", "verify-backend", "--backend", "opencode"])
     assert rc == 0
-    assert vb.call_args.kwargs["backend"] == "codex"
-    assert vb.call_args.kwargs["provider"] == "llama_swap"
+    assert vb.call_args.kwargs["backend"] == "opencode"
+    assert vb.call_args.kwargs["provider"] is None
 
 
-def test_cli_verify_backend_prints_enable_guidance_from_result_provider(
+def test_cli_verify_backend_prints_enable_guidance_for_opencode(
         tmp_path, monkeypatch, capsys):
     """I1 是正 (codex 1周目, verified-codex-round1.md `cli.py:533` 脚):
-    `--provider` を省略しても、`verify_backend` が実効値 (settings 由来) を
-    `result.provider` として返していれば、有効化案内が出る。是正前は
-    `args.provider` (常に None) を見ていたため、案内が一切出なかった。"""
+    opencode の成功後にのみ verify フラグの有効化案内が出ることを pin する。"""
     from unittest.mock import patch
     from agentic_fx.entry import main as entry_main
     from agentic_fx.loops.verify_backend import VerifyBackendResult
@@ -985,9 +980,9 @@ def test_cli_verify_backend_prints_enable_guidance_from_result_provider(
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
          patch("agentic_fx.loops.verify_backend.verify_backend") as vb:
         vb.return_value = VerifyBackendResult(
-            ok=True, backend="codex", provider="llama_swap",
+            ok=True, backend="opencode", provider=None,
             fingerprint="0" * 64, detail="ok")
-        rc = entry_main(["improve", "verify-backend", "--backend", "codex"])
+        rc = entry_main(["improve", "verify-backend", "--backend", "opencode"])
     assert rc == 0
     assert vb.call_args.kwargs["provider"] is None
     assert "llama_swap_verified" in capsys.readouterr().out

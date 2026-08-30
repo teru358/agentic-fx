@@ -48,6 +48,18 @@ def test_exec_closure_codex_includes_usr_bin_and_bin_parent(tmp_path):
     assert fake_codex.parent in closure.dirs
 
 
+def test_exec_closure_opencode_includes_cli_binary(tmp_path):
+    """opencode 実行ファイルを closure から落とすと Landlock 後の exec が
+    PermissionError になるため、target と親ディレクトリを pin する。"""
+    from agentic_fx.mission_worker import _exec_closure_for
+    venv = tmp_path / "venv"; venv.mkdir()
+    binary = tmp_path / "vendor" / "opencode"; binary.parent.mkdir(); binary.write_text("")
+    closure = _exec_closure_for("opencode", claude_bin=None, codex_bin=None,
+                                opencode_bin=binary, venv_root=venv)
+    assert binary.resolve() in closure.targets
+    assert binary.resolve().parent in closure.dirs
+
+
 def test_exec_closure_local_excludes_claude_and_codex_bin_dirs(tmp_path):
     """local backend に claude_bin/codex_bin を渡しても無視される
     (LocalRunner は subprocess を起こさない — §2.2)。"""
@@ -603,7 +615,7 @@ def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
     source_snapshot_dir = tmp_path / "source"
     source_snapshot_dir.mkdir()
 
-    for backend in ["local", "claude", "codex"]:
+    for backend in ["local", "claude", "codex", "opencode"]:
         captured.clear()
         settings = _settings_with_improve_backend(backend)
         mw_mod._run_improve_mission(

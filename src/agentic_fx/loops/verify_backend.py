@@ -3,7 +3,7 @@
 scheduler・wave・backlog・improve_waves/improve_wave_slots・improvement_runs
 のいずれにも触れない one-shot 接続性プローブ。`improve.llama_swap_verified=
 false` のまま実行できる唯一の経路 — 通常入口 (`ImproveSupervisor`) は
-§7.1-2 の pin により `provider=llama_swap` を拒否したままにする (本モジュ
+§7.1-2 の pin により通常入口の opencode backend を拒否したままにする (本モジュ
 ールはその pin を変更しない。バイパスするのはこの検証専用入口だけであり、
 その旨を WARNING ログへ残す)。
 
@@ -59,8 +59,8 @@ class VerifyBackendGateError(Exception):
 @dataclass(frozen=True)
 class VerifyBackendResult:
     ok: bool
-    backend: Literal["local", "claude", "codex"]
-    provider: Literal["chatgpt", "llama_swap"] | None
+    backend: Literal["local", "claude", "codex", "opencode"]
+    provider: Literal["chatgpt"] | None
     fingerprint: str | None
     detail: str
 
@@ -130,8 +130,8 @@ class _DescendantWatcher:
 
 def verify_backend(
     root: Path, settings: "Settings", *,
-    backend: Literal["local", "claude", "codex"],
-    provider: Literal["chatgpt", "llama_swap"] | None,
+    backend: Literal["local", "claude", "codex", "opencode"],
+    provider: Literal["chatgpt"] | None,
     clock: "Clock",
 ) -> VerifyBackendResult:
     now = clock.now()
@@ -160,14 +160,14 @@ def verify_backend(
     effective_provider = (
         scoped_settings.runner.codex.provider if backend == "codex" else None)
 
-    if (backend == "codex" and effective_provider == "llama_swap"
+    if (backend == "opencode"
             and not settings.improve.llama_swap_verified):
         # 通常入口 (ImproveSupervisor) はこの組み合わせを拒否したまま
         # (§7.1-2 の pin は変更しない) — verify-backend だけが唯一の
         # バイパス経路であることを WARNING で残す。
         _log.warning(
             "verify-backend: bypassing improve.llama_swap_verified=false "
-            "gate for provider=llama_swap (this is the only entry point "
+            "gate for backend=opencode (this is the only entry point "
             "allowed to do so)")
 
     mission_id = -1

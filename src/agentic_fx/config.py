@@ -73,12 +73,25 @@ class ClaudeCliSettings(_Strict):
 
 class CodexCliSettings(_Strict):
     bin: str
-    provider: str = Field(pattern="^(chatgpt|llama_swap)$", default="chatgpt")
+    provider: str = "chatgpt"
     auth_file: str = "~/.codex/auth.json"
+
+    @field_validator("provider")
+    @classmethod
+    def _chatgpt_only(cls, value: str) -> str:
+        if value != "chatgpt":
+            raise ValueError(
+                "codex は namespace tools のため llama.cpp と不成立 "
+                "(2026-08-30 裁定)。ローカルは opencode backend を使う")
+        return value
+
+
+class OpencodeCliSettings(_Strict):
+    bin: str = "~/.opencode/bin/opencode"
 
 
 class RunnerChoice(_Strict):
-    backend: str = Field(pattern="^(local|claude|codex)$")
+    backend: str = Field(pattern="^(local|claude|codex|opencode)$")
     model: str
 
 
@@ -87,14 +100,15 @@ class RunnerSettings(_Strict):
     improve: RunnerChoice
     claude: ClaudeCliSettings = Field(default_factory=ClaudeCliSettings)
     codex: CodexCliSettings
+    opencode: OpencodeCliSettings = Field(default_factory=OpencodeCliSettings)
     cli_terminate_grace_sec: float = Field(gt=0, default=10.0)
 
     @model_validator(mode="after")
     def _trade_backend_not_codex(self) -> "RunnerSettings":
-        if self.trade.backend == "codex":
+        if self.trade.backend in ("codex", "opencode"):
             raise ValueError(
-                "runner.trade.backend='codex' is not allowed "
-                "(codex cannot drop shell; trade worker has no Landlock)")
+                f"runner.trade.backend={self.trade.backend!r} is not allowed "
+                "(CLI backend cannot drop shell; trade worker has no Landlock)")
         return self
 
 

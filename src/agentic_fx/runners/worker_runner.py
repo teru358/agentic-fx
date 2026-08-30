@@ -164,6 +164,20 @@ class WorkerRunner(AgentRunner):
                     return MissionResult(
                         "failed", None, [],
                         reason="codex auth copy failed")
+            elif choice is not None and choice.backend == "opencode":
+                try:
+                    source_config = Path("~/.config/opencode").expanduser()
+                    destination = workdir / "home" / ".config" / "opencode"
+                    destination.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(source_config / "node_modules",
+                                    destination / "node_modules", symlinks=False)
+                    shutil.copy2(source_config / "package.json", destination / "package.json")
+                    shutil.copytree(Path("~/.cache/opencode").expanduser(),
+                                    workdir / "home" / ".cache" / "opencode",
+                                    symlinks=False)
+                except (OSError, shutil.Error):
+                    return MissionResult("failed", None, [],
+                                         reason="opencode runtime assets copy failed")
 
             run_context_fields: dict[str, object] = {}
             if self._run_context is not None:

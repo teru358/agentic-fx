@@ -139,11 +139,11 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     verify_backend_parser = improve_sub.add_parser(
         "verify-backend",
         help="scheduler/backlog に触れない one-shot backend 検証 "
-            "(llama_swap_verified=false のまま実行できる唯一の経路)")
+            "(opencode の llama_swap_verified=false をバイパスできる唯一の経路)")
     verify_backend_parser.add_argument(
-        "--backend", choices=("local", "claude", "codex"), required=True)
+        "--backend", choices=("local", "claude", "codex", "opencode"), required=True)
     verify_backend_parser.add_argument(
-        "--provider", choices=("chatgpt", "llama_swap"), default=None,
+        "--provider", choices=("chatgpt",), default=None,
         help="--backend codex のときのみ意味を持つ (runner.codex.provider "
             "の一時上書き)")
 
@@ -531,11 +531,7 @@ def _improve_verify_backend(conn, settings, args: argparse.Namespace,
         return 1
     print(result.detail)
     print(f"fingerprint: {result.fingerprint}")
-    # I1 是正 (codex 1周目 verified-codex-round1.md cli.py:533 脚):
-    # `--provider` を省略しても実効 provider が llama_swap なら案内を出す
-    # 必要がある。`args.provider` (常に None のことがある) ではなく
-    # `result.provider` (verify_backend が解決した実効値) を見る。
-    if result.backend == "codex" and result.provider == "llama_swap":
+    if result.backend == "opencode":
         print("合格後、人間が config/settings.yaml の improve.llama_swap_verified "
              "を true に設定してください (この CLI は書き換えません)。")
     return 0

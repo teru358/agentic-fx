@@ -26,13 +26,11 @@ def _mission(**over):
     return Mission(**d)
 
 
-def _runner(tmp_path, *, provider="chatgpt", llama_swap_base_url=None,
-           behavior="success", **over):
+def _runner(tmp_path, *, behavior="success", **over):
     workdir = tmp_path / "wd"
     workdir.mkdir()
     kw = dict(bin_path=Path(sys.executable), model="gpt-5.6-sol",
-              workdir=workdir, provider=provider,
-              llama_swap_base_url=llama_swap_base_url,
+                  workdir=workdir, provider="chatgpt",
               cli_terminate_grace_sec=0.3, registry=ToolRegistry())
     kw.update(over)
     r = CodexRunner(**kw)
@@ -72,22 +70,10 @@ def test_codex_argv_shape_pins_bypass_and_ignore_user_config(tmp_path):
     assert "--output-schema" in argv
 
 
-def test_codex_argv_uses_llama_swap_provider_config_when_selected(tmp_path):
-    runner, workdir, _ = _runner(
-        tmp_path, provider="llama_swap",
-        llama_swap_base_url="http://localhost:8080/v1")
-    argv = runner._build_argv(_mission(), mcp_socket=workdir / "afx.sock")
-    joined = " ".join(argv)
-    assert "model_providers.llamaswap.base_url=http://localhost:8080/v1" in joined
-    assert "model_providers.llamaswap.wire_api=responses" in joined
-    assert "model_provider=llamaswap" in joined
-    # codex 0.150.x は model_providers.<id>.name が無いと config エラーで rc=1 に
-    # なる (実機 E2E F-9 の真因、2026-08-30 実測)
-    assert "model_providers.llamaswap.name=llamaswap" in joined
-
-
-def test_codex_argv_omits_llama_swap_config_for_chatgpt_provider(tmp_path):
-    runner, workdir, _ = _runner(tmp_path, provider="chatgpt")
+def test_codex_argv_has_no_llama_swap_provider_config(tmp_path):
+    """llama_swap 用 argv を復活させる変異は namespace tools 非互換を再導入
+    するため、chatgpt 固定の argv から設定片が消えていることを pin する。"""
+    runner, workdir, _ = _runner(tmp_path)
     argv = runner._build_argv(_mission(), mcp_socket=workdir / "afx.sock")
     joined = " ".join(argv)
     assert "llamaswap" not in joined

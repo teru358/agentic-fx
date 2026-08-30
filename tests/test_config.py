@@ -27,6 +27,19 @@ def test_example_file_loads():
     assert s.datafeed.mt5.enabled is False
 
 
+def test_opencode_is_improve_only_and_codex_llama_swap_is_rejected():
+    """opencode を trade に通す、または codex の llama_swap 封鎖を外す変異は
+    shell 境界/namespace tools 非互換を再導入するため validator で pin する。"""
+    raw = load_settings(EXAMPLE).model_dump()
+    raw["runner"]["trade"]["backend"] = "opencode"
+    with pytest.raises(ValidationError, match="opencode"):
+        Settings.model_validate(raw)
+    raw = load_settings(EXAMPLE).model_dump()
+    raw["runner"]["codex"]["provider"] = "llama_swap"
+    with pytest.raises(ValidationError, match="namespace tools"):
+        Settings.model_validate(raw)
+
+
 def test_pair_without_rule_rejected(tmp_path):
     import yaml
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
@@ -438,12 +451,13 @@ def test_every_nested_settings_type_forbids_unknown_keys():
     assert loose == [], f"未知キーを拒否しない設定型: {loose}"
 
 
-def test_settings_yaml_example_has_claude_and_codex_runner_settings():
+def test_settings_yaml_example_has_cli_runner_settings():
     s = load_settings(EXAMPLE)
     assert s.runner.claude.bin == "claude"
     assert s.runner.claude.credentials_file == "~/.claude/.credentials.json"
     assert s.runner.codex.bin
-    assert s.runner.codex.provider in ("chatgpt", "llama_swap")
+    assert s.runner.codex.provider == "chatgpt"
+    assert s.runner.opencode.bin == "~/.opencode/bin/opencode"
     assert s.runner.cli_terminate_grace_sec > 0
 
 

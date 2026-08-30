@@ -108,6 +108,7 @@ def _set_resource_limits(*, as_mb: int, nofile: int, fsize_mb: int) -> None:
 def _bootstrap_improve_profile(
     *, backend: str, mission_id: str, staging_dir: str,
     source_snapshot_dir: str, claude_bin: str | None, codex_bin: str | None,
+    opencode_bin: str | None = None,
 ) -> None:
     """improve worker profile の bootstrap (プラン8, 設計書 §4.6)。
 
@@ -147,7 +148,10 @@ def _bootstrap_improve_profile(
             read_only.append(sys_path)
     if Path("/run/systemd/resolve").exists():
         read_only.append(Path("/run/systemd/resolve"))
-    if backend == "claude":
+    if backend in ("claude", "opencode"):
+        # opencode (bun/JSC) は /proc/self/maps 読取に失敗すると SIGABRT
+        # (検収実測 2026-08-30: mmap 予約は全て成功した状態で maps/cgroup
+        # EACCES 直後に自己 abort)。claude と同じリスク受容 (R10 参照)。
         read_only.append(Path("/proc"))
 
     # staging_dir の相互照合 (§2.2): 末尾成分が mission_id と一致するか。
@@ -179,7 +183,12 @@ def _bootstrap_improve_profile(
 
     closure = _exec_closure_for(
         backend, claude_bin=Path(claude_bin) if claude_bin else None,
-        codex_bin=Path(codex_bin) if codex_bin else None, venv_root=venv_root)
+        codex_bin=Path(codex_bin) if codex_bin else None,
+        # opencode の既定 bin は "~/.opencode/bin/opencode" (チルダ入り)。
+        # expanduser しないと後段の .resolve() が workdir 相対に化ける
+        # (検収実測 2026-08-30: /tmp/afx-mission-*/~/.opencode/... で ENOENT)
+        opencode_bin=(Path(opencode_bin).expanduser()
+                      if opencode_bin else None), venv_root=venv_root)
     execute_dirs = list(closure.dirs)
     # `_exec_closure_for` の docstring どおり base_prefix は呼び出し側
     # (このモジュール) が合成する — venv の `sys.executable` が指す実体
@@ -240,7 +249,8 @@ class ExecClosure(NamedTuple):
 
 
 def _exec_closure_for(backend: str, *, claude_bin: Path | None,
-                      codex_bin: Path | None, venv_root: Path) -> ExecClosure:
+                      codex_bin: Path | None, venv_root: Path,
+                      opencode_bin: Path | None = None) -> ExecClosure:
     """§2.2 の表。**local backend には EXECUTE をディレクトリ単位で `/usr/lib`
     に与えない** — 与えると `/usr/lib` 配下に実体を持つ実行ファイル
     (uutils coreutils 等) がすべて exec 可能になり、shell 遮断が無効化される
@@ -259,7 +269,7 @@ def _exec_closure_for(backend: str, *, claude_bin: Path | None,
     """
     dirs: list[Path] = [venv_root]                     # base_prefix は呼び出し側で合成
     targets: list[Path] = [Path(sys.executable).resolve()]
-    if backend in ("claude", "codex"):
+    if backend in ("claude", "codex", "opencode"):
         dirs.append(Path("/usr/bin"))
         if Path("/bin").is_dir() and not Path("/bin").is_symlink():
             dirs.append(Path("/bin"))
@@ -272,6 +282,10 @@ def _exec_closure_for(backend: str, *, claude_bin: Path | None,
         targets.append(real)
     if backend == "codex" and codex_bin is not None:
         real = codex_bin.resolve()
+        dirs.append(real.parent)
+        targets.append(real)
+    if backend == "opencode" and opencode_bin is not None:
+        real = opencode_bin.resolve()
         dirs.append(real.parent)
         targets.append(real)
     return ExecClosure(dirs=dirs, targets=targets)
@@ -628,20 +642,40 @@ def main() -> None:
             if improve_backend == "claude":
                 claude_bin = settings_dict["runner"]["claude"]["bin"]
                 codex_bin = None
+                # 検収是正 (2026-08-30): opencode_bin の代入漏れ — この分岐
+                # だけ未代入だと backend=claude が UnboundLocalError で死ぬ
+                opencode_bin = None
             elif improve_backend == "codex":
                 claude_bin = None
                 codex_bin = settings_dict["runner"]["codex"]["bin"]
+                opencode_bin = None
+            elif improve_backend == "opencode":
+                claude_bin = None
+                codex_bin = None
+                opencode_bin = settings_dict["runner"]["opencode"]["bin"]
             else:
                 claude_bin = None
                 codex_bin = None
+                opencode_bin = None
             _bootstrap_improve_profile(
                 backend=improve_backend,
                 mission_id=handshake["mission_id"],
                 staging_dir=handshake["staging_dir"],
                 source_snapshot_dir=handshake["source_snapshot_dir"],
-                claude_bin=claude_bin, codex_bin=codex_bin)
+                claude_bin=claude_bin, codex_bin=codex_bin,
+                opencode_bin=opencode_bin)
+            # 検収実測 (2026-08-30): opencode (bun/JSC) は `run` 時に巨大な
+            # 仮想アドレス予約を行う (strace 実測: 8GB 一括 (gigacage)、
+            # 16GB 制限下では 128GB 一括の arena 予約が ENOMEM → SIGABRT)。
+            # 予約は仮想アドレスのみで実メモリ消費ではないが、この規模では
+            # RLIMIT_AS は封じ込めとして機能しない — opencode backend の
+            # ときだけ 256GB へ引き上げる (実質的な暴走抑止は NOFILE/FSIZE/
+            # timeout が担う)。他 backend の既定 4096MB は緩めない。
+            as_mb = settings_dict["worker"]["child_as_mb"]
+            if improve_backend == "opencode":
+                as_mb = max(as_mb, 262144)
             _set_resource_limits(
-                as_mb=settings_dict["worker"]["child_as_mb"],
+                as_mb=as_mb,
                 nofile=settings_dict["worker"]["child_nofile"],
                 fsize_mb=settings_dict["worker"]["child_fsize_mb"])
             from agentic_fx.config import Settings

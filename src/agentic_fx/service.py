@@ -358,7 +358,7 @@ def _check_cli_backend(settings, *, which: str):
     検査⑤ (`_check_service_initial_env_has_no_secrets`) は claude/codex
     共通 (backend=local を除く全 CLI backend) で 1 回だけ呼ぶ — 段 0 申し送り
     1: 旧実装は claude 分岐でしか呼んでいなかったが、improve worker は
-    codex 分岐 (chatgpt/llama_swap とも) でも同 UID で `/proc/<pid>/environ`
+    codex/opencode 分岐でも同 UID で `/proc/<pid>/environ`
     を読めるため脅威モデルは同一。"""
     choice = getattr(settings.runner, which)
     backend = choice.backend
@@ -380,16 +380,21 @@ def _check_cli_backend(settings, *, which: str):
             _check_credentials_file(settings.runner.codex.auth_file,
                                     label="codex")
             _check_codex_subscription_expiry(settings.runner.codex.auth_file)
-        elif settings.runner.codex.provider == "llama_swap":
-            if not settings.improve.llama_swap_verified:
-                raise RuntimeError(
-                    "runner.codex.provider='llama_swap' requires "
-                    "improve.llama_swap_verified=true (set only after "
-                    "`afx improve verify-backend` passes — Task 13)")
         settings = settings.model_copy(update={
             "runner": settings.runner.model_copy(update={
                 "codex": settings.runner.codex.model_copy(
                     update={"bin": str(bin_path)})})})
+    elif backend == "opencode":
+        if not settings.improve.llama_swap_verified:
+            raise RuntimeError(
+                "runner.improve.backend='opencode' requires "
+                "improve.llama_swap_verified=true (set only after "
+                "`afx improve verify-backend --backend opencode` passes)")
+        bin_path = _resolve_cli_bin(settings.runner.opencode.bin, require_elf=True)
+        _check_cli_version(bin_path)
+        settings = settings.model_copy(update={"runner": settings.runner.model_copy(
+            update={"opencode": settings.runner.opencode.model_copy(
+                update={"bin": str(bin_path)})})})
     _check_service_initial_env_has_no_secrets(settings)
     return settings
 

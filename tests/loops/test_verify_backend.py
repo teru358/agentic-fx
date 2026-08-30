@@ -360,7 +360,7 @@ def test_verify_backend_overrides_runner_improve_backend_and_codex_provider(
     assert settings.runner.codex.provider != "llama_swap"  # 元の複製元は無変更
 
 
-def test_verify_backend_bypasses_llama_swap_verified_gate_with_warning_log(
+def test_verify_backend_opencode_bypasses_llama_swap_verified_gate_with_warning_log(
         tmp_path, monkeypatch, caplog):
     """通常入口 (`ImproveSupervisor`) の拒否契約は変更しない — verify-backend
     だけが `improve.llama_swap_verified=false` のままバイパスでき、その旨を
@@ -388,21 +388,17 @@ def test_verify_backend_bypasses_llama_swap_verified_gate_with_warning_log(
     assert settings.improve.llama_swap_verified is False
 
     with caplog.at_level("WARNING", logger="agentic_fx.loops.verify_backend"):
-        result = verify_backend(tmp_path, settings, backend="codex",
-                               provider="llama_swap", clock=FixedClock(NOW))
+        result = verify_backend(tmp_path, settings, backend="opencode",
+                               provider=None, clock=FixedClock(NOW))
 
     assert result.ok is True
     assert any("llama_swap_verified" in r.message for r in caplog.records)
 
 
-def test_verify_backend_reports_settings_provider_when_provider_arg_is_omitted(
+def test_verify_backend_opencode_has_no_codex_provider(
         tmp_path, monkeypatch, caplog):
-    """I1 是正 (codex 1周目, verified-codex-round1.md): `--provider` を
-    省略しても `backend="codex"` かつ `settings.runner.codex.provider` が
-    設定されているなら、実際に走る provider (WorkerRunner に渡る値) と
-    `result.provider`/fingerprint 原像/バイパス WARNING の判定が一致する。
-    是正前は `provider=None` がそのまま `VerifyBackendResult.provider` へ
-    透過し、fingerprint 原像も `f"codex:None:..."` になっていた。"""
+    """opencode 検証に codex provider を漏らす変異を防ぐ。fingerprint は
+    backend と model/nonce に基づき、provider は常に None である。"""
     class _Capture(_FakeVerifyWorkerRunner):
         def run(self, mission):
             captured_mission["m"] = mission
@@ -414,22 +410,20 @@ def test_verify_backend_reports_settings_provider_when_provider_arg_is_omitted(
     monkeypatch.setattr("agentic_fx.loops.verify_backend._descendant_pids",
                         lambda pid: set())
     _BEHAVIOR["current"] = {"result": _echo_ok}
-    settings = _settings_with_codex_provider("llama_swap")
+    settings = _settings()
     assert settings.improve.llama_swap_verified is False
 
     with caplog.at_level(logging.WARNING, logger="agentic_fx.loops.verify_backend"):
-        result = verify_backend(tmp_path, settings, backend="codex",
+        result = verify_backend(tmp_path, settings, backend="opencode",
                                provider=None, clock=FixedClock(NOW))
 
-    eff = _FakeVerifyWorkerRunner.captured_kwargs["settings"].runner.codex.provider
     eff_model = _FakeVerifyWorkerRunner.captured_kwargs["settings"].runner.improve.model
     nonce = captured_mission["m"].output_schema["properties"]["echo"]["const"]
-    assert eff == "llama_swap"
-    assert result.provider == "llama_swap"
-    assert "provider=llama_swap" in result.detail
+    assert result.provider is None
+    assert "provider=None" in result.detail
     assert any("llama_swap_verified" in r.message for r in caplog.records)
     assert result.fingerprint == hashlib.sha256(
-        f"codex:llama_swap:{eff_model}:{nonce}".encode("utf-8")).hexdigest()
+        f"opencode:None:{eff_model}:{nonce}".encode("utf-8")).hexdigest()
 
 
 @pytest.mark.parametrize("backend", ["local", "claude"])
