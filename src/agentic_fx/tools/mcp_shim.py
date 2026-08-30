@@ -20,9 +20,10 @@ from agentic_fx.tools.registry import ToolRegistry
 # 裁定 5: 実 CLI の initialize 要求を実測して確定する (Task 13 → [T13-5c])。
 # 実測 (2026-08-30、runbook「claude 実ターン」節): claude CLI 2.1.251 は
 # "2025-11-25" を送る。単一固定だと backend 間で版が割れた時に片方が必ず
-# 落ちるため、実測済み版の allowlist + 要求版 echo とする。codex の実測版は
-# 取得後にここへ追加する。未実測の版は従来どおり -32600 で fail closed。
-_SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-11-25")
+# 落ちるため、実測済み版の allowlist + 要求版 echo とする。codex-mcp-client
+# 0.150.1 は "2025-06-18" を送る (tee 捕捉、同 runbook)。未実測の版は
+# 従来どおり -32600 で fail closed。
+_SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-06-18", "2025-11-25")
 _SUPPORTED_PROTOCOL_VERSION = _SUPPORTED_PROTOCOL_VERSIONS[0]
 
 
