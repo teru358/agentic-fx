@@ -3879,6 +3879,17 @@ def test_trade_claude_real_process_completes_via_factory_build_runner(
                           rag=_rag(tmp_path), worker_profile="trade")
     mission = Mission(prompt="hi", tools=[], output_schema={},
                       max_turns=1, timeout_sec=30.0)
+    # 段A (mission transcript 常時保存): このテストは本物の
+    # mission_worker 子プロセスを spawn する — 子は別プロセスなので
+    # `tests/conftest.py` の `_isolate_mission_transcripts_default_dir`
+    # (親プロセスの `cli_runner._TRANSCRIPT_DIR_DEFAULT` monkeypatch) が
+    # 届かず、実 `<repo>/logs/mission-transcripts/` へ書く。実ファイルへの
+    # 書き込み自体は意図通りの動作 (診断用途) だが、テスト実行のたびに
+    # 実リポジトリへ蓄積させない — 事前スナップショットとの差分だけを
+    # `finally` で消す。
+    real_transcript_dir = Path(__file__).resolve().parents[2] / "logs" / "mission-transcripts"
+    transcripts_before = (set(real_transcript_dir.glob("*.jsonl"))
+                          if real_transcript_dir.is_dir() else set())
     try:
         result = runner.run(mission)
 
@@ -3906,3 +3917,7 @@ def test_trade_claude_real_process_completes_via_factory_build_runner(
         import shutil as _shutil
         for d in created_tempdirs:
             _shutil.rmtree(d, ignore_errors=True)
+        transcripts_after = (set(real_transcript_dir.glob("*.jsonl"))
+                             if real_transcript_dir.is_dir() else set())
+        for f in transcripts_after - transcripts_before:
+            f.unlink(missing_ok=True)

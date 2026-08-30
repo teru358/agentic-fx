@@ -67,6 +67,12 @@ from agentic_fx.core.mission_protocol import (
 # monkeypatch を可能にするため module level import (test 側から
 # `mw_mod.runner_factory` として属性差し替え)。
 from agentic_fx.runners import factory as runner_factory
+# 段A 是正 (2026-08-30): CliRunner の transcript 既定保存先を Landlock の
+# rw allowlist へ加える唯一の真実源として import する (別々に導出すると
+# 座標がずれて allowlist が空振りする — `_guarded_data_dir` が禁じている
+# のとは逆に、こちらは**一致**させたい)。cli_runner.py は mission_worker
+# を `run()` 内でしか (遅延) import しないため循環 import にならない。
+from agentic_fx.runners.cli_runner import _TRANSCRIPT_DIR_DEFAULT as _MISSION_TRANSCRIPT_DIR
 # A-4 検収是正 (2026-08-22, B1): McpShimDispatcher の module level import。
 # `_start_mcp_dispatcher` から使う。ToolRegistry も同様に module level へ
 # 上げる (`_build_improve_registry` の型注釈・既定実装で使うため — 従来
@@ -204,13 +210,35 @@ def _bootstrap_improve_profile(
     # 検証と同じ扱い。
     execute_files = landlock.interpreter_files_for(closure.targets)
 
+    # 段A 是正 (2026-08-30): `CliRunner._save_transcript` の既定保存先
+    # (`<repo>/logs/mission-transcripts/`) を rw allowlist に加え、improve
+    # profile でも mission transcript を保存できるようにする。Landlock は
+    # 「存在しないディレクトリへのルール化」ができないため、適用**前**に
+    # ここで pre-create する — 加えるのは `logs/mission-transcripts/`
+    # **専用ディレクトリのみ** (`logs/` 全体には広げない、`workdir`/
+    # `staging_path` と同じディレクトリ単位の rw 付与)。作成に失敗しても
+    # bootstrap 自体は止めない — transcript 保存は診断用の best-effort
+    # 機能であり、improve worker の起動可否を左右してはならない
+    # (`CliRunner._save_transcript` 側の「保存失敗で mission を落とさない」
+    # 規範と対称。作成できなければ rw allowlist にも加えない — 存在しない
+    # dir はそもそもルール化できない)。
+    extra_rw_paths: list[Path] = []
+    try:
+        _MISSION_TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    else:
+        extra_rw_paths.append(_MISSION_TRANSCRIPT_DIR)
+
     _assert_allowlist_excludes_data_dir(
-        read_only + [workdir, staging_path] + execute_dirs + execute_files,
+        read_only + [workdir, staging_path] + extra_rw_paths
+        + execute_dirs + execute_files,
         guarded_data_dir=_guarded_data_dir())
     try:
         landlock.restrict_to(
-            read_only_paths=read_only, read_write_paths=[workdir, staging_path,
-                                                          Path("/dev")],
+            read_only_paths=read_only,
+            read_write_paths=[workdir, staging_path, Path("/dev")]
+            + extra_rw_paths,
             execute_paths=execute_dirs, execute_file_paths=execute_files)
     except landlock.LandlockUnavailable as e:
         raise RuntimeError(

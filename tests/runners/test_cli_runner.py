@@ -422,3 +422,135 @@ def test_cli_runner_forwards_rlimits_to_launcher(tmp_path):
                          rlimits=want, launcher=fake_launcher)
     runner.run(_mission())
     assert captured["rlimits"] == want
+
+
+# --- 段A: mission transcript 常時保存 --------------------------------
+
+
+def test_cli_runner_saves_transcript_on_completed_mission(tmp_path):
+    """成功 mission でも transcript ファイルが生成され、stdout のイベント
+    行がそのまま入っている。"""
+    transcript_dir = tmp_path / "transcripts"
+    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path,
+                         transcript_dir=transcript_dir)
+    result = runner.run(_mission())
+    assert result.status == "completed"
+    files = list(transcript_dir.glob("*.jsonl"))
+    assert len(files) == 1
+    lines = files[0].read_text(encoding="utf-8").splitlines()
+    assert any(json.loads(l).get("answer") == 4 for l in lines
+               if l and not l.startswith('{"_'))
+
+
+def test_cli_runner_saves_transcript_when_no_output_recovered(tmp_path):
+    """出力回収失敗 (no output) の failed mission でも transcript は
+    生成される。"""
+    transcript_dir = tmp_path / "transcripts"
+    script = "print('not json and no answer key')\n"
+    runner = _new_runner(script, tmp_path, transcript_dir=transcript_dir)
+    result = runner.run(_mission())
+    assert result.status == "failed"
+    assert result.reason is not None and "no output" in result.reason
+    files = list(transcript_dir.glob("*.jsonl"))
+    assert len(files) == 1
+    assert "not json and no answer key" in files[0].read_text(encoding="utf-8")
+
+
+def test_cli_runner_saves_transcript_on_timeout(tmp_path):
+    """timeout 終端でも transcript の保存呼び出しは通る (保存箇所の
+    placement pin — join 直後の finally を素通りしていないか)。"""
+    transcript_dir = tmp_path / "transcripts"
+    runner = _new_runner(_SLEEP_FOREVER, tmp_path, transcript_dir=transcript_dir)
+    result = runner.run(_mission(timeout_sec=0.3))
+    assert result.status == "timeout"
+    files = list(transcript_dir.glob("*.jsonl"))
+    assert len(files) == 1
+
+
+def test_cli_runner_transcript_dir_is_auto_created(tmp_path):
+    """保存先ディレクトリが存在しなくても自動作成される (親も含む)。"""
+    transcript_dir = tmp_path / "does" / "not" / "exist" / "yet"
+    assert not transcript_dir.exists()
+    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path,
+                         transcript_dir=transcript_dir)
+    runner.run(_mission())
+    assert transcript_dir.is_dir()
+    assert len(list(transcript_dir.glob("*.jsonl"))) == 1
+
+
+def test_cli_runner_transcript_save_failure_does_not_raise_and_result_returned(tmp_path):
+    """保存先が書込不可 (権限エラー) でも `run()` は例外を出さず
+    MissionResult を返す。"""
+    transcript_dir = tmp_path / "ro_transcripts"
+    transcript_dir.mkdir()
+    transcript_dir.chmod(0o500)  # 書込不可、読み+実行のみ
+    try:
+        runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path,
+                             transcript_dir=transcript_dir)
+        result = runner.run(_mission())
+        assert result.status == "completed"
+        assert result.output == {"answer": 4}
+        assert list(transcript_dir.glob("*.jsonl")) == []
+    finally:
+        transcript_dir.chmod(0o700)  # tmp_path クリーンアップのため復元
+
+
+def test_cli_runner_transcript_stderr_tail_is_appended(tmp_path):
+    """stderr も末尾に `{"_stderr_tail": "..."}` 行として付く。"""
+    transcript_dir = tmp_path / "transcripts"
+    script = ("import sys, json\n"
+              "sys.stderr.write('diag line\\n')\n"
+              "print(json.dumps({'answer': 4}))\n")
+    runner = _new_runner(script, tmp_path, transcript_dir=transcript_dir)
+    runner.run(_mission())
+    files = list(transcript_dir.glob("*.jsonl"))
+    lines = files[0].read_text(encoding="utf-8").splitlines()
+    stderr_lines = [json.loads(l) for l in lines if '"_stderr_tail"' in l]
+    assert len(stderr_lines) == 1
+    assert "diag line" in stderr_lines[0]["_stderr_tail"]
+
+
+def test_cli_runner_transcript_truncates_when_over_budget(tmp_path, monkeypatch):
+    """肥大化対策: 合計サイズが上限を超えると先頭/末尾を残して中間を
+    `_omitted` マーカー付きで省略する。上限を極小に monkeypatch して
+    実測する。"""
+    from agentic_fx.runners import cli_runner as cli_runner_mod
+
+    monkeypatch.setattr(cli_runner_mod, "_TRANSCRIPT_MAX_BYTES", 200)
+    transcript_dir = tmp_path / "transcripts"
+    # 200 バイト上限を確実に超える量の event 行を吐く fake CLI。
+    script = (
+        "import json\n"
+        "for i in range(200):\n"
+        "    print(json.dumps({'i': i, 'pad': 'x' * 20}))\n"
+        "print(json.dumps({'answer': 4}))\n"
+    )
+    runner = _new_runner(script, tmp_path, transcript_dir=transcript_dir)
+    result = runner.run(_mission())
+    assert result.status == "completed"
+    files = list(transcript_dir.glob("*.jsonl"))
+    assert len(files) == 1
+    lines = files[0].read_text(encoding="utf-8").splitlines()
+    omitted_lines = [l for l in lines if '"_omitted"' in l]
+    assert len(omitted_lines) == 1
+    # 先頭 (i=0) と末尾 (answer=4) の両方が残っている。
+    assert any('"i": 0' in l for l in lines[:5])
+    assert any(json.loads(l).get("answer") == 4 for l in lines
+               if l and not l.startswith('{"_'))
+    # 中間は本当に間引かれている (全 201 行 + マーカー + stderr_tail より
+    # 少ない)。
+    assert len(lines) < 203
+
+
+def test_cli_runner_transcript_default_dir_is_module_attribute(tmp_path, monkeypatch):
+    """`transcript_dir=None` (既定) のとき、`_TRANSCRIPT_DIR_DEFAULT` を
+    呼び出し時点で読む (インスタンス生成時に固定しない) — テストの
+    session fixture がこの属性を monkeypatch して実リポジトリを保護できる
+    ことの pin。"""
+    from agentic_fx.runners import cli_runner as cli_runner_mod
+
+    isolated = tmp_path / "isolated-default"
+    monkeypatch.setattr(cli_runner_mod, "_TRANSCRIPT_DIR_DEFAULT", isolated)
+    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path)  # transcript_dir 未指定
+    runner.run(_mission())
+    assert len(list(isolated.glob("*.jsonl"))) == 1

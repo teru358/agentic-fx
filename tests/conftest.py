@@ -70,6 +70,59 @@ _FORBIDDEN_PORTS = frozenset(_FORBIDDEN_PORTS)
 
 
 @pytest.fixture(autouse=True, scope="session")
+def _isolate_mission_transcripts_default_dir(tmp_path_factory):
+    """段A (mission transcript 常時保存) の既定保存先は `CliRunner` が
+    `<repo>/logs/mission-transcripts/` を `__file__` から導出する
+    (`cli_runner._TRANSCRIPT_DIR_DEFAULT`)。`CliRunner.run()` を呼ぶ
+    どのテストも既定のままだと実リポジトリの `logs/` に書き込んでしまう
+    ── `_guard_real_data_dir_is_never_touched` と同じ「テストが実
+    リポジトリ資源を絶対座標で触る」事故クラス。セッション全体で
+    その属性自体を隔離先へ差し替える (個別テストは transcript_dir= を
+    渡す必要が無くなる)。"""
+    from agentic_fx.runners import cli_runner as _cli_runner_mod
+
+    original = _cli_runner_mod._TRANSCRIPT_DIR_DEFAULT
+    isolated = tmp_path_factory.mktemp("mission-transcripts-default")
+    _cli_runner_mod._TRANSCRIPT_DIR_DEFAULT = isolated
+    yield
+    _cli_runner_mod._TRANSCRIPT_DIR_DEFAULT = original
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _guard_real_mission_transcripts_dir_is_never_touched():
+    """`_isolate_mission_transcripts_default_dir` は **親プロセス**の
+    `cli_runner._TRANSCRIPT_DIR_DEFAULT` しか差し替えられない。
+    `subprocess.Popen([sys.executable, "-m", "agentic_fx.mission_worker"],
+    ...)` で本物の子プロセスを起動するテスト
+    (`tests/test_improve_profile_isolation.py::
+    test_real_improve_worker_reaches_ready` 等、`_forbid_worker_spawn_
+    against_real_llama_swap` の docstring が既に名指ししている穴) は
+    別プロセスで `cli_runner` を再 import するため、この monkeypatch は
+    素通りする。子が実際に `CliRunner.run()` まで到達すれば実
+    `<repo>/logs/mission-transcripts/` へ書く経路が残る —
+    `_guard_real_data_dir_is_never_touched` と同じ「テストが実リポジトリ
+    資源を絶対座標で触る」事故クラスなので、同じ形 (session 前後の
+    スナップショット比較) で検査する。"""
+    real_dir = Path(__file__).resolve().parents[1] / "logs" / "mission-transcripts"
+
+    def _sig():
+        if not real_dir.is_dir():
+            return None
+        return sorted(p.name for p in real_dir.iterdir())
+
+    before = _sig()
+    yield
+    after = _sig()
+    if before != after:
+        pytest.fail(
+            f"実 {real_dir} がテスト実行中に変更された: {before} -> {after}。"
+            "本物の mission_worker 子プロセスを起動するテストが CliRunner."
+            "run() まで到達し、既定の transcript 保存先 (親プロセスの "
+            "monkeypatch が届かない別プロセス) へ書き込んだ可能性がある。",
+            pytrace=False)
+
+
+@pytest.fixture(autouse=True, scope="session")
 def _guard_real_data_dir_is_never_touched():
     """実機 E2E (2026-08-30) の事故 pin: `test_run_gate_pytest_cannot_open_
     agentic_db` (旧実装) が実リポジトリの `data/agentic.db` を上書き→unlink

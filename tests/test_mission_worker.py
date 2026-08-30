@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import textwrap
+import uuid
 from pathlib import Path
 
 import pytest
@@ -203,6 +204,50 @@ def test_bootstrap_improve_profile_staging_dir_is_writable(improve_worker_layout
         source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"])
     assert result.returncode == 0, result.stderr
     assert "STAGING_WRITABLE" in result.stdout
+
+
+def test_bootstrap_improve_profile_mission_transcript_dir_is_writable(
+        improve_worker_layout):
+    """段A 是正 (2026-08-30): `CliRunner` の transcript 既定保存先
+    (`cli_runner._TRANSCRIPT_DIR_DEFAULT` == `<repo>/logs/mission-
+    transcripts`) が improve profile の Landlock rw allowlist に無いと、
+    improve/opencode mission の transcript 保存が `PermissionError` →
+    `logging.warning` (`stderr=subprocess.DEVNULL` 越しに握り潰される) で
+    silent に無効化される。ここでは `_bootstrap_improve_profile` 後に
+    実際にその dir へ書けることを子プロセスで実測する。
+
+    書込先は実リポジトリの `logs/mission-transcripts/` (`CliRunner` 本体
+    と Landlock allowlist が同じ座標に一致していることを検証するのが
+    このテストの主旨のため、テスト専用ディレクトリへ差し替えない) —
+    一意なマーカーファイル名で書き、assert 後に必ず削除して実リポジトリを
+    汚さない (`tests-touching-real-repo-resources` の再演防止)。
+
+    **`real_dir` は `_REPO_ROOT` から独立に導出する** — 子プロセスの
+    `_TRANSCRIPT_DIR_DEFAULT` を親プロセス側で直接 import して比較する
+    と、`tests/conftest.py::_isolate_mission_transcripts_default_dir`
+    (セッション全体で親プロセスのその属性を隔離先へ monkeypatch する
+    fixture) の影響を受けてしまい、子 (別プロセス、monkeypatch 不到達)
+    が実際に書いた実リポジトリの座標と食い違う。"""
+    l = improve_worker_layout
+    marker_name = f"landlock-probe-{uuid.uuid4().hex}.txt"
+    script = f"""
+    from agentic_fx.runners.cli_runner import _TRANSCRIPT_DIR_DEFAULT
+    p = _TRANSCRIPT_DIR_DEFAULT / {marker_name!r}
+    p.write_text("ok")
+    print("TRANSCRIPT_DIR_WRITABLE")
+    """
+    real_dir = _REPO_ROOT / "logs" / "mission-transcripts"
+    marker_path = real_dir / marker_name
+    try:
+        result = _run_bootstrap_probe(
+            script, staging_dir=l["staging_dir"], mission_id=l["mission_id"],
+            source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"])
+        assert result.returncode == 0, result.stderr
+        assert "TRANSCRIPT_DIR_WRITABLE" in result.stdout
+        assert marker_path.is_file()
+        assert marker_path.read_text() == "ok"
+    finally:
+        marker_path.unlink(missing_ok=True)
 
 
 def test_bootstrap_improve_profile_rejects_staging_dir_mission_id_mismatch(

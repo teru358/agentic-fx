@@ -7,7 +7,10 @@ Global Constraints)。
 """
 from __future__ import annotations
 
+import json
+import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -15,6 +18,7 @@ import threading
 import time
 from abc import abstractmethod
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -26,6 +30,87 @@ from agentic_fx.runners.launcher import build_launcher_argv
 from agentic_fx.tools.registry import ToolRegistry
 
 _MAX_REASON_CHARS = 500
+
+# 段A (mission transcript 常時保存): 既定の保存先。`<repo>/logs/` は
+# gitignore 済み (.gitignore:18)。`__file__` から repo root を導く形は
+# `mission_worker._guarded_data_dir` と同じ流儀 — 呼び出し元 (workdir) の
+# 事情に左右されずに固定できる。**モジュール属性として** 保持し、
+# `_save_transcript` は毎回この属性を読み直す — テストは
+# `tests/conftest.py` のセッション fixture でこの属性そのものを
+# monkeypatch し、実リポジトリの `logs/`を一切触らせない
+# (`tests-touching-real-repo-resources` の再演防止)。
+_TRANSCRIPT_DIR_DEFAULT = Path(__file__).resolve().parents[3] / "logs" / "mission-transcripts"
+
+#: stdout イベント行の合計サイズがこれを超えたら先頭/末尾を残して中間を
+#: 省略する (肥大化対策)。テストが差し替えられるようモジュール定数にする。
+_TRANSCRIPT_MAX_BYTES = 50 * 1024 * 1024
+
+#: stdout 予算 (下記 `_effective_transcript_max_bytes` の結果) のうち
+#: stderr tail に残す割合。マーカー/JSON overhead 込みでも合計が予算を
+#: 大きく超えないための目安。
+_STDERR_TAIL_BUDGET_FRACTION = 0.15
+
+
+def _effective_transcript_max_bytes() -> int:
+    """`_TRANSCRIPT_MAX_BYTES` (既定 50MB) と、いま実際に効いている
+    `RLIMIT_FSIZE` の小さい方を返す。
+
+    mission_worker (改善 loop・trade loop 双方) は `_set_resource_limits`
+    で `RLIMIT_FSIZE` を soft=hard で固定する (既定 `child_fsize_mb: 8`
+    — `config/settings.yaml.example`)。これを超えて `write()` すると
+    `SIGXFSZ` (既定動作: 即座にプロセスを終了、`try/except` で捕捉
+    **できない**) が飛ぶ — 「transcript 保存の失敗で mission を落とさない」
+    という制約 (§4) は Python 例外だけでは満たせず、書く前に上限側で
+    クランプする必要がある。安全マージンとして soft limit の半分までに
+    抑える (JSON overhead・`_stderr_tail` 行・ファイルシステムの
+    ブロック丸め等の余地を残す)。"""
+    cap = _TRANSCRIPT_MAX_BYTES
+    try:
+        import resource
+        soft, _hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        if soft not in (resource.RLIM_INFINITY, -1) and soft >= 0:
+            cap = min(cap, max(int(soft * 0.5), 1024))
+    except (ImportError, ValueError, OSError):
+        pass
+    return cap
+
+
+def _budget_transcript_lines(stdout_lines: list[str], max_bytes: int) -> list[str]:
+    """`stdout_lines` の合計サイズが `max_bytes` を超える場合、先頭と末尾を
+    それぞれ半分の予算まで残し、中間を省略した旨の 1 行を挟んで返す。
+    超えなければそのまま返す。"""
+    def _size(line: str) -> int:
+        return len(line.encode("utf-8", "replace")) + 1
+
+    total = sum(_size(line) for line in stdout_lines)
+    if total <= max_bytes:
+        return list(stdout_lines)
+
+    half = max_bytes // 2
+    head: list[str] = []
+    head_bytes = 0
+    for line in stdout_lines:
+        b = _size(line)
+        if head_bytes + b > half:
+            break
+        head.append(line)
+        head_bytes += b
+
+    tail: list[str] = []
+    tail_bytes = 0
+    for line in reversed(stdout_lines):
+        b = _size(line)
+        if tail_bytes + b > half:
+            break
+        tail.append(line)
+        tail_bytes += b
+    tail.reverse()
+
+    omitted = max(len(stdout_lines) - len(head) - len(tail), 0)
+    marker = json.dumps({
+        "_omitted": (f"{omitted} lines omitted (~{total} bytes total, "
+                      f"exceeds {max_bytes} byte cap)")})
+    return head + [marker] + tail
 
 
 @dataclass(frozen=True)
@@ -60,7 +145,8 @@ class CliRunner(AgentRunner):
                  cli_started_sink: Callable[[int], None] | None = None,
                  rlimits: dict[str, tuple[int, int]] | None = None,
                  launcher: Callable[..., list[str]] | None = None,
-                 popen: Callable[..., subprocess.Popen] | None = None) -> None:
+                 popen: Callable[..., subprocess.Popen] | None = None,
+                 transcript_dir: Path | None = None) -> None:
         self._bin_path = bin_path
         self._model = model
         self._workdir = workdir
@@ -71,6 +157,10 @@ class CliRunner(AgentRunner):
         self._rlimits = rlimits
         self._build_launcher_argv = launcher or build_launcher_argv
         self._popen = popen or subprocess.Popen
+        # 段A: 既定 None なら `_save_transcript` が呼び出し時点で
+        # `_TRANSCRIPT_DIR_DEFAULT` を読む (固定値をここでキャッシュしない
+        # — テストの monkeypatch がインスタンス生成後でも効くようにする)。
+        self._transcript_dir = transcript_dir
 
     @abstractmethod
     def _build_argv(self, mission: Mission, *, mcp_socket: Path) -> list[str]: ...
@@ -147,6 +237,11 @@ class CliRunner(AgentRunner):
         finally:
             t_out.join(timeout=5.0)
             t_err.join(timeout=5.0)
+            # 段A: どの終端経路 (timeout/failed/schema mismatch/completed)
+            # でも漏れなく保存する — reader thread の join 直後・全 return
+            # より前のこの `finally` に置く (先行する `_terminate_pgid` が
+            # 例外を出しても実行される)。
+            self._save_transcript(list(stdout_lines), stderr_chunks)
 
         if timed_out:
             return MissionResult("timeout", None, [], reason="cli timeout")
@@ -169,6 +264,41 @@ class CliRunner(AgentRunner):
                 "failed", None, [],
                 reason=_normalize_reason(f"output_schema mismatch: {e.message}"))
         return MissionResult("completed", raw, [])
+
+    def _save_transcript(self, stdout_lines: list[str],
+                          stderr_chunks: list[str]) -> None:
+        """mission 終了時に stdout のイベント行を常時保存する (段A)。
+
+        成功/失敗を問わず呼ばれる。保存自体の失敗 (ディスク・権限・
+        Landlock で `logs/` へ書けない等) で mission を落としてはならない
+        — 例外は握って `logging.warning` に留める。"""
+        try:
+            target_dir = (self._transcript_dir if self._transcript_dir is not None
+                          else _TRANSCRIPT_DIR_DEFAULT)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            model_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", self._model) or "model"
+            path = target_dir / f"{ts}-{type(self).__name__}-{model_slug}.jsonl"
+            effective_cap = _effective_transcript_max_bytes()
+            stderr_budget = max(int(effective_cap * _STDERR_TAIL_BUDGET_FRACTION), 256)
+            stdout_budget = max(effective_cap - stderr_budget, 1024)
+            lines = _budget_transcript_lines(stdout_lines, stdout_budget)
+            stderr_text = "".join(stderr_chunks)
+            stderr_bytes = stderr_text.encode("utf-8", "replace")
+            if len(stderr_bytes) > stderr_budget:
+                # 文字境界を壊さないよう decode(errors="ignore") で丸める
+                # (末尾優先 — "tail" の名の通り)。
+                stderr_text = stderr_bytes[-stderr_budget:].decode("utf-8", "ignore")
+            with path.open("w", encoding="utf-8", errors="replace") as f:
+                for line in lines:
+                    f.write(line)
+                    f.write("\n")
+                f.write(json.dumps({"_stderr_tail": stderr_text}))
+                f.write("\n")
+        except Exception as e:  # noqa: BLE001 — 保存失敗で mission を落とさない
+            logging.warning(
+                "mission transcript の保存に失敗した (mission は継続): %s",
+                safe_text(str(e)))
 
     def _terminate_pgid(self, pgid: int, proc: subprocess.Popen) -> None:
         """<!-- precheck 2026-08-22: T1-B9 --> `proc` (CLI 自身、pgid の
