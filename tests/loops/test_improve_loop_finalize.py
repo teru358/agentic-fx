@@ -467,6 +467,66 @@ def test_finalize_failed_mission_slot_terminalize_false_leaves_slot_untouched(
         "slot_terminalize=False は revert 済み slot を終端してはならない")
 
 
+def test_finalize_failed_mission_writes_mission_failed_activity_with_reason(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """[fail-observability]: `_finalize_output_invalid` は activity に
+    `output_invalid` イベントを書くのに `_finalize_failed_mission` は何も
+    書かず非対称だった (improve mission が failed のとき死因が一切残ら
+    ない)。`_finalize_failed_mission` も `mission_failed` イベントを書き、
+    `result.reason` を運ぶことを pin する。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    result = MissionResult(status="timeout", output=None, transcript=[],
+                           reason="worker eof")
+
+    loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
+                                      now=datetime(2026, 8, 22))
+
+    line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
+               if "mission_failed" in line)
+    assert f"mission={mission_id}" in line
+    assert "status=timeout" in line
+    assert "reason=worker eof" in line
+
+
+def test_finalize_failed_mission_writes_activity_with_dash_reason_when_none(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """reason=None のケースでも例外を投げず、activity には `-` を書く。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    result = MissionResult(status="failed", output=None, transcript=[],
+                           reason=None)
+
+    loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
+                                      now=datetime(2026, 8, 22))
+
+    line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
+               if "mission_failed" in line)
+    assert f"mission={mission_id}" in line
+    assert "status=failed" in line
+    assert "reason=-" in line
+
+
 def test_commit_slot_terminalize_false_propagates_to_finalize_failed_mission(
         loop_full, conn, mission_and_run_fixture_with_slot, tmp_path):
     """`ImproveLoop.commit(..., slot_terminalize=False)` の公開 API から

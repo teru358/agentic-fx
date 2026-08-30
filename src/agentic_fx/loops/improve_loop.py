@@ -1475,7 +1475,18 @@ class ImproveLoop:
         pre-ready 失敗の巻き戻し (呼び出し元が既に `revert_to_reserved`
         済み) では `slot_key=None` を `finish_improve_mission` へ渡し、
         mission/run のみ終端して slot には触れない (`mark_terminal` の
-        無条件 UPDATE が巻き戻した `reserved` を潰すのを防ぐ)。"""
+        無条件 UPDATE が巻き戻した `reserved` を潰すのを防ぐ)。
+
+        [fail-observability] 是正 (2026-08-30): `_finalize_output_invalid`
+        は activity に `output_invalid` を書くのに、ここは何も書いておらず
+        非対称だった — improve mission が failed のとき死因が一切残らない
+        原因の一つ。`result.reason` (runner が診断した失敗理由、無ければ
+        `-`) を添えて `mission_failed` を書く。"""
+        reason_text = "-" if result.reason is None else str(result.reason)[:500]
+        self._activity.write(
+            Category.IMPROVE, "mission_failed",
+            f"mission={ctx.mission_id} status={result.status} "
+            f"reason={reason_text}")
         ctx.ledger.mark_discarded()
         self._delete_staging(ctx)
         conn.execute("BEGIN IMMEDIATE")

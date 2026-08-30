@@ -427,11 +427,25 @@ class WorkerRunner(AgentRunner):
             if kind == "result":
                 status = payload["status"]
                 output = payload.get("output")
+                # [fail-observability]: worker 内例外経路
+                # (mission_worker.py の `except Exception` ハンドラ) は
+                # `reason` ではなく `error` キーで送るため、`reason` キー
+                # が無ければ (None) `error` を拾う (死因を落とさない)。
+                # `reason` キーが明示的に空文字で来た場合はそのまま
+                # 空文字を通す (`or` ではなく `is None` で判定 — 既存の
+                # test_worker_runner_preserves_empty_string_reason の
+                # 契約「キーが無い (None) とキーはあるが空 (\"\") は別の
+                # 事象」を壊さない)。
                 reason = payload.get("reason")
+                if reason is None:
+                    reason = payload.get("error")
             else:  # eof / protocol_error / error — すべて failed に正規化
                 status = "failed"
                 output = None
-                reason = None
+                # [fail-observability]: kind (eof/protocol_error/error) を
+                # そのまま残し、result フレームを受け取れなかった終端でも
+                # 死因の手がかりを一切残さないことを避ける。
+                reason = f"worker {kind}"
             return MissionResult(status, output, transcript, reason=reason)
         finally:
             dispatch_queue.put(None)
