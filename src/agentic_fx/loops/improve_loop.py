@@ -1383,9 +1383,15 @@ class ImproveLoop:
             return _REPORT_WRITE_FAILED
         final_path = self._final_report_path(
             reports_dir, mission_id=ctx.mission_id, now=now)
-        conn.execute(
-            "UPDATE improvement_runs SET report_state='prepared', "
-            "report_path=? WHERE id=?", (str(final_path), ctx.run_id))
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE improvement_runs SET report_state='prepared', "
+                "report_path=? WHERE id=?", (str(final_path), ctx.run_id))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         return str(final_path)
 
     def _finalize_report_or_observation(self, conn, *, ctx, backlog_id,

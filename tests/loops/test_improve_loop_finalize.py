@@ -408,25 +408,20 @@ def test_commit_demotes_recovered_report_to_observation_without_publishing(
 
 
 def test_commit_publishes_report_normally_when_not_recovered(
-        loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+        loop_full, conn, mission_and_run_fixture, tmp_path):
     """対照: recovered=False (通常経路) の report artifact は従来どおり
     公開される — 降格分岐を常に通す変異を殺す。
 
-    注意 (着手前確認で発見・M4 スコープ外の既存欠陥): `_prepare_report_
-    if_applicable` の成功パスは Tx-2 の一部のつもりの `UPDATE
-    improvement_runs SET report_state='prepared' ...` を裸の
-    `conn.execute` (BEGIN 無し) で発行しており、python sqlite3 の既定
-    isolation_level 下では暗黙 transaction を開いたままにする。続く
-    `_finalize_report_or_observation` の `conn.execute("BEGIN IMMEDIATE")`
-    が「トランザクション中にトランザクション開始」で `OperationalError`
-    になる — `commit()` を通した report (risk_gate 以外) の成功系を
-    最初に end-to-end で駆動する本テストで発覚した (既存スイートは
-    `_finalize_report_or_observation` を直接呼ぶか、report が
-    OSError/risk_gate に倒れる経路しか通していなかった)。M4 のスコープは
-    provenance 伝搬 + report 降格のみのため、ここでは
-    `_prepare_report_if_applicable` を実ファイル書込のみ行うよう
-    monkeypatch してこの既存欠陥を回避し、降格分岐を通らないことと
-    以降の公開が従来どおり完了することだけを検証する。"""
+    report-tx-crash 是正 (2026-08-30): 従来は `_prepare_report_if_
+    applicable` の実ファイル書込 + Tx-2 更新を monkeypatch で回避して
+    いたが、これは本経路の `sqlite3.OperationalError: cannot start a
+    transaction within a transaction` (`_prepare_report_if_applicable`
+    の裸 `conn.execute(UPDATE ...)` が既定 isolation_level 下で暗黙
+    transaction を開いたまま `_finalize_report_or_observation` の
+    `BEGIN IMMEDIATE` に突入していた) を隠していた。ここでは
+    `_prepare_report_if_applicable` を実経路のまま (real write `conn`
+    = `connect()`) 駆動し、report 準備 → Tx-2 finalize の連続呼び出しが
+    例外なく完走し、以降の公開が従来どおり完了することを検証する。"""
     mission_id, run_id, backlog_id = mission_and_run_fixture
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
@@ -445,18 +440,6 @@ def test_commit_publishes_report_normally_when_not_recovered(
         "artifact": {"type": "report", "proposal_kind": "core",
                     "title": "Normal Report", "body_md": "body"},
         "selection_rationale": "r"}, transcript=[])
-
-    reports_dir = tmp_path / "data" / "improve_reports"
-    (reports_dir / ".tmp").mkdir(parents=True)
-    final_path = reports_dir / f"improve-{mission_id}.md"
-    part_path = reports_dir / ".tmp" / f"improve-{mission_id}.md.part"
-
-    def _fake_prepare(conn, *, ctx, artifact, output, now, backlog_id=None):
-        part_path.write_text("# report\n")
-        return str(final_path)
-
-    monkeypatch.setattr(loop_full, "_prepare_report_if_applicable",
-                        _fake_prepare)
 
     loop_full.commit(mission=mission, ctx=ctx, result=result,
                      now=datetime(2026, 8, 22))
