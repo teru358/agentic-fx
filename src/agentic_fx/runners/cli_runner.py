@@ -174,17 +174,41 @@ class CliRunner(AgentRunner):
     @abstractmethod
     def _max_turns_semantics(self) -> Literal["passthrough", "ignored"]: ...
 
-    def run(self, mission: Mission) -> MissionResult:
-        # B2-r2 是正: bind 側 (`mission_worker._start_mcp_dispatcher`) と
-        # 同じ `mcp_socket_path()` から導出する — 独立したリテラルの
-        # 偶然の一致に頼らない (検収 B2-r2、`cli_runner.py:88` のパス
-        # 変異が全スイートを生き延びた指摘への対応)。
-        from agentic_fx.mission_worker import mcp_socket_path
-        mcp_socket = mcp_socket_path(self._workdir)
-        inner_argv = self._build_argv(mission, mcp_socket=mcp_socket)
-        env = self._build_env(mission)
+    def _recovery_reserve_sec(self) -> float:
+        """段B M2: mission 総予算のうち追撃用に取り分ける秒数 (「内数化」)。
+        既定 (このクラス) は 0 — 予約しない。0 のときは `run()` の予算計算が
+        `reserve > 0` を素通りし、primary の timeout は `mission.timeout_sec`
+        のまま・追撃には予算 0 が渡る (= 追撃を実装しない backend は現状と
+        完全一致)。backend (OpencodeRunner 等) が追撃を実装する場合に
+        正の秒数を返すようオーバーライドする。"""
+        return 0.0
+
+    def _recover_output(self, mission: Mission, stdout_lines: list[str],
+                         recovery_timeout_sec: float) -> dict[str, Any] | None:
+        """段 B: timeout / no-output の 2 経路から `run()` が呼ぶ追撃回収
+        フック。既定 (このクラス) は no-op — 常に None を返し、呼び出し側の
+        既存 timeout/failed 挙動を完全に保つ。backend (OpencodeRunner 等)
+        が session resume 等の追撃を実装する場合にオーバーライドする。
+        `recovery_timeout_sec` は `_recovery_reserve_sec()` から
+        `run()` が算出した、追撃に使ってよい残り秒数の上限 (M2: 予算の
+        内数化 — mission 総予算を超えて追撃しない)。"""
+        return None
+
+    def _run_cli_process(self, argv: list[str], env: dict[str, str], *,
+                          timeout_sec: float,
+                          on_started: Callable[[int], None] | None = None,
+                          ) -> tuple[bool, int | None, list[str], list[str]]:
+        """launcher 経由で `argv` を起動し、pgid 管理
+        (`start_new_session=True` + `_terminate_pgid`) と stdout/stderr の
+        読み切りまでを行う共通経路。`run()` の主呼び出しと、追撃
+        (`_recover_output` を実装する backend) の両方がこれを使う (段B M1:
+        プロセス管理の統一 — 追撃も launcher / pgid 単位の
+        SIGTERM→grace→SIGKILL / `self._rlimits` という同じ規律に従う)。
+
+        戻り値は `(timed_out, returncode, stdout_lines, stderr_chunks)`。
+        """
         launcher_argv = self._build_launcher_argv(
-            os.getpid(), inner_argv, rlimits=self._rlimits)
+            os.getpid(), argv, rlimits=self._rlimits)
 
         devnull_r = os.open(os.devnull, os.O_RDONLY)
         try:
@@ -196,21 +220,17 @@ class CliRunner(AgentRunner):
             os.close(devnull_r)
 
         pgid = os.getpgid(proc.pid)
-        if self._cli_started_sink is not None:
-            self._cli_started_sink(pgid)  # <!-- precheck 2026-08-22: T1-B10 --> §7.1-2
+        if on_started is not None:
+            on_started(pgid)  # <!-- precheck 2026-08-22: T1-B10 --> §7.1-2
         stdout_lines: list[str] = []
         stderr_chunks: list[str] = []
-        reader_done = threading.Event()
 
         def reader() -> None:
-            try:
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    stdout_lines.append(line.rstrip("\n"))
-                    self._on_message({"type": "event", "message": {
-                        "role": "system", "content": line.rstrip("\n")}})
-            finally:
-                reader_done.set()
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                stdout_lines.append(line.rstrip("\n"))
+                self._on_message({"type": "event", "message": {
+                    "role": "system", "content": line.rstrip("\n")}})
 
         def stderr_reader() -> None:
             assert proc.stderr is not None
@@ -224,7 +244,7 @@ class CliRunner(AgentRunner):
 
         timed_out = False
         try:
-            proc.wait(timeout=mission.timeout_sec)
+            proc.wait(timeout=timeout_sec)
         except subprocess.TimeoutExpired:
             timed_out = True
 
@@ -237,26 +257,61 @@ class CliRunner(AgentRunner):
         finally:
             t_out.join(timeout=5.0)
             t_err.join(timeout=5.0)
-            # 段A: どの終端経路 (timeout/failed/schema mismatch/completed)
-            # でも漏れなく保存する — reader thread の join 直後・全 return
-            # より前のこの `finally` に置く (先行する `_terminate_pgid` が
-            # 例外を出しても実行される)。
-            self._save_transcript(list(stdout_lines), stderr_chunks)
+
+        return timed_out, proc.returncode, stdout_lines, stderr_chunks
+
+    def run(self, mission: Mission) -> MissionResult:
+        # B2-r2 是正: bind 側 (`mission_worker._start_mcp_dispatcher`) と
+        # 同じ `mcp_socket_path()` から導出する — 独立したリテラルの
+        # 偶然の一致に頼らない (検収 B2-r2、`cli_runner.py:88` のパス
+        # 変異が全スイートを生き延びた指摘への対応)。
+        from agentic_fx.mission_worker import mcp_socket_path
+        mcp_socket = mcp_socket_path(self._workdir)
+        inner_argv = self._build_argv(mission, mcp_socket=mcp_socket)
+        env = self._build_env(mission)
+
+        # 段B M2: 追撃予算を mission 総予算の内数にする。reserve<=0、または
+        # mission.timeout_sec が reserve 以下なら reserve を無効化し、
+        # primary に全予算を渡す (追撃は予算 0 → `_recover_output` に
+        # 委ねる — 基底/reserve=0 の場合は現状と完全一致)。
+        reserve = self._recovery_reserve_sec()
+        if reserve > 0 and mission.timeout_sec > reserve:
+            primary_timeout = mission.timeout_sec - reserve
+            recovery_timeout = reserve
+        else:
+            primary_timeout = mission.timeout_sec
+            recovery_timeout = 0.0
+
+        timed_out, rc, stdout_lines, stderr_chunks = self._run_cli_process(
+            inner_argv, env, timeout_sec=primary_timeout,
+            on_started=self._cli_started_sink)
+
+        # 段A: どの終端経路 (timeout/failed/schema mismatch/completed) でも
+        # 漏れなく保存する — 追撃 (`_recover_output`) より前のこの位置に
+        # 置く (追撃分は backend 側が別途自前で保存する、既存の流儀)。
+        self._save_transcript(list(stdout_lines), stderr_chunks)
 
         if timed_out:
-            return MissionResult("timeout", None, [], reason="cli timeout")
+            # 段B: timeout 経路でも追撃回収を 1 回試みる (SIGTERM 中断後も
+            # session が継続できる backend 向け)。基底実装は no-op (None) の
+            # ため、追撃を実装しない backend は従来どおり "timeout" になる。
+            raw = self._recover_output(mission, list(stdout_lines), recovery_timeout)
+            if raw is None:
+                return MissionResult("timeout", None, [], reason="cli timeout")
+        else:
+            if rc != 0:
+                stderr_text = "".join(stderr_chunks)
+                reason = _normalize_reason(
+                    f"HTTP-like CLI exit rc={rc}: {stderr_text.splitlines()[0] if stderr_text else ''}")
+                return MissionResult("failed", None, [], reason=reason)
 
-        rc = proc.returncode
-        if rc != 0:
-            stderr_text = "".join(stderr_chunks)
-            reason = _normalize_reason(
-                f"HTTP-like CLI exit rc={rc}: {stderr_text.splitlines()[0] if stderr_text else ''}")
-            return MissionResult("failed", None, [], reason=reason)
-
-        raw = self._extract_output(stdout_lines, self._workdir)
-        if raw is None:
-            return MissionResult("failed", None, [],
-                                 reason=_normalize_reason("no output recovered from cli"))
+            raw = self._extract_output(stdout_lines, self._workdir)
+            if raw is None:
+                # 段B: 最終出力が回収できない場合も追撃回収を 1 回試みる。
+                raw = self._recover_output(mission, list(stdout_lines), recovery_timeout)
+                if raw is None:
+                    return MissionResult("failed", None, [],
+                                         reason=_normalize_reason("no output recovered from cli"))
         try:
             jsonschema.validate(raw, mission.output_schema)
         except jsonschema.ValidationError as e:

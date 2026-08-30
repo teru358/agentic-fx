@@ -542,6 +542,147 @@ def test_cli_runner_transcript_truncates_when_over_budget(tmp_path, monkeypatch)
     assert len(lines) < 203
 
 
+# --- 段B: 追撃回収フック (_recover_output) の基底 no-op 契約 -----------
+
+
+def test_cli_runner_recover_output_default_is_noop(tmp_path):
+    """基底 `CliRunner._recover_output` は常に None (no-op)。追撃を実装
+    しない backend (_FakeCliRunner) の timeout/no-output 挙動が変わらない
+    ことの直接 pin。"""
+    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path)
+    assert runner._recover_output(_mission(), ["some", "stdout", "lines"], 0.0) is None
+    assert runner._recovery_reserve_sec() == 0.0
+
+
+def test_cli_runner_timeout_path_invokes_recover_output_hook(tmp_path):
+    """timeout 経路は return 前に `_recover_output(mission, stdout_lines,
+    recovery_timeout_sec)` を呼ぶ — 戻り値が None でなければ通常の schema
+    検証経路 (completed) に乗る。"""
+    calls: list[tuple[Any, list[str], float]] = []
+
+    class _RecoveringRunner(_FakeCliRunner):
+        def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
+            calls.append((mission, list(stdout_lines), recovery_timeout_sec))
+            return {"answer": 4}
+
+    runner = _RecoveringRunner(
+        script=_SLEEP_FOREVER, bin_path=Path(sys.executable), model="m",
+        workdir=tmp_path, cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    result = runner.run(_mission(timeout_sec=0.3))
+    assert result.status == "completed"
+    assert result.output == {"answer": 4}
+    assert len(calls) == 1
+
+
+def test_cli_runner_no_output_path_invokes_recover_output_hook(tmp_path):
+    """no-output (`_extract_output` が None) 経路も return 前に
+    `_recover_output` を呼ぶ。戻り値があれば completed に乗る。"""
+    calls: list[tuple[Any, list[str], float]] = []
+
+    class _RecoveringRunner(_FakeCliRunner):
+        def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
+            calls.append((mission, list(stdout_lines), recovery_timeout_sec))
+            return {"answer": 4}
+
+    script = "print('no answer key here')\n"
+    runner = _RecoveringRunner(
+        script=script, bin_path=Path(sys.executable), model="m",
+        workdir=tmp_path, cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    result = runner.run(_mission())
+    assert result.status == "completed"
+    assert result.output == {"answer": 4}
+    assert len(calls) == 1
+
+
+def test_cli_runner_recover_output_returning_none_preserves_original_failed_reason(tmp_path):
+    """`_recover_output` が None を返す (回収できず) 場合、no-output 経路の
+    reason は追撃なし時と同一のまま (基底 no-op と完全一致)。"""
+    script = "print('no answer key here')\n"
+    runner = _new_runner(script, tmp_path)
+    result = runner.run(_mission())
+    assert result.status == "failed"
+    assert result.reason is not None and "no output" in result.reason
+
+
+def test_cli_runner_reserve_zero_primary_timeout_is_full_mission_timeout(tmp_path):
+    """段B M2 pin: `_recovery_reserve_sec()` が 0 (基底既定) のとき、
+    `_run_cli_process` に渡る primary の timeout は `mission.timeout_sec`
+    そのまま (reserve を差し引かない) — 現状の timeout 挙動と完全一致する
+    ことを `_run_cli_process` の呼び出し引数で直接 pin する。"""
+    captured: dict[str, Any] = {}
+
+    class _SpyingRunner(_FakeCliRunner):
+        def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None):
+            captured["timeout_sec"] = timeout_sec
+            return super()._run_cli_process(
+                argv, env, timeout_sec=timeout_sec, on_started=on_started)
+
+    runner = _SpyingRunner(
+        script=_PRINT_ANSWER_AND_EXIT, bin_path=Path(sys.executable), model="m",
+        workdir=tmp_path, cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    runner.run(_mission(timeout_sec=5))
+    assert captured["timeout_sec"] == 5
+
+
+def test_cli_runner_reserve_positive_shortens_primary_timeout(tmp_path):
+    """段B M2 pin: `_recovery_reserve_sec() > 0` かつ
+    `mission.timeout_sec > reserve` のとき、primary の timeout は
+    `mission.timeout_sec - reserve` に短縮され、追撃には `reserve` 秒が
+    予算として渡る。"""
+    captured: dict[str, Any] = {}
+    recover_calls: list[float] = []
+
+    class _ReservingRunner(_FakeCliRunner):
+        def _recovery_reserve_sec(self):
+            return 2.0
+
+        def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None):
+            captured["timeout_sec"] = timeout_sec
+            return super()._run_cli_process(
+                argv, env, timeout_sec=timeout_sec, on_started=on_started)
+
+        def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
+            recover_calls.append(recovery_timeout_sec)
+            return None
+
+    script = "print('no answer key here')\n"
+    runner = _ReservingRunner(
+        script=script, bin_path=Path(sys.executable), model="m",
+        workdir=tmp_path, cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    runner.run(_mission(timeout_sec=5))
+    assert captured["timeout_sec"] == 3
+    assert recover_calls == [2.0]
+
+
+def test_cli_runner_reserve_disabled_when_mission_timeout_not_greater_than_reserve(tmp_path):
+    """段B M2 pin: `mission.timeout_sec <= reserve` のときは reserve を
+    無効化し、primary に全予算 (`mission.timeout_sec`) を渡す。追撃予算は
+    0 になる (`_recover_output` に 0.0 が渡る)。"""
+    captured: dict[str, Any] = {}
+    recover_calls: list[float] = []
+
+    class _ReservingRunner(_FakeCliRunner):
+        def _recovery_reserve_sec(self):
+            return 10.0
+
+        def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None):
+            captured["timeout_sec"] = timeout_sec
+            return super()._run_cli_process(
+                argv, env, timeout_sec=timeout_sec, on_started=on_started)
+
+        def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
+            recover_calls.append(recovery_timeout_sec)
+            return None
+
+    script = "print('no answer key here')\n"
+    runner = _ReservingRunner(
+        script=script, bin_path=Path(sys.executable), model="m",
+        workdir=tmp_path, cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    runner.run(_mission(timeout_sec=5))  # 5 <= reserve(10)
+    assert captured["timeout_sec"] == 5
+    assert recover_calls == [0.0]
+
+
 def test_cli_runner_transcript_default_dir_is_module_attribute(tmp_path, monkeypatch):
     """`transcript_dir=None` (既定) のとき、`_TRANSCRIPT_DIR_DEFAULT` を
     呼び出し時点で読む (インスタンス生成時に固定しない) — テストの

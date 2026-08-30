@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import sys
 from pathlib import Path
 
@@ -21,6 +22,260 @@ def _runner(tmp_path):
                           workdir=workdir,
                           llama_swap_base_url="http://localhost:8080/v1",
                           cli_terminate_grace_sec=1, registry=ToolRegistry()), workdir
+
+
+# --- 段B: session resume による追撃回収 ---------------------------------
+#
+# `_recover_output` は実際に opencode CLI を再実行する — Popen をモックする
+# と `CliRunner.run()` の `os.getpgid(proc.pid)`/`killpg` が実プロセスを
+# 前提にしており fake proc では動かない (`test_cli_runner.py` の既存流儀と
+# 同じ理由)。そのため「fake opencode」として実行可能な python スクリプトを
+# 用意し、実 subprocess として起動する — argv に `-s <id>` が含まれるかで
+# 初回呼び出しと追撃呼び出しを区別させる。
+
+_RESUME_SCHEMA = {"type": "object", "properties": {"answer": {"type": "integer"}},
+                  "required": ["answer"]}
+
+
+def _write_fake_opencode(tmp_path: Path, body: str) -> Path:
+    script = tmp_path / "fake_opencode"
+    script.write_text(f"#!{sys.executable}\n{body}")
+    mode = script.stat().st_mode
+    script.chmod(mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+def _resume_mission(**over) -> Mission:
+    # timeout_sec の既定は 300: OpencodeRunner の `_recovery_reserve_sec()`
+    # (240) より大きくしておかないと、M2 (予算の内数化) により reserve が
+    # 無効化されて追撃自体が起こらない (`_recover_output` が
+    # `recovery_timeout_sec<=0` で即 None) — 追撃の中身 (session id /
+    # rc / reason 検査) を検証したいテストはこの既定のままにする。
+    d = dict(prompt="do it", tools=[], output_schema=_RESUME_SCHEMA,
+             max_turns=1, timeout_sec=300)
+    d.update(over)
+    return Mission(**d)
+
+
+def _resume_runner(tmp_path: Path, bin_path: Path, **over):
+    workdir = tmp_path / "wd"; workdir.mkdir(exist_ok=True)
+    kw = dict(bin_path=bin_path, model="qwen-test", workdir=workdir,
+              llama_swap_base_url="http://localhost:8080/v1",
+              cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    kw.update(over)
+    return OpencodeRunner(**kw), workdir
+
+
+def test_opencode_resumes_session_and_recovers_json_after_no_output(tmp_path):
+    """(a) 初回が text イベント無しで終わっても、`sessionID` を使った追撃
+    argv (`-s <id>`) が組まれ、追撃出力 (rc=0 かつ最終 step_finish の
+    reason=="stop") の JSON が回収されて completed になる。"""
+    body = (
+        "import sys, json\n"
+        "argv = sys.argv[1:]\n"
+        "if '-s' in argv:\n"
+        "    session_id = argv[argv.index('-s') + 1]\n"
+        "    text = json.dumps({'answer': 4, 'resumed': session_id})\n"
+        "    print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': text}}))\n"
+        "    print(json.dumps({'type': 'step_finish', 'reason': 'stop'}))\n"
+        "else:\n"
+        "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_abc123'}))\n"
+    )
+    script = _write_fake_opencode(tmp_path, body)
+    runner, _workdir = _resume_runner(tmp_path, script)
+    result = runner.run(_resume_mission())
+    assert result.status == "completed"
+    assert result.output == {"answer": 4, "resumed": "ses_abc123"}
+
+
+def test_opencode_no_session_id_falls_back_to_failed_without_resume(tmp_path):
+    """(b) sessionID がイベント行に無ければ追撃せず、従来どおり failed
+    (`no output` reason) になる。"""
+    body = "import json\nprint(json.dumps({'type': 'step_start'}))\n"
+    script = _write_fake_opencode(tmp_path, body)
+    runner, _workdir = _resume_runner(tmp_path, script)
+    result = runner.run(_resume_mission())
+    assert result.status == "failed"
+    assert result.reason is not None and "no output" in result.reason
+
+
+def test_opencode_resume_without_text_also_fails(tmp_path):
+    """(c) sessionID はあるが追撃出力にも text イベントが無ければ failed
+    (`no output` reason) のまま。"""
+    body = (
+        "import sys, json\n"
+        "argv = sys.argv[1:]\n"
+        "if '-s' in argv:\n"
+        "    print(json.dumps({'type': 'step_finish'}))\n"
+        "else:\n"
+        "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_xyz'}))\n"
+    )
+    script = _write_fake_opencode(tmp_path, body)
+    runner, _workdir = _resume_runner(tmp_path, script)
+    result = runner.run(_resume_mission())
+    assert result.status == "failed"
+    assert result.reason is not None and "no output" in result.reason
+
+
+def test_opencode_timeout_path_also_triggers_resume(tmp_path):
+    """(d) timeout 終端 (CLI が sessionID 出力後にハングして
+    `_terminate_pgid` で殺される) でも追撃が走り、回収できれば completed
+    になる。M2 (予算の内数化) 対応: mission.timeout_sec (240.5) を
+    reserve (240) より僅かに大きくし、primary の実 timeout を 0.5 秒に
+    縮めてテストを高速に保ちつつ追撃予算 (240 秒、実際は即完了) を残す。"""
+    body = (
+        "import sys, json, time\n"
+        "argv = sys.argv[1:]\n"
+        "if '-s' in argv:\n"
+        "    text = json.dumps({'answer': 7})\n"
+        "    print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': text}}))\n"
+        "    print(json.dumps({'type': 'step_finish', 'reason': 'stop'}))\n"
+        "else:\n"
+        "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_timeout'}), flush=True)\n"
+        "    time.sleep(600)\n"
+    )
+    script = _write_fake_opencode(tmp_path, body)
+    runner, _workdir = _resume_runner(tmp_path, script)
+    result = runner.run(_resume_mission(timeout_sec=240.5))
+    assert result.status == "completed"
+    assert result.output == {"answer": 7}
+
+
+# --- M1: 追撃のプロセス管理は primary と同じ規律を使う -------------------
+
+
+def test_opencode_resume_uses_launcher_start_new_session_and_rlimits(tmp_path):
+    """M1 (プロセス管理の統一) killer: 追撃 subprocess も primary と同じ
+    `_run_cli_process` 経由 — launcher (`python -c <LAUNCHER_SOURCE> ...`)
+    を通り、`start_new_session=True` かつ `self._rlimits` が JSON として
+    launcher argv に乗る。primary 呼び出しを直接 `Popen(argv, kill=...)`
+    のような別系統にする変異はここで壊れる。"""
+    import subprocess as _subprocess
+
+    body = (
+        "import sys, json\n"
+        "argv = sys.argv[1:]\n"
+        "if '-s' in argv:\n"
+        "    text = json.dumps({'answer': 4})\n"
+        "    print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': text}}))\n"
+        "    print(json.dumps({'type': 'step_finish', 'reason': 'stop'}))\n"
+        "else:\n"
+        "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_abc123'}))\n"
+    )
+    script = _write_fake_opencode(tmp_path, body)
+    runner, _workdir = _resume_runner(tmp_path, script)
+    want_rlimits = {"RLIMIT_FSIZE": (1024, 1024)}
+    runner._rlimits = want_rlimits  # OpencodeRunner は rlimits を公開 kw に
+    # していないため、CliRunner が既に持つ instance 属性を直接差し替える。
+
+    captured: list[tuple[tuple, dict]] = []
+    real_popen = _subprocess.Popen
+
+    def spying_popen(*a, **kw):
+        captured.append((a, kw))
+        return real_popen(*a, **kw)
+
+    runner._popen = spying_popen
+    result = runner.run(_resume_mission())
+    assert result.status == "completed"
+    # primary + 追撃 の 2 回起動される。
+    assert len(captured) == 2
+    for args, kwargs in captured:
+        assert kwargs.get("start_new_session") is True
+        launcher_argv = args[0]
+        assert launcher_argv[0] == sys.executable
+        assert launcher_argv[1] == "-c"
+        assert launcher_argv[4] == json.dumps(want_rlimits)
+
+
+# --- M3: rc==0 かつ最終 step_finish の reason=="stop" を必須にする -------
+
+
+def test_opencode_resume_nonzero_rc_is_rejected(tmp_path):
+    """M3 killer: 追撃 CLI が rc!=0 で終われば、text/step_finish が
+    正しくても None (failed) にする。"""
+    body = (
+        "import sys, json\n"
+        "argv = sys.argv[1:]\n"
+        "if '-s' in argv:\n"
+        "    text = json.dumps({'answer': 4})\n"
+        "    print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': text}}))\n"
+        "    print(json.dumps({'type': 'step_finish', 'reason': 'stop'}))\n"
+        "    sys.exit(1)\n"
+        "else:\n"
+        "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_rc'}))\n"
+    )
+    script = _write_fake_opencode(tmp_path, body)
+    runner, _workdir = _resume_runner(tmp_path, script)
+    result = runner.run(_resume_mission())
+    assert result.status == "failed"
+    assert result.reason is not None and "no output" in result.reason
+
+
+def test_opencode_resume_reason_not_stop_is_rejected(tmp_path):
+    """M3 killer: 最終 step_finish の reason が "stop" 以外 (例:
+    "max_tokens" — 打ち切り) なら、text/rc が正しくても None (failed)
+    にする。"""
+    body = (
+        "import sys, json\n"
+        "argv = sys.argv[1:]\n"
+        "if '-s' in argv:\n"
+        "    text = json.dumps({'answer': 4})\n"
+        "    print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': text}}))\n"
+        "    print(json.dumps({'type': 'step_finish', 'reason': 'max_tokens'}))\n"
+        "else:\n"
+        "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_reason'}))\n"
+    )
+    script = _write_fake_opencode(tmp_path, body)
+    runner, _workdir = _resume_runner(tmp_path, script)
+    result = runner.run(_resume_mission())
+    assert result.status == "failed"
+    assert result.reason is not None and "no output" in result.reason
+
+
+def test_opencode_resume_missing_step_finish_is_rejected(tmp_path):
+    """M3 killer (境界): step_finish イベント自体が無ければ
+    `_last_step_finish_reason` は None — "stop" と一致せず None (failed)
+    になる。"""
+    body = (
+        "import sys, json\n"
+        "argv = sys.argv[1:]\n"
+        "if '-s' in argv:\n"
+        "    text = json.dumps({'answer': 4})\n"
+        "    print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': text}}))\n"
+        "else:\n"
+        "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_nofinish'}))\n"
+    )
+    script = _write_fake_opencode(tmp_path, body)
+    runner, _workdir = _resume_runner(tmp_path, script)
+    result = runner.run(_resume_mission())
+    assert result.status == "failed"
+
+
+# --- Minor5: sessionID の形式検証 ---------------------------------------
+
+
+def test_opencode_invalid_session_id_format_skips_resume(tmp_path):
+    """Minor5 killer: `sessionID` が `ses_[A-Za-z0-9]+` に fullmatch しない
+    (例: 空白混入・別プレフィックス) 場合、追撃 subprocess を起動しない —
+    popen 呼び出し回数が primary の 1 回のみであることまで pin する。"""
+    import subprocess as _subprocess
+
+    body = "import json\nprint(json.dumps({'type': 'step_start', 'sessionID': 'not the right format!'}))\n"
+    script = _write_fake_opencode(tmp_path, body)
+    runner, _workdir = _resume_runner(tmp_path, script)
+    captured: list[tuple] = []
+    real_popen = _subprocess.Popen
+
+    def spying_popen(*a, **kw):
+        captured.append(a)
+        return real_popen(*a, **kw)
+
+    runner._popen = spying_popen
+    result = runner.run(_resume_mission())
+    assert result.status == "failed"
+    assert result.reason is not None and "no output" in result.reason
+    assert len(captured) == 1  # primary のみ、追撃は起動されない
 
 
 def test_opencode_argv_writes_self_contained_mcp_provider_config(tmp_path):
