@@ -181,6 +181,11 @@ def run_mcp_shim(sock_path: Path) -> None:
         if not line:
             return
         req = json.loads(line)
+        if "id" not in req:
+            # JSON-RPC 通知 (id 無し、例: codex の notifications/initialized)
+            # には応答してはならない — 実機実測 (2026-08-30 mission #6):
+            # 旧実装は dispatcher へ転送して -32601 error を書き戻していた。
+            continue
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.connect(str(sock_path))
             s.sendall((json.dumps(req) + "\n").encode())

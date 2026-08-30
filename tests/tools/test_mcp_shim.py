@@ -305,3 +305,25 @@ def test_run_mcp_shim_forwards_stdio_to_unix_socket(tmp_path):
     finally:
         proc.kill()
         proc.wait(timeout=5)
+
+
+def test_run_mcp_shim_swallows_notifications(tmp_path):
+    """実機実測 (2026-08-30, mission #6 trace): codex は initialize 後に
+    `notifications/initialized` 通知 (id 無し) を送るが、旧実装は -32601
+    error を応答していた。JSON-RPC で通知に応答してはならない — 通知は
+    無応答で飲み込み、次の要求 (id あり) への応答が最初の出力行になること。"""
+    dispatcher, sock_path, _ = _start_dispatcher(tmp_path)
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(sock_path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        note = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        req = {"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}}
+        proc.stdin.write(json.dumps(note) + "\n" + json.dumps(req) + "\n")
+        proc.stdin.flush()
+        resp = json.loads(proc.stdout.readline())
+        assert resp["id"] == 7, f"通知への応答が漏れている: {resp}"
+        assert "result" in resp
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
