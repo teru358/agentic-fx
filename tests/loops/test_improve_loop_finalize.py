@@ -348,6 +348,213 @@ def test_commit_terminates_scheduler_wave_slot_via_ctx_slot_key(
     assert slot["status"] == "done"
 
 
+# --- M4: resume 追撃回収 (result.recovered) の report 降格 ------------
+# 背景 (codex レビュー Major 4、2026-08-30): plugin artifact は既存の
+# 決定論 gate (staging 実体・pytest・hash) で虚偽 completed を防げるが、
+# report artifact はモデルの body_md を実体突合なしでファイル公開し得る。
+# `result.recovered=True` (段B の resume 追撃で回収した出力) かつ
+# `artifact.type=='report'` のときは report を公開せず、既存の
+# observation 終端経路 (`_finalize_report_or_observation`) を再利用して
+# 降格する。
+
+
+def test_commit_demotes_recovered_report_to_observation_without_publishing(
+        loop_full, conn, mission_and_run_fixture, tmp_path):
+    """recovered=True + report artifact → report ファイルは作られず
+    observation として終端し、activity に report_demoted_recovered が
+    書かれる。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    result = MissionResult(status="completed", output={
+        "discoveries": [], "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "artifact": {"type": "report", "proposal_kind": "core",
+                    "title": "Suspicious Recovered Report", "body_md": "body"},
+        "selection_rationale": "r"}, transcript=[], recovered=True)
+
+    loop_full.commit(mission=mission, ctx=ctx, result=result,
+                     now=datetime(2026, 8, 22))
+
+    reports_dir = tmp_path / "data" / "improve_reports"
+    published = [p for p in reports_dir.glob("*.md")] if reports_dir.exists() else []
+    assert published == [], "recovered report artifact must not be published"
+
+    run = conn.execute(
+        "SELECT result, report_state FROM improvement_runs WHERE id=?",
+        (run_id,)).fetchone()
+    assert run["result"] is None
+    assert run["report_state"] == "none"
+
+    backlog = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert backlog["status"] == "observation"
+    assert "Suspicious Recovered Report" in backlog["last_result"]
+    assert "resume 回収経由のため降格" in backlog["last_result"]
+
+    activity_text = (tmp_path / "activity.log").read_text()
+    assert "report_demoted_recovered" in activity_text
+    assert f"mission={mission_id}" in activity_text
+
+
+def test_commit_publishes_report_normally_when_not_recovered(
+        loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """対照: recovered=False (通常経路) の report artifact は従来どおり
+    公開される — 降格分岐を常に通す変異を殺す。
+
+    注意 (着手前確認で発見・M4 スコープ外の既存欠陥): `_prepare_report_
+    if_applicable` の成功パスは Tx-2 の一部のつもりの `UPDATE
+    improvement_runs SET report_state='prepared' ...` を裸の
+    `conn.execute` (BEGIN 無し) で発行しており、python sqlite3 の既定
+    isolation_level 下では暗黙 transaction を開いたままにする。続く
+    `_finalize_report_or_observation` の `conn.execute("BEGIN IMMEDIATE")`
+    が「トランザクション中にトランザクション開始」で `OperationalError`
+    になる — `commit()` を通した report (risk_gate 以外) の成功系を
+    最初に end-to-end で駆動する本テストで発覚した (既存スイートは
+    `_finalize_report_or_observation` を直接呼ぶか、report が
+    OSError/risk_gate に倒れる経路しか通していなかった)。M4 のスコープは
+    provenance 伝搬 + report 降格のみのため、ここでは
+    `_prepare_report_if_applicable` を実ファイル書込のみ行うよう
+    monkeypatch してこの既存欠陥を回避し、降格分岐を通らないことと
+    以降の公開が従来どおり完了することだけを検証する。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    result = MissionResult(status="completed", output={
+        "discoveries": [], "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "artifact": {"type": "report", "proposal_kind": "core",
+                    "title": "Normal Report", "body_md": "body"},
+        "selection_rationale": "r"}, transcript=[])
+
+    reports_dir = tmp_path / "data" / "improve_reports"
+    (reports_dir / ".tmp").mkdir(parents=True)
+    final_path = reports_dir / f"improve-{mission_id}.md"
+    part_path = reports_dir / ".tmp" / f"improve-{mission_id}.md.part"
+
+    def _fake_prepare(conn, *, ctx, artifact, output, now, backlog_id=None):
+        part_path.write_text("# report\n")
+        return str(final_path)
+
+    monkeypatch.setattr(loop_full, "_prepare_report_if_applicable",
+                        _fake_prepare)
+
+    loop_full.commit(mission=mission, ctx=ctx, result=result,
+                     now=datetime(2026, 8, 22))
+
+    run = conn.execute(
+        "SELECT result, report_state FROM improvement_runs WHERE id=?",
+        (run_id,)).fetchone()
+    assert run["result"] == "report"
+    assert run["report_state"] == "published"
+
+    backlog = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert backlog["status"] == "done"
+    assert backlog["last_result"] == "reported"
+
+    activity_path = tmp_path / "activity.log"
+    activity_text = activity_path.read_text() if activity_path.exists() else ""
+    assert "report_demoted_recovered" not in activity_text
+
+
+def test_commit_recovered_risk_gate_report_keeps_unsupported_label(
+        loop_full, conn, mission_and_run_fixture, tmp_path):
+    """recovered=True + `proposal_kind=='risk_gate'` report → 降格せず、
+    設計書 §4.3 状態表の逐語ラベル `unsupported_in_plan10:risk_gate` の
+    まま (risk_gate は `_prepare_report_if_applicable` が本文書込み前に
+    None を返すため元々ファイルを公開しない — 降格の動機である「実体
+    突合なしでファイル公開し得る」が成立しないケースを対象から外す
+    実装者裁定の pin。対象を広げる変異を殺す)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    result = MissionResult(status="completed", output={
+        "discoveries": [], "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "artifact": {"type": "report", "proposal_kind": "risk_gate",
+                    "title": "widen SL", "body_md": "body"},
+        "selection_rationale": "r"}, transcript=[], recovered=True)
+
+    loop_full.commit(mission=mission, ctx=ctx, result=result,
+                     now=datetime(2026, 8, 22))
+
+    backlog = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert backlog["status"] == "observation"
+    assert backlog["last_result"] == "unsupported_in_plan10:risk_gate"
+
+    activity_path = tmp_path / "activity.log"
+    activity_text = activity_path.read_text() if activity_path.exists() else ""
+    assert "report_demoted_recovered" not in activity_text
+
+
+def test_commit_recovered_plugin_still_goes_through_gate(
+        loop_full, conn, mission_and_run_fixture, tmp_path):
+    """recovered=True + plugin artifact → 降格せず、従来どおり plugin
+    gate (staging 実体・pytest) 経路を通る (plugin は既存 gate が防衛線
+    のため対象外)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    _write_candidate(staging_dir, "myind")
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    result = MissionResult(status="completed", output={
+        "discoveries": [], "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "artifact": {"type": "plugin", "name": "myind", "kind": "indicator",
+                    "self_test": "passed", "summary": "s"},
+        "selection_rationale": "r"}, transcript=[], recovered=True)
+
+    loop_full.commit(mission=mission, ctx=ctx, result=result,
+                     now=datetime(2026, 8, 22))
+
+    r = conn.execute("SELECT result FROM improvement_runs WHERE id=?",
+                     (run_id,)).fetchone()
+    assert r["result"] == "approval"
+
+    activity_path = tmp_path / "activity.log"
+    activity_text = activity_path.read_text() if activity_path.exists() else ""
+    assert "report_demoted_recovered" not in activity_text
+
+
 # --- 10.11 節「未執筆メソッド」の回収 (前任 haiku が stub のまま残した
 # _finalize_failed_mission/_finalize_output_invalid/_finalize_loser/
 # _finalize_gate_failed の TDD 実装) ---

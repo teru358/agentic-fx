@@ -740,7 +740,11 @@ def main() -> None:
                     _send_frame(protocol_out, out_seq, {
                         "type": "result",
                         "status": result.status, "output": result.output,
-                        "reason": result.reason})
+                        "reason": result.reason,
+                        # M4: 追撃回収経由の provenance を worker protocol
+                        # へ伝搬する (getattr で安全に — 旧 runner が
+                        # `recovered` 属性を持たない場合も既定 False)。
+                        "recovered": getattr(result, "recovered", False)})
                 except Exception as exc:  # noqa: BLE001
                     _send_frame(protocol_out, out_seq, {
                         "type": "result", "status": "failed", "output": None,

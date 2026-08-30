@@ -439,6 +439,9 @@ class WorkerRunner(AgentRunner):
                 reason = payload.get("reason")
                 if reason is None:
                     reason = payload.get("error")
+                # M4: 旧フレーム (`recovered` キー無し) は既定 False —
+                # `MissionResult.recovered` の既定と一致させる後方互換。
+                recovered = payload.get("recovered", False)
             else:  # eof / protocol_error / error — すべて failed に正規化
                 status = "failed"
                 output = None
@@ -446,7 +449,9 @@ class WorkerRunner(AgentRunner):
                 # そのまま残し、result フレームを受け取れなかった終端でも
                 # 死因の手がかりを一切残さないことを避ける。
                 reason = f"worker {kind}"
-            return MissionResult(status, output, transcript, reason=reason)
+                recovered = False
+            return MissionResult(status, output, transcript, reason=reason,
+                                 recovered=recovered)
         finally:
             dispatch_queue.put(None)
             self._ensure_dead(proc, w)

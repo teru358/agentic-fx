@@ -251,6 +251,107 @@ def test_worker_runner_completes_mission_via_pipes(tmp_path, monkeypatch):
     assert {"role": "user", "content": "hi"} in result.transcript
 
 
+def test_worker_runner_result_frame_carries_recovered_true(
+        tmp_path, monkeypatch):
+    """M4: result フレームに `"recovered": True` が乗っていれば
+    `MissionResult.recovered` へそのまま伝わる。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        child_in.close()  # M4: 他テストと違い fd を積み増さない (fd 枯渇回避)
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {"x": 1},
+                                "recovered": True})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert result.recovered is True
+
+
+def test_worker_runner_result_frame_without_recovered_key_defaults_false(
+        tmp_path, monkeypatch):
+    """M4 後方互換: `recovered` キーの無い旧フレーム (旧 mission_worker
+    子プロセス) は `MissionResult.recovered=False` になる。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        child_in.close()  # M4: 他テストと違い fd を積み増さない (fd 枯渇回避)
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {"x": 1}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert result.recovered is False
+
+
 def test_worker_runner_result_frame_falls_back_to_error_key_for_reason(
         tmp_path, monkeypatch):
     """[fail-observability]: worker 内例外経路 (mission_worker.py の

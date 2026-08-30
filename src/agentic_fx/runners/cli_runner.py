@@ -291,6 +291,12 @@ class CliRunner(AgentRunner):
         # 置く (追撃分は backend 側が別途自前で保存する、既存の流儀)。
         self._save_transcript(list(stdout_lines), stderr_chunks)
 
+        # M4: どちらの追撃経路 (timeout/no-output) を通って `raw` が
+        # 得られたかを覚えておき、schema 検証を通った completed にだけ
+        # `recovered=True` を立てる (provenance — improve_loop が report
+        # artifact を observation へ降格する判断材料)。
+        via_recovery = False
+
         if timed_out:
             # 段B: timeout 経路でも追撃回収を 1 回試みる (SIGTERM 中断後も
             # session が継続できる backend 向け)。基底実装は no-op (None) の
@@ -298,6 +304,7 @@ class CliRunner(AgentRunner):
             raw = self._recover_output(mission, list(stdout_lines), recovery_timeout)
             if raw is None:
                 return MissionResult("timeout", None, [], reason="cli timeout")
+            via_recovery = True
         else:
             if rc != 0:
                 stderr_text = "".join(stderr_chunks)
@@ -312,13 +319,14 @@ class CliRunner(AgentRunner):
                 if raw is None:
                     return MissionResult("failed", None, [],
                                          reason=_normalize_reason("no output recovered from cli"))
+                via_recovery = True
         try:
             jsonschema.validate(raw, mission.output_schema)
         except jsonschema.ValidationError as e:
             return MissionResult(
                 "failed", None, [],
                 reason=_normalize_reason(f"output_schema mismatch: {e.message}"))
-        return MissionResult("completed", raw, [])
+        return MissionResult("completed", raw, [], recovered=via_recovery)
 
     def _save_transcript(self, stdout_lines: list[str],
                           stderr_chunks: list[str]) -> None:

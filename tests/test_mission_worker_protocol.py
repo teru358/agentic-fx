@@ -1482,6 +1482,68 @@ def test_result_frame_carries_null_reason_for_improve_profile(
     assert result_frame["reason"] is None
 
 
+class _FakeLocalRunnerWithRecovered:
+    """M4: `MissionResult.recovered=True` (追撃回収経由) の completed を
+    返す improve 用差し替え。"""
+
+    instances: list["_FakeLocalRunnerWithRecovered"] = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        _FakeLocalRunnerWithRecovered.instances.append(self)
+
+    def run(self, mission):
+        from agentic_fx.runners.base import MissionResult
+        return MissionResult(status="completed", output={}, recovered=True)
+
+
+def test_result_frame_carries_recovered_true_for_improve_profile(
+        monkeypatch, tmp_path):
+    """M4: improve profile の result frame は `result.recovered` を
+    `"recovered"` キーへ乗せる。"""
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda *args, **kwargs: None)
+
+    def settings_mutator(settings_dict):
+        pass  # improve は既定 settings のまま (backend=local)
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve",
+                             "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-proto-test",
+                             "staging_dir": str(tmp_path / "staging" / "m-proto-test"),
+                             "source_snapshot_dir": str(tmp_path / "source")},
+        settings_mutator=settings_mutator,
+        runner_cls=_FakeLocalRunnerWithRecovered)
+    result_frame = frames[-1]
+    assert result_frame["type"] == "result"
+    assert result_frame["recovered"] is True
+
+
+def test_result_frame_carries_recovered_false_for_improve_profile_default(
+        monkeypatch, tmp_path):
+    """M4 対照: runner が `recovered` を明示しない (既定 False) とき、
+    result frame は `False` を乗せる — 常に True にする変異を殺す。"""
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda *args, **kwargs: None)
+
+    def settings_mutator(settings_dict):
+        pass  # improve は既定 settings のまま (backend=local)
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve",
+                             "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-proto-test",
+                             "staging_dir": str(tmp_path / "staging" / "m-proto-test"),
+                             "source_snapshot_dir": str(tmp_path / "source")},
+        settings_mutator=settings_mutator)
+    result_frame = frames[-1]
+    assert result_frame["type"] == "result"
+    assert result_frame["recovered"] is False
+
+
 def test_ready_is_sent_only_after_mcp_dispatcher_socket_is_bound_for_improve_profile(
         monkeypatch, tmp_path):
     """RW6 是正 pin (プラン10 着手前検証 rulings 末尾): improve worker は

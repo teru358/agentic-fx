@@ -604,6 +604,30 @@ def test_cli_runner_recover_output_returning_none_preserves_original_failed_reas
     assert result.reason is not None and "no output" in result.reason
 
 
+def test_cli_runner_recover_output_success_sets_recovered_true(tmp_path):
+    """M4: `_recover_output` の追撃が成功した (非 None かつ schema 検証を
+    通った) completed には `recovered=True` が立つ。"""
+    class _RecoveringRunner(_FakeCliRunner):
+        def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
+            return {"answer": 4}
+
+    runner = _RecoveringRunner(
+        script=_SLEEP_FOREVER, bin_path=Path(sys.executable), model="m",
+        workdir=tmp_path, cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    result = runner.run(_mission(timeout_sec=0.3))
+    assert result.status == "completed"
+    assert result.recovered is True
+
+
+def test_cli_runner_primary_success_leaves_recovered_false(tmp_path):
+    """M4 対照: primary (追撃なし) の completed は `recovered=False`
+    (既定) のまま — recovered を常に True にする変異を殺す。"""
+    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path)
+    result = runner.run(_mission())
+    assert result.status == "completed"
+    assert result.recovered is False
+
+
 def test_cli_runner_reserve_zero_primary_timeout_is_full_mission_timeout(tmp_path):
     """段B M2 pin: `_recovery_reserve_sec()` が 0 (基底既定) のとき、
     `_run_cli_process` に渡る primary の timeout は `mission.timeout_sec`

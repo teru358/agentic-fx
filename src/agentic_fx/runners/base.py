@@ -45,6 +45,12 @@ class MissionResult:
     # design.md §4.2)。「なぜ失敗したか」の軸であり、`status` (「どの
     # 終端状態か」の軸) とは独立 — 新しい status 値は作らない (同 §4.1)。
     reason: str | None = None
+    # M4 (2026-08-30、codex レビュー Major 4): timeout/no-output からの
+    # session resume 追撃 (`CliRunner._recover_output`) で回収した出力
+    # かどうかの provenance。既定 False — 既存呼び出しは無変更。
+    # improve_loop はこれを見て report artifact を observation へ降格する
+    # (plugin artifact は既存の決定論 gate が防衛線のため対象外)。
+    recovered: bool = False
 
 
 class AgentRunner(ABC):

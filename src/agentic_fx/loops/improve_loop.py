@@ -1223,6 +1223,43 @@ class ImproveLoop:
             approval_payload = None
             gate_rows: list[dict] = []
 
+            # M4 (2026-08-30、codex レビュー Major 4): plugin artifact は
+            # 既存の決定論 gate (staging 実体・pytest・hash) が虚偽
+            # completed を防げるが、report artifact はモデルの body_md を
+            # 実体突合なしでファイル公開し得る。`result.recovered` (段B の
+            # timeout/no-output からの session resume 追撃で回収した出力)
+            # のときは report を公開せず、既存の observation 終端経路
+            # (`_finalize_report_or_observation`) を再利用して降格する。
+            # plugin/observation 形は従来どおり (plugin は既存 gate が防衛線)。
+            # `proposal_kind == "risk_gate"` は対象外 — このケースは
+            # `_prepare_report_if_applicable` が本文書込み前に None を返す
+            # ため元々ファイルを公開しない (降格の動機である「実体突合
+            # なしでファイル公開し得る」が成立しない) — 対象にすると設計書
+            # §4.3 状態表の逐語ラベル `unsupported_in_plan10:risk_gate` を
+            # 無条件で書き換えてしまう (実装者裁定 — 挙動差分を実際に
+            # ファイル公開しうる経路だけに絞る)。
+            if (getattr(result, "recovered", False) and atype == "report"
+                    and artifact.get("proposal_kind") != "risk_gate"):
+                from agentic_fx._safe_error import safe_text
+                title = safe_text(str(artifact.get("title", "")))
+                # activity は終端 tx より前に書く (`_finalize_failed_
+                # mission`/`_finalize_output_invalid` と同じ規律 —
+                # [fail-observability] 是正: tx が例外を送出しても降格の
+                # 痕跡が activity.log に残るようにする)。
+                self._activity.write(
+                    Category.IMPROVE, "report_demoted_recovered",
+                    f"mission={ctx.mission_id} title={title}")
+                self._finalize_report_or_observation(
+                    conn, ctx=ctx, backlog_id=selection.backlog_id,
+                    report_path=None,
+                    artifact={
+                        "type": "observation",
+                        "reason": (f"title={title} — "
+                                  "resume 回収経由のため降格"),
+                    },
+                    now=now)
+                return
+
             if atype == "plugin":
                 candidate_dir = ctx.staging_dir / artifact["name"]
                 gate_verdict = self._run_plugin_gate(                  # 手順3

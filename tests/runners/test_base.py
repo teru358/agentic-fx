@@ -91,6 +91,21 @@ def test_mission_result_reason_can_be_set_via_keyword():
     assert r.reason == "context exceeded: prompt 1 tokens > n_ctx 2"
 
 
+def test_mission_result_recovered_defaults_to_false_via_positional_call():
+    """M4: recovered は既定 False。既存の 3 positional 引数の呼び出し
+    (プラン10 以前からの全呼び出し site) が無変更のまま動作すること。"""
+    r = MissionResult("completed", {"a": 1}, [])
+    assert r.recovered is False
+
+
+def test_mission_result_recovered_can_be_set_via_keyword():
+    """M4: recovered は追撃回収成功経路でのみ True になる — キーワードで
+    明示設定できる。"""
+    r = MissionResult(status="completed", output={"a": 1}, transcript=[],
+                      recovered=True)
+    assert r.recovered is True
+
+
 def test_agent_runner_docstring_states_reason_contract():
     """Task 1: AgentRunner の docstring に reason の規範が書かれている
     (設計: 2026-08-10-context-overflow-diagnosis-design.md §4.3)。"""
