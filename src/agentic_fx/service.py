@@ -204,6 +204,10 @@ _SECRET_ENV_PATTERNS = ("_API_KEY", "TOKEN", "SECRET", "WEBHOOK",
 def _resolve_cli_bin(bin_value: str, *, require_elf: bool) -> Path:
     import shutil
 
+    # opencode の既定 bin "~/.opencode/bin/opencode" (チルダ入り) 対応
+    # (検収実測 2026-08-30): which は "~" を展開しないため、まず展開する。
+    # claude ("claude" = PATH 解決) / codex (絶対パス) には無影響。
+    bin_value = str(Path(bin_value).expanduser())
     resolved = shutil.which(bin_value) or (
         bin_value if Path(bin_value).is_absolute() else None)
     if resolved is None:

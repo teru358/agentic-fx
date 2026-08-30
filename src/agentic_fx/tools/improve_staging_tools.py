@@ -76,12 +76,24 @@ def build_improve_staging_tooldefs(*, staging_dir: Path,
         base = _safe_join(staging_dir, name)
         if base is None or not (base / "test_plugin.py").is_file():
             return {"error": "not found"}
+        # 実機 E2E 是正 (2026-08-30 mission #9): (a) rootdir/confcutdir を
+        # 候補 dir に固定し cwd も候補 dir にする — 未指定だと pytest の
+        # rootdir 探索が Landlock allowlist 外 (リポジトリ root の
+        # pyproject.toml 等) へ遡り PermissionError で収集前に死ぬ
+        # (メモリ pytest-under-landlock-pitfalls)。(b) stderr も tail に
+        # 含める — 収集前の死因は stderr にしか出ず、旧実装は
+        # `stdout_tail:""` の盲目デバッグをモデルに強いていた。
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:logging",
+             "-p", "no:cacheprovider",
+             "--rootdir", str(base), "--confcutdir", str(base),
              str(base / "test_plugin.py")],
-            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            cwd=str(base), timeout=120)
+        combined = result.stdout + (
+            ("\n[stderr]\n" + result.stderr) if result.stderr else "")
         return {"passed": result.returncode == 0,
-                "stdout_tail": result.stdout[-2000:]}
+                "stdout_tail": combined[-2000:]}
 
     return [
         ToolDef(name="list_staging", description="候補置き場の一覧。",

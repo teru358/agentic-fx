@@ -196,3 +196,48 @@ def test_write_staging_file_rejects_symlinked_candidate_dir(tmp_path):
         name="evil", rel="plugin.py", content="PWNED")
     assert "error" in out, out
     assert not (outside / "plugin.py").exists(), "staging 外へ書き込まれた"
+
+
+def test_run_plugin_tests_includes_stderr_in_tail(tmp_path):
+    """実機 E2E (2026-08-30 mission #9) 是正: pytest が収集前に死ぬと
+    (Landlock 下の rootdir 遡り PermissionError 等)、死因は stderr にしか
+    出ないのに旧実装は stdout だけ返し `stdout_tail:""` の盲目デバッグに
+    なっていた。stderr も tail に含めること。"""
+    tools, staging_dir, _ = _build(tmp_path)
+    (staging_dir / "crash_case").mkdir()
+    (staging_dir / "crash_case" / "test_plugin.py").write_text(
+        "import nonexistent_module_xyz\n")
+    out = tools["run_plugin_tests"].func(name="crash_case")
+    assert out["passed"] is False
+    assert "nonexistent_module_xyz" in out["stdout_tail"]
+
+
+def test_run_plugin_tests_confines_pytest_to_candidate_dir(tmp_path):
+    """同上: rootdir/confcutdir 未指定だと pytest が候補 dir の外
+    (リポジトリ root の pyproject.toml 等、Landlock allowlist 外) へ遡って
+    PermissionError で死ぬ。--rootdir と --confcutdir を候補 dir に固定し、
+    cwd も候補 dir にすることを argv/cwd で pin する。"""
+    import subprocess as _subprocess
+    captured = {}
+    orig_run = _subprocess.run
+
+    def spy_run(argv, **kw):
+        captured["argv"] = argv
+        captured["cwd"] = kw.get("cwd")
+        return orig_run(argv, **kw)
+
+    tools, staging_dir, _ = _build(tmp_path)
+    (staging_dir / "pin_case").mkdir()
+    (staging_dir / "pin_case" / "test_plugin.py").write_text(
+        "def test_x():\n    assert True\n")
+    import agentic_fx.tools.improve_staging_tools as mod
+    orig = mod.subprocess.run
+    mod.subprocess.run = spy_run
+    try:
+        out = tools["run_plugin_tests"].func(name="pin_case")
+    finally:
+        mod.subprocess.run = orig
+    assert out["passed"] is True
+    joined = " ".join(map(str, captured["argv"]))
+    assert "--rootdir" in joined
+    assert "--confcutdir" in joined or captured["cwd"] is not None
