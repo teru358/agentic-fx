@@ -32,7 +32,14 @@ class OpencodeRunner(CliRunner):
             "npm": "@ai-sdk/openai-compatible", "name": "llama-swap",
             "options": {"baseURL": self._llama_swap_base_url},
             "models": {self._model: {"name": self._model, "limit": {"context": 131072, "output": 8192}}}}},
-            "mcp": {"afx": {"type": "local", "command": [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(mcp_socket)], "enabled": True}}}), encoding="utf-8")
+            "mcp": {"afx": {"type": "local", "command": [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(mcp_socket)], "enabled": True}},
+            # 組み込み tool は afx MCP 以外の全部を無効化 (実測: probe で bash が
+            # tool_use イベント自体を出さなくなることを確認済み)。MCP 側は
+            # "<server>_<tool>" (例: afx_list_staging) の別名前空間のため巻き込まれない。
+            "tools": {"bash": False, "read": False, "write": False, "edit": False, "patch": False,
+                      "glob": False, "grep": False, "list": False, "webfetch": False,
+                      "websearch": False, "task": False, "todowrite": False, "question": False,
+                      "skill": False}}), encoding="utf-8")
         return [str(self._bin_path), "run", mission.prompt, "--format", "json", "--pure", "-m", f"llama-swap/{self._model}", "--dir", str(self._workdir)]
 
     def _build_env(self, mission: Mission) -> dict[str, str]:

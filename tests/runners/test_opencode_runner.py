@@ -25,7 +25,10 @@ def _runner(tmp_path):
 
 def test_opencode_argv_writes_self_contained_mcp_provider_config(tmp_path):
     """mcp/provider 節を落とす変異では、隔離 HOME で tools も provider も
-    見えず起動不能になるため、生成済み設定と argv の両方を pin する。"""
+    見えず起動不能になるため、生成済み設定と argv の両方を pin する。
+    `tools` 節 (組み込み tool 無効化) を落とす変異は、bash/read 等での
+    project 外境界越え・徘徊 (probe 実証済み、2026-08-30) を再度許してしまう
+    ため、無効化する tool の完全な集合も pin する。"""
     runner, workdir = _runner(tmp_path)
     argv = runner._build_argv(_mission(), mcp_socket=workdir / "afx.sock")
     config = json.loads((workdir / "home/.config/opencode/opencode.json").read_text())
@@ -34,6 +37,11 @@ def test_opencode_argv_writes_self_contained_mcp_provider_config(tmp_path):
     assert config["provider"]["llama-swap"]["options"]["baseURL"] == "http://localhost:8080/v1"
     assert config["provider"]["llama-swap"]["models"]["qwen-test"]["limit"] == {"context": 131072, "output": 8192}
     assert config["mcp"]["afx"]["command"] == [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(workdir / "afx.sock")]
+    assert config["tools"] == {
+        "bash": False, "read": False, "write": False, "edit": False, "patch": False,
+        "glob": False, "grep": False, "list": False, "webfetch": False,
+        "websearch": False, "task": False, "todowrite": False, "question": False,
+        "skill": False}
 
 
 def test_opencode_env_is_minimal_and_output_is_last_text_json(tmp_path):
