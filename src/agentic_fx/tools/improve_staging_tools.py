@@ -39,8 +39,13 @@ def _safe_join(root: Path, name: str, rel: str | None = None) -> Path | None:
 def build_improve_staging_tooldefs(*, staging_dir: Path,
                                     source_snapshot_dir: Path) -> list[ToolDef]:
     def list_staging() -> dict:
+        # opencode E2E m11 実測 (2026-08-30): `_snapshot_src/` (staging_dir
+        # 直下に実体化される snapshot) を候補として返すと、モデルは
+        # read_staging_file で読もうとして _NAME_RE (先頭 `_` 不可) に必ず
+        # 弾かれる。ツールで読めない名前は列挙しない。
         candidates = []
-        for d in sorted(p for p in staging_dir.iterdir() if p.is_dir()):
+        for d in sorted(p for p in staging_dir.iterdir()
+                        if p.is_dir() and _NAME_RE.fullmatch(p.name)):
             files = sorted(f.name for f in d.iterdir() if f.is_file())
             candidates.append({"name": d.name, "files": files})
         return {"candidates": candidates}

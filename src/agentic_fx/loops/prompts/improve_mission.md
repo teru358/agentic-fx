@@ -54,11 +54,58 @@ open / observation の課題一覧です。担当分担がある場合は印が�
 1. **ネットワークアクセスはツール経由のみ**。shell や python から直接
    HTTP リクエストを送らないでください。予算 (件数・間隔・host 上限) は
    ツールでしか数えられません。
-2. **候補は `write_staging_file` でのみ書いてください** — 他の場所への
-   書き込みは失敗します。
+2. **ファイルの読み書きは afx の MCP tool のみを使ってください**
+   (`list_staging` / `read_staging_file` / `write_staging_file` /
+   `read_plugin_source` / `run_plugin_tests`)。エディタ・ハーネス組み込みの
+   read / write / shell によるファイル操作はプロジェクトのファイルに
+   届かず、境界で拒否されます。
+   - 呼び出し例: `write_staging_file(name="my_plugin", rel="plugin.py",
+     content="...")`
+   - `rel` は `plugin.py` / `config.yaml` / `test_plugin.py` の 3 値のみ。
+     `name` は plugin 名そのもの (単一の名前。パスや `/` は不可)。
 3. **1 回の結果で課題を捨てないでください** — うまくいかなかった場合も
    `observation` として理由を残し、次回への申し送りにしてください。
-4. 出力は必ず指定された JSON schema (`discoveries` / `selected` /
+4. 出力は必ず下の「最終出力」の形式 (`discoveries` / `selected` /
    `artifact` / `selection_rationale`) に従ってください。分析 ID・探索
    回数などの集計値はあなたが数える必要はありません (親が RPC 記録から
    生成します)。
+
+## 最終出力
+
+ミッションの最後のメッセージは **JSON オブジェクト 1 個のみ** にして
+ください。前置きの文章・コードフェンス・後書きは付けないでください。
+
+形式の実例 (値は例。この構造をそのまま守ること):
+
+{{
+  "discoveries": [
+    {{
+      "idea": "RSI の期間を 14 から 21 に伸ばしてダマシを減らす",
+      "source": "research",
+      "evidence": "https://example.com/rsi-period-study の要約: ..."
+    }}
+  ],
+  "selected": {{
+    "backlog_id": 12,
+    "idea": "RSI インジケータ plugin を追加する"
+  }},
+  "artifact": {{
+    "type": "plugin",
+    "name": "rsi_indicator",
+    "kind": "indicator",
+    "self_test": "passed",
+    "summary": "RSI(14) を算出する indicator plugin。warmup 14 本。"
+  }},
+  "selection_rationale": "backlog #12 は試行 1 回目で、直近成績の hold 率の高さに直結するため。"
+}}
+
+- `discoveries` は**オブジェクトの配列**です (文字列の配列ではない)。
+  各要素は `idea` / `source` (`agent` か `research`) / `evidence` の
+  3 キー。発見が無ければ `[]`。
+- `selected` も**オブジェクト**です。`backlog_id` は整数 (新規課題なら
+  null)、`idea` は選んだ課題の説明文字列。
+- `artifact` は 3 形のいずれか:
+  - plugin 形: 上の実例のとおり (`name` は候補置き場に書いた plugin 名)
+  - report 形: `{{"type": "report", "proposal_kind": "core" | "risk_gate" | "research", "title": "...", "body_md": "..."}}`
+  - observation 形 (実施まで至らなかった場合): `{{"type": "observation", "reason": "..."}}`
+- 上に挙げたキー以外は追加しないでください。

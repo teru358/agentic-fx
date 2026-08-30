@@ -51,6 +51,19 @@ def test_list_staging_returns_candidates_in_sorted_order(tmp_path):
     assert [c["name"] for c in out["candidates"]] == ["apple", "mango", "zebra"]
 
 
+def test_list_staging_excludes_names_unreadable_by_tools(tmp_path):
+    """opencode E2E m11 実測 (2026-08-30): snapshot は staging_dir 直下の
+    `_snapshot_src/` に実体化されるため、list_staging が候補として返して
+    いた。`_NAME_RE` は先頭 `_` を弾くので、モデルはその「候補」を
+    read_staging_file で読もうとして必ず not found になる — 読めない名前は
+    列挙しない。"""
+    tools, staging_dir, _ = _build(tmp_path)
+    tools["write_staging_file"].func(name="a", rel="plugin.py", content="1")
+    (staging_dir / "_snapshot_src" / "rsi").mkdir(parents=True)
+    out = tools["list_staging"].func()
+    assert [c["name"] for c in out["candidates"]] == ["a"]
+
+
 def test_safe_join_rejects_circular_symlink(tmp_path):
     """L17: `_safe_join` の `except (OSError, RuntimeError)` (resolve 失敗)
     経路が未テスト — 循環 symlink を張って error になることを確認する。"""
