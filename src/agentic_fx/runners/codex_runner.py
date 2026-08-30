@@ -60,6 +60,8 @@ class CodexRunner(CliRunner):
         ]
         if self._provider == "llama_swap":
             argv += [
+                # codex 0.150.x は name 欠落を config エラー (rc=1) にする
+                "-c", "model_providers.llamaswap.name=llamaswap",
                 "-c", f"model_providers.llamaswap.base_url={self._llama_swap_base_url}",
                 "-c", "model_providers.llamaswap.wire_api=responses",
                 "-c", "model_provider=llamaswap",

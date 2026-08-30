@@ -81,6 +81,9 @@ def test_codex_argv_uses_llama_swap_provider_config_when_selected(tmp_path):
     assert "model_providers.llamaswap.base_url=http://localhost:8080/v1" in joined
     assert "model_providers.llamaswap.wire_api=responses" in joined
     assert "model_provider=llamaswap" in joined
+    # codex 0.150.x は model_providers.<id>.name が無いと config エラーで rc=1 に
+    # なる (実機 E2E F-9 の真因、2026-08-30 実測)
+    assert "model_providers.llamaswap.name=llamaswap" in joined
 
 
 def test_codex_argv_omits_llama_swap_config_for_chatgpt_provider(tmp_path):
