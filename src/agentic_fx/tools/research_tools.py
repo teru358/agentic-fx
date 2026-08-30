@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 class _SearchBackend(Protocol):
-    def text(self, query: str, max_results: int) -> list[dict]: ...
+    def text(self, query: str, *, max_results: int) -> list[dict]: ...
 
 
 class _FetchBackend(Protocol):
@@ -82,7 +82,7 @@ def build_research_tooldefs(
             return {"error": "budget exhausted"}
         state["search_count"] += 1
         state["last_search_at"] = now
-        results = search_backend.text(query, max_results)
+        results = search_backend.text(query, max_results=max_results)
         return {"results": results}
 
     def fetch_article(url: str) -> dict:

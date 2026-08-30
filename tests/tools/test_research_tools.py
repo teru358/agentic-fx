@@ -3,6 +3,7 @@
 「21 回目が通る」「429 で再試行する」等の**カウンタの穴**だけを狙う。"""
 from __future__ import annotations
 
+import inspect
 import json
 
 import pytest
@@ -408,6 +409,45 @@ def test_fetch_article_429_host_abort_survives_case_and_port_variants():
         out = tools["fetch_article"].func(url=u)
         assert out == {"error": "host aborted (429/503)"}
     assert len(backend.calls) == 1
+
+
+class _SignatureFaithfulSearchBackend:
+    """`ddgs.DDGS.text` (ddgs==9.15.0) の実シグネチャ
+    `text(self, query: str, **kwargs: Any)` を忠実に再現した fake。
+    実 DDGS 同様、`max_results` を位置引数で渡すと
+    `TypeError: text() takes 2 positional arguments but 3 were given`
+    になる (実機 E2E mission #9/#11、2026-08-30 で観測した全断)。"""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def text(self, query, **kwargs):
+        self.calls.append((query, kwargs))
+        return [{"title": "t", "href": "https://example.com/a", "body": "b"}]
+
+
+def test_ddgs_text_real_signature_rejects_positional_max_results():
+    """API 変更の再発防止 pin: `ddgs.DDGS.text` の実シグネチャに対して
+    位置渡し max_results は束縛不可・キーワード渡しは束縛可であることを
+    実測する (推測禁止 — インストール済み ddgs==9.15.0 を直接検査)。"""
+    from ddgs import DDGS
+
+    sig = inspect.signature(DDGS.text)
+    with pytest.raises(TypeError):
+        sig.bind(object(), "q", 3)
+    sig.bind(object(), "q", max_results=3)  # 適合すること (例外を投げない)
+
+
+def test_web_search_calls_backend_with_keyword_max_results():
+    """web_search は search_backend.text を `max_results` キーワード引数で
+    呼ぶこと。位置引数で呼ぶと実 DDGS.text (ddgs==9.15.0) 相当の signature
+    では TypeError になる — その形を忠実に再現した fake で再現する。"""
+    backend = _SignatureFaithfulSearchBackend()
+    tools, _, _ = _build(_settings(min_interval_sec=0.01), search_backend=backend)
+    out = tools["web_search"].func(query="q", max_results=3)
+    assert "error" not in out
+    assert backend.calls == [("q", {"max_results": 3})]
+    assert out == {"results": [{"title": "t", "href": "https://example.com/a", "body": "b"}]}
 
 
 def test_fetch_article_max_per_host_normalizes_via_registry_execute():
