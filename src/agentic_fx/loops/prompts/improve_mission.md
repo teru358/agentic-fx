@@ -46,8 +46,11 @@ open / observation の課題一覧です。担当分担がある場合は印が�
 - plugin 名の正規形: `{plugin_name_pattern}` (単一パス成分、小文字英数字と
   `_` のみ、先頭は英字)
 - plugin 契約: {plugin_contract_summary}
-- サンプル plugin: `{source_snapshot_dir}/_examples/` にコピー済みです。
-  実装の起点として参照してください。
+- サンプル plugin: `list_examples()` で一覧、
+  `read_example_plugin(name="rsi_indicator")` で本文
+  (`plugin.py` / `config.yaml` / `test_plugin.py`) を読めます。
+  `config.yaml` に書いてよいキーはサンプルの `config.yaml` に倣うこと
+  (未知キーは gate で `loader_rejected` になります)。
 
 ## 規律 (必ず守ること)
 
@@ -56,7 +59,8 @@ open / observation の課題一覧です。担当分担がある場合は印が�
    ツールでしか数えられません。
 2. **ファイルの読み書きは afx の MCP tool のみを使ってください**
    (`list_staging` / `read_staging_file` / `write_staging_file` /
-   `read_plugin_source` / `run_plugin_tests`)。エディタ・ハーネス組み込みの
+   `read_plugin_source` / `list_examples` / `read_example_plugin` /
+   `run_plugin_tests`)。エディタ・ハーネス組み込みの
    read / write / shell によるファイル操作はプロジェクトのファイルに
    届かず、境界で拒否されます。
    - 呼び出し例: `write_staging_file(name="my_plugin", rel="plugin.py",

@@ -128,7 +128,75 @@ def test_read_plugin_source_reads_from_source_snapshot_dir_only(tmp_path):
 def test_read_plugin_source_absent_name_returns_error_not_raise(tmp_path):
     tools, _, _ = _build(tmp_path)
     out = tools["read_plugin_source"].func(name="does_not_exist")
-    assert "error" in out
+    assert out["error"] == "not found"
+    assert "list_examples / read_example_plugin" in out["hint"]
+    assert "list_staging / read_staging_file" in out["hint"]
+
+
+def test_read_staging_file_absent_path_returns_guidance(tmp_path):
+    tools, _, _ = _build(tmp_path)
+    out = tools["read_staging_file"].func(name="does_not_exist", rel="plugin.py")
+    assert out["error"] == "not found"
+    assert "list_staging" in out["hint"]
+    assert "write_staging_file" in out["hint"]
+
+
+def test_read_example_plugin_reads_all_allowed_files(tmp_path):
+    tools, _, source_dir = _build(tmp_path)
+    example = source_dir / "_examples" / "rsi_indicator"
+    example.mkdir(parents=True)
+    expected = {
+        "plugin.py": "def compute():\n    return 42\n",
+        "config.yaml": "kind: indicator\n",
+        "test_plugin.py": "def test_compute():\n    assert True\n",
+    }
+    for rel, content in expected.items():
+        (example / rel).write_text(content)
+
+    assert tools["read_example_plugin"].func(name="rsi_indicator") == expected
+
+
+def test_read_example_plugin_absent_name_lists_available_examples(tmp_path):
+    tools, _, source_dir = _build(tmp_path)
+    (source_dir / "_examples" / "rsi_indicator").mkdir(parents=True)
+
+    out = tools["read_example_plugin"].func(name="does_not_exist")
+
+    assert out["error"] == "not found"
+    assert out["available"] == ["rsi_indicator"]
+
+
+def test_list_examples_returns_canonical_directories_in_sorted_order(tmp_path):
+    tools, _, source_dir = _build(tmp_path)
+    examples = source_dir / "_examples"
+    for name in ("sma_cross", "rsi_indicator", "_private"):
+        (examples / name).mkdir(parents=True)
+
+    assert tools["list_examples"].func() == {
+        "examples": ["rsi_indicator", "sma_cross"]}
+
+
+@pytest.mark.parametrize("invalid_name", ["../x", "_examples"])
+def test_read_example_plugin_rejects_non_canonical_name(tmp_path, invalid_name):
+    tools, _, _ = _build(tmp_path)
+
+    out = tools["read_example_plugin"].func(name=invalid_name)
+
+    assert out["error"] == "not found"
+    assert out["available"] == []
+
+
+def test_example_tools_are_registered(tmp_path):
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    registry = ToolRegistry()
+    registry.register_all(build_improve_staging_tooldefs(
+        staging_dir=staging_dir, source_snapshot_dir=source_dir))
+
+    assert "list_examples" in registry.names()
+    assert "read_example_plugin" in registry.names()
 
 
 def test_run_plugin_tests_reports_participant_result(tmp_path):

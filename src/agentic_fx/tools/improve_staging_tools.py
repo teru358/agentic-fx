@@ -53,7 +53,11 @@ def build_improve_staging_tooldefs(*, staging_dir: Path,
     def read_staging_file(name: str, rel: str) -> dict:
         path = _safe_join(staging_dir, name, rel)
         if path is None or not path.is_file():
-            return {"error": "not found"}
+            return {
+                "error": "not found",
+                "hint": "staging に無い名前/rel です。list_staging で確認し、"
+                        "write_staging_file で先に作成してください",
+            }
         return {"content": path.read_text(encoding="utf-8")}
 
     def write_staging_file(name: str, rel: str, content: str) -> dict:
@@ -67,15 +71,47 @@ def build_improve_staging_tooldefs(*, staging_dir: Path,
     def read_plugin_source(name: str) -> dict:
         base = _safe_join(source_snapshot_dir, name)
         if base is None or not base.is_dir():
-            return {"error": "not found"}
+            return {
+                "error": "not found",
+                "hint": "deployed plugin が無い名前です。サンプルは "
+                        "list_examples / read_example_plugin、作業中の候補は "
+                        "list_staging / read_staging_file",
+            }
         out = {}
         for rel in sorted(_ALLOWED_REL):
             p = base / rel
             if p.is_file():
                 out[rel] = p.read_text(encoding="utf-8")
         if not out:
-            return {"error": "not found"}
+            return {
+                "error": "not found",
+                "hint": "deployed plugin が無い名前です。サンプルは "
+                        "list_examples / read_example_plugin、作業中の候補は "
+                        "list_staging / read_staging_file",
+            }
         return out
+
+    def list_examples() -> dict:
+        examples_dir = source_snapshot_dir / "_examples"
+        if not examples_dir.is_dir():
+            return {"examples": []}
+        examples = sorted(
+            d.name for d in examples_dir.iterdir()
+            if d.is_dir() and _NAME_RE.fullmatch(d.name))
+        return {"examples": examples}
+
+    def read_example_plugin(name: str) -> dict:
+        examples_dir = source_snapshot_dir / "_examples"
+        base = _safe_join(examples_dir, name)
+        if base is not None and base.is_dir():
+            out = {}
+            for rel in sorted(_ALLOWED_REL):
+                p = base / rel
+                if p.is_file():
+                    out[rel] = p.read_text(encoding="utf-8")
+            if out:
+                return out
+        return {"error": "not found", "available": list_examples()["examples"]}
 
     def run_plugin_tests(name: str) -> dict:
         base = _safe_join(staging_dir, name)
@@ -121,11 +157,21 @@ def build_improve_staging_tooldefs(*, staging_dir: Path,
                                           "content": {"type": "string"}},
                             "required": ["name", "rel", "content"]},
                 func=write_staging_file),
-        ToolDef(name="read_plugin_source", description="承認済み plugin の読取専用スナップショットを読む。",
+        ToolDef(name="read_plugin_source",
+                description="承認済み (deployed) plugin の読取専用スナップショットを読む。サンプルは read_example_plugin。",
                 parameters={"type": "object",
                             "properties": {"name": {"type": "string"}},
                             "required": ["name"]},
                 func=read_plugin_source),
+        ToolDef(name="list_examples", description="サンプル plugin (docs/examples) の一覧。",
+                parameters={"type": "object", "properties": {}},
+                func=list_examples),
+        ToolDef(name="read_example_plugin",
+                description="サンプル plugin (docs/examples) を読む。config.yaml の許可キーはここで確認する。",
+                parameters={"type": "object",
+                            "properties": {"name": {"type": "string"}},
+                            "required": ["name"]},
+                func=read_example_plugin),
         ToolDef(name="run_plugin_tests", description="候補の test_plugin.py を回す (参考結果)。",
                 parameters={"type": "object",
                             "properties": {"name": {"type": "string"}},
