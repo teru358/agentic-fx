@@ -37,6 +37,7 @@ from agentic_fx.plugin.gate_pytest import (
     CandidateSnapshotError, check_candidate_snapshot, hashes_of,
     run_gate_pytest,
 )
+from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.strategy_gate import evaluate_strategy_adoption_gate
 from agentic_fx.runners.base import Mission
@@ -885,6 +886,11 @@ class ImproveLoop:
                         extra_allowed=frozenset({"pytest", "plugin"}))
         except SandboxError as exc:
             return _PluginGateVerdict(passed=False, reason=str(exc))
+
+        meta, reason = plugin_loader.discover_one_with_reason(plugin_dir, name)
+        if meta is None:
+            return _PluginGateVerdict(
+                passed=False, reason=f"loader_rejected: {reason}")
 
         try:
             result = run_gate_pytest(plugin_dir, settings=self._settings)

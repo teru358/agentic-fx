@@ -127,7 +127,8 @@ def test_commit_loader_rejection_becomes_gate_failed(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
         (backlog_id,)).fetchone()
     assert backlog["status"] == "observation"
-    assert backlog["last_result"] == "gate_failed:loader_rejected"
+    assert backlog["last_result"] == (
+        "gate_failed:loader_rejected: unknown config keys: ['warmup_bars']")
     mission_row = conn.execute(
         "SELECT status FROM missions WHERE id=?", (mission_id,)).fetchone()
     assert mission_row["status"] == "completed"

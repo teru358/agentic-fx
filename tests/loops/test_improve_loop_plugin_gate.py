@@ -9,7 +9,8 @@ import pytest
 from agentic_fx.plugin.gate_pytest import GateResult
 
 
-def _write_candidate(staging_dir: Path, name: str, *, plugin_py=b"P",
+def _write_candidate(staging_dir: Path, name: str, *,
+                     plugin_py=b"def compute(df, params):\n    return {}\n",
                      config_yaml=b"kind: indicator\npairs: []\ntimeframe: 1h\n",
                      test_plugin=b"def test_x(): pass\n"):
     d = staging_dir / name
@@ -18,6 +19,25 @@ def _write_candidate(staging_dir: Path, name: str, *, plugin_py=b"P",
     (d / "config.yaml").write_bytes(config_yaml)
     (d / "test_plugin.py").write_bytes(test_plugin)
     return d
+
+
+def test_loader_rejection_short_circuits_before_pytest(
+        tmp_path, loop_min, monkeypatch):
+    d = _write_candidate(
+        tmp_path,
+        "myind",
+        config_yaml=(b"kind: indicator\npairs: []\ntimeframe: 1h\n"
+                     b"warmup_bars: 5\n"),
+    )
+    pytest_gate = MagicMock()
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.run_gate_pytest", pytest_gate)
+
+    verdict = loop_min._run_plugin_gate(d, name="myind")
+
+    assert verdict.passed is False
+    assert verdict.reason.startswith("loader_rejected: unknown config keys")
+    pytest_gate.assert_not_called()
 
 
 def test_snapshot_check_rejects_extra_file(tmp_path, loop_min):

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import ast
+import contextvars
 import hashlib
 import logging
 import os
@@ -27,6 +28,11 @@ import yaml
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
 
 _log = logging.getLogger(__name__)
+
+# ContextVar isolates rejection capture per execution context (effectively per
+# thread/async task), so parallel missions cannot cross-contaminate reasons.
+_reject_sink: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "plugin_loader_reject_sink", default=None)
 
 REQUIRED_FILES = ("plugin.py", "config.yaml", "test_plugin.py")
 
@@ -123,6 +129,9 @@ def content_hash(plugin_dir: Path) -> str:
 
 def _reject(name: str, reason: str) -> None:
     _log.warning("plugin %s: %s — rejecting", name, reason)
+    sink = _reject_sink.get()
+    if sink is not None:
+        sink.append(reason)
 
 
 def _validate_config(raw: dict, name: str) -> dict | None:
@@ -425,3 +434,17 @@ def _discover_one(entry: Path, name: str) -> PluginMeta | None:
         content_hash=content_hash(entry),
         artifact_hash=artifact_hash_bytes(plugin_bytes, config_bytes, test_bytes),
     )
+
+
+def discover_one_with_reason(
+        entry: Path, name: str) -> tuple[PluginMeta | None, str | None]:
+    """Discover one plugin and return its first logged rejection reason."""
+    reasons: list[str] = []
+    token = _reject_sink.set(reasons)
+    try:
+        meta = _discover_one(entry, name)
+    finally:
+        _reject_sink.reset(token)
+    if meta is None:
+        return None, reasons[0] if reasons else None
+    return meta, None

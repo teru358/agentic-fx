@@ -15,7 +15,12 @@ import pytest
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
 from agentic_fx.plugin import loader as loader_module
-from agentic_fx.plugin.loader import PluginMeta, content_hash, discover
+from agentic_fx.plugin.loader import (
+    PluginMeta,
+    content_hash,
+    discover,
+    discover_one_with_reason,
+)
 
 INDICATOR_PY = """
 def compute(df, params):
@@ -129,6 +134,36 @@ def test_discover_normal_strategy_plugin(tmp_path):
     assert meta.content_hash == content_hash(tmp_path / "sma_cross")
     # exit_mode は検証されるが PluginMeta には保持されない
     assert not hasattr(meta, "exit_mode")
+
+
+def test_discover_one_with_reason_reports_unknown_config_key(tmp_path):
+    candidate = _write_plugin(
+        tmp_path,
+        "bad_indicator",
+        plugin_py=INDICATOR_PY,
+        config_yaml="kind: indicator\nwarmup_bars: 5\n",
+    )
+
+    meta, reason = discover_one_with_reason(candidate, "bad_indicator")
+
+    assert meta is None
+    assert isinstance(reason, str)
+    assert reason.startswith("unknown config keys")
+    assert "warmup_bars" in reason
+
+
+def test_discover_one_with_reason_returns_valid_meta_without_reason(tmp_path):
+    candidate = _write_plugin(
+        tmp_path,
+        "valid_indicator",
+        plugin_py=INDICATOR_PY,
+        config_yaml=INDICATOR_CONFIG,
+    )
+
+    meta, reason = discover_one_with_reason(candidate, "valid_indicator")
+
+    assert meta is not None
+    assert reason is None
 
 
 def test_discover_normal_indicator_plugin_defaults(tmp_path):
