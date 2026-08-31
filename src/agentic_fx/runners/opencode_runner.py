@@ -141,6 +141,7 @@ class OpencodeRunner(CliRunner):
         M3: `rc == 0` かつ最終 `step_finish` イベントの `reason == "stop"`
         の両方を必須にする (probe p3 実測: 正常な追撃は reason:"stop")。
         どちらか欠けたら None。
+        破棄理由は transcript の先頭 marker に記録する。
 
         追撃自体の失敗 (rc≠0/timeout/reason 不一致) は握って None を返す —
         mission を悪化させない (追撃前と同じ failed/timeout に落ちるだけ)。
@@ -162,10 +163,30 @@ class OpencodeRunner(CliRunner):
         resume_timeout = min(_RESUME_TIMEOUT_SEC, recovery_timeout_sec)
         timed_out, rc, resume_lines, _stderr_chunks = self._run_cli_process(
             argv, env, timeout_sec=resume_timeout)
-        marker = json.dumps({"_resume_recovery": True, "session_id": session_id})
+        step_finish_reason = self._last_step_finish_reason(resume_lines)
+        if timed_out:
+            discard_reason = "timed_out"
+        elif rc != 0:
+            discard_reason = "rc"
+        elif step_finish_reason != "stop":
+            discard_reason = "step_finish_reason"
+        else:
+            discard_reason = None
+        accepted = discard_reason is None
+        marker = json.dumps({
+            "_resume_recovery": True,
+            "session_id": session_id,
+            "timed_out": timed_out,
+            "rc": rc,
+            "step_finish_reason": step_finish_reason,
+            "accepted": accepted,
+            "discard_reason": discard_reason,
+        })
         self._save_transcript([marker, *resume_lines], [])
+        self._on_message({"type": "event", "message": {
+            "role": "system", "content": marker}})
         if timed_out or rc != 0:
             return None
-        if self._last_step_finish_reason(resume_lines) != "stop":
+        if step_finish_reason != "stop":
             return None
         return self._extract_output(resume_lines, self._workdir)

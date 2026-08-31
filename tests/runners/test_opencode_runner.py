@@ -191,6 +191,93 @@ def test_opencode_resume_uses_launcher_start_new_session_and_rlimits(tmp_path):
 # --- M3: rc==0 かつ最終 step_finish の reason=="stop" を必須にする -------
 
 
+def test_opencode_resume_marker_records_nonzero_rc_discard(tmp_path, monkeypatch):
+    messages = []
+    runner, workdir = _resume_runner(
+        tmp_path, Path("/opt/opencode"), on_message=messages.append)
+    resume_lines = [
+        '{"type":"text","part":{"type":"text","text":"{\\"answer\\":4}"}}',
+        '{"type":"step_finish","reason":"stop"}',
+    ]
+    saved = []
+    monkeypatch.setattr(
+        runner, "_run_cli_process",
+        lambda *args, **kwargs: (False, 1, resume_lines, []))
+    monkeypatch.setattr(runner, "_save_transcript", lambda stdout, stderr: saved.append(stdout))
+
+    result = runner._recover_output(
+        _resume_mission(), ['{"sessionID":"ses_rcmarker"}'], 10)
+
+    assert result is None
+    marker = json.loads(saved[0][0])
+    assert marker["accepted"] is False
+    assert marker["discard_reason"] == "rc"
+    assert marker["rc"] == 1
+    assert messages == [{"type": "event", "message": {
+        "role": "system", "content": saved[0][0]}}]
+
+
+def test_opencode_resume_marker_records_timeout_discard(tmp_path, monkeypatch):
+    runner, _workdir = _resume_runner(tmp_path, Path("/opt/opencode"))
+    resume_lines = ['{"type":"step_finish","reason":"stop"}']
+    saved = []
+    monkeypatch.setattr(
+        runner, "_run_cli_process",
+        lambda *args, **kwargs: (True, 0, resume_lines, []))
+    monkeypatch.setattr(runner, "_save_transcript", lambda stdout, stderr: saved.append(stdout))
+
+    result = runner._recover_output(
+        _resume_mission(), ['{"sessionID":"ses_timeoutmarker"}'], 10)
+
+    assert result is None
+    marker = json.loads(saved[0][0])
+    assert marker["accepted"] is False
+    assert marker["discard_reason"] == "timed_out"
+
+
+def test_opencode_resume_marker_records_finish_reason_discard(tmp_path, monkeypatch):
+    runner, _workdir = _resume_runner(tmp_path, Path("/opt/opencode"))
+    resume_lines = ['{"type":"step_finish","reason":"max_tokens"}']
+    saved = []
+    monkeypatch.setattr(
+        runner, "_run_cli_process",
+        lambda *args, **kwargs: (False, 0, resume_lines, []))
+    monkeypatch.setattr(runner, "_save_transcript", lambda stdout, stderr: saved.append(stdout))
+
+    result = runner._recover_output(
+        _resume_mission(), ['{"sessionID":"ses_reasonmarker"}'], 10)
+
+    assert result is None
+    marker = json.loads(saved[0][0])
+    assert marker["accepted"] is False
+    assert marker["discard_reason"] == "step_finish_reason"
+
+
+def test_opencode_resume_marker_records_accepted_recovery(tmp_path, monkeypatch):
+    messages = []
+    runner, _workdir = _resume_runner(
+        tmp_path, Path("/opt/opencode"), on_message=messages.append)
+    resume_lines = [
+        '{"type":"text","part":{"type":"text","text":"{\\"answer\\":4}"}}',
+        '{"type":"step_finish","reason":"stop"}',
+    ]
+    saved = []
+    monkeypatch.setattr(
+        runner, "_run_cli_process",
+        lambda *args, **kwargs: (False, 0, resume_lines, []))
+    monkeypatch.setattr(runner, "_save_transcript", lambda stdout, stderr: saved.append(stdout))
+
+    result = runner._recover_output(
+        _resume_mission(), ['{"sessionID":"ses_acceptedmarker"}'], 10)
+
+    assert result == {"answer": 4}
+    marker = json.loads(saved[0][0])
+    assert marker["accepted"] is True
+    assert marker["discard_reason"] is None
+    assert messages == [{"type": "event", "message": {
+        "role": "system", "content": saved[0][0]}}]
+
+
 def test_opencode_resume_nonzero_rc_is_rejected(tmp_path):
     """M3 killer: 追撃 CLI が rc!=0 で終われば、text/step_finish が
     正しくても None (failed) にする。"""
