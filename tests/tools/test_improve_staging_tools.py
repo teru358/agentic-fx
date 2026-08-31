@@ -140,6 +140,20 @@ def test_run_plugin_tests_reports_participant_result(tmp_path):
     assert out["passed"] is True
 
 
+def test_run_plugin_tests_ignores_ancestor_pytest_config(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n"
+        'addopts = "--this-flag-does-not-exist"\n')
+    tools, staging_dir, _ = _build(tmp_path)
+    (staging_dir / "isolated_case").mkdir()
+    (staging_dir / "isolated_case" / "test_plugin.py").write_text(
+        "def test_x():\n    assert True\n")
+
+    out = tools["run_plugin_tests"].func(name="isolated_case")
+
+    assert out["passed"] is True, out["stdout_tail"]
+
+
 def test_run_plugin_tests_reports_failure_without_raising(tmp_path):
     tools, staging_dir, _ = _build(tmp_path)
     (staging_dir / "bad_case").mkdir()

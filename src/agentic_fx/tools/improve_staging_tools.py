@@ -88,9 +88,11 @@ def build_improve_staging_tooldefs(*, staging_dir: Path,
         # (メモリ pytest-under-landlock-pitfalls)。(b) stderr も tail に
         # 含める — 収集前の死因は stderr にしか出ず、旧実装は
         # `stdout_tail:""` の盲目デバッグをモデルに強いていた。
+        # `-c` 未指定では `locate_config()` が祖先の pyproject.toml を開き、
+        # Landlock 下で EACCES になる (mission m20/m22 で実測)。
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:logging",
-             "-p", "no:cacheprovider",
+             "-p", "no:cacheprovider", "-c", "/dev/null",
              "--rootdir", str(base), "--confcutdir", str(base),
              str(base / "test_plugin.py")],
             capture_output=True, text=True, stdin=subprocess.DEVNULL,
