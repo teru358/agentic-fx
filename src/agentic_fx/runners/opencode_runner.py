@@ -106,16 +106,20 @@ class OpencodeRunner(CliRunner):
 
     @staticmethod
     def _last_step_finish_reason(stdout_lines: list[str]) -> str | None:
-        """`type == "step_finish"` の最後のイベントの `reason` を返す
-        (M3: probe p3 実測で正常な追撃は `reason: "stop"`)。該当イベントが
-        無ければ None。"""
+        """最後の `step_finish` イベントの `part.reason` を返す。
+
+        opencode の実イベントでは終了理由はトップレベルではなく
+        `part` (`{"type": "step-finish", "reason": "stop", ...}`) に入る。
+        該当イベントまたは文字列の `part.reason` が無ければ None。
+        """
         for line in reversed(stdout_lines):
             try:
                 event = json.loads(line)
             except (json.JSONDecodeError, ValueError):
                 continue
             if isinstance(event, dict) and event.get("type") == "step_finish":
-                reason = event.get("reason")
+                part = event.get("part")
+                reason = part.get("reason") if isinstance(part, dict) else None
                 return reason if isinstance(reason, str) else None
         return None
 

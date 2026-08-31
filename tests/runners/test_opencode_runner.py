@@ -66,6 +66,32 @@ def _resume_runner(tmp_path: Path, bin_path: Path, **over):
     return OpencodeRunner(**kw), workdir
 
 
+def _step_finish(reason: str | None) -> str:
+    """実 transcript と同じ opencode の step_finish イベントを作る。"""
+    part = {
+        "id": "prt_05794c3050012xfyCsveOPhNmI",
+        "messageID": "msg_057942a24001G9FQl2AEordUSY",
+        "sessionID": "ses_fa86fce77ffe1MJzH5eShyXdY2",
+        "type": "step-finish",
+        "tokens": {
+            "cache": {"read": 11127, "write": 0},
+            "input": 110,
+            "output": 581,
+            "reasoning": 0,
+            "total": 11818,
+        },
+        "cost": 0,
+    }
+    if reason is not None:
+        part["reason"] = reason
+    return json.dumps({
+        "type": "step_finish",
+        "timestamp": 1788175762190,
+        "sessionID": "ses_fa86fce77ffe1MJzH5eShyXdY2",
+        "part": part,
+    })
+
+
 def test_opencode_resumes_session_and_recovers_json_after_no_output(tmp_path):
     """(a) 初回が text イベント無しで終わっても、`sessionID` を使った追撃
     argv (`-s <id>`) が組まれ、追撃出力 (rc=0 かつ最終 step_finish の
@@ -77,7 +103,7 @@ def test_opencode_resumes_session_and_recovers_json_after_no_output(tmp_path):
         "    session_id = argv[argv.index('-s') + 1]\n"
         "    text = json.dumps({'answer': 4, 'resumed': session_id})\n"
         "    print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': text}}))\n"
-        "    print(json.dumps({'type': 'step_finish', 'reason': 'stop'}))\n"
+        f"    print({_step_finish('stop')!r})\n"
         "else:\n"
         "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_abc123'}))\n"
     )
@@ -106,7 +132,7 @@ def test_opencode_resume_without_text_also_fails(tmp_path):
         "import sys, json\n"
         "argv = sys.argv[1:]\n"
         "if '-s' in argv:\n"
-        "    print(json.dumps({'type': 'step_finish'}))\n"
+        f"    print({_step_finish(None)!r})\n"
         "else:\n"
         "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_xyz'}))\n"
     )
@@ -129,7 +155,7 @@ def test_opencode_timeout_path_also_triggers_resume(tmp_path):
         "if '-s' in argv:\n"
         "    text = json.dumps({'answer': 7})\n"
         "    print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': text}}))\n"
-        "    print(json.dumps({'type': 'step_finish', 'reason': 'stop'}))\n"
+        f"    print({_step_finish('stop')!r})\n"
         "else:\n"
         "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_timeout'}), flush=True)\n"
         "    time.sleep(600)\n"
@@ -158,7 +184,7 @@ def test_opencode_resume_uses_launcher_start_new_session_and_rlimits(tmp_path):
         "if '-s' in argv:\n"
         "    text = json.dumps({'answer': 4})\n"
         "    print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': text}}))\n"
-        "    print(json.dumps({'type': 'step_finish', 'reason': 'stop'}))\n"
+        f"    print({_step_finish('stop')!r})\n"
         "else:\n"
         "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_abc123'}))\n"
     )
@@ -197,7 +223,7 @@ def test_opencode_resume_marker_records_nonzero_rc_discard(tmp_path, monkeypatch
         tmp_path, Path("/opt/opencode"), on_message=messages.append)
     resume_lines = [
         '{"type":"text","part":{"type":"text","text":"{\\"answer\\":4}"}}',
-        '{"type":"step_finish","reason":"stop"}',
+        _step_finish("stop"),
     ]
     saved = []
     monkeypatch.setattr(
@@ -219,7 +245,7 @@ def test_opencode_resume_marker_records_nonzero_rc_discard(tmp_path, monkeypatch
 
 def test_opencode_resume_marker_records_timeout_discard(tmp_path, monkeypatch):
     runner, _workdir = _resume_runner(tmp_path, Path("/opt/opencode"))
-    resume_lines = ['{"type":"step_finish","reason":"stop"}']
+    resume_lines = [_step_finish("stop")]
     saved = []
     monkeypatch.setattr(
         runner, "_run_cli_process",
@@ -237,7 +263,7 @@ def test_opencode_resume_marker_records_timeout_discard(tmp_path, monkeypatch):
 
 def test_opencode_resume_marker_records_finish_reason_discard(tmp_path, monkeypatch):
     runner, _workdir = _resume_runner(tmp_path, Path("/opt/opencode"))
-    resume_lines = ['{"type":"step_finish","reason":"max_tokens"}']
+    resume_lines = [_step_finish("max_tokens")]
     saved = []
     monkeypatch.setattr(
         runner, "_run_cli_process",
@@ -259,7 +285,7 @@ def test_opencode_resume_marker_records_accepted_recovery(tmp_path, monkeypatch)
         tmp_path, Path("/opt/opencode"), on_message=messages.append)
     resume_lines = [
         '{"type":"text","part":{"type":"text","text":"{\\"answer\\":4}"}}',
-        '{"type":"step_finish","reason":"stop"}',
+        _step_finish("stop"),
     ]
     saved = []
     monkeypatch.setattr(
@@ -280,7 +306,7 @@ def test_opencode_resume_marker_records_accepted_recovery(tmp_path, monkeypatch)
 
 def test_opencode_resume_transcript_preserves_stderr(tmp_path, monkeypatch):
     runner, _workdir = _resume_runner(tmp_path, Path("/opt/opencode"))
-    resume_lines = ['{"type":"step_finish","reason":"stop"}']
+    resume_lines = [_step_finish("stop")]
     saved = []
     monkeypatch.setattr(
         runner, "_run_cli_process",
@@ -308,7 +334,7 @@ def test_opencode_resume_nonzero_rc_is_rejected(tmp_path):
         "if '-s' in argv:\n"
         "    text = json.dumps({'answer': 4})\n"
         "    print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': text}}))\n"
-        "    print(json.dumps({'type': 'step_finish', 'reason': 'stop'}))\n"
+        f"    print({_step_finish('stop')!r})\n"
         "    sys.exit(1)\n"
         "else:\n"
         "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_rc'}))\n"
@@ -330,7 +356,7 @@ def test_opencode_resume_reason_not_stop_is_rejected(tmp_path):
         "if '-s' in argv:\n"
         "    text = json.dumps({'answer': 4})\n"
         "    print(json.dumps({'type': 'text', 'part': {'type': 'text', 'text': text}}))\n"
-        "    print(json.dumps({'type': 'step_finish', 'reason': 'max_tokens'}))\n"
+        f"    print({_step_finish('max_tokens')!r})\n"
         "else:\n"
         "    print(json.dumps({'type': 'step_start', 'sessionID': 'ses_reason'}))\n"
     )
@@ -434,5 +460,18 @@ def test_opencode_extract_output_fails_closed_when_no_text_event(tmp_path):
         llama_swap_base_url="http://127.0.0.1:1/v1",
         cli_terminate_grace_sec=0.3, registry=ToolRegistry())
     lines = ['{"type": "step_start", "part": {"type": "step-start"}}',
-             'not-json', '{"type": "step_finish"}']
+             'not-json', _step_finish(None)]
     assert runner._extract_output(lines, workdir) is None
+
+
+def test_opencode_last_step_finish_reason_rejects_fake_top_level_shape():
+    lines = [json.dumps({"type": "step_finish", "reason": "stop"})]
+    assert OpencodeRunner._last_step_finish_reason(lines) is None
+
+
+def test_opencode_last_step_finish_reason_reads_part_reason():
+    assert OpencodeRunner._last_step_finish_reason([_step_finish("stop")]) == "stop"
+
+
+def test_opencode_last_step_finish_reason_returns_none_when_part_reason_missing():
+    assert OpencodeRunner._last_step_finish_reason([_step_finish(None)]) is None
