@@ -1,6 +1,7 @@
 import pytest
 
 from agentic_fx.runners.response_parser import ParseError, parse_json_output
+from tests.runners.m30_fixture import M30_TEXT
 
 
 def test_plain_json():
@@ -84,3 +85,26 @@ def test_top_level_string_raises():
     """Fix 2: Top-level string is valid JSON but not dict → ParseError"""
     with pytest.raises(ParseError):
         parse_json_output('"just a string"')
+
+
+IMPROVE_KEYS = frozenset({"discoveries", "selected", "artifact"})
+
+
+def test_prefer_keys_selects_final_object_from_real_m30_text():
+    result = parse_json_output(M30_TEXT, prefer_keys=IMPROVE_KEYS)
+    assert "discoveries" in result
+
+
+def test_real_m30_text_preserves_first_object_default():
+    assert parse_json_output(M30_TEXT) == {"candidates": []}
+
+
+def test_prefer_keys_without_match_returns_first_parseable_dict():
+    text = 'prefix {broken} then {"first": 1} then {"second": 2}'
+    assert parse_json_output(text, prefer_keys=frozenset({"missing"})) == {"first": 1}
+
+
+def test_prefer_keys_ignores_matching_object_after_64_object_cap():
+    text = " ".join([f'{{"index": {index}}}' for index in range(64)] +
+                    ['{"wanted": true}'])
+    assert parse_json_output(text, prefer_keys=frozenset({"wanted"})) == {"index": 0}

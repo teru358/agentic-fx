@@ -72,6 +72,8 @@ class OpencodeRunner(CliRunner):
         return {"PATH": "/usr/bin:/bin", "HOME": str(self._workdir / "home"), "TMPDIR": str(self._workdir / "tmp"), "TERM": "dumb", "PYTHONPATH": "", "PYTHONSAFEPATH": "1"}
 
     def _extract_output(self, stdout_lines: list[str], workdir: Path) -> dict[str, Any] | None:
+        from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA
+
         text = None
         for line in stdout_lines:
             try: event = json.loads(line)
@@ -81,7 +83,8 @@ class OpencodeRunner(CliRunner):
         if text is None: return None
         try: return json.loads(text)
         except (json.JSONDecodeError, ValueError):
-            try: return parse_json_output(text)
+            try: return parse_json_output(
+                text, prefer_keys=frozenset(IMPROVE_OUTPUT_SCHEMA["required"]))
             except ParseError: return None
 
     def _max_turns_semantics(self) -> Literal["passthrough", "ignored"]: return "ignored"

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 
 
 class ParseError(ValueError):
@@ -13,7 +14,7 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
-def _first_balanced_object(text: str) -> str | None:
+def _iter_balanced_objects(text: str) -> Iterator[str]:
     start = text.find("{")
     while start != -1:
         depth = 0
@@ -34,12 +35,19 @@ def _first_balanced_object(text: str) -> str | None:
                 elif ch == "}":
                     depth -= 1
                     if depth == 0:
-                        return text[start:i + 1]
-        start = text.find("{", start + 1)
-    return None
+                        yield text[start:i + 1]
+                        start = text.find("{", i + 1)
+                        break
+        else:
+            start = text.find("{", start + 1)
 
 
-def parse_json_output(text: str) -> dict:
+def _first_balanced_object(text: str) -> str | None:
+    return next(iter(_iter_balanced_objects(text)), None)
+
+
+def parse_json_output(text: str, *,
+                      prefer_keys: frozenset[str] | None = None) -> dict:
     cleaned = _THINK_RE.sub("", text)
 
     # Fix 1: Discard everything from unclosed <think> to end
@@ -67,13 +75,31 @@ def parse_json_output(text: str) -> dict:
             pass
 
     # Try balanced object extraction (prose-embedded case)
-    candidate = _first_balanced_object(cleaned)
-    if candidate:
-        try:
-            obj = json.loads(candidate)
-            if isinstance(obj, dict):
+    if prefer_keys is None:
+        candidate = _first_balanced_object(cleaned)
+        if candidate:
+            try:
+                obj = json.loads(candidate)
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                pass
+    else:
+        fallback = None
+        for index, candidate in enumerate(_iter_balanced_objects(cleaned)):
+            if index == 64:
+                break
+            try:
+                obj = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if fallback is None:
+                fallback = obj
+            if prefer_keys <= obj.keys():
                 return obj
-        except json.JSONDecodeError:
-            pass
+        if fallback is not None:
+            return fallback
 
     raise ParseError(f"no parsable JSON object in: {text[:200]!r}")

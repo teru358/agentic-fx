@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agentic_fx.runners.base import Mission
 from agentic_fx.runners.opencode_runner import OpencodeRunner
+from tests.runners.m30_fixture import M30_TEXT_EVENT_LINE
 from agentic_fx.tools.registry import ToolRegistry
 
 
@@ -462,6 +463,13 @@ def test_opencode_extract_output_fails_closed_when_no_text_event(tmp_path):
     lines = ['{"type": "step_start", "part": {"type": "step-start"}}',
              'not-json', _step_finish(None)]
     assert runner._extract_output(lines, workdir) is None
+
+
+def test_opencode_extract_output_selects_final_object_from_real_m30_event(tmp_path):
+    runner, workdir = _runner(tmp_path)
+    result = runner._extract_output([M30_TEXT_EVENT_LINE], workdir)
+    assert result is not None
+    assert "discoveries" in result
 
 
 def test_opencode_last_step_finish_reason_rejects_fake_top_level_shape():
