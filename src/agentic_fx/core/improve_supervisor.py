@@ -129,8 +129,17 @@ class ImproveSupervisor:
         mission, ctx, runner = self._improve_loop.prepare(
             slot_key=None, now=now)
         result = runner.run(mission)
-        self._improve_loop.commit(mission=mission, ctx=ctx, result=result,
-                                  now=self._clock.now())
+        try:
+            self._improve_loop.commit(
+                mission=mission, ctx=ctx, result=result, now=self._clock.now())
+        except Exception as exc:
+            _log.exception(
+                "improve commit raised for manual mission_id=%s — "
+                "compensating", ctx.mission_id)
+            self._improve_loop.compensate_commit_failure(
+                ctx=ctx, now=self._clock.now(), exc=exc,
+                slot_terminalize=True)
+            raise
         return ctx.mission_id
 
     def shutdown(self) -> None:
@@ -267,9 +276,18 @@ class ImproveSupervisor:
                 # on_ready 到達後 (= running へ遷移済み) の失敗、または
                 # 完走 — 通常の commit 終端へ渡す。retry しない (二重実行
                 # を避ける、コメント上部の区別どおり)。
-                self._improve_loop.commit(
-                    mission=mission, ctx=ctx, result=result,
-                    now=self._clock.now())
+                try:
+                    self._improve_loop.commit(
+                        mission=mission, ctx=ctx, result=result,
+                        now=self._clock.now())
+                except Exception as exc:
+                    _log.exception(
+                        "improve commit raised for slot %s/%s — compensating",
+                        period_key, k)
+                    self._improve_loop.compensate_commit_failure(
+                        ctx=ctx, now=self._clock.now(), exc=exc,
+                        slot_terminalize=True)
+                    raise
                 return
             # pre-ready 失敗 (on_ready 未到達) — I2b: 巻き戻し
             # (`_handle_pre_ready_failure`) は `commit()` より**前**に完了
@@ -278,9 +296,18 @@ class ImproveSupervisor:
             # 先に revert した `reserved` を commit の無条件終端が潰す
             # のを防ぐ (I2 の主害)。
             should_retry = self._handle_pre_ready_failure(period_key, k)
-            self._improve_loop.commit(
-                mission=mission, ctx=ctx, result=result,
-                now=self._clock.now(), slot_terminalize=False)
+            try:
+                self._improve_loop.commit(
+                    mission=mission, ctx=ctx, result=result,
+                    now=self._clock.now(), slot_terminalize=False)
+            except Exception as exc:
+                _log.exception(
+                    "improve pre-ready commit raised for slot %s/%s — "
+                    "compensating", period_key, k)
+                self._improve_loop.compensate_commit_failure(
+                    ctx=ctx, now=self._clock.now(), exc=exc,
+                    slot_terminalize=False)
+                raise
             if not should_retry:
                 return
             if self._stop_event.is_set():

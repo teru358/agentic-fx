@@ -390,6 +390,72 @@ class ImproveLoop:
             if getattr(self, "_conn_for_test", None) is None:
                 conn.close()
 
+    def compensate_commit_failure(
+            self, *, ctx: "ImproveRunContext", now: datetime,
+            exc: BaseException, slot_terminalize: bool = True) -> None:
+        """`commit()` 例外後に mission/run/(必要なら slot) を終端する。
+
+        失敗した `commit()` の接続は transaction 状態が不明なため再利用せず、
+        新しい write 接続上の `BEGIN IMMEDIATE` で補償する。mission の終端は
+        `finish_improve_mission()` の ``WHERE status='running'`` CAS に守られ、
+        既に終端済みなら補償は状態を上書きしないため冪等である。
+        補償自体の失敗は元の `commit()` 例外を置換しないよう握りつぶす。
+        """
+        conn = None
+        try:
+            self._activity.write(
+                Category.IMPROVE, "mission_failed",
+                f"mission={ctx.mission_id} status=failed "
+                f"reason=commit_crashed:{type(exc).__name__}:{str(exc)[:300]}")
+            try:
+                ctx.ledger.mark_discarded()
+            except Exception:
+                _log.exception(
+                    "ledger discard failed during commit compensation for "
+                    "mission_id=%s — continuing with DB terminalization",
+                    ctx.mission_id)
+            try:
+                self._delete_staging(ctx)
+            except Exception:
+                _log.exception(
+                    "staging deletion failed during commit compensation for "
+                    "mission_id=%s — continuing with DB terminalization",
+                    ctx.mission_id)
+
+            conn = self._db_write_conn_factory()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # `missions.recover_interrupted` と同じ selected backlog の
+                # 収束。関数自体は全 running mission を対象に別 tx を開始
+                # するため再利用せず、この mission の run だけに限定する。
+                conn.execute(
+                    "UPDATE improvement_backlog SET status='observation', "
+                    "last_result='interrupted', updated_at=? WHERE id=("
+                    "SELECT backlog_id FROM improvement_runs WHERE id=?"
+                    ") AND status='selected'",
+                    (now.isoformat(), ctx.run_id))
+                missions_store.finish_improve_mission(
+                    conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                    slot_key=ctx.slot_key if slot_terminalize else None,
+                    mission_status="failed", run_result=None, now=now,
+                    backlog_transition=None, commit=False)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        except Exception:
+            _log.exception(
+                "commit failure compensation itself failed for mission_id=%s "
+                "— preserving original commit exception", ctx.mission_id)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    _log.exception(
+                        "write connection close failed during commit "
+                        "compensation for mission_id=%s", ctx.mission_id)
+
     # precheck 2026-08-22 pass2: RB4 — Step 2a で定義した失敗するテストへの
     # 最小実装。8-I 節「プレースホルダ⇔戻り値キーの対応表 (B8)」の 17 項目
     # をそのまま埋める。self の属性には依存しない (Step 2a のテストが

@@ -12,7 +12,10 @@ from __future__ import annotations
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 from agentic_fx.core.improve_supervisor import ImproveSupervisor
 from agentic_fx.store import db as db_mod
@@ -131,3 +134,98 @@ def test_improve_supervisor_tick_skips_process_expired_approvals_when_stopped(
     sup.tick(NOW)
 
     assert calls == []
+
+
+class _CommitFailureRunner:
+    def __init__(self, result, *, call_on_ready=False, stop_event=None):
+        self.result = result
+        self.on_ready = None
+        self.call_on_ready = call_on_ready
+        self.stop_event = stop_event
+
+    def run(self, mission):
+        if self.call_on_ready:
+            self.on_ready({"type": "ready", "ok": True})
+        if self.stop_event is not None:
+            self.stop_event.set()
+        return self.result
+
+
+class _CommitFailureLoop:
+    def __init__(self, ctx, runner):
+        self.ctx = ctx
+        self.runner = runner
+        self.compensations = []
+
+    def prepare(self, *, slot_key, now, on_ready=None):
+        self.runner.on_ready = on_ready
+        return "mission", self.ctx, self.runner
+
+    def commit(self, **kwargs):
+        raise RuntimeError("boom")
+
+    def compensate_commit_failure(self, **kwargs):
+        self.compensations.append(kwargs)
+
+
+def _commit_failure_supervisor(tmp_path, *, stop_event=None):
+    stop_event = stop_event or threading.Event()
+    return ImproveSupervisor(
+        capacity=1, root=tmp_path, settings=_fake_settings(parallel=1),
+        clock=_FixedClock(NOW), db_path=tmp_path / "unused.db",
+        stop_event=stop_event)
+
+
+def test_submit_manual_compensates_commit_exception_and_reraises(tmp_path):
+    ctx = SimpleNamespace(mission_id=101)
+    loop = _CommitFailureLoop(
+        ctx, _CommitFailureRunner(type("Result", (), {"status": "completed"})()))
+    sup = _commit_failure_supervisor(tmp_path)
+    sup._improve_loop = loop
+
+    with pytest.raises(RuntimeError, match="boom"):
+        sup.submit_manual()
+
+    assert len(loop.compensations) == 1
+    assert loop.compensations[0]["ctx"] is ctx
+    assert loop.compensations[0]["slot_terminalize"] is True
+
+
+def test_launch_slot_running_path_compensates_commit_exception_and_reraises(
+        tmp_path, monkeypatch):
+    ctx = SimpleNamespace(mission_id=102)
+    runner = _CommitFailureRunner(
+        type("Result", (), {"status": "failed"})(), call_on_ready=True)
+    loop = _CommitFailureLoop(ctx, runner)
+    sup = _commit_failure_supervisor(tmp_path)
+    sup._improve_loop = loop
+    monkeypatch.setattr(
+        "agentic_fx.core.improve_supervisor.improve_waves.mark_running",
+        lambda *args, **kwargs: True)
+    sup._conn_for_test = object()
+
+    with pytest.raises(RuntimeError, match="boom"):
+        sup._launch_slot("2026-W36", 0)
+
+    assert len(loop.compensations) == 1
+    assert loop.compensations[0]["ctx"] is ctx
+    assert loop.compensations[0]["slot_terminalize"] is True
+
+
+def test_launch_slot_pre_ready_path_compensates_commit_exception_and_reraises(
+        tmp_path, monkeypatch):
+    stop_event = threading.Event()
+    ctx = SimpleNamespace(mission_id=103)
+    runner = _CommitFailureRunner(
+        type("Result", (), {"status": "failed"})(), stop_event=stop_event)
+    loop = _CommitFailureLoop(ctx, runner)
+    sup = _commit_failure_supervisor(tmp_path, stop_event=stop_event)
+    sup._improve_loop = loop
+    monkeypatch.setattr(sup, "_handle_pre_ready_failure", lambda *args: True)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        sup._launch_slot("2026-W36", 0)
+
+    assert len(loop.compensations) == 1
+    assert loop.compensations[0]["ctx"] is ctx
+    assert loop.compensations[0]["slot_terminalize"] is False
