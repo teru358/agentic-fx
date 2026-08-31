@@ -1274,6 +1274,11 @@ class ImproveLoop:
                 from agentic_fx.plugin import loader as plugin_loader
                 candidate_meta = plugin_loader._discover_one(
                     candidate_dir, artifact["name"])
+                if candidate_meta is None:
+                    self._finalize_gate_failed(
+                        conn, ctx=ctx, backlog_id=selection.backlog_id,
+                        reason="gate_failed:loader_rejected", now=now)
+                    return
                 try:
                     approval.assert_max_bars_within_limit(
                         candidate_meta, settings=self._settings)

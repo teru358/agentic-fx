@@ -97,6 +97,42 @@ def test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin(
     assert r["result"] == "approval"
 
 
+def test_commit_loader_rejection_becomes_gate_failed(
+        loop_full, conn, mission_and_run_fixture, tmp_path):
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    _write_candidate(staging_dir, "myind")
+    candidate_config = staging_dir / "myind" / "config.yaml"
+    candidate_config.write_text(candidate_config.read_text() + "warmup_bars: 5\n")
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
+        "analyze_corr": 60.0, "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    result = MissionResult(status="completed", output={
+        "discoveries": [], "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "artifact": {"type": "plugin", "name": "myind", "kind": "indicator",
+                     "self_test": "passed", "summary": "s"},
+        "selection_rationale": "r"}, transcript=[])
+
+    loop_full.commit(mission=mission, ctx=ctx, result=result,
+                     now=datetime(2026, 8, 22))
+
+    backlog = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert backlog["status"] == "observation"
+    assert backlog["last_result"] == "gate_failed:loader_rejected"
+    mission_row = conn.execute(
+        "SELECT status FROM missions WHERE id=?", (mission_id,)).fetchone()
+    assert mission_row["status"] == "completed"
+
+
 def test_commit_rolls_back_tx2_on_db_fault_between_gate_rows_and_approval(
         loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
     """レビュー1周目 I4: `_finalize_success` の Tx-2 本体 (台帳→gate rows→
