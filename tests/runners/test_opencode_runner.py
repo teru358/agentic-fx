@@ -278,6 +278,27 @@ def test_opencode_resume_marker_records_accepted_recovery(tmp_path, monkeypatch)
         "role": "system", "content": saved[0][0]}}]
 
 
+def test_opencode_resume_transcript_preserves_stderr(tmp_path, monkeypatch):
+    runner, _workdir = _resume_runner(tmp_path, Path("/opt/opencode"))
+    resume_lines = ['{"type":"step_finish","reason":"stop"}']
+    saved = []
+    monkeypatch.setattr(
+        runner, "_run_cli_process",
+        lambda *args, **kwargs: (False, 1, resume_lines, ["boom\n"]))
+    monkeypatch.setattr(
+        runner, "_save_transcript",
+        lambda stdout, stderr: saved.append((stdout, stderr)))
+
+    result = runner._recover_output(
+        _resume_mission(), ['{"sessionID":"ses_stderrmarker"}'], 10)
+
+    assert result is None
+    stdout, stderr = saved[0]
+    assert stderr == ["boom\n"]
+    marker = json.loads(stdout[0])
+    assert marker["stderr_tail"] == "boom\n"
+
+
 def test_opencode_resume_nonzero_rc_is_rejected(tmp_path):
     """M3 killer: 追撃 CLI が rc!=0 で終われば、text/step_finish が
     正しくても None (failed) にする。"""

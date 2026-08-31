@@ -161,7 +161,7 @@ class OpencodeRunner(CliRunner):
                 "-s", session_id]
         env = self._build_env(mission)
         resume_timeout = min(_RESUME_TIMEOUT_SEC, recovery_timeout_sec)
-        timed_out, rc, resume_lines, _stderr_chunks = self._run_cli_process(
+        timed_out, rc, resume_lines, stderr_chunks = self._run_cli_process(
             argv, env, timeout_sec=resume_timeout)
         step_finish_reason = self._last_step_finish_reason(resume_lines)
         if timed_out:
@@ -181,8 +181,9 @@ class OpencodeRunner(CliRunner):
             "step_finish_reason": step_finish_reason,
             "accepted": accepted,
             "discard_reason": discard_reason,
+            "stderr_tail": "".join(stderr_chunks)[-2000:],
         })
-        self._save_transcript([marker, *resume_lines], [])
+        self._save_transcript([marker, *resume_lines], stderr_chunks)
         self._on_message({"type": "event", "message": {
             "role": "system", "content": marker}})
         if timed_out or rc != 0:
