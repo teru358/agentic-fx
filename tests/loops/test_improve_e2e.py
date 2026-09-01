@@ -56,7 +56,7 @@ def _plugin_artifact(name: str, *, kind: str = "indicator",
                      self_test: str = "passed") -> dict:
     return {
         "discoveries": [{"idea": f"idea for {name}", "source": "agent",
-                         "evidence": "test evidence"}],
+                         "evidence": "test evidence", "kind": "task"}],
         "selected": {"backlog_id": None, "idea": f"idea for {name}"},
         "artifact": {"type": "plugin", "name": name, "kind": kind,
                     "self_test": self_test, "summary": f"{name} candidate"},
@@ -109,6 +109,16 @@ def test_compute_returns_value():
     from plugin import compute
     df = pd.DataFrame({"close": [1.0, 2.0, 3.0]})
     assert compute(df, {})["value"] == 3.0
+
+def test_compute_uses_latest_close():
+    import pandas as pd
+    from plugin import compute
+    assert compute(pd.DataFrame({"close": [4.0, 5.0]}), {})["value"] == 5.0
+
+def test_compute_accepts_single_row():
+    import pandas as pd
+    from plugin import compute
+    assert compute(pd.DataFrame({"close": [7.0]}), {})["value"] == 7.0
 """
 
 # strategy kind 用の候補 3 本 (D-15 是正: `test_strategy_below_evaluable_
@@ -138,6 +148,17 @@ def test_evaluate_returns_hold():
     from plugin import evaluate
     df = pd.DataFrame({"close": [1.0, 2.0, 3.0]})
     assert evaluate(df, {}, [], {})["action"] == "hold"
+
+def test_evaluate_has_rationale():
+    import pandas as pd
+    from plugin import evaluate
+    result = evaluate(pd.DataFrame({"close": [1.0]}), {}, [], {})
+    assert result["rationale"]
+
+def test_evaluate_ignores_optional_inputs():
+    import pandas as pd
+    from plugin import evaluate
+    assert evaluate(pd.DataFrame({"close": [1.0]}), {"x": 1}, ["s"], {"p": 2})["action"] == "hold"
 """
 
 # test_plugin.py が plugin.py の書き換えを試みる不合格候補 (§4.2-3e の主 pin と

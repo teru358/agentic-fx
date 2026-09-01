@@ -590,6 +590,12 @@ def test_improve_mission_timeout_sec_minimum_is_60():
         ImproveSettings(mission_timeout_sec=59)
 
 
+def test_improve_gate_default_requires_three_self_tests():
+    """個人 YAML に gate 節が無くても安全な下限を維持する。"""
+    from agentic_fx.config import ImproveSettings
+    assert ImproveSettings().gate.min_test_functions == 3
+
+
 def test_plugin_settings_pytest_timeout_sec_default():
     """6-A Step 1: pytest_timeout_sec の既定値が 300.0 であること。"""
     from agentic_fx.config import PluginSettings

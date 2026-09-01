@@ -113,12 +113,13 @@ IMPROVE_OUTPUT_SCHEMA: dict = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["idea", "source", "evidence"],
+                "required": ["idea", "source", "evidence", "kind"],
                 "additionalProperties": False,
                 "properties": {
                     "idea": {"type": "string"},
                     "source": {"type": "string", "enum": ["agent", "research"]},
                     "evidence": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["task", "fact"]},
                 },
             },
         },

@@ -103,7 +103,12 @@ def _backlog_section(conn: "sqlite3.Connection",
         if allowed_backlog_ids is not None:
             item["assigned"] = row["id"] in allowed_backlog_ids
         items.append(item)
-    return {"items": items}
+    notes = [
+        {"id": row["id"], "idea": row["idea"], "status": row["status"],
+         "attempts": row["attempts"], "last_result": row["last_result"]}
+        for row in backlog_mod.list_notes(conn)
+    ]
+    return {"items": items, "notes": notes}
 
 
 def _user_policy_section(root: Path) -> dict:

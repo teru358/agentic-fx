@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+import jsonschema
+
 # F-6 是正 (検収 task12): renameat2(2) の AT_FDCWD / RENAME_NOREPLACE。
 # x86_64 Linux の値 (Linux 3.15+ の ABI、glibc 2.28+ が libc wrapper を持つ)。
 _AT_FDCWD = -100
@@ -38,6 +40,7 @@ from agentic_fx.plugin.gate_pytest import (
     run_gate_pytest,
 )
 from agentic_fx.plugin import loader as plugin_loader
+from agentic_fx.plugin.noop_gate import count_self_test_functions, find_noop_copy
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.strategy_gate import evaluate_strategy_adoption_gate
 from agentic_fx.runners.base import Mission
@@ -517,7 +520,11 @@ class ImproveLoop:
                 f"{s['name']}({'on' if s['enabled'] else 'off'})"
                 for s in inv["news_sources"]) or "(なし)"),
             "risk_gate_summary": _dict_to_line(inv["risk_gate"]),
-            "backlog_table": _backlog_table(bl["items"]),
+            "backlog_table": (
+                "## 選べる課題 (backlog_id を selected に書けるのはここだけ)\n\n"
+                + _backlog_table(bl["items"])
+                + "\n\n## 既知の事実 (note、選択不可、context として参照)\n\n"
+                + (_backlog_table(bl["notes"]) if bl["notes"] else "(なし)")),
             "user_policy_tail": policy["tail"],
             "plugin_name_pattern": refs["plugin_name_pattern"],
             "plugin_contract_summary": refs["plugin_contract_summary"],
@@ -747,6 +754,30 @@ class ImproveLoop:
     def _inspect_output(self, output: dict, ctx: ImproveRunContext,
                         conn=None) -> _InspectionVerdict:
         artifact = output.get("artifact", {})
+        if artifact.get("type") == "plugin":
+            name = artifact.get("name", "")
+            # round2 M1 是正 (2026-08-29、verified-round2.md M1): `.match()`
+            # + `$` は末尾改行を受理する穴がある (`'foo\n'` が match する —
+            # probe 実測)。`fullmatch` に揃える。schema validate より前に置く
+            # のは、agent 由来の巨大 name を activity へ 240 文字も echo
+            # させないため (120 文字 cap、test_noncanonical_artifact_name_*)。
+            if not _PLUGIN_NAME_RE.fullmatch(name):
+                display_name = name[:120] + ("…" if len(name) > 120 else "")
+                return _InspectionVerdict(
+                    ok=False, reason=f"artifact.name {display_name!r} is not in "
+                                    "canonical form")
+        # 親側の二重防御: worker (local_runner/cli_runner) も validate するが、
+        # resume 回収経路や将来の runner 追加で抜けても kind 欠落等を
+        # output_invalid で止める。
+        try:
+            jsonschema.validate(output, IMPROVE_OUTPUT_SCHEMA)
+        except jsonschema.ValidationError as exc:
+            path = ".".join(str(part) for part in exc.absolute_path)
+            location = f" at {path}" if path else ""
+            message = exc.message[:240]
+            return _InspectionVerdict(
+                ok=False,
+                reason=f"output schema invalid{location}: {message}")
         atype = artifact.get("type")
         selected_id = output.get("selected", {}).get("backlog_id")
         if selected_id is not None:
@@ -768,15 +799,7 @@ class ImproveLoop:
                     f"mission={ctx.mission_id} backlog_id={selected_id}")
 
         if atype == "plugin":
-            name = artifact.get("name", "")
-            # round2 M1 是正 (2026-08-29、verified-round2.md M1): `.match()`
-            # + `$` は末尾改行を受理する穴がある (`'foo\n'` が match する —
-            # probe 実測)。`fullmatch` に揃える。
-            if not _PLUGIN_NAME_RE.fullmatch(name):
-                display_name = name[:120] + ("…" if len(name) > 120 else "")
-                return _InspectionVerdict(
-                    ok=False, reason=f"artifact.name {display_name!r} is not in "
-                                    "canonical form")
+            name = artifact.get("name", "")  # 正規形は冒頭で検査済み
             # staging_dir/<name> の dirfd+lstat 検査は 10.6 節 (plugin ゲート)
             # で実装する — ここでは name 正規形のみ (手順1の範囲)。
             return _InspectionVerdict(ok=True)
@@ -818,11 +841,14 @@ class ImproveLoop:
                 if inserted >= limit:
                     dropped += 1
                     continue
+                # Schema-valid mission output always has kind. The default keeps
+                # direct/internal callers compatible with pre-kind task records.
+                status = "note" if d.get("kind", "task") == "fact" else "open"
                 conn.execute(
                     "INSERT INTO improvement_backlog (idea, source, status, "
                     "created_at, updated_at, idea_norm) VALUES "
-                    "(?,?,'open',?,?,?)",
-                    (d["idea"], d.get("source", "agent"), now.isoformat(),
+                    "(?,?,?,?,?,?)",
+                    (d["idea"], d.get("source", "agent"), status, now.isoformat(),
                      now.isoformat(), idea_norm))
                 inserted += 1
             if dropped:
@@ -870,8 +896,8 @@ class ImproveLoop:
             conn.rollback()
             raise
 
-    def _run_plugin_gate(self, plugin_dir: Path, *,
-                         name: str) -> _PluginGateVerdict:
+    def _run_plugin_gate(self, plugin_dir: Path, *, name: str,
+                         source_snapshot_dir: Path) -> _PluginGateVerdict:
         # precheck 2026-08-22 wave2: T10-B14 T10-M5 T10-M6 T10-M7
         try:
             check_candidate_snapshot(plugin_dir)
@@ -891,6 +917,21 @@ class ImproveLoop:
         if meta is None:
             return _PluginGateVerdict(
                 passed=False, reason=f"loader_rejected: {reason}")
+
+        try:
+            noop_copy = find_noop_copy(
+                plugin_dir, source_snapshot_dir=source_snapshot_dir, name=name)
+        except SyntaxError:
+            return _PluginGateVerdict(passed=False, reason="plugin.py syntax error")
+        if noop_copy is not None:
+            return _PluginGateVerdict(
+                passed=False, reason=f"noop_copy_of:{noop_copy}")
+
+        test_count = count_self_test_functions(plugin_dir / "test_plugin.py")
+        minimum = self._settings.improve.gate.min_test_functions
+        if test_count < minimum:
+            return _PluginGateVerdict(
+                passed=False, reason=f"self_test_too_thin:{test_count}<{minimum}")
 
         try:
             result = run_gate_pytest(plugin_dir, settings=self._settings)
@@ -1341,7 +1382,8 @@ class ImproveLoop:
             if atype == "plugin":
                 candidate_dir = ctx.staging_dir / artifact["name"]
                 gate_verdict = self._run_plugin_gate(                  # 手順3
-                    candidate_dir, name=artifact["name"])
+                    candidate_dir, name=artifact["name"],
+                    source_snapshot_dir=ctx.source_snapshot_dir)
                 if not gate_verdict.passed:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,

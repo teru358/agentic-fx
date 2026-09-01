@@ -105,6 +105,16 @@ def test_list_open_excludes_selected_done_rejected(tmp_path):
     assert backlog.list_open(c) == []
 
 
+def test_note_is_not_open_or_selectable_and_is_listed_as_note(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    bid = backlog.add(c, "known constraint", "agent", NOW)
+    backlog.set_status(c, bid, "note", NOW)
+
+    assert backlog.list_open(c) == []
+    assert backlog.select_for_mission(c, bid, now=NOW) is False
+    assert [row["id"] for row in backlog.list_notes(c)] == [bid]
+
+
 def test_set_status_writes_last_result(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
     bid = backlog.add(c, "a", "user", NOW)

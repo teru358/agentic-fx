@@ -25,7 +25,9 @@ def _write_candidate(staging_dir: Path, name: str) -> None:
     (candidate_dir / "config.yaml").write_text(
         "kind: indicator\npairs: ['USDJPY']\ntimeframe: '1h'\n")
     (candidate_dir / "test_plugin.py").write_text(
-        "def test_x():\n    pass\n")
+        "def test_x():\n    pass\n"
+        "def test_y():\n    pass\n"
+        "def test_z():\n    pass\n")
 
 
 def test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin(
@@ -921,6 +923,40 @@ def test_finalize_gate_failed_sets_backlog_observation_with_reason(
     assert b["last_result"] == "gate_failed:pytest failed: boom"
     assert not staging_dir.exists()
     assert ledger._state == "DISCARDED"
+
+
+@pytest.mark.parametrize("gate_reason", [
+    "noop_copy_of:_examples/rsi_indicator",
+    "self_test_too_thin:1<3",
+])
+def test_finalize_gate_failed_preserves_new_gate_reason(
+        loop_min, conn, mission_and_run_fixture, tmp_path, gate_reason):
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    from agentic_fx.store import backlog as backlog_store
+    backlog_store.select_for_mission(
+        conn, backlog_id, now=datetime(2026, 8, 22), commit=True)
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id,
+        reason=f"gate_failed:{gate_reason}", now=datetime(2026, 8, 22))
+
+    row = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert row["status"] == "observation"
+    assert row["last_result"] == f"gate_failed:{gate_reason}"
+    activity_text = (tmp_path / "activity.log").read_text()
+    assert "gate_failed" in activity_text
+    assert f"reason=gate_failed:{gate_reason}" in activity_text
 
 
 def test_finalize_gate_failed_terminates_scheduler_wave_slot_as_done(

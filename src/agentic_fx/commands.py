@@ -25,7 +25,7 @@ _HELP = """コマンド一覧:
   reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
   improve                    手動 improve one-shot (全バックログ担当)
   improve add <idea text>    バックログへ課題を追加
-  backlog reject <id> / reopen <id>   バックログの手動操作
+  backlog reject <id> / reopen <id> / note <id>   バックログの手動操作
   policy add <text>          policy/directives.md へ追記
   stop                       graceful shutdown (シェルのみ)
 (Phase 2 で追加: news / model / mode / autopilot)"""
@@ -216,6 +216,22 @@ class Commands:
                 self.activity.write(Category.IMPROVE, "backlog_rejected",
                                     f"#{bid} via shell", ref_id=str(bid))
                 return f"backlog #{bid} を rejected にしました"
+            if cmd == "backlog" and len(args) == 2 and args[0] == "note":
+                bid = int(args[1])
+                row = self.conn.execute(
+                    "SELECT status FROM improvement_backlog WHERE id=?",
+                    (bid,)).fetchone()
+                if row is None:
+                    return f"backlog #{bid} は存在しません"
+                current_status = row["status"]
+                if current_status not in ("open", "observation"):
+                    return (f"backlog #{bid} は status={current_status} のため"
+                            f" note にできません (open|observation からのみ可)")
+                backlog.set_status(self.conn, bid, "note", self.clock.now(),
+                                   last_result="human_noted", commit=True)
+                self.activity.write(Category.IMPROVE, "backlog_noted",
+                                    f"#{bid} via shell", ref_id=str(bid))
+                return f"backlog #{bid} を note にしました"
             if cmd == "backlog" and len(args) == 2 and args[0] == "reopen":
                 bid = int(args[1])
                 # 検収 B3: reopen は done|rejected (終端) からのみ。

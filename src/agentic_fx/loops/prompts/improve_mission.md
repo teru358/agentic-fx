@@ -28,10 +28,9 @@
 - ニュースソース: {news_sources}
 - 現在の risk gate 設定: {risk_gate_summary}
 
-## バックログ
+## バックログと既知の事実
 
-open / observation の課題一覧です。担当分担がある場合は印が付いています
-(手動実行では印なし — 全件が対象)。
+選べる課題と、選択不可だが context として参照できる note です。
 
 {backlog_table}
 
@@ -67,6 +66,9 @@ open / observation の課題一覧です。担当分担がある場合は印が�
      content="...")`
    - `rel` は `plugin.py` / `config.yaml` / `test_plugin.py` の 3 値のみ。
      `name` は plugin 名そのもの (単一の名前。パスや `/` は不可)。
+   - example や配備済み plugin と code・config が両方同一の候補は gate で
+     `noop_copy_of` として不合格になる。必ず実質的な変更を含めること。
+   - `test_plugin.py` の `test_*` 関数は 3 本以上 (gate の下限)。
 3. **1 回の結果で課題を捨てないでください** — うまくいかなかった場合も
    `observation` として理由を残し、次回への申し送りにしてください。
 4. 出力は必ず下の「最終出力」の形式 (`discoveries` / `selected` /
@@ -86,7 +88,8 @@ open / observation の課題一覧です。担当分担がある場合は印が�
     {{
       "idea": "RSI の期間を 14 から 21 に伸ばしてダマシを減らす",
       "source": "research",
-      "evidence": "https://example.com/rsi-period-study の要約: ..."
+      "evidence": "https://example.com/rsi-period-study の要約: ...",
+      "kind": "task"
     }}
   ],
   "selected": {{
@@ -104,8 +107,9 @@ open / observation の課題一覧です。担当分担がある場合は印が�
 }}
 
 - `discoveries` は**オブジェクトの配列**です (文字列の配列ではない)。
-  各要素は `idea` / `source` (`agent` か `research`) / `evidence` の
-  3 キー。発見が無ければ `[]`。
+  各要素は `idea` / `source` (`agent` か `research`) / `evidence` / `kind`
+  の 4 キー。`kind` は `task` (実装できる変更) か `fact` (観察・制約の
+  記録。backlog には note として保存され選択対象外)。発見が無ければ `[]`。
 - `selected` も**オブジェクト**です。`backlog_id` は整数 (新規課題なら
   null)、`idea` は選んだ課題の説明文字列。
 - `artifact` は 3 形のいずれか:

@@ -223,6 +223,11 @@ class ResearchSettings(_Strict):
     user_agent: str = "agentic-fx/0.1 (+https://github.com/agentic-fx/agentic-fx)"
 
 
+class ImproveGateSettings(_Strict):
+    """Execution-free plugin gate thresholds applied before pytest."""
+    min_test_functions: int = Field(ge=0, default=3)
+
+
 class ImproveSettings(_Strict):
     parallel: int = Field(ge=1, le=4, default=1)
     mission_max_turns: int = Field(ge=1, default=200)
@@ -231,6 +236,7 @@ class ImproveSettings(_Strict):
     max_new_backlog_per_mission: int = Field(ge=1, default=20)
     backtest_rpc_timeout_sec: float = Field(gt=0, default=600)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
+    gate: ImproveGateSettings = Field(default_factory=ImproveGateSettings)
 
 
 class ScheduleSettings(_Strict):

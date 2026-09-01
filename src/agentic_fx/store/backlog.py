@@ -1,6 +1,6 @@
 """improvement_backlog CRUD + 状態機械 (設計書 §4.3、§8.1-27)。
 
-status: open | observation | selected | done | rejected。`observation` は
+status: open | observation | note | selected | done | rejected。`observation` は
 「1 回の結果で課題を悪いと判断しない」(R8) の受け皿 — 失敗・却下・標本不足は
 ここへ落ち、`list_open` (= open|observation) に残り続ける。
 
@@ -35,6 +35,11 @@ def list_open(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in conn.execute(
         "SELECT * FROM improvement_backlog WHERE status IN ('open','observation') "
         "ORDER BY id")]
+
+
+def list_notes(conn: sqlite3.Connection) -> list[dict]:
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM improvement_backlog WHERE status='note' ORDER BY id")]
 
 
 def set_status(conn: sqlite3.Connection, backlog_id: int, status: str,

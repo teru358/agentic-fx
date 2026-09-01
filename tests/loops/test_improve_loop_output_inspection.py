@@ -23,6 +23,21 @@ def test_plugin_artifact_requires_name_and_staging_checks(loop_and_ctx):
     assert "name" in verdict.reason
 
 
+def test_discovery_missing_kind_is_output_invalid(loop_and_ctx):
+    loop, ctx, conn = loop_and_ctx
+    output = {
+        "artifact": {"type": "observation", "reason": "x"},
+        "selected": {"backlog_id": None, "idea": "x"},
+        "discoveries": [{"idea": "fact", "source": "agent", "evidence": "e"}],
+        "selection_rationale": "x",
+    }
+
+    verdict = loop._inspect_output(output, ctx, conn=conn)
+
+    assert verdict.ok is False
+    assert "discoveries" in verdict.reason or "kind" in verdict.reason
+
+
 def test_plugin_artifact_name_with_trailing_newline_is_rejected(loop_and_ctx):
     """round2 D3 是正 (検収 acceptance-round2.md D3): `_inspect_output`
     (improve_loop.py:689) の `artifact.name` 検査が `.fullmatch()` に

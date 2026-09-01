@@ -9,7 +9,8 @@ from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA
 
 def _valid_plugin_output():
     return {
-        "discoveries": [{"idea": "x", "source": "agent", "evidence": "y"}],
+        "discoveries": [{"idea": "x", "source": "agent", "evidence": "y",
+                         "kind": "task"}],
         "selected": {"backlog_id": None, "idea": "x"},
         "artifact": {"type": "plugin", "name": "rsi_v2", "kind": "indicator",
                     "self_test": "passed", "summary": "s"},
@@ -130,6 +131,13 @@ def test_artifact_plugin_variant_rejects_report_only_key():
 def test_discoveries_item_missing_evidence_is_rejected():
     out = _valid_plugin_output()
     del out["discoveries"][0]["evidence"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
+def test_discoveries_item_missing_kind_is_rejected():
+    out = _valid_plugin_output()
+    del out["discoveries"][0]["kind"]
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
 

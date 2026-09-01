@@ -293,7 +293,9 @@ def _sample_ctx_data():
             "risk_gate": {"max_positions": 3}},
         "backlog": {"items": [
             {"id": 2, "idea": "x", "status": "open", "attempts": 1,
-             "assigned": True}]},
+             "assigned": True}],
+            "notes": [{"id": 3, "idea": "market closes Friday",
+                       "status": "note", "attempts": 0}]},
         "user_policy": {"tail": "方針テキスト"},
         "references": {"plugin_name_pattern": "^[a-z][a-z0-9_]{0,63}$",
                        "plugin_contract_summary": "契約要約"},
@@ -331,6 +333,19 @@ def test_render_improve_mission_prompt_fills_all_placeholders(tmp_path):
         assert placeholder not in text, f"未展開のプレースホルダ: {placeholder}"
     assert str(tmp_path / "staging") in text
     assert str(tmp_path / "source") in text
+
+
+def test_render_prompt_separates_selectable_backlog_from_notes(tmp_path):
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    loop = ImproveLoop.__new__(ImproveLoop)
+    ctx = _FakeRunContext(tmp_path / "staging", tmp_path / "source")
+    text = loop._render_improve_mission_prompt(_sample_ctx_data(), ctx=ctx)
+
+    selectable, notes = text.split("## 既知の事実", 1)
+    assert "## 選べる課題" in selectable
+    assert "market closes Friday" not in selectable
+    assert "market closes Friday" in notes
 
 
 def test_render_improve_mission_prompt_fails_closed_on_missing_key(tmp_path):
@@ -910,6 +925,5 @@ def test_compensate_launch_failure_deletes_readonly_staging_dir(loop_no_seam):
     assert not staging_dir.exists(), (
         "compensate_launch_failure が readonly staging ディレクトリを"
         "削除していない")
-
 
 

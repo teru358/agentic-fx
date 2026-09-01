@@ -79,6 +79,9 @@ improve:
     max_per_host: 5
     fetch_max_bytes: 2097152
     user_agent: "agentic-fx/0.1 (+https://github.com/agentic-fx/agentic-fx)"
+  gate:
+    # plugin gate で要求する self-test (`test_*`) の最低本数。
+    min_test_functions: 3
 
 logging:
   level: INFO

@@ -217,6 +217,35 @@ def test_unknown_shows_help(tmp_path):
     assert "reflect retry" in out
 
 
+def test_backlog_note_transitions_open_and_writes_activity(tmp_path):
+    conn, _, activity, cmds = _commands(tmp_path)
+    conn.execute("INSERT INTO improvement_backlog "
+                 "(id, idea, source, status, created_at, updated_at) "
+                 "VALUES (5, 'fact', 'user', 'open', ?, ?)",
+                 (NOW.isoformat(), NOW.isoformat()))
+    conn.commit()
+
+    out = cmds.dispatch("backlog note 5")
+
+    assert "note" in out
+    assert conn.execute("SELECT status FROM improvement_backlog WHERE id=5").fetchone()[0] == "note"
+    assert any("backlog_noted" in row for row in activity.tail(10, Category.IMPROVE))
+
+
+def test_backlog_note_rejects_selected_row(tmp_path):
+    conn, _, _, cmds = _commands(tmp_path)
+    conn.execute("INSERT INTO improvement_backlog "
+                 "(id, idea, source, status, created_at, updated_at) "
+                 "VALUES (5, 'busy', 'user', 'selected', ?, ?)",
+                 (NOW.isoformat(), NOW.isoformat()))
+    conn.commit()
+
+    out = cmds.dispatch("backlog note 5")
+
+    assert "できません" in out
+    assert conn.execute("SELECT status FROM improvement_backlog WHERE id=5").fetchone()[0] == "selected"
+
+
 def test_transcript_json_not_leaked(tmp_path):
     """Regression: transcript_json (sensitive) must not appear in dispatch output."""
     conn, _, _, cmds = _commands(tmp_path)
