@@ -350,6 +350,14 @@ def test_check_source_rejects_pytest_importorskip(tmp_path):
         check_source(src, extra_allowed=frozenset({"pytest", "plugin"}))
 
 
+@pytest.mark.parametrize("fixture_name", ["capsys", "capfd", "capsysbinary", "capfdbinary"])
+def test_check_source_rejects_pytest_capture_fixtures(tmp_path, fixture_name):
+    src = tmp_path / "test_plugin.py"
+    src.write_text(f"def test_capture({fixture_name}): pass\n")
+    with pytest.raises(SandboxError):
+        check_source(src, extra_allowed=frozenset({"pytest", "plugin"}))
+
+
 def test_check_source_rejects_from_pytest_import_importorskip(tmp_path):
     """`from pytest import importorskip` のような別名バイパスも、裸 Name
     への束縛検査 (`_is_denied_bare_name`) で拒否される (F1 レビュー fix

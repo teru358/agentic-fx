@@ -26,6 +26,19 @@ from tests.backtest.test_analysis import (
 _ISO_DATETIME_LEAF_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
+def _write_loader_candidate(base, name, config):
+    candidate = base / name
+    candidate.mkdir()
+    (candidate / "plugin.py").write_text(
+        ("def evaluate(df, indicators, signals, params): return {'action': 'hold'}\n"
+         if config and "kind: strategy" in config
+         else "def compute(df, params): return {}\n"))
+    (candidate / "test_plugin.py").write_text("def test_placeholder(): pass\n")
+    if config is not None:
+        (candidate / "config.yaml").write_text(config)
+    return candidate
+
+
 def _walk_leaves(value):
     """dict/list を再帰展開して (キー列, 葉値列) を返す
     (`tests/backtest/test_analysis.py::_leaves` と同型 — B2 pin 専用に
@@ -65,10 +78,7 @@ def test_run_backtest_records_to_ledger_and_returns_handler_result():
 
 
 def test_run_backtest_guides_indicator_without_calling_handler(tmp_path):
-    candidate = tmp_path / "rsi_v2"
-    candidate.mkdir()
-    (candidate / "config.yaml").write_text(
-        "kind: indicator\n", encoding="utf-8")
+    _write_loader_candidate(tmp_path, "rsi_v2", "kind: indicator\n")
     calls = []
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
     tools = {t.name: t for t in build_improve_rpc_tooldefs(
@@ -86,10 +96,10 @@ def test_run_backtest_guides_indicator_without_calling_handler(tmp_path):
 
 
 def test_run_backtest_calls_handler_for_strategy_candidate(tmp_path):
-    candidate = tmp_path / "sma_cross_v2"
-    candidate.mkdir()
-    (candidate / "config.yaml").write_text(
-        "kind: strategy\n", encoding="utf-8")
+    _write_loader_candidate(
+        tmp_path, "sma_cross_v2",
+        "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\n"
+        "exit_mode: levels\nmax_bars: 200\n")
     calls = []
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
     tools = {t.name: t for t in build_improve_rpc_tooldefs(
@@ -103,19 +113,16 @@ def test_run_backtest_calls_handler_for_strategy_candidate(tmp_path):
 
 
 @pytest.mark.parametrize(("name", "config", "expected_error", "expected_kind"), [
-    ("missing", None, "config.yaml not found", None),
-    ("bad_yaml", "kind: [\n", "config.yaml unreadable", None),
-    ("missing_kind", "pairs: []\n", "kind missing", None),
-    ("non_str", "kind: 3\n", "kind must be str", 3),
+    ("missing", None, "loader_rejected: missing required files", None),
+    ("bad_yaml", "kind: [\n", "loader_rejected: invalid YAML", None),
+    ("missing_kind", "pairs: []\n", "loader_rejected: invalid kind: None", None),
+    ("non_str", "kind: 3\n", "loader_rejected: invalid kind", None),
     ("indicator", "kind: indicator\n",
      "run_backtest is only for kind=strategy candidates", "indicator"),
 ])
 def test_run_backtest_fails_closed_for_invalid_candidate_config(
         tmp_path, name, config, expected_error, expected_kind):
-    if config is not None:
-        candidate = tmp_path / name
-        candidate.mkdir()
-        (candidate / "config.yaml").write_text(config)
+    _write_loader_candidate(tmp_path, name, config)
     calls = []
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
     tools = {t.name: t for t in build_improve_rpc_tooldefs(
@@ -124,7 +131,7 @@ def test_run_backtest_fails_closed_for_invalid_candidate_config(
         analyze_corr_handler=lambda args: {})}
 
     out = tools["run_backtest"].func(name=name, pair="USDJPY")
-    assert out["error"] == expected_error
+    assert out["error"].startswith(expected_error)
     assert out["candidate_kind"] == expected_kind
     assert out["hint"]
     assert calls == []
@@ -138,7 +145,7 @@ def test_run_backtest_fails_closed_for_unsafe_candidate_name(tmp_path):
         run_backtest_handler=lambda args: calls.append(args) or {},
         analyze_corr_handler=lambda args: {})}
     out = tools["run_backtest"].func(name="../escape", pair="USDJPY")
-    assert out["error"] == "config.yaml not found"
+    assert out["error"] == "invalid candidate name"
     assert out["candidate_kind"] is None and out["hint"]
     assert calls == []
 

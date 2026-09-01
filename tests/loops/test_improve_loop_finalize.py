@@ -1333,3 +1333,35 @@ def test_report_path_deletes_staging_including_readonly_snapshot(
     assert (f"mission={mission_id} backlog={backlog_id} path={final_path}"
             f"\t{mission_id}") in activity_text
     assert "\tmission_observation\t" not in activity_text
+
+
+def test_report_publish_failure_does_not_log_published(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """2 周目 CR3 (実形状): `_publish_report` は rename 失敗で例外を出さず
+    `_fail_report` (report_state=failed) して False を返す。その経路で
+    `report_published` を書いてはならない。段 0 変異「publish 成否を無視」は
+    `_publish_report` を raise する mock で書いた旧版では生存した — 実経路
+    (final_path が既に存在 → RENAME_NOREPLACE が EEXIST) で踏む。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging-publish-fail"
+    staging_dir.mkdir()
+    ctx = _finalize_report_or_observation_ctx(
+        staging_dir, mission_id=mission_id, run_id=run_id)
+    loop_min._root = tmp_path
+    reports_dir = tmp_path / "data" / "improve_reports"
+    (reports_dir / ".tmp").mkdir(parents=True)
+    (reports_dir / ".tmp" / f"improve-{mission_id}.md.part").write_text("# r\n")
+    final_path = reports_dir / f"improve-{mission_id}.md"
+    final_path.write_text("# already there\n")  # rename_conflict を誘発
+
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
+        artifact={"type": "report"}, now=datetime(2026, 8, 22))
+
+    run = conn.execute(
+        "SELECT report_state FROM improvement_runs WHERE id=?",
+        (run_id,)).fetchone()
+    assert run["report_state"] == "failed"
+    activity_text = ((tmp_path / "activity.log").read_text()
+                     if (tmp_path / "activity.log").exists() else "")
+    assert "\treport_published\t" not in activity_text

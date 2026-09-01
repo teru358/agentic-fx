@@ -3629,8 +3629,17 @@ def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
     # 1 周目 I2 (2026-09-01): run_backtest tool は staging の config.yaml の
     # kind が strategy でないと RPC を呼ばず fail closed する。このテストは
     # 「RPC が親 handler に届くか」の配線検査なので strategy 候補を置く。
+    # 2 周目 CR6: wrapper は loader (discover_one_with_reason) で候補を検証
+    # するので、plugin.py / test_plugin.py と完全な strategy config が要る。
     (staging / "x").mkdir()
-    (staging / "x" / "config.yaml").write_text("kind: strategy\n", encoding="utf-8")
+    (staging / "x" / "config.yaml").write_text(
+        "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\n"
+        "exit_mode: levels\nmax_bars: 200\n", encoding="utf-8")
+    (staging / "x" / "plugin.py").write_text(
+        "def evaluate(df, indicators, signals, params): "
+        "return {'action': 'hold'}\n", encoding="utf-8")
+    (staging / "x" / "test_plugin.py").write_text(
+        "def test_placeholder(): pass\n", encoding="utf-8")
     source_snapshot = tmp_path / "source"
     source_snapshot.mkdir(mode=0o500)
 

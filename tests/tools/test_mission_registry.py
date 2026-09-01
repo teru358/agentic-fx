@@ -239,7 +239,14 @@ def test_build_mission_registry_improve_wires_rpc_handlers_by_tool_not_swapped(t
     source_snapshot_dir.mkdir()
     candidate_dir = staging_dir / "n"
     candidate_dir.mkdir()
-    (candidate_dir / "config.yaml").write_text("kind: strategy\n")
+    (candidate_dir / "config.yaml").write_text(
+        "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\n"
+        "exit_mode: levels\nmax_bars: 200\n")
+    (candidate_dir / "plugin.py").write_text(
+        "def evaluate(df, indicators, signals, params): "
+        "return {'action': 'hold'}\n")
+    (candidate_dir / "test_plugin.py").write_text(
+        "def test_placeholder(): pass\n")
 
     registry = build_mission_registry(
         "improve", conn, SETTINGS, _clock(), rag, activity=activity,

@@ -123,6 +123,7 @@ _DENY_NAMES = frozenset({
     "load", "loads", "loadtxt", "genfromtxt", "save", "savetxt", "savez",
     "memmap", "fromfile", "tofile", "pickle", "unpickle", "dump", "dumps",
     "ExcelWriter", "HDFStore", "importorskip",
+    "capsys", "capfd", "capsysbinary", "capfdbinary",
 })
 
 # `to_` 前綴りの属性は既定で禁止 (`to_csv`/`to_pickle`/`to_sql` 等の I/O
@@ -172,6 +173,9 @@ def check_source(path: Path, *, extra_allowed: frozenset[str] = frozenset()) -> 
         elif isinstance(node, ast.Name):
             if _is_denied_bare_name(node.id):
                 raise SandboxError(f"{path}: use of name {node.id!r} is not allowed")
+        elif isinstance(node, ast.arg):
+            if _is_denied_bare_name(node.arg):
+                raise SandboxError(f"{path}: argument {node.arg!r} is not allowed")
         elif isinstance(node, ast.Attribute):
             if _is_denied_bare_name(node.attr):
                 raise SandboxError(f"{path}: attribute {node.attr!r} is not allowed")

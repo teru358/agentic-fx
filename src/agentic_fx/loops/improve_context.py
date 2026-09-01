@@ -103,12 +103,14 @@ def _backlog_section(conn: "sqlite3.Connection",
         if allowed_backlog_ids is not None:
             item["assigned"] = row["id"] in allowed_backlog_ids
         items.append(item)
+    all_notes = list(reversed(backlog_mod.list_notes(conn)))
     notes = [
         {"id": row["id"], "idea": row["idea"], "status": row["status"],
          "attempts": row["attempts"], "last_result": row["last_result"]}
-        for row in backlog_mod.list_notes(conn)
+        for row in all_notes[:20]
     ]
-    return {"items": items, "notes": notes}
+    return {"items": items, "notes": notes,
+            "notes_omitted": max(0, len(all_notes) - len(notes))}
 
 
 def _user_policy_section(root: Path) -> dict:

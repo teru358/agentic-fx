@@ -47,9 +47,11 @@ def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
         comparisons.extend(
             (f"_examples/{item.name}", item)
             for item in sorted(examples.iterdir()) if item.is_dir())
-    deployed = source_snapshot_dir / name
-    if deployed.is_dir():
-        comparisons.append((name, deployed))
+    if source_snapshot_dir.is_dir():
+        comparisons.extend(
+            (item.name, item) for item in sorted(source_snapshot_dir.iterdir())
+            if item.is_dir() and not item.name.startswith("_")
+            and (item / "plugin.py").is_file())
 
     for label, comparison in comparisons:
         try:
@@ -63,7 +65,7 @@ def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
 
 
 def count_self_test_functions(path: Path) -> int:
-    """Count tests pytest collects by its default module/class name rules."""
+    """Approximately count tests using pytest's default function/class names."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     count = 0
     for node in tree.body:

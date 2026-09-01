@@ -442,7 +442,16 @@ def discover_one_with_reason(
     reasons: list[str] = []
     token = _reject_sink.set(reasons)
     try:
-        meta = _discover_one(entry, name)
+        missing = [f for f in REQUIRED_FILES if not (entry / f).is_file()]
+        if missing:
+            _reject(name, f"missing required files: {missing}")
+            meta = None
+        else:
+            try:
+                meta = _discover_one(entry, name)
+            except OSError as exc:
+                _reject(name, f"I/O error ({exc})")
+                meta = None
     finally:
         _reject_sink.reset(token)
     if meta is None:

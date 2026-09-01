@@ -54,7 +54,7 @@ def test_normalized_plugin_ast_detects_logic_change(tmp_path):
     ("def test_a(): pass\nclass Padding:\n def test_b(self): pass\n def test_c(self): pass\n def test_d(self): pass\n def test_e(self): pass\n def test_f(self): pass\n", 1),
     ("async def test_async(): pass\n", 1),
 ])
-def test_count_self_tests_matches_pytest_default_collection(tmp_path, source, expected):
+def test_count_self_tests_approximates_pytest_default_collection(tmp_path, source, expected):
     path = tmp_path / "test_plugin.py"
     path.write_text(source)
     assert count_self_test_functions(path) == expected
@@ -94,6 +94,14 @@ def test_find_noop_copy_compares_same_named_deployed_plugin(tmp_path):
                           name="candidate") == "candidate"
 
 
+def test_find_noop_copy_compares_differently_named_deployed_plugin(tmp_path):
+    source = _source_snapshot(tmp_path)
+    _write_candidate(source, "deployed")
+    candidate = _write_candidate(tmp_path / "staging", "candidate")
+    assert find_noop_copy(candidate, source_snapshot_dir=source,
+                          name="candidate") == "deployed"
+
+
 def test_find_noop_copy_requires_ast_match_even_when_config_matches(tmp_path):
     source = _source_snapshot(tmp_path)
     _write_candidate(source, "candidate")
@@ -118,17 +126,46 @@ def test_gate_rejects_example_copy_before_pytest(tmp_path, loop_min, monkeypatch
     pytest_gate.assert_not_called()
 
 
-def test_gate_rejects_too_few_self_tests_before_pytest(tmp_path, loop_min, monkeypatch):
+def test_gate_rejects_missing_self_tests_before_pytest(tmp_path, loop_min, monkeypatch):
     source = _source_snapshot(tmp_path)
-    candidate = _write_candidate(tmp_path / "staging", "candidate")
+    candidate = _write_candidate(tmp_path / "staging", "candidate", test_plugin=b"x = 1\n")
     pytest_gate = MagicMock()
     monkeypatch.setattr("agentic_fx.loops.improve_loop.run_gate_pytest", pytest_gate)
 
     verdict = loop_min._run_plugin_gate(
         candidate, name="candidate", source_snapshot_dir=source)
 
-    assert verdict.reason == "self_test_too_thin:1<3"
+    assert verdict.reason == "self_test_missing"
     pytest_gate.assert_not_called()
+
+
+def test_gate_accepts_one_parametrized_function_when_three_cases_pass(
+        tmp_path, loop_min, monkeypatch):
+    source = _source_snapshot(tmp_path)
+    candidate = _write_candidate(
+        tmp_path / "staging", "candidate",
+        test_plugin=b"import pytest\n@pytest.mark.parametrize('x', [1,2,3])\ndef test_x(x): assert x\n")
+    monkeypatch.setattr("agentic_fx.loops.improve_loop.run_gate_pytest", lambda *a, **k: GateResult(
+        passed=True, returncode=0, stdout_tail="3 passed in 0.1s", duration_sec=0.1))
+    assert loop_min._run_plugin_gate(candidate, name="candidate", source_snapshot_dir=source).passed
+
+
+def test_gate_uses_last_pytest_summary_shaped_line(tmp_path, loop_min, monkeypatch):
+    source = _source_snapshot(tmp_path)
+    candidate = _write_candidate(tmp_path / "staging", "candidate",
+        test_plugin=b"def test_x(): print('99 passed in 0.01s')\n")
+    monkeypatch.setattr("agentic_fx.loops.improve_loop.run_gate_pytest", lambda *a, **k: GateResult(
+        passed=True, returncode=0,
+        stdout_tail="99 passed in 0.01s\nnoise\n=== 3 passed in 0.1s ===", duration_sec=0.1))
+    gate = loop_min._settings.improve.gate
+    original_minimum = gate.min_test_functions
+    try:
+        object.__setattr__(gate, "min_test_functions", 50)
+        verdict = loop_min._run_plugin_gate(
+            candidate, name="candidate", source_snapshot_dir=source)
+        assert verdict.reason == "self_test_too_thin_collected:3<50"
+    finally:
+        object.__setattr__(gate, "min_test_functions", original_minimum)
 
 
 def test_gate_with_five_tests_and_material_change_reaches_pytest(

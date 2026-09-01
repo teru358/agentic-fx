@@ -314,6 +314,7 @@ def test_render_improve_mission_prompt_fills_all_placeholders(tmp_path):
     from agentic_fx.loops.improve_loop import ImproveLoop
 
     loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = SETTINGS
     ctx = _FakeRunContext(tmp_path / "staging", tmp_path / "source")
     text = loop._render_improve_mission_prompt(_sample_ctx_data(), ctx=ctx)
 
@@ -329,16 +330,18 @@ def test_render_improve_mission_prompt_fills_all_placeholders(tmp_path):
             "{news_sources}", "{risk_gate_summary}", "{backlog_table}",
             "{user_policy_tail}", "{plugin_name_pattern}",
             "{plugin_contract_summary}", "{staging_dir}",
-            "{source_snapshot_dir}"):
+            "{source_snapshot_dir}", "{min_test_functions}"):
         assert placeholder not in text, f"未展開のプレースホルダ: {placeholder}"
     assert str(tmp_path / "staging") in text
     assert str(tmp_path / "source") in text
+    assert "pytest が実際に通したテスト数 (`3` 本以上)" in text
 
 
 def test_render_prompt_separates_selectable_backlog_from_notes(tmp_path):
     from agentic_fx.loops.improve_loop import ImproveLoop
 
     loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = SETTINGS
     ctx = _FakeRunContext(tmp_path / "staging", tmp_path / "source")
     text = loop._render_improve_mission_prompt(_sample_ctx_data(), ctx=ctx)
 
@@ -355,6 +358,7 @@ def test_render_improve_mission_prompt_fails_closed_on_missing_key(tmp_path):
     from agentic_fx.loops.improve_loop import ImproveLoop
 
     loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = SETTINGS
     ctx = _FakeRunContext(tmp_path / "staging", tmp_path / "source")
     bad_ctx_data = _sample_ctx_data()
     del bad_ctx_data["references"]
@@ -925,5 +929,3 @@ def test_compensate_launch_failure_deletes_readonly_staging_dir(loop_no_seam):
     assert not staging_dir.exists(), (
         "compensate_launch_failure が readonly staging ディレクトリを"
         "削除していない")
-
-

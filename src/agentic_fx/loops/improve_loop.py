@@ -524,7 +524,10 @@ class ImproveLoop:
                 "## 選べる課題 (backlog_id を selected に書けるのはここだけ)\n\n"
                 + _backlog_table(bl["items"])
                 + "\n\n## 既知の事実 (note、選択不可、context として参照)\n\n"
-                + (_backlog_table(bl["notes"]) if bl["notes"] else "(なし)")),
+                + (_backlog_table(bl["notes"]) if bl["notes"] else "(なし)")
+                + (f"\n\n(他 {bl.get('notes_omitted', 0)} 件)"
+                   if bl.get("notes_omitted", 0) else "")),
+            "min_test_functions": self._settings.improve.gate.min_test_functions,
             "user_policy_tail": policy["tail"],
             "plugin_name_pattern": refs["plugin_name_pattern"],
             "plugin_contract_summary": refs["plugin_contract_summary"],
@@ -755,7 +758,7 @@ class ImproveLoop:
     def _inspect_output(self, output: dict, ctx: ImproveRunContext,
                         conn=None) -> _InspectionVerdict:
         artifact = output.get("artifact", {})
-        if artifact.get("type") == "plugin":
+        if isinstance(artifact, dict) and artifact.get("type") == "plugin":
             name = artifact.get("name", "")
             # round2 M1 是正 (2026-08-29、verified-round2.md M1): `.match()`
             # + `$` は末尾改行を受理する穴がある (`'foo\n'` が match する —
@@ -810,6 +813,32 @@ class ImproveLoop:
 
         return _InspectionVerdict(ok=True)
 
+    def _upsert_backlog_idea(self, conn, idea: str, source: str, kind: str,
+                             now: datetime) -> tuple[int, str]:
+        """Insert, reuse, or promote one normalized backlog idea."""
+        idea_norm = idea.strip().lower()
+        row = conn.execute(
+            "SELECT id,status FROM improvement_backlog WHERE idea_norm=? "
+            "ORDER BY id LIMIT 1", (idea_norm,)).fetchone()
+        if row is not None:
+            if row["status"] == "note" and kind == "task":
+                conn.execute(
+                    "UPDATE improvement_backlog SET status='open', "
+                    "last_result='promoted_from_note', updated_at=? WHERE id=?",
+                    (now.isoformat(), row["id"]))
+                if self._activity is not None:
+                    self._activity.write(Category.IMPROVE, "backlog_promoted",
+                                         f"#{row['id']} from note", str(row["id"]))
+                return row["id"], "promoted"
+            return row["id"], "existing"
+        status = "note" if kind == "fact" else "open"
+        cur = conn.execute(
+            "INSERT INTO improvement_backlog "
+            "(idea,source,status,created_at,updated_at,idea_norm) "
+            "VALUES (?,?,?,?,?,?)",
+            (idea, source, status, now.isoformat(), now.isoformat(), idea_norm))
+        return cur.lastrowid, "inserted"
+
     # precheck 2026-08-22 wave2: T10-B5 T10-M10 T10-M11
     def _select_and_bind(self, conn, output: dict, ctx: ImproveRunContext,
                          *, now: datetime) -> _SelectionOutcome:
@@ -835,23 +864,19 @@ class ImproveLoop:
             for d in output.get("discoveries", []):
                 idea_norm = _norm(d["idea"])
                 dup = conn.execute(
-                    "SELECT id FROM improvement_backlog WHERE "
+                    "SELECT id,status FROM improvement_backlog WHERE "
                     "idea_norm=?", (idea_norm,)).fetchone()
-                if dup is not None:
+                if dup is not None and not (
+                        dup["status"] == "note" and d.get("kind", "task") == "task"):
                     continue
                 if inserted >= limit:
-                    dropped += 1
-                    continue
-                # Schema-valid mission output always has kind. The default keeps
-                # direct/internal callers compatible with pre-kind task records.
-                status = "note" if d.get("kind", "task") == "fact" else "open"
-                conn.execute(
-                    "INSERT INTO improvement_backlog (idea, source, status, "
-                    "created_at, updated_at, idea_norm) VALUES "
-                    "(?,?,?,?,?,?)",
-                    (d["idea"], d.get("source", "agent"), status, now.isoformat(),
-                     now.isoformat(), idea_norm))
-                inserted += 1
+                    if dup is None:
+                        dropped += 1
+                        continue
+                _, action = self._upsert_backlog_idea(
+                    conn, d["idea"], d.get("source", "agent"),
+                    d.get("kind", "task"), now)
+                inserted += action == "inserted"
             if dropped:
                 self._activity.write(
                     Category.IMPROVE, "backlog_limit_exceeded",
@@ -861,32 +886,19 @@ class ImproveLoop:
             backlog_id = selected.get("backlog_id")
             if backlog_id is None:
                 selected_idea = selected.get("idea", "")
-                idea_norm = _norm(selected_idea)
-                row = conn.execute(
-                    "SELECT id FROM improvement_backlog WHERE "
-                    "idea_norm=? AND status IN ('open','observation')",
-                    (idea_norm,)).fetchone()
-                if row is None:
-                    # precheck 2026-08-22 wave2: T10-B5 — discoveries にも
-                    # 既存 backlog にも無い「新規 idea を選択」した場合は、
-                    # ここで improvement_backlog へ INSERT してから選ぶ
-                    # (docstring が謳う契約。test_new_idea_selected_creates_
-                    # and_binds_in_same_tx が要求する)。空文字は選択なしとして
-                    # 扱う (fail closed — 実在しない idea を勝者にしない)。
-                    if not selected_idea.strip():
-                        conn.commit()
-                        return _SelectionOutcome(won=False, backlog_id=None)
-                    # `selected` の新規 idea は選んだ本人が task と判断したもの
-                    # → kind 振り分けを通さず open (設計判断 2026-09-01)。
-                    cur = conn.execute(
-                        "INSERT INTO improvement_backlog (idea, source, status, "
-                        "created_at, updated_at, idea_norm) VALUES "
-                        "(?,?,'open',?,?,?)",
-                        (selected_idea, selected.get("source", "agent"),
-                         now.isoformat(), now.isoformat(), idea_norm))
-                    backlog_id = cur.lastrowid
-                else:
-                    backlog_id = row["id"]
+                if not selected_idea.strip():
+                    conn.commit()
+                    return _SelectionOutcome(won=False, backlog_id=None)
+                # precheck 2026-08-22 wave2: T10-B5 — discoveries にも既存
+                # backlog にも無い「新規 idea を選択」は INSERT してから選ぶ
+                # (test_new_idea_selected_creates_and_binds_in_same_tx)。空文字
+                # は上で選択なし扱い (fail closed)。2 周目 CR4: 同文の行が
+                # 既にあれば INSERT せずその行を使い、note なら task として
+                # open に昇格する (`_upsert_backlog_idea`)。`selected` の新規
+                # idea は選んだ本人が task と判断したもの → kind=task 固定。
+                backlog_id, _ = self._upsert_backlog_idea(
+                    conn, selected_idea, selected.get("source", "agent"),
+                    "task", now)
 
             won = backlog_store.select_for_mission(
                 conn, backlog_id, now=now, commit=False)
@@ -932,9 +944,8 @@ class ImproveLoop:
 
         test_count = count_self_test_functions(plugin_dir / "test_plugin.py")
         minimum = self._settings.improve.gate.min_test_functions
-        if test_count < minimum:
-            return _PluginGateVerdict(
-                passed=False, reason=f"self_test_too_thin:{test_count}<{minimum}")
+        if test_count == 0:
+            return _PluginGateVerdict(passed=False, reason="self_test_missing")
 
         try:
             result = run_gate_pytest(plugin_dir, settings=self._settings)
@@ -952,7 +963,15 @@ class ImproveLoop:
         # `3 passed, 2 skipped, 1 warning in 0.1s` の形も取る (カンマ続き) —
         # 末尾を `\b` にしないと後者が 0 扱いで誤 fail closed する。
         # 解析不能 (summary 無し) は 0 = fail closed。
-        match = re.search(r"(?:^|\s)(\d+) passed\b", result.stdout_tail)
+        # pytest summary is trusted only as the last summary-shaped line. Tests
+        # must not emit forged summary-shaped output after pytest's real summary.
+        summary = None
+        for line in reversed(result.stdout_tail.splitlines()):
+            cleaned = line.strip().strip("=").strip()
+            if re.fullmatch(r"(?:\d+ [a-z]+(?:, )?)+ in [\d.]+s", cleaned):
+                summary = cleaned
+                break
+        match = re.search(r"(?:^|, )(\d+) passed\b", summary or "")
         collected_count = int(match.group(1)) if match is not None else 0
         if collected_count < minimum:
             return _PluginGateVerdict(
@@ -1083,13 +1102,18 @@ class ImproveLoop:
         raise OSError(err, os.strerror(err), str(dst))
 
     def _publish_report(self, conn, *, run_id: int, part_path: Path,
-                        final_path: Path, now: datetime) -> None:
+                        final_path: Path, now: datetime) -> bool:
         """report outbox — rename 後に published へ遷移、fsync。
 
         F-6 是正 (検収 task12、設計書 §4.2 L389): 最終名への rename は
         `renameat2(RENAME_NOREPLACE)` で行う (`_rename_no_replace` 参照)。
         非対応環境 (非 Linux・古いカーネル) のみ、旧来の
-        exists+rename (TOCTOU 近似) にフォールバックする。"""
+        exists+rename (TOCTOU 近似) にフォールバックする。
+
+        戻り値: published に遷移したら True、rename 失敗で `_fail_report`
+        に落ちたら False (2 周目 CR3: 呼び出し元は True のときだけ
+        `report_published` activity を書く — 失敗時に「published」の痕跡を
+        残さない)。"""
         try:
             if not self._rename_no_replace(part_path, final_path):
                 # renameat2 非対応環境向けフォールバック (TOCTOU 近似 —
@@ -1101,17 +1125,18 @@ class ImproveLoop:
                 os.rename(part_path, final_path)
         except FileExistsError:
             self._fail_report(conn, run_id=run_id, now=now, reason="rename_conflict")
-            return
+            return False
         except OSError as exc:
             self._fail_report(conn, run_id=run_id, now=now,
                               reason=f"rename_failed:{exc}")
-            return
+            return False
         self._fsync_dir(final_path.parent)
         self._fsync_dir(part_path.parent)
         conn.execute(
             "UPDATE improvement_runs SET report_state='published' "
             "WHERE id=?", (run_id,))
         conn.commit()
+        return True
 
     def _fail_report(self, conn, *, run_id: int, now: datetime,
                      reason: str) -> None:
@@ -1280,18 +1305,21 @@ class ImproveLoop:
                         "last_result": f"approval_pending:{approval_id}"},
                     commit=False)
                 conn.commit()
-                # 成功系 activity は commit 成功後に書く (1 周目 F2、3 モデル
-                # 一致): tx 前に書くと rollback しても「成功」が activity に残る。
-                # 失敗系が tx 前に書くのは痕跡を残す意図で、成功系とは逆。
-                if self._activity is not None:
-                    self._activity.write(
-                        Category.IMPROVE, "approval_requested",
-                        f"mission={mission_id} backlog={backlog_id} "
-                        f"plugin={approval_payload['name']} "
-                        f"approval={approval_id}", str(mission_id))
             except BaseException:
                 conn.rollback()
                 raise
+            # 成功系 activity は commit 成功後に書く (1 周目 F2、3 モデル
+            # 一致): tx 前に書くと rollback しても「成功」が activity に残る。
+            # 失敗系が tx 前に書くのは痕跡を残す意図で、成功系とは逆。
+            # 2 周目 R2-1: try の外に置き `_finalize_report_or_observation` と
+            # 対称にする (write は非送出契約だが、万一の例外で commit 済みの
+            # 成功を補償経路が failed に上書きしないよう構造で保証)。
+            if self._activity is not None:
+                self._activity.write(
+                    Category.IMPROVE, "approval_requested",
+                    f"mission={mission_id} backlog={backlog_id} "
+                    f"plugin={approval_payload['name']} "
+                    f"approval={approval_id}", str(mission_id))
         # C6 裁定 (2026-08-28、束D検収 verified-local-round1.md §7、
         # 現状維持): 内側 tx は `except BaseException:` (rollback して
         # 必ず re-raise) だが、この外側の補償トリガーは意図的に
@@ -1587,14 +1615,7 @@ class ImproveLoop:
             conn.rollback()
             raise
         # 成功系 activity は commit 成功後 (1 周目 F2。`_finalize_success` と同じ理由)。
-        if self._activity is not None:
-            if report_path is not None:
-                self._activity.write(
-                    Category.IMPROVE, "report_published",
-                    f"mission={ctx.mission_id} backlog="
-                    f"{backlog_id if backlog_id is not None else '-'} "
-                    f"path={report_path}", str(ctx.mission_id))
-            else:
+        if self._activity is not None and report_path is None:
                 self._activity.write(
                     Category.IMPROVE, "mission_observation",
                     f"mission={ctx.mission_id} backlog="
@@ -1603,8 +1624,17 @@ class ImproveLoop:
         if report_path is not None:
             reports_dir = self._root / "data" / "improve_reports"
             part_path = reports_dir / ".tmp" / f"improve-{ctx.mission_id}.md.part"
-            self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
-                                 final_path=Path(report_path), now=now)
+            published = self._publish_report(
+                conn, run_id=ctx.run_id, part_path=part_path,
+                final_path=Path(report_path), now=now)
+            # 2 周目 CR3: rename 失敗 (`_fail_report` → report_state=failed) は
+            # 例外を出さず False で返るので、True のときだけ「published」を書く。
+            if published and self._activity is not None:
+                self._activity.write(
+                    Category.IMPROVE, "report_published",
+                    f"mission={ctx.mission_id} backlog="
+                    f"{backlog_id if backlog_id is not None else '-'} "
+                    f"path={report_path}", str(ctx.mission_id))
         # round2 #7 是正 (2026-08-29、verified-round2.md #7、設計逐語違反):
         # 設計 §4.2 手順9「承認申請を出した staging は残す。それ以外は
         # 削除。」— report/observation 経路は承認申請を出さないため、

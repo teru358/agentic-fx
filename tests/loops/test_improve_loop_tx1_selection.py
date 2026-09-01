@@ -82,6 +82,54 @@ def test_internal_discovery_missing_kind_defaults_to_open(
     assert row["status"] == "open"
 
 
+def test_task_discovery_promotes_matching_fact_note_without_duplicate(
+        loop_and_ctx_with_open_backlog):
+    loop, ctx, conn, selected_id = loop_and_ctx_with_open_backlog
+    now = datetime(2026, 8, 22)
+    conn.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea,source,status,created_at,updated_at,idea_norm) "
+        "VALUES ('same idea','agent','note',?,?, 'same idea')",
+        (now.isoformat(), now.isoformat()))
+    conn.commit()
+    output = {"discoveries": [{"idea": "same idea", "source": "agent",
+                               "evidence": "e", "kind": "task"}],
+              "selected": {"backlog_id": selected_id, "idea": "x"},
+              "artifact": {"type": "observation", "reason": "x"},
+              "selection_rationale": "x"}
+    loop._select_and_bind(conn, output, ctx, now=now)
+    rows = conn.execute(
+        "SELECT status,last_result FROM improvement_backlog WHERE idea_norm='same idea'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert dict(rows[0]) == {"status": "open", "last_result": "promoted_from_note"}
+
+
+def test_selected_new_idea_promotes_matching_note_and_selects_it(
+        loop_and_ctx_with_open_backlog):
+    loop, ctx, conn, _ = loop_and_ctx_with_open_backlog
+    now = datetime(2026, 8, 22)
+    cur = conn.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea,source,status,created_at,updated_at,idea_norm) "
+        "VALUES ('selected note','agent','note',?,?, 'selected note')",
+        (now.isoformat(), now.isoformat()))
+    note_id = cur.lastrowid
+    conn.commit()
+    output = {"discoveries": [],
+              "selected": {"backlog_id": None, "idea": "selected note"},
+              "artifact": {"type": "observation", "reason": "x"},
+              "selection_rationale": "x"}
+    outcome = loop._select_and_bind(conn, output, ctx, now=now)
+    assert outcome.won is True and outcome.backlog_id == note_id
+    row = conn.execute("SELECT status FROM improvement_backlog WHERE id=?",
+                       (note_id,)).fetchone()
+    assert row["status"] == "selected"
+    assert conn.execute(
+        "SELECT count(*) c FROM improvement_backlog WHERE idea_norm='selected note'"
+    ).fetchone()["c"] == 1
+
+
 def test_duplicate_idea_normalized_whitespace_and_case_is_deduped(
         loop_and_ctx_with_open_backlog):
     loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
@@ -254,7 +302,7 @@ def test_new_idea_selected_creates_and_binds_in_same_tx(loop_and_ctx_with_open_b
 # だった (`status IN (...)` を落とす変異が生存)。`status='done'` の同一
 # idea 行を置いた状態で新規 idea を selected に流し、既存 done 行を巻き
 # 戻さずに新規行が作られて won=True になることを固定する。
-def test_new_idea_selected_ignores_done_row_with_same_idea_norm(
+def test_selected_idea_reuses_done_row_without_duplicate_or_selection(
         loop_and_ctx_with_open_backlog):
     loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
     conn.execute(
@@ -272,15 +320,12 @@ def test_new_idea_selected_ignores_done_row_with_same_idea_norm(
               "selection_rationale": "x"}
     outcome = loop._select_and_bind(conn, output, ctx, now=datetime(2026, 8, 22))
 
-    assert outcome.won is True
+    assert outcome.won is False
     rows = conn.execute(
         "SELECT id, status FROM improvement_backlog WHERE idea='brand new idea'"
     ).fetchall()
-    assert len(rows) == 2  # 既存 done 行 + 新規 selected 行
-    by_id = {r["id"]: r["status"] for r in rows}
-    assert by_id[done_row["id"]] == "done"  # 既存 done 行は触られない
-    new_row_id = next(rid for rid in by_id if rid != done_row["id"])
-    assert by_id[new_row_id] == "selected"
+    assert len(rows) == 1
+    assert rows[0]["id"] == done_row["id"] and rows[0]["status"] == "done"
 
 
 def test_python_and_sql_idea_normalization_agree_on_internal_whitespace(

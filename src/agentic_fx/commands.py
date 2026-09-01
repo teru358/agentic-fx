@@ -244,11 +244,12 @@ class Commands:
                 if row is None:
                     return f"backlog #{bid} は存在しません"
                 current_status = row["status"]
-                if current_status not in ("done", "rejected"):
+                if current_status not in ("done", "rejected", "note"):
                     return (f"backlog #{bid} は status={current_status} のため"
-                            f" reopen できません (done|rejected からのみ可)")
+                            f" reopen できません (done|rejected|note からのみ可)")
                 backlog.set_status(self.conn, bid, "open", self.clock.now(),
-                                   last_result="reopened", commit=True)
+                                   last_result=("human_reopened" if current_status == "note"
+                                                else "reopened"), commit=True)
                 self.activity.write(Category.IMPROVE, "backlog_reopened",
                                     f"#{bid} via shell", ref_id=str(bid))
                 return f"backlog #{bid} を open に戻しました"

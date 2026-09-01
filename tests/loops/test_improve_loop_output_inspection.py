@@ -2,6 +2,15 @@
 (設計書 §4.2-0/1、プラン §8.1-42)。"""
 from __future__ import annotations
 
+
+def test_artifact_non_mapping_is_schema_invalid(loop_and_ctx):
+    loop_min, improve_ctx, _ = loop_and_ctx
+    output = {"discoveries": [], "selected": {"backlog_id": None, "idea": ""},
+              "artifact": "observation", "selection_rationale": "x"}
+    verdict = loop_min._inspect_output(output, improve_ctx)
+    assert verdict.ok is False
+    assert verdict.reason.startswith("output schema invalid")
+
 import pytest
 
 

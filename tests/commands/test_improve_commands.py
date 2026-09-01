@@ -101,6 +101,16 @@ def test_backlog_reopen_returns_done_to_open(commands):
     assert row["last_result"] == "reopened"
 
 
+def test_backlog_reopen_promotes_note_to_open(commands):
+    cmds, conn, _ = commands
+    now = datetime(2026, 8, 22)
+    bid = backlog.add(conn, "fact becoming task", "agent", now)
+    backlog.set_status(conn, bid, "note", now, last_result="human_noted")
+    assert "open" in cmds.dispatch(f"backlog reopen {bid}")
+    row = conn.execute("SELECT status,last_result FROM improvement_backlog WHERE id=?", (bid,)).fetchone()
+    assert dict(row) == {"status": "open", "last_result": "human_reopened"}
+
+
 def test_backlog_reopen_rejects_from_non_terminal_status(commands):
     """検収 B3 (2026-08-22): §4.3 の「done/rejected → open のみ」制約を
     commands.py 側の遷移ガードで強制する (反転 — 旧テストはガード不在を

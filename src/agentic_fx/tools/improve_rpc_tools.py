@@ -6,9 +6,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-import yaml
-
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.tools.improve_staging_tools import _safe_join
 from agentic_fx.tools.registry import ToolDef
 
@@ -67,29 +66,18 @@ def build_improve_rpc_tooldefs(
         analyze_corr_handler: Callable[[dict], dict],
         staging_dir: Path | None = None) -> list[ToolDef]:
     def run_backtest(name: str, pair: str) -> dict:
-        config_path = (_safe_join(staging_dir, name, "config.yaml")
-                       if staging_dir is not None else None)
         if staging_dir is not None:
-            candidate_kind = None
-            error = None
-            if config_path is None or not config_path.is_file():
-                error = "config.yaml not found"
-            else:
-                try:
-                    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeError, yaml.YAMLError):
-                    error = "config.yaml unreadable"
-                else:
-                    if not isinstance(config, dict) or "kind" not in config:
-                        error = "kind missing"
-                    else:
-                        candidate_kind = config["kind"]
-                        if not isinstance(candidate_kind, str):
-                            error = "kind must be str"
-                        elif candidate_kind != "strategy":
-                            error = "run_backtest is only for kind=strategy candidates"
-            if error is not None:
-                return {"error": error, "candidate_kind": candidate_kind,
+            candidate_dir = _safe_join(staging_dir, name)
+            if candidate_dir is None:
+                return {"error": "invalid candidate name", "candidate_kind": None,
+                        "hint": _RUN_BACKTEST_KIND_HINT}
+            meta, reason = plugin_loader.discover_one_with_reason(candidate_dir, name)
+            if meta is None:
+                return {"error": f"loader_rejected: {reason}", "candidate_kind": None,
+                        "hint": _RUN_BACKTEST_KIND_HINT}
+            if meta.kind != "strategy":
+                return {"error": "run_backtest is only for kind=strategy candidates",
+                        "candidate_kind": meta.kind,
                         "hint": _RUN_BACKTEST_KIND_HINT}
         result = run_backtest_handler({"name": name, "pair": pair})
         ledger.record(opaque_ref=f"run_backtest:{name}:{pair}",

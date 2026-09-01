@@ -68,7 +68,7 @@
      `name` は plugin 名そのもの (単一の名前。パスや `/` は不可)。
    - example や配備済み plugin と code・config が両方同一の候補は gate で
      `noop_copy_of` として不合格になる。必ず実質的な変更を含めること。
-   - `test_plugin.py` の `test_*` 関数は 3 本以上 (gate の下限)。
+   - gate は pytest が実際に通したテスト数 (`{min_test_functions}` 本以上) で判定。
 3. **1 回の結果で課題を捨てないでください** — うまくいかなかった場合も
    `observation` として理由を残し、次回への申し送りにしてください。
 4. 出力は必ず下の「最終出力」の形式 (`discoveries` / `selected` /

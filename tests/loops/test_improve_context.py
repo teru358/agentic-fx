@@ -50,6 +50,19 @@ def test_backlog_section_no_partition_mark_for_manual_wave(tmp_path):
     assert "assigned" not in item
 
 
+def test_backlog_notes_are_newest_twenty_with_omission_count(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    ids = []
+    for i in range(25):
+        bid = backlog.add(c, f"note-{i}", "agent", NOW)
+        backlog.set_status(c, bid, "note", NOW, last_result="human_noted")
+        ids.append(bid)
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
+                                allowed_backlog_ids=None)
+    assert [n["id"] for n in ctx["backlog"]["notes"]] == list(reversed(ids))[:20]
+    assert ctx["backlog"]["notes_omitted"] == 5
+
+
 def test_backlog_section_includes_attempts_and_trial_count(tmp_path):
     """§3.2「各バックログ課題の試行回数と、strategy なら標本 (取引数) を
     添える (R8)」。"""
