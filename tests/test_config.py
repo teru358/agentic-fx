@@ -34,6 +34,22 @@ def test_opencode_is_improve_only_and_codex_llama_swap_is_rejected():
     raw["runner"]["trade"]["backend"] = "opencode"
     with pytest.raises(ValidationError, match="opencode"):
         Settings.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("backend", "context_limit", "valid"),
+    [("opencode", 0, False), ("opencode", 65536, True), ("local", 0, True)],
+)
+def test_opencode_context_limit_is_required_only_for_opencode(
+        backend, context_limit, valid):
+    raw = load_settings(EXAMPLE).model_dump()
+    raw["runner"]["improve"]["backend"] = backend
+    raw["runner"]["opencode"]["context_limit"] = context_limit
+    if valid:
+        assert Settings.model_validate(raw).runner.opencode.context_limit == context_limit
+    else:
+        with pytest.raises(ValidationError, match="context_limit must be >0"):
+            Settings.model_validate(raw)
     raw = load_settings(EXAMPLE).model_dump()
     raw["runner"]["codex"]["provider"] = "llama_swap"
     with pytest.raises(ValidationError, match="namespace tools"):

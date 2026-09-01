@@ -88,6 +88,7 @@ class CodexCliSettings(_Strict):
 
 class OpencodeCliSettings(_Strict):
     bin: str = "~/.opencode/bin/opencode"
+    context_limit: int = 0
 
 
 class RunnerChoice(_Strict):
@@ -109,6 +110,16 @@ class RunnerSettings(_Strict):
             raise ValueError(
                 f"runner.trade.backend={self.trade.backend!r} is not allowed "
                 "(CLI backend cannot drop shell; trade worker has no Landlock)")
+        return self
+
+    @model_validator(mode="after")
+    def _opencode_context_limit_required(self) -> "RunnerSettings":
+        if (self.improve.backend == "opencode"
+                and self.opencode.context_limit <= 0):
+            raise ValueError(
+                "runner.opencode.context_limit must be >0 when "
+                "runner.improve.backend='opencode' (set it equal to "
+                "llama-swap --ctx-size for the model)")
         return self
 
 

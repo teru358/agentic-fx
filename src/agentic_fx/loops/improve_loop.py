@@ -1213,6 +1213,12 @@ class ImproveLoop:
                 approval_id = approvals_store.create(
                     conn, kind="plugin", payload=approval_payload, now=now,
                     commit=False)
+                if self._activity is not None:
+                    self._activity.write(
+                        Category.IMPROVE, "approval_requested",
+                        f"mission={mission_id} backlog={backlog_id} "
+                        f"plugin={approval_payload['name']} "
+                        f"approval={approval_id}", str(mission_id))
                 missions_store.finish_improve_mission(
                     conn, mission_id=mission_id, run_id=run_id,
                     slot_key=slot_key, mission_status="completed",
@@ -1497,6 +1503,19 @@ class ImproveLoop:
             # `unsupported_in_plan10:risk_gate` — `proposal_kind=='risk_gate'`
             # (本プラン未対応) のときの正規ラベル。
             observation_last_result = "unsupported_in_plan10:risk_gate"
+        if self._activity is not None:
+            if report_path is not None:
+                self._activity.write(
+                    Category.IMPROVE, "report_published",
+                    f"mission={ctx.mission_id} backlog="
+                    f"{backlog_id if backlog_id is not None else '-'} "
+                    f"path={report_path}", str(ctx.mission_id))
+            else:
+                self._activity.write(
+                    Category.IMPROVE, "mission_observation",
+                    f"mission={ctx.mission_id} backlog="
+                    f"{backlog_id if backlog_id is not None else '-'} "
+                    f"reason={observation_last_result}", str(ctx.mission_id))
         conn.execute("BEGIN IMMEDIATE")
         try:
             missions_store.finish_improve_mission(

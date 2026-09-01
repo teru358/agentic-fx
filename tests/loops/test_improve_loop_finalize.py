@@ -244,6 +244,13 @@ def test_finalize_success_tx2_internal_seams_run_ledger_then_gate_then_approval_
         "approvals_store.create",
         "missions_store.finish_improve_mission",
     ]
+    approval_id = conn.execute(
+        "SELECT id FROM approval_requests WHERE kind='plugin'"
+    ).fetchone()[0]
+    activity_text = (loop_min._activity._path).read_text()
+    assert "\tIMPROVE\tapproval_requested\t" in activity_text
+    assert (f"mission={mission_id} backlog={backlog_id} plugin=x "
+            f"approval={approval_id}\t{mission_id}") in activity_text
 
 
 def test_finalize_success_persists_ledger_and_gate_rows_in_tx2(
@@ -1150,6 +1157,10 @@ def test_observation_artifact_records_reason_not_risk_gate_label(
         (run_id,)).fetchone()
     assert run["result"] is None
     assert run["report_state"] == "none"
+    activity_text = (tmp_path / "activity.log").read_text()
+    assert "\tIMPROVE\tmission_observation\t" in activity_text
+    assert (f"mission={mission_id} backlog={backlog_id} "
+            f"reason=observation:insufficient data\t{mission_id}") in activity_text
 
 
 def test_risk_gate_report_artifact_keeps_unsupported_label(
@@ -1215,3 +1226,7 @@ def test_report_path_deletes_staging_including_readonly_snapshot(
         (run_id,)).fetchone()
     assert run["result"] == "report"
     assert run["report_state"] == "published"
+    activity_text = (tmp_path / "activity.log").read_text()
+    assert "\tIMPROVE\treport_published\t" in activity_text
+    assert (f"mission={mission_id} backlog={backlog_id} path={final_path}"
+            f"\t{mission_id}") in activity_text

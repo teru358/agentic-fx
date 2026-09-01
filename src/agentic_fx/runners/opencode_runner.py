@@ -41,11 +41,13 @@ _SESSION_ID_RE = re.compile(r"^ses_[A-Za-z0-9]+$")
 class OpencodeRunner(CliRunner):
     """improve 専用。CLI に上限指定がないため max_turns は無視する。"""
     def __init__(self, *, bin_path: Path, model: str, workdir: Path,
-                 llama_swap_base_url: str, cli_terminate_grace_sec: float,
+                 llama_swap_base_url: str, context_limit: int,
+                 cli_terminate_grace_sec: float,
                  registry: ToolRegistry,
                  on_message: Callable[[dict], None] | None = None,
                  cli_started_sink: Callable[[int], None] | None = None) -> None:
         self._llama_swap_base_url = llama_swap_base_url
+        self._context_limit = context_limit
         super().__init__(bin_path=bin_path, model=model, workdir=workdir,
                          cli_terminate_grace_sec=cli_terminate_grace_sec,
                          registry=registry, on_message=on_message,
@@ -57,7 +59,7 @@ class OpencodeRunner(CliRunner):
         path.write_text(json.dumps({"provider": {"llama-swap": {
             "npm": "@ai-sdk/openai-compatible", "name": "llama-swap",
             "options": {"baseURL": self._llama_swap_base_url},
-            "models": {self._model: {"name": self._model, "limit": {"context": 131072, "output": 8192}}}}},
+            "models": {self._model: {"name": self._model, "limit": {"context": self._context_limit, "output": 8192}}}}},
             "mcp": {"afx": {"type": "local", "command": [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(mcp_socket)], "enabled": True}},
             # 組み込み tool は afx MCP 以外の全部を無効化 (実測: probe で bash が
             # tool_use イベント自体を出さなくなることを確認済み)。MCP 側は

@@ -22,6 +22,7 @@ def _runner(tmp_path):
     return OpencodeRunner(bin_path=Path("/opt/opencode"), model="qwen-test",
                           workdir=workdir,
                           llama_swap_base_url="http://localhost:8080/v1",
+                          context_limit=65536,
                           cli_terminate_grace_sec=1, registry=ToolRegistry()), workdir
 
 
@@ -62,6 +63,7 @@ def _resume_runner(tmp_path: Path, bin_path: Path, **over):
     workdir = tmp_path / "wd"; workdir.mkdir(exist_ok=True)
     kw = dict(bin_path=bin_path, model="qwen-test", workdir=workdir,
               llama_swap_base_url="http://localhost:8080/v1",
+              context_limit=65536,
               cli_terminate_grace_sec=0.3, registry=ToolRegistry())
     kw.update(over)
     return OpencodeRunner(**kw), workdir
@@ -425,7 +427,7 @@ def test_opencode_argv_writes_self_contained_mcp_provider_config(tmp_path):
     assert argv == ["/opt/opencode", "run", "reply", "--format", "json", "--pure",
                     "-m", "llama-swap/qwen-test", "--dir", str(workdir)]
     assert config["provider"]["llama-swap"]["options"]["baseURL"] == "http://localhost:8080/v1"
-    assert config["provider"]["llama-swap"]["models"]["qwen-test"]["limit"] == {"context": 131072, "output": 8192}
+    assert config["provider"]["llama-swap"]["models"]["qwen-test"]["limit"] == {"context": 65536, "output": 8192}
     assert config["mcp"]["afx"]["command"] == [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(workdir / "afx.sock")]
     assert config["tools"] == {
         "bash": False, "read": False, "write": False, "edit": False, "patch": False,
@@ -459,6 +461,7 @@ def test_opencode_extract_output_fails_closed_when_no_text_event(tmp_path):
     runner = OpencodeRunner(
         bin_path=Path("/usr/bin/true"), model="m", workdir=workdir,
         llama_swap_base_url="http://127.0.0.1:1/v1",
+        context_limit=65536,
         cli_terminate_grace_sec=0.3, registry=ToolRegistry())
     lines = ['{"type": "step_start", "part": {"type": "step-start"}}',
              'not-json', _step_finish(None)]

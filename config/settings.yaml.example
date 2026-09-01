@@ -34,6 +34,7 @@ runner:
     auth_file: ~/.codex/auth.json
   opencode:
     bin: ~/.opencode/bin/opencode
+    context_limit: 0   # opencode backend を使うときは必ず llama-swap の --ctx-size (= ~/.config/opencode/opencode.jsonc の limit.context) と同じ値に書き換える。0 のままだと起動拒否。モデルを切り替えたら同時に更新
   cli_terminate_grace_sec: 10.0
 
 backtest:                      # コア所有 (§6) — holdout_months の変更は人間レビュー必須

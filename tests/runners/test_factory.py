@@ -10,7 +10,9 @@ import pytest
 
 from agentic_fx.runners.base import AgentRunner
 from agentic_fx.runners.factory import build_runner
-from agentic_fx.config import Settings, RunnerChoice, RunnerSettings, ClaudeCliSettings, CodexCliSettings
+from agentic_fx.config import (Settings, RunnerChoice, RunnerSettings,
+                               ClaudeCliSettings, CodexCliSettings,
+                               OpencodeCliSettings)
 from agentic_fx.tools.registry import ToolRegistry
 
 
@@ -45,6 +47,7 @@ def _settings_with_backend(trade_backend="local", improve_backend="local") -> Se
     s.runner.improve = RunnerChoice(backend=improve_backend, model="test-model")
     s.runner.claude = ClaudeCliSettings()
     s.runner.codex = CodexCliSettings(bin="/tmp/codex-bin")
+    s.runner.opencode = OpencodeCliSettings(context_limit=65536)
     s.runner.cli_terminate_grace_sec = 10.0
     s.llama_swap = MagicMock()
     s.llama_swap.base_url = "http://localhost:8080/v1"
@@ -157,7 +160,9 @@ def test_build_runner_opencode_forwards_base_url(tmp_path, monkeypatch):
     settings = settings.model_copy(update={
         "runner": settings.runner.model_copy(update={
             "improve": settings.runner.improve.model_copy(
-                    update={"backend": "opencode"})})})
+                    update={"backend": "opencode"}),
+            "opencode": settings.runner.opencode.model_copy(
+                    update={"context_limit": 65536})})})
     build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
     assert captured["llama_swap_base_url"] == settings.llama_swap.base_url
     # 検収実測 (2026-08-30): 既定 bin "~/.opencode/bin/opencode" のチルダを
@@ -165,6 +170,18 @@ def test_build_runner_opencode_forwards_base_url(tmp_path, monkeypatch):
     # factory が expanduser 済みの絶対パスを渡すことを pin する。
     assert "~" not in str(captured["bin_path"])
     assert Path(captured["bin_path"]).is_absolute()
+    assert captured["context_limit"] == 65536
+
+
+def test_build_runner_rejects_unvalidated_opencode_context_limit(
+        tmp_path, monkeypatch):
+    _install_fake_cli_runner_module(
+        monkeypatch, "agentic_fx.runners.opencode_runner", "OpencodeRunner")
+    settings = _settings_with_backend(improve_backend="opencode")
+    settings.runner.opencode = settings.runner.opencode.model_copy(
+        update={"context_limit": 0})
+    with pytest.raises(ValueError, match="context_limit must be >0"):
+        build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
 
 
 def test_build_runner_trade_profile_uses_trade_choice(tmp_path):

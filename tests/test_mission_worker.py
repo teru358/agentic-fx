@@ -621,6 +621,8 @@ def _settings_with_improve_backend(backend):
         "runner": settings.runner.model_copy(update={
             "improve": settings.runner.improve.model_copy(
                 update={"backend": backend}),
+            "opencode": settings.runner.opencode.model_copy(
+                update={"context_limit": 65536}),
         }),
     })
 

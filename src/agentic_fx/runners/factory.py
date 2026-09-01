@@ -52,12 +52,21 @@ def build_runner(
             registry=registry, on_message=on_message)
     if choice.backend == "opencode":
         from agentic_fx.runners.opencode_runner import OpencodeRunner
+        # verify_backend は model_copy(update={"backend": backend}) で backend
+        # を上書きし、Pydantic validator を再実行しない。設定 validator を
+        # 迂回した経路でも未設定の context 窓を runner へ通さない二重の柵。
+        if settings.runner.opencode.context_limit <= 0:
+            raise ValueError(
+                "runner.opencode.context_limit must be >0 when opencode "
+                "backend is selected (set it equal to llama-swap --ctx-size "
+                "for the model)")
         return OpencodeRunner(
             # 既定値が "~/.opencode/bin/opencode" (チルダ入り) のため展開が
             # 必須 — launcher は argv[0] が絶対パスでないと拒否する (検収
             # 実測 2026-08-30: 未展開だと handshake failed で即死)
             bin_path=Path(settings.runner.opencode.bin).expanduser(),
             model=choice.model,
+            context_limit=settings.runner.opencode.context_limit,
             workdir=workdir, llama_swap_base_url=settings.llama_swap.base_url,
             cli_terminate_grace_sec=settings.runner.cli_terminate_grace_sec,
             registry=registry, on_message=on_message,

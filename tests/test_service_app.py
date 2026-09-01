@@ -2806,7 +2806,7 @@ def test_build_app_opencode_does_not_require_credentials(
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
     root = _root_with_settings(tmp_path, runner={
         "improve": {"backend": "opencode", "model": "m"},
-        "opencode": {"bin": vendor_codex}},
+        "opencode": {"bin": vendor_codex, "context_limit": 65536}},
         improve={"llama_swap_verified": True})
     build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())  # 例外を出さない
 
@@ -3076,7 +3076,7 @@ def test_build_app_rejects_opencode_when_not_verified(tmp_path):
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
     root = _root_with_settings(tmp_path, runner={
         "improve": {"backend": "opencode", "model": "m"},
-        "opencode": {"bin": vendor_codex}})
+        "opencode": {"bin": vendor_codex, "context_limit": 65536}})
     with pytest.raises(RuntimeError, match="llama_swap_verified"):
         build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
@@ -3245,7 +3245,7 @@ def test_build_app_rewrites_relative_codex_bin_to_absolute_path(tmp_path, monkey
         mp.setenv("PATH", f"{bin_dir}:{old_path}")
         root = _root_with_settings(tmp_path, runner={
             "improve": {"backend": "opencode", "model": "m"},
-            "opencode": {"bin": "afx-fake-codex"}},
+            "opencode": {"bin": "afx-fake-codex", "context_limit": 65536}},
             improve={"llama_swap_verified": True})
         app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
         try:
@@ -3276,7 +3276,7 @@ def test_check_service_initial_env_has_no_secrets_is_called_for_opencode_backend
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
     root = _root_with_settings(tmp_path, runner={
         "improve": {"backend": "opencode", "model": "m"},
-        "opencode": {"bin": vendor_codex}},
+        "opencode": {"bin": vendor_codex, "context_limit": 65536}},
         improve={"llama_swap_verified": True})
     with pytest.raises(RuntimeError, match="API_KEY"):
         build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
