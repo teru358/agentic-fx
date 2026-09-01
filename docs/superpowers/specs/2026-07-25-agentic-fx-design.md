@@ -419,7 +419,7 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 
 ### 改善バックログ
 
-- SQLite `improvement_backlog` テーブル。source: `user` / `agent` / `research`、status: `open` / `selected` / `done` / `rejected`
+- SQLite `improvement_backlog` テーブル。source: `user` / `agent` / `research`、status: `open` / `observation` / `selected` / `note` / `done` / `rejected`。`observation` は 1 回の結果だけで課題を捨てない受け皿。`note` は選択対象にならない事実の記録で、`backlog note <id>` または `discoveries.kind=fact` から入る
 - ユーザーは `improve add "アイデア"` (対話シェル / client.py) でいつでも投入できる (収集へのユーザー入力受付)
 
 ### 許可ツール

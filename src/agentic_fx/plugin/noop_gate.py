@@ -35,6 +35,9 @@ def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
     config can be a substantive plugin candidate even when code is shared.
     Unreadable or invalid comparison targets are ignored; candidate errors are
     allowed to propagate to the gate that owns candidate validation.
+
+    AST 同一性は逐語コピー検出の下限。``pass`` 追加・注釈・import 順などの
+    無害変形は検出対象外 (設計判断 2026-09-01)。
     """
     candidate_ast = normalized_plugin_ast(plugin_dir / "plugin.py")
     candidate_config = _config_value(plugin_dir)
@@ -60,13 +63,13 @@ def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
 
 
 def count_self_test_functions(path: Path) -> int:
-    """Count module-level and class-contained ``test_*`` functions."""
+    """Count tests pytest collects by its default module/class name rules."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     count = 0
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             count += node.name.startswith("test_")
-        elif isinstance(node, ast.ClassDef):
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
             count += sum(
                 child.name.startswith("test_")
                 for child in node.body

@@ -237,6 +237,9 @@ def test_build_mission_registry_improve_wires_rpc_handlers_by_tool_not_swapped(t
     source_snapshot_dir = tmp_path / "source"
     staging_dir.mkdir()
     source_snapshot_dir.mkdir()
+    candidate_dir = staging_dir / "n"
+    candidate_dir.mkdir()
+    (candidate_dir / "config.yaml").write_text("kind: strategy\n")
 
     registry = build_mission_registry(
         "improve", conn, SETTINGS, _clock(), rag, activity=activity,

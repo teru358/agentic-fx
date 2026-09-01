@@ -128,6 +128,8 @@ def test_build_app_seeds_default_news_sources_idempotently(tmp_path):
                     embedding_fn=FakeEmbedding())
     try:
         assert len(news_sources.list_all(app.conn_core)) == len(DEFAULT_SOURCES)
+        assert sum("\tNEWS\tsources_seeded\t" in line
+                   for line in app.activity.tail(20)) == 1
         assert any("\tNEWS\tsources_seeded\t" in line and
                    f"\t{len(DEFAULT_SOURCES)} default sources\t" in line
                    for line in app.activity.tail(20))
@@ -138,6 +140,8 @@ def test_build_app_seeds_default_news_sources_idempotently(tmp_path):
                     embedding_fn=FakeEmbedding())
     try:
         assert len(news_sources.list_all(app.conn_core)) == len(DEFAULT_SOURCES)
+        assert sum("\tNEWS\tsources_seeded\t" in line
+                   for line in app.activity.tail(20)) == 1
     finally:
         app.close()
 

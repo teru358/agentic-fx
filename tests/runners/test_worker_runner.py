@@ -3626,6 +3626,11 @@ def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
 
     staging = tmp_path / "staging" / "rd2-real-probe"
     staging.mkdir(parents=True, mode=0o700)
+    # 1 周目 I2 (2026-09-01): run_backtest tool は staging の config.yaml の
+    # kind が strategy でないと RPC を呼ばず fail closed する。このテストは
+    # 「RPC が親 handler に届くか」の配線検査なので strategy 候補を置く。
+    (staging / "x").mkdir()
+    (staging / "x" / "config.yaml").write_text("kind: strategy\n", encoding="utf-8")
     source_snapshot = tmp_path / "source"
     source_snapshot.mkdir(mode=0o500)
 

@@ -68,6 +68,20 @@ def test_discovery_kind_controls_initial_backlog_status(
     assert row["status"] == expected_status
 
 
+def test_internal_discovery_missing_kind_defaults_to_open(
+        loop_and_ctx_with_open_backlog):
+    loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
+    output = {"discoveries": [{"idea": "legacy task", "source": "agent",
+                                "evidence": "e"}],
+              "selected": {"backlog_id": backlog_id, "idea": "x"},
+              "artifact": {"type": "observation", "reason": "x"},
+              "selection_rationale": "x"}
+    loop._select_and_bind(conn, output, ctx, now=datetime(2026, 8, 22))
+    row = conn.execute(
+        "SELECT status FROM improvement_backlog WHERE idea='legacy task'").fetchone()
+    assert row["status"] == "open"
+
+
 def test_duplicate_idea_normalized_whitespace_and_case_is_deduped(
         loop_and_ctx_with_open_backlog):
     loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog

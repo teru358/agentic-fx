@@ -142,6 +142,13 @@ def test_discoveries_item_missing_kind_is_rejected():
         jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
 
 
+def test_discoveries_item_note_kind_is_rejected():
+    out = _valid_plugin_output()
+    out["discoveries"][0]["kind"] = "note"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(out, IMPROVE_OUTPUT_SCHEMA)
+
+
 def test_selected_missing_backlog_id_is_rejected():
     out = _valid_plugin_output()
     del out["selected"]["backlog_id"]

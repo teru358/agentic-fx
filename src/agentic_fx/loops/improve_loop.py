@@ -876,6 +876,8 @@ class ImproveLoop:
                     if not selected_idea.strip():
                         conn.commit()
                         return _SelectionOutcome(won=False, backlog_id=None)
+                    # `selected` の新規 idea は選んだ本人が task と判断したもの
+                    # → kind 振り分けを通さず open (設計判断 2026-09-01)。
                     cur = conn.execute(
                         "INSERT INTO improvement_backlog (idea, source, status, "
                         "created_at, updated_at, idea_norm) VALUES "
@@ -943,6 +945,20 @@ class ImproveLoop:
         if not result.passed:
             return _PluginGateVerdict(
                 passed=False, reason=f"pytest failed: {result.stdout_tail}")
+
+        # 1 周目 I1: AST の事前カウントは名前規則の近似でしかない (pytest が
+        # 収集しない class 内でも数える等の水増しが可能)。真の下限は pytest の
+        # summary から取る。pytest -q の summary は `3 passed in 0.1s` のほか
+        # `3 passed, 2 skipped, 1 warning in 0.1s` の形も取る (カンマ続き) —
+        # 末尾を `\b` にしないと後者が 0 扱いで誤 fail closed する。
+        # 解析不能 (summary 無し) は 0 = fail closed。
+        match = re.search(r"(?:^|\s)(\d+) passed\b", result.stdout_tail)
+        collected_count = int(match.group(1)) if match is not None else 0
+        if collected_count < minimum:
+            return _PluginGateVerdict(
+                passed=False,
+                reason=(f"self_test_too_thin_collected:{collected_count}"
+                        f"<{minimum}"))
 
         content_hash_after, artifact_hash_after = hashes_of(plugin_dir)
         if (content_hash_after != content_hash_before
@@ -1255,12 +1271,6 @@ class ImproveLoop:
                 approval_id = approvals_store.create(
                     conn, kind="plugin", payload=approval_payload, now=now,
                     commit=False)
-                if self._activity is not None:
-                    self._activity.write(
-                        Category.IMPROVE, "approval_requested",
-                        f"mission={mission_id} backlog={backlog_id} "
-                        f"plugin={approval_payload['name']} "
-                        f"approval={approval_id}", str(mission_id))
                 missions_store.finish_improve_mission(
                     conn, mission_id=mission_id, run_id=run_id,
                     slot_key=slot_key, mission_status="completed",
@@ -1270,6 +1280,15 @@ class ImproveLoop:
                         "last_result": f"approval_pending:{approval_id}"},
                     commit=False)
                 conn.commit()
+                # 成功系 activity は commit 成功後に書く (1 周目 F2、3 モデル
+                # 一致): tx 前に書くと rollback しても「成功」が activity に残る。
+                # 失敗系が tx 前に書くのは痕跡を残す意図で、成功系とは逆。
+                if self._activity is not None:
+                    self._activity.write(
+                        Category.IMPROVE, "approval_requested",
+                        f"mission={mission_id} backlog={backlog_id} "
+                        f"plugin={approval_payload['name']} "
+                        f"approval={approval_id}", str(mission_id))
             except BaseException:
                 conn.rollback()
                 raise
@@ -1546,19 +1565,6 @@ class ImproveLoop:
             # `unsupported_in_plan10:risk_gate` — `proposal_kind=='risk_gate'`
             # (本プラン未対応) のときの正規ラベル。
             observation_last_result = "unsupported_in_plan10:risk_gate"
-        if self._activity is not None:
-            if report_path is not None:
-                self._activity.write(
-                    Category.IMPROVE, "report_published",
-                    f"mission={ctx.mission_id} backlog="
-                    f"{backlog_id if backlog_id is not None else '-'} "
-                    f"path={report_path}", str(ctx.mission_id))
-            else:
-                self._activity.write(
-                    Category.IMPROVE, "mission_observation",
-                    f"mission={ctx.mission_id} backlog="
-                    f"{backlog_id if backlog_id is not None else '-'} "
-                    f"reason={observation_last_result}", str(ctx.mission_id))
         conn.execute("BEGIN IMMEDIATE")
         try:
             missions_store.finish_improve_mission(
@@ -1580,6 +1586,20 @@ class ImproveLoop:
         except BaseException:
             conn.rollback()
             raise
+        # 成功系 activity は commit 成功後 (1 周目 F2。`_finalize_success` と同じ理由)。
+        if self._activity is not None:
+            if report_path is not None:
+                self._activity.write(
+                    Category.IMPROVE, "report_published",
+                    f"mission={ctx.mission_id} backlog="
+                    f"{backlog_id if backlog_id is not None else '-'} "
+                    f"path={report_path}", str(ctx.mission_id))
+            else:
+                self._activity.write(
+                    Category.IMPROVE, "mission_observation",
+                    f"mission={ctx.mission_id} backlog="
+                    f"{backlog_id if backlog_id is not None else '-'} "
+                    f"reason={observation_last_result}", str(ctx.mission_id))
         if report_path is not None:
             reports_dir = self._root / "data" / "improve_reports"
             part_path = reports_dir / ".tmp" / f"improve-{ctx.mission_id}.md.part"

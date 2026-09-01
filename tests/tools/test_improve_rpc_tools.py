@@ -102,7 +102,20 @@ def test_run_backtest_calls_handler_for_strategy_candidate(tmp_path):
     assert calls == [{"name": "sma_cross_v2", "pair": "USDJPY"}]
 
 
-def test_run_backtest_calls_handler_when_candidate_is_absent(tmp_path):
+@pytest.mark.parametrize(("name", "config", "expected_error", "expected_kind"), [
+    ("missing", None, "config.yaml not found", None),
+    ("bad_yaml", "kind: [\n", "config.yaml unreadable", None),
+    ("missing_kind", "pairs: []\n", "kind missing", None),
+    ("non_str", "kind: 3\n", "kind must be str", 3),
+    ("indicator", "kind: indicator\n",
+     "run_backtest is only for kind=strategy candidates", "indicator"),
+])
+def test_run_backtest_fails_closed_for_invalid_candidate_config(
+        tmp_path, name, config, expected_error, expected_kind):
+    if config is not None:
+        candidate = tmp_path / name
+        candidate.mkdir()
+        (candidate / "config.yaml").write_text(config)
     calls = []
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
     tools = {t.name: t for t in build_improve_rpc_tooldefs(
@@ -110,9 +123,24 @@ def test_run_backtest_calls_handler_when_candidate_is_absent(tmp_path):
         run_backtest_handler=lambda args: calls.append(args) or {"ok": True},
         analyze_corr_handler=lambda args: {})}
 
-    assert tools["run_backtest"].func(
-        name="missing", pair="USDJPY") == {"ok": True}
-    assert calls == [{"name": "missing", "pair": "USDJPY"}]
+    out = tools["run_backtest"].func(name=name, pair="USDJPY")
+    assert out["error"] == expected_error
+    assert out["candidate_kind"] == expected_kind
+    assert out["hint"]
+    assert calls == []
+
+
+def test_run_backtest_fails_closed_for_unsafe_candidate_name(tmp_path):
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    calls = []
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, staging_dir=tmp_path,
+        run_backtest_handler=lambda args: calls.append(args) or {},
+        analyze_corr_handler=lambda args: {})}
+    out = tools["run_backtest"].func(name="../escape", pair="USDJPY")
+    assert out["error"] == "config.yaml not found"
+    assert out["candidate_kind"] is None and out["hint"]
+    assert calls == []
 
 
 def test_analyze_corr_records_trial_count_from_handler():

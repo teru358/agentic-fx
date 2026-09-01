@@ -115,6 +115,15 @@ def test_note_is_not_open_or_selectable_and_is_listed_as_note(tmp_path):
     assert [row["id"] for row in backlog.list_notes(c)] == [bid]
 
 
+def test_list_notes_filters_mixed_backlog_statuses(tmp_path):
+    c = connect(tmp_path / "mixed.db"); init_db(c)
+    ids = {}
+    for status in ("open", "observation", "selected", "note", "rejected"):
+        ids[status] = backlog.add(c, status, "agent", NOW)
+        backlog.set_status(c, ids[status], status, NOW)
+    assert [row["id"] for row in backlog.list_notes(c)] == [ids["note"]]
+
+
 def test_set_status_writes_last_result(tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)
     bid = backlog.add(c, "a", "user", NOW)

@@ -1170,6 +1170,56 @@ def _finalize_report_or_observation_ctx(staging_dir, *, mission_id, run_id):
         rpc_handlers={})
 
 
+class _CommitFailingConnection:
+    """Delegate SQL to a real connection but fail every commit deterministically."""
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, *args, **kwargs):
+        return self._conn.execute(*args, **kwargs)
+
+    def commit(self):
+        raise RuntimeError("simulated commit failure")
+
+    def rollback(self):
+        return self._conn.rollback()
+
+
+def test_approval_activity_is_written_only_after_successful_commit(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    loop_min._finalize_success(
+        _CommitFailingConnection(conn), mission_id=mission_id, run_id=run_id,
+        backlog_id=backlog_id, slot_key=None,
+        approval_payload={"name": "myst", "kind": "indicator"},
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc))
+    text = ((tmp_path / "activity.log").read_text()
+            if (tmp_path / "activity.log").exists() else "")
+    assert "\tapproval_requested\t" not in text
+
+
+@pytest.mark.parametrize(("report_path", "artifact", "forbidden_event"), [
+    ("/tmp/report.md", {"type": "report"}, "report_published"),
+    (None, {"type": "observation", "reason": "x"}, "mission_observation"),
+])
+def test_report_and_observation_activity_are_written_only_after_successful_commit(
+        loop_min, conn, mission_and_run_fixture, tmp_path,
+        report_path, artifact, forbidden_event):
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging-commit-fail"
+    staging_dir.mkdir()
+    ctx = _finalize_report_or_observation_ctx(
+        staging_dir, mission_id=mission_id, run_id=run_id)
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        loop_min._finalize_report_or_observation(
+            _CommitFailingConnection(conn), ctx=ctx, backlog_id=backlog_id,
+            report_path=report_path, artifact=artifact,
+            now=datetime(2026, 8, 22))
+    text = ((tmp_path / "activity.log").read_text()
+            if (tmp_path / "activity.log").exists() else "")
+    assert f"\t{forbidden_event}\t" not in text
+
+
 def test_observation_artifact_records_reason_not_risk_gate_label(
         loop_min, conn, mission_and_run_fixture, tmp_path):
     mission_id, run_id, backlog_id = mission_and_run_fixture
@@ -1197,6 +1247,22 @@ def test_observation_artifact_records_reason_not_risk_gate_label(
     assert "\tIMPROVE\tmission_observation\t" in activity_text
     assert (f"mission={mission_id} backlog={backlog_id} "
             f"reason=observation:insufficient data\t{mission_id}") in activity_text
+    assert "\treport_published\t" not in activity_text
+
+
+def test_observation_without_backlog_logs_dash(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    mission_id, run_id, _ = mission_and_run_fixture
+    staging_dir = tmp_path / "staging-no-backlog"
+    staging_dir.mkdir()
+    ctx = _finalize_report_or_observation_ctx(
+        staging_dir, mission_id=mission_id, run_id=run_id)
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=None, report_path=None,
+        artifact={"type": "observation", "reason": "no candidate"},
+        now=datetime(2026, 8, 22))
+    activity_text = (tmp_path / "activity.log").read_text()
+    assert f"mission={mission_id} backlog=- reason=observation:no candidate" in activity_text
 
 
 def test_risk_gate_report_artifact_keeps_unsupported_label(
@@ -1266,3 +1332,4 @@ def test_report_path_deletes_staging_including_readonly_snapshot(
     assert "\tIMPROVE\treport_published\t" in activity_text
     assert (f"mission={mission_id} backlog={backlog_id} path={final_path}"
             f"\t{mission_id}") in activity_text
+    assert "\tmission_observation\t" not in activity_text
