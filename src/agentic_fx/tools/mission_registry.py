@@ -98,7 +98,8 @@ def build_mission_registry(
             staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir))
         registry.register_all(improve_rpc_tools.build_improve_rpc_tooldefs(
             ledger=ledger, run_backtest_handler=rpc_handlers["run_backtest"],
-            analyze_corr_handler=rpc_handlers["analyze_corr"]))
+            analyze_corr_handler=rpc_handlers["analyze_corr"],
+            staging_dir=staging_dir))
         return registry
 
     # --- 既存 trade/ask 分岐 (無変更) ---

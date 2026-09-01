@@ -706,6 +706,10 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     try:
         conn_core = connect(root / "data" / "agentic.db")
         init_db(conn_core)
+        seeded = seed_default_sources(conn_core, clock.now())
+        if seeded:
+            activity.write(Category.NEWS, "sources_seeded",
+                           f"{seeded} default sources")
         # プラン 8 (codex C-5): 前回停止時に running のまま残った mission と、
         # それが claim していた signal を同一トランザクションで回収する。
         # 既存の signals.reclaim_expired (403-407 行付近、lease ベースの

@@ -248,8 +248,10 @@ def test_run_backtest_handler_rejects_non_strategy_candidate(
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
     handlers = loop_min._build_rpc_handlers(ledger, staging_dir=staging_dir)
 
-    with pytest.raises(ValueError, match="requires a strategy"):
+    with pytest.raises(RuntimeError, match="requires a strategy") as exc_info:
         handlers["run_backtest"]({"name": "myst", "pair": "USDJPY"})
+    assert "run_plugin_tests" in str(exc_info.value)
+    assert "設計 §6" in str(exc_info.value)
 
 
 def test_run_backtest_handler_returns_error_dict_and_closes_conn_on_failure(

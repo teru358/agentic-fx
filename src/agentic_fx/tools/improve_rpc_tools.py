@@ -3,10 +3,21 @@
 handler をラップし、台帳への record と遮断 7 のキー剥がしだけを行う。"""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
+import yaml
+
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.tools.improve_staging_tools import _safe_join
 from agentic_fx.tools.registry import ToolDef
+
+_RUN_BACKTEST_KIND_HINT = (
+    "indicator/signal plugin はバックテストできません "
+    "(決済規則を持たないため、設計 §6)。self-test (run_plugin_tests) で検証し、"
+    "そのまま最終出力へ進んでください。strategy を作る場合は config.yaml に "
+    "kind: strategy / timeframe / pairs / exit_mode / max_bars を書きます "
+    '(read_example_plugin(name="sma_cross") 参照)')
 
 _FORBIDDEN_KEYS = frozenset({
     "period_start", "period_end", "start", "end", "window", "timestamps",
@@ -53,8 +64,23 @@ def _strip_forbidden(value: object) -> object:
 def build_improve_rpc_tooldefs(
         *, ledger: ImproveRpcLedger,
         run_backtest_handler: Callable[[dict], dict],
-        analyze_corr_handler: Callable[[dict], dict]) -> list[ToolDef]:
+        analyze_corr_handler: Callable[[dict], dict],
+        staging_dir: Path | None = None) -> list[ToolDef]:
     def run_backtest(name: str, pair: str) -> dict:
+        config_path = (_safe_join(staging_dir, name, "config.yaml")
+                       if staging_dir is not None else None)
+        if config_path is not None and config_path.is_file():
+            try:
+                config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+                candidate_kind = config.get("kind") if isinstance(config, dict) else None
+            except (OSError, UnicodeError, yaml.YAMLError):
+                candidate_kind = None
+            if isinstance(candidate_kind, str) and candidate_kind != "strategy":
+                return {
+                    "error": "run_backtest is only for kind=strategy candidates",
+                    "candidate_kind": candidate_kind,
+                    "hint": _RUN_BACKTEST_KIND_HINT,
+                }
         result = run_backtest_handler({"name": name, "pair": pair})
         ledger.record(opaque_ref=f"run_backtest:{name}:{pair}",
                       kind="run_backtest", params={"name": name, "pair": pair},
@@ -71,7 +97,8 @@ def build_improve_rpc_tooldefs(
         return _strip_forbidden(result)
 
     return [
-        ToolDef(name="run_backtest", description="親が in-sample バックテストを回す。",
+        ToolDef(name="run_backtest", description=(
+                    "kind=strategy の候補専用。親が in-sample バックテストを回す。"),
                 parameters={"type": "object",
                             "properties": {"name": {"type": "string"},
                                           "pair": {"type": "string"}},

@@ -667,9 +667,10 @@ class ImproveLoop:
             candidate_dir = staging_dir / args["name"]
             meta = plugin_loader._discover_one(candidate_dir, args["name"])
             if meta is None or meta.kind != "strategy":
-                raise ValueError(
+                from agentic_fx.tools.improve_rpc_tools import _RUN_BACKTEST_KIND_HINT
+                raise RuntimeError(
                     f"run_backtest requires a strategy candidate: "
-                    f"{args['name']!r}")
+                    f"{args['name']!r}. {_RUN_BACKTEST_KIND_HINT}")
             try:
                 conn = self._db_readonly_conn_factory()
                 captured: list[dict] = []

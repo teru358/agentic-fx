@@ -16,6 +16,7 @@ from agentic_fx.core.contracts import (
     Action, ConversionRate, Direction, EntryType, FixedClock, Horizon,
     InstrumentSpec, Origin, Quote, TradeIntent,
 )
+from agentic_fx.datafeed.news_collector import DEFAULT_SOURCES
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
@@ -23,6 +24,7 @@ from agentic_fx.service import (
     _assert_tools_registered, _check_llama_swap, _validate_startup,
     build_app, build_splash, run_init, run_service,
 )
+from agentic_fx.store import news_sources
 from agentic_fx.tools import market_tools
 from tests.store.test_rag import FakeEmbedding
 
@@ -112,6 +114,32 @@ def test_build_app_wires_everything(tmp_path):
     for name in ("get_ohlcv", "search_news", "get_positions",
                  "get_recent_reflections"):
         assert name in app.registry.names()
+
+
+def test_build_app_seeds_default_news_sources_idempotently(tmp_path):
+    """afx init 未実行の DB でも起動時 seed され、再起動で重複しない。"""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "settings.yaml").write_text(
+        Path("config/settings.yaml.example").read_text(encoding="utf-8"),
+        encoding="utf-8")
+
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    try:
+        assert len(news_sources.list_all(app.conn_core)) == len(DEFAULT_SOURCES)
+        assert any("\tNEWS\tsources_seeded\t" in line and
+                   f"\t{len(DEFAULT_SOURCES)} default sources\t" in line
+                   for line in app.activity.tail(20))
+    finally:
+        app.close()
+
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    try:
+        assert len(news_sources.list_all(app.conn_core)) == len(DEFAULT_SOURCES)
+    finally:
+        app.close()
 
 
 def test_build_app_wires_one_stop_event_to_scheduler_and_worker(tmp_path):

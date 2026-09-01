@@ -64,6 +64,57 @@ def test_run_backtest_records_to_ledger_and_returns_handler_result():
     assert ledger.entries()[0]["kind"] == "run_backtest"
 
 
+def test_run_backtest_guides_indicator_without_calling_handler(tmp_path):
+    candidate = tmp_path / "rsi_v2"
+    candidate.mkdir()
+    (candidate / "config.yaml").write_text(
+        "kind: indicator\n", encoding="utf-8")
+    calls = []
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, staging_dir=tmp_path,
+        run_backtest_handler=lambda args: calls.append(args) or {},
+        analyze_corr_handler=lambda args: {})}
+
+    out = tools["run_backtest"].func(name="rsi_v2", pair="USDJPY")
+
+    assert out["error"] == "run_backtest is only for kind=strategy candidates"
+    assert out["candidate_kind"] == "indicator"
+    assert "run_plugin_tests" in out["hint"]
+    assert "設計 §6" in out["hint"]
+    assert calls == []
+
+
+def test_run_backtest_calls_handler_for_strategy_candidate(tmp_path):
+    candidate = tmp_path / "sma_cross_v2"
+    candidate.mkdir()
+    (candidate / "config.yaml").write_text(
+        "kind: strategy\n", encoding="utf-8")
+    calls = []
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, staging_dir=tmp_path,
+        run_backtest_handler=lambda args: calls.append(args) or {"ok": True},
+        analyze_corr_handler=lambda args: {})}
+
+    assert tools["run_backtest"].func(
+        name="sma_cross_v2", pair="USDJPY") == {"ok": True}
+    assert calls == [{"name": "sma_cross_v2", "pair": "USDJPY"}]
+
+
+def test_run_backtest_calls_handler_when_candidate_is_absent(tmp_path):
+    calls = []
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, staging_dir=tmp_path,
+        run_backtest_handler=lambda args: calls.append(args) or {"ok": True},
+        analyze_corr_handler=lambda args: {})}
+
+    assert tools["run_backtest"].func(
+        name="missing", pair="USDJPY") == {"ok": True}
+    assert calls == [{"name": "missing", "pair": "USDJPY"}]
+
+
 def test_analyze_corr_records_trial_count_from_handler():
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0})
     tools = {t.name: t for t in build_improve_rpc_tooldefs(

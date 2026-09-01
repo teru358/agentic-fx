@@ -59,7 +59,7 @@
 2. **ファイルの読み書きは afx の MCP tool のみを使ってください**
    (`list_staging` / `read_staging_file` / `write_staging_file` /
    `read_plugin_source` / `list_examples` / `read_example_plugin` /
-   `run_plugin_tests`)。エディタ・ハーネス組み込みの
+   `run_plugin_tests` / `run_backtest` (strategy 専用))。エディタ・ハーネス組み込みの
    read / write / shell によるファイル操作はプロジェクトのファイルに
    届かず、境界で拒否されます。
    - 呼び出し例: `write_staging_file(name="my_plugin", rel="plugin.py",
