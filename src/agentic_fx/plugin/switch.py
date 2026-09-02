@@ -229,7 +229,28 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
             for candidate in mission_dir.iterdir():
                 rel = f"plugins/_staging/{mission_dir.name}/{candidate.name}"
                 if rel not in referenced:
-                    shutil.rmtree(candidate, ignore_errors=True)
+                    # Source snapshots are immutable (0500/0400), just like
+                    # version-store entries handled in branch ③ below.
+                    # Restore owner write permission before recursive removal.
+                    # _snapshot_src は入れ子 (_examples/<name>/… の 3 階層、
+                    # dir はすべて 0500) — 1 階層だけの chmod では内側の
+                    # 0500 dir で rmtree(ignore_errors=True) が黙って失敗
+                    # するため、os.walk で全階層に降りる。
+                    try:
+                        if candidate.is_dir():
+                            for dirpath, _dirs, files in os.walk(candidate):
+                                Path(dirpath).chmod(0o700)
+                                for fn in files:
+                                    (Path(dirpath) / fn).chmod(0o600)
+                            shutil.rmtree(candidate, ignore_errors=True)
+                        else:
+                            candidate.chmod(0o600)
+                            candidate.unlink()
+                    except OSError as exc:
+                        if activity is not None:
+                            activity.write(
+                                Category.APPROVAL, "sweep_orphan_staging_failed",
+                                f"path={candidate} error={safe_error_text(exc)}")
 
     # ② tmp-* の削除 (どの版にも成長していない残骸)
     versions_root = plugins_root / ".versions"

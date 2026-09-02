@@ -692,6 +692,53 @@ class ImproveLoop:
                 finally:
                     intent_source.close()
                     conn.close()
+            except ValueError as exc:
+                message = str(exc)
+                if message.startswith("no 1m history for symbol="):
+                    # settings.pairs (設定 pair) を「available」と言っては
+                    # いけない — pair_rules に居てもデータが無い pair が
+                    # あり得る (m47 の EURUSD がまさにそれで、モデルを
+                    # 死路に再誘導する)。実際に 1m 履歴が存在する symbol
+                    # を DB から出す。
+                    symbols: list[str] = []
+                    try:
+                        hist_conn = self._db_readonly_conn_factory()
+                        try:
+                            symbols = sorted(
+                                row[0] for row in hist_conn.execute(
+                                    "SELECT DISTINCT symbol FROM ohlcv_history"
+                                    " WHERE interval='1m' AND source=?",
+                                    (self._EVAL_SOURCE,)))
+                        finally:
+                            hist_conn.close()
+                    except Exception:
+                        pass  # hint 構築の失敗で error 応答自体を壊さない
+                    if symbols:
+                        hint = (f"No 1m history for {args['pair']}. Pairs "
+                                "with local backtest history: "
+                                f"{', '.join(symbols)}.")
+                    else:
+                        hint = (f"No 1m history for {args['pair']}, and no "
+                                "pair has local backtest history yet — "
+                                "run_backtest cannot succeed until history "
+                                "data is imported. Report this as a "
+                                "discovery instead of retrying other pairs.")
+                    return {
+                        "error": "no_history_for_symbol",
+                        "message": message,
+                        "hint": hint,
+                    }
+                if " is not in plugin " in message and "declared pairs" in message:
+                    declared = ", ".join(meta.pairs)
+                    return {
+                        "error": "pair_not_declared_by_plugin",
+                        "message": message,
+                        "hint": ("Request one of the plugin's declared pairs: "
+                                 f"{declared}."),
+                    }
+                _log.exception("run_backtest_handler failed for %r",
+                               args.get("name"))
+                return {"error": "backtest_failed"}
             except Exception:
                 _log.exception("run_backtest_handler failed for %r",
                                args.get("name"))
@@ -1364,6 +1411,7 @@ class ImproveLoop:
         if conn is None:
             conn = self._db_write_conn_factory()
             owns_conn = True
+        commit_raised = False
         try:
             self._freeze_ledger(ctx)                                  # 手順0
 
@@ -1458,13 +1506,26 @@ class ImproveLoop:
 
                 kind = self._read_candidate_kind(candidate_dir)
                 if kind == "strategy":
-                    strategy_verdict = self._run_strategy_gate(         # 手順4
-                        conn, name=artifact["name"],
-                        pairs=self._read_candidate_pairs(candidate_dir),
-                        timeframe=self._read_candidate_timeframe(candidate_dir),
-                        content_hash=gate_verdict.content_hash, now=now,
-                        meta=candidate_meta, kind=kind,
-                        record_fn=gate_rows.append)
+                    try:
+                        strategy_verdict = self._run_strategy_gate(     # 手順4
+                            conn, name=artifact["name"],
+                            pairs=self._read_candidate_pairs(candidate_dir),
+                            timeframe=self._read_candidate_timeframe(candidate_dir),
+                            content_hash=gate_verdict.content_hash, now=now,
+                            meta=candidate_meta, kind=kind,
+                            record_fn=gate_rows.append)
+                    except ValueError as exc:
+                        # holdout._oldest_bar_start uses ValueError for missing
+                        # market history. Convert only that known data condition
+                        # into a verdict; other ValueErrors may be programming
+                        # defects and must still abort the commit.
+                        if not str(exc).startswith("no 1m history for symbol="):
+                            raise
+                        self._finalize_gate_failed(
+                            conn, ctx=ctx, backlog_id=selection.backlog_id,
+                            reason=("gate_failed:backtest_data_unavailable:"
+                                    f"{exc}"), now=now)
+                        return
                     if not strategy_verdict.evaluable:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -1504,13 +1565,17 @@ class ImproveLoop:
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
                     report_path=report_path, artifact=artifact, now=now)
+        except BaseException:
+            commit_raised = True
+            raise
         finally:
             if owns_conn:
                 conn.close()
-            try:
-                ctx.ledger.mark_persisted()
-            except RuntimeError:
-                pass
+            if not commit_raised:
+                try:
+                    ctx.ledger.mark_persisted()
+                except RuntimeError:
+                    pass
 
     def _prepare_report_if_applicable(self, conn, *, ctx, artifact, output,
                                       now, backlog_id=None) -> str | None:

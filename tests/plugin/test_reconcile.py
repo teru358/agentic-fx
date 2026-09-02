@@ -197,6 +197,28 @@ def test_sweep_orphans_deletes_staging_candidate_without_pending_approval(env):
     assert not candidate_dir.exists()
 
 
+def test_sweep_orphans_deletes_readonly_staging_snapshot(env):
+    """実機の _snapshot_src の形状 (2026-09-02 実測、_staging/38):
+    _snapshot_src/_examples/<name>/ の 3 階層で dir はすべて 0500、
+    file は 0400。1 階層だけ chmod する実装だと内側の 0500 dir で
+    rmtree(ignore_errors=True) が黙って失敗しリークが再発するため、
+    入れ子のまま pin する。"""
+    tmp_path, plugins_dir, conn = env
+    snapshot_dir = plugins_dir / "_staging" / "38" / "_snapshot_src"
+    example_dir = snapshot_dir / "_examples" / "rsi_indicator"
+    example_dir.mkdir(parents=True)
+    plugin_file = example_dir / "plugin.py"
+    plugin_file.write_text("x")
+    plugin_file.chmod(0o400)
+    example_dir.chmod(0o500)
+    (snapshot_dir / "_examples").chmod(0o500)
+    snapshot_dir.chmod(0o500)
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+
+    assert not snapshot_dir.exists()
+
+
 def test_sweep_orphans_preserves_staging_candidate_referenced_by_pending_approval(env):
     """確定-10 の対称側: pending approval が参照している staging 候補は
     削除されない。"""

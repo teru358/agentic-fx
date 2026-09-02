@@ -1,11 +1,36 @@
 from __future__ import annotations
 
+import pytest
+
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import db as db_mod
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import missions as missions_store
+
+
+def test_commit_exception_leaves_ledger_discardable(loop_full, monkeypatch):
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ctx = ImproveRunContext(
+        mission_id=1, run_id=1, staging_dir=loop_full._root / "staging",
+        source_snapshot_dir=loop_full._root / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    monkeypatch.setattr(
+        loop_full, "_inspect_output",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("commit boom")))
+
+    from agentic_fx.runners.base import Mission, MissionResult
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=1,
+                      timeout_sec=1)
+    result = MissionResult(status="completed", output={}, transcript=[])
+    with pytest.raises(RuntimeError, match="commit boom"):
+        loop_full.commit(mission=mission, ctx=ctx, result=result,
+                         now=loop_full._clock.now())
+
+    ledger.mark_discarded()
+    assert ledger._state == "DISCARDED"
 
 
 def test_compensate_commit_failure_terminalizes_and_is_idempotent(
@@ -27,9 +52,8 @@ def test_compensate_commit_failure_terminalizes_and_is_idempotent(
     (staging_dir / "candidate.py").write_text("candidate = True\n")
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
     ledger.freeze()
-    # commit() は例外でも finally で PERSISTED 化する現行契約。補償は
-    # mark_discarded() の RuntimeError に阻まれず DB 終端を続行する。
-    ledger.mark_persisted()
+    # commit() の例外時と同じ FROZEN 状態から補償を開始する。補償は台帳を
+    # DISCARDED にしてから DB と staging の pre-commit state を収束させる。
     ctx = ImproveRunContext(
         mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
         source_snapshot_dir=staging_dir / "_snapshot_src",
@@ -59,6 +83,7 @@ def test_compensate_commit_failure_terminalizes_and_is_idempotent(
     assert run["finished_at"] is not None
     assert backlog["status"] == "observation"
     assert backlog["last_result"] == "interrupted"
+    assert ledger._state == "DISCARDED"
     assert not staging_dir.exists()
     activity = (tmp_path / "activity.log").read_text()
     assert "mission_failed" in activity

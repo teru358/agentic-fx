@@ -306,6 +306,90 @@ def test_run_backtest_handler_returns_error_dict_and_closes_conn_on_failure(
     assert closed["conn"] is True
 
 
+def test_run_backtest_handler_reports_missing_history_with_available_pairs(
+        loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        lambda *a, **kw: (_ for _ in ()).throw(ValueError(
+            "no 1m history for symbol='EURUSD' source='dukascopy' "
+            "(cannot determine in-sample start)")))
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+    handlers = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}), staging_dir=staging_dir)
+
+    result = handlers["run_backtest"]({"name": "myst", "pair": "EURUSD"})
+
+    # ohlcv_history が空のとき、hint は「設定 pair」を available と偽らず
+    # (m47 の EURUSD 死路再誘導の防止)、履歴未投入である事実を伝える。
+    assert result["error"] == "no_history_for_symbol"
+    assert result["message"] == (
+        "no 1m history for symbol='EURUSD' source='dukascopy' "
+        "(cannot determine in-sample start)")
+    assert "no pair has local backtest history" in result["hint"]
+    assert "USDJPY" not in result["hint"]
+
+
+def test_run_backtest_handler_missing_history_hint_lists_pairs_with_data(
+        loop_no_seam, tmp_path, monkeypatch):
+    """1m 履歴が実在する symbol だけを hint に載せる (settings.pairs では
+    なく DB の実データで判定する) ことを pin する。hint 構築は handler が
+    readonly conn を close した後の再接続なので、write/readonly が同一
+    conn の loop_min seam では検証できない — 本番同型の loop_no_seam
+    (毎回新規接続) を使う。"""
+    loop, db_path = loop_no_seam
+    _patch_strategy_lookup(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        lambda *a, **kw: (_ for _ in ()).throw(ValueError(
+            "no 1m history for symbol='EURUSD' source='dukascopy' "
+            "(cannot determine in-sample start)")))
+    seed_conn = loop._db_write_conn_factory()
+    seed_conn.execute(
+        "INSERT INTO ohlcv_history (symbol, interval, bar_time, open, high,"
+        " low, close, volume, source) VALUES ('USDJPY', '1m',"
+        " '2026-01-01T00:00:00+00:00', 1, 1, 1, 1, 0, 'dukascopy')")
+    seed_conn.commit()
+    seed_conn.close()
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+    handlers = loop._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}), staging_dir=staging_dir)
+
+    result = handlers["run_backtest"]({"name": "myst", "pair": "EURUSD"})
+
+    assert result["error"] == "no_history_for_symbol"
+    assert "Pairs with local backtest history: USDJPY." in result["hint"]
+
+
+def test_run_backtest_handler_reports_pair_not_declared(
+        loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.loader._discover_one",
+        lambda path, name: SimpleNamespace(
+            name="myst", kind="strategy", timeframe="1h",
+            content_hash="cand-hash", pairs=("EURUSD",)))
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        lambda *a, **kw: (_ for _ in ()).throw(ValueError(
+            "pair 'USDJPY' is not in plugin 'myst''s declared pairs ('EURUSD',)")))
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+    handlers = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}), staging_dir=staging_dir)
+
+    result = handlers["run_backtest"]({"name": "myst", "pair": "USDJPY"})
+
+    assert result == {
+        "error": "pair_not_declared_by_plugin",
+        "message": "pair 'USDJPY' is not in plugin 'myst''s declared pairs "
+                   "('EURUSD',)",
+        "hint": "Request one of the plugin's declared pairs: EURUSD.",
+    }
+
+
 def test_analyze_corr_handler_returns_error_dict_on_failure(
         loop_min, tmp_path, monkeypatch):
     """L-B27 是正 (束D検収, verified-local-round1.md §11 #8):
