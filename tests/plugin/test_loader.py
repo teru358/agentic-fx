@@ -875,3 +875,31 @@ def test_artifact_hash_bytes_delegates_to_version_store(tmp_path):
     from agentic_fx.plugin import loader, version_store
     p, c, t = b"plugin body", b"kind: indicator\n", b"def test_x():\n    pass\n"
     assert loader.artifact_hash_bytes(p, c, t) == version_store.artifact_hash_bytes(p, c, t)
+
+
+def test_discover_one_with_reason_reports_oserror_reason(tmp_path, monkeypatch):
+    """discover_one_with_reason が OSError 経路でその例外メッセージを
+    reason に含めることを pin する (変異生存 F1)。
+
+    REQUIRED_FILES を満たす候補で _discover_one が OSError を投げると、
+    (None, "I/O error (...)") を返し、その reason に例外メッセージ内容が
+    含まれることを検証する。reason 記録を削除する変異は fail するはず。
+    """
+    candidate = _write_plugin(
+        tmp_path,
+        "test_plugin",
+        plugin_py=INDICATOR_PY,
+        config_yaml=INDICATOR_CONFIG,
+    )
+
+    def failing_discover_one(entry, name):
+        raise OSError("boom")
+
+    monkeypatch.setattr(loader_module, "_discover_one", failing_discover_one)
+
+    meta, reason = discover_one_with_reason(candidate, "test_plugin")
+
+    assert meta is None
+    assert isinstance(reason, str)
+    assert "I/O error" in reason
+    assert "boom" in reason

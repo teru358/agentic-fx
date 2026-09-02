@@ -234,7 +234,8 @@ class Commands:
                 return f"backlog #{bid} を note にしました"
             if cmd == "backlog" and len(args) == 2 and args[0] == "reopen":
                 bid = int(args[1])
-                # 検収 B3: reopen は done|rejected (終端) からのみ。
+                # 検収 B3: reopen は done|rejected|note (終端) からのみ。
+                # note からの reopen は d894983 (CR8) で追加 (note に出口を作る)。
                 # `selected` (Mission 実行中) から reopen を許すと
                 # 別 Mission の select_for_mission CAS が成功しうる
                 # (設計書 §4 が挙げる「二重承認申請」への到達経路)。
