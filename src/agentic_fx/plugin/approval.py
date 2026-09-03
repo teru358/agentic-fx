@@ -22,7 +22,7 @@ content_hash` と検証完了時点のファイル内容が一致することを
 変換せず素通しする — 変換対象は「plugin 検証の失敗」に限る)。
 
 **承認 source と本番 source の差異を人間に見せる (opus R2 I1)**: payload
-の `eval_source` は承認バックテストが常に使う `"dukascopy"` 固定、
+の `eval_source` は承認バックテストが使う `settings.backtest.eval_source`、
 `live_source` は `settings.plugin.producer_source` (本番 producer が使う
 source) — 両者が異なり得ることを承認レビュー時に人間が見えるようにする。
 
@@ -78,7 +78,6 @@ PytestRunnerFn = Callable[[Path], GateResult]
 # 専用シグネチャで呼ばれる (settings は位置引数)。
 RunInSampleFn = Callable[..., dict[str, Any]]
 
-_EVAL_SOURCE = "dukascopy"
 _NOTE = "バックテスト成績は実運用成績の予測値ではない (足切り専用)"
 # D5: plugin 宣言 timeframe → run_in_sample に渡す eval_timeframe。"1d" だけ
 # "24h" へ写像する (runner.parse_timeframe が "1d" を受理しないため)。
@@ -135,10 +134,12 @@ def _validate_strategy(conn: sqlite3.Connection, meta: PluginMeta, *,
     per_pair_metrics: dict[str, dict] = {}
     for pair in meta.pairs:
         intent_source = strategy_adapter.build_intent_source(
-            meta, conn=conn, pair=pair, source=_EVAL_SOURCE, settings=settings)
+            meta, conn=conn, pair=pair, source=settings.backtest.eval_source,
+            settings=settings)
         try:
             per_pair_metrics[pair] = run_in_sample(
-                settings, history_conn=conn, symbol=pair, source=_EVAL_SOURCE,
+                settings, history_conn=conn, symbol=pair,
+                source=settings.backtest.eval_source,
                 intent_source=intent_source, eval_timeframe=eval_timeframe,
                 plugin_ref=plugin_ref, content_hash=meta.content_hash,
                 kind="strategy", now=now)
@@ -309,7 +310,7 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
                    "summary": _pytest_summary(pytest_result.stdout_tail)},
         "metrics": metrics,
         "evaluable": evaluable,
-        "eval_source": _EVAL_SOURCE,
+        "eval_source": settings.backtest.eval_source,
         "live_source": settings.plugin.producer_source,
         "note": _NOTE,
     }

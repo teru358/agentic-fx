@@ -257,6 +257,9 @@ def test_gate_hash_mismatch_fault_injection_via_default_runner_creates_no_row(
 def test_indicator_success_creates_row_with_expected_payload(tmp_path, settings):
     import hashlib
 
+    settings = settings.model_copy(update={
+        "backtest": settings.backtest.model_copy(update={"eval_source": "mt5"})})
+
     d = _write_plugin(tmp_path, "ind", kind="indicator", plugin_py=INDICATOR_PY,
                       config_yaml="kind: indicator\n")
     meta = _indicator_meta(d)
@@ -282,7 +285,7 @@ def test_indicator_success_creates_row_with_expected_payload(tmp_path, settings)
     assert payload["pytest"] == {"returncode": 0, "summary": "1 passed in 0.01s"}
     assert payload["metrics"] == {}
     assert payload["evaluable"] is True
-    assert payload["eval_source"] == "dukascopy"
+    assert payload["eval_source"] == "mt5"
     assert payload["live_source"] == settings.plugin.producer_source
     assert payload["note"] == "バックテスト成績は実運用成績の予測値ではない (足切り専用)"
 
@@ -357,7 +360,10 @@ def test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
                                  "pairs: [USDJPY, EURUSD]\nexit_mode: levels\n"
                                  "max_bars: 200\n")
     meta = _strategy_meta(d, pairs=("USDJPY", "EURUSD"))
-    two_pair_settings = settings.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
+    two_pair_settings = settings.model_copy(update={
+        "pairs": ["USDJPY", "EURUSD"],
+        "backtest": settings.backtest.model_copy(update={"eval_source": "mt5"}),
+    })
     conn = _conn(tmp_path)
 
     calls: list[dict] = []
@@ -389,7 +395,7 @@ def test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
     symbols = {c["symbol"] for c in calls}
     assert symbols == {"USDJPY", "EURUSD"}
     for c in calls:
-        assert c["source"] == "dukascopy"
+        assert c["source"] == "mt5"
         assert c["eval_timeframe"] == "1h"
         assert c["plugin_ref"] == "plugins/strat"
         assert c["content_hash"] == meta.content_hash
@@ -403,6 +409,7 @@ def test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
         (approval_id,)).fetchone()["payload_json"])
     assert set(payload["metrics"]) == {"USDJPY", "EURUSD"}
     assert payload["metrics"]["USDJPY"]["trades"] == 15
+    assert payload["eval_source"] == "mt5"
     # 15+15=30 == EVALUABLE_MIN_TRADES (境界値, >= なので True)
     assert payload["evaluable"] is True
 

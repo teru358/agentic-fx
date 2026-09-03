@@ -54,11 +54,9 @@ assert set(_TF_MINUTES) == set(TIMEFRAMES)
 # 「窓数 < 2 は ValueError」(§C) で下限を強制する。
 MIN_COMMON_OBS = 30
 
-# バックテスト・分析の正系列は dukascopy 固定 (Task 5 で mt5 は照合用と
-# 裁定済み)。request からは受け付けない — request に source キーがあれば
-# 余剰キーとして invalid_request になる。
-ANALYSIS_SOURCE = "dukascopy"
-
+# 分析 source は settings.backtest.eval_source からのみ取得する。request
+# からは受け付けない — request に source キーがあれば余剰キーとして
+# invalid_request になる。
 
 def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
                   source: str, in_sample_until: datetime,
@@ -507,7 +505,8 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
     try:
         if kind == "corr_matrix":
             result, trial_count = _corr_matrix_impl(
-                conn, candidates, timeframe=timeframe, source=ANALYSIS_SOURCE,
+                conn, candidates, timeframe=timeframe,
+                source=settings.backtest.eval_source,
                 in_sample_until=in_sample_until, since=since)
             if trial_count == 0:
                 # 候補が 2 未満、またはペアが計算できなかった —
@@ -518,12 +517,14 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
         elif kind == "rolling_corr_summary":
             result, trial_count = _rolling_corr_summary_impl(
                 conn, a, b, timeframe=timeframe, window=window,
-                source=ANALYSIS_SOURCE, in_sample_until=in_sample_until,
+                source=settings.backtest.eval_source,
+                in_sample_until=in_sample_until,
                 since=since)
             payload_body = dict(result)
         else:  # lead_lag
             result, trial_count = _lead_lag_impl(
-                conn, a, b, timeframe=timeframe, source=ANALYSIS_SOURCE,
+                conn, a, b, timeframe=timeframe,
+                source=settings.backtest.eval_source,
                 in_sample_until=in_sample_until, since=since)
             payload_body = dict(result)
     except (ValueError, ArithmeticError):
@@ -547,7 +548,8 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
 
     save_params = {"params": {"request": dict(request),
                               "in_sample_until": in_sample_until.isoformat()},
-                   "trial_count": trial_count, "source": ANALYSIS_SOURCE}
+                   "trial_count": trial_count,
+                   "source": settings.backtest.eval_source}
     if persist:
         run_id = analysis_runs_store.save(conn, now=now_utc, **save_params)
         return {"analysis_run_id": run_id, **payload_body}

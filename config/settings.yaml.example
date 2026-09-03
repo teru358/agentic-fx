@@ -40,6 +40,7 @@ runner:
 backtest:                      # コア所有 (§6) — holdout_months の変更は人間レビュー必須
   holdout_months: 3
   initial_balance: 1000000
+  eval_source: "dukascopy"     # 評価用 history source。IMPORT_SOURCES のいずれか
 
 llama_swap:
   base_url: "http://localhost:8080/v1"

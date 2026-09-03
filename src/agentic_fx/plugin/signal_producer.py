@@ -25,7 +25,7 @@ floor`` かつ ``b >= now − tf幅 × signal_freshness_bars`` を満たすバ�
    source にまだ取り込まれていないだけ」を fail-open で捌く。
 
 **source** は本番運用の data source (``settings.plugin.producer_source``、
-既定 "yfinance") — 承認バックテスト (Task 6) の "dukascopy" とは意図的に
+既定 "yfinance") — 承認バックテスト (Task 6) の eval source とは意図的に
 異なる (承認 payload の "live_source" に差異を記載済み)。
 
 **評価対象**: 承認済み signal/strategy plugin × 宣言 pairs ∩

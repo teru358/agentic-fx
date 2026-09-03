@@ -225,6 +225,42 @@ def test_eval_timeframe_normalizes_1d_to_24h_for_run_in_sample_and_holdout(
                                     ("run_holdout", "24h")]
 
 
+def test_eval_source_follows_backtest_settings(
+        monkeypatch, conn_with_approved_strategy):
+    settings = MagicMock()
+    settings.backtest.eval_source = "mt5"
+    seen_sources = []
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.strategy_adapter.build_intent_source",
+        lambda meta, **kw: (seen_sources.append(("intent", kw["source"]))
+                            or MagicMock(close=lambda: None)))
+
+    def _fake_run_in_sample(*a, **kw):
+        seen_sources.append(("in_sample", kw["source"]))
+        return {"trades": 30, "pf": 1.2}
+
+    def _fake_run_holdout(*a, **kw):
+        seen_sources.append(("holdout", kw["source"]))
+        return {"trades": 30, "pf": 1.1}
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        _fake_run_in_sample)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        _fake_run_holdout)
+
+    evaluate_strategy_adoption_gate(
+        conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        timeframe="1h", content_hash="h6", now=datetime(2026, 8, 22),
+        settings=settings, meta=_meta(content_hash="h6"))
+
+    assert seen_sources == [
+        ("intent", "mt5"), ("in_sample", "mt5"),
+        ("intent", "mt5"), ("holdout", "mt5")]
+
+
 # round2 O1/O2/O3 是正 (2026-08-29、verified-round2.md、pin のみ — 実装は
 # 触らない): `record_fn=None` の即時 save 経路 (`switch._run_full_gate`
 # = P1 submit / P3 bless の本番経路。改善ループ側は `record_fn=gate_rows.

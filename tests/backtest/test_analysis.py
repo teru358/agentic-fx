@@ -69,7 +69,7 @@ def test_analyze_for_agent_rejects_candidate_count_exceeding_max(tmp_path):
                            "timeframe": "1h"}, now=NOW)
 
 
-def _series(conn, symbol, values, *, start, timeframe="1h"):
+def _series(conn, symbol, values, *, start, timeframe="1h", source="dukascopy"):
     """決定的な close 列を、timeframe 幅 (既定 1h) 刻みの **1m** バーとして
     投入する (乱数・実時刻不使用)。
 
@@ -95,7 +95,7 @@ def _series(conn, symbol, values, *, start, timeframe="1h"):
     rows = [(symbol, "1m", (start + i * step).isoformat(),
              v, v + 0.05, v - 0.05, v, 1.0, 0.01)
             for i, v in enumerate(values)]
-    ohlcv.import_history_bars(conn, rows, source="dukascopy")
+    ohlcv.import_history_bars(conn, rows, source=source)
 
 
 def _sine(n, *, phase=0):
@@ -103,10 +103,10 @@ def _sine(n, *, phase=0):
     return [100 + math.sin((i + phase) / 5.0) for i in range(n)]
 
 
-def _seed_two_series(conn, *, start=H):
+def _seed_two_series(conn, *, start=H, source="dukascopy"):
     """EURUSD が USDJPY に 1 バー先行する系列 (b[t] = a[t+1] と同位相差)。"""
-    _series(conn, "USDJPY", _sine(200, phase=0), start=start)
-    _series(conn, "EURUSD", _sine(200, phase=1), start=start)
+    _series(conn, "USDJPY", _sine(200, phase=0), start=start, source=source)
+    _series(conn, "EURUSD", _sine(200, phase=1), start=start, source=source)
 
 
 def test_corr_matrix_inner_join_and_gap_exclusion(tmp_path):
@@ -772,6 +772,19 @@ def test_analyze_for_agent_persist_false_does_not_write_analysis_runs(tmp_path):
         "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
     assert after == before
     assert "params" in result and "trial_count" in result and "source" in result
+
+
+def test_analyze_for_agent_source_follows_backtest_settings(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_two_series(conn, start=BEFORE_BOUNDARY, source="mt5")
+    settings = _settings_watch_eurusd().model_copy(update={
+        "backtest": SETTINGS.backtest.model_copy(update={"eval_source": "mt5"})})
+
+    result = analyze_for_agent(
+        conn, settings, {"kind": "corr_matrix", "timeframe": "1h"},
+        now=NOW, persist=False)
+
+    assert result["source"] == "mt5"
 
 
 def test_analyze_for_agent_persist_true_keeps_existing_behavior(tmp_path):

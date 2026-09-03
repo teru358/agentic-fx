@@ -13,9 +13,7 @@ from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
 from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin.loader import PluginMeta
 
-# `plugin/approval.py` の `_EVAL_SOURCE`/`_EVAL_TIMEFRAME_OVERRIDE` と同じ値
-# (approval.py は改修しない — 出典が違う独立モジュールなので値だけ複製する)。
-_EVAL_SOURCE = "dukascopy"
+# `plugin/approval.py` と同じ timeframe 正規化。
 _EVAL_TIMEFRAME_OVERRIDE = {"1d": "24h"}
 
 
@@ -54,7 +52,8 @@ def evaluate_strategy_adoption_gate(
     改善ループの DB は単一ファイルであり、`backtest_runs`/`approval_requests`
     は同じ接続で読み書きできる)。`intent_source` は候補ごとに
     `strategy_adapter.build_intent_source(meta, conn=conn, pair=pair,
-    source=_EVAL_SOURCE, settings=settings)` で組み立て、`_validate_strategy`
+    source=settings.backtest.eval_source, settings=settings)` で組み立て、
+    `_validate_strategy`
     と同じ try/finally で `close()` する (サンドボックスプロセスのリーク防止) —
     in-sample ループと holdout ループはそれぞれ独立に構築・close する
     (閉じた intent_source は使い回せない)。
@@ -134,12 +133,12 @@ def evaluate_strategy_adoption_gate(
     per_pair = {}
     for pair in pairs:
         intent_source = strategy_adapter.build_intent_source(
-            meta, conn=conn, pair=pair, source=_EVAL_SOURCE,
+            meta, conn=conn, pair=pair, source=settings.backtest.eval_source,
             settings=settings)
         try:
             per_pair[pair] = run_in_sample(
                 settings, history_conn=history_conn, symbol=pair,
-                source=_EVAL_SOURCE, intent_source=intent_source,
+                source=settings.backtest.eval_source, intent_source=intent_source,
                 eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
                 content_hash=content_hash, kind="strategy", now=now,
                 record_fn=_in_sample_record_fn)
@@ -154,12 +153,12 @@ def evaluate_strategy_adoption_gate(
 
     for pair in pairs:
         intent_source = strategy_adapter.build_intent_source(
-            meta, conn=conn, pair=pair, source=_EVAL_SOURCE,
+            meta, conn=conn, pair=pair, source=settings.backtest.eval_source,
             settings=settings)
         try:
             run_holdout(
                 settings, history_conn=history_conn, symbol=pair,
-                source=_EVAL_SOURCE, intent_source=intent_source,
+                source=settings.backtest.eval_source, intent_source=intent_source,
                 eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
                 content_hash=content_hash, kind="strategy", now=now,
                 record_fn=record_fn)

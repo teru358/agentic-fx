@@ -102,6 +102,40 @@ def test_run_backtest_handler_hides_period_and_now_from_agent(
     assert "period_start" not in out and "period_end" not in out
 
 
+def test_run_backtest_handler_source_follows_backtest_settings(
+        loop_no_seam, tmp_path, monkeypatch):
+    loop, _ = loop_no_seam
+    loop._settings = loop._settings.model_copy(update={
+        "backtest": loop._settings.backtest.model_copy(
+            update={"eval_source": "mt5"})})
+    _patch_strategy_lookup(monkeypatch)
+    seen_sources = []
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_adapter.build_intent_source",
+        lambda meta, **kw: (seen_sources.append(("intent", kw["source"]))
+                            or SimpleNamespace(close=lambda: None)))
+
+    def _fake_run_in_sample(*args, record_fn=None, **kwargs):
+        seen_sources.append(("in_sample", kwargs["source"]))
+        record_fn({**_SAVE_KWARGS, "source": kwargs["source"]})
+        return dict(_SAVE_KWARGS["metrics"])
+
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        _fake_run_in_sample)
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+
+    result = loop._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging_dir)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+
+    assert seen_sources == [("intent", "mt5"), ("in_sample", "mt5")]
+    assert result["source"] == "mt5"
+
+
 def test_run_backtest_handler_result_feeds_persist_ledger_rows(
         loop_min, conn, tmp_path, monkeypatch):
     """handler → ledger.record(result_summary=save_kwargs 込み) →
@@ -339,17 +373,20 @@ def test_run_backtest_handler_missing_history_hint_lists_pairs_with_data(
     conn の loop_min seam では検証できない — 本番同型の loop_no_seam
     (毎回新規接続) を使う。"""
     loop, db_path = loop_no_seam
+    loop._settings = loop._settings.model_copy(update={
+        "backtest": loop._settings.backtest.model_copy(
+            update={"eval_source": "mt5"})})
     _patch_strategy_lookup(monkeypatch)
     monkeypatch.setattr(
         "agentic_fx.loops.improve_loop.holdout.run_in_sample",
         lambda *a, **kw: (_ for _ in ()).throw(ValueError(
-            "no 1m history for symbol='EURUSD' source='dukascopy' "
+            "no 1m history for symbol='EURUSD' source='mt5' "
             "(cannot determine in-sample start)")))
     seed_conn = loop._db_write_conn_factory()
     seed_conn.execute(
         "INSERT INTO ohlcv_history (symbol, interval, bar_time, open, high,"
         " low, close, volume, source) VALUES ('USDJPY', '1m',"
-        " '2026-01-01T00:00:00+00:00', 1, 1, 1, 1, 0, 'dukascopy')")
+        " '2026-01-01T00:00:00+00:00', 1, 1, 1, 1, 0, 'mt5')")
     seed_conn.commit()
     seed_conn.close()
     staging_dir = tmp_path / "staging"

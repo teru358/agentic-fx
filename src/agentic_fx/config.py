@@ -279,6 +279,17 @@ class ApiSettings(_Strict):
 class BacktestSettings(_Strict):
     holdout_months: int = Field(ge=1)
     initial_balance: float = Field(gt=0)
+    eval_source: str = "dukascopy"
+
+    @field_validator("eval_source")
+    @classmethod
+    def _eval_source_is_import_source(cls, value: str) -> str:
+        from agentic_fx.store.ohlcv import IMPORT_SOURCES
+        if value not in IMPORT_SOURCES:
+            raise ValueError(
+                f"eval_source must be one of {sorted(IMPORT_SOURCES)}, "
+                f"got {value!r}")
+        return value
 
 
 class AnalysisSettings(_Strict):
@@ -325,8 +336,8 @@ class PluginSettings(_Strict):
     # max_bars はこれ以下でなければならない — 照合は消費側の責務)。
     max_bars_limit: int = Field(ge=1, default=1000)
     # 本番運用 (producer) が signal/strategy plugin を評価するときのデータ
-    # source。承認バックテスト (Task 6) は常に "dukascopy" を使うため、
-    # 承認 payload の "live_source" にこの値を載せて「承認 source と本番
+    # source。承認バックテスト (Task 6) は backtest.eval_source を使い、
+    # 承認 payload の "live_source" にこの値を載せて「評価 source と本番
     # source の差異」を人間に見せる (プラン 7 Task 6, opus R2 I1)。
     producer_source: str = "yfinance"
     # signals テーブル (プラン 7 Task 7) の requeue 上限。この回数以上

@@ -367,9 +367,26 @@ def test_backtest_and_analysis_defaults():
     s = load_settings(EXAMPLE)
     assert s.backtest.holdout_months == 3
     assert s.backtest.initial_balance > 0
+    assert s.backtest.eval_source == "dukascopy"
     assert s.datafeed.watch_symbols == []
     assert s.analysis.max_watch_symbols == 10
     assert s.analysis.max_gap_pct == 5.0
+
+
+def test_backtest_eval_source_accepts_import_source():
+    raw = load_settings(EXAMPLE).model_dump()
+    raw["backtest"]["eval_source"] = "mt5"
+
+    assert Settings.model_validate(raw).backtest.eval_source == "mt5"
+
+
+@pytest.mark.parametrize("source", ["yfinance", "unknown"])
+def test_backtest_eval_source_rejects_non_import_source(source):
+    raw = load_settings(EXAMPLE).model_dump()
+    raw["backtest"]["eval_source"] = source
+
+    with pytest.raises(ValidationError, match=r"dukascopy.*mt5"):
+        Settings.model_validate(raw)
 
 
 def test_watch_symbols_never_extend_pairs():

@@ -643,8 +643,6 @@ class ImproveLoop:
 
         return staging_dir, source_snapshot_root
 
-    _EVAL_SOURCE = "dukascopy"
-
     def _build_rpc_handlers(self, ledger: "ImproveRpcLedger", *,
                             staging_dir: Path) -> dict:
         """10.9 Step 11: run_backtest/analyze_corr の親側実装。
@@ -678,12 +676,14 @@ class ImproveLoop:
                 conn = self._db_readonly_conn_factory()
                 captured: list[dict] = []
                 intent_source = strategy_adapter.build_intent_source(
-                    meta, conn=conn, pair=args["pair"], source=self._EVAL_SOURCE,
+                    meta, conn=conn, pair=args["pair"],
+                    source=self._settings.backtest.eval_source,
                     settings=self._settings)
                 try:
                     holdout.run_in_sample(
                         self._settings, history_conn=conn, symbol=args["pair"],
-                        source=self._EVAL_SOURCE, intent_source=intent_source,
+                        source=self._settings.backtest.eval_source,
+                        intent_source=intent_source,
                         eval_timeframe=meta.timeframe,
                         plugin_ref=f"plugins/_staging/{staging_dir.name}/"
                                    f"{args['name']}",
@@ -708,7 +708,7 @@ class ImproveLoop:
                                 row[0] for row in hist_conn.execute(
                                     "SELECT DISTINCT symbol FROM ohlcv_history"
                                     " WHERE interval='1m' AND source=?",
-                                    (self._EVAL_SOURCE,)))
+                                    (self._settings.backtest.eval_source,)))
                         finally:
                             hist_conn.close()
                     except Exception:
