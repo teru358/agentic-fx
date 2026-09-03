@@ -198,6 +198,54 @@ def test_commit_strategy_missing_history_becomes_gate_failed(
         in activity)
 
 
+def test_commit_strategy_other_valueerror_still_propagates(
+        loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """段 0 変異 M1 (2026-09-03) の pin: gate の ValueError を gate_failed に
+    変換するのは「no 1m history for symbol=」で始まるデータ欠損だけ。
+    それ以外の ValueError はプログラム欠陥の可能性があるため素通しで
+    commit を中断させる (黙って observation に落とすと欠陥が隠れる)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    _write_candidate(staging_dir, "myst")
+    (staging_dir / "myst" / "config.yaml").write_text(
+        "kind: strategy\npairs: [EURUSD]\ntimeframe: 1h\n"
+        "exit_mode: levels\nparams: {}\n")
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    result = MissionResult(status="completed", output={
+        "discoveries": [],
+        "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "artifact": {"type": "plugin", "name": "myst", "kind": "strategy",
+                     "self_test": "passed", "summary": "s"},
+        "selection_rationale": "r"}, transcript=[])
+    gate_verdict = SimpleNamespace(
+        passed=True, content_hash="c" * 64, artifact_hash="a" * 64)
+    meta = SimpleNamespace(max_bars=100)
+    monkeypatch.setattr(
+        loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.loader._discover_one", lambda *a, **kw: meta)
+    monkeypatch.setattr(
+        loop_full, "_run_strategy_gate",
+        lambda *a, **kw: (_ for _ in ()).throw(ValueError(
+            "pair 'USDJPY' is not in plugin 'myst's declared pairs")))
+
+    with pytest.raises(ValueError, match="declared pairs"):
+        loop_full.commit(mission=mission, ctx=ctx, result=result,
+                         now=datetime(2026, 8, 22, tzinfo=timezone.utc))
+
+    backlog_row = conn.execute(
+        "SELECT status FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert backlog_row["status"] != "observation"
+
+
 def test_commit_rolls_back_tx2_on_db_fault_between_gate_rows_and_approval(
         loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
     """レビュー1周目 I4: `_finalize_success` の Tx-2 本体 (台帳→gate rows→

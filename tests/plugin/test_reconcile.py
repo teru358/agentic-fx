@@ -219,6 +219,22 @@ def test_sweep_orphans_deletes_readonly_staging_snapshot(env):
     assert not snapshot_dir.exists()
 
 
+def test_sweep_orphans_deletes_readonly_stray_file_in_staging(env):
+    """段 0 変異 M8 (2026-09-03) の pin: _staging/<id>/ 直下の候補が
+    ディレクトリでなく読み取り専用ファイル (残骸) でも sweep が chmod +
+    unlink で消す (dir 分岐しか検証していないと unlink 除去が生存する)。"""
+    tmp_path, plugins_dir, conn = env
+    mission_dir = plugins_dir / "_staging" / "39"
+    mission_dir.mkdir(parents=True)
+    stray = mission_dir / "leftover.txt"
+    stray.write_text("x")
+    stray.chmod(0o400)
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+
+    assert not stray.exists()
+
+
 def test_sweep_orphans_preserves_staging_candidate_referenced_by_pending_approval(env):
     """確定-10 の対称側: pending approval が参照している staging 候補は
     削除されない。"""
