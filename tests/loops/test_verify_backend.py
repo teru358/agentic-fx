@@ -135,6 +135,12 @@ def test_verify_backend_constructs_worker_runner_with_run_context_and_rejecting_
     assert kwargs["worker_profile"] == "improve"
     ctx = kwargs["run_context"]
     assert kwargs["rpc_handlers"] is ctx.rpc_handlers
+    expected_timeouts = {
+        "run_backtest": _settings().improve.backtest_rpc_timeout_sec,
+        "analyze_corr": _settings().improve.backtest_rpc_timeout_sec,
+    }
+    assert kwargs["rpc_timeout_sec_by_kind"] == expected_timeouts
+    assert ctx.ledger._rpc_timeout_sec_by_kind == expected_timeouts
     with pytest.raises(RuntimeError):
         ctx.rpc_handlers["run_backtest"]({})
     with pytest.raises(RuntimeError):

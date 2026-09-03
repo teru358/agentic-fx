@@ -1023,6 +1023,68 @@ def test_worker_runner_rag_rpc_leak_calls_on_rpc_leak(tmp_path, monkeypatch):
     assert on_rpc_leak_called, "on_rpc_leak should have been called"
 
 
+def test_worker_runner_uses_rpc_kind_timeout_and_default_for_other_names(
+        tmp_path, monkeypatch):
+    """種別別 timeout は対象 RPC だけを延長し、他名は既定値で切る。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    responses: list[dict] = []
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        for seq, name in ((2, "run_backtest"), (3, "other_rpc")):
+            write_frame(child_out, {
+                "type": "tool_rpc", "seq": seq, "rpc_id": str(seq),
+                "name": name, "args": {},
+            })
+            responses.append(json.loads(child_in.readline()))
+        write_frame(child_out, {"type": "result", "seq": 4,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    child_thread = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: FakeProc())
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    def slow_success(_args):
+        time.sleep(0.5)
+        return {"finished": True}
+
+    settings = _tiny_worker_settings(rpc_timeout_sec=0.2)
+    runner = WorkerRunner(
+        root=_root(tmp_path), settings=settings, clock=FixedClock(NOW),
+        rag=_rag(tmp_path),
+        rpc_handlers={"run_backtest": slow_success, "other_rpc": slow_success},
+        rpc_timeout_sec_by_kind={"run_backtest": 2.0},
+    )
+
+    child_thread.start()
+    result = runner.run(_mission())
+    child_thread.join(timeout=3.0)
+
+    assert result.status == "completed"
+    assert responses[0]["ok"] is True
+    assert responses[0]["result"] == {"finished": True}
+    assert responses[1]["ok"] is False
+    assert responses[1]["error"] == "rag rpc timed out"
+
+
 def test_worker_runner_finally_joins_dispatcher_before_closing_stdin(tmp_path, monkeypatch):
     """IM-7 対応: finally 節は proc.stdin を close する前に dispatcher
     スレッドの join を完了させる (dispatcher が stdin_lock を保持して

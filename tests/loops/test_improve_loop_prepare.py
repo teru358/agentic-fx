@@ -769,6 +769,11 @@ def test_build_worker_runner_passes_ctx_as_run_context(loop_full, conn):
     # tests/runners/test_worker_runner.py::
     # test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag)。
     assert runner._rpc_handlers is ctx.rpc_handlers
+    expected_timeouts = {
+        "run_backtest": loop_full._settings.improve.backtest_rpc_timeout_sec,
+        "analyze_corr": loop_full._settings.improve.backtest_rpc_timeout_sec,
+    }
+    assert runner._rpc_timeout_sec_by_kind == expected_timeouts
 
 
 def test_read_candidate_kind_defaults_to_indicator_when_key_omitted(

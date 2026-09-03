@@ -254,9 +254,7 @@ class ImproveLoop:
             staging_dir, source_snapshot_dir = self._materialize_workspace(
                 conn, mission_id, allowed_ids)
             ledger = ImproveRpcLedger(
-                rpc_timeout_sec_by_kind={
-                    "run_backtest": self._settings.improve.backtest_rpc_timeout_sec,
-                    "analyze_corr": self._settings.improve.backtest_rpc_timeout_sec})
+                rpc_timeout_sec_by_kind=self._improve_rpc_timeout_sec_by_kind())
             rpc_handlers = self._build_rpc_handlers(ledger, staging_dir=staging_dir)
             ctx = ImproveRunContext(
                 mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
@@ -797,7 +795,12 @@ class ImproveLoop:
         return WorkerRunner(
             root=self._root, settings=self._settings, clock=self._clock,
             rag=self._rag, worker_profile="improve",
-            run_context=ctx, on_ready=on_ready, rpc_handlers=ctx.rpc_handlers)
+            run_context=ctx, on_ready=on_ready, rpc_handlers=ctx.rpc_handlers,
+            rpc_timeout_sec_by_kind=self._improve_rpc_timeout_sec_by_kind())
+
+    def _improve_rpc_timeout_sec_by_kind(self) -> dict[str, float]:
+        timeout = self._settings.improve.backtest_rpc_timeout_sec
+        return {"run_backtest": timeout, "analyze_corr": timeout}
 
     def _freeze_ledger(self, ctx: ImproveRunContext) -> None:
         ctx.ledger.freeze()
@@ -1524,12 +1527,14 @@ class ImproveLoop:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
                             reason=("gate_failed:backtest_data_unavailable:"
-                                    f"{exc}"), now=now)
+                                    f"{exc}"), now=now,
+                            gate_rows=tuple(gate_rows))
                         return
                     if not strategy_verdict.evaluable:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
-                            reason=strategy_verdict.observation_reason, now=now)
+                            reason=strategy_verdict.observation_reason, now=now,
+                            gate_rows=tuple(gate_rows))
                         return
                     gate_metrics["baseline"] = strategy_verdict.baseline_row
 
@@ -1879,7 +1884,8 @@ class ImproveLoop:
         self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
                              final_path=final_path, now=now)
 
-    def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now) -> None:
+    def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now,
+                              gate_rows=()) -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
         `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
@@ -1923,6 +1929,9 @@ class ImproveLoop:
         except OSError as exc:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                self._persist_gate_rows(
+                    conn, gate_rows=gate_rows, now=now,
+                    mission_id=ctx.mission_id)
                 missions_store.finish_improve_mission(
                     conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                     slot_key=ctx.slot_key, mission_status="completed",
@@ -1944,6 +1953,9 @@ class ImproveLoop:
 
         conn.execute("BEGIN IMMEDIATE")
         try:
+            self._persist_gate_rows(
+                conn, gate_rows=gate_rows, now=now,
+                mission_id=ctx.mission_id)
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="completed",

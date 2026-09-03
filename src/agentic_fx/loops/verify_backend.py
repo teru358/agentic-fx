@@ -181,9 +181,11 @@ def verify_backend(
         from agentic_fx.loops.improve_run_context import ImproveRunContext
         from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 
-        ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
+        rpc_timeout_sec_by_kind = {
             "run_backtest": scoped_settings.improve.backtest_rpc_timeout_sec,
-            "analyze_corr": scoped_settings.improve.backtest_rpc_timeout_sec})
+            "analyze_corr": scoped_settings.improve.backtest_rpc_timeout_sec}
+        ledger = ImproveRpcLedger(
+            rpc_timeout_sec_by_kind=rpc_timeout_sec_by_kind)
         ctx = ImproveRunContext(
             mission_id=mission_id, run_id=-1,
             staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
@@ -221,7 +223,8 @@ def verify_backend(
         runner = WorkerRunner(
             root=root, settings=scoped_settings, clock=clock, rag=rag,
             worker_profile="improve", run_context=ctx, on_ready=on_ready,
-            rpc_handlers=ctx.rpc_handlers)
+            rpc_handlers=ctx.rpc_handlers,
+            rpc_timeout_sec_by_kind=rpc_timeout_sec_by_kind)
 
         mission = Mission(
             prompt=(

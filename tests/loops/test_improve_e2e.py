@@ -802,6 +802,13 @@ def test_strategy_below_evaluable_min_trades_becomes_observation(improve_env):
         "ORDER BY id DESC LIMIT 1").fetchone()
     assert backlog_row[0] == "observation"
     assert backlog_row[1].startswith("insufficient_trades:")
+    persisted = conn.execute(
+        "SELECT mission_id, scope FROM backtest_runs WHERE mission_id=?",
+        (ctx.mission_id,),
+    ).fetchall()
+    assert [(row[0], row[1]) for row in persisted] == [
+        (ctx.mission_id, "in_sample")
+    ]
 
 
 def test_artifact_name_traversal_fails_mission(improve_env):

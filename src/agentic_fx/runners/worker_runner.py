@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from agentic_fx.core.contracts import Clock
 from agentic_fx.core.mission_protocol import (
@@ -88,6 +88,7 @@ class WorkerRunner(AgentRunner):
                 on_rpc_leak: Callable[[], None] | None = None,
                 on_ready: Callable[[dict], None] | None = None,
                 rpc_handlers: dict[str, Callable] | None = None,
+                rpc_timeout_sec_by_kind: Mapping[str, float] | None = None,
                 stop_event: threading.Event | None = None) -> None:
         self._root = root
         self._settings = settings
@@ -98,6 +99,7 @@ class WorkerRunner(AgentRunner):
         self._on_rpc_leak = on_rpc_leak
         self._on_ready = on_ready
         self._rpc_handlers = rpc_handlers
+        self._rpc_timeout_sec_by_kind = dict(rpc_timeout_sec_by_kind or {})
         self._stop_event = stop_event
 
     def close(self) -> None:
@@ -295,8 +297,10 @@ class WorkerRunner(AgentRunner):
 
                 threading.Thread(target=_rpc_worker, daemon=True,
                                  name="afx-rag-rpc").start()
+                rpc_timeout_sec = self._rpc_timeout_sec_by_kind.get(
+                    frame["name"], w.rpc_timeout_sec)
                 try:
-                    ok, payload = result_queue.get(timeout=w.rpc_timeout_sec)
+                    ok, payload = result_queue.get(timeout=rpc_timeout_sec)
                     response = ({"ok": True, "result": payload} if ok
                                else {"ok": False, "error": payload})
                 except queue.Empty:
@@ -305,7 +309,7 @@ class WorkerRunner(AgentRunner):
                               "reclaimed but will not block process exit "
                               "(daemon thread — 设計書 §4.3 codex I3-1, "
                               "レビュー FC-1)",
-                              w.rpc_timeout_sec, frame["name"])
+                              rpc_timeout_sec, frame["name"])
                     if self._on_rpc_leak is not None:
                         try:
                             self._on_rpc_leak()
@@ -463,12 +467,14 @@ class WorkerRunner(AgentRunner):
             # stdin_lock の外から proc.stdin.close() すると、dispatcher が
             # まさに書込中の瞬間と競合し得る (設計書 §4.3「writer は
             # 2 時点で排他」違反 — レビュー IM-7)。dispatcher を先に join
-            # する (dispatcher 自身は `result_queue.get(timeout=
-            # w.rpc_timeout_sec)` で必ず打ち切られるため — FC-1 対応の
+            # する (dispatcher 自身は RPC 種別に応じた timeout 付きの
+            # `result_queue.get()` で必ず打ち切られるため — FC-1 対応の
             # daemon スレッドがリークしても、dispatcher 自体は有限時間で
             # `dispatch_queue.get()` に戻り、None sentinel を見て return
             # する — 有界待ち)。
-            dispatcher.join(timeout=w.rpc_timeout_sec + 5.0)
+            dispatcher_timeout_sec = max(
+                [w.rpc_timeout_sec, *self._rpc_timeout_sec_by_kind.values()])
+            dispatcher.join(timeout=dispatcher_timeout_sec + 5.0)
             with stdin_lock:
                 stdin_state["closed"] = True
                 try:
