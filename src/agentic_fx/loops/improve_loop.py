@@ -63,6 +63,28 @@ _log = logging.getLogger("agentic_fx.improve_loop")
 _PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
+class _BacktestReply(dict):
+    """公開応答とは別に、同一プロセスのTx-2用元データを保持する。"""
+
+    def __init__(self, reply: dict, save_kwargs: dict) -> None:
+        super().__init__(reply)
+        self.save_kwargs = save_kwargs
+
+
+def _backtest_reply_from_save_kwargs(save_kwargs: dict) -> dict:
+    """永続化用 save kwargs を JSON-safe な RPC 応答へ限定投影する。
+    期間端点 (`period`) と保存時刻 (`now`) は agent に見せない (遮断 7、
+    `improve_rpc_tools._FORBIDDEN_KEYS`) — 台帳用の元データは属性で運ぶ。"""
+    return _BacktestReply({
+        "scope": save_kwargs["scope"],
+        "pair": save_kwargs["pair"],
+        "timeframe": save_kwargs["timeframe"],
+        "source": save_kwargs["source"],
+        "metrics": save_kwargs["metrics"],
+        "trial_count": 1,
+    }, save_kwargs)
+
+
 @dataclass(frozen=True)
 class _InspectionVerdict:  # 新規命名
     ok: bool
@@ -741,8 +763,7 @@ class ImproveLoop:
                 _log.exception("run_backtest_handler failed for %r",
                                args.get("name"))
                 return {"error": "backtest_failed"}
-            save_kwargs = captured[0]
-            return {**save_kwargs, "trial_count": 1}
+            return _backtest_reply_from_save_kwargs(captured[0])
 
         def analyze_corr_handler(args: dict) -> dict:
             try:

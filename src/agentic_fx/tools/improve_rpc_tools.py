@@ -80,9 +80,12 @@ def build_improve_rpc_tooldefs(
                         "candidate_kind": meta.kind,
                         "hint": _RUN_BACKTEST_KIND_HINT}
         result = run_backtest_handler({"name": name, "pair": pair})
+        # 台帳は永続化用 save_kwargs (period/now 込み) を読む契約 —
+        # agent 向け応答 (JSON-safe、期間端点なし) とは別物として受け取る。
+        ledger_result = getattr(result, "save_kwargs", result)
         ledger.record(opaque_ref=f"run_backtest:{name}:{pair}",
                       kind="run_backtest", params={"name": name, "pair": pair},
-                      result_summary=result,
+                      result_summary=ledger_result,
                       trial_count=result.get("trial_count", 1))
         return _strip_forbidden(result)
 

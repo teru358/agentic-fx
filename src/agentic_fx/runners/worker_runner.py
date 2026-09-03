@@ -317,14 +317,30 @@ class WorkerRunner(AgentRunner):
                             _log.exception("on_rpc_leak callback failed")
                     response = {"ok": False, "error": "rag rpc timed out"}
                 out_seq_holder["n"] += 1
+                result_frame = {
+                    "type": "tool_rpc_result",
+                    "seq": out_seq_holder["n"] + 1,  # handshake=1 済み
+                    "rpc_id": frame["rpc_id"], **response}
                 try:
                     with stdin_lock:
                         if stdin_state["closed"]:
                             return
-                        write_frame(proc.stdin, {
-                            "type": "tool_rpc_result",
-                            "seq": out_seq_holder["n"] + 1,  # handshake=1 済み
-                            "rpc_id": frame["rpc_id"], **response})
+                        write_frame(proc.stdin, result_frame)
+                except (TypeError, ValueError):
+                    _log.error("rpc result not serializable name=%s type=%s",
+                               frame["name"], type(payload).__name__)
+                    try:
+                        with stdin_lock:
+                            if stdin_state["closed"]:
+                                return
+                            write_frame(proc.stdin, {
+                                "type": "tool_rpc_result",
+                                "seq": result_frame["seq"],
+                                "rpc_id": frame["rpc_id"],
+                                "ok": False,
+                                "error": "rpc result not serializable"})
+                    except (BrokenPipeError, OSError):
+                        return
                 except (BrokenPipeError, OSError):
                     return  # 子が既に死んでいる — 応答不能
 

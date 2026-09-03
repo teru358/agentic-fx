@@ -36,6 +36,66 @@ SETTINGS = load_settings(
 NOW = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
 
 
+def test_rpc_serialization_failure_returns_error_and_dispatcher_survives(
+        tmp_path, monkeypatch):
+    """JSON 化不能な応答の後も dispatcher が次の RPC を処理する。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    responses: list[dict] = []
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "tool_rpc", "seq": 2,
+                                "rpc_id": "bad", "name": "bad",
+                                "args": {}})
+        responses.append(json.loads(child_in.readline()))
+        write_frame(child_out, {"type": "tool_rpc", "seq": 3,
+                                "rpc_id": "good", "name": "good",
+                                "args": {}})
+        responses.append(json.loads(child_in.readline()))
+        write_frame(child_out, {"type": "result", "seq": 4,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    thread = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: FakeProc())
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+    runner = WorkerRunner(
+        root=_root(tmp_path), settings=SETTINGS,
+        clock=FixedClock(NOW), rag=_rag(tmp_path),
+        rpc_handlers={"bad": lambda args: {"x": datetime.now()},
+                      "good": lambda args: {"value": 7}},
+    )
+
+    thread.start()
+    result = runner.run(_mission())
+    thread.join(timeout=2)
+
+    assert result.status == "completed"
+    assert responses == [
+        {"type": "tool_rpc_result", "seq": 2, "rpc_id": "bad",
+         "ok": False, "error": "rpc result not serializable"},
+        {"type": "tool_rpc_result", "seq": 3, "rpc_id": "good",
+         "ok": True, "result": {"value": 7}},
+    ]
+
+
 def _root(tmp_path):
     import shutil
     root = tmp_path / "root"

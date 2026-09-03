@@ -67,6 +67,8 @@ def build_runner(
             bin_path=Path(settings.runner.opencode.bin).expanduser(),
             model=choice.model,
             context_limit=settings.runner.opencode.context_limit,
+            mcp_timeout_ms=int(
+                settings.improve.backtest_rpc_timeout_sec * 1000) + 5000,
             workdir=workdir, llama_swap_base_url=settings.llama_swap.base_url,
             cli_terminate_grace_sec=settings.runner.cli_terminate_grace_sec,
             registry=registry, on_message=on_message,

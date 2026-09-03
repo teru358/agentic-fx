@@ -171,6 +171,7 @@ def test_build_runner_opencode_forwards_base_url(tmp_path, monkeypatch):
     assert "~" not in str(captured["bin_path"])
     assert Path(captured["bin_path"]).is_absolute()
     assert captured["context_limit"] == 65536
+    assert captured["mcp_timeout_ms"] == 605000
 
 
 def test_build_runner_rejects_unvalidated_opencode_context_limit(

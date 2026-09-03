@@ -11,6 +11,7 @@ tz-aware に揃える)。
 from __future__ import annotations
 
 import math
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,10 +83,9 @@ def _patch_run_in_sample(monkeypatch, save_kwargs=_SAVE_KWARGS):
         _fake_run_in_sample)
 
 
-def test_run_backtest_handler_hides_period_and_now_from_agent(
+def test_run_backtest_handler_returns_json_safe_limited_reply(
         loop_full, tmp_path, monkeypatch):
-    """遮断7: `_FORBIDDEN_KEYS` に `period`/`now` を足さないと、save_kwargs
-    をそのまま返す run_backtest handler が期間端点/日時を agent へ漏らす。"""
+    """実際の save_kwargs 形でも RPC 応答は限定され JSON 化できる。"""
     _patch_strategy_lookup(monkeypatch)
     _patch_run_in_sample(monkeypatch)
     staging_dir = tmp_path / "staging"
@@ -98,8 +98,18 @@ def test_run_backtest_handler_hides_period_and_now_from_agent(
         analyze_corr_handler=handlers["analyze_corr"])}
 
     out = tools["run_backtest"].func(name="myst", pair="USDJPY")
+
+    json.dumps(out)
+    assert out == {
+        "scope": "in_sample",
+        "pair": "USDJPY",
+        "timeframe": "1h",
+        "source": "dukascopy",
+        "metrics": {"pf": 1.3, "trades": 40},
+        "trial_count": 1,
+    }
     assert "period" not in out and "now" not in out
-    assert "period_start" not in out and "period_end" not in out
+    assert "content_hash" not in out
 
 
 def test_run_backtest_handler_source_follows_backtest_settings(

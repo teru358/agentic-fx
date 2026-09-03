@@ -23,6 +23,7 @@ def _runner(tmp_path):
                           workdir=workdir,
                           llama_swap_base_url="http://localhost:8080/v1",
                           context_limit=65536,
+                          mcp_timeout_ms=605000,
                           cli_terminate_grace_sec=1, registry=ToolRegistry()), workdir
 
 
@@ -64,6 +65,7 @@ def _resume_runner(tmp_path: Path, bin_path: Path, **over):
     kw = dict(bin_path=bin_path, model="qwen-test", workdir=workdir,
               llama_swap_base_url="http://localhost:8080/v1",
               context_limit=65536,
+              mcp_timeout_ms=605000,
               cli_terminate_grace_sec=0.3, registry=ToolRegistry())
     kw.update(over)
     return OpencodeRunner(**kw), workdir
@@ -93,6 +95,16 @@ def _step_finish(reason: str | None) -> str:
         "sessionID": "ses_fa86fce77ffe1MJzH5eShyXdY2",
         "part": part,
     })
+
+
+def test_opencode_config_sets_mcp_timeout(tmp_path):
+    runner, workdir = _runner(tmp_path)
+
+    runner._build_argv(_mission(), mcp_socket=tmp_path / "mcp.sock")
+
+    config = json.loads(
+        (workdir / "home/.config/opencode/opencode.json").read_text())
+    assert config["mcp"]["afx"]["timeout"] == 605000
 
 
 def test_opencode_resumes_session_and_recovers_json_after_no_output(tmp_path):
@@ -462,6 +474,7 @@ def test_opencode_extract_output_fails_closed_when_no_text_event(tmp_path):
         bin_path=Path("/usr/bin/true"), model="m", workdir=workdir,
         llama_swap_base_url="http://127.0.0.1:1/v1",
         context_limit=65536,
+        mcp_timeout_ms=605000,
         cli_terminate_grace_sec=0.3, registry=ToolRegistry())
     lines = ['{"type": "step_start", "part": {"type": "step-start"}}',
              'not-json', _step_finish(None)]
