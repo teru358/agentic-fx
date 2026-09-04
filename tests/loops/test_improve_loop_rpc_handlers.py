@@ -375,6 +375,32 @@ def test_run_backtest_handler_reports_missing_history_with_available_pairs(
     assert "USDJPY" not in result["hint"]
 
 
+def test_run_backtest_handler_maps_real_holdout_missing_history_contract(
+        loop_no_seam, tmp_path, monkeypatch):
+    """実 DB の空履歴から出る holdout の文言を handler 契約まで pin する。"""
+    loop, _ = loop_no_seam
+    _patch_strategy_lookup(monkeypatch)
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+    handlers = loop._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging_dir)
+
+    result = handlers["run_backtest"]({"name": "myst", "pair": "EURUSD"})
+
+    assert result == {
+        "error": "no_history_for_symbol",
+        "message": (
+            "no 1m history for symbol='EURUSD' source='dukascopy' "
+            "(cannot determine in-sample start)"),
+        "hint": (
+            "No 1m history for EURUSD, and no pair has local backtest "
+            "history yet — run_backtest cannot succeed until history data is "
+            "imported. Report this as a discovery instead of retrying other "
+            "pairs."),
+    }
+
+
 def test_run_backtest_handler_missing_history_hint_lists_pairs_with_data(
         loop_no_seam, tmp_path, monkeypatch):
     """1m 履歴が実在する symbol だけを hint に載せる (settings.pairs では

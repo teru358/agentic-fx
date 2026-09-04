@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from agentic_fx.config import ConfigError, Settings, load_settings
+from agentic_fx.config import BacktestSettings, ConfigError, Settings, load_settings
 from agentic_fx.core.accounting import drawdown_pct
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example"
@@ -25,6 +25,11 @@ def test_example_file_loads():
     assert s.runner.trade.backend == "local"
     assert s.datafeed.yfinance.enabled is True
     assert s.datafeed.mt5.enabled is False
+
+
+def test_backtest_settings_eval_source_defaults_to_dukascopy():
+    assert BacktestSettings(
+        holdout_months=1, initial_balance=1.0).eval_source == "dukascopy"
 
 
 def test_opencode_is_improve_only_and_codex_llama_swap_is_rejected():
