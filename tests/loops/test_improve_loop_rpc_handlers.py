@@ -423,6 +423,10 @@ def test_run_backtest_handler_missing_history_hint_lists_pairs_with_data(
         "INSERT INTO ohlcv_history (symbol, interval, bar_time, open, high,"
         " low, close, volume, source) VALUES ('USDJPY', '1m',"
         " '2026-01-01T00:00:00+00:00', 1, 1, 1, 1, 0, 'mt5')")
+    seed_conn.execute(
+        "INSERT INTO ohlcv_history (symbol, interval, bar_time, open, high,"
+        " low, close, volume, source) VALUES ('EURUSD', '1m',"
+        " '2026-01-01T00:00:00+00:00', 1, 1, 1, 1, 0, 'dukascopy')")
     seed_conn.commit()
     seed_conn.close()
     staging_dir = tmp_path / "staging"
@@ -434,6 +438,8 @@ def test_run_backtest_handler_missing_history_hint_lists_pairs_with_data(
 
     assert result["error"] == "no_history_for_symbol"
     assert "Pairs with local backtest history: USDJPY." in result["hint"]
+    available = result["hint"].split("history: ", 1)[1]
+    assert "EURUSD" not in available
 
 
 def test_run_backtest_handler_reports_pair_not_declared(

@@ -183,8 +183,14 @@ def copy_examples_snapshot(examples_root: Path, *, dest_root: Path) -> None:
 def _chmod_tree_readonly(root: Path) -> None:
     for dirpath, dirnames, filenames in os.walk(root):
         for fname in filenames:
-            os.chmod(os.path.join(dirpath, fname), 0o400)
-        os.chmod(dirpath, 0o500)
+            p = Path(dirpath) / fname
+            if p.is_symlink():
+                continue
+            p.chmod(0o400)
+        p = Path(dirpath)
+        if p.is_symlink():
+            continue
+        p.chmod(0o500)
 
 
 # Task 12 Step3: `_prepare_report_if_applicable` が OSError を捕まえて
@@ -1781,8 +1787,14 @@ class ImproveLoop:
         import shutil
         for dirpath, dirnames, filenames in os.walk(ctx.staging_dir):
             for fname in filenames:
-                os.chmod(os.path.join(dirpath, fname), 0o600)
-            os.chmod(dirpath, 0o700)
+                p = Path(dirpath) / fname
+                if p.is_symlink():
+                    continue
+                p.chmod(0o600)
+            p = Path(dirpath)
+            if p.is_symlink():
+                continue
+            p.chmod(0o700)
         shutil.rmtree(ctx.staging_dir, ignore_errors=True)
 
     def _finalize_failed_mission(self, conn, *, ctx, result, now,

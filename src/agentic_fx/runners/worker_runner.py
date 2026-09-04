@@ -299,6 +299,7 @@ class WorkerRunner(AgentRunner):
                                  name="afx-rag-rpc").start()
                 rpc_timeout_sec = self._rpc_timeout_sec_by_kind.get(
                     frame["name"], w.rpc_timeout_sec)
+                payload = None
                 try:
                     ok, payload = result_queue.get(timeout=rpc_timeout_sec)
                     response = ({"ok": True, "result": payload} if ok

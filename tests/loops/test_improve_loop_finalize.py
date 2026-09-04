@@ -31,6 +31,22 @@ def _write_candidate(staging_dir: Path, name: str) -> None:
         "def test_z():\n    pass\n")
 
 
+def test_delete_staging_does_not_chmod_file_symlink_target(
+        loop_min, tmp_path):
+    external = tmp_path / "external.txt"
+    external.write_text("outside")
+    external.chmod(0o400)
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    (staging_dir / "external-link").symlink_to(external)
+    ctx = SimpleNamespace(staging_dir=staging_dir)
+
+    loop_min._delete_staging(ctx)
+
+    assert external.stat().st_mode & 0o777 == 0o400
+    assert not staging_dir.exists()
+
+
 def test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin(
         loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
     """End-to-end (fake CLI 出力を使う) — 発見→選択→plugin ゲート合格→
@@ -91,6 +107,7 @@ def test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin(
                      now=datetime(2026, 8, 22))
 
     assert call_order == _EXPECTED_ORDER
+    assert ctx.ledger._state == "PERSISTED"
 
     m = conn.execute("SELECT status FROM missions WHERE id=?",
                      (mission_id,)).fetchone()
@@ -166,11 +183,22 @@ def test_commit_strategy_missing_history_becomes_gate_failed(
         loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
     monkeypatch.setattr(
         "agentic_fx.plugin.loader._discover_one", lambda *a, **kw: meta)
-    monkeypatch.setattr(
-        loop_full, "_run_strategy_gate",
-        lambda *a, **kw: (_ for _ in ()).throw(ValueError(
+    def fake_strategy_gate(*a, **kw):
+        kw["record_fn"]({
+            "scope": "holdout_gate", "plugin_ref": "plugins/myst",
+            "content_hash": "c" * 64, "kind": "strategy",
+            "pair": "USDJPY", "timeframe": "1h", "source": "dukascopy",
+            "period": (datetime(2026, 1, 1, tzinfo=timezone.utc),
+                       datetime(2026, 2, 1, tzinfo=timezone.utc)),
+            "metrics": {"pf": 1.1}, "settings_hash": "settings-hash",
+            "core_commit": "core", "initial_balance": 10000.0,
+            "now": datetime(2026, 2, 1, tzinfo=timezone.utc),
+        })
+        raise ValueError(
             "no 1m history for symbol='EURUSD' source='dukascopy' "
-            "(cannot determine in-sample start)")))
+            "(cannot determine in-sample start)")
+
+    monkeypatch.setattr(loop_full, "_run_strategy_gate", fake_strategy_gate)
 
     loop_full.commit(mission=mission, ctx=ctx, result=result,
                      now=datetime(2026, 8, 22, tzinfo=timezone.utc))
@@ -196,6 +224,44 @@ def test_commit_strategy_missing_history_becomes_gate_failed(
     assert (
         "backtest_data_unavailable:no 1m history for symbol='EURUSD'"
         in activity)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backtest_runs WHERE mission_id=?",
+        (mission_id,)).fetchone()[0] == 1
+
+
+def test_finalize_gate_failed_persists_gate_rows_when_report_write_raises_oserror(
+        loop_min, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """L05: report part 作成失敗の補償 Tx にも親 gate 行を残す。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+    gate_rows = ({
+        "scope": "holdout_gate", "plugin_ref": "plugins/myst",
+        "content_hash": "c" * 64, "kind": "strategy", "pair": "USDJPY",
+        "timeframe": "1h", "source": "dukascopy",
+        "period": (datetime(2026, 1, 1, tzinfo=timezone.utc),
+                   datetime(2026, 2, 1, tzinfo=timezone.utc)),
+        "metrics": {"pf": 1.1}, "settings_hash": "settings-hash",
+        "core_commit": "core", "initial_balance": 10000.0,
+        "now": datetime(2026, 2, 1, tzinfo=timezone.utc),
+    },)
+    monkeypatch.setattr(
+        loop_min, "_write_report_part",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError("write failed")))
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id, reason="gate_failed:test",
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc), gate_rows=gate_rows)
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backtest_runs WHERE mission_id=?",
+        (mission_id,)).fetchone()[0] == 1
 
 
 def test_commit_real_strategy_gate_missing_history_becomes_gate_failed(
@@ -293,6 +359,7 @@ def test_commit_strategy_other_valueerror_still_propagates(
         "SELECT status FROM improvement_backlog WHERE id=?",
         (backlog_id,)).fetchone()
     assert backlog_row["status"] != "observation"
+    assert staging_dir.exists()
 
 
 def test_commit_rolls_back_tx2_on_db_fault_between_gate_rows_and_approval(

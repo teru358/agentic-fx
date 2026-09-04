@@ -529,6 +529,24 @@ def test_analyze_for_agent_success_saves_run_and_returns_flat_shape(tmp_path):
         == 1
 
 
+@pytest.mark.parametrize("kind", ["rolling_corr_summary", "lead_lag"])
+def test_analyze_for_agent_pair_analysis_uses_configured_mt5_source(
+        tmp_path, kind):
+    """L23: pair 分析は dukascopy 固定でなく eval_source を使う。"""
+    conn = _conn(tmp_path)
+    _seed_two_series(conn, start=BEFORE_BOUNDARY, source="mt5")
+    settings = _settings_watch_eurusd().model_copy(update={
+        "backtest": SETTINGS.backtest.model_copy(update={"eval_source": "mt5"})})
+    request = {"kind": kind, "a": "USDJPY", "b": "EURUSD",
+               "timeframe": "1h"}
+    if kind == "rolling_corr_summary":
+        request["window"] = 20
+
+    out = analyze_for_agent(conn, settings, request, now=NOW)
+
+    assert "error" not in out
+
+
 def test_analyze_for_agent_corr_matrix_pairs_keys_are_slash_joined(tmp_path):
     conn = _conn(tmp_path)
     _seed_two_series(conn, start=BEFORE_BOUNDARY)

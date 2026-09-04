@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.plugin import switch, version_store
+from agentic_fx.activity import ActivityLog
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import db as db_store
 
@@ -195,6 +196,48 @@ def test_sweep_orphans_deletes_staging_candidate_without_pending_approval(env):
     switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
 
     assert not candidate_dir.exists()
+
+
+def test_sweep_orphans_does_not_chmod_file_symlink_target(env):
+    tmp_path, plugins_dir, conn = env
+    external = tmp_path / "external.txt"
+    external.write_text("outside")
+    external.chmod(0o400)
+    candidate_dir = plugins_dir / "_staging" / "1" / "orphan"
+    candidate_dir.mkdir(parents=True)
+    (candidate_dir / "external-link").symlink_to(external)
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+
+    assert external.stat().st_mode & 0o777 == 0o400
+    assert not candidate_dir.exists()
+
+
+def test_sweep_orphans_logs_rmtree_failure_and_continues(env, monkeypatch):
+    """L29: 1候補の削除失敗を記録し、後続候補を処理する。"""
+    tmp_path, plugins_dir, conn = env
+    first = plugins_dir / "_staging" / "1" / "first"
+    second = plugins_dir / "_staging" / "1" / "second"
+    first.mkdir(parents=True)
+    second.mkdir()
+    activity = ActivityLog(tmp_path / "activity.log")
+    original_rmtree = switch.shutil.rmtree
+    seen = []
+
+    def flaky_rmtree(path, *args, **kwargs):
+        seen.append(Path(path).name)
+        if len(seen) == 1:
+            raise OSError("simulated rmtree failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(switch.shutil, "rmtree", flaky_rmtree)
+
+    switch.sweep_orphans(
+        conn, plugins_root=plugins_dir, now=NOW, activity=activity)
+
+    assert sorted(seen) == ["first", "second"]
+    assert "sweep_orphan_staging_failed" in (tmp_path / "activity.log").read_text()
+    assert sum(path.exists() for path in (first, second)) == 1
 
 
 def test_sweep_orphans_deletes_readonly_staging_snapshot(env):

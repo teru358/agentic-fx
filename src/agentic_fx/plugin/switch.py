@@ -239,9 +239,14 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
                     try:
                         if candidate.is_dir():
                             for dirpath, _dirs, files in os.walk(candidate):
-                                Path(dirpath).chmod(0o700)
+                                p = Path(dirpath)
+                                if not p.is_symlink():
+                                    p.chmod(0o700)
                                 for fn in files:
-                                    (Path(dirpath) / fn).chmod(0o600)
+                                    p = Path(dirpath) / fn
+                                    if p.is_symlink():
+                                        continue
+                                    p.chmod(0o600)
                             shutil.rmtree(candidate, ignore_errors=True)
                         else:
                             candidate.chmod(0o600)

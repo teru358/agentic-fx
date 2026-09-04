@@ -98,13 +98,20 @@ def _step_finish(reason: str | None) -> str:
 
 
 def test_opencode_config_sets_mcp_timeout(tmp_path):
-    runner, workdir = _runner(tmp_path)
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    runner = OpencodeRunner(
+        bin_path=Path("/opt/opencode"), model="qwen-test", workdir=workdir,
+        llama_swap_base_url="http://localhost:8080/v1", context_limit=65536,
+        mcp_timeout_ms=12000, cli_terminate_grace_sec=1,
+        registry=ToolRegistry())
 
     runner._build_argv(_mission(), mcp_socket=tmp_path / "mcp.sock")
 
     config = json.loads(
         (workdir / "home/.config/opencode/opencode.json").read_text())
-    assert config["mcp"]["afx"]["timeout"] == 605000
+    assert config["mcp"]["afx"]["timeout"] == 12000
+    assert config["mcp"]["afx"]["enabled"] is True
 
 
 def test_opencode_resumes_session_and_recovers_json_after_no_output(tmp_path):

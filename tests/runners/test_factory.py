@@ -174,6 +174,29 @@ def test_build_runner_opencode_forwards_base_url(tmp_path, monkeypatch):
     assert captured["mcp_timeout_ms"] == 605000
 
 
+def test_build_runner_opencode_derives_mcp_timeout_from_backtest_rpc_timeout(
+        tmp_path, monkeypatch):
+    """L15: improve RPC timeout 7 秒には transport reserve 5 秒を加える。"""
+    _Fake, captured = _install_fake_cli_runner_module(
+        monkeypatch, "agentic_fx.runners.opencode_runner", "OpencodeRunner")
+    from agentic_fx.config import load_settings
+    example = Path(__file__).resolve().parents[2] / "config/settings.yaml.example"
+    settings = load_settings(example)
+    settings = settings.model_copy(update={
+        "improve": settings.improve.model_copy(
+            update={"backtest_rpc_timeout_sec": 7}),
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": "opencode"}),
+            "opencode": settings.runner.opencode.model_copy(
+                update={"context_limit": 65536})}),
+    })
+
+    build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+
+    assert captured["mcp_timeout_ms"] == 12000
+
+
 def test_build_runner_rejects_unvalidated_opencode_context_limit(
         tmp_path, monkeypatch):
     _install_fake_cli_runner_module(

@@ -536,12 +536,17 @@ def test_strategy_close_called_for_each_pair_on_success(tmp_path, settings):
                                  "pairs: [USDJPY, EURUSD]\nexit_mode: levels\n"
                                  "max_bars: 200\n")
     meta = _strategy_meta(d, name="strat_close_ok", pairs=("USDJPY", "EURUSD"))
-    two_pair_settings = settings.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
+    two_pair_settings = settings.model_copy(update={
+        "pairs": ["USDJPY", "EURUSD"],
+        "backtest": settings.backtest.model_copy(update={"eval_source": "mt5"}),
+    })
     conn = _conn(tmp_path)
 
     created: list[_FakeIntentSource] = []
+    seen_sources: list[str] = []
 
     def fake_build_intent_source(meta_arg, *, conn, pair, source, settings):
+        seen_sources.append(source)
         src = _FakeIntentSource(pair)
         created.append(src)
         return src
@@ -557,6 +562,7 @@ def test_strategy_close_called_for_each_pair_on_success(tmp_path, settings):
 
     assert len(created) == 2
     assert all(src.closed for src in created)
+    assert seen_sources == ["mt5", "mt5"]
 
 
 def test_strategy_close_called_even_when_run_in_sample_raises(tmp_path, settings):

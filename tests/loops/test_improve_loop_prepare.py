@@ -10,6 +10,7 @@ import pytest
 from agentic_fx.activity import ActivityLog
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.loops.improve_loop import _chmod_tree_readonly
 from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
@@ -17,6 +18,22 @@ from agentic_fx.store import missions as missions_store
 from agentic_fx.store.db import connect, connect_readonly, init_db
 
 from tests.loops.conftest import SETTINGS, _FakeRag, _prepare_wave_slot
+
+
+def test_chmod_tree_readonly_does_not_chmod_file_symlink_target(tmp_path):
+    external = tmp_path / "external.txt"
+    external.write_text("outside")
+    external.chmod(0o600)
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    link = tree / "external-link"
+    link.symlink_to(external)
+
+    _chmod_tree_readonly(tree)
+
+    assert external.stat().st_mode & 0o777 == 0o600
+    tree.chmod(0o700)
+    link.unlink()
 
 
 def test_improve_run_context_is_frozen_dataclass():
