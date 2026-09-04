@@ -38,6 +38,10 @@ _UTC = timezone.utc
 _log = logging.getLogger(__name__)
 
 
+class NoHistoryError(ValueError):
+    """Requested symbol/source has no local 1m history."""
+
+
 def _require_aware(dt: datetime, label: str) -> datetime:
     if dt.tzinfo is None:
         raise ValueError(f"{label} is naive; tz-aware UTC datetime required "
@@ -90,7 +94,7 @@ def _oldest_bar_start(history_conn: sqlite3.Connection, symbol: str,
         "AND source=?", (symbol, source)).fetchone()
     bar_time_iso = row[0] if row is not None else None
     if bar_time_iso is None:
-        raise ValueError(
+        raise NoHistoryError(
             f"no 1m history for symbol={symbol!r} source={source!r} "
             "(cannot determine in-sample start)")
     start = datetime.fromisoformat(bar_time_iso).astimezone(_UTC)

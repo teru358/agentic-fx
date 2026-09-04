@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -759,16 +760,37 @@ def test_prepare_compensation_failure_with_activity_none_preserves_original_exce
         loop.prepare(slot_key=None, now=clock.now())
 
 
-def test_build_worker_runner_passes_ctx_as_run_context(loop_full, conn):
+def test_build_worker_runner_passes_ctx_as_run_context(
+        loop_full, conn, monkeypatch):
     """`_build_worker_runner` が `ImproveRunContext` をそのまま
     `WorkerRunner(run_context=ctx)` へ渡すことの契約テスト (D-4 是正、
     プラン L18265 逐語 — 検収で「欠落 (10.9 Step7 M6/M7 を殺す唯一の
     pin)」と指摘された)。"""
+    class BacktestReply(dict):
+        save_kwargs = {
+            "scope": "in_sample", "plugin_ref": "plugins/probe",
+            "content_hash": "c" * 64, "kind": "strategy",
+            "pair": "USDJPY", "timeframe": "1h", "source": "dukascopy",
+            "period": ("private-start", "private-end"),
+            "metrics": {"trades": 1}, "settings_hash": "settings-hash",
+            "core_commit": "core", "initial_balance": 10000.0,
+            "now": "private-now",
+        }
+
+    raw_handlers = {
+        "run_backtest": lambda args: BacktestReply({
+            "pair": args["pair"], "trial_count": 1}),
+        "analyze_corr": lambda args: {"params": args, "trial_count": 1,
+                                       "source": "probe"},
+    }
+    monkeypatch.setattr(
+        "agentic_fx.tools.improve_rpc_tools.plugin_loader.discover_one_with_reason",
+        lambda *args: (SimpleNamespace(kind="strategy"), "ok"))
     ctx = ImproveRunContext(
         mission_id=1, run_id=1, staging_dir=Path("/tmp/x"),
         source_snapshot_dir=Path("/tmp/y"), allowed_backlog_ids=None,
         slot_key=None, ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
-        rpc_handlers={})
+        rpc_handlers=raw_handlers)
     runner = loop_full._build_worker_runner(ctx)
     assert runner._run_context is ctx
     assert runner._worker_profile == "improve"
@@ -785,7 +807,15 @@ def test_build_worker_runner_passes_ctx_as_run_context(loop_full, conn):
     # AttributeError に化ける (実プロセス回帰ピン:
     # tests/runners/test_worker_runner.py::
     # test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag)。
-    assert runner._rpc_handlers is ctx.rpc_handlers
+    assert runner._rpc_handlers is not ctx.rpc_handlers
+    reply = runner._rpc_handlers["run_backtest"]({
+        "name": "probe", "pair": "USDJPY"})
+    assert "period" not in reply
+    ctx.ledger.freeze()
+    entries = ctx.ledger.entries()
+    assert len(entries) == 1
+    assert entries[0]["result_summary"]["period"] == (
+        "private-start", "private-end")
     expected_timeouts = {
         "run_backtest": loop_full._settings.improve.backtest_rpc_timeout_sec,
         "analyze_corr": loop_full._settings.improve.backtest_rpc_timeout_sec,

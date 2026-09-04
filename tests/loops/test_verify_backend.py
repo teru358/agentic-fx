@@ -134,7 +134,8 @@ def test_verify_backend_constructs_worker_runner_with_run_context_and_rejecting_
     kwargs = _FakeVerifyWorkerRunner.captured_kwargs
     assert kwargs["worker_profile"] == "improve"
     ctx = kwargs["run_context"]
-    assert kwargs["rpc_handlers"] is ctx.rpc_handlers
+    assert kwargs["rpc_handlers"] is not ctx.rpc_handlers
+    assert set(kwargs["rpc_handlers"]) == {"run_backtest", "analyze_corr"}
     expected_timeouts = {
         "run_backtest": _settings().improve.backtest_rpc_timeout_sec,
         "analyze_corr": _settings().improve.backtest_rpc_timeout_sec,

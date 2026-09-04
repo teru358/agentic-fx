@@ -15,7 +15,7 @@ import pytest
 
 from agentic_fx.backtest import holdout, metrics, runner
 from agentic_fx.backtest.holdout import (
-    holdout_boundary, run_holdout_gate, run_in_sample,
+    NoHistoryError, holdout_boundary, run_holdout_gate, run_in_sample,
 )
 from agentic_fx.backtest.runner import BacktestResult
 from agentic_fx.store import ohlcv
@@ -72,6 +72,10 @@ def test_holdout_boundary_naive_rejected():
 def test_holdout_boundary_months_below_one_rejected():
     with pytest.raises(ValueError):
         holdout_boundary(datetime(2026, 8, 1, tzinfo=UTC), 0)
+
+
+def test_no_history_error_remains_a_value_error():
+    assert issubclass(NoHistoryError, ValueError)
 
 
 def test_wiring_pins_real_run_replay_and_compute_metrics():

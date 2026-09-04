@@ -464,6 +464,8 @@ def _build_improve_registry(*, settings: Any, workdir: Path, staging_dir: Path,
                             ) -> ToolRegistry:
     """improve profile 用 `ToolRegistry` の構築 (A-4 検収是正、裁定 R-D2)。
 
+    子 ledger は遮断の二重防御用で、親 ledger とは別なので DB に二重記録しない。
+
     A14 裁定 (2026-08-28、束D検収 verified-local-round1.md §7):
     `rpc_client` を必須引数化した。旧実装は `rpc_client=None` の既定値で
     空 `ToolRegistry()` を返す fail-open 経路を持っていた (Task 4/A-4 段階

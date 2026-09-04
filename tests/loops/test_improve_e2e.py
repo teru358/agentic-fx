@@ -694,7 +694,7 @@ def _fake_holdout_metrics():
 
 
 def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
-        improve_env):
+        improve_env, monkeypatch):
     """agent が selection_rationale に虚偽の analysis id / 回数を書いても、
     payload の analysis_run_ids / trial_count / analysis_call_count は
     RPC 台帳の実測値だけから作られる (§4.2-5, §8.1-16)。"""
@@ -719,8 +719,15 @@ def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
             ctx.staging_dir, "ledger_pin_e2e",
             _PASSING_INDICATOR_PY, _PASSING_INDICATOR_CONFIG,
             _PASSING_INDICATOR_TEST)
-        # 台帳に RPC 呼出しを一切積まない (analyze_corr/run_backtest を
-        # 呼ばない Mission) — 台帳は空のまま FROZEN になる
+        _write_staging_plugin(
+            ctx.staging_dir, "ledger_probe_e2e",
+            _PASSING_STRATEGY_PY, _PASSING_STRATEGY_CONFIG,
+            _PASSING_STRATEGY_TEST)
+        monkeypatch.setattr(
+            "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+            _fake_in_sample_metrics(40))
+        worker.kwargs["rpc_handlers"]["run_backtest"]({
+            "name": "ledger_probe_e2e", "pair": "USDJPY"})
         mission_result = worker.run(mission)
         loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
 
@@ -737,8 +744,11 @@ def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
     # 落ちた)。台帳由来であるべきフィールド (`analysis_run_ids`/
     # `trial_count`) だけを個別に検査する形に直す。
     assert payload["analysis_run_ids"] == []
-    assert payload["trial_count"] == 0
+    assert payload["trial_count"] == 1
     assert payload["analysis_call_count"] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backtest_runs WHERE mission_id=?",
+        (ctx.mission_id,)).fetchone()[0] == 1
     assert payload["selection_rationale"] == (
         "used analysis_run_ids=[9999,9998] trial_count=100000")
 
@@ -1067,31 +1077,14 @@ def test_timeout_mission_leaves_no_backtest_or_analysis_run_rows(
             ctx.staging_dir, "ledger_probe_e2e",
             _PASSING_STRATEGY_PY, _PASSING_STRATEGY_CONFIG,
             _PASSING_STRATEGY_TEST)
-        # 逐語乖離の申告 (着手前検証): `ctx.rpc_handlers` は台帳記録の
-        # **前段** (`_build_rpc_handlers` の生 handler) であり、
-        # `ledger.record(...)` の呼出しは 1 段上の
-        # `agentic_fx.tools.improve_rpc_tools.build_improve_rpc_tooldefs`
-        # が返す tool 関数の中にある (handler の戻り値をラップして
-        # record してから strip する)。旧稿は生 handler を直接呼んでいた
-        # ため台帳には一切積まれず (かつ引数に `name` が無いため
-        # `KeyError` で即例外)、`except: pass` に飲まれて空洞化していた
-        # (M-3 コメントが警告していた欠陥そのもの)。実際に呼ばれる経路
-        # (tool 関数) を通す形に直す。
-        from agentic_fx.tools.improve_rpc_tools import (
-            build_improve_rpc_tooldefs,
-        )
-        tooldefs = {
-            td.name: td.func for td in build_improve_rpc_tooldefs(
-                ledger=ctx.ledger,
-                run_backtest_handler=ctx.rpc_handlers["run_backtest"],
-                analyze_corr_handler=ctx.rpc_handlers["analyze_corr"])
-        }
         # `run_backtest` は staging に候補が無いため内部で失敗するが、
         # handler 自身が例外を飲んで `{"error": "backtest_failed"}` を
         # 返す設計 (`_build_rpc_handlers.run_backtest_handler`) なので
         # tool 関数は正常終了し `ledger.record` まで到達する。
-        tooldefs["run_backtest"](name="ledger_probe_e2e", pair="USDJPY")
-        tooldefs["analyze_corr"](request={"pairs": ["USDJPY"]})
+        worker.kwargs["rpc_handlers"]["run_backtest"](
+            {"name": "ledger_probe_e2e", "pair": "USDJPY"})
+        worker.kwargs["rpc_handlers"]["analyze_corr"](
+            {"request": {"pairs": ["USDJPY"]}})
         mission_result = worker.run(mission)
         loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
 

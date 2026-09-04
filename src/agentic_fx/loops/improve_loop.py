@@ -50,6 +50,7 @@ from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
 from agentic_fx.store import missions as missions_store
+from agentic_fx.tools.improve_rpc_tools import build_ledger_wrapped_rpc_handlers
 
 if TYPE_CHECKING:
     from agentic_fx.activity import ActivityLog
@@ -720,7 +721,7 @@ class ImproveLoop:
                     conn.close()
             except ValueError as exc:
                 message = str(exc)
-                if message.startswith("no 1m history for symbol="):
+                if isinstance(exc, holdout.NoHistoryError):
                     # settings.pairs (設定 pair) を「available」と言っては
                     # いけない — pair_rules に居てもデータが無い pair が
                     # あり得る (m47 の EURUSD がまさにそれで、モデルを
@@ -822,7 +823,10 @@ class ImproveLoop:
         return WorkerRunner(
             root=self._root, settings=self._settings, clock=self._clock,
             rag=self._rag, worker_profile="improve",
-            run_context=ctx, on_ready=on_ready, rpc_handlers=ctx.rpc_handlers,
+            run_context=ctx, on_ready=on_ready,
+            rpc_handlers=build_ledger_wrapped_rpc_handlers(
+                ledger=ctx.ledger, rpc_handlers=ctx.rpc_handlers,
+                staging_dir=ctx.staging_dir),
             rpc_timeout_sec_by_kind=self._improve_rpc_timeout_sec_by_kind())
 
     def _improve_rpc_timeout_sec_by_kind(self) -> dict[str, float]:
@@ -1544,13 +1548,9 @@ class ImproveLoop:
                             content_hash=gate_verdict.content_hash, now=now,
                             meta=candidate_meta, kind=kind,
                             record_fn=gate_rows.append)
-                    except ValueError as exc:
-                        # holdout._oldest_bar_start uses ValueError for missing
-                        # market history. Convert only that known data condition
-                        # into a verdict; other ValueErrors may be programming
-                        # defects and must still abort the commit.
-                        if not str(exc).startswith("no 1m history for symbol="):
-                            raise
+                    except holdout.NoHistoryError as exc:
+                        # Missing market history is an expected gate verdict;
+                        # unrelated ValueErrors still abort the commit.
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
                             reason=("gate_failed:backtest_data_unavailable:"

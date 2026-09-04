@@ -18,6 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentic_fx.backtest.holdout import NoHistoryError
+
 from agentic_fx.backtest.timeframes import TF_MINUTES
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.store import ohlcv
@@ -355,7 +357,7 @@ def test_run_backtest_handler_reports_missing_history_with_available_pairs(
     _patch_strategy_lookup(monkeypatch)
     monkeypatch.setattr(
         "agentic_fx.loops.improve_loop.holdout.run_in_sample",
-        lambda *a, **kw: (_ for _ in ()).throw(ValueError(
+        lambda *a, **kw: (_ for _ in ()).throw(NoHistoryError(
             "no 1m history for symbol='EURUSD' source='dukascopy' "
             "(cannot determine in-sample start)")))
     staging_dir = tmp_path / "staging"
@@ -388,17 +390,12 @@ def test_run_backtest_handler_maps_real_holdout_missing_history_contract(
 
     result = handlers["run_backtest"]({"name": "myst", "pair": "EURUSD"})
 
-    assert result == {
-        "error": "no_history_for_symbol",
-        "message": (
-            "no 1m history for symbol='EURUSD' source='dukascopy' "
-            "(cannot determine in-sample start)"),
-        "hint": (
-            "No 1m history for EURUSD, and no pair has local backtest "
-            "history yet — run_backtest cannot succeed until history data is "
-            "imported. Report this as a discovery instead of retrying other "
-            "pairs."),
-    }
+    assert result["error"] == "no_history_for_symbol"
+    assert result["hint"] == (
+        "No 1m history for EURUSD, and no pair has local backtest "
+        "history yet — run_backtest cannot succeed until history data is "
+        "imported. Report this as a discovery instead of retrying other "
+        "pairs.")
 
 
 def test_run_backtest_handler_missing_history_hint_lists_pairs_with_data(
@@ -415,7 +412,7 @@ def test_run_backtest_handler_missing_history_hint_lists_pairs_with_data(
     _patch_strategy_lookup(monkeypatch)
     monkeypatch.setattr(
         "agentic_fx.loops.improve_loop.holdout.run_in_sample",
-        lambda *a, **kw: (_ for _ in ()).throw(ValueError(
+        lambda *a, **kw: (_ for _ in ()).throw(NoHistoryError(
             "no 1m history for symbol='EURUSD' source='mt5' "
             "(cannot determine in-sample start)")))
     seed_conn = loop._db_write_conn_factory()

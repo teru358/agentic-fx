@@ -111,3 +111,23 @@ def build_improve_rpc_tooldefs(
                             "required": ["request"]},
                 func=analyze_corr),
     ]
+
+
+def build_ledger_wrapped_rpc_handlers(
+        *, ledger: ImproveRpcLedger, rpc_handlers: dict[str, Callable],
+        staging_dir: Path | None = None) -> dict[str, Callable[[dict], dict]]:
+    """親 (WorkerRunner) が子からの tool_rpc を受ける側の handler 表。
+
+    生 handler (`ImproveLoop._build_rpc_handlers`) を tooldef 層で包み、
+    台帳記録 (`ledger.record`) と遮断 7 (`_strip_forbidden`) を親側でも
+    通す — 生 handler を直接 `WorkerRunner(rpc_handlers=...)` に渡すと
+    親 ledger は永遠に空で `_persist_ledger_rows` が何も書かない
+    ([ledger-never-populated-in-production]、/code-review 2026-09-04)。
+    子側の wrapper (mission_worker、使い捨て ledger) は二重防御として残す。"""
+    tools = build_improve_rpc_tooldefs(
+        ledger=ledger,
+        run_backtest_handler=rpc_handlers["run_backtest"],
+        analyze_corr_handler=rpc_handlers["analyze_corr"],
+        staging_dir=staging_dir)
+    return {tool.name: (lambda args, func=tool.func: func(**args))
+            for tool in tools}

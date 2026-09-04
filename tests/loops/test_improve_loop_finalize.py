@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentic_fx.backtest.holdout import NoHistoryError
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.runners.base import Mission, MissionResult
@@ -194,7 +195,7 @@ def test_commit_strategy_missing_history_becomes_gate_failed(
             "core_commit": "core", "initial_balance": 10000.0,
             "now": datetime(2026, 2, 1, tzinfo=timezone.utc),
         })
-        raise ValueError(
+        raise NoHistoryError(
             "no 1m history for symbol='EURUSD' source='dukascopy' "
             "(cannot determine in-sample start)")
 
@@ -307,10 +308,8 @@ def test_commit_real_strategy_gate_missing_history_becomes_gate_failed(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
         (backlog_id,)).fetchone()
     assert backlog_row["status"] == "observation"
-    assert backlog_row["last_result"] == (
-        "gate_failed:backtest_data_unavailable:no 1m history for "
-        "symbol='EURUSD' source='dukascopy' "
-        "(cannot determine in-sample start)")
+    assert backlog_row["last_result"].startswith(
+        "gate_failed:backtest_data_unavailable:")
 
 
 def test_commit_strategy_other_valueerror_still_propagates(

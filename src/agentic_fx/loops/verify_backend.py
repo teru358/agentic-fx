@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Callable, Literal
 from agentic_fx.runners.base import Mission
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.store.rag import Rag
+from agentic_fx.tools.improve_rpc_tools import build_ledger_wrapped_rpc_handlers
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
@@ -223,7 +224,9 @@ def verify_backend(
         runner = WorkerRunner(
             root=root, settings=scoped_settings, clock=clock, rag=rag,
             worker_profile="improve", run_context=ctx, on_ready=on_ready,
-            rpc_handlers=ctx.rpc_handlers,
+            rpc_handlers=build_ledger_wrapped_rpc_handlers(
+                ledger=ctx.ledger, rpc_handlers=ctx.rpc_handlers,
+                staging_dir=ctx.staging_dir),
             rpc_timeout_sec_by_kind=rpc_timeout_sec_by_kind)
 
         mission = Mission(
