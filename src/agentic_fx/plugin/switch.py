@@ -226,8 +226,22 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
                 "WHERE kind='plugin' AND status='pending'")
         }
         for mission_dir in staging_root.iterdir():
+            # dir symlink は追わない — is_dir()/os.walk が外部 dir を
+            # chmod/rmtree してしまう (2 周目 codex I1)。link 自体だけ消す。
+            if mission_dir.is_symlink():
+                try:
+                    mission_dir.unlink()
+                except OSError:
+                    pass
+                continue
             for candidate in mission_dir.iterdir():
                 rel = f"plugins/_staging/{mission_dir.name}/{candidate.name}"
+                if rel not in referenced and candidate.is_symlink():
+                    try:
+                        candidate.unlink()
+                    except OSError:
+                        pass
+                    continue
                 if rel not in referenced:
                     # Source snapshots are immutable (0500/0400), just like
                     # version-store entries handled in branch ③ below.

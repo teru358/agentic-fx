@@ -213,6 +213,32 @@ def test_sweep_orphans_does_not_chmod_file_symlink_target(env):
     assert not candidate_dir.exists()
 
 
+def test_sweep_orphans_does_not_follow_dir_symlink_candidate(env):
+    """2 周目 codex I1 (R01): 候補や mission dir が **dir symlink** のとき
+    os.walk/is_dir が追って外部 dir を chmod/rmtree する。link 自体だけ消す。"""
+    tmp_path, plugins_dir, conn = env
+    external_dir = tmp_path / "external_dir"
+    external_dir.mkdir()
+    external_file = external_dir / "keep.txt"
+    external_file.write_text("outside")
+    external_file.chmod(0o400)
+    external_dir.chmod(0o500)
+    mission_dir = plugins_dir / "_staging" / "1"
+    mission_dir.mkdir(parents=True)
+    (mission_dir / "linked-candidate").symlink_to(external_dir)
+    (plugins_dir / "_staging" / "2").symlink_to(external_dir)
+
+    try:
+        switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+    finally:
+        external_dir.chmod(0o700)
+
+    assert external_file.exists()
+    assert external_file.stat().st_mode & 0o777 == 0o400
+    assert not (mission_dir / "linked-candidate").exists()
+    assert not (plugins_dir / "_staging" / "2").is_symlink()
+
+
 def test_sweep_orphans_logs_rmtree_failure_and_continues(env, monkeypatch):
     """L29: 1候補の削除失敗を記録し、後続候補を処理する。"""
     tmp_path, plugins_dir, conn = env

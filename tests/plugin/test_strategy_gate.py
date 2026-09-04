@@ -225,10 +225,12 @@ def test_eval_timeframe_normalizes_1d_to_24h_for_run_in_sample_and_holdout(
                                     ("run_holdout", "24h")]
 
 
+@pytest.mark.parametrize("eval_source", ["mt5", "dukascopy"])
 def test_eval_source_follows_backtest_settings(
-        monkeypatch, conn_with_approved_strategy):
+        monkeypatch, conn_with_approved_strategy, eval_source):
+    # R09 (2 周目): 単一値だと "mt5" ハードコード変異が生存するため 2 値で pin
     settings = MagicMock()
-    settings.backtest.eval_source = "mt5"
+    settings.backtest.eval_source = eval_source
     seen_sources = []
 
     monkeypatch.setattr(
@@ -257,8 +259,8 @@ def test_eval_source_follows_backtest_settings(
         settings=settings, meta=_meta(content_hash="h6"))
 
     assert seen_sources == [
-        ("intent", "mt5"), ("in_sample", "mt5"),
-        ("intent", "mt5"), ("holdout", "mt5")]
+        ("intent", eval_source), ("in_sample", eval_source),
+        ("intent", eval_source), ("holdout", eval_source)]
 
 
 # round2 O1/O2/O3 是正 (2026-08-29、verified-round2.md、pin のみ — 実装は

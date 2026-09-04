@@ -1143,6 +1143,10 @@ def test_worker_runner_uses_rpc_kind_timeout_and_default_for_other_names(
     assert responses[0]["result"] == {"finished": True}
     assert responses[1]["ok"] is False
     assert responses[1]["error"] == "rag rpc timed out"
+    # R21 (2 周目): timeout 応答も通常応答と同じフレーム形 (type/rpc_id/seq 連番)
+    assert responses[1]["type"] == "tool_rpc_result"
+    assert responses[1]["rpc_id"] != responses[0]["rpc_id"]
+    assert responses[1]["seq"] == responses[0]["seq"] + 1
 
 
 def test_worker_runner_finally_joins_dispatcher_before_closing_stdin(tmp_path, monkeypatch):

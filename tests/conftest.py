@@ -152,6 +152,36 @@ def _guard_real_data_dir_is_never_touched():
 
 
 @pytest.fixture(autouse=True)
+def _restore_tmp_path_writable(request):
+    """テストが tmp_path 配下に残す読み取り専用ツリー (0500 dir / 0400 file —
+    _snapshot_src / version-store の pin) を teardown で書き込み可に戻す。
+
+    戻さないと pytest の basetemp 掃除 (古い basetemp を `garbage-<uuid>` に
+    rename → rmtree) が EACCES で失敗し、`/tmp/pytest-of-<user>/garbage-*`
+    が世代ごとに残る (2026-09-05 実測: 95 世代 × 250MB = 12GB で /tmp の
+    クォータを使い切り、Claude Code の Bash ツールが全滅した)。"""
+    yield
+    tmp_path = request.node.funcargs.get("tmp_path") if hasattr(
+        request.node, "funcargs") else None
+    if tmp_path is None or not tmp_path.exists():
+        return
+    import os
+    for dirpath, dirnames, filenames in os.walk(tmp_path):
+        try:
+            os.chmod(dirpath, 0o700)
+        except OSError:
+            pass
+        for fn in filenames:
+            fp = os.path.join(dirpath, fn)
+            if os.path.islink(fp):
+                continue
+            try:
+                os.chmod(fp, 0o600)
+            except OSError:
+                pass
+
+
+@pytest.fixture(autouse=True)
 def _forbid_worker_spawn_against_real_llama_swap(request, monkeypatch):
     # Task13 Step5b (`@pytest.mark.realbackend`): この marker が付いた
     # テストは「実 llama-swap を意図的に叩く」ことそのものが目的の opt-in
