@@ -178,7 +178,8 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
 
 
 def compare_sources(conn, symbol: str, settings, *,
-                    a: str = "dukascopy", b: str = "mt5") -> dict:
+                    a: str = "dukascopy", b: str = "mt5",
+                    base_interval: str = "1m") -> dict:
     """両 source が重複する期間の close 差を集計する (人間 CLI / 報告用)。
 
     `a` は mid 系列 (Dukascopy) を仮定し、`assumed_half_spread` を引いてから
@@ -200,9 +201,9 @@ def compare_sources(conn, symbol: str, settings, *,
         "FROM ohlcv_history ta JOIN ohlcv_history tb "
         "ON ta.symbol = tb.symbol AND ta.interval = tb.interval "
         "AND ta.bar_time = tb.bar_time "
-        "WHERE ta.symbol = ? AND ta.interval = '1m' "
+        "WHERE ta.symbol = ? AND ta.interval = ? "
         "AND ta.source = ? AND tb.source = ?",
-        (symbol, a, b))
+        (symbol, base_interval, a, b))
 
     # F3 (fix round 1, codex Important-1): ストリーミング集計 (Welford 法)。
     # 従来は全行を rows/diffs の 2 本の list に丸ごと実体化していたため、

@@ -31,12 +31,15 @@ from tests.backtest.factories import H, _conn, _row_at
 
 
 def test_enums_and_minutes_are_consistent():
-    assert RESAMPLE_TIMEFRAMES == ("1m", "15m", "1h", "4h", "1d")
+    # 段階 3: 5m が base_interval の一般化 (A2/A3) で正規列挙に追加された
+    # (production の意図変更 — 5m 基底のバックテストが対象)。
+    assert RESAMPLE_TIMEFRAMES == ("1m", "5m", "15m", "1h", "4h", "1d")
     assert PLUGIN_TIMEFRAMES == ("15m", "1h", "4h", "1d")
-    # plugin 宣言足は「1m を除く RESAMPLE_TIMEFRAMES」(D5)
+    # plugin 宣言足は「1m/5m を除く RESAMPLE_TIMEFRAMES」(D5、5m は基底専用)
     assert PLUGIN_TIMEFRAMES == tuple(
-        tf for tf in RESAMPLE_TIMEFRAMES if tf != "1m")
-    assert TF_MINUTES == {"1m": 1, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+        tf for tf in RESAMPLE_TIMEFRAMES if tf not in ("1m", "5m"))
+    assert TF_MINUTES == {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240,
+                          "1d": 1440}
 
 
 # --- floor_to_bucket (Task 8 producer が使う epoch 錨切り下げ) ----------
@@ -64,7 +67,7 @@ def test_floor_to_bucket_rejects_naive_and_unknown_tf():
     with pytest.raises(ValueError):
         floor_to_bucket(datetime(2026, 7, 22, 14, 0), "1h")  # naive
     with pytest.raises(ValueError):
-        floor_to_bucket(H, "5m")  # 列挙外
+        floor_to_bucket(H, "10m")  # 列挙外 (段階 3 で 5m が正規列挙入りしたため 10m に変更)
 
 
 def test_floor_to_bucket_normalizes_non_utc_offset():
@@ -83,6 +86,7 @@ def test_resampled_1h_bucket_anchor_and_ohlc(tmp_path):
                     l=100 + i - 0.5, c=100 + i + 0.2) for i in range(90)]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                               until=H + timedelta(minutes=90))
     assert len(df) == 1 and df.index[0].to_pydatetime() == H
     assert df.iloc[0]["open"] == 100 and df.iloc[0]["high"] == 159.5
@@ -96,6 +100,7 @@ def test_partial_tail_bucket_dropped_lookahead_guard(tmp_path):
             for i in range(120)]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                               until=H + timedelta(minutes=61))
     assert len(df) == 1
 
@@ -107,6 +112,7 @@ def test_since_returns_only_buckets_starting_at_or_after_since(tmp_path):
                     l=100 + i - 0.5, c=100 + i) for i in range(120)]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                               since=H + timedelta(minutes=30),
                               until=H + timedelta(minutes=120))
     assert len(df) == 1 and df.iloc[0]["open"] == 160  # [H+1h,) のみ・欠け open なし
@@ -123,6 +129,7 @@ def test_max_bars_limits_result_and_sql_window(tmp_path):
     seen_sql: list[str] = []
     conn.set_trace_callback(seen_sql.append)
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                               until=H + timedelta(minutes=300), max_bars=2)
     conn.set_trace_callback(None)
     # プラン原文は index[-1]==H+3h だが完成判定 (bucket_end <= until) と
@@ -154,6 +161,7 @@ def test_max_bars_window_lower_is_bucket_aligned_no_partial_head(tmp_path):
     ]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                               until=H + timedelta(hours=5, minutes=30),
                               max_bars=2)
     assert len(df) == 2
@@ -184,6 +192,7 @@ def test_max_bars_completeness_cut_precedes_tail_not_after(tmp_path):
             for i in range(330)]  # H 〜 H+5h30m、密な 1m データ
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                               until=H + timedelta(hours=5, minutes=30),
                               max_bars=2)
     assert len(df) == 2
@@ -197,6 +206,7 @@ def test_intra_bucket_gap_aggregates_present_bars(tmp_path):
             for i in range(60) if i != 30]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                               until=H + timedelta(minutes=60))
     assert len(df) == 1 and df.iloc[0]["volume"] == 59 * 10.0
 
@@ -209,6 +219,7 @@ def test_1m_is_passthrough_not_resampled(tmp_path):
                     l=99.5 + i, c=100 + i) for i in range(3)]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1m", source="dukascopy",
+                             base_interval="1m",
                               until=H + timedelta(minutes=3))
     assert len(df) == 3
     assert list(df["open"]) == [100, 101, 102]
@@ -221,6 +232,7 @@ def test_1m_partial_tail_minute_dropped(tmp_path):
             for i in range(3)]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1m", source="dukascopy",
+                             base_interval="1m",
                               until=H + timedelta(minutes=2, seconds=30))
     assert len(df) == 2  # 3 本目 (H+2m) は終端 H+3m > until で未確定
 
@@ -228,7 +240,8 @@ def test_1m_partial_tail_minute_dropped(tmp_path):
 def test_unknown_timeframe_rejected(tmp_path):
     conn = _conn(tmp_path)
     with pytest.raises(ValueError):
-        load_resampled_frame(conn, "USDJPY", "5m", source="dukascopy",
+        load_resampled_frame(conn, "USDJPY", "10m", source="dukascopy",
+                             base_interval="1m",
                              until=H)
 
 
@@ -236,9 +249,11 @@ def test_until_required_for_resampled_timeframes(tmp_path):
     """until 無しでは完成判定の基準点が無い — fail closed (レジャー裁定)。"""
     conn = _conn(tmp_path)
     with pytest.raises(ValueError):
-        load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy")
+        load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m")
     with pytest.raises(ValueError):  # max_bars の SQL 窓も until 依存
         load_resampled_frame(conn, "USDJPY", "1m", source="dukascopy",
+                             base_interval="1m",
                              max_bars=10)
 
 
@@ -246,9 +261,11 @@ def test_naive_since_until_rejected(tmp_path):
     conn = _conn(tmp_path)
     with pytest.raises(ValueError):
         load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                              until=datetime(2026, 7, 22, 13, 0))  # naive
     with pytest.raises(ValueError):
         load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                              since=datetime(2026, 7, 22, 12, 0),  # naive
                              until=H + timedelta(hours=1))
 
@@ -257,12 +274,14 @@ def test_max_bars_must_be_positive(tmp_path):
     conn = _conn(tmp_path)
     with pytest.raises(ValueError):
         load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                              until=H + timedelta(hours=1), max_bars=0)
 
 
 def test_empty_history_returns_empty_frame(tmp_path):
     conn = _conn(tmp_path)
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                               until=H + timedelta(hours=1))
     assert len(df) == 0
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
@@ -280,6 +299,7 @@ def test_source_is_filtered(tmp_path):
              10.0) for i in range(60)],
         source="yfinance")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                               until=H + timedelta(minutes=60))
     assert len(df) == 1 and df.iloc[0]["open"] == 100
 
@@ -294,6 +314,7 @@ def test_1d_bucket_anchored_at_utc_midnight(tmp_path):
                     o=102, h=103, l=101, c=102.5)]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1d", source="dukascopy",
+                             base_interval="1m",
                               until=day + timedelta(days=1))
     assert len(df) == 1 and df.index[0].to_pydatetime() == day
     assert df.iloc[0]["open"] == 100 and df.iloc[0]["close"] == 102.5
@@ -314,6 +335,7 @@ def test_live_source_reads_the_cache_table(tmp_path):
                 100.0, 101.0, 99.0, 100.5, 10.0) for i in range(60)]
     ohlcv.upsert_cache_bars(conn, bars, source="yfinance")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="yfinance",
+                             base_interval="1m",
                               until=H + timedelta(minutes=60))
     assert len(df) == 1
     assert df.index[0].to_pydatetime() == H
@@ -328,6 +350,7 @@ def test_history_source_does_not_read_cache_rows(tmp_path):
                 100.0, 101.0, 99.0, 100.5, 10.0) for i in range(60)]
     ohlcv.upsert_cache_bars(conn, bars, source="yfinance")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="dukascopy",
+                             base_interval="1m",
                               until=H + timedelta(minutes=60))
     assert df.empty
 
@@ -339,6 +362,7 @@ def test_live_source_does_not_read_history_rows(tmp_path):
             for i in range(60)]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
     df = load_resampled_frame(conn, "USDJPY", "1h", source="yfinance",
+                             base_interval="1m",
                               until=H + timedelta(minutes=60))
     assert df.empty
 
@@ -349,4 +373,5 @@ def test_unknown_source_is_rejected(tmp_path):
     conn = _conn(tmp_path)
     with pytest.raises(ValueError, match="KNOWN_OHLCV_SOURCES"):
         load_resampled_frame(conn, "USDJPY", "1h", source="yfinace",
+                             base_interval="1m",
                              until=H + timedelta(minutes=60))

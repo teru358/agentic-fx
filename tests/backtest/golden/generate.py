@@ -1,4 +1,4 @@
-"""再現可能な 1m backtest golden-v1 の生成器。"""
+"""再現可能な 1m backtest golden-v2 の生成器。"""
 from __future__ import annotations
 
 import json
@@ -14,7 +14,7 @@ from agentic_fx.store import ohlcv
 from tests.backtest.factories import SETTINGS, WED, _conn, _row_at, DATASET_1M
 
 
-_GOLDEN_PATH = Path(__file__).with_name("golden-v1.json")
+_GOLDEN_PATH = Path(__file__).with_name("golden-v2.json")
 _DAY = timedelta(days=1)
 
 

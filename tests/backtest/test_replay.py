@@ -133,8 +133,8 @@ def test_bar_feed_filters_by_source(tmp_path):
     assert bar.close == 148.1  # dukascopy, not mt5
 
 
-def test_bar_feed_latest_completed_1m_returns_previous_bar(tmp_path):
-    """BarFeed.latest_completed_1m(ts) returns bar at ts-1m (completed bar)."""
+def test_bar_feed_latest_completed_returns_previous_bar(tmp_path):
+    """BarFeed.latest_completed(ts) returns bar at ts-1m (completed bar)."""
     conn = _conn(tmp_path)
     ohlcv.import_history_bars(
         conn,
@@ -142,14 +142,14 @@ def test_bar_feed_latest_completed_1m_returns_previous_bar(tmp_path):
          _row_at(H + timedelta(minutes=1), o=148.1, h=148.3, l=148.0, c=148.2)],
         source="dukascopy")
     feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
-    # latest_completed_1m(H+1m) should return bar at H
-    completed = feed.latest_completed_1m(H + timedelta(minutes=1))
+    # latest_completed(H+1m) should return bar at H
+    completed = feed.latest_completed(H + timedelta(minutes=1))
     assert completed is not None
     assert completed.ts == H
 
 
-def test_bar_feed_latest_completed_1m_gap_returns_none(tmp_path):
-    """BarFeed.latest_completed_1m returns None if previous bar missing (gap)."""
+def test_bar_feed_latest_completed_gap_returns_none(tmp_path):
+    """BarFeed.latest_completed returns None if previous bar missing (gap)."""
     conn = _conn(tmp_path)
     ohlcv.import_history_bars(
         conn,
@@ -157,20 +157,20 @@ def test_bar_feed_latest_completed_1m_gap_returns_none(tmp_path):
          _row_at(H + timedelta(minutes=2), o=148.1, h=148.3, l=148.0, c=148.2)],
         source="dukascopy")
     feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
-    # latest_completed_1m(H+2m) looks for bar at H+1m which is missing
-    assert feed.latest_completed_1m(H + timedelta(minutes=2)) is None
+    # latest_completed(H+2m) looks for bar at H+1m which is missing
+    assert feed.latest_completed(H + timedelta(minutes=2)) is None
 
 
-def test_bar_feed_latest_completed_1m_before_start_returns_none(tmp_path):
-    """BarFeed.latest_completed_1m(H) returns None (no bar at H-1m)."""
+def test_bar_feed_latest_completed_before_start_returns_none(tmp_path):
+    """BarFeed.latest_completed(H) returns None (no bar at H-1m)."""
     conn = _conn(tmp_path)
     ohlcv.import_history_bars(
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
         source="dukascopy")
     feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
-    # latest_completed_1m(H) looks for bar at H-1m which doesn't exist
-    assert feed.latest_completed_1m(H) is None
+    # latest_completed(H) looks for bar at H-1m which doesn't exist
+    assert feed.latest_completed(H) is None
 
 
 def test_bar_feed_rejects_naive_start(tmp_path):

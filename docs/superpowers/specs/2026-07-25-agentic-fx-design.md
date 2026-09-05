@@ -325,7 +325,7 @@ TradeIntent は発注前に全ルールを通過しなければならない。1 
 ### Executor と取引モードの承認ゲート
 
 - Phase 1 は学習モード (ペーパー取引) のみ (前身の PositionManager 簡素版 + SQLite `orders` 状態機械)。学習モードでは risk gate 通過後に自動でペーパー発注する
-- **ペーパー約定規則**: 現在値のスナップショットではなく **1 分足の high/low で到達判定**する (ポーリング間の水準通過を見逃さないため)。同一バーで SL と TP の両方に到達した場合は**保守的に SL 約定**とする。指値エントリーと SL/TP が同一バー内で成立し得る場合など、OHLC から順序を判定できないときも**最悪結果 (SL 約定) を採用**する。約定価格は spread を考慮し、ギャップ時の SL はギャップ後の価格で約定させる (実勢の滑りを再現し、成績評価の歪みを防ぐ)
+- **ペーパー約定規則**: 現在値のスナップショットではなく **バックテスト基底足の high/low で到達判定**する。同一バーで SL と TP の両方に到達した場合は**保守的に SL 約定**とする。粗い基底での評価は、同一基底足内の順序に依存しない戦略に限る。粗い足では kill switch の反応も最大 1 基底足遅延し得る。
 - MT5 の発注系接続は Phase 3。取引モードへの切替は config ではなく **`main.py mode trading` (人間の明示操作)** でのみ行う
 - **取引モードの手動承認ゲート (Phase 3、初期状態)**: risk gate を通過した open intent は `approval_requests` (kind=live_trade) に登録され、**人間の承認 (Discord ボタン or CLI) が下りるまで発注しない**。expires_at (指値は指値期限、market は 15 分) を過ぎると自動 expired となり発注しない。close / cancel は資金保護方向の操作なので承認不要で即時実行する
 - **承認時の再検証 (TOCTOU 対策)**: 承認までの間に価格・残高・kill switch 状態が変わり得るため、承認 POST は単なる status 更新ではなく、サービス内の排他区間で ①pending・未失効の compare-and-set ②mode / autopilot / kill switch / 口座・ポジション状態の再取得 ③**最新 bid/ask で Risk Gate 全ルール + position sizing を再実行** — を行い、再検証に失敗した場合は `invalidated` として理由を記録する (approved にしない)
@@ -478,12 +478,12 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 
 #### 実行アーキテクチャ (2026-08-01 確定)
 
-- **BacktestRunner** (コア所有の新モジュール) が組み立てる: `ReplayClock` (`Clock` 実装 — 履歴の 1m 格子に沿って進む) / `bars_fn`・`quote_fn`・`spec_fn` = `ohlcv_history` テーブルからの履歴供給 / intent 生成元 = strategy plugin の閉じた提案
+- **BacktestRunner** (コア所有の新モジュール) が組み立てる: `ReplayClock` (`Clock` 実装 — dataset の基底足格子に沿って進む) / `bars_fn`・`quote_fn`・`spec_fn` = `ohlcv_history` テーブルからの履歴供給 / intent 生成元 = strategy plugin の閉じた提案
 - DB は **in-memory SQLite に `init_db`** して実行毎に使い捨てる。実 DB (`data/agentic.db`)・実 `data/state/` には一切触れない。risk gate・sizing・約定判定 (`check_limit_fill` / `check_exit`)・executor・scheduler は実運用と同一コードを通す
-- strategy の評価タイミングは「plugin が宣言した timeframe のバー確定毎」。約定・SL/TP 判定は 1m バー (実運用互換)
+- strategy の評価タイミングは「plugin が宣言した timeframe のバー確定毎」。約定・SL/TP 判定は基底足で行う。
 - **§5 の起動元検証を無効化しない**: BacktestRunner は strategy 判定毎に in-memory DB へ `loop='trade'` の **synthetic Mission 行を作成**し、intent は通常どおり `origin=SCHEDULER` + `mission_id` 実在 + `loop='trade'` の検証を**同一コードで通す**。executor の検証を注入で置換・緩和する実装は不可 (in-memory DB は実 DB と分離されているため、この synthetic 行が実運用の境界を弱めることはない)
-- **先読みの禁止 (look-ahead bias)**: 「確定バーを plugin に渡す時点」と「その intent が約定可能になる最初の 1m バー」を厳密に分ける。plugin が評価した確定バー (およびそれ以前) の 1m バーでは約定・SL/TP 判定に参加させず、**評価に使った確定バーの終了より後の 1m バーから**のみ約定可能とする (market 相当は次バーの open ± half-spread、指値は次バー以降の `check_limit_fill`)。実運用でも Mission はバー確定後に走るため、これが忠実な順序である
-- **ReplayClock と market_hours の契約**: ReplayClock は **UTC の 1m 格子を履歴バーの有無に関わらず連続に進める**。指値期限・day 強制クローズ・日次境界などの時間依存判定は時間経過で必ず進み、**価格依存判定 (約定・SL/TP) はその時刻のバーが存在する tick のみ**行う。市場オープン判定は実運用と同一の `market_hours` (週末・NY 17:00 ロールオーバー・DST を含む) が唯一の判定元であり、**バー欠損を市場クローズとみなしてはならない**: market_hours がオープンと判定し、かつバーが欠損している tick では、時間依存判定は通常どおり実行し、価格依存判定だけをスキップする (実運用でデータが一時欠損した状態と同じ扱い)
+- **先読みの禁止 (look-ahead bias)**: 最初の意思決定は `ceil(start, eval_tf)+eval_tf` とし、開始境界を跨ぐ部分足を評価しない。確定バーの終了より後の基底足からのみ約定可能とする。
+- **ReplayClock と market_hours の契約**: ReplayClock は **UTC の dataset 基底足格子を履歴バーの有無に関わらず連続に進める**。時間依存判定は進み、価格依存判定はその時刻のバーが存在する tick のみ行う。バー欠損を市場クローズとみなしてはならない。
 - news / econ / reflection / activity / notifier には no-op を注入する (結果に寄与しない副作用を切る)
 - 速度は設計で約束しない — 1 年 ≈ 37 万 tick。実装プランに「1 年分の実測ゲート」を置き、遅い場合も**専用執行ロジックは書かず**、tick ループの外側 (バー供給・SQL) だけを最適化する
 

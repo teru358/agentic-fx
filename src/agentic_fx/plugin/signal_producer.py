@@ -168,7 +168,7 @@ class SignalProducer:
                          width: timedelta, source: str, call: _CallFn) -> int:
         bucket_end = bucket_start + width
         df = load_resampled_frame(
-            conn, pair, meta.timeframe, source=source, until=bucket_end,
+            conn, pair, meta.timeframe, source=source, base_interval="1m", until=bucket_end,
             max_bars=meta.max_bars)
         # fix round 1 F3 (codex): df が非空でも「末尾行 = 対象バケット」と
         # は限らない — 取り込みラグ/欠損で対象バケット分の 1m 行が 1 本も

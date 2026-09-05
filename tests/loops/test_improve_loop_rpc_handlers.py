@@ -446,6 +446,40 @@ def test_run_backtest_handler_missing_history_hint_lists_pairs_with_data(
     assert "EURUSD" not in available
 
 
+def test_run_backtest_handler_missing_history_hint_uses_dataset_base_interval(
+        loop_no_seam, tmp_path, monkeypatch):
+    """段 0 pin: hint 構築の symbol 探索 SQL は ``dataset.base_interval`` を
+    使うべきで、literal "1m" に固定戻しすると 5m 基底運用で実在する
+    symbol を取りこぼす (hint が「no pair has local backtest history」に
+    後退する)。"""
+    loop, db_path = loop_no_seam
+    loop._settings = loop._settings.model_copy(update={
+        "backtest": loop._settings.backtest.model_copy(
+            update={"eval_source": "mt5", "base_interval": "5m"})})
+    _patch_strategy_lookup(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        lambda *a, **kw: (_ for _ in ()).throw(NoHistoryError(
+            "no 5m history for symbol='EURUSD' source='mt5' "
+            "(cannot determine in-sample start)")))
+    seed_conn = loop._db_write_conn_factory()
+    seed_conn.execute(
+        "INSERT INTO ohlcv_history (symbol, interval, bar_time, open, high,"
+        " low, close, volume, source) VALUES ('USDJPY', '5m',"
+        " '2026-01-01T00:00:00+00:00', 1, 1, 1, 1, 0, 'mt5')")
+    seed_conn.commit()
+    seed_conn.close()
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+    handlers = loop._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}), staging_dir=staging_dir)
+
+    result = handlers["run_backtest"]({"name": "myst", "pair": "EURUSD"})
+
+    assert result["error"] == "no_history_for_symbol"
+    assert "Pairs with local backtest history: USDJPY." in result["hint"]
+
+
 def test_run_backtest_handler_reports_pair_not_declared(
         loop_min, tmp_path, monkeypatch):
     _patch_strategy_lookup(monkeypatch)

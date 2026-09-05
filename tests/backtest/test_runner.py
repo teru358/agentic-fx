@@ -31,16 +31,6 @@ from agentic_fx.backtest.runner import _aggregate_bucket, run_replay
 from tests.backtest.factories import H, WED, SETTINGS, _conn, _row_at, DATASET_1M
 
 
-def test_run_replay_rejects_non_1m_dataset_before_replay(tmp_path):
-    from agentic_fx.backtest.dataset import HistoryDataset
-    hist = _conn(tmp_path)
-    with pytest.raises(NotImplementedError,
-                       match="base_interval generalization lands in stage 3"):
-        run_replay(SETTINGS, symbol="USDJPY",
-                   dataset=HistoryDataset("dukascopy", "5m"),
-                   start=H, end=H, intent_source=lambda bar: None,
-                   history_conn=hist)
-
 OPEN = {"action": "open", "pair": "USDJPY", "direction": "long",
         "entry_type": "limit", "horizon": "day",
         "limit_price": 148.20, "expires_in": "6h",
@@ -462,7 +452,9 @@ def test_replay_exposes_timestamp_then_id_ordered_snapshots_and_first_decision(
         start=WED, end=WED + timedelta(minutes=2), intent_source=lambda b: None,
         eval_timeframe="1h", history_conn=hist)
 
-    assert res.first_decision_at == WED
+    # 段階 3 の先頭足規則 (A2): 最初の意思決定 = ceil_to_bucket(start, eval_tf)
+    # + eval_tf。WED は 1h 格子上のため ceil(WED)==WED、よって WED+1h。
+    assert res.first_decision_at == WED + timedelta(hours=1)
     assert res.snapshots
     assert [(row["ts"], row["id"]) for row in res.snapshots] == sorted(
         (row["ts"], row["id"]) for row in res.snapshots)

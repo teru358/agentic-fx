@@ -50,7 +50,8 @@ class Scheduler:
                  on_cache_maintenance: Callable[[datetime], None] | None = None,
                  on_improve_tick: Callable[[datetime], None] | None = None,
                  signal_due_fn: Callable[[datetime], bool] | None = None,
-                 stop_event: threading.Event | None = None) -> None:
+                 stop_event: threading.Event | None = None,
+                 bar_freshness: timedelta = _BAR_FRESHNESS) -> None:
         self.conn = conn
         self.executor = executor
         self.settings = settings
@@ -87,6 +88,7 @@ class Scheduler:
         self.on_improve_tick = on_improve_tick
         self.signal_due_fn = signal_due_fn
         self._stop_event = stop_event
+        self.bar_freshness = bar_freshness
         # 上書き 1 の改名: cron (1 時間毎) の締切だけを追跡する。signal
         # 起動 (reason == "signal") はこの締切に触れない — signal 起動後も
         # 次の cron 締切が早まったり延びたりしないことをテストで固定する
@@ -344,7 +346,7 @@ class Scheduler:
     def _fresh_bar(self, pair: str, now: datetime) -> Bar | None:
         """鮮度検証 + 同一バー再処理防止を通ったバーのみ返す。"""
         bar = self.bars_fn(pair)
-        if bar is None or now - bar.ts > _BAR_FRESHNESS:
+        if bar is None or now - bar.ts > self.bar_freshness:
             return None
         if self._processed_bar_ts.get(pair) == bar.ts:
             return None
@@ -412,7 +414,7 @@ class Scheduler:
         cycle_rate = self.executor.cycle_rate_fn(now)
         for row in orders.list_by_status(self.conn, S.OPEN):
             bar = self.bars_fn(row["pair"])
-            if bar is None or now - bar.ts > _BAR_FRESHNESS:
+            if bar is None or now - bar.ts > self.bar_freshness:
                 stale = True
                 self.activity.write(
                     Category.SYSTEM, "snapshot_stale_bar_skip",

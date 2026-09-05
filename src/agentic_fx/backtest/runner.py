@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Callable
 
 from agentic_fx.backtest.replay import BarFeed, ReplayClock, quote_from_bar
+from agentic_fx.backtest.timeframes import ceil_to_bucket, floor_to_bucket
 from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.config import Settings
 from agentic_fx.core import market_hours
@@ -137,7 +138,7 @@ def parse_timeframe(tf: str) -> timedelta:
     return timedelta(hours=n) if unit == "h" else timedelta(minutes=n)
 
 
-def _require_minute_grid(dt: datetime, label: str) -> None:
+def _require_base_grid(dt: datetime, label: str, width: timedelta) -> None:
     """``ReplayClock``/``BarFeed`` と同じ正時格子契約 (second==microsecond==0)
     を ``end`` にも適用する (fix round 1 F3 — codex Important)。格子外の
     ``end`` は宣言した ``[start, end)`` を最大 1 分近く超過して処理して
@@ -146,10 +147,8 @@ def _require_minute_grid(dt: datetime, label: str) -> None:
     if dt.tzinfo is None:
         raise ValueError(f"{label} must be timezone-aware")
     dt_utc = dt.astimezone(timezone.utc)
-    if dt_utc.second != 0 or dt_utc.microsecond != 0:
-        raise ValueError(
-            f"{label} must be on minute boundary (second and microsecond "
-            "must be 0)")
+    if (dt_utc - _EPOCH) % width:
+        raise ValueError(f"{label} must be on minute boundary / base interval grid")
 
 
 def _aggregate_bucket(feed: BarFeed, symbol: str, interval: str,
@@ -168,7 +167,7 @@ def _aggregate_bucket(feed: BarFeed, symbol: str, interval: str,
         bar = feed.bar_at(t)
         if bar is not None:
             bars.append(bar)
-        t += timedelta(minutes=1)
+        t += feed._width
     if not bars:
         return None
     return Bar(
@@ -213,14 +212,16 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
     OHLCV 履歴の読み取り専用接続で、実行時状態を持つ in-memory 接続とは
     別物 (``BarFeed`` にのみ渡す)。
     """
-    if dataset.base_interval != "1m":
-        raise NotImplementedError("base_interval generalization lands in stage 3")
     tf = parse_timeframe(eval_timeframe)
-    _require_minute_grid(end, "end")  # fix round 1 F3
+    if tf < dataset.width or tf % dataset.width:
+        raise ValueError("eval_timeframe must be an integer multiple of base_interval")
+    _require_base_grid(start, "start", dataset.width)
+    _require_base_grid(end, "end", dataset.width)
+    first_decision_at = ceil_to_bucket(start, eval_timeframe) + tf
 
     conn = connect(Path(":memory:"))
     init_db(conn)
-    clock = ReplayClock(start)
+    clock = ReplayClock(first_decision_at, dataset.width)
     state = _RecordingStateStore(Path(tempfile.mkdtemp()) / "state.json",
                                  clock=clock)
 
@@ -236,7 +237,8 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
     record_snapshot(conn, now=start, balance=initial_balance,
                     equity=initial_balance)
 
-    feed = BarFeed(history_conn, symbol, dataset=dataset, start=start, end=end)
+    preload_start = floor_to_bucket(start, eval_timeframe) - tf * 200
+    feed = BarFeed(history_conn, symbol, dataset=dataset, start=preload_start, end=end)
     fallback_spread_used = False
     current_ts = start
 
@@ -252,12 +254,12 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
     def bars_fn(pair: str) -> Bar | None:
         if pair != symbol:
             return None
-        return feed.latest_completed_1m(current_ts)
+        return feed.latest_completed(current_ts)
 
     def quote_fn(pair: str):
         # bar が None なら例外を投げてよい (executor 側の既存例外処理に
         # 任せる — 無 quote で発注が通る方が危険。レビュー裁定 上書き A)。
-        bar = feed.latest_completed_1m(current_ts)
+        bar = feed.latest_completed(current_ts)
         if bar is None:
             raise ValueError(
                 f"no completed 1m bar for {pair} at "
@@ -278,7 +280,7 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
             return ConversionRate(1.0, ccy, account_ccy, (now,))
         spec = _SPECS[symbol]
         if ccy == spec.base_currency and account_ccy == spec.quote_currency:
-            bar = feed.latest_completed_1m(current_ts)
+            bar = feed.latest_completed(current_ts)
             if bar is None:
                 raise ValueError(
                     f"no completed 1m bar for rate conversion at "
@@ -297,13 +299,14 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
     scheduler = Scheduler(
         conn=conn, executor=executor, settings=bt_settings, state_store=state,
         activity=activity, bars_fn=bars_fn,
-        on_trade_mission=lambda reason: None,   # 取引判断は cron でなく IntentSource 駆動
-        on_news_cycle=lambda: None, on_econ_cycle=lambda: None)
+        on_trade_mission=lambda reason: None,
+        on_news_cycle=lambda: None, on_econ_cycle=lambda: None,
+        bar_freshness=dataset.width + timedelta(minutes=1))
 
     equity_curve: list[tuple[str, float]] = [
         (start.isoformat(), initial_balance)]
     pending_proposal: dict | None = None
-    now = start
+    now = first_decision_at
     while now < end:
         current_ts = now
         scheduler.tick(now)            # 市場クローズ判定は tick 内部 — 無条件に毎分呼ぶ
@@ -333,8 +336,13 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
             if closed_bar is not None and market_hours.is_market_open(now):
                 pending_proposal = intent_source(closed_bar)
         # fix round 1 F7 (sonnet M1): 先頭の seed 点 (start, initial_balance)
-        # と初回ループの tail 追記が同一 ts (= start) になり二重記録される
-        # ため、初回だけ tail 追記をスキップする (seed 点はそのまま維持)。
+        # と初回ループの tail 追記が同一 ts になり二重記録されるため、その
+        # 場合だけ tail 追記をスキップする (seed 点はそのまま維持)。
+        # 段階 3 是正: 先頭足規則 (A2) 導入後は first_decision_at != start
+        # が通常になった。旧比較 (`now != first_decision_at`) のままだと
+        # ループの最初の tick (now == first_decision_at) の equity 点が
+        # 常に (start と重複していないのに) 誤って欠落する — 比較対象を
+        # 重複が実際に起き得る `start` に修正する (収束テストで発見)。
         if now != start:
             equity_curve.append((now.isoformat(), broker.equity()[1]))
         now = clock.advance()
@@ -359,4 +367,4 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
         orders=order_rows, equity_curve=equity_curve, start=start, end=end,
         source=dataset.source, fallback_spread_used=fallback_spread_used,
         snapshots=snapshots, kill_switch_events=kill_switch_events,
-        first_decision_at=start)
+        first_decision_at=first_decision_at)

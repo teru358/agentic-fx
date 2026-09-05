@@ -68,10 +68,12 @@ def holdout_boundary(now: datetime, months: int) -> datetime:
     return now_utc.replace(year=year, month=month, day=day)
 
 
-def _normalize_now(now: datetime) -> datetime:
+def _normalize_now(now: datetime, base_interval: str = "1m") -> datetime:
     """UTC へ正規化し、分格子へ切り捨てる (run_replay の格子契約)。"""
     now_utc = _require_aware(now, "now")
-    return now_utc.replace(second=0, microsecond=0)
+    width = HistoryDataset("dukascopy", base_interval).width
+    epoch = datetime(1970, 1, 1, tzinfo=_UTC)
+    return epoch + ((now_utc - epoch) // width) * width
 
 
 def in_sample_until(now: datetime, months: int) -> datetime:
@@ -89,10 +91,10 @@ def in_sample_until(now: datetime, months: int) -> datetime:
 
 
 def _oldest_bar_start(history_conn: sqlite3.Connection, symbol: str,
-                      source: str) -> datetime:
+                      source: str, base_interval: str = "1m") -> datetime:
     row = history_conn.execute(
-        "SELECT MIN(bar_time) FROM ohlcv_history WHERE symbol=? AND interval='1m' "
-        "AND source=?", (symbol, source)).fetchone()
+        "SELECT MIN(bar_time) FROM ohlcv_history WHERE symbol=? AND interval=? "
+        "AND source=?", (symbol, base_interval, source)).fetchone()
     bar_time_iso = row[0] if row is not None else None
     if bar_time_iso is None:
         raise NoHistoryError(
@@ -107,7 +109,8 @@ def _oldest_bar_start(history_conn: sqlite3.Connection, symbol: str,
     # (fail closed)、原因が分かりにくいままそこまで到達させず、ここで
     # 明示的に検出する。メッセージにタイムスタンプは含めない (F1 と同じ
     # 遮断規律 — 期間・端点の漏洩は例外経路にも適用される)。
-    if start.second != 0 or start.microsecond != 0:
+    width = HistoryDataset(source, base_interval).width
+    if (start - datetime(1970, 1, 1, tzinfo=_UTC)) % width:
         raise ValueError(
             f"oldest 1m bar for symbol={symbol!r} source={source!r} is not "
             "on minute boundary (second and microsecond must be 0 — data "
@@ -126,10 +129,19 @@ def _run_scope(settings: Settings, *, scope: str,
         end=period_end, intent_source=intent_source,
         eval_timeframe=eval_timeframe, history_conn=history_conn)
     metrics = compute_metrics(result)
+    width = dataset.width
+    expected = int((period_end - period_start) // width)
+    present = history_conn.execute(
+        "SELECT COUNT(*) FROM ohlcv_history WHERE symbol=? AND source=? "
+        "AND interval=? AND bar_time >= ? AND bar_time < ?",
+        (symbol, dataset.source, dataset.base_interval,
+         period_start.isoformat(), period_end.isoformat())).fetchone()[0]
     save_kwargs = dict(
         scope=scope, plugin_ref=plugin_ref, content_hash=content_hash,
         kind=kind, pair=symbol, timeframe=eval_timeframe, source=dataset.source,
-        base_interval=dataset.base_interval, params={},
+        base_interval=dataset.base_interval, params={
+            "raw_grid_bars_expected": expected,
+            "raw_grid_bars_present": present},
         period=(period_start, period_end), metrics=metrics,
         settings_hash=settings_snapshot_hash(settings),
         core_commit=core_commit(),
@@ -153,9 +165,9 @@ def run_in_sample(settings: Settings, *, history_conn: sqlite3.Connection,
     含めない (§6 遮断 1)。months は ``settings.backtest.holdout_months``
     経由のみ (呼び出し側が境界を動かせる自由度を作らない)。
     """
-    now_norm = _normalize_now(now)
+    now_norm = _normalize_now(now, dataset.base_interval)
     boundary = in_sample_until(now_norm, settings.backtest.holdout_months)
-    start = _oldest_bar_start(history_conn, symbol, dataset.source)
+    start = _oldest_bar_start(history_conn, symbol, dataset.source, dataset.base_interval)
     if start >= boundary:
         # F1 (fix round 1, codex Important): 遮断 1 (期間・端点はハーネスが
         # 所有) は例外経路にも適用される — 改善ループが例外本文を観測でき
@@ -189,7 +201,7 @@ def run_holdout_gate(settings: Settings, *, history_conn: sqlite3.Connection,
     API 形状までで、到達不能性の構造的成立はプラン 8/9 が担う
     (レビュー裁定 codex C1)。
     """
-    now_norm = _normalize_now(now)
+    now_norm = _normalize_now(now, dataset.base_interval)
     boundary = in_sample_until(now_norm, settings.backtest.holdout_months)
     return _run_scope(
         settings, scope="holdout_gate", history_conn=history_conn,

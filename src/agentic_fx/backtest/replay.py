@@ -16,7 +16,7 @@ class ReplayClock:
     Requires start to be timezone-aware UTC.
     """
 
-    def __init__(self, start: datetime):
+    def __init__(self, start: datetime, width: timedelta = timedelta(minutes=1)):
         """Initialize with start time.
 
         Args:
@@ -28,9 +28,10 @@ class ReplayClock:
             raise ValueError("start must be timezone-aware")
         # Normalize any aware datetime to UTC
         start_utc = start.astimezone(timezone.utc)
-        if start_utc.second != 0 or start_utc.microsecond != 0:
-            raise ValueError("start must be on minute boundary (second and microsecond must be 0)")
+        if width <= timedelta(0) or (start_utc - datetime(1970, 1, 1, tzinfo=timezone.utc)) % width:
+            raise ValueError("start must be on minute boundary / base interval grid")
         self._current = start_utc
+        self._width = width
 
     def now(self) -> datetime:
         """Return current replay time."""
@@ -38,7 +39,7 @@ class ReplayClock:
 
     def advance(self) -> datetime:
         """Advance 1 minute and return new time."""
-        self._current = self._current + timedelta(minutes=1)
+        self._current = self._current + self._width
         return self._current
 
 
@@ -77,21 +78,25 @@ class BarFeed:
 
         self._symbol = symbol
         self._source = dataset.source
+        self._width = dataset.width
         self._bars: dict[str, Bar] = {}
         self._spreads: dict[str, float] = {}
 
         # Preload bars and spreads from database
         # Use custom SELECT to get spread column (load_history_bars doesn't return it)
         rows = conn.execute(
-            "SELECT * FROM ohlcv_history WHERE symbol=? AND interval='1m' AND source=? "
+            "SELECT * FROM ohlcv_history WHERE symbol=? AND interval=? AND source=? "
             "AND bar_time>=? AND bar_time<=? ORDER BY bar_time",
-            (symbol, dataset.source, start_utc.isoformat(), end_utc.isoformat())
+            (symbol, dataset.base_interval, dataset.source, start_utc.isoformat(), end_utc.isoformat())
         ).fetchall()
 
         for row in rows:
             # Normalize bar_time to UTC for consistent keying and storage
             bar_time_dt = datetime.fromisoformat(row["bar_time"])
             bar_time_utc = bar_time_dt.astimezone(timezone.utc)
+            if ((bar_time_utc - datetime(1970, 1, 1, tzinfo=timezone.utc))
+                    % self._width):
+                raise ValueError("history bar is not on the base interval grid")
             normalized_key = bar_time_utc.isoformat()
 
             # Store Bar object with UTC-normalized ts
@@ -129,7 +134,7 @@ class BarFeed:
         normalized_key = ts_utc.isoformat()
         return self._bars.get(normalized_key)
 
-    def latest_completed_1m(self, ts: datetime) -> Bar | None:
+    def latest_completed(self, ts: datetime) -> Bar | None:
         """Return the most recently completed 1-minute bar before ts.
 
         bar_time represents the start of the bar interval. bar_at(now) returns
@@ -144,7 +149,7 @@ class BarFeed:
         """
         if ts.tzinfo is None:
             raise ValueError("ts must be timezone-aware")
-        return self.bar_at(ts - timedelta(minutes=1))
+        return self.bar_at(ts - self._width)
 
     def spread_at(self, ts: datetime) -> float | None:
         """Return spread at given timestamp, or None if missing.

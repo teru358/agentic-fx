@@ -340,6 +340,39 @@ def test_coverage_report_gap_pct(tmp_path):
     assert rep["bars"] == 24 and rep["gap_pct"] > 0  # 後半 24h が欠損
 
 
+def test_coverage_report_uses_dataset_base_interval_not_1m_fixed(tmp_path):
+    """段 0 pin: `coverage_report` の `load_resampled_frame` 呼び出しが
+    `dataset.base_interval` ではなく "1m" 固定へ退行していないかを直接
+    検証する。history には 5m 行のみ (1m 行は 0 件) を投入し、5m dataset
+    を渡した coverage_report が実際にそれを読めることをピンする。
+    """
+    conn = _conn(tmp_path)
+    rows = [("USDJPY", "5m", (H + timedelta(minutes=5 * i)).isoformat(),
+             100.0, 100.5, 99.5, 100.0, 10.0, 0.01) for i in range(24)]
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
+    rep = coverage_report(conn, "USDJPY", timeframe="1h",
+                          dataset=HistoryDataset("dukascopy", "5m"),
+                          start=H, end=H + timedelta(hours=2))
+    assert rep["bars"] >= 1
+
+
+def test_load_returns_uses_dataset_base_interval_not_1m_fixed(tmp_path):
+    """段 0 pin: `_load_returns` の `load_resampled_frame` 呼び出しが
+    `dataset.base_interval` ではなく "1m" 固定へ退行していないかを直接
+    検証する (history に 5m 行のみを投入)。
+    """
+    conn = _conn(tmp_path)
+    values = [100.0, 101.0, 102.0, 103.0, 104.0]
+    rows = [("USDJPY", "5m", (H + i * timedelta(hours=1)).isoformat(),
+             v, v + 0.05, v - 0.05, v, 1.0, 0.01)
+            for i, v in enumerate(values)]
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
+    returns = _load_returns(conn, "USDJPY", "1h",
+                            dataset=HistoryDataset("dukascopy", "5m"),
+                            in_sample_until=FAR_FUTURE)
+    assert returns  # 1m 固定へ退行すると空になる (5m 行しか無いため)
+
+
 def test_coverage_report_allows_1m(tmp_path):
     """F3 (最終レビュー opus I-2 must-fix): coverage_report は 1m を拒否
     しない — 本ブランチのインポータが書く唯一のデータを人間が検査できる

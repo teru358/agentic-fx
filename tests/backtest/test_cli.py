@@ -214,6 +214,44 @@ def test_cli_backtest_run_rejects_empty_history(tmp_path, monkeypatch):
     br.save_human_run.assert_not_called()
 
 
+def test_cli_backtest_run_empty_history_guard_uses_base_interval_arg(
+        tmp_path, monkeypatch):
+    """段 0 pin: `_empty_history_guard` の COUNT クエリが literal "1m" に
+    固定戻しすると、5m 基底で実データが在るのに rc=1 (fail closed) の
+    誤検出になる — ``args.base_interval`` を使うことを pin する。"""
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    proposals = tmp_path / "p.jsonl"
+    proposals.write_text("", encoding="utf-8")
+    from agentic_fx.store import ohlcv as ohlcv_store
+    seed_conn = connect(tmp_path / "data" / "agentic.db")
+    init_db(seed_conn)
+    ohlcv_store.import_history_bars(
+        seed_conn, [("USDJPY", "5m", "2026-07-01T00:00:00+00:00",
+                    148.0, 148.2, 147.9, 148.1, 10.0, 0.01)],
+        source="mt5")
+    seed_conn.close()
+    fake_result = BacktestResult(
+        orders=[], equity_curve=[("2026-07-01T00:00:00+00:00", 1_000_000.0)],
+        start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        source="mt5", fallback_spread_used=False)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay") as rr, \
+         patch("agentic_fx.backtest.cli.backtest_runs") as br:
+        rr.return_value = fake_result
+        br.save_human_run.return_value = 1
+        br.settings_snapshot_hash.side_effect = \
+            backtest_runs_real.settings_snapshot_hash
+        br.core_commit.return_value = "deadbeef"
+        rc = main(["backtest", "run", "--symbol", "USDJPY",
+                   "--source", "mt5", "--base-interval", "5m",
+                   "--from", "2026-07-01", "--to", "2026-07-02",
+                   "--proposal-file", str(proposals)])
+    assert rc == 0
+    rr.assert_called_once()
+
+
 def test_cli_backtest_run_rejects_naive_ts_in_proposal_file(tmp_path, monkeypatch):
     """ts の naive 性だけを不正要因として孤立させる (Fix Round 1 レビュー
     指摘: action='open' の完全な有効 intent に naive ts だけを混ぜることで、

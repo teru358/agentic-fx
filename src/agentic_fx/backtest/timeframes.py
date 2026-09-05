@@ -43,7 +43,7 @@ def _table(source: str) -> str:
         f"{sorted(LIVE_SOURCES | IMPORT_SOURCES)} に含まれません")
 
 # 本モジュールの許容 timeframe の正規列挙 (分析用に 15m を含む)。
-RESAMPLE_TIMEFRAMES = ("1m", "15m", "1h", "4h", "1d")
+RESAMPLE_TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
 
 # signal/strategy plugin の宣言 timeframe の正規列挙 (D5 — 1m を除く
 # RESAMPLE_TIMEFRAMES)。1m は約定判定の足そのもの、5m は resample 供給面の
@@ -52,10 +52,12 @@ RESAMPLE_TIMEFRAMES = ("1m", "15m", "1h", "4h", "1d")
 # 3 箇所に集約されている (5m 追加は小 task 1 個で可能な設計)。
 PLUGIN_TIMEFRAMES = ("15m", "1h", "4h", "1d")
 
-TF_MINUTES = {"1m": 1, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+TF_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 
 assert set(TF_MINUTES) == set(RESAMPLE_TIMEFRAMES)
-assert PLUGIN_TIMEFRAMES == tuple(t for t in RESAMPLE_TIMEFRAMES if t != "1m")
+# Plugin declarations are the supported resample targets, rather than an
+# accidental statement about whichever interval happens to be the base feed.
+assert set(PLUGIN_TIMEFRAMES) <= set(RESAMPLE_TIMEFRAMES)
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -90,8 +92,18 @@ def floor_to_bucket(ts: datetime, timeframe: str) -> datetime:
     return _EPOCH + ((ts_utc - _EPOCH) // width) * width
 
 
+def ceil_to_bucket(ts: datetime, timeframe: str) -> datetime:
+    """UTC epoch anchored mathematical ceil for a timeframe bucket."""
+    ts_utc = _require_aware_utc(ts, "ts")
+    floor = floor_to_bucket(ts_utc, timeframe)
+    if floor == ts_utc:
+        return floor
+    return floor + timedelta(minutes=TF_MINUTES[timeframe])
+
+
 def load_resampled_frame(conn: sqlite3.Connection, symbol: str,
                          timeframe: str, *, source: str,
+                         base_interval: str,
                          since: datetime | None = None,
                          until: datetime | None = None,
                          max_bars: int | None = None) -> pd.DataFrame:
@@ -128,7 +140,7 @@ def load_resampled_frame(conn: sqlite3.Connection, symbol: str,
     """
     _validate_timeframe(timeframe)
     if until is None:
-        if timeframe != "1m" or max_bars is not None:
+        if timeframe != base_interval or max_bars is not None:
             raise ValueError(
                 "until is required (bucket completeness and the max_bars SQL "
                 "window have no reference point without it)")
@@ -152,8 +164,8 @@ def load_resampled_frame(conn: sqlite3.Connection, symbol: str,
         lower = window_lower if lower is None else max(lower, window_lower)
 
     q = (f"SELECT bar_time, open, high, low, close, volume FROM {_table(source)} "
-         "WHERE symbol=? AND interval='1m' AND source=?")
-    args: list = [symbol, source]
+         "WHERE symbol=? AND interval=? AND source=?")
+    args: list = [symbol, base_interval, source]
     if lower is not None:
         q += " AND bar_time >= ?"
         args.append(lower.isoformat())
@@ -177,7 +189,7 @@ def load_resampled_frame(conn: sqlite3.Connection, symbol: str,
             pd.to_datetime([r["bar_time"] for r in rows], utc=True)),
         columns=list(_COLUMNS))
 
-    if timeframe != "1m":
+    if timeframe != base_interval:
         df = resample(df, pandas_rule(timeframe))
 
     if until_utc is not None:

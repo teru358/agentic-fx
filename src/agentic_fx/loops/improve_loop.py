@@ -734,18 +734,18 @@ class ImproveLoop:
                             symbols = sorted(
                                 row[0] for row in hist_conn.execute(
                                     "SELECT DISTINCT symbol FROM ohlcv_history"
-                                    " WHERE interval='1m' AND source=?",
-                                    (self._settings.backtest.eval_source,)))
+                                    " WHERE interval=? AND source=?",
+                                    (dataset.base_interval, dataset.source)))
                         finally:
                             hist_conn.close()
                     except Exception:
                         pass  # hint 構築の失敗で error 応答自体を壊さない
                     if symbols:
-                        hint = (f"No 1m history for {args['pair']}. Pairs "
+                        hint = (f"No {dataset.base_interval} history for {args['pair']}. Pairs "
                                 "with local backtest history: "
                                 f"{', '.join(symbols)}.")
                     else:
-                        hint = (f"No 1m history for {args['pair']}, and no "
+                        hint = (f"No {dataset.base_interval} history for {args['pair']}, and no "
                                 "pair has local backtest history yet — "
                                 "run_backtest cannot succeed until history "
                                 "data is imported. Report this as a "

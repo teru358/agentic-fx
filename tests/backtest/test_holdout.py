@@ -100,6 +100,39 @@ def test_run_in_sample_returns_metrics_without_period(tmp_path, monkeypatch):
     assert forbidden.isdisjoint(out.keys())
 
 
+def test_run_in_sample_oldest_bar_lookup_uses_dataset_base_interval_not_1m(
+        tmp_path, monkeypatch):
+    """段階 3 pin: `_oldest_bar_start` の SQL が `interval="1m"` 固定へ
+    退行すると、5m dataset のみを持つ history では最古バーが見つからず
+    `NoHistoryError` になる — dataset.base_interval を実際に使うことを
+    直接検証する (段 0 変異「SQL の base 固定戻し」用)。
+    """
+    from agentic_fx.backtest.dataset import HistoryDataset
+    hist = _conn(tmp_path)
+    rows_5m = [
+        (r[0], "5m", r[2], r[3], r[4], r[5], r[6], r[7], r[8])
+        for r in [
+            _row_at(H - timedelta(days=200), o=100.0, h=100.5, l=99.5, c=100.2),
+            _row_at(H, o=100.3, h=100.7, l=99.9, c=100.4),
+        ]
+    ]
+    ohlcv.import_history_bars(hist, rows_5m, source="dukascopy")
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    calls = []
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
+    saved = []
+    out = run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
+                        dataset=HistoryDataset("dukascopy", "5m"),
+                        intent_source=lambda b: None,
+                        eval_timeframe="1h", plugin_ref="p", content_hash="h",
+                        kind="strategy", now=WED + timedelta(days=120),
+                        record_fn=saved.append)
+    assert "trades" in out
+    # raw_grid_bars_present (params) も dataset.base_interval="5m" の行数を
+    # 数えていること — "1m" 固定へ退行すると 0 行 (5m 行しか無いため) になる。
+    assert saved[0]["params"]["raw_grid_bars_present"] >= 1
+
+
 def test_in_sample_and_gate_use_disjoint_periods(tmp_path, monkeypatch):
     """分割点の両側が交わらないことを backtest_runs の記録で検証。"""
     hist = _conn(tmp_path)

@@ -114,6 +114,7 @@ def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
     until_utc = as_utc(in_sample_until)
     since_utc = None if since is None else as_utc(since)
     df = load_resampled_frame(conn, symbol, timeframe, source=dataset.source,
+                              base_interval=dataset.base_interval,
                               since=since_utc, until=until_utc)
     closes = {ts.to_pydatetime(): float(c) for ts, c in df["close"].items()}
     width = timedelta(minutes=_TF_MINUTES[timeframe])
@@ -310,7 +311,7 @@ def lead_lag(conn: sqlite3.Connection, a: str, b: str, *, timeframe: str,
 # (§6 遮断の対象外、docstring どおり) なのでここだけ 1m を追加する。
 # **TIMEFRAMES / _TF_MINUTES / 直後の assert は一切変更しない** — 改善ループ
 # 面の列挙は不変 (ここを触るとモジュール import 時の assert が落ちる)。
-_COVERAGE_TF_MINUTES = {"1m": 1, **_TF_MINUTES}
+_COVERAGE_TF_MINUTES = {**_TF_MINUTES}
 
 
 def coverage_report(conn: sqlite3.Connection, symbol: str, *, timeframe: str,
@@ -351,11 +352,12 @@ def coverage_report(conn: sqlite3.Connection, symbol: str, *, timeframe: str,
     書くのは 1m のみのため (``load_resampled_frame`` は "1m" を素通しで
     返す)。
     """
-    if timeframe not in _COVERAGE_TF_MINUTES:
+    if timeframe not in _COVERAGE_TF_MINUTES and timeframe != dataset.base_interval:
         raise ValueError("timeframe is not one of the enumerated values")
     start_utc = as_utc(start)
     end_utc = as_utc(end)
-    step = timedelta(minutes=_COVERAGE_TF_MINUTES[timeframe])
+    step = timedelta(minutes=_COVERAGE_TF_MINUTES.get(
+        timeframe, int(dataset.width.total_seconds() // 60)))
     expected_open_bars = 0
     # F4 (レビュー Fix Round 1, codex Medium): actual (load_resampled_frame)
     # と同じ epoch 錨バケット格子を歩く — start からではなく
@@ -370,6 +372,7 @@ def coverage_report(conn: sqlite3.Connection, symbol: str, *, timeframe: str,
         raise ValueError("expected_open_bars is zero (empty or fully closed "
                          "range)")
     df = load_resampled_frame(conn, symbol, timeframe, source=dataset.source,
+                              base_interval=dataset.base_interval,
                               since=start_utc, until=end_utc)
     bars = len(df)
     gap_pct = (expected_open_bars - bars) / expected_open_bars * 100

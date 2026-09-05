@@ -194,6 +194,30 @@ def test_no_fire_when_df_is_empty(tmp_path):
     assert session.calls == []
 
 
+def test_5m_dataset_uses_5m_base_interval_for_load_resampled_frame(tmp_path):
+    """段 0 pin: `__call__` が `load_resampled_frame` へ渡す `base_interval`
+    が `self._dataset.base_interval` ではなく "1m" 固定へ退行していないか
+    を直接検証する。dataset=5m、history には 5m 行のみ (1m 行は 0 件) を
+    seed し、"1m" 固定なら df が空になって発火しないところを、正しく
+    dataset.base_interval="5m" を使えば発火することをピンする。
+    """
+    from agentic_fx.backtest.dataset import HistoryDataset
+
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=5 * i), o=100.0, h=100.0, l=100.0,
+                    c=100.0) for i in range(60)]
+    rows = [(r[0], "5m", r[2], r[3], r[4], r[5], r[6], r[7], r[8]) for r in rows]
+    ohlcv_store.import_history_bars(conn, rows, source="dukascopy")
+    meta = _meta(timeframe="1h")
+    session = _FakeSession()
+    src = strategy_adapter.build_intent_source(
+        meta, conn=conn, pair="USDJPY",
+        dataset=HistoryDataset("dukascopy", "5m"), settings=SETTINGS,
+        session=session)
+    src(_bar(H + timedelta(hours=1)))
+    assert session.calls, "5m dataset の base_interval が伝播していれば発火するはず"
+
+
 # --- ③ open → intent dict 写像 ---------------------------------------------
 
 def test_open_market_without_take_profit_omits_take_profit_key(tmp_path):

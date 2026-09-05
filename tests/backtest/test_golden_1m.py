@@ -1,4 +1,4 @@
-"""golden-v1 は 1m replay の観測面を逐語固定する。"""
+"""golden-v2 は先頭完全足規則後の 1m replay を逐語固定する。"""
 from __future__ import annotations
 
 import difflib
@@ -8,7 +8,7 @@ from pathlib import Path
 from tests.backtest.golden.generate import build_golden
 
 
-GOLDEN_PATH = Path(__file__).parent / "golden" / "golden-v1.json"
+GOLDEN_PATH = Path(__file__).parent / "golden" / "golden-v2.json"
 
 # generate.py の main() が golden-v1.json を書く際の canonical serialization
 # (段階 1 レビュー是正 6b): sort_keys / 固定 separators (indent=2 の既定
@@ -19,7 +19,7 @@ def _canonical(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
-def test_golden_v1_replay_observations_are_verbatim():
+def test_golden_v2_replay_observations_are_verbatim():
     """orders / curve / metrics / snapshots / kill-switch を消す変異を検出する。
 
     byte-for-byte 比較 (段階 1 レビュー是正 6b): dict 等価では int/float の
@@ -32,8 +32,8 @@ def test_golden_v1_replay_observations_are_verbatim():
     if actual_text != expected_text:
         diff = "\n".join(difflib.unified_diff(
             expected_text.splitlines(), actual_text.splitlines(),
-            fromfile="golden-v1.json", tofile="actual", lineterm=""))
-        raise AssertionError(f"golden-v1 mismatch:\n{diff}")
+            fromfile="golden-v2.json", tofile="actual", lineterm=""))
+        raise AssertionError(f"golden-v2 mismatch:\n{diff}")
 
     close_reasons = [row["close_reason"] for row in actual["orders"]]
     assert "sl" in close_reasons
