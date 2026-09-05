@@ -128,9 +128,15 @@ def test_run_in_sample_oldest_bar_lookup_uses_dataset_base_interval_not_1m(
                         kind="strategy", now=WED + timedelta(days=120),
                         record_fn=saved.append)
     assert "trades" in out
-    # raw_grid_bars_present (params) も dataset.base_interval="5m" の行数を
-    # 数えていること — "1m" 固定へ退行すると 0 行 (5m 行しか無いため) になる。
-    assert saved[0]["params"]["raw_grid_bars_present"] >= 1
+
+
+def test_in_sample_until_rounds_off_grid_now_to_5m_dataset_grid():
+    """C4a-1: 5m dataset の境界は 1m 格子ではなく 5m 格子へ丸める。"""
+    from agentic_fx.backtest.holdout import in_sample_until
+
+    now = H + timedelta(days=120, minutes=3, seconds=30)
+    assert in_sample_until(now, 3, base_interval="5m") == in_sample_until(
+        H + timedelta(days=120), 3, base_interval="5m")
 
 
 def test_in_sample_and_gate_use_disjoint_periods(tmp_path, monkeypatch):

@@ -4,6 +4,7 @@
 同じ関数を import する — §8.1-41)。"""
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from unittest.mock import MagicMock
 
@@ -490,5 +491,6 @@ def test_no_strategy_row_copies_identity_and_replaces_metrics_only(
     assert row["scope"] == candidate_row["scope"]
     assert row["plugin_ref"] == "no_strategy:brand_new_strategy"
     assert row["variant"] == "no_strategy"
+    assert json.loads(row["params_json"]) == candidate_row["params"]
     # candidate 行の dict 自体は破壊されていないこと (shallow copy pin)
     assert candidate_row["plugin_ref"] == "plugins/brand_new_strategy"

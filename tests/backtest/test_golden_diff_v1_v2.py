@@ -271,6 +271,16 @@ def test_synthetic_pre_decision_snapshot_removal_classifies_and_matches_ground_t
     assert removed[0]["ts"] == _START.isoformat()
 
 
+def test_snapshot_removed_at_first_decision_is_unclassifiable():
+    """C7-1: first_decision_at ちょうどの除去を pre-decision に緩和しない。"""
+    first_decision = _expected_first_decision_at(_START, "1h")
+    with pytest.raises(AssertionError, match="分類不能"):
+        _classify_removed_rows(
+            [{"ts": first_decision.isoformat(), "equity": 1_000_000.0}], [],
+            key_fn=_snapshot_key, ts_fn=lambda row: row["ts"],
+            first_decision_at=first_decision)
+
+
 def test_synthetic_derived_order_from_early_signal_classifies_as_b():
     """(b) derived の実例: pre-decision 期間内 (`created_at <
     first_decision_at(v2)`) のシグナルに由来する order が v1 にのみ存在し、

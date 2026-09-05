@@ -736,6 +736,29 @@ def test_aggregate_bucket_and_load_resampled_frame_agree():
     assert bucket.volume == pytest.approx(row0["volume"])
 
 
+def test_aggregate_bucket_and_load_resampled_frame_agree_for_multiple_buckets_with_gaps():
+    """C8a-3: 欠損混在の複数バケットでも両経路の集約規則は一致する。"""
+    rows = []
+    for i in range(15):
+        if i in {2, 11}:
+            continue
+        rows.append(_row(WED + timedelta(minutes=i), 100 + i, 101 + i,
+                         99 + i, 100.5 + i, v=10 + i))
+    conn = _conn()
+    ohlcv.import_history_bars(conn, rows, source="dukascopy")
+    feed = BarFeed(conn, "USDJPY", dataset=HistoryDataset("dukascopy", "1m"),
+                   start=WED, end=WED + timedelta(minutes=15))
+    frame = load_resampled_frame(conn, "USDJPY", "5m", source="dukascopy",
+                                 base_interval="1m", until=WED + timedelta(minutes=15))
+    assert len(frame) == 3
+    for bucket_start, row in frame.iterrows():
+        bucket = _aggregate_bucket(feed, "USDJPY", "5m", bucket_start.to_pydatetime(),
+                                   timedelta(minutes=5))
+        assert bucket is not None
+        assert (bucket.open, bucket.high, bucket.low, bucket.close, bucket.volume) == pytest.approx(
+            (row["open"], row["high"], row["low"], row["close"], row["volume"]))
+
+
 def test_aggregate_bucket_all_missing_returns_none_both_paths():
     conn = _conn()
     dataset = HistoryDataset("dukascopy", "1m")
