@@ -615,6 +615,13 @@ def test_migration_backup_not_overwritten_on_retry(tmp_path):
     db_module._backup_before_migration(conn, ".bak-ohlcv-v2")
 
     assert bak.read_text() == "sentinel"  # 上書きされていない
+    backups = sorted(tmp_path.glob("legacy.db.bak-ohlcv-v2*"))
+    assert len(backups) == 2
+    assert backups[0] == bak
+    datetime.strptime(backups[1].name.rsplit(".", 1)[1], "%Y%m%dT%H%M%SZ")
+    with sqlite3.connect(backups[1]) as bak_conn:
+        assert bak_conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='ohlcv'").fetchone()
 
 
 def test_migration_skips_backup_for_inmemory_db():

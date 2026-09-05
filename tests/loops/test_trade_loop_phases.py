@@ -461,6 +461,38 @@ def test_signals_consume_failure_is_caught_and_recorded(tmp_path):
     assert m["status"] == "completed"
 
 
+def test_signals_consume_operational_error_uses_outer_failure_path(tmp_path):
+    """非 ValueError の consume 障害は signal 拒否へ変換せず外側で扱う。"""
+    import sqlite3
+
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "x"}, [])])
+    sid = signals.add(
+        conn, plugin="sig1", content_hash="h1", pair="USDJPY",
+        timeframe="1h", bar_ts=NOW.isoformat(), kind="signal",
+        payload={"direction": "long", "strength": 0.7, "rationale": "up"},
+        now=NOW)
+
+    with patch("agentic_fx.loops.trade_loop.signals.consume",
+               side_effect=sqlite3.OperationalError("database is locked")):
+        out = loop.run_once("signal")
+
+    assert out is None
+    intent_row = conn.execute(
+        "SELECT gate_result, reject_category FROM trade_intents "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert intent_row is not None
+    assert dict(intent_row) == {"gate_result": None, "reject_category": None}
+    act_text = (tp / "a.log").read_text(encoding="utf-8")
+    assert "intent_execution_failed" in act_text
+    signal_row = conn.execute(
+        "SELECT status, requeue_count FROM signals WHERE id=?", (sid,)).fetchone()
+    assert dict(signal_row) == {"status": "pending", "requeue_count": 1}
+    mission = conn.execute(
+        "SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()
+    assert mission["status"] != "running"
+
+
 # ---- `_finalize_mission` の lock 保持 (指揮者の変異スイープ・レビュー 3 周目)
 #
 # KAT-Coder のレビュー指摘 (「これらの経路にテストが無い」) を指揮者が実測し、

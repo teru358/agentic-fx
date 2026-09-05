@@ -2120,6 +2120,77 @@ def test_scheduler_tick_defers_close_notification_until_after_core_lock(tmp_path
     assert observations == [(True, True)]
 
 
+def test_scheduler_tick_drains_notification_after_tick_raises(tmp_path):
+    """tick が通知を溜めてから失敗しても、lock 解放後に送って再送出する。"""
+    from agentic_fx.service import _scheduler_tick_once
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    observations: list[bool] = []
+
+    class CheckingNotifier:
+        def send(self, text):
+            acquired: list[bool] = []
+
+            def check_lock():
+                ok = app.core_lock.acquire(blocking=False)
+                acquired.append(ok)
+                if ok:
+                    app.core_lock.release()
+
+            checker = threading.Thread(target=check_lock)
+            checker.start()
+            checker.join(timeout=5.0)
+            observations.append(acquired == [True])
+
+    app.executor.notifier = CheckingNotifier()
+
+    def failing_tick(now):
+        app.executor._notify("notification before failure")
+        raise RuntimeError("tick boom")
+
+    app.scheduler.tick = failing_tick
+    with pytest.raises(RuntimeError, match="tick boom"):
+        _scheduler_tick_once(app)
+
+    assert observations == [True]
+
+
+def test_scheduler_tick_sends_deferred_notifications_before_hooks(tmp_path):
+    """scheduler の遅延通知は tick が返した hook より先に送信する。"""
+    from agentic_fx.service import _scheduler_tick_once
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    events: list[str] = []
+    app.executor.notifier.send = lambda text: events.append("notification")
+
+    def notifying_tick(now):
+        app.executor._notify("tick notification")
+        return [lambda: events.append("hook")]
+
+    app.scheduler.tick = notifying_tick
+    _scheduler_tick_once(app)
+
+    assert events == ["notification", "hook"]
+
+
+def test_scheduler_tick_runs_hook_when_deferred_notification_fails(tmp_path):
+    """遅延通知の送信失敗は hook の実行を妨げない。"""
+    from agentic_fx.service import _scheduler_tick_once
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    hooks: list[str] = []
+    app.executor.notifier.send = MagicMock(side_effect=RuntimeError("send boom"))
+
+    def notifying_tick(now):
+        app.executor._notify("tick notification")
+        return [lambda: hooks.append("hook")]
+
+    app.scheduler.tick = notifying_tick
+    _scheduler_tick_once(app)
+
+    assert hooks == ["hook"]
+
+
 def test_watchdog_tick_uses_mission_watch_time_fn_directly(tmp_path):
     """_watchdog_tick の elapsed 算出が MissionWatch.time_fn 経由で行われ、
     結果を FakeActivity/FakeNotifier に観測する (time_fn を壁時計に戻す

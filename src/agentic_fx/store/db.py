@@ -402,7 +402,8 @@ def _backup_before_migration(conn: sqlite3.Connection, suffix: str) -> None:
     src_path = Path(db_file)
     bak_path = src_path.with_name(src_path.name + suffix)
     if bak_path.exists():
-        return
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        bak_path = src_path.with_name(src_path.name + suffix + "." + timestamp)
     bak_conn = sqlite3.connect(bak_path)
     try:
         conn.backup(bak_conn)

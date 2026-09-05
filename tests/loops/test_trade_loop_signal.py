@@ -113,6 +113,25 @@ def test_signal_stays_consumed_when_executor_raises(tmp_path):
     assert row["status"] == "consumed"  # requeue されない
 
 
+def test_signal_requeues_when_intent_recording_raises(tmp_path):
+    """intent 記録失敗は consume 前なので、claimed signal を requeue する。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "ok"}, [])])
+    sid = _add_signal(conn)
+    loop.executor.record_and_validate_intent = MagicMock(
+        side_effect=RuntimeError("record boom"))
+
+    with patch("agentic_fx.loops.trade_loop.signals.consume",
+               wraps=signals.consume) as consume:
+        out = loop.run_once("signal")
+
+    assert out is None
+    consume.assert_not_called()
+    row = conn.execute(
+        "SELECT status, requeue_count FROM signals WHERE id=?", (sid,)).fetchone()
+    assert dict(row) == {"status": "pending", "requeue_count": 1}
+
+
 # ---------------------------------------------------------------------
 # 鮮度: claim は settings.plugin.signal_freshness_bars を鮮度ゲートとして
 # claim_oldest に渡す (freshness_bars を渡し忘れる/None にする変異の killer
