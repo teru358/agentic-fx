@@ -322,6 +322,31 @@ def test_sweep_orphans_preserves_staging_candidate_referenced_by_pending_approva
     assert candidate_dir.exists()
 
 
+def test_sweep_orphans_keeps_symlink_candidate_referenced_by_pending_approval(env):
+    """3 周目 I1 (2026-09-05): symlink guard は `rel not in referenced` と
+    組み合わさっていなければならない — pending approval が参照する候補が
+    symlink でも link を消してはいけない (guard を `is_symlink()` 単独に
+    する変異が全テスト緑で生存していた)。"""
+    tmp_path, plugins_dir, conn = env
+    real_dir = tmp_path / "real_candidate"
+    real_dir.mkdir()
+    (real_dir / "plugin.py").write_text("x")
+    mission_dir = plugins_dir / "_staging" / "1"
+    mission_dir.mkdir(parents=True)
+    link = mission_dir / "kept"
+    link.symlink_to(real_dir)
+    approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "kept", "artifact_hash": "a" * 64, "content_hash": "x",
+                 "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/1/kept"}, now=NOW)
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+
+    assert link.is_symlink()
+    assert (real_dir / "plugin.py").exists()
+
+
 def test_sweep_orphans_preserves_temp_link_of_open_journal(env):
     """確定-11: `sweep_orphans` ④ の `gc_roots` 除外が pin されていな
     かった (`test_gc_roots_includes_temp_link_path_itself` は gc_roots の
