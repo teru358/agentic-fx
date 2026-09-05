@@ -22,6 +22,7 @@ from pathlib import Path
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog
 from agentic_fx.backtest.analysis import coverage_report, corr_matrix
+from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import compare_sources, import_mt5
@@ -75,6 +76,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     cov.add_argument("--symbol", required=True)
     cov.add_argument("--timeframe", required=True)
     cov.add_argument("--source", required=True, choices=sorted(ohlcv.IMPORT_SOURCES))
+    cov.add_argument("--base-interval", default="1m", choices=("1m", "5m", "15m"))
     cov.add_argument("--from", dest="from_", type=_parse_date, required=True)
     cov.add_argument("--to", dest="to", type=_parse_date, required=True)
 
@@ -85,6 +87,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
         "run", help="人間用バックテスト実行 (自由期間・scope=human_custom)")
     run.add_argument("--symbol", required=True)
     run.add_argument("--source", required=True, choices=sorted(ohlcv.IMPORT_SOURCES))
+    run.add_argument("--base-interval", default="1m", choices=("1m", "5m", "15m"))
     run.add_argument("--from", dest="from_", type=_parse_date, required=True)
     run.add_argument("--to", dest="to", type=_parse_date, required=True)
     # opus R2 M6: --proposal-file (既存の JSONL 提案列経路) と --plugin
@@ -188,8 +191,9 @@ def _history_compare(conn, settings, args: argparse.Namespace) -> int:
 
 
 def _history_coverage(conn, args: argparse.Namespace) -> int:
+    dataset = HistoryDataset(args.source, args.base_interval)
     result = coverage_report(conn, args.symbol, timeframe=args.timeframe,
-                             source=args.source, start=args.from_,
+                             dataset=dataset, start=args.from_,
                              end=args.to)
     print(result)
     return 0
@@ -281,13 +285,13 @@ def _empty_history_guard(conn, args: argparse.Namespace) -> bool:
     ここで診断メッセージを出す。
     """
     n_bars = conn.execute(
-        "SELECT COUNT(*) FROM ohlcv_history WHERE symbol=? AND interval='1m' "
+        "SELECT COUNT(*) FROM ohlcv_history WHERE symbol=? AND interval=? "
         "AND source=? AND bar_time >= ? AND bar_time < ?",
-        (args.symbol, args.source, args.from_.isoformat(),
+        (args.symbol, args.base_interval, args.source, args.from_.isoformat(),
          args.to.isoformat())).fetchone()[0]
     if n_bars == 0:
         print(f"エラー: symbol={args.symbol} source={args.source} の指定期間に "
-             "1m 履歴が 0 件です (source のタイプミスや未インポート期間の "
+             f"{args.base_interval} 履歴が 0 件です (source のタイプミスや未インポート期間の "
              "可能性があります)", file=sys.stderr)
         return False
     return True
@@ -307,7 +311,8 @@ def _backtest_run_proposal(conn, settings, args: argparse.Namespace) -> int:
     if not _empty_history_guard(conn, args):
         return 1
 
-    result = run_replay(settings, symbol=args.symbol, source=args.source,
+    dataset = HistoryDataset(args.source, args.base_interval)
+    result = run_replay(settings, symbol=args.symbol, dataset=dataset,
                         start=args.from_, end=args.to,
                         intent_source=intent_source,
                         eval_timeframe=args.timeframe, history_conn=conn)
@@ -315,7 +320,8 @@ def _backtest_run_proposal(conn, settings, args: argparse.Namespace) -> int:
     run_id = backtest_runs.save_human_run(
         conn, plugin_ref=str(proposal_path), content_hash=content_hash,
         kind="proposals", pair=args.symbol, timeframe=args.timeframe,
-        source=args.source, period=(args.from_, args.to), metrics=metrics,
+        source=dataset.source, base_interval=dataset.base_interval,
+        period=(args.from_, args.to), metrics=metrics,
         settings_hash=backtest_runs.settings_snapshot_hash(settings),
         core_commit=backtest_runs.core_commit(),
         initial_balance=settings.backtest.initial_balance,
@@ -359,8 +365,9 @@ def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
     if not _empty_history_guard(conn, args):
         return 1
 
+    dataset = HistoryDataset(args.source, args.base_interval)
     intent_source = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair=args.symbol, source=args.source,
+        meta, conn=conn, pair=args.symbol, dataset=dataset,
         settings=settings)
     try:
         # strategy_adapter の「貫通」契約 (SandboxError を hold へ読み替え
@@ -370,7 +377,7 @@ def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
         # 確立方針を --plugin 経路にも適用するため (最終レビュー F2、
         # `plugin submit`/`bless` の既存 catch と同じ変換規律)。fail
         # closed の実体 (human_custom 行を残さない・rc≠0) は維持する。
-        result = run_replay(settings, symbol=args.symbol, source=args.source,
+        result = run_replay(settings, symbol=args.symbol, dataset=dataset,
                             start=args.from_, end=args.to,
                             intent_source=intent_source,
                             eval_timeframe=args.timeframe, history_conn=conn)
@@ -393,7 +400,8 @@ def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
     run_id = backtest_runs.save_human_run(
         conn, plugin_ref=f"plugins/{meta.name}", content_hash=meta.content_hash,
         kind="strategy", pair=args.symbol, timeframe=args.timeframe,
-        source=args.source, period=(args.from_, args.to), metrics=metrics,
+        source=dataset.source, base_interval=dataset.base_interval,
+        period=(args.from_, args.to), metrics=metrics,
         settings_hash=backtest_runs.settings_snapshot_hash(settings),
         core_commit=backtest_runs.core_commit(),
         initial_balance=settings.backtest.initial_balance,
@@ -414,8 +422,9 @@ def _backtest_run(conn, settings, args: argparse.Namespace, root: Path) -> int:
 
 def _analyze_corr(conn, args: argparse.Namespace) -> int:
     in_sample_until = args.to if args.to is not None else _NO_LIMIT
+    dataset = HistoryDataset(args.source, "1m")
     result = corr_matrix(conn, [args.a, args.b], timeframe=args.timeframe,
-                         source=args.source, in_sample_until=in_sample_until,
+                         dataset=dataset, in_sample_until=in_sample_until,
                          since=args.from_)
     print(result[(args.a, args.b)])
     return 0

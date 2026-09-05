@@ -189,6 +189,7 @@ def test_commit_strategy_missing_history_becomes_gate_failed(
             "scope": "holdout_gate", "plugin_ref": "plugins/myst",
             "content_hash": "c" * 64, "kind": "strategy",
             "pair": "USDJPY", "timeframe": "1h", "source": "dukascopy",
+            "base_interval": "1m", "params": {},
             "period": (datetime(2026, 1, 1, tzinfo=timezone.utc),
                        datetime(2026, 2, 1, tzinfo=timezone.utc)),
             "metrics": {"pf": 1.1}, "settings_hash": "settings-hash",
@@ -246,6 +247,7 @@ def test_finalize_gate_failed_persists_gate_rows_when_report_write_raises_oserro
         "scope": "holdout_gate", "plugin_ref": "plugins/myst",
         "content_hash": "c" * 64, "kind": "strategy", "pair": "USDJPY",
         "timeframe": "1h", "source": "dukascopy",
+        "base_interval": "1m", "params": {},
         "period": (datetime(2026, 1, 1, tzinfo=timezone.utc),
                    datetime(2026, 2, 1, tzinfo=timezone.utc)),
         "metrics": {"pf": 1.1}, "settings_hash": "settings-hash",
@@ -503,7 +505,8 @@ def test_finalize_success_persists_ledger_and_gate_rows_in_tx2(
          "result_summary": {
              "scope": "in_sample", "plugin_ref": "plugins/myst",
              "content_hash": "h1", "kind": "strategy", "pair": "USDJPY",
-             "timeframe": "1h", "source": "dukascopy", "period": in_sample_period,
+             "timeframe": "1h", "source": "dukascopy", "base_interval": "1m",
+             "params": {}, "period": in_sample_period,
              "metrics": {"pf": 1.2}, "settings_hash": "sh1",
              "core_commit": "c1", "initial_balance": 10000.0,
              "now": in_sample_period[0]}},
@@ -516,7 +519,8 @@ def test_finalize_success_persists_ledger_and_gate_rows_in_tx2(
     gate_rows = (
         {"scope": "holdout_gate", "plugin_ref": "plugins/myst",
          "content_hash": "h1", "kind": "strategy", "pair": "USDJPY",
-         "timeframe": "1h", "source": "dukascopy", "period": holdout_period,
+         "timeframe": "1h", "source": "dukascopy", "base_interval": "1m",
+         "params": {}, "period": holdout_period,
          "metrics": {"pf": 1.1}, "settings_hash": "sh1",
          "core_commit": "c1", "initial_balance": 10000.0,
          "now": holdout_period[1]},
@@ -529,12 +533,15 @@ def test_finalize_success_persists_ledger_and_gate_rows_in_tx2(
         ledger_entries=ledger_entries, gate_rows=gate_rows)
 
     bt_rows = conn.execute(
-        "SELECT scope, pair, content_hash, variant FROM backtest_runs "
-        "ORDER BY id").fetchall()
+        "SELECT scope, pair, content_hash, variant, base_interval "
+        "FROM backtest_runs ORDER BY id").fetchall()
     assert [(r["scope"], r["pair"], r["content_hash"], r["variant"])
             for r in bt_rows] == [
         ("in_sample", "USDJPY", "h1", "candidate"),
         ("holdout_gate", "USDJPY", "h1", "candidate")]
+    # A6 (v3 設計): 台帳経路 (in_sample) と親ゲート経路 (holdout_gate) の
+    # 双方で base_interval が実際に永続化されることを直接検査する。
+    assert [r["base_interval"] for r in bt_rows] == ["1m", "1m"]
     an_rows = conn.execute(
         "SELECT trial_count, source FROM analysis_runs").fetchall()
     assert [(r["trial_count"], r["source"]) for r in an_rows] == [
@@ -1235,7 +1242,8 @@ def test_finalize_success_writes_mission_id_on_ledger_and_gate_rows(
     gate_rows = [{
         "scope": "in_sample", "plugin_ref": "no_strategy:x",
         "content_hash": "h" * 8, "kind": "strategy", "pair": "USDJPY",
-        "timeframe": "1h", "source": "dukascopy", "period": period,
+        "timeframe": "1h", "source": "dukascopy", "base_interval": "1m",
+        "params": {}, "period": period,
         "metrics": {}, "settings_hash": "s", "core_commit": "c",
         "initial_balance": 10000.0, "now": now, "variant": "no_strategy"}]
 
@@ -1276,7 +1284,8 @@ def test_persist_ledger_rows_skips_error_entries(loop_min, conn):
          "result_summary": {
              "scope": "in_sample", "plugin_ref": "plugins/myst",
              "content_hash": "h1", "kind": "strategy", "pair": "USDJPY",
-             "timeframe": "1h", "source": "dukascopy", "period": period,
+             "timeframe": "1h", "source": "dukascopy", "base_interval": "1m",
+             "params": {}, "period": period,
              "metrics": {"pf": 1.2}, "settings_hash": "sh1",
              "core_commit": "c1", "initial_balance": 10000.0, "now": now}},
         # 正常な error 応答 (`analyze_corr_handler` が insufficient_data を

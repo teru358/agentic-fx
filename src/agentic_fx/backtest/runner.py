@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Callable
 
 from agentic_fx.backtest.replay import BarFeed, ReplayClock, quote_from_bar
+from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.config import Settings
 from agentic_fx.core import market_hours
 from agentic_fx.core.accounting import record_snapshot
@@ -75,15 +76,20 @@ class _RecordingActivity:
         self._clock = clock
         self.entries: list[dict] = []
 
-    def write(self, category, kind: str, text: str,
+    def write(self, category, event: str, summary: str,
               ref_id: str | None = None) -> None:
-        self.entries.append({
-            "ts": self._clock.now().astimezone(timezone.utc).isoformat(),
-            "category": getattr(category, "value", str(category)),
-            "kind": kind,
-            "text": text,
-            "ref_id": ref_id,
-        })
+        """Mirror ``ActivityLog.write`` and never interrupt replay."""
+        try:
+            self.entries.append({
+                "ts": self._clock.now().astimezone(timezone.utc).isoformat(),
+                "category": getattr(category, "value", str(category)),
+                "kind": event,
+                "text": summary,
+                "ref_id": ref_id,
+            })
+        except Exception:
+            # Activity is observability only; scheduler protection must proceed.
+            return
 
 
 class _RecordingStateStore(StateStore):
@@ -172,7 +178,29 @@ def _aggregate_bucket(feed: BarFeed, symbol: str, interval: str,
         volume=sum(b.volume for b in bars))
 
 
-def run_replay(settings: Settings, *, symbol: str, source: str,
+def _kill_switch_event(conn: sqlite3.Connection, entry: dict, kind: str) -> dict:
+    """kill_switch_events の 1 要素を組み立てる (段階 1 レビュー是正 6c を
+    テスト可能にするための module-level 抽出 — 挙動は不変)。
+
+    ``drawdown_pct`` は ``entry["ts"]`` 以前の最新 ``account_snapshots``
+    (``ORDER BY ts DESC, id DESC LIMIT 1`` — 同時刻の複数 snapshot は最大
+    id を選ぶ) から ``(hwm − equity)/hwm×100`` を計算する。``hwm <= 0``
+    (未初期化・境界) は ``None`` (計算不能)。
+    """
+    row = conn.execute(
+        "SELECT equity, hwm FROM account_snapshots "
+        "WHERE ts <= ? ORDER BY ts DESC, id DESC LIMIT 1",
+        (entry["ts"],)).fetchone()
+    drawdown = None
+    if row is not None and row["hwm"] > 0:
+        drawdown = max(0.0, (row["hwm"] - row["equity"])
+                       / row["hwm"] * 100.0)
+    return {"ts": entry["ts"], "kind": kind,
+            "reason": entry["text"] if "text" in entry else entry["reason"],
+            "drawdown_pct": drawdown}
+
+
+def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
                start: datetime, end: datetime,
                intent_source: IntentSource,
                eval_timeframe: str = "1h",
@@ -185,6 +213,8 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
     OHLCV 履歴の読み取り専用接続で、実行時状態を持つ in-memory 接続とは
     別物 (``BarFeed`` にのみ渡す)。
     """
+    if dataset.base_interval != "1m":
+        raise NotImplementedError("base_interval generalization lands in stage 3")
     tf = parse_timeframe(eval_timeframe)
     _require_minute_grid(end, "end")  # fix round 1 F3
 
@@ -206,7 +236,7 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
     record_snapshot(conn, now=start, balance=initial_balance,
                     equity=initial_balance)
 
-    feed = BarFeed(history_conn, symbol, source=source, start=start, end=end)
+    feed = BarFeed(history_conn, symbol, dataset=dataset, start=start, end=end)
     fallback_spread_used = False
     current_ts = start
 
@@ -314,31 +344,19 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
     snapshots = [dict(r) for r in conn.execute(
         "SELECT * FROM account_snapshots ORDER BY ts, id").fetchall()]
 
-    def _event(entry: dict, kind: str) -> dict:
-        row = conn.execute(
-            "SELECT equity, hwm FROM account_snapshots "
-            "WHERE ts <= ? ORDER BY ts DESC, id DESC LIMIT 1",
-            (entry["ts"],)).fetchone()
-        drawdown = None
-        if row is not None and row["hwm"] > 0:
-            drawdown = max(0.0, (row["hwm"] - row["equity"])
-                           / row["hwm"] * 100.0)
-        return {"ts": entry["ts"], "kind": kind,
-                "reason": entry["text"] if "text" in entry else entry["reason"],
-                "drawdown_pct": drawdown}
-
     kill_switch_events = [
-        _event(entry, "released" if "reset" in entry["kind"] else "latched")
+        _kill_switch_event(
+            conn, entry, "released" if "reset" in entry["kind"] else "latched")
         for entry in activity.entries if "kill_switch" in entry["kind"]
     ]
     for transition in state.kill_switch_transitions:
-        event = _event(transition, transition["kind"])
+        event = _kill_switch_event(conn, transition, transition["kind"])
         kill_switch_events.append(event)
     # 観測面の順序は時刻で固定する (activity 由来と StateStore 由来が
     # 別 list から合流するため、合流順に依存させない)。
     kill_switch_events.sort(key=lambda e: (e["ts"], e["kind"]))
     return BacktestResult(
         orders=order_rows, equity_curve=equity_curve, start=start, end=end,
-        source=source, fallback_spread_used=fallback_spread_used,
+        source=dataset.source, fallback_spread_used=fallback_spread_used,
         snapshots=snapshots, kill_switch_events=kill_switch_events,
         first_decision_at=start)

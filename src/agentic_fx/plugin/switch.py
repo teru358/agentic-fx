@@ -527,6 +527,9 @@ def submit_candidate(
             "candidate_path": candidate_path,
             "content_hash": content_hash, "artifact_hash": artifact_hash,
             "metrics": metrics, "evaluable": evaluable,
+            "base_interval": (settings.backtest.dataset().base_interval
+                              if meta.kind == "strategy" else None),
+            "eval_timeframe": (meta.timeframe if meta.kind == "strategy" else None),
             "mission_id": mission_id, "backlog_id": backlog_id,
         }
         conn.execute("BEGIN IMMEDIATE")
@@ -1180,6 +1183,9 @@ def bless_candidate(
             "candidate_path": f"plugins/_human/{name}",
             "content_hash": content_hash, "artifact_hash": artifact_hash,
             "metrics": metrics, "evaluable": evaluable,
+            "base_interval": (settings.backtest.dataset().base_interval
+                              if meta.kind == "strategy" else None),
+            "eval_timeframe": (meta.timeframe if meta.kind == "strategy" else None),
             "mission_id": None, "backlog_id": None,
         }
 

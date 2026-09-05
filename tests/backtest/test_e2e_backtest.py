@@ -47,7 +47,7 @@ from agentic_fx.backtest.metrics import METRIC_KEYS
 from agentic_fx.store import ohlcv
 from agentic_fx.store.backtest_runs import in_sample_view
 
-from tests.backtest.factories import SETTINGS, _conn, _row_at
+from tests.backtest.factories import SETTINGS, _conn, _row_at, DATASET_1M
 
 _UTC = timezone.utc
 
@@ -120,7 +120,7 @@ def test_e2e_import_run_in_sample_in_sample_view(tmp_path, monkeypatch):
     source, fired = _make_source()
 
     metrics = run_in_sample(
-        SETTINGS, history_conn=conn, symbol="USDJPY", source="dukascopy",
+        SETTINGS, history_conn=conn, symbol="USDJPY", dataset=DATASET_1M,
         intent_source=source, eval_timeframe="1h", plugin_ref="e2e-plugin",
         content_hash="e2e-content-hash", kind="e2e", now=NOW)
 

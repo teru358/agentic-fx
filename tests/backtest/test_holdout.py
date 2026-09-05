@@ -21,7 +21,7 @@ from agentic_fx.backtest.runner import BacktestResult
 from agentic_fx.store import ohlcv
 from agentic_fx.store.backtest_runs import settings_snapshot_hash
 
-from tests.backtest.factories import H, SETTINGS, WED, _conn, _row_at
+from tests.backtest.factories import H, SETTINGS, WED, _conn, _row_at, DATASET_1M
 
 UTC = timezone.utc
 
@@ -47,13 +47,13 @@ def _seed_history(hist):
 
 
 def _make_fake_replay(calls):
-    def fake(settings, *, symbol, source, start, end, intent_source,
+    def fake(settings, *, symbol, dataset, start, end, intent_source,
              eval_timeframe="1h", history_conn):
-        calls.append({"symbol": symbol, "source": source, "start": start,
+        calls.append({"symbol": symbol, "source": dataset.source, "start": start,
                       "end": end, "eval_timeframe": eval_timeframe})
         return BacktestResult(
             orders=[], equity_curve=[(start.isoformat(), 1e6)], start=start,
-            end=end, source=source, fallback_spread_used=False)
+            end=end, source=dataset.source, fallback_spread_used=False)
     return fake
 
 
@@ -92,7 +92,7 @@ def test_run_in_sample_returns_metrics_without_period(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
     out = run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
-                        source="dukascopy", intent_source=lambda b: None,
+                        dataset=DATASET_1M, intent_source=lambda b: None,
                         eval_timeframe="1h", plugin_ref="p", content_hash="h",
                         kind="strategy", now=WED + timedelta(days=120))
     assert "trades" in out
@@ -108,7 +108,7 @@ def test_in_sample_and_gate_use_disjoint_periods(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
     now = WED + timedelta(days=120)
-    kw = dict(history_conn=hist, symbol="USDJPY", source="dukascopy",
+    kw = dict(history_conn=hist, symbol="USDJPY", dataset=DATASET_1M,
               intent_source=lambda b: None, eval_timeframe="1h",
               plugin_ref="p", content_hash="h", kind="strategy", now=now)
     run_in_sample(SETTINGS, **kw)
@@ -129,7 +129,7 @@ def test_run_in_sample_passes_oldest_bar_to_boundary_as_period(tmp_path, monkeyp
     now = WED + timedelta(days=120)
     boundary = holdout_boundary(now, SETTINGS.backtest.holdout_months)
     run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
-                 source="dukascopy", intent_source=lambda b: None,
+                 dataset=DATASET_1M, intent_source=lambda b: None,
                  eval_timeframe="1h", plugin_ref="p", content_hash="h",
                  kind="strategy", now=now)
     assert len(calls) == 1
@@ -150,7 +150,7 @@ def test_run_holdout_gate_passes_boundary_to_now_as_period(tmp_path, monkeypatch
     now = WED + timedelta(days=120)
     boundary = holdout_boundary(now, SETTINGS.backtest.holdout_months)
     run_holdout_gate(SETTINGS, history_conn=hist, symbol="USDJPY",
-                     source="dukascopy", intent_source=lambda b: None,
+                     dataset=DATASET_1M, intent_source=lambda b: None,
                      eval_timeframe="1h", plugin_ref="p", content_hash="h",
                      kind="strategy", now=now)
     assert len(calls) == 1
@@ -165,7 +165,7 @@ def test_run_in_sample_normalizes_naive_now_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
     with pytest.raises(ValueError):
         run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
-                      source="dukascopy", intent_source=lambda b: None,
+                      dataset=DATASET_1M, intent_source=lambda b: None,
                       eval_timeframe="1h", plugin_ref="p", content_hash="h",
                       kind="strategy", now=datetime(2026, 11, 19, 12, 0))
 
@@ -176,7 +176,7 @@ def test_run_in_sample_no_history_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
     with pytest.raises(ValueError):
         run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
-                      source="dukascopy", intent_source=lambda b: None,
+                      dataset=DATASET_1M, intent_source=lambda b: None,
                       eval_timeframe="1h", plugin_ref="p", content_hash="h",
                       kind="strategy", now=WED + timedelta(days=120))
 
@@ -194,7 +194,7 @@ def test_run_in_sample_empty_period_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
     with pytest.raises(ValueError) as excinfo:
         run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
-                      source="dukascopy", intent_source=lambda b: None,
+                      dataset=DATASET_1M, intent_source=lambda b: None,
                       eval_timeframe="1h", plugin_ref="p", content_hash="h",
                       kind="strategy", now=now)
     # F1 (fix round 1, codex Important): 遮断 1 (期間・端点はハーネスが
@@ -218,7 +218,7 @@ def test_run_in_sample_rejects_off_grid_oldest_bar(tmp_path, monkeypatch):
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
     with pytest.raises(ValueError) as excinfo:
         run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
-                      source="dukascopy", intent_source=lambda b: None,
+                      dataset=DATASET_1M, intent_source=lambda b: None,
                       eval_timeframe="1h", plugin_ref="p", content_hash="h",
                       kind="strategy", now=WED + timedelta(days=120))
     assert calls == []
@@ -241,7 +241,7 @@ def test_run_holdout_gate_wires_eval_timeframe_and_created_at(
     now = datetime(2026, 11, 19, 21, 37, 42, 123456, tzinfo=jst)
     expected_created_at = datetime(2026, 11, 19, 12, 37, 0, tzinfo=UTC)
     run_holdout_gate(SETTINGS, history_conn=hist, symbol="USDJPY",
-                     source="dukascopy", intent_source=lambda b: None,
+                     dataset=DATASET_1M, intent_source=lambda b: None,
                      eval_timeframe="30m", plugin_ref="p", content_hash="h",
                      kind="strategy", now=now)
     row = dict(hist.execute(
@@ -257,7 +257,7 @@ def test_run_holdout_gate_saves_scope_holdout_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
     now = WED + timedelta(days=120)
     out = run_holdout_gate(SETTINGS, history_conn=hist, symbol="USDJPY",
-                           source="dukascopy", intent_source=lambda b: None,
+                           dataset=DATASET_1M, intent_source=lambda b: None,
                            eval_timeframe="1h", plugin_ref="p",
                            content_hash="h", kind="strategy", now=now)
     assert "trades" in out
@@ -293,7 +293,7 @@ def test_run_holdout_gate_normalizes_non_utc_now_and_floors_to_minute(
     now = datetime(2026, 11, 19, 21, 37, 42, 123456, tzinfo=jst)
     expected_now = datetime(2026, 11, 19, 12, 37, 0, tzinfo=UTC)
     run_holdout_gate(SETTINGS, history_conn=hist, symbol="USDJPY",
-                     source="dukascopy", intent_source=lambda b: None,
+                     dataset=DATASET_1M, intent_source=lambda b: None,
                      eval_timeframe="1h", plugin_ref="p", content_hash="h",
                      kind="strategy", now=now)
     assert len(calls) == 1
@@ -312,7 +312,7 @@ def test_save_harness_run_full_argument_wiring(tmp_path, monkeypatch):
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
     now = WED + timedelta(days=120)
     out = run_holdout_gate(SETTINGS, history_conn=hist, symbol="USDJPY",
-                           source="dukascopy", intent_source=lambda b: None,
+                           dataset=DATASET_1M, intent_source=lambda b: None,
                            eval_timeframe="1h", plugin_ref="p",
                            content_hash="h", kind="strategy", now=now)
     row = dict(hist.execute("SELECT * FROM backtest_runs").fetchone())
@@ -339,7 +339,7 @@ def test_run_in_sample_record_fn_sink_does_not_write_backtest_runs(
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
     sunk = []
     result = run_in_sample(
-        SETTINGS, history_conn=hist, symbol="USDJPY", source="dukascopy",
+        SETTINGS, history_conn=hist, symbol="USDJPY", dataset=DATASET_1M,
         intent_source=lambda b: None, eval_timeframe="1h", plugin_ref="p",
         content_hash="h", kind="strategy", now=WED + timedelta(days=120),
         record_fn=sunk.append)
@@ -358,7 +358,7 @@ def test_run_in_sample_without_record_fn_keeps_existing_behavior(
     monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
     run_in_sample(SETTINGS, history_conn=hist, symbol="USDJPY",
-                  source="dukascopy", intent_source=lambda b: None,
+                  dataset=DATASET_1M, intent_source=lambda b: None,
                   eval_timeframe="1h", plugin_ref="p", content_hash="h",
                   kind="strategy", now=WED + timedelta(days=120))
     count = hist.execute(

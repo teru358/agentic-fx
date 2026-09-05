@@ -466,3 +466,18 @@ def test_short_window_is_reported(tmp_path, caplog):
             sandbox_run=fake, settings=SETTINGS)
     msgs = [r.getMessage() for r in caplog.records]
     assert any("cache_retention_days" in m for m in msgs), msgs
+
+
+def test_signal_producer_module_does_not_read_settings_backtest():
+    """A1 (設計 v3): ライブ signal_producer は adapter を使わず
+    `load_resampled_frame` を直接呼ぶ → 明示 base_interval="1m" を渡す
+    契約であり、`settings.backtest` (バックテスト専用の dataset/eval_source
+    設定) を読んではならない (pin)。ソース走査で `settings.backtest` への
+    アクセスが一切無いことを固定する — バックテスト設定の変更がライブ
+    producer の挙動に波及する経路が生まれていないことの回帰防止。"""
+    import inspect
+
+    from agentic_fx.plugin import signal_producer
+
+    src = inspect.getsource(signal_producer)
+    assert "settings.backtest" not in src

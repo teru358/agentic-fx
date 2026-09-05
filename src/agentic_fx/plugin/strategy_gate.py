@@ -130,15 +130,16 @@ def evaluate_strategy_adoption_gate(
     else:
         _in_sample_record_fn = record_fn
 
+    dataset = settings.backtest.dataset()
     per_pair = {}
     for pair in pairs:
         intent_source = strategy_adapter.build_intent_source(
-            meta, conn=conn, pair=pair, source=settings.backtest.eval_source,
+            meta, conn=conn, pair=pair, dataset=dataset,
             settings=settings)
         try:
             per_pair[pair] = run_in_sample(
                 settings, history_conn=history_conn, symbol=pair,
-                source=settings.backtest.eval_source, intent_source=intent_source,
+                dataset=dataset, intent_source=intent_source,
                 eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
                 content_hash=content_hash, kind="strategy", now=now,
                 record_fn=_in_sample_record_fn)
@@ -153,12 +154,12 @@ def evaluate_strategy_adoption_gate(
 
     for pair in pairs:
         intent_source = strategy_adapter.build_intent_source(
-            meta, conn=conn, pair=pair, source=settings.backtest.eval_source,
+            meta, conn=conn, pair=pair, dataset=dataset,
             settings=settings)
         try:
             run_holdout(
                 settings, history_conn=history_conn, symbol=pair,
-                source=settings.backtest.eval_source, intent_source=intent_source,
+                dataset=dataset, intent_source=intent_source,
                 eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
                 content_hash=content_hash, kind="strategy", now=now,
                 record_fn=record_fn)

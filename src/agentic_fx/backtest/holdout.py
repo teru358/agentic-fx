@@ -27,6 +27,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Callable
 
+from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.runner import IntentSource, run_replay
 from agentic_fx.config import Settings
@@ -115,19 +116,20 @@ def _oldest_bar_start(history_conn: sqlite3.Connection, symbol: str,
 
 
 def _run_scope(settings: Settings, *, scope: str,
-              history_conn: sqlite3.Connection, symbol: str, source: str,
+              history_conn: sqlite3.Connection, symbol: str, dataset: HistoryDataset,
               intent_source: IntentSource, eval_timeframe: str,
               plugin_ref: str, content_hash: str, kind: str, now: datetime,
               period_start: datetime, period_end: datetime,
               record_fn: "Callable[[dict], int] | None" = None) -> dict:
     result = run_replay(
-        settings, symbol=symbol, source=source, start=period_start,
+        settings, symbol=symbol, dataset=dataset, start=period_start,
         end=period_end, intent_source=intent_source,
         eval_timeframe=eval_timeframe, history_conn=history_conn)
     metrics = compute_metrics(result)
     save_kwargs = dict(
         scope=scope, plugin_ref=plugin_ref, content_hash=content_hash,
-        kind=kind, pair=symbol, timeframe=eval_timeframe, source=source,
+        kind=kind, pair=symbol, timeframe=eval_timeframe, source=dataset.source,
+        base_interval=dataset.base_interval, params={},
         period=(period_start, period_end), metrics=metrics,
         settings_hash=settings_snapshot_hash(settings),
         core_commit=core_commit(),
@@ -140,7 +142,7 @@ def _run_scope(settings: Settings, *, scope: str,
 
 
 def run_in_sample(settings: Settings, *, history_conn: sqlite3.Connection,
-                  symbol: str, source: str, intent_source: IntentSource,
+                  symbol: str, dataset: HistoryDataset, intent_source: IntentSource,
                   eval_timeframe: str, plugin_ref: str, content_hash: str,
                   kind: str, now: datetime,
                   record_fn: "Callable[[dict], int] | None" = None) -> dict:
@@ -153,7 +155,7 @@ def run_in_sample(settings: Settings, *, history_conn: sqlite3.Connection,
     """
     now_norm = _normalize_now(now)
     boundary = in_sample_until(now_norm, settings.backtest.holdout_months)
-    start = _oldest_bar_start(history_conn, symbol, source)
+    start = _oldest_bar_start(history_conn, symbol, dataset.source)
     if start >= boundary:
         # F1 (fix round 1, codex Important): 遮断 1 (期間・端点はハーネスが
         # 所有) は例外経路にも適用される — 改善ループが例外本文を観測でき
@@ -162,20 +164,20 @@ def run_in_sample(settings: Settings, *, history_conn: sqlite3.Connection,
         # された側) にのみ出す。
         _log.warning(
             "in-sample period is empty for symbol=%r source=%r: oldest bar "
-            "%s >= holdout boundary %s", symbol, source, start.isoformat(),
-            boundary.isoformat())
+            "%s >= holdout boundary %s", symbol, dataset.source,
+            start.isoformat(), boundary.isoformat())
         raise ValueError(
             "in-sample period is empty (oldest bar >= holdout boundary)")
     return _run_scope(
         settings, scope="in_sample", history_conn=history_conn,
-        symbol=symbol, source=source, intent_source=intent_source,
+        symbol=symbol, dataset=dataset, intent_source=intent_source,
         eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
         content_hash=content_hash, kind=kind, now=now_norm,
         period_start=start, period_end=boundary, record_fn=record_fn)
 
 
 def run_holdout_gate(settings: Settings, *, history_conn: sqlite3.Connection,
-                     symbol: str, source: str, intent_source: IntentSource,
+                     symbol: str, dataset: HistoryDataset, intent_source: IntentSource,
                      eval_timeframe: str, plugin_ref: str, content_hash: str,
                      kind: str, now: datetime,
                      record_fn: "Callable[[dict], int] | None" = None) -> dict:
@@ -191,7 +193,7 @@ def run_holdout_gate(settings: Settings, *, history_conn: sqlite3.Connection,
     boundary = in_sample_until(now_norm, settings.backtest.holdout_months)
     return _run_scope(
         settings, scope="holdout_gate", history_conn=history_conn,
-        symbol=symbol, source=source, intent_source=intent_source,
+        symbol=symbol, dataset=dataset, intent_source=intent_source,
         eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
         content_hash=content_hash, kind=kind, now=now_norm,
         period_start=boundary, period_end=now_norm, record_fn=record_fn)

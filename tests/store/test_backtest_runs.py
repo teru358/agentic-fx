@@ -19,7 +19,7 @@ import pytest
 from agentic_fx.store import backtest_runs
 from agentic_fx.store.db import connect, init_db
 
-from tests.backtest.factories import H
+from tests.backtest.factories import H, DATASET_1M
 
 
 def _conn(tmp_path):
@@ -31,7 +31,7 @@ def _conn(tmp_path):
 def test_backtest_runs_issuer_and_view(tmp_path):
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H), metrics={"trades": 0}, settings_hash="s",
               core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
@@ -40,6 +40,21 @@ def test_backtest_runs_issuer_and_view(tmp_path):
     rows = backtest_runs.in_sample_view(conn)
     assert len(rows) == 1 and rows[0]["issued_by"] == "harness"
     assert {"period_start", "period_end"}.isdisjoint(rows[0].keys())  # 遮断 1
+    assert rows[0]["base_interval"] == "1m"
+
+
+def test_latest_in_sample_metrics_filters_by_dataset_interval(tmp_path):
+    conn = _conn(tmp_path)
+    common = dict(plugin_ref="p", content_hash="h", kind="strategy", pair="USDJPY",
+                  timeframe="1h", source="dukascopy", period=(H, H),
+                  settings_hash="s", core_commit="c", initial_balance=1.0, now=H)
+    backtest_runs.save_harness_run(conn, scope="in_sample", base_interval="1m",
+                                   metrics={"trades": 1}, **common)
+    backtest_runs.save_harness_run(conn, scope="in_sample", base_interval="5m",
+                                   metrics={"trades": 5}, **common)
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "h", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m") == {"trades": 1}
 
 
 def test_human_run_cannot_forge_in_sample(tmp_path):
@@ -49,7 +64,7 @@ def test_human_run_cannot_forge_in_sample(tmp_path):
         backtest_runs.save_human_run(conn, scope="in_sample",
                                      plugin_ref="p", content_hash="h",
                                      kind="strategy", pair="USDJPY",
-                                     timeframe="1h", source="dukascopy",
+                                     timeframe="1h", source="dukascopy", base_interval="1m",
                                      period=(H, H), metrics={},
                                      settings_hash="s", core_commit="c",
                                      initial_balance=1e6, now=H)  # scope 引数を受けない
@@ -76,7 +91,7 @@ def test_issued_by_check_rejects_unknown_value(tmp_path):
 def test_save_harness_run_rejects_human_custom_scope(tmp_path):
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H), metrics={}, settings_hash="s",
               core_commit="c", initial_balance=1e6, now=H)
     with pytest.raises(ValueError):
@@ -107,7 +122,7 @@ def test_save_human_run_persists_human_custom_scope_and_issued_by(tmp_path):
     scope='in_sample' に化けても検出できない)。"""
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H), metrics={}, settings_hash="s",
               core_commit="c", initial_balance=1e6, now=H)
     rowid = backtest_runs.save_human_run(conn, **kw)
@@ -120,7 +135,7 @@ def test_save_human_run_persists_human_custom_scope_and_issued_by(tmp_path):
 def test_in_sample_view_orders_by_created_at_then_id(tmp_path):
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H), metrics={}, settings_hash="s",
               core_commit="c", initial_balance=1e6)
     later = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
@@ -133,7 +148,7 @@ def test_in_sample_view_orders_by_created_at_then_id(tmp_path):
 def test_in_sample_view_filters_by_pair(tmp_path):
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              timeframe="1h", source="dukascopy", period=(H, H),
+              timeframe="1h", source="dukascopy", base_interval="1m", period=(H, H),
               metrics={"trades": 0}, settings_hash="s", core_commit="c",
               initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="in_sample", pair="USDJPY", **kw)
@@ -145,7 +160,7 @@ def test_in_sample_view_filters_by_pair(tmp_path):
 def test_in_sample_view_expands_metrics_json(tmp_path):
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H), metrics={"pf": 1.5, "trades": 40},
               settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
@@ -162,7 +177,7 @@ def test_in_sample_view_whitelists_metric_keys_against_period_smuggling(tmp_path
     """
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H),
               metrics={"trades": 40, "pf": 1.5,
                       "period_start": "2020-01-01T00:00:00+00:00",
@@ -183,7 +198,7 @@ def test_in_sample_view_excludes_created_at(tmp_path):
     分精度で完全復元できてしまう (遮断 1 の派生漏洩)。"""
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H), metrics={"trades": 0}, settings_hash="s",
               core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
@@ -195,7 +210,7 @@ def test_naive_period_rejected(tmp_path):
     conn = _conn(tmp_path)
     naive = datetime(2026, 7, 22, 12, 0)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(naive, H), metrics={}, settings_hash="s",
               core_commit="c", initial_balance=1e6, now=H)
     with pytest.raises(ValueError):
@@ -206,7 +221,7 @@ def test_naive_now_rejected(tmp_path):
     conn = _conn(tmp_path)
     naive = datetime(2026, 7, 22, 12, 0)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H), metrics={}, settings_hash="s",
               core_commit="c", initial_balance=1e6, now=naive)
     with pytest.raises(ValueError):
@@ -220,7 +235,7 @@ def test_reversed_period_rejected(tmp_path):
     from datetime import timedelta
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H - timedelta(hours=1)), metrics={}, settings_hash="s",
               core_commit="c", initial_balance=1e6, now=H)
     with pytest.raises(ValueError, match="period"):
@@ -310,22 +325,25 @@ def test_core_commit_exception_is_unknown(monkeypatch):
 def test_latest_in_sample_metrics_returns_none_when_no_match(tmp_path):
     conn = _conn(tmp_path)
     assert backtest_runs.latest_in_sample_metrics(
-        conn, "nope", pair="USDJPY") is None
+        conn, "nope", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m") is None
 
 
 def test_latest_in_sample_metrics_filters_content_hash(tmp_path):
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", kind="strategy", pair="USDJPY",
-              timeframe="1h", source="dukascopy", period=(H, H),
+              timeframe="1h", source="dukascopy", base_interval="1m", period=(H, H),
               settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(
         conn, scope="in_sample", content_hash="a", metrics={"trades": 1}, **kw)
     backtest_runs.save_harness_run(
         conn, scope="in_sample", content_hash="b", metrics={"trades": 2}, **kw)
     assert backtest_runs.latest_in_sample_metrics(
-        conn, "a", pair="USDJPY") == {"trades": 1}
+        conn, "a", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m") == {"trades": 1}
     assert backtest_runs.latest_in_sample_metrics(
-        conn, "b", pair="USDJPY") == {"trades": 2}
+        conn, "b", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m") == {"trades": 2}
 
 
 def test_latest_in_sample_metrics_picks_latest_by_id_desc(tmp_path):
@@ -333,7 +351,7 @@ def test_latest_in_sample_metrics_picks_latest_by_id_desc(tmp_path):
     created_at (H 固定) が同一でも id で一意に決まることを検証する。"""
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H), settings_hash="s", core_commit="c",
               initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(
@@ -341,7 +359,8 @@ def test_latest_in_sample_metrics_picks_latest_by_id_desc(tmp_path):
     backtest_runs.save_harness_run(
         conn, scope="in_sample", metrics={"trades": 99}, **kw)
     assert backtest_runs.latest_in_sample_metrics(
-        conn, "h", pair="USDJPY") == {"trades": 99}
+        conn, "h", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m") == {"trades": 99}
 
 
 def test_latest_in_sample_metrics_whitelists_metric_keys(tmp_path):
@@ -349,12 +368,14 @@ def test_latest_in_sample_metrics_whitelists_metric_keys(tmp_path):
     と同じ濾過境界)。"""
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H),
               metrics={"trades": 40, "period_start": "2020-01-01T00:00:00+00:00"},
               settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
-    metrics = backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
+    metrics = backtest_runs.latest_in_sample_metrics(
+        conn, "h", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m")
     assert metrics == {"trades": 40}
     assert "period_start" not in metrics
 
@@ -363,12 +384,14 @@ def test_latest_in_sample_metrics_excludes_holdout_gate_and_human_custom(tmp_pat
     """scope='in_sample' AND issued_by='harness' 以外は対象外。"""
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H), metrics={"trades": 1}, settings_hash="s",
               core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="holdout_gate", **kw)
     backtest_runs.save_human_run(conn, **kw)
-    assert backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY") is None
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "h", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m") is None
 
 
 # ---- fix round 1 F1 (Critical, codex): ネスト密輸の遮断 ---------------------
@@ -382,7 +405,7 @@ def test_latest_in_sample_metrics_excludes_holdout_gate_and_human_custom(tmp_pat
 def test_in_sample_view_filters_nested_dict_value_smuggling(tmp_path):
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H),
               metrics={"trades": {"period_start": "2020-01-01T00:00:00+00:00",
                                   "period_end": "2020-06-01T00:00:00+00:00"},
@@ -397,13 +420,15 @@ def test_in_sample_view_filters_nested_dict_value_smuggling(tmp_path):
 def test_latest_in_sample_metrics_filters_nested_dict_value_smuggling(tmp_path):
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H),
               metrics={"trades": {"period_start": "2020-01-01T00:00:00+00:00"},
                       "pf": 1.5},
               settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
-    metrics = backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
+    metrics = backtest_runs.latest_in_sample_metrics(
+        conn, "h", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m")
     assert metrics == {"pf": 1.5}
     assert "trades" not in metrics
 
@@ -412,12 +437,14 @@ def test_latest_in_sample_metrics_filters_list_value_smuggling(tmp_path):
     """値が list のネスト密輸も同様に落ちる (dict だけを弾く変異への防波堤)。"""
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H),
               metrics={"trades": ["2020-01-01T00:00:00+00:00"], "pf": 1.5},
               settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
-    metrics = backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
+    metrics = backtest_runs.latest_in_sample_metrics(
+        conn, "h", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m")
     assert metrics == {"pf": 1.5}
 
 
@@ -429,16 +456,18 @@ def test_latest_in_sample_metrics_scoped_by_pair_not_content_hash_alone(tmp_path
     (レビュアーが実 DB で再現した誤帰属)。"""
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="multi", kind="strategy",
-              timeframe="1h", source="dukascopy", period=(H, H),
+              timeframe="1h", source="dukascopy", base_interval="1m", period=(H, H),
               settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(
         conn, scope="in_sample", pair="USDJPY", metrics={"pf": 1.1}, **kw)
     backtest_runs.save_harness_run(
         conn, scope="in_sample", pair="EURUSD", metrics={"pf": 2.2}, **kw)
     assert backtest_runs.latest_in_sample_metrics(
-        conn, "multi", pair="USDJPY") == {"pf": 1.1}
+        conn, "multi", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m") == {"pf": 1.1}
     assert backtest_runs.latest_in_sample_metrics(
-        conn, "multi", pair="EURUSD") == {"pf": 2.2}
+        conn, "multi", pair="EURUSD", variant="candidate", source="dukascopy",
+        base_interval="1m") == {"pf": 2.2}
 
 
 # ---- fix round 1 F4 (Important, codex): metrics_json 破損の fail-open -------
@@ -449,14 +478,16 @@ def test_latest_in_sample_metrics_malformed_json_returns_none_fail_open(tmp_path
     fail-open。"""
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H), metrics={"trades": 1}, settings_hash="s",
               core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
     conn.execute("UPDATE backtest_runs SET metrics_json='not json' "
                 "WHERE content_hash='h'")
     conn.commit()
-    assert backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY") is None
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "h", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m") is None
 
 
 def test_latest_in_sample_metrics_malformed_json_logs_warning(tmp_path, caplog):
@@ -466,7 +497,7 @@ def test_latest_in_sample_metrics_malformed_json_logs_warning(tmp_path, caplog):
     import logging
     conn = _conn(tmp_path)
     kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
-              pair="USDJPY", timeframe="1h", source="dukascopy",
+              pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
               period=(H, H), metrics={"trades": 1}, settings_hash="s",
               core_commit="c", initial_balance=1e6, now=H)
     backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
@@ -474,7 +505,9 @@ def test_latest_in_sample_metrics_malformed_json_logs_warning(tmp_path, caplog):
                 "WHERE content_hash='h'")
     conn.commit()
     with caplog.at_level(logging.WARNING, logger="agentic_fx.store.backtest_runs"):
-        backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
+        backtest_runs.latest_in_sample_metrics(
+            conn, "h", pair="USDJPY", variant="candidate", source="dukascopy",
+            base_interval="1m")
     assert any("decode failed" in r.message for r in caplog.records)
 
 
@@ -491,7 +524,7 @@ def test_save_harness_run_accepts_variant_and_ref_fields(tmp_path):
     run_id = backtest_runs.save_harness_run(
         conn, scope="in_sample", plugin_ref="no_strategy:rsi_v2",
         content_hash="cand-hash", kind="strategy", pair="USDJPY",
-        timeframe="1h", source="test", period=(H, H),
+        timeframe="1h", source="test", base_interval="1m", period=(H, H),
         metrics={"pf": 1.0}, settings_hash="s", core_commit="c",
         initial_balance=10000.0, now=H,
         variant="no_strategy", ref_plugin_ref="p.py", ref_content_hash="h")
@@ -509,7 +542,7 @@ def test_save_harness_run_default_variant_is_candidate(tmp_path):
     run_id = backtest_runs.save_harness_run(
         conn, scope="in_sample", plugin_ref="rsi_v2",
         content_hash="h", kind="indicator", pair="USDJPY", timeframe="1h",
-        source="test", period=(H, H), metrics={"pf": 1.0},
+        source="test", base_interval="1m", period=(H, H), metrics={"pf": 1.0},
         settings_hash="s", core_commit="c", initial_balance=10000.0, now=H)
     row = conn.execute("SELECT variant FROM backtest_runs WHERE id=?",
                        (run_id,)).fetchone()
@@ -522,19 +555,23 @@ def test_latest_in_sample_metrics_ignores_baseline_and_no_strategy_rows(tmp_path
     conn = _conn(tmp_path)
     backtest_runs.save_harness_run(
         conn, scope="in_sample", plugin_ref="p", content_hash="h",
-        kind="strategy", pair="USDJPY", timeframe="1h", source="test",
+        kind="strategy", pair="USDJPY", timeframe="1h", source="test", base_interval="1m",
         period=(H, H), metrics={"pf": 9.9}, settings_hash="s",
         core_commit="c", initial_balance=10000.0, now=H, variant="baseline",
         ref_plugin_ref="p", ref_content_hash="h")  # 同じ content_hash で baseline 行
-    got = backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
+    got = backtest_runs.latest_in_sample_metrics(
+        conn, "h", pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m")
     assert got is None  # candidate 行が無いので None (baseline は無視)
 
     backtest_runs.save_harness_run(
         conn, scope="in_sample", plugin_ref="p", content_hash="h",
-        kind="strategy", pair="USDJPY", timeframe="1h", source="test",
+        kind="strategy", pair="USDJPY", timeframe="1h", source="test", base_interval="1m",
         period=(H, H), metrics={"pf": 1.5}, settings_hash="s",
         core_commit="c", initial_balance=10000.0, now=H, variant="candidate")
-    got2 = backtest_runs.latest_in_sample_metrics(conn, "h", pair="USDJPY")
+    got2 = backtest_runs.latest_in_sample_metrics(
+        conn, "h", pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m")
     assert got2["pf"] == 1.5  # candidate 行だけが返る
 
 
@@ -545,7 +582,7 @@ def test_save_harness_run_commit_false_does_not_commit(tmp_path):
     conn.execute("BEGIN IMMEDIATE")
     run_id = backtest_runs.save_harness_run(
         conn, scope="in_sample", plugin_ref="p", content_hash="h",
-        kind="indicator", pair="USDJPY", timeframe="1h", source="test",
+        kind="indicator", pair="USDJPY", timeframe="1h", source="test", base_interval="1m",
         period=(H, H), metrics={"pf": 1.0},
         settings_hash="s", core_commit="c", initial_balance=10000.0,
         now=H, commit=False)
@@ -562,7 +599,7 @@ def test_save_harness_run_accepts_mission_id_kw_and_persists_it(tmp_path):
     conn = _conn(tmp_path)
     run_id = backtest_runs.save_harness_run(
         conn, scope="in_sample", plugin_ref="p", content_hash="h" * 8,
-        kind="indicator", pair="USDJPY", timeframe="1h", source="dukascopy",
+        kind="indicator", pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
         period=(datetime(2026, 1, 1, tzinfo=timezone.utc),
                 datetime(2026, 1, 2, tzinfo=timezone.utc)),
         metrics={}, settings_hash="s", core_commit="c",
@@ -577,7 +614,7 @@ def test_save_harness_run_mission_id_defaults_to_null(tmp_path):
     conn = _conn(tmp_path)
     run_id = backtest_runs.save_harness_run(
         conn, scope="in_sample", plugin_ref="p", content_hash="h" * 8,
-        kind="indicator", pair="USDJPY", timeframe="1h", source="dukascopy",
+        kind="indicator", pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
         period=(datetime(2026, 1, 1, tzinfo=timezone.utc),
                 datetime(2026, 1, 2, tzinfo=timezone.utc)),
         metrics={}, settings_hash="s", core_commit="c",

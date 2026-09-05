@@ -284,6 +284,7 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   plugin_ref TEXT NOT NULL, content_hash TEXT NOT NULL, kind TEXT NOT NULL,
   pair TEXT NOT NULL, timeframe TEXT NOT NULL, source TEXT NOT NULL,
+  base_interval TEXT NOT NULL DEFAULT '1m', params_json TEXT NOT NULL DEFAULT '{}',
   period_start TEXT NOT NULL, period_end TEXT NOT NULL,
   scope TEXT NOT NULL
     CHECK(scope IN ('in_sample','holdout_gate','human_custom')),
@@ -1274,6 +1275,10 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "improvement_backlog", "last_result", "last_result TEXT")
     _migrate_improvement_runs_mission_id_fk(conn)   # 裁定 D1 (2026-08-24)
     _ensure_column(conn, "backtest_runs", "mission_id", "mission_id INTEGER")
+    _ensure_column(conn, "backtest_runs", "base_interval",
+                   "base_interval TEXT NOT NULL DEFAULT '1m'")
+    _ensure_column(conn, "backtest_runs", "params_json",
+                   "params_json TEXT NOT NULL DEFAULT '{}'")
     _ensure_column(conn, "analysis_runs", "mission_id", "mission_id INTEGER")
     conn.execute(_IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL)
     _migrate_improve_wave_slots_mission_id_fk(conn)  # 裁定 D1 (2026-08-24)

@@ -57,3 +57,38 @@ def test_frozen_ledger_rejects_late_record_calls(loop_min):
     ledger.record(opaque_ref="late", kind="analyze_corr", params={},
                   result_summary={}, trial_count=999)  # 例外にしない — 無視
     assert ledger.entries() == []  # 遅延結果は捨てる
+
+
+def test_payload_base_interval_follows_backtest_settings_for_strategy(
+        loop_min, conn):
+    """A6 (v3 設計): `_build_approval_payload` の base_interval/eval_timeframe
+    は strategy kind のとき `settings.backtest.dataset().base_interval` /
+    gate_metrics の meta.timeframe を反映する。既定 "1m" のままだと "1m"
+    固定リテラルへの変異が生き残るため "5m" に設定して区別する (段階 2
+    レビュー是正)。indicator kind は両方 null。"""
+    loop_min._settings = loop_min._settings.model_copy(update={
+        "backtest": loop_min._settings.backtest.model_copy(
+            update={"base_interval": "5m"})})
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger.freeze()
+
+    class _Meta:
+        timeframe = "1h"
+
+    payload = loop_min._build_approval_payload(
+        conn, name="myst", kind="strategy", content_hash="h",
+        artifact_hash="a", ctx_ledger=ledger, mission_id=1, backlog_id=2,
+        candidate_origin="staging", candidate_path="plugins/_staging/1/myst",
+        gate_metrics={"meta": _Meta()}, output={"selection_rationale": ""},
+        now=datetime(2026, 8, 22))
+    assert payload["base_interval"] == "5m"
+    assert payload["eval_timeframe"] == "1h"
+
+    payload_indicator = loop_min._build_approval_payload(
+        conn, name="myind", kind="indicator", content_hash="h",
+        artifact_hash="a", ctx_ledger=ledger, mission_id=1, backlog_id=2,
+        candidate_origin="staging", candidate_path="plugins/_staging/1/myind",
+        gate_metrics={}, output={"selection_rationale": ""},
+        now=datetime(2026, 8, 22))
+    assert payload_indicator["base_interval"] is None
+    assert payload_indicator["eval_timeframe"] is None

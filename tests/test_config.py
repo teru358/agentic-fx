@@ -32,6 +32,21 @@ def test_backtest_settings_eval_source_defaults_to_dukascopy():
         holdout_months=1, initial_balance=1.0).eval_source == "dukascopy"
 
 
+def test_backtest_settings_constructs_default_history_dataset():
+    settings = BacktestSettings(holdout_months=1, initial_balance=1.0)
+    assert settings.base_interval == "1m"
+    assert settings.dataset().as_dict() == {
+        "source": "dukascopy", "base_interval": "1m"}
+
+
+@pytest.mark.parametrize("field,value", [("eval_source", "bogus"),
+                                           ("base_interval", "2m")])
+def test_backtest_settings_delegates_invalid_dataset_to_validation(field, value):
+    values = {"holdout_months": 1, "initial_balance": 1.0, field: value}
+    with pytest.raises(ValidationError):
+        BacktestSettings(**values)
+
+
 def test_opencode_is_improve_only_and_codex_llama_swap_is_rejected():
     """opencode を trade に通す、または codex の llama_swap 封鎖を外す変異は
     shell 境界/namespace tools 非互換を再導入するため validator で pin する。"""

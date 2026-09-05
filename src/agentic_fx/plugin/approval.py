@@ -131,15 +131,16 @@ def _validate_strategy(conn: sqlite3.Connection, meta: PluginMeta, *,
     eval_timeframe = _eval_timeframe(meta.timeframe)
     plugin_ref = f"plugins/{meta.name}"
 
+    dataset = settings.backtest.dataset()
     per_pair_metrics: dict[str, dict] = {}
     for pair in meta.pairs:
         intent_source = strategy_adapter.build_intent_source(
-            meta, conn=conn, pair=pair, source=settings.backtest.eval_source,
+            meta, conn=conn, pair=pair, dataset=dataset,
             settings=settings)
         try:
             per_pair_metrics[pair] = run_in_sample(
                 settings, history_conn=conn, symbol=pair,
-                source=settings.backtest.eval_source,
+                dataset=dataset,
                 intent_source=intent_source, eval_timeframe=eval_timeframe,
                 plugin_ref=plugin_ref, content_hash=meta.content_hash,
                 kind="strategy", now=now)
@@ -311,6 +312,10 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
         "metrics": metrics,
         "evaluable": evaluable,
         "eval_source": settings.backtest.eval_source,
+        "base_interval": (settings.backtest.dataset().base_interval
+                          if meta.kind == "strategy" else None),
+        "eval_timeframe": (_eval_timeframe(meta.timeframe)
+                           if meta.kind == "strategy" else None),
         "live_source": settings.plugin.producer_source,
         "note": _NOTE,
     }

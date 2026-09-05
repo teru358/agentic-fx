@@ -1322,3 +1322,83 @@ def test_advance_to_decided_detects_in_place_tamper_of_artifact_hash_only(env, m
     status = conn.execute("SELECT status FROM approval_requests WHERE id=?",
                           (aid,)).fetchone()["status"]
     assert status == "pending"
+
+
+# --- 段階 2 レビュー是正: submit/bless payload の base_interval/eval_timeframe ---
+
+
+def _fake_evaluable_gate(conn, meta, *, settings, now, record_fn=None):
+    """`evaluate_strategy_adoption_gate` のフェイク (evaluable=True)。"""
+    from agentic_fx.plugin.strategy_gate import StrategyGateVerdict
+    return StrategyGateVerdict(
+        evaluable=True, baseline_variant="no_strategy",
+        baseline_row={"plugin_ref": f"no_strategy:{meta.name}",
+                     "variant": "no_strategy"},
+        candidate_metrics={"USDJPY": {"trades": 40, "pf": 1.2}})
+
+
+def test_submit_candidate_strategy_payload_base_interval_follows_settings(
+        env, monkeypatch):
+    """A6 (v3 設計): submit_candidate の payload は strategy kind のとき
+    `settings.backtest.dataset().base_interval` を反映する。base_interval
+    を既定 "1m" のままにすると "1m" 固定リテラルへの変異が生き残るため、
+    "5m" に設定して区別できるようにする (段階 2 レビュー是正)。"""
+    root, plugins_dir, conn, settings = env
+    settings = settings.model_copy(update={
+        "backtest": settings.backtest.model_copy(update={"base_interval": "5m"})})
+    strategy_py = ("def evaluate(df, indicators, signals, params):\n"
+                  "    return {'action': 'hold', 'rationale': 'x'}\n")
+    strategy_cfg = "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nexit_mode: levels\n"
+    d = plugins_dir / "_staging" / "1" / "st"
+    d.mkdir(parents=True)
+    (d / "plugin.py").write_text(strategy_py)
+    (d / "config.yaml").write_text(strategy_cfg)
+    (d / "test_plugin.py").write_text(TEST_PY_OK)
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
+        _fake_evaluable_gate)
+
+    approval_id = switch.submit_candidate(
+        conn, name="st", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    import json
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["payload_json"])
+    assert payload["base_interval"] == "5m"
+    assert payload["eval_timeframe"] == "1h"
+
+
+def test_bless_candidate_strategy_payload_base_interval_follows_settings(
+        env, monkeypatch):
+    """bless_candidate も submit と同じ payload 契約 (base_interval を
+    settings から取る) を満たす。"""
+    root, plugins_dir, conn, settings = env
+    settings = settings.model_copy(update={
+        "backtest": settings.backtest.model_copy(update={"base_interval": "5m"})})
+    strategy_py = ("def evaluate(df, indicators, signals, params):\n"
+                  "    return {'action': 'hold', 'rationale': 'x'}\n")
+    strategy_cfg = "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nexit_mode: levels\n"
+    d = plugins_dir / "_human" / "st"
+    d.mkdir(parents=True)
+    (d / "plugin.py").write_text(strategy_py)
+    (d / "config.yaml").write_text(strategy_cfg)
+    (d / "test_plugin.py").write_text(TEST_PY_OK)
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
+        _fake_evaluable_gate)
+
+    approval_id = switch.bless_candidate(
+        conn, name="st", human_dir=d, settings=settings, now=NOW,
+        decided_by="human_cli")
+
+    import json
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["payload_json"])
+    assert payload["base_interval"] == "5m"
+    assert payload["eval_timeframe"] == "1h"

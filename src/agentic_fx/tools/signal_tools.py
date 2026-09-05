@@ -90,6 +90,10 @@ def build(conn: sqlite3.Connection, settings: Settings,
     する (コントローラ解決)。service.py は既存の clock をそのまま渡す。
     """
     max_hours = settings.plugin.signals_max_lookback_hours
+    # signals テーブルは source/base_interval を持たない (スキーマ変更なし)
+    # — in_sample_metrics の絞りは現行 settings.backtest.dataset() を単一の
+    # 評価基準として使う (strategy_gate/approval と同じ dataset 所有規律)。
+    dataset = settings.backtest.dataset()
 
     def get_signals(pair: str, since_hours: int = _DEFAULT_SINCE_HOURS) -> list[dict]:
         if pair not in settings.pairs:
@@ -121,7 +125,9 @@ def build(conn: sqlite3.Connection, settings: Settings,
                 # 誤帰属される (latest_in_sample_metrics 側の docstring 参照)。
                 item["in_sample_metrics"] = (
                     backtest_runs.latest_in_sample_metrics(
-                        conn, row["content_hash"], pair=row["pair"]))
+                        conn, row["content_hash"], pair=row["pair"],
+                        variant="candidate", source=dataset.source,
+                        base_interval=dataset.base_interval))
                 item["note"] = _ANNOTATION
             result.append(item)
         return result

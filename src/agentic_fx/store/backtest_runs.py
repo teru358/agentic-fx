@@ -54,7 +54,7 @@ def _filter_metrics(raw_metrics: dict) -> dict:
             if k in METRIC_KEYS and isinstance(v, _SCALAR_TYPES)}
 
 _VIEW_COLUMNS = (
-    "id, plugin_ref, content_hash, kind, pair, timeframe, source, scope, "
+    "id, plugin_ref, content_hash, kind, pair, timeframe, source, base_interval, scope, "
     "issued_by, metrics_json, settings_hash, core_commit, initial_balance"
 )
 # F2 (最終レビュー codex I1): created_at をここに含めない。run_in_sample は
@@ -80,11 +80,11 @@ def _require_utc(dt: datetime, what: str) -> datetime:
 
 def _insert(conn: sqlite3.Connection, *, scope: str, issued_by: str,
             plugin_ref: str, content_hash: str, kind: str, pair: str,
-            timeframe: str, source: str, period: tuple[datetime, datetime],
+            timeframe: str, source: str, base_interval: str, period: tuple[datetime, datetime],
             metrics: dict, settings_hash: str, core_commit: str,
             initial_balance: float, now: datetime, variant: str = "candidate",
             ref_plugin_ref: str | None = None, ref_content_hash: str | None = None,
-            mission_id: int | None = None,
+            mission_id: int | None = None, params: dict = {},
             commit: bool = True) -> int:
     start, end = period
     start_utc = _require_utc(start, "period[0]")
@@ -99,15 +99,14 @@ def _insert(conn: sqlite3.Connection, *, scope: str, issued_by: str,
     metrics_json = json.dumps(metrics, sort_keys=True)
     cur = conn.execute(
         "INSERT INTO backtest_runs (plugin_ref, content_hash, kind, pair, "
-        "timeframe, source, period_start, period_end, scope, issued_by, "
+        "timeframe, source, base_interval, params_json, period_start, period_end, scope, issued_by, "
         "metrics_json, settings_hash, core_commit, initial_balance, "
         "created_at, variant, ref_plugin_ref, ref_content_hash, mission_id) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (plugin_ref, content_hash, kind, pair, timeframe, source,
-         start_utc.isoformat(), end_utc.isoformat(), scope, issued_by,
-         metrics_json, settings_hash, core_commit, initial_balance,
-         now_utc.isoformat(), variant, ref_plugin_ref, ref_content_hash,
-         mission_id))
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (plugin_ref, content_hash, kind, pair, timeframe, source, base_interval,
+         json.dumps(params, sort_keys=True), start_utc.isoformat(), end_utc.isoformat(),
+         scope, issued_by, metrics_json, settings_hash, core_commit, initial_balance,
+         now_utc.isoformat(), variant, ref_plugin_ref, ref_content_hash, mission_id))
     if commit:
         conn.commit()
     return cur.lastrowid
@@ -115,13 +114,13 @@ def _insert(conn: sqlite3.Connection, *, scope: str, issued_by: str,
 
 def save_harness_run(conn: sqlite3.Connection, *, scope: str, plugin_ref: str,
                       content_hash: str, kind: str, pair: str, timeframe: str,
-                      source: str, period: tuple[datetime, datetime],
+                      source: str, base_interval: str, period: tuple[datetime, datetime],
                       metrics: dict, settings_hash: str, core_commit: str,
                       initial_balance: float, now: datetime,
                       variant: str = "candidate",
                       ref_plugin_ref: str | None = None,
                       ref_content_hash: str | None = None,
-                      mission_id: int | None = None,
+                      mission_id: int | None = None, params: dict = {},
                       commit: bool = True) -> int:
     """ハーネス発行 (issued_by='harness' 固定)。scope は in_sample/holdout_gate のみ。
 
@@ -136,18 +135,18 @@ def save_harness_run(conn: sqlite3.Connection, *, scope: str, plugin_ref: str,
     return _insert(
         conn, scope=scope, issued_by="harness", plugin_ref=plugin_ref,
         content_hash=content_hash, kind=kind, pair=pair, timeframe=timeframe,
-        source=source, period=period, metrics=metrics,
+        source=source, base_interval=base_interval, period=period, metrics=metrics,
         settings_hash=settings_hash, core_commit=core_commit,
         initial_balance=initial_balance, now=now, variant=variant,
         ref_plugin_ref=ref_plugin_ref, ref_content_hash=ref_content_hash,
-        mission_id=mission_id, commit=commit)
+        mission_id=mission_id, params=params, commit=commit)
 
 
 def save_human_run(conn: sqlite3.Connection, *, plugin_ref: str,
                     content_hash: str, kind: str, pair: str, timeframe: str,
-                    source: str, period: tuple[datetime, datetime],
+                    source: str, base_interval: str, period: tuple[datetime, datetime],
                     metrics: dict, settings_hash: str, core_commit: str,
-                    initial_balance: float, now: datetime) -> int:
+                    initial_balance: float, now: datetime, params: dict = {}) -> int:
     """CLI 用の人間発行 (scope='human_custom' / issued_by='human_cli' 固定)。
 
     scope 引数を持たない — in_sample を呼び出し引数から偽装できない
@@ -156,9 +155,9 @@ def save_human_run(conn: sqlite3.Connection, *, plugin_ref: str,
     return _insert(
         conn, scope="human_custom", issued_by="human_cli",
         plugin_ref=plugin_ref, content_hash=content_hash, kind=kind,
-        pair=pair, timeframe=timeframe, source=source, period=period,
+        pair=pair, timeframe=timeframe, source=source, base_interval=base_interval, period=period,
         metrics=metrics, settings_hash=settings_hash, core_commit=core_commit,
-        initial_balance=initial_balance, now=now)
+        initial_balance=initial_balance, now=now, params=params)
 
 
 def in_sample_view(conn: sqlite3.Connection, *,
@@ -188,7 +187,8 @@ def in_sample_view(conn: sqlite3.Connection, *,
 
 
 def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
-                              pair: str) -> dict | None:
+                              pair: str, variant: str, source: str,
+                              base_interval: str) -> dict | None:
     """指定 content_hash・pair の in_sample 成績のうち最新 1 件の metrics
     を返す。
 
@@ -220,8 +220,9 @@ def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
     row = conn.execute(
         "SELECT metrics_json FROM backtest_runs WHERE scope='in_sample' "
         "AND issued_by='harness' AND content_hash=? AND pair=? "
-        "AND variant='candidate' "               # §8.1-40 挙動変更
-        "ORDER BY id DESC LIMIT 1", (content_hash, pair)).fetchone()
+        "AND variant=? AND source=? AND base_interval=? "
+        "ORDER BY id DESC LIMIT 1", (content_hash, pair, variant, source,
+                                      base_interval)).fetchone()
     if row is None:
         return None
     try:

@@ -54,7 +54,7 @@ def _seed_series(conn, symbol, values, *, start, timeframe="1h"):
 _SAVE_KWARGS = dict(
     scope="in_sample", plugin_ref="plugins/_staging/x/myst",
     content_hash="cand-hash", kind="strategy", pair="USDJPY",
-    timeframe="1h", source="dukascopy",
+    timeframe="1h", source="dukascopy", base_interval="1m", params={},
     period=(datetime(2020, 1, 1, tzinfo=timezone.utc),
             datetime(2026, 1, 1, tzinfo=timezone.utc)),
     metrics={"pf": 1.3, "trades": 40}, settings_hash="s",
@@ -125,12 +125,12 @@ def test_run_backtest_handler_source_follows_backtest_settings(
 
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_adapter.build_intent_source",
-        lambda meta, **kw: (seen_sources.append(("intent", kw["source"]))
+        lambda meta, **kw: (seen_sources.append(("intent", kw["dataset"].source))
                             or SimpleNamespace(close=lambda: None)))
 
     def _fake_run_in_sample(*args, record_fn=None, **kwargs):
-        seen_sources.append(("in_sample", kwargs["source"]))
-        record_fn({**_SAVE_KWARGS, "source": kwargs["source"]})
+        seen_sources.append(("in_sample", kwargs["dataset"].source))
+        record_fn({**_SAVE_KWARGS, "source": kwargs["dataset"].source})
         return dict(_SAVE_KWARGS["metrics"])
 
     monkeypatch.setattr(
@@ -186,6 +186,13 @@ def test_run_backtest_handler_result_feeds_persist_ledger_rows(
     after = conn.execute(
         "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
     assert after == before + 1
+    # A6 (v3 設計): RPC ledger 経路で保存された行の base_interval が実際に
+    # dataset (既定 1m) と一致することを直接検査する (段階 2 レビュー是正
+    # — TypeError にならないことだけでは列の値までは pin できない)。
+    row = conn.execute(
+        "SELECT base_interval FROM backtest_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row["base_interval"] == "1m"
 
 
 def test_persist_ledger_rows_fails_closed_when_handler_omits_save_kwargs(

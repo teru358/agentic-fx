@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.config import load_settings
 from agentic_fx.store.db import connect, init_db
 
@@ -12,6 +13,7 @@ H = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 WED = H  # 2026-07-22 は水曜 — 市場オープン
 SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+DATASET_1M = HistoryDataset("dukascopy", "1m")
 
 
 def _conn(tmp_path):

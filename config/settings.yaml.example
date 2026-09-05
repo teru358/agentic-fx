@@ -41,6 +41,7 @@ backtest:                      # コア所有 (§6) — holdout_months の変更
   holdout_months: 3
   initial_balance: 1000000
   eval_source: "dukascopy"     # 評価用 history source。IMPORT_SOURCES のいずれか
+  base_interval: "1m"          # バックテスト基底足。1m/5m/15m。ライブの datafeed.intervals とは別軸
 
 llama_swap:
   base_url: "http://localhost:8080/v1"

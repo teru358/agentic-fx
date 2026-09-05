@@ -11,7 +11,7 @@ from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.store import ohlcv
 
-from tests.backtest.factories import SETTINGS, WED, _conn, _row_at
+from tests.backtest.factories import SETTINGS, WED, _conn, _row_at, DATASET_1M
 
 
 _GOLDEN_PATH = Path(__file__).with_name("golden-v1.json")
@@ -82,7 +82,7 @@ def build_golden() -> dict:
         conn = _conn(Path(tmp))
         _history(conn)
         result = run_replay(
-            SETTINGS, symbol="USDJPY", source="dukascopy", start=WED,
+            SETTINGS, symbol="USDJPY", dataset=DATASET_1M, start=WED,
             end=WED + _DAY * 3, intent_source=_intent, eval_timeframe="1h",
             history_conn=conn)
     return _json_safe({

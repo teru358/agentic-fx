@@ -85,7 +85,7 @@ def test_strategy_row_gets_in_sample_metrics_and_annotation(tmp_path):
     assert sid is not None
     backtest_runs.save_harness_run(
         conn, scope="in_sample", plugin_ref="p.py", content_hash="strat1",
-        kind="strategy", pair="USDJPY", timeframe="1h", source="dukascopy",
+        kind="strategy", pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
         period=(NOW, NOW), metrics={"trades": 40, "pf": 1.3},
         settings_hash="s", core_commit="c", initial_balance=1e6, now=NOW)
     tool = _tool(conn)
@@ -203,7 +203,7 @@ def test_strategy_metrics_scoped_by_own_pair_not_other_pair(tmp_path):
     _add_signal(conn, hours_ago=1, kind="strategy", content_hash="multi",
                pair="EURUSD")
     kw = dict(plugin_ref="p.py", content_hash="multi", kind="strategy",
-              timeframe="1h", source="dukascopy", period=(NOW, NOW),
+              timeframe="1h", source="dukascopy", base_interval="1m", period=(NOW, NOW),
               settings_hash="s", core_commit="c", initial_balance=1e6, now=NOW)
     # EURUSD を後から保存する (id が大きい) — pair 絞りが無いと id 降順で
     # USDJPY 側の呼び出しにも EURUSD の成績が誤って付く。
@@ -257,7 +257,7 @@ def test_malformed_backtest_metrics_json_does_not_break_other_rows(tmp_path):
     _add_signal(conn, hours_ago=1, kind="strategy", content_hash="broken")
     backtest_runs.save_harness_run(
         conn, scope="in_sample", plugin_ref="p.py", content_hash="broken",
-        kind="strategy", pair="USDJPY", timeframe="1h", source="dukascopy",
+        kind="strategy", pair="USDJPY", timeframe="1h", source="dukascopy", base_interval="1m",
         period=(NOW, NOW), metrics={"trades": 1}, settings_hash="s",
         core_commit="c", initial_balance=1e6, now=NOW)
     conn.execute("UPDATE backtest_runs SET metrics_json='not json' "

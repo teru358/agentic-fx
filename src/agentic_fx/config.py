@@ -280,17 +280,20 @@ class BacktestSettings(_Strict):
     holdout_months: int = Field(ge=1)
     initial_balance: float = Field(gt=0)
     eval_source: str = "dukascopy"
+    base_interval: str = "1m"
 
-    @field_validator("eval_source")
-    @classmethod
-    def _eval_source_is_import_source(cls, value: str) -> str:
-        from agentic_fx.store.ohlcv import IMPORT_SOURCES
-        if value not in IMPORT_SOURCES:
-            raise ValueError(
-                f"eval_source must be one of {sorted(IMPORT_SOURCES)}, "
-                f"got {value!r}")
-        return value
+    @model_validator(mode="after")
+    def _history_dataset_is_valid(self):
+        from agentic_fx.backtest.dataset import DatasetError, HistoryDataset
+        try:
+            HistoryDataset(self.eval_source, self.base_interval)
+        except DatasetError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
 
+    def dataset(self):
+        from agentic_fx.backtest.dataset import HistoryDataset
+        return HistoryDataset(self.eval_source, self.base_interval)
 
 class AnalysisSettings(_Strict):
     max_watch_symbols: int = Field(ge=1)

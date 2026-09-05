@@ -28,7 +28,18 @@ from agentic_fx.activity import ActivityLog
 from agentic_fx.backtest.replay import BarFeed
 from agentic_fx.backtest.runner import _aggregate_bucket, run_replay
 
-from tests.backtest.factories import H, WED, SETTINGS, _conn, _row_at
+from tests.backtest.factories import H, WED, SETTINGS, _conn, _row_at, DATASET_1M
+
+
+def test_run_replay_rejects_non_1m_dataset_before_replay(tmp_path):
+    from agentic_fx.backtest.dataset import HistoryDataset
+    hist = _conn(tmp_path)
+    with pytest.raises(NotImplementedError,
+                       match="base_interval generalization lands in stage 3"):
+        run_replay(SETTINGS, symbol="USDJPY",
+                   dataset=HistoryDataset("dukascopy", "5m"),
+                   start=H, end=H, intent_source=lambda bar: None,
+                   history_conn=hist)
 
 OPEN = {"action": "open", "pair": "USDJPY", "direction": "long",
         "entry_type": "limit", "horizon": "day",
@@ -79,7 +90,7 @@ def test_full_cycle_open_fill_tp(tmp_path):
             return dict(OPEN)
         return None
 
-    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                      start=WED, end=WED + timedelta(hours=2),
                      intent_source=source, eval_timeframe="1h",
                      history_conn=hist)
@@ -117,7 +128,7 @@ def test_limit_price_only_reachable_within_eval_bucket_never_fills(tmp_path):
     rows.append(_row_at(WED + timedelta(hours=1), o=148.5, h=148.6,
                         l=148.4, c=148.5))
     ohlcv.import_history_bars(conn=hist, rows=rows, source="dukascopy")
-    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                      start=WED, end=WED + timedelta(hours=2),
                      intent_source=lambda b: dict(OPEN),
                      eval_timeframe="1h", history_conn=hist)
@@ -147,7 +158,7 @@ def test_limit_fill_uses_only_completed_bar_not_forming_bar(tmp_path):
                         h=148.35, l=148.10, c=148.15))          # 13:02 完成バー (指値到達)
     ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
-    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                      start=WED, end=WED + timedelta(hours=2),
                      intent_source=lambda b: dict(OPEN),
                      eval_timeframe="1h", history_conn=hist)
@@ -163,7 +174,7 @@ def test_synthetic_mission_passes_origin_gate(tmp_path):
     """§5 検証を同一コードで通す — missions 行が in-memory に作られ intent が accepted。"""
     hist = _conn(tmp_path)
     _seed_history(hist)
-    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                      start=WED, end=WED + timedelta(hours=2),
                      intent_source=lambda b: dict(OPEN),
                      eval_timeframe="1h", history_conn=hist)
@@ -175,7 +186,7 @@ def test_real_db_untouched(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     hist = _conn(tmp_path)
     _seed_history(hist)
-    run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                start=WED, end=WED + timedelta(hours=1),
                intent_source=lambda b: None, eval_timeframe="1h",
                history_conn=hist)
@@ -189,7 +200,7 @@ def test_initial_balance_wiring_no_spurious_killswitch(tmp_path):
     _seed_history(hist)
     s = SETTINGS.model_copy(update={"backtest": SETTINGS.backtest.model_copy(
         update={"initial_balance": 5_000_000.0})})   # paper 側は 1,000,000 のまま
-    res = run_replay(s, symbol="USDJPY", source="dukascopy",
+    res = run_replay(s, symbol="USDJPY", dataset=DATASET_1M,
                      start=WED, end=WED + timedelta(hours=2),
                      intent_source=lambda b: dict(OPEN),
                      eval_timeframe="1h", history_conn=hist)
@@ -227,7 +238,7 @@ def test_fallback_spread_used_when_db_spread_missing(tmp_path):
                         l=148.85, c=149.05, spread=None))
     ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
-    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                      start=WED, end=WED + timedelta(hours=2),
                      intent_source=lambda b: dict(OPEN),
                      eval_timeframe="1h", history_conn=hist)
@@ -249,7 +260,7 @@ def test_bucket_alignment_uses_utc_epoch_anchor(tmp_path):
     ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
     fired = []
-    run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
               start=off_grid_start, end=off_grid_start + timedelta(hours=3),
               intent_source=lambda b: fired.append(b.ts),
               eval_timeframe="1h", history_conn=hist)
@@ -276,7 +287,7 @@ def test_aggregate_bucket_ohlcv_values(tmp_path):
         _row_at(WED + timedelta(minutes=2), o=102.0, h=103.0, l=95.0, c=101.0),
     ]
     ohlcv.import_history_bars(hist, rows, source="dukascopy")
-    feed = BarFeed(hist, "USDJPY", source="dukascopy", start=WED,
+    feed = BarFeed(hist, "USDJPY", dataset=DATASET_1M, start=WED,
                    end=WED + timedelta(minutes=3))
     bar = _aggregate_bucket(feed, "USDJPY", "3m", WED, timedelta(minutes=3))
     assert bar is not None
@@ -303,7 +314,7 @@ def test_bucket_evaluation_skipped_when_market_closed(tmp_path):
     ohlcv.import_history_bars(hist, rows, source="dukascopy")
 
     fired = []
-    run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
               start=fri_close, end=fri_close + timedelta(hours=3),
               intent_source=lambda b: fired.append(b.ts),
               eval_timeframe="1h", history_conn=hist)
@@ -332,7 +343,7 @@ def test_pending_proposal_discarded_when_market_closes_before_execution(tmp_path
             return dict(OPEN)
         return None
 
-    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                      start=fri_start, end=fri_start + timedelta(minutes=5),
                      intent_source=source, eval_timeframe="1m",
                      history_conn=hist)
@@ -377,7 +388,7 @@ def test_pending_execution_happens_after_tick_not_before(tmp_path):
             return dict(OPEN_MARKET)
         return None
 
-    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                      start=WED, end=WED + timedelta(hours=2),
                      intent_source=source, eval_timeframe="1h",
                      history_conn=hist)
@@ -395,7 +406,7 @@ def test_end_must_be_on_minute_grid(tmp_path):
     hist = _conn(tmp_path)
     _seed_history(hist)
     with pytest.raises(ValueError, match="minute boundary"):
-        run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+        run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                   start=WED, end=WED + timedelta(hours=1, seconds=30),
                   intent_source=lambda b: None, eval_timeframe="1h",
                   history_conn=hist)
@@ -408,7 +419,7 @@ def test_parse_timeframe_rejects_zero(tmp_path):
     hist = _conn(tmp_path)
     _seed_history(hist)
     with pytest.raises(ValueError, match="eval_timeframe"):
-        run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+        run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                   start=WED, end=WED + timedelta(hours=1),
                   intent_source=lambda b: None, eval_timeframe="0m",
                   history_conn=hist)
@@ -419,7 +430,7 @@ def test_equity_curve_has_no_duplicate_timestamps(tmp_path):
     ループの tail 追記が同一 ts になり二重記録されていた。"""
     hist = _conn(tmp_path)
     _seed_history(hist)
-    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                      start=WED, end=WED + timedelta(minutes=5),
                      intent_source=lambda b: None, eval_timeframe="1h",
                      history_conn=hist)
@@ -447,7 +458,7 @@ def test_replay_exposes_timestamp_then_id_ordered_snapshots_and_first_decision(
     monkeypatch.setattr(runner_module, "init_db", _init_with_reverse_ties)
 
     res = runner_module.run_replay(
-        SETTINGS, symbol="USDJPY", source="dukascopy",
+        SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
         start=WED, end=WED + timedelta(minutes=2), intent_source=lambda b: None,
         eval_timeframe="1h", history_conn=hist)
 
@@ -495,7 +506,7 @@ def test_drawdown_kill_switch_latches_and_blocks_next_open(tmp_path):
                     "reasoning": "f1b-after-crash"}
         return None
 
-    res = run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
                      start=WED, end=WED + timedelta(hours=3),
                      intent_source=source, eval_timeframe="1h",
                      history_conn=hist)
@@ -583,3 +594,128 @@ def test_expire_limits_reached_despite_stale_mark_to_market(tmp_path):
     after = snapshots.latest(conn)["ts"]
     assert after == before  # stale=True — この tick の snapshot は記録されない
     assert orders.get(conn, pend_oid)["status"] == "expired"  # にも関わらず到達
+
+
+# ---------------------------------------------------------------------------
+# 段階 1 レビュー是正 6a: _RecordingActivity.write の no-throw 契約 + 記録
+# 失敗を注入しても replay (orders/SL/TP) が no-op 時と一致すること。
+# ---------------------------------------------------------------------------
+
+
+def test_recording_activity_write_never_raises_on_malformed_input(tmp_path):
+    """`ActivityLog.write` の「決して送出しない」契約 (activity.py docstring)
+    と同じく、`_RecordingActivity.write` も summary=None や category が
+    `.value` を持たない素の str でも例外を送出しない。"""
+    from agentic_fx.backtest.runner import _RecordingActivity, ReplayClock
+    activity = _RecordingActivity(ReplayClock(WED))
+    # 例外を送出しないことが主眼 — category に `.value` が無い素の
+    # str/object でも `getattr(category, "value", str(category))` の
+    # fallback で安全に記録される。
+    activity.write("not-a-category", "evt", "ok1")
+    activity.write(object(), "evt", "ok2")
+    assert len(activity.entries) == 2
+    assert activity.entries[0]["category"] == "not-a-category"
+
+    class _Explodes:
+        def __str__(self):
+            raise RuntimeError("boom: str() itself fails")
+
+    # `getattr(category, "value", str(category))` が str() 呼び出しで例外を
+    # 送出しても write は握り潰す (try が組み立て全体を包む契約)。
+    activity.write(_Explodes(), "evt", "ok3")
+    assert len(activity.entries) == 2  # 例外側は記録されない (握り潰され黙って戻る)
+
+
+def test_recording_activity_write_failure_does_not_change_replay_outcome(
+        tmp_path, monkeypatch):
+    """記録失敗 (_RecordingActivity.write が例外を握り潰す経路) を注入して
+    も、orders/SL/TP の判定は記録成功時 (no-op) と完全に一致する — activity
+    は可観測性のみで判断に影響しない契約 (段階 1 レビュー是正 6a)。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+
+    def source(bar):
+        if bar.ts == WED + timedelta(hours=1):
+            return dict(OPEN_MARKET)
+        return None
+
+    baseline = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+                          start=WED, end=WED + timedelta(hours=2),
+                          intent_source=source, eval_timeframe="1h",
+                          history_conn=hist)
+
+    from agentic_fx.backtest.runner import _RecordingActivity
+
+    def _broken_write(self, category, event, summary, ref_id=None):
+        try:
+            raise RuntimeError("boom: simulated recording failure")
+        except Exception:
+            return
+    monkeypatch.setattr(_RecordingActivity, "write", _broken_write)
+
+    hist2 = _conn(tmp_path)
+    _seed_history(hist2)
+    injected = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+                          start=WED, end=WED + timedelta(hours=2),
+                          intent_source=source, eval_timeframe="1h",
+                          history_conn=hist2)
+
+    def _order_shape(res):
+        return [(o["status"], o.get("close_reason"), o.get("stop_loss"),
+                 o.get("take_profit")) for o in res.orders]
+
+    assert _order_shape(injected) == _order_shape(baseline)
+    assert injected.equity_curve == baseline.equity_curve
+    # 記録失敗を注入したため activity 由来の kill_switch_events は取れない
+    # (StateStore 由来は影響を受けない) — replay 自体は止まらないことが主眼。
+
+
+# ---------------------------------------------------------------------------
+# 段階 1 レビュー是正 6c: kill_switch_events 境界テスト
+# ---------------------------------------------------------------------------
+
+
+def _snap(conn, *, ts, equity, hwm, balance=None):
+    conn.execute(
+        "INSERT INTO account_snapshots (ts, balance, equity, hwm, cashflow, "
+        "source) VALUES (?,?,?,?,0,'paper')",
+        (ts, balance if balance is not None else equity, equity, hwm))
+    conn.commit()
+
+
+def test_kill_switch_event_picks_max_id_snapshot_at_same_timestamp(tmp_path):
+    """event と同時刻に equity/hwm が異なる複数 snapshot があるとき、最大
+    id (= 最後に書かれたもの) を選ぶ。"""
+    from agentic_fx.backtest.runner import _kill_switch_event
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    ts = WED.isoformat()
+    _snap(conn, ts=ts, equity=90_000.0, hwm=100_000.0)   # id=1, dd=10%
+    _snap(conn, ts=ts, equity=80_000.0, hwm=100_000.0)   # id=2 (最新) dd=20%
+    event = _kill_switch_event(conn, {"ts": ts, "text": "latched"}, "latched")
+    assert event["drawdown_pct"] == pytest.approx(20.0)
+
+
+def test_kill_switch_event_hwm_non_positive_yields_null_drawdown(tmp_path):
+    """hwm<=0 (未初期化・境界) は drawdown_pct=None (計算不能)。"""
+    from agentic_fx.backtest.runner import _kill_switch_event
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    ts = WED.isoformat()
+    _snap(conn, ts=ts, equity=1_000.0, hwm=0.0)
+    event = _kill_switch_event(conn, {"ts": ts, "text": "latched"}, "latched")
+    assert event["drawdown_pct"] is None
+
+
+def test_kill_switch_event_reset_reports_released_kind(tmp_path):
+    """StateStore 由来の reset 遷移 (`_RecordingStateStore`) は "released" と
+    して観測される — `run_replay` の合流規則 (kind に reset を含めば
+    released) を `_RecordingStateStore.kill_switch_transitions` の実データで
+    直接確認する。"""
+    from agentic_fx.backtest.runner import _RecordingStateStore, ReplayClock
+    clock = ReplayClock(WED)
+    state = _RecordingStateStore(tmp_path / "state.json", clock=clock)
+    state.update(kill_switch_latched=True)
+    state.update(kill_switch_latched=False)
+    kinds = [t["kind"] for t in state.kill_switch_transitions]
+    assert kinds == ["latched", "released"]

@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.backtest.analysis import (
     LAGS, MIN_COMMON_OBS, TIMEFRAMES, WINDOWS, _load_returns, _pick_peak,
     analyze_for_agent, corr_matrix, coverage_report, lead_lag,
@@ -37,7 +38,7 @@ from agentic_fx.backtest.holdout import holdout_boundary
 from agentic_fx.backtest.timeframes import TF_MINUTES
 from agentic_fx.store import ohlcv
 
-from tests.backtest.factories import H, SETTINGS, _conn
+from tests.backtest.factories import H, SETTINGS, _conn, DATASET_1M
 
 FAR_FUTURE = datetime(2030, 1, 1, tzinfo=timezone.utc)
 NOW = datetime(2026, 8, 1, tzinfo=timezone.utc)
@@ -69,7 +70,7 @@ def test_analyze_for_agent_rejects_candidate_count_exceeding_max(tmp_path):
                            "timeframe": "1h"}, now=NOW)
 
 
-def _series(conn, symbol, values, *, start, timeframe="1h", source="dukascopy"):
+def _series(conn, symbol, values, *, start, timeframe="1h", dataset=DATASET_1M):
     """決定的な close 列を、timeframe 幅 (既定 1h) 刻みの **1m** バーとして
     投入する (乱数・実時刻不使用)。
 
@@ -95,7 +96,7 @@ def _series(conn, symbol, values, *, start, timeframe="1h", source="dukascopy"):
     rows = [(symbol, "1m", (start + i * step).isoformat(),
              v, v + 0.05, v - 0.05, v, 1.0, 0.01)
             for i, v in enumerate(values)]
-    ohlcv.import_history_bars(conn, rows, source=source)
+    ohlcv.import_history_bars(conn, rows, source=dataset.source)
 
 
 def _sine(n, *, phase=0):
@@ -103,10 +104,10 @@ def _sine(n, *, phase=0):
     return [100 + math.sin((i + phase) / 5.0) for i in range(n)]
 
 
-def _seed_two_series(conn, *, start=H, source="dukascopy"):
+def _seed_two_series(conn, *, start=H, dataset=DATASET_1M):
     """EURUSD が USDJPY に 1 バー先行する系列 (b[t] = a[t+1] と同位相差)。"""
-    _series(conn, "USDJPY", _sine(200, phase=0), start=start, source=source)
-    _series(conn, "EURUSD", _sine(200, phase=1), start=start, source=source)
+    _series(conn, "USDJPY", _sine(200, phase=0), start=start, dataset=dataset)
+    _series(conn, "EURUSD", _sine(200, phase=1), start=start, dataset=dataset)
 
 
 def test_corr_matrix_inner_join_and_gap_exclusion(tmp_path):
@@ -115,7 +116,7 @@ def test_corr_matrix_inner_join_and_gap_exclusion(tmp_path):
     conn.execute("DELETE FROM ohlcv_history WHERE symbol='USDJPY' AND bar_time=?",
                  ((H + timedelta(hours=7)).isoformat(),)); conn.commit()
     m = corr_matrix(conn, ["USDJPY", "EURUSD"], timeframe="1h",
-                    source="dukascopy", in_sample_until=FAR_FUTURE)
+                    dataset=DATASET_1M, in_sample_until=FAR_FUTURE)
     assert ("USDJPY", "EURUSD") in m
     assert -1.0 <= m[("USDJPY", "EURUSD")] <= 1.0
 
@@ -123,7 +124,7 @@ def test_corr_matrix_inner_join_and_gap_exclusion(tmp_path):
 def test_lead_lag_detects_leader(tmp_path):
     conn = _conn(tmp_path); _seed_two_series(conn)
     r = lead_lag(conn, "USDJPY", "EURUSD", timeframe="1h",
-                 source="dukascopy", in_sample_until=FAR_FUTURE)
+                 dataset=DATASET_1M, in_sample_until=FAR_FUTURE)
     assert set(r.keys()) == {"peak_lag", "peak_corr"}  # 返却スキーマ固定
     assert r["peak_lag"] == 1 and r["peak_corr"] > 0.9
 
@@ -197,7 +198,7 @@ def test_agent_analysis_is_in_sample_bounded(tmp_path):
             _sine(n_in, phase=1) + _sine(n_out, phase=-1)[::-1],  # holdout 部を破壊
             start=start)
     r_all = lead_lag(conn, "USDJPY", "EURUSD", timeframe="1h",
-                     source="dukascopy", in_sample_until=FAR_FUTURE)
+                     dataset=DATASET_1M, in_sample_until=FAR_FUTURE)
     out = analyze_for_agent(conn, _settings_watch_eurusd(),
                             {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD",
                              "timeframe": "1h"}, now=NOW)
@@ -313,7 +314,7 @@ def test_load_returns_excludes_non_positive_close_pairs(tmp_path):
              .isoformat(), v, v + 0.05, v - 0.05, v, 1.0, 0.01)
             for i, v in enumerate(values)]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
-    returns = _load_returns(conn, "USDJPY", "1h", source="dukascopy",
+    returns = _load_returns(conn, "USDJPY", "1h", dataset=DATASET_1M,
                             in_sample_until=FAR_FUTURE)  # ここで例外なし
     # 2 本目 (close=100.0, prev=close=0.0) は正値ガードにより除外されな
     # ければならない (さもなくば 100.0/0.0 で ZeroDivisionError)。
@@ -334,7 +335,7 @@ def test_analysis_runs_records_trials(tmp_path):
 def test_coverage_report_gap_pct(tmp_path):
     conn = _conn(tmp_path)
     _series(conn, "USDJPY", _sine(24), start=H)   # 水曜 24h — 全てオープン時間
-    rep = coverage_report(conn, "USDJPY", timeframe="1h", source="dukascopy",
+    rep = coverage_report(conn, "USDJPY", timeframe="1h", dataset=DATASET_1M,
                           start=H, end=H + timedelta(hours=48))
     assert rep["bars"] == 24 and rep["gap_pct"] > 0  # 後半 24h が欠損
 
@@ -351,7 +352,7 @@ def test_coverage_report_allows_1m(tmp_path):
              v, v + 0.05, v - 0.05, v, 1.0, 0.01)
             for i, v in enumerate(values)]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
-    rep = coverage_report(conn, "USDJPY", timeframe="1m", source="dukascopy",
+    rep = coverage_report(conn, "USDJPY", timeframe="1m", dataset=DATASET_1M,
                           start=H, end=H + timedelta(minutes=60))
     # H は水曜 12:00 UTC (全てオープン時間) なので、1 分刻みのステップが
     # 実際に使われていれば expected_open_bars == 60・gap_pct == 0 になる。
@@ -385,7 +386,7 @@ def test_coverage_report_epoch_anchor_matches_actual_for_offgrid_bounds(
              100.0 + i, 100.5 + i, 99.5 + i, 100.0 + i, 1.0, 0.01)
             for i in range(150)]  # H 〜 H+2h30分、密な 1m データ (欠損なし)
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
-    rep = coverage_report(conn, "USDJPY", timeframe="1h", source="dukascopy",
+    rep = coverage_report(conn, "USDJPY", timeframe="1h", dataset=DATASET_1M,
                           start=start, end=end)
     assert rep["expected_open_bars"] == 1
     assert rep["bars"] == 1
@@ -534,7 +535,8 @@ def test_analyze_for_agent_pair_analysis_uses_configured_mt5_source(
         tmp_path, kind):
     """L23: pair 分析は dukascopy 固定でなく eval_source を使う。"""
     conn = _conn(tmp_path)
-    _seed_two_series(conn, start=BEFORE_BOUNDARY, source="mt5")
+    _seed_two_series(conn, start=BEFORE_BOUNDARY,
+                     dataset=HistoryDataset("mt5", "1m"))
     settings = _settings_watch_eurusd().model_copy(update={
         "backtest": SETTINGS.backtest.model_copy(update={"eval_source": "mt5"})})
     request = {"kind": kind, "a": "USDJPY", "b": "EURUSD",
@@ -573,9 +575,9 @@ def test_corr_matrix_boundary_is_exclusive_of_in_sample_until(tmp_path):
     boundary = start + timedelta(hours=30)
     with pytest.raises(ValueError):
         corr_matrix(conn, ["USDJPY", "EURUSD"], timeframe="1h",
-                    source="dukascopy", in_sample_until=boundary)
+                    dataset=DATASET_1M, in_sample_until=boundary)
     ok = corr_matrix(conn, ["USDJPY", "EURUSD"], timeframe="1h",
-                     source="dukascopy",
+                     dataset=DATASET_1M,
                      in_sample_until=boundary + timedelta(hours=1))
     assert ("USDJPY", "EURUSD") in ok
 
@@ -604,7 +606,7 @@ def test_load_returns_excludes_gap_crossing_return(tmp_path):
     conn.execute("DELETE FROM ohlcv_history WHERE symbol='USDJPY' AND bar_time=?",
                  (gap_time.isoformat(),))
     conn.commit()
-    returns = _load_returns(conn, "USDJPY", "1h", source="dukascopy",
+    returns = _load_returns(conn, "USDJPY", "1h", dataset=DATASET_1M,
                             in_sample_until=FAR_FUTURE)
     # gap_time 自体 (バーが無い) と gap_time+1h (直前バーが欠損) はどちらも
     # リターン未定義でなければならない — ギャップを跨いだリターンを作らない。
@@ -633,7 +635,7 @@ def test_load_returns_offgrid_until_drops_forming_bucket_4h(tmp_path):
     conn = _conn(tmp_path)
     _series(conn, "USDJPY", [100.0, 101.0, 102.0], start=H, timeframe="4h")
     offgrid_until = H + timedelta(hours=9, minutes=30)  # 570分、非 4h 倍数
-    returns = _load_returns(conn, "USDJPY", "4h", source="dukascopy",
+    returns = _load_returns(conn, "USDJPY", "4h", dataset=DATASET_1M,
                             in_sample_until=offgrid_until)
     assert (H + timedelta(hours=8)) not in returns  # 形成中バケットは不算入
     assert (H + timedelta(hours=4)) in returns
@@ -659,7 +661,7 @@ def test_load_returns_uses_bucket_last_close_not_first_1m_row(tmp_path):
          210, 222.5, 199.5, 222, 1.0, 0.01),
     ]
     ohlcv.import_history_bars(conn, rows, source="dukascopy")
-    returns = _load_returns(conn, "USDJPY", "1h", source="dukascopy",
+    returns = _load_returns(conn, "USDJPY", "1h", dataset=DATASET_1M,
                             in_sample_until=H + timedelta(hours=2))
     # 正: [H,H+1h) の close はバケット最終行 (H+30分, close=110)、
     # [H+1h,H+2h) の close はバケット最終行 (H+90分, close=222)。
@@ -705,7 +707,7 @@ def test_rolling_corr_summary_matches_manual_stdev_not_population_stdev(
     assert expected_std != pytest.approx(expected_pstdev, rel=1e-6)
 
     out = rolling_corr_summary(conn, "USDJPY", "EURUSD", timeframe="1h",
-                               window=window, source="dukascopy",
+                               window=window, dataset=DATASET_1M,
                                in_sample_until=FAR_FUTURE)
     assert out["mean"] == pytest.approx(statistics.mean(corrs))
     assert out["std"] == pytest.approx(expected_std, rel=1e-9)
@@ -771,7 +773,7 @@ def test_corr_matrix_perfect_positive_and_negative_correlation(tmp_path):
     _series(conn, "BBB", b_same, start=BEFORE_BOUNDARY)
     _series(conn, "CCC", b_recip, start=BEFORE_BOUNDARY)
     m = corr_matrix(conn, ["AAA", "BBB", "CCC"], timeframe="1h",
-                    source="dukascopy", in_sample_until=FAR_FUTURE)
+                    dataset=DATASET_1M, in_sample_until=FAR_FUTURE)
     assert m[("AAA", "BBB")] == pytest.approx(1.0, abs=1e-9)
     assert m[("AAA", "CCC")] == pytest.approx(-1.0, abs=1e-9)
 
@@ -794,7 +796,8 @@ def test_analyze_for_agent_persist_false_does_not_write_analysis_runs(tmp_path):
 
 def test_analyze_for_agent_source_follows_backtest_settings(tmp_path):
     conn = _conn(tmp_path)
-    _seed_two_series(conn, start=BEFORE_BOUNDARY, source="mt5")
+    _seed_two_series(conn, start=BEFORE_BOUNDARY,
+                     dataset=HistoryDataset("mt5", "1m"))
     settings = _settings_watch_eurusd().model_copy(update={
         "backtest": SETTINGS.backtest.model_copy(update={"eval_source": "mt5"})})
 

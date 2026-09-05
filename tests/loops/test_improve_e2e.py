@@ -652,6 +652,11 @@ def _fake_record_kwargs(*, settings, trades: int, **overrides) -> dict:
     未実装の本ファイル執筆時点では正確な呼び出しシグネチャが確定していない
     ため `overrides` (fake `_run` が受け取った **kwargs から抽出した値) で
     上書きしつつ、欠けている項目には安全なデフォルトを補う (申し送り 9②)。"""
+    dataset = overrides.get("dataset")
+    source = overrides.get("source", dataset.source if dataset is not None
+                           else "yfinance")
+    base_interval = overrides.get(
+        "base_interval", dataset.base_interval if dataset is not None else "1m")
     return dict(
         scope=overrides.get("scope", "in_sample"),
         plugin_ref=overrides.get("plugin_ref", "unknown:unknown"),
@@ -659,7 +664,7 @@ def _fake_record_kwargs(*, settings, trades: int, **overrides) -> dict:
         kind=overrides.get("kind", "strategy"),
         pair=overrides.get("pair", "USDJPY"),
         timeframe=overrides.get("eval_timeframe", overrides.get("timeframe", "1h")),
-        source=overrides.get("source", "yfinance"),
+        source=source, base_interval=base_interval, params={},
         period=(overrides.get("period_start", NOW), overrides.get("period_end", NOW)),
         metrics={"trades": trades},
         settings_hash="fake-settings-hash",

@@ -18,7 +18,9 @@ import pytest
 
 import agentic_fx.backtest.cli as cli
 from agentic_fx.backtest import runner as runner_module
+from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.backtest.runner import BacktestResult
+from tests.backtest.factories import DATASET_1M
 from agentic_fx.entry import main
 from agentic_fx.store import backtest_runs as backtest_runs_real
 from agentic_fx.store.db import connect, init_db
@@ -125,7 +127,9 @@ def test_cli_history_coverage_calls_report(tmp_path, monkeypatch):
                    "--from", "2026-07-01", "--to", "2026-07-02"])
     assert rc == 0
     _, kwargs = cov.call_args
-    assert kwargs["timeframe"] == "1h" and kwargs["source"] == "dukascopy"
+    assert kwargs["timeframe"] == "1h"
+    assert kwargs["dataset"].source == "dukascopy"
+    assert kwargs["dataset"].base_interval == "1m"
     assert kwargs["start"].isoformat().startswith("2026-07-01")
     assert kwargs["end"].isoformat().startswith("2026-07-02")
 
@@ -364,12 +368,12 @@ def test_cli_backtest_run_plugin_records_strategy_scope(tmp_path, monkeypatch,
     assert build_src.called
     _, build_kwargs = build_src.call_args
     assert build_kwargs["pair"] == "USDJPY"
-    assert build_kwargs["source"] == "dukascopy"
+    assert build_kwargs["dataset"].source == "dukascopy"
 
     assert rr.called
     _, rr_kwargs = rr.call_args
     assert rr_kwargs["symbol"] == "USDJPY"
-    assert rr_kwargs["source"] == "dukascopy"
+    assert rr_kwargs["dataset"].source == "dukascopy"
     assert rr_kwargs["eval_timeframe"] == "2h"
     assert rr_kwargs["intent_source"] is sentinel_source  # build_src の戻り値そのもの
 
@@ -826,7 +830,8 @@ def test_dispatch_sqlite_error_returns_rc1_with_diagnostic(tmp_path, capsys, mon
     _install_settings(tmp_path)
     with patch("agentic_fx.backtest.cli.ensure_initialized"):
         args = argparse.Namespace(command="history", history_command="coverage",
-                                  symbol="USDJPY", timeframe="1h", source="dukascopy",
+                                  symbol="USDJPY", timeframe="1h",
+                                  source="dukascopy", base_interval="1m",
                                   **{"from": "2026-07-01", "to": "2026-07-02"})
         rc = cli.dispatch(args, tmp_path)
     assert rc == 1
@@ -848,7 +853,8 @@ def test_dispatch_sqlite_error_on_connect_returns_rc1_with_diagnostic(
     _install_settings(tmp_path)
     with patch("agentic_fx.backtest.cli.ensure_initialized"):
         args = argparse.Namespace(command="history", history_command="coverage",
-                                  symbol="USDJPY", timeframe="1h", source="dukascopy",
+                                  symbol="USDJPY", timeframe="1h",
+                                  source="dukascopy", base_interval="1m",
                                   **{"from": "2026-07-01", "to": "2026-07-02"})
         rc = cli.dispatch(args, tmp_path)
     assert rc == 1
@@ -870,7 +876,8 @@ def test_dispatch_sqlite_error_on_init_db_returns_rc1_with_diagnostic(
     _install_settings(tmp_path)
     with patch("agentic_fx.backtest.cli.ensure_initialized"):
         args = argparse.Namespace(command="history", history_command="coverage",
-                                  symbol="USDJPY", timeframe="1h", source="dukascopy",
+                                  symbol="USDJPY", timeframe="1h",
+                                  source="dukascopy", base_interval="1m",
                                   **{"from": "2026-07-01", "to": "2026-07-02"})
         rc = cli.dispatch(args, tmp_path)
     assert rc == 1

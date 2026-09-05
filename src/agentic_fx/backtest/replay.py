@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from agentic_fx.core.contracts import Bar, Quote
+from agentic_fx.backtest.dataset import HistoryDataset
 
 
 class ReplayClock:
@@ -49,7 +50,7 @@ class BarFeed:
     """
 
     def __init__(self, conn: sqlite3.Connection, symbol: str, *,
-                 source: str, start: datetime, end: datetime):
+                 dataset: HistoryDataset, start: datetime, end: datetime):
         """Initialize bar feed.
 
         Args:
@@ -75,7 +76,7 @@ class BarFeed:
             raise ValueError("start > end")
 
         self._symbol = symbol
-        self._source = source
+        self._source = dataset.source
         self._bars: dict[str, Bar] = {}
         self._spreads: dict[str, float] = {}
 
@@ -84,7 +85,7 @@ class BarFeed:
         rows = conn.execute(
             "SELECT * FROM ohlcv_history WHERE symbol=? AND interval='1m' AND source=? "
             "AND bar_time>=? AND bar_time<=? ORDER BY bar_time",
-            (symbol, source, start_utc.isoformat(), end_utc.isoformat())
+            (symbol, dataset.source, start_utc.isoformat(), end_utc.isoformat())
         ).fetchall()
 
         for row in rows:

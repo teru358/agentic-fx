@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from agentic_fx.backtest.holdout import in_sample_until as _in_sample_until
+from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.backtest.timeframes import floor_to_bucket, load_resampled_frame
 from agentic_fx.config import Settings
 from agentic_fx.core.market_hours import is_market_open
@@ -59,7 +60,7 @@ MIN_COMMON_OBS = 30
 # invalid_request になる。
 
 def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
-                  source: str, in_sample_until: datetime,
+                  dataset: HistoryDataset, in_sample_until: datetime,
                   since: datetime | None = None,
                   ) -> dict[datetime, float]:
     """symbol の log リターン系列を返す (キーは aware UTC datetime)。
@@ -112,7 +113,7 @@ def _load_returns(conn: sqlite3.Connection, symbol: str, timeframe: str, *,
     """
     until_utc = as_utc(in_sample_until)
     since_utc = None if since is None else as_utc(since)
-    df = load_resampled_frame(conn, symbol, timeframe, source=source,
+    df = load_resampled_frame(conn, symbol, timeframe, source=dataset.source,
                               since=since_utc, until=until_utc)
     closes = {ts.to_pydatetime(): float(c) for ts, c in df["close"].items()}
     width = timedelta(minutes=_TF_MINUTES[timeframe])
@@ -182,11 +183,11 @@ def _pick_peak(corrs: dict[int, float]) -> int:
 # --- 相関 3 種 (低レベル API — 期間は呼び出し元が渡す) -----------------
 
 def _corr_matrix_impl(conn: sqlite3.Connection, symbols: list[str], *,
-                      timeframe: str, source: str, in_sample_until: datetime,
+                      timeframe: str, dataset: HistoryDataset, in_sample_until: datetime,
                       since: datetime | None = None,
                       ) -> tuple[dict[tuple[str, str], float], int]:
     _validate_timeframe(timeframe)
-    returns = {s: _load_returns(conn, s, timeframe, source=source,
+    returns = {s: _load_returns(conn, s, timeframe, dataset=dataset,
                                 in_sample_until=in_sample_until, since=since)
               for s in symbols}
     result: dict[tuple[str, str], float] = {}
@@ -201,7 +202,7 @@ def _corr_matrix_impl(conn: sqlite3.Connection, symbols: list[str], *,
 
 
 def corr_matrix(conn: sqlite3.Connection, symbols: list[str], *,
-                timeframe: str, source: str, in_sample_until: datetime,
+                timeframe: str, dataset: HistoryDataset, in_sample_until: datetime,
                 since: datetime | None = None,
                 ) -> dict[tuple[str, str], float]:
     """symbols の全 2-組合せ (入力順で i < j) の log リターン相関 (ピアソン)。
@@ -210,23 +211,23 @@ def corr_matrix(conn: sqlite3.Connection, symbols: list[str], *,
     (人間 CLI の ``analyze corr --from`` 用。既定 None = 従来どおり全履歴)。
     """
     result, _ = _corr_matrix_impl(conn, symbols, timeframe=timeframe,
-                                  source=source,
+                                  dataset=dataset,
                                   in_sample_until=in_sample_until,
                                   since=since)
     return result
 
 
 def _rolling_corr_summary_impl(conn: sqlite3.Connection, a: str, b: str, *,
-                               timeframe: str, window: int, source: str,
+                               timeframe: str, window: int, dataset: HistoryDataset,
                                in_sample_until: datetime,
                                since: datetime | None = None,
                                ) -> tuple[dict[str, float], int]:
     _validate_timeframe(timeframe)
     if window not in WINDOWS:
         raise ValueError("window is not one of the enumerated values")
-    ret_a = _load_returns(conn, a, timeframe, source=source,
+    ret_a = _load_returns(conn, a, timeframe, dataset=dataset,
                           in_sample_until=in_sample_until, since=since)
-    ret_b = _load_returns(conn, b, timeframe, source=source,
+    ret_b = _load_returns(conn, b, timeframe, dataset=dataset,
                           in_sample_until=in_sample_until, since=since)
     xs, ys = _align_same_time(ret_a, ret_b)
     if len(xs) < MIN_COMMON_OBS:
@@ -246,7 +247,7 @@ def _rolling_corr_summary_impl(conn: sqlite3.Connection, a: str, b: str, *,
 
 
 def rolling_corr_summary(conn: sqlite3.Connection, a: str, b: str, *,
-                         timeframe: str, window: int, source: str,
+                         timeframe: str, window: int, dataset: HistoryDataset,
                          in_sample_until: datetime,
                          since: datetime | None = None) -> dict[str, float]:
     """整列済み観測対列上の連続 window 対のスライド窓ごとに pearson を計算し、
@@ -257,20 +258,20 @@ def rolling_corr_summary(conn: sqlite3.Connection, a: str, b: str, *,
     限定する (人間 CLI 用・既定 None = 従来どおり全履歴。
     ``analyze_for_agent`` はここに内部窓を強制する)。"""
     result, _ = _rolling_corr_summary_impl(
-        conn, a, b, timeframe=timeframe, window=window, source=source,
+        conn, a, b, timeframe=timeframe, window=window, dataset=dataset,
         in_sample_until=in_sample_until, since=since)
     return result
 
 
 def _lead_lag_impl(conn: sqlite3.Connection, a: str, b: str, *,
-                   timeframe: str, source: str, in_sample_until: datetime,
+                   timeframe: str, dataset: HistoryDataset, in_sample_until: datetime,
                    since: datetime | None = None,
                    ) -> tuple[dict[str, float], int]:
     _validate_timeframe(timeframe)
     width = _TF_MINUTES[timeframe]
-    ret_a = _load_returns(conn, a, timeframe, source=source,
+    ret_a = _load_returns(conn, a, timeframe, dataset=dataset,
                           in_sample_until=in_sample_until, since=since)
-    ret_b = _load_returns(conn, b, timeframe, source=source,
+    ret_b = _load_returns(conn, b, timeframe, dataset=dataset,
                           in_sample_until=in_sample_until, since=since)
     corrs: dict[int, float] = {}
     for k in LAGS:
@@ -282,7 +283,7 @@ def _lead_lag_impl(conn: sqlite3.Connection, a: str, b: str, *,
 
 
 def lead_lag(conn: sqlite3.Connection, a: str, b: str, *, timeframe: str,
-            source: str, in_sample_until: datetime,
+            dataset: HistoryDataset, in_sample_until: datetime,
             since: datetime | None = None) -> dict[str, float]:
     """各 ``k ∈ LAGS`` について ``pearson(a_ret[t + k*width], b_ret[t])`` を
     計算し、符号付き最大の ``k`` (peak_lag) とその相関 (peak_corr) を返す。
@@ -294,7 +295,7 @@ def lead_lag(conn: sqlite3.Connection, a: str, b: str, *, timeframe: str,
     限定する (人間 CLI 用・既定 None = 従来どおり全履歴。
     ``analyze_for_agent`` はここに内部窓を強制する)。
     """
-    result, _ = _lead_lag_impl(conn, a, b, timeframe=timeframe, source=source,
+    result, _ = _lead_lag_impl(conn, a, b, timeframe=timeframe, dataset=dataset,
                                in_sample_until=in_sample_until, since=since)
     return result
 
@@ -313,7 +314,7 @@ _COVERAGE_TF_MINUTES = {"1m": 1, **_TF_MINUTES}
 
 
 def coverage_report(conn: sqlite3.Connection, symbol: str, *, timeframe: str,
-                    source: str, start: datetime, end: datetime) -> dict:
+                    dataset: HistoryDataset, start: datetime, end: datetime) -> dict:
     """``{bars, expected_open_bars, gap_pct}``。
 
     ``expected_open_bars`` は ``bars`` (``load_resampled_frame`` の epoch
@@ -368,7 +369,7 @@ def coverage_report(conn: sqlite3.Connection, symbol: str, *, timeframe: str,
     if expected_open_bars == 0:
         raise ValueError("expected_open_bars is zero (empty or fully closed "
                          "range)")
-    df = load_resampled_frame(conn, symbol, timeframe, source=source,
+    df = load_resampled_frame(conn, symbol, timeframe, source=dataset.source,
                               since=start_utc, until=end_utc)
     bars = len(df)
     gap_pct = (expected_open_bars - bars) / expected_open_bars * 100
@@ -495,6 +496,10 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
     # 同じ経路で境界を得ることで、同じ now に対する境界のずれを無くす)。
     in_sample_until = _in_sample_until(now_utc,
                                        settings.backtest.holdout_months)
+    # A1/A5 (v3): analyze_for_agent が dataset の唯一の所有者 — settings
+    # から 1 回だけ確定し、_load_returns へ渡す (leaf の source 分解は
+    # _corr_matrix_impl 等が dataset.source として行う)。
+    dataset = settings.backtest.dataset()
     # 裁定A / round2 #9 是正、裁定A改訂 (D1 是正、§6.1): 決定論的な
     # in_sample_until から遡る窓 (window/timeframe から導出、下限90日・
     # 上限730日) を内部で強制する。`_REQUEST_SCHEMA` にキーは無いので
@@ -506,7 +511,7 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
         if kind == "corr_matrix":
             result, trial_count = _corr_matrix_impl(
                 conn, candidates, timeframe=timeframe,
-                source=settings.backtest.eval_source,
+                dataset=dataset,
                 in_sample_until=in_sample_until, since=since)
             if trial_count == 0:
                 # 候補が 2 未満、またはペアが計算できなかった —
@@ -517,14 +522,14 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
         elif kind == "rolling_corr_summary":
             result, trial_count = _rolling_corr_summary_impl(
                 conn, a, b, timeframe=timeframe, window=window,
-                source=settings.backtest.eval_source,
+                dataset=dataset,
                 in_sample_until=in_sample_until,
                 since=since)
             payload_body = dict(result)
         else:  # lead_lag
             result, trial_count = _lead_lag_impl(
                 conn, a, b, timeframe=timeframe,
-                source=settings.backtest.eval_source,
+                dataset=dataset,
                 in_sample_until=in_sample_until, since=since)
             payload_body = dict(result)
     except (ValueError, ArithmeticError):
@@ -549,7 +554,7 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
     save_params = {"params": {"request": dict(request),
                               "in_sample_until": in_sample_until.isoformat()},
                    "trial_count": trial_count,
-                   "source": settings.backtest.eval_source}
+                   "source": dataset.source}
     if persist:
         run_id = analysis_runs_store.save(conn, now=now_utc, **save_params)
         return {"analysis_run_id": run_id, **payload_body}

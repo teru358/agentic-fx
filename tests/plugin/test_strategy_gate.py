@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.strategy_gate import evaluate_strategy_adoption_gate
 
@@ -231,19 +232,20 @@ def test_eval_source_follows_backtest_settings(
     # R09 (2 周目): 単一値だと "mt5" ハードコード変異が生存するため 2 値で pin
     settings = MagicMock()
     settings.backtest.eval_source = eval_source
+    settings.backtest.dataset.return_value = HistoryDataset(eval_source, "1m")
     seen_sources = []
 
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.strategy_adapter.build_intent_source",
-        lambda meta, **kw: (seen_sources.append(("intent", kw["source"]))
+        lambda meta, **kw: (seen_sources.append(("intent", kw["dataset"].source))
                             or MagicMock(close=lambda: None)))
 
     def _fake_run_in_sample(*a, **kw):
-        seen_sources.append(("in_sample", kw["source"]))
+        seen_sources.append(("in_sample", kw["dataset"].source))
         return {"trades": 30, "pf": 1.2}
 
     def _fake_run_holdout(*a, **kw):
-        seen_sources.append(("holdout", kw["source"]))
+        seen_sources.append(("holdout", kw["dataset"].source))
         return {"trades": 30, "pf": 1.1}
 
     monkeypatch.setattr(
@@ -275,7 +277,8 @@ def _no_strategy_row_kwargs(*, pair="USDJPY"):
     return {
         "scope": "in_sample", "plugin_ref": "plugins/brand_new_strategy",
         "content_hash": "h3", "kind": "strategy", "pair": pair,
-        "timeframe": "1h", "source": "dukascopy",
+        "timeframe": "1h", "source": "dukascopy", "base_interval": "1m",
+        "params": {},
         "period": (datetime(2026, 1, 1, tzinfo=timezone.utc),
                   datetime(2026, 2, 1, tzinfo=timezone.utc)),
         "metrics": {"trades": 30, "pf": 1.2, "win_rate": 0.5, "avg_r": 0.1,

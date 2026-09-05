@@ -20,7 +20,7 @@ from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin.loader import PluginMeta, content_hash as _real_content_hash
 from agentic_fx.plugin.sandbox import SandboxError
 from agentic_fx.store import ohlcv as ohlcv_store
-from tests.backtest.factories import H, SETTINGS, _conn, _row_at
+from tests.backtest.factories import H, SETTINGS, _conn, _row_at, DATASET_1M
 
 SMA_CROSS_DIR = (Path(__file__).resolve().parents[2] / "docs" / "examples"
                  / "plugins" / "sma_cross")
@@ -87,7 +87,7 @@ def test_fires_only_on_declared_timeframe_boundary(tmp_path):
     meta = _meta(timeframe="4h")
     session = _FakeSession()
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS,
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
         session=session)
 
     fired_at = []
@@ -117,7 +117,7 @@ def test_fires_only_on_1h_boundary_with_30m_eval_grid(tmp_path):
     meta = _meta(timeframe="1h")
     session = _FakeSession()
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS,
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
         session=session)
 
     fired_at = []
@@ -136,7 +136,7 @@ def test_fires_only_on_1h_boundary_with_30m_eval_grid(tmp_path):
 def test_unknown_eval_bar_interval_raises_value_error():
     meta = _meta(timeframe="4h")
     src = strategy_adapter.build_intent_source(
-        meta, conn=object(), pair="USDJPY", source="dukascopy",
+        meta, conn=object(), pair="USDJPY", dataset=DATASET_1M,
         settings=SETTINGS, session=_FakeSession())
     # F5 (sonnet Minor — レビュー fix round 1): エラー文言固有の部分文字列
     # に絞る (本プランのテスト規約)。F1 で幅導出を runner.parse_timeframe
@@ -156,7 +156,7 @@ def test_df_passed_to_session_has_no_lookahead_and_respects_max_bars(tmp_path):
     meta = _meta(timeframe="1h", max_bars=2, params={"period": 7})
     session = _FakeSession()
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS,
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
         session=session)
 
     closed_bar = _bar(H + timedelta(hours=5))  # bucket_end = H+6h
@@ -187,7 +187,7 @@ def test_no_fire_when_df_is_empty(tmp_path):
     meta = _meta(timeframe="1h")
     session = _FakeSession()
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS,
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
         session=session)
     result = src(_bar(H))
     assert result is None
@@ -205,7 +205,7 @@ def test_open_market_without_take_profit_omits_take_profit_key(tmp_path):
         "entry_type": "market", "limit_price": None, "stop_loss": 149.0,
         "take_profit": None}])
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS,
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
         session=session)
 
     intent = src(_bar(H))
@@ -227,7 +227,7 @@ def test_open_market_with_take_profit_includes_take_profit_key(tmp_path):
         "entry_type": "market", "limit_price": None, "stop_loss": 151.0,
         "take_profit": 148.0}])
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS,
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
         session=session)
 
     intent = src(_bar(H))
@@ -245,7 +245,7 @@ def test_open_limit_includes_limit_price_and_expires_in(tmp_path):
         "entry_type": "limit", "limit_price": 150.5, "stop_loss": 149.5,
         "take_profit": 152.0}])
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS,
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
         session=session)
 
     intent = src(_bar(H))
@@ -261,7 +261,7 @@ def test_hold_maps_to_none(tmp_path):
     meta = _meta(timeframe="1h")
     session = _FakeSession(results=[dict(_HOLD_RESULT)])
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS,
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
         session=session)
     assert src(_bar(H)) is None
 
@@ -274,7 +274,7 @@ def test_sandbox_error_propagates_uncaught(tmp_path):
     meta = _meta(timeframe="1h")
     session = _FakeSession(raises=SandboxError("plugin crashed"))
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS,
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
         session=session)
     with pytest.raises(SandboxError, match="plugin crashed"):
         src(_bar(H))
@@ -320,7 +320,7 @@ def test_session_none_creates_lazily_on_first_fire_only(tmp_path, monkeypatch):
     _seed_flat(conn, H, 8 * 60 + 1)
     meta = _meta(timeframe="4h")
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS)
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS)
 
     assert created == []  # 構築時点ではまだ何も起動しない
 
@@ -346,7 +346,7 @@ def test_close_does_not_close_injected_session(tmp_path):
     meta = _meta(timeframe="1h")
     fake = _FakeSession()
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", source="dukascopy", settings=SETTINGS,
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
         session=fake)
     src(_bar(H))
     src.close()
@@ -448,12 +448,12 @@ def test_integration_plugin_5h_replay_reaches_orders_with_single_session(
         content_hash=_real_content_hash(plugin_dir))
 
     intent_source = strategy_adapter.build_intent_source(
-        meta, conn=hist_conn, pair="USDJPY", source="dukascopy",
+        meta, conn=hist_conn, pair="USDJPY", dataset=DATASET_1M,
         settings=SETTINGS)
     session_pid = None
     try:
         result = run_replay(
-            SETTINGS, symbol="USDJPY", source="dukascopy", start=H,
+            SETTINGS, symbol="USDJPY", dataset=DATASET_1M, start=H,
             end=H + timedelta(hours=5), intent_source=intent_source,
             eval_timeframe="1h", history_conn=hist_conn)
         # close() 前に pid を記録する (close() は所有セッションを None に
@@ -479,4 +479,4 @@ def test_build_intent_source_rejects_pair_not_in_meta_pairs(tmp_path):
     with pytest.raises(ValueError, match="pairs"):
         strategy_adapter.build_intent_source(
             meta, conn=_conn(tmp_path), pair="EURUSD",
-            source="dukascopy", settings=SETTINGS)
+            dataset=DATASET_1M, settings=SETTINGS)

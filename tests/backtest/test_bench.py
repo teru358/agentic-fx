@@ -24,7 +24,7 @@ import pytest
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.store import ohlcv
 
-from tests.backtest.factories import SETTINGS, _conn, _row_at
+from tests.backtest.factories import SETTINGS, _conn, _row_at, DATASET_1M
 
 _START = datetime(2026, 1, 5, 0, 0, tzinfo=timezone.utc)   # 月曜
 
@@ -58,7 +58,7 @@ def _run_bench(tmp_path, span: timedelta) -> tuple[float, int]:
     end = _START + span
 
     t0 = time.monotonic()
-    run_replay(SETTINGS, symbol="USDJPY", source="dukascopy",
+    run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
               start=_START, end=end, intent_source=lambda b: None,
               eval_timeframe="1h", history_conn=conn)
     elapsed = time.monotonic() - t0

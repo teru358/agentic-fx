@@ -702,14 +702,14 @@ class ImproveLoop:
             try:
                 conn = self._db_readonly_conn_factory()
                 captured: list[dict] = []
+                dataset = self._settings.backtest.dataset()
                 intent_source = strategy_adapter.build_intent_source(
-                    meta, conn=conn, pair=args["pair"],
-                    source=self._settings.backtest.eval_source,
+                    meta, conn=conn, pair=args["pair"], dataset=dataset,
                     settings=self._settings)
                 try:
                     holdout.run_in_sample(
                         self._settings, history_conn=conn, symbol=args["pair"],
-                        source=self._settings.backtest.eval_source,
+                        dataset=dataset,
                         intent_source=intent_source,
                         eval_timeframe=meta.timeframe,
                         plugin_ref=f"plugins/_staging/{staging_dir.name}/"
@@ -1091,6 +1091,10 @@ class ImproveLoop:
             "candidate_origin": candidate_origin,
             "candidate_path": candidate_path,
             "content_hash": content_hash, "artifact_hash": artifact_hash,
+            "base_interval": (self._settings.backtest.dataset().base_interval
+                              if kind == "strategy" else None),
+            "eval_timeframe": (getattr(gate_metrics.get("meta"), "timeframe", None)
+                               if kind == "strategy" else None),
             "mission_id": mission_id, "backlog_id": backlog_id,
             "in_sample": gate_metrics.get("in_sample"),
             "holdout": gate_metrics.get("holdout"),
@@ -1287,7 +1291,7 @@ class ImproveLoop:
     # 10.10 節キーホワイトリスト
     _BACKTEST_ROW_KEYS = (
         "scope", "plugin_ref", "content_hash", "kind", "pair", "timeframe",
-        "source", "period", "metrics", "settings_hash", "core_commit",
+        "source", "base_interval", "params", "period", "metrics", "settings_hash", "core_commit",
         "initial_balance", "now")
     _ANALYSIS_ROW_KEYS = ("params", "trial_count", "source")
 

@@ -288,6 +288,10 @@ def test_indicator_success_creates_row_with_expected_payload(tmp_path, settings)
     assert payload["eval_source"] == "mt5"
     assert payload["live_source"] == settings.plugin.producer_source
     assert payload["note"] == "バックテスト成績は実運用成績の予測値ではない (足切り専用)"
+    # A6 (v3 設計): indicator/signal はバックテスト無しなので base_interval/
+    # eval_timeframe は null (strategy のみ実値を持つ)。
+    assert payload["base_interval"] is None
+    assert payload["eval_timeframe"] is None
 
 
 # --- F1 (レビュー fix round 1, codex Critical): content_hash 再検証 -------
@@ -360,20 +364,24 @@ def test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
                                  "pairs: [USDJPY, EURUSD]\nexit_mode: levels\n"
                                  "max_bars: 200\n")
     meta = _strategy_meta(d, pairs=("USDJPY", "EURUSD"))
+    # base_interval="5m" (mt5): payload の base_interval が "1m" 固定
+    # リテラルへ置換される変異を殺す (段階 2 レビュー是正 — 既定 1m だけの
+    # テストでは常に "1m" と一致してしまい変異を検出できない)。
     two_pair_settings = settings.model_copy(update={
         "pairs": ["USDJPY", "EURUSD"],
-        "backtest": settings.backtest.model_copy(update={"eval_source": "mt5"}),
+        "backtest": settings.backtest.model_copy(
+            update={"eval_source": "mt5", "base_interval": "5m"}),
     })
     conn = _conn(tmp_path)
 
     calls: list[dict] = []
 
-    def fake_run_in_sample(settings_arg, *, history_conn, symbol, source,
+    def fake_run_in_sample(settings_arg, *, history_conn, symbol, dataset,
                            intent_source, eval_timeframe, plugin_ref,
                            content_hash, kind, now):
         calls.append({
             "settings": settings_arg, "history_conn": history_conn,
-            "symbol": symbol, "source": source, "intent_source": intent_source,
+            "symbol": symbol, "source": dataset.source, "intent_source": intent_source,
             "eval_timeframe": eval_timeframe, "plugin_ref": plugin_ref,
             "content_hash": content_hash, "kind": kind, "now": now})
         return {"trades": 15, "pf": 1.0, "win_rate": 0.5, "avg_r": 0.1,
@@ -412,6 +420,10 @@ def test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
     assert payload["eval_source"] == "mt5"
     # 15+15=30 == EVALUABLE_MIN_TRADES (境界値, >= なので True)
     assert payload["evaluable"] is True
+    # A6 (v3 設計): strategy は base_interval/eval_timeframe が実値を持つ。
+    # settings 側を "5m" にしているため "1m" リテラル固定の変異はここで死ぬ。
+    assert payload["base_interval"] == "5m"
+    assert payload["eval_timeframe"] == "1h"
 
 
 def test_strategy_sandbox_error_from_run_in_sample_becomes_value_error(
@@ -545,8 +557,8 @@ def test_strategy_close_called_for_each_pair_on_success(tmp_path, settings):
     created: list[_FakeIntentSource] = []
     seen_sources: list[str] = []
 
-    def fake_build_intent_source(meta_arg, *, conn, pair, source, settings):
-        seen_sources.append(source)
+    def fake_build_intent_source(meta_arg, *, conn, pair, dataset, settings):
+        seen_sources.append(dataset.source)
         src = _FakeIntentSource(pair)
         created.append(src)
         return src
@@ -584,7 +596,7 @@ def test_strategy_close_called_even_when_run_in_sample_raises(tmp_path, settings
 
     created: list[_FakeIntentSource] = []
 
-    def fake_build_intent_source(meta_arg, *, conn, pair, source, settings):
+    def fake_build_intent_source(meta_arg, *, conn, pair, dataset, settings):
         src = _FakeIntentSource(pair)
         created.append(src)
         return src

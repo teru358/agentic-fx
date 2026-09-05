@@ -71,7 +71,7 @@ _RW7_SETTINGS = load_settings(
 _RW7_SAVE_KWARGS = dict(
     scope="in_sample", plugin_ref="plugins/_staging/x/myst",
     content_hash="cand-hash", kind="strategy", pair="USDJPY",
-    timeframe="1h", source="dukascopy",
+    timeframe="1h", source="dukascopy", base_interval="1m", params={},
     period=(datetime(2020, 1, 1, tzinfo=timezone.utc),
             datetime(2026, 1, 1, tzinfo=timezone.utc)),
     metrics={"pf": 1.3, "trades": 40}, settings_hash="s",

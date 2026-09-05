@@ -179,3 +179,61 @@ def test_trade_intents_old_check_without_signal_is_rebuilt(tmp_path):
         "INSERT INTO trade_intents (mission_id,payload_json,action,gate_result,"
         "reject_reason,reject_category,created_at) VALUES "
         "(1,'{}','open','rejected','r','signal','2026-01-01T00:00:00+00:00')")
+
+
+# 段階 2 (base_interval/params_json 導入) の migration pin ------------------
+
+
+def test_backtest_runs_base_interval_and_params_json_migration_backfills_existing_rows(
+        tmp_path):
+    """旧スキーマ (`base_interval`/`params_json` 列なし) の `backtest_runs`
+    に既存行を直接 INSERT しておき、`init_db` (ALTER TABLE) を通した後、
+    既存行の `base_interval` が '1m'、`params_json` が '{}' で埋まっている
+    ことを確認する (A6 設計: 許容値 CHECK は付けない — dataset が唯一の
+    validator)。"""
+    import sqlite3
+
+    from agentic_fx.store.db import connect, init_db
+
+    db_path = tmp_path / "t.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.execute("""
+        CREATE TABLE backtest_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          plugin_ref TEXT NOT NULL, content_hash TEXT NOT NULL,
+          kind TEXT NOT NULL, pair TEXT NOT NULL, timeframe TEXT NOT NULL,
+          source TEXT NOT NULL, period_start TEXT NOT NULL,
+          period_end TEXT NOT NULL,
+          scope TEXT NOT NULL, issued_by TEXT NOT NULL,
+          metrics_json TEXT NOT NULL, settings_hash TEXT NOT NULL,
+          core_commit TEXT NOT NULL, initial_balance REAL NOT NULL,
+          created_at TEXT NOT NULL
+        )
+    """)
+    legacy.execute(
+        "INSERT INTO backtest_runs (plugin_ref, content_hash, kind, pair, "
+        "timeframe, source, period_start, period_end, scope, issued_by, "
+        "metrics_json, settings_hash, core_commit, initial_balance, "
+        "created_at) VALUES ('p','h','strategy','USDJPY','1h','dukascopy',"
+        "'2026-01-01T00:00:00+00:00','2026-01-02T00:00:00+00:00',"
+        "'in_sample','harness','{}','s','c',1,'2026-01-01T00:00:00+00:00')")
+    legacy.commit()
+    legacy.close()
+
+    conn = connect(db_path)
+    init_db(conn)
+    row = conn.execute(
+        "SELECT base_interval, params_json FROM backtest_runs WHERE id=1"
+    ).fetchone()
+    assert row["base_interval"] == "1m"
+    assert row["params_json"] == "{}"
+
+
+def test_backtest_runs_view_columns_include_base_interval(tmp_path):
+    from agentic_fx.store.backtest_runs import _VIEW_COLUMNS
+
+    assert "base_interval" in _VIEW_COLUMNS
+    # params_json (段階 2 の追加) は agent 公開面 (view) を汚さない設計
+    # 決定 (A6) — VIEW_COLUMNS に含めない。
+    assert "params_json" not in _VIEW_COLUMNS
+    assert "params" not in _VIEW_COLUMNS

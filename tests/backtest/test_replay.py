@@ -4,7 +4,7 @@ import pytest
 from agentic_fx.backtest.replay import ReplayClock, BarFeed, quote_from_bar
 from agentic_fx.core.contracts import Bar
 from agentic_fx.store import ohlcv
-from tests.backtest.factories import _conn, _row_at, H
+from tests.backtest.factories import _conn, _row_at, H, DATASET_1M
 
 
 # === ReplayClock tests ===
@@ -70,7 +70,7 @@ def test_bar_feed_returns_none_for_gap(tmp_path):
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(H + timedelta(minutes=2), o=148.1, h=148.3, l=148.0, c=148.2)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     assert feed.bar_at(H) is not None
     assert feed.bar_at(H + timedelta(minutes=1)) is None  # gap
     assert feed.bar_at(H + timedelta(minutes=2)) is not None
@@ -84,7 +84,7 @@ def test_bar_feed_respects_start_boundary(tmp_path):
         [_row_at(H - timedelta(minutes=2), o=147.0, h=147.2, l=146.9, c=147.1),
          _row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     assert feed.bar_at(H - timedelta(minutes=2)) is None  # before start
     assert feed.bar_at(H) is not None
 
@@ -97,7 +97,7 @@ def test_bar_feed_respects_end_boundary(tmp_path):
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(H + timedelta(minutes=10), o=148.1, h=148.3, l=148.0, c=148.2)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     assert feed.bar_at(H) is not None
     assert feed.bar_at(H + timedelta(minutes=10)) is None  # after end
 
@@ -111,7 +111,7 @@ def test_bar_feed_bar_at_end_boundary_included(tmp_path):
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(end_time, o=148.1, h=148.3, l=148.0, c=148.2)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=end_time)
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=end_time)
     assert feed.bar_at(end_time) is not None  # bar at boundary should be included
 
 
@@ -127,7 +127,7 @@ def test_bar_feed_filters_by_source(tmp_path):
         conn,
         [_row_at(H, o=149.0, h=149.2, l=148.9, c=149.1)],
         source="mt5")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     bar = feed.bar_at(H)
     assert bar is not None
     assert bar.close == 148.1  # dukascopy, not mt5
@@ -141,7 +141,7 @@ def test_bar_feed_latest_completed_1m_returns_previous_bar(tmp_path):
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(H + timedelta(minutes=1), o=148.1, h=148.3, l=148.0, c=148.2)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     # latest_completed_1m(H+1m) should return bar at H
     completed = feed.latest_completed_1m(H + timedelta(minutes=1))
     assert completed is not None
@@ -156,7 +156,7 @@ def test_bar_feed_latest_completed_1m_gap_returns_none(tmp_path):
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(H + timedelta(minutes=2), o=148.1, h=148.3, l=148.0, c=148.2)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     # latest_completed_1m(H+2m) looks for bar at H+1m which is missing
     assert feed.latest_completed_1m(H + timedelta(minutes=2)) is None
 
@@ -168,7 +168,7 @@ def test_bar_feed_latest_completed_1m_before_start_returns_none(tmp_path):
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     # latest_completed_1m(H) looks for bar at H-1m which doesn't exist
     assert feed.latest_completed_1m(H) is None
 
@@ -178,7 +178,7 @@ def test_bar_feed_rejects_naive_start(tmp_path):
     conn = _conn(tmp_path)
     naive_start = datetime(2026, 7, 22, 12, 0)  # naive
     with pytest.raises(ValueError, match="aware"):
-        BarFeed(conn, "USDJPY", source="dukascopy", start=naive_start, end=H)
+        BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=naive_start, end=H)
 
 
 def test_bar_feed_rejects_naive_end(tmp_path):
@@ -186,7 +186,7 @@ def test_bar_feed_rejects_naive_end(tmp_path):
     conn = _conn(tmp_path)
     naive_end = datetime(2026, 7, 22, 13, 0)  # naive
     with pytest.raises(ValueError, match="aware"):
-        BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=naive_end)
+        BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=naive_end)
 
 
 def test_bar_feed_accepts_non_utc_start_and_normalizes(tmp_path):
@@ -199,7 +199,7 @@ def test_bar_feed_accepts_non_utc_start_and_normalizes(tmp_path):
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=start_utc9, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=start_utc9, end=H + timedelta(minutes=5))
     # Should find the bar at H even though start was given in UTC+9
     assert feed.bar_at(H) is not None
 
@@ -215,7 +215,7 @@ def test_bar_feed_accepts_non_utc_end_and_normalizes(tmp_path):
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1),
          _row_at(H + timedelta(minutes=5), o=148.1, h=148.3, l=148.0, c=148.2)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=end_utc9)
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=end_utc9)
     # Should find bar at H+5m even though end was given in UTC+9
     assert feed.bar_at(H + timedelta(minutes=5)) is not None
 
@@ -224,7 +224,7 @@ def test_bar_feed_rejects_start_greater_than_end(tmp_path):
     """BarFeed rejects start > end."""
     conn = _conn(tmp_path)
     with pytest.raises(ValueError, match="start > end"):
-        BarFeed(conn, "USDJPY", source="dukascopy",
+        BarFeed(conn, "USDJPY", dataset=DATASET_1M,
                 start=H + timedelta(minutes=5), end=H)
 
 
@@ -235,7 +235,7 @@ def test_bar_feed_bar_at_rejects_naive_ts(tmp_path):
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     naive_ts = datetime(2026, 7, 22, 12, 0)
     with pytest.raises(ValueError, match="aware"):
         feed.bar_at(naive_ts)
@@ -248,7 +248,7 @@ def test_bar_feed_bar_at_accepts_non_utc_aware_and_normalizes(tmp_path):
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     utc9 = timezone(timedelta(hours=9))
     # 21:00:00+09:00 = 12:00:00 UTC
     ts_utc9 = datetime(2026, 7, 22, 21, 0, tzinfo=utc9)
@@ -265,7 +265,7 @@ def test_bar_feed_spread_at_returns_none_for_gap(tmp_path):
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1, spread=0.02),
          _row_at(H + timedelta(minutes=2), o=148.1, h=148.3, l=148.0, c=148.2, spread=0.03)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     assert feed.spread_at(H) == 0.02
     assert feed.spread_at(H + timedelta(minutes=1)) is None  # gap
 
@@ -278,7 +278,7 @@ def test_bar_feed_spread_at_uses_actual_value(tmp_path):
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1, spread=0.03)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     assert feed.spread_at(H) == 0.03
 
 
@@ -289,7 +289,7 @@ def test_bar_feed_spread_at_rejects_naive_ts(tmp_path):
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1, spread=0.02)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     naive_ts = datetime(2026, 7, 22, 12, 0)
     with pytest.raises(ValueError, match="aware"):
         feed.spread_at(naive_ts)
@@ -302,7 +302,7 @@ def test_bar_feed_spread_at_accepts_non_utc_ts_and_normalizes(tmp_path):
         conn,
         [_row_at(H, o=148.0, h=148.2, l=147.9, c=148.1, spread=0.02)],
         source="dukascopy")
-    feed = BarFeed(conn, "USDJPY", source="dukascopy", start=H, end=H + timedelta(minutes=5))
+    feed = BarFeed(conn, "USDJPY", dataset=DATASET_1M, start=H, end=H + timedelta(minutes=5))
     utc9 = timezone(timedelta(hours=9))
     # 21:00:00+09:00 = 12:00:00 UTC
     ts_utc9 = datetime(2026, 7, 22, 21, 0, tzinfo=utc9)

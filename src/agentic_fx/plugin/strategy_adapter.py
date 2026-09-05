@@ -136,7 +136,7 @@ class PluginStrategyIntentSource:
 
 
 def build_intent_source(meta: PluginMeta, *, conn: sqlite3.Connection,
-                        pair: str, source: str, settings: "Settings",
+                        pair: str, dataset, settings: "Settings",
                         session: _SessionLike | None = None,
                         ) -> PluginStrategyIntentSource:
     """`meta` (kind="strategy") から `pair` 用の `IntentSource` を組み立てる。
@@ -145,7 +145,7 @@ def build_intent_source(meta: PluginMeta, *, conn: sqlite3.Connection,
     (try/finally — brief 明記。サンドボックスプロセスのリーク防止)。
     """
     return PluginStrategyIntentSource(
-        meta, conn=conn, pair=pair, source=source, settings=settings,
+        meta, conn=conn, pair=pair, source=dataset.source, settings=settings,
         session=session)
 
 
