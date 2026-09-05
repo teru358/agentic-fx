@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import agentic_fx.backtest.runner as runner_module
 from agentic_fx.core.accounting import record_snapshot
 from agentic_fx.core.contracts import (
     ConversionRate, FixedClock, InstrumentSpec, Origin, Quote, TradeIntent,
@@ -425,6 +426,35 @@ def test_equity_curve_has_no_duplicate_timestamps(tmp_path):
     ts_list = [ts for ts, _ in res.equity_curve]
     assert len(ts_list) == len(set(ts_list))
     assert res.equity_curve[0] == (WED.isoformat(), SETTINGS.backtest.initial_balance)
+
+
+def test_replay_exposes_timestamp_then_id_ordered_snapshots_and_first_decision(
+        tmp_path, monkeypatch):
+    """観測面を外す変異（snapshots を返さない／同時刻行を id 順にしない）を検出する。"""
+    hist = _conn(tmp_path)
+    _seed_history(hist)
+
+    real_init_db = runner_module.init_db
+
+    def _init_with_reverse_ties(conn):
+        real_init_db(conn)
+        conn.execute("DROP INDEX ix_account_snapshots_ts_id")
+        conn.execute(
+            "CREATE INDEX snapshot_reverse_ties ON account_snapshots(ts, id DESC)")
+
+    # 同一 ts の順序は id を明示しなければ DB 契約に含まれない。逆順 index
+    # を使う実 DB で、その不完全な ORDER BY を可観測な誤順序にする。
+    monkeypatch.setattr(runner_module, "init_db", _init_with_reverse_ties)
+
+    res = runner_module.run_replay(
+        SETTINGS, symbol="USDJPY", source="dukascopy",
+        start=WED, end=WED + timedelta(minutes=2), intent_source=lambda b: None,
+        eval_timeframe="1h", history_conn=hist)
+
+    assert res.first_decision_at == WED
+    assert res.snapshots
+    assert [(row["ts"], row["id"]) for row in res.snapshots] == sorted(
+        (row["ts"], row["id"]) for row in res.snapshots)
 
 
 def test_drawdown_kill_switch_latches_and_blocks_next_open(tmp_path):

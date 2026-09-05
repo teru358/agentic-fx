@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -63,12 +63,47 @@ _TF_RE = re.compile(r"^(\d+)(m|h)$")
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
-class _NullActivity:
-    """no-op ActivityLog。ActivityLog.write は例外を出さない契約 (実物と
-    同じ) — write のみを提供する (scheduler/executor は write しか呼ばない)。"""
+class _RecordingActivity:
+    """Backtest 専用の in-memory ActivityLog 代替。
 
-    def write(self, *args, **kwargs) -> None:
-        pass
+    実物と同じ ``write`` 境界だけを提供し、ファイル出力はしない。時刻は
+    ``datetime.now()`` ではなく replay clock から採るため、golden を決定的に
+    保てる。
+    """
+
+    def __init__(self, clock: ReplayClock) -> None:
+        self._clock = clock
+        self.entries: list[dict] = []
+
+    def write(self, category, kind: str, text: str,
+              ref_id: str | None = None) -> None:
+        self.entries.append({
+            "ts": self._clock.now().astimezone(timezone.utc).isoformat(),
+            "category": getattr(category, "value", str(category)),
+            "kind": kind,
+            "text": text,
+            "ref_id": ref_id,
+        })
+
+
+class _RecordingStateStore(StateStore):
+    """ラッチ遷移を replay の観測面へ追加する StateStore。"""
+
+    def __init__(self, path: Path, *, clock: ReplayClock) -> None:
+        super().__init__(path)
+        self._clock = clock
+        self.kill_switch_transitions: list[dict] = []
+
+    def update(self, **changes):
+        before = self.load().kill_switch_latched
+        result = super().update(**changes)
+        if result.kill_switch_latched != before:
+            self.kill_switch_transitions.append({
+                "ts": self._clock.now().astimezone(timezone.utc).isoformat(),
+                "kind": "latched" if result.kill_switch_latched else "released",
+                "reason": "state_store kill_switch_latched transition",
+            })
+        return result
 
 
 @dataclass
@@ -79,6 +114,9 @@ class BacktestResult:
     end: datetime
     source: str
     fallback_spread_used: bool
+    snapshots: list[dict] = field(default_factory=list)
+    kill_switch_events: list[dict] = field(default_factory=list)
+    first_decision_at: datetime | None = None
 
 
 def parse_timeframe(tf: str) -> timedelta:
@@ -152,7 +190,9 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
 
     conn = connect(Path(":memory:"))
     init_db(conn)
-    state = StateStore(Path(tempfile.mkdtemp()) / "state.json")
+    clock = ReplayClock(start)
+    state = _RecordingStateStore(Path(tempfile.mkdtemp()) / "state.json",
+                                 clock=clock)
 
     # レビュー裁定 sonnet C1: PaperBroker.equity() は settings.paper.
     # starting_balance 基準のため、backtest.initial_balance と二重基準に
@@ -167,8 +207,6 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
                     equity=initial_balance)
 
     feed = BarFeed(history_conn, symbol, source=source, start=start, end=end)
-    clock = ReplayClock(start)
-
     fallback_spread_used = False
     current_ts = start
 
@@ -221,7 +259,7 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
             f"{ccy}->{account_ccy}")
 
     broker = PaperBroker(conn, bt_settings, clock)
-    activity = _NullActivity()
+    activity = _RecordingActivity(clock)
     executor = Executor(
         conn=conn, broker=broker, settings=bt_settings, state_store=state,
         activity=activity, notifier=Notifier(False, None), clock=clock,
@@ -273,6 +311,34 @@ def run_replay(settings: Settings, *, symbol: str, source: str,
 
     order_rows = [dict(r) for r in
                  conn.execute("SELECT * FROM orders ORDER BY id").fetchall()]
+    snapshots = [dict(r) for r in conn.execute(
+        "SELECT * FROM account_snapshots ORDER BY ts, id").fetchall()]
+
+    def _event(entry: dict, kind: str) -> dict:
+        row = conn.execute(
+            "SELECT equity, hwm FROM account_snapshots "
+            "WHERE ts <= ? ORDER BY ts DESC, id DESC LIMIT 1",
+            (entry["ts"],)).fetchone()
+        drawdown = None
+        if row is not None and row["hwm"] > 0:
+            drawdown = max(0.0, (row["hwm"] - row["equity"])
+                           / row["hwm"] * 100.0)
+        return {"ts": entry["ts"], "kind": kind,
+                "reason": entry["text"] if "text" in entry else entry["reason"],
+                "drawdown_pct": drawdown}
+
+    kill_switch_events = [
+        _event(entry, "released" if "reset" in entry["kind"] else "latched")
+        for entry in activity.entries if "kill_switch" in entry["kind"]
+    ]
+    for transition in state.kill_switch_transitions:
+        event = _event(transition, transition["kind"])
+        kill_switch_events.append(event)
+    # 観測面の順序は時刻で固定する (activity 由来と StateStore 由来が
+    # 別 list から合流するため、合流順に依存させない)。
+    kill_switch_events.sort(key=lambda e: (e["ts"], e["kind"]))
     return BacktestResult(
         orders=order_rows, equity_curve=equity_curve, start=start, end=end,
-        source=source, fallback_spread_used=fallback_spread_used)
+        source=source, fallback_spread_used=fallback_spread_used,
+        snapshots=snapshots, kill_switch_events=kill_switch_events,
+        first_decision_at=start)
