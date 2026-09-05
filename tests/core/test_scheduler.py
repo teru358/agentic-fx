@@ -933,6 +933,38 @@ def test_close_retry_notification_uses_executor_deferred_window(tmp_path):
     assert recording.sent == []
 
 
+def test_close_retry_degraded_rate_notification_uses_executor_deferred_window(tmp_path):
+    """段 0 (2026-09-05) M4: `_retry_close` の close_pnl_rate_degraded 通知も
+    Executor の遅延窓に従う (close_unknown 側だけ pin されていて、こちらを
+    `notifier.send` 直叩きに戻す変異が生存していた)。"""
+    class RecordingNotifier:
+        def __init__(self):
+            self.sent: list[str] = []
+
+        def send(self, text):
+            self.sent.append(text)
+
+    def failing_rate_fn(ccy, account_ccy, now, **_ignored):
+        raise DataUnhealthy("vendor outage for JPY")
+
+    env = Env(tmp_path, rate_fn=failing_rate_fn)
+    recording = RecordingNotifier()
+    env.executor.notifier = recording
+    oid = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="closing", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8,
+                        avg_fill_price=148.2)
+    row = orders.get(env.conn, oid)
+
+    with env.executor.defer_notifications() as deferred:
+        env.sched._retry_close(row, WED)
+        assert recording.sent == []
+        assert deferred == [f"[agentic-fx] クローズ換算レート degraded #{oid}"]
+
+    assert recording.sent == []
+
+
 def test_close_retry_quote_exception_stays_closing_for_next_tick_retry(tmp_path):
     """quote_fn の例外は broker に触れる前に起きる → 未実行が確定して
     おり、CLOSING のまま次 tick で再試行してよい (broker.close の例外とは

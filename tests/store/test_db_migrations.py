@@ -131,3 +131,51 @@ def test_idea_norm_backfill_normalizes_existing_rows_and_keeps_dedup_consistent(
         "SELECT idea_norm FROM improvement_backlog WHERE id=?",
         (row["id"],)).fetchone()["idea_norm"] == "sentinel"  # 既存値を上書きしない
     conn.close()
+
+
+def test_trade_intents_old_check_without_signal_is_rebuilt(tmp_path):
+    """段 0 (2026-09-05) M5: 列は揃っているが CHECK の許可カテゴリに 'signal'
+    が無い旧 DDL の DB でも init_db が trade_intents を rebuild し、既存行
+    (action / reject_category) を保持する。列の有無だけ見る冪等ガードに
+    戻す変異が生存していた。"""
+    import sqlite3
+
+    from agentic_fx.store.db import connect, init_db
+
+    db_path = tmp_path / "t.db"
+    conn = connect(db_path)
+    init_db(conn)
+    old_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='trade_intents'").fetchone()["sql"]
+    assert "'signal'" in old_sql
+    conn.close()
+
+    raw = sqlite3.connect(db_path)
+    raw.execute("PRAGMA foreign_keys=OFF")
+    raw.executescript(
+        "INSERT INTO missions (id,loop,runner,model,status,started_at) VALUES "
+        "(1,'trade','local','m','completed','2026-01-01T00:00:00+00:00');\n"
+        "DROP TABLE trade_intents;\n"
+        + old_sql.replace("'execution','signal'", "'execution'")
+        + ";\n"
+        "INSERT INTO trade_intents (id,mission_id,payload_json,action,gate_result,"
+        "reject_reason,reject_category,created_at) VALUES "
+        "(1,1,'{}','open','rejected','r','execution','2026-01-01T00:00:00+00:00');")
+    raw.commit()
+    stale = raw.execute(
+        "SELECT sql FROM sqlite_master WHERE name='trade_intents'").fetchone()[0]
+    assert "'signal'" not in stale
+    raw.close()
+
+    conn = connect(db_path)
+    init_db(conn)
+    new_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='trade_intents'").fetchone()["sql"]
+    assert "'signal'" in new_sql
+    row = conn.execute(
+        "SELECT action, reject_category FROM trade_intents WHERE id=1").fetchone()
+    assert (row["action"], row["reject_category"]) == ("open", "execution")
+    conn.execute(
+        "INSERT INTO trade_intents (mission_id,payload_json,action,gate_result,"
+        "reject_reason,reject_category,created_at) VALUES "
+        "(1,'{}','open','rejected','r','signal','2026-01-01T00:00:00+00:00')")
