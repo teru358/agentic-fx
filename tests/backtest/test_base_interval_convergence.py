@@ -11,13 +11,15 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.backtest.replay import BarFeed
 from agentic_fx.backtest.runner import run_replay, _aggregate_bucket
-from agentic_fx.backtest.timeframes import load_resampled_frame
+from agentic_fx.backtest.timeframes import floor_to_bucket, load_resampled_frame
 from agentic_fx.core.scheduler import Scheduler
+from agentic_fx.datafeed.bars import pandas_rule, resample
 from agentic_fx.store import ohlcv
 from agentic_fx.store.db import connect, init_db
 
@@ -44,31 +46,48 @@ class _NullActivity:
 
 
 def _aggregate_5m(rows_1m: list[tuple]) -> list[tuple]:
-    """1m 行 (epoch 錨) を素直に 5 分バケットへ集約する (テスト専用ヘルパ)。
+    """1m 行 (epoch 錨) を 5 分バケットへ集約する (テスト専用ヘルパ)。
 
-    プロジェクトの epoch 錨・左 label 規則 (timeframes.floor_to_bucket と
-    同じ切り下げ) で束ね、OHLC は open=先頭/high=max/low=min/close=末尾/
-    volume=sum とする — `_aggregate_bucket` / `load_resampled_frame` の
-    集約規則と同一の定義。
+    I4 是正 (codex 段階2/3 是正 1周目): OHLC/volume の集約規則はプロジェクト
+    自身の `agentic_fx.datafeed.bars.resample` (実出力) に委ねる —
+    「1m 系列からプロジェクト自身の規則で 5m を生成する」設計 v2 §6 の
+    要求どおり、pandas 側の境界・欠損・型・volume 処理をテスト内で
+    再実装しない (二重実装は実装側とテスト側が同じバグを共有してしまう
+    リスクがある)。bucket の境界も `timeframes.floor_to_bucket`
+    (`_aggregate_bucket`/`load_resampled_frame` と同一の epoch 錨規則)
+    を使う。
+
+    spread は Bar/OHLCV の集約対象に含まれない列 (`resample`/`bars_to_df`
+    の domain 外) — 本ヘルパは従来どおり「バケット内最終行の spread」を
+    採用する (ohlcv_history への 5m ネイティブ行投入に spread 値が必須の
+    ため、テスト fixture 独自の規約として明記)。
     """
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    width = timedelta(minutes=5)
-    buckets: dict[datetime, list[tuple]] = {}
+    if not rows_1m:
+        return []
+    rows_1m = sorted(rows_1m, key=lambda r: r[2])  # load_resampled_frame と
+                                                    # 同じ ORDER BY bar_time
+    symbol = rows_1m[0][0]
+    df = pd.DataFrame(
+        {"open": [r[3] for r in rows_1m], "high": [r[4] for r in rows_1m],
+         "low": [r[5] for r in rows_1m], "close": [r[6] for r in rows_1m],
+         "volume": [r[7] for r in rows_1m]},
+        index=pd.DatetimeIndex(
+            pd.to_datetime([r[2] for r in rows_1m], utc=True)))
+    resampled = resample(df, pandas_rule("5m"))
+
+    spread_by_bucket: dict[datetime, float] = {}
     for r in rows_1m:
-        symbol, interval, ts_iso, o, h, l, c, v, spread = r
-        ts = datetime.fromisoformat(ts_iso)
-        bucket_start = epoch + ((ts - epoch) // width) * width
-        buckets.setdefault(bucket_start, []).append((ts, o, h, l, c, v, spread))
+        ts = datetime.fromisoformat(r[2])
+        bucket_start = floor_to_bucket(ts, "5m")
+        spread_by_bucket[bucket_start] = r[8]  # 昇順走査 → 最終行が残る
+
     out = []
-    for bstart in sorted(buckets):
-        items = sorted(buckets[bstart])
-        o = items[0][1]
-        h = max(x[2] for x in items)
-        l = min(x[3] for x in items)
-        c = items[-1][4]
-        v = sum(x[5] for x in items)
-        spread = items[-1][6]
-        out.append(_row(bstart, o, h, l, c, v, spread, interval="5m"))
+    for ts, row in resampled.iterrows():
+        bstart = ts.to_pydatetime()
+        out.append(_row(bstart, row["open"], row["high"], row["low"],
+                        row["close"], row["volume"],
+                        spread_by_bucket[bstart], symbol=symbol,
+                        interval="5m"))
     return out
 
 

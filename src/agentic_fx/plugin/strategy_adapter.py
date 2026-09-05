@@ -72,7 +72,7 @@ class PluginStrategyIntentSource:
     経由で構築する。"""
 
     def __init__(self, meta: PluginMeta, *, conn: sqlite3.Connection,
-                pair: str, source: str, dataset, settings: "Settings",
+                pair: str, dataset, settings: "Settings",
                 session: _SessionLike | None = None) -> None:
         # プラン 8 B 束 (Fable M-1): producer 側 (settings.pairs 外は
         # warning + skip) と対称の検証。adapter は 1 インスタンス = 1 pair
@@ -86,7 +86,6 @@ class PluginStrategyIntentSource:
         self._meta = meta
         self._conn = conn
         self._pair = pair
-        self._source = source
         self._dataset = dataset
         self._settings = settings
         self._session = session
@@ -109,7 +108,8 @@ class PluginStrategyIntentSource:
             return None  # plugin 宣言 timeframe の境界に乗っていない tick
 
         df = load_resampled_frame(
-            self._conn, self._pair, self._meta.timeframe, source=self._source,
+            self._conn, self._pair, self._meta.timeframe,
+            source=self._dataset.source,
             base_interval=self._dataset.base_interval,
             until=bucket_end, max_bars=self._meta.max_bars)
         if df.empty:
@@ -147,7 +147,7 @@ def build_intent_source(meta: PluginMeta, *, conn: sqlite3.Connection,
     (try/finally — brief 明記。サンドボックスプロセスのリーク防止)。
     """
     return PluginStrategyIntentSource(
-        meta, conn=conn, pair=pair, source=dataset.source, dataset=dataset,
+        meta, conn=conn, pair=pair, dataset=dataset,
         settings=settings,
         session=session)
 

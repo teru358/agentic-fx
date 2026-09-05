@@ -285,7 +285,12 @@ def test_indicator_success_creates_row_with_expected_payload(tmp_path, settings)
     assert payload["pytest"] == {"returncode": 0, "summary": "1 passed in 0.01s"}
     assert payload["metrics"] == {}
     assert payload["evaluable"] is True
-    assert payload["eval_source"] == "mt5"
+    # I2 是正 (codex 段階2/3 是正 1周目 — 逸脱申告): indicator/signal は
+    # バックテストを一切実行しないため、旧 pin `payload["eval_source"] ==
+    # "mt5"` は「使ってもいない source」を人間承認レビューに露出させて
+    # いた欠陥 pin だった。base_interval/eval_timeframe と同じ規約
+    # (strategy のみ実値、indicator/signal は null) に揃える。
+    assert payload["eval_source"] is None
     assert payload["live_source"] == settings.plugin.producer_source
     assert payload["note"] == "バックテスト成績は実運用成績の予測値ではない (足切り専用)"
     # A6 (v3 設計): indicator/signal はバックテスト無しなので base_interval/

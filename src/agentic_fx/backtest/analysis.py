@@ -493,16 +493,20 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
         if a not in candidates or b not in candidates:
             return {"error": "unknown_symbol"}
 
-    # F1 (最終レビュー opus I-1 是正): 境界算術は holdout.in_sample_until が
-    # 単一所有する (UTC 正規化 + 分格子切り捨てを含む) — ここで
-    # holdout_boundary を直接呼ばない (run_in_sample/run_holdout_gate と
-    # 同じ経路で境界を得ることで、同じ now に対する境界のずれを無くす)。
-    in_sample_until = _in_sample_until(now_utc,
-                                       settings.backtest.holdout_months)
     # A1/A5 (v3): analyze_for_agent が dataset の唯一の所有者 — settings
     # から 1 回だけ確定し、_load_returns へ渡す (leaf の source 分解は
     # _corr_matrix_impl 等が dataset.source として行う)。
     dataset = settings.backtest.dataset()
+    # F1 (最終レビュー opus I-1 是正) / C1 (codex 段階2/3 是正 1周目):
+    # 境界算術は holdout.in_sample_until が単一所有する (UTC 正規化 + 分
+    # 格子切り捨てを含む) — ここで holdout_boundary を直接呼ばない
+    # (run_in_sample/run_holdout_gate と同じ経路・同じ base_interval で
+    # 境界を得ることで、同じ now に対する境界のずれを無くす)。dataset
+    # 確定より前に呼ぶと既定 "1m" 格子で丸まってしまい、5m/15m 基底では
+    # replay の in-sample 境界と食い違う — dataset 確定後に呼ぶこと。
+    in_sample_until = _in_sample_until(now_utc,
+                                       settings.backtest.holdout_months,
+                                       base_interval=dataset.base_interval)
     # 裁定A / round2 #9 是正、裁定A改訂 (D1 是正、§6.1): 決定論的な
     # in_sample_until から遡る窓 (window/timeframe から導出、下限90日・
     # 上限730日) を内部で強制する。`_REQUEST_SCHEMA` にキーは無いので

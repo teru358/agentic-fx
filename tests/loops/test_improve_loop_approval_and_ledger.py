@@ -92,3 +92,26 @@ def test_payload_base_interval_follows_backtest_settings_for_strategy(
         now=datetime(2026, 8, 22))
     assert payload_indicator["base_interval"] is None
     assert payload_indicator["eval_timeframe"] is None
+
+
+def test_payload_eval_timeframe_maps_1d_to_24h_for_strategy(loop_min, conn):
+    """写像非対称是正 (codex 段階2/3 是正 1周目): `_build_approval_payload`
+    (improve_loop 系統) は `meta.timeframe` を生のまま payload の
+    `eval_timeframe` に載せていた — switch.py の submit/bless と同じ欠陥
+    (approval.py だけが "1d"→"24h" 写像を適用していた)。写像は
+    `strategy_gate._eval_timeframe` に一元化し、4 系統すべてがこれを
+    経由すること。
+    """
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger.freeze()
+
+    class _Meta:
+        timeframe = "1d"
+
+    payload = loop_min._build_approval_payload(
+        conn, name="myst_1d", kind="strategy", content_hash="h",
+        artifact_hash="a", ctx_ledger=ledger, mission_id=1, backlog_id=2,
+        candidate_origin="staging", candidate_path="plugins/_staging/1/myst_1d",
+        gate_metrics={"meta": _Meta()}, output={"selection_rationale": ""},
+        now=datetime(2026, 8, 22))
+    assert payload["eval_timeframe"] == "24h"

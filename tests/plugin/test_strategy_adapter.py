@@ -530,3 +530,17 @@ def test_build_intent_source_rejects_pair_not_in_meta_pairs(tmp_path):
         strategy_adapter.build_intent_source(
             meta, conn=_conn(tmp_path), pair="EURUSD",
             dataset=DATASET_1M, settings=SETTINGS)
+
+
+def test_plugin_strategy_intent_source_no_longer_accepts_source_kwarg():
+    """I1 (codex 段階2/3 是正 1周目): `PluginStrategyIntentSource` は
+    `source` と `dataset` の両方を受けていたため、直接構築で
+    `source="dukascopy"` + `dataset=HistoryDataset("mt5", "5m")` のような
+    split-brain (SQL は source=self._source, base_interval=
+    self._dataset.base_interval で混成) が型で成立してしまっていた。
+    `source` 引数を廃止し dataset のみを受けること (TypeError で拒否)。
+    """
+    with pytest.raises(TypeError):
+        strategy_adapter.PluginStrategyIntentSource(
+            _meta(), conn=None, pair="USDJPY", source="dukascopy",
+            dataset=DATASET_1M, settings=SETTINGS)

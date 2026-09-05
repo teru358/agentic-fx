@@ -35,6 +35,7 @@ from agentic_fx.backtest.analysis import (
     rolling_corr_summary,
 )
 from agentic_fx.backtest.holdout import holdout_boundary
+from agentic_fx.backtest import analysis as analysis_module
 from agentic_fx.backtest.timeframes import TF_MINUTES
 from agentic_fx.store import ohlcv
 
@@ -953,3 +954,38 @@ def test_analyze_for_agent_rolling_corr_summary_1d_window_120_succeeds(
          "timeframe": "1d", "window": 120}, now=NOW)
     assert "error" not in out, out
     assert set(out.keys()) == {"analysis_run_id", "mean", "std", "min", "max"}
+
+
+# --- C1 (codex 段階2/3 是正 1周目): dataset 確定前の "1m" 既定境界計算 ----
+
+def test_analyze_for_agent_computes_boundary_with_dataset_base_interval(
+        tmp_path, monkeypatch):
+    """C1 (Critical, codex 是正): `analyze_for_agent` は dataset
+    (`settings.backtest.dataset()`) 確定前に `in_sample_until(now, months)`
+    を既定 "1m" 格子で計算していた — 5m/15m 基底では replay
+    (`run_in_sample`/`run_holdout_gate`、holdout.py の `_normalize_now` 経由
+    で base 格子に丸める) の in-sample 境界と分析境界が食い違う
+    (`holdout.in_sample_until` の単一所有原則の破り)。dataset 確定後に
+    `base_interval=dataset.base_interval` を渡して呼ぶこと。
+    """
+    conn = _conn(tmp_path)
+    settings_5m = SETTINGS.model_copy(update={
+        "backtest": SETTINGS.backtest.model_copy(
+            update={"base_interval": "5m"})})
+
+    calls = []
+    real = analysis_module._in_sample_until
+
+    def _spy(now, months, **kwargs):
+        calls.append(kwargs)
+        return real(now, months, **kwargs)
+
+    monkeypatch.setattr(analysis_module, "_in_sample_until", _spy)
+
+    analyze_for_agent(conn, settings_5m,
+                      {"kind": "corr_matrix", "timeframe": "1h"}, now=NOW)
+
+    assert calls, "in_sample_until が呼ばれていない"
+    assert calls[0].get("base_interval") == "5m", (
+        "analyze_for_agent は dataset 確定後の base_interval を "
+        "in_sample_until に渡さなければならない (既定 1m 固定は退行)")

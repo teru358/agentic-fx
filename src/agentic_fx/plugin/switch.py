@@ -16,7 +16,9 @@ from typing import Literal
 
 from agentic_fx._safe_error import safe_error_text  # 検収 m10: per-row fault isolation の ERROR 記録に使う
 from agentic_fx.activity import ActivityLog, Category  # B-2: journal_store 層に activity を書かせない
-from agentic_fx.plugin import approval, history_git, loader, version_store
+from agentic_fx.plugin import (
+    approval, history_git, loader, strategy_gate, version_store,
+)
 from agentic_fx.plugin.gate_pytest import (  # M-8: モジュールレベル import (11d/11e/11g の monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", ...) seam が効くために必須)
     check_candidate_snapshot, hashes_of, run_gate_pytest,
 )
@@ -527,9 +529,12 @@ def submit_candidate(
             "candidate_path": candidate_path,
             "content_hash": content_hash, "artifact_hash": artifact_hash,
             "metrics": metrics, "evaluable": evaluable,
+            "eval_source": (settings.backtest.eval_source
+                            if meta.kind == "strategy" else None),
             "base_interval": (settings.backtest.dataset().base_interval
                               if meta.kind == "strategy" else None),
-            "eval_timeframe": (meta.timeframe if meta.kind == "strategy" else None),
+            "eval_timeframe": (strategy_gate._eval_timeframe(meta.timeframe)
+                              if meta.kind == "strategy" else None),
             "mission_id": mission_id, "backlog_id": backlog_id,
         }
         conn.execute("BEGIN IMMEDIATE")
@@ -1183,9 +1188,12 @@ def bless_candidate(
             "candidate_path": f"plugins/_human/{name}",
             "content_hash": content_hash, "artifact_hash": artifact_hash,
             "metrics": metrics, "evaluable": evaluable,
+            "eval_source": (settings.backtest.eval_source
+                            if meta.kind == "strategy" else None),
             "base_interval": (settings.backtest.dataset().base_interval
                               if meta.kind == "strategy" else None),
-            "eval_timeframe": (meta.timeframe if meta.kind == "strategy" else None),
+            "eval_timeframe": (strategy_gate._eval_timeframe(meta.timeframe)
+                              if meta.kind == "strategy" else None),
             "mission_id": None, "backlog_id": None,
         }
 

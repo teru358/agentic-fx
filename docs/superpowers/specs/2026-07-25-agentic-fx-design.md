@@ -326,6 +326,8 @@ TradeIntent は発注前に全ルールを通過しなければならない。1 
 
 - Phase 1 は学習モード (ペーパー取引) のみ (前身の PositionManager 簡素版 + SQLite `orders` 状態機械)。学習モードでは risk gate 通過後に自動でペーパー発注する
 - **ペーパー約定規則**: 現在値のスナップショットではなく **バックテスト基底足の high/low で到達判定**する。同一バーで SL と TP の両方に到達した場合は**保守的に SL 約定**とする。粗い基底での評価は、同一基底足内の順序に依存しない戦略に限る。粗い足では kill switch の反応も最大 1 基底足遅延し得る。
+  - **粗い基底 (5m/15m) で系統的に変わるもの (実測: USDJPY 3 ヶ月、SL30/TP60 で SL+TP を跨ぐ足 5m 0.055% / 15m 0.256%)**: (a) シグナル後の執行は次 tick = 最大 base 幅の遅延 (5m で最大 4 分) (b) 指値約定価格 (`check_limit_fill` の open 改善判定が base 足の open に変わる) (c) SL ギャップ滑り価格 (base 足 open) (d) `entry_same_bar` による TP 確定延期が base 足単位 (e) SL/TP 同時到達 (SL 優先) の頻度 (f) `_mark_to_market` / account snapshot / unrealized drawdown / kill switch / risk gate の HWM 更新が base 幅ごと (谷の取りこぼし = kill switch 遅延) (g) equity curve の点密度低下 (max DD が小さく見える) (h) expiry / day-close の観測格子。(a)〜(d)(h) は 1h/4h 戦略で無視可能だが**ゼロではない**ので、粗い基底の run は「粗い基底で評価した」と記録・表示する
+  - **品質制約 (gate では判定しない、運用上の目安)**: 粗い基底で評価してよい戦略は、SL/TP/指値の間隔と注文寿命が base 幅と **base 足 p99 range (5m: 20.6 pips、15m: 38.7 pips)** に対して十分大きいものに限る。スキャル級 (SL/TP が base 足 p99 range に近い戦略) は不可。**kill switch の判定遅延は最大 base 幅**であることを踏まえて資金保護パラメータを設定すること。
 - MT5 の発注系接続は Phase 3。取引モードへの切替は config ではなく **`main.py mode trading` (人間の明示操作)** でのみ行う
 - **取引モードの手動承認ゲート (Phase 3、初期状態)**: risk gate を通過した open intent は `approval_requests` (kind=live_trade) に登録され、**人間の承認 (Discord ボタン or CLI) が下りるまで発注しない**。expires_at (指値は指値期限、market は 15 分) を過ぎると自動 expired となり発注しない。close / cancel は資金保護方向の操作なので承認不要で即時実行する
 - **承認時の再検証 (TOCTOU 対策)**: 承認までの間に価格・残高・kill switch 状態が変わり得るため、承認 POST は単なる status 更新ではなく、サービス内の排他区間で ①pending・未失効の compare-and-set ②mode / autopilot / kill switch / 口座・ポジション状態の再取得 ③**最新 bid/ask で Risk Gate 全ルール + position sizing を再実行** — を行い、再検証に失敗した場合は `invalidated` として理由を記録する (approved にしない)
@@ -481,6 +483,7 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 - **BacktestRunner** (コア所有の新モジュール) が組み立てる: `ReplayClock` (`Clock` 実装 — dataset の基底足格子に沿って進む) / `bars_fn`・`quote_fn`・`spec_fn` = `ohlcv_history` テーブルからの履歴供給 / intent 生成元 = strategy plugin の閉じた提案
 - DB は **in-memory SQLite に `init_db`** して実行毎に使い捨てる。実 DB (`data/agentic.db`)・実 `data/state/` には一切触れない。risk gate・sizing・約定判定 (`check_limit_fill` / `check_exit`)・executor・scheduler は実運用と同一コードを通す
 - strategy の評価タイミングは「plugin が宣言した timeframe のバー確定毎」。約定・SL/TP 判定は基底足で行う。
+  - **基底足 (`HistoryDataset.base_interval`) を 1m より粗くすると系統的に変わるもの・品質制約は §5「ペーパー約定規則」に列挙済み** (執行遅延・指値/SL 約定価格・entry_same_bar・SL/TP 同時到達・mark-to-market/HWM/equity 点密度・expiry/day-close の観測格子、および SL/TP 距離 vs base 足 p99 range・kill switch 遅延 = 最大 base 幅の品質制約)。改善ループが粗い基底で候補を評価する場合も同じ制約が適用される — 採用ゲート (§8) の承認 payload に `base_interval` を記録し、人間承認時にこの制約への抵触を確認できるようにする。
 - **§5 の起動元検証を無効化しない**: BacktestRunner は strategy 判定毎に in-memory DB へ `loop='trade'` の **synthetic Mission 行を作成**し、intent は通常どおり `origin=SCHEDULER` + `mission_id` 実在 + `loop='trade'` の検証を**同一コードで通す**。executor の検証を注入で置換・緩和する実装は不可 (in-memory DB は実 DB と分離されているため、この synthetic 行が実運用の境界を弱めることはない)
 - **先読みの禁止 (look-ahead bias)**: 最初の意思決定は `ceil(start, eval_tf)+eval_tf` とし、開始境界を跨ぐ部分足を評価しない。確定バーの終了より後の基底足からのみ約定可能とする。
 - **ReplayClock と market_hours の契約**: ReplayClock は **UTC の dataset 基底足格子を履歴バーの有無に関わらず連続に進める**。時間依存判定は進み、価格依存判定はその時刻のバーが存在する tick のみ行う。バー欠損を市場クローズとみなしてはならない。

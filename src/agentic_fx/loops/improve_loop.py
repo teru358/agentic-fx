@@ -42,7 +42,10 @@ from agentic_fx.plugin.gate_pytest import (
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin.noop_gate import count_self_test_functions, find_noop_copy
 from agentic_fx.plugin.sandbox import SandboxError, check_source
-from agentic_fx.plugin.strategy_gate import evaluate_strategy_adoption_gate
+from agentic_fx.plugin.strategy_gate import (
+    _eval_timeframe as _strategy_gate_eval_timeframe,
+    evaluate_strategy_adoption_gate,
+)
 from agentic_fx.runners.base import Mission
 from agentic_fx.tools.plugin_loader import approved_plugins
 from agentic_fx.store import approvals as approvals_store
@@ -1091,9 +1094,12 @@ class ImproveLoop:
             "candidate_origin": candidate_origin,
             "candidate_path": candidate_path,
             "content_hash": content_hash, "artifact_hash": artifact_hash,
+            "eval_source": (self._settings.backtest.eval_source
+                            if kind == "strategy" else None),
             "base_interval": (self._settings.backtest.dataset().base_interval
                               if kind == "strategy" else None),
-            "eval_timeframe": (getattr(gate_metrics.get("meta"), "timeframe", None)
+            "eval_timeframe": (_strategy_gate_eval_timeframe(
+                                   getattr(gate_metrics.get("meta"), "timeframe", None))
                                if kind == "strategy" else None),
             "mission_id": mission_id, "backlog_id": backlog_id,
             "in_sample": gate_metrics.get("in_sample"),

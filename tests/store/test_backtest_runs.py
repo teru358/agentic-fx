@@ -622,3 +622,29 @@ def test_save_harness_run_mission_id_defaults_to_null(tmp_path):
     row = conn.execute(
         "SELECT mission_id FROM backtest_runs WHERE id=?", (run_id,)).fetchone()
     assert row["mission_id"] is None
+
+
+def test_save_harness_run_params_default_is_not_shared_mutable(tmp_path):
+    """M1 (codex 段階2/3 是正 1周目 Minor): `params: dict = {}` の mutable
+    default を排す。既定 (params 未指定) の複数保存間で、内部で使う辞書が
+    同一オブジェクトを共有していないこと (将来 `_insert` 内で正規化処理を
+    足しても run 間で汚染しない不変条件を pin する)。"""
+    conn = _conn(tmp_path)
+    kw = dict(plugin_ref="p.py", content_hash="h", kind="strategy",
+              pair="USDJPY", timeframe="1h", source="dukascopy",
+              base_interval="1m", period=(H, H), metrics={"trades": 0},
+              settings_hash="s", core_commit="c", initial_balance=1e6, now=H)
+    id1 = backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+    id2 = backtest_runs.save_harness_run(conn, scope="in_sample", **kw)
+    row1 = conn.execute("SELECT params_json FROM backtest_runs WHERE id=?",
+                        (id1,)).fetchone()
+    row2 = conn.execute("SELECT params_json FROM backtest_runs WHERE id=?",
+                        (id2,)).fetchone()
+    assert row1["params_json"] == row2["params_json"] == "{}"
+    import inspect
+    for fn in (backtest_runs._insert, backtest_runs.save_harness_run,
+              backtest_runs.save_human_run):
+        default = inspect.signature(fn).parameters["params"].default
+        assert default is None, (
+            f"{fn.__name__}.params の既定値は None であること (mutable "
+            f"default {default!r} が残っている)")

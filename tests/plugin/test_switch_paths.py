@@ -1402,3 +1402,63 @@ def test_bless_candidate_strategy_payload_base_interval_follows_settings(
         (approval_id,)).fetchone()["payload_json"])
     assert payload["base_interval"] == "5m"
     assert payload["eval_timeframe"] == "1h"
+
+
+def test_submit_candidate_strategy_payload_eval_timeframe_maps_1d_to_24h(
+        env, monkeypatch):
+    """写像非対称是正 (codex 段階2/3 是正 1周目): submit_candidate の
+    payload は `meta.timeframe` を生のまま `eval_timeframe` に載せていた
+    (approval.py だけが "1d"→"24h" 写像を適用していた)。写像は
+    `strategy_gate._eval_timeframe` 経由で 4 系統すべてに揃えること。"""
+    root, plugins_dir, conn, settings = env
+    strategy_py = ("def evaluate(df, indicators, signals, params):\n"
+                  "    return {'action': 'hold', 'rationale': 'x'}\n")
+    strategy_cfg = "kind: strategy\ntimeframe: 1d\npairs: [USDJPY]\nexit_mode: levels\n"
+    d = plugins_dir / "_staging" / "1" / "st1d"
+    d.mkdir(parents=True)
+    (d / "plugin.py").write_text(strategy_py)
+    (d / "config.yaml").write_text(strategy_cfg)
+    (d / "test_plugin.py").write_text(TEST_PY_OK)
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
+        _fake_evaluable_gate)
+
+    approval_id = switch.submit_candidate(
+        conn, name="st1d", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    import json
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["payload_json"])
+    assert payload["eval_timeframe"] == "24h"
+
+
+def test_bless_candidate_strategy_payload_eval_timeframe_maps_1d_to_24h(
+        env, monkeypatch):
+    """bless_candidate も同じ写像を適用すること。"""
+    root, plugins_dir, conn, settings = env
+    strategy_py = ("def evaluate(df, indicators, signals, params):\n"
+                  "    return {'action': 'hold', 'rationale': 'x'}\n")
+    strategy_cfg = "kind: strategy\ntimeframe: 1d\npairs: [USDJPY]\nexit_mode: levels\n"
+    d = plugins_dir / "_human" / "st1d"
+    d.mkdir(parents=True)
+    (d / "plugin.py").write_text(strategy_py)
+    (d / "config.yaml").write_text(strategy_cfg)
+    (d / "test_plugin.py").write_text(TEST_PY_OK)
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
+        _fake_evaluable_gate)
+
+    approval_id = switch.bless_candidate(
+        conn, name="st1d", human_dir=d, settings=settings, now=NOW,
+        decided_by="human_cli")
+
+    import json
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["payload_json"])
+    assert payload["eval_timeframe"] == "24h"

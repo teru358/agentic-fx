@@ -13,7 +13,11 @@ from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
 from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin.loader import PluginMeta
 
-# `plugin/approval.py` と同じ timeframe 正規化。
+# timeframe 正規化の単一所有者 (codex 段階2/3 是正 1周目): `plugin/
+# approval.py` はこの辞書を再実装せず `strategy_gate._eval_timeframe` を
+# 直接参照する。switch.py (submit/bless) と improve_loop.py の payload
+# 組み立ても同じ関数を経由すること (4 系統の eval_timeframe 写像を 1 箇所
+# に集約する)。
 _EVAL_TIMEFRAME_OVERRIDE = {"1d": "24h"}
 
 

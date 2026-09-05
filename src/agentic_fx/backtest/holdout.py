@@ -76,7 +76,8 @@ def _normalize_now(now: datetime, base_interval: str = "1m") -> datetime:
     return epoch + ((now_utc - epoch) // width) * width
 
 
-def in_sample_until(now: datetime, months: int) -> datetime:
+def in_sample_until(now: datetime, months: int, *,
+                    base_interval: str = "1m") -> datetime:
     """in-sample 境界算術の単一所有者 (F1, 最終レビュー opus I-1 是正)。
 
     ``holdout_boundary`` は h/m/s/µs を保持したまま暦月を引くだけなので、
@@ -86,8 +87,15 @@ def in_sample_until(now: datetime, months: int) -> datetime:
     だったため不一致が生じていた)。in-sample 境界を必要とする全ての
     呼び出し元は本関数だけを経由すること — ``holdout_boundary`` を直接
     呼ばない。
+
+    ``base_interval`` (C1, codex 段階2/3 是正 1周目): 分格子への切り捨ては
+    dataset の基底足格子で行う (既定は後方互換の "1m")。5m/15m 基底では
+    replay (``run_in_sample``/``run_holdout_gate``、``_normalize_now``
+    経由で base 格子に丸める) と同じ格子で丸めないと、5m 格子外の ``now``
+    で分析境界が replay の in-sample 境界からずれる (最大 base 幅弱)。
+    呼び出し元は dataset 確定後に ``dataset.base_interval`` を渡すこと。
     """
-    return holdout_boundary(_normalize_now(now), months)
+    return holdout_boundary(_normalize_now(now, base_interval), months)
 
 
 def _oldest_bar_start(history_conn: sqlite3.Connection, symbol: str,

@@ -84,8 +84,9 @@ def _insert(conn: sqlite3.Connection, *, scope: str, issued_by: str,
             metrics: dict, settings_hash: str, core_commit: str,
             initial_balance: float, now: datetime, variant: str = "candidate",
             ref_plugin_ref: str | None = None, ref_content_hash: str | None = None,
-            mission_id: int | None = None, params: dict = {},
+            mission_id: int | None = None, params: dict | None = None,
             commit: bool = True) -> int:
+    params = dict(params or {})
     start, end = period
     start_utc = _require_utc(start, "period[0]")
     end_utc = _require_utc(end, "period[1]")
@@ -120,7 +121,7 @@ def save_harness_run(conn: sqlite3.Connection, *, scope: str, plugin_ref: str,
                       variant: str = "candidate",
                       ref_plugin_ref: str | None = None,
                       ref_content_hash: str | None = None,
-                      mission_id: int | None = None, params: dict = {},
+                      mission_id: int | None = None, params: dict | None = None,
                       commit: bool = True) -> int:
     """ハーネス発行 (issued_by='harness' 固定)。scope は in_sample/holdout_gate のみ。
 
@@ -146,7 +147,8 @@ def save_human_run(conn: sqlite3.Connection, *, plugin_ref: str,
                     content_hash: str, kind: str, pair: str, timeframe: str,
                     source: str, base_interval: str, period: tuple[datetime, datetime],
                     metrics: dict, settings_hash: str, core_commit: str,
-                    initial_balance: float, now: datetime, params: dict = {}) -> int:
+                    initial_balance: float, now: datetime,
+                    params: dict | None = None) -> int:
     """CLI 用の人間発行 (scope='human_custom' / issued_by='human_cli' 固定)。
 
     scope 引数を持たない — in_sample を呼び出し引数から偽装できない

@@ -25,6 +25,10 @@ content_hash` と検証完了時点のファイル内容が一致することを
 の `eval_source` は承認バックテストが使う `settings.backtest.eval_source`、
 `live_source` は `settings.plugin.producer_source` (本番 producer が使う
 source) — 両者が異なり得ることを承認レビュー時に人間が見えるようにする。
+**`eval_source` は strategy kind のみ実値 (indicator/signal は null —
+I2 是正、codex 段階2/3 是正 1周目)**: `base_interval`/`eval_timeframe` と
+同じ規約 — indicator/signal はバックテストを一切実行しないため、
+「使ってもいない source」を見せない。
 
 **evaluable の意味**: indicator/signal は `True` 固定 (schema 安定のため
 キー自体は必ず含める — 精度評価は `signal_eval` 側の precision/recall で
@@ -81,11 +85,11 @@ RunInSampleFn = Callable[..., dict[str, Any]]
 _NOTE = "バックテスト成績は実運用成績の予測値ではない (足切り専用)"
 # D5: plugin 宣言 timeframe → run_in_sample に渡す eval_timeframe。"1d" だけ
 # "24h" へ写像する (runner.parse_timeframe が "1d" を受理しないため)。
-_EVAL_TIMEFRAME_OVERRIDE = {"1d": "24h"}
-
-
-def _eval_timeframe(meta_timeframe: str) -> str:
-    return _EVAL_TIMEFRAME_OVERRIDE.get(meta_timeframe, meta_timeframe)
+# 写像の単一所有者は strategy_gate._eval_timeframe (codex 段階2/3 是正
+# 1周目 — approval.py と strategy_gate.py が同じ辞書を二重実装していた。
+# switch.py (submit/bless) と improve_loop.py の payload 組み立てが写像を
+# 適用しておらず、4 系統が非対称になっていた是正の一環)。
+_eval_timeframe = strategy_gate._eval_timeframe
 
 
 def assert_max_bars_within_limit(meta: PluginMeta, *, settings: "Settings") -> None:
@@ -311,7 +315,13 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
                    "summary": _pytest_summary(pytest_result.stdout_tail)},
         "metrics": metrics,
         "evaluable": evaluable,
-        "eval_source": settings.backtest.eval_source,
+        # I2 (codex 段階2/3 是正 1周目): eval_source は base_interval/
+        # eval_timeframe と同じ規約 (strategy のみ実値、indicator/signal は
+        # null) — 旧実装は kind に依らず実値を露出しており、バックテストを
+        # 一切実行しない indicator/signal に「使ってもいない source」を
+        # 見せていた (4 系統の共通契約 — I2 統合テストで pin)。
+        "eval_source": (settings.backtest.eval_source
+                        if meta.kind == "strategy" else None),
         "base_interval": (settings.backtest.dataset().base_interval
                           if meta.kind == "strategy" else None),
         "eval_timeframe": (_eval_timeframe(meta.timeframe)
