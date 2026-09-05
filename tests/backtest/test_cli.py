@@ -194,6 +194,47 @@ def test_cli_backtest_run_records_human_custom_scope(tmp_path, monkeypatch):
     assert kwargs["initial_balance"] == settings.backtest.initial_balance
 
 
+def test_cli_backtest_run_passes_base_interval_arg_to_save_human_run(
+        tmp_path, monkeypatch):
+    """段階 2 レビュー是正 c4b-2: `backtest run` (`_backtest_run_proposal`)
+    の `save_human_run` へ渡す `base_interval` が `--base-interval` (既定
+    "1m" とは異なる "5m") を正しく反映することをピンする — 既定値のみの
+    既存テストでは "1m" 固定への退行を検出できない。
+    """
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    proposals = tmp_path / "p.jsonl"
+    proposals.write_text("", encoding="utf-8")
+    from agentic_fx.store import ohlcv as ohlcv_store
+    seed_conn = connect(tmp_path / "data" / "agentic.db")
+    init_db(seed_conn)
+    ohlcv_store.import_history_bars(
+        seed_conn, [("USDJPY", "5m", "2026-07-01T00:00:00+00:00",
+                    148.0, 148.2, 147.9, 148.1, 10.0, 0.01)],
+        source="mt5")
+    seed_conn.close()
+    fake_result = BacktestResult(
+        orders=[], equity_curve=[("2026-07-01T00:00:00+00:00", 1_000_000.0)],
+        start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        source="mt5", fallback_spread_used=False)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay") as rr, \
+         patch("agentic_fx.backtest.cli.backtest_runs") as br:
+        rr.return_value = fake_result
+        br.save_human_run.return_value = 1
+        br.settings_snapshot_hash.side_effect = \
+            backtest_runs_real.settings_snapshot_hash
+        br.core_commit.return_value = "deadbeef"
+        rc = main(["backtest", "run", "--symbol", "USDJPY",
+                   "--source", "mt5", "--base-interval", "5m",
+                   "--from", "2026-07-01", "--to", "2026-07-02",
+                   "--proposal-file", str(proposals)])
+    assert rc == 0
+    _, kwargs = br.save_human_run.call_args
+    assert kwargs["base_interval"] == "5m"
+
+
 def test_cli_backtest_run_rejects_empty_history(tmp_path, monkeypatch):
     """F4 (最終レビュー opus I-4): 対象 source/期間に 1m 履歴が 0 行なら
     run_replay を呼ばず rc=1 (--source のタイプミス等が正常系と見分けの

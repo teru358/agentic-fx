@@ -699,6 +699,20 @@ def test_kill_switch_event_hwm_non_positive_yields_null_drawdown(tmp_path):
     assert event["drawdown_pct"] is None
 
 
+def test_kill_switch_event_equity_above_hwm_clamps_drawdown_to_zero(tmp_path):
+    """段階 2 レビュー是正 c2a-09: `max(0.0, …)` の下限。equity > hwm (新高値
+    更新直後・浮動小数の丸め等) で生の計算式は負値になるが、
+    drawdown_pct は 0.0 にクランプされる (負の drawdown は意味を持たない)。
+    """
+    from agentic_fx.backtest.runner import _kill_switch_event
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    ts = WED.isoformat()
+    _snap(conn, ts=ts, equity=100_500.0, hwm=100_000.0)  # equity > hwm
+    event = _kill_switch_event(conn, {"ts": ts, "text": "latched"}, "latched")
+    assert event["drawdown_pct"] == 0.0
+
+
 def test_kill_switch_event_reset_reports_released_kind(tmp_path):
     """StateStore 由来の reset 遷移 (`_RecordingStateStore`) は "released" と
     して観測される — `run_replay` の合流規則 (kind に reset を含めば

@@ -383,6 +383,41 @@ def test_run_in_sample_record_fn_sink_does_not_write_backtest_runs(
     assert sunk[0]["scope"] == "in_sample"
 
 
+def test_run_scope_save_kwargs_base_interval_and_params_via_record_fn(
+        tmp_path, monkeypatch):
+    """段階 2 レビュー是正 c2b-1: `_run_scope` が組み立てる save_kwargs の
+    `base_interval` (dataset.base_interval そのもの) と `params`
+    (`raw_grid_bars_expected`/`raw_grid_bars_present`) の**値**を
+    record_fn 経由で直接ピンする。dataset に "5m" を使い、"1m" 固定への
+    退行や params キー抜けを検知する。`run_holdout_gate` (period =
+    [boundary, now]) を使い、期間端点を自分で完全制御する。
+    """
+    from agentic_fx.backtest.dataset import HistoryDataset
+    hist = _conn(tmp_path)
+    now = WED
+    boundary = holdout.in_sample_until(now, SETTINGS.backtest.holdout_months)
+    period_start, period_end = boundary, now
+    rows_5m = [(r[0], "5m", r[2], r[3], r[4], r[5], r[6], r[7], r[8])
+              for r in [_row_at(period_start + timedelta(minutes=5 * i),
+                                o=100.0, h=100.5, l=99.5, c=100.2)
+                       for i in range(3)]]
+    ohlcv.import_history_bars(hist, rows_5m, source="dukascopy")
+    monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay([]))
+    saved = []
+    run_holdout_gate(SETTINGS, history_conn=hist, symbol="USDJPY",
+                     dataset=HistoryDataset("dukascopy", "5m"),
+                     intent_source=lambda b: None, eval_timeframe="1h",
+                     plugin_ref="p", content_hash="h", kind="strategy",
+                     now=now, record_fn=saved.append)
+    kwargs = saved[0]
+    assert kwargs["base_interval"] == "5m"
+    expected = int((period_end - period_start) // timedelta(minutes=5))
+    assert kwargs["params"] == {
+        "raw_grid_bars_expected": expected,
+        "raw_grid_bars_present": 3}
+
+
 def test_run_in_sample_without_record_fn_keeps_existing_behavior(
         tmp_path, monkeypatch):
     """既定 (record_fn なし) は従来どおり save_harness_run で永続化する。"""

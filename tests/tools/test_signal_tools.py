@@ -96,6 +96,34 @@ def test_strategy_row_gets_in_sample_metrics_and_annotation(tmp_path):
     assert row["note"] == "バックテスト成績は実運用成績の予測値ではない"
 
 
+def test_strategy_row_uses_dataset_derived_source_and_base_interval(
+        tmp_path):
+    """段階 2 レビュー是正 c4b-1: `latest_in_sample_metrics` へ渡す
+    `source`/`base_interval` が `settings.backtest.dataset()` 由来 (=
+    settings.backtest.eval_source/base_interval) であることをピンする。
+    既定 ("dukascopy"/"1m") とは異なる ("mt5"/"5m") 設定で backtest_runs 行
+    を保存し、それが取れることを確認する — ハードコード ("dukascopy"/"1m"
+    固定) への退行ならこの行は見つからず metrics は None になる。
+    """
+    conn = _conn(tmp_path)
+    settings_5m = SETTINGS.model_copy(deep=True)
+    settings_5m.backtest.eval_source = "mt5"
+    settings_5m.backtest.base_interval = "5m"
+    sid = _add_signal(conn, hours_ago=1, kind="strategy",
+                      content_hash="strat_5m")
+    assert sid is not None
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="p.py", content_hash="strat_5m",
+        kind="strategy", pair="USDJPY", timeframe="1h", source="mt5",
+        base_interval="5m",
+        period=(NOW, NOW), metrics={"trades": 40, "pf": 1.3},
+        settings_hash="s", core_commit="c", initial_balance=1e6, now=NOW)
+    tool = _tool(conn, settings=settings_5m)
+    out = tool.func(pair="USDJPY")
+    assert len(out) == 1
+    assert out[0]["in_sample_metrics"] == {"trades": 40, "pf": 1.3}
+
+
 def test_strategy_row_without_backtest_run_gets_none_metrics_but_note(tmp_path):
     """未計測 (backtest_runs に対応行なし) でも note は必ず付き、
     in_sample_metrics は明示的に None。"""

@@ -218,6 +218,32 @@ def test_5m_dataset_uses_5m_base_interval_for_load_resampled_frame(tmp_path):
     assert session.calls, "5m dataset の base_interval が伝播していれば発火するはず"
 
 
+def test_build_intent_source_uses_dataset_source_not_settings_eval_source(
+        tmp_path):
+    """段階 2 レビュー是正 C1-5: `build_intent_source` が
+    `load_resampled_frame` へ渡す `source` が `dataset.source` ではなく
+    `settings.backtest.eval_source` (既定 "dukascopy") へ退行していないか
+    を直接検証する。history は `dataset.source="mt5"` でのみ seed し
+    (settings.backtest.eval_source の "dukascopy" 側は 0 件)、
+    settings.eval_source 固定なら df が空になって発火しないところを、
+    正しく dataset.source="mt5" を使えば発火することをピンする。
+    """
+    assert SETTINGS.backtest.eval_source != "mt5"
+    conn = _conn(tmp_path)
+    rows = [_row_at(H + timedelta(minutes=i), o=100.0, h=100.0, l=100.0,
+                    c=100.0) for i in range(60)]
+    ohlcv_store.import_history_bars(conn, rows, source="mt5")
+    meta = _meta(timeframe="1h")
+    session = _FakeSession()
+    from agentic_fx.backtest.dataset import HistoryDataset
+    src = strategy_adapter.build_intent_source(
+        meta, conn=conn, pair="USDJPY",
+        dataset=HistoryDataset("mt5", "1m"), settings=SETTINGS,
+        session=session)
+    src(_bar(H + timedelta(hours=1)))
+    assert session.calls, "dataset.source が伝播していれば発火するはず"
+
+
 # --- ③ open → intent dict 写像 ---------------------------------------------
 
 def test_open_market_without_take_profit_omits_take_profit_key(tmp_path):

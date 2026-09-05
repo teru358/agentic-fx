@@ -426,6 +426,52 @@ def test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
     assert payload["eval_timeframe"] == "1h"
 
 
+def test_validate_strategy_uses_single_dataset_object_no_split_brain(
+        tmp_path, settings):
+    """段階 2 レビュー是正 c4a-1: `_validate_strategy` は
+    `settings.backtest.dataset()` を **1 回だけ**呼び、その同一オブジェクト
+    (`is`) を `build_intent_source` と `run_in_sample` の両方へ渡す —
+    別々に呼んで別インスタンスを渡す split-brain (アダプタと実行で異なる
+    dataset を見る) を防ぐ。
+    """
+    from agentic_fx.config import BacktestSettings
+
+    d = _write_plugin(tmp_path, "strat_split", kind="strategy",
+                      plugin_py=STRATEGY_PY,
+                      config_yaml="kind: strategy\ntimeframe: 1h\n"
+                                 "pairs: [USDJPY]\nexit_mode: levels\n"
+                                 "max_bars: 200\n")
+    meta = _strategy_meta(d, name="strat_split", pairs=("USDJPY",))
+    conn = _conn(tmp_path)
+
+    call_count = {"n": 0}
+    real_dataset = BacktestSettings.dataset
+
+    def counting_dataset(self):
+        call_count["n"] += 1
+        return real_dataset(self)
+
+    seen_adapter_dataset = {}
+    seen_run_dataset = {}
+
+    def fake_build_intent_source(meta_arg, *, conn, pair, dataset, settings):
+        seen_adapter_dataset["obj"] = dataset
+        return _FakeIntentSource(pair)
+
+    def fake_run_in_sample(settings_arg, *, dataset, **kwargs):
+        seen_run_dataset["obj"] = dataset
+        return {"trades": 0}
+
+    with patch.object(BacktestSettings, "dataset", counting_dataset), \
+         patch("agentic_fx.plugin.approval.strategy_adapter.build_intent_source",
+               side_effect=fake_build_intent_source):
+        approval._validate_strategy(conn, meta, settings=settings, now=NOW,
+                                    run_in_sample_fn=fake_run_in_sample)
+
+    assert call_count["n"] == 1
+    assert seen_adapter_dataset["obj"] is seen_run_dataset["obj"]
+
+
 def test_strategy_sandbox_error_from_run_in_sample_becomes_value_error(
         tmp_path, settings):
     """③ kind 別検証段階 (strategy の run_in_sample) で SandboxError が
@@ -472,6 +518,37 @@ def test_strategy_eval_timeframe_maps_1d_to_24h(tmp_path, settings):
                            run_in_sample_fn=fake_run_in_sample)
     assert len(calls) == 1
     assert calls[0]["eval_timeframe"] == "24h"
+
+
+def test_strategy_payload_eval_timeframe_maps_1d_to_24h(tmp_path, settings):
+    """段階 2 レビュー是正 F1: approval payload (submit 系統) の
+    `eval_timeframe` も "1d"→"24h" 写像を適用する (既存 pin
+    `test_strategy_eval_timeframe_maps_1d_to_24h` は run_in_sample へ渡す
+    kwarg だけを見ており、`approvals.create` に保存される payload 自体は
+    別に構築される (approval.py:317) ため未カバーだった)。
+    """
+    d = _write_plugin(tmp_path, "strat_1d_payload", kind="strategy",
+                      plugin_py=STRATEGY_PY,
+                      config_yaml="kind: strategy\ntimeframe: 1d\n"
+                                 "pairs: [USDJPY]\nexit_mode: levels\n"
+                                 "max_bars: 200\n")
+    meta = _strategy_meta(d, name="strat_1d_payload", timeframe="1d")
+    conn = _conn(tmp_path)
+
+    def fake_run_in_sample(settings_arg, **kwargs):
+        return {"trades": 0, "pf": None, "win_rate": None, "avg_r": None,
+                "max_drawdown": 0.0, "total_pnl": 0.0, "evaluable": False,
+                "fallback_spread_used": False}
+
+    approval_id = approval.submit_plugin(
+        conn, meta, settings=settings, now=NOW,
+        pytest_runner=_ok_pytest_runner, run_in_sample_fn=fake_run_in_sample)
+
+    import json
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["payload_json"])
+    assert payload["eval_timeframe"] == "24h"
 
 
 # --- ④ pairs が settings.pairs 外 ValueError ----------------------------

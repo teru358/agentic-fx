@@ -19,3 +19,13 @@ def test_history_dataset_validates_and_exposes_immutable_metadata():
 def test_history_dataset_rejects_unknown_source_or_interval(source, interval):
     with pytest.raises(DatasetError):
         HistoryDataset(source, interval)
+
+
+def test_history_dataset_15m_width_and_as_dict():
+    """段階 2 レビュー是正 C1-1: `_WIDTHS` から "15m" が抜けると
+    ``HistoryDataset("mt5", "15m")`` 自体が構築できなくなる (許容一覧の
+    縮退) — 15m を明示的に構築できること・width・as_dict をピンする。
+    """
+    dataset = HistoryDataset("mt5", "15m")
+    assert dataset.width == timedelta(minutes=15)
+    assert dataset.as_dict() == {"source": "mt5", "base_interval": "15m"}

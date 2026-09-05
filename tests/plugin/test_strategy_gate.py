@@ -265,6 +265,49 @@ def test_eval_source_follows_backtest_settings(
         ("intent", eval_source), ("holdout", eval_source)]
 
 
+def test_evaluate_strategy_adoption_gate_uses_single_dataset_object(
+        monkeypatch, conn_with_approved_strategy):
+    """段階 2 レビュー是正 c4a-2: `evaluate_strategy_adoption_gate` は
+    `settings.backtest.dataset()` を **1 回だけ**呼び、その同一オブジェクト
+    (`is`) を in-sample ループ (build_intent_source/run_in_sample) と
+    holdout ループ (build_intent_source/run_holdout_gate) の全呼び出しへ
+    渡す — split-brain (ループごとに異なる dataset を見る) を防ぐ。
+    """
+    settings = MagicMock()
+    settings.backtest.eval_source = "dukascopy"
+    settings.backtest.dataset.return_value = HistoryDataset("dukascopy", "1m")
+    seen_datasets = []
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.strategy_adapter.build_intent_source",
+        lambda meta, **kw: (seen_datasets.append(kw["dataset"])
+                            or MagicMock(close=lambda: None)))
+
+    def _fake_run_in_sample(*a, **kw):
+        seen_datasets.append(kw["dataset"])
+        return {"trades": 30, "pf": 1.2}
+
+    def _fake_run_holdout(*a, **kw):
+        seen_datasets.append(kw["dataset"])
+        return {"trades": 30, "pf": 1.1}
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        _fake_run_in_sample)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        _fake_run_holdout)
+
+    evaluate_strategy_adoption_gate(
+        conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        timeframe="1h", content_hash="h6", now=datetime(2026, 8, 22),
+        settings=settings, meta=_meta(content_hash="h6"))
+
+    assert settings.backtest.dataset.call_count == 1
+    assert len(seen_datasets) == 4
+    assert all(d is seen_datasets[0] for d in seen_datasets)
+
+
 # round2 O1/O2/O3 是正 (2026-08-29、verified-round2.md、pin のみ — 実装は
 # 触らない): `record_fn=None` の即時 save 経路 (`switch._run_full_gate`
 # = P1 submit / P3 bless の本番経路。改善ループ側は `record_fn=gate_rows.

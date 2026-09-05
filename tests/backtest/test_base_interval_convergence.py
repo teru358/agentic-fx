@@ -157,9 +157,25 @@ def _one_shot_source():
     return source
 
 
-ORDER_COLUMNS = ("status", "entry_type", "direction", "avg_fill_price",
-                 "filled_at", "closed_at", "close_reason", "realized_pnl",
-                 "stop_loss", "take_profit", "quantity")
+# 段階 2/3 レビュー是正 B: 11 列の許可リストを廃し、`orders` の全列を比較
+# する。除外は以下の 3 列のみ (実測で確認済み — `probe_b.py` 相当の手動
+# 検証で、他の全列は 1m/5m 両基底で厳密一致することを確認した):
+#   - client_order_id: `f"afx-{intent_id}-{now.timestamp():.0f}"` — now は
+#     注文の "submitting" 遷移時刻。決定 (closed_bar) は同一 (13:00) でも、
+#     執行は次 tick (1m なら+1分、5m なら+5分) まで遅延する設計 (v2 §1(a)
+#     「シグナル後の執行は次 tick = 最大 base 幅の遅延」) のため、この
+#     "now" 自体が base 幅ぶんずれる — 非決定性ではなく base 幅に比例する
+#     設計上の実行遅延で、意図的に非収束。
+#   - created_at: 上と同じ理由 (注文行の INSERT 時刻 = 上記の "now" その
+#     もの)。fresh DB + replay clock で決定的だが、1m/5m で値そのものが
+#     異なることが設計上正しい。
+#   - expires_at: `created_at + expires_in` (今回のシナリオは "6h") から
+#     計算されるため、created_at のずれがそのまま伝播する。
+# 上記いずれも「同じ入力に対して毎回同じ値になる」という意味では決定的
+# だが、1m 基底と 5m 基底の間では値そのものが一致しない (base 幅に比例する
+# 実行遅延) — pytest.approx や等値では吸収できないため列ごと除外する。
+_NON_COMPARABLE_ORDER_COLUMNS = frozenset(
+    {"client_order_id", "created_at", "expires_at"})
 
 
 def test_replay_convergence_1m_vs_5m_orders_equity_metrics_identical():
@@ -187,7 +203,10 @@ def test_replay_convergence_1m_vs_5m_orders_equity_metrics_identical():
     assert res1.first_decision_at == res5.first_decision_at == WED + timedelta(hours=1)
     assert len(res1.orders) == len(res5.orders) == 1
     o1, o5 = res1.orders[0], res5.orders[0]
-    for col in ORDER_COLUMNS:
+    all_cols = sorted(set(o1) | set(o5))
+    compared = [c for c in all_cols if c not in _NON_COMPARABLE_ORDER_COLUMNS]
+    assert compared  # 除外リストで空にならないこと自体を確認
+    for col in compared:
         assert o1[col] == o5[col], f"{col}: {o1[col]!r} != {o5[col]!r}"
     assert o1["status"] == "closed" and o1["close_reason"] == "tp"
 
@@ -350,6 +369,320 @@ def test_barfeed_rejects_misaligned_5m_row():
     with pytest.raises(ValueError):
         BarFeed(conn, "USDJPY", dataset=HistoryDataset("mt5", "5m"),
                start=WED, end=WED + timedelta(minutes=10))
+
+
+# --- (c') 非収束ケース追加 7 本 (design-v2.md §7 / design-v3.md A9) -------
+# 既存 4 ケース (limit 途中到達・SL gap・欠損 1m vs native 5m・非整列
+# 拒否) の作り方 (`_run_both`/`_row`/`_aggregate_5m` を使い、1m と 5m の
+# 判定タイミング/優先順位の違いが観測できる価格系列を組む) を踏襲する。
+
+
+def test_nonconvergence_entry_same_bar_defers_tp_confirmation_on_5m():
+    """① entry 後同一 5m 足で TP のみ到達 — 5m は `entry_same_bar` 抑制で
+    その足では TP を確定させず、以降 TP に再到達しなければ持ち越しのまま
+    残る。1m は fill した 1m 足と TP 到達 1m 足が別々なので同一バー抑制の
+    対象にならず、次の完成 1m 足で普通に TP 確定する。
+    """
+    rows = []
+    t = WED
+    for i in range(80):  # 12:00-13:19 静穏 (決定は 13:00, 執行遅延を待つ)
+        rows.append(_row(t + timedelta(minutes=i), 148.5, 148.6, 148.4, 148.5))
+    # 13:20: 指値 148.20 到達 (bucket [13:20,13:25) 先頭分)
+    rows.append(_row(t + timedelta(minutes=80), 148.3, 148.35, 148.10, 148.15))
+    rows.append(_row(t + timedelta(minutes=81), 148.5, 148.6, 148.4, 148.5))
+    # 13:22: TP 149.00 到達 (同じ bucket [13:20,13:25) 内、fill とは別の 1m 足)
+    rows.append(_row(t + timedelta(minutes=82), 148.9, 149.10, 148.85, 149.05))
+    for i in range(83, 120):  # 13:23-13:59 静穏 (以降 TP 再到達なし)
+        rows.append(_row(t + timedelta(minutes=i), 148.5, 148.6, 148.4, 148.5))
+    res1, res5 = _run_both(rows)
+    assert res1.orders and res5.orders
+    o1, o5 = res1.orders[0], res5.orders[0]
+    # 1m: 別々の 1m 足なので entry_same_bar は掛からず TP が確定する。
+    assert o1["status"] == "closed"
+    assert o1["close_reason"] == "tp"
+    # 5m: fill も TP 到達も同一 5m バケット内 → entry_same_bar=True で
+    # その足では確定させない。以降 TP に再到達しないため持ち越しのまま
+    # run 終了まで残る (非収束)。
+    assert o5["status"] == "open"
+    assert o5["close_reason"] is None
+
+
+def test_nonconvergence_sl_tp_same_bucket_5m_prioritizes_sl_over_first_touch():
+    """② SL・TP 同時到達 — 1m は TP が先に (別々の 1m 足で) 単独到達する
+    ので TP で確定するが、5m は同じ 5m バケットに TP 到達分と SL 到達分の
+    両方が入り込むため、`check_exit` の SL 優先規則により SL で確定する
+    (「先に触れた方」を判定できない粗い基底の帰結)。
+    """
+    rows = []
+    t = WED
+    for i in range(69):  # 12:00-13:08 静穏
+        rows.append(_row(t + timedelta(minutes=i), 148.5, 148.6, 148.4, 148.5))
+    # 13:09: 指値 148.20 到達・約定 (bucket [13:05,13:10) 末尾分)
+    rows.append(_row(t + timedelta(minutes=69), 148.3, 148.35, 148.10, 148.15))
+    for i in range(70, 100):  # 13:10-13:39 静穏 (約定確定を待つ)
+        rows.append(_row(t + timedelta(minutes=i), 148.5, 148.6, 148.4, 148.5))
+    # bucket [13:40,13:45): 13:40 に TP のみ到達、13:41 に SL のみ到達
+    rows.append(_row(t + timedelta(minutes=100), 148.9, 149.10, 148.85, 149.05))
+    rows.append(_row(t + timedelta(minutes=101), 147.90, 147.95, 147.60, 147.70))
+    for i in range(102, 120):  # 13:42-13:59 静穏
+        rows.append(_row(t + timedelta(minutes=i), 148.5, 148.6, 148.4, 148.5))
+    res1, res5 = _run_both(rows, end_hours=3)
+    assert res1.orders and res5.orders
+    o1 = [o for o in res1.orders if o["status"] == "closed"][0]
+    o5 = [o for o in res5.orders if o["status"] == "closed"][0]
+    # 1m: 13:40 の TP のみ単独到達 → 次の完成 1m 足でまず TP 確定
+    # (13:41 の SL 到達より前に既にクローズ済み)。
+    assert o1["close_reason"] == "tp"
+    # 5m: bucket [13:40,13:45) に TP・SL 両方の到達分が入り、SL 優先規則
+    # により SL で確定する。
+    assert o5["close_reason"] == "sl"
+    assert o1["closed_at"] != o5["closed_at"]
+
+
+def test_nonconvergence_short_expiry_1_to_4_minutes_only_1m_fills():
+    """④ expiry が 1〜4 分内 — `_expire_limits` は `_process_limit_fills`
+    より**先に**評価される (scheduler.tick の内部順序)。expires_in を base
+    幅より短く (3 分) 取ると、5m 基底は「次に評価される tick (= 次の 5m
+    格子点)」の時点で既に期限切れになっており、一度も約定機会を得ないまま
+    EXPIRED になる。1m 基底は毎分評価されるため、期限内に価格が指値へ
+    到達すれば約定できる。
+    """
+    short_limit = dict(OPEN_LIMIT)
+    short_limit["expires_in"] = "0.05h"  # 3 分
+
+    def _short_source():
+        fired: list = []
+
+        def source(bar):
+            if not fired:
+                fired.append(bar.ts)
+                return dict(short_limit)
+            return None
+        return source
+
+    rows = []
+    t = WED
+    for i in range(60):  # 12:00-12:59 静穏
+        rows.append(_row(t + timedelta(minutes=i), 148.5, 148.6, 148.4, 148.5))
+    rows.append(_row(t + timedelta(hours=1), 148.5, 148.6, 148.4, 148.5))  # 13:00
+    # 13:01: 指値 148.20 到達 (1m 側の作成直後の 1 分足)
+    rows.append(_row(t + timedelta(hours=1, minutes=1), 148.3, 148.35,
+                     148.10, 148.15))
+    for i in range(2, 60):  # 13:02-13:59 静穏
+        rows.append(_row(t + timedelta(hours=1, minutes=i),
+                         148.5, 148.6, 148.4, 148.5))
+    res1, res5 = _run_both(rows, source_factory=_short_source)
+    assert res1.orders and res5.orders
+    o1, o5 = res1.orders[0], res5.orders[0]
+    # 1m: 作成 (13:01) 直後の完成 1m 足 (13:01) で指値到達 → 13:02 に約定。
+    # 期限 (13:04) より前に約定できている。
+    assert o1["status"] == "open"
+    assert o1["filled_at"] is not None
+    # 5m: 作成 (13:05) → 期限 (13:08) だが、次に評価される 5m 格子点は
+    # 13:10 (bucket [13:05,13:10) の完成時) — その時点で既に期限切れの
+    # ため、一度も約定機会を得ないまま EXPIRED になる。
+    assert o5["status"] == "expired"
+    assert o5["filled_at"] is None
+
+
+def test_nonconvergence_day_close_boundary_execution_delay_shifts_rollover_day():
+    """⑤ day close 直前 (expiry とは別経路) — market 注文の約定は「決定
+    (closed_bar 確定) の次 tick」まで遅延する (base 幅ぶん)。この執行遅延
+    が NY 17:00 (=このケースの UTC 21:00、夏時間) の日次ロールオーバー
+    境界を跨ぐと、`_force_close_day` が使う `anchor` (filled_at) の
+    ロールオーバー期限 (`market_hours.next_rollover`) が丸ごと 1 日ずれる。
+    決定は共通 (5 分格子の同一バケット) だが、1m 基底は 1 分遅れで
+    20:56 に約定し即日 21:00 の期限にかかって直後に強制決済されるのに
+    対し、5m 基底は 5 分遅れでちょうど 21:00 (NY 17:00) に約定し、
+    ``next_rollover`` の `>=` 判定により期限が**翌日**へ送られ、同じ
+    シミュレーション窓内では強制決済されずに持ち越される。
+    """
+    open_market = {"action": "open", "pair": "USDJPY", "direction": "long",
+                  "entry_type": "market", "horizon": "day",
+                  "stop_loss": 148.0, "take_profit": 149.5,
+                  "reasoning": "day-close-boundary"}
+    # 決定バケット = [20:50,20:55) の完成 (closed_bar.ts=20:50) — 執行は
+    # 1m 基底で 20:56 (1 分遅延)、5m 基底でちょうど 21:00 (5 分遅延) に
+    # なるよう、決定の 1 tick 後が NY 17:00 (UTC 21:00) を跨ぐ位置を選ぶ。
+    target_ts = WED + timedelta(hours=8, minutes=50)
+
+    def _one_shot_at(target):
+        fired: list = []
+
+        def source(bar):
+            if not fired and bar.ts == target:
+                fired.append(bar.ts)
+                return dict(open_market)
+            return None
+        return source
+
+    rows = []
+    t = WED
+    for i in range(9 * 60 + 30):  # 12:00 〜 21:30 静穏
+        rows.append(_row(t + timedelta(minutes=i), 148.5, 148.6, 148.4, 148.5))
+    rows_5m = _aggregate_5m(rows)
+    end = WED + timedelta(hours=9, minutes=30)
+
+    conn1 = _conn()
+    ohlcv.import_history_bars(conn1, rows, source="dukascopy")
+    res1 = run_replay(SETTINGS, symbol="USDJPY",
+                      dataset=HistoryDataset("dukascopy", "1m"),
+                      start=WED, end=end,
+                      intent_source=_one_shot_at(target_ts),
+                      eval_timeframe="5m", history_conn=conn1)
+
+    conn5 = _conn()
+    ohlcv.import_history_bars(conn5, rows_5m, source="mt5")
+    res5 = run_replay(SETTINGS, symbol="USDJPY",
+                      dataset=HistoryDataset("mt5", "5m"),
+                      start=WED, end=end,
+                      intent_source=_one_shot_at(target_ts),
+                      eval_timeframe="5m", history_conn=conn5)
+
+    assert res1.orders and res5.orders
+    o1, o5 = res1.orders[0], res5.orders[0]
+    # 1m: 20:56 約定 → ロールオーバー期限は同日 21:00 → 直後の tick
+    # (20:57 以降 バッファ 5 分に入る 20:55 以降なので即座) で強制決済。
+    assert o1["filled_at"].startswith("2026-07-22T20:56")
+    assert o1["status"] == "closed"
+    assert o1["close_reason"] == "day_rollover"
+    # 5m: ちょうど 21:00 (NY 17:00) に約定 → next_rollover の `>=` 判定で
+    # 期限が翌日へ送られ、同じシミュレーション窓 (21:30 まで) では
+    # 強制決済されずに持ち越される (非収束)。
+    assert o5["filled_at"].startswith("2026-07-22T21:00")
+    assert o5["status"] == "open"
+    assert o5["close_reason"] is None
+
+
+def test_nonconvergence_5m_bucket_hides_intrabar_dd_delays_kill_switch():
+    """③ 5m 内の unrealized DD で kill switch が遅れる — SL には触れない
+    (実現損益は変えない) 程度の一時的な値洗い含み損が、1m 基底ではその分の
+    close で即座に mark-to-market へ反映されるが、5m 基底では同じ 5 分
+    バケットの**最終分**が回復済みの値なので `_aggregate_bucket` の
+    ``close=bars[-1].close`` により一時的な含み損の谷が隠れる (v2 §1(f))。
+    2 件目の建玉提案を、この谷の直後 (1m) / 谷が隠れた回復後 (5m) に
+    ぶつけると、1m は kill switch (drawdown threshold) に引っかかって
+    2 件目が rejected になるが、5m は谷を観測できないため 2 件目も
+    通ってしまう (非収束)。`drawdown_kill_pct` を小さく (0.05%) した
+    settings を使う — 既定 (2.0%) では単一建玉の最大許容リスク
+    (`max_total_risk_pct=1.5%`) が SL 非到達のまま作れる含み損の上限
+    (SL 距離の範囲内) を上回れず、この現象を SL 非到達のまま再現できない
+    ため。
+    """
+    settings_sensitive = SETTINGS.model_copy(update={
+        "risk": SETTINGS.risk.model_copy(update={"drawdown_kill_pct": 0.05})})
+
+    open1 = {"action": "open", "pair": "USDJPY", "direction": "long",
+            "entry_type": "market", "horizon": "day",
+            "stop_loss": 148.0, "take_profit": 149.5,
+            "reasoning": "position1"}
+    open2 = {"action": "open", "pair": "USDJPY", "direction": "long",
+            "entry_type": "market", "horizon": "day",
+            "stop_loss": 148.0, "take_profit": 149.5,
+            "reasoning": "position2"}
+    d1 = WED  # 決定 1 のバケット [WED,WED+5m) 完成時刻
+    d2 = WED + timedelta(hours=1)  # 決定 2 のバケット完成時刻
+
+    def _scripted_source():
+        done1: list = []
+        done2: list = []
+
+        def source(bar):
+            if not done1 and bar.ts == d1:
+                done1.append(1)
+                return dict(open1)
+            if not done2 and bar.ts == d2:
+                done2.append(1)
+                return dict(open2)
+            return None
+        return source
+
+    rows = []
+    t = WED
+    for i in range(130):  # 12:00 〜 14:10 静穏 (デフォルト)
+        rows.append(_row(t + timedelta(minutes=i), 148.5, 148.6, 148.4, 148.5))
+    # 決定 2 のバケット [13:05,13:10) の**先頭分** (13:05) だけ一時的な
+    # 含み損の谷 (148.3、SL=148.0 には非到達) を作り、同バケットの
+    # **最終分** (13:09) は静穏 (回復済み) に戻す。
+    rows[65] = _row(t + timedelta(minutes=65), 148.3, 148.3, 148.3, 148.3)
+    rows[69] = _row(t + timedelta(minutes=69), 148.5, 148.6, 148.4, 148.5)
+    rows_5m = _aggregate_5m(rows)
+    end = WED + timedelta(hours=2)
+
+    conn1 = _conn()
+    ohlcv.import_history_bars(conn1, rows, source="dukascopy")
+    res1 = run_replay(settings_sensitive, symbol="USDJPY",
+                      dataset=HistoryDataset("dukascopy", "1m"),
+                      start=WED, end=end,
+                      intent_source=_scripted_source(), eval_timeframe="5m",
+                      history_conn=conn1)
+
+    conn5 = _conn()
+    ohlcv.import_history_bars(conn5, rows_5m, source="mt5")
+    res5 = run_replay(settings_sensitive, symbol="USDJPY",
+                      dataset=HistoryDataset("mt5", "5m"),
+                      start=WED, end=end,
+                      intent_source=_scripted_source(), eval_timeframe="5m",
+                      history_conn=conn5)
+
+    # position1 は SL に一度も到達しない (両基底とも "open" のまま) —
+    # kill switch が「実現損益」ではなく「一時的な含み損の谷」由来である
+    # ことの前提を確認する。
+    assert all(o["status"] == "open" for o in res1.orders)
+    assert all(o["status"] == "open" for o in res5.orders)
+    # 1m: 谷 (13:05) の直後 (13:06) の tick で mark-to-market が谷の
+    # close をそのまま反映し、決定 2 (13:06 執行) が kill switch で
+    # rejected される → 建玉は position1 の 1 件のみ。
+    assert len(res1.orders) == 1
+    assert res1.kill_switch_events
+    assert res1.kill_switch_events[0]["kind"] == "latched"
+    # 5m: 決定 2 の執行 tick (13:10) で使われる直前完成バケット
+    # [13:05,13:10) の close は最終分 (13:09、回復済み) — 谷が隠れて
+    # kill switch は発火せず、決定 2 も通って建玉が 2 件になる (非収束)。
+    assert len(res5.orders) == 2
+    assert res5.kill_switch_events == []
+
+
+def test_start_on_base_grid_but_off_eval_grid_shifts_first_decision_identically():
+    """⑦ start が base 格子上だが eval 格子外 — 先頭足規則
+    (design-v3.md A2: 最初の意思決定 = ``ceil_to_bucket(start, eval_tf) +
+    eval_tf``) は ``base_interval`` に依存しない純粋関数であるべきで、
+    1m/5m どちらの dataset でも同じ ``first_decision_at`` へずれることを
+    両 dataset で直接ピンする (base 幅ぶんの off-by-one 退行や
+    `dataset.width` 混入への回帰チェック)。``start=WED+5分`` (12:05) は
+    1m/5m どちらの base 格子にも乗るが、eval_timeframe="1h" の格子には
+    乗っていない。
+    """
+    from agentic_fx.backtest.timeframes import ceil_to_bucket
+
+    start = WED + timedelta(minutes=5)
+    end = start + timedelta(hours=2)
+    expected = ceil_to_bucket(start, "1h") + timedelta(hours=1)
+    assert expected == WED + timedelta(hours=2)  # 前提: 14:00 へずれる
+
+    rows = []
+    t = WED
+    for i in range(150):
+        rows.append(_row(t + timedelta(minutes=i), 148.5, 148.6, 148.4, 148.5))
+    rows_5m = _aggregate_5m(rows)
+
+    conn1 = _conn()
+    ohlcv.import_history_bars(conn1, rows, source="dukascopy")
+    res1 = run_replay(SETTINGS, symbol="USDJPY",
+                      dataset=HistoryDataset("dukascopy", "1m"),
+                      start=start, end=end,
+                      intent_source=lambda b: None, eval_timeframe="1h",
+                      history_conn=conn1)
+
+    conn5 = _conn()
+    ohlcv.import_history_bars(conn5, rows_5m, source="mt5")
+    res5 = run_replay(SETTINGS, symbol="USDJPY",
+                      dataset=HistoryDataset("mt5", "5m"),
+                      start=start, end=end,
+                      intent_source=lambda b: None, eval_timeframe="1h",
+                      history_conn=conn5)
+
+    assert res1.first_decision_at == res5.first_decision_at == expected
 
 
 # --- (d) 契約テスト: load_resampled_frame と runner._aggregate_bucket の
