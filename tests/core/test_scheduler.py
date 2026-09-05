@@ -902,6 +902,37 @@ def test_close_retry_broker_exception_marks_close_unknown_not_closing(tmp_path):
         encoding="utf-8")
 
 
+def test_close_retry_notification_uses_executor_deferred_window(tmp_path):
+    """retry-close の close_unknown 通知も Executor の遅延窓に従う。"""
+    class RecordingNotifier:
+        def __init__(self):
+            self.sent: list[str] = []
+
+        def send(self, text):
+            self.sent.append(text)
+
+    def bad_broker_close(row, price, reason):
+        raise RuntimeError("broker close timeout")
+
+    env = Env(tmp_path)
+    recording = RecordingNotifier()
+    env.executor.notifier = recording
+    oid = orders.insert(env.conn, pair="USDJPY", direction="long",
+                        entry_type="limit", horizon="day",
+                        status="closing", now=WED, quantity=0.1,
+                        requested_price=148.2, stop_loss=147.8,
+                        avg_fill_price=148.2)
+    env.executor.broker.close = bad_broker_close
+    row = orders.get(env.conn, oid)
+
+    with env.executor.defer_notifications() as deferred:
+        env.sched._retry_close(row, WED)
+        assert recording.sent == []
+        assert deferred == [f"[agentic-fx] クローズ結果不明 #{oid}"]
+
+    assert recording.sent == []
+
+
 def test_close_retry_quote_exception_stays_closing_for_next_tick_retry(tmp_path):
     """quote_fn の例外は broker に触れる前に起きる → 未実行が確定して
     おり、CLOSING のまま次 tick で再試行してよい (broker.close の例外とは

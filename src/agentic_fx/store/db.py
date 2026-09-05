@@ -94,7 +94,7 @@ CREATE TABLE {ine}{name} (
   action TEXT,                   -- open | close | cancel | hold (NULL = 移行前の行)
   gate_result TEXT,              -- accepted | rejected (NULL = 未判定)
   reject_reason TEXT,
-  reject_category TEXT,          -- risk_gate | origin | mission | execution
+  reject_category TEXT,          -- risk_gate | origin | mission | execution | signal
   created_at TEXT NOT NULL,
   -- `action IS NULL` は移行前の行を対象外にする意図の明示である。
   -- **SQL の NULL 意味論により、この節が無くても legacy 行は通る**
@@ -115,7 +115,7 @@ CREATE TABLE {ine}{name} (
          OR (gate_result='accepted' AND reject_category IS NULL)
          OR (gate_result='rejected' AND reject_category IS NOT NULL
              AND reject_category IN
-             ('risk_gate','origin','mission','execution')))
+             ('risk_gate','origin','mission','execution','signal')))
 );
 """
 
@@ -1119,18 +1119,16 @@ def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
     へは進まない。外側・内側の 2 段ガードは同じ `_needs_rebuild()` /
     `_has_leftover_new_table()` の組を使う。
 
-    **本修正 (2026-08-16、レビュー 1 周目) 以前に移行済みの DB は弱い
-    CHECK のまま残る**(冪等ガードは列の有無しか見ない)。`_needs_rebuild()`
-    は `{"action", "reject_category"} <= cols` しか見ないため、旧 CHECK
-    本文 (`reject_category IS NOT NULL` を欠く版) で一度 rebuild を通した
-    DB は外側 early-return で抜け、SQLite が表ごとに保存している旧 DDL
-    文字列をそのまま保持し続ける。Task 17 は本修正時点で未 merge のため
-    該当 DB は存在しない — 将来 CHECK 本文を変える場合は
-    `sqlite_master.sql` 判定で rebuild を強制する必要がある。
+    CHECK の許可カテゴリ追加も既存 DB に反映するため、列だけでなく
+    `sqlite_master.sql` に `'signal'` があることも冪等ガードで確認する。
     """
     def _needs_rebuild() -> bool:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(trade_intents)")}
-        return not ({"action", "reject_category"} <= cols)
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='trade_intents'").fetchone()
+        return (not ({"action", "reject_category"} <= cols)
+                or sql_row is None or "'signal'" not in sql_row["sql"])
 
     def _has_leftover_new_table() -> bool:
         return conn.execute(
@@ -1166,15 +1164,21 @@ def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
                 conn.execute("DROP TABLE trade_intents_new")
             old_count = conn.execute(
                 "SELECT COUNT(*) c FROM trade_intents").fetchone()["c"]
+            old_cols = {
+                r["name"] for r in conn.execute(
+                    "PRAGMA table_info(trade_intents)")}
             # executescript は暗黙 commit し得るため migration transaction 内では使わない。
             conn.execute(_TRADE_INTENTS_DDL.format(
                 name="trade_intents_new", ine=""))
+            action_expr = "action" if "action" in old_cols else "NULL"
+            category_expr = ("reject_category"
+                             if "reject_category" in old_cols else "NULL")
             conn.execute(
                 "INSERT INTO trade_intents_new "
                 "(id,mission_id,payload_json,action,gate_result,reject_reason,"
                 "reject_category,created_at) "
-                "SELECT id,mission_id,payload_json,NULL,gate_result,reject_reason,"
-                "NULL,created_at FROM trade_intents")
+                f"SELECT id,mission_id,payload_json,{action_expr},gate_result,"
+                f"reject_reason,{category_expr},created_at FROM trade_intents")
             new_count = conn.execute(
                 "SELECT COUNT(*) c FROM trade_intents_new").fetchone()["c"]
             if new_count != old_count:

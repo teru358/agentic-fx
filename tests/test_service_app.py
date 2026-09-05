@@ -2083,6 +2083,43 @@ def test_scheduler_tick_once_uses_app_clock(tmp_path):
     assert seen == [fixed.now()]
 
 
+def test_scheduler_tick_defers_close_notification_until_after_core_lock(tmp_path):
+    """tick 中の close 通知は tick 復帰後かつ core_lock 解放後に送る。"""
+    from agentic_fx.service import _scheduler_tick_once
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    tick_returned = False
+    observations: list[tuple[bool, bool]] = []
+
+    class CheckingNotifier:
+        def send(self, text):
+            acquired: list[bool] = []
+
+            def check_lock():
+                ok = app.core_lock.acquire(blocking=False)
+                acquired.append(ok)
+                if ok:
+                    app.core_lock.release()
+
+            checker = threading.Thread(target=check_lock)
+            checker.start()
+            checker.join(timeout=5.0)
+            observations.append((tick_returned, acquired == [True]))
+
+    app.executor.notifier = CheckingNotifier()
+
+    def notifying_tick(now):
+        nonlocal tick_returned
+        app.executor._notify("close notification")
+        tick_returned = True
+        return []
+
+    app.scheduler.tick = notifying_tick
+    _scheduler_tick_once(app)
+
+    assert observations == [(True, True)]
+
+
 def test_watchdog_tick_uses_mission_watch_time_fn_directly(tmp_path):
     """_watchdog_tick の elapsed 算出が MissionWatch.time_fn 経由で行われ、
     結果を FakeActivity/FakeNotifier に観測する (time_fn を壁時計に戻す

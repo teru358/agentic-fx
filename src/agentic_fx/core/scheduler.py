@@ -528,7 +528,7 @@ class Scheduler:
             self.activity.write(Category.TRADE, "close_unknown",
                                 f"{row['pair']} — reconcile 待ち "
                                 f"(broker error: {text})", ref_id=str(row["id"]))
-            self.executor.notifier.send(
+            self.executor._notify(
                 f"[agentic-fx] クローズ結果不明 #{row['id']}")
             _log.warning("close retry -> close_unknown (broker error) "
                         "#%s: %s", row["id"], text)
@@ -563,7 +563,7 @@ class Scheduler:
                     + (f" [cause: {degraded_reason}]"
                        if degraded_reason else ""),
                     ref_id=str(row["id"]))
-                self.executor.notifier.send(
+                self.executor._notify(
                     f"[agentic-fx] クローズ換算レート degraded #{row['id']}")
         else:
             transitions.transition(self.conn, row["id"], S.CLOSE_UNKNOWN, now)

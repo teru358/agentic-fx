@@ -408,9 +408,8 @@ def test_signals_consume_failure_is_caught_and_recorded(tmp_path):
     例外が `with self._core_lock, defer_notifications():` ブロックを
     丸ごと素通りし、`record_and_validate_intent` すら呼ばれないまま
     completed した有効な intent が DB に痕跡を残さず捨てられていた。
-    `try:` の内側に移した後は、①少なくとも `intent_execution_failed` が
-    activity に残る ②signal が requeue される ③mission が終端される
-    ことを確認する。"""
+    consume より先に intent を記録した後は、CAS 失敗を記録済みの signal
+    gate 拒否として確定し、執行せず signal を requeue することを確認する。"""
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed", {"action": "hold", "reasoning": "x"}, [])])
     sid = signals.add(
@@ -419,15 +418,33 @@ def test_signals_consume_failure_is_caught_and_recorded(tmp_path):
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
         now=NOW)
 
-    with patch("agentic_fx.loops.trade_loop.signals.consume",
-              side_effect=ValueError("signal not claimed by mission")):
+    with patch.object(loop.executor, "open_from_snapshot",
+                      wraps=loop.executor.open_from_snapshot) as open_, \
+         patch.object(loop.executor, "close_from_snapshot",
+                      wraps=loop.executor.close_from_snapshot) as close_, \
+         patch("agentic_fx.loops.trade_loop.signals.consume",
+               side_effect=ValueError("signal not claimed by mission")):
         out = loop.run_once("signal")
 
-    assert out is None
+    reason = ("signal not claimed by this mission: "
+              "ValueError: signal not claimed by mission")
+    assert out == {"result": "rejected", "order_id": None,
+                   "reasons": [reason]}
+    intent_row = conn.execute(
+        "SELECT gate_result, reject_reason, reject_category "
+        "FROM trade_intents ORDER BY id DESC LIMIT 1").fetchone()
+    assert intent_row is not None, "consume 失敗前に intent が記録されていない"
+    assert dict(intent_row) == {
+        "gate_result": "rejected",
+        "reject_reason": reason,
+        "reject_category": "signal",
+    }
     act_text = (tp / "a.log").read_text(encoding="utf-8")
-    assert "intent_execution_failed" in act_text, (
-        "signals.consume の例外が commit-core の try 外へ素通りし、"
-        "activity に何も残らないまま公開境界の汎用失敗になっている")
+    assert "gate_rejected" in act_text
+    assert reason in act_text
+    assert "intent_execution_failed" not in act_text
+    open_.assert_not_called()
+    close_.assert_not_called()
     row = conn.execute(
         "SELECT status, requeue_count FROM signals WHERE id=?",
         (sid,)).fetchone()

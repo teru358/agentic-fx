@@ -92,15 +92,17 @@ def test_signal_abandoned_after_requeue_limit_notifies(tmp_path):
 
 
 # ---------------------------------------------------------------------
-# ⑧ executor.handle_intent が例外でも consumed のまま (requeue されない — 二重発注ピン)
+# ⑧ consume 成功後の executor 執行例外でも consumed のまま
+# (requeue されない — 二重発注ピン)
 # ---------------------------------------------------------------------
 def test_signal_stays_consumed_when_executor_raises(tmp_path):
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
-        "completed", {"action": "hold", "reasoning": "ok"}, [])])
+        "completed", {"action": "cancel", "order_id": 999999,
+                      "reasoning": "ok"}, [])])
     sid = _add_signal(conn)
-    # プラン8 五相再構成: commit-core の dispatch 入口は
-    # executor.record_and_validate_intent (handle_intent はもう呼ばれない)
-    loop.executor.record_and_validate_intent = MagicMock(
+    # record → consume の後にある執行分岐を失敗させる。記録自体の失敗は
+    # consume 前なので requeue されるのが新しい順序契約。
+    loop.executor.cancel_intent = MagicMock(
         side_effect=RuntimeError("executor_boom"))
 
     out = loop.run_once("signal")

@@ -296,30 +296,40 @@ class TradeLoop:
             with self._core_lock, \
                     self.executor.defer_notifications() as deferred:
                 try:
+                    # intent は執行前に必ず記録し、以降の拒否理由を iid に
+                    # 結び付ける。record_and_validate_intent 自体は発注しない。
+                    iid, early = self.executor.record_and_validate_intent(
+                        intent, mid)
+                    consume_error = None
                     if claimed is not None:
                         # ⑥consume/requeue の確定規則: パース成功の時点で
                         # consume する (プロンプトに実際に載せた Mission が
                         # 確定できる)。executor 実行後の requeue は二重発注
                         # ハザードになるため、ここで確定させる。
                         #
-                        # **(レビュー 2 周目 codex D3)** `signals.consume`
-                        # は fail-closed (CAS 不一致で ValueError) であり、
-                        # `try:` の**内側**に置かなければならない。外側に
-                        # あると、この例外だけが `with self._core_lock,
-                        # self.executor.defer_notifications():` ブロック
-                        # 全体を素通りし、`record_and_validate_intent` が
-                        # 一度も呼ばれないまま (= `trade_intents` に行が
-                        # 残らないまま) 汎用の公開境界例外になってしまう
-                        # (completed した有効な intent が DB に理由の痕跡を
-                        # 一切残さず捨てられる)。consume が失敗したら
-                        # `consumed` は False のままにし (下の except で
-                        # 設定しない)、finally の requeue に委ねる。
-                        signals.consume(self.conn, claimed["id"],
-                                        mission_id=mid, now=self.clock.now())
-                        consumed = True
-                    iid, early = self.executor.record_and_validate_intent(
-                        intent, mid)
-                    if snapshot_error is not None:
+                        # `signals.consume` は fail-closed (CAS 不一致で
+                        # ValueError)。失敗時は consumed=False のままにして
+                        # finally の requeue に委ね、記録済み intent を signal
+                        # gate 拒否として確定する。
+                        try:
+                            signals.consume(
+                                self.conn, claimed["id"], mission_id=mid,
+                                now=self.clock.now())
+                        except ValueError as e:
+                            consume_error = e
+                        else:
+                            consumed = True
+                    if consume_error is not None:
+                        reason = ("signal not claimed by this mission: "
+                                  + safe_error_text(consume_error))
+                        intents_store.set_gate_result(
+                            self.conn, iid, accepted=False,
+                            reject_reason=reason, reject_category="signal")
+                        self.activity.write(Category.TRADE, "gate_rejected",
+                                            reason, ref_id=str(iid))
+                        out = {"result": "rejected", "order_id": None,
+                               "reasons": [reason]}
+                    elif snapshot_error is not None:
                         # **(Task 14 レビュー 2 周からの申し送りの回収)**
                         # commit-pre の外部取得失敗を、ライブ経路 (`_open` の
                         # `except DataUnhealthy`) と**同じ形の「記録済み gate
@@ -328,8 +338,7 @@ class TradeLoop:
                         # `trade_intents.gate_result` が NULL のまま残り、
                         # 「なぜ発注されなかったか」を DB から追えない。
                         #
-                        # `record_and_validate_intent` を**先に**呼ぶのは
-                        # `iid` を得るため (intent の記録自体は常に行う契約)。
+                        # intent の記録自体は常に行い、`iid` に拒否を結び付ける。
                         # early (hold/origin/mission 拒否) が確定している
                         # ケースはそちらを優先する — snapshot は使わない。
                         if early is not None:

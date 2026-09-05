@@ -225,8 +225,8 @@ class Executor:
 
     @contextmanager
     def defer_notifications(self):
-        """commit-core 相専用 — この中の通知は送らずに溜め、`with` を抜けた
-        後に呼び出し元 (commit-post 相) が送る。
+        """commit-core / scheduler tick 相専用 — この中の通知は送らずに
+        溜め、`with` と core_lock を抜けた後に呼び出し元が送る。
 
         **スレッド安全性の根拠 (レビュー 3 周目 codex E4 — docstring 訂正:
         以前の記述「commit-core も scheduler tick も core_lock を保持
@@ -239,7 +239,8 @@ class Executor:
         しない。
 
         本当に守るべき不変条件は**遅延窓 (`with defer_notifications():`
-        の内側) が完全に `core_lock` の内側にあること**である —
+        の内側) が完全に `core_lock` の内側にあること**であり、Mission の
+        commit-core と scheduler tick の双方がこの窓を開く —
         `Executor` は Mission スレッドと scheduler スレッドで共有される
         が、**commit-core も scheduler tick も、`_notify` に到達しうる
         呼び出しは `core_lock` を保持している間にしか行わない**

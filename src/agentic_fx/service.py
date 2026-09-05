@@ -1132,8 +1132,13 @@ def _scheduler_tick_once(app: App) -> None:
     伴うため core_lock 下では実行できない)。`with app.core_lock:` ブロック
     を抜けた**後**にそれらを順に実行する。
     """
-    with app.core_lock:
+    with app.core_lock, app.executor.defer_notifications() as deferred:
         pending = app.scheduler.tick(app.clock.now())
+    for text in deferred:
+        try:
+            app.executor.notifier.send(text)
+        except Exception:  # noqa: BLE001 — 通知失敗で tick/hook を止めない
+            _log.exception("deferred scheduler notification failed")
     for hook in pending:
         hook()
 
