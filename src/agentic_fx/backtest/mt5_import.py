@@ -19,7 +19,7 @@ import httpx
 
 from agentic_fx.datafeed.price_provider import _SPECS
 from agentic_fx.datafeed.sources import _mt5_headers
-from agentic_fx.store.ohlcv import ImportResult, import_history_bars
+from agentic_fx.store.ohlcv import _FLOAT_TOL, ImportResult, import_history_bars
 
 _log = logging.getLogger(__name__)
 
@@ -189,7 +189,7 @@ def _conflict_details(conn, rows: list[tuple]) -> list[tuple]:
                                  "spread"))
         incoming_values = (o, h, low, close, volume, spread)
         if any(not (a is None and b is None)
-               and (a is None or b is None or abs(a - b) >= 1e-9)
+               and (a is None or b is None or abs(a - b) >= _FLOAT_TOL)
                for a, b in zip(existing_values, incoming_values)):
             conflicts.append((symbol, interval, bar_time, existing_values,
                               incoming_values))

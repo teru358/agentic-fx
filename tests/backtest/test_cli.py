@@ -43,6 +43,11 @@ _OPEN_MARKET_LINE = (
     '"take_profit": 149.00, "reasoning": "{reasoning}"}}\n')
 
 
+def test_parse_date_ignores_explicit_offset():
+    assert cli._parse_date("2026-07-01T00:00:00+09:00") == datetime(
+        2026, 7, 1, tzinfo=timezone.utc)
+
+
 # ---- history import ---------------------------------------------------
 
 

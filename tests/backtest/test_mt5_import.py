@@ -281,7 +281,9 @@ def test_import_mt5_rejects_non_dict_bar(tmp_path):
 def test_import_mt5_rejects_non_finite_or_non_numeric_ohlcv(
         tmp_path, field, value):
     conn = _conn(tmp_path)
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(
+            ValueError,
+            match=rf"bars\[0\] {field} must be a finite number"):
         import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
                    base_url="http://x",
                    fetch=lambda _url: _payload(_bar(**{field: value})))
@@ -307,10 +309,9 @@ def test_import_mt5_rejects_payload_identity_mismatch(tmp_path, payload):
 
 
 @pytest.mark.parametrize("changes", [
-    {"open": 0}, {"close": -1}, {"low": 148.05}, {"high": 148.05},
+    {"close": -1}, {"low": 148.05}, {"high": 148.05},
     {"volume": -1},
-], ids=["R3-zero-price", "R3-negative-price", "R4a-low", "R4b-high",
-        "R5-volume"])
+], ids=["R3-negative-price", "R4a-low", "R4b-high", "R5-volume"])
 def test_import_mt5_rejects_invalid_ohlcv_relationships(tmp_path, changes):
     conn = _conn(tmp_path)
     with pytest.raises(ValueError):
@@ -319,12 +320,35 @@ def test_import_mt5_rejects_invalid_ohlcv_relationships(tmp_path, changes):
                    fetch=lambda _url: _payload(_bar(**changes)))
 
 
+@pytest.mark.parametrize("field,value,accepted", [
+    ("low", 148.0, True),
+    ("low", 148.0 + 1e-6, False),
+    ("high", 148.1, True),
+    ("high", 148.1 - 1e-6, False),
+], ids=["low-equal", "low-above", "high-equal", "high-below"])
+def test_import_mt5_ohlc_inclusion_uses_exact_boundaries(
+        tmp_path, field, value, accepted):
+    conn = _conn(tmp_path)
+    fetch = lambda _url: _payload(_bar(**{field: value}))
+    if accepted:
+        result = import_mt5(
+            conn, "USDJPY", H, H + timedelta(minutes=1),
+            base_url="http://x", fetch=fetch)
+        assert result.inserted == 1
+    else:
+        with pytest.raises(ValueError, match=field):
+            import_mt5(
+                conn, "USDJPY", H, H + timedelta(minutes=1),
+                base_url="http://x", fetch=fetch)
+
+
 def test_import_mt5_validates_right_edge_before_dropping(tmp_path):
     conn = _conn(tmp_path)
     end = H + timedelta(minutes=1)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="prices must be > 0"):
         import_mt5(conn, "USDJPY", H, end, base_url="http://x",
-                   fetch=lambda _url: _payload(_bar(end, open=0)))
+                   fetch=lambda _url: _payload(
+                       _bar(end, open=0, high=0, low=0, close=0)))
 
 
 def test_import_mt5_rejects_two_right_edge_bars(tmp_path):
@@ -557,6 +581,76 @@ def test_import_mt5_spread_only_conflict_is_reported(tmp_path):
     ]
 
 
+def test_conflict_details_mixed_new_and_conflicting_rows_reports_only_conflict(
+        tmp_path):
+    conn = _conn(tmp_path)
+    conflict_time = H + timedelta(minutes=1)
+    ohlcv.import_history_bars(
+        conn, [("USDJPY", "1m", conflict_time.isoformat(), 148.0, 148.2,
+                147.9, 148.1, 10, None)], source="mt5")
+
+    rows = [
+        ("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9,
+         148.1, 10, None),
+        ("USDJPY", "1m", conflict_time.isoformat(), 149.0, 149.2,
+         148.9, 149.1, 20, None),
+    ]
+
+    conflicts = mt5_import._conflict_details(conn, rows)
+
+    assert [item[2] for item in conflicts] == [conflict_time.isoformat()]
+
+
+@pytest.mark.parametrize("delta,conflicted", [
+    (5e-10, False),
+    (2e-9, True),
+], ids=["below-tolerance", "above-tolerance"])
+def test_import_mt5_conflict_details_use_float_tolerance(
+        tmp_path, delta, conflicted):
+    conn = _conn(tmp_path)
+    ohlcv.import_history_bars(
+        conn, [("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9,
+                148.1, 10, None)], source="mt5")
+    fetch = lambda _url: _payload(_bar(H, close=148.1 + delta))
+
+    if conflicted:
+        with pytest.raises(ImportConflictError) as raised:
+            import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                       base_url="http://x", fetch=fetch)
+        assert len(raised.value.conflicts) == 1
+    else:
+        result = import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                            base_url="http://x", fetch=fetch)
+        assert result == ohlcv.ImportResult(0, 1, 0)
+
+
+def test_conflict_details_uses_store_float_tolerance():
+    assert mt5_import._FLOAT_TOL == ohlcv._FLOAT_TOL
+
+
+def test_import_mt5_reports_each_conflict_in_same_window(tmp_path):
+    conn = _conn(tmp_path)
+    second = H + timedelta(minutes=1)
+    ohlcv.import_history_bars(
+        conn, [
+            ("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9,
+             148.1, 10, None),
+            ("USDJPY", "1m", second.isoformat(), 149.0, 149.2, 148.9,
+             149.1, 20, None),
+        ], source="mt5")
+
+    with pytest.raises(ImportConflictError) as raised:
+        import_mt5(
+            conn, "USDJPY", H, H + timedelta(minutes=2),
+            base_url="http://x",
+            fetch=lambda _url: _payload(
+                _bar(H, open=150.0, high=150.2, low=149.9, close=150.1),
+                _bar(second, open=151.0, high=151.2, low=150.9,
+                     close=151.1)))
+
+    assert len(raised.value.conflicts) == 2
+
+
 def test_import_mt5_second_window_conflict_exposes_committed_partial_result(
         tmp_path):
     conn = _conn(tmp_path)
@@ -630,6 +724,29 @@ def test_compare_sources_reports_distribution(tmp_path):
     assert rep["mean"] == pytest.approx(0.0, abs=1e-9)
     assert rep["std"] == 0.0
     assert rep["max_abs"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_compare_sources_reports_three_point_population_distribution(tmp_path):
+    conn = _conn(tmp_path)
+    times = [H + timedelta(minutes=i) for i in range(3)]
+    # half_spread=0.005; resulting differences are exactly -0.01, 0.02, 0.05.
+    a_closes = [148.095, 148.125, 148.155]
+    b_closes = [148.10, 148.10, 148.10]
+    ohlcv.import_history_bars(
+        conn, [("USDJPY", "1m", ts.isoformat(), close, close, close,
+                close, 5, 0.01) for ts, close in zip(times, a_closes)],
+        source="dukascopy")
+    ohlcv.import_history_bars(
+        conn, [("USDJPY", "1m", ts.isoformat(), close, close, close,
+                close, 5, None) for ts, close in zip(times, b_closes)],
+        source="mt5")
+
+    rep = compare_sources(conn, "USDJPY", SETTINGS)
+
+    assert rep["count"] == 3
+    assert rep["mean"] == pytest.approx(0.02)
+    assert rep["std"] == pytest.approx((0.0006) ** 0.5)
+    assert rep["max_abs"] == pytest.approx(0.05)
 
 
 def test_compare_sources_empty_overlap_returns_none_fields(tmp_path):
