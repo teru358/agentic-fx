@@ -14,7 +14,7 @@ from agentic_fx.store import ohlcv
 from tests.backtest.factories import SETTINGS, WED, _conn, _row_at, DATASET_1M
 
 
-_GOLDEN_PATH = Path(__file__).with_name("golden-v2.json")
+_GOLDEN_PATH = Path(__file__).with_name("golden-v3.json")
 _DAY = timedelta(days=1)
 
 
@@ -63,7 +63,7 @@ def _intent(bar):
 def _json_safe(value: Any) -> Any:
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise ValueError("golden-v1 must not contain non-finite floats")
+            raise ValueError("golden-v3 must not contain non-finite floats")
         return value
     if isinstance(value, dict):
         return {key: _json_safe(item) for key, item in value.items()}

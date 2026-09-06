@@ -40,3 +40,19 @@ pin する (ずれたら本表も更新すること)。
 `start` (12:00) から `13:00` へ後ろ倒しになった。差の実体は「12:00〜12:59
 の warmup 中、v2 では Scheduler が動かないため snapshots/equity_curve の
 観測記録が作られない」ことのみで、orders・metrics は逐語一致した。
+
+## golden-v2 → golden-v3 差分分類
+
+v2 は保持する。v3 は replay kill-switch 評価規約を正とし、既存 fixture
+期間内には次の市場再開がないため auto-release と snapshot 追加はない。
+
+| 分類 | 件数 |
+| --- | ---: |
+| added_metric_keys | 1 |
+| removed_duplicate_activity_events | 1 |
+| changed_existing_values | 0 |
+| unexpected_added_rows | 0 |
+| unclassified | 0 |
+
+`tests/backtest/test_golden_diff_v2_v3.py` が上表と、6 種の不許可差分を
+機械検証する。分類不能が 1 件でもあれば golden は更新しない。

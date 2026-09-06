@@ -32,13 +32,16 @@ def _closed_row(pnl: float, *, avg_fill_price=148.0, stop_loss=147.8,
 
 
 def _result_with_closed(pnls: list[float], *, equity_curve=None,
-                        fallback_spread_used=False) -> BacktestResult:
+                        fallback_spread_used=False,
+                        kill_switch_latches=0) -> BacktestResult:
     orders = [_closed_row(p, id_=i) for i, p in enumerate(pnls)]
     curve = equity_curve if equity_curve is not None else [
         (H.isoformat(), 1_000_000.0)]
-    return BacktestResult(
+    result = BacktestResult(
         orders=orders, equity_curve=curve, start=H, end=H,
         source="dukascopy", fallback_spread_used=fallback_spread_used)
+    result.kill_switch_latches = kill_switch_latches
+    return result
 
 
 def test_metrics_basic_and_evaluable_threshold():
@@ -59,8 +62,13 @@ def test_zero_trades_returns_none_metrics_but_not_evaluable():
     assert m == {
         "trades": 0, "pf": None, "win_rate": None, "avg_r": None,
         "total_pnl": 0.0, "max_drawdown": 0.0, "evaluable": False,
-        "fallback_spread_used": True,
+        "fallback_spread_used": True, "kill_switch_latches": 0,
     }
+
+
+def test_kill_switch_latches_is_exposed_for_nonzero_trades():
+    assert compute_metrics(_result_with_closed(
+        [100.0], kill_switch_latches=2))["kill_switch_latches"] == 2
 
 
 def test_pf_none_when_no_losses():

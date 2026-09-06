@@ -9,6 +9,7 @@ from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.store import approvals
+from agentic_fx.store import snapshots
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.state import StateStore
 
@@ -193,14 +194,21 @@ def test_approve_nonexistent(tmp_path):
 
 def test_killswitch_reset(tmp_path):
     """F2: killswitch reset で activity 記録を確認。"""
-    _, state, activity, cmds = _commands(tmp_path)
+    conn, state, activity, cmds = _commands(tmp_path)
     # Set non-default state
     state.update(kill_switch_latched=True, autopilot=True)
+    snapshots.add(conn, ts=NOW, balance=1_000_000, equity=980_000,
+                  hwm=1_000_000, cashflow=0, source="paper")
+    before = [dict(row) for row in conn.execute(
+        "SELECT * FROM account_snapshots ORDER BY id")]
     out = cmds.dispatch("killswitch reset")
+    after = [dict(row) for row in conn.execute(
+        "SELECT * FROM account_snapshots ORDER BY id")]
     # kill_switch_latched=False に変更されること
     assert state.load().kill_switch_latched is False
     # 他の状態は保持されること
     assert state.load().autopilot is True
+    assert after == before
     assert "解除" in out
     # F2: activity に SYSTEM レコードが記録されること
     records = activity.tail(10, Category.SYSTEM)

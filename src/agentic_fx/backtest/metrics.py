@@ -27,7 +27,7 @@ EVALUABLE_MIN_TRADES = 30
 # 読み側 (store/backtest_runs.py) がこの定数で白リスト濾過する。
 METRIC_KEYS = frozenset({
     "trades", "pf", "win_rate", "avg_r", "max_drawdown", "total_pnl",
-    "evaluable", "fallback_spread_used",
+    "evaluable", "fallback_spread_used", "kill_switch_latches",
 })
 
 
@@ -122,6 +122,7 @@ def compute_metrics(result: BacktestResult) -> dict:
             "total_pnl": 0.0,
             "evaluable": False,
             "fallback_spread_used": result.fallback_spread_used,
+            "kill_switch_latches": result.kill_switch_latches,
         }
 
     total_pnl, gross_profit, gross_loss, wins, r_multiples = _closed_metrics(closed)
@@ -139,4 +140,5 @@ def compute_metrics(result: BacktestResult) -> dict:
         "total_pnl": total_pnl,
         "evaluable": trades >= EVALUABLE_MIN_TRADES,
         "fallback_spread_used": result.fallback_spread_used,
+        "kill_switch_latches": result.kill_switch_latches,
     }

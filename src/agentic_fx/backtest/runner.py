@@ -45,20 +45,24 @@ from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.activity import Category
 from agentic_fx.config import Settings
 from agentic_fx.core import market_hours
-from agentic_fx.core.accounting import record_snapshot
+from agentic_fx.core.accounting import drawdown_pct, record_snapshot
 from agentic_fx.core.contracts import Bar, ConversionRate, Origin, TradeIntent
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
 from agentic_fx.datafeed.price_provider import _SPECS
-from agentic_fx.store import missions
+from agentic_fx.store import missions, snapshots as snapshot_store
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.state import StateStore
 
 # strategy plugin アダプタはこの型に合わせる (プラン 7)。引数は確定した
 # 評価 timeframe バー、返り値は LLM 出力と同形の dict / None = 提案なし。
 IntentSource = Callable[[Bar], dict | None]
+
+
+class _KillSwitchCompensationError(RuntimeError):
+    pass
 
 _TF_RE = re.compile(r"^(\d+)(m|h)$")
 # バケット境界の錨。実運用の datafeed.bars.BAR_ANCHOR="epoch" と揃える
@@ -97,21 +101,36 @@ class _RecordingActivity:
 class _RecordingStateStore(StateStore):
     """ラッチ遷移を replay の観測面へ追加する StateStore。"""
 
-    def __init__(self, path: Path, *, clock: ReplayClock) -> None:
+    def __init__(self, path: Path, *, clock: ReplayClock,
+                 snapshot_id_fn: Callable[[], int | None] | None = None) -> None:
         super().__init__(path)
         self._clock = clock
+        self._snapshot_id_fn = snapshot_id_fn
         self.kill_switch_transitions: list[dict] = []
 
-    def update(self, **changes):
+    def update(self, *, transition_snapshot_id=None, publish=True, **changes):
         before = self.load().kill_switch_latched
+        snapshot_id = transition_snapshot_id
+        is_transition = ("kill_switch_latched" in changes and
+                         changes["kill_switch_latched"] != before)
+        if (is_transition and snapshot_id is None and
+                self._snapshot_id_fn is not None):
+            snapshot_id = self._snapshot_id_fn()
         result = super().update(**changes)
-        if result.kill_switch_latched != before:
+        if publish and result.kill_switch_latched != before:
             self.kill_switch_transitions.append({
                 "ts": self._clock.now().astimezone(timezone.utc).isoformat(),
                 "kind": "latched" if result.kill_switch_latched else "released",
                 "reason": "state_store kill_switch_latched transition",
+                "snapshot_id": snapshot_id,
             })
         return result
+
+    def publish_released(self, *, ts: datetime, snapshot_id: int,
+                         reason: str) -> None:
+        self.kill_switch_transitions.append({
+            "ts": ts.astimezone(timezone.utc).isoformat(), "kind": "released",
+            "reason": reason, "snapshot_id": snapshot_id})
 
 
 @dataclass
@@ -124,6 +143,7 @@ class BacktestResult:
     fallback_spread_used: bool
     snapshots: list[dict] = field(default_factory=list)
     kill_switch_events: list[dict] = field(default_factory=list)
+    kill_switch_latches: int = 0
     first_decision_at: datetime | None = None
 
 
@@ -178,7 +198,8 @@ def _aggregate_bucket(feed: BarFeed, symbol: str, interval: str,
         volume=sum(b.volume for b in bars))
 
 
-def _kill_switch_event(conn: sqlite3.Connection, entry: dict, kind: str) -> dict:
+def _kill_switch_event(conn: sqlite3.Connection, entry: dict, kind: str,
+                       activity_entries: list[dict] | None = None) -> dict:
     """kill_switch_events の 1 要素を組み立てる (段階 1 レビュー是正 6c を
     テスト可能にするための module-level 抽出 — 挙動は不変)。
 
@@ -187,17 +208,107 @@ def _kill_switch_event(conn: sqlite3.Connection, entry: dict, kind: str) -> dict
     id を選ぶ) から ``(hwm − equity)/hwm×100`` を計算する。``hwm <= 0``
     (未初期化・境界) は ``None`` (計算不能)。
     """
-    row = conn.execute(
-        "SELECT equity, hwm FROM account_snapshots "
-        "WHERE ts <= ? ORDER BY ts DESC, id DESC LIMIT 1",
-        (entry["ts"],)).fetchone()
+    row = None
+    if entry.get("snapshot_id") is not None:
+        row = conn.execute("SELECT equity, hwm FROM account_snapshots WHERE id=?",
+                           (entry["snapshot_id"],)).fetchone()
+    elif "snapshot_id" not in entry:  # legacy direct helper callers
+        row = conn.execute(
+            "SELECT equity, hwm FROM account_snapshots WHERE ts <= ? "
+            "ORDER BY ts DESC, id DESC LIMIT 1", (entry["ts"],)).fetchone()
     drawdown = None
     if row is not None and row["hwm"] > 0:
         drawdown = max(0.0, (row["hwm"] - row["equity"])
                        / row["hwm"] * 100.0)
-    return {"ts": entry["ts"], "kind": kind,
-            "reason": entry["text"] if "text" in entry else entry["reason"],
+    reason = entry.get("reason", "state_store kill_switch_latched transition")
+    if kind == "latched" and activity_entries is not None:
+        match = next((a for a in activity_entries
+                      if a["ts"] == entry["ts"] and
+                      a["kind"] == "kill_switch_latched"), None)
+        if match is not None:
+            reason = match["text"]
+    return {"ts": entry["ts"], "kind": kind, "reason": reason,
             "drawdown_pct": drawdown}
+
+
+def _auto_release_kill_switch(conn: sqlite3.Connection, *,
+                              state: _RecordingStateStore,
+                              activity: _RecordingActivity, now: datetime,
+                              mtm: dict, latched_at: datetime) -> bool:
+    """Replay-local kill-switch release with DB rollback/state compensation."""
+    if now < datetime.fromisoformat(mtm["ts"]):
+        activity.write(Category.SYSTEM, "replay_kill_switch_release_deferred",
+                       "MTM snapshot timestamp is after release tick")
+        return False
+    hwm_before = mtm["hwm"]
+    try:
+        conn.execute("BEGIN")
+        cur = conn.execute(
+            "INSERT INTO account_snapshots "
+            "(ts,balance,equity,hwm,cashflow,source) VALUES (?,?,?,?,?,?)",
+            (now.astimezone(timezone.utc).isoformat(), mtm["balance"],
+             mtm["equity"], mtm["equity"], 0.0, "replay_ks_rebase"))
+        rebase_id = cur.lastrowid
+        rebased = snapshot_store.latest(conn)
+        valid = (rebased is not None and rebased["id"] == rebase_id and
+                 rebased["ts"] == now.astimezone(timezone.utc).isoformat() and
+                 rebased["source"] == "replay_ks_rebase" and
+                 rebased["equity"] == rebased["hwm"] and
+                 drawdown_pct(rebased["equity"], rebased["hwm"]) == 0)
+        if not valid:
+            conn.rollback()
+            activity.write(Category.SYSTEM,
+                           "replay_kill_switch_release_deferred",
+                           "rebase snapshot postcondition failed")
+            return False
+        state.update(kill_switch_latched=False,
+                     transition_snapshot_id=rebase_id, publish=False)
+        try:
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            try:
+                state.update(kill_switch_latched=True, publish=False)
+            except Exception as exc:
+                raise _KillSwitchCompensationError(
+                    "kill-switch state compensation failed") from exc
+            activity.write(Category.SYSTEM, "replay_kill_switch_release_failed",
+                           "commit failed; state compensated")
+            return False
+        state.publish_released(ts=now, snapshot_id=rebase_id,
+                               reason="replay_kill_switch_auto_release")
+        activity.write(
+            Category.SYSTEM, "replay_kill_switch_auto_release",
+            f"latched_at={latched_at.isoformat()} released_at={now.isoformat()} "
+            f"hwm_before={hwm_before} hwm_after={rebased['hwm']} "
+            f"rebase_id={rebase_id}")
+        return True
+    except _KillSwitchCompensationError:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        activity.write(Category.SYSTEM, "replay_kill_switch_release_deferred",
+                       f"release operation failed: {type(exc).__name__}")
+        return False
+    finally:
+        assert conn.in_transaction is False
+
+
+def _release_is_due(*, now: datetime, latched_at: datetime, mtm: dict | None,
+                    before_id: int) -> bool:
+    return bool(now >= market_hours.next_rollover(latched_at)
+                and market_hours.is_market_open(now) and mtm is not None
+                and mtm["id"] > before_id and mtm["ts"] == now.isoformat()
+                and mtm["source"] == "paper")
+
+
+def _executor_transition_snapshot_id(latest: dict | None,
+                                     now: datetime) -> int | None:
+    if (latest is None or latest["ts"] != now.isoformat()
+            or latest["source"] != "paper"):
+        return None
+    return latest["id"]
 
 
 def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
@@ -223,8 +334,13 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
     conn = connect(Path(":memory:"))
     init_db(conn)
     clock = ReplayClock(first_decision_at, dataset.width)
+    def transition_snapshot_id() -> int | None:
+        return _executor_transition_snapshot_id(snapshot_store.latest(conn),
+                                                clock.now())
+
     state = _RecordingStateStore(Path(tempfile.mkdtemp()) / "state.json",
-                                 clock=clock)
+                                 clock=clock,
+                                 snapshot_id_fn=transition_snapshot_id)
 
     # レビュー裁定 sonnet C1: PaperBroker.equity() は settings.paper.
     # starting_balance 基準のため、backtest.initial_balance と二重基準に
@@ -310,7 +426,21 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
     now = first_decision_at
     while now < end:
         current_ts = now
+        before = snapshot_store.latest(conn)
+        before_id = before["id"] if before is not None else 0
         scheduler.tick(now)            # 市場クローズ判定は tick 内部 — 無条件に毎分呼ぶ
+        if state.load().kill_switch_latched:
+            latched = next((t for t in reversed(state.kill_switch_transitions)
+                            if t["kind"] == "latched"), None)
+            if latched is not None:
+                latched_at = datetime.fromisoformat(latched["ts"])
+                mtm = snapshot_store.latest(conn)
+                if _release_is_due(now=now, latched_at=latched_at, mtm=mtm,
+                                   before_id=before_id):
+                    _auto_release_kill_switch(
+                        conn, state=state, activity=activity, now=now,
+                        mtm=mtm, latched_at=latched_at)
+        assert conn.in_transaction is False
         if pending_proposal is not None:
             # fix round 1 F2 (codex Important + sonnet Important): 評価時は
             # 市場オープンでも、1 tick 遅れの執行時にクローズしている場合が
@@ -359,13 +489,8 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
         "SELECT * FROM account_snapshots ORDER BY ts, id").fetchall()]
 
     kill_switch_events = [
-        _kill_switch_event(
-            conn, entry, "released" if "reset" in entry["kind"] else "latched")
-        for entry in activity.entries if "kill_switch" in entry["kind"]
-    ]
-    for transition in state.kill_switch_transitions:
-        event = _kill_switch_event(conn, transition, transition["kind"])
-        kill_switch_events.append(event)
+        _kill_switch_event(conn, transition, transition["kind"], activity.entries)
+        for transition in state.kill_switch_transitions]
     # 観測面の順序は時刻で固定する (activity 由来と StateStore 由来が
     # 別 list から合流するため、合流順に依存させない)。
     kill_switch_events.sort(key=lambda e: (e["ts"], e["kind"]))
@@ -373,4 +498,6 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
         orders=order_rows, equity_curve=equity_curve, start=start, end=end,
         source=dataset.source, fallback_spread_used=fallback_spread_used,
         snapshots=snapshots, kill_switch_events=kill_switch_events,
+        kill_switch_latches=sum(
+            t["kind"] == "latched" for t in state.kill_switch_transitions),
         first_decision_at=first_decision_at)
