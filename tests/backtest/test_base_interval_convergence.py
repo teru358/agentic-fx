@@ -330,6 +330,10 @@ def test_nonconvergence_sl_gap_fill_price_diverges():
     assert o1["close_reason"] == o5["close_reason"] == "sl"
     # 到達分がバケット先頭のため 5m 側の検出は 1 バケット (最大 4 分) 遅れ、
     # 決済価格は両経路とも SL 価格規則で同値 (147.795、gap の低値では約定しない)。
+    # codex 2 周目: 価格規則そのものを pin する (足中スパイクの low/open で
+    # 約定させる変異は closed_at/close_reason を保ったまま通ってしまう)。
+    assert o1["close_price"] == pytest.approx(147.795)
+    assert o5["close_price"] == pytest.approx(147.795)
     assert o1["closed_at"] != o5["closed_at"]
 
 

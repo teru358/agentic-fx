@@ -206,6 +206,16 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
                 if proc.stdout is not None:
                     proc.stdout.close()
                 stdout = "\n[gate_pytest] gate timeout: stdout holder survived"
+                # codex 2 周目 (2026-09-06): communicate は pipe の EOF 待ちで
+                # timeout するため、SIGKILL 済みの直接子が未 reap のまま残る。
+                # 長寿命の service/improve プロセスで zombie が蓄積するので
+                # stdout を閉じた後に必ず wait する (孫は別 session に逃げる
+                # ので killpg では止まらない — ここでは直接子の回収のみ)。
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
             returncode = -1
         duration = time.monotonic() - started
 

@@ -354,6 +354,15 @@ def test_run_gate_pytest_timeout_returns_when_detached_stdout_holder_survives(
     monkeypatch.setattr(gate_mod, "build_launcher_argv", fake_launcher)
     short_settings = settings.model_copy(update={
         "plugin": settings.plugin.model_copy(update={"pytest_timeout_sec": 0.1})})
+    # codex 2 周目: 直接子が reap 済みであることも pin する (Popen を捕捉)。
+    spawned = []
+    real_popen = gate_mod.subprocess.Popen
+
+    def capturing_popen(*a, **kw):
+        proc = real_popen(*a, **kw)
+        spawned.append(proc)
+        return proc
+    monkeypatch.setattr(gate_mod.subprocess, "Popen", capturing_popen)
 
     grandchild_pid = None
     started = time.monotonic()
@@ -376,6 +385,11 @@ def test_run_gate_pytest_timeout_returns_when_detached_stdout_holder_survives(
     assert result.returncode == -1
     assert "gate timeout: stdout holder survived" in result.stdout_tail
     assert captured_rlimits["RLIMIT_NPROC"] == (512, 512)
+    # 直接子は SIGKILL 後に wait されている (zombie を残さない)。
+    assert len(spawned) == 1
+    assert spawned[0].returncode is not None
+    with pytest.raises(ChildProcessError):
+        os.waitpid(spawned[0].pid, os.WNOHANG)
 
 
 def test_run_gate_pytest_candidate_dir_is_read_only(tmp_path, settings):
