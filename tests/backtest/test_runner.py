@@ -342,6 +342,74 @@ def test_pending_proposal_discarded_when_market_closes_before_execution(tmp_path
     assert not res.orders  # クローズ後の執行は破棄される
 
 
+def test_pending_proposal_is_dropped_and_recorded_when_execution_bar_missing(
+        tmp_path, monkeypatch):
+    """M6/M7: 次tickだけ欠損しても完走し、提案破棄をactivityへ残す。"""
+    hist = _conn(tmp_path)
+    ohlcv.import_history_bars(
+        hist, [_row_at(WED, o=148.5, h=148.6, l=148.4, c=148.5)],
+        source="dukascopy")
+    recorded = []
+    real_write = runner_module._RecordingActivity.write
+
+    def capture(self, category, event, summary, ref_id=None):
+        real_write(self, category, event, summary, ref_id)
+        recorded.extend(self.entries[-1:])
+
+    monkeypatch.setattr(runner_module._RecordingActivity, "write", capture)
+    res = run_replay(
+        SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+        start=WED, end=WED + timedelta(minutes=3),
+        intent_source=lambda b: dict(OPEN_MARKET), eval_timeframe="1m",
+        history_conn=hist)
+
+    assert res.orders == []
+    dropped = [entry for entry in recorded
+               if entry["kind"] == "proposal_dropped_no_bar"]
+    assert len(dropped) == 1
+    assert (WED + timedelta(minutes=2)).isoformat() in dropped[0]["text"]
+
+
+def test_pending_proposal_opens_when_execution_bar_exists(tmp_path):
+    """fail-soft追加後も足がある通常の執行経路は維持する。"""
+    hist = _conn(tmp_path)
+    rows = [_row_at(WED + timedelta(minutes=i), o=148.5, h=148.6,
+                    l=148.4, c=148.5) for i in range(2)]
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
+    res = run_replay(
+        SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+        start=WED, end=WED + timedelta(minutes=3),
+        intent_source=lambda b: dict(OPEN_MARKET), eval_timeframe="1m",
+        history_conn=hist)
+    assert len(res.orders) == 1
+    assert res.orders[0]["status"] == "open"
+
+
+def test_quote_error_names_5m_base_interval(tmp_path, monkeypatch):
+    """M8: quoteの最後の網はdatasetの5m粒度を正確に報告する。"""
+    hist = _conn(tmp_path)
+    rows = [
+        ("USDJPY", "5m", (WED + timedelta(minutes=i)).isoformat(),
+         148.5, 148.6, 148.4, 148.5, 10.0, 0.01)
+        for i in (0, 5)
+    ]
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
+
+    def remove_guarded_bar_then_quote(self, intent, mission_id):
+        feed = next(cell.cell_contents for cell in self.quote_fn.__closure__
+                    if isinstance(cell.cell_contents, BarFeed))
+        feed._bars.pop((WED + timedelta(minutes=5)).isoformat())
+        return self.quote_fn(intent.pair)
+
+    monkeypatch.setattr(Executor, "handle_intent", remove_guarded_bar_then_quote)
+    with pytest.raises(ValueError, match="no completed 5m bar"):
+        run_replay(
+            SETTINGS, symbol="USDJPY", dataset=HistoryDataset("dukascopy", "5m"),
+            start=WED, end=WED + timedelta(minutes=15),
+            intent_source=lambda b: dict(OPEN_MARKET), eval_timeframe="5m",
+            history_conn=hist)
+
+
 def test_pending_execution_happens_after_tick_not_before(tmp_path):
     """F4 (sonnet I1 — sonnet 変異②の再現)。
 

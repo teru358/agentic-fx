@@ -67,21 +67,34 @@ def test_timezone_normalization():
     assert is_friday_after(utc_time, "21:00") is False
 
 
-# --- レビュー修正 (codex 6): NY 現地時間 17:00 基準 (冬時間は 22:00 UTC) ---
+# --- OANDA Japan MT5 実測: 夏冬とも 21:00 UTC 固定 ---
 
-def test_winter_dst_boundary_is_22_00_utc():
-    """NY 標準時 (EST, UTC-5) の 17:00 は 22:00 UTC (夏時間なら 21:00 UTC)。
-    固定 21:00 UTC のままだと冬季に日次リセット・day 強制決済が
-    本来より 1 時間早まってしまう (資金制限の意味が変わる — Critical 級)。"""
-    fri_open = _dt(2026, 1, 16, 21, 59)   # 金 21:59 UTC = 16:59 EST (冬) → まだ open
-    fri_close = _dt(2026, 1, 16, 22, 0)   # 金 22:00 UTC = 17:00 EST (冬) → close
+def test_winter_weekend_boundary_is_fixed_at_21_00_utc():
+    """M1/M2: 冬も金曜 close / 日曜 open は 21:00 UTC 固定。"""
+    fri_open = _dt(2026, 1, 16, 20, 55)
+    fri_close = _dt(2026, 1, 16, 21, 0)
     assert is_market_open(fri_open) is True
     assert is_market_open(fri_close) is False
+    assert is_market_open(_dt(2026, 1, 18, 20, 55)) is False
+    assert is_market_open(_dt(2026, 1, 18, 21, 0)) is True
 
-    assert trading_day_start(_dt(2026, 1, 14, 12, 0)) == _dt(2026, 1, 13, 22, 0)
-    assert trading_day_start(_dt(2026, 1, 14, 23, 0)) == _dt(2026, 1, 14, 22, 0)
 
-    assert next_rollover(_dt(2026, 1, 14, 12, 0)) == _dt(2026, 1, 14, 22, 0)
+def test_utc_holidays_are_closed():
+    """M3: ブローカー休場日の 12/25 と 1/1 は曜日に関係なく閉場。"""
+    assert is_market_open(_dt(2025, 12, 25, 12, 0)) is False
+    assert is_market_open(_dt(2026, 1, 1, 12, 0)) is False
+
+
+def test_trading_day_start_uses_fixed_21_00_utc_boundary():
+    """M4: 日次開始は冬も直前の 21:00 UTC。"""
+    assert trading_day_start(_dt(2026, 1, 13, 20, 59)) == _dt(2026, 1, 12, 21, 0)
+    assert trading_day_start(_dt(2026, 1, 13, 21, 0)) == _dt(2026, 1, 13, 21, 0)
+
+
+def test_next_rollover_uses_fixed_21_00_utc_boundary():
+    """M5: 次回ロールオーバーは冬も次の 21:00 UTC。"""
+    assert next_rollover(_dt(2026, 1, 13, 20, 59)) == _dt(2026, 1, 13, 21, 0)
+    assert next_rollover(_dt(2026, 1, 13, 21, 0)) == _dt(2026, 1, 14, 21, 0)
 
 
 def test_friday_cutoff_dst_invariant():
@@ -106,59 +119,12 @@ def test_friday_cutoff_utc_ny_weekday_mismatch():
     assert is_friday_after(sat_utc, "20:00") is True  # NY では金曜 20:30
 
 
-# --- レビュー修正 (方式比較の過程で発見): next_rollover の DST 遷移バグ ---
-#
-# next_rollover は trading_day_start (現地カレンダー基準) の結果に UTC のまま
-# timedelta(days=1) を足していたため、絶対時間で +24h になっていた。DST 遷移
-# (2026 年は 3/8 開始・11/1 終了) をまたぐ週末はそれぞれ 23h/25h のはずで、
-# 固定 24h だと 1 時間ずれる。以下は「trading_day_start の当日境界を過ぎた
-# 直後」を入力にして、次の境界 (翌現地日の 17:00) が DST をまたぐケースを
-# 直接検証する (zoneinfo で事前に確認済みの値)。
-
-def test_next_rollover_spring_forward_gap_is_23h():
-    """2026-03-08 (日) が夏時間開始 (2nd Sunday of March)。
-    土 2026-03-07 17:00 NY (EST) = 22:00 UTC の境界を過ぎた直後の時刻を入力にすると、
-    次の境界は 日 2026-03-08 17:00 NY (EDT) = 21:00 UTC になる (23 時間後)。"""
-    now = _dt(2026, 3, 7, 23, 0)  # 土 23:00 UTC = 18:00 EST (Sat 17:00 境界の直後)
-    start = trading_day_start(now)
-    rollover = next_rollover(now)
-    assert start == _dt(2026, 3, 7, 22, 0)
-    assert rollover == _dt(2026, 3, 8, 21, 0)
-    assert rollover - start == timedelta(hours=23)
-
-
-def test_next_rollover_fall_back_gap_is_25h():
-    """2026-11-01 (日) が夏時間終了 (1st Sunday of November)。
-    土 2026-10-31 17:00 NY (EDT) = 21:00 UTC の境界を過ぎた直後の時刻を入力にすると、
-    次の境界は 日 2026-11-01 17:00 NY (EST) = 22:00 UTC になる (25 時間後)。"""
-    now = _dt(2026, 10, 31, 22, 0)  # 土 22:00 UTC = 18:00 EDT (Sat 17:00 境界の直後)
-    start = trading_day_start(now)
-    rollover = next_rollover(now)
-    assert start == _dt(2026, 10, 31, 21, 0)
-    assert rollover == _dt(2026, 11, 1, 22, 0)
-    assert rollover - start == timedelta(hours=25)
-
-
-def test_next_rollover_normal_day_gap_stays_24h():
-    """DST 遷移をまたがない通常日は従来通り厳密に 24 時間 (回帰防止)。"""
-    now = _dt(2026, 7, 22, 12, 0)  # 夏、通常の水曜
-    start = trading_day_start(now)
-    rollover = next_rollover(now)
-    assert rollover - start == timedelta(hours=24)
-
-    now_winter = _dt(2026, 1, 14, 12, 0)  # 冬、通常の水曜
-    start_w = trading_day_start(now_winter)
-    rollover_w = next_rollover(now_winter)
-    assert rollover_w - start_w == timedelta(hours=24)
-
-
-def test_is_market_open_across_fall_back_weekend():
-    """秋の移行週末: 金曜クローズ (NY 17:00 EDT) と、翌日曜オープン (NY 17:00 EST) が
-    それぞれ正しい UTC オフセットで判定されること。"""
+def test_market_boundary_does_not_follow_fall_back():
+    """夏時間終了後も境界を22:00へ動かさず21:00 UTCを維持する。"""
     fri_close = _dt(2026, 10, 30, 21, 0)   # 金 17:00 EDT → close
     fri_open = _dt(2026, 10, 30, 20, 59)   # 金 16:59 EDT → まだ open
-    sun_open = _dt(2026, 11, 1, 22, 0)     # 日 17:00 EST → open
-    sun_closed = _dt(2026, 11, 1, 21, 59)  # 日 16:59 EST → まだ closed
+    sun_open = _dt(2026, 11, 1, 21, 0)
+    sun_closed = _dt(2026, 11, 1, 20, 59)
     assert is_market_open(fri_open) is True
     assert is_market_open(fri_close) is False
     assert is_market_open(sun_closed) is False

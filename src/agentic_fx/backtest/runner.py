@@ -42,6 +42,7 @@ from typing import Callable
 from agentic_fx.backtest.replay import BarFeed, ReplayClock, quote_from_bar
 from agentic_fx.backtest.timeframes import ceil_to_bucket, floor_to_bucket
 from agentic_fx.backtest.dataset import HistoryDataset
+from agentic_fx.activity import Category
 from agentic_fx.config import Settings
 from agentic_fx.core import market_hours
 from agentic_fx.core.accounting import record_snapshot
@@ -262,7 +263,7 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
         bar = feed.latest_completed(current_ts)
         if bar is None:
             raise ValueError(
-                f"no completed 1m bar for {pair} at "
+                f"no completed {dataset.base_interval} bar for {pair} at "
                 f"{current_ts.isoformat()} (no-lookahead quote source)")
         return quote_from_bar(bar, _spread(bar.ts))
 
@@ -283,7 +284,7 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
             bar = feed.latest_completed(current_ts)
             if bar is None:
                 raise ValueError(
-                    f"no completed 1m bar for rate conversion at "
+                    f"no completed {dataset.base_interval} bar for rate conversion at "
                     f"{current_ts.isoformat()}")
             return ConversionRate(bar.close, ccy, account_ccy, (bar.ts,))
         raise ValueError(
@@ -315,7 +316,8 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
             # 市場オープンでも、1 tick 遅れの執行時にクローズしている場合が
             # ある (例: 金曜クローズ直前バケットの提案)。執行直前に再確認し、
             # クローズ中なら発注せず破棄する (週明けの執行は stale で不可)。
-            if market_hours.is_market_open(now):
+            if (market_hours.is_market_open(now)
+                    and feed.latest_completed(now) is not None):
                 mid = missions.start(conn, "trade", "backtest",
                                      "intent-source", now)
                 missions.finish(conn, mid, "completed", pending_proposal, [],
@@ -323,6 +325,10 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
                 intent = TradeIntent.from_llm_dict(pending_proposal,
                                                    origin=Origin.SCHEDULER)
                 executor.handle_intent(intent, mid)
+            elif market_hours.is_market_open(now):
+                activity.write(
+                    Category.TRADE, "proposal_dropped_no_bar",
+                    f"proposal dropped: no completed bar at {now.isoformat()}")
             pending_proposal = None
         # バケット境界の錨は UTC epoch (実運用の datafeed.bars.resample /
         # BAR_ANCHOR="epoch" と同じ規律) — `start` 相対にすると、start が
