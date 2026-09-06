@@ -38,14 +38,17 @@ NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
 # 偶然一致する」変異を検出できるようにする。
 SETTINGS = load_settings(_EXAMPLE).model_copy(update={
     "backtest": load_settings(_EXAMPLE).backtest.model_copy(
-        update={"eval_source": "mt5", "base_interval": "5m"})})
+        update={"eval_source": "mt5", "base_interval": "5m"}),
+    "plugin": load_settings(_EXAMPLE).plugin.model_copy(
+        update={"producer_source": "twelvedata"})})
 
 INDICATOR_PY = "def compute(df, params):\n    return {'v': 1.0}\n"
 STRATEGY_PY = ("def evaluate(df, indicators, signals, params):\n"
               "    return {'action': 'hold', 'rationale': 'x'}\n")
 TEST_PY_OK = "def test_x():\n    pass\n"
 
-_CONTRACT_KEYS = {"eval_source", "base_interval", "eval_timeframe"}
+_CONTRACT_KEYS = {
+    "eval_source", "base_interval", "eval_timeframe", "live_source"}
 
 
 def _conn(tmp_path):
@@ -196,13 +199,14 @@ def test_four_payload_systems_share_eval_contract(tmp_path, monkeypatch, kind):
 
     if kind == "strategy":
         expected = {"eval_source": "mt5", "base_interval": "5m",
-                    "eval_timeframe": "24h"}  # "1d" → "24h" 写像後
+                    "eval_timeframe": "24h",  # "1d" → "24h" 写像後
+                    "live_source": "twelvedata"}
     else:
         expected = {"eval_source": None, "base_interval": None,
-                    "eval_timeframe": None}
+                    "eval_timeframe": None, "live_source": "twelvedata"}
 
     for system, payload in payloads.items():
-        # 完全キー集合: 3 キーとも必ず存在する (欠落キーは契約違反)。
+        # 完全キー集合: 4 キーとも必ず存在する (欠落キーは契約違反)。
         assert _CONTRACT_KEYS.issubset(payload.keys()), (
             f"{system}: {_CONTRACT_KEYS - payload.keys()} キーが欠落")
         actual = {k: payload[k] for k in _CONTRACT_KEYS}

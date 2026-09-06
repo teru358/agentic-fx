@@ -535,6 +535,7 @@ def submit_candidate(
                               if meta.kind == "strategy" else None),
             "eval_timeframe": (strategy_gate._eval_timeframe(meta.timeframe)
                               if meta.kind == "strategy" else None),
+            "live_source": settings.plugin.producer_source,
             "mission_id": mission_id, "backlog_id": backlog_id,
         }
         conn.execute("BEGIN IMMEDIATE")
@@ -1194,6 +1195,7 @@ def bless_candidate(
                               if meta.kind == "strategy" else None),
             "eval_timeframe": (strategy_gate._eval_timeframe(meta.timeframe)
                               if meta.kind == "strategy" else None),
+            "live_source": settings.plugin.producer_source,
             "mission_id": None, "backlog_id": None,
         }
 

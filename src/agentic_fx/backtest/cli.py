@@ -34,6 +34,7 @@ from agentic_fx.plugin import approval as plugin_approval
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin import strategy_adapter
+from agentic_fx.plugin import strategy_gate
 from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.service import ensure_initialized
 from agentic_fx.store import backtest_runs, ohlcv
@@ -98,7 +99,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     source_group.add_argument("--proposal-file")
     source_group.add_argument("--plugin", help="評価する strategy plugin の名前 "
                               "(<cwd>/plugins/<name>/)")
-    run.add_argument("--timeframe", default="1h")
+    run.add_argument("--timeframe", default=None)
 
     analyze = sub.add_parser("analyze", help="履歴分析")
     analyze_sub = analyze.add_subparsers(dest="analyze_command",
@@ -312,14 +313,15 @@ def _backtest_run_proposal(conn, settings, args: argparse.Namespace) -> int:
         return 1
 
     dataset = HistoryDataset(args.source, args.base_interval)
+    timeframe = args.timeframe or "1h"
     result = run_replay(settings, symbol=args.symbol, dataset=dataset,
                         start=args.from_, end=args.to,
                         intent_source=intent_source,
-                        eval_timeframe=args.timeframe, history_conn=conn)
+                        eval_timeframe=timeframe, history_conn=conn)
     metrics = compute_metrics(result)
     run_id = backtest_runs.save_human_run(
         conn, plugin_ref=str(proposal_path), content_hash=content_hash,
-        kind="proposals", pair=args.symbol, timeframe=args.timeframe,
+        kind="proposals", pair=args.symbol, timeframe=timeframe,
         source=dataset.source, base_interval=dataset.base_interval,
         period=(args.from_, args.to), metrics=metrics,
         settings_hash=backtest_runs.settings_snapshot_hash(settings),
@@ -351,6 +353,7 @@ def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
              "(backtest run --plugin は kind=strategy のみ対応)",
              file=sys.stderr)
         return 1
+    timeframe = strategy_gate._eval_timeframe(args.timeframe or meta.timeframe)
     if args.symbol not in meta.pairs:
         print(f"エラー: plugin '{args.plugin}' は symbol={args.symbol!r} を "
              f"宣言していません (pairs={meta.pairs})", file=sys.stderr)
@@ -380,7 +383,7 @@ def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
         result = run_replay(settings, symbol=args.symbol, dataset=dataset,
                             start=args.from_, end=args.to,
                             intent_source=intent_source,
-                            eval_timeframe=args.timeframe, history_conn=conn)
+                            eval_timeframe=timeframe, history_conn=conn)
     except plugin_sandbox.SandboxError as e:
         print(f"エラー: plugin '{args.plugin}' の評価がサンドボックスエラーで"
              f"停止しました (backtest_runs 行は残しません): "
@@ -399,7 +402,7 @@ def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
     metrics = compute_metrics(result)
     run_id = backtest_runs.save_human_run(
         conn, plugin_ref=f"plugins/{meta.name}", content_hash=meta.content_hash,
-        kind="strategy", pair=args.symbol, timeframe=args.timeframe,
+        kind="strategy", pair=args.symbol, timeframe=timeframe,
         source=dataset.source, base_interval=dataset.base_interval,
         period=(args.from_, args.to), metrics=metrics,
         settings_hash=backtest_runs.settings_snapshot_hash(settings),

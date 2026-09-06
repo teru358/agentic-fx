@@ -18,6 +18,7 @@ from agentic_fx.plugin.loader import (
 )
 from agentic_fx.plugin.loader import _MAX_FILE_BYTES
 from agentic_fx.plugin.sandbox import _SINGLE_THREAD_ENV
+from agentic_fx.plugin.worker import _NPROC_CAP
 from agentic_fx.runners.launcher import build_launcher_argv
 
 if TYPE_CHECKING:
@@ -163,6 +164,10 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
             "RLIMIT_AS": (settings.plugin.sandbox_memory_mb * 1024 * 1024,) * 2,
             "RLIMIT_NOFILE": (settings.plugin.sandbox_nofile,) * 2,
             "RLIMIT_FSIZE": (settings.plugin.sandbox_fsize_mb * 1024 * 1024,) * 2,
+            # RLIMIT_NPROC is a per-uid cumulative counter, so keep the same
+            # deliberately generous, best-effort cap as plugin.worker.  CPU/AS
+            # remain the primary defenses; this only limits accidental forks.
+            "RLIMIT_NPROC": (_NPROC_CAP, _NPROC_CAP),
         }
         argv = build_launcher_argv(
             os.getpid(),
@@ -195,7 +200,12 @@ def run_gate_pytest(plugin_dir: Path, *, settings: "Settings") -> GateResult:
                 os.killpg(proc.pid, __import__("signal").SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
-            stdout, _ = proc.communicate()
+            try:
+                stdout, _ = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                stdout = "\n[gate_pytest] gate timeout: stdout holder survived"
             returncode = -1
         duration = time.monotonic() - started
 

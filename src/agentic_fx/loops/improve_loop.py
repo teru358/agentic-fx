@@ -1101,6 +1101,7 @@ class ImproveLoop:
             "eval_timeframe": (_strategy_gate_eval_timeframe(
                                    getattr(gate_metrics.get("meta"), "timeframe", None))
                                if kind == "strategy" else None),
+            "live_source": self._settings.plugin.producer_source,
             "mission_id": mission_id, "backlog_id": backlog_id,
             "in_sample": gate_metrics.get("in_sample"),
             "holdout": gate_metrics.get("holdout"),
@@ -1549,6 +1550,11 @@ class ImproveLoop:
                     return
 
                 kind = self._read_candidate_kind(candidate_dir)
+                if kind not in {"indicator", "strategy"}:
+                    self._finalize_gate_failed(
+                        conn, ctx=ctx, backlog_id=selection.backlog_id,
+                        reason=f"gate_failed:kind_unsupported:{kind}", now=now)
+                    return
                 if kind == "strategy":
                     try:
                         strategy_verdict = self._run_strategy_gate(     # 手順4

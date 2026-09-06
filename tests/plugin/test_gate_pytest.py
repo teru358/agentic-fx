@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import os
+import signal
+import time
 from pathlib import Path
 
 import pytest
@@ -321,6 +323,59 @@ def test_run_gate_pytest_fails_for_failing_test(tmp_path, settings):
     result = run_gate_pytest(d, settings=settings)
     assert result.passed is False
     assert result.returncode != 0
+
+
+def test_run_gate_pytest_timeout_returns_when_detached_stdout_holder_survives(
+        tmp_path, settings, monkeypatch):
+    """A detached grandchild retaining stdout must not hang timeout cleanup."""
+    _skip_if_no_landlock()
+    d = _write_candidate(tmp_path, test_py=_PASSING_TEST)
+    pid_file = tmp_path / "grandchild.pid"
+    fake_pytest = tmp_path / "fake-pytest"
+    fake_pytest.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, time\n"
+        "pid = os.fork()\n"
+        "if pid == 0:\n"
+        "    os.setsid()\n"
+        f"    open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "    time.sleep(60)\n"
+        "else:\n"
+        "    time.sleep(60)\n")
+    fake_pytest.chmod(0o700)
+
+    captured_rlimits = {}
+
+    def fake_launcher(_parent_pid, _argv, *, rlimits):
+        captured_rlimits.update(rlimits)
+        return [str(fake_pytest)]
+
+    import agentic_fx.plugin.gate_pytest as gate_mod
+    monkeypatch.setattr(gate_mod, "build_launcher_argv", fake_launcher)
+    short_settings = settings.model_copy(update={
+        "plugin": settings.plugin.model_copy(update={"pytest_timeout_sec": 0.1})})
+
+    grandchild_pid = None
+    started = time.monotonic()
+    try:
+        result = run_gate_pytest(d, settings=short_settings)
+        elapsed = time.monotonic() - started
+        if pid_file.exists():
+            grandchild_pid = int(pid_file.read_text())
+    finally:
+        if grandchild_pid is None and pid_file.exists():
+            grandchild_pid = int(pid_file.read_text())
+        if grandchild_pid is not None:
+            try:
+                os.kill(grandchild_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    assert elapsed < 10
+    assert result.passed is False
+    assert result.returncode == -1
+    assert "gate timeout: stdout holder survived" in result.stdout_tail
+    assert captured_rlimits["RLIMIT_NPROC"] == (512, 512)
 
 
 def test_run_gate_pytest_candidate_dir_is_read_only(tmp_path, settings):

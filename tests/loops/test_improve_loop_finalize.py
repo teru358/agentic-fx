@@ -155,6 +155,52 @@ def test_commit_loader_rejection_becomes_gate_failed(
     assert mission_row["status"] == "completed"
 
 
+def test_commit_signal_candidate_is_gate_failed_without_approval(
+        loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    _write_candidate(staging_dir, "mysignal")
+    candidate_dir = staging_dir / "mysignal"
+    (candidate_dir / "plugin.py").write_text(
+        "def detect(df, params):\n    return []\n")
+    (candidate_dir / "config.yaml").write_text(
+        "kind: signal\npairs: ['USDJPY']\ntimeframe: '1h'\n")
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    result = MissionResult(status="completed", output={
+        "discoveries": [],
+        "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "artifact": {"type": "plugin", "name": "mysignal", "kind": "signal",
+                     "self_test": "passed", "summary": "s"},
+        "selection_rationale": "r"}, transcript=[])
+    gate_verdict = SimpleNamespace(
+        passed=True, content_hash="c" * 64, artifact_hash="a" * 64)
+    candidate_meta = SimpleNamespace(max_bars=100)
+    monkeypatch.setattr(
+        loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.loader._discover_one",
+        lambda *a, **kw: candidate_meta)
+
+    loop_full.commit(mission=mission, ctx=ctx, result=result,
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc))
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'"
+    ).fetchone()[0] == 0
+    backlog = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()
+    assert backlog["status"] == "observation"
+    assert backlog["last_result"] == "gate_failed:kind_unsupported:signal"
+
+
 def test_commit_strategy_missing_history_becomes_gate_failed(
         loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
     mission_id, run_id, backlog_id = mission_and_run_fixture

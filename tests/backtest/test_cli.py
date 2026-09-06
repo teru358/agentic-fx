@@ -469,6 +469,48 @@ def test_cli_backtest_run_plugin_records_strategy_scope(tmp_path, monkeypatch,
     sentinel_source.close.assert_called_once()  # try/finally が close() を呼ぶ
 
 
+@pytest.mark.parametrize("explicit_timeframe", [True, False])
+def test_cli_backtest_run_plugin_normalizes_declared_or_explicit_daily_timeframe(
+        tmp_path, monkeypatch, explicit_timeframe):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    _write_strategy_plugin(
+        tmp_path / "plugins", "daily", pairs=["USDJPY"], timeframe="1d")
+    seed_conn = connect(tmp_path / "data" / "agentic.db")
+    init_db(seed_conn)
+    from agentic_fx.store import ohlcv as ohlcv_store
+    ohlcv_store.import_history_bars(
+        seed_conn, [("USDJPY", "1m", "2026-07-01T00:00:00+00:00",
+                    148.0, 148.2, 147.9, 148.1, 10.0, 0.01)],
+        source="dukascopy")
+    seed_conn.close()
+    fake_result = BacktestResult(
+        orders=[], equity_curve=[("2026-07-01T00:00:00+00:00", 1_000_000.0)],
+        start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        source="dukascopy", fallback_spread_used=False)
+    sentinel_source = MagicMock(eval_count=0)
+    argv = ["backtest", "run", "--symbol", "USDJPY", "--source", "dukascopy",
+            "--from", "2026-07-01", "--to", "2026-07-02", "--plugin", "daily"]
+    if explicit_timeframe:
+        argv.extend(["--timeframe", "1d"])
+
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay", return_value=fake_result), \
+         patch("agentic_fx.backtest.cli.strategy_adapter.build_intent_source",
+               return_value=sentinel_source), \
+         patch("agentic_fx.backtest.cli.backtest_runs.core_commit",
+               return_value="deadbeef"):
+        rc = main(argv)
+
+    assert rc == 0
+    check_conn = connect(tmp_path / "data" / "agentic.db")
+    row = check_conn.execute(
+        "SELECT timeframe FROM backtest_runs ORDER BY id DESC LIMIT 1").fetchone()
+    check_conn.close()
+    assert row["timeframe"] == "24h"
+
+
 def test_cli_backtest_run_plugin_closes_session_even_if_run_replay_raises(
         tmp_path, monkeypatch, capsys):
     """F3 (sonnet Important — レビュー fix round 1): `try/finally:
