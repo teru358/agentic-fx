@@ -816,3 +816,35 @@ def test_kill_switch_event_reset_reports_released_kind(tmp_path):
     state.update(kill_switch_latched=False)
     kinds = [t["kind"] for t in state.kill_switch_transitions]
     assert kinds == ["latched", "released"]
+
+
+def test_kill_switch_events_use_kind_as_same_timestamp_tiebreak(
+        tmp_path, monkeypatch):
+    """同一 ts のイベントは kind を第 2 sort key として決定的に並べる。"""
+    hist = _conn(tmp_path)
+    real_init = runner_module._RecordingStateStore.__init__
+
+    def init_with_reverse_kind_order(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        ts = WED.isoformat()
+        self.kill_switch_transitions = [
+            {"ts": ts, "kind": "released", "reason": "released",
+             "snapshot_id": 999},
+            {"ts": ts, "kind": "latched", "reason": "latched",
+             "snapshot_id": 999},
+        ]
+
+    monkeypatch.setattr(
+        runner_module._RecordingStateStore, "__init__",
+        init_with_reverse_kind_order)
+
+    res = run_replay(
+        SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+        start=WED, end=WED + timedelta(minutes=2),
+        intent_source=lambda bar: None, eval_timeframe="1h",
+        history_conn=hist)
+
+    assert [(event["ts"], event["kind"]) for event in res.kill_switch_events] == [
+        (WED.isoformat(), "latched"),
+        (WED.isoformat(), "released"),
+    ]

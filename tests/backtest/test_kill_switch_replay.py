@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -32,6 +32,19 @@ def test_release_due_waits_for_real_market_open(now, expected):
     mtm = {"id": 2, "ts": now.isoformat(), "source": "paper"}
     assert _release_is_due(now=now, latched_at=latched_at, mtm=mtm,
                            before_id=1) is expected
+
+
+def test_release_due_includes_exact_rollover_boundary():
+    latched_at = datetime(2026, 9, 3, 20, tzinfo=UTC)
+    rollover = datetime(2026, 9, 3, 21, tzinfo=UTC)
+    mtm = {"id": 2, "ts": rollover.isoformat(), "source": "paper"}
+
+    assert not _release_is_due(
+        now=rollover - timedelta(microseconds=1), latched_at=latched_at,
+        mtm={**mtm, "ts": (rollover - timedelta(microseconds=1)).isoformat()},
+        before_id=1)
+    assert _release_is_due(
+        now=rollover, latched_at=latched_at, mtm=mtm, before_id=1)
 
 
 def test_release_requires_fresh_same_tick_paper_mtm():
@@ -107,6 +120,18 @@ def test_event_uses_transition_snapshot_id_not_later_row(tmp_path):
     assert _kill_switch_event(conn, transition, "latched")["drawdown_pct"] == 20
 
 
+def test_event_with_explicit_null_snapshot_has_null_drawdown(tmp_path):
+    now = datetime(2026, 9, 6, 21, tzinfo=UTC)
+    conn = connect(tmp_path / "x.db"); init_db(conn)
+    _mtm(conn, now, equity=80_000, hwm=100_000)
+    transition = {"ts": now.isoformat(), "kind": "latched", "reason": "x",
+                  "snapshot_id": None}
+
+    event = _kill_switch_event(conn, transition, "latched")
+
+    assert event["drawdown_pct"] is None
+
+
 class _FaultConn:
     def __init__(self, conn, fault): self.conn, self.fault = conn, fault
     def execute(self, sql, params=()):
@@ -165,6 +190,23 @@ def test_executor_transition_rejects_stale_or_non_paper_snapshot():
         {"id": 3, "ts": now.replace(minute=59).isoformat(), "source": "paper"}, now) is None
     assert _executor_transition_snapshot_id(
         {"id": 3, "ts": now.isoformat(), "source": "replay_ks_rebase"}, now) is None
+
+
+def test_executor_transition_accepts_missing_latest_snapshot():
+    now = datetime(2026, 9, 6, 21, tzinfo=UTC)
+
+    assert _executor_transition_snapshot_id(None, now) is None
+
+
+def test_repeated_latched_value_does_not_publish_duplicate_transition(tmp_path):
+    now = datetime(2026, 9, 6, 21, tzinfo=UTC)
+    state = _RecordingStateStore(tmp_path / "state.json", clock=ReplayClock(now))
+
+    state.update(kill_switch_latched=True)
+    state.update(kill_switch_latched=True)
+
+    assert [transition["kind"] for transition in state.kill_switch_transitions] == [
+        "latched"]
 
 
 def test_compensation_failure_aborts_replay_operation(tmp_path):
