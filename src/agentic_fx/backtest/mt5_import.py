@@ -11,6 +11,7 @@ Dukascopy 側 (mid 系列) と揃える。
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -21,6 +22,14 @@ from agentic_fx.datafeed.sources import _mt5_headers
 from agentic_fx.store.ohlcv import ImportResult, import_history_bars
 
 _log = logging.getLogger(__name__)
+
+
+class ImportConflictError(ValueError):
+    """An MT5 window contained values conflicting with immutable history."""
+
+    def __init__(self, conflicts):
+        self.conflicts = conflicts
+        super().__init__(f"MT5 import conflicts: {len(conflicts)} row(s)")
 
 
 def _default_fetch(url: str) -> dict:
@@ -35,9 +44,14 @@ def _default_fetch(url: str) -> dict:
     return resp.json()
 
 
-def _window_url(base_url: str, symbol: str, start: datetime, end: datetime) -> str:
+_INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900}
+_BAR_FIELDS = ("time", "open", "high", "low", "close", "volume")
+
+
+def _window_url(base_url: str, symbol: str, start: datetime, end: datetime,
+                interval: str = "1m") -> str:
     return (f"{base_url}/ohlcv/{symbol}?from={quote(start.isoformat())}"
-            f"&to={quote(end.isoformat())}&interval=1m")
+            f"&to={quote(end.isoformat())}&interval={interval}")
 
 
 def _normalize_bar_time(raw: str) -> tuple[str, bool]:
@@ -63,8 +77,119 @@ def _normalize_bar_time(raw: str) -> tuple[str, bool]:
     return dt.isoformat(), was_naive
 
 
+def _validated_window_rows(payload, *, symbol: str, interval: str,
+                           current: datetime, window_end: datetime
+                           ) -> tuple[list[tuple], int, int]:
+    """Validate a complete bridge response before returning import rows."""
+    if not isinstance(payload, dict):
+        raise ValueError("import_mt5: payload must be a dict")
+    for field in ("symbol", "interval", "bars"):
+        if field not in payload:
+            raise ValueError(f"import_mt5: payload missing required {field!r}")
+    if not isinstance(payload["bars"], list):
+        raise ValueError("import_mt5: payload 'bars' must be a list")
+    if payload["symbol"] != symbol:
+        raise ValueError(
+            f"import_mt5: payload symbol={payload['symbol']!r} does not match "
+            f"requested symbol={symbol!r}")
+    if payload["interval"] != interval:
+        raise ValueError(
+            f"import_mt5: payload interval={payload['interval']!r} does not "
+            f"match requested interval={interval!r}")
+
+    normalized = []
+    naive_count = 0
+    for idx, bar in enumerate(payload["bars"]):
+        if not isinstance(bar, dict):
+            raise ValueError(f"import_mt5: bars[{idx}] must be a dict")
+        for field in _BAR_FIELDS:
+            if field not in bar:
+                raise ValueError(
+                    f"import_mt5: bars[{idx}] missing required {field!r}")
+        for field in ("open", "high", "low", "close", "volume"):
+            value = bar[field]
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or not math.isfinite(value)):
+                raise ValueError(
+                    f"import_mt5: bars[{idx}] {field} must be a finite number")
+        try:
+            bar_time_iso, was_naive = _normalize_bar_time(bar["time"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"import_mt5: bars[{idx}] time is not parseable: "
+                f"{bar['time']!r}") from exc
+        naive_count += int(was_naive)
+
+        o, h, low, close, volume = (
+            bar["open"], bar["high"], bar["low"], bar["close"],
+            bar["volume"])
+        if any(price <= 0 for price in (o, h, low, close)):
+            raise ValueError(f"import_mt5: bars[{idx}] prices must be > 0")
+        if low > min(o, close):
+            raise ValueError(
+                f"import_mt5: bars[{idx}] low must be <= min(open, close)")
+        if h < max(o, close):
+            raise ValueError(
+                f"import_mt5: bars[{idx}] high must be >= max(open, close)")
+        if volume < 0:
+            raise ValueError(f"import_mt5: bars[{idx}] volume must be >= 0")
+        normalized.append((bar, datetime.fromisoformat(bar_time_iso),
+                           bar_time_iso, o, h, low, close, volume))
+
+    right_edge_count = sum(item[1] == window_end for item in normalized)
+    if right_edge_count > 1:
+        raise ValueError(
+            "import_mt5: more than one right-edge bar at window_end")
+    remaining = [item for item in normalized if item[1] != window_end]
+    for bar, bar_dt, *_rest in remaining:
+        if not (current <= bar_dt < window_end):
+            raise ValueError(
+                f"import_mt5: symbol={symbol!r} のバー time={bar['time']!r} "
+                f"が要求窓 [{current.isoformat()}, {window_end.isoformat()}) "
+                "の外です (bridge の不具合の可能性)")
+
+    width_sec = _INTERVAL_SECONDS[interval]
+    capacity = int((window_end - current).total_seconds()) // width_sec
+    if len(remaining) > capacity:
+        raise ValueError(
+            f"import_mt5: bar count {len(remaining)} exceeds window capacity "
+            f"{capacity} for interval={interval}")
+    times = [item[1] for item in remaining]
+    if len(set(times)) != len(times):
+        raise ValueError("import_mt5: bar times must be unique")
+    if any(left >= right for left, right in zip(times, times[1:])):
+        raise ValueError("import_mt5: bar times must be strictly increasing")
+    for bar_dt in times:
+        if bar_dt.timestamp() % width_sec != 0:
+            raise ValueError(
+                f"import_mt5: bar time {bar_dt.isoformat()} is off interval grid")
+
+    rows = [(symbol, interval, bar_time_iso, o, h, low, close, volume, None)
+            for _bar, _dt, bar_time_iso, o, h, low, close, volume in remaining]
+    return rows, naive_count, right_edge_count
+
+
+def _conflict_details(conn, rows: list[tuple]) -> list[tuple]:
+    conflicts = []
+    for symbol, interval, bar_time, o, h, low, close, volume, _spread in rows:
+        existing = conn.execute(
+            "SELECT open, high, low, close, volume FROM ohlcv_history "
+            "WHERE source='mt5' AND symbol=? AND interval=? AND bar_time=?",
+            (symbol, interval, bar_time)).fetchone()
+        if existing is None:
+            continue
+        existing_values = tuple(existing[name] for name in
+                                ("open", "high", "low", "close", "volume"))
+        incoming_values = (o, h, low, close, volume)
+        if any(abs(a - b) >= 1e-9
+               for a, b in zip(existing_values, incoming_values)):
+            conflicts.append((symbol, interval, bar_time, existing_values,
+                              incoming_values))
+    return conflicts
+
+
 def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
-               base_url: str, fetch=None) -> ImportResult:
+               base_url: str, fetch=None, interval: str = "1m") -> ImportResult:
     """MT5 bridge から 1 分足を 1 日窓でページングして取り込む。
 
     Args:
@@ -94,6 +219,15 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
                 f"{name} must be timezone-aware; got naive datetime")
         if dt.tzinfo != timezone.utc:
             raise ValueError(f"{name} must be UTC; got {dt.tzinfo}")
+    if interval not in _INTERVAL_SECONDS:
+        raise ValueError(
+            f"interval must be one of {sorted(_INTERVAL_SECONDS)}; got {interval!r}")
+    if start >= end:
+        raise ValueError("start must be earlier than end")
+    width_sec = _INTERVAL_SECONDS[interval]
+    for dt, name in ((start, "start"), (end, "end")):
+        if dt.timestamp() % width_sec != 0:
+            raise ValueError(f"{name} must be aligned to the {interval} grid")
 
     if fetch is None:
         fetch = _default_fetch
@@ -107,50 +241,26 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
     current = start
     while current < end:
         window_end = min(current + timedelta(days=1), end)
-        url = _window_url(base_url, symbol, current, window_end)
+        url = _window_url(base_url, symbol, current, window_end, interval)
         payload = fetch(url)
-
-        # payload["bars"] を必須で読む (F: sources.py:mt5_bars_range と同じ
-        # fail-loud パターン)。.get(..., []) にすると HTTP 200 でエラー body
-        # を返す bridge 障害時に「0 件」と区別が付かなくなる。
-        rows = []
-        for b in payload["bars"]:
-            bar_time_iso, was_naive = _normalize_bar_time(b["time"])
-            if was_naive:
-                naive_count += 1
-            # F5 (最終レビュー codex I2): 正規化後の timestamp を現在の取得窓
-            # [current, window_end) に対して検証する。bridge が "to" を
-            # inclusive 解釈した場合の境界重複や、bridge の不具合・キャッシュ
-            # 汚染による窓外行の無言混入を防ぐ (fail loud — import_history_bars の
-            # 既存行不変性は値の上書きを防ぐだけで、窓外の新規キー挿入は
-            # 防がない)。
-            bar_dt = datetime.fromisoformat(bar_time_iso)
-            if bar_dt == window_end:
-                # bridge は "to" を **inclusive** で返す (2026-08-12 実機実測:
-                # 1 日窓に対し先頭 T00:00・末尾は翌 T00:00 が含まれ 1440 本)。
-                # 終端ちょうどは「次窓の開始」であって不具合ではないので
-                # 落とす。次のページング窓が current=window_end で取り直すため
-                # **欠損しない** (最終窓の右端だけは落ちるが、end は exclusive
-                # なのでそれが正しい)。
-                #
-                # 旧実装はここも fail loud にしており、境界に 1 本乗るだけで
-                # **取り込み全体が失敗**していた (実機で 1440 本が 1 本も
-                # 入らなかった)。窓外の無言混入を防ぐ F5 の目的は下の判定で維持。
-                right_edge_drops += 1
-                continue
-            if not (current <= bar_dt < window_end):
-                raise ValueError(
-                    f"import_mt5: symbol={symbol!r} のバー time={b['time']!r} "
-                    f"が要求窓 [{current.isoformat()}, {window_end.isoformat()}) "
-                    "の外です (bridge の不具合の可能性)")
-            rows.append((symbol, "1m", bar_time_iso,
-                        float(b["open"]), float(b["high"]), float(b["low"]),
-                        float(b["close"]), float(b["volume"]), None))
+        try:
+            rows, window_naive, window_right_edges = _validated_window_rows(
+                payload, symbol=symbol, interval=interval, current=current,
+                window_end=window_end)
+        except ValueError as exc:
+            raise ValueError(
+                f"import_mt5: failed window [{current.isoformat()}, "
+                f"{window_end.isoformat()}); last successful window end="
+                f"{current.isoformat()}: {exc}") from exc
+        naive_count += window_naive
+        right_edge_drops += window_right_edges
         if rows:
             result = import_history_bars(conn, rows, source="mt5")
             total_inserted += result.inserted
             total_unchanged += result.unchanged
             total_conflicted += result.conflicted
+            if result.conflicted > 0:
+                raise ImportConflictError(_conflict_details(conn, rows))
 
         current = window_end
 

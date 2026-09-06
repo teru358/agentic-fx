@@ -25,7 +25,8 @@ from agentic_fx.backtest.analysis import coverage_report, corr_matrix
 from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
-from agentic_fx.backtest.mt5_import import compare_sources, import_mt5
+from agentic_fx.backtest.mt5_import import (
+    ImportConflictError, compare_sources, import_mt5)
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
@@ -65,6 +66,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     imp.add_argument("--symbol", required=True)
     imp.add_argument("--from", dest="from_", type=_parse_date, required=True)
     imp.add_argument("--to", dest="to", type=_parse_date, required=True)
+    imp.add_argument("--interval", choices=("1m", "5m", "15m"), default="1m")
     imp.add_argument("--max-requests", type=int, default=None,
                      help="dukascopy: 1 回で投げるリクエスト上限 (既定 500)。"
                           "相手は無料公開サービスなので 1 秒間隔で投げる — "
@@ -72,6 +74,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
 
     comp = history_sub.add_parser("compare", help="source 間の close 差照合")
     comp.add_argument("--symbol", required=True)
+    comp.add_argument("--interval", choices=("1m", "5m", "15m"), required=True)
 
     cov = history_sub.add_parser("coverage", help="カバレッジレポート")
     cov.add_argument("--symbol", required=True)
@@ -168,6 +171,20 @@ def _make_dukascopy_progress():
 
 
 def _history_import(conn, settings, args: argparse.Namespace) -> int:
+    if args.source == "dukascopy" and args.interval != "1m":
+        print("エラー: dukascopy import は interval=1m のみ対応しています",
+              file=sys.stderr)
+        return 2
+    width_sec = {"1m": 60, "5m": 300, "15m": 900}[args.interval]
+    if args.from_ >= args.to:
+        print("エラー: --from は --to より前でなければなりません",
+              file=sys.stderr)
+        return 2
+    if (args.from_.timestamp() % width_sec != 0
+            or args.to.timestamp() % width_sec != 0):
+        print(f"エラー: --from/--to は {args.interval} 格子に整列が必要です",
+              file=sys.stderr)
+        return 2
     if args.source == "dukascopy":
         kw = {} if args.max_requests is None else {
             "max_requests": args.max_requests}
@@ -178,16 +195,26 @@ def _history_import(conn, settings, args: argparse.Namespace) -> int:
         if bridge_url is None:
             print("datafeed.mt5.bridge_url が未設定です", file=sys.stderr)
             return 1
-        result = import_mt5(conn, args.symbol, args.from_, args.to,
-                            base_url=bridge_url)
+        try:
+            result = import_mt5(conn, args.symbol, args.from_, args.to,
+                                base_url=bridge_url, interval=args.interval)
+        except ImportConflictError as exc:
+            for _symbol, _interval, bar_time, existing, incoming in exc.conflicts:
+                print(f"conflict bar_time={bar_time} existing={existing} "
+                      f"incoming={incoming}", file=sys.stderr)
+            return 3
     print(f"inserted={result.inserted} unchanged={result.unchanged} "
          f"conflicted={result.conflicted}")
     return 0
 
 
 def _history_compare(conn, settings, args: argparse.Namespace) -> int:
-    result = compare_sources(conn, args.symbol, settings)
+    result = compare_sources(conn, args.symbol, settings,
+                             base_interval=args.interval)
     print(result)
+    if result["count"] == 0:
+        print("警告: 比較対象となる重複データがありません", file=sys.stderr)
+        return 2
     return 0
 
 

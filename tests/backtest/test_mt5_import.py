@@ -6,7 +6,7 @@ import pytest
 
 from agentic_fx.backtest import mt5_import
 from agentic_fx.backtest.mt5_import import (
-    _default_fetch, compare_sources, import_mt5)
+    ImportConflictError, _default_fetch, compare_sources, import_mt5)
 from agentic_fx.store import ohlcv
 from tests.backtest.factories import H, SETTINGS, _conn
 
@@ -219,13 +219,311 @@ def test_import_mt5_rejects_non_utc_end(tmp_path):
 
 
 def test_import_mt5_requires_bars_key(tmp_path):
-    """payload に "bars" キーが無い (bridge の障害応答等) 場合は KeyError で
-    fail-loud する — .get(..., []) で「0 件取り込み」と静かに区別が付かなく
-    なることを防ぐ (sources.py:mt5_bars_range と同じ契約)。"""
+    """payload の bars 欠落を ValueError で fail loud にする。"""
     conn = _conn(tmp_path)
-    with pytest.raises(KeyError):
+    with pytest.raises(ValueError, match="bars"):
         import_mt5(conn, "USDJPY", H, H + timedelta(days=1),
-                   base_url="http://x", fetch=lambda url: {"error": "oops"})
+                   base_url="http://x", fetch=lambda url: {
+                       "symbol": "USDJPY", "interval": "1m"})
+
+
+def _bar(ts=H, **changes):
+    bar = {"time": ts.isoformat(), "open": 148.0, "high": 148.2,
+           "low": 147.9, "close": 148.1, "volume": 10}
+    bar.update(changes)
+    return bar
+
+
+def _payload(*bars, symbol="USDJPY", interval="1m"):
+    return {"symbol": symbol, "interval": interval, "bars": list(bars)}
+
+
+@pytest.mark.parametrize("payload,match", [
+    ([], "payload"),                                      # S1
+    ({"interval": "1m", "bars": []}, "symbol"),         # S2a
+    ({"symbol": "USDJPY", "bars": []}, "interval"),     # S2b
+    ({"symbol": "USDJPY", "interval": "1m"}, "bars"),  # S2c
+    ({"symbol": "USDJPY", "interval": "1m", "bars": None}, "bars"),
+    ({"symbol": "USDJPY", "interval": "1m", "bars": {}}, "bars"),
+], ids=["S1", "S2a", "S2b", "S2c", "S3-null", "S3-dict"])
+def test_import_mt5_rejects_invalid_payload_structure(tmp_path, payload, match):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError, match=match):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                   base_url="http://x", fetch=lambda _url: payload)
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_history").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("missing", [
+    "time", "open", "high", "low", "close", "volume",
+], ids=["S4a-time", "S4b-open", "S4c-high", "S4d-low", "S4e-close",
+        "S4f-volume"])
+def test_import_mt5_rejects_bar_missing_required_field(tmp_path, missing):
+    conn = _conn(tmp_path)
+    bar = _bar()
+    del bar[missing]
+    with pytest.raises(ValueError, match=missing):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                   base_url="http://x", fetch=lambda _url: _payload(bar))
+
+
+def test_import_mt5_rejects_non_dict_bar(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError, match="bar"):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                   base_url="http://x", fetch=lambda _url: _payload([]))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("open", True), ("high", float("nan")), ("low", float("inf")),
+    ("close", "148.1"), ("volume", False),
+], ids=["S5a-bool", "S5b-nan", "S5c-inf", "S5d-str", "S5a-volume-bool"])
+def test_import_mt5_rejects_non_finite_or_non_numeric_ohlcv(
+        tmp_path, field, value):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError, match=field):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                   base_url="http://x",
+                   fetch=lambda _url: _payload(_bar(**{field: value})))
+
+
+def test_import_mt5_rejects_unparseable_time(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError, match="time"):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                   base_url="http://x",
+                   fetch=lambda _url: _payload(_bar(time="not-iso")))
+
+
+@pytest.mark.parametrize("payload", [
+    _payload(_bar(), symbol="EURUSD"),
+    _payload(_bar(), interval="5m"),
+], ids=["R1-symbol", "R2-interval"])
+def test_import_mt5_rejects_payload_identity_mismatch(tmp_path, payload):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                   base_url="http://x", fetch=lambda _url: payload)
+
+
+@pytest.mark.parametrize("changes", [
+    {"open": 0}, {"close": -1}, {"low": 148.05}, {"high": 148.05},
+    {"volume": -1},
+], ids=["R3-zero-price", "R3-negative-price", "R4a-low", "R4b-high",
+        "R5-volume"])
+def test_import_mt5_rejects_invalid_ohlcv_relationships(tmp_path, changes):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                   base_url="http://x",
+                   fetch=lambda _url: _payload(_bar(**changes)))
+
+
+def test_import_mt5_validates_right_edge_before_dropping(tmp_path):
+    conn = _conn(tmp_path)
+    end = H + timedelta(minutes=1)
+    with pytest.raises(ValueError):
+        import_mt5(conn, "USDJPY", H, end, base_url="http://x",
+                   fetch=lambda _url: _payload(_bar(end, open=0)))
+
+
+def test_import_mt5_rejects_two_right_edge_bars(tmp_path):
+    conn = _conn(tmp_path)
+    end = H + timedelta(minutes=1)
+    with pytest.raises(ValueError, match="right-edge|window_end|right edge"):
+        import_mt5(conn, "USDJPY", H, end, base_url="http://x",
+                   fetch=lambda _url: _payload(_bar(end), _bar(end)))
+
+
+@pytest.mark.parametrize("times", [
+    [H, H],
+    [H + timedelta(minutes=1), H],
+], ids=["T2-duplicate", "T3-descending"])
+def test_import_mt5_rejects_non_unique_or_non_increasing_times(tmp_path, times):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=2),
+                   base_url="http://x",
+                   fetch=lambda _url: _payload(*[_bar(ts) for ts in times]))
+
+
+@pytest.mark.parametrize("interval,offset", [
+    ("5m", timedelta(minutes=1)),
+    ("15m", timedelta(minutes=1)),
+], ids=["T4a-5m-grid", "T4b-aware-offset-normalized-grid"])
+def test_import_mt5_rejects_off_grid_bar_time(tmp_path, interval, offset):
+    conn = _conn(tmp_path)
+    ts = H + offset
+    if interval == "15m":
+        ts = ts.astimezone(timezone(timedelta(hours=9)))
+    with pytest.raises(ValueError, match="grid|格子"):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=15),
+                   base_url="http://x", interval=interval,
+                   fetch=lambda _url: _payload(_bar(ts), interval=interval))
+
+
+def test_import_mt5_accepts_aware_non_utc_bar_on_utc_grid(tmp_path):
+    conn = _conn(tmp_path)
+    same_instant = H.astimezone(timezone(timedelta(hours=9)))
+    result = import_mt5(
+        conn, "USDJPY", H, H + timedelta(minutes=5), base_url="http://x",
+        interval="5m",
+        fetch=lambda _url: _payload(_bar(same_instant), interval="5m"))
+    assert result.inserted == 1
+    assert ohlcv.load_history_bars(conn, "USDJPY", "5m", source="mt5")[0].ts == H
+
+
+def test_import_mt5_rejects_count_over_interval_capacity(tmp_path):
+    conn = _conn(tmp_path)
+    bars = [_bar(H + timedelta(seconds=i)) for i in range(61)]
+    with pytest.raises(ValueError, match="count|本数|capacity"):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                   base_url="http://x", fetch=lambda _url: _payload(*bars))
+
+
+def test_import_mt5_final_partial_window_uses_partial_capacity(tmp_path):
+    conn = _conn(tmp_path)
+    end = H + timedelta(days=1, minutes=5)
+
+    def fetch(url):
+        start = datetime.fromisoformat(_query_param(url, "from"))
+        stop = datetime.fromisoformat(_query_param(url, "to"))
+        if stop - start == timedelta(minutes=5):
+            return _payload(*[_bar(start + timedelta(seconds=i))
+                              for i in range(6)])
+        return _payload()
+
+    with pytest.raises(ValueError, match="count|本数|capacity"):
+        import_mt5(conn, "USDJPY", H, end, base_url="http://x", fetch=fetch)
+
+
+def test_import_mt5_right_edge_is_removed_before_capacity_check(tmp_path):
+    conn = _conn(tmp_path)
+    end = H + timedelta(minutes=1)
+    result = import_mt5(conn, "USDJPY", H, end, base_url="http://x",
+                        fetch=lambda _url: _payload(_bar(H), _bar(end)))
+    assert result.inserted == 1
+
+
+def test_import_mt5_5m_propagates_url_storage_and_daily_capacity(tmp_path):
+    conn = _conn(tmp_path)
+    seen = []
+    bars = [_bar(H + timedelta(minutes=5 * i)) for i in range(288)]
+
+    def fetch(url):
+        seen.append(url)
+        return _payload(*bars, interval="5m")
+
+    result = import_mt5(conn, "USDJPY", H, H + timedelta(days=1),
+                        base_url="http://x", fetch=fetch, interval="5m")
+    assert result.inserted == 288
+    assert _query_param(seen[0], "interval") == "5m"
+    assert len(ohlcv.load_history_bars(
+        conn, "USDJPY", "5m", source="mt5")) == 288
+
+
+def test_import_mt5_rejects_unsupported_interval_before_fetch(tmp_path):
+    conn = _conn(tmp_path)
+    calls = []
+    with pytest.raises(ValueError, match="interval"):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                   base_url="http://x", interval="2m",
+                   fetch=lambda url: calls.append(url))
+    assert calls == []
+
+
+@pytest.mark.parametrize("start,end", [
+    (H, H), (H + timedelta(minutes=1), H),
+], ids=["W1a-equal", "W1a-reversed"])
+def test_import_mt5_rejects_non_increasing_window_before_fetch(
+        tmp_path, start, end):
+    conn = _conn(tmp_path)
+    calls = []
+    with pytest.raises(ValueError, match="start|end"):
+        import_mt5(conn, "USDJPY", start, end, base_url="http://x",
+                   fetch=lambda url: calls.append(url))
+    assert calls == []
+
+
+def test_import_mt5_rejects_misaligned_window_before_fetch(tmp_path):
+    conn = _conn(tmp_path)
+    calls = []
+    with pytest.raises(ValueError, match="grid|格子"):
+        import_mt5(conn, "USDJPY", H + timedelta(minutes=1),
+                   H + timedelta(minutes=11), base_url="http://x",
+                   interval="5m", fetch=lambda url: calls.append(url))
+    assert calls == []
+
+
+def test_import_mt5_two_window_failure_keeps_first_window(tmp_path):
+    conn = _conn(tmp_path)
+
+    def fetch(url):
+        start = datetime.fromisoformat(_query_param(url, "from"))
+        if start == H:
+            return _payload(_bar(H))
+        return _payload(_bar(start, open=0))
+
+    with pytest.raises(ValueError):
+        import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
+                   base_url="http://x", fetch=fetch)
+    bars = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
+    assert [bar.ts for bar in bars] == [H]
+
+
+def test_import_mt5_validation_error_reports_failed_window_and_last_success(
+        tmp_path):
+    conn = _conn(tmp_path)
+
+    def fetch(url):
+        start = datetime.fromisoformat(_query_param(url, "from"))
+        if start == H:
+            return _payload(_bar(H))
+        return _payload(_bar(start, open=0))
+
+    with pytest.raises(ValueError) as raised:
+        import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
+                   base_url="http://x", fetch=fetch)
+    message = str(raised.value)
+    assert f"failed window [{(H + timedelta(days=1)).isoformat()}" in message
+    assert f"last successful window end={ (H + timedelta(days=1)).isoformat()}" in message
+
+
+def test_import_mt5_same_payload_rerun_is_unchanged_only(tmp_path):
+    conn = _conn(tmp_path)
+    fetch = lambda _url: _payload(_bar(H))
+    first = import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                       base_url="http://x", fetch=fetch)
+    second = import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                        base_url="http://x", fetch=fetch)
+    assert first.inserted == 1
+    assert second == ohlcv.ImportResult(inserted=0, unchanged=1, conflicted=0)
+
+
+def test_import_mt5_conflict_raises_with_existing_and_incoming_and_stops(tmp_path):
+    conn = _conn(tmp_path)
+    ohlcv.import_history_bars(
+        conn, [("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9,
+                148.1, 10, None)], source="mt5")
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        start = datetime.fromisoformat(_query_param(url, "from"))
+        return _payload(_bar(start, open=149.0, high=149.2, low=148.9,
+                                 close=149.1, volume=20))
+
+    with pytest.raises(ImportConflictError) as raised:
+        import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
+                   base_url="http://x", fetch=fetch)
+    assert len(calls) == 1
+    assert raised.value.conflicts == [
+        ("USDJPY", "1m", H.isoformat(),
+         (148.0, 148.2, 147.9, 148.1, 10.0),
+         (149.0, 149.2, 148.9, 149.1, 20)),
+    ]
+    stored = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
+    assert stored[0].close == 148.1
 
 
 def test_import_mt5_normalizes_naive_bar_time_for_join(tmp_path):

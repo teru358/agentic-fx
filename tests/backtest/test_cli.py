@@ -19,6 +19,7 @@ import pytest
 import agentic_fx.backtest.cli as cli
 from agentic_fx.backtest import runner as runner_module
 from agentic_fx.backtest.dataset import HistoryDataset
+from agentic_fx.backtest.mt5_import import ImportConflictError
 from agentic_fx.backtest.runner import BacktestResult
 from tests.backtest.factories import DATASET_1M
 from agentic_fx.entry import main
@@ -77,6 +78,73 @@ def test_cli_history_import_mt5_dispatches_to_import_mt5(tmp_path, monkeypatch):
     assert mt5imp.called
     _, kwargs = mt5imp.call_args
     assert kwargs["base_url"] == "http://localhost:8812"
+    assert kwargs["interval"] == "1m"
+
+
+def test_cli_history_import_mt5_passes_explicit_interval(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.import_mt5") as mt5imp:
+        mt5imp.return_value = MagicMock(inserted=1, unchanged=0, conflicted=0)
+        rc = main(["history", "import", "--source", "mt5",
+                   "--symbol", "USDJPY", "--interval", "5m",
+                   "--from", "2026-07-01", "--to", "2026-07-02"])
+    assert rc == 0
+    assert mt5imp.call_args.kwargs["interval"] == "5m"
+
+
+def test_cli_history_import_rejects_dukascopy_non_1m_before_importer(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.import_dukascopy") as imp:
+        rc = main(["history", "import", "--source", "dukascopy",
+                   "--symbol", "USDJPY", "--interval", "5m",
+                   "--from", "2026-07-01", "--to", "2026-07-02"])
+    assert rc == 2
+    imp.assert_not_called()
+    assert "dukascopy" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("start,end", [
+    ("2026-07-01", "2026-07-01"),
+    ("2026-07-02", "2026-07-01"),
+    ("2026-07-01T00:01:00", "2026-07-01T00:06:00"),
+], ids=["equal-W1a", "reversed-W1a", "misaligned-W1b"])
+def test_cli_history_import_rejects_invalid_window_before_importer(
+        tmp_path, monkeypatch, capsys, start, end):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.import_mt5") as imp:
+        rc = main(["history", "import", "--source", "mt5",
+                   "--symbol", "USDJPY", "--interval", "5m",
+                   "--from", start, "--to", end])
+    assert rc == 2
+    imp.assert_not_called()
+    assert capsys.readouterr().err
+
+
+def test_cli_history_import_conflict_prints_details_and_returns_3(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    conflict = ("USDJPY", "5m", "2026-07-01T00:00:00+00:00",
+                (148.0, 148.2, 147.9, 148.1, 10.0),
+                (149.0, 149.2, 148.9, 149.1, 20.0))
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.import_mt5",
+               side_effect=ImportConflictError([conflict])):
+        rc = main(["history", "import", "--source", "mt5",
+                   "--symbol", "USDJPY", "--interval", "5m",
+                   "--from", "2026-07-01", "--to", "2026-07-02"])
+    assert rc == 3
+    err = capsys.readouterr().err
+    assert conflict[2] in err
+    assert "existing=(148.0, 148.2, 147.9, 148.1, 10.0)" in err
+    assert "incoming=(149.0, 149.2, 148.9, 149.1, 20.0)" in err
 
 
 def test_cli_history_import_mt5_requires_bridge_url(tmp_path, monkeypatch):
@@ -108,11 +176,38 @@ def test_cli_history_compare_prints_result(tmp_path, monkeypatch, capsys):
          patch("agentic_fx.backtest.cli.compare_sources") as cmp:
         cmp.return_value = {"count": 0, "mean": None, "std": None,
                             "max_abs": None}
-        rc = main(["history", "compare", "--symbol", "USDJPY"])
-    assert rc == 0
+        rc = main(["history", "compare", "--symbol", "USDJPY",
+                   "--interval", "1m"])
+    assert rc == 2
     assert cmp.called
-    out = capsys.readouterr().out
+    _, kwargs = cmp.call_args
+    assert kwargs["base_interval"] == "1m"
+    captured = capsys.readouterr()
+    out = captured.out
     assert "None" in out
+    assert "warning" in captured.err.lower() or "警告" in captured.err
+
+
+def test_cli_history_compare_passes_required_interval_and_nonempty_returns_zero(
+        tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.compare_sources") as cmp:
+        cmp.return_value = {"count": 2, "mean": 0.0, "std": 0.0,
+                            "max_abs": 0.0}
+        rc = main(["history", "compare", "--symbol", "USDJPY",
+                   "--interval", "15m"])
+    assert rc == 0
+    assert cmp.call_args.kwargs["base_interval"] == "15m"
+
+
+def test_cli_history_compare_requires_interval(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with pytest.raises(SystemExit) as raised:
+        main(["history", "compare", "--symbol", "USDJPY"])
+    assert raised.value.code == 2
 
 
 def test_cli_history_coverage_calls_report(tmp_path, monkeypatch):
