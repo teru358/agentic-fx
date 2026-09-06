@@ -981,7 +981,7 @@ def test_coverage_report_gap_pct(tmp_path):
 - Consumes: Task 4/5 importer / Task 7 runner / Task 8 metrics / Task 10 analysis
 - Produces (entry.py の sub_parsers に追加 — 既存 `init` と同居):
   - `afx history import --source {dukascopy,mt5} --symbol USDJPY --from 2016-01-01 --to 2026-05-01` — 一括取り込み (進捗を件数で表示)
-  - `afx history compare --symbol USDJPY` — compare_sources の表示
+  - `afx history compare --symbol USDJPY --interval 1m` — compare_sources の表示
   - `afx backtest run --symbol USDJPY --source dukascopy --from ... --to ... --proposal-file proposals.jsonl` — **人間用の自由期間** (scope=human_custom で保存)。proposal-file は `{"ts": iso, ...OPEN_INTENT 形...}` の JSONL (plugin 未実装のため、人間が用意した提案列を IntentSource 化する薄いアダプタ。プラン 7 で `--plugin` オプションが加わる)
   - `afx analyze corr --a USDJPY --b EURUSD --timeframe 1h --source dukascopy` — 人間は期間自由 (`--from/--to` 任意)。**analysis_runs には保存しない** (探索監査は改善ループ経路のみの契約 — 人間の探索まで記録すると探索数の意味が濁る。§6 の記録義務は「改善ループ向け API」に係る)
   - `afx history coverage --symbol EURUSD --timeframe 1h --source dukascopy --from ... --to ...` — Task 10 の `coverage_report` 表示 (watch 選定基準③の判定材料)

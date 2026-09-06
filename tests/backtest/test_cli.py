@@ -127,6 +127,21 @@ def test_cli_history_import_rejects_invalid_window_before_importer(
     assert capsys.readouterr().err
 
 
+def test_cli_history_import_rejects_far_future_microsecond_misalignment(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.import_mt5") as imp:
+        rc = main(["history", "import", "--source", "mt5",
+                   "--symbol", "USDJPY", "--interval", "1m",
+                   "--from", "9999-01-01T00:00:00.000001",
+                   "--to", "9999-01-02T00:00:00"])
+    assert rc == 2
+    imp.assert_not_called()
+    assert "格子" in capsys.readouterr().err
+
+
 def test_cli_history_import_conflict_prints_details_and_returns_3(
         tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
@@ -136,7 +151,9 @@ def test_cli_history_import_conflict_prints_details_and_returns_3(
                 (149.0, 149.2, 148.9, 149.1, 20.0))
     with patch("agentic_fx.backtest.cli.ensure_initialized"), \
          patch("agentic_fx.backtest.cli.import_mt5",
-               side_effect=ImportConflictError([conflict])):
+               side_effect=ImportConflictError(
+                   [conflict], MagicMock(
+                       inserted=7, unchanged=8, conflicted=1))):
         rc = main(["history", "import", "--source", "mt5",
                    "--symbol", "USDJPY", "--interval", "5m",
                    "--from", "2026-07-01", "--to", "2026-07-02"])
@@ -145,6 +162,7 @@ def test_cli_history_import_conflict_prints_details_and_returns_3(
     assert conflict[2] in err
     assert "existing=(148.0, 148.2, 147.9, 148.1, 10.0)" in err
     assert "incoming=(149.0, 149.2, 148.9, 149.1, 20.0)" in err
+    assert "partial inserted=7 unchanged=8 conflicted=1" in err
 
 
 def test_cli_history_import_mt5_requires_bridge_url(tmp_path, monkeypatch):

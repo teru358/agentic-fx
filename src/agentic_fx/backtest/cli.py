@@ -26,7 +26,7 @@ from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import (
-    ImportConflictError, compare_sources, import_mt5)
+    ImportConflictError, _is_grid_aligned, compare_sources, import_mt5)
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
@@ -180,8 +180,8 @@ def _history_import(conn, settings, args: argparse.Namespace) -> int:
         print("エラー: --from は --to より前でなければなりません",
               file=sys.stderr)
         return 2
-    if (args.from_.timestamp() % width_sec != 0
-            or args.to.timestamp() % width_sec != 0):
+    if (not _is_grid_aligned(args.from_, width_sec)
+            or not _is_grid_aligned(args.to, width_sec)):
         print(f"エラー: --from/--to は {args.interval} 格子に整列が必要です",
               file=sys.stderr)
         return 2
@@ -202,6 +202,9 @@ def _history_import(conn, settings, args: argparse.Namespace) -> int:
             for _symbol, _interval, bar_time, existing, incoming in exc.conflicts:
                 print(f"conflict bar_time={bar_time} existing={existing} "
                       f"incoming={incoming}", file=sys.stderr)
+            print(f"partial inserted={exc.partial.inserted} "
+                  f"unchanged={exc.partial.unchanged} "
+                  f"conflicted={exc.partial.conflicted}", file=sys.stderr)
             return 3
     print(f"inserted={result.inserted} unchanged={result.unchanged} "
          f"conflicted={result.conflicted}")

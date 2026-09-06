@@ -27,9 +27,10 @@ _log = logging.getLogger(__name__)
 class ImportConflictError(ValueError):
     """An MT5 window contained values conflicting with immutable history."""
 
-    def __init__(self, conflicts):
+    def __init__(self, conflicts, partial: ImportResult, message=None):
         self.conflicts = conflicts
-        super().__init__(f"MT5 import conflicts: {len(conflicts)} row(s)")
+        self.partial = partial
+        super().__init__(message or f"MT5 import conflicts: {len(conflicts)} row(s)")
 
 
 def _default_fetch(url: str) -> dict:
@@ -46,6 +47,11 @@ def _default_fetch(url: str) -> dict:
 
 _INTERVAL_SECONDS = {"1m": 60, "5m": 300, "15m": 900}
 _BAR_FIELDS = ("time", "open", "high", "low", "close", "volume")
+
+
+def _is_grid_aligned(dt: datetime, width_sec: int) -> bool:
+    return ((dt - datetime(1970, 1, 1, tzinfo=timezone.utc))
+            % timedelta(seconds=width_sec) == timedelta(0))
 
 
 def _window_url(base_url: str, symbol: str, start: datetime, end: datetime,
@@ -160,7 +166,7 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
     if any(left >= right for left, right in zip(times, times[1:])):
         raise ValueError("import_mt5: bar times must be strictly increasing")
     for bar_dt in times:
-        if bar_dt.timestamp() % width_sec != 0:
+        if not _is_grid_aligned(bar_dt, width_sec):
             raise ValueError(
                 f"import_mt5: bar time {bar_dt.isoformat()} is off interval grid")
 
@@ -171,17 +177,19 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
 
 def _conflict_details(conn, rows: list[tuple]) -> list[tuple]:
     conflicts = []
-    for symbol, interval, bar_time, o, h, low, close, volume, _spread in rows:
+    for symbol, interval, bar_time, o, h, low, close, volume, spread in rows:
         existing = conn.execute(
-            "SELECT open, high, low, close, volume FROM ohlcv_history "
+            "SELECT open, high, low, close, volume, spread FROM ohlcv_history "
             "WHERE source='mt5' AND symbol=? AND interval=? AND bar_time=?",
             (symbol, interval, bar_time)).fetchone()
         if existing is None:
             continue
         existing_values = tuple(existing[name] for name in
-                                ("open", "high", "low", "close", "volume"))
-        incoming_values = (o, h, low, close, volume)
-        if any(abs(a - b) >= 1e-9
+                                ("open", "high", "low", "close", "volume",
+                                 "spread"))
+        incoming_values = (o, h, low, close, volume, spread)
+        if any(not (a is None and b is None)
+               and (a is None or b is None or abs(a - b) >= 1e-9)
                for a, b in zip(existing_values, incoming_values)):
             conflicts.append((symbol, interval, bar_time, existing_values,
                               incoming_values))
@@ -226,7 +234,7 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
         raise ValueError("start must be earlier than end")
     width_sec = _INTERVAL_SECONDS[interval]
     for dt, name in ((start, "start"), (end, "end")):
-        if dt.timestamp() % width_sec != 0:
+        if not _is_grid_aligned(dt, width_sec):
             raise ValueError(f"{name} must be aligned to the {interval} grid")
 
     if fetch is None:
@@ -260,7 +268,14 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
             total_unchanged += result.unchanged
             total_conflicted += result.conflicted
             if result.conflicted > 0:
-                raise ImportConflictError(_conflict_details(conn, rows))
+                conflicts = _conflict_details(conn, rows)
+                message = None
+                if not conflicts:
+                    message = (f"MT5 import conflicted={result.conflicted} "
+                               "but no detail rows matched")
+                partial = ImportResult(
+                    total_inserted, total_unchanged, total_conflicted)
+                raise ImportConflictError(conflicts, partial, message)
 
         current = window_end
 

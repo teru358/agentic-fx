@@ -455,6 +455,16 @@ def test_import_mt5_rejects_misaligned_window_before_fetch(tmp_path):
     assert calls == []
 
 
+def test_grid_alignment_preserves_microseconds_at_datetime_max_year():
+    dt = datetime(9999, 1, 1, 0, 0, 0, 1, tzinfo=timezone.utc)
+    assert mt5_import._is_grid_aligned(dt, 60) is False
+
+
+def test_grid_alignment_accepts_aligned_time_before_epoch():
+    dt = datetime(1969, 12, 31, 23, 59, tzinfo=timezone.utc)
+    assert mt5_import._is_grid_aligned(dt, 60) is True
+
+
 def test_import_mt5_two_window_failure_keeps_first_window(tmp_path):
     conn = _conn(tmp_path)
 
@@ -519,11 +529,68 @@ def test_import_mt5_conflict_raises_with_existing_and_incoming_and_stops(tmp_pat
     assert len(calls) == 1
     assert raised.value.conflicts == [
         ("USDJPY", "1m", H.isoformat(),
-         (148.0, 148.2, 147.9, 148.1, 10.0),
-         (149.0, 149.2, 148.9, 149.1, 20)),
+         (148.0, 148.2, 147.9, 148.1, 10.0, None),
+         (149.0, 149.2, 148.9, 149.1, 20, None)),
     ]
     stored = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
     assert stored[0].close == 148.1
+
+
+def test_import_mt5_spread_only_conflict_is_reported(tmp_path):
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO ohlcv_history "
+        "(symbol, interval, bar_time, open, high, low, close, volume, "
+        "source, spread) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9, 148.1,
+         10, "mt5", 0.001))
+    conn.commit()
+
+    with pytest.raises(ImportConflictError) as raised:
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                   base_url="http://x", fetch=lambda _url: _payload(_bar(H)))
+
+    assert raised.value.conflicts == [
+        ("USDJPY", "1m", H.isoformat(),
+         (148.0, 148.2, 147.9, 148.1, 10.0, 0.001),
+         (148.0, 148.2, 147.9, 148.1, 10, None)),
+    ]
+
+
+def test_import_mt5_second_window_conflict_exposes_committed_partial_result(
+        tmp_path):
+    conn = _conn(tmp_path)
+    second_start = H + timedelta(days=1)
+    ohlcv.import_history_bars(
+        conn, [("USDJPY", "1m", second_start.isoformat(), 149.0, 149.2,
+                148.9, 149.1, 20, None)], source="mt5")
+
+    def fetch(url):
+        start = datetime.fromisoformat(_query_param(url, "from"))
+        return _payload(_bar(start))
+
+    with pytest.raises(ImportConflictError) as raised:
+        import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
+                   base_url="http://x", fetch=fetch)
+
+    assert raised.value.partial == ohlcv.ImportResult(
+        inserted=1, unchanged=0, conflicted=1)
+
+
+def test_import_mt5_conflicted_count_without_details_fails_loudly(
+        tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    monkeypatch.setattr(
+        mt5_import, "import_history_bars",
+        lambda *_args, **_kwargs: ohlcv.ImportResult(0, 0, 2))
+
+    with pytest.raises(
+            ImportConflictError,
+            match="conflicted=2 but no detail rows matched") as raised:
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
+                   base_url="http://x", fetch=lambda _url: _payload(_bar(H)))
+
+    assert raised.value.conflicts == []
 
 
 def test_import_mt5_normalizes_naive_bar_time_for_join(tmp_path):
