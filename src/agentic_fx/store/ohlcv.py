@@ -7,10 +7,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from agentic_fx.core.contracts import Bar
+from agentic_fx.store.db import FLOAT_TOL
 
 _log = logging.getLogger("agentic_fx.store.ohlcv")
 
-_FLOAT_TOL = 1e-9
+_FLOAT_TOL = FLOAT_TOL
 
 # ライブチェーンの永続化名のみ。"mt5" ではなく "mt5-live"
 # (datafeed/price_provider.py の _STORAGE_SOURCE 参照)。
@@ -128,6 +129,7 @@ class ImportResult:
     inserted: int
     unchanged: int
     conflicted: int
+    conflicts: tuple = ()
 
 
 def _close_enough(a: float | None, b: float | None) -> bool:
@@ -214,6 +216,7 @@ def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
     inserted = 0
     unchanged = 0
     conflicted = 0
+    conflicts = []
     conn.execute("SAVEPOINT import_history_bars")
     try:
         # 行単位ループは意図的 — inserted/unchanged/conflicted の三分計上は
@@ -249,6 +252,12 @@ def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
                 unchanged += 1
             else:
                 conflicted += 1
+                existing_values = tuple(existing[name] for name in
+                                        ("open", "high", "low", "close",
+                                         "volume", "spread"))
+                incoming_values = (o, h, l, c, volume, spread)
+                conflicts.append((symbol, interval, bar_time_iso,
+                                  existing_values, incoming_values))
         conn.execute("RELEASE import_history_bars")
     except BaseException:
         conn.execute("ROLLBACK TO SAVEPOINT import_history_bars")
@@ -260,7 +269,7 @@ def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
             "import_history_bars: %d row(s) conflicted with existing data "
             "for source=%s (existing rows left unchanged)",
             conflicted, source)
-    return ImportResult(inserted, unchanged, conflicted)
+    return ImportResult(inserted, unchanged, conflicted, tuple(conflicts))
 
 
 def load_history_bars(conn: sqlite3.Connection, symbol: str, interval: str,

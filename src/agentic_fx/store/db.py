@@ -382,7 +382,8 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str,
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
-_FLOAT_TOL = 1e-9
+FLOAT_TOL = 1e-9
+_FLOAT_TOL = FLOAT_TOL
 
 
 def _values_match(a: float | None, b: float | None) -> bool:

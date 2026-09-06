@@ -551,11 +551,11 @@ def test_import_mt5_conflict_raises_with_existing_and_incoming_and_stops(tmp_pat
         import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
                    base_url="http://x", fetch=fetch)
     assert len(calls) == 1
-    assert raised.value.conflicts == [
+    assert raised.value.conflicts == (
         ("USDJPY", "1m", H.isoformat(),
          (148.0, 148.2, 147.9, 148.1, 10.0, None),
          (149.0, 149.2, 148.9, 149.1, 20, None)),
-    ]
+    )
     stored = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
     assert stored[0].close == 148.1
 
@@ -574,14 +574,14 @@ def test_import_mt5_spread_only_conflict_is_reported(tmp_path):
         import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
                    base_url="http://x", fetch=lambda _url: _payload(_bar(H)))
 
-    assert raised.value.conflicts == [
+    assert raised.value.conflicts == (
         ("USDJPY", "1m", H.isoformat(),
          (148.0, 148.2, 147.9, 148.1, 10.0, 0.001),
          (148.0, 148.2, 147.9, 148.1, 10, None)),
-    ]
+    )
 
 
-def test_conflict_details_mixed_new_and_conflicting_rows_reports_only_conflict(
+def test_import_mt5_mixed_new_and_conflicting_rows_reports_only_conflict(
         tmp_path):
     conn = _conn(tmp_path)
     conflict_time = H + timedelta(minutes=1)
@@ -589,23 +589,26 @@ def test_conflict_details_mixed_new_and_conflicting_rows_reports_only_conflict(
         conn, [("USDJPY", "1m", conflict_time.isoformat(), 148.0, 148.2,
                 147.9, 148.1, 10, None)], source="mt5")
 
-    rows = [
-        ("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9,
-         148.1, 10, None),
-        ("USDJPY", "1m", conflict_time.isoformat(), 149.0, 149.2,
-         148.9, 149.1, 20, None),
-    ]
+    with pytest.raises(ImportConflictError) as raised:
+        import_mt5(
+            conn, "USDJPY", H, H + timedelta(minutes=2),
+            base_url="http://x",
+            fetch=lambda _url: _payload(
+                _bar(H),
+                _bar(conflict_time, open=149.0, high=149.2, low=148.9,
+                     close=149.1, volume=20)))
 
-    conflicts = mt5_import._conflict_details(conn, rows)
-
-    assert [item[2] for item in conflicts] == [conflict_time.isoformat()]
+    assert [item[2] for item in raised.value.conflicts] == [
+        conflict_time.isoformat()]
+    assert ohlcv.load_history_bars(
+        conn, "USDJPY", "1m", source="mt5")[0].ts == H
 
 
 @pytest.mark.parametrize("delta,conflicted", [
     (5e-10, False),
     (2e-9, True),
 ], ids=["below-tolerance", "above-tolerance"])
-def test_import_mt5_conflict_details_use_float_tolerance(
+def test_import_mt5_conflicts_use_store_float_tolerance(
         tmp_path, delta, conflicted):
     conn = _conn(tmp_path)
     ohlcv.import_history_bars(
@@ -622,10 +625,6 @@ def test_import_mt5_conflict_details_use_float_tolerance(
         result = import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
                             base_url="http://x", fetch=fetch)
         assert result == ohlcv.ImportResult(0, 1, 0)
-
-
-def test_conflict_details_uses_store_float_tolerance():
-    assert mt5_import._FLOAT_TOL == ohlcv._FLOAT_TOL
 
 
 def test_import_mt5_reports_each_conflict_in_same_window(tmp_path):
@@ -669,22 +668,6 @@ def test_import_mt5_second_window_conflict_exposes_committed_partial_result(
 
     assert raised.value.partial == ohlcv.ImportResult(
         inserted=1, unchanged=0, conflicted=1)
-
-
-def test_import_mt5_conflicted_count_without_details_fails_loudly(
-        tmp_path, monkeypatch):
-    conn = _conn(tmp_path)
-    monkeypatch.setattr(
-        mt5_import, "import_history_bars",
-        lambda *_args, **_kwargs: ohlcv.ImportResult(0, 0, 2))
-
-    with pytest.raises(
-            ImportConflictError,
-            match="conflicted=2 but no detail rows matched") as raised:
-        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
-                   base_url="http://x", fetch=lambda _url: _payload(_bar(H)))
-
-    assert raised.value.conflicts == []
 
 
 def test_import_mt5_normalizes_naive_bar_time_for_join(tmp_path):

@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agentic_fx.core.contracts import Bar
-from agentic_fx.store import ohlcv
+from agentic_fx.store import db, ohlcv
 from agentic_fx.store.db import connect, init_db
 
 NOW_ISO = "2026-07-22T12:00:00+00:00"
@@ -70,6 +70,21 @@ def test_import_history_bars_never_mutates_existing(tmp_path):
         "SELECT close FROM ohlcv_history").fetchone()[0] == 148.1
 
 
+def test_import_history_bars_returns_one_detail_for_each_conflict(tmp_path):
+    conn = _conn(tmp_path)
+    ohlcv.import_history_bars(conn, [ROW], source="dukascopy")
+    incoming = ROW[:6] + (148.15,) + ROW[7:]
+
+    result = ohlcv.import_history_bars(conn, [incoming], source="dukascopy")
+
+    assert result.conflicted == len(result.conflicts) == 1
+    assert result.conflicts == (
+        ("USDJPY", "1m", NOW_ISO,
+         (148.0, 148.2, 147.9, 148.1, 100.0, 0.012),
+         (148.0, 148.2, 147.9, 148.15, 100.0, 0.012)),
+    )
+
+
 def test_import_history_bars_spread_null_vs_value_conflicts(tmp_path):
     conn = _conn(tmp_path)
     no_spread = ROW[:8] + (None,)
@@ -89,6 +104,17 @@ def test_import_history_bars_float_tolerance_within_1e9_is_unchanged(tmp_path):
     almost_same = ROW[:3] + (ROW[3] + 1e-10,) + ROW[4:]
     r = ohlcv.import_history_bars(conn, [almost_same], source="dukascopy")
     assert (r.inserted, r.unchanged, r.conflicted) == (0, 1, 0)
+
+
+def test_store_float_tolerance_is_shared_and_has_the_same_boundaries(
+        monkeypatch):
+    assert ohlcv._FLOAT_TOL == db.FLOAT_TOL
+    monkeypatch.setattr(db, "FLOAT_TOL", 1e-3)
+    assert ohlcv._FLOAT_TOL == 1e-9
+
+    for delta, expected in ((5e-10, True), (1e-9, False), (2e-9, False)):
+        assert ohlcv._close_enough(0.0, delta) is expected
+        assert db._values_match(0.0, delta) is expected
 
 
 def test_import_history_bars_conflicted_logs_warning(tmp_path, caplog):

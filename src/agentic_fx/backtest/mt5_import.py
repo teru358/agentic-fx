@@ -19,7 +19,7 @@ import httpx
 
 from agentic_fx.datafeed.price_provider import _SPECS
 from agentic_fx.datafeed.sources import _mt5_headers
-from agentic_fx.store.ohlcv import _FLOAT_TOL, ImportResult, import_history_bars
+from agentic_fx.store.ohlcv import ImportResult, import_history_bars
 
 _log = logging.getLogger(__name__)
 
@@ -175,27 +175,6 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
     return rows, naive_count, right_edge_count
 
 
-def _conflict_details(conn, rows: list[tuple]) -> list[tuple]:
-    conflicts = []
-    for symbol, interval, bar_time, o, h, low, close, volume, spread in rows:
-        existing = conn.execute(
-            "SELECT open, high, low, close, volume, spread FROM ohlcv_history "
-            "WHERE source='mt5' AND symbol=? AND interval=? AND bar_time=?",
-            (symbol, interval, bar_time)).fetchone()
-        if existing is None:
-            continue
-        existing_values = tuple(existing[name] for name in
-                                ("open", "high", "low", "close", "volume",
-                                 "spread"))
-        incoming_values = (o, h, low, close, volume, spread)
-        if any(not (a is None and b is None)
-               and (a is None or b is None or abs(a - b) >= _FLOAT_TOL)
-               for a, b in zip(existing_values, incoming_values)):
-            conflicts.append((symbol, interval, bar_time, existing_values,
-                              incoming_values))
-    return conflicts
-
-
 def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
                base_url: str, fetch=None, interval: str = "1m") -> ImportResult:
     """MT5 bridge から 1 分足を 1 日窓でページングして取り込む。
@@ -268,14 +247,9 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
             total_unchanged += result.unchanged
             total_conflicted += result.conflicted
             if result.conflicted > 0:
-                conflicts = _conflict_details(conn, rows)
-                message = None
-                if not conflicts:
-                    message = (f"MT5 import conflicted={result.conflicted} "
-                               "but no detail rows matched")
                 partial = ImportResult(
                     total_inserted, total_unchanged, total_conflicted)
-                raise ImportConflictError(conflicts, partial, message)
+                raise ImportConflictError(result.conflicts, partial=partial)
 
         current = window_end
 
