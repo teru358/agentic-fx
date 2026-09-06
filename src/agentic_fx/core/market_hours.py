@@ -25,7 +25,11 @@ _HOLIDAYS_MONTH_DAY = frozenset({(12, 25), (1, 1)})
 def is_market_open(now: datetime) -> bool:
     now = _as_utc(now)
     wd, t = now.weekday(), now.timetz().replace(tzinfo=None)
-    if (now.month, now.day) in _HOLIDAYS_MONTH_DAY:
+    # 祝日は UTC 暦日でなく**取引日ラベル** (21:00 UTC 起点、= サーバ UTC+3 の日付)
+    # で判定する。実測 (2025-12 / 2026-01): 12/24 21:00 UTC に閉場し 12/25 21:00 UTC
+    # に再開 = 取引日 12/25 が休場。12/25 21:00 以降は取引日 12/26 で開場。
+    label = (now + timedelta(hours=3)).date()
+    if (label.month, label.day) in _HOLIDAYS_MONTH_DAY:
         return False
     if wd == 4 and t >= _ROLLOVER_UTC:
         return False

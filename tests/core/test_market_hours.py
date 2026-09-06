@@ -85,6 +85,17 @@ def test_utc_holidays_are_closed():
     assert is_market_open(_dt(2026, 1, 1, 12, 0)) is False
 
 
+def test_holiday_follows_trading_day_label_not_utc_calendar_day():
+    """codex 1 周目 [重要]: 祝日は取引日ラベル (21:00 UTC 起点) で判定する。
+    実測: 12/24 21:00 UTC 閉場 → 12/25 21:00 UTC 再開 (1/1 も同型)。"""
+    assert is_market_open(_dt(2025, 12, 24, 20, 55)) is True
+    assert is_market_open(_dt(2025, 12, 24, 21, 0)) is False   # 取引日 12/25 開始
+    assert is_market_open(_dt(2025, 12, 25, 20, 59)) is False
+    assert is_market_open(_dt(2025, 12, 25, 21, 0)) is True    # 取引日 12/26 開始
+    assert is_market_open(_dt(2025, 12, 31, 21, 0)) is False   # 取引日 1/1
+    assert is_market_open(_dt(2026, 1, 1, 21, 0)) is True      # 取引日 1/2
+
+
 def test_trading_day_start_uses_fixed_21_00_utc_boundary():
     """M4: 日次開始は冬も直前の 21:00 UTC。"""
     assert trading_day_start(_dt(2026, 1, 13, 20, 59)) == _dt(2026, 1, 12, 21, 0)
