@@ -51,6 +51,22 @@ def test_parse_date_ignores_explicit_offset():
 # ---- history import ---------------------------------------------------
 
 
+def test_cli_history_import_rejects_invalid_from_date_before_importer(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.import_mt5") as importer:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["history", "import", "--source", "mt5",
+                  "--symbol", "USDJPY", "--from", "2026-13-45",
+                  "--to", "2026-07-02"])
+
+    assert exc_info.value.code == 2
+    importer.assert_not_called()
+    assert "2026-13-45" in capsys.readouterr().err
+
+
 def test_cli_history_import_calls_importer(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)

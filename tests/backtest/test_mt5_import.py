@@ -65,6 +65,27 @@ def test_import_mt5_uses_default_fetch_when_none(monkeypatch, tmp_path):
     assert bars and bars[0].close == 148.1
 
 
+def test_import_mt5_inserts_when_same_bar_exists_from_another_source(tmp_path):
+    conn = _conn(tmp_path)
+    dukascopy_row = (
+        "USDJPY", "1m", H.isoformat(), 147.0, 147.2, 146.9, 147.1, 20, None)
+    ohlcv.import_history_bars(conn, [dukascopy_row], source="dukascopy")
+
+    fetch = lambda _url: _payload(_bar())
+    result = import_mt5(
+        conn, "USDJPY", H, H + timedelta(minutes=1),
+        base_url="http://x", fetch=fetch)
+    repeated = import_mt5(
+        conn, "USDJPY", H, H + timedelta(minutes=1),
+        base_url="http://x", fetch=fetch)
+
+    assert (result.inserted, result.unchanged, result.conflicted) == (1, 0, 0)
+    assert (repeated.inserted, repeated.unchanged, repeated.conflicted) == (0, 1, 0)
+    mt5_bars = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
+    assert len(mt5_bars) == 1
+    assert mt5_bars[0].close == 148.1
+
+
 def test_import_mt5_last_window_clipped_to_end(tmp_path):
     """半端な最終窓 (< 1 日) でも to= が end に丸められる (over-fetch しない)。"""
     conn = _conn(tmp_path)
@@ -183,6 +204,29 @@ def test_import_mt5_right_edge_bar_is_picked_up_by_the_next_window(tmp_path):
     # 窓 1 の右端 (= boundary) は窓 2 の左端として入る。最終窓の右端だけが
     # 落ちる — end は exclusive なので正しい
     assert [b.ts for b in bars] == [H, boundary]
+
+
+def test_import_mt5_logs_naive_and_right_edge_counts_once(tmp_path, caplog):
+    conn = _conn(tmp_path)
+    window_end = H + timedelta(minutes=1)
+    naive_time = H.replace(tzinfo=None).isoformat()
+
+    with caplog.at_level("DEBUG", logger="agentic_fx.backtest.mt5_import"):
+        result = import_mt5(
+            conn, "USDJPY", H, window_end, base_url="http://x",
+            fetch=lambda _url: _payload(
+                _bar(time=naive_time), _bar(window_end)))
+
+    assert result.inserted == 1
+    warnings = [record for record in caplog.records
+                if record.levelname == "WARNING" and "naive" in record.message]
+    right_edge_debugs = [
+        record for record in caplog.records
+        if record.levelname == "DEBUG" and "right-edge" in record.message]
+    assert len(warnings) == 1
+    assert "1/1 bar(s)" in warnings[0].message
+    assert len(right_edge_debugs) == 1
+    assert "dropped 1 right-edge bar(s)" in right_edge_debugs[0].message
 
 
 def test_import_mt5_rejects_naive_start(tmp_path):
@@ -318,6 +362,19 @@ def test_import_mt5_rejects_invalid_ohlcv_relationships(tmp_path, changes):
         import_mt5(conn, "USDJPY", H, H + timedelta(minutes=1),
                    base_url="http://x",
                    fetch=lambda _url: _payload(_bar(**changes)))
+
+
+def test_import_mt5_accepts_zero_volume_bar(tmp_path):
+    conn = _conn(tmp_path)
+
+    result = import_mt5(
+        conn, "USDJPY", H, H + timedelta(minutes=1),
+        base_url="http://x", fetch=lambda _url: _payload(_bar(volume=0)))
+
+    assert (result.inserted, result.unchanged, result.conflicted) == (1, 0, 0)
+    bars = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
+    assert len(bars) == 1
+    assert bars[0].volume == 0
 
 
 @pytest.mark.parametrize("field,value,accepted", [
