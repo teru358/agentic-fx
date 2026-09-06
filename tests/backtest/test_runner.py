@@ -27,6 +27,7 @@ from agentic_fx.activity import ActivityLog
 
 from agentic_fx.backtest.replay import BarFeed
 from agentic_fx.backtest.runner import _aggregate_bucket, run_replay
+from agentic_fx.backtest.dataset import HistoryDataset
 
 from tests.backtest.factories import H, WED, SETTINGS, _conn, _row_at, DATASET_1M
 
@@ -413,6 +414,28 @@ def test_parse_timeframe_rejects_zero(tmp_path):
                   start=WED, end=WED + timedelta(hours=1),
                   intent_source=lambda b: None, eval_timeframe="0m",
                   history_conn=hist)
+
+
+def test_eval_timeframe_must_be_multiple_of_5m_base_interval(tmp_path):
+    """C3-1: parse 可能な 7m でも 5m 基底の整数倍でなければ拒否する。"""
+    hist = _conn(tmp_path)
+    with pytest.raises(ValueError, match="eval_timeframe must be an integer multiple"):
+        run_replay(
+            SETTINGS, symbol="USDJPY", dataset=HistoryDataset("dukascopy", "5m"),
+            start=WED, end=WED + timedelta(hours=1),
+            intent_source=lambda b: None, eval_timeframe="7m",
+            history_conn=hist)
+
+
+def test_eval_timeframe_must_not_be_narrower_than_5m_base_interval(tmp_path):
+    """C3-1: 5m 基底より狭い 1m 評価時間足を拒否する。"""
+    hist = _conn(tmp_path)
+    with pytest.raises(ValueError, match="eval_timeframe must be an integer multiple"):
+        run_replay(
+            SETTINGS, symbol="USDJPY", dataset=HistoryDataset("dukascopy", "5m"),
+            start=WED, end=WED + timedelta(hours=1),
+            intent_source=lambda b: None, eval_timeframe="1m",
+            history_conn=hist)
 
 
 def test_equity_curve_has_no_duplicate_timestamps(tmp_path):

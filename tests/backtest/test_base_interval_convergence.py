@@ -329,7 +329,7 @@ def test_nonconvergence_sl_gap_fill_price_diverges():
     o5 = [o for o in res5.orders if o["status"] == "closed"][0]
     assert o1["close_reason"] == o5["close_reason"] == "sl"
     # 到達分がバケット先頭のため 5m 側の検出は 1 バケット (最大 4 分) 遅れ、
-    # gap 幅ぶん fill 価格がずれる。
+    # 決済価格は両経路とも SL 価格規則で同値 (147.795、gap の低値では約定しない)。
     assert o1["closed_at"] != o5["closed_at"]
 
 
@@ -488,8 +488,14 @@ def test_nonconvergence_short_expiry_1_to_4_minutes_only_1m_fills():
     rows.append(_row(t + timedelta(hours=1, minutes=1), 148.3, 148.35,
                      148.10, 148.15))
     for i in range(2, 60):  # 13:02-13:59 静穏
-        rows.append(_row(t + timedelta(hours=1, minutes=i),
-                         148.5, 148.6, 148.4, 148.5))
+        if i == 6:
+            # 5m 側の注文作成後、判定 bucket [13:05,13:10) 内でも到達。
+            # 正しい順序なら 13:10 tick で expiry が先に確定し約定しない。
+            rows.append(_row(t + timedelta(hours=1, minutes=i),
+                             148.3, 148.35, 148.10, 148.15))
+        else:
+            rows.append(_row(t + timedelta(hours=1, minutes=i),
+                             148.5, 148.6, 148.4, 148.5))
     res1, res5 = _run_both(rows, source_factory=_short_source)
     assert res1.orders and res5.orders
     o1, o5 = res1.orders[0], res5.orders[0]

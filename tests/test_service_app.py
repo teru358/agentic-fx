@@ -2060,6 +2060,13 @@ def test_build_app_provider_seam_falls_back_to_provider_bound_methods(tmp_path):
     assert app.scheduler.bars_fn is fake_provider.latest_1m_bar
 
 
+def test_build_app_live_scheduler_uses_five_minute_bar_freshness(tmp_path):
+    """C5-7: live build_app 経路の Scheduler freshness 契約を固定する。"""
+    _init(tmp_path)
+    app = build_app(tmp_path, provider=_FakeProvider())
+    assert app.scheduler.bar_freshness == timedelta(minutes=5)
+
+
 def test_scheduler_tick_once_uses_app_clock(tmp_path):
     """scheduler_thread の 1 tick 分が app.clock.now() を読むことを直接確認
     (app.clock を壁時計に戻す変異で red になるべき)。"""

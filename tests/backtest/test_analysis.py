@@ -989,3 +989,27 @@ def test_analyze_for_agent_computes_boundary_with_dataset_base_interval(
     assert calls[0].get("base_interval") == "5m", (
         "analyze_for_agent は dataset 確定後の base_interval を "
         "in_sample_until に渡さなければならない (既定 1m 固定は退行)")
+
+
+def test_analyze_for_agent_returns_boundary_floored_to_5m_dataset_grid(tmp_path):
+    """A5: agent 応答の内部記録値で 5m dataset の境界格子を固定する。"""
+    conn = _conn(tmp_path)
+    settings = _settings_watch_eurusd()
+    settings_5m = settings.model_copy(update={
+        "backtest": settings.backtest.model_copy(
+            update={"base_interval": "5m"})})
+    now = datetime(2026, 8, 1, 0, 4, tzinfo=timezone.utc)
+    start = datetime(2026, 4, 28, tzinfo=timezone.utc)
+    for symbol, phase in (("USDJPY", 0), ("EURUSD", 1)):
+        values = _sine(50, phase=phase)
+        rows = [(symbol, "5m", (start + timedelta(hours=i)).isoformat(),
+                 value, value + 0.05, value - 0.05, value, 1.0, 0.01)
+                for i, value in enumerate(values)]
+        ohlcv.import_history_bars(conn, rows, source="dukascopy")
+
+    result = analyze_for_agent(
+        conn, settings_5m,
+        {"kind": "corr_matrix", "timeframe": "1h"}, now=now,
+        persist=False)
+
+    assert result["params"]["in_sample_until"] == "2026-05-01T00:00:00+00:00"

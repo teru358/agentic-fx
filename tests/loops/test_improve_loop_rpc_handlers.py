@@ -477,6 +477,7 @@ def test_run_backtest_handler_missing_history_hint_uses_dataset_base_interval(
     result = handlers["run_backtest"]({"name": "myst", "pair": "EURUSD"})
 
     assert result["error"] == "no_history_for_symbol"
+    assert "No 5m history for EURUSD" in result["hint"]
     assert "Pairs with local backtest history: USDJPY." in result["hint"]
 
 

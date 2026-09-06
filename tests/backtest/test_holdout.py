@@ -109,6 +109,7 @@ def test_run_in_sample_oldest_bar_lookup_uses_dataset_base_interval_not_1m(
     """
     from agentic_fx.backtest.dataset import HistoryDataset
     hist = _conn(tmp_path)
+    old_1m = _row_at(H - timedelta(days=250), o=90.0, h=90.5, l=89.5, c=90.2)
     rows_5m = [
         (r[0], "5m", r[2], r[3], r[4], r[5], r[6], r[7], r[8])
         for r in [
@@ -116,7 +117,7 @@ def test_run_in_sample_oldest_bar_lookup_uses_dataset_base_interval_not_1m(
             _row_at(H, o=100.3, h=100.7, l=99.9, c=100.4),
         ]
     ]
-    ohlcv.import_history_bars(hist, rows_5m, source="dukascopy")
+    ohlcv.import_history_bars(hist, [old_1m, *rows_5m], source="dukascopy")
     monkeypatch.setattr(holdout, "core_commit", lambda: "testcommit")
     calls = []
     monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
@@ -128,6 +129,7 @@ def test_run_in_sample_oldest_bar_lookup_uses_dataset_base_interval_not_1m(
                         kind="strategy", now=WED + timedelta(days=120),
                         record_fn=saved.append)
     assert "trades" in out
+    assert calls[0]["start"] == H - timedelta(days=200)
 
 
 def test_in_sample_until_rounds_off_grid_now_to_5m_dataset_grid():
