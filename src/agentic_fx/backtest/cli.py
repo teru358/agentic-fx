@@ -199,8 +199,11 @@ def _history_import(conn, settings, args: argparse.Namespace) -> int:
             result = import_mt5(conn, args.symbol, args.from_, args.to,
                                 base_url=bridge_url, interval=args.interval)
         except ImportConflictError as exc:
-            for _symbol, _interval, bar_time, existing, incoming in exc.conflicts:
-                print(f"conflict bar_time={bar_time} existing={existing} "
+            # codex 2 周目 Minor: stderr だけを保存した運用記録でも conflict 行を
+            # 一意に特定できるよう、主キー全フィールドを出す (CP3b の復旧資料)。
+            for symbol, interval, bar_time, existing, incoming in exc.conflicts:
+                print(f"conflict symbol={symbol} interval={interval} "
+                      f"bar_time={bar_time} existing={existing} "
                       f"incoming={incoming}", file=sys.stderr)
             print(f"partial inserted={exc.partial.inserted} "
                   f"unchanged={exc.partial.unchanged} "

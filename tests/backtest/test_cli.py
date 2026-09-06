@@ -164,7 +164,7 @@ def test_cli_history_import_conflict_prints_details_and_returns_3(
                    "--from", "2026-07-01", "--to", "2026-07-02"])
     assert rc == 3
     err = capsys.readouterr().err
-    assert conflict[2] in err
+    assert "conflict symbol=USDJPY interval=5m bar_time=" + conflict[2] in err
     assert "existing=(148.0, 148.2, 147.9, 148.1, 10.0)" in err
     assert "incoming=(149.0, 149.2, 148.9, 149.1, 20.0)" in err
     assert "partial inserted=7 unchanged=8 conflicted=1" in err
