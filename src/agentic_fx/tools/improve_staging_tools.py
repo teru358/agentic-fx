@@ -30,7 +30,7 @@ RUN_BACKTEST_FIRST_DIRECTIVE = (
     "self-test の合否は run_backtest の前提ではありません。実データで trade が出れば plugin は正しく、"
     "失敗しているのはテスト側です。")
 REPEATED_FAILURE_DIRECTIVE = (
-    "同じテストが同じ assert で 3 回続けて失敗しています。テストデータの前提を疑ってください "
+    "同じテストが同じ assert で {n} 回続けて失敗しています。テストデータの前提を疑ってください "
     "(evaluate は渡された df の最終バーで判定します。クロス等のイベントは最終バーで起きるデータにすること)。"
     "直らなければこのテストを外し、observation に理由を残して提出してください。")
 
@@ -205,7 +205,7 @@ def build_improve_staging_tooldefs(
             if budget is not None and consecutive >= budget.self_test_warn_after:
                 out["repeated_failure"] = {
                     "consecutive": consecutive, "failed_tests": ["<no-tests>"],
-                    "last_values": [], "directive": REPEATED_FAILURE_DIRECTIVE}
+                    "last_values": [], "directive": REPEATED_FAILURE_DIRECTIVE.format(n=consecutive)}
             return out
         combined = result.stdout + (
             ("\n[stderr]\n" + result.stderr) if result.stderr else "")
@@ -227,7 +227,7 @@ def build_improve_staging_tooldefs(
                         break
                 out["repeated_failure"] = {
                     "consecutive": consecutive, "failed_tests": failed,
-                    "last_values": values, "directive": REPEATED_FAILURE_DIRECTIVE}
+                    "last_values": values, "directive": REPEATED_FAILURE_DIRECTIVE.format(n=consecutive)}
         return out
 
     return [

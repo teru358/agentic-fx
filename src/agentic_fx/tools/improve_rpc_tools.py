@@ -64,6 +64,13 @@ def _strip_forbidden(value: object) -> object:
     return value
 
 
+def _is_successful_backtest(result: object) -> bool:
+    """設計 v4 Tier B の「成功した run_backtest」= error が無く metrics を持つ
+    応答 (`_backtest_reply_from_save_kwargs` の形)。空 dict や metrics 欠落は
+    成功に数えない (codex 1 周目 Important 1)。"""
+    return isinstance(result, dict) and "error" not in result and "metrics" in result
+
+
 def build_improve_rpc_tooldefs(
         *, ledger: ImproveRpcLedger,
         run_backtest_handler: Callable[[dict], dict],
@@ -72,13 +79,6 @@ def build_improve_rpc_tooldefs(
         counters: "MissionToolCounters | None" = None,
         budget: "ImproveToolBudgetSettings | None" = None) -> list[ToolDef]:
     def run_backtest(name: str, pair: str) -> dict:
-        if counters is not None and budget is not None \
-                and not counters.reserve_backtest(
-                    name, budget.max_backtests_per_candidate):
-            from agentic_fx.tools.improve_staging_tools import BUDGET_EXHAUSTED_DIRECTIVE
-            return {"error": "budget exhausted",
-                    "budget": "max_backtests_per_candidate",
-                    "directive": BUDGET_EXHAUSTED_DIRECTIVE}
         if staging_dir is not None:
             candidate_dir = _safe_join(staging_dir, name)
             if candidate_dir is None:
@@ -92,12 +92,23 @@ def build_improve_rpc_tooldefs(
                 return {"error": "run_backtest is only for kind=strategy candidates",
                         "candidate_kind": meta.kind,
                         "hint": _RUN_BACKTEST_KIND_HINT}
+        # codex 1 周目 Important 2 (2026-09-07): 予算の消費は候補名・loader・kind
+        # 検証の **後**。誤呼び出し (名前不正 / loader 拒否 / indicator) で候補
+        # あたり枠を減らさない — 設計 v4 Tier C の目的は「実 backtest の修正
+        # ループ」の上限であって、検証エラーは対象外。
+        if counters is not None and budget is not None \
+                and not counters.reserve_backtest(
+                    name, budget.max_backtests_per_candidate):
+            from agentic_fx.tools.improve_staging_tools import BUDGET_EXHAUSTED_DIRECTIVE
+            return {"error": "budget exhausted",
+                    "budget": "max_backtests_per_candidate",
+                    "directive": BUDGET_EXHAUSTED_DIRECTIVE}
         result = run_backtest_handler({"name": name, "pair": pair})
         if counters is not None:
             if budget is not None:
-                counters.record_backtest_result(name, ok="error" not in result)
+                counters.record_backtest_result(name, ok=_is_successful_backtest(result))
             else:
-                counters.record_backtest(name, ok="error" not in result)
+                counters.record_backtest(name, ok=_is_successful_backtest(result))
         # 台帳は永続化用 save_kwargs (period/now 込み) を読む契約 —
         # agent 向け応答 (JSON-safe、期間端点なし) とは別物として受け取る。
         ledger_result = getattr(result, "save_kwargs", result)

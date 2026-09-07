@@ -516,3 +516,40 @@ def test_run_plugin_tests_rejects_exactly_at_max_self_test_runs(monkeypatch, tmp
     assert third == {"error": "budget exhausted", "budget": "max_self_test_runs",
                      "directive": BUDGET_EXHAUSTED_DIRECTIVE}
     assert counters.self_test_runs == 2
+
+
+def test_indicator_candidate_is_not_subject_to_backtest_order(tmp_path):
+    """codex 1 周目 Important 3: loader 上 kind=indicator の候補は Tier B
+    (run_backtest_required_first) の対象外 — 2 回目以降の self-test も通る。"""
+    staging = tmp_path / "staging"; staging.mkdir()
+    source = tmp_path / "source"; source.mkdir()
+    example = Path(__file__).resolve().parents[2] / "docs/examples/plugins/rsi_indicator"
+    shutil.copytree(example, staging / "rsi_v2")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source, counters=counters,
+        budget=ImproveToolBudgetSettings(max_self_tests_before_backtest=1))}
+    for _ in range(3):
+        out = tools["run_plugin_tests"].func("rsi_v2")
+        assert "error" not in out
+        assert out["passed"] is True
+    assert counters.self_tests_before_backtest == 0
+
+
+def test_repeated_failure_directive_reports_configured_count(monkeypatch, tmp_path):
+    """codex 1 周目 Minor 4: directive の回数は設定 (self_test_warn_after) に従い、
+    固定の「3 回」ではない。"""
+    staging = tmp_path / "staging"; source = tmp_path / "source"
+    staging.mkdir(); source.mkdir(); (staging / "a").mkdir()
+    (staging / "a" / "test_plugin.py").write_text("def test_x(): pass\n")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source, counters=counters,
+        budget=ImproveToolBudgetSettings(self_test_warn_after=2))}
+    monkeypatch.setattr(
+        "agentic_fx.tools.improve_staging_tools.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("pytest", 120)))
+    tools["run_plugin_tests"].func("a")
+    second = tools["run_plugin_tests"].func("a")
+    assert "2 回続けて失敗" in second["repeated_failure"]["directive"]
+    assert "3 回" not in second["repeated_failure"]["directive"]

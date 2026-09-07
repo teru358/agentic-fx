@@ -344,3 +344,39 @@ def test_analyze_corr_recursively_strips_nested_period_endpoints(tmp_path):
     # 読むための契約) — B2 是正が台帳を痩せさせていないことも確認する。
     ledger.freeze()
     assert "in_sample_until" in ledger.entries()[0]["result_summary"]["params"]
+
+
+# --- codex 1 周目 (2026-09-07、tmp/review-20260907-st/codex-round1.md) の pin ---
+
+@pytest.mark.parametrize("reply", [{}, {"scope": "in_sample"}, {"error": "x", "metrics": {}}])
+def test_run_backtest_counts_success_only_when_metrics_present(reply):
+    """Important 1: 「成功 backtest」= error 無し **かつ** metrics あり。空 dict や
+    metrics 欠落は Tier B を解除しない。"""
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
+        run_backtest_handler=lambda args: reply,
+        analyze_corr_handler=lambda args: {}, counters=counters,
+        budget=ImproveToolBudgetSettings())}
+    tools["run_backtest"].func("a", "USDJPY")
+    assert counters.successful_backtests["a"] == 0
+
+
+def test_run_backtest_validation_errors_do_not_consume_candidate_budget(tmp_path):
+    """Important 2: 名前不正 / loader 拒否 / indicator の応答は候補あたり予算を
+    消費しない。予算が減るのは handler に到達した呼び出しだけ。"""
+    _write_loader_candidate(tmp_path, "rsi_v2", "kind: indicator\n")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
+        staging_dir=tmp_path,
+        run_backtest_handler=lambda args: {"metrics": {}},
+        analyze_corr_handler=lambda args: {}, counters=counters,
+        budget=ImproveToolBudgetSettings(max_backtests_per_candidate=1))}
+    assert "error" in tools["run_backtest"].func(name="Bad-Name", pair="USDJPY")
+    assert "error" in tools["run_backtest"].func(name="missing", pair="USDJPY")
+    assert tools["run_backtest"].func(name="rsi_v2", pair="USDJPY")["error"] == \
+        "run_backtest is only for kind=strategy candidates"
+    assert counters.backtest_calls["Bad-Name"] == 0
+    assert counters.backtest_calls["missing"] == 0
+    assert counters.backtest_calls["rsi_v2"] == 0
