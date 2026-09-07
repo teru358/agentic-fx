@@ -303,3 +303,49 @@ def test_human_reject_and_reopen(tmp_path):
     row = c.execute("SELECT status FROM improvement_backlog WHERE id=?",
                     (bid,)).fetchone()
     assert row["status"] == "open"
+
+
+# --- ローカル 1 周目 pin (2026-09-07、tmp/review-20260907-st/verified-round1-local.md) ---
+
+# 追加 5: 挿入先: 新規関数 `test_upsert_system_note_only_updates_its_own_system_note_row`。追加 import 不要。
+def test_upsert_system_note_only_updates_its_own_system_note_row(tmp_path):
+    """ローカル 1 周目 (ornith c3 / muse c3 / qwen c3): SELECT の行選定条件
+    `status='note' AND source='system'` は、どちらの片方を落としても既存
+    テストが緑のままだった。同じ idea_norm の
+    (a) source!='system' の note 行 (`ImproveLoop._upsert_backlog_idea` の
+        kind='fact' 経路、`backlog note` CLI) と
+    (b) source='system' だが status='open' の行 — 到達可能
+        (`_upsert_backlog_idea` の promote 経路は source を問わず note→open にする)
+    を並べ、どちらも触らずに自分の system note を新規 INSERT することを pin。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    idea, norm = "Known Constraint", "known constraint"
+    agent_note = c.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea, source, status, created_at, updated_at, idea_norm, last_result) "
+        "VALUES (?, 'agent', 'note', ?, ?, ?, 'agent_fact')",
+        (idea, NOW.isoformat(), NOW.isoformat(), norm)).lastrowid
+    promoted = c.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea, source, status, created_at, updated_at, idea_norm, last_result) "
+        "VALUES (?, 'system', 'open', ?, ?, ?, 'promoted_from_note')",
+        (idea, NOW.isoformat(), NOW.isoformat(), norm)).lastrowid
+
+    note_id = backlog.upsert_system_note(
+        c, idea=idea, last_result="system note", now=NOW)
+
+    assert note_id not in (agent_note, promoted)
+    rows = {r["id"]: r for r in c.execute(
+        "SELECT id, source, status, last_result FROM improvement_backlog "
+        "WHERE idea_norm=?", (norm,)).fetchall()}
+    assert rows[agent_note]["last_result"] == "agent_fact"
+    assert rows[promoted]["last_result"] == "promoted_from_note"
+    assert rows[promoted]["status"] == "open"
+    assert (rows[note_id]["source"], rows[note_id]["status"]) == ("system", "note")
+    assert rows[note_id]["last_result"] == "system note"
+
+    # 2 回目は自分の行だけを UPDATE する (行が増えない)
+    assert backlog.upsert_system_note(
+        c, idea=idea, last_result="second", now=NOW) == note_id
+    assert c.execute(
+        "SELECT COUNT(*) FROM improvement_backlog WHERE idea_norm=?",
+        (norm,)).fetchone()[0] == 3

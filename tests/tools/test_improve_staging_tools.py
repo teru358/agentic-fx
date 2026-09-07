@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from types import SimpleNamespace
 import shutil
 from pathlib import Path
 
@@ -553,3 +554,59 @@ def test_repeated_failure_directive_reports_configured_count(monkeypatch, tmp_pa
     second = tools["run_plugin_tests"].func("a")
     assert "2 回続けて失敗" in second["repeated_failure"]["directive"]
     assert "3 回" not in second["repeated_failure"]["directive"]
+
+
+# --- ローカル 1 周目 pin (2026-09-07、tmp/review-20260907-st/verified-round1-local.md) ---
+
+# 追加 2: 挿入先: 新規関数 `test_repeated_failure_last_values_are_capped_at_five`。
+# ファイル先頭に追加: from types import SimpleNamespace
+# 以下 2 定数はモジュールレベル
+_MANY_ASSERTS = "".join(
+    f"E       AssertionError: assert {i} == 0\n" for i in range(1, 8)
+) + "FAILED test_plugin.py::test_x\n"
+
+
+def test_repeated_failure_last_values_are_capped_at_five(monkeypatch, tmp_path):
+    """ローカル 1 周目 (ornith c1): `last_values` の 5 件上限を撤去する変異が
+    緑で生存していた — 既存 fixture は assert 失敗行が 1 本しかなく上限を
+    踏まない。失敗 assert が多い候補で tool 応答が肥大するのを防ぐ枠なので
+    上限そのものを pin する。"""
+    staging = tmp_path / "staging"; source = tmp_path / "source"
+    staging.mkdir(); source.mkdir(); (staging / "a").mkdir()
+    (staging / "a" / "test_plugin.py").write_text("def test_x(): assert 0\n")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source, counters=counters,
+        budget=ImproveToolBudgetSettings(self_test_warn_after=1))}
+    monkeypatch.setattr(
+        "agentic_fx.tools.improve_staging_tools.subprocess.run",
+        lambda *a, **k: SimpleNamespace(returncode=1, stdout=_MANY_ASSERTS, stderr=""))
+
+    out = tools["run_plugin_tests"].func("a")
+    assert out["passed"] is False
+    assert out["repeated_failure"]["last_values"] == [
+        f"assert {i} == 0" for i in range(1, 6)]
+
+# 追加 3: 挿入先: 新規関数 `test_failure_signature_distinguishes_assert_source_expression`。
+# ファイル先頭 (import 群の下、モジュールレベル) に置く
+_SIG_HEAD = """=================================== FAILURES ===================================
+_____________________________ test_cross_signal ______________________________
+"""
+_SIG_TAIL = """E       AssertionError: assert 'hold' == 'open'
+=========================== short test summary info ============================
+FAILED test_plugin.py::test_cross_signal - AssertionError: assert 'hold' == 'o'
+"""
+
+
+def test_failure_signature_distinguishes_assert_source_expression():
+    """ローカル 1 周目 (qwen c1): 署名 3 成分のうち `assertions` (`>` 行) だけを
+    落とす変異が緑で生存していた。node id と例外型が同じで `>` 行の式だけが違う
+    2 出力で署名が異なることを pin する — テスト側を書き換えて別の assert に
+    したのに「同じ失敗が続いている」と誤警告する退行を防ぐ。"""
+    a = _SIG_HEAD + ">       assert signal == 'open'\n" + _SIG_TAIL
+    b = _SIG_HEAD + ">       assert last_bar_signal(df) == 'open'\n" + _SIG_TAIL
+    sig_a, sig_b = _failure_signature(a), _failure_signature(b)
+    assert sig_a[0] == sig_b[0]                          # 失敗 node id は同じ
+    assert sig_a[1] == sig_b[1] == ("AssertionError",)   # 例外型も同じ
+    assert sig_a[2] != sig_b[2]                          # assert ソース式だけが違う
+    assert sig_a != sig_b

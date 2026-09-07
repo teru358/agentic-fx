@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -350,3 +351,52 @@ def test_build_mission_registry_trade_unaffected_by_improve_branch(tmp_path):
         "trade", conn, SETTINGS, _clock(), rag, activity=activity)
     assert "get_ohlcv" in registry.names()
     assert "web_search" not in registry.names()
+
+
+# --- ローカル 1 周目 pin (2026-09-07、tmp/review-20260907-st/verified-round1-local.md) ---
+
+# 追加 4: 挿入先: 新規関数 `test_improve_registry_shares_one_counters_across_staging_and_rpc`。
+# ファイル先頭に追加: import shutil
+def test_improve_registry_shares_one_counters_across_staging_and_rpc(tmp_path):
+    """ローカル 1 周目 (muse c2 / qwen c2): staging builder と rpc builder に
+    渡る counters が**同一インスタンス**であることを誰も観測していなかった
+    (どちらかを別インスタンスにする変異が全テスト緑で生存)。total_calls は
+    on_execute 経由で常に共有されるので判別材料にならない — rpc 側で記録した
+    成功 backtest が staging 側の Tier B 順序制約を解除するところまで見る。"""
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+
+    conn = connect(tmp_path / "x.db"); init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    staging = tmp_path / "staging"; staging.mkdir()
+    source = tmp_path / "source"; source.mkdir()
+    example = Path(__file__).resolve().parents[2] / "docs/examples/plugins/sma_cross"
+    shutil.copytree(example, staging / "candidate")
+    with (staging / "candidate" / "test_plugin.py").open("a") as f:
+        f.write("\ndef test_deliberate_failure():\n    assert 'hold' == 'open'\n")
+
+    registry = build_mission_registry(
+        "improve", conn, SETTINGS, _clock(), rag,
+        activity=ActivityLog(tmp_path / "activity.log"), staging_dir=staging,
+        source_snapshot_dir=source,
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        rpc_handlers={"run_backtest": lambda a: {"metrics": {"trades": 1}},
+                      "analyze_corr": lambda a: {}})
+
+    def call(name, args):
+        return json.loads(registry.execute(name, args, list(registry.names())))
+
+    # staging 側の書き込みが共有 counters に載る
+    assert call("write_staging_file",
+                {"name": "scratch", "rel": "plugin.py",
+                 "content": "x = 1\n"}) == {"ok": True}
+    assert registry.counters.writes == 1
+
+    # rpc 側の成功 backtest も同じ counters に載る
+    assert "error" not in call("run_backtest",
+                               {"name": "candidate", "pair": "USDJPY"})
+    assert registry.counters.successful_backtests["candidate"] == 1
+    assert registry.counters.backtest_calls["candidate"] == 1
+
+    # 層をまたぐ配線: rpc 側で記録された成功 backtest が staging 側の
+    # Tier B 順序制約を解除する (counters が別インスタンスなら解除されない)
+    assert "error" not in call("run_plugin_tests", {"name": "candidate"})

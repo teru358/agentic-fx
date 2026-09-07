@@ -1719,3 +1719,41 @@ def test_report_publish_failure_does_not_log_published(
     activity_text = ((tmp_path / "activity.log").read_text()
                      if (tmp_path / "activity.log").exists() else "")
     assert "\treport_published\t" not in activity_text
+
+
+# --- ローカル 1 周目 pin (2026-09-07、tmp/review-20260907-st/verified-round1-local.md) ---
+
+# 追加 6: 挿入先: 新規関数 `test_finalize_max_turns_also_writes_system_note`。追加 import 不要
+def test_finalize_max_turns_also_writes_system_note(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """ローカル 1 周目 (muse c3 / ornith c3): `in ("timeout", "max_turns")` を
+    `in ("timeout",)` に縮める変異が緑で生存していた — 既存テストは timeout
+    (陽性) と failed (陰性) しか踏まない。max_turns は「最終出力なしで終了」の
+    主要経路 (mission 2/2 全損の実測) なので陽性側で pin する。"""
+    mission_id, run_id, _ = mission_and_run_fixture
+    staging_dir = tmp_path / "staging_mt"
+    staging_dir.mkdir()
+    ledger = ImproveRpcLedger(
+        rpc_timeout_sec_by_kind={"analyze_corr": 60.0, "run_backtest": 600.0})
+    ledger.record(opaque_ref="bt", kind="run_backtest", params={},
+                  result_summary={}, trial_count=1)
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+
+    loop_min._finalize_failed_mission(
+        conn, ctx=ctx,
+        result=MissionResult(status="max_turns", output=None, transcript=[]),
+        now=datetime(2026, 8, 22))
+
+    note = conn.execute(
+        "SELECT status, idea, last_result FROM improvement_backlog "
+        "WHERE source='system'").fetchone()
+    assert note is not None
+    assert note["status"] == "note"
+    assert "timeout/max_turns" in note["idea"]
+    assert note["last_result"] == (
+        f"mission #{mission_id} status=max_turns run_backtest=1 analyze_corr=0")
