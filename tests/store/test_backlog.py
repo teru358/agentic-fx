@@ -349,3 +349,30 @@ def test_upsert_system_note_only_updates_its_own_system_note_row(tmp_path):
     assert c.execute(
         "SELECT COUNT(*) FROM improvement_backlog WHERE idea_norm=?",
         (norm,)).fetchone()[0] == 3
+
+
+# --- ローカル 2 周目 pin (2026-09-07、tmp/review-20260907-st-r2/verified-round2-local.md #19) ---
+def test_upsert_system_note_refreshes_the_oldest_when_duplicates_exist(tmp_path):
+    """ローカル 2 周目 (qwen c2 Minor の派生): 同一 idea_norm の
+    (source='system', status='note') が 2 行並ぶ状態は到達可能 —
+    upsert_system_note が自分の note を作った後、同じ idea_norm の
+    system/open 行 (`_upsert_backlog_idea` の promote 経路) を人間が
+    `backlog note <id>` (commands.py) で note に落とすと重複する。
+    このとき SELECT の `ORDER BY id` が更新先を古い方に固定する
+    (DESC / 逆順への変異が全テスト緑で生存していた)。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    idea, norm = "Known Constraint", "known constraint"
+    ids = [c.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea, source, status, created_at, updated_at, idea_norm, last_result) "
+        "VALUES (?, 'system', 'note', ?, ?, ?, ?)",
+        (idea, NOW.isoformat(), NOW.isoformat(), norm, f"old{i}")).lastrowid
+        for i in range(2)]
+
+    assert backlog.upsert_system_note(
+        c, idea=idea, last_result="fresh", now=NOW) == ids[0]
+    rows = {r["id"]: r["last_result"] for r in c.execute(
+        "SELECT id, last_result FROM improvement_backlog WHERE idea_norm=?",
+        (norm,)).fetchall()}
+    assert rows[ids[0]] == "fresh"
+    assert rows[ids[1]] == "old1"
