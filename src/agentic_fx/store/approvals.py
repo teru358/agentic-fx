@@ -129,7 +129,7 @@ def expire_due(conn: sqlite3.Connection, now: datetime, *,
     を呼ぶ Task 11 の `process_expired_approvals(conn, *, plugins_root, now)`
     の責務 (未完ジャーナルがある行はスキップし次回再試行する)。対象行の
     列挙は下記 `list_due_for_expiry` を使う。非 plugin kind
-    (`tech_plugin`/`news_source`/`live_trade`) は従来どおりここで直接
+    (`tech_plugin`/`live_trade`。`news_source` は 2026-09-07 に経路廃止) は従来どおりここで直接
     expired 化してよい (§4.3 の対象外・switch ジャーナルと無関係)。
     戻り値は「このコールで直接 expired 化した件数」(除外 kind の分は
     含まない)。"""

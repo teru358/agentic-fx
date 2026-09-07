@@ -347,7 +347,7 @@ TradeIntent は発注前に全ルールを通過しなければならない。1 
 | 経路 | 対象 | 置き場所 | 承認ゲート |
 |---|---|---|---|
 | **plugin 追加・変更** | indicator / signal / strategy の実装 (コード) | `plugins/<name>/` (**gitignore**) | **approval_requests (kind=plugin)** — Discord ボタン or CLI。承認前の plugin はロードされない |
-| **news ソース追加** | ニュース取得先の追加 (**データ 1 行、コードなし**) | SQLite `news_sources` テーブル | **approval_requests (kind=news_source)** — 機械検証 (URL 到達性・parse 成功・重複) を自動実行した上で軽量な人間承認 |
+| ~~news ソース追加~~ | **廃止 (2026-09-07 裁定)** — 改善ループ経由のソース追加は行わない。ソースの追加・無効化は人間の運用操作 (`news_sources` テーブル)。LLM が「このソースが欲しい」と判断したときは提案レポート (`proposal_kind: research`) で人間に提案する | — | — (approval kind=news_source は作らない) |
 
 plugin を gitignore するのは、LLM が実装するツール群がプロジェクトを clone したユーザーごとに異なるため。公開リポジトリには plugin 機構と組み込みデフォルト実装のみをコミットする。
 
@@ -355,7 +355,7 @@ plugin を gitignore するのは、LLM が実装するツール群がプロジ�
 
 ### news はソースリスト方式 (plugin ではない)
 
-ニュースの取得方式は実質 **feed parse (RSS/Atom)** / **web fetch (HTML 記事抽出)** の 2 つに収斂するため、fetcher は `src/` の組み込み実装に固定し、**news の拡張はすべて `news_sources` テーブルへのデータ追加**とする (feedly は使わない — 前身の feedly_fetcher は移植しない):
+ニュースの取得方式は実質 **feed parse (RSS/Atom)** / **web fetch (HTML 記事抽出)** の 2 つに収斂するため、fetcher は `src/` の組み込み実装に固定し、**news の拡張はすべて `news_sources` テーブルへのデータ追加**とする (追加は人間の運用操作。改善ループの出力経路ではない — 2026-09-07 裁定: plugin にはバックテストという定量ゲートがあるがニュースソースには評価軸が無く、LLM でも人間でも「質を上げるか」を事前に判断できない) (feedly は使わない — 前身の feedly_fetcher は移植しない):
 
 ```
 news_sources: id, name, fetcher (feed | web), url,
@@ -428,13 +428,13 @@ indicator と signal は**材料**を出すが、strategy は**判断**を出す
 
 ### 許可ツール
 
-成績 DB 読取、`web_search` / `fetch_article` (無料実装: ddgs + 前身 article_fetcher 移植)、**`plugins/` のファイル読み書き** (リポジトリ本体は**読取のみ** — 出力の 2 経路の裁定に伴い、コア変更用の専用ブランチ・PR 作成 (`gh`) は撤去)、news_sources への追加提案、`uv run pytest` 実行 (plugin の同梱テスト — **worker 内で回す要否は改善ループ実装プランの設計段階で確定させる**。EXECUTE 権と一時書き込み先が要り Landlock 設計に跳ね返るため、task に埋めない)、バックテスト実行、バックログ読み書き、approval_request 発行、提案レポート書き出し (`reports/`)
+成績 DB 読取、`web_search` / `fetch_article` (無料実装: ddgs + 前身 article_fetcher 移植)、**`plugins/` のファイル読み書き** (リポジトリ本体は**読取のみ** — 出力の 2 経路の裁定に伴い、コア変更用の専用ブランチ・PR 作成 (`gh`) は撤去)、(news_sources への追加提案は 2026-09-07 に廃止 — 提案レポートに吸収)、`uv run pytest` 実行 (plugin の同梱テスト — **worker 内で回す要否は改善ループ実装プランの設計段階で確定させる**。EXECUTE 権と一時書き込み先が要り Landlock 設計に跳ね返るため、task に埋めない)、バックテスト実行、バックログ読み書き、approval_request 発行、提案レポート書き出し (`reports/`)
 
 ### 品質ゲート (loop 側で強制) — コード品質と戦略品質を分離
 
 **コード品質ゲート**:
 - テストが 1 件でも落ちる変更は approval_request にしない。分析レポート (`reports/improve-YYYY-MM-DD.md`) だけ残す
-- **採用は必ず人間承認** (plugin / news_source = approval_requests。本体コードの変更経路は改善ループに存在しない — 出力の 2 経路)
+- **採用は必ず人間承認** (plugin = approval_requests。news_source 経路は 2026-09-07 に廃止。本体コードの変更経路は改善ループに存在しない — 出力の 2 経路 = plugins/ + 提案レポート)
 
 **戦略採用ゲート** (対象 = `strategy` plugin の採用と、agent による **`strategy` plugin の** `config.yaml` パラメータ変更。pytest 合格だけでは戦略の良し悪しは判定できないため。**`indicator` / `signal` は対象外** — 収益バックテストが plugin 単独に帰属しない (§6 分類表) ため、各種別の検証手段 + コード品質ゲート + 人間承認で採用する):
 - バックテスト必須 (手数料・spread 込み)。**最低取引数 (初期 30) 未満の標本による変更提案は不可** — 「観察のみ」としてバックログに残す
