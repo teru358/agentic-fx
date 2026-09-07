@@ -13,10 +13,12 @@ from datetime import datetime, timezone
 import pytest
 
 from agentic_fx.backtest.analysis import analyze_for_agent
+from agentic_fx.config import ImproveToolBudgetSettings
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.tools.improve_rpc_tools import (
     _FORBIDDEN_KEYS, _strip_forbidden, build_improve_rpc_tooldefs,
 )
+from agentic_fx.tools.mission_counters import MissionToolCounters
 
 from tests.backtest.factories import _conn
 from tests.backtest.test_analysis import (
@@ -75,6 +77,38 @@ def test_run_backtest_records_to_ledger_and_returns_handler_result():
     ledger.freeze()
     assert len(ledger.entries()) == 1
     assert ledger.entries()[0]["kind"] == "run_backtest"
+
+
+def test_run_backtest_error_does_not_count_as_success_and_budget_stops_seventh_call():
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    counters = MissionToolCounters()
+    calls = []
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger,
+        run_backtest_handler=lambda args: calls.append(args) or {"error": "no history"},
+        analyze_corr_handler=lambda args: {}, counters=counters,
+        budget=ImproveToolBudgetSettings(max_backtests_per_candidate=6))}
+
+    for _ in range(6):
+        assert tools["run_backtest"].func("a", "USDJPY")["error"] == "no history"
+    rejected = tools["run_backtest"].func("a", "USDJPY")
+    assert rejected["error"] == "budget exhausted"
+    assert rejected["budget"] == "max_backtests_per_candidate"
+    assert len(calls) == 6
+    assert counters.successful_backtests["a"] == 0
+    ledger.freeze()
+    assert len(ledger.entries()) == 6
+
+
+def test_run_backtest_success_is_recorded_in_shared_counters():
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
+        run_backtest_handler=lambda args: {"metrics": {"trades": 1}},
+        analyze_corr_handler=lambda args: {}, counters=counters,
+        budget=ImproveToolBudgetSettings())}
+    tools["run_backtest"].func("a", "USDJPY")
+    assert counters.successful_backtests["a"] == 1
 
 
 def test_run_backtest_guides_indicator_without_calling_handler(tmp_path):

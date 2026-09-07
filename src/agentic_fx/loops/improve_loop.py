@@ -1842,6 +1842,22 @@ class ImproveLoop:
         self._delete_staging(ctx)
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if result.status in ("timeout", "max_turns"):
+                entries = ctx.ledger.entries()
+                n_bt = sum(e["kind"] == "run_backtest" for e in entries)
+                n_corr = sum(e["kind"] == "analyze_corr" for e in entries)
+                try:
+                    backlog_store.upsert_system_note(
+                        conn,
+                        idea=("improve mission が最終出力なしで終了した (timeout/max_turns)。"
+                              "strategy はまず run_backtest を呼び、self-test の修正を繰り返さないこと"),
+                        last_result=(f"mission #{ctx.mission_id} status={result.status} "
+                                     f"run_backtest={n_bt} analyze_corr={n_corr}"),
+                        now=now)
+                except sqlite3.Error as e:
+                    self._activity.write(
+                        Category.IMPROVE, "backlog_note_failed",
+                        f"mission={ctx.mission_id} {safe_error_text(e)}")
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key if slot_terminalize else None,

@@ -220,6 +220,25 @@ def test_build_mission_registry_improve_has_research_and_staging_and_rpc_tools(t
             "run_backtest", "analyze_corr"} <= names
 
 
+def test_improve_registry_counts_rejected_tool_calls(tmp_path):
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+
+    conn = connect(tmp_path / "x.db"); init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    staging = tmp_path / "staging"; staging.mkdir()
+    source = tmp_path / "source"; source.mkdir()
+    registry = build_mission_registry(
+        "improve", conn, SETTINGS, _clock(), rag,
+        activity=ActivityLog(tmp_path / "activity.log"), staging_dir=staging,
+        source_snapshot_dir=source,
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        rpc_handlers={"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}})
+
+    registry.execute("run_plugin_tests", {"name": "missing"}, ["run_plugin_tests"])
+    registry.execute("not_allowed", {}, ["run_plugin_tests"])
+    assert registry.counters.total_calls == 2
+
+
 def test_build_mission_registry_improve_wires_rpc_handlers_by_tool_not_swapped(tmp_path):
     """M11 (段 0 Important): improve 分岐で `run_backtest_handler` と
     `analyze_corr_handler` を入れ替える変異が red になる pin —

@@ -23,8 +23,9 @@ class ToolDef:
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(self, *, on_execute: Callable[[], None] | None = None) -> None:
         self._tools: dict[str, ToolDef] = {}
+        self._on_execute = on_execute
 
     def register(self, tool: ToolDef) -> None:
         if tool.name in self._tools:
@@ -45,6 +46,8 @@ class ToolRegistry:
                 for n, t in self._tools.items() if n in allowed]
 
     def execute(self, name: str, arguments: dict, allowed: list[str]) -> str:
+        if self._on_execute is not None:
+            self._on_execute()
         # F2: check isinstance first to avoid TypeError on unhashable name
         if not isinstance(name, str):
             return json.dumps({"error": f"tool name must be str, got {type(name).__name__!r}"}, ensure_ascii=False)

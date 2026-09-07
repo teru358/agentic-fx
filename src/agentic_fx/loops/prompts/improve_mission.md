@@ -71,7 +71,11 @@
    - gate は pytest が実際に通したテスト数 (`{min_test_functions}` 本以上) で判定。
 3. **1 回の結果で課題を捨てないでください** — うまくいかなかった場合も
    `observation` として理由を残し、次回への申し送りにしてください。
-4. 出力は必ず下の「最終出力」の形式 (`discoveries` / `selected` /
+4. **strategy 候補は self-test の合否に関わらず、まず `run_backtest` で実データを確認してください。**
+   2 回目以降の self-test は run_backtest 後でないと拒否されます。`evaluate` は df の最終バーで判定するため、
+   クロス等のイベントは最終バーで起こしてください。設定 `improve.tool_budget` で定める予算を超えた
+   self-test・write・候補ごとの backtest は拒否されます。
+5. 出力は必ず下の「最終出力」の形式 (`discoveries` / `selected` /
    `artifact` / `selection_rationale`) に従ってください。分析 ID・探索
    回数などの集計値はあなたが数える必要はありません (親が RPC 記録から
    生成します)。

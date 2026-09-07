@@ -74,6 +74,13 @@ improve:
   llama_swap_verified: false
   max_new_backlog_per_mission: 20
   backtest_rpc_timeout_sec: 600
+  tool_budget:                  # 改善 mission 1 回あたりの tool 予算
+    self_test_warn_after: 3     # 同一失敗の警告を返し始める連続回数
+    max_self_test_runs: 12      # self-test 実行回数の上限
+    max_self_tests_before_backtest: 3  # 成功 backtest 前の strategy self-test 総数
+    max_writes: 30              # staging 書き込み回数の上限
+    max_backtests_per_candidate: 6  # 候補ごとの backtest 呼び出し上限
+    max_tool_calls: 100         # 全 tool 呼び出し数 (カウントのみ、abort は Tier F)
   research:
     max_searches: 20
     max_fetches: 30

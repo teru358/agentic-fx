@@ -2,10 +2,18 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import shutil
+from pathlib import Path
 
 import pytest
 
-from agentic_fx.tools.improve_staging_tools import build_improve_staging_tooldefs
+from agentic_fx.config import ImproveToolBudgetSettings
+from agentic_fx.tools.improve_staging_tools import (
+    BUDGET_EXHAUSTED_DIRECTIVE,
+    _failure_signature, build_improve_staging_tooldefs,
+)
+from agentic_fx.tools.mission_counters import MissionToolCounters
 from agentic_fx.tools.registry import ToolRegistry
 
 
@@ -336,3 +344,175 @@ def test_run_plugin_tests_confines_pytest_to_candidate_dir(tmp_path):
     joined = " ".join(map(str, captured["argv"]))
     assert "--rootdir" in joined
     assert "--confcutdir" in joined or captured["cwd"] is not None
+
+
+def test_failure_signature_uses_real_outputs_and_ignores_assert_values():
+    fixtures = Path(__file__).resolve().parents[1] / "fixtures" / "selftest_loop"
+    m60 = [_failure_signature((fixtures / f"m60_run_plugin_tests_{i}.txt").read_text())
+           for i in range(28)]
+    m58 = _failure_signature((fixtures / "m58_run_plugin_tests_0.txt").read_text())
+    assert len(set(m60)) == 1
+    assert m58 != m60[0]
+    assert _failure_signature(
+        (fixtures / "m58_run_plugin_tests_1.txt").read_text()) == (
+            "<no-tests>", "", "")
+
+
+@pytest.mark.parametrize("output", ["", "Traceback\nImportError: broken\n"])
+def test_failure_signature_without_failed_lines_is_stable(output):
+    assert _failure_signature(output) == ("<no-tests>", "", "")
+
+
+def test_failure_signature_takes_first_custom_exception_per_failure_block():
+    output = """___ test_one ___
+E       Boom: first
+E       ValueError: chained
+___ test_two ___
+E       SystemExit: second
+FAILED test_plugin.py::test_one
+FAILED test_plugin.py::test_two
+"""
+    assert _failure_signature(output)[1] == ("Boom", "SystemExit")
+
+
+def test_write_staging_file_rejects_only_after_budget_is_used(tmp_path):
+    staging = tmp_path / "staging"; staging.mkdir()
+    source = tmp_path / "source"; source.mkdir()
+    counters = MissionToolCounters()
+    budget = ImproveToolBudgetSettings(max_writes=2)
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source,
+        counters=counters, budget=budget)}
+    assert tools["write_staging_file"].func("a", "plugin.py", "x") == {"ok": True}
+    assert tools["write_staging_file"].func("a", "plugin.py", "y") == {"ok": True}
+    rejected = tools["write_staging_file"].func("a", "plugin.py", "z")
+    assert rejected["error"] == "budget exhausted"
+    assert rejected["budget"] == "max_writes"
+
+
+def test_run_plugin_tests_timeout_is_counted(monkeypatch, tmp_path):
+    staging = tmp_path / "staging"; source = tmp_path / "source"
+    staging.mkdir(); source.mkdir(); (staging / "a").mkdir()
+    (staging / "a" / "test_plugin.py").write_text("def test_x(): pass\n")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source,
+        counters=counters, budget=ImproveToolBudgetSettings())}
+    monkeypatch.setattr(
+        "agentic_fx.tools.improve_staging_tools.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("pytest", 120)))
+    assert tools["run_plugin_tests"].func("a") == {
+        "passed": False, "stdout_tail": "pytest timeout (120s)"}
+    assert counters.self_test_runs == 1
+
+
+def test_repeated_timeouts_include_repeated_failure(monkeypatch, tmp_path):
+    staging = tmp_path / "staging"; source = tmp_path / "source"
+    staging.mkdir(); source.mkdir(); (staging / "broken").mkdir()
+    (staging / "broken" / "test_plugin.py").write_text("def test_x(): pass\n")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source, counters=counters,
+        budget=ImproveToolBudgetSettings(self_test_warn_after=3))}
+    monkeypatch.setattr(
+        "agentic_fx.tools.improve_staging_tools.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("pytest", 120)))
+    for _ in range(2):
+        assert "repeated_failure" not in tools["run_plugin_tests"].func("broken")
+    out = tools["run_plugin_tests"].func("broken")
+    assert out["repeated_failure"]["consecutive"] == 3
+    assert out["repeated_failure"]["failed_tests"] == ["<no-tests>"]
+
+
+def test_strategy_self_test_requires_successful_backtest_before_repeating(tmp_path):
+    staging = tmp_path / "staging"; staging.mkdir()
+    source = tmp_path / "source"; source.mkdir()
+    example = Path(__file__).resolve().parents[2] / "docs/examples/plugins/sma_cross"
+    shutil.copytree(example, staging / "candidate")
+    with (staging / "candidate" / "test_plugin.py").open("a") as f:
+        f.write("\ndef test_deliberate_failure():\n    assert 'hold' == 'open'\n")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source, counters=counters,
+        budget=ImproveToolBudgetSettings())}
+
+    assert tools["run_plugin_tests"].func("candidate")["passed"] is False
+    assert tools["run_plugin_tests"].func("candidate")["error"] == \
+        "run_backtest_required_first"
+    counters.record_backtest("candidate", ok=False)
+    assert tools["run_plugin_tests"].func("candidate")["error"] == \
+        "run_backtest_required_first"
+    counters.record_backtest("candidate", ok=True)
+    second = tools["run_plugin_tests"].func("candidate")
+    third = tools["run_plugin_tests"].func("candidate")
+    assert second["passed"] is False
+    assert third["repeated_failure"]["consecutive"] == 3
+    assert third["repeated_failure"]["last_values"] == [
+        "assert 'hold' == 'open'"]
+
+
+def test_strategy_name_rotation_cannot_evade_pre_backtest_budget(tmp_path):
+    staging = tmp_path / "staging"; staging.mkdir()
+    source = tmp_path / "source"; source.mkdir()
+    example = Path(__file__).resolve().parents[2] / "docs/examples/plugins/sma_cross"
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source, counters=counters,
+        budget=ImproveToolBudgetSettings(max_self_tests_before_backtest=3))}
+    for name in ("one", "two", "three", "four"):
+        shutil.copytree(example, staging / name)
+
+    for name in ("one", "two", "three"):
+        assert "error" not in tools["run_plugin_tests"].func(name)
+    assert tools["run_plugin_tests"].func("four")["error"] == \
+        "run_backtest_required_first"
+
+
+def test_loader_rejected_candidate_is_not_subject_to_backtest_order(tmp_path):
+    staging = tmp_path / "staging"; staging.mkdir()
+    source = tmp_path / "source"; source.mkdir()
+    candidate = staging / "broken"; candidate.mkdir()
+    (candidate / "plugin.py").write_text("this is invalid python")
+    (candidate / "test_plugin.py").write_text("def test_x(): assert False\n")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source, counters=counters,
+        budget=ImproveToolBudgetSettings())}
+    assert tools["run_plugin_tests"].func("broken")["passed"] is False
+    assert tools["run_plugin_tests"].func("broken")["passed"] is False
+
+
+# --- 段 0 変異スイープ pin (2026-09-07、指揮者): 生存 3 件のうち 2 件 ---
+
+def test_failure_signature_ignores_assert_actual_values():
+    """M7 pin: `E   assert 'hold' == 'open'` の実値だけが変わっても署名は同一
+    (設計 v4 Tier A: 実値は署名に含めない — 値が漸進するだけの無進捗ループを
+    同一失敗として数えるため)。"""
+    fixtures = Path(__file__).resolve().parents[1] / "fixtures" / "selftest_loop"
+    base = (fixtures / "m60_run_plugin_tests_0.txt").read_text()
+    assert "assert 'hold' == 'open'" in base
+    varied = base.replace("assert 'hold' == 'open'", "assert 'hold' == 'flat'")
+    assert varied != base
+    assert _failure_signature(varied) == _failure_signature(base)
+
+
+def test_run_plugin_tests_rejects_exactly_at_max_self_test_runs(monkeypatch, tmp_path):
+    """M2 pin: max_self_test_runs=2 なら 3 回目が budget exhausted (off-by-one)。
+    strategy でない候補 (plugin.py 無し → loader 不成立) で Tier B を外す。"""
+    staging = tmp_path / "staging"; source = tmp_path / "source"
+    staging.mkdir(); source.mkdir(); (staging / "a").mkdir()
+    (staging / "a" / "test_plugin.py").write_text("def test_x(): pass\n")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source, counters=counters,
+        budget=ImproveToolBudgetSettings(max_self_test_runs=2, self_test_warn_after=1,
+                                         max_self_tests_before_backtest=1))}
+    monkeypatch.setattr(
+        "agentic_fx.tools.improve_staging_tools.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("pytest", 120)))
+    assert tools["run_plugin_tests"].func("a")["passed"] is False
+    assert tools["run_plugin_tests"].func("a")["passed"] is False
+    third = tools["run_plugin_tests"].func("a")
+    assert third == {"error": "budget exhausted", "budget": "max_self_test_runs",
+                     "directive": BUDGET_EXHAUSTED_DIRECTIVE}
+    assert counters.self_test_runs == 2

@@ -25,6 +25,7 @@ from agentic_fx.tools import (
     signal_tools, improve_rpc_tools, improve_staging_tools, research_tools,
 )
 from agentic_fx.tools.registry import ToolRegistry
+from agentic_fx.tools.mission_counters import MissionToolCounters
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
@@ -91,15 +92,19 @@ def build_mission_registry(
             raise ValueError(
                 "loop='improve' には staging_dir/source_snapshot_dir/ledger/"
                 "rpc_handlers が必須です")
-        registry = ToolRegistry()
+        counters = MissionToolCounters()
+        registry = ToolRegistry(on_execute=counters.record_call)
+        registry.counters = counters
+        budget = settings.improve.tool_budget
         registry.register_all(research_tools.build_research_tooldefs(
             settings=settings.improve.research))
         registry.register_all(improve_staging_tools.build_improve_staging_tooldefs(
-            staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir))
+            staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+            counters=counters, budget=budget))
         registry.register_all(improve_rpc_tools.build_improve_rpc_tooldefs(
             ledger=ledger, run_backtest_handler=rpc_handlers["run_backtest"],
             analyze_corr_handler=rpc_handlers["analyze_corr"],
-            staging_dir=staging_dir))
+            staging_dir=staging_dir, counters=counters, budget=budget))
         return registry
 
     # --- 既存 trade/ask 分岐 (無変更) ---

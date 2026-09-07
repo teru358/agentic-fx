@@ -32,6 +32,8 @@ def test_evaluate_holds_on_flat_prices_no_crossover():
 
 def test_evaluate_opens_long_on_upward_crossover():
     # 20 本の緩やかな下降 (120→101) の直後に急騰 (200) させ、
+    # クロスは最終バーで起きる必要がある (evaluate は df の最終バーで判定する)。
+    # 上昇区間を伸ばすほどクロスは過去に遠のく。
     # fast SMA(5) が slow SMA(20) を上抜ける状態を作る (手計算で確認済み:
     # prev_diff=-7.5 → curr_diff=+7.5)。
     closes = [120 - i for i in range(20)] + [200]
@@ -44,6 +46,7 @@ def test_evaluate_opens_long_on_upward_crossover():
 
 def test_evaluate_opens_short_on_downward_crossover():
     # 上記の鏡像 (急騰の代わりに急落) で下抜けクロスを作る。
+    # クロスは最終バーで起きる必要がある。下降区間を伸ばすほどクロスは過去に遠のく。
     closes = [101 + i for i in range(20)] + [50]
     out = evaluate(_df(closes), {}, [], {})
     assert out["action"] == "open"

@@ -228,6 +228,24 @@ class ImproveGateSettings(_Strict):
     min_test_functions: int = Field(ge=0, default=3)
 
 
+class ImproveToolBudgetSettings(_Strict):
+    self_test_warn_after: int = Field(ge=1, default=3)
+    max_self_test_runs: int = Field(ge=1, default=12)
+    max_self_tests_before_backtest: int = Field(ge=1, default=3)
+    max_writes: int = Field(ge=1, default=30)
+    max_backtests_per_candidate: int = Field(ge=1, default=6)
+    max_tool_calls: int = Field(ge=1, default=100)
+
+    @model_validator(mode="after")
+    def _thresholds_fit_self_test_budget(self) -> "ImproveToolBudgetSettings":
+        if self.self_test_warn_after > self.max_self_test_runs:
+            raise ValueError("self_test_warn_after must be <= max_self_test_runs")
+        if self.max_self_tests_before_backtest > self.max_self_test_runs:
+            raise ValueError(
+                "max_self_tests_before_backtest must be <= max_self_test_runs")
+        return self
+
+
 class ImproveSettings(_Strict):
     parallel: int = Field(ge=1, le=4, default=1)
     mission_max_turns: int = Field(ge=1, default=200)
@@ -237,6 +255,7 @@ class ImproveSettings(_Strict):
     backtest_rpc_timeout_sec: float = Field(gt=0, default=600)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
     gate: ImproveGateSettings = Field(default_factory=ImproveGateSettings)
+    tool_budget: ImproveToolBudgetSettings = ImproveToolBudgetSettings()
 
 
 class ScheduleSettings(_Strict):

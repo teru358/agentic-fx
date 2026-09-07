@@ -11,11 +11,49 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.tools.registry import ToolDef
+
+if TYPE_CHECKING:
+    from agentic_fx.config import ImproveToolBudgetSettings
+    from agentic_fx.tools.mission_counters import MissionToolCounters
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _ALLOWED_REL = frozenset({"plugin.py", "config.yaml", "test_plugin.py"})
+
+BUDGET_EXHAUSTED_DIRECTIVE = (
+    "予算を使い切りました。現状の候補で提出するか、observation で理由を残して最終出力を出してください。")
+RUN_BACKTEST_FIRST_DIRECTIVE = (
+    "strategy 候補は self-test を繰り返す前に run_backtest(name, pair) で実データの挙動を確認してください。"
+    "self-test の合否は run_backtest の前提ではありません。実データで trade が出れば plugin は正しく、"
+    "失敗しているのはテスト側です。")
+REPEATED_FAILURE_DIRECTIVE = (
+    "同じテストが同じ assert で 3 回続けて失敗しています。テストデータの前提を疑ってください "
+    "(evaluate は渡された df の最終バーで判定します。クロス等のイベントは最終バーで起きるデータにすること)。"
+    "直らなければこのテストを外し、observation に理由を残して提出してください。")
+
+
+def _failure_signature(full_output: str) -> tuple:
+    failed = tuple(sorted(set(re.findall(r"^FAILED\s+(\S+)", full_output, re.MULTILINE))))
+    if not failed:
+        return ("<no-tests>", "", "")
+    lines = full_output.splitlines()
+    starts = [i for i, line in enumerate(lines)
+              if re.match(r"^_{3,}\s+.+?\s+_{3,}$", line)]
+    blocks = [lines[start:(starts[pos + 1] if pos + 1 < len(starts) else len(lines))]
+              for pos, start in enumerate(starts)] or [lines]
+    exc_types = []
+    for block in blocks:
+        for line in block:
+            match = re.match(r"^E\s+([A-Za-z_][A-Za-z0-9_.]*):", line)
+            if match:
+                exc_types.append(match.group(1).rsplit(".", 1)[-1])
+                break
+    assertions = tuple(line.strip() for line in full_output.splitlines()
+                       if line.lstrip().startswith(">"))
+    return (failed, tuple(exc_types), assertions)
 
 
 def _safe_join(root: Path, name: str, rel: str | None = None) -> Path | None:
@@ -36,8 +74,10 @@ def _safe_join(root: Path, name: str, rel: str | None = None) -> Path | None:
     return candidate
 
 
-def build_improve_staging_tooldefs(*, staging_dir: Path,
-                                    source_snapshot_dir: Path) -> list[ToolDef]:
+def build_improve_staging_tooldefs(
+        *, staging_dir: Path, source_snapshot_dir: Path,
+        counters: "MissionToolCounters | None" = None,
+        budget: "ImproveToolBudgetSettings | None" = None) -> list[ToolDef]:
     def list_staging() -> dict:
         # opencode E2E m11 実測 (2026-08-30): `_snapshot_src/` (staging_dir
         # 直下に実体化される snapshot) を候補として返すと、モデルは
@@ -64,8 +104,14 @@ def build_improve_staging_tooldefs(*, staging_dir: Path,
         path = _safe_join(staging_dir, name, rel)
         if path is None:
             return {"error": "invalid name or rel"}
+        if counters is not None and budget is not None \
+                and not counters.reserve_write(budget.max_writes):
+            return {"error": "budget exhausted", "budget": "max_writes",
+                    "directive": BUDGET_EXHAUSTED_DIRECTIVE}
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+        if counters is not None and budget is None:
+            counters.record_write()
         return {"ok": True}
 
     def read_plugin_source(name: str) -> dict:
@@ -117,6 +163,20 @@ def build_improve_staging_tooldefs(*, staging_dir: Path,
         base = _safe_join(staging_dir, name)
         if base is None or not (base / "test_plugin.py").is_file():
             return {"error": "not found"}
+        is_strategy = False
+        if counters is not None and budget is not None:
+            meta, _ = plugin_loader.discover_one_with_reason(base, name)
+            is_strategy = meta is not None and meta.kind == "strategy"
+            rejection = counters.reserve_self_test(
+                name, max_runs=budget.max_self_test_runs,
+                max_before_backtest=budget.max_self_tests_before_backtest,
+                is_strategy=is_strategy)
+            if rejection == "max_self_test_runs":
+                return {"error": "budget exhausted", "budget": "max_self_test_runs",
+                        "directive": BUDGET_EXHAUSTED_DIRECTIVE}
+            if rejection == "run_backtest_required_first":
+                return {"error": "run_backtest_required_first",
+                        "directive": RUN_BACKTEST_FIRST_DIRECTIVE}
         # 実機 E2E 是正 (2026-08-30 mission #9): (a) rootdir/confcutdir を
         # 候補 dir に固定し cwd も候補 dir にする — 未指定だと pytest の
         # rootdir 探索が Landlock allowlist 外 (リポジトリ root の
@@ -126,17 +186,49 @@ def build_improve_staging_tooldefs(*, staging_dir: Path,
         # `stdout_tail:""` の盲目デバッグをモデルに強いていた。
         # `-c` 未指定では `locate_config()` が祖先の pyproject.toml を開き、
         # Landlock 下で EACCES になる (mission m20/m22 で実測)。
-        result = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "-p", "no:logging",
-             "-p", "no:cacheprovider", "-c", "/dev/null",
-             "--rootdir", str(base), "--confcutdir", str(base),
-             str(base / "test_plugin.py")],
-            capture_output=True, text=True, stdin=subprocess.DEVNULL,
-            cwd=str(base), timeout=120)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", "-p", "no:logging",
+                 "-p", "no:cacheprovider", "-c", "/dev/null",
+                 "--rootdir", str(base), "--confcutdir", str(base),
+                 str(base / "test_plugin.py")],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                cwd=str(base), timeout=120)
+        except subprocess.TimeoutExpired:
+            if counters is not None:
+                consecutive = counters.record_self_test_result(
+                    name, ("<no-tests>", "", "")) if budget is not None else \
+                    counters.record_self_test(name, ("<no-tests>", "", ""))
+            else:
+                consecutive = 0
+            out = {"passed": False, "stdout_tail": "pytest timeout (120s)"}
+            if budget is not None and consecutive >= budget.self_test_warn_after:
+                out["repeated_failure"] = {
+                    "consecutive": consecutive, "failed_tests": ["<no-tests>"],
+                    "last_values": [], "directive": REPEATED_FAILURE_DIRECTIVE}
+            return out
         combined = result.stdout + (
             ("\n[stderr]\n" + result.stderr) if result.stderr else "")
-        return {"passed": result.returncode == 0,
-                "stdout_tail": combined[-2000:]}
+        out = {"passed": result.returncode == 0, "stdout_tail": combined[-2000:]}
+        if counters is not None:
+            signature = _failure_signature(combined)
+            consecutive = counters.record_self_test_result(name, signature) \
+                if budget is not None else counters.record_self_test(name, signature)
+            if not out["passed"] and budget is not None \
+                    and consecutive >= budget.self_test_warn_after:
+                failed = [node.rsplit("::", 1)[-1]
+                          for node in _failure_signature(combined)[0]]
+                values = []
+                for line in combined.splitlines():
+                    match = re.match(r"^E\s+(?:AssertionError:\s*)?(assert\s.+)$", line)
+                    if match:
+                        values.append(match.group(1))
+                    if len(values) == 5:
+                        break
+                out["repeated_failure"] = {
+                    "consecutive": consecutive, "failed_tests": failed,
+                    "last_values": values, "directive": REPEATED_FAILURE_DIRECTIVE}
+        return out
 
     return [
         ToolDef(name="list_staging", description="候補置き場の一覧。",

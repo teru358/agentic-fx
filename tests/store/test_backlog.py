@@ -8,6 +8,34 @@ from agentic_fx.store.db import connect, init_db
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 
 
+def test_upsert_system_note_inserts_then_updates_without_committing(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    idea = "  Known Constraint  "
+    note_id = backlog.upsert_system_note(
+        c, idea=idea, last_result="first", now=NOW)
+    assert c.in_transaction
+    again = backlog.upsert_system_note(
+        c, idea=idea, last_result="second", now=NOW)
+    rows = c.execute(
+        "SELECT * FROM improvement_backlog WHERE status='note'").fetchall()
+    assert again == note_id
+    assert len(rows) == 1
+    assert rows[0]["idea_norm"] == "known constraint"
+    assert rows[0]["source"] == "system"
+    assert rows[0]["last_result"] == "second"
+
+
+def test_upsert_system_note_does_not_overwrite_same_open_idea(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    open_id = backlog.add(c, "Known Constraint", "user", NOW)
+    note_id = backlog.upsert_system_note(
+        c, idea="known constraint", last_result="system note", now=NOW)
+    assert note_id != open_id
+    assert c.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (open_id,)).fetchone()["status"] == "open"
+
+
 def test_backlog_and_run(tmp_path):
     c = connect(tmp_path / "t.db")
     init_db(c)

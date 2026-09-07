@@ -1,0 +1,44 @@
+..FF.                                                                    [100%]
+=================================== FAILURES ===================================
+___________ test_evaluate_opens_long_on_upward_crossover_with_trend ____________
+
+    def test_evaluate_opens_long_on_upward_crossover_with_trend():
+        # 急落 20 バース (120→101) + 持続的な上昇 400 バース (102..501)。
+        # ADX は直近 adx_period(14) バースのトレンドで決まるため、急落後に
+        # 緩やかな反発 (slope 0.05) を挟み、最後に持続的な上昇 (slope 1.0)
+        # を置く。直近 14 バースが上昇トレンドなので ADX>25、かつ fast SMA(5)
+        # が slow SMA(20) を上抜けて long open になる。
+        closes = [120 - i for i in range(20)]
+        closes += [101 + i * 0.05 for i in range(1, 41)]   # 緩やかな反発
+        closes += [103 + i for i in range(1, 401)]         # 持続的な上昇
+        out = evaluate(_df(closes), {}, [], {})
+>       assert out["action"] == "open"
+E       AssertionError: assert 'hold' == 'open'
+E         
+E         - open
+E         + hold
+
+test_plugin.py:44: AssertionError
+__________ test_evaluate_opens_short_on_downward_crossover_with_trend __________
+
+    def test_evaluate_opens_short_on_downward_crossover_with_trend():
+        # 鏡像: 急騰 + 緩やかな反落 (slope -0.05) + 持続的な下落。
+        closes = [101 + i for i in range(20)]
+        closes += [120 - i * 0.05 for i in range(1, 41)]
+        closes += [118 - i for i in range(1, 401)]
+        out = evaluate(_df(closes), {}, [], {})
+>       assert out["action"] == "open"
+E       AssertionError: assert 'hold' == 'open'
+E         
+E         - open
+E         + hold
+
+test_plugin.py:57: AssertionError
+=========================== short test summary info ============================
+FAILED test_plugin.py::test_evaluate_opens_long_on_upward_crossover_with_trend
+FAILED test_plugin.py::test_evaluate_opens_short_on_downward_crossover_with_trend
+2 failed, 3 passed in 0.13s
+
+[stderr]
+No entry for terminal type "dumb";
+using dumb terminal settings.

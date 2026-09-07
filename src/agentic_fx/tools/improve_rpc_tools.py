@@ -4,12 +4,16 @@ handler をラップし、台帳への record と遮断 7 のキー剥がしだ�
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.tools.improve_staging_tools import _safe_join
 from agentic_fx.tools.registry import ToolDef
+
+if TYPE_CHECKING:
+    from agentic_fx.config import ImproveToolBudgetSettings
+    from agentic_fx.tools.mission_counters import MissionToolCounters
 
 _RUN_BACKTEST_KIND_HINT = (
     "indicator/signal plugin はバックテストできません "
@@ -64,8 +68,17 @@ def build_improve_rpc_tooldefs(
         *, ledger: ImproveRpcLedger,
         run_backtest_handler: Callable[[dict], dict],
         analyze_corr_handler: Callable[[dict], dict],
-        staging_dir: Path | None = None) -> list[ToolDef]:
+        staging_dir: Path | None = None,
+        counters: "MissionToolCounters | None" = None,
+        budget: "ImproveToolBudgetSettings | None" = None) -> list[ToolDef]:
     def run_backtest(name: str, pair: str) -> dict:
+        if counters is not None and budget is not None \
+                and not counters.reserve_backtest(
+                    name, budget.max_backtests_per_candidate):
+            from agentic_fx.tools.improve_staging_tools import BUDGET_EXHAUSTED_DIRECTIVE
+            return {"error": "budget exhausted",
+                    "budget": "max_backtests_per_candidate",
+                    "directive": BUDGET_EXHAUSTED_DIRECTIVE}
         if staging_dir is not None:
             candidate_dir = _safe_join(staging_dir, name)
             if candidate_dir is None:
@@ -80,6 +93,11 @@ def build_improve_rpc_tooldefs(
                         "candidate_kind": meta.kind,
                         "hint": _RUN_BACKTEST_KIND_HINT}
         result = run_backtest_handler({"name": name, "pair": pair})
+        if counters is not None:
+            if budget is not None:
+                counters.record_backtest_result(name, ok="error" not in result)
+            else:
+                counters.record_backtest(name, ok="error" not in result)
         # 台帳は永続化用 save_kwargs (period/now 込み) を読む契約 —
         # agent 向け応答 (JSON-safe、期間端点なし) とは別物として受け取る。
         ledger_result = getattr(result, "save_kwargs", result)

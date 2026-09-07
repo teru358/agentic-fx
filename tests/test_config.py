@@ -2,6 +2,17 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+from agentic_fx.config import ImproveToolBudgetSettings
+
+
+@pytest.mark.parametrize("values", [
+    {"self_test_warn_after": 4, "max_self_test_runs": 3},
+    {"max_self_tests_before_backtest": 4, "max_self_test_runs": 3},
+])
+def test_improve_tool_budget_rejects_threshold_above_run_limit(values):
+    with pytest.raises(ValueError):
+        ImproveToolBudgetSettings(**values)
 from pydantic import ValidationError
 
 from agentic_fx.config import BacktestSettings, ConfigError, Settings, load_settings

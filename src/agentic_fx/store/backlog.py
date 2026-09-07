@@ -16,6 +16,29 @@ from datetime import datetime
 _log = logging.getLogger("agentic_fx.store.backlog")
 
 
+def upsert_system_note(
+        conn: sqlite3.Connection, *, idea: str, last_result: str,
+        now: datetime) -> int:
+    """Insert or refresh one system note. Transaction ownership stays with caller."""
+    idea_norm = idea.strip().lower()
+    row = conn.execute(
+        "SELECT id FROM improvement_backlog WHERE idea_norm=? "
+        "AND status='note' AND source='system' ORDER BY id LIMIT 1",
+        (idea_norm,)).fetchone()
+    if row is not None:
+        note_id = int(row["id"])
+        conn.execute(
+            "UPDATE improvement_backlog SET last_result=?, updated_at=? WHERE id=?",
+            (last_result, now.isoformat(), note_id))
+        return note_id
+    cur = conn.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea, source, status, created_at, updated_at, idea_norm, last_result) "
+        "VALUES (?, 'system', 'note', ?, ?, ?, ?)",
+        (idea, now.isoformat(), now.isoformat(), idea_norm, last_result))
+    return int(cur.lastrowid)
+
+
 def add(conn: sqlite3.Connection, idea: str, source: str, now: datetime) -> int:
     # round2 #8 是正 (2026-08-29、verified-round2.md #8): 正規化は
     # improve_loop._select_and_bind と同じ Python 側 1 箇所

@@ -1,0 +1,38 @@
+..FF.                                                                    [100%]
+=================================== FAILURES ===================================
+___________ test_opens_long_on_sustained_upward_crossover_with_trend ___________
+
+    def test_opens_long_on_sustained_upward_crossover_with_trend():
+        # 60 バースの下降 → 30 バースの持続上昇。fast SMA(20) が slow SMA(50)
+        # を上抜け、かつトレンド継続で ADX>25 になる。
+        closes = _trend_closes(60, 30)
+        out = evaluate(_df(closes), {}, [], {})
+>       assert out["action"] == "open"
+E       AssertionError: assert 'hold' == 'open'
+E         
+E         - open
+E         + hold
+
+test_plugin.py:45: AssertionError
+_________ test_opens_short_on_sustained_downward_crossover_with_trend __________
+
+    def test_opens_short_on_sustained_downward_crossover_with_trend():
+        # 上昇 → 持続下降の鏡像。short クロス + ADX>25。
+        closes = _trend_closes(60, 30, start=140.0)
+        closes_rev = [max(closes) - (c - min(closes)) for c in closes]
+        out = evaluate(_df(closes_rev), {}, [], {})
+>       assert out["action"] == "open"
+E       AssertionError: assert 'hold' == 'open'
+E         
+E         - open
+E         + hold
+
+test_plugin.py:57: AssertionError
+=========================== short test summary info ============================
+FAILED test_plugin.py::test_opens_long_on_sustained_upward_crossover_with_trend
+FAILED test_plugin.py::test_opens_short_on_sustained_downward_crossover_with_trend
+2 failed, 3 passed in 0.21s
+
+[stderr]
+No entry for terminal type "dumb";
+using dumb terminal settings.
