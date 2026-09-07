@@ -380,3 +380,16 @@ def test_run_backtest_validation_errors_do_not_consume_candidate_budget(tmp_path
     assert counters.backtest_calls["Bad-Name"] == 0
     assert counters.backtest_calls["missing"] == 0
     assert counters.backtest_calls["rsi_v2"] == 0
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"counters": MissionToolCounters()},
+    {"budget": ImproveToolBudgetSettings()},
+])
+def test_rpc_builder_rejects_half_wiring(kwargs):
+    """codex 2 周目 (2026-09-07): counters と budget は対 (staging 側と同じ規律)。"""
+    with pytest.raises(ValueError):
+        build_improve_rpc_tooldefs(
+            ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
+            run_backtest_handler=lambda args: {}, analyze_corr_handler=lambda args: {},
+            **kwargs)

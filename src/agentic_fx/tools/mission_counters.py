@@ -1,4 +1,9 @@
-"""Mission-local counters shared by improve tools."""
+"""Mission-local counters shared by improve tools (設計 v4 Tier B/C).
+
+API は `reserve_*` (上限チェック + 加算を同一 lock 区間で) と `record_*_result`
+(実行結果の記録) の 2 段のみ。codex 2 周目 (2026-09-07) の裁定で budget=None
+専用の旧 API (`record_self_test` / `record_backtest` / `record_write`) は削除 —
+builder は counters と budget を **両方** 受け取るか **両方** 省く。"""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -21,10 +26,6 @@ class MissionToolCounters:
     def record_call(self) -> None:
         with self._lock:
             self.total_calls += 1
-
-    def record_write(self) -> None:
-        with self._lock:
-            self.writes += 1
 
     def reserve_write(self, limit: int) -> bool:
         with self._lock:
@@ -51,20 +52,6 @@ class MissionToolCounters:
                 self.self_tests_before_backtest += 1
             return None
 
-    def record_self_test(
-            self, name: str, signature: tuple, *,
-            before_backtest: bool = False) -> int:
-        with self._lock:
-            self.self_test_runs += 1
-            if before_backtest:
-                self.self_tests_before_backtest += 1
-            if self.last_signature.get(name) == signature:
-                self.consecutive_same[name] += 1
-            else:
-                self.last_signature[name] = signature
-                self.consecutive_same[name] = 1
-            return self.consecutive_same[name]
-
     def record_self_test_result(self, name: str, signature: tuple) -> int:
         with self._lock:
             if self.last_signature.get(name) == signature:
@@ -87,8 +74,3 @@ class MissionToolCounters:
         with self._lock:
             self.successful_backtests[name] += 1
 
-    def record_backtest(self, name: str, ok: bool) -> None:
-        with self._lock:
-            self.backtest_calls[name] += 1
-            if ok:
-                self.successful_backtests[name] += 1

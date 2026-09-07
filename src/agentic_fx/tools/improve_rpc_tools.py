@@ -78,6 +78,9 @@ def build_improve_rpc_tooldefs(
         staging_dir: Path | None = None,
         counters: "MissionToolCounters | None" = None,
         budget: "ImproveToolBudgetSettings | None" = None) -> list[ToolDef]:
+    if (counters is None) != (budget is None):
+        raise ValueError("counters と budget は両方渡すか両方省く")
+
     def run_backtest(name: str, pair: str) -> dict:
         if staging_dir is not None:
             candidate_dir = _safe_join(staging_dir, name)
@@ -105,10 +108,7 @@ def build_improve_rpc_tooldefs(
                     "directive": BUDGET_EXHAUSTED_DIRECTIVE}
         result = run_backtest_handler({"name": name, "pair": pair})
         if counters is not None:
-            if budget is not None:
-                counters.record_backtest_result(name, ok=_is_successful_backtest(result))
-            else:
-                counters.record_backtest(name, ok=_is_successful_backtest(result))
+            counters.record_backtest_result(name, ok=_is_successful_backtest(result))
         # 台帳は永続化用 save_kwargs (period/now 込み) を読む契約 —
         # agent 向け応答 (JSON-safe、期間端点なし) とは別物として受け取る。
         ledger_result = getattr(result, "save_kwargs", result)

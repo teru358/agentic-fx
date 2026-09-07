@@ -400,3 +400,8 @@ def test_improve_registry_shares_one_counters_across_staging_and_rpc(tmp_path):
     # 層をまたぐ配線: rpc 側で記録された成功 backtest が staging 側の
     # Tier B 順序制約を解除する (counters が別インスタンスなら解除されない)
     assert "error" not in call("run_plugin_tests", {"name": "candidate"})
+    # codex 2 周目 Important (2026-09-07): 1 回目の self-test は Tier B に
+    # 関係なく通るので、上の assert だけでは配線分離を検出できない。
+    # **2 回目** が通ることが「rpc 側の成功 backtest を staging 側が見ている」
+    # 唯一の公開挙動 (counters が別インスタンスなら run_backtest_required_first)。
+    assert "error" not in call("run_plugin_tests", {"name": "candidate"})

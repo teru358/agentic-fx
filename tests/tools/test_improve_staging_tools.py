@@ -440,10 +440,10 @@ def test_strategy_self_test_requires_successful_backtest_before_repeating(tmp_pa
     assert tools["run_plugin_tests"].func("candidate")["passed"] is False
     assert tools["run_plugin_tests"].func("candidate")["error"] == \
         "run_backtest_required_first"
-    counters.record_backtest("candidate", ok=False)
+    counters.record_backtest_result("candidate", ok=False)
     assert tools["run_plugin_tests"].func("candidate")["error"] == \
         "run_backtest_required_first"
-    counters.record_backtest("candidate", ok=True)
+    counters.record_backtest_result("candidate", ok=True)
     second = tools["run_plugin_tests"].func("candidate")
     third = tools["run_plugin_tests"].func("candidate")
     assert second["passed"] is False
@@ -610,3 +610,15 @@ def test_failure_signature_distinguishes_assert_source_expression():
     assert sig_a[1] == sig_b[1] == ("AssertionError",)   # 例外型も同じ
     assert sig_a[2] != sig_b[2]                          # assert ソース式だけが違う
     assert sig_a != sig_b
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"counters": MissionToolCounters()},
+    {"budget": ImproveToolBudgetSettings()},
+])
+def test_staging_builder_rejects_half_wiring(tmp_path, kwargs):
+    """codex 2 周目 (2026-09-07): counters と budget は対。片方だけは予算が
+    静かに無効化される配線ミスなので ValueError (fail closed)。"""
+    with pytest.raises(ValueError):
+        build_improve_staging_tooldefs(
+            staging_dir=tmp_path, source_snapshot_dir=tmp_path, **kwargs)

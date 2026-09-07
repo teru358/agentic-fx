@@ -6,9 +6,11 @@ from agentic_fx.tools.mission_counters import MissionToolCounters
 def test_mission_tool_counters_track_calls_writes_and_backtests():
     counters = MissionToolCounters()
     counters.record_call()
-    counters.record_write()
-    counters.record_backtest("candidate", ok=False)
-    counters.record_backtest("candidate", ok=True)
+    assert counters.reserve_write(limit=1) is True
+    assert counters.reserve_backtest("candidate", limit=2) is True
+    counters.record_backtest_result("candidate", ok=False)
+    assert counters.reserve_backtest("candidate", limit=2) is True
+    counters.record_backtest_result("candidate", ok=True)
     assert counters.total_calls == 1
     assert counters.writes == 1
     assert counters.backtest_calls["candidate"] == 2
@@ -17,9 +19,12 @@ def test_mission_tool_counters_track_calls_writes_and_backtests():
 
 def test_record_self_test_counts_consecutive_equal_signatures():
     counters = MissionToolCounters()
-    assert counters.record_self_test("a", ("x",)) == 1
-    assert counters.record_self_test("a", ("x",)) == 2
-    assert counters.record_self_test("a", ("y",)) == 1
+    for _ in range(3):
+        assert counters.reserve_self_test(
+            "a", max_runs=10, max_before_backtest=10, is_strategy=False) is None
+    assert counters.record_self_test_result("a", ("x",)) == 1
+    assert counters.record_self_test_result("a", ("x",)) == 2
+    assert counters.record_self_test_result("a", ("y",)) == 1
     assert counters.self_test_runs == 3
 
 

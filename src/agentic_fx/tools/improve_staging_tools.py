@@ -78,6 +78,11 @@ def build_improve_staging_tooldefs(
         *, staging_dir: Path, source_snapshot_dir: Path,
         counters: "MissionToolCounters | None" = None,
         budget: "ImproveToolBudgetSettings | None" = None) -> list[ToolDef]:
+    # codex 2 周目 (2026-09-07): counters と budget は対で渡す。片方だけは
+    # 配線ミス (予算が静かに無効化される) なので fail closed。
+    if (counters is None) != (budget is None):
+        raise ValueError("counters と budget は両方渡すか両方省く")
+
     def list_staging() -> dict:
         # opencode E2E m11 実測 (2026-08-30): `_snapshot_src/` (staging_dir
         # 直下に実体化される snapshot) を候補として返すと、モデルは
@@ -110,8 +115,6 @@ def build_improve_staging_tooldefs(
                     "directive": BUDGET_EXHAUSTED_DIRECTIVE}
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        if counters is not None and budget is None:
-            counters.record_write()
         return {"ok": True}
 
     def read_plugin_source(name: str) -> dict:
@@ -195,12 +198,8 @@ def build_improve_staging_tooldefs(
                 capture_output=True, text=True, stdin=subprocess.DEVNULL,
                 cwd=str(base), timeout=120)
         except subprocess.TimeoutExpired:
-            if counters is not None:
-                consecutive = counters.record_self_test_result(
-                    name, ("<no-tests>", "", "")) if budget is not None else \
-                    counters.record_self_test(name, ("<no-tests>", "", ""))
-            else:
-                consecutive = 0
+            consecutive = counters.record_self_test_result(
+                name, ("<no-tests>", "", "")) if counters is not None else 0
             out = {"passed": False, "stdout_tail": "pytest timeout (120s)"}
             if budget is not None and consecutive >= budget.self_test_warn_after:
                 out["repeated_failure"] = {
@@ -212,8 +211,7 @@ def build_improve_staging_tooldefs(
         out = {"passed": result.returncode == 0, "stdout_tail": combined[-2000:]}
         if counters is not None:
             signature = _failure_signature(combined)
-            consecutive = counters.record_self_test_result(name, signature) \
-                if budget is not None else counters.record_self_test(name, signature)
+            consecutive = counters.record_self_test_result(name, signature)
             if not out["passed"] and budget is not None \
                     and consecutive >= budget.self_test_warn_after:
                 failed = [node.rsplit("::", 1)[-1]
