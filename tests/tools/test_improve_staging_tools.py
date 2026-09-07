@@ -11,7 +11,7 @@ import pytest
 
 from agentic_fx.config import ImproveToolBudgetSettings
 from agentic_fx.tools.improve_staging_tools import (
-    BUDGET_EXHAUSTED_DIRECTIVE,
+    BUDGET_EXHAUSTED_DIRECTIVE, NO_TESTS_SIGNATURE, TIMEOUT_SIGNATURE,
     _failure_signature, build_improve_staging_tooldefs,
 )
 from agentic_fx.tools.mission_counters import MissionToolCounters
@@ -355,13 +355,12 @@ def test_failure_signature_uses_real_outputs_and_ignores_assert_values():
     assert len(set(m60)) == 1
     assert m58 != m60[0]
     assert _failure_signature(
-        (fixtures / "m58_run_plugin_tests_1.txt").read_text()) == (
-            "<no-tests>", "", "")
+        (fixtures / "m58_run_plugin_tests_1.txt").read_text()) == NO_TESTS_SIGNATURE
 
 
 @pytest.mark.parametrize("output", ["", "Traceback\nImportError: broken\n"])
 def test_failure_signature_without_failed_lines_is_stable(output):
-    assert _failure_signature(output) == ("<no-tests>", "", "")
+    assert _failure_signature(output) == NO_TESTS_SIGNATURE
 
 
 def test_failure_signature_takes_first_custom_exception_per_failure_block():
@@ -422,7 +421,11 @@ def test_repeated_timeouts_include_repeated_failure(monkeypatch, tmp_path):
         assert "repeated_failure" not in tools["run_plugin_tests"].func("broken")
     out = tools["run_plugin_tests"].func("broken")
     assert out["repeated_failure"]["consecutive"] == 3
-    assert out["repeated_failure"]["failed_tests"] == ["<no-tests>"]
+    assert out["repeated_failure"]["failed_tests"] == ["<timeout>"]
+    # /code-review 2 周目 (2026-09-07): 実行不能 (timeout / 収集エラー) は assert
+    # 失敗向けの directive を出さない
+    assert "実行できていません" in out["repeated_failure"]["directive"]
+    assert "最終バー" not in out["repeated_failure"]["directive"]
 
 
 def test_strategy_self_test_requires_successful_backtest_before_repeating(tmp_path):
@@ -552,7 +555,7 @@ def test_repeated_failure_directive_reports_configured_count(monkeypatch, tmp_pa
         lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("pytest", 120)))
     tools["run_plugin_tests"].func("a")
     second = tools["run_plugin_tests"].func("a")
-    assert "2 回続けて失敗" in second["repeated_failure"]["directive"]
+    assert "2 回続けて" in second["repeated_failure"]["directive"]
     assert "3 回" not in second["repeated_failure"]["directive"]
 
 
@@ -622,3 +625,66 @@ def test_staging_builder_rejects_half_wiring(tmp_path, kwargs):
     with pytest.raises(ValueError):
         build_improve_staging_tooldefs(
             staging_dir=tmp_path, source_snapshot_dir=tmp_path, **kwargs)
+
+
+
+# --- /code-review high 2 周目 (2026-09-07、tmp/review-20260907-st-r2/code-review-high.md) の pin ---
+
+def test_collection_error_repeated_failure_lists_sentinel_not_characters(monkeypatch, tmp_path):
+    """#1: FAILED 行の無い失敗 (収集エラー) の repeated_failure.failed_tests は
+    ['<no-tests>'] であって文字分割 ['<','n','o',...] ではない。directive は
+    実行不能向け。"""
+    staging = tmp_path / "staging"; source = tmp_path / "source"
+    staging.mkdir(); source.mkdir(); (staging / "a").mkdir()
+    (staging / "a" / "test_plugin.py").write_text("import nonexistent_module_xyz\n")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source, counters=counters,
+        budget=ImproveToolBudgetSettings(self_test_warn_after=2))}
+    tools["run_plugin_tests"].func("a")
+    out = tools["run_plugin_tests"].func("a")
+    assert out["passed"] is False
+    assert out["repeated_failure"]["failed_tests"] == ["<no-tests>"]
+    assert "実行できていません" in out["repeated_failure"]["directive"]
+
+
+def test_timeout_and_collection_error_are_distinct_signatures(monkeypatch, tmp_path):
+    """#3: timeout と収集エラーは別署名 — 交互に起きても連続回数が積み上がらない。"""
+    staging = tmp_path / "staging"; source = tmp_path / "source"
+    staging.mkdir(); source.mkdir(); (staging / "a").mkdir()
+    (staging / "a" / "test_plugin.py").write_text("import nonexistent_module_xyz\n")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source, counters=counters,
+        budget=ImproveToolBudgetSettings(self_test_warn_after=2))}
+    real_run = subprocess.run
+    tools["run_plugin_tests"].func("a")                      # 収集エラー (1)
+    monkeypatch.setattr(
+        "agentic_fx.tools.improve_staging_tools.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("pytest", 120)))
+    out = tools["run_plugin_tests"].func("a")                # timeout (1)
+    assert "repeated_failure" not in out
+    monkeypatch.setattr("agentic_fx.tools.improve_staging_tools.subprocess.run", real_run)
+    out = tools["run_plugin_tests"].func("a")                # 収集エラー (1)
+    assert "repeated_failure" not in out
+    assert counters.self_test_runs == 3
+
+
+def test_oserror_from_pytest_launch_is_a_delivered_failure(monkeypatch, tmp_path):
+    """#2: subprocess.run が OSError を投げても、予約を消費した 1 回として
+    通常の失敗応答 (passed=False + stdout_tail) を返す — registry の汎用
+    error で結果が届かないまま予約だけ燃える形にしない。"""
+    staging = tmp_path / "staging"; source = tmp_path / "source"
+    staging.mkdir(); source.mkdir(); (staging / "a").mkdir()
+    (staging / "a" / "test_plugin.py").write_text("def test_x(): pass\n")
+    counters = MissionToolCounters()
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source, counters=counters,
+        budget=ImproveToolBudgetSettings())}
+    monkeypatch.setattr(
+        "agentic_fx.tools.improve_staging_tools.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(OSError(12, "Cannot allocate memory")))
+    out = tools["run_plugin_tests"].func("a")
+    assert out["passed"] is False
+    assert "could not start" in out["stdout_tail"]
+    assert counters.self_test_runs == 1

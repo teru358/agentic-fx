@@ -29,6 +29,12 @@ RUN_BACKTEST_FIRST_DIRECTIVE = (
     "strategy 候補は self-test を繰り返す前に run_backtest(name, pair) で実データの挙動を確認してください。"
     "self-test の合否は run_backtest の前提ではありません。実データで trade が出れば plugin は正しく、"
     "失敗しているのはテスト側です。")
+NO_TESTS_SIGNATURE = (("<no-tests>",), (), ())
+TIMEOUT_SIGNATURE = (("<timeout>",), (), ())
+NOT_RUNNABLE_DIRECTIVE = (
+    "テストが {n} 回続けて実行できていません (収集エラー / import エラー / timeout)。"
+    "assert の失敗ではありません。stdout_tail の traceback を読み、import・構文・"
+    "無限ループなど実行できない原因を先に直してください。")
 REPEATED_FAILURE_DIRECTIVE = (
     "同じテストが同じ assert で {n} 回続けて失敗しています。テストデータの前提を疑ってください "
     "(evaluate は渡された df の最終バーで判定します。クロス等のイベントは最終バーで起きるデータにすること)。"
@@ -38,7 +44,7 @@ REPEATED_FAILURE_DIRECTIVE = (
 def _failure_signature(full_output: str) -> tuple:
     failed = tuple(sorted(set(re.findall(r"^FAILED\s+(\S+)", full_output, re.MULTILINE))))
     if not failed:
-        return ("<no-tests>", "", "")
+        return NO_TESTS_SIGNATURE
     lines = full_output.splitlines()
     starts = [i for i, line in enumerate(lines)
               if re.match(r"^_{3,}\s+.+?\s+_{3,}$", line)]
@@ -109,8 +115,7 @@ def build_improve_staging_tooldefs(
         path = _safe_join(staging_dir, name, rel)
         if path is None:
             return {"error": "invalid name or rel"}
-        if counters is not None and budget is not None \
-                and not counters.reserve_write(budget.max_writes):
+        if counters is not None and not counters.reserve_write(budget.max_writes):
             return {"error": "budget exhausted", "budget": "max_writes",
                     "directive": BUDGET_EXHAUSTED_DIRECTIVE}
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,8 +171,7 @@ def build_improve_staging_tooldefs(
         base = _safe_join(staging_dir, name)
         if base is None or not (base / "test_plugin.py").is_file():
             return {"error": "not found"}
-        is_strategy = False
-        if counters is not None and budget is not None:
+        if counters is not None:
             meta, _ = plugin_loader.discover_one_with_reason(base, name)
             is_strategy = meta is not None and meta.kind == "strategy"
             rejection = counters.reserve_self_test(
@@ -189,6 +193,11 @@ def build_improve_staging_tooldefs(
         # `stdout_tail:""` の盲目デバッグをモデルに強いていた。
         # `-c` 未指定では `locate_config()` が祖先の pyproject.toml を開き、
         # Landlock 下で EACCES になる (mission m20/m22 で実測)。
+        # /code-review 2 周目 (2026-09-07): 予約 (reserve_self_test) の後に
+        # 例外で抜けると予約だけ消費して結果が届かない。TimeoutExpired と
+        # OSError (fork/exec 失敗) はどちらも「実行できなかった 1 回」として
+        # 通常の失敗応答にし、署名は assert 失敗と別 (NO_TESTS/TIMEOUT) に
+        # 保って directive も実行不能向けにする。
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "pytest", "-q", "-p", "no:logging",
@@ -198,34 +207,41 @@ def build_improve_staging_tooldefs(
                 capture_output=True, text=True, stdin=subprocess.DEVNULL,
                 cwd=str(base), timeout=120)
         except subprocess.TimeoutExpired:
-            consecutive = counters.record_self_test_result(
-                name, ("<no-tests>", "", "")) if counters is not None else 0
-            out = {"passed": False, "stdout_tail": "pytest timeout (120s)"}
-            if budget is not None and consecutive >= budget.self_test_warn_after:
-                out["repeated_failure"] = {
-                    "consecutive": consecutive, "failed_tests": ["<no-tests>"],
-                    "last_values": [], "directive": REPEATED_FAILURE_DIRECTIVE.format(n=consecutive)}
+            passed, combined, signature = False, "pytest timeout (120s)", TIMEOUT_SIGNATURE
+        except OSError as exc:
+            passed, combined = False, f"pytest could not start: {exc!r}"
+            signature = NO_TESTS_SIGNATURE
+        else:
+            combined = result.stdout + (
+                ("\n[stderr]\n" + result.stderr) if result.stderr else "")
+            passed = result.returncode == 0
+            signature = _failure_signature(combined) if not passed else None
+        out = {"passed": passed, "stdout_tail": combined[-2000:]}
+        if counters is None:
             return out
-        combined = result.stdout + (
-            ("\n[stderr]\n" + result.stderr) if result.stderr else "")
-        out = {"passed": result.returncode == 0, "stdout_tail": combined[-2000:]}
-        if counters is not None:
-            signature = _failure_signature(combined)
-            consecutive = counters.record_self_test_result(name, signature)
-            if not out["passed"] and budget is not None \
-                    and consecutive >= budget.self_test_warn_after:
-                failed = [node.rsplit("::", 1)[-1]
-                          for node in _failure_signature(combined)[0]]
-                values = []
-                for line in combined.splitlines():
-                    match = re.match(r"^E\s+(?:AssertionError:\s*)?(assert\s.+)$", line)
-                    if match:
-                        values.append(match.group(1))
-                    if len(values) == 5:
-                        break
-                out["repeated_failure"] = {
-                    "consecutive": consecutive, "failed_tests": failed,
-                    "last_values": values, "directive": REPEATED_FAILURE_DIRECTIVE.format(n=consecutive)}
+        consecutive = counters.record_self_test_result(
+            name, signature if signature is not None else ("<passed>",))
+        if passed or consecutive < budget.self_test_warn_after:
+            return out
+        failed_nodes = signature[0]
+        if signature in (NO_TESTS_SIGNATURE, TIMEOUT_SIGNATURE):
+            out["repeated_failure"] = {
+                "consecutive": consecutive, "failed_tests": list(failed_nodes),
+                "last_values": [],
+                "directive": NOT_RUNNABLE_DIRECTIVE.format(n=consecutive)}
+            return out
+        values = []
+        for line in combined.splitlines():
+            match = re.match(r"^E\s+(?:AssertionError:\s*)?(assert\s.+)$", line)
+            if match:
+                values.append(match.group(1))
+            if len(values) == 5:
+                break
+        out["repeated_failure"] = {
+            "consecutive": consecutive,
+            "failed_tests": [node.rsplit("::", 1)[-1] for node in failed_nodes],
+            "last_values": values,
+            "directive": REPEATED_FAILURE_DIRECTIVE.format(n=consecutive)}
         return out
 
     return [

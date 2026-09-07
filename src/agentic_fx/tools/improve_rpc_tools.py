@@ -99,8 +99,7 @@ def build_improve_rpc_tooldefs(
         # 検証の **後**。誤呼び出し (名前不正 / loader 拒否 / indicator) で候補
         # あたり枠を減らさない — 設計 v4 Tier C の目的は「実 backtest の修正
         # ループ」の上限であって、検証エラーは対象外。
-        if counters is not None and budget is not None \
-                and not counters.reserve_backtest(
+        if counters is not None and not counters.reserve_backtest(
                     name, budget.max_backtests_per_candidate):
             from agentic_fx.tools.improve_staging_tools import BUDGET_EXHAUSTED_DIRECTIVE
             return {"error": "budget exhausted",
