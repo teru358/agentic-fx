@@ -35,6 +35,14 @@ class Mission:
     timeout_sec: float
 
 
+#: ツール予算 abort の reason prefix (runner が構築し、worker / improve_loop が判定)。
+TOOL_BUDGET_ABORT_PREFIX = "tool_budget_abort:"
+
+
+def is_tool_budget_abort(reason: str | None) -> bool:
+    return bool(reason) and reason.startswith(TOOL_BUDGET_ABORT_PREFIX)
+
+
 @dataclass
 class MissionResult:
     status: Literal["completed", "failed", "timeout", "max_turns"]
@@ -64,7 +72,11 @@ class AgentRunner(ABC):
     漏らしてはならない。
 
     ツール予算による abort は新しい status を増やさず、`status="failed"`
-    かつ `reason` が `tool_budget_abort:` で始まる形で返す。
+    かつ `reason` が `TOOL_BUDGET_ABORT_PREFIX` (`tool_budget_abort:`) で
+    始まる形で返す。abort 後の追撃 (session resume) で最終出力が回収できた
+    場合は `status="completed"`, `recovered=True` のまま **同じ reason を
+    保持する** (provenance を落とさない — /code-review 2 周目 #2)。
+    判定は `is_tool_budget_abort(reason)` を使い、文字列を直書きしない。
 
     **現在の適用範囲**: 本規範を満たすのは `LocalRunner` (HTTP failure
     から解釈できた reason — プラン 9 Task 2) のみ。`WorkerRunner` が

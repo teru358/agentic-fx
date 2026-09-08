@@ -179,7 +179,7 @@ schedule:
 - staging ファイルツール (§3.4) の根は **handshake の `staging_dir`**、`read_plugin_source` の根は **handshake の `source_snapshot_dir`** (§2.2 I7/I6) から導く。シム・registry・prompt が同じ値を見る
 - claude 定義: `--mcp-config workdir/mcp.json` = `{"mcpServers":{"afx":{"command":"<sys.executable>","args":["-m","agentic_fx.tools.mcp_shim","<sock>"],"env":{"PYTHONPATH":…}}}}`。codex 定義: `-c mcp_servers.afx.command=… -c mcp_servers.afx.args=[…]`
 - **許可集合は profile ごとに固定**:
-  - improve + claude: `--allowedTools "mcp__afx__*,Bash,Read,Write,Edit,Glob,Grep"` (CLI ネイティブのファイル/shell を許可。Landlock が唯一の線である以上、ツール層で絞っても形式的 — プラン 9 §5 D3 放棄裁定)
+  - improve + claude: `--allowedTools "mcp__afx__*"` のみ (**2026-09-08 改訂** [mission-abort-on-tool-budget] design v4: 旧仕様 `mcp__afx__*,Bash,Read,Write,Edit,Glob,Grep` は廃止。組み込みツールは worker の registry = ツール予算と abort の発火点を迂回するため、許可すると終了保証が claude だけ壊れる。ファイル操作は afx MCP tool 経由に統一)
   - improve + codex: shell/ファイルは常にある + `mcp_servers.afx`
   - trade + claude: `--allowedTools "mcp__afx__*"` のみ。**`Bash`/`Write` が含まれないことを argv pin**
   - trade + local: 現行どおり

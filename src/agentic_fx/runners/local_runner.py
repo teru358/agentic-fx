@@ -21,7 +21,7 @@ import httpx
 import jsonschema
 
 from agentic_fx._safe_error import safe_error_text, safe_text
-from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
+from agentic_fx.runners.base import TOOL_BUDGET_ABORT_PREFIX, AgentRunner, Mission, MissionResult
 from agentic_fx.runners.response_parser import ParseError, parse_json_output
 from agentic_fx.tools.registry import ToolRegistry
 
@@ -100,7 +100,8 @@ class LocalRunner(AgentRunner):
                  time_fn: Callable[[], float] = time.monotonic,
                  on_message: Callable[[dict], None] | None = None,
                  abort_event: threading.Event | None = None,
-                 abort_reason_fn: Callable[[], str] | None = None) -> None:
+                 abort_reason_fn: Callable[[], str] | None = None,
+                 after_tool_call: Callable[[], None] | None = None) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._registry = registry
@@ -113,6 +114,11 @@ class LocalRunner(AgentRunner):
         self._on_message = on_message
         self._abort_event = abort_event
         self._abort_reason_fn = abort_reason_fn
+        # /code-review 2 周目 #1 (2026-09-08): in-process の tool 実行には
+        # dispatcher の after_send が無く、counters.fire_if_pending() を誰も
+        # 呼ばなかった → local backend では abort が永久に発火しなかった。
+        # CLI 経路の after_send と同じ役割のフック。
+        self._after_tool_call = after_tool_call
 
     def close(self) -> None:
         """Close the HTTP client connection."""
@@ -155,7 +161,7 @@ class LocalRunner(AgentRunner):
 
         def abort_result() -> MissionResult:
             reason = (self._abort_reason_fn() if self._abort_reason_fn
-                      else "tool_budget_abort:")
+                      else TOOL_BUDGET_ABORT_PREFIX)
             return _finish("failed", reason=_normalize_reason(reason))
 
         for _turn in range(mission.max_turns):
@@ -251,6 +257,8 @@ class LocalRunner(AgentRunner):
                         return _finish("failed")
                     self._sink(messages, {"role": "tool", "tool_call_id": tc["id"],
                                           "content": result})
+                    if self._after_tool_call is not None:
+                        self._after_tool_call()
                     if timed_out():
                         return _finish("timeout")
                     if aborted():

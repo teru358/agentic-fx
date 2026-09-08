@@ -202,6 +202,7 @@ def build_improve_staging_tooldefs(
         # OSError (fork/exec 失敗) はどちらも「実行できなかった 1 回」として
         # 通常の失敗応答にし、署名は assert 失敗と別 (NO_TESTS/TIMEOUT) に
         # 保って directive も実行不能向けにする。
+        ran = False   # pytest が実際に走ったか (timeout / 起動失敗は False)
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "pytest", "-q", "-p", "no:logging",
@@ -216,6 +217,7 @@ def build_improve_staging_tooldefs(
             passed, combined = False, f"pytest could not start: {exc!r}"
             signature = NO_TESTS_SIGNATURE
         else:
+            ran = True
             combined = result.stdout + (
                 ("\n[stderr]\n" + result.stderr) if result.stderr else "")
             passed = result.returncode == 0
@@ -223,7 +225,7 @@ def build_improve_staging_tooldefs(
         out = {"passed": passed, "stdout_tail": combined[-2000:]}
         if counters is None:
             return out
-        if 'result' in locals():
+        if ran:
             counters.record_progress(name, "self_test_ran")
         out["remaining_budget"] = {
             "self_tests": max(budget.max_self_test_runs - counters.self_test_runs, 0)}

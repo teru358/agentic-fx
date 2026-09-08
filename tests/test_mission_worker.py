@@ -640,7 +640,8 @@ def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
     captured = {}
 
     def spy(profile, settings, registry, *, workdir, on_message=None,
-            cli_started_sink=None, abort_event=None, abort_reason_fn=None):
+            cli_started_sink=None, abort_event=None, abort_reason_fn=None,
+            after_tool_call=None):
         captured["profile"] = profile
         captured["backend"] = getattr(
             getattr(settings.runner, profile, None), "backend", None)
@@ -967,7 +968,8 @@ def test_run_improve_mission_shares_one_counters_across_registry_and_runner(
     captured: dict = {}
 
     def spy(profile, settings, registry, *, workdir, on_message=None,
-            cli_started_sink=None, abort_event=None, abort_reason_fn=None):
+            cli_started_sink=None, abort_event=None, abort_reason_fn=None,
+            after_tool_call=None):
         captured["registry"] = registry
         captured["abort_event"] = abort_event
 
@@ -1024,5 +1026,42 @@ def test_run_improve_mission_shares_one_counters_across_registry_and_runner(
         # dispatcher が握るフックと runner に渡った event が同じ counters を
         # 指していなければ、ここで event は立たない。
         assert captured["abort_event"].wait(5)
+    finally:
+        runner._afx_mcp_dispatcher.close()
+
+
+def test_run_improve_mission_wires_after_tool_call_for_local_backend(monkeypatch, tmp_path):
+    """/code-review 2 周目 #1: worker は factory に `after_tool_call=counters.fire_if_pending`
+    を渡す。これが無いと local backend で abort_event が永久に set されない (run6 再現)。"""
+    import agentic_fx.mission_worker as mw_mod
+    captured = {}
+
+    def spy(profile, settings, registry, *, workdir, on_message=None,
+            cli_started_sink=None, abort_event=None, abort_reason_fn=None,
+            after_tool_call=None):
+        captured["after_tool_call"] = after_tool_call
+        captured["abort_event"] = abort_event
+
+        class _Fake:
+            def run(self, mission):
+                raise AssertionError("not used")
+            def close(self):
+                pass
+        return _Fake()
+
+    monkeypatch.setattr(mw_mod.runner_factory, "build_runner", spy)
+    staging_dir = tmp_path / "staging"; staging_dir.mkdir()
+    source_snapshot_dir = tmp_path / "source"; source_snapshot_dir.mkdir()
+    runner = mw_mod._run_improve_mission(
+        settings=_settings_with_improve_backend("local"), workdir=tmp_path,
+        staging_dir=str(staging_dir), source_snapshot_dir=str(source_snapshot_dir),
+        protocol_out=None, out_seq=None, in_seq=None)
+    try:
+        counters = runner._afx_mission_counters
+        assert captured["after_tool_call"] is not None
+        counters.abort_pending = True            # 閾値到達を模す
+        assert not captured["abort_event"].is_set()
+        captured["after_tool_call"]()            # LocalRunner が tool 実行後に呼ぶフック
+        assert captured["abort_event"].is_set()
     finally:
         runner._afx_mcp_dispatcher.close()

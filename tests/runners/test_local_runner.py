@@ -656,3 +656,39 @@ def test_abort_already_set_before_first_tool_executes_nothing():
     assert called == []
     assert result.status == "failed"
     assert result.reason == "tool_budget_abort:max_tool_calls"
+
+
+def test_after_tool_call_hook_fires_pending_abort_for_in_process_tools():
+    """/code-review 2 周目 #1 (2026-09-08、本番欠陥): local backend は in-process で
+    tool を実行するため dispatcher の after_send が無く、counters.fire_if_pending()
+    を誰も呼ばず abort が永久に発火しなかった。LocalRunner は各 tool 実行の後に
+    `after_tool_call` を呼び、それが event を set すれば残りの tool を実行しない。
+    counters の実物で「拒否 → pending → hook → event → abort」を通す。"""
+    from agentic_fx.config import ImproveToolBudgetSettings
+    from agentic_fx.tools.mission_counters import MissionToolCounters
+    counters = MissionToolCounters(budget=ImproveToolBudgetSettings(max_refusal_streak=1))
+    called = []
+    reg = ToolRegistry()
+
+    def refuse(n):
+        called.append(n)
+        counters.record_terminal_refusal()
+        return {"error": "budget exhausted"}
+
+    reg.register(ToolDef("refuse", "refuse", {
+        "type": "object", "properties": {"n": {"type": "integer"}},
+        "required": ["n"]}, refuse))
+    msg = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": str(n), "type": "function",
+         "function": {"name": "refuse", "arguments": json.dumps({"n": n})}}
+        for n in (1, 2, 3)]}
+    runner = LocalRunner(
+        base_url="http://test/v1", model="qwen", registry=reg,
+        transport=httpx.MockTransport(lambda _r: _resp(msg)),
+        abort_event=counters.abort_event,
+        abort_reason_fn=lambda: f"tool_budget_abort:{counters.abort_trigger}",
+        after_tool_call=counters.fire_if_pending)
+    result = runner.run(_mission(tools=["refuse"]))
+    assert called == [1]
+    assert result.status == "failed"
+    assert result.reason == "tool_budget_abort:terminal_refusals"

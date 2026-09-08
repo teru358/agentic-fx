@@ -34,6 +34,7 @@ from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
 from agentic_fx.loops.improve_context import build_improve_context
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.runners.base import is_tool_budget_abort
 from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA  # precheck 2026-08-22 wave2: T10-B12
 from agentic_fx.plugin.gate_pytest import (
     CandidateSnapshotError, check_candidate_snapshot, hashes_of,
@@ -1466,6 +1467,12 @@ class ImproveLoop:
                     slot_terminalize=slot_terminalize)
                 return
 
+            if is_tool_budget_abort(result.reason):
+                # /code-review 2 周目 #2: abort 後の追撃で回収できた completed。
+                # 成果は通常どおり処理するが、拒否の嵐があったことを activity に残す。
+                self._activity.write(
+                    Category.IMPROVE, "tool_budget_abort_recovered",
+                    f"mission={ctx.mission_id} reason={str(result.reason)[:500]}")
             output = result.output or {}
             verdict = self._inspect_output(output, ctx, conn=conn)     # 手順1
             if not verdict.ok:
@@ -1844,7 +1851,7 @@ class ImproveLoop:
         try:
             if (result.status in ("timeout", "max_turns") or
                     (result.status == "failed" and
-                     (result.reason or "").startswith("tool_budget_abort:"))):
+                     is_tool_budget_abort(result.reason))):
                 entries = ctx.ledger.entries()
                 n_bt = sum(e["kind"] == "run_backtest" for e in entries)
                 n_corr = sum(e["kind"] == "analyze_corr" for e in entries)

@@ -25,7 +25,7 @@ from typing import Any, Callable, Literal
 import jsonschema
 
 from agentic_fx._safe_error import safe_text
-from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
+from agentic_fx.runners.base import TOOL_BUDGET_ABORT_PREFIX, AgentRunner, Mission, MissionResult
 from agentic_fx.runners.launcher import build_launcher_argv
 from agentic_fx.tools.registry import ToolRegistry
 
@@ -211,7 +211,9 @@ class CliRunner(AgentRunner):
         プロセス管理の統一 — 追撃も launcher / pgid 単位の
         SIGTERM→grace→SIGKILL / `self._rlimits` という同じ規律に従う)。
 
-        戻り値は `(timed_out, returncode, stdout_lines, stderr_chunks)`。
+        戻り値は `(cause, returncode, stdout_lines, stderr_chunks)`。`cause` は
+        `TerminationCause` ("completed" / "timeout" / "abort") の**文字列**で、
+        真偽値ではない — 呼び出し側は `==` で比較する ("completed" は truthy)。
         """
         launcher_argv = self._build_launcher_argv(
             os.getpid(), argv, rlimits=self._rlimits)
@@ -316,12 +318,13 @@ class CliRunner(AgentRunner):
             # session が継続できる backend 向け)。基底実装は no-op (None) の
             # ため、追撃を実装しない backend は従来どおり "timeout" になる。
             raw = self._recover_output(mission, list(stdout_lines), recovery_timeout)
+            if cause == "abort":
+                abort_reason = _normalize_reason(
+                    self._abort_reason_fn() if self._abort_reason_fn
+                    else TOOL_BUDGET_ABORT_PREFIX)
             if raw is None:
                 if cause == "abort":
-                    reason = (self._abort_reason_fn() if self._abort_reason_fn
-                              else "tool_budget_abort:")
-                    return MissionResult("failed", None, [],
-                                         reason=_normalize_reason(reason))
+                    return MissionResult("failed", None, [], reason=abort_reason)
                 return MissionResult("timeout", None, [], reason="cli timeout")
             via_recovery = True
         else:
@@ -345,7 +348,11 @@ class CliRunner(AgentRunner):
             return MissionResult(
                 "failed", None, [],
                 reason=_normalize_reason(f"output_schema mismatch: {e.message}"))
-        return MissionResult("completed", raw, [], recovered=via_recovery)
+        # /code-review 2 周目 #2 (2026-09-08): abort → 追撃で回収できた
+        # completed は abort の provenance (reason) を保持する — worker の
+        # summary 付与と親の activity がこれを読む。
+        return MissionResult("completed", raw, [], recovered=via_recovery,
+                             reason=abort_reason if cause == "abort" else None)
 
     def _save_transcript(self, stdout_lines: list[str],
                           stderr_chunks: list[str]) -> None:

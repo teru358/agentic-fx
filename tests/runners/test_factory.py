@@ -289,17 +289,15 @@ def test_build_runner_trade_claude_allowed_tools_excludes_bash(tmp_path, monkeyp
 
 def test_build_runner_improve_claude_allowed_tools_are_mcp_only(
         tmp_path, monkeypatch):
-    """段 0 M17 pin: profile=improve + backend=claude のとき `allowed_tools`
-    が trade と異なり `Bash`/`Read`/`Write`/`Edit`/`Glob`/`Grep` を含む
-    **完全一致**であること (§1.6: 改善ループは `plugins/` を編集できる必要が
-    ある)。`in` 判定だけでは 1 要素の欠落を取り逃す (メモリ 6.8) ため、
-    リスト全体を等値比較する — 段 0 変異スイープ M17: `build_runner` の
-    `allowed_tools=(... if profile == "trade" else [...])` の条件式ごと
-    trade 側 (`["mcp__afx__*"]`) に潰す変異が、この pin が無い状態では
-    全スイート green のまま生存した (improve の Mission が Bash 系ツールを
-    一つも持たずに起動し、改善ループの存在理由そのものを失う致命的な
-    退行)。`test_build_runner_trade_claude_allowed_tools_excludes_bash`
-    と対で置く。"""
+    """[mission-abort-on-tool-budget] design v4 §Tier F (2026-09-08、/code-review 2 周目 #5 で
+    docstring を反転): profile=improve + backend=claude の `allowed_tools` は trade と同じ
+    `["mcp__afx__*"]` のみで**完全一致**。旧契約 (§1.6: Bash/Read/Write/Edit/Glob/Grep を
+    許可) は **廃止** — 組み込みツールは worker の registry (ツール予算 / abort の発火点)
+    を迂回するため、許可すると local/opencode で成立する終了保証が claude だけ壊れる
+    (codex 設計レビュー 3 周目 Critical、メモリ tool-budget-does-not-terminate-mission)。
+    prompt は既に「ファイル操作は afx MCP tool のみ」と宣言している。
+    リスト全体を等値比較する (`in` 判定は 1 要素の混入を取り逃す)。
+    `test_build_runner_trade_claude_allowed_tools_excludes_bash` と対で置く。"""
     from agentic_fx.config import load_settings
 
     FakeClaudeRunner, captured = _install_fake_cli_runner_module(
@@ -373,3 +371,20 @@ def test_build_runner_forwards_abort_wiring_for_every_backend(
                  abort_event=event, abort_reason_fn=lambda: "tool_budget_abort:x")
     assert captured["abort_event"] is event, backend
     assert captured["abort_reason_fn"]() == "tool_budget_abort:x", backend
+
+
+def test_build_runner_forwards_after_tool_call_to_local_backend(tmp_path, monkeypatch):
+    """/code-review 2 周目 #1: factory は local backend に `after_tool_call` を透過する
+    (worker が counters.fire_if_pending を渡す)。落とすと local で abort が発火しない。"""
+    import agentic_fx.runners.local_runner as lr
+    captured = {}
+
+    class _Spy(lr.LocalRunner):
+        def __init__(self, **kw):
+            captured.update(kw)
+    monkeypatch.setattr(lr, "LocalRunner", _Spy)
+    settings = _settings_with_backend(improve_backend="local")
+    hook = lambda: None
+    build_runner("improve", settings, ToolRegistry(), workdir=tmp_path,
+                 after_tool_call=hook)
+    assert captured["after_tool_call"] is hook

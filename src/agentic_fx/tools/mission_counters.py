@@ -34,8 +34,16 @@ class MissionToolCounters:
     def record_call(self) -> None:
         with self._lock:
             self.total_calls += 1
-            if self._budget is not None and self.total_calls >= self._budget.max_tool_calls:
-                self._mark_abort("max_tool_calls")
+            self._check_threshold(self.total_calls,
+                                  getattr(self._budget, "max_tool_calls", None),
+                                  "max_tool_calls")
+
+    def _check_threshold(self, value: int, limit: int | None, trigger: str) -> None:
+        """3 本の閾値 (総呼び出し / terminal / recoverable) を 1 箇所で判定する
+        (/code-review 2 周目 #7)。budget 無し (limit None) は判定しない。
+        呼び出し側が lock を保持している前提。"""
+        if limit is not None and value >= limit:
+            self._mark_abort(trigger)
 
     def _mark_abort(self, trigger: str) -> None:
         if not self.abort_pending:
@@ -51,16 +59,18 @@ class MissionToolCounters:
         with self._lock:
             self.refusals += 1
             self.terminal_refusal_streak += 1
-            if self._budget is not None and self.terminal_refusal_streak >= self._budget.max_refusal_streak:
-                self._mark_abort("terminal_refusals")
+            self._check_threshold(self.terminal_refusal_streak,
+                                  getattr(self._budget, "max_refusal_streak", None),
+                                  "terminal_refusals")
 
     def record_recoverable_refusal(self, name: str, reason: str) -> None:
         with self._lock:
             self.refusals += 1
             key = (name, reason)
             self.recoverable_refusal_streak[key] += 1
-            if self._budget is not None and self.recoverable_refusal_streak[key] >= self._budget.max_refusal_streak:
-                self._mark_abort(f"recoverable_refusals:{name}")
+            self._check_threshold(self.recoverable_refusal_streak[key],
+                                  getattr(self._budget, "max_refusal_streak", None),
+                                  f"recoverable_refusals:{name}")
 
     def record_progress(
             self, name: str,

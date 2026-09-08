@@ -80,6 +80,7 @@ from agentic_fx.runners.cli_runner import (
 # 上げる (`_build_improve_registry` の型注釈・既定実装で使うため — 従来
 # `_run_improve_mission` 内の関数内 import だったものを引き上げた)。
 from agentic_fx.tools.mcp_shim import McpShimDispatcher
+from agentic_fx.runners.base import TOOL_BUDGET_ABORT_PREFIX, is_tool_budget_abort
 from agentic_fx.tools.registry import ToolRegistry
 from agentic_fx.tools.mission_counters import MissionToolCounters
 
@@ -632,7 +633,8 @@ def _run_improve_mission(
         cli_started_sink=lambda pgid: _send_frame(
             protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}),
         abort_event=counters.abort_event,
-        abort_reason_fn=lambda: f"tool_budget_abort:{counters.abort_trigger or ''}")
+        abort_reason_fn=lambda: f"{TOOL_BUDGET_ABORT_PREFIX}{counters.abort_trigger or ''}",
+        after_tool_call=counters.fire_if_pending)
     runner._afx_mcp_dispatcher = dispatcher
     runner._afx_mission_counters = counters
     return runner
@@ -753,7 +755,7 @@ def main() -> None:
                 try:
                     result = runner.run(mission)
                     counters = runner._afx_mission_counters
-                    if (result.reason or "").startswith("tool_budget_abort:"):
+                    if is_tool_budget_abort(result.reason):
                         summary = counters.summary()
                         if summary not in result.reason:
                             result.reason = _normalize_reason(

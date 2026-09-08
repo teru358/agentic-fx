@@ -800,3 +800,30 @@ def test_abort_saves_transcript_like_timeout(tmp_path):
     result = runner.run(_mission())
     assert result.status == "failed"
     assert saved == [["partial"]]
+
+
+
+def test_abort_recovered_completion_keeps_abort_reason(tmp_path):
+    """/code-review 2 周目 #2 (2026-09-08): abort → 追撃で回収できた completed は
+    abort の provenance (reason prefix) を保持する (worker の summary 付与と親の
+    activity がこれを読む)。recovered=True も維持。"""
+    from agentic_fx.runners.base import is_tool_budget_abort
+
+    class RecoveringRunner(_FakeCliRunner):
+        def _run_cli_process(self, argv, env, *, timeout_sec,
+                             on_started=None, abort_event=None):
+            return "abort", None, ["partial"], []
+        def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
+            return {"answer": 4}
+
+    event = threading.Event(); event.set()
+    runner = RecoveringRunner(
+        script="", bin_path=Path(sys.executable), model="m", workdir=tmp_path,
+        cli_terminate_grace_sec=0.3, registry=ToolRegistry(),
+        abort_event=event,
+        abort_reason_fn=lambda: "tool_budget_abort:terminal_refusals")
+    result = runner.run(_mission())
+    assert result.status == "completed"
+    assert result.recovered is True
+    assert is_tool_budget_abort(result.reason)
+    assert result.reason == "tool_budget_abort:terminal_refusals"

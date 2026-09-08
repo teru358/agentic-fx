@@ -26,6 +26,7 @@ def build_runner(
     cli_started_sink: Callable[[int], None] | None = None,
     abort_event: threading.Event | None = None,
     abort_reason_fn: Callable[[], str] | None = None,
+    after_tool_call: Callable[[], None] | None = None,
 ) -> AgentRunner:
     choice = getattr(settings.runner, profile)
     if choice.backend == "local":
@@ -33,7 +34,10 @@ def build_runner(
         return LocalRunner(base_url=settings.llama_swap.base_url,
                            model=choice.model, registry=registry,
                            on_message=on_message, abort_event=abort_event,
-                           abort_reason_fn=abort_reason_fn)
+                           abort_reason_fn=abort_reason_fn,
+                           # local は in-process tool 実行なので dispatcher の
+                           # after_send に相当するフックをここで渡す
+                           after_tool_call=after_tool_call)
     if choice.backend == "claude":
         from agentic_fx.runners.claude_runner import ClaudeRunner
         return ClaudeRunner(
