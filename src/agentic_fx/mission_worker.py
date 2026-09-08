@@ -72,13 +72,16 @@ from agentic_fx.runners import factory as runner_factory
 # 座標がずれて allowlist が空振りする — `_guarded_data_dir` が禁じている
 # のとは逆に、こちらは**一致**させたい)。cli_runner.py は mission_worker
 # を `run()` 内でしか (遅延) import しないため循環 import にならない。
-from agentic_fx.runners.cli_runner import _TRANSCRIPT_DIR_DEFAULT as _MISSION_TRANSCRIPT_DIR
+from agentic_fx.runners.cli_runner import (
+    _TRANSCRIPT_DIR_DEFAULT as _MISSION_TRANSCRIPT_DIR, _normalize_reason,
+)
 # A-4 検収是正 (2026-08-22, B1): McpShimDispatcher の module level import。
 # `_start_mcp_dispatcher` から使う。ToolRegistry も同様に module level へ
 # 上げる (`_build_improve_registry` の型注釈・既定実装で使うため — 従来
 # `_run_improve_mission` 内の関数内 import だったものを引き上げた)。
 from agentic_fx.tools.mcp_shim import McpShimDispatcher
 from agentic_fx.tools.registry import ToolRegistry
+from agentic_fx.tools.mission_counters import MissionToolCounters
 
 if TYPE_CHECKING:
     from agentic_fx.core.contracts import Clock
@@ -461,7 +464,7 @@ def _make_rpc_client(protocol_out: Any, out_seq: SeqTracker,
 def _build_improve_registry(*, settings: Any, workdir: Path, staging_dir: Path,
                             source_snapshot_dir: Path,
                             rpc_client: Callable[[str, dict], Any]
-                            ) -> ToolRegistry:
+                            ) -> tuple[ToolRegistry, MissionToolCounters]:
     """improve profile 用 `ToolRegistry` の構築 (A-4 検収是正、裁定 R-D2)。
 
     子 ledger は遮断の二重防御用で、親 ledger とは別なので DB に二重記録しない。
@@ -476,16 +479,19 @@ def _build_improve_registry(*, settings: Any, workdir: Path, staging_dir: Path,
     渡すため実害は無かったが、既定値を消して呼び出し元に明示させる。"""
     from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
     from agentic_fx.tools.mission_registry import build_mission_registry
+    counters = MissionToolCounters(budget=settings.improve.tool_budget)
 
     child_ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
         "run_backtest": settings.improve.backtest_rpc_timeout_sec,
         "analyze_corr": settings.improve.backtest_rpc_timeout_sec})
-    return build_mission_registry(
+    registry = build_mission_registry(
         "improve", None, settings, None, None, activity=None,
         staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
         ledger=child_ledger,
         rpc_handlers={"run_backtest": lambda a: rpc_client("run_backtest", a),
-                     "analyze_corr": lambda a: rpc_client("analyze_corr", a)})
+                     "analyze_corr": lambda a: rpc_client("analyze_corr", a)},
+        counters=counters)
+    return registry, counters
 
 
 def mcp_socket_path(workdir: Path) -> Path:
@@ -502,7 +508,8 @@ def mcp_socket_path(workdir: Path) -> Path:
     return workdir / "afx.sock"
 
 
-def _start_mcp_dispatcher(*, workdir: Path, registry: ToolRegistry) -> McpShimDispatcher:
+def _start_mcp_dispatcher(*, workdir: Path, registry: ToolRegistry,
+                          after_send: Callable[[], None] | None = None) -> McpShimDispatcher:
     """improve worker 側の Unix socket dispatcher を起動する
     (A-4 検収是正 Step 7a/7b、設計書 §1.6、r2 是正 B1-r2/RW6)。
 
@@ -525,7 +532,8 @@ def _start_mcp_dispatcher(*, workdir: Path, registry: ToolRegistry) -> McpShimDi
     """
     sock_path = mcp_socket_path(workdir)
     dispatcher = McpShimDispatcher(
-        sock_path=sock_path, registry=registry, allowed=registry.names())
+        sock_path=sock_path, registry=registry, allowed=registry.names(),
+        after_send=after_send)
     try:
         dispatcher.bind()
     except OSError as e:
@@ -607,10 +615,12 @@ def _run_improve_mission(
         `McpShimDispatcher` を保持する)
     """
     rpc_client = _make_rpc_client(protocol_out, out_seq, in_seq)
-    registry = _build_improve_registry(
+    registry, counters = _build_improve_registry(
         settings=settings, workdir=workdir, staging_dir=Path(staging_dir),
         source_snapshot_dir=Path(source_snapshot_dir), rpc_client=rpc_client)
-    dispatcher = _start_mcp_dispatcher(workdir=workdir, registry=registry)
+    dispatcher = _start_mcp_dispatcher(
+        workdir=workdir, registry=registry,
+        after_send=counters.fire_if_pending)
     on_message = _make_on_message(protocol_out, out_seq)
     runner = runner_factory.build_runner(
         "improve", settings, registry, workdir=workdir,
@@ -620,8 +630,11 @@ def _run_improve_mission(
         # 送出経路 (_send_frame) に相乗りさせて親 (WorkerRunner) へ通知する。
         # local backend では build_runner がこの引数を無視するため無害。
         cli_started_sink=lambda pgid: _send_frame(
-            protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}))
+            protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}),
+        abort_event=counters.abort_event,
+        abort_reason_fn=lambda: f"tool_budget_abort:{counters.abort_trigger or ''}")
     runner._afx_mcp_dispatcher = dispatcher
+    runner._afx_mission_counters = counters
     return runner
 
 
@@ -739,6 +752,12 @@ def main() -> None:
             try:
                 try:
                     result = runner.run(mission)
+                    counters = runner._afx_mission_counters
+                    if (result.reason or "").startswith("tool_budget_abort:"):
+                        summary = counters.summary()
+                        if summary not in result.reason:
+                            result.reason = _normalize_reason(
+                                f"{result.reason} {summary}")
                     _send_frame(protocol_out, out_seq, {
                         "type": "result",
                         "status": result.status, "output": result.output,

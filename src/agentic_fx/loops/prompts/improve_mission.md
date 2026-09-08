@@ -75,6 +75,10 @@
    2 回目以降の self-test は run_backtest 後でないと拒否されます。`evaluate` は df の最終バーで判定するため、
    クロス等のイベントは最終バーで起こしてください。設定 `improve.tool_budget` で定める予算を超えた
    self-test・write・候補ごとの backtest は拒否されます。
+   `budget exhausted` を受けたら同じ tool を再度呼ばず、直ちに最終出力
+   (提出か observation) を出してください。拒否が続くと mission は打ち切られ、
+   それまでの backtest 結果は保存されません。応答の `remaining_budget` で
+   残り枠が分かります。
 5. 出力は必ず下の「最終出力」の形式 (`discoveries` / `selected` /
    `artifact` / `selection_rationale`) に従ってください。分析 ID・探索
    回数などの集計値はあなたが数える必要はありません (親が RPC 記録から

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from agentic_fx.tools.mission_counters import MissionToolCounters
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -638,7 +640,7 @@ def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
     captured = {}
 
     def spy(profile, settings, registry, *, workdir, on_message=None,
-            cli_started_sink=None):
+            cli_started_sink=None, abort_event=None, abort_reason_fn=None):
         captured["profile"] = profile
         captured["backend"] = getattr(
             getattr(settings.runner, profile, None), "backend", None)
@@ -646,6 +648,10 @@ def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
         # precheck 2026-08-22 pass2: RB3 — cli_started_sink= が
         # build_runner まで届いていることを pin する。
         captured["cli_started_sink"] = cli_started_sink
+        # 段 0 pin A16 (2026-09-08): abort の reason は `tool_budget_abort:`
+        # prefix で始まる (親の Tier D' / activity がこの prefix で判定する)。
+        captured["abort_event"] = abort_event
+        captured["abort_reason_fn"] = abort_reason_fn
         # 実 CLI/実 LLM を起動しない fake を返す — 構築経路の到達のみ確認する。
         class _Fake:
             def run(self, mission):
@@ -674,6 +680,9 @@ def test_mission_worker_builds_runner_via_factory_for_all_improve_backends(
         # 3 周目レビュー Important-1: on_message が callable として配線されている
         # ことを assert する — 落とすと transcript/event 転送が全 backend で失われる。
         assert callable(captured["on_message"]), f"backend={backend}"
+        assert captured["abort_event"] is not None, f"backend={backend}"
+        assert captured["abort_reason_fn"]().startswith("tool_budget_abort:"), \
+            f"backend={backend}"
         # precheck 2026-08-22 pass2: RB3 — cli_started_sink も callable として
         # 配線されていることを assert する (§7.1-2 の受入条件、裁定 R1)。
         assert callable(captured["cli_started_sink"]), f"backend={backend}"
@@ -733,7 +742,8 @@ def test_run_improve_mission_binds_mcp_dispatcher_and_serves_registry_tool(
 
     monkeypatch.setattr(
         mw_mod, "_build_improve_registry",
-        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client: fake_registry)
+        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client:
+        (fake_registry, MissionToolCounters(budget=settings.improve.tool_budget)))
 
     class _Fake:
         def run(self, mission):
@@ -853,7 +863,8 @@ def test_run_improve_mission_claude_backend_workdir_matches_dispatcher_socket(
 
     monkeypatch.setattr(
         mw_mod, "_build_improve_registry",
-        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client: fake_registry)
+        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client:
+        (fake_registry, MissionToolCounters(budget=settings.improve.tool_budget)))
     # `ClaudeRunner.run()` は `cli_started_sink` 経由で実際に `cli_started`
     # フレームを送出する (`_make_on_message`/`_send_frame` 配線) — 実プロセス
     # を起動するこのテストではその配線を素通りさせるため、

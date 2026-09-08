@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import threading
 import time
 from typing import Callable
 
@@ -97,7 +98,9 @@ class LocalRunner(AgentRunner):
     def __init__(self, *, base_url: str, model: str, registry: ToolRegistry,
                  transport: httpx.BaseTransport | None = None,
                  time_fn: Callable[[], float] = time.monotonic,
-                 on_message: Callable[[dict], None] | None = None) -> None:
+                 on_message: Callable[[dict], None] | None = None,
+                 abort_event: threading.Event | None = None,
+                 abort_reason_fn: Callable[[], str] | None = None) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._registry = registry
@@ -108,6 +111,8 @@ class LocalRunner(AgentRunner):
         # event フレームを親へ送出するためのコールバック。既定 None は
         # 既存挙動 (sink 呼び出しなし) と完全互換。
         self._on_message = on_message
+        self._abort_event = abort_event
+        self._abort_reason_fn = abort_reason_fn
 
     def close(self) -> None:
         """Close the HTTP client connection."""
@@ -145,7 +150,19 @@ class LocalRunner(AgentRunner):
             return MissionResult("timeout" if timed_out() else status, None,
                                  messages, reason=reason)
 
+        def aborted() -> bool:
+            return self._abort_event is not None and self._abort_event.is_set()
+
+        def abort_result() -> MissionResult:
+            reason = (self._abort_reason_fn() if self._abort_reason_fn
+                      else "tool_budget_abort:")
+            return _finish("failed", reason=_normalize_reason(reason))
+
         for _turn in range(mission.max_turns):
+            if timed_out():
+                return _finish("timeout")
+            if aborted():
+                return abort_result()
             remaining = deadline - self._time()
             if remaining <= 0:
                 return _finish("timeout")
@@ -198,6 +215,10 @@ class LocalRunner(AgentRunner):
                                  _MAX_TOOL_CALLS_PER_TURN)
                     return _finish("failed")
                 for tc in normalized_msg["tool_calls"]:
+                    if timed_out():
+                        return _finish("timeout")
+                    if aborted():
+                        return abort_result()
                     if not isinstance(tc, dict):
                         _log.warning("tool_call entry is not a dict")
                         return _finish("failed")
@@ -232,6 +253,8 @@ class LocalRunner(AgentRunner):
                                           "content": result})
                     if timed_out():
                         return _finish("timeout")
+                    if aborted():
+                        return abort_result()
 
                 # Guard: tool_calls + non-string content must be stringified
                 # to keep the message protocol-valid for the next request

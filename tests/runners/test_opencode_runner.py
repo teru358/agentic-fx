@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agentic_fx.runners.base import Mission
 from agentic_fx.runners.opencode_runner import OpencodeRunner
+from agentic_fx.runners.opencode_runner import _disable_mcp_for_recovery
 from tests.runners.m30_fixture import M30_TEXT_EVENT_LINE
 from agentic_fx.tools.registry import ToolRegistry
 
@@ -68,7 +69,9 @@ def _resume_runner(tmp_path: Path, bin_path: Path, **over):
               mcp_timeout_ms=605000,
               cli_terminate_grace_sec=0.3, registry=ToolRegistry())
     kw.update(over)
-    return OpencodeRunner(**kw), workdir
+    runner = OpencodeRunner(**kw)
+    runner._build_argv(_resume_mission(), mcp_socket=workdir / "afx.sock")
+    return runner, workdir
 
 
 def _step_finish(reason: str | None) -> str:
@@ -95,6 +98,19 @@ def _step_finish(reason: str | None) -> str:
         "sessionID": "ses_fa86fce77ffe1MJzH5eShyXdY2",
         "part": part,
     })
+
+
+def test_disable_mcp_for_recovery_preserves_other_config(tmp_path):
+    path = tmp_path / "home/.config/opencode/opencode.json"
+    path.parent.mkdir(parents=True)
+    original = {"provider": {"x": {"name": "keep"}},
+                "mcp": {"afx": {"enabled": True, "timeout": 123}},
+                "tools": {"bash": False}}
+    path.write_text(json.dumps(original))
+    _disable_mcp_for_recovery(tmp_path)
+    changed = json.loads(path.read_text())
+    assert changed == {**original, "mcp": {"afx": {
+        "enabled": False, "timeout": 123}}}
 
 
 def test_opencode_config_sets_mcp_timeout(tmp_path):
@@ -250,7 +266,7 @@ def test_opencode_resume_marker_records_nonzero_rc_discard(tmp_path, monkeypatch
     saved = []
     monkeypatch.setattr(
         runner, "_run_cli_process",
-        lambda *args, **kwargs: (False, 1, resume_lines, []))
+        lambda *args, **kwargs: ("completed", 1, resume_lines, []))
     monkeypatch.setattr(runner, "_save_transcript", lambda stdout, stderr: saved.append(stdout))
 
     result = runner._recover_output(
@@ -271,7 +287,7 @@ def test_opencode_resume_marker_records_timeout_discard(tmp_path, monkeypatch):
     saved = []
     monkeypatch.setattr(
         runner, "_run_cli_process",
-        lambda *args, **kwargs: (True, 0, resume_lines, []))
+        lambda *args, **kwargs: ("timeout", 0, resume_lines, []))
     monkeypatch.setattr(runner, "_save_transcript", lambda stdout, stderr: saved.append(stdout))
 
     result = runner._recover_output(
@@ -289,7 +305,7 @@ def test_opencode_resume_marker_records_finish_reason_discard(tmp_path, monkeypa
     saved = []
     monkeypatch.setattr(
         runner, "_run_cli_process",
-        lambda *args, **kwargs: (False, 0, resume_lines, []))
+        lambda *args, **kwargs: ("completed", 0, resume_lines, []))
     monkeypatch.setattr(runner, "_save_transcript", lambda stdout, stderr: saved.append(stdout))
 
     result = runner._recover_output(
@@ -310,15 +326,19 @@ def test_opencode_resume_marker_records_accepted_recovery(tmp_path, monkeypatch)
         _step_finish("stop"),
     ]
     saved = []
+    process_kwargs = []
+    def fake_process(*args, **kwargs):
+        process_kwargs.append(kwargs)
+        return "completed", 0, resume_lines, []
     monkeypatch.setattr(
-        runner, "_run_cli_process",
-        lambda *args, **kwargs: (False, 0, resume_lines, []))
+        runner, "_run_cli_process", fake_process)
     monkeypatch.setattr(runner, "_save_transcript", lambda stdout, stderr: saved.append(stdout))
 
     result = runner._recover_output(
         _resume_mission(), ['{"sessionID":"ses_acceptedmarker"}'], 10)
 
     assert result == {"answer": 4}
+    assert "abort_event" not in process_kwargs[0]
     marker = json.loads(saved[0][0])
     assert marker["accepted"] is True
     assert marker["discard_reason"] is None
@@ -332,7 +352,7 @@ def test_opencode_resume_transcript_preserves_stderr(tmp_path, monkeypatch):
     saved = []
     monkeypatch.setattr(
         runner, "_run_cli_process",
-        lambda *args, **kwargs: (False, 1, resume_lines, ["boom\n"]))
+        lambda *args, **kwargs: ("completed", 1, resume_lines, ["boom\n"]))
     monkeypatch.setattr(
         runner, "_save_transcript",
         lambda stdout, stderr: saved.append((stdout, stderr)))
@@ -506,3 +526,20 @@ def test_opencode_last_step_finish_reason_reads_part_reason():
 
 def test_opencode_last_step_finish_reason_returns_none_when_part_reason_missing():
     assert OpencodeRunner._last_step_finish_reason([_step_finish(None)]) is None
+
+
+def test_disable_mcp_for_recovery_tolerates_missing_or_malformed_config(tmp_path):
+    """追撃は best-effort: 設定が無い / 壊れている場合は例外にせず False を返し、
+    resume 自体は続行できる (指揮者の段 0 追加、2026-09-08)。"""
+    from agentic_fx.runners.opencode_runner import _disable_mcp_for_recovery
+    assert _disable_mcp_for_recovery(tmp_path) is False          # ファイル無し
+    cfg = tmp_path / "home/.config/opencode/opencode.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("{not json", encoding="utf-8")
+    assert _disable_mcp_for_recovery(tmp_path) is False          # 壊れた JSON
+    cfg.write_text('{"mcp": {}}', encoding="utf-8")
+    assert _disable_mcp_for_recovery(tmp_path) is False          # afx キー無し
+    cfg.write_text('{"mcp": {"afx": {"enabled": true, "x": 1}}}', encoding="utf-8")
+    assert _disable_mcp_for_recovery(tmp_path) is True
+    import json
+    assert json.loads(cfg.read_text()) == {"mcp": {"afx": {"enabled": False, "x": 1}}}

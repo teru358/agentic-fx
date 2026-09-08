@@ -3850,9 +3850,13 @@ def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
     assert "run_backtest" in responses, "on_ready 経由の tools/call が失敗した"
     content = responses["run_backtest"]["result"]["content"][0]["text"]
     payload = json.loads(content)
-    assert payload == {"trial_count": 1, "probe": "parent-rpc-handler"}, (
+    # [mission-abort-on-tool-budget] Tier C 補足 (2026-09-08): 成功応答には
+    # `remaining_budget` が付く。probe 用の 2 キーは従来どおり厳密一致。
+    assert {k: v for k, v in payload.items() if k != "remaining_budget"} == {
+        "trial_count": 1, "probe": "parent-rpc-handler"}, (
         "親の dispatcher_loop が rpc_handlers を無視して self._rag へ "
         f"ルーティングした疑い (R-D2 dead code): {payload!r}")
+    assert payload["remaining_budget"] == {"backtests_for_candidate": 5}
     assert handler_calls == [{"name": "x", "pair": "USDJPY"}]
 
 

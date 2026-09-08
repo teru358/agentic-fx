@@ -43,6 +43,7 @@ def build_mission_registry(
         source_snapshot_dir: "Path | None" = None,
         ledger: "ImproveRpcLedger | None" = None,
         rpc_handlers: "dict[str, Callable[[dict], dict]] | None" = None,
+        counters: MissionToolCounters | None = None,
         ) -> ToolRegistry:
     """`loop == "improve"` は 7-E (プラン10 Task 7) で分岐するようになった
     (M-3, 検収是正 — 旧 docstring は「本プランでは分岐しない」としていたが
@@ -92,7 +93,8 @@ def build_mission_registry(
             raise ValueError(
                 "loop='improve' には staging_dir/source_snapshot_dir/ledger/"
                 "rpc_handlers が必須です")
-        counters = MissionToolCounters()
+        counters = counters or MissionToolCounters(
+            budget=settings.improve.tool_budget)
         registry = ToolRegistry(on_execute=counters.record_call)
         budget = settings.improve.tool_budget
         registry.register_all(research_tools.build_research_tooldefs(
@@ -106,6 +108,8 @@ def build_mission_registry(
             staging_dir=staging_dir, counters=counters, budget=budget))
         return registry
 
+    if counters is not None:
+        raise ValueError("counters は loop='improve' 専用です")
     # --- 既存 trade/ask 分岐 (無変更) ---
     # provider と readonly=True の併用は禁止: provider が指定されると readonly
     # は無視される。子プロセス (mission_worker.py) から呼ぶ場合は provider を

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -20,7 +21,9 @@ class ClaudeRunner(CliRunner):
                  cli_terminate_grace_sec: float,
                  registry: ToolRegistry,
                  on_message: Callable[[dict], None] | None = None,
-                 cli_started_sink: Callable[[int], None] | None = None) -> None:
+                 cli_started_sink: Callable[[int], None] | None = None,
+                 abort_event: threading.Event | None = None,
+                 abort_reason_fn: Callable[[], str] | None = None) -> None:
         # #26 (`verified-round1.md` 1-B): `--allowedTools ""` (空リスト) は
         # claude CLI の意味論では「制限なし」に近い挙動になりうる —
         # 空リストを渡す変異/設定ミスを fail closed で拒否する (production
@@ -31,7 +34,9 @@ class ClaudeRunner(CliRunner):
         super().__init__(bin_path=bin_path, model=model, workdir=workdir,
                          cli_terminate_grace_sec=cli_terminate_grace_sec,
                          registry=registry, on_message=on_message,
-                         cli_started_sink=cli_started_sink)
+                         cli_started_sink=cli_started_sink,
+                         abort_event=abort_event,
+                         abort_reason_fn=abort_reason_fn)
 
     def _build_argv(self, mission: Mission, *, mcp_socket: Path) -> list[str]:
         mcp_config_path = self._workdir / "mcp.json"

@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +133,38 @@ def test_cli_runner_completed_leaves_no_pgid_survivors(tmp_path):
     assert result.output == {"answer": 4}
     assert "pgid" in seen_pgid
     assert _no_process_group_members(seen_pgid["pgid"])
+
+
+def test_cli_runner_abort_returns_failed_with_tool_budget_reason(tmp_path):
+    abort_event = threading.Event()
+    abort_event.set()
+    runner = _new_runner(
+        _SLEEP_FOREVER, tmp_path, abort_event=abort_event,
+        abort_reason_fn=lambda: "tool_budget_abort:terminal_refusals")
+    result = runner.run(_mission(timeout_sec=5))
+    assert result.status == "failed"
+    assert result.reason == "tool_budget_abort:terminal_refusals"
+
+
+def test_cli_runner_abort_uses_recovery_and_marks_recovered(tmp_path):
+    class RecoveringRunner(_FakeCliRunner):
+        def _run_cli_process(self, argv, env, *, timeout_sec,
+                             on_started=None, abort_event=None):
+            assert abort_event is event
+            return "abort", None, ["partial"], []
+        def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
+            assert stdout_lines == ["partial"]
+            return {"answer": 4}
+
+    event = threading.Event()
+    runner = RecoveringRunner(
+        script="", bin_path=Path(sys.executable), model="m", workdir=tmp_path,
+        cli_terminate_grace_sec=0.3, registry=ToolRegistry(),
+        abort_event=event)
+    result = runner.run(_mission())
+    assert result.status == "completed"
+    assert result.output == {"answer": 4}
+    assert result.recovered is True
 
 
 def test_cli_runner_completed_with_grandchild_still_reaps_pgid_quickly(tmp_path):
@@ -636,10 +669,12 @@ def test_cli_runner_reserve_zero_primary_timeout_is_full_mission_timeout(tmp_pat
     captured: dict[str, Any] = {}
 
     class _SpyingRunner(_FakeCliRunner):
-        def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None):
+        def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None,
+                             abort_event=None):
             captured["timeout_sec"] = timeout_sec
             return super()._run_cli_process(
-                argv, env, timeout_sec=timeout_sec, on_started=on_started)
+                argv, env, timeout_sec=timeout_sec, on_started=on_started,
+                abort_event=abort_event)
 
     runner = _SpyingRunner(
         script=_PRINT_ANSWER_AND_EXIT, bin_path=Path(sys.executable), model="m",
@@ -660,10 +695,12 @@ def test_cli_runner_reserve_positive_shortens_primary_timeout(tmp_path):
         def _recovery_reserve_sec(self):
             return 2.0
 
-        def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None):
+        def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None,
+                             abort_event=None):
             captured["timeout_sec"] = timeout_sec
             return super()._run_cli_process(
-                argv, env, timeout_sec=timeout_sec, on_started=on_started)
+                argv, env, timeout_sec=timeout_sec, on_started=on_started,
+                abort_event=abort_event)
 
         def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
             recover_calls.append(recovery_timeout_sec)
@@ -689,10 +726,12 @@ def test_cli_runner_reserve_disabled_when_mission_timeout_not_greater_than_reser
         def _recovery_reserve_sec(self):
             return 10.0
 
-        def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None):
+        def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None,
+                             abort_event=None):
             captured["timeout_sec"] = timeout_sec
             return super()._run_cli_process(
-                argv, env, timeout_sec=timeout_sec, on_started=on_started)
+                argv, env, timeout_sec=timeout_sec, on_started=on_started,
+                abort_event=abort_event)
 
         def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
             recover_calls.append(recovery_timeout_sec)

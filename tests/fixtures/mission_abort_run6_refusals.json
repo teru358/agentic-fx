@@ -1,0 +1,12 @@
+[
+  {"tool":"afx_run_backtest","input":{"name":"sma_cross_usdjpy","pair":"USDJPY"},"output":{"error":"budget exhausted","budget":"max_backtests_per_candidate"}},
+  {"tool":"afx_run_plugin_tests","input":{"name":"sma_cross_usdjpy"},"output":{"error":"budget exhausted","budget":"max_self_test_runs"}},
+  {"tool":"afx_run_backtest","input":{"name":"sma_cross_usdjpy","pair":"USDJPY"},"output":{"error":"budget exhausted","budget":"max_backtests_per_candidate"}},
+  {"tool":"afx_run_plugin_tests","input":{"name":"sma_cross_usdjpy"},"output":{"error":"budget exhausted","budget":"max_self_test_runs"}},
+  {"tool":"afx_run_backtest","input":{"name":"sma_cross_usdjpy","pair":"USDJPY"},"output":{"error":"budget exhausted","budget":"max_backtests_per_candidate"}},
+  {"tool":"afx_run_plugin_tests","input":{"name":"sma_cross_usdjpy"},"output":{"error":"budget exhausted","budget":"max_self_test_runs"}},
+  {"tool":"afx_run_backtest","input":{"name":"sma_cross_usdjpy","pair":"USDJPY"},"output":{"error":"budget exhausted","budget":"max_backtests_per_candidate"}},
+  {"tool":"afx_run_plugin_tests","input":{"name":"sma_cross_usdjpy"},"output":{"error":"budget exhausted","budget":"max_self_test_runs"}},
+  {"tool":"afx_run_backtest","input":{"name":"sma_cross_usdjpy","pair":"USDJPY"},"output":{"error":"budget exhausted","budget":"max_backtests_per_candidate"}},
+  {"tool":"afx_run_plugin_tests","input":{"name":"sma_cross_usdjpy"},"output":{"error":"budget exhausted","budget":"max_self_test_runs"}}
+]

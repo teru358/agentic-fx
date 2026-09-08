@@ -402,7 +402,8 @@ def test_run_plugin_tests_timeout_is_counted(monkeypatch, tmp_path):
         "agentic_fx.tools.improve_staging_tools.subprocess.run",
         lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("pytest", 120)))
     assert tools["run_plugin_tests"].func("a") == {
-        "passed": False, "stdout_tail": "pytest timeout (120s)"}
+        "passed": False, "stdout_tail": "pytest timeout (120s)",
+        "remaining_budget": {"self_tests": 11}}
     assert counters.self_test_runs == 1
 
 
@@ -688,3 +689,21 @@ def test_oserror_from_pytest_launch_is_a_delivered_failure(monkeypatch, tmp_path
     assert out["passed"] is False
     assert "could not start" in out["stdout_tail"]
     assert counters.self_test_runs == 1
+
+
+def test_write_budget_refusal_counts_toward_terminal_streak(tmp_path):
+    """段 0 pin A17 (2026-09-08): write の budget exhausted も terminal 拒否として
+    streak に積む (self-test / backtest と同じ扱い)。"""
+    staging = tmp_path / "staging"; source = tmp_path / "source"
+    staging.mkdir(); source.mkdir()
+    budget = ImproveToolBudgetSettings(max_writes=1, max_refusal_streak=3)
+    counters = MissionToolCounters(budget=budget)
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source,
+        counters=counters, budget=budget)}
+    assert tools["write_staging_file"].func("a", "plugin.py", "x") == {"ok": True}
+    for _ in range(3):
+        assert tools["write_staging_file"].func("a", "plugin.py", "y")["error"] == "budget exhausted"
+    assert counters.terminal_refusal_streak == 3
+    assert counters.abort_pending is True
+    assert counters.abort_trigger == "terminal_refusals"

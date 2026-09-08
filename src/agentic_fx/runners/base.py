@@ -63,6 +63,9 @@ class AgentRunner(ABC):
     の result frame をそのまま経由しうるため、秘密や長大なペイロードを
     漏らしてはならない。
 
+    ツール予算による abort は新しい status を増やさず、`status="failed"`
+    かつ `reason` が `tool_budget_abort:` で始まる形で返す。
+
     **現在の適用範囲**: 本規範を満たすのは `LocalRunner` (HTTP failure
     から解釈できた reason — プラン 9 Task 2) のみ。`WorkerRunner` が
     親側で生成する失敗 (起動 timeout・protocol error・EOF) と

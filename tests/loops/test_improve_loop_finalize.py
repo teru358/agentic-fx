@@ -910,9 +910,10 @@ def test_finalize_failed_mission_terminates_failed_with_null_result_and_deletes_
         "SELECT idea, source, status, last_result FROM improvement_backlog "
         "WHERE source='system'").fetchone()
     assert note["status"] == "note"
-    assert "timeout/max_turns" in note["idea"]
+    assert "backtest 完走後" in note["idea"]
     assert note["last_result"] == (
-        f"mission #{mission_id} status=timeout run_backtest=1 analyze_corr=1")
+        f"mission #{mission_id} status=timeout reason=- "
+        "run_backtest=1 analyze_corr=1")
     # M18 pin (段 0 変異、2026-09-07): idea は固定文 — mission 番号を含めると
     # idea_norm が毎回変わり、失敗 mission の数だけ note が増殖する (codex 1 周目
     # 推奨 6)。mission 番号は last_result 側にだけ載る。
@@ -934,6 +935,28 @@ def test_finalize_failed_status_does_not_write_system_note(
         now=datetime(2026, 8, 22))
     assert conn.execute(
         "SELECT COUNT(*) FROM improvement_backlog WHERE source='system'").fetchone()[0] == 0
+
+
+def test_finalize_tool_budget_abort_writes_zero_backtest_note(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    mission_id, run_id, _ = mission_and_run_fixture
+    staging = tmp_path / "staging_abort"; staging.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={}); ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging,
+        source_snapshot_dir=tmp_path / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+    reason = "tool_budget_abort:terminal_refusals calls=42 refused=10"
+    loop_min._finalize_failed_mission(
+        conn, ctx=ctx,
+        result=MissionResult(status="failed", output=None, transcript=[],
+                             reason=reason),
+        now=datetime(2026, 8, 22))
+    note = conn.execute(
+        "SELECT idea, last_result FROM improvement_backlog WHERE source='system'"
+    ).fetchone()
+    assert "まず run_backtest" in note["idea"]
+    assert f"reason={reason}" in note["last_result"]
 
 
 def test_finalize_timeout_continues_when_system_note_upsert_fails(
@@ -1754,6 +1777,7 @@ def test_finalize_max_turns_also_writes_system_note(
         "WHERE source='system'").fetchone()
     assert note is not None
     assert note["status"] == "note"
-    assert "timeout/max_turns" in note["idea"]
+    assert "backtest 完走後" in note["idea"]
     assert note["last_result"] == (
-        f"mission #{mission_id} status=max_turns run_backtest=1 analyze_corr=0")
+        f"mission #{mission_id} status=max_turns reason=- "
+        "run_backtest=1 analyze_corr=0")

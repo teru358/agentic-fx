@@ -393,3 +393,35 @@ def test_rpc_builder_rejects_half_wiring(kwargs):
             ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
             run_backtest_handler=lambda args: {}, analyze_corr_handler=lambda args: {},
             **kwargs)
+
+
+def test_run_backtest_reports_remaining_budget_and_records_terminal_refusal():
+    budget = ImproveToolBudgetSettings(
+        max_backtests_per_candidate=1, max_refusal_streak=1)
+    counters = MissionToolCounters(budget=budget)
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ImproveRpcLedger(
+            rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
+        run_backtest_handler=lambda args: {"metrics": {"pf": 1.1}},
+        analyze_corr_handler=lambda args: {}, counters=counters,
+        budget=budget)}
+    first = tools["run_backtest"].func("a", "USDJPY")
+    assert first["remaining_budget"] == {"backtests_for_candidate": 0}
+    rejected = tools["run_backtest"].func("a", "USDJPY")
+    assert "remaining_budget" not in rejected
+    assert counters.abort_pending
+
+
+def test_successful_backtest_resets_terminal_refusal_streak():
+    """段 0 pin A18 (2026-09-08): 成功 backtest (metrics あり) は tool 経由で
+    `record_progress(name, "backtest_ok")` を呼び、terminal streak を 0 に戻す。"""
+    budget = ImproveToolBudgetSettings()
+    counters = MissionToolCounters(budget=budget)
+    counters.record_terminal_refusal(); counters.record_terminal_refusal()
+    assert counters.terminal_refusal_streak == 2
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
+        run_backtest_handler=lambda args: {"metrics": {"trades": 1}},
+        analyze_corr_handler=lambda args: {}, counters=counters, budget=budget)}
+    tools["run_backtest"].func("a", "USDJPY")
+    assert counters.terminal_refusal_streak == 0

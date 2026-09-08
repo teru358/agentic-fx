@@ -234,7 +234,8 @@ class ImproveToolBudgetSettings(_Strict):
     max_self_tests_before_backtest: int = Field(ge=1, default=3)
     max_writes: int = Field(ge=1, default=30)
     max_backtests_per_candidate: int = Field(ge=1, default=6)
-    max_tool_calls: int = Field(ge=1, default=100)
+    max_tool_calls: int = Field(ge=1, default=300)
+    max_refusal_streak: int = Field(ge=1, default=10)
 
     @model_validator(mode="after")
     def _thresholds_fit_self_test_budget(self) -> "ImproveToolBudgetSettings":

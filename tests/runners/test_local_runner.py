@@ -1,4 +1,5 @@
 import json
+import threading
 
 import httpx
 
@@ -69,6 +70,35 @@ def test_tool_call_loop():
     assert json.loads(msgs[-1]["content"]) == {"price": 148.5}
     # transcript に全メッセージが残る
     assert any(m.get("role") == "tool" for m in r.transcript)
+
+
+def test_abort_after_first_tool_skips_remaining_calls():
+    event = threading.Event()
+    called = []
+    reg = ToolRegistry()
+
+    def tool(n):
+        called.append(n)
+        if n == 1:
+            event.set()
+        return {"n": n}
+
+    reg.register(ToolDef("work", "work", {
+        "type": "object", "properties": {"n": {"type": "integer"}},
+        "required": ["n"]}, tool))
+    msg = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": str(n), "type": "function",
+         "function": {"name": "work", "arguments": json.dumps({"n": n})}}
+        for n in (1, 2, 3)]}
+    transport = httpx.MockTransport(lambda _request: _resp(msg))
+    runner = LocalRunner(
+        base_url="http://test/v1", model="qwen", registry=reg,
+        transport=transport, abort_event=event,
+        abort_reason_fn=lambda: "tool_budget_abort:terminal_refusals")
+    result = runner.run(_mission(tools=["work"]))
+    assert called == [1]
+    assert result.status == "failed"
+    assert result.reason == "tool_budget_abort:terminal_refusals"
 
 
 def test_think_tag_repaired():
@@ -597,3 +627,32 @@ def test_on_message_receives_deepcopy_not_aliased():
         "transcript の assistant msg は常に stringify されるべき "
         "(こちらのみが source of truth)"
     )
+
+
+def test_abort_already_set_before_first_tool_executes_nothing():
+    """段 0 pin A14 (2026-09-08): event が tool 実行の**前**に set されていたら
+    (別スレッドの dispatcher が set した状況)、同一応答の tool を 1 つも実行しない
+    — turn 先頭だけでなく各 tool の直前でも確認する。"""
+    event = threading.Event()
+    called = []
+    reg = ToolRegistry()
+    reg.register(ToolDef("work", "work", {
+        "type": "object", "properties": {"n": {"type": "integer"}},
+        "required": ["n"]}, lambda n: called.append(n) or {"n": n}))
+    msg = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": str(n), "type": "function",
+         "function": {"name": "work", "arguments": json.dumps({"n": n})}}
+        for n in (1, 2)]}
+
+    def handler(_request):
+        event.set()          # 応答を返した時点 (tool 実行前) に set
+        return _resp(msg)
+
+    runner = LocalRunner(
+        base_url="http://test/v1", model="qwen", registry=reg,
+        transport=httpx.MockTransport(handler), abort_event=event,
+        abort_reason_fn=lambda: "tool_budget_abort:max_tool_calls")
+    result = runner.run(_mission(tools=["work"]))
+    assert called == []
+    assert result.status == "failed"
+    assert result.reason == "tool_budget_abort:max_tool_calls"

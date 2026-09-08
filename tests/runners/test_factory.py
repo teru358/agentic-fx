@@ -286,7 +286,7 @@ def test_build_runner_trade_claude_allowed_tools_excludes_bash(tmp_path, monkeyp
     assert "Bash" not in captured["allowed_tools"]
 
 
-def test_build_runner_improve_claude_allowed_tools_includes_edit_tools(
+def test_build_runner_improve_claude_allowed_tools_are_mcp_only(
         tmp_path, monkeypatch):
     """段 0 M17 pin: profile=improve + backend=claude のとき `allowed_tools`
     が trade と異なり `Bash`/`Read`/`Write`/`Edit`/`Glob`/`Grep` を含む
@@ -310,8 +310,7 @@ def test_build_runner_improve_claude_allowed_tools_includes_edit_tools(
             "improve": settings.runner.improve.model_copy(
                 update={"backend": "claude"})})})
     build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
-    assert captured["allowed_tools"] == [
-        "mcp__afx__*", "Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+    assert captured["allowed_tools"] == ["mcp__afx__*"]
 
 
 def test_build_runner_returns_real_claude_runner_class(tmp_path):

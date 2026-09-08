@@ -19,6 +19,8 @@ import pytest
 
 from agentic_fx.tools.mcp_shim import McpShimDispatcher
 from agentic_fx.tools.registry import ToolDef, ToolRegistry
+from agentic_fx.config import ImproveToolBudgetSettings
+from agentic_fx.tools.mission_counters import MissionToolCounters
 
 
 def _slow_tool(x: int) -> dict:
@@ -195,6 +197,89 @@ def test_tools_call_executes_registered_handler(tmp_path):
     assert content[0]["type"] == "text"
     payload = json.loads(content[0]["text"])
     assert payload == {"echo": 7}
+
+
+def test_after_send_runs_only_after_tool_response_is_sent(tmp_path):
+    order = []
+    reg = ToolRegistry()
+    reg.register(ToolDef("x", "x", {"type": "object"},
+                         lambda: order.append("execute") or {"ok": True}))
+    dispatcher = McpShimDispatcher(
+        sock_path=tmp_path / "unused", registry=reg, allowed=["x"],
+        after_send=lambda: order.append("after_send"))
+
+    class FakeSocket:
+        def __init__(self):
+            self.read = False
+        def recv(self, _n):
+            if self.read:
+                return b""
+            self.read = True
+            return (b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                    b'"params":{"name":"x","arguments":{}}}\n')
+        def sendall(self, _data):
+            order.append("send")
+        def close(self):
+            order.append("close")
+
+    dispatcher._handle_conn(FakeSocket())
+    assert order == ["execute", "send", "after_send", "close"]
+
+
+def test_concurrent_accepted_response_is_sent_before_abort_event(tmp_path):
+    entered = threading.Barrier(2)
+    release = threading.Event()
+    order = []
+    counters = MissionToolCounters(
+        budget=ImproveToolBudgetSettings(max_refusal_streak=1))
+    reg = ToolRegistry()
+
+    def accepted():
+        entered.wait()
+        release.wait(2)
+        return {"ok": True}
+
+    def refused():
+        counters.record_terminal_refusal()
+        return {"error": "budget exhausted"}
+
+    reg.register(ToolDef("accepted", "", {"type": "object"}, accepted))
+    reg.register(ToolDef("refused", "", {"type": "object"}, refused))
+    dispatcher = McpShimDispatcher(
+        sock_path=tmp_path / "unused", registry=reg,
+        allowed=["accepted", "refused"],
+        after_send=lambda: (counters.fire_if_pending(),
+                            order.append("event")
+                            if counters.abort_event.is_set() else None))
+
+    class FakeSocket:
+        def __init__(self, name):
+            self.name = name
+            self.done = False
+        def recv(self, _n):
+            if self.done:
+                return b""
+            self.done = True
+            return (json.dumps({"jsonrpc": "2.0", "id": self.name,
+                                "method": "tools/call", "params": {
+                                    "name": self.name, "arguments": {}}})
+                    + "\n").encode()
+        def sendall(self, _data):
+            order.append(f"send:{self.name}")
+        def close(self):
+            pass
+
+    first = threading.Thread(
+        target=dispatcher._handle_conn, args=(FakeSocket("accepted"),))
+    first.start()
+    entered.wait()
+    second = threading.Thread(
+        target=dispatcher._handle_conn, args=(FakeSocket("refused"),))
+    second.start()
+    release.set()
+    first.join(2); second.join(2)
+    assert order.index("send:accepted") < order.index("event")
+    assert order.index("send:refused") < order.index("event")
 
 
 def test_tools_call_null_arguments_falls_back_to_empty_dict(tmp_path):

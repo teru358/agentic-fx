@@ -80,7 +80,8 @@ improve:
     max_self_tests_before_backtest: 3  # 成功 backtest 前の strategy self-test 総数
     max_writes: 30              # staging 書き込み回数の上限
     max_backtests_per_candidate: 6  # 候補ごとの backtest 呼び出し上限
-    max_tool_calls: 100         # 全 tool 呼び出し数 (カウントのみ、abort は Tier F)
+    max_tool_calls: 300         # 全 tool 呼び出し数 (Tier F の安全網)
+    max_refusal_streak: 10      # 同種の連続拒否で mission を中断
   research:
     max_searches: 20
     max_fetches: 30

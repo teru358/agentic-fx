@@ -102,12 +102,16 @@ def build_improve_rpc_tooldefs(
         if counters is not None and not counters.reserve_backtest(
                     name, budget.max_backtests_per_candidate):
             from agentic_fx.tools.improve_staging_tools import BUDGET_EXHAUSTED_DIRECTIVE
+            counters.record_terminal_refusal()
             return {"error": "budget exhausted",
                     "budget": "max_backtests_per_candidate",
                     "directive": BUDGET_EXHAUSTED_DIRECTIVE}
         result = run_backtest_handler({"name": name, "pair": pair})
         if counters is not None:
-            counters.record_backtest_result(name, ok=_is_successful_backtest(result))
+            backtest_ok = _is_successful_backtest(result)
+            counters.record_backtest_result(name, ok=backtest_ok)
+            if backtest_ok:
+                counters.record_progress(name, "backtest_ok")
         # 台帳は永続化用 save_kwargs (period/now 込み) を読む契約 —
         # agent 向け応答 (JSON-safe、期間端点なし) とは別物として受け取る。
         ledger_result = getattr(result, "save_kwargs", result)
@@ -115,7 +119,13 @@ def build_improve_rpc_tooldefs(
                       kind="run_backtest", params={"name": name, "pair": pair},
                       result_summary=ledger_result,
                       trial_count=result.get("trial_count", 1))
-        return _strip_forbidden(result)
+        response = _strip_forbidden(result)
+        if counters is not None:
+            response["remaining_budget"] = {
+                "backtests_for_candidate": max(
+                    budget.max_backtests_per_candidate
+                    - counters.backtest_calls[name], 0)}
+        return response
 
     def analyze_corr(request: dict) -> dict:
         result = analyze_corr_handler(request)

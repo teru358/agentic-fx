@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 from typing import Any, Callable, Literal
 
 from agentic_fx.runners.base import AgentRunner
@@ -23,24 +24,26 @@ def build_runner(
     on_message: Callable[[dict], None] | None = None,
     workdir: Path,
     cli_started_sink: Callable[[int], None] | None = None,
+    abort_event: threading.Event | None = None,
+    abort_reason_fn: Callable[[], str] | None = None,
 ) -> AgentRunner:
     choice = getattr(settings.runner, profile)
     if choice.backend == "local":
         from agentic_fx.runners.local_runner import LocalRunner
         return LocalRunner(base_url=settings.llama_swap.base_url,
                            model=choice.model, registry=registry,
-                           on_message=on_message)
+                           on_message=on_message, abort_event=abort_event,
+                           abort_reason_fn=abort_reason_fn)
     if choice.backend == "claude":
         from agentic_fx.runners.claude_runner import ClaudeRunner
         return ClaudeRunner(
             bin_path=Path(settings.runner.claude.bin), model=choice.model,
             workdir=workdir, credentials_file_copied=True,
-            allowed_tools=(["mcp__afx__*"] if profile == "trade"
-                           else ["mcp__afx__*", "Bash", "Read", "Write",
-                                 "Edit", "Glob", "Grep"]),
+            allowed_tools=["mcp__afx__*"],
             cli_terminate_grace_sec=settings.runner.cli_terminate_grace_sec,
             registry=registry, on_message=on_message,
-            cli_started_sink=cli_started_sink)
+            cli_started_sink=cli_started_sink, abort_event=abort_event,
+            abort_reason_fn=abort_reason_fn)
     if choice.backend == "codex":
         from agentic_fx.runners.codex_runner import CodexRunner
         codex_settings = settings.runner.codex
@@ -49,7 +52,8 @@ def build_runner(
             workdir=workdir, provider="chatgpt",
             cli_started_sink=cli_started_sink,
             cli_terminate_grace_sec=settings.runner.cli_terminate_grace_sec,
-            registry=registry, on_message=on_message)
+            registry=registry, on_message=on_message,
+            abort_event=abort_event, abort_reason_fn=abort_reason_fn)
     if choice.backend == "opencode":
         from agentic_fx.runners.opencode_runner import OpencodeRunner
         # verify_backend は model_copy(update={"backend": backend}) で backend
@@ -72,5 +76,6 @@ def build_runner(
             workdir=workdir, llama_swap_base_url=settings.llama_swap.base_url,
             cli_terminate_grace_sec=settings.runner.cli_terminate_grace_sec,
             registry=registry, on_message=on_message,
-            cli_started_sink=cli_started_sink)
+            cli_started_sink=cli_started_sink, abort_event=abort_event,
+            abort_reason_fn=abort_reason_fn)
     raise ValueError(f"unknown runner backend: {choice.backend!r}")

@@ -30,6 +30,7 @@ from agentic_fx.runners.launcher import build_launcher_argv
 from agentic_fx.tools.registry import ToolRegistry
 
 _MAX_REASON_CHARS = 500
+TerminationCause = Literal["completed", "timeout", "abort"]
 
 # 段A (mission transcript 常時保存): 既定の保存先。`<repo>/logs/` は
 # gitignore 済み (.gitignore:18)。`__file__` から repo root を導く形は
@@ -146,7 +147,9 @@ class CliRunner(AgentRunner):
                  rlimits: dict[str, tuple[int, int]] | None = None,
                  launcher: Callable[..., list[str]] | None = None,
                  popen: Callable[..., subprocess.Popen] | None = None,
-                 transcript_dir: Path | None = None) -> None:
+                 transcript_dir: Path | None = None,
+                 abort_event: threading.Event | None = None,
+                 abort_reason_fn: Callable[[], str] | None = None) -> None:
         self._bin_path = bin_path
         self._model = model
         self._workdir = workdir
@@ -161,6 +164,8 @@ class CliRunner(AgentRunner):
         # `_TRANSCRIPT_DIR_DEFAULT` を読む (固定値をここでキャッシュしない
         # — テストの monkeypatch がインスタンス生成後でも効くようにする)。
         self._transcript_dir = transcript_dir
+        self._abort_event = abort_event
+        self._abort_reason_fn = abort_reason_fn
 
     @abstractmethod
     def _build_argv(self, mission: Mission, *, mcp_socket: Path) -> list[str]: ...
@@ -197,7 +202,8 @@ class CliRunner(AgentRunner):
     def _run_cli_process(self, argv: list[str], env: dict[str, str], *,
                           timeout_sec: float,
                           on_started: Callable[[int], None] | None = None,
-                          ) -> tuple[bool, int | None, list[str], list[str]]:
+                          abort_event: threading.Event | None = None,
+                          ) -> tuple[TerminationCause, int | None, list[str], list[str]]:
         """launcher 経由で `argv` を起動し、pgid 管理
         (`start_new_session=True` + `_terminate_pgid`) と stdout/stderr の
         読み切りまでを行う共通経路。`run()` の主呼び出しと、追撃
@@ -242,23 +248,31 @@ class CliRunner(AgentRunner):
         t_out.start()
         t_err.start()
 
-        timed_out = False
-        try:
-            proc.wait(timeout=timeout_sec)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        cause: TerminationCause = "completed"
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            if time.monotonic() >= deadline:
+                cause = "timeout"
+                break
+            if abort_event is not None and abort_event.is_set():
+                cause = "abort"
+                break
+            try:
+                proc.wait(timeout=min(1.0, max(deadline - time.monotonic(), 0)))
+                break
+            except subprocess.TimeoutExpired:
+                continue
 
         try:
-            if timed_out or proc.poll() is None:
+            if cause != "completed" or proc.poll() is None:
                 self._terminate_pgid(pgid, proc)
-                timed_out = True
             else:
                 self._terminate_pgid(pgid, proc)  # completed でも孫を確実に回収する (§1.1-4)
         finally:
             t_out.join(timeout=5.0)
             t_err.join(timeout=5.0)
 
-        return timed_out, proc.returncode, stdout_lines, stderr_chunks
+        return cause, proc.returncode, stdout_lines, stderr_chunks
 
     def run(self, mission: Mission) -> MissionResult:
         # B2-r2 是正: bind 側 (`mission_worker._start_mcp_dispatcher`) と
@@ -282,9 +296,9 @@ class CliRunner(AgentRunner):
             primary_timeout = mission.timeout_sec
             recovery_timeout = 0.0
 
-        timed_out, rc, stdout_lines, stderr_chunks = self._run_cli_process(
+        cause, rc, stdout_lines, stderr_chunks = self._run_cli_process(
             inner_argv, env, timeout_sec=primary_timeout,
-            on_started=self._cli_started_sink)
+            on_started=self._cli_started_sink, abort_event=self._abort_event)
 
         # 段A: どの終端経路 (timeout/failed/schema mismatch/completed) でも
         # 漏れなく保存する — 追撃 (`_recover_output`) より前のこの位置に
@@ -297,12 +311,17 @@ class CliRunner(AgentRunner):
         # artifact を observation へ降格する判断材料)。
         via_recovery = False
 
-        if timed_out:
+        if cause in ("timeout", "abort"):
             # 段B: timeout 経路でも追撃回収を 1 回試みる (SIGTERM 中断後も
             # session が継続できる backend 向け)。基底実装は no-op (None) の
             # ため、追撃を実装しない backend は従来どおり "timeout" になる。
             raw = self._recover_output(mission, list(stdout_lines), recovery_timeout)
             if raw is None:
+                if cause == "abort":
+                    reason = (self._abort_reason_fn() if self._abort_reason_fn
+                              else "tool_budget_abort:")
+                    return MissionResult("failed", None, [],
+                                         reason=_normalize_reason(reason))
                 return MissionResult("timeout", None, [], reason="cli timeout")
             via_recovery = True
         else:

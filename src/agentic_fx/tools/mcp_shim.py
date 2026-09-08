@@ -10,12 +10,16 @@ lock で直列化する (in-flight 1)。
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import sys
 import threading
 from pathlib import Path
+from typing import Callable
 
 from agentic_fx.tools.registry import ToolRegistry
+
+_log = logging.getLogger("agentic_fx.mcp_shim")
 
 # 裁定 5: 実 CLI の initialize 要求を実測して確定する (Task 13 → [T13-5c])。
 # 実測 (2026-08-30、runbook「claude 実ターン」節): claude CLI 2.1.251 は
@@ -35,11 +39,13 @@ def _mcp_tool_from_openai_tool(openai_tool: dict) -> dict:
 
 class McpShimDispatcher:
     def __init__(self, *, sock_path: Path, registry: ToolRegistry,
-                 allowed: list[str]) -> None:
+                 allowed: list[str],
+                 after_send: Callable[[], None] | None = None) -> None:
         self._sock_path = sock_path
         self._registry = registry
         self._allowed = list(allowed)
         self._call_lock = threading.Lock()
+        self._after_send = after_send
         self.protocol_version = _SUPPORTED_PROTOCOL_VERSION
         # A-4 検収是正 (r2, B1-r2): bind 済み server socket。`bind()` が
         # 呼び出しスレッドで同期実行され、`self._server` が設定された時点で
@@ -132,8 +138,20 @@ class McpShimDispatcher:
                     return
                 buf += chunk
             req = json.loads(buf.decode())
-            resp = self._dispatch(req)
-            conn.sendall((json.dumps(resp) + "\n").encode())
+            if req.get("method") == "tools/call":
+                with self._call_lock:
+                    resp = self._dispatch(req)
+                    try:
+                        conn.sendall((json.dumps(resp) + "\n").encode())
+                    except (BrokenPipeError, ConnectionResetError):
+                        _log.warning("MCP client disconnected while sending response")
+                    if self._after_send is not None:
+                        self._after_send()
+            else:
+                try:
+                    conn.sendall((json.dumps(self._dispatch(req)) + "\n").encode())
+                except (BrokenPipeError, ConnectionResetError):
+                    _log.warning("MCP client disconnected while sending response")
         finally:
             conn.close()
 
@@ -162,11 +180,11 @@ class McpShimDispatcher:
             if name not in self._allowed:
                 return {"jsonrpc": "2.0", "id": rpc_id,
                         "error": {"code": -32601, "message": f"tool not allowed: {name!r}"}}
-            with self._call_lock:
-                # execute() は例外を送出せず、失敗時も JSON エラー文字列を
-                # 返す (実 API、統合裁定 R-i7) — 呼び出し側で try/except しない。
-                result = self._registry.execute(name, params.get("arguments") or {},
-                                                self._allowed)
+            # execute() は例外を送出せず、失敗時も JSON エラー文字列を
+            # 返す。呼び出し側 `_handle_conn` が execute + sendall を同じ
+            # lock 区間に置く。
+            result = self._registry.execute(name, params.get("arguments") or {},
+                                            self._allowed)
             # result は既に JSON 文字列 (execute の戻り値) — json.dumps で
             # 再エンコードすると二重エンコードになるため、そのまま入れる。
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {

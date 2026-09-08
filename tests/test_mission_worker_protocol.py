@@ -858,7 +858,8 @@ def test_main_routes_trade_claude_backend_through_factory_build_runner(
                                  reason=None)
 
     def fake_build_runner(profile, settings, registry, *, workdir,
-                          on_message=None, cli_started_sink=None):
+                          on_message=None, cli_started_sink=None,
+                          abort_event=None, abort_reason_fn=None):
         build_calls.append((profile, settings.runner.trade.backend))
         return _FakeClaudeRunner()
 
@@ -1776,3 +1777,36 @@ def test_main_sets_os_environ_for_multiple_credentials_keys(monkeypatch, tmp_pat
     finally:
         os.environ.pop("TWELVEDATA_API_KEY", None)
         os.environ.pop("ALPHAVANTAGE_API_KEY", None)
+
+
+class _FakeAbortedRunner(_FakeLocalRunnerWithReason):
+    """段 0 pin A15 (2026-09-08): tool 予算 abort の reason prefix を持つ failed。"""
+
+    def run(self, mission):
+        from agentic_fx.runners.base import MissionResult
+        return MissionResult(status="failed", output=None,
+                             reason="tool_budget_abort:terminal_refusals")
+
+
+def test_result_frame_appends_counters_summary_to_tool_budget_abort_reason(
+        monkeypatch, tmp_path):
+    """段 0 pin A15: reason が `tool_budget_abort:` で始まる failed のとき、
+    main() は counters.summary() を 1 回だけ末尾に付けて result フレームへ載せる
+    (親の activity / system note の last_result がこれを読む)。"""
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda *args, **kwargs: None)
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve", "plugins_dir": None,
+                             "mission_id": "m-abort",
+                             "staging_dir": str(tmp_path / "staging" / "m-abort"),
+                             "source_snapshot_dir": str(tmp_path / "source")},
+        runner_cls=_FakeAbortedRunner)
+    result_frame = frames[-1]
+    assert result_frame["type"] == "result"
+    assert result_frame["status"] == "failed"
+    reason = result_frame["reason"]
+    assert reason.startswith("tool_budget_abort:terminal_refusals ")
+    assert reason.count("calls=") == 1
+    assert " refused=" in reason and " self_test=" in reason and " backtest=" in reason
+    assert "\n" not in reason

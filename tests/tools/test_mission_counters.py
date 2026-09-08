@@ -1,6 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
+import json
+from pathlib import Path
 
 from agentic_fx.tools.mission_counters import MissionToolCounters
+from agentic_fx.config import ImproveToolBudgetSettings
 
 
 def test_mission_tool_counters_track_calls_writes_and_backtests():
@@ -58,3 +61,55 @@ def test_reserve_self_test_rejection_does_not_consume_budget():
     counters.record_backtest_result("a", ok=True)
     assert counters.reserve_self_test("a", **kwargs) is None
     assert counters.self_test_runs == before_runs + 1
+
+
+def _budget(**changes):
+    return ImproveToolBudgetSettings(max_refusal_streak=3, max_tool_calls=5,
+                                     **changes)
+
+
+def test_terminal_refusal_fires_only_after_response_delivery_hook():
+    counters = MissionToolCounters(budget=_budget())
+    counters.record_terminal_refusal()
+    counters.record_terminal_refusal()
+    assert not counters.abort_pending
+    counters.record_terminal_refusal()
+    assert counters.abort_pending
+    assert counters.abort_trigger == "terminal_refusals"
+    assert not counters.abort_event.is_set()
+    counters.fire_if_pending()
+    assert counters.abort_event.is_set()
+
+
+def test_progress_resets_only_the_relevant_refusal_streaks():
+    counters = MissionToolCounters(budget=_budget())
+    counters.record_terminal_refusal()
+    counters.record_recoverable_refusal("a", "run_backtest_required_first")
+    counters.record_recoverable_refusal("b", "run_backtest_required_first")
+    counters.record_progress("a", "self_test_ran")
+    assert counters.terminal_refusal_streak == 0
+    assert counters.recoverable_refusal_streak[("a", "run_backtest_required_first")] == 1
+    counters.record_progress("a", "backtest_ok")
+    assert counters.recoverable_refusal_streak[("a", "run_backtest_required_first")] == 0
+    assert counters.recoverable_refusal_streak[("b", "run_backtest_required_first")] == 1
+
+
+def test_max_calls_sets_pending_and_summary_is_single_line():
+    counters = MissionToolCounters(budget=_budget())
+    for _ in range(5):
+        counters.record_call()
+    assert counters.abort_pending
+    assert counters.abort_trigger == "max_tool_calls"
+    assert counters.summary() == "calls=5 refused=0 self_test=0 backtest=0"
+
+
+def test_run6_real_refusal_sequence_reaches_abort_threshold():
+    rows = json.loads((Path(__file__).resolve().parents[1] / "fixtures" /
+                       "mission_abort_run6_refusals.json").read_text())
+    counters = MissionToolCounters(
+        budget=ImproveToolBudgetSettings(max_refusal_streak=10))
+    for row in rows:
+        assert row["output"]["error"] == "budget exhausted"
+        counters.record_terminal_refusal()
+    assert counters.abort_pending
+    assert counters.abort_trigger == "terminal_refusals"

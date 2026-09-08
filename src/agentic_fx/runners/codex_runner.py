@@ -8,6 +8,7 @@ trade worker は Landlock 無し + データ資格情報を持つため)。
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any, Callable, Literal
 
@@ -30,12 +31,16 @@ class CodexRunner(CliRunner):
                  cli_terminate_grace_sec: float,
                  registry: ToolRegistry,
                  on_message: Callable[[dict], None] | None = None,
-                 cli_started_sink: Callable[[int], None] | None = None) -> None:
+                 cli_started_sink: Callable[[int], None] | None = None,
+                 abort_event: threading.Event | None = None,
+                 abort_reason_fn: Callable[[], str] | None = None) -> None:
         self._provider = provider
         super().__init__(bin_path=bin_path, model=model, workdir=workdir,
                          cli_terminate_grace_sec=cli_terminate_grace_sec,
                          registry=registry, on_message=on_message,
-                         cli_started_sink=cli_started_sink)
+                         cli_started_sink=cli_started_sink,
+                         abort_event=abort_event,
+                         abort_reason_fn=abort_reason_fn)
 
     def _build_argv(self, mission: Mission, *, mcp_socket: Path) -> list[str]:
         import sys as _sys

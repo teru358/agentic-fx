@@ -1842,16 +1842,28 @@ class ImproveLoop:
         self._delete_staging(ctx)
         conn.execute("BEGIN IMMEDIATE")
         try:
-            if result.status in ("timeout", "max_turns"):
+            if (result.status in ("timeout", "max_turns") or
+                    (result.status == "failed" and
+                     (result.reason or "").startswith("tool_budget_abort:"))):
                 entries = ctx.ledger.entries()
                 n_bt = sum(e["kind"] == "run_backtest" for e in entries)
                 n_corr = sum(e["kind"] == "analyze_corr" for e in entries)
+                if n_bt == 0:
+                    idea = ("improve mission が最終出力なしで終了した "
+                            "(timeout/max_turns)。strategy はまず run_backtest "
+                            "を呼び、self-test の修正を繰り返さないこと")
+                else:
+                    idea = (
+                        "improve mission が backtest 完走後に最終出力を出さずに終了した。"
+                        "予算が尽きたら (`budget exhausted` を受けたら) 直ちに現状の"
+                        "候補で提出するか observation を出すこと。拒否された tool を"
+                        "繰り返し呼ばないこと")
                 try:
                     backlog_store.upsert_system_note(
                         conn,
-                        idea=("improve mission が最終出力なしで終了した (timeout/max_turns)。"
-                              "strategy はまず run_backtest を呼び、self-test の修正を繰り返さないこと"),
+                        idea=idea,
                         last_result=(f"mission #{ctx.mission_id} status={result.status} "
+                                     f"reason={result.reason or '-'} "
                                      f"run_backtest={n_bt} analyze_corr={n_corr}"),
                         now=now)
                 except sqlite3.Error as e:

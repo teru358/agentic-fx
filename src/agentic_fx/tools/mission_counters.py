@@ -7,12 +7,20 @@ builder は counters と budget を **両方** 受け取るか **両方** 省く
 from __future__ import annotations
 
 from collections import defaultdict
-from threading import Lock
+from threading import Event, Lock
+from typing import Any, Literal
 
 
 class MissionToolCounters:
-    def __init__(self) -> None:
+    def __init__(self, budget: Any | None = None) -> None:
         self._lock = Lock()
+        self._budget = budget
+        self.abort_event = Event()
+        self.abort_pending = False
+        self.abort_trigger: str | None = None
+        self.terminal_refusal_streak = 0
+        self.recoverable_refusal_streak = defaultdict(int)
+        self.refusals = 0
         self.total_calls = 0
         self.writes = 0
         self.self_test_runs = 0
@@ -26,6 +34,48 @@ class MissionToolCounters:
     def record_call(self) -> None:
         with self._lock:
             self.total_calls += 1
+            if self._budget is not None and self.total_calls >= self._budget.max_tool_calls:
+                self._mark_abort("max_tool_calls")
+
+    def _mark_abort(self, trigger: str) -> None:
+        if not self.abort_pending:
+            self.abort_pending = True
+            self.abort_trigger = trigger
+
+    def fire_if_pending(self) -> None:
+        with self._lock:
+            if self.abort_pending:
+                self.abort_event.set()
+
+    def record_terminal_refusal(self) -> None:
+        with self._lock:
+            self.refusals += 1
+            self.terminal_refusal_streak += 1
+            if self._budget is not None and self.terminal_refusal_streak >= self._budget.max_refusal_streak:
+                self._mark_abort("terminal_refusals")
+
+    def record_recoverable_refusal(self, name: str, reason: str) -> None:
+        with self._lock:
+            self.refusals += 1
+            key = (name, reason)
+            self.recoverable_refusal_streak[key] += 1
+            if self._budget is not None and self.recoverable_refusal_streak[key] >= self._budget.max_refusal_streak:
+                self._mark_abort(f"recoverable_refusals:{name}")
+
+    def record_progress(
+            self, name: str,
+            kind: Literal["backtest_ok", "self_test_ran"]) -> None:
+        with self._lock:
+            self.terminal_refusal_streak = 0
+            if kind == "backtest_ok":
+                self.recoverable_refusal_streak[(
+                    name, "run_backtest_required_first")] = 0
+
+    def summary(self) -> str:
+        with self._lock:
+            return (f"calls={self.total_calls} refused={self.refusals} "
+                    f"self_test={self.self_test_runs} "
+                    f"backtest={sum(self.backtest_calls.values())}")
 
     def reserve_write(self, limit: int) -> bool:
         with self._lock:
@@ -73,4 +123,3 @@ class MissionToolCounters:
             return
         with self._lock:
             self.successful_backtests[name] += 1
-

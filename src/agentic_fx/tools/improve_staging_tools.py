@@ -116,6 +116,7 @@ def build_improve_staging_tooldefs(
         if path is None:
             return {"error": "invalid name or rel"}
         if counters is not None and not counters.reserve_write(budget.max_writes):
+            counters.record_terminal_refusal()
             return {"error": "budget exhausted", "budget": "max_writes",
                     "directive": BUDGET_EXHAUSTED_DIRECTIVE}
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,9 +180,12 @@ def build_improve_staging_tooldefs(
                 max_before_backtest=budget.max_self_tests_before_backtest,
                 is_strategy=is_strategy)
             if rejection == "max_self_test_runs":
+                counters.record_terminal_refusal()
                 return {"error": "budget exhausted", "budget": "max_self_test_runs",
                         "directive": BUDGET_EXHAUSTED_DIRECTIVE}
             if rejection == "run_backtest_required_first":
+                counters.record_recoverable_refusal(
+                    name, "run_backtest_required_first")
                 return {"error": "run_backtest_required_first",
                         "directive": RUN_BACKTEST_FIRST_DIRECTIVE}
         # 実機 E2E 是正 (2026-08-30 mission #9): (a) rootdir/confcutdir を
@@ -219,6 +223,10 @@ def build_improve_staging_tooldefs(
         out = {"passed": passed, "stdout_tail": combined[-2000:]}
         if counters is None:
             return out
+        if 'result' in locals():
+            counters.record_progress(name, "self_test_ran")
+        out["remaining_budget"] = {
+            "self_tests": max(budget.max_self_test_runs - counters.self_test_runs, 0)}
         consecutive = counters.record_self_test_result(
             name, signature if signature is not None else ("<passed>",))
         if passed or consecutive < budget.self_test_warn_after:

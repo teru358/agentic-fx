@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.runners.base import Mission
 from agentic_fx.runners.cli_runner import CliRunner
 from agentic_fx.runners.response_parser import ParseError, parse_json_output
@@ -16,6 +19,8 @@ from agentic_fx.tools.registry import ToolRegistry
 #: 「作業はするが最終テキストを出さずに終わる」ことがある。中断/timeout 後の
 #: session (`-s <id>`) へこのプロンプトで 1 回だけ追撃し、KV cache 再利用で
 #: schema 準拠 JSON を回収する。
+_log = logging.getLogger("agentic_fx.runners.opencode")
+
 _RESUME_PROMPT = (
     "これまでの作業を踏まえ、指定された JSON schema "
     "(discoveries / selected / artifact / selection_rationale) の最終出力だけを"
@@ -38,6 +43,26 @@ _RESUME_RESERVE_SEC = 240.0
 _SESSION_ID_RE = re.compile(r"^ses_[A-Za-z0-9]+$")
 
 
+def _disable_mcp_for_recovery(workdir: Path) -> bool:
+    """追撃 (session resume) の前に workdir の opencode 設定で afx MCP を
+    無効化する (設計 v4 §Tier F — 追撃は最終 JSON の回収専用で tool を
+    再実行させない。実 opencode 1.18.25 で resume が home config を再読込
+    することを probe で確認済み: `tmp/design-mission-abort/probe-resume-mcp.md`)。
+
+    設定が読めない / 形が違う場合は **無効化を諦めて追撃は続行** する
+    (追撃は best-effort であり、ここで例外を出すと回収経路ごと失う)。
+    戻り値は無効化できたか。"""
+    path = workdir / "home/.config/opencode/opencode.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+        config["mcp"]["afx"]["enabled"] = False
+        path.write_text(json.dumps(config), encoding="utf-8")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        _log.warning("could not disable MCP for recovery: %s", safe_error_text(exc))
+        return False
+    return True
+
+
 class OpencodeRunner(CliRunner):
     """improve 専用。CLI に上限指定がないため max_turns は無視する。"""
     def __init__(self, *, bin_path: Path, model: str, workdir: Path,
@@ -46,14 +71,18 @@ class OpencodeRunner(CliRunner):
                  cli_terminate_grace_sec: float,
                  registry: ToolRegistry,
                  on_message: Callable[[dict], None] | None = None,
-                 cli_started_sink: Callable[[int], None] | None = None) -> None:
+                 cli_started_sink: Callable[[int], None] | None = None,
+                 abort_event: threading.Event | None = None,
+                 abort_reason_fn: Callable[[], str] | None = None) -> None:
         self._llama_swap_base_url = llama_swap_base_url
         self._context_limit = context_limit
         self._mcp_timeout_ms = mcp_timeout_ms
         super().__init__(bin_path=bin_path, model=model, workdir=workdir,
                          cli_terminate_grace_sec=cli_terminate_grace_sec,
                          registry=registry, on_message=on_message,
-                         cli_started_sink=cli_started_sink)
+                         cli_started_sink=cli_started_sink,
+                         abort_event=abort_event,
+                         abort_reason_fn=abort_reason_fn)
 
     def _build_argv(self, mission: Mission, *, mcp_socket: Path) -> list[str]:
         path = self._workdir / "home/.config/opencode/opencode.json"
@@ -168,15 +197,16 @@ class OpencodeRunner(CliRunner):
         session_id = self._extract_session_id(stdout_lines)
         if session_id is None:
             return None
+        _disable_mcp_for_recovery(self._workdir)
         argv = [str(self._bin_path), "run", _RESUME_PROMPT, "--format", "json",
                 "--pure", "-m", f"llama-swap/{self._model}", "--dir", str(self._workdir),
                 "-s", session_id]
         env = self._build_env(mission)
         resume_timeout = min(_RESUME_TIMEOUT_SEC, recovery_timeout_sec)
-        timed_out, rc, resume_lines, stderr_chunks = self._run_cli_process(
+        cause, rc, resume_lines, stderr_chunks = self._run_cli_process(
             argv, env, timeout_sec=resume_timeout)
         step_finish_reason = self._last_step_finish_reason(resume_lines)
-        if timed_out:
+        if cause == "timeout":
             discard_reason = "timed_out"
         elif rc != 0:
             discard_reason = "rc"
@@ -188,7 +218,7 @@ class OpencodeRunner(CliRunner):
         marker = json.dumps({
             "_resume_recovery": True,
             "session_id": session_id,
-            "timed_out": timed_out,
+            "timed_out": cause == "timeout",
             "rc": rc,
             "step_finish_reason": step_finish_reason,
             "accepted": accepted,
@@ -198,7 +228,7 @@ class OpencodeRunner(CliRunner):
         self._save_transcript([marker, *resume_lines], stderr_chunks)
         self._on_message({"type": "event", "message": {
             "role": "system", "content": marker}})
-        if timed_out or rc != 0:
+        if cause == "timeout" or rc != 0:
             return None
         if step_finish_reason != "stop":
             return None
