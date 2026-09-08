@@ -1,6 +1,7 @@
 """factory.build_runner — backend選択と設定配線 (プラン10 Task1 Step 26-32)。"""
 from __future__ import annotations
 
+import threading
 import sys
 import types
 from pathlib import Path
@@ -327,3 +328,48 @@ def test_build_runner_returns_real_claude_runner_class(tmp_path):
                 update={"backend": "claude"})})})
     runner = build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
     assert isinstance(runner, ClaudeRunner)
+
+
+# --- ローカル 1 周目 pin (2026-09-08、tmp/review-20260908-ma/verified-round1-local.md) ---
+
+# P5
+@pytest.mark.parametrize("backend", ["local", "claude", "codex", "opencode"])
+def test_build_runner_forwards_abort_wiring_for_every_backend(
+        monkeypatch, tmp_path, backend):
+    """ローカル 1 周目 #5 (muse c3 / qwen c3): 設計の backend 別表は local /
+    claude / opencode を「残存 = 無し」と主張する = `abort_event` /
+    `abort_reason_fn` が全 backend の runner に届くこと。local 分岐だけ
+    `abort_event=None` に落とす変異が全スイート green で生存していた
+    (既存 factory テストは claude の allowlist しか見ていない)。"""
+    from agentic_fx.config import load_settings
+
+    captured: dict = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    for mod, cls in (("agentic_fx.runners.claude_runner", "ClaudeRunner"),
+                     ("agentic_fx.runners.codex_runner", "CodexRunner"),
+                     ("agentic_fx.runners.opencode_runner", "OpencodeRunner"),
+                     ("agentic_fx.runners.local_runner", "LocalRunner")):
+        m = types.ModuleType(mod)
+        setattr(m, cls, FakeRunner)
+        monkeypatch.setitem(sys.modules, mod, m)
+
+    EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(EXAMPLE)
+    settings = settings.model_copy(update={
+        "runner": settings.runner.model_copy(update={
+            "improve": settings.runner.improve.model_copy(
+                update={"backend": backend}),
+            "opencode": settings.runner.opencode.model_copy(
+                update={"context_limit": 65536}),
+            "codex": settings.runner.codex.model_copy(
+                update={"bin": "/tmp/codex-bin"}),
+        })})
+    event = threading.Event()
+    build_runner("improve", settings, ToolRegistry(), workdir=tmp_path,
+                 abort_event=event, abort_reason_fn=lambda: "tool_budget_abort:x")
+    assert captured["abort_event"] is event, backend
+    assert captured["abort_reason_fn"]() == "tool_budget_abort:x", backend

@@ -543,3 +543,35 @@ def test_disable_mcp_for_recovery_tolerates_missing_or_malformed_config(tmp_path
     assert _disable_mcp_for_recovery(tmp_path) is True
     import json
     assert json.loads(cfg.read_text()) == {"mcp": {"afx": {"enabled": False, "x": 1}}}
+
+
+# --- ローカル 1 周目 pin (2026-09-08、tmp/review-20260908-ma/verified-round1-local.md) ---
+
+# P8
+def test_recover_output_disables_mcp_before_launching_resume(tmp_path):
+    """ローカル 1 周目 #9 (muse c2): 追撃 (resume) は最終 JSON の回収専用で
+    tool を再実行させない = `_disable_mcp_for_recovery` は resume プロセスの
+    **起動前**に効いていること。呼び出しを削除する変異が全スイート green で
+    生存していた (既存の `test_disable_mcp_for_recovery_*` は関数を直接叩く
+    だけで、追撃経路から呼ばれることを見ていない)。起動時点の設定値を
+    `_run_cli_process` の中で読むので、呼び出しを後ろへ移す順序反転も red。"""
+    workdir = tmp_path / "wd"; workdir.mkdir()
+    cfg = workdir / "home/.config/opencode/opencode.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps({"mcp": {"afx": {"enabled": True}}}))
+    seen: dict = {}
+
+    class R(OpencodeRunner):
+        def _run_cli_process(self, argv, env, *, timeout_sec,
+                             on_started=None, abort_event=None):
+            seen["enabled_at_launch"] = json.loads(
+                cfg.read_text())["mcp"]["afx"]["enabled"]
+            return "timeout", None, [], []
+
+    runner = R(bin_path=Path(sys.executable), model="qwen-test",
+               workdir=workdir, llama_swap_base_url="http://localhost:8080/v1",
+               context_limit=65536, mcp_timeout_ms=605000,
+               cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    stdout_lines = [json.dumps({"sessionID": "ses_abc123"})]
+    runner._recover_output(_resume_mission(), stdout_lines, 10.0)
+    assert seen["enabled_at_launch"] is False

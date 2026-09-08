@@ -946,3 +946,67 @@ def test_start_mcp_dispatcher_fails_closed_when_socket_path_is_masked_by_directo
     (tmp_path / "afx.sock").mkdir()
     with pytest.raises(RuntimeError, match="failed to bind"):
         mw_mod._start_mcp_dispatcher(workdir=tmp_path, registry=ToolRegistry())
+
+
+# --- ローカル 1 周目 pin (2026-09-08、tmp/review-20260908-ma/verified-round1-local.md) ---
+
+# P2
+def test_run_improve_mission_shares_one_counters_across_registry_and_runner(
+        monkeypatch, tmp_path):
+    """ローカル 1 周目 #2 (muse c5 / ornith c5 / qwen c5): registry・
+    dispatcher・runner が**同一の** counters を見ていること。(a)
+    `after_send=` に別インスタンスの `fire_if_pending` を渡す変異、(b)
+    `build_mission_registry(..., counters=None)` に落とす変異、いずれも全
+    スイート green で生存していた — どちらが起きても abort_event は永久に
+    set されず、run6 (拒否 455 回・48 分) がそのまま再現する。
+    tool の拒否は registry 経由の公開挙動で作り、発火は dispatcher が
+    実際に配線したフック経由で起こす。"""
+    import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.config import ImproveToolBudgetSettings
+
+    captured: dict = {}
+
+    def spy(profile, settings, registry, *, workdir, on_message=None,
+            cli_started_sink=None, abort_event=None, abort_reason_fn=None):
+        captured["registry"] = registry
+        captured["abort_event"] = abort_event
+
+        class _Fake:
+            def run(self, mission):
+                raise AssertionError("not used")
+
+            def close(self):
+                pass
+        return _Fake()
+
+    monkeypatch.setattr(mw_mod.runner_factory, "build_runner", spy)
+    staging_dir = tmp_path / "staging"; staging_dir.mkdir()
+    source_snapshot_dir = tmp_path / "source"; source_snapshot_dir.mkdir()
+
+    settings = _settings_with_improve_backend("local")
+    settings = settings.model_copy(update={
+        "improve": settings.improve.model_copy(update={
+            "tool_budget": ImproveToolBudgetSettings(
+                max_writes=1, max_refusal_streak=1)})})
+
+    runner = mw_mod._run_improve_mission(
+        settings=settings, workdir=tmp_path, staging_dir=str(staging_dir),
+        source_snapshot_dir=str(source_snapshot_dir),
+        protocol_out=None, out_seq=None, in_seq=None)
+
+    registry = captured["registry"]
+    names = list(registry.names())
+    assert json.loads(registry.execute(
+        "write_staging_file",
+        {"name": "a", "rel": "plugin.py", "content": "x = 1\n"},
+        names)) == {"ok": True}
+    refused = json.loads(registry.execute(
+        "write_staging_file",
+        {"name": "a", "rel": "plugin.py", "content": "y = 1\n"}, names))
+    assert refused["error"] == "budget exhausted"
+
+    # dispatcher が握るフックと runner に渡った event が同じ counters を
+    # 指していなければ、ここで event は立たない。
+    assert not captured["abort_event"].is_set()
+    runner._afx_mcp_dispatcher._after_send()
+    assert captured["abort_event"].is_set()

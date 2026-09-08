@@ -113,3 +113,33 @@ def test_run6_real_refusal_sequence_reaches_abort_threshold():
         counters.record_terminal_refusal()
     assert counters.abort_pending
     assert counters.abort_trigger == "terminal_refusals"
+
+
+# --- ローカル 1 周目 pin (2026-09-08、tmp/review-20260908-ma/verified-round1-local.md) ---
+
+# P6 / P3b
+def test_first_abort_trigger_is_not_overwritten_by_a_later_one():
+    """ローカル 1 周目 #6 (muse c1 / qwen c1): `_mark_abort` の
+    `if not self.abort_pending:` は「最初の到達だけが trigger を決める」契約。
+    ガード削除の変異が全スイート green で生存していた — 上書きされると
+    reason 文字列と Tier D' の申し送りが誤った死因を報告する。"""
+    budget = ImproveToolBudgetSettings(max_refusal_streak=1, max_tool_calls=1)
+    counters = MissionToolCounters(budget=budget)
+    counters.record_terminal_refusal()
+    assert counters.abort_trigger == "terminal_refusals"
+    counters.record_call()
+    assert counters.abort_trigger == "terminal_refusals"
+
+
+def test_recoverable_refusal_streak_aborts_exactly_at_threshold():
+    """ローカル 1 周目 #7 (muse c1): 3 本ある閾値のうち recoverable だけ
+    境界が未検証だった (`>=` を `>` に緩める変異が生存)。手前で立たない /
+    到達で立つ を対で踏み、trigger 名 `recoverable_refusals:<name>` も見る。"""
+    budget = ImproveToolBudgetSettings(max_refusal_streak=3)
+    counters = MissionToolCounters(budget=budget)
+    for _ in range(2):
+        counters.record_recoverable_refusal("cand", "run_backtest_required_first")
+    assert not counters.abort_pending
+    counters.record_recoverable_refusal("cand", "run_backtest_required_first")
+    assert counters.abort_pending
+    assert counters.abort_trigger == "recoverable_refusals:cand"

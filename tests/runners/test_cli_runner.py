@@ -758,3 +758,45 @@ def test_cli_runner_transcript_default_dir_is_module_attribute(tmp_path, monkeyp
     runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path)  # transcript_dir 未指定
     runner.run(_mission())
     assert len(list(isolated.glob("*.jsonl"))) == 1
+
+
+# --- ローカル 1 周目 pin (2026-09-08、tmp/review-20260908-ma/verified-round1-local.md) ---
+
+# P1
+def test_run_cli_process_prefers_timeout_when_deadline_and_event_coincide(tmp_path):
+    """ローカル 1 周目 #1 (muse c2): poll loop は deadline を event より先に
+    評価する — wall-clock 優先の意味契約 (`base.py:23,28`)。両方が同時に真の
+    状態で入ると、評価順を入れ替える変異が全スイート green で生存していた
+    (段 0 が red と記録していたが実測は生存)。timeout_sec=0.0 で loop 突入
+    時点の deadline 到達を決定論的に作る。"""
+    event = threading.Event()
+    event.set()
+    runner = _new_runner(_SLEEP_FOREVER, tmp_path, abort_event=event)
+    cause, _rc, _out, _err = runner._run_cli_process(
+        [sys.executable, "-c", _SLEEP_FOREVER], {"PATH": "/usr/bin:/bin"},
+        timeout_sec=0.0, abort_event=event)
+    assert cause == "timeout"
+
+# P7
+def test_abort_saves_transcript_like_timeout(tmp_path):
+    """ローカル 1 周目 #8 (muse c2): abort は timeout と同じ追撃経路を通る =
+    `_save_transcript` も同じ位置で呼ばれる。abort 時だけ保存を飛ばす変異が
+    生存していた (既存 abort テストは status/reason しか見ていない)。"""
+    saved = []
+
+    class R(_FakeCliRunner):
+        def _run_cli_process(self, argv, env, *, timeout_sec,
+                             on_started=None, abort_event=None):
+            return "abort", None, ["partial"], []
+
+        def _save_transcript(self, stdout_lines, stderr_chunks):
+            saved.append(list(stdout_lines))
+
+    event = threading.Event()
+    runner = R(script="", bin_path=Path(sys.executable), model="m",
+               workdir=tmp_path, cli_terminate_grace_sec=0.3,
+               registry=ToolRegistry(), abort_event=event,
+               abort_reason_fn=lambda: "tool_budget_abort:terminal_refusals")
+    result = runner.run(_mission())
+    assert result.status == "failed"
+    assert saved == [["partial"]]

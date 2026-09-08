@@ -707,3 +707,67 @@ def test_write_budget_refusal_counts_toward_terminal_streak(tmp_path):
     assert counters.terminal_refusal_streak == 3
     assert counters.abort_pending is True
     assert counters.abort_trigger == "terminal_refusals"
+
+
+# --- ローカル 1 周目 pin (2026-09-08、tmp/review-20260908-ma/verified-round1-local.md) ---
+
+# P3 / P4
+def test_pre_backtest_rejection_feeds_the_recoverable_streak(tmp_path):
+    """ローカル 1 周目 #3 (muse c4 / qwen c4): `run_backtest_required_first`
+    の拒否が recoverable streak に積まれ、閾値で abort に至る唯一の経路。
+    `counters.record_recoverable_refusal(...)` の 2 行を削除する変異が全
+    スイート green で生存していた (拒否経路自体は既存テストが踏むが、
+    streak を誰も見ていなかった) — これが無いと設計が v1 の穴と呼ぶ
+    「self-test 拒否だけを叩き続けるループ」が timeout まで止まらない。"""
+    staging = tmp_path / "staging"; staging.mkdir()
+    source = tmp_path / "source"; source.mkdir()
+    example = Path(__file__).resolve().parents[2] / "docs/examples/plugins/sma_cross"
+    shutil.copytree(example, staging / "cand")
+    budget = ImproveToolBudgetSettings(max_refusal_streak=3)
+    counters = MissionToolCounters(budget=budget)
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source,
+        counters=counters, budget=budget)}
+    assert "error" not in tools["run_plugin_tests"].func("cand")
+    key = ("cand", "run_backtest_required_first")
+    for n in (1, 2):
+        assert tools["run_plugin_tests"].func("cand")["error"] == \
+            "run_backtest_required_first"
+        assert counters.recoverable_refusal_streak[key] == n
+        assert not counters.abort_pending
+    assert tools["run_plugin_tests"].func("cand")["error"] == \
+        "run_backtest_required_first"
+    assert counters.recoverable_refusal_streak[key] == 3
+    assert counters.abort_pending
+    assert counters.abort_trigger == "recoverable_refusals:cand"
+
+
+@pytest.mark.parametrize("exc", [
+    subprocess.TimeoutExpired("pytest", 120),
+    OSError(12, "Cannot allocate memory"),
+])
+def test_unrun_self_test_does_not_reset_the_terminal_refusal_streak(
+        monkeypatch, tmp_path, exc):
+    """ローカル 1 周目 #4 (muse c4 / qwen c4): terminal streak のリセットは
+    「pytest が実際に走った」応答のみ (設計 §1)。`if 'result' in locals():`
+    を外して無条件に `record_progress` する変異が全スイート green で生存
+    していた — 既存 2 テストは戻り値の辞書等値比較しか見ていない。無条件化
+    すると timeout ループが毎回 streak を 0 に戻し abort が永久に発火しない。"""
+    staging = tmp_path / "staging"; staging.mkdir()
+    source = tmp_path / "source"; source.mkdir()
+    (staging / "a").mkdir()
+    (staging / "a" / "test_plugin.py").write_text("def test_x(): pass\n")
+    budget = ImproveToolBudgetSettings(max_writes=1, max_refusal_streak=10)
+    counters = MissionToolCounters(budget=budget)
+    tools = {t.name: t for t in build_improve_staging_tooldefs(
+        staging_dir=staging, source_snapshot_dir=source,
+        counters=counters, budget=budget)}
+    assert tools["write_staging_file"].func("a", "plugin.py", "x") == {"ok": True}
+    assert tools["write_staging_file"].func("a", "plugin.py", "y")["error"] == \
+        "budget exhausted"
+    assert counters.terminal_refusal_streak == 1
+    monkeypatch.setattr(
+        "agentic_fx.tools.improve_staging_tools.subprocess.run",
+        lambda *a, **k: (_ for _ in ()).throw(exc))
+    assert tools["run_plugin_tests"].func("a")["passed"] is False
+    assert counters.terminal_refusal_streak == 1
