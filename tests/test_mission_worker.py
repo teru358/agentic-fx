@@ -1065,3 +1065,73 @@ def test_run_improve_mission_wires_after_tool_call_for_local_backend(monkeypatch
         assert captured["abort_event"].is_set()
     finally:
         runner._afx_mcp_dispatcher.close()
+
+
+def test_local_backend_end_to_end_abort_without_hand_made_state(monkeypatch, tmp_path):
+    """3 周目 sonnet #2 (2026-09-08): 多段配線を**手で中間状態を作らず**に 1 本で通す。
+    実 counters → 実 registry (staging tool の拒否) → 実 factory (backend=local) →
+    実 LocalRunner (HTTP だけ MockTransport) → after_tool_call → event → runner 終端。
+    fake LLM は write_staging_file を毎 turn 3 回呼ぶ。max_writes=1 /
+    max_refusal_streak=2 なので 2 回目の拒否で pending → フックで event → 3 回目は
+    実行されず `failed` + prefix。手で set / 代入する箇所は無い。"""
+    import json as _json
+
+    import httpx
+
+    import agentic_fx.mission_worker as mw_mod
+    import agentic_fx.runners.local_runner as lr
+    from agentic_fx.config import ImproveToolBudgetSettings
+    from agentic_fx.runners.base import Mission, is_tool_budget_abort
+
+    calls = []
+    msg = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": f"c{n}", "type": "function",
+         "function": {"name": "write_staging_file", "arguments": _json.dumps(
+             {"name": "a", "rel": "plugin.py", "content": f"x = {n}\n"})}}
+        for n in (1, 2, 3)]}
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"choices": [{"message": msg}]})
+
+    real_init = lr.LocalRunner.__init__
+
+    def init_with_mock_transport(self, **kw):   # HTTP だけ差し替え、配線は実物
+        real_init(self, transport=httpx.MockTransport(handler), **kw)
+
+    monkeypatch.setattr(lr.LocalRunner, "__init__", init_with_mock_transport)
+    monkeypatch.setattr(mw_mod, "_bootstrap_improve_profile",
+                        lambda *a, **k: None, raising=False)
+
+    staging_dir = tmp_path / "staging"; staging_dir.mkdir()
+    source_snapshot_dir = tmp_path / "source"; source_snapshot_dir.mkdir()
+    settings = _settings_with_improve_backend("local")
+    settings = settings.model_copy(update={
+        "improve": settings.improve.model_copy(update={
+            "tool_budget": ImproveToolBudgetSettings(
+                max_writes=1, max_refusal_streak=2)})})
+    # on_message は event フレームを protocol_out へ書けないと os._exit(1) する
+    # (fail closed) ので、実物の出力先と seq tracker を渡す。
+    import io
+    from agentic_fx.core.mission_protocol import SeqTracker
+    protocol_out = io.BytesIO()
+    runner = mw_mod._run_improve_mission(
+        settings=settings, workdir=tmp_path, staging_dir=str(staging_dir),
+        source_snapshot_dir=str(source_snapshot_dir),
+        protocol_out=protocol_out, out_seq=SeqTracker(), in_seq=SeqTracker())
+    try:
+        assert isinstance(runner, lr.LocalRunner)
+        result = runner.run(Mission(
+            prompt="p", tools=["write_staging_file"], output_schema={"type": "object"},
+            max_turns=5, timeout_sec=30))
+    finally:
+        runner._afx_mcp_dispatcher.close()
+
+    assert result.status == "failed"
+    assert is_tool_budget_abort(result.reason)
+    assert "terminal_refusals" in result.reason
+    counters = runner._afx_mission_counters
+    assert counters.writes == 1                 # 1 回受理
+    assert counters.terminal_refusal_streak == 2  # 2 回目の拒否で閾値 → 3 回目は未実行
+    assert counters.abort_event.is_set()
+    assert len(calls) == 1                      # 1 turn で終わる

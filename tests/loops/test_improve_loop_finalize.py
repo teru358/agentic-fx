@@ -1781,3 +1781,62 @@ def test_finalize_max_turns_also_writes_system_note(
     assert note["last_result"] == (
         f"mission #{mission_id} status=max_turns reason=- "
         "run_backtest=1 analyze_corr=0")
+
+
+# --- 3 周目 sonnet #1 (2026-09-08、tmp/review-20260908-ma-r2/round3-sonnet.md) ---
+
+def test_commit_writes_activity_when_completed_result_carries_abort_reason(
+        loop_full, conn, mission_and_run_fixture, tmp_path):
+    """/code-review 2 周目 #2 で追加した「abort → 追撃回収の completed は reason を
+    保持し、親は activity `tool_budget_abort_recovered` を残す」の親側が無テスト
+    だった (3 周目 #1: 当該ブロック削除で 46 passed のまま生存)。observation
+    artifact の completed に abort reason を載せ、activity 行と mission id を pin。
+    対照: reason 無しの completed では書かれない。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"; staging_dir.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    output = {"discoveries": [], "selected": {"backlog_id": backlog_id, "idea": "x"},
+              "artifact": {"type": "observation", "reason": "budget"},
+              "selection_rationale": "r"}
+    result = MissionResult(status="completed", output=output, transcript=[],
+                           recovered=True,
+                           reason="tool_budget_abort:terminal_refusals calls=40 refused=10")
+    loop_full.commit(mission=mission, ctx=ctx, result=result,
+                     now=datetime(2026, 8, 22))
+    activity_text = (tmp_path / "activity.log").read_text()
+    assert "tool_budget_abort_recovered" in activity_text
+    assert f"mission={mission_id}" in activity_text
+    assert "reason=tool_budget_abort:terminal_refusals" in activity_text
+
+
+def test_commit_does_not_write_abort_activity_without_abort_reason(
+        loop_full, conn, mission_and_run_fixture, tmp_path):
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"; staging_dir.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    output = {"discoveries": [], "selected": {"backlog_id": backlog_id, "idea": "x"},
+              "artifact": {"type": "observation", "reason": "plain"},
+              "selection_rationale": "r"}
+    loop_full.commit(mission=mission, ctx=ctx,
+                     result=MissionResult(status="completed", output=output,
+                                          transcript=[]),
+                     now=datetime(2026, 8, 22))
+    activity_path = tmp_path / "activity.log"
+    text = activity_path.read_text() if activity_path.exists() else ""
+    assert "tool_budget_abort_recovered" not in text
