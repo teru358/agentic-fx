@@ -412,3 +412,64 @@ def test_run_mcp_shim_swallows_notifications(tmp_path):
     finally:
         proc.kill()
         proc.wait(timeout=5)
+
+
+def test_call_lock_covers_sendall_so_refusal_cannot_execute_during_send(tmp_path):
+    """codex 1 周目 Important (2026-09-08): 「sendall が _call_lock の内側」を決定論的に
+    観測する。受理側の sendall を event でブロックしている間、拒否側の tool 関数
+    (execute) に **入れない** こと。lock を execute だけに縮める変異 (sendall を
+    lock 外へ) では、受理側の送信中に拒否側が execute に入り refused_entered が
+    立つ → red。"""
+    send_release = threading.Event()
+    accepted_sending = threading.Event()
+    refused_entered = threading.Event()
+    order = []
+    counters = MissionToolCounters(
+        budget=ImproveToolBudgetSettings(max_refusal_streak=1))
+    reg = ToolRegistry()
+    reg.register(ToolDef("accepted", "", {"type": "object"}, lambda: {"ok": True}))
+
+    def refused():
+        refused_entered.set()
+        counters.record_terminal_refusal()
+        return {"error": "budget exhausted"}
+
+    reg.register(ToolDef("refused", "", {"type": "object"}, refused))
+    dispatcher = McpShimDispatcher(
+        sock_path=tmp_path / "unused", registry=reg,
+        allowed=["accepted", "refused"],
+        after_send=lambda: (counters.fire_if_pending(),
+                            order.append("event")
+                            if counters.abort_event.is_set() else None))
+
+    class FakeSocket:
+        def __init__(self, name):
+            self.name = name
+            self.done = False
+        def recv(self, _n):
+            if self.done:
+                return b""
+            self.done = True
+            return (json.dumps({"jsonrpc": "2.0", "id": self.name,
+                                "method": "tools/call", "params": {
+                                    "name": self.name, "arguments": {}}})
+                    + "\n").encode()
+        def sendall(self, _data):
+            if self.name == "accepted":
+                accepted_sending.set()
+                assert send_release.wait(5), "test harness: release not set"
+            order.append(f"send:{self.name}")
+        def close(self):
+            pass
+
+    first = threading.Thread(target=dispatcher._handle_conn, args=(FakeSocket("accepted"),))
+    first.start()
+    assert accepted_sending.wait(5)
+    second = threading.Thread(target=dispatcher._handle_conn, args=(FakeSocket("refused"),))
+    second.start()
+    # 受理側が sendall の途中 (lock 保持中) — 拒否側は execute に入れない
+    assert refused_entered.wait(0.5) is False, "sendall 中に別接続の execute が走った (lock が sendall を覆っていない)"
+    send_release.set()
+    first.join(5); second.join(5)
+    assert refused_entered.is_set()
+    assert order == ["send:accepted", "send:refused", "event"]
