@@ -994,19 +994,35 @@ def test_run_improve_mission_shares_one_counters_across_registry_and_runner(
         source_snapshot_dir=str(source_snapshot_dir),
         protocol_out=None, out_seq=None, in_seq=None)
 
-    registry = captured["registry"]
-    names = list(registry.names())
-    assert json.loads(registry.execute(
-        "write_staging_file",
-        {"name": "a", "rel": "plugin.py", "content": "x = 1\n"},
-        names)) == {"ok": True}
-    refused = json.loads(registry.execute(
-        "write_staging_file",
-        {"name": "a", "rel": "plugin.py", "content": "y = 1\n"}, names))
-    assert refused["error"] == "budget exhausted"
+    # codex 2 周目 Minor: private seam (`_afx_mcp_dispatcher._after_send`) を
+    # 直叩きせず、実 Unix socket に tools/call を送って dispatcher 自身に
+    # フックを呼ばせる (公開挙動)。dispatcher は finally で必ず close する。
+    import socket
 
-    # dispatcher が握るフックと runner に渡った event が同じ counters を
-    # 指していなければ、ここで event は立たない。
-    assert not captured["abort_event"].is_set()
-    runner._afx_mcp_dispatcher._after_send()
-    assert captured["abort_event"].is_set()
+    def _call(name, arguments):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(5)
+            c.connect(str(mw_mod.mcp_socket_path(tmp_path)))
+            c.sendall((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": name, "arguments": arguments}})
+                       + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        return json.loads(json.loads(buf)["result"]["content"][0]["text"])
+
+    try:
+        assert _call("write_staging_file",
+                     {"name": "a", "rel": "plugin.py", "content": "x = 1\n"}) == {"ok": True}
+        assert not captured["abort_event"].is_set()
+        refused = _call("write_staging_file",
+                        {"name": "a", "rel": "plugin.py", "content": "y = 1\n"})
+        assert refused["error"] == "budget exhausted"
+        # dispatcher が握るフックと runner に渡った event が同じ counters を
+        # 指していなければ、ここで event は立たない。
+        assert captured["abort_event"].wait(5)
+    finally:
+        runner._afx_mcp_dispatcher.close()

@@ -423,6 +423,7 @@ def test_call_lock_covers_sendall_so_refusal_cannot_execute_during_send(tmp_path
     send_release = threading.Event()
     accepted_sending = threading.Event()
     refused_entered = threading.Event()
+    refused_received = threading.Event()   # 拒否側が _handle_conn で要求を読み終えた
     order = []
     counters = MissionToolCounters(
         budget=ImproveToolBudgetSettings(max_refusal_streak=1))
@@ -450,6 +451,8 @@ def test_call_lock_covers_sendall_so_refusal_cannot_execute_during_send(tmp_path
             if self.done:
                 return b""
             self.done = True
+            if self.name == "refused":
+                refused_received.set()
             return (json.dumps({"jsonrpc": "2.0", "id": self.name,
                                 "method": "tools/call", "params": {
                                     "name": self.name, "arguments": {}}})
@@ -467,6 +470,10 @@ def test_call_lock_covers_sendall_so_refusal_cannot_execute_during_send(tmp_path
     assert accepted_sending.wait(5)
     second = threading.Thread(target=dispatcher._handle_conn, args=(FakeSocket("refused"),))
     second.start()
+    # codex 2 周目 Important: 拒否側スレッドが要求を読み終えて lock 取得に
+    # 進んだことを同期してから判定する (スケジューリング遅延で偽 green に
+    # ならないように)。
+    assert refused_received.wait(5), "test harness: refused thread did not start"
     # 受理側が sendall の途中 (lock 保持中) — 拒否側は execute に入れない
     assert refused_entered.wait(0.5) is False, "sendall 中に別接続の execute が走った (lock が sendall を覆っていない)"
     send_release.set()
