@@ -143,3 +143,23 @@ def test_recoverable_refusal_streak_aborts_exactly_at_threshold():
     counters.record_recoverable_refusal("cand", "run_backtest_required_first")
     assert counters.abort_pending
     assert counters.abort_trigger == "recoverable_refusals:cand"
+
+
+# --- ローカル 2 周目 pin (2026-09-08、tmp/review-20260908-ma-r2/verified-round2-local.md #23) ---
+def test_max_tool_calls_aborts_exactly_at_threshold_not_before():
+    """ローカル 2 周目 #23 (qwen c2): 閾値 3 本のうち `max_tool_calls` だけ
+    「手前で立たない」側が未検証だった (terminal は
+    `test_terminal_refusal_fires_only_after_response_delivery_hook`、
+    recoverable は 1 周目 P6 が対で押さえている)。定数を 1 減らす変異
+    (`>= max_tool_calls - 1`) が全スイート green で生存していた —
+    1 手前で abort すると mission が予算を使い切る前に殺され、Tier D' の
+    申し送りが実際には残っていた予算を「使い切った」と偽る。"""
+    budget = ImproveToolBudgetSettings(max_tool_calls=3, max_refusal_streak=10)
+    counters = MissionToolCounters(budget=budget)
+    for _ in range(2):
+        counters.record_call()
+        assert not counters.abort_pending
+        assert counters.abort_trigger is None
+    counters.record_call()
+    assert counters.abort_pending
+    assert counters.abort_trigger == "max_tool_calls"
