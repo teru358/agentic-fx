@@ -378,7 +378,7 @@ def test_improve_registry_shares_one_counters_across_staging_and_rpc(tmp_path):
         activity=ActivityLog(tmp_path / "activity.log"), staging_dir=staging,
         source_snapshot_dir=source,
         ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
-        rpc_handlers={"run_backtest": lambda a: {"metrics": {"trades": 1}},
+        rpc_handlers={"run_backtest": lambda a: {"metrics": {"trades": 1, "evaluable": True}},
                       "analyze_corr": lambda a: {}})
 
     def call(name, args):

@@ -1855,16 +1855,24 @@ class ImproveLoop:
                 entries = ctx.ledger.entries()
                 n_bt = sum(e["kind"] == "run_backtest" for e in entries)
                 n_corr = sum(e["kind"] == "analyze_corr" for e in entries)
+                # [system-note-type-by-cause] (run7 欠陥 B、2026-09-09): 型は
+                # 死因で決める。旧実装は backtest 件数だけで型 B を選び、枯渇して
+                # いない timeout に「予算が尽きたら…」を申し送っていた。
                 if n_bt == 0:
-                    idea = ("improve mission が最終出力なしで終了した "
+                    idea = ("improve mission が最終出力なしで終了した "  # 型 A
                             "(timeout/max_turns)。strategy はまず run_backtest "
                             "を呼び、self-test の修正を繰り返さないこと")
-                else:
-                    idea = (
+                elif is_tool_budget_abort(result.reason):
+                    idea = (                                        # 型 B: 予算枯渇 abort
                         "improve mission が backtest 完走後に最終出力を出さずに終了した。"
                         "予算が尽きたら (`budget exhausted` を受けたら) 直ちに現状の"
                         "候補で提出するか observation を出すこと。拒否された tool を"
                         "繰り返し呼ばないこと")
+                else:
+                    idea = (                                        # 型 C: 時間切れ
+                        "improve mission が backtest 完走後に時間切れで終了した "
+                        "(最終出力なし)。backtest の結果を得たら self-test の修正に"
+                        "戻らず、早めに提出か observation を出すこと")
                 try:
                     backlog_store.upsert_system_note(
                         conn,

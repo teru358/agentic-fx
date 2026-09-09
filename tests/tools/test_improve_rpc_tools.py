@@ -104,7 +104,7 @@ def test_run_backtest_success_is_recorded_in_shared_counters():
     counters = MissionToolCounters()
     tools = {t.name: t for t in build_improve_rpc_tooldefs(
         ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
-        run_backtest_handler=lambda args: {"metrics": {"trades": 1}},
+        run_backtest_handler=lambda args: {"metrics": {"trades": 1, "evaluable": True}},
         analyze_corr_handler=lambda args: {}, counters=counters,
         budget=ImproveToolBudgetSettings())}
     tools["run_backtest"].func("a", "USDJPY")
@@ -421,7 +421,42 @@ def test_successful_backtest_resets_terminal_refusal_streak():
     assert counters.terminal_refusal_streak == 2
     tools = {t.name: t for t in build_improve_rpc_tooldefs(
         ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
-        run_backtest_handler=lambda args: {"metrics": {"trades": 1}},
+        run_backtest_handler=lambda args: {"metrics": {"trades": 1, "evaluable": True}},
         analyze_corr_handler=lambda args: {}, counters=counters, budget=budget)}
     tools["run_backtest"].func("a", "USDJPY")
+    assert counters.terminal_refusal_streak == 0
+
+
+
+# --- run7 是正 [tier-b-release-requires-evaluable-backtest] (2026-09-09) ---
+
+@pytest.mark.parametrize("metrics", [
+    {"trades": 0, "evaluable": False},   # 空振り backtest (run7 #63 の実形)
+    {"trades": 3},                        # evaluable 欠落
+    {"trades": 0, "evaluable": None},
+])
+def test_run_backtest_does_not_count_unevaluable_backtest_as_success(metrics):
+    """run7 欠陥 A: trades=0 / evaluable=false の backtest 1 本で Tier B が恒久解除され、
+    モデルが self-test 修正ループへ復帰した。成功 = metrics.evaluable が真のみ。"""
+    counters = MissionToolCounters(budget=ImproveToolBudgetSettings())
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
+        run_backtest_handler=lambda args: {"metrics": metrics},
+        analyze_corr_handler=lambda args: {}, counters=counters,
+        budget=ImproveToolBudgetSettings())}
+    tools["run_backtest"].func("a", "USDJPY")
+    assert counters.successful_backtests["a"] == 0
+    assert counters.backtest_calls["a"] == 1      # 予算は消費する
+
+
+def test_run_backtest_counts_evaluable_backtest_as_success():
+    counters = MissionToolCounters(budget=ImproveToolBudgetSettings())
+    counters.record_terminal_refusal()
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
+        run_backtest_handler=lambda args: {"metrics": {"trades": 5, "evaluable": True}},
+        analyze_corr_handler=lambda args: {}, counters=counters,
+        budget=ImproveToolBudgetSettings())}
+    tools["run_backtest"].func("a", "USDJPY")
+    assert counters.successful_backtests["a"] == 1
     assert counters.terminal_refusal_streak == 0

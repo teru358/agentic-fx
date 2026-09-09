@@ -1840,3 +1840,45 @@ def test_commit_does_not_write_abort_activity_without_abort_reason(
     activity_path = tmp_path / "activity.log"
     text = activity_path.read_text() if activity_path.exists() else ""
     assert "tool_budget_abort_recovered" not in text
+
+
+
+# --- run7 是正 [system-note-type-by-cause] (2026-09-09) ---
+
+def _failed_ctx_with_backtests(tmp_path, mission_id, run_id, n_bt):
+    staging_dir = tmp_path / "staging"; staging_dir.mkdir(exist_ok=True)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    for i in range(n_bt):
+        ledger.record(opaque_ref=f"bt{i}", kind="run_backtest", params={},
+                      result_summary={}, trial_count=1)
+    ledger.freeze()
+    return ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger, rpc_handlers={})
+
+
+@pytest.mark.parametrize("status,reason,n_bt,expect,absent", [
+    ("failed", "tool_budget_abort:terminal_refusals calls=40", 6, "予算が尽きたら", "時間切れ"),
+    ("timeout", "cli timeout", 2, "時間切れ", "予算が尽きたら"),
+    ("timeout", "cli timeout", 0, "まず run_backtest", "時間切れ"),
+    ("max_turns", None, 3, "時間切れ", "予算が尽きたら"),
+    ("failed", "tool_budget_abort:terminal_refusals", 0, "まず run_backtest", "予算が尽きたら"),
+])
+def test_system_note_type_is_chosen_by_cause_not_backtest_count(
+        loop_min, conn, mission_and_run_fixture, tmp_path, status, reason, n_bt,
+        expect, absent):
+    """run7 欠陥 B: 枯渇していない timeout に型 B「予算が尽きたら…」を申し送っていた。
+    型は死因で決める: abort → 型 B / timeout・max_turns × backtest 0 → 型 A /
+    timeout・max_turns × backtest ≥ 1 → 型 C (時間切れ)。"""
+    mission_id, run_id, _ = mission_and_run_fixture
+    ctx = _failed_ctx_with_backtests(tmp_path, mission_id, run_id, n_bt)
+    loop_min._finalize_failed_mission(
+        conn, ctx=ctx, result=MissionResult(status=status, output=None, transcript=[],
+                                            reason=reason),
+        now=datetime(2026, 9, 9))
+    note = conn.execute(
+        "SELECT idea FROM improvement_backlog WHERE source='system'").fetchone()
+    assert expect in note["idea"]
+    assert absent not in note["idea"]
