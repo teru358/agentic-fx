@@ -1862,6 +1862,8 @@ def _failed_ctx_with_backtests(tmp_path, mission_id, run_id, n_bt):
 @pytest.mark.parametrize("status,reason,n_bt,expect,absent", [
     ("failed", "tool_budget_abort:terminal_refusals calls=40", 6, "予算が尽きたら", "時間切れ"),
     ("timeout", "cli timeout", 2, "時間切れ", "予算が尽きたら"),
+    ("timeout", "tool_budget_abort:terminal_refusals calls=40", 2,
+     "予算が尽きたら", "時間切れ"),   # Y2 (L2): LocalRunner の timeout 優先で実到達する組合せ
     ("timeout", "cli timeout", 0, "まず run_backtest", "時間切れ"),
     ("max_turns", None, 3, "時間切れ", "予算が尽きたら"),
     ("failed", "tool_budget_abort:terminal_refusals", 0, "まず run_backtest", "予算が尽きたら"),

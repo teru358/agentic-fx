@@ -16,7 +16,8 @@ from agentic_fx.backtest.analysis import analyze_for_agent
 from agentic_fx.config import ImproveToolBudgetSettings
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.tools.improve_rpc_tools import (
-    _FORBIDDEN_KEYS, _strip_forbidden, build_improve_rpc_tooldefs,
+    _FORBIDDEN_KEYS, _is_successful_backtest, _strip_forbidden,
+    build_improve_rpc_tooldefs,
 )
 from agentic_fx.tools.mission_counters import MissionToolCounters
 
@@ -466,3 +467,18 @@ def test_run_backtest_counts_any_traded_backtest_as_success(trades):
     tools["run_backtest"].func("a", "USDJPY")
     assert counters.successful_backtests["a"] == 1
     assert counters.terminal_refusal_streak == 0
+
+
+# --- ローカルレビュー pin Y1 (2026-09-09、tmp/review-20260909-r7/verified-local.md L1) ---
+@pytest.mark.parametrize("result", [
+    None, "backtest_failed", ["metrics"],
+    {"error": "backtest_failed", "metrics": {"trades": 5}},
+    {"metrics": None},
+    {"metrics": "trades=5"},
+])
+def test_is_successful_backtest_rejects_malformed_replies(result):
+    """ローカル 1 周目 L1 (muse/ornith/qwen): docstring 契約の前段 (「error が
+    無く」「metrics が dict」「result が dict」) は 1 つも変異で落ちなかった。
+    tool 経由では踏めない — 後続 (`result.get("trial_count", 1)`、
+    `_strip_forbidden`) が dict を前提にしているため、関数を直接呼んで pin する。"""
+    assert _is_successful_backtest(result) is False
