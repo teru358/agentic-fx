@@ -65,18 +65,26 @@ def _strip_forbidden(value: object) -> object:
 
 
 def _is_successful_backtest(result: object) -> bool:
-    """設計 v4 Tier B の「成功した run_backtest」= error が無く、metrics が
-    **evaluable** (trades ≥ 1 を含意) な応答。空 dict / metrics 欠落 (codex 1 周目
-    Important 1) に加え、trades=0 / evaluable=false の空振り backtest も成功に
-    数えない — run7 #63 (2026-09-08) で空振り 1 本により Tier B が恒久解除され、
-    モデルが self-test 修正ループへ復帰した ([tier-b-release-requires-evaluable-
-    backtest])。directive「実データで trade が出れば plugin は正しい」と一致させる。
+    """設計 v4 Tier B の「成功した run_backtest」= error が無く、metrics の
+    **trades が 1 以上** (実データで trade が出た) 応答。空 dict / metrics 欠落
+    (codex 1 周目 Important 1) に加え、trades=0 の空振り backtest も成功に数えない
+    — run7 #63 (2026-09-08) で空振り 1 本により Tier B が恒久解除され、モデルが
+    self-test 修正ループへ復帰した ([tier-b-release-requires-evaluable-backtest])。
+    directive「実データで trade が出れば plugin は正しい」と一致させる。
+
+    `metrics.evaluable` は使わない — それは gate 用の「trades ≥ EVALUABLE_MIN_TRADES
+    (30)」で、Tier B の問い「plugin は実データで動くか」とは別 (codex 是正束
+    レビュー Important: evaluable を使うと 1〜29 trade の正しい低頻度戦略が候補
+    あたり backtest 予算 6 を使い切るまで self-test に戻れない)。
     正しい plugin でも期間次第で trades=0 になりうるが、その場合の次の一手は
-    パラメータ/期間を変えた backtest (予算 6) であってテストの修正ではない。"""
+    パラメータを変えた backtest であってテストの修正ではない。"""
     if not (isinstance(result, dict) and "error" not in result):
         return False
     metrics = result.get("metrics")
-    return isinstance(metrics, dict) and metrics.get("evaluable") is True
+    if not isinstance(metrics, dict):
+        return False
+    trades = metrics.get("trades")
+    return isinstance(trades, int) and not isinstance(trades, bool) and trades > 0
 
 
 def build_improve_rpc_tooldefs(

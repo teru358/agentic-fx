@@ -777,7 +777,7 @@ def test_unrun_self_test_does_not_reset_the_terminal_refusal_streak(
 def test_tier_b_stays_armed_after_unevaluable_backtest(tmp_path):
     """run7 欠陥 A の E2E (staging tool 実物): 空振り backtest (evaluable=false) の後も
     strategy 候補の 2 回目 self-test は run_backtest_required_first で拒否される。
-    evaluable な backtest の後は許可される。"""
+    trade が 1 本でも出た backtest の後は許可される (evaluable=False でも)。"""
     from agentic_fx.tools.improve_rpc_tools import build_improve_rpc_tooldefs
     from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
     staging = tmp_path / "staging"; staging.mkdir()
@@ -789,7 +789,7 @@ def test_tier_b_stays_armed_after_unevaluable_backtest(tmp_path):
     st = {t.name: t for t in build_improve_staging_tooldefs(
         staging_dir=staging, source_snapshot_dir=source, counters=counters, budget=budget)}
     replies = [{"metrics": {"trades": 0, "evaluable": False}},
-               {"metrics": {"trades": 4, "evaluable": True}}]
+               {"metrics": {"trades": 4, "evaluable": False}}]   # 4 本 = 低頻度でも実行された
     rpc = {t.name: t for t in build_improve_rpc_tooldefs(
         ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0}),
         staging_dir=staging, run_backtest_handler=lambda args: replies.pop(0),
