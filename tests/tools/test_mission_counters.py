@@ -100,7 +100,7 @@ def test_max_calls_sets_pending_and_summary_is_single_line():
         counters.record_call()
     assert counters.abort_pending
     assert counters.abort_trigger == "max_tool_calls"
-    assert counters.summary() == "calls=5 refused=0 self_test=0 backtest=0"
+    assert counters.summary() == "calls=5 refused=0 errors=0 self_test=0 backtest=0"
 
 
 def test_run6_real_refusal_sequence_reaches_abort_threshold():
@@ -163,3 +163,41 @@ def test_max_tool_calls_aborts_exactly_at_threshold_not_before():
     counters.record_call()
     assert counters.abort_pending
     assert counters.abort_trigger == "max_tool_calls"
+
+
+
+# --- run8 是正 [tool-exception-bypasses-refusal-streak] (2026-09-09) ---
+
+def test_tool_error_streak_trips_abort_and_resets_only_on_same_tool_success():
+    """run8 欠陥 B: 壊れた tool の連打 (例外応答 293 回) が refusal streak を素通りし
+    max_tool_calls (300) まで止まらなかった。tool 名単位の streak で `max_refusal_streak`
+    回目に pending (`tool_errors:<name>`)。同 tool の成功で 0、別 tool の成功では戻らない。"""
+    from agentic_fx.config import ImproveToolBudgetSettings
+    c = MissionToolCounters(budget=ImproveToolBudgetSettings(max_refusal_streak=3))
+    c.record_tool_result("analyze_corr", False)
+    c.record_tool_result("analyze_corr", False)
+    c.record_tool_result("list_staging", True)       # 別 tool の成功は無関係
+    assert c.abort_pending is False
+    c.record_tool_result("analyze_corr", True)       # 同 tool の成功でリセット
+    c.record_tool_result("analyze_corr", False)
+    c.record_tool_result("analyze_corr", False)
+    assert c.abort_pending is False
+    c.record_tool_result("analyze_corr", False)
+    assert c.abort_pending is True
+    assert c.abort_trigger == "tool_errors:analyze_corr"
+    assert c.errors == 5
+    assert "errors=5" in c.summary()
+
+
+
+def test_other_tool_success_between_failures_does_not_reset_tool_error_streak():
+    """G6 pin: 壊れた tool の失敗の間に別 tool が成功しても streak は続く
+    (run8 の実形: analyze_corr 失敗の合間に list_staging 等は成功していた)。"""
+    from agentic_fx.config import ImproveToolBudgetSettings
+    c = MissionToolCounters(budget=ImproveToolBudgetSettings(max_refusal_streak=3))
+    c.record_tool_result("analyze_corr", False)
+    c.record_tool_result("analyze_corr", False)
+    c.record_tool_result("list_staging", True)
+    c.record_tool_result("analyze_corr", False)
+    assert c.abort_pending is True
+    assert c.abort_trigger == "tool_errors:analyze_corr"

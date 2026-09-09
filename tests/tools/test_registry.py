@@ -229,3 +229,37 @@ def test_T8_mutating_openai_tools_result_does_not_affect_execute():
     assert "error" not in parsed
     assert "result" in parsed
     assert parsed["result"] == 5
+
+
+
+# --- run8 是正 [tool-exception-bypasses-refusal-streak] (2026-09-09) ---
+
+def _reg_with_result_hook():
+    seen = []
+    reg = ToolRegistry(on_result=lambda name, ok: seen.append((name, ok)))
+    reg.register(ToolDef("boom", "", {"type": "object", "properties": {"x": {"type": "integer"}},
+                                      "required": ["x"]}, lambda x: 1 / 0))
+    reg.register(ToolDef("soft", "", {"type": "object"}, lambda: {"error": "loader_rejected"}))
+    reg.register(ToolDef("ok", "", {"type": "object"}, lambda: {"ok": True}))
+    return reg, seen
+
+
+def test_on_result_reports_false_for_exception_invalid_args_and_error_dict():
+    """run8 欠陥 B: 例外 / 引数不正 / `{"error": …}` 応答は全て ok=False として
+    フックに届く (壊れた tool の反復を refusal streak が数えるための観測点)。"""
+    reg, seen = _reg_with_result_hook()
+    allowed = ["boom", "soft", "ok"]
+    reg.execute("boom", {"x": 1}, allowed)          # 例外
+    reg.execute("boom", {"x": "no"}, allowed)       # 引数不正
+    reg.execute("soft", {}, allowed)                # error dict
+    reg.execute("ok", {}, allowed)                  # 正常
+    assert seen == [("boom", False), ("boom", False), ("soft", False), ("ok", True)]
+
+
+def test_on_result_not_called_for_disallowed_tool_and_default_is_noop():
+    reg, seen = _reg_with_result_hook()
+    reg.execute("boom", {"x": 1}, ["ok"])           # not allowed → フックなし
+    assert seen == []
+    plain = ToolRegistry()
+    plain.register(ToolDef("ok", "", {"type": "object"}, lambda: {"ok": True}))
+    assert '"ok": true' in plain.execute("ok", {}, ["ok"])

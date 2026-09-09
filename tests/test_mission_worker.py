@@ -1135,3 +1135,57 @@ def test_local_backend_end_to_end_abort_without_hand_made_state(monkeypatch, tmp
     assert counters.terminal_refusal_streak == 2  # 2 回目の拒否で閾値 → 3 回目は未実行
     assert counters.abort_event.is_set()
     assert len(calls) == 1                      # 1 turn で終わる
+
+
+
+# --- run8 是正 [analyze-corr-rpc-double-unwrap] (2026-09-09) ---
+
+def test_every_improve_rpc_crosses_child_frame_and_parent_wrapper(monkeypatch, tmp_path):
+    """run8 欠陥 A: 子 `analyze_corr(request)` は request の中身を RPC に送り、親 wrapper
+    `build_ledger_wrapped_rpc_handlers` は `func(**args)` で再 splat するため、本番で
+    100% TypeError だった (run_backtest はフラット dict で偶然一致)。契約 = `tool_rpc`
+    フレームの `args` は親 tooldef の**キーワード引数 dict**。子 registry.execute →
+    子 rpc lambda (フレーム捕捉) → 親 wrapper → 親 raw handler を **全 RPC 種別**で通す。"""
+    import json as _json
+
+    import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+    from agentic_fx.tools.improve_rpc_tools import build_ledger_wrapped_rpc_handlers
+
+    frames = []
+
+    def fake_rpc_client(name, args):
+        frames.append((name, args))
+        return {"metrics": {"trades": 1, "evaluable": False}} if name == "run_backtest" else {"rows": []}
+
+    monkeypatch.setattr(mw_mod, "_make_rpc_client", lambda *a, **k: fake_rpc_client)
+    staging = tmp_path / "staging"; staging.mkdir(); (tmp_path / "source").mkdir()
+    settings = _settings_with_improve_backend("local")
+    registry, _ = mw_mod._build_improve_registry(
+        settings=settings, workdir=tmp_path, staging_dir=staging,
+        source_snapshot_dir=tmp_path / "source", rpc_client=fake_rpc_client)
+    names = list(registry.names())
+    request = {"pairs": ["USDJPY", "EURUSD"], "window": 90}
+    out = _json.loads(registry.execute("analyze_corr", {"request": request}, names))
+    assert "error" not in out, out
+    # run_backtest も子 registry 経由で (loader が通る strategy 候補を staging に置く)
+    import shutil
+    from pathlib import Path as _P
+    shutil.copytree(_P(__file__).resolve().parents[1] / "docs/examples/plugins/sma_cross",
+                    staging / "cand")
+    out = _json.loads(registry.execute("run_backtest", {"name": "cand", "pair": "USDJPY"}, names))
+    assert "error" not in out, out
+    # 親側: raw handler を spy に差し替えた wrapper にフレームをそのまま渡す
+    received = {}
+    parent = build_ledger_wrapped_rpc_handlers(
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 1, "analyze_corr": 1}),
+        rpc_handlers={"run_backtest": lambda a: received.setdefault("run_backtest", a) or {"metrics": {}},
+                      "analyze_corr": lambda a: received.setdefault("analyze_corr", a) or {"rows": []}},
+        staging_dir=None)
+    rpc_names = {n for n, _ in frames}
+    assert rpc_names == set(parent) == {"run_backtest", "analyze_corr"}, \
+        "RPC 種別を増やしたらこのテストに足す (全種別を子→親で通す)"
+    for name, args in frames:
+        parent[name](args)                      # ここが本番で TypeError だった
+    assert received["analyze_corr"] == request
+    assert received["run_backtest"] == {"name": "cand", "pair": "USDJPY"}

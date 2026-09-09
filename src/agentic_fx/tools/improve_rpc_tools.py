@@ -177,7 +177,12 @@ def build_ledger_wrapped_rpc_handlers(
     通す — 生 handler を直接 `WorkerRunner(rpc_handlers=...)` に渡すと
     親 ledger は永遠に空で `_persist_ledger_rows` が何も書かない
     ([ledger-never-populated-in-production]、/code-review 2026-09-04)。
-    子側の wrapper (mission_worker、使い捨て ledger) は二重防御として残す。"""
+    子側の wrapper (mission_worker、使い捨て ledger) は二重防御として残す。
+
+    **RPC 契約** (run8 是正、2026-09-09): 引数 `args` は tooldef 関数の
+    **キーワード引数 dict** で、ここで `func(**args)` に展開する。子の RPC
+    handler (`mission_worker._build_improve_registry`) はこの形で送る責務を持つ
+    (`run_backtest` → `{"name", "pair"}`、`analyze_corr` → `{"request": …}`)。"""
     tools = build_improve_rpc_tooldefs(
         ledger=ledger,
         run_backtest_handler=rpc_handlers["run_backtest"],

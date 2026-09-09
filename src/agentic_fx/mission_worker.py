@@ -489,8 +489,16 @@ def _build_improve_registry(*, settings: Any, workdir: Path, staging_dir: Path,
         "improve", None, settings, None, None, activity=None,
         staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
         ledger=child_ledger,
+        # RPC 契約 (run8 是正 [analyze-corr-rpc-double-unwrap]、2026-09-09): `tool_rpc`
+        # フレームの `args` は**親 tooldef のキーワード引数 dict** — 親の
+        # `build_ledger_wrapped_rpc_handlers` が `func(**args)` で展開する。
+        # run_backtest の子 handler は既に {"name","pair"} (= kwargs) を受けるが、
+        # analyze_corr の子 handler は `request` の**中身**を受けるので、ここで
+        # `{"request": …}` に包む。包み忘れは本番で 100% TypeError になる
+        # (run8 #65: 293/293 失敗)。全 RPC 種別の契約テスト:
+        # tests/test_mission_worker.py::test_every_improve_rpc_crosses_child_frame_and_parent_wrapper
         rpc_handlers={"run_backtest": lambda a: rpc_client("run_backtest", a),
-                     "analyze_corr": lambda a: rpc_client("analyze_corr", a)},
+                     "analyze_corr": lambda a: rpc_client("analyze_corr", {"request": a})},
         counters=counters)
     return registry, counters
 

@@ -401,3 +401,29 @@ def test_improve_registry_shares_one_counters_across_staging_and_rpc(tmp_path):
     # **2 回目** が通ることが「rpc 側の成功 backtest を staging 側が見ている」
     # 唯一の公開挙動 (counters が別インスタンスなら run_backtest_required_first)。
     assert "error" not in call("run_plugin_tests", {"name": "candidate"})
+
+
+
+def test_improve_registry_reports_tool_errors_to_shared_counters(tmp_path):
+    """G7 pin (run8 是正): improve 分岐の registry は `on_result=counters.record_tool_result`
+    を配線する — 引数不正の呼び出しが counters.errors に載る。配線を落とすと
+    壊れた tool の反復を誰も数えない (run8 #65 の再現)。"""
+    from agentic_fx.config import ImproveToolBudgetSettings
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+    from agentic_fx.tools.mission_counters import MissionToolCounters
+    from agentic_fx.tools.mission_registry import build_mission_registry
+    staging = tmp_path / "staging"; staging.mkdir()
+    source = tmp_path / "source"; source.mkdir()
+    counters = MissionToolCounters(budget=ImproveToolBudgetSettings(max_refusal_streak=2))
+    registry = build_mission_registry(
+        "improve", None, SETTINGS, None, None, activity=None,
+        staging_dir=staging, source_snapshot_dir=source,
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 1, "analyze_corr": 1}),
+        rpc_handlers={"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}},
+        counters=counters)
+    names = list(registry.names())
+    registry.execute("analyze_corr", {"request": "not-an-object"}, names)   # 引数不正
+    registry.execute("analyze_corr", {"request": "not-an-object"}, names)
+    assert counters.errors == 2
+    assert counters.abort_pending is True
+    assert counters.abort_trigger == "tool_errors:analyze_corr"

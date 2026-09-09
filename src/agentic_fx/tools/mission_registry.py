@@ -95,7 +95,8 @@ def build_mission_registry(
                 "rpc_handlers が必須です")
         counters = counters or MissionToolCounters(
             budget=settings.improve.tool_budget)
-        registry = ToolRegistry(on_execute=counters.record_call)
+        registry = ToolRegistry(on_execute=counters.record_call,
+                                on_result=counters.record_tool_result)
         budget = settings.improve.tool_budget
         registry.register_all(research_tools.build_research_tooldefs(
             settings=settings.improve.research))

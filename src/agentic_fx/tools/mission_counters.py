@@ -21,6 +21,7 @@ class MissionToolCounters:
         self.terminal_refusal_streak = 0
         self.recoverable_refusal_streak = defaultdict(int)
         self.refusals = 0
+        self.errors = 0   # tool の例外 / 引数不正 / error 応答 (run8 是正)
         self.total_calls = 0
         self.writes = 0
         self.self_test_runs = 0
@@ -72,6 +73,24 @@ class MissionToolCounters:
                                   getattr(self._budget, "max_refusal_streak", None),
                                   f"recoverable_refusals:{name}")
 
+    def record_tool_result(self, name: str, ok: bool) -> None:
+        """registry の `on_result` フック (run8 是正 [tool-exception-bypasses-
+        refusal-streak])。tool 名単位の recoverable streak: 同じ tool の失敗が
+        `max_refusal_streak` 回続いたら abort (`tool_errors:<name>`)、同じ tool の
+        成功で 0 に戻る。別 tool の成功では戻らない (壊れた tool と無関係)。
+        予算拒否は tool 関数が error dict を返すので terminal streak と二重に
+        数えるが、どちらかが先に閾値に達するだけで無害。"""
+        with self._lock:
+            key = (name, "tool_error")
+            if ok:
+                self.recoverable_refusal_streak[key] = 0
+                return
+            self.errors += 1
+            self.recoverable_refusal_streak[key] += 1
+            self._check_threshold(self.recoverable_refusal_streak[key],
+                                  getattr(self._budget, "max_refusal_streak", None),
+                                  f"tool_errors:{name}")
+
     def record_progress(
             self, name: str,
             kind: Literal["backtest_ok", "self_test_ran"]) -> None:
@@ -84,7 +103,7 @@ class MissionToolCounters:
     def summary(self) -> str:
         with self._lock:
             return (f"calls={self.total_calls} refused={self.refusals} "
-                    f"self_test={self.self_test_runs} "
+                    f"errors={self.errors} self_test={self.self_test_runs} "
                     f"backtest={sum(self.backtest_calls.values())}")
 
     def reserve_write(self, limit: int) -> bool:
