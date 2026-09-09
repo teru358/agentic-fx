@@ -215,3 +215,19 @@ def test_different_business_errors_of_same_tool_do_not_merge_into_one_streak():
     assert c.abort_pending is False
     c.record_tool_result("run_backtest", False, "no_history_for_symbol")
     assert c.abort_pending is True and c.abort_trigger == "tool_errors:run_backtest"
+
+
+# --- ローカルレビュー pin Y1 (2026-09-09、tmp/review-20260909-r8/verified-local.md) ---
+def test_error_messages_differing_only_past_60_chars_share_one_streak():
+    """L6 派生 pin (ローカル 1 周目 2026-09-09): 失敗種別キーの 60 字切り詰めが未検証だった
+    (`[:60]` を外す変異が全スイート緑で生存)。切り詰めが無いと、末尾だけ変わる長い error 文
+    (`loader_rejected: invalid YAML (…, line N, column M)` — 先頭 60 字は同一、行番号だけ違う) が
+    毎回別 streak になり、閾値に永久に届かない —
+    run8 #65 (壊れた tool を 293 回) の再発。対の「切り詰めすぎて別種別を合算しない」側は
+    test_different_business_errors_of_same_tool_do_not_merge_into_one_streak が押さえている。"""
+    c = MissionToolCounters(budget=ImproveToolBudgetSettings(max_refusal_streak=3))
+    base = "loader_rejected: " + "x" * 50          # 67 字 — 先頭 60 字は 3 回とも同一
+    for tail in ("/tmp/run-a", "/tmp/run-b", "/tmp/run-c"):
+        c.record_tool_result("run_backtest", False, base + tail)
+    assert c.abort_pending is True
+    assert c.abort_trigger == "tool_errors:run_backtest"
