@@ -73,19 +73,23 @@ class MissionToolCounters:
                                   getattr(self._budget, "max_refusal_streak", None),
                                   f"recoverable_refusals:{name}")
 
-    def record_tool_result(self, name: str, ok: bool) -> None:
+    def record_tool_result(self, name: str, ok: bool, error: str | None = None) -> None:
         """registry の `on_result` フック (run8 是正 [tool-exception-bypasses-
-        refusal-streak])。tool 名単位の recoverable streak: 同じ tool の失敗が
-        `max_refusal_streak` 回続いたら abort (`tool_errors:<name>`)、同じ tool の
-        成功で 0 に戻る。別 tool の成功では戻らない (壊れた tool と無関係)。
-        予算拒否は tool 関数が error dict を返すので terminal streak と二重に
-        数えるが、どちらかが先に閾値に達するだけで無害。"""
+        refusal-streak])。streak のキーは (tool 名, 失敗種別): `exception` /
+        `invalid_args` はそれぞれ集約、tool が返した error 文字列は先頭 60 字で
+        区別する (codex Important 1: run_backtest の no_history / loader_rejected /
+        backtest_failed のような入力依存の業務エラーを 1 本に合算して「壊れた
+        tool」扱いしない)。同じ (tool, 種別) が `max_refusal_streak` 回続いたら
+        abort (`tool_errors:<name>`)。同じ tool の成功でその tool の全種別を 0 に
+        戻す。別 tool の成功では戻らない。"""
         with self._lock:
-            key = (name, "tool_error")
             if ok:
-                self.recoverable_refusal_streak[key] = 0
+                for key in [k for k in self.recoverable_refusal_streak
+                            if k[0] == name and k[1].startswith("tool_error:")]:
+                    self.recoverable_refusal_streak[key] = 0
                 return
             self.errors += 1
+            key = (name, "tool_error:" + (error or "exception")[:60])
             self.recoverable_refusal_streak[key] += 1
             self._check_threshold(self.recoverable_refusal_streak[key],
                                   getattr(self._budget, "max_refusal_streak", None),

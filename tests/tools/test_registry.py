@@ -236,7 +236,7 @@ def test_T8_mutating_openai_tools_result_does_not_affect_execute():
 
 def _reg_with_result_hook():
     seen = []
-    reg = ToolRegistry(on_result=lambda name, ok: seen.append((name, ok)))
+    reg = ToolRegistry(on_result=lambda name, ok, err: seen.append((name, ok, err)))
     reg.register(ToolDef("boom", "", {"type": "object", "properties": {"x": {"type": "integer"}},
                                       "required": ["x"]}, lambda x: 1 / 0))
     reg.register(ToolDef("soft", "", {"type": "object"}, lambda: {"error": "loader_rejected"}))
@@ -253,7 +253,8 @@ def test_on_result_reports_false_for_exception_invalid_args_and_error_dict():
     reg.execute("boom", {"x": "no"}, allowed)       # 引数不正
     reg.execute("soft", {}, allowed)                # error dict
     reg.execute("ok", {}, allowed)                  # 正常
-    assert seen == [("boom", False), ("boom", False), ("soft", False), ("ok", True)]
+    assert seen == [("boom", False, "exception"), ("boom", False, "invalid_args"),
+                    ("soft", False, "loader_rejected"), ("ok", True, None)]
 
 
 def test_on_result_not_called_for_disallowed_tool_and_default_is_noop():
@@ -263,3 +264,24 @@ def test_on_result_not_called_for_disallowed_tool_and_default_is_noop():
     plain = ToolRegistry()
     plain.register(ToolDef("ok", "", {"type": "object"}, lambda: {"ok": True}))
     assert '"ok": true' in plain.execute("ok", {}, ["ok"])
+
+
+
+def test_result_hook_exception_does_not_break_execute():
+    """codex Important 2: フックの例外で execute が落ちると dispatcher が応答を返せない。
+    観測フックは握る。"""
+    def bad_hook(*_a):
+        raise RuntimeError("hook broke")
+    reg = ToolRegistry(on_execute=lambda: 1 / 0, on_result=bad_hook)
+    reg.register(ToolDef("ok", "", {"type": "object"}, lambda: {"ok": True}))
+    assert '"ok": true' in reg.execute("ok", {}, ["ok"])
+
+
+def test_unserializable_result_is_reported_as_failure_not_success():
+    """codex Minor 4: 直列化できない戻り値は届かないので成功として通知しない。"""
+    seen = []
+    reg = ToolRegistry(on_result=lambda n, ok, e: seen.append((ok, e)))
+    reg.register(ToolDef("cyc", "", {"type": "object"}, lambda: {(1, 2): "tuple key"}))
+    out = reg.execute("cyc", {}, ["cyc"])
+    assert "unserializable" in out or "error" in out
+    assert seen == [(False, "exception")]

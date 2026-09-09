@@ -201,3 +201,17 @@ def test_other_tool_success_between_failures_does_not_reset_tool_error_streak():
     c.record_tool_result("analyze_corr", False)
     assert c.abort_pending is True
     assert c.abort_trigger == "tool_errors:analyze_corr"
+
+
+
+def test_different_business_errors_of_same_tool_do_not_merge_into_one_streak():
+    """codex Important 1: run_backtest の no_history / loader_rejected / backtest_failed
+    は別 streak。同一種別が閾値まで続いたときだけ abort。"""
+    from agentic_fx.config import ImproveToolBudgetSettings
+    c = MissionToolCounters(budget=ImproveToolBudgetSettings(max_refusal_streak=3))
+    for err in ("no_history_for_symbol", "loader_rejected: x", "backtest_failed",
+                "no_history_for_symbol", "loader_rejected: x"):
+        c.record_tool_result("run_backtest", False, err)
+    assert c.abort_pending is False
+    c.record_tool_result("run_backtest", False, "no_history_for_symbol")
+    assert c.abort_pending is True and c.abort_trigger == "tool_errors:run_backtest"

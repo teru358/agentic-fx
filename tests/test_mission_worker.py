@@ -1182,10 +1182,71 @@ def test_every_improve_rpc_crosses_child_frame_and_parent_wrapper(monkeypatch, t
         rpc_handlers={"run_backtest": lambda a: received.setdefault("run_backtest", a) or {"metrics": {}},
                       "analyze_corr": lambda a: received.setdefault("analyze_corr", a) or {"rows": []}},
         staging_dir=None)
+    # tripwire (codex Minor 2): 親 handler の集合 = 子 registry が公開する RPC tool の
+    # 集合 = このテストが通したフレームの集合。どれかに追加して他を忘れると落ちる。
     rpc_names = {n for n, _ in frames}
-    assert rpc_names == set(parent) == {"run_backtest", "analyze_corr"}, \
+    child_rpc_tools = {n for n in names if n in parent}
+    assert rpc_names == set(parent) == child_rpc_tools == {"run_backtest", "analyze_corr"}, \
         "RPC 種別を増やしたらこのテストに足す (全種別を子→親で通す)"
     for name, args in frames:
         parent[name](args)                      # ここが本番で TypeError だった
     assert received["analyze_corr"] == request
     assert received["run_backtest"] == {"name": "cand", "pair": "USDJPY"}
+
+
+def test_local_backend_end_to_end_abort_on_broken_tool_exceptions(monkeypatch, tmp_path):
+    """codex Minor 3 (run8 是正): 壊れた tool (例外) の連打が **実配線** で abort に至る —
+    実 counters → 実 registry (on_result) → 実 factory (local) → 実 LocalRunner (HTTP のみ Mock)
+    → after_tool_call → event → `failed` + `tool_budget_abort:tool_errors:<name>`。手で
+    中間状態を作らない。run8 #65 の実形 (analyze_corr 293 回) を max_refusal_streak=3 で再現。"""
+    import io
+    import json as _json
+
+    import httpx
+
+    import agentic_fx.mission_worker as mw_mod
+    import agentic_fx.runners.local_runner as lr
+    from agentic_fx.config import ImproveToolBudgetSettings
+    from agentic_fx.core.mission_protocol import SeqTracker
+    from agentic_fx.runners.base import Mission, is_tool_budget_abort
+
+    calls = []
+    msg = {"role": "assistant", "content": None, "tool_calls": [
+        {"id": f"c{n}", "type": "function",
+         "function": {"name": "analyze_corr",
+                      "arguments": _json.dumps({"request": {"pairs": ["USDJPY"]}})}}
+        for n in range(6)]}
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"choices": [{"message": msg}]})
+
+    real_init = lr.LocalRunner.__init__
+    monkeypatch.setattr(lr.LocalRunner, "__init__",
+                        lambda self, **kw: real_init(self, transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(mw_mod, "_bootstrap_improve_profile", lambda *a, **k: None, raising=False)
+
+    def broken_rpc_client(name, args):          # 親 RPC が毎回例外 (run8 の親側 TypeError 相当)
+        raise RuntimeError("simulated parent rpc failure")
+
+    monkeypatch.setattr(mw_mod, "_make_rpc_client", lambda *a, **k: broken_rpc_client)
+    staging_dir = tmp_path / "staging"; staging_dir.mkdir()
+    source_snapshot_dir = tmp_path / "source"; source_snapshot_dir.mkdir()
+    settings = _settings_with_improve_backend("local")
+    settings = settings.model_copy(update={"improve": settings.improve.model_copy(update={
+        "tool_budget": ImproveToolBudgetSettings(max_refusal_streak=3)})})
+    runner = mw_mod._run_improve_mission(
+        settings=settings, workdir=tmp_path, staging_dir=str(staging_dir),
+        source_snapshot_dir=str(source_snapshot_dir),
+        protocol_out=io.BytesIO(), out_seq=SeqTracker(), in_seq=SeqTracker())
+    try:
+        result = runner.run(Mission(prompt="p", tools=["analyze_corr"],
+                                    output_schema={"type": "object"}, max_turns=5, timeout_sec=30))
+    finally:
+        runner._afx_mcp_dispatcher.close()
+    assert result.status == "failed"
+    assert is_tool_budget_abort(result.reason)
+    assert "tool_errors:analyze_corr" in result.reason
+    counters = runner._afx_mission_counters
+    assert counters.errors == 3                 # 3 回目で pending → フックで event → 4 回目は未実行
+    assert len(calls) == 1
