@@ -1,4 +1,4 @@
-"""SQLite 接続 + 19 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
+"""SQLite 接続 + 21 テーブルスキーマ (`_SCHEMA` が作る分。移行専用の旧
 `ohlcv` は含まない) — 設計書 §12。"""
 from __future__ import annotations
 
@@ -291,12 +291,29 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
   issued_by TEXT NOT NULL CHECK(issued_by IN ('harness','human_cli')),
   metrics_json TEXT NOT NULL, settings_hash TEXT NOT NULL,
   core_commit TEXT NOT NULL, initial_balance REAL NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  mission_id INTEGER,
+  variant TEXT NOT NULL DEFAULT 'candidate'
+    CHECK(variant IN ('candidate','baseline','no_strategy')),
+  ref_plugin_ref TEXT, ref_content_hash TEXT,
+  mission_outcome TEXT
 );
 CREATE TABLE IF NOT EXISTS analysis_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   params_json TEXT NOT NULL, trial_count INTEGER NOT NULL,
   source TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS candidate_archives (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mission_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  artifact_hash TEXT NOT NULL,
+  archive_path TEXT,
+  pair TEXT NOT NULL,
+  metrics_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(mission_id, artifact_hash)
 );
 """ + _SIGNALS_V2_DDL + """
 -- プラン 9 束 C (codex 指摘の裏取り): prune_cache (store/ohlcv.py) の
@@ -316,6 +333,7 @@ TABLE_NAMES = frozenset({
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
     "alert_state", "improve_waves", "improve_wave_slots", "plugin_switch_journal",
+    "candidate_archives",
 })
 
 
@@ -380,6 +398,12 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str,
     cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+def _migrate_backtest_runs_outcome(conn: sqlite3.Connection) -> None:
+    """旧 backtest_runs に Mission の終端結果列を冪等に追加する。"""
+    _ensure_column(
+        conn, "backtest_runs", "mission_outcome", "mission_outcome TEXT")
 
 
 FLOAT_TOL = 1e-9
@@ -1293,6 +1317,9 @@ def init_db(conn: sqlite3.Connection) -> None:
         "CHECK(variant IN ('candidate','baseline','no_strategy'))")
     _ensure_column(conn, "backtest_runs", "ref_plugin_ref", "ref_plugin_ref TEXT")
     _ensure_column(conn, "backtest_runs", "ref_content_hash", "ref_content_hash TEXT")
+    _migrate_backtest_runs_outcome(conn)
+    # candidate_archives は _SCHEMA (CREATE TABLE IF NOT EXISTS) だけで作る —
+    # 新規表なので migration 経路は不要 (旧 DB でも _SCHEMA が先に流れる)。
     _migrate_legacy_plugin_approval_payloads(conn)   # §5.5 (8-C 節)
     # --- プラン 10 Task 8 ここまで ---
     # round2 #8 是正 (2026-08-29、verified-round2.md #8): 重複検出を Python

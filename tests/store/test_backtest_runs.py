@@ -624,6 +624,60 @@ def test_save_harness_run_mission_id_defaults_to_null(tmp_path):
     assert row["mission_id"] is None
 
 
+def test_save_harness_run_persists_mission_outcome_and_defaults_to_null(tmp_path):
+    conn = _conn(tmp_path)
+    kw = dict(scope="in_sample", plugin_ref="p", content_hash="h",
+              kind="strategy", pair="USDJPY", timeframe="1h", source="test",
+              base_interval="1m", period=(H, H), metrics={"pf": 1.0},
+              settings_hash="s", core_commit="c", initial_balance=1.0, now=H)
+    default_id = backtest_runs.save_harness_run(conn, **kw)
+    failed_id = backtest_runs.save_harness_run(
+        conn, mission_outcome="failed", **kw)
+    rows = conn.execute(
+        "SELECT id, mission_outcome FROM backtest_runs WHERE id IN (?,?) ORDER BY id",
+        (default_id, failed_id)).fetchall()
+    assert [(r["id"], r["mission_outcome"]) for r in rows] == [
+        (default_id, None), (failed_id, "failed")]
+
+
+def test_in_sample_view_includes_mission_identity_and_outcome(tmp_path):
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="p", content_hash="h",
+        kind="strategy", pair="USDJPY", timeframe="1h", source="test",
+        base_interval="1m", period=(H, H), metrics={}, settings_hash="s",
+        core_commit="c", initial_balance=1.0, now=H, mission_id=7,
+        mission_outcome="gate_failed")
+    row = backtest_runs.in_sample_view(conn)[0]
+    assert row["mission_id"] == 7
+    assert row["mission_outcome"] == "gate_failed"
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "expected"),
+    [
+        ([(None, 1.1)], {"pf": 1.1}),
+        ([("approval", 1.2)], {"pf": 1.2}),
+        ([("failed", 9.9)], None),
+        ([(None, 1.1), ("failed", 9.9)], {"pf": 1.1}),
+        ([("approval", 1.2), ("failed", 9.9)], {"pf": 1.2}),
+    ],
+)
+def test_latest_in_sample_metrics_only_uses_live_eligible_outcomes(
+        tmp_path, outcomes, expected):
+    conn = _conn(tmp_path)
+    kw = dict(scope="in_sample", plugin_ref="p", content_hash="same",
+              kind="strategy", pair="USDJPY", timeframe="1h", source="test",
+              base_interval="1m", period=(H, H), settings_hash="s",
+              core_commit="c", initial_balance=1.0, now=H)
+    for outcome, pf in outcomes:
+        backtest_runs.save_harness_run(
+            conn, metrics={"pf": pf}, mission_outcome=outcome, **kw)
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "same", pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m") == expected
+
+
 def test_save_harness_run_params_default_is_not_shared_mutable(tmp_path):
     """M1 (codex 段階2/3 是正 1周目 Minor): `params: dict = {}` の mutable
     default を排す。既定 (params 未指定) の複数保存間で、内部で使う辞書が

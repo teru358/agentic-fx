@@ -54,8 +54,9 @@ def _filter_metrics(raw_metrics: dict) -> dict:
             if k in METRIC_KEYS and isinstance(v, _SCALAR_TYPES)}
 
 _VIEW_COLUMNS = (
-    "id, plugin_ref, content_hash, kind, pair, timeframe, source, base_interval, scope, "
-    "issued_by, metrics_json, settings_hash, core_commit, initial_balance"
+    "id, plugin_ref, content_hash, kind, pair, timeframe, source, "
+    "base_interval, scope, issued_by, metrics_json, settings_hash, "
+    "core_commit, initial_balance, mission_id, mission_outcome"
 )
 # F2 (最終レビュー codex I1): created_at をここに含めない。run_in_sample は
 # now_norm (分格子切り捨て済み) を created_at として保存するため、改善
@@ -85,6 +86,7 @@ def _insert(conn: sqlite3.Connection, *, scope: str, issued_by: str,
             initial_balance: float, now: datetime, variant: str = "candidate",
             ref_plugin_ref: str | None = None, ref_content_hash: str | None = None,
             mission_id: int | None = None, params: dict | None = None,
+            mission_outcome: str | None = None,
             commit: bool = True) -> int:
     params = dict(params or {})
     start, end = period
@@ -102,12 +104,13 @@ def _insert(conn: sqlite3.Connection, *, scope: str, issued_by: str,
         "INSERT INTO backtest_runs (plugin_ref, content_hash, kind, pair, "
         "timeframe, source, base_interval, params_json, period_start, period_end, scope, issued_by, "
         "metrics_json, settings_hash, core_commit, initial_balance, "
-        "created_at, variant, ref_plugin_ref, ref_content_hash, mission_id) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "created_at, variant, ref_plugin_ref, ref_content_hash, mission_id, "
+        "mission_outcome) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (plugin_ref, content_hash, kind, pair, timeframe, source, base_interval,
          json.dumps(params, sort_keys=True), start_utc.isoformat(), end_utc.isoformat(),
          scope, issued_by, metrics_json, settings_hash, core_commit, initial_balance,
-         now_utc.isoformat(), variant, ref_plugin_ref, ref_content_hash, mission_id))
+         now_utc.isoformat(), variant, ref_plugin_ref, ref_content_hash, mission_id,
+         mission_outcome))
     if commit:
         conn.commit()
     return cur.lastrowid
@@ -122,6 +125,7 @@ def save_harness_run(conn: sqlite3.Connection, *, scope: str, plugin_ref: str,
                       ref_plugin_ref: str | None = None,
                       ref_content_hash: str | None = None,
                       mission_id: int | None = None, params: dict | None = None,
+                      mission_outcome: str | None = None,
                       commit: bool = True) -> int:
     """ハーネス発行 (issued_by='harness' 固定)。scope は in_sample/holdout_gate のみ。
 
@@ -140,7 +144,8 @@ def save_harness_run(conn: sqlite3.Connection, *, scope: str, plugin_ref: str,
         settings_hash=settings_hash, core_commit=core_commit,
         initial_balance=initial_balance, now=now, variant=variant,
         ref_plugin_ref=ref_plugin_ref, ref_content_hash=ref_content_hash,
-        mission_id=mission_id, params=params, commit=commit)
+        mission_id=mission_id, params=params, mission_outcome=mission_outcome,
+        commit=commit)
 
 
 def save_human_run(conn: sqlite3.Connection, *, plugin_ref: str,
@@ -222,6 +227,7 @@ def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
     row = conn.execute(
         "SELECT metrics_json FROM backtest_runs WHERE scope='in_sample' "
         "AND issued_by='harness' AND content_hash=? AND pair=? "
+        "AND (mission_outcome IS NULL OR mission_outcome = 'approval') "
         "AND variant=? AND source=? AND base_interval=? "
         "ORDER BY id DESC LIMIT 1", (content_hash, pair, variant, source,
                                       base_interval)).fetchone()

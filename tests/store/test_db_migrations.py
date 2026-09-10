@@ -25,9 +25,7 @@ def test_ensure_column_migration_is_idempotent_for_mission_id(tmp_path):
     assert "mission_id" in cols
 
 
-def test_table_names_unchanged_after_mission_id_columns_added():
-    """T10-13 は既存テーブルへの列追加のみであり、新テーブルは追加しない
-    — TABLE_NAMES (現物 20 項目) が不変であることの pin。"""
+def test_table_names_include_candidate_archives():
     from agentic_fx.store.db import TABLE_NAMES
 
     assert TABLE_NAMES == frozenset({
@@ -37,6 +35,7 @@ def test_table_names_unchanged_after_mission_id_columns_added():
         "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
         "alert_state", "improve_waves", "improve_wave_slots",
         "plugin_switch_journal",
+        "candidate_archives",
     })
 
 
@@ -237,3 +236,94 @@ def test_backtest_runs_view_columns_include_base_interval(tmp_path):
     # 決定 (A6) — VIEW_COLUMNS に含めない。
     assert "params_json" not in _VIEW_COLUMNS
     assert "params" not in _VIEW_COLUMNS
+
+
+def test_backtest_runs_outcome_migration_preserves_rows_and_is_idempotent(tmp_path):
+    """旧 schema の既存行は NULL として残り、init_db の再実行も安全。"""
+    import sqlite3
+
+    from agentic_fx.store.db import connect, init_db
+
+    db_path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.execute("""
+        CREATE TABLE backtest_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          plugin_ref TEXT NOT NULL, content_hash TEXT NOT NULL,
+          kind TEXT NOT NULL, pair TEXT NOT NULL, timeframe TEXT NOT NULL,
+          source TEXT NOT NULL, base_interval TEXT NOT NULL DEFAULT '1m',
+          params_json TEXT NOT NULL DEFAULT '{}', period_start TEXT NOT NULL,
+          period_end TEXT NOT NULL, scope TEXT NOT NULL, issued_by TEXT NOT NULL,
+          metrics_json TEXT NOT NULL, settings_hash TEXT NOT NULL,
+          core_commit TEXT NOT NULL, initial_balance REAL NOT NULL,
+          created_at TEXT NOT NULL, variant TEXT NOT NULL DEFAULT 'candidate',
+          ref_plugin_ref TEXT, ref_content_hash TEXT, mission_id INTEGER
+        )
+    """)
+    legacy.execute(
+        "INSERT INTO backtest_runs (plugin_ref,content_hash,kind,pair,timeframe,"
+        "source,period_start,period_end,scope,issued_by,metrics_json,settings_hash,"
+        "core_commit,initial_balance,created_at) VALUES "
+        "('p','h','strategy','USDJPY','1h','test','a','b','in_sample','harness',"
+        "'{}','s','c',1,'now')")
+    legacy.commit()
+    legacy.close()
+
+    migrated = connect(db_path)
+    init_db(migrated)
+    init_db(migrated)
+    row = migrated.execute(
+        "SELECT mission_outcome FROM backtest_runs WHERE id=1").fetchone()
+    assert row["mission_outcome"] is None
+    assert migrated.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='candidate_archives'").fetchone() is not None
+    # 段 0 pin (2026-09-10): migration 経路で作った candidate_archives も
+    # (mission_id, artifact_hash) UNIQUE を持つ (fresh DDL と同じ来歴の冪等性)。
+    from agentic_fx.store import candidate_archives
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 10, tzinfo=timezone.utc)
+    kw = dict(mission_id=1, name="n", content_hash="c", artifact_hash="a",
+              archive_path=None, pair="USDJPY", metrics={}, now=now, commit=True)
+    first = candidate_archives.insert(migrated, **kw)
+    assert candidate_archives.insert(migrated, **kw) == first
+    assert len(candidate_archives.list_by_mission(migrated, 1)) == 1
+
+
+def test_fresh_and_migrated_backtest_runs_have_same_columns(tmp_path):
+    import sqlite3
+
+    from agentic_fx.store.db import connect, init_db
+
+    fresh = connect(tmp_path / "fresh.db")
+    init_db(fresh)
+    legacy_path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(legacy_path)
+    legacy.execute("""
+        CREATE TABLE backtest_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          plugin_ref TEXT NOT NULL, content_hash TEXT NOT NULL,
+          kind TEXT NOT NULL, pair TEXT NOT NULL, timeframe TEXT NOT NULL,
+          source TEXT NOT NULL, base_interval TEXT NOT NULL DEFAULT '1m',
+          params_json TEXT NOT NULL DEFAULT '{}', period_start TEXT NOT NULL,
+          period_end TEXT NOT NULL,
+          scope TEXT NOT NULL CHECK(scope IN ('in_sample','holdout_gate','human_custom')),
+          issued_by TEXT NOT NULL CHECK(issued_by IN ('harness','human_cli')),
+          metrics_json TEXT NOT NULL, settings_hash TEXT NOT NULL,
+          core_commit TEXT NOT NULL, initial_balance REAL NOT NULL,
+          created_at TEXT NOT NULL, mission_id INTEGER,
+          variant TEXT NOT NULL DEFAULT 'candidate'
+            CHECK(variant IN ('candidate','baseline','no_strategy')),
+          ref_plugin_ref TEXT, ref_content_hash TEXT
+        )
+    """)
+    legacy.commit()
+    legacy.close()
+    migrated = connect(legacy_path)
+    init_db(migrated)
+
+    def shape(conn):
+        return [(r["name"], r["type"], r["notnull"], r["dflt_value"], r["pk"])
+                for r in conn.execute("PRAGMA table_info(backtest_runs)")]
+
+    assert shape(migrated) == shape(fresh)
