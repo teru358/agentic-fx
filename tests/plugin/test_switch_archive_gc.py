@@ -86,6 +86,32 @@ def test_sweep_orphans_tmp_symlink_is_unlinked_not_followed(env):
 # ---------------------------------------------------------------------------
 
 
+def test_sweep_orphans_tmp_cleanup_failure_is_reported(env, monkeypatch):
+    """ローカル T4 1 周目 #L12 (2026-09-10): tmp 回収 (⑥) の失敗は
+    `sweep_archive_tmp_failed` activity に残す。`rmtree(ignore_errors=True)`
+    が全てを飲むため、この枝に到達するのは `_chmod_tree_writable` 由来の
+    `OSError` だけで、GC ⑦ の `rmtree_incomplete` (段 0 T4-7) とは別経路。
+    ログを落とすと tmp が残り続けても誰も気づけない。"""
+    tmp_path, plugins_dir, conn = env
+    tmp_dir = plugins_dir / "_archive" / "1" / ".tmp-abc-1234"
+    tmp_dir.mkdir(parents=True)
+    (tmp_dir / "plugin.py").write_bytes(b"x")
+    activity = ActivityLog(tmp_path / "activity.log")
+
+    def failing_chmod_tree(path):
+        raise OSError("simulated chmod failure")
+
+    monkeypatch.setattr(switch, "_chmod_tree_writable", failing_chmod_tree)
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW,
+                         activity=activity)
+
+    assert tmp_dir.exists()
+    log = (tmp_path / "activity.log").read_text()
+    assert "sweep_archive_tmp_failed" in log
+    assert str(tmp_dir) in log
+
+
 def test_sweep_orphans_reports_orphan_final_without_deleting(env):
     tmp_path, plugins_dir, conn = env
     activity = ActivityLog(tmp_path / "activity.log")

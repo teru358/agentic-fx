@@ -79,6 +79,25 @@ def test_best_candidate_tie_breaks_by_ascending_id():
     assert best_candidate(rows)["id"] == 2
 
 
+def test_best_candidate_treats_bool_metrics_as_non_numeric():
+    """ローカル T4 1 周目 #L1 (2026-09-10): `bool` は `int` の subclass。
+    `_is_numeric` の `not isinstance(value, bool)` を落とすと `True` が
+    `pf=1.0` / `trades=1` として順位に参加してしまう。契約 (ブリーフ 1) の
+    「None / 非数値は最下」に bool も含まれることを固定する。"""
+    rows = [_row(1, trades=10, pf=True), _row(2, trades=10, pf=0.01)]
+    assert best_candidate(rows)["id"] == 2
+
+    rows = [_row(1, trades=True), _row(2, trades=1)]
+    assert best_candidate(rows)["id"] == 2
+
+    rows = [_row(3, pf=1.0, max_drawdown=False),
+            _row(4, pf=1.0, max_drawdown=0.9)]
+    assert best_candidate(rows)["id"] == 4
+
+    label = _best_label(_row(1, pf=True, max_drawdown=False))
+    assert "pf=-" in label and "dd=-" in label
+
+
 def test_best_label_formats_pf_and_dd_to_three_decimals():
     row = _row(1, pf=1.23456, max_drawdown=0.04321,
                artifact_hash="0123456789abcdef", name="strat_x")
@@ -263,6 +282,46 @@ def test_finalize_gate_failed_appends_index_row(
     assert f"mission {mission_id}" in text
     assert "| gate_failed |" in text
     assert f"best=x@{artifact_hash[:8]}" in text
+    # ローカル T4 1 周目 #L4 (2026-09-10): 日付セルは `now.isoformat()`
+    # (ブリーフ「変更点」3 の `| <now ISO> |`)。`str(now)` に落とすと
+    # 空白区切りになり ISO 形式でなくなる。
+    date_cell = text.strip().splitlines()[-1].split("|")[1].strip()
+    assert date_cell == NOW.isoformat()
+    assert "T" in date_cell and " " not in date_cell
+
+
+def test_index_append_is_fsynced(
+        loop_min, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """ローカル T4 1 周目 #L6 (2026-09-10): INDEX.md の追記は
+    `flush` + `os.fsync` で永続化する (ブリーフ「変更点」3)。fsync を
+    落としてもテストが緑のままだったので、INDEX の fd に対して
+    実際に fsync が呼ばれることを固定する。"""
+    import os as _os
+
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    real_fsync = _os.fsync
+    synced: list[str] = []
+
+    def spy_fsync(fd):
+        try:
+            synced.append(_os.readlink(f"/proc/self/fd/{fd}"))
+        except OSError:  # pragma: no cover - /proc が無い環境
+            synced.append("")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(_os, "fsync", spy_fsync)
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id, reason="gate_failed:test",
+        now=NOW)
+
+    index_path = str(_index_path(loop_min))
+    assert index_path in synced, synced
 
 
 def test_finalize_loser_does_not_write_index_row_with_zero_candidates(
