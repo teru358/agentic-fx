@@ -1,8 +1,11 @@
-"""improve registry の RPC ツール — run_backtest / analyze_corr
-(設計書 §3.4)。親 RPC 経由 (WorkerRunner の tool_rpc フレーム) で実行される
-handler をラップし、台帳への record と遮断 7 のキー剥がしだけを行う。"""
+"""improve registry の RPC ツール — run_backtest / analyze_corr。
+
+子 tooldef は従来どおり子 ledger へ記録する。親 wrapper は公開／非公開 payload
+を分離し、受理期限を所有する WorkerRunner callback に記録を委ねる。
+"""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -42,6 +45,20 @@ _FORBIDDEN_KEYS = frozenset({
     # 集合を平坦に列挙するだけでは足りない — `_strip_forbidden` 自体を
     # 再帰化し、`in_sample_until` を禁止キーに加える。
     "in_sample_until"})
+
+
+@dataclass(frozen=True)
+class RpcOutcome:
+    public: dict
+    private: dict | None = None
+
+
+class _RpcToolResult(dict):
+    """dict 互換の公開応答に、親 dispatcher 専用 payload を添える。"""
+
+    def __init__(self, public: dict, *, save_kwargs: dict | None = None) -> None:
+        super().__init__(public)
+        self.save_kwargs = save_kwargs
 
 
 def _strip_forbidden(value: object) -> object:
@@ -135,7 +152,8 @@ def build_improve_rpc_tooldefs(
                       kind="run_backtest", params={"name": name, "pair": pair},
                       result_summary=ledger_result,
                       trial_count=result.get("trial_count", 1))
-        response = _strip_forbidden(result)
+        response = _RpcToolResult(
+            _strip_forbidden(result), save_kwargs=getattr(result, "save_kwargs", None))
         if counters is not None:
             response["remaining_budget"] = {
                 "backtests_for_candidate": max(
@@ -149,7 +167,8 @@ def build_improve_rpc_tooldefs(
                       kind="analyze_corr", params=request,
                       result_summary=result,
                       trial_count=result.get("trial_count", 1))
-        return _strip_forbidden(result)
+        return _RpcToolResult(
+            _strip_forbidden(result), save_kwargs=getattr(result, "save_kwargs", None))
 
     return [
         ToolDef(name="run_backtest", description=(
@@ -167,26 +186,44 @@ def build_improve_rpc_tooldefs(
     ]
 
 
-def build_ledger_wrapped_rpc_handlers(
-        *, ledger: ImproveRpcLedger, rpc_handlers: dict[str, Callable],
-        staging_dir: Path | None = None) -> dict[str, Callable[[dict], dict]]:
+def build_rpc_handlers(
+        rpc_handlers: dict[str, Callable],
+        staging_dir: Path | None = None) -> dict[str, Callable[[dict], RpcOutcome]]:
     """親 (WorkerRunner) が子からの tool_rpc を受ける側の handler 表。
 
-    生 handler (`ImproveLoop._build_rpc_handlers`) を tooldef 層で包み、
-    台帳記録 (`ledger.record`) と遮断 7 (`_strip_forbidden`) を親側でも
-    通す — 生 handler を直接 `WorkerRunner(rpc_handlers=...)` に渡すと
-    親 ledger は永遠に空で `_persist_ledger_rows` が何も書かない
-    ([ledger-never-populated-in-production]、/code-review 2026-09-04)。
-    子側の wrapper (mission_worker、使い捨て ledger) は二重防御として残す。
+    生 handler を tooldef 層で包んで遮断 7 を適用するが、親 ledger には
+    記録しない。記録は期限内応答だけを知る dispatcher callback が行う。
+    子側 tooldef の ledger 契約は変更しない。
 
     **RPC 契約** (run8 是正、2026-09-09): 引数 `args` は tooldef 関数の
     **キーワード引数 dict** で、ここで `func(**args)` に展開する。子の RPC
     handler (`mission_worker._build_improve_registry`) はこの形で送る責務を持つ
     (`run_backtest` → `{"name", "pair"}`、`analyze_corr` → `{"request": …}`)。"""
+    class _NoopLedger:
+        def record(self, **_kwargs) -> None:
+            return None
+
     tools = build_improve_rpc_tooldefs(
-        ledger=ledger,
+        ledger=_NoopLedger(),
         run_backtest_handler=rpc_handlers["run_backtest"],
         analyze_corr_handler=rpc_handlers["analyze_corr"],
         staging_dir=staging_dir)
-    return {tool.name: (lambda args, func=tool.func: func(**args))
-            for tool in tools}
+
+    def wrap(func: Callable) -> Callable[[dict], RpcOutcome]:
+        def call(args: dict) -> RpcOutcome:
+            result = func(**args)
+            return RpcOutcome(
+                public=_strip_forbidden(result),
+                private=getattr(result, "save_kwargs", None),
+            )
+        return call
+
+    return {tool.name: wrap(tool.func) for tool in tools}
+
+
+def build_ledger_wrapped_rpc_handlers(
+        *, ledger: ImproveRpcLedger, rpc_handlers: dict[str, Callable],
+        staging_dir: Path | None = None) -> dict[str, Callable]:
+    """後方互換 alias。親側 ledger 引数は受理境界移動後は使用しない。"""
+    del ledger
+    return build_rpc_handlers(rpc_handlers, staging_dir)

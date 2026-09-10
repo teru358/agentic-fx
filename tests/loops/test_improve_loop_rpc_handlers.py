@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,12 +66,27 @@ def _patch_strategy_lookup(monkeypatch):
     """candidate meta 解決 (`plugin_loader._discover_one`) と
     `strategy_adapter.build_intent_source` を fake する — 本節が検査するのは
     RPC handler と台帳/persist の結線であり、実バックテスト実行ではない。"""
-    fake_meta = SimpleNamespace(
-        name="myst", kind="strategy", timeframe="1h",
-        content_hash="cand-hash", pairs=("USDJPY",))
-    monkeypatch.setattr(
-        "agentic_fx.plugin.loader._discover_one",
-        lambda path, name: fake_meta)
+    from agentic_fx.plugin.version_store import content_hash_bytes
+
+    def discover(path, name):
+        path.mkdir(parents=True, exist_ok=True)
+        files = {
+            "plugin.py": b"def evaluate(*args): return {}\n",
+            "config.yaml": b"kind: strategy\n",
+            "test_plugin.py": b"def test_candidate(): pass\n",
+        }
+        for filename, data in files.items():
+            target = path / filename
+            if not target.exists():
+                target.write_bytes(data)
+        return SimpleNamespace(
+            name=name, kind="strategy", timeframe="1h",
+            content_hash=content_hash_bytes(
+                (path / "plugin.py").read_bytes(),
+                (path / "config.yaml").read_bytes()),
+            pairs=("USDJPY",))
+
+    monkeypatch.setattr("agentic_fx.plugin.loader._discover_one", discover)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_adapter.build_intent_source",
         lambda meta, **kw: SimpleNamespace(close=lambda: None))
@@ -78,11 +94,92 @@ def _patch_strategy_lookup(monkeypatch):
 
 def _patch_run_in_sample(monkeypatch, save_kwargs=_SAVE_KWARGS):
     def _fake_run_in_sample(*a, record_fn=None, **kw):
-        record_fn(save_kwargs)
+        record_fn(dict(save_kwargs))
         return dict(save_kwargs["metrics"])
     monkeypatch.setattr(
         "agentic_fx.loops.improve_loop.holdout.run_in_sample",
         _fake_run_in_sample)
+
+
+def test_run_backtest_creates_readonly_tmp_snapshot(loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    result = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+
+    archive_tmp = Path(result.save_kwargs["archive_tmp"])
+    assert archive_tmp.name.startswith(
+        f".tmp-{result.save_kwargs['artifact_hash']}-")
+    assert {p.name for p in archive_tmp.iterdir()} == {
+        "plugin.py", "config.yaml", "test_plugin.py", "meta.json"}
+    assert archive_tmp.stat().st_mode & 0o777 == 0o500
+    assert all(p.stat().st_mode & 0o777 == 0o400 for p in archive_tmp.iterdir())
+    meta = json.loads((archive_tmp / "meta.json").read_text())
+    assert meta["artifact_hash"] == result.save_kwargs["artifact_hash"]
+
+
+def test_run_backtest_rejects_changed_content_before_execution(
+        loop_min, tmp_path, monkeypatch):
+    candidate = tmp_path / "staging" / "myst"
+    candidate.mkdir(parents=True)
+    for filename in ("plugin.py", "config.yaml", "test_plugin.py"):
+        (candidate / filename).write_text("changed")
+    monkeypatch.setattr(
+        "agentic_fx.plugin.loader._discover_one",
+        lambda path, name: SimpleNamespace(
+            name=name, kind="strategy", timeframe="1h",
+            content_hash="stale", pairs=("USDJPY",)))
+    called = threading.Event()
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        lambda *a, **kw: called.set())
+    result = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=candidate.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+    assert result == {"error": "loader_rejected: content changed during backtest"}
+    assert not called.is_set()
+
+
+def test_snapshot_write_failure_returns_backtest_and_logs_activity(
+        loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.version_store._write_ro_file",
+        lambda *a, **kw: (_ for _ in ()).throw(PermissionError("denied")))
+    candidate = tmp_path / "staging" / "myst"
+    candidate.mkdir(parents=True)
+    result = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=candidate.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+    assert result["metrics"] == {"pf": 1.3, "trades": 40}
+    assert "archive_tmp" not in result.save_kwargs
+    assert "archive_failed" in (tmp_path / "activity.log").read_text()
+
+
+def test_snapshot_a_b_a_creates_three_distinct_tmp_dirs(
+        loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+    candidate = tmp_path / "staging" / "myst"
+    candidate.mkdir(parents=True)
+    handler = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=candidate.parent)["run_backtest"]
+    hashes = []
+    for body in (b"A", b"B", b"A"):
+        (candidate / "plugin.py").write_bytes(body)
+        result = handler({"name": "myst", "pair": "USDJPY"})
+        hashes.append(result.save_kwargs["artifact_hash"])
+    tmp_dirs = list((tmp_path / "plugins" / "_archive" / "staging").iterdir())
+    assert hashes[0] == hashes[2] != hashes[1]
+    assert len(tmp_dirs) == 3
 
 
 def test_run_backtest_handler_returns_json_safe_limited_reply(
@@ -357,6 +454,8 @@ def test_run_backtest_handler_returns_error_dict_and_closes_conn_on_failure(
     assert result == {"error": "backtest_failed"}
     assert closed["intent_source"] is True
     assert closed["conn"] is True
+    archive_root = tmp_path / "plugins" / "_archive"
+    assert not archive_root.exists() or not any(archive_root.rglob(".tmp-*"))
 
 
 def test_run_backtest_handler_reports_missing_history_with_available_pairs(
@@ -369,6 +468,17 @@ def test_run_backtest_handler_reports_missing_history_with_available_pairs(
             "(cannot determine in-sample start)")))
     staging_dir = tmp_path / "staging"
     (staging_dir / "myst").mkdir(parents=True)
+    candidate = staging_dir / "myst"
+    (candidate / "plugin.py").write_bytes(b"plugin")
+    (candidate / "config.yaml").write_bytes(b"config")
+    (candidate / "test_plugin.py").write_bytes(b"test")
+    from agentic_fx.plugin.version_store import content_hash_bytes
+    monkeypatch.setattr(
+        "agentic_fx.plugin.loader._discover_one",
+        lambda path, name: SimpleNamespace(
+            name="myst", kind="strategy", timeframe="1h",
+            content_hash=content_hash_bytes(b"plugin", b"config"),
+            pairs=("EURUSD",)))
     handlers = loop_min._build_rpc_handlers(
         ImproveRpcLedger(rpc_timeout_sec_by_kind={}), staging_dir=staging_dir)
 
@@ -484,17 +594,23 @@ def test_run_backtest_handler_missing_history_hint_uses_dataset_base_interval(
 def test_run_backtest_handler_reports_pair_not_declared(
         loop_min, tmp_path, monkeypatch):
     _patch_strategy_lookup(monkeypatch)
+    staging_dir = tmp_path / "staging"
+    candidate = staging_dir / "myst"
+    candidate.mkdir(parents=True)
+    (candidate / "plugin.py").write_bytes(b"plugin")
+    (candidate / "config.yaml").write_bytes(b"config")
+    (candidate / "test_plugin.py").write_bytes(b"test")
+    from agentic_fx.plugin.version_store import content_hash_bytes
     monkeypatch.setattr(
         "agentic_fx.plugin.loader._discover_one",
         lambda path, name: SimpleNamespace(
             name="myst", kind="strategy", timeframe="1h",
-            content_hash="cand-hash", pairs=("EURUSD",)))
+            content_hash=content_hash_bytes(b"plugin", b"config"),
+            pairs=("EURUSD",)))
     monkeypatch.setattr(
         "agentic_fx.loops.improve_loop.holdout.run_in_sample",
         lambda *a, **kw: (_ for _ in ()).throw(ValueError(
             "pair 'USDJPY' is not in plugin 'myst''s declared pairs ('EURUSD',)")))
-    staging_dir = tmp_path / "staging"
-    (staging_dir / "myst").mkdir(parents=True)
     handlers = loop_min._build_rpc_handlers(
         ImproveRpcLedger(rpc_timeout_sec_by_kind={}), staging_dir=staging_dir)
 

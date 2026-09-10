@@ -533,6 +533,7 @@ def test_settings_yaml_example_has_improve_settings():
     assert s.improve.llama_swap_verified is False
     assert s.improve.max_new_backlog_per_mission >= 1
     assert s.improve.backtest_rpc_timeout_sec > 0
+    assert s.improve.accept_drain_sec == 30.0
     assert s.improve.research.max_searches >= 1
 
 

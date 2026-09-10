@@ -47,6 +47,7 @@ def _fake_settings(parallel: int) -> Any:
     class _Improve:
         def __init__(self, p: int) -> None:
             self.parallel = p
+            self.accept_drain_sec = 0.0
 
     class _FakeSettings:
         def __init__(self) -> None:
@@ -1213,6 +1214,22 @@ def test_join_budget_is_shared_not_multiplied_by_thread_count(tmp_path):
     assert elapsed < timeout * 2, (
         f"join budget appears multiplied by thread count: "
         f"elapsed={elapsed:.3f}s, timeout={timeout}s, N=3")
+
+
+def test_join_deadline_includes_accept_drain(tmp_path):
+    sup = ImproveSupervisor(capacity=1, root=tmp_path,
+                            settings=_fake_settings(parallel=1),
+                            clock=_FixedClock(datetime(2026, 8, 22, tzinfo=timezone.utc)),
+                            db_path=tmp_path / "unused.db",
+                            stop_event=threading.Event())
+    sup._settings.improve.accept_drain_sec = 0.15
+    never_done = threading.Event()
+    thread = threading.Thread(target=never_done.wait, daemon=True)
+    thread.start()
+    sup._active_threads = [thread]
+    started = time.monotonic()
+    sup.join(timeout=0.05)
+    assert time.monotonic() - started >= 0.15
 
 
 def test_join_prunes_finished_threads(tmp_path):

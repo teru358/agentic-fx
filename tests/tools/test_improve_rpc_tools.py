@@ -16,8 +16,8 @@ from agentic_fx.backtest.analysis import analyze_for_agent
 from agentic_fx.config import ImproveToolBudgetSettings
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.tools.improve_rpc_tools import (
-    _FORBIDDEN_KEYS, _is_successful_backtest, _strip_forbidden,
-    build_improve_rpc_tooldefs,
+    RpcOutcome, _FORBIDDEN_KEYS, _is_successful_backtest, _strip_forbidden,
+    build_improve_rpc_tooldefs, build_rpc_handlers,
 )
 from agentic_fx.tools.mission_counters import MissionToolCounters
 
@@ -59,6 +59,30 @@ def _walk_leaves(value):
     else:
         leaves.append(value)
     return keys, leaves
+
+
+def test_parent_rpc_wrapper_returns_public_private_without_recording(tmp_path):
+    class HandlerResult(dict):
+        pass
+
+    result = HandlerResult(
+        metrics={"pf": 1.2}, period=("secret-start", "secret-end"),
+        trial_count=3)
+    result.save_kwargs = {
+        "metrics": {"pf": 1.2}, "period": ("secret-start", "secret-end"),
+        "trial_count": 3, "archive_tmp": "/tmp/snapshot",
+    }
+    handlers = build_rpc_handlers(
+        {"run_backtest": lambda args: result,
+         "analyze_corr": lambda args: {"trial_count": 1}},
+        None,
+    )
+
+    outcome = handlers["run_backtest"]({"name": "x", "pair": "USDJPY"})
+
+    assert isinstance(outcome, RpcOutcome)
+    assert outcome.public == {"metrics": {"pf": 1.2}, "trial_count": 3}
+    assert outcome.private == result.save_kwargs
 
 
 def test_run_backtest_records_to_ledger_and_returns_handler_result():
