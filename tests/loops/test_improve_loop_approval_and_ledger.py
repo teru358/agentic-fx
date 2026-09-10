@@ -2,6 +2,7 @@
 (設計書 §4.2-5、プラン §8.1-16)。"""
 from __future__ import annotations
 
+import threading
 from datetime import datetime
 
 import pytest
@@ -153,3 +154,85 @@ def test_payload_eval_timeframe_maps_1d_to_24h_for_strategy(loop_min, conn):
         gate_metrics={"meta": _Meta()}, output={"selection_rationale": ""},
         now=datetime(2026, 8, 22))
     assert payload["eval_timeframe"] == "24h"
+
+
+def test_accepted_records_public_when_private_is_absent_or_empty(loop_and_ctx):
+    """ローカル 1 周目 #12 (2026-09-10): `summary = outcome.private or
+    outcome.public` の分岐。private=None (analyze_corr の本番形) と
+    private={} の両方で public に落ちる。既存テストは非空 private しか
+    通さないため、`is not None` 判定に置き換えても緑のままだった。
+    (private={} は現行の本番経路では到達しないが、summary 選択の契約を
+    一意に固定するために合わせて pin する。)"""
+    loop, ctx, _conn = loop_and_ctx
+    ctx.rpc_handlers.update({
+        "run_backtest": lambda args: {}, "analyze_corr": lambda args: {}})
+    runner = loop._build_worker_runner(ctx)
+    for private in (None, {}):
+        assert runner._on_rpc_begin("run_backtest") is True
+        runner._on_rpc_accepted(
+            "run_backtest", {"name": "myst", "pair": "USDJPY"},
+            RpcOutcome(public={"trial_count": 2}, private=private))
+    ctx.ledger.freeze()
+    entries = ctx.ledger.entries()
+    assert [e["result_summary"] for e in entries] == [
+        {"trial_count": 2}, {"trial_count": 2}]
+    assert [e["trial_count"] for e in entries] == [2, 2]
+
+
+def test_accepted_analyze_corr_opaque_ref_is_per_request(loop_and_ctx):
+    """ローカル 1 周目 #13 (2026-09-10): analyze_corr の else 側
+    (`opaque_ref = f"analyze_corr:{id(request)}"` と `params = request`) が
+    一度も踏まれていない。callback を叩くテストは run_backtest しか通さず、
+    opaque_ref を固定文字列にしても緑のままだった。"""
+    loop, ctx, _conn = loop_and_ctx
+    ctx.rpc_handlers.update({
+        "run_backtest": lambda args: {}, "analyze_corr": lambda args: {}})
+    runner = loop._build_worker_runner(ctx)
+    for request in ({"pairs": ["USDJPY"]}, {"pairs": ["EURUSD"]}):
+        assert runner._on_rpc_begin("analyze_corr") is True
+        runner._on_rpc_accepted(
+            "analyze_corr", {"request": request},
+            RpcOutcome(public={"trial_count": 1}, private=None))
+    ctx.ledger.freeze()
+    entries = ctx.ledger.entries()
+    assert [e["kind"] for e in entries] == ["analyze_corr", "analyze_corr"]
+    assert [e["params"] for e in entries] == [
+        {"pairs": ["USDJPY"]}, {"pairs": ["EURUSD"]}]
+    assert entries[0]["opaque_ref"] != entries[1]["opaque_ref"]
+    assert all(e["opaque_ref"].startswith("analyze_corr:") for e in entries)
+
+
+def test_freeze_ledger_logs_timeout_activity_when_drain_expires(
+        loop_and_ctx, monkeypatch):
+    """ローカル 1 周目 #14 (2026-09-10): `_freeze_ledger` が drain timeout で
+    activity へ `ledger_freeze_timeout` を書くこと。この文字列は tests/ の
+    どこにも現れず、on_timeout ごと消しても activity キーを書き換えても
+    緑のままだった。commit 相の drain timeout は運用の唯一の signal。"""
+    loop, ctx, _conn = loop_and_ctx
+    monkeypatch.setattr(loop._settings.improve, "accept_drain_sec", 0.0)
+    ctx.ledger.begin_accept()          # 解放されない予約を 1 件残す
+    loop._freeze_ledger(ctx)
+    log = (loop._root / "activity.log").read_text()
+    assert "ledger_freeze_timeout" in log
+    assert f"mission={ctx.mission_id} dropped=1" in log
+
+
+def test_freeze_ledger_drain_waits_accept_drain_sec_before_dropping(
+        loop_and_ctx, monkeypatch):
+    """ローカル 1 周目 #15 (2026-09-10): drain 秒数が `accept_drain_sec` から
+    来ていること。`drain_timeout_sec=0.0` に潰す変異は、timeout 側だけを見る
+    テストでは検出できない。期限内に end_accept が来れば timeout activity は
+    書かれない。"""
+    loop, ctx, _conn = loop_and_ctx
+    monkeypatch.setattr(loop._settings.improve, "accept_drain_sec", 2.0)
+    reservation = ctx.ledger.begin_accept()
+    timer = threading.Timer(0.2, ctx.ledger.end_accept, args=(reservation,))
+    timer.start()
+    try:
+        loop._freeze_ledger(ctx)
+    finally:
+        timer.cancel()
+    log_path = loop._root / "activity.log"
+    log = log_path.read_text() if log_path.exists() else ""
+    assert "ledger_freeze_timeout" not in log
+    assert ctx.ledger.entries() == []

@@ -3862,7 +3862,7 @@ def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
 
 def _run_fake_tool_rpc(tmp_path, monkeypatch, *, handler, timeout=1.0,
                        on_rpc_begin=None, on_rpc_accepted=None,
-                       on_rpc_released=None):
+                       on_rpc_released=None, on_child_response=None):
     r, w = os.pipe()
     r2, w2 = os.pipe()
     response = {}
@@ -3877,6 +3877,10 @@ def _run_fake_tool_rpc(tmp_path, monkeypatch, *, handler, timeout=1.0,
                                 "name": "run_backtest",
                                 "args": {"name": "x", "pair": "USDJPY"}})
         response.update(json.loads(child_in.readline()))
+        if on_child_response is not None:
+            # ローカル 1 周目 #7: 子が応答フレームを受け取った瞬間を親側へ
+            # 知らせる seam (accepted が応答より前かを順序として観測する)。
+            on_child_response()
         write_frame(child_out, {"type": "result", "seq": 3,
                                 "status": "completed", "output": {}})
         child_out.close()
@@ -4318,3 +4322,38 @@ def test_trade_claude_real_process_completes_via_factory_build_runner(
                              if real_transcript_dir.is_dir() else set())
         for f in transcripts_after - transcripts_before:
             f.unlink(missing_ok=True)
+
+
+def test_rpc_handler_returning_rpcoutcome_is_not_double_wrapped(
+        tmp_path, monkeypatch):
+    """ローカル 1 周目 #5 (2026-09-10): `isinstance(payload, RpcOutcome)` を
+    落として常に包み直すと、handler が返した private が捨てられ public が
+    RpcOutcome 自体になる。既存の正規化テストは dict 返却しか通さない
+    (本番の build_rpc_handlers はまさに RpcOutcome を返す)。"""
+    from agentic_fx.tools.improve_rpc_tools import RpcOutcome
+    events = []
+    outcome = RpcOutcome(public={"value": 7}, private={"secret": 1})
+    _, response = _run_fake_tool_rpc(
+        tmp_path, monkeypatch, handler=lambda args: outcome,
+        on_rpc_begin=lambda name: True,
+        on_rpc_accepted=lambda n, a, o: events.append(o))
+    assert events[0] is outcome              # 包み直していない
+    assert events[0].private == {"secret": 1}
+    assert response["result"] == {"value": 7}  # 子へは public だけ
+
+
+def test_rpc_accepted_completes_before_response_reaches_child(
+        tmp_path, monkeypatch):
+    """ローカル 1 周目 #7 (2026-09-10): 契約「accepted は子へ応答を書く前」を
+    順序として観測する。既存 test_rpc_accepted_normalizes_dict_and_runs_
+    before_response は名前に反し events の中身と response の中身しか見て
+    おらず、accepted を応答後にずらしても緑のままだった。"""
+    accepted_done = threading.Event()
+    seen: list[bool] = []
+    _, response = _run_fake_tool_rpc(
+        tmp_path, monkeypatch, handler=lambda args: {"value": 7},
+        on_rpc_begin=lambda name: True,
+        on_rpc_accepted=lambda n, a, o: accepted_done.set(),
+        on_child_response=lambda: seen.append(accepted_done.is_set()))
+    assert seen == [True]   # 応答が子に届いた時点で accepted は完了済み
+    assert response["result"] == {"value": 7}

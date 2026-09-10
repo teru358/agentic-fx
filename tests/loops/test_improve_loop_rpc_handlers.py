@@ -643,3 +643,102 @@ def test_analyze_corr_handler_returns_error_dict_on_failure(
     result = handlers["analyze_corr"]({"kind": "corr_matrix", "timeframe": "1h"})
 
     assert result == {"error": "analyze_failed"}
+
+
+def test_snapshot_meta_json_metrics_match_save_kwargs(
+        loop_min, tmp_path, monkeypatch):
+    """ローカル 1 周目 #8 (2026-09-10): meta.json の metrics が
+    save_kwargs["metrics"] と同一であること。既存 snapshot テストは
+    `meta["artifact_hash"] == save_kwargs["artifact_hash"]` の自己一致しか
+    見ないため、metadata の metrics を空 dict にしても緑のままだった。"""
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    result = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+    meta = json.loads(
+        (Path(result.save_kwargs["archive_tmp"]) / "meta.json").read_text())
+    assert meta["metrics"] == result.save_kwargs["metrics"]
+    assert meta["metrics"] == {"pf": 1.3, "trades": 40}
+    assert meta["name"] == "myst"
+    assert meta["pair"] == "USDJPY"
+
+
+def test_snapshot_artifact_hash_covers_test_plugin_bytes(
+        loop_min, tmp_path, monkeypatch):
+    """ローカル 1 周目 #9 (2026-09-10): artifact_hash が 3 ファイル
+    (plugin.py / config.yaml / test_plugin.py) の bytes から計算されること。
+    テストが実装と独立に hash を再計算していなかったため、3 本目を落として
+    content_hash 相当 (2 ファイル) に退化させても緑のままだった。"""
+    from agentic_fx.plugin.version_store import artifact_hash_bytes
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    handler = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"]
+    first = handler({"name": "myst", "pair": "USDJPY"})
+    expected = artifact_hash_bytes(
+        (staging / "plugin.py").read_bytes(),
+        (staging / "config.yaml").read_bytes(),
+        (staging / "test_plugin.py").read_bytes())
+    assert first.save_kwargs["artifact_hash"] == expected
+    # test_plugin.py だけを変える (content_hash は plugin.py+config.yaml 由来
+    # なので不変) → artifact_hash は変わらなければならない
+    (staging / "test_plugin.py").write_bytes(b"def test_candidate(): assert 1\n")
+    second = handler({"name": "myst", "pair": "USDJPY"})
+    assert second.save_kwargs["artifact_hash"] != expected
+
+
+def test_snapshot_fsyncs_tmp_dir_and_parent(loop_min, tmp_path, monkeypatch):
+    """ローカル 1 周目 #10 (2026-09-10): `_fsync_dir(archive_tmp)` と
+    `_fsync_dir(archive_tmp.parent)` が両方呼ばれること。fsync は観測不能な
+    次元で spy が無く、両方削除しても緑のままだった。spy は
+    `_build_rpc_handlers` を呼ぶ **前** に張る (handler が関数内 import で
+    名前を束縛するため)。"""
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+    synced: list[Path] = []
+    monkeypatch.setattr("agentic_fx.plugin.version_store._fsync_dir",
+                        lambda d: synced.append(Path(d)))
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    result = loop_min._build_rpc_handlers(   # spy を張った後に構築する
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+    archive_tmp = Path(result.save_kwargs["archive_tmp"])
+    assert synced == [archive_tmp, archive_tmp.parent]
+
+
+def test_unreadable_candidate_files_are_loader_rejected_before_execution(
+        loop_min, tmp_path, monkeypatch):
+    """ローカル 1 周目 #11 (2026-09-10): 候補 3 ファイルのいずれかが読めない
+    (`except OSError`) 経路も loader_rejected を返し backtest を起動しない
+    こと。既存は content hash 不一致だけを通すので OSError 節は一度も
+    踏まれず、返す文字列を書き換えても緑のままだった。"""
+    called = threading.Event()
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        lambda *a, **kw: called.set())
+    monkeypatch.setattr(
+        "agentic_fx.plugin.loader._discover_one",
+        lambda path, name: SimpleNamespace(
+            name=name, kind="strategy", timeframe="1h",
+            content_hash="whatever", pairs=("USDJPY",)))
+    candidate = tmp_path / "staging" / "myst"
+    candidate.mkdir(parents=True)
+    (candidate / "plugin.py").write_bytes(b"x")
+    (candidate / "config.yaml").write_bytes(b"y")
+    # test_plugin.py を作らない → read_bytes が FileNotFoundError (OSError)
+    result = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=candidate.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+    assert result == {
+        "error": "loader_rejected: content changed during backtest"}
+    assert not called.is_set()

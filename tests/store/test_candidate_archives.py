@@ -72,3 +72,19 @@ def test_insert_and_clear_path_honor_caller_owned_transaction(tmp_path):
     candidate_archives.clear_path(conn, archive_id, commit=False)
     conn.rollback()
     assert candidate_archives.list_by_mission(conn, 3)[0]["archive_path"] is not None
+
+
+def test_insert_does_not_commit_by_default(tmp_path):
+    """ローカル 1 周目 #17 (2026-09-10): `commit` の既定が False
+    (caller-owned tx)。既存の caller-owned tx テストは `commit=False` を明示
+    して呼び、ヘルパ `_insert` も `commit=True` を既定で埋めているので、
+    ライブラリ既定値は一度も踏まれず True へ変えても緑のままだった。
+    T3 が SAVEPOINT の中で insert する前提そのもの。ヘルパを通さず直に呼ぶ。"""
+    conn = _conn(tmp_path)
+    conn.execute("BEGIN IMMEDIATE")
+    candidate_archives.insert(          # commit を渡さない = ライブラリ既定
+        conn, mission_id=3, name="rsi_v2", content_hash="content-a",
+        artifact_hash="artifact-a", archive_path="plugins/_archive/3/a",
+        pair="USDJPY", metrics={"pf": 1.25}, now=NOW)
+    conn.rollback()
+    assert candidate_archives.list_by_mission(conn, 3) == []

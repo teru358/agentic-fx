@@ -702,3 +702,27 @@ def test_save_harness_run_params_default_is_not_shared_mutable(tmp_path):
         assert default is None, (
             f"{fn.__name__}.params の既定値は None であること (mutable "
             f"default {default!r} が残っている)")
+
+
+def test_latest_in_sample_metrics_filters_by_source(tmp_path):
+    """ローカル 1 周目 #16 (2026-09-10): WHERE の `source=?` が実際に効いて
+    いること。同じ束の `variant=?` (ignores_baseline_and_no_strategy_rows) と
+    `base_interval=?` (filters_by_dataset_interval) には対応するテストが
+    あるが、source だけは全テストで全行が同値なので
+    `(source=? OR 1=1)` への緩和が通ってしまっていた。"""
+    conn = _conn(tmp_path)
+    kw = dict(scope="in_sample", plugin_ref="p", content_hash="same",
+              kind="strategy", pair="USDJPY", timeframe="1h",
+              base_interval="1m", period=(H, H), settings_hash="s",
+              core_commit="c", initial_balance=1.0, now=H)
+    backtest_runs.save_harness_run(
+        conn, source="dukascopy", metrics={"pf": 1.1}, **kw)
+    # id が大きい = 「最新」だが source が違うので選ばれてはならない
+    backtest_runs.save_harness_run(
+        conn, source="mt5", metrics={"pf": 9.9}, **kw)
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "same", pair="USDJPY", variant="candidate",
+        source="dukascopy", base_interval="1m") == {"pf": 1.1}
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, "same", pair="USDJPY", variant="candidate",
+        source="mt5", base_interval="1m") == {"pf": 9.9}
