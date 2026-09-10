@@ -510,3 +510,185 @@ def test_compensate_commit_failure_savepoint_failure_then_terminal_insert_only_o
         "SELECT count(*) FROM backtest_runs WHERE mission_id=? "
         "AND mission_outcome='commit_failed'", (mission_id,)).fetchone()[0] == 1
     check.close()
+
+
+def _snapshot_real(path):
+    """実物の tmp snapshot と同じ 4 ファイル構成 (`meta.json` 込み) を作る。
+
+    `artifact_hash_bytes` は 3 ファイルだけを対象にする契約なので、
+    `meta.json` は hash に寄与しない (metrics を含み実行ごとに変わるため)。
+    """
+    import json as _json
+    path.mkdir(parents=True)
+    blobs = (b"plugin = 1\n", b"name: x\n", b"def test_x(): pass\n")
+    for name, data in zip(("plugin.py", "config.yaml", "test_plugin.py"), blobs):
+        (path / name).write_bytes(data)
+    (path / "meta.json").write_text(
+        _json.dumps({"pair": "USDJPY", "metrics": {"pf": 1.2}}))
+    return artifact_hash_bytes(*blobs)
+
+
+def test_publish_retry_with_matching_hash_inserts_row_without_tmp(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """ローカル T3 1 周目 #Y1 (2026-09-10): 再試行の**成功**側 — tmp 無し +
+    final あり (実物どおり `meta.json` 込み) + 再計算 hash 一致 なら
+    「publish 済み」として `candidate_archives` に行だけを挿入する。
+
+    既存 pin は hash **不一致**側 (`archive_failed`) しか踏んでいないため、
+    再試行分岐を常に失敗させる変異 (`if final_path.is_symlink() or not
+    final_path.is_dir():` → `if True:`) がフルスイートでも生存していた。
+    """
+    mission_id, run_id, _ = mission_and_run_fixture
+    missing_tmp = tmp_path / "gone"
+    assert not missing_tmp.exists()
+    final = loop_min._root / "plugins" / "_archive" / str(mission_id)
+    artifact_hash = _snapshot_real(final / "PLACEHOLDER")
+    (final / "PLACEHOLDER").rename(final / artifact_hash)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(missing_tmp, artifact_hash)])
+
+    conn.execute("BEGIN IMMEDIATE")
+    loop_min._persist_ledger_in_tx(
+        conn, ctx=ctx, now=NOW, mission_outcome="failed")
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT archive_path, artifact_hash FROM candidate_archives "
+        "WHERE mission_id=?", (mission_id,)).fetchone()
+    assert row is not None, "hash 一致の再試行は行を挿入する"
+    assert row["artifact_hash"] == artifact_hash
+    assert row["archive_path"] == (
+        f"plugins/_archive/{mission_id}/{artifact_hash}")
+    log = loop_min._activity._path
+    assert "archive_failed" not in (log.read_text() if log.exists() else "")
+
+
+def test_publish_fsyncs_final_parent_after_rename(
+        loop_min, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """ローカル T3 1 周目 #Y7 (2026-09-10): rename 成功のあと final の親 dir を
+    `_fsync_dir` する (ブリーフ 3)。呼び出しを削る変異が生存していた。"""
+    from agentic_fx.plugin import version_store
+
+    calls = []
+    monkeypatch.setattr(version_store, "_fsync_dir", lambda p: calls.append(p))
+
+    mission_id, run_id, _ = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    conn.execute("BEGIN IMMEDIATE")
+    loop_min._persist_ledger_in_tx(
+        conn, ctx=ctx, now=NOW, mission_outcome="failed")
+    conn.commit()
+
+    final = loop_min._root / "plugins" / "_archive" / str(mission_id) / artifact_hash
+    assert final.is_dir()
+    assert calls == [final.parent]
+
+
+def test_remove_archive_tmp_does_not_chmod_through_symlink(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """ローカル T3 1 周目 #Y8 (2026-09-10): EEXIST 敗者の tmp を消すとき、
+    tmp 内の symlink を**辿らない** (`if not candidate.is_symlink()`)。
+
+    `os.walk` は symlink-to-file を `filenames` に入れるので、ガードを外すと
+    `chmod(0o600)` がリンク**先** (tmp の外のファイル) の mode を書き換える。
+    symlink を含む tmp を作るテストが無く、この変異が生存していた。
+    """
+    mission_id, run_id, _ = mission_and_run_fixture
+    outsider = tmp_path / "outside.txt"
+    outsider.write_text("do not touch\n")
+    outsider.chmod(0o644)
+
+    winner = tmp_path / "winner"
+    loser = tmp_path / "loser"
+    artifact_hash = _snapshot(winner)
+    assert _snapshot(loser) == artifact_hash
+    (loser / "link_to_outsider").symlink_to(outsider)
+
+    ctx = _ctx(tmp_path, mission_id, run_id, [
+        _backtest_entry(winner, artifact_hash),
+        _backtest_entry(loser, artifact_hash),
+    ])
+
+    conn.execute("BEGIN IMMEDIATE")
+    loop_min._persist_ledger_in_tx(
+        conn, ctx=ctx, now=NOW, mission_outcome="failed")
+    conn.commit()
+
+    assert not loser.exists(), "敗者 tmp は削除される"
+    assert outsider.exists(), "symlink の先は削除されない"
+    assert (outsider.stat().st_mode & 0o777) == 0o644, (
+        "symlink を辿って chmod してはならない")
+
+
+def test_finalize_success_begin_failure_still_runs_compensation(
+        loop_min, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """ローカル T3 1 周目 申し送り (2026-09-10): `BEGIN IMMEDIATE` 自体が例外
+    (ロック競合) でも `_compensate_tx2_failure` は呼ばれる。旧実装は
+    `persist_ctx` を tx の中で束縛していたため UnboundLocalError で補償が
+    静かに飛び、mission が running のまま残った。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    ctx = _ctx(tmp_path, mission_id, run_id, [])
+    import sqlite3
+
+    class _FlakyBegin:
+        """sqlite3.Connection の execute は差し替え不可 (read-only) なので
+        委譲 proxy で最初の BEGIN IMMEDIATE だけを失敗させる。"""
+        def __init__(self, inner):
+            self._inner = inner
+            self._armed = True
+
+        def execute(self, sql, *args):
+            if self._armed and sql.strip().upper().startswith("BEGIN IMMEDIATE"):
+                self._armed = False  # 補償 tx の BEGIN は通す
+                raise sqlite3.OperationalError("database is locked (injected)")
+            return self._inner.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    loop_min._finalize_success(
+        _FlakyBegin(conn), mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+    assert conn.execute(
+        "SELECT status FROM missions WHERE id=?",
+        (mission_id,)).fetchone()["status"] == "failed", (
+        "BEGIN 失敗でも補償 tx で mission は failed に終端されなければならない")
+
+
+def test_finalize_success_fails_tx2_when_ledger_persistence_fails(
+        loop_min, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """ローカル T3 1 周目 #Y2 (2026-09-10): approval 経路は SAVEPOINT 永続化が
+    失敗したら Tx-2 全体を落とす (設計 §3「approval Tx-2 失敗 → 内部補償」)。
+
+    `raise RuntimeError` を落とす変異は、監査値 (`analysis_run_ids` /
+    `trial_count`) を欠いたまま `approval_requests` を commit してしまうが、
+    既存テストは成功側しか踏んでおらずフルスイートでも生存していた。
+    """
+    from agentic_fx.store import backtest_runs
+
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+    monkeypatch.setattr(
+        backtest_runs, "save_harness_run",
+        lambda *a, **kw: (_ for _ in ()).throw(KeyError("injected")))
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+
+    assert conn.execute(
+        "SELECT count(*) FROM approval_requests").fetchone()[0] == 0, (
+        "台帳が永続化できないまま承認申請を出してはならない")
+    assert conn.execute(
+        "SELECT status FROM missions WHERE id=?",
+        (mission_id,)).fetchone()["status"] == "failed"
+    assert ctx.ledger.state() == "PERSIST_FAILED"

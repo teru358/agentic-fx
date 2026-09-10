@@ -1708,27 +1708,31 @@ class ImproveLoop:
         from agentic_fx.store import approvals as approvals_store
         from agentic_fx.store import missions as missions_store
 
+        # persist_ctx は `BEGIN IMMEDIATE` の**前**に束縛する — 中で BEGIN が
+        # 例外 (ロック競合) を出すと外側 except の `_compensate_tx2_failure(
+        # ctx=persist_ctx)` が UnboundLocalError になり補償が静かに飛ぶ
+        # (ローカル T3 1 周目 申し送り、2026-09-10)。
+        if ctx is None:
+            class _EntriesView:
+                def entries(self):
+                    return list(ledger_entries)
+                def mark_persisted(self):
+                    return None
+                def mark_persist_failed(self):
+                    return None
+                def mark_discarded(self):
+                    return None
+            from types import SimpleNamespace
+            persist_ctx = SimpleNamespace(
+                mission_id=mission_id, ledger=_EntriesView())
+        else:
+            persist_ctx = ctx
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 # precheck 2026-08-23 wave3: RW4 — mission_id (= ctx.mission_id、
                 # commit() が渡すローカル引数) を台帳/親ゲート両方の永続化へ
                 # 転送する。Task 12 の `WHERE mission_id=?` assert が読む列。
-                if ctx is None:
-                    class _EntriesView:
-                        def entries(self):
-                            return list(ledger_entries)
-                        def mark_persisted(self):
-                            return None
-                        def mark_persist_failed(self):
-                            return None
-                        def mark_discarded(self):
-                            return None
-                    from types import SimpleNamespace
-                    persist_ctx = SimpleNamespace(
-                        mission_id=mission_id, ledger=_EntriesView())
-                else:
-                    persist_ctx = ctx
                 analysis_run_ids = self._persist_ledger_in_tx(
                     conn, ctx=persist_ctx, now=now,
                     mission_outcome="approval")

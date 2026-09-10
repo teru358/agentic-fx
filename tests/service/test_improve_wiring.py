@@ -231,3 +231,47 @@ def test_build_app_startup_survives_report_outbox_reconcile_failure(tmp_path):
         "reconcile 失敗が activity へ記録されていない (F-S11 の穴): "
         f"{tail!r}")
     app.close()
+
+
+def test_run_service_reports_busy_when_improve_supervisor_is_still_alive(tmp_path):
+    """ローカル T3 1 周目 #Y3/#Y4/#Y5 (2026-09-10): improve thread が join 後も
+    生きているとき、停止シーケンスは (a) 終了コード 1、(b) `service_stopped`
+    = `shutdown_timeout`、(c) `close(busy_resources=...)` に `conn_core` /
+    `instance_lock` を算入する。
+
+    既存 `test_run_service_calls_improve_supervisor_shutdown_and_join` は
+    `is_alive` を `MagicMock(return_value=False)` で固定しており、
+    `improve_still_busy` を `_exit_code` / `service_stopped` 判定 /
+    `_busy_resources_after_join` へ渡す**配線**が 3 箇所とも観測されて
+    いなかった (段 0 T3-11 は `_exit_code` 本体の変異しか見ていない)。
+    """
+    _init(tmp_path)
+    stop_event = threading.Event()
+    stop_event.set()
+
+    with patch("agentic_fx.service.build_app") as mock_build_app, \
+         patch("agentic_fx.service.build_splash") as mock_splash, \
+         patch("agentic_fx.service.Policy"):
+        mock_app = MagicMock()
+        mock_app.improve_supervisor = MagicMock()
+        mock_app.improve_supervisor.is_alive = MagicMock(return_value=True)
+        mock_app.supervisor = MagicMock()
+        mock_app.supervisor.is_alive = MagicMock(return_value=False)
+        mock_app.close = MagicMock(return_value=[])
+        mock_app.activity.write = MagicMock()
+        mock_app.fatal_reason = None
+        mock_build_app.return_value = mock_app
+        mock_splash.return_value = "splash"
+
+        exit_code = run_service(tmp_path, _stop_event=stop_event)
+
+    assert exit_code == 1, "improve thread 生存中は終了コード 1"
+
+    busy = mock_app.close.call_args.kwargs["busy_resources"]
+    assert "conn_core" in busy
+    assert "instance_lock" in busy
+
+    stopped = [c for c in mock_app.activity.write.call_args_list
+               if c[0][1] == "service_stopped"]
+    assert len(stopped) == 1
+    assert "shutdown_timeout" in stopped[0][0][2]

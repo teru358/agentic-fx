@@ -89,3 +89,34 @@ def test_compensate_commit_failure_terminalizes_and_is_idempotent(
     assert "mission_failed" in activity
     assert f"mission={mission_id} status=failed" in activity
     assert "reason=commit_crashed:RuntimeError:boom" in activity
+
+
+def test_commit_exception_marks_ledger_persist_failed(loop_full, monkeypatch):
+    """ローカル T3 1 周目 #Y9 (2026-09-10): `commit()` が例外で抜けるとき、
+    FROZEN の台帳は `PERSIST_FAILED` へ遷移する (設計 §1 L1)。
+
+    既存 `test_commit_exception_leaves_ledger_discardable` はテスト側で
+    `mark_discarded()` を呼ぶだけで、`mark_discarded` は FROZEN からも
+    PERSIST_FAILED からも合法なため、`except BaseException` 内の
+    `if ctx.ledger.state() == "FROZEN": ctx.ledger.mark_persist_failed()`
+    を削る変異がフルスイートでも生存していた。
+    """
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ctx = ImproveRunContext(
+        mission_id=1, run_id=1, staging_dir=loop_full._root / "staging",
+        source_snapshot_dir=loop_full._root / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    monkeypatch.setattr(
+        loop_full, "_inspect_output",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("commit boom")))
+
+    from agentic_fx.runners.base import Mission, MissionResult
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=1,
+                      timeout_sec=1)
+    result = MissionResult(status="completed", output={}, transcript=[])
+    with pytest.raises(RuntimeError, match="commit boom"):
+        loop_full.commit(mission=mission, ctx=ctx, result=result,
+                         now=loop_full._clock.now())
+
+    assert ledger.state() == "PERSIST_FAILED"

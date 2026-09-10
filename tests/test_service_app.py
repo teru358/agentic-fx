@@ -37,6 +37,23 @@ def test_exit_code_is_failure_while_improve_thread_is_alive():
     assert _exit_code(app, False, False, False) == 0
 
 
+def test_busy_resources_include_core_and_lock_when_only_improve_is_busy():
+    """ローカル T3 1 周目 #Y6 (2026-09-10): improve thread だけが残っていても
+    `conn_core` / `instance_lock` は close しない (設計 §5.6「使用中資源は
+    閉じず leak を選ぶ」)。`conn_supervisor` は supervisor 専用なので入らない。
+
+    この関数を直接叩くテストが 1 本も無く、`or improve_still_busy` を削る
+    変異がフルスイートでも生存していた。
+    """
+    from agentic_fx.service import _busy_resources_after_join
+
+    busy = _busy_resources_after_join(False, False, True)
+    assert "conn_core" in busy
+    assert "instance_lock" in busy
+    assert "conn_supervisor" not in busy
+    assert _busy_resources_after_join(False, False, False) == frozenset()
+
+
 def _init(tmp_path):
     (tmp_path / "config").mkdir()
     src = open("config/settings.yaml.example", encoding="utf-8").read()
