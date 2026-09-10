@@ -808,9 +808,11 @@ def test_build_worker_runner_passes_ctx_as_run_context(
     # tests/runners/test_worker_runner.py::
     # test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag)。
     assert runner._rpc_handlers is not ctx.rpc_handlers
-    reply = runner._rpc_handlers["run_backtest"]({
-        "name": "probe", "pair": "USDJPY"})
-    assert "period" not in reply
+    args = {"name": "probe", "pair": "USDJPY"}
+    assert runner._on_rpc_begin("run_backtest") is True
+    reply = runner._rpc_handlers["run_backtest"](args)
+    runner._on_rpc_accepted("run_backtest", args, reply)
+    assert "period" not in reply.public
     ctx.ledger.freeze()
     entries = ctx.ledger.entries()
     assert len(entries) == 1

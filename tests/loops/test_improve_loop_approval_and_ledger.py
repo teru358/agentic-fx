@@ -7,6 +7,7 @@ from datetime import datetime
 import pytest
 
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.tools.improve_rpc_tools import RpcOutcome
 
 
 def test_payload_analysis_fields_come_from_ledger_not_agent_output(
@@ -57,6 +58,24 @@ def test_frozen_ledger_rejects_late_record_calls(loop_min):
     ledger.record(opaque_ref="late", kind="analyze_corr", params={},
                   result_summary={}, trial_count=999)  # 例外にしない — 無視
     assert ledger.entries() == []  # 遅延結果は捨てる
+
+
+def test_build_worker_runner_records_private_outcome_and_releases(loop_and_ctx):
+    loop, ctx, _conn = loop_and_ctx
+    ctx.rpc_handlers.update({
+        "run_backtest": lambda args: {}, "analyze_corr": lambda args: {}})
+    runner = loop._build_worker_runner(ctx)
+    assert runner._on_rpc_begin("run_backtest") is True
+    private = {"trial_count": 4, "archive_tmp": "/tmp/archive",
+               "artifact_hash": "abc"}
+    runner._on_rpc_accepted(
+        "run_backtest", {"name": "myst", "pair": "USDJPY"},
+        RpcOutcome(public={"trial_count": 1}, private=private))
+    ctx.ledger.freeze()
+    assert ctx.ledger.entries() == [{
+        "opaque_ref": "run_backtest:myst:USDJPY", "kind": "run_backtest",
+        "params": {"name": "myst", "pair": "USDJPY"},
+        "result_summary": private, "trial_count": 4}]
 
 
 def test_payload_base_interval_follows_backtest_settings_for_strategy(

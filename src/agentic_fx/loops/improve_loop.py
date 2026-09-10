@@ -12,11 +12,13 @@ import sqlite3
 import stat
 import sys
 import threading
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+import json
 import jsonschema
 
 # F-6 是正 (検収 task12): renameat2(2) の AT_FDCWD / RENAME_NOREPLACE。
@@ -54,7 +56,7 @@ from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
 from agentic_fx.store import missions as missions_store
-from agentic_fx.tools.improve_rpc_tools import build_ledger_wrapped_rpc_handlers
+from agentic_fx.tools.improve_rpc_tools import RpcOutcome, build_rpc_handlers
 
 if TYPE_CHECKING:
     from agentic_fx.activity import ActivityLog
@@ -438,6 +440,11 @@ class ImproveLoop:
         """
         conn = None
         try:
+            ctx.ledger.freeze_if_open(
+                drain_timeout_sec=self._settings.improve.accept_drain_sec,
+                on_timeout=lambda dropped: self._activity.write(
+                    Category.IMPROVE, "ledger_freeze_timeout",
+                    f"mission={ctx.mission_id} dropped={dropped}"))
             self._activity.write(
                 Category.IMPROVE, "mission_failed",
                 f"mission={ctx.mission_id} status=failed "
@@ -694,6 +701,9 @@ class ImproveLoop:
         from agentic_fx.backtest.analysis import analyze_for_agent
         from agentic_fx.plugin import loader as plugin_loader
         from agentic_fx.plugin import strategy_adapter
+        from agentic_fx.plugin.version_store import (
+            _fsync_dir, _write_ro_file, artifact_hash_bytes, content_hash_bytes,
+        )
 
         def run_backtest_handler(args: dict) -> dict:
             candidate_dir = staging_dir / args["name"]
@@ -703,6 +713,14 @@ class ImproveLoop:
                 raise RuntimeError(
                     f"run_backtest requires a strategy candidate: "
                     f"{args['name']!r}. {_RUN_BACKTEST_KIND_HINT}")
+            try:
+                plugin_py = (candidate_dir / "plugin.py").read_bytes()
+                config_yaml = (candidate_dir / "config.yaml").read_bytes()
+                test_plugin = (candidate_dir / "test_plugin.py").read_bytes()
+            except OSError:
+                return {"error": "loader_rejected: content changed during backtest"}
+            if content_hash_bytes(plugin_py, config_yaml) != meta.content_hash:
+                return {"error": "loader_rejected: content changed during backtest"}
             try:
                 conn = self._db_readonly_conn_factory()
                 captured: list[dict] = []
@@ -774,7 +792,39 @@ class ImproveLoop:
                 _log.exception("run_backtest_handler failed for %r",
                                args.get("name"))
                 return {"error": "backtest_failed"}
-            return _backtest_reply_from_save_kwargs(captured[0])
+            save_kwargs = captured[0]
+            artifact_hash = artifact_hash_bytes(
+                plugin_py, config_yaml, test_plugin)
+            archive_tmp = (self._root / "plugins" / "_archive" /
+                           staging_dir.name /
+                           f".tmp-{artifact_hash}-{uuid.uuid4()}")
+            try:
+                archive_tmp.mkdir(parents=True, mode=0o700)
+                _write_ro_file(archive_tmp / "plugin.py", plugin_py)
+                _write_ro_file(archive_tmp / "config.yaml", config_yaml)
+                _write_ro_file(archive_tmp / "test_plugin.py", test_plugin)
+                metadata = {
+                    "name": meta.name, "content_hash": meta.content_hash,
+                    "artifact_hash": artifact_hash, "pair": args["pair"],
+                    "metrics": save_kwargs["metrics"],
+                    "created_at": self._clock.now().isoformat(),
+                }
+                _write_ro_file(
+                    archive_tmp / "meta.json",
+                    json.dumps(metadata, sort_keys=True).encode())
+                _fsync_dir(archive_tmp)
+                os.chmod(archive_tmp, 0o500)
+                _fsync_dir(archive_tmp.parent)
+            except Exception as exc:
+                _log.exception("archive snapshot failed for %r", args.get("name"))
+                self._activity.write(
+                    Category.IMPROVE, "archive_failed",
+                    f"mission={staging_dir.name} name={args.get('name')} "
+                    f"reason={type(exc).__name__}:{str(exc)[:300]}")
+            else:
+                save_kwargs["artifact_hash"] = artifact_hash
+                save_kwargs["archive_tmp"] = str(archive_tmp)
+            return _backtest_reply_from_save_kwargs(save_kwargs)
 
         def analyze_corr_handler(args: dict) -> dict:
             try:
@@ -824,21 +874,58 @@ class ImproveLoop:
         # 以前はここで省略されており (rpc_handlers=None のまま)、
         # WorkerRunner.__init__ が受け取って格納するだけで
         # dispatcher_loop から一度も参照されなかった。
+        reservations: dict[str, tuple[int, int]] = {}
+        reservation_lock = threading.Lock()
+
+        def on_rpc_begin(name: str) -> bool:
+            reservation = ctx.ledger.begin_accept()
+            if reservation is None:
+                return False
+            with reservation_lock:
+                reservations[name] = reservation
+            return True
+
+        def release(name: str) -> None:
+            with reservation_lock:
+                reservation = reservations.pop(name, None)
+            ctx.ledger.end_accept(reservation)
+
+        def on_rpc_accepted(name: str, args: dict, outcome: RpcOutcome) -> None:
+            summary = outcome.private or outcome.public
+            if name == "run_backtest":
+                opaque_ref = f"run_backtest:{args['name']}:{args['pair']}"
+                params = {"name": args["name"], "pair": args["pair"]}
+            else:
+                request = args.get("request", args)
+                opaque_ref = f"analyze_corr:{id(request)}"
+                params = request
+            try:
+                ctx.ledger.record(
+                    opaque_ref=opaque_ref, kind=name, params=params,
+                    result_summary=summary,
+                    trial_count=summary.get("trial_count", 1))
+            finally:
+                release(name)
+
         return WorkerRunner(
             root=self._root, settings=self._settings, clock=self._clock,
             rag=self._rag, worker_profile="improve",
             run_context=ctx, on_ready=on_ready,
-            rpc_handlers=build_ledger_wrapped_rpc_handlers(
-                ledger=ctx.ledger, rpc_handlers=ctx.rpc_handlers,
-                staging_dir=ctx.staging_dir),
-            rpc_timeout_sec_by_kind=self._improve_rpc_timeout_sec_by_kind())
+            rpc_handlers=build_rpc_handlers(ctx.rpc_handlers, ctx.staging_dir),
+            rpc_timeout_sec_by_kind=self._improve_rpc_timeout_sec_by_kind(),
+            on_rpc_begin=on_rpc_begin, on_rpc_accepted=on_rpc_accepted,
+            on_rpc_released=release)
 
     def _improve_rpc_timeout_sec_by_kind(self) -> dict[str, float]:
         timeout = self._settings.improve.backtest_rpc_timeout_sec
         return {"run_backtest": timeout, "analyze_corr": timeout}
 
     def _freeze_ledger(self, ctx: ImproveRunContext) -> None:
-        ctx.ledger.freeze()
+        ctx.ledger.freeze(
+            drain_timeout_sec=self._settings.improve.accept_drain_sec,
+            on_timeout=lambda dropped: self._activity.write(
+                Category.IMPROVE, "ledger_freeze_timeout",
+                f"mission={ctx.mission_id} dropped={dropped}"))
 
     def _inspect_output(self, output: dict, ctx: ImproveRunContext,
                         conn=None) -> _InspectionVerdict:

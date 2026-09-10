@@ -155,7 +155,8 @@ class ImproveSupervisor:
         抵触する)。あわせて `_active_threads` から終了済みスレッドを
         prune する (tick 時 `_spawn_slot_thread` でも行うが、join 時にも
         念のため行う — 単調増加を防ぐ)。"""
-        deadline = time.monotonic() + timeout
+        deadline = (time.monotonic() + timeout
+                    + self._settings.improve.accept_drain_sec)
         with self._launch_lock:
             threads = list(self._active_threads)
         for t in threads:

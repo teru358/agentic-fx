@@ -731,8 +731,10 @@ def test_approval_payload_analysis_ids_come_from_ledger_not_agent_claim(
         monkeypatch.setattr(
             "agentic_fx.loops.improve_loop.holdout.run_in_sample",
             _fake_in_sample_metrics(40))
-        worker.kwargs["rpc_handlers"]["run_backtest"]({
-            "name": "ledger_probe_e2e", "pair": "USDJPY"})
+        args = {"name": "ledger_probe_e2e", "pair": "USDJPY"}
+        assert worker.kwargs["on_rpc_begin"]("run_backtest") is True
+        outcome = worker.kwargs["rpc_handlers"]["run_backtest"](args)
+        worker.kwargs["on_rpc_accepted"]("run_backtest", args, outcome)
         mission_result = worker.run(mission)
         loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
 
@@ -1086,10 +1088,14 @@ def test_timeout_mission_leaves_no_backtest_or_analysis_run_rows(
         # handler 自身が例外を飲んで `{"error": "backtest_failed"}` を
         # 返す設計 (`_build_rpc_handlers.run_backtest_handler`) なので
         # tool 関数は正常終了し `ledger.record` まで到達する。
-        worker.kwargs["rpc_handlers"]["run_backtest"](
-            {"name": "ledger_probe_e2e", "pair": "USDJPY"})
-        worker.kwargs["rpc_handlers"]["analyze_corr"](
-            {"request": {"pairs": ["USDJPY"]}})
+        bt_args = {"name": "ledger_probe_e2e", "pair": "USDJPY"}
+        assert worker.kwargs["on_rpc_begin"]("run_backtest") is True
+        bt_outcome = worker.kwargs["rpc_handlers"]["run_backtest"](bt_args)
+        worker.kwargs["on_rpc_accepted"]("run_backtest", bt_args, bt_outcome)
+        corr_args = {"request": {"pairs": ["USDJPY"]}}
+        assert worker.kwargs["on_rpc_begin"]("analyze_corr") is True
+        corr_outcome = worker.kwargs["rpc_handlers"]["analyze_corr"](corr_args)
+        worker.kwargs["on_rpc_accepted"]("analyze_corr", corr_args, corr_outcome)
         mission_result = worker.run(mission)
         loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
 

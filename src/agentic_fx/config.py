@@ -254,6 +254,7 @@ class ImproveSettings(_Strict):
     llama_swap_verified: bool = False
     max_new_backlog_per_mission: int = Field(ge=1, default=20)
     backtest_rpc_timeout_sec: float = Field(gt=0, default=600)
+    accept_drain_sec: float = Field(ge=0, default=30.0)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
     gate: ImproveGateSettings = Field(default_factory=ImproveGateSettings)
     tool_budget: ImproveToolBudgetSettings = ImproveToolBudgetSettings()

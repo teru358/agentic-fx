@@ -3860,6 +3860,127 @@ def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
     assert handler_calls == [{"name": "x", "pair": "USDJPY"}]
 
 
+def _run_fake_tool_rpc(tmp_path, monkeypatch, *, handler, timeout=1.0,
+                       on_rpc_begin=None, on_rpc_accepted=None,
+                       on_rpc_released=None):
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    response = {}
+
+    def child():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        json.loads(child_in.readline())
+        write_frame(child_out, {"type": "tool_rpc", "seq": 2, "rpc_id": "r1",
+                                "name": "run_backtest",
+                                "args": {"name": "x", "pair": "USDJPY"}})
+        response.update(json.loads(child_in.readline()))
+        write_frame(child_out, {"type": "result", "seq": 3,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    thread = threading.Thread(target=child, daemon=True)
+    fake_proc = _fake_improve_proc(r, w, w2, r2)
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+    settings = _tiny_worker_settings(rpc_timeout_sec=timeout)
+    runner = WorkerRunner(
+        root=_root(tmp_path), settings=settings, clock=FixedClock(NOW),
+        rag=_rag(tmp_path), worker_profile="improve",
+        rpc_handlers={"run_backtest": handler},
+        on_rpc_begin=on_rpc_begin, on_rpc_accepted=on_rpc_accepted,
+        on_rpc_released=on_rpc_released,
+    )
+    thread.start()
+    result = runner.run(_mission())
+    thread.join(2.0)
+    return result, response
+
+
+def test_rpc_begin_false_rejects_without_starting_handler(tmp_path, monkeypatch):
+    called = threading.Event()
+    _, response = _run_fake_tool_rpc(
+        tmp_path, monkeypatch, handler=lambda args: called.set(),
+        on_rpc_begin=lambda name: False)
+    assert response["error"] == "mission_finalizing"
+    assert not called.is_set()
+
+
+def test_rpc_accepted_normalizes_dict_and_runs_before_response(tmp_path, monkeypatch):
+    events = []
+
+    def accepted(name, args, outcome):
+        events.append((name, args, outcome))
+
+    _, response = _run_fake_tool_rpc(
+        tmp_path, monkeypatch, handler=lambda args: {"value": 7},
+        on_rpc_begin=lambda name: True, on_rpc_accepted=accepted)
+    from agentic_fx.tools.improve_rpc_tools import RpcOutcome
+    assert isinstance(events[0][2], RpcOutcome)
+    assert events[0][2].private is None
+    assert response["result"] == {"value": 7}
+
+
+@pytest.mark.parametrize("mode", ["error", "timeout"])
+def test_rpc_error_and_timeout_release_reservation(tmp_path, monkeypatch, mode):
+    released = []
+
+    def handler(args):
+        if mode == "error":
+            raise RuntimeError("boom")
+        time.sleep(0.2)
+        return {"late": True}
+
+    _, response = _run_fake_tool_rpc(
+        tmp_path, monkeypatch, handler=handler,
+        timeout=0.05 if mode == "timeout" else 1.0,
+        on_rpc_begin=lambda name: True, on_rpc_released=released.append)
+    assert released == ["run_backtest"]
+    assert response["ok"] is False
+
+
+def test_rpc_callback_exceptions_do_not_replace_response(tmp_path, monkeypatch):
+    _, response = _run_fake_tool_rpc(
+        tmp_path, monkeypatch, handler=lambda args: {"value": 9},
+        on_rpc_begin=lambda name: (_ for _ in ()).throw(RuntimeError("begin")),
+        on_rpc_accepted=lambda *args: (_ for _ in ()).throw(RuntimeError("accepted")))
+    assert response == {"type": "tool_rpc_result", "seq": 3,
+                        "rpc_id": "r1", "ok": True, "result": {"value": 9}}
+
+
+def test_rpc_timeout_then_handler_completion_before_freeze_is_not_recorded(
+        tmp_path, monkeypatch):
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    barrier = threading.Barrier(2)
+    reservations = {}
+
+    def begin(name):
+        reservations[name] = ledger.begin_accept()
+        return True
+
+    def released(name):
+        ledger.end_accept(reservations.pop(name))
+
+    def handler(args):
+        barrier.wait()
+        return {"trial_count": 9}
+
+    _run_fake_tool_rpc(
+        tmp_path, monkeypatch, handler=handler, timeout=0.05,
+        on_rpc_begin=begin,
+        on_rpc_accepted=lambda *args: ledger.record(
+            opaque_ref="late", kind="run_backtest", params={},
+            result_summary={}, trial_count=9),
+        on_rpc_released=released)
+    barrier.wait()
+    ledger.freeze()
+    assert ledger.entries() == []
+
+
 def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
         monkeypatch, tmp_path):
     """(裁定 R1/RB3、§7.1-2 の blocking 受入条件、A-4 検収是正 B2)

@@ -30,6 +30,7 @@ from agentic_fx.core.mission_protocol import (
 from agentic_fx.plugin.sandbox import _build_env
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
 from agentic_fx.store.rag import Rag
+from agentic_fx.tools.improve_rpc_tools import RpcOutcome
 
 import logging
 
@@ -89,6 +90,9 @@ class WorkerRunner(AgentRunner):
                 on_ready: Callable[[dict], None] | None = None,
                 rpc_handlers: dict[str, Callable] | None = None,
                 rpc_timeout_sec_by_kind: Mapping[str, float] | None = None,
+                on_rpc_begin: Callable[[str], bool] | None = None,
+                on_rpc_accepted: Callable[[str, dict, RpcOutcome], None] | None = None,
+                on_rpc_released: Callable[[str], None] | None = None,
                 stop_event: threading.Event | None = None) -> None:
         self._root = root
         self._settings = settings
@@ -100,6 +104,9 @@ class WorkerRunner(AgentRunner):
         self._on_ready = on_ready
         self._rpc_handlers = rpc_handlers
         self._rpc_timeout_sec_by_kind = dict(rpc_timeout_sec_by_kind or {})
+        self._on_rpc_begin = on_rpc_begin
+        self._on_rpc_accepted = on_rpc_accepted
+        self._on_rpc_released = on_rpc_released
         self._stop_event = stop_event
 
     def close(self) -> None:
@@ -289,6 +296,28 @@ class WorkerRunner(AgentRunner):
                 result_queue: "queue.Queue[tuple[bool, object]]" = (
                     queue.Queue(maxsize=1))
 
+                accepted = True
+                if self._on_rpc_begin is not None:
+                    try:
+                        accepted = self._on_rpc_begin(frame["name"]) is not False
+                    except Exception:  # noqa: BLE001
+                        _log.warning("on_rpc_begin callback failed", exc_info=True)
+                if not accepted:
+                    out_seq_holder["n"] += 1
+                    result_frame = {
+                        "type": "tool_rpc_result",
+                        "seq": out_seq_holder["n"] + 1,
+                        "rpc_id": frame["rpc_id"], "ok": False,
+                        "error": "mission_finalizing"}
+                    try:
+                        with stdin_lock:
+                            if stdin_state["closed"]:
+                                return
+                            write_frame(proc.stdin, result_frame)
+                    except (BrokenPipeError, OSError, ValueError):
+                        return
+                    continue
+
                 def _rpc_worker(name=frame["name"], args=frame["args"]) -> None:
                     try:
                         result_queue.put((True, self._dispatch_rpc(name, args)))
@@ -302,8 +331,26 @@ class WorkerRunner(AgentRunner):
                 payload = None
                 try:
                     ok, payload = result_queue.get(timeout=rpc_timeout_sec)
-                    response = ({"ok": True, "result": payload} if ok
-                               else {"ok": False, "error": payload})
+                    if ok:
+                        outcome = (payload if isinstance(payload, RpcOutcome)
+                                   else RpcOutcome(public=payload, private=None))
+                        if self._on_rpc_accepted is not None:
+                            try:
+                                self._on_rpc_accepted(
+                                    frame["name"], frame["args"], outcome)
+                            except Exception:  # noqa: BLE001
+                                _log.warning("on_rpc_accepted callback failed",
+                                             exc_info=True)
+                        payload = outcome.public
+                        response = {"ok": True, "result": payload}
+                    else:
+                        if self._on_rpc_released is not None:
+                            try:
+                                self._on_rpc_released(frame["name"])
+                            except Exception:  # noqa: BLE001
+                                _log.warning("on_rpc_released callback failed",
+                                             exc_info=True)
+                        response = {"ok": False, "error": payload}
                 except queue.Empty:
                     _log.error("RAG RPC leaked past rpc_timeout_sec=%s "
                               "(name=%s) — this thread will never be "
@@ -316,6 +363,12 @@ class WorkerRunner(AgentRunner):
                             self._on_rpc_leak()
                         except Exception:  # noqa: BLE001
                             _log.exception("on_rpc_leak callback failed")
+                    if self._on_rpc_released is not None:
+                        try:
+                            self._on_rpc_released(frame["name"])
+                        except Exception:  # noqa: BLE001
+                            _log.warning("on_rpc_released callback failed",
+                                         exc_info=True)
                     response = {"ok": False, "error": "rag rpc timed out"}
                 out_seq_holder["n"] += 1
                 result_frame = {
