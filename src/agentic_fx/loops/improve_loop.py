@@ -75,6 +75,48 @@ def accepted_entries(entries):
     return [e for e in entries if "error" not in e["result_summary"]]
 
 
+def _is_numeric(value) -> bool:
+    """T4 §1 L3: `bool` は `int` の subclass なので明示的に除く。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def best_candidate(rows: list[dict]) -> dict | None:
+    """`candidate_archives.list_by_mission` の行から best を 1 件選ぶ
+    (ブリーフ「変更点」1)。順序 = `metrics.evaluable` (True 先) →
+    `trades` desc → `pf` desc (None/非数値は最下) → `max_drawdown` asc
+    (None は最下)。同点は id 昇順で先頭 (決定的)。行 0 件は `None`。"""
+    if not rows:
+        return None
+
+    def sort_key(row: dict):
+        metrics = row.get("metrics") or {}
+        evaluable_rank = 0 if metrics.get("evaluable") else 1
+        trades = metrics.get("trades")
+        trades_rank = -trades if _is_numeric(trades) else float("inf")
+        pf = metrics.get("pf")
+        pf_rank = -pf if _is_numeric(pf) else float("inf")
+        max_drawdown = metrics.get("max_drawdown")
+        dd_rank = max_drawdown if _is_numeric(max_drawdown) else float("inf")
+        return (evaluable_rank, trades_rank, pf_rank, dd_rank, row["id"])
+
+    return min(rows, key=sort_key)
+
+
+def _format_metric(value) -> str:
+    return f"{value:.3f}" if _is_numeric(value) else "-"
+
+
+def _best_label(best: dict | None) -> str | None:
+    """`best_candidate()` の 1 行から `<name>@<hash8> pf=.. dd=..` を作る。
+    `best` が `None` なら `None` (呼び出し側は「best 無し」を意味する)。"""
+    if best is None:
+        return None
+    metrics = best.get("metrics") or {}
+    hash8 = str(best.get("artifact_hash", ""))[:8]
+    return (f"{best.get('name')}@{hash8} pf={_format_metric(metrics.get('pf'))} "
+            f"dd={_format_metric(metrics.get('max_drawdown'))}")
+
+
 class _BacktestReply(dict):
     """公開応答とは別に、同一プロセスのTx-2用元データを保持する。"""
 
@@ -509,6 +551,8 @@ class ImproveLoop:
                         ctx.ledger.mark_persist_failed()
                 else:
                     ctx.ledger.mark_persisted()
+            self._write_archive_index_safe(
+                conn, ctx=ctx, status="commit_failed", now=now)
         except Exception:
             _log.exception(
                 "commit failure compensation itself failed for mission_id=%s "
@@ -1453,6 +1497,76 @@ class ImproveLoop:
                 Category.IMPROVE, "archive_failed",
                 f"mission={mission_id} hash={artifact_hash} reason={reason}")
 
+    def _archive_rows_for_note(self, conn, *, mission_id: int) -> list[dict]:
+        """T4 変更点2: note 用の best を、`_persist_ledger_in_tx` の後・
+        `finish_improve_mission` の前、**同じ tx 内**で読む。例外は活動記録
+        のみで終端を止めない (ブリーフ「テスト」節)。"""
+        from agentic_fx.store import candidate_archives as candidate_archives_store
+        try:
+            return candidate_archives_store.list_by_mission(conn, mission_id)
+        except Exception as exc:
+            if self._activity is not None:
+                self._activity.write(
+                    Category.IMPROVE, "best_candidate_lookup_failed",
+                    f"mission={mission_id} reason="
+                    f"{type(exc).__name__}:{str(exc)[:300]}")
+            return []
+
+    @staticmethod
+    def _best_note_suffix(best: dict | None) -> str:
+        """T4 変更点2: note の `last_result` 末尾に付ける
+        ` best=<name>@<hash8> pf=<pf> dd=<dd> archive=<archive_path>`。
+        `best` が `None` なら空文字 (何も付けない)。"""
+        label = _best_label(best)
+        if label is None:
+            return ""
+        archive = best.get("archive_path") or "-"
+        return f" best={label} archive={archive}"
+
+    def _append_archive_index(self, ctx, *, status: str, rows: list[dict],
+                              now: datetime) -> None:
+        """T4 変更点3: `plugins/_archive/INDEX.md` に 1 mission 1 行を
+        追記する。呼び出し元が `rows` (0 件でないことを確認済み) を渡す。"""
+        index_path = self._root / "plugins" / "_archive" / "INDEX.md"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        best = best_candidate(rows)
+        label = _best_label(best)
+        best_cell = f"best={label}" if label is not None else "-"
+        archive_cell = "-"
+        if best is not None:
+            archive_cell = best.get("archive_path") or "-"
+        line = (f"| {now.isoformat()} | mission {ctx.mission_id} | {status} "
+                f"| candidates={len(rows)} | {best_cell} | {archive_cell} |\n")
+        is_new = not index_path.exists()
+        with open(index_path, "a") as fh:
+            if is_new:
+                fh.write(
+                    "| date | mission | status | candidates | best | "
+                    "archive |\n")
+                fh.write("| --- | --- | --- | --- | --- | --- |\n")
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def _write_archive_index_safe(self, conn, *, ctx, status: str,
+                                  now: datetime) -> None:
+        """T4 変更点3: 終端 tx の**外側 commit 成功後**に呼ぶ。行 0 件の
+        mission は書かない。`OSError` (readonly dir 等) を含むあらゆる
+        例外は `archive_index_failed` activity にして終端を壊さない
+        (ブリーフ「変更点」3・「テスト」節)。"""
+        from agentic_fx.store import candidate_archives as candidate_archives_store
+        try:
+            rows = candidate_archives_store.list_by_mission(conn, ctx.mission_id)
+            if not rows:
+                return
+            self._append_archive_index(ctx, status=status, rows=rows, now=now)
+        except Exception as exc:
+            if self._activity is not None:
+                self._activity.write(
+                    Category.IMPROVE, "archive_index_failed",
+                    f"mission={ctx.mission_id} reason="
+                    f"{type(exc).__name__}:{str(exc)[:300]}")
+
     @staticmethod
     def _remove_archive_tmp(path: Path) -> None:
         import shutil
@@ -1584,6 +1698,8 @@ class ImproveLoop:
         self._activity.write(
             Category.IMPROVE, "improve_commit_failed",
             f"mission_id={mission_id} run_id={run_id}")
+        self._write_archive_index_safe(
+            conn, ctx=ctx, status="commit_failed", now=now)
 
     def _finalize_success(self, conn, *, mission_id, run_id, backlog_id,
                           slot_key, approval_payload, now,
@@ -1923,6 +2039,8 @@ class ImproveLoop:
                 ctx.ledger.mark_persist_failed()
             else:
                 ctx.ledger.mark_persisted()
+            self._write_archive_index_safe(
+                conn, ctx=ctx, status="report_failed", now=now)
             return _REPORT_WRITE_FAILED
         final_path = self._final_report_path(
             reports_dir, mission_id=ctx.mission_id, now=now)
@@ -1993,6 +2111,10 @@ class ImproveLoop:
             ctx.ledger.mark_persist_failed()
         else:
             ctx.ledger.mark_persisted()
+        self._write_archive_index_safe(
+            conn, ctx=ctx,
+            status=("report" if report_path is not None else "observation"),
+            now=now)
         # 成功系 activity は commit 成功後 (1 周目 F2。`_finalize_success` と同じ理由)。
         if self._activity is not None and report_path is None:
                 self._activity.write(
@@ -2133,14 +2255,19 @@ class ImproveLoop:
                         "improve mission が backtest 完走後に時間切れで終了した "
                         "(最終出力なし)。backtest の結果を得たら self-test の修正に"
                         "戻らず、早めに提出か observation を出すこと")
+                # T4 変更点2: note の best は `_persist_ledger_in_tx` の後・
+                # `finish_improve_mission` の前、同じ tx 内で読む。
+                archive_rows = self._archive_rows_for_note(
+                    conn, mission_id=ctx.mission_id)
+                last_result = (
+                    f"mission #{ctx.mission_id} status={result.status} "
+                    f"reason={result.reason or '-'} "
+                    f"run_backtest={n_bt} analyze_corr={n_corr}")
+                last_result += self._best_note_suffix(
+                    best_candidate(archive_rows))
                 try:
                     backlog_store.upsert_system_note(
-                        conn,
-                        idea=idea,
-                        last_result=(f"mission #{ctx.mission_id} status={result.status} "
-                                     f"reason={result.reason or '-'} "
-                                     f"run_backtest={n_bt} analyze_corr={n_corr}"),
-                        now=now)
+                        conn, idea=idea, last_result=last_result, now=now)
                 except sqlite3.Error as e:
                     self._activity.write(
                         Category.IMPROVE, "backlog_note_failed",
@@ -2159,12 +2286,18 @@ class ImproveLoop:
             ctx.ledger.mark_persist_failed()
         else:
             ctx.ledger.mark_persisted()
+        self._write_archive_index_safe(
+            conn, ctx=ctx, status="failed", now=now)
 
     def _finalize_output_invalid(self, conn, *, ctx, reason, now) -> None:
         """§4.2 手順1 不合格 (schema 不整合・`artifact.name` 非正規形・
         `staging_dir/<name>` 異常等) → Mission `failed`、
         `improvement_runs.result` は NULL のまま、staging 削除、
-        台帳 `DISCARDED`。backlog は Tx-1 未到達のため遷移なし。"""
+        台帳 `DISCARDED`。backlog は Tx-1 未到達のため遷移なし。
+
+        T4 変更点2: `_finalize_failed_mission` の型 A/B/C と対の system
+        note を新設する (型 A の「最終出力なし」の流用ではなく、
+        schema/名前検査不合格専用の文面)。best があれば末尾に付く。"""
         self._delete_staging(ctx)
         self._activity.write(
             Category.IMPROVE, "output_invalid",
@@ -2174,6 +2307,21 @@ class ImproveLoop:
         try:
             ledger_ids = self._persist_ledger_in_tx(
                 conn, ctx=ctx, now=now, mission_outcome="output_invalid")
+            archive_rows = self._archive_rows_for_note(
+                conn, mission_id=ctx.mission_id)
+            idea = (
+                "improve mission の最終出力が schema/名前検査に不合格。"
+                "出力 schema を守り、candidate 名は "
+                "`^[a-z][a-z0-9_]{0,63}$` に従うこと")
+            last_result = f"mission #{ctx.mission_id} reason={reason}"
+            last_result += self._best_note_suffix(best_candidate(archive_rows))
+            try:
+                backlog_store.upsert_system_note(
+                    conn, idea=idea, last_result=last_result, now=now)
+            except sqlite3.Error as e:
+                self._activity.write(
+                    Category.IMPROVE, "backlog_note_failed",
+                    f"mission={ctx.mission_id} {safe_error_text(e)}")
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="failed",
@@ -2187,6 +2335,8 @@ class ImproveLoop:
             ctx.ledger.mark_persist_failed()
         else:
             ctx.ledger.mark_persisted()
+        self._write_archive_index_safe(
+            conn, ctx=ctx, status="output_invalid", now=now)
 
     def _finalize_loser(self, conn, *, ctx, output, now) -> None:
         """§4.2 手順2 敗者経路 (Tx-1 の選択 CAS で rowcount=0):
@@ -2233,6 +2383,8 @@ class ImproveLoop:
                 ctx.ledger.mark_persist_failed()
             else:
                 ctx.ledger.mark_persisted()
+            self._write_archive_index_safe(
+                conn, ctx=ctx, status="report_failed", now=now)
             return
         final_path = self._final_report_path(
             reports_dir, mission_id=ctx.mission_id, now=now)
@@ -2256,6 +2408,8 @@ class ImproveLoop:
             ctx.ledger.mark_persist_failed()
         else:
             ctx.ledger.mark_persisted()
+        self._write_archive_index_safe(
+            conn, ctx=ctx, status="loser", now=now)
         self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
                              final_path=final_path, now=now)
 
@@ -2328,6 +2482,8 @@ class ImproveLoop:
                 ctx.ledger.mark_persist_failed()
             else:
                 ctx.ledger.mark_persisted()
+            self._write_archive_index_safe(
+                conn, ctx=ctx, status="report_failed", now=now)
             return
         final_path = self._final_report_path(
             reports_dir, mission_id=ctx.mission_id, now=now)
@@ -2358,5 +2514,7 @@ class ImproveLoop:
             ctx.ledger.mark_persist_failed()
         else:
             ctx.ledger.mark_persisted()
+        self._write_archive_index_safe(
+            conn, ctx=ctx, status="gate_failed", now=now)
         self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
                              final_path=final_path, now=now)

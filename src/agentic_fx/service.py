@@ -832,7 +832,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         try:
             switch.sweep_orphans(
                 conn_core, plugins_root=plugins_dir, now=clock.now(),
-                activity=activity)
+                activity=activity,
+                archive_max_bytes=settings.improve.archive_max_bytes,
+                archive_max_missions=settings.improve.archive_max_missions)
         except Exception as exc:
             activity.write(Category.APPROVAL, "plugin_sweep_failed",
                            safe_error_text(exc))

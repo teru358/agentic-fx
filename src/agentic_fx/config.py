@@ -255,6 +255,8 @@ class ImproveSettings(_Strict):
     max_new_backlog_per_mission: int = Field(ge=1, default=20)
     backtest_rpc_timeout_sec: float = Field(gt=0, default=600)
     accept_drain_sec: float = Field(ge=0, default=30.0)
+    archive_max_bytes: int = Field(ge=0, default=200 * 1024 * 1024)
+    archive_max_missions: int = Field(ge=1, default=50)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
     gate: ImproveGateSettings = Field(default_factory=ImproveGateSettings)
     tool_budget: ImproveToolBudgetSettings = ImproveToolBudgetSettings()

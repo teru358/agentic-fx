@@ -24,6 +24,7 @@ from agentic_fx.plugin.gate_pytest import (  # M-8: モジュールレベル imp
 )
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.store import approvals as approvals_store
+from agentic_fx.store import candidate_archives as candidate_archives_store  # T4 §1 L4 の archive GC が使う
 from agentic_fx.store import plugin_switch_journal as journal_store  # Task 8 produces
 
 _PHASE_ORDER = ["preparing", "versioned", "recorded", "switched", "decided", "reverted"]
@@ -208,14 +209,52 @@ def reconcile_switch_journals(conn: sqlite3.Connection, *,
                                f"error={safe_error_text(exc)}")
 
 
+# T4 §1 L4: readonly (0500/0400) な archive final ディレクトリを削除前に
+# 書込可能へ戻す (改善ループ側の `_remove_archive_tmp`/`_delete_staging` と
+# 同じ os.walk 流儀、symlink は chmod しない)。
+def _chmod_tree_writable(path: Path) -> None:
+    for dirpath, _dirnames, filenames in os.walk(path):
+        directory = Path(dirpath)
+        if not directory.is_symlink():
+            directory.chmod(0o700)
+        for filename in filenames:
+            candidate = directory / filename
+            if not candidate.is_symlink():
+                candidate.chmod(0o600)
+
+
+def _archive_dir_size(path: Path) -> int:
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for filename in filenames:
+            fp = Path(dirpath) / filename
+            if fp.is_symlink():
+                continue
+            try:
+                total += fp.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
 # precheck 2026-08-22 wave2: T11-B2
 def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime,
-                  activity: "ActivityLog | None" = None) -> None:
+                  activity: "ActivityLog | None" = None,
+                  archive_max_bytes: int | None = None,
+                  archive_max_missions: int | None = None) -> None:
     """§5.3 起動時 reconcile ①〜⑦ (journal-first の後に呼ぶこと)。B-2 是正:
     activity 記録は journal_store 層 (非実在の `record_activity_error`) では
     なく、呼び出し元であるこの関数が直接 `activity.write` する (層違反の
     解消)。M-10 是正: tmp スキップ条件は 1 桁の op_identity にしか一致しない
-    バグがあったため `".tmp-" in name` の部分一致に変える。"""
+    バグがあったため `".tmp-" in name` の部分一致に変える。
+
+    T4 §1 L4 (このドキュメントの ①〜⑦ とは別建ての番号): `plugins/_archive/`
+    に対して archive GC ⑥ (startup 限定 tmp 回収)・⑦ (バイト/mission 数上限
+    GC)・⑦′ (path 不存在の再収束) を行う。**⑥ は runner 起動前の startup
+    sweep だけが呼ぶ前提** — この関数の呼び出し元は `service.py` の起動時
+    reconcile 一箇所のみで、前プロセスの handler は存在しない。runtime GC
+    (mission 実行中) に転用するなら age cutoff が要る (在走中 handler の
+    `.tmp-*` を消してしまう)。"""
     roots = version_store.gc_roots(conn, plugins_root=plugins_root)
 
     # ① 孤児 staging (対応する pending approval_request の候補パスが無いもの)
@@ -329,6 +368,124 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
             activity.write(Category.APPROVAL, "legacy_plain_present_pending_count",
                            f"count={legacy_count}")
 
+    # archive GC ⑥ (T4 §1 L4、docstring 参照): startup 限定 tmp 回収。
+    # publish されなかった `.tmp-*` を無条件に chmod → rmtree する。
+    archive_root = plugins_root / "_archive"
+    if archive_root.is_dir():
+        for mission_dir in archive_root.iterdir():
+            if mission_dir.is_symlink() or not mission_dir.is_dir():
+                continue
+            if not mission_dir.name.isdigit():
+                continue
+            for tmp_dir in mission_dir.glob(".tmp-*"):
+                if tmp_dir.is_symlink():
+                    try:
+                        tmp_dir.unlink()
+                    except OSError:
+                        pass
+                    continue
+                try:
+                    _chmod_tree_writable(tmp_dir)
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                except OSError as exc:
+                    if activity is not None:
+                        activity.write(
+                            Category.APPROVAL, "sweep_archive_tmp_failed",
+                            f"path={tmp_dir} error={safe_error_text(exc)}")
+
+    # T4 変更点6: 孤立 final (`candidate_archives` に (mission_id,
+    # artifact_hash) の行が無い final ディレクトリ) を activity に出す。
+    # 削除しない (2 回目補償が拾えるようにする)。
+    if archive_root.is_dir():
+        for mission_dir in archive_root.iterdir():
+            if mission_dir.is_symlink() or not mission_dir.is_dir():
+                continue
+            if not mission_dir.name.isdigit():
+                continue
+            mission_id = int(mission_dir.name)
+            known_hashes = {
+                r["artifact_hash"] for r in conn.execute(
+                    "SELECT artifact_hash FROM candidate_archives "
+                    "WHERE mission_id=? AND archive_path IS NOT NULL",
+                    (mission_id,))}
+            for entry in mission_dir.iterdir():
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+                if entry.name.startswith(".tmp-"):
+                    continue
+                if entry.name not in known_hashes and activity is not None:
+                    activity.write(
+                        Category.APPROVAL, "archive_orphan_final",
+                        f"path={entry}")
+
+    # archive GC ⑦ (T4 §1 L4): バイト/mission 数上限。数字名の mission dir
+    # だけを対象に mission_id 昇順 (古い順) に削除する。symlink は追わず
+    # link 自体も触らない。INDEX.md・数字でない名前は無視 (上の iterdir
+    # フィルタで既に除外済み)。削除できたことを確認してから
+    # `candidate_archives.clear_path` する — branch 全体を 1 tx で commit。
+    if archive_root.is_dir() and (archive_max_bytes is not None or
+                                  archive_max_missions is not None):
+        mission_dirs = sorted(
+            (entry for entry in archive_root.iterdir()
+             if not entry.is_symlink() and entry.is_dir()
+             and entry.name.isdigit()),
+            key=lambda p: int(p.name))
+        sizes = {p: _archive_dir_size(p) for p in mission_dirs}
+        total_bytes = sum(sizes.values())
+        n_missions = len(mission_dirs)
+        committed_any = False
+        while mission_dirs and (
+                (archive_max_bytes is not None and
+                 total_bytes > archive_max_bytes) or
+                (archive_max_missions is not None and
+                 n_missions > archive_max_missions)):
+            victim = mission_dirs.pop(0)
+            victim_size = sizes.pop(victim)
+            try:
+                _chmod_tree_writable(victim)
+                shutil.rmtree(victim, ignore_errors=True)
+            except OSError as exc:
+                if activity is not None:
+                    activity.write(
+                        Category.APPROVAL, "sweep_archive_failed",
+                        f"path={victim} error={safe_error_text(exc)}")
+                continue
+            if victim.exists():
+                if activity is not None:
+                    activity.write(
+                        Category.APPROVAL, "sweep_archive_failed",
+                        f"path={victim} error=rmtree_incomplete")
+                continue
+            total_bytes -= victim_size
+            n_missions -= 1
+            mission_id = int(victim.name)
+            for row in candidate_archives_store.list_by_mission(conn, mission_id):
+                if row["archive_path"] is not None:
+                    candidate_archives_store.clear_path(
+                        conn, row["id"], commit=False)
+                    committed_any = True
+        if committed_any:
+            conn.commit()
+
+    # archive GC ⑦′ (T4 §1 L4): 前回 DB 更新失敗の再収束。`archive_path` が
+    # 非 NULL なのに dir が無い行を `clear_path` する (上の ⑦ が消した分は
+    # 既に NULL なので対象外、対象は別プロセス/前回起動でのクラッシュ跡)。
+    root_dir = plugins_root.parent
+    stale_missions = {
+        r["mission_id"] for r in conn.execute(
+            "SELECT DISTINCT mission_id FROM candidate_archives "
+            "WHERE archive_path IS NOT NULL")}
+    cleared_any = False
+    for mission_id in stale_missions:
+        for row in candidate_archives_store.list_by_mission(conn, mission_id):
+            path = row["archive_path"]
+            if path is None:
+                continue
+            if not (root_dir / path).exists():
+                candidate_archives_store.clear_path(conn, row["id"], commit=False)
+                cleared_any = True
+    if cleared_any:
+        conn.commit()
 
 # ============================================================
 # candidate_origin/candidate_path payload validator (§8.1-29、プラン10 Task 11d 逐語)

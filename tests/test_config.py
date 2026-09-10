@@ -534,7 +534,18 @@ def test_settings_yaml_example_has_improve_settings():
     assert s.improve.max_new_backlog_per_mission >= 1
     assert s.improve.backtest_rpc_timeout_sec > 0
     assert s.improve.accept_drain_sec == 30.0
+    assert s.improve.archive_max_bytes == 200 * 1024 * 1024
+    assert s.improve.archive_max_missions == 50
     assert s.improve.research.max_searches >= 1
+
+
+def test_improve_settings_archive_gc_defaults_without_yaml():
+    """T4 §1 L4: `ImproveSettings` の既定値そのもの (yaml に無くても効く)。"""
+    from agentic_fx.config import ImproveSettings
+
+    s = ImproveSettings()
+    assert s.archive_max_bytes == 200 * 1024 * 1024
+    assert s.archive_max_missions == 50
 
 
 def test_settings_yaml_example_has_schedule_improve_at():

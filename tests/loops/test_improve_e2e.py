@@ -831,8 +831,10 @@ def test_strategy_below_evaluable_min_trades_becomes_observation(improve_env):
 def test_artifact_name_traversal_fails_mission(improve_env):
     """§4.2-1: `artifact.name` が正規形 (`^[a-z][a-z0-9_]{0,63}$`) でない
     (`../` を含む) 候補は出力検査で不合格になり、Mission は `failed`。
-    Tx-1 (backlog 追記・選択) には一切進まない — backlog 行は 0 件のまま
-    (敗者経路とも異なり、遷移そのものが起きない)。"""
+    Tx-1 (backlog 追記・選択) には一切進まない (敗者経路とも異なり、遷移
+    そのものが起きない) — `source != 'system'` の行は 0 件のまま。T4
+    変更点2 が `_finalize_output_invalid` に system note (source='system',
+    status='note') を新設したため、そちらは別途 1 件だけ増える。"""
     app, root = improve_env
     conn = app.conn_core
 
@@ -860,8 +862,16 @@ def test_artifact_name_traversal_fails_mission(improve_env):
     assert mission_row[0] == "failed"
 
     backlog_count = conn.execute(
-        "SELECT COUNT(*) FROM improvement_backlog").fetchone()[0]
+        "SELECT COUNT(*) FROM improvement_backlog WHERE source != 'system'"
+    ).fetchone()[0]
     assert backlog_count == 0
+
+    note = conn.execute(
+        "SELECT idea, last_result FROM improvement_backlog "
+        "WHERE source='system' AND status='note'").fetchone()
+    assert note is not None
+    assert "schema" in note["idea"]
+    assert f"mission #{ctx.mission_id}" in note["last_result"]
 
     approval_count = conn.execute(
         "SELECT COUNT(*) FROM approval_requests WHERE kind='plugin'").fetchone()[0]
