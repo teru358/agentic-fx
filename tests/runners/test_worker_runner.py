@@ -3942,13 +3942,44 @@ def test_rpc_error_and_timeout_release_reservation(tmp_path, monkeypatch, mode):
     assert response["ok"] is False
 
 
-def test_rpc_callback_exceptions_do_not_replace_response(tmp_path, monkeypatch):
+def test_rpc_begin_exception_is_fail_closed(tmp_path, monkeypatch):
+    """codex 1 周目 Important (2026-09-10): begin が例外なら予約の有無が
+    不明なので handler を起動しない (fail-closed)。応答は返る。"""
+    started = []
+    _, response = _run_fake_tool_rpc(
+        tmp_path, monkeypatch,
+        handler=lambda args: started.append(args) or {"value": 9},
+        on_rpc_begin=lambda name: (_ for _ in ()).throw(RuntimeError("begin")))
+    assert started == []
+    assert response == {"type": "tool_rpc_result", "seq": 3,
+                        "rpc_id": "r1", "ok": False, "error": "rpc_begin_failed"}
+
+
+def test_rpc_accepted_exception_keeps_response_and_releases_reservation(
+        tmp_path, monkeypatch):
+    """accepted が例外でも成功応答は維持し、予約は released fallback で
+    解放される (実 ledger で freeze の dropped が 0 になることを観測)。"""
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    reservations = {}
+
+    def begin(name):
+        reservations[name] = ledger.begin_accept()
+        return reservations[name] is not None
+
+    def release(name):
+        ledger.end_accept(reservations.pop(name, None))
+
     _, response = _run_fake_tool_rpc(
         tmp_path, monkeypatch, handler=lambda args: {"value": 9},
-        on_rpc_begin=lambda name: (_ for _ in ()).throw(RuntimeError("begin")),
-        on_rpc_accepted=lambda *args: (_ for _ in ()).throw(RuntimeError("accepted")))
+        on_rpc_begin=begin,
+        on_rpc_accepted=lambda *args: (_ for _ in ()).throw(RuntimeError("accepted")),
+        on_rpc_released=release)
     assert response == {"type": "tool_rpc_result", "seq": 3,
                         "rpc_id": "r1", "ok": True, "result": {"value": 9}}
+    dropped = []
+    ledger.freeze(drain_timeout_sec=0.0, on_timeout=dropped.append)
+    assert dropped == []
 
 
 def test_rpc_timeout_then_handler_completion_before_freeze_is_not_recorded(

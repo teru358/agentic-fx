@@ -296,19 +296,25 @@ class WorkerRunner(AgentRunner):
                 result_queue: "queue.Queue[tuple[bool, object]]" = (
                     queue.Queue(maxsize=1))
 
+                # 受理境界 (codex 1 周目 Important、2026-09-10): begin が
+                # 例外でも fail-closed — 予約の有無が不明なまま handler を
+                # 起動すると commit 相の freeze と並走する。
                 accepted = True
+                begin_error = "mission_finalizing"
                 if self._on_rpc_begin is not None:
                     try:
                         accepted = self._on_rpc_begin(frame["name"]) is not False
                     except Exception:  # noqa: BLE001
                         _log.warning("on_rpc_begin callback failed", exc_info=True)
+                        accepted = False
+                        begin_error = "rpc_begin_failed"
                 if not accepted:
                     out_seq_holder["n"] += 1
                     result_frame = {
                         "type": "tool_rpc_result",
                         "seq": out_seq_holder["n"] + 1,
                         "rpc_id": frame["rpc_id"], "ok": False,
-                        "error": "mission_finalizing"}
+                        "error": begin_error}
                     try:
                         with stdin_lock:
                             if stdin_state["closed"]:
@@ -341,6 +347,15 @@ class WorkerRunner(AgentRunner):
                             except Exception:  # noqa: BLE001
                                 _log.warning("on_rpc_accepted callback failed",
                                              exc_info=True)
+                                # accepted が record 前に落ちた場合の予約解放
+                                # fallback (release 側は冪等)。
+                                if self._on_rpc_released is not None:
+                                    try:
+                                        self._on_rpc_released(frame["name"])
+                                    except Exception:  # noqa: BLE001
+                                        _log.warning(
+                                            "on_rpc_released callback failed",
+                                            exc_info=True)
                         payload = outcome.public
                         response = {"ok": True, "result": payload}
                     else:

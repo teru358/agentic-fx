@@ -891,15 +891,17 @@ class ImproveLoop:
             ctx.ledger.end_accept(reservation)
 
         def on_rpc_accepted(name: str, args: dict, outcome: RpcOutcome) -> None:
-            summary = outcome.private or outcome.public
-            if name == "run_backtest":
-                opaque_ref = f"run_backtest:{args['name']}:{args['pair']}"
-                params = {"name": args["name"], "pair": args["pair"]}
-            else:
-                request = args.get("request", args)
-                opaque_ref = f"analyze_corr:{id(request)}"
-                params = request
+            # 前処理 (summary / opaque_ref / params) も finally の中 — ここで
+            # 落ちると予約が残り freeze が drain 全時間を待つ (codex 1 周目)。
             try:
+                summary = outcome.private or outcome.public
+                if name == "run_backtest":
+                    opaque_ref = f"run_backtest:{args['name']}:{args['pair']}"
+                    params = {"name": args["name"], "pair": args["pair"]}
+                else:
+                    request = args.get("request", args)
+                    opaque_ref = f"analyze_corr:{id(request)}"
+                    params = request
                 ctx.ledger.record(
                     opaque_ref=opaque_ref, kind=name, params=params,
                     result_summary=summary,

@@ -78,6 +78,25 @@ def test_build_worker_runner_records_private_outcome_and_releases(loop_and_ctx):
         "result_summary": private, "trial_count": 4}]
 
 
+def test_build_worker_runner_accepted_preprocessing_failure_still_releases(
+        loop_and_ctx):
+    """codex 1 周目 Important (2026-09-10): summary / opaque_ref の前処理で
+    例外になっても予約は解放される (freeze が drain を待たない)。"""
+    loop, ctx, _conn = loop_and_ctx
+    ctx.rpc_handlers.update({
+        "run_backtest": lambda args: {}, "analyze_corr": lambda args: {}})
+    runner = loop._build_worker_runner(ctx)
+    assert runner._on_rpc_begin("run_backtest") is True
+    with pytest.raises(KeyError):
+        runner._on_rpc_accepted(  # args に pair が無い → 前処理で KeyError
+            "run_backtest", {"name": "myst"},
+            RpcOutcome(public={"trial_count": 1}, private=None))
+    dropped = []
+    ctx.ledger.freeze(drain_timeout_sec=0.0, on_timeout=dropped.append)
+    assert dropped == []
+    assert ctx.ledger.entries() == []
+
+
 def test_payload_base_interval_follows_backtest_settings_for_strategy(
         loop_min, conn):
     """A6 (v3 設計): `_build_approval_payload` の base_interval/eval_timeframe
