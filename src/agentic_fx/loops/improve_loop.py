@@ -70,6 +70,11 @@ _log = logging.getLogger("agentic_fx.improve_loop")
 _PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
+def accepted_entries(entries):
+    """Return ledger entries whose RPC result was accepted successfully."""
+    return [e for e in entries if "error" not in e["result_summary"]]
+
+
 class _BacktestReply(dict):
     """公開応答とは別に、同一プロセスのTx-2用元データを保持する。"""
 
@@ -450,13 +455,6 @@ class ImproveLoop:
                 f"mission={ctx.mission_id} status=failed "
                 f"reason=commit_crashed:{type(exc).__name__}:{str(exc)[:300]}")
             try:
-                ctx.ledger.mark_discarded()
-            except Exception:
-                _log.exception(
-                    "ledger discard failed during commit compensation for "
-                    "mission_id=%s — continuing with DB terminalization",
-                    ctx.mission_id)
-            try:
                 self._delete_staging(ctx)
             except Exception:
                 _log.exception(
@@ -465,26 +463,52 @@ class ImproveLoop:
                     ctx.mission_id)
 
             conn = self._db_write_conn_factory()
+            state = ctx.ledger.state()
+            if state == "DISCARDED":
+                return
             conn.execute("BEGIN IMMEDIATE")
+            ledger_ids = [] if state == "PERSISTED" else None
             try:
+                mission_row = conn.execute(
+                    "SELECT status FROM missions WHERE id=?",
+                    (ctx.mission_id,)).fetchone()
+                terminal = mission_row is not None and mission_row["status"] != "running"
+                if state in ("FROZEN", "PERSIST_FAILED"):
+                    already_saved = conn.execute(
+                        "SELECT 1 FROM backtest_runs WHERE mission_id=? "
+                        "AND mission_outcome='commit_failed' LIMIT 1",
+                        (ctx.mission_id,)).fetchone()
+                    if not already_saved:
+                        ledger_ids = self._persist_ledger_in_tx(
+                            conn, ctx=ctx, now=now,
+                            mission_outcome="commit_failed")
+                    else:
+                        ledger_ids = []
                 # `missions.recover_interrupted` と同じ selected backlog の
                 # 収束。関数自体は全 running mission を対象に別 tx を開始
                 # するため再利用せず、この mission の run だけに限定する。
-                conn.execute(
-                    "UPDATE improvement_backlog SET status='observation', "
-                    "last_result='interrupted', updated_at=? WHERE id=("
-                    "SELECT backlog_id FROM improvement_runs WHERE id=?"
-                    ") AND status='selected'",
-                    (now.isoformat(), ctx.run_id))
-                missions_store.finish_improve_mission(
-                    conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
-                    slot_key=ctx.slot_key if slot_terminalize else None,
-                    mission_status="failed", run_result=None, now=now,
-                    backlog_transition=None, commit=False)
+                if not terminal:
+                    conn.execute(
+                        "UPDATE improvement_backlog SET status='observation', "
+                        "last_result='interrupted', updated_at=? WHERE id=("
+                        "SELECT backlog_id FROM improvement_runs WHERE id=?"
+                        ") AND status='selected'",
+                        (now.isoformat(), ctx.run_id))
+                    missions_store.finish_improve_mission(
+                        conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                        slot_key=ctx.slot_key if slot_terminalize else None,
+                        mission_status="failed", run_result=None, now=now,
+                        backlog_transition=None, commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
                 raise
+            if state in ("FROZEN", "PERSIST_FAILED"):
+                if ledger_ids is None:
+                    if state == "FROZEN":
+                        ctx.ledger.mark_persist_failed()
+                else:
+                    ctx.ledger.mark_persisted()
         except Exception:
             _log.exception(
                 "commit failure compensation itself failed for mission_id=%s "
@@ -1175,7 +1199,7 @@ class ImproveLoop:
                                 artifact_hash, ctx_ledger, mission_id,
                                 backlog_id, candidate_origin, candidate_path,
                                 gate_metrics, output, now) -> dict:
-        entries = ctx_ledger.entries()
+        entries = accepted_entries(ctx_ledger.entries())
         analysis_entries = [e for e in entries if e["kind"] == "analyze_corr"]
         backtest_entries = [e for e in entries if e["kind"] == "run_backtest"]
         trial_count = sum(e["trial_count"] for e in entries)
@@ -1393,7 +1417,8 @@ class ImproveLoop:
     _ANALYSIS_ROW_KEYS = ("params", "trial_count", "source")
 
     def _persist_ledger_rows(self, conn, *, ledger_entries, now,
-                             mission_id: int | None = None) -> list[int]:
+                             mission_id: int | None = None,
+                             mission_outcome: str) -> list[int]:
         """10.10 Step 3: 台帳から analysis_runs/backtest_runs へ永続化。"""
         from agentic_fx.store import analysis_runs as analysis_runs_store
         from agentic_fx.store import backtest_runs as backtest_runs_store
@@ -1406,12 +1431,14 @@ class ImproveLoop:
                     Category.IMPROVE, "ledger_entry_skipped_error",
                     f"mission={mission_id} kind={entry['kind']} "
                     f"error={summary['error']!r}")
-                continue
+        for entry in accepted_entries(ledger_entries):
+            summary = entry["result_summary"]
             if entry["kind"] == "run_backtest":
                 row_kwargs = {k: summary[k] for k in self._BACKTEST_ROW_KEYS}
                 backtest_runs_store.save_harness_run(
                     conn, commit=False, variant="candidate",
-                    mission_id=mission_id, **row_kwargs)
+                    mission_id=mission_id, mission_outcome=mission_outcome,
+                    **row_kwargs)
             elif entry["kind"] == "analyze_corr":
                 row_kwargs = {k: summary[k] for k in self._ANALYSIS_ROW_KEYS}
                 run_id = analysis_runs_store.save(
@@ -1419,6 +1446,106 @@ class ImproveLoop:
                     **row_kwargs)
                 analysis_run_ids.append(run_id)
         return analysis_run_ids
+
+    def _archive_failed(self, *, mission_id, artifact_hash, reason) -> None:
+        if self._activity is not None:
+            self._activity.write(
+                Category.IMPROVE, "archive_failed",
+                f"mission={mission_id} hash={artifact_hash} reason={reason}")
+
+    @staticmethod
+    def _remove_archive_tmp(path: Path) -> None:
+        import shutil
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for filename in filenames:
+                candidate = Path(dirpath) / filename
+                if not candidate.is_symlink():
+                    candidate.chmod(0o600)
+            directory = Path(dirpath)
+            if not directory.is_symlink():
+                directory.chmod(0o700)
+        shutil.rmtree(path, ignore_errors=True)
+
+    def _publish_archives(self, conn, *, ctx, now,
+                          mission_outcome: str) -> None:
+        from agentic_fx.plugin.version_store import artifact_hash_bytes, _fsync_dir
+        from agentic_fx.store import candidate_archives
+
+        for entry in accepted_entries(ctx.ledger.entries()):
+            if entry["kind"] != "run_backtest":
+                continue
+            summary = entry["result_summary"]
+            archive_tmp = summary.get("archive_tmp")
+            artifact_hash = summary.get("artifact_hash")
+            if not archive_tmp or not artifact_hash:
+                continue
+            tmp_path = Path(archive_tmp)
+            final_path = self._root / "plugins" / "_archive" / str(
+                ctx.mission_id) / artifact_hash
+            published = False
+            if tmp_path.exists():
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.rename(tmp_path, final_path)
+                    _fsync_dir(final_path.parent)
+                    published = True
+                except OSError as exc:
+                    if isinstance(exc, FileExistsError) or exc.errno in (
+                            errno.EEXIST, errno.ENOTEMPTY):
+                        self._remove_archive_tmp(tmp_path)
+                    else:
+                        self._archive_failed(
+                            mission_id=ctx.mission_id,
+                            artifact_hash=artifact_hash,
+                            reason=f"{type(exc).__name__}:{str(exc)[:300]}")
+                        continue
+            if not published:
+                try:
+                    if final_path.is_symlink() or not final_path.is_dir():
+                        raise ValueError("final_not_regular_directory")
+                    actual = artifact_hash_bytes(
+                        (final_path / "plugin.py").read_bytes(),
+                        (final_path / "config.yaml").read_bytes(),
+                        (final_path / "test_plugin.py").read_bytes())
+                    if actual != artifact_hash:
+                        raise ValueError(f"hash_mismatch:{actual}")
+                    published = True
+                except (OSError, ValueError) as exc:
+                    self._archive_failed(
+                        mission_id=ctx.mission_id, artifact_hash=artifact_hash,
+                        reason=f"{type(exc).__name__}:{str(exc)[:300]}")
+                    continue
+            relative_path = final_path.relative_to(self._root).as_posix()
+            candidate_archives.insert(
+                conn, mission_id=ctx.mission_id,
+                name=entry["params"]["name"],
+                content_hash=summary["content_hash"],
+                artifact_hash=artifact_hash, archive_path=relative_path,
+                pair=summary["pair"], metrics=summary["metrics"], now=now,
+                commit=False)
+
+    def _persist_ledger_in_tx(self, conn, *, ctx, now,
+                              mission_outcome: str) -> list[int] | None:
+        conn.execute("SAVEPOINT ledger")
+        try:
+            # 全 entry を渡す (error entry の `ledger_entry_skipped_error`
+            # activity は _persist_ledger_rows 側で維持、行は accepted のみ)。
+            ids = self._persist_ledger_rows(
+                conn, ledger_entries=ctx.ledger.entries(),
+                now=now, mission_id=ctx.mission_id,
+                mission_outcome=mission_outcome)
+            self._publish_archives(
+                conn, ctx=ctx, now=now, mission_outcome=mission_outcome)
+            conn.execute("RELEASE ledger")
+            return ids
+        except Exception as exc:
+            conn.execute("ROLLBACK TO ledger")
+            conn.execute("RELEASE ledger")
+            self._activity.write(
+                Category.IMPROVE, "ledger_persist_failed",
+                f"mission={ctx.mission_id} reason="
+                f"{type(exc).__name__}:{str(exc)[:300]}")
+            return None
 
     def _persist_gate_rows(self, conn, *, gate_rows, now,
                            mission_id: int | None = None) -> None:
@@ -1429,11 +1556,14 @@ class ImproveLoop:
             backtest_runs_store.save_harness_run(
                 conn, commit=False, mission_id=mission_id, **row)
 
-    def _compensate_tx2_failure(self, conn, *, mission_id, run_id,
+    def _compensate_tx2_failure(self, conn, *, ctx, mission_id, run_id,
                                 backlog_id, slot_key, now) -> None:
         """10.10 Step 3: Tx-2 失敗時の補償 tx。"""
         conn.execute("BEGIN IMMEDIATE")
+        ledger_ids = None
         try:
+            ledger_ids = self._persist_ledger_in_tx(
+                conn, ctx=ctx, now=now, mission_outcome="commit_failed")
             missions_store.finish_improve_mission(
                 conn, mission_id=mission_id, run_id=run_id,
                 slot_key=slot_key, mission_status="failed", run_result=None,
@@ -1447,13 +1577,17 @@ class ImproveLoop:
         except BaseException:
             conn.rollback()
             raise
+        if ledger_ids is None:
+            ctx.ledger.mark_persist_failed()
+        else:
+            ctx.ledger.mark_persisted()
         self._activity.write(
             Category.IMPROVE, "improve_commit_failed",
             f"mission_id={mission_id} run_id={run_id}")
 
     def _finalize_success(self, conn, *, mission_id, run_id, backlog_id,
                           slot_key, approval_payload, now,
-                          ledger_entries=(), gate_rows=()) -> None:
+                          ledger_entries=(), gate_rows=(), ctx=None) -> None:
         """10.10 Step 3: Tx-2 本体 (台帳→gate→approval→finish)。"""
         from agentic_fx.store import approvals as approvals_store
         from agentic_fx.store import missions as missions_store
@@ -1464,17 +1598,35 @@ class ImproveLoop:
                 # precheck 2026-08-23 wave3: RW4 — mission_id (= ctx.mission_id、
                 # commit() が渡すローカル引数) を台帳/親ゲート両方の永続化へ
                 # 転送する。Task 12 の `WHERE mission_id=?` assert が読む列。
-                analysis_run_ids = self._persist_ledger_rows(
-                    conn, ledger_entries=ledger_entries, now=now,
-                    mission_id=mission_id)
+                if ctx is None:
+                    class _EntriesView:
+                        def entries(self):
+                            return list(ledger_entries)
+                        def mark_persisted(self):
+                            return None
+                        def mark_persist_failed(self):
+                            return None
+                        def mark_discarded(self):
+                            return None
+                    from types import SimpleNamespace
+                    persist_ctx = SimpleNamespace(
+                        mission_id=mission_id, ledger=_EntriesView())
+                else:
+                    persist_ctx = ctx
+                analysis_run_ids = self._persist_ledger_in_tx(
+                    conn, ctx=persist_ctx, now=now,
+                    mission_outcome="approval")
+                if analysis_run_ids is None:
+                    raise RuntimeError("approval ledger persistence failed")
                 self._persist_gate_rows(
                     conn, gate_rows=gate_rows, now=now, mission_id=mission_id)
                 approval_payload = dict(approval_payload)
                 approval_payload["analysis_run_ids"] = analysis_run_ids
+                accepted = accepted_entries(ledger_entries)
                 approval_payload["analysis_call_count"] = sum(
-                    1 for e in ledger_entries if e["kind"] == "analyze_corr")
+                    1 for e in accepted if e["kind"] == "analyze_corr")
                 approval_payload["trial_count"] = sum(
-                    e["trial_count"] for e in ledger_entries)
+                    e["trial_count"] for e in accepted)
                 approval_id = approvals_store.create(
                     conn, kind="plugin", payload=approval_payload, now=now,
                     commit=False)
@@ -1502,6 +1654,8 @@ class ImproveLoop:
                     f"mission={mission_id} backlog={backlog_id} "
                     f"plugin={approval_payload['name']} "
                     f"approval={approval_id}", str(mission_id))
+            if ctx is not None:
+                ctx.ledger.mark_persisted()
         # C6 裁定 (2026-08-28、束D検収 verified-local-round1.md §7、
         # 現状維持): 内側 tx は `except BaseException:` (rollback して
         # 必ず re-raise) だが、この外側の補償トリガーは意図的に
@@ -1516,7 +1670,7 @@ class ImproveLoop:
                            "compensation", mission_id)
             try:
                 self._compensate_tx2_failure(
-                    conn, mission_id=mission_id, run_id=run_id,
+                    conn, ctx=persist_ctx, mission_id=mission_id, run_id=run_id,
                     backlog_id=backlog_id, slot_key=slot_key, now=now)
             except Exception:
                 _log.exception(
@@ -1526,6 +1680,8 @@ class ImproveLoop:
                 self._activity.write(
                     Category.IMPROVE, "tx2_compensation_failed",
                     f"mission_id={mission_id} run_id={run_id}")
+                if ctx is not None:
+                    ctx.ledger.mark_discarded()
 
     def commit(self, *, mission, ctx, result, now,
               slot_terminalize: bool = True) -> None:
@@ -1704,22 +1860,19 @@ class ImproveLoop:
                     backlog_id=selection.backlog_id, slot_key=ctx.slot_key,
                     approval_payload=approval_payload, now=now,
                     ledger_entries=tuple(ctx.ledger.entries()),
-                    gate_rows=tuple(gate_rows))
+                    gate_rows=tuple(gate_rows), ctx=ctx)
             else:
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
                     report_path=report_path, artifact=artifact, now=now)
         except BaseException:
             commit_raised = True
+            if ctx.ledger.state() == "FROZEN":
+                ctx.ledger.mark_persist_failed()
             raise
         finally:
             if owns_conn:
                 conn.close()
-            if not commit_raised:
-                try:
-                    ctx.ledger.mark_persisted()
-                except RuntimeError:
-                    pass
 
     def _prepare_report_if_applicable(self, conn, *, ctx, artifact, output,
                                       now, backlog_id=None) -> str | None:
@@ -1746,7 +1899,11 @@ class ImproveLoop:
                 reports_dir, mission_id=ctx.mission_id, body_md=body_md)
         except OSError as exc:
             conn.execute("BEGIN IMMEDIATE")
+            ledger_ids = None
             try:
+                ledger_ids = self._persist_ledger_in_tx(
+                    conn, ctx=ctx, now=now,
+                    mission_outcome="report_failed")
                 missions_store.finish_improve_mission(
                     conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                     slot_key=ctx.slot_key, mission_status="completed",
@@ -1762,6 +1919,10 @@ class ImproveLoop:
             except BaseException:
                 conn.rollback()
                 raise
+            if ledger_ids is None:
+                ctx.ledger.mark_persist_failed()
+            else:
+                ctx.ledger.mark_persisted()
             return _REPORT_WRITE_FAILED
         final_path = self._final_report_path(
             reports_dir, mission_id=ctx.mission_id, now=now)
@@ -1803,7 +1964,12 @@ class ImproveLoop:
             # (本プラン未対応) のときの正規ラベル。
             observation_last_result = "unsupported_in_plan10:risk_gate"
         conn.execute("BEGIN IMMEDIATE")
+        ledger_ids = None
         try:
+            ledger_ids = self._persist_ledger_in_tx(
+                conn, ctx=ctx, now=now,
+                mission_outcome=("report" if report_path is not None
+                                 else "observation"))
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="completed",
@@ -1823,6 +1989,10 @@ class ImproveLoop:
         except BaseException:
             conn.rollback()
             raise
+        if ledger_ids is None:
+            ctx.ledger.mark_persist_failed()
+        else:
+            ctx.ledger.mark_persisted()
         # 成功系 activity は commit 成功後 (1 周目 F2。`_finalize_success` と同じ理由)。
         if self._activity is not None and report_path is None:
                 self._activity.write(
@@ -1856,7 +2026,6 @@ class ImproveLoop:
         # RuntimeError → 既存の `except RuntimeError: pass` に吸われる
         # (この経路の台帳エントリは実際には永続化されていないため、
         # mark_persisted は元々誤り — 副次的に解消する)。
-        ctx.ledger.mark_discarded()
         self._delete_staging(ctx)
 
     def _read_candidate_kind(self, candidate_dir: Path) -> str:
@@ -1934,10 +2103,12 @@ class ImproveLoop:
             Category.IMPROVE, "mission_failed",
             f"mission={ctx.mission_id} status={result.status} "
             f"reason={reason_text}")
-        ctx.ledger.mark_discarded()
         self._delete_staging(ctx)
         conn.execute("BEGIN IMMEDIATE")
+        ledger_ids = None
         try:
+            ledger_ids = self._persist_ledger_in_tx(
+                conn, ctx=ctx, now=now, mission_outcome="failed")
             if (result.status in ("timeout", "max_turns") or
                     (result.status == "failed" and
                      is_tool_budget_abort(result.reason))):
@@ -1984,19 +2155,25 @@ class ImproveLoop:
         except BaseException:
             conn.rollback()
             raise
+        if ledger_ids is None:
+            ctx.ledger.mark_persist_failed()
+        else:
+            ctx.ledger.mark_persisted()
 
     def _finalize_output_invalid(self, conn, *, ctx, reason, now) -> None:
         """§4.2 手順1 不合格 (schema 不整合・`artifact.name` 非正規形・
         `staging_dir/<name>` 異常等) → Mission `failed`、
         `improvement_runs.result` は NULL のまま、staging 削除、
         台帳 `DISCARDED`。backlog は Tx-1 未到達のため遷移なし。"""
-        ctx.ledger.mark_discarded()
         self._delete_staging(ctx)
         self._activity.write(
             Category.IMPROVE, "output_invalid",
             f"mission={ctx.mission_id} reason={reason}")
         conn.execute("BEGIN IMMEDIATE")
+        ledger_ids = None
         try:
+            ledger_ids = self._persist_ledger_in_tx(
+                conn, ctx=ctx, now=now, mission_outcome="output_invalid")
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="failed",
@@ -2006,6 +2183,10 @@ class ImproveLoop:
         except BaseException:
             conn.rollback()
             raise
+        if ledger_ids is None:
+            ctx.ledger.mark_persist_failed()
+        else:
+            ctx.ledger.mark_persisted()
 
     def _finalize_loser(self, conn, *, ctx, output, now) -> None:
         """§4.2 手順2 敗者経路 (Tx-1 の選択 CAS で rowcount=0):
@@ -2015,7 +2196,6 @@ class ImproveLoop:
         `_publish_report`) で書き、run を `result='report'` で終端する
         (プラン10 Task10-11 申し送り)。staging は残す候補が無いため削除、
         台帳はこの Mission の RPC 結果を一切永続化しないため `DISCARDED`。"""
-        ctx.ledger.mark_discarded()
         self._delete_staging(ctx)
         idea = output.get("selected", {}).get("idea", "")
         body_md = (
@@ -2035,7 +2215,10 @@ class ImproveLoop:
                 reports_dir, mission_id=ctx.mission_id, body_md=body_md)
         except OSError:
             conn.execute("BEGIN IMMEDIATE")
+            ledger_ids = None
             try:
+                ledger_ids = self._persist_ledger_in_tx(
+                    conn, ctx=ctx, now=now, mission_outcome="report_failed")
                 missions_store.finish_improve_mission(
                     conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                     slot_key=ctx.slot_key, mission_status="completed",
@@ -2046,12 +2229,19 @@ class ImproveLoop:
             except BaseException:
                 conn.rollback()
                 raise
+            if ledger_ids is None:
+                ctx.ledger.mark_persist_failed()
+            else:
+                ctx.ledger.mark_persisted()
             return
         final_path = self._final_report_path(
             reports_dir, mission_id=ctx.mission_id, now=now)
 
         conn.execute("BEGIN IMMEDIATE")
+        ledger_ids = None
         try:
+            ledger_ids = self._persist_ledger_in_tx(
+                conn, ctx=ctx, now=now, mission_outcome="loser")
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="completed",
@@ -2062,6 +2252,10 @@ class ImproveLoop:
         except BaseException:
             conn.rollback()
             raise
+        if ledger_ids is None:
+            ctx.ledger.mark_persist_failed()
+        else:
+            ctx.ledger.mark_persisted()
         self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
                              final_path=final_path, now=now)
 
@@ -2083,7 +2277,6 @@ class ImproveLoop:
         (`tests/loops/test_improve_e2e.py::
         test_gate_failure_stops_at_report_no_approval_request` が期待する
         レポートファイルに届かなかった)。"""
-        ctx.ledger.mark_discarded()
         self._delete_staging(ctx)
         self._activity.write(
             Category.IMPROVE, "gate_failed",
@@ -2109,7 +2302,10 @@ class ImproveLoop:
                 reports_dir, mission_id=ctx.mission_id, body_md=body_md)
         except OSError as exc:
             conn.execute("BEGIN IMMEDIATE")
+            ledger_ids = None
             try:
+                ledger_ids = self._persist_ledger_in_tx(
+                    conn, ctx=ctx, now=now, mission_outcome="report_failed")
                 self._persist_gate_rows(
                     conn, gate_rows=gate_rows, now=now,
                     mission_id=ctx.mission_id)
@@ -2128,12 +2324,19 @@ class ImproveLoop:
             except BaseException:
                 conn.rollback()
                 raise
+            if ledger_ids is None:
+                ctx.ledger.mark_persist_failed()
+            else:
+                ctx.ledger.mark_persisted()
             return
         final_path = self._final_report_path(
             reports_dir, mission_id=ctx.mission_id, now=now)
 
         conn.execute("BEGIN IMMEDIATE")
+        ledger_ids = None
         try:
+            ledger_ids = self._persist_ledger_in_tx(
+                conn, ctx=ctx, now=now, mission_outcome="gate_failed")
             self._persist_gate_rows(
                 conn, gate_rows=gate_rows, now=now,
                 mission_id=ctx.mission_id)
@@ -2151,5 +2354,9 @@ class ImproveLoop:
         except BaseException:
             conn.rollback()
             raise
+        if ledger_ids is None:
+            ctx.ledger.mark_persist_failed()
+        else:
+            ctx.ledger.mark_persisted()
         self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
                              final_path=final_path, now=now)

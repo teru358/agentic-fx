@@ -30,7 +30,7 @@ def test_commit_exception_leaves_ledger_discardable(loop_full, monkeypatch):
                          now=loop_full._clock.now())
 
     ledger.mark_discarded()
-    assert ledger._state == "DISCARDED"
+    assert ledger.state() == "DISCARDED"
 
 
 def test_compensate_commit_failure_terminalizes_and_is_idempotent(
@@ -53,7 +53,7 @@ def test_compensate_commit_failure_terminalizes_and_is_idempotent(
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
     ledger.freeze()
     # commit() の例外時と同じ FROZEN 状態から補償を開始する。補償は台帳を
-    # DISCARDED にしてから DB と staging の pre-commit state を収束させる。
+    # 永続化してから DB と staging の pre-commit state を収束させる。
     ctx = ImproveRunContext(
         mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
         source_snapshot_dir=staging_dir / "_snapshot_src",
@@ -83,7 +83,7 @@ def test_compensate_commit_failure_terminalizes_and_is_idempotent(
     assert run["finished_at"] is not None
     assert backlog["status"] == "observation"
     assert backlog["last_result"] == "interrupted"
-    assert ledger._state == "DISCARDED"
+    assert ledger.state() == "PERSISTED"
     assert not staging_dir.exists()
     activity = (tmp_path / "activity.log").read_text()
     assert "mission_failed" in activity

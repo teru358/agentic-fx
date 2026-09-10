@@ -166,6 +166,10 @@ class ImproveSupervisor:
             self._active_threads = [
                 t for t in self._active_threads if t.is_alive()]
 
+    def is_alive(self) -> bool:
+        with self._launch_lock:
+            return any(t.is_alive() for t in self._active_threads)
+
     # ---- 内部 ---------------------------------------------------------
 
     def _run_slot_thread(self, period_key: str, k: int) -> None:

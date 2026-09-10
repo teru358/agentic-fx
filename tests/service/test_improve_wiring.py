@@ -100,6 +100,7 @@ def test_run_service_calls_improve_supervisor_shutdown_and_join(tmp_path):
         # Mock app with mock improve_supervisor and other required attributes
         mock_app = MagicMock()
         mock_app.improve_supervisor = MagicMock()
+        mock_app.improve_supervisor.is_alive = MagicMock(return_value=False)
         mock_app.supervisor = MagicMock()
         mock_app.supervisor.shutdown = MagicMock()
         mock_app.supervisor.join = MagicMock()

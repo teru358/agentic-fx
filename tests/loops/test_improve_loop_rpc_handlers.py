@@ -278,7 +278,8 @@ def test_run_backtest_handler_result_feeds_persist_ledger_rows(
     before = conn.execute(
         "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
     loop_min._persist_ledger_rows(
-        conn, ledger_entries=ledger.entries(), now=_NOW)
+        conn, ledger_entries=ledger.entries(), now=_NOW,
+        mission_outcome="approval")
     conn.commit()
     after = conn.execute(
         "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
@@ -301,7 +302,8 @@ def test_persist_ledger_rows_fails_closed_when_handler_omits_save_kwargs(
                "result_summary": {"metrics": {"pf": 1.0}}}]  # save_kwargs 欠落
     with pytest.raises(KeyError):
         loop_min._persist_ledger_rows(
-            conn, ledger_entries=entries, now=_NOW)
+            conn, ledger_entries=entries, now=_NOW,
+            mission_outcome="approval")
 
 
 def test_persist_ledger_error_activity_includes_mission_id(loop_min, conn, tmp_path):
@@ -315,6 +317,7 @@ def test_persist_ledger_error_activity_includes_mission_id(loop_min, conn, tmp_p
         }],
         now=_NOW,
         mission_id=424242,
+        mission_outcome="approval",
     )
 
     activity_text = (tmp_path / "activity.log").read_text()

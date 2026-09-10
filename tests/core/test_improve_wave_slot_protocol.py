@@ -26,6 +26,17 @@ def conn(tmp_path: Path) -> sqlite3.Connection:
     return c
 
 
+def test_is_alive_reflects_any_active_improve_thread():
+    sup = ImproveSupervisor.__new__(ImproveSupervisor)
+    sup._launch_lock = threading.Lock()
+    dead = type("ThreadState", (), {"is_alive": lambda self: False})()
+    alive = type("ThreadState", (), {"is_alive": lambda self: True})()
+    sup._active_threads = [dead, alive]
+    assert sup.is_alive() is True
+    sup._active_threads = [dead]
+    assert sup.is_alive() is False
+
+
 # Test helpers for 9.2 (and later sections)
 class _FixedClock:
     """Fixed clock for testing."""

@@ -22,13 +22,19 @@ from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.service import (
     _assert_tools_registered, _check_llama_swap, _validate_startup,
-    build_app, build_splash, run_init, run_service,
+    _exit_code, build_app, build_splash, run_init, run_service,
 )
 from agentic_fx.store import news_sources
 from agentic_fx.tools import market_tools
 from tests.store.test_rag import FakeEmbedding
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+
+
+def test_exit_code_is_failure_while_improve_thread_is_alive():
+    app = MagicMock(fatal_reason=None)
+    assert _exit_code(app, False, False, True) == 1
+    assert _exit_code(app, False, False, False) == 0
 
 
 def _init(tmp_path):

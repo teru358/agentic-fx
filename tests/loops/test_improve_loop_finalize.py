@@ -884,9 +884,9 @@ def test_finalize_failed_mission_terminates_failed_with_null_result_and_deletes_
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
                                                         "run_backtest": 600.0})
     ledger.record(opaque_ref="bt", kind="run_backtest", params={},
-                  result_summary={}, trial_count=1)
+                  result_summary={"error": "fixture"}, trial_count=1)
     ledger.record(opaque_ref="corr", kind="analyze_corr", params={},
-                  result_summary={}, trial_count=1)
+                  result_summary={"error": "fixture"}, trial_count=1)
     ledger.freeze()
     ctx = ImproveRunContext(
         mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
@@ -905,7 +905,7 @@ def test_finalize_failed_mission_terminates_failed_with_null_result_and_deletes_
                      (run_id,)).fetchone()
     assert r["result"] is None
     assert not staging_dir.exists()
-    assert ledger._state == "DISCARDED"
+    assert ledger.state() == "PERSISTED"
     note = conn.execute(
         "SELECT idea, source, status, last_result FROM improvement_backlog "
         "WHERE source='system'").fetchone()
@@ -1203,7 +1203,7 @@ def test_finalize_output_invalid_terminates_failed_with_null_result_and_deletes_
                      (run_id,)).fetchone()
     assert r["result"] is None
     assert not staging_dir.exists()
-    assert ledger._state == "DISCARDED"
+    assert ledger.state() == "PERSISTED"
 
 
 def test_finalize_loser_writes_skip_report_and_finishes_run_as_report(
@@ -1240,7 +1240,7 @@ def test_finalize_loser_writes_skip_report_and_finishes_run_as_report(
     assert r["report_path"] is not None
     assert Path(r["report_path"]).exists()
     assert not staging_dir.exists()
-    assert ledger._state == "DISCARDED"
+    assert ledger.state() == "PERSISTED"
     b = conn.execute(
         "SELECT status FROM improvement_backlog WHERE id=?",
         (backlog_id,)).fetchone()
@@ -1297,7 +1297,7 @@ def test_finalize_gate_failed_sets_backlog_observation_with_reason(
     assert b["status"] == "observation"
     assert b["last_result"] == "gate_failed:pytest failed: boom"
     assert not staging_dir.exists()
-    assert ledger._state == "DISCARDED"
+    assert ledger.state() == "PERSISTED"
 
 
 @pytest.mark.parametrize("gate_reason", [
@@ -1443,7 +1443,8 @@ def test_persist_ledger_rows_skips_error_entries(loop_min, conn):
         "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
 
     analysis_run_ids = loop_min._persist_ledger_rows(
-        conn, ledger_entries=ledger_entries, now=now)
+        conn, ledger_entries=ledger_entries, now=now,
+        mission_outcome="approval")
 
     after_bt = conn.execute(
         "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]

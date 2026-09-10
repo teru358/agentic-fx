@@ -1,0 +1,512 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from agentic_fx.loops.improve_loop import _REPORT_WRITE_FAILED
+from agentic_fx.loops.improve_run_context import ImproveRunContext
+from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.plugin.version_store import artifact_hash_bytes
+from agentic_fx.runners.base import MissionResult
+from agentic_fx.store import backlog as backlog_store
+from agentic_fx.store import db as db_mod
+from agentic_fx.store import improve_runs as improve_runs_store
+from agentic_fx.store import missions as missions_store
+
+
+NOW = datetime(2026, 9, 10, tzinfo=timezone.utc)
+
+
+def _snapshot(path):
+    path.mkdir(parents=True)
+    blobs = (b"plugin = 1\n", b"name: x\n", b"def test_x(): pass\n")
+    for name, data in zip(("plugin.py", "config.yaml", "test_plugin.py"), blobs):
+        (path / name).write_bytes(data)
+    return artifact_hash_bytes(*blobs)
+
+
+def _ctx(tmp_path, mission_id, run_id, entries):
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    for entry in entries:
+        ledger.record(**entry)
+    ledger.freeze()
+    staging = tmp_path / "plugins" / "_staging" / str(mission_id)
+    staging.mkdir(parents=True, exist_ok=True)
+    return ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging,
+        source_snapshot_dir=staging / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+
+
+def _backtest_entry(tmp, artifact_hash):
+    return {
+        "opaque_ref": f"bt:{tmp.name}", "kind": "run_backtest",
+        "params": {"name": "x", "pair": "USDJPY"}, "trial_count": 1,
+        "result_summary": {
+            "scope": "in_sample", "plugin_ref": "plugins/x",
+            "content_hash": "content", "kind": "strategy",
+            "pair": "USDJPY", "timeframe": "1h", "source": "test",
+            "base_interval": "1m", "period": (NOW, NOW), "metrics": {"pf": 1.2},
+            "settings_hash": "settings", "core_commit": "core",
+            "initial_balance": 10000.0, "now": NOW, "params": {},
+            "artifact_hash": artifact_hash, "archive_tmp": str(tmp),
+        },
+    }
+
+
+def test_publish_same_hash_race_keeps_one_row_and_removes_loser_tmp(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    mission_id, run_id, _ = mission_and_run_fixture
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    artifact_hash = _snapshot(first)
+    assert _snapshot(second) == artifact_hash
+    ctx = _ctx(tmp_path, mission_id, run_id, [
+        _backtest_entry(first, artifact_hash),
+        _backtest_entry(second, artifact_hash),
+    ])
+
+    conn.execute("BEGIN IMMEDIATE")
+    ids = loop_min._persist_ledger_in_tx(
+        conn, ctx=ctx, now=NOW, mission_outcome="failed")
+    conn.commit()
+
+    assert ids == []
+    final = loop_min._root / "plugins" / "_archive" / str(mission_id) / artifact_hash
+    assert final.is_dir()
+    assert not first.exists() and not second.exists()
+    assert conn.execute(
+        "SELECT count(*) FROM candidate_archives WHERE mission_id=?",
+        (mission_id,)).fetchone()[0] == 1
+
+
+def test_publish_retry_revalidates_hash_before_inserting_row(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    mission_id, run_id, _ = mission_and_run_fixture
+    missing_tmp = tmp_path / "gone"
+    artifact_hash = artifact_hash_bytes(b"expected", b"bytes", b"here")
+    final = loop_min._root / "plugins" / "_archive" / str(mission_id) / artifact_hash
+    _snapshot(final)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(missing_tmp, artifact_hash)])
+
+    conn.execute("BEGIN IMMEDIATE")
+    loop_min._persist_ledger_in_tx(
+        conn, ctx=ctx, now=NOW, mission_outcome="failed")
+    conn.commit()
+
+    assert conn.execute(
+        "SELECT count(*) FROM candidate_archives WHERE mission_id=?",
+        (mission_id,)).fetchone()[0] == 0
+    assert "archive_failed" in loop_min._activity._path.read_text()
+
+
+def test_failed_terminal_persists_outcome_and_marks_ledger_persisted(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    mission_id, run_id, _ = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    loop_min._finalize_failed_mission(
+        conn, ctx=ctx,
+        result=MissionResult(status="failed", output=None, transcript=[]),
+        now=NOW)
+
+    assert conn.execute(
+        "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
+        (mission_id,)).fetchone()[0] == "failed"
+    assert ctx.ledger.state() == "PERSISTED"
+
+
+def test_savepoint_failure_finishes_terminal_and_marks_persist_failed(
+        loop_min, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    mission_id, run_id, _ = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+    from agentic_fx.store import backtest_runs
+    monkeypatch.setattr(
+        backtest_runs, "save_harness_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(KeyError("injected")))
+
+    loop_min._finalize_failed_mission(
+        conn, ctx=ctx,
+        result=MissionResult(status="failed", output=None, transcript=[]),
+        now=NOW)
+
+    assert conn.execute(
+        "SELECT status FROM missions WHERE id=?", (mission_id,)).fetchone()[0] == "failed"
+    assert conn.execute("SELECT count(*) FROM backtest_runs").fetchone()[0] == 0
+    assert ctx.ledger.state() == "PERSIST_FAILED"
+    assert "ledger_persist_failed" in loop_min._activity._path.read_text()
+
+
+# ---------------------------------------------------------------------------
+# 段0変異スイープ是正 (2026-09-10): T3-3/T3-7/T3-8/T3-9/T3-12/T3-13 の pin。
+# §3 全終端表がテストの守る仕様 — 各終端が `backtest_runs.mission_outcome` に
+# 書く文字列そのものと、error entry を数から除く `accepted_entries` の適用
+# 範囲 (payload / activity 双方) をリテラルで固定する。
+# ---------------------------------------------------------------------------
+
+
+def test_finalize_gate_failed_persists_outcome_gate_failed_and_archives(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """T3-7 pin: `_finalize_gate_failed` は `mission_outcome='gate_failed'`
+    で行を書く (mutant は文字列を `'approval'` にすり替える)。この経路で
+    `archive_tmp` 付き entry を渡し、`candidate_archives` 行が揃うことも
+    合わせて確認する (§3 表の要求 — 少なくとも1経路)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id, reason="gate_failed:test",
+        now=NOW)
+
+    row = conn.execute(
+        "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
+        (mission_id,)).fetchone()
+    assert row is not None
+    assert row["mission_outcome"] == "gate_failed"
+    assert ctx.ledger.state() == "PERSISTED"
+    assert conn.execute(
+        "SELECT count(*) FROM candidate_archives WHERE mission_id=?",
+        (mission_id,)).fetchone()[0] == 1
+    final = loop_min._root / "plugins" / "_archive" / str(mission_id) / artifact_hash
+    assert final.is_dir()
+
+
+def test_finalize_loser_persists_outcome_loser(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """§3 表: 敗者経路は `mission_outcome='loser'`。"""
+    mission_id, run_id, _ = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    loop_min._finalize_loser(
+        conn, ctx=ctx, output={"selected": {"idea": "dup"}}, now=NOW)
+
+    row = conn.execute(
+        "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
+        (mission_id,)).fetchone()
+    assert row is not None
+    assert row["mission_outcome"] == "loser"
+    assert ctx.ledger.state() == "PERSISTED"
+
+
+def test_finalize_output_invalid_persists_outcome_output_invalid(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """§3 表: schema 不合格経路は `mission_outcome='output_invalid'`
+    (T3-8 pin: mutant は `_persist_ledger_in_tx` を呼ばず `ledger_ids=[]`
+    に差し替えるので行が一切書かれなくなる)。"""
+    mission_id, run_id, _ = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    loop_min._finalize_output_invalid(
+        conn, ctx=ctx, reason="schema_invalid:missing name", now=NOW)
+
+    row = conn.execute(
+        "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
+        (mission_id,)).fetchone()
+    assert row is not None
+    assert row["mission_outcome"] == "output_invalid"
+    assert ctx.ledger.state() == "PERSISTED"
+
+
+def test_finalize_report_or_observation_persists_outcome_report(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """T3-13 pin: `report_path is not None` のとき `mission_outcome='report'`
+    (mutant は report/observation の条件式を反転させる)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+    reports_dir = loop_min._root / "data" / "improve_reports"
+    (reports_dir / ".tmp").mkdir(parents=True, exist_ok=True)
+    loop_min._write_report_part(
+        reports_dir, mission_id=mission_id, body_md="body")
+    final_path = loop_min._final_report_path(
+        reports_dir, mission_id=mission_id, now=NOW)
+
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
+        artifact={"type": "report"}, now=NOW)
+
+    row = conn.execute(
+        "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
+        (mission_id,)).fetchone()
+    assert row is not None
+    assert row["mission_outcome"] == "report"
+    assert ctx.ledger.state() == "PERSISTED"
+
+
+def test_finalize_report_or_observation_persists_outcome_observation(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """T3-13 pin (逆方向): `report_path is None` のとき
+    `mission_outcome='observation'`。上のテストと対で条件反転を検出する。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
+        artifact={"type": "observation", "reason": "insufficient data"},
+        now=NOW)
+
+    row = conn.execute(
+        "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
+        (mission_id,)).fetchone()
+    assert row is not None
+    assert row["mission_outcome"] == "observation"
+    assert ctx.ledger.state() == "PERSISTED"
+
+
+def test_prepare_report_write_failure_persists_outcome_report_failed(
+        loop_min, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """§3 表: report `.part` 書込失敗 (OSError) は `mission_outcome=
+    'report_failed'` で終端する。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+    monkeypatch.setattr(
+        loop_min, "_write_report_part",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError("write failed")))
+
+    result = loop_min._prepare_report_if_applicable(
+        conn, ctx=ctx, artifact={"type": "report", "proposal_kind": "core",
+                                 "body_md": "x"},
+        output={}, now=NOW, backlog_id=backlog_id)
+
+    assert result is _REPORT_WRITE_FAILED
+    row = conn.execute(
+        "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
+        (mission_id,)).fetchone()
+    assert row is not None
+    assert row["mission_outcome"] == "report_failed"
+    assert ctx.ledger.state() == "PERSISTED"
+
+
+def test_finalize_success_persists_outcome_approval(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """§3 表: 承認申請経路は `mission_outcome='approval'`。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+
+    row = conn.execute(
+        "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
+        (mission_id,)).fetchone()
+    assert row is not None
+    assert row["mission_outcome"] == "approval"
+    assert ctx.ledger.state() == "PERSISTED"
+
+
+def test_finalize_success_payload_counts_exclude_error_entries(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """T3-3 pin: `_finalize_success` の approval payload `trial_count`/
+    `analysis_call_count` は `accepted_entries` (error entry 除外) から
+    計算する (mutant は `list(ledger_entries)` にすり替え、error entry の
+    `trial_count` まで足し込む)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    entries = [
+        {"opaque_ref": "a1", "kind": "analyze_corr", "params": {},
+         "trial_count": 5,
+         "result_summary": {"params": {}, "trial_count": 5,
+                            "source": "improve_agent"}},
+        {"opaque_ref": "a2", "kind": "analyze_corr", "params": {},
+         "trial_count": 30,
+         "result_summary": {"error": "insufficient_data"}},
+    ]
+    ctx = _ctx(tmp_path, mission_id, run_id, entries)
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+
+    import json as _json
+    row = conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE kind='plugin' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    payload = _json.loads(row["payload_json"])
+    assert payload["trial_count"] == 5
+    assert payload["analysis_call_count"] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM analysis_runs").fetchone()[0] == 1
+
+
+def test_finalize_failed_mission_skips_error_entries_and_logs_activity(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """T3-12 pin: `_persist_ledger_in_tx` は素の `ctx.ledger.entries()`
+    (error entry を含む) を `_persist_ledger_rows` に渡し、そちら側で
+    `ledger_entry_skipped_error` activity を書いてから accepted のみを
+    保存する。mutant は呼び出し側で先に `accepted_entries` を適用するため、
+    `_persist_ledger_rows` の error-detection ループが空になり activity が
+    書かれなくなる。"""
+    mission_id, run_id, _ = mission_and_run_fixture
+    entries = [
+        {"opaque_ref": "a1", "kind": "analyze_corr", "params": {},
+         "trial_count": 0,
+         "result_summary": {"error": "insufficient_data"}},
+    ]
+    ctx = _ctx(tmp_path, mission_id, run_id, entries)
+
+    loop_min._finalize_failed_mission(
+        conn, ctx=ctx,
+        result=MissionResult(status="failed", output=None, transcript=[]),
+        now=NOW)
+
+    assert conn.execute(
+        "SELECT count(*) FROM analysis_runs").fetchone()[0] == 0
+    activity_text = loop_min._activity._path.read_text()
+    assert "ledger_entry_skipped_error" in activity_text
+    assert ctx.ledger.state() == "PERSISTED"
+
+
+def _compensation_ctx(staging_dir, *, mission_id, run_id, tmp=None,
+                      artifact_hash=None):
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    if tmp is not None:
+        ledger.record(**_backtest_entry(tmp, artifact_hash))
+    ledger.freeze()
+    return ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=staging_dir / "_snapshot_src",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+
+
+def test_compensate_commit_failure_double_call_frozen_does_not_duplicate_rows(
+        loop_no_seam, tmp_path, clock):
+    """T3-9 pin: `compensate_commit_failure` の 2 回目呼び出し (別 ctx/ledger
+    だが同一 mission、両方 FROZEN で開始 — プロセス再起動を跨いだ2重呼び出し
+    を模す) は `already_saved` の DB 側チェックで永続化をスキップし、行数が
+    増えないこと。mutant (`if True:`) は毎回 `_persist_ledger_in_tx` を
+    再実行し重複行を作る。"""
+    loop, db_path = loop_no_seam
+    conn = db_mod.connect(db_path)
+    backlog_id = backlog_store.add(conn, "idea", "user", clock.now())
+    mission_id = missions_store.start(
+        conn, "improve", "local", "model", clock.now(), commit=False)
+    run_id = improve_runs_store.start(
+        conn, backlog_id, clock.now(), mission_id=mission_id, commit=False)
+    conn.commit()
+    conn.close()
+
+    staging_dir = tmp_path / "plugins" / "_staging" / str(mission_id)
+    staging_dir.mkdir(parents=True)
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx1 = _compensation_ctx(staging_dir, mission_id=mission_id, run_id=run_id,
+                             tmp=tmp, artifact_hash=artifact_hash)
+
+    loop.compensate_commit_failure(ctx=ctx1, now=clock.now(),
+                                   exc=RuntimeError("boom"))
+
+    check = db_mod.connect(db_path)
+    assert check.execute(
+        "SELECT count(*) FROM backtest_runs WHERE mission_id=? "
+        "AND mission_outcome='commit_failed'", (mission_id,)).fetchone()[0] == 1
+    check.close()
+    assert ctx1.ledger.state() == "PERSISTED"
+
+    # 2回目: 新しい ctx/ledger だが同じ tmp を指す entry (再起動後の再構築を
+    # 模す) — `already_saved` の DB 照会だけが重複を防ぐ唯一の防波堤。
+    ctx2 = _compensation_ctx(staging_dir, mission_id=mission_id, run_id=run_id,
+                             tmp=tmp, artifact_hash=artifact_hash)
+    loop.compensate_commit_failure(ctx=ctx2, now=clock.now(),
+                                   exc=RuntimeError("boom"))
+
+    check = db_mod.connect(db_path)
+    assert check.execute(
+        "SELECT count(*) FROM backtest_runs WHERE mission_id=? "
+        "AND mission_outcome='commit_failed'", (mission_id,)).fetchone()[0] == 1
+    assert check.execute(
+        "SELECT count(*) FROM candidate_archives WHERE mission_id=?",
+        (mission_id,)).fetchone()[0] == 1
+    check.close()
+
+
+def test_compensate_commit_failure_savepoint_failure_then_terminal_insert_only_once(
+        loop_no_seam, tmp_path, clock, monkeypatch):
+    """§9 M2 pin: 1回目 SAVEPOINT 失敗 (`save_harness_run` 例外) →
+    `PERSIST_FAILED` (mission は終端)。2回目 (mission は既に terminal) は
+    行だけ挿入し `PERSISTED` に遷移。3回目は増えない。"""
+    loop, db_path = loop_no_seam
+    conn = db_mod.connect(db_path)
+    backlog_id = backlog_store.add(conn, "idea", "user", clock.now())
+    mission_id = missions_store.start(
+        conn, "improve", "local", "model", clock.now(), commit=False)
+    run_id = improve_runs_store.start(
+        conn, backlog_id, clock.now(), mission_id=mission_id, commit=False)
+    conn.commit()
+    conn.close()
+
+    staging_dir = tmp_path / "plugins" / "_staging" / str(mission_id)
+    staging_dir.mkdir(parents=True)
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _compensation_ctx(staging_dir, mission_id=mission_id, run_id=run_id,
+                            tmp=tmp, artifact_hash=artifact_hash)
+
+    from agentic_fx.store import backtest_runs
+    real_save = backtest_runs.save_harness_run
+    calls = {"n": 0}
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KeyError("injected")
+        return real_save(*a, **kw)
+
+    monkeypatch.setattr(backtest_runs, "save_harness_run", flaky)
+
+    loop.compensate_commit_failure(ctx=ctx, now=clock.now(),
+                                   exc=RuntimeError("boom"))
+    assert ctx.ledger.state() == "PERSIST_FAILED"
+    check = db_mod.connect(db_path)
+    assert check.execute(
+        "SELECT count(*) FROM backtest_runs WHERE mission_id=? "
+        "AND mission_outcome='commit_failed'", (mission_id,)).fetchone()[0] == 0
+    assert check.execute(
+        "SELECT status FROM missions WHERE id=?",
+        (mission_id,)).fetchone()["status"] == "failed"
+    check.close()
+
+    loop.compensate_commit_failure(ctx=ctx, now=clock.now(),
+                                   exc=RuntimeError("boom"))
+    assert ctx.ledger.state() == "PERSISTED"
+    check = db_mod.connect(db_path)
+    assert check.execute(
+        "SELECT count(*) FROM backtest_runs WHERE mission_id=? "
+        "AND mission_outcome='commit_failed'", (mission_id,)).fetchone()[0] == 1
+    check.close()
+
+    loop.compensate_commit_failure(ctx=ctx, now=clock.now(),
+                                   exc=RuntimeError("boom"))
+    check = db_mod.connect(db_path)
+    assert check.execute(
+        "SELECT count(*) FROM backtest_runs WHERE mission_id=? "
+        "AND mission_outcome='commit_failed'", (mission_id,)).fetchone()[0] == 1
+    check.close()

@@ -88,6 +88,10 @@ class ImproveRpcLedger:
                 raise RuntimeError("entries() is only valid after freeze()")
             return list(self._entries)
 
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
     def mark_persisted(self) -> None:
         with self._lock:
             if self._state not in ("FROZEN", "PERSIST_FAILED"):

@@ -7,8 +7,32 @@ from datetime import datetime
 
 import pytest
 
+from agentic_fx.loops.improve_loop import accepted_entries
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.tools.improve_rpc_tools import RpcOutcome
+
+
+def test_accepted_entries_excludes_error_results():
+    good = {"kind": "analyze_corr", "result_summary": {"trial_count": 2}}
+    failed = {"kind": "run_backtest", "result_summary": {"error": "boom"}}
+    assert accepted_entries([good, failed]) == [good]
+
+
+def test_approval_payload_counts_only_accepted_entries(loop_min, conn):
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger.record(opaque_ref="ok", kind="analyze_corr", params={},
+                  result_summary={"trial_count": 4}, trial_count=4)
+    ledger.record(opaque_ref="bad", kind="analyze_corr", params={},
+                  result_summary={"error": "boom"}, trial_count=99)
+    ledger.freeze()
+    payload = loop_min._build_approval_payload(
+        conn, name="x", kind="indicator", content_hash="c",
+        artifact_hash="a", ctx_ledger=ledger, mission_id=1,
+        backlog_id=1, candidate_origin="staging", candidate_path="p",
+        gate_metrics={}, output={}, now=loop_min._clock.now())
+    assert payload["trial_count"] == 4
+    assert payload["analysis_call_count"] == 1
+    assert payload["backtest_call_count"] == 0
 
 
 def test_payload_analysis_fields_come_from_ledger_not_agent_output(

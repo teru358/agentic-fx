@@ -12,6 +12,15 @@ def _ledger() -> ImproveRpcLedger:
     return ImproveRpcLedger(rpc_timeout_sec_by_kind={})
 
 
+def test_state_exposes_authoritative_transition_state():
+    ledger = _ledger()
+    assert ledger.state() == "OPEN"
+    ledger.freeze()
+    assert ledger.state() == "FROZEN"
+    ledger.mark_persist_failed()
+    assert ledger.state() == "PERSIST_FAILED"
+
+
 def test_begin_end_reserves_only_while_open():
     ledger = _ledger()
     reservation = ledger.begin_accept()

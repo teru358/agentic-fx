@@ -1277,9 +1277,10 @@ def _check_watchdog_health(app: App, watchdog_thread_obj: threading.Thread,
 
 
 def _busy_resources_after_join(scheduler_still_busy: bool,
-                               supervisor_still_busy: bool) -> frozenset[str]:
+                               supervisor_still_busy: bool,
+                               improve_still_busy: bool = False) -> frozenset[str]:
     busy: set[str] = set()
-    if scheduler_still_busy or supervisor_still_busy:
+    if scheduler_still_busy or supervisor_still_busy or improve_still_busy:
         busy.add("conn_core")
         # レビュー2周目 codex Critical: `instance_lock` は単なる close 対象
         # ではなく**残存 App 全体の単一起動所有権**を表す。残存スレッドが
@@ -1308,10 +1309,10 @@ def _busy_resources_after_join(scheduler_still_busy: bool,
 
 
 def _exit_code(app: App, scheduler_alive: bool,
-               supervisor_alive: bool) -> int:
+               supervisor_alive: bool, improve_alive: bool = False) -> int:
     if app.fatal_reason is not None:
         return 1
-    return 1 if scheduler_alive or supervisor_alive else 0
+    return 1 if scheduler_alive or supervisor_alive or improve_alive else 0
 
 
 def run_service(root: Path, *, daemon: bool = False,
@@ -1480,6 +1481,7 @@ def run_service(root: Path, *, daemon: bool = False,
         app.improve_supervisor.join(timeout=supervisor_join_timeout_sec)
         app.supervisor.join(timeout=supervisor_join_timeout_sec)
         supervisor_still_busy = app.supervisor.is_alive()
+        improve_still_busy = app.improve_supervisor.is_alive()
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
         # 行う。notifier は最大 10 秒ブロックしうるため、記録を先にすると
         # 「graceful」記録の後に watchdog がまだ activity へ書き込める窓が
@@ -1492,17 +1494,20 @@ def run_service(root: Path, *, daemon: bool = False,
         # leak 防止を優先する形に変更する)。close 自体の失敗で shutdown
         # シーケンスを止めない。
         skipped = app.close(busy_resources=_busy_resources_after_join(
-            scheduler_still_busy, supervisor_still_busy))
+            scheduler_still_busy, supervisor_still_busy,
+            improve_still_busy))
         if skipped:
             app.activity.write(Category.SYSTEM, "close_skipped_resources",
                                f"{skipped} (join timeout — used-in-flight)")
-        if th.is_alive() or app.supervisor.is_alive():
+        if (th.is_alive() or app.supervisor.is_alive()
+                or app.improve_supervisor.is_alive()):
             app.activity.write(Category.SYSTEM, "service_stopped",
                                "shutdown_timeout (Mission 継続中の可能性)")
         else:
             app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
 
-    if _exit_code(app, th.is_alive(), app.supervisor.is_alive()):
+    if _exit_code(app, th.is_alive(), app.supervisor.is_alive(),
+                  app.improve_supervisor.is_alive()):
         print("警告: 停止タイムアウト。実行中の処理が残っている可能性があります。")
         return 1
     print("停止しました。")
