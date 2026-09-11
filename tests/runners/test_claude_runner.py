@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.runners.base import Mission
-from agentic_fx.runners.claude_runner import ClaudeRunner
+from agentic_fx.runners.claude_runner import (CLAUDE_DISALLOWED_BUILTIN_TOOLS,
+                                              ClaudeRunner)
 from agentic_fx.tools.registry import ToolRegistry
 
 FAKE_CLAUDE = Path(__file__).resolve().parent / "fixtures" / "fake_claude.py"
@@ -86,12 +87,39 @@ def test_claude_argv_shape(tmp_path):
     assert "--strict-mcp-config" in argv
     assert _flag_value(argv, "--mcp-config") == str(mcp_config_path)
     assert _flag_value(argv, "--allowedTools") == ",".join(runner._allowed_tools)
+    assert _flag_value(argv, "--disallowedTools") == ",".join(
+        CLAUDE_DISALLOWED_BUILTIN_TOOLS)
     assert _flag_value(argv, "--max-turns") == str(mission.max_turns)
     assert _flag_value(argv, "--model") == runner._model
     # #34 (`verified-round1.md` 1-B): 各フラグの隣接値は pin 済みだが、
     # argv の長さ (= 余分なフラグが無いこと) は未検査だった。
-    assert len(argv) == 19, (
+    assert len(argv) == 21, (
         f"argv に既知フラグ以外の要素が混入している (len={len(argv)}): {argv!r}")
+
+
+def test_claude_argv_disallows_builtin_tools_but_keeps_read_and_output(tmp_path):
+    """[claude-builtin-tools-exposed] 是正 (A4 10 回目 claude #69 観測 C):
+    `--disallowedTools` は 1 回だけ現れ、外向き経路 (Bash/WebFetch/
+    SendMessage) を遮断リストへ含む一方、`mcp__afx__*` (registry 経由の
+    afx ツール) は含まない。`Read`/`ToolSearch`/`StructuredOutput` は
+    keep 側 — 遮断すると workdir 内の無害な読み取りや最終出力の抽出
+    (`_extract_output` は `structured_output` を読む) が壊れるため、
+    keep 側も明示的に pin する (`ToolSearch`/`StructuredOutput` を
+    遮断リストへ足す変異を殺す)。"""
+    mission = _mission()
+    runner, workdir = _runner(tmp_path)
+    argv = runner._build_argv(mission, mcp_socket=workdir / "afx.sock")
+
+    assert argv.count("--disallowedTools") == 1
+    disallowed = _flag_value(argv, "--disallowedTools")
+    assert "Bash" in disallowed
+    assert "WebFetch" in disallowed
+    assert "SendMessage" in disallowed
+    assert "mcp__afx__" not in disallowed
+    for kept in ("Read", "ToolSearch", "StructuredOutput"):
+        assert kept not in disallowed.split(","), (
+            f"{kept} must stay usable — it must not appear in "
+            f"--disallowedTools: {disallowed!r}")
 
 
 def test_claude_argv_does_not_leak_parent_secrets(tmp_path, monkeypatch):

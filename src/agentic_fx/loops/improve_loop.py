@@ -2079,6 +2079,27 @@ class ImproveLoop:
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls)
                         return
                     gate_metrics["baseline"] = strategy_verdict.baseline_row
+                    # [approval-payload-missing-gate-metrics] 是正 (A4 10
+                    # 回目 claude #69 観測 A、2026-09-11): ゲートが実際に
+                    # 測った in-sample/holdout の成績を承認 payload へ載せる。
+                    # 従来はここで代入されるのが baseline (メタ情報のみ) だけ
+                    # だったため、holdout で負けている候補でも人間の承認
+                    # 材料には agent 自身の自己申告しか出てこなかった。
+                    # in_sample は pair→metrics の dict (StrategyGateVerdict.
+                    # candidate_metrics をそのまま)。holdout は gate_rows の
+                    # scope=='holdout_gate' 行の metrics から組む — pair が
+                    # 1 つなら metrics dict そのもの、複数なら pair→metrics
+                    # の dict (`_build_approval_payload` が期待する形、
+                    # ブリーフの明示指定どおり)。
+                    gate_metrics["in_sample"] = strategy_verdict.candidate_metrics
+                    holdout_by_pair = {
+                        row["pair"]: row["metrics"] for row in gate_rows
+                        if row.get("scope") == "holdout_gate"}
+                    if len(holdout_by_pair) == 1:
+                        gate_metrics["holdout"] = next(iter(holdout_by_pair.values()))
+                    elif holdout_by_pair:
+                        gate_metrics["holdout"] = holdout_by_pair
+                    gate_metrics["meta"] = candidate_meta
 
                 candidate_path = (f"plugins/_staging/{ctx.mission_id}/"
                                   f"{artifact['name']}")

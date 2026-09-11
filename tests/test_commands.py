@@ -506,6 +506,54 @@ def test_approval_retry_without_plugins_root_reports_unwired(tmp_path):
     assert "未配線" in out
 
 
+def test_approval_detail_shows_in_sample_and_holdout_metrics(tmp_path):
+    """[approval-payload-missing-gate-metrics] 是正 (A4 10 回目 claude #69
+    観測 A、2026-09-11): `approval <id>` は payload の in_sample/holdout
+    (pf/trades/avg_r/max_drawdown) を表示する — approve/reject する前に
+    人間が場外 (holdout) の成績を読める。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={
+            "name": "sma_cross_usdjpy", "content_hash": "h1",
+            "eval_timeframe": "1h",
+            "in_sample": {"USDJPY": {
+                "pf": 1.474, "trades": 193, "avg_r": 0.188,
+                "max_drawdown": 0.0373}},
+            "holdout": {
+                "pf": 0.904, "trades": 54, "avg_r": -0.037,
+                "max_drawdown": 0.0392},
+        },
+        now=NOW)
+
+    out = cmds.dispatch(f"approval {approval_id}")
+
+    assert f"approval #{approval_id}" in out
+    assert "kind=plugin" in out
+    assert "in_sample USDJPY: pf=1.474 trades=193 avg_r=0.188" in out
+    assert "holdout: pf=0.904 trades=54 avg_r=-0.037 max_drawdown=0.0392" in out
+
+
+def test_approval_detail_missing_metrics_show_dash(tmp_path):
+    """holdout/in_sample が無い旧 payload (indicator kind 等) でも例外に
+    ならず `-` を表示する。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "myind", "content_hash": "h1"}, now=NOW)
+
+    out = cmds.dispatch(f"approval {approval_id}")
+
+    assert "in_sample: -" in out
+    assert "holdout: -" in out
+
+
+def test_approval_detail_unknown_id_reports_not_found(tmp_path):
+    _, _, _, cmds = _commands(tmp_path)
+    out = cmds.dispatch("approval 999")
+    assert "存在しません" in out
+
+
 def test_policy_add_without_policy_path_reports_unwired(tmp_path):
     """確定-3: `policy add` は `_policy_path` 未配線時に例外でなく
     「未配線」文言を返す (SURVIVED 変異 c21_policy_drop_wiring_guard の

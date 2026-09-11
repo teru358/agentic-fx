@@ -1,6 +1,7 @@
 """操作コマンド定義 — main.py シェルと (Phase 2) client.py で共有 (設計書 §8)。"""
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -20,6 +21,7 @@ _HELP = """コマンド一覧:
   activity [n] [カテゴリ]     activity ログ (NEWS/TECH/AGGREGATE/TRADE/IMPROVE/APPROVAL/SYSTEM)
   ask <質問>                  臨時 Mission (回答専用 — 発注はしない)
   approve <id> / reject <id> [理由]   承認操作
+  approval <id>               承認申請の詳細 (in_sample/holdout 成績を含む)
   approval retry <id>        承認手順を頭から再試行 (§5.3 契機③)
   killswitch reset           kill switch ラッチの解除 (人間の明示操作)
   reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
@@ -148,6 +150,14 @@ class Commands:
                 self.activity.write(Category.APPROVAL, "retry",
                                     f"#{approval_id} via shell", ref_id=str(approval_id))
                 return f"approval #{approval_id} を再試行しました"
+            if cmd == "approval" and len(args) == 1 and args[0].isdigit():
+                # [approval-payload-missing-gate-metrics] 是正 (A4 10 回目
+                # claude #69 観測 A、2026-09-11): approve/reject する前に
+                # 人間が in-sample/holdout の成績を読める詳細表示。従来
+                # `afx>` には approval の中身を見る手段が無く (splash の
+                # 承認待ち件数のみ)、承認判断が agent の自己申告に偏って
+                # いた欠陥の一部。
+                return self._approval_detail(int(args[0]))
             if cmd == "killswitch" and args and args[0] == "reset":
                 self.state.update(kill_switch_latched=False)
                 self.activity.write(Category.SYSTEM, "kill_switch_reset",
@@ -302,6 +312,55 @@ class Commands:
             reasons = "; ".join(self.health_latch.summary()[:3])
             result += f"\nhealth: LATCHED ({reasons})"
         return result
+
+    @staticmethod
+    def _metrics_line(prefix: str, metrics: dict | None) -> str:
+        """1 行分の pf/trades/avg_r/max_drawdown 表示。値が無ければ `-`。"""
+        if metrics is None:
+            return f"{prefix}: -"
+
+        def _fmt(v):
+            return "-" if v is None else v
+        return (f"{prefix}: pf={_fmt(metrics.get('pf'))} "
+                f"trades={_fmt(metrics.get('trades'))} "
+                f"avg_r={_fmt(metrics.get('avg_r'))} "
+                f"max_drawdown={_fmt(metrics.get('max_drawdown'))}")
+
+    @classmethod
+    def _metrics_lines(cls, prefix: str, value) -> list[str]:
+        """`value` は単一 pair の metrics dict (`"trades"` キーを持つ) か、
+        複数 pair の `{pair: metrics}` dict、あるいは None
+        ([approval-payload-missing-gate-metrics] 是正前の旧 payload との
+        後方互換)。単一 dict は 1 行、per-pair dict は pair ごとに 1 行。"""
+        if value is None:
+            return [cls._metrics_line(prefix, None)]
+        if isinstance(value, dict) and "trades" in value:
+            return [cls._metrics_line(prefix, value)]
+        if isinstance(value, dict):
+            return [cls._metrics_line(f"{prefix} {pair}", metrics)
+                   for pair, metrics in value.items()]
+        return [cls._metrics_line(prefix, None)]
+
+    def _approval_detail(self, approval_id: int) -> str:
+        row = self.conn.execute(
+            "SELECT kind, status, payload_json FROM approval_requests "
+            "WHERE id=?", (approval_id,)).fetchone()
+        if row is None:
+            return f"approval #{approval_id} は存在しません"
+        try:
+            payload = (json.loads(row["payload_json"])
+                      if row["payload_json"] else {})
+        except (TypeError, ValueError):
+            payload = {}
+        lines = [
+            f"approval #{approval_id} kind={row['kind']} status={row['status']}",
+            f"name={payload.get('name', '-')} "
+            f"content_hash={payload.get('content_hash', '-')} "
+            f"eval_timeframe={payload.get('eval_timeframe') or '-'}",
+        ]
+        lines += self._metrics_lines("in_sample", payload.get("in_sample"))
+        lines += self._metrics_lines("holdout", payload.get("holdout"))
+        return "\n".join(lines)
 
     def _log(self, n: int) -> str:
         if n <= 0:
