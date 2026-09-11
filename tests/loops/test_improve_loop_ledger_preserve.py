@@ -100,6 +100,36 @@ def test_publish_retry_revalidates_hash_before_inserting_row(
     assert "archive_failed" in loop_min._activity._path.read_text()
 
 
+def test_publish_treats_preexisting_empty_final_dir_as_already_published(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """sonnet 3 周目 Minor (2026-09-11): os.rename は宛先が既存の空ディレ
+    クトリだと例外なしで成功し (先着を消費して置換)、EEXIST/ENOTEMPTY 経路
+    の先着扱い (hash 再検証) をバイパスしてしまう。final が空 dir として
+    先に存在するとき、mkdir 正規化で「先着扱い」に倒し、publish 済みと
+    誤認して行を書かないこと (空 dir は 3 ファイルが無いので hash 再検証
+    は archive_failed に倒れ、行は書かれない) を確認する。"""
+    mission_id, run_id, _ = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    final = loop_min._root / "plugins" / "_archive" / str(mission_id) / artifact_hash
+    final.mkdir(parents=True)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    conn.execute("BEGIN IMMEDIATE")
+    ids = loop_min._persist_ledger_in_tx(
+        conn, ctx=ctx, now=NOW, mission_outcome="failed")
+    conn.commit()
+
+    assert ids == []
+    assert conn.execute(
+        "SELECT count(*) FROM candidate_archives WHERE mission_id=?",
+        (mission_id,)).fetchone()[0] == 0
+    assert "archive_failed" in loop_min._activity._path.read_text()
+    # tmp は「先着扱い」経路で自 tmp として削除される
+    assert not tmp.exists()
+
+
 def test_failed_terminal_persists_outcome_and_marks_ledger_persisted(
         loop_min, conn, mission_and_run_fixture, tmp_path):
     mission_id, run_id, _ = mission_and_run_fixture

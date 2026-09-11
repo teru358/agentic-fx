@@ -1659,20 +1659,40 @@ class ImproveLoop:
             published = False
             if tmp_path.exists():
                 final_path.parent.mkdir(parents=True, exist_ok=True)
+                # sonnet 3 周目 Minor (2026-09-11): os.rename は宛先が
+                # 既存の空ディレクトリだと例外なしで成功し (先着を消費して
+                # 置換してしまう)、EEXIST/ENOTEMPTY 経路の先着扱い
+                # (hash 再検証) をバイパスする。rename 直前に final_path を
+                # mkdir して既存判定を正規化する: FileExistsError なら
+                # 既存扱い (tmp 削除 → 下の hash 再検証へ)。mkdir が成功
+                # したら自分が作った空 dir を rmdir してから rename する
+                # (空 dir を残したまま rename すると同じ問題が再現する)。
                 try:
-                    os.rename(tmp_path, final_path)
-                    _fsync_dir(final_path.parent)
-                    published = True
+                    final_path.mkdir()
+                except FileExistsError:
+                    self._remove_archive_tmp(tmp_path)
                 except OSError as exc:
-                    if isinstance(exc, FileExistsError) or exc.errno in (
-                            errno.EEXIST, errno.ENOTEMPTY):
-                        self._remove_archive_tmp(tmp_path)
-                    else:
-                        self._archive_failed(
-                            mission_id=ctx.mission_id,
-                            artifact_hash=artifact_hash,
-                            reason=f"{type(exc).__name__}:{str(exc)[:300]}")
-                        continue
+                    self._archive_failed(
+                        mission_id=ctx.mission_id,
+                        artifact_hash=artifact_hash,
+                        reason=f"{type(exc).__name__}:{str(exc)[:300]}")
+                    continue
+                else:
+                    final_path.rmdir()
+                    try:
+                        os.rename(tmp_path, final_path)
+                        _fsync_dir(final_path.parent)
+                        published = True
+                    except OSError as exc:
+                        if isinstance(exc, FileExistsError) or exc.errno in (
+                                errno.EEXIST, errno.ENOTEMPTY):
+                            self._remove_archive_tmp(tmp_path)
+                        else:
+                            self._archive_failed(
+                                mission_id=ctx.mission_id,
+                                artifact_hash=artifact_hash,
+                                reason=f"{type(exc).__name__}:{str(exc)[:300]}")
+                            continue
             if not published:
                 try:
                     if final_path.is_symlink() or not final_path.is_dir():
