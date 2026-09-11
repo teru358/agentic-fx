@@ -870,6 +870,22 @@ def test_detect_stderr_fatal_tail_capped_at_200_chars():
     assert len(tail) == 200
 
 
+def test_detect_stderr_fatal_is_single_line_and_scrubs_secrets():
+    """advisor 指摘 (2026-09-11): `stderr_fatal` は `reason` と同じ
+    「外部応答本文を生で入れない」規範に従う —
+    `test_cli_runner_reason_is_single_line_and_capped` の対の pin。
+    複数行の stderr (実 #71 の `_stderr_tail` も複数行) かつ秘密混入が
+    あっても、単一行に潰され秘密は除去される。"""
+    from agentic_fx.runners.cli_runner import _detect_stderr_fatal
+
+    text = "SIGTRAP\nAPIKEY=SECRET123\n"
+    found = _detect_stderr_fatal(text)
+    assert found is not None
+    assert "\n" not in found
+    assert "SECRET123" not in found
+    assert "pattern=SIGTRAP" in found
+
+
 def test_cli_runner_completed_mission_carries_stderr_fatal(tmp_path):
     """A4 #71 観測 B の核心: rc=0/completed 終端でも stderr に致命
     パターンがあれば `result.stderr_fatal` へ載る (「ツール基盤が死んで

@@ -75,11 +75,20 @@ def _detect_stderr_fatal(stderr_text: str) -> str | None:
     """`stderr_text` に `CLI_STDERR_FATAL_PATTERNS` のいずれかが含まれて
     いれば `pattern=<p> tail=<先頭 200 字>` を返す。無ければ `None`。
     最初に一致したパターン (タプル順) を採用する — 複数一致は稀で、
-    診断上はどれか 1 つが分かれば十分。"""
+    診断上はどれか 1 つが分かれば十分。
+
+    `_normalize_reason` を通す (advisor 指摘、2026-09-11): `reason` と
+    同じ「外部応答本文を生で入れない」規範 (`base.py` の `AgentRunner`
+    docstring) がここにも適用される。生の 200 字 tail は複数行 (実 #71
+    の `_stderr_tail` は改行区切り) かつ秘密混入の可能性がある
+    (`test_cli_runner_reason_is_single_line_and_capped` が `reason` に
+    対して pin している規律と同じ穴)。`_normalize_reason` は単一行化・
+    `safe_text` によるスクラブ・上限カットを行う — 500 字上限は 200 字
+    tail より広いため実質的に切り詰めない。"""
     for pattern in CLI_STDERR_FATAL_PATTERNS:
         if pattern and pattern in stderr_text:
             tail = stderr_text[:_STDERR_FATAL_TAIL_CHARS]
-            return f"pattern={pattern} tail={tail}"
+            return _normalize_reason(f"pattern={pattern} tail={tail}")
     return None
 
 
