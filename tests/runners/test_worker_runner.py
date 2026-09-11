@@ -3986,6 +3986,94 @@ def test_rpc_accepted_exception_keeps_response_and_releases_reservation(
     assert dropped == []
 
 
+def test_rpc_worker_late_result_does_not_land_in_next_rpc_queue(
+        tmp_path, monkeypatch):
+    """/code-review 2 周目 CR2 (2026-09-11): `_rpc_worker` の result_queue は
+    反復ごとに再束縛される自由変数だった。成功経路は `result_queue.put(
+    handler())` が queue を先に評価するので自 queue に入るが、**例外経路**
+    (`except` 節の put) は handler 完了後に評価されるため、timeout した
+    前 RPC が遅れて失敗すると次の RPC の queue にエラーが落ちる。子が
+    2 本連続で tool_rpc を送り、1 本目を timeout 後に失敗させ、2 本目の
+    応答が 2 本目 handler の結果であることを固定する。"""
+    import agentic_fx.runners.worker_runner as wr_mod
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    responses = []
+    release_first = threading.Event()
+    accepted = []
+
+    slow_done = threading.Event()
+
+    def handler(args):
+        if args["name"] == "slow":
+            release_first.wait(2.0)
+            slow_done.set()  # 直後に except 節の put が起きる (r2 の queue が束縛済み)
+            raise RuntimeError("slow failed late")
+        # r2 の handler が走っている = dispatcher は r2 の queue を待っている。
+        # ここで slow を起こすと、旧実装では slow の put が r2 の queue に落ちる。
+        release_first.set()
+        slow_done.wait(2.0)
+        time.sleep(0.05)
+        return {"from": "fast"}
+
+    def child():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        json.loads(child_in.readline())
+        write_frame(child_out, {"type": "tool_rpc", "seq": 2, "rpc_id": "r1",
+                                "name": "run_backtest",
+                                "args": {"name": "slow", "pair": "USDJPY"}})
+        responses.append(json.loads(child_in.readline()))  # timeout 応答
+        write_frame(child_out, {"type": "tool_rpc", "seq": 3, "rpc_id": "r2",
+                                "name": "run_backtest",
+                                "args": {"name": "fast", "pair": "USDJPY"}})
+        responses.append(json.loads(child_in.readline()))
+        write_frame(child_out, {"type": "result", "seq": 4,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    thread = threading.Thread(target=child, daemon=True)
+    fake_proc = _fake_improve_proc(r, w, w2, r2)
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+    runner = WorkerRunner(
+        root=_root(tmp_path), settings=_tiny_worker_settings(rpc_timeout_sec=0.3),
+        clock=FixedClock(NOW), rag=_rag(tmp_path), worker_profile="improve",
+        rpc_handlers={"run_backtest": handler},
+        on_rpc_accepted=lambda name, args, outcome: accepted.append(
+            (args["name"], outcome.public)))
+    thread.start()
+    runner.run(_mission())
+    thread.join(3.0)
+    assert responses[0]["ok"] is False
+    assert responses[1] == {"type": "tool_rpc_result", "seq": 4, "rpc_id": "r2",
+                            "ok": True, "result": {"from": "fast"}}
+    assert accepted == [("fast", {"from": "fast"})]
+
+
+def test_rpc_thread_start_failure_releases_reservation(tmp_path, monkeypatch):
+    """/code-review 2 周目 CR7 (2026-09-11): begin 予約の後で Thread.start が
+    落ちても予約は解放される (放置すると freeze が drain 全時間を待つ)。"""
+    import agentic_fx.runners.worker_runner as wr_mod
+    released = []
+    real_thread = wr_mod.threading.Thread
+
+    class _Boom(real_thread):
+        def start(self):
+            if self.name == "afx-rag-rpc":
+                raise RuntimeError("can't start new thread")
+            return super().start()
+
+    monkeypatch.setattr(wr_mod.threading, "Thread", _Boom)
+    _, response = _run_fake_tool_rpc(
+        tmp_path, monkeypatch, handler=lambda args: {"v": 1},
+        on_rpc_begin=lambda name: True, on_rpc_released=released.append)
+    assert released == ["run_backtest"]
+    assert response["ok"] is False and response["error"] == "rpc_start_failed"
+
+
 def test_rpc_timeout_then_handler_completion_before_freeze_is_not_recorded(
         tmp_path, monkeypatch):
     from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger

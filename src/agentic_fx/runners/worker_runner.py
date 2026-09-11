@@ -324,14 +324,46 @@ class WorkerRunner(AgentRunner):
                         return
                     continue
 
-                def _rpc_worker(name=frame["name"], args=frame["args"]) -> None:
+                # /code-review 2 周目 CR2 (2026-09-11): result_queue は
+                # 反復ごとに再束縛される自由変数だった — timeout 後に完了
+                # した前 RPC の put が**次の RPC の queue** に落ち、accepted
+                # callback が別 RPC の結果を記録していた。既定引数で束縛。
+                def _rpc_worker(name=frame["name"], args=frame["args"],
+                                result_queue=result_queue) -> None:
                     try:
                         result_queue.put((True, self._dispatch_rpc(name, args)))
                     except Exception as e:  # noqa: BLE001 — 子へ tool error として返す
                         result_queue.put((False, str(e)))
 
-                threading.Thread(target=_rpc_worker, daemon=True,
-                                 name="afx-rag-rpc").start()
+                try:
+                    threading.Thread(target=_rpc_worker, daemon=True,
+                                     name="afx-rag-rpc").start()
+                except Exception:  # noqa: BLE001
+                    # CR7 (/code-review 2 周目、2026-09-11): begin 予約後に
+                    # Thread.start が落ちたら予約を返し (返さないと freeze が
+                    # drain 全時間を待つ)、子へ tool error を返して dispatcher
+                    # は生かす (死なせると子は応答待ちのまま mission timeout)。
+                    _log.exception("rpc worker thread start failed")
+                    if self._on_rpc_released is not None:
+                        try:
+                            self._on_rpc_released(frame["name"])
+                        except Exception:  # noqa: BLE001
+                            _log.warning("on_rpc_released callback failed",
+                                         exc_info=True)
+                    out_seq_holder["n"] += 1
+                    result_frame = {
+                        "type": "tool_rpc_result",
+                        "seq": out_seq_holder["n"] + 1,
+                        "rpc_id": frame["rpc_id"], "ok": False,
+                        "error": "rpc_start_failed"}
+                    try:
+                        with stdin_lock:
+                            if stdin_state["closed"]:
+                                return
+                            write_frame(proc.stdin, result_frame)
+                    except (BrokenPipeError, OSError, ValueError):
+                        return
+                    continue
                 rpc_timeout_sec = self._rpc_timeout_sec_by_kind.get(
                     frame["name"], w.rpc_timeout_sec)
                 payload = None

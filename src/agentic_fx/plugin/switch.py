@@ -213,14 +213,7 @@ def reconcile_switch_journals(conn: sqlite3.Connection, *,
 # 書込可能へ戻す (改善ループ側の `_remove_archive_tmp`/`_delete_staging` と
 # 同じ os.walk 流儀、symlink は chmod しない)。
 def _chmod_tree_writable(path: Path) -> None:
-    for dirpath, _dirnames, filenames in os.walk(path):
-        directory = Path(dirpath)
-        if not directory.is_symlink():
-            directory.chmod(0o700)
-        for filename in filenames:
-            candidate = directory / filename
-            if not candidate.is_symlink():
-                candidate.chmod(0o600)
+    version_store.chmod_tree_writable(path)
 
 
 def _archive_dir_size(path: Path) -> int:
@@ -392,6 +385,14 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
                         activity.write(
                             Category.APPROVAL, "sweep_archive_tmp_failed",
                             f"path={tmp_dir} error={safe_error_text(exc)}")
+                    continue
+                # /code-review 2 周目 CR6 (2026-09-11): 黙って残った tmp は
+                # 報告する (⑦ の rmtree_incomplete と同型。残骸のバイトが
+                # ⑦ の上限計算に混ざり無音で余計な mission を消す)。
+                if tmp_dir.exists() and activity is not None:
+                    activity.write(
+                        Category.APPROVAL, "sweep_archive_tmp_failed",
+                        f"path={tmp_dir} error=rmtree_incomplete")
 
     # T4 変更点6: 孤立 final (`candidate_archives` に (mission_id,
     # artifact_hash) の行が無い final ディレクトリ) を activity に出す。
@@ -501,7 +502,10 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
                 path = row["archive_path"]
                 if path is None:
                     continue
-                if not (root_dir / path).exists():
+                target = root_dir / path
+                # /code-review 2 周目 CR8 (2026-09-11): exists() は symlink を
+                # 辿る。⑥⑦ と同じく symlink / 非 dir は「無い」扱い。
+                if target.is_symlink() or not target.is_dir():
                     candidate_archives_store.clear_path(
                         conn, row["id"], commit=False)
                     cleared_any = True

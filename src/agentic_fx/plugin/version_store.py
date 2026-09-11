@@ -33,6 +33,24 @@ def artifact_hash_bytes(plugin_py: bytes, config_yaml: bytes,
     ).hexdigest()
 
 
+def chmod_tree_writable(path: Path) -> None:
+    """readonly (0500/0400) なツリーを削除前に書込可能へ戻す。**`path` 自身が
+    symlink なら何もしない** — `os.walk(followlinks=False)` でも起点が symlink
+    だとリンク先へ降りてしまう (/code-review 2 周目 CR5、2026-09-11)。内側の
+    symlink は chmod しない。`_delete_staging` / `_remove_archive_tmp` /
+    `switch._chmod_tree_writable` の 3 コピーを統合 (CR10)。"""
+    if path.is_symlink():
+        return
+    for dirpath, _dirnames, filenames in os.walk(path):
+        directory = Path(dirpath)
+        if not directory.is_symlink():
+            directory.chmod(0o700)
+        for filename in filenames:
+            candidate = directory / filename
+            if not candidate.is_symlink():
+                candidate.chmod(0o600)
+
+
 def _fsync_dir(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:

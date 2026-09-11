@@ -122,6 +122,26 @@ def test_run_backtest_creates_readonly_tmp_snapshot(loop_min, tmp_path, monkeypa
     assert meta["artifact_hash"] == result.save_kwargs["artifact_hash"]
 
 
+def test_run_backtest_skips_snapshot_when_ledger_not_open(
+        loop_min, tmp_path, monkeypatch):
+    """/code-review 2 周目 CR4 (2026-09-11): timeout 後に完了した handler
+    (受理境界の外) は snapshot を書かない — commit 後の plugins/_archive に
+    孤立 tmp が残り、次の起動まで誰も拾わない。"""
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger.freeze()
+    result = loop_min._build_rpc_handlers(
+        ledger, staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+    assert "error" not in result
+    assert "archive_tmp" not in result.save_kwargs
+    assert not (loop_min._root / "plugins" / "_archive").exists()
+    assert "archive_skipped_late" in (tmp_path / "activity.log").read_text()
+
+
 def test_run_backtest_rejects_changed_content_before_execution(
         loop_min, tmp_path, monkeypatch):
     candidate = tmp_path / "staging" / "myst"
@@ -376,6 +396,12 @@ def test_analyze_corr_handler_does_not_persist_before_tx2(
     after = conn.execute(
         "SELECT COUNT(*) c FROM analysis_runs").fetchone()["c"]
     assert after == before
+    # /code-review 2 周目 CR3 (2026-09-11): 台帳は痩せない — 親 wrapper が
+    # 記録する private (.save_kwargs) は遮断 7 前の全量 (in_sample_until を
+    # 含む)。無いと analysis_runs.params_json から境界が落ちる。
+    private = getattr(result, "save_kwargs", None)
+    assert private is not None
+    assert "in_sample_until" in private.get("params", private)
 
 
 def test_run_backtest_handler_rejects_non_strategy_candidate(

@@ -180,6 +180,33 @@ def test_finalize_gate_failed_persists_outcome_gate_failed_and_archives(
     assert final.is_dir()
 
 
+def test_finalize_gate_failed_gate_rows_carry_outcome_and_stay_out_of_live(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """/code-review 2 周目 CR1 (2026-09-11): 親ゲート行 (`gate_rows`) も
+    `mission_outcome='gate_failed'` で保存する。NULL のままだと
+    `latest_in_sample_metrics` の live 絞りを通り、gate 不合格候補の成績が
+    live plugin の成績として表示される (content_hash が同じ候補)。"""
+    from agentic_fx.store import backtest_runs
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    ctx = _ctx(tmp_path, mission_id, run_id, [])
+    live_hash = "h" * 64
+    gate_row = dict(
+        scope="in_sample", plugin_ref="x", content_hash=live_hash,
+        kind="strategy", pair="USDJPY", timeframe="1h", source="test",
+        base_interval="1m", period=(NOW, NOW), metrics={"pf": 9.9, "trades": 50},
+        settings_hash="s", core_commit="c", initial_balance=1.0, now=NOW)
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id, reason="gate_failed:test",
+        now=NOW, gate_rows=[gate_row])
+    rows = conn.execute(
+        "SELECT mission_outcome FROM backtest_runs WHERE mission_id=? "
+        "AND content_hash=?", (mission_id, live_hash)).fetchall()
+    assert [r["mission_outcome"] for r in rows] == ["gate_failed"]
+    assert backtest_runs.latest_in_sample_metrics(
+        conn, live_hash, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m") is None
+
+
 def test_finalize_loser_persists_outcome_loser(
         loop_min, conn, mission_and_run_fixture, tmp_path):
     """§3 表: 敗者経路は `mission_outcome='loser'`。"""

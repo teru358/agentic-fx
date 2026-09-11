@@ -368,6 +368,65 @@ def test_sweep_orphans_archive_gc_db_failure_rolls_back_and_leaves_no_open_tx(
     assert "sweep_archive_db_failed" in (tmp_path / "activity.log").read_text()
 
 
+def test_chmod_tree_writable_ignores_symlink_top_level(env):
+    """/code-review 2 周目 CR5 (2026-09-11): 起点が symlink なら何もしない
+    (os.walk は followlinks=False でも起点 symlink の中へ降りる)。"""
+    import stat
+    from agentic_fx.plugin.version_store import chmod_tree_writable
+    tmp_path, plugins_dir, conn = env
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    f = outside / "keep.txt"
+    f.write_text("k")
+    f.chmod(0o400)
+    outside.chmod(0o500)
+    link = tmp_path / "link"
+    link.symlink_to(outside, target_is_directory=True)
+    try:
+        chmod_tree_writable(link)
+        assert stat.S_IMODE(f.stat().st_mode) == 0o400
+        assert stat.S_IMODE(outside.stat().st_mode) == 0o500
+    finally:
+        outside.chmod(0o700)
+        f.chmod(0o600)
+
+
+def test_sweep_orphans_tmp_silent_rmtree_failure_is_reported(env, monkeypatch):
+    """/code-review 2 周目 CR6 (2026-09-11): ⑥ の rmtree が黙って残しても
+    `rmtree_incomplete` を報告する (⑦ と同型)。"""
+    tmp_path, plugins_dir, conn = env
+    tmp_dir = plugins_dir / "_archive" / "1" / ".tmp-abc-1"
+    tmp_dir.mkdir(parents=True)
+    (tmp_dir / "plugin.py").write_bytes(b"x")
+    activity = ActivityLog(tmp_path / "activity.log")
+    monkeypatch.setattr(switch.shutil, "rmtree",
+                        lambda path, ignore_errors=False: None)
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW,
+                         activity=activity)
+    assert tmp_dir.exists()
+    assert "rmtree_incomplete" in (tmp_path / "activity.log").read_text()
+
+
+def test_sweep_orphans_reconcile_treats_symlink_path_as_missing(env):
+    """/code-review 2 周目 CR8 (2026-09-11): ⑦′ の存在判定は symlink を
+    辿らない (⑥⑦ と同じ規律)。symlink に差し替えられた archive_path は
+    NULL に戻す。"""
+    tmp_path, plugins_dir, conn = env
+    h = "9" * 64
+    real = _make_final(plugins_dir, 2, "a" * 64, readonly=False)
+    link = plugins_dir / "_archive" / "1" / h
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real, target_is_directory=True)
+    _insert_row(conn, mission_id=1, artifact_hash=h,
+               archive_path=f"plugins/_archive/1/{h}")
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+    row = conn.execute(
+        "SELECT archive_path FROM candidate_archives WHERE mission_id=1"
+    ).fetchone()
+    assert row["archive_path"] is None
+    assert link.is_symlink() and real.exists()
+
+
 # ---------------------------------------------------------------------------
 # archive GC ⑦′: path 不存在の再収束
 # ---------------------------------------------------------------------------
