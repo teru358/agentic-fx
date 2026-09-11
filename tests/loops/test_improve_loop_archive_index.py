@@ -267,6 +267,9 @@ def _index_path(loop):
 
 def test_finalize_gate_failed_appends_index_row(
         loop_min, conn, mission_and_run_fixture, tmp_path):
+    """ローカル T4 1 周目 #L4 (2026-09-10) を同居: INDEX 行の日付セルは
+    `now.isoformat()` (ブリーフ「変更点」3 の `| <now ISO> |`)。`str(now)`
+    に落とすと空白区切りになり ISO 形式でなくなる。"""
     mission_id, run_id, backlog_id = mission_and_run_fixture
     tmp = tmp_path / "archive"
     artifact_hash = _snapshot(tmp)
