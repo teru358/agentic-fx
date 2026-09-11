@@ -459,13 +459,32 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
             total_bytes -= victim_size
             n_missions -= 1
             mission_id = int(victim.name)
-            for row in candidate_archives_store.list_by_mission(conn, mission_id):
-                if row["archive_path"] is not None:
-                    candidate_archives_store.clear_path(
-                        conn, row["id"], commit=False)
-                    committed_any = True
+            # codex 1 周目 (T3+T4) Important 2 (2026-09-11): DB 更新の失敗は
+            # 呼び出し元の connection に未完了 transaction を残さない —
+            # rollback して activity、行は次回 sweep の ⑦′ で再収束する。
+            try:
+                for row in candidate_archives_store.list_by_mission(
+                        conn, mission_id):
+                    if row["archive_path"] is not None:
+                        candidate_archives_store.clear_path(
+                            conn, row["id"], commit=False)
+                        committed_any = True
+            except sqlite3.Error as exc:
+                conn.rollback()
+                committed_any = False
+                if activity is not None:
+                    activity.write(
+                        Category.APPROVAL, "sweep_archive_db_failed",
+                        f"mission={mission_id} error={safe_error_text(exc)}")
         if committed_any:
-            conn.commit()
+            try:
+                conn.commit()
+            except sqlite3.Error as exc:
+                conn.rollback()
+                if activity is not None:
+                    activity.write(
+                        Category.APPROVAL, "sweep_archive_db_failed",
+                        f"phase=commit error={safe_error_text(exc)}")
 
     # archive GC ⑦′ (T4 §1 L4): 前回 DB 更新失敗の再収束。`archive_path` が
     # 非 NULL なのに dir が無い行を `clear_path` する (上の ⑦ が消した分は
@@ -476,16 +495,24 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
             "SELECT DISTINCT mission_id FROM candidate_archives "
             "WHERE archive_path IS NOT NULL")}
     cleared_any = False
-    for mission_id in stale_missions:
-        for row in candidate_archives_store.list_by_mission(conn, mission_id):
-            path = row["archive_path"]
-            if path is None:
-                continue
-            if not (root_dir / path).exists():
-                candidate_archives_store.clear_path(conn, row["id"], commit=False)
-                cleared_any = True
-    if cleared_any:
-        conn.commit()
+    try:
+        for mission_id in stale_missions:
+            for row in candidate_archives_store.list_by_mission(conn, mission_id):
+                path = row["archive_path"]
+                if path is None:
+                    continue
+                if not (root_dir / path).exists():
+                    candidate_archives_store.clear_path(
+                        conn, row["id"], commit=False)
+                    cleared_any = True
+        if cleared_any:
+            conn.commit()
+    except sqlite3.Error as exc:
+        conn.rollback()
+        if activity is not None:
+            activity.write(
+                Category.APPROVAL, "sweep_archive_db_failed",
+                f"phase=reconcile error={safe_error_text(exc)}")
 
 # ============================================================
 # candidate_origin/candidate_path payload validator (§8.1-29、プラン10 Task 11d 逐語)

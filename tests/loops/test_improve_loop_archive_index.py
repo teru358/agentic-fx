@@ -293,6 +293,47 @@ def test_finalize_gate_failed_appends_index_row(
     assert "T" in date_cell and " " not in date_cell
 
 
+def test_index_concurrent_first_append_writes_single_header(loop_min):
+    """codex 1 周目 (T3+T4) Important 1 (2026-09-11): 2 mission の初回追記が
+    並行しても、ヘッダは 1 組・各 mission 1 行 (プロセス内 lock で直列化)。
+    lock を外すと両方が「ファイル無し」を観測しヘッダが 2 組になる。"""
+    import threading
+    from types import SimpleNamespace
+    rows = [{"id": 1, "name": "x", "artifact_hash": "a" * 64,
+             "archive_path": "plugins/_archive/1/" + "a" * 64,
+             "metrics": {"pf": 1.0, "trades": 5, "evaluable": True}}]
+    barrier = threading.Barrier(2)
+    real_exists = type(_index_path(loop_min)).exists
+
+    def slow_exists(self, *a, **kw):
+        result = real_exists(self, *a, **kw)
+        if self.name == "INDEX.md":
+            try:
+                barrier.wait(timeout=2)  # 両者が exists() を評価し終えるまで待つ
+            except threading.BrokenBarrierError:
+                pass
+        return result
+
+    import pathlib as _pl
+    orig = _pl.Path.exists
+    _pl.Path.exists = slow_exists
+    try:
+        threads = [threading.Thread(
+            target=loop_min._append_archive_index,
+            args=(SimpleNamespace(mission_id=m),),
+            kwargs=dict(status="failed", rows=rows, now=NOW)) for m in (1, 2)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(5)
+    finally:
+        _pl.Path.exists = orig
+    lines = _index_path(loop_min).read_text().splitlines()
+    assert sum(ln.startswith("| date |") for ln in lines) == 1
+    assert sum("| mission 1 |" in ln for ln in lines) == 1
+    assert sum("| mission 2 |" in ln for ln in lines) == 1
+
+
 def test_index_append_is_fsynced(
         loop_min, conn, mission_and_run_fixture, tmp_path, monkeypatch):
     """ローカル T4 1 周目 #L6 (2026-09-10): INDEX.md の追記は

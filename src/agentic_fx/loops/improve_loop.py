@@ -255,6 +255,9 @@ _REPORT_WRITE_FAILED = object()
 
 
 class ImproveLoop:
+    # INDEX.md の追記を直列化する (プロセス内、slot スレッド間で共有)。
+    _archive_index_lock = threading.Lock()
+
     # precheck 2026-08-22 wave2: T10-B10 — Rag はここで注入を受ける
     # (`_build_worker_runner` が独自シグネチャで new しない)
     def __init__(self, *, root: Path, settings: "Settings", clock: "Clock",
@@ -1537,16 +1540,26 @@ class ImproveLoop:
             archive_cell = best.get("archive_path") or "-"
         line = (f"| {now.isoformat()} | mission {ctx.mission_id} | {status} "
                 f"| candidates={len(rows)} | {best_cell} | {archive_cell} |\n")
-        is_new = not index_path.exists()
-        with open(index_path, "a") as fh:
-            if is_new:
-                fh.write(
-                    "| date | mission | status | candidates | best | "
-                    "archive |\n")
-                fh.write("| --- | --- | --- | --- | --- | --- |\n")
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+        marker = f"| mission {ctx.mission_id} |"
+        # codex 1 周目 (T3+T4) Important 1 (2026-09-11): 「1 mission 1 行」を
+        # プロセス内 lock で守る — 外部補償の二重呼び出しは同 mission を
+        # 2 回通り、並行 slot の初回終端は双方が「ファイル無し」を観測して
+        # ヘッダを重複させていた。lock 内で既出 mission を確認して skip。
+        with self._archive_index_lock:
+            is_new = not index_path.exists()
+            if not is_new:
+                with open(index_path, "r") as fh:
+                    if any(marker in existing for existing in fh):
+                        return
+            with open(index_path, "a") as fh:
+                if is_new:
+                    fh.write(
+                        "| date | mission | status | candidates | best | "
+                        "archive |\n")
+                    fh.write("| --- | --- | --- | --- | --- | --- |\n")
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
 
     def _write_archive_index_safe(self, conn, *, ctx, status: str,
                                   now: datetime) -> None:

@@ -334,6 +334,40 @@ def test_sweep_orphans_archive_gc_silent_rmtree_failure_keeps_row(env, monkeypat
     assert "rmtree_incomplete" in (tmp_path / "activity.log").read_text()
 
 
+def test_sweep_orphans_archive_gc_db_failure_rolls_back_and_leaves_no_open_tx(
+        env, monkeypatch):
+    """codex 1 周目 (T3+T4) Important 2 (2026-09-11): 2 件目の `clear_path`
+    が失敗したら rollback して呼び出し元 connection に未完了 transaction を
+    残さない (次の起動時 reconcile が `BEGIN` できる)。1 件目の更新も
+    確定しない (次回 sweep の ⑦′ で再収束)。"""
+    import sqlite3
+    tmp_path, plugins_dir, conn = env
+    h1, h2 = "7" * 64, "8" * 64
+    _make_final(plugins_dir, 1, h1, size=10, readonly=False)
+    _make_final(plugins_dir, 1, h2, size=10, readonly=False)
+    _insert_row(conn, mission_id=1, artifact_hash=h1,
+               archive_path=f"plugins/_archive/1/{h1}")
+    _insert_row(conn, mission_id=1, artifact_hash=h2,
+               archive_path=f"plugins/_archive/1/{h2}", name="cand2")
+    activity = ActivityLog(tmp_path / "activity.log")
+    real_clear = candidate_archives.clear_path
+    calls = {"n": 0}
+
+    def flaky_clear(conn_, archive_id, *, commit=False):
+        calls["n"] += 1
+        if calls["n"] >= 2:  # 2 件目以降は全部失敗 (⑦′ の再収束も含む)
+            raise sqlite3.OperationalError("injected")
+        return real_clear(conn_, archive_id, commit=commit)
+
+    monkeypatch.setattr(switch.candidate_archives_store, "clear_path", flaky_clear)
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW,
+                         activity=activity, archive_max_missions=0)
+    assert not conn.in_transaction
+    conn.execute("BEGIN IMMEDIATE")  # 未完了 tx が残っていれば ここで失敗
+    conn.rollback()
+    assert "sweep_archive_db_failed" in (tmp_path / "activity.log").read_text()
+
+
 # ---------------------------------------------------------------------------
 # archive GC ⑦′: path 不存在の再収束
 # ---------------------------------------------------------------------------

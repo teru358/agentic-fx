@@ -448,6 +448,36 @@ def test_compensate_commit_failure_double_call_frozen_does_not_duplicate_rows(
     check.close()
 
 
+def test_compensate_commit_failure_double_call_writes_index_row_once(
+        loop_no_seam, tmp_path, clock):
+    """codex 1 周目 (T3+T4) Important 1 (2026-09-11): 外部補償の二重呼び出し
+    (同 ctx、1 回目で PERSISTED) でも INDEX.md の行は 1 mission 1 行。"""
+    loop, db_path = loop_no_seam
+    conn = db_mod.connect(db_path)
+    backlog_id = backlog_store.add(conn, "idea", "user", clock.now())
+    mission_id = missions_store.start(
+        conn, "improve", "local", "model", clock.now(), commit=False)
+    run_id = improve_runs_store.start(
+        conn, backlog_id, clock.now(), mission_id=mission_id, commit=False)
+    conn.commit()
+    conn.close()
+    staging_dir = tmp_path / "plugins" / "_staging" / str(mission_id)
+    staging_dir.mkdir(parents=True)
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _compensation_ctx(staging_dir, mission_id=mission_id, run_id=run_id,
+                            tmp=tmp, artifact_hash=artifact_hash)
+    loop.compensate_commit_failure(ctx=ctx, now=clock.now(),
+                                   exc=RuntimeError("boom"))
+    assert ctx.ledger.state() == "PERSISTED"
+    loop.compensate_commit_failure(ctx=ctx, now=clock.now(),
+                                   exc=RuntimeError("boom again"))
+    index = tmp_path / "plugins" / "_archive" / "INDEX.md"
+    lines = index.read_text().splitlines()
+    assert sum(f"| mission {mission_id} |" in ln for ln in lines) == 1
+    assert sum(ln.startswith("| date |") for ln in lines) == 1
+
+
 def test_compensate_commit_failure_savepoint_failure_then_terminal_insert_only_once(
         loop_no_seam, tmp_path, clock, monkeypatch):
     """§9 M2 pin: 1回目 SAVEPOINT 失敗 (`save_harness_run` 例外) →
