@@ -988,3 +988,106 @@ def test_cli_runner_primary_and_recovery_stderr_fatal_are_both_merged(tmp_path):
     assert "Segmentation fault" in result.stderr_fatal
     assert "resume-side" in result.stderr_fatal
     assert "; " in result.stderr_fatal
+
+
+# --- ローカル backend-fix 1 周目 #S2/#S3 (2026-09-11) -----
+#
+# `stderr_fatal` は「どの終端経路でも載る」ことが契約だが、材料時点の
+# テスト網は completed (+ 追撃マージ) しか踏んでいなかった。変異実測で
+# timeout / abort / schema mismatch / rc≠0 / no-output の 5 つの return
+# から `stderr_fatal=stderr_fatal` を落としても全件緑のまま (SURVIVED)
+# だったため、5 経路それぞれを個別に pin する。
+
+
+_STDERR_FATAL_LINE = (
+    "sys.stderr.write('error=code-mode host exited with status "
+    "signal: 5 (SIGTRAP)\\n')\nsys.stderr.flush()\n")
+
+
+def test_detect_stderr_fatal_tail_is_head_not_last_200_chars():
+    """ローカル backend-fix 1 周目 #S2 (2026-09-11): tail は **先頭** 200 字。
+    既存の `test_detect_stderr_fatal_tail_capped_at_200_chars` は長さしか
+    見ておらず、`stderr_text[:200]` を `stderr_text[-200:]` にする変異が
+    生存していた (実測 SURVIVED) — 内容で pin する。"""
+    from agentic_fx.runners.cli_runner import _detect_stderr_fatal
+
+    text = "SIGTRAP" + ("x" * 500)
+    found = _detect_stderr_fatal(text)
+    assert found is not None
+    assert found == f"pattern=SIGTRAP tail={text[:200]}"
+
+
+def test_cli_runner_timeout_carries_stderr_fatal(tmp_path):
+    """ローカル backend-fix 1 周目 #S3 (2026-09-11): timeout 終端でも
+    `stderr_fatal` が載る (`MissionResult("timeout", ...)` から
+    `stderr_fatal=` を落とす変異の killer)。"""
+    script = "import sys, time\n" + _STDERR_FATAL_LINE + "time.sleep(600)\n"
+    runner = _new_runner(script, tmp_path)
+    result = runner.run(_mission(timeout_sec=0.5))
+    assert result.status == "timeout"
+    assert result.stderr_fatal is not None
+    assert "SIGTRAP" in result.stderr_fatal
+
+
+def test_cli_runner_abort_carries_stderr_fatal(tmp_path):
+    """ローカル backend-fix 1 周目 #S3 (2026-09-11): abort (tool budget)
+    終端でも `stderr_fatal` が載る。stderr は `_run_cli_process` の戻り
+    4 要素目として決定論的に与える (abort は起動直後に入るため実
+    プロセスの stderr 到達はレースになる)。"""
+    class _AbortingRunner(_FakeCliRunner):
+        def _run_cli_process(self, argv, env, *, timeout_sec,
+                             on_started=None, abort_event=None):
+            return "abort", None, [], [
+                "error=code-mode host exited with status signal: 5 (SIGTRAP)\n"]
+
+    runner = _AbortingRunner(
+        script="", bin_path=Path(sys.executable), model="m", workdir=tmp_path,
+        cli_terminate_grace_sec=0.3, registry=ToolRegistry(),
+        abort_reason_fn=lambda: "tool_budget_abort:terminal_refusals")
+    result = runner.run(_mission())
+    assert result.status == "failed"
+    assert result.reason == "tool_budget_abort:terminal_refusals"
+    assert result.stderr_fatal is not None
+    assert "SIGTRAP" in result.stderr_fatal
+
+
+def test_cli_runner_schema_mismatch_carries_stderr_fatal(tmp_path):
+    """ローカル backend-fix 1 周目 #S3 (2026-09-11): output_schema 不適合の
+    failed 終端でも `stderr_fatal` が載る。"""
+    # `_extract_output` は "answer" キーを拾うので、型だけ schema 違反に
+    # する (キーごと欠けると no-output 経路に落ちて schema 検証に届かない)
+    script = ("import json, sys\n" + _STDERR_FATAL_LINE
+              + "print(json.dumps({'answer': 'not-an-integer'}))\n")
+    runner = _new_runner(script, tmp_path)
+    result = runner.run(_mission())
+    assert result.status == "failed"
+    assert result.reason is not None and "output_schema" in result.reason
+    assert result.stderr_fatal is not None
+    assert "SIGTRAP" in result.stderr_fatal
+
+
+def test_cli_runner_nonzero_rc_carries_stderr_fatal(tmp_path):
+    """ローカル backend-fix 1 周目 #S3 (2026-09-11): rc≠0 の failed 終端でも
+    `stderr_fatal` が載る。"""
+    script = "import sys\n" + _STDERR_FATAL_LINE + "sys.exit(3)\n"
+    runner = _new_runner(script, tmp_path)
+    result = runner.run(_mission())
+    assert result.status == "failed"
+    assert result.reason is not None and "rc=3" in result.reason
+    assert result.stderr_fatal is not None
+    assert "SIGTRAP" in result.stderr_fatal
+
+
+def test_cli_runner_no_output_failed_carries_stderr_fatal(tmp_path):
+    """ローカル backend-fix 1 周目 #S3 (2026-09-11): 追撃でも回収できない
+    no-output の failed 終端でも `stderr_fatal` が載る (既存の
+    `test_cli_runner_primary_stderr_fatal_only_is_kept_without_recovery` は
+    追撃が成功した completed 側しか踏まない)。"""
+    script = ("import sys\n" + _STDERR_FATAL_LINE
+              + "print('no answer key here')\n")
+    runner = _new_runner(script, tmp_path)
+    result = runner.run(_mission())
+    assert result.status == "failed"
+    assert result.reason is not None and "no output" in result.reason
+    assert result.stderr_fatal is not None
+    assert "SIGTRAP" in result.stderr_fatal

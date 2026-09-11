@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -146,9 +147,16 @@ def _run_bootstrap_probe(script: str, *, staging_dir: Path, mission_id: str,
     `Path.cwd()` を rw allowlist に加える際にその祖先ごと書込可能になり、
     `plugins/` 全体が書ける事故を自己生産してしまう (5-E で顕在化する
     穴と同じ — ここでは fixture 側で作らない)。"""
+    # ローカル backend-fix 1 周目 #L1 (2026-09-11): `PYTHONPATH` が与えられて
+    # いるときは子の sys.path 先頭に実 src を差し込まない — 段 0 の変異
+    # overlay (`PYTHONPATH=overlay/src`) をこの probe にも効かせるため
+    # (従来は実 src を必ず先頭に挿すので overlay が無視され、Landlock
+    # allowlist の変異が測れなかった)。通常実行では `PYTHONPATH` は
+    # 与えられないので挙動は変わらない。
     full_script = textwrap.dedent(f"""
-        import sys
-        sys.path.insert(0, {str(_REPO_ROOT / "src")!r})
+        import os, sys
+        if not os.environ.get("PYTHONPATH"):
+            sys.path.insert(0, {str(_REPO_ROOT / "src")!r})
         from agentic_fx.mission_worker import _bootstrap_improve_profile
         _bootstrap_improve_profile(
             backend={backend!r}, mission_id={mission_id!r},
@@ -157,6 +165,14 @@ def _run_bootstrap_probe(script: str, *, staging_dir: Path, mission_id: str,
             claude_bin=None, codex_bin=None)
     """) + "\n" + textwrap.dedent(script)
     env = {"PATH": "/usr/bin:/bin"}
+    # 同上 (#L1): 親に `PYTHONPATH` があれば子へ渡す (段 0 overlay)。子は
+    # `cwd=workdir` (tmp_path 配下) で走るため、相対パスのままでは解決
+    # できない — **親の cwd で絶対化してから**渡す。
+    parent_pythonpath = os.environ.get("PYTHONPATH")
+    if parent_pythonpath:
+        env["PYTHONPATH"] = os.pathsep.join(
+            str(Path(entry).resolve()) for entry in
+            parent_pythonpath.split(os.pathsep) if entry)
     env.update(extra_env or {})
     return subprocess.run([sys.executable, "-c", full_script],
                           cwd=str(workdir), env=env,
@@ -455,6 +471,34 @@ def test_bootstrap_improve_profile_proc_readable_for_codex(
         source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"],
         backend="codex")
     assert "PROC_READABLE" in result_codex.stdout, result_codex.stderr
+
+
+def test_bootstrap_improve_profile_proc_readable_for_opencode(
+        improve_worker_layout):
+    """ローカル backend-fix 1 周目 #L1 (2026-09-11): opencode backend でも
+    `/proc` が read_only に入る。
+
+    `backend in ("claude", "opencode", "codex")` のタプルから `opencode`
+    だけを落とす変異は、claude 側と codex 側の probe しか無かった材料
+    時点では生存した (opencode = bun/JSC は `/proc/self/maps` を読めないと
+    SIGABRT するので、落ちれば improve mission が起動ごと死ぬ)。"""
+    l = improve_worker_layout
+    script = """
+    try:
+        import os
+        os.listdir("/proc")
+        print("PROC_READABLE")
+    except PermissionError:
+        print("PROC_BLOCKED")
+    """
+    layout4_staging = (l["staging_dir"].parent.parent.parent / "_staging4"
+                       / l["mission_id"])
+    layout4_staging.mkdir(parents=True, mode=0o700)
+    result_opencode = _run_bootstrap_probe(
+        script, staging_dir=layout4_staging, mission_id=l["mission_id"],
+        source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"],
+        backend="opencode")
+    assert "PROC_READABLE" in result_opencode.stdout, result_opencode.stderr
 
 
 def test_bootstrap_improve_profile_home_env_is_scratch_dir(improve_worker_layout):

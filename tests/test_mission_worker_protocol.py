@@ -1832,3 +1832,53 @@ def test_result_frame_appends_counters_summary_to_tool_budget_abort_reason(
     assert reason.count("calls=") == 1
     assert " refused=" in reason and " self_test=" in reason and " backtest=" in reason
     assert "\n" not in reason
+
+
+def test_main_improve_result_tool_calls_receives_configured_backend(
+        monkeypatch, tmp_path):
+    """ローカル backend-fix 1 周目 #L3 (2026-09-11): `main()` は
+    `_improve_result_tool_calls` へ **handshake settings の
+    `runner.improve.backend`** を渡す。
+
+    既存の `test_main_improve_result_frame_uses_improve_result_tool_calls_
+    return_value` は `lambda counters, improve_backend: 42` で置換するため
+    引数を一切観測せず、第 2 引数を定数 `"local"` に差し替える変異
+    (= CLI backend でも `tool_calls` が常に `None` になり、#71 観測 B の
+    診断が丸ごと消える) が生存していた (実測 SURVIVED)。ここでは backend を
+    `claude` に設定し、spy が受け取った値そのものを pin する。"""
+    from agentic_fx.runners.base import MissionResult
+    from agentic_fx.tools.mission_counters import MissionToolCounters
+
+    seen: list[str] = []
+
+    class _FakeImproveRunner:
+        def __init__(self):
+            self._afx_mission_counters = MissionToolCounters(budget=100)
+
+        def run(self, mission):
+            return MissionResult(status="completed",
+                                 output={"action": "no_trade"})
+
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda **kw: None)
+    monkeypatch.setattr(mission_worker, "_run_improve_mission",
+                        lambda **kw: _FakeImproveRunner())
+
+    def _spy(counters, improve_backend):
+        seen.append(improve_backend)
+        return 7
+
+    monkeypatch.setattr(mission_worker, "_improve_result_tool_calls", _spy)
+
+    def to_claude(settings_dict):
+        settings_dict["runner"]["improve"]["backend"] = "claude"
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides=_improve_handshake_overrides(
+            tmp_path, mission_id="m-tool-calls-backend"),
+        settings_mutator=to_claude, send_go=True)
+
+    assert seen == ["claude"], seen
+    assert frames[-1]["type"] == "result", frames[-1]
+    assert frames[-1]["tool_calls"] == 7
