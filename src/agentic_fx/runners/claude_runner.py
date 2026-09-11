@@ -11,6 +11,23 @@ from agentic_fx.runners.cli_runner import CliRunner
 from agentic_fx.runners.response_parser import ParseError, parse_json_output
 from agentic_fx.tools.registry import ToolRegistry
 
+# [claude-builtin-tools-exposed] 是正 (A4 10 回目 claude #69 観測 C、
+# 2026-09-11): `--allowedTools mcp__afx__*` は claude CLI の意味論では
+# 「自動承認の allowlist」であって「可用性のフィルタ」ではないため、
+# 組み込みツール (Bash/Edit/Write/…) は `--allowedTools` を絞っても
+# `system/init` にそのまま広告され、実測でも `ToolSearch`/`StructuredOutput`
+# が実行された (registry を通らず `max_tool_calls` に数えられない)。
+# `--disallowedTools` で明示的に遮断する。`Read` (workdir 内の読み取りは
+# Landlock 下で無害) と `ToolSearch`/`StructuredOutput` (StructuredOutput は
+# `_extract_output` が最終出力として読む) は遮断リストから除外する。
+CLAUDE_DISALLOWED_BUILTIN_TOOLS = (
+    "Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
+    "Task", "SendMessage", "RemoteTrigger", "CronCreate", "CronDelete",
+    "CronList", "PushNotification", "Workflow", "EnterWorktree",
+    "ExitWorktree", "Skill", "Monitor", "ScheduleWakeup", "DesignSync",
+    "ListAgents", "TaskOutput", "TaskStop", "ReportFindings",
+)
+
 
 # precheck 2026-08-22 pass2: RB3 追随 (build_runner から cli_started_sink= を
 # 透過するため、__init__ シグネチャと super().__init__() 呼び出しに追加)
@@ -53,6 +70,7 @@ class ClaudeRunner(CliRunner):
             "--strict-mcp-config",
             "--mcp-config", str(mcp_config_path),
             "--allowedTools", ",".join(self._allowed_tools),
+            "--disallowedTools", ",".join(CLAUDE_DISALLOWED_BUILTIN_TOOLS),
             "--max-turns", str(mission.max_turns),
             "--model", self._model,
         ]

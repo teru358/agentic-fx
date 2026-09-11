@@ -1270,6 +1270,88 @@ def test_strategy_baseline_falls_back_to_no_strategy_row(improve_env):
     assert null_baseline == 0
 
 
+_IN_SAMPLE_METRICS_FOR_PAYLOAD = {
+    "trades": 40, "pf": 1.474, "win_rate": 0.487, "avg_r": 0.188,
+    "max_drawdown": 0.0373, "total_pnl": 100.0}
+_HOLDOUT_METRICS_FOR_PAYLOAD = {
+    "trades": 54, "pf": 0.904, "win_rate": 0.3, "avg_r": -0.037,
+    "max_drawdown": 0.0392, "total_pnl": -10.0}
+
+
+def _fake_in_sample_with_metrics(metrics: dict):
+    """`run_in_sample` の fake。`record_fn` へ save_kwargs 形の in_sample 行を
+    積み、`per_pair[pair]` (= `StrategyGateVerdict.candidate_metrics`) には
+    `metrics` そのものを返す — [approval-payload-missing-gate-metrics]
+    是正のテストは in-sample と holdout で異なる数値を使い、コピー/スワップ
+    系の変異 (holdout に in_sample の値を代入する等) を殺す。"""
+    def _run(settings, *, history_conn, record_fn, **kwargs):
+        record_fn(_fake_record_kwargs(settings=settings, trades=metrics["trades"],
+                                      scope="in_sample", **kwargs))
+        return dict(metrics)
+    return _run
+
+
+def _fake_holdout_with_metrics(metrics: dict):
+    """`run_holdout_gate` の fake。`record_fn` へ渡す save_kwargs の
+    `metrics` を `_fake_record_kwargs` の既定 (`{"trades": trades}` のみ) から
+    差し替え、pf/avg_r/max_drawdown まで持つ現物形にする。"""
+    def _run(settings, *, history_conn, record_fn, **kwargs):
+        row = _fake_record_kwargs(settings=settings, trades=metrics["trades"],
+                                  scope="holdout_gate", **kwargs)
+        row["metrics"] = dict(metrics)
+        record_fn(row)
+        return dict(metrics)
+    return _run
+
+
+def test_approval_payload_includes_in_sample_and_holdout_metrics(improve_env):
+    """[approval-payload-missing-gate-metrics] (A4 10 回目 claude #69 観測 A、
+    2026-09-11): strategy candidate の承認 payload には、ゲートが実際に測った
+    in-sample / holdout の成績が載らなければならない (それまでは
+    `gate_metrics` に代入されるのが `baseline` だけで、両方とも構造的に
+    None だった — holdout で負けている候補でも人間の承認材料には自己申告
+    しか出てこない、という欠陥)。single pair (USDJPY 1 本) の候補なので
+    `payload["holdout"]` はブリーフの取り決め通り pair→metrics の dict では
+    なく metrics dict そのもの。`payload["in_sample"]` は
+    `StrategyGateVerdict.candidate_metrics` をそのまま (pair→metrics の
+    dict) 載せる — この非対称はブリーフの明示指定どおり。"""
+    app, root = improve_env
+    conn = app.conn_core
+
+    output = _plugin_artifact("payload_metrics_e2e", kind="strategy")
+    result = MissionResult(status="completed", output=output, transcript=[])
+
+    loop = ImproveLoop(
+        root=root, settings=app.settings, clock=FixedClock(NOW),
+        db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
+        activity=app.activity, rag=app.rag,
+    )
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               lambda **kw: FakeImproveWorkerRunner(result=result, **kw)), \
+         patch("agentic_fx.loops.improve_loop.holdout.run_in_sample",
+               _fake_in_sample_with_metrics(_IN_SAMPLE_METRICS_FOR_PAYLOAD)), \
+         patch("agentic_fx.loops.improve_loop.holdout.run_holdout_gate",
+               _fake_holdout_with_metrics(_HOLDOUT_METRICS_FOR_PAYLOAD)):
+        mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+        _write_staging_plugin(
+            ctx.staging_dir, "payload_metrics_e2e",
+            _PASSING_STRATEGY_PY, _PASSING_STRATEGY_CONFIG,
+            _PASSING_STRATEGY_TEST)
+        mission_result = worker.run(mission)
+        loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
+
+    payload_json = conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE kind='plugin'"
+        ).fetchone()[0]
+    payload = json.loads(payload_json)
+
+    assert payload["in_sample"] == {"USDJPY": _IN_SAMPLE_METRICS_FOR_PAYLOAD}
+    assert payload["holdout"] == _HOLDOUT_METRICS_FOR_PAYLOAD
+    assert payload["eval_timeframe"] == "1h"
+
+
 def test_report_outbox_state_transitions_published_then_rename_failure(
         improve_env):
     """§4.1「report の公開状態」: 1 本目は `.tmp/*.part` → Tx-2
