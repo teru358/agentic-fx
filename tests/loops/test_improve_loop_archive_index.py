@@ -458,3 +458,24 @@ def test_index_write_failure_does_not_break_termination(
         (mission_id,)).fetchone()[0] == "gate_failed"
     assert not _index_path(loop_min).exists()
     assert "archive_index_failed" in loop_min._activity._path.read_text()
+
+
+def test_index_marker_requires_full_mission_cell(loop_min):
+    """ローカル 2 周目 #I1 (2026-09-11): 既出判定の marker は
+    `| mission <id> |` の**セル全体**でなければならない。末尾の `|` を落とす
+    と `| mission 11 |` の行が mission 1 の marker (`| mission 1`) に部分一致
+    し、mission 1 の行が永久に書かれなくなる (INDEX は 1 mission 1 行の唯一の索引で、
+    落ちた行は誰も気づけない)。既存の重複テストは mission 1 と 2 しか使わず、
+    `marker` から末尾 `|` を削る変異を緑で通していた (実測 SURVIVED)。"""
+    from types import SimpleNamespace
+    rows = [{"id": 1, "name": "x", "artifact_hash": "a" * 64,
+             "archive_path": "plugins/_archive/1/" + "a" * 64,
+             "metrics": {"pf": 1.0, "trades": 5, "evaluable": True}}]
+    # 桁数の長い mission を先に書く = 短い側の marker が部分一致する向き
+    for mission_id in (11, 1):
+        loop_min._append_archive_index(
+            SimpleNamespace(mission_id=mission_id), status="failed",
+            rows=rows, now=NOW)
+    lines = _index_path(loop_min).read_text().splitlines()
+    assert sum("| mission 1 |" in ln for ln in lines) == 1
+    assert sum("| mission 11 |" in ln for ln in lines) == 1

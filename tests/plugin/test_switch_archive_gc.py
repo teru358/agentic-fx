@@ -459,3 +459,85 @@ def test_sweep_orphans_does_not_touch_row_whose_path_exists(env):
         "SELECT archive_path FROM candidate_archives WHERE mission_id=1"
     ).fetchone()
     assert row["archive_path"] == path
+
+
+# ---------------------------------------------------------------------------
+# ローカル 2 周目 pin (2026-09-11)
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_orphans_archive_gc_db_failure_rolls_back_when_reconcile_is_noop(
+        env, monkeypatch):
+    """ローカル 2 周目 #S3 (2026-09-11): ⑦ の DB 失敗は**その場で** rollback
+    しなければならない。既存の
+    `test_sweep_orphans_archive_gc_db_failure_rolls_back_and_leaves_no_open_tx`
+    は直後の ⑦′ が必ず例外か commit に到達するため、⑦ 側の `conn.rollback()`
+    を削る変異を緑で通していた (実測 SURVIVED)。ここでは ⑦′ が何もしない形
+    (失敗 mission の行が最初から `archive_path IS NULL`) を作り、⑦ が巻き
+    戻さないと呼び出し元 connection に未完了 tx が残ることを観測する。"""
+    import sqlite3
+    tmp_path, plugins_dir, conn = env
+    h1, h2 = "1" * 64, "2" * 64
+    _make_final(plugins_dir, 1, h1, size=10, readonly=False)
+    _make_final(plugins_dir, 2, h2, size=10, readonly=False)
+    _insert_row(conn, mission_id=1, artifact_hash=h1,
+                archive_path=f"plugins/_archive/1/{h1}")
+    # mission 2 の行は最初から NULL — ⑦′ の対象にならない
+    _insert_row(conn, mission_id=2, artifact_hash=h2, archive_path=None,
+                name="cand2")
+    activity = ActivityLog(tmp_path / "activity.log")
+    real_list = candidate_archives.list_by_mission
+
+    def flaky_list(conn_, mission_id):
+        if mission_id == 2:
+            raise sqlite3.OperationalError("injected")
+        return real_list(conn_, mission_id)
+
+    monkeypatch.setattr(switch.candidate_archives_store, "list_by_mission",
+                        flaky_list)
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW,
+                         activity=activity, archive_max_missions=0)
+
+    assert not conn.in_transaction
+    conn.execute("BEGIN IMMEDIATE")  # 未完了 tx が残っていれば失敗
+    conn.rollback()
+    assert "sweep_archive_db_failed" in (tmp_path / "activity.log").read_text()
+
+
+def test_sweep_orphans_reconcile_db_failure_rolls_back_open_tx(env, monkeypatch):
+    """ローカル 2 周目 #S4 (2026-09-11): ⑦′ の DB 失敗も rollback する
+    (`clear_path(commit=False)` が 1 件成功した後に失敗すると、巻き戻さない
+    限り呼び出し元 connection に未完了 tx が残り、次の起動時 reconcile の
+    `BEGIN` が落ちる)。⑦ を走らせない形 (`archive_max_*` 既定の None) に
+    したので、⑦′ の `conn.rollback()` だけを観測する — 既存テストは ⑦ 側の
+    rollback に救われ、この行を削る変異を緑で通していた (実測 SURVIVED)。"""
+    import sqlite3
+    tmp_path, plugins_dir, conn = env
+    (plugins_dir / "_archive").mkdir()
+    ha, hb = "a" * 64, "b" * 64
+    # dir は作らない = `archive_path` が非 NULL なのに disk に無い (⑦′ 対象)
+    _insert_row(conn, mission_id=5, artifact_hash=ha,
+                archive_path=f"plugins/_archive/5/{ha}")
+    _insert_row(conn, mission_id=5, artifact_hash=hb,
+                archive_path=f"plugins/_archive/5/{hb}", name="cand2")
+    activity = ActivityLog(tmp_path / "activity.log")
+    real_clear = candidate_archives.clear_path
+    calls = {"n": 0}
+
+    def flaky_clear(conn_, archive_id, *, commit=False):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise sqlite3.OperationalError("injected")
+        return real_clear(conn_, archive_id, commit=commit)
+
+    monkeypatch.setattr(switch.candidate_archives_store, "clear_path",
+                        flaky_clear)
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW,
+                         activity=activity)
+
+    assert calls["n"] >= 2  # 2 件目で実際に失敗した
+    assert not conn.in_transaction
+    conn.execute("BEGIN IMMEDIATE")
+    conn.rollback()
+    log = (tmp_path / "activity.log").read_text()
+    assert "sweep_archive_db_failed" in log and "phase=reconcile" in log
