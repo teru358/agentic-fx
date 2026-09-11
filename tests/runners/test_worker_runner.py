@@ -3946,6 +3946,38 @@ def test_rpc_error_and_timeout_release_reservation(tmp_path, monkeypatch, mode):
     assert response["ok"] is False
 
 
+def test_rpc_timeout_marks_worker_thread_rpc_abandoned(tmp_path, monkeypatch):
+    """codex 2 周目 Important (2026-09-11): timeout で予約を release した
+    後も `_rpc_worker` daemon thread は生き続け、遅れて完了し得る。
+    `run_backtest_handler` (improve_loop 側) はこの thread に立った
+    `RPC_ABANDONED_ATTR` を読んで、release 後に書かれる孤立 snapshot を
+    防ぐ — ここでは dispatcher が実際にその属性を立てることだけを検証
+    する (`current_thread()` を handler 内で捕まえ、runner 終了後に読む)。"""
+    from agentic_fx.runners.worker_runner import RPC_ABANDONED_ATTR
+
+    captured_thread: dict[str, threading.Thread] = {}
+
+    def handler(args):
+        captured_thread["thread"] = threading.current_thread()
+        time.sleep(0.3)
+        return {"late": True}
+
+    _run_fake_tool_rpc(
+        tmp_path, monkeypatch, handler=handler, timeout=0.05,
+        on_rpc_begin=lambda name: True)
+    # dispatcher は timeout 直後に abandoned を立てる — worker thread が
+    # 実際に走り終えるまで最大 0.3s 待つ必要がある。
+    deadline = time.monotonic() + 2.0
+    thread = None
+    while time.monotonic() < deadline:
+        thread = captured_thread.get("thread")
+        if thread is not None and not thread.is_alive():
+            break
+        time.sleep(0.02)
+    assert thread is not None
+    assert getattr(thread, RPC_ABANDONED_ATTR, False) is True
+
+
 def test_rpc_begin_exception_is_fail_closed(tmp_path, monkeypatch):
     """codex 1 周目 Important (2026-09-10): begin が例外なら予約の有無が
     不明なので handler を起動しない (fail-closed)。応答は返る。"""

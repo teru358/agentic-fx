@@ -125,6 +125,22 @@ class _BacktestReply(dict):
         self.save_kwargs = save_kwargs
 
 
+def _current_rpc_abandoned() -> bool:
+    """codex 2 周目 Important (2026-09-11): `run_backtest_handler` が
+    `ledger.state() != "OPEN"` を読んだ**直後**に dispatcher の RPC
+    timeout が予約を release し、freeze が完了しても、この state 読み取り
+    と snapshot mkdir は原子的でないため handler は続行してしまう
+    (check-then-act 競合)。`worker_runner.dispatcher_loop` は timeout
+    分岐で自分が起動した worker thread に `RPC_ABANDONED_ATTR` を立てる
+    — この handler は snapshot を書く前後の両方でこれを読み、abandoned
+    ならその場で打ち切る/後始末する。`worker_runner` の import は関数内に
+    留める (モジュール先頭import は `store.rag` 経由の chromadb を
+    improve_loop の import 時に強制する — 既存の遅延方針 (`_build_worker_
+    runner` 参照) を踏襲する)。"""
+    from agentic_fx.runners.worker_runner import RPC_ABANDONED_ATTR
+    return getattr(threading.current_thread(), RPC_ABANDONED_ATTR, False)
+
+
 def _backtest_reply_from_save_kwargs(save_kwargs: dict) -> dict:
     """永続化用 save kwargs を JSON-safe な RPC 応答へ限定投影する。
     期間端点 (`period`) と保存時刻 (`now`) は agent に見せない (遮断 7、
@@ -864,10 +880,13 @@ class ImproveLoop:
                                args.get("name"))
                 return {"error": "backtest_failed"}
             save_kwargs = captured[0]
-            if ledger.state() != "OPEN":
+            if ledger.state() != "OPEN" or _current_rpc_abandoned():
                 # /code-review 2 周目 CR4 (2026-09-11): timeout 後に完了した
                 # handler は記録されない (受理境界) — snapshot も書かない
                 # (書くと commit 後の plugins/_archive に孤立 tmp が残る)。
+                # codex 2 周目 Important: state の読み取りと release/freeze
+                # は原子的でないため、release 済み worker thread かどうか
+                # (`_current_rpc_abandoned`) も合わせて見る。
                 self._activity.write(
                     Category.IMPROVE, "archive_skipped_late",
                     f"mission={staging_dir.name} name={args.get('name')}")
@@ -901,8 +920,19 @@ class ImproveLoop:
                     f"mission={staging_dir.name} name={args.get('name')} "
                     f"reason={type(exc).__name__}:{str(exc)[:300]}")
             else:
-                save_kwargs["artifact_hash"] = artifact_hash
-                save_kwargs["archive_tmp"] = str(archive_tmp)
+                # codex 2 周目 Important (2026-09-11): 書き込み中に
+                # release/freeze が割り込んだ場合、今書いた tmp を残さず
+                # 消す (post-write の再確認 — 事前確認だけでは check-then
+                # -act 競合窓を閉じ切れない)。
+                if ledger.state() != "OPEN" or _current_rpc_abandoned():
+                    self._remove_archive_tmp(archive_tmp)
+                    self._activity.write(
+                        Category.IMPROVE, "archive_skipped_late",
+                        f"mission={staging_dir.name} name={args.get('name')} "
+                        f"reason=post_write")
+                else:
+                    save_kwargs["artifact_hash"] = artifact_hash
+                    save_kwargs["archive_tmp"] = str(archive_tmp)
             return _backtest_reply_from_save_kwargs(save_kwargs)
 
         def analyze_corr_handler(args: dict) -> dict:

@@ -39,6 +39,14 @@ _log = logging.getLogger("agentic_fx.worker_runner")
 _DATA_PROVIDER_ENV_ALLOWLIST = ("TWELVEDATA_API_KEY", "MT5_BRIDGE_API_KEY")
 _MAX_CREDENTIALS_FILE_BYTES = 64 * 1024
 
+#: codex 2 周目 Important (2026-09-11): RPC timeout で予約を release した
+#: 後も `_rpc_worker` daemon thread は生き続け、後から (dispatcher が既に
+#: timeout 応答を返した後に) 完了し得る。`dispatcher_loop` は timeout 分岐
+#: でこの thread オブジェクトへ本属性を立て、`improve_loop.
+#: run_backtest_handler` が「自分は abandon 済みの thread で走っている」
+#: ことを検知して archive snapshot の作成/登録を打ち切れるようにする。
+RPC_ABANDONED_ATTR = "rpc_abandoned"
+
 
 def _mission_worker_env(worker_profile: str) -> dict[str, str]:
     """R10-①: trade 資格情報も env では渡さない。全 profile 共通で
@@ -335,9 +343,10 @@ class WorkerRunner(AgentRunner):
                     except Exception as e:  # noqa: BLE001 — 子へ tool error として返す
                         result_queue.put((False, str(e)))
 
+                rpc_thread = threading.Thread(target=_rpc_worker, daemon=True,
+                                              name="afx-rag-rpc")
                 try:
-                    threading.Thread(target=_rpc_worker, daemon=True,
-                                     name="afx-rag-rpc").start()
+                    rpc_thread.start()
                 except Exception:  # noqa: BLE001
                     # CR7 (/code-review 2 周目、2026-09-11): begin 予約後に
                     # Thread.start が落ちたら予約を返し (返さないと freeze が
@@ -399,6 +408,11 @@ class WorkerRunner(AgentRunner):
                                              exc_info=True)
                         response = {"ok": False, "error": payload}
                 except queue.Empty:
+                    # codex 2 周目 Important (2026-09-11): この thread は
+                    # timeout 応答を返した後も生き続け、後から commit 相と
+                    # 競合し得る (check-then-act 窓)。abandoned を立てて、
+                    # thread 自身に「もう記録されない」ことを分からせる。
+                    setattr(rpc_thread, RPC_ABANDONED_ATTR, True)
                     _log.error("RAG RPC leaked past rpc_timeout_sec=%s "
                               "(name=%s) — this thread will never be "
                               "reclaimed but will not block process exit "

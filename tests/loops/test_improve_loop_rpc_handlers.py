@@ -142,6 +142,94 @@ def test_run_backtest_skips_snapshot_when_ledger_not_open(
     assert "archive_skipped_late" in (tmp_path / "activity.log").read_text()
 
 
+def test_run_backtest_skips_snapshot_when_rpc_abandoned_before_write(
+        loop_min, tmp_path, monkeypatch):
+    """codex 2 周目 Important (2026-09-11): `ledger.state()` を読んだ
+    直後に dispatcher の RPC timeout が予約を release しても、その競合窓は
+    `state() != "OPEN"` 単独では捉えられない — handler 自身が動いている
+    worker thread に `RPC_ABANDONED_ATTR` が立っていないかも見る。ここでは
+    `run_in_sample` (backtest 本体) の内側で abandoned を模擬的に立てて、
+    OPEN のままでも snapshot が作られないことを確認する。"""
+    import threading as _threading
+
+    from agentic_fx.runners.worker_runner import RPC_ABANDONED_ATTR
+
+    _patch_strategy_lookup(monkeypatch)
+
+    def _fake_run_in_sample(*a, record_fn=None, **kw):
+        setattr(_threading.current_thread(), RPC_ABANDONED_ATTR, True)
+        record_fn(dict(_SAVE_KWARGS))
+        return dict(_SAVE_KWARGS["metrics"])
+
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        _fake_run_in_sample)
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    assert ledger.state() == "OPEN"
+    try:
+        result = loop_min._build_rpc_handlers(
+            ledger, staging_dir=staging.parent)["run_backtest"](
+                {"name": "myst", "pair": "USDJPY"})
+    finally:
+        # このマーカーは実 thread 属性として残る (monkeypatch のロールバック
+        # 対象外) — 同一プロセスの後続テストへ漏れないよう必ず外す。
+        if hasattr(_threading.current_thread(), RPC_ABANDONED_ATTR):
+            delattr(_threading.current_thread(), RPC_ABANDONED_ATTR)
+    assert "error" not in result
+    assert "archive_tmp" not in result.save_kwargs
+    assert not (loop_min._root / "plugins" / "_archive").exists()
+    assert "archive_skipped_late" in (tmp_path / "activity.log").read_text()
+
+
+def test_run_backtest_removes_tmp_when_rpc_abandoned_after_write(
+        loop_min, tmp_path, monkeypatch):
+    """post-write 経路: snapshot 書き込みが (meta.json まで) 完了した
+    *後* に abandoned が立った場合でも、書いた tmp を残さず消し、
+    `archive_tmp`/`artifact_hash` を台帳へ渡さない (post_write)。"""
+    import threading as _threading
+
+    from agentic_fx.runners.worker_runner import RPC_ABANDONED_ATTR
+
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+
+    from agentic_fx.plugin import version_store as _version_store
+    original_write_ro_file = _version_store._write_ro_file
+    calls = {"n": 0}
+
+    def _fake_write_ro_file(path, data):
+        original_write_ro_file(path, data)
+        calls["n"] += 1
+        if path.name == "meta.json":
+            # meta.json は最後に書かれるファイル — その書き込み完了直後に
+            # abandoned を立てる (post-write の競合窓を模擬する)。
+            setattr(_threading.current_thread(), RPC_ABANDONED_ATTR, True)
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.version_store._write_ro_file", _fake_write_ro_file)
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    try:
+        result = loop_min._build_rpc_handlers(
+            ledger, staging_dir=staging.parent)["run_backtest"](
+                {"name": "myst", "pair": "USDJPY"})
+    finally:
+        if hasattr(_threading.current_thread(), RPC_ABANDONED_ATTR):
+            delattr(_threading.current_thread(), RPC_ABANDONED_ATTR)
+    assert calls["n"] == 4  # plugin.py / config.yaml / test_plugin.py / meta.json
+    assert "error" not in result
+    assert "archive_tmp" not in result.save_kwargs
+    assert "artifact_hash" not in result.save_kwargs
+    archive_root = loop_min._root / "plugins" / "_archive" / staging.parent.name
+    if archive_root.exists():
+        assert list(archive_root.iterdir()) == []
+    assert ("archive_skipped_late" in (tmp_path / "activity.log").read_text()
+            and "reason=post_write" in (tmp_path / "activity.log").read_text())
+
+
 def test_run_backtest_rejects_changed_content_before_execution(
         loop_min, tmp_path, monkeypatch):
     candidate = tmp_path / "staging" / "myst"
