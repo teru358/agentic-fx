@@ -59,6 +59,17 @@ class MissionResult:
     # improve_loop はこれを見て report artifact を observation へ降格する
     # (plugin artifact は既存の決定論 gate が防衛線のため対象外)。
     recovered: bool = False
+    # A4 10 回目 #71 観測 B (2026-09-11): improve mission 終端での
+    # registry tool 呼び出し総数 (`MissionToolCounters.total_calls`)。
+    # 既定 None — local backend の終端、および本規範の対象外
+    # (trade mission、非対応 runner) では付与しない。改善ループはこれを
+    # 見て「呼ばれなかったことが記録されない」欠落 (§7 観測 B) を塞ぐ。
+    tool_calls: int | None = None
+    # 同 観測 B: CLI backend (claude/codex/opencode) の stderr tail に
+    # 既知の致命パターン (`CLI_STDERR_FATAL_PATTERNS`) が見つかったときの
+    # 1 行要約。既定 None。runner (`CliRunner`) が埋め、improve_loop の
+    # 終端で activity `cli_stderr_fatal` として書く。
+    stderr_fatal: str | None = None
 
 
 class AgentRunner(ABC):

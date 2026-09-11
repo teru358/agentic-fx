@@ -827,3 +827,68 @@ def test_abort_recovered_completion_keeps_abort_reason(tmp_path):
     assert result.recovered is True
     assert is_tool_budget_abort(result.reason)
     assert result.reason == "tool_budget_abort:terminal_refusals"
+
+
+# --- A4 10 回目 #71 観測 B (2026-09-11): stderr 既知致命パターン検知 -----
+
+def test_detect_stderr_fatal_matches_known_pattern():
+    """`CLI_STDERR_FATAL_PATTERNS` に一致すると `pattern=<p> tail=<200 字>`
+    を返す (codex code-mode host の SIGTRAP 連鎖が初出動機)。"""
+    from agentic_fx.runners.cli_runner import _detect_stderr_fatal
+
+    text = ("WARNING: proceeding\n"
+            "2026-09-11T13:11:22Z ERROR codex_core::tools::router: "
+            "error=code-mode host exited with status signal: 5 (SIGTRAP)\n")
+    found = _detect_stderr_fatal(text)
+    assert found is not None
+    assert "pattern=" in found and "tail=" in found
+
+
+def test_detect_stderr_fatal_no_match_returns_none():
+    """既知パターンに一致しない stderr は None (誤検知しない)。"""
+    from agentic_fx.runners.cli_runner import _detect_stderr_fatal
+
+    assert _detect_stderr_fatal("ordinary log line, nothing fatal here") is None
+
+
+def test_detect_stderr_fatal_empty_pattern_tuple_disables_detection(monkeypatch):
+    """パターン定数を空にすると検知そのものが無効化される — 逆変異
+    (「パターン判定を if False にする」の対) の裏付け pin。"""
+    import agentic_fx.runners.cli_runner as cli_runner_mod
+
+    monkeypatch.setattr(cli_runner_mod, "CLI_STDERR_FATAL_PATTERNS", ())
+    assert cli_runner_mod._detect_stderr_fatal(
+        "error=code-mode host exited with status signal: 5 (SIGTRAP)") is None
+
+
+def test_detect_stderr_fatal_tail_capped_at_200_chars():
+    from agentic_fx.runners.cli_runner import _detect_stderr_fatal
+
+    text = "SIGTRAP" + ("x" * 500)
+    found = _detect_stderr_fatal(text)
+    tail = found.split("tail=", 1)[1]
+    assert len(tail) == 200
+
+
+def test_cli_runner_completed_mission_carries_stderr_fatal(tmp_path):
+    """A4 #71 観測 B の核心: rc=0/completed 終端でも stderr に致命
+    パターンがあれば `result.stderr_fatal` へ載る (「ツール基盤が死んで
+    いても mission は正常終了する」を可視化する経路)。"""
+    script = (
+        "import json, sys\n"
+        "sys.stderr.write('error=code-mode host exited with status "
+        "signal: 5 (SIGTRAP)\\n')\n"
+        "print(json.dumps({'answer': 4}))\n"
+    )
+    runner = _new_runner(script, tmp_path)
+    result = runner.run(_mission())
+    assert result.status == "completed"
+    assert result.stderr_fatal is not None
+    assert "pattern=SIGTRAP" in result.stderr_fatal or "pattern=code-mode host" in result.stderr_fatal
+
+
+def test_cli_runner_completed_mission_without_fatal_pattern_has_none(tmp_path):
+    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path)
+    result = runner.run(_mission())
+    assert result.status == "completed"
+    assert result.stderr_fatal is None

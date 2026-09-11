@@ -270,6 +270,19 @@ def _chmod_tree_readonly(root: Path) -> None:
 _REPORT_WRITE_FAILED = object()
 
 
+def _tool_calls_suffix(tool_calls: int | None) -> str:
+    """A4 10 回目 #71 観測 B (2026-09-11): registry 経由の tool 呼び出しが
+    0 件で終端した improve mission は「agent が自主的に観察を選んだ」
+    状態と同じ記録になり区別がつかない。`MissionResult.tool_calls`
+    (`WorkerRunner` が improve/非 local backend の終端でだけ埋める) を
+    終端 activity 行に ` tool_calls=<N>` として明示する。`None`
+    (local backend、または counters 未取得) では何も付けない — 既存の
+    local backend 終端 activity の文面を変えない。"""
+    if tool_calls is None:
+        return ""
+    return f" tool_calls={tool_calls}"
+
+
 class ImproveLoop:
     # INDEX.md の追記を直列化する (プロセス内、slot スレッド間で共有)。
     _archive_index_lock = threading.Lock()
@@ -1788,7 +1801,8 @@ class ImproveLoop:
 
     def _finalize_success(self, conn, *, mission_id, run_id, backlog_id,
                           slot_key, approval_payload, now,
-                          ledger_entries=(), gate_rows=(), ctx=None) -> None:
+                          ledger_entries=(), gate_rows=(), ctx=None,
+                          tool_calls: int | None = None) -> None:
         """10.10 Step 3: Tx-2 本体 (台帳→gate→approval→finish)。"""
         from agentic_fx.store import approvals as approvals_store
         from agentic_fx.store import missions as missions_store
@@ -1859,7 +1873,8 @@ class ImproveLoop:
                     Category.IMPROVE, "approval_requested",
                     f"mission={mission_id} backlog={backlog_id} "
                     f"plugin={approval_payload['name']} "
-                    f"approval={approval_id}", str(mission_id))
+                    f"approval={approval_id}{_tool_calls_suffix(tool_calls)}",
+                    str(mission_id))
             if ctx is not None:
                 ctx.ledger.mark_persisted()
         # C6 裁定 (2026-08-28、束D検収 verified-local-round1.md §7、
@@ -1912,6 +1927,26 @@ class ImproveLoop:
         try:
             self._freeze_ledger(ctx)                                  # 手順0
 
+            # A4 10 回目 #71 観測 B (2026-09-11): `result.tool_calls`/
+            # `.stderr_fatal` は `MissionResult` の新設フィールド
+            # (2026-09-11 追加)。`getattr` で読む — 一部テストは duck-typed
+            # な独自 Result スタブ (これらの属性を持たない) を渡すため、
+            # 直接属性アクセスだと `AttributeError` で既存テストを壊す。
+            tool_calls = getattr(result, "tool_calls", None)
+            stderr_fatal = getattr(result, "stderr_fatal", None)
+
+            # 終端種別より前 (どの経路へ分岐しても漏れなく書く) に、CLI
+            # backend の stderr 既知致命パターン検知を activity へ出す。
+            # `stderr_fatal` は CliRunner (claude/codex/opencode) だけが
+            # 埋め、LocalRunner の結果では常に None — local backend では
+            # 一切書かれない。
+            if self._activity is not None and stderr_fatal:
+                self._activity.write(
+                    Category.IMPROVE, "cli_stderr_fatal",
+                    f"mission={ctx.mission_id} "
+                    f"backend={self._settings.runner.improve.backend} "
+                    f"{stderr_fatal}")
+
             if result.status != "completed":
                 self._finalize_failed_mission(
                     conn, ctx=ctx, result=result, now=now,
@@ -1927,7 +1962,9 @@ class ImproveLoop:
             output = result.output or {}
             verdict = self._inspect_output(output, ctx, conn=conn)     # 手順1
             if not verdict.ok:
-                self._finalize_output_invalid(conn, ctx=ctx, reason=verdict.reason, now=now)
+                self._finalize_output_invalid(
+                    conn, ctx=ctx, reason=verdict.reason, now=now,
+                    tool_calls=tool_calls)
                 return
 
             selection = self._select_and_bind(conn, output, ctx, now=now)  # 手順2
@@ -1975,7 +2012,7 @@ class ImproveLoop:
                         "reason": (f"title={title} — "
                                   "resume 回収経由のため降格"),
                     },
-                    now=now)
+                    now=now, tool_calls=tool_calls)
                 return
 
             if atype == "plugin":
@@ -1986,7 +2023,8 @@ class ImproveLoop:
                 if not gate_verdict.passed:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason=f"gate_failed:{gate_verdict.reason}", now=now)
+                        reason=f"gate_failed:{gate_verdict.reason}", now=now,
+                        tool_calls=tool_calls)
                     return
 
                 from agentic_fx.plugin import approval
@@ -1996,7 +2034,8 @@ class ImproveLoop:
                 if candidate_meta is None:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason="gate_failed:loader_rejected", now=now)
+                        reason="gate_failed:loader_rejected", now=now,
+                        tool_calls=tool_calls)
                     return
                 try:
                     approval.assert_max_bars_within_limit(
@@ -2004,14 +2043,16 @@ class ImproveLoop:
                 except ValueError as exc:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason=f"gate_failed:max_bars_limit:{exc}", now=now)
+                        reason=f"gate_failed:max_bars_limit:{exc}", now=now,
+                        tool_calls=tool_calls)
                     return
 
                 kind = self._read_candidate_kind(candidate_dir)
                 if kind not in {"indicator", "strategy"}:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason=f"gate_failed:kind_unsupported:{kind}", now=now)
+                        reason=f"gate_failed:kind_unsupported:{kind}", now=now,
+                        tool_calls=tool_calls)
                     return
                 if kind == "strategy":
                     try:
@@ -2029,13 +2070,13 @@ class ImproveLoop:
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
                             reason=("gate_failed:backtest_data_unavailable:"
                                     f"{exc}"), now=now,
-                            gate_rows=tuple(gate_rows))
+                            gate_rows=tuple(gate_rows), tool_calls=tool_calls)
                         return
                     if not strategy_verdict.evaluable:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
                             reason=strategy_verdict.observation_reason, now=now,
-                            gate_rows=tuple(gate_rows))
+                            gate_rows=tuple(gate_rows), tool_calls=tool_calls)
                         return
                     gate_metrics["baseline"] = strategy_verdict.baseline_row
 
@@ -2066,11 +2107,13 @@ class ImproveLoop:
                     backlog_id=selection.backlog_id, slot_key=ctx.slot_key,
                     approval_payload=approval_payload, now=now,
                     ledger_entries=tuple(ctx.ledger.entries()),
-                    gate_rows=tuple(gate_rows), ctx=ctx)
+                    gate_rows=tuple(gate_rows), ctx=ctx,
+                    tool_calls=tool_calls)
             else:
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
-                    report_path=report_path, artifact=artifact, now=now)
+                    report_path=report_path, artifact=artifact, now=now,
+                    tool_calls=tool_calls)
         except BaseException:
             commit_raised = True
             if ctx.ledger.state() == "FROZEN":
@@ -2142,7 +2185,8 @@ class ImproveLoop:
         return str(final_path)
 
     def _finalize_report_or_observation(self, conn, *, ctx, backlog_id,
-                                        report_path, artifact, now) -> None:
+                                        report_path, artifact, now,
+                                        tool_calls: int | None = None) -> None:
         """承認申請を出さない経路の Tx-2 + finish。
 
         round2 #6 是正 (2026-08-29、verified-round2.md #6、設計逐語違反):
@@ -2200,7 +2244,8 @@ class ImproveLoop:
                     Category.IMPROVE, "mission_observation",
                     f"mission={ctx.mission_id} backlog="
                     f"{backlog_id if backlog_id is not None else '-'} "
-                    f"reason={observation_last_result}", str(ctx.mission_id))
+                    f"reason={observation_last_result}"
+                    f"{_tool_calls_suffix(tool_calls)}", str(ctx.mission_id))
         if report_path is not None:
             reports_dir = self._root / "data" / "improve_reports"
             part_path = reports_dir / ".tmp" / f"improve-{ctx.mission_id}.md.part"
@@ -2292,10 +2337,13 @@ class ImproveLoop:
         原因の一つ。`result.reason` (runner が診断した失敗理由、無ければ
         `-`) を添えて `mission_failed` を書く。"""
         reason_text = "-" if result.reason is None else str(result.reason)[:500]
+        # duck-typed な独自 Result スタブ (`tool_calls` 属性を持たない) を
+        # 渡すテストがあるため getattr で読む。
         self._activity.write(
             Category.IMPROVE, "mission_failed",
             f"mission={ctx.mission_id} status={result.status} "
-            f"reason={reason_text}")
+            f"reason={reason_text}"
+            f"{_tool_calls_suffix(getattr(result, 'tool_calls', None))}")
         self._delete_staging(ctx)
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
@@ -2356,7 +2404,8 @@ class ImproveLoop:
         self._settle_ledger_after_commit(
             conn, ctx=ctx, ledger_ids=ledger_ids, outcome="failed", now=now)
 
-    def _finalize_output_invalid(self, conn, *, ctx, reason, now) -> None:
+    def _finalize_output_invalid(self, conn, *, ctx, reason, now,
+                                 tool_calls: int | None = None) -> None:
         """§4.2 手順1 不合格 (schema 不整合・`artifact.name` 非正規形・
         `staging_dir/<name>` 異常等) → Mission `failed`、
         `improvement_runs.result` は NULL のまま、staging 削除、
@@ -2368,7 +2417,8 @@ class ImproveLoop:
         self._delete_staging(ctx)
         self._activity.write(
             Category.IMPROVE, "output_invalid",
-            f"mission={ctx.mission_id} reason={reason}")
+            f"mission={ctx.mission_id} reason={reason}"
+            f"{_tool_calls_suffix(tool_calls)}")
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
         try:
@@ -2469,7 +2519,7 @@ class ImproveLoop:
                              final_path=final_path, now=now)
 
     def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now,
-                              gate_rows=()) -> None:
+                              gate_rows=(), tool_calls: int | None = None) -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
         `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
@@ -2489,7 +2539,8 @@ class ImproveLoop:
         self._delete_staging(ctx)
         self._activity.write(
             Category.IMPROVE, "gate_failed",
-            f"mission={ctx.mission_id} reason={reason}")
+            f"mission={ctx.mission_id} reason={reason}"
+            f"{_tool_calls_suffix(tool_calls)}")
         body_md = (
             f"# Improve Mission {ctx.mission_id} — gate failed\n\n"
             f"reason: `{reason}`\n\nNo approval request was produced by "

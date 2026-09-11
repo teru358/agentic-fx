@@ -577,6 +577,11 @@ class WorkerRunner(AgentRunner):
                 # M4: 旧フレーム (`recovered` キー無し) は既定 False —
                 # `MissionResult.recovered` の既定と一致させる後方互換。
                 recovered = payload.get("recovered", False)
+                # A4 10 回目 #71 観測 B (2026-09-11): 旧フレーム (キー
+                # 無し) は既定 None — `MissionResult.tool_calls`/
+                # `.stderr_fatal` の既定と一致させる後方互換。
+                tool_calls = payload.get("tool_calls")
+                stderr_fatal = payload.get("stderr_fatal")
             else:  # eof / protocol_error / error — すべて failed に正規化
                 status = "failed"
                 output = None
@@ -585,8 +590,11 @@ class WorkerRunner(AgentRunner):
                 # 死因の手がかりを一切残さないことを避ける。
                 reason = f"worker {kind}"
                 recovered = False
+                tool_calls = None
+                stderr_fatal = None
             return MissionResult(status, output, transcript, reason=reason,
-                                 recovered=recovered)
+                                 recovered=recovered, tool_calls=tool_calls,
+                                 stderr_fatal=stderr_fatal)
         finally:
             dispatch_queue.put(None)
             self._ensure_dead(proc, w)

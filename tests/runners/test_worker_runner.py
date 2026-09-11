@@ -412,6 +412,112 @@ def test_worker_runner_result_frame_without_recovered_key_defaults_false(
     assert result.recovered is False
 
 
+def test_worker_runner_result_frame_carries_tool_calls_and_stderr_fatal(
+        tmp_path, monkeypatch):
+    """A4 10 回目 #71 観測 B (2026-09-11): `mission_worker` が result
+    フレームへ乗せる `tool_calls`/`stderr_fatal` が `MissionResult` へ
+    そのまま伝わる (`tool_calls=0` も欠落させない — キー自体は存在)。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        child_in.close()
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {"x": 1},
+                                "tool_calls": 11,
+                                "stderr_fatal": "pattern=SIGTRAP tail=x"})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert result.tool_calls == 11
+    assert result.stderr_fatal == "pattern=SIGTRAP tail=x"
+
+
+def test_worker_runner_result_frame_without_tool_calls_key_defaults_none(
+        tmp_path, monkeypatch):
+    """後方互換 + local backend の pin: `tool_calls`/`stderr_fatal` キーの
+    無い result フレーム (local backend、または旧 mission_worker) は
+    `MissionResult.tool_calls is None` / `.stderr_fatal is None` になる。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        handshake = json.loads(child_in.readline())
+        assert handshake["type"] == "handshake"
+        child_in.close()
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {"x": 1}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    root = _root(tmp_path)
+    clock = FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc))
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=clock,
+                          rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert result.tool_calls is None
+    assert result.stderr_fatal is None
+
+
 def test_worker_runner_result_frame_falls_back_to_error_key_for_reason(
         tmp_path, monkeypatch):
     """[fail-observability]: worker 内例外経路 (mission_worker.py の

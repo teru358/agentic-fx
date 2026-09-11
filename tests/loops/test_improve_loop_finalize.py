@@ -1175,6 +1175,116 @@ def test_commit_slot_terminalize_false_propagates_to_finalize_failed_mission(
     assert m["status"] == "failed"
 
 
+def test_finalize_failed_mission_writes_tool_calls_when_present(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """A4 10 回目 #71 観測 B (2026-09-11): `MissionResult.tool_calls`
+    (非 local backend の counters 由来) が終端 activity 行に
+    ` tool_calls=<N>` として付く。0 も欠落させない。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    result = MissionResult(status="failed", output=None, transcript=[],
+                           reason="worker eof", tool_calls=0)
+
+    loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
+                                      now=datetime(2026, 8, 22))
+
+    line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
+               if "mission_failed" in line)
+    assert "tool_calls=0" in line
+
+
+def test_finalize_failed_mission_omits_tool_calls_when_none(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """local backend (`tool_calls=None`) では既存の文面を変えない —
+    サフィックス自体が現れない。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    result = MissionResult(status="failed", output=None, transcript=[],
+                           reason="worker eof")
+
+    loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
+                                      now=datetime(2026, 8, 22))
+
+    line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
+               if "mission_failed" in line)
+    assert "tool_calls=" not in line
+
+
+def test_commit_writes_cli_stderr_fatal_activity_when_result_has_it(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """A4 #71 観測 B (2): `result.stderr_fatal` (CLI backend の既知致命
+    パターン検知) が terminal activity 種別 (ここでは failed) より前に
+    `cli_stderr_fatal` 1 行として書かれる。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    mission = SimpleNamespace()
+    result = MissionResult(
+        status="failed", output=None, transcript=[], reason="cli timeout",
+        stderr_fatal="pattern=SIGTRAP tail=error=code-mode host…")
+
+    loop_min.commit(mission=mission, ctx=ctx, result=result,
+                    now=datetime(2026, 8, 22))
+
+    lines = (tmp_path / "activity.log").read_text().splitlines()
+    line = next(line for line in lines if "cli_stderr_fatal" in line)
+    assert f"mission={mission_id}" in line
+    assert "backend=local" in line
+    assert "pattern=SIGTRAP" in line
+
+
+def test_commit_does_not_write_cli_stderr_fatal_when_result_has_none(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+    mission = SimpleNamespace()
+    result = MissionResult(status="failed", output=None, transcript=[],
+                           reason="cli timeout")
+
+    loop_min.commit(mission=mission, ctx=ctx, result=result,
+                    now=datetime(2026, 8, 22))
+
+    lines = (tmp_path / "activity.log").read_text().splitlines()
+    assert not any("cli_stderr_fatal" in line for line in lines)
+
+
 def test_finalize_output_invalid_terminates_failed_with_null_result_and_deletes_staging(
         loop_min, conn, mission_and_run_fixture, tmp_path):
     """§4.2 手順1 不合格: Mission failed、improvement_runs.result は NULL、
@@ -1204,6 +1314,31 @@ def test_finalize_output_invalid_terminates_failed_with_null_result_and_deletes_
     assert r["result"] is None
     assert not staging_dir.exists()
     assert ledger.state() == "PERSISTED"
+
+
+def test_finalize_output_invalid_writes_tool_calls_when_present(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """A4 #71 観測 B: `output_invalid` 終端行にも `tool_calls=<N>` が付く。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+
+    loop_min._finalize_output_invalid(
+        conn, ctx=ctx, reason="artifact.name is not canonical",
+        now=datetime(2026, 8, 22), tool_calls=11)
+
+    line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
+               if "output_invalid" in line)
+    assert "tool_calls=11" in line
 
 
 def test_finalize_loser_writes_skip_report_and_finishes_run_as_report(
@@ -1298,6 +1433,35 @@ def test_finalize_gate_failed_sets_backlog_observation_with_reason(
     assert b["last_result"] == "gate_failed:pytest failed: boom"
     assert not staging_dir.exists()
     assert ledger.state() == "PERSISTED"
+
+
+def test_finalize_gate_failed_writes_tool_calls_when_present(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """A4 #71 観測 B: `gate_failed` 終端行にも `tool_calls=<N>` が付く。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    from agentic_fx.store import backlog as backlog_store
+    backlog_store.select_for_mission(conn, backlog_id,
+                                     now=datetime(2026, 8, 22), commit=True)
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
+                                                        "run_backtest": 600.0})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source",
+        allowed_backlog_ids=None, slot_key=None, ledger=ledger,
+        rpc_handlers={})
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id,
+        reason="gate_failed:pytest failed: boom", now=datetime(2026, 8, 22),
+        tool_calls=7)
+
+    line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
+               if "gate_failed" in line)
+    assert "tool_calls=7" in line
 
 
 @pytest.mark.parametrize("gate_reason", [
@@ -1403,6 +1567,23 @@ def test_finalize_success_writes_mission_id_on_ledger_and_gate_rows(
         "SELECT mission_id FROM backtest_runs WHERE mission_id=? "
         "AND variant='no_strategy'", (mission_id,)).fetchone()
     assert bt_row is not None
+
+
+def test_finalize_success_writes_tool_calls_on_approval_requested(
+        loop_min, conn, mission_and_run_fixture):
+    """A4 #71 観測 B: `approval_requested` 終端行にも `tool_calls=<N>`
+    が付く。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    now = datetime(2026, 8, 22, tzinfo=timezone.utc)
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        now=now, tool_calls=9)
+
+    line = next(line for line in (loop_min._root / "activity.log")
+               .read_text().splitlines() if "approval_requested" in line)
+    assert "tool_calls=9" in line
 
 
 def test_persist_ledger_rows_skips_error_entries(loop_min, conn):
@@ -1641,6 +1822,42 @@ def test_observation_without_backlog_logs_dash(
         now=datetime(2026, 8, 22))
     activity_text = (tmp_path / "activity.log").read_text()
     assert f"mission={mission_id} backlog=- reason=observation:no candidate" in activity_text
+
+
+def test_observation_writes_tool_calls_when_present(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """A4 #71 観測 B の核心テストケース: `mission_observation` 終端行に
+    `tool_calls=0` (registry を 1 回も呼べなかった) が明示される。"""
+    mission_id, run_id, _ = mission_and_run_fixture
+    staging_dir = tmp_path / "staging-tool-calls"
+    staging_dir.mkdir()
+    ctx = _finalize_report_or_observation_ctx(
+        staging_dir, mission_id=mission_id, run_id=run_id)
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=None, report_path=None,
+        artifact={"type": "observation", "reason": "no tools available"},
+        now=datetime(2026, 8, 22), tool_calls=0)
+    line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
+               if "mission_observation" in line)
+    assert "tool_calls=0" in line
+
+
+def test_observation_omits_tool_calls_when_none(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """local backend (`tool_calls=None`) では既存の文面のまま —
+    サフィックスが現れない。"""
+    mission_id, run_id, _ = mission_and_run_fixture
+    staging_dir = tmp_path / "staging-no-tool-calls"
+    staging_dir.mkdir()
+    ctx = _finalize_report_or_observation_ctx(
+        staging_dir, mission_id=mission_id, run_id=run_id)
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=None, report_path=None,
+        artifact={"type": "observation", "reason": "no candidate"},
+        now=datetime(2026, 8, 22))
+    line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
+               if "mission_observation" in line)
+    assert "tool_calls=" not in line
 
 
 def test_risk_gate_report_artifact_keeps_unsupported_label(

@@ -97,6 +97,18 @@ def _build_clock() -> "Clock":
     return SystemClock()
 
 
+def _improve_result_tool_calls(
+        counters: MissionToolCounters, improve_backend: str) -> int | None:
+    """A4 10 回目 #71 観測 B (2026-09-11): improve mission 終端 frame へ
+    載せる registry tool 呼び出し総数。local backend では `None` (既存の
+    local 終端 activity 行の文面を変えない — 「呼べるのに呼ばなかった」を
+    判別する動機が無い)。それ以外の backend (claude/codex/opencode) では
+    `counters.total_calls` をそのまま返す (0 も含め欠落させない)。"""
+    if improve_backend == "local":
+        return None
+    return counters.total_calls
+
+
 def _set_pdeathsig(sig: int) -> None:
     libc = ctypes.CDLL("libc.so.6", use_errno=True)
     if libc.prctl(_PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
@@ -158,10 +170,12 @@ def _bootstrap_improve_profile(
             read_only.append(sys_path)
     if Path("/run/systemd/resolve").exists():
         read_only.append(Path("/run/systemd/resolve"))
-    if backend in ("claude", "opencode"):
+    if backend in ("claude", "opencode", "codex"):
         # opencode (bun/JSC) は /proc/self/maps 読取に失敗すると SIGABRT
         # (検収実測 2026-08-30: mmap 予約は全て成功した状態で maps/cgroup
         # EACCES 直後に自己 abort)。claude と同じリスク受容 (R10 参照)。
+        # codex 0.150.1 の code-mode host (V8) も /proc/self/maps を読む。
+        # A4 10 回目 #71 で SIGTRAP 7 件、2026-09-11
         read_only.append(Path("/proc"))
 
     # staging_dir の相互照合 (§2.2): 末尾成分が mission_id と一致するか。
@@ -768,6 +782,13 @@ def main() -> None:
                         if summary not in result.reason:
                             result.reason = _normalize_reason(
                                 f"{result.reason} {summary}")
+                    # A4 10 回目 #71 観測 B (2026-09-11): registry tool
+                    # 呼び出し総数 (`MissionToolCounters.total_calls`) を
+                    # 終端行に載せる — local backend では付けない (local
+                    # は「呼べるのに呼ばなかった」を判別する動機が無く、
+                    # 既存の local 終端 activity の文面を変えない)。
+                    tool_calls = _improve_result_tool_calls(
+                        counters, improve_backend)
                     _send_frame(protocol_out, out_seq, {
                         "type": "result",
                         "status": result.status, "output": result.output,
@@ -775,7 +796,13 @@ def main() -> None:
                         # M4: 追撃回収経由の provenance を worker protocol
                         # へ伝搬する (getattr で安全に — 旧 runner が
                         # `recovered` 属性を持たない場合も既定 False)。
-                        "recovered": getattr(result, "recovered", False)})
+                        "recovered": getattr(result, "recovered", False),
+                        "tool_calls": tool_calls,
+                        # 観測 B (2): CLI backend の stderr 既知致命
+                        # パターン検知 (`CliRunner._detect_stderr_fatal`)。
+                        # LocalRunner の結果には存在しない属性なので
+                        # getattr で安全に既定 None。
+                        "stderr_fatal": getattr(result, "stderr_fatal", None)})
                 except Exception as exc:  # noqa: BLE001
                     _send_frame(protocol_out, out_seq, {
                         "type": "result", "status": "failed", "output": None,

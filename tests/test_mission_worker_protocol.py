@@ -677,6 +677,28 @@ def test_main_runs_llm_and_sends_result_when_go_frame_arrives(
         "runner_factory.build_runner の第 1 引数 (profile) が improve でない")
 
 
+def test_main_improve_result_frame_uses_improve_result_tool_calls_return_value(
+        monkeypatch, tmp_path):
+    """A4 10 回目 #71 観測 B (2026-09-11): `main()` の improve 分岐が
+    実際に `_improve_result_tool_calls(counters, improve_backend)` の
+    戻り値を `result` frame の `tool_calls` へ乗せていることの配線 pin
+    (「単体が全部緑でも呼び出し元が使っていない」を防ぐ — `tool_calls
+    = None` に固定してしまう変異は、この pin だけが検出できる)。"""
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda **kw: None)
+    monkeypatch.setattr(mission_worker, "_improve_result_tool_calls",
+                        lambda counters, improve_backend: 42)
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides=_improve_handshake_overrides(
+            tmp_path, mission_id="m-tool-calls-wiring"),
+        runner_cls=_FakeLocalRunner, send_go=True)
+
+    assert frames[-1]["type"] == "result"
+    assert frames[-1]["tool_calls"] == 42
+
+
 def test_main_happy_path_emits_ready_event_result_in_one_seq_sequence(
         monkeypatch, tmp_path):
     """正常経路の配線 pin。子→親の全フレーム種別が**単一の out_seq**で

@@ -16,6 +16,36 @@ from agentic_fx.tools.mission_counters import MissionToolCounters
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+# --- A4 10 回目 #71 観測 B (2026-09-11): _improve_result_tool_calls -----
+
+def test_improve_result_tool_calls_none_for_local_backend():
+    """local backend では終端 frame に tool_calls を載せない (既存の
+    local 終端 activity の文面を変えない)。"""
+    from agentic_fx.mission_worker import _improve_result_tool_calls
+    from agentic_fx.tools.mission_counters import MissionToolCounters
+
+    counters = MissionToolCounters(budget=100)
+    for _ in range(11):
+        counters.total_calls += 1
+    assert _improve_result_tool_calls(counters, "local") is None
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex", "opencode"])
+def test_improve_result_tool_calls_reflects_counters_for_cli_backends(backend):
+    """非 local backend では counters.total_calls をそのまま返す — 0 も
+    欠落させない。"""
+    from agentic_fx.mission_worker import _improve_result_tool_calls
+    from agentic_fx.tools.mission_counters import MissionToolCounters
+
+    zero_counters = MissionToolCounters(budget=100)
+    assert _improve_result_tool_calls(zero_counters, backend) == 0
+
+    eleven_counters = MissionToolCounters(budget=100)
+    for _ in range(11):
+        eleven_counters.total_calls += 1
+    assert _improve_result_tool_calls(eleven_counters, backend) == 11
+
+
 # --- Task 5 Section 5-C: _exec_closure_for -----
 
 def test_exec_closure_local_has_no_shell_or_cli_dirs(tmp_path):
@@ -398,6 +428,33 @@ def test_bootstrap_improve_profile_proc_readable_only_for_claude(
         source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"],
         backend="claude")
     assert "PROC_READABLE" in result_claude.stdout, result_claude.stderr
+
+
+def test_bootstrap_improve_profile_proc_readable_for_codex(
+        improve_worker_layout):
+    """A4 10 回目 #71 (2026-09-11): codex backend の code-mode host
+    (V8) は `/proc/self/maps` を読む。claude/opencode と同じリスク受容を
+    codex にも延ばす — `/proc` が read_only に入り listdir が通ること、
+    local backend には影響しないことの両方を pin する (別 staging_dir
+    で local 側 (`test_bootstrap_improve_profile_proc_readable_only_for_claude`)
+    と相互照合)。"""
+    l = improve_worker_layout
+    script = """
+    try:
+        import os
+        os.listdir("/proc")
+        print("PROC_READABLE")
+    except PermissionError:
+        print("PROC_BLOCKED")
+    """
+    layout3_staging = (l["staging_dir"].parent.parent.parent / "_staging3"
+                       / l["mission_id"])
+    layout3_staging.mkdir(parents=True, mode=0o700)
+    result_codex = _run_bootstrap_probe(
+        script, staging_dir=layout3_staging, mission_id=l["mission_id"],
+        source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"],
+        backend="codex")
+    assert "PROC_READABLE" in result_codex.stdout, result_codex.stderr
 
 
 def test_bootstrap_improve_profile_home_env_is_scratch_dir(improve_worker_layout):

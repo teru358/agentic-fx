@@ -51,6 +51,37 @@ _TRANSCRIPT_MAX_BYTES = 50 * 1024 * 1024
 #: 大きく超えないための目安。
 _STDERR_TAIL_BUDGET_FRACTION = 0.15
 
+#: A4 10 回目 #71 観測 B (2026-09-11): registry tool 呼び出しが 1 件も
+#: 無いまま completed 終端する improve mission は「agent が自主的に
+#: 観察を選んだ」場合と区別がつかない。CLI backend (claude/codex/
+#: opencode) がツール基盤ごと無力化されたときの stderr 既知致命パターン
+#: — 観測された codex code-mode host の SIGTRAP 連鎖 (`_stderr_tail` の
+#: `error=code-mode host exited with status signal: 5 (SIGTRAP)` /
+#: `code-mode host closed its stdout`) がこのタプルの初出動機。空にする
+#: と検知自体が無効化される (逆変異 pin の対象)。
+CLI_STDERR_FATAL_PATTERNS: tuple[str, ...] = (
+    "code-mode host",
+    "SIGTRAP",
+    "closed its stdout",
+    "Segmentation fault",
+)
+
+#: activity `cli_stderr_fatal` 1 行に埋め込む tail の文字数上限
+#: (ブリーフ「先頭 200 字」)。
+_STDERR_FATAL_TAIL_CHARS = 200
+
+
+def _detect_stderr_fatal(stderr_text: str) -> str | None:
+    """`stderr_text` に `CLI_STDERR_FATAL_PATTERNS` のいずれかが含まれて
+    いれば `pattern=<p> tail=<先頭 200 字>` を返す。無ければ `None`。
+    最初に一致したパターン (タプル順) を採用する — 複数一致は稀で、
+    診断上はどれか 1 つが分かれば十分。"""
+    for pattern in CLI_STDERR_FATAL_PATTERNS:
+        if pattern and pattern in stderr_text:
+            tail = stderr_text[:_STDERR_FATAL_TAIL_CHARS]
+            return f"pattern={pattern} tail={tail}"
+    return None
+
 
 def _effective_transcript_max_bytes() -> int:
     """`_TRANSCRIPT_MAX_BYTES` (既定 50MB) と、いま実際に効いている
@@ -307,6 +338,11 @@ class CliRunner(AgentRunner):
         # 置く (追撃分は backend 側が別途自前で保存する、既存の流儀)。
         self._save_transcript(list(stdout_lines), stderr_chunks)
 
+        # A4 10 回目 #71 観測 B (2026-09-11): どの終端経路でも (completed
+        # を含む — codex の code-mode host 無力化はまさに rc=0/completed
+        # で起きた) stderr に既知の致命パターンが無いか調べておく。
+        stderr_fatal = _detect_stderr_fatal("".join(stderr_chunks))
+
         # M4: どちらの追撃経路 (timeout/no-output) を通って `raw` が
         # 得られたかを覚えておき、schema 検証を通った completed にだけ
         # `recovered=True` を立てる (provenance — improve_loop が report
@@ -324,15 +360,18 @@ class CliRunner(AgentRunner):
                     else TOOL_BUDGET_ABORT_PREFIX)
             if raw is None:
                 if cause == "abort":
-                    return MissionResult("failed", None, [], reason=abort_reason)
-                return MissionResult("timeout", None, [], reason="cli timeout")
+                    return MissionResult("failed", None, [], reason=abort_reason,
+                                         stderr_fatal=stderr_fatal)
+                return MissionResult("timeout", None, [], reason="cli timeout",
+                                     stderr_fatal=stderr_fatal)
             via_recovery = True
         else:
             if rc != 0:
                 stderr_text = "".join(stderr_chunks)
                 reason = _normalize_reason(
                     f"HTTP-like CLI exit rc={rc}: {stderr_text.splitlines()[0] if stderr_text else ''}")
-                return MissionResult("failed", None, [], reason=reason)
+                return MissionResult("failed", None, [], reason=reason,
+                                     stderr_fatal=stderr_fatal)
 
             raw = self._extract_output(stdout_lines, self._workdir)
             if raw is None:
@@ -340,19 +379,22 @@ class CliRunner(AgentRunner):
                 raw = self._recover_output(mission, list(stdout_lines), recovery_timeout)
                 if raw is None:
                     return MissionResult("failed", None, [],
-                                         reason=_normalize_reason("no output recovered from cli"))
+                                         reason=_normalize_reason("no output recovered from cli"),
+                                         stderr_fatal=stderr_fatal)
                 via_recovery = True
         try:
             jsonschema.validate(raw, mission.output_schema)
         except jsonschema.ValidationError as e:
             return MissionResult(
                 "failed", None, [],
-                reason=_normalize_reason(f"output_schema mismatch: {e.message}"))
+                reason=_normalize_reason(f"output_schema mismatch: {e.message}"),
+                stderr_fatal=stderr_fatal)
         # /code-review 2 周目 #2 (2026-09-08): abort → 追撃で回収できた
         # completed は abort の provenance (reason) を保持する — worker の
         # summary 付与と親の activity がこれを読む。
         return MissionResult("completed", raw, [], recovered=via_recovery,
-                             reason=abort_reason if cause == "abort" else None)
+                             reason=abort_reason if cause == "abort" else None,
+                             stderr_fatal=stderr_fatal)
 
     def _save_transcript(self, stdout_lines: list[str],
                           stderr_chunks: list[str]) -> None:
