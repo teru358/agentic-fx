@@ -11,7 +11,7 @@ from typing import Any, Callable, Literal
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.runners.base import Mission
-from agentic_fx.runners.cli_runner import CliRunner
+from agentic_fx.runners.cli_runner import CliRunner, _detect_stderr_fatal
 from agentic_fx.runners.response_parser import ParseError, parse_json_output
 from agentic_fx.tools.registry import ToolRegistry
 
@@ -205,6 +205,12 @@ class OpencodeRunner(CliRunner):
         resume_timeout = min(_RESUME_TIMEOUT_SEC, recovery_timeout_sec)
         cause, rc, resume_lines, stderr_chunks = self._run_cli_process(
             argv, env, timeout_sec=resume_timeout)
+        # codex 1 周目 I4 是正 (2026-09-11): 追撃 (resume) プロセスの
+        # stderr は primary とは別プロセスから来るため、`CliRunner.run()`
+        # が primary の stderr だけを見る `_detect_stderr_fatal` では拾えない
+        # — ここで検知して `self._recovery_stderr_fatal` に置き、`run()` が
+        # primary 分と合成する (`_merge_stderr_fatal`)。
+        self._recovery_stderr_fatal = _detect_stderr_fatal("".join(stderr_chunks))
         step_finish_reason = self._last_step_finish_reason(resume_lines)
         if cause == "timeout":
             discard_reason = "timed_out"

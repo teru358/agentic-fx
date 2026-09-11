@@ -367,6 +367,30 @@ def test_opencode_resume_transcript_preserves_stderr(tmp_path, monkeypatch):
     assert marker["stderr_tail"] == "boom\n"
 
 
+def test_opencode_resume_stderr_sigtrap_sets_recovery_stderr_fatal(tmp_path, monkeypatch):
+    """codex 1 周目 I4 是正 (2026-09-11): 追撃 (resume) プロセスの stderr に
+    `SIGTRAP` があれば `_recover_output` が
+    `self._recovery_stderr_fatal` に検知結果を残す (`CliRunner.run()` が
+    primary 分と合成して `MissionResult.stderr_fatal` に載せる契約側)。
+    accepted/discard の判定 (rc/step_finish_reason) とは独立に効く —
+    ここでは accepted=False (rc!=0) のケースで確認する。"""
+    runner, _workdir = _resume_runner(tmp_path, Path("/opt/opencode"))
+    resume_lines = [_step_finish("stop")]
+    monkeypatch.setattr(
+        runner, "_run_cli_process",
+        lambda *args, **kwargs: (
+            "completed", 1, resume_lines,
+            ["error=code-mode host exited with status signal: 5 (SIGTRAP)\n"]))
+    monkeypatch.setattr(runner, "_save_transcript", lambda stdout, stderr: None)
+
+    result = runner._recover_output(
+        _resume_mission(), ['{"sessionID":"ses_sigtrapmarker"}'], 10)
+
+    assert result is None
+    assert runner._recovery_stderr_fatal is not None
+    assert "SIGTRAP" in runner._recovery_stderr_fatal
+
+
 def test_opencode_resume_nonzero_rc_is_rejected(tmp_path):
     """M3 killer: 追撃 CLI が rc!=0 で終われば、text/step_finish が
     正しくても None (failed) にする。"""

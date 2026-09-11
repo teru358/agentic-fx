@@ -92,6 +92,16 @@ def _detect_stderr_fatal(stderr_text: str) -> str | None:
     return None
 
 
+def _merge_stderr_fatal(primary: str | None, recovery: str | None) -> str | None:
+    """codex 1 周目 I4 是正 (2026-09-11): primary (メインプロセス) と
+    recovery (`_recover_output` が起動する追撃プロセス、例 resume) の
+    どちらか一方または両方に検知済み fatal 文字列があれば返す。両方
+    あれば `; ` で連結し、どちらの経路で落ちたかを両方とも保つ。"""
+    if primary and recovery:
+        return f"{primary}; {recovery}"
+    return primary or recovery
+
+
 def _effective_transcript_max_bytes() -> int:
     """`_TRANSCRIPT_MAX_BYTES` (既定 50MB) と、いま実際に効いている
     `RLIMIT_FSIZE` の小さい方を返す。
@@ -206,6 +216,14 @@ class CliRunner(AgentRunner):
         self._transcript_dir = transcript_dir
         self._abort_event = abort_event
         self._abort_reason_fn = abort_reason_fn
+        # codex 1 周目 I4 是正 (2026-09-11): `_recover_output` (resume を
+        # 実装する backend、例 `OpencodeRunner`) が起動する追撃プロセスの
+        # stderr は、primary の stderr とは別プロセスから来る — backend は
+        # ここへ検知済み fatal 文字列 (`_detect_stderr_fatal` の戻り値) を
+        # 書き込み、`run()` が primary 分と `; ` 連結して
+        # `MissionResult.stderr_fatal` へ渡す。`_recover_output` を
+        # override しない backend (既定 no-op) は触らないため None のまま。
+        self._recovery_stderr_fatal: str | None = None
 
     @abstractmethod
     def _build_argv(self, mission: Mission, *, mcp_socket: Path) -> list[str]: ...
@@ -338,6 +356,11 @@ class CliRunner(AgentRunner):
             primary_timeout = mission.timeout_sec
             recovery_timeout = 0.0
 
+        # codex 1 周目 I4 是正 (2026-09-11): この mission の追撃 stderr
+        # 検知結果を毎回リセットする — インスタンスが再利用されないのが
+        # 通例でも、前回呼び出しの残骸を次の `run()` に持ち越さない。
+        self._recovery_stderr_fatal = None
+
         cause, rc, stdout_lines, stderr_chunks = self._run_cli_process(
             inner_argv, env, timeout_sec=primary_timeout,
             on_started=self._cli_started_sink, abort_event=self._abort_event)
@@ -363,6 +386,7 @@ class CliRunner(AgentRunner):
             # session が継続できる backend 向け)。基底実装は no-op (None) の
             # ため、追撃を実装しない backend は従来どおり "timeout" になる。
             raw = self._recover_output(mission, list(stdout_lines), recovery_timeout)
+            stderr_fatal = _merge_stderr_fatal(stderr_fatal, self._recovery_stderr_fatal)
             if cause == "abort":
                 abort_reason = _normalize_reason(
                     self._abort_reason_fn() if self._abort_reason_fn
@@ -386,6 +410,7 @@ class CliRunner(AgentRunner):
             if raw is None:
                 # 段B: 最終出力が回収できない場合も追撃回収を 1 回試みる。
                 raw = self._recover_output(mission, list(stdout_lines), recovery_timeout)
+                stderr_fatal = _merge_stderr_fatal(stderr_fatal, self._recovery_stderr_fatal)
                 if raw is None:
                     return MissionResult("failed", None, [],
                                          reason=_normalize_reason("no output recovered from cli"),

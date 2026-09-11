@@ -908,3 +908,83 @@ def test_cli_runner_completed_mission_without_fatal_pattern_has_none(tmp_path):
     result = runner.run(_mission())
     assert result.status == "completed"
     assert result.stderr_fatal is None
+
+
+# --- codex 1 周目 I4 是正 (2026-09-11): 追撃 (resume) の stderr マージ ---
+#
+# `_recover_output` を実装する backend (`OpencodeRunner` 等) は追撃用の別
+# プロセスを起動する。その stderr は primary の stderr とは別物であり、
+# backend は検知結果を `self._recovery_stderr_fatal` に置く契約 —
+# `CliRunner.run()` はそれを primary の `stderr_fatal` と `_merge_stderr_fatal`
+# で合成して `MissionResult.stderr_fatal` に載せる。ここでは no-output 経路
+# (`_extract_output` が None) の `_recover_output` を実装するテスト専用
+# backend で、primary のみ/recovery のみ/両方の 3 ケースを直接 pin する。
+
+
+def test_cli_runner_recovery_stderr_fatal_only_is_merged_into_result(tmp_path):
+    """primary の stderr は無害だが、recovery (resume) の stderr に
+    `SIGTRAP` があれば `MissionResult.stderr_fatal` に載る。"""
+    class RecoveringRunner(_FakeCliRunner):
+        def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
+            self._recovery_stderr_fatal = (
+                "pattern=SIGTRAP tail=error=code-mode host exited "
+                "with status signal: 5 (SIGTRAP)")
+            return {"answer": 4}
+
+    script = "print('no answer key here')\n"
+    runner = RecoveringRunner(
+        script=script, bin_path=Path(sys.executable), model="m",
+        workdir=tmp_path, cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    result = runner.run(_mission())
+    assert result.status == "completed"
+    assert result.stderr_fatal is not None
+    assert "SIGTRAP" in result.stderr_fatal
+
+
+def test_cli_runner_primary_stderr_fatal_only_is_kept_without_recovery(tmp_path):
+    """recovery が何も検知しなければ (None のまま)、primary 側の検知だけが
+    `MissionResult.stderr_fatal` に残る — マージ導入で primary 単独分が
+    消える変異を殺す。"""
+    class RecoveringRunner(_FakeCliRunner):
+        def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
+            return {"answer": 4}
+
+    script = (
+        "import sys\n"
+        "sys.stderr.write('error=code-mode host exited with status "
+        "signal: 5 (SIGTRAP)\\n')\n"
+        "print('no answer key here')\n"
+    )
+    runner = RecoveringRunner(
+        script=script, bin_path=Path(sys.executable), model="m",
+        workdir=tmp_path, cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    result = runner.run(_mission())
+    assert result.status == "completed"
+    assert result.stderr_fatal is not None
+    assert "SIGTRAP" in result.stderr_fatal
+    # primary 分だけであって recovery の tail 文字列が二重に入っていない。
+    assert result.stderr_fatal.count("pattern=") == 1
+
+
+def test_cli_runner_primary_and_recovery_stderr_fatal_are_both_merged(tmp_path):
+    """primary・recovery の両方に致命パターンがあれば、両方の検知結果が
+    `; ` で連結されて残る (どちらか一方だけを勝たせる変異を殺す)。"""
+    class RecoveringRunner(_FakeCliRunner):
+        def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
+            self._recovery_stderr_fatal = "pattern=SIGTRAP tail=resume-side"
+            return {"answer": 4}
+
+    script = (
+        "import sys\n"
+        "sys.stderr.write('Segmentation fault\\n')\n"
+        "print('no answer key here')\n"
+    )
+    runner = RecoveringRunner(
+        script=script, bin_path=Path(sys.executable), model="m",
+        workdir=tmp_path, cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    result = runner.run(_mission())
+    assert result.status == "completed"
+    assert result.stderr_fatal is not None
+    assert "Segmentation fault" in result.stderr_fatal
+    assert "resume-side" in result.stderr_fatal
+    assert "; " in result.stderr_fatal

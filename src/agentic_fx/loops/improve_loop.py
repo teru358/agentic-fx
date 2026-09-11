@@ -2280,7 +2280,8 @@ class ImproveLoop:
                     Category.IMPROVE, "report_published",
                     f"mission={ctx.mission_id} backlog="
                     f"{backlog_id if backlog_id is not None else '-'} "
-                    f"path={report_path}", str(ctx.mission_id))
+                    f"path={report_path}"
+                    f"{_tool_calls_suffix(tool_calls)}", str(ctx.mission_id))
         # round2 #7 是正 (2026-08-29、verified-round2.md #7、設計逐語違反):
         # 設計 §4.2 手順9「承認申請を出した staging は残す。それ以外は
         # 削除。」— report/observation 経路は承認申請を出さないため、

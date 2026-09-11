@@ -17,16 +17,21 @@ from agentic_fx.tools.registry import ToolRegistry
 # 組み込みツール (Bash/Edit/Write/…) は `--allowedTools` を絞っても
 # `system/init` にそのまま広告され、実測でも `ToolSearch`/`StructuredOutput`
 # が実行された (registry を通らず `max_tool_calls` に数えられない)。
-# `--disallowedTools` で明示的に遮断する。`Read` (workdir 内の読み取りは
-# Landlock 下で無害) と `ToolSearch`/`StructuredOutput` (StructuredOutput は
-# `_extract_output` が最終出力として読む) は遮断リストから除外する。
-CLAUDE_DISALLOWED_BUILTIN_TOOLS = (
-    "Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
-    "Task", "SendMessage", "RemoteTrigger", "CronCreate", "CronDelete",
-    "CronList", "PushNotification", "Workflow", "EnterWorktree",
-    "ExitWorktree", "Skill", "Monitor", "ScheduleWakeup", "DesignSync",
-    "ListAgents", "TaskOutput", "TaskStop", "ReportFindings",
-)
+#
+# codex 1 周目 I2/I3 是正 (2026-09-11): denylist (`--disallowedTools`) は
+# CLI 更新で新しい組み込みツール名 (`Glob`/`Grep`/`LS`/`MultiEdit`/
+# `BashOutput`/`KillShell`/`TodoWrite`/`AskUserQuestion`/`EnterPlanMode`/
+# `ExitPlanMode` 等、観測時点の denylist に無い名前) が広告されると
+# fail-open する。CLI 2.1.268 の `--help` が明記する `--tools` (組み込み
+# ツール可用性そのものの allowlist、`""` で全無効化) に置換する — 未知の
+# 新規組み込みツールも既定で不可視になる。`StructuredOutput`
+# (`_extract_output` が最終出力として読む) と `ToolSearch` (MCP の
+# deferred ツール読み込みに要る可能性がある) だけを許可する。`Read` は
+# 許可集合から落とす — Landlock の read_only は workdir だけでなく
+# `/etc`・コードツリー・`/proc` を含むため、built-in `Read` を許すと
+# registry を経由しない読み取りが可能になる (監査可能な MCP
+# `read_staging_file` / `read_plugin_source` に一本化する)。
+CLAUDE_BUILTIN_TOOLS = ("StructuredOutput", "ToolSearch")
 
 
 # precheck 2026-08-22 pass2: RB3 追随 (build_runner から cli_started_sink= を
@@ -70,7 +75,7 @@ class ClaudeRunner(CliRunner):
             "--strict-mcp-config",
             "--mcp-config", str(mcp_config_path),
             "--allowedTools", ",".join(self._allowed_tools),
-            "--disallowedTools", ",".join(CLAUDE_DISALLOWED_BUILTIN_TOOLS),
+            "--tools", ",".join(CLAUDE_BUILTIN_TOOLS),
             "--max-turns", str(mission.max_turns),
             "--model", self._model,
         ]

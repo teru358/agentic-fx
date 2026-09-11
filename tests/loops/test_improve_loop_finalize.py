@@ -1930,6 +1930,58 @@ def test_report_path_deletes_staging_including_readonly_snapshot(
     assert "\tmission_observation\t" not in activity_text
 
 
+def test_report_published_writes_tool_calls_when_present(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """codex 1 周目 M1 是正 (2026-09-11): `report_published` 終端行にも
+    `mission_observation` と同じ `tool_calls=<N>` サフィックスが付く —
+    `commit()` は `_finalize_report_or_observation` に `tool_calls` を渡す
+    が、従来は observation 経路にしか反映されていなかった。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging-report-tool-calls"
+    staging_dir.mkdir()
+    ctx = _finalize_report_or_observation_ctx(
+        staging_dir, mission_id=mission_id, run_id=run_id)
+    loop_min._root = tmp_path
+    reports_dir = tmp_path / "data" / "improve_reports"
+    (reports_dir / ".tmp").mkdir(parents=True)
+    part_path = reports_dir / ".tmp" / f"improve-{mission_id}.md.part"
+    part_path.write_text("# report\n")
+    final_path = reports_dir / f"improve-{mission_id}.md"
+
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
+        artifact={"type": "report"}, now=datetime(2026, 8, 22), tool_calls=3)
+
+    line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
+               if "report_published" in line)
+    assert "tool_calls=3" in line
+
+
+def test_report_published_omits_tool_calls_when_none(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """local backend (`tool_calls=None`) では `report_published` にも
+    サフィックスが現れない — 既定引数 (未指定) のまま従来文面を保つ。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging-report-no-tool-calls"
+    staging_dir.mkdir()
+    ctx = _finalize_report_or_observation_ctx(
+        staging_dir, mission_id=mission_id, run_id=run_id)
+    loop_min._root = tmp_path
+    reports_dir = tmp_path / "data" / "improve_reports"
+    (reports_dir / ".tmp").mkdir(parents=True)
+    part_path = reports_dir / ".tmp" / f"improve-{mission_id}.md.part"
+    part_path.write_text("# report\n")
+    final_path = reports_dir / f"improve-{mission_id}.md"
+
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
+        artifact={"type": "report"}, now=datetime(2026, 8, 22))
+
+    line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
+               if "report_published" in line)
+    assert "tool_calls=" not in line
+
+
 def test_report_publish_failure_does_not_log_published(
         loop_min, conn, mission_and_run_fixture, tmp_path):
     """2 周目 CR3 (実形状): `_publish_report` は rename 失敗で例外を出さず
