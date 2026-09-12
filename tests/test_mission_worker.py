@@ -446,14 +446,15 @@ def test_bootstrap_improve_profile_proc_readable_only_for_claude(
     assert "PROC_READABLE" in result_claude.stdout, result_claude.stderr
 
 
-def test_bootstrap_improve_profile_proc_readable_for_codex(
+def test_bootstrap_improve_profile_proc_blocked_for_codex(
         improve_worker_layout):
-    """A4 10 回目 #71 (2026-09-11): codex backend の code-mode host
-    (V8) は `/proc/self/maps` を読む。claude/opencode と同じリスク受容を
-    codex にも延ばす — `/proc` が read_only に入り listdir が通ること、
-    local backend には影響しないことの両方を pin する (別 staging_dir
-    で local 側 (`test_bootstrap_improve_profile_proc_readable_only_for_claude`)
-    と相互照合)。"""
+    """反証 (2026-09-12): A4 10 回目 #71 の「codex の code-mode host (V8)
+    は `/proc/self/maps` を読む」という主張は単体切り分けの実測で否定
+    された (`tmp/codex-host-probe/findings.md`) — SIGTRAP の真因は
+    RLIMIT_AS 4096MB であり、Landlock/proc の有無とは無関係。codex は
+    claude/opencode と違って `/proc` を read_only に必要としない —
+    local backend と同じく listdir が拒否されることを pin する
+    (`838b09d` で足した readable pin を反転)。"""
     l = improve_worker_layout
     script = """
     try:
@@ -470,7 +471,7 @@ def test_bootstrap_improve_profile_proc_readable_for_codex(
         script, staging_dir=layout3_staging, mission_id=l["mission_id"],
         source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"],
         backend="codex")
-    assert "PROC_READABLE" in result_codex.stdout, result_codex.stderr
+    assert "PROC_BLOCKED" in result_codex.stdout, result_codex.stderr
 
 
 def test_bootstrap_improve_profile_proc_readable_for_opencode(

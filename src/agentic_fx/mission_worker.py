@@ -170,12 +170,16 @@ def _bootstrap_improve_profile(
             read_only.append(sys_path)
     if Path("/run/systemd/resolve").exists():
         read_only.append(Path("/run/systemd/resolve"))
-    if backend in ("claude", "opencode", "codex"):
+    if backend in ("claude", "opencode"):
         # opencode (bun/JSC) は /proc/self/maps 読取に失敗すると SIGABRT
         # (検収実測 2026-08-30: mmap 予約は全て成功した状態で maps/cgroup
         # EACCES 直後に自己 abort)。claude と同じリスク受容 (R10 参照)。
-        # codex 0.150.1 の code-mode host (V8) も /proc/self/maps を読む。
-        # A4 10 回目 #71 で SIGTRAP 7 件、2026-09-11
+        # codex は /proc 不要 (A4 11 回目で反証、真因は RLIMIT_AS —
+        # `tmp/codex-host-probe/findings.md` 2026-09-12。従来の「codex
+        # 0.150.1 の code-mode host も /proc/self/maps を読む」という
+        # 主張は単体切り分けの実測で否定された — Landlock/proc なしの
+        # 状態でも SIGTRAP は RLIMIT_AS 4096MB だけで再現し、/proc を
+        # 加えても外しても結果は変わらない)。
         read_only.append(Path("/proc"))
 
     # staging_dir の相互照合 (§2.2): 末尾成分が mission_id と一致するか。
@@ -738,8 +742,12 @@ def main() -> None:
             # RLIMIT_AS は封じ込めとして機能しない — opencode backend の
             # ときだけ 256GB へ引き上げる (実質的な暴走抑止は NOFILE/FSIZE/
             # timeout が担う)。他 backend の既定 4096MB は緩めない。
+            # codex 0.150.1 の code-mode host (V8) は 12〜14 GB の仮想アド
+            # レスを予約する。4096 MB では `Failed to reserve the virtual
+            # address space for the V8 sandbox` → int3 SIGTRAP、
+            # `tmp/codex-host-probe/findings.md` 2026-09-12。
             as_mb = settings_dict["worker"]["child_as_mb"]
-            if improve_backend == "opencode":
+            if improve_backend in ("opencode", "codex"):
                 as_mb = max(as_mb, 262144)
             _set_resource_limits(
                 as_mb=as_mb,

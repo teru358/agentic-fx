@@ -846,6 +846,58 @@ def test_main_applies_landlock_bootstrap_before_running_improve_mission(
     assert len(registry_calls) == 1  # _build_improve_registry から 1 呼び出し
 
 
+def test_main_bumps_as_mb_for_improve_backend_codex(monkeypatch, tmp_path):
+    """2026-09-12 裁定: codex 0.150.1 の code-mode host (V8) は 12〜14 GB の
+    仮想アドレスを予約する。4096 MB (既定) では
+    `Failed to reserve the virtual address space for the V8 sandbox` →
+    int3 SIGTRAP (`tmp/codex-host-probe/findings.md`)。opencode と同じ
+    256GB (262144 MiB) へ引き上げる分岐を `_set_resource_limits` の
+    実引数で pin する (`_bootstrap_improve_profile` は fake 化して
+    Landlock 適用前で観測する)。"""
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda **kw: None)
+
+    def to_codex(settings_dict):
+        settings_dict["runner"]["improve"]["backend"] = "codex"
+
+    frames, rlimit_calls, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve",
+                             "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-codex-as-mb",
+                             "staging_dir": str(tmp_path / "staging" / "m-codex-as-mb"),
+                             "source_snapshot_dir": str(tmp_path / "source")},
+        settings_mutator=to_codex)
+
+    assert frames[0]["type"] == "ready" and frames[0]["ok"] is True, frames[0]
+    assert rlimit_calls[0]["as_mb"] >= 262144, rlimit_calls
+
+
+def test_main_does_not_bump_as_mb_for_improve_backend_claude(
+        monkeypatch, tmp_path):
+    """上の裏 — claude backend は既定の `child_as_mb` (4096) のまま緩めない
+    (V8 code-mode host の VA 予約問題は codex/opencode 固有で、claude CLI
+    には無い)。`in ("opencode", "codex")` を `in ("opencode", "codex",
+    "claude")` などへ広げる変異のキラー。"""
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
+                        lambda **kw: None)
+
+    def to_claude(settings_dict):
+        settings_dict["runner"]["improve"]["backend"] = "claude"
+
+    frames, rlimit_calls, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve",
+                             "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-claude-as-mb",
+                             "staging_dir": str(tmp_path / "staging" / "m-claude-as-mb"),
+                             "source_snapshot_dir": str(tmp_path / "source")},
+        settings_mutator=to_claude)
+
+    assert frames[0]["type"] == "ready" and frames[0]["ok"] is True, frames[0]
+    assert rlimit_calls[0]["as_mb"] == 4096, rlimit_calls
+
+
 def test_main_routes_trade_claude_backend_through_factory_build_runner(
         monkeypatch, tmp_path):
     """I-1 是正 (`tmp/review-bundleA/verified-round1.md` §4): 旧
