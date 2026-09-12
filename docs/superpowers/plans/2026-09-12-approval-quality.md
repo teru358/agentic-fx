@@ -116,3 +116,4 @@ ledger 設計書 (`2026-09-10-ledger-preserve-design.md`) §3 の全終端表は
 | 日付 | 版 | 変更 | 理由 (レビュー指摘 / 実機観測 / 裁定) | commit |
 |---|---|---|---|---|
 | 2026-09-12 | v1 | 起案。T-A〜T-D の task 分割 (A〜C 直列 1 worktree、D 並列別 worktree)、§0 に失敗終端実証 run を追加、レビュー段・実機確認・進捗表を規定 | 設計書 `2026-09-12-approval-quality-design.md` v1 のユーザー承認 (2026-09-12) を実装プランへ写す | - |
+| 2026-09-12 | v1.1 | §0 失敗終端実証 run 完了 (codex #77、`max_tool_calls` は 6 でなく 8 — 6/7 では run_backtest (8 番目) 前に abort し観測不能。窓は 1 呼び出し分) → F1〜F7 充足、新規欠陥 0 | 実機観測 | fb6aed8 以降 |
