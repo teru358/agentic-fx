@@ -10,8 +10,9 @@ from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
-from agentic_fx.store import (approvals, backlog, missions, orders,
-                              reflection_attempts, reflections)
+from agentic_fx.store import (approvals, backlog, candidate_archives,
+                              missions, orders, reflection_attempts,
+                              reflections)
 from agentic_fx.store.approvals import AlreadyDecidedError, ApprovalNotFoundError
 from agentic_fx.store.state import StateStore
 
@@ -360,7 +361,30 @@ class Commands:
         ]
         lines += self._metrics_lines("in_sample", payload.get("in_sample"))
         lines += self._metrics_lines("holdout", payload.get("holdout"))
+        lines.append(self._archive_line(payload))
         return "\n".join(lines)
+
+    def _archive_line(self, payload: dict) -> str:
+        """approval-quality 設計書 §C ([archive-artifact-hash-vs-
+        submitted]): archive の引き当ては payload の `mission_id`/
+        `content_hash` で行う — payload の `artifact_hash` は self-test
+        修正 (提出直前の `test_plugin.py` 書き換え) でずれうるため引き
+        当てキーには使わない (run12 観測 C、docstring は
+        `store/candidate_archives.py::find_by_mission_content` 側にも
+        明記)。見つからない (GC 済み・失敗終端等) ときは「archive 不明」
+        と明示する。"""
+        mission_id = payload.get("mission_id")
+        content_hash = payload.get("content_hash")
+        if mission_id is None or content_hash is None:
+            return "archive=不明 (mission_id/content_hash 欠落)"
+        row = candidate_archives.find_by_mission_content(
+            self.conn, mission_id=mission_id, content_hash=content_hash)
+        if row is None:
+            return "archive=不明 (GC 済み・失敗終端等)"
+        archive_path = row.get("archive_path")
+        if archive_path is None:
+            return "archive=不明 (パス欠落、GC 済みの可能性)"
+        return f"archive={archive_path}"
 
     def _log(self, n: int) -> str:
         if n <= 0:

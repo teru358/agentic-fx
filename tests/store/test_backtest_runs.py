@@ -704,6 +704,167 @@ def test_save_harness_run_params_default_is_not_shared_mutable(tmp_path):
             f"default {default!r} が残っている)")
 
 
+# ---- approval-quality 設計書 §A: find_matching_approved_metrics ------------
+
+def _approved_kw(**overrides):
+    kw = dict(scope="in_sample", plugin_ref="p", content_hash="approved-hash",
+              kind="strategy", pair="USDJPY", timeframe="1h", source="test",
+              base_interval="1m", period=(H, H), settings_hash="s",
+              core_commit="c", initial_balance=1.0, now=H,
+              mission_outcome="approval",
+              metrics={"trades": 194, "pf": 1.4981, "avg_r": 0.2})
+    kw.update(overrides)
+    return kw
+
+
+def test_find_matching_approved_metrics_exact_match_returns_content_hash(tmp_path):
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(conn, **_approved_kw())
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
+    assert got == "approved-hash"
+
+
+def test_find_matching_approved_metrics_no_match_returns_none(tmp_path):
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(conn, **_approved_kw())
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=195, pf=1.4981, avg_r=0.2)
+    assert got is None
+
+
+@pytest.mark.parametrize("field", ["trades", "pf", "avg_r"])
+def test_find_matching_approved_metrics_any_single_field_mismatch_is_no_match(
+        tmp_path, field):
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(conn, **_approved_kw())
+    values = {"trades": 194, "pf": 1.4981, "avg_r": 0.2}
+    values[field] = values[field] + 1 if field == "trades" else values[field] + 0.5
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", **values)
+    assert got is None
+
+
+def test_find_matching_approved_metrics_ignores_non_approval_outcome(tmp_path):
+    """`mission_outcome` が 'approval' 以外 (承認されていない候補) は母集団
+    から除外される。"""
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, **_approved_kw(mission_outcome="observation"))
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
+    assert got is None
+
+
+def test_find_matching_approved_metrics_none_pf_matches_none_pf(tmp_path):
+    """avg_r/pf が両方 `None` のケース (§A 検証節: `avg_r` が `None` 同士の
+    一致)。"""
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, **_approved_kw(metrics={"trades": 0, "pf": None, "avg_r": None}))
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=0, pf=None, avg_r=None)
+    assert got == "approved-hash"
+
+
+def test_find_matching_approved_metrics_none_vs_value_is_no_match(tmp_path):
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, **_approved_kw(metrics={"trades": 0, "pf": None, "avg_r": None}))
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=0, pf=0.0, avg_r=None)
+    assert got is None
+
+
+def test_find_matching_approved_metrics_float_tol_boundary(tmp_path):
+    """§A 検証節: `FLOAT_TOL` (1e-9) 境界 (ちょうど閾値上・閾値未満)。
+
+    基準値を `0.0` に取る — `1.0 + FLOAT_TOL` のような加算は浮動小数の
+    丸め誤差で実際の差が `FLOAT_TOL` からわずかにずれる (`1.0 +
+    1.0000000827...e-9` になる環境がある)。`0.0` からの差は加算誤差が
+    無く、`FLOAT_TOL` ちょうど/その半分を正確に表現できるため、比較演算子
+    `<` を `<=` に反転する変異を確実に red にできる (段 0 変異で
+    SURVIVED を実測、原因は加算誤差 — 2026-09-12)。"""
+    from agentic_fx.store.db import FLOAT_TOL
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, **_approved_kw(metrics={"trades": 1, "pf": 0.0, "avg_r": 0.0}))
+    # 閾値未満の差 (一致)
+    got_close = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=1, pf=FLOAT_TOL / 2, avg_r=0.0)
+    assert got_close == "approved-hash"
+    # ちょうど閾値上の差 (不一致 — `<` は閾値と等しい差を弾く)
+    got_far = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=1, pf=FLOAT_TOL, avg_r=0.0)
+    assert got_far is None
+
+
+def test_find_matching_approved_metrics_respects_pair_source_base_interval(
+        tmp_path):
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(conn, **_approved_kw())
+    for kw in (
+        dict(pair="EURUSD", variant="candidate", source="test", base_interval="1m"),
+        dict(pair="USDJPY", variant="candidate", source="other", base_interval="1m"),
+        dict(pair="USDJPY", variant="candidate", source="test", base_interval="5m"),
+        dict(pair="USDJPY", variant="baseline", source="test", base_interval="1m"),
+    ):
+        got = backtest_runs.find_matching_approved_metrics(
+            conn, trades=194, pf=1.4981, avg_r=0.2, **kw)
+        assert got is None, kw
+
+
+def test_find_matching_approved_metrics_excludes_human_custom_scope(tmp_path):
+    """`issued_by='harness'` 以外 (人間発行行) は母集団から除外する
+    (`in_sample_view`/`latest_in_sample_metrics` と同じ防御レイヤ)。
+    `save_human_run` は scope='human_custom' 固定 (scope 自体で弾かれる)
+    なので、`issued_by` 絞りだけを独立に検査するには
+    `test_in_sample_view_excludes_forged_issued_by_via_raw_insert` と同じ
+    手法 (生 INSERT で scope='in_sample' かつ issued_by='human_cli' の行を
+    作る) が要る — さもないと `issued_by='harness'` 絞りを削る変異が
+    SURVIVED する (段 0 変異で実測)。"""
+    conn = _conn(tmp_path)
+    backtest_runs.save_human_run(
+        conn, plugin_ref="p", content_hash="human-hash", kind="strategy",
+        pair="USDJPY", timeframe="1h", source="test", base_interval="1m",
+        period=(H, H), metrics={"trades": 194, "pf": 1.4981, "avg_r": 0.2},
+        settings_hash="s", core_commit="c", initial_balance=1.0, now=H)
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
+    assert got is None
+
+
+def test_find_matching_approved_metrics_excludes_forged_issued_by_in_sample_row(
+        tmp_path):
+    """`scope='in_sample'` かつ `issued_by='human_cli'`（生 INSERT でのみ
+    作れる、CHECK は独立検査のため通る）は `issued_by='harness'` 絞りが
+    無いと母集団に混入する。"""
+    conn = _conn(tmp_path)
+    conn.execute(
+        "INSERT INTO backtest_runs (plugin_ref, content_hash, kind, pair,"
+        " timeframe, source, base_interval, period_start, period_end, scope,"
+        " issued_by, metrics_json, settings_hash, core_commit,"
+        " initial_balance, created_at, variant, mission_outcome)"
+        " VALUES ('p','forged-hash','strategy','USDJPY','1h','test','1m',"
+        "'t','t','in_sample','human_cli',"
+        "'{\"trades\": 194, \"pf\": 1.4981, \"avg_r\": 0.2}','s','c',1,'t',"
+        "'candidate','approval')")
+    conn.commit()
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
+    assert got is None
+
+
 def test_latest_in_sample_metrics_filters_by_source(tmp_path):
     """ローカル 1 周目 #16 (2026-09-10): WHERE の `source=?` が実際に効いて
     いること。同じ束の `variant=?` (ignores_baseline_and_no_strategy_rows) と

@@ -380,9 +380,14 @@ def test_finalize_loser_does_not_write_index_row_with_zero_candidates(
     assert not _index_path(loop_min).exists()
 
 
-def test_finalize_success_does_not_write_index_row_for_approval(
+def test_finalize_success_writes_index_row_for_approval(
         loop_min, conn, mission_and_run_fixture, tmp_path):
-    """approval は書かない。"""
+    """approval-quality 設計書 §B (2026-09-12、[archive-index-naming]):
+    approval 終端も INDEX.md へ 1 行残す (旧稿は「approval は書かない」を
+    pin していたが、A4 12〜13 回目の観測 B — approval が 3 run 連続で
+    INDEX に載らない — を受けて挙動を反転する)。行フォーマットは既存の
+    report/observation/failed 系と同じ列 (mission/status/candidates/best/
+    archive) を共有する。"""
     mission_id, run_id, backlog_id = mission_and_run_fixture
     tmp = tmp_path / "archive"
     artifact_hash = _snapshot(tmp)
@@ -394,7 +399,89 @@ def test_finalize_success_does_not_write_index_row_for_approval(
         slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
 
+    text = _index_path(loop_min).read_text()
+    assert f"mission {mission_id}" in text
+    assert "| approval |" in text
+    assert f"best=x@{artifact_hash[:8]}" in text
+    assert "candidates=1" in text
+
+
+def test_finalize_success_index_row_matches_other_terminal_columns(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """approval 行は report/observation/failed 系と同じ列見出しを共有する
+    (別のフォーマットの表を新設しない)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+
+    text = _index_path(loop_min).read_text()
+    assert text.count("| date | mission | status | candidates | best | "
+                      "archive |") == 1
+
+
+def test_finalize_success_index_header_notes_it_is_a_terminal_log(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """設計書 §B: 「終端ログ (GC 非対象)。正は candidate_archives」の趣旨が
+    ヘッダに明記される。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+
+    text = _index_path(loop_min).read_text()
+    assert "candidate_archives" in text
+    assert "終端ログ" in text
+
+
+def test_finalize_success_does_not_write_index_row_with_zero_candidates(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """行 0 件 (ledger entries が run_backtest を含まない) の approval
+    mission は INDEX 行を書かない (既存の「行 0 件は書かない」不変条件を
+    approval 経路でも保つ)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    ctx = _ctx(tmp_path, mission_id, run_id, [])
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+
     assert not _index_path(loop_min).exists()
+
+
+def test_finalize_success_index_row_not_duplicated_on_direct_call_without_ctx(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """`ctx=None` (直接呼び出し、単体テストが多用する形) でも `persist_ctx`
+    (mission_id を持つ) 経由で INDEX 行が書ける — `ctx` 自体が `None` でも
+    `AttributeError` にならないこと。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger.record(**_backtest_entry(tmp, artifact_hash))
+    ledger.freeze()
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        now=NOW, ledger_entries=tuple(ledger.entries()))
+
+    text = _index_path(loop_min).read_text()
+    assert f"mission {mission_id}" in text
+    assert "| approval |" in text
 
 
 def test_index_header_written_only_once(

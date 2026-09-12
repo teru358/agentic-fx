@@ -244,6 +244,51 @@ def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
     return _filter_metrics(raw_metrics)
 
 
+def _metric_value_matches(a: Any, b: Any) -> bool:
+    """approval-quality §A: `(a, b)` が両方 `None` なら一致、片方だけ
+    `None` なら不一致、両方数値なら `store/db.py:409` の ``FLOAT_TOL``
+    (1e-9) で比較する (既存の ``abs(a-b) < FLOAT_TOL`` パターンを流用)。"""
+    from agentic_fx.store.db import FLOAT_TOL
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) < FLOAT_TOL
+
+
+def find_matching_approved_metrics(conn: sqlite3.Connection, *, pair: str,
+                                    variant: str, source: str,
+                                    base_interval: str, trades: Any,
+                                    pf: Any, avg_r: Any) -> str | None:
+    """approval-quality 設計書 §A: 承認済み (``mission_outcome='approval'``)
+    の in_sample/harness 候補行のうち、``(trades, pf, avg_r)`` が
+    ``FLOAT_TOL`` で一致する行があれば、その ``content_hash`` を返す
+    (無ければ ``None``)。
+
+    質検査の母集団 = ``scope='in_sample' AND issued_by='harness' AND
+    variant=? AND mission_outcome='approval'``。過去に承認された example
+    (`sma_cross` 等) の行もここに自然に含まれる — example 専用の variant
+    を新設する必要はない (承認済みなら `mission_outcome='approval'` で
+    既に絞り込める、設計書 §A)。``issued_by='harness'`` は
+    ``in_sample_view``/``latest_in_sample_metrics`` と同じ防御レイヤ
+    (人間発行行を母集団から除く)。"""
+    rows = conn.execute(
+        "SELECT content_hash, metrics_json FROM backtest_runs WHERE "
+        "scope='in_sample' AND issued_by='harness' AND variant=? "
+        "AND mission_outcome='approval' AND pair=? AND source=? "
+        "AND base_interval=? ORDER BY id",
+        (variant, pair, source, base_interval)).fetchall()
+    for row in rows:
+        try:
+            raw_metrics = json.loads(row["metrics_json"])
+        except (TypeError, ValueError):
+            continue
+        filtered = _filter_metrics(raw_metrics)
+        if (_metric_value_matches(filtered.get("trades"), trades)
+                and _metric_value_matches(filtered.get("pf"), pf)
+                and _metric_value_matches(filtered.get("avg_r"), avg_r)):
+            return row["content_hash"]
+    return None
+
+
 def settings_snapshot_hash(settings: Any) -> str:
     """risk / backtest 設定の安定 JSON の sha256 hexdigest (再現性メタデータ)。
 

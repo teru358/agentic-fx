@@ -1333,6 +1333,25 @@ class ImproveLoop:
             "audit_note": "RPC timeout した呼出しは数えていない",
         }
 
+    def _check_duplicate_metrics(self, conn, *, content_hash, pair, variant,
+                                 source, base_interval, metrics) -> str | None:
+        """approval-quality 設計書 §A: `_build_approval_payload` の直後
+        (gate 通過後・approval 提出前) に挟む質検査。候補の
+        `(trades, pf, avg_r)` が既存の承認済み candidate 行と一致すれば、
+        一致した行の `content_hash` を返す (呼び出し元はこれを
+        `duplicate_metrics_of:<hash>` として観測降格の note に使う)。
+        一致が無ければ `None`。
+
+        `content_hash` (候補自身の hash) はこの検査の比較には使わない —
+        `_check_duplicate_metrics` の呼び出し規約を
+        `_build_approval_payload` と揃え、将来 activity ログに候補自身の
+        hash も残すときに引数を増やさず済むようにするための保持。"""
+        from agentic_fx.store import backtest_runs as backtest_runs_store
+        return backtest_runs_store.find_matching_approved_metrics(
+            conn, pair=pair, variant=variant, source=source,
+            base_interval=base_interval, trades=metrics.get("trades"),
+            pf=metrics.get("pf"), avg_r=metrics.get("avg_r"))
+
     def _final_report_path(self, reports_dir: Path, *, mission_id: int,
                            now: datetime) -> Path:
         """F-3 是正 (検収 task12、設計書 §4.2 改訂): 最終レポート名は
@@ -1608,6 +1627,17 @@ class ImproveLoop:
                         return
             with open(index_path, "a") as fh:
                 if is_new:
+                    # approval-quality 設計書 §B (2026-09-12、
+                    # [archive-index-naming]): この見出しは「終端ログ」で
+                    # あって承認可否の目録ではない旨を明記する — approval
+                    # 終端 (T-B で追加) も 1 行だけ載るため、この一覧に
+                    # 無いことは「未承認」を意味しない。GC はこのファイルを
+                    # 更新しない。承認済み候補の正 (authoritative source)
+                    # は `candidate_archives` 表と `approval_requests` 表。
+                    fh.write(
+                        "終端ログ (GC 非対象)。承認可否の目録ではない。"
+                        "承認済み候補の正は `candidate_archives` 表と "
+                        "`approval_requests` 表である。\n\n")
                     fh.write(
                         "| date | mission | status | candidates | best | "
                         "archive |\n")
@@ -1877,6 +1907,17 @@ class ImproveLoop:
                     str(mission_id))
             if ctx is not None:
                 ctx.ledger.mark_persisted()
+            # approval-quality 設計書 §B (2026-09-12、
+            # [archive-index-naming]): approval 終端も INDEX.md へ 1 行
+            # 残す — `_settle_ledger_after_commit` (report/observation/
+            # failed/output_invalid/gate_failed/commit_failed 系) だけが
+            # 呼んでいた既存の `_write_archive_index_safe` を、外側 commit
+            # 成功後のここでも呼ぶ (二重書き防止のロックは
+            # `_append_archive_index` 内の既存プロセス内 lock がそのまま
+            # 効く)。`ctx` は直接呼び出し (単体テスト) で `None` になり
+            # うるため、常に `mission_id` を持つ `persist_ctx` を渡す。
+            self._write_archive_index_safe(
+                conn, ctx=persist_ctx, status="approval", now=now)
         # C6 裁定 (2026-08-28、束D検収 verified-local-round1.md §7、
         # 現状維持): 内側 tx は `except BaseException:` (rollback して
         # 必ず re-raise) だが、この外側の補償トリガーは意図的に
@@ -2111,6 +2152,35 @@ class ImproveLoop:
                     backlog_id=selection.backlog_id,
                     candidate_origin="staging", candidate_path=candidate_path,
                     gate_metrics=gate_metrics, output=output, now=now)
+
+                # approval-quality 設計書 §A (2026-09-12): approval payload
+                # 組み立て直後・提出前に質検査を挟む。indicator は成績
+                # (trades/pf/avg_r) を持たないため対象外 (kind=='strategy'
+                # のときだけ gate_metrics['in_sample'] が pair→metrics の
+                # dict を持つ)。複数 pair の候補は pair ごとに検査し、
+                # いずれか 1 pair でも既承認候補と一致すれば候補全体を
+                # observation へ倒す (実装時点の未決事項 — 設計書は単一
+                # pair を前提にした記述のみで多 pair の合成方針を明示
+                # していない)。
+                if kind == "strategy":
+                    eval_source = self._settings.backtest.eval_source
+                    eval_base_interval = (
+                        self._settings.backtest.dataset().base_interval)
+                    for pair, pair_metrics in (
+                            gate_metrics.get("in_sample") or {}).items():
+                        duplicate_of = self._check_duplicate_metrics(
+                            conn, content_hash=gate_verdict.content_hash,
+                            pair=pair, variant="candidate",
+                            source=eval_source,
+                            base_interval=eval_base_interval,
+                            metrics=pair_metrics)
+                        if duplicate_of is not None:
+                            approval_payload = None
+                            artifact = {
+                                "type": "observation",
+                                "reason": f"duplicate_metrics_of:{duplicate_of}",
+                            }
+                            break
 
             report_path = None
             if approval_payload is None:

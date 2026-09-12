@@ -548,6 +548,58 @@ def test_approval_detail_missing_metrics_show_dash(tmp_path):
     assert "holdout: -" in out
 
 
+def test_approval_detail_shows_archive_path_by_mission_content_hash(tmp_path):
+    """approval-quality 設計書 §C ([archive-artifact-hash-vs-submitted]):
+    `approval <id>` は payload の `mission_id`/`content_hash` で
+    `candidate_archives` を引き、`archive=<path>` を出力に追加する。
+    run12 観測 C の実データ形 — payload の `artifact_hash` は self-test
+    書き直しでずれるため、archive 行自体は別の `artifact_hash` を持つ
+    (それでも content_hash が一致すれば引ける)。"""
+    from agentic_fx.store import candidate_archives
+    conn, _, _, cmds = _commands(tmp_path)
+    candidate_archives.insert(
+        conn, mission_id=5, name="sma_cross_usdjpy",
+        content_hash="stable-content", artifact_hash="artifact-at-backtest",
+        archive_path="plugins/_archive/5/artifact-at-backtest",
+        pair="USDJPY", metrics={"pf": 1.25}, now=NOW, commit=True)
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "sma_cross_usdjpy", "mission_id": 5,
+                "content_hash": "stable-content",
+                "artifact_hash": "artifact-submitted-different"},
+        now=NOW)
+
+    out = cmds.dispatch(f"approval {approval_id}")
+
+    assert "archive=plugins/_archive/5/artifact-at-backtest" in out
+
+
+def test_approval_detail_shows_archive_unknown_when_no_archive_row(tmp_path):
+    """GC 済み・失敗終端等で archive 行が無いとき「archive 不明」を明示。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "myind", "mission_id": 99, "content_hash": "h1"},
+        now=NOW)
+
+    out = cmds.dispatch(f"approval {approval_id}")
+
+    assert "archive=不明" in out
+
+
+def test_approval_detail_shows_archive_unknown_when_payload_lacks_identity(
+        tmp_path):
+    """旧 payload に `mission_id`/`content_hash` が欠けていても例外にせず
+    「archive 不明」を出す。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    approval_id = approvals.create(
+        conn, kind="plugin", payload={"name": "myind"}, now=NOW)
+
+    out = cmds.dispatch(f"approval {approval_id}")
+
+    assert "archive=不明" in out
+
+
 def test_approval_detail_unknown_id_reports_not_found(tmp_path):
     _, _, _, cmds = _commands(tmp_path)
     out = cmds.dispatch("approval 999")
