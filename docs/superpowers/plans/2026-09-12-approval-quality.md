@@ -1,0 +1,118 @@
+# 承認品質・運用導線 実装プラン v1 (設計書 = `2026-09-12-approval-quality-design.md` 準拠)
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) または superpowers:executing-plans で task ごとに実行すること。
+
+**Goal:** 設計書 v1 の A (成績一致候補の質検査) / B (INDEX.md に approval 終端も 1 行) / C (archive 引き当てキー) / D (mission prompt の stdin 渡し) を実装する。**設計を変えない** — 曖昧な箇所は各 task 末尾の「執筆時の未決事項」に列挙する。
+
+**Architecture:** 4 task を 2 束に分ける。**T-A/T-B/T-C は 1 worktree で直列** (いずれも `loops/improve_loop.py` の `_finalize_success` 近傍・`store/backtest_runs.py` / `store/candidate_archives.py` を触るため、同一ファイルへの衝突を避ける)。**T-D は別 worktree で並列可** (`runners/claude_runner.py` / `runners/codex_runner.py` / `runners/cli_runner.py` のみを触り、A〜C と重ならない)。決定論的コアの判定ロジック (Risk Gate・approval 決定) は全 task で不変。
+
+**Tech Stack:** Python 3.13 / uv / pytest / sqlite3 (既存 schema への追加のみ、破壊的 migration なし)
+
+## Global Constraints
+
+- **Anthropic API (従量課金) は使用不可**。Claude 利用は `claude -p` (サブスク認証) のみ
+- 発注・SL 変更・クローズ・資金保護は本プランの対象外 (改善ループの経路に閉じる)
+- T-D の変更は **argv からプロンプト文字列を除くだけ**で、Landlock の allowlist・遮断 8 項目には触れない
+- `plugins/`・`config/`・`data/` はコミット対象外のまま (本プランは `src/` と `docs/` のみ変更)
+
+## §0. 先行する実機 run — 失敗終端の実証
+
+ledger 設計書 (`2026-09-10-ledger-preserve-design.md`) §3 の全終端表は `failed` / `timeout` / `output_invalid` 終端でも台帳・archive・INDEX が保全される設計だが、**A4 10〜13 回目では未観測**(`2026-09-10-ledger-preserve-design.md` 変更履歴の最終行、「失敗終端の永続化は未観測」)。T-B (INDEX への approval 行追加) と併せて INDEX.md の全終端網羅を検収するには、失敗終端を実機で 1 回は起こす必要がある。
+
+**実施内容 (T-A〜T-D 着手前、または並行して実施可)**:
+1. `config/settings.yaml` の `improve.tool_budget.max_tool_calls` を一時的に **6** に絞り、backtest 1 回に満たない予算で mission を強制的に abort させる ([mission-abort-on-tool-budget] の Tier F と同じ機構)
+2. improve mission を 1 回発火し、`failed` (`tool_budget_abort:*`) 終端で `backtest_runs (mission_outcome='failed')` / `candidate_archives` (backtest が 1 回でも成功していれば) / `plugins/_archive/INDEX.md` の行が揃うことを確認
+3. 終了後は `max_tool_calls` を既定値に戻す (設定は個人設定 `config/settings.yaml` のため、変更・復元は運用操作でありコミット対象外)
+4. 結果は `tmp/a4-run14-failed-*.md` に記録 (書式は run10〜13 の CP 実値表を踏襲)
+
+この run は T-A〜T-D の実装成否を左右しないため、**着手前に必須ではないが、T-B の検収 (INDEX.md が全終端を網羅すること) の材料として実装完了までに 1 回は実施する**。
+
+## T-A: 成績一致候補の質検査 [candidates-converge-to-example-sma]
+
+**対応**: 設計書 §A
+
+**変更**:
+- `store/backtest_runs.py`: `find_matching_approved_metrics(conn, *, pair, variant, source, base_interval, trades, pf, avg_r)` を新設。`scope='in_sample' AND variant='candidate' AND mission_outcome='approval'` に絞り、`FLOAT_TOL` (`store/db.py:409`) で `(trades, pf, avg_r)` を比較
+- `loops/improve_loop.py`: `_finalize_success` 手前 (gate_metrics 確定後・approval_payload 組み立て前) に質検査を挟み、一致時は `approval_payload = None` のまま `_finalize_report_or_observation` へ回す。`last_result="duplicate_metrics_of:<content_hash>"`
+- system note 文面組立箇所: 具体パラメータ (fast/slow 等) を note に出さない
+
+**完了条件**:
+- [ ] pin: 一致 → observation + `duplicate_metrics_of` / 不一致 (3 値のうち 1 つでも異なる) → approval 継続 / `avg_r=None` 同士の一致 / `FLOAT_TOL` 境界値
+- [ ] 逆変異 red: 比較演算子反転 / 3 値のうち 1 つを比較から除外 / `mission_outcome='approval'` 絞りの除去
+- [ ] フルスイート green
+
+## T-B: INDEX.md に approval 終端も 1 行 [archive-index-naming]
+
+**対応**: 設計書 §B。**T-A の後**に着手 (T-A が observation に倒した候補は approval 経路を通らないため、INDEX 行が増えるのは approval に残った候補のみ — 順序が逆だと「質検査で弾かれた候補」も approval 行として INDEX に載る事故になる)
+
+**変更**:
+- `loops/improve_loop.py::_finalize_success`: 外側 commit 成功後に `_write_archive_index_safe(conn, ctx=ctx, status="approval", now=now)` を追加
+- `plugins/_archive/INDEX.md` のヘッダテンプレート: 「終端ログ (GC 非対象)。正は `candidate_archives`」を追記
+
+**完了条件**:
+- [ ] pin: approval 終端後に INDEX.md へ 1 行追加 (mission_id/status=approval/候補数/best) / 二重終端 (commit 失敗補償の再試行) で行が重複しない (既存プロセス内 lock の対象に approval 経路が含まれることを確認) / 既存の report/observation/failed 系の行フォーマットと列が揃う
+- [ ] 逆変異 red: `status="approval"` を渡さない分岐 / lock 除去
+- [ ] フルスイート green
+
+## T-C: archive 引き当てキー [archive-artifact-hash-vs-submitted]
+
+**対応**: 設計書 §C。T-A/T-B と独立性が高いが同一ファイル (`improve_loop.py`) を触るため同 worktree の直列で最後に置く
+
+**変更**:
+- `store/candidate_archives.py`: `find_by_mission_content(conn, *, mission_id, content_hash) -> CandidateArchiveRow | None` を新設
+- `commands.py::_approval_detail`: payload の `mission_id`/`content_hash` で `find_by_mission_content` を呼び、`archive=<path>` 行を出力に追加。無ければ「archive 不明」
+
+**完了条件**:
+- [ ] pin: `content_hash` 一致・`artifact_hash` 不一致 (run12 実データ形のフィクスチャ) で archive が引ける / archive 無し (GC 済み・失敗終端) の表示 / 同一 mission 複数候補で指定 `content_hash` の 1 件だけ返る
+- [ ] 逆変異 red: 検索キーを `artifact_hash` に戻す
+- [ ] フルスイート green
+
+## T-D: prompt を stdin 渡しに [mission-prompt-in-argv-readable-via-proc]
+
+**対応**: 設計書 §D。**別 worktree で T-A〜T-C と並列可**
+
+**変更**:
+- `runners/claude_runner.py::_build_argv`: `mission.prompt` を argv から除去 (`-p` のみ残す)
+- `runners/codex_runner.py::_build_argv`: `mission.prompt` を argv から除去 (`exec` のみ残す)
+- `runners/cli_runner.py`: `workdir/prompt.txt` (0600) を書き、`_run_cli_process` の `stdin=` を現行の `devnull_r` パターンから `os.open(prompt_path, os.O_RDONLY)` に変更
+- 既存の argv pin テスト: 「argv に prompt 文字列を含む」前提を「含まない」へ反転
+
+**完了条件**:
+- [ ] pin: argv に prompt の一部が含まれない / `prompt.txt` が 0600 で書かれ内容が一致 / stdin fd がそのファイルを指す (fake Popen)
+- [ ] 逆変異 red: prompt を argv に戻す
+- [ ] **実機確認 (要実測、各 CLI 実ターン 1 回まで)**: claude `-p` が stdin からの prompt を受理して mission 完走 / codex `exec` が stdin からの prompt を受理して mission 完走。**いずれか不成立ならその backend だけ現行 argv 渡しに残し、起票して報告する** (設計を強行しない)
+- [ ] フルスイート green
+
+## レビュー段
+
+1. **段 0 (指揮者の変異スイープ)** — レビュー前に必ず回す。T-A/T-B/T-C 束と T-D 束それぞれで実施
+2. **1 周目**: codex + ローカル LLM 3 本 (枠ゼロ、並列可)
+3. **2 周目**: `/code-review high` + codex + ローカル 3 本
+4. `/code-review high` は指揮者から起動できないため**ユーザーに打ってもらう**。有償 2 本 (`/code-review` と sonnet) は並列にしない
+5. **3 周目 (must-fix のみ)**: ブリーフ付き sonnet。1〜2 周目で must-fix (Critical/Important) が出た場合のみ実施。Critical/Important 0 なら 2 周で収束とする
+
+## 実機確認 (A4 14 回目)
+
+- **codex 1 ターン**で T-A/T-B/T-C を検収: 質検査が発火する状況を作る (backlog に fast=10/slow=30 系の note が残る環境、または run12/13 の再現) → observation `duplicate_metrics_of` を確認 / それとは別に承認に至る候補があれば INDEX.md の approval 行と `afx> approval <id>` の archive 表示を確認
+- **claude 1 ターン**で T-D を検収: mission 走行中に `/proc/<pid>/cmdline` を読み、prompt が含まれないことを確認 (run11 で確認した「読めてしまう」の反証)
+- 実施前提: §0 の失敗終端 run (`tmp/a4-run14-failed-*.md`) を完了していること
+
+## 進捗表
+
+| task | 状態 | commit | 備考 |
+|---|---|---|---|
+| §0 失敗終端 run | 未着手 | - | `tmp/a4-run14-failed-*.md` |
+| T-A 質検査 | 未着手 | - | |
+| T-B INDEX approval 行 | 未着手 | - | T-A の後 |
+| T-C archive 引き当て | 未着手 | - | |
+| T-D prompt stdin | 未着手 | - | 別 worktree、並列可 |
+| レビュー 1 周目 | 未着手 | - | |
+| レビュー 2 周目 (`/code-review high`) | 未着手 | - | ユーザー起動 |
+| レビュー 3 周目 | 未着手 (must-fix 時のみ) | - | |
+| A4 14 回目 (実機確認) | 未着手 | - | |
+
+## 変更履歴
+
+| 日付 | 版 | 変更 | 理由 (レビュー指摘 / 実機観測 / 裁定) | commit |
+|---|---|---|---|---|
+| 2026-09-12 | v1 | 起案。T-A〜T-D の task 分割 (A〜C 直列 1 worktree、D 並列別 worktree)、§0 に失敗終端実証 run を追加、レビュー段・実機確認・進捗表を規定 | 設計書 `2026-09-12-approval-quality-design.md` v1 のユーザー承認 (2026-09-12) を実装プランへ写す | - |

@@ -920,3 +920,14 @@ window=120` が恒久的に `insufficient_data` になる (D1 の再発防止 pi
 5. `plugin_versions` = 初回 provenance / GC root、switch ジャーナル + activity = rollback 履歴、の所有分離 (`INSERT OR IGNORE` で消える行を監査に使わない)
 6. risk_gate proposal の exact key / type / range / pair schema、導出 `affected_pairs` と `affected_strategies`、strategy × pair の単一再生、baseline と candidate **双方**の strategy ごと最低取引数、deep-merge 後の全体 validation、`backtest_runs` の identity 対応
 7. wave slot の再開機構 (`started_at`・全 failed wave の削除で period を返す・`claimed→reserved` の同 period 再開) の SQL state machine と、wave 作成〜Tx-0〜spawn〜ready の各 crash fault point
+
+---
+
+## 変更履歴
+
+| 日付 | 版 | 変更 | 理由 (レビュー指摘 / 実機観測 / 裁定) | commit |
+|---|---|---|---|---|
+| 2026-08-16 | 初版 | ClaudeRunner + CodexRunner + 戦略改善 loop の設計 (probe 実測 + 裁定 9 件を反映)。以降 codex 設計レビュー 14 周・R12 スコープ縮小を経て 2026-08-17 に収束宣言 | probe 実測 (`probe-runner-feasibility-report.md`) とユーザー裁定 R1〜R12 | `f2876b8`〜`536de27` |
+| 2026-09-08 | §1.6 改訂 | improve + claude の `--allowedTools` を `mcp__afx__*` のみへ変更 (旧 `mcp__afx__*,Bash,Read,Write,Edit,Glob,Grep` を廃止)。組み込みツールは worker の registry = ツール予算と abort の発火点を迂回するため | [mission-abort-on-tool-budget] design v4、`/code-review high` 2 周目 (`tmp/review-20260908-ma-r2/code-review-high.md`) | `7c6e049` |
+| 2026-09-10 | §3.4・§3.6・§4.1 改訂 | 監査境界を dispatcher (RPC 受理直後) に是正し、全終端で RPC 台帳を永続化 (`mission_outcome` 列・`PERSIST_FAILED` 状態) する形へ改訂。ledger 設計書 v6 の内容を本体設計書へ反映 | [gate-failed-ledger-discarded] 設計 v6 (`2026-09-10-ledger-preserve-design.md`)、動機は run9 #67 の候補破棄観測 | `29f260e` |
+| 2026-09-11〜12 | (本文未反映、次版予告) | claude backend の `--tools` allowlist を組み込み可用性ベースへ絞り込み (`StructuredOutput,ToolSearch`、`Read` も外し MCP `read_*` に一本化) / codex backend の RLIMIT_AS を 256GB に引き上げ (V8 sandbox の SIGTRAP 原因が確定) / `tool_calls=N` を report/approval 双方の可視化に統一。**本書 §1.6/§1.4 相当箇所への反映は次版で行う** | backend-fix codex 1 周目 (`tmp/backend-fix/codex-r1.md`)、codex-host-probe 実測 (`tmp/codex-host-probe/findings.md`)、A4 10〜12 回目実機観測 | `244559c`, `b8004d9`, `2801614` |
