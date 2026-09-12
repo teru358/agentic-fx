@@ -139,14 +139,26 @@ def test_exec_closure_targets_include_the_running_python_for_all_backends():
 def _run_bootstrap_probe(script: str, *, staging_dir: Path, mission_id: str,
                          source_snapshot_dir: Path, workdir: Path,
                          backend: str = "local",
-                         extra_env: dict | None = None) -> subprocess.CompletedProcess:
+                         extra_env: dict | None = None,
+                         isolate_transcripts_dir: bool = True,
+                         ) -> subprocess.CompletedProcess:
     """`_bootstrap_improve_profile` を子プロセスで呼び、続けて `script` を
     実行する。子プロセス 1 個 = 検査 1 件 (Landlock 不可逆のため)。
     **`cwd` は明示的に `workdir` を渡す** — `staging_dir` の祖先 (`repo/
     plugins/`) を cwd にすると、`_bootstrap_improve_profile` が
     `Path.cwd()` を rw allowlist に加える際にその祖先ごと書込可能になり、
     `plugins/` 全体が書ける事故を自己生産してしまう (5-E で顕在化する
-    穴と同じ — ここでは fixture 側で作らない)。"""
+    穴と同じ — ここでは fixture 側で作らない)。
+
+    T1(a) 是正 (test-hygiene 設計書 2026-09-12): `isolate_transcripts_dir`
+    (既定 True) のとき `AGENTIC_FX_MISSION_TRANSCRIPTS_DIR` を
+    `workdir` 配下 (tmp_path 由来) の隔離先に向けて子プロセスの env に
+    渡す — `_bootstrap_improve_profile` は別プロセスなので親プロセスの
+    `cli_runner._TRANSCRIPT_DIR_DEFAULT` monkeypatch (`tests/conftest.py`)
+    が届かず、環境変数だけがこの別プロセスを隔離できる唯一の経路。
+    `test_bootstrap_improve_profile_mission_transcript_dir_is_writable`
+    は実リポジトリの `logs/mission-transcripts/` との座標一致を検証する
+    のが主旨のため `isolate_transcripts_dir=False` を渡し、隔離しない。"""
     # ローカル backend-fix 1 周目 #L1 (2026-09-11): `PYTHONPATH` が与えられて
     # いるときは子の sys.path 先頭に実 src を差し込まない — 段 0 の変異
     # overlay (`PYTHONPATH=overlay/src`) をこの probe にも効かせるため
@@ -173,6 +185,9 @@ def _run_bootstrap_probe(script: str, *, staging_dir: Path, mission_id: str,
         env["PYTHONPATH"] = os.pathsep.join(
             str(Path(entry).resolve()) for entry in
             parent_pythonpath.split(os.pathsep) if entry)
+    if isolate_transcripts_dir:
+        isolated_transcripts_dir = workdir / "mission-transcripts-isolated"
+        env["AGENTIC_FX_MISSION_TRANSCRIPTS_DIR"] = str(isolated_transcripts_dir)
     env.update(extra_env or {})
     return subprocess.run([sys.executable, "-c", full_script],
                           cwd=str(workdir), env=env,
@@ -275,7 +290,18 @@ def test_bootstrap_improve_profile_mission_transcript_dir_is_writable(
     と、`tests/conftest.py::_isolate_mission_transcripts_default_dir`
     (セッション全体で親プロセスのその属性を隔離先へ monkeypatch する
     fixture) の影響を受けてしまい、子 (別プロセス、monkeypatch 不到達)
-    が実際に書いた実リポジトリの座標と食い違う。"""
+    が実際に書いた実リポジトリの座標と食い違う。
+
+    T1(b) 是正 (test-hygiene 設計書 2026-09-12, fresh worktree では
+    `logs/mission-transcripts/` がそもそも存在しない): `_bootstrap_
+    improve_profile` はこのディレクトリが無ければ `mkdir(parents=True)`
+    で新規作成する。fresh worktree でこのテストを実行すると、マーカー
+    ファイルを消すだけではディレクトリ自体が新規に残ってしまい、
+    `tests/conftest.py::_guard_real_mission_transcripts_dir_is_never_
+    touched` (session 前後のスナップショット比較) が ERROR になる。
+    このテストが**このディレクトリを新規作成した側**である場合は、
+    マーカー削除後にディレクトリごと rmdir して session 開始時点の
+    状態 (無い) へ戻す。"""
     l = improve_worker_layout
     marker_name = f"landlock-probe-{uuid.uuid4().hex}.txt"
     script = f"""
@@ -286,16 +312,23 @@ def test_bootstrap_improve_profile_mission_transcript_dir_is_writable(
     """
     real_dir = _REPO_ROOT / "logs" / "mission-transcripts"
     marker_path = real_dir / marker_name
+    real_dir_pre_existed = real_dir.is_dir()
     try:
         result = _run_bootstrap_probe(
             script, staging_dir=l["staging_dir"], mission_id=l["mission_id"],
-            source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"])
+            source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"],
+            isolate_transcripts_dir=False)
         assert result.returncode == 0, result.stderr
         assert "TRANSCRIPT_DIR_WRITABLE" in result.stdout
         assert marker_path.is_file()
         assert marker_path.read_text() == "ok"
     finally:
         marker_path.unlink(missing_ok=True)
+        if not real_dir_pre_existed:
+            try:
+                real_dir.rmdir()
+            except OSError:
+                pass
 
 
 def test_bootstrap_improve_profile_rejects_staging_dir_mission_id_mismatch(
@@ -360,7 +393,17 @@ def test_bootstrap_improve_profile_fails_closed_when_exec_closure_dirs_reach_dat
             claude_bin=None, codex_bin=None)
         print('SHOULD_NOT_REACH')
     """)
-    env = {"PATH": "/usr/bin:/bin"}
+    # T1(a)/(b) 是正 (test-hygiene 設計書 2026-09-12): このテストは
+    # `_run_bootstrap_probe` を経由せず直接 `subprocess.run` を組み立てる
+    # ため、隔離用の `AGENTIC_FX_MISSION_TRANSCRIPTS_DIR` 環境変数が付か
+    # ないまま `_bootstrap_improve_profile` の mkdir (fail closed の
+    # `_assert_allowlist_excludes_data_dir` より前で実行される) が実
+    # `logs/mission-transcripts/` を毎回作っていた (repo root 直下の
+    # untracked 残骸 — `_guard_repo_root_has_no_new_untracked_files` が
+    # 検出する対象そのもの)。他の probe と同じ隔離先を明示する。
+    env = {"PATH": "/usr/bin:/bin",
+           "AGENTIC_FX_MISSION_TRANSCRIPTS_DIR":
+               str(l["workdir"] / "mission-transcripts-isolated")}
     result = subprocess.run([sys.executable, "-c", full_script],
                             cwd=str(l["workdir"]), env=env,
                             capture_output=True, text=True, timeout=30)

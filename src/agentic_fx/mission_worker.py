@@ -72,9 +72,17 @@ from agentic_fx.runners import factory as runner_factory
 # 座標がずれて allowlist が空振りする — `_guarded_data_dir` が禁じている
 # のとは逆に、こちらは**一致**させたい)。cli_runner.py は mission_worker
 # を `run()` 内でしか (遅延) import しないため循環 import にならない。
-from agentic_fx.runners.cli_runner import (
-    _TRANSCRIPT_DIR_DEFAULT as _MISSION_TRANSCRIPT_DIR, _normalize_reason,
-)
+#
+# T1(a) 是正 (test-hygiene 設計書 2026-09-12): 以前はここで
+# `_TRANSCRIPT_DIR_DEFAULT as _MISSION_TRANSCRIPT_DIR` という**値コピー**
+# import をしていた。`tests/conftest.py` の session fixture が書き換える
+# のは `cli_runner` モジュール属性であって、この別名の束縛ではないため、
+# `_bootstrap_improve_profile` の mkdir (下記) は monkeypatch を素通り
+# して実 `logs/mission-transcripts/` に書いていた。`cli_runner` モジュール
+# ごと import し、使用箇所で `cli_runner._TRANSCRIPT_DIR_DEFAULT` を
+# **都度参照**する形に変える。
+from agentic_fx.runners import cli_runner
+from agentic_fx.runners.cli_runner import _normalize_reason
 # A-4 検収是正 (2026-08-22, B1): McpShimDispatcher の module level import。
 # `_start_mcp_dispatcher` から使う。ToolRegistry も同様に module level へ
 # 上げる (`_build_improve_registry` の型注釈・既定実装で使うため — 従来
@@ -248,13 +256,18 @@ def _bootstrap_improve_profile(
     # (`CliRunner._save_transcript` 側の「保存失敗で mission を落とさない」
     # 規範と対称。作成できなければ rw allowlist にも加えない — 存在しない
     # dir はそもそもルール化できない)。
+    # T1(a): `cli_runner._TRANSCRIPT_DIR_DEFAULT` を都度参照する (値コピー
+    # にしない) — 同一プロセス内の monkeypatch (`tests/conftest.py`) にも
+    # `AGENTIC_FX_MISSION_TRANSCRIPTS_DIR` 環境変数経由の子プロセス隔離
+    # (別プロセスで起動される bootstrap probe 用) にも両方追従する。
     extra_rw_paths: list[Path] = []
+    transcript_dir = cli_runner._TRANSCRIPT_DIR_DEFAULT
     try:
-        _MISSION_TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+        transcript_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
     else:
-        extra_rw_paths.append(_MISSION_TRANSCRIPT_DIR)
+        extra_rw_paths.append(transcript_dir)
 
     _assert_allowlist_excludes_data_dir(
         read_only + [workdir, staging_path] + extra_rw_paths

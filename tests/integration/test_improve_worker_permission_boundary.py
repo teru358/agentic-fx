@@ -95,8 +95,17 @@ def _run_probe(script: str, *, staging_dir: Path, mission_id: str,
             source_snapshot_dir={str(source_snapshot_dir)!r},
             claude_bin=None, codex_bin=None)
     """) + "\n" + _EACCES_PRELUDE + "\n" + textwrap.dedent(script)
+    # T1(a) 是正 (test-hygiene 設計書 2026-09-12): `_bootstrap_improve_
+    # profile` は fail-closed 検査の前に (無条件で) transcript 保存先を
+    # mkdir する。この probe は別プロセスなので `tests/conftest.py` の
+    # 親プロセス monkeypatch が届かず、隔離用環境変数で子自身に伝える
+    # 必要がある (`tests/test_mission_worker.py::_run_bootstrap_probe`
+    # と同じ手当て)。
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(workdir / "home"),
+           "AGENTIC_FX_MISSION_TRANSCRIPTS_DIR":
+               str(workdir / "mission-transcripts-isolated")}
     return subprocess.run([sys.executable, "-c", full], cwd=str(workdir),
-                          env={"PATH": "/usr/bin:/bin", "HOME": str(workdir / "home")},
+                          env=env,
                           capture_output=True, text=True, timeout=30)
 
 

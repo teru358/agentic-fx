@@ -292,48 +292,6 @@ def _check_service_initial_env_has_no_secrets(
             "(R10). Put secrets in .env, not exported shell env.")
 
 
-def _check_codex_subscription_expiry(auth_file: str, *, clock=None) -> None:
-    """検査④ (設計書 §1.4、裁定 R4): codex+chatgpt の `auth_file` 内
-    `chatgpt_subscription_active_until` を読み、期限切れなら起動拒否
-    (ERROR)、7 日以内なら WARNING ログのみで起動は継続する。キー欠落・
-    読み取り不能・形式不正は WARNING に留める (fail closed にしない —
-    `auth.json` の形式は実測できていないため、裁定 R4 に従い誤検出で
-    起動不能にしない)。`clock` はテスト注入用 (既定 `datetime.now(UTC)`)。"""
-    import json as _json
-
-    _logger = logging.getLogger("agentic_fx.service")
-    now = (clock or (lambda: datetime.now(timezone.utc)))()
-    path = Path(auth_file).expanduser()
-    try:
-        raw = _json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        _logger.warning(
-            "codex auth.json (%s) を読めない: %s — chatgpt_subscription_active_until "
-            "を検査できない (fail closed にしない、裁定 R4)", path, e)
-        return
-    value = raw.get("chatgpt_subscription_active_until") if isinstance(raw, dict) else None
-    if value is None:
-        _logger.warning(
-            "codex auth.json (%s) に chatgpt_subscription_active_until が無い "
-            "— サブスク期限を検査できない (形式未実測、裁定 R4)", path)
-        return
-    try:
-        active_until = datetime.fromisoformat(value)
-        if active_until.tzinfo is None:
-            active_until = active_until.replace(tzinfo=timezone.utc)
-    except (TypeError, ValueError) as e:
-        _logger.warning(
-            "chatgpt_subscription_active_until の形式が不正: %r (%s)", value, e)
-        return
-    if active_until <= now:
-        raise RuntimeError(
-            f"codex chatgpt subscription expired at {active_until.isoformat()} "
-            "— renew before starting improve+codex")
-    if active_until - now <= timedelta(days=7):
-        _logger.warning(
-            "codex chatgpt subscription expires soon: %s", active_until.isoformat())
-
-
 def _check_cli_backend(settings, *, which: str):
     """<!-- precheck 2026-08-22: T1-M14 --> CLI backend 起動時検査 ①②③⑤
     (設計書 §1.4)。`which` は `"trade"` か `"improve"` — `getattr(settings.runner,
@@ -383,7 +341,15 @@ def _check_cli_backend(settings, *, which: str):
         if settings.runner.codex.provider == "chatgpt":
             _check_credentials_file(settings.runner.codex.auth_file,
                                     label="codex")
-            _check_codex_subscription_expiry(settings.runner.codex.auth_file)
+            # T4 是正 (test-hygiene 設計書 2026-09-12、指揮者裁定): 旧
+            # `_check_codex_subscription_expiry` は撤去した — 実
+            # `~/.codex/auth.json` (codex CLI 0.150.1) のトップレベル
+            # キーは `auth_mode`/`OPENAI_API_KEY`/`tokens`/`last_refresh`
+            # のみで `chatgpt_subscription_active_until` は存在せず、
+            # 4 run 連続で「キーが無い」WARNING が空振りしていた
+            # (期限相当の情報がこのスキーマに無い)。期限切れは codex 自身
+            # が実行時に 401/usage limit で返すのに任せ、その応答を
+            # `cli_runner.CLI_STDERR_FATAL_PATTERNS` で検知する。
         settings = settings.model_copy(update={
             "runner": settings.runner.model_copy(update={
                 "codex": settings.runner.codex.model_copy(

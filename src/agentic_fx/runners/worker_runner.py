@@ -50,7 +50,16 @@ RPC_ABANDONED_ATTR = "rpc_abandoned"
 
 def _mission_worker_env(worker_profile: str) -> dict[str, str]:
     """R10-①: trade 資格情報も env では渡さない。全 profile 共通で
-    `plugin/sandbox.py:_build_env()` の最小 env のみ返す。"""
+    `plugin/sandbox.py:_build_env()` の最小 env のみ返す。
+
+    **意図的にこれ以外の env は足さない** (`test_mission_worker_env_
+    delegates_entirely_to_build_env` が「委譲が集合一致であること」を
+    pin している — R10-① の裏返し: 子へ渡す env を最小に保つこと自体が
+    情報漏えい対策)。test-hygiene 是正で一度
+    `AGENTIC_FX_MISSION_TRANSCRIPTS_DIR` を条件付きで足す案を検討したが
+    この pin と正面衝突したため撤回した。実 mission_worker 子プロセスの
+    transcript 保存先隔離が必要なテストは、`_mission_worker_env` を
+    monkeypatch する側 (テストコード) の責務とする。"""
     return _build_env()
 
 

@@ -510,6 +510,22 @@ def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
     """
     import io as _io
 
+    # T1(b) 是正 (test-hygiene 設計書 2026-09-12): `main()` は `Path.cwd()`
+    # を Mission workdir として使う (本番では `WorkerRunner` が専用 tempdir
+    # へ `Popen(cwd=...)` する契約 — mission_worker.py:169,777,911,913)。
+    # ここでは `main()` を in-process で直接駆動するため、chdir しない
+    # backend=claude/codex の呼び出しは実行中の pytest プロセスの cwd
+    # (= repo/worktree root) をそのまま Mission workdir に使ってしまい、
+    # `ClaudeRunner._build_argv`/`CodexRunner._build_argv` が実際に
+    # `mcp.json`/`schema.json` を repo root へ書く事故になっていた
+    # (`test_main_bumps_as_mb_for_improve_backend_codex` が `schema.json`
+    # を、`test_main_does_not_bump_as_mb_for_improve_backend_claude_or_local
+    # [claude]` が `mcp.json` を残す — 一部のテストは個別に
+    # `monkeypatch.chdir(tmp_path)` していたが全呼び出しに漏れなく効かせる
+    # ため `_drive_main` 自体で行う。個別に既に chdir している呼び出し元は
+    # 二重 chdir になるだけで無害)。
+    monkeypatch.chdir(tmp_path)
+
     from agentic_fx.store.db import connect, init_db
 
     db_path = tmp_path / "t.db"

@@ -96,6 +96,32 @@ def test_rpc_serialization_failure_returns_error_and_dispatcher_survives(
     ]
 
 
+def _isolate_real_mission_worker_transcripts_dir(monkeypatch, tmp_path):
+    """T1(a) 是正 (test-hygiene 設計書 2026-09-12): 実 `mission_worker`
+    子プロセスを spawn するテスト (`landlock_available()` skip ガードが
+    付いた `test_real_improve_worker_*` 系) は `WorkerRunner._mission_
+    worker_env` (= `plugin/sandbox._build_env()` の最小 env、意図的に
+    それ以外を足さない — R10-① / `test_mission_worker_env_delegates_
+    entirely_to_build_env` pin) をそのまま子へ渡す。子は別プロセスなので
+    `tests/conftest.py` の session fixture (親プロセスの `cli_runner.
+    _TRANSCRIPT_DIR_DEFAULT`/`os.environ` monkeypatch) が届かず、
+    `_bootstrap_improve_profile` が実 `logs/mission-transcripts/` を
+    mkdir してしまう (fresh worktree で `_guard_real_mission_transcripts_
+    dir_is_never_touched` が ERROR になる実例)。**この 1 テストに限り**
+    `_mission_worker_env` を monkeypatch し、隔離用環境変数を子へ渡す —
+    `_mission_worker_env` 自身 (`_build_env()` への完全委譲という pin) は
+    変えない。"""
+    from agentic_fx.runners.worker_runner import _mission_worker_env as _original
+    isolated_dir = str(tmp_path / "mission-transcripts-isolated")
+
+    def _patched(worker_profile):
+        env = dict(_original(worker_profile))
+        env["AGENTIC_FX_MISSION_TRANSCRIPTS_DIR"] = isolated_dir
+        return env
+
+    monkeypatch.setattr(wr_mod, "_mission_worker_env", _patched)
+
+
 def _root(tmp_path):
     import shutil
     root = tmp_path / "root"
@@ -3684,7 +3710,8 @@ def test_source_snapshot_dir_origin_symlink_is_fail_closed(tmp_path, monkeypatch
         "いない")
 
 
-def test_real_improve_worker_ready_then_on_ready_then_result_ordering(tmp_path):
+def test_real_improve_worker_ready_then_on_ready_then_result_ordering(
+        tmp_path, monkeypatch):
     """R-D1/RW1 pin (c): 実プロセスの `mission_worker.py` (improve profile) を
     本物の `WorkerRunner` で起動し、`ready` → `on_ready` → `go` (実フレーム、
     親側 `WorkerRunner.run()` が on_ready 完了直後に送出) → `result` の
@@ -3695,6 +3722,7 @@ def test_real_improve_worker_ready_then_on_ready_then_result_ordering(tmp_path):
     ready 直後に実行を継続していることの間接証拠。"""
     if not landlock_available():
         pytest.skip("Landlock not available on this kernel/architecture")
+    _isolate_real_mission_worker_transcripts_dir(monkeypatch, tmp_path)
     from tests.conftest import _LLAMA_SWAP_UNREACHABLE_URL
 
     root = _root(tmp_path)
@@ -3768,6 +3796,7 @@ def test_real_improve_worker_on_ready_exception_leaves_no_surviving_child(
     と同じ規律)。"""
     if not landlock_available():
         pytest.skip("Landlock not available on this kernel/architecture")
+    _isolate_real_mission_worker_transcripts_dir(monkeypatch, tmp_path)
     from tests.conftest import _LLAMA_SWAP_UNREACHABLE_URL
 
     root = _root(tmp_path)
@@ -3837,6 +3866,7 @@ def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
     返り値がそのまま通る。"""
     if not landlock_available():
         pytest.skip("Landlock not available on this kernel/architecture")
+    _isolate_real_mission_worker_transcripts_dir(monkeypatch, tmp_path)
     import socket as socket_mod
     import agentic_fx.runners.worker_runner as wr_mod
 
@@ -4288,6 +4318,7 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
     (`test_trade_claude_real_process_completes_via_factory_build_runner`)
     と同じ手口 (`_NoCleanupTempDir` + `subprocess.Popen` spy) で実行時に
     捕捉する。"""
+    _isolate_real_mission_worker_transcripts_dir(monkeypatch, tmp_path)
     import agentic_fx.runners.worker_runner as wr_mod
 
     root = _root(tmp_path)
@@ -4503,6 +4534,7 @@ def test_worker_runner_reaps_real_cli_pgid_under_improve_profile(
     参照) によるものと考えられる。fixture は変更していない。"""
     if not landlock_available():
         pytest.skip("Landlock not available on this kernel/architecture")
+    _isolate_real_mission_worker_transcripts_dir(monkeypatch, tmp_path)
 
     fake_claude_bin = _compile_fake_claude_pgid_driver_elf(tmp_path)
 
@@ -4651,6 +4683,7 @@ def test_trade_claude_real_process_completes_via_factory_build_runner(
         `tools/list` を発行できることで実測する (trade 分岐にも
         dispatcher を配線した是正そのものの killer)
     """
+    _isolate_real_mission_worker_transcripts_dir(monkeypatch, tmp_path)
     root = _root(tmp_path)
 
     creds = tmp_path / ".credentials.json"

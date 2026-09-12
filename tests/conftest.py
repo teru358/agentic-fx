@@ -34,6 +34,7 @@ fixture が届かない)。そこで `WorkerRunner.run` = 起動引数が確定�
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -78,14 +79,32 @@ def _isolate_mission_transcripts_default_dir(tmp_path_factory):
     ── `_guard_real_data_dir_is_never_touched` と同じ「テストが実
     リポジトリ資源を絶対座標で触る」事故クラス。セッション全体で
     その属性自体を隔離先へ差し替える (個別テストは transcript_dir= を
-    渡す必要が無くなる)。"""
+    渡す必要が無くなる)。
+
+    T1(a) 是正 (test-hygiene 設計書 2026-09-12): この monkeypatch は
+    **親プロセス**の属性しか差し替えられず、`WorkerRunner` が実
+    `mission_worker` 子プロセスを起動するテスト (`worker_runner.
+    _mission_worker_env` 経由) や `_bootstrap_improve_profile` を
+    別プロセスで直接呼ぶ bootstrap probe (`tests/test_mission_worker.py`)
+    には届かない。`os.environ["AGENTIC_FX_MISSION_TRANSCRIPTS_DIR"]` も
+    同じ隔離先へ合わせて設定する — `cli_runner._TRANSCRIPT_DIR_DEFAULT`
+    の初期化式がこの環境変数を読むため、子プロセス側で `cli_runner` が
+    (再) import されたときも同じ隔離先を使う。"""
+    import os
+
     from agentic_fx.runners import cli_runner as _cli_runner_mod
 
     original = _cli_runner_mod._TRANSCRIPT_DIR_DEFAULT
     isolated = tmp_path_factory.mktemp("mission-transcripts-default")
     _cli_runner_mod._TRANSCRIPT_DIR_DEFAULT = isolated
+    original_env = os.environ.get("AGENTIC_FX_MISSION_TRANSCRIPTS_DIR")
+    os.environ["AGENTIC_FX_MISSION_TRANSCRIPTS_DIR"] = str(isolated)
     yield
     _cli_runner_mod._TRANSCRIPT_DIR_DEFAULT = original
+    if original_env is None:
+        os.environ.pop("AGENTIC_FX_MISSION_TRANSCRIPTS_DIR", None)
+    else:
+        os.environ["AGENTIC_FX_MISSION_TRANSCRIPTS_DIR"] = original_env
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -119,6 +138,59 @@ def _guard_real_mission_transcripts_dir_is_never_touched():
             "本物の mission_worker 子プロセスを起動するテストが CliRunner."
             "run() まで到達し、既定の transcript 保存先 (親プロセスの "
             "monkeypatch が届かない別プロセス) へ書き込んだ可能性がある。",
+            pytrace=False)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _guard_repo_root_has_no_new_untracked_files():
+    """T1(b) 是正 (test-hygiene 設計書 2026-09-12): テストが repo root
+    直下 (worktree root 直下、**再帰しない** — サブディレクトリの意図した
+    一時ファイルまで拾うと fail closed が過検出になる) に production
+    ファイル (`mcp.json` / `schema.json` / `prompt.txt` 等) を残す事故の
+    構造ピン。`_guard_real_mission_transcripts_dir_is_never_touched` /
+    `_guard_real_data_dir_is_never_touched` と同じ「session 前後の
+    スナップショット比較・fail closed」の形を、repo root 直下の
+    untracked ファイル全般に広げる。
+
+    `git status --porcelain --ignored=no -- .` の top-level (`/` を
+    含まない path) かつ `??` (untracked) 行だけを対象にする — 追跡済み
+    ファイルへの変更や `.gitignore` 済みパスは対象外 (それらは意図した
+    運用上の変化でありこの pin の対象外)。"""
+    repo_root = Path(__file__).resolve().parents[1]
+
+    def _sig():
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain", "--ignored=no", "--", "."],
+                cwd=str(repo_root), capture_output=True, text=True,
+                timeout=30, check=True)
+        except (OSError, subprocess.CalledProcessError):
+            # git が使えない環境では検査できない — fail open ではなく
+            # 「検査不能」を記録するだけに留め、無関係な環境要因でスイート
+            # 全体を落とさない。
+            return None
+        names = set()
+        for line in result.stdout.splitlines():
+            if len(line) < 4 or line[:2] != "??":
+                continue
+            path = line[3:]
+            if path.startswith('"') and path.endswith('"'):
+                path = path[1:-1]
+            if "/" in path.rstrip("/"):
+                continue  # サブディレクトリ配下 — 非再帰の対象外
+            names.add(path)
+        return names
+
+    before = _sig()
+    yield
+    after = _sig()
+    if before is not None and after is not None and before != after:
+        added = sorted(after - before)
+        pytest.fail(
+            f"repo root 直下に新規 untracked ファイルが残った: {added}。"
+            "テストが production ファイルを cwd (repo root) に書いている "
+            "可能性がある — workdir を tmp_path へ隔離すること "
+            "(test-hygiene T1(b))。",
             pytrace=False)
 
 

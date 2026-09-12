@@ -986,6 +986,24 @@ def test_detect_stderr_fatal_no_match_returns_none():
     assert _detect_stderr_fatal("ordinary log line, nothing fatal here") is None
 
 
+# --- T4 (test-hygiene 設計書 2026-09-12): codex/claude のサブスク上限・
+# 認証失効文言も `cli_stderr_fatal` で検知する (撤去した
+# `service._check_codex_subscription_expiry` の代替 — 期限は codex/claude
+# 自身が実行時に返す応答文言で検知する側に寄せた)。
+
+@pytest.mark.parametrize("stderr_text", [
+    "Error: usage limit reached, please upgrade your plan",
+    "rate limited — try again at 2026-09-13T00:00:00Z",
+    "HTTP request failed: 401 Unauthorized",
+])
+def test_detect_stderr_fatal_matches_subscription_and_auth_patterns(stderr_text):
+    from agentic_fx.runners.cli_runner import _detect_stderr_fatal
+
+    found = _detect_stderr_fatal(stderr_text)
+    assert found is not None
+    assert "pattern=" in found and "tail=" in found
+
+
 def test_detect_stderr_fatal_empty_pattern_tuple_disables_detection(monkeypatch):
     """パターン定数を空にすると検知そのものが無効化される — 逆変異
     (「パターン判定を if False にする」の対) の裏付け pin。"""

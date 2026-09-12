@@ -518,6 +518,51 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
                 Category.APPROVAL, "sweep_archive_db_failed",
                 f"phase=reconcile error={safe_error_text(exc)}")
 
+    # ⑧ (T2, test-hygiene 設計書 2026-09-12、指揮者裁定: startup sweep で
+    # 回収): `_plugin_lock` (行 615 付近) は flock を取って yield するだけで
+    # `plugins/.locks/<name>.lock` を unlink する経路がどこにも無く、
+    # approve/reject/bless のたびに 1 ファイルずつ純増していた
+    # (実測: reject 4 件で 3 → 7 件)。対応する pending な approval_request
+    # が存在しない名前のロックファイルだけを、`flock(LOCK_EX|LOCK_NB)` が
+    # 取れる (= 誰も保持していない) ことを確認してから削除する。
+    # `sweep_orphans` は「runner 起動前の単一プロセス、他プロセスからの
+    # 同時アクセスが無い」前提 (本関数冒頭の docstring) で動くため、
+    # decide (approve/reject/bless) 完了直後 unlink 案 (裁定候補 1) の
+    # ような flock+unlink の TOCTOU 穴が構造的に無い。
+    locks_dir = plugins_root / ".locks"
+    if locks_dir.is_dir():
+        pending_names = {
+            json.loads(r["payload_json"]).get("name")
+            for r in conn.execute(
+                "SELECT payload_json FROM approval_requests "
+                "WHERE kind='plugin' AND status='pending'")
+        }
+        for lock_file in locks_dir.iterdir():
+            if lock_file.is_symlink() or not lock_file.is_file():
+                continue
+            if not lock_file.name.endswith(".lock"):
+                continue
+            name = lock_file.name[: -len(".lock")]
+            if name in pending_names:
+                continue  # 進行中の候補 — 残す
+            try:
+                fh = open(lock_file, "a+")
+            except OSError:
+                continue
+            try:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    continue  # 誰かが保持中 — 残す (fail closed)
+                try:
+                    lock_file.unlink()
+                except OSError:
+                    pass
+                finally:
+                    fcntl.flock(fh, fcntl.LOCK_UN)
+            finally:
+                fh.close()
+
 # ============================================================
 # candidate_origin/candidate_path payload validator (§8.1-29、プラン10 Task 11d 逐語)
 # ============================================================

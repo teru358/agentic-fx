@@ -40,7 +40,18 @@ TerminationCause = Literal["completed", "timeout", "abort"]
 # `tests/conftest.py` のセッション fixture でこの属性そのものを
 # monkeypatch し、実リポジトリの `logs/`を一切触らせない
 # (`tests-touching-real-repo-resources` の再演防止)。
-_TRANSCRIPT_DIR_DEFAULT = Path(__file__).resolve().parents[3] / "logs" / "mission-transcripts"
+#
+# T1(a) 是正 (test-hygiene 設計書 2026-09-12): `AGENTIC_FX_MISSION_
+# TRANSCRIPTS_DIR` 環境変数が設定されていればそちらを既定値として使う。
+# `tests/conftest.py` の session fixture は **親プロセス**のこの属性を
+# monkeypatch できるが、`_bootstrap_improve_profile` の bootstrap probe
+# (`tests/test_mission_worker.py::_run_bootstrap_probe`) は
+# `subprocess.run` で**別プロセス**を起こすため親の monkeypatch は届かない
+# — 環境変数経由なら子プロセスの import 時点でこの初期化式が読み、
+# 隔離が効く。
+_TRANSCRIPT_DIR_DEFAULT = Path(
+    os.environ.get("AGENTIC_FX_MISSION_TRANSCRIPTS_DIR")
+    or (Path(__file__).resolve().parents[3] / "logs" / "mission-transcripts"))
 
 #: stdout イベント行の合計サイズがこれを超えたら先頭/末尾を残して中間を
 #: 省略する (肥大化対策)。テストが差し替えられるようモジュール定数にする。
@@ -59,11 +70,19 @@ _STDERR_TAIL_BUDGET_FRACTION = 0.15
 #: `error=code-mode host exited with status signal: 5 (SIGTRAP)` /
 #: `code-mode host closed its stdout`) がこのタプルの初出動機。空にする
 #: と検知自体が無効化される (逆変異 pin の対象)。
+#: T4 是正 (test-hygiene 設計書 2026-09-12、指揮者裁定): 旧
+#: `service._check_codex_subscription_expiry` は撤去した (実 auth.json に
+#: 期限キーが無く空振り WARNING しか出さなかった)。サブスク上限/認証失効は
+#: codex/claude 自身が実行時に返す文言 (`usage limit` / `try again at` /
+#: `401`) をここに足し、`cli_stderr_fatal` 経由で検知する側に寄せる。
 CLI_STDERR_FATAL_PATTERNS: tuple[str, ...] = (
     "code-mode host",
     "SIGTRAP",
     "closed its stdout",
     "Segmentation fault",
+    "usage limit",
+    "try again at",
+    "401",
 )
 
 #: activity `cli_stderr_fatal` 1 行に埋め込む tail の文字数上限
