@@ -4242,6 +4242,10 @@ def test_rpc_timeout_then_handler_completion_before_freeze_is_not_recorded(
     assert ledger.entries() == []
 
 
+FAKE_CLAUDE_PGID_DRIVER = (
+    Path(__file__).resolve().parent / "fixtures" / "fake_claude_pgid_driver.py")
+
+
 def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
         monkeypatch, tmp_path):
     """(裁定 R1/RB3、§7.1-2 の blocking 受入条件、A-4 検収是正 B2)
@@ -4257,68 +4261,36 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
     `WorkerRunner._terminate_cli_pgid` を一切経由せずに旧テストが green に
     なっていた (空振り)。`_terminate_cli_pgid` が存在する理由そのものが
     **孫プロセスの回収** (孫は PDEATHSIG を継がない) であるため、本テストは
-    fake CLI (`fake_claude_driver.py`) 自身の直接の子プロセスとして
+    fake CLI (`fake_claude_pgid_driver.py`) 自身の直接の子プロセスとして
     **同一 pgid・PDEATHSIG 無し**の孫を spawn させ、mission_worker を
     SIGKILL した後にその孫が消えていることを assert する。
 
-    gcc 依存は撤去: `claude.bin` に POSIX sh の実体 (`os.path.realpath("/bin/sh")`
-    — このシステムでは dash だが、bash 環境でも同じ挙動、コンパイル不要) を
-    直接使う。`ClaudeRunner._build_argv` は mission_worker.py が
-    real subprocess として実行するため **cross-process monkeypatch 不能**
-    (別プロセスの `sys.modules` は独立) — 代わりに **実際の `_build_argv`
-    が組み立てる argv をそのまま dash に解釈させる**: 実装は
-    `[bin_path, "-p", mission.prompt, "--output-format", ...]` を返す
-    (`claude_runner.py:38-45`)。dash は `-p` (privileged, no-op) を自分の
-    起動オプションとして消費した後、**次の非オプション引数を「実行す
-    べきスクリプトファイル」として open+読み込みする** (`sh script
-    [args...]`, POSIX 仕様) ため、`mission.prompt` に driver スクリプトの
-    パスを仕込めば、以降の `--output-format stream-json ...` 等は単なる
-    `$1 $2 ...` の位置パラメータとして無視される (dash 自身はそれらを
-    オプションとして再解釈しない — 実測: `/bin/sh -p <file>` で確認済み)。
-    driver スクリプトは `mission.output_schema`/`--mcp-config` 等の内容を
-    一切読まない — argv の中身に依存しない。"""
+    設計書 §D (T-D, [mission-prompt-in-argv-readable-via-proc]) 是正後、
+    `ClaudeRunner._build_argv` はもう `mission.prompt` を argv に積まない
+    (`[bin_path, "-p", "--output-format", ...]` — `CliRunner._run_cli_process`
+    が `workdir/prompt.txt` 経由の stdin に回す)。旧稿は `claude.bin` に
+    素の `/bin/sh` を直接使い、`-p <script path>` の隣接性 (mission.prompt
+    が script operand になる POSIX sh の挙動) を悪用していたが、この隣接性
+    が無くなったため `-p` の直後に続く `--output-format` 等が sh 自身の
+    (未知の) 長いオプションとして解釈され `Illegal option` で即死するように
+    なった。`claude.bin` 自体を shebang script にする案も検討したが、
+    `improve` profile の Landlock 適用前 bootstrap
+    (`mission_worker.py::elf_interpreter`) は **`claude.bin` が ELF である
+    こと**を要求し、shebang script は `RuntimeError` で fail closed される
+    (`core/landlock.py:198` 以降)。そこで本テストは `trade` profile に
+    切り替える (`trade` は Landlock 無し — `test_trade_claude_real_process_
+    completes_via_factory_build_runner` と同じ前例) — `_terminate_cli_pgid`
+    の pgid 単位回収は profile 非依存の `WorkerRunner` 共通コードであり、
+    trade 経由でも同じものを検証できる。`claude.bin` には argv/stdin の
+    中身を一切読まない python shebang fixture
+    (`fake_claude_pgid_driver.py`) を使う — mission workdir (呼び出しごとに
+    tempdir なので事前に path を知れない) は `trade` 版の既存 pin
+    (`test_trade_claude_real_process_completes_via_factory_build_runner`)
+    と同じ手口 (`_NoCleanupTempDir` + `subprocess.Popen` spy) で実行時に
+    捕捉する。"""
     import agentic_fx.runners.worker_runner as wr_mod
 
     root = _root(tmp_path)
-    mission_id = "m-t4-cli-started"
-    staging_dir = tmp_path / "staging" / mission_id
-    staging_dir.mkdir(parents=True, mode=0o700)
-    # source_snapshot_dir は staging_dir 配下に置く (bootstrap 検証ルール)
-    source_snapshot_dir = staging_dir / "source"
-    source_snapshot_dir.mkdir(mode=0o500)
-
-    # marker: fake CLI (driver, 直接の子) 自身の pid を記録する
-    # (`assert marker.exists()` は「CLI が起動したか」だけを見る — B2
-    # 是正前と同じ意味論。pgid == driver の pid (session leader、
-    # `CliRunner.run()` が `start_new_session=True` で spawn するため))。
-    marker = staging_dir / "fake_claude_pid"
-    # grandchild_marker: PDEATHSIG を持たない孫プロセスが自身の pid を
-    # 書く。この孫が「回収されずに生き残る」かどうかが B2 の観測点。
-    grandchild_marker = staging_dir / "fake_claude_grandchild_pid"
-
-    # advisor 指摘 #4: `/usr/bin/dash` のハードコードを撤去し、システムの
-    # POSIX sh 実体を `realpath` で解決する (bash 環境でも `-p <script>` は
-    # 同じ挙動 — M-2 の「gcc 不在で不正確な skip」と同種の環境依存を防ぐ)。
-    import shutil
-    sh_bin = os.path.realpath("/bin/sh")
-    sleep_bin = shutil.which("sleep") or "/usr/bin/sleep"
-    driver_script = staging_dir / "fake_claude_driver.sh"
-    driver_script.write_text(
-        "trap '' TERM\n"
-        f"echo $$ > {str(marker)!r}\n"
-        # 孫: 別プロセスとして sh を fork (setsid しないので同じ pgid に
-        # 留まり、PDEATHSIG も継がない — 孫は自分で prctl を呼んでいない)。
-        # 孫自身も SIGTERM を無視し、SIGKILL へのエスカレーションが実際に
-        # 発火することを確認する観測対象にする。
-        f"{sh_bin} -c 'trap \"\" TERM; exec {sleep_bin} 600' &\n"
-        f"echo $! > {str(grandchild_marker)!r}\n"
-        "wait\n")
-    driver_script.chmod(0o500)
-
-    # claude.bin には既存の ELF (sh) を直接使う — gcc も shebang script も
-    # 不要。sh に「-p <driver_script>」を渡すと script として実行する
-    # (docstring 参照)。
-    fake_claude_bin = Path(sh_bin)
 
     creds = tmp_path / ".credentials.json"
     creds.write_text('{"token":"x"}')
@@ -4326,10 +4298,11 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
 
     settings = SETTINGS.model_copy(update={
         "runner": SETTINGS.runner.model_copy(update={
-            "improve": SETTINGS.runner.improve.model_copy(
+            "trade": SETTINGS.runner.trade.model_copy(
                 update={"backend": "claude"}),
             "claude": SETTINGS.runner.claude.model_copy(update={
-                "bin": str(fake_claude_bin), "credentials_file": str(creds)}),
+                "bin": str(FAKE_CLAUDE_PGID_DRIVER),
+                "credentials_file": str(creds)}),
             # advisor 指摘 #3: `_terminate_cli_pgid` (`worker_runner.py:429`)
             # は `self._settings.runner.cli_terminate_grace_sec` を読む
             # (`worker.worker_grace_sec` ではない — 別のフィールド)。
@@ -4342,43 +4315,57 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
             "worker_startup_timeout_sec": 10.0, "worker_grace_sec": 5.0}),
     })
 
-    class _RunContext:
-        def __init__(self):
-            self.mission_id = mission_id
-            self.staging_dir = staging_dir
-            # 裁定 R-D3: source_snapshot_dir は「出所」として親プロセス
-            # (`WorkerRunner.run()`) 自身が `Path(...).is_dir()` を検査し、
-            # `workdir/source` へ `shutil.copytree` する。旧稿の相対パス
-            # "." は「子プロセスの cwd=workdir で解決される」という R-D3
-            # 以前の前提に依存していたが、R-D3 以降は親プロセスの cwd
-            # (pytest 実行時のリポジトリルート) で解決されてしまい、
-            # リポジトリ全体を誤って copytree する事故になる — 冒頭で
-            # 用意済みの `source_snapshot_dir` (staging_dir 配下の空 dir)
-            # を出所として使う。
-            self.source_snapshot_dir = source_snapshot_dir
-
     real_popen = subprocess.Popen
     spawned: dict = {}
+    captured_cwd: dict[str, object] = {}
 
     def spy_popen(*a, **kw):
         p = real_popen(*a, **kw)
         spawned["proc"] = p
+        captured_cwd["cwd"] = kw.get("cwd")
         return p
 
     monkeypatch.setattr(wr_mod.subprocess, "Popen", spy_popen)
 
+    # `test_trade_claude_real_process_completes_via_factory_build_runner`
+    # と同じ手口: `WorkerRunner.run()` の `with tempfile.TemporaryDirectory`
+    # は正常終了時に workdir を rmtree するため、cleanup だけ無効化した
+    # 差し替えでテスト側から workdir を検査可能にする (workdir 自体は
+    # `finally` で明示的に消す)。
+    created_tempdirs: list[str] = []
+
+    class _NoCleanupTempDir(wr_mod.tempfile.TemporaryDirectory):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            created_tempdirs.append(self.name)
+            self._finalizer.detach()
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+    monkeypatch.setattr(wr_mod.tempfile, "TemporaryDirectory", _NoCleanupTempDir)
+
     runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
-                          rag=_rag(tmp_path), worker_profile="improve",
-                          run_context=_RunContext())
-    # `mission.prompt` は `_build_argv` によって `["-p", mission.prompt, ...]`
-    # として argv に載る — dash はこれを「実行すべきスクリプトファイル」
-    # として open する (docstring 参照)。
-    mission = Mission(prompt=str(driver_script), tools=[],
+                          rag=_rag(tmp_path), worker_profile="trade")
+    # `mission.prompt` は `CliRunner._run_cli_process` によって
+    # `workdir/prompt.txt` に書かれ stdin へ回るだけで、driver
+    # (`fake_claude_pgid_driver.py`) はそれを読まない — 内容は任意でよい。
+    mission = Mission(prompt="hi", tools=[],
                       output_schema={"type": "object"},
                       max_turns=1, timeout_sec=120.0)
 
     thread = threading.Thread(target=lambda: runner.run(mission))
     thread.start()
+    deadline = time.monotonic() + 20.0
+    while "cwd" not in captured_cwd and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert "cwd" in captured_cwd, (
+        "mission_worker 子プロセスが起動しなかった (WorkerRunner.run() の"
+        "早期 return の可能性)")
+    mission_workdir = Path(captured_cwd["cwd"])
+    marker = mission_workdir / "fake_claude_pid"
+    grandchild_marker = mission_workdir / "fake_claude_grandchild_pid"
+
     deadline = time.monotonic() + 20.0
     while not marker.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -4422,6 +4409,12 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
             os.killpg(cli_pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+        # `_NoCleanupTempDir` で無効化した workdir の rmtree をここで行う
+        # (`test_trade_claude_real_process_completes_via_factory_build_
+        # runner` と同じ後始末)。
+        import shutil as _shutil
+        for d in created_tempdirs:
+            _shutil.rmtree(d, ignore_errors=True)
 
 
 FAKE_CLAUDE_TRADE_DRIVER = (

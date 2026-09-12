@@ -70,6 +70,20 @@ def test_codex_argv_shape_pins_bypass_and_ignore_user_config(tmp_path):
     assert "--output-schema" in argv
 
 
+def test_codex_argv_does_not_contain_prompt_and_uses_exec_dash(tmp_path):
+    """[mission-prompt-in-argv-readable-via-proc] 是正 (設計書 §D):
+    `mission.prompt` はもう argv に乗らない (`/proc/<pid>/cmdline` から
+    読めなくするため stdin 経由に回す)。codex `exec [PROMPT]` は
+    引数無しだと後続要素を PROMPT と誤読しかねないため、`exec` の直後は
+    明示の `-` (stdin 読み指定) にする (指揮者の CLI 事前確認)。"""
+    mission = _mission()
+    runner, workdir, _ = _runner(tmp_path)
+    argv = runner._build_argv(mission, mcp_socket=workdir / "afx.sock")
+    assert mission.prompt not in argv
+    exec_idx = argv.index("exec")
+    assert argv[exec_idx + 1] == "-"
+
+
 def test_codex_argv_has_no_llama_swap_provider_config(tmp_path):
     """llama_swap 用 argv を復活させる変異は namespace tools 非互換を再導入
     するため、chatgpt 固定の argv から設定片が消えていることを pin する。"""
@@ -104,6 +118,43 @@ def test_codex_missing_output_file_is_failed(tmp_path, monkeypatch):
     runner, workdir, behavior = _runner(tmp_path, behavior="missing_output_file")
     result = _run_with_fake_env(runner, _mission(), behavior, monkeypatch)
     assert result.status == "failed"
+
+
+def test_codex_stdin_prompt_hook_returns_mission_prompt(tmp_path):
+    """設計書 §D: `_stdin_prompt` が `mission.prompt` を返す。"""
+    mission = _mission()
+    runner, workdir, _ = _runner(tmp_path)
+    assert runner._stdin_prompt(mission) == mission.prompt
+
+
+def test_codex_run_writes_prompt_file_0600_and_feeds_stdin(tmp_path, monkeypatch):
+    """設計書 §D pin: `workdir/prompt.txt` が 0600 で書かれ、内容が
+    `mission.prompt` と一致し、CLI の stdin fd がそのファイルを指す。"""
+    import stat as _stat
+    import subprocess
+
+    runner, workdir, behavior = _runner(tmp_path)
+    mission = _mission()
+
+    captured: dict = {}
+    real_popen = subprocess.Popen
+
+    def spying_popen(*a, **kw):
+        stdin_fd = kw.get("stdin")
+        if isinstance(stdin_fd, int) and stdin_fd >= 0:
+            captured["stdin_target"] = os.readlink(f"/proc/self/fd/{stdin_fd}")
+        return real_popen(*a, **kw)
+
+    runner._popen = spying_popen
+    result = _run_with_fake_env(runner, mission, behavior, monkeypatch)
+    assert result.status == "completed"
+
+    prompt_path = workdir / "prompt.txt"
+    assert prompt_path.is_file()
+    assert prompt_path.read_text(encoding="utf-8") == mission.prompt
+    mode = _stat.S_IMODE(prompt_path.stat().st_mode)
+    assert mode == 0o600, f"prompt.txt のパーミッションが 0600 でない: {oct(mode)}"
+    assert captured.get("stdin_target") == str(prompt_path)
 
 
 def test_codex_max_turns_is_ignored_docstring_and_semantics(tmp_path):

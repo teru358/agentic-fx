@@ -77,7 +77,12 @@ def test_claude_argv_shape(tmp_path):
 
     assert argv[0] == str(runner._bin_path)
     assert argv[1] == "-p"
-    assert argv[2] == mission.prompt
+    # [mission-prompt-in-argv-readable-via-proc] 是正 (設計書 §D):
+    # `mission.prompt` はもう argv に乗らない (`/proc/<pid>/cmdline` から
+    # 読めなくするため、stdin 経由の prompt.txt に回す — 下の
+    # `test_claude_stdin_prompt_*` 群で検証)。`-p` の直後は次のフラグ。
+    assert argv[2] == "--output-format"
+    assert mission.prompt not in argv
 
     assert "--output-format" in argv
     assert _flag_value(argv, "--output-format") == "stream-json"
@@ -92,7 +97,9 @@ def test_claude_argv_shape(tmp_path):
     assert _flag_value(argv, "--model") == runner._model
     # #34 (`verified-round1.md` 1-B): 各フラグの隣接値は pin 済みだが、
     # argv の長さ (= 余分なフラグが無いこと) は未検査だった。
-    assert len(argv) == 21, (
+    # 設計書 §D で `mission.prompt` の位置引数 1 要素分を argv から
+    # 除いたため 21 → 20。
+    assert len(argv) == 20, (
         f"argv に既知フラグ以外の要素が混入している (len={len(argv)}): {argv!r}")
 
 
@@ -131,6 +138,46 @@ def test_claude_argv_does_not_leak_parent_secrets(tmp_path, monkeypatch):
     joined = " ".join(observed_argv)
     assert "sk-ant-sentinel-argv" not in joined
     assert "sk-sentinel-argv" not in joined
+
+
+def test_claude_stdin_prompt_hook_returns_mission_prompt(tmp_path):
+    """設計書 §D: `_stdin_prompt` が `mission.prompt` を返す (argv から
+    除いた分の受け渡し経路)。"""
+    runner, workdir = _runner(tmp_path)
+    mission = _mission()
+    assert runner._stdin_prompt(mission) == mission.prompt
+
+
+def test_claude_run_writes_prompt_file_0600_and_feeds_stdin(tmp_path):
+    """設計書 §D pin: `workdir/prompt.txt` が 0600 で書かれ、内容が
+    `mission.prompt` と一致し、CLI の stdin fd がそのファイルを指す
+    (`os.readlink(/proc/self/fd/<fd>)` — `test_cli_runner_does_not_use_
+    subprocess_devnull_for_stdin` と同じ観測の作法)。"""
+    import stat as _stat
+    import subprocess
+
+    runner, workdir = _runner(tmp_path)
+    mission = _mission()
+
+    captured: dict = {}
+    real_popen = subprocess.Popen
+
+    def spying_popen(*a, **kw):
+        stdin_fd = kw.get("stdin")
+        if isinstance(stdin_fd, int) and stdin_fd >= 0:
+            captured["stdin_target"] = os.readlink(f"/proc/self/fd/{stdin_fd}")
+        return real_popen(*a, **kw)
+
+    runner._popen = spying_popen
+    result = runner.run(mission)
+    assert result.status == "completed"
+
+    prompt_path = workdir / "prompt.txt"
+    assert prompt_path.is_file()
+    assert prompt_path.read_text(encoding="utf-8") == mission.prompt
+    mode = _stat.S_IMODE(prompt_path.stat().st_mode)
+    assert mode == 0o600, f"prompt.txt のパーミッションが 0600 でない: {oct(mode)}"
+    assert captured.get("stdin_target") == str(prompt_path)
 
 
 def test_claude_completed_terminal_status(tmp_path):

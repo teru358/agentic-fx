@@ -188,6 +188,20 @@ def _normalize_reason(text: str) -> str:
     return text
 
 
+def _write_prompt_file(workdir: Path, prompt: str) -> Path:
+    """設計書 §D: mission prompt を argv に載せず stdin 経由で渡すための
+    一時ファイル。`workdir/prompt.txt` を **0600 で新規作成**する
+    (`O_EXCL` — 同名ファイルが既にあれば衝突として例外を送出する、
+    fail closed。1 mission の workdir は 1 回の `run()` でしか使わない
+    前提と一致する)。fsync は不要 — 直後に同プロセス内で開いて読むだけで、
+    クラッシュ耐性は要らない (指揮者の実装依頼どおり)。"""
+    path = workdir / "prompt.txt"
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(prompt)
+    return path
+
+
 class CliRunner(AgentRunner):
     def __init__(self, *, bin_path: Path, model: str, workdir: Path,
                  cli_terminate_grace_sec: float,
@@ -257,10 +271,23 @@ class CliRunner(AgentRunner):
         内数化 — mission 総予算を超えて追撃しない)。"""
         return None
 
+    def _stdin_prompt(self, mission: Mission) -> str | None:
+        """設計書 §D: `_run_cli_process` へ渡す stdin 用 prompt 文字列。
+
+        既定 (このクラス) は `None` — `_run_cli_process` はこれまでどおり
+        `/dev/null` を stdin に開く。argv に `mission.prompt` を積んだまま
+        の backend (`OpencodeRunner`、本対応の対象外) はこの hook を
+        override しないため devnull のまま変わらない。argv から
+        `mission.prompt` を除いた backend (`ClaudeRunner`/`CodexRunner`)
+        だけが override して `mission.prompt` を返し、ファイル経由の
+        stdin に切り替える。"""
+        return None
+
     def _run_cli_process(self, argv: list[str], env: dict[str, str], *,
                           timeout_sec: float,
                           on_started: Callable[[int], None] | None = None,
                           abort_event: threading.Event | None = None,
+                          prompt: str | None = None,
                           ) -> tuple[TerminationCause, int | None, list[str], list[str]]:
         """launcher 経由で `argv` を起動し、pgid 管理
         (`start_new_session=True` + `_terminate_pgid`) と stdout/stderr の
@@ -276,14 +303,24 @@ class CliRunner(AgentRunner):
         launcher_argv = self._build_launcher_argv(
             os.getpid(), argv, rlimits=self._rlimits)
 
-        devnull_r = os.open(os.devnull, os.O_RDONLY)
+        # 設計書 §D: `prompt` が渡されたときだけ `workdir/prompt.txt`
+        # (0600) をファイル読み出しで stdin に充てる — pipe に書きながら
+        # 流すのではなくファイル読み出しにすることで、prompt サイズによる
+        # pipe バッファのデッドロックを避ける。渡されなければ既存どおり
+        # `/dev/null` を開く (devnull と同じ「開いて Popen へ渡し、
+        # Popen 後に close する」流儀をそのまま流用)。
+        if prompt is not None:
+            prompt_path = _write_prompt_file(self._workdir, prompt)
+            stdin_r = os.open(str(prompt_path), os.O_RDONLY)
+        else:
+            stdin_r = os.open(os.devnull, os.O_RDONLY)
         try:
             proc = self._popen(
                 launcher_argv, cwd=str(self._workdir), env=env,
-                stdin=devnull_r, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=stdin_r, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 start_new_session=True, text=True)
         finally:
-            os.close(devnull_r)
+            os.close(stdin_r)
 
         pgid = os.getpgid(proc.pid)
         if on_started is not None:
@@ -363,7 +400,8 @@ class CliRunner(AgentRunner):
 
         cause, rc, stdout_lines, stderr_chunks = self._run_cli_process(
             inner_argv, env, timeout_sec=primary_timeout,
-            on_started=self._cli_started_sink, abort_event=self._abort_event)
+            on_started=self._cli_started_sink, abort_event=self._abort_event,
+            prompt=self._stdin_prompt(mission))
 
         # 段A: どの終端経路 (timeout/failed/schema mismatch/completed) でも
         # 漏れなく保存する — 追撃 (`_recover_output`) より前のこの位置に

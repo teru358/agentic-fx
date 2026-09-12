@@ -48,7 +48,11 @@ class CodexRunner(CliRunner):
         schema_path.write_text(json.dumps(mission.output_schema))
         out_path = self._workdir / "output.txt"
         argv = [
-            str(self._bin_path), "exec", mission.prompt,
+            # 設計書 §D: codex `exec [PROMPT]` は「引数無し、または `-`
+            # なら stdin から読む」(指揮者の CLI 事前確認)。引数を単に
+            # 省くと後続の argv 要素が誤って PROMPT 位置引数と解釈され
+            # かねないため、`-` を明示して stdin 読みだと確定させる。
+            str(self._bin_path), "exec", "-",
             "--json",
             "--output-schema", str(schema_path), "-o", str(out_path),
             "--ignore-user-config",
@@ -92,3 +96,11 @@ class CodexRunner(CliRunner):
 
     def _max_turns_semantics(self) -> Literal["passthrough", "ignored"]:
         return "ignored"
+
+    def _stdin_prompt(self, mission: Mission) -> str | None:
+        # [mission-prompt-in-argv-readable-via-proc] 是正 (設計書 §D):
+        # `_build_argv` はもう `mission.prompt` を argv に積まない
+        # (`exec -` で stdin 読みを明示) — `/proc/<pid>/cmdline` から
+        # 読めなくするため、代わりにここで stdin (workdir/prompt.txt
+        # 経由) に回す。
+        return mission.prompt
