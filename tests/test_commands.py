@@ -584,7 +584,10 @@ def test_approval_detail_shows_archive_unknown_when_no_archive_row(tmp_path):
 
     out = cmds.dispatch(f"approval {approval_id}")
 
-    assert "archive=不明" in out
+    # ローカル approval-quality 1 周目 #C1x (2026-09-12): 4 分岐すべてが
+    # 「archive=不明」で始まるため、部分一致 assert では分岐の取り違え
+    # (GC 済みとパス欠落の文言すり替え等) を検出できない。理由まで pin する。
+    assert "archive=不明 (GC 済み・失敗終端等)" in out
 
 
 def test_approval_detail_shows_archive_unknown_when_payload_lacks_identity(
@@ -597,7 +600,8 @@ def test_approval_detail_shows_archive_unknown_when_payload_lacks_identity(
 
     out = cmds.dispatch(f"approval {approval_id}")
 
-    assert "archive=不明" in out
+    # ローカル approval-quality 1 周目 #C1x (2026-09-12): 理由まで pin する。
+    assert "archive=不明 (mission_id/content_hash 欠落)" in out
 
 
 def test_approval_detail_archive_unknown_when_mission_id_is_wrong_type(
@@ -612,7 +616,8 @@ def test_approval_detail_archive_unknown_when_mission_id_is_wrong_type(
 
     out = cmds.dispatch(f"approval {approval_id}")
 
-    assert "archive=不明" in out
+    # ローカル approval-quality 1 周目 #C1x (2026-09-12): 理由まで pin する。
+    assert "archive=不明 (mission_id/content_hash 不正)" in out
 
 
 def test_approval_detail_archive_unknown_when_content_hash_is_wrong_type(
@@ -627,7 +632,31 @@ def test_approval_detail_archive_unknown_when_content_hash_is_wrong_type(
 
     out = cmds.dispatch(f"approval {approval_id}")
 
-    assert "archive=不明" in out
+    # ローカル approval-quality 1 周目 #C1x (2026-09-12): 理由まで pin する。
+    assert "archive=不明 (mission_id/content_hash 不正)" in out
+
+
+def test_approval_detail_archive_unknown_when_only_row_has_null_path(tmp_path):
+    """ローカル approval-quality 1 周目 #C2x (2026-09-12): 候補行は在るが
+    `archive_path` が NULL (GC 済み等) のとき「archive=不明 (パス欠落…)」を
+    出す。この分岐を踏むテストが 1 本も無く、分岐ごと削除して
+    `archive=None` を出す変異が SURVIVED だった。I2 是正で非 NULL 行が
+    優先されるため、NULL 行だけを 1 件入れて踏む。"""
+    from agentic_fx.store import candidate_archives
+    conn, _, _, cmds = _commands(tmp_path)
+    candidate_archives.insert(
+        conn, mission_id=7, name="rsi_v2", content_hash="c7",
+        artifact_hash="a7", archive_path=None, pair="USDJPY",
+        metrics={"pf": 1.1}, now=NOW, commit=True)
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "rsi_v2", "mission_id": 7, "content_hash": "c7"},
+        now=NOW)
+
+    out = cmds.dispatch(f"approval {approval_id}")
+
+    assert "archive=不明 (パス欠落、GC 済みの可能性)" in out
+    assert "archive=None" not in out
 
 
 def test_approval_detail_unknown_id_reports_not_found(tmp_path):

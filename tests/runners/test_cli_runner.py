@@ -1091,3 +1091,20 @@ def test_cli_runner_no_output_failed_carries_stderr_fatal(tmp_path):
     assert result.reason is not None and "no output" in result.reason
     assert result.stderr_fatal is not None
     assert "SIGTRAP" in result.stderr_fatal
+
+
+def test_write_prompt_file_refuses_to_overwrite_existing(tmp_path):
+    """ローカル approval-quality 1 周目 #D1 (2026-09-12): `_write_prompt_file`
+    は `O_EXCL` で新規作成 (fail closed) — 既存 `prompt.txt` は無言で
+    上書きしない。既存テストは毎回空の `tmp_path` で走るため、`O_EXCL` を
+    落とす変異が SURVIVED だった。"""
+    from agentic_fx.runners.cli_runner import _write_prompt_file
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    existing = workdir / "prompt.txt"
+    existing.write_text("前回の prompt", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        _write_prompt_file(workdir, "新しい prompt")
+
+    assert existing.read_text(encoding="utf-8") == "前回の prompt"

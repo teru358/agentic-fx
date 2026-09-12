@@ -198,3 +198,22 @@ def test_insert_does_not_commit_by_default(tmp_path):
         pair="USDJPY", metrics={"pf": 1.25}, now=NOW)
     conn.rollback()
     assert candidate_archives.list_by_mission(conn, 3) == []
+
+
+def test_find_by_mission_content_ignores_row_whose_artifact_hash_equals_key(
+        tmp_path):
+    """ローカル approval-quality 1 周目 #C3x (2026-09-12): 検索キーは
+    `content_hash` のみ。`artifact_hash` が検索キーと同値の別候補行 (罠) が
+    同一 mission にあっても拾ってはいけない。既存テストは `content_hash`
+    側だけを変えていたため、WHERE を
+    `(content_hash=? OR artifact_hash=?)` に緩める変異が SURVIVED だった。"""
+    conn = _conn(tmp_path)
+    _insert(conn, mission_id=30, content_hash="target", artifact_hash="ah-a",
+            archive_path="plugins/_archive/30/a")
+    _insert(conn, mission_id=30, content_hash="other", artifact_hash="target",
+            archive_path="plugins/_archive/30/trap")
+    row = candidate_archives.find_by_mission_content(
+        conn, mission_id=30, content_hash="target")
+    assert row is not None
+    assert row["archive_path"] == "plugins/_archive/30/a"
+    assert row["artifact_hash"] == "ah-a"

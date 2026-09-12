@@ -943,3 +943,18 @@ def test_latest_in_sample_metrics_filters_by_source(tmp_path):
     assert backtest_runs.latest_in_sample_metrics(
         conn, "same", pair="USDJPY", variant="candidate",
         source="mt5", base_interval="1m") == {"pf": 9.9}
+
+
+def test_find_matching_approved_metrics_excludes_non_in_sample_scope(tmp_path):
+    """ローカル approval-quality 1 周目 #A1 (2026-09-12): 質検査の母集団は
+    `scope='in_sample'` に限る。`holdout_gate` の承認済み行 (approval_requests
+    にも載っている) が母集団に混入すると、in_sample 成績と holdout 成績を
+    取り違えて正当な候補を降格しうる。既存テストは全候補行を
+    `scope='in_sample'` で作っていたため、SQL から `scope='in_sample' AND`
+    を落とす変異が SURVIVED だった。"""
+    conn = _conn_approved(tmp_path)
+    backtest_runs.save_harness_run(conn, **_approved_kw(scope="holdout_gate"))
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
+    assert got is None

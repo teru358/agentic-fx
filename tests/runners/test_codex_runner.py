@@ -157,6 +157,51 @@ def test_codex_run_writes_prompt_file_0600_and_feeds_stdin(tmp_path, monkeypatch
     assert captured.get("stdin_target") == str(prompt_path)
 
 
+def test_codex_argv_shape_has_no_extra_elements(tmp_path):
+    """ローカル approval-quality 1 周目 #D3 (2026-09-12): codex 側の argv に
+    要素数チェックが無く、未知フラグを 1 つ足す変異が SURVIVED だった
+    (claude 側は `len(argv) == 20` で守られている)。要素数を pin する。"""
+    runner, workdir, _ = _runner(tmp_path)
+    argv = runner._build_argv(_mission(), mcp_socket=workdir / "afx.sock")
+    assert len(argv) == 24, argv
+
+
+def test_codex_run_closes_stdin_fd_after_popen(tmp_path, monkeypatch):
+    """ローカル approval-quality 1 周目 #D2 (2026-09-12): `prompt.txt` を開いた
+    fd は `Popen` 後に close する (`try/finally`)。既存テストは Popen 時点の
+    stdin しか見ておらず、`finally: os.close(stdin_r)` ごと落とす fd リーク
+    変異が SURVIVED だった。`run()` 後にその fd が prompt.txt を指していない
+    ことを確認する (閉じていれば readlink が失敗、再利用なら別を指す)。"""
+    import subprocess
+
+    runner, workdir, behavior = _runner(tmp_path)
+    mission = _mission()
+
+    captured: dict = {}
+    real_popen = subprocess.Popen
+
+    def spying_popen(*a, **kw):
+        stdin_fd = kw.get("stdin")
+        if isinstance(stdin_fd, int) and stdin_fd >= 0:
+            captured["stdin_fd"] = stdin_fd
+            captured["stdin_target"] = os.readlink(f"/proc/self/fd/{stdin_fd}")
+        return real_popen(*a, **kw)
+
+    runner._popen = spying_popen
+    result = _run_with_fake_env(runner, mission, behavior, monkeypatch)
+    assert result.status == "completed"
+
+    prompt_path = workdir / "prompt.txt"
+    assert captured.get("stdin_target") == str(prompt_path)
+    fd = captured["stdin_fd"]
+    try:
+        still = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        still = None          # close 済み (期待どおり)
+    assert still != str(prompt_path), (
+        f"stdin fd {fd} が run() 後も prompt.txt を指している (fd リーク)")
+
+
 def test_codex_max_turns_is_ignored_docstring_and_semantics(tmp_path):
     """§1.5: Codex は max_turns 到達不能。docstring に明記し、
     `_max_turns_semantics()` は `"ignored"`。"""

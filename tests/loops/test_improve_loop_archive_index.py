@@ -442,8 +442,12 @@ def test_finalize_success_index_header_notes_it_is_a_terminal_log(
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
 
     text = _index_path(loop_min).read_text()
-    assert "candidate_archives" in text
-    assert "終端ログ" in text
+    # ローカル approval-quality 1 周目 #B2 (2026-09-12): 2 語の部分一致では
+    # 「(GC 非対象)」「承認可否の目録ではない」「approval_requests」が
+    # 落ちる変異を検出できなかった。ヘッダ文言を一文ごと pin する。
+    assert "終端ログ (GC 非対象)。承認可否の目録ではない。" in text
+    assert ("承認済み候補の正は `candidate_archives` 表と "
+            "`approval_requests` 表である。") in text
 
 
 def test_finalize_success_does_not_write_index_row_with_zero_candidates(
