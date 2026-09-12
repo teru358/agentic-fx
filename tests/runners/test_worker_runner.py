@@ -4424,9 +4424,13 @@ _FAKE_CLAUDE_PGID_DRIVER_ELF_SRC = (
 
 def _compile_fake_claude_pgid_driver_elf(tmp_path: Path) -> Path:
     """`_FAKE_CLAUDE_PGID_DRIVER_ELF_SRC` をテスト実行時に ELF へビルド
-    する — バイナリはコミットしない (アーキテクチャ依存)。`cc` が使えない
-    環境では呼び出し元のテストを skip する (改造できない旨を report で
-    明示する、黙って red のまま残さない)。"""
+    する — バイナリはコミットしない (アーキテクチャ依存)。`cc`/`gcc` が
+    **見つからない** (非対応環境) ときだけ呼び出し元のテストを skip する。
+    compiler が見つかったのにビルドが非ゼロ終了した場合は環境要因では
+    なく fixture 自体の壊れ (構文エラー、include 不足、将来の編集ミス
+    等) の可能性が高いため、無言で skip して pgid 回収 pin を握り潰さず
+    `pytest.fail` で red のまま可視化する (codex 2 周目 Minor 是正
+    2026-09-12)。"""
     import shutil as _shutil
     cc = _shutil.which("cc") or _shutil.which("gcc")
     if cc is None:
@@ -4437,8 +4441,9 @@ def _compile_fake_claude_pgid_driver_elf(tmp_path: Path) -> Path:
         [cc, "-O2", "-o", str(binary), str(_FAKE_CLAUDE_PGID_DRIVER_ELF_SRC)],
         capture_output=True, text=True)
     if result.returncode != 0:
-        pytest.skip(
-            f"failed to build the fixture ELF driver: {result.stderr}")
+        pytest.fail(
+            "failed to build the fixture ELF driver "
+            f"(cc={cc}, rc={result.returncode}): {result.stderr}")
     return binary
 
 
@@ -4467,7 +4472,35 @@ def test_worker_runner_reaps_real_cli_pgid_under_improve_profile(
     を満たしたまま起動する。mission_worker を SIGKILL した後、fake CLI
     自身 (PDEATHSIG で即死) ではなく **PDEATHSIG を継がない孫プロセス**
     が `_terminate_cli_pgid` の pgid 単位回収 (SIGTERM 無視→grace→
-    SIGKILL) で消えることを確認する。"""
+    SIGKILL) で消えることを確認する。
+
+    codex 2 周目 I1 是正 (2026-09-12、切り分け): このテストが環境によって
+    skip になる条件は次の 2 つのみ (どちらも fail closed ではなく明示
+    skip):
+    - Landlock がこのカーネル/アーキテクチャで利用不能 (`landlock_
+      available()` が False)。improve profile は Landlock 必須のため。
+    - `cc`/`gcc` が見つからない (`_compile_fake_claude_pgid_driver_elf`
+      内)。fixture ELF driver をビルドできない環境向け。compiler が
+      見つかった上でビルドが非ゼロ終了する場合は環境要因ではなく
+      fixture 自体の欠陥とみなし `pytest.fail` にする (Minor 是正、
+      同ファイル内のコメント参照)。
+
+    codex の指摘 (「`source_snapshot_dir = tmp_path / "source"` は
+    `WorkerRunner` の workdir 配下でないため `mission_worker.py:~208`
+    の fail-closed で必ず失敗する」) は一次証拠で確認した結果**偽**
+    だった: `WorkerRunner.run()` (`src/agentic_fx/runners/worker_runner.
+    py:132-151`, 裁定 R-D3) は `run_context.source_snapshot_dir` を
+    「出所」としてのみ扱い、`shutil.copytree` で `workdir/source` へ
+    実体化してから、その実体化先 (`workdir/source`、必ず workdir 配下)
+    を `run_context_fields["source_snapshot_dir"]` として子プロセスへ
+    渡す。したがって `mission_worker.py` の fail-closed 検査が見るのは
+    このテストが渡す生の `tmp_path / "source"` ではなく実体化後のパス
+    であり、fail-closed は発火しない。実測でもこのテスト単体は
+    `1 passed` する (2026-09-12、`uv run pytest ...::test_worker_runner_
+    reaps_real_cli_pgid_under_improve_profile` 単体実行)。codex 環境で
+    観測された failure は別原因 (RLIMIT_AS/Landlock/`/proc` 制約など
+    codex サンドボックス固有の要因、`tmp/codex-host-probe/findings.md`
+    参照) によるものと考えられる。fixture は変更していない。"""
     if not landlock_available():
         pytest.skip("Landlock not available on this kernel/architecture")
 

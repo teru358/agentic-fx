@@ -398,21 +398,36 @@ class CliRunner(AgentRunner):
         # (設計書 §D の脅威モデル) ので fail closed で `ValueError`。
         # `_stdin_prompt` を明示的に `None` へ override した opt-out
         # backend (`OpencodeRunner` — stdin 受理未確認) はこの検査の対象
-        # 外 — argv 渡しのままでよい。`mission.prompt in inner_argv` は
-        # **完全一致の要素**としての判定であり部分文字列検索ではない
-        # (`ClaudeRunner._build_argv` の `"-p"` フラグのような短い argv
-        # 要素に `mission.prompt` がたまたま部分文字列として現れても
-        # 誤検知しない)。
+        # 外 — argv 渡しのままでよい。
+        #
+        # codex 2 周目 I2 是正 (2026-09-12): 要素**完全一致**だけでは
+        # `--prompt=<mission.prompt>` のような連結や、テンプレート接頭辞
+        # 付き argv 要素 (`"prefix: " + mission.prompt`) を見逃す —
+        # これらは要素として `mission.prompt` と等しくないが、prompt の
+        # 全文または大部分を argv 要素の中に含んでおり同じ脅威 (`/proc/
+        # <pid>/cmdline` 経由の露出) を持つ。よって argv の**各要素に
+        # ついて部分文字列として** prompt 全文、または prompt が長い
+        # 場合はその先頭 64 字 (短ければ全文と同じ) が含まれるかを見る。
+        # 先頭 64 字を含む要素は必ず全文を含む要素の上位集合になるため
+        # (prefix はその prompt 自体の部分文字列)、実装は prefix の
+        # 包含だけを判定すれば両方を捕捉できる。空 prompt はそもそも
+        # 情報を持たないため対象外 (`in` が常に True になり誤検知するのを
+        # 防ぐ)。
         stdin_prompt = self._stdin_prompt(mission)
-        if stdin_prompt is not None and mission.prompt in inner_argv:
-            raise ValueError(
-                f"{type(self).__name__}._build_argv leaves mission.prompt "
-                "in argv while _stdin_prompt did not opt out (None) — "
-                "the prompt would be readable via /proc/<pid>/cmdline by "
-                "other same-UID processes (design doc §D). Either remove "
-                "mission.prompt from _build_argv's return value, or "
-                "override _stdin_prompt to return None with a comment "
-                "explaining why this CLI cannot accept stdin.")
+        prompt = mission.prompt
+        if stdin_prompt is not None and prompt:
+            prompt_prefix = prompt[:64]
+            if any(prompt_prefix in arg for arg in inner_argv):
+                raise ValueError(
+                    f"{type(self).__name__}._build_argv leaves "
+                    "mission.prompt (or its leading 64 chars) embedded in "
+                    "an argv element while _stdin_prompt did not opt out "
+                    "(None) — the prompt would be readable via "
+                    "/proc/<pid>/cmdline by other same-UID processes "
+                    "(design doc §D). Either remove mission.prompt from "
+                    "_build_argv's return value, or override "
+                    "_stdin_prompt to return None with a comment "
+                    "explaining why this CLI cannot accept stdin.")
 
         # 段B M2: 追撃予算を mission 総予算の内数にする。reserve<=0、または
         # mission.timeout_sec が reserve 以下なら reserve を無効化し、

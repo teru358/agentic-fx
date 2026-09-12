@@ -28,8 +28,12 @@ SCHEMA = {"type": "object", "properties": {"answer": {"type": "integer"}},
 
 
 def _mission(**over: Any) -> Mission:
-    d = dict(prompt="p", tools=[], output_schema=SCHEMA, max_turns=8,
-             timeout_sec=5)
+    # codex 2 周目 I2 是正で argv 漏えいガードが部分一致になったため、
+    # 単一文字 "p" は sys.executable のパスや `-c` 等の argv 要素に偶然
+    # 含まれ誤検知する (実測: 44 件が偽陽性 fail closed した)。実運用の
+    # prompt は十分な長さを持つので、衝突しない既定値に変える。
+    d = dict(prompt="afx-test-mission-prompt-default-fixture", tools=[],
+             output_schema=SCHEMA, max_turns=8, timeout_sec=5)
     d.update(over)
     return Mission(**d)
 
@@ -437,6 +441,52 @@ def test_cli_runner_stdin_prompt_default_guards_argv_leak(tmp_path):
     # opt-out subclass は同じ argv 形でも guard の対象外 — 従来どおり通る。
     opted_out = _OptedOutLeakyRunner(script=_PRINT_ANSWER_AND_EXIT, **kw)
     result = opted_out.run(_mission())
+    assert result.status == "completed"
+
+
+@pytest.mark.parametrize("build_leaky_argv", [
+    lambda script, prompt: [
+        sys.executable, "-c", script, "--prompt=" + prompt],
+    lambda script, prompt: [
+        sys.executable, "-c", script, "prefix: " + prompt],
+    lambda script, prompt: [
+        sys.executable, "-c", script, prompt[:64] + "-suffix-junk"],
+], ids=["equals-form", "prefix-template-form", "prefix-64-concat-form"])
+def test_cli_runner_stdin_prompt_default_guards_argv_leak_partial_match(
+        tmp_path, build_leaky_argv):
+    """codex 2 周目 I2 是正の pin: `mission.prompt` が argv 要素の**完全
+    一致**ではなく部分文字列として (`--prompt=<secret>`、テンプレート
+    接頭辞連結、または prompt 先頭 64 字の連結として) 埋め込まれた場合も
+    `run()` は `ValueError` で fail closed する — 完全一致だけを見る
+    ガードだと、これらの連結形は要素として `mission.prompt` と等しく
+    ならないため素通りしてしまう (codex-r2.md Important #2)。"""
+
+    long_prompt = "S" * 40 + "ecret" + "-payload" * 10  # 64 字超の prompt
+
+    class _LeakyRunner(_FakeCliRunner):
+        def _build_argv(self, mission, *, mcp_socket):
+            return build_leaky_argv(self._script, mission.prompt)
+
+    kw = dict(bin_path=Path(sys.executable), model="m", workdir=tmp_path,
+              cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    leaky = _LeakyRunner(script=_PRINT_ANSWER_AND_EXIT, **kw)
+    with pytest.raises(ValueError):
+        leaky.run(_mission(prompt=long_prompt))
+
+
+def test_cli_runner_stdin_prompt_default_guard_allows_argv_without_prompt(
+        tmp_path):
+    """prompt を含まない argv (通常の非漏えい経路) はガードの対象外 —
+    部分一致化で偽陽性を作っていないことの pin。"""
+
+    class _CleanRunner(_FakeCliRunner):
+        def _build_argv(self, mission, *, mcp_socket):
+            return [sys.executable, "-c", self._script, "--flag", "value"]
+
+    kw = dict(bin_path=Path(sys.executable), model="m", workdir=tmp_path,
+              cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    clean = _CleanRunner(script=_PRINT_ANSWER_AND_EXIT, **kw)
+    result = clean.run(_mission(prompt="S" * 40 + "ecret" + "-payload" * 10))
     assert result.status == "completed"
 
 
