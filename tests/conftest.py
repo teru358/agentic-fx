@@ -54,6 +54,36 @@ def _new_untracked(before: "set[str] | None", after: "set[str] | None") -> set[s
         return set()
     return after - before
 
+
+def _top_level_untracked(porcelain_text: str) -> set[str]:
+    """ローカル 1 周目 pin 是正 (test-hygiene 2026-09-12): `git status
+    --porcelain --ignored=no -- .` の生テキストから、repo root 直下
+    (非再帰) の untracked (`??`) エントリ名だけを抽出する純関数。
+    `_guard_repo_root_has_no_new_untracked_files` の判定本体からこの
+    解析部分だけを切り出し、`git` を実行せずに単体で pin できるように
+    する。
+
+    - `??` (untracked) 以外の行 (` M tracked.py` の変更・`!! ignored`
+      の無視ファイル等) は対象外。
+    - path がサブディレクトリ配下 (`/` を含む、末尾 `/` 自体は許容 —
+      新規ディレクトリそのものは対象) なら対象外 (非再帰の対象外)。
+    - git が二重引用符でクォートした path (空白・非 ASCII 等を含む場合)
+      は前後のクォートだけを外す (エスケープシーケンスの解釈はしない —
+      本 pin が扱う入力に現れない)。
+    """
+    names: set[str] = set()
+    for line in porcelain_text.splitlines():
+        if len(line) < 4 or line[:2] != "??":
+            continue
+        path = line[3:]
+        if path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+        if "/" in path.rstrip("/"):
+            continue  # サブディレクトリ配下 — 非再帰の対象外
+        names.add(path)
+    return names
+
+
 #: 実 llama-swap の差し替え先 (即 ECONNREFUSED)。
 #: `tests/test_e2e_worker_isolation.py` と
 #: `tests/test_improve_profile_isolation.py` の双方が使う共有定数。
@@ -183,17 +213,7 @@ def _guard_repo_root_has_no_new_untracked_files():
             # 「検査不能」を記録するだけに留め、無関係な環境要因でスイート
             # 全体を落とさない。
             return None
-        names = set()
-        for line in result.stdout.splitlines():
-            if len(line) < 4 or line[:2] != "??":
-                continue
-            path = line[3:]
-            if path.startswith('"') and path.endswith('"'):
-                path = path[1:-1]
-            if "/" in path.rstrip("/"):
-                continue  # サブディレクトリ配下 — 非再帰の対象外
-            names.add(path)
-        return names
+        return _top_level_untracked(result.stdout)
 
     before = _sig()
     yield

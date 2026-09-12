@@ -77,6 +77,31 @@ def test_sweep_orphans_keeps_lock_held_by_flock_even_without_pending_approval(en
         fh.close()
 
 
+def test_sweep_orphans_keeps_lock_held_with_shared_lock_even_without_pending_approval(env):
+    """ローカル 1 周目 pin (P3, test-hygiene 2026-09-12):
+    `test_sweep_orphans_keeps_lock_held_by_flock_even_without_pending_
+    approval` (上記) は外部保持を `LOCK_EX` (排他) にしているため、
+    sweep 側が `LOCK_EX|LOCK_NB` を `LOCK_SH|LOCK_NB` (共有) へ緩める
+    変異を殺せない — `LOCK_SH` の保持者に対して sweep が `LOCK_SH|
+    LOCK_NB` を試みると (SH は SH 同士で両立するため) 取得に**成功**し、
+    誤って unlink してしまう。ここでは外部保持を `LOCK_SH` にし、正しく
+    `LOCK_EX|LOCK_NB` を試みる sweep なら (EX は既存の SH と非両立のため)
+    取得に失敗して残ることを確認する。"""
+    tmp_path, plugins_dir, conn = env
+    lock_path = _make_lock(plugins_dir, "shared_held_candidate")
+
+    fh = open(lock_path, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_SH)
+        switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+        assert lock_path.exists(), (
+            "外部が LOCK_SH で保持中のロックが sweep で消えた — "
+            "sweep 側が LOCK_EX ではなく LOCK_SH で試行している疑い")
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+
+
 def test_sweep_orphans_does_nothing_when_locks_dir_absent(env):
     tmp_path, plugins_dir, conn = env
     assert not (plugins_dir / ".locks").exists()

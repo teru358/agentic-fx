@@ -587,6 +587,18 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
             except OSError:
                 continue
             try:
+                # ローカル 1 周目 P3 (test-hygiene 2026-09-12): `LOCK_EX`
+                # (排他) を要求する — `LOCK_SH` (共有) に緩めると、外部が
+                # `LOCK_SH` で保持中でも取得に成功してしまい誤って unlink
+                # する (`tests/plugin/test_switch_locks_sweep.py::
+                # test_sweep_orphans_keeps_lock_held_with_shared_lock_
+                # even_without_pending_approval` が pin)。**`LOCK_NB` を
+                # 外す変異はここでは検査しない** — 本関数は「runner 起動前
+                # の単一プロセス、他プロセスからの同時アクセスが無い」
+                # 前提 (関数冒頭の docstring) で動くため、`LOCK_NB` を
+                # 外すとブロッキング待ちになり得るが、これはテストで
+                # 再現するとタイムアウトなしにはハングし得る類の変異
+                # (単体テストでは実行しない、設計上の既知の非検査対象)。
                 try:
                     fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except OSError:

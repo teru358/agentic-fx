@@ -602,6 +602,28 @@ def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
     return frames, rlimit_calls, registry_calls
 
 
+def test_drive_main_chdirs_to_tmp_path(monkeypatch, tmp_path):
+    """ローカル 1 周目 pin (P2, test-hygiene 2026-09-12): `_drive_main`
+    自体が `monkeypatch.chdir(tmp_path)` していることを直接 assert する。
+
+    既存の証拠は `tests/conftest.py::_guard_repo_root_has_no_new_
+    untracked_files` (session guard) が間接的に捉えていただけで、この
+    ヘルパ単体の pin は無かった — session guard に頼らず単体で red に
+    なるようにする (`_drive_main` の `monkeypatch.chdir(tmp_path)` を
+    落とす変異は、他のどのテストも直接には見ていなかった)。
+
+    `mission_worker.main()` は `Path.cwd()` を読むだけで自らは chdir し
+    ない — `_drive_main` から戻った直後 (monkeypatch の teardown 前) の
+    `os.getcwd()` が `_drive_main` に渡した `tmp_path` と一致することを
+    確認すれば、`_drive_main` 内で実際に chdir が起きたことの直接証拠に
+    なる。"""
+    _drive_main(monkeypatch, tmp_path)
+
+    assert os.path.samefile(os.getcwd(), tmp_path), (
+        f"_drive_main が cwd を tmp_path へ chdir していない: "
+        f"os.getcwd()={os.getcwd()!r} tmp_path={tmp_path!r}")
+
+
 class _CountingFakeLocalRunner(_FakeLocalRunner):
     """`_FakeLocalRunner` の `.run()` 呼び出し回数を数える (RW1/RW6 pin —
     `go` を送らないと Mission/LLM が一切起動しないことの検証には、

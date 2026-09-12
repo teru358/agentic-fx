@@ -365,6 +365,56 @@ def test_bootstrap_improve_profile_does_not_mkdir_transcript_dir_under_guarded_d
             _shutil.rmtree(data_marker_dir, ignore_errors=True)
 
 
+def test_bootstrap_improve_profile_skips_rw_allowlist_when_transcript_mkdir_raises_oserror(
+        improve_worker_layout):
+    """ローカル 1 周目 pin (P4, test-hygiene 2026-09-12): C4 是正後の形で
+    「mkdir が `OSError` (例: 対象パスに既に通常ファイルがある) のとき
+    `extra_rw_paths` に追加されない」ことを、Landlock の実際の
+    read_write_paths (`landlock.restrict_to` の呼び出し引数) を捕まえて
+    直接確認する。`_run_bootstrap_probe` はそのプリアンブルで
+    `_bootstrap_improve_profile` を呼んでしまう (monkeypatch を挟む余地が
+    無い) ため、ここでは
+    `test_bootstrap_improve_profile_fails_closed_when_exec_closure_dirs_
+    reach_data` と同じ形で subprocess スクリプトを自前で組み立てる。"""
+    l = improve_worker_layout
+    blocked_path = l["workdir"] / "blocked-transcripts-file"
+    blocked_path.write_text("this is a regular file, not a directory")
+    full_script = textwrap.dedent(f"""
+        import json, sys
+        sys.path.insert(0, {str(_REPO_ROOT / "src")!r})
+        from agentic_fx import mission_worker
+        from agentic_fx.core import landlock
+
+        captured = {{}}
+
+        def fake_restrict_to(**kw):
+            captured.update(kw)
+
+        landlock.restrict_to = fake_restrict_to
+        mission_worker._bootstrap_improve_profile(
+            backend={"local"!r}, mission_id={l["mission_id"]!r},
+            staging_dir={str(l["staging_dir"])!r},
+            source_snapshot_dir={str(l["source_snapshot_dir"])!r},
+            claude_bin=None, codex_bin=None)
+        rw = [str(p) for p in captured.get("read_write_paths", [])]
+        print(json.dumps(rw))
+    """)
+    env = {"PATH": "/usr/bin:/bin",
+          "AGENTIC_FX_MISSION_TRANSCRIPTS_DIR": str(blocked_path)}
+    result = subprocess.run([sys.executable, "-c", full_script],
+                            cwd=str(l["workdir"]), env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    read_write_paths = json.loads(result.stdout.strip().splitlines()[-1])
+    assert str(blocked_path) not in read_write_paths, (
+        f"mkdir が OSError (対象が通常ファイル) で失敗したのに "
+        f"{blocked_path} が read_write_paths (extra_rw_paths) に "
+        f"追加されている: {read_write_paths}")
+    # mkdir 失敗の副作用でファイル自体が壊れていないことも確認する。
+    assert blocked_path.is_file()
+    assert not blocked_path.is_dir()
+
+
 def test_bootstrap_improve_profile_rejects_staging_dir_mission_id_mismatch(
         improve_worker_layout):
     """§2.2: `staging_dir` の末尾成分が handshake の `mission_id` と

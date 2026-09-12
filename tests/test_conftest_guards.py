@@ -8,7 +8,7 @@ fail していた (文言「新規…残った」と矛盾する偽陽性)。判
 """
 from __future__ import annotations
 
-from tests.conftest import _new_untracked
+from tests.conftest import _new_untracked, _top_level_untracked
 
 
 def test_new_untracked_returns_empty_set_when_a_file_is_removed():
@@ -44,3 +44,31 @@ def test_new_untracked_is_empty_when_either_side_is_none():
     assert _new_untracked(None, {"a.txt"}) == set()
     assert _new_untracked({"a.txt"}, None) == set()
     assert _new_untracked(None, None) == set()
+
+
+# --- ローカル 1 周目 pin (P1, test-hygiene 2026-09-12):
+# `_top_level_untracked` の porcelain 解析 pin ------------------------
+
+def test_top_level_untracked_excludes_subdirectory_entries():
+    """サブディレクトリ配下の untracked (`??` 行の path に `/` を含む)
+    は非再帰の対象外 — 意図した一時ファイルまで拾って過検出にしない。"""
+    assert _top_level_untracked("?? sub/x.txt\n") == set()
+
+
+def test_top_level_untracked_unquotes_and_includes_quoted_non_ascii_path():
+    """git がクォートした path (空白・非 ASCII を含む場合) は前後の
+    クォートだけを外して top-level エントリとして含める。"""
+    assert _top_level_untracked('?? "日本 語.txt"\n') == {"日本 語.txt"}
+
+
+def test_top_level_untracked_excludes_tracked_changes_and_ignored_paths():
+    """`??` (untracked) 以外の行 — 追跡済みファイルへの変更 (` M`) や
+    `.gitignore` 済み (`!!`、`--ignored=` 指定時のみ現れる) — は対象外。"""
+    porcelain = " M tracked.py\n!! ignored\n"
+    assert _top_level_untracked(porcelain) == set()
+
+
+def test_top_level_untracked_includes_new_top_level_directory():
+    """`?? newdir/` (新規ディレクトリそのもの、末尾 `/` のみで内部の `/`
+    を含まない) は top-level エントリとして含める。"""
+    assert _top_level_untracked("?? newdir/\n") == {"newdir/"}
