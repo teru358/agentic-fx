@@ -283,9 +283,15 @@ def _bootstrap_improve_profile(
     if (resolved_transcript_dir == guarded_data_dir
             or resolved_transcript_dir in guarded_data_dir.parents
             or guarded_data_dir in resolved_transcript_dir.parents):
+        # codex 2 周目 Minor M2 (2026-09-12): 旧文言の「(fail closed)」は
+        # improve worker の起動そのものを拒否しているように読めるが、
+        # ここは transcript 保存 (best-effort 機能) だけを諦めて bootstrap
+        # 自体は継続する分岐 — 「fail closed」という語で worker 起動拒否と
+        # 誤読されないよう、継続する事実を明示する文言に変更する。
         logging.getLogger("agentic_fx.mission_worker").warning(
             "mission transcript dir (%s) resolves under the guarded data "
-            "dir (%s) — skipping mkdir/allowlist for it (fail closed, "
+            "dir (%s) — protected path excluded; continuing without "
+            "transcript persistence (mkdir/rw allowlist skipped, "
             "test-hygiene C4)", resolved_transcript_dir, guarded_data_dir)
     else:
         try:

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from agentic_fx.activity import ActivityLog
 from agentic_fx.plugin import switch
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import db as db_store
@@ -174,3 +175,47 @@ def test_sweep_orphans_skips_pending_row_whose_name_is_not_a_string(env):
         "name が非 str の pending 行が混在すると sweep が途中停止し "
         "孤児ロックが残った")
     assert another_pending_lock.exists(), "正常な pending ロックまで消えた"
+
+
+def test_sweep_orphans_recovers_empty_name_lock_despite_empty_string_pending_row(env):
+    """codex 2 周目 Minor M1 (test-hygiene 2026-09-12): `isinstance(name,
+    str)` だけでは、`name=""` (空文字、plugin 名の正規形
+    `^[a-z][a-z0-9_]{0,63}$` に合致しない) が `pending_names` にそのまま
+    入ってしまう。`.locks/.lock` (ファイル名が単に `.lock` — 拡張子を
+    剥がすと空文字になる孤児ロック) が「pending」と誤認され、回収され
+    ないまま残留することが codex により実測された (指揮者のローカル
+    1 周目では「空文字は実害なし」と却下したが、この残留実測を受けて
+    採用に変更)。plugin 名の正規形と `fullmatch` しない `name` は
+    corrupt 行として skip し、`.locks/.lock` は孤児ロックとして正しく
+    回収されることを確認する。"""
+    tmp_path, plugins_dir, conn = env
+    empty_name_lock = _make_lock(plugins_dir, "")
+    approvals_store.create(
+        conn, kind="plugin", payload={"name": ""}, now=NOW, commit=True)
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+
+    assert not empty_name_lock.exists(), (
+        "name=\"\" の pending 行が誤って正規の名前として扱われ、"
+        ".locks/.lock が回収されずに残った")
+
+
+def test_sweep_orphans_records_activity_when_pending_name_has_a_path_separator(env):
+    """codex 2 周目 Minor M1: `name` が str であっても plugin 名の正規形
+    (パス区切りを含んではならない) に合致しなければ corrupt 扱いで
+    activity に記録されることを確認する。"""
+    tmp_path, plugins_dir, conn = env
+    activity = ActivityLog(tmp_path / "activity.log")
+    # `.locks/` ディレクトリ自体が無いと ⑧ branch そのものが skip される
+    # (`locks_dir.is_dir()` ガード) ため、無関係なロックを 1 つ置いて
+    # branch を実行させる。
+    _make_lock(plugins_dir, "unrelated")
+    approvals_store.create(
+        conn, kind="plugin", payload={"name": "sub/name"}, now=NOW, commit=True)
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW,
+                         activity=activity)
+
+    log = (tmp_path / "activity.log").read_text()
+    assert "sweep_locks_payload_corrupt" in log
+    assert "sub/name" in log

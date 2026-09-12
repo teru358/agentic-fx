@@ -564,13 +564,26 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
             # 値 (list/dict) だった場合は `set.add` で `TypeError` に
             # なり、C2 で足した per-entry 隔離が **型のずれまでは** カバー
             # していなかった (この 1 行の型異常だけで sweep 全体が再び
-            # 止まる)。`isinstance(name, str)` でなければ skip し、
-            # activity に 1 行残す。
-            if name is not None and not isinstance(name, str):
+            # 止まる)。
+            #
+            # ローカル 1 周目是正 M1 (codex 2 周目 Minor, 2026-09-12):
+            # `isinstance(name, str)` だけでは不十分 — `name=""` (空文字)
+            # のような plugin 名の正規形に合致しない文字列も pending_names
+            # に入ってしまい、`.locks/.lock` (`lock_file.name[:-len(".lock")]`
+            # が空文字になる、ファイル名が単に `.lock` のケース) を
+            # 「pending」誤認して回収し損なう実害が実測された (指揮者の
+            # ローカル 1 周目では「空文字は実害なし」と却下していたが、
+            # codex がこの残留を実測したため採用に変更)。plugin 名の正規形
+            # (`loader._PLUGIN_NAME_RE` = `^[a-z][a-z0-9_]{0,63}$`) を
+            # `fullmatch` で流用し、不一致 (空文字・`sub/name` のような
+            # パス区切り混入・大文字等) も corrupt 扱いで skip する。
+            if name is not None and not (
+                    isinstance(name, str)
+                    and loader._PLUGIN_NAME_RE.fullmatch(name)):
                 if activity is not None:
                     activity.write(
                         Category.APPROVAL, "sweep_locks_payload_corrupt",
-                        f"error=name is not a string (type={type(name).__name__})")
+                        f"error=name is not a valid plugin name ({name!r})")
                 continue
             if name is not None:
                 pending_names.add(name)

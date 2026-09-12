@@ -365,6 +365,38 @@ def test_bootstrap_improve_profile_does_not_mkdir_transcript_dir_under_guarded_d
             _shutil.rmtree(data_marker_dir, ignore_errors=True)
 
 
+def test_bootstrap_improve_profile_data_dir_skip_warning_does_not_read_as_startup_refusal(
+        improve_worker_layout):
+    """codex 2 周目 Minor M2 (test-hygiene 2026-09-12): C4 是正の warning
+    文言に含まれていた「(fail closed)」は improve worker の起動そのものを
+    拒否しているように読める。実際にはこの分岐は transcript 保存だけを
+    諦めて bootstrap 自体は継続するため、「起動は継続する」ことを明示する
+    文言 (`continuing without transcript persistence`) に変更し、
+    誤解を招く「fail closed」の語をこの警告からは外した。`logging` の
+    既定 (ハンドラ未設定時の `lastResort`) は stderr へ出るため、子
+    プロセスの `result.stderr` で文言を確認する。"""
+    l = improve_worker_layout
+    marker = f"c4-wording-probe-{uuid.uuid4().hex}"
+    malicious_dir = _REPO_ROOT / "data" / marker / "mission-transcripts"
+    data_marker_dir = _REPO_ROOT / "data" / marker
+    script = "print('BOOTSTRAP_OK')"
+    try:
+        result = _run_bootstrap_probe(
+            script, staging_dir=l["staging_dir"], mission_id=l["mission_id"],
+            source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"],
+            extra_env={"AGENTIC_FX_MISSION_TRANSCRIPTS_DIR": str(malicious_dir)})
+        assert result.returncode == 0, result.stderr
+        assert "continuing without transcript persistence" in result.stderr, (
+            f"是正後の文言が stderr に出ていない: {result.stderr!r}")
+        assert "fail closed" not in result.stderr, (
+            "起動拒否と誤読されうる旧文言 'fail closed' がまだ warning に "
+            f"残っている: {result.stderr!r}")
+    finally:
+        if data_marker_dir.exists():
+            import shutil as _shutil
+            _shutil.rmtree(data_marker_dir, ignore_errors=True)
+
+
 def test_bootstrap_improve_profile_skips_rw_allowlist_when_transcript_mkdir_raises_oserror(
         improve_worker_layout):
     """ローカル 1 周目 pin (P4, test-hygiene 2026-09-12): C4 是正後の形で
