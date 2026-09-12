@@ -96,3 +96,32 @@ def test_sweep_orphans_ignores_non_lock_entries_in_locks_dir(env):
     switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
 
     assert stray.exists()
+
+
+def test_sweep_orphans_skips_corrupt_payload_row_without_aborting_the_sweep(env):
+    """検収是正 C2 (test-hygiene 2026-09-12): 旧実装は集合内包表記で全
+    `approval_requests` 行を一括 `json.loads` していたため、1 行でも
+    `payload_json` が壊れている (不正 JSON・非 dict) と例外がそのまま
+    送出され `.locks/` 回収そのものが止まっていた。壊れた行を混在させても
+    (a) 正常な pending 行に対応するロックは残り、(b) 対応する pending が
+    無いロックは回収される、の両方を確認する (= 例外が握り潰されて
+    sweep 全体が継続していることの間接証拠)。"""
+    tmp_path, plugins_dir, conn = env
+    pending_lock = _make_lock(plugins_dir, "healthy_pending")
+    orphan_lock = _make_lock(plugins_dir, "orphaned_candidate")
+    _pending_approval(conn, "healthy_pending")
+    # 壊れた行 (不正 JSON) を直接挿入する — approvals_store.create は
+    # 常に valid JSON を書くため、ここだけ生 SQL で汚す。
+    conn.execute(
+        "INSERT INTO approval_requests (kind, payload_json, created_at) "
+        "VALUES ('plugin', ?, ?)", ("{not valid json", NOW.isoformat()))
+    # 非 dict payload (リスト) の行も混在させる。
+    conn.execute(
+        "INSERT INTO approval_requests (kind, payload_json, created_at) "
+        "VALUES ('plugin', ?, ?)", ("[1, 2, 3]", NOW.isoformat()))
+    conn.commit()
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+
+    assert pending_lock.exists(), "壊れた行の混在で正常な pending ロックまで消えた"
+    assert not orphan_lock.exists(), "壊れた行の例外で sweep が途中停止し孤児ロックが残った"

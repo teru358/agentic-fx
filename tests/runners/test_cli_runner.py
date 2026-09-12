@@ -995,6 +995,7 @@ def test_detect_stderr_fatal_no_match_returns_none():
     "Error: usage limit reached, please upgrade your plan",
     "rate limited — try again at 2026-09-13T00:00:00Z",
     "HTTP request failed: 401 Unauthorized",
+    "Error: Unauthorized (no valid credentials)",
 ])
 def test_detect_stderr_fatal_matches_subscription_and_auth_patterns(stderr_text):
     from agentic_fx.runners.cli_runner import _detect_stderr_fatal
@@ -1002,6 +1003,17 @@ def test_detect_stderr_fatal_matches_subscription_and_auth_patterns(stderr_text)
     found = _detect_stderr_fatal(stderr_text)
     assert found is not None
     assert "pattern=" in found and "tail=" in found
+
+
+def test_detect_stderr_fatal_401_is_not_a_bare_substring():
+    """検収是正 C1 (test-hygiene): 旧パターン `"401"` は `_detect_stderr_
+    fatal` が素の `in` で照合するため、`"elapsed 14012 ms"` のような
+    無関係な数字混入にも一致してしまう偽陽性だった。`"401 Unauthorized"`
+    / `"Unauthorized"` へ置換したことで、`401` を含むが認証失敗ではない
+    stderr は検知されないことを確認する。"""
+    from agentic_fx.runners.cli_runner import _detect_stderr_fatal
+
+    assert _detect_stderr_fatal("elapsed 14012 ms, request id abc-401-xyz") is None
 
 
 def test_detect_stderr_fatal_empty_pattern_tuple_disables_detection(monkeypatch):

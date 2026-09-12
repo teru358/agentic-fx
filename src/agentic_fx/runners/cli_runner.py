@@ -74,7 +74,13 @@ _STDERR_TAIL_BUDGET_FRACTION = 0.15
 #: `service._check_codex_subscription_expiry` は撤去した (実 auth.json に
 #: 期限キーが無く空振り WARNING しか出さなかった)。サブスク上限/認証失効は
 #: codex/claude 自身が実行時に返す文言 (`usage limit` / `try again at` /
-#: `401`) をここに足し、`cli_stderr_fatal` 経由で検知する側に寄せる。
+#: `401 Unauthorized` / `Unauthorized`) をここに足し、`cli_stderr_fatal`
+#: 経由で検知する側に寄せる。
+#: **検収是正 C1 (2026-09-12)**: `_detect_stderr_fatal` は素の `in` で
+#: 照合するため、単なる `"401"` は `"elapsed 14012 ms"` のような無関係な
+#: 数字混入 (経過時間・リクエスト ID 等) にも一致する偽陽性だった。
+#: `"401 Unauthorized"` (数字+文言のペア) と `"Unauthorized"` (文言単独の
+#: 認証失敗表現) の 2 パターンへ置換する。
 CLI_STDERR_FATAL_PATTERNS: tuple[str, ...] = (
     "code-mode host",
     "SIGTRAP",
@@ -82,7 +88,8 @@ CLI_STDERR_FATAL_PATTERNS: tuple[str, ...] = (
     "Segmentation fault",
     "usage limit",
     "try again at",
-    "401",
+    "401 Unauthorized",
+    "Unauthorized",
 )
 
 #: activity `cli_stderr_fatal` 1 行に埋め込む tail の文字数上限

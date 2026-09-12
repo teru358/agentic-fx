@@ -40,6 +40,20 @@ from urllib.parse import urlsplit
 
 import pytest
 
+
+def _new_untracked(before: "set[str] | None", after: "set[str] | None") -> set[str]:
+    """検収是正 C3 (test-hygiene 2026-09-12):
+    `_guard_repo_root_has_no_new_untracked_files` の判定本体を切り出した
+    もの。**新規に増えた** untracked 名だけを返す — `before != after` で
+    判定すると、テスト中に untracked ファイルが**減った**場合 (別の
+    fixture が偶然 cleanup した等) にも fail してしまい、文言「新規…
+    残った」と矛盾する。`before`/`after` のどちらかが `None` (git が
+    使えず検査不能) なら空集合を返す (呼び出し側は None を「検査不能」
+    として scope 外に扱う)。"""
+    if before is None or after is None:
+        return set()
+    return after - before
+
 #: 実 llama-swap の差し替え先 (即 ECONNREFUSED)。
 #: `tests/test_e2e_worker_isolation.py` と
 #: `tests/test_improve_profile_isolation.py` の双方が使う共有定数。
@@ -184,10 +198,10 @@ def _guard_repo_root_has_no_new_untracked_files():
     before = _sig()
     yield
     after = _sig()
-    if before is not None and after is not None and before != after:
-        added = sorted(after - before)
+    added = _new_untracked(before, after)
+    if added:
         pytest.fail(
-            f"repo root 直下に新規 untracked ファイルが残った: {added}。"
+            f"repo root 直下に新規 untracked ファイルが残った: {sorted(added)}。"
             "テストが production ファイルを cwd (repo root) に書いている "
             "可能性がある — workdir を tmp_path へ隔離すること "
             "(test-hygiene T1(b))。",

@@ -531,12 +531,33 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
     # ような flock+unlink の TOCTOU 穴が構造的に無い。
     locks_dir = plugins_root / ".locks"
     if locks_dir.is_dir():
-        pending_names = {
-            json.loads(r["payload_json"]).get("name")
-            for r in conn.execute(
+        # 検収是正 C2 (2026-09-12): 旧実装は集合内包表記で全行を一括
+        # `json.loads` していたため、1 行でも payload_json が壊れている
+        # (不正 JSON・非 dict) と例外がそのまま送出され、sweep_orphans
+        # 全体 (このあとに続く ⑦′ 等も含む) が止まっていた。他の branch
+        # (⑦ 等) と同じ「1 行の失敗を隔離する」規律に合わせ、行ごとに
+        # try/except で読み、壊れた行は skip して activity に 1 行残す。
+        pending_names: set[str] = set()
+        for r in conn.execute(
                 "SELECT payload_json FROM approval_requests "
-                "WHERE kind='plugin' AND status='pending'")
-        }
+                "WHERE kind='plugin' AND status='pending'"):
+            try:
+                payload = json.loads(r["payload_json"])
+            except (ValueError, TypeError) as exc:
+                if activity is not None:
+                    activity.write(
+                        Category.APPROVAL, "sweep_locks_payload_corrupt",
+                        f"error={safe_error_text(exc)}")
+                continue
+            if not isinstance(payload, dict):
+                if activity is not None:
+                    activity.write(
+                        Category.APPROVAL, "sweep_locks_payload_corrupt",
+                        f"error=payload not a dict (type={type(payload).__name__})")
+                continue
+            name = payload.get("name")
+            if name is not None:
+                pending_names.add(name)
         for lock_file in locks_dir.iterdir():
             if lock_file.is_symlink() or not lock_file.is_file():
                 continue
