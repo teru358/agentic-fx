@@ -4417,6 +4417,186 @@ def test_worker_runner_reaps_real_cli_pgid_via_mission_worker_wiring(
             _shutil.rmtree(d, ignore_errors=True)
 
 
+_FAKE_CLAUDE_PGID_DRIVER_ELF_SRC = (
+    Path(__file__).resolve().parent / "fixtures"
+    / "fake_claude_pgid_driver_elf.c")
+
+
+def _compile_fake_claude_pgid_driver_elf(tmp_path: Path) -> Path:
+    """`_FAKE_CLAUDE_PGID_DRIVER_ELF_SRC` をテスト実行時に ELF へビルド
+    する — バイナリはコミットしない (アーキテクチャ依存)。`cc` が使えない
+    環境では呼び出し元のテストを skip する (改造できない旨を report で
+    明示する、黙って red のまま残さない)。"""
+    import shutil as _shutil
+    cc = _shutil.which("cc") or _shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C compiler (cc/gcc) available to build the fixture "
+                    "ELF driver")
+    binary = tmp_path / "fake_claude_pgid_driver_elf"
+    result = subprocess.run(
+        [cc, "-O2", "-o", str(binary), str(_FAKE_CLAUDE_PGID_DRIVER_ELF_SRC)],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        pytest.skip(
+            f"failed to build the fixture ELF driver: {result.stderr}")
+    return binary
+
+
+def test_worker_runner_reaps_real_cli_pgid_under_improve_profile(
+        monkeypatch, tmp_path):
+    """/code-review 2 周目 CR2 是正 (2026-09-12): improve profile
+    (Landlock、`core/landlock.py::elf_interpreter` の ELF-only gate) の
+    実 subprocess で `_terminate_cli_pgid` の pgid 単位回収
+    (SIGTERM→grace→SIGKILL のエスカレーション込み) を検証する。
+
+    設計書 §D (T-D) 是正後、caffc1b 版のこのテスト
+    (`/bin/sh -p <driver script>` を悪用して `-p` の隣接性で mission.prompt
+    をスクリプトパスとして解釈させていた) は argv から `mission.prompt`
+    が消えたことで動かなくなり、`test_worker_runner_reaps_real_cli_pgid_
+    via_mission_worker_wiring` として `trade` profile (Landlock 無し) へ
+    downgrade された — improve profile の Landlock/ELF bootstrap を経由
+    した実測がその時点で失われていた。
+
+    fake CLI (`fake_claude_pgid_driver_elf.c`、テスト実行時に `cc` で
+    ビルドする ELF バイナリ、argv/stdin の中身を一切読まない) を
+    `claude.bin` に据えることで、`ClaudeRunner._build_argv` が実際に
+    組み立てる argv (`-p --output-format stream-json --verbose
+    --json-schema <json> --setting-sources "" --strict-mcp-config
+    --mcp-config <path> --allowedTools <str> --tools <str> --max-turns <n>
+    --model <model>`) をそのまま渡しても `elf_interpreter()` の ELF 判定
+    を満たしたまま起動する。mission_worker を SIGKILL した後、fake CLI
+    自身 (PDEATHSIG で即死) ではなく **PDEATHSIG を継がない孫プロセス**
+    が `_terminate_cli_pgid` の pgid 単位回収 (SIGTERM 無視→grace→
+    SIGKILL) で消えることを確認する。"""
+    if not landlock_available():
+        pytest.skip("Landlock not available on this kernel/architecture")
+
+    fake_claude_bin = _compile_fake_claude_pgid_driver_elf(tmp_path)
+
+    root = _root(tmp_path)
+
+    creds = tmp_path / ".credentials.json"
+    creds.write_text('{"token":"x"}')
+    creds.chmod(0o600)
+
+    settings = SETTINGS.model_copy(update={
+        "runner": SETTINGS.runner.model_copy(update={
+            "improve": SETTINGS.runner.improve.model_copy(
+                update={"backend": "claude"}),
+            "claude": SETTINGS.runner.claude.model_copy(update={
+                "bin": str(fake_claude_bin), "credentials_file": str(creds)}),
+            "cli_terminate_grace_sec": 2.0,
+        }),
+        "worker": SETTINGS.worker.model_copy(update={
+            "worker_startup_timeout_sec": 10.0, "worker_grace_sec": 5.0}),
+    })
+
+    staging_dir = tmp_path / "staging" / "improve-pgid-probe"
+    staging_dir.mkdir(parents=True, mode=0o700)
+    source_snapshot_dir = tmp_path / "source"
+    source_snapshot_dir.mkdir(mode=0o500)
+
+    class _RunContext:
+        def __init__(self):
+            self.mission_id = "improve-pgid-probe"
+            self.staging_dir = staging_dir
+            self.source_snapshot_dir = source_snapshot_dir
+
+    real_popen = subprocess.Popen
+    spawned: dict = {}
+    captured_cwd: dict[str, object] = {}
+
+    def spy_popen(*a, **kw):
+        p = real_popen(*a, **kw)
+        spawned["proc"] = p
+        captured_cwd["cwd"] = kw.get("cwd")
+        return p
+
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", spy_popen)
+
+    # `test_trade_claude_real_process_completes_via_factory_build_runner` と
+    # 同じ手口: `WorkerRunner.run()` の `with tempfile.TemporaryDirectory`
+    # は正常終了時に workdir を rmtree するため、cleanup だけ無効化した
+    # 差し替えでテスト側から workdir を検査可能にする。
+    created_tempdirs: list[str] = []
+
+    class _NoCleanupTempDir(wr_mod.tempfile.TemporaryDirectory):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            created_tempdirs.append(self.name)
+            self._finalizer.detach()
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return None
+
+    monkeypatch.setattr(wr_mod.tempfile, "TemporaryDirectory", _NoCleanupTempDir)
+
+    runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_RunContext())
+    mission = Mission(prompt="hi", tools=[], output_schema={"type": "object"},
+                      max_turns=1, timeout_sec=120.0)
+
+    thread = threading.Thread(target=lambda: runner.run(mission))
+    thread.start()
+    deadline = time.monotonic() + 20.0
+    while "cwd" not in captured_cwd and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert "cwd" in captured_cwd, (
+        "mission_worker 子プロセスが起動しなかった "
+        "(WorkerRunner.run() の早期 return の可能性)")
+    mission_workdir = Path(captured_cwd["cwd"])
+    marker = mission_workdir / "fake_claude_pid"
+    grandchild_marker = mission_workdir / "fake_claude_grandchild_pid"
+
+    deadline = time.monotonic() + 20.0
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.exists(), (
+        "fake claude CLI が起動しなかった (improve profile の Landlock/"
+        "ELF bootstrap で claude.bin の exec 自体が拒否された可能性、"
+        "または cli_started 配線が mission_worker.py に届いていない可能性)")
+    cli_pid = int(marker.read_text())
+
+    # 孫プロセスが実際に起動 (自身の pid を書く) するまで待つ — これが
+    # 出現していないと「孫が生き残った」ことの検査自体が成立しない。
+    deadline = time.monotonic() + 20.0
+    while not grandchild_marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert grandchild_marker.exists(), "孫プロセスが起動しなかった"
+
+    # cli_pid が判明した以降は assert 失敗時にも必ず孤児回収まで到達させる。
+    try:
+        os.kill(spawned["proc"].pid, signal.SIGKILL)  # mission_worker を SIGKILL
+        thread.join(timeout=20.0)
+        assert not thread.is_alive(), "runner.run() が終わらない"
+
+        # PDEATHSIG は fake CLI 自身 (直接の子) には即座に届く — ここでは
+        # 孫の生死だけを観測点にする (孫の回収は `_terminate_cli_pgid` の
+        # killpg(pgid) を経由しないと起きない)。
+        deadline = time.monotonic() + 8.0
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(cli_pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            time.sleep(0.05)
+        assert not alive, (
+            "fake claude CLI の pgid (孫プロセス含む) が SIGKILL へ昇格"
+            "して回収されず生存している (improve profile)")
+    finally:
+        # テストが落ちても SIGTERM 無視プロセスを孤児として残さない。
+        try:
+            os.killpg(cli_pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        import shutil as _shutil
+        for d in created_tempdirs:
+            _shutil.rmtree(d, ignore_errors=True)
+
+
 FAKE_CLAUDE_TRADE_DRIVER = (
     Path(__file__).resolve().parent / "fixtures" / "fake_claude_trade_driver.py")
 

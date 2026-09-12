@@ -274,14 +274,22 @@ class CliRunner(AgentRunner):
     def _stdin_prompt(self, mission: Mission) -> str | None:
         """設計書 §D: `_run_cli_process` へ渡す stdin 用 prompt 文字列。
 
-        既定 (このクラス) は `None` — `_run_cli_process` はこれまでどおり
-        `/dev/null` を stdin に開く。argv に `mission.prompt` を積んだまま
-        の backend (`OpencodeRunner`、本対応の対象外) はこの hook を
-        override しないため devnull のまま変わらない。argv から
-        `mission.prompt` を除いた backend (`ClaudeRunner`/`CodexRunner`)
-        だけが override して `mission.prompt` を返し、ファイル経由の
-        stdin に切り替える。"""
-        return None
+        /code-review 2 周目 CR5 是正 (2026-09-12): 既定 (このクラス) は
+        `mission.prompt` — argv 渡しではなく安全側 (stdin 経由、
+        `/proc/<pid>/cmdline` から読めない) を base class の**不変条件**に
+        する。従来の既定は `None` (devnull) で、`_build_argv` から
+        `mission.prompt` を抜くことを個々の backend の自己申告に委ねて
+        いた — 新しい subclass がこの hook を override し忘れると、argv に
+        `mission.prompt` を積んだまま気づかれずに通る (`ClaudeRunner`/
+        `CodexRunner` は現に override していたので実害は無かったが、
+        「安全な既定」ではなく「安全側にした backend だけが安全」という
+        構造だった)。`run()` は `_build_argv` の戻り値にまだ
+        `mission.prompt` が残っていないかをこの返り値 (非 None) と対で
+        検査する (fail closed — 残っていれば `ValueError`)。stdin を
+        読めない CLI (`OpencodeRunner`) は明示的にこの hook を `None` へ
+        override して opt-out する — その場合だけ argv 渡しのままでよい
+        (`run()` 側のガードは opt-out 時は検査しない)。"""
+        return mission.prompt
 
     def _run_cli_process(self, argv: list[str], env: dict[str, str], *,
                           timeout_sec: float,
@@ -381,6 +389,31 @@ class CliRunner(AgentRunner):
         inner_argv = self._build_argv(mission, mcp_socket=mcp_socket)
         env = self._build_env(mission)
 
+        # /code-review 2 周目 CR5 是正 (2026-09-12): `_stdin_prompt` を
+        # 一度だけ呼ぶ (`_run_cli_process` への引数と、このガードの両方が
+        # 同じ値を見る)。既定 (stdin 経由、非 None) を選んだ subclass は
+        # `_build_argv` が `mission.prompt` を argv から抜いている
+        # ことを assert する — 抜けていなければ、その prompt は
+        # `/proc/<pid>/cmdline` から他の同 UID プロセスに読める
+        # (設計書 §D の脅威モデル) ので fail closed で `ValueError`。
+        # `_stdin_prompt` を明示的に `None` へ override した opt-out
+        # backend (`OpencodeRunner` — stdin 受理未確認) はこの検査の対象
+        # 外 — argv 渡しのままでよい。`mission.prompt in inner_argv` は
+        # **完全一致の要素**としての判定であり部分文字列検索ではない
+        # (`ClaudeRunner._build_argv` の `"-p"` フラグのような短い argv
+        # 要素に `mission.prompt` がたまたま部分文字列として現れても
+        # 誤検知しない)。
+        stdin_prompt = self._stdin_prompt(mission)
+        if stdin_prompt is not None and mission.prompt in inner_argv:
+            raise ValueError(
+                f"{type(self).__name__}._build_argv leaves mission.prompt "
+                "in argv while _stdin_prompt did not opt out (None) — "
+                "the prompt would be readable via /proc/<pid>/cmdline by "
+                "other same-UID processes (design doc §D). Either remove "
+                "mission.prompt from _build_argv's return value, or "
+                "override _stdin_prompt to return None with a comment "
+                "explaining why this CLI cannot accept stdin.")
+
         # 段B M2: 追撃予算を mission 総予算の内数にする。reserve<=0、または
         # mission.timeout_sec が reserve 以下なら reserve を無効化し、
         # primary に全予算を渡す (追撃は予算 0 → `_recover_output` に
@@ -401,7 +434,7 @@ class CliRunner(AgentRunner):
         cause, rc, stdout_lines, stderr_chunks = self._run_cli_process(
             inner_argv, env, timeout_sec=primary_timeout,
             on_started=self._cli_started_sink, abort_event=self._abort_event,
-            prompt=self._stdin_prompt(mission))
+            prompt=stdin_prompt)
 
         # 段A: どの終端経路 (timeout/failed/schema mismatch/completed) でも
         # 漏れなく保存する — 追撃 (`_recover_output`) より前のこの位置に

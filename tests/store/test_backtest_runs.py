@@ -958,3 +958,52 @@ def test_find_matching_approved_metrics_excludes_non_in_sample_scope(tmp_path):
         conn, pair="USDJPY", variant="candidate", source="test",
         base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
     assert got is None
+
+
+def test_find_matching_approved_metrics_malformed_row_fails_open_and_logs(
+        tmp_path, caplog):
+    """/code-review 2 周目 CR4 是正 (2026-09-12): 承認済み行のうち 1 件の
+    `metrics_json` が壊れていても質検査全体を壊さず (fail-open で
+    `continue`)、`latest_in_sample_metrics` と同じ WARNING ログを残す —
+    従来は無言で `continue` していたため、承認済み行が破損しているだけで
+    質検査が「一致無し」を返し続けても運用者は気づけなかった。他の正常な
+    承認済み行との一致判定は継続する (1 行の破損で質検査全体を fail-open
+    にしない)。"""
+    import logging
+    conn = _conn_approved(tmp_path, content_hash="broken-hash")
+    backtest_runs.save_harness_run(
+        conn, **_approved_kw(content_hash="broken-hash"))
+    conn.execute("UPDATE backtest_runs SET metrics_json='not json' "
+                "WHERE content_hash='broken-hash'")
+    conn.commit()
+    with caplog.at_level(
+            logging.WARNING, logger="agentic_fx.store.backtest_runs"):
+        got = backtest_runs.find_matching_approved_metrics(
+            conn, pair="USDJPY", variant="candidate", source="test",
+            base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
+    assert got is None
+    assert any("decode failed" in r.message for r in caplog.records)
+
+
+def test_find_matching_approved_metrics_malformed_row_does_not_hide_other_matches(
+        tmp_path):
+    """壊れた行 1 件の隣に正常な一致行があれば、質検査はその一致を見失わ
+    ない (malformed 行での `continue` が母集団の走査そのものを止めない)。"""
+    conn = _conn_approved(tmp_path, content_hash="broken-hash")
+    from agentic_fx.store import approvals
+    approvals.create(
+        conn, kind="plugin",
+        payload={"name": "n2", "mission_id": 2,
+                "content_hash": "good-hash"},
+        now=H, commit=True)
+    backtest_runs.save_harness_run(
+        conn, **_approved_kw(content_hash="broken-hash"))
+    backtest_runs.save_harness_run(
+        conn, **_approved_kw(content_hash="good-hash"))
+    conn.execute("UPDATE backtest_runs SET metrics_json='not json' "
+                "WHERE content_hash='broken-hash'")
+    conn.commit()
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
+    assert got == "good-hash"

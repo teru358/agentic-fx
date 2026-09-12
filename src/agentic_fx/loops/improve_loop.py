@@ -182,6 +182,18 @@ class _PluginGateVerdict:  # 新規命名
     artifact_hash: str | None = None
 
 
+@dataclass(frozen=True)
+class _DuplicateDemotion:
+    """/code-review 2 周目 CR1 是正 (2026-09-12): `_finalize_success` の
+    質検査 (§A) が既承認候補との metrics 一致を見つけたときに返す降格通知。
+    `_finalize_success` は自分では observation 経路を呼ばない (内側 tx を
+    rollback した直後は呼び出し元の `commit()` が持つ `report_path`/
+    `artifact` 変数を書き換える立場にないため) — `commit()` が戻り値で
+    受け取り、`_finalize_report_or_observation` へルーティングする。"""
+    content_hash: str
+    pair: str
+
+
 def _artifact_hash_of(plugin_py: bytes, config_yaml: bytes,
                       test_plugin: bytes) -> str:
     h = hashlib.sha256()
@@ -1829,11 +1841,45 @@ class ImproveLoop:
         self._write_archive_index_safe(
             conn, ctx=ctx, status="commit_failed", now=now)
 
+    def _check_duplicate_metrics_for_approval(
+            self, conn, approval_payload: dict) -> _DuplicateDemotion | None:
+        """/code-review 2 周目 CR1+CR7 是正 (2026-09-12): `_finalize_success`
+        の `BEGIN IMMEDIATE` 内側から呼ぶ質検査 (approval-quality 設計書
+        §A)。CR7: `eval_source`/`base_interval`/`content_hash`/`in_sample`
+        は `approval_payload` (`_build_approval_payload` が数手前に書いた
+        もの) からそのまま読む — `commit()` 側で `self._settings` から
+        再導出した throwaway `HistoryDataset` を別途作らない (2 つの導出が
+        将来ズレて質検査の絞り込みキーが提出される行と食い違うことを
+        構造的に防ぐ)。indicator (`kind != 'strategy'`) は成績
+        (trades/pf/avg_r) を持たないため対象外。複数 pair の候補は pair
+        ごとに検査し、いずれか 1 pair でも既承認候補と一致すれば候補全体を
+        observation へ倒す (実装時点の未決事項 — 設計書は単一 pair を
+        前提にした記述のみで多 pair の合成方針を明示していない)。"""
+        if approval_payload.get("kind") != "strategy":
+            return None
+        in_sample = approval_payload.get("in_sample") or {}
+        eval_source = approval_payload.get("eval_source")
+        eval_base_interval = approval_payload.get("base_interval")
+        for pair, pair_metrics in in_sample.items():
+            duplicate_of = self._check_duplicate_metrics(
+                conn, content_hash=approval_payload.get("content_hash"),
+                pair=pair, variant="candidate", source=eval_source,
+                base_interval=eval_base_interval, metrics=pair_metrics)
+            if duplicate_of is not None:
+                return _DuplicateDemotion(content_hash=duplicate_of, pair=pair)
+        return None
+
     def _finalize_success(self, conn, *, mission_id, run_id, backlog_id,
                           slot_key, approval_payload, now,
                           ledger_entries=(), gate_rows=(), ctx=None,
-                          tool_calls: int | None = None) -> None:
-        """10.10 Step 3: Tx-2 本体 (台帳→gate→approval→finish)。"""
+                          tool_calls: int | None = None,
+                          ) -> _DuplicateDemotion | None:
+        """10.10 Step 3: Tx-2 本体 (台帳→gate→approval→finish)。
+
+        戻り値: 質検査 (CR1) が既承認候補との一致を検出したときは
+        `_DuplicateDemotion` を返す (この場合、内側 tx は既に rollback 済み
+        — 呼び出し元 `commit()` が observation 経路へ再ルートする)。通常の
+        approval 終端では `None` を返す。"""
         from agentic_fx.store import approvals as approvals_store
         from agentic_fx.store import missions as missions_store
 
@@ -1859,6 +1905,22 @@ class ImproveLoop:
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # /code-review 2 周目 CR1 是正 (2026-09-12): 質検査は
+                # `_persist_ledger_in_tx` (→ `_publish_archives` が
+                # `os.rename` でファイルシステムへ副作用を及ぼす) より前、
+                # かつ `BEGIN IMMEDIATE` の内側で行う。ファイルシステムの
+                # 変更はトランザクショナルでない (rollback で戻せない) ため、
+                # 何か書く前でなければ「ヒットしたら安全に降格して戻る」が
+                # 成立しない。WAL の `BEGIN IMMEDIATE` は書き込みロックの
+                # 直列化なので、並行 slot の 2 本目はここで待たされ、1 本目
+                # の commit 後のスナップショットを読む — bare SELECT だった
+                # 旧位置 (`commit()` 内、gate 通過直後) の check-then-insert
+                # レースを閉じる。
+                demotion = self._check_duplicate_metrics_for_approval(
+                    conn, approval_payload)
+                if demotion is not None:
+                    conn.rollback()
+                    return demotion
                 # precheck 2026-08-23 wave3: RW4 — mission_id (= ctx.mission_id、
                 # commit() が渡すローカル引数) を台帳/親ゲート両方の永続化へ
                 # 転送する。Task 12 の `WHERE mission_id=?` assert が読む列。
@@ -1905,19 +1967,20 @@ class ImproveLoop:
                     f"plugin={approval_payload['name']} "
                     f"approval={approval_id}{_tool_calls_suffix(tool_calls)}",
                     str(mission_id))
-            if ctx is not None:
-                ctx.ledger.mark_persisted()
-            # approval-quality 設計書 §B (2026-09-12、
-            # [archive-index-naming]): approval 終端も INDEX.md へ 1 行
-            # 残す — `_settle_ledger_after_commit` (report/observation/
-            # failed/output_invalid/gate_failed/commit_failed 系) だけが
-            # 呼んでいた既存の `_write_archive_index_safe` を、外側 commit
-            # 成功後のここでも呼ぶ (二重書き防止のロックは
-            # `_append_archive_index` 内の既存プロセス内 lock がそのまま
-            # 効く)。`ctx` は直接呼び出し (単体テスト) で `None` になり
-            # うるため、常に `mission_id` を持つ `persist_ctx` を渡す。
-            self._write_archive_index_safe(
-                conn, ctx=persist_ctx, status="approval", now=now)
+            # /code-review 2 周目 CR8 是正 (2026-09-12): `mark_persisted` +
+            # `_write_archive_index_safe` の対を素の呼び出しで並べていたが、
+            # `_settle_ledger_after_commit` はこの対を 1 本化するために
+            # 導入された helper (docstring 参照) — この呼び出し元だけ独自に
+            # インライン化していた。`analysis_run_ids` はこの行に到達する
+            # 時点で non-None 確定 (数行上の `if analysis_run_ids is None:
+            # raise` を通過済み) なので drop-in で置き換えられる。`ctx` は
+            # 直接呼び出し (単体テスト) で `None` になりうるため、常に
+            # `mission_id`/ledger を持つ `persist_ctx` を渡す
+            # (`persist_ctx.ledger` は `ctx is None` のとき no-op
+            # `_EntriesView` — 従来の `if ctx is not None:` ガードと等価)。
+            self._settle_ledger_after_commit(
+                conn, ctx=persist_ctx, ledger_ids=analysis_run_ids,
+                outcome="approval", now=now)
         # C6 裁定 (2026-08-28、束D検収 verified-local-round1.md §7、
         # 現状維持): 内側 tx は `except BaseException:` (rollback して
         # 必ず re-raise) だが、この外側の補償トリガーは意図的に
@@ -2152,35 +2215,15 @@ class ImproveLoop:
                     backlog_id=selection.backlog_id,
                     candidate_origin="staging", candidate_path=candidate_path,
                     gate_metrics=gate_metrics, output=output, now=now)
-
-                # approval-quality 設計書 §A (2026-09-12): approval payload
-                # 組み立て直後・提出前に質検査を挟む。indicator は成績
-                # (trades/pf/avg_r) を持たないため対象外 (kind=='strategy'
-                # のときだけ gate_metrics['in_sample'] が pair→metrics の
-                # dict を持つ)。複数 pair の候補は pair ごとに検査し、
-                # いずれか 1 pair でも既承認候補と一致すれば候補全体を
-                # observation へ倒す (実装時点の未決事項 — 設計書は単一
-                # pair を前提にした記述のみで多 pair の合成方針を明示
-                # していない)。
-                if kind == "strategy":
-                    eval_source = self._settings.backtest.eval_source
-                    eval_base_interval = (
-                        self._settings.backtest.dataset().base_interval)
-                    for pair, pair_metrics in (
-                            gate_metrics.get("in_sample") or {}).items():
-                        duplicate_of = self._check_duplicate_metrics(
-                            conn, content_hash=gate_verdict.content_hash,
-                            pair=pair, variant="candidate",
-                            source=eval_source,
-                            base_interval=eval_base_interval,
-                            metrics=pair_metrics)
-                        if duplicate_of is not None:
-                            approval_payload = None
-                            artifact = {
-                                "type": "observation",
-                                "reason": f"duplicate_metrics_of:{duplicate_of}",
-                            }
-                            break
+                # /code-review 2 周目 CR1 是正 (2026-09-12): 質検査
+                # (approval-quality 設計書 §A) は check-then-insert のまま
+                # ここ (bare `SELECT` が `_finalize_success` の
+                # `BEGIN IMMEDIATE` より前に実行される autocommit) に置くと
+                # 並行 slot 間でレースする — `settings.improve.parallel>1`
+                # では 2 スレッドが同時にここを通過し両方とも一致無しと
+                # 判定しうる。質検査本体は `_finalize_success` の
+                # `BEGIN IMMEDIATE` 内側 (`_check_duplicate_metrics_for_
+                # approval`) へ移した。ここではもう呼ばない。
 
             report_path = None
             if approval_payload is None:
@@ -2193,13 +2236,32 @@ class ImproveLoop:
                     return
 
             if approval_payload is not None:
-                self._finalize_success(                                 # 手順7-9
+                demotion = self._finalize_success(                      # 手順7-9
                     conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                     backlog_id=selection.backlog_id, slot_key=ctx.slot_key,
                     approval_payload=approval_payload, now=now,
                     ledger_entries=tuple(ctx.ledger.entries()),
                     gate_rows=tuple(gate_rows), ctx=ctx,
                     tool_calls=tool_calls)
+                if demotion is not None:
+                    # CR1 是正: `_finalize_success` が質検査ヒットを検出し
+                    # 内側 tx を rollback 済み (何も永続化していない) —
+                    # observation 経路へ再ルートする。CR3: 全 pair 分の
+                    # gate 行 (in_sample/holdout とも) を
+                    # mission_outcome='observation' で残す — 一致した pair
+                    # は reason に埋め込む (どの pair が降格を引いたかを
+                    # 人間が追跡できるようにする)。
+                    self._finalize_report_or_observation(
+                        conn, ctx=ctx, backlog_id=selection.backlog_id,
+                        report_path=None,
+                        artifact={
+                            "type": "observation",
+                            "reason": (
+                                f"duplicate_metrics_of:{demotion.content_hash} "
+                                f"pair={demotion.pair}"),
+                        },
+                        now=now, gate_rows=tuple(gate_rows),
+                        tool_calls=tool_calls)
             else:
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -2277,8 +2339,19 @@ class ImproveLoop:
 
     def _finalize_report_or_observation(self, conn, *, ctx, backlog_id,
                                         report_path, artifact, now,
+                                        gate_rows=(),
                                         tool_calls: int | None = None) -> None:
         """承認申請を出さない経路の Tx-2 + finish。
+
+        /code-review 2 周目 CR3 是正 (2026-09-12): `gate_rows` (既定 ()) —
+        質検査 (CR1) で observation へ降格した strategy 候補は、gate が
+        実際に計測した in_sample/holdout の成績行 (全 pair 分、一致しな
+        かった pair も含む) を失わずに残す。`_finalize_gate_failed` と
+        同じく `_persist_gate_rows(..., mission_outcome='observation')` を
+        この tx の内側で呼ぶ。他の呼び出し元 (report/observation
+        (質検査以外の理由)/`unsupported_in_plan10:risk_gate`) は
+        `gate_rows=()` のまま — `_persist_gate_rows` は空リストで何もしない
+        ため無害。
 
         round2 #6 是正 (2026-08-29、verified-round2.md #6、設計逐語違反):
         `report_path is None` になる分岐は 2 つある —
@@ -2308,6 +2381,9 @@ class ImproveLoop:
         try:
             ledger_ids = self._persist_ledger_in_tx(
                 conn, ctx=ctx, now=now, mission_outcome=outcome)
+            self._persist_gate_rows(
+                conn, gate_rows=gate_rows, now=now, mission_id=ctx.mission_id,
+                mission_outcome=outcome)
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="completed",

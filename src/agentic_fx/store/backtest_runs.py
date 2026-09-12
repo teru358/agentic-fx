@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from agentic_fx.backtest.metrics import METRIC_KEYS
+from agentic_fx.store.db import values_match
 
 _log = logging.getLogger("agentic_fx.store.backtest_runs")
 
@@ -244,16 +245,6 @@ def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
     return _filter_metrics(raw_metrics)
 
 
-def _metric_value_matches(a: Any, b: Any) -> bool:
-    """approval-quality §A: `(a, b)` が両方 `None` なら一致、片方だけ
-    `None` なら不一致、両方数値なら `store/db.py:409` の ``FLOAT_TOL``
-    (1e-9) で比較する (既存の ``abs(a-b) < FLOAT_TOL`` パターンを流用)。"""
-    from agentic_fx.store.db import FLOAT_TOL
-    if a is None or b is None:
-        return a is None and b is None
-    return abs(a - b) < FLOAT_TOL
-
-
 def find_matching_approved_metrics(conn: sqlite3.Connection, *, pair: str,
                                     variant: str, source: str,
                                     base_interval: str, trades: Any,
@@ -291,11 +282,25 @@ def find_matching_approved_metrics(conn: sqlite3.Connection, *, pair: str,
         try:
             raw_metrics = json.loads(row["metrics_json"])
         except (TypeError, ValueError):
+            # /code-review 2 周目 CR4 是正 (2026-09-12): `latest_in_sample_
+            # metrics` (同ファイル、同じ decode 失敗パターン) と同じ
+            # fail-open + warning ログにする — 従来は無言で `continue` して
+            # おり、承認済み行が 1 件破損しているだけで質検査が「一致無し」
+            # を返し続け、痕跡が一切残らなかった (母集団の他の正常行との
+            # 比較は継続する — 1 行の破損で質検査全体を失敗させない)。
+            _log.warning(
+                "find_matching_approved_metrics: metrics_json decode "
+                "failed for approved content_hash=%s pair=%s — skipping "
+                "this row (fail-open)", row["content_hash"], pair)
             continue
         filtered = _filter_metrics(raw_metrics)
-        if (_metric_value_matches(filtered.get("trades"), trades)
-                and _metric_value_matches(filtered.get("pf"), pf)
-                and _metric_value_matches(filtered.get("avg_r"), avg_r)):
+        # /code-review 2 周目 CR6 是正 (2026-09-12): 独自複製
+        # (`_metric_value_matches`) を廃止し、`db.values_match`
+        # (公開名、旧 `db._values_match`) へ委譲する — `ohlcv._close_enough`
+        # と同じ関数を共有する (frozen `_FLOAT_TOL` の意味論は不変)。
+        if (values_match(filtered.get("trades"), trades)
+                and values_match(filtered.get("pf"), pf)
+                and values_match(filtered.get("avg_r"), avg_r)):
             return row["content_hash"]
     return None
 

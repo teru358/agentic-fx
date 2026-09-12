@@ -416,6 +416,20 @@ def _values_match(a: float | None, b: float | None) -> bool:
     return abs(a - b) < _FLOAT_TOL
 
 
+# /code-review 2 周目 CR6 是正 (2026-09-12): `_values_match` の公開名。
+# `ohlcv._close_enough` と `backtest_runs.find_matching_approved_metrics`
+# の質検査比較は従来これと同じロジックをそれぞれ独立に複製していた
+# (3 本目の複製は `backtest_runs._metric_value_matches` — 関数ローカルの
+# `from agentic_fx.store.db import FLOAT_TOL` を呼び出しごとに再 import
+# しており、`_values_match` が閉じ込めている frozen `_FLOAT_TOL` と異なり
+# `db.FLOAT_TOL` の monkeypatch に追従してしまう意味論のズレがあった)。
+# `_values_match` 自身の名前・frozen 挙動 (`tests/store/test_ohlcv.py:
+# 112-117` が `db.FLOAT_TOL` を monkeypatch しても `_values_match` の
+# 判定境界が変わらないことを pin している) は変えず、公開名の別名として
+# 追加するだけにとどめる。
+values_match = _values_match
+
+
 def _backup_before_migration(conn: sqlite3.Connection, suffix: str) -> None:
     """移行が必要と判定された時だけ、移行前スナップショットを取る。
     `suffix` は移行の種類ごとに別ファイルにするための識別子

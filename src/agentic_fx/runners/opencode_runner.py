@@ -123,6 +123,18 @@ class OpencodeRunner(CliRunner):
 
     def _max_turns_semantics(self) -> Literal["passthrough", "ignored"]: return "ignored"
 
+    def _stdin_prompt(self, mission: Mission) -> str | None:
+        # /code-review 2 周目 CR5 是正 (2026-09-12): 明示的な opt-out —
+        # `CliRunner` の基底既定は `mission.prompt` を返す (stdin 経由に
+        # 切り替える不変条件、cli_runner.py 参照) になったが、opencode は
+        # stdin 経由の prompt 受理が実機で未確認 (実装時点でこの CLI に
+        # ついて stdin 経由の prompt 入力を検証したテスト/実測が無い) の
+        # ため、この hook を `None` へ override して argv 渡し
+        # (`_build_argv` の `mission.prompt` 引数、上記) のまま維持する。
+        # `run()` のガードは `_stdin_prompt` が `None` を返す backend には
+        # 適用されない (opt-out)。
+        return None
+
     @staticmethod
     def _extract_session_id(stdout_lines: list[str]) -> str | None:
         """イベント行の `sessionID` フィールド (`ses_...`) を末尾から探す

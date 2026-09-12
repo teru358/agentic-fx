@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from agentic_fx.core.contracts import Bar
+from agentic_fx.store import db
 from agentic_fx.store.db import FLOAT_TOL
 
 _log = logging.getLogger("agentic_fx.store.ohlcv")
@@ -133,9 +134,15 @@ class ImportResult:
 
 
 def _close_enough(a: float | None, b: float | None) -> bool:
-    if a is None or b is None:
-        return a is None and b is None
-    return abs(a - b) < _FLOAT_TOL
+    # /code-review 2 周目 CR6 是正 (2026-09-12): `db._values_match`
+    # (公開名 `db.values_match`) へ委譲する — このモジュールの独自複製を
+    # 廃止する。`db._values_match` は frozen `_FLOAT_TOL` (import 時点の
+    # 値) を閉じているため、`ohlcv._FLOAT_TOL` (同じく frozen、モジュール
+    # 冒頭で束縛済み) と挙動は完全に一致する
+    # (`test_store_float_tolerance_is_shared_and_has_the_same_boundaries`
+    # が `db.FLOAT_TOL` を monkeypatch しても両者の判定境界が変わらない
+    # ことを pin している — この委譲後も成立する)。
+    return db.values_match(a, b)
 
 
 def _validate_and_normalize_row(idx: int, row: tuple) -> tuple:

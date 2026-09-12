@@ -311,15 +311,32 @@ def test_cli_runner_schema_mismatch_is_failed(tmp_path):
     assert result.reason is not None
 
 
+class _OptOutStdinFakeCliRunner(_FakeCliRunner):
+    """/code-review 2 周目 CR5 是正 (2026-09-12): `CliRunner._stdin_prompt`
+    の既定は `mission.prompt` (stdin 経由) に変わった — devnull 経路
+    (opt-out) を検証するテストは、明示的にこの hook を `None` へ override
+    した subclass を使う (`OpencodeRunner` と同じ opt-out 形)。"""
+
+    def _stdin_prompt(self, mission: Mission) -> str | None:
+        return None
+
+
 def test_cli_runner_does_not_use_subprocess_devnull_for_stdin(tmp_path):
-    """`subprocess.DEVNULL` は使わない (probe §5-③: Landlock 下で `/dev`
-    が ro だと `O_RDWR` オープンが失敗する) — `open('/dev/null', O_RDONLY)`
-    相当の fd を渡すことを popen 呼び出しの kwargs で pin する。
+    """opt-out backend (`_stdin_prompt` が `None`) は `subprocess.DEVNULL`
+    を使わない (probe §5-③: Landlock 下で `/dev` が ro だと `O_RDWR`
+    オープンが失敗する) — `open('/dev/null', O_RDONLY)` 相当の fd を渡す
+    ことを popen 呼び出しの kwargs で pin する。
 
     <!-- precheck 2026-08-22: T1-M11 --> Minor 11 の再発防止: `!=
     subprocess.DEVNULL` だけだと `stdin=None` (継承) へ変異しても green の
     まま (弱い pin)。int fd であること・`O_RDONLY` で開かれた character
     device であることまで見る。
+
+    CR5 是正で `_FakeCliRunner` (override 無し) の既定は `mission.prompt`
+    ファイル経由の stdin に変わった — この pin は「devnull 経路そのものが
+    まだ存在する」ことの検証なので、`_OptOutStdinFakeCliRunner` (明示
+    opt-out) を使う (`test_cli_runner_default_stdin_prompt_uses_prompt_file`
+    が新しい既定・非 opt-out 経路を担当する)。
     """
     import stat as _stat
 
@@ -342,7 +359,10 @@ def test_cli_runner_does_not_use_subprocess_devnull_for_stdin(tmp_path):
         captured["stdin"] = stdin_fd
         return real_popen(*a, **kw)
 
-    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path, popen=spying_popen)
+    kw = dict(bin_path=Path(sys.executable), model="m", workdir=tmp_path,
+              cli_terminate_grace_sec=0.3, registry=ToolRegistry(),
+              popen=spying_popen)
+    runner = _OptOutStdinFakeCliRunner(script=_PRINT_ANSWER_AND_EXIT, **kw)
     runner.run(_mission())
     stdin_fd = captured.get("stdin")
     assert stdin_fd != subprocess.DEVNULL
@@ -353,6 +373,71 @@ def test_cli_runner_does_not_use_subprocess_devnull_for_stdin(tmp_path):
         "stdin fd が character device (/dev/null) でない")
     assert captured.get("stdin_target") == "/dev/null", (
         f"stdin fd の実体が /dev/null ではない: {captured.get('stdin_target')!r}")
+
+
+def test_cli_runner_default_stdin_prompt_uses_prompt_file(tmp_path):
+    """/code-review 2 周目 CR5 是正の主 pin: `_stdin_prompt` を override
+    しない (= opt-out していない) `CliRunner` subclass は、既定で
+    `workdir/prompt.txt` (0600 の通常ファイル) 経由の stdin を使う —
+    devnull ではない。新規 subclass が `_stdin_prompt` を override せず
+    `_build_argv` に `mission.prompt` を残すと `run()` が `ValueError` で
+    fail closed することは `test_cli_runner_stdin_prompt_default_guards_
+    argv_leak` (別テスト) が pin する。"""
+    import stat as _stat
+
+    captured: dict[str, Any] = {}
+    real_popen = subprocess.Popen
+
+    def spying_popen(*a, **kw):
+        stdin_fd = kw.get("stdin")
+        if isinstance(stdin_fd, int) and stdin_fd >= 0:
+            st = os.fstat(stdin_fd)
+            captured["stdin_is_reg"] = _stat.S_ISREG(st.st_mode)
+            captured["stdin_mode"] = _stat.S_IMODE(st.st_mode)
+            captured["stdin_target"] = os.readlink(f"/proc/self/fd/{stdin_fd}")
+        captured["stdin"] = stdin_fd
+        return real_popen(*a, **kw)
+
+    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path, popen=spying_popen)
+    result = runner.run(_mission(prompt="the secret mission prompt"))
+    assert result.status == "completed"
+    stdin_fd = captured.get("stdin")
+    assert isinstance(stdin_fd, int) and stdin_fd >= 0
+    assert captured.get("stdin_is_reg") is True, (
+        "既定の stdin fd は通常ファイル (workdir/prompt.txt) でなければ"
+        "ならない")
+    assert captured.get("stdin_mode") == 0o600
+    assert captured.get("stdin_target") == str(tmp_path / "prompt.txt")
+
+
+def test_cli_runner_stdin_prompt_default_guards_argv_leak(tmp_path):
+    """/code-review 2 周目 CR5 是正の pin: `_stdin_prompt` を override
+    しない (既定 = opt-out していない) のに `_build_argv` が
+    `mission.prompt` を argv に残す subclass は `run()` が `ValueError`
+    で fail closed する — 新規 backend が stdin 切替を実装し忘れて
+    `/proc/<pid>/cmdline` 経由の prompt 露出を再導入することを防ぐ。
+    opt-out (`_stdin_prompt` を `None` へ override、`OpencodeRunner` と
+    同じ形) すればこのガードは適用されない (現行 `OpencodeRunner` は
+    従来どおり argv 渡しのまま)。"""
+
+    class _LeakyRunner(_FakeCliRunner):
+        def _build_argv(self, mission, *, mcp_socket):
+            return [sys.executable, "-c", self._script, mission.prompt]
+
+    class _OptedOutLeakyRunner(_OptOutStdinFakeCliRunner):
+        def _build_argv(self, mission, *, mcp_socket):
+            return [sys.executable, "-c", self._script, mission.prompt]
+
+    kw = dict(bin_path=Path(sys.executable), model="m", workdir=tmp_path,
+              cli_terminate_grace_sec=0.3, registry=ToolRegistry())
+    leaky = _LeakyRunner(script=_PRINT_ANSWER_AND_EXIT, **kw)
+    with pytest.raises(ValueError):
+        leaky.run(_mission())
+
+    # opt-out subclass は同じ argv 形でも guard の対象外 — 従来どおり通る。
+    opted_out = _OptedOutLeakyRunner(script=_PRINT_ANSWER_AND_EXIT, **kw)
+    result = opted_out.run(_mission())
+    assert result.status == "completed"
 
 
 def test_cli_runner_env_is_fully_specified_no_secret_keys(tmp_path):
