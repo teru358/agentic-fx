@@ -151,6 +151,19 @@ def _isolate_mission_transcripts_default_dir(tmp_path_factory):
         os.environ["AGENTIC_FX_MISSION_TRANSCRIPTS_DIR"] = original_env
 
 
+def _logs_dir_leaked(existed_before: bool, exists_after: bool) -> bool:
+    """フルスイート是正 (test-hygiene 2026-09-12): `<repo>/logs/` (`logs/
+    mission-transcripts/` の親) が session 開始前に無かったのに session
+    後に残っていれば `True`。`tests/test_mission_worker.py::
+    test_bootstrap_improve_profile_mission_transcript_dir_is_writable` の
+    teardown は `logs/mission-transcripts` を rmdir するが、自分が
+    `mkdir(parents=True)` で作った親 `logs/` を片付けていなかった —
+    `.gitignore` 済みのため `_guard_repo_root_has_no_new_untracked_files`
+    (git status ベース) には出ない残骸クラス。判定を純関数として切り出し、
+    `git`/実ファイルシステムに依らず単体で pin できるようにする。"""
+    return (not existed_before) and exists_after
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _guard_real_mission_transcripts_dir_is_never_touched():
     """`_isolate_mission_transcripts_default_dir` は **親プロセス**の
@@ -165,24 +178,42 @@ def _guard_real_mission_transcripts_dir_is_never_touched():
     `<repo>/logs/mission-transcripts/` へ書く経路が残る —
     `_guard_real_data_dir_is_never_touched` と同じ「テストが実リポジトリ
     資源を絶対座標で触る」事故クラスなので、同じ形 (session 前後の
-    スナップショット比較) で検査する。"""
-    real_dir = Path(__file__).resolve().parents[1] / "logs" / "mission-transcripts"
+    スナップショット比較) で検査する。
+
+    フルスイート是正 (2026-09-12): `logs/mission-transcripts/` の**中身**
+    が変わっていなくても、その親 `logs/` 自体が session 開始前に無かった
+    のに session 後に残っていれば fail する (`_logs_dir_leaked`) —
+    `.gitignore` 済みで `git status` に出ない残骸クラスを、この session
+    guard で構造的に捕まえる。"""
+    real_logs_dir = Path(__file__).resolve().parents[1] / "logs"
+    real_dir = real_logs_dir / "mission-transcripts"
 
     def _sig():
         if not real_dir.is_dir():
             return None
         return sorted(p.name for p in real_dir.iterdir())
 
+    logs_existed_before = real_logs_dir.is_dir()
     before = _sig()
     yield
     after = _sig()
+    logs_exists_after = real_logs_dir.is_dir()
+    failures = []
     if before != after:
-        pytest.fail(
+        failures.append(
             f"実 {real_dir} がテスト実行中に変更された: {before} -> {after}。"
             "本物の mission_worker 子プロセスを起動するテストが CliRunner."
             "run() まで到達し、既定の transcript 保存先 (親プロセスの "
-            "monkeypatch が届かない別プロセス) へ書き込んだ可能性がある。",
-            pytrace=False)
+            "monkeypatch が届かない別プロセス) へ書き込んだ可能性がある。")
+    if _logs_dir_leaked(logs_existed_before, logs_exists_after):
+        failures.append(
+            f"実 {real_logs_dir} は session 開始前には存在しなかったのに、"
+            "テスト実行後も残っている。テストが mkdir(parents=True) で "
+            "作った祖先ディレクトリの片付けを、自分自身 (mission-"
+            "transcripts) だけに留めて親 (logs/) まで及ぼしていない疑い "
+            "(test-hygiene フルスイート是正、2026-09-12)。")
+    if failures:
+        pytest.fail("\n".join(failures), pytrace=False)
 
 
 @pytest.fixture(autouse=True, scope="session")

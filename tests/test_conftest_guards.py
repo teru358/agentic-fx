@@ -8,7 +8,7 @@ fail していた (文言「新規…残った」と矛盾する偽陽性)。判
 """
 from __future__ import annotations
 
-from tests.conftest import _new_untracked, _top_level_untracked
+from tests.conftest import _logs_dir_leaked, _new_untracked, _top_level_untracked
 
 
 def test_new_untracked_returns_empty_set_when_a_file_is_removed():
@@ -72,3 +72,27 @@ def test_top_level_untracked_includes_new_top_level_directory():
     """`?? newdir/` (新規ディレクトリそのもの、末尾 `/` のみで内部の `/`
     を含まない) は top-level エントリとして含める。"""
     assert _top_level_untracked("?? newdir/\n") == {"newdir/"}
+
+
+# --- フルスイート是正 (test-hygiene 2026-09-12): `_logs_dir_leaked` pin
+# (`logs/mission-transcripts` の親 `logs/` が session 開始前に無かった
+# のに残った、という .gitignore 済みで git status に出ない残骸クラス) --
+
+def test_logs_dir_leaked_true_when_absent_before_and_present_after():
+    assert _logs_dir_leaked(existed_before=False, exists_after=True) is True
+
+
+def test_logs_dir_leaked_false_when_already_existed_before():
+    """元々 `logs/` があった環境 (既存リポジトリでの継続実行等) では、
+    session 後に存在していても「新規に残った」わけではないので False。"""
+    assert _logs_dir_leaked(existed_before=True, exists_after=True) is False
+
+
+def test_logs_dir_leaked_false_when_absent_both_before_and_after():
+    assert _logs_dir_leaked(existed_before=False, exists_after=False) is False
+
+
+def test_logs_dir_leaked_false_when_removed_during_session():
+    """稀だが元々あったものが session 中に消えたケースは「残骸」ではない
+    ので False (この guard の対象外 — 別の懸念)。"""
+    assert _logs_dir_leaked(existed_before=True, exists_after=False) is False

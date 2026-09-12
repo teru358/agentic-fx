@@ -312,7 +312,22 @@ def test_bootstrap_improve_profile_mission_transcript_dir_is_writable(
     """
     real_dir = _REPO_ROOT / "logs" / "mission-transcripts"
     marker_path = real_dir / marker_name
-    real_dir_pre_existed = real_dir.is_dir()
+    # フルスイート是正 (test-hygiene 2026-09-12): 従来は `real_dir`
+    # (`logs/mission-transcripts`) 自身の pre-existence だけを記録して
+    # rmdir していたが、`_bootstrap_improve_profile` の `mkdir(parents=
+    # True)` は祖先 `logs/` もまとめて作る。fresh worktree (`logs/` 自体
+    # が無い状態) でこのテストを実行すると、`mission-transcripts` は
+    # rmdir されても親 `logs/` が空のまま残り続けた (二分探索で特定された
+    # 実測の残骸)。session 開始前に**存在しなかった祖先**を repo root を
+    # 越えない範囲で列挙し (深い方から順、`missing_ancestors[0]` が
+    # `real_dir` 自身)、teardown で子から順に rmdir する — 空でなければ
+    # `OSError` を握って諦める (他の何かがまだ使っている可能性があるので
+    # 無理に消さない)。
+    missing_ancestors: list[Path] = []
+    _p = real_dir
+    while _p != _REPO_ROOT and not _p.exists():
+        missing_ancestors.append(_p)
+        _p = _p.parent
     try:
         result = _run_bootstrap_probe(
             script, staging_dir=l["staging_dir"], mission_id=l["mission_id"],
@@ -324,9 +339,9 @@ def test_bootstrap_improve_profile_mission_transcript_dir_is_writable(
         assert marker_path.read_text() == "ok"
     finally:
         marker_path.unlink(missing_ok=True)
-        if not real_dir_pre_existed:
+        for _ancestor in missing_ancestors:
             try:
-                real_dir.rmdir()
+                _ancestor.rmdir()
             except OSError:
                 pass
 
