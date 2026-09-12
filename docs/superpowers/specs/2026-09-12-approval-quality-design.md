@@ -107,4 +107,5 @@
 |---|---|---|---|---|
 | 2026-09-12 | v1 | 起案。A (質検査) / B (INDEX approval 行) / C (archive 引き当てキー) / D (prompt stdin 化) の 4 項目、保留 E ([backtest-dedup-cache] と同時設計) を明記 | 根拠 = A4 12〜13 回目の観測 (`tmp/a4-run12-codex-20260912.md`, `tmp/a4-run13-ornith-20260912.md`, `tmp/a4-run13-muse-20260912.md`)、ユーザー承認 (2026-09-12) | - |
 | 2026-09-12 | v1.1 | 実装で確定した差分: §A 多 pair は 1 pair 一致で候補全体を降格 / 降格時は親ゲート行 (`_persist_gate_rows`) を書かない (ledger 行は `mission_outcome='observation'` で残る) / `last_result` は既存規約どおり `observation:duplicate_metrics_of:<hash>` / §B INDEX ヘッダに「終端ログ (GC 非対象)。正は candidate_archives・approval_requests」 / §D codex は `exec -` (stdin 明示)、opencode は未対応 (stdin 受理未確認) | 実装 (sonnet、T-A〜T-D) の逸脱申告を採用 | 7837fe9 |
+| 2026-09-12 | v1.2 | §A 母集団を「approval_requests に載った content_hash の in_sample candidate 行」に限定 (mission 単位の `approval` outcome だけでは捨てた中間候補が混じり偽陽性) / §C 引き当ては archive_path 非 NULL 優先・最新 / 表示は payload 型不正を fail-soft | codex 1 周目 Important 3 (`tmp/review-20260912-aq/codex-r1.md`) | (merge of approval-quality-r1) |
 
