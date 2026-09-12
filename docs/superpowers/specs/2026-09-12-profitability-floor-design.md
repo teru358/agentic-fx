@@ -1,6 +1,6 @@
-# 収益性フロア + reject reason 漏洩の是正 設計書 v1.1
+# 収益性フロア + reject reason 漏洩の是正 設計書 v1.2
 
-束 [profitability-floor] + T0 [reject-reason-leak]。起案 2026-09-12、ユーザー裁定済 (U1〜U5)、codex 設計レビュー 1 周目 18 件を全件反映 (v1.1)。
+束 [profitability-floor] + T0 [reject-reason-leak]。起案 2026-09-12、ユーザー裁定済 (U1〜U5)、codex 設計レビュー 1 周目 18 件 (v1.1) / 2 周目 5 件 (v1.2) を全件反映。
 
 正の参照元:
 - 本体設計書 §6 (改善 loop・品質ゲート・遮断 8 項目・plugin 機構)
@@ -93,6 +93,9 @@
 | U5 除染 | スクリプト更新済、ユーザー実行待ち |
 | C1 legacy submit | `afx plugin submit <name>` (live plugin 回廊) は **kind=strategy のとき拒否**し `materialize` → `submit --from _human` を案内する。indicator/signal は従来どおり。共有ゲートへの統合・回廊廃止は別起票 [legacy-submit-corridor-bypasses-gate] |
 | C2 bless の warn | `floor_mode` を evaluator まで渡す。`warn` では in_sample 不合格でも **holdout・baseline 収集まで完走**し失敗ビットを保持する (短絡は `enforce` のときだけ) |
+| R2-I1 失敗種別の識別 | **`run_kind_gate` は常に `GateOutcome` を返す** (ゲート判定で raise しない)。判別子 `verdict_kind` / `floor_failed` を持たせ、enforce の raise と失敗行 outcome の決定は `_run_full_gate` が**型付き結果から**行う。**例外メッセージによる分類は禁止** |
+| R2-I2 submit の activity | `submit_candidate(..., activity: ActivityLog | None = None)` を追加し、`_plugin_submit` から bless と同じ `ActivityLog(root / "logs" / "activity.log")` を渡す |
+| R2-I3 report 失敗時の INDEX | **共通 settle 契約を維持** — report 失敗分岐でも `_settle_ledger_after_commit(outcome="report_failed")` を通し、archive / INDEX も `report_failed` になる (INDEX 書込みを抑止する専用 API は作らない) |
 
 ### 指揮者の既定選択 (裁定不要と判断、既定として明記)
 
@@ -159,7 +162,7 @@ _check_profitability_floor(per_pair: dict[str, dict], *, settings, scope: str) -
 | `activity` の `gate_failed` 行 | `mission=<id> reason=unprofitable` (固定) + 適用閾値 (`min_pf=… require_positive_avg_r=… require_holdout_evaluable=…`) | activity は親専有だが `last_result` と文言を揃え「どちらを見ても同じ」状態を作る |
 | 親専有レポート (`data/improve_reports/improve-YYYY-MM-DD-<mission_id>.md`) | **全数値** — in_sample / holdout の pair ごとの `trades / pf / win_rate / avg_r / max_drawdown / total_pnl / kill_switch_latches / evaluable`、落ちた段、落ちた pair、適用閾値 | 人間だけが読む。worker の rw に無い |
 | `backtest_runs` | 既存どおり metrics 全数 + `mission_outcome='unprofitable'` | 監査台帳 |
-| approval payload (`profitability_floor`) | 適用した閾値 snapshot — **成功・警告・失敗の全終端**で (§3 T1-g、codex I3) | 緩めて通した候補の監査 |
+| approval payload (`profitability_floor`) | 適用した閾値 snapshot — **approval 行を作る全終端 (改善ループ成功 / 人間 submit 成功 / bless 警告)** で (§3 T1-g、codex I3 + R2-M2)。**approval を作らない失敗終端は payload を持たないのでレポート / activity で監査する** | 緩めて通した候補の監査 |
 
 ### T1-a 判定関数と verdict (`plugin/strategy_gate.py`)
 
@@ -188,11 +191,24 @@ _check_profitability_floor(per_pair: dict[str, dict], *, settings, scope: str) -
 class GateOutcome:                     # plugin/approval.py
     metrics: dict
     evaluable: bool
+    verdict_kind: Literal["ok", "insufficient_trades", "floor"] = "ok"
+    floor_failed: bool = False         # verdict_kind == "floor" と同値 (読みやすさのため併置)
     floor_warning: str = ""            # "" | "unprofitable"
     floor_detail: str = ""             # 人間向け全数値 (payload / 表示用)
+    insufficient_trades_reason: str = ""   # "insufficient_trades:<n>" (標本不足のときだけ)
     gate_rows: tuple[dict, ...] = ()   # T1-f の非コミット sink に積まれた行
 ```
 
+**`run_kind_gate` はゲート判定で例外を投げない** (codex R2-I1)。標本不足も収益性不合格も `verdict_kind` に載せて**常に `GateOutcome` を返す**。**例外メッセージ (`"unprofitable"` の部分一致など) による分類は禁止** — 文言変更や候補名への混入で誤分類しうる。
+
+| `verdict_kind` | 意味 | `_run_full_gate` の挙動 (enforce) | 失敗行の `mission_outcome` |
+|---|---|---|---|
+| `"ok"` | 全ゲート通過 (indicator / signal は常にこれ) | 続行 | (`approval`) |
+| `"insufficient_trades"` | in-sample 合計 < 30 (現行 `approval.py:216-221` が `ValueError` にしていたもの) | `ValueError(f"plugin {name!r}: strategy not evaluable ({insufficient_trades_reason})")` | **`gate_failed`** |
+| `"floor"` | 収益性フロア不合格 | `ValueError(f"plugin {name!r}: unprofitable (min_pf=… …)")` | **`unprofitable`** |
+
+- `floor_mode="warn"` のときは `verdict_kind == "floor"` でも `_run_full_gate` は raise せず続行する (`floor_warning` / `floor_detail` を payload へ運ぶ)。`"insufficient_trades"` は `floor_mode` に関わらず raise する (U2 が緩和したのはフロアだけ)。
+- `run_kind_gate` を**抜けてくる例外** (想定外。`holdout.NoHistoryError` / 履歴空の `ValueError` 等) は判別子を持たないので `_run_full_gate` が **`gate_failed`** として扱う。
 - `approval.run_kind_gate` の戻り値を `tuple[dict, bool]` → `GateOutcome` に変更 (src の呼び出し元は `switch.py:779` のみ)。
 - `switch._run_full_gate` の戻り値を `(meta, after_content, after_artifact, outcome: GateOutcome)` の **4 要素**に固定 (呼び出し元 `switch.py:818`, `:1470`)。spec/plan で要素数が食い違っていた v1 の矛盾を解消。
 - **`bless_candidate` の戻り値は `int` (approval_id) のまま変えない** — 直接呼び出しが tests に 11 箇所あり (`tests/plugin/test_switch_paths.py:202,225,241,264,300,346,1201,1395,1456` / `test_approval_payload_common_contract.py:154` / `test_materialize_retire.py:212`)、v1 の「呼び出し元 1 箇所」は誤りだった (codex I5)。警告は次の 2 経路で取る:
@@ -221,7 +237,8 @@ class GateOutcome:                     # plugin/approval.py
 |---|---|---|
 | `submit_candidate` 成功 | approval 作成 | `approval` |
 | `submit_candidate` フロア不合格 (enforce) | `ValueError` | `unprofitable` |
-| `submit_candidate` その他ゲート不合格 (標本不足 / pytest / hash) | `ValueError` | `gate_failed` |
+| `submit_candidate` 標本不足 (`verdict_kind="insufficient_trades"`) | `ValueError` | `gate_failed` |
+| `submit_candidate` その他ゲート不合格 (pytest / hash / snapshot / 想定外例外) | `ValueError` | `gate_failed` |
 | `bless_candidate` 成功 (フロア合格) | approval 作成 | `approval` |
 | `bless_candidate` 成功 (フロア不合格・警告) | approval 作成 | **`approval`** (承認経路としては成立している。フロア不合格の事実は payload の `floor_warning` が持つ) |
 
@@ -237,7 +254,7 @@ class GateOutcome:                     # plugin/approval.py
   - `plugin/switch.py::bless_candidate` の payload
 - approval を作らない終端の監査:
   - 改善ループのフロア不合格 → 親専有レポート本文 + `activity` の `gate_failed` 行 (T1-b)
-  - 人間 submit のフロア不合格 → `activity.write(Category.APPROVAL, "submit_floor_rejected", f"name=… unprofitable min_pf=… …")` と `ValueError` メッセージ
+  - 人間 submit のフロア不合格 → `activity.write(Category.APPROVAL, "submit_floor_rejected", f"name=… unprofitable min_pf=… require_positive_avg_r=… require_holdout_evaluable=…")` と `ValueError` メッセージ。**そのために `submit_candidate(..., activity: "ActivityLog | None" = None)` を追加し、`backtest/cli.py::_plugin_submit` から bless と同じ `ActivityLog(root / "logs" / "activity.log")` を渡す** (codex R2-I2 — 現行 `submit_candidate` は `activity` を受け取らず CLI も渡していないので、配線しないと実装者が `plugins_root.parent/logs` を関数内で推測する新しい所有規則を作ってしまう)
 - `commands.py::_approval_detail` がこの snapshot を表示する (T1-d)。
 
 ### 終端名
@@ -356,7 +373,7 @@ agent は `run_backtest` の返却で in_sample の `pf`/`avg_r` を見ている
 | 形式/pytest 不合格 (既存) | `_finalize_gate_failed` | observation / `gate_failed:<reason>` | `gate_failed` | `gate_failed` | `gate_failed` | 書く | `report` | なし | 削除 |
 | **フロア不合格 (in_sample 段、新)** | `_finalize_gate_failed(mission_outcome='unprofitable')` | observation / **`unprofitable`** | **`unprofitable`** (in_sample 行のみ) | **`unprofitable`** | **`unprofitable`** | 書く (全数値 + 適用閾値) | `report` | なし | 削除 |
 | **フロア不合格 (holdout 段、新)** | 同上 | observation / **`unprofitable`** (in_sample 段と文字列同一) | **`unprofitable`** (in_sample + holdout_gate 行の全 pair) | **`unprofitable`** | **`unprofitable`** | 書く (in_sample + holdout 全数値) | `report` | なし | 削除 |
-| **フロア不合格 + report 作成失敗 (新)** | `_finalize_gate_failed` の OSError 分岐 | observation / `report_failed:<safe_reason>` | **`report_failed`** (`unprofitable` で上書きしない) | **`report_failed`** | — | 失敗 | `NULL` | なし | 削除 |
+| **フロア不合格 + report 作成失敗 (新)** | `_finalize_gate_failed` の OSError 分岐 | observation / `report_failed:<safe_reason>` | **`report_failed`** (`unprofitable` で上書きしない) | **`report_failed`** | **`report_failed`** (共通 settle 契約を維持 — INDEX 書込みを抑止する専用 API は作らない。codex R2-I3) | 失敗 | `NULL` | なし | 削除 |
 | 成績一致降格 (§A、既存) | `_finalize_success` → rollback → `_finalize_report_or_observation` | observation / `observation:duplicate_metrics_of:<hash> pair=<P>` | `observation` | `observation` | `observation` | 書かない | `NULL` | なし | 削除 |
 | observation (agent 申告、既存) | `_finalize_report_or_observation` | observation / `observation:<safe_text(reason)>` | `observation` | `observation` | `observation` | 書かない | `NULL` | なし | 削除 |
 | 承認申請 (既存) | `_finalize_success` | selected / `approval_pending:<id>` | `approval` | `approval` | `approval` (§B) | 任意 | `approval` | 作る (+`profitability_floor`) | **残す** |
@@ -412,7 +429,7 @@ agent は `run_backtest` の返却で in_sample の `pf`/`avg_r` を見ている
 - F4-7 既存 3 呼び出し (`insufficient_trades` / `gate_failed:*` / `backtest_data_unavailable`) の gate 行・ledger 行・INDEX が `gate_failed` のまま (引数化の後方互換)
 - F4-8 §A の dedup 母集団に `unprofitable` 行が入らない
 - F4-9 **gate 行・ledger 行・settle が同じ branch-local outcome** (`unprofitable`) を受ける (codex I6)。変異: ledger だけ `gate_failed` 固定に戻す → killer
-- F4-10 **report 作成失敗分岐では gate 行・ledger 行とも `report_failed`** (`unprofitable` で上書きしない)。変異: 引数をそのまま使う → killer
+- F4-10 **report 作成失敗分岐では gate 行・ledger 行・settle・archive INDEX の 4 点すべてが `report_failed`** (`unprofitable` で上書きしない)。ledger 状態は `PERSISTED` になる。変異: 引数をそのまま使う / INDEX だけ `unprofitable` になる → killer (codex R2-I3)
 
 ### F5 遮断 8 (**配置**: 純粋な store / rendering pin は新規 `tests/loops/test_floor_leak_guard.py` = Landlock skip なし。実プロセス依存のものだけ `test_improve_forbidden_regression.py`、codex I12)
 
@@ -432,7 +449,10 @@ agent は `run_backtest` の返却で in_sample の `pf`/`avg_r` を見ている
 - F6-5 **`approval.submit_plugin(kind=strategy)` が `ValueError` で拒否され、メッセージに `materialize` と `--from _human` の案内が含まれる** (codex C1)。変異: 拒否を外す → killer
 - F6-6 **in_sample 合格・holdout 不合格の候補が legacy submit 経路で approval にならない** (C1 の本質 pin。現行実装ではこれが approval になってしまう)
 - F6-7 `bless_candidate` の既存 11 テスト呼び出しが **戻り値 `int` のまま**通る (後方互換 pin)
-- F6-8 人間 corridor の gate 行に `mission_outcome` が付く: submit 成功 = `approval` / submit フロア不合格 = `unprofitable` / submit その他不合格 = `gate_failed` / bless (警告含む) = `approval`。**`None` の行を新たに作らない** (codex I2)。変異: `record_fn` を渡さず即時 commit に戻す → killer
+- F6-8 人間 corridor の gate 行に `mission_outcome` が付く: submit 成功 = `approval` / **submit フロア不合格 = `unprofitable`** / **submit 標本不足 = `gate_failed`** / submit その他不合格 = `gate_failed` / bless (警告含む) = `approval`。**`None` の行を新たに作らない** (codex I2)。**フロア不合格と標本不足の両方を別々に pin する** (codex R2-I1)。変異: `record_fn` を渡さず即時 commit に戻す / 判別子を無視して両方 `gate_failed` にする → killer
+- F6-9 **`run_kind_gate` がゲート判定で例外を投げない** — 標本不足でも収益性不合格でも `GateOutcome` が返り、`verdict_kind` が `"insufficient_trades"` / `"floor"` になる (codex R2-I1)。変異: `run_kind_gate` 内で raise に戻す → killer
+- F6-10 **`_run_full_gate` の分類が判別子由来**である pin — `floor_detail` / 候補名に `"unprofitable"` の文字列を混ぜた fixture でも標本不足は `gate_failed` に保存される。変異: 例外メッセージの部分一致で分類する → killer
+- F6-11 **人間 submit のフロア不合格で `activity` に `submit_floor_rejected` が書かれ、適用閾値 (`min_pf` / `require_positive_avg_r` / `require_holdout_evaluable`) が行に含まれる** (codex R2-I2)。`activity=None` でも例外を出さない。変異: `activity` 引数を外す / CLI が渡さない → killer
 
 ### F7 T2
 
@@ -485,3 +505,4 @@ F1-4 (`trades>0, pf=None`) / F1-8 (enforce で holdout を回さない) / F2-4 (
 |---|---|---|---|---|
 | 2026-09-12 | v1 | 起案 + ユーザー裁定反映。T0 (reject reason 漏洩) / T1 (収益性フロア 2 段: in_sample + holdout、ラベルは `unprofitable` 固定) / T2 (RPC ヒント + プロンプト、in_sample のみ) / T3 (config 3 キー) の 4 task。U1 = holdout も門に (固定文言 1 bit は許容、遮断 8 にただし書き追記) / U2 = submit は raise・bless は警告のみ / U3 = DD・latches は門にせずレポートに出す / U4 = baseline 再生は別起票 / U5 = 除染はユーザー実行。指揮者既定 = holdout は `evaluable=true` のときだけ判定 (`require_holdout_evaluable=False`) | 実機観測 `tmp/a4-run16-codex-20260912.md` / `tmp/approval-20260912b.md` (approval #10 = mission 80)、実 DB read-only 調査 (`backtest_runs` 35 行 / `approval_requests` 10 件 / `improvement_backlog` 64 行)、ユーザー裁定 2026-09-12 | - |
 | 2026-09-12 | v1.1 | codex 設計レビュー 1 周目 18 件 (Critical 2 / Important 14 / Minor 2) を全件反映。C1 = legacy submit (`approval.submit_plugin`) は kind=strategy を拒否し materialize → `--from _human` を案内 (回廊統合は別起票) / C2 = `floor_mode` を evaluator まで渡し `warn` では in_sample 不合格でも holdout・baseline 完走 / I1 = 遮断 8 の例外を「人間 reject と同程度」ではなく「反復可能な二値 oracle を受容する脅威モデル」として逐語記録 (テスト保証は数値・段名・pair・baseline 差分の不在に限定) / I2 = `_run_full_gate` に非コミット sink、人間回廊の gate 行に明示 outcome (`approval` / `unprofitable` / `gate_failed`) / I3 = approval payload 3 箇所に `profitability_floor` snapshot / I4・I5 = tuple 拡張を撤回し `GateOutcome` dataclass、`bless_candidate` は `int` 戻りを維持して `on_floor_warning` コールバックで警告を渡す (tests 11 箇所を壊さない)、`_approval_detail` に floor 表示 / I6 = `_finalize_gate_failed` の gate 行・ledger 行・settle に同じ branch-local outcome、report 失敗時は `report_failed` を上書きしない / I7 = `submission_blocked` は親 `run_backtest_handler` で 1 回だけ導出 (builder/registry のシグネチャは変えない) / I8 = プロンプト・CLI 文言を settings からレンダ / I9 = strict holdout 判定を zero-trade shortcut より前 / I10・I11 = 「別名で予算再取得」を撤回し `max_backtests_per_candidate >= len(pairs)` validator + 全 pair backtest 規律 / I12 = 純粋漏洩 pin を Landlock skip の無い新規モジュールへ / I13 = F5-2 を完全一致 + canary + `floor_detail` + 段名断片に限定 / I14 = `_check_profitability_floor` の 3 呼び出し元 spy pin + 「helper を呼ばない」変異 / M1 = F1-4 を `trades>0, pf=None, avg_r>0` / M2 = DD・latches 極端値で verdict 不変の pin | codex 設計レビュー 1 周目 `tmp/design-profitability-floor/codex-design-r1.md` (gpt-5.6-sol、spec/plan v1 = 3ab0b06)、指揮者裁定 2026-09-12 (全件採用) | - |
+| 2026-09-12 | v1.2 | codex 設計レビュー 2 周目 5 件 (Important 3 / Minor 2) を全件反映。R2-I1 = `run_kind_gate` はゲート判定で例外を投げず**常に `GateOutcome` を返す**契約に固定、判別子 `verdict_kind` (`ok`/`insufficient_trades`/`floor`) + `floor_failed` を追加し enforce の raise と失敗行 outcome の決定は `_run_full_gate` が型付き結果から行う、**例外メッセージによる分類は禁止**と明記 (標本不足 = `gate_failed` / フロア = `unprofitable` を別々に pin、F6-9〜F6-11) / R2-I2 = `submit_candidate(..., activity=None)` を追加し `_plugin_submit` から `ActivityLog(root/"logs"/"activity.log")` を渡す配線を明記 (F6-11) / R2-I3 = 共通 settle 契約を維持し終端表「フロア不合格 + report 作成失敗」の archive / INDEX を `report_failed` に訂正、F4-10 を gate 行・ledger 行・settle・INDEX の 4 点 + ledger `PERSISTED` に拡張 / R2-M2 = 閾値 snapshot の出力先を「approval を作る全終端 (成功・bless 警告)」に限定し、approval を作らない失敗はレポート / activity で監査と明記 | codex 設計レビュー 2 周目 `tmp/design-profitability-floor/codex-design-r2.md` (gpt-5.6-sol、v1.1 = cbed926)、指揮者裁定 2026-09-12 (全件採用) | - |
