@@ -33,6 +33,53 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
     baseline_variant: str = "no_strategy"
     baseline_row: dict | None = None
     candidate_metrics: dict | None = None
+    # [profitability-floor] T1 Step 1-2 (2026-09-12、設計書 §3 T1-a):
+    # `evaluable` は R8 の「標本不足」意味論を流用しない (別フィールド)。
+    floor_reason: str = ""
+    floor_detail: str = ""
+
+
+def _check_profitability_floor(
+        per_pair: dict, *, settings: "Settings", scope: str) -> tuple[str, str]:
+    """[profitability-floor] T1 Step 1-1 (設計書 §3「判定規則 (逐語)」)。
+
+    戻り値 `(label, detail)`。`label` は `""` (合格) か `"unprofitable"`
+    (固定文言 — この文字列は `improvement_backlog.last_result` に逐語で
+    現れるため変えない)。`detail` は人間向けレポート専用の全数値文字列
+    — `label` と混ぜない (遮断 8 の 1 bit 例外を守るため)。
+
+    pair ごとに判定し、**1 pair でも不合格なら候補全体を落とす**
+    (pf は pair 間で算術合成できないため合計ではなく pair ごとに見る)。
+
+    順序 ①→②→③ は契約 (codex I9): ① (strict holdout 判定) を ② の
+    後に置くと `require_holdout_evaluable=True` でも `trades=0` の pair
+    が通ってしまう。
+    """
+    g = settings.improve.gate
+    fail_details: list[str] = []
+    for pair, m in per_pair.items():
+        # ① strict holdout 判定は zero-trade shortcut より前 (trades==0
+        # でも FAIL する)。
+        if scope == "holdout" and g.require_holdout_evaluable \
+                and not m.get("evaluable"):
+            fail_details.append(f"{pair}: holdout_not_evaluable")
+            continue
+        # ② 成績が無い pair は通常モードでは判定から除外する。
+        if m["trades"] == 0:
+            continue
+        # ③ 既定: holdout の標本不足は「悪いとは言わない」(R8)。
+        if scope == "holdout" and not m.get("evaluable"):
+            continue
+        pf = m["pf"]
+        if pf is not None and pf < g.min_pf:  # pf is None (gross_loss==0) は PASS
+            fail_details.append(f"{pair}: pf={pf}")
+            continue
+        avg_r = m["avg_r"]
+        if g.require_positive_avg_r and avg_r is not None and avg_r <= 0.0:
+            fail_details.append(f"{pair}: avg_r={avg_r}")
+    if fail_details:
+        return "unprofitable", f"{scope}: " + ", ".join(fail_details)
+    return "", ""
 
 
 def evaluate_strategy_adoption_gate(
