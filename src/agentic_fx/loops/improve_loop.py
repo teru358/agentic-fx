@@ -1304,10 +1304,14 @@ class ImproveLoop:
 
     def _run_strategy_gate(self, conn, *, name, pairs, timeframe, content_hash,
                            now, meta, kind="strategy", record_fn=None):
+        # [profitability-floor] T1 Step 1-3 (2026-09-12、設計書 §3 T1-b):
+        # 改善ループは常に `floor_mode="enforce"` (in_sample 段の不合格で
+        # holdout を回さず即終端 — evaluator の既定と同じ値だが、この
+        # 呼び出し元が「常に enforce」であることを明示するために渡す)。
         return evaluate_strategy_adoption_gate(
             conn, name=name, pairs=pairs, timeframe=timeframe,
             content_hash=content_hash, now=now, settings=self._settings,
-            meta=meta, kind=kind, record_fn=record_fn)
+            meta=meta, kind=kind, record_fn=record_fn, floor_mode="enforce")
 
     def _build_approval_payload(self, conn, *, name, kind, content_hash,
                                 artifact_hash, ctx_ledger, mission_id,
@@ -2182,6 +2186,19 @@ class ImproveLoop:
                             reason=strategy_verdict.observation_reason, now=now,
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls)
                         return
+                    # [profitability-floor] T1 Step 1-3 (2026-09-12、設計書
+                    # §3 T1-b): 収益性フロア不合格の再ルート。`reason` は
+                    # 固定文言 `unprofitable` (last_result にそのまま流れる
+                    # — 遮断 8 の 1 bit 例外)。`report_detail` は親専有
+                    # レポートにのみ渡り、activity/last_result には流れない。
+                    if strategy_verdict.floor_reason:
+                        self._finalize_gate_failed(
+                            conn, ctx=ctx, backlog_id=selection.backlog_id,
+                            reason="unprofitable", now=now,
+                            gate_rows=tuple(gate_rows), tool_calls=tool_calls,
+                            mission_outcome="unprofitable",
+                            report_detail=strategy_verdict.floor_detail)
+                        return
                     gate_metrics["baseline"] = strategy_verdict.baseline_row
                     # [approval-payload-missing-gate-metrics] 是正 (A4 10
                     # 回目 claude #69 観測 A、2026-09-11): ゲートが実際に
@@ -2687,12 +2704,25 @@ class ImproveLoop:
                              final_path=final_path, now=now)
 
     def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now,
-                              gate_rows=(), tool_calls: int | None = None) -> None:
+                              gate_rows=(), tool_calls: int | None = None,
+                              mission_outcome: str = "gate_failed",
+                              report_detail: str = "") -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
         `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
         渡す)。承認申請は出さないため mission は `completed` で終端
         (取引は止めない — R8)。staging を削除し、台帳は `DISCARDED`。
+
+        [profitability-floor] T1 Step 1-3 (2026-09-12、設計書 §3 T1-b、
+        codex I6): `mission_outcome` は正常分岐 (report 作成成功) の
+        gate 行・ledger 行・settle の 3 箇所すべてへ渡す branch-local な
+        1 つの値 (既定 `"gate_failed"`、フロア経路は呼び出し元が
+        `"unprofitable"` を渡す)。**report 作成失敗分岐は
+        `outcome="report_failed"` に固定し、この引数で上書きしない**
+        (既存の `report_failed` 意味論を壊さない)。`report_detail` は
+        `body_md` の後段に追記する人間向けレポート専用の文字列 —
+        `last_result`/`activity` には一切流さない (pin F2-7/F5-2 の
+        「ラベルと数値の分離」契約)。
 
         D-15 是正 (着手前検証): 設計書 §4.2 手順6「ゲート不合格・評価不能・
         observation・敗者のとき、reports に書く」に従い、`_finalize_loser`
@@ -2713,6 +2743,11 @@ class ImproveLoop:
             f"# Improve Mission {ctx.mission_id} — gate failed\n\n"
             f"reason: `{reason}`\n\nNo approval request was produced by "
             "this mission.\n")
+        if report_detail:
+            # [profitability-floor] T1 Step 1-3: 親専有レポート本文の
+            # 後段にのみ全数値を書く。activity/last_result には流れない
+            # (report_detail の呼び出し元は `reason` と混ぜていない)。
+            body_md += f"\n## Profitability floor detail\n\n{report_detail}\n"
         reports_dir = self._root / "data" / "improve_reports"
         (reports_dir / ".tmp").mkdir(parents=True, exist_ok=True)
         # D-15 是正: 設計書 §4.2 手順6/7「一時ファイル作成に失敗していたら
@@ -2758,14 +2793,18 @@ class ImproveLoop:
         final_path = self._final_report_path(
             reports_dir, mission_id=ctx.mission_id, now=now)
 
+        # [profitability-floor] T1 Step 1-3 (codex I6): outcome を
+        # branch-local に 1 つ決めて gate 行・ledger 行・settle の 3 箇所
+        # 全てへ同じ値を渡す (分裂させない)。
+        outcome = mission_outcome
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
         try:
             ledger_ids = self._persist_ledger_in_tx(
-                conn, ctx=ctx, now=now, mission_outcome="gate_failed")
+                conn, ctx=ctx, now=now, mission_outcome=outcome)
             self._persist_gate_rows(
                 conn, gate_rows=gate_rows, now=now,
-                mission_id=ctx.mission_id, mission_outcome="gate_failed")
+                mission_id=ctx.mission_id, mission_outcome=outcome)
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="completed",
@@ -2781,6 +2820,6 @@ class ImproveLoop:
             conn.rollback()
             raise
         self._settle_ledger_after_commit(
-            conn, ctx=ctx, ledger_ids=ledger_ids, outcome="gate_failed", now=now)
+            conn, ctx=ctx, ledger_ids=ledger_ids, outcome=outcome, now=now)
         self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
                              final_path=final_path, now=now)

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable
+from typing import Callable, Literal
 
 from agentic_fx.backtest import holdout
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
@@ -90,6 +90,7 @@ def evaluate_strategy_adoption_gate(
     history_conn=None,
     run_in_sample_fn=None, run_holdout_gate_fn=None,
     record_fn: "Callable[[dict], None] | None" = None,
+    floor_mode: Literal["enforce", "warn"] = "enforce",
 ) -> "StrategyGateVerdict | None":
     """candidate/baseline/no_strategy の identity と評価可能性。
     indicator/signal はこのゲートを課さない (None を返す)。
@@ -203,12 +204,30 @@ def evaluate_strategy_adoption_gate(
             evaluable=False,
             observation_reason=f"insufficient_trades:{total_trades}")
 
+    # [profitability-floor] T1 Step 1-2 (2026-09-12、設計書 §3):
+    # in_sample 段の判定は total_trades 判定の直後 (holdout ループより前)。
+    # `floor_mode="enforce"` で不合格なら holdout を回さずに即 return する
+    # (落ちる候補に holdout の計算コストを払わない/holdout 情報の発生
+    # 自体を無くす — 遮断 8 の 1 bit 例外の前提)。`floor_mode="warn"` の
+    # 不合格は `floor_reason`/`floor_detail` を保持したまま完走する
+    # (codex C2 — bless で強行する候補にも通常 submit と同じ全ゲート
+    # 証跡を残すため)。
+    in_sample_floor_reason, in_sample_floor_detail = _check_profitability_floor(
+        per_pair, settings=settings, scope="in_sample")
+    if in_sample_floor_reason and floor_mode == "enforce":
+        return StrategyGateVerdict(
+            evaluable=True, floor_reason=in_sample_floor_reason,
+            floor_detail=in_sample_floor_detail, candidate_metrics=per_pair)
+
+    holdout_per_pair: dict = {}
     for pair in pairs:
         intent_source = strategy_adapter.build_intent_source(
             meta, conn=conn, pair=pair, dataset=dataset,
             settings=settings)
         try:
-            run_holdout(
+            # 現行は戻り値を捨てていた (§0「前提を疑う」) — フロア判定の
+            # holdout 段はこの戻り値が要る。
+            holdout_per_pair[pair] = run_holdout(
                 settings, history_conn=history_conn, symbol=pair,
                 dataset=dataset, intent_source=intent_source,
                 eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
@@ -217,11 +236,19 @@ def evaluate_strategy_adoption_gate(
         finally:
             intent_source.close()
 
+    holdout_floor_reason, holdout_floor_detail = _check_profitability_floor(
+        holdout_per_pair, settings=settings, scope="holdout")
+    # warn で in_sample も落ちていた場合は floor_detail に両段を含める。
+    floor_reason = in_sample_floor_reason or holdout_floor_reason
+    floor_detail = " | ".join(
+        d for d in (in_sample_floor_detail, holdout_floor_detail) if d)
+
     if approved_row is not None:
         baseline_row = {"ref_plugin_ref": plugin_ref, "variant": "baseline"}
         return StrategyGateVerdict(
             evaluable=True, baseline_variant="baseline",
-            baseline_row=baseline_row, candidate_metrics=per_pair)
+            baseline_row=baseline_row, candidate_metrics=per_pair,
+            floor_reason=floor_reason, floor_detail=floor_detail)
 
     for row in in_sample_rows:
         no_strategy_row = dict(row)
@@ -242,4 +269,5 @@ def evaluate_strategy_adoption_gate(
                     "variant": "no_strategy"}
     return StrategyGateVerdict(
         evaluable=True, baseline_variant="no_strategy",
-        baseline_row=baseline_row, candidate_metrics=per_pair)
+        baseline_row=baseline_row, candidate_metrics=per_pair,
+        floor_reason=floor_reason, floor_detail=floor_detail)

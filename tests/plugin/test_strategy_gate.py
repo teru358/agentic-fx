@@ -11,10 +11,26 @@ from unittest.mock import MagicMock
 import pytest
 
 from agentic_fx.backtest.dataset import HistoryDataset
+from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.strategy_gate import evaluate_strategy_adoption_gate
 
-_SETTINGS = MagicMock()  # run_in_sample/run_holdout_gate は monkeypatch で
+
+def _configure_gate_mock(settings: MagicMock) -> MagicMock:
+    """[profitability-floor] T1 Step 1-2 (2026-09-12): `_check_
+    profitability_floor` は `settings.improve.gate.{min_pf,
+    require_positive_avg_r,require_holdout_evaluable}` を実値で読む —
+    `MagicMock()` のままだと `pf < g.min_pf` が `MagicMock` との比較で
+    `TypeError` になる。既定 (`config/settings.yaml.example` と同じ)
+    値を明示的に設定する。"""
+    settings.improve.gate.min_pf = 1.0
+    settings.improve.gate.require_positive_avg_r = True
+    settings.improve.gate.require_holdout_evaluable = False
+    return settings
+
+
+_SETTINGS = _configure_gate_mock(MagicMock())  # run_in_sample/
+                         # run_holdout_gate は monkeypatch で
                          # 差し替えるため settings の中身は本節のテストでは
                          # 参照されない (build_intent_source も同様に
                          # monkeypatch する — 下記 `_meta`/`_fake_intent_source`)
@@ -37,12 +53,36 @@ def _fake_intent_source(monkeypatch):
         lambda meta, **kw: MagicMock(close=lambda: None))
 
 
+def _metrics(*, trades: int, pf: float | None, avg_r: float | None = 0.15,
+             evaluable: bool | None = None, win_rate: float | None = 0.5,
+             max_drawdown: float = 0.01, total_pnl: float = 100.0,
+             fallback_spread_used: bool = False,
+             kill_switch_latches: int = 0) -> dict:
+    """[profitability-floor] T1 Step 1-2 (2026-09-12、コーディネータ裁定):
+    `backtest/metrics.py::compute_metrics` と同形の完全な per-pair 成績
+    dict を作る共通 helper。この節の既存 14 tests は
+    `{"trades": N, "pf": M}` の部分 dict で `run_in_sample`/
+    `run_holdout_gate` を monkeypatch していたが、Step 1-2 で追加した
+    `_check_profitability_floor` は `m["avg_r"]` を直接インデックスする
+    (`.get` に緩めない — fail closed。spec の判定規則契約、メモリ
+    `test-fixtures-from-real-transcripts` の教訓どおり手書きの偽形状を
+    使わない)。既定値は全て「フロアを通す」無害な値 (`pf>=1.0`,
+    `avg_r>0`) — 各 test の期待値 (evaluable/baseline 等) は不変。"""
+    if evaluable is None:
+        evaluable = trades >= EVALUABLE_MIN_TRADES
+    return {"trades": trades, "pf": pf, "win_rate": win_rate,
+            "avg_r": avg_r, "max_drawdown": max_drawdown,
+            "total_pnl": total_pnl, "evaluable": evaluable,
+            "fallback_spread_used": fallback_spread_used,
+            "kill_switch_latches": kill_switch_latches}
+
+
 def test_below_evaluable_min_trades_is_observation_not_rejected(monkeypatch):
     """合計取引数 < 30 → 承認申請を出さず observation (悪いとは記録しない)。"""
     _fake_intent_source(monkeypatch)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
-        lambda *a, **kw: {"trades": 10, "pf": 1.0})
+        lambda *a, **kw: _metrics(trades=10, pf=1.0))
     verdict = evaluate_strategy_adoption_gate(
         MagicMock(), name="myst", pairs=["USDJPY"], timeframe="1h",
         content_hash="h1", now=datetime(2026, 8, 22), settings=_SETTINGS,
@@ -58,13 +98,13 @@ def test_evaluable_min_trades_is_sum_across_pairs(monkeypatch):
     calls = []
     def _fake_run_in_sample(*a, **kw):
         calls.append(kw.get("symbol"))
-        return {"trades": 16, "pf": 1.2}
+        return _metrics(trades=16, pf=1.2)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
         _fake_run_in_sample)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
-        lambda *a, **kw: {"trades": 16, "pf": 1.1})
+        lambda *a, **kw: _metrics(trades=16, pf=1.1))
     verdict = evaluate_strategy_adoption_gate(
         MagicMock(), name="myst", pairs=["USDJPY", "EURUSD"], timeframe="1h",
         content_hash="h1", now=datetime(2026, 8, 22), settings=_SETTINGS,
@@ -78,10 +118,10 @@ def test_baseline_uses_live_d4_approved_same_name_strategy(
     _fake_intent_source(monkeypatch)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
-        lambda *a, **kw: {"trades": 30, "pf": 1.2})
+        lambda *a, **kw: _metrics(trades=30, pf=1.2))
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
-        lambda *a, **kw: {"trades": 30, "pf": 1.1})
+        lambda *a, **kw: _metrics(trades=30, pf=1.1))
     verdict = evaluate_strategy_adoption_gate(
         conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
         timeframe="1h", content_hash="h2", now=datetime(2026, 8, 22),
@@ -95,10 +135,10 @@ def test_baseline_falls_back_to_no_strategy_when_no_approved_same_name(
     _fake_intent_source(monkeypatch)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
-        lambda *a, **kw: {"trades": 30, "pf": 1.2})
+        lambda *a, **kw: _metrics(trades=30, pf=1.2))
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
-        lambda *a, **kw: {"trades": 30, "pf": 1.1})
+        lambda *a, **kw: _metrics(trades=30, pf=1.1))
     verdict = evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
         content_hash="h3", now=datetime(2026, 8, 22), settings=_SETTINGS,
@@ -127,12 +167,12 @@ def test_record_fn_is_forwarded_to_run_in_sample_and_run_holdout(
 
     def _fake_run_in_sample(*a, record_fn=None, **kw):
         seen_record_fns.append(("run_in_sample", record_fn))
-        return {"trades": 30, "pf": 1.2}  # >= EVALUABLE_MIN_TRADES (30) で
+        return _metrics(trades=30, pf=1.2)  # >= EVALUABLE_MIN_TRADES (30) で
                                           # run_holdout まで到達させる
 
     def _fake_run_holdout(*a, record_fn=None, **kw):
         seen_record_fns.append(("run_holdout", record_fn))
-        return {"trades": 30, "pf": 1.1}
+        return _metrics(trades=30, pf=1.1)
 
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
@@ -158,13 +198,13 @@ def test_content_hash_argument_wins_over_meta_content_hash(
     seen_content_hashes = []
     def _fake_run_in_sample(*a, **kw):
         seen_content_hashes.append(kw.get("content_hash"))
-        return {"trades": 30, "pf": 1.2}
+        return _metrics(trades=30, pf=1.2)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
         _fake_run_in_sample)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
-        lambda *a, **kw: {"trades": 30, "pf": 1.1})
+        lambda *a, **kw: _metrics(trades=30, pf=1.1))
     evaluate_strategy_adoption_gate(
         conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
         timeframe="1h", content_hash="recomputed-hash",
@@ -184,10 +224,10 @@ def test_pending_only_approval_does_not_count_as_baseline(
     _fake_intent_source(monkeypatch)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
-        lambda *a, **kw: {"trades": 30, "pf": 1.2})
+        lambda *a, **kw: _metrics(trades=30, pf=1.2))
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
-        lambda *a, **kw: {"trades": 30, "pf": 1.1})
+        lambda *a, **kw: _metrics(trades=30, pf=1.1))
     verdict = evaluate_strategy_adoption_gate(
         conn_with_pending_strategy, name="myst", pairs=["USDJPY"],
         timeframe="1h", content_hash="h2", now=datetime(2026, 8, 22),
@@ -207,11 +247,11 @@ def test_eval_timeframe_normalizes_1d_to_24h_for_run_in_sample_and_holdout(
 
     def _fake_run_in_sample(*a, **kw):
         seen_eval_timeframes.append(("run_in_sample", kw.get("eval_timeframe")))
-        return {"trades": 30, "pf": 1.2}
+        return _metrics(trades=30, pf=1.2)
 
     def _fake_run_holdout(*a, **kw):
         seen_eval_timeframes.append(("run_holdout", kw.get("eval_timeframe")))
-        return {"trades": 30, "pf": 1.1}
+        return _metrics(trades=30, pf=1.1)
 
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
@@ -231,7 +271,7 @@ def test_eval_timeframe_normalizes_1d_to_24h_for_run_in_sample_and_holdout(
 def test_eval_source_follows_backtest_settings(
         monkeypatch, conn_with_approved_strategy, eval_source):
     # R09 (2 周目): 単一値だと "mt5" ハードコード変異が生存するため 2 値で pin
-    settings = MagicMock()
+    settings = _configure_gate_mock(MagicMock())
     settings.backtest.eval_source = eval_source
     settings.backtest.dataset.return_value = HistoryDataset(eval_source, "1m")
     seen_sources = []
@@ -243,11 +283,11 @@ def test_eval_source_follows_backtest_settings(
 
     def _fake_run_in_sample(*a, **kw):
         seen_sources.append(("in_sample", kw["dataset"].source))
-        return {"trades": 30, "pf": 1.2}
+        return _metrics(trades=30, pf=1.2)
 
     def _fake_run_holdout(*a, **kw):
         seen_sources.append(("holdout", kw["dataset"].source))
-        return {"trades": 30, "pf": 1.1}
+        return _metrics(trades=30, pf=1.1)
 
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
@@ -274,7 +314,7 @@ def test_evaluate_strategy_adoption_gate_uses_single_dataset_object(
     holdout ループ (build_intent_source/run_holdout_gate) の全呼び出しへ
     渡す — split-brain (ループごとに異なる dataset を見る) を防ぐ。
     """
-    settings = MagicMock()
+    settings = _configure_gate_mock(MagicMock())
     settings.backtest.eval_source = "dukascopy"
     settings.backtest.dataset.return_value = HistoryDataset("dukascopy", "1m")
     seen_datasets = []
@@ -286,11 +326,11 @@ def test_evaluate_strategy_adoption_gate_uses_single_dataset_object(
 
     def _fake_run_in_sample(*a, **kw):
         seen_datasets.append(kw["dataset"])
-        return {"trades": 30, "pf": 1.2}
+        return _metrics(trades=30, pf=1.2)
 
     def _fake_run_holdout(*a, **kw):
         seen_datasets.append(kw["dataset"])
-        return {"trades": 30, "pf": 1.1}
+        return _metrics(trades=30, pf=1.1)
 
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
@@ -347,14 +387,14 @@ def test_no_strategy_row_is_saved_immediately_when_record_fn_is_none(
         row = _no_strategy_row_kwargs(pair=kw.get("symbol", "USDJPY"))
         if record_fn is not None:
             record_fn(row)
-        return {"trades": 30, "pf": 1.2}
+        return _metrics(trades=30, pf=1.2)
 
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
         _fake_run_in_sample)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
-        lambda *a, **kw: {"trades": 30, "pf": 1.1})
+        lambda *a, **kw: _metrics(trades=30, pf=1.1))
 
     verdict = evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
@@ -381,11 +421,11 @@ def test_no_strategy_path_wraps_record_fn_for_run_in_sample_only(
 
     def _fake_run_in_sample(*a, record_fn=None, **kw):
         seen.append(("run_in_sample", record_fn))
-        return {"trades": 30, "pf": 1.2}
+        return _metrics(trades=30, pf=1.2)
 
     def _fake_run_holdout(*a, record_fn=None, **kw):
         seen.append(("run_holdout", record_fn))
-        return {"trades": 30, "pf": 1.1}
+        return _metrics(trades=30, pf=1.1)
 
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
@@ -419,7 +459,7 @@ def test_no_strategy_path_wraps_record_fn_for_run_in_sample_only(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
         lambda *a, record_fn=None, **kw: (
             record_fn(_no_strategy_row_kwargs()),
-            {"trades": 30, "pf": 1.2})[1])
+            _metrics(trades=30, pf=1.2))[1])
     # wrapper は `evaluate_strategy_adoption_gate` の閉じたクロージャ内で
     # `in_sample_rows.append(row)` と `record_fn(row)` (呼び出し元の
     # record_fn=None のときは即時 save) の両方を行う。ここでは呼び出し元
@@ -461,14 +501,14 @@ def test_no_strategy_row_copies_identity_and_replaces_metrics_only(
         if record_fn is not None:
             record_fn(row)
         captured_rows.append(row)
-        return {"trades": 30, "pf": 1.2}
+        return _metrics(trades=30, pf=1.2)
 
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
         _fake_run_in_sample)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
-        lambda *a, **kw: {"trades": 30, "pf": 1.1})
+        lambda *a, **kw: _metrics(trades=30, pf=1.1))
 
     evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
@@ -494,3 +534,66 @@ def test_no_strategy_row_copies_identity_and_replaces_metrics_only(
     assert json.loads(row["params_json"]) == candidate_row["params"]
     # candidate 行の dict 自体は破壊されていないこと (shallow copy pin)
     assert candidate_row["plugin_ref"] == "plugins/brand_new_strategy"
+
+
+# ---- [profitability-floor] T1 Step 1-2 (2026-09-12) --------------------
+
+def test_f1_8_enforce_floor_fail_short_circuits_before_holdout(
+        monkeypatch, conn):
+    """F1-8: `floor_mode="enforce"` (既定) で in_sample 段が不合格なら
+    holdout ループに入らない (`run_holdout_gate` が呼ばれない)。"""
+    _fake_intent_source(monkeypatch)
+    holdout_calls = []
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, **kw: _metrics(trades=30, pf=0.5, avg_r=0.1))
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: (holdout_calls.append(1), _metrics(trades=30, pf=1.5))[1])
+    verdict = evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        content_hash="h9", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", content_hash="h9"))
+    assert verdict.floor_reason == "unprofitable"
+    assert holdout_calls == []  # holdout に到達していない
+
+
+def test_f6_3_warn_mode_completes_holdout_and_baseline_despite_in_sample_fail(
+        monkeypatch, conn):
+    """F6-3 (strategy_gate 側の対応部分): `floor_mode="warn"` は in_sample
+    不合格でも holdout ループ・baseline/no_strategy 分岐まで完走する。"""
+    _fake_intent_source(monkeypatch)
+    holdout_calls = []
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, **kw: _metrics(trades=30, pf=0.5, avg_r=0.1))
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: (holdout_calls.append(1), _metrics(trades=30, pf=1.5))[1])
+    verdict = evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        content_hash="h10", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", content_hash="h10"),
+        floor_mode="warn")
+    assert verdict.floor_reason == "unprofitable"
+    assert holdout_calls == [1]  # holdout まで完走した
+    assert verdict.baseline_variant == "no_strategy"  # baseline 分岐にも到達
+
+
+def test_holdout_stage_failure_sets_floor_reason_when_in_sample_passes(
+        monkeypatch, conn):
+    """holdout 段だけが不合格でも `floor_reason` が立つ (in_sample は
+    合格 → holdout まで進む既存の経路)。"""
+    _fake_intent_source(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.1))
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: _metrics(trades=30, pf=0.4, avg_r=0.1))
+    verdict = evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        content_hash="h11", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", content_hash="h11"))
+    assert verdict.floor_reason == "unprofitable"
+    assert "holdout" in verdict.floor_detail
