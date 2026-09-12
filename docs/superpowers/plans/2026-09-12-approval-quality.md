@@ -118,3 +118,5 @@ ledger 設計書 (`2026-09-10-ledger-preserve-design.md`) §3 の全終端表は
 | 2026-09-12 | v1 | 起案。T-A〜T-D の task 分割 (A〜C 直列 1 worktree、D 並列別 worktree)、§0 に失敗終端実証 run を追加、レビュー段・実機確認・進捗表を規定 | 設計書 `2026-09-12-approval-quality-design.md` v1 のユーザー承認 (2026-09-12) を実装プランへ写す | - |
 | 2026-09-12 | v1.1 | §0 失敗終端実証 run 完了 (codex #77、`max_tool_calls` は 6 でなく 8 — 6/7 では run_backtest (8 番目) 前に abort し観測不能。窓は 1 呼び出し分) → F1〜F7 充足、新規欠陥 0 | 実機観測 | fb6aed8 以降 |
 | 2026-09-12 | v1.2 | T-A〜T-D 実装完了 (2 worktree 並列、段 0 逆変異 12/12 red、3736 passed)。進捗表更新。次 = codex + ローカル 1 周目 → /code-review high → A4 15 回目 | 実装完了 | 7837fe9 |
+| 2026-09-12 | v1.3 | 1 周目完了: codex Important 4 (I1〜I3 是正 `d2c103e`、I4 = 実機で) / ローカル 3 本 本番欠陥 0、pin 8。次 = A4 15 回目 (claude + codex 各 1 ターン: D の `/proc/<pid>/cmdline` に prompt 無し、A の `duplicate_metrics_of` 降格、B の INDEX approval 行、C の `approval <id>` archive 行) → `/code-review high` | レビュー | (this) |
+
