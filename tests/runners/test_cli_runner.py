@@ -149,7 +149,7 @@ def test_cli_runner_abort_returns_failed_with_tool_budget_reason(tmp_path):
 def test_cli_runner_abort_uses_recovery_and_marks_recovered(tmp_path):
     class RecoveringRunner(_FakeCliRunner):
         def _run_cli_process(self, argv, env, *, timeout_sec,
-                             on_started=None, abort_event=None):
+                             on_started=None, abort_event=None, prompt=None):
             assert abort_event is event
             return "abort", None, ["partial"], []
         def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
@@ -670,7 +670,7 @@ def test_cli_runner_reserve_zero_primary_timeout_is_full_mission_timeout(tmp_pat
 
     class _SpyingRunner(_FakeCliRunner):
         def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None,
-                             abort_event=None):
+                             abort_event=None, prompt=None):
             captured["timeout_sec"] = timeout_sec
             return super()._run_cli_process(
                 argv, env, timeout_sec=timeout_sec, on_started=on_started,
@@ -696,7 +696,7 @@ def test_cli_runner_reserve_positive_shortens_primary_timeout(tmp_path):
             return 2.0
 
         def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None,
-                             abort_event=None):
+                             abort_event=None, prompt=None):
             captured["timeout_sec"] = timeout_sec
             return super()._run_cli_process(
                 argv, env, timeout_sec=timeout_sec, on_started=on_started,
@@ -727,7 +727,7 @@ def test_cli_runner_reserve_disabled_when_mission_timeout_not_greater_than_reser
             return 10.0
 
         def _run_cli_process(self, argv, env, *, timeout_sec, on_started=None,
-                             abort_event=None):
+                             abort_event=None, prompt=None):
             captured["timeout_sec"] = timeout_sec
             return super()._run_cli_process(
                 argv, env, timeout_sec=timeout_sec, on_started=on_started,
@@ -786,7 +786,7 @@ def test_abort_saves_transcript_like_timeout(tmp_path):
 
     class R(_FakeCliRunner):
         def _run_cli_process(self, argv, env, *, timeout_sec,
-                             on_started=None, abort_event=None):
+                             on_started=None, abort_event=None, prompt=None):
             return "abort", None, ["partial"], []
 
         def _save_transcript(self, stdout_lines, stderr_chunks):
@@ -811,7 +811,7 @@ def test_abort_recovered_completion_keeps_abort_reason(tmp_path):
 
     class RecoveringRunner(_FakeCliRunner):
         def _run_cli_process(self, argv, env, *, timeout_sec,
-                             on_started=None, abort_event=None):
+                             on_started=None, abort_event=None, prompt=None):
             return "abort", None, ["partial"], []
         def _recover_output(self, mission, stdout_lines, recovery_timeout_sec):
             return {"answer": 4}
@@ -1036,7 +1036,7 @@ def test_cli_runner_abort_carries_stderr_fatal(tmp_path):
     プロセスの stderr 到達はレースになる)。"""
     class _AbortingRunner(_FakeCliRunner):
         def _run_cli_process(self, argv, env, *, timeout_sec,
-                             on_started=None, abort_event=None):
+                             on_started=None, abort_event=None, prompt=None):
             return "abort", None, [], [
                 "error=code-mode host exited with status signal: 5 (SIGTRAP)\n"]
 

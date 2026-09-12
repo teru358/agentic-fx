@@ -68,7 +68,7 @@ class ClaudeRunner(CliRunner):
             "env": {}}}}
         mcp_config_path.write_text(json.dumps(mcp_config))
         return [
-            str(self._bin_path), "-p", mission.prompt,
+            str(self._bin_path), "-p",
             "--output-format", "stream-json", "--verbose",
             "--json-schema", json.dumps(mission.output_schema),
             "--setting-sources", "",
@@ -114,3 +114,10 @@ class ClaudeRunner(CliRunner):
 
     def _max_turns_semantics(self) -> Literal["passthrough", "ignored"]:
         return "passthrough"
+
+    def _stdin_prompt(self, mission: Mission) -> str | None:
+        # [mission-prompt-in-argv-readable-via-proc] 是正 (設計書 §D):
+        # `_build_argv` はもう `mission.prompt` を argv に積まない —
+        # `/proc/<pid>/cmdline` から読めなくするため、代わりにここで
+        # stdin (workdir/prompt.txt 経由) に回す。
+        return mission.prompt
