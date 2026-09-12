@@ -102,9 +102,9 @@ ledger 設計書 (`2026-09-10-ledger-preserve-design.md`) §3 の全終端表は
 | task | 状態 | commit | 備考 |
 |---|---|---|---|
 | §0 失敗終端 run | 未着手 | - | `tmp/a4-run14-failed-*.md` |
-| T-A 質検査 | 未着手 | - | |
-| T-B INDEX approval 行 | 未着手 | - | T-A の後 |
-| T-C archive 引き当て | 未着手 | - | |
+| T-A 質検査 | 完了 | 7837fe9 | 逆変異 5/5 RED。多 pair は 1 pair 一致で降格、降格時 gate 行なし、`observation:` prefix |
+| T-B INDEX approval 行 | 完了 | 7837fe9 | 逆変異 2/2 RED |
+| T-C archive 引き当て | 完了 | 7837fe9 | 逆変異 3/3 RED |
 | T-D prompt stdin | 完了 (実機未確認: claude/codex 各 1 ターンで A4 15 回目) | 7837fe9 | 逆変異 2/2 RED。pgid 回収テストは trade profile + python fixture に |
 | レビュー 1 周目 | 未着手 | - | |
 | レビュー 2 周目 (`/code-review high`) | 未着手 | - | ユーザー起動 |
