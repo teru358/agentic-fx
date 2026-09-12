@@ -209,6 +209,9 @@ sweep 回収」(候補2、推奨) を両論併記している。**着手前に�
 
 > 指揮者補足 (2026-09-12): T1(b) の残骸 `prompt.txt` の中身は 1 byte `p` = `tests/runners` の `_mission()` 既定 prompt (r2b 以前) と一致するので **pytest 由来で確定**。`workdir=` が tmp_path でも、`CliRunner` を `workdir` 省略で構築する経路か、`Path.cwd()` を既定にする fixture を疑う (`grep -rn "CliRunner(\|ClaudeRunner(\|CodexRunner(" tests | grep -v workdir`)。実装者は「テスト実行後に repo root の untracked が増えない」session guard を先に入れ、guard が落ちるテストを犯人として特定する。
 
+
+> 指揮者裁定 (2026-09-12 17:00、既定選択): T2 = startup sweep で `.locks/` を回収 (flock/unlink の TOCTOU を避ける) / T3 = 文書化 (`finished_at` は論理終端時刻、壁時計は activity) のみ、コード変更なし / T4 = 実 auth.json (codex 0.150.1) に期限キーが存在しないため検査を撤去 (WARNING の空振りを止める。期限は codex 側が 401 で返すのに任せ、`cli_stderr_fatal` に `usage limit` / `401` パターンを足す) / T5 = 据え置き (文書に明記済)。
+
 ## 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
