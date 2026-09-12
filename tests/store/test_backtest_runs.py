@@ -1007,3 +1007,34 @@ def test_find_matching_approved_metrics_malformed_row_does_not_hide_other_matche
         conn, pair="USDJPY", variant="candidate", source="test",
         base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
     assert got == "good-hash"
+
+
+def test_find_matching_approved_metrics_float_tol_is_frozen_at_import(
+        tmp_path, monkeypatch):
+    """ローカル approval-quality 2 周目 #N4 (2026-09-12): 質検査の比較は
+    `db.values_match` が import 時に閉じ込めた frozen `_FLOAT_TOL` (1e-9)
+    を使う — 走行中に `db.FLOAT_TOL` を差し替えても判定境界は動かない。
+
+    CR6 前の形 (呼び出しごとに `from agentic_fx.store.db import FLOAT_TOL`
+    する独自複製 `_metric_value_matches`) は live binding なので
+    monkeypatch に追従し、質検査の境界が走行中に変わってしまう
+    (`tests/store/test_ohlcv.py` の
+    `test_store_float_tolerance_is_shared_and_has_the_same_boundaries` が
+    `ohlcv._close_enough`/`db._values_match` について同じことを pin して
+    いるが、質検査側には対応する pin が無く、live binding への revert 変異
+    が広域 1422 件を生き延びた)。"""
+    from agentic_fx.store import db as db_mod
+    conn = _conn_approved(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, **_approved_kw(metrics={"trades": 1, "pf": 0.0, "avg_r": 0.0}))
+    monkeypatch.setattr(db_mod, "FLOAT_TOL", 1e-3)
+
+    # pin: 5e-4 の差は frozen 1e-9 では不一致 (live binding なら一致する)。
+    assert backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=1, pf=5e-4, avg_r=0.0) is None
+    # 対照: frozen 境界未満の差は monkeypatch 後も一致する (fixture が生きて
+    # いる証明 — 上の None が「そもそも母集団に届いていない」ではない)。
+    assert backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=1, pf=5e-10, avg_r=0.0) == "approved-hash"

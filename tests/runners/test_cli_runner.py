@@ -1243,3 +1243,18 @@ def test_write_prompt_file_refuses_to_overwrite_existing(tmp_path):
         _write_prompt_file(workdir, "新しい prompt")
 
     assert existing.read_text(encoding="utf-8") == "前回の prompt"
+
+
+def test_cli_runner_empty_prompt_does_not_trip_argv_leak_guard(tmp_path):
+    """ローカル approval-quality 2 周目 #M4 (2026-09-12): `mission.prompt`
+    が空文字列のとき argv 漏えいガード (codex 2 周目 I2 で部分一致化) は
+    発火しない — `prompt_prefix = ""` の包含判定は任意の argv 要素に対して
+    常真なので、`and prompt` の空判定を落とすと**空 prompt の mission が
+    全 backend で `ValueError` で落ちる** (実装コメントが明記している
+    誤検知防止が無防備になる。この変異は広域 1422 件を生き延びた)。
+
+    空 prompt はそもそも漏えいする情報を持たないため、ガードの対象外で
+    あることが契約 (`cli_runner.py` の CR5/I2 コメント)。"""
+    runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path)
+    result = runner.run(_mission(prompt=""))
+    assert result.status == "completed"

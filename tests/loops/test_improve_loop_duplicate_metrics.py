@@ -314,3 +314,52 @@ def test_concurrent_duplicate_candidates_only_one_reaches_approval(
     ).fetchall()
     assert len(observation_rows) == 1
 
+
+
+def test_duplicate_metrics_check_skips_non_strategy_kind(improve_env):
+    """ローカル approval-quality 2 周目 #L3 (2026-09-12): 質検査
+    (`_check_duplicate_metrics_for_approval`) は `kind != 'strategy'` の
+    payload を対象外にする — indicator は成績 (trades/pf/avg_r) を持たない
+    ので、仮に payload に `in_sample` が載っていても既承認 strategy 候補と
+    の一致で降格してはいけない。
+
+    ガードを削った変異は現行の payload 形状では観測されない
+    (`gate_metrics["in_sample"]` は `kind == "strategy"` 分岐でのみ代入され、
+    非 strategy では `eval_source`/`base_interval` も `None` になるため
+    実質的に等価変異 — 広域 1422 件で SURVIVED を実測)。ここでは
+    `_check_duplicate_metrics_for_approval` を直接呼び、ガードの有無を
+    観測可能にする。対照 (`kind='strategy'` で降格が返る) を同じ payload
+    で取ることで、fixture が退化していない (母集団に一致行が実在する)
+    ことを同時に示す。"""
+    app, root = improve_env
+    conn = app.conn_core
+
+    ctx_a = _run_strategy_mission(
+        app, root, name="kindguard_a", plugin_py=_STRATEGY_PY_VARIANT_A,
+        in_sample_metrics=_CONVERGED_METRICS, holdout_metrics=_HOLDOUT_METRICS)
+
+    row = conn.execute(
+        "SELECT content_hash, pair, source, base_interval FROM backtest_runs "
+        "WHERE mission_id=? AND scope='in_sample' AND variant='candidate'",
+        (ctx_a.mission_id,)).fetchone()
+    assert row is not None
+
+    loop = _make_loop(app, root)
+    payload = {
+        "name": "kindguard_b",
+        "kind": "strategy",
+        "content_hash": "kindguard-b-hash",
+        "eval_source": row["source"],
+        "base_interval": row["base_interval"],
+        "in_sample": {row["pair"]: dict(_CONVERGED_METRICS)},
+    }
+
+    # 対照: strategy なら同じ成績の既承認候補を検出して降格する。
+    demotion = loop._check_duplicate_metrics_for_approval(conn, payload)
+    assert demotion is not None
+    assert demotion.content_hash == row["content_hash"]
+    assert demotion.pair == row["pair"]
+
+    # pin: kind が strategy 以外なら質検査そのものを行わない。
+    assert loop._check_duplicate_metrics_for_approval(
+        conn, dict(payload, kind="indicator")) is None
