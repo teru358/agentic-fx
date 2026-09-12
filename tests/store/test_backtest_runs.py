@@ -717,8 +717,24 @@ def _approved_kw(**overrides):
     return kw
 
 
-def test_find_matching_approved_metrics_exact_match_returns_content_hash(tmp_path):
+def _conn_approved(tmp_path, content_hash="approved-hash", *, status="pending"):
+    """`_approved_kw()` の候補 (既定 content_hash='approved-hash') を
+    approval_requests 母集団にも載せた conn を返す (I1 是正後の既定形)。"""
     conn = _conn(tmp_path)
+    from agentic_fx.store import approvals
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "n", "mission_id": 1, "content_hash": content_hash},
+        now=H, commit=True)
+    if status != "pending":
+        conn.execute("UPDATE approval_requests SET status=? WHERE id=?",
+                    (status, approval_id))
+        conn.commit()
+    return conn
+
+
+def test_find_matching_approved_metrics_exact_match_returns_content_hash(tmp_path):
+    conn = _conn_approved(tmp_path)
     backtest_runs.save_harness_run(conn, **_approved_kw())
     got = backtest_runs.find_matching_approved_metrics(
         conn, pair="USDJPY", variant="candidate", source="test",
@@ -727,7 +743,7 @@ def test_find_matching_approved_metrics_exact_match_returns_content_hash(tmp_pat
 
 
 def test_find_matching_approved_metrics_no_match_returns_none(tmp_path):
-    conn = _conn(tmp_path)
+    conn = _conn_approved(tmp_path)
     backtest_runs.save_harness_run(conn, **_approved_kw())
     got = backtest_runs.find_matching_approved_metrics(
         conn, pair="USDJPY", variant="candidate", source="test",
@@ -738,7 +754,7 @@ def test_find_matching_approved_metrics_no_match_returns_none(tmp_path):
 @pytest.mark.parametrize("field", ["trades", "pf", "avg_r"])
 def test_find_matching_approved_metrics_any_single_field_mismatch_is_no_match(
         tmp_path, field):
-    conn = _conn(tmp_path)
+    conn = _conn_approved(tmp_path)
     backtest_runs.save_harness_run(conn, **_approved_kw())
     values = {"trades": 194, "pf": 1.4981, "avg_r": 0.2}
     values[field] = values[field] + 1 if field == "trades" else values[field] + 0.5
@@ -751,7 +767,7 @@ def test_find_matching_approved_metrics_any_single_field_mismatch_is_no_match(
 def test_find_matching_approved_metrics_ignores_non_approval_outcome(tmp_path):
     """`mission_outcome` が 'approval' 以外 (承認されていない候補) は母集団
     から除外される。"""
-    conn = _conn(tmp_path)
+    conn = _conn_approved(tmp_path)
     backtest_runs.save_harness_run(
         conn, **_approved_kw(mission_outcome="observation"))
     got = backtest_runs.find_matching_approved_metrics(
@@ -763,7 +779,7 @@ def test_find_matching_approved_metrics_ignores_non_approval_outcome(tmp_path):
 def test_find_matching_approved_metrics_none_pf_matches_none_pf(tmp_path):
     """avg_r/pf が両方 `None` のケース (§A 検証節: `avg_r` が `None` 同士の
     一致)。"""
-    conn = _conn(tmp_path)
+    conn = _conn_approved(tmp_path)
     backtest_runs.save_harness_run(
         conn, **_approved_kw(metrics={"trades": 0, "pf": None, "avg_r": None}))
     got = backtest_runs.find_matching_approved_metrics(
@@ -773,7 +789,7 @@ def test_find_matching_approved_metrics_none_pf_matches_none_pf(tmp_path):
 
 
 def test_find_matching_approved_metrics_none_vs_value_is_no_match(tmp_path):
-    conn = _conn(tmp_path)
+    conn = _conn_approved(tmp_path)
     backtest_runs.save_harness_run(
         conn, **_approved_kw(metrics={"trades": 0, "pf": None, "avg_r": None}))
     got = backtest_runs.find_matching_approved_metrics(
@@ -792,7 +808,7 @@ def test_find_matching_approved_metrics_float_tol_boundary(tmp_path):
     `<` を `<=` に反転する変異を確実に red にできる (段 0 変異で
     SURVIVED を実測、原因は加算誤差 — 2026-09-12)。"""
     from agentic_fx.store.db import FLOAT_TOL
-    conn = _conn(tmp_path)
+    conn = _conn_approved(tmp_path)
     backtest_runs.save_harness_run(
         conn, **_approved_kw(metrics={"trades": 1, "pf": 0.0, "avg_r": 0.0}))
     # 閾値未満の差 (一致)
@@ -809,7 +825,7 @@ def test_find_matching_approved_metrics_float_tol_boundary(tmp_path):
 
 def test_find_matching_approved_metrics_respects_pair_source_base_interval(
         tmp_path):
-    conn = _conn(tmp_path)
+    conn = _conn_approved(tmp_path)
     backtest_runs.save_harness_run(conn, **_approved_kw())
     for kw in (
         dict(pair="EURUSD", variant="candidate", source="test", base_interval="1m"),
@@ -820,6 +836,46 @@ def test_find_matching_approved_metrics_respects_pair_source_base_interval(
         got = backtest_runs.find_matching_approved_metrics(
             conn, trades=194, pf=1.4981, avg_r=0.2, **kw)
         assert got is None, kw
+
+
+def test_find_matching_approved_metrics_ignores_intermediate_candidate_not_in_approval_requests(
+        tmp_path):
+    """codex 1周目 I1 是正の pin: `mission_outcome='approval'` の行でも
+    approval_requests に載っていない (approval mission 中に捨てた中間
+    候補の) `content_hash` は母集団から除外する — 未提出の成績が正当な
+    新規候補への恒久的な veto にならない。approval_requests テーブルに
+    一切行が無い状態 (= どの候補も提出されていない) で確認する。"""
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(conn, **_approved_kw())
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
+    assert got is None
+
+
+def test_find_matching_approved_metrics_matches_row_in_approval_requests(
+        tmp_path):
+    """approval_requests に content_hash が載っている行 (= 実際に提出
+    された候補) は母集団に含まれ、降格対象になる — 候補自身が同じ
+    content_hash で再申請するケースも含む (意図どおり)。"""
+    conn = _conn_approved(tmp_path)
+    backtest_runs.save_harness_run(conn, **_approved_kw())
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
+    assert got == "approved-hash"
+
+
+def test_find_matching_approved_metrics_matches_rejected_approval_request(
+        tmp_path):
+    """approval_requests の status が 'rejected' でも母集団に含まれる
+    (status は問わない — rejected の再申請も止めたい対象)。"""
+    conn = _conn_approved(tmp_path, status="rejected")
+    backtest_runs.save_harness_run(conn, **_approved_kw())
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
+    assert got == "approved-hash"
 
 
 def test_find_matching_approved_metrics_excludes_human_custom_scope(tmp_path):

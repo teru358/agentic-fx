@@ -372,11 +372,17 @@ class Commands:
         当てキーには使わない (run12 観測 C、docstring は
         `store/candidate_archives.py::find_by_mission_content` 側にも
         明記)。見つからない (GC 済み・失敗終端等) ときは「archive 不明」
-        と明示する。"""
+        と明示する。payload の型が壊れている (`mission_id` が int でない、
+        `content_hash` が非空文字列でない) 場合も例外にせず「archive=
+        不明」を返す (codex 1周目 I3 是正 — 手動修復・旧版移行・部分
+        破損時に `_approval_detail` 全体が fail-hard するのを防ぐ)。"""
         mission_id = payload.get("mission_id")
         content_hash = payload.get("content_hash")
         if mission_id is None or content_hash is None:
             return "archive=不明 (mission_id/content_hash 欠落)"
+        if (type(mission_id) is not int or type(content_hash) is not str
+                or not content_hash):
+            return "archive=不明 (mission_id/content_hash 不正)"
         row = candidate_archives.find_by_mission_content(
             self.conn, mission_id=mission_id, content_hash=content_hash)
         if row is None:

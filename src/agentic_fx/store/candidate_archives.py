@@ -68,11 +68,15 @@ def find_by_mission_content(conn: sqlite3.Connection, *, mission_id: int,
     ずれる (run12 観測 C、`content_hash` は plugin.py/config.yaml 相当
     のみをカバーするため両時点で不変)。`(mission_id, artifact_hash)` の
     UNIQUE 制約自体はそのまま — この関数は検索キーだけを `content_hash`
-    に限定する。同一 mission に複数候補があるときも `content_hash` の
-    一致行 1 件だけを返す。"""
+    に限定する。同一 mission/content_hash で `artifact_hash` の異なる
+    行が複数あり得る (self-test 書き直し等) ため、選択規約は
+    `archive_path IS NOT NULL` を最優先し (実在する archive を「不明」
+    と誤表示しない、codex 1周目 I2 是正)、同点 (すべて NULL、または
+    複数の有効行) なら `id` 降順 (最新) を返す。"""
     row = conn.execute(
         "SELECT * FROM candidate_archives WHERE mission_id=? "
-        "AND content_hash=? ORDER BY id LIMIT 1",
+        "AND content_hash=? "
+        "ORDER BY (archive_path IS NOT NULL) DESC, id DESC LIMIT 1",
         (mission_id, content_hash)).fetchone()
     if row is None:
         return None

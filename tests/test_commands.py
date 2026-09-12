@@ -600,6 +600,36 @@ def test_approval_detail_shows_archive_unknown_when_payload_lacks_identity(
     assert "archive=不明" in out
 
 
+def test_approval_detail_archive_unknown_when_mission_id_is_wrong_type(
+        tmp_path):
+    """codex 1周目 I3 是正の pin: `mission_id` が int でない (list) payload
+    でも例外にせず「archive 不明」を出す。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "myind", "mission_id": [], "content_hash": "h1"},
+        now=NOW)
+
+    out = cmds.dispatch(f"approval {approval_id}")
+
+    assert "archive=不明" in out
+
+
+def test_approval_detail_archive_unknown_when_content_hash_is_wrong_type(
+        tmp_path):
+    """codex 1周目 I3 是正の pin: `content_hash` が str でない (dict)
+    payload でも例外にせず「archive 不明」を出す。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "myind", "mission_id": 5, "content_hash": {}},
+        now=NOW)
+
+    out = cmds.dispatch(f"approval {approval_id}")
+
+    assert "archive=不明" in out
+
+
 def test_approval_detail_unknown_id_reports_not_found(tmp_path):
     _, _, _, cmds = _commands(tmp_path)
     out = cmds.dispatch("approval 999")

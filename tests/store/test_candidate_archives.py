@@ -135,6 +135,55 @@ def test_find_by_mission_content_does_not_use_artifact_hash_as_key(tmp_path):
     assert row is not None
 
 
+def test_find_by_mission_content_prefers_row_with_archive_path_over_older_null(
+        tmp_path):
+    """codex 1周目 I2 是正の pin: 同一 mission/content_hash で古い行の
+    `archive_path` が NULL (GC 済み等)、後続の新しい行が有効な場合、
+    最古行 (旧実装) ではなく有効な行を返す。"""
+    conn = _conn(tmp_path)
+    _insert(conn, mission_id=20, content_hash="dup-hash",
+            artifact_hash="old-artifact", archive_path=None)
+    newer_id = _insert(conn, mission_id=20, content_hash="dup-hash",
+                       artifact_hash="new-artifact",
+                       archive_path="plugins/_archive/20/new-artifact")
+    row = candidate_archives.find_by_mission_content(
+        conn, mission_id=20, content_hash="dup-hash")
+    assert row["id"] == newer_id
+    assert row["archive_path"] == "plugins/_archive/20/new-artifact"
+
+
+def test_find_by_mission_content_returns_newest_when_both_have_archive_path(
+        tmp_path):
+    """同一 mission/content_hash で両方とも `archive_path` が有効な場合、
+    新しい (id が大きい) 方を返す。"""
+    conn = _conn(tmp_path)
+    _insert(conn, mission_id=21, content_hash="dup-hash-2",
+            artifact_hash="artifact-old",
+            archive_path="plugins/_archive/21/old")
+    newer_id = _insert(conn, mission_id=21, content_hash="dup-hash-2",
+                       artifact_hash="artifact-new",
+                       archive_path="plugins/_archive/21/new")
+    row = candidate_archives.find_by_mission_content(
+        conn, mission_id=21, content_hash="dup-hash-2")
+    assert row["id"] == newer_id
+    assert row["archive_path"] == "plugins/_archive/21/new"
+
+
+def test_find_by_mission_content_returns_newest_null_row_when_all_null(
+        tmp_path):
+    """全行の `archive_path` が NULL のとき、最新 (id 降順) の行を返す
+    (「表示は『パス欠落』」の対象行として最新を選ぶ)。"""
+    conn = _conn(tmp_path)
+    _insert(conn, mission_id=22, content_hash="dup-hash-3",
+            artifact_hash="artifact-old-null", archive_path=None)
+    newer_id = _insert(conn, mission_id=22, content_hash="dup-hash-3",
+                       artifact_hash="artifact-new-null", archive_path=None)
+    row = candidate_archives.find_by_mission_content(
+        conn, mission_id=22, content_hash="dup-hash-3")
+    assert row["id"] == newer_id
+    assert row["archive_path"] is None
+
+
 def test_insert_does_not_commit_by_default(tmp_path):
     """ローカル 1 周目 #17 (2026-09-10): `commit` の既定が False
     (caller-owned tx)。既存の caller-owned tx テストは `commit=False` を明示

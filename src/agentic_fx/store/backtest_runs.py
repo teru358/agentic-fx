@@ -259,22 +259,33 @@ def find_matching_approved_metrics(conn: sqlite3.Connection, *, pair: str,
                                     base_interval: str, trades: Any,
                                     pf: Any, avg_r: Any) -> str | None:
     """approval-quality 設計書 §A: 承認済み (``mission_outcome='approval'``)
-    の in_sample/harness 候補行のうち、``(trades, pf, avg_r)`` が
+    かつ **実際に approval_requests へ提出された** (payload の
+    ``content_hash`` が一致する行が ``approval_requests`` に存在する)
+    in_sample/harness 候補行のうち、``(trades, pf, avg_r)`` が
     ``FLOAT_TOL`` で一致する行があれば、その ``content_hash`` を返す
     (無ければ ``None``)。
 
     質検査の母集団 = ``scope='in_sample' AND issued_by='harness' AND
-    variant=? AND mission_outcome='approval'``。過去に承認された example
-    (`sma_cross` 等) の行もここに自然に含まれる — example 専用の variant
-    を新設する必要はない (承認済みなら `mission_outcome='approval'` で
-    既に絞り込める、設計書 §A)。``issued_by='harness'`` は
-    ``in_sample_view``/``latest_in_sample_metrics`` と同じ防御レイヤ
-    (人間発行行を母集団から除く)。"""
+    variant=? AND mission_outcome='approval' AND content_hash IN
+    (approval_requests.payload_json の content_hash)``。approval mission
+    中に捨てた中間候補 (approval_requests に載らない content_hash) は
+    母集団から除外する (codex 1周目 I1 是正 — mission_outcome='approval'
+    だけでは中間候補まで母集団に入り、偽陽性で正当な新規候補を降格して
+    いた)。``approval_requests`` の ``status`` は問わない (pending /
+    approved / rejected いずれも母集団に含める — rejected の再申請も
+    止めたい対象)。過去に承認された example (`sma_cross` 等) の行も
+    ここに自然に含まれる — example 専用の variant を新設する必要はない
+    (承認済みなら `mission_outcome='approval'` で既に絞り込める、設計書
+    §A)。``issued_by='harness'`` は ``in_sample_view``/
+    ``latest_in_sample_metrics`` と同じ防御レイヤ (人間発行行を母集団
+    から除く)。"""
     rows = conn.execute(
         "SELECT content_hash, metrics_json FROM backtest_runs WHERE "
         "scope='in_sample' AND issued_by='harness' AND variant=? "
         "AND mission_outcome='approval' AND pair=? AND source=? "
-        "AND base_interval=? ORDER BY id",
+        "AND base_interval=? AND content_hash IN ("
+        "SELECT json_extract(payload_json, '$.content_hash') "
+        "FROM approval_requests) ORDER BY id",
         (variant, pair, source, base_interval)).fetchall()
     for row in rows:
         try:
