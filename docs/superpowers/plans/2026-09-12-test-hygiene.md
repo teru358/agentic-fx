@@ -217,3 +217,6 @@ sweep 回収」(候補2、推奨) を両論併記している。**着手前に�
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-09-12 | v1 | 起案。T1 (本体) / T2〜T5 (小物) の task 分割、T2/T4/T5 にユーザー裁定待ちを明記、完了条件に fresh worktree フルスイート残骸ゼロを規定、レビュー段に「1周目 must-fix 0 件なら2周目省略」の提案を明記 (裁定はユーザー) | 設計書 `2026-09-12-test-hygiene-design.md` v1 を実装プランへ写す | - |
+| 2026-09-12 | v1.1 | 指揮者裁定を追記 (T2 startup sweep / T3 文書 / T4 撤去 + stderr パターン / T5 据え置き)、補足 (`prompt.txt`=`p` は pytest 由来、session guard 先行) | 実 auth.json のキー確認と残骸の中身から既定を確定 | f39bed5 |
+| 2026-09-12 | v1.2 | 実装完了 (sonnet)。T1(a) 遅延参照 + env `AGENTIC_FX_MISSION_TRANSCRIPTS_DIR` / T1(b) session guard、犯人 = `test_mission_worker_protocol._drive_main` の chdir 漏れ (ブリーフの「runner テスト」想定は外れ) / T2 ⑧ / T4 撤去 + 4 パターン / T3,T5 文書。worker_runner への env 伝播は R10-① pin と衝突し撤回 (テスト側 monkeypatch)。逆変異 4/4 RED (run_mut.py overlay は `__file__` 相対の既定値で偽陰性 → 手動プロトコル)。fresh worktree フルスイート 3766 passed、残骸ゼロ、`logs/` 未生成 | 実装報告 `tmp/th/impl-report.md` | a6cef16 |
+| 2026-09-12 | v1.3 | 検収是正 C1 `"401"` 部分一致 → `"401 Unauthorized"` / `"Unauthorized"` (ブリーフ側の欠陥) / C2 `.locks` sweep の payload 解析を行単位隔離 (`sweep_locks_payload_corrupt`) / C3 guard は増加のみ fail (`_new_untracked`、pin `tests/test_conftest_guards.py`)。指揮者が T2 flock 逆変異を独立再現 (RED) | 削除行と部分一致の検収 | 3413fe9 |
