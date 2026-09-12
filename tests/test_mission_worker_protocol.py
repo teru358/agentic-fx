@@ -873,26 +873,28 @@ def test_main_bumps_as_mb_for_improve_backend_codex(monkeypatch, tmp_path):
     assert rlimit_calls[0]["as_mb"] >= 262144, rlimit_calls
 
 
-def test_main_does_not_bump_as_mb_for_improve_backend_claude(
-        monkeypatch, tmp_path):
-    """上の裏 — claude backend は既定の `child_as_mb` (4096) のまま緩めない
-    (V8 code-mode host の VA 予約問題は codex/opencode 固有で、claude CLI
-    には無い)。`in ("opencode", "codex")` を `in ("opencode", "codex",
-    "claude")` などへ広げる変異のキラー。"""
+@pytest.mark.parametrize("backend", ["claude", "local"])
+def test_main_does_not_bump_as_mb_for_improve_backend_claude_or_local(
+        monkeypatch, tmp_path, backend):
+    """上の裏 — claude/local backend は既定の `child_as_mb` (4096) のまま
+    緩めない (V8 code-mode host の VA 予約問題は codex/opencode 固有で、
+    claude CLI/local には無い)。`in ("opencode", "codex")` を
+    `in ("opencode", "codex", "claude")` (または他 backend を巻き込む形)
+    へ広げる変異のキラー。"""
     monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
                         lambda **kw: None)
 
-    def to_claude(settings_dict):
-        settings_dict["runner"]["improve"]["backend"] = "claude"
+    def to_backend(settings_dict):
+        settings_dict["runner"]["improve"]["backend"] = backend
 
     frames, rlimit_calls, _ = _drive_main(
         monkeypatch, tmp_path,
         handshake_overrides={"worker_profile": "improve",
                              "db_path": None, "plugins_dir": None,
-                             "mission_id": "m-claude-as-mb",
-                             "staging_dir": str(tmp_path / "staging" / "m-claude-as-mb"),
+                             "mission_id": f"m-{backend}-as-mb",
+                             "staging_dir": str(tmp_path / "staging" / f"m-{backend}-as-mb"),
                              "source_snapshot_dir": str(tmp_path / "source")},
-        settings_mutator=to_claude)
+        settings_mutator=to_backend)
 
     assert frames[0]["type"] == "ready" and frames[0]["ok"] is True, frames[0]
     assert rlimit_calls[0]["as_mb"] == 4096, rlimit_calls

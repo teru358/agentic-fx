@@ -175,11 +175,15 @@ def _bootstrap_improve_profile(
         # (検収実測 2026-08-30: mmap 予約は全て成功した状態で maps/cgroup
         # EACCES 直後に自己 abort)。claude と同じリスク受容 (R10 参照)。
         # codex は /proc 不要 (A4 11 回目で反証、真因は RLIMIT_AS —
-        # `tmp/codex-host-probe/findings.md` 2026-09-12。従来の「codex
+        # `tmp/codex-host-probe/findings.md` 2026-09-12)。従来の「codex
         # 0.150.1 の code-mode host も /proc/self/maps を読む」という
-        # 主張は単体切り分けの実測で否定された — Landlock/proc なしの
-        # 状態でも SIGTRAP は RLIMIT_AS 4096MB だけで再現し、/proc を
-        # 加えても外しても結果は変わらない)。
+        # 主張 (SIGTRAP の引き金だという意味では) は単体切り分けの実測で
+        # 否定された — Landlock + env + RLIMIT_AS 4096MB のみで同じ
+        # SIGTRAP が再現する。ただし **/proc を外した対照は未実施** で
+        # あり「codex に /proc が不要と証明された」わけではない
+        # (findings.md 未証明の点 2)。ユーザー裁定 (2026-09-12) により、
+        # [mission-prompt-in-argv-readable-via-proc] の露出面をこれ以上
+        # 広げないため codex には付与しない。
         read_only.append(Path("/proc"))
 
     # staging_dir の相互照合 (§2.2): 末尾成分が mission_id と一致するか。

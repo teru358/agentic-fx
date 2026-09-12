@@ -448,13 +448,15 @@ def test_bootstrap_improve_profile_proc_readable_only_for_claude(
 
 def test_bootstrap_improve_profile_proc_blocked_for_codex(
         improve_worker_layout):
-    """反証 (2026-09-12): A4 10 回目 #71 の「codex の code-mode host (V8)
-    は `/proc/self/maps` を読む」という主張は単体切り分けの実測で否定
-    された (`tmp/codex-host-probe/findings.md`) — SIGTRAP の真因は
-    RLIMIT_AS 4096MB であり、Landlock/proc の有無とは無関係。codex は
-    claude/opencode と違って `/proc` を read_only に必要としない —
-    local backend と同じく listdir が拒否されることを pin する
-    (`838b09d` で足した readable pin を反転)。"""
+    """反証 (2026-09-12): A4 10 回目 #71 が SIGTRAP の引き金だとした
+    「codex の code-mode host (V8) が /proc/self/maps を読む」という説は
+    単体切り分けの実測で否定された (`tmp/codex-host-probe/findings.md`)
+    — 引き金は RLIMIT_AS 4096MB (Landlock + env + RLIMIT_AS のみでも同じ
+    SIGTRAP が再現し、/proc なしの対照でも再現する)。ユーザー裁定
+    (2026-09-12) により、codex には /proc を付与しない — local と同じく
+    listdir が拒否されることを pin する (`838b09d` で足した readable pin
+    を反転)。**codex に /proc が不要と証明されたわけではない**
+    (findings.md 未証明の点 2 — /proc を外した対照は未実施)。"""
     l = improve_worker_layout
     script = """
     try:
