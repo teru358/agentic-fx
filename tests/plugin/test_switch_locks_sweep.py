@@ -125,3 +125,27 @@ def test_sweep_orphans_skips_corrupt_payload_row_without_aborting_the_sweep(env)
 
     assert pending_lock.exists(), "壊れた行の混在で正常な pending ロックまで消えた"
     assert not orphan_lock.exists(), "壊れた行の例外で sweep が途中停止し孤児ロックが残った"
+
+
+def test_sweep_orphans_skips_pending_row_whose_name_is_not_a_string(env):
+    """検収是正 C5 (codex 1 周目 Important, test-hygiene 2026-09-12):
+    C2 の per-entry 隔離は JSON 解析エラー/非 dict payload までしか
+    カバーしておらず、`payload["name"]` 自体が非 str (list/dict 等) だと
+    `pending_names.add(name)` が `TypeError: unhashable type` で例外を
+    送出し、sweep 全体が再び止まっていた。`{"name": ["x"]}` という
+    pending 行が混在していても、他の孤児ロックは正しく回収されることを
+    確認する。"""
+    tmp_path, plugins_dir, conn = env
+    orphan_lock = _make_lock(plugins_dir, "orphaned_candidate")
+    another_pending_lock = _make_lock(plugins_dir, "healthy_pending")
+    _pending_approval(conn, "healthy_pending")
+    # name が非 str (list) の pending 行。
+    approvals_store.create(
+        conn, kind="plugin", payload={"name": ["x"]}, now=NOW, commit=True)
+
+    switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
+
+    assert not orphan_lock.exists(), (
+        "name が非 str の pending 行が混在すると sweep が途中停止し "
+        "孤児ロックが残った")
+    assert another_pending_lock.exists(), "正常な pending ロックまで消えた"

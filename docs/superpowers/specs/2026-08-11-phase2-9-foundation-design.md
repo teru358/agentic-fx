@@ -464,7 +464,7 @@ D ───────┴─ E   (E は A・C・D・B すべての後)
   - **公式 Python SDK が存在する (2026-08-11 実測)**: **`openai-codex`** (PyPI 0.144.4、`openai/codex` リポジトリの `sdk/python`、`requires_python >=3.10`)。依存は `pydantic>=2.12` と **`openai-codex-cli-bin==0.144.4`** — **claude-agent-sdk と同じく CLI をラップする構造**であり、実体は CLI サブプロセスである
   - **紛らわしい別パッケージに注意**: PyPI の **`openai-codex-sdk`** (0.1.11) は `author: OpenAI` を名乗るが **repository も homepage も無く**、版体系も公式 (0.14x) と一致しない。**使わないこと**。TypeScript 版の公式は `@openai/codex-sdk` (0.147.0, Apache-2.0)
   - **従量課金の回避は成立する (2026-08-11 実測で確定)**: `~/.codex/auth.json` は **`auth_mode: "chatgpt"`** / **`OPENAI_API_KEY: null`** / `chatgpt_plan_type: "plus"` で、tokens は OAuth (`id_token`/`access_token`/`refresh_token`) のみ。環境変数にも `OPENAI_API_KEY` は無い。**API キー経路が存在せず、ChatGPT サブスクリプションで動いている**。CLAUDE.md の絶対制約と両立する
-    - `auth.json` に **`chatgpt_subscription_active_until`** があるので**サブスク期限切れを検出できる**。ClaudeRunner の既存裁定 (「クレジット枯渇時は停止するだけ。local への自動フォールバックはしない — 挙動を予測可能に保つ」設計書 §13) と**同じ扱いにする**
+    - `auth.json` に **`chatgpt_subscription_active_until`** があるので**サブスク期限切れを検出できる**。ClaudeRunner の既存裁定 (「クレジット枯渇時は停止するだけ。local への自動フォールバックはしない — 挙動を予測可能に保つ」設計書 §13) と**同じ扱いにする** (2026-09-12: 現行 auth.json にこのキーは無い、検査は撤去 — test-hygiene T4、`docs/superpowers/specs/2026-08-16-phase2-10-improve-loop-design.md` の変更履歴参照)
   - **⚠ codex は Chat Completions API をサポートしない (2026-08-11 実測)**。カスタムプロバイダに `wire_api="chat"` を設定すると **`wire_api = "chat" is no longer supported. set wire_api = "responses"` で起動拒否**される。**Responses API を実装していないサーバーでは codex は使えない**
   - **ローカル LLM 駆動が成立した (2026-08-11 実測)**: llama-swap をカスタムプロバイダとして定義し、`qwen3-coder-30b-a3b-instruct` で応答を得た (`2+2` → `4`)。llama-swap は `/v1/responses` と `/v1/chat/completions` の**両方が 200** を返すため通った。設定:
     ```

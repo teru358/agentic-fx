@@ -296,9 +296,14 @@ def _check_cli_backend(settings, *, which: str):
     """<!-- precheck 2026-08-22: T1-M14 --> CLI backend 起動時検査 ①②③⑤
     (設計書 §1.4)。`which` は `"trade"` か `"improve"` — `getattr(settings.runner,
     which)` で対象の `RunnerChoice` を選ぶ。backend=local の環境では一切
-    走らない。④ (codex サブスク期限) は improve+codex+chatgpt のみ発火する
-    (trade+codex は `RunnerSettings._trade_backend_not_codex` が `Settings`
-    構築時点で拒否するため、trade 側でこの分岐に到達しない)。
+    走らない。**④ (codex サブスク期限の起動時検査) は撤去済み**
+    (test-hygiene T4、2026-09-12): 実 `~/.codex/auth.json` (codex CLI
+    0.150.1) に `chatgpt_subscription_active_until` キーが存在せず、
+    4 run 連続で「キーが無い」WARNING が空振りしていたため。サブスク上限・
+    認証失効は codex 自身が実行時に返す stderr 文言 (`usage limit` /
+    `try again at` / `401 Unauthorized`) を
+    `cli_runner.CLI_STDERR_FATAL_PATTERNS` (`cli_stderr_fatal`) で検知する
+    側に寄せた — 起動時検査ではなく実行時検知。
 
     **Minor 14 の再発防止**: 旧実装 (`_check_improve_backend`) は
     `settings.runner.improve` しか見なかったため、`runner.trade.backend=claude`

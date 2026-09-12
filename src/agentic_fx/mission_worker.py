@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import os
 import queue
 import signal
@@ -260,14 +261,39 @@ def _bootstrap_improve_profile(
     # にしない) — 同一プロセス内の monkeypatch (`tests/conftest.py`) にも
     # `AGENTIC_FX_MISSION_TRANSCRIPTS_DIR` 環境変数経由の子プロセス隔離
     # (別プロセスで起動される bootstrap probe 用) にも両方追従する。
+    #
+    # 検収是正 C4 (codex 1 周目 Important, 2026-09-12): 上記の環境変数
+    # override は任意の値を受け付けるため、`AGENTIC_FX_MISSION_
+    # TRANSCRIPTS_DIR` が `data/` 配下 (例 `data/x/y`) を指すと、下の
+    # `mkdir(parents=True)` が **`_assert_allowlist_excludes_data_dir`
+    # (272 行) より前に実行される**ため、fail closed で弾かれる前に
+    # `data/` 配下のディレクトリが実際に作られてしまっていた (assert 自体
+    # は最終的に拒否するが、mkdir という副作用は防げていなかった)。
+    # mkdir の**前**に `_guarded_data_dir()` の祖先・一致・子孫であるかを
+    # 確認し (`_assert_allowlist_excludes_data_dir` と同じ判定 —
+    # 一致/祖先/子孫の 3 方向)、該当すれば mkdir も allowlist 追加もせず
+    # skip する。既存の「作成できなければ rw allowlist にも加えない」
+    # 規範 (直後の `except OSError` 節) と同じ scope — transcript 保存は
+    # 診断用の best-effort 機能であり、improve worker の起動可否を
+    # 左右してはならない。
     extra_rw_paths: list[Path] = []
     transcript_dir = cli_runner._TRANSCRIPT_DIR_DEFAULT
-    try:
-        transcript_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
+    guarded_data_dir = _guarded_data_dir()
+    resolved_transcript_dir = transcript_dir.resolve()
+    if (resolved_transcript_dir == guarded_data_dir
+            or resolved_transcript_dir in guarded_data_dir.parents
+            or guarded_data_dir in resolved_transcript_dir.parents):
+        logging.getLogger("agentic_fx.mission_worker").warning(
+            "mission transcript dir (%s) resolves under the guarded data "
+            "dir (%s) — skipping mkdir/allowlist for it (fail closed, "
+            "test-hygiene C4)", resolved_transcript_dir, guarded_data_dir)
     else:
-        extra_rw_paths.append(transcript_dir)
+        try:
+            transcript_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        else:
+            extra_rw_paths.append(transcript_dir)
 
     _assert_allowlist_excludes_data_dir(
         read_only + [workdir, staging_path] + extra_rw_paths

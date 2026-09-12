@@ -331,6 +331,40 @@ def test_bootstrap_improve_profile_mission_transcript_dir_is_writable(
                 pass
 
 
+def test_bootstrap_improve_profile_does_not_mkdir_transcript_dir_under_guarded_data_dir(
+        improve_worker_layout):
+    """検収是正 C4 (codex 1 周目 Important, test-hygiene 2026-09-12):
+    `AGENTIC_FX_MISSION_TRANSCRIPTS_DIR` が `_guarded_data_dir()`
+    (`<repo>/data`) 配下を指す場合、是正前は `_assert_allowlist_
+    excludes_data_dir` (fail closed の assert) が最終的に拒否する**前**
+    に `transcript_dir.mkdir(parents=True)` が実行され、`data/` 配下に
+    ディレクトリが実際に作られてしまっていた (assert 自体は空振りしない
+    が、mkdir という副作用は防げていなかった)。ここでは
+    `<repo>/data/<マーカー>/mission-transcripts` を狙い、bootstrap 後に
+    そのディレクトリが**作られていない**ことを確認する (mkdir 前の
+    早期 skip が効いていることの直接証拠)。実リポジトリの `data/` 直下に
+    残骸を作らないよう、常に teardown で掃除する。"""
+    l = improve_worker_layout
+    marker = f"c4-probe-{uuid.uuid4().hex}"
+    malicious_dir = _REPO_ROOT / "data" / marker / "mission-transcripts"
+    data_marker_dir = _REPO_ROOT / "data" / marker
+    script = "print('BOOTSTRAP_OK')"
+    try:
+        result = _run_bootstrap_probe(
+            script, staging_dir=l["staging_dir"], mission_id=l["mission_id"],
+            source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"],
+            extra_env={"AGENTIC_FX_MISSION_TRANSCRIPTS_DIR": str(malicious_dir)})
+        assert result.returncode == 0, result.stderr
+        assert "BOOTSTRAP_OK" in result.stdout
+        assert not malicious_dir.exists(), (
+            f"{malicious_dir} が data/ 配下にもかかわらず mkdir された "
+            "(C4 是正が効いていない)")
+    finally:
+        if data_marker_dir.exists():
+            import shutil as _shutil
+            _shutil.rmtree(data_marker_dir, ignore_errors=True)
+
+
 def test_bootstrap_improve_profile_rejects_staging_dir_mission_id_mismatch(
         improve_worker_layout):
     """§2.2: `staging_dir` の末尾成分が handshake の `mission_id` と

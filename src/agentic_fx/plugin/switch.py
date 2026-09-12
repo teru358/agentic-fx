@@ -556,6 +556,22 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
                         f"error=payload not a dict (type={type(payload).__name__})")
                 continue
             name = payload.get("name")
+            # 検収是正 C5 (codex 1 周目 Important, 2026-09-12): `name` が
+            # 非 str (list/dict 等) だと `pending_names.add(name)` 自体は
+            # 例外を出さない (unhashable でない限り) が、後段の
+            # `lock_file.name[:-len(".lock")] == name` 比較が常に False
+            # になるだけでなく、`payload.get("name")` が unhashable な
+            # 値 (list/dict) だった場合は `set.add` で `TypeError` に
+            # なり、C2 で足した per-entry 隔離が **型のずれまでは** カバー
+            # していなかった (この 1 行の型異常だけで sweep 全体が再び
+            # 止まる)。`isinstance(name, str)` でなければ skip し、
+            # activity に 1 行残す。
+            if name is not None and not isinstance(name, str):
+                if activity is not None:
+                    activity.write(
+                        Category.APPROVAL, "sweep_locks_payload_corrupt",
+                        f"error=name is not a string (type={type(name).__name__})")
+                continue
             if name is not None:
                 pending_names.add(name)
         for lock_file in locks_dir.iterdir():
