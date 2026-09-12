@@ -194,7 +194,7 @@ def test_set_status_commit_false_does_not_commit(tmp_path):
     ("selected", "insufficient_trades", "observation", "insufficient_trades:"),
     ("selected", "unsupported_in_plan10", "observation", "unsupported_in_plan10:"),
     ("selected", "approved", "done", "approved:"),
-    ("selected", "rejected", "observation", "rejected:"),
+    ("selected", "rejected", "observation", "rejected_by_human"),
     ("selected", "expired", "observation", "expired"),
     ("selected", "invalidated", "observation", "invalidated"),
     ("selected", "mission_failed", "observation", "mission_failed:"),
@@ -212,7 +212,15 @@ def test_apply_approval_outcome_state_machine_table(
     row = c.execute("SELECT status, last_result FROM improvement_backlog "
                     "WHERE id=?", (bid,)).fetchone()
     assert row["status"] == expected_status
-    assert row["last_result"].startswith(expected_last_result_prefix)
+    # [reject-reason-leak] T0 (2026-09-12): 固定文言 (末尾 `:` を持たない
+    # = `{reason}` を含まないテンプレート) は完全一致で検証する。
+    # `rejected` はこの束で `rejected_by_human` へ固定文言化された
+    # (旧 `rejected:{reason}` から変更) ため、startswith だけでは
+    # 「固定文言のはずが末尾に理由が付いていない」ことを保証できない。
+    if expected_last_result_prefix.endswith(":"):
+        assert row["last_result"].startswith(expected_last_result_prefix)
+    else:
+        assert row["last_result"] == expected_last_result_prefix
 
 
 def test_apply_approval_outcome_done_to_observation_only_for_report_state_failed(tmp_path):

@@ -48,6 +48,15 @@ def apply_decision(
     (旧 `decide` の 2 段 commit 挙動) はここでは行わない — 呼び出し元が
     決定 tx に入る前に `expire_due(commit=True)` を単独 tx で呼ぶ運用
     (骨格 裁定1 逐語)。
+    [reject-reason-leak] T0 (2026-09-12): `rejected` 経路は人間の却下
+    理由 (`reason` 引数) を **backlog へは渡さない** —
+    `backlog.apply_approval_outcome` に渡る `reason` は
+    `_OUTCOME_TABLE['rejected']` が固定文言 `rejected_by_human` になった
+    ため実質無視される (`"{reason}" in template` が False)。理由は
+    `approval_requests.reason` 列へは従来どおり書かれる (この関数の
+    UPDATE 文、削らない) — 人間が `afx> approval <id>` で読める
+    (`commands.py::_approval_detail`)。
+
     CAS には既存 `decide` (`approvals.py:34`) と同じ `expires_at` 述語
     (`expires_at IS NULL OR expires_at >= ?`) を **`status in ("approved",
     "rejected")` のときだけ** 追加する (R9 — fail closed の維持: 期限切れ

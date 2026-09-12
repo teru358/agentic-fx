@@ -226,6 +226,14 @@ class ResearchSettings(_Strict):
 class ImproveGateSettings(_Strict):
     """Execution-free plugin gate thresholds applied before pytest."""
     min_test_functions: int = Field(ge=0, default=3)
+    # [floor-config] T3 (2026-09-12、設計書 §6 T3): 収益性フロアの判定
+    # 閾値。「採用判断の品質基準」であり、drawdown kill switch の無効化
+    # 不可制約 (risk.*) とは別物 — 緩めても実資金は動かない
+    # (承認は人間の最終判断を通る)。T1 の `_check_profitability_floor`
+    # が参照する (この束では未実装、config の読み出しまで)。
+    min_pf: float = Field(ge=0.0, default=1.0)
+    require_positive_avg_r: bool = True
+    require_holdout_evaluable: bool = False
 
 
 class ImproveToolBudgetSettings(_Strict):
@@ -466,6 +474,20 @@ class Settings(_Strict):
             raise ValueError(
                 f"datafeed.watch_symbols ({len(self.datafeed.watch_symbols)}) "
                 f"exceeds analysis.max_watch_symbols ({self.analysis.max_watch_symbols})")
+        return self
+
+    @model_validator(mode="after")
+    def _tool_budget_covers_all_pairs(self) -> "Settings":
+        # [floor-config] T3 (2026-09-12、設計書 §6 T3、codex I10):
+        # 候補の plugin `pairs` は `Settings.pairs` の部分集合に制限
+        # されるので、`max_backtests_per_candidate >= len(pairs)` を
+        # 保証すれば「宣言全 pair を 1 回ずつ確認する枠」が担保できる。
+        # 境界 (`==`) は通す。fail closed (ValueError)。
+        max_backtests = self.improve.tool_budget.max_backtests_per_candidate
+        if max_backtests < len(self.pairs):
+            raise ValueError(
+                "improve.tool_budget.max_backtests_per_candidate "
+                f"({max_backtests}) must be >= len(pairs) ({len(self.pairs)})")
         return self
 
     @model_validator(mode="after")

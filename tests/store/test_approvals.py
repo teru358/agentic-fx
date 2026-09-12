@@ -147,7 +147,10 @@ def test_apply_decision_rejected_backlog_to_observation(tmp_path):
     row = c.execute("SELECT status, last_result FROM improvement_backlog "
                     "WHERE id=?", (bid,)).fetchone()
     assert row["status"] == "observation"
-    assert row["last_result"] == "rejected:not useful"
+    # [reject-reason-leak] T0 (2026-09-12): backlog 側は固定文言のみ
+    # (理由は backlog へ渡らない)。理由は approval_requests.reason に残る
+    # (F5-3、tests/loops/test_floor_leak_guard.py で確認)。
+    assert row["last_result"] == "rejected_by_human"
 
 
 def test_apply_decision_non_pending_cas_rowcount_zero_raises_with_zero_side_effect(tmp_path):

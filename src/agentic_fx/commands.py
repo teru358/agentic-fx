@@ -344,8 +344,9 @@ class Commands:
 
     def _approval_detail(self, approval_id: int) -> str:
         row = self.conn.execute(
-            "SELECT kind, status, payload_json FROM approval_requests "
-            "WHERE id=?", (approval_id,)).fetchone()
+            "SELECT kind, status, payload_json, reason, decided_by, "
+            "decided_at FROM approval_requests WHERE id=?",
+            (approval_id,)).fetchone()
         if row is None:
             return f"approval #{approval_id} は存在しません"
         try:
@@ -361,6 +362,27 @@ class Commands:
         ]
         lines += self._metrics_lines("in_sample", payload.get("in_sample"))
         lines += self._metrics_lines("holdout", payload.get("holdout"))
+        # [reject-reason-leak] T0 (2026-09-12): 人間の却下理由の唯一の
+        # 読み出し導線。`approval_requests.reason` は backlog の
+        # `last_result` (固定文言 `rejected_by_human`) へは流れないため、
+        # ここで表示しないと write-only になる。
+        lines.append(
+            f"reason={row['reason'] or '-'} "
+            f"decided_by={row['decided_by'] or '-'} "
+            f"decided_at={row['decided_at'] or '-'}")
+        # [profitability-floor] T0 (2026-09-12、T1 Step 1-8 と対): 収益性
+        # フロア警告 (`bless_candidate` の `floor_mode="warn"` 経路) の
+        # payload キーを表示する。T1 実装前は payload に無いため fail-soft
+        # (キー欠落時は行を出さない)。
+        floor_warning = payload.get("floor_warning")
+        if floor_warning:
+            lines.append(f"floor_warning={floor_warning}")
+        floor_detail = payload.get("floor_detail")
+        if floor_detail:
+            lines.append(f"floor_detail={floor_detail}")
+        profitability_floor = payload.get("profitability_floor")
+        if profitability_floor:
+            lines.append(f"profitability_floor={profitability_floor}")
         lines.append(self._archive_line(payload))
         return "\n".join(lines)
 
