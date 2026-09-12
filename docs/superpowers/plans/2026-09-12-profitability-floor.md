@@ -1,4 +1,4 @@
-# 収益性フロア + reject reason 漏洩 実装プラン v1.2 (設計書 = `2026-09-12-profitability-floor-design.md` v1.2 準拠)
+# 収益性フロア + reject reason 漏洩 実装プラン v1.3 (設計書 = `2026-09-12-profitability-floor-design.md` v1.3 準拠)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (推奨) または superpowers:executing-plans で task ごとに実行すること。
@@ -6,7 +6,7 @@
 **Goal:** 設計書 v1 の T0 (人間 reject reason のプロンプト漏洩の是正) / T1 (収益性フロアを
 決定論ゲートに 2 段で課す) / T2 (RPC 返却ヒント + プロンプト規律) / T3 (config 3 キー) を
 実装する。**設計を変えない** — ユーザー裁定 U1〜U5 と codex 設計レビュー 1 周目 18 件 /
-2 周目 5 件の全件採用は設計書 v1.2 §2 に確定記録済みなので
+2 周目 5 件 / 3 周目 3 件の全件採用は設計書 v1.3 §2 に確定記録済みなので
 「裁定待ち」は無い。設計書に無い判断が必要になったら実装を止めて指揮者へ申告すること
 (設計書 §9 の R1 に該当する範囲は本束では触らない)。
 
@@ -265,6 +265,12 @@ def _check_profitability_floor(per_pair: dict[str, dict], *, settings,
 **接合面の注意**: `report_detail` は **`last_result` に一切流さない**
 (`last_result` は `reason` 逐語 = `unprofitable` のみ。pin F2-7 / F5-2)。
 
+> **`floor_mode` の役割 (codex R3-I1)**: `floor_mode` は「判定を止める」ためではなく
+> 「`warn` のとき evaluator に holdout・baseline まで完走させる」ためのスイッチ
+> (C2)。判定結果そのものは `floor_mode` に関わらず同じ `verdict_kind` になる。
+> **`run_kind_gate` は `floor_mode` がどちらでも raise しない** — raise の決定は
+> Step 1-4 の表に従って `_run_full_gate` だけが行う。
+
 ### Step 1-4: named result 型 `GateOutcome` + 判別子 (codex I4/I5 + R2-I1)
 
 **変更**: `src/agentic_fx/plugin/approval.py`
@@ -354,6 +360,11 @@ class GateOutcome:
     から raise**。分類は **`GateOutcome.verdict_kind` だけ**を見る (codex R2-I1) —
     `"floor"` かつ enforce = `unprofitable` / `"insufficient_trades"` = `gate_failed` /
     その他 (pytest / hash / snapshot / 想定外例外) = `gate_failed`
+  - **`run_kind_gate` が sink に行を積んだ後に contract 外例外を投げたケースも同じ扱い**
+    (codex R3-M1): 捕捉済みの行を `gate_failed` で保存してから元例外を伝播させる
+    (または `_run_full_gate` の既存規約どおり `ValueError` へ正規化する)。
+    **行を捨てない / `unprofitable` で保存しない** (pin F6-12)。実装上は
+    `except BaseException:` で捕捉行を保存 → `raise` の形にする
 - 規約表 (設計書 §3 T1-f と同一):
 
 | 経路 | `mission_outcome` |
@@ -400,6 +411,11 @@ live 絞りへの混入を止める)。既存の NULL 行 4 件の遡及修正�
 - `src/agentic_fx/backtest/cli.py::_plugin_submit` (`:490-505` の `--from _human` 分岐) から
   **bless と同じ** `ActivityLog(root / "logs" / "activity.log")` を構築して渡す。
   **`plugins_root.parent / "logs"` を関数内で推測する新しい所有規則を作らないこと**
+- **この CLI 配線は専用 pin で直接固定する (F6-11(b)、codex R3-I2)** — `submit_candidate` を
+  spy に差し替えて `_plugin_submit` の `--from _human` 分岐を実行し、`activity=` に渡された
+  `ActivityLog` の `path` が `root / "logs" / "activity.log"` であることを assert する。
+  `submit_candidate(activity=fake)` の直接呼び出し pin (F6-11(a)) だけでは、CLI が
+  `activity=` を渡し忘れても検出できない
 
 **既存テストへの影響**: `approval.submit_plugin` を strategy で呼ぶ既存テストがあれば
 **xfail ではなく「拒否されること」を期待する形へ書き換える**。着手前に
@@ -443,8 +459,13 @@ marker を付けない**)。
 - [ ] F6-1〜F6-11 (**F6-3 = warn bless でも holdout 呼び出しと baseline 添付がある** /
       **F6-9 = `run_kind_gate` がゲート判定で例外を投げない (標本不足も `GateOutcome`)** /
       **F6-10 = 分類が判別子由来 (`floor_detail`/候補名に `"unprofitable"` を混ぜても
-      標本不足は `gate_failed`)** / **F6-11 = 人間 submit フロア不合格の `submit_floor_rejected`
-      activity に適用閾値が載る** /
+      標本不足は `gate_failed`)** / **F6-11(a) = `submit_candidate` 層: `submit_floor_rejected`
+      に閾値 3 値が載る・`activity=None` 後方互換** / **F6-11(b) = CLI 層 spy pin:
+      `_plugin_submit --from _human` が `ActivityLog(root/"logs"/"activity.log")` 相当を
+      `activity=` に渡す** (codex R3-I2 — (a) だけでは CLI 配線欠落を検出できない) /
+      **F6-12 = `run_kind_gate` の fake が `record_fn` に 1 行積んだ後に contract 外例外を
+      投げるケースで、その行が `gate_failed` で保存され元例外が伝播 / 規定 `ValueError` へ
+      変換され、`unprofitable` にならない** (codex R3-M1) /
       **F6-5・F6-6 = legacy submit の strategy 拒否と「in_sample 合格・holdout 不合格が
       legacy 経路で approval にならない」** / **F6-7 = bless の戻り値 `int` 後方互換** /
       **F6-8 = 人間 corridor の gate 行に明示 outcome、`None` を作らない**)
@@ -456,7 +477,9 @@ marker を付けない**)。
 - [ ] 逆変異 red: holdout の返り値を捨てる (現行実装) → F2-1 / `record_fn` を渡さず
       即時 commit に戻す → F6-8 / warn でも短絡する → F6-3 /
       `run_kind_gate` 内で raise に戻す → F6-9 / 例外メッセージの部分一致で分類する → F6-10 /
-      `submit_candidate` の `activity` 引数を外す → F6-11
+      `submit_candidate` の `activity` 引数を外す → F6-11(a) /
+      **CLI が `activity=` を渡さない (現行実装のまま) → F6-11(b)** /
+      **想定外例外の経路で捕捉行を捨てる・`unprofitable` で保存する → F6-12**
 - [ ] `grep -rn "submit_plugin" tests/` の全数と対応結果を実装報告に書く
 - [ ] フルスイート green
 
@@ -562,11 +585,12 @@ marker を付けない**)。
 **codex 設計レビュー 1 周目 (18 件) / 2 周目 (5 件) は全件採用済** — 同じ指摘が再掲された
 場合は v1.2 の該当 Step を指して閉じる。**蒸し返しの裁定は不要**。
 
-**設計レビュー 3 周目 (codex が要求) の確認範囲はこの 4 点に限定する**:
-① フロア専用失敗の型付き伝播と失敗行の outcome 分類 (Step 1-4 / 1-6、F6-9/F6-10)
-② 人間 submit の activity 配線 (Step 1-7、F6-11)
-③ `report_failed` 時の gate 行 / ledger 行 / settle / INDEX の統一 (Step 1-3、F4-10)
-④ 修正後の F4-10・F6-8 pin の十分性
+**設計レビュー 3 周目は完了 (v1.3 で実装着手可、codex 収束判定)**。以後の設計レビューは
+行わず、実装後のコードレビュー段 (上記 1〜5) に進む。3 周目の 4 確認点の決着:
+① 型付き伝播と失敗行分類 → Step 1-4 の表に一本化 (T1-c の旧契約を削除、R3-I1)
+② 人間 submit の activity 配線 → F6-11 を (a) 層別 / (b) CLI spy に二分 (R3-I2)
+③ `report_failed` 時の 4 点統一 → v1.2 で決着済 (codex「十分」判定)
+④ F4-10・F6-8 pin の十分性 → F6-12 (想定外例外の保存) を追加して充足 (R3-M1)
 
 ## 完了条件 (束全体)
 
@@ -593,6 +617,7 @@ marker を付けない**)。
 | レビュー段0 (変異スイープ) | 未着手 | - | 最優先 6 件 (F1-4 / F1-8 / F2-4 / F2-5(b) / F5-2 / F9-2) |
 | レビュー1周目 (codex 設計 18 件) | **完了・全件採用** | - | `tmp/design-profitability-floor/codex-design-r1.md` → spec/plan v1.1 |
 | レビュー2周目 (codex 設計 5 件) | **完了・全件採用** | - | `tmp/design-profitability-floor/codex-design-r2.md` → spec/plan v1.2 |
+| レビュー3周目 (codex 設計 3 件) | **完了・全件採用。実装着手可** | - | `tmp/design-profitability-floor/codex-design-r3.md` → spec/plan v1.3 |
 | レビュー1周目 (実装後: codex + ローカル3) | 未着手 | - | ブリーフにラベル規律 + 18 件の決着を含める |
 | レビュー2周目 (`/code-review high` + codex + ローカル3) | 未着手 | - | ユーザーが打つ |
 | レビュー3周目 (sonnet、要否判断) | 未着手 | - | |
@@ -641,6 +666,16 @@ marker を付けない**)。
 > R2-M1 = 進捗表の段0 を最優先 6 件に訂正 / R2-M2 = 閾値 snapshot の出力先を
 > 「approval を作る全終端 (成功・bless 警告)」に限定。
 
+> 指揮者裁定 (2026-09-12、codex 設計レビュー 3 周目 = **全 3 件採用**。**v1.3 で実装着手可**):
+> R3-I1 = spec T1-c の旧契約 (`run_kind_gate` が enforce で raise) を削除し
+> 「`run_kind_gate` は `GateOutcome` を返し、`_run_full_gate` が `verdict_kind` と
+> `floor_mode` から raise を決める」に統一 (enforce/warn の対応は Step 1-4 の表へ一本化) /
+> R3-I2 = F6-11 を (a) `submit_candidate` 層 (イベント・閾値 3 値・`activity=None` 後方互換) と
+> (b) CLI 層 spy pin (`_plugin_submit --from _human` が `ActivityLog(root/"logs"/"activity.log")`
+> 相当を `activity=` に渡す) に二分 /
+> R3-M1 = F6-12 新設 (`run_kind_gate` の fake が `record_fn` に 1 行積んだ後に想定外例外を
+> 投げるケースで、その行は `gate_failed` で保存し、元例外は伝播または規定 `ValueError` へ変換)。
+
 ## 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
@@ -648,3 +683,4 @@ marker を付けない**)。
 | 2026-09-12 | v1 | 起案。T0 (reject reason 固定文言化 + `_approval_detail` の reason 表示 + 2026-08-16 設計書 §7.1-1 ⑧ へのただし書き追記) / T3 (config 3 キー) / T1 (収益性フロア 2 段、`_finalize_gate_failed` の `mission_outcome`/`report_detail` 引数化、`run_kind_gate`/`_run_full_gate`/`bless_candidate` の戻り値拡張、legacy corridor は in_sample のみ) / T2 (RPC `submission_blocked` + プロンプト規律) の順序と Step 分割、接合面、完了条件、レビュー段 (ブリーフにラベル規律必須)、プラン規約 (実 DB 不可触・ラベル固定文言規律) | 設計書 `2026-09-12-profitability-floor-design.md` v1 を実装プランへ写す。ユーザー裁定 U1〜U5 (2026-09-12) と指揮者既定選択を反映 | - |
 | 2026-09-12 | v1.1 | codex 設計レビュー 1 周目 18 件を全件反映。T1 を Step 1-1〜1-9 へ再構成 (判定順序 ①strict holdout→②zero-trade→③R8、`floor_mode` を evaluator まで、branch-local outcome 統一、`GateOutcome` dataclass、`bless_candidate` は `int` 戻り + `on_floor_warning`、非コミット sink と人間回廊の明示 outcome 規約表、legacy submit の strategy 拒否、`profitability_floor` snapshot)。T2 を「親 handler 1 箇所導出 + settings からの文言レンダ」へ書き換え (builder/registry の配線は作らない)。T3 に `max_backtests_per_candidate >= len(pairs)` validator を追加し「別名で枠再取得」を撤回。T0 に漏洩 pin 用の新規モジュール `tests/loops/test_floor_leak_guard.py` (Landlock skip 無し) と `_approval_detail` の floor 表示を追加。完了条件・進捗表・レビュー段・裁定ブロックを更新 | codex 設計レビュー 1 周目 `tmp/design-profitability-floor/codex-design-r1.md` (gpt-5.6-sol、spec/plan v1 = 3ab0b06)、指揮者裁定 2026-09-12 (全件採用) | - |
 | 2026-09-12 | v1.2 | codex 設計レビュー 2 周目 5 件を全件反映。Step 1-4 を `GateOutcome` + 判別子 (`verdict_kind` / `floor_failed` / `insufficient_trades_reason`) に書き換え、`run_kind_gate` はゲート判定で raise しない契約と「例外メッセージによる分類の禁止」を Global Constraints + 判別子→outcome 対応表で固定 (R2-I1)。Step 1-6 の分類を判別子のみに、標本不足行を別行として規約表に追加。Step 1-7 に `submit_candidate(..., activity=None)` + `_plugin_submit` からの `ActivityLog` 配線を追加 (R2-I2)。Step 1-3 の report 失敗分岐に「共通 settle 契約を維持、INDEX も `report_failed`、抑止 API は作らない」を明記し完了条件の F4-10 を 4 点 + `PERSISTED` に拡張 (R2-I3)。Step 1-8 の snapshot を「approval を作る 3 箇所」に限定 (R2-M2)。進捗表の段0 を最優先 6 件に訂正 (R2-M1)、2 周目行を追加。レビュー段に 3 周目の確認範囲 4 点を明記 | codex 設計レビュー 2 周目 `tmp/design-profitability-floor/codex-design-r2.md` (gpt-5.6-sol、v1.1 = cbed926)、指揮者裁定 2026-09-12 (全件採用) | - |
+| 2026-09-12 | v1.3 | codex 設計レビュー 3 周目 3 件を全件反映。**v1.3 で実装着手可** (codex 収束判定、以後の設計レビューは行わない)。R3-I1 = Step 1-4 の直前に「`floor_mode` は判定を止めるためでなく warn の完走のためのスイッチ / `run_kind_gate` はどちらでも raise しない」を明記 (spec T1-c の旧契約は削除) / R3-I2 = 完了条件の F6-11 を (a) `submit_candidate` 層 と (b) CLI 層 spy pin に二分し、Step 1-7 に spy pin の具体 assert (渡された `ActivityLog` の `path` が `root/"logs"/"activity.log"`) を追記、逆変異に「CLI が渡さない」を追加 / R3-M1 = Step 1-6 に「sink に行を積んだ後の contract 外例外も `gate_failed` で保存してから伝播 (`except BaseException:` で保存 → `raise`)」を追記し F6-12 を完了条件・逆変異に追加。レビュー段の 3 周目 4 確認点を決着記録に置換、進捗表に 3 周目行 | codex 設計レビュー 3 周目 `tmp/design-profitability-floor/codex-design-r3.md` (gpt-5.6-sol、v1.2 = 8ef4694)、指揮者裁定 2026-09-12 (全件採用) | - |
