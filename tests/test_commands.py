@@ -575,7 +575,11 @@ def test_approval_detail_shows_archive_path_by_mission_content_hash(tmp_path):
 
 
 def test_approval_detail_shows_archive_unknown_when_no_archive_row(tmp_path):
-    """GC 済み・失敗終端等で archive 行が無いとき「archive 不明」を明示。"""
+    """GC 済み・失敗終端等で archive 行が無いとき「archive 不明」を明示。
+
+    ローカル approval-quality 1 周目 #C1x (2026-09-12): assert を理由文込みに
+    厳格化 (4 分岐すべてが「archive=不明」で始まるため、部分一致では分岐の
+    取り違えを検出できず、文言すり替え変異が SURVIVED だった)。"""
     conn, _, _, cmds = _commands(tmp_path)
     approval_id = approvals.create(
         conn, kind="plugin",
@@ -584,30 +588,32 @@ def test_approval_detail_shows_archive_unknown_when_no_archive_row(tmp_path):
 
     out = cmds.dispatch(f"approval {approval_id}")
 
-    # ローカル approval-quality 1 周目 #C1x (2026-09-12): 4 分岐すべてが
-    # 「archive=不明」で始まるため、部分一致 assert では分岐の取り違え
-    # (GC 済みとパス欠落の文言すり替え等) を検出できない。理由まで pin する。
     assert "archive=不明 (GC 済み・失敗終端等)" in out
 
 
 def test_approval_detail_shows_archive_unknown_when_payload_lacks_identity(
         tmp_path):
     """旧 payload に `mission_id`/`content_hash` が欠けていても例外にせず
-    「archive 不明」を出す。"""
+    「archive 不明」を出す。
+
+    ローカル approval-quality 1 周目 #C1x (2026-09-12): assert を理由文込みに
+    厳格化。"""
     conn, _, _, cmds = _commands(tmp_path)
     approval_id = approvals.create(
         conn, kind="plugin", payload={"name": "myind"}, now=NOW)
 
     out = cmds.dispatch(f"approval {approval_id}")
 
-    # ローカル approval-quality 1 周目 #C1x (2026-09-12): 理由まで pin する。
     assert "archive=不明 (mission_id/content_hash 欠落)" in out
 
 
 def test_approval_detail_archive_unknown_when_mission_id_is_wrong_type(
         tmp_path):
     """codex 1周目 I3 是正の pin: `mission_id` が int でない (list) payload
-    でも例外にせず「archive 不明」を出す。"""
+    でも例外にせず「archive 不明」を出す。
+
+    ローカル approval-quality 1 周目 #C1x (2026-09-12): assert を理由文込みに
+    厳格化。"""
     conn, _, _, cmds = _commands(tmp_path)
     approval_id = approvals.create(
         conn, kind="plugin",
@@ -616,14 +622,16 @@ def test_approval_detail_archive_unknown_when_mission_id_is_wrong_type(
 
     out = cmds.dispatch(f"approval {approval_id}")
 
-    # ローカル approval-quality 1 周目 #C1x (2026-09-12): 理由まで pin する。
     assert "archive=不明 (mission_id/content_hash 不正)" in out
 
 
 def test_approval_detail_archive_unknown_when_content_hash_is_wrong_type(
         tmp_path):
     """codex 1周目 I3 是正の pin: `content_hash` が str でない (dict)
-    payload でも例外にせず「archive 不明」を出す。"""
+    payload でも例外にせず「archive 不明」を出す。
+
+    ローカル approval-quality 1 周目 #C1x (2026-09-12): assert を理由文込みに
+    厳格化。"""
     conn, _, _, cmds = _commands(tmp_path)
     approval_id = approvals.create(
         conn, kind="plugin",
@@ -632,7 +640,6 @@ def test_approval_detail_archive_unknown_when_content_hash_is_wrong_type(
 
     out = cmds.dispatch(f"approval {approval_id}")
 
-    # ローカル approval-quality 1 周目 #C1x (2026-09-12): 理由まで pin する。
     assert "archive=不明 (mission_id/content_hash 不正)" in out
 
 

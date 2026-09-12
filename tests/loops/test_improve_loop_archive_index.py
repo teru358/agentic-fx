@@ -429,7 +429,11 @@ def test_finalize_success_index_row_matches_other_terminal_columns(
 def test_finalize_success_index_header_notes_it_is_a_terminal_log(
         loop_min, conn, mission_and_run_fixture, tmp_path):
     """設計書 §B: 「終端ログ (GC 非対象)。正は candidate_archives」の趣旨が
-    ヘッダに明記される。"""
+    ヘッダに明記される。
+
+    ローカル approval-quality 1 周目 #B2 (2026-09-12): 2 語の部分一致では
+    「(GC 非対象)」「承認可否の目録ではない」「approval_requests」が落ちる
+    変異を検出できなかったため、ヘッダ文言を一文ごと pin する。"""
     mission_id, run_id, backlog_id = mission_and_run_fixture
     tmp = tmp_path / "archive"
     artifact_hash = _snapshot(tmp)
@@ -442,12 +446,41 @@ def test_finalize_success_index_header_notes_it_is_a_terminal_log(
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
 
     text = _index_path(loop_min).read_text()
-    # ローカル approval-quality 1 周目 #B2 (2026-09-12): 2 語の部分一致では
-    # 「(GC 非対象)」「承認可否の目録ではない」「approval_requests」が
-    # 落ちる変異を検出できなかった。ヘッダ文言を一文ごと pin する。
     assert "終端ログ (GC 非対象)。承認可否の目録ではない。" in text
     assert ("承認済み候補の正は `candidate_archives` 表と "
             "`approval_requests` 表である。") in text
+
+
+def test_finalize_success_writes_no_approval_index_row_when_mark_persisted_raises(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """ローカル approval-quality 1 周目 #B1 (2026-09-12): `_finalize_success`
+    は `ctx.ledger.mark_persisted()` の**後**に `_write_archive_index_safe`
+    を呼ぶ。`mark_persisted()` は台帳状態が FROZEN/PERSIST_FAILED 以外だと
+    `RuntimeError` を送出し (`improve_rpc_ledger.py` の状態ガード)、外側の
+    `except Exception:` が補償経路を走らせる。順序が入れ替わると「approval で
+    終端した」と読める `| approval |` 行が INDEX に残ったまま補償が走り、
+    しかも `| mission <id> |` マーカーで補償側の訂正行まで塞がれる。
+    既存テストは INDEX の内容しか見ておらず順序入れ替え変異が SURVIVED
+    だったため、挙動 (raise 時に approval 行を残さないこと) で pin する。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    def _raise_state_violation():
+        raise RuntimeError("cannot mark_persisted from state 'DISCARDED'")
+
+    ctx.ledger.mark_persisted = _raise_state_violation
+
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+
+    index_path = _index_path(loop_min)
+    text = index_path.read_text() if index_path.exists() else ""
+    assert "| approval |" not in text, text
 
 
 def test_finalize_success_does_not_write_index_row_with_zero_candidates(
