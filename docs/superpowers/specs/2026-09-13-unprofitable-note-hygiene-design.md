@@ -1,4 +1,4 @@
-# [unprofitable-note-hygiene] 設計書 v1.1
+# [unprofitable-note-hygiene] 設計書 v1.2
 
 束: 収益性フロア不合格 (`unprofitable`) で終わった改善 mission が起票した backlog 行 (note / task) に機械注記を付け、次 mission の同型再提出を抑止する。ユーザー承認 2026-09-13。親: [floor-path-skips-duplicate-metrics] 裁定 (c) 現状維持、遮断 8 例外の再評価 (`2026-09-12-profitability-floor-design.md` v1.5)。
 
@@ -14,7 +14,7 @@ A4 run19 (`tmp/a4-run19-codex-20260913.md` 観測 D): mission #83 が holdout �
 ## 2. 設計
 
 1. **起票行の追跡**: `_SelectionOutcome` (`:186`) に `inserted_ids: tuple[int, ...]` を追加。`_select_and_bind` が INSERT した行 id (note / task とも、`_upsert_backlog_idea` が `"inserted"` を返したもの) を格納。既存行の再利用 (`existing` / `promoted`) は含めない。
-2. **機械注記**: `commit()` は `selection.inserted_ids` を `_finalize_gate_failed(..., inserted_ids=...)` に渡す。`_finalize_gate_failed` は `mission_outcome == "unprofitable"` のときだけ、既存の `BEGIN IMMEDIATE` tx 内で `UPDATE improvement_backlog SET last_result='origin:unprofitable', updated_at=? WHERE id IN (...)` を実行する。`idea` / `idea_norm` / `status` は触らない。他の終端 (`gate_failed` 系 / report / observation / approval / `report_failed` 分岐) では書かない。当該行が後に選択されて終端すれば `last_result` は既存規律で上書きされる。
+2. **機械注記**: `commit()` は `selection.inserted_ids` を `_finalize_gate_failed(..., inserted_ids=...)` に渡す。`_finalize_gate_failed` は `mission_outcome == "unprofitable"` のときだけ、既存の `BEGIN IMMEDIATE` tx 内で `UPDATE improvement_backlog SET last_result='origin:unprofitable', updated_at=? WHERE id IN (...) AND last_result IS NULL` を実行する (`AND last_result IS NULL` = 更新世代 CAS。起票 INSERT と注記 UPDATE は別 tx なので `parallel>1` では他 mission が先にその行を選択・終端しうる — 終端済みの行は上書きしない、codex r2 I1)。`idea` / `idea_norm` / `status` は触らない。**note → task 昇格** (`_upsert_backlog_idea` の `promoted`) では `last_result` が `origin:unprofitable` ならそのまま保持し (昇格だけでは未評価なので警告を残す、codex r2 I2)、それ以外は従来どおり `promoted_from_note`。他の終端 (`gate_failed` 系 / report / observation / approval / `report_failed` 分岐) では書かない。当該行が後に選択されて終端すれば `last_result` は既存規律で上書きされる。
 3. **表示**: `_backlog_table` に `origin` 列を追加 (items 表・notes 表の両方)。`row["last_result"] == "origin:unprofitable"` のときだけ `unprofitable`、それ以外は空文字。`improve_context.build_improve_context` は既に `last_result` を items / notes に載せている (`improve_context.py:102,109`) ので配線変更なし。
 4. **規律文**: `src/agentic_fx/loops/prompts/improve_mission.md` の「規律 (必ず守ること)」に 1 項追加 (逐語):
    > 5. **`origin` 列が `unprofitable` の課題・note は、その mission の候補が収益性フロアで落ちたときに書かれたものです。** 同じ指標・同じパラメータの候補を再提出しないでください。試すなら明確にパラメータを変え、その理由を `selection_rationale` に書いてください。
@@ -41,6 +41,8 @@ A4 run19 (`tmp/a4-run19-codex-20260913.md` 観測 D): mission #83 が holdout �
 | N6 | prompt の backlog 表・note 表に `origin` 列があり、注記行だけ `unprofitable`、他行は空 | レンダ済み prompt 文字列 |
 | N7 | 規律 5 が prompt に逐語で出る。既存遮断 pin (prompt に `holdout` 0 件、F5-2) は緑のまま | 同上 |
 | N8 | 当該行が後に選択されて終端すると `last_result` は終端の値で上書きされる | 同上 |
+| N9 | 逆順並行: A が INSERT → B がその行を選択・終端 → A が `unprofitable` 終端しても B の `last_result` / `updated_at` が残る (CAS) | 同上 |
+| N10 | origin 付き note を同一 idea の task で昇格しても `last_result == 'origin:unprofitable'` (origin 列に出続ける) | 同上 |
 
 ## 変更履歴
 
@@ -48,3 +50,4 @@ A4 run19 (`tmp/a4-run19-codex-20260913.md` 観測 D): mission #83 が holdout �
 |---|---|---|---|---|
 | 2026-09-13 | v1.0 | 初版 (bounded 設計、チャット提示 → ユーザー承認) | run19 観測 D、裁定 (c) の後継 | - |
 | 2026-09-13 | v1.1 | 実装 `98a5d68` (sonnet) → 段 0 `e1595a5` (14 変異、生存 6 → pin S1〜S5) → ローカル 3 本 1 周目 `9088c86` (Y2/N14/dup6、pin L1/L2、本番欠陥 0) → codex 1 周目 (`tmp/review-20260913-nh/codex-r1.md`): Critical 0 / Important 1 (N2 の report/observation/approval 終端が未 pin) / Minor 5 (F5-5 説明改訂、N3 空振り、N5 note 不変、L1 docstring、N4 文言) → 全件是正。N4 の受入文言を「注記後の後段失敗で rollback」に訂正 (report 作成失敗は注記より前) | codex r1 | - |
+| 2026-09-13 | v1.2 | codex 2 周目 (`tmp/review-20260913-nh/codex-r2.md`): Critical 0 / Important 2 (I1 並行時の後発 UPDATE が他 mission の終端値を潰す → `AND last_result IS NULL` CAS / I2 note 昇格で注記が消える → 保持分岐) / Minor 2 (文書) → 全件是正 `b658caf` (pin N9/N10 追加、602 passed)。§2-2 の SQL と昇格規則、§4 N9/N10 を追記 | codex r2 | b658caf |
