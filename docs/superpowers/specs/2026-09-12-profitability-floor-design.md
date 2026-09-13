@@ -93,7 +93,7 @@
 | U5 除染 | スクリプト更新済、ユーザー実行待ち |
 | C1 legacy submit | `afx plugin submit <name>` (live plugin 回廊) は **kind=strategy のとき拒否**し `materialize` → `submit --from _human` を案内する。indicator/signal は従来どおり。共有ゲートへの統合・回廊廃止は別起票 [legacy-submit-corridor-bypasses-gate] |
 | C2 bless の warn | `floor_mode` を evaluator まで渡す。`warn` では in_sample 不合格でも **holdout・baseline 収集まで完走**し失敗ビットを保持する (短絡は `enforce` のときだけ) |
-| R2-I1 失敗種別の識別 | **`run_kind_gate` は常に `GateOutcome` を返す** (ゲート判定で raise しない)。判別子 `verdict_kind` / `floor_failed` を持たせ、enforce の raise と失敗行 outcome の決定は `_run_full_gate` が**型付き結果から**行う。**例外メッセージによる分類は禁止** |
+| R2-I1 失敗種別の識別 | **`run_kind_gate` は常に `GateOutcome` を返す** (ゲート判定で raise しない)。判別子 `verdict_kind` (v1.4: `floor_failed` は削除) を持たせ、enforce の raise と失敗行 outcome の決定は `_run_full_gate` が**型付き結果から**行う。**例外メッセージによる分類は禁止** |
 | R2-I2 submit の activity | `submit_candidate(..., activity: ActivityLog | None = None)` を追加し、`_plugin_submit` から bless と同じ `ActivityLog(root / "logs" / "activity.log")` を渡す |
 | R2-I3 report 失敗時の INDEX | **共通 settle 契約を維持** — report 失敗分岐でも `_settle_ledger_after_commit(outcome="report_failed")` を通し、archive / INDEX も `report_failed` になる (INDEX 書込みを抑止する専用 API は作らない) |
 
@@ -193,7 +193,7 @@ class GateOutcome:                     # plugin/approval.py
     metrics: dict
     evaluable: bool
     verdict_kind: Literal["ok", "insufficient_trades", "floor"] = "ok"
-    floor_failed: bool = False         # verdict_kind == "floor" と同値 (読みやすさのため併置)
+    # (v1.4: `floor_failed` は冗長のため削除 — 判別子は `verdict_kind` のみ)
     floor_warning: str = ""            # "" | "unprofitable"
     floor_detail: str = ""             # 人間向け全数値 (payload / 表示用)
     insufficient_trades_reason: str = ""   # "insufficient_trades:<n>" (標本不足のときだけ)

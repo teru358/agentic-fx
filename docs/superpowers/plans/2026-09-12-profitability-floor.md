@@ -280,7 +280,7 @@ class GateOutcome:
     metrics: dict
     evaluable: bool
     verdict_kind: Literal["ok", "insufficient_trades", "floor"] = "ok"
-    floor_failed: bool = False             # verdict_kind == "floor" と同値
+    # (v1.8: `floor_failed` は冗長のため削除、判別子は `verdict_kind` のみ)
     floor_warning: str = ""                # "" | "unprofitable"
     floor_detail: str = ""
     insufficient_trades_reason: str = ""   # "insufficient_trades:<n>"
@@ -292,7 +292,7 @@ class GateOutcome:
 - **`run_kind_gate` はゲート判定で例外を投げない** (codex R2-I1)。現行が
   `ValueError("strategy not evaluable …")` を投げている標本不足 (`approval.py:213-221`) も
   **`verdict_kind="insufficient_trades"` + `insufficient_trades_reason` に載せて return** する。
-  収益性フロア不合格は `verdict_kind="floor"` / `floor_failed=True`。
+  収益性フロア不合格は `verdict_kind="floor"` (v1.8: `floor_failed` は削除)。
   indicator / signal は `_validate_kind` に委譲して `verdict_kind="ok"`
 - **raise と失敗行 outcome の決定は `_run_full_gate` が判別子から行う**:
 
@@ -653,7 +653,7 @@ marker を付けない**)。
 
 > 指揮者裁定 (2026-09-12、codex 設計レビュー 2 周目 = **全 5 件採用**、蒸し返さない):
 > R2-I1 = `run_kind_gate` はゲート判定で例外を投げず**常に `GateOutcome` を返す**契約に固定。
-> 判別子 `verdict_kind` (`ok` / `insufficient_trades` / `floor`) + `floor_failed` を持たせ、
+> 判別子 `verdict_kind` (`ok` / `insufficient_trades` / `floor`) を持たせ (v1.8: `floor_failed` は削除)、
 > enforce の raise と失敗行 outcome (`unprofitable` / `gate_failed`) の決定は
 > `_run_full_gate` が**型付き結果から**行う。**例外メッセージによる分類は禁止**。
 > 標本不足 (現行 `approval.py:213-221` が `ValueError` にしていたもの) も同じ判別子経由に揃え、
@@ -689,3 +689,4 @@ marker を付けない**)。
 | 2026-09-13 | v1.6 | 段 0 (opus 独立変異 18 件、実装者の逆変異とは別の壊し方): RED 17 / 生存 1 (M8 = `run_kind_gate` → evaluator の `floor_mode` 転送に pin 無し、bless warn が黙って短絡し得る pin gap) / designated pin 空振り 2 (F2-4 fixture 非現実形状、F9-2 が holdout 段に未到達) → pin 是正 c678762。次 = 1 周目 codex + ローカル 3 本 (材料は c678762 から) | `tmp/review-20260912-pf/stage0.md` | c678762 |
 | 2026-09-13 | v1.7 | 1 周目: codex (sol) Critical/Important/Minor 0 (7 観点すべて問題なし、593 passed) / ローカル 3 本 (muse 0/0/6、ornith 2/5/4、qwen 3/5/7) 本番欠陥 0、pin 追加 4 (L1/L3/L5/L7)、既存充足 3。**2 周目 = `/code-review high` (ユーザー起動) + codex + ローカル** | `tmp/review-20260912-pf/{codex-r1,verified-local}.md` | 5416a39 |
 | 2026-09-13 | v1.8 | 2 周目 `/code-review high` (sonnet) 8 件: 本番欠陥 0、部分採用 1 (CR1 = human 向けのみ holdout 条件) / 採用 6 (CR3〜CR8) / 記録 1 (CR2 既知チケット) → 是正 684fb31。spec v1.4 に設計微修正を反映。次 = codex 2 周目 (差分限定 716eeec..684fb31) | `code-review-r2.md` | 684fb31 |
+| 2026-09-13 | v1.9 | codex 2 周目 (是正差分 716eeec..b9618a7): Critical 0 / Important 1 / Minor 0 — CR6 で削除した `floor_failed` が spec/plan の規範本文 5 箇所に残存 → 指揮者が文書是正 (`rg floor_failed` の残存は変更履歴と削除説明のみ)。CR1〜CR7 の実装は収束判定「収束」。3 周目は codex 指定の「文書差分のみの短い確認」を指揮者 grep で代替。次 = fresh フルスイート → main マージ (ユーザー承認) | `tmp/review-20260912-pf/codex-r2.md` | - |
