@@ -216,33 +216,137 @@ def test_n2_report_failed_branch_leaves_inserted_row_untouched(
     assert row["last_result"] is None
 
 
+def _write_indicator_candidate(staging_dir, name: str) -> None:
+    """`tests/loops/test_improve_loop_finalize.py::_write_candidate` と
+    同型 (indicator gate は strategy gate と異なり `evaluate` を要求
+    しない `compute` のみの plugin.py で合格する)。"""
+    candidate_dir = staging_dir / name
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    (candidate_dir / "plugin.py").write_text(
+        "def compute(df, params):\n    return {'v': 1.0}\n")
+    (candidate_dir / "config.yaml").write_text(
+        "kind: indicator\npairs: ['USDJPY']\ntimeframe: '1h'\n")
+    (candidate_dir / "test_plugin.py").write_text(
+        "def test_x():\n    pass\n"
+        "def test_y():\n    pass\n"
+        "def test_z():\n    pass\n")
+
+
+def _commit_terminal_with_discoveries(
+        loop, conn, mission_and_run_fixture, tmp_path, *, artifact,
+        note_idea: str, task_idea: str, write_plugin: bool = False):
+    """discovery の note (`kind=fact`) と task (`kind=task`) を持つ
+    commit-level fixture で、任意の終端 `artifact` を通す (codex r1
+    是正、N2 Important: report/observation/approval の 3 終端で
+    `inserted_ids` が注記されないことを pin するための共有 helper)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    if write_plugin:
+        _write_indicator_candidate(staging_dir, artifact["name"])
+    else:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+    mission = Mission(prompt="x", tools=[], output_schema={}, max_turns=10,
+                      timeout_sec=60)
+    result = MissionResult(status="completed", output={
+        "discoveries": [
+            {"idea": note_idea, "source": "agent", "evidence": "e",
+             "kind": "fact"},
+            {"idea": task_idea, "source": "agent", "evidence": "e",
+             "kind": "task"},
+        ],
+        "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "artifact": artifact,
+        "selection_rationale": "r"}, transcript=[])
+
+    loop.commit(mission=mission, ctx=ctx, result=result, now=_NOW)
+    return conn
+
+
+def test_n2_report_outcome_leaves_inserted_rows_untouched(
+        loop_full, conn, mission_and_run_fixture, tmp_path):
+    """codex r1 Important: report 終端 (`_finalize_report_or_observation`
+    経由、`artifact.type=='report'`) を discovery の note/task を持つ
+    commit-level fixture で実際に通し、両行の `last_result` が NULL の
+    ままであることを pin する。"""
+    _commit_terminal_with_discoveries(
+        loop_full, conn, mission_and_run_fixture, tmp_path,
+        artifact={"type": "report", "proposal_kind": "core",
+                  "title": "report terminal", "body_md": "body"},
+        note_idea="report 終端の note", task_idea="report 終端の task")
+
+    assert _idea_last_result(conn, "report 終端の note") is None
+    assert _idea_last_result(conn, "report 終端の task") is None
+
+
+def test_n2_observation_outcome_leaves_inserted_rows_untouched(
+        loop_full, conn, mission_and_run_fixture, tmp_path):
+    """codex r1 Important: observation 終端 (`_finalize_report_or_
+    observation` 経由、`artifact.type=='observation'`) を discovery の
+    note/task を持つ commit-level fixture で実際に通し、両行の
+    `last_result` が NULL のままであることを pin する。"""
+    _commit_terminal_with_discoveries(
+        loop_full, conn, mission_and_run_fixture, tmp_path,
+        artifact={"type": "observation", "reason": "no candidate"},
+        note_idea="observation 終端の note", task_idea="observation 終端の task")
+
+    assert _idea_last_result(conn, "observation 終端の note") is None
+    assert _idea_last_result(conn, "observation 終端の task") is None
+
+
+def test_n2_approval_outcome_leaves_inserted_rows_untouched(
+        loop_full, conn, mission_and_run_fixture, tmp_path):
+    """codex r1 Important: approval 終端 (`_finalize_success` 経由、
+    plugin/indicator がゲート合格し承認申請を出す経路) を discovery の
+    note/task を持つ commit-level fixture で実際に通し、両行の
+    `last_result` が NULL のままであることを pin する (indicator は
+    strategy gate — 収益性フロア判定 — を経由しないため、この終端が
+    `unprofitable` 分岐へ誤って迷い込まないことも合わせて確認する)。"""
+    conn = _commit_terminal_with_discoveries(
+        loop_full, conn, mission_and_run_fixture, tmp_path,
+        artifact={"type": "plugin", "name": "myind", "kind": "indicator",
+                  "self_test": "passed", "summary": "s"},
+        note_idea="approval 終端の note", task_idea="approval 終端の task",
+        write_plugin=True)
+
+    run_id = mission_and_run_fixture[1]
+    run = conn.execute(
+        "SELECT result FROM improvement_runs WHERE id=?",
+        (run_id,)).fetchone()
+    assert run["result"] == "approval"
+    assert _idea_last_result(conn, "approval 終端の note") is None
+    assert _idea_last_result(conn, "approval 終端の task") is None
+
+
 # ---------------------------------------------------------------------------
 # N3: 既存行の再利用 (existing / promoted) は注記されない
 # ---------------------------------------------------------------------------
 
-def test_n3_select_and_bind_inserted_ids_excludes_existing_reuse(
+def test_n3_selected_existing_task_reuses_without_inserting(
         loop_and_ctx_with_open_backlog):
-    loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
+    """codex r1 Minor: discoveries 側の重複は `_upsert_backlog_idea` より
+    前の `continue` で除外されるため existing 戻り値を実際には通らない
+    (段0 M12)。ここでは `selected.backlog_id` を省略し `selected.idea` を
+    既存 task の idea と一致させ、`_upsert_backlog_idea(...) -> "existing"`
+    を実際に通す経路 (`_select_and_bind` の `selected` 分岐) を pin する。
+    その ID が `inserted_ids` に無いことを確認する。"""
+    loop, ctx, conn, _backlog_id = loop_and_ctx_with_open_backlog
     existing_id = backlog_store.add(conn, "already known idea", "user", _NOW)
 
     output = {
-        "discoveries": [
-            {"idea": "already known idea", "source": "agent", "evidence": "e",
-             "kind": "task"},  # existing — 再利用のみ
-            {"idea": "brand new idea", "source": "agent", "evidence": "e",
-             "kind": "task"},  # inserted
-        ],
-        "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "discoveries": [],
+        "selected": {"idea": "already known idea", "source": "agent"},
         "artifact": {"type": "observation", "reason": "x"},
         "selection_rationale": "x"}
 
     outcome = loop._select_and_bind(conn, output, ctx, now=_NOW)
 
-    new_row = conn.execute(
-        "SELECT id FROM improvement_backlog WHERE idea='brand new idea'"
-    ).fetchone()
+    assert outcome.backlog_id == existing_id
     assert existing_id not in outcome.inserted_ids
-    assert new_row["id"] in outcome.inserted_ids
 
 
 def test_n3_select_and_bind_inserted_ids_excludes_note_promoted_to_task(
@@ -279,6 +383,14 @@ def test_n3_select_and_bind_inserted_ids_excludes_note_promoted_to_task(
 
 def test_n4_rollback_in_same_tx_undoes_origin_marker(
         loop_min, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """codex r1 Minor (N4): report part 作成失敗は注記 tx より前 (注記を
+    一度も書かない) のため atomicity の probe にならない — その分岐は N2
+    の非書込み基準 (`test_n2_report_failed_branch_leaves_inserted_row_
+    untouched`) 側で扱う。ここで検査するのは、正常分岐 tx の注記後に
+    後段 DB 処理 (`finish_improve_mission`) が失敗した場合の rollback —
+    `_finalize_gate_failed` の `mission_outcome=="unprofitable"` UPDATE 後、
+    同一 tx 内の `finish_improve_mission` が例外を送出すると、先に書いた
+    `origin:unprofitable` も rollback で消えることを pin する。"""
     mission_id, run_id, backlog_id = mission_and_run_fixture
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
@@ -315,6 +427,11 @@ def test_n4_rollback_in_same_tx_undoes_origin_marker(
 
 def test_n5_origin_marker_does_not_touch_idea_idea_norm_or_status(
         loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """codex r1 Minor (N5): task 行だけを検査すると、UPDATE に
+    `status='open'` を混ぜる変異 (note の `status` を `note` から `open`
+    へ壊す) は task 側の期待値 (既定 `open`) を変えないため全 pin が緑の
+    まま生存する。note 行 (`kind=fact` の discovery) についても
+    `idea`/`idea_norm`/`status=='note'`/機械注記を検査する。"""
     conn = _commit_unprofitable_mission(
         loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch,
         holdout_metrics=None)
@@ -326,6 +443,15 @@ def test_n5_origin_marker_does_not_touch_idea_idea_norm_or_status(
     assert row["idea_norm"] == "次は fast=12/slow=28 を試す".strip().lower()
     assert row["status"] == "open"  # kind=task の既定 status のまま
     assert row["last_result"] == "origin:unprofitable"
+
+    note_row = conn.execute(
+        "SELECT idea, idea_norm, status, last_result FROM improvement_backlog "
+        "WHERE idea=?", ("fast=10/slow=30 は提出条件を満たした",)).fetchone()
+    assert note_row["idea"] == "fast=10/slow=30 は提出条件を満たした"
+    assert (note_row["idea_norm"]
+            == "fast=10/slow=30 は提出条件を満たした".strip().lower())
+    assert note_row["status"] == "note"  # kind=fact の既定 status のまま
+    assert note_row["last_result"] == "origin:unprofitable"
 
 
 # ---------------------------------------------------------------------------
@@ -617,8 +743,11 @@ def test_l1_selected_new_idea_insert_is_tracked_in_inserted_ids(
     (`test_n3_*`) は前者しか見ておらず、後者の
     `if selected_action == "inserted": inserted_ids.append(backlog_id)`
     を丸ごと削除しても `tests/loops/` 全体が緑だった (probe 実測 SURVIVED)。
-    落ちると、選ばれた候補自身が起票行だったフロア不合格 mission で
-    その行に機械注記が付かない。"""
+    `_SelectionOutcome` の構造契約 (`_upsert_backlog_idea` が返した
+    inserted 行の id を漏れなく `inserted_ids` へ伝播すること) を守る
+    white-box pin (codex r1 Minor L1 是正、2026-09-13: `finish_improve_
+    mission` の `backlog_transition` による上書きで最終 DB 状態は等価に
+    なりうるため、利用者影響 — 機械注記欠落 — としては説明しない)。"""
     loop, ctx, conn, _backlog_id = loop_and_ctx_with_open_backlog
 
     output = {

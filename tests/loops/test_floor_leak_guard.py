@@ -135,10 +135,15 @@ def test_afx_approval_detail_shows_reason_for_rejected(tmp_path):
     assert "decided_by=shell" in out
 
 
-def test_history_table_is_sole_renderer_of_last_result(tmp_path):
-    """F5-5: `_history_table` が `last_result` をレンダする唯一の経路。
-    `_backlog_table` が last_result を描き始めたら (漏洩面が広がったら)
-    落ちる — backlog 側センチネルが本文に出ないことを固定する。"""
+def test_backlog_table_does_not_verbatim_render_arbitrary_last_result(tmp_path):
+    """F5-5 (codex r1 是正、2026-09-13): [unprofitable-note-hygiene] 以降
+    `_backlog_table` は `last_result` を判定して `origin` 列へ写像する
+    (完全一致 `origin:unprofitable` のみ)。よって「`_history_table` が
+    `last_result` をレンダする唯一の経路」という旧名称・説明はもう成立
+    しない。ここで pin するのは「backlog の任意の `last_result` は逐語
+    表示せず、許可された完全一致だけを `origin` に写像する」という契約 —
+    任意文字列のセンチネル (`origin:unprofitable` と一致しない) は本文に
+    出ないことを固定する (遮断 8 の維持)。"""
     loop = ImproveLoop.__new__(ImproveLoop)
     loop._settings = SETTINGS
     ctx = _FakeRunContext(tmp_path / "staging", tmp_path / "source")
