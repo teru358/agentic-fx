@@ -82,6 +82,48 @@ def _check_profitability_floor(
     return "", ""
 
 
+def floor_rule_text(gate_settings: "ImproveGateSettings", *,
+                    audience: Literal["agent", "human"]) -> str:
+    """[profitability-floor] codex 2 周目レビュー CR3 (2026-09-13):
+    フロア条件を説明する文言の**条件節**を組み立てる唯一の場所。以前は
+    `loops/improve_loop.py::_floor_rule_text` (LLM 向けプロンプト)・
+    `backtest/cli.py::_plugin_bless::_warn` (CLI 警告)・
+    `plugin/switch.py::_run_full_gate` (人間 corridor の ValueError/
+    activity 文言) がそれぞれ独立に `min_pf`/`require_positive_avg_r`/
+    `require_holdout_evaluable` を手書きで文言化しており、新しい閾値を
+    足すたびに 3 箇所を手で揃える必要があった (1 箇所を書き換え忘れると
+    CLI 操作者・LLM のプロンプト・activity ログが 3 つの異なるバージョンの
+    説明を見ることになる)。
+
+    戻り値は「条件節」(例: ``"`pf < 1.0` または `avg_r <= 0`"``) のみ —
+    文全体ではないので、各呼び出し元は自分の文脈に合わせて前後に文言を
+    足せる (CLI の警告文・improve_loop の規律文・switch.py の例外文で
+    それぞれ文体が異なるため)。
+
+    **`audience="agent"` (LLM 向け、改善ループのプロンプト) は
+    `require_holdout_evaluable` を条件節に一切含めない** — 遮断 8
+    (holdout の閾値・条件を agent に見せない設計判断、
+    [profitability-floor] 設計書 §4 の「ただし書き」) を優先する。
+    この設定が有効でも、agent 向け文言は pf/avg_r だけで説明する。
+    holdout 起因の拒否は agent から見ると「in_sample 段のヒント
+    (`submission_blocked`) は出なかったのに最終的に `unprofitable` に
+    なった」という形になる — これは設計書 §4 が受容済みの挙動であり、
+    ここで holdout 条件を漏らして解消してはならない (codex 2 周目
+    レビュー CR1 の裁定)。
+
+    **`audience="human"` (CLI/activity/例外メッセージ向け) は
+    `require_holdout_evaluable=True` のとき holdout 条件も条件節に
+    含める** — 人間はフロアの全条件を知る権利があり、遮断 8 の対象外
+    (CR1)。"""
+    g = gate_settings
+    parts = [f"`pf < {g.min_pf}`"]
+    if g.require_positive_avg_r:
+        parts.append("`avg_r <= 0`")
+    if audience == "human" and g.require_holdout_evaluable:
+        parts.append("holdout が評価可能 (30 trades 以上) でない")
+    return " または ".join(parts)
+
+
 def evaluate_strategy_adoption_gate(
     conn, *, meta: "PluginMeta | None", now: datetime, settings: "Settings",
     name: str | None = None, pairs: "list[str] | None" = None,
@@ -125,9 +167,26 @@ def evaluate_strategy_adoption_gate(
     契約 — 単一の dict を位置引数で渡す形。`ImproveLoop.commit` 手順4は
     ここへ `list.append` を渡し、蓄積した行を Tx-2 (`_persist_gate_rows`)
     へ渡す (設計書 §4.1「long-running work is outside tx」、3 周目レビュー
-    Important-2)。`None` (既定) のときは `holdout` 側が即時 commit する
-    従来経路のまま (Task 11 の `bless --from _human` など Tx-2 の外から
-    呼ぶ経路はこちらを使う)。"""
+    Important-2)。
+
+    [profitability-floor] codex 2 周目レビュー CR8 是正 (2026-09-13、
+    stale docstring 訂正): **`record_fn=None` (即時 commit) の経路は
+    現在どちらの corridor からも到達しない。** `plugin/approval.py::
+    run_kind_gate` は改善ループ (`ImproveLoop.commit` 手順4) からも
+    人間 corridor (`switch.py::submit_candidate`/`bless_candidate` →
+    `_run_full_gate`) からも、**常に**明示的な sink (`record_fn=_sink`、
+    T1 Step 1-6) を渡すようになった — 旧稿は「`bless --from _human` は
+    Tx-2 の外から呼ぶので `None` 経路を使う」と書いていたが、これは
+    T1 Step 1-6 (2026-09-13) 以前の実装を指しており、現在は
+    `switch._run_full_gate` が捕捉した行を `outcome.gate_rows` 経由で
+    自分の tx 内に明示的に persist する (`switch.py::
+    _persist_human_gate_rows`/成功パスの gate-row 保存)。**この
+    auto-commit 分岐は現状どちらの corridor からも呼ばれない到達不能
+    コードであり、削除しないのは「将来 Tx-2 の外から `record_fn` 無しで
+    呼ぶ第三の corridor ができたときの後方互換」のためだけ** —
+    このコメントを信じて switch.py 側の明示 persist ループ (T1 Step
+    1-6) を削除・変更すると、strategy 候補の in_sample/holdout 実測が
+    無言で失われる (どちらの corridor も auto-commit に頼っていないため)。"""
     if kind != "strategy":
         return None
     # R-i3 追随 (プラン10 Task 11): `plugin/approval.py::run_kind_gate` は

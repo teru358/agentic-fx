@@ -543,11 +543,14 @@ def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
     # ここで stderr へ settings からレンダした警告文を出す。終了コードは
     # 0 のまま (人間裁定で承認は成立している)。
     def _warn(label: str, detail: str) -> None:
+        # [profitability-floor] codex 2 周目レビュー CR1/CR3 (2026-09-13):
+        # 条件節は共有 helper `strategy_gate.floor_rule_text` から得る。
+        # audience="human" — `require_holdout_evaluable=True` のとき
+        # holdout 条件も文言に含める (CR1: 人間は遮断 8 の対象外)。
         g = settings.improve.gate
-        avg_r_clause = (
-            f" または avg_r <= 0" if g.require_positive_avg_r else "")
+        condition = strategy_gate.floor_rule_text(g, audience="human")
         print(
-            f"警告: この候補は収益性フロア (pf < {g.min_pf}{avg_r_clause}) "
+            f"警告: この候補は収益性フロア ({condition}) "
             "を満たしません。人間裁定で承認申請を作成しました。詳細は "
             "`afx> approval <id>`", file=sys.stderr)
 

@@ -49,6 +49,7 @@ from agentic_fx.plugin.strategy_gate import (
     _check_profitability_floor,
     _eval_timeframe as _strategy_gate_eval_timeframe,
     evaluate_strategy_adoption_gate,
+    floor_rule_text as _strategy_gate_floor_rule_text,
 )
 from agentic_fx.runners.base import Mission
 from agentic_fx.tools.plugin_loader import approved_plugins
@@ -709,12 +710,16 @@ class ImproveLoop:
         組み立てる。`.format()` は条件分岐できないため、文そのものを
         ここで組み立ててプレースホルダへ渡す —
         `require_positive_avg_r=False` のときは avg_r の条件を文から
-        省く (ハードコードした固定文言にしない)。"""
+        省く (ハードコードした固定文言にしない)。
+
+        codex 2 周目レビュー CR3/CR1 (2026-09-13): 条件節の組み立て
+        自体は共有 helper `strategy_gate.floor_rule_text` に委譲する
+        (CLI・`switch._run_full_gate` と同じ実装を通す)。
+        `audience="agent"` を渡すため、`require_holdout_evaluable` は
+        **この文言に一切現れない** (遮断 8、設計書 §4 のただし書き —
+        holdout の閾値・条件を agent に見せない)。"""
         g = self._settings.improve.gate
-        if g.require_positive_avg_r:
-            condition = f"`pf < {g.min_pf}` または `avg_r <= 0`"
-        else:
-            condition = f"`pf < {g.min_pf}`"
+        condition = _strategy_gate_floor_rule_text(g, audience="agent")
         return (
             f"**{condition} の候補は提出しても承認申請になりません**"
             "(親の決定論ゲートが `unprofitable` として observation に"
@@ -1407,12 +1412,8 @@ class ImproveLoop:
             # [profitability-floor] T1 Step 1-8 (2026-09-13、codex I3):
             # 適用した閾値 snapshot (approval 行を作る 3 箇所すべてに載せる
             # — switch.submit_candidate / switch.bless_candidate / ここ)。
-            "profitability_floor": {
-                "min_pf": self._settings.improve.gate.min_pf,
-                "require_positive_avg_r":
-                    self._settings.improve.gate.require_positive_avg_r,
-                "require_holdout_evaluable":
-                    self._settings.improve.gate.require_holdout_evaluable},
+            # CR4 (2026-09-13): `ImproveGateSettings.snapshot()` に一本化。
+            "profitability_floor": self._settings.improve.gate.snapshot(),
         }
 
     def _check_duplicate_metrics(self, conn, *, content_hash, pair, variant,

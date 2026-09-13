@@ -130,7 +130,21 @@ def _validate_strategy(conn: sqlite3.Connection, meta: PluginMeta, *,
     strategy 分岐は **`submit_plugin` 経由では到達不能** — 直接呼び出し
     (テスト) からのみ到達する。削除はしない (tests が直接使う)。
     この分岐にフロアは足さない (v1 の「legacy corridor に in_sample 段
-    だけ足す」は C1 により撤回済み)。"""
+    だけ足す」は C1 により撤回済み)。
+
+    [profitability-floor] codex 2 周目レビュー CR2 (2026-09-13、
+    追加是正・既知の限界の明記): **この関数自体は収益性フロアを一切
+    実装していない** (`_check_profitability_floor` を呼ばない) —
+    フロアからの保護は `submit_plugin` 冒頭の `kind == "strategy"`
+    チェック 1 点だけに依存する構造的な弱さがある (この関数の性質では
+    なく呼び出し元の 1 箇所のガードだけが守っている、という事実)。
+    将来、`_validate_kind`/`_validate_strategy` を strategy candidate に
+    対して直接呼ぶ新しい経路 (`submit_plugin` を経由しない) ができれば、
+    その経路はフロアを黙って迂回する。**正しい経路は常に共有ゲート
+    (`switch.submit_candidate`/`bless_candidate` → `run_kind_gate` →
+    `evaluate_strategy_adoption_gate`) を通ること** — 起票済み
+    [legacy-submit-corridor-bypasses-gate] の対象 (本束では対応しない、
+    構造的な保護への転換は別途検討)。"""
     invalid_pairs = [p for p in meta.pairs if p not in settings.pairs]
     if invalid_pairs:
         raise ValueError(
@@ -196,11 +210,19 @@ class GateOutcome:
     metrics: dict
     evaluable: bool
     verdict_kind: Literal["ok", "insufficient_trades", "floor"] = "ok"
-    floor_failed: bool = False  # verdict_kind == "floor" と同値 (読みやすさのため併置)
+    # [profitability-floor] codex 2 周目レビュー CR6 (2026-09-13):
+    # `floor_failed` フィールドは削除した (`verdict_kind == "floor"` と
+    # 完全な同値で、生産コードのどこからも読まれず — `switch.py::
+    # _run_full_gate` の分岐は全て `verdict_kind` を見る — 2 つの
+    # `GateOutcome(...)` 構築箇所の片方だけ更新されて食い違っても
+    # 検出する読者が居なかった)。判別子は `verdict_kind` に一本化する。
     floor_warning: str = ""  # "" | "unprofitable"
     floor_detail: str = ""  # 人間向け全数値 (payload/表示用)
     insufficient_trades_reason: str = ""  # "insufficient_trades:<n>"
-    gate_rows: tuple[dict, ...] = field(default_factory=tuple)  # T1-f の非コミット sink
+    # T1-f の非コミット sink。CR7 (2026-09-13): 呼び出し元が `run_kind_gate`
+    # に `sink=` を渡した場合はその**同じ list オブジェクト**になる
+    # (`is` で同一性が成立する) — 既定は空 tuple。
+    gate_rows: "tuple[dict, ...] | list[dict]" = field(default_factory=tuple)
 
 
 # precheck 2026-08-22 wave2: T11-B-11d
@@ -210,6 +232,7 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
                   run_in_sample_fn: RunInSampleFn | None = None,
                   floor_mode: Literal["enforce", "warn"] = "enforce",
                   record_fn: "Callable[[dict], None] | None" = None,
+                  sink: "list[dict] | None" = None,
                   ) -> GateOutcome:
     """`switch.py` の `submit_candidate`/`bless_candidate` (`_run_full_gate`
     手順 7) から共有呼び出しされる kind 別検証の入口。indicator/signal は
@@ -242,9 +265,23 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
     gate` の `run_in_sample_fn` 引数へは転送しない (シグネチャの
     `run_in_sample_fn` 仮引数は `_validate_kind` 経由の indicator/signal/
     非-strategy 呼び出しとの互換のためだけに残す)。
+
+    [profitability-floor] codex 2 周目レビュー CR7 (2026-09-13):
+    `sink` は呼び出し元が既に持っている `list[dict]` をそのまま行の
+    蓄積先として使わせるための引数 — 渡せば `GateOutcome.gate_rows` は
+    **その同じ list オブジェクト** (`is` で同一性が成立する) になる。
+    以前は `_run_full_gate` (switch.py) が自分の `rows` list を
+    `record_fn=rows.append` で渡し、この関数がさらに**別の** `rows`
+    list を作って両方に積んでいた — 例外/insufficient_trades/floor 分岐
+    でしか読まれない `_run_full_gate` 側の list が、成功経路では二重に
+    確保・充填されるだけで一切使われずに捨てられていた (無駄な allocation
+    + 2 つの「正」の list が存在する紛らわしさ)。`sink` を渡せば
+    `_run_full_gate` は自分の list だけを唯一の正として持てる。
+    `record_fn` は引き続き「行 1 件ごとのコールバック通知」用に残す
+    (list を持たず単に転送を挟みたい呼び出し元向け、`sink` とは独立)。
     """
     if meta.kind == "strategy":
-        rows: list[dict] = []
+        rows: list[dict] = sink if sink is not None else []
 
         def _sink(row: dict) -> None:
             rows.append(row)
@@ -261,20 +298,21 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
             return GateOutcome(
                 metrics={}, evaluable=False,
                 verdict_kind="insufficient_trades",
-                insufficient_trades_reason=reason, gate_rows=tuple(rows))
+                insufficient_trades_reason=reason, gate_rows=rows)
         if verdict.floor_reason:
             return GateOutcome(
                 metrics=verdict.candidate_metrics or {}, evaluable=True,
-                verdict_kind="floor", floor_failed=True,
+                verdict_kind="floor",
                 floor_warning=verdict.floor_reason,
-                floor_detail=verdict.floor_detail, gate_rows=tuple(rows))
+                floor_detail=verdict.floor_detail, gate_rows=rows)
         return GateOutcome(
             metrics=verdict.candidate_metrics or {}, evaluable=verdict.evaluable,
-            verdict_kind="ok", gate_rows=tuple(rows))
+            verdict_kind="ok", gate_rows=rows)
     metrics, evaluable = _validate_kind(
         conn, meta, settings=settings, now=now, sandbox_run=sandbox_run,
         run_in_sample_fn=run_in_sample_fn)
-    return GateOutcome(metrics=metrics, evaluable=evaluable, verdict_kind="ok")
+    return GateOutcome(metrics=metrics, evaluable=evaluable, verdict_kind="ok",
+                       gate_rows=sink if sink is not None else [])
 
 
 def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,

@@ -235,6 +235,22 @@ class ImproveGateSettings(_Strict):
     require_positive_avg_r: bool = True
     require_holdout_evaluable: bool = False
 
+    def snapshot(self) -> dict:
+        """[profitability-floor] codex 2 周目レビュー CR4 (2026-09-13):
+        approval payload の `profitability_floor` snapshot を作る唯一の
+        場所。以前は `switch.py::submit_candidate`/`bless_candidate` /
+        `loops/improve_loop.py::_build_approval_payload` の 3 箇所が
+        この 3 キー dict を手書きで複製しており、閾値フィールドを
+        追加するたびに 3 箇所を手で揃える必要があった (1 箇所を忘れると
+        approval payload の snapshot が実際に適用されたゲートと
+        サイレントに食い違う — 本機能が防ぎたい監査ログの欠陥そのもの)。
+        """
+        return {
+            "min_pf": self.min_pf,
+            "require_positive_avg_r": self.require_positive_avg_r,
+            "require_holdout_evaluable": self.require_holdout_evaluable,
+        }
+
 
 class ImproveToolBudgetSettings(_Strict):
     self_test_warn_after: int = Field(ge=1, default=3)

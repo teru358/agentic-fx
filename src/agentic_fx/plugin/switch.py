@@ -736,6 +736,24 @@ def _plugin_lock(plugins_root: Path, name: str):
         fh.close()
 
 
+def _write_gate_rows(conn: sqlite3.Connection, rows, *,
+                     mission_outcome: str) -> None:
+    """[profitability-floor] codex 2 周目レビュー CR5 (2026-09-13):
+    `outcome.gate_rows` を `backtest_runs` へ書く生ループを 1 箇所に
+    集約する。**tx 管理は呼び出し元の責務** (このループ自体は
+    `BEGIN`/`COMMIT` に触れない) — 既に開いている tx の中で呼ぶ場合
+    (成功パス、`submit_candidate`/`bless_candidate` 2 分岐) と、専用の
+    短い tx を新設する場合 (`_persist_human_gate_rows`、失敗パス) の
+    両方から共有する。以前はこの `for row in rows: save_harness_run(...)`
+    が 3 箇所 (成功パス 1 + bless の 2 分岐) に手書きでコピーされて
+    おり、将来の変更 (activity 追加・mission_outcome の意味変更等) を
+    3 箇所そろえて直す必要があった。"""
+    for row in rows:
+        backtest_runs_store.save_harness_run(
+            conn, commit=False, mission_id=None,
+            mission_outcome=mission_outcome, **row)
+
+
 def _persist_human_gate_rows(conn: sqlite3.Connection, rows: list[dict], *,
                              mission_outcome: str, now: datetime) -> None:
     """[profitability-floor] T1 Step 1-6 (2026-09-13、設計書 §3 T1-f):
@@ -751,10 +769,7 @@ def _persist_human_gate_rows(conn: sqlite3.Connection, rows: list[dict], *,
         return
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for row in rows:
-            backtest_runs_store.save_harness_run(
-                conn, commit=False, mission_id=None,
-                mission_outcome=mission_outcome, **row)
+        _write_gate_rows(conn, rows, mission_outcome=mission_outcome)
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -817,7 +832,10 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
 
         outcome = approval.run_kind_gate(  # 手順 7
             conn, meta, settings=settings, now=now, floor_mode=floor_mode,
-            record_fn=rows.append)
+            sink=rows)
+        # CR7 (2026-09-13): `sink=rows` を渡したので `outcome.gate_rows`
+        # は `rows` と同一オブジェクト — 二重の list を作らない。
+        assert outcome.gate_rows is rows
     except SandboxError as exc:
         _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
         raise ValueError(f"plugin {name!r}: {exc}") from exc
@@ -836,6 +854,14 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
     if outcome.verdict_kind == "floor" and floor_mode == "enforce":
         _persist_human_gate_rows(conn, rows, mission_outcome="unprofitable", now=now)
         g = settings.improve.gate
+        # [profitability-floor] codex 2 周目レビュー CR1/CR3 (2026-09-13):
+        # `strategy_gate.floor_rule_text(audience="human")` を使う —
+        # `require_holdout_evaluable=True` のとき holdout 条件も条件節に
+        # 含める (CR1、人間向けは遮断 8 の対象外)。既存の key=value 形式
+        # (`min_pf=`/`require_positive_avg_r=`/`require_holdout_evaluable=`)
+        # は既存 pin (F6-11a) が厳密一致で読むため残し、条件節を前段に
+        # 追加する形にする。
+        condition = strategy_gate.floor_rule_text(g, audience="human")
         # [profitability-floor] T1 Step 1-7/T1-g (2026-09-13、codex R2-I2):
         # `submit_candidate` のフロア不合格 activity 行はここで書く —
         # bless は常に floor_mode="warn" でこの分岐に到達しないため、
@@ -843,11 +869,13 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         if activity is not None:
             activity.write(
                 Category.APPROVAL, "submit_floor_rejected",
-                f"name={name} unprofitable min_pf={g.min_pf} "
+                f"name={name} unprofitable ({condition}) "
+                f"min_pf={g.min_pf} "
                 f"require_positive_avg_r={g.require_positive_avg_r} "
                 f"require_holdout_evaluable={g.require_holdout_evaluable}")
         raise ValueError(
-            f"plugin {name!r}: unprofitable (min_pf={g.min_pf} "
+            f"plugin {name!r}: unprofitable ({condition}) "
+            f"(min_pf={g.min_pf} "
             f"require_positive_avg_r={g.require_positive_avg_r} "
             f"require_holdout_evaluable={g.require_holdout_evaluable})")
 
@@ -911,11 +939,9 @@ def submit_candidate(
             "live_source": settings.plugin.producer_source,
             "mission_id": mission_id, "backlog_id": backlog_id,
             # [profitability-floor] T1 Step 1-8 (codex I3): 適用した閾値
-            # snapshot (approval 行を作る 3 箇所すべてに載せる)。
-            "profitability_floor": {
-                "min_pf": g.min_pf,
-                "require_positive_avg_r": g.require_positive_avg_r,
-                "require_holdout_evaluable": g.require_holdout_evaluable},
+            # snapshot (approval 行を作る 3 箇所すべてに載せる)。CR4
+            # (2026-09-13): `ImproveGateSettings.snapshot()` に一本化。
+            "profitability_floor": g.snapshot(),
         }
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -926,10 +952,7 @@ def submit_candidate(
             # 即時 commit が無効化された) を承認と同じ tx で保存する —
             # ここに保存しないと strategy 候補の in_sample/holdout 実測が
             # backtest_runs に一切残らなくなる (auto-commit の代替)。
-            for row in outcome.gate_rows:
-                backtest_runs_store.save_harness_run(
-                    conn, commit=False, mission_id=None,
-                    mission_outcome="approval", **row)
+            _write_gate_rows(conn, outcome.gate_rows, mission_outcome="approval")
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -1608,10 +1631,7 @@ def bless_candidate(
             "mission_id": None, "backlog_id": None,
             "floor_warning": outcome.floor_warning,
             "floor_detail": outcome.floor_detail,
-            "profitability_floor": {
-                "min_pf": g.min_pf,
-                "require_positive_avg_r": g.require_positive_avg_r,
-                "require_holdout_evaluable": g.require_holdout_evaluable},
+            "profitability_floor": g.snapshot(),
         }
 
         if old_kind == "plain":
@@ -1620,10 +1640,7 @@ def bless_candidate(
             try:
                 approval_id = approvals_store.create(
                     conn, kind="plugin", payload=payload, now=now, commit=False)
-                for row in outcome.gate_rows:
-                    backtest_runs_store.save_harness_run(
-                        conn, commit=False, mission_id=None,
-                        mission_outcome="approval", **row)
+                _write_gate_rows(conn, outcome.gate_rows, mission_outcome="approval")
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -1650,10 +1667,7 @@ def bless_candidate(
         try:
             approval_id = approvals_store.create(
                 conn, kind="plugin", payload=payload, now=now, commit=False)
-            for row in outcome.gate_rows:
-                backtest_runs_store.save_harness_run(
-                    conn, commit=False, mission_id=None,
-                    mission_outcome="approval", **row)
+            _write_gate_rows(conn, outcome.gate_rows, mission_outcome="approval")
             op_id = begin_switch_journal(
                 conn, kind="bless", approval_id=approval_id, name=name,
                 old_kind=old_kind, old_target=old_target, new_target=new_target,

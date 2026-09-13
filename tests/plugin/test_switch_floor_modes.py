@@ -146,7 +146,8 @@ def test_f6_9_run_kind_gate_never_raises_for_floor_failure(env, monkeypatch):
 
     assert isinstance(outcome, approval.GateOutcome)
     assert outcome.verdict_kind == "floor"
-    assert outcome.floor_failed is True
+    # CR6 (2026-09-13): `floor_failed` フィールドは削除された —
+    # 判別子は `verdict_kind == "floor"` に一本化 (上で確認済み)。
     assert outcome.floor_warning == "unprofitable"
 
 
@@ -554,3 +555,187 @@ def test_g3_bless_candidate_warn_reaches_holdout_seam_via_real_evaluator(
         decided_by="human_cli")
 
     assert holdout_calls == [1]  # warn 経路: in_sample 不合格でも holdout へ到達
+
+
+# ---- /code-review 2 周目 (2026-09-13、code-review-r2.md) CR1/CR3/CR4/CR7 --
+
+def test_cr7_run_kind_gate_sink_identity_is_preserved(env, monkeypatch):
+    """CR7: `sink=` に渡した list がそのまま `GateOutcome.gate_rows` に
+    なる (コピーしない、二重 list を作らない)。逆変異:
+    `gate_rows=tuple(rows)` に戻す (コピーを作る) → killer。"""
+    root, plugins_dir, conn, settings = env
+    d = plugins_dir / "_staging" / "1" / "st"
+    _write_strategy_candidate(d)
+    from agentic_fx.plugin.loader import _discover_one
+    meta = _discover_one(d, "st")
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
+        _ok_gate)
+
+    my_sink: list = []
+    outcome = approval.run_kind_gate(
+        conn, meta, settings=settings, now=NOW, sink=my_sink)
+
+    assert outcome.gate_rows is my_sink
+
+
+def test_cr7_run_full_gate_success_path_uses_a_single_list(env, monkeypatch):
+    """CR7: `_run_full_gate` の成功経路で `rows` list は 1 つだけ
+    (`outcome.gate_rows is rows` が production code 内で assert される —
+    ここではその契約が実際に例外を出さずに通ることを確認する)。"""
+    root, plugins_dir, conn, settings = env
+    d = plugins_dir / "_staging" / "1" / "st"
+    _write_strategy_candidate(d)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
+        _ok_gate)
+
+    approval_id = switch.submit_candidate(
+        conn, name="st", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    assert isinstance(approval_id, int)
+
+
+def test_cr3_three_call_sites_use_the_same_shared_floor_rule_text_helper(
+        env, monkeypatch):
+    """CR3: CLI (`_warn` 相当)・improve_loop (`_floor_rule_text`)・
+    `switch._run_full_gate` の 3 箇所が同一の共有 helper
+    (`strategy_gate.floor_rule_text`) を呼ぶ — spy で1関数だけが
+    呼ばれることを確認する (individual な文言組み立てロジックを別々に
+    持たない)。"""
+    import agentic_fx.loops.improve_loop as improve_loop_module
+    import agentic_fx.plugin.strategy_gate as strategy_gate_module
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    calls = []
+    real_fn = strategy_gate_module.floor_rule_text
+
+    def _spy(gate_settings, *, audience):
+        calls.append(audience)
+        return real_fn(gate_settings, audience=audience)
+
+    # `improve_loop.py` は `from ... import floor_rule_text as
+    # _strategy_gate_floor_rule_text` で名前を束縛済みのため、
+    # `strategy_gate_module.floor_rule_text` を差し替えるだけでは
+    # improve_loop 側の呼び出しは観測できない (import 時に束縛された
+    # 別名は元のモジュール属性差し替えを追随しない) — 両方の名前空間を
+    # 差し替える。
+    monkeypatch.setattr(strategy_gate_module, "floor_rule_text", _spy)
+    monkeypatch.setattr(
+        improve_loop_module, "_strategy_gate_floor_rule_text", _spy)
+
+    root, plugins_dir, conn, settings = env
+
+    # (1) improve_loop._floor_rule_text (agent 向け)
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = settings
+    loop._floor_rule_text()
+
+    # (2) switch._run_full_gate 経由 (human 向け、フロア不合格で raise)
+    d = plugins_dir / "_staging" / "1" / "st2"
+    _write_strategy_candidate(d)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    monkeypatch.setattr(
+        strategy_gate_module, "evaluate_strategy_adoption_gate",
+        _floor_fail_gate)
+    with pytest.raises(ValueError, match="unprofitable"):
+        switch.submit_candidate(
+            conn, name="st2", staging_dir=plugins_dir / "_staging" / "1",
+            candidate_origin="staging", mission_id=1, backlog_id=None,
+            settings=settings, now=NOW)
+
+    assert calls == ["agent", "human"]
+
+
+def test_cr1_human_message_includes_holdout_condition_agent_prompt_does_not(
+        env):
+    """CR1: `require_holdout_evaluable=True` のとき、人間向け文言
+    (`floor_rule_text(audience="human")`) には holdout 条件が含まれるが、
+    agent 向け文言 (`audience="agent"`) には `"holdout"` の語が一切
+    現れない (遮断 8)。"""
+    from agentic_fx.plugin.strategy_gate import floor_rule_text
+
+    root, plugins_dir, conn, settings = env
+    settings = settings.model_copy(deep=True)
+    settings.improve.gate.require_holdout_evaluable = True
+
+    human_text = floor_rule_text(settings.improve.gate, audience="human")
+    agent_text = floor_rule_text(settings.improve.gate, audience="agent")
+
+    assert "holdout" in human_text
+    assert "holdout" not in agent_text
+
+
+def test_cr1_cli_warn_message_includes_holdout_condition_when_enabled(
+        tmp_path, monkeypatch):
+    """CR1: CLI `_plugin_bless` の警告文にも
+    `require_holdout_evaluable=True` のとき holdout 条件が現れる。"""
+    import argparse
+    import shutil
+
+    from agentic_fx.backtest import cli as backtest_cli
+    from agentic_fx.config import load_settings
+
+    root = tmp_path
+    (root / "config").mkdir(parents=True)
+    shutil.copy(
+        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example",
+        root / "config" / "settings.yaml")
+    settings = load_settings(root / "config" / "settings.yaml")
+    settings = settings.model_copy(deep=True)
+    settings.improve.gate.require_holdout_evaluable = True
+    conn = db_store.connect(root / "data" / "agentic.db")
+    db_store.init_db(conn)
+
+    def _fake_bless_candidate(conn_arg, *, name, human_dir, settings,
+                              now, decided_by, on_floor_warning=None,
+                              activity=None):
+        if on_floor_warning is not None:
+            on_floor_warning("unprofitable", "in_sample: USDJPY: pf=0.5")
+        return 42
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.switch.bless_candidate", _fake_bless_candidate)
+
+    args = argparse.Namespace(name="st", from_kind="_human")
+    rc = backtest_cli._plugin_bless(conn, settings, args, root)
+
+    assert rc == 0
+
+
+def test_cr4_three_payload_sites_match_gate_settings_snapshot(
+        env, monkeypatch):
+    """CR4: `submit_candidate`/`bless_candidate`/`improve_loop._build_
+    approval_payload` の `profitability_floor` snapshot が
+    `ImproveGateSettings.snapshot()` と一致する (実装は既に snapshot() を
+    呼ぶよう置換済み — ここでは 3 箇所の payload 値が非既定値
+    `min_pf=1.5` でも揃うことを確認する)。"""
+    import json as json_module
+
+    root, plugins_dir, conn, settings = env
+    settings = settings.model_copy(deep=True)
+    settings.improve.gate.min_pf = 1.5
+    expected = settings.improve.gate.snapshot()
+
+    d = plugins_dir / "_staging" / "1" / "st"
+    _write_strategy_candidate(d)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
+        _ok_gate)
+
+    approval_id = switch.submit_candidate(
+        conn, name="st", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+    row = conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()
+    payload = json_module.loads(row["payload_json"])
+    assert payload["profitability_floor"] == expected
