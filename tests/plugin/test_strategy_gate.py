@@ -656,14 +656,12 @@ def test_f9_1_evaluator_calls_shared_floor_helper_for_both_stages(
     assert calls[0][1]["USDJPY"]["avg_r"] == 0.1
 
 
-def test_f9_2_helper_is_the_single_shared_implementation_not_duplicated(
+def test_f9_2_in_sample_stage_helper_is_shared_not_duplicated(
         monkeypatch, conn):
-    """F9-2: 段0変異「helper を呼ばず同等ロジックをインラインで複製する」を
-    検出する — `_check_profitability_floor` を丸ごと差し替えると
-    (実装をインラインコピーしたのと同じ効果)、evaluator の判定結果が
-    その差し替え後の関数の戻り値と完全に一致する (= 呼び出しを経由して
-    いる証拠)。差し替え関数の戻り値をわざと逆にして、実際に呼ばれて
-    いることを確認する。"""
+    """F9-2 (in_sample 段): 段0変異「helper を呼ばず同等ロジックを
+    インラインで複製する」を検出する — `_check_profitability_floor` を
+    丸ごと差し替えると、evaluator の判定結果がその差し替え後の関数の
+    戻り値と完全に一致する (= 呼び出しを経由している証拠)。"""
     import agentic_fx.plugin.strategy_gate as strategy_gate_module
 
     _fake_intent_source(monkeypatch)
@@ -685,3 +683,47 @@ def test_f9_2_helper_is_the_single_shared_implementation_not_duplicated(
     # ままになる — 呼ばれていれば FAIL に反転する。
     assert verdict.floor_reason == "unprofitable"
     assert verdict.floor_detail == "forced-by-spy"
+
+
+def test_f9_2_holdout_stage_helper_is_shared_not_duplicated(
+        monkeypatch, conn):
+    """F9-2 (holdout 段、2026-09-13 段0 是正 G2): 上の in_sample 版は
+    `floor_mode="enforce"` の既定で in_sample 段で即 return するため、
+    holdout 段が実際に共有 helper を呼んでいるかを検証できていなかった
+    (段0 独立変異 M6 — holdout 段だけを振る舞い等価にインライン複製した
+    変異が生存し、F9-1 の呼び出し順 spy だけが偶然拾っていた。F9-2 の
+    docstring は「複製を検出する」と主張しながら実際の保証範囲は
+    in_sample 段だけだった)。ここでは in_sample を **実際に PASS** させ
+    holdout 段まで進めた上で、`scope` ごとに異なる判定を返す spy に
+    差し替え、holdout 段の判定結果が spy の戻り値と一致することを
+    確認する — holdout 側の呼び出しがインライン複製されていれば、この
+    差し替えは効かず PASS のままになる。"""
+    import agentic_fx.plugin.strategy_gate as strategy_gate_module
+
+    _fake_intent_source(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.1))
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.1,
+                                  evaluable=True))  # 実 metrics 的には PASS のはず
+
+    def _pass_in_sample_fail_holdout(per_pair, *, settings, scope):
+        if scope == "in_sample":
+            return "", ""
+        return "unprofitable", "forced-by-holdout-spy"
+
+    monkeypatch.setattr(
+        strategy_gate_module, "_check_profitability_floor",
+        _pass_in_sample_fail_holdout)
+
+    verdict = evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        content_hash="h15", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", content_hash="h15"))
+    # holdout 段の呼び出しがインライン複製されていれば、run_holdout_gate
+    # の実 metrics (本来 PASS) がそのまま判定に使われ PASS のままになる —
+    # 共有 spy を経由していれば FAIL に反転する。
+    assert verdict.floor_reason == "unprofitable"
+    assert verdict.floor_detail == "forced-by-holdout-spy"

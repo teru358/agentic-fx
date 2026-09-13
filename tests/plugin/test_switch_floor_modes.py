@@ -442,3 +442,115 @@ def test_f6_4_cli_plugin_bless_floor_warning_exits_zero_and_warns_stderr(
     assert "警告" in captured.err
     assert "収益性フロア" in captured.err
     assert "approval <id>" in captured.err
+
+
+# ---- 段0 是正 G3 (2026-09-13、指揮者独立変異 M8): run_kind_gate → -----
+# evaluator の floor_mode 転送の pin (M8 は広域 1924 passed で生存していた)
+
+def test_g3_run_kind_gate_forwards_floor_mode_warn_to_evaluator(env, monkeypatch):
+    """(a) `run_kind_gate(..., floor_mode="warn")` を呼ぶと、
+    `evaluate_strategy_adoption_gate` に `floor_mode="warn"` が実際に
+    届く。逆変異: `run_kind_gate` から `floor_mode=floor_mode` の転送を
+    外す → killer。"""
+    root, plugins_dir, conn, settings = env
+    d = plugins_dir / "_staging" / "1" / "st"
+    _write_strategy_candidate(d)
+    from agentic_fx.plugin.loader import _discover_one
+    meta = _discover_one(d, "st")
+
+    seen_floor_modes = []
+
+    def _spy(conn_arg, *, meta, settings, now, floor_mode="enforce",
+            record_fn=None):
+        seen_floor_modes.append(floor_mode)
+        return StrategyGateVerdict(
+            evaluable=True, baseline_variant="no_strategy",
+            baseline_row={"plugin_ref": f"no_strategy:{meta.name}",
+                         "variant": "no_strategy"},
+            candidate_metrics={"USDJPY": {"trades": 40, "pf": 1.5,
+                                          "avg_r": 0.1, "evaluable": True}})
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
+        _spy)
+
+    approval.run_kind_gate(conn, meta, settings=settings, now=NOW,
+                           floor_mode="warn")
+
+    assert seen_floor_modes == ["warn"]
+
+
+def test_g3_run_kind_gate_default_floor_mode_is_enforce(env, monkeypatch):
+    """(b) `floor_mode` を明示しない既定呼び出しでは `"enforce"` が届く。"""
+    root, plugins_dir, conn, settings = env
+    d = plugins_dir / "_staging" / "1" / "st"
+    _write_strategy_candidate(d)
+    from agentic_fx.plugin.loader import _discover_one
+    meta = _discover_one(d, "st")
+
+    seen_floor_modes = []
+
+    def _spy(conn_arg, *, meta, settings, now, floor_mode="enforce",
+            record_fn=None):
+        seen_floor_modes.append(floor_mode)
+        return StrategyGateVerdict(
+            evaluable=True, baseline_variant="no_strategy",
+            baseline_row={"plugin_ref": f"no_strategy:{meta.name}",
+                         "variant": "no_strategy"},
+            candidate_metrics={"USDJPY": {"trades": 40, "pf": 1.5,
+                                          "avg_r": 0.1, "evaluable": True}})
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
+        _spy)
+
+    approval.run_kind_gate(conn, meta, settings=settings, now=NOW)
+
+    assert seen_floor_modes == ["enforce"]
+
+
+def test_g3_bless_candidate_warn_reaches_holdout_seam_via_real_evaluator(
+        env, monkeypatch):
+    """(c) codex C2 の保証を switch 層から通しで確認する:
+    `evaluate_strategy_adoption_gate` は fake せず (実 evaluator を通す)、
+    `holdout.run_in_sample`/`holdout.run_holdout_gate` の seam だけを
+    fake する。in_sample 段がフロア不合格でも、`bless_candidate` の
+    `floor_mode="warn"` により `run_holdout_gate` seam に実際に到達する
+    (= run_kind_gate → evaluator への floor_mode 転送が生きている証拠)。
+    逆変異: `run_kind_gate` の `floor_mode=floor_mode` 転送を外す →
+    evaluator は既定 `enforce` になり in_sample で短絡、
+    `run_holdout_gate` seam に到達しなくなる → killer。"""
+    root, plugins_dir, conn, settings = env
+    d = plugins_dir / "_human" / "st"
+    _write_strategy_candidate(d)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.strategy_adapter.build_intent_source",
+        lambda meta, **kw: type("Fake", (), {"close": lambda self: None})())
+
+    holdout_calls = []
+
+    def _fake_run_in_sample(*a, record_fn=None, **kw):
+        return {"trades": 40, "pf": 0.3, "avg_r": -0.2, "win_rate": 0.4,
+                "max_drawdown": 0.1, "total_pnl": -50.0, "evaluable": True,
+                "fallback_spread_used": False}
+
+    def _fake_run_holdout_gate(*a, record_fn=None, **kw):
+        holdout_calls.append(1)
+        return {"trades": 40, "pf": 1.5, "avg_r": 0.1, "win_rate": 0.5,
+                "max_drawdown": 0.05, "total_pnl": 100.0, "evaluable": True,
+                "fallback_spread_used": False}
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        _fake_run_in_sample)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        _fake_run_holdout_gate)
+
+    switch.bless_candidate(
+        conn, name="st", human_dir=d, settings=settings, now=NOW,
+        decided_by="human_cli")
+
+    assert holdout_calls == [1]  # warn 経路: in_sample 不合格でも holdout へ到達

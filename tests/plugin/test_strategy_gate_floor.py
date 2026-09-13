@@ -86,9 +86,21 @@ def test_f1_max_drawdown_and_kill_switch_latches_not_in_metrics_dict_still_passe
 
 def test_f2_4_holdout_not_evaluable_passes_by_default():
     """既定 `require_holdout_evaluable=False`: 標本不足は「悪いとは
-    言わない」(R8) — evaluable=False でも通す。"""
+    言わない」(R8) — evaluable=False でも通す。
+
+    段0 是正 (2026-09-13、指揮者独立変異 G1): 元の fixture は
+    `pf=None, avg_r=None` だったため、③ (R8 免除) を削除する変異でも
+    ④ の `pf is not None`/`avg_r is not None` ガードに吸収されて
+    すり抜けてしまい (M3 で実測: SURVIVED — designated pin が空振り)、
+    R8 免除そのものを検証していなかった (F1-3 の pf/avg_r=None PASS と
+    実質重複)。承認 #10 の holdout 実測形状
+    (`trades=7, pf=0.5, avg_r=-0.1, evaluable=False`) に差し替える —
+    この値は ④ の判定に通せば本来 FAIL する組み合わせであり、③ が
+    なければ確実に `unprofitable` に反転する (メモリ
+    `test-fixtures-from-real-transcripts`: 手書きの偽形状は緑のまま
+    本番全滅)。"""
     label, _ = _check_profitability_floor(
-        {"USDJPY": _m(7, None, None, evaluable=False)},
+        {"USDJPY": _m(7, 0.5, -0.1, evaluable=False)},
         settings=SETTINGS, scope="holdout")
     assert label == ""
 
