@@ -254,6 +254,68 @@ def test_backlog_note_rejects_selected_row(tmp_path):
     assert conn.execute("SELECT status FROM improvement_backlog WHERE id=5").fetchone()[0] == "selected"
 
 
+# ---------------------------------------------------------------------------
+# [unprofitable-note-hygiene] 設計書 v2.0 §2-7 / §4 N10 (code-review #2):
+# 人間コマンド (`backlog note`/`reopen`/`reject`) は origin_mission_id/
+# origin_outcome (系譜) を一切触らない。`backlog.set_status` の UPDATE は
+# status/last_result/updated_at のみを書くため、専用列方式では構造的に
+# 干渉しないはずだが、それを実測で pin する (逆変異: UPDATE 文に
+# `origin_outcome=NULL` などを混ぜると red)。
+# ---------------------------------------------------------------------------
+
+def _insert_annotated_row(conn, *, id_, status, mission_id=7):
+    conn.execute(
+        "INSERT INTO improvement_backlog "
+        "(id, idea, source, status, created_at, updated_at, idea_norm, "
+        "origin_mission_id, origin_outcome) "
+        "VALUES (?, ?, 'agent', ?, ?, ?, ?, ?, 'unprofitable')",
+        (id_, f"annotated idea {id_}", status, NOW.isoformat(),
+         NOW.isoformat(), f"annotated idea {id_}", mission_id))
+    conn.commit()
+
+
+def test_n10_backlog_note_leaves_origin_columns_untouched(tmp_path):
+    conn, _, _, cmds = _commands(tmp_path)
+    _insert_annotated_row(conn, id_=11, status="open")
+
+    out = cmds.dispatch("backlog note 11")
+
+    assert "note" in out
+    row = conn.execute(
+        "SELECT origin_mission_id, origin_outcome FROM improvement_backlog "
+        "WHERE id=11").fetchone()
+    assert row["origin_mission_id"] == 7
+    assert row["origin_outcome"] == "unprofitable"
+
+
+def test_n10_backlog_reopen_leaves_origin_columns_untouched(tmp_path):
+    conn, _, _, cmds = _commands(tmp_path)
+    _insert_annotated_row(conn, id_=12, status="note")
+
+    out = cmds.dispatch("backlog reopen 12")
+
+    assert "open" in out
+    row = conn.execute(
+        "SELECT origin_mission_id, origin_outcome FROM improvement_backlog "
+        "WHERE id=12").fetchone()
+    assert row["origin_mission_id"] == 7
+    assert row["origin_outcome"] == "unprofitable"
+
+
+def test_n10_backlog_reject_leaves_origin_columns_untouched(tmp_path):
+    conn, _, _, cmds = _commands(tmp_path)
+    _insert_annotated_row(conn, id_=13, status="open")
+
+    out = cmds.dispatch("backlog reject 13")
+
+    assert "rejected" in out
+    row = conn.execute(
+        "SELECT origin_mission_id, origin_outcome FROM improvement_backlog "
+        "WHERE id=13").fetchone()
+    assert row["origin_mission_id"] == 7
+    assert row["origin_outcome"] == "unprofitable"
+
+
 def test_transcript_json_not_leaked(tmp_path):
     """Regression: transcript_json (sensitive) must not appear in dispatch output."""
     conn, _, _, cmds = _commands(tmp_path)

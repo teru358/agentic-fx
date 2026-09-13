@@ -186,12 +186,10 @@ class _InspectionVerdict:  # 新規命名
 class _SelectionOutcome:  # 新規命名
     won: bool
     backlog_id: int | None
-    # [unprofitable-note-hygiene] v1.0 §2-1: `_select_and_bind` がこの
-    # tx で実際に INSERT した backlog 行 id (note/task とも)。既存行の
-    # 再利用 (`existing`/`promoted`) は含まない。`commit()` がフロア
-    # 不合格 (`mission_outcome=="unprofitable"`) のときだけ
-    # `_finalize_gate_failed` へ渡し、機械注記の対象を絞る。
-    inserted_ids: tuple[int, ...] = ()
+    # [unprofitable-note-hygiene] 設計書 v2.0 §2 (専用列方式への作り直し):
+    # `inserted_ids` は撤回。起票時の系譜は INSERT 時点で
+    # `improvement_backlog.origin_mission_id` へ直接書く (`commit()` 側で
+    # 後から絞り込む必要がなくなった)。
 
 
 @dataclass(frozen=True)
@@ -653,11 +651,12 @@ class ImproveLoop:
                 f"{r.get('last_result')} |" for r in rows)
 
         def _backlog_table(items: list[dict]) -> str:
-            # [unprofitable-note-hygiene] v1.0 §2-3: `origin` 列。
-            # `last_result` が機械注記 `origin:unprofitable` の行だけ
-            # `unprofitable` を出す — 他行は空文字 (regression 防止:
-            # `last_result` そのものの値は表に出さない、遮断 8 の語彙が
-            # ここ経由で漏れない)。
+            # [unprofitable-note-hygiene] 設計書 v2.0 §2-3: `origin` 列。
+            # 専用列 `origin_outcome` が `'unprofitable'` の行だけ
+            # `unprofitable` を出す — 他行は空文字。`last_result` には
+            # 一切触れない (`origin_outcome` は他の書き手が触らない
+            # 専用列なので、判定は完全一致でも部分一致でもなく単純な
+            # 値比較で足りる)。
             if not items:
                 return "(バックログなし)"
             header = ("| id | idea | status | attempts | assigned | "
@@ -665,7 +664,7 @@ class ImproveLoop:
             return header + "\n".join(
                 f"| {i.get('id')} | {i.get('idea')} | {i.get('status')} | "
                 f"{i.get('attempts')} | {i.get('assigned', '')} | "
-                f"{'unprofitable' if i.get('last_result') == 'origin:unprofitable' else ''} |"
+                f"{'unprofitable' if i.get('origin_outcome') == 'unprofitable' else ''} |"
                 for i in items)
 
         def _dict_to_line(d: dict) -> str:
@@ -1202,30 +1201,27 @@ class ImproveLoop:
         return _InspectionVerdict(ok=True)
 
     def _upsert_backlog_idea(self, conn, idea: str, source: str, kind: str,
-                             now: datetime) -> tuple[int, str]:
-        """Insert, reuse, or promote one normalized backlog idea."""
+                             now: datetime, *,
+                             mission_id: int | None = None) -> tuple[int, str]:
+        """Insert, reuse, or promote one normalized backlog idea.
+
+        [unprofitable-note-hygiene] 設計書 v2.0 §3: v1.1 以前の挙動に
+        戻す (昇格は無条件 `promoted_from_note`。`last_result` の CAS 相当
+        分岐は撤回 — 系譜は専用列 `origin_mission_id`/`origin_outcome` が
+        持つため、この関数はもう `last_result` を読む必要がない)。
+        `mission_id` は新規 INSERT (`"inserted"`) のときだけ
+        `origin_mission_id` へ書く — 既存行の再利用 (`existing`/
+        `promoted`) は最初の起票者のまま変えない (§2-1)。"""
         idea_norm = idea.strip().lower()
         row = conn.execute(
-            "SELECT id,status,last_result FROM improvement_backlog "
+            "SELECT id,status FROM improvement_backlog "
             "WHERE idea_norm=? ORDER BY id LIMIT 1", (idea_norm,)).fetchone()
         if row is not None:
             if row["status"] == "note" and kind == "task":
-                # codex r2 Important 2 是正 (2026-09-13): 昇格だけでは
-                # まだ選択・終端されていない — `origin:unprofitable` が
-                # 付いた note をここで無条件に `promoted_from_note` で
-                # 上書きすると、実際にゲートへ通るまで警告が保持される
-                # という本束の目的 (設計書 §2/N8) に反して origin 列が
-                # 消える。`origin:unprofitable` のときだけ保持し、それ
-                # 以外は従来どおり `promoted_from_note` に置換する
-                # (実際の選択・終端時は N8 の既存上書き規律で勝つ)。
-                new_last_result = (
-                    "origin:unprofitable"
-                    if row["last_result"] == "origin:unprofitable"
-                    else "promoted_from_note")
                 conn.execute(
                     "UPDATE improvement_backlog SET status='open', "
-                    "last_result=?, updated_at=? WHERE id=?",
-                    (new_last_result, now.isoformat(), row["id"]))
+                    "last_result='promoted_from_note', updated_at=? WHERE id=?",
+                    (now.isoformat(), row["id"]))
                 if self._activity is not None:
                     self._activity.write(Category.IMPROVE, "backlog_promoted",
                                          f"#{row['id']} from note", str(row["id"]))
@@ -1234,9 +1230,10 @@ class ImproveLoop:
         status = "note" if kind == "fact" else "open"
         cur = conn.execute(
             "INSERT INTO improvement_backlog "
-            "(idea,source,status,created_at,updated_at,idea_norm) "
-            "VALUES (?,?,?,?,?,?)",
-            (idea, source, status, now.isoformat(), now.isoformat(), idea_norm))
+            "(idea,source,status,created_at,updated_at,idea_norm,"
+            "origin_mission_id) VALUES (?,?,?,?,?,?,?)",
+            (idea, source, status, now.isoformat(), now.isoformat(), idea_norm,
+             mission_id))
         return cur.lastrowid, "inserted"
 
     # precheck 2026-08-22 wave2: T10-B5 T10-M10 T10-M11
@@ -1249,10 +1246,6 @@ class ImproveLoop:
                           # で数える (enumerate インデックスは重複 skip の分だけ
                           # ずれる)
             dropped = 0
-            # [unprofitable-note-hygiene] v1.0 §2-1: `_upsert_backlog_idea`
-            # が `"inserted"` を返した行の id のみ集める (`existing`/
-            # `promoted` は含めない)。
-            inserted_ids: list[int] = []
 
             def _norm(idea: str) -> str:
                 # round2 #8 是正 (2026-08-29、verified-round2.md #8): 正規化
@@ -1277,12 +1270,10 @@ class ImproveLoop:
                     if dup is None:
                         dropped += 1
                         continue
-                row_id, action = self._upsert_backlog_idea(
+                _row_id, action = self._upsert_backlog_idea(
                     conn, d["idea"], d.get("source", "agent"),
-                    d.get("kind", "task"), now)
+                    d.get("kind", "task"), now, mission_id=ctx.mission_id)
                 inserted += action == "inserted"
-                if action == "inserted":
-                    inserted_ids.append(row_id)
             if dropped:
                 self._activity.write(
                     Category.IMPROVE, "backlog_limit_exceeded",
@@ -1294,9 +1285,7 @@ class ImproveLoop:
                 selected_idea = selected.get("idea", "")
                 if not selected_idea.strip():
                     conn.commit()
-                    return _SelectionOutcome(
-                        won=False, backlog_id=None,
-                        inserted_ids=tuple(inserted_ids))
+                    return _SelectionOutcome(won=False, backlog_id=None)
                 # precheck 2026-08-22 wave2: T10-B5 — discoveries にも既存
                 # backlog にも無い「新規 idea を選択」は INSERT してから選ぶ
                 # (test_new_idea_selected_creates_and_binds_in_same_tx)。空文字
@@ -1304,11 +1293,9 @@ class ImproveLoop:
                 # 既にあれば INSERT せずその行を使い、note なら task として
                 # open に昇格する (`_upsert_backlog_idea`)。`selected` の新規
                 # idea は選んだ本人が task と判断したもの → kind=task 固定。
-                backlog_id, selected_action = self._upsert_backlog_idea(
+                backlog_id, _selected_action = self._upsert_backlog_idea(
                     conn, selected_idea, selected.get("source", "agent"),
-                    "task", now)
-                if selected_action == "inserted":
-                    inserted_ids.append(backlog_id)
+                    "task", now, mission_id=ctx.mission_id)
 
             won = backlog_store.select_for_mission(
                 conn, backlog_id, now=now, commit=False)
@@ -1317,8 +1304,7 @@ class ImproveLoop:
                     conn, ctx.run_id, backlog_id, commit=False)
             conn.commit()
             return _SelectionOutcome(
-                won=won, backlog_id=backlog_id if won else None,
-                inserted_ids=tuple(inserted_ids))
+                won=won, backlog_id=backlog_id if won else None)
         except BaseException:
             conn.rollback()
             raise
@@ -2316,8 +2302,7 @@ class ImproveLoop:
                             reason="unprofitable", now=now,
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls,
                             mission_outcome="unprofitable",
-                            report_detail=report_detail,
-                            inserted_ids=selection.inserted_ids)
+                            report_detail=report_detail)
                         return
                     gate_metrics["baseline"] = strategy_verdict.baseline_row
                     # [approval-payload-missing-gate-metrics] 是正 (A4 10
@@ -2880,8 +2865,7 @@ class ImproveLoop:
     def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now,
                               gate_rows=(), tool_calls: int | None = None,
                               mission_outcome: str = "gate_failed",
-                              report_detail: str = "",
-                              inserted_ids: tuple[int, ...] = ()) -> None:
+                              report_detail: str = "") -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
         `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
@@ -2994,32 +2978,22 @@ class ImproveLoop:
             self._persist_gate_rows(
                 conn, gate_rows=gate_rows, now=now,
                 mission_id=ctx.mission_id, mission_outcome=outcome)
-            # [unprofitable-note-hygiene] v1.0 §2-2: フロア不合格
+            # [unprofitable-note-hygiene] 設計書 v2.0 §2-2/§3: フロア不合格
             # (`mission_outcome=="unprofitable"`) のときだけ、この mission
-            # が起票した note/task (`inserted_ids`、`existing`/`promoted`
-            # は含まれない) に機械注記 `origin:unprofitable` を書く。
-            # `idea`/`idea_norm`/`status` には触れない。同じ tx 内 — 後段
-            # (`finish_improve_mission` の rollback を含む) が失敗すれば
-            # この UPDATE も一緒に rollback する。`finish_improve_mission`
-            # の `backlog_transition` より前に置く: `backlog_id` (この
-            # mission の候補行そのもの) がもし `inserted_ids` にも含まれる
-            # 稀なケース (選択された idea 自体が新規挿入) でも、実際に
-            # ゲートへ通した候補の終端理由 (`reason`) が最終的に勝つ。
-            # codex r2 Important 1 是正 (2026-09-13): 起票 INSERT と注記
-            # UPDATE は別 tx のため、`parallel>1` では mission A のこの
-            # UPDATE より先に mission B が同じ行を選択・終端できる
-            # (逆順)。`AND last_result IS NULL` の更新世代 CAS で、まだ
-            # 誰も終端していない行だけへ注記を乗せる — 既に終端済み
-            # (`last_result` が非 NULL) の行は無条件で残す。N8 (後で
-            # 選択・終端されると終端値で上書きされる) はこの CAS の対象
-            # 外 (backlog_transition 経由の別 UPDATE) のため変わらない。
-            if mission_outcome == "unprofitable" and inserted_ids:
-                placeholders = ",".join("?" * len(inserted_ids))
+            # が起票した全行 (`origin_mission_id=ctx.mission_id` — INSERT
+            # 時に書かれた専用列、既存行の再利用は含まれない) の
+            # `origin_outcome` を `'unprofitable'` にする。`last_result`/
+            # `idea`/`idea_norm`/`status` には一切触れない — 専用列なので
+            # 他の書き手 (終端・人間コマンド・note 昇格) と衝突しない
+            # (CAS 不要、v1.x の `AND last_result IS NULL` は撤回)。同じ
+            # tx 内 — 後段 (`finish_improve_mission` の rollback を含む)
+            # が失敗すればこの UPDATE も一緒に rollback する。当該 mission
+            # の選択行 (`backlog_id`) 自身が起票行でも、`origin_outcome`
+            # と `last_result` は別列なので衝突しない (N11)。
+            if mission_outcome == "unprofitable":
                 conn.execute(
-                    "UPDATE improvement_backlog SET "
-                    "last_result='origin:unprofitable', updated_at=? "
-                    f"WHERE id IN ({placeholders}) AND last_result IS NULL",
-                    (now.isoformat(), *inserted_ids))
+                    "UPDATE improvement_backlog SET origin_outcome='unprofitable' "
+                    "WHERE origin_mission_id=?", (ctx.mission_id,))
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="completed",

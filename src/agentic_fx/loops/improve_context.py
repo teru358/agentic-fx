@@ -99,14 +99,16 @@ def _backlog_section(conn: "sqlite3.Connection",
     items = []
     for row in backlog_mod.list_open(conn):
         item = {"id": row["id"], "idea": row["idea"], "status": row["status"],
-                "attempts": row["attempts"], "last_result": row["last_result"]}
+                "attempts": row["attempts"], "last_result": row["last_result"],
+                "origin_outcome": row["origin_outcome"]}
         if allowed_backlog_ids is not None:
             item["assigned"] = row["id"] in allowed_backlog_ids
         items.append(item)
     all_notes = list(reversed(backlog_mod.list_notes(conn)))
     notes = [
         {"id": row["id"], "idea": row["idea"], "status": row["status"],
-         "attempts": row["attempts"], "last_result": row["last_result"]}
+         "attempts": row["attempts"], "last_result": row["last_result"],
+         "origin_outcome": row["origin_outcome"]}
         for row in all_notes[:20]
     ]
     return {"items": items, "notes": notes,

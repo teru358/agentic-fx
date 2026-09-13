@@ -1343,6 +1343,16 @@ def init_db(conn: sqlite3.Connection) -> None:
     # idea は Python 側正規形と食い違い重複行が生まれていた (probe 実測)。
     _ensure_column(conn, "improvement_backlog", "idea_norm", "idea_norm TEXT")
     _backfill_improvement_backlog_idea_norm(conn)
+    # [unprofitable-note-hygiene] 設計書 v2.0 §3: 専用列方式。起票時の
+    # 系譜 (`origin_mission_id`) と終端時の結果 (`origin_outcome`) を
+    # `last_result` (終端値・他の書き手多数) から分離する — additive な
+    # 2 列のみ、既存の `_ensure_column` 移行慣行に従う。過去行は NULL の
+    # まま (§2-8 遡及しない)。
+    _ensure_column(
+        conn, "improvement_backlog", "origin_mission_id",
+        "origin_mission_id INTEGER")
+    _ensure_column(
+        conn, "improvement_backlog", "origin_outcome", "origin_outcome TEXT")
     conn.commit()
 
 
