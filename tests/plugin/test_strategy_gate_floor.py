@@ -73,6 +73,38 @@ def test_f1_zero_trades_pair_is_skipped():
     assert label == ""
 
 
+def test_l5_zero_trades_pair_is_skipped_even_with_nondegenerate_metrics():
+    """L5 (2026-09-13、ローカル 1 周目 qwen 指摘): 上の
+    `test_f1_zero_trades_pair_is_skipped` は `pf=None, avg_r=None` の
+    退化 fixture のため、② (`trades==0` skip) を削除する変異でも ④ の
+    `pf is not None`/`avg_r is not None` ガードに吸収されてすり抜けて
+    しまう (G1/F2-4 と同型の欠陥)。`trades=0` でも `pf`/`avg_r` に
+    具体的な (本来 FAIL する) 値を持つ fixture に差し替え、② の
+    skip が確実に効いていることを確認する。"""
+    label, _ = _check_profitability_floor(
+        {"USDJPY": _m(0, 0.5, -0.1)}, settings=SETTINGS, scope="in_sample")
+    assert label == ""
+
+
+def test_l1_strict_holdout_guard_does_not_apply_to_in_sample_scope():
+    """L1 (2026-09-13、ローカル 1 周目 ornith+qwen 独立到達 dup):
+    `require_holdout_evaluable=True` でも in_sample scope では
+    `evaluable=False` の pair を落とさない (① の strict 判定は
+    holdout 限定、`scope == "holdout"` ガードそのものが効いているかを
+    直接確認する — 既存テストはこの変異 (① の `scope=="holdout"` を
+    外す/常時適用する) を 1 本も検出できなかった)。pf/avg_r が本来 FAIL
+    する値でも、in_sample scope では ① を経由せず②③④ の通常経路のみで
+    判定されることを固定する。"""
+    settings = SETTINGS.model_copy(deep=True)
+    settings.improve.gate.require_holdout_evaluable = True
+    # evaluable=False だが pf/avg_r は合格値 — ① が in_sample にも
+    # 適用される変異なら、evaluable=False だけで FAIL してしまう。
+    label, _ = _check_profitability_floor(
+        {"USDJPY": _m(50, 1.5, 0.1, evaluable=False)},
+        settings=settings, scope="in_sample")
+    assert label == ""
+
+
 def test_f1_max_drawdown_and_kill_switch_latches_not_in_metrics_dict_still_passes():
     """判定式には `max_drawdown`/`kill_switch_latches` を一切見ない —
     metrics dict に含まれていなくても判定は動く (F10 系と対)。"""

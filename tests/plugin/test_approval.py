@@ -393,6 +393,38 @@ def test_submit_plugin_rejects_strategy_kind_f6_5(tmp_path, settings):
     assert _count_rows(conn) == 0
 
 
+def test_l3_submit_plugin_rejects_strategy_before_reading_test_plugin_file(
+        tmp_path, settings):
+    """L3 (2026-09-13、ローカル 1 周目 ornith+qwen 独立到達 dup):
+    `test_submit_plugin_rejects_strategy_kind_f6_5` は例外メッセージの
+    文言だけを見ており、「strategy 判定 → 即 raise (ファイル読取・
+    ゲート実行を一切経ない)」という順序契約を積極検証していなかった —
+    後続処理 (`test_plugin.py` 読み取り・`check_source`・pytest 実行)
+    を追加しても文言さえ保てば緑のままだった。
+
+    ここでは `test_plugin.py` ファイルを**意図的に作らない**候補で
+    `submit_plugin` を呼ぶ。もし strategy 拒否が `test_plugin_path.
+    read_bytes()` より後ろへ移動していれば `FileNotFoundError` (OSError)
+    が飛ぶ — 拒否が本当に読み取りより前にあれば、ファイル不在に関わらず
+    同じ `ValueError` (materialize 案内) が飛ぶ。"""
+    d = tmp_path / "strat_no_test_file"
+    d.mkdir()
+    (d / "plugin.py").write_text(STRATEGY_PY)
+    (d / "config.yaml").write_text(
+        "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nexit_mode: levels\n")
+    # test_plugin.py を意図的に作らない。
+    meta = _strategy_meta(d, name="strat_no_test_file")
+
+    pytest_runner_calls = []
+
+    with pytest.raises(ValueError, match="materialize"):
+        approval.submit_plugin(
+            conn=_conn(tmp_path), meta=meta, settings=settings, now=NOW,
+            pytest_runner=lambda p: pytest_runner_calls.append(p))
+
+    assert pytest_runner_calls == []  # ゲートにも一切到達していない
+
+
 def test_validate_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
         tmp_path, settings):
     """`_validate_strategy` 直接呼び出しへの書き換え (上記 F6-5 pin の
