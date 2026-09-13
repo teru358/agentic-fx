@@ -46,6 +46,7 @@ from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin.noop_gate import count_self_test_functions, find_noop_copy
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.strategy_gate import (
+    _check_profitability_floor,
     _eval_timeframe as _strategy_gate_eval_timeframe,
     evaluate_strategy_adoption_gate,
 )
@@ -141,18 +142,28 @@ def _current_rpc_abandoned() -> bool:
     return getattr(threading.current_thread(), RPC_ABANDONED_ATTR, False)
 
 
-def _backtest_reply_from_save_kwargs(save_kwargs: dict) -> dict:
+def _backtest_reply_from_save_kwargs(
+        save_kwargs: dict, *, submission_blocked: dict | None = None) -> dict:
     """永続化用 save kwargs を JSON-safe な RPC 応答へ限定投影する。
     期間端点 (`period`) と保存時刻 (`now`) は agent に見せない (遮断 7、
-    `improve_rpc_tools._FORBIDDEN_KEYS`) — 台帳用の元データは属性で運ぶ。"""
-    return _BacktestReply({
+    `improve_rpc_tools._FORBIDDEN_KEYS`) — 台帳用の元データは属性で運ぶ。
+
+    [profitability-floor] T2 Step 2-1 (2026-09-13): `submission_blocked`
+    は**agent へ返る公開面にだけ**足す — `save_kwargs` (= 台帳/Tx-2 が
+    読む非公開の元データ) には一切混ぜない (`improve_rpc_tools.py:150-154`
+    の `save_kwargs` 契約を痩せさせない)。in_sample 段が合格のときは
+    キー自体を作らない (`None` を渡さない呼び出し元の既定)。"""
+    reply = {
         "scope": save_kwargs["scope"],
         "pair": save_kwargs["pair"],
         "timeframe": save_kwargs["timeframe"],
         "source": save_kwargs["source"],
         "metrics": save_kwargs["metrics"],
         "trial_count": 1,
-    }, save_kwargs)
+    }
+    if submission_blocked is not None:
+        reply["submission_blocked"] = submission_blocked
+    return _BacktestReply(reply, save_kwargs)
 
 
 @dataclass(frozen=True)
@@ -683,10 +694,36 @@ class ImproveLoop:
             "plugin_contract_summary": refs["plugin_contract_summary"],
             "staging_dir": str(ctx.staging_dir),
             "source_snapshot_dir": str(ctx.source_snapshot_dir),
+            # [profitability-floor] T2 Step 2-2 (2026-09-13、codex I8):
+            # 文言は settings からレンダする (ハードコードすると設定変更後
+            # にゲートと説明が食い違う)。
+            "profitability_floor_rule": self._floor_rule_text(),
         }
         template_path = (Path(__file__).resolve().parent / "prompts"
                          / "improve_mission.md")
         return template_path.read_text().format(**render_map)
+
+    def _floor_rule_text(self) -> str:
+        """[profitability-floor] T2 Step 2-2 (2026-09-13、設計書 §6 T2、
+        codex I8): 収益性フロアの規律文言を `improve.gate` の実値から
+        組み立てる。`.format()` は条件分岐できないため、文そのものを
+        ここで組み立ててプレースホルダへ渡す —
+        `require_positive_avg_r=False` のときは avg_r の条件を文から
+        省く (ハードコードした固定文言にしない)。"""
+        g = self._settings.improve.gate
+        if g.require_positive_avg_r:
+            condition = f"`pf < {g.min_pf}` または `avg_r <= 0`"
+        else:
+            condition = f"`pf < {g.min_pf}`"
+        return (
+            f"**{condition} の候補は提出しても承認申請になりません**"
+            "(親の決定論ゲートが `unprofitable` として observation に"
+            "落とします)。予算内でパラメータ・フィルタ・エントリ条件を"
+            f"変えて `run_backtest` をやり直し、`pf >= {g.min_pf}`"
+            + (f" かつ `avg_r > 0`" if g.require_positive_avg_r else "")
+            + "を満たした候補だけを提出してください。予算を使い切っても"
+            "満たせなければ**提出せず** `observation` として、試した"
+            "パラメータ群とそれぞれの pf / avg_r を理由に書いてください。")
 
     def _compute_partition_hint(self, conn, slot_key) -> frozenset[int] | None:
         # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
@@ -905,6 +942,24 @@ class ImproveLoop:
                                args.get("name"))
                 return {"error": "backtest_failed"}
             save_kwargs = captured[0]
+            # [profitability-floor] T2 Step 2-1 (2026-09-13、設計書 §6
+            # T2、codex I7): `submission_blocked` は親 handler (ここ) の
+            # 1 箇所だけで導出する — `self._settings` を既に持っている
+            # ため、`build_improve_rpc_tooldefs`/`build_rpc_handlers`/
+            # `tools/mission_registry.py` のシグネチャは変えない (子側
+            # tooldef の `_strip_forbidden` は禁止キーのみを剥がすので
+            # このキーはそのまま agent へ通る)。**in_sample 段のみ判定
+            # (holdout は一切参照しない)**。判定は
+            # `_check_profitability_floor` を再利用する (閾値のハード
+            # コード禁止、T1 と同じ関数)。
+            floor_label, floor_detail_text = _check_profitability_floor(
+                {args["pair"]: save_kwargs["metrics"]},
+                settings=self._settings, scope="in_sample")
+            submission_blocked = (
+                {"reason": "unprofitable",
+                 "detail": f"{floor_detail_text} — この成績では親ゲートが"
+                           "承認申請を出さず observation になります"}
+                if floor_label else None)
             if ledger.state() != "OPEN" or _current_rpc_abandoned():
                 # /code-review 2 周目 CR4 (2026-09-11): timeout 後に完了した
                 # handler は記録されない (受理境界) — snapshot も書かない
@@ -915,7 +970,8 @@ class ImproveLoop:
                 self._activity.write(
                     Category.IMPROVE, "archive_skipped_late",
                     f"mission={staging_dir.name} name={args.get('name')}")
-                return _backtest_reply_from_save_kwargs(save_kwargs)
+                return _backtest_reply_from_save_kwargs(
+                    save_kwargs, submission_blocked=submission_blocked)
             artifact_hash = artifact_hash_bytes(
                 plugin_py, config_yaml, test_plugin)
             archive_tmp = (self._root / "plugins" / "_archive" /
@@ -958,7 +1014,8 @@ class ImproveLoop:
                 else:
                     save_kwargs["artifact_hash"] = artifact_hash
                     save_kwargs["archive_tmp"] = str(archive_tmp)
-            return _backtest_reply_from_save_kwargs(save_kwargs)
+            return _backtest_reply_from_save_kwargs(
+                save_kwargs, submission_blocked=submission_blocked)
 
         def analyze_corr_handler(args: dict) -> dict:
             try:

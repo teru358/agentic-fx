@@ -313,6 +313,173 @@ def test_finalize_gate_failed_persists_gate_rows_when_report_write_raises_oserro
         (mission_id,)).fetchone()[0] == 1
 
 
+def test_f4_9_gate_row_and_ledger_row_share_the_same_branch_local_outcome(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """F4-9 (2026-09-13、codex I6、F 番号 gap 充足): `_finalize_gate_failed`
+    の正常分岐は、**台帳経路** (`ctx.ledger.entries()` → `_persist_ledger_
+    rows` → `backtest_runs`) と**親ゲート経路** (`gate_rows` →
+    `_persist_gate_rows` → `backtest_runs`) の両方へ**同じ**
+    `mission_outcome` を書く — 現行は gate 行が引数、ledger が
+    `"gate_failed"` 固定で分裂しうる欠陥だった (codex I6)。変異: ledger
+    側だけ `"gate_failed"` に固定する → killer (下記逆変異で確認)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    ledger.record(
+        opaque_ref="run_backtest:myst:USDJPY", kind="run_backtest",
+        params={"name": "myst", "pair": "USDJPY"}, trial_count=1,
+        result_summary={
+            "scope": "in_sample", "plugin_ref": "plugins/myst",
+            "content_hash": "ledger-hash" + "0" * 53, "kind": "strategy",
+            "pair": "USDJPY", "timeframe": "1h", "source": "dukascopy",
+            "base_interval": "1m", "params": {},
+            "period": (datetime(2026, 1, 1, tzinfo=timezone.utc),
+                      datetime(2026, 2, 1, tzinfo=timezone.utc)),
+            "metrics": {"pf": 0.5}, "settings_hash": "sh1",
+            "core_commit": "c1", "initial_balance": 10000.0,
+            "now": datetime(2026, 1, 1, tzinfo=timezone.utc)})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+    gate_rows = ({
+        "scope": "holdout_gate", "plugin_ref": "plugins/myst",
+        "content_hash": "gate-hash" + "0" * 55, "kind": "strategy",
+        "pair": "USDJPY", "timeframe": "1h", "source": "dukascopy",
+        "base_interval": "1m", "params": {},
+        "period": (datetime(2026, 2, 1, tzinfo=timezone.utc),
+                  datetime(2026, 3, 1, tzinfo=timezone.utc)),
+        "metrics": {"pf": 0.5}, "settings_hash": "sh1",
+        "core_commit": "c1", "initial_balance": 10000.0,
+        "now": datetime(2026, 3, 1, tzinfo=timezone.utc),
+    },)
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable",
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        gate_rows=gate_rows, mission_outcome="unprofitable")
+
+    rows = conn.execute(
+        "SELECT scope, mission_outcome FROM backtest_runs "
+        "WHERE mission_id=? ORDER BY scope", (mission_id,)).fetchall()
+    scopes = {r["scope"] for r in rows}
+    assert scopes == {"in_sample", "holdout_gate"}
+    assert all(r["mission_outcome"] == "unprofitable" for r in rows)
+
+
+def test_f4_7_default_mission_outcome_stays_gate_failed_for_both_sinks(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """F4-7 (2026-09-13、F 番号 gap 充足): 既存 3 呼び出し
+    (`insufficient_trades`/`gate_failed:*`/`backtest_data_unavailable`)
+    は `mission_outcome` を明示しない — 既定値 `"gate_failed"` のまま、
+    台帳経路・親ゲート経路の両方の行が `gate_failed` になる後方互換を
+    固定する。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    ledger.record(
+        opaque_ref="run_backtest:myst:USDJPY", kind="run_backtest",
+        params={"name": "myst", "pair": "USDJPY"}, trial_count=1,
+        result_summary={
+            "scope": "in_sample", "plugin_ref": "plugins/myst",
+            "content_hash": "ledger-hash" + "0" * 53, "kind": "strategy",
+            "pair": "USDJPY", "timeframe": "1h", "source": "dukascopy",
+            "base_interval": "1m", "params": {},
+            "period": (datetime(2026, 1, 1, tzinfo=timezone.utc),
+                      datetime(2026, 2, 1, tzinfo=timezone.utc)),
+            "metrics": {"pf": 0.5}, "settings_hash": "sh1",
+            "core_commit": "c1", "initial_balance": 10000.0,
+            "now": datetime(2026, 1, 1, tzinfo=timezone.utc)})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+    gate_rows = ({
+        "scope": "holdout_gate", "plugin_ref": "plugins/myst",
+        "content_hash": "gate-hash" + "0" * 55, "kind": "strategy",
+        "pair": "USDJPY", "timeframe": "1h", "source": "dukascopy",
+        "base_interval": "1m", "params": {},
+        "period": (datetime(2026, 2, 1, tzinfo=timezone.utc),
+                  datetime(2026, 3, 1, tzinfo=timezone.utc)),
+        "metrics": {"pf": 0.5}, "settings_hash": "sh1",
+        "core_commit": "c1", "initial_balance": 10000.0,
+        "now": datetime(2026, 3, 1, tzinfo=timezone.utc),
+    },)
+
+    # `mission_outcome` を明示しない (既存 3 呼び出しと同じ呼び方)。
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id,
+        reason="insufficient_trades:5",
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc), gate_rows=gate_rows)
+
+    rows = conn.execute(
+        "SELECT scope, mission_outcome FROM backtest_runs "
+        "WHERE mission_id=? ORDER BY scope", (mission_id,)).fetchall()
+    assert {r["scope"] for r in rows} == {"in_sample", "holdout_gate"}
+    assert all(r["mission_outcome"] == "gate_failed" for r in rows)
+
+
+def test_f4_10_report_write_failure_forces_report_failed_on_all_four_points(
+        loop_min, conn, mission_and_run_fixture, tmp_path, monkeypatch):
+    """F4-10 (2026-09-13、F 番号 gap 充足、codex R2-I3): report 作成失敗
+    分岐では、呼び出し元が `mission_outcome="unprofitable"` を渡しても
+    **上書きされず** gate 行・ledger 行・settle (INDEX)・ledger 状態の
+    4 点すべてが `report_failed` になる。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    ledger.record(
+        opaque_ref="run_backtest:myst:USDJPY", kind="run_backtest",
+        params={"name": "myst", "pair": "USDJPY"}, trial_count=1,
+        result_summary={
+            "scope": "in_sample", "plugin_ref": "plugins/myst",
+            "content_hash": "ledger-hash" + "0" * 53, "kind": "strategy",
+            "pair": "USDJPY", "timeframe": "1h", "source": "dukascopy",
+            "base_interval": "1m", "params": {},
+            "period": (datetime(2026, 1, 1, tzinfo=timezone.utc),
+                      datetime(2026, 2, 1, tzinfo=timezone.utc)),
+            "metrics": {"pf": 0.5}, "settings_hash": "sh1",
+            "core_commit": "c1", "initial_balance": 10000.0,
+            "now": datetime(2026, 1, 1, tzinfo=timezone.utc)})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+    gate_rows = ({
+        "scope": "holdout_gate", "plugin_ref": "plugins/myst",
+        "content_hash": "gate-hash" + "0" * 55, "kind": "strategy",
+        "pair": "USDJPY", "timeframe": "1h", "source": "dukascopy",
+        "base_interval": "1m", "params": {},
+        "period": (datetime(2026, 2, 1, tzinfo=timezone.utc),
+                  datetime(2026, 3, 1, tzinfo=timezone.utc)),
+        "metrics": {"pf": 0.5}, "settings_hash": "sh1",
+        "core_commit": "c1", "initial_balance": 10000.0,
+        "now": datetime(2026, 3, 1, tzinfo=timezone.utc),
+    },)
+    monkeypatch.setattr(
+        loop_min, "_write_report_part",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError("write failed")))
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable",
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc), gate_rows=gate_rows,
+        mission_outcome="unprofitable")
+
+    rows = conn.execute(
+        "SELECT scope, mission_outcome FROM backtest_runs "
+        "WHERE mission_id=?", (mission_id,)).fetchall()
+    assert {r["scope"] for r in rows} == {"in_sample", "holdout_gate"}
+    assert all(r["mission_outcome"] == "report_failed" for r in rows), (
+        "mission_outcome 引数で report_failed が上書きされてはならない")
+    assert ctx.ledger.state() == "PERSISTED"
+
+
 def test_commit_real_strategy_gate_missing_history_becomes_gate_failed(
         loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
     """実 strategy gate/holdout の空履歴例外を commit が安全に終端する。"""

@@ -597,3 +597,91 @@ def test_holdout_stage_failure_sets_floor_reason_when_in_sample_passes(
         meta=_meta(name="brand_new_strategy", content_hash="h11"))
     assert verdict.floor_reason == "unprofitable"
     assert "holdout" in verdict.floor_detail
+
+
+def test_f2_1_holdout_capture_is_not_discarded(monkeypatch, conn):
+    """F2-1 (2026-09-13、F 番号 gap 充足): in_sample 合格 (pf=1.5/
+    avg_r=+0.2) かつ holdout `evaluable=true`/`pf=0.8` (不合格) →
+    候補全体が FAIL。変異: holdout の返り値を捨てる (現行実装) →
+    killer (下記逆変異で確認)。"""
+    _fake_intent_source(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.2))
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: _metrics(trades=30, pf=0.8, avg_r=0.2,
+                                  evaluable=True))
+    verdict = evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        content_hash="h12", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", content_hash="h12"))
+    assert verdict.floor_reason == "unprofitable"
+
+
+# ---- F9-1/F9-2 (2026-09-13、F 番号 gap 充足、codex I14) -----------------
+
+def test_f9_1_evaluator_calls_shared_floor_helper_for_both_stages(
+        monkeypatch, conn):
+    """F9-1 (evaluator 側の 2 呼び出し元): `_check_profitability_floor`
+    が in_sample 段・holdout 段の両方から、それぞれ `scope="in_sample"`/
+    `scope="holdout"` と実 metrics dict で呼ばれる。"""
+    import agentic_fx.plugin.strategy_gate as strategy_gate_module
+
+    _fake_intent_source(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.1))
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.1))
+
+    calls = []
+    real_fn = strategy_gate_module._check_profitability_floor
+
+    def _spy(per_pair, *, settings, scope):
+        calls.append((scope, per_pair))
+        return real_fn(per_pair, settings=settings, scope=scope)
+
+    monkeypatch.setattr(strategy_gate_module, "_check_profitability_floor", _spy)
+
+    evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        content_hash="h13", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", content_hash="h13"))
+
+    assert [c[0] for c in calls] == ["in_sample", "holdout"]
+    assert calls[0][1]["USDJPY"]["trades"] == 30
+    assert calls[0][1]["USDJPY"]["pf"] == 1.5
+    assert calls[0][1]["USDJPY"]["avg_r"] == 0.1
+
+
+def test_f9_2_helper_is_the_single_shared_implementation_not_duplicated(
+        monkeypatch, conn):
+    """F9-2: 段0変異「helper を呼ばず同等ロジックをインラインで複製する」を
+    検出する — `_check_profitability_floor` を丸ごと差し替えると
+    (実装をインラインコピーしたのと同じ効果)、evaluator の判定結果が
+    その差し替え後の関数の戻り値と完全に一致する (= 呼び出しを経由して
+    いる証拠)。差し替え関数の戻り値をわざと逆にして、実際に呼ばれて
+    いることを確認する。"""
+    import agentic_fx.plugin.strategy_gate as strategy_gate_module
+
+    _fake_intent_source(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.1))  # 本来 PASS
+
+    def _always_fail(per_pair, *, settings, scope):
+        return "unprofitable", "forced-by-spy"
+
+    monkeypatch.setattr(
+        strategy_gate_module, "_check_profitability_floor", _always_fail)
+
+    verdict = evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        content_hash="h14", now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", content_hash="h14"))
+    # helper がインライン複製されていれば、この差し替えは効かず PASS の
+    # ままになる — 呼ばれていれば FAIL に反転する。
+    assert verdict.floor_reason == "unprofitable"
+    assert verdict.floor_detail == "forced-by-spy"

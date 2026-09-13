@@ -666,7 +666,14 @@ def _fake_record_kwargs(*, settings, trades: int, **overrides) -> dict:
         timeframe=overrides.get("eval_timeframe", overrides.get("timeframe", "1h")),
         source=source, base_interval=base_interval, params={},
         period=(overrides.get("period_start", NOW), overrides.get("period_end", NOW)),
-        metrics={"trades": trades},
+        # [profitability-floor] T2 Step 2-1 (2026-09-13): `run_backtest_
+        # handler` はこの `metrics` に対して `_check_profitability_floor`
+        # を直接呼ぶ (`save_kwargs["metrics"]` が判定入力) — `pf`/`avg_r`
+        # を直接インデックスするため、完全な metrics 形状にする
+        # (既定はフロアを通す値、既存テストの期待値は変えない)。
+        metrics={"trades": trades, "pf": overrides.get("pf", 1.5),
+                "avg_r": overrides.get("avg_r", 0.1),
+                "evaluable": trades >= 30},
         settings_hash="fake-settings-hash",
         core_commit="fake-core-commit",
         initial_balance=settings.backtest.initial_balance,
@@ -688,7 +695,8 @@ def _fake_in_sample_metrics(trades: int, *, pf: float | None = 1.5,
     メモリ `test-fixtures-from-real-transcripts`)。"""
     def _run(settings, *, history_conn, record_fn, **kwargs):
         record_fn(_fake_record_kwargs(settings=settings, trades=trades,
-                                      scope="in_sample", **kwargs))
+                                      scope="in_sample", pf=pf, avg_r=avg_r,
+                                      **kwargs))
         return {"trades": trades, "pf": pf, "avg_r": avg_r,
                 "evaluable": trades >= 30}
     return _run
@@ -1349,6 +1357,71 @@ def test_strategy_profitability_floor_reroutes_to_gate_failed_unprofitable(
     # チャは `run_backtest` RPC 経由のアーカイブ生成を経ないため、この
     # pin は `_settle_ledger_after_commit` の branch-local outcome 単体
     # pin (下記 F4-9 相当、mission_outcome の一致) で代替する。
+
+
+def test_f2_6_f4_series_holdout_only_failure_marks_all_gate_rows_unprofitable(
+        improve_env):
+    """F2-6/F4-1/F4-2/F4-3/F4-6 (2026-09-13、F 番号 gap 充足): in_sample
+    段は合格 (pf=1.5/avg_r=+0.2) だが holdout 段が不合格 (pf=0.8) の
+    候補は、in_sample 行**と** holdout_gate 行の全 pair が
+    `mission_outcome='unprofitable'` になる (F2-6)。副作用は F1 系と同じ:
+    backlog は `observation` かつ `list_open` に含まれる (F4-2)、
+    approval_requests に行が増えない (F4-3)、staging が削除される
+    (F4-6)。`mission_outcome` は `None` にならない (F4-1)。"""
+    app, root = improve_env
+    conn = app.conn_core
+
+    output = _plugin_artifact("holdout_floor_e2e", kind="strategy")
+    result = MissionResult(status="completed", output=output, transcript=[])
+
+    loop = ImproveLoop(
+        root=root, settings=app.settings, clock=FixedClock(NOW),
+        db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
+        activity=app.activity, rag=app.rag,
+    )
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               lambda **kw: FakeImproveWorkerRunner(result=result, **kw)), \
+         patch("agentic_fx.loops.improve_loop.holdout.run_in_sample",
+               _fake_in_sample_metrics(40, pf=1.5, avg_r=0.2)), \
+         patch("agentic_fx.loops.improve_loop.holdout.run_holdout_gate",
+               _fake_holdout_metrics(pf=0.8, avg_r=0.2)):
+        mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+        _write_staging_plugin(
+            ctx.staging_dir, "holdout_floor_e2e",
+            _PASSING_STRATEGY_PY, _PASSING_STRATEGY_CONFIG,
+            _PASSING_STRATEGY_TEST)
+        mission_result = worker.run(mission)
+        loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
+
+    backlog_row = conn.execute(
+        "SELECT id, status, last_result FROM improvement_backlog "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert backlog_row["status"] == "observation"
+    assert backlog_row["last_result"] == "unprofitable"
+
+    # F4-2: observation は list_open に残る (R8、次回再挑戦できる)。
+    from agentic_fx.store import backlog as backlog_store
+    open_ids = {row["id"] for row in backlog_store.list_open(conn)}
+    assert backlog_row["id"] in open_ids
+
+    # F2-6/F4-1: in_sample 行と holdout_gate 行の全 pair が unprofitable
+    # (None にならない)。
+    rows = conn.execute(
+        "SELECT scope, mission_outcome FROM backtest_runs "
+        "WHERE mission_id=?", (ctx.mission_id,)).fetchall()
+    scopes_seen = {r["scope"] for r in rows}
+    assert scopes_seen == {"in_sample", "holdout_gate"}
+    assert all(r["mission_outcome"] == "unprofitable" for r in rows)
+
+    # F4-3: approval_requests に行が増えない。
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM approval_requests").fetchone()[0]
+    assert pending == 0
+
+    # F4-6: staging が削除される。
+    assert not ctx.staging_dir.exists()
 
 
 _IN_SAMPLE_METRICS_FOR_PAYLOAD = {

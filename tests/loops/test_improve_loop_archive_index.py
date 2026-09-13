@@ -293,6 +293,29 @@ def test_finalize_gate_failed_appends_index_row(
     assert "T" in date_cell and " " not in date_cell
 
 
+def test_f4_5_finalize_gate_failed_index_status_is_unprofitable(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """F4-5 (2026-09-13、F 番号 gap 充足、codex I6 の帰結): フロア経路
+    (`mission_outcome="unprofitable"`) では archive INDEX の `status` も
+    `unprofitable` になる (`_finalize_gate_failed` の branch-local
+    outcome 統一が `_settle_ledger_after_commit`→`_write_archive_index_
+    safe(status=outcome)` にまで一貫する)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    tmp = tmp_path / "archive"
+    artifact_hash = _snapshot(tmp)
+    ctx = _ctx(tmp_path, mission_id, run_id,
+               [_backtest_entry(tmp, artifact_hash)])
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable",
+        now=NOW, mission_outcome="unprofitable")
+
+    text = _index_path(loop_min).read_text()
+    assert f"mission {mission_id}" in text
+    assert "| unprofitable |" in text
+    assert "| gate_failed |" not in text
+
+
 def test_index_concurrent_first_append_writes_single_header(loop_min):
     """codex 1 周目 (T3+T4) Important 1 (2026-09-11): 2 mission の初回追記が
     並行しても、ヘッダは 1 組・各 mission 1 行 (プロセス内 lock で直列化)。

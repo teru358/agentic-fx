@@ -154,3 +154,50 @@ def test_f10_1_extreme_drawdown_and_latches_do_not_change_verdict():
     label_zero, _ = _check_profitability_floor(
         {"USDJPY": m_zero}, settings=SETTINGS, scope="in_sample")
     assert label_extreme == label_zero == ""
+
+
+# ---- F 番号 gap 充足 (2026-09-13、コーディネータ指示): F1-2/F1-5/F1-7 --
+
+def test_f1_2_pf_just_below_min_pf_fails_with_exact_label():
+    label, _ = _check_profitability_floor(
+        {"USDJPY": _m(50, 1.0 - 1e-9, 0.1)}, settings=SETTINGS,
+        scope="in_sample")
+    assert label == "unprofitable"  # 固定文言、完全一致
+
+
+def test_f1_5_pf_pass_but_avg_r_fail_independent_gates():
+    """F1-5: `pf==1.5` (合格) かつ `avg_r==-0.01` (不合格) → 2 門は独立
+    なので FAIL。変異: avg_r 検査を落とす → killer (下記逆変異で確認)。"""
+    label, detail = _check_profitability_floor(
+        {"USDJPY": _m(50, 1.5, -0.01)}, settings=SETTINGS, scope="in_sample")
+    assert label == "unprofitable"
+    assert "avg_r" in detail
+
+
+def test_f1_7_min_pf_zero_lets_low_pf_pass():
+    settings = SETTINGS.model_copy(deep=True)
+    settings.improve.gate.min_pf = 0.0
+    label, _ = _check_profitability_floor(
+        {"USDJPY": _m(50, 0.5, 0.1)}, settings=settings, scope="in_sample")
+    assert label == ""
+
+
+# ---- F2-1/F2-2/F2-3/F2-6 ------------------------------------------------
+
+def test_f2_2_holdout_pf_equal_min_pf_passes_and_below_fails():
+    label_pass, _ = _check_profitability_floor(
+        {"USDJPY": _m(50, 1.0, 0.1, evaluable=True)}, settings=SETTINGS,
+        scope="holdout")
+    label_fail, _ = _check_profitability_floor(
+        {"USDJPY": _m(50, 1.0 - 1e-9, 0.1, evaluable=True)},
+        settings=SETTINGS, scope="holdout")
+    assert label_pass == ""
+    assert label_fail == "unprofitable"
+
+
+def test_f2_3_holdout_evaluable_true_pf_pass_avg_r_fail():
+    label, detail = _check_profitability_floor(
+        {"USDJPY": _m(50, 1.2, -0.01, evaluable=True)}, settings=SETTINGS,
+        scope="holdout")
+    assert label == "unprofitable"
+    assert "avg_r" in detail

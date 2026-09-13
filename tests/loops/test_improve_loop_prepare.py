@@ -327,8 +327,9 @@ class _FakeRunContext:
 
 
 def test_render_improve_mission_prompt_fills_all_placeholders(tmp_path):
-    """RB4: 8-I の対応表の全 17 キーが埋まり、テンプレートに未展開の
-    `{...}` プレースホルダが残らない。"""
+    """RB4: 8-I の対応表の全 18 キーが埋まり、テンプレートに未展開の
+    `{...}` プレースホルダが残らない。**[profitability-floor] T2 Step
+    2-2 (2026-09-13) で `{profitability_floor_rule}` を追加** (17→18)。"""
     from agentic_fx.loops.improve_loop import ImproveLoop
 
     loop = ImproveLoop.__new__(ImproveLoop)
@@ -337,7 +338,7 @@ def test_render_improve_mission_prompt_fills_all_placeholders(tmp_path):
     text = loop._render_improve_mission_prompt(_sample_ctx_data(), ctx=ctx)
 
     assert isinstance(text, str)
-    # テンプレートの 17 プレースホルダが 1 つも未展開のまま残っていない
+    # テンプレートの 18 プレースホルダが 1 つも未展開のまま残っていない
     # ことを確認する (`{plugin_name_pattern}` の値自体は正規表現なので
     # `{`/`}` を含みうる — ブランケットで全体を検査すると恒真になるため、
     # プレースホルダ名そのものが残っていないかを個別に見る)。
@@ -348,11 +349,49 @@ def test_render_improve_mission_prompt_fills_all_placeholders(tmp_path):
             "{news_sources}", "{risk_gate_summary}", "{backlog_table}",
             "{user_policy_tail}", "{plugin_name_pattern}",
             "{plugin_contract_summary}", "{staging_dir}",
-            "{source_snapshot_dir}", "{min_test_functions}"):
+            "{source_snapshot_dir}", "{min_test_functions}",
+            "{profitability_floor_rule}"):
         assert placeholder not in text, f"未展開のプレースホルダ: {placeholder}"
     assert str(tmp_path / "staging") in text
     assert str(tmp_path / "source") in text
     assert "pytest が実際に通したテスト数 (`3` 本以上)" in text
+    # F7-5: 規律に「宣言全 pair を最低 1 回 backtest」が含まれる。
+    assert "宣言した全 pair を" in text
+    assert "最低 1 回 `run_backtest`" in text
+
+
+def test_f7_3_floor_rule_text_renders_min_pf_from_settings(tmp_path):
+    """F7-3 (codex I8): プロンプト文言が settings からレンダされる —
+    `min_pf=1.5` にすると文言に `1.5` が出る。変異: 文言をハードコード
+    に戻す → killer。"""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    settings = SETTINGS.model_copy(deep=True)
+    settings.improve.gate.min_pf = 1.5
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = settings
+    ctx = _FakeRunContext(tmp_path / "staging", tmp_path / "source")
+    text = loop._render_improve_mission_prompt(_sample_ctx_data(), ctx=ctx)
+
+    assert "pf < 1.5" in text
+    assert "pf >= 1.5" in text
+
+
+def test_f7_3_floor_rule_text_omits_avg_r_condition_when_disabled(tmp_path):
+    """F7-3: `require_positive_avg_r=False` のとき avg_r 条件が
+    `_floor_rule_text()` 自体の文言から消える (規律3 の別文言
+    「試したパラメータと得られた pf / avg_r」は別関心なので、
+    `_floor_rule_text()` の戻り値だけを見る)。"""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    settings = SETTINGS.model_copy(deep=True)
+    settings.improve.gate.require_positive_avg_r = False
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = settings
+
+    text = loop._floor_rule_text()
+    assert "avg_r <= 0" not in text
+    assert "avg_r > 0" not in text
 
 
 def test_render_prompt_separates_selectable_backlog_from_notes(tmp_path):

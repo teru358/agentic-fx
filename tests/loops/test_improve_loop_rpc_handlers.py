@@ -58,7 +58,7 @@ _SAVE_KWARGS = dict(
     timeframe="1h", source="dukascopy", base_interval="1m", params={},
     period=(datetime(2020, 1, 1, tzinfo=timezone.utc),
             datetime(2026, 1, 1, tzinfo=timezone.utc)),
-    metrics={"pf": 1.3, "trades": 40}, settings_hash="s",
+    metrics={"pf": 1.3, "trades": 40, "avg_r": 0.1, "evaluable": True}, settings_hash="s",
     core_commit="c", initial_balance=10000.0, now=_NOW)
 
 
@@ -266,7 +266,7 @@ def test_snapshot_write_failure_returns_backtest_and_logs_activity(
         ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
         staging_dir=candidate.parent)["run_backtest"](
             {"name": "myst", "pair": "USDJPY"})
-    assert result["metrics"] == {"pf": 1.3, "trades": 40}
+    assert result["metrics"] == {"pf": 1.3, "trades": 40, "avg_r": 0.1, "evaluable": True}
     assert "archive_tmp" not in result.save_kwargs
     assert "archive_failed" in (tmp_path / "activity.log").read_text()
 
@@ -312,7 +312,7 @@ def test_run_backtest_handler_returns_json_safe_limited_reply(
         "pair": "USDJPY",
         "timeframe": "1h",
         "source": "dukascopy",
-        "metrics": {"pf": 1.3, "trades": 40},
+        "metrics": {"pf": 1.3, "trades": 40, "avg_r": 0.1, "evaluable": True},
         "trial_count": 1,
     }
     assert "period" not in out and "now" not in out
@@ -779,7 +779,7 @@ def test_snapshot_meta_json_metrics_match_save_kwargs(
     meta = json.loads(
         (Path(result.save_kwargs["archive_tmp"]) / "meta.json").read_text())
     assert meta["metrics"] == result.save_kwargs["metrics"]
-    assert meta["metrics"] == {"pf": 1.3, "trades": 40}
+    assert meta["metrics"] == {"pf": 1.3, "trades": 40, "avg_r": 0.1, "evaluable": True}
     assert meta["name"] == "myst"
     assert meta["pair"] == "USDJPY"
 
@@ -859,3 +859,167 @@ def test_unreadable_candidate_files_are_loader_rejected_before_execution(
     assert result == {
         "error": "loader_rejected: content changed during backtest"}
     assert not called.is_set()
+
+
+# ---- [profitability-floor] T2 Step 2-1 (2026-09-13): submission_blocked ----
+
+def test_f7_1_submission_blocked_absent_when_in_sample_passes_floor(
+        loop_min, tmp_path, monkeypatch):
+    """F7-1: in_sample 段が合格するときはキー自体が無い。"""
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)  # 既定 metrics: pf=1.3, avg_r=0.1 (合格)
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    result = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+    assert "submission_blocked" not in result
+
+
+def test_f7_1_submission_blocked_present_when_in_sample_fails_floor(
+        loop_min, tmp_path, monkeypatch):
+    """F7-1: in_sample 段が不合格のときだけ `submission_blocked` が現れる
+    (`reason=unprofitable`)。"""
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(
+        monkeypatch,
+        save_kwargs={**_SAVE_KWARGS,
+                    "metrics": {"trades": 40, "pf": 0.3, "avg_r": -0.2,
+                               "evaluable": True}})
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    result = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+    assert result["submission_blocked"]["reason"] == "unprofitable"
+    assert "pf=0.3" in result["submission_blocked"]["detail"]
+
+
+def test_f7_2_submission_blocked_uses_same_settings_as_t1_min_pf(
+        loop_min, tmp_path, monkeypatch):
+    """F7-2: T1 と同じ判定関数 (`_check_profitability_floor`) を呼ぶ —
+    `min_pf` を変えると判定が追従する (ハードコードではない)。"""
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(
+        monkeypatch,
+        save_kwargs={**_SAVE_KWARGS,
+                    "metrics": {"trades": 40, "pf": 1.3, "avg_r": 0.1,
+                               "evaluable": True}})
+    loop_min._settings = loop_min._settings.model_copy(deep=True)
+    loop_min._settings.improve.gate.min_pf = 2.0  # pf=1.3 を不合格にする
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    result = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+    assert result["submission_blocked"]["reason"] == "unprofitable"
+
+
+def test_f7_4_submission_blocked_not_in_save_kwargs_or_ledger(
+        loop_min, tmp_path, monkeypatch):
+    """F7-4: `submission_blocked` は公開面 (agent へ返る dict) にのみ現れ、
+    `save_kwargs` (台帳/Tx-2 が読む非公開の元データ) には混ざらない。"""
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(
+        monkeypatch,
+        save_kwargs={**_SAVE_KWARGS,
+                    "metrics": {"trades": 40, "pf": 0.3, "avg_r": -0.2,
+                               "evaluable": True}})
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    result = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+    assert "submission_blocked" in result
+    assert "submission_blocked" not in result.save_kwargs
+
+
+def test_f9_1_run_backtest_handler_calls_shared_floor_helper_in_sample_only(
+        loop_min, tmp_path, monkeypatch):
+    """F9-1 (親 `run_backtest_handler` 側の 3 番目の呼び出し元、2026-09-13
+    F 番号 gap 充足): `_check_profitability_floor` が `scope="in_sample"`
+    と実 metrics dict で呼ばれる (holdout は一切参照しない — T2 Step
+    2-1 の契約)。"""
+    import agentic_fx.loops.improve_loop as improve_loop_module
+
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+
+    calls = []
+    real_fn = improve_loop_module._check_profitability_floor
+
+    def _spy(per_pair, *, settings, scope):
+        calls.append((scope, per_pair))
+        return real_fn(per_pair, settings=settings, scope=scope)
+
+    monkeypatch.setattr(
+        improve_loop_module, "_check_profitability_floor", _spy)
+
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+
+    assert len(calls) == 1
+    assert calls[0][0] == "in_sample"
+    assert calls[0][1] == {"USDJPY": {"pf": 1.3, "trades": 40,
+                                      "avg_r": 0.1, "evaluable": True}}
+
+
+def test_f9_2_run_backtest_handler_helper_not_duplicated_inline(
+        loop_min, tmp_path, monkeypatch):
+    """F9-2: `run_backtest_handler` が helper を経由せず同等ロジックを
+    複製していたら、差し替えは効かず `submission_blocked` は付かない —
+    実際は経由しているので差し替えどおり付く。"""
+    import agentic_fx.loops.improve_loop as improve_loop_module
+
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)  # pf=1.3 (既定で PASS するはず)
+
+    monkeypatch.setattr(
+        improve_loop_module, "_check_profitability_floor",
+        lambda per_pair, *, settings, scope: ("unprofitable", "forced-by-spy"))
+
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    result = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+
+    assert result["submission_blocked"]["reason"] == "unprofitable"
+    assert "forced-by-spy" in result["submission_blocked"]["detail"]
+
+
+def test_f5_6_submission_blocked_has_no_holdout_language_or_period_endpoints(
+        loop_min, tmp_path, monkeypatch):
+    """F5-6 (2026-09-13、F 番号 gap 充足、遮断 8): `submission_blocked` に
+    `"holdout"` の語・holdout の数値・期間端点が無い (既存 pin
+    `tests/tools/test_improve_rpc_tools.py::
+    test_run_backtest_records_to_ledger_and_returns_handler_result` の
+    `"period_start" not in json.dumps(out)` を、submission_blocked が
+    付く経路にも拡張する)。"""
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(
+        monkeypatch,
+        save_kwargs={**_SAVE_KWARGS,
+                    "metrics": {"trades": 40, "pf": 0.3, "avg_r": -0.2,
+                               "evaluable": True}})
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    result = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+
+    dumped = json.dumps(dict(result))
+    assert "submission_blocked" in dumped
+    assert "holdout" not in dumped
+    assert "period_start" not in dumped
+    assert "period_end" not in dumped
