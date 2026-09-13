@@ -353,11 +353,20 @@ def _sample_ctx_data_with_origin():
              "assigned": True, "last_result": None},
             {"id": 3, "idea": "flagged item", "status": "open", "attempts": 1,
              "assigned": False, "last_result": "origin:unprofitable"},
+            # 段0 S1 の囮: ゲート終端が書く実際の `last_result`
+            # (`unprofitable` — フロア不合格候補そのものの行、`observation`
+            # で `list_open` に残る)。`origin` 列は **機械注記の完全一致**
+            # だけを映す契約なので、この行は空欄でなければならない。
+            {"id": 6, "idea": "the candidate row itself", "status": "observation",
+             "attempts": 2, "assigned": False, "last_result": "unprofitable"},
         ], "notes": [
             {"id": 4, "idea": "clean note", "status": "note", "attempts": 0,
              "last_result": None},
             {"id": 5, "idea": "flagged note", "status": "note", "attempts": 0,
              "last_result": "origin:unprofitable"},
+            # 段0 S1 の囮 (notes 側): `promoted_from_note` など別語彙。
+            {"id": 7, "idea": "other machine note", "status": "note",
+             "attempts": 0, "last_result": "promoted_from_note"},
         ]},
         "user_policy": {"tail": "方針テキスト"},
         "references": {"plugin_name_pattern": "^[a-z][a-z0-9_]{0,63}$",
@@ -449,3 +458,147 @@ def test_n8_annotated_row_last_result_overwritten_when_later_selected(
         "SELECT last_result FROM improvement_backlog WHERE id=?",
         (annotated_id,)).fetchone()
     assert row["last_result"] == "insufficient_trades:2"
+
+
+# ---------------------------------------------------------------------------
+# 段0 (指揮者変異スイープ 2026-09-13) で SURVIVED した次元の pin。
+# `tmp/review-20260913-nh/stage0.md` の S1〜S5。
+# ---------------------------------------------------------------------------
+
+def _origin_cell(text: str, row_id: int) -> str:
+    """レンダ済み prompt から `| <id> | ... |` 行を拾い、末尾の
+    `origin` セルを返す。"""
+    line = next(l for l in text.splitlines() if l.startswith(f"| {row_id} |"))
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    return cells[-1]
+
+
+def test_s1_origin_cell_is_exact_match_not_substring(tmp_path):
+    """段0 M1: `_backlog_table` の origin 判定を部分一致
+    (`'unprofitable' in str(last_result)`) に緩めると、ゲート終端が書く
+    実際の `last_result='unprofitable'` (フロアで落ちた候補行そのもの、
+    `observation` として `list_open` に残る) まで `origin` 列で
+    `unprofitable` と誤表示される — 機械注記でない行が「前 mission が
+    起票した note/task」に見えてしまい、規律 5 の意味が壊れる。
+    完全一致 (`== 'origin:unprofitable'`) を pin する。"""
+    text = _render(tmp_path)
+
+    assert _origin_cell(text, 3) == "unprofitable"   # 機械注記
+    assert _origin_cell(text, 5) == "unprofitable"   # 機械注記 (note)
+    assert _origin_cell(text, 2) == ""               # last_result なし
+    assert _origin_cell(text, 6) == ""               # 終端理由 'unprofitable'
+    assert _origin_cell(text, 7) == ""               # 'promoted_from_note'
+
+
+def test_s2_build_improve_context_carries_note_last_result_to_origin_column(
+        tmp_path):
+    """段0 M3 (配線): N6 は `ctx_data` を手書きするため、
+    `improve_context._backlog_section` が **notes** 行に `last_result` を
+    載せている配線を誰も検証していなかった (items 側は
+    `test_improve_context.py` の既存 pin が守っている)。実 DB →
+    `build_improve_context` → `_render_improve_mission_prompt` を通し、
+    機械注記した note が note 表の `origin` 列に出ることを pin する。"""
+    from agentic_fx.loops.improve_context import build_improve_context
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    from agentic_fx.store.db import connect, init_db
+    from tests.loops.conftest import SETTINGS
+
+    c = connect(tmp_path / "ctx.db")
+    init_db(c)
+    flagged = backlog_store.upsert_system_note(
+        c, idea="flagged wired note", last_result="origin:unprofitable",
+        now=_NOW)
+    clean = backlog_store.upsert_system_note(
+        c, idea="clean wired note", last_result="human_noted", now=_NOW)
+    c.commit()
+
+    ctx_data = build_improve_context(
+        c, settings=SETTINGS, now=_NOW, root=tmp_path,
+        allowed_backlog_ids=None)
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = SETTINGS
+    text = loop._render_improve_mission_prompt(
+        ctx_data, ctx=_FakeRunContext(tmp_path / "staging",
+                                      tmp_path / "source"))
+    c.close()
+
+    assert _origin_cell(text, flagged) == "unprofitable"
+    assert _origin_cell(text, clean) == ""
+
+
+def test_s3_origin_marker_updates_updated_at_to_now(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """段0 M4: UPDATE から `updated_at=?` を落としても既存 pin は全て緑
+    (どのテストも INSERT と終端で同じ `now` を使っていた)。設計書 §2-2 の
+    `updated_at=?` を、終端時刻が起票時刻と異なる条件で pin する。"""
+    from datetime import timedelta
+
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    note_id = backlog_store.add(conn, "stale note", "agent", _NOW)
+    later = _NOW + timedelta(hours=3)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable",
+        now=later, mission_outcome="unprofitable", inserted_ids=(note_id,))
+
+    row = conn.execute(
+        "SELECT last_result, updated_at FROM improvement_backlog WHERE id=?",
+        (note_id,)).fetchone()
+    assert row["last_result"] == "origin:unprofitable"
+    assert row["updated_at"] == later.isoformat()
+
+
+def test_s4_origin_marker_touches_only_listed_ids(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """段0 M5: `WHERE id IN (...)` を `WHERE id >= min(inserted_ids)` に
+    緩めても既存 pin は全て緑だった (既存テストでは起票行が常に最大 id)。
+    `inserted_ids` に無い、かつ id がより大きい行が注記されないことを
+    pin する (無関係な backlog 行の `last_result` を機械注記で潰すと、
+    その行の実際の終端理由が失われる)。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    marked_id = backlog_store.add(conn, "inserted by this mission", "agent", _NOW)
+    bystander_id = backlog_store.add(conn, "unrelated newer row", "user", _NOW)
+    assert bystander_id > marked_id
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger.freeze()
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
+        source_snapshot_dir=tmp_path / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+
+    loop_min._finalize_gate_failed(
+        conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable",
+        now=_NOW, mission_outcome="unprofitable", inserted_ids=(marked_id,))
+
+    rows = {r["id"]: r["last_result"] for r in conn.execute(
+        "SELECT id, last_result FROM improvement_backlog")}
+    assert rows[marked_id] == "origin:unprofitable"
+    assert rows[bystander_id] is None
+
+
+def test_s5_discipline_5_full_block_and_renumbering(tmp_path):
+    """段0 M6/M13: N7 は規律 5 の第 1・2 文しか見ておらず、第 3 文
+    (「試すなら明確にパラメータを変え、その理由を `selection_rationale` に
+    書いてください。」) を消しても緑、番号を `5.` から `4.` に変えて
+    (既存項目 4 と重複) も緑だった。設計書 §2-4 の逐語ブロック全体と、
+    実装者が申告した繰り下げ (既存の「出力は必ず」項目が `6.`) を pin
+    する。"""
+    text = _render(tmp_path)
+
+    assert (
+        "5. **`origin` 列が `unprofitable` の課題・note は、その mission の"
+        "候補が収益性フロアで落ちたときに書かれたものです。**\n"
+        "   同じ指標・同じパラメータの候補を再提出しないでください。"
+        "試すなら明確にパラメータを変え、その理由を `selection_rationale` に"
+        "書いてください。\n") in text
+    assert "6. 出力は必ず下の「最終出力」の形式" in text
