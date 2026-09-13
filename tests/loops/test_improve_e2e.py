@@ -1342,6 +1342,13 @@ def test_strategy_profitability_floor_reroutes_to_gate_failed_unprofitable(
     report_text = report_files[0].read_text(encoding="utf-8")
     assert "Profitability floor detail" in report_text
     assert "pf=" in report_text  # 全数値は親専有レポートにのみ現れる
+    # F4-5 (archive INDEX の status=='unprofitable') はこの最小 e2e
+    # フィクスチャでは検証できない —
+    # `_write_archive_index_safe` は `candidate_archives` に行が 0 件の
+    # mission には何も書かない契約 (`list_by_mission` が空)。本フィクス
+    # チャは `run_backtest` RPC 経由のアーカイブ生成を経ないため、この
+    # pin は `_settle_ledger_after_commit` の branch-local outcome 単体
+    # pin (下記 F4-9 相当、mission_outcome の一致) で代替する。
 
 
 _IN_SAMPLE_METRICS_FOR_PAYLOAD = {

@@ -36,7 +36,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agentic_fx.core.contracts import Bar, FixedClock, InstrumentSpec, Quote
-from agentic_fx.plugin import approval
+from agentic_fx.plugin import approval, strategy_gate
 from agentic_fx.plugin.gate_pytest import GateResult
 from agentic_fx.plugin.loader import discover
 from agentic_fx.runners.base import MissionResult
@@ -97,7 +97,17 @@ def _fake_run_in_sample(settings_arg, **kwargs) -> dict:
 
 
 def _submit_and_approve(root: Path) -> None:
-    """① strategy plugin を submit_plugin (fake) → decide(approved) する。
+    """① strategy plugin を承認済みにする → decide(approved)。
+
+    [profitability-floor] T1 Step 1-7 (2026-09-13、codex C1): `submit_
+    plugin` (legacy API) は strategy candidate を拒否するようになった
+    (固定 holdout を含む共有ゲートを経由しない corridor にフロアが課され
+    ない抜け道を塞ぐ、pin は tests/plugin/test_approval.py::
+    test_submit_plugin_rejects_strategy_kind_f6_5)。ここは承認評価その
+    ものではなく e2e シナリオの前提 (承認済み plugin) を作る目的の fake
+    corridor なので、`_validate_strategy` を直接呼んで承認 payload を
+    組み立て (`submit_plugin` の payload 構築と同形)、
+    `approvals_store.create` で直接 approval 行を作る。
 
     build_app より前に呼ぶこと — plugin の反映は次回起動時のみ (hot reload
     しない、Task 3 の brief 明示)。build_app 呼び出し時点で承認済みでなけ
@@ -115,9 +125,23 @@ def _submit_and_approve(root: Path) -> None:
     assert meta.kind == "strategy" and meta.timeframe == "1h"
     assert meta.pairs == ("USDJPY",)
 
-    approval_id = approval.submit_plugin(
-        conn, meta, settings=settings, now=H, pytest_runner=_ok_pytest_runner,
+    metrics, evaluable = approval._validate_strategy(
+        conn, meta, settings=settings, now=H,
         run_in_sample_fn=_fake_run_in_sample)
+    payload = {
+        "name": meta.name, "kind": meta.kind,
+        "content_hash": meta.content_hash,
+        "test_file_hash": "test",
+        "pytest": {"returncode": 0, "summary": "1 passed"},
+        "metrics": metrics, "evaluable": evaluable,
+        "eval_source": settings.backtest.eval_source,
+        "base_interval": settings.backtest.dataset().base_interval,
+        "eval_timeframe": strategy_gate._eval_timeframe(meta.timeframe),
+        "live_source": settings.plugin.producer_source,
+        "note": "e2e fake",
+    }
+    approval_id = approvals_store.create(
+        conn, kind="plugin", payload=payload, now=H)
     approvals_store.apply_decision(conn, approval_id, status="approved",
                            decided_by="human_reviewer", now=H)
     conn.close()

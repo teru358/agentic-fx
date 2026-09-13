@@ -35,6 +35,26 @@ def test_approval_payload_counts_only_accepted_entries(loop_min, conn):
     assert payload["backtest_call_count"] == 0
 
 
+def test_payload_profitability_floor_snapshot_f6_8_like(loop_min, conn):
+    """[profitability-floor] T1 Step 1-8 (2026-09-13、codex I3):
+    `_build_approval_payload` の payload に適用した閾値 snapshot
+    (`profitability_floor`) が入る — approval 行を作る 3 箇所
+    (ここ / switch.submit_candidate / switch.bless_candidate) すべてに
+    載せる契約の 1 つ。"""
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger.freeze()
+    payload = loop_min._build_approval_payload(
+        conn, name="x", kind="indicator", content_hash="c",
+        artifact_hash="a", ctx_ledger=ledger, mission_id=1,
+        backlog_id=1, candidate_origin="staging", candidate_path="p",
+        gate_metrics={}, output={}, now=loop_min._clock.now())
+    g = loop_min._settings.improve.gate
+    assert payload["profitability_floor"] == {
+        "min_pf": g.min_pf,
+        "require_positive_avg_r": g.require_positive_avg_r,
+        "require_holdout_evaluable": g.require_holdout_evaluable}
+
+
 def test_payload_analysis_fields_come_from_ledger_not_agent_output(
         loop_min, conn):
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,

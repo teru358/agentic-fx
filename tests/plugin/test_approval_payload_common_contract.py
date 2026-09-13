@@ -92,7 +92,7 @@ def _fake_pytest_ok(plugin_dir, *, settings):
                       duration_sec=0.1)
 
 
-def _fake_evaluable_gate(conn, meta, *, settings, now, record_fn=None):
+def _fake_evaluable_gate(conn, meta, *, settings, now, record_fn=None, floor_mode="enforce"):
     return StrategyGateVerdict(
         evaluable=True, baseline_variant="no_strategy",
         baseline_row={"plugin_ref": f"no_strategy:{meta.name}",
@@ -187,8 +187,15 @@ def _payload_from_improve_loop(tmp_path, kind):
 
 @pytest.mark.parametrize("kind", ["strategy", "indicator"])
 def test_four_payload_systems_share_eval_contract(tmp_path, monkeypatch, kind):
+    # [profitability-floor] T1 Step 1-7 (2026-09-13、codex C1): legacy
+    # `submit_plugin` は strategy candidate を fail closed で拒否する
+    # ようになった (固定 holdout を含む共有ゲートを経由しない corridor
+    # にフロアを一切課さない抜け道を塞ぐ、pin は
+    # tests/plugin/test_approval.py::test_submit_plugin_rejects_strategy_
+    # kind_f6_5) — kind="strategy" のときは 4 系統ではなく残り 3 系統
+    # (switch.submit_candidate/switch.bless_candidate/improve_loop) だけ
+    # を比較する。indicator は従来どおり 4 系統とも比較する。
     payloads = {
-        "submit_plugin": _payload_from_submit_plugin(tmp_path, kind),
         "switch.submit_candidate": _payload_from_switch_submit(
             tmp_path, kind, monkeypatch),
         "switch.bless_candidate": _payload_from_switch_bless(
@@ -196,6 +203,8 @@ def test_four_payload_systems_share_eval_contract(tmp_path, monkeypatch, kind):
         "improve_loop._build_approval_payload": _payload_from_improve_loop(
             tmp_path, kind),
     }
+    if kind != "strategy":
+        payloads["submit_plugin"] = _payload_from_submit_plugin(tmp_path, kind)
 
     if kind == "strategy":
         expected = {"eval_source": "mt5", "base_interval": "5m",

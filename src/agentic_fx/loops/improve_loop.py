@@ -1347,6 +1347,15 @@ class ImproveLoop:
             "selection_rationale": output.get("selection_rationale", ""),
             "summary": output.get("artifact", {}).get("summary", ""),
             "audit_note": "RPC timeout した呼出しは数えていない",
+            # [profitability-floor] T1 Step 1-8 (2026-09-13、codex I3):
+            # 適用した閾値 snapshot (approval 行を作る 3 箇所すべてに載せる
+            # — switch.submit_candidate / switch.bless_candidate / ここ)。
+            "profitability_floor": {
+                "min_pf": self._settings.improve.gate.min_pf,
+                "require_positive_avg_r":
+                    self._settings.improve.gate.require_positive_avg_r,
+                "require_holdout_evaluable":
+                    self._settings.improve.gate.require_holdout_evaluable},
         }
 
     def _check_duplicate_metrics(self, conn, *, content_hash, pair, variant,
