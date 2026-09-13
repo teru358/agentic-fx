@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable
+from typing import Callable, Literal
 
 from agentic_fx.backtest import holdout
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
@@ -33,6 +33,95 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
     baseline_variant: str = "no_strategy"
     baseline_row: dict | None = None
     candidate_metrics: dict | None = None
+    # [profitability-floor] T1 Step 1-2 (2026-09-12、設計書 §3 T1-a):
+    # `evaluable` は R8 の「標本不足」意味論を流用しない (別フィールド)。
+    floor_reason: str = ""
+    floor_detail: str = ""
+
+
+def _check_profitability_floor(
+        per_pair: dict, *, settings: "Settings", scope: str) -> tuple[str, str]:
+    """[profitability-floor] T1 Step 1-1 (設計書 §3「判定規則 (逐語)」)。
+
+    戻り値 `(label, detail)`。`label` は `""` (合格) か `"unprofitable"`
+    (固定文言 — この文字列は `improvement_backlog.last_result` に逐語で
+    現れるため変えない)。`detail` は人間向けレポート専用の全数値文字列
+    — `label` と混ぜない (遮断 8 の 1 bit 例外を守るため)。
+
+    pair ごとに判定し、**1 pair でも不合格なら候補全体を落とす**
+    (pf は pair 間で算術合成できないため合計ではなく pair ごとに見る)。
+
+    順序 ①→②→③ は契約 (codex I9): ① (strict holdout 判定) を ② の
+    後に置くと `require_holdout_evaluable=True` でも `trades=0` の pair
+    が通ってしまう。
+    """
+    g = settings.improve.gate
+    fail_details: list[str] = []
+    for pair, m in per_pair.items():
+        # ① strict holdout 判定は zero-trade shortcut より前 (trades==0
+        # でも FAIL する)。
+        if scope == "holdout" and g.require_holdout_evaluable \
+                and not m.get("evaluable"):
+            fail_details.append(f"{pair}: holdout_not_evaluable")
+            continue
+        # ② 成績が無い pair は通常モードでは判定から除外する。
+        if m["trades"] == 0:
+            continue
+        # ③ 既定: holdout の標本不足は「悪いとは言わない」(R8)。
+        if scope == "holdout" and not m.get("evaluable"):
+            continue
+        pf = m["pf"]
+        if pf is not None and pf < g.min_pf:  # pf is None (gross_loss==0) は PASS
+            fail_details.append(f"{pair}: pf={pf}")
+            continue
+        avg_r = m["avg_r"]
+        if g.require_positive_avg_r and avg_r is not None and avg_r <= 0.0:
+            fail_details.append(f"{pair}: avg_r={avg_r}")
+    if fail_details:
+        return "unprofitable", f"{scope}: " + ", ".join(fail_details)
+    return "", ""
+
+
+def floor_rule_text(gate_settings: "ImproveGateSettings", *,
+                    audience: Literal["agent", "human"]) -> str:
+    """[profitability-floor] codex 2 周目レビュー CR3 (2026-09-13):
+    フロア条件を説明する文言の**条件節**を組み立てる唯一の場所。以前は
+    `loops/improve_loop.py::_floor_rule_text` (LLM 向けプロンプト)・
+    `backtest/cli.py::_plugin_bless::_warn` (CLI 警告)・
+    `plugin/switch.py::_run_full_gate` (人間 corridor の ValueError/
+    activity 文言) がそれぞれ独立に `min_pf`/`require_positive_avg_r`/
+    `require_holdout_evaluable` を手書きで文言化しており、新しい閾値を
+    足すたびに 3 箇所を手で揃える必要があった (1 箇所を書き換え忘れると
+    CLI 操作者・LLM のプロンプト・activity ログが 3 つの異なるバージョンの
+    説明を見ることになる)。
+
+    戻り値は「条件節」(例: ``"`pf < 1.0` または `avg_r <= 0`"``) のみ —
+    文全体ではないので、各呼び出し元は自分の文脈に合わせて前後に文言を
+    足せる (CLI の警告文・improve_loop の規律文・switch.py の例外文で
+    それぞれ文体が異なるため)。
+
+    **`audience="agent"` (LLM 向け、改善ループのプロンプト) は
+    `require_holdout_evaluable` を条件節に一切含めない** — 遮断 8
+    (holdout の閾値・条件を agent に見せない設計判断、
+    [profitability-floor] 設計書 §4 の「ただし書き」) を優先する。
+    この設定が有効でも、agent 向け文言は pf/avg_r だけで説明する。
+    holdout 起因の拒否は agent から見ると「in_sample 段のヒント
+    (`submission_blocked`) は出なかったのに最終的に `unprofitable` に
+    なった」という形になる — これは設計書 §4 が受容済みの挙動であり、
+    ここで holdout 条件を漏らして解消してはならない (codex 2 周目
+    レビュー CR1 の裁定)。
+
+    **`audience="human"` (CLI/activity/例外メッセージ向け) は
+    `require_holdout_evaluable=True` のとき holdout 条件も条件節に
+    含める** — 人間はフロアの全条件を知る権利があり、遮断 8 の対象外
+    (CR1)。"""
+    g = gate_settings
+    parts = [f"`pf < {g.min_pf}`"]
+    if g.require_positive_avg_r:
+        parts.append("`avg_r <= 0`")
+    if audience == "human" and g.require_holdout_evaluable:
+        parts.append("holdout が評価可能 (30 trades 以上) でない")
+    return " または ".join(parts)
 
 
 def evaluate_strategy_adoption_gate(
@@ -43,6 +132,7 @@ def evaluate_strategy_adoption_gate(
     history_conn=None,
     run_in_sample_fn=None, run_holdout_gate_fn=None,
     record_fn: "Callable[[dict], None] | None" = None,
+    floor_mode: Literal["enforce", "warn"] = "enforce",
 ) -> "StrategyGateVerdict | None":
     """candidate/baseline/no_strategy の identity と評価可能性。
     indicator/signal はこのゲートを課さない (None を返す)。
@@ -77,9 +167,26 @@ def evaluate_strategy_adoption_gate(
     契約 — 単一の dict を位置引数で渡す形。`ImproveLoop.commit` 手順4は
     ここへ `list.append` を渡し、蓄積した行を Tx-2 (`_persist_gate_rows`)
     へ渡す (設計書 §4.1「long-running work is outside tx」、3 周目レビュー
-    Important-2)。`None` (既定) のときは `holdout` 側が即時 commit する
-    従来経路のまま (Task 11 の `bless --from _human` など Tx-2 の外から
-    呼ぶ経路はこちらを使う)。"""
+    Important-2)。
+
+    [profitability-floor] codex 2 周目レビュー CR8 是正 (2026-09-13、
+    stale docstring 訂正): **`record_fn=None` (即時 commit) の経路は
+    現在どちらの corridor からも到達しない。** `plugin/approval.py::
+    run_kind_gate` は改善ループ (`ImproveLoop.commit` 手順4) からも
+    人間 corridor (`switch.py::submit_candidate`/`bless_candidate` →
+    `_run_full_gate`) からも、**常に**明示的な sink (`record_fn=_sink`、
+    T1 Step 1-6) を渡すようになった — 旧稿は「`bless --from _human` は
+    Tx-2 の外から呼ぶので `None` 経路を使う」と書いていたが、これは
+    T1 Step 1-6 (2026-09-13) 以前の実装を指しており、現在は
+    `switch._run_full_gate` が捕捉した行を `outcome.gate_rows` 経由で
+    自分の tx 内に明示的に persist する (`switch.py::
+    _persist_human_gate_rows`/成功パスの gate-row 保存)。**この
+    auto-commit 分岐は現状どちらの corridor からも呼ばれない到達不能
+    コードであり、削除しないのは「将来 Tx-2 の外から `record_fn` 無しで
+    呼ぶ第三の corridor ができたときの後方互換」のためだけ** —
+    このコメントを信じて switch.py 側の明示 persist ループ (T1 Step
+    1-6) を削除・変更すると、strategy 候補の in_sample/holdout 実測が
+    無言で失われる (どちらの corridor も auto-commit に頼っていないため)。"""
     if kind != "strategy":
         return None
     # R-i3 追随 (プラン10 Task 11): `plugin/approval.py::run_kind_gate` は
@@ -156,12 +263,30 @@ def evaluate_strategy_adoption_gate(
             evaluable=False,
             observation_reason=f"insufficient_trades:{total_trades}")
 
+    # [profitability-floor] T1 Step 1-2 (2026-09-12、設計書 §3):
+    # in_sample 段の判定は total_trades 判定の直後 (holdout ループより前)。
+    # `floor_mode="enforce"` で不合格なら holdout を回さずに即 return する
+    # (落ちる候補に holdout の計算コストを払わない/holdout 情報の発生
+    # 自体を無くす — 遮断 8 の 1 bit 例外の前提)。`floor_mode="warn"` の
+    # 不合格は `floor_reason`/`floor_detail` を保持したまま完走する
+    # (codex C2 — bless で強行する候補にも通常 submit と同じ全ゲート
+    # 証跡を残すため)。
+    in_sample_floor_reason, in_sample_floor_detail = _check_profitability_floor(
+        per_pair, settings=settings, scope="in_sample")
+    if in_sample_floor_reason and floor_mode == "enforce":
+        return StrategyGateVerdict(
+            evaluable=True, floor_reason=in_sample_floor_reason,
+            floor_detail=in_sample_floor_detail, candidate_metrics=per_pair)
+
+    holdout_per_pair: dict = {}
     for pair in pairs:
         intent_source = strategy_adapter.build_intent_source(
             meta, conn=conn, pair=pair, dataset=dataset,
             settings=settings)
         try:
-            run_holdout(
+            # 現行は戻り値を捨てていた (§0「前提を疑う」) — フロア判定の
+            # holdout 段はこの戻り値が要る。
+            holdout_per_pair[pair] = run_holdout(
                 settings, history_conn=history_conn, symbol=pair,
                 dataset=dataset, intent_source=intent_source,
                 eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
@@ -170,11 +295,19 @@ def evaluate_strategy_adoption_gate(
         finally:
             intent_source.close()
 
+    holdout_floor_reason, holdout_floor_detail = _check_profitability_floor(
+        holdout_per_pair, settings=settings, scope="holdout")
+    # warn で in_sample も落ちていた場合は floor_detail に両段を含める。
+    floor_reason = in_sample_floor_reason or holdout_floor_reason
+    floor_detail = " | ".join(
+        d for d in (in_sample_floor_detail, holdout_floor_detail) if d)
+
     if approved_row is not None:
         baseline_row = {"ref_plugin_ref": plugin_ref, "variant": "baseline"}
         return StrategyGateVerdict(
             evaluable=True, baseline_variant="baseline",
-            baseline_row=baseline_row, candidate_metrics=per_pair)
+            baseline_row=baseline_row, candidate_metrics=per_pair,
+            floor_reason=floor_reason, floor_detail=floor_detail)
 
     for row in in_sample_rows:
         no_strategy_row = dict(row)
@@ -195,4 +328,5 @@ def evaluate_strategy_adoption_gate(
                     "variant": "no_strategy"}
     return StrategyGateVerdict(
         evaluable=True, baseline_variant="no_strategy",
-        baseline_row=baseline_row, candidate_metrics=per_pair)
+        baseline_row=baseline_row, candidate_metrics=per_pair,
+        floor_reason=floor_reason, floor_detail=floor_detail)

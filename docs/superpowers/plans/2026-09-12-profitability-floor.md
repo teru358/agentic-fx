@@ -280,7 +280,7 @@ class GateOutcome:
     metrics: dict
     evaluable: bool
     verdict_kind: Literal["ok", "insufficient_trades", "floor"] = "ok"
-    floor_failed: bool = False             # verdict_kind == "floor" と同値
+    # (v1.8: `floor_failed` は冗長のため削除、判別子は `verdict_kind` のみ)
     floor_warning: str = ""                # "" | "unprofitable"
     floor_detail: str = ""
     insufficient_trades_reason: str = ""   # "insufficient_trades:<n>"
@@ -292,7 +292,7 @@ class GateOutcome:
 - **`run_kind_gate` はゲート判定で例外を投げない** (codex R2-I1)。現行が
   `ValueError("strategy not evaluable …")` を投げている標本不足 (`approval.py:213-221`) も
   **`verdict_kind="insufficient_trades"` + `insufficient_trades_reason` に載せて return** する。
-  収益性フロア不合格は `verdict_kind="floor"` / `floor_failed=True`。
+  収益性フロア不合格は `verdict_kind="floor"` (v1.8: `floor_failed` は削除)。
   indicator / signal は `_validate_kind` に委譲して `verdict_kind="ok"`
 - **raise と失敗行 outcome の決定は `_run_full_gate` が判別子から行う**:
 
@@ -653,7 +653,7 @@ marker を付けない**)。
 
 > 指揮者裁定 (2026-09-12、codex 設計レビュー 2 周目 = **全 5 件採用**、蒸し返さない):
 > R2-I1 = `run_kind_gate` はゲート判定で例外を投げず**常に `GateOutcome` を返す**契約に固定。
-> 判別子 `verdict_kind` (`ok` / `insufficient_trades` / `floor`) + `floor_failed` を持たせ、
+> 判別子 `verdict_kind` (`ok` / `insufficient_trades` / `floor`) を持たせ (v1.8: `floor_failed` は削除)、
 > enforce の raise と失敗行 outcome (`unprofitable` / `gate_failed`) の決定は
 > `_run_full_gate` が**型付き結果から**行う。**例外メッセージによる分類は禁止**。
 > 標本不足 (現行 `approval.py:213-221` が `ValueError` にしていたもの) も同じ判別子経由に揃え、
@@ -685,3 +685,9 @@ marker を付けない**)。
 | 2026-09-12 | v1.2 | codex 設計レビュー 2 周目 5 件を全件反映。Step 1-4 を `GateOutcome` + 判別子 (`verdict_kind` / `floor_failed` / `insufficient_trades_reason`) に書き換え、`run_kind_gate` はゲート判定で raise しない契約と「例外メッセージによる分類の禁止」を Global Constraints + 判別子→outcome 対応表で固定 (R2-I1)。Step 1-6 の分類を判別子のみに、標本不足行を別行として規約表に追加。Step 1-7 に `submit_candidate(..., activity=None)` + `_plugin_submit` からの `ActivityLog` 配線を追加 (R2-I2)。Step 1-3 の report 失敗分岐に「共通 settle 契約を維持、INDEX も `report_failed`、抑止 API は作らない」を明記し完了条件の F4-10 を 4 点 + `PERSISTED` に拡張 (R2-I3)。Step 1-8 の snapshot を「approval を作る 3 箇所」に限定 (R2-M2)。進捗表の段0 を最優先 6 件に訂正 (R2-M1)、2 周目行を追加。レビュー段に 3 周目の確認範囲 4 点を明記 | codex 設計レビュー 2 周目 `tmp/design-profitability-floor/codex-design-r2.md` (gpt-5.6-sol、v1.1 = cbed926)、指揮者裁定 2026-09-12 (全件採用) | - |
 | 2026-09-12 | v1.3 | codex 設計レビュー 3 周目 3 件を全件反映。**v1.3 で実装着手可** (codex 収束判定、以後の設計レビューは行わない)。R3-I1 = Step 1-4 の直前に「`floor_mode` は判定を止めるためでなく warn の完走のためのスイッチ / `run_kind_gate` はどちらでも raise しない」を明記 (spec T1-c の旧契約は削除) / R3-I2 = 完了条件の F6-11 を (a) `submit_candidate` 層 と (b) CLI 層 spy pin に二分し、Step 1-7 に spy pin の具体 assert (渡された `ActivityLog` の `path` が `root/"logs"/"activity.log"`) を追記、逆変異に「CLI が渡さない」を追加 / R3-M1 = Step 1-6 に「sink に行を積んだ後の contract 外例外も `gate_failed` で保存してから伝播 (`except BaseException:` で保存 → `raise`)」を追記し F6-12 を完了条件・逆変異に追加。レビュー段の 3 周目 4 確認点を決着記録に置換、進捗表に 3 周目行 | codex 設計レビュー 3 周目 `tmp/design-profitability-floor/codex-design-r3.md` (gpt-5.6-sol、v1.2 = 8ef4694)、指揮者裁定 2026-09-12 (全件採用) | - |
 | 2026-09-12 | v1.3a | U5 除染完了 (ユーザー実行): 1 回目 #27/#38/#39/#51/#60 (バックアップ `tmp/db-backup-20260912-decontam.db`)、2 回目 #1/#3 (`…-decontam2.db`)。`last_result LIKE 'rejected:%'` は 0 行。除染スクリプトの afx 稼働検査は引数部分一致で自己マッチした事故を是正済 (`tmp/decontam-20260912.py`) | 実 DB の漏洩実体を先に消す | - |
+| 2026-09-12 | v1.4 | 実装着手 (ユーザー承認 21:50)。worktree `tmp/wt/pf` branch `profitability-floor`。T0/T3 完了 (b337c95、検収済: 削除行は `_OUTCOME_TABLE['rejected']` の `{reason}` と approval SELECT 拡張のみ) / T1 Step 1-1 完了 (0adf415、pin 15、逆変異 2 RED) / **T1 Step 1-2/1-3 WIP** (226cdd3、sonnet が session limit で中断、対象テスト 33+20 green、**pin・逆変異・検収は未**)。ブロッカー裁定: 既存 14 fixture の部分 metrics dict は全キー化 (a) を採用 ([[test-fixtures-from-real-transcripts]])。報告 `tmp/review-20260912-pf/impl-report.md` (本体側に置く規律)。**再開点 = Step 1-3 の検収 (impl-report のチェックポイント節) → Step 1-4 (GateOutcome / run_kind_gate) 以降** | 中断記録 | 226cdd3 |
+| 2026-09-13 | v1.5 | 実装完了 (sonnet、worktree `tmp/wt/pf`): T1 Step 1-4〜1-9 = `7d7546b` (GateOutcome / verdict_kind / 人間回廊の明示 outcome / bless warn callback / submit activity / legacy submit の strategy 拒否 / snapshot)、T2 + F gap 充足 = `b0203ec` (F 59/59 pin、逆変異 RED)。逸脱採用: test_approval.py の strategy 8 本は `_validate_strategy` 直接呼び出しへ。事故 1 件 (record_fn 常時非 None で holdout の暗黙 commit が消え success 経路の行が消失 → 明示保存で是正、pin 済)。fresh フルスイート 3863 passed (既知 shell_interrupt 1)。次 = 段 0 (指揮者の変異スイープ、opus 委任) | 実装記録 | b0203ec |
+| 2026-09-13 | v1.6 | 段 0 (opus 独立変異 18 件、実装者の逆変異とは別の壊し方): RED 17 / 生存 1 (M8 = `run_kind_gate` → evaluator の `floor_mode` 転送に pin 無し、bless warn が黙って短絡し得る pin gap) / designated pin 空振り 2 (F2-4 fixture 非現実形状、F9-2 が holdout 段に未到達) → pin 是正 c678762。次 = 1 周目 codex + ローカル 3 本 (材料は c678762 から) | `tmp/review-20260912-pf/stage0.md` | c678762 |
+| 2026-09-13 | v1.7 | 1 周目: codex (sol) Critical/Important/Minor 0 (7 観点すべて問題なし、593 passed) / ローカル 3 本 (muse 0/0/6、ornith 2/5/4、qwen 3/5/7) 本番欠陥 0、pin 追加 4 (L1/L3/L5/L7)、既存充足 3。**2 周目 = `/code-review high` (ユーザー起動) + codex + ローカル** | `tmp/review-20260912-pf/{codex-r1,verified-local}.md` | 5416a39 |
+| 2026-09-13 | v1.8 | 2 周目 `/code-review high` (sonnet) 8 件: 本番欠陥 0、部分採用 1 (CR1 = human 向けのみ holdout 条件) / 採用 6 (CR3〜CR8) / 記録 1 (CR2 既知チケット) → 是正 684fb31。spec v1.4 に設計微修正を反映。次 = codex 2 周目 (差分限定 716eeec..684fb31) | `code-review-r2.md` | 684fb31 |
+| 2026-09-13 | v1.9 | codex 2 周目 (是正差分 716eeec..b9618a7): Critical 0 / Important 1 / Minor 0 — CR6 で削除した `floor_failed` が spec/plan の規範本文 5 箇所に残存 → 指揮者が文書是正 (`rg floor_failed` の残存は変更履歴と削除説明のみ)。CR1〜CR7 の実装は収束判定「収束」。3 周目は codex 指定の「文書差分のみの短い確認」を指揮者 grep で代替。次 = fresh フルスイート → main マージ (ユーザー承認) | `tmp/review-20260912-pf/codex-r2.md` | - |

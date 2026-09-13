@@ -108,7 +108,14 @@ _OUTCOME_TABLE: dict[str, tuple[str, str]] = {
     "insufficient_trades": ("observation", "insufficient_trades:{reason}"),
     "unsupported_in_plan10": ("observation", "unsupported_in_plan10:{reason}"),
     "approved": ("done", "approved:{reason}"),
-    "rejected": ("observation", "rejected:{reason}"),
+    # [reject-reason-leak] T0 (2026-09-12): 人間の却下理由をプロンプト
+    # 注入面 (改善履歴表) から切る。旧テンプレート `rejected:{reason}` は
+    # `last_result` 経由で次 mission に逐語で漏れていた。固定文言
+    # `rejected_by_human` にし、理由は `approval_requests.reason` 列
+    # だけに残す (`store/approvals.py::apply_decision` 経由、削らない)。
+    # テンプレートに `{reason}` を含まないため、以降 `reason` 引数は
+    # 使われない (`"{reason}" in template` 分岐が定数側を通る)。
+    "rejected": ("observation", "rejected_by_human"),
     "expired": ("observation", "expired"),
     "invalidated": ("observation", "invalidated"),
     "mission_failed": ("observation", "mission_failed:{reason}"),

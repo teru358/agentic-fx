@@ -362,8 +362,73 @@ def test_signal_metrics_come_from_evaluate_detection(tmp_path, settings):
 
 # --- ③ strategy: pairs 毎に run_in_sample_fn が実シグネチャ相当で呼ばれる --
 
-def test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
+def test_submit_plugin_rejects_strategy_kind_f6_5(tmp_path, settings):
+    """[profitability-floor] T1 Step 1-7 (2026-09-13、codex C1、F6-5/F6-6):
+    `submit_plugin` (legacy corridor) は strategy candidate を fail
+    closed で拒否する — 固定 holdout を含む共有ゲート
+    (`switch.submit_candidate`) を経由しない candidate にはフロアが一切
+    課されないため。エラーメッセージには案内 (`materialize`/
+    `--from _human`) を含む (pin F6-5)。approval_requests 行は作らない
+    (pin F6-6)。
+
+    **未申告の逸脱ではない適応**: この節の 8 tests
+    (`test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs`
+    等) は `submit_plugin` 経由で `_validate_strategy` の内部挙動
+    (pairs 検証順序・intent_source.close()・eval_timeframe 写像) を
+    検証していた。`submit_plugin` が strategy を拒否するようになった
+    ため、それらは `approval._validate_strategy` を直接呼ぶ形に
+    書き換えた (docstring が明記する「直接呼び出し (テスト) からのみ
+    到達する」を体現— 削除すると `_validate_strategy` の回帰カバレッジ
+    が失われるため)。本 test だけが新規の「拒否」pin。"""
+    d = _write_plugin(tmp_path, "strat", kind="strategy", plugin_py=STRATEGY_PY,
+                      config_yaml="kind: strategy\ntimeframe: 1h\n"
+                                 "pairs: [USDJPY, EURUSD]\nexit_mode: levels\n"
+                                 "max_bars: 200\n")
+    meta = _strategy_meta(d, pairs=("USDJPY", "EURUSD"))
+    conn = _conn(tmp_path)
+
+    with pytest.raises(ValueError, match="materialize") as exc_info:
+        approval.submit_plugin(conn, meta, settings=settings, now=NOW)
+    assert "--from _human" in str(exc_info.value)
+    assert _count_rows(conn) == 0
+
+
+def test_l3_submit_plugin_rejects_strategy_before_reading_test_plugin_file(
         tmp_path, settings):
+    """L3 (2026-09-13、ローカル 1 周目 ornith+qwen 独立到達 dup):
+    `test_submit_plugin_rejects_strategy_kind_f6_5` は例外メッセージの
+    文言だけを見ており、「strategy 判定 → 即 raise (ファイル読取・
+    ゲート実行を一切経ない)」という順序契約を積極検証していなかった —
+    後続処理 (`test_plugin.py` 読み取り・`check_source`・pytest 実行)
+    を追加しても文言さえ保てば緑のままだった。
+
+    ここでは `test_plugin.py` ファイルを**意図的に作らない**候補で
+    `submit_plugin` を呼ぶ。もし strategy 拒否が `test_plugin_path.
+    read_bytes()` より後ろへ移動していれば `FileNotFoundError` (OSError)
+    が飛ぶ — 拒否が本当に読み取りより前にあれば、ファイル不在に関わらず
+    同じ `ValueError` (materialize 案内) が飛ぶ。"""
+    d = tmp_path / "strat_no_test_file"
+    d.mkdir()
+    (d / "plugin.py").write_text(STRATEGY_PY)
+    (d / "config.yaml").write_text(
+        "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nexit_mode: levels\n")
+    # test_plugin.py を意図的に作らない。
+    meta = _strategy_meta(d, name="strat_no_test_file")
+
+    pytest_runner_calls = []
+
+    with pytest.raises(ValueError, match="materialize"):
+        approval.submit_plugin(
+            conn=_conn(tmp_path), meta=meta, settings=settings, now=NOW,
+            pytest_runner=lambda p: pytest_runner_calls.append(p))
+
+    assert pytest_runner_calls == []  # ゲートにも一切到達していない
+
+
+def test_validate_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
+        tmp_path, settings):
+    """`_validate_strategy` 直接呼び出しへの書き換え (上記 F6-5 pin の
+    docstring 参照)。"""
     d = _write_plugin(tmp_path, "strat", kind="strategy", plugin_py=STRATEGY_PY,
                       config_yaml="kind: strategy\ntimeframe: 1h\n"
                                  "pairs: [USDJPY, EURUSD]\nexit_mode: levels\n"
@@ -393,17 +458,10 @@ def test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
                 "max_drawdown": 0.05, "total_pnl": 100.0, "evaluable": False,
                 "fallback_spread_used": False}
 
-    pytest_calls: list[Path] = []
-
-    def counting_ok_runner(path: Path) -> GateResult:
-        pytest_calls.append(path)
-        return _ok_pytest_runner(path)
-
-    approval_id = approval.submit_plugin(
+    metrics, evaluable = approval._validate_strategy(
         conn, meta, settings=two_pair_settings, now=NOW,
-        pytest_runner=counting_ok_runner, run_in_sample_fn=fake_run_in_sample)
+        run_in_sample_fn=fake_run_in_sample)
 
-    assert len(pytest_calls) == 1  # pytest はプラグイン全体で 1 回だけ
     assert len(calls) == 2
     symbols = {c["symbol"] for c in calls}
     assert symbols == {"USDJPY", "EURUSD"}
@@ -416,19 +474,10 @@ def test_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
         assert c["now"] == NOW
         assert c["history_conn"] is conn
 
-    import json
-    payload = json.loads(conn.execute(
-        "SELECT payload_json FROM approval_requests WHERE id=?",
-        (approval_id,)).fetchone()["payload_json"])
-    assert set(payload["metrics"]) == {"USDJPY", "EURUSD"}
-    assert payload["metrics"]["USDJPY"]["trades"] == 15
-    assert payload["eval_source"] == "mt5"
+    assert set(metrics) == {"USDJPY", "EURUSD"}
+    assert metrics["USDJPY"]["trades"] == 15
     # 15+15=30 == EVALUABLE_MIN_TRADES (境界値, >= なので True)
-    assert payload["evaluable"] is True
-    # A6 (v3 設計): strategy は base_interval/eval_timeframe が実値を持つ。
-    # settings 側を "5m" にしているため "1m" リテラル固定の変異はここで死ぬ。
-    assert payload["base_interval"] == "5m"
-    assert payload["eval_timeframe"] == "1h"
+    assert evaluable is True
 
 
 def test_validate_strategy_uses_single_dataset_object_no_split_brain(
@@ -477,12 +526,15 @@ def test_validate_strategy_uses_single_dataset_object_no_split_brain(
     assert seen_adapter_dataset["obj"] is seen_run_dataset["obj"]
 
 
-def test_strategy_sandbox_error_from_run_in_sample_becomes_value_error(
+def test_validate_strategy_sandbox_error_from_run_in_sample_propagates(
         tmp_path, settings):
-    """③ kind 別検証段階 (strategy の run_in_sample) で SandboxError が
-    出た場合も submit_plugin の統一契約どおり ValueError に変換され、
-    approval_requests 行は作られないこと (①/②の check_source 失敗経路
-    しか通らない import-os テストでは検証できない分岐 — advisor 指摘)。"""
+    """[profitability-floor] T1 Step 1-7 の書き換え (F6-5 pin docstring
+    参照): `submit_plugin` は strategy を拒否するため、SandboxError→
+    ValueError 変換は legacy corridor では検証できなくなった (変換自体は
+    `submit_plugin` の `except SandboxError` にまだ存在し、indicator/
+    signal 側の既存 pin がカバーする)。ここでは `_validate_strategy`
+    自体が `SandboxError` を素通しすること (呼び出し元が変換の責務を持つ
+    契約) を pin する。"""
     from agentic_fx.plugin.sandbox import SandboxError
 
     d = _write_plugin(tmp_path, "strat_crash", kind="strategy",
@@ -496,14 +548,15 @@ def test_strategy_sandbox_error_from_run_in_sample_becomes_value_error(
     def crashing_run_in_sample(settings_arg, **kwargs):
         raise SandboxError("plugin worker crashed mid-evaluation")
 
-    with pytest.raises(ValueError, match="plugin worker crashed mid-evaluation"):
-        approval.submit_plugin(conn, meta, settings=settings, now=NOW,
-                               pytest_runner=_ok_pytest_runner,
-                               run_in_sample_fn=crashing_run_in_sample)
+    with pytest.raises(SandboxError, match="plugin worker crashed mid-evaluation"):
+        approval._validate_strategy(conn, meta, settings=settings, now=NOW,
+                                    run_in_sample_fn=crashing_run_in_sample)
     assert _count_rows(conn) == 0
 
 
-def test_strategy_eval_timeframe_maps_1d_to_24h(tmp_path, settings):
+def test_validate_strategy_eval_timeframe_maps_1d_to_24h(tmp_path, settings):
+    """`_validate_strategy` 直接呼び出しへの書き換え (F6-5 pin docstring
+    参照 — submit_plugin は strategy を拒否するため)。"""
     d = _write_plugin(tmp_path, "strat_1d", kind="strategy", plugin_py=STRATEGY_PY,
                       config_yaml="kind: strategy\ntimeframe: 1d\npairs: [USDJPY]\n"
                                  "exit_mode: levels\nmax_bars: 200\n")
@@ -518,47 +571,18 @@ def test_strategy_eval_timeframe_maps_1d_to_24h(tmp_path, settings):
                 "max_drawdown": 0.0, "total_pnl": 0.0, "evaluable": False,
                 "fallback_spread_used": False}
 
-    approval.submit_plugin(conn, meta, settings=settings, now=NOW,
-                           pytest_runner=_ok_pytest_runner,
-                           run_in_sample_fn=fake_run_in_sample)
+    approval._validate_strategy(conn, meta, settings=settings, now=NOW,
+                                run_in_sample_fn=fake_run_in_sample)
     assert len(calls) == 1
     assert calls[0]["eval_timeframe"] == "24h"
 
 
-def test_strategy_payload_eval_timeframe_maps_1d_to_24h(tmp_path, settings):
-    """段階 2 レビュー是正 F1: approval payload (submit 系統) の
-    `eval_timeframe` も "1d"→"24h" 写像を適用する (既存 pin
-    `test_strategy_eval_timeframe_maps_1d_to_24h` は run_in_sample へ渡す
-    kwarg だけを見ており、`approvals.create` に保存される payload 自体は
-    別に構築される (approval.py:317) ため未カバーだった)。
-    """
-    d = _write_plugin(tmp_path, "strat_1d_payload", kind="strategy",
-                      plugin_py=STRATEGY_PY,
-                      config_yaml="kind: strategy\ntimeframe: 1d\n"
-                                 "pairs: [USDJPY]\nexit_mode: levels\n"
-                                 "max_bars: 200\n")
-    meta = _strategy_meta(d, name="strat_1d_payload", timeframe="1d")
-    conn = _conn(tmp_path)
-
-    def fake_run_in_sample(settings_arg, **kwargs):
-        return {"trades": 0, "pf": None, "win_rate": None, "avg_r": None,
-                "max_drawdown": 0.0, "total_pnl": 0.0, "evaluable": False,
-                "fallback_spread_used": False}
-
-    approval_id = approval.submit_plugin(
-        conn, meta, settings=settings, now=NOW,
-        pytest_runner=_ok_pytest_runner, run_in_sample_fn=fake_run_in_sample)
-
-    import json
-    payload = json.loads(conn.execute(
-        "SELECT payload_json FROM approval_requests WHERE id=?",
-        (approval_id,)).fetchone()["payload_json"])
-    assert payload["eval_timeframe"] == "24h"
-
-
 # --- ④ pairs が settings.pairs 外 ValueError ----------------------------
 
-def test_strategy_pair_outside_settings_pairs_raises_value_error(tmp_path, settings):
+def test_validate_strategy_pair_outside_settings_pairs_raises_value_error(
+        tmp_path, settings):
+    """`_validate_strategy` 直接呼び出しへの書き換え (F6-5 pin docstring
+    参照)。"""
     d = _write_plugin(tmp_path, "strat_bad", kind="strategy", plugin_py=STRATEGY_PY,
                       config_yaml="kind: strategy\ntimeframe: 1h\npairs: [EURJPY]\n"
                                  "exit_mode: levels\nmax_bars: 200\n")
@@ -572,20 +596,21 @@ def test_strategy_pair_outside_settings_pairs_raises_value_error(tmp_path, setti
         return {"trades": 0}
 
     with pytest.raises(ValueError, match="not in settings.pairs"):
-        approval.submit_plugin(conn, meta, settings=settings, now=NOW,
-                               pytest_runner=_ok_pytest_runner,
-                               run_in_sample_fn=fake_run_in_sample)
+        approval._validate_strategy(conn, meta, settings=settings, now=NOW,
+                                    run_in_sample_fn=fake_run_in_sample)
     assert called == []  # 1 pair 目ですでに ValueError — バックテストは 0 回
     assert _count_rows(conn) == 0
 
 
-def test_strategy_second_pair_outside_settings_pairs_raises_value_error(
+def test_validate_strategy_second_pair_outside_settings_pairs_raises_value_error(
         tmp_path, settings):
     """F2 (レビュー fix round 1, sonnet 変異生存): pairs 検証を
     「先頭 pair のみ」に縮小する変異が既存テストでは検出できなかった
     (先頭が不正なケースしか無かったため)。先頭は settings.pairs 内の
     有効な pair ("USDJPY")・後方が settings.pairs 外 ("EURJPY") という
-    組み合わせで、後方の不正 pair も確実に検出されることをピンする。"""
+    組み合わせで、後方の不正 pair も確実に検出されることをピンする。
+    (`_validate_strategy` 直接呼び出しへの書き換え、F6-5 pin docstring
+    参照)。"""
     d = _write_plugin(tmp_path, "strat_bad2", kind="strategy",
                       plugin_py=STRATEGY_PY,
                       config_yaml="kind: strategy\ntimeframe: 1h\n"
@@ -601,9 +626,8 @@ def test_strategy_second_pair_outside_settings_pairs_raises_value_error(
         return {"trades": 0}
 
     with pytest.raises(ValueError, match="not in settings.pairs"):
-        approval.submit_plugin(conn, meta, settings=settings, now=NOW,
-                               pytest_runner=_ok_pytest_runner,
-                               run_in_sample_fn=fake_run_in_sample)
+        approval._validate_strategy(conn, meta, settings=settings, now=NOW,
+                                    run_in_sample_fn=fake_run_in_sample)
     assert called == []  # 先頭 pair が有効でも、後方の不正で 0 回のまま
     assert _count_rows(conn) == 0
 
@@ -623,7 +647,9 @@ class _FakeIntentSource:
         self.closed = True
 
 
-def test_strategy_close_called_for_each_pair_on_success(tmp_path, settings):
+def test_validate_strategy_close_called_for_each_pair_on_success(tmp_path, settings):
+    """`_validate_strategy` 直接呼び出しへの書き換え (F6-5 pin docstring
+    参照)。"""
     d = _write_plugin(tmp_path, "strat_close_ok", kind="strategy",
                       plugin_py=STRATEGY_PY,
                       config_yaml="kind: strategy\ntimeframe: 1h\n"
@@ -650,23 +676,24 @@ def test_strategy_close_called_for_each_pair_on_success(tmp_path, settings):
 
     with patch("agentic_fx.plugin.approval.strategy_adapter.build_intent_source",
                side_effect=fake_build_intent_source):
-        approval.submit_plugin(conn, meta, settings=two_pair_settings, now=NOW,
-                               pytest_runner=_ok_pytest_runner,
-                               run_in_sample_fn=fake_run_in_sample)
+        approval._validate_strategy(conn, meta, settings=two_pair_settings, now=NOW,
+                                    run_in_sample_fn=fake_run_in_sample)
 
     assert len(created) == 2
     assert all(src.closed for src in created)
     assert seen_sources == ["mt5", "mt5"]
 
 
-def test_strategy_close_called_even_when_run_in_sample_raises(tmp_path, settings):
+def test_validate_strategy_close_called_even_when_run_in_sample_raises(
+        tmp_path, settings):
     """F3 (レビュー fix round 1, sonnet 変異生存): 既存の fake
     run_in_sample_fn はどれも intent_source を一度も呼ばなかったため、
     session が lazy 未生成のままで `close()` を finally から外す変異が
     19 テスト全部 green のまま生存した (実測)。close() 呼び出しを観測可能
     な fake アダプタを直接注入し、run_in_sample_fn が例外を投げても
     (a) その pair の close() が確実に呼ばれる (b) 以降の pair へは進まない
-    ことをピンする。"""
+    ことをピンする。(`_validate_strategy` 直接呼び出しへの書き換え、
+    F6-5 pin docstring 参照)。"""
     d = _write_plugin(tmp_path, "strat_close_err", kind="strategy",
                       plugin_py=STRATEGY_PY,
                       config_yaml="kind: strategy\ntimeframe: 1h\n"
@@ -692,9 +719,9 @@ def test_strategy_close_called_even_when_run_in_sample_raises(tmp_path, settings
     with patch("agentic_fx.plugin.approval.strategy_adapter.build_intent_source",
                side_effect=fake_build_intent_source):
         with pytest.raises(RuntimeError, match="boom"):
-            approval.submit_plugin(conn, meta, settings=two_pair_settings, now=NOW,
-                                   pytest_runner=_ok_pytest_runner,
-                                   run_in_sample_fn=crashing_run_in_sample)
+            approval._validate_strategy(
+                conn, meta, settings=two_pair_settings, now=NOW,
+                run_in_sample_fn=crashing_run_in_sample)
 
     assert run_in_sample_calls == ["USDJPY"]  # 2 pair 目には進まない
     assert len(created) == 1
@@ -887,11 +914,15 @@ def _seed_flat(conn, start: datetime, minutes: int, *, price: float,
 
 
 def test_integration_strategy_real_session_and_run_in_sample(tmp_path, settings):
-    """実 pytest + 実 PluginSession (sma_cross サンプル) + 実
-    holdout.run_in_sample を通す (fake 一切なし)。opus R2 I1 の性能懸念
-    (セッション型で解消される見込み) を実測するための唯一の実サブプロセス
-    strategy 統合テスト — 実測秒数は report に記録する。
-    """
+    """実 PluginSession (sma_cross サンプル) + 実 holdout.run_in_sample を
+    通す (fake 一切なし)。opus R2 I1 の性能懸念 (セッション型で解消される
+    見込み) を実測するための唯一の実サブプロセス strategy 統合テスト —
+    実測秒数は report に記録する。
+
+    [profitability-floor] T1 Step 1-7 の書き換え (F6-5 pin docstring
+    参照): `submit_plugin` は strategy を拒否するため `_validate_strategy`
+    を直接呼ぶ (実 pytest 実行は無くなる — `_validate_strategy` 自体は
+    pytest を実行しない)。"""
     boundary = holdout_boundary(NOW, settings.backtest.holdout_months)
     seed_start = boundary - timedelta(days=2)
 
@@ -906,18 +937,14 @@ def test_integration_strategy_real_session_and_run_in_sample(tmp_path, settings)
         content_hash=real_content_hash(_SMA_CROSS_DIR))
 
     started = time.perf_counter()
-    approval_id = approval.submit_plugin(conn, meta, settings=settings, now=NOW)
+    metrics, evaluable = approval._validate_strategy(
+        conn, meta, settings=settings, now=NOW, run_in_sample_fn=None)
     elapsed = time.perf_counter() - started
-    print(f"\n[Task 6 実測] strategy submit (実 pytest + 実 PluginSession + "
+    print(f"\n[Task 6 実測] _validate_strategy (実 PluginSession + "
          f"実 run_in_sample, 2 日分 1h 評価): {elapsed:.3f}s")
 
-    import json
-    payload = json.loads(conn.execute(
-        "SELECT payload_json FROM approval_requests WHERE id=?",
-        (approval_id,)).fetchone()["payload_json"])
-    assert "USDJPY" in payload["metrics"]
-    assert "trades" in payload["metrics"]["USDJPY"]
-    assert payload["content_hash"] == meta.content_hash
+    assert "USDJPY" in metrics
+    assert "trades" in metrics["USDJPY"]
 
 
 # --- CLI 配線: entry.main(["plugin", "submit"/"bless", name]) ------------

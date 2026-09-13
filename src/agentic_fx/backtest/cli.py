@@ -492,11 +492,18 @@ def _plugin_submit(conn, settings, args: argparse.Namespace, root: Path) -> int:
         # 11d/11e: --from _human は switch.submit_candidate (P1) を通す
         # (candidate_origin="human" — plugins/_human/<name> を候補にする)
         plugins_dir = root / "plugins"
+        # [profitability-floor] T1 Step 1-7/T1-g (2026-09-13、codex R2-I2):
+        # bless と同じ ActivityLog を渡す — `submit_candidate` の
+        # フロア不合格 activity 行 (`submit_floor_rejected`) の配線元。
+        # `plugins_root.parent / "logs"` を関数内で推測する新しい所有
+        # 規則は作らない (cli.py:556 の既存例と同じ構築のみ)。
+        activity = ActivityLog(root / "logs" / "activity.log")
         try:
             approval_id = plugin_switch.submit_candidate(
                 conn, name=args.name, staging_dir=plugins_dir / "_human",
                 candidate_origin="human", mission_id=None, backlog_id=None,
-                settings=settings, now=datetime.now(timezone.utc))
+                settings=settings, now=datetime.now(timezone.utc),
+                activity=activity)
         except (ValueError, plugin_sandbox.SandboxError,
                 plugin_switch.CandidateMissingError) as e:
             print(f"エラー: {e}", file=sys.stderr)
@@ -529,10 +536,29 @@ def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
         return 1
     plugins_dir = root / "plugins"
     human_dir = plugins_dir / "_human" / args.name
+    activity = ActivityLog(root / "logs" / "activity.log")
+
+    # [profitability-floor] T1 Step 1-5 (2026-09-13、codex I5):
+    # `bless_candidate` は収益性フロア不合格でも `int` を返す (警告のみ)。
+    # ここで stderr へ settings からレンダした警告文を出す。終了コードは
+    # 0 のまま (人間裁定で承認は成立している)。
+    def _warn(label: str, detail: str) -> None:
+        # [profitability-floor] codex 2 周目レビュー CR1/CR3 (2026-09-13):
+        # 条件節は共有 helper `strategy_gate.floor_rule_text` から得る。
+        # audience="human" — `require_holdout_evaluable=True` のとき
+        # holdout 条件も文言に含める (CR1: 人間は遮断 8 の対象外)。
+        g = settings.improve.gate
+        condition = strategy_gate.floor_rule_text(g, audience="human")
+        print(
+            f"警告: この候補は収益性フロア ({condition}) "
+            "を満たしません。人間裁定で承認申請を作成しました。詳細は "
+            "`afx> approval <id>`", file=sys.stderr)
+
     try:
         approval_id = plugin_switch.bless_candidate(
             conn, name=args.name, human_dir=human_dir, settings=settings,
-            now=datetime.now(timezone.utc), decided_by="human_cli")
+            now=datetime.now(timezone.utc), decided_by="human_cli",
+            on_floor_warning=_warn, activity=activity)
     except (ValueError, plugin_sandbox.SandboxError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1

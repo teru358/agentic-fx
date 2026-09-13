@@ -70,7 +70,8 @@
      `noop_copy_of` として不合格になる。必ず実質的な変更を含めること。
    - gate は pytest が実際に通したテスト数 (`{min_test_functions}` 本以上) で判定。
 3. **1 回の結果で課題を捨てないでください** — うまくいかなかった場合も
-   `observation` として理由を残し、次回への申し送りにしてください。
+   `observation` として理由を残し、**試したパラメータと得られた pf /
+   avg_r を具体的に**書いて次回への申し送りにしてください。
 4. **strategy 候補は self-test の合否に関わらず、まず `run_backtest` で実データを確認してください。**
    2 回目以降の self-test は run_backtest 後でないと拒否されます。`evaluate` は df の最終バーで判定するため、
    クロス等のイベントは最終バーで起こしてください。設定 `improve.tool_budget` で定める予算を超えた
@@ -78,7 +79,9 @@
    `budget exhausted` を受けたら同じ tool を再度呼ばず、直ちに最終出力
    (提出か observation) を出してください。拒否が続くと mission は打ち切られ、
    それまでの backtest 結果は保存されません。応答の `remaining_budget` で
-   残り枠が分かります。
+   残り枠が分かります。**`config.yaml` の `pairs` に宣言した全 pair を
+   最低 1 回 `run_backtest` で確認してから提出してください** (候補は
+   1 pair の不合格で全体が落ちます)。{profitability_floor_rule}
 5. 出力は必ず下の「最終出力」の形式 (`discoveries` / `selected` /
    `artifact` / `selection_rationale`) に従ってください。分析 ID・探索
    回数などの集計値はあなたが数える必要はありません (親が RPC 記録から

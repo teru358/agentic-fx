@@ -58,9 +58,10 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from agentic_fx.backtest import holdout
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
@@ -123,7 +124,27 @@ def _validate_strategy(conn: sqlite3.Connection, meta: PluginMeta, *,
     (1 pair でも外れていれば ValueError — バックテストは 1 回も実行しない)、
     各 pair について build_intent_source → run_in_sample → try/finally で
     close() する (Task 5 の CLI と同じ規律)。
-    """
+
+    [profitability-floor] T1 Step 1-7 (2026-09-13、codex C1): `submit_plugin`
+    は冒頭で `meta.kind == "strategy"` を拒否するため、この関数の
+    strategy 分岐は **`submit_plugin` 経由では到達不能** — 直接呼び出し
+    (テスト) からのみ到達する。削除はしない (tests が直接使う)。
+    この分岐にフロアは足さない (v1 の「legacy corridor に in_sample 段
+    だけ足す」は C1 により撤回済み)。
+
+    [profitability-floor] codex 2 周目レビュー CR2 (2026-09-13、
+    追加是正・既知の限界の明記): **この関数自体は収益性フロアを一切
+    実装していない** (`_check_profitability_floor` を呼ばない) —
+    フロアからの保護は `submit_plugin` 冒頭の `kind == "strategy"`
+    チェック 1 点だけに依存する構造的な弱さがある (この関数の性質では
+    なく呼び出し元の 1 箇所のガードだけが守っている、という事実)。
+    将来、`_validate_kind`/`_validate_strategy` を strategy candidate に
+    対して直接呼ぶ新しい経路 (`submit_plugin` を経由しない) ができれば、
+    その経路はフロアを黙って迂回する。**正しい経路は常に共有ゲート
+    (`switch.submit_candidate`/`bless_candidate` → `run_kind_gate` →
+    `evaluate_strategy_adoption_gate`) を通ること** — 起票済み
+    [legacy-submit-corridor-bypasses-gate] の対象 (本束では対応しない、
+    構造的な保護への転換は別途検討)。"""
     invalid_pairs = [p for p in meta.pairs if p not in settings.pairs]
     if invalid_pairs:
         raise ValueError(
@@ -174,12 +195,45 @@ def _validate_kind(conn: sqlite3.Connection, meta: PluginMeta, *,
     raise ValueError(f"plugin {meta.name!r}: unsupported kind {meta.kind!r}")
 
 
+@dataclass(frozen=True)
+class GateOutcome:
+    """[profitability-floor] T1 Step 1-4 (2026-09-13、設計書 §3 T1-d、
+    codex I4/I5 + R2-I1)。`run_kind_gate` の戻り値の named result 型 —
+    `tuple[dict, bool]` からの拡張は tuple 化せず、この型に一本化する
+    (Global Constraints 逐語: tuple 拡張禁止)。
+
+    `verdict_kind` が判別子。`_run_full_gate` (switch.py) は**これだけ**
+    を見て raise するか続行するかを決める — 例外メッセージの部分一致
+    (`"unprofitable"` など) による分類は禁止 (`floor_detail` や候補名に
+    紛れ込みうるため、pin F6-10)。
+    """
+    metrics: dict
+    evaluable: bool
+    verdict_kind: Literal["ok", "insufficient_trades", "floor"] = "ok"
+    # [profitability-floor] codex 2 周目レビュー CR6 (2026-09-13):
+    # `floor_failed` フィールドは削除した (`verdict_kind == "floor"` と
+    # 完全な同値で、生産コードのどこからも読まれず — `switch.py::
+    # _run_full_gate` の分岐は全て `verdict_kind` を見る — 2 つの
+    # `GateOutcome(...)` 構築箇所の片方だけ更新されて食い違っても
+    # 検出する読者が居なかった)。判別子は `verdict_kind` に一本化する。
+    floor_warning: str = ""  # "" | "unprofitable"
+    floor_detail: str = ""  # 人間向け全数値 (payload/表示用)
+    insufficient_trades_reason: str = ""  # "insufficient_trades:<n>"
+    # T1-f の非コミット sink。CR7 (2026-09-13): 呼び出し元が `run_kind_gate`
+    # に `sink=` を渡した場合はその**同じ list オブジェクト**になる
+    # (`is` で同一性が成立する) — 既定は空 tuple。
+    gate_rows: "tuple[dict, ...] | list[dict]" = field(default_factory=tuple)
+
+
 # precheck 2026-08-22 wave2: T11-B-11d
 def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
                   settings: "Settings", now: datetime,
                   sandbox_run: SandboxRunFn | None = None,
                   run_in_sample_fn: RunInSampleFn | None = None,
-                  ) -> tuple[dict, bool]:
+                  floor_mode: Literal["enforce", "warn"] = "enforce",
+                  record_fn: "Callable[[dict], None] | None" = None,
+                  sink: "list[dict] | None" = None,
+                  ) -> GateOutcome:
     """`switch.py` の `submit_candidate`/`bless_candidate` (`_run_full_gate`
     手順 7) から共有呼び出しされる kind 別検証の入口。indicator/signal は
     `_validate_kind` (= `submit_plugin` の旧 kind="plugin" 直接申請 API と
@@ -199,28 +253,66 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
     name/pairs/timeframe/content_hash は明示せず `meta` 由来のデフォルトに
     委ねる (switch.py 側は `_run_full_gate` が直前に discover した鮮度の
     高い meta を渡すため、10.6 節が懸念する staleness は生じない)。
-    `evaluable=False` (閾値未満) は §8.1-41 pin どおり approval 行を一切
-    作らせないため、ここで fail closed に ValueError へ倒す (verdict が
-    そのまま `ValueError` を送出する場合 — 例えば history 不足 — はそれを
-    そのまま伝播させる、二重に包まない)。`run_in_sample_fn` seam は
+
+    [profitability-floor] T1 Step 1-4 (2026-09-13、codex R2-I1):
+    **ゲート判定で例外を投げない** — 標本不足 (旧: `ValueError` 直接
+    送出) も収益性フロア不合格も `verdict_kind` に載せて常に
+    `GateOutcome` を返す。raise するかどうかの決定は呼び出し元
+    (`_run_full_gate`) が判別子から行う。`run_in_sample_fn` seam は
     switch.py 側にまだ注入経路が無い (既存テストは `submit_plugin`/
     `_validate_kind` 経由の corridor でしか使っていない — `grep -rn
     run_in_sample_fn tests/` で確認済み) ため、`evaluate_strategy_adoption_
     gate` の `run_in_sample_fn` 引数へは転送しない (シグネチャの
     `run_in_sample_fn` 仮引数は `_validate_kind` 経由の indicator/signal/
     非-strategy 呼び出しとの互換のためだけに残す)。
+
+    [profitability-floor] codex 2 周目レビュー CR7 (2026-09-13):
+    `sink` は呼び出し元が既に持っている `list[dict]` をそのまま行の
+    蓄積先として使わせるための引数 — 渡せば `GateOutcome.gate_rows` は
+    **その同じ list オブジェクト** (`is` で同一性が成立する) になる。
+    以前は `_run_full_gate` (switch.py) が自分の `rows` list を
+    `record_fn=rows.append` で渡し、この関数がさらに**別の** `rows`
+    list を作って両方に積んでいた — 例外/insufficient_trades/floor 分岐
+    でしか読まれない `_run_full_gate` 側の list が、成功経路では二重に
+    確保・充填されるだけで一切使われずに捨てられていた (無駄な allocation
+    + 2 つの「正」の list が存在する紛らわしさ)。`sink` を渡せば
+    `_run_full_gate` は自分の list だけを唯一の正として持てる。
+    `record_fn` は引き続き「行 1 件ごとのコールバック通知」用に残す
+    (list を持たず単に転送を挟みたい呼び出し元向け、`sink` とは独立)。
     """
     if meta.kind == "strategy":
+        rows: list[dict] = sink if sink is not None else []
+
+        def _sink(row: dict) -> None:
+            rows.append(row)
+            if record_fn is not None:
+                record_fn(row)
+
         verdict = strategy_gate.evaluate_strategy_adoption_gate(
-            conn, meta=meta, settings=settings, now=now)
+            conn, meta=meta, settings=settings, now=now,
+            floor_mode=floor_mode, record_fn=_sink)
         if verdict is None or not verdict.evaluable:
+            # strategy_gate.evaluate_strategy_adoption_gate は既に
+            # "insufficient_trades:<n>" の形で observation_reason を返す。
             reason = verdict.observation_reason if verdict is not None else ""
-            raise ValueError(
-                f"plugin {meta.name!r}: strategy not evaluable "
-                f"({reason})")
-        return (verdict.candidate_metrics or {}), verdict.evaluable
-    return _validate_kind(conn, meta, settings=settings, now=now,
-                          sandbox_run=sandbox_run, run_in_sample_fn=run_in_sample_fn)
+            return GateOutcome(
+                metrics={}, evaluable=False,
+                verdict_kind="insufficient_trades",
+                insufficient_trades_reason=reason, gate_rows=rows)
+        if verdict.floor_reason:
+            return GateOutcome(
+                metrics=verdict.candidate_metrics or {}, evaluable=True,
+                verdict_kind="floor",
+                floor_warning=verdict.floor_reason,
+                floor_detail=verdict.floor_detail, gate_rows=rows)
+        return GateOutcome(
+            metrics=verdict.candidate_metrics or {}, evaluable=verdict.evaluable,
+            verdict_kind="ok", gate_rows=rows)
+    metrics, evaluable = _validate_kind(
+        conn, meta, settings=settings, now=now, sandbox_run=sandbox_run,
+        run_in_sample_fn=run_in_sample_fn)
+    return GateOutcome(metrics=metrics, evaluable=evaluable, verdict_kind="ok",
+                       gate_rows=sink if sink is not None else [])
 
 
 def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
@@ -238,7 +330,23 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
     統一契約 — F5)。**環境障害 (`OSError`・`sqlite3.Error` 等、例えば
     `approvals.create` の DB 書き込み失敗) はここでは catch せず、その
     まま貫通させる** — 変換対象は「plugin 検証の失敗」に限る。
+
+    [profitability-floor] T1 Step 1-7 (2026-09-13、設計書 §3 T1-e、
+    codex C1): この経路 (legacy submit) は **strategy を受け付けない**
+    — 固定 holdout を含む共有ゲート (`switch.submit_candidate` →
+    `run_kind_gate` → `evaluate_strategy_adoption_gate`) を通さないため、
+    収益性フロアの判定が一切課されない抜け道になる。検証ゲート
+    (`test_plugin_bytes` の読み取り) より前・API 側で fail closed に
+    拒否する (CLI だけの案内にしない)。indicator/signal は従来どおり
+    この経路を通れる。
     """
+    if meta.kind == "strategy":
+        raise ValueError(
+            f"plugin {meta.name!r}: この経路は strategy を受け付けません — "
+            "`afx plugin materialize <name>` で候補を書き出し "
+            "`afx plugin submit <name> --from _human` を使ってください "
+            "(固定 holdout を含む共有ゲートを通すため)")
+
     test_plugin_path = meta.path / "test_plugin.py"
     # test_file_hash は監査値 (ロード時検証には使わない)。ゲートを通る前の
     # バイト列を記録する — ゲート後の内容で記録すると、pytest 実行から

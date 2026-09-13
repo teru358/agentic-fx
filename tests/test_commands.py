@@ -548,6 +548,45 @@ def test_approval_detail_missing_metrics_show_dash(tmp_path):
     assert "holdout: -" in out
 
 
+def test_approval_detail_shows_profitability_floor_fields(tmp_path):
+    """[profitability-floor] T1 Step 1-8 (2026-09-13): `bless_candidate`
+    のフロア警告 payload (`floor_warning`/`floor_detail`/
+    `profitability_floor`) が `afx> approval <id>` に表示される。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={
+            "name": "myst", "content_hash": "h1",
+            "floor_warning": "unprofitable",
+            "floor_detail": "in_sample: USDJPY: pf=0.5",
+            "profitability_floor": {
+                "min_pf": 1.0, "require_positive_avg_r": True,
+                "require_holdout_evaluable": False}},
+        now=NOW)
+
+    out = cmds.dispatch(f"approval {approval_id}")
+
+    assert "floor_warning=unprofitable" in out
+    assert "floor_detail=in_sample: USDJPY: pf=0.5" in out
+    assert "profitability_floor=" in out
+    assert "min_pf" in out
+
+
+def test_approval_detail_omits_floor_fields_when_absent(tmp_path):
+    """フロア関連 payload キーが無い (通常の合格 approval) 場合は行を
+    出さない (fail-soft、T0 実装の既存契約の回帰確認)。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "myind", "content_hash": "h1"}, now=NOW)
+
+    out = cmds.dispatch(f"approval {approval_id}")
+
+    assert "floor_warning=" not in out
+    assert "floor_detail=" not in out
+    assert "profitability_floor=" not in out
+
+
 def test_approval_detail_shows_archive_path_by_mission_content_hash(tmp_path):
     """approval-quality 設計書 §C ([archive-artifact-hash-vs-submitted]):
     `approval <id>` は payload の `mission_id`/`content_hash` で

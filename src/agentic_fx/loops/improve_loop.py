@@ -46,8 +46,10 @@ from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin.noop_gate import count_self_test_functions, find_noop_copy
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.strategy_gate import (
+    _check_profitability_floor,
     _eval_timeframe as _strategy_gate_eval_timeframe,
     evaluate_strategy_adoption_gate,
+    floor_rule_text as _strategy_gate_floor_rule_text,
 )
 from agentic_fx.runners.base import Mission
 from agentic_fx.tools.plugin_loader import approved_plugins
@@ -141,18 +143,28 @@ def _current_rpc_abandoned() -> bool:
     return getattr(threading.current_thread(), RPC_ABANDONED_ATTR, False)
 
 
-def _backtest_reply_from_save_kwargs(save_kwargs: dict) -> dict:
+def _backtest_reply_from_save_kwargs(
+        save_kwargs: dict, *, submission_blocked: dict | None = None) -> dict:
     """永続化用 save kwargs を JSON-safe な RPC 応答へ限定投影する。
     期間端点 (`period`) と保存時刻 (`now`) は agent に見せない (遮断 7、
-    `improve_rpc_tools._FORBIDDEN_KEYS`) — 台帳用の元データは属性で運ぶ。"""
-    return _BacktestReply({
+    `improve_rpc_tools._FORBIDDEN_KEYS`) — 台帳用の元データは属性で運ぶ。
+
+    [profitability-floor] T2 Step 2-1 (2026-09-13): `submission_blocked`
+    は**agent へ返る公開面にだけ**足す — `save_kwargs` (= 台帳/Tx-2 が
+    読む非公開の元データ) には一切混ぜない (`improve_rpc_tools.py:150-154`
+    の `save_kwargs` 契約を痩せさせない)。in_sample 段が合格のときは
+    キー自体を作らない (`None` を渡さない呼び出し元の既定)。"""
+    reply = {
         "scope": save_kwargs["scope"],
         "pair": save_kwargs["pair"],
         "timeframe": save_kwargs["timeframe"],
         "source": save_kwargs["source"],
         "metrics": save_kwargs["metrics"],
         "trial_count": 1,
-    }, save_kwargs)
+    }
+    if submission_blocked is not None:
+        reply["submission_blocked"] = submission_blocked
+    return _BacktestReply(reply, save_kwargs)
 
 
 @dataclass(frozen=True)
@@ -683,10 +695,40 @@ class ImproveLoop:
             "plugin_contract_summary": refs["plugin_contract_summary"],
             "staging_dir": str(ctx.staging_dir),
             "source_snapshot_dir": str(ctx.source_snapshot_dir),
+            # [profitability-floor] T2 Step 2-2 (2026-09-13、codex I8):
+            # 文言は settings からレンダする (ハードコードすると設定変更後
+            # にゲートと説明が食い違う)。
+            "profitability_floor_rule": self._floor_rule_text(),
         }
         template_path = (Path(__file__).resolve().parent / "prompts"
                          / "improve_mission.md")
         return template_path.read_text().format(**render_map)
+
+    def _floor_rule_text(self) -> str:
+        """[profitability-floor] T2 Step 2-2 (2026-09-13、設計書 §6 T2、
+        codex I8): 収益性フロアの規律文言を `improve.gate` の実値から
+        組み立てる。`.format()` は条件分岐できないため、文そのものを
+        ここで組み立ててプレースホルダへ渡す —
+        `require_positive_avg_r=False` のときは avg_r の条件を文から
+        省く (ハードコードした固定文言にしない)。
+
+        codex 2 周目レビュー CR3/CR1 (2026-09-13): 条件節の組み立て
+        自体は共有 helper `strategy_gate.floor_rule_text` に委譲する
+        (CLI・`switch._run_full_gate` と同じ実装を通す)。
+        `audience="agent"` を渡すため、`require_holdout_evaluable` は
+        **この文言に一切現れない** (遮断 8、設計書 §4 のただし書き —
+        holdout の閾値・条件を agent に見せない)。"""
+        g = self._settings.improve.gate
+        condition = _strategy_gate_floor_rule_text(g, audience="agent")
+        return (
+            f"**{condition} の候補は提出しても承認申請になりません**"
+            "(親の決定論ゲートが `unprofitable` として observation に"
+            "落とします)。予算内でパラメータ・フィルタ・エントリ条件を"
+            f"変えて `run_backtest` をやり直し、`pf >= {g.min_pf}`"
+            + (f" かつ `avg_r > 0`" if g.require_positive_avg_r else "")
+            + "を満たした候補だけを提出してください。予算を使い切っても"
+            "満たせなければ**提出せず** `observation` として、試した"
+            "パラメータ群とそれぞれの pf / avg_r を理由に書いてください。")
 
     def _compute_partition_hint(self, conn, slot_key) -> frozenset[int] | None:
         # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
@@ -905,6 +947,24 @@ class ImproveLoop:
                                args.get("name"))
                 return {"error": "backtest_failed"}
             save_kwargs = captured[0]
+            # [profitability-floor] T2 Step 2-1 (2026-09-13、設計書 §6
+            # T2、codex I7): `submission_blocked` は親 handler (ここ) の
+            # 1 箇所だけで導出する — `self._settings` を既に持っている
+            # ため、`build_improve_rpc_tooldefs`/`build_rpc_handlers`/
+            # `tools/mission_registry.py` のシグネチャは変えない (子側
+            # tooldef の `_strip_forbidden` は禁止キーのみを剥がすので
+            # このキーはそのまま agent へ通る)。**in_sample 段のみ判定
+            # (holdout は一切参照しない)**。判定は
+            # `_check_profitability_floor` を再利用する (閾値のハード
+            # コード禁止、T1 と同じ関数)。
+            floor_label, floor_detail_text = _check_profitability_floor(
+                {args["pair"]: save_kwargs["metrics"]},
+                settings=self._settings, scope="in_sample")
+            submission_blocked = (
+                {"reason": "unprofitable",
+                 "detail": f"{floor_detail_text} — この成績では親ゲートが"
+                           "承認申請を出さず observation になります"}
+                if floor_label else None)
             if ledger.state() != "OPEN" or _current_rpc_abandoned():
                 # /code-review 2 周目 CR4 (2026-09-11): timeout 後に完了した
                 # handler は記録されない (受理境界) — snapshot も書かない
@@ -915,7 +975,8 @@ class ImproveLoop:
                 self._activity.write(
                     Category.IMPROVE, "archive_skipped_late",
                     f"mission={staging_dir.name} name={args.get('name')}")
-                return _backtest_reply_from_save_kwargs(save_kwargs)
+                return _backtest_reply_from_save_kwargs(
+                    save_kwargs, submission_blocked=submission_blocked)
             artifact_hash = artifact_hash_bytes(
                 plugin_py, config_yaml, test_plugin)
             archive_tmp = (self._root / "plugins" / "_archive" /
@@ -958,7 +1019,8 @@ class ImproveLoop:
                 else:
                     save_kwargs["artifact_hash"] = artifact_hash
                     save_kwargs["archive_tmp"] = str(archive_tmp)
-            return _backtest_reply_from_save_kwargs(save_kwargs)
+            return _backtest_reply_from_save_kwargs(
+                save_kwargs, submission_blocked=submission_blocked)
 
         def analyze_corr_handler(args: dict) -> dict:
             try:
@@ -1304,10 +1366,14 @@ class ImproveLoop:
 
     def _run_strategy_gate(self, conn, *, name, pairs, timeframe, content_hash,
                            now, meta, kind="strategy", record_fn=None):
+        # [profitability-floor] T1 Step 1-3 (2026-09-12、設計書 §3 T1-b):
+        # 改善ループは常に `floor_mode="enforce"` (in_sample 段の不合格で
+        # holdout を回さず即終端 — evaluator の既定と同じ値だが、この
+        # 呼び出し元が「常に enforce」であることを明示するために渡す)。
         return evaluate_strategy_adoption_gate(
             conn, name=name, pairs=pairs, timeframe=timeframe,
             content_hash=content_hash, now=now, settings=self._settings,
-            meta=meta, kind=kind, record_fn=record_fn)
+            meta=meta, kind=kind, record_fn=record_fn, floor_mode="enforce")
 
     def _build_approval_payload(self, conn, *, name, kind, content_hash,
                                 artifact_hash, ctx_ledger, mission_id,
@@ -1343,6 +1409,11 @@ class ImproveLoop:
             "selection_rationale": output.get("selection_rationale", ""),
             "summary": output.get("artifact", {}).get("summary", ""),
             "audit_note": "RPC timeout した呼出しは数えていない",
+            # [profitability-floor] T1 Step 1-8 (2026-09-13、codex I3):
+            # 適用した閾値 snapshot (approval 行を作る 3 箇所すべてに載せる
+            # — switch.submit_candidate / switch.bless_candidate / ここ)。
+            # CR4 (2026-09-13): `ImproveGateSettings.snapshot()` に一本化。
+            "profitability_floor": self._settings.improve.gate.snapshot(),
         }
 
     def _check_duplicate_metrics(self, conn, *, content_hash, pair, variant,
@@ -2182,6 +2253,19 @@ class ImproveLoop:
                             reason=strategy_verdict.observation_reason, now=now,
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls)
                         return
+                    # [profitability-floor] T1 Step 1-3 (2026-09-12、設計書
+                    # §3 T1-b): 収益性フロア不合格の再ルート。`reason` は
+                    # 固定文言 `unprofitable` (last_result にそのまま流れる
+                    # — 遮断 8 の 1 bit 例外)。`report_detail` は親専有
+                    # レポートにのみ渡り、activity/last_result には流れない。
+                    if strategy_verdict.floor_reason:
+                        self._finalize_gate_failed(
+                            conn, ctx=ctx, backlog_id=selection.backlog_id,
+                            reason="unprofitable", now=now,
+                            gate_rows=tuple(gate_rows), tool_calls=tool_calls,
+                            mission_outcome="unprofitable",
+                            report_detail=strategy_verdict.floor_detail)
+                        return
                     gate_metrics["baseline"] = strategy_verdict.baseline_row
                     # [approval-payload-missing-gate-metrics] 是正 (A4 10
                     # 回目 claude #69 観測 A、2026-09-11): ゲートが実際に
@@ -2687,12 +2771,25 @@ class ImproveLoop:
                              final_path=final_path, now=now)
 
     def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now,
-                              gate_rows=(), tool_calls: int | None = None) -> None:
+                              gate_rows=(), tool_calls: int | None = None,
+                              mission_outcome: str = "gate_failed",
+                              report_detail: str = "") -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
         `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
         渡す)。承認申請は出さないため mission は `completed` で終端
         (取引は止めない — R8)。staging を削除し、台帳は `DISCARDED`。
+
+        [profitability-floor] T1 Step 1-3 (2026-09-12、設計書 §3 T1-b、
+        codex I6): `mission_outcome` は正常分岐 (report 作成成功) の
+        gate 行・ledger 行・settle の 3 箇所すべてへ渡す branch-local な
+        1 つの値 (既定 `"gate_failed"`、フロア経路は呼び出し元が
+        `"unprofitable"` を渡す)。**report 作成失敗分岐は
+        `outcome="report_failed"` に固定し、この引数で上書きしない**
+        (既存の `report_failed` 意味論を壊さない)。`report_detail` は
+        `body_md` の後段に追記する人間向けレポート専用の文字列 —
+        `last_result`/`activity` には一切流さない (pin F2-7/F5-2 の
+        「ラベルと数値の分離」契約)。
 
         D-15 是正 (着手前検証): 設計書 §4.2 手順6「ゲート不合格・評価不能・
         observation・敗者のとき、reports に書く」に従い、`_finalize_loser`
@@ -2713,6 +2810,11 @@ class ImproveLoop:
             f"# Improve Mission {ctx.mission_id} — gate failed\n\n"
             f"reason: `{reason}`\n\nNo approval request was produced by "
             "this mission.\n")
+        if report_detail:
+            # [profitability-floor] T1 Step 1-3: 親専有レポート本文の
+            # 後段にのみ全数値を書く。activity/last_result には流れない
+            # (report_detail の呼び出し元は `reason` と混ぜていない)。
+            body_md += f"\n## Profitability floor detail\n\n{report_detail}\n"
         reports_dir = self._root / "data" / "improve_reports"
         (reports_dir / ".tmp").mkdir(parents=True, exist_ok=True)
         # D-15 是正: 設計書 §4.2 手順6/7「一時ファイル作成に失敗していたら
@@ -2758,14 +2860,18 @@ class ImproveLoop:
         final_path = self._final_report_path(
             reports_dir, mission_id=ctx.mission_id, now=now)
 
+        # [profitability-floor] T1 Step 1-3 (codex I6): outcome を
+        # branch-local に 1 つ決めて gate 行・ledger 行・settle の 3 箇所
+        # 全てへ同じ値を渡す (分裂させない)。
+        outcome = mission_outcome
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
         try:
             ledger_ids = self._persist_ledger_in_tx(
-                conn, ctx=ctx, now=now, mission_outcome="gate_failed")
+                conn, ctx=ctx, now=now, mission_outcome=outcome)
             self._persist_gate_rows(
                 conn, gate_rows=gate_rows, now=now,
-                mission_id=ctx.mission_id, mission_outcome="gate_failed")
+                mission_id=ctx.mission_id, mission_outcome=outcome)
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="completed",
@@ -2781,6 +2887,6 @@ class ImproveLoop:
             conn.rollback()
             raise
         self._settle_ledger_after_commit(
-            conn, ctx=ctx, ledger_ids=ledger_ids, outcome="gate_failed", now=now)
+            conn, ctx=ctx, ledger_ids=ledger_ids, outcome=outcome, now=now)
         self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
                              final_path=final_path, now=now)

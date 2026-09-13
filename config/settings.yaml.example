@@ -95,6 +95,11 @@ improve:
   gate:
     # plugin gate で要求する self-test (`test_*`) の最低本数。
     min_test_functions: 3
+    # [floor-config] 収益性フロア (設計書 §6 T3)。採用判断の品質基準
+    # (risk.* の資金保護制約とは別物、緩めても実資金は動かない)。
+    min_pf: 1.0                     # in_sample/holdout の pf 下限 (pf が None = gross_loss 0 は PASS)
+    require_positive_avg_r: true    # avg_r <= 0.0 を不合格にするか
+    require_holdout_evaluable: false  # holdout evaluable=false を不合格にするか (既定: 標本不足は continue)
 
 logging:
   level: INFO

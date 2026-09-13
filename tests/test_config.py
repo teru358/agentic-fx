@@ -674,3 +674,65 @@ def test_settings_yaml_example_has_pytest_timeout_sec():
     from agentic_fx.config import load_settings
     settings = load_settings(EXAMPLE)
     assert settings.plugin.pytest_timeout_sec == 300.0
+
+
+def test_floor_config_defaults_f8_1():
+    """[floor-config] T3 pin F8-1: `ImproveGateSettings` の 3 キー既定値
+    (設計書 §6 T3 逐語)。"""
+    from agentic_fx.config import ImproveGateSettings
+    s = ImproveGateSettings()
+    assert s.min_pf == 1.0
+    assert s.require_positive_avg_r is True
+    assert s.require_holdout_evaluable is False
+
+
+def test_floor_config_example_keys_match_settings_type_f8_2():
+    """[floor-config] T3 pin F8-2: `settings.yaml.example` の
+    `improve.gate` のキー集合が `ImproveGateSettings` のフィールド集合と
+    一致する (`_Strict` = extra forbid のため、片方だけの追記は起動時に
+    ValidationError または既定値埋没のどちらかで気づかれずに終わる)。"""
+    import yaml
+
+    from agentic_fx.config import ImproveGateSettings
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    example_keys = set(raw["improve"]["gate"].keys())
+    model_keys = set(ImproveGateSettings.model_fields.keys())
+    assert example_keys == model_keys
+
+
+def test_floor_config_min_pf_rejects_negative_f8_3():
+    """[floor-config] T3 pin F8-3: `min_pf` は負値を拒否する (`ge=0.0`)。"""
+    from agentic_fx.config import ImproveGateSettings
+    with pytest.raises(ValidationError):
+        ImproveGateSettings(min_pf=-0.1)
+
+
+def test_max_backtests_per_candidate_below_pairs_count_rejected_f8_5(tmp_path):
+    """[floor-config] T3 pin F8-5: `improve.tool_budget
+    .max_backtests_per_candidate < len(pairs)` は `ValidationError`
+    (境界 `==` は通る、codex I10)。**`ge=1` 単体の既存制約では検出でき
+    ない値** (2 pairs に対し 1) を使う — `max_backtests_per_candidate=0`
+    は既存フィールド制約 (`ge=1`) だけで落ちてしまい、本 pin が検出したい
+    「クロスフィールド」の欠落を見逃す。"""
+    import yaml
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["pairs"] = ["USDJPY", "EURUSD"]
+    raw["risk"]["pair_rules"]["EURUSD"] = dict(raw["risk"]["pair_rules"]["USDJPY"])
+    raw.setdefault("improve", {}).setdefault(
+        "tool_budget", {})["max_backtests_per_candidate"] = 1
+    with pytest.raises(ValidationError):
+        Settings.model_validate(raw)
+
+
+def test_max_backtests_per_candidate_equal_to_pairs_count_passes_f8_5b():
+    """[floor-config] T3 pin F8-5 の境界対: `==` は通る。"""
+    import yaml
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["pairs"] = ["USDJPY", "EURUSD"]
+    raw["risk"]["pair_rules"]["EURUSD"] = dict(raw["risk"]["pair_rules"]["USDJPY"])
+    raw.setdefault("improve", {}).setdefault(
+        "tool_budget", {})["max_backtests_per_candidate"] = 2
+    Settings.model_validate(raw)  # ValidationError を投げない

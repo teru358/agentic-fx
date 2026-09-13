@@ -776,6 +776,22 @@ def test_find_matching_approved_metrics_ignores_non_approval_outcome(tmp_path):
     assert got is None
 
 
+def test_f4_8_unprofitable_outcome_excluded_from_dedup_population(tmp_path):
+    """F4-8 (2026-09-13、F 番号 gap 充足、[profitability-floor] 設計書
+    §3 T1「§A の dedup 母集団には影響しない」): `mission_outcome=
+    'unprofitable'` の行 (フロア不合格) は
+    `find_matching_approved_metrics` の母集団に入らない —
+    `WHERE ... AND mission_outcome='approval'` が既に絞るため
+    (新規コード変更は不要、回帰 pin)。"""
+    conn = _conn_approved(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, **_approved_kw(mission_outcome="unprofitable"))
+    got = backtest_runs.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="test",
+        base_interval="1m", trades=194, pf=1.4981, avg_r=0.2)
+    assert got is None
+
+
 def test_find_matching_approved_metrics_none_pf_matches_none_pf(tmp_path):
     """avg_r/pf が両方 `None` のケース (§A 検証節: `avg_r` が `None` 同士の
     一致)。"""

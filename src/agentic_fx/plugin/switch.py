@@ -12,7 +12,7 @@ import sqlite3
 import stat
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 from agentic_fx._safe_error import safe_error_text  # 検収 m10: per-row fault isolation の ERROR 記録に使う
 from agentic_fx.activity import ActivityLog, Category  # B-2: journal_store 層に activity を書かせない
@@ -24,6 +24,7 @@ from agentic_fx.plugin.gate_pytest import (  # M-8: モジュールレベル imp
 )
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.store import approvals as approvals_store
+from agentic_fx.store import backtest_runs as backtest_runs_store  # [profitability-floor] T1 Step 1-6: 人間 corridor の gate 行保存
 from agentic_fx.store import candidate_archives as candidate_archives_store  # T4 §1 L4 の archive GC が使う
 from agentic_fx.store import plugin_switch_journal as journal_store  # Task 8 produces
 
@@ -735,13 +736,65 @@ def _plugin_lock(plugins_root: Path, name: str):
         fh.close()
 
 
+def _write_gate_rows(conn: sqlite3.Connection, rows, *,
+                     mission_outcome: str) -> None:
+    """[profitability-floor] codex 2 周目レビュー CR5 (2026-09-13):
+    `outcome.gate_rows` を `backtest_runs` へ書く生ループを 1 箇所に
+    集約する。**tx 管理は呼び出し元の責務** (このループ自体は
+    `BEGIN`/`COMMIT` に触れない) — 既に開いている tx の中で呼ぶ場合
+    (成功パス、`submit_candidate`/`bless_candidate` 2 分岐) と、専用の
+    短い tx を新設する場合 (`_persist_human_gate_rows`、失敗パス) の
+    両方から共有する。以前はこの `for row in rows: save_harness_run(...)`
+    が 3 箇所 (成功パス 1 + bless の 2 分岐) に手書きでコピーされて
+    おり、将来の変更 (activity 追加・mission_outcome の意味変更等) を
+    3 箇所そろえて直す必要があった。"""
+    for row in rows:
+        backtest_runs_store.save_harness_run(
+            conn, commit=False, mission_id=None,
+            mission_outcome=mission_outcome, **row)
+
+
+def _persist_human_gate_rows(conn: sqlite3.Connection, rows: list[dict], *,
+                             mission_outcome: str, now: datetime) -> None:
+    """[profitability-floor] T1 Step 1-6 (2026-09-13、設計書 §3 T1-f):
+    `run_kind_gate` (経由 `evaluate_strategy_adoption_gate`) が
+    `record_fn` sink に積んだ行 (`GateOutcome.gate_rows`) を、
+    `_run_full_gate` が `ValueError` を投げる分岐で**短い専用 tx**として
+    保存してから raise する (証跡を失わない)。分類は呼び出し元が渡す
+    `mission_outcome` のみに従う (`GateOutcome.verdict_kind` から一意に
+    決まる値を渡すこと — ここで例外メッセージの部分一致は見ない)。
+    `rows` が空 (indicator/signal、または strategy ゲートの手前で落ちた)
+    なら no-op。"""
+    if not rows:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _write_gate_rows(conn, rows, mission_outcome=mission_outcome)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
-                   settings, now: datetime):
+                   settings, now: datetime,
+                   floor_mode: Literal["enforce", "warn"] = "enforce",
+                   activity: "ActivityLog | None" = None):
     """P1 手順 2〜7 / P3 手順 1〜2 の共有ゲート本体 (§8.1-41 pin: P1 と P3
     は同じゲートを通る — 二重実装しない)。合格すれば
-    `(meta, content_hash, artifact_hash, metrics, evaluable)` を返す。
+    `(meta, content_hash, artifact_hash, outcome: approval.GateOutcome)`
+    を返す (**4 要素固定** — tuple をこれ以上伸ばさない、設計書 §3 T1-d)。
     不合格 (スナップショット不正・AST 不合格・pytest 不合格・hash 不一致・
-    kind 別ゲート不合格) は ValueError — 何も作らない (fail closed)。"""
+    kind 別ゲート不合格) は ValueError — 何も作らない (fail closed)。
+
+    [profitability-floor] T1 Step 1-4/1-6 (2026-09-13、codex R2-I1):
+    `run_kind_gate` はゲート判定で例外を投げず常に `GateOutcome` を返す
+    — raise するかどうかは**ここ**が `verdict_kind` だけを見て決める
+    (`str(exc)` の部分一致による分類は禁止、pin F6-10)。捕捉済みの
+    `gate_rows` は raise の直前に `_persist_human_gate_rows` で保存する
+    (F6-12: `run_kind_gate` を抜けてくる想定外例外の経路でも同様に
+    `gate_failed` で保存してから元例外を伝播する — 行を捨てない/
+    `unprofitable` で保存しない)。"""
     check_candidate_snapshot(candidate_dir)  # 手順 2 (B-5: 名指し再利用)
     before_content, before_artifact = hashes_of(candidate_dir)  # 手順 3
 
@@ -751,6 +804,7 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
             f"plugin {name!r}: candidate at {candidate_dir} failed discovery "
             "validation (config/AST ゲート不合格 — ログ参照)")
 
+    rows: list[dict] = []
     try:
         check_source(candidate_dir / "plugin.py")  # 手順 4
         check_source(candidate_dir / "test_plugin.py",
@@ -776,12 +830,56 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         # 前で fail closed する。
         approval.assert_max_bars_within_limit(meta, settings=settings)
 
-        metrics, evaluable = approval.run_kind_gate(  # 手順 7
-            conn, meta, settings=settings, now=now)
+        outcome = approval.run_kind_gate(  # 手順 7
+            conn, meta, settings=settings, now=now, floor_mode=floor_mode,
+            sink=rows)
+        # CR7 (2026-09-13): `sink=rows` を渡したので `outcome.gate_rows`
+        # は `rows` と同一オブジェクト — 二重の list を作らない。
+        assert outcome.gate_rows is rows
     except SandboxError as exc:
+        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
         raise ValueError(f"plugin {name!r}: {exc}") from exc
+    except BaseException:
+        # F6-12 (codex R3-M1): run_kind_gate を抜けてくる想定外例外
+        # (holdout.NoHistoryError・履歴空の ValueError 等) も含め、
+        # 捕捉済みの行を gate_failed で保存してから元例外を伝播する。
+        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        raise
 
-    return meta, after_content, after_artifact, metrics, evaluable
+    if outcome.verdict_kind == "insufficient_trades":
+        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        raise ValueError(
+            f"plugin {name!r}: strategy not evaluable "
+            f"({outcome.insufficient_trades_reason})")
+    if outcome.verdict_kind == "floor" and floor_mode == "enforce":
+        _persist_human_gate_rows(conn, rows, mission_outcome="unprofitable", now=now)
+        g = settings.improve.gate
+        # [profitability-floor] codex 2 周目レビュー CR1/CR3 (2026-09-13):
+        # `strategy_gate.floor_rule_text(audience="human")` を使う —
+        # `require_holdout_evaluable=True` のとき holdout 条件も条件節に
+        # 含める (CR1、人間向けは遮断 8 の対象外)。既存の key=value 形式
+        # (`min_pf=`/`require_positive_avg_r=`/`require_holdout_evaluable=`)
+        # は既存 pin (F6-11a) が厳密一致で読むため残し、条件節を前段に
+        # 追加する形にする。
+        condition = strategy_gate.floor_rule_text(g, audience="human")
+        # [profitability-floor] T1 Step 1-7/T1-g (2026-09-13、codex R2-I2):
+        # `submit_candidate` のフロア不合格 activity 行はここで書く —
+        # bless は常に floor_mode="warn" でこの分岐に到達しないため、
+        # ここへの到達 = submit 経路のフロア拒否と同値。
+        if activity is not None:
+            activity.write(
+                Category.APPROVAL, "submit_floor_rejected",
+                f"name={name} unprofitable ({condition}) "
+                f"min_pf={g.min_pf} "
+                f"require_positive_avg_r={g.require_positive_avg_r} "
+                f"require_holdout_evaluable={g.require_holdout_evaluable}")
+        raise ValueError(
+            f"plugin {name!r}: unprofitable ({condition}) "
+            f"(min_pf={g.min_pf} "
+            f"require_positive_avg_r={g.require_positive_avg_r} "
+            f"require_holdout_evaluable={g.require_holdout_evaluable})")
+
+    return meta, after_content, after_artifact, outcome
 
 
 def _candidate_locator(*, staging_dir: Path, candidate_origin: str, name: str,
@@ -806,24 +904,32 @@ def submit_candidate(
     conn: sqlite3.Connection, *, name: str, staging_dir: Path,
     candidate_origin: Literal["staging", "human"], mission_id: int | None,
     backlog_id: int | None, settings, now: datetime,
+    activity: "ActivityLog | None" = None,
 ) -> int:
     """P1 (submit) の入口。kind 別ゲートを通し、1 つの短い tx で pending
-    approval 行を作る。ジャーナルは作らない (§5.1 冒頭の pin)。"""
+    approval 行を作る。ジャーナルは作らない (§5.1 冒頭の pin)。
+
+    [profitability-floor] T1 Step 1-7/T1-g (2026-09-13): 常に
+    `floor_mode="enforce"` で `_run_full_gate` を呼ぶ (フロア不合格候補は
+    approval 行を作らせない)。`activity` はフロア拒否 activity 行
+    (`submit_floor_rejected`、`_run_full_gate` 内部で書く) の配線用。"""
     plugins_root, candidate_path = _candidate_locator(
         staging_dir=staging_dir, candidate_origin=candidate_origin,
         name=name, mission_id=mission_id)
     candidate_dir = staging_dir / name
 
     with _plugin_lock(plugins_root, name):
-        meta, content_hash, artifact_hash, metrics, evaluable = _run_full_gate(
-            conn, candidate_dir, name=name, settings=settings, now=now)
+        meta, content_hash, artifact_hash, outcome = _run_full_gate(
+            conn, candidate_dir, name=name, settings=settings, now=now,
+            floor_mode="enforce", activity=activity)
 
+        g = settings.improve.gate
         payload = {
             "name": name, "kind": meta.kind,
             "candidate_origin": candidate_origin,
             "candidate_path": candidate_path,
             "content_hash": content_hash, "artifact_hash": artifact_hash,
-            "metrics": metrics, "evaluable": evaluable,
+            "metrics": outcome.metrics, "evaluable": outcome.evaluable,
             "eval_source": (settings.backtest.eval_source
                             if meta.kind == "strategy" else None),
             "base_interval": (settings.backtest.dataset().base_interval
@@ -832,11 +938,21 @@ def submit_candidate(
                               if meta.kind == "strategy" else None),
             "live_source": settings.plugin.producer_source,
             "mission_id": mission_id, "backlog_id": backlog_id,
+            # [profitability-floor] T1 Step 1-8 (codex I3): 適用した閾値
+            # snapshot (approval 行を作る 3 箇所すべてに載せる)。CR4
+            # (2026-09-13): `ImproveGateSettings.snapshot()` に一本化。
+            "profitability_floor": g.snapshot(),
         }
         conn.execute("BEGIN IMMEDIATE")
         try:
             approval_id = approvals_store.create(
                 conn, kind="plugin", payload=payload, now=now, commit=False)
+            # [profitability-floor] T1 Step 1-6 (設計書 §3 T1-f):
+            # `outcome.gate_rows` (record_fn sink に積まれた行、Step 1-4 で
+            # 即時 commit が無効化された) を承認と同じ tx で保存する —
+            # ここに保存しないと strategy 候補の in_sample/holdout 実測が
+            # backtest_runs に一切残らなくなる (auto-commit の代替)。
+            _write_gate_rows(conn, outcome.gate_rows, mission_outcome="approval")
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -1445,11 +1561,22 @@ def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
 def bless_candidate(
     conn: sqlite3.Connection, *, name: str, human_dir: Path,
     settings, now: datetime, decided_by: str,
+    on_floor_warning: "Callable[[str, str], None] | None" = None,
+    activity: "ActivityLog | None" = None,
 ) -> int:
     """P3 (bless --from _human) の入口。live の形で二分:
     absent/symlink なら 1 tx で pending+証跡+preparing ジャーナル → 版/git/
     切替 → apply_decision。プレーンなら pending+証跡のみ →
-    legacy_plain_present。"""
+    legacy_plain_present。
+
+    [profitability-floor] T1 Step 1-5 (2026-09-13、codex I5): 常に
+    `floor_mode="warn"` で `_run_full_gate` を呼ぶ — bless は人間裁定で
+    フロア不合格を強行できる (承認は成立する)。**戻り値は `int`
+    (approval_id) のまま変えない** (既存呼び出し元 11 箇所が無変更で
+    通る、pin F6-7)。警告は `on_floor_warning(label, detail)` コールバック
+    (`None` なら何もしない) と `activity` (`bless_floor_warning`) の
+    2 経路 + payload の `floor_warning`/`floor_detail`/
+    `profitability_floor` (永続側) で伝える。"""
     plugins_root = human_dir.parent.parent  # human_dir = plugins/_human/<name>
 
     approvals_store.expire_due(conn, now, commit=True)  # 0a
@@ -1467,8 +1594,17 @@ def bless_candidate(
                 f"approval_id={existing_journal['approval_id']}) blocks "
                 f"bless — resolve it first (reconcile or approval retry)")
 
-        meta, content_hash, artifact_hash, metrics, evaluable = _run_full_gate(
-            conn, human_dir, name=name, settings=settings, now=now)
+        meta, content_hash, artifact_hash, outcome = _run_full_gate(
+            conn, human_dir, name=name, settings=settings, now=now,
+            floor_mode="warn")
+
+        if outcome.floor_warning:
+            if on_floor_warning is not None:
+                on_floor_warning(outcome.floor_warning, outcome.floor_detail)
+            if activity is not None:
+                activity.write(
+                    Category.APPROVAL, "bless_floor_warning",
+                    f"name={name} unprofitable")
 
         live = plugins_root / name
         if live.is_symlink():
@@ -1478,12 +1614,13 @@ def bless_candidate(
         else:
             old_kind, old_target = "absent", None
 
+        g = settings.improve.gate
         payload = {
             "name": name, "kind": meta.kind,
             "candidate_origin": "human",
             "candidate_path": f"plugins/_human/{name}",
             "content_hash": content_hash, "artifact_hash": artifact_hash,
-            "metrics": metrics, "evaluable": evaluable,
+            "metrics": outcome.metrics, "evaluable": outcome.evaluable,
             "eval_source": (settings.backtest.eval_source
                             if meta.kind == "strategy" else None),
             "base_interval": (settings.backtest.dataset().base_interval
@@ -1492,6 +1629,9 @@ def bless_candidate(
                               if meta.kind == "strategy" else None),
             "live_source": settings.plugin.producer_source,
             "mission_id": None, "backlog_id": None,
+            "floor_warning": outcome.floor_warning,
+            "floor_detail": outcome.floor_detail,
+            "profitability_floor": g.snapshot(),
         }
 
         if old_kind == "plain":
@@ -1500,6 +1640,7 @@ def bless_candidate(
             try:
                 approval_id = approvals_store.create(
                     conn, kind="plugin", payload=payload, now=now, commit=False)
+                _write_gate_rows(conn, outcome.gate_rows, mission_outcome="approval")
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -1526,6 +1667,7 @@ def bless_candidate(
         try:
             approval_id = approvals_store.create(
                 conn, kind="plugin", payload=payload, now=now, commit=False)
+            _write_gate_rows(conn, outcome.gate_rows, mission_outcome="approval")
             op_id = begin_switch_journal(
                 conn, kind="bless", approval_id=approval_id, name=name,
                 old_kind=old_kind, old_target=old_target, new_target=new_target,
