@@ -82,7 +82,9 @@
    残り枠が分かります。**`config.yaml` の `pairs` に宣言した全 pair を
    最低 1 回 `run_backtest` で確認してから提出してください** (候補は
    1 pair の不合格で全体が落ちます)。{profitability_floor_rule}
-5. 出力は必ず下の「最終出力」の形式 (`discoveries` / `selected` /
+5. **`origin` 列が `unprofitable` の課題・note は、その mission の候補が収益性フロアで落ちたときに書かれたものです。**
+   同じ指標・同じパラメータの候補を再提出しないでください。試すなら明確にパラメータを変え、その理由を `selection_rationale` に書いてください。
+6. 出力は必ず下の「最終出力」の形式 (`discoveries` / `selected` /
    `artifact` / `selection_rationale`) に従ってください。分析 ID・探索
    回数などの集計値はあなたが数える必要はありません (親が RPC 記録から
    生成します)。

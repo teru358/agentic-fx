@@ -186,6 +186,12 @@ class _InspectionVerdict:  # 新規命名
 class _SelectionOutcome:  # 新規命名
     won: bool
     backlog_id: int | None
+    # [unprofitable-note-hygiene] v1.0 §2-1: `_select_and_bind` がこの
+    # tx で実際に INSERT した backlog 行 id (note/task とも)。既存行の
+    # 再利用 (`existing`/`promoted`) は含まない。`commit()` がフロア
+    # 不合格 (`mission_outcome=="unprofitable"`) のときだけ
+    # `_finalize_gate_failed` へ渡し、機械注記の対象を絞る。
+    inserted_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -647,13 +653,19 @@ class ImproveLoop:
                 f"{r.get('last_result')} |" for r in rows)
 
         def _backlog_table(items: list[dict]) -> str:
+            # [unprofitable-note-hygiene] v1.0 §2-3: `origin` 列。
+            # `last_result` が機械注記 `origin:unprofitable` の行だけ
+            # `unprofitable` を出す — 他行は空文字 (regression 防止:
+            # `last_result` そのものの値は表に出さない、遮断 8 の語彙が
+            # ここ経由で漏れない)。
             if not items:
                 return "(バックログなし)"
-            header = ("| id | idea | status | attempts | assigned |\n"
-                      "|---|---|---|---|---|\n")
+            header = ("| id | idea | status | attempts | assigned | "
+                      "origin |\n|---|---|---|---|---|---|\n")
             return header + "\n".join(
                 f"| {i.get('id')} | {i.get('idea')} | {i.get('status')} | "
-                f"{i.get('attempts')} | {i.get('assigned', '')} |"
+                f"{i.get('attempts')} | {i.get('assigned', '')} | "
+                f"{'unprofitable' if i.get('last_result') == 'origin:unprofitable' else ''} |"
                 for i in items)
 
         def _dict_to_line(d: dict) -> str:
@@ -1225,6 +1237,10 @@ class ImproveLoop:
                           # で数える (enumerate インデックスは重複 skip の分だけ
                           # ずれる)
             dropped = 0
+            # [unprofitable-note-hygiene] v1.0 §2-1: `_upsert_backlog_idea`
+            # が `"inserted"` を返した行の id のみ集める (`existing`/
+            # `promoted` は含めない)。
+            inserted_ids: list[int] = []
 
             def _norm(idea: str) -> str:
                 # round2 #8 是正 (2026-08-29、verified-round2.md #8): 正規化
@@ -1249,10 +1265,12 @@ class ImproveLoop:
                     if dup is None:
                         dropped += 1
                         continue
-                _, action = self._upsert_backlog_idea(
+                row_id, action = self._upsert_backlog_idea(
                     conn, d["idea"], d.get("source", "agent"),
                     d.get("kind", "task"), now)
                 inserted += action == "inserted"
+                if action == "inserted":
+                    inserted_ids.append(row_id)
             if dropped:
                 self._activity.write(
                     Category.IMPROVE, "backlog_limit_exceeded",
@@ -1264,7 +1282,9 @@ class ImproveLoop:
                 selected_idea = selected.get("idea", "")
                 if not selected_idea.strip():
                     conn.commit()
-                    return _SelectionOutcome(won=False, backlog_id=None)
+                    return _SelectionOutcome(
+                        won=False, backlog_id=None,
+                        inserted_ids=tuple(inserted_ids))
                 # precheck 2026-08-22 wave2: T10-B5 — discoveries にも既存
                 # backlog にも無い「新規 idea を選択」は INSERT してから選ぶ
                 # (test_new_idea_selected_creates_and_binds_in_same_tx)。空文字
@@ -1272,9 +1292,11 @@ class ImproveLoop:
                 # 既にあれば INSERT せずその行を使い、note なら task として
                 # open に昇格する (`_upsert_backlog_idea`)。`selected` の新規
                 # idea は選んだ本人が task と判断したもの → kind=task 固定。
-                backlog_id, _ = self._upsert_backlog_idea(
+                backlog_id, selected_action = self._upsert_backlog_idea(
                     conn, selected_idea, selected.get("source", "agent"),
                     "task", now)
+                if selected_action == "inserted":
+                    inserted_ids.append(backlog_id)
 
             won = backlog_store.select_for_mission(
                 conn, backlog_id, now=now, commit=False)
@@ -1282,7 +1304,9 @@ class ImproveLoop:
                 improve_runs_store.bind_backlog(
                     conn, ctx.run_id, backlog_id, commit=False)
             conn.commit()
-            return _SelectionOutcome(won=won, backlog_id=backlog_id if won else None)
+            return _SelectionOutcome(
+                won=won, backlog_id=backlog_id if won else None,
+                inserted_ids=tuple(inserted_ids))
         except BaseException:
             conn.rollback()
             raise
@@ -2280,7 +2304,8 @@ class ImproveLoop:
                             reason="unprofitable", now=now,
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls,
                             mission_outcome="unprofitable",
-                            report_detail=report_detail)
+                            report_detail=report_detail,
+                            inserted_ids=selection.inserted_ids)
                         return
                     gate_metrics["baseline"] = strategy_verdict.baseline_row
                     # [approval-payload-missing-gate-metrics] 是正 (A4 10
@@ -2843,7 +2868,8 @@ class ImproveLoop:
     def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now,
                               gate_rows=(), tool_calls: int | None = None,
                               mission_outcome: str = "gate_failed",
-                              report_detail: str = "") -> None:
+                              report_detail: str = "",
+                              inserted_ids: tuple[int, ...] = ()) -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
         `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
@@ -2956,6 +2982,24 @@ class ImproveLoop:
             self._persist_gate_rows(
                 conn, gate_rows=gate_rows, now=now,
                 mission_id=ctx.mission_id, mission_outcome=outcome)
+            # [unprofitable-note-hygiene] v1.0 §2-2: フロア不合格
+            # (`mission_outcome=="unprofitable"`) のときだけ、この mission
+            # が起票した note/task (`inserted_ids`、`existing`/`promoted`
+            # は含まれない) に機械注記 `origin:unprofitable` を書く。
+            # `idea`/`idea_norm`/`status` には触れない。同じ tx 内 — 後段
+            # (`finish_improve_mission` の rollback を含む) が失敗すれば
+            # この UPDATE も一緒に rollback する。`finish_improve_mission`
+            # の `backlog_transition` より前に置く: `backlog_id` (この
+            # mission の候補行そのもの) がもし `inserted_ids` にも含まれる
+            # 稀なケース (選択された idea 自体が新規挿入) でも、実際に
+            # ゲートへ通した候補の終端理由 (`reason`) が最終的に勝つ。
+            if mission_outcome == "unprofitable" and inserted_ids:
+                placeholders = ",".join("?" * len(inserted_ids))
+                conn.execute(
+                    "UPDATE improvement_backlog SET "
+                    "last_result='origin:unprofitable', updated_at=? "
+                    f"WHERE id IN ({placeholders})",
+                    (now.isoformat(), *inserted_ids))
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="completed",
