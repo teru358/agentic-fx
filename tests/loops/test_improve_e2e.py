@@ -373,6 +373,14 @@ def test_gate_failure_stops_at_report_no_approval_request(improve_env):
     live = root / "plugins" / "bad_gate_e2e"
     assert not live.exists()
 
+    # [profitability-floor-fix] G1: 通常の gate_failed (フロア不合格
+    # ではない) には適用閾値 3 値を出さない。
+    activity_text = (root / "logs" / "activity.log").read_text()
+    gate_failed_lines = [
+        line for line in activity_text.splitlines() if "gate_failed" in line]
+    assert gate_failed_lines
+    assert not any("min_pf=" in line for line in gate_failed_lines)
+
 
 def test_gate_failure_stops_before_any_further_candidate_processing(
         improve_env, monkeypatch):
@@ -1358,6 +1366,32 @@ def test_strategy_profitability_floor_reroutes_to_gate_failed_unprofitable(
     # pin は `_settle_ledger_after_commit` の branch-local outcome 単体
     # pin (下記 F4-9 相当、mission_outcome の一致) で代替する。
 
+    # [profitability-floor-fix] G2: 落ちた段 (in_sample) + 落ちた pair
+    # (USDJPY) + 8 指標の表 (in_sample のみ — holdout は回っていない)
+    # + 適用閾値がレポート本文に出る。
+    assert "failed_stage: in_sample" in report_text
+    assert "failed_pairs: USDJPY" in report_text
+    g = app.settings.improve.gate
+    assert (f"thresholds: min_pf={g.min_pf} "
+            f"require_positive_avg_r={g.require_positive_avg_r} "
+            f"require_holdout_evaluable={g.require_holdout_evaluable}"
+            ) in report_text
+    assert "### in_sample" in report_text
+    assert "### holdout" not in report_text  # in_sample 段落ち → holdout 表無し
+    assert "| USDJPY | 40 | 0.3 |" in report_text  # trades/pf 列
+
+    # [profitability-floor-fix] G1: activity の `gate_failed` 行に、
+    # `reason=unprofitable` と同じ行で適用閾値 3 値が出る。
+    activity_text = (root / "logs" / "activity.log").read_text()
+    gate_failed_lines = [
+        line for line in activity_text.splitlines()
+        if "gate_failed" in line and f"mission={ctx.mission_id}" in line]
+    assert len(gate_failed_lines) == 1
+    assert "reason=unprofitable" in gate_failed_lines[0]
+    assert (f"min_pf={g.min_pf} require_positive_avg_r={g.require_positive_avg_r} "
+            f"require_holdout_evaluable={g.require_holdout_evaluable}"
+            ) in gate_failed_lines[0]
+
 
 def test_f2_6_f4_series_holdout_only_failure_marks_all_gate_rows_unprofitable(
         improve_env):
@@ -1422,6 +1456,32 @@ def test_f2_6_f4_series_holdout_only_failure_marks_all_gate_rows_unprofitable(
 
     # F4-6: staging が削除される。
     assert not ctx.staging_dir.exists()
+
+    # [profitability-floor-fix] G2: holdout 段で落ちた場合は in_sample・
+    # holdout 両方の表がレポート本文に出る (in_sample は合格しているので
+    # failed_stage/failed_pairs には出ない)。
+    report_files = list((root / "data" / "improve_reports").glob(
+        f"improve-*-{ctx.mission_id}.md"))
+    assert len(report_files) == 1
+    report_text = report_files[0].read_text(encoding="utf-8")
+    assert "failed_stage: holdout" in report_text
+    assert "failed_pairs: USDJPY" in report_text
+    assert "### in_sample" in report_text
+    assert "### holdout" in report_text
+    assert "| USDJPY | 40 | 1.5 |" in report_text  # in_sample 行
+    assert "| USDJPY | 40 | 0.8 |" in report_text  # holdout 行
+
+    # [profitability-floor-fix] G1: activity の gate_failed 行にも同じ
+    # 閾値 3 値が出る。
+    g = app.settings.improve.gate
+    activity_text = (root / "logs" / "activity.log").read_text()
+    gate_failed_lines = [
+        line for line in activity_text.splitlines()
+        if "gate_failed" in line and f"mission={ctx.mission_id}" in line]
+    assert len(gate_failed_lines) == 1
+    assert (f"min_pf={g.min_pf} require_positive_avg_r={g.require_positive_avg_r} "
+            f"require_holdout_evaluable={g.require_holdout_evaluable}"
+            ) in gate_failed_lines[0]
 
 
 _IN_SAMPLE_METRICS_FOR_PAYLOAD = {

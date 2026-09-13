@@ -1,6 +1,6 @@
-# 収益性フロア + reject reason 漏洩の是正 設計書 v1.3
+# 収益性フロア + reject reason 漏洩の是正 設計書 v1.4
 
-束 [profitability-floor] + T0 [reject-reason-leak]。起案 2026-09-12、ユーザー裁定済 (U1〜U5)、codex 設計レビュー 1 周目 18 件 (v1.1) / 2 周目 5 件 (v1.2) / 3 周目 3 件 (v1.3) を全件反映。**v1.3 で実装着手可** (codex 収束判定)。
+束 [profitability-floor] + T0 [reject-reason-leak]。起案 2026-09-12、ユーザー裁定済 (U1〜U5)、codex 設計レビュー 1 周目 18 件 (v1.1) / 2 周目 5 件 (v1.2) / 3 周目 3 件 (v1.3) を全件反映。**v1.3 で実装着手可** (codex 収束判定)。v1.4 = 変更履歴のとおり実装レビューでの設計微修正。
 
 正の参照元:
 - 本体設計書 §6 (改善 loop・品質ゲート・遮断 8 項目・plugin 機構)

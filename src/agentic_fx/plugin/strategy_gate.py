@@ -37,6 +37,53 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
     # `evaluable` は R8 の「標本不足」意味論を流用しない (別フィールド)。
     floor_reason: str = ""
     floor_detail: str = ""
+    # [profitability-floor-fix] G2 (2026-09-13): holdout 段の pair→metrics
+    # (`_run_holdout` の戻り値をそのまま、`candidate_metrics` の holdout
+    # 版)。in_sample 段で enforce 不合格になり holdout を回さなかった
+    # ときは `None` のまま (改善ループのレポート本文が holdout 表の
+    # 有無を判定する材料 — plan pin 「in_sample で落ちた場合は holdout
+    # 表無し」)。`record_fn` の sink (gate_rows) 経由で持ち直さない —
+    # sink の `metrics` は永続化用に呼び出し元が別途組み立てる値であり
+    # (テストの fake がそうであるように) 判定に使った実際の pf/avg_r と
+    # 一致する保証がないため、判定元の dict をそのまま持たせる。
+    holdout_metrics: dict | None = None
+
+
+def _floor_fail_items(
+        per_pair: dict, *, settings: "Settings",
+        scope: str) -> list[tuple[str, str]]:
+    """[profitability-floor-fix] G2 (2026-09-13): `_check_profitability_
+    floor` の判定条件だけを取り出した内部 helper — pair ごとの不合格理由
+    を `(pair, message)` のリストで返す (`_check_profitability_floor` は
+    ここから文字列を組み立てるだけにし、判定条件を 2 箇所に複製しない)。
+
+    順序 ①→②→③ は契約 (codex I9): ① (strict holdout 判定) を ② の
+    後に置くと `require_holdout_evaluable=True` でも `trades=0` の pair
+    が通ってしまう。
+    """
+    g = settings.improve.gate
+    items: list[tuple[str, str]] = []
+    for pair, m in per_pair.items():
+        # ① strict holdout 判定は zero-trade shortcut より前 (trades==0
+        # でも FAIL する)。
+        if scope == "holdout" and g.require_holdout_evaluable \
+                and not m.get("evaluable"):
+            items.append((pair, "holdout_not_evaluable"))
+            continue
+        # ② 成績が無い pair は通常モードでは判定から除外する。
+        if m["trades"] == 0:
+            continue
+        # ③ 既定: holdout の標本不足は「悪いとは言わない」(R8)。
+        if scope == "holdout" and not m.get("evaluable"):
+            continue
+        pf = m["pf"]
+        if pf is not None and pf < g.min_pf:  # pf is None (gross_loss==0) は PASS
+            items.append((pair, f"pf={pf}"))
+            continue
+        avg_r = m["avg_r"]
+        if g.require_positive_avg_r and avg_r is not None and avg_r <= 0.0:
+            items.append((pair, f"avg_r={avg_r}"))
+    return items
 
 
 def _check_profitability_floor(
@@ -51,35 +98,28 @@ def _check_profitability_floor(
     pair ごとに判定し、**1 pair でも不合格なら候補全体を落とす**
     (pf は pair 間で算術合成できないため合計ではなく pair ごとに見る)。
 
-    順序 ①→②→③ は契約 (codex I9): ① (strict holdout 判定) を ② の
-    後に置くと `require_holdout_evaluable=True` でも `trades=0` の pair
-    が通ってしまう。
+    判定条件そのものは `_floor_fail_items` に委譲する (二重実装しない)。
     """
-    g = settings.improve.gate
-    fail_details: list[str] = []
-    for pair, m in per_pair.items():
-        # ① strict holdout 判定は zero-trade shortcut より前 (trades==0
-        # でも FAIL する)。
-        if scope == "holdout" and g.require_holdout_evaluable \
-                and not m.get("evaluable"):
-            fail_details.append(f"{pair}: holdout_not_evaluable")
-            continue
-        # ② 成績が無い pair は通常モードでは判定から除外する。
-        if m["trades"] == 0:
-            continue
-        # ③ 既定: holdout の標本不足は「悪いとは言わない」(R8)。
-        if scope == "holdout" and not m.get("evaluable"):
-            continue
-        pf = m["pf"]
-        if pf is not None and pf < g.min_pf:  # pf is None (gross_loss==0) は PASS
-            fail_details.append(f"{pair}: pf={pf}")
-            continue
-        avg_r = m["avg_r"]
-        if g.require_positive_avg_r and avg_r is not None and avg_r <= 0.0:
-            fail_details.append(f"{pair}: avg_r={avg_r}")
-    if fail_details:
-        return "unprofitable", f"{scope}: " + ", ".join(fail_details)
+    items = _floor_fail_items(per_pair, settings=settings, scope=scope)
+    if items:
+        detail = ", ".join(f"{pair}: {msg}" for pair, msg in items)
+        return "unprofitable", f"{scope}: {detail}"
     return "", ""
+
+
+def floor_settings_kv(gate_settings: "ImproveGateSettings") -> str:
+    """[profitability-floor-fix] G1 (2026-09-13): 適用閾値 3 値
+    (`min_pf`/`require_positive_avg_r`/`require_holdout_evaluable`、
+    `ImproveGateSettings.snapshot()` 由来) を `key=value` 形式の 1 行に
+    組み立てる唯一の場所。以前は `plugin/switch.py::_run_full_gate` の
+    activity 行・例外メッセージが同じ 3 行を手書きで複製しており
+    (`min_pf=`/`require_positive_avg_r=`/`require_holdout_evaluable=`、
+    既存 pin F6-11a が厳密一致で読む形式)、改善ループの `gate_failed`
+    activity 行 (G1) でも同じ文字列を組み立てる必要が生じたため、この
+    唯一の場所に集約する。フォーマットは既存 pin (F6-11a) と厳密一致 —
+    `ImproveGateSettings.snapshot()` の 3 キーの順序でスペース区切り。"""
+    snap = gate_settings.snapshot()
+    return " ".join(f"{key}={value}" for key, value in snap.items())
 
 
 def floor_rule_text(gate_settings: "ImproveGateSettings", *,
@@ -307,7 +347,8 @@ def evaluate_strategy_adoption_gate(
         return StrategyGateVerdict(
             evaluable=True, baseline_variant="baseline",
             baseline_row=baseline_row, candidate_metrics=per_pair,
-            floor_reason=floor_reason, floor_detail=floor_detail)
+            floor_reason=floor_reason, floor_detail=floor_detail,
+            holdout_metrics=holdout_per_pair)
 
     for row in in_sample_rows:
         no_strategy_row = dict(row)
@@ -329,4 +370,5 @@ def evaluate_strategy_adoption_gate(
     return StrategyGateVerdict(
         evaluable=True, baseline_variant="no_strategy",
         baseline_row=baseline_row, candidate_metrics=per_pair,
-        floor_reason=floor_reason, floor_detail=floor_detail)
+        floor_reason=floor_reason, floor_detail=floor_detail,
+        holdout_metrics=holdout_per_pair)

@@ -10,7 +10,11 @@ from __future__ import annotations
 
 import pytest
 
-from agentic_fx.plugin.strategy_gate import _check_profitability_floor
+from agentic_fx.plugin.strategy_gate import (
+    _check_profitability_floor,
+    _floor_fail_items,
+    floor_settings_kv,
+)
 
 from tests.plugin.conftest import SETTINGS
 
@@ -245,3 +249,42 @@ def test_f2_3_holdout_evaluable_true_pf_pass_avg_r_fail():
         scope="holdout")
     assert label == "unprofitable"
     assert "avg_r" in detail
+
+
+# ---- [profitability-floor-fix] G1: 適用閾値 3 値の共有 helper -----------
+# `floor_settings_kv` は switch.py の人間回廊 (`_run_full_gate`) が
+# `activity`/例外文言に書く key=value 形式 (`min_pf=`/
+# `require_positive_avg_r=`/`require_holdout_evaluable=`、既存 pin
+# F6-11a が厳密一致で読む) と、改善ループの `gate_failed` activity 行
+# (G1) の**唯一の**組み立て場所 — 二重実装しない。
+
+def test_floor_settings_kv_matches_snapshot_order_and_format():
+    kv = floor_settings_kv(SETTINGS.improve.gate)
+    assert kv == (
+        f"min_pf={SETTINGS.improve.gate.min_pf} "
+        f"require_positive_avg_r={SETTINGS.improve.gate.require_positive_avg_r} "
+        f"require_holdout_evaluable="
+        f"{SETTINGS.improve.gate.require_holdout_evaluable}")
+
+
+# ---- [profitability-floor-fix] G2: 落ちた pair を構造化して取り出す -----
+# `_floor_fail_items` は `_check_profitability_floor` の文字列組み立てと
+# 同じ判定条件を再利用する内部 helper (二重実装しない)。改善ループの
+# レポート本文 (G2) が「落ちた pair」のリストをここから取る。
+
+def test_floor_fail_items_returns_failing_pairs_only():
+    items = _floor_fail_items(
+        {"USDJPY": _m(50, 0.5, 0.1), "EURUSD": _m(50, 1.5, 0.1)},
+        settings=SETTINGS, scope="in_sample")
+    assert [pair for pair, _ in items] == ["USDJPY"]
+
+
+def test_floor_fail_items_agrees_with_check_profitability_floor_string():
+    per_pair = {"USDJPY": _m(50, 0.5, 0.1), "EURUSD": _m(50, 1.5, -1.0)}
+    label, detail = _check_profitability_floor(
+        per_pair, settings=SETTINGS, scope="in_sample")
+    items = _floor_fail_items(per_pair, settings=SETTINGS, scope="in_sample")
+    assert label == "unprofitable"
+    for pair, msg in items:
+        assert pair in detail
+        assert msg in detail

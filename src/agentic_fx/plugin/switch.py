@@ -862,6 +862,11 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         # は既存 pin (F6-11a) が厳密一致で読むため残し、条件節を前段に
         # 追加する形にする。
         condition = strategy_gate.floor_rule_text(g, audience="human")
+        # [profitability-floor-fix] G1 (2026-09-13): key=value 3 値の
+        # 組み立ては `strategy_gate.floor_settings_kv` の唯一の場所に
+        # 集約 (以前はここで 2 回手書きで複製していた)。フォーマットは
+        # 既存 pin (F6-11a) と厳密一致 (変更なし)。
+        settings_kv = strategy_gate.floor_settings_kv(g)
         # [profitability-floor] T1 Step 1-7/T1-g (2026-09-13、codex R2-I2):
         # `submit_candidate` のフロア不合格 activity 行はここで書く —
         # bless は常に floor_mode="warn" でこの分岐に到達しないため、
@@ -869,15 +874,9 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         if activity is not None:
             activity.write(
                 Category.APPROVAL, "submit_floor_rejected",
-                f"name={name} unprofitable ({condition}) "
-                f"min_pf={g.min_pf} "
-                f"require_positive_avg_r={g.require_positive_avg_r} "
-                f"require_holdout_evaluable={g.require_holdout_evaluable}")
+                f"name={name} unprofitable ({condition}) {settings_kv}")
         raise ValueError(
-            f"plugin {name!r}: unprofitable ({condition}) "
-            f"(min_pf={g.min_pf} "
-            f"require_positive_avg_r={g.require_positive_avg_r} "
-            f"require_holdout_evaluable={g.require_holdout_evaluable})")
+            f"plugin {name!r}: unprofitable ({condition}) ({settings_kv})")
 
     return meta, after_content, after_artifact, outcome
 

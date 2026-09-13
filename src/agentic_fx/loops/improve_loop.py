@@ -48,8 +48,10 @@ from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.strategy_gate import (
     _check_profitability_floor,
     _eval_timeframe as _strategy_gate_eval_timeframe,
+    _floor_fail_items,
     evaluate_strategy_adoption_gate,
     floor_rule_text as _strategy_gate_floor_rule_text,
+    floor_settings_kv,
 )
 from agentic_fx.runners.base import Mission
 from agentic_fx.tools.plugin_loader import approved_plugins
@@ -2259,12 +2261,26 @@ class ImproveLoop:
                     # — 遮断 8 の 1 bit 例外)。`report_detail` は親専有
                     # レポートにのみ渡り、activity/last_result には流れない。
                     if strategy_verdict.floor_reason:
+                        # [profitability-floor-fix] G2 (2026-09-13): holdout
+                        # 段の per-pair 成績は `StrategyGateVerdict.
+                        # holdout_metrics` (evaluator が判定に使った実際の
+                        # dict、`_run_strategy_gate` が enforce で in_sample
+                        # 段を落とし holdout を回さなかったときは `None`)。
+                        # `gate_rows` (record_fn sink) 経由では取らない —
+                        # sink の `metrics` は永続化用に呼び出し元が別途
+                        # 組み立てる値であり、判定に使った pf/avg_r と
+                        # 一致する保証がない (fixture 実測で乖離を確認)。
+                        report_detail = self._render_floor_report_detail(
+                            in_sample_metrics=(
+                                strategy_verdict.candidate_metrics or {}),
+                            holdout_metrics=(
+                                strategy_verdict.holdout_metrics or {}))
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
                             reason="unprofitable", now=now,
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls,
                             mission_outcome="unprofitable",
-                            report_detail=strategy_verdict.floor_detail)
+                            report_detail=report_detail)
                         return
                     gate_metrics["baseline"] = strategy_verdict.baseline_row
                     # [approval-payload-missing-gate-metrics] 是正 (A4 10
@@ -2770,6 +2786,60 @@ class ImproveLoop:
         self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
                              final_path=final_path, now=now)
 
+    _FLOOR_REPORT_METRIC_KEYS = (
+        "trades", "pf", "win_rate", "avg_r", "max_drawdown", "total_pnl",
+        "kill_switch_latches", "evaluable")
+
+    def _render_floor_report_detail(self, *, in_sample_metrics: dict,
+                                     holdout_metrics: dict) -> str:
+        """[profitability-floor-fix] G2 (2026-09-13、plan `:258-263`):
+        `_finalize_gate_failed` のフロア不合格レポート本文専用の
+        Markdown を組み立てる。in_sample/holdout の pair ごとに
+        `trades/pf/win_rate/avg_r/max_drawdown/total_pnl/
+        kill_switch_latches/evaluable` の 8 指標 + 落ちた段 + 落ちた
+        pair + 適用閾値を含める。`_floor_fail_items` (`_check_
+        profitability_floor` と同じ判定条件) を再利用し、判定条件を
+        二重実装しない。
+
+        `holdout_metrics` が空 (enforce モードで in_sample 段が落ち、
+        holdout を回さなかった場合) は holdout 表を出さない — plan pin
+        「in_sample で落ちた場合は holdout 表無し / holdout で落ちた場合
+        は両方」。戻り値は `_finalize_gate_failed` の `body_md` に
+        そのまま追記される文字列であり、`last_result`/`activity`/
+        INDEX には一切流れない (呼び出し元がそこへ渡さない契約)。"""
+        stages: list[tuple[str, dict]] = [("in_sample", in_sample_metrics)]
+        if holdout_metrics:
+            stages.append(("holdout", holdout_metrics))
+
+        failed_scopes: list[str] = []
+        failed_pairs: list[str] = []
+        tables: list[str] = []
+        for scope, per_pair in stages:
+            fail_items = _floor_fail_items(
+                per_pair, settings=self._settings, scope=scope)
+            if fail_items:
+                failed_scopes.append(scope)
+                for pair, _msg in fail_items:
+                    if pair not in failed_pairs:
+                        failed_pairs.append(pair)
+            header = "| pair | " + " | ".join(
+                self._FLOOR_REPORT_METRIC_KEYS) + " |"
+            separator = "|---" * (len(self._FLOOR_REPORT_METRIC_KEYS) + 1) + "|"
+            rows = [header, separator]
+            for pair, m in per_pair.items():
+                values = [str(m.get(key, "")) for key
+                          in self._FLOOR_REPORT_METRIC_KEYS]
+                rows.append("| " + pair + " | " + " | ".join(values) + " |")
+            tables.append(f"### {scope}\n\n" + "\n".join(rows))
+
+        lines = [
+            f"failed_stage: {', '.join(failed_scopes)}",
+            f"failed_pairs: {', '.join(failed_pairs)}",
+            f"thresholds: {floor_settings_kv(self._settings.improve.gate)}",
+            "",
+        ]
+        return "\n".join(lines) + "\n\n".join(tables)
+
     def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now,
                               gate_rows=(), tool_calls: int | None = None,
                               mission_outcome: str = "gate_failed",
@@ -2791,6 +2861,14 @@ class ImproveLoop:
         `last_result`/`activity` には一切流さない (pin F2-7/F5-2 の
         「ラベルと数値の分離」契約)。
 
+        [profitability-floor-fix] G1 (2026-09-13、plan `:258-263`):
+        フロア経路 (`mission_outcome=="unprofitable"`) だけ、`activity`
+        の `gate_failed` 行に `reason=unprofitable` と同じ行で適用閾値
+        3 値 (`floor_settings_kv` — `ImproveGateSettings.snapshot()`
+        由来) を足す。**`report_detail` の数値 (per-pair 8 指標) は
+        ここには一切書かない** — 通常の `gate_failed` (標本不足など)
+        には閾値も出ない。
+
         D-15 是正 (着手前検証): 設計書 §4.2 手順6「ゲート不合格・評価不能・
         observation・敗者のとき、reports に書く」に従い、`_finalize_loser`
         と**全く同じ既存の outbox 規約** (`data/improve_reports/
@@ -2802,9 +2880,15 @@ class ImproveLoop:
         test_gate_failure_stops_at_report_no_approval_request` が期待する
         レポートファイルに届かなかった)。"""
         self._delete_staging(ctx)
+        # [profitability-floor-fix] G1: フロア不合格 (mission_outcome=
+        # "unprofitable") のときだけ同じ行に閾値 3 値を足す。他の
+        # gate_failed 経路 (標本不足・pytest 不合格等) には出さない。
+        floor_suffix = (
+            f" {floor_settings_kv(self._settings.improve.gate)}"
+            if mission_outcome == "unprofitable" else "")
         self._activity.write(
             Category.IMPROVE, "gate_failed",
-            f"mission={ctx.mission_id} reason={reason}"
+            f"mission={ctx.mission_id} reason={reason}{floor_suffix}"
             f"{_tool_calls_suffix(tool_calls)}")
         body_md = (
             f"# Improve Mission {ctx.mission_id} — gate failed\n\n"
