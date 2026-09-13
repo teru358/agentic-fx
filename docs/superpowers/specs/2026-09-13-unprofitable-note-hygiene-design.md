@@ -1,4 +1,4 @@
-# [unprofitable-note-hygiene] 設計書 v1.0
+# [unprofitable-note-hygiene] 設計書 v1.1
 
 束: 収益性フロア不合格 (`unprofitable`) で終わった改善 mission が起票した backlog 行 (note / task) に機械注記を付け、次 mission の同型再提出を抑止する。ユーザー承認 2026-09-13。親: [floor-path-skips-duplicate-metrics] 裁定 (c) 現状維持、遮断 8 例外の再評価 (`2026-09-12-profitability-floor-design.md` v1.5)。
 
@@ -36,7 +36,7 @@ A4 run19 (`tmp/a4-run19-codex-20260913.md` 観測 D): mission #83 が holdout �
 | N1 | フロア不合格 (in_sample 段 / holdout 段の両方) で終わった mission が INSERT した note と task の `last_result` が `origin:unprofitable` (バイト一致) | 実 DB 相当の sqlite fixture |
 | N2 | `gate_failed:*` / `insufficient_trades` / report / observation / approval / `report_failed` 分岐では `last_result` が NULL のまま (逆変異: 条件を外すと red) | 同上 |
 | N3 | 既存行の再利用 (`existing` / `promoted`) は注記されない | 同上 |
-| N4 | 同 tx: `_finalize_gate_failed` が rollback する経路 (report 作成失敗) で注記も消える | 同上 |
+| N4 | 同 tx: 正常分岐 tx で注記を書いた後に後段 DB 処理 (`finish_improve_mission`) が失敗すると注記も rollback で消える (report part 作成失敗は注記 tx より前なので注記を書かない = N2 側の非書込み基準) | 同上 |
 | N5 | `idea` / `idea_norm` / `status` 不変 | 同上 |
 | N6 | prompt の backlog 表・note 表に `origin` 列があり、注記行だけ `unprofitable`、他行は空 | レンダ済み prompt 文字列 |
 | N7 | 規律 5 が prompt に逐語で出る。既存遮断 pin (prompt に `holdout` 0 件、F5-2) は緑のまま | 同上 |
@@ -47,3 +47,4 @@ A4 run19 (`tmp/a4-run19-codex-20260913.md` 観測 D): mission #83 が holdout �
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-09-13 | v1.0 | 初版 (bounded 設計、チャット提示 → ユーザー承認) | run19 観測 D、裁定 (c) の後継 | - |
+| 2026-09-13 | v1.1 | 実装 `98a5d68` (sonnet) → 段 0 `e1595a5` (14 変異、生存 6 → pin S1〜S5) → ローカル 3 本 1 周目 `9088c86` (Y2/N14/dup6、pin L1/L2、本番欠陥 0) → codex 1 周目 (`tmp/review-20260913-nh/codex-r1.md`): Critical 0 / Important 1 (N2 の report/observation/approval 終端が未 pin) / Minor 5 (F5-5 説明改訂、N3 空振り、N5 note 不変、L1 docstring、N4 文言) → 全件是正。N4 の受入文言を「注記後の後段失敗で rollback」に訂正 (report 作成失敗は注記より前) | codex r1 | - |
