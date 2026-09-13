@@ -602,3 +602,57 @@ def test_s5_discipline_5_full_block_and_renumbering(tmp_path):
         "試すなら明確にパラメータを変え、その理由を `selection_rationale` に"
         "書いてください。\n") in text
     assert "6. 出力は必ず下の「最終出力」の形式" in text
+
+
+# ---------------------------------------------------------------------------
+# ローカル LLM レビュー 1 周目 (2026-09-13) で採った pin (L1/L2)。
+# `tmp/review-20260913-nh/local-triage.md`。
+# ---------------------------------------------------------------------------
+
+def test_l1_selected_new_idea_insert_is_tracked_in_inserted_ids(
+        loop_and_ctx_with_open_backlog):
+    """L1 (muse c1): `_select_and_bind` には INSERT 経路が 2 つある —
+    discoveries ループの `_upsert_backlog_idea` と、`selected` が既存に
+    無い新規 idea だったときの `_upsert_backlog_idea`。既存 pin
+    (`test_n3_*`) は前者しか見ておらず、後者の
+    `if selected_action == "inserted": inserted_ids.append(backlog_id)`
+    を丸ごと削除しても `tests/loops/` 全体が緑だった (probe 実測 SURVIVED)。
+    落ちると、選ばれた候補自身が起票行だったフロア不合格 mission で
+    その行に機械注記が付かない。"""
+    loop, ctx, conn, _backlog_id = loop_and_ctx_with_open_backlog
+
+    output = {
+        "discoveries": [],
+        "selected": {"idea": "a brand new idea chosen by the agent",
+                     "source": "agent"},
+        "artifact": {"type": "observation", "reason": "x"},
+        "selection_rationale": "x"}
+
+    outcome = loop._select_and_bind(conn, output, ctx, now=_NOW)
+
+    new_row = conn.execute(
+        "SELECT id FROM improvement_backlog WHERE idea=?",
+        ("a brand new idea chosen by the agent",)).fetchone()
+    assert new_row is not None
+    assert outcome.backlog_id == new_row["id"]
+    assert new_row["id"] in outcome.inserted_ids
+
+
+def test_l2_backlog_table_header_declares_origin_column(tmp_path):
+    """L2 (muse c3 + qwen c3): `test_n6`/`test_s1` はデータ行のセルしか
+    見ておらず、`_backlog_table` のヘッダ行から `origin` 列を削っても
+    (セルはそのまま) `tests/loops/` 全体が緑だった (probe 実測 SURVIVED)。
+    ヘッダが欠けると markdown 表の列数がセル側と食い違い、規律 5 が指す
+    「`origin` 列」を agent が同定できない。課題表・note 表の両方で
+    ヘッダ行と区切り行の列数を pin する。"""
+    text = _render(tmp_path)
+
+    selectable, notes = text.split("## 既知の事実", 1)
+    for section in (selectable, notes):
+        header = next(
+            l for l in section.splitlines() if l.startswith("| id |"))
+        assert header == (
+            "| id | idea | status | attempts | assigned | origin |")
+        separator = next(
+            l for l in section.splitlines() if l.startswith("|---|"))
+        assert separator.count("|") == header.count("|") == 7
