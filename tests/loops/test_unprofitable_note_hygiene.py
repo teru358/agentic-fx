@@ -1,5 +1,5 @@
 # tests/loops/test_unprofitable_note_hygiene.py
-"""[unprofitable-note-hygiene] 設計書 v1.0 §4 (N1〜N8) の pin。
+"""[unprofitable-note-hygiene] 設計書 v1.1 §4 (N1〜N8) の pin。
 
 `docs/superpowers/specs/2026-09-13-unprofitable-note-hygiene-design.md`。
 A4 run19 観測 D: mission が収益性フロアで `unprofitable` に落ちたとき、
@@ -11,7 +11,7 @@ prompt 上で抑止する。fixture 流儀は
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -584,6 +584,118 @@ def test_n8_annotated_row_last_result_overwritten_when_later_selected(
         "SELECT last_result FROM improvement_backlog WHERE id=?",
         (annotated_id,)).fetchone()
     assert row["last_result"] == "insufficient_trades:2"
+
+
+# ---------------------------------------------------------------------------
+# codex 2周目 (`tmp/review-20260913-nh/codex-r2.md`) Important 1/2 是正
+# ---------------------------------------------------------------------------
+
+def test_n9_late_origin_marker_does_not_clobber_concurrent_termination(
+        loop_full, conn, mission_and_run_fixture, tmp_path):
+    """codex r2 Important 1: 起票 INSERT と注記 UPDATE は別 tx —
+    `parallel>1` では mission A の起票行を mission B が先に選択・終端
+    できる。A の `_finalize_gate_failed(mission_outcome="unprofitable")`
+    は `inserted_ids` を無条件 `WHERE id IN (...)` で上書きしていたため、
+    A→B の順 (N8 が検査済み) だけでなく B→A の逆順でも B の終端値
+    (`last_result`/`updated_at`) が A の `origin:unprofitable` に潰されて
+    いた。`WHERE ... AND last_result IS NULL` の更新世代 CAS で、A の
+    起票行がまだ未終端 (`last_result IS NULL`) のときだけ注記が乗る
+    ことを pin する (逆変異: CAS を外すと red)。"""
+    mission_id_a, run_id_a, _ = mission_and_run_fixture
+    # mission A が起票した note (このテストでは `_finalize_gate_failed`
+    # の tx より前に別途起票された体で直接 INSERT する)。
+    note_id = backlog_store.add(conn, "concurrent note idea", "agent", _NOW)
+
+    # mission B が同じ行を選び、標本不足で先に終端する (last_result が
+    # NULL でなくなる)。
+    mission_id_b = missions_store.start(
+        conn, "improve", "codex", "gpt-5", _NOW, commit=True)
+    from agentic_fx.store import improve_runs as improve_runs_store
+    run_id_b = improve_runs_store.start(
+        conn, None, _NOW, mission_id=mission_id_b, commit=True)
+    staging_dir_b = tmp_path / "staging_b"
+    staging_dir_b.mkdir()
+    ledger_b = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger_b.freeze()
+    ctx_b = ImproveRunContext(
+        mission_id=mission_id_b, run_id=run_id_b, staging_dir=staging_dir_b,
+        source_snapshot_dir=tmp_path / "source_b", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger_b, rpc_handlers={})
+    loop_full._finalize_gate_failed(
+        conn, ctx=ctx_b, backlog_id=note_id,
+        reason="insufficient_trades:2", now=_NOW)
+
+    row = conn.execute(
+        "SELECT last_result, updated_at FROM improvement_backlog WHERE id=?",
+        (note_id,)).fetchone()
+    assert row["last_result"] == "insufficient_trades:2"
+    updated_at_after_b = row["updated_at"]
+
+    # mission A がいまさら注記 tx を実行する (後発だが起票は先だった)。
+    # `now` を B と変えておく — CAS が無ければ `updated_at` も A の値に
+    # 書き換わってしまい、この assert が変異を判別できなくなる。
+    now_a = _NOW + timedelta(hours=1)
+    staging_dir_a = tmp_path / "staging_a"
+    staging_dir_a.mkdir()
+    ledger_a = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger_a.freeze()
+    ctx_a = ImproveRunContext(
+        mission_id=mission_id_a, run_id=run_id_a, staging_dir=staging_dir_a,
+        source_snapshot_dir=tmp_path / "source_a", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger_a, rpc_handlers={})
+    loop_full._finalize_gate_failed(
+        conn, ctx=ctx_a, backlog_id=None, reason="unprofitable", now=now_a,
+        mission_outcome="unprofitable", inserted_ids=(note_id,))
+
+    row = conn.execute(
+        "SELECT last_result, updated_at FROM improvement_backlog WHERE id=?",
+        (note_id,)).fetchone()
+    assert row["last_result"] == "insufficient_trades:2"
+    assert row["updated_at"] == updated_at_after_b
+
+
+# ---------------------------------------------------------------------------
+
+def test_n10_task_promotion_preserves_origin_unprofitable_marker(
+        loop_and_ctx_with_open_backlog):
+    """codex r2 Important 2: `origin:unprofitable` が付いた note を
+    後続 mission が同一 idea の task discovery として昇格すると、実際に
+    選択・終端されないまま `last_result='promoted_from_note'` に無条件で
+    置換され、origin 列が空になっていた。設計書 §2/N8 は「実際に選択・
+    終端した時点でだけ上書きする」— 昇格だけでは保持する。昇格後に別途
+    選択・終端されれば終端値で上書きされる (N8 は既存 pin のまま)。
+    `test_n3_select_and_bind_inserted_ids_excludes_note_promoted_to_task`
+    と同じ経路 (`_select_and_bind` の discoveries → 昇格) を通し、
+    dup 事前フィルタ (`status=='note' and kind=='task'` は通す) も一緒に
+    通過させる — `_upsert_backlog_idea` を直接呼ぶだけでは経路の手前を
+    素通りしてしまう。`origin` 列としてのレンダは S1/S2 が別途 pin 済み
+    (この行の `last_result` が `_backlog_table` の origin セルへそのまま
+    流れることを担保する) ため、ここでは DB 側の `last_result` 保持のみ
+    検査する。"""
+    loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
+    note_id = backlog_store.add(conn, "annotated note idea", "agent", _NOW)
+    conn.execute(
+        "UPDATE improvement_backlog SET status='note', "
+        "last_result='origin:unprofitable' WHERE id=?", (note_id,))
+    conn.commit()
+
+    output = {
+        "discoveries": [
+            {"idea": "annotated note idea", "source": "agent", "evidence": "e",
+             "kind": "task"},
+        ],
+        "selected": {"backlog_id": backlog_id, "idea": "x"},
+        "artifact": {"type": "observation", "reason": "x"},
+        "selection_rationale": "x"}
+
+    outcome = loop._select_and_bind(conn, output, ctx, now=_NOW)
+
+    assert note_id not in outcome.inserted_ids  # 昇格は起票扱いしない (N3 同様)
+    row = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog WHERE id=?",
+        (note_id,)).fetchone()
+    assert row["status"] == "open"  # 昇格どおり
+    assert row["last_result"] == "origin:unprofitable"  # 保持される
 
 
 # ---------------------------------------------------------------------------

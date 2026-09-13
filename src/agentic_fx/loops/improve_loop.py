@@ -1206,14 +1206,26 @@ class ImproveLoop:
         """Insert, reuse, or promote one normalized backlog idea."""
         idea_norm = idea.strip().lower()
         row = conn.execute(
-            "SELECT id,status FROM improvement_backlog WHERE idea_norm=? "
-            "ORDER BY id LIMIT 1", (idea_norm,)).fetchone()
+            "SELECT id,status,last_result FROM improvement_backlog "
+            "WHERE idea_norm=? ORDER BY id LIMIT 1", (idea_norm,)).fetchone()
         if row is not None:
             if row["status"] == "note" and kind == "task":
+                # codex r2 Important 2 是正 (2026-09-13): 昇格だけでは
+                # まだ選択・終端されていない — `origin:unprofitable` が
+                # 付いた note をここで無条件に `promoted_from_note` で
+                # 上書きすると、実際にゲートへ通るまで警告が保持される
+                # という本束の目的 (設計書 §2/N8) に反して origin 列が
+                # 消える。`origin:unprofitable` のときだけ保持し、それ
+                # 以外は従来どおり `promoted_from_note` に置換する
+                # (実際の選択・終端時は N8 の既存上書き規律で勝つ)。
+                new_last_result = (
+                    "origin:unprofitable"
+                    if row["last_result"] == "origin:unprofitable"
+                    else "promoted_from_note")
                 conn.execute(
                     "UPDATE improvement_backlog SET status='open', "
-                    "last_result='promoted_from_note', updated_at=? WHERE id=?",
-                    (now.isoformat(), row["id"]))
+                    "last_result=?, updated_at=? WHERE id=?",
+                    (new_last_result, now.isoformat(), row["id"]))
                 if self._activity is not None:
                     self._activity.write(Category.IMPROVE, "backlog_promoted",
                                          f"#{row['id']} from note", str(row["id"]))
@@ -2993,12 +3005,20 @@ class ImproveLoop:
             # mission の候補行そのもの) がもし `inserted_ids` にも含まれる
             # 稀なケース (選択された idea 自体が新規挿入) でも、実際に
             # ゲートへ通した候補の終端理由 (`reason`) が最終的に勝つ。
+            # codex r2 Important 1 是正 (2026-09-13): 起票 INSERT と注記
+            # UPDATE は別 tx のため、`parallel>1` では mission A のこの
+            # UPDATE より先に mission B が同じ行を選択・終端できる
+            # (逆順)。`AND last_result IS NULL` の更新世代 CAS で、まだ
+            # 誰も終端していない行だけへ注記を乗せる — 既に終端済み
+            # (`last_result` が非 NULL) の行は無条件で残す。N8 (後で
+            # 選択・終端されると終端値で上書きされる) はこの CAS の対象
+            # 外 (backlog_transition 経由の別 UPDATE) のため変わらない。
             if mission_outcome == "unprofitable" and inserted_ids:
                 placeholders = ",".join("?" * len(inserted_ids))
                 conn.execute(
                     "UPDATE improvement_backlog SET "
                     "last_result='origin:unprofitable', updated_at=? "
-                    f"WHERE id IN ({placeholders})",
+                    f"WHERE id IN ({placeholders}) AND last_result IS NULL",
                     (now.isoformat(), *inserted_ids))
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
