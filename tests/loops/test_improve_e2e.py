@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1392,6 +1393,25 @@ def test_strategy_profitability_floor_reroutes_to_gate_failed_unprofitable(
             f"require_holdout_evaluable={g.require_holdout_evaluable}"
             ) in gate_failed_lines[0]
 
+    # [profitability-floor-fix] codex 差分レビュー Important (2026-09-13):
+    # `gate_failed` activity 行**全体**には `report_detail` 由来の内容
+    # (段名・pair 名・生成績値・failed_stage/failed_pairs) が一切出ない
+    # — 閾値そのもの (`min_pf=`/`require_positive_avg_r=`/
+    # `require_holdout_evaluable=`、`floor_settings_kv` 由来) だけが例外。
+    # 逆変異 = `_finalize_gate_failed` の activity 文字列に
+    # `report_detail` を連結する → RED。
+    line = gate_failed_lines[0]
+    assert not re.search(r"(?<!require_)holdout", line)  # require_holdout_evaluable= は許容
+    assert "in_sample" not in line
+    assert "USDJPY" not in line  # pair 名
+    assert "trades" not in line
+    assert not re.search(r"(?<!min_)pf=", line)  # 閾値の min_pf= だけ許容
+    assert not re.search(r"(?<!require_positive_)avg_r", line)
+    assert "failed_stage" not in line
+    assert "failed_pairs" not in line
+    assert "0.3" not in line  # レポート固有値 canary (in_sample pf)
+    assert "-0.1" not in line  # レポート固有値 canary (in_sample avg_r)
+
 
 def test_f2_6_f4_series_holdout_only_failure_marks_all_gate_rows_unprofitable(
         improve_env):
@@ -1482,6 +1502,136 @@ def test_f2_6_f4_series_holdout_only_failure_marks_all_gate_rows_unprofitable(
     assert (f"min_pf={g.min_pf} require_positive_avg_r={g.require_positive_avg_r} "
             f"require_holdout_evaluable={g.require_holdout_evaluable}"
             ) in gate_failed_lines[0]
+
+    # [profitability-floor-fix] codex 差分レビュー Important (2026-09-13):
+    # holdout 段落ちのときも `gate_failed` activity 行**全体**には
+    # `report_detail` 由来の内容が一切出ない — 閾値の `min_pf=` (と
+    # `require_positive_avg_r=`) だけが例外。逆変異 = `_finalize_gate_
+    # failed` の activity 文字列に `report_detail` を連結する → RED。
+    line = gate_failed_lines[0]
+    assert not re.search(r"(?<!require_)holdout", line)  # require_holdout_evaluable= は許容
+    assert "in_sample" not in line
+    assert "USDJPY" not in line  # pair 名
+    assert "trades" not in line
+    assert not re.search(r"(?<!min_)pf=", line)  # 閾値の min_pf= だけ許容
+    assert not re.search(r"(?<!require_positive_)avg_r", line)
+    assert "failed_stage" not in line
+    assert "failed_pairs" not in line
+    assert "1.5" not in line  # レポート固有値 canary (in_sample pf)
+    assert "0.8" not in line  # レポート固有値 canary (holdout pf)
+
+
+_TWO_PAIR_STRATEGY_CONFIG = """
+kind: strategy
+pairs: [USDJPY, EURUSD]
+timeframe: 1h
+exit_mode: levels
+params: {}
+"""
+
+# [profitability-floor-fix] codex 差分レビュー Important (2026-09-13):
+# 2 pair とも 8 指標が全部異なる値にし、列 1 つ落とす変異や 2 番目の pair
+# を落とす変異のどちらも「全 8 値 × 2 pair」の厳密一致で確実に KILL する。
+_TWO_PAIR_IN_SAMPLE_METRICS = {
+    "USDJPY": {"trades": 40, "pf": 1.5, "win_rate": 0.5, "avg_r": 0.3,
+               "max_drawdown": 0.05, "total_pnl": 120.0,
+               "kill_switch_latches": 0, "evaluable": True},
+    "EURUSD": {"trades": 45, "pf": 1.8, "win_rate": 0.55, "avg_r": 0.25,
+               "max_drawdown": 0.04, "total_pnl": 200.0,
+               "kill_switch_latches": 2, "evaluable": True},
+}
+_TWO_PAIR_HOLDOUT_METRICS = {
+    "USDJPY": {"trades": 35, "pf": 0.7, "win_rate": 0.4, "avg_r": -0.2,
+               "max_drawdown": 0.08, "total_pnl": -50.0,
+               "kill_switch_latches": 1, "evaluable": True},
+    "EURUSD": {"trades": 38, "pf": 1.2, "win_rate": 0.6, "avg_r": 0.15,
+               "max_drawdown": 0.03, "total_pnl": 80.0,
+               "kill_switch_latches": 3, "evaluable": True},
+}
+
+
+def _fake_in_sample_per_pair(metrics_by_pair: dict):
+    """`run_in_sample` の fake — pair (`symbol` kwarg) ごとに異なる
+    `metrics_by_pair[symbol]` を返す (単一値を全 pair で共有する既存の
+    `_fake_in_sample_with_metrics` と違い、2 pair 全部異なる値の fixture
+    を作れる)。"""
+    def _run(settings, *, history_conn, record_fn, symbol, **kwargs):
+        m = metrics_by_pair[symbol]
+        record_fn(_fake_record_kwargs(settings=settings, trades=m["trades"],
+                                      scope="in_sample", pair=symbol, **kwargs))
+        return dict(m)
+    return _run
+
+
+def _fake_holdout_per_pair(metrics_by_pair: dict):
+    """`run_holdout_gate` の fake — pair ごとに異なる metrics を返す。"""
+    def _run(settings, *, history_conn, record_fn, symbol, **kwargs):
+        m = metrics_by_pair[symbol]
+        record_fn(_fake_record_kwargs(settings=settings, trades=m["trades"],
+                                      scope="holdout_gate", pair=symbol, **kwargs))
+        return dict(m)
+    return _run
+
+
+def test_floor_report_detail_holdout_fail_two_pairs_full_metrics(improve_env):
+    """[profitability-floor-fix] codex 差分レビュー Important (2026-09-13):
+    2 pair (値がすべて異なる fixture) で holdout 段が不合格になったとき、
+    レポート本文のヘッダ行 (8 列名) が完全一致し、in_sample・holdout の
+    各表に**全 8 値 × 2 pair** がそのまま出ることを固定する。列を 1 つ
+    落とす変異 (代表: `win_rate`/`kill_switch_latches`) や 2 番目の pair
+    を落とす変異のどちらも、行全体の厳密一致で KILL される。"""
+    app, root = improve_env
+    conn = app.conn_core
+
+    output = _plugin_artifact("floor_two_pair_e2e", kind="strategy")
+    result = MissionResult(status="completed", output=output, transcript=[])
+
+    loop = ImproveLoop(
+        root=root, settings=app.settings, clock=FixedClock(NOW),
+        db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
+        db_readonly_conn_factory=lambda: connect_readonly(
+            root / "data" / "agentic.db"),
+        activity=app.activity, rag=app.rag,
+    )
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               lambda **kw: FakeImproveWorkerRunner(result=result, **kw)), \
+         patch("agentic_fx.loops.improve_loop.holdout.run_in_sample",
+               _fake_in_sample_per_pair(_TWO_PAIR_IN_SAMPLE_METRICS)), \
+         patch("agentic_fx.loops.improve_loop.holdout.run_holdout_gate",
+               _fake_holdout_per_pair(_TWO_PAIR_HOLDOUT_METRICS)):
+        mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+        _write_staging_plugin(
+            ctx.staging_dir, "floor_two_pair_e2e",
+            _PASSING_STRATEGY_PY, _TWO_PAIR_STRATEGY_CONFIG,
+            _PASSING_STRATEGY_TEST)
+        mission_result = worker.run(mission)
+        loop.commit(mission=mission, ctx=ctx, result=mission_result, now=NOW)
+
+    backlog_row = conn.execute(
+        "SELECT status, last_result FROM improvement_backlog "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert backlog_row[0] == "observation"
+    assert backlog_row[1] == "unprofitable"
+
+    report_files = list((root / "data" / "improve_reports").glob(
+        f"improve-*-{ctx.mission_id}.md"))
+    assert len(report_files) == 1
+    report_text = report_files[0].read_text(encoding="utf-8")
+
+    header = ("| pair | trades | pf | win_rate | avg_r | max_drawdown | "
+              "total_pnl | kill_switch_latches | evaluable |")
+    assert header in report_text
+
+    assert "### in_sample" in report_text
+    assert "### holdout" in report_text
+    assert ("| USDJPY | 40 | 1.5 | 0.5 | 0.3 | 0.05 | 120.0 | 0 | True |"
+            in report_text)
+    assert ("| EURUSD | 45 | 1.8 | 0.55 | 0.25 | 0.04 | 200.0 | 2 | True |"
+            in report_text)
+    assert ("| USDJPY | 35 | 0.7 | 0.4 | -0.2 | 0.08 | -50.0 | 1 | True |"
+            in report_text)
+    assert ("| EURUSD | 38 | 1.2 | 0.6 | 0.15 | 0.03 | 80.0 | 3 | True |"
+            in report_text)
 
 
 _IN_SAMPLE_METRICS_FOR_PAYLOAD = {
