@@ -809,3 +809,132 @@ def test_n12_unrelated_discovery_is_also_annotated_accepted_tradeoff(
 
     row = _idea_row(conn, "完全に無関係な改善案")
     assert row["origin_outcome"] == "unprofitable"
+
+
+# ---------------------------------------------------------------------------
+# 段 0 v2.0 S6 (生存変異 M8): 注記 UPDATE の WHERE を
+# `origin_mission_id IS NOT NULL` に広げても既存 pin は全て緑だった。
+# N9 は mission B が自分の行を起票しない (A の行を選ぶだけ) ため、
+# 「他 mission が起票した行まで注記が波及する」次元を誰も見ていない。
+# 実装レポートは「値等値の WHERE 句は範囲を広げる変異が構造的に成立
+# しない」として v1.x の S4 を割愛したが、成立する (実測)。
+# ---------------------------------------------------------------------------
+
+def test_s6_origin_update_does_not_annotate_other_missions_rows(
+        loop_full, conn, mission_and_run_fixture, tmp_path):
+    """mission A と mission B がそれぞれ自分の行を起票し、A だけがフロア
+    不合格で終端する。A の行には `origin_outcome` が付き、B の行は NULL の
+    まま — 注記は `origin_mission_id=<この mission>` の行に限定される
+    (設計書 §2-2「この mission が起票した全行」)。"""
+    mission_id_a, run_id_a, _backlog_id = mission_and_run_fixture
+    row_a, _ = loop_full._upsert_backlog_idea(
+        conn, "mission A idea", "agent", "fact", _NOW, mission_id=mission_id_a)
+
+    mission_id_b = missions_store.start(
+        conn, "improve", "codex", "gpt-5", _NOW, commit=True)
+    row_b, _ = loop_full._upsert_backlog_idea(
+        conn, "mission B idea", "agent", "fact", _NOW, mission_id=mission_id_b)
+    # 起票者が誰でもない過去行 (§2-8 遡及しない) も置く。
+    legacy = backlog_store.upsert_system_note(
+        conn, idea="legacy row without origin", last_result=None, now=_NOW)
+    conn.commit()
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    ctx_a = _mk_ctx(mission_id_a, run_id_a, staging_dir, tmp_path / "source",
+                    frozen=True)
+    loop_full._finalize_gate_failed(
+        conn, ctx=ctx_a, backlog_id=None, reason="unprofitable", now=_NOW,
+        mission_outcome="unprofitable")
+
+    assert _row_by_id(conn, row_a)["origin_outcome"] == "unprofitable"
+    assert _row_by_id(conn, row_b)["origin_outcome"] is None
+    assert _row_by_id(conn, row_b)["origin_mission_id"] == mission_id_b
+    assert _row_by_id(conn, legacy)["origin_outcome"] is None
+
+
+# ---------------------------------------------------------------------------
+# 段 0 v2.0 S7 (生存変異 M10): `_backlog_table` の判定を完全一致から
+# 部分一致 (`'unprofitable' in str(...)`) に緩めても既存 pin は全て緑
+# だった。N6 のおとり行は `origin_outcome` が全て NULL なので、
+# 「origin_outcome に別の値が入ったとき」の次元を誰も見ていない。
+# 遮断 8: `origin` 列に出る語彙は固定文言 `unprofitable` のみで、
+# 派生値 (段名や数値が付いたもの) をそのまま通してはいけない。
+# ---------------------------------------------------------------------------
+
+def test_s7_origin_column_matches_fixed_vocabulary_exactly(tmp_path):
+    """`origin_outcome` が固定文言 `unprofitable` と完全一致する行だけ
+    `unprofitable` と表示する。`unprofitable` を部分文字列として含む値
+    (将来の派生値・否定形) は空欄 — 部分一致に緩めると red。"""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    from tests.loops.conftest import SETTINGS
+
+    ctx_data = _sample_ctx_data_with_origin()
+    ctx_data["backlog"]["items"].append(
+        {"id": 8, "idea": "derived value item", "status": "open",
+         "attempts": 0, "assigned": False, "last_result": None,
+         "origin_outcome": "unprofitable:holdout_pf=0.53"})
+    ctx_data["backlog"]["notes"].append(
+        {"id": 9, "idea": "negated value note", "status": "note",
+         "attempts": 0, "last_result": None,
+         "origin_outcome": "not_unprofitable"})
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = SETTINGS
+    text = loop._render_improve_mission_prompt(
+        ctx_data, ctx=_FakeRunContext(tmp_path / "staging",
+                                      tmp_path / "source"))
+
+    assert _origin_cell(text, 8) == ""
+    assert _origin_cell(text, 9) == ""
+    # 遮断 8: 派生値の中身 (段名・数値) は prompt に漏れない。
+    assert "holdout" not in text
+    assert "0.53" not in text
+
+
+# ---------------------------------------------------------------------------
+# 段 0 v2.0 S8 (生存変異 M11): `improve_context._backlog_section` の
+# **items** 側 dict から `origin_outcome` を落としても既存 pin は全て緑
+# だった。実装レポートは「items 側は tests/test_improve_context.py の
+# 既存 pin が守っている」と書いているが、同ファイルに `origin_outcome`
+# の文字列は 1 つも無い (実測)。S2 は notes 側だけを配線検証している。
+# ---------------------------------------------------------------------------
+
+def test_s8_build_improve_context_carries_item_origin_outcome_to_column(
+        tmp_path):
+    """配線 (items 側): 実 DB → `build_improve_context` →
+    `_render_improve_mission_prompt` を通し、機械注記した **選択可能な
+    課題行** (`list_open` 側) が課題表の `origin` 列に出ることを pin する
+    (S2 の items 版)。"""
+    from agentic_fx.loops.improve_context import build_improve_context
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    from agentic_fx.store.db import connect, init_db
+    from tests.loops.conftest import SETTINGS
+
+    c = connect(tmp_path / "ctx_items.db")
+    init_db(c)
+    flagged = c.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea,source,status,created_at,updated_at,idea_norm,origin_outcome) "
+        "VALUES ('flagged wired item','agent','open',?,?,"
+        "'flagged wired item','unprofitable')",
+        (_NOW.isoformat(), _NOW.isoformat())).lastrowid
+    clean = c.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea,source,status,created_at,updated_at,idea_norm) "
+        "VALUES ('clean wired item','agent','open',?,?,'clean wired item')",
+        (_NOW.isoformat(), _NOW.isoformat())).lastrowid
+    c.commit()
+
+    ctx_data = build_improve_context(
+        c, settings=SETTINGS, now=_NOW, root=tmp_path,
+        allowed_backlog_ids=None)
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = SETTINGS
+    text = loop._render_improve_mission_prompt(
+        ctx_data, ctx=_FakeRunContext(tmp_path / "staging",
+                                      tmp_path / "source"))
+    c.close()
+
+    selectable = text.split("## 既知の事実", 1)[0]
+    assert _origin_cell(selectable, flagged) == "unprofitable"
+    assert _origin_cell(selectable, clean) == ""
