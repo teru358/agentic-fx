@@ -17,6 +17,7 @@ CAS (`AND last_result IS NULL`)・昇格時の保持分岐・`inserted_ids` は
 """
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -938,3 +939,62 @@ def test_s8_build_improve_context_carries_item_origin_outcome_to_column(
     selectable = text.split("## 既知の事実", 1)[0]
     assert _origin_cell(selectable, flagged) == "unprofitable"
     assert _origin_cell(selectable, clean) == ""
+
+
+# ---------------------------------------------------------------------------
+# ローカル LLM 1 周目 L1 (qwen3.8 c3 提起、指揮者が probe で SURVIVED を実測):
+# 注記 UPDATE を「終端 tx の commit の後ろ」へ移し、独立 tx で書く変異が
+# 既存 pin 全数を通り抜けた (650 passed)。N4 は `finish_improve_mission` に
+# 障害を注入するため、注記より後段で失敗する経路しか見ておらず、「注記
+# そのものが失敗したら終端ごと巻き戻る」という逆向きの原子性を誰も観測して
+# いなかった。設計書 v2.0 §2-2 は「既存の `BEGIN IMMEDIATE` tx 内で」実行
+# すると定めており、独立 tx 化は終端だけが commit されて注記が永久に欠落
+# する状態 (プロセス死・UPDATE 失敗) を作る。
+# ---------------------------------------------------------------------------
+
+class _FailingOriginUpdateConn:
+    """`origin_outcome` を書く UPDATE **だけ**失敗させる conn プロキシ。
+
+    他の文と `commit`/`rollback` は実接続へそのまま委譲する。"""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, *args, **kwargs):
+        if "origin_outcome='unprofitable'" in sql:
+            raise sqlite3.OperationalError("simulated fault on origin UPDATE")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_l1_origin_update_failure_rolls_back_the_whole_terminal(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    """注記 UPDATE が失敗したら、同じ tx の終端 (`finish_improve_mission`)
+    も一緒に巻き戻る。注記が終端と**同一 tx**であることの、N4 と逆向きの
+    観測点 — N4 は「注記の後段が失敗したら注記が消える」、ここは「注記が
+    失敗したら終端が残らない」。注記を独立 tx へ切り出すと mission だけが
+    `completed` で確定し、注記の無い終端行が残るため red になる。"""
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    note_id, _ = loop_min._upsert_backlog_idea(
+        conn, "atomic origin note", "agent", "fact", _NOW,
+        mission_id=mission_id)
+    conn.commit()
+    ctx = _mk_ctx(mission_id, run_id, staging_dir, tmp_path / "source",
+                  frozen=True)
+
+    with pytest.raises(sqlite3.OperationalError):
+        loop_min._finalize_gate_failed(
+            _FailingOriginUpdateConn(conn), ctx=ctx, backlog_id=backlog_id,
+            reason="unprofitable", now=_NOW, mission_outcome="unprofitable")
+
+    assert _row_by_id(conn, note_id)["origin_outcome"] is None
+    mission_status = conn.execute(
+        "SELECT status FROM missions WHERE id=?", (mission_id,)).fetchone()
+    assert mission_status["status"] == "running"
+    backlog_row = _row_by_id(conn, backlog_id)
+    assert backlog_row["status"] != "observation"
+    assert backlog_row["last_result"] is None
