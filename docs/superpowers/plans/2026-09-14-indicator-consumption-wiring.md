@@ -1,4 +1,4 @@
-# [indicator-consumption-wiring] 実装プラン v1 (設計書 = `docs/superpowers/specs/2026-09-14-indicator-consumption-wiring-design.md` v1.1 準拠)
+# [indicator-consumption-wiring] 実装プラン v1.1 (設計書 = `docs/superpowers/specs/2026-09-14-indicator-consumption-wiring-design.md` v1.2 準拠)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (推奨) または superpowers:executing-plans で task ごとに実行すること。Step は
@@ -20,7 +20,7 @@ indicator の実行は strategy と**同一 worker プロセス内**で行う (I
 **DB スキーマ変更なし** (`backtest_runs.indicator_deps` 列は設計書 §2.7 で撤回済み。
 additive 列も追加しない)。
 
-**Spec:** `docs/superpowers/specs/2026-09-14-indicator-consumption-wiring-design.md` (v1.1)。
+**Spec:** `docs/superpowers/specs/2026-09-14-indicator-consumption-wiring-design.md` (v1.2)。
 survey: `tmp/design-indicator-wiring/survey.md`。**設計を変えない** — ユーザー裁定 U1〜U6 と
 codex 設計レビュー 9 周 + opus 1 周の全件採用は設計書 §0/§8〜§14 に確定記録済みなので
 「裁定待ち」は無い。設計書に無い判断が必要になったら実装を止めて指揮者へ申告すること。
@@ -84,6 +84,27 @@ codex 設計レビュー 9 周 + opus 1 周の全件採用は設計書 §0/§8�
   `InventoryBuildResult` にフィールドを足す)
 - **モックで実 worker を潰さない**: E2E 系の pin (A1 / A1-b / A1' / C1 / V2 / V3 / N1) は
   実 sqlite + 実 worker サブプロセスで書く ([[test-fixtures-from-real-transcripts]])
+- **本プラン中の `src/…:NNN` という行番号参照は v1 執筆時点のもので、着手時にはズレている**
+  (opus r1 M10 実測: `_DENY_NAMES` は `:120-127` と書いてあるが現物 `:120-129`、
+  `check_source` は `:153-188` と書いてあるが現物 `:153-190`)。**逐語転写の前に必ず
+  `rg -n '<記号名>' <path>` で行番号を再取得すること**。`sed -n 'A,Bp'` を本文の行番号
+  そのままで使わない
+- **コード片中の `...` は「この行以降は既存コードのまま、触らない」という意味**であり、
+  貼り付ける文字列ではない (opus r1 §5)。本プランに **8 箇所**残っている
+  (着手時に `rg -n '^\s*\.\.\.' docs/superpowers/plans/2026-09-14-indicator-consumption-wiring.md`
+  で再取得すること — 各 `...` の行末コメントがどの既存ブロックを指すかを書いてある)。
+  `...` の前後を貼る前に**その周辺の既存コードを `git diff` で確認し、既存行を
+  消していないこと**を diff で確かめてから次へ進む
+  ([[transcription-must-be-machine-diffed]])
+- **fixture の実測は済んでいる** (着手前検証、`tmp/plan-indicator-wiring/probe_fixture.py` /
+  `probe_fixture.txt`): 設計書 §6 の bar 生成式 → 1h resample → Wilder RSI(14)
+  (`ewm(alpha=1/14, adjust=False, min_periods=14)`) を in_sample `[2025-11-03, 2026-02-01)` で
+  実行すると **RSI min = 27.2159 / max = 78.4162、long open 52 回 / short open 50 回 (計 102)、
+  先頭 14 本が NaN で index 14 (15 本目) から値が入る**。設計書 §6 の warmup 記述
+  ("最初の評価から 14 本目までは NaN で hold、15 本目以降で値") と一致する。
+  **T6a の fixture 自己整合テストの期待値はこの実測値を上限・下限の目安として書くこと**
+  (逐語の 102 を pin すると resample 実装差で脆いので、`opens >= 30` と
+  `27.0 < rsi.min() < 30.0` / `70.0 < rsi.max() < 80.0` の形で pin する)
 
 ---
 
@@ -99,7 +120,8 @@ codex 設計レビュー 9 周 + opus 1 周の全件採用は設計書 §0/§8�
 | `tests/plugin/test_indicator_wiring_e2e.py` | A1 / A1-b / C1 / N1 / P3'。実 worker + 実 sqlite |
 | `tests/plugin/test_indicator_containment.py` | V3 (差し替え拒否、3 root) |
 | `tests/fixtures/indicator_wiring.py` | 受入 fixture の唯一の生成器 (3 indicator + `rsi_pullback` + synthetic bars + 独立参照実装 oracle)。**`tests/` 配下、`plugins/` は触らない** |
-| `tests/fixtures/wiring_envs.py` | T3〜T5 のテストが共有する環境ビルダ (`switch_env` / `reconcile_env` / `improve_env` / `shell_env` / `rpc_tools` / `deploy_strategy` / `bump_indicator_version` / `stage_switched_journal` 等)。**本プラン内で定義される唯一の場所** (T6 Step 6-5) |
+| `tests/fixtures/wiring_envs.py` | T4 / T5 のテストが共有する環境ビルダ 20 本 (`switch_env` / `reconcile_env` / `improve_env` / `prepare_ctx` / `activity_text` / `shell_env` / `rpc_tooldefs` / `rpc_tools` / `deploy_strategy` / `bump_indicator_version` / `stage_switched_journal` 等)。**本プラン内で定義される唯一の場所** (T6b)。T3 は使わない (opus r1 M12) |
+| `tests/fixtures/test_wiring_envs.py` | 上記 20 ビルダの smoke test (T6b、opus r1 I3) |
 | `docs/examples/plugins/rsi_pullback/{plugin.py,config.yaml,test_plugin.py}` | 依存ありの strategy 例 (設計書 §2.10 で判定式が固定済み) |
 
 ### 変更
@@ -137,13 +159,40 @@ codex 設計レビュー 9 周 + opus 1 周の全件採用は設計書 §0/§8�
 
 ### 実行順序と並列可否
 
-**T1 → T2 → T6 → T3 → T4 → T5** (直列)。
+**T1 → T2 → T6a → {T3 ∥ T6b} → T4a → T4b → T5a → T5b** (8 task)。
 
-- T6 は T2 完了後に**別 worktree で並列着手してよい**が、**T3 着手前に main へマージすること** —
-  T3 の A1' と T4 の A1 / A1-b は T6 の fixture (`tests/fixtures/indicator_wiring.py`) を
-  `Consumes` する。T6 を並列にする場合、T2 完了コミットから worktree を切り、
-  T3 の Step 3-5 の直前で merge する。
-- T1〜T5 は互いに前段の型・シグネチャを `Consumes` するため worktree 並列不可 (1 レーン直列)。
+> **opus r1 観点 7 で T6 / T4 / T5 を分割した** (旧 6 task はいずれも 1 セッションの
+> 上限を超えていた): T6 → **T6a** (Step 6-1〜6-4: example + fixture + docs) /
+> **T6b** (`tests/fixtures/wiring_envs.py` の 20 ビルダ + 各ビルダの smoke test)、
+> T4 → **T4a** (Step 4-1〜4-3) / **T4b** (Step 4-4〜4-8)、
+> T5 → **T5a** (Step 5-1〜5-3) / **T5b** (Step 5-4〜5-6)。
+
+**依存グラフ**:
+
+```
+T1 ──► T2 ──► T6a ──┬──► T3 ───┐
+                    └──► T6b ──┴──► T4a ──► T4b ──► T5a ──► T5b
+                         (T4a 以降のすべてが wiring_envs を Consumes)
+```
+
+| task | 着手条件 (main にマージ済み) | worktree 並列 |
+|---|---|---|
+| T1 | — | 不可 |
+| T2 | T1 | 不可 |
+| T6a | T2 | **T2 完了コミットから並列着手可** (T3 着手前にマージ) |
+| T6b | T6a | **T3 と並列可** (T3 は `wiring_envs` を使わない — opus r1 M12)。T4a 着手前にマージ |
+| T3 | T1・T2・T6a | **T6b と並列可** |
+| T4a | T3・T6b | 不可 |
+| T4b | T4a・T6b | 不可 |
+| T5a | T4a・T4b・T6b | 不可 |
+| T5b | T5a・T4b | 不可 |
+
+- T6a は T2 完了後に**別 worktree で並列着手してよい**が、**T3 着手前に main へマージすること** —
+  T3 の A1' と T4a の A1 / A1-b は T6a の fixture (`tests/fixtures/indicator_wiring.py`) を
+  `Consumes` する。
+- **T6b と T3 の 2 レーンだけが同時進行可能**。T6b は **T4a 着手前**に main へマージする
+  (T4a Step 4-2 のテストが `wiring_envs.switch_env` を使う)。
+- それ以外は互いに前段の型・シグネチャを `Consumes` するため worktree 並列不可 (1 レーン直列)。
 - task 内分散は可 (テスト転写と実装転写を並列執筆 → 統合 + red/green は 1 レーン直列)。
 
 ---
@@ -337,7 +386,10 @@ def test_indicator_outputs_rejects(tmp_path, outputs, reason):
     assert got == reason
 
 
-def test_duplicate_alias_via_two_entries_is_rejected(tmp_path):
+def test_same_plugin_via_multiple_aliases_is_accepted(tmp_path):
+    # opus r1 M7 是正: 旧名 `test_duplicate_alias_via_two_entries_is_rejected`
+    # は「拒否」を名乗りながら**受理**を検査していた (U3 で同一 plugin の
+    # 複数 alias は許容される)。名前を内容に合わせる。
     # YAML の重複キーは _NoDuplicateKeySafeLoader が先に落とすため、
     # 別名の重複は「同じ plugin を 2 alias」ではなく alias 自身の重複を作る
     # 経路が無い。ここでは alias 数の上限と、同一 plugin の複数 alias が
@@ -553,11 +605,12 @@ class PluginMeta:
         outputs=fields["outputs"],
 ```
 
-(`_check_json_safe` は Step 1-2 で実装する。Step 1-1 の時点では
-`def _check_json_safe(value, path): return None` の**スタブを置かず**、
-Step 1-2 のテストが先に落ちるよう Step 1-2 と同じコミットに入れてもよい。
-分けて進める場合はここで最小実装 —
-`return None` — を書き、Step 1-2 で本実装に置き換える。)
+(`_check_json_safe` の扱い — opus r1 M5 で**一意に確定**: Step 1-1 では
+`def _check_json_safe(value: object, path: str) -> str | None: return None`
+の**スタブを置く**。Step 1-1 は import エラーなく green にし、Step 1-2 で
+このスタブを本実装に置き換える。「スタブを置かず Step 1-2 と同じコミットに
+入れてもよい」という選択肢は取らない — Step 1-1d の `Expected: PASS` と
+矛盾するため。)
 
 - [ ] **Step 1-1d: Run test to verify it passes**
 
@@ -1389,7 +1442,17 @@ def lock_config(candidate_dir: Path, pins: Mapping[str, str]
 def strip_pins(config: dict) -> dict:
     """`config` の deep copy から `indicators.<alias>.pin` だけを除いたもの。
     入力は書き換えない。pin は作者の設計判断ではなくハーネスの派生値なので、
-    「実質的に同じ候補か」の比較はこの形で行う (設計書 §2.7)。"""
+    「実質的に同じ候補か」の比較はこの形で行う (設計書 §2.7)。
+
+    **比較専用** (opus r1 M2): `default=str` は YAML の date / datetime を
+    黙って文字列にする。loader が JSON-safe 検証をかけるのは `params` だけ
+    なので、`config.yaml` の他キー (例: 作者が書いた `note: 2026-01-01`) に
+    date があると、この関数を通した値は元の config と型が変わる。**この
+    戻り値は `same_modulo_pins` / `is_relock_transition` の等価比較に
+    しか使わない** — 両辺を同じ変換に通すので比較意味論は壊れないが、
+    **この戻り値を書き戻したり handshake に載せたりしてはならない**
+    (書き戻しは `lock_config` の `yaml.safe_load` → `safe_dump` 経路のみ)。
+    """
     out = json.loads(json.dumps(config, default=str))
     refs = out.get("indicators")
     if isinstance(refs, dict):
@@ -1433,17 +1496,23 @@ def is_relock_transition(candidate_dir: Path, deployed_dir: Path,
     if not deployed_pins or not candidate_pins:
         return False
 
-    def _current(alias: str, pins: dict[str, str | None]) -> str | None:
-        refs = (_config_of(deployed_dir) or {}).get("indicators") or {}
+    # opus r1 M1 是正: 元案は `_current(alias, pins)` と引数 `pins` を
+    # 取りながら本文で使っていなかった (死に引数 = 嘘のシグネチャ)。
+    # plugin 名の引き元は candidate / deployed のどちらでもよい
+    # (`same_modulo_pins` が `strip_pins` 一致を先に保証しているので
+    # `indicators` の alias → plugin 対応は両者で同一) が、**どちらを
+    # 読むかを明示**するため `plugin_dir` を引数にする。
+    def _current(alias: str, plugin_dir: Path) -> str | None:
+        refs = (_config_of(plugin_dir) or {}).get("indicators") or {}
         ref = refs.get(alias)
         if not isinstance(ref, dict):
             return None
         dep = inventory.by_name(ref.get("plugin"))
         return dep.content_hash if dep is not None else None
 
-    stale = any(pin != _current(alias, deployed_pins)
+    stale = any(pin != _current(alias, deployed_dir)
                 for alias, pin in deployed_pins.items())
-    fresh = all(pin is not None and pin == _current(alias, candidate_pins)
+    fresh = all(pin is not None and pin == _current(alias, candidate_dir)
                 for alias, pin in candidate_pins.items())
     return stale and fresh
 ```
@@ -1701,30 +1770,50 @@ git commit -m "feat(plugin_loader): two-phase approved_plugins returning Invento
 def test_no_caller_uses_legacy_approved_plugins_signature():
     """[indicator-consumption-wiring] T1: `approved_plugins(conn, dir)` の
     2 引数呼び出しが src/ に残っていないこと (settings= を渡し忘れると
-    TypeError で落ちるが、動的呼び出しが混ざると発見が遅れる)。"""
-    import re
+    TypeError で落ちるが、動的呼び出しが混ざると発見が遅れる)。
+
+    **AST で `ast.Call` ノードだけを見る** (opus r1 I2 是正)。正規表現
+    `approved_plugins\(([^)]*)\)` は日本語 docstring 中の
+    `` `plugin_loader.approved_plugins()` `` (引数なし) 6 箇所
+    (`plugin/sandbox.py` 2 / `plugin/signal_producer.py` 1 /
+    `tools/market_tools.py` 1 / `service.py` 2 — 着手時に
+    `rg -n 'approved_plugins' src` で再取得すること) にもマッチし、
+    移行後も永久に offender として残る。AST 走査の前例は
+    `tests/test_no_duplicate_module_level_defs.py`。"""
+    import ast
     from pathlib import Path
-    src = Path(__file__).resolve().parents[2] / "src"
+    src = Path(__file__).resolve().parents[2] / "src" / "agentic_fx"
     offenders = []
-    for path in src.rglob("*.py"):
+    for path in sorted(src.rglob("*.py")):
         if path.name == "plugin_loader.py":
             continue
-        text = path.read_text(encoding="utf-8")
-        for match in re.finditer(r"approved_plugins\(([^)]*)\)", text, re.S):
-            if "settings=" not in match.group(1):
-                offenders.append(f"{path}: {match.group(0)[:80]}")
-    assert offenders == []
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (func.attr if isinstance(func, ast.Attribute)
+                    else func.id if isinstance(func, ast.Name) else None)
+            if name != "approved_plugins":
+                continue
+            if not any(kw.arg == "settings" for kw in node.keywords):
+                offenders.append(f"{path.relative_to(src)}:{node.lineno}")
+    assert offenders == [], (
+        "approved_plugins(...) を settings= 無しで呼んでいる箇所: "
+        f"{offenders}")
 ```
 
 - [ ] **Step 1-7b: Run test to verify it fails**
 
 Run: `uv run pytest tests/tools/test_plugin_loader.py::test_no_caller_uses_legacy_approved_plugins_signature tests/test_service_app.py tests/test_e2e_plugin_signal.py -q`
-Expected: FAIL — offenders に `service.py` / `mission_worker.py` / `improve_loop.py` /
-`improve_context.py` の 4 件が並ぶ
+Expected: FAIL — offenders に **`ast.Call` 由来の 4 件** (`service.py` /
+`mission_worker.py` / `loops/improve_loop.py` / `loops/improve_context.py`) が並ぶ。
+docstring 言及 6 箇所は `ast.Call` ではないので**含まれない** (正規表現版なら
+10 件になっていた — opus r1 I2)
 
 - [ ] **Step 1-7c: Write minimal implementation**
 
-4 箇所を最小形で移行する (意味は変えない — T3/T5 が本格配線する):
+4 箇所を最小形で移行する (意味は変えない — T3/T5a / T5b が本格配線する):
 
 `src/agentic_fx/service.py:823`:
 
@@ -1957,6 +2046,30 @@ def test_non_dict_and_non_str_keys_rejected():
         validate_indicator_result([1, 2], df_index=idx, outputs=None)
     with pytest.raises(IndicatorResultError):
         validate_indicator_result({1: 2.0}, df_index=idx, outputs=None)
+
+
+def test_numeric_string_is_rejected():
+    """opus r1 M3: `float("1.5")` が通るため素の `float()` では数値文字列を
+    受理してしまう。スカラー経路・系列経路の両方を pin する。"""
+    idx = _idx()
+    with pytest.raises(IndicatorResultError, match="got str"):
+        validate_indicator_result({"a": "1.5"}, df_index=idx, outputs=("a",))
+    with pytest.raises(IndicatorResultError, match="got str"):
+        validate_indicator_result({"a": ["1.5"] * 5}, df_index=idx,
+                                  outputs=("a",))
+
+
+def test_nested_container_element_raises_indicator_result_error():
+    """opus r1 M4: 要素が list / dict のとき `pd.isna(v)` は配列を返し、
+    素の `ValueError`(truth value ambiguous) が漏れていた。必ず
+    `IndicatorResultError` に写像されること。"""
+    idx = _idx()
+    with pytest.raises(IndicatorResultError):
+        validate_indicator_result({"a": [[1.0], [2.0], [3.0], [4.0], [5.0]]},
+                                  df_index=idx, outputs=("a",))
+    with pytest.raises(IndicatorResultError):
+        validate_indicator_result({"a": [{"x": 1}] * 5}, df_index=idx,
+                                  outputs=("a",))
 ```
 
 - [ ] **Step 2-1b: Run test to verify it fails**
@@ -1998,13 +2111,23 @@ class IndicatorResultError(ValueError):
 
 
 def _check_number(value: Any, where: str) -> float:
-    if isinstance(value, bool):
+    # opus r1 M3 是正: `float(value)` を先に呼ぶと `float("1.5")` が通り、
+    # **数値文字列を受理**してしまう (設計書 §2.5 は「要素は数値」)。
+    # 型を先に見て、数値型以外は無条件で拒否する。`numbers.Real` を使うと
+    # `Decimal`/`Fraction` が漏れるので、実際に扱う型 (int / float /
+    # numpy スカラー) だけを allowlist する。
+    import numpy as np
+
+    if isinstance(value, bool) or isinstance(value, np.bool_):
         raise IndicatorResultError(f"{where} must be a number, got bool")
     if value is None:
         raise IndicatorResultError(f"{where} must be a number, got None")
+    if not isinstance(value, (int, float, np.integer, np.floating)):
+        raise IndicatorResultError(
+            f"{where} must be a number, got {type(value).__name__}")
     try:
         fvalue = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise IndicatorResultError(
             f"{where} must be a number, got {type(value).__name__}") from exc
     if math.isinf(fvalue):
@@ -2044,10 +2167,23 @@ def validate_indicator_result(result: Any, *, df_index, outputs):
             if expected_len is not None and len(seq) != expected_len:
                 raise IndicatorResultError(
                     f"{where} series length {len(seq)} != df length {expected_len}")
-            values = [None if (v is None or (isinstance(v, float) and math.isnan(v))
-                               or (not isinstance(v, (bool, str))
-                                   and pd.isna(v)))
-                      else _check_number(v, where) for v in seq]
+            # opus r1 M4 是正: 元案は `pd.isna(v)` を要素に直接かけていたが、
+            # `v` が list / dict / ndarray のとき `pd.isna` は**配列**を返し、
+            # `if` が `ValueError: truth value of an array is ambiguous` を
+            # 素で送出する (= `IndicatorResultError` にならず親の
+            # `except IndicatorResultError` を素通りする)。NaN 判定を
+            # スカラー数値型に限定し、それ以外は `_check_number` に回して
+            # 必ず `IndicatorResultError` へ写像する。
+            def _nan_or_number(v: Any) -> float | None:
+                if v is None:
+                    return None
+                if isinstance(v, (float, np.floating)) and math.isnan(float(v)):
+                    return None
+                if v is pd.NaT or (v is pd.NA):
+                    return None
+                return _check_number(v, where)
+
+            values = [_nan_or_number(v) for v in seq]
             out[key] = (pd.Series(values, index=df_index, dtype="float64")
                         if df_index is not None else values)
             continue
@@ -2067,9 +2203,16 @@ git add src/agentic_fx/plugin/indicator_validate.py tests/plugin/test_indicator_
 git commit -m "feat(plugin): shared indicator result validator supporting series (V1)"
 ```
 
-### Step 2-2: worker の同居実行 (handshake の indicators → evaluate へ)
+### Step 2-2: worker の同居実行 + `PluginSession` の `resolved` / `__enter__` 検査
 
-- [ ] **Step 2-2a: Write the failing test**
+> **opus r1 M8 是正で旧 Step 2-2 と旧 Step 2-3 を 1 Step に統合した。**
+> 旧 Step 2-2d は「Run test to verify it **passes**」というチェックボックスの
+> 直下に「この Step ではまだ FAIL のまま」と書かれており自己矛盾していた
+> (worker 側だけでは handshake の送り手がいないので緑にならない)。
+> **worker (子) と `PluginSession` (親) は 1 つの red → green で扱う。**
+> 旧 2-3a〜2-3e は本 Step の d〜h に対応する (旧番号を参照する記述は無い)。
+
+- [ ] **Step 2-2a: Write the failing test (worker 側)**
 
 `tests/plugin/test_sandbox.py` に追記 (実 subprocess — 既存 `_meta` は
 `config.yaml` を `kind: <kind>` 1 行で書くので、`resolved` 用の indicator は
@@ -2137,12 +2280,20 @@ def _indicator_dir(base, name, plugin_py, *, outputs=("v",), params=None,
 
 
 def _resolved(root, *entries):
-    """entries = [(alias, dir, outputs, params, max_bars)]"""
+    """entries = [(alias, dir, outputs, params, max_bars)]
+
+    opus r1 C5 是正: `ResolvedIndicator` は 8 フィールド全てが既定値なしの
+    必須引数 (`@dataclass(frozen=True, slots=True)`、Step 1-3 の Produces)
+    なので `pinned=` を落とすと `TypeError: __init__() missing 1 required
+    positional argument: 'pinned'` で本ヘルパを使う 6 テストが全滅する。
+    同 task の `tests/plugin/test_indicator_containment.py` 側は
+    `pinned=True` を渡しており、こちらが転写ミスだった。
+    """
     from agentic_fx.plugin.loader import content_hash as _ch
     items = tuple(sorted(
         (ResolvedIndicator(alias=a, plugin_name=d.name, plugin_py=d / "plugin.py",
                            content_hash=_ch(d), params=freeze_params(p),
-                           max_bars=mb, outputs=tuple(o))
+                           max_bars=mb, outputs=tuple(o), pinned=True)
          for a, d, o, p, mb in entries), key=lambda i: i.alias))
     return ResolvedIndicatorSet(inventory_root=root.resolve(), items=items,
                                 all_pinned=True)
@@ -2411,19 +2562,10 @@ def _write_line(stream: Any, obj: dict[str, Any]) -> None:
     stream.flush()
 ```
 
-- [ ] **Step 2-2d: Run test to verify it passes**
+> ここまでで worker (子プロセス) 側が揃った。**まだ green にならない**
+> (handshake の送り手 = `PluginSession` が未実装)。続けて親側を書く。
 
-Run: `uv run pytest tests/plugin/test_sandbox.py -q`
-Expected: PASS (`PluginSession(resolved=)` は Step 2-3 で実装するので、この Step では
-まだ FAIL のまま。**Step 2-2 と 2-3 は 1 コミットで green にする** — worker 単体では
-handshake の送り手がいないため。red 確認は `uv run python -m agentic_fx.plugin.worker`
-に手で handshake を流す代わりに、Step 2-3 の実装後に同じコマンドで green を取る)
-
-- [ ] **Step 2-2e: (commit は Step 2-3 と合わせる)**
-
-### Step 2-3: `PluginSession` の `resolved` と `__enter__` 検査
-
-- [ ] **Step 2-3a: Write the failing test**
+- [ ] **Step 2-2d: Write the failing test (`PluginSession` 側、V3)**
 
 `tests/plugin/test_indicator_containment.py` (新規、V3):
 
@@ -2578,12 +2720,13 @@ def test_strategy_session_without_resolved_is_rejected(tmp_path, plugin_settings
     assert calls == []
 ```
 
-- [ ] **Step 2-3b: Run test to verify it fails**
+- [ ] **Step 2-2e: Run test to verify it fails**
 
-Run: `uv run pytest tests/plugin/test_indicator_containment.py -q`
+Run: `uv run pytest tests/plugin/test_indicator_containment.py tests/plugin/test_sandbox.py -q`
 Expected: FAIL — `TypeError: PluginSession.__init__() got an unexpected keyword argument 'resolved'`
+(Step 2-2a の worker 側テストも同じ理由で FAIL のまま = 統合後の red はここ 1 回)
 
-- [ ] **Step 2-3c: Write minimal implementation**
+- [ ] **Step 2-2f: Write minimal implementation (`PluginSession` 側)**
 
 `src/agentic_fx/plugin/sandbox.py`:
 
@@ -2679,12 +2822,12 @@ if TYPE_CHECKING:
     from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 ```
 
-- [ ] **Step 2-3d: Run test to verify it passes**
+- [ ] **Step 2-2g: Run test to verify it passes**
 
 Run: `uv run pytest tests/plugin/test_indicator_containment.py tests/plugin/test_sandbox.py -q`
-Expected: PASS
+Expected: PASS (統合後の green はここ 1 回。worker 側・親側の両テストが同時に緑になる)
 
-- [ ] **Step 2-3e: Commit**
+- [ ] **Step 2-2h: Commit**
 
 ```bash
 git add src/agentic_fx/plugin/worker.py src/agentic_fx/plugin/sandbox.py \
@@ -2737,12 +2880,17 @@ def test_cpu_sec_is_none_after_timeout_kill(tmp_path):
     assert session.cpu_sec is None
 
 
-def test_cpu_sec_is_none_after_plugin_error(tmp_path, plugin_settings):
-    """C1: plugin error 後は worker が生きているが cpu_sec は取れない契約
-    ではなく、**取れる** — plugin error はセッションを殺さないため
-    graceful close が成立する。ここでは「plugin error 後も close が
-    成功し float が入る」ことを固定する (設計書 §2.4 の
-    「plugin error 後 None」はセッション死亡時の fallback を指す)。"""
+def test_cpu_sec_is_float_after_plugin_error(tmp_path, plugin_settings):
+    """C1: plugin error 後は worker が生きているので graceful close が成立し
+    `cpu_sec` は **float**。plugin コード自身の例外はセッションを `_dead` に
+    しない既存契約 (`sandbox.py`、着手時に `rg -n '_dead' src/agentic_fx/plugin/sandbox.py`
+    で再取得) のため。`None` になるのは SIGKILL fallback (timeout 後) と
+    worker 未起動 (`__enter__` 失敗) の 2 経路だけ。
+
+    opus r1 §5 / I10 是正: 旧名 `test_cpu_sec_is_none_after_plugin_error` は
+    名前 (None) と内容 (float) が逆だった。**設計書 §6 の C1 行も v1.2 で
+    この解釈に改訂済み** (「正常終了 / plugin error 後で float、SIGKILL
+    fallback / worker 未起動で None」)。"""
     meta = _meta(tmp_path, "ind_err", "indicator",
                  "def compute(df, params):\n    raise ValueError('x')\n")
     session = PluginSession(meta, settings=plugin_settings)
@@ -2753,17 +2901,21 @@ def test_cpu_sec_is_none_after_plugin_error(tmp_path, plugin_settings):
     assert isinstance(session.cpu_sec, float)
 ```
 
-> **実装者への申し送り (設計との差分ではなく解釈の固定)**: 設計書 §2.4 の
-> 「plugin error 後は `None`」は「セッションが `_dead` になった後の close」を
-> 指す。plugin コード自身の例外は `_dead` にしないという既存契約
-> (`sandbox.py:54-60`) があるため、そのケースは graceful close が成立して
-> float が入る。上のテストがこの解釈を逐語で固定する。
+> **実装者への申し送り**: 設計書 v1.1 §6 C1 は「plugin error 後 / SIGKILL
+> fallback で `None`」と書いていたが、plugin コード自身の例外はセッションを
+> `_dead` にしないという既存契約があるため graceful close が成立し float が
+> 入る。**この食い違いはプラン着手前検証 (opus r1 I10) で指揮者へ申告し、
+> 設計書 v1.2 の §6 C1 行を「正常終了 / plugin error 後で `cpu_sec` は float、
+> SIGKILL fallback (timeout 後の強制終了) / worker 未起動 (`__enter__` 失敗)
+> で `None`」へ改訂済み**。実装者はこれ以上の解釈を足さないこと
+> (`_dead` の判定行は着手時に `rg -n '_dead' src/agentic_fx/plugin/sandbox.py`
+> で再取得する — 本文の行番号参照は当てにしない)。
 
 - [ ] **Step 2-4b: Run test to verify it fails**
 
 Run: `uv run pytest tests/plugin/test_sandbox.py -k cpu_sec -q`
 Expected: FAIL — `AttributeError: 'PluginSession' object has no attribute 'cpu_sec'`
-(Step 2-3 で property を足していれば `assert isinstance(session.cpu_sec, float)` が
+(Step 2-2f で property を足していれば `assert isinstance(session.cpu_sec, float)` が
 `None` で落ちる)
 
 - [ ] **Step 2-4c: Write minimal implementation**
@@ -2989,10 +3141,19 @@ def test_get_indicators_projects_series_to_last_value_and_drops_nan(tmp_path):
     provider.get_bars.return_value = _bars()
 
     def fake_sandbox_run(meta_arg, payload, *, settings):
+        # opus r1 I4 是正: `sandbox_run` の既定は `sandbox.run_plugin` であり、
+        # その戻り値は **`_validate_indicator_result` を通した後**の形
+        # (`{key: float | list[float|None] | None}`) — wire 形式
+        # `{"series": [...]}` ではない。fake も同じ形で返す。
+        # **契約 (1 行で固定)**: `market_tools.get_indicators` は
+        # `run_plugin` の戻りしか見ない = 系列は **list**。wire の
+        # `{"series": [...]}` 封筒を解くのは `sandbox.py` の
+        # `_validate_indicator_result` の責務であり、
+        # `_project_indicator_output` は封筒を知らない (設計書 §2.5 と整合)。
         return {"a": 1.5,
-                "b": {"series": [1.0, 2.0, 3.0]},
-                "c": None,                      # スカラー NaN (wire では null)
-                "d": {"series": [1.0, None]}}   # 系列末尾 NaN
+                "b": [1.0, 2.0, 3.0],
+                "c": None,               # スカラー NaN (wire の null を親が None 化)
+                "d": [1.0, None]}        # 系列末尾 NaN
 
     tools = market_tools.build(provider, MagicMock(), _SETTINGS,
                                indicator_plugins=[meta],
@@ -3028,7 +3189,8 @@ def test_scalar_only_indicator_still_works_standalone(tmp_path, plugin_settings=
 
 Run: `uv run pytest tests/tools/test_plugin_loader.py -k "projects_series or scalar_only" -q`
 Expected: FAIL — 現行 `get_indicators` は `plugin_result` をそのまま合成するので
-`{"a": 1.5, "b": {"series": [...]}, "c": None, "d": {...}}` が返る
+`{"a": 1.5, "b": [1.0, 2.0, 3.0], "c": None, "d": [1.0, None]}` が返る
+(期待は `{"a": 1.5, "b": 3.0}`)
 
 - [ ] **Step 2-6c: Write minimal implementation**
 
@@ -3094,6 +3256,12 @@ def _validate_indicator_result(result: Any) -> dict[str, Any]:
 ```python
 def _project_indicator_output(plugin_result: dict) -> dict:
     """[indicator-consumption-wiring] §2.5: 系列は**末尾値**へ射影し、
+
+    **入力は `sandbox.run_plugin` の戻り (= `_validate_indicator_result` を
+    通した後) に限る** — 系列は `list[float | None]`、スカラー NaN は
+    `None` (opus r1 I4 で契約を固定)。wire 封筒 `{"series": [...]}` は
+    ここへは来ない。
+
     値が未確定 (スカラー NaN = None、系列末尾 None) のキーは落とす
     (fail-open 維持 — LLM 向けの参考情報なので「値が無い」ことを
     `null` で見せるより落とす方が誤読が少ない)。空系列も落とす。"""
@@ -3148,7 +3316,7 @@ git commit -m "feat(market_tools): project standalone indicator series to last v
 
 ---
 
-## T6: example + 受入 fixture + 設計書の契約文 [examples-and-fixture]
+## T6a: example + 受入 fixture + 設計書の契約文 [examples-and-fixture]
 
 **対応**: 設計書 §2.10 / §6 の fixture 節 / §4 の `docs/examples/plugins/` と「設計書」行。
 **完了条件の受入 ID**: A1 の fixture 部分 (fixture 3 indicator + synthetic bars + 独立参照
@@ -3194,9 +3362,15 @@ def write_indicator(base: Path, name: str) -> Path: ...   # name in {"sma","rsi"
 def write_rsi_pullback(base: Path, *, pins: dict[str, str] | None) -> Path: ...
 def deploy_approved(conn, plugins_root: Path, names: list[str], *,
                     now: datetime) -> dict[str, str]: ...   # name -> content_hash
-def expected_eval_timestamps(conn) -> list[datetime]: ...
+def expected_eval_timestamps() -> list[datetime]: ...
+    # opus r1 I9 #3: 旧案は `conn` を受けていたが本文で一切使っていなかった
+    # (実際のバーの有無を見ず、暦格子 × `is_market_open` だけで決まる)。
+    # 死に引数なので落とす。
 def oracle_decisions(conn) -> dict[datetime, dict]: ...
     # {bucket_end: {"action","direction","entry_type","stop_loss","take_profit"}}
+    # opus r1 M11: 同一 conn に対する結果をモジュール内でメモ化する
+    # (in_sample の全 bucket ≒ 2,100 点で `load_resampled_frame` を回すため、
+    # T6a の自己整合テストと T4a の A1 で計 3 回走ると無視できない)。
 def assert_decisions_match(recorded: list[tuple[datetime, dict]], conn) -> None: ...
 ```
 
@@ -3591,16 +3765,28 @@ def test_open_is_previous_close():
         assert b[3] == pytest.approx(a[6])
 
 
+@pytest.mark.slow   # opus r1 M11: `seed_history` が 33,984 行を投入する
 def test_expected_eval_timestamps_follow_market_hours(tmp_path):
     conn = _conn(tmp_path)
     fx.seed_history(conn)
-    stamps = fx.expected_eval_timestamps(conn)
+    stamps = fx.expected_eval_timestamps()
     assert stamps, "no evaluation timestamps derived"
     assert all(market_hours.is_market_open(ts) for ts in stamps)
     assert all(ts.minute == 0 and ts.second == 0 for ts in stamps)
-    # 週末・12/25・1/1 が抜けている (暦格子より少ない)
-    grid = (fx.NOW - fx.BARS_START) // timedelta(hours=1)
-    assert len(stamps) < grid
+    # opus r1 M6 是正: 旧案は `grid = (fx.NOW - fx.BARS_START) // 1h` と
+    # **holdout 期間まで含んだ暦格子**と比べていたので、市場時間を完全に
+    # 無視する実装でも常に真になる空振り assert だった (`stamps` は
+    # `in_sample_until` = 2026-02-01 までしか無い)。同じ期間の暦格子と
+    # 比べ、かつ「週末の timestamp が 1 件も含まれない」を直接 pin する。
+    from agentic_fx.backtest.holdout import in_sample_until
+    end = in_sample_until(fx.NOW, fx.HOLDOUT_MONTHS,
+                          base_interval=fx.BASE_INTERVAL)
+    grid = (end - (fx.BARS_START + timedelta(hours=1))) // timedelta(hours=1)
+    assert 0 < len(stamps) < grid
+    # 土曜 00:00Z〜日曜 21:00Z は市場休止 (サーバ UTC+3 固定、週末境界
+    # 21:00 UTC) — 1 件も含まれないことを直接見る
+    assert not [ts for ts in stamps
+                if ts.weekday() == 5], "土曜の評価時点が混ざっている"
 
 
 def test_fixture_plugins_discover_and_pin(tmp_path):
@@ -3619,10 +3805,13 @@ def test_fixture_plugins_discover_and_pin(tmp_path):
     assert meta.indicators[0].pin == hashes["rsi"]
 
 
+@pytest.mark.slow   # opus r1 M11: in_sample の全 bucket (≒2,100 点) で
+                    # `load_resampled_frame` を回すため。A1 (Step 4-3) にも
+                    # 既に `slow` が付いている
 def test_oracle_produces_hold_during_warmup_then_values(tmp_path):
     conn = _conn(tmp_path)
     fx.seed_history(conn)
-    stamps = fx.expected_eval_timestamps(conn)
+    stamps = fx.expected_eval_timestamps()
     decisions = fx.oracle_decisions(conn)
     assert set(decisions) == set(stamps)
     # 最初の 14 評価は RSI warmup で必ず hold
@@ -3634,7 +3823,7 @@ def test_oracle_produces_hold_during_warmup_then_values(tmp_path):
     # A1 の gate は `total_trades >= EVALUABLE_MIN_TRADES` (= 30、
     # `backtest/metrics.py:20`) を満たさないと `insufficient_trades` で
     # 早期 return する。fixture の生成式・閾値は設計書 §6 の逐語なので
-    # 調整できない — ここで下限を先に pin して、A1 の偽陰性を T6 の段階で
+    # 調整できない — ここで下限を先に pin して、A1 の偽陰性を T6a の段階で
     # 検出する (open 数 >= 成立 trade 数 なので必要条件)。
     assert opens >= 30, f"fixture produces only {opens} entries — A1 would fail "\
                         "with insufficient_trades (escalate to 指揮者)"
@@ -3848,10 +4037,26 @@ def deploy_approved(conn, plugins_root: Path, names, *, now) -> dict[str, str]:
     return hashes
 
 
-def expected_eval_timestamps(conn) -> list[datetime]:
+_ORACLE_CACHE: dict[int, dict] = {}
+
+
+def expected_eval_timestamps() -> list[datetime]:
     """`backtest/runner.run_replay` が `intent_source(closed_bar)` を呼ぶ
     時点と同じ集合を、ハーネスのコード (`market_hours.is_market_open`) から
-    導出する。plugin コードは一切 import しない。"""
+    導出する。plugin コードは一切 import しない。
+
+    **runner の実挙動との対応 (opus r1 I9 で実測確認済み)**: 着手時に
+    `rg -n 'bucket_start|is_market_open|first_decision_at' src/agentic_fx/backtest/runner.py`
+    で再取得して照合すること。v1 執筆時点の実測では
+    `bucket_start = now - tf` → `closed_bar = _aggregate_bucket(..., bucket_start, tf)`
+    → `if closed_bar is not None and market_hours.is_market_open(now)` で
+    `intent_source(closed_bar)` を呼ぶ。この `now` は **bucket_end** なので
+    本関数の `is_market_open(ts)` (ts = bucket_end) と**同じ述語**。開始点も
+    `first_decision_at = ceil_to_bucket(start, eval_timeframe) + tf`
+    = `BARS_START + 1h` で一致する。**週末境界のズレは発生しない**。
+
+    `conn` は受けない (opus r1 I9 #3: 旧案は受けていたが本文で使っていな
+    かった = 死に引数)。"""
     from agentic_fx.backtest.holdout import in_sample_until
     from agentic_fx.core import market_hours
     end = in_sample_until(NOW, HOLDOUT_MONTHS, base_interval=BASE_INTERVAL)
@@ -3879,13 +4084,31 @@ def oracle_decisions(conn) -> dict[datetime, dict]:
 
     from agentic_fx.backtest.timeframes import load_resampled_frame
 
+    # opus r1 M11: 同一 conn に対する再計算を避ける (T6a の自己整合テストと
+    # T4a の A1 で計 3 回走る)。`functools.lru_cache` は conn を hashable と
+    # して保持し続けるので使わず、`id(conn)` キーの module-level dict で
+    # 明示的にメモ化する (テストは関数スコープの conn なので衝突しない)。
+    cached = _ORACLE_CACHE.get(id(conn))
+    if cached is not None:
+        return cached
+
     out: dict[datetime, dict] = {}
-    for bucket_end in expected_eval_timestamps(conn):
+    for bucket_end in expected_eval_timestamps():
         df = load_resampled_frame(conn, PAIR, EVAL_TIMEFRAME, source=SOURCE,
                                   base_interval=BASE_INTERVAL,
                                   until=bucket_end, max_bars=MAX_BARS)
-        if df.empty:
-            continue
+        # opus r1 I9 #1 是正: 旧案はここに `if df.empty: continue` があり、
+        # `expected_eval_timestamps` (df を見ない) と集合が食い違う可能性が
+        # あった (`test_oracle_produces_hold_during_warmup_then_values` は
+        # `set(decisions) == set(stamps)` を要求する)。fixture は欠損なしの
+        # 33,984 本なのでここへは到達しない — **到達したら fixture が
+        # 壊れているので落ちる方が正しい**。continue せず素通しする
+        # (`close.diff()` が空 Series になり `len(rsi) < 2` で hold に落ちる
+        # のではなく、`df["close"]` の KeyError / IndexError で落ちること
+        # 自体が検出になる)。
+        assert not df.empty, (
+            f"fixture has a gap at {bucket_end.isoformat()} — "
+            "expected_eval_timestamps と oracle の集合が食い違う")
         close = df["close"].astype(float)
         delta = close.diff()
         gain = delta.clip(lower=0.0)
@@ -3920,6 +4143,7 @@ def oracle_decisions(conn) -> dict[datetime, dict]:
                                "take_profit": last_close - target}
         else:
             out[bucket_end] = hold
+    _ORACLE_CACHE[id(conn)] = out
     return out
 
 
@@ -3928,7 +4152,15 @@ def assert_decisions_match(recorded, conn) -> None:
     `[(bucket_end, decision_dict), ...]` を oracle と逐次比較する。
     比較対象 (codex r8 I3): `(action, direction)`、open のときは
     `entry_type == "market"` と `stop_loss` / `take_profit` を ±1e-9。
-    `rationale` は比較しない。"""
+    `rationale` は比較しない。
+
+    **adapter 側の逐語契約 (opus r1 I9 #2)**: `StrategyAdapter.__call__` は
+    `load_resampled_frame(...)` の結果が `df.empty` のとき **`decision_sink` を
+    呼ばずに `None` を返す** (Step 3-1c の実装を参照)。一方この関数は
+    `[ts for ts, _ in recorded] == sorted(expected)` の**完全一致**を要求する。
+    欠損のない本 fixture では `df.empty` に到達しないので両者は一致するが、
+    **fixture を欠損ありに変えた瞬間に片側だけが落ちる非対称**なので、
+    fixture の bar 生成式を変更するときはこの 2 つを同時に見直すこと。"""
     expected = oracle_decisions(conn)
     assert [ts for ts, _ in recorded] == sorted(expected), \
         "evaluated timestamps do not match the market-hours grid"
@@ -3947,11 +4179,17 @@ def assert_decisions_match(recorded, conn) -> None:
 Run: `uv run pytest tests/fixtures/test_indicator_wiring_fixture.py -q`
 Expected: PASS
 
-> `test_oracle_produces_hold_during_warmup_then_values` が
-> 「open が 1 件も無い」で落ちた場合、正弦波の振幅 (`2.0`) が RSI を
-> 30/70 の外へ振り切らせていない。**設計書 §6 の生成式は逐語で固定なので
-> 式を変えず**、`OVERSOLD` / `OVERBOUGHT` を動かすのでもなく、
-> **指揮者へ申告すること** (設計書の fixture 定義の是正が要る)。
+> **この懸念は着手前に実測で解消済み** (opus r1 観点 7 #10 / I9 補足、
+> `tmp/plan-indicator-wiring/probe_fixture.py` + `probe_fixture.txt`)。
+> 設計書 §6 の生成式で in_sample `[2025-11-03, 2026-02-01)` の 1h RSI(14) は
+> **min 27.2159 / max 78.4162、long open 52 回 + short open 50 回 = 102 回**、
+> warmup は**先頭 14 本が NaN、index 14 (15 本目) から値**。`opens >= 30` は
+> 余裕で満たす。
+>
+> それでも `opens >= 30` が落ちたら、resample の `label`/`closed` や
+> `load_resampled_frame` の tail 幅が probe と違う可能性が高い。**設計書 §6 の
+> 生成式は逐語で固定なので式を変えず**、`OVERSOLD` / `OVERBOUGHT` も動かさず、
+> **指揮者へ申告すること**。
 
 - [ ] **Step 6-3e: Commit**
 
@@ -4035,32 +4273,327 @@ git add docs src/agentic_fx/plugin/sandbox.py tests/fixtures
 git commit -m "docs: update plugin contract for indicator series and colocated execution"
 ```
 
-### Step 6-5: 共通テストヘルパ (`tests/fixtures/wiring_envs.py`)
+---
 
-T3 / T4 / T5 のテストが使う環境ビルダを 1 箇所に置く。**これらは本プラン内で
-定義される唯一の場所** — 各 task のテストは `from tests.fixtures.wiring_envs
-import ...` で取る。
+**T6a 完了条件**:
+- [ ] `docs/examples/plugins/rsi_indicator` が系列 + `outputs: [rsi]` で、
+      自身の `test_plugin.py` が緑
+- [ ] `docs/examples/plugins/rsi_pullback` が新設され、判定式が設計書 §2.10 逐語
+      (境界 `curr == oversold` は hold)、`discover` と `check_source` を通る、
+      unpinned のまま
+- [ ] **A1 の fixture 部分**: `tests/fixtures/indicator_wiring.py` の bar 生成式が
+      設計書 §6 逐語 (33,984 本・端点・`open_k = close_{k-1}`)、
+      `expected_eval_timestamps` が `market_hours.is_market_open` から導出され
+      (引数なし)、oracle が plugin コードを import せず warmup 14 本の hold を
+      再現し、**open が 30 件以上** (着手前 probe 実測 102 件)
+- [ ] 設計書 `2026-07-25` / `phase2-7-plugins.md:246` / sandbox 脅威モデルが更新済み
+      (`tests/fixtures/wiring_envs.py` は **T6b** の完了条件へ移した — opus r1 I3)
+- [ ] 段 0 変異 red: (a) oracle の `load_resampled_frame(max_bars=MAX_BARS)` を
+      `max_bars=None` にする → `test_oracle_produces_hold_during_warmup_then_values`
+      の warmup 期待が崩れる (b) `expected_eval_timestamps` の `is_market_open`
+      判定を削る → `test_expected_eval_timestamps_follow_market_hours` が落ちる
 
-- [ ] **Step 6-5a: Write the failing test**
+---
 
-`tests/fixtures/test_indicator_wiring_fixture.py` に追記:
+## T6b: 共通テストヘルパ `tests/fixtures/wiring_envs.py` [wiring-test-envs]
+
+**この task は opus r1 I3 で T6 から切り出した独立 task。** `wiring_envs` は 20 個の
+ビルダを定義し、T4 / T5 の受入テストがほぼ全部これに依存する。T6 のままだと
+検証が `switch_env` 1 本のみで、**壊れたまま「T6 緑」になり T4/T5 の実装中に一気に
+爆発する**構造だった (実際 opus r1 では `improve_env` (C2) / `activity_text` (C3) /
+`shell_env` (C4) / `stage_switched_journal` (I8) の 4 ビルダが現物 API と噛み合って
+いなかった)。**各ビルダに最小 1 本の smoke test を付ける** — 「起動できる」ではなく
+「返り値で 1 手進める」まで踏む ([[measure-capability-not-startup]])。
+
+**対応**: 設計書 §6 の fixture 節 (テスト環境の再現)。受入 ID は持たない (他 task の
+受入を支える基盤) が、**T4 の R2 / D1 と T5 の F4 / F5 / C1 の成否を丸ごと決める**。
+
+**着手条件**: T6a が main にマージ済み (`tests.fixtures.indicator_wiring` を import する)。
+**T3 と並列可** (T3 は `wiring_envs` を使わない — opus r1 M12)。**T4 着手前に main へマージ**。
+
+**Files:**
+- Create: `tests/fixtures/wiring_envs.py`
+- Modify: `tests/fixtures/test_wiring_envs.py` (新規、ビルダごとの smoke test)
+
+**Interfaces (Produces — 逐語シグネチャ。後続 task はこの名前しか使わない):**
 
 ```python
-def test_env_builders_produce_isolated_roots(tmp_path):
-    from tests.fixtures import wiring_envs as env
-    conn, plugins_root = env.switch_env(tmp_path / "a")
-    assert plugins_root.is_dir() and plugins_root.name == "plugins"
-    assert conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 0
-    # 実 DB / 実 plugins に触れていない
-    assert str(plugins_root).startswith(str(tmp_path))
+# tests/fixtures/wiring_envs.py
+SETTINGS_FIXTURE: Settings                    # holdout_months / eval_source / base_interval を fixture 値に
+
+def switch_env(root: Path) -> tuple[Connection, Path]: ...
+    # (conn, plugins_root)。plugins/ と plugins/_human を作る
+def reconcile_env(root: Path) -> tuple[Connection, Path, ActivityLog]: ...
+def improve_env(root: Path) -> tuple[ImproveLoop, Connection, Path]: ...
+    # factory は毎回 connect(db_path) (opus r1 I6)。conn はテスト専用の別接続
+def improve_env_with_activity(root: Path) -> tuple[ImproveLoop, Connection, Path, ActivityLog]: ...
+def loop_env(root: Path) -> tuple[ImproveLoop, Connection, Path]: ...
+    # (loop, conn, plugins_root) — 質検査 (P5) 用の薄い別名
+def prepare_ctx(loop: ImproveLoop, *, now: datetime) -> ImproveRunContext: ...
+    # opus r1 C1: loop.prepare(slot_key=None, now=now) の 3-tuple から ctx を取る
+def synthetic_ctx(loop: ImproveLoop, conn: Connection, root: Path) -> ImproveRunContext: ...
+    # prepare_ctx が tmp 環境で成立しない場合のみ使う fallback
+def activity_text(activity: ActivityLog) -> str: ...
+    # opus r1 C3: ActivityLog に read_text() は無い。tail(10_000) の join
+def shell_env(root: Path) -> tuple[Commands, Connection, Path]: ...
+    # opus r1 C4: commands.Shell ではなく commands.Commands
+def rpc_tooldefs(root: Path, *, counters: MissionToolCounters,
+                 run_backtest_handler: Callable) -> list[ToolDef]: ...
+    # ToolRegistry(on_execute=…, on_result=…).register_all(defs) にそのまま渡す
+def rpc_tools(root: Path, *, counters: MissionToolCounters,
+              run_backtest_handler: Callable) -> dict[str, Callable]: ...
+    # tooldef を直接呼ぶ経路 (registry を通らない = errors/streak は増えない)
+def deploy_strategy(conn: Connection, plugins_root: Path, name: str, *,
+                    pins: dict) -> str: ...                      # content_hash
+def bump_indicator_version(conn: Connection, plugins_root: Path, name: str, *,
+                           now: datetime) -> str: ...            # 新 content_hash
+def submit_indicator_v2(conn: Connection, plugins_root: Path,
+                        name: str) -> tuple[int, str]: ...       # (approval_id, content_hash)
+def approve_indicator_v2(conn: Connection, plugins_root: Path, name: str, *,
+                         approval_id: int) -> None: ...
+def stage_switched_journal(conn: Connection, plugins_root: Path, *, name: str,
+                           pins: dict, now: datetime
+                           ) -> tuple[str, str, int, str]: ...
+    # (old_target, new_target, approval_id, op_id)。opus r1 I8: payload の
+    # content_hash は新 version dir の実体から、advance は commit=True
+def copy_example(dest_root: Path, name: str) -> Path: ...
+def rename_dependency(plugin_dir: Path, old: str, new: str) -> None: ...
+def write_dependency_free_strategy(base: Path, name: str) -> Path: ...
+def completed_result(output: dict) -> MissionResult: ...
+def mission_for(ctx: ImproveRunContext) -> Mission: ...
 ```
 
-- [ ] **Step 6-5b: Run test to verify it fails**
+### Step 6b-1: `wiring_envs` の全ビルダと smoke test
 
-Run: `uv run pytest tests/fixtures/test_indicator_wiring_fixture.py -k env_builders -q`
+- [ ] **Step 6b-1a: Write the failing test**
+
+`tests/fixtures/test_wiring_envs.py` (新規)。**ビルダごとに 1 本**、「返り値で
+1 手進める」ところまで書く:
+
+```python
+"""[indicator-consumption-wiring] T6b: `wiring_envs` の各ビルダの smoke test。
+
+opus r1 I3: 元案は `switch_env` 1 本しか検証しておらず、他の 18 ビルダは
+「壊れたまま緑」で T4/T5 へ渡る構造だった。各ビルダについて**返り値を使って
+1 手進める**ところまで検査する。
+"""
+from __future__ import annotations
+
+from datetime import timedelta
+
+import pytest
+
+from agentic_fx.activity import Category
+from tests.fixtures import indicator_wiring as fx
+from tests.fixtures import wiring_envs as env
+
+
+def test_switch_env_produces_isolated_roots(tmp_path):
+    conn, plugins_root = env.switch_env(tmp_path / "a")
+    assert plugins_root.is_dir() and plugins_root.name == "plugins"
+    assert (plugins_root / "_human").is_dir()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 0
+    assert str(plugins_root).startswith(str(tmp_path))
+
+
+def test_reconcile_env_activity_is_writable(tmp_path):
+    conn, plugins_root, activity = env.reconcile_env(tmp_path / "b")
+    activity.write(Category.APPROVAL, "probe", "hello world")
+    assert "probe" in env.activity_text(activity)
+
+
+def test_activity_text_returns_written_lines(tmp_path):
+    """opus r1 C3: `ActivityLog.read_text()` は存在しない。行の**形**
+    (tab 区切り 5 列、3 列目 = event、4 列目 = summary) をここで 1 度だけ
+    固定し、R2 / F5 / C1 の逐語 pin はこの形を前提に書く。"""
+    _conn, _root, activity = env.reconcile_env(tmp_path / "c")
+    activity.write(Category.IMPROVE, "backtest_cpu",
+                   "mission=1 plugin=rsi_pullback cpu_sec=1.5")
+    line = env.activity_text(activity).splitlines()[-1]
+    cols = line.split("\t")
+    assert len(cols) == 5
+    assert cols[1] == "IMPROVE"
+    assert cols[2] == "backtest_cpu"
+    assert cols[3] == "mission=1 plugin=rsi_pullback cpu_sec=1.5"
+    assert cols[4] == "-"
+
+
+def test_improve_env_survives_a_closed_handler_conn(tmp_path):
+    """opus r1 I6: 親の `run_backtest_handler` は自分で開いた conn を
+    `finally` で閉じる。factory が毎回新規接続を返さないと、1 回回した
+    時点でテスト側の conn まで閉じる。"""
+    loop, conn, root = env.improve_env(tmp_path / "d")
+    handler_conn = loop._db_write_conn_factory()
+    handler_conn.close()
+    # テスト側の conn は生きている
+    assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+
+def test_prepare_ctx_builds_a_run_context(tmp_path):
+    """opus r1 C1: `prepare` は 3-tuple を返し `conn` 引数を持たない。
+    tmp 環境で `WorkerRunner` 構築まで通ることをここで確かめる
+    (通らなければ `synthetic_ctx` へ切り替え、指揮者へ申告する)。"""
+    loop, _conn, root = env.improve_env(tmp_path / "e")
+    ctx = env.prepare_ctx(loop, now=fx.NOW)
+    assert ctx.staging_dir.is_dir()
+    assert ctx.source_snapshot_dir.is_dir()
+    assert ctx.mission_id > 0 and ctx.run_id > 0
+
+
+def test_synthetic_ctx_is_usable_without_prepare(tmp_path):
+    loop, conn, root = env.improve_env(tmp_path / "f")
+    ctx = env.synthetic_ctx(loop, conn, root)
+    assert ctx.staging_dir.is_dir() and ctx.rpc_handlers == {}
+
+
+def test_shell_env_dispatches(tmp_path):
+    """opus r1 C4: `commands.Shell` は存在しない。`Commands.dispatch` が
+    動くところまで進める。"""
+    cmds, conn, plugins_root = env.shell_env(tmp_path / "g")
+    assert "learning" in cmds.dispatch("status")
+    assert cmds.plugins_root == plugins_root
+    assert cmds.settings is env.SETTINGS_FIXTURE
+
+
+def test_rpc_tools_expose_run_backtest(tmp_path):
+    from agentic_fx.tools.mission_counters import MissionToolCounters
+    calls = []
+    tools = env.rpc_tools(tmp_path / "h", counters=MissionToolCounters(),
+                          run_backtest_handler=lambda a: calls.append(a)
+                          or {"started": True})
+    assert "run_backtest" in tools
+    tools["run_backtest"](name="cand", pair="USDJPY")
+    assert calls and calls[0]["name"] == "cand"
+
+
+def test_rpc_tooldefs_can_be_registered(tmp_path):
+    """opus r1 I5: F4 の `errors` / refusal streak は `ToolRegistry` の
+    `on_result` 経由でしか増えない。tooldef のリストがそのまま
+    `ToolRegistry` に渡せることをここで据える。"""
+    from agentic_fx.tools.mission_counters import MissionToolCounters
+    from agentic_fx.tools.registry import ToolRegistry
+    counters = MissionToolCounters()
+    defs = env.rpc_tooldefs(tmp_path / "h2", counters=counters,
+                            run_backtest_handler=lambda a: {
+                                "started": False, "error": "indicator_unresolved"})
+    registry = ToolRegistry(on_execute=counters.record_call,
+                            on_result=counters.record_tool_result)
+    registry.register_all(defs)
+    registry.execute("run_backtest", {"name": "cand", "pair": "USDJPY"},
+                     allowed=registry.names())
+    assert counters.errors == 1
+
+
+def test_deploy_strategy_is_discoverable_and_hashes_match(tmp_path):
+    from agentic_fx.plugin.loader import content_hash, discover_one_with_reason
+    conn, plugins_root = env.switch_env(tmp_path / "i")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    chash = env.deploy_strategy(conn, plugins_root, "rsi_pullback",
+                                pins={"rsi": hashes["rsi"]})
+    meta, reason = discover_one_with_reason(plugins_root / "rsi_pullback",
+                                            "rsi_pullback")
+    assert reason is None and meta.content_hash == chash
+    assert chash == content_hash((plugins_root / "rsi_pullback").resolve())
+
+
+def test_bump_indicator_version_changes_hash_and_symlink(tmp_path):
+    conn, plugins_root = env.switch_env(tmp_path / "j")
+    before = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)["rsi"]
+    after = env.bump_indicator_version(conn, plugins_root, "rsi",
+                                       now=fx.NOW + timedelta(hours=1))
+    assert after != before
+    assert (plugins_root / "rsi").is_symlink()
+
+
+def test_submit_and_approve_indicator_v2_round_trip(tmp_path):
+    # `agentic_fx.store.approvals` に `get(conn, id)` は**存在しない**
+    # (公開 API は create / apply_decision / pending / expire_due /
+    # list_due_for_expiry / set_reason。着手時に
+    # `rg -n '^def ' src/agentic_fx/store/approvals.py` で再取得)。
+    # 既存テスト (`tests/test_commands.py`) と同じ SQL で status を読む。
+    def _status(conn, aid):
+        return conn.execute(
+            "SELECT status FROM approval_requests WHERE id=?", (aid,)).fetchone()[0]
+
+    conn, plugins_root = env.switch_env(tmp_path / "k")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    approval_id, chash = env.submit_indicator_v2(conn, plugins_root, "rsi")
+    assert _status(conn, approval_id) == "pending"
+    env.approve_indicator_v2(conn, plugins_root, "rsi",
+                             approval_id=approval_id)
+    assert _status(conn, approval_id) == "approved"
+
+
+@pytest.mark.slow
+def test_stage_switched_journal_reconciles_to_decided_when_pin_intact(tmp_path):
+    """opus r1 I8: このヘルパは R2 の成否を丸ごと決める。**pin が破れて
+    いないとき reconcile が `decided` まで進む**ことをここで据える
+    (T4b Step 4-7 の R2 は「破れているとき reverted」を見る裏返し)。"""
+    from agentic_fx.plugin import switch as plugin_switch
+    conn, plugins_root = env.switch_env(tmp_path / "l")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    old_target, new_target, approval_id, op_id = env.stage_switched_journal(
+        conn, plugins_root, name="rsi_pullback",
+        pins={"rsi": hashes["rsi"]}, now=fx.NOW)
+    # 現物は `reconcile_switch_journals(conn, *, plugins_root, now, settings,
+    # activity=None, force_revert_op_id=None)` (着手時に
+    # `rg -n 'def reconcile_switch_journals' -A 5 src/agentic_fx/plugin/switch.py`
+    # で再取得)。T4b Step 4-7 で引数が増えたら本テストも更新すること。
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, settings=env.SETTINGS_FIXTURE,
+        now=fx.NOW + timedelta(minutes=1))
+    # テーブル名は **`plugin_switch_journal`** (`store/db.py` の DDL)
+    row = conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE op_id = ?",
+        (op_id,)).fetchone()
+    assert row[0] == "decided", (
+        "pin が破れていないのに decided へ進まない — payload の content_hash か "
+        "advance_switch_journal(commit=True) を疑う (opus r1 I8)")
+    assert (plugins_root / "rsi_pullback").readlink().name \
+        == new_target.rsplit("/", 1)[-1]
+
+
+def test_copy_example_does_not_touch_the_repo(tmp_path):
+    dest = env.copy_example(tmp_path / "m", "rsi_pullback")
+    assert (dest / "plugin.py").exists()
+    assert str(dest).startswith(str(tmp_path))
+
+
+def test_rename_dependency_rewrites_config(tmp_path):
+    import yaml
+    d = fx.write_rsi_pullback(tmp_path / "n", pins=None)
+    env.rename_dependency(d, "rsi", "rsi_other")
+    config = yaml.safe_load((d / "config.yaml").read_text(encoding="utf-8"))
+    assert config["indicators"]["rsi"]["plugin"] == "rsi_other"
+
+
+def test_write_dependency_free_strategy_discovers_with_no_indicators(tmp_path):
+    from agentic_fx.plugin.loader import discover_one_with_reason
+    d = env.write_dependency_free_strategy(tmp_path / "o", "plain")
+    meta, reason = discover_one_with_reason(d, "plain")
+    assert reason is None and meta.indicators == ()
+
+
+def test_completed_result_and_mission_for_are_accepted_shapes(tmp_path):
+    loop, conn, root = env.improve_env(tmp_path / "p")
+    ctx = env.synthetic_ctx(loop, conn, root)
+    result = env.completed_result({"summary": "x"})
+    assert result.status == "completed"
+    assert env.mission_for(ctx).max_turns == 1
+```
+
+> **smoke test で「起動できる」で止めない** ([[measure-capability-not-startup]])。
+> 上の各テストは必ず「返り値を 1 手使う」ところまで踏んでいる
+> (`dispatch("status")` / `discover_one_with_reason` / `reconcile → decided` /
+> `prepare → ctx.staging_dir`)。
+
+- [ ] **Step 6b-1b: Run test to verify it fails**
+
+Run: `uv run pytest tests/fixtures/test_wiring_envs.py -q`
 Expected: FAIL — `ModuleNotFoundError: No module named 'tests.fixtures.wiring_envs'`
 
-- [ ] **Step 6-5c: Write minimal implementation**
+- [ ] **Step 6b-1c: Write minimal implementation**
 
 `tests/fixtures/wiring_envs.py` (新規):
 
@@ -4080,15 +4613,27 @@ from pathlib import Path
 import yaml
 
 from agentic_fx.config import load_settings
-from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.db import connect, connect_readonly, init_db
 from tests.fixtures import indicator_wiring as fx
 
 _REPO = Path(__file__).resolve().parents[2]
 
-SETTINGS_FIXTURE = load_settings(_REPO / "config" / "settings.yaml.example")
-SETTINGS_FIXTURE.backtest.holdout_months = fx.HOLDOUT_MONTHS
-SETTINGS_FIXTURE.backtest.eval_source = fx.SOURCE
-SETTINGS_FIXTURE.backtest.base_interval = fx.BASE_INTERVAL
+# opus r1 (未確認 #9 への予防): 元案は `load_settings(...)` の戻りを**その場で
+# mutate** していた。`Settings` は pydantic モデルで既定 mutable なので動くが、
+# module-level の共有オブジェクトを書き換える形はテスト間汚染の温床。
+# `model_copy` で新しい object を作る (着手時に `rg -n 'class Settings' src/agentic_fx/config.py`
+# で pydantic v2 であることと `backtest` のフィールド名を再確認すること)。
+SETTINGS_FIXTURE = load_settings(_REPO / "config" / "settings.yaml.example").model_copy(
+    deep=True)
+SETTINGS_FIXTURE.backtest = SETTINGS_FIXTURE.backtest.model_copy(
+    update={"holdout_months": fx.HOLDOUT_MONTHS, "eval_source": fx.SOURCE,
+            "base_interval": fx.BASE_INTERVAL})
+
+
+class _FakeRag:
+    """`ImproveLoop.__init__(rag=...)` を満たすだけの no-op。
+    `tests/loops/conftest.py` の `_FakeRag` からの逐語転写
+    (手書きの偽形状は禁止 — [[test-fixtures-from-real-transcripts]])。"""
 
 
 def _db(root: Path):
@@ -4116,26 +4661,117 @@ def reconcile_env(root: Path):
 
 
 def improve_env(root: Path):
-    """`(loop, conn, root)`。`ImproveLoop` を `_root=root` で組む。
-    WorkerRunner は使わない (prepare / commit だけを叩く)。"""
+    """`(loop, conn, root)`。`ImproveLoop` を本番同型で組む。
+
+    **opus r1 C2 / I6 是正**。元案には 2 つの欠陥があった:
+
+    1. `ImproveLoop.__init__` は
+       `(*, root, settings, clock, db_write_conn_factory, db_readonly_conn_factory,
+       activity: ActivityLog, rag: Rag)` で **`activity` / `rag` も必須**
+       (着手時に `rg -n 'def __init__' -A 12 src/agentic_fx/loops/improve_loop.py`
+       で再取得)。5 引数だけでは `TypeError`。
+    2. write/readonly の両 factory に**同一の 1 本の conn** を返すと、
+       親の `run_backtest_handler` が `finally: conn.close()` する既存構造
+       (Step 5-4c 参照) により 1 回 backtest を回した時点でテスト側の
+       `conn` まで閉じ、以降の `conn.execute(...)` が
+       `ProgrammingError: Cannot operate on a closed database` になる。
+
+    本番 (`service.py` の配線) と同型の「毎回 db_path へ新規接続」にし、
+    テストが握る `conn` は**別に 1 本**開く。`tests/loops/conftest.py` の
+    `loop_no_seam` fixture がこの形の現物なので逐語転写する
+    (`_conn_for_test` seam は**立てない** — seam を立てると prepare が
+    conn を閉じない代わりに上記 1 本共有に戻ってしまう)。
+    """
+    from agentic_fx.activity import ActivityLog
     from agentic_fx.core.contracts import FixedClock
     from agentic_fx.loops.improve_loop import ImproveLoop
     root.mkdir(parents=True, exist_ok=True)
-    conn = _db(root)
+    (root / "data").mkdir(parents=True, exist_ok=True)
     (root / "plugins").mkdir(exist_ok=True)
-    (root / "logs").mkdir(exist_ok=True)
+    (root / "logs").mkdir(parents=True, exist_ok=True)
+    db_path = root / "data" / "agentic.db"
+    bootstrap = connect(db_path)
+    init_db(bootstrap)
+    bootstrap.close()
+    conn = connect(db_path)          # テストが握る接続 (loop のものとは別)
     loop = ImproveLoop(root=root, settings=SETTINGS_FIXTURE,
                        clock=FixedClock(fx.NOW),
-                       db_write_conn_factory=lambda: conn,
-                       db_readonly_conn_factory=lambda: conn)
-    loop._conn_for_test = conn
+                       db_write_conn_factory=lambda: connect(db_path),
+                       db_readonly_conn_factory=lambda: connect_readonly(db_path),
+                       activity=ActivityLog(root / "logs" / "activity.log"),
+                       rag=_FakeRag())
     return loop, conn, root
 
 
 def improve_env_with_activity(root: Path):
-    """`(loop, conn, root, activity)`。"""
+    """`(loop, conn, root, activity)`。`activity` は `improve_env` が
+    `ImproveLoop(activity=...)` へ渡した `ActivityLog` そのもの
+    (`ImproveLoop.__init__` が `self._activity = activity` を持つのは現物で
+    確認済み — 着手時に `rg -n '_activity' src/agentic_fx/loops/improve_loop.py`
+    で再確認する)。"""
     loop, conn, root = improve_env(root)
     return loop, conn, root, loop._activity
+
+
+def prepare_ctx(loop, *, now):
+    """`ImproveRunContext` を 1 本で取る (**opus r1 C1 是正**)。
+
+    現物のシグネチャは
+    `prepare(self, *, slot_key: tuple[str, int] | None, now: datetime,
+    on_ready: Callable[[dict], None] | None = None) -> tuple[Mission, ImproveRunContext, WorkerRunner]`
+    (着手時に `rg -n 'def prepare' -A 4 src/agentic_fx/loops/improve_loop.py`
+    で再取得)。すなわち **`conn` 引数は無く** (conn は
+    `db_write_conn_factory` から自前で取る)、**`slot_key` はキーワード必須**、
+    **戻り値は 3-tuple で ctx は 2 番目**。プラン v1 が全テストで書いていた
+    `ctx = _prepare_ctx(loop, now=...)` は
+    `TypeError: prepare() got an unexpected keyword argument 'conn'` で即死する。
+    T5 の全テストは**このヘルパ経由**にすること。
+
+    `prepare` は副作用として `WorkerRunner` を構築する。tmp 環境で成立する
+    ことは T6b の smoke test (`test_prepare_ctx_builds_a_run_context`) で
+    確かめる — 成立しない場合のみ `ImproveRunContext` 直組みの
+    `synthetic_ctx` (下記) に切り替える。
+    """
+    _mission, ctx, _runner = loop.prepare(slot_key=None, now=now)
+    return ctx
+
+
+def synthetic_ctx(loop, conn, root: Path):
+    """`prepare` を経由せず `ImproveRunContext` を直組みする fallback。
+    `tests/loops/conftest.py` の `loop_and_ctx` fixture からの逐語転写。
+    **`prepare_ctx` が tmp 環境で成立する限り使わない** (T6b の smoke test が
+    判定する)。"""
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+    from agentic_fx.loops.improve_run_context import ImproveRunContext
+    staging_dir = root / "staging"
+    source_snapshot_dir = root / "source"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    source_snapshot_dir.mkdir(parents=True, exist_ok=True)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
+        "run_backtest": 600.0, "analyze_corr": 600.0})
+    return ImproveRunContext(
+        mission_id=1, run_id=1, staging_dir=staging_dir,
+        source_snapshot_dir=source_snapshot_dir,
+        allowed_backlog_ids=frozenset(), slot_key=None, ledger=ledger,
+        rpc_handlers={})
+
+
+def activity_text(activity) -> str:
+    """activity ログの全文 (**opus r1 C3 是正**)。
+
+    `ActivityLog` の公開メソッドは `write(category, event, summary, ref_id=None)`
+    と `tail(n=20, category=None)` **だけ** — `read_text()` は存在しない
+    (プラン v1 は 4 箇所で `activity.read_text()` を呼んでおり全部
+    `AttributeError`)。逐語 pin はこのヘルパ経由で行う。
+
+    **行の形 (逐語)**: `ActivityLog.write` は
+    `"\t".join([ts_iso_seconds, category.value, event, " ".join(summary.split()), ref_id or "-"])`
+    を 1 行として書く。つまり受入の「逐語」は**行全体の完全一致ではなく
+    `event` と `summary` 部分の一致**で見る (先頭 2 列は時刻とカテゴリ)。
+    T6b の smoke test (`test_activity_text_returns_written_lines`) で
+    この形を 1 度だけ確かめてから 4 箇所へ展開すること。
+    """
+    return "\n".join(activity.tail(10_000))
 
 
 def loop_env(root: Path):
@@ -4145,16 +4781,46 @@ def loop_env(root: Path):
 
 
 def shell_env(root: Path):
-    """`(shell, conn, plugins_root)` — `commands` の対話シェル。"""
-    from agentic_fx.commands import Shell
+    """`(cmds, conn, plugins_root)` — `commands.Commands` (**opus r1 C4 是正**)。
+
+    `agentic_fx.commands` にあるクラスは `Shell` ではなく **`Commands`** で、
+    `__init__` は `conn / state_store / broker / trade_loop / activity /
+    log_dir / clock` が**すべて必須**、`root` 引数は存在しない
+    (`plugins_root` / `settings` / `health_latch` などが任意)。
+    `tests/test_commands.py::_commands` の組み方を逐語転写する。
+    `_approval_detail` (Step 4-8c) は `self.plugins_root` と `self.settings` を
+    読むので両方渡す。
+    """
+    from unittest.mock import MagicMock
+
+    from agentic_fx.activity import ActivityLog
+    from agentic_fx.commands import Commands
+    from agentic_fx.core.contracts import FixedClock
+    from agentic_fx.core.health_latch import HealthLatch
+    from agentic_fx.core.paper_broker import PaperBroker
+    from agentic_fx.store.state import StateStore
     conn, plugins_root = switch_env(root)
-    shell = Shell(conn=conn, settings=SETTINGS_FIXTURE, root=root)
-    return shell, conn, plugins_root
+    (root / "logs").mkdir(parents=True, exist_ok=True)
+    clock = FixedClock(fx.NOW)
+    cmds = Commands(
+        conn=conn, state_store=StateStore(root / "s.json"),
+        broker=PaperBroker(conn, SETTINGS_FIXTURE, clock),
+        trade_loop=MagicMock(),
+        activity=ActivityLog(root / "logs" / "activity.log"),
+        log_dir=root / "logs", clock=clock, health_latch=HealthLatch(),
+        plugins_root=plugins_root, settings=SETTINGS_FIXTURE)
+    return cmds, conn, plugins_root
 
 
-def rpc_tools(root: Path, *, counters, run_backtest_handler):
-    """`{tool 名: func}`。`improve_rpc_tools.build_improve_rpc_tooldefs` の
-    薄いラッパ (staging_dir 検証を通すため候補を 1 本置く)。"""
+def rpc_tooldefs(root: Path, *, counters, run_backtest_handler) -> list:
+    """`improve_rpc_tools.build_improve_rpc_tooldefs` の薄いラッパ
+    (staging_dir 検証を通すため候補を 1 本置く)。**`ToolDef` のリスト**を
+    返すので、`ToolRegistry(on_execute=counters.record_call,
+    on_result=counters.record_tool_result)` を作って `register_all(defs)` で
+    登録し `execute(name, args, allowed=registry.names())` で呼べる
+    (`ToolRegistry.__init__` はキーワード専用で tooldef を取らない —
+    `mission_registry.py` の構築行の逐語)。F4 の `errors` / refusal streak は
+    registry の `on_result` 経由でしか増えないため必要 (opus r1 I5)。"""
     from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
     from agentic_fx.tools import improve_rpc_tools
     staging = root / "staging"
@@ -4162,14 +4828,20 @@ def rpc_tools(root: Path, *, counters, run_backtest_handler):
     (staging / "cand").mkdir(parents=True, exist_ok=True)
     shutil.copytree(staging / "rsi_pullback", staging / "cand",
                     dirs_exist_ok=True)
-    defs = improve_rpc_tools.build_improve_rpc_tooldefs(
+    return improve_rpc_tools.build_improve_rpc_tooldefs(
         ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 60,
                                                          "analyze_corr": 60}),
         run_backtest_handler=run_backtest_handler,
         analyze_corr_handler=lambda a: {},
         staging_dir=staging, counters=counters,
         budget=SETTINGS_FIXTURE.improve.tool_budget)
-    return {d.name: d.func for d in defs}
+
+
+def rpc_tools(root: Path, *, counters, run_backtest_handler):
+    """`{tool 名: func}` — tooldef を**直接呼ぶ**経路 (registry を通らない)。"""
+    return {d.name: d.func for d in
+            rpc_tooldefs(root, counters=counters,
+                         run_backtest_handler=run_backtest_handler)}
 
 
 def deploy_strategy(conn, plugins_root: Path, name: str, *, pins: dict) -> str:
@@ -4247,7 +4919,28 @@ def stage_switched_journal(conn, plugins_root: Path, *, name: str, pins: dict,
     """`switched` 段で止まった journal を再現する
     (版 dir 作成 + live symlink 差し替え + journal phase=switched、DB は
     まだ `decided` にしない)。戻り値 =
-    `(old_target, new_target, approval_id, op_id)`。"""
+    `(old_target, new_target, approval_id, op_id)`。
+
+    **opus r1 I8 是正 (2 点)**:
+
+    1. 元案は新 version dir に `plugin.py + "\n# next\n"` を書きながら
+       approval payload には**旧** `content_hash` を入れていた。
+       reconcile → `retry_approval` → `approve_candidate` →
+       `_version_dir_hashes_ok(version_dir, content_hash=payload["content_hash"], ...)`
+       が不一致で落ちるため、R2 の裏テスト
+       (`test_switched_journal_with_intact_pin_proceeds_to_decided`) が
+       そもそも `decided` に到達しない。**payload の `content_hash` は
+       新 version dir の実体から `loader.content_hash(version_dir)` で
+       算出する** (`artifact_hash` は既に `artifact_hash_bytes` で
+       新実体から算出しているので整合する)。
+    2. `advance_switch_journal(...)` は既定 `commit=False` なので、
+       phase を書いても**同一 conn の外からは見えない**。
+       `commit=True` を明示する (`begin_switch_journal` 側は既に
+       `commit=True`)。
+
+    このヘルパは R2 の成否を丸ごと決めるので、**T6b で「実際に reconcile が
+    `decided` まで進む」smoke test を 1 本据えてから** T4b Step 4-7 へ渡すこと。
+    """
     from agentic_fx.plugin import switch as plugin_switch
     from agentic_fx.plugin.loader import artifact_hash_bytes
     from agentic_fx.store import approvals
@@ -4265,18 +4958,24 @@ def stage_switched_journal(conn, plugins_root: Path, *, name: str, pins: dict,
     version_dir.mkdir(parents=True, exist_ok=True)
     for rel in ("plugin.py", "config.yaml", "test_plugin.py"):
         (version_dir / rel).write_bytes((human / rel).read_bytes())
+    from agentic_fx.plugin.loader import content_hash as _content_hash
+    new_hash = _content_hash(version_dir)   # opus r1 I8: 新実体から算出
+    assert new_hash != old_hash, (
+        "stage_switched_journal: 新 version dir の content_hash が旧と同じ "
+        "— plugin.py への追記が効いていない")
     approval_id = approvals.create(
         conn, "plugin",
         {"name": name, "kind": "strategy", "candidate_origin": "human",
          "candidate_path": f"plugins/_human/{name}",
-         "content_hash": old_hash, "artifact_hash": ahash}, now)
+         "content_hash": new_hash, "artifact_hash": ahash}, now)
     op_id = plugin_switch.begin_switch_journal(
         conn, kind="approve", approval_id=approval_id, name=name,
         old_kind="symlink", old_target=old_target, new_target=new_target,
         switch_required=True, actor="human_cli", now=now, commit=True)
     plugin_switch.switch_live(plugins_root, name, new_target=new_target,
                               op_id=op_id)
-    plugin_switch.advance_switch_journal(conn, op_id, phase="switched", now=now)
+    plugin_switch.advance_switch_journal(conn, op_id, phase="switched", now=now,
+                                        commit=True)   # opus r1 I8
     return old_target, new_target, approval_id, op_id
 
 
@@ -4336,54 +5035,57 @@ def mission_for(ctx):
 
 ```python
 from tests.fixtures.wiring_envs import (
-    SETTINGS_FIXTURE, approve_indicator_v2 as _approve_indicator_v2,
+    SETTINGS_FIXTURE, activity_text as _activity_text,
+    approve_indicator_v2 as _approve_indicator_v2,
     bump_indicator_version as _bump_indicator_version,
     completed_result as _completed_result, copy_example as _copy_example,
     deploy_strategy as _deploy_strategy, improve_env as _improve_env,
     improve_env_with_activity as _improve_env_with_activity,
     loop_env as _loop_env, mission_for as _mission,
-    reconcile_env as _reconcile_env, rename_dependency as _rename_dependency,
-    rpc_tools as _rpc_tools, shell_env as _shell_env,
+    prepare_ctx as _prepare_ctx, reconcile_env as _reconcile_env,
+    rename_dependency as _rename_dependency,
+    rpc_tooldefs as _rpc_tooldefs, rpc_tools as _rpc_tools,
+    shell_env as _shell_env,
     stage_switched_journal as _stage_switched_journal,
     submit_indicator_v2 as _submit_indicator_v2, switch_env as _switch_env,
+    synthetic_ctx as _synthetic_ctx,
     write_dependency_free_strategy as _write_dependency_free_strategy,
 )
 ```
 
 > **`_last_rendered_prompt` について**: `ImproveLoop._render_improve_mission_prompt`
-> の戻り値を `self._last_rendered_prompt` に保持する 1 行を T5 Step 5-1c で足す
+> の戻り値を `self._last_rendered_prompt` に保持する 1 行を T5a Step 5-1c で足す
 > (テスト専用の観測面。本番挙動は変わらない)。
 
-- [ ] **Step 6-5d: Run test to verify it passes**
+- [ ] **Step 6b-1d: Run test to verify it passes**
 
-Run: `uv run pytest tests/fixtures -q`
-Expected: PASS
+Run: `uv run pytest tests/fixtures -q && uv run pytest tests/fixtures -q -m slow`
+Expected: PASS (20 ビルダ全部に smoke test が緑で付いている)
 
-- [ ] **Step 6-5e: Commit**
+- [ ] **Step 6b-1e: Commit**
 
 ```bash
-git add tests/fixtures/wiring_envs.py tests/fixtures/test_indicator_wiring_fixture.py
-git commit -m "test(fixtures): shared environment builders for the wiring acceptance tests"
+git add tests/fixtures/wiring_envs.py tests/fixtures/test_wiring_envs.py
+git commit -m "test(fixtures): shared environment builders with per-builder smoke tests"
 ```
 
-**T6 完了条件**:
-- [ ] `docs/examples/plugins/rsi_indicator` が系列 + `outputs: [rsi]` で、
-      自身の `test_plugin.py` が緑
-- [ ] `docs/examples/plugins/rsi_pullback` が新設され、判定式が設計書 §2.10 逐語
-      (境界 `curr == oversold` は hold)、`discover` と `check_source` を通る、
-      unpinned のまま
-- [ ] **A1 の fixture 部分**: `tests/fixtures/indicator_wiring.py` の bar 生成式が
-      設計書 §6 逐語 (33,984 本・端点・`open_k = close_{k-1}`)、
-      `expected_eval_timestamps` が `market_hours.is_market_open` から導出され、
-      oracle が plugin コードを import せず warmup 14 本の hold を再現し、
-      open を 1 件以上生む
-- [ ] `tests/fixtures/wiring_envs.py` が T3〜T5 の全ヘルパを定義し、実 DB / 実 `plugins/` /
-      `docs/examples/` を書き換えない
-- [ ] 設計書 `2026-07-25` / `phase2-7-plugins.md:246` / sandbox 脅威モデルが更新済み
-- [ ] 段 0 変異 red: (a) oracle の `load_resampled_frame(max_bars=MAX_BARS)` を
-      `max_bars=None` にする → `test_oracle_produces_hold_during_warmup_then_values`
-      の warmup 期待が崩れる (b) `expected_eval_timestamps` の `is_market_open`
-      判定を削る → `test_expected_eval_timestamps_follow_market_hours` が落ちる
+**T6b 完了条件**:
+- [ ] `tests/fixtures/wiring_envs.py` が Produces の 20 シンボルを逐語シグネチャで定義し、
+      **それぞれに smoke test が 1 本以上**ある (`switch_env` だけの検証にしない)
+- [ ] `improve_env` が `ImproveLoop(activity=..., rag=...)` を渡し、両 factory が
+      **毎回新規接続**を返す (handler の `conn.close()` でテスト側 conn が死なない)
+- [ ] `prepare_ctx` が tmp 環境で `ImproveRunContext` を返す
+      (返らない場合は `synthetic_ctx` へ切替 + 指揮者へ申告)
+- [ ] `activity_text` の行の形 (tab 5 列) が pin されている
+- [ ] `shell_env` が `Commands` を組み `dispatch("status")` が通る
+- [ ] `stage_switched_journal` から `reconcile_switch_journals` が `decided` へ進む
+- [ ] 実 DB (`data/agentic.db`) / 実 `plugins/` / `docs/examples/` を書き換えない
+      (全て `tmp_path` 配下、`copy_example` は read-only)
+- [ ] 段 0 変異 red: (a) `improve_env` の factory を `lambda: conn` 共有に戻す →
+      `test_improve_env_survives_a_closed_handler_conn` が落ちる
+      (b) `stage_switched_journal` の `content_hash` を旧 hash に戻す →
+      `test_stage_switched_journal_reconciles_to_decided_when_pin_intact` が落ちる
+      (c) `advance_switch_journal` の `commit=True` を外す → 同上
 
 ---
 
@@ -4393,7 +5095,8 @@ git commit -m "test(fixtures): shared environment builders for the wiring accept
 `signal_producer.py` / `mission_worker.py` / `market_tools.py` / `backtest/cli.py` 行。
 **完了条件の受入 ID**: F1 / F2 / A1' / A1'' / P1 (人間 CLI 部分)。
 
-**着手条件**: T1・T2・T6 が main にマージ済み (A1' は T6 の fixture を使う)。
+**着手条件**: T1・T2・**T6a** が main にマージ済み (A1' は T6a の fixture を使う)。
+T6b には依存しない (opus r1 M12) ので **T6b と並列可**。
 
 **Files:**
 - Modify: `src/agentic_fx/plugin/strategy_adapter.py:200-283`
@@ -4412,8 +5115,11 @@ git commit -m "test(fixtures): shared environment builders for the wiring accept
 
 - Consumes: `resolve.ResolvedIndicatorSet` / `.empty(root)` / `resolve_indicator_deps` /
   `IndicatorResolutionError(alias, reason)` (T1)、`PluginSession(meta, *, settings,
-  resolved=None)` / `.cpu_sec` (T2)、`tests.fixtures.indicator_wiring` と `tests.fixtures.wiring_envs` (T6 Step 6-3 / 6-5)、
+  resolved=None)` / `.cpu_sec` (T2)、`tests.fixtures.indicator_wiring` (T6a Step 6-3)、
   `plugin_loader.approved_plugins(conn, plugins_dir, *, settings) -> InventoryBuildResult` (T1)。
+  **`tests.fixtures.wiring_envs` (T6b) は使わない** — T3 のテストは
+  `_cli_root_with_deployed_rsi_pullback` をローカル定義する (opus r1 M12)。
+  そのため **T3 は T6b と並列に進められる**。
 - Produces:
 
 ```python
@@ -4462,6 +5168,49 @@ def _plugin_lock(conn, settings, args, root: Path) -> int: ...
 ### Step 3-1: adapter の `resolved` 必須化 + `decision_sink` + `cpu_sec`
 
 - [ ] **Step 3-1a: Write the failing test**
+
+> **先に読む — `build_intent_source` の既存呼び出しの全数移行表 (opus r1 I1)**
+>
+> `resolved` を**キーワード必須**にすると、既存の呼び出し・patch がすべて
+> `TypeError` になる。プラン v1 は「4 つの src 呼び出し元へ透通させる」しか
+> 書いておらず、**テスト側 19 箇所の移行が欠落**していた (Step 3-1d は
+> `tests/plugin tests/backtest -q` の PASS を期待しているので必ず赤になる)。
+> T1 Step 1-7 と同じ流儀で **`rg -n 'build_intent_source' src tests` の全結果を
+> 貼り、着手時に再取得して差分を確認すること** (行番号は v1 執筆時点の値):
+>
+> **src 側 (5 箇所、本 Step と Step 3-4 / T4 / T5 で `resolved=` を渡す)**
+>
+> | path:line | 呼び出し元 | 渡す `resolved` |
+> |---|---|---|
+> | `plugin/strategy_gate.py:287` | in_sample 経路 | `evaluate_strategy_adoption_gate(resolved=)` |
+> | `plugin/strategy_gate.py:323` | holdout 経路 | 同上 (**同一 object**、P3') |
+> | `plugin/approval.py:162` | `_validate_strategy` | 引数で透通 (Produces 参照) |
+> | `backtest/cli.py:405` | 人間 CLI | Step 3-4 で `check` 解決 |
+> | `loops/improve_loop.py:895` | 改善 RPC | T5b Step 5-4 で解決 |
+>
+> **テスト側 patch (12 箇所)** — `def fake_build_intent_source(meta_arg, *, conn,
+> pair, dataset, settings)` のような**固定シグネチャの fake** が置かれている。
+> **一律方針: fake の引数末尾に `**kwargs` を足す** (`resolved` / `decision_sink` を
+> 受け流す)。fake が `resolved` を検査する必要がある箇所だけ明示引数にする。
+>
+> `tests/plugin/test_approval.py:511, 668, 708` /
+> `tests/plugin/test_strategy_gate.py:52, 280, 323` /
+> `tests/plugin/test_switch_floor_modes.py:530` /
+> `tests/loops/test_improve_loop_rpc_handlers.py:91, 332, 561` /
+> `tests/loops/test_improve_loop_finalize.py:516` /
+> `tests/integration/test_improve_forbidden_regression.py:297` /
+> `tests/backtest/test_cli.py:567, 634, 686`
+>
+> (patch 対象が `agentic_fx.plugin.approval.strategy_adapter.build_intent_source`
+> のように**モジュール属性経由**なので、`patch(...)` の文字列自体は変えない)
+>
+> **テスト側の直接呼び出し (7 箇所、`tests/plugin/test_strategy_adapter.py`)** —
+> `:89, 119, 138, 158, 189, 213, 239` (+ 本 Step で追記する分)。これらは
+> **`resolved=_EMPTY` を足す**。`:158` 付近の「`resolved` 無しでも通る」契約
+> テストは本 Step で反転する (F1)。
+>
+> **Step 3-1d の Run はこの移行を含めて緑にすること**:
+> `uv run pytest tests/plugin tests/backtest tests/loops tests/integration -q`
 
 `tests/plugin/test_strategy_adapter.py:150-180` の契約テストを反転し、追記する:
 
@@ -4691,7 +5440,7 @@ if TYPE_CHECKING:
    `resolved=ResolvedIndicatorSet.empty(meta.path.parent)` を渡して素通りさせる。
    **`_validate_kind` 側の `resolved` は `resolved: "ResolvedIndicatorSet | None"
    = None` (キーワード任意)** にする — `indicator` / `signal` 分岐は使わないので、
-   T3 と T4 の間で `run_kind_gate` の非 strategy 経路が壊れない。
+   T3 と T4a の間で `run_kind_gate` の非 strategy 経路が壊れない。
 3. `switch._run_full_gate` に `plugins_root: Path` を足し、
    `approval.assert_max_bars_within_limit` の直後で
    ```python
@@ -4711,14 +5460,14 @@ if TYPE_CHECKING:
    持っているのでそのまま渡す。
 4. `improve_loop.run_backtest_handler` (`:895`) は
    `resolved=ResolvedIndicatorSet.empty(self._root / "plugins")` を渡す
-   (**T5 Step 5-4 で `ImproveRunContext.inventory` からの `check` 解決に
+   (**T5b Step 5-4 で `ImproveRunContext.inventory` からの `check` 解決に
    置き換える**。それまでは依存ありの staging 候補は worker 内で
    `KeyError` → `SandboxError` → `backtest_failed` になる = fail closed)。
 5. `improve_loop._run_strategy_gate` (`improve_loop.py:1391`) に
    `resolved` を足して `evaluate_strategy_adoption_gate` へ中継する。
    `:2258` の呼び出し元は暫定で
    `resolved=ResolvedIndicatorSet.empty(self._root / "plugins")` を渡す
-   (**T5 Step 5-5 で `ImproveRunContext.inventory` からの `require` 解決に
+   (**T5b Step 5-5 で `ImproveRunContext.inventory` からの `require` 解決に
    置き換える**)。**この 5 番目を落とすと T3 以降の改善 E2E が
    `TypeError` で赤くなり、Step 3-5d の全数実行が通らない。**
 
@@ -5433,12 +6182,17 @@ git commit -m "feat(cli): afx plugin lock --from _human writes dependency pins (
 
 ---
 
-## T4: gate / approval / switch / noop [approval-corridor]
+## T4a: gate の判別子と人間回廊の非送出 + A1 E2E [approval-corridor-1]
 
-**対応**: 設計書 §2.3 の承認回廊行、§2.7、§2.8、§4 の `approval.py` / `strategy_gate.py` /
-`switch.py` / `noop_gate.py` / `commands.py` 行。
-**完了条件の受入 ID**: F3 / F3' / A1 / A1-b / A2 / P2 / P2' / P2'' / P3 (payload 部分) /
-P3' / P4 / P5 / D1 / R2 / U4a / U4b (承認経路)。
+> **opus r1 観点 7 で旧 T4 (8 Step / 約 1,700 行) を T4a (Step 4-1〜4-3) と
+> T4b (Step 4-4〜4-8) に分割した。** 境界は「gate の判別子が確定したところ」。
+
+**対応**: 設計書 §2.8 (判別子)、§2.3 の `_run_full_gate` 行、§4 の `approval.py` /
+`strategy_gate.py` / `switch.py` (`_run_full_gate` のみ) 行。
+**完了条件の受入 ID**: F3 / F3' / A1 / A1-b / U4a / U4b (承認経路) / C1 (verdict 経路)。
+
+**着手条件**: T1・T2・T6a・T3・**T6b** が main にマージ済み
+(Step 4-2 の F3'/U4a テストが `wiring_envs.switch_env` を使う)。**worktree 並列不可**。
 
 **Files:**
 - Modify: `src/agentic_fx/plugin/approval.py:198-315` (`GateOutcome` / `run_kind_gate`)
@@ -5456,10 +6210,13 @@ P3' / P4 / P5 / D1 / R2 / U4a / U4b (承認経路)。
 **Interfaces:**
 
 - Consumes: T1 の `InventoryBuildResult` / `resolve_indicator_deps` /
-  `IndicatorResolutionError` / `same_modulo_pins` / `is_relock_transition`、
+  `IndicatorResolutionError`、
   T3 の `evaluate_strategy_adoption_gate(..., resolved, inventory)` /
   `build_intent_source(..., resolved, decision_sink)` / `_run_full_gate(..., plugins_root)`、
-  T6 の `tests.fixtures.indicator_wiring` / `tests.fixtures.wiring_envs`。
+  T6a の `tests.fixtures.indicator_wiring`、
+  T6b の `tests.fixtures.wiring_envs`(`switch_env` / `SETTINGS_FIXTURE` のみ)。
+  (`same_modulo_pins` / `is_relock_transition` と `wiring_envs` の残りのビルダは
+  **T4b** の Consumes — opus r1 観点 7)
 - Produces:
 
 ```python
@@ -5513,6 +6270,38 @@ def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
 ### Step 4-1: `GateOutcome` の `indicator_unresolved` 判別子と `run_kind_gate`
 
 - [ ] **Step 4-1a: Write the failing test**
+
+> **先に読む — `run_kind_gate` の既存呼び出しの全数移行表 (opus r1 C6)**
+>
+> `inventory` を**キーワード必須**にすると、既存の 5 呼び出しが全部
+> `TypeError` になる。プラン v1 のどの Step にも移行指示が無く、Step 4-1d の
+> `uv run pytest tests/plugin -q` は必ず赤になっていた。T1 Step 1-7 /
+> T3 Step 3-1a と同じ流儀で **`rg -n 'run_kind_gate\(' src tests` の全結果を
+> 貼る** (行番号は v1 執筆時点。着手時に再取得すること):
+>
+> | path:line | 現行の呼び出し | 移行後 |
+> |---|---|---|
+> | `src/agentic_fx/plugin/approval.py:229` | 定義 | 新シグネチャ (本 Step 4-1c) |
+> | `src/agentic_fx/plugin/switch.py:833` | `_run_full_gate` 内 (手順 7) | Step 4-2c で `inventory=` を渡す |
+> | `tests/plugin/test_switch_floor_modes.py:127` | `run_kind_gate(conn, meta, settings=settings, now=NOW)` | `+ inventory=_empty_inventory(plugins_dir)` |
+> | `tests/plugin/test_switch_floor_modes.py:144` | `..., floor_mode="enforce")` | 同上 |
+> | `tests/plugin/test_switch_floor_modes.py:478` | `..., floor_mode="warn")` | 同上 |
+> | `tests/plugin/test_switch_floor_modes.py:508` | `run_kind_gate(conn, meta, settings=settings, now=NOW)` | 同上 |
+> | `tests/plugin/test_switch_floor_modes.py:576` | `..., sink=my_sink)` | 同上 |
+>
+> **移行後の期待値は変わらない**: これら 5 件は候補 `st`
+> (`_write_strategy_candidate` = `indicators:` を持たない strategy) を
+> `evaluate_strategy_adoption_gate` の monkeypatch で通しているので、
+> **resolver は deps 0 本で即 `ResolvedIndicatorSet.empty(inventory.inventory.root)`
+> を返す** = 判定に影響しない。`_empty_inventory(...)` は下で定義するヘルパを
+> `tests/plugin/test_switch_floor_modes.py` 側にも import する
+> (`from tests.plugin.test_approval import _empty_inventory` ではなく、
+> `tests/fixtures/wiring_envs.py` にも置かず、**同ファイル内にローカル定義**
+> する — T4a は T6b の `wiring_envs` を Consumes するがこのヘルパは
+> `wiring_envs` の Produces に無いため)。
+>
+> **Step 4-1d の Run はこの移行を含めて緑にすること**:
+> `uv run pytest tests/plugin -q`
 
 `tests/plugin/test_approval.py` に追記:
 
@@ -5768,10 +6557,25 @@ baseline 探索 (`:257-261`) を inventory 正本へ置換:
 
 以降の `approved_row is None` 判定は `not has_approved_baseline` に置換する。
 
+**`strategy_gate` 側の申し送り 2 件 (opus r1 M9 で旧 Step 4-3c から移動)** —
+本 Step で必ず一緒に入れること:
+
+1. `StrategyGateVerdict` を返す**すべての return** (`insufficient_trades` /
+   in_sample フロア / holdout 後の通常 return。着手時に
+   `rg -n 'StrategyGateVerdict(' src/agentic_fx/plugin/strategy_gate.py` で
+   全数を再取得する) に `cpu_samples=tuple(cpu_samples)` を渡す。早期 return を
+   1 つでも落とすと `test_cpu_samples_reach_the_verdict` が `cpu_samples == ()`
+   で落ちる。
+2. `cpu_samples.append((scope, pair, intent_source.cpu_sec))` は
+   `finally: intent_source.close()` の**後**に置く (`cpu_sec` は graceful
+   close 後に確定する property)。in_sample ループと holdout ループの
+   **両方**に置く。
+
 - [ ] **Step 4-1d: Run test to verify it passes**
 
 Run: `uv run pytest tests/plugin -q`
-Expected: PASS
+Expected: PASS (**Step 4-1a の移行表の 5 件 (`test_switch_floor_modes.py`) を
+移行済みであること** — opus r1 C6)
 
 - [ ] **Step 4-1e: Commit**
 
@@ -5796,7 +6600,7 @@ from tests.fixtures import indicator_wiring as fx
 def test_submit_candidate_rejects_unpinned_with_fixed_text(tmp_path):
     """F3': unpinned → ValueError('indicator_unresolved:rsi:unpinned')、
     approval 行 0 / gate 行 0。"""
-    conn, plugins_root = _switch_env(tmp_path)     # tests.fixtures.wiring_envs (T6 Step 6-5)
+    conn, plugins_root = _switch_env(tmp_path)     # tests.fixtures.wiring_envs (T6b)
     fx.write_indicator(plugins_root, "rsi")
     fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
     fx.write_rsi_pullback(plugins_root / "_human", pins=None)
@@ -6078,20 +6882,11 @@ Run: `uv run pytest tests/plugin/test_indicator_wiring_e2e.py -q`
 Expected: FAIL — `StrategyGateVerdict` に `cpu_samples` が無い / gate に
 `resolved` / `inventory` を渡す経路が未完成
 
-- [ ] **Step 4-3c: Write minimal implementation**
-
-実装は Step 4-1c で完結している (この Step は E2E の検証のみ)。
-Step 4-1c の `strategy_gate` 変更には次の 2 点を必ず含めること:
-
-1. `StrategyGateVerdict` を返す**すべての return** (`:302-304` の
-   `insufficient_trades`、`:316-319` の in_sample フロア、holdout 後の
-   通常 return) に `cpu_samples=tuple(cpu_samples)` を渡す。早期 return を
-   1 つでも落とすと `test_cpu_samples_reach_the_verdict` が
-   `cpu_samples == ()` で落ちる。
-2. `cpu_samples.append((scope, pair, intent_source.cpu_sec))` は
-   `finally: intent_source.close()` の**後**に置く (`cpu_sec` は graceful
-   close 後に確定する property)。in_sample ループと holdout ループの
-   両方に置く。
+> **opus r1 M9: 旧 Step 4-3c は削除した。** 「Write minimal implementation」と
+> いう見出しの下に実装が無く、内容は Step 4-1c への申し送り 2 件だけだった
+> (変更履歴には「4-1c へ移動」と書かれていたが本文は移動していなかった)。
+> 申し送りは **Step 4-1c の末尾へ実際に移した**。本 Step (4-3) は
+> **a / b / d / e の 4 段**で、実装は持たず E2E の検証のみ。
 
 - [ ] **Step 4-3d: Run test to verify it passes**
 
@@ -6107,6 +6902,84 @@ Expected: PASS
 ```bash
 git add tests/plugin/test_indicator_wiring_e2e.py src/agentic_fx/plugin
 git commit -m "test(e2e): rsi_pullback completes the adoption gate against an oracle (A1/A1-b)"
+```
+
+**T4a 完了条件**:
+- [ ] **F3**: `run_kind_gate` が未解決で `verdict_kind == "indicator_unresolved"` +
+      alias + reason を**返す** (例外なし)、`backtest_runs` / `approval_requests` 行数不変
+- [ ] **F3'**: `_run_full_gate` / submit / bless が unpinned で
+      `ValueError("indicator_unresolved:rsi:unpinned")`、approval 行 0 / gate 行 0
+- [ ] **U4a**: submit / bless (kind=indicator) で `outputs` 無し →
+      `ValueError("outputs_required")` (完全一致)、approval 行 0。`outputs` 宣言済みは通る
+- [ ] **U4b (承認経路)**: `outputs` 宣言なしの配備済 indicator に依存する strategy は
+      `indicator_unresolved:<alias>:outputs_undeclared` で拒否される
+- [ ] **A1**: `rsi_pullback` (依存 1) が gate 経路を完走し、candidate の
+      `scope='in_sample'` 行 1 (`content_hash` = pinned config の hash) と
+      `no_strategy` 行 1 が残る。**A1-b**: `run_in_sample` 直接では candidate 行のみ
+- [ ] **A1 の核**: `decision_sink` の記録が独立参照実装と全時点で一致
+      (`(action, direction)` + `entry_type` + SL/TP ±1e-9)
+- [ ] **C1 (verdict 経路)**: `StrategyGateVerdict.cpu_samples` が
+      in_sample / holdout × pair ごとに 1 件 (例外終了時は `cpu_sec=None` で 1 件)
+- [ ] **`run_kind_gate(inventory=)` の既存 5 呼び出しが移行済み** (opus r1 C6、
+      Step 4-1a の移行表)
+- [ ] 段 0 変異 red: (a) `run_kind_gate` の `except IndicatorResolutionError` を
+      `raise` に変える → F3 のテストが落ちる (b) `_run_full_gate` の
+      `outputs_required` 判定を `meta.outputs == ()` にする → U4a が落ちる
+
+---
+
+## T4b: ロック集合 / 再解決 / payload / noop / reconcile / 承認詳細 [approval-corridor-2]
+
+**この task は opus r1 観点 7 で T4 から切り出した** (旧 T4 = 8 Step / 約 1,700 行 /
+src 6 ファイルで 1 セッションの上限を超えていた)。境界は「gate の判別子が確定した
+ところ」。**T4b は T4a の `GateOutcome.resolved` / `GateOutcome.verdict_kind` を
+Consumes するだけ**で、gate の内部には触らない。
+
+**対応**: 設計書 §2.3 の承認回廊行 (lock 集合 / approve 時再解決 / bless TOCTOU)、
+§2.7 (noop の pin 除去比較・再ロック例外・質検査)、§2.8、§4 の `switch.py` /
+`noop_gate.py` / `commands.py` 行。
+**完了条件の受入 ID**: A2 / P2 / P2' / P2'' / P3 (payload 部分) / P3' / P4 / P5 / D1 / R2。
+
+**着手条件**: T4a が main にマージ済み。T6b も必須 (`stage_switched_journal` /
+`shell_env` / `deploy_strategy` / `bump_indicator_version` を使う)。
+**worktree 並列不可** (T4a の型を Consumes するので 1 レーン直列)。
+
+**Files:**
+- Modify: `src/agentic_fx/plugin/switch.py` (`_plugin_lock` / `_plugin_locks`、
+  `submit_candidate`、`approve_candidate`、`bless_candidate`、`_build_approval_payload`、
+  `reconcile_switch_journals` + `_unresolved_after_switch`)
+- Modify: `src/agentic_fx/plugin/noop_gate.py`
+- Modify: `src/agentic_fx/commands.py` (`_approval_detail` + `_dependent_strategies`)
+- Modify: `src/agentic_fx/loops/improve_loop.py` (質検査の再ロック除外のみ)
+- Test: `tests/plugin/test_switch_paths.py`、`tests/plugin/test_reconcile.py`、
+  `tests/loops/test_improve_loop_plugin_gate.py`、`tests/test_commands.py`
+
+**Interfaces:**
+
+- Consumes: T4a の `GateOutcome.resolved` / `.verdict_kind` / `.indicator_alias` /
+  `.indicator_reason`、T1 の `same_modulo_pins` / `is_relock_transition` /
+  `ResolvedIndicatorSet.pin_object()`、T6b の `wiring_envs`
+  (`stage_switched_journal` / `shell_env` / `deploy_strategy` /
+  `bump_indicator_version` / `submit_indicator_v2` / `approve_indicator_v2`)。
+- Produces:
+
+```python
+# src/agentic_fx/plugin/switch.py
+@contextlib.contextmanager
+def _plugin_locks(plugins_root: Path, names: "Iterable[str]"): ...
+    # sorted(set(names)) の順に flock を取る (deadlock 回避のための順序 pin)
+def _unresolved_after_switch(conn, row: dict, *, plugins_root: Path,
+                             settings) -> tuple[str, str] | None: ...
+
+# src/agentic_fx/plugin/noop_gate.py
+def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
+                   examples_dir: Path, name: str,
+                   inventory: "InventoryBuildResult") -> str | None: ...
+
+# src/agentic_fx/commands.py
+class Commands:
+    def _dependent_strategies(self, *, indicator_name: str,
+                              candidate_hash: str) -> tuple[list[str], list[str]]: ...
 ```
 
 ### Step 4-4: ロック集合 + `approve_candidate` の決定時解決 + bless の TOCTOU
@@ -6638,7 +7511,7 @@ def _seed_approved_candidate_metrics(conn, *, pair, trades, pf, avg_r):
 
 def monkeypatch_dirs(loop, *, deployed, candidate):
     """`_deployed_dir_for` / `_candidate_dir_for` を固定する
-    (T4 Step 4-6c で新設した private helper の注入シーム)。"""
+    (T4b Step 4-6c で新設した private helper の注入シーム)。"""
     loop._deployed_dir_for = lambda name: deployed
     loop._candidate_dir_for = lambda payload: candidate
 ```
@@ -6648,7 +7521,7 @@ def test_relock_only_resubmission_skips_the_duplicate_metrics_check(tmp_path):
     """P5: indicator を出力不変の変更で更新 → 依存 strategy を再ロック →
     再提出の成績が既承認版と一致しても `duplicate_metrics_of` で降格されない。"""
     from tests.fixtures import indicator_wiring as fx
-    loop, conn, plugins_root = _loop_env(tmp_path)     # tests.fixtures.wiring_envs (T6 Step 6-5)
+    loop, conn, plugins_root = _loop_env(tmp_path)     # tests.fixtures.wiring_envs (T6b)
     fx.write_indicator(plugins_root, "rsi")            # = I2 (現在 inventory)
     hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
     # 既承認版 S (pin I1 = 破れている) を snapshot / 配備側に置く
@@ -6754,7 +7627,7 @@ def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
 ```
 
 (`_run_plugin_gate` に `inventory` 引数を足し、`commit()` が `ctx.inventory` を渡す —
-**T5 Step 5-1 で `ImproveRunContext.inventory` を足すまでは**
+**T5a Step 5-1 で `ImproveRunContext.inventory` を足すまでは**
 `self._inventory_for_gate(conn)` という private helper で
 `approved_plugins(conn, self._root / "plugins", settings=self._settings)` を呼ぶ。)
 
@@ -6803,7 +7676,7 @@ def test_switched_journal_with_broken_pin_is_reverted(tmp_path):
     依存 indicator を更新・承認 → 再起動 → `require` 解決に失敗 →
     live symlink は旧 target、journal `reverted`、approval は `pending`、
     **新 version dir は `.versions` に残る**、activity 逐語。"""
-    conn, plugins_root, activity = _reconcile_env(tmp_path)   # tests.fixtures.wiring_envs (T6 Step 6-5)
+    conn, plugins_root, activity = _reconcile_env(tmp_path)   # tests.fixtures.wiring_envs (T6b)
     from tests.fixtures import indicator_wiring as fx
     fx.write_indicator(plugins_root, "rsi")
     hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
@@ -6830,7 +7703,7 @@ def test_switched_journal_with_broken_pin_is_reverted(tmp_path):
         (approval_id,)).fetchone()["status"] == "pending"
     assert new_version_dir.is_dir()      # 回収は本束の範囲外 (codex r8 I2)
     assert ("switch_reverted reason=indicator_unresolved alias=rsi "
-            "cause=pin_mismatch") in activity.read_text()
+            "cause=pin_mismatch") in _activity_text(activity)
 
 
 def test_switched_journal_with_intact_pin_proceeds_to_decided(tmp_path):
@@ -6906,6 +7779,18 @@ def _unresolved_after_switch(conn: sqlite3.Connection, row: dict, *,
     meta = loader._discover_one(version_dir, row["name"])
     if meta is None or meta.kind != "strategy":
         return None
+    # **TOCTOU 窓の明記 (opus r1 M13)**: 自己デッドロックは起きない —
+    # `rg -n '_plugin_lock\(' src/agentic_fx/plugin/switch.py` の実測では
+    # 定義 1 + 入口 4 (submit / approve / bless ほか) で入れ子は無く、
+    # `retry_approval` → `approve_candidate` も lock を取るのは 1 回。
+    # そのため本 helper は with を**抜けてから** `retry_approval` を呼ぶ
+    # 設計で正しい。ただし **lock 解放から `retry_approval` が lock を
+    # 取り直すまでの窓**で、別プロセスが依存 indicator を承認して pin を
+    # 破り得る。その場合は `approve_candidate` 側の決定時 `require` 解決
+    # (Step 4-4) が `pin_mismatch` で弾き、approval は pending のまま残る
+    # (= 多層防御で fail closed)。**この窓を塞ぐために本 helper と
+    # `retry_approval` を同一 lock 内へまとめてはならない** (approve 経路の
+    # lock 取得と二重になる)。
     with _plugin_locks(plugins_root, _dependency_names(version_dir, row["name"])):
         inventory = tools_plugin_loader.approved_plugins(
             conn, plugins_root, settings=settings)
@@ -6940,7 +7825,7 @@ def test_indicator_approval_detail_lists_dependent_strategies_in_two_columns(
         tmp_path):
     """D1: (i) この候補の hash に pin 済み / (ii) 同名 indicator の別 hash に
     pin (承認すると外れる) の 2 欄。決定順 (id) で表示。"""
-    shell, conn, plugins_root = _shell_env(tmp_path)     # tests.fixtures.wiring_envs (T6 Step 6-5)
+    shell, conn, plugins_root = _shell_env(tmp_path)     # tests.fixtures.wiring_envs (T6b)
     from tests.fixtures import indicator_wiring as fx
     fx.write_indicator(plugins_root, "rsi")
     hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
@@ -7013,7 +7898,15 @@ def test_relock_creates_a_new_hash_that_never_collides_with_the_old_rows(tmp_pat
     assert signals_store.add(conn, plugin="rsi_pullback", content_hash=new_hash,
                              pair="USDJPY", timeframe="1h", bar_ts=BAR_TS,
                              kind="strategy", payload={}, now=NOW) is not None
-    assert br_store.latest_in_sample_metrics(conn, new_hash, pair="USDJPY") is None
+    # opus r1 I7 是正: 現物は
+    # `latest_in_sample_metrics(conn, content_hash, *, pair, variant, source,
+    # base_interval)` で 3 引数が必須 (着手時に
+    # `rg -n 'def latest_in_sample_metrics' -A 3 src/agentic_fx/store/backtest_runs.py`
+    # で再取得)。直下の `find_matching_approved_metrics` は揃っているので
+    # 転写時の取りこぼしだった。
+    assert br_store.latest_in_sample_metrics(
+        conn, new_hash, pair="USDJPY", variant="candidate",
+        source="dukascopy", base_interval="5m") is None
     assert br_store.find_matching_approved_metrics(
         conn, pair="USDJPY", variant="candidate", source="dukascopy",
         base_interval="5m", trades=40, pf=1.5, avg_r=0.2) == old_hash
@@ -7054,11 +7947,22 @@ Expected: FAIL — `_approval_detail` に依存欄が無い
                               ) -> tuple[list[str], list[str]]:
         """`_approval_detail` の 2 欄を作る。決定順 (approval id) で並べる。
         inventory 構築に失敗した場合は両方空 (表示は fail-soft — 承認詳細の
-        表示が inventory の不調で落ちない)。"""
+        表示が inventory の不調で落ちない)。
+
+        **opus r1 C4 ③ 是正**: `Commands` に `root` 属性は**無い**
+        (`__init__` は `conn / state_store / broker / trade_loop / activity /
+        log_dir / clock` 必須 + `plugins_root` / `settings` / `health_latch` /
+        `improve_supervisor` / `policy_path` 任意)。plugin の root は
+        **`self.plugins_root`** (既に `plugin` 系コマンドが使っている)。
+        `plugins_root` / `settings` は任意引数なので `None` があり得る —
+        その場合も両方空を返す (fail-soft)。
+        """
         from agentic_fx.tools import plugin_loader as tools_plugin_loader
+        if self.plugins_root is None or self.settings is None:
+            return [], []
         try:
             result = tools_plugin_loader.approved_plugins(
-                self.conn, self.root / "plugins", settings=self.settings)
+                self.conn, self.plugins_root, settings=self.settings)
         except Exception:  # noqa: BLE001 — 表示は fail-soft
             return [], []
 
@@ -7086,20 +7990,7 @@ git add src/agentic_fx/commands.py tests
 git commit -m "feat(commands): list dependent strategies in indicator approval detail (D1/P2)"
 ```
 
-**T4 完了条件**:
-- [ ] **F3**: `run_kind_gate` が未解決で `verdict_kind == "indicator_unresolved"` +
-      alias + reason を**返す** (例外なし)、`backtest_runs` / `approval_requests` 行数不変
-- [ ] **F3'**: `_run_full_gate` / submit / bless が unpinned で
-      `ValueError("indicator_unresolved:rsi:unpinned")`、approval 行 0 / gate 行 0
-- [ ] **U4a**: submit / bless (kind=indicator) で `outputs` 無し →
-      `ValueError("outputs_required")` (完全一致)、approval 行 0。`outputs` 宣言済みは通る
-- [ ] **U4b (承認経路)**: `outputs` 宣言なしの配備済 indicator に依存する strategy は
-      `indicator_unresolved:<alias>:outputs_undeclared` で拒否される
-- [ ] **A1**: `rsi_pullback` (依存 1) が gate 経路を完走し、candidate の
-      `scope='in_sample'` 行 1 (`content_hash` = pinned config の hash) と
-      `no_strategy` 行 1 が残る。**A1-b**: `run_in_sample` 直接では candidate 行のみ
-- [ ] **A1 の核**: `decision_sink` の記録が独立参照実装と全時点で一致
-      (`(action, direction)` + `entry_type` + SL/TP ±1e-9)
+**T4b 完了条件**:
 - [ ] **A2**: submit 後の indicator 更新 → approve で
       `ValueError("indicator_unresolved:rsi:pin_mismatch")`、pending のまま、
       `.versions` に新版なし、symlink 不変
@@ -7119,15 +8010,14 @@ git commit -m "feat(commands): list dependent strategies in indicator approval d
       正式な再ロックは noop にならず、再ロックなしの複製は `noop_copy_of:S`
 - [ ] **P5**: 再ロックのみの再提出は `duplicate_metrics_of` で降格されない
       (再ロックでない一致は従来どおり降格する)
-- [ ] **D1**: I2 承認前 = (ii) 欄に S、承認後も (ii) 欄に残る、S 再ロック後 = (i) 欄に S'
+- [ ] **D1**: I2 承認前 = (ii) 欄に S、承認後も (ii) 欄に残る、S 再ロック後 = (i) 欄に S'。
+      `_dependent_strategies` は `self.plugins_root` を読む (`self.root` は存在しない —
+      opus r1 C4)。`plugins_root` / `settings` が `None` のときは両欄空 (fail-soft)
 - [ ] **R2**: switched + pin 破れ → 旧 target へ戻り journal `reverted`、approval
       `pending`、新 version dir は `.versions` に残る、activity 逐語。
-      pin が破れていなければ `decided`
-- [ ] **C1 (verdict 経路)**: `StrategyGateVerdict.cpu_samples` が
-      in_sample / holdout × pair ごとに 1 件 (例外終了時は `cpu_sec=None` で 1 件)
-- [ ] 段 0 変異 red: (a) `run_kind_gate` の `except IndicatorResolutionError` を
-      `raise` に変える → F3 のテストが落ちる (b) `_run_full_gate` の
-      `outputs_required` 判定を `meta.outputs == ()` にする → U4a が落ちる
+      pin が破れていなければ `decided` (この裏側は T6b の
+      `test_stage_switched_journal_reconciles_to_decided_when_pin_intact` が据える)
+- [ ] 段 0 変異 red:
       (c) `_plugin_locks` の `sorted(set(...))` を `list(names)` にする → P2'' が落ちる
       (d) `approve_candidate` の `require` 解決を `check` にする → A2 が落ちる
       (e) `find_noop_copy` の `is_relock_transition` 例外を削る →
@@ -7136,14 +8026,20 @@ git commit -m "feat(commands): list dependent strategies in indicator approval d
 
 ---
 
-## T5: 改善ループへの露出と RPC [improve-loop-exposure]
+## T5a: 改善 context の inventory 露出と RPC 予約 [improve-loop-exposure-1]
 
 **対応**: 設計書 §2.9 全体、§2.1 の再ロック手順 (worker 側)、§4 の `improve_loop.py` /
 `improve_run_context.py` / `improve_rpc_tools.py` / `mission_counters.py` /
 `improve_staging_tools.py` / `mission_registry.py` / `improve_mission.md` /
 `improve_context.py` 行。
-**完了条件の受入 ID**: F4 / F5 / P1 (改善経路) / P1' / P3 (改善経路) / P4 (改善経路) /
-C1 (`backtest_cpu` activity)。
+**完了条件の受入 ID**: F4 (counters / RPC 部分) / P1 (改善経路) / P1' /
+P3 (露出部分)。
+
+> **opus r1 観点 7 で旧 T5 (6 Step / 約 1,200 行 / src 10 ファイル) を
+> T5a (Step 5-1〜5-3) と T5b (Step 5-4〜5-6) に分割した。** 境界は
+> 「露出面 (context / tool / counters) が確定したところ」。
+
+**着手条件**: T4a・T4b・T6b が main にマージ済み。**worktree 並列不可**。
 
 **Files:**
 - Modify: `src/agentic_fx/loops/improve_run_context.py`
@@ -7168,9 +8064,11 @@ C1 (`backtest_cpu` activity)。
 
 - Consumes: T1 の `InventoryBuildResult` / `lock_config` / `resolve_indicator_deps` /
   `IndicatorResolutionError`、T3 の `build_intent_source(..., resolved)`、
-  T4 の `run_kind_gate(..., inventory)` / `GateOutcome.resolved` / `.cpu_samples` /
-  `evaluate_strategy_adoption_gate(..., resolved, inventory)` /
-  `find_noop_copy(..., examples_dir, inventory)`、T6 の `tests.fixtures.wiring_envs`。
+  T4a の `run_kind_gate(..., inventory)` / `GateOutcome.resolved` / `.cpu_samples`、
+  T6b の `tests.fixtures.wiring_envs` (`improve_env` / `prepare_ctx` /
+  `rpc_tooldefs` / `rpc_tools` / `loop_env`)。
+  (`evaluate_strategy_adoption_gate(..., resolved, inventory)` /
+  `find_noop_copy(..., examples_dir, inventory)` は **T5b** の Consumes)
 - Produces:
 
 ```python
@@ -7222,13 +8120,13 @@ def test_pin_broken_strategy_stays_in_the_snapshot_but_not_in_the_inventory(
     """P1': phase 2 で落ちた strategy は `_snapshot_src` に残り
     `read_plugin_source` で読めるが、inventory には出ない。"""
     from tests.fixtures import indicator_wiring as fx
-    loop, conn, root = _improve_env(tmp_path)         # tests.fixtures.wiring_envs (T6 Step 6-5)
+    loop, conn, root = _improve_env(tmp_path)         # tests.fixtures.wiring_envs (T6b)
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
     _deploy_strategy(conn, plugins_root, "rsi_pullback",
                      pins={"rsi": "a" * 64})          # pin 破れ
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
 
     snapshot = ctx.source_snapshot_dir
     assert (snapshot / "rsi_pullback" / "plugin.py").is_file()
@@ -7249,7 +8147,7 @@ def test_prompt_shows_the_number_of_pin_broken_strategies(tmp_path):
     fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
     _deploy_strategy(conn, plugins_root, "rsi_pullback",
                      pins={"rsi": "a" * 64})          # pin 破れ
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     rendered = loop._last_rendered_prompt
     # `_last_rendered_prompt` が無ければ `ImproveLoop._render_improve_mission_prompt`
     # の戻り値を `self._last_rendered_prompt` に保持する 1 行を同じコミットで足す
@@ -7266,7 +8164,7 @@ def test_inventory_view_is_generated_once_from_the_same_result(tmp_path):
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     before = json.dumps(ctx.inventory_view, sort_keys=True)
     fx.write_indicator(plugins_root, "adx")
     fx.deploy_approved(conn, plugins_root, ["adx"], now=fx.NOW)
@@ -7685,29 +8583,93 @@ def test_release_backtest_does_not_touch_successful_backtests():
 `tests/tools/test_improve_rpc_tools.py` に追記 (`_budget` は
 `tests/tools/test_mission_counters.py:66` の `def _budget(**changes)` を
 `from tests.tools.test_mission_counters import _budget` で取る。
-`_rpc_tools` は `tests.fixtures.wiring_envs.rpc_tools` の別名 import):
+`_rpc_tools` / `_rpc_tooldefs` はそれぞれ `tests.fixtures.wiring_envs.rpc_tools` /
+`.rpc_tooldefs` の別名 import):
 
 ```python
 def test_unresolved_backtest_releases_the_reservation(tmp_path):
-    """F4: `{"started": false, ...}` で予約を戻す。`backtest_calls` は
-    呼び出し前後で不変、`successful_backtests` 不変、`errors` +1、
-    recoverable streak +1、`max_tool_calls` は常に +1、
-    `last_result` は触らない。"""
+    """F4 (予約・解放の部分): `{"started": false, ...}` で予約を戻す。
+
+    **opus r1 I12 是正**: 旧案は `before_calls = dict(counters.backtest_calls)`
+    → `assert dict(counters.backtest_calls) == before_calls` と書いていたが、
+    `backtest_calls` は `defaultdict(int)` なので呼び出し前は `{}`、
+    `reserve_backtest("cand", …)` で `{"cand": 1}`、`release_backtest("cand")`
+    で `{"cand": 0}` になる。`{} != {"cand": 0}` なので **予約解放が正しく
+    動いていてもこの assert は落ちる**し、逆変異 (M8: `release_backtest` を
+    no-op) でも同じ理由で落ちる = 判別力ゼロだった。**キー単位の直接 assert**
+    にする (段 0 の M8 の観測点も同じものに差し替えること —
+    [[mutation-testing]] の「pin の観測点は probe で決める」)。
+
+    **`_strip_forbidden` は denylist** (`{k: … for k, v in value.items()
+    if k not in _FORBIDDEN_KEYS}`、着手時に
+    `rg -n 'def _strip_forbidden' -A 12 src/agentic_fx/tools/improve_rpc_tools.py`
+    で再確認する) なので、新規キー `started` / `alias` / `reason` /
+    `available` はそのまま通る (opus r1 I11)。`_FORBIDDEN_KEYS` には
+    `start` はあるが `started` は**別キー**で完全一致では当たらない。
+    **src 側の変更は不要** — 下の 4 キーの pin がそれを固定する。
+    """
     counters = MissionToolCounters(budget=_budget())
     handler_result = {"started": False, "error": "indicator_unresolved",
                       "alias": "rsi", "reason": "not_found",
                       "available": ["sma", "adx"]}
     tools = _rpc_tools(tmp_path, counters=counters,
                        run_backtest_handler=lambda args: handler_result)
-    before_calls = dict(counters.backtest_calls)
-    before_success = dict(counters.successful_backtests)
 
     out = tools["run_backtest"](name="cand", pair="USDJPY")
 
+    # `_strip_forbidden` (denylist) を通っても 4 キーが残る (opus r1 I11)
+    assert out["started"] is False
     assert out["error"] == "indicator_unresolved"
+    assert out["alias"] == "rsi"
+    assert out["reason"] == "not_found"
     assert out["available"] == ["sma", "adx"]
-    assert dict(counters.backtest_calls) == before_calls
-    assert dict(counters.successful_backtests) == before_success
+    # 予約 → 解放で 0 に戻る (opus r1 I12: defaultdict 比較にしない)
+    assert counters.backtest_calls["cand"] == 0
+    assert counters.successful_backtests["cand"] == 0
+
+
+def test_unresolved_backtest_counts_errors_and_streak_via_the_registry(tmp_path):
+    """F4 (counters の残りのフィールド、**opus r1 I5 是正**)。
+
+    設計書 §5 は「未解決 `run_backtest` は予算枠を消費しないが `errors` /
+    refusal streak に計上」と書いているが、`errors` / `recoverable_refusal_streak`
+    を増やすのは **`ToolRegistry` の `_notify_result` → `counters.record_tool_result`**
+    だけ (`registry.py` の `if isinstance(result, dict) and "error" in result:`
+    分岐、配線は `mission_registry.py` の `on_result=counters.record_tool_result`。
+    着手時に `rg -n 'on_result' src/agentic_fx/tools/registry.py src/agentic_fx/tools/mission_registry.py`
+    で再取得)。tooldef を**直接呼ぶ** `_rpc_tools` 経路は registry を通らない
+    ので、上のテストだけでは受入が空振りする。**registry 経由で 1 本足す**。
+
+    前提 (1 行で固定): `started:false` 応答には `"error"` キーが含まれる
+    ので registry は `ok=False` と判定する。
+    """
+    from agentic_fx.tools.registry import ToolRegistry
+    counters = MissionToolCounters(budget=_budget())
+    defs = _rpc_tooldefs(tmp_path, counters=counters,
+                         run_backtest_handler=lambda args: {
+                             "started": False, "error": "indicator_unresolved",
+                             "alias": "rsi", "reason": "not_found",
+                             "available": ["sma", "adx"]})
+    # `ToolRegistry.__init__` は **キーワード専用** (`on_execute` / `on_result`) で
+    # tooldef は取らない。登録は `register_all`、実行は
+    # `execute(name, arguments, allowed)` (`mission_registry.py` の構築行を
+    # 逐語転写。着手時に `sed -n '20,70p' src/agentic_fx/tools/registry.py` と
+    # `rg -n 'ToolRegistry(' src/agentic_fx/tools/mission_registry.py` で再取得)
+    registry = ToolRegistry(on_execute=counters.record_call,
+                            on_result=counters.record_tool_result)
+    registry.register_all(defs)
+    before_errors = counters.errors
+
+    registry.execute("run_backtest", {"name": "cand", "pair": "USDJPY"},
+                     allowed=registry.names())
+
+    assert counters.errors == before_errors + 1
+    # streak のキーは `(tool 名, "tool_error:" + error[:60])`
+    # (`mission_counters.record_tool_result` の逐語。着手時に
+    # `rg -n 'tool_error:' src/agentic_fx/tools/mission_counters.py` で再確認)
+    assert counters.recoverable_refusal_streak[
+        ("run_backtest", "tool_error:indicator_unresolved")] == 1
+    assert counters.backtest_calls["cand"] == 0      # 予約は戻っている
 
 
 def test_response_without_started_key_keeps_the_reservation(tmp_path):
@@ -7786,6 +8748,72 @@ git add src/agentic_fx/tools/mission_counters.py src/agentic_fx/tools/improve_rp
 git commit -m "feat(improve-rpc): release the backtest reservation when the parent did not start (F4)"
 ```
 
+**T5a 完了条件**:
+- [ ] **F4**: 未解決 RPC が `{"started": false, "error": "indicator_unresolved",
+      "alias", "reason", "available"}` を返し (`_strip_forbidden` は denylist なので
+      4 キーとも通る — opus r1 I11)、`backtest_calls[name] == 0` (予約 → 解放、
+      **キー単位の直接 assert**。`dict(...)` 比較にしない — opus r1 I12)、
+      `successful_backtests[name] == 0`。`errors` +1 と
+      `recoverable_refusal_streak[("run_backtest", "tool_error:indicator_unresolved")]` +1 は
+      **`ToolRegistry` 経由のテスト**で観測する (tooldef 直呼びでは registry を
+      通らないので増えない — opus r1 I5)。`last_result` 不変。
+      staging 内 indicator は `available` に出ない。`started` キー無し応答では解放されない
+- [ ] **P1 (改善経路)**: `lock_staging_deps` が view の `content_hash` を pin に書き、
+      `content_hash` が変わり、書き換え後も `discover` を通る。同じ pin は `changed: false`、
+      古い pin は上書き、未知/`outputs` なし依存は固定 reason で拒否
+- [ ] **P1'**: phase 2 で落ちた strategy が `_snapshot_src` に残り `read_plugin_source` で
+      読めるが `list_deployed_plugins` には出ず、prompt に「pin 破れ N 本 (名前)」が出る
+- [ ] **P3 (改善経路の露出部分)**: `list_deployed_plugins` と prompt inventory が同じ
+      view 由来 (prepare 後に live `plugins/` を差し替えても不変)、staging・examples を
+      含まず、`IMPROVE_FORBIDDEN` と非交差
+- [ ] 段 0 変異 red: (a) `release_backtest` を no-op にする →
+      `test_unresolved_backtest_releases_the_reservation` の
+      `backtest_calls["cand"] == 0` が落ちる (**旧案の `dict(...)` 比較では
+      SURVIVED していた** — opus r1 I12)
+      (b) `result.get("started") is False` を `result.get("started") is not True` にする
+      → `test_response_without_started_key_keeps_the_reservation` が落ちる
+      (d) `build_inventory_view` を snapshot ディレクトリ列挙に置き換える →
+      `test_pin_broken_strategy_stays_in_the_snapshot_but_not_in_the_inventory` が落ちる
+
+---
+
+## T5b: handler の解決 / commit gate / activity / prompt [improve-loop-exposure-2]
+
+**この task は opus r1 観点 7 で T5 から切り出した** (旧 T5 = 6 Step / 約 1,200 行 /
+src 10 ファイル)。境界は「露出面 (context / tool / counters) が確定したところ」。
+
+**対応**: 設計書 §2.9 の `run_backtest_handler` / commit gate、§4 の `improve_loop.py`
+(`run_backtest_handler` / `commit` の gate / `_build_approval_payload` /
+`_finalize_gate_failed` / `backtest_cpu` activity) / `improve_mission.md` /
+`improve_context.py` 行。
+**完了条件の受入 ID**: F5 / U4a (改善経路) / P3 (payload 部分) / P4 (改善経路) /
+C1 (`backtest_cpu` activity)。
+
+**着手条件**: T5a が main にマージ済み (`ImproveRunContext.inventory` /
+`inventory_view` / `release_backtest` を Consumes)。T4b も必須
+(`GateOutcome.resolved` / `.cpu_samples` / `find_noop_copy(..., inventory)`)。
+**worktree 並列不可**。
+
+**Files:**
+- Modify: `src/agentic_fx/loops/improve_loop.py` (`run_backtest_handler` /
+  `_run_plugin_gate` / `_build_approval_payload` / `commit` の gate /
+  `_finalize_gate_failed` / `backtest_cpu` activity)
+- Modify: `src/agentic_fx/loops/prompts/improve_mission.md`
+- Modify: `src/agentic_fx/loops/improve_context.py`
+- Test: `tests/loops/test_improve_e2e.py`、`tests/loops/test_improve_loop_finalize.py`、
+  `tests/loops/test_improve_loop_plugin_gate.py`、
+  `tests/integration/test_improve_forbidden_regression.py`
+
+**Interfaces:**
+
+- Consumes: T5a の `ImproveRunContext.inventory` / `.inventory_view` /
+  `MissionToolCounters.release_backtest`、T4a の `GateOutcome.resolved` /
+  `.verdict_kind` / `.cpu_samples`、T4b の `find_noop_copy(..., examples_dir, inventory)`、
+  T3 の `build_intent_source(..., resolved)`、T6b の `wiring_envs`
+  (`improve_env` / `improve_env_with_activity` / `prepare_ctx` / `activity_text` /
+  `loop_env` / `completed_result` / `mission_for`)。
+- Produces: 本 task は新しい公開シンボルを作らない (既存メソッドの挙動変更のみ)。
+
 ### Step 5-4: `run_backtest_handler` の解決と `started`
 
 - [ ] **Step 5-4a: Write the failing test**
@@ -7801,7 +8829,7 @@ def test_run_backtest_handler_refuses_unresolved_dependency(tmp_path):
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     # staging に indicator 候補を置いても inventory には入らない
     fx.write_indicator(ctx.staging_dir, "adx")
     cand = fx.write_rsi_pullback(ctx.staging_dir, pins=None)
@@ -7828,7 +8856,7 @@ def test_run_backtest_handler_accepts_unpinned_candidates(tmp_path):
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     fx.write_rsi_pullback(ctx.staging_dir, pins=None)
     out = ctx.rpc_handlers["run_backtest"](
         {"name": "rsi_pullback", "pair": "USDJPY"})
@@ -7842,7 +8870,7 @@ def test_run_backtest_handler_refuses_stale_pin_under_check(tmp_path):
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": "a" * 64})
     out = ctx.rpc_handlers["run_backtest"](
         {"name": "rsi_pullback", "pair": "USDJPY"})
@@ -7858,7 +8886,7 @@ def test_started_true_is_present_on_success(tmp_path):
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
     out = ctx.rpc_handlers["run_backtest"](
         {"name": "rsi_pullback", "pair": "USDJPY"})
@@ -7943,7 +8971,7 @@ def test_commit_gate_reports_indicator_unresolved(tmp_path):
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     fx.write_rsi_pullback(ctx.staging_dir, pins=None)   # unpinned → require で落ちる
     result = _completed_result(_plugin_artifact("rsi_pullback", kind="strategy"))
 
@@ -7956,7 +8984,7 @@ def test_commit_gate_reports_indicator_unresolved(tmp_path):
     assert conn.execute(
         "SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 1  # rsi のみ
     assert conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == 0
-    text = activity.read_text()
+    text = _activity_text(activity)
     assert ("gate_failed mission=" in text
             and "reason=indicator_unresolved alias=rsi cause=unpinned" in text)
 
@@ -7968,7 +8996,7 @@ def test_last_result_never_carries_alias_or_reason(tmp_path):
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     fx.write_rsi_pullback(ctx.staging_dir, pins=None)
     loop.commit(mission=_mission(ctx), ctx=ctx,
                 result=_completed_result(
@@ -7986,7 +9014,7 @@ def test_commit_gate_reports_outputs_required_for_indicator_without_outputs(
         tmp_path):
     """U4a (改善 commit gate): 固定文言 `outputs_required`、approval 行 0。"""
     loop, conn, root, activity = _improve_env_with_activity(tmp_path)
-    ctx = loop.prepare(conn=conn, now=NOW)
+    ctx = _prepare_ctx(loop, now=NOW)
     d = ctx.staging_dir / "legacy_ind"
     d.mkdir(parents=True)
     (d / "plugin.py").write_text(
@@ -8014,7 +9042,7 @@ def test_pinned_candidate_reaches_the_approval_payload_with_indicator_deps(
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
     loop.commit(mission=_mission(ctx), ctx=ctx,
                 result=_completed_result(
@@ -8158,13 +9186,13 @@ def test_backtest_cpu_activity_lines_are_verbatim(tmp_path):
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
     loop.commit(mission=_mission(ctx), ctx=ctx,
                 result=_completed_result(
                     _plugin_artifact("rsi_pullback", kind="strategy")),
                 now=fx.NOW)
-    lines = [l for l in activity.read_text().splitlines() if "backtest_cpu" in l]
+    lines = [l for l in _activity_text(activity).splitlines() if "backtest_cpu" in l]
     assert lines, "no backtest_cpu activity written"
     assert any(
         f"backtest_cpu mission={ctx.mission_id} plugin=rsi_pullback "
@@ -8182,7 +9210,7 @@ def test_backtest_cpu_is_written_with_null_when_the_session_died(
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
 
     # graceful close の応答を殺して SIGKILL fallback に倒す
@@ -8197,7 +9225,7 @@ def test_backtest_cpu_is_written_with_null_when_the_session_died(
                 result=_completed_result(
                     _plugin_artifact("rsi_pullback", kind="strategy")),
                 now=fx.NOW)
-    assert "cpu_sec=null" in activity.read_text()
+    assert "cpu_sec=null" in _activity_text(activity)
 
 
 def test_prompt_inventory_includes_params_outputs_and_hash(tmp_path):
@@ -8208,7 +9236,7 @@ def test_prompt_inventory_includes_params_outputs_and_hash(tmp_path):
     plugins_root = root / "plugins"
     fx.write_indicator(plugins_root, "rsi")
     fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    ctx = loop.prepare(conn=conn, now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
     rendered = loop._last_rendered_prompt
     assert '"outputs"' in rendered or "outputs" in rendered
     assert "period" in rendered
@@ -8304,42 +9332,33 @@ git add src/agentic_fx/loops tests/loops
 git commit -m "feat(improve): backtest_cpu activity and richer prompt inventory (C1/P3)"
 ```
 
-**T5 完了条件**:
-- [ ] **F4**: 未解決 RPC が `{"started": false, "error": "indicator_unresolved",
-      "alias", "reason", "available"}` を返し、`backtest_calls[name]` が呼び出し前後で
-      不変 (予約 → 解放)、`successful_backtests` 不変、`errors` +1、
-      recoverable streak +1、`max_tool_calls` +1、`last_result` 不変。
-      staging 内 indicator は `available` に出ない。`started` キー無し応答では解放されない
+**T5b 完了条件**:
 - [ ] **F5**: 改善 commit gate の未解決 (unpinned を含む) で
       `gate_failed reason=indicator_unresolved`、`last_result == "indicator_unresolved"`
       (**完全一致**、alias も cause も混ざらない)、gate 行 0、approval 行 0
 - [ ] **U4a (改善経路)**: `outputs` なし indicator 候補は `last_result == "outputs_required"`、
       approval 行 0
-- [ ] **P1 (改善経路)**: `lock_staging_deps` が view の `content_hash` を pin に書き、
-      `content_hash` が変わり、書き換え後も `discover` を通る。同じ pin は `changed: false`、
-      古い pin は上書き、未知/`outputs` なし依存は固定 reason で拒否
-- [ ] **P1'**: phase 2 で落ちた strategy が `_snapshot_src` に残り `read_plugin_source` で
-      読めるが `list_deployed_plugins` には出ず、prompt に「pin 破れ N 本 (名前)」が出る
-- [ ] **P3 (改善経路)**: `list_deployed_plugins` と prompt inventory が同じ view 由来
-      (prepare 後に live `plugins/` を差し替えても不変)、staging・examples を含まず、
-      `IMPROVE_FORBIDDEN` と非交差。改善 commit の payload にも `indicator_deps`
+- [ ] **F4 (handler 側)**: `run_backtest_handler` が未解決で backtest を走らせず
+      `{"started": false, ...}` を返す。staging 内 indicator は `available` に出ない
+- [ ] **P3 (payload)**: 改善 commit の payload にも `indicator_deps` が入り、
+      submit / bless と同形
 - [ ] **P4 (改善経路)**: `_run_plugin_gate` が `ctx.inventory` を `find_noop_copy` へ渡す
 - [ ] **C1 (activity)**: `IMPROVE backtest_cpu mission=… plugin=… scope=… pair=… deps=N
-      cpu_sec=<float|null>` が scope × pair ごとに 1 行 (逐語)
-- [ ] 段 0 変異 red: (a) `release_backtest` を no-op にする → F4 が落ちる
-      (b) `result.get("started") is False` を `result.get("started") is not True` にする
-      → `test_response_without_started_key_keeps_the_reservation` が落ちる
+      cpu_sec=<float|null>` が scope × pair ごとに 1 行 (逐語)。
+      逐語 pin は `wiring_envs.activity_text(activity)` 経由で取る
+      (`ActivityLog.read_text()` は存在しない — opus r1 C3)
+- [ ] 段 0 変異 red:
       (c) `_finalize_gate_failed(reason="indicator_unresolved")` を
       `reason=f"indicator_unresolved:{exc.alias}"` にする →
       `test_last_result_never_carries_alias_or_reason` が落ちる
-      (d) `build_inventory_view` を snapshot ディレクトリ列挙に置き換える →
-      `test_pin_broken_strategy_stays_in_the_snapshot_but_not_in_the_inventory` が落ちる
+      (e) `backtest_cpu` の `cpu_sec` を常に `0.0` にする →
+      `test_backtest_cpu_activity_lines_are_verbatim` の `cpu_sec=null` が落ちる
 
 ---
 
 ## プラン規約
 
-- **設計を変えない。** 設計書 v1.1 (§0 の U1〜U6 + §8〜§14 の対応表) が正。設計書に無い
+- **設計を変えない。** 設計書 v1.2 (§0 の U1〜U6 + §8〜§14 の対応表) が正。設計書に無い
   判断が必要になったら**実装を止めて指揮者へ申告**する。設計レビューは 9 周 + opus 1 周で
   収束済みなので、同じ論点の蒸し返しには「設計書 §X で決着済み」と返して閉じる
 - **逸脱は必ず申告する** ([[haiku-silently-adapts-report-deviations]])。プランの Step
@@ -8370,13 +9389,17 @@ git commit -m "feat(improve): backtest_cpu activity and richer prompt inventory 
    - M5: `check_source` の `ast.Store` 分岐を削る (V2)
    - M6: `_plugin_locks` の `sorted(set(...))` を `list(names)` にする (P2'')
    - M7: `run_kind_gate` の `except IndicatorResolutionError` を `raise` に変える (F3)
-   - M8: `release_backtest` を no-op にする (F4)
+   - M8: `release_backtest` を no-op にする (F4)。**観測点は
+     `counters.backtest_calls["cand"] == 0` の直接 assert** —
+     `dict(counters.backtest_calls) == before_calls` の形では正しい実装でも
+     落ちるため判別力がゼロ (opus r1 I12、[[mutation-testing]] の
+     「pin の観測点は probe で決める」)
 
    加えて**各 task の完了条件に書いた逆変異**をすべて回す。
    観測点は probe で決める (「落ちるはず」で済ませない — [[mutation-testing]])
 2. **1 周目**: codex + ローカル LLM 3 本 (枠ゼロ、並列可)。
    **ブリーフに必ず含める材料**:
-   - 設計書 v1.1 の §2.3 の root 表・§2.7 (identity とロック方式)・§2.8 (非送出規律)
+   - 設計書 v1.2 の §2.3 の root 表・§2.7 (identity とロック方式)・§2.8 (非送出規律)
    - Global Constraints の固定文言語彙一覧 (これを知らないレビュアーは
      「理由の分からないラベルは不親切」と逆方向の指摘を出す)
    - 遮断 8 のただし書き (`last_result` は 1 bit、alias/cause は activity のみ)
@@ -8416,7 +9439,7 @@ git commit -m "feat(improve): backtest_cpu activity and richer prompt inventory 
 
 ## 完了条件 (束全体)
 
-- [ ] T1 / T2 / T6 / T3 / T4 / T5 がすべて実装完了
+- [ ] T1 / T2 / T6a / T6b / T3 / T4a / T4b / T5a / T5b がすべて実装完了
 - [ ] **設計書 §6 の受入 ID が全て pin として存在する** (下限なので追加は可):
       U4a / U4b / L1 / R1 / A1 / A1-b / A1' / A1'' / A2 / F1 / F2 / F3 / F3' / F4 / F5 /
       V1 / V2 / V3 / S1 / S1' / P1 / P1' / P2 / P2' / P2'' / P3 / P3' / P4 / P5 /
@@ -8446,12 +9469,15 @@ prerequisite 3 indicator 配備後、deps=0 と deps=3 の同一 strategy で in
 
 | task | 状態 | commit | 備考 |
 |---|---|---|---|
-| T1 loader + resolve + approved_plugins 二相 | 未着手 | - | Step 1-1〜1-7。全 caller 移行を含む |
-| T2 sandbox + worker の同居実行 | 未着手 | - | Step 2-1〜2-6。Step 2-2/2-3 は 1 コミットで green |
-| T6 examples + fixture + docs | 未着手 | - | Step 6-1〜6-5。T2 後に worktree 並列可、**T3 前にマージ** |
-| T3 composition root | 未着手 | - | Step 3-1〜3-5。T6 の fixture を使う |
-| T4 gate / approval / switch / noop | 未着手 | - | Step 4-1〜4-8。本束最大。A1 は実 worker で数分 |
-| T5 improve loop | 未着手 | - | Step 5-1〜5-6 |
+| T1 loader + resolve + approved_plugins 二相 | 未着手 | - | Step 1-1〜1-7 (7 Step)。受入 L1 / R1 / P1 (resolver 部分)。全 caller 移行を含む |
+| T2 sandbox + worker の同居実行 | 未着手 | - | Step 2-1〜2-6 (5 Step: 旧 2-2/2-3 を統合 — opus r1 M8)。受入 V1 / V2 / V3 / S1 / S1' / C1 (sandbox 部分) / N1 |
+| T6a examples + fixture + docs | 未着手 | - | Step 6-1〜6-4 (4 Step)。受入 A1 の fixture 部分。T2 後に worktree 並列可、**T3 前にマージ** |
+| T6b `wiring_envs` (20 ビルダ + smoke) | 未着手 | - | Step 6b-1 (1 Step、20 ビルダ)。受入 ID なし (T4a 以降すべての基盤)。**T3 と並列可、T4a 着手前にマージ** |
+| T3 composition root | 未着手 | - | Step 3-1〜3-5 (5 Step)。受入 F1 / F2 / A1' / A1'' / P1 (人間 CLI)。T6a の fixture を使う |
+| T4a gate 判別子 + A1 E2E | 未着手 | - | Step 4-1〜4-3 (3 Step)。T3 + T6b 後。受入 F3 / F3' / A1 / A1-b / U4a / U4b (承認経路) / C1 (verdict)。A1 は実 worker で数分 |
+| T4b lock / 再解決 / noop / reconcile | 未着手 | - | Step 4-4〜4-8 (5 Step)。受入 A2 / P2 / P2' / P2'' / P3 (payload) / P3' / P4 / P5 / D1 / R2 |
+| T5a improve context 露出 + RPC 予約 | 未着手 | - | Step 5-1〜5-3 (3 Step)。受入 F4 (counters/RPC) / P1 (改善経路) / P1' / P3 (露出部分) |
+| T5b handler / commit gate / activity | 未着手 | - | Step 5-4〜5-6 (3 Step)。受入 F5 / U4a (改善経路) / F4 (handler) / P3 (payload) / P4 (改善経路) / C1 (activity) |
 | レビュー段0 (変異スイープ) | 未着手 | - | 最優先 8 件 (M1〜M8) + 各 task の逆変異 |
 | レビュー1周目 (codex + ローカル3) | 未着手 | - | ブリーフに固定文言語彙と遮断 8 を含める |
 | レビュー2周目 (`/code-review high` + codex + ローカル3) | 未着手 | - | ユーザーが打つ |
@@ -8459,7 +9485,7 @@ prerequisite 3 indicator 配備後、deps=0 と deps=3 の同一 strategy で in
 | fresh worktree フルスイート (slow 込み) | 未着手 | - | 残骸ゼロ + `logs/` 未生成 |
 | U6 prerequisite (fable ひな形 → ユーザー承認) | 未着手 | - | **本束の完了条件ではない**。実装完了後 |
 
-> 指揮者裁定 (2026-09-14、設計書 v1.1 の §0 U1〜U6 を実装プランへ写す):
+> 指揮者裁定 (2026-09-14、設計書 v1.2 の §0 U1〜U6 を実装プランへ写す):
 > U1 = 渡す indicator は strategy が config で宣言した依存のみ / U2 = indicator は
 > 系列も返せる (スカラー返却は従来どおり有効) / U3 = 依存宣言は別名付き・params 上書き可 /
 > U4 = `outputs` は新規承認 (submit / bless、kind=indicator) で必須、宣言なしの既存配備は
@@ -8479,9 +9505,11 @@ prerequisite 3 indicator 配備後、deps=0 と deps=3 の同一 strategy で in
 > ③ **`_KIND_PAYLOAD_KEYS["strategy"]`** = `("df", "params")` — `indicators`/`signals` は
 > worker が組み立てるので wire に載せない (既存の `call()` は余分なキーを無視するため、
 > `test_sandbox.py` の payload 縮小は挙動を変えない) / ④ **`cpu_sec` の plugin error 後** =
-> plugin コード自身の例外はセッションを `_dead` にしない既存契約 (`sandbox.py:54-60`) が
-> あるため graceful close が成立し float が入る。設計書 §2.4 の「plugin error 後 None」は
-> セッション死亡時の fallback を指すと解釈する (Step 2-4a の申し送りに逐語で固定) /
+> plugin コード自身の例外はセッションを `_dead` にしない既存契約があるため graceful
+> close が成立し **float** が入る。`None` は SIGKILL fallback と worker 未起動の 2 経路のみ。
+> **この解釈は「既定選択」ではなく指揮者へ申告済みの設計是正**であり、
+> **設計書 v1.2 の §6 C1 行で本文が改訂された** (opus r1 I10)。Step 2-4a の
+> `test_cpu_sec_is_float_after_plugin_error` が逐語で固定する /
 > ⑤ **`same_modulo_pins` / `is_relock_transition` の引数型** = `Path` (plugin ディレクトリ)。
 > `noop_gate` が既に Path ベースで比較しているため / ⑥ **lock 後の候補の snapshot 検査** =
 > `check_candidate_snapshot` は 3 ファイルの存在と属性しか見ない (`gate_pytest.py:57-117`)
@@ -8491,13 +9519,16 @@ prerequisite 3 indicator 配備後、deps=0 と deps=3 の同一 strategy で in
 > ⑧ **`handshake_too_large` は正常入力から到達しない** — loader が通す最大は
 > deps 8 × params 8 KiB (+ strategy 側 8 KiB の上書き) で handshake ~136 KB に
 > しかならず、既定の `MAX_HANDSHAKE_BYTES = 262144` には届かない。よって
-> R1 の境界テストは定数を monkeypatch して `>` 判定そのものを pin する形にした
-> (設計書 §2.3 の R1 は上限の**存在**を求めており、正常入力での到達可能性は
-> 求めていないと解釈する)。**この上限は「将来 params 上限を緩めたときの
-> 最後の壁」として残す** — 実装から消してはならない。
+> R1 の境界テストは定数を monkeypatch して `>` 判定そのものを pin する形にする。
+> **設計書 v1.1 §6 R1 は「同一 plugin の 8 alias × 大 default params で到達させる」と
+> 書いていたが、この算術は成り立たない**。指揮者へ申告し、**設計書 v1.2 の §6 R1 行で
+> 「定数 monkeypatch による境界試験。正常入力では到達不能 (8 alias × 8 KiB ≒ 136 KB
+> < 256 KiB) であることを注記」へ改訂済み** (opus r1 I10)。**この上限は「将来 params
+> 上限を緩めたときの最後の壁」として残す** — 実装から消してはならない。
 
 ## 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-14 | v1.1 | **着手前検証 (opus r1: Critical 6 / Important 12 / Minor 13) を全件是正。** **Critical**: C1 `prepare(conn=…)` → `wiring_envs.prepare_ctx(loop, now=)` (現物は `prepare(*, slot_key, now, on_ready)` → 3-tuple、15 箇所を置換) / C2 `improve_env` の `ImproveLoop(activity=, rag=)` 必須引数を追加 (`_FakeRag` は `tests/loops/conftest.py` から逐語転写) / C3 `ActivityLog.read_text()` は存在しない → `wiring_envs.activity_text` (tab 5 列の行形式を smoke test で固定、4 箇所を置換) / C4 `commands.Shell` → `commands.Commands` (必須 7 引数を `tests/test_commands.py` から転写)、`_dependent_strategies` の `self.root` → `self.plugins_root` (None は fail-soft) / C5 `_resolved()` に `pinned=True` / C6 `run_kind_gate(inventory=)` の既存 5 呼び出しの移行表を Step 4-1a に追加。 **Important**: I1 `build_intent_source` の patch 12 + 直接呼び出し 7 = 19 箇所の移行表を Step 3-1a に追加 (`**kwargs` 一律方針) / I2 移行全数性テストを正規表現 → AST (`ast.Call`) 走査に置換 (docstring 6 件の偽陽性を除去、期待 FAIL を 4 件に訂正) / I3 `wiring_envs` を T6b として独立 task 化 + 20 ビルダ全部に smoke test + Produces に逐語シグネチャ / I4 `_project_indicator_output` の入力契約を list に固定し fake を親再検証後の形へ / I5 F4 の `errors` / refusal streak は registry (`on_result`) 経由でしか増えないため registry 経由テストを追加 (`rpc_tooldefs` ビルダを新設) / I6 `improve_env` の conn factory を毎回新規接続に (handler の `conn.close()` でテスト conn が死ぬ) / I7 `latest_in_sample_metrics` に `variant`/`source`/`base_interval` を追加 / I8 `stage_switched_journal` の payload `content_hash` を新 version dir 実体から算出 + `advance_switch_journal(commit=True)` + T6b に reconcile→`decided` の smoke / I9 oracle の `df.empty: continue` を削除、`expected_eval_timestamps` の死に引数 `conn` を削除、adapter の sink 非呼び出し条件を逐語明記 / I10 設計書 §6 の C1 / R1 を **設計書 v1.2** で改訂 (指揮者へ申告済み) / I11 `_strip_forbidden` は denylist と実測確認 → src 変更不要、4 キーの pin テストへ / I12 `dict(counters.backtest_calls)` 比較 (正しい実装でも落ち、変異でも落ちる = 判別力ゼロ) を `backtest_calls["cand"] == 0` の直接 assert へ (段 0 M8 の観測点も同じに)。 **Minor M1〜M13**: `_current` の死に引数を `plugin_dir` に / `strip_pins` の `default=str` を比較専用と明記 / `_check_number` の型 allowlist (数値文字列拒否) / list 分岐の `pd.isna` 曖昧性 / Step 1-1c の `_check_json_safe` スタブを一意に確定 / `grid` 比較を in_sample 期間に + 週末非混入を直接 assert / テスト名 2 件の改名 / Step 2-2 と 2-3 を 1 Step に統合 / Step 4-3c の申し送りを 4-1c へ実際に移動 / 行番号再取得の指示を Global Constraints へ / oracle のメモ化 + `slow` マーク / T3 の Consumes から `wiring_envs` を除去 / `_unresolved_after_switch` の TOCTOU 窓をコメントで明記。 **task 分割 (観点 7)**: T6 → T6a / T6b、T4 → T4a / T4b、T5 → T5a / T5b の 9 task に。依存グラフと worktree 並列可否 (T3 ∥ T6b) を更新。 **fixture の実測 probe**: `tmp/plan-indicator-wiring/probe_fixture.py` で設計書 §6 の生成式を実行 — in_sample の 1h Wilder RSI(14) は **min 27.2159 / max 78.4162、long 52 + short 50 = 102 opens、先頭 14 本 NaN で index 14 から値**。`opens >= 30` (`EVALUABLE_MIN_TRADES`) を満たすため**設計書 §6 の生成式の是正は不要**。 **自己レビューで新規追記コードも現物照合**: `ToolRegistry` はキーワード専用 `__init__` + `register_all` + `execute(name, args, allowed)` (`call` は存在しない) / `approvals.get()` は存在しない (SQL で status を読む) / journal のテーブル名は `plugin_switch_journal` / `reconcile_switch_journals` は既に `settings` を取る、へ是正。 **T4a Step 4-2 が `wiring_envs.switch_env` を使うため T4a の着手条件に T6b を追加**し依存グラフを訂正 | プラン着手前検証 `tmp/plan-indicator-wiring/opus-plan-r1.md` (opus r1) | - |
 | 2026-09-14 | v1 | 起案。設計書 v1.1 を実装プランへ写す。T1 (loader 新キー + `plugin/resolve.py` + `approved_plugins` 二相 + 全 caller 移行) / T2 (`indicator_validate.py` + worker の同居実行 + `PluginSession(resolved=)` の containment 検査 + graceful close/`cpu_sec` + `check_source` の共有状態遮断 + standalone 系列 wire) / T6 (`rsi_indicator` 系列化 + 新規 `rsi_pullback` + `tests/fixtures/indicator_wiring.py` の決定論 fixture と独立参照実装 + 設計書契約文) / T3 (adapter の `resolved` 必須 + `decision_sink` + service/producer/trade worker/人間 CLI の配線 + `afx plugin lock --from _human`) / T4 (`GateOutcome.verdict_kind="indicator_unresolved"` + `_run_full_gate` の固定 ValueError と `outputs_required` + A1/A1-b E2E + ロック集合と approve 時再解決と bless TOCTOU + payload `indicator_deps` + noop の pin 除去比較と再ロック例外 + 質検査除外 + reconcile の revert + 承認詳細 2 欄) / T5 (`ImproveRunContext.inventory`/`inventory_view` + `list_deployed_plugins`/`lock_staging_deps` + `release_backtest` と `started:false` + commit gate の解決 + `backtest_cpu` activity + prompt inventory) の 6 task に分割。実行順序 T1→T2→T6→T3→T4→T5、T6 のみ T2 後に worktree 並列可 (T3 前にマージ必須)。Global Constraints に固定文言語彙一覧・上限 4 種・遮断 8・実 DB 不可触・`run_kind_gate` 非送出・スキーマ変更ゼロを明記。レビュー段 (段 0 の最優先 8 件を含む)・完了条件 (受入 33 ID)・進捗表・指揮者の既定選択 8 件を追加。着手前検証で 10 件是正 — `handshake_too_large` の到達不能を定数 monkeypatch 境界に置換 / A1'' の `.versions` 直書きを正規再配備 (`_redeploy_rsi_variant`) に置換 / Step 3-1c の呼び出し元に `improve_loop._run_strategy_gate` を追加し `_validate_kind(resolved=None)` を任意化 / A1 を `floor_mode="warn"` にし T6 に `opens >= EVALUABLE_MIN_TRADES` の先行 pin を追加 / P2' の並行ロック待ちテストを新規追加 / 非 str キー YAML ケースを削除し `indicator_ref_duplicate_alias` 到達不能を L1 に明記 / `lock_config(candidate_dir, pins)` に変更し `lock_staging_deps` の YAML 書き換え重複を解消 / `deploy_approved` の kind を config.yaml 由来に / Step 4-3c の「実測で決める」記述を 4-1c の具体指示へ移動 / 残存 `...` を実コードに展開 | 設計書 `2026-09-14-indicator-consumption-wiring-design.md` v1.1 (実装着手可、ユーザー裁定 U1〜U6 反映済み) を writing-plans 規約の実装プランへ写す | - |

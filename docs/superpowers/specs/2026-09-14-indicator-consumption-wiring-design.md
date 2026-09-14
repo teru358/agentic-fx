@@ -1,6 +1,6 @@
-# [indicator-consumption-wiring] 設計書 v1.1
+# [indicator-consumption-wiring] 設計書 v1.2
 
-束: 指標層 → 戦略層の配線。strategy plugin が `config.yaml` で宣言した配備済 indicator plugin の出力を、strategy worker 内で計算して `evaluate(df, indicators, ...)` に渡す。依存の版は `config.yaml` の `pin` (= `content_hash` の署名対象) に書き込む「ロック方式」で固定する。ユーザー裁定 U1〜U3 (2026-09-13)、下書き `tmp/design-indicator-wiring/design.md` v0.1〜v0.9 を codex 設計レビュー 9 周 (r1〜r3 sol、r4〜r6 sol、r7〜r9 terra) + opus 独立レビュー 1 周で収束 (r9: Critical 0 / Important 0 / Minor 0)。**v1.1 = §7 の裁定を反映、実装着手可 (writing-plans へ)**。
+束: 指標層 → 戦略層の配線。strategy plugin が `config.yaml` で宣言した配備済 indicator plugin の出力を、strategy worker 内で計算して `evaluate(df, indicators, ...)` に渡す。依存の版は `config.yaml` の `pin` (= `content_hash` の署名対象) に書き込む「ロック方式」で固定する。ユーザー裁定 U1〜U3 (2026-09-13)、下書き `tmp/design-indicator-wiring/design.md` v0.1〜v0.9 を codex 設計レビュー 9 周 (r1〜r3 sol、r4〜r6 sol、r7〜r9 terra) + opus 独立レビュー 1 周で収束 (r9: Critical 0 / Important 0 / Minor 0)。**v1.2 = 実装プランの着手前検証 (opus r1) で判明した §6 の 2 行 (C1 / R1) を現物に合わせて改訂**。v1.1 = §7 の裁定を反映、実装着手可 (writing-plans へ)。
 
 ## 0. ユーザー裁定 (2026-09-13)
 
@@ -176,7 +176,7 @@ params: {...}
 | U4a | submit / bless (kind=indicator) で `outputs` 無し → `ValueError("outputs_required")`、approval 行 0。改善 commit gate でも同じ固定文言で gate 不合格 | |
 | U4b | `outputs` 宣言なしの配備済 indicator を依存に書いた strategy → resolver `outputs_undeclared` (require / check とも)。standalone `get_indicators` では従来どおり動く | |
 | L1 | loader 表駆動: 各 kind × `indicators`/`outputs`/reference object の unknown key / 型違反 / 別名規則 / pin 形式 / params 非 JSON-safe (date, set, Inf, NaN, bytes) / 上限 → §2.2 の固定 reason 文字列 (完全一致) と reject (戻り集合に含まれない) | `discover` の warning 文字列と戻り集合 |
-| R1 | resolver 表駆動: `not_found` / `not_indicator` / `over_max_bars_limit` / `params_not_json_safe` / `unpinned` (`require`) / `pin_mismatch` (`require`/`check`) / `handshake_too_large` の各 reason、`ignore` が古い pin を無視して解決すること、成功時の `pin_object()` の alias 順と値の型。**上限境界** (codex r6 I3): deps 8 通過 / 9 拒否、outputs 32 / 33、params 8 KiB ちょうど / +1 byte、handshake 256 KiB / +1 byte (同一 plugin の 8 alias × 大 default params で到達させる)、いずれも拒否時に worker spawn 0 回 | 返り値 / 例外フィールド / spawn spy |
+| R1 | resolver 表駆動: `not_found` / `not_indicator` / `over_max_bars_limit` / `params_not_json_safe` / `unpinned` (`require`) / `pin_mismatch` (`require`/`check`) / `handshake_too_large` の各 reason、`ignore` が古い pin を無視して解決すること、成功時の `pin_object()` の alias 順と値の型。**上限境界** (codex r6 I3): deps 8 通過 / 9 拒否、outputs 32 / 33、params 8 KiB ちょうど / +1 byte、**handshake 256 KiB / +1 byte は `MAX_HANDSHAKE_BYTES` 定数を monkeypatch して `>` 判定そのものを pin する** — 正常入力からは到達不能 (loader が通す最大 = deps 8 × params 8 KiB (+ strategy 側の上書き 8 KiB) で handshake ≒ 136 KB < 256 KiB) なので、実データで到達させる試験は成立しない。上限は「将来 params 上限を緩めたときの最後の壁」として残す。いずれも拒否時に worker spawn 0 回 | 返り値 / 例外フィールド / spawn spy |
 | A1 | `rsi_pullback` (依存 1) が `evaluate_strategy_adoption_gate` (strategy gate 経路) を完走 | `backtest_runs` に candidate の `scope='in_sample'` 行 1 (`content_hash` = pinned config の hash) と、baseline 不在時に gate が合成する `no_strategy` 行 1 |
 | A1-b | 同 example を `holdout.run_in_sample` 直接 | candidate 行 1 のみ (`no_strategy` 行は作られない) |
 | A1' | CLI: 配備済 (pinned) `rsi_pullback` に対し `afx backtest run --plugin rsi_pullback --symbol USDJPY --source dukascopy --from 2025-12-01 --to 2026-01-01` | rc=0、`scope='human_custom'` 行 1、meta は `discover` 由来 (承認行を消しても rc=0 で走る = 手元評価契約の維持) |
@@ -203,7 +203,7 @@ params: {...}
 | P3' | resolver 呼び出し 1 回 + 同一 object (r5 I1 / r6 I1): gate を通す test double で `resolve_indicator_deps` の呼び出し回数が候補ごとに 1、in_sample session と holdout session に渡った `resolved`、`GateOutcome.resolved`、payload の `indicator_deps` を作った元が同一 object (`is`)。service 起動でも strategy ごとに 1 回で producer の session が `InventoryBuildResult.resolved[(name, hash)]` と `is` 一致 | resolver spy / `is` |
 | D1 | indicator 承認詳細: I2 承認前 = (ii) 欄に S、承認後 = S は inventory から外れ (ii) 欄に残る、S 再ロック後 = (i) 欄に S' | `_approval_detail` の出力 |
 | R2 | reconcile: switch 直後 (journal `switched`、新 version directory は作成済) で停止 → 依存 indicator を別 hash に更新・承認 → 再起動 → `reconcile_switch_journals` が strategy + 依存名の lock 下で `require` 解決に失敗 → live symlink は旧 target、journal `reverted`、approval は `pending`、**新 version directory は `.versions` に残る** (現行 reconcile も version store を回収しない — 回収は本束の範囲外、GC は既存の archive/versions 規律に任せる、codex r8 I2)、activity `switch_reverted reason=indicator_unresolved alias=<alias> cause=pin_mismatch` 逐語。pin が破れていなければ従来どおり `decided` | journal / symlink / approval / `.versions` / activity |
-| C1 | graceful close: 正常終了で `cpu_sec` float、plugin error 後 / SIGKILL fallback で `None`。activity `backtest_cpu` 行の逐語 (scope / pair / deps / cpu_sec) | |
+| C1 | graceful close: **正常終了・plugin error 後ともに `cpu_sec` は float** (plugin コード自身の例外はセッションを `_dead` にしない既存契約のため graceful close が成立する)、**`None` は SIGKILL fallback (timeout 後の強制終了) と worker 未起動 (`__enter__` 失敗) の 2 経路のみ**。activity `backtest_cpu` 行の逐語 (scope / pair / deps / cpu_sec) | |
 | N1 | `signals` 引数は依然 `None` (worker spy) | |
 
 **運用観測 (受入ではない、A4 で)**: prerequisite 3 indicator 配備後、deps=0 と deps=3 の同一 strategy で in_sample 完走し `backtest_cpu` の差を記録。目安 = deps=3 が 60 秒予算の 50% 未満。
@@ -318,4 +318,5 @@ params: {...}
 | 2026-09-13 | v0.4b〜v0.7 | opus 独立レビュー (C1/I7/M5) → codex r4 (C2/I7/M1) → r5 (C1/I5/M2) → r6 (C0/I7/M1)。RPC 境界、noop の再ロック例外、lock 集合、`InventoryBuildResult`、handshake 上限、reconcile、`GateOutcome.resolved`、`inventory_view` | 設計レビュー | - |
 | 2026-09-14 | v0.8〜v0.9 | codex r7 terra (C0/I3/M2: fixture の market hours、decision sink、対応表の矛盾) → r8 terra (C0/I4/M2: noop 入力契約、R2 の `.versions`、oracle 語彙、identity 受入、loader reason 語彙) → **r9 terra: 指摘 0** | 設計レビュー | - |
 | 2026-09-14 | v1.0 | spec 化 (`tmp/design-indicator-wiring/design.md` v0.9 を移植、対応表 §8〜§14 は経緯として保持)。ユーザーレビュー待ち | 収束 | - |
+| 2026-09-14 | v1.2 | §6 の C1 (plugin error 後の `cpu_sec` は float、`None` は SIGKILL fallback / worker 未起動の 2 経路) と R1 (`handshake_too_large` は定数 monkeypatch で境界試験、正常入力では到達不能である算術を注記) を改訂 | **実装プランの着手前検証 (opus r1 I10) で判明** — v1.1 の文言のままでは実装・テストと恒久的に食い違う | - |
 | 2026-09-14 | v1.1 | ユーザー裁定 U4 (`outputs` は新規承認で必須、宣言なし既存は null = 依存不可) / U5 (ロックは全体再シリアライズ) / U6 (prerequisite 3 本は fable ひな形 + ユーザー承認) を §0 / §2.2 / §2.3 / §2.5 / §2.9 / §2.10 / §6 (U4a/U4b) に反映、§7 を解消。実装着手可 | 裁定 | - |
