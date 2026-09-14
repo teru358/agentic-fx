@@ -1,6 +1,6 @@
-# [indicator-consumption-wiring] 設計書 v1.0
+# [indicator-consumption-wiring] 設計書 v1.1
 
-束: 指標層 → 戦略層の配線。strategy plugin が `config.yaml` で宣言した配備済 indicator plugin の出力を、strategy worker 内で計算して `evaluate(df, indicators, ...)` に渡す。依存の版は `config.yaml` の `pin` (= `content_hash` の署名対象) に書き込む「ロック方式」で固定する。ユーザー裁定 U1〜U3 (2026-09-13)、下書き `tmp/design-indicator-wiring/design.md` v0.1〜v0.9 を codex 設計レビュー 9 周 (r1〜r3 sol、r4〜r6 sol、r7〜r9 terra) + opus 独立レビュー 1 周で収束 (r9: Critical 0 / Important 0 / Minor 0)。**v1.0 = 実装着手可 (ユーザーレビュー待ち)**。
+束: 指標層 → 戦略層の配線。strategy plugin が `config.yaml` で宣言した配備済 indicator plugin の出力を、strategy worker 内で計算して `evaluate(df, indicators, ...)` に渡す。依存の版は `config.yaml` の `pin` (= `content_hash` の署名対象) に書き込む「ロック方式」で固定する。ユーザー裁定 U1〜U3 (2026-09-13)、下書き `tmp/design-indicator-wiring/design.md` v0.1〜v0.9 を codex 設計レビュー 9 周 (r1〜r3 sol、r4〜r6 sol、r7〜r9 terra) + opus 独立レビュー 1 周で収束 (r9: Critical 0 / Important 0 / Minor 0)。**v1.1 = §7 の裁定を反映、実装着手可 (writing-plans へ)**。
 
 ## 0. ユーザー裁定 (2026-09-13)
 
@@ -9,6 +9,9 @@
 | U1 | 渡す indicator の範囲 | **strategy が config で宣言した依存のみ** |
 | U2 | indicator の出力契約 | **系列 (Series) も返せるように拡張** (スカラー返却は従来どおり有効) |
 | U3 | 依存宣言の形 | **別名付き・params 上書き可** |
+| U4 (2026-09-14) | indicator の `outputs` 宣言 | **新規承認 (submit / bless、kind=indicator) では必須**。宣言なしの既存配備 (`rsi_indicator` / `rsi_wilder`) は inventory に `outputs: null` で残り standalone (`get_indicators`) では従来どおり使えるが、**strategy の依存先にはできない** (resolver `outputs_undeclared` で fail closed)。依存させたければ `outputs` を足して再承認 |
+| U5 (2026-09-14) | ロック時の `config.yaml` 書き換え | **全体を再シリアライズ** (`yaml.safe_load` → pin 追加 → `yaml.safe_dump`)。コメント・キー順は保持しない (lock 応答に差分を表示) |
+| U6 (2026-09-14) | 実機 prerequisite の indicator 3 本 (sma / rsi / adx、系列版、`outputs` 宣言) | **fable がひな形を `plugins/_human/` に作り、ユーザーが submit → approve** (実装完了後、validator が系列を通してから) |
 
 ## 1. 前提を疑う (何が本当の問題か)
 
@@ -33,7 +36,7 @@ params: {...}
 ```
 `evaluate` の中では `indicators["rsi"]["rsi"]` を読む (系列なら `pd.Series`、df と同じ index、warmup 行は NaN。スカラーなら `float`、NaN = 未確定)。作者は `max_bars` が「依存の warmup + 自分の lookback」を覆うよう宣言する (example docstring に明記、ハーネスは強制しない)。
 
-**ライフサイクル (ラチェット)**: 探索中は `pin` なしでよい (staging の `run_backtest`、人間の `afx backtest run` は現在の inventory で解決)。**提出 (`submit_candidate` / `submit` / `bless`) は unpinned を固定文言で拒否**する (gate も行も作らない)。pin は明示的なロック操作で**ハーネスが書く** (agent が 64 hex を写さない): 改善 tool `lock_staging_deps(name)` / 人間 CLI `afx plugin lock --from _human <name>` (`submit`/`bless` と同じ `--from` 規約、`--from` なしは同じ固定文言で拒否)。ロック = 現在の inventory で解決した各 alias の `content_hash` を `config.yaml` の `pin` に書き込む (YAML を再シリアライズせず、`indicators` ブロックだけを書き換える実装はプランで決める。書き換え後の `config.yaml` が discover を通ることを同 tool 内で確認)。**テストした artifact == 提出する artifact** (改善 worker はロック後に `run_plugin_tests` / `run_backtest` を再実行する規律をプロンプトに書く。ロックは pin の追加だけで挙動は変わらない)。
+**ライフサイクル (ラチェット)**: 探索中は `pin` なしでよい (staging の `run_backtest`、人間の `afx backtest run` は現在の inventory で解決)。**提出 (`submit_candidate` / `submit` / `bless`) は unpinned を固定文言で拒否**する (gate も行も作らない)。pin は明示的なロック操作で**ハーネスが書く** (agent が 64 hex を写さない): 改善 tool `lock_staging_deps(name)` / 人間 CLI `afx plugin lock --from _human <name>` (`submit`/`bless` と同じ `--from` 規約、`--from` なしは同じ固定文言で拒否)。ロック = 現在の inventory で解決した各 alias の `content_hash` を `config.yaml` の `pin` に書き込む (U5: `yaml.safe_load` → 各 alias に `pin` を足す → `yaml.safe_dump(sort_keys=False)`。コメントは失われるので lock 応答に書き換え前後の差分を出す。書き換え後の `config.yaml` が discover を通ることを同 tool 内で確認)。**テストした artifact == 提出する artifact** (改善 worker はロック後に `run_plugin_tests` / `run_backtest` を再実行する規律をプロンプトに書く。ロックは pin の追加だけで挙動は変わらない)。
 
 **人間経路の正式手順**: 現行 `afx backtest run --plugin` は `plugins/` 直下を `discover` するだけで `_human` 候補を読めない (`cli.py:374-376`、`loader.py:314` の `_` 除外)。本束では人間の探索 backtest を足さず、**materialize → lock → submit (gate が in_sample/holdout を回す)** を正式手順とする: `afx plugin materialize <name>` (配備済を `_human` へ複製、既存) → 編集 → `afx plugin lock --from _human <name>` → `afx plugin submit --from _human <name>`。`afx backtest run --plugin <deployed>` は配備済 (必ず pinned) に対する `check` で従来どおり使える。
 
@@ -43,7 +46,7 @@ params: {...}
 - `indicators` は strategy 専用、`outputs` は indicator 専用キー。他 kind に現れたら reject。
 - **全 kind の `params`** を再帰的に JSON-safe 検証 (キー str、値 str / int / bool / 有限 float / None / list / dict、YAML date・set・bytes・±Inf・NaN は reject)。`PluginMeta.params` は**従来どおり `dict`** (`MappingProxyType` 化は撤回 — 現行 wire の `json.dumps` を壊す、r3 C3)。不変性は resolver が canonical な frozen 表現を別途持つ (§2.3)。
 - reference object の許可キーは `{plugin, params, pin}`。`plugin` 必須 (`_PLUGIN_NAME_RE`、≤64)。`params` 任意 (JSON-safe)。`pin` 任意、`^[0-9a-f]{64}$`。別名 `^[a-z][a-z0-9_]{0,31}$`、重複不可。
-- `outputs`: 非空 str list、各 `^[a-z][a-z0-9_]{0,31}$`、重複不可。
+- `outputs`: 非空 str list、各 `^[a-z][a-z0-9_]{0,31}$`、重複不可。loader では任意 (既存配備との discover 互換)。**承認時 (submit / bless、kind=indicator) は必須** — 無ければ固定 `ValueError("outputs_required")` で拒否、approval 行なし (U4)。
 - **上限** (codex r5 C1、handshake 展開の無制限膨張を spawn 前に fail closed): `indicators` の要素数 ≤ 8 (`MAX_INDICATOR_DEPS`)、`outputs` ≤ 32、各 `params` の canonical JSON ≤ 8 KiB。resolver は展開後の canonical handshake 総 byte 数 ≤ 256 KiB (`MAX_HANDSHAKE_BYTES`、既存 `_STARTUP_MAX_BYTES` 65536 の応答側とは別の送信側上限) を検査し、超過は `IndicatorResolutionError(alias=None, reason="handshake_too_large")`。同一 indicator を複数 alias から参照するのは可 (U3) だが、この総量上限に含まれる。
 - `PluginMeta.indicators: tuple[IndicatorRef, ...]` (宣言順、`IndicatorRef(alias, plugin, params: dict, pin: str | None)` frozen)、`PluginMeta.outputs: tuple[str, ...] | None`。
 - **loader の reject reason 語彙** (codex r8 M2、`_reject(name, reason)` の `reason` 文字列。既存の `unknown config keys` 等と同じ形で固定): `indicators_not_allowed_for_kind` / `outputs_not_allowed_for_kind` / `indicator_ref_unknown_key:<key>` / `indicator_ref_missing_plugin` / `indicator_ref_bad_plugin_name` / `indicator_ref_bad_alias` / `indicator_ref_duplicate_alias` / `indicator_ref_bad_pin` / `params_not_json_safe:<path>` / `outputs_bad_entry` / `outputs_duplicate` / `too_many_indicators` / `too_many_outputs` / `params_too_large:<path>`。
@@ -54,7 +57,7 @@ params: {...}
   - `ResolvedIndicator(alias, plugin_name, plugin_py: Path, content_hash, params: FrozenParams (再帰的に frozen: tuple / `frozenset` of items), max_bars, outputs, pinned: bool)`。
   - `ResolvedIndicatorSet(inventory_root: Path, items: tuple[ResolvedIndicator, ...] (alias 順), all_pinned: bool)`。`pin_object()` → `{alias: {plugin, content_hash, params}}` (plain JSON object、alias 順)。
   - `thaw(params) -> dict`: call ごとに完全に独立した plain JSON object を作る (deep)。
-- `resolve_indicator_deps(meta, inventory, *, settings, pin_mode: Literal["require", "check", "ignore"]) -> ResolvedIndicatorSet`: 1 箇所。失敗 = `IndicatorResolutionError(alias, reason)`、reason 固定語彙: `not_found` / `not_indicator` / `over_max_bars_limit` / `params_not_json_safe` / `unpinned` (`require` で pin なし) / `pin_mismatch` (`require`/`check` で pin が inventory の hash と不一致) / `handshake_too_large` (§2.2 の総量上限超過、alias=None)。(`max_bars` は「渡す履歴の最大本数」であって必要 warmup 本数ではないので、大小比較による拒否は入れない — codex r4 I3。warmup 不足は全 NaN として validator を通る仕様で、規律文と example docstring で作者に伝える。)`pin_mode` の使い分け: **`require`** = submit / bless / commit gate / `approved_plugins` 第 2 相 (pin 必須かつ一致)、**`check`** = 探索中の `run_backtest` / 人間 CLI (pin があれば一致を要求、無ければ通す)、**`ignore`** = ロック操作 (既存 pin が古くても名前で解決し直して上書きする — codex r4 部分指摘: `require`/`check` のままでは古い pin の再ロックに到達できない)。
+- `resolve_indicator_deps(meta, inventory, *, settings, pin_mode: Literal["require", "check", "ignore"]) -> ResolvedIndicatorSet`: 1 箇所。失敗 = `IndicatorResolutionError(alias, reason)`、reason 固定語彙: `not_found` / `not_indicator` / `over_max_bars_limit` / `params_not_json_safe` / `unpinned` (`require` で pin なし) / `pin_mismatch` (`require`/`check` で pin が inventory の hash と不一致) / `handshake_too_large` (§2.2 の総量上限超過、alias=None) / `outputs_undeclared` (依存先 indicator が `outputs` を宣言していない、U4)。(`max_bars` は「渡す履歴の最大本数」であって必要 warmup 本数ではないので、大小比較による拒否は入れない — codex r4 I3。warmup 不足は全 NaN として validator を通る仕様で、規律文と example docstring で作者に伝える。)`pin_mode` の使い分け: **`require`** = submit / bless / commit gate / `approved_plugins` 第 2 相 (pin 必須かつ一致)、**`check`** = 探索中の `run_backtest` / 人間 CLI (pin があれば一致を要求、無ければ通す)、**`ignore`** = ロック操作 (既存 pin が古くても名前で解決し直して上書きする — codex r4 部分指摘: `require`/`check` のままでは古い pin の再ロックに到達できない)。
 - params の merge = indicator の params の deep copy に strategy 側を 1 段上書き → 再帰 JSON-safe 検証 → freeze。
 - **`approved_plugins()` の二相**: 第 1 相 = 既存規律 (discover + 最新決定 approved + hash 一致) で indicator / signal / strategy を admit。第 2 相 = strategy を、第 1 相の indicator 集合に対して同じ `resolve_indicator_deps(pin_mode="require")` を通し、成功したものだけ最終 admit (失敗は warning + reason を log)。戻り型は **`InventoryBuildResult(inventory: ApprovedInventory, phase1_metas: tuple[PluginMeta, ...], resolved: Mapping[(name, content_hash), ResolvedIndicatorSet], rejected_strategies: tuple[RejectedStrategy(name, content_hash, alias, reason), ...])`** (codex r4 I2 + r5 I1: 第 2 相で成功した strategy の `ResolvedIndicatorSet` を保持し、service はそれを**再解決せず**そのまま producer / session に渡す。resolver 呼び出しは strategy ごとに 1 回、object identity を受入で観測)。`inventory.metas` は最終 admit のみ。snapshot 材料 (`copy_source_snapshot`) は `phase1_metas` (pin 破れ strategy を含む)、prompt の「pin 破れ N 本」は `rejected_strategies` から生成する。`approved_plugins(conn, plugins_dir, *, settings)` に settings を渡す (`max_bars_limit`)。既存の list 利用者 (`len` / index / equality を含む) は本束で `result.inventory.metas` へ**全数移行**する (`__iter__` だけの互換は不正確、codex r5 M1)。移行対象 = プランで `rg 'approved_plugins\(' src tests` の全結果 (少なくとも `service.py` / `mission_worker.py` / `improve_loop.py` / `improve_context.py` / `strategy_gate.py` / `tests/tools/test_plugin_loader.py` / `tests/test_service_app.py:305-334` (mock 戻り値を list 固定) / `tests/test_e2e_plugin_signal.py:202-206` (戻り値を直接 iteration)、codex r6 M1)。mock は `InventoryBuildResult` を返し、利用側は `.inventory.metas` と `settings=` の新契約に更新する。merge/lookup の規則は resolver 1 箇所。
 - **composition root** (1 回構築し同じオブジェクトを配る):
@@ -80,7 +83,7 @@ params: {...}
 - **graceful close**: `close()` は従来どおり戻り値なし。親が `{"op": "close"}` を送り、worker は `{"ok": true, "cpu_sec": ru_utime+ru_stime}` を返して exit。`sandbox_timeout_sec` 内に来なければ SIGKILL。**`PluginSession.cpu_sec: float | None`** は close 完了後に確定する property (正常終了で float、SIGKILL fallback / plugin error 後 / `__enter__` 失敗で worker 未起動なら `None`)。**caller (`run_in_sample` の呼び出し元の `finally` 後)** が読み、in_sample / holdout × pair ごとに合算して activity へ (§2.9 (e))。
 
 ### 2.5 indicator の戻り値検証 — 内部表現と wire 表現
-- 共通 validator `validate_indicator_result(result, *, df_index, outputs)` は **worker 内**で呼ぶ。dict[str, value]、value は (a) `float`/`int` (bool・±Inf 拒否、NaN 許可) または (b) 系列 (`pd.Series` は `index.equals(df_i.index)` 必須、list/ndarray は `len == len(df_i)`、要素は数値、bool・±Inf 拒否、NaN 許可)。`outputs` 宣言済みは毎回宣言キー集合と完全一致 (warmup は NaN)。宣言なしは `{}` 許可 (互換)。
+- 共通 validator `validate_indicator_result(result, *, df_index, outputs)` は **worker 内**で呼ぶ。dict[str, value]、value は (a) `float`/`int` (bool・±Inf 拒否、NaN 許可) または (b) 系列 (`pd.Series` は `index.equals(df_i.index)` 必須、list/ndarray は `len == len(df_i)`、要素は数値、bool・±Inf 拒否、NaN 許可)。`outputs` 宣言済みは毎回宣言キー集合と完全一致 (warmup は NaN)。宣言なしは standalone (`get_indicators`) でのみ到達し `{}` 許可 (互換。依存経路には U4 により来ない)。
 - 同居実行: 検証後 worker 内で Series 化 → strategy へ。
 - standalone (`get_indicators`): wire `{key: float | {"series": [float|null,...]}}`、NaN は `null` にしてから `allow_nan=False` で送る。親が境界再検証。`market_tools.get_indicators` は系列を末尾値に射影し、**スカラー NaN と系列末尾 NaN はキー単位で落とす** (fail-open 維持)。
 
@@ -109,7 +112,7 @@ params: {...}
 
 ### 2.9 改善 worker への露出と RPC
 - (a) prompt の `current_inventory.approved_plugins` は `ImproveRunContext.inventory` から生成し、indicator の `params` / `outputs` / `content_hash` を含める。
-- (b) tool `list_deployed_plugins()` / `lock_staging_deps(name)` は**子 worker プロセス内**の staging tooldefs で実行される (親の `ImproveRunContext.inventory` を直接は参照できない、codex r6 I2)。親は mission handshake に **`inventory_view`** (JSON-safe: 最終 admit 済 plugin の `{name, kind, pairs, params, outputs, content_hash}` の list + `rejected_strategies` の `{name, alias, reason}` list) を載せ、子の両 tool はこの view だけを読む (snapshot ディレクトリを列挙しない = phase 2 で落ちた strategy が inventory に混ざらない)。`lock_staging_deps` は view の `content_hash` を pin に書く (staging・examples は参照しない)。view は `ImproveRunContext.inventory` と同じ `InventoryBuildResult` から 1 回だけ生成する。登録先 = staging tooldefs / `mission_registry` / `improve_mission.md` の使用可能 tool 列挙。`IMPROVE_FORBIDDEN` には入れない。
+- (b) tool `list_deployed_plugins()` / `lock_staging_deps(name)` は**子 worker プロセス内**の staging tooldefs で実行される (親の `ImproveRunContext.inventory` を直接は参照できない、codex r6 I2)。親は mission handshake に **`inventory_view`** (JSON-safe: 最終 admit 済 plugin の `{name, kind, pairs, params, outputs (宣言なしは null = 依存不可), content_hash}` の list + `rejected_strategies` の `{name, alias, reason}` list) を載せ、子の両 tool はこの view だけを読む (snapshot ディレクトリを列挙しない = phase 2 で落ちた strategy が inventory に混ざらない)。`lock_staging_deps` は view の `content_hash` を pin に書く (staging・examples は参照しない)。view は `ImproveRunContext.inventory` と同じ `InventoryBuildResult` から 1 回だけ生成する。登録先 = staging tooldefs / `mission_registry` / `improve_mission.md` の使用可能 tool 列挙。`IMPROVE_FORBIDDEN` には入れない。
 - (c) `run_backtest` の予算と解決は**プロセス境界を跨ぐ** (codex r4 C1 で確定: `reserve_backtest` は子 worker の tooldef (`improve_rpc_tools.py:135`)、`run_backtest_handler` は RPC の先の親 (`improve_loop.py:864`)。`ImproveRunContext.inventory` は親にしか無い。v0.4b の「同じクロージャ」は誤りで撤回)。したがって解決は親でしか行えず、予約は子で先に起きる。契約 = **予約 → 親 RPC → 未開始なら解放**: 子 tooldef は既存どおり検証後に `reserve_backtest` → RPC。親は backtest を始める前に `ImproveRunContext.inventory` で `check` 解決し、未解決なら backtest を走らせず `{"started": false, "error": "indicator_unresolved", "alias", "reason", "available": [indicator 名...]}` を返す。子は `started is False` のときだけ `counters.release_backtest(name)` (lock 内で `backtest_calls[name] -= 1`、0 未満にしない、`successful_backtests` は触らない) で予約を戻す。`error` キーがあるので `registry.py:101-102` により `errors` と recoverable refusal streak に自動計上 (同じ未解決を繰り返す agent は既存規律で abort)。`max_tool_calls` は常に +1。`started` キーが無い応答 (旧形式・RPC 失敗) では解放しない (fail closed = 予算は消費されたまま)。
 - (d) `improve_mission.md` の規律文: 「strategy は配備済 indicator を `indicators:` で宣言して使う (`list_deployed_plugins`)。提出前に `lock_staging_deps` でロックし、ロック後に self-test / backtest を再実行する。無い指標は自前計算せず `不足指標: <名前と定義>` として backlog に起票する」。
 - (e) activity `IMPROVE backtest_cpu mission=… plugin=… scope=in_sample|holdout pair=… deps=N cpu_sec=<float|null>`: adapter の直接 caller が `finally` 後に `cpu_sec` を読み、**`StrategyGateVerdict.cpu_samples: tuple[(scope, pair, cpu_sec|None), ...]`** に載せる (commit gate では `strategy_gate.py` が adapter を内部生成・close するため verdict 経由でしか ImproveLoop に届かない、codex r5 I4)。ImproveLoop は verdict から scope × pair ごとに 1 行ずつ activity を書く。`run_backtest_handler` 経路は handler が直接読む。例外終了時も `finally` で sample を積み `cpu_sec=null`。
@@ -170,6 +173,8 @@ params: {...}
 
 | # | 基準 | 観測点 |
 |---|---|---|
+| U4a | submit / bless (kind=indicator) で `outputs` 無し → `ValueError("outputs_required")`、approval 行 0。改善 commit gate でも同じ固定文言で gate 不合格 | |
+| U4b | `outputs` 宣言なしの配備済 indicator を依存に書いた strategy → resolver `outputs_undeclared` (require / check とも)。standalone `get_indicators` では従来どおり動く | |
 | L1 | loader 表駆動: 各 kind × `indicators`/`outputs`/reference object の unknown key / 型違反 / 別名規則 / pin 形式 / params 非 JSON-safe (date, set, Inf, NaN, bytes) / 上限 → §2.2 の固定 reason 文字列 (完全一致) と reject (戻り集合に含まれない) | `discover` の warning 文字列と戻り集合 |
 | R1 | resolver 表駆動: `not_found` / `not_indicator` / `over_max_bars_limit` / `params_not_json_safe` / `unpinned` (`require`) / `pin_mismatch` (`require`/`check`) / `handshake_too_large` の各 reason、`ignore` が古い pin を無視して解決すること、成功時の `pin_object()` の alias 順と値の型。**上限境界** (codex r6 I3): deps 8 通過 / 9 拒否、outputs 32 / 33、params 8 KiB ちょうど / +1 byte、handshake 256 KiB / +1 byte (同一 plugin の 8 alias × 大 default params で到達させる)、いずれも拒否時に worker spawn 0 回 | 返り値 / 例外フィールド / spawn spy |
 | A1 | `rsi_pullback` (依存 1) が `evaluate_strategy_adoption_gate` (strategy gate 経路) を完走 | `backtest_runs` に candidate の `scope='in_sample'` 行 1 (`content_hash` = pinned config の hash) と、baseline 不在時に gate が合成する `no_strategy` 行 1 |
@@ -205,8 +210,7 @@ params: {...}
 
 ## 7. 未決
 
-- `outputs` を必須にするか (v0.4 = 任意)。
-- ロック時の `config.yaml` 書き換え方法 (YAML 再シリアライズ vs ブロック置換) — プランで決める (コメント保持は要件にしない)。
+なし (v1.1 で U4〜U6 として裁定済)。
 
 ## 8. codex r3 対応表
 
@@ -314,3 +318,4 @@ params: {...}
 | 2026-09-13 | v0.4b〜v0.7 | opus 独立レビュー (C1/I7/M5) → codex r4 (C2/I7/M1) → r5 (C1/I5/M2) → r6 (C0/I7/M1)。RPC 境界、noop の再ロック例外、lock 集合、`InventoryBuildResult`、handshake 上限、reconcile、`GateOutcome.resolved`、`inventory_view` | 設計レビュー | - |
 | 2026-09-14 | v0.8〜v0.9 | codex r7 terra (C0/I3/M2: fixture の market hours、decision sink、対応表の矛盾) → r8 terra (C0/I4/M2: noop 入力契約、R2 の `.versions`、oracle 語彙、identity 受入、loader reason 語彙) → **r9 terra: 指摘 0** | 設計レビュー | - |
 | 2026-09-14 | v1.0 | spec 化 (`tmp/design-indicator-wiring/design.md` v0.9 を移植、対応表 §8〜§14 は経緯として保持)。ユーザーレビュー待ち | 収束 | - |
+| 2026-09-14 | v1.1 | ユーザー裁定 U4 (`outputs` は新規承認で必須、宣言なし既存は null = 依存不可) / U5 (ロックは全体再シリアライズ) / U6 (prerequisite 3 本は fable ひな形 + ユーザー承認) を §0 / §2.2 / §2.3 / §2.5 / §2.9 / §2.10 / §6 (U4a/U4b) に反映、§7 を解消。実装着手可 | 裁定 | - |
