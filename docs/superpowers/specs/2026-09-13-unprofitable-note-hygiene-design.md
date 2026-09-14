@@ -1,4 +1,4 @@
-# [unprofitable-note-hygiene] 設計書 v2.0
+# [unprofitable-note-hygiene] 設計書 v2.1
 
 束: 収益性フロア不合格 (`unprofitable`) で終わった改善 mission が起票した backlog 行 (note / task) に機械注記を付け、次 mission の同型再提出を抑止する。ユーザー承認 2026-09-13。親: [floor-path-skips-duplicate-metrics] 裁定 (c) 現状維持、遮断 8 例外の再評価 (`2026-09-12-profitability-floor-design.md` v1.5)。
 
@@ -60,3 +60,4 @@ A4 run19 (`tmp/a4-run19-codex-20260913.md` 観測 D): mission #83 が holdout �
 | 2026-09-13 | v1.1 | 実装 `98a5d68` (sonnet) → 段 0 `e1595a5` (14 変異、生存 6 → pin S1〜S5) → ローカル 3 本 1 周目 `9088c86` (Y2/N14/dup6、pin L1/L2、本番欠陥 0) → codex 1 周目 (`tmp/review-20260913-nh/codex-r1.md`): Critical 0 / Important 1 (N2 の report/observation/approval 終端が未 pin) / Minor 5 (F5-5 説明改訂、N3 空振り、N5 note 不変、L1 docstring、N4 文言) → 全件是正。N4 の受入文言を「注記後の後段失敗で rollback」に訂正 (report 作成失敗は注記より前) | codex r1 | - |
 | 2026-09-13 | v1.2 | codex 2 周目 (`tmp/review-20260913-nh/codex-r2.md`): Critical 0 / Important 2 (I1 並行時の後発 UPDATE が他 mission の終端値を潰す → `AND last_result IS NULL` CAS / I2 note 昇格で注記が消える → 保持分岐) / Minor 2 (文書) → 全件是正 `b658caf` (pin N9/N10 追加、602 passed)。§2-2 の SQL と昇格規則、§4 N9/N10 を追記 | codex r2 | b658caf |
 | 2026-09-13 | v2.0 | `/code-review high` (sonnet、`a0fd1e4..3a40070`) 5 件: #3 根本原因 = 注記を `last_result` に相乗りさせたため書き手 10 箇所が CAS/保持分岐を要し、#1 同 tx 自己昇格 / #2 人間 `backlog note`/`reopen` で注記が消える、#5 順序依存が未 pin、#4 無関係 discovery の誤帰属が未記録。**ユーザー裁定: 専用列 (`origin_mission_id` / `origin_outcome`) に作り直す** → §2 全面改訂、v1.x の CAS・昇格保持・`inserted_ids` を撤回、#4 は受容トレードオフとして §2-6 に明記 | code-review high | - |
+| 2026-09-14 | v2.1 | v2.0 実装 `3e56825` (sonnet、N1〜N12) → 段 0 `5caa8b6` (opus、18 変異、生存 3 → S6〜S8: 他 mission 行への UPDATE 波及 / origin 判定の部分一致 / items 側の配線) → ローカル 3 本 `8d5a57a` (15 走、Y1/N40/dup7、pin L1 = 注記 UPDATE を commit 後の独立 tx に移す変異が生存 → 終端ごと rollback を pin) → codex 1 周目 terra/medium (`tmp/review-20260913-nh/codex-r1-v2.md`): Critical 0 / Important 0 / Minor 1 (F5-5 docstring) → `8533f96`。フルスイート 3900 passed + 既知 flake 9。本番欠陥 0 で main へ ff | 実装レビュー | 8533f96 |
