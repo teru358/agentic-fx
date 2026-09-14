@@ -1,6 +1,6 @@
-# [indicator-consumption-wiring] 設計書 v1.2
+# [indicator-consumption-wiring] 設計書 v1.3
 
-束: 指標層 → 戦略層の配線。strategy plugin が `config.yaml` で宣言した配備済 indicator plugin の出力を、strategy worker 内で計算して `evaluate(df, indicators, ...)` に渡す。依存の版は `config.yaml` の `pin` (= `content_hash` の署名対象) に書き込む「ロック方式」で固定する。ユーザー裁定 U1〜U3 (2026-09-13)、下書き `tmp/design-indicator-wiring/design.md` v0.1〜v0.9 を codex 設計レビュー 9 周 (r1〜r3 sol、r4〜r6 sol、r7〜r9 terra) + opus 独立レビュー 1 周で収束 (r9: Critical 0 / Important 0 / Minor 0)。**v1.2 = 実装プランの着手前検証 (opus r1) で判明した §6 の 2 行 (C1 / R1) を現物に合わせて改訂**。v1.1 = §7 の裁定を反映、実装着手可 (writing-plans へ)。
+束: 指標層 → 戦略層の配線。strategy plugin が `config.yaml` で宣言した配備済 indicator plugin の出力を、strategy worker 内で計算して `evaluate(df, indicators, ...)` に渡す。依存の版は `config.yaml` の `pin` (= `content_hash` の署名対象) に書き込む「ロック方式」で固定する。ユーザー裁定 U1〜U3 (2026-09-13)、下書き `tmp/design-indicator-wiring/design.md` v0.1〜v0.9 を codex 設計レビュー 9 周 (r1〜r3 sol、r4〜r6 sol、r7〜r9 terra) + opus 独立レビュー 1 周で収束 (r9: Critical 0 / Important 0 / Minor 0)。**v1.3 = 実装プランの指揮者裁定 (2026-09-14) で判明した §6 の 2 行 (F2 / P2') を実装プランの申し送りに合わせて改訂**。v1.2 = 実装プランの着手前検証 (opus r1) で判明した §6 の 2 行 (C1 / R1) を現物に合わせて改訂。v1.1 = §7 の裁定を反映、実装着手可 (writing-plans へ)。
 
 ## 0. ユーザー裁定 (2026-09-13)
 
@@ -183,7 +183,7 @@ params: {...}
 | A1'' | CLI 未解決 (not_found / not_indicator / over_max_bars_limit): rc=1、stderr = `indicator_unresolved:<alias>:<reason>` 逐語、`backtest_runs` 行数不変、traceback なし | |
 | A2 | `approve_candidate`: submit 後に indicator を更新 → approve → `ValueError("indicator_unresolved:<alias>:pin_mismatch")`、approval は pending のまま、`.versions` に新版なし、symlink 不変 | |
 | F1 | adapter: `resolved` 無し → `TypeError`、worker 0 | |
-| F2 | service 起動: pin 破れ strategy → warning 1 行 (reason 込み)、producer の一覧に無い、session cache 未登録 | |
+| F2 | service 起動: pin 破れ strategy → warning 1 行 (reason 込み)、producer の plugin 一覧に含まれない (session cache 未登録は producer 一覧に無いことの帰結なので観測しない) | |
 | F3 | `run_kind_gate`: 未解決 → `verdict_kind == "indicator_unresolved"` + alias + reason、例外なし、行数不変 | |
 | F3' | `_run_full_gate` / submit / bless: unpinned → `ValueError("indicator_unresolved:<alias>:unpinned")`、approval 行 0、gate 行 0 | |
 | F4 | 改善 RPC 未解決: `{"started": false, ...}`、`backtest_calls[name]` が呼び出し前後で不変 (予約 → 解放)、`successful_backtests` 不変、`errors` +1、recoverable streak +1、`max_tool_calls` +1、`last_result` 不変。staging 内 indicator 指定は `available` に staging 名なし。`started` キー無し応答では解放されない | counters の全フィールド |
@@ -197,7 +197,7 @@ params: {...}
 | P4 | noop: `_examples/rsi_pullback` を逐語コピーして lock した候補は `noop_copy_of:_examples/rsi_pullback` で reject。配備済 S (pin I1、I2 承認済で pin 破れ) を複製して pin I2 に再ロックした候補は noop にならず gate に進む。同じ複製を pin I1 のまま (再ロックなし) 提出すると `noop_copy_of:S` | |
 | P5 | 再ロック再提出: indicator を出力不変の変更で更新 → 依存 strategy を再ロック → 再提出の成績が既承認版と一致しても `duplicate_metrics_of` で降格されない (pin 除去 config + AST 一致で母集団除外) | | |
 | P2 | pin 検算 (r3 C1 シナリオ): S(pin I1) approved → I2 承認 → S 除外 (warning) → 再ロック → hash 変化 → approval / signals / backtest_runs の各行が新 hash で旧行と分離される (approval 新規行、`signals` 2 行挿入成功、`latest_in_sample_metrics(new_hash)` が旧行を返さない)。`find_matching_approved_metrics` は仕様どおり**旧 hash を返す** (重複検出 API) — その結果を再ロック時に無視する caller 側は P5 で検証 | |
-| P2' | 並行: S の approve 中 (解決後・切替前) に I2 の承認が待たされる (名前昇順ロック)。逆順で取っても deadlock しない (順序 pin) | |
+| P2' | 並行: S の approve 中 (解決後・切替前) に I2 の承認が待たされる (名前昇順ロック)。`_plugin_lock` の取得順序が常に名前昇順・重複なしであることを spy で pin する (順序が崩れる変異を検出) | |
 | P2'' | lock 集合: 同一 indicator を 2 alias で参照する strategy の approve が deadlock せず、当該 indicator の lock 取得は 1 回 (`_plugin_lock` spy)。bless: 事前読取 → lock 取得の間に候補 `config.yaml` を差し替えると固定文言 `candidate_changed`、approval 行 0、`.versions`・symlink 不変、全 lock 解放 | spy / DB / FS |
 | P3 | approval payload 三経路に `indicator_deps` (plain object) が同形。`list_deployed_plugins` / prompt inventory が同じ snapshot 由来 (prepare 後に live `plugins/` を差し替えても不変)、staging・examples を含まず、`IMPROVE_FORBIDDEN` と非交差 | |
 | P3' | resolver 呼び出し 1 回 + 同一 object (r5 I1 / r6 I1): gate を通す test double で `resolve_indicator_deps` の呼び出し回数が候補ごとに 1、in_sample session と holdout session に渡った `resolved`、`GateOutcome.resolved`、payload の `indicator_deps` を作った元が同一 object (`is`)。service 起動でも strategy ごとに 1 回で producer の session が `InventoryBuildResult.resolved[(name, hash)]` と `is` 一致 | resolver spy / `is` |
@@ -314,6 +314,7 @@ params: {...}
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-14 | v1.3 | §6 の F2 (pin 破れ strategy の観測を「producer の plugin 一覧に含まれない」に絞り、session cache 未登録はその帰結として別途観測しない) と P2' (「逆順で取っても deadlock しない」という実測不能な主張を、`_plugin_lock` の取得順序が常に名前昇順・重複なしであることを spy で pin する形に置換) を改訂。指揮者の実装プラン既定選択 8 件のうち①(validator の置き場 = `core/plugin_contract.py`)と⑥(lock 後は snapshot を取り直す)をユーザー裁定で変更、②③④⑤⑦⑧は変更なしで採用 | ユーザー裁定 (2026-09-14、実装プラン `docs/superpowers/plans/2026-09-14-indicator-consumption-wiring.md` 側の指揮者の既定選択 8 件 + 申し送り 2 件の確定) | - |
 | 2026-09-13 | v0.1〜v0.4a | 初稿 → codex r1 (C5/I10/M2) / r2 (C3/I12/M1) / r3 (C3/I8/M2)。identity 論点が 3 周連続 Critical → v0.4 で §2.7 を作り直し (pin を config.yaml に書くロック方式、`execution_hash` 撤回)。r4 部分 (`pin_mode` 3 値) | 設計レビュー | - |
 | 2026-09-13 | v0.4b〜v0.7 | opus 独立レビュー (C1/I7/M5) → codex r4 (C2/I7/M1) → r5 (C1/I5/M2) → r6 (C0/I7/M1)。RPC 境界、noop の再ロック例外、lock 集合、`InventoryBuildResult`、handshake 上限、reconcile、`GateOutcome.resolved`、`inventory_view` | 設計レビュー | - |
 | 2026-09-14 | v0.8〜v0.9 | codex r7 terra (C0/I3/M2: fixture の market hours、decision sink、対応表の矛盾) → r8 terra (C0/I4/M2: noop 入力契約、R2 の `.versions`、oracle 語彙、identity 受入、loader reason 語彙) → **r9 terra: 指摘 0** | 設計レビュー | - |

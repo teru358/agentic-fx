@@ -1,4 +1,4 @@
-# [indicator-consumption-wiring] 実装プラン v1.1 (設計書 = `docs/superpowers/specs/2026-09-14-indicator-consumption-wiring-design.md` v1.2 準拠)
+# [indicator-consumption-wiring] 実装プラン v1.2 (設計書 = `docs/superpowers/specs/2026-09-14-indicator-consumption-wiring-design.md` v1.3 準拠)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (推奨) または superpowers:executing-plans で task ごとに実行すること。Step は
@@ -115,7 +115,7 @@ codex 設計レビュー 9 周 + opus 1 周の全件採用は設計書 §0/§8�
 | path | 責務 |
 |---|---|
 | `src/agentic_fx/plugin/resolve.py` | 依存解決の**唯一の場所**。`ApprovedInventory` / `ResolvedIndicator` / `ResolvedIndicatorSet` / `RejectedStrategy` / `InventoryBuildResult` / `IndicatorResolutionError` / `resolve_indicator_deps` / `freeze_params` / `thaw` / `lock_config` / `strip_pins` / `same_modulo_pins` / `is_relock_transition` / 4 つの上限定数 |
-| `src/agentic_fx/plugin/indicator_validate.py` | `validate_indicator_result(result, *, df_index, outputs)` の**唯一の実装**。worker (同居実行の検証) と sandbox (standalone wire の境界再検証) の双方が import する。`plugin/worker.py` は `sandbox.py` を import できない (contracts / subprocess を子プロセスへ持ち込まない既存規律) ため、共有先を独立モジュールにする |
+| `src/agentic_fx/core/plugin_contract.py` | `validate_indicator_result(result, *, df_index, outputs)` の**唯一の実装**。worker (同居実行の検証) と sandbox (standalone wire の境界再検証) の双方が import する。`plugin/worker.py` は `sandbox.py` を import できない (contracts / subprocess を子プロセスへ持ち込まない既存規律) ため、共有先を独立モジュールにする |
 | `tests/plugin/test_resolve.py` | R1 (表駆動 resolver) / lock_config / `same_modulo_pins` / `is_relock_transition` の単体 |
 | `tests/plugin/test_indicator_wiring_e2e.py` | A1 / A1-b / C1 / N1 / P3'。実 worker + 実 sqlite |
 | `tests/plugin/test_indicator_containment.py` | V3 (差し替え拒否、3 root) |
@@ -306,8 +306,12 @@ def thaw(frozen): ...                    # call ごとに完全独立な plain J
 def resolve_indicator_deps(meta: PluginMeta, inventory: ApprovedInventory, *,
                            settings, pin_mode: Literal["require", "check", "ignore"],
                            ) -> ResolvedIndicatorSet: ...
-def lock_config(candidate_dir: Path, pins: Mapping[str, str]) -> tuple[str, str]: ...
-    # (before_text, after_text) を返す。副作用 = config.yaml の再シリアライズ書き込み
+def lock_config(candidate_dir: Path, pins: Mapping[str, str]
+                ) -> tuple[str, str, str]: ...
+    # (before_text, after_text, new_content_hash) を返す。副作用 = config.yaml の
+    # 再シリアライズ書き込み。new_content_hash は書き込み**後**に disk から
+    # content_hash() を再計算した値 (ユーザー裁定 2026-09-14 ⑥: lock 後は必ず
+    # snapshot を取り直す — 呼び出し元は resolve 時点の hash を使い回さない)
 def strip_pins(config: dict) -> dict: ...
 def same_modulo_pins(candidate_dir: Path, other_dir: Path) -> bool: ...
 def is_relock_transition(candidate_dir: Path, deployed_dir: Path,
@@ -915,7 +919,7 @@ from typing import Any, Literal, Mapping
 
 import yaml
 
-from agentic_fx.plugin.loader import PluginMeta
+from agentic_fx.plugin.loader import PluginMeta, content_hash
 
 # 展開後の canonical handshake 総 byte 数の上限 (設計書 §2.2、codex r5 C1)。
 # 既存 `sandbox._STARTUP_MAX_BYTES` (65536、worker → 親の起動応答) とは
@@ -1321,20 +1325,27 @@ def test_lock_config_writes_pins_and_keeps_discoverable(tmp_path):
     before_hash = s.content_hash
     resolved = resolve_indicator_deps(s, _inv(root, rsi, adx), settings=SETTINGS,
                                       pin_mode="ignore")
-    before_text, after_text = lock_config(cand / "s", resolved.pins())
+    before_text, after_text, new_hash = lock_config(cand / "s", resolved.pins())
     assert "pin:" not in before_text
     written = yaml.safe_load((cand / "s" / "config.yaml").read_text())
     assert written["indicators"]["rsi"]["pin"] == rsi.content_hash
     assert written["indicators"]["adx"]["pin"] == adx.content_hash
     assert after_text == (cand / "s" / "config.yaml").read_text()
+    # ユーザー裁定 2026-09-14 ⑥: lock 後は必ず snapshot (content_hash) を
+    # disk から取り直す。返り値の new_hash が、書き込み後の config.yaml を
+    # 独立に再読して計算した content_hash() と一致すること (呼び出し元が
+    # resolve 時点の値を使い回していないことの pin)。
+    assert new_hash == content_hash(cand / "s")
     relocked, reason = discover_one_with_reason(cand / "s", "s")
     assert reason is None                       # P1: 書き換え後も discover を通る
     assert relocked.content_hash != before_hash  # pin は content_hash の署名対象
+    assert relocked.content_hash == new_hash     # snapshot 再取得の値と一致
     # 既に同じ pin なら no-op (2 回目の lock で内容が変わらない)
     resolved2 = resolve_indicator_deps(relocked, _inv(root, rsi, adx),
                                        settings=SETTINGS, pin_mode="ignore")
-    b2, a2 = lock_config(cand / "s", resolved2.pins())
+    b2, a2, h2 = lock_config(cand / "s", resolved2.pins())
     assert b2 == a2
+    assert h2 == new_hash                        # no-op でも snapshot は再計算される
 
 
 def test_lock_config_overwrites_stale_pin(tmp_path):
@@ -1410,18 +1421,27 @@ Expected: FAIL — `ImportError: cannot import name 'lock_config'`
 
 ```python
 def lock_config(candidate_dir: Path, pins: Mapping[str, str]
-                ) -> tuple[str, str]:
+                ) -> tuple[str, str, str]:
     """候補の `config.yaml` の各 alias に `pin` を書き込む (U5: 全体を
     `yaml.safe_load` → pin 追加 → `yaml.safe_dump(sort_keys=False)` で
     再シリアライズ。コメント・キー順は保持しない — 呼び出し元が差分を
-    人間へ表示する)。戻り値 `(before_text, after_text)`。
+    人間へ表示する)。戻り値 `(before_text, after_text, new_content_hash)`。
 
     `pins` は `{alias: content_hash}`。resolver 経路の呼び出し元は
     `ResolvedIndicatorSet.pins()` を渡し (`pin_mode="ignore"` で解決した
     もの)、改善 worker の `lock_staging_deps` は `inventory_view` から
     組んだ dict を渡す — **YAML 書き換えの実装はここ 1 箇所に閉じる**
     (設計書 §2.3)。`pins` に無い alias は触らない。**既に同じ pin なら
-    書き込み内容は変わらない** (before == after)。"""
+    書き込み内容は変わらない** (before == after)。
+
+    **snapshot 再取得** (ユーザー裁定 2026-09-14 ⑥): 書き込み後、disk 上の
+    `config.yaml` を独立に再読して `content_hash()` を計算し直し、それを
+    `new_content_hash` として返す。`check_candidate_snapshot`
+    (`gate_pytest.py`) は 3 ファイルの存在・属性しか見ず内容の一致は
+    検査しないため、その「lock で壊れるものはない」という主張だけに
+    依存せず、呼び出し元 (`_plugin_lock` CLI / `lock_staging_deps` tool)
+    は **resolve 時点で計算した hash を使い回さず、必ずこの戻り値を
+    使う**。"""
     path = candidate_dir / "config.yaml"
     before_text = path.read_text(encoding="utf-8")
     config = yaml.safe_load(before_text)
@@ -1436,7 +1456,8 @@ def lock_config(candidate_dir: Path, pins: Mapping[str, str]
                                 default_flow_style=False)
     if after_text != before_text:
         path.write_text(after_text, encoding="utf-8")
-    return before_text, after_text
+    new_content_hash = content_hash(candidate_dir)
+    return before_text, after_text, new_content_hash
 
 
 def strip_pins(config: dict) -> dict:
@@ -1894,7 +1915,7 @@ git commit -m "refactor: migrate every approved_plugins caller to InventoryBuild
 **完了条件の受入 ID**: V1 / V2 / V3 / S1 / S1' / C1 / N1。
 
 **Files:**
-- Create: `src/agentic_fx/plugin/indicator_validate.py`
+- Create: `src/agentic_fx/core/plugin_contract.py`
 - Modify: `src/agentic_fx/plugin/worker.py:135-231`
 - Modify: `src/agentic_fx/plugin/sandbox.py:103-131` (deny)、`:153-188` (check_source)、
   `:272-276` (`_KIND_PAYLOAD_KEYS`)、`:292-475` (`PluginSession`)、`:648-661`
@@ -1914,7 +1935,7 @@ git commit -m "refactor: migrate every approved_plugins caller to InventoryBuild
 - Produces:
 
 ```python
-# src/agentic_fx/plugin/indicator_validate.py
+# src/agentic_fx/core/plugin_contract.py
 class IndicatorResultError(ValueError): ...
 def validate_indicator_result(result, *, df_index, outputs: tuple[str, ...] | None):
     """戻り値 = {key: float | list[float|None]}。
@@ -1944,7 +1965,7 @@ _KIND_PAYLOAD_KEYS = {"indicator": ("df", "params"), "signal": ("df", "params"),
 
 - [ ] **Step 2-1a: Write the failing test**
 
-`tests/plugin/test_indicator_validate.py` (新規):
+`tests/core/test_plugin_contract.py` (新規):
 
 ```python
 """[indicator-consumption-wiring] T2: indicator 戻り値の共通 validator (V1)。"""
@@ -1954,7 +1975,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from agentic_fx.plugin.indicator_validate import (
+from agentic_fx.core.plugin_contract import (
     IndicatorResultError, validate_indicator_result,
 )
 
@@ -2074,21 +2095,27 @@ def test_nested_container_element_raises_indicator_result_error():
 
 - [ ] **Step 2-1b: Run test to verify it fails**
 
-Run: `uv run pytest tests/plugin/test_indicator_validate.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'agentic_fx.plugin.indicator_validate'`
+Run: `uv run pytest tests/core/test_plugin_contract.py -q`
+Expected: FAIL — `ModuleNotFoundError: No module named 'agentic_fx.core.plugin_contract'`
 
 - [ ] **Step 2-1c: Write minimal implementation**
 
-`src/agentic_fx/plugin/indicator_validate.py` (新規):
+`src/agentic_fx/core/plugin_contract.py` (新規):
 
 ```python
 """indicator の戻り値検証 — 唯一の実装 ([indicator-consumption-wiring] §2.5)。
 
-**このモジュールは `sandbox.py` を import しない** — `plugin/worker.py`
-(子プロセス、RLIMIT_AS 下) が import するため、`core.contracts` や
-`subprocess` を巻き込む `sandbox.py` への依存を作らない。`pandas`/`numpy` は
-関数内 lazy import にする (import 自体は worker がどのみち行うが、
-親プロセス側の単体テストで余計な import を強制しない)。
+**親プロセス (`plugin/sandbox.py`) と sandbox worker (`plugin/worker.py`)
+の両方から import される** — ①置き場の裁定 (ユーザー裁定 2026-09-14):
+`core/` は `core/contracts.py` の前例どおり上位層に依存しない性格の
+モジュールを置く場所であり、worker エントリは既に
+`agentic_fx.core.landlock` を import している。**このモジュールは
+`agentic_fx.plugin.*` を import してはならない** — `plugin/worker.py`
+(子プロセス、RLIMIT_AS 下) が import するため、`subprocess` や DB 接続を
+巻き込む `plugin.sandbox` / `plugin.switch` 等への依存を作ると子プロセスに
+不要な依存を持ち込む。`pandas`/`numpy` は関数内 lazy import にする
+(import 自体は worker がどのみち行うが、親プロセス側の単体テストで
+余計な import を強制しない)。
 
 検証内容 (設計書 §2.5):
 - dict[str, value] であること (キーは str)
@@ -2193,13 +2220,13 @@ def validate_indicator_result(result: Any, *, df_index, outputs):
 
 - [ ] **Step 2-1d: Run test to verify it passes**
 
-Run: `uv run pytest tests/plugin/test_indicator_validate.py -q`
+Run: `uv run pytest tests/core/test_plugin_contract.py -q`
 Expected: PASS
 
 - [ ] **Step 2-1e: Commit**
 
 ```bash
-git add src/agentic_fx/plugin/indicator_validate.py tests/plugin/test_indicator_validate.py
+git add src/agentic_fx/core/plugin_contract.py tests/core/test_plugin_contract.py
 git commit -m "feat(plugin): shared indicator result validator supporting series (V1)"
 ```
 
@@ -2484,7 +2511,7 @@ def main() -> None:
 
     import pandas as pd
     import numpy as np
-    from agentic_fx.plugin.indicator_validate import validate_indicator_result
+    from agentic_fx.core.plugin_contract import validate_indicator_result
 
     baseline_chained = pd.get_option("mode.chained_assignment")
     baseline_errstate = dict(np.geterr())
@@ -3202,7 +3229,7 @@ def _validate_indicator_result(result: Any) -> dict[str, Any]:
     """standalone (`run_plugin` / `PluginSession.call(kind="indicator")`) の
     応答を親側で**再検証**する ([indicator-consumption-wiring] §2.5)。
 
-    worker は既に `indicator_validate.validate_indicator_result` を通した
+    worker は既に `plugin_contract.validate_indicator_result` を通した
     値を wire 形式 (`{key: float | {"series": [float|null, ...]}}`) で返して
     いるが、信頼境界を跨いだ値なのでここで形だけもう一度見る。
     NaN は wire 上で `null` になっている。戻り値は
@@ -3337,7 +3364,7 @@ git commit -m "feat(market_tools): project standalone indicator series to last v
 
 **Interfaces:**
 
-- Consumes: `indicator_validate.validate_indicator_result` の契約 (系列は `pd.Series`、
+- Consumes: `plugin_contract.validate_indicator_result` の契約 (系列は `pd.Series`、
   warmup は NaN)、`loader` の `outputs` / `indicators` schema (T1)、
   `resolve.ResolvedIndicatorSet` (T2)、`ohlcv.import_history_bars(conn, rows, source=...)`、
   `market_hours.is_market_open(now) -> bool`、
@@ -5491,8 +5518,10 @@ git commit -m "feat(adapter): require resolved indicator set and add decision_si
 
 ```python
 def test_service_startup_excludes_pin_broken_strategy_from_producer(tmp_path, caplog):
-    """F2: pin 破れ strategy は warning 1 行 (reason 込み) で producer に渡らず、
-    session cache にも載らない。"""
+    """F2 (設計書 v1.3 §6 で緩和): pin 破れ strategy は warning 1 行
+    (reason 込み) で producer の plugin 一覧に含まれない。session cache への
+    未登録は producer 一覧に無いことの帰結にすぎないため、別項目としては
+    観測しない (申し送り F2、2026-09-14 裁定)。"""
     import logging
 
     from agentic_fx.plugin.loader import content_hash
@@ -6085,7 +6114,18 @@ def _plugin_lock(conn, settings, args: argparse.Namespace, root: Path) -> int:
     `pin_mode="ignore"` 解決し (古い pin は上書き)、`lock_config` が
     `config.yaml` を再シリアライズする (U5: コメント・キー順は保持しない
     ので差分を表示する)。書き換え後に `discover` を通ることを同じ関数内で
-    確認する (壊れた config を残さない)。"""
+    確認する (壊れた config を残さない)。
+
+    **snapshot 再取得** (ユーザー裁定 2026-09-14 ⑥): `check_candidate_snapshot`
+    (`gate_pytest.py`) はファイル 3 本の存在・属性しか見ず、lock による
+    内容変更を検査しない。そのため「lock 後も submit は無条件で通る」と
+    決め打ちせず、ここでは `lock_config` が書き込み**後**に返す
+    `new_hash` (disk から再計算した content_hash) を唯一の正とし、
+    `resolve_indicator_deps` 実行時点で得た `meta.content_hash` を
+    使い回さない。`discover_one_with_reason` の再実行結果
+    (`relocked.content_hash`) と一致することも assert する
+    (どちらも同じ disk 状態を独立に読んでいるので、食い違えば
+    `lock_config` かここの配線のバグ)。"""
     if getattr(args, "from_kind", None) != "_human":
         print(_LOCK_NO_FROM_ERROR, file=sys.stderr)
         return 1
@@ -6108,7 +6148,7 @@ def _plugin_lock(conn, settings, args: argparse.Namespace, root: Path) -> int:
     except IndicatorResolutionError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    before_text, after_text = plugin_resolve.lock_config(
+    before_text, after_text, new_hash = plugin_resolve.lock_config(
         candidate_dir, resolved.pins())
     relocked, relock_reason = plugin_loader.discover_one_with_reason(
         candidate_dir, args.name)
@@ -6116,11 +6156,14 @@ def _plugin_lock(conn, settings, args: argparse.Namespace, root: Path) -> int:
         print(f"エラー: ロック後の config.yaml が discover を通りません "
              f"({relock_reason}) — 元に戻してください", file=sys.stderr)
         return 1
+    assert relocked.content_hash == new_hash, (
+        "lock_config の snapshot 再取得値と discover の再取得値が食い違う"
+        f" ({new_hash} != {relocked.content_hash})")
     if before_text == after_text:
         print(f"lock: {args.name} は既に最新の pin です (変更なし)")
         return 0
     print(f"lock: {args.name} content_hash {meta.content_hash} -> "
-         f"{relocked.content_hash}")
+         f"{new_hash}")
     for line in difflib.unified_diff(
             before_text.splitlines(), after_text.splitlines(),
             fromfile="config.yaml (before)", tofile="config.yaml (after)",
@@ -6160,9 +6203,11 @@ git commit -m "feat(cli): afx plugin lock --from _human writes dependency pins (
 
 **T3 完了条件**:
 - [ ] **F1**: `build_intent_source` を `resolved` 無しで呼ぶと `TypeError`、worker 0 起動
-- [ ] **F2**: service 起動で pin 破れ strategy が warning 1 行 (reason 込み) になり、
-      producer の一覧に無く、session cache にも載らない。producer は
-      `InventoryBuildResult.resolved` の**同一オブジェクト**を session へ渡す
+- [ ] **F2** (設計書 v1.3 §6 で緩和): service 起動で pin 破れ strategy が
+      warning 1 行 (reason 込み) になり、producer の plugin 一覧に含まれない
+      (session cache 未登録はこの帰結であり別途観測しない、2026-09-14 裁定)。
+      producer は `InventoryBuildResult.resolved` の**同一オブジェクト**を
+      session へ渡す
 - [ ] **A1'**: 配備済 (pinned) `rsi_pullback` の `afx backtest run --plugin` が rc=0 /
       `scope='human_custom'` 行 1 本。承認行を消しても rc=0 (手元評価契約の維持)
 - [ ] **A1''**: 未解決 3 種 (`not_found` / `not_indicator` / `over_max_bars_limit`) で
@@ -7010,9 +7055,47 @@ def test_plugin_locks_acquires_sorted_unique_names(tmp_path, monkeypatch):
     assert acquired == ["adx", "rsi", "s"]
 
 
+def test_plugin_lock_order_for_approve_candidate_is_sorted_unique(
+        tmp_path, monkeypatch):
+    """P2' (設計書 v1.3): `_plugin_lock` の取得順序が常に**名前昇順・
+    重複なし**であることを spy で pin する (順序が崩れる変異を検出)。
+    `approve_candidate` の実経路で `_plugin_lock` を monkeypatch し、
+    記録した取得順が `sorted(set(names))` と一致することを assert する
+    (指揮者へ申告済みの設計是正 — 「逆順で取っても deadlock しない」は
+    実測不能な主張だったため、実測可能な順序 pin に置換した)。"""
+    acquired: list[str] = []
+    import contextlib as _ctx
+    real = plugin_switch._plugin_lock
+
+    @_ctx.contextmanager
+    def _spy(root, name):
+        acquired.append(name)
+        with real(root, name):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    conn, plugins_root = _switch_env(tmp_path)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    fx.write_rsi_pullback(plugins_root / "_human", pins={"rsi": hashes["rsi"]})
+    approval_id = plugin_switch.submit_candidate(
+        conn, name="rsi_pullback", staging_dir=plugins_root / "_human",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS, now=fx.NOW)
+    acquired.clear()  # submit 経路のロックは対象外、approve 経路だけを見る
+    plugin_switch.approve_candidate(
+        conn, approval_id, decided_by="human_cli", now=fx.NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+    # 依存は alias "rsi" -> plugin "rsi" の 1 本、名前集合は
+    # {"rsi_pullback", "rsi"} (`_dependency_names` = [name, *deps])。
+    assert acquired == sorted({"rsi_pullback", "rsi"})
+
+
 def test_dependency_lock_blocks_a_concurrent_indicator_approval(tmp_path):
-    """P2': S の approve が握っている間、依存 indicator I の approve は
-    待たされる (相互排除が実際に成立している)。
+    """並行実行の相互排除 (順序 pin 自体は上の
+    `test_plugin_lock_order_for_approve_candidate_is_sorted_unique` が
+    spy で検証する): S の approve が握っている間、依存 indicator I の
+    approve は待たされる。
 
     `fcntl.flock(LOCK_EX)` は**同一プロセスでも別 fd 同士なら競合する**
     ので、スレッド 2 本で観測できる (`_plugin_lock` は fd を毎回開く)。"""
@@ -7149,7 +7232,7 @@ def test_bless_locks_are_all_released_after_candidate_changed(tmp_path,
 
 - [ ] **Step 4-4b: Run test to verify it fails**
 
-Run: `uv run pytest tests/plugin/test_switch_paths.py -k "plugin_locks or pin_mismatch_and_stays_pending or candidate_change" -q`
+Run: `uv run pytest tests/plugin/test_switch_paths.py -k "plugin_locks or sorted_unique or pin_mismatch_and_stays_pending or candidate_change" -q`
 Expected: FAIL — `AttributeError: module has no attribute '_plugin_locks'`
 
 - [ ] **Step 4-4c: Write minimal implementation**
@@ -7996,10 +8079,13 @@ git commit -m "feat(commands): list dependent strategies in indicator approval d
       `.versions` に新版なし、symlink 不変
 - [ ] **P2**: 再ロックで hash が変わり、approval / signals / `backtest_runs` の各行が
       新 hash で旧行と分離される。`find_matching_approved_metrics` は旧 hash を返す
-- [ ] **P2'**: S の approve 中に I2 の承認が待たされる (名前昇順ロック)。
-      観測は `test_dependency_lock_blocks_a_concurrent_indicator_approval`
-      (スレッド 2 本 + 別 fd の `flock` 競合)。
-      逆順で取っても deadlock しない
+- [ ] **P2'** (設計書 v1.3 §6 で置換): `_plugin_lock` の取得順序が
+      `approve_candidate` の実行経路で常に**名前昇順・重複なし**であることを
+      spy で pin する (順序が崩れる変異を検出) —
+      `test_plugin_lock_order_for_approve_candidate_is_sorted_unique`。
+      並行実行で S の approve 中に I2 の承認が待たされる事実 (相互排除の成立)
+      は `test_dependency_lock_blocks_a_concurrent_indicator_approval`
+      (スレッド 2 本 + 別 fd の `flock` 競合) が引き続き別途検証する
 - [ ] **P2''**: 同一 indicator を 2 alias で参照する strategy の approve で lock 取得が
       1 回。bless の事前読取 → lock 間の差し替えは `candidate_changed`、approval 行 0、
       `.versions` / symlink 不変、全 lock 解放
@@ -8337,6 +8423,10 @@ def test_lock_staging_deps_writes_pins_from_the_view(tmp_path):
     assert out["ok"] is True
     assert out["pins"] == {"rsi": "c" * 64}
     assert out["changed"] is True
+    # ユーザー裁定 2026-09-14 ⑥: 返り値の content_hash は lock 後に disk から
+    # 再計算した snapshot 値 (`check_candidate_snapshot` はこれを保証しない)。
+    from agentic_fx.plugin.loader import content_hash as _content_hash
+    assert out["content_hash"] == _content_hash(staging / "rsi_pullback")
     import yaml
     cfg = yaml.safe_load((staging / "rsi_pullback" / "config.yaml").read_text())
     assert cfg["indicators"]["rsi"]["pin"] == "c" * 64
@@ -8476,13 +8566,23 @@ def build_improve_staging_tooldefs(*, staging_dir: Path,
 
         # YAML の書き換えは `plugin/resolve.lock_config` 1 箇所に閉じる
         # (人間 CLI の `afx plugin lock` と同じ関数 — 設計書 §2.3)。
-        before, after = plugin_resolve.lock_config(candidate_dir, pins)
+        # snapshot 再取得 (ユーザー裁定 2026-09-14 ⑥): `check_candidate_snapshot`
+        # はファイル 3 本の存在・属性しか見ないため、lock 後に無条件で
+        # submit が通ると決め打ちしない。`lock_config` が書き込み後に
+        # 再計算して返す `new_hash` を正とし、`discover_one_with_reason`
+        # の再取得結果 (`relocked.content_hash`) と一致することを assert
+        # する (どちらも書き込み後の disk を独立に読む)。
+        before, after, new_hash = plugin_resolve.lock_config(candidate_dir, pins)
         relocked, relock_reason = plugin_loader.discover_one_with_reason(
             candidate_dir, name)
         if relocked is None:
             (candidate_dir / "config.yaml").write_text(before, encoding="utf-8")
             return {"error": f"loader_rejected_after_lock: {relock_reason}"}
+        assert relocked.content_hash == new_hash, (
+            "lock_config の snapshot 再取得値と discover の再取得値が食い違う"
+            f" ({new_hash} != {relocked.content_hash})")
         return {"ok": True, "pins": pins, "changed": after != before,
+                "content_hash": new_hash,
                 "diff": "".join(difflib.unified_diff(
                     before.splitlines(keepends=True),
                     after.splitlines(keepends=True),
@@ -9495,27 +9595,63 @@ prerequisite 3 indicator 配備後、deps=0 と deps=3 の同一 strategy で in
 > **蒸し返しの裁定は不要** — 設計レビュー codex 9 周 (r1〜r9、r9 は指摘 0) + opus 1 周は
 > 全件採用済みで設計書 §8〜§14 に確定記録済み。
 
-> 指揮者の既定選択 (裁定不要と判断、実装者が従うこと):
-> ① **validator の置き場** = 新規 `plugin/indicator_validate.py` (worker は `sandbox.py` を
-> import しない既存規律を守るため。設計書 §2.5 は「worker 内で呼ぶ」としか書いておらず
-> 置き場を指定していない) / ② **`PluginSession(resolved=None)` の既定** = indicator/signal
+> ユーザー裁定 (2026-09-14、指揮者の既定選択 8 件の採否): 指揮者が「裁定不要」と
+> 判断して先行実装していた既定選択 8 件のうち、**① と ⑥ は本裁定で変更**し、
+> **②③④⑤⑦⑧ は変更なしで採用** (「ユーザー裁定 2026-09-14 採用」)。
+>
+> ① **validator の置き場 (裁定で変更)** = **`src/agentic_fx/core/plugin_contract.py`**
+> (単一モジュール。指揮者の元案 `plugin/indicator_validate.py` は**採らない**)。
+> 根拠: `core/contracts.py` の前例 (全レイヤー共有の契約型を置く場所は `core/`)、
+> worker エントリが既に `agentic_fx.core.landlock` を import している、`core` は
+> 上位層 (`plugin/sandbox.py` 等) に依存しない性格のモジュールを置く場所である
+> (worker は `sandbox.py` を import しない既存規律を守るため、置き場自体を独立
+> モジュールにする必要があるのは元案と同じ)。モジュール docstring に「親
+> (`plugin/sandbox.py`) と sandbox worker (`plugin/worker.py`) の両方から
+> import される。`agentic_fx.plugin.*` を import してはならない」を明記する
+> (Step 2-1c)。プラン全体の `plugin/indicator_validate.py` /
+> `agentic_fx.plugin.indicator_validate` の参照 (import 文・File Structure・
+> Files・Interfaces・Step 本文・テストの import・変更履歴) は全数
+> `core/plugin_contract.py` / `agentic_fx.core.plugin_contract` に置換済み
+> (`grep -n "indicator_validate"` 残存 0)。テストファイルも
+> `tests/core/test_plugin_contract.py` (`tests/core/test_contracts.py` と
+> 同じ配置規約) に移す。
+> ② **`PluginSession(resolved=None)` の既定** = indicator/signal
 > セッション (`market_tools.run_plugin` / `signal_eval`) が `resolved` を持たないため
 > `None` 既定にし、`kind == "strategy"` かつ `resolved is None` を `SandboxError` にする
-> (F1 の `TypeError` は adapter の契約であってセッションの契約ではない) /
+> (F1 の `TypeError` は adapter の契約であってセッションの契約ではない)。
+> **ユーザー裁定 2026-09-14 採用 (変更なし)** /
 > ③ **`_KIND_PAYLOAD_KEYS["strategy"]`** = `("df", "params")` — `indicators`/`signals` は
 > worker が組み立てるので wire に載せない (既存の `call()` は余分なキーを無視するため、
-> `test_sandbox.py` の payload 縮小は挙動を変えない) / ④ **`cpu_sec` の plugin error 後** =
+> `test_sandbox.py` の payload 縮小は挙動を変えない)。**ユーザー裁定 2026-09-14 採用
+> (変更なし)** /
+> ④ **`cpu_sec` の plugin error 後** =
 > plugin コード自身の例外はセッションを `_dead` にしない既存契約があるため graceful
 > close が成立し **float** が入る。`None` は SIGKILL fallback と worker 未起動の 2 経路のみ。
 > **この解釈は「既定選択」ではなく指揮者へ申告済みの設計是正**であり、
 > **設計書 v1.2 の §6 C1 行で本文が改訂された** (opus r1 I10)。Step 2-4a の
-> `test_cpu_sec_is_float_after_plugin_error` が逐語で固定する /
+> `test_cpu_sec_is_float_after_plugin_error` が逐語で固定する。**ユーザー裁定
+> 2026-09-14 採用 (変更なし)** /
 > ⑤ **`same_modulo_pins` / `is_relock_transition` の引数型** = `Path` (plugin ディレクトリ)。
-> `noop_gate` が既に Path ベースで比較しているため / ⑥ **lock 後の候補の snapshot 検査** =
-> `check_candidate_snapshot` は 3 ファイルの存在と属性しか見ない (`gate_pytest.py:57-117`)
-> ため、`lock_config` の書き換え後も submit は通る (追加の snapshot 更新は不要) /
+> `noop_gate` が既に Path ベースで比較しているため。**ユーザー裁定 2026-09-14 採用
+> (変更なし)** /
+> ⑥ **lock 後の候補の snapshot 検査 (裁定で代替)** = 指揮者の元案「`check_candidate_snapshot`
+> は 3 ファイルの存在と属性しか見ない (`gate_pytest.py:57-117`) ため、`lock_config` の
+> 書き換え後も submit は通る (追加の snapshot 更新は不要)」は**不採用**。**代替**:
+> lock (`lock_config` / `afx plugin lock --from _human` / `lock_staging_deps`) の後は
+> **必ず snapshot (content_hash) を取り直す** — `check_candidate_snapshot` が
+> 「壊れるものはない」と主張する範囲 (ファイル 3 本の存在・属性) だけに依存しない。
+> `lock_config` は書き込み**後**に disk を独立に再読して `content_hash()` を計算し直し、
+> `(before_text, after_text, new_content_hash)` の 3-tuple を返す (Step 1-5)。呼び出し元
+> 3 箇所は resolve 時点の hash を使い回さずこの `new_content_hash` を使う: T1 の
+> `lock_config` 単体テスト (`new_hash == content_hash(...)` を独立 assert)、T3 の
+> `_plugin_lock` (`afx plugin lock --from _human`、`new_hash` を `discover_one_with_reason`
+> の再取得結果と突き合わせ assert)、T5a の `lock_staging_deps` (同様の assert + 応答
+> `content_hash` フィールドをテストで pin)。3 箇所とも discover の再取得値と
+> `lock_config` の `new_content_hash` が一致することを assert し、食い違えば
+> `lock_config` か配線のバグとして即座に落ちるようにする /
 > ⑦ **A1 / A1-b / decision sink の実行時間** = `pytest.mark.slow` を付け、
-> `uv run pytest -m "not slow"` で日常ループから外せるようにする (検収では必ず回す) /
+> `uv run pytest -m "not slow"` で日常ループから外せるようにする (検収では必ず回す)。
+> **ユーザー裁定 2026-09-14 採用 (変更なし)** /
 > ⑧ **`handshake_too_large` は正常入力から到達しない** — loader が通す最大は
 > deps 8 × params 8 KiB (+ strategy 側 8 KiB の上書き) で handshake ~136 KB に
 > しかならず、既定の `MAX_HANDSHAKE_BYTES = 262144` には届かない。よって
@@ -9524,11 +9660,13 @@ prerequisite 3 indicator 配備後、deps=0 と deps=3 の同一 strategy で in
 > 書いていたが、この算術は成り立たない**。指揮者へ申告し、**設計書 v1.2 の §6 R1 行で
 > 「定数 monkeypatch による境界試験。正常入力では到達不能 (8 alias × 8 KiB ≒ 136 KB
 > < 256 KiB) であることを注記」へ改訂済み** (opus r1 I10)。**この上限は「将来 params
-> 上限を緩めたときの最後の壁」として残す** — 実装から消してはならない。
+> 上限を緩めたときの最後の壁」として残す** — 実装から消してはならない。**ユーザー裁定
+> 2026-09-14 採用 (変更なし)**。
 
 ## 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-14 | v1.2 | **ユーザー裁定 (2026-09-14、設計書 v1.3 準拠) を反映、10 件。** ①**置き場変更**: validator を `plugin/indicator_validate.py` から `src/agentic_fx/core/plugin_contract.py` へ (全数置換、`grep -n "indicator_validate"` 残存 0、モジュール docstring に「親 (`plugin/sandbox.py`) と sandbox worker の両方から import される・`agentic_fx.plugin.*` を import してはならない」を追加、テストも `tests/core/test_plugin_contract.py` へ) / ②③④⑤⑦⑧ = 変更なしで採用 (「ユーザー裁定 2026-09-14 採用」と注記) / ⑥**代替**: lock (`lock_config` / `afx plugin lock --from _human` / `lock_staging_deps`) の後は必ず snapshot (content_hash) を取り直す — `lock_config` の戻り値を `(before_text, after_text)` から `(before_text, after_text, new_content_hash)` に変更し (Step 1-5)、T1 単体テスト・T3 `_plugin_lock`・T5a `lock_staging_deps` の 3 箇所で `discover_one_with_reason` の再取得結果と assert 突き合わせるコードを追加。**申し送り F2**: 設計書 §6 F2 を「warning 1 行 (reason 込み)、producer の plugin 一覧に含まれない」に緩和 (session cache 未登録は producer 一覧に無いことの帰結なので別途観測しない)。Step 3-2 のテスト docstring・T3 完了条件を同文言に統一。**申し送り P2'**: 設計書 §6 P2' の「逆順で取っても deadlock しない (順序 pin)」を「`_plugin_lock` の取得順序が常に名前昇順・重複なしであることを spy で pin する」に置換。T4b Step 4-4 に `test_plugin_lock_order_for_approve_candidate_is_sorted_unique` (spy 形、`approve_candidate` の実経路で `_plugin_lock` を monkeypatch し `sorted(set(names))` と一致を assert) を新規追加し、既存の並行ブロッキングテストは相互排除の実測として役割を分離。設計書の変更履歴に v1.3 行、本プランの見出しを v1.2 / 設計書準拠 v1.3 に更新。「指揮者の既定選択」ブロックを「ユーザー裁定 (2026-09-14、指揮者の既定選択 8 件の採否)」ブロックに改題 | ユーザー裁定 (2026-09-14、プラン末尾「指揮者の既定選択」8 件 + 申し送り 2 件の確定) | - |
 | 2026-09-14 | v1.1 | **着手前検証 (opus r1: Critical 6 / Important 12 / Minor 13) を全件是正。** **Critical**: C1 `prepare(conn=…)` → `wiring_envs.prepare_ctx(loop, now=)` (現物は `prepare(*, slot_key, now, on_ready)` → 3-tuple、15 箇所を置換) / C2 `improve_env` の `ImproveLoop(activity=, rag=)` 必須引数を追加 (`_FakeRag` は `tests/loops/conftest.py` から逐語転写) / C3 `ActivityLog.read_text()` は存在しない → `wiring_envs.activity_text` (tab 5 列の行形式を smoke test で固定、4 箇所を置換) / C4 `commands.Shell` → `commands.Commands` (必須 7 引数を `tests/test_commands.py` から転写)、`_dependent_strategies` の `self.root` → `self.plugins_root` (None は fail-soft) / C5 `_resolved()` に `pinned=True` / C6 `run_kind_gate(inventory=)` の既存 5 呼び出しの移行表を Step 4-1a に追加。 **Important**: I1 `build_intent_source` の patch 12 + 直接呼び出し 7 = 19 箇所の移行表を Step 3-1a に追加 (`**kwargs` 一律方針) / I2 移行全数性テストを正規表現 → AST (`ast.Call`) 走査に置換 (docstring 6 件の偽陽性を除去、期待 FAIL を 4 件に訂正) / I3 `wiring_envs` を T6b として独立 task 化 + 20 ビルダ全部に smoke test + Produces に逐語シグネチャ / I4 `_project_indicator_output` の入力契約を list に固定し fake を親再検証後の形へ / I5 F4 の `errors` / refusal streak は registry (`on_result`) 経由でしか増えないため registry 経由テストを追加 (`rpc_tooldefs` ビルダを新設) / I6 `improve_env` の conn factory を毎回新規接続に (handler の `conn.close()` でテスト conn が死ぬ) / I7 `latest_in_sample_metrics` に `variant`/`source`/`base_interval` を追加 / I8 `stage_switched_journal` の payload `content_hash` を新 version dir 実体から算出 + `advance_switch_journal(commit=True)` + T6b に reconcile→`decided` の smoke / I9 oracle の `df.empty: continue` を削除、`expected_eval_timestamps` の死に引数 `conn` を削除、adapter の sink 非呼び出し条件を逐語明記 / I10 設計書 §6 の C1 / R1 を **設計書 v1.2** で改訂 (指揮者へ申告済み) / I11 `_strip_forbidden` は denylist と実測確認 → src 変更不要、4 キーの pin テストへ / I12 `dict(counters.backtest_calls)` 比較 (正しい実装でも落ち、変異でも落ちる = 判別力ゼロ) を `backtest_calls["cand"] == 0` の直接 assert へ (段 0 M8 の観測点も同じに)。 **Minor M1〜M13**: `_current` の死に引数を `plugin_dir` に / `strip_pins` の `default=str` を比較専用と明記 / `_check_number` の型 allowlist (数値文字列拒否) / list 分岐の `pd.isna` 曖昧性 / Step 1-1c の `_check_json_safe` スタブを一意に確定 / `grid` 比較を in_sample 期間に + 週末非混入を直接 assert / テスト名 2 件の改名 / Step 2-2 と 2-3 を 1 Step に統合 / Step 4-3c の申し送りを 4-1c へ実際に移動 / 行番号再取得の指示を Global Constraints へ / oracle のメモ化 + `slow` マーク / T3 の Consumes から `wiring_envs` を除去 / `_unresolved_after_switch` の TOCTOU 窓をコメントで明記。 **task 分割 (観点 7)**: T6 → T6a / T6b、T4 → T4a / T4b、T5 → T5a / T5b の 9 task に。依存グラフと worktree 並列可否 (T3 ∥ T6b) を更新。 **fixture の実測 probe**: `tmp/plan-indicator-wiring/probe_fixture.py` で設計書 §6 の生成式を実行 — in_sample の 1h Wilder RSI(14) は **min 27.2159 / max 78.4162、long 52 + short 50 = 102 opens、先頭 14 本 NaN で index 14 から値**。`opens >= 30` (`EVALUABLE_MIN_TRADES`) を満たすため**設計書 §6 の生成式の是正は不要**。 **自己レビューで新規追記コードも現物照合**: `ToolRegistry` はキーワード専用 `__init__` + `register_all` + `execute(name, args, allowed)` (`call` は存在しない) / `approvals.get()` は存在しない (SQL で status を読む) / journal のテーブル名は `plugin_switch_journal` / `reconcile_switch_journals` は既に `settings` を取る、へ是正。 **T4a Step 4-2 が `wiring_envs.switch_env` を使うため T4a の着手条件に T6b を追加**し依存グラフを訂正 | プラン着手前検証 `tmp/plan-indicator-wiring/opus-plan-r1.md` (opus r1) | - |
-| 2026-09-14 | v1 | 起案。設計書 v1.1 を実装プランへ写す。T1 (loader 新キー + `plugin/resolve.py` + `approved_plugins` 二相 + 全 caller 移行) / T2 (`indicator_validate.py` + worker の同居実行 + `PluginSession(resolved=)` の containment 検査 + graceful close/`cpu_sec` + `check_source` の共有状態遮断 + standalone 系列 wire) / T6 (`rsi_indicator` 系列化 + 新規 `rsi_pullback` + `tests/fixtures/indicator_wiring.py` の決定論 fixture と独立参照実装 + 設計書契約文) / T3 (adapter の `resolved` 必須 + `decision_sink` + service/producer/trade worker/人間 CLI の配線 + `afx plugin lock --from _human`) / T4 (`GateOutcome.verdict_kind="indicator_unresolved"` + `_run_full_gate` の固定 ValueError と `outputs_required` + A1/A1-b E2E + ロック集合と approve 時再解決と bless TOCTOU + payload `indicator_deps` + noop の pin 除去比較と再ロック例外 + 質検査除外 + reconcile の revert + 承認詳細 2 欄) / T5 (`ImproveRunContext.inventory`/`inventory_view` + `list_deployed_plugins`/`lock_staging_deps` + `release_backtest` と `started:false` + commit gate の解決 + `backtest_cpu` activity + prompt inventory) の 6 task に分割。実行順序 T1→T2→T6→T3→T4→T5、T6 のみ T2 後に worktree 並列可 (T3 前にマージ必須)。Global Constraints に固定文言語彙一覧・上限 4 種・遮断 8・実 DB 不可触・`run_kind_gate` 非送出・スキーマ変更ゼロを明記。レビュー段 (段 0 の最優先 8 件を含む)・完了条件 (受入 33 ID)・進捗表・指揮者の既定選択 8 件を追加。着手前検証で 10 件是正 — `handshake_too_large` の到達不能を定数 monkeypatch 境界に置換 / A1'' の `.versions` 直書きを正規再配備 (`_redeploy_rsi_variant`) に置換 / Step 3-1c の呼び出し元に `improve_loop._run_strategy_gate` を追加し `_validate_kind(resolved=None)` を任意化 / A1 を `floor_mode="warn"` にし T6 に `opens >= EVALUABLE_MIN_TRADES` の先行 pin を追加 / P2' の並行ロック待ちテストを新規追加 / 非 str キー YAML ケースを削除し `indicator_ref_duplicate_alias` 到達不能を L1 に明記 / `lock_config(candidate_dir, pins)` に変更し `lock_staging_deps` の YAML 書き換え重複を解消 / `deploy_approved` の kind を config.yaml 由来に / Step 4-3c の「実測で決める」記述を 4-1c の具体指示へ移動 / 残存 `...` を実コードに展開 | 設計書 `2026-09-14-indicator-consumption-wiring-design.md` v1.1 (実装着手可、ユーザー裁定 U1〜U6 反映済み) を writing-plans 規約の実装プランへ写す | - |
+| 2026-09-14 | v1 | 起案。設計書 v1.1 を実装プランへ写す。T1 (loader 新キー + `plugin/resolve.py` + `approved_plugins` 二相 + 全 caller 移行) / T2 (`core/plugin_contract.py` + worker の同居実行 + `PluginSession(resolved=)` の containment 検査 + graceful close/`cpu_sec` + `check_source` の共有状態遮断 + standalone 系列 wire) / T6 (`rsi_indicator` 系列化 + 新規 `rsi_pullback` + `tests/fixtures/indicator_wiring.py` の決定論 fixture と独立参照実装 + 設計書契約文) / T3 (adapter の `resolved` 必須 + `decision_sink` + service/producer/trade worker/人間 CLI の配線 + `afx plugin lock --from _human`) / T4 (`GateOutcome.verdict_kind="indicator_unresolved"` + `_run_full_gate` の固定 ValueError と `outputs_required` + A1/A1-b E2E + ロック集合と approve 時再解決と bless TOCTOU + payload `indicator_deps` + noop の pin 除去比較と再ロック例外 + 質検査除外 + reconcile の revert + 承認詳細 2 欄) / T5 (`ImproveRunContext.inventory`/`inventory_view` + `list_deployed_plugins`/`lock_staging_deps` + `release_backtest` と `started:false` + commit gate の解決 + `backtest_cpu` activity + prompt inventory) の 6 task に分割。実行順序 T1→T2→T6→T3→T4→T5、T6 のみ T2 後に worktree 並列可 (T3 前にマージ必須)。Global Constraints に固定文言語彙一覧・上限 4 種・遮断 8・実 DB 不可触・`run_kind_gate` 非送出・スキーマ変更ゼロを明記。レビュー段 (段 0 の最優先 8 件を含む)・完了条件 (受入 33 ID)・進捗表・指揮者の既定選択 8 件を追加。着手前検証で 10 件是正 — `handshake_too_large` の到達不能を定数 monkeypatch 境界に置換 / A1'' の `.versions` 直書きを正規再配備 (`_redeploy_rsi_variant`) に置換 / Step 3-1c の呼び出し元に `improve_loop._run_strategy_gate` を追加し `_validate_kind(resolved=None)` を任意化 / A1 を `floor_mode="warn"` にし T6 に `opens >= EVALUABLE_MIN_TRADES` の先行 pin を追加 / P2' の並行ロック待ちテストを新規追加 / 非 str キー YAML ケースを削除し `indicator_ref_duplicate_alias` 到達不能を L1 に明記 / `lock_config(candidate_dir, pins)` に変更し `lock_staging_deps` の YAML 書き換え重複を解消 / `deploy_approved` の kind を config.yaml 由来に / Step 4-3c の「実測で決める」記述を 4-1c の具体指示へ移動 / 残存 `...` を実コードに展開 | 設計書 `2026-09-14-indicator-consumption-wiring-design.md` v1.1 (実装着手可、ユーザー裁定 U1〜U6 反映済み) を writing-plans 規約の実装プランへ写す | - |
