@@ -136,13 +136,11 @@ def test_afx_approval_detail_shows_reason_for_rejected(tmp_path):
 
 
 def test_backlog_table_does_not_verbatim_render_arbitrary_last_result(tmp_path):
-    """F5-5 (codex r1 是正、2026-09-13): [unprofitable-note-hygiene] 以降
-    `_backlog_table` は `last_result` を判定して `origin` 列へ写像する
-    (完全一致 `origin:unprofitable` のみ)。よって「`_history_table` が
-    `last_result` をレンダする唯一の経路」という旧名称・説明はもう成立
-    しない。ここで pin するのは「backlog の任意の `last_result` は逐語
-    表示せず、許可された完全一致だけを `origin` に写像する」という契約 —
-    任意文字列のセンチネル (`origin:unprofitable` と一致しない) は本文に
+    """F5-5 (codex r1 是正、2026-09-13 / v2.0 で説明更新): backlog 表・
+    note 表は `last_result` を一切レンダしない。`origin` 列は専用列
+    `origin_outcome` の固定値 (`unprofitable`) だけを表示する (設計書
+    v2.0 §2-3/§2-5)。ここで pin するのは「backlog の任意の `last_result`
+    が本文に逐語で出ない」という契約 — 任意文字列のセンチネルが本文に
     出ないことを固定する (遮断 8 の維持)。"""
     loop = ImproveLoop.__new__(ImproveLoop)
     loop._settings = SETTINGS
