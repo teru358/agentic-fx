@@ -87,6 +87,12 @@ def _report_artifact(proposal_kind: str, *, title: str = "test proposal",
     }
 
 
+_MIN3_TEST_PY = (
+    "def test_placeholder_a():\n    pass\n\n\n"
+    "def test_placeholder_b():\n    pass\n\n\n"
+    "def test_placeholder_c():\n    pass\n")
+
+
 def _write_staging_plugin(staging_dir: Path, name: str,
                           plugin_py: str, config_yaml: str,
                           test_plugin: str) -> Path:
@@ -111,6 +117,7 @@ kind: indicator
 pairs: [USDJPY]
 timeframe: 1h
 params: {}
+outputs: [value]
 """
 _PASSING_INDICATOR_TEST = """
 def test_compute_returns_value():
@@ -1949,3 +1956,126 @@ def test_started_true_is_present_on_success(tmp_path):
     out = ctx.rpc_handlers["run_backtest"](
         {"name": "rsi_pullback", "pair": "USDJPY"})
     assert out["started"] is True
+
+
+def test_commit_gate_reports_indicator_unresolved(tmp_path):
+    """F5: `gate_failed reason=indicator_unresolved`、
+    `last_result == "indicator_unresolved"` (**完全一致**)、gate 行 0、
+    approval 行 0。alias/cause は activity にだけ出る (遮断 8)。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    # [indicator-consumption-wiring] T5b 逸脱是正: プラン本文は
+    # `fx.seed_history(conn)` を欠いていた — `_run_strategy_gate` は
+    # 資格判定に入る前に `run_in_sample` が USDJPY の 1m 履歴を要求し、
+    # 無いと `NoHistoryError` → `gate_failed:backtest_data_unavailable:...`
+    # になって resolve 判別子 (`indicator_unresolved`) まで到達しない
+    # (実測で確認)。
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    cand = fx.write_rsi_pullback(ctx.staging_dir, pins=None)   # unpinned → require で落ちる
+    # [indicator-consumption-wiring] T5b 逸脱是正: `fx.write_rsi_pullback` の
+    # 既定 test_plugin.py はプレースホルダ 1 本のみで
+    # `settings.improve.gate.min_test_functions=3` (`_run_plugin_gate` の
+    # pytest gate) を満たさず、resolve 到達前に
+    # `self_test_too_thin_collected:1<3` で落ちる (実測で確認)。commit()
+    # 経由の gate は `run_backtest_handler` を経由しない別経路のため、
+    # このテストで初めて pytest gate を通す必要がある — 3 本の no-op
+    # test に差し替える。
+    (cand / "test_plugin.py").write_text(_MIN3_TEST_PY)
+    result = _completed_result(_plugin_artifact("rsi_pullback", kind="strategy"))
+
+    loop.commit(mission=_mission(ctx), ctx=ctx, result=result, now=fx.NOW)
+
+    row = conn.execute(
+        "SELECT last_result FROM improvement_backlog ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row["last_result"] == "indicator_unresolved"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 1  # rsi のみ
+    assert conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == 0
+    # [indicator-consumption-wiring] T5b 逸脱是正 (T4b と同型): `ActivityLog.
+    # write` は event/summary をタブ区切りの別列に書くため、単一文字列
+    # `"gate_failed mission="` の in 判定は実装のタブ区切りと必ず食い違う
+    # (`_activity_text` docstring の指示どおり event と summary を分けて
+    # 見る)。
+    text = _activity_text(activity)
+    assert "gate_failed" in text
+    assert "reason=indicator_unresolved alias=rsi cause=unpinned" in text
+
+
+def test_last_result_never_carries_alias_or_reason(tmp_path):
+    """遮断 8: `last_result` は固定文言のみ — alias も cause も混ぜない。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    # [indicator-consumption-wiring] T5b 逸脱是正: 上のテストと同じ理由
+    # (`fx.seed_history` が無いと resolve より前の `NoHistoryError` gate で
+    # 落ち、本テストが検証したい indicator_unresolved 経路を通らない)。
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    cand = fx.write_rsi_pullback(ctx.staging_dir, pins=None)
+    (cand / "test_plugin.py").write_text(_MIN3_TEST_PY)
+    loop.commit(mission=_mission(ctx), ctx=ctx,
+                result=_completed_result(
+                    _plugin_artifact("rsi_pullback", kind="strategy")),
+                now=fx.NOW)
+    row = conn.execute(
+        "SELECT last_result FROM improvement_backlog ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert "rsi" not in row["last_result"]
+    assert "unpinned" not in row["last_result"]
+    assert "holdout" not in row["last_result"]
+
+
+def test_commit_gate_reports_outputs_required_for_indicator_without_outputs(
+        tmp_path):
+    """U4a (改善 commit gate): 固定文言 `outputs_required`、approval 行 0。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    d = ctx.staging_dir / "legacy_ind"
+    d.mkdir(parents=True)
+    (d / "plugin.py").write_text(
+        "def compute(df, params):\n    return {'rsi_14': 1.0}\n")
+    (d / "config.yaml").write_text("kind: indicator\nparams:\n  period: 14\n")
+    (d / "test_plugin.py").write_text(_MIN3_TEST_PY)
+    result = _completed_result(_plugin_artifact("legacy_ind", kind="indicator"))
+
+    loop.commit(mission=_mission(ctx), ctx=ctx, result=result, now=fx.NOW)
+
+    row = conn.execute(
+        "SELECT last_result FROM improvement_backlog ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row["last_result"] == "outputs_required"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 0
+
+
+def test_pinned_candidate_reaches_the_approval_payload_with_indicator_deps(
+        tmp_path):
+    """P3 (改善経路): 改善 commit の payload にも `indicator_deps` が載る。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    cand = fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
+    (cand / "test_plugin.py").write_text(_MIN3_TEST_PY)
+    loop.commit(mission=_mission(ctx), ctx=ctx,
+                result=_completed_result(
+                    _plugin_artifact("rsi_pullback", kind="strategy")),
+                now=fx.NOW)
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE "
+        "json_extract(payload_json,'$.name')='rsi_pullback'"
+    ).fetchone()["payload_json"])
+    assert payload["indicator_deps"] == {
+        "rsi": {"plugin": "rsi", "content_hash": hashes["rsi"],
+                "params": {"period": fx.RSI_PERIOD}}}

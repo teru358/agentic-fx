@@ -1407,17 +1407,6 @@ class ImproveLoop:
             conn.rollback()
             raise
 
-    def _inventory_for_gate(self, conn):
-        """[indicator-consumption-wiring] T4b Step 4-6c (codex plan r2 束3
-        Critical): `ctx.inventory` が (本 task の時点では常に) `None` の
-        ときの暫定フォールバック — `approved_plugins` を都度呼ぶだけ。
-        `_run_plugin_gate` の呼び出し元 (`commit()`) と
-        `_check_duplicate_metrics_for_approval` の呼び出し元
-        (`_finalize_success`) の両方が共有する。T5a Step 5-1 で
-        `ctx.inventory` が実配線された後は使われなくなる。"""
-        return approved_plugins(conn, self._root / "plugins",
-                                settings=self._settings)
-
     def _run_plugin_gate(self, plugin_dir: Path, *, name: str,
                          source_snapshot_dir: Path,
                          inventory=None) -> _PluginGateVerdict:
@@ -1503,7 +1492,7 @@ class ImproveLoop:
 
     def _run_strategy_gate(self, conn, *, name, pairs, timeframe, content_hash,
                            now, meta, resolved, kind="strategy",
-                           record_fn=None):
+                           record_fn=None, inventory=None):
         # [profitability-floor] T1 Step 1-3 (2026-09-12、設計書 §3 T1-b):
         # 改善ループは常に `floor_mode="enforce"` (in_sample 段の不合格で
         # holdout を回さず即終端 — evaluator の既定と同じ値だが、この
@@ -1511,11 +1500,13 @@ class ImproveLoop:
         #
         # [indicator-consumption-wiring] T3 Step 3-1 (5 番目): `resolved`
         # は呼び出し元が composition root で解決したものをそのまま中継する
-        # (再解決しない)。
+        # (再解決しない)。T5b Step 5-5: `inventory` も同様に中継する
+        # (`find_noop_copy`/再ロック判定が読む)。
         return evaluate_strategy_adoption_gate(
             conn, name=name, pairs=pairs, timeframe=timeframe,
             content_hash=content_hash, now=now, settings=self._settings,
             meta=meta, kind=kind, record_fn=record_fn, floor_mode="enforce",
+            inventory=inventory,
             resolved=resolved)
 
     def _build_approval_payload(self, conn, *, name, kind, content_hash,
@@ -2167,19 +2158,19 @@ class ImproveLoop:
                 # の commit 後のスナップショットを読む — bare SELECT だった
                 # 旧位置 (`commit()` 内、gate 通過直後) の check-then-insert
                 # レースを閉じる。
-                # [indicator-consumption-wiring] codex plan r2 束3
-                # Critical: `ctx.inventory` は本 task の時点では常に
-                # 既定値 `None` (実配線は T5a Step 5-1) — 直渡しすると
-                # `_deployed_dir_for(name, inventory=None)` が
-                # `AttributeError` になる。`None` フォールバックを挟む。
+                # [indicator-consumption-wiring] T5b Step 5-5c: T5a 完了後は
+                # `prepare()` が常に非空の `ctx.inventory` を書き込むため
+                # `ctx.inventory` を直渡しする (`_inventory_for_gate`
+                # フォールバックは削除 — 到達不能な死にコードだった)。
                 # `ctx is None` はテスト専用の直接呼び出し経路
-                # (`approval_payload["kind"] != "strategy"` のケースしか
-                # 使っていないため `staging_dir=None` でも安全)。
+                # (`_finalize_success` を単体で呼ぶ既存テストが `ctx` を
+                # 省略する) — その場合だけ空 inventory を作る
+                # (`_empty_inventory_result`、`staging_dir=None` でも安全)。
                 demotion = self._check_duplicate_metrics_for_approval(
                     conn, approval_payload,
-                    inventory=(ctx.inventory
-                              if ctx is not None and ctx.inventory is not None
-                              else self._inventory_for_gate(conn)),
+                    inventory=(ctx.inventory if ctx is not None
+                              else _empty_inventory_result(
+                                  self._root / "plugins")),
                     staging_dir=(ctx.staging_dir if ctx is not None else None))
                 if demotion is not None:
                     conn.rollback()
@@ -2387,8 +2378,10 @@ class ImproveLoop:
                 gate_verdict = self._run_plugin_gate(                  # 手順3
                     candidate_dir, name=artifact["name"],
                     source_snapshot_dir=ctx.source_snapshot_dir,
-                    inventory=(ctx.inventory if ctx.inventory is not None
-                              else self._inventory_for_gate(conn)))
+                    # [indicator-consumption-wiring] T5b Step 5-5c:
+                    # `commit()` の `ctx` は常に実 `ImproveRunContext`
+                    # (`_inventory_for_gate` フォールバックは撤去)。
+                    inventory=ctx.inventory)
                 if not gate_verdict.passed:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -2423,9 +2416,36 @@ class ImproveLoop:
                         reason=f"gate_failed:kind_unsupported:{kind}", now=now,
                         tool_calls=tool_calls)
                     return
+                # [indicator-consumption-wiring] U4a: kind=indicator の
+                # `outputs` 宣言は新規承認で必須。固定文言のみ
+                # (`last_result` にそのまま流れる — 遮断 8)。
+                if kind == "indicator" and candidate_meta.outputs is None:
+                    self._finalize_gate_failed(
+                        conn, ctx=ctx, backlog_id=selection.backlog_id,
+                        reason="outputs_required", now=now,
+                        tool_calls=tool_calls)
+                    return
                 if kind == "strategy":
+                    # [indicator-consumption-wiring] §2.8: 解決は commit
+                    # gate でも `require` (提出物は必ず pinned)。**alias と
+                    # cause は activity にだけ出す** — `last_result` は
+                    # 固定文言 `indicator_unresolved` のみ (遮断 8)。
+                    from agentic_fx.plugin.resolve import (
+                        IndicatorResolutionError, resolve_indicator_deps,
+                    )
                     try:
-                        from agentic_fx.plugin.resolve import ResolvedIndicatorSet
+                        resolved = resolve_indicator_deps(
+                            candidate_meta, ctx.inventory.inventory,
+                            settings=self._settings, pin_mode="require")
+                    except IndicatorResolutionError as exc:
+                        self._finalize_gate_failed(
+                            conn, ctx=ctx, backlog_id=selection.backlog_id,
+                            reason="indicator_unresolved", now=now,
+                            tool_calls=tool_calls,
+                            activity_extra=(f" alias={exc.alias or '-'} "
+                                            f"cause={exc.reason}"))
+                        return
+                    try:
                         strategy_verdict = self._run_strategy_gate(     # 手順4
                             conn, name=artifact["name"],
                             pairs=self._read_candidate_pairs(candidate_dir),
@@ -2433,11 +2453,7 @@ class ImproveLoop:
                             content_hash=gate_verdict.content_hash, now=now,
                             meta=candidate_meta, kind=kind,
                             record_fn=gate_rows.append,
-                            # [indicator-consumption-wiring] T3 暫定
-                            # (T5b Step 5-5 で `ImproveRunContext.inventory`
-                            # からの `require` 解決に置き換える)。
-                            resolved=ResolvedIndicatorSet.empty(
-                                self._root / "plugins"))
+                            resolved=resolved, inventory=ctx.inventory)
                     except holdout.NoHistoryError as exc:
                         # Missing market history is an expected gate verdict;
                         # unrelated ValueErrors still abort the commit.
@@ -2512,7 +2528,12 @@ class ImproveLoop:
                     ctx_ledger=ctx.ledger, mission_id=ctx.mission_id,
                     backlog_id=selection.backlog_id,
                     candidate_origin="staging", candidate_path=candidate_path,
-                    gate_metrics=gate_metrics, output=output, now=now)
+                    gate_metrics=gate_metrics, output=output, now=now,
+                    # [indicator-consumption-wiring] T5b Step 5-5c:
+                    # `resolved` は strategy 分岐でのみ束縛される
+                    # (indicator 候補には依存解決が無い、既定 None →
+                    # `indicator_deps` は `{}`)。
+                    resolved=(resolved if kind == "strategy" else None))
                 # /code-review 2 周目 CR1 是正 (2026-09-12): 質検査
                 # (approval-quality 設計書 §A) は check-then-insert のまま
                 # ここ (bare `SELECT` が `_finalize_success` の
@@ -3041,12 +3062,18 @@ class ImproveLoop:
     def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now,
                               gate_rows=(), tool_calls: int | None = None,
                               mission_outcome: str = "gate_failed",
-                              report_detail: str = "") -> None:
+                              report_detail: str = "",
+                              activity_extra: str = "") -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
         `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
         渡す)。承認申請は出さないため mission は `completed` で終端
         (取引は止めない — R8)。staging を削除し、台帳は `DISCARDED`。
+
+        [indicator-consumption-wiring] §2.8: `activity_extra` は activity 行
+        にだけ足す補足 (`alias=<alias> cause=<reason>`)。**`last_result` /
+        `report_detail` には絶対に流さない** — `reason` (固定文言) だけが
+        `improvement_backlog.last_result` へ行く (遮断 8)。
 
         [profitability-floor] T1 Step 1-3 (2026-09-12、設計書 §3 T1-b、
         codex I6): `mission_outcome` は正常分岐 (report 作成成功) の
@@ -3087,7 +3114,7 @@ class ImproveLoop:
         self._activity.write(
             Category.IMPROVE, "gate_failed",
             f"mission={ctx.mission_id} reason={reason}{floor_suffix}"
-            f"{_tool_calls_suffix(tool_calls)}")
+            f"{activity_extra}{_tool_calls_suffix(tool_calls)}")
         body_md = (
             f"# Improve Mission {ctx.mission_id} — gate failed\n\n"
             f"reason: `{reason}`\n\nNo approval request was produced by "

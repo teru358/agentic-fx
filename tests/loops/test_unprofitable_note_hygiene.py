@@ -81,7 +81,7 @@ def _install_floor_strategy_gate(monkeypatch, loop, *, holdout_metrics):
             passed=True, content_hash="c" * 64, artifact_hash="a" * 64))
     monkeypatch.setattr(
         "agentic_fx.plugin.loader._discover_one",
-        lambda *a, **kw: SimpleNamespace(max_bars=100))
+        lambda *a, **kw: SimpleNamespace(max_bars=100, indicators=()))
 
     def fake_strategy_gate(*a, **kw):
         kw["record_fn"](_gate_row(scope="in_sample", pf=0.5))
@@ -252,8 +252,12 @@ def _write_indicator_candidate(staging_dir, name: str) -> None:
     candidate_dir.mkdir(parents=True, exist_ok=True)
     (candidate_dir / "plugin.py").write_text(
         "def compute(df, params):\n    return {'v': 1.0}\n")
+    # [indicator-consumption-wiring] T5b 逸脱是正: U4a により
+    # `outputs:` 未宣言の indicator 候補は `outputs_required` で拒否される
+    # ようになった (実測で確認)。
     (candidate_dir / "config.yaml").write_text(
-        "kind: indicator\npairs: ['USDJPY']\ntimeframe: '1h'\n")
+        "kind: indicator\npairs: ['USDJPY']\ntimeframe: '1h'\n"
+        "outputs: ['v']\n")
     (candidate_dir / "test_plugin.py").write_text(
         "def test_x():\n    pass\n"
         "def test_y():\n    pass\n"

@@ -24,8 +24,15 @@ def _write_candidate(staging_dir: Path, name: str) -> None:
     candidate_dir.mkdir(parents=True, exist_ok=True)
     (candidate_dir / "plugin.py").write_text(
         "def compute(df, params):\n    return {'v': 1.0}\n")
+    # [indicator-consumption-wiring] T5b 逸脱是正: U4a (改善 commit gate)
+    # は `kind=='indicator'` かつ `meta.outputs is None` を固定
+    # `outputs_required` で拒否するようになった — この汎用ヘルパの happy
+    # path 候補は `outputs:` を宣言していなかったため退行した
+    # (実測で確認)。既存の `find_matching_approved_metrics` 等は影響を
+    # 受けないため、単に `outputs: ['v']` を足す。
     (candidate_dir / "config.yaml").write_text(
-        "kind: indicator\npairs: ['USDJPY']\ntimeframe: '1h'\n")
+        "kind: indicator\npairs: ['USDJPY']\ntimeframe: '1h'\n"
+        "outputs: ['v']\n")
     (candidate_dir / "test_plugin.py").write_text(
         "def test_x():\n    pass\n"
         "def test_y():\n    pass\n"
@@ -181,7 +188,7 @@ def test_commit_signal_candidate_is_gate_failed_without_approval(
         "selection_rationale": "r"}, transcript=[])
     gate_verdict = SimpleNamespace(
         passed=True, content_hash="c" * 64, artifact_hash="a" * 64)
-    candidate_meta = SimpleNamespace(max_bars=100)
+    candidate_meta = SimpleNamespace(max_bars=100, indicators=())
     monkeypatch.setattr(
         loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
     monkeypatch.setattr(
@@ -225,7 +232,7 @@ def test_commit_strategy_missing_history_becomes_gate_failed(
         "selection_rationale": "r"}, transcript=[])
     gate_verdict = SimpleNamespace(
         passed=True, content_hash="c" * 64, artifact_hash="a" * 64)
-    meta = SimpleNamespace(max_bars=100)
+    meta = SimpleNamespace(max_bars=100, indicators=())
     monkeypatch.setattr(
         loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
     monkeypatch.setattr(
@@ -507,7 +514,8 @@ def test_commit_real_strategy_gate_missing_history_becomes_gate_failed(
         passed=True, content_hash="c" * 64, artifact_hash="a" * 64)
     meta = SimpleNamespace(
         name="myst", kind="strategy", timeframe="1h",
-        content_hash="c" * 64, pairs=("EURUSD",), max_bars=100)
+        content_hash="c" * 64, pairs=("EURUSD",), max_bars=100,
+        indicators=())
     monkeypatch.setattr(
         loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
     monkeypatch.setattr(
@@ -555,7 +563,7 @@ def test_commit_strategy_other_valueerror_still_propagates(
         "selection_rationale": "r"}, transcript=[])
     gate_verdict = SimpleNamespace(
         passed=True, content_hash="c" * 64, artifact_hash="a" * 64)
-    meta = SimpleNamespace(max_bars=100)
+    meta = SimpleNamespace(max_bars=100, indicators=())
     monkeypatch.setattr(
         loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
     monkeypatch.setattr(

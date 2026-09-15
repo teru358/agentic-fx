@@ -526,38 +526,9 @@ def test_relock_detection_uses_the_real_dir_helpers(tmp_path):
         conn, payload, inventory=inventory, staging_dir=staging) is None
 
 
-def test_finalize_success_falls_back_to_inventory_for_gate_when_ctx_inventory_is_none(
-        tmp_path):
-    """codex plan r2 束3 Critical: `ImproveRunContext.inventory` は本 task
-    の時点では常に既定値 `None` — `_finalize_success` が `ctx.inventory`
-    をそのまま渡すと strategy kind の承認で `AttributeError` になる。
-    `self._inventory_for_gate(conn)` へフォールバックすれば
-    `ctx.inventory is None` のままでも P5 (質検査) が完走すること。"""
-    from tests.fixtures.wiring_envs import synthetic_ctx
-    loop, conn, plugins_root = _loop_env(tmp_path)
-    fx.write_indicator(plugins_root, "rsi")
-    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
-    fx.write_rsi_pullback(plugins_root, pins={"rsi": hashes["rsi"]})
-    _approve_plain_strategy(conn, plugins_root, "rsi_pullback")
-    fx.write_rsi_pullback(loop_staging(loop), pins={"rsi": hashes["rsi"]})
-    _seed_approved_candidate_metrics(conn, pair="USDJPY", trades=40, pf=1.5,
-                                     avg_r=0.2)
-    payload = {"kind": "strategy", "name": "rsi_pullback",
-               "content_hash": "c" * 64, "eval_source": "dukascopy",
-               "base_interval": "5m",
-               "in_sample": {"USDJPY": {"trades": 40, "pf": 1.5, "avg_r": 0.2}}}
-    # [indicator-consumption-wiring] T5a Step 5-1 逸脱申告: `synthetic_ctx`
-    # は T5a Step 5-1c (codex plan r1 C4) で「空だが非 None の
-    # `InventoryBuildResult`」を返すよう更新された (T5b の consumer が
-    # `ctx.inventory.inventory` を読むための必須変更)。本テストの意図
-    # (`ctx.inventory is None` のときの `_finalize_success` フォールバック
-    # を検証する) を保つため、`dataclasses.replace` で `inventory=None`
-    # を明示的に上書きする。
-    import dataclasses
-    ctx = dataclasses.replace(synthetic_ctx(loop, conn, plugins_root.parent),
-                              inventory=None)
-    assert ctx.inventory is None
-    demotion = loop._finalize_success(
-        conn, mission_id=1, run_id=1, backlog_id=1, slot_key=None,
-        approval_payload=payload, now=fx.NOW, ctx=ctx)
-    assert demotion is not None   # AttributeError にならず質検査まで完走した
+# [indicator-consumption-wiring] T5b Step 5-5c: T4b の
+# `test_finalize_success_falls_back_to_inventory_for_gate_when_ctx_
+# inventory_is_none` はここに存在したが、`_inventory_for_gate` フォール
+# バック分岐ごと削除した (プラン本文どおり — T5a 完了以降は `prepare()` が
+# 常に非空の `ctx.inventory` を書き込むため、フォールバック分岐は恒久的に
+# 到達不能な死にコードになっていた)。
