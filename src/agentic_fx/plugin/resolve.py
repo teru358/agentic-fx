@@ -136,8 +136,55 @@ class InventoryBuildResult:
     rejected_strategies: tuple[RejectedStrategy, ...]
 
 
+def _merge_params(base: dict, override: dict) -> dict:
+    """indicator の params の deep copy に strategy 側を 1 段上書き
+    (設計書 §2.3)。base は絶対に書き換えない。"""
+    merged = json.loads(json.dumps(base))   # deep copy (JSON-safe が前提)
+    merged.update(json.loads(json.dumps(override)))
+    return merged
+
+
 def resolve_indicator_deps(meta: PluginMeta, inventory: ApprovedInventory, *,
                            settings, pin_mode: PinMode) -> ResolvedIndicatorSet:
-    """[indicator-consumption-wiring] T1 Step 1-3 の骨格スタブ。本実装は
-    Step 1-4 で入れる。"""
-    raise NotImplementedError
+    """`meta.indicators` を `inventory` に対して解決する。失敗は
+    `IndicatorResolutionError(alias, reason)` — reason 語彙は設計書 §2.3 の
+    8 語のみ。`max_bars` は「渡す履歴の最大本数」であって必要 warmup 本数
+    ではないので、大小比較による拒否は入れない (codex r4 I3)。"""
+    items: list[ResolvedIndicator] = []
+    for ref in meta.indicators:
+        dep = inventory.by_name(ref.plugin)
+        if dep is None:
+            raise IndicatorResolutionError(ref.alias, "not_found")
+        if dep.kind != "indicator":
+            raise IndicatorResolutionError(ref.alias, "not_indicator")
+        if dep.outputs is None:
+            raise IndicatorResolutionError(ref.alias, "outputs_undeclared")
+        if dep.max_bars > settings.plugin.max_bars_limit:
+            raise IndicatorResolutionError(ref.alias, "over_max_bars_limit")
+        if pin_mode != "ignore":
+            if ref.pin is None:
+                if pin_mode == "require":
+                    raise IndicatorResolutionError(ref.alias, "unpinned")
+            elif ref.pin != dep.content_hash:
+                raise IndicatorResolutionError(ref.alias, "pin_mismatch")
+        try:
+            merged = _merge_params(dep.params, ref.params)
+            json.dumps(merged, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise IndicatorResolutionError(
+                ref.alias, "params_not_json_safe") from exc
+        items.append(ResolvedIndicator(
+            alias=ref.alias, plugin_name=dep.name,
+            plugin_py=dep.path / "plugin.py", content_hash=dep.content_hash,
+            params=freeze_params(merged), max_bars=dep.max_bars,
+            outputs=dep.outputs,
+            pinned=(pin_mode == "ignore") or ref.pin is not None))
+    items.sort(key=lambda i: i.alias)
+    resolved = ResolvedIndicatorSet(
+        inventory_root=inventory.root, items=tuple(items),
+        all_pinned=all(i.pinned for i in items))
+    encoded = json.dumps(resolved.handshake_items(), separators=(",", ":"),
+                         sort_keys=True, ensure_ascii=False, allow_nan=False)
+    if len(encoded.encode("utf-8")) > MAX_HANDSHAKE_BYTES:
+        raise IndicatorResolutionError(None, "handshake_too_large")
+    return resolved

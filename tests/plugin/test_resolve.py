@@ -99,3 +99,174 @@ def test_indicator_resolution_error_str_is_fixed_text():
     assert str(exc) == "indicator_unresolved:rsi:pin_mismatch"
     assert str(IndicatorResolutionError(None, "handshake_too_large")) == \
         "indicator_unresolved:-:handshake_too_large"
+
+
+def _inv(root: Path, *metas: PluginMeta) -> ApprovedInventory:
+    return ApprovedInventory(root=root.resolve(), metas=tuple(metas))
+
+
+def test_resolve_not_found(tmp_path):
+    root = tmp_path / "plugins"
+    root.mkdir()
+    s = _strategy(tmp_path / "c", "s", "indicators:\n  rsi: {plugin: rsi}\n")
+    with pytest.raises(IndicatorResolutionError) as ei:
+        resolve_indicator_deps(s, _inv(root), settings=SETTINGS, pin_mode="check")
+    assert (ei.value.alias, ei.value.reason) == ("rsi", "not_found")
+
+
+def test_resolve_not_indicator(tmp_path):
+    root = tmp_path / "plugins"
+    other = _strategy(root, "rsi", "")
+    s = _strategy(tmp_path / "c", "s", "indicators:\n  rsi: {plugin: rsi}\n")
+    with pytest.raises(IndicatorResolutionError) as ei:
+        resolve_indicator_deps(s, _inv(root, other), settings=SETTINGS,
+                               pin_mode="check")
+    assert (ei.value.alias, ei.value.reason) == ("rsi", "not_indicator")
+
+
+def test_resolve_outputs_undeclared(tmp_path):
+    """U4b: outputs 宣言なしの配備済 indicator は依存先にできない。"""
+    root = tmp_path / "plugins"
+    legacy = _indicator(root, "rsi", outputs="")
+    assert legacy.outputs is None
+    s = _strategy(tmp_path / "c", "s", "indicators:\n  rsi: {plugin: rsi}\n")
+    for mode in ("require", "check"):
+        with pytest.raises(IndicatorResolutionError) as ei:
+            resolve_indicator_deps(s, _inv(root, legacy), settings=SETTINGS,
+                                   pin_mode=mode)
+        assert (ei.value.alias, ei.value.reason) == ("rsi", "outputs_undeclared")
+
+
+def test_resolve_over_max_bars_limit(tmp_path):
+    root = tmp_path / "plugins"
+    big = _indicator(root, "rsi", max_bars=f"max_bars: {SETTINGS.plugin.max_bars_limit + 1}\n")
+    s = _strategy(tmp_path / "c", "s", "indicators:\n  rsi: {plugin: rsi}\n")
+    with pytest.raises(IndicatorResolutionError) as ei:
+        resolve_indicator_deps(s, _inv(root, big), settings=SETTINGS,
+                               pin_mode="check")
+    assert (ei.value.alias, ei.value.reason) == ("rsi", "over_max_bars_limit")
+
+
+def test_resolve_params_not_json_safe_after_merge(tmp_path):
+    root = tmp_path / "plugins"
+    ind = _indicator(root, "rsi")
+    # strategy 側の上書きに非 JSON-safe 値を差し込む (loader を通さずに
+    # meta を組み替えて merge 後検証だけを突く — loader は既に L1 で pin 済み)
+    from agentic_fx.plugin.loader import IndicatorRef
+    s = _strategy(tmp_path / "c", "s", "indicators:\n  rsi: {plugin: rsi}\n")
+    broken = PluginMeta(
+        name=s.name, kind=s.kind, path=s.path, params=s.params,
+        timeframe=s.timeframe, pairs=s.pairs, max_bars=s.max_bars,
+        content_hash=s.content_hash, artifact_hash=s.artifact_hash,
+        indicators=(IndicatorRef(alias="rsi", plugin="rsi",
+                                 params={"period": float("inf")}, pin=None),),
+        outputs=None)
+    with pytest.raises(IndicatorResolutionError) as ei:
+        resolve_indicator_deps(broken, _inv(root, ind), settings=SETTINGS,
+                               pin_mode="check")
+    assert (ei.value.alias, ei.value.reason) == ("rsi", "params_not_json_safe")
+
+
+def test_resolve_unpinned_only_fails_under_require(tmp_path):
+    root = tmp_path / "plugins"
+    ind = _indicator(root, "rsi")
+    s = _strategy(tmp_path / "c", "s", "indicators:\n  rsi: {plugin: rsi}\n")
+    with pytest.raises(IndicatorResolutionError) as ei:
+        resolve_indicator_deps(s, _inv(root, ind), settings=SETTINGS,
+                               pin_mode="require")
+    assert (ei.value.alias, ei.value.reason) == ("rsi", "unpinned")
+    got = resolve_indicator_deps(s, _inv(root, ind), settings=SETTINGS,
+                                 pin_mode="check")
+    assert got.all_pinned is False and got.items[0].pinned is False
+
+
+def test_resolve_pin_mismatch_under_require_and_check_but_ignored_under_ignore(tmp_path):
+    root = tmp_path / "plugins"
+    ind = _indicator(root, "rsi")
+    stale = "a" * 64
+    s = _strategy(tmp_path / "c", "s",
+                  f"indicators:\n  rsi: {{plugin: rsi, pin: '{stale}'}}\n")
+    for mode in ("require", "check"):
+        with pytest.raises(IndicatorResolutionError) as ei:
+            resolve_indicator_deps(s, _inv(root, ind), settings=SETTINGS,
+                                   pin_mode=mode)
+        assert (ei.value.alias, ei.value.reason) == ("rsi", "pin_mismatch")
+    got = resolve_indicator_deps(s, _inv(root, ind), settings=SETTINGS,
+                                 pin_mode="ignore")
+    assert got.items[0].content_hash == ind.content_hash   # 名前で解決し直す
+    assert got.items[0].pinned is True and got.all_pinned is True
+
+
+def test_resolve_pin_match_under_require(tmp_path):
+    root = tmp_path / "plugins"
+    ind = _indicator(root, "rsi")
+    s = _strategy(tmp_path / "c", "s",
+                  f"indicators:\n  rsi: {{plugin: rsi, pin: '{ind.content_hash}'}}\n")
+    got = resolve_indicator_deps(s, _inv(root, ind), settings=SETTINGS,
+                                 pin_mode="require")
+    assert got.all_pinned is True
+    assert got.items[0].plugin_py == ind.path / "plugin.py"
+    assert got.items[0].outputs == ("v",)
+    assert got.inventory_root == root.resolve()
+
+
+def test_resolve_merges_strategy_params_over_indicator_defaults(tmp_path):
+    root = tmp_path / "plugins"
+    ind = _indicator(root, "rsi", params="params:\n  period: 14\n  src: close\n")
+    s = _strategy(tmp_path / "c", "s",
+                  "indicators:\n  rsi: {plugin: rsi, params: {period: 21}}\n")
+    got = resolve_indicator_deps(s, _inv(root, ind), settings=SETTINGS,
+                                 pin_mode="check")
+    assert thaw(got.items[0].params) == {"period": 21, "src": "close"}
+    # indicator 側の params dict は書き換えられない (deep copy)
+    assert ind.params == {"period": 14, "src": "close"}
+
+
+def test_resolve_handshake_too_large_boundary(tmp_path, monkeypatch):
+    """R1 上限境界: `>` 判定を実測サイズの前後 1 byte で挟む。
+
+    注: loader が通す入力 (deps <= 8 / params <= 8 KiB) では handshake は
+    最大でも ~136 KB にしかならず、既定の 256 KiB には到達しない。よって
+    定数を monkeypatch して境界そのものを pin する (設計 R1 の申し送り参照)。
+    """
+    import json
+    root = tmp_path / "plugins"
+    from agentic_fx.plugin.loader import MAX_PARAMS_BYTES
+    blob = "x" * (MAX_PARAMS_BYTES - 64)
+    ind = _indicator(root, "rsi", params=f"params:\n  big: '{blob}'\n")
+    body = "indicators:\n" + "".join(
+        f"  a{i}: {{plugin: rsi}}\n" for i in range(8))
+    s = _strategy(tmp_path / "c", "s", body)
+
+    got = resolve_indicator_deps(s, _inv(root, ind), settings=SETTINGS,
+                                 pin_mode="check")
+    assert len(got.items) == 8
+    size = len(json.dumps(got.handshake_items(), separators=(",", ":"),
+                          sort_keys=True, ensure_ascii=False).encode("utf-8"))
+
+    # ちょうど上限は通る (実装は `>` 判定)
+    monkeypatch.setattr(resolve, "MAX_HANDSHAKE_BYTES", size)
+    assert len(resolve_indicator_deps(
+        s, _inv(root, ind), settings=SETTINGS, pin_mode="check").items) == 8
+
+    # 1 byte 下げると落ちる
+    monkeypatch.setattr(resolve, "MAX_HANDSHAKE_BYTES", size - 1)
+    with pytest.raises(IndicatorResolutionError) as ei:
+        resolve_indicator_deps(s, _inv(root, ind), settings=SETTINGS,
+                               pin_mode="check")
+    assert (ei.value.alias, ei.value.reason) == (None, "handshake_too_large")
+
+
+def test_resolver_failure_spawns_no_worker(tmp_path, monkeypatch):
+    """R1: 拒否時に worker spawn 0 回。"""
+    import subprocess
+    calls = []
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(
+                            AssertionError("worker spawned")))
+    root = tmp_path / "plugins"
+    root.mkdir()
+    s = _strategy(tmp_path / "c", "s", "indicators:\n  rsi: {plugin: rsi}\n")
+    with pytest.raises(IndicatorResolutionError):
+        resolve_indicator_deps(s, _inv(root), settings=SETTINGS, pin_mode="check")
+    assert calls == []
