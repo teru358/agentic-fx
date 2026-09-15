@@ -999,6 +999,11 @@ def submit_candidate(
             # snapshot (approval 行を作る 3 箇所すべてに載せる)。CR4
             # (2026-09-13): `ImproveGateSettings.snapshot()` に一本化。
             "profitability_floor": g.snapshot(),
+            # [indicator-consumption-wiring] §2.7: 表示・監査用 (identity には
+            # 使わない — identity は既存の `content_hash` のまま)。
+            # **`outcome.resolved` から作る** — ここで再解決しない (P3')。
+            "indicator_deps": (outcome.resolved.pin_object()
+                               if outcome.resolved is not None else {}),
         }
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1728,6 +1733,9 @@ def bless_candidate(
             "floor_warning": outcome.floor_warning,
             "floor_detail": outcome.floor_detail,
             "profitability_floor": g.snapshot(),
+            # [indicator-consumption-wiring] §2.7: submit と同形。
+            "indicator_deps": (outcome.resolved.pin_object()
+                               if outcome.resolved is not None else {}),
         }
 
         if old_kind == "plain":

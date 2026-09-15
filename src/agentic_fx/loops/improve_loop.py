@@ -1417,7 +1417,9 @@ class ImproveLoop:
     def _build_approval_payload(self, conn, *, name, kind, content_hash,
                                 artifact_hash, ctx_ledger, mission_id,
                                 backlog_id, candidate_origin, candidate_path,
-                                gate_metrics, output, now) -> dict:
+                                gate_metrics, output, now,
+                                resolved: "ResolvedIndicatorSet | None" = None,
+                                ) -> dict:
         entries = accepted_entries(ctx_ledger.entries())
         analysis_entries = [e for e in entries if e["kind"] == "analyze_corr"]
         backtest_entries = [e for e in entries if e["kind"] == "run_backtest"]
@@ -1453,6 +1455,11 @@ class ImproveLoop:
             # — switch.submit_candidate / switch.bless_candidate / ここ)。
             # CR4 (2026-09-13): `ImproveGateSettings.snapshot()` に一本化。
             "profitability_floor": self._settings.improve.gate.snapshot(),
+            # [indicator-consumption-wiring] §2.7: switch.py の
+            # submit / bless と**同形**。呼び出し元が解決済み集合を
+            # 渡す (ここで再解決しない — P3')。
+            "indicator_deps": (resolved.pin_object()
+                               if resolved is not None else {}),
         }
 
     def _check_duplicate_metrics(self, conn, *, content_hash, pair, variant,

@@ -24,10 +24,17 @@ from agentic_fx.core.contracts import FixedClock
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.loops.improve_loop import ImproveLoop
 from agentic_fx.plugin import approval, switch
+from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.plugin.gate_pytest import GateResult
 from agentic_fx.plugin.loader import PluginMeta, content_hash as real_content_hash
 from agentic_fx.plugin.strategy_gate import StrategyGateVerdict
 from agentic_fx.store.db import connect, init_db
+from tests.fixtures.wiring_envs import (
+    SETTINGS_FIXTURE,
+    install_gate_double as _install_gate_double,
+    switch_env as _switch_env,
+    write_dependency_free_strategy as _write_dependency_free_strategy,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _EXAMPLE = _REPO_ROOT / "config" / "settings.yaml.example"
@@ -164,7 +171,7 @@ class _FakeRag:
     """`ImproveLoop.__init__(rag=...)` を満たすだけの no-op。"""
 
 
-def _payload_from_improve_loop(tmp_path, kind):
+def _payload_from_improve_loop(tmp_path, kind, *, resolved=None):
     root = tmp_path / "d"
     root.mkdir()
     conn = _conn(root)
@@ -183,7 +190,8 @@ def _payload_from_improve_loop(tmp_path, kind):
         conn, name=f"{kind}_d", kind=kind, content_hash="h", artifact_hash="a",
         ctx_ledger=ledger, mission_id=1, backlog_id=2,
         candidate_origin="staging", candidate_path=f"plugins/_staging/1/{kind}_d",
-        gate_metrics=gate_metrics, output={"selection_rationale": ""}, now=NOW)
+        gate_metrics=gate_metrics, output={"selection_rationale": ""}, now=NOW,
+        resolved=resolved)
 
 
 @pytest.mark.parametrize("kind", ["strategy", "indicator"])
@@ -221,3 +229,114 @@ def test_four_payload_systems_share_eval_contract(tmp_path, monkeypatch, kind):
             f"{system}: {_CONTRACT_KEYS - payload.keys()} キーが欠落")
         actual = {k: payload[k] for k in _CONTRACT_KEYS}
         assert actual == expected, f"{system}: {actual} != {expected}"
+
+
+# --- [indicator-consumption-wiring] T4b Step 4-5: indicator_deps (P3/P3') ---
+
+def test_indicator_deps_is_present_and_identical_in_all_three_corridors(
+        tmp_path, monkeypatch):
+    """P3: submit / bless / `_build_approval_payload` の 3 経路が
+    `indicator_deps` を**同形 (plain object) かつ同値**で載せる。"""
+    from agentic_fx.plugin.resolve import ResolvedIndicatorSet
+    from tests.fixtures import indicator_wiring as fx
+
+    conn, plugins_root = _switch_env(tmp_path)
+    _install_gate_double(monkeypatch)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    fx.write_rsi_pullback(plugins_root / "_human", pins={"rsi": hashes["rsi"]})
+    submit_id = plugin_switch.submit_candidate(
+        conn, name="rsi_pullback", staging_dir=plugins_root / "_human",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS_FIXTURE, now=fx.NOW)
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (submit_id,)).fetchone()["payload_json"])
+    expected = {"rsi": {"plugin": "rsi", "content_hash": hashes["rsi"],
+                        "params": {"period": fx.RSI_PERIOD}}}
+    assert payload["indicator_deps"] == expected
+    json.dumps(payload)     # plain JSON であること
+
+    # --- 経路 2: bless -----------------------------------------------
+    bless_dir = fx.write_rsi_pullback(plugins_root / "_human2",
+                                      pins={"rsi": hashes["rsi"]})
+    bless_id = plugin_switch.bless_candidate(
+        conn, name="rsi_pullback", human_dir=bless_dir,
+        settings=SETTINGS_FIXTURE, now=fx.NOW, decided_by="human_cli")
+    bless_payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (bless_id,)).fetchone()["payload_json"])
+    assert bless_payload["indicator_deps"] == expected
+    json.dumps(bless_payload)
+
+    # --- 経路 3: `ImproveLoop._build_approval_payload` (改善経路) --------
+    from agentic_fx.plugin import loader as plugin_loader_mod
+    from agentic_fx.plugin.resolve import resolve_indicator_deps
+    from agentic_fx.tools import plugin_loader as tools_plugin_loader
+    meta, _reason = plugin_loader_mod.discover_one_with_reason(
+        plugins_root / "_human" / "rsi_pullback", "rsi_pullback")
+    inventory = tools_plugin_loader.approved_plugins(
+        conn, plugins_root, settings=SETTINGS_FIXTURE)
+    resolved = resolve_indicator_deps(meta, inventory.inventory,
+                                      settings=SETTINGS_FIXTURE,
+                                      pin_mode="require")
+    improve_payload = _payload_from_improve_loop(
+        tmp_path, "strategy", resolved=resolved)
+    assert improve_payload["indicator_deps"] == expected
+
+    assert (payload["indicator_deps"] == bless_payload["indicator_deps"]
+            == improve_payload["indicator_deps"])
+
+
+def test_indicator_deps_is_empty_object_for_a_strategy_without_deps(
+        tmp_path, monkeypatch):
+    conn, plugins_root = _switch_env(tmp_path)
+    _install_gate_double(monkeypatch)
+    _write_dependency_free_strategy(plugins_root / "_human", "plain_strat")
+    approval_id = plugin_switch.submit_candidate(
+        conn, name="plain_strat", staging_dir=plugins_root / "_human",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS_FIXTURE, now=NOW)
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["payload_json"])
+    assert payload["indicator_deps"] == {}
+
+
+def test_indicator_deps_is_absent_for_indicator_kind(tmp_path):
+    """indicator 候補には依存が無いので `indicator_deps` は `{}`。
+    gate double 不要 — kind=indicator は strategy backtest を回さない。"""
+    conn, plugins_root = _switch_env(tmp_path)
+    from tests.fixtures import indicator_wiring as fx
+    fx.write_indicator(plugins_root / "_human", "rsi")
+    approval_id = plugin_switch.submit_candidate(
+        conn, name="rsi", staging_dir=plugins_root / "_human",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS_FIXTURE, now=fx.NOW)
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["payload_json"])
+    assert payload["indicator_deps"] == {}
+
+
+def test_payload_indicator_deps_comes_from_the_gate_outcome_not_a_re_resolve(
+        tmp_path, monkeypatch):
+    """P3' (呼び出し回数): submit 1 回あたり resolver 呼び出しは 1 回だけ。
+    call site である `approval.resolve_indicator_deps` を patch する。"""
+    from agentic_fx.plugin import approval as approval_mod
+    calls = []
+    real = approval_mod.resolve_indicator_deps
+    monkeypatch.setattr(
+        approval_mod, "resolve_indicator_deps",
+        lambda *a, **k: calls.append(k.get("pin_mode")) or real(*a, **k))
+    conn, plugins_root = _switch_env(tmp_path)
+    _install_gate_double(monkeypatch)
+    from tests.fixtures import indicator_wiring as fx
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    fx.write_rsi_pullback(plugins_root / "_human", pins={"rsi": hashes["rsi"]})
+    plugin_switch.submit_candidate(
+        conn, name="rsi_pullback", staging_dir=plugins_root / "_human",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS_FIXTURE, now=fx.NOW)
+    assert calls == ["require"]     # 候補ごとに 1 回だけ
