@@ -39,5 +39,6 @@ testpaths = ["tests"]
 markers = [
     "bench: 長時間ベンチ (既定 skip、-m bench で実行)",
     "realbackend: 実 CLI (claude/codex)・実 llama-swap を叩く (既定 skip、-m realbackend で実行、課金枠を消費し得る)",
+    "slow: 実 worker + 2,000 評価超の E2E ([indicator-consumption-wiring] A1/A1-b/decision sink、既定で回る。-m 'not slow' で日常ループから外せる)",
 ]
 addopts = "-m 'not bench and not realbackend'"
