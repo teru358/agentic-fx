@@ -1,6 +1,6 @@
-# [indicator-consumption-wiring] 設計書 v1.3
+# [indicator-consumption-wiring] 設計書 v1.4
 
-束: 指標層 → 戦略層の配線。strategy plugin が `config.yaml` で宣言した配備済 indicator plugin の出力を、strategy worker 内で計算して `evaluate(df, indicators, ...)` に渡す。依存の版は `config.yaml` の `pin` (= `content_hash` の署名対象) に書き込む「ロック方式」で固定する。ユーザー裁定 U1〜U3 (2026-09-13)、下書き `tmp/design-indicator-wiring/design.md` v0.1〜v0.9 を codex 設計レビュー 9 周 (r1〜r3 sol、r4〜r6 sol、r7〜r9 terra) + opus 独立レビュー 1 周で収束 (r9: Critical 0 / Important 0 / Minor 0)。**v1.3 = 実装プランの指揮者裁定 (2026-09-14) で判明した §6 の 2 行 (F2 / P2') を実装プランの申し送りに合わせて改訂**。v1.2 = 実装プランの着手前検証 (opus r1) で判明した §6 の 2 行 (C1 / R1) を現物に合わせて改訂。v1.1 = §7 の裁定を反映、実装着手可 (writing-plans へ)。
+束: 指標層 → 戦略層の配線。strategy plugin が `config.yaml` で宣言した配備済 indicator plugin の出力を、strategy worker 内で計算して `evaluate(df, indicators, ...)` に渡す。依存の版は `config.yaml` の `pin` (= `content_hash` の署名対象) に書き込む「ロック方式」で固定する。ユーザー裁定 U1〜U3 (2026-09-13)、下書き `tmp/design-indicator-wiring/design.md` v0.1〜v0.9 を codex 設計レビュー 9 周 (r1〜r3 sol、r4〜r6 sol、r7〜r9 terra) + opus 独立レビュー 1 周で収束 (r9: Critical 0 / Important 0 / Minor 0)。**v1.4 = 実装プランの codex レビュー r1 (2026-09-15) で判明した §6 S1 の U4 との自己矛盾を訂正**。v1.3 = 実装プランの指揮者裁定 (2026-09-14) で判明した §6 の 2 行 (F2 / P2') を実装プランの申し送りに合わせて改訂。v1.2 = 実装プランの着手前検証 (opus r1) で判明した §6 の 2 行 (C1 / R1) を現物に合わせて改訂。v1.1 = §7 の裁定を反映、実装着手可 (writing-plans へ)。
 
 ## 0. ユーザー裁定 (2026-09-13)
 
@@ -191,7 +191,7 @@ params: {...}
 | V1 | validator: index 不一致 / 長さ不一致 / bool / ±Inf / outputs 集合不一致 → `SandboxError` (親に届く)。NaN 通過。全 kind の main plugin params が wire を通る (dict) | |
 | V2 | mutation 回帰: indicator が df / params (nested list/dict) を書き換えても strategy と後続 indicator と**次回 call** は元の値。`pd.set_option(...)` / `pd.reset_option(...)` / `pd.options.mode.chained_assignment = None` / `pd.options.display.max_rows: int = 5` (AnnAssign) / `(a, np.x.y) = ...` / `for pd.options.x.y in ...` / `del pd.options.x.y` を含む plugin がそれぞれ `check_source` で reject。worker の不変 assert = `pd.get_option("mode.chained_assignment") == 'warn'` と `np.geterr()` | |
 | V3 | 差し替え拒否: 解決後に indicator ファイルを書き換えると `__enter__` が `SandboxError`。`inventory_root` 外の実体パスも `SandboxError` (live / snapshot / human root の 3 root) | |
-| S1 | standalone: 配備済 `rsi_wilder` 相当 (スカラー、outputs なし) は無変更で `get_indicators` と依存の両方で使える。スカラー NaN / 系列末尾 NaN のキーは落ちる | |
+| S1 | standalone: 配備済 `rsi_wilder` 相当 (スカラー、outputs なし) は無変更で **standalone `get_indicators` でのみ**従来どおり使える (**strategy の依存先にはできない** — resolver が `outputs_undeclared` で fail closed、それは U4b の観測点)。系列は末尾値へ射影し、スカラー NaN / 系列末尾 NaN のキーは落ちる | |
 | P1 | ロック: `lock_staging_deps` / `afx plugin lock --from _human` が `config.yaml` の各 alias に `pin` を書き、`content_hash` が変わり、書き換え後も `discover` を通る。既に同じ pin なら no-op、**古い pin は上書き** (`ignore`)。`--from` なしは固定文言で拒否 |
 | P1' | snapshot: phase 2 で落ちた strategy が `_snapshot_src` に残り `read_plugin_source` で読める、inventory (`list_deployed_plugins`) には出ない、prompt に「pin 破れ N 本」が出る | |
 | P4 | noop: `_examples/rsi_pullback` を逐語コピーして lock した候補は `noop_copy_of:_examples/rsi_pullback` で reject。配備済 S (pin I1、I2 承認済で pin 破れ) を複製して pin I2 に再ロックした候補は noop にならず gate に進む。同じ複製を pin I1 のまま (再ロックなし) 提出すると `noop_copy_of:S` | |
@@ -314,6 +314,7 @@ params: {...}
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-15 | v1.4 | §6 S1 の「配備済 `rsi_wilder` 相当 (スカラー、outputs なし) は無変更で `get_indicators` **と依存の両方**で使える」を「**standalone `get_indicators` でのみ**使える (strategy の依存先にはできない — resolver `outputs_undeclared`、それは U4b の観測点)」へ訂正。あわせて系列末尾射影・NaN キー除去の記述を同じ行に明示 | **§0 U4 (2026-09-14 ユーザー裁定) と §6 U4b が「outputs 宣言なしは依存先にできない」と定めているのに、S1 だけが v1.1 以前の文言 (依存でも使える) のまま残っていた自己矛盾**。全受入 ID を逐語 pin する実装プランは S1 と U4b を同時に満たせない (codex プランレビュー r1 の Important、`tmp/plan-indicator-wiring/codex-plan-r1.md`) | - |
 | 2026-09-14 | v1.3 | §6 の F2 (pin 破れ strategy の観測を「producer の plugin 一覧に含まれない」に絞り、session cache 未登録はその帰結として別途観測しない) と P2' (「逆順で取っても deadlock しない」という実測不能な主張を、`_plugin_lock` の取得順序が常に名前昇順・重複なしであることを spy で pin する形に置換) を改訂。指揮者の実装プラン既定選択 8 件のうち①(validator の置き場 = `core/plugin_contract.py`)と⑥(lock 後は snapshot を取り直す)をユーザー裁定で変更、②③④⑤⑦⑧は変更なしで採用 | ユーザー裁定 (2026-09-14、実装プラン `docs/superpowers/plans/2026-09-14-indicator-consumption-wiring.md` 側の指揮者の既定選択 8 件 + 申し送り 2 件の確定) | - |
 | 2026-09-13 | v0.1〜v0.4a | 初稿 → codex r1 (C5/I10/M2) / r2 (C3/I12/M1) / r3 (C3/I8/M2)。identity 論点が 3 周連続 Critical → v0.4 で §2.7 を作り直し (pin を config.yaml に書くロック方式、`execution_hash` 撤回)。r4 部分 (`pin_mode` 3 値) | 設計レビュー | - |
 | 2026-09-13 | v0.4b〜v0.7 | opus 独立レビュー (C1/I7/M5) → codex r4 (C2/I7/M1) → r5 (C1/I5/M2) → r6 (C0/I7/M1)。RPC 境界、noop の再ロック例外、lock 集合、`InventoryBuildResult`、handshake 上限、reconcile、`GateOutcome.resolved`、`inventory_view` | 設計レビュー | - |
