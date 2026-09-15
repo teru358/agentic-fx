@@ -407,3 +407,14 @@ def test_holdout_and_analysis_ids_never_come_from_agent_output(tmp_path):
     assert payload["analysis_call_count"] == 1
     assert payload["trial_count"] == 1
     conn.close()
+
+
+def test_new_improve_tools_are_registered_and_not_forbidden():
+    """P3: 2 tool が registry と規律文に載り、`IMPROVE_FORBIDDEN` と非交差。"""
+    from agentic_fx.tools.signal_tools import IMPROVE_FORBIDDEN
+    names = {"list_deployed_plugins", "lock_staging_deps"}
+    assert names.isdisjoint(set(IMPROVE_FORBIDDEN))
+    prompt = (Path(__file__).resolve().parents[2] / "src" / "agentic_fx"
+              / "loops" / "prompts" / "improve_mission.md").read_text()
+    for name in names:
+        assert name in prompt

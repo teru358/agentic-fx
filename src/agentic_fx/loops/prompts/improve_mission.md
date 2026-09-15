@@ -60,7 +60,8 @@
 2. **ファイルの読み書きは afx の MCP tool のみを使ってください**
    (`list_staging` / `read_staging_file` / `write_staging_file` /
    `read_plugin_source` / `list_examples` / `read_example_plugin` /
-   `run_plugin_tests` / `run_backtest` (strategy 専用))。エディタ・ハーネス組み込みの
+   `run_plugin_tests` / `run_backtest` (strategy 専用) /
+   `list_deployed_plugins` / `lock_staging_deps`)。エディタ・ハーネス組み込みの
    read / write / shell によるファイル操作はプロジェクトのファイルに
    届かず、境界で拒否されます。
    - 呼び出し例: `write_staging_file(name="my_plugin", rel="plugin.py",
@@ -89,6 +90,15 @@
    `artifact` / `selection_rationale`) に従ってください。分析 ID・探索
    回数などの集計値はあなたが数える必要はありません (親が RPC 記録から
    生成します)。
+7. **strategy は配備済 indicator を `indicators:` で宣言して使ってください**
+   (`list_deployed_plugins()` で一覧。`outputs` が `null` の indicator は
+   依存先にできません)。**提出前に `lock_staging_deps(name="<候補名>")` で
+   依存の版をロックし、ロック後に `run_plugin_tests` と `run_backtest` を
+   再実行してください** (テストした artifact == 提出する artifact)。
+   系列が全 NaN のままなら warmup 不足の兆候です — `max_bars` は
+   「依存 indicator の warmup + 自分の lookback」を覆う値を宣言してください。
+   **無い指標は自前計算せず**、`不足指標: <名前と定義>` として
+   `discoveries` に起票してください。
 
 ## 最終出力
 

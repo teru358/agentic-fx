@@ -7,6 +7,7 @@ LocalRunner (worker 内 in-process) 用の防御** — claude/codex はネイテ
 """
 from __future__ import annotations
 
+import difflib
 import re
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agentic_fx.plugin import loader as plugin_loader
+from agentic_fx.plugin import resolve as plugin_resolve
 from agentic_fx.tools.registry import ToolDef
 
 if TYPE_CHECKING:
@@ -83,11 +85,90 @@ def _safe_join(root: Path, name: str, rel: str | None = None) -> Path | None:
 def build_improve_staging_tooldefs(
         *, staging_dir: Path, source_snapshot_dir: Path,
         counters: "MissionToolCounters | None" = None,
-        budget: "ImproveToolBudgetSettings | None" = None) -> list[ToolDef]:
+        budget: "ImproveToolBudgetSettings | None" = None,
+        inventory_view: dict | None = None) -> list[ToolDef]:
     # codex 2 周目 (2026-09-07): counters と budget は対で渡す。片方だけは
     # 配線ミス (予算が静かに無効化される) なので fail closed。
     if (counters is None) != (budget is None):
         raise ValueError("counters と budget は両方渡すか両方省く")
+    # [indicator-consumption-wiring] T5a Step 5-2c
+    view = inventory_view or {"plugins": [], "pin_broken_strategies": []}
+
+    def list_deployed_plugins() -> dict:
+        """[indicator-consumption-wiring] §2.9(b): **親が handshake に
+        載せた `inventory_view` だけ**を読む (snapshot ディレクトリを
+        列挙しない — phase 2 で落ちた strategy が混ざらないようにするため)。
+        `outputs` が `null` の indicator は依存先にできない (U4)。"""
+        return {"plugins": list(view["plugins"]),
+                "pin_broken_strategies": list(view["pin_broken_strategies"])}
+
+    def lock_staging_deps(name: str) -> dict:
+        """候補 `config.yaml` の `indicators.<alias>.pin` を、`inventory_view`
+        の `content_hash` で書き換える (ハーネスが書く — agent が 64 hex を
+        写さない)。staging / examples は参照しない。書き換え後に
+        `discover` を通ることを同じ tool 内で確認する。
+
+        `outputs` 宣言なしの indicator は依存先にできないので
+        `reason="outputs_undeclared"` で拒否する (U4)。"""
+        candidate_dir = _safe_join(staging_dir, name)
+        if candidate_dir is None or not candidate_dir.is_dir():
+            return {"error": "not found",
+                    "hint": "staging に無い名前です。list_staging で確認してください"}
+        meta, reason = plugin_loader.discover_one_with_reason(candidate_dir, name)
+        if meta is None:
+            return {"error": f"loader_rejected: {reason}"}
+        if meta.kind != "strategy":
+            return {"error": "lock_staging_deps is only for kind=strategy "
+                             "candidates", "candidate_kind": meta.kind}
+        by_name = {p["name"]: p for p in view["plugins"]}
+        pins: dict[str, str] = {}
+        for ref in meta.indicators:
+            dep = by_name.get(ref.plugin)
+            if dep is None:
+                return {"error": "indicator_unresolved", "alias": ref.alias,
+                        "reason": "not_found",
+                        "available": [p["name"] for p in view["plugins"]
+                                      if p["kind"] == "indicator"]}
+            if dep["kind"] != "indicator":
+                return {"error": "indicator_unresolved", "alias": ref.alias,
+                        "reason": "not_indicator",
+                        "available": [p["name"] for p in view["plugins"]
+                                      if p["kind"] == "indicator"]}
+            if dep["outputs"] is None:
+                return {"error": "indicator_unresolved", "alias": ref.alias,
+                        "reason": "outputs_undeclared",
+                        "available": [p["name"] for p in view["plugins"]
+                                      if p["kind"] == "indicator"
+                                      and p["outputs"] is not None]}
+            pins[ref.alias] = dep["content_hash"]
+
+        # YAML の書き換えは `plugin/resolve.lock_config` 1 箇所に閉じる
+        # (人間 CLI の `afx plugin lock` と同じ関数 — 設計書 §2.3)。
+        # snapshot 再取得 (ユーザー裁定 2026-09-14 ⑥): `check_candidate_snapshot`
+        # はファイル 3 本の存在・属性しか見ないため、lock 後に無条件で
+        # submit が通ると決め打ちしない。`lock_config` が書き込み後に
+        # 再計算して返す `new_hash` を正とし、`discover_one_with_reason`
+        # の再取得結果 (`relocked.content_hash`) と一致することを assert
+        # する (どちらも書き込み後の disk を独立に読む)。
+        before, after, new_hash = plugin_resolve.lock_config(candidate_dir, pins)
+        relocked, relock_reason = plugin_loader.discover_one_with_reason(
+            candidate_dir, name)
+        if relocked is None:
+            (candidate_dir / "config.yaml").write_text(before, encoding="utf-8")
+            return {"error": f"loader_rejected_after_lock: {relock_reason}"}
+        assert relocked.content_hash == new_hash, (
+            "lock_config の snapshot 再取得値と discover の再取得値が食い違う"
+            f" ({new_hash} != {relocked.content_hash})")
+        return {"ok": True, "pins": pins, "changed": after != before,
+                "content_hash": new_hash,
+                "diff": "".join(difflib.unified_diff(
+                    before.splitlines(keepends=True),
+                    after.splitlines(keepends=True),
+                    fromfile="config.yaml (before)",
+                    tofile="config.yaml (after)")),
+                "directive": "ロック後に run_plugin_tests と run_backtest を "
+                             "再実行してから提出してください "
+                             "(テストした artifact == 提出する artifact)"}
 
     def list_staging() -> dict:
         # opencode E2E m11 実測 (2026-08-30): `_snapshot_src/` (staging_dir
@@ -293,4 +374,18 @@ def build_improve_staging_tooldefs(
                             "properties": {"name": {"type": "string"}},
                             "required": ["name"]},
                 func=run_plugin_tests),
+        ToolDef(name="list_deployed_plugins",
+                description="配備済 (承認済) plugin の一覧。strategy の "
+                            "indicators: で依存に書けるのは kind=indicator かつ "
+                            "outputs が null でないものだけ。",
+                parameters={"type": "object", "properties": {}},
+                func=list_deployed_plugins),
+        ToolDef(name="lock_staging_deps",
+                description="候補の indicators 依存を現在の配備版でロックする "
+                            "(config.yaml の pin をハーネスが書く)。提出前に "
+                            "必ず実行し、その後 self-test / backtest を再実行する。",
+                parameters={"type": "object",
+                            "properties": {"name": {"type": "string"}},
+                            "required": ["name"]},
+                func=lock_staging_deps),
     ]

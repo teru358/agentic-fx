@@ -555,7 +555,8 @@ def _make_rpc_client(protocol_out: Any, out_seq: SeqTracker,
 
 def _build_improve_registry(*, settings: Any, workdir: Path, staging_dir: Path,
                             source_snapshot_dir: Path,
-                            rpc_client: Callable[[str, dict], Any]
+                            rpc_client: Callable[[str, dict], Any],
+                            inventory_view: dict | None = None,
                             ) -> tuple[ToolRegistry, MissionToolCounters]:
     """improve profile 用 `ToolRegistry` の構築 (A-4 検収是正、裁定 R-D2)。
 
@@ -590,7 +591,7 @@ def _build_improve_registry(*, settings: Any, workdir: Path, staging_dir: Path,
         # tests/test_mission_worker.py::test_every_improve_rpc_crosses_child_frame_and_parent_wrapper
         rpc_handlers={"run_backtest": lambda a: rpc_client("run_backtest", a),
                      "analyze_corr": lambda a: rpc_client("analyze_corr", {"request": a})},
-        counters=counters)
+        counters=counters, inventory_view=inventory_view)
     return registry, counters
 
 
@@ -686,7 +687,7 @@ def _wait_for_go(in_seq: "SeqTracker", timeout_sec: float) -> bool:
 def _run_improve_mission(
     *, settings: Any, workdir: Path, staging_dir: str,
     source_snapshot_dir: str, protocol_out: Any = None, out_seq: Any = None,
-    in_seq: Any = None
+    in_seq: Any = None, inventory_view: dict | None = None,
 ) -> Any:
     """improve profile での runner 構築・Mission 実行 (Step 7d + A-4 検収
     是正 Step 7a/7b)。
@@ -717,7 +718,8 @@ def _run_improve_mission(
     rpc_client = _make_rpc_client(protocol_out, out_seq, in_seq)
     registry, counters = _build_improve_registry(
         settings=settings, workdir=workdir, staging_dir=Path(staging_dir),
-        source_snapshot_dir=Path(source_snapshot_dir), rpc_client=rpc_client)
+        source_snapshot_dir=Path(source_snapshot_dir), rpc_client=rpc_client,
+        inventory_view=inventory_view)
     dispatcher = _start_mcp_dispatcher(
         workdir=workdir, registry=registry,
         after_send=counters.fire_if_pending)
@@ -836,7 +838,8 @@ def main() -> None:
                 settings=settings, workdir=workdir,
                 staging_dir=handshake["staging_dir"],
                 source_snapshot_dir=handshake["source_snapshot_dir"],
-                protocol_out=protocol_out, out_seq=out_seq, in_seq=in_seq)
+                protocol_out=protocol_out, out_seq=out_seq, in_seq=in_seq,
+                inventory_view=handshake.get("inventory_view"))
 
             _send_frame(protocol_out, out_seq, {
                 "type": "ready", "ok": True,

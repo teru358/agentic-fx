@@ -1021,7 +1021,8 @@ def test_run_improve_mission_binds_mcp_dispatcher_and_serves_registry_tool(
 
     monkeypatch.setattr(
         mw_mod, "_build_improve_registry",
-        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client:
+        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client,
+               inventory_view=None:
         (fake_registry, MissionToolCounters(budget=settings.improve.tool_budget)))
 
     class _Fake:
@@ -1142,7 +1143,8 @@ def test_run_improve_mission_claude_backend_workdir_matches_dispatcher_socket(
 
     monkeypatch.setattr(
         mw_mod, "_build_improve_registry",
-        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client:
+        lambda *, settings, workdir, staging_dir, source_snapshot_dir, rpc_client,
+               inventory_view=None:
         (fake_registry, MissionToolCounters(budget=settings.improve.tool_budget)))
     # `ClaudeRunner.run()` は `cli_started_sink` 経由で実際に `cli_started`
     # フレームを送出する (`_make_on_message`/`_send_frame` 配線) — 実プロセス

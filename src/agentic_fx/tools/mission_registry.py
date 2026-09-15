@@ -44,6 +44,7 @@ def build_mission_registry(
         ledger: "ImproveRpcLedger | None" = None,
         rpc_handlers: "dict[str, Callable[[dict], dict]] | None" = None,
         counters: MissionToolCounters | None = None,
+        inventory_view: dict | None = None,
         ) -> ToolRegistry:
     """`loop == "improve"` は 7-E (プラン10 Task 7) で分岐するようになった
     (M-3, 検収是正 — 旧 docstring は「本プランでは分岐しない」としていたが
@@ -102,7 +103,7 @@ def build_mission_registry(
             settings=settings.improve.research))
         registry.register_all(improve_staging_tools.build_improve_staging_tooldefs(
             staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
-            counters=counters, budget=budget))
+            counters=counters, budget=budget, inventory_view=inventory_view))
         registry.register_all(improve_rpc_tools.build_improve_rpc_tooldefs(
             ledger=ledger, run_backtest_handler=rpc_handlers["run_backtest"],
             analyze_corr_handler=rpc_handlers["analyze_corr"],

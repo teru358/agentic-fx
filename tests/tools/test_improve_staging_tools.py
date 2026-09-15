@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.config import ImproveToolBudgetSettings
+from agentic_fx.tools import improve_staging_tools
 from agentic_fx.tools.improve_staging_tools import (
     BUDGET_EXHAUSTED_DIRECTIVE, NO_TESTS_SIGNATURE, TIMEOUT_SIGNATURE,
     _failure_signature, build_improve_staging_tooldefs,
@@ -800,3 +801,153 @@ def test_tier_b_stays_armed_after_unevaluable_backtest(tmp_path):
     assert st["run_plugin_tests"].func("cand")["error"] == "run_backtest_required_first"
     rpc["run_backtest"].func("cand", "USDJPY")                           # evaluable
     assert "error" not in st["run_plugin_tests"].func("cand")
+
+
+# --- [indicator-consumption-wiring] T5a Step 5-2: 露出 tool ------------------------
+
+_VIEW = {
+    "plugins": [
+        {"name": "rsi", "kind": "indicator", "pairs": [],
+         "params": {"period": 14}, "outputs": ["rsi"], "content_hash": "a" * 64},
+        {"name": "legacy", "kind": "indicator", "pairs": [],
+         "params": {"period": 14}, "outputs": None, "content_hash": "b" * 64},
+    ],
+    "pin_broken_strategies": [
+        {"name": "s_old", "alias": "rsi", "reason": "pin_mismatch"}],
+}
+
+
+def _tools(tmp_path, view=_VIEW):
+    defs = improve_staging_tools.build_improve_staging_tooldefs(
+        staging_dir=tmp_path / "staging",
+        source_snapshot_dir=tmp_path / "snap", inventory_view=view)
+    return {d.name: d.func for d in defs}
+
+
+def _field_names(value, *, skip_keys=("params",)):
+    """`value` 以下に現れる **辞書のキー名**を再帰的に集める。
+    `skip_keys` に挙げたキーの**配下は降りない** (plugin 作者が決める
+    自由な名前空間なので、遮断 8 の語彙表と衝突しうる)。"""
+    names = set()
+    if isinstance(value, dict):
+        for k, v in value.items():
+            names.add(k)
+            if k in skip_keys:
+                continue
+            names |= _field_names(v, skip_keys=skip_keys)
+    elif isinstance(value, list):
+        for item in value:
+            names |= _field_names(item, skip_keys=skip_keys)
+    return names
+
+
+def test_list_deployed_plugins_returns_the_view_verbatim(tmp_path):
+    out = _tools(tmp_path)["list_deployed_plugins"]()
+    assert out["plugins"] == _VIEW["plugins"]
+    assert out["pin_broken_strategies"] == _VIEW["pin_broken_strategies"]
+    # 遮断 8: 成績・期間・段の**フィールド名**が view に現れないこと。
+    #
+    # **codex plan r1 C5 是正**: v1.2 は `json.dumps(out)` の全文に
+    # `"period"` が含まれないことを assert していたが、同じ `_VIEW` が
+    # `params: {"period": 14}` を持っており **正しい出力でも必ず落ちる**
+    # (判別力ゼロ)。設計書 §2.9b / §5 は **`params` の露出を明示的に許可**
+    # しているので、これは遮断 8 との混同でもある。検査対象を
+    # **トップレベルのフィールド名 (`params` 配下は除外)** に絞る。
+    forbidden = {"pf", "avg_r", "win_rate", "max_drawdown", "total_pnl",
+                 "trades", "in_sample", "holdout", "scope", "period",
+                 "period_start", "period_end", "baseline", "metrics"}
+    assert _field_names(out) & forbidden == set()
+    # `params` 配下の `"period"` は許可されている (plugin 作者の名前空間)
+    assert out["plugins"][0]["params"] == {"period": 14}
+
+
+def test_list_deployed_plugins_marks_outputs_none_as_not_dependable(tmp_path):
+    """U4: outputs なし = 依存先にできない — その事実が view から読める。"""
+    out = _tools(tmp_path)["list_deployed_plugins"]()
+    legacy = next(p for p in out["plugins"] if p["name"] == "legacy")
+    assert legacy["outputs"] is None
+
+
+def test_lock_staging_deps_writes_pins_from_the_view(tmp_path):
+    """P1 (改善経路): view の content_hash を pin に書く。
+    staging・examples は参照しない。"""
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    fx.write_rsi_pullback(staging, pins=None)
+    view = {"plugins": [{"name": "rsi", "kind": "indicator", "pairs": [],
+                         "params": {"period": 14}, "outputs": ["rsi"],
+                         "content_hash": "c" * 64}],
+            "pin_broken_strategies": []}
+    out = _tools(tmp_path, view)["lock_staging_deps"]("rsi_pullback")
+    assert out["ok"] is True
+    assert out["pins"] == {"rsi": "c" * 64}
+    assert out["changed"] is True
+    # ユーザー裁定 2026-09-14 ⑥: 返り値の content_hash は lock 後に disk から
+    # 再計算した snapshot 値 (`check_candidate_snapshot` はこれを保証しない)。
+    from agentic_fx.plugin.loader import content_hash as _content_hash
+    assert out["content_hash"] == _content_hash(staging / "rsi_pullback")
+    import yaml
+    cfg = yaml.safe_load((staging / "rsi_pullback" / "config.yaml").read_text())
+    assert cfg["indicators"]["rsi"]["pin"] == "c" * 64
+
+
+def test_lock_staging_deps_is_idempotent(tmp_path):
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    fx.write_rsi_pullback(staging, pins={"rsi": "c" * 64})
+    view = {"plugins": [{"name": "rsi", "kind": "indicator", "pairs": [],
+                         "params": {"period": 14}, "outputs": ["rsi"],
+                         "content_hash": "c" * 64}],
+            "pin_broken_strategies": []}
+    out = _tools(tmp_path, view)["lock_staging_deps"]("rsi_pullback")
+    assert out["ok"] is True and out["changed"] is False
+
+
+def test_lock_staging_deps_refuses_unknown_dependency(tmp_path):
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    fx.write_rsi_pullback(staging, pins=None)
+    view = {"plugins": [], "pin_broken_strategies": []}
+    out = _tools(tmp_path, view)["lock_staging_deps"]("rsi_pullback")
+    assert out["error"] == "indicator_unresolved"
+    assert out["alias"] == "rsi" and out["reason"] == "not_found"
+    assert out["available"] == []
+
+
+def test_lock_staging_deps_refuses_outputs_undeclared_dependency(tmp_path):
+    """codex plan r2 束4 Important 是正: `_tools(tmp_path)` の**既定引数**
+    (`view=_VIEW`) に頼ると、`_VIEW` の中身が別の理由で変わったときに
+    この受入がこっそり `not_found` へ後退しても誰も気づけない
+    (`_VIEW` はモジュールレベル共有 fixture — `test_list_deployed_plugins_*`
+    等、他の複数テストとも共用している)。**このテストだけが読む
+    `inventory_view` を明示的にローカルで組み立て**、U4b
+    (`outputs_undeclared`) 分岐に実際に到達することを自己完結で保証する。"""
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    d = fx.write_rsi_pullback(staging, pins=None)
+    import yaml
+    cfg = yaml.safe_load((d / "config.yaml").read_text())
+    cfg["indicators"]["rsi"]["plugin"] = "legacy"
+    (d / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    view = {"plugins": [
+                {"name": "legacy", "kind": "indicator", "pairs": [],
+                 "params": {"period": 14}, "outputs": None,
+                 "content_hash": "b" * 64}],
+            "pin_broken_strategies": []}
+    out = _tools(tmp_path, view)["lock_staging_deps"]("rsi_pullback")
+    assert out["reason"] == "outputs_undeclared"
+
+
+def test_lock_staging_deps_keeps_the_candidate_discoverable(tmp_path):
+    from agentic_fx.plugin.loader import discover_one_with_reason
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    fx.write_rsi_pullback(staging, pins=None)
+    view = {"plugins": [{"name": "rsi", "kind": "indicator", "pairs": [],
+                         "params": {"period": 14}, "outputs": ["rsi"],
+                         "content_hash": "c" * 64}],
+            "pin_broken_strategies": []}
+    _tools(tmp_path, view)["lock_staging_deps"]("rsi_pullback")
+    meta, reason = discover_one_with_reason(staging / "rsi_pullback",
+                                            "rsi_pullback")
+    assert reason is None and meta.indicators[0].pin == "c" * 64
