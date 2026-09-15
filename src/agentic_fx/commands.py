@@ -383,8 +383,76 @@ class Commands:
         profitability_floor = payload.get("profitability_floor")
         if profitability_floor:
             lines.append(f"profitability_floor={profitability_floor}")
+        # [indicator-consumption-wiring] §2.7 (codex r4 M1): indicator の
+        # 承認詳細に依存 strategy を 2 欄で列挙する。**payload には入れない**
+        # (表示時に `InventoryBuildResult` を逆引きする — payload は承認時点の
+        # snapshot であり、承認待ちの間に依存関係が変わるため)。
+        # (i) この候補の hash に pin 済み = `inventory.metas` のうち当該
+        #     alias の pin が候補 `content_hash` と一致する strategy
+        # (ii) 同名 indicator の別 hash に pin (承認すると外れる) =
+        #     `phase1_metas` のうち同名 indicator への pin が候補 hash と不一致
+        if payload.get("kind") == "indicator":
+            here, elsewhere = self._dependent_strategies(
+                indicator_name=payload.get("name"),
+                candidate_hash=payload.get("content_hash"))
+            lines.append(f"dependent_pinned_here={', '.join(here) or '-'}")
+            lines.append(
+                f"dependent_pinned_elsewhere={', '.join(elsewhere) or '-'}")
         lines.append(self._archive_line(payload))
         return "\n".join(lines)
+
+    def _dependent_strategies(self, *, indicator_name, candidate_hash
+                              ) -> "tuple[list[str], list[str]]":
+        """`_approval_detail` の 2 欄を作る。**決定順 (最新承認の approval
+        `id` の昇順)** で並べる。
+
+        `approval_requests` に `name` 列は無いので、
+        `json_extract(payload_json,'$.name')` で引く。
+
+        inventory 構築に失敗した場合は両方空 (表示は fail-soft)。
+        `plugins_root` / `settings` は任意引数なので `None` があり得る —
+        その場合も両方空を返す (fail-soft)。plugin の root は
+        `self.plugins_root` (`self.root` は存在しない — opus r1 C4)。"""
+        from agentic_fx.tools import plugin_loader as tools_plugin_loader
+        if self.plugins_root is None or self.settings is None:
+            return [], []
+        try:
+            result = tools_plugin_loader.approved_plugins(
+                self.conn, self.plugins_root, settings=self.settings)
+        except Exception:  # noqa: BLE001 — 表示は fail-soft
+            return [], []
+
+        def _pins_to(meta) -> list[str]:
+            return [ref.pin for ref in meta.indicators
+                    if ref.plugin == indicator_name and ref.pin is not None]
+
+        # [codex plan r1 I9] 各 strategy 名の「最新承認 approval id」を
+        # 1 クエリで引き、その昇順 = 決定順に並べる。承認行が無い名前
+        # (まだ承認されていない配備物) は id を持たないので**末尾**に、
+        # その中では名前昇順で安定させる。
+        decided = {
+            row["name"]: row["last_id"] for row in self.conn.execute(
+                "SELECT json_extract(payload_json,'$.name') AS name, "
+                "       MAX(id) AS last_id "
+                "FROM approval_requests "
+                "WHERE status='approved' "
+                "  AND json_extract(payload_json,'$.kind')='strategy' "
+                "GROUP BY name")
+            if row["name"] is not None}
+
+        def _in_decision_order(names: list[str]) -> list[str]:
+            return sorted(names,
+                          key=lambda n: (decided.get(n) is None,
+                                         decided.get(n, 0), n))
+
+        here = _in_decision_order(
+            [m.name for m in result.inventory.metas
+             if m.kind == "strategy" and candidate_hash in _pins_to(m)])
+        elsewhere = _in_decision_order(
+            [m.name for m in result.phase1_metas
+             if m.kind == "strategy"
+             and any(p != candidate_hash for p in _pins_to(m))])
+        return here, elsewhere
 
     def _archive_line(self, payload: dict) -> str:
         """approval-quality 設計書 §C ([archive-artifact-hash-vs-

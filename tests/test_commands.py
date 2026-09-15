@@ -12,6 +12,12 @@ from agentic_fx.store import approvals
 from agentic_fx.store import snapshots
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.state import StateStore
+from tests.fixtures.wiring_envs import (
+    approve_indicator_v2 as _approve_indicator_v2,
+    deploy_strategy as _deploy_strategy,
+    shell_env as _shell_env,
+    submit_indicator_v2 as _submit_indicator_v2,
+)
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 SETTINGS = load_settings(
@@ -796,3 +802,60 @@ def test_policy_add_appends_to_policy_path(tmp_path):
 
     assert "policy" in out
     assert "テスト方針" in policy_path.read_text(encoding="utf-8")
+
+
+# --- [indicator-consumption-wiring] T4b Step 4-8: 依存 strategy 2 欄 (D1) ---
+
+def test_indicator_approval_detail_lists_dependent_strategies_in_two_columns(
+        tmp_path):
+    """D1: (i) この候補の hash に pin 済み / (ii) 同名 indicator の別 hash に
+    pin (承認すると外れる) の 2 欄。決定順 (id) で表示。"""
+    shell, conn, plugins_root = _shell_env(tmp_path)
+    from tests.fixtures import indicator_wiring as fx
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    _deploy_strategy(conn, plugins_root, "s_old", pins={"rsi": hashes["rsi"]})
+    i2_id, i2_hash = _submit_indicator_v2(conn, plugins_root, "rsi")
+
+    out = shell._approval_detail(i2_id)
+
+    assert "dependent_pinned_here=" in out
+    assert "dependent_pinned_elsewhere=s_old" in out
+    assert "dependent_pinned_here=-" in out   # まだ誰も I2 に pin していない
+
+
+def test_dependent_strategy_moves_to_the_first_column_after_relock(tmp_path):
+    shell, conn, plugins_root = _shell_env(tmp_path)
+    from tests.fixtures import indicator_wiring as fx
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    _deploy_strategy(conn, plugins_root, "s_old", pins={"rsi": hashes["rsi"]})
+    i2_id, i2_hash = _submit_indicator_v2(conn, plugins_root, "rsi")
+    _approve_indicator_v2(conn, plugins_root, "rsi", approval_id=i2_id)
+    # s_old は pin 破れで inventory から外れる → (ii) 欄に残る
+    assert "dependent_pinned_elsewhere=s_old" in shell._approval_detail(i2_id)
+    # 再ロックした s_new を配備すると (i) 欄へ移る
+    _deploy_strategy(conn, plugins_root, "s_new", pins={"rsi": i2_hash})
+    out = shell._approval_detail(i2_id)
+    assert "dependent_pinned_here=s_new" in out
+
+
+def test_dependent_strategies_are_listed_in_decision_id_order(tmp_path):
+    """D1 (順序、codex plan r1 I9): 表示順は**決定順 (最新承認の approval id
+    昇順)** であり、plugin 名の辞書順ではない。"""
+    shell, conn, plugins_root = _shell_env(tmp_path)
+    from tests.fixtures import indicator_wiring as fx
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    # 承認順 = z_first → a_second (`_deploy_strategy` は approval 行を作る)
+    _deploy_strategy(conn, plugins_root, "z_first", pins={"rsi": hashes["rsi"]})
+    _deploy_strategy(conn, plugins_root, "a_second", pins={"rsi": hashes["rsi"]})
+    i2_id, _i2_hash = _submit_indicator_v2(conn, plugins_root, "rsi")
+
+    here, elsewhere = shell._dependent_strategies(
+        indicator_name="rsi", candidate_hash=hashes["rsi"])
+
+    assert here == ["z_first", "a_second"]       # 決定順 (名前順なら逆)
+    assert elsewhere == []
+    out = shell._approval_detail(i2_id)
+    assert "dependent_pinned_elsewhere=z_first, a_second" in out

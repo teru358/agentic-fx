@@ -1763,3 +1763,98 @@ def test_bless_locks_are_all_released_after_candidate_changed(tmp_path,
     # 解放されていれば即座に取れる (blocking flock なのでハングしない)
     with plugin_switch._plugin_locks(plugins_root, ["rsi_pullback", "rsi"]):
         pass
+
+
+# --- [indicator-consumption-wiring] T4b Step 4-8: 再ロックの hash 分離 (P2) ---
+
+from agentic_fx.plugin import loader as plugin_loader
+from datetime import timedelta as _timedelta
+
+BAR_TS = fx.NOW.isoformat()
+
+
+def _seed_approved_in_sample_row(conn, *, content_hash, pair="USDJPY",
+                                 trades=40, pf=1.5, avg_r=0.2):
+    """既承認候補の in_sample 行を任意の `content_hash` で 1 本入れる
+    (`find_matching_approved_metrics` の母集団)。"""
+    from agentic_fx.store import approvals, backtest_runs as br
+    aid = approvals.create(conn, "plugin",
+                           {"name": "rsi_pullback", "kind": "strategy",
+                            "content_hash": content_hash}, fx.NOW)
+    approvals.apply_decision(conn, aid, status="approved", decided_by="t",
+                             now=fx.NOW)
+    br.save_harness_run(
+        conn, scope="in_sample", plugin_ref="plugins/rsi_pullback",
+        content_hash=content_hash, kind="strategy", pair=pair, timeframe="1h",
+        source="dukascopy", base_interval="5m", params={},
+        period=(fx.NOW - _timedelta(days=90), fx.NOW),
+        metrics={"trades": trades, "pf": pf, "win_rate": 0.5, "avg_r": avg_r,
+                 "max_drawdown": 0.05, "total_pnl": 100.0, "evaluable": True,
+                 "fallback_spread_used": False},
+        settings_hash="h", core_commit="c", initial_balance=1_000_000.0,
+        now=fx.NOW, variant="candidate",
+        # [indicator-consumption-wiring] T4b 逸脱: Step 4-6 と同じ理由で
+        # `mission_outcome="approval"` を明示 (母集団条件)。
+        mission_outcome="approval")
+
+
+def test_relock_creates_a_new_hash_that_never_collides_with_the_old_rows(
+        tmp_path, monkeypatch):
+    """P2 (r3 C1 シナリオの検算): S(pin I1) approved → I2 承認 → S 除外 →
+    再ロック → hash 変化 → approval / signals / backtest_runs が新 hash で
+    旧行と分離される。`find_matching_approved_metrics` は仕様どおり旧 hash
+    を返す (重複検出 API — caller 側の無視は P5 で検証)。"""
+    from agentic_fx.store import backtest_runs as br_store
+    from agentic_fx.store import signals as signals_store
+    conn, plugins_root = _switch_env(tmp_path)
+    _install_gate_double(monkeypatch)
+    fx.write_indicator(plugins_root, "rsi")
+    i1 = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)["rsi"]
+    old_dir = fx.write_rsi_pullback(plugins_root / "_human", pins={"rsi": i1})
+    old_hash = plugin_loader.content_hash(old_dir)
+    old_approval = plugin_switch.submit_candidate(
+        conn, name="rsi_pullback", staging_dir=plugins_root / "_human",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS, now=fx.NOW)
+    plugin_switch.approve_candidate(
+        conn, old_approval, decided_by="human_cli", now=fx.NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+    _seed_approved_in_sample_row(conn, content_hash=old_hash)
+    i2 = _bump_indicator_version(conn, plugins_root, "rsi", now=fx.NOW)
+    new_dir = fx.write_rsi_pullback(plugins_root / "_human2", pins={"rsi": i2})
+    new_hash = plugin_loader.content_hash(new_dir)
+    plugin_switch.submit_candidate(
+        conn, name="rsi_pullback", staging_dir=plugins_root / "_human2",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS, now=fx.NOW)
+    assert new_hash != old_hash
+    hashes_in_approvals = [
+        r[0] for r in conn.execute(
+            "SELECT json_extract(payload_json,'$.content_hash') "
+            "FROM approval_requests "
+            "WHERE json_extract(payload_json,'$.name')='rsi_pullback' "
+            "ORDER BY id")]
+    assert old_hash in hashes_in_approvals and new_hash in hashes_in_approvals
+    # [indicator-consumption-wiring] T4b 逸脱: プラン本文は「hash ごとに
+    # 1 行ずつ分離」を `len(set(...)) == len(list(...))` (全 3 行が互いに
+    # 異なる hash) で pin していたが、`_seed_approved_in_sample_row` 自身が
+    # `old_hash` で 2 本目の approval 行を作る (submit の old_hash 行と
+    # 合わせて old_hash が 2 回現れる) ため、正しい実装でも 3 hash 中 2 種
+    # (old/new) にしかならず、この pin は判別力ゼロどころか必ず赤になる
+    # 自己矛盾だった (実測で確認)。本テストが見たい性質は「新旧が同じ
+    # 行に collide しない」ことなので、new_hash がちょうど 1 回だけ現れる
+    # (= 新規 submit が旧行を上書き/合流しない) ことで確認する。
+    assert hashes_in_approvals.count(new_hash) == 1
+    assert hashes_in_approvals.count(old_hash) == 2  # submit 1 + seed 1
+    assert signals_store.add(conn, plugin="rsi_pullback", content_hash=old_hash,
+                             pair="USDJPY", timeframe="1h", bar_ts=BAR_TS,
+                             kind="strategy", payload={}, now=fx.NOW) is not None
+    assert signals_store.add(conn, plugin="rsi_pullback", content_hash=new_hash,
+                             pair="USDJPY", timeframe="1h", bar_ts=BAR_TS,
+                             kind="strategy", payload={}, now=fx.NOW) is not None
+    assert br_store.latest_in_sample_metrics(
+        conn, new_hash, pair="USDJPY", variant="candidate",
+        source="dukascopy", base_interval="5m") is None
+    assert br_store.find_matching_approved_metrics(
+        conn, pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="5m", trades=40, pf=1.5, avg_r=0.2) == old_hash
