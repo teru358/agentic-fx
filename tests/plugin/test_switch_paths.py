@@ -1568,3 +1568,198 @@ def test_submit_candidate_rejects_dependency_without_outputs(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM approval_requests "
                         "WHERE json_extract(payload_json,'$.name')="
                         "'rsi_pullback'").fetchone()[0] == 0
+
+
+# --- [indicator-consumption-wiring] T4b Step 4-4: lock 集合 / 決定時解決 / TOCTOU ---
+
+from tests.fixtures.wiring_envs import (
+    bump_indicator_version as _bump_indicator_version,
+    install_gate_double as _install_gate_double,
+)
+
+
+def test_plugin_locks_acquires_sorted_unique_names(tmp_path, monkeypatch):
+    """P2'': 同一 indicator を 2 alias で参照しても lock 取得は 1 回。
+    名前昇順 (順序 pin — 逆順で取っても deadlock しない)。"""
+    acquired = []
+    import contextlib as _ctx
+    real = plugin_switch._plugin_lock
+
+    @_ctx.contextmanager
+    def _spy(root, name):
+        acquired.append(name)
+        with real(root, name):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    with plugin_switch._plugin_locks(root, ["s", "rsi", "rsi", "adx"]):
+        pass
+    assert acquired == ["adx", "rsi", "s"]
+
+
+def test_plugin_lock_order_for_approve_candidate_is_sorted_unique(
+        tmp_path, monkeypatch):
+    """P2' (設計書 v1.3): `_plugin_lock` の取得順序が常に**名前昇順・
+    重複なし**であることを spy で pin する (順序が崩れる変異を検出)。"""
+    acquired: list[str] = []
+    import contextlib as _ctx
+    real = plugin_switch._plugin_lock
+
+    @_ctx.contextmanager
+    def _spy(root, name):
+        acquired.append(name)
+        with real(root, name):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    conn, plugins_root = _switch_env(tmp_path)
+    _install_gate_double(monkeypatch)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    fx.write_rsi_pullback(plugins_root / "_human", pins={"rsi": hashes["rsi"]})
+    approval_id = plugin_switch.submit_candidate(
+        conn, name="rsi_pullback", staging_dir=plugins_root / "_human",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS, now=fx.NOW)
+    acquired.clear()  # submit 経路のロックは対象外、approve 経路だけを見る
+    plugin_switch.approve_candidate(
+        conn, approval_id, decided_by="human_cli", now=fx.NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+    assert acquired == sorted({"rsi_pullback", "rsi"})
+
+
+def test_dependency_lock_blocks_a_concurrent_indicator_approval(tmp_path):
+    """並行実行の相互排除: S の approve が握っている間、依存 indicator I
+    の approve は待たされる。"""
+    import threading
+
+    root = tmp_path / "plugins"
+    root.mkdir()
+    holding = threading.Event()
+    release = threading.Event()
+    acquired_second = threading.Event()
+
+    def hold_strategy_locks():
+        with plugin_switch._plugin_locks(root, ["rsi_pullback", "rsi"]):
+            holding.set()
+            release.wait(5.0)
+
+    def take_indicator_lock():
+        with plugin_switch._plugin_lock(root, "rsi"):
+            acquired_second.set()
+
+    a = threading.Thread(target=hold_strategy_locks)
+    a.start()
+    assert holding.wait(5.0), "strategy locks were never acquired"
+    b = threading.Thread(target=take_indicator_lock)
+    b.start()
+    try:
+        assert not acquired_second.wait(0.5), \
+            "indicator lock was granted while the strategy held it"
+    finally:
+        release.set()
+    a.join(5.0)
+    assert acquired_second.wait(5.0)
+    b.join(5.0)
+    assert not a.is_alive() and not b.is_alive()
+
+
+def test_approve_candidate_rejects_pin_mismatch_and_stays_pending(tmp_path,
+                                                                  monkeypatch):
+    """A2: submit 後に indicator を更新 → approve で
+    ValueError('indicator_unresolved:rsi:pin_mismatch')、pending のまま、
+    `.versions` に新版なし、symlink 不変。"""
+    conn, plugins_root = _switch_env(tmp_path)
+    _install_gate_double(monkeypatch)   # codex plan r1 C1 (submit は実 gate)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    fx.write_rsi_pullback(plugins_root / "_human", pins={"rsi": hashes["rsi"]})
+    approval_id = plugin_switch.submit_candidate(
+        conn, name="rsi_pullback", staging_dir=plugins_root / "_human",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS, now=fx.NOW)
+
+    _bump_indicator_version(conn, plugins_root, "rsi", now=fx.NOW)
+    before_versions = sorted(
+        p.name for p in (plugins_root / ".versions" / "rsi_pullback").glob("*")) \
+        if (plugins_root / ".versions" / "rsi_pullback").is_dir() else []
+    before_link = (plugins_root / "rsi_pullback").is_symlink()
+
+    with pytest.raises(ValueError) as ei:
+        plugin_switch.approve_candidate(
+            conn, approval_id, decided_by="human_cli", now=fx.NOW,
+            plugins_root=plugins_root, settings=SETTINGS)
+    assert str(ei.value) == "indicator_unresolved:rsi:pin_mismatch"
+    assert conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                        (approval_id,)).fetchone()["status"] == "pending"
+    after_versions = sorted(
+        p.name for p in (plugins_root / ".versions" / "rsi_pullback").glob("*")) \
+        if (plugins_root / ".versions" / "rsi_pullback").is_dir() else []
+    assert after_versions == before_versions
+    assert (plugins_root / "rsi_pullback").is_symlink() == before_link
+
+
+def test_bless_detects_candidate_change_between_read_and_lock(tmp_path,
+                                                              monkeypatch):
+    """P2'': 事前読取 → lock 取得の間に候補 config.yaml を差し替えると
+    固定文言 `candidate_changed`、approval 行 0、`.versions`/symlink 不変。
+
+    gate double は不要 — `candidate_changed` は `_plugin_locks` の内側・
+    `_run_full_gate` の**手前**で送出されるので backtest に到達しない。"""
+    conn, plugins_root = _switch_env(tmp_path)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    human = plugins_root / "_human"
+    d = fx.write_rsi_pullback(human, pins={"rsi": hashes["rsi"]})
+
+    import contextlib as _ctx
+    real = plugin_switch._plugin_locks
+
+    @_ctx.contextmanager
+    def _tamper(root, names):
+        (d / "config.yaml").write_text(
+            (d / "config.yaml").read_text() + "\n# tampered\n")
+        with real(root, names):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_locks", _tamper)
+    with pytest.raises(ValueError, match="^candidate_changed$"):
+        plugin_switch.bless_candidate(
+            conn, name="rsi_pullback", human_dir=d,
+            settings=SETTINGS,
+            now=fx.NOW, decided_by="human_cli")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 1  # rsi のみ
+    assert not (plugins_root / ".versions" / "rsi_pullback").exists()
+
+
+def test_bless_locks_are_all_released_after_candidate_changed(tmp_path,
+                                                              monkeypatch):
+    """同上: 全 lock が解放されている (次の操作がブロックしない)。"""
+    conn, plugins_root = _switch_env(tmp_path)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    human = plugins_root / "_human"
+    d = fx.write_rsi_pullback(human, pins={"rsi": hashes["rsi"]})
+    import contextlib as _ctx
+    real = plugin_switch._plugin_locks
+
+    @_ctx.contextmanager
+    def _tamper(root, names):
+        (d / "config.yaml").write_text(
+            (d / "config.yaml").read_text() + "\n# tampered\n")
+        with real(root, names):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_locks", _tamper)
+    with pytest.raises(ValueError):
+        plugin_switch.bless_candidate(
+            conn, name="rsi_pullback", human_dir=d,
+            settings=SETTINGS,
+            now=fx.NOW, decided_by="human_cli")
+    monkeypatch.undo()
+    # 解放されていれば即座に取れる (blocking flock なのでハングしない)
+    with plugin_switch._plugin_locks(plugins_root, ["rsi_pullback", "rsi"]):
+        pass

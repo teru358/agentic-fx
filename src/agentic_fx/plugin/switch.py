@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal
 
+import yaml
+
 from agentic_fx._safe_error import safe_error_text  # 検収 m10: per-row fault isolation の ERROR 記録に使う
 from agentic_fx.activity import ActivityLog, Category  # B-2: journal_store 層に activity を書かせない
 from agentic_fx.plugin import (
@@ -21,6 +23,9 @@ from agentic_fx.plugin import (
 )
 from agentic_fx.plugin.gate_pytest import (  # M-8: モジュールレベル import (11d/11e/11g の monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", ...) seam が効くために必須)
     check_candidate_snapshot, hashes_of, run_gate_pytest,
+)
+from agentic_fx.plugin.resolve import (  # [indicator-consumption-wiring] T4b Step 4-4
+    IndicatorResolutionError, resolve_indicator_deps,
 )
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.tools import plugin_loader as tools_plugin_loader
@@ -737,6 +742,37 @@ def _plugin_lock(plugins_root: Path, name: str):
         fh.close()
 
 
+@contextlib.contextmanager
+def _plugin_locks(plugins_root: Path, names):
+    """[indicator-consumption-wiring] §2.3 (codex r4 I1 / r5 I2):
+    strategy + 依存 indicator 名を `sorted(set(names))` の順に取る。
+
+    - **重複排除**: 同一 indicator を複数 alias から参照しても 1 回だけ取る
+      (二重取得は同一プロセス内の flock 再入で無害だが、spy が数える
+      「取得回数」を契約として固定する — P2'')。
+    - **名前昇順**: 逆順で取る呼び出し元が現れても deadlock しないよう
+      順序を 1 箇所に固定する (P2')。
+    """
+    with contextlib.ExitStack() as stack:
+        for name in sorted(set(names)):
+            stack.enter_context(_plugin_lock(plugins_root, name))
+        yield
+
+
+def _dependency_names(candidate_dir: Path, name: str) -> list[str]:
+    """候補 `config.yaml` から依存 indicator 名を読む (lock 集合の材料)。
+    読めない/依存なしなら `[name]` だけを返す。"""
+    try:
+        config = yaml.safe_load(
+            (candidate_dir / "config.yaml").read_text(encoding="utf-8"))
+    except (OSError, ValueError, yaml.YAMLError):
+        return [name]
+    refs = (config or {}).get("indicators") or {}
+    deps = [ref.get("plugin") for ref in refs.values()
+            if isinstance(ref, dict) and isinstance(ref.get("plugin"), str)]
+    return [name, *deps]
+
+
 def _write_gate_rows(conn: sqlite3.Connection, rows, *,
                      mission_outcome: str) -> None:
     """[profitability-floor] codex 2 周目レビュー CR5 (2026-09-13):
@@ -939,7 +975,7 @@ def submit_candidate(
         name=name, mission_id=mission_id)
     candidate_dir = staging_dir / name
 
-    with _plugin_lock(plugins_root, name):
+    with _plugin_locks(plugins_root, _dependency_names(candidate_dir, name)):
         meta, content_hash, artifact_hash, outcome = _run_full_gate(
             conn, candidate_dir, name=name, settings=settings, now=now,
             floor_mode="enforce", plugins_root=plugins_root, activity=activity)
@@ -1221,7 +1257,19 @@ def approve_candidate(
     payload = json.loads(row["payload_json"])
     name = payload["name"]
 
-    with _plugin_lock(plugins_root, name):  # 0b
+    payload_pre = json.loads(row["payload_json"])
+    candidate_origin_pre = payload_pre["candidate_origin"]
+    candidate_path_pre = payload_pre["candidate_path"]
+    candidate_dir_pre = None
+    try:
+        candidate_dir_pre = resolve_candidate_dir(
+            plugins_root, candidate_origin=candidate_origin_pre,
+            candidate_path=candidate_path_pre, name=name)
+        dep_names = _dependency_names(candidate_dir_pre, name)
+    except CandidateMissingError:
+        dep_names = [name]
+
+    with _plugin_locks(plugins_root, dep_names):  # 0b
         row = conn.execute(
             "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
         if row["status"] != "pending":
@@ -1242,6 +1290,23 @@ def approve_candidate(
             # 削除する (§5.1 手順 3)。
             _drop_staging_candidate(plugins_root, payload, activity=activity)
             return
+
+        # [indicator-consumption-wiring] §2.3: P2 (決定時) に `require` で
+        # **解決だけ**行う (gate は再実行しない)。submit → approve の間に
+        # indicator が更新されていれば pending のまま拒否する — 版作成・
+        # symlink 切替に進まない。inventory はこの lock の内側で構築する
+        # (lock の外で読むと切替との間に別ロックの承認が割り込む)。
+        meta_for_deps = (loader._discover_one(candidate_dir_pre, name)
+                        if candidate_dir_pre is not None else None)
+        if meta_for_deps is not None and meta_for_deps.kind == "strategy":
+            inventory = tools_plugin_loader.approved_plugins(
+                conn, plugins_root, settings=settings)
+            try:
+                resolve_indicator_deps(
+                    meta_for_deps, inventory.inventory, settings=settings,
+                    pin_mode="require")
+            except IndicatorResolutionError as exc:
+                raise ValueError(str(exc)) from exc
 
         # 0d: 同名の未完ジャーナルが「この approval 自身の再試行」であれば
         # その op_id から再開する。switched まで進んでいれば decide のみ
@@ -1602,7 +1667,17 @@ def bless_candidate(
 
     approvals_store.expire_due(conn, now, commit=True)  # 0a
 
-    with _plugin_lock(plugins_root, name):  # 0b
+    # [indicator-consumption-wiring] §2.3 (codex r5 I2): bless は候補
+    # (mutable な `_human`) から依存名を lock **前**に読むので、lock 取得後に
+    # 候補の content_hash と依存名集合を再読し、事前読取と完全一致しなければ
+    # 全解放して固定文言 `candidate_changed` で失敗する (retry しない)。
+    pre_hash = loader.content_hash(human_dir)
+    pre_deps = sorted(set(_dependency_names(human_dir, name)))
+
+    with _plugin_locks(plugins_root, pre_deps):  # 0b
+        if (loader.content_hash(human_dir) != pre_hash
+                or sorted(set(_dependency_names(human_dir, name))) != pre_deps):
+            raise ValueError("candidate_changed")
         # 確定-2: `approve_candidate` (switch.py:728-733) と同じガードを
         # `bless_candidate` にも置く。無ければ `begin_switch_journal` が
         # 部分 UNIQUE index に当たり、生の `sqlite3.IntegrityError` が
