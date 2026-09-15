@@ -3,6 +3,10 @@
 docs/examples/plugins/ は discover の対象外 (承認・本番配線とは独立の
 サンプル)。承認フロー (プラン 7 Task 6) はこのファイルを実行して plugin
 提出者が「動くテスト」を書いていることを検証する。
+
+[indicator-consumption-wiring] 2026-09-14: 戻り値を**系列** (`pd.Series`、
+df と同じ index、warmup 行は NaN) にした。`config.yaml` の `outputs: [rsi]`
+が宣言キー — ハーネスは毎回この集合と完全一致することを検証する。
 """
 from __future__ import annotations
 
@@ -19,33 +23,50 @@ def _df(closes: list[float]) -> pd.DataFrame:
         index=idx)
 
 
-def test_compute_returns_rsi_key_when_enough_bars():
-    closes = [100 + i * 0.1 for i in range(30)]
-    out = compute(_df(closes), {})
-    assert "rsi_14" in out
-    assert 0.0 <= out["rsi_14"] <= 100.0
+def test_compute_returns_declared_output_key_only():
+    out = compute(_df([100 + i * 0.1 for i in range(30)]), {})
+    assert set(out) == {"rsi"}
 
 
-def test_compute_warmup_insufficient_returns_empty():
-    """len(df) < period+1 は空を返す (warmup は plugin 自身の責務)。"""
-    out = compute(_df([100.0] * 5), {})
-    assert out == {}
+def test_compute_returns_series_aligned_to_df_index():
+    df = _df([100 + i * 0.1 for i in range(30)])
+    out = compute(df, {})
+    assert isinstance(out["rsi"], pd.Series)
+    assert out["rsi"].index.equals(df.index)
 
 
-def test_compute_uptrend_yields_high_rsi():
-    closes = [100 + i for i in range(20)]  # 単調増加
-    out = compute(_df(closes), {})
-    assert out["rsi_14"] > 70.0
+def test_warmup_rows_are_nan_and_later_rows_have_values():
+    df = _df([100 + i * 0.1 for i in range(30)])
+    rsi = compute(df, {})["rsi"]
+    # period=14 (`min_periods=14`) → **先頭 14 行 (index 0..13) が NaN**、
+    # index 14 (15 本目) から値が入る。probe 実測 (`tmp/plan-indicator-wiring/
+    # probe_fixture.txt`) と設計書 §6 の warmup 記述と一致する。
+    # codex plan r1 M4: `iloc[:13]` では index 13 を見ておらず、warmup が
+    # 1 本早く明ける変異を検出できなかった。**境界 2 点を pin する**。
+    assert bool(rsi.iloc[:14].isna().all())
+    assert not pd.isna(rsi.iloc[14])
+    assert not pd.isna(rsi.iloc[-1])
+    assert 0.0 <= float(rsi.iloc[-1]) <= 100.0
 
 
-def test_compute_respects_custom_period_param():
-    closes = [100 + i * 0.1 for i in range(10)]
-    out = compute(_df(closes), {"period": 5})
-    assert "rsi_5" in out
+def test_short_frame_returns_all_nan_series_not_empty_dict():
+    df = _df([100.0] * 5)
+    out = compute(df, {})
+    assert set(out) == {"rsi"}
+    assert bool(out["rsi"].isna().all())
 
 
-def test_compute_flat_series_yields_neutral_rsi():
-    """avg_gain == avg_loss == 0 (完全フラット) は中立 50.0 を返す —
-    100.0 (買われすぎ) は誤解を招く (レビュー fix round 1 C8)。"""
-    out = compute(_df([100.0] * 20), {})
-    assert out["rsi_14"] == 50.0
+def test_uptrend_yields_high_rsi():
+    rsi = compute(_df([100 + i for i in range(20)]), {})["rsi"]
+    assert float(rsi.iloc[-1]) > 70.0
+
+
+def test_custom_period_param_keeps_the_same_output_key():
+    out = compute(_df([100 + i * 0.1 for i in range(10)]), {"period": 5})
+    assert set(out) == {"rsi"}
+    assert not pd.isna(out["rsi"].iloc[-1])
+
+
+def test_flat_series_yields_neutral_rsi():
+    rsi = compute(_df([100.0] * 20), {})["rsi"]
+    assert float(rsi.iloc[-1]) == 50.0

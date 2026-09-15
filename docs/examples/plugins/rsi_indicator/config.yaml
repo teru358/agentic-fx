@@ -1,3 +1,4 @@
 kind: indicator
+outputs: [rsi]
 params:
   period: 14

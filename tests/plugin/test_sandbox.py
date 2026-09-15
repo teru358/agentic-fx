@@ -814,19 +814,22 @@ def test_signal_rationale_over_2000_chars_rejected(tmp_path, plugin_settings):
 # --- integration: サンプル plugin (rsi_indicator / sma_cross) -------------
 
 def test_sample_rsi_indicator_passes_check_source_and_runs(plugin_settings):
+    # [indicator-consumption-wiring] 2026-09-14: サンプルは系列返却
+    # (`outputs: [rsi]`) に更新済み。
     plugin_dir = SAMPLES / "rsi_indicator"
     check_source(plugin_dir / "plugin.py")
     meta = PluginMeta(name="rsi_indicator", kind="indicator", path=plugin_dir,
                       params={"period": 14}, timeframe=None, pairs=(),
-                      max_bars=200, content_hash=_real_content_hash(plugin_dir))
+                      max_bars=200, content_hash=_real_content_hash(plugin_dir),
+                      outputs=("rsi",))
     closes = [100 + i * 0.1 for i in range(30)]
     idx = pd.date_range("2026-01-01", periods=len(closes), freq="1h", tz="UTC")
     df = pd.DataFrame(
         {"open": closes, "high": closes, "low": closes, "close": closes,
          "volume": [1.0] * len(closes)}, index=idx)
     out = run_plugin(meta, {"df": df, "params": {"period": 14}}, settings=plugin_settings)
-    assert "rsi_14" in out
-    assert 0.0 <= out["rsi_14"] <= 100.0
+    assert "rsi" in out
+    assert 0.0 <= out["rsi"][-1] <= 100.0
 
 
 def test_sample_sma_cross_passes_check_source_and_runs(plugin_settings):
