@@ -84,7 +84,26 @@ _KNOWN_KINDS = frozenset(_KIND_FUNCS)
 
 # config.yaml で許容するトップレベルキー。未知キーは fail closed で reject。
 _KNOWN_CONFIG_KEYS = frozenset(
-    {"kind", "params", "timeframe", "pairs", "exit_mode", "max_bars"})
+    {"kind", "params", "timeframe", "pairs", "exit_mode", "max_bars",
+     "indicators", "outputs"})
+
+# 上限 (設計書 §2.2、codex r5 C1)。handshake 総量上限は resolve.py が持つ。
+MAX_INDICATOR_DEPS = 8
+MAX_OUTPUTS = 32
+MAX_PARAMS_BYTES = 8192
+
+_ALIAS_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_OUTPUT_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_PIN_RE = re.compile(r"^[0-9a-f]{64}$")
+_INDICATOR_REF_KEYS = frozenset({"plugin", "params", "pin"})
+
+
+@dataclass(frozen=True, slots=True)
+class IndicatorRef:
+    alias: str
+    plugin: str
+    params: dict
+    pin: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +117,10 @@ class PluginMeta:
     max_bars: int
     content_hash: str
     artifact_hash: str | None = None  # プラン10 Task 5 5-F (申し送り③)
+    # [indicator-consumption-wiring] 設計書 §2.2。strategy 以外は必ず ()、
+    # indicator 以外の outputs は必ず None (kind 限定は _validate_config)。
+    indicators: tuple["IndicatorRef", ...] = ()
+    outputs: tuple[str, ...] | None = None
 
 
 _PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -132,6 +155,12 @@ def _reject(name: str, reason: str) -> None:
     sink = _reject_sink.get()
     if sink is not None:
         sink.append(reason)
+
+
+def _check_json_safe(value: object, path: str) -> str | None:
+    """[indicator-consumption-wiring] T1 Step 1-1 のスタブ。本実装は
+    Step 1-2 で入れる (opus r1 M5)。"""
+    return None
 
 
 def _validate_config(raw: dict, name: str) -> dict | None:
@@ -199,12 +228,88 @@ def _validate_config(raw: dict, name: str) -> dict | None:
         _reject(name, f"invalid max_bars: {max_bars!r} (must be an int >= 1)")
         return None
 
+    indicators: tuple[IndicatorRef, ...] = ()
+    if "indicators" in raw:
+        if kind != "strategy":
+            _reject(name, "indicators_not_allowed_for_kind")
+            return None
+        refs = raw["indicators"]
+        if not isinstance(refs, dict) or not refs:
+            _reject(name, "indicator_ref_bad_alias")
+            return None
+        if len(refs) > MAX_INDICATOR_DEPS:
+            _reject(name, "too_many_indicators")
+            return None
+        built: list[IndicatorRef] = []
+        seen: set[str] = set()
+        for alias, ref in refs.items():
+            if not isinstance(alias, str) or not _ALIAS_RE.fullmatch(alias):
+                _reject(name, "indicator_ref_bad_alias")
+                return None
+            if alias in seen:
+                _reject(name, "indicator_ref_duplicate_alias")
+                return None
+            seen.add(alias)
+            if not isinstance(ref, dict):
+                _reject(name, "indicator_ref_missing_plugin")
+                return None
+            unknown = sorted(set(ref) - _INDICATOR_REF_KEYS)
+            if unknown:
+                _reject(name, f"indicator_ref_unknown_key:{unknown[0]}")
+                return None
+            plugin_name = ref.get("plugin")
+            if not isinstance(plugin_name, str) or not plugin_name:
+                _reject(name, "indicator_ref_missing_plugin")
+                return None
+            if not _PLUGIN_NAME_RE.fullmatch(plugin_name):
+                _reject(name, "indicator_ref_bad_plugin_name")
+                return None
+            ref_params = ref.get("params", {})
+            if not isinstance(ref_params, dict):
+                _reject(name, f"params_not_json_safe:indicators.{alias}.params")
+                return None
+            bad = _check_json_safe(ref_params, f"indicators.{alias}.params")
+            if bad is not None:
+                _reject(name, bad)
+                return None
+            pin = ref.get("pin")
+            if pin is not None and (not isinstance(pin, str)
+                                    or not _PIN_RE.fullmatch(pin)):
+                _reject(name, "indicator_ref_bad_pin")
+                return None
+            built.append(IndicatorRef(alias=alias, plugin=plugin_name,
+                                      params=ref_params, pin=pin))
+        indicators = tuple(built)
+
+    outputs: tuple[str, ...] | None = None
+    if "outputs" in raw:
+        if kind != "indicator":
+            _reject(name, "outputs_not_allowed_for_kind")
+            return None
+        raw_outputs = raw["outputs"]
+        if not isinstance(raw_outputs, list) or not raw_outputs:
+            _reject(name, "outputs_bad_entry")
+            return None
+        if len(raw_outputs) > MAX_OUTPUTS:
+            _reject(name, "too_many_outputs")
+            return None
+        for item in raw_outputs:
+            if not isinstance(item, str) or not _OUTPUT_RE.fullmatch(item):
+                _reject(name, "outputs_bad_entry")
+                return None
+        if len(set(raw_outputs)) != len(raw_outputs):
+            _reject(name, "outputs_duplicate")
+            return None
+        outputs = tuple(raw_outputs)
+
     return {
         "kind": kind,
         "params": params,
         "timeframe": timeframe,
         "pairs": pairs,
         "max_bars": max_bars,
+        "indicators": indicators,
+        "outputs": outputs,
     }
 
 
@@ -433,6 +538,8 @@ def _discover_one(entry: Path, name: str) -> PluginMeta | None:
         max_bars=fields["max_bars"],
         content_hash=content_hash(entry),
         artifact_hash=artifact_hash_bytes(plugin_bytes, config_bytes, test_bytes),
+        indicators=fields["indicators"],
+        outputs=fields["outputs"],
     )
 
 

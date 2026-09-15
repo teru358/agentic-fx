@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
+from agentic_fx.plugin import loader
 from agentic_fx.plugin import loader as loader_module
 from agentic_fx.plugin.loader import (
     PluginMeta,
@@ -903,3 +904,132 @@ def test_discover_one_with_reason_reports_oserror_reason(tmp_path, monkeypatch):
     assert isinstance(reason, str)
     assert "I/O error" in reason
     assert "boom" in reason
+
+
+# --- [indicator-consumption-wiring] T1: indicators / outputs schema (L1) ---
+
+_STRATEGY_PY = (
+    "def evaluate(df, indicators, signals, params):\n"
+    "    return {'action': 'hold', 'rationale': 'x'}\n")
+_INDICATOR_PY = "def compute(df, params):\n    return {}\n"
+_TEST_PY = "def test_placeholder():\n    pass\n"
+
+
+def _write(base, name, *, plugin_py, config_yaml):
+    d = base / name
+    d.mkdir()
+    (d / "plugin.py").write_text(plugin_py)
+    (d / "config.yaml").write_text(config_yaml)
+    (d / "test_plugin.py").write_text(_TEST_PY)
+    return d
+
+
+_STRATEGY_HEAD = ("kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\n"
+                  "exit_mode: levels\nmax_bars: 200\n")
+
+
+@pytest.mark.parametrize("body,reason", [
+    ("indicators:\n  rsi: {plugin: rsi, bogus: 1}\n",
+     "indicator_ref_unknown_key:bogus"),
+    ("indicators:\n  rsi: {params: {p: 1}}\n", "indicator_ref_missing_plugin"),
+    ("indicators:\n  rsi: {plugin: 'Bad Name'}\n", "indicator_ref_bad_plugin_name"),
+    ("indicators:\n  RSI: {plugin: rsi}\n", "indicator_ref_bad_alias"),
+    ("indicators:\n  rsi: {plugin: rsi, pin: 'zz'}\n", "indicator_ref_bad_pin"),
+    ("outputs: [rsi]\n", "outputs_not_allowed_for_kind"),
+])
+def test_strategy_config_rejects_with_fixed_reason(tmp_path, body, reason):
+    d = _write(tmp_path, "s1", plugin_py=_STRATEGY_PY,
+               config_yaml=_STRATEGY_HEAD + body)
+    meta, got = loader.discover_one_with_reason(d, "s1")
+    assert meta is None
+    assert got == reason
+
+
+def test_indicator_config_rejects_indicators_key(tmp_path):
+    d = _write(tmp_path, "i1", plugin_py=_INDICATOR_PY,
+               config_yaml="kind: indicator\nindicators:\n  a: {plugin: b}\n")
+    meta, got = loader.discover_one_with_reason(d, "i1")
+    assert meta is None
+    assert got == "indicators_not_allowed_for_kind"
+
+
+@pytest.mark.parametrize("outputs,reason", [
+    ("outputs: []\n", "outputs_bad_entry"),
+    ("outputs: [rsi, rsi]\n", "outputs_duplicate"),
+    ("outputs: [RSI]\n", "outputs_bad_entry"),
+    ("outputs: [1]\n", "outputs_bad_entry"),
+])
+def test_indicator_outputs_rejects(tmp_path, outputs, reason):
+    d = _write(tmp_path, "i2", plugin_py=_INDICATOR_PY,
+               config_yaml="kind: indicator\n" + outputs)
+    meta, got = loader.discover_one_with_reason(d, "i2")
+    assert meta is None
+    assert got == reason
+
+
+def test_same_plugin_via_multiple_aliases_is_accepted(tmp_path):
+    # opus r1 M7 是正: 旧名 `test_duplicate_alias_via_two_entries_is_rejected`
+    # は「拒否」を名乗りながら**受理**を検査していた (U3 で同一 plugin の
+    # 複数 alias は許容される)。名前を内容に合わせる。
+    # YAML の重複キーは _NoDuplicateKeySafeLoader が先に落とすため、
+    # 別名の重複は「同じ plugin を 2 alias」ではなく alias 自身の重複を作る
+    # 経路が無い。ここでは alias 数の上限と、同一 plugin の複数 alias が
+    # **許容される** ことを固定する (U3)。
+    body = "indicators:\n" + "".join(
+        f"  a{i}: {{plugin: rsi}}\n" for i in range(8))
+    d = _write(tmp_path, "s8", plugin_py=_STRATEGY_PY,
+               config_yaml=_STRATEGY_HEAD + body)
+    meta, reason = loader.discover_one_with_reason(d, "s8")
+    assert reason is None
+    assert len(meta.indicators) == 8
+    assert [r.alias for r in meta.indicators] == [f"a{i}" for i in range(8)]
+    assert all(r.plugin == "rsi" and r.pin is None for r in meta.indicators)
+
+
+def test_nine_indicator_deps_rejected(tmp_path):
+    body = "indicators:\n" + "".join(
+        f"  a{i}: {{plugin: rsi}}\n" for i in range(9))
+    d = _write(tmp_path, "s9", plugin_py=_STRATEGY_PY,
+               config_yaml=_STRATEGY_HEAD + body)
+    meta, reason = loader.discover_one_with_reason(d, "s9")
+    assert meta is None
+    assert reason == "too_many_indicators"
+
+
+def test_outputs_32_ok_33_rejected(tmp_path):
+    ok = "outputs: [" + ", ".join(f"o{i}" for i in range(32)) + "]\n"
+    ng = "outputs: [" + ", ".join(f"o{i}" for i in range(33)) + "]\n"
+    d_ok = _write(tmp_path, "i32", plugin_py=_INDICATOR_PY,
+                  config_yaml="kind: indicator\n" + ok)
+    meta, reason = loader.discover_one_with_reason(d_ok, "i32")
+    assert reason is None and len(meta.outputs) == 32
+    d_ng = _write(tmp_path, "i33", plugin_py=_INDICATOR_PY,
+                  config_yaml="kind: indicator\n" + ng)
+    meta, reason = loader.discover_one_with_reason(d_ng, "i33")
+    assert meta is None and reason == "too_many_outputs"
+
+
+def test_indicator_without_outputs_still_discovers(tmp_path):
+    """U4: loader では outputs は任意 (既存配備との discover 互換)。"""
+    d = _write(tmp_path, "i0", plugin_py=_INDICATOR_PY,
+               config_yaml="kind: indicator\nparams:\n  period: 14\n")
+    meta, reason = loader.discover_one_with_reason(d, "i0")
+    assert reason is None
+    assert meta.outputs is None
+    assert meta.indicators == ()
+
+
+def test_strategy_indicator_ref_is_frozen_and_ordered(tmp_path):
+    body = ("indicators:\n"
+            "  rsi: {plugin: rsi_wilder, params: {period: 21}}\n"
+            "  adx: {plugin: adx, pin: '" + "3f9a" * 16 + "'}\n")
+    d = _write(tmp_path, "s2", plugin_py=_STRATEGY_PY,
+               config_yaml=_STRATEGY_HEAD + body)
+    meta, reason = loader.discover_one_with_reason(d, "s2")
+    assert reason is None
+    assert [r.alias for r in meta.indicators] == ["rsi", "adx"]  # 宣言順
+    assert meta.indicators[0].params == {"period": 21}
+    assert meta.indicators[1].pin == "3f9a" * 16
+    assert meta.outputs is None
+    with pytest.raises(Exception):
+        meta.indicators[0].alias = "x"   # frozen dataclass
