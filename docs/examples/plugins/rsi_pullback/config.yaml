@@ -1,0 +1,16 @@
+kind: strategy
+timeframe: 1h
+pairs: [USDJPY]
+exit_mode: levels
+max_bars: 200
+indicators:
+  rsi:
+    plugin: rsi_indicator
+    params:
+      period: 14
+params:
+  oversold: 30
+  overbought: 70
+  stop_loss_pips: 30
+  take_profit_pips: 60
+  pip_size: 0.01
