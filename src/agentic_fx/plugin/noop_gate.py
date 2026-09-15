@@ -28,39 +28,49 @@ def _config_value(plugin_dir: Path):
 
 
 def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
-                   name: str) -> str | None:
-    """Find a candidate whose code and config both match an existing plugin.
+                   examples_dir: Path, name: str,
+                   inventory) -> str | None:
+    """コードと config が既存 plugin と両方一致する候補を検出する。
 
-    Both must match so parameter-only variants remain valid: changing only
-    config can be a substantive plugin candidate even when code is shared.
-    Unreadable or invalid comparison targets are ignored; candidate errors are
-    allowed to propagate to the gate that owns candidate validation.
+    [indicator-consumption-wiring] §2.7 (codex r4 C2 / r8 I1):
+    - 比較は **`same_modulo_pins`** (正規化 AST + `strip_pins(config)`) —
+      pin は作者の設計判断ではなくハーネスの派生値なので、「lock しただけの
+      コピー」は noop のまま検出される (ロックで noop を回避できない)。
+    - ただし**同名**の snapshot plugin との比較だけは
+      `is_relock_transition` を例外にする。例外が無いと正式な再ロック経路
+      (複製 → pin だけ I1→I2 → 提出) が必ず `noop_copy_of:S` で拒否される。
+      「現在 inventory の hash」は `inventory.inventory` (最終 admit 済
+      indicator) から引く。
+    - 入力 (`source_snapshot_dir` / `examples_dir` / `inventory`) は**明示
+      注入**する — 呼び出し元が持っている値を関数内で推測しない。
 
     AST 同一性は逐語コピー検出の下限。``pass`` 追加・注釈・import 順などの
     無害変形は検出対象外 (設計判断 2026-09-01)。
     """
-    candidate_ast = normalized_plugin_ast(plugin_dir / "plugin.py")
-    candidate_config = _config_value(plugin_dir)
-    comparisons: list[tuple[str, Path]] = []
-    examples = source_snapshot_dir / "_examples"
-    if examples.is_dir():
+    from agentic_fx.plugin.resolve import is_relock_transition, same_modulo_pins
+
+    comparisons: list[tuple[str, Path, bool]] = []
+    if examples_dir.is_dir():
         comparisons.extend(
-            (f"_examples/{item.name}", item)
-            for item in sorted(examples.iterdir()) if item.is_dir())
+            (f"_examples/{item.name}", item, False)
+            for item in sorted(examples_dir.iterdir()) if item.is_dir())
     if source_snapshot_dir.is_dir():
         comparisons.extend(
-            (item.name, item) for item in sorted(source_snapshot_dir.iterdir())
+            (item.name, item, item.name == name)
+            for item in sorted(source_snapshot_dir.iterdir())
             if item.is_dir() and not item.name.startswith("_")
             and (item / "plugin.py").is_file())
 
-    for label, comparison in comparisons:
+    for label, comparison, is_same_name in comparisons:
         try:
-            comparison_ast = normalized_plugin_ast(comparison / "plugin.py")
-            comparison_config = _config_value(comparison)
+            if not same_modulo_pins(plugin_dir, comparison):
+                continue
+            if is_same_name and is_relock_transition(
+                    plugin_dir, comparison, inventory.inventory):
+                continue
         except (OSError, UnicodeError, SyntaxError, yaml.YAMLError):
             continue
-        if candidate_ast == comparison_ast and candidate_config == comparison_config:
-            return label
+        return label
     return None
 
 

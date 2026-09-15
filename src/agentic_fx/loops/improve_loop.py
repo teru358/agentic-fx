@@ -44,6 +44,7 @@ from agentic_fx.plugin.gate_pytest import (
 )
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin.noop_gate import count_self_test_functions, find_noop_copy
+from agentic_fx.plugin.resolve import is_relock_transition
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.strategy_gate import (
     _check_profitability_floor,
@@ -190,6 +191,17 @@ class _SelectionOutcome:  # 新規命名
     # `inserted_ids` は撤回。起票時の系譜は INSERT 時点で
     # `improvement_backlog.origin_mission_id` へ直接書く (`commit()` 側で
     # 後から絞り込む必要がなくなった)。
+
+
+def _empty_inventory_result(plugins_root: Path):
+    """[indicator-consumption-wiring] T4b: `inventory` が渡されない直接
+    テスト呼び出し (conn を持たない経路) 用のフォールバック — 空
+    `InventoryBuildResult`。`is_relock_transition` の再ロック例外は
+    「現在 inventory」を引けないため常に False になる (安全側)。"""
+    from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
+    inv = ApprovedInventory(root=plugins_root.resolve(), metas=())
+    return InventoryBuildResult(inventory=inv, phase1_metas=(), resolved={},
+                                rejected_strategies=())
 
 
 @dataclass(frozen=True)
@@ -1318,8 +1330,20 @@ class ImproveLoop:
             conn.rollback()
             raise
 
+    def _inventory_for_gate(self, conn):
+        """[indicator-consumption-wiring] T4b Step 4-6c (codex plan r2 束3
+        Critical): `ctx.inventory` が (本 task の時点では常に) `None` の
+        ときの暫定フォールバック — `approved_plugins` を都度呼ぶだけ。
+        `_run_plugin_gate` の呼び出し元 (`commit()`) と
+        `_check_duplicate_metrics_for_approval` の呼び出し元
+        (`_finalize_success`) の両方が共有する。T5a Step 5-1 で
+        `ctx.inventory` が実配線された後は使われなくなる。"""
+        return approved_plugins(conn, self._root / "plugins",
+                                settings=self._settings)
+
     def _run_plugin_gate(self, plugin_dir: Path, *, name: str,
-                         source_snapshot_dir: Path) -> _PluginGateVerdict:
+                         source_snapshot_dir: Path,
+                         inventory=None) -> _PluginGateVerdict:
         # precheck 2026-08-22 wave2: T10-B14 T10-M5 T10-M6 T10-M7
         try:
             check_candidate_snapshot(plugin_dir)
@@ -1342,7 +1366,10 @@ class ImproveLoop:
 
         try:
             noop_copy = find_noop_copy(
-                plugin_dir, source_snapshot_dir=source_snapshot_dir, name=name)
+                plugin_dir, source_snapshot_dir=source_snapshot_dir,
+                examples_dir=source_snapshot_dir / "_examples", name=name,
+                inventory=(inventory if inventory is not None
+                          else _empty_inventory_result(self._root / "plugins")))
         except SyntaxError:
             return _PluginGateVerdict(passed=False, reason="plugin.py syntax error")
         if noop_copy is not None:
@@ -1959,7 +1986,9 @@ class ImproveLoop:
             conn, ctx=ctx, status="commit_failed", now=now)
 
     def _check_duplicate_metrics_for_approval(
-            self, conn, approval_payload: dict) -> _DuplicateDemotion | None:
+            self, conn, approval_payload: dict, *,
+            inventory: "InventoryBuildResult", staging_dir: Path,
+            ) -> _DuplicateDemotion | None:
         """/code-review 2 周目 CR1+CR7 是正 (2026-09-12): `_finalize_success`
         の `BEGIN IMMEDIATE` 内側から呼ぶ質検査 (approval-quality 設計書
         §A)。CR7: `eval_source`/`base_interval`/`content_hash`/`in_sample`
@@ -1971,8 +2000,21 @@ class ImproveLoop:
         (trades/pf/avg_r) を持たないため対象外。複数 pair の候補は pair
         ごとに検査し、いずれか 1 pair でも既承認候補と一致すれば候補全体を
         observation へ倒す (実装時点の未決事項 — 設計書は単一 pair を
-        前提にした記述のみで多 pair の合成方針を明示していない)。"""
+        前提にした記述のみで多 pair の合成方針を明示していない)。
+
+        [indicator-consumption-wiring] §2.7 (opus I5): 再ロックのみの
+        再提出は母集団から除外する — pin はハーネスの派生値であり、
+        「同じ戦略を新しい indicator 版に貼り直しただけ」の再提出が
+        成績一致で降格されると正式な再ロック経路が塞がる。"""
         if approval_payload.get("kind") != "strategy":
+            return None
+        deployed_dir = self._deployed_dir_for(approval_payload.get("name"),
+                                              inventory=inventory)
+        candidate_dir = self._candidate_dir_for(approval_payload,
+                                                staging_dir=staging_dir)
+        if (deployed_dir is not None and candidate_dir is not None
+                and is_relock_transition(candidate_dir, deployed_dir,
+                                        inventory.inventory)):
             return None
         in_sample = approval_payload.get("in_sample") or {}
         eval_source = approval_payload.get("eval_source")
@@ -1985,6 +2027,21 @@ class ImproveLoop:
             if duplicate_of is not None:
                 return _DuplicateDemotion(content_hash=duplicate_of, pair=pair)
         return None
+
+    def _deployed_dir_for(self, name, *, inventory) -> "Path | None":
+        """`inventory.phase1_metas` のうち同名 strategy の `meta.path`。
+        見つからなければ `None`。"""
+        for meta in inventory.phase1_metas:
+            if meta.name == name and meta.kind == "strategy":
+                return meta.path
+        return None
+
+    def _candidate_dir_for(self, approval_payload, *, staging_dir) -> "Path | None":
+        """`staging_dir / approval_payload["name"]`。存在しなければ `None`。"""
+        if staging_dir is None:
+            return None
+        candidate_dir = staging_dir / approval_payload.get("name", "")
+        return candidate_dir if candidate_dir.is_dir() else None
 
     def _finalize_success(self, conn, *, mission_id, run_id, backlog_id,
                           slot_key, approval_payload, now,
@@ -2033,8 +2090,20 @@ class ImproveLoop:
                 # の commit 後のスナップショットを読む — bare SELECT だった
                 # 旧位置 (`commit()` 内、gate 通過直後) の check-then-insert
                 # レースを閉じる。
+                # [indicator-consumption-wiring] codex plan r2 束3
+                # Critical: `ctx.inventory` は本 task の時点では常に
+                # 既定値 `None` (実配線は T5a Step 5-1) — 直渡しすると
+                # `_deployed_dir_for(name, inventory=None)` が
+                # `AttributeError` になる。`None` フォールバックを挟む。
+                # `ctx is None` はテスト専用の直接呼び出し経路
+                # (`approval_payload["kind"] != "strategy"` のケースしか
+                # 使っていないため `staging_dir=None` でも安全)。
                 demotion = self._check_duplicate_metrics_for_approval(
-                    conn, approval_payload)
+                    conn, approval_payload,
+                    inventory=(ctx.inventory
+                              if ctx is not None and ctx.inventory is not None
+                              else self._inventory_for_gate(conn)),
+                    staging_dir=(ctx.staging_dir if ctx is not None else None))
                 if demotion is not None:
                     conn.rollback()
                     return demotion
@@ -2240,7 +2309,9 @@ class ImproveLoop:
                 candidate_dir = ctx.staging_dir / artifact["name"]
                 gate_verdict = self._run_plugin_gate(                  # 手順3
                     candidate_dir, name=artifact["name"],
-                    source_snapshot_dir=ctx.source_snapshot_dir)
+                    source_snapshot_dir=ctx.source_snapshot_dir,
+                    inventory=(ctx.inventory if ctx.inventory is not None
+                              else self._inventory_for_gate(conn)))
                 if not gate_verdict.passed:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,

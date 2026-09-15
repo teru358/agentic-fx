@@ -85,6 +85,16 @@ _DIFFERENT_METRICS = {
     "max_drawdown": 0.02, "total_pnl": 5.0}
 
 
+def _empty_inventory(plugins_root):
+    """[indicator-consumption-wiring] T4b: 依存なし strategy のテストが
+    使う空 inventory (`_check_duplicate_metrics_for_approval` の
+    `inventory=`/`staging_dir=` 必須化に伴う移行)。"""
+    from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
+    inv = ApprovedInventory(root=plugins_root.resolve(), metas=())
+    return InventoryBuildResult(inventory=inv, phase1_metas=(), resolved={},
+                                rejected_strategies=())
+
+
 def _make_loop(app, root):
     return ImproveLoop(
         root=root, settings=app.settings, clock=FixedClock(NOW),
@@ -355,11 +365,190 @@ def test_duplicate_metrics_check_skips_non_strategy_kind(improve_env):
     }
 
     # 対照: strategy なら同じ成績の既承認候補を検出して降格する。
-    demotion = loop._check_duplicate_metrics_for_approval(conn, payload)
+    inventory = _empty_inventory(root / "plugins")
+    demotion = loop._check_duplicate_metrics_for_approval(
+        conn, payload, inventory=inventory, staging_dir=root / "plugins")
     assert demotion is not None
     assert demotion.content_hash == row["content_hash"]
     assert demotion.pair == row["pair"]
 
     # pin: kind が strategy 以外なら質検査そのものを行わない。
     assert loop._check_duplicate_metrics_for_approval(
-        conn, dict(payload, kind="indicator")) is None
+        conn, dict(payload, kind="indicator"), inventory=inventory,
+        staging_dir=root / "plugins") is None
+
+
+# --- [indicator-consumption-wiring] T4b Step 4-6: P5 (再ロック除外) --------
+
+from tests.fixtures import indicator_wiring as fx
+from tests.fixtures.wiring_envs import SETTINGS_FIXTURE, loop_env as _loop_env
+
+
+def loop_staging(loop):
+    """候補置き場 (このテストでは mission を回さないので直接作る)。"""
+    d = loop._root / "plugins" / "_staging" / "1"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _approve_plain_strategy(conn, plugins_root, name):
+    """[indicator-consumption-wiring] T4b 逸脱: `_deployed_dir_for` は
+    `inventory.phase1_metas` の `meta.path` を返す — plain directory の
+    場合は `meta.path == plugins_root/name` だが、`fx.deploy_approved`
+    (symlink 化して `.versions/` へ移す) を通すと `meta.path` は
+    `.versions/<name>/<hash>` になってしまい、`test_relock_detection_
+    uses_the_real_dir_helpers` の「配備位置そのもの」を pin するアサート
+    と食い違う。plain directory のまま `approval_requests` にだけ承認済み
+    行を作る (着手前検証の取りこぼし — plan 本文はこの承認登録手段を
+    明示していなかった)。"""
+    from agentic_fx.plugin.loader import content_hash as _content_hash
+    from agentic_fx.store import approvals
+    chash = _content_hash(plugins_root / name)
+    aid = approvals.create(conn, "plugin",
+                           {"name": name, "kind": "strategy",
+                            "content_hash": chash}, fx.NOW)
+    approvals.apply_decision(conn, aid, status="approved", decided_by="fixture",
+                             now=fx.NOW)
+    return chash
+
+
+def _seed_approved_candidate_metrics(conn, *, pair, trades, pf, avg_r):
+    """既承認候補の in_sample 行を 1 本入れる
+    (`find_matching_approved_metrics` が引き当てる母集団)。"""
+    from datetime import timedelta
+
+    from agentic_fx.store import approvals, backtest_runs as br
+    aid = approvals.create(conn, "plugin",
+                           {"name": "rsi_pullback", "kind": "strategy",
+                            "content_hash": "d" * 64}, NOW)
+    approvals.apply_decision(conn, aid, status="approved", decided_by="t", now=NOW)
+    br.save_harness_run(
+        conn, scope="in_sample", plugin_ref="plugins/rsi_pullback",
+        content_hash="d" * 64, kind="strategy", pair=pair, timeframe="1h",
+        source="dukascopy", base_interval="5m", params={},
+        period=(NOW - timedelta(days=90), NOW),
+        metrics={"trades": trades, "pf": pf, "win_rate": 0.5, "avg_r": avg_r,
+                 "max_drawdown": 0.05, "total_pnl": 100.0, "evaluable": True,
+                 "fallback_spread_used": False},
+        settings_hash="h", core_commit="c", initial_balance=1_000_000.0,
+        now=NOW, variant="candidate",
+        # [indicator-consumption-wiring] T4b 逸脱: プラン本文のこの
+        # ヘルパは `mission_outcome` を渡していなかったが、
+        # `find_matching_approved_metrics` の母集団条件は
+        # `mission_outcome='approval'` を要求する (store/backtest_runs.py)。
+        # 明示的に付けないと既定 `None` のまま母集団に入らず、質検査が
+        # 常に「一致無し」になる (実測で確認、着手前検証の取りこぼし)。
+        mission_outcome="approval")
+
+
+def monkeypatch_dirs(loop, *, deployed, candidate):
+    """`_deployed_dir_for` / `_candidate_dir_for` を固定する。
+
+    **これは注入シームではなく短絡である** (codex plan r1 C3): これを使う
+    テストは 2 つの helper の中身を 1 行も実行しない。`is_relock_transition`
+    の判定そのものを見るために使い、**helper の配線は下の
+    `test_relock_detection_uses_the_real_dir_helpers` が実物で検証する**。"""
+    loop._deployed_dir_for = lambda name, *, inventory=None: deployed
+    loop._candidate_dir_for = lambda payload, *, staging_dir=None: candidate
+
+
+def _inventory_with_phase1(conn, plugins_root):
+    from agentic_fx.tools import plugin_loader as tools_plugin_loader
+    return tools_plugin_loader.approved_plugins(
+        conn, plugins_root, settings=SETTINGS_FIXTURE)
+
+
+def test_relock_only_resubmission_skips_the_duplicate_metrics_check(tmp_path):
+    """P5: indicator を出力不変の変更で更新 → 依存 strategy を再ロック →
+    再提出の成績が既承認版と一致しても `duplicate_metrics_of` で降格されない。"""
+    loop, conn, plugins_root = _loop_env(tmp_path)
+    fx.write_indicator(plugins_root, "rsi")            # = I2 (現在 inventory)
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    deployed = fx.write_rsi_pullback(plugins_root, pins={"rsi": "a" * 64})
+    candidate = fx.write_rsi_pullback(loop_staging(loop), pins={"rsi": hashes["rsi"]})
+    inventory = _inventory_with_phase1(conn, plugins_root)
+    _seed_approved_candidate_metrics(conn, pair="USDJPY", trades=40, pf=1.5,
+                                     avg_r=0.2)
+    payload = {"kind": "strategy", "name": "rsi_pullback",
+               "content_hash": "c" * 64, "eval_source": "dukascopy",
+               "base_interval": "5m",
+               "in_sample": {"USDJPY": {"trades": 40, "pf": 1.5, "avg_r": 0.2}}}
+    monkeypatch_dirs(loop, deployed=deployed, candidate=candidate)
+    demotion = loop._check_duplicate_metrics_for_approval(
+        conn, payload, inventory=inventory, staging_dir=loop_staging(loop))
+    assert demotion is None
+
+
+def test_unrelated_duplicate_metrics_still_demote(tmp_path):
+    """P5 の裏: 再ロックでない一致は従来どおり降格する。"""
+    loop, conn, plugins_root = _loop_env(tmp_path)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    deployed = fx.write_rsi_pullback(plugins_root, pins={"rsi": hashes["rsi"]})
+    candidate = fx.write_rsi_pullback(loop_staging(loop),
+                                      pins={"rsi": hashes["rsi"]})
+    inventory = _inventory_with_phase1(conn, plugins_root)
+    _seed_approved_candidate_metrics(conn, pair="USDJPY", trades=40, pf=1.5,
+                                     avg_r=0.2)
+    payload = {"kind": "strategy", "name": "rsi_pullback",
+               "content_hash": "c" * 64, "eval_source": "dukascopy",
+               "base_interval": "5m",
+               "in_sample": {"USDJPY": {"trades": 40, "pf": 1.5, "avg_r": 0.2}}}
+    monkeypatch_dirs(loop, deployed=deployed, candidate=candidate)
+    assert loop._check_duplicate_metrics_for_approval(
+        conn, payload, inventory=inventory, staging_dir=loop_staging(loop)
+    ) is not None
+
+
+def test_relock_detection_uses_the_real_dir_helpers(tmp_path):
+    """codex plan r1 C3: `monkeypatch_dirs` を使わず、`_deployed_dir_for` /
+    `_candidate_dir_for` の**実装そのもの**を通す。"""
+    loop, conn, plugins_root = _loop_env(tmp_path)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    fx.write_rsi_pullback(plugins_root, pins={"rsi": "a" * 64})
+    _approve_plain_strategy(conn, plugins_root, "rsi_pullback")
+    staging = loop_staging(loop)
+    fx.write_rsi_pullback(staging, pins={"rsi": hashes["rsi"]})
+    inventory = _inventory_with_phase1(conn, plugins_root)
+    _seed_approved_candidate_metrics(conn, pair="USDJPY", trades=40, pf=1.5,
+                                     avg_r=0.2)
+    payload = {"kind": "strategy", "name": "rsi_pullback",
+               "content_hash": "c" * 64, "eval_source": "dukascopy",
+               "base_interval": "5m",
+               "in_sample": {"USDJPY": {"trades": 40, "pf": 1.5, "avg_r": 0.2}}}
+
+    assert loop._deployed_dir_for("rsi_pullback", inventory=inventory) == \
+        (plugins_root / "rsi_pullback")
+    assert loop._candidate_dir_for(payload, staging_dir=staging) == \
+        (staging / "rsi_pullback")
+    assert loop._check_duplicate_metrics_for_approval(
+        conn, payload, inventory=inventory, staging_dir=staging) is None
+
+
+def test_finalize_success_falls_back_to_inventory_for_gate_when_ctx_inventory_is_none(
+        tmp_path):
+    """codex plan r2 束3 Critical: `ImproveRunContext.inventory` は本 task
+    の時点では常に既定値 `None` — `_finalize_success` が `ctx.inventory`
+    をそのまま渡すと strategy kind の承認で `AttributeError` になる。
+    `self._inventory_for_gate(conn)` へフォールバックすれば
+    `ctx.inventory is None` のままでも P5 (質検査) が完走すること。"""
+    from tests.fixtures.wiring_envs import synthetic_ctx
+    loop, conn, plugins_root = _loop_env(tmp_path)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    fx.write_rsi_pullback(plugins_root, pins={"rsi": hashes["rsi"]})
+    _approve_plain_strategy(conn, plugins_root, "rsi_pullback")
+    fx.write_rsi_pullback(loop_staging(loop), pins={"rsi": hashes["rsi"]})
+    _seed_approved_candidate_metrics(conn, pair="USDJPY", trades=40, pf=1.5,
+                                     avg_r=0.2)
+    payload = {"kind": "strategy", "name": "rsi_pullback",
+               "content_hash": "c" * 64, "eval_source": "dukascopy",
+               "base_interval": "5m",
+               "in_sample": {"USDJPY": {"trades": 40, "pf": 1.5, "avg_r": 0.2}}}
+    ctx = synthetic_ctx(loop, conn, plugins_root.parent)
+    assert ctx.inventory is None
+    demotion = loop._finalize_success(
+        conn, mission_id=1, run_id=1, backlog_id=1, slot_key=None,
+        approval_payload=payload, now=fx.NOW, ctx=ctx)
+    assert demotion is not None   # AttributeError にならず質検査まで完走した
