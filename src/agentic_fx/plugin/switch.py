@@ -186,6 +186,32 @@ def reconcile_switch_journals(conn: sqlite3.Connection, *,
             new_norm = row["new_target"]
             old_norm = row["old_target"]
             if live_target == new_norm:
+                # [indicator-consumption-wiring] §2.4 (codex r5 I3):
+                # switched (symlink 切替済・DB decided 前) のまま停止し、
+                # 再起動までに indicator が更新されて pin が破れた場合、
+                # そのまま decided にすると **live に未解決の strategy が
+                # 残る**。当該 strategy + 依存名の lock 下で `require`
+                # 解決を再試行し、失敗なら旧 target へ原子的に戻して
+                # journal を `reverted`、approval は `pending` のまま残す
+                # (人間が再ロック → 再承認)。新 version dir は回収しない
+                # (現行 reconcile も version store を回収しない — GC は
+                # 既存の archive/versions 規律に任せる、codex r8 I2)。
+                unresolved = _unresolved_after_switch(
+                    conn, row, plugins_root=plugins_root, settings=settings)
+                if unresolved is not None:
+                    alias, reason = unresolved
+                    _revert_one(conn, row, plugins_root=plugins_root, now=now,
+                               activity=activity)
+                    conn.commit()
+                    if activity is not None:
+                        # Global Constraints の固定文言 (逐語):
+                        # `switch_reverted reason=indicator_unresolved
+                        # alias=<alias> cause=<reason>`。
+                        activity.write(
+                            Category.APPROVAL, "switch_reverted",
+                            f"reason=indicator_unresolved alias={alias} "
+                            f"cause={reason}")
+                    continue
                 # switched は完遂しているが、decided への遷移は apply_decision と
                 # 同一 tx で行う契約 (§4.3) — reconcile 自身は phase を書き換え
                 # ない。11d/11g の再試行入口 (retry_approval → approve_candidate)
@@ -214,6 +240,42 @@ def reconcile_switch_journals(conn: sqlite3.Connection, *,
                 activity.write(Category.APPROVAL, "switch_reconcile_row_failed",
                                f"name={row['name']} op_id={row['op_id']} "
                                f"error={safe_error_text(exc)}")
+
+
+def _unresolved_after_switch(conn: sqlite3.Connection, row: dict, *,
+                             plugins_root: Path, settings
+                             ) -> "tuple[str, str] | None":
+    """switched 行の新 target (= live が既に指している版) を `require` で
+    解決し直す。解決できれば `None`、できなければ `(alias, reason)`。
+    strategy 以外・meta を読めない場合は `None` (従来の収束規則に委ねる)。"""
+    version_dir = (plugins_root / row["new_target"]).resolve()
+    if not version_dir.is_dir():
+        # meta を読めない (版ディレクトリが未実在 — 単体テストの sparse
+        # fixture 等) — 従来の収束規則 (retry_approval 経由) に委ねる。
+        return None
+    meta = loader._discover_one(version_dir, row["name"])
+    if meta is None or meta.kind != "strategy":
+        return None
+    # **TOCTOU 窓の明記 (opus r1 M13)**: 自己デッドロックは起きない —
+    # 定義 1 + 入口 4 (submit / approve / bless ほか) で入れ子は無く、
+    # `retry_approval` → `approve_candidate` も lock を取るのは 1 回。
+    # そのため本 helper は with を**抜けてから** `retry_approval` を呼ぶ
+    # 設計で正しい。ただし **lock 解放から `retry_approval` が lock を
+    # 取り直すまでの窓**で、別プロセスが依存 indicator を承認して pin を
+    # 破り得る。その場合は `approve_candidate` 側の決定時 `require` 解決
+    # (Step 4-4) が `pin_mismatch` で弾き、approval は pending のまま残る
+    # (= 多層防御で fail closed)。**この窓を塞ぐために本 helper と
+    # `retry_approval` を同一 lock 内へまとめてはならない** (approve 経路の
+    # lock 取得と二重になる)。
+    with _plugin_locks(plugins_root, _dependency_names(version_dir, row["name"])):
+        inventory = tools_plugin_loader.approved_plugins(
+            conn, plugins_root, settings=settings)
+        try:
+            resolve_indicator_deps(meta, inventory.inventory, settings=settings,
+                                   pin_mode="require")
+        except IndicatorResolutionError as exc:
+            return (exc.alias or "-", exc.reason)
+    return None
 
 
 # T4 §1 L4: readonly (0500/0400) な archive final ディレクトリを削除前に

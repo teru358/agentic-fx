@@ -8,10 +8,19 @@ from pathlib import Path
 
 import pytest
 
-from agentic_fx.plugin import switch, version_store
+from agentic_fx.plugin import switch
+from agentic_fx.plugin import switch as plugin_switch
+from agentic_fx.plugin import version_store
 from agentic_fx.activity import ActivityLog
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import db as db_store
+from tests.fixtures.wiring_envs import (
+    SETTINGS_FIXTURE as SETTINGS,
+    activity_text as _activity_text,
+    bump_indicator_version as _bump_indicator_version,
+    reconcile_env as _reconcile_env,
+    stage_switched_journal as _stage_switched_journal,
+)
 
 NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
 
@@ -366,3 +375,66 @@ def test_sweep_orphans_preserves_temp_link_of_open_journal(env):
     assert temp_path.is_symlink(), (
         "非終端ジャーナルが参照する temp link が sweep_orphans ④ で "
         "消されてしまった (確定-11 の欠陥)")
+
+
+# --- [indicator-consumption-wiring] T4b Step 4-7: reconcile pin 破れ (R2) ---
+
+def test_switched_journal_with_broken_pin_is_reverted(tmp_path):
+    """R2: switch 直後 (journal `switched`、新 version dir 作成済) で停止 →
+    依存 indicator を更新・承認 → 再起動 → `require` 解決に失敗 →
+    live symlink は旧 target、journal `reverted`、approval は `pending`、
+    **新 version dir は `.versions` に残る**、activity 逐語。"""
+    conn, plugins_root, activity = _reconcile_env(tmp_path)
+    from tests.fixtures import indicator_wiring as fx
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    old_target, new_target, approval_id, op_id = _stage_switched_journal(
+        conn, plugins_root, name="rsi_pullback",
+        pins={"rsi": hashes["rsi"]}, now=fx.NOW)
+    assert (plugins_root / "rsi_pullback").readlink().as_posix() == new_target
+    new_version_dir = plugins_root / new_target
+    assert new_version_dir.is_dir()
+
+    _bump_indicator_version(conn, plugins_root, "rsi", now=fx.NOW)  # I1 -> I2
+
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=fx.NOW, settings=SETTINGS,
+        activity=activity)
+
+    assert (plugins_root / "rsi_pullback").readlink().as_posix() == old_target
+    assert conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE op_id=?",
+        (op_id,)).fetchone()["phase"] == "reverted"
+    assert conn.execute(
+        "SELECT status FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["status"] == "pending"
+    assert new_version_dir.is_dir()      # 回収は本束の範囲外 (codex r8 I2)
+    # [indicator-consumption-wiring] T4b 逸脱: `_activity_text` の docstring
+    # (tests/fixtures/wiring_envs.py) どおり「行全体の完全一致ではなく
+    # event と summary 部分の一致」で見る — `ActivityLog.write` は
+    # `event`/`summary` をタブ区切りで別列に書くため、プラン本文の
+    # 単一文字列 in 判定 (空白連結) は実装のタブ区切りと食い違い、正しい
+    # 実装でも必ず赤になる判別力ゼロの pin だった (着手前検証の取りこぼし)。
+    text = _activity_text(activity)
+    assert "switch_reverted" in text
+    assert "reason=indicator_unresolved alias=rsi cause=pin_mismatch" in text
+
+
+def test_switched_journal_with_intact_pin_proceeds_to_decided(tmp_path):
+    """R2 の裏: pin が破れていなければ従来どおり `decided` まで進む。"""
+    conn, plugins_root, activity = _reconcile_env(tmp_path)
+    from tests.fixtures import indicator_wiring as fx
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    _old, _new, approval_id, op_id = _stage_switched_journal(
+        conn, plugins_root, name="rsi_pullback",
+        pins={"rsi": hashes["rsi"]}, now=fx.NOW)
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=fx.NOW, settings=SETTINGS,
+        activity=activity)
+    assert conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE op_id=?",
+        (op_id,)).fetchone()["phase"] == "decided"
+    assert conn.execute(
+        "SELECT status FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["status"] == "approved"
