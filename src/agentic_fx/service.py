@@ -466,6 +466,11 @@ class App:
     scheduler: object
     commands: object
     registry: object
+    # [indicator-consumption-wiring] T3 Step 3-2: 起動時に構築した二相
+    # inventory の正本。`approved_plugins` は `inventory_result.inventory.
+    # metas` と同じ list (producer/registry が実際に使う値そのもの)。
+    inventory_result: object
+    approved_plugins: object
     core_lock: threading.RLock
     mission_watch: MissionWatch
     notifier: object
@@ -590,7 +595,7 @@ class _SupervisorAsk:
 
 
 def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
-                            now: datetime) -> None:
+                            now: datetime, resolved_by_identity) -> None:
     """`on_signal_maintenance` の実体 (裁定書 F-16/IM-10 — module レベル
     関数として抽出し、`build_app()` 全体を構築せずに単体テスト可能に
     する)。
@@ -616,7 +621,8 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
                          freshness_bars=settings.plugin.signal_freshness_bars)
     signal_producer.evaluate_due_plugins(
         conn=conn, plugins=approved, now=now,
-        source=settings.plugin.producer_source, settings=settings)
+        source=settings.plugin.producer_source, settings=settings,
+        resolved_by_identity=resolved_by_identity)
 
 
 def build_app(root: Path, *, runner: AgentRunner | None = None,
@@ -993,8 +999,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
         # プラン 7 Task 8: signal 起動の判定・保守処理を Scheduler へ配線する。
         def on_signal_maintenance(now: datetime) -> None:
-            _run_signal_maintenance(conn=conn_core, signal_producer=signal_producer,
-                                    approved=approved, settings=settings, now=now)
+            # codex plan r2 束2 Critical: キーは `InventoryBuildResult.
+            # resolved` と同じ `(name, content_hash)` のまま渡す —
+            # `content_hash` だけへ潰すと、同一 content_hash・別名の 2
+            # strategy が存在するとき、どちらか一方の `ResolvedIndicatorSet`
+            # が失われる。
+            _run_signal_maintenance(
+                conn=conn_core, signal_producer=signal_producer,
+                approved=approved, settings=settings, now=now,
+                resolved_by_identity=dict(inventory_result.resolved))
 
         def on_cache_maintenance(now: datetime) -> None:
             # プラン 9 Task 16: ohlcv_cache の保持ポリシー。有界バッチ
@@ -1050,7 +1063,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    executor=executor, provider=provider, econ=econ,
                    collector=collector, rag=rag, trade_loop=trade_loop,
                    reflection=reflection, scheduler=scheduler, commands=commands,
-                   registry=registry, core_lock=core_lock,
+                   registry=registry, inventory_result=inventory_result,
+                   approved_plugins=approved, core_lock=core_lock,
                    mission_watch=mission_watch, notifier=notifier,
                    runner=runner, owns_runner=owns_runner, clock=clock,
                    instance_lock=instance_lock, supervisor=supervisor,

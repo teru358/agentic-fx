@@ -9,7 +9,8 @@ def _app():
                   state=None, activity=None, broker=None, executor=None,
                   provider=None, econ=None, collector=None, rag=MagicMock(),
                   trade_loop=None, reflection=None, scheduler=None, commands=None,
-                  registry=None, core_lock=None, mission_watch=None, notifier=None,
+                  registry=None, inventory_result=None, approved_plugins=None,
+                  core_lock=None, mission_watch=None, notifier=None,
                   runner=MagicMock(), owns_runner=True, clock=None,
                   instance_lock=MagicMock(), supervisor=None,
                   improve_supervisor=None, conn_supervisor=MagicMock())

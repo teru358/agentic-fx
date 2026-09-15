@@ -16,6 +16,7 @@ from agentic_fx.backtest.timeframes import floor_to_bucket
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Bar
 from agentic_fx.plugin.loader import PluginMeta
+from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 from agentic_fx.plugin.sandbox import SandboxError
 from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.store import ohlcv as ohlcv_store
@@ -74,6 +75,17 @@ def _signal_result(**overrides) -> dict:
     return base
 
 
+def _resolved_by_identity(meta: PluginMeta) -> dict:
+    """[indicator-consumption-wiring] T3 Step 3-2: このファイルの全テストは
+    `sandbox_run` を注入する (`_FakeSandbox` が `PluginSession` を経由
+    しない) ため `resolved` の値そのものは使われないが、strategy kind の
+    meta は `resolved_by_identity` に自分の `(name, content_hash)` が
+    無いと未解決として skip される (fail closed)。この helper は
+    signal/indicator kind でも無害な空集合エントリを 1 件だけ用意する。"""
+    return {(meta.name, meta.content_hash):
+            ResolvedIndicatorSet.empty(Path("/nonexistent"))}
+
+
 class _FakeSandbox:
     """`SandboxRunFn` 契約 (meta, payload, *, settings) -> dict の fake。
 
@@ -118,23 +130,23 @@ def test_fires_once_per_bucket_progression_with_non_minute_aligned_now(tmp_path)
 
     producer.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=1, seconds=3),
-        source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert len(fake.calls) == 1  # bucket H:00 のみ (H-1:00 は鮮度窓外)
 
     # 同一バケット (floor は依然 H+1:00) の間は非分格子 now で何度呼んでも
     # 追加発火しない
     producer.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=1, seconds=45),
-        source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     producer.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=1, minutes=30),
-        source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert len(fake.calls) == 1
 
     # バケット進行 (floor が H+2:00 へ進む) で 1 回だけ追加発火
     producer.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=2, seconds=10),
-        source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert len(fake.calls) == 2
 
 
@@ -149,14 +161,14 @@ def test_no_reevaluation_within_same_bucket_across_ticks(tmp_path):
     producer = SignalProducer()
 
     producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=1),
-                                  source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+                                  source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     n_after_first = len(fake.calls)
     assert n_after_first > 0
 
     for delta in (timedelta(minutes=1), timedelta(minutes=30), timedelta(minutes=59)):
         producer.evaluate_due_plugins(
             conn, plugins=[meta], now=H + timedelta(hours=1) + delta,
-            source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+            source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert len(fake.calls) == n_after_first
 
 
@@ -171,18 +183,18 @@ def test_4h_plugin_only_fires_on_4h_progression(tmp_path):
     producer = SignalProducer()
 
     producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=4),
-                                  source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+                                  source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     n0 = len(fake.calls)
     assert n0 > 0
 
     for h in (1, 2, 3):  # 4h 境界に乗らない 1h 刻みの tick
         producer.evaluate_due_plugins(
             conn, plugins=[meta], now=H + timedelta(hours=4 + h),
-            source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+            source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
         assert len(fake.calls) == n0  # 発火しない
 
     producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=8),
-                                  source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+                                  source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert len(fake.calls) == n0 + 1  # 4h 境界進行で 1 回だけ発火
 
 
@@ -198,7 +210,7 @@ def test_hold_not_stored_and_survives_cursor_loss_idempotently(tmp_path):
     producer1 = SignalProducer()
     inserted1 = producer1.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=1),
-        source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert inserted1 == 0
     assert conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"] == 0
 
@@ -207,7 +219,7 @@ def test_hold_not_stored_and_survives_cursor_loss_idempotently(tmp_path):
     producer2 = SignalProducer()
     inserted2 = producer2.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=1),
-        source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert inserted2 == 0
     assert conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"] == 0
     assert len(fake.calls) > 0  # 実際に再評価は起きている (cursor が空だった証拠)
@@ -225,13 +237,13 @@ def test_stall_beyond_window_only_catches_up_within_freshness(tmp_path):
     producer = SignalProducer()
 
     producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=1),
-                                  source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+                                  source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     n0 = len(fake.calls)
     assert n0 == 2  # 鮮度窓 (2 バケット) 分だけ catch-up
 
     # 9 時間分の停止を模す (9 バケット経過、鮮度窓 2 バケットを大きく超える)
     producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=10),
-                                  source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+                                  source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert len(fake.calls) == n0 + 2  # 窓内 2 バケットのみ追加評価・窓外 7 は評価しない
 
 
@@ -249,7 +261,7 @@ def test_sandbox_failure_does_not_advance_cursor(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="agentic_fx.plugin.signal_producer"):
         inserted = producer.evaluate_due_plugins(
             conn, plugins=[meta], now=H + timedelta(hours=1),
-            source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+            source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert inserted == 0
     assert "evaluation failed" in caplog.text
     n_after_failure = len(fake.calls)
@@ -258,7 +270,7 @@ def test_sandbox_failure_does_not_advance_cursor(tmp_path, caplog):
     fake.queue("sig", {"signals": [_signal_result()]})
     inserted2 = producer.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=1),
-        source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert inserted2 == 1
     assert len(fake.calls) > n_after_failure
 
@@ -277,7 +289,7 @@ def test_pair_outside_settings_pairs_is_skipped_with_warning(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="agentic_fx.plugin.signal_producer"):
         producer.evaluate_due_plugins(
             conn, plugins=[meta], now=H + timedelta(hours=1),
-            source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+            source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
 
     # settings.pairs (= ["USDJPY"]) に無い EURUSD は評価対象から除外される。
     # 呼び出し回数は USDJPY 分 (鮮度窓 2 バケット) のみのはず。
@@ -300,7 +312,7 @@ def test_dedupe_on_cursor_loss_reevaluation(tmp_path):
     fake.queue("sig", {"signals": [sig]}, {"signals": [sig]})
     inserted1 = producer1.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=1),
-        source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert inserted1 >= 1
     count_after_first = conn.execute(
         "SELECT COUNT(*) c FROM signals").fetchone()["c"]
@@ -311,7 +323,7 @@ def test_dedupe_on_cursor_loss_reevaluation(tmp_path):
     fake.queue("sig", {"signals": [sig]}, {"signals": [sig]})
     inserted2 = producer2.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=1),
-        source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert inserted2 == 0
     count_after_second = conn.execute(
         "SELECT COUNT(*) c FROM signals").fetchone()["c"]
@@ -330,7 +342,7 @@ def test_row_bar_ts_is_forced_to_bucket_start(tmp_path):
     now = H + timedelta(hours=1)
     producer = SignalProducer()
     producer.evaluate_due_plugins(conn, plugins=[meta], now=now, source=SOURCE,
-                                  sandbox_run=fake, settings=SETTINGS)
+                                  sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
 
     rows = conn.execute("SELECT bar_ts FROM signals").fetchall()
     assert len(rows) == 1
@@ -352,7 +364,7 @@ def test_strategy_open_action_is_stored(tmp_path):
     producer = SignalProducer()
     inserted = producer.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
-        sandbox_run=fake, settings=SETTINGS)
+        sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert inserted == 1
     row = conn.execute("SELECT * FROM signals").fetchone()
     assert row["kind"] == "strategy"
@@ -370,7 +382,7 @@ def test_indicator_plugins_are_ignored(tmp_path):
     producer = SignalProducer()
     inserted = producer.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
-        sandbox_run=fake, settings=SETTINGS)
+        sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert inserted == 0
     assert fake.calls == []
 
@@ -393,7 +405,7 @@ def test_missing_target_bucket_data_is_not_mistaken_for_completion(tmp_path, cap
     with caplog.at_level(logging.WARNING, logger="agentic_fx.plugin.signal_producer"):
         producer.evaluate_due_plugins(
             conn, plugins=[meta], now=H + timedelta(hours=1),
-            source=SOURCE, sandbox_run=fake, settings=SETTINGS)
+            source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
 
     # H-1:00 は評価され signal 化されるが、対象バケット H:00 は不在として
     # fail-open されるため signal は生成されない (bar_ts=H:00 の行が無い)。
@@ -407,7 +419,7 @@ def test_missing_target_bucket_data_is_not_mistaken_for_completion(tmp_path, cap
     fake.queue("sig", {"signals": [_signal_result()]})
     producer.evaluate_due_plugins(
         conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
-        sandbox_run=fake, settings=SETTINGS)
+        sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
 
     rows2 = conn.execute("SELECT bar_ts FROM signals ORDER BY bar_ts").fetchall()
     assert [r["bar_ts"] for r in rows2] == [
@@ -434,7 +446,7 @@ def test_multiple_signals_in_same_bucket_drop_is_observed_via_warning(
     with caplog.at_level(logging.WARNING, logger="agentic_fx.plugin.signal_producer"):
         inserted = producer.evaluate_due_plugins(
             conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
-            sandbox_run=fake, settings=SETTINGS)
+            sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
 
     assert inserted == 1  # 2 出力中 1 個だけ挿入される
     count = conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"]
@@ -463,7 +475,7 @@ def test_short_window_is_reported(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         producer.evaluate_due_plugins(
             conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
-            sandbox_run=fake, settings=SETTINGS)
+            sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     msgs = [r.getMessage() for r in caplog.records]
     assert any("cache_retention_days" in m for m in msgs), msgs
 
@@ -481,3 +493,130 @@ def test_signal_producer_module_does_not_read_settings_backtest():
 
     src = inspect.getsource(signal_producer)
     assert "settings.backtest" not in src
+
+
+# ---------------------------------------------------------------------
+# [indicator-consumption-wiring] T3 Step 3-2 (F2): resolved_by_identity
+# ---------------------------------------------------------------------
+
+def test_producer_requires_resolved_for_strategy_and_reuses_the_same_object(
+        tmp_path, monkeypatch):
+    """F2: producer は解決済み strategy しか評価せず、
+    `InventoryBuildResult.resolved` が持つ `ResolvedIndicatorSet` を
+    **そのまま** session へ渡す (再解決しない)。sandbox_run を注入しない
+    経路 (実 `PluginSession` は monkeypatch で spy に差し替える)。"""
+    from agentic_fx.plugin import sandbox as plugin_sandbox
+
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    strategy_meta = _meta(name="strat", kind="strategy", timeframe="1h")
+    seen = {}
+
+    class _Spy:
+        def __init__(self, meta, *, settings, resolved=None):
+            seen[meta.content_hash] = resolved
+        def __enter__(self):
+            return self
+        def call(self, payload):
+            return dict(_HOLD)
+        def close(self):
+            return None
+
+    monkeypatch.setattr(plugin_sandbox, "PluginSession", _Spy)
+    sentinel = ResolvedIndicatorSet.empty(tmp_path)
+    producer = SignalProducer()
+    producer.evaluate_due_plugins(
+        conn, plugins=[strategy_meta], now=H + timedelta(hours=1), source=SOURCE,
+        settings=SETTINGS,
+        resolved_by_identity={(strategy_meta.name, strategy_meta.content_hash):
+                              sentinel})
+    assert seen[strategy_meta.content_hash] is sentinel
+
+
+def test_producer_skips_strategy_without_resolution(tmp_path, caplog):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    strategy_meta = _meta(name="strat", kind="strategy", timeframe="1h")
+    producer = SignalProducer()
+    with caplog.at_level(logging.WARNING,
+                         logger="agentic_fx.plugin.signal_producer"):
+        inserted = producer.evaluate_due_plugins(
+            conn, plugins=[strategy_meta], now=H + timedelta(hours=1),
+            source=SOURCE, settings=SETTINGS, resolved_by_identity={})
+    assert inserted == 0
+    assert "unresolved" in caplog.text
+
+
+def test_producer_uses_name_and_hash_identity_not_hash_alone(
+        tmp_path, monkeypatch):
+    """P3' 回帰 (codex plan r2 束2 Critical): 同一 `content_hash`・別名の 2
+    strategy が同時に inventory に存在するとき、producer は
+    `InventoryBuildResult.resolved` の `(name, content_hash)` キーで
+    `resolved_by_identity` を引く — `content_hash` だけをキーにした辞書へ
+    潰すと (`.get(meta.content_hash)`)、どちらの meta にも一致するキーが
+    無くなり `seen["strat_a"]` が `None` になる (この assert がその変異を
+    殺す、実測で確認済み)。
+
+    [indicator-consumption-wiring] T3 Step 3-2c の docstring どおり、
+    **同一 content_hash の 2 strategy は同じバッチ内では session cache
+    (`content_hash` 単独キー) を共有する** — 2 つ目の meta では
+    `PluginSession(...)` が再構築されないため、2 つ目の `resolved` は
+    そもそも観測できない (plan Step 3-2a の原案は `seen["strat_b"]` も
+    直接 assert していたが、これは Step 3-2c 自身の session 共有設計と
+    両立しない — 実測で `KeyError` を確認したため、ここでは「session は
+    1 個だけ・最初の meta の正しい resolved を受け取る」ことと「2 つ目の
+    meta も skip されず実際に評価される (session 共有経由)」ことを
+    assert する形に直した。2 つ目の meta 単独の resolved 受け渡しは
+    別呼び出し (下) で確認する。"""
+    import dataclasses
+
+    from agentic_fx.plugin import sandbox as plugin_sandbox
+
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    shared_hash = "b" * 64
+    base_meta = _meta(name="strat_a", kind="strategy", timeframe="1h",
+                      content_hash=shared_hash)
+    meta_a = base_meta
+    meta_b = dataclasses.replace(base_meta, name="strat_b")
+    seen = {}
+    call_count = {"n": 0}
+
+    class _Spy:
+        def __init__(self, meta, *, settings, resolved=None):
+            seen[meta.name] = resolved
+        def __enter__(self):
+            return self
+        def call(self, payload):
+            call_count["n"] += 1
+            return dict(_HOLD)
+        def close(self):
+            return None
+
+    monkeypatch.setattr(plugin_sandbox, "PluginSession", _Spy)
+    sentinel_a = ResolvedIndicatorSet.empty(tmp_path / "a")
+    sentinel_b = ResolvedIndicatorSet.empty(tmp_path / "b")
+    producer = SignalProducer()
+    producer.evaluate_due_plugins(
+        conn, plugins=[meta_a, meta_b], now=H + timedelta(hours=1),
+        source=SOURCE, settings=SETTINGS,
+        resolved_by_identity={
+            ("strat_a", shared_hash): sentinel_a,
+            ("strat_b", shared_hash): sentinel_b})
+    # 唯一構築された session (meta_a 分) は自分自身の (name, hash) に
+    # 一致する resolved を受け取る — content_hash だけで潰した辞書だと
+    # ここが None になる (段 0 逆変異 (d) の観測点)。
+    assert seen == {"strat_a": sentinel_a}
+    # meta_b は「未解決として skip」されたのではなく、共有 session 経由で
+    # 実際に評価されている (skip なら call_count は meta_a 分の 2 回のまま)。
+    assert call_count["n"] == 4  # 鮮度窓 2 バケット × 2 meta
+
+    # 2 つ目の meta 単独では、別バッチ (別 session) で自分自身の resolved
+    # を正しく受け取る。
+    seen.clear()
+    producer2 = SignalProducer()
+    producer2.evaluate_due_plugins(
+        conn, plugins=[meta_b], now=H + timedelta(hours=1),
+        source=SOURCE, settings=SETTINGS,
+        resolved_by_identity={("strat_b", shared_hash): sentinel_b})
+    assert seen == {"strat_b": sentinel_b}

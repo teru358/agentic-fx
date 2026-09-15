@@ -601,8 +601,8 @@ class _FakeSignalSession:
     service.py の配線には存在しない (常に None) ため、これが唯一の seam。
     """
 
-    def __init__(self, meta, *, settings) -> None:
-        del meta, settings
+    def __init__(self, meta, *, settings, resolved=None) -> None:
+        del meta, settings, resolved
 
     def __enter__(self):
         return self
@@ -1857,7 +1857,7 @@ def test_signal_maintenance_reclaims_before_expiring(monkeypatch):
         settings=service_mod.load_settings(
             Path(__file__).resolve().parents[1]
             / "config" / "settings.yaml.example"),
-        now=now)
+        now=now, resolved_by_identity={})
 
     assert calls == ["reclaim", "expire", "producer"]
 
@@ -1913,7 +1913,7 @@ def test_signal_maintenance_state_transition_stale_claimed_becomes_abandoned(tmp
 
     service_mod._run_signal_maintenance(
         conn=conn, signal_producer=_NoOpProducer(), approved=[],
-        settings=settings, now=now)
+        settings=settings, now=now, resolved_by_identity={})
 
     # maintenance 後の状態確認
     row_after = conn.execute(
@@ -1948,7 +1948,8 @@ def test_signal_maintenance_callback_integration(tmp_path, monkeypatch):
     # を呼ぶ spy に切り替える
     calls: list[dict] = []
 
-    def spy_run_signal_maintenance(*, conn, signal_producer, approved, settings, now):
+    def spy_run_signal_maintenance(*, conn, signal_producer, approved,
+                                  settings, now, resolved_by_identity):
         calls.append({
             "conn": conn is not None,
             "signal_producer": signal_producer is not None,
@@ -2043,7 +2044,8 @@ def test_watchdog_tick_uses_mission_watch_time_fn(monkeypatch):
               activity=FakeActivity(), broker=None, executor=None,
               provider=None, econ=None, collector=None, rag=None,
               trade_loop=None, reflection=None, scheduler=None,
-              commands=None, registry=None, core_lock=None,
+              commands=None, registry=None, inventory_result=None,
+              approved_plugins=None, core_lock=None,
               mission_watch=watch, improve_supervisor=None, notifier=FakeNotifier(), runner=None,
               owns_runner=False, clock=None, instance_lock=None,
               supervisor=None, conn_supervisor=None)
@@ -2260,7 +2262,8 @@ def test_watchdog_tick_uses_mission_watch_time_fn_directly(tmp_path):
               activity=FakeActivity(), broker=None, executor=None,
               provider=None, econ=None, collector=None, rag=None,
               trade_loop=None, reflection=None, scheduler=None,
-              commands=None, registry=None, core_lock=None,
+              commands=None, registry=None, inventory_result=None,
+              approved_plugins=None, core_lock=None,
               mission_watch=watch, improve_supervisor=None, notifier=FakeNotifier(), runner=None,
               owns_runner=False, clock=None, instance_lock=None,
               supervisor=None, conn_supervisor=None)
@@ -3401,6 +3404,54 @@ def test_service_startup_calls_reconcile_sweep_expire_then_approved_plugins_in_o
                   embedding_fn=FakeEmbedding())
         call_names = [c[0] for c in manager.mock_calls]
         assert call_names == ["reconcile", "sweep", "expire", "approved"]
+
+
+# --- [indicator-consumption-wiring] T3 Step 3-2 (F2) ------------------------
+
+def test_service_startup_excludes_pin_broken_strategy_from_producer(tmp_path):
+    """F2 (設計書 v1.3 §6 で緩和): pin 破れ strategy は warning 1 行
+    (reason 込み) で producer の plugin 一覧に含まれない。session cache への
+    未登録は producer 一覧に無いことの帰結にすぎないため、別項目としては
+    観測しない (申し送り F2、2026-09-14 裁定)。
+
+    技術ログは `caplog` ではなく実ログファイルを読む
+    ([[design-review-style]] の先例と同じ理由 — `logging_setup.
+    setup_technical_logging()` が `run_init`/`build_app` の中で親
+    `agentic_fx` logger を `propagate=False` にするため、`caplog` の
+    handler (root logger に付く) にはこのテストの `_init(tmp_path)` 実行後
+    は何も届かない。`tests/test_init_and_guard.py`/
+    `tests/loops/test_reflection_cycle.py` と同じ回避)。"""
+    from agentic_fx.plugin.loader import content_hash
+    from agentic_fx.store import approvals
+    from agentic_fx.store.db import connect
+    from tests.fixtures import indicator_wiring as fx
+
+    _init(tmp_path)
+    root = tmp_path
+    plugins_dir = root / "plugins"
+    plugins_dir.mkdir(exist_ok=True)
+    fx.write_indicator(plugins_dir, "rsi")
+    conn = connect(root / "data" / "agentic.db")
+    fx.deploy_approved(conn, plugins_dir, ["rsi"], now=fx.NOW)
+    strat_dir = fx.write_rsi_pullback(plugins_dir, pins={"rsi": "a" * 64})
+    aid = approvals.create(conn, "plugin",
+                           {"name": "rsi_pullback", "kind": "strategy",
+                            "content_hash": content_hash(strat_dir)}, fx.NOW)
+    approvals.apply_decision(conn, aid, status="approved", decided_by="t",
+                             now=fx.NOW)
+    conn.close()
+
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    try:
+        names = [m.name for m in app.approved_plugins]
+        assert "rsi" in names and "rsi_pullback" not in names
+        log_text = (tmp_path / "logs" / "agentic.log").read_text(
+            encoding="utf-8")
+        assert "indicator_unresolved:rsi:pin_mismatch" in log_text
+        assert app.inventory_result.rejected_strategies[0].reason == "pin_mismatch"
+    finally:
+        app.close()
 
 
 def test_service_startup_reconcile_failure_does_not_block_startup(tmp_path, monkeypatch):

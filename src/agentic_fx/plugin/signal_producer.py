@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     import sqlite3
 
     from agentic_fx.config import Settings
+    from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 
 _log = logging.getLogger("agentic_fx.plugin.signal_producer")
 
@@ -87,13 +88,40 @@ class SignalProducer:
     def evaluate_due_plugins(self, conn: "sqlite3.Connection", *,
                              plugins: list[PluginMeta], now: datetime,
                              source: str, sandbox_run: SandboxRunFn | None = None,
-                             settings: "Settings") -> int:
+                             settings: "Settings",
+                             resolved_by_identity: (
+                                 "dict[tuple[str, str], ResolvedIndicatorSet]"),
+                             ) -> int:
         """承認済み signal/strategy plugin のうち評価期限が来たバケットを
         評価し、新規挿入した signals 行の総数を返す。
 
         ``plugins`` は ``plugin_loader.approved_plugins()`` の戻り値
         (承認済み・任意 kind 混在) をそのまま渡してよい — kind が
         signal/strategy 以外の要素はここで無視する。
+
+        [indicator-consumption-wiring] §2.3 (codex plan r2 束2 Critical 是正):
+        `resolved_by_identity` は `InventoryBuildResult.resolved` をそのまま
+        (キー `(name, content_hash)`) 渡したもの。**strategy は解決済みの
+        ものしか評価しない** — 未解決の strategy は warning + skip
+        (fail closed。producer には再解決の責務を持たせない)。
+
+        `resolved` の取得キーは `(meta.name, meta.content_hash)` (Global
+        Constraints の既存 identity と同じ) — `content_hash` だけでは、
+        同一 content_hash (= `plugin.py` + `config.yaml` が完全に同一バイト
+        列) を持つ別名 strategy が存在したとき、どちらの `ResolvedIndicatorSet`
+        を渡すべきか一意に決まらない。
+
+        **session cache のキーは `content_hash` 単独のまま変えない**
+        (codex plan r2 束2 Critical への回答、根拠 3 点):
+        (1) content_hash は plugin.py + config.yaml のバイト列そのものの
+        hash であり、config.yaml には依存宣言 (`indicators:` ブロックと
+        pin) も含まれる — content_hash が一致する 2 つの strategy は
+        依存宣言も含めてバイト単位で同一なので、同じ inventory 構築の中で
+        解決された `ResolvedIndicatorSet` は値として等価になる。
+        (2) resolved の**受け渡し**は `(name, hash)` 単位に保つ (上記) ため、
+        「渡す値の identity 保証」と「subprocess 再利用の単位」を分離できる。
+        (3) `(name, hash)` を session cache キーに含めると、同一コードの
+        strategy を改名しただけで無駄に subprocess が増える退行を生む。
         """
         inserted = 0
         sessions: dict[str, plugin_sandbox.PluginSession] = {}
@@ -103,7 +131,10 @@ class SignalProducer:
                 return sandbox_run(meta, payload, settings=settings.plugin)
             session = sessions.get(meta.content_hash)
             if session is None:
-                session = plugin_sandbox.PluginSession(meta, settings=settings.plugin)
+                session = plugin_sandbox.PluginSession(
+                    meta, settings=settings.plugin,
+                    resolved=resolved_by_identity.get(
+                        (meta.name, meta.content_hash)))
                 session.__enter__()
                 sessions[meta.content_hash] = session
             return session.call(payload)
@@ -111,6 +142,13 @@ class SignalProducer:
         try:
             for meta in plugins:
                 if meta.kind not in ("signal", "strategy"):
+                    continue
+                if (meta.kind == "strategy"
+                        and (meta.name, meta.content_hash)
+                        not in resolved_by_identity):
+                    _log.warning(
+                        "plugin %s: indicator dependencies are unresolved — "
+                        "skipping (fail closed)", meta.name)
                     continue
                 for pair in meta.pairs:
                     if pair not in settings.pairs:
@@ -226,8 +264,7 @@ class SignalProducer:
             return inserted
 
         # strategy: action="open" のみ保存 ("hold" は非保存)
-        result = call(meta, {"df": df, "indicators": None, "signals": None,
-                              "params": meta.params})
+        result = call(meta, {"df": df, "params": meta.params})
         if result.get("action") != "open":
             return 0
         row_id = signals.add(
