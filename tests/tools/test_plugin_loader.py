@@ -1039,3 +1039,23 @@ def test_scalar_only_indicator_still_works_standalone(tmp_path):
         index=pd.date_range("2026-01-01", periods=1, freq="1h", tz="UTC"))
     out = run_plugin(meta, {"df": df, "params": meta.params}, settings=settings)
     assert out == {"rsi_14": 55.0}
+
+
+# --- [indicator-consumption-wiring] T3 Step 3-3: 二相後も indicator-only --
+
+def test_market_tools_ignores_non_indicator_kind_after_two_phase(tmp_path):
+    """S1 の周辺: `inventory.metas` をそのまま渡してよい契約は維持される。"""
+    from agentic_fx.config import load_settings
+    settings = load_settings(
+        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+
+    strategy = PluginMeta(name="s", kind="strategy", path=tmp_path, params={},
+                          timeframe="1h", pairs=("USDJPY",), max_bars=200,
+                          content_hash="h" * 64)
+    provider = MagicMock()
+    provider.get_bars.return_value = _bars()
+    tools = market_tools.build(provider, MagicMock(), settings,
+                               indicator_plugins=[strategy],
+                               sandbox_run=lambda *a, **k: {"x": 1.0})
+    get_indicators = next(t.func for t in tools if t.name == "get_indicators")
+    assert not any(k.startswith("plugin:") for k in get_indicators("USDJPY", "1h"))

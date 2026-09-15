@@ -92,6 +92,12 @@ from agentic_fx.tools.mcp_shim import McpShimDispatcher
 from agentic_fx.runners.base import TOOL_BUDGET_ABORT_PREFIX, is_tool_budget_abort
 from agentic_fx.tools.registry import ToolRegistry
 from agentic_fx.tools.mission_counters import MissionToolCounters
+# [indicator-consumption-wiring] T3 Step 3-3: trade worker 分岐が
+# `_build_trade_indicator_metas` から呼ぶ。テストが `mission_worker.
+# plugin_loader` をモジュール属性として patch する前提でもある
+# (循環 import は `uv run python -c "import agentic_fx.mission_worker"`
+# で確認済み)。
+from agentic_fx.tools import plugin_loader
 
 if TYPE_CHECKING:
     from agentic_fx.core.contracts import Clock
@@ -104,6 +110,24 @@ def _build_clock() -> "Clock":
     `FixedClock` を注入できる (seam)。"""
     from agentic_fx.core.contracts import SystemClock
     return SystemClock()
+
+
+def _build_trade_indicator_metas(conn, plugins_dir, settings) -> list:
+    """[indicator-consumption-wiring] §2.3: **これは producer とは別の
+    composition root** — 子が handshake の `plugins_dir` から
+    `approved_plugins` を再実行する。trade LLM 向けの参考情報
+    (`get_indicators`) であり、producer との版ずれは許容する
+    (strategy の解決はここでは行わない — 第 2 相は strategy にしか
+    効かず、`market_tools` は indicator kind しか使わない)。
+
+    `main()` の trade 分岐から呼ぶだけの薄い helper。**切り出しは
+    ふるまいを変えない** — 切り出し前の `approved` 変数と同じ値を返す。
+    """
+    if plugins_dir is None:
+        return []
+    return [m for m in plugin_loader.approved_plugins(
+                conn, plugins_dir, settings=settings).inventory.metas
+            if m.kind == "indicator"]
 
 
 def _improve_result_tool_calls(
@@ -894,7 +918,6 @@ def main() -> None:
             os.environ[_cred_key] = _cred_value
 
         from agentic_fx.store.db import connect_readonly
-        from agentic_fx.tools import plugin_loader
         from agentic_fx.tools.mission_registry import build_mission_registry
         from agentic_fx.activity import ActivityLog
 
@@ -910,9 +933,7 @@ def main() -> None:
         activity = ActivityLog(Path.cwd() / "activity.log")
         plugins_dir = (Path(handshake["plugins_dir"])
                        if handshake.get("plugins_dir") else None)
-        approved = (list(plugin_loader.approved_plugins(
-                        conn, plugins_dir, settings=settings).inventory.metas)
-                   if plugins_dir is not None else [])
+        approved = _build_trade_indicator_metas(conn, plugins_dir, settings)
 
         # CR-3 対応: `main()` 冒頭で構築した out_seq を、_RagRpcProxy と
         # on_message (event フレーム送出) の両方に**同一インスタンス**で

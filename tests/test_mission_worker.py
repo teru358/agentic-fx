@@ -1528,3 +1528,77 @@ def test_local_backend_end_to_end_abort_on_broken_tool_exceptions(monkeypatch, t
     counters = runner._afx_mission_counters
     assert counters.errors == 3                 # 3 回目で pending → フックで event → 4 回目は未実行
     assert len(calls) == 1
+
+
+# --- [indicator-consumption-wiring] T3 Step 3-3: trade worker の別 root ----
+
+def test_trade_worker_builds_its_own_inventory_and_passes_indicator_metas(
+        tmp_path, monkeypatch):
+    """[indicator-consumption-wiring] §2.3: trade worker は **別 root** で
+    `approved_plugins` を再実行する (producer との版ずれは許容する)。
+    `market_tools` には indicator kind だけが届く。
+
+    **codex plan r1 I3 是正**: v1.2 の本テストは fake `approved_plugins` を
+    テスト自身が直接呼び、その結果をテスト自身が `build_mission_registry`
+    に渡していた。`mission_worker.py` のコードは 1 行も実行されないので、
+    src を何も直さなくても assert が成立する = 記載どおりの Expected FAIL に
+    ならない ([[verify-integration-not-just-units]])。**trade worker の実入口を
+    起動し、`plugins_dir` / `settings` / `.inventory.metas` / indicator-only
+    filtering を spy で観測する**。
+
+    実入口の形は `mission_worker.py` の `main()` trade 分岐から
+    `_build_trade_indicator_metas(conn, plugins_dir, settings)` という純粋
+    helper に切り出し済み (Step 3-3c) — テストは helper を実物として呼び、
+    `approved_plugins` 側だけを spy する (helper 抽出はふるまいを変えない
+    — 切り出し前後で `main()` の `approved` 変数の値は同一)。"""
+    from unittest.mock import MagicMock
+
+    from agentic_fx import mission_worker
+    from agentic_fx.config import load_settings
+    from agentic_fx.plugin.loader import PluginMeta
+    from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
+
+    SETTINGS = load_settings(_REPO_ROOT / "config" / "settings.yaml.example")
+
+    ind = PluginMeta(name="rsi", kind="indicator", path=tmp_path, params={},
+                     timeframe=None, pairs=(), max_bars=200,
+                     content_hash="a" * 64, outputs=("rsi",))
+    strat = PluginMeta(name="s", kind="strategy", path=tmp_path, params={},
+                       timeframe="1h", pairs=("USDJPY",), max_bars=200,
+                       content_hash="b" * 64)
+    seen_args = {}
+
+    def _spy(conn, plugins_dir, *, settings):
+        seen_args.update(conn=conn, plugins_dir=plugins_dir, settings=settings)
+        return InventoryBuildResult(
+            inventory=ApprovedInventory(root=plugins_dir, metas=(ind, strat)),
+            phase1_metas=(ind, strat), resolved={}, rejected_strategies=())
+
+    # `mission_worker` は `from agentic_fx.tools import plugin_loader` で
+    # **モジュールを** import している (module-level import、Step 3-3c)。
+    monkeypatch.setattr(mission_worker.plugin_loader, "approved_plugins", _spy)
+
+    conn = MagicMock()
+    metas = mission_worker._build_trade_indicator_metas(
+        conn, tmp_path / "plugins", SETTINGS)
+
+    # 実入口が渡した引数 (別 root / settings 透通)
+    assert seen_args["plugins_dir"] == tmp_path / "plugins"
+    assert seen_args["settings"] is SETTINGS
+    assert seen_args["conn"] is conn
+    # `.inventory.metas` から indicator kind だけを取り出している
+    assert [m.name for m in metas] == ["rsi"]
+    assert all(m.kind == "indicator" for m in metas)
+
+
+def test_trade_worker_indicator_metas_is_empty_without_a_plugins_dir(tmp_path):
+    """`plugins_dir is None` (handshake にキーが無い) なら空リスト。
+    現行の `if plugins_dir is not None else []` を helper 側で保つ。"""
+    from unittest.mock import MagicMock
+
+    from agentic_fx import mission_worker
+    from agentic_fx.config import load_settings
+
+    SETTINGS = load_settings(_REPO_ROOT / "config" / "settings.yaml.example")
+    assert mission_worker._build_trade_indicator_metas(
+        MagicMock(), None, SETTINGS) == []

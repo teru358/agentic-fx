@@ -25,9 +25,14 @@ def pair_param(settings: Settings) -> dict:
 def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
           indicator_plugins: list[PluginMeta] | None = None,
           sandbox_run=None) -> list[ToolDef]:
-    """`indicator_plugins` は `plugin_loader.approved_plugins()` の戻り値
-    (承認済み・任意 kind 混在) をそのまま渡してよい — `kind != "indicator"`
-    の要素はここで無視する (kind="indicator" だけが `get_indicators` の対象)。
+    """`indicator_plugins` は `plugin_loader.approved_plugins()` の
+    `result.inventory.metas` をそのまま渡してよい — `kind != "indicator"` の
+    要素はここで無視する (kind="indicator" だけが `get_indicators` の対象)。
+
+    [indicator-consumption-wiring] §2.3: 親 (`service.py`) と子
+    (`mission_worker.py`) は**別々の composition root** で inventory を
+    構築する。子は handshake の `plugins_dir` から再実行するため、
+    live producer と版がずれ得る — LLM 向けの参考情報なので許容する。
 
     `sandbox_run` は既定 `None` で `plugin.sandbox.run_plugin` を使う。テストは
     fake を注入して実 subprocess を起動せずに合成ロジックだけを検証できる
