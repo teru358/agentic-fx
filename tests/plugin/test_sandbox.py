@@ -1119,3 +1119,74 @@ def test_cpu_sec_is_float_after_plugin_error(tmp_path, plugin_settings):
         session.call({"df": _df(), "params": {}})
     session.close()
     assert isinstance(session.cpu_sec, float)
+
+
+@pytest.mark.parametrize("snippet,needle", [
+    ("pd.set_option('mode.chained_assignment', None)", "set_option"),
+    ("pd.reset_option('mode.chained_assignment')", "reset_option"),
+    ("pd.set_eng_float_format(accuracy=3)", "set_eng_float_format"),
+    ("np.seterr(all='ignore')", "seterr"),
+    ("np.seterrcall(None)", "seterrcall"),
+    ("np.setbufsize(8192)", "setbufsize"),
+    ("np.set_printoptions(threshold=5)", "set_printoptions"),
+])
+def test_check_source_denies_global_state_mutators(tmp_path, snippet, needle):
+    path = tmp_path / f"p_{needle}.py"
+    path.write_text("import numpy as np\nimport pandas as pd\n"
+                    f"def compute(df, params):\n    {snippet}\n    return {{}}\n")
+    with pytest.raises(SandboxError, match=needle):
+        check_source(path)
+
+
+@pytest.mark.parametrize("snippet", [
+    "pd.options.mode.chained_assignment = None",
+    "pd.options.display.max_rows: int = 5",
+    "pd.options.display.max_rows += 1",
+    "(a, np.x.y) = (1, 2)",
+    "for pd.options.x.y in [1]:\n        pass",
+    "del pd.options.x.y",
+    "with open_ctx() as pd.options.x.y:\n        pass",
+])
+def test_check_source_rejects_attribute_store(tmp_path, snippet):
+    path = tmp_path / "attr_store.py"
+    path.write_text("import numpy as np\nimport pandas as pd\n"
+                    f"def compute(df, params):\n    {snippet}\n    return {{}}\n")
+    with pytest.raises(SandboxError, match="attribute assignment"):
+        check_source(path)
+
+
+def test_check_source_allows_local_attribute_free_assignment(tmp_path):
+    """自ローカル変数への代入・添字代入は従来どおり許す (誤検出しない)。"""
+    path = tmp_path / "ok.py"
+    path.write_text(
+        "import pandas as pd\n"
+        "def compute(df, params):\n"
+        "    out = {}\n"
+        "    out['v'] = 1.0\n"
+        "    x, y = 1, 2\n"
+        "    for i in range(3):\n        x += i\n"
+        "    return out\n")
+    check_source(path)
+
+
+def test_worker_asserts_global_state_unchanged(tmp_path, plugin_settings):
+    """V2: check_source を通り抜けた動的変更があっても worker の
+    不変 assert が SandboxError に倒す (多層防御)。"""
+    root = tmp_path / "plugins"
+    sneaky = _indicator_dir(
+        root, "sneaky",
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "def compute(df, params):\n"
+        "    fn = np.__dict__['seterr']\n"
+        "    fn(all='ignore')\n"
+        "    return {'v': 1.0}\n")
+    meta = _meta(tmp_path, "strat_g", "strategy",
+                 STRATEGY_READS_INDICATORS_PY.replace('indicators["rsi"]["rsi"]',
+                                                      'indicators["sneaky"]["v"]')
+                 .replace("len(r)", "1").replace("r.iloc[-1]", "r"),
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("sneaky", sneaky, ("v",), {}, 200))
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as s:
+        with pytest.raises(SandboxError, match="global state"):
+            s.call({"df": _df(10), "params": {}})

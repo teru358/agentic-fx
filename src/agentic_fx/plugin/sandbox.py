@@ -125,6 +125,14 @@ _DENY_NAMES = frozenset({
     "memmap", "fromfile", "tofile", "pickle", "unpickle", "dump", "dumps",
     "ExcelWriter", "HDFStore", "importorskip",
     "capsys", "capfd", "capsysbinary", "capfdbinary",
+    # [indicator-consumption-wiring] §2.4 (codex r3 I7): strategy と
+    # indicator が同一 worker プロセスを共有するため、pandas/numpy の
+    # **プロセス全体のグローバル状態**を書き換える API を遮断する
+    # (`np.errstate` / `pd.option_context` は with 脱出で復元するので
+    # 足さない)。`_is_denied_bare_name` は `ast.Attribute.attr` にも
+    # 効くので `pd.set_option(...)` の形も拒否できる。
+    "set_option", "reset_option", "set_eng_float_format",
+    "seterr", "seterrcall", "setbufsize", "set_printoptions",
 })
 
 # `to_` 前綴りの属性は既定で禁止 (`to_csv`/`to_pickle`/`to_sql` 等の I/O
@@ -180,6 +188,16 @@ def check_source(path: Path, *, extra_allowed: frozenset[str] = frozenset()) -> 
         elif isinstance(node, ast.Attribute):
             if _is_denied_bare_name(node.attr):
                 raise SandboxError(f"{path}: attribute {node.attr!r} is not allowed")
+            # [indicator-consumption-wiring] §2.4 (codex r4 I7): 外部
+            # オブジェクトの属性への**代入・削除**は構文種別
+            # (Assign / AugAssign / AnnAssign / タプル target / for target /
+            # del / with ... as) によらず一律 reject する。`ctx` を見れば
+            # 構文種別を列挙せずに全形を捕まえられる (現行 example に
+            # 外部属性代入の正当用途は無い)。
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                raise SandboxError(
+                    f"{path}: attribute assignment/deletion "
+                    f"({node.attr!r}) is not allowed")
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if _is_denied_bare_name(node.name):
                 raise SandboxError(
