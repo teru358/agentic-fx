@@ -1,0 +1,123 @@
+"""[indicator-consumption-wiring] T2: indicator 戻り値の共通 validator (V1)。"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from agentic_fx.core.plugin_contract import (
+    IndicatorResultError, validate_indicator_result,
+)
+
+
+def _idx(n: int = 5) -> pd.DatetimeIndex:
+    return pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+
+
+def test_scalar_and_series_accepted():
+    idx = _idx()
+    out = validate_indicator_result(
+        {"a": 1.5, "b": pd.Series([1.0] * 5, index=idx)},
+        df_index=idx, outputs=("a", "b"))
+    assert out["a"] == 1.5
+    assert list(out["b"]) == [1.0] * 5
+
+
+def test_nan_is_allowed_in_scalar_and_series():
+    idx = _idx()
+    out = validate_indicator_result(
+        {"a": float("nan"), "b": pd.Series([float("nan")] * 5, index=idx)},
+        df_index=idx, outputs=("a", "b"))
+    assert np.isnan(out["a"])
+    assert bool(pd.isna(out["b"]).all())
+
+
+def test_list_and_ndarray_series_accepted_by_length():
+    idx = _idx()
+    out = validate_indicator_result(
+        {"a": [1.0, 2.0, 3.0, 4.0, 5.0],
+         "b": np.array([1.0, 2.0, 3.0, 4.0, 5.0])},
+        df_index=idx, outputs=("a", "b"))
+    assert len(out["a"]) == 5 and len(out["b"]) == 5
+
+
+@pytest.mark.parametrize("value", [
+    True,                               # bool は数値として拒否
+    float("inf"),
+    float("-inf"),
+])
+def test_scalar_rejects(value):
+    idx = _idx()
+    with pytest.raises(IndicatorResultError):
+        validate_indicator_result({"a": value}, df_index=idx, outputs=("a",))
+
+
+def test_series_index_mismatch_rejected():
+    idx = _idx()
+    other = pd.date_range("2027-01-01", periods=5, freq="1h", tz="UTC")
+    with pytest.raises(IndicatorResultError, match="index"):
+        validate_indicator_result({"a": pd.Series([1.0] * 5, index=other)},
+                                  df_index=idx, outputs=("a",))
+
+
+def test_series_length_mismatch_rejected():
+    idx = _idx()
+    with pytest.raises(IndicatorResultError, match="length"):
+        validate_indicator_result({"a": [1.0, 2.0]}, df_index=idx, outputs=("a",))
+
+
+def test_series_with_inf_or_bool_rejected():
+    idx = _idx()
+    with pytest.raises(IndicatorResultError):
+        validate_indicator_result({"a": [1.0, 2.0, float("inf"), 4.0, 5.0]},
+                                  df_index=idx, outputs=("a",))
+    with pytest.raises(IndicatorResultError):
+        validate_indicator_result({"a": [True] * 5}, df_index=idx, outputs=("a",))
+
+
+def test_outputs_set_must_match_exactly():
+    idx = _idx()
+    with pytest.raises(IndicatorResultError, match="outputs"):
+        validate_indicator_result({"a": 1.0}, df_index=idx, outputs=("a", "b"))
+    with pytest.raises(IndicatorResultError, match="outputs"):
+        validate_indicator_result({"a": 1.0, "x": 1.0}, df_index=idx,
+                                  outputs=("a",))
+
+
+def test_outputs_none_allows_empty_dict_for_standalone():
+    idx = _idx()
+    assert validate_indicator_result({}, df_index=idx, outputs=None) == {}
+    assert validate_indicator_result({"whatever": 1.0}, df_index=idx,
+                                     outputs=None) == {"whatever": 1.0}
+
+
+def test_non_dict_and_non_str_keys_rejected():
+    idx = _idx()
+    with pytest.raises(IndicatorResultError):
+        validate_indicator_result([1, 2], df_index=idx, outputs=None)
+    with pytest.raises(IndicatorResultError):
+        validate_indicator_result({1: 2.0}, df_index=idx, outputs=None)
+
+
+def test_numeric_string_is_rejected():
+    """opus r1 M3: `float("1.5")` が通るため素の `float()` では数値文字列を
+    受理してしまう。スカラー経路・系列経路の両方を pin する。"""
+    idx = _idx()
+    with pytest.raises(IndicatorResultError, match="got str"):
+        validate_indicator_result({"a": "1.5"}, df_index=idx, outputs=("a",))
+    with pytest.raises(IndicatorResultError, match="got str"):
+        validate_indicator_result({"a": ["1.5"] * 5}, df_index=idx,
+                                  outputs=("a",))
+
+
+def test_nested_container_element_raises_indicator_result_error():
+    """opus r1 M4: 要素が list / dict のとき `pd.isna(v)` は配列を返し、
+    素の `ValueError`(truth value ambiguous) が漏れていた。必ず
+    `IndicatorResultError` に写像されること。"""
+    idx = _idx()
+    with pytest.raises(IndicatorResultError):
+        validate_indicator_result({"a": [[1.0], [2.0], [3.0], [4.0], [5.0]]},
+                                  df_index=idx, outputs=("a",))
+    with pytest.raises(IndicatorResultError):
+        validate_indicator_result({"a": [{"x": 1}] * 5}, df_index=idx,
+                                  outputs=("a",))
