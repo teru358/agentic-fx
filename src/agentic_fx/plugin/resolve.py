@@ -188,3 +188,121 @@ def resolve_indicator_deps(meta: PluginMeta, inventory: ApprovedInventory, *,
     if len(encoded.encode("utf-8")) > MAX_HANDSHAKE_BYTES:
         raise IndicatorResolutionError(None, "handshake_too_large")
     return resolved
+
+
+def lock_config(candidate_dir: Path, pins: Mapping[str, str]
+                ) -> tuple[str, str, str]:
+    """候補の `config.yaml` の各 alias に `pin` を書き込む (U5: 全体を
+    `yaml.safe_load` → pin 追加 → `yaml.safe_dump(sort_keys=False)` で
+    再シリアライズ。コメント・キー順は保持しない — 呼び出し元が差分を
+    人間へ表示する)。戻り値 `(before_text, after_text, new_content_hash)`。
+
+    `pins` は `{alias: content_hash}`。resolver 経路の呼び出し元は
+    `ResolvedIndicatorSet.pins()` を渡し (`pin_mode="ignore"` で解決した
+    もの)、改善 worker の `lock_staging_deps` は `inventory_view` から
+    組んだ dict を渡す — **YAML 書き換えの実装はここ 1 箇所に閉じる**
+    (設計書 §2.3)。`pins` に無い alias は触らない。**既に同じ pin なら
+    書き込み内容は変わらない** (before == after)。
+
+    **snapshot 再取得** (ユーザー裁定 2026-09-14 ⑥): 書き込み後、disk 上の
+    `config.yaml` を独立に再読して `content_hash()` を計算し直し、それを
+    `new_content_hash` として返す。`check_candidate_snapshot`
+    (`gate_pytest.py`) は 3 ファイルの存在・属性しか見ず内容の一致は
+    検査しないため、その「lock で壊れるものはない」という主張だけに
+    依存せず、呼び出し元 (`_plugin_lock` CLI / `lock_staging_deps` tool)
+    は **resolve 時点で計算した hash を使い回さず、必ずこの戻り値を
+    使う**。"""
+    path = candidate_dir / "config.yaml"
+    before_text = path.read_text(encoding="utf-8")
+    config = yaml.safe_load(before_text)
+    if not isinstance(config, dict):
+        raise ValueError(f"lock_config: {path} is not a mapping")
+    refs = config.get("indicators") or {}
+    for alias, pin in pins.items():
+        ref = refs.get(alias)
+        if isinstance(ref, dict):
+            ref["pin"] = pin
+    after_text = yaml.safe_dump(config, sort_keys=False, allow_unicode=True,
+                                default_flow_style=False)
+    if after_text != before_text:
+        path.write_text(after_text, encoding="utf-8")
+    new_content_hash = content_hash(candidate_dir)
+    return before_text, after_text, new_content_hash
+
+
+def strip_pins(config: dict) -> dict:
+    """`config` の deep copy から `indicators.<alias>.pin` だけを除いたもの。
+    入力は書き換えない。pin は作者の設計判断ではなくハーネスの派生値なので、
+    「実質的に同じ候補か」の比較はこの形で行う (設計書 §2.7)。
+
+    **比較専用** (opus r1 M2): `default=str` は YAML の date / datetime を
+    黙って文字列にする。loader が JSON-safe 検証をかけるのは `params` だけ
+    なので、`config.yaml` の他キー (例: 作者が書いた `note: 2026-01-01`) に
+    date があると、この関数を通した値は元の config と型が変わる。**この
+    戻り値は `same_modulo_pins` / `is_relock_transition` の等価比較に
+    しか使わない** — 両辺を同じ変換に通すので比較意味論は壊れないが、
+    **この戻り値を書き戻したり handshake に載せたりしてはならない**
+    (書き戻しは `lock_config` の `yaml.safe_load` → `safe_dump` 経路のみ)。
+    """
+    out = json.loads(json.dumps(config, default=str))
+    refs = out.get("indicators")
+    if isinstance(refs, dict):
+        for ref in refs.values():
+            if isinstance(ref, dict):
+                ref.pop("pin", None)
+    return out
+
+
+def _config_of(plugin_dir: Path) -> dict:
+    return yaml.safe_load((plugin_dir / "config.yaml").read_text(encoding="utf-8"))
+
+
+def same_modulo_pins(candidate_dir: Path, other_dir: Path) -> bool:
+    """正規化 AST の一致 **かつ** `strip_pins(config)` の一致。
+    `noop_gate.normalized_plugin_ast` を再利用する (AST 正規化の実装は
+    noop_gate 側の 1 箇所のみ)。"""
+    from agentic_fx.plugin.noop_gate import normalized_plugin_ast
+    if (normalized_plugin_ast(candidate_dir / "plugin.py")
+            != normalized_plugin_ast(other_dir / "plugin.py")):
+        return False
+    return strip_pins(_config_of(candidate_dir)) == strip_pins(_config_of(other_dir))
+
+
+def _pins_of(plugin_dir: Path) -> dict[str, str | None]:
+    refs = (_config_of(plugin_dir) or {}).get("indicators") or {}
+    return {alias: (ref.get("pin") if isinstance(ref, dict) else None)
+            for alias, ref in refs.items()}
+
+
+def is_relock_transition(candidate_dir: Path, deployed_dir: Path,
+                         inventory: ApprovedInventory) -> bool:
+    """「正式な再ロック経路 (複製 → pin だけ I1→I2 → 提出)」かどうか
+    (設計書 §2.7、codex r4 C2)。`same_modulo_pins` **かつ** deployed の
+    pin の少なくとも 1 つが現在 inventory と不一致 **かつ** candidate の
+    pin が全て現在 inventory と一致。依存が 0 本なら常に False。"""
+    if not same_modulo_pins(candidate_dir, deployed_dir):
+        return False
+    deployed_pins = _pins_of(deployed_dir)
+    candidate_pins = _pins_of(candidate_dir)
+    if not deployed_pins or not candidate_pins:
+        return False
+
+    # opus r1 M1 是正: 元案は `_current(alias, pins)` と引数 `pins` を
+    # 取りながら本文で使っていなかった (死に引数 = 嘘のシグネチャ)。
+    # plugin 名の引き元は candidate / deployed のどちらでもよい
+    # (`same_modulo_pins` が `strip_pins` 一致を先に保証しているので
+    # `indicators` の alias → plugin 対応は両者で同一) が、**どちらを
+    # 読むかを明示**するため `plugin_dir` を引数にする。
+    def _current(alias: str, plugin_dir: Path) -> str | None:
+        refs = (_config_of(plugin_dir) or {}).get("indicators") or {}
+        ref = refs.get(alias)
+        if not isinstance(ref, dict):
+            return None
+        dep = inventory.by_name(ref.get("plugin"))
+        return dep.content_hash if dep is not None else None
+
+    stale = any(pin != _current(alias, deployed_dir)
+                for alias, pin in deployed_pins.items())
+    fresh = all(pin is not None and pin == _current(alias, candidate_dir)
+                for alias, pin in candidate_pins.items())
+    return stale and fresh

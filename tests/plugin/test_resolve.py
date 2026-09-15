@@ -270,3 +270,107 @@ def test_resolver_failure_spawns_no_worker(tmp_path, monkeypatch):
     with pytest.raises(IndicatorResolutionError):
         resolve_indicator_deps(s, _inv(root), settings=SETTINGS, pin_mode="check")
     assert calls == []
+
+
+import shutil
+
+import yaml
+
+from agentic_fx.plugin.resolve import (
+    is_relock_transition, lock_config, same_modulo_pins, strip_pins,
+)
+
+
+def test_lock_config_writes_pins_and_keeps_discoverable(tmp_path):
+    root = tmp_path / "plugins"
+    rsi = _indicator(root, "rsi")
+    adx = _indicator(root, "adx")
+    cand = tmp_path / "cand"
+    s = _strategy(cand, "s", "indicators:\n"
+                             "  rsi: {plugin: rsi}\n  adx: {plugin: adx}\n")
+    before_hash = s.content_hash
+    resolved = resolve_indicator_deps(s, _inv(root, rsi, adx), settings=SETTINGS,
+                                      pin_mode="ignore")
+    before_text, after_text, new_hash = lock_config(cand / "s", resolved.pins())
+    assert "pin:" not in before_text
+    written = yaml.safe_load((cand / "s" / "config.yaml").read_text())
+    assert written["indicators"]["rsi"]["pin"] == rsi.content_hash
+    assert written["indicators"]["adx"]["pin"] == adx.content_hash
+    assert after_text == (cand / "s" / "config.yaml").read_text()
+    # ユーザー裁定 2026-09-14 ⑥: lock 後は必ず snapshot (content_hash) を
+    # disk から取り直す。返り値の new_hash が、書き込み後の config.yaml を
+    # 独立に再読して計算した content_hash() と一致すること (呼び出し元が
+    # resolve 時点の値を使い回していないことの pin)。
+    assert new_hash == content_hash(cand / "s")
+    relocked, reason = discover_one_with_reason(cand / "s", "s")
+    assert reason is None                       # P1: 書き換え後も discover を通る
+    assert relocked.content_hash != before_hash  # pin は content_hash の署名対象
+    assert relocked.content_hash == new_hash     # snapshot 再取得の値と一致
+    # 既に同じ pin なら no-op (2 回目の lock で内容が変わらない)
+    resolved2 = resolve_indicator_deps(relocked, _inv(root, rsi, adx),
+                                       settings=SETTINGS, pin_mode="ignore")
+    b2, a2, h2 = lock_config(cand / "s", resolved2.pins())
+    assert b2 == a2
+    assert h2 == new_hash                        # no-op でも snapshot は再計算される
+
+
+def test_lock_config_overwrites_stale_pin(tmp_path):
+    root = tmp_path / "plugins"
+    rsi = _indicator(root, "rsi")
+    cand = tmp_path / "cand"
+    s = _strategy(cand, "s",
+                  "indicators:\n  rsi: {plugin: rsi, pin: '" + "b" * 64 + "'}\n")
+    resolved = resolve_indicator_deps(s, _inv(root, rsi), settings=SETTINGS,
+                                      pin_mode="ignore")
+    lock_config(cand / "s", resolved.pins())
+    written = yaml.safe_load((cand / "s" / "config.yaml").read_text())
+    assert written["indicators"]["rsi"]["pin"] == rsi.content_hash
+
+
+def test_strip_pins_removes_only_pins():
+    cfg = {"kind": "strategy", "indicators": {
+        "rsi": {"plugin": "rsi", "pin": "a" * 64, "params": {"p": 1}}}}
+    out = strip_pins(cfg)
+    assert out["indicators"]["rsi"] == {"plugin": "rsi", "params": {"p": 1}}
+    assert cfg["indicators"]["rsi"]["pin"] == "a" * 64   # 入力は不変
+
+
+def test_same_modulo_pins(tmp_path):
+    root = tmp_path / "plugins"
+    rsi = _indicator(root, "rsi")
+    a = tmp_path / "a"
+    _strategy(a, "s", f"indicators:\n  rsi: {{plugin: rsi, pin: '{'a' * 64}'}}\n")
+    b = tmp_path / "b"
+    _strategy(b, "s", f"indicators:\n  rsi: {{plugin: rsi, pin: '{rsi.content_hash}'}}\n")
+    c = tmp_path / "c"
+    _strategy(c, "s", "indicators:\n  rsi: {plugin: rsi, params: {p: 1}}\n")
+    assert same_modulo_pins(a / "s", b / "s") is True
+    assert same_modulo_pins(a / "s", c / "s") is False
+
+
+def test_is_relock_transition(tmp_path):
+    root = tmp_path / "plugins"
+    rsi = _indicator(root, "rsi")          # 現在 inventory の hash
+    inv = _inv(root, rsi)
+    deployed = tmp_path / "dep"
+    _strategy(deployed, "s",
+              f"indicators:\n  rsi: {{plugin: rsi, pin: '{'a' * 64}'}}\n")  # 破れ
+    cand = tmp_path / "cand"
+    _strategy(cand, "s",
+              f"indicators:\n  rsi: {{plugin: rsi, pin: '{rsi.content_hash}'}}\n")
+    assert is_relock_transition(cand / "s", deployed / "s", inv) is True
+    # 候補が古い pin のまま = 再ロックではない
+    stale_cand = tmp_path / "stale"
+    _strategy(stale_cand, "s",
+              f"indicators:\n  rsi: {{plugin: rsi, pin: '{'a' * 64}'}}\n")
+    assert is_relock_transition(stale_cand / "s", deployed / "s", inv) is False
+    # deployed の pin が破れていない = 再ロックではない
+    fresh_dep = tmp_path / "fresh"
+    _strategy(fresh_dep, "s",
+              f"indicators:\n  rsi: {{plugin: rsi, pin: '{rsi.content_hash}'}}\n")
+    assert is_relock_transition(cand / "s", fresh_dep / "s", inv) is False
+    # 依存なしの strategy 同士は再ロックではない
+    nodep_a, nodep_b = tmp_path / "na", tmp_path / "nb"
+    _strategy(nodep_a, "s", "")
+    _strategy(nodep_b, "s", "")
+    assert is_relock_transition(nodep_a / "s", nodep_b / "s", inv) is False
