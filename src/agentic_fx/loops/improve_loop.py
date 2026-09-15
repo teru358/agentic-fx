@@ -147,7 +147,8 @@ def _current_rpc_abandoned() -> bool:
 
 
 def _backtest_reply_from_save_kwargs(
-        save_kwargs: dict, *, submission_blocked: dict | None = None) -> dict:
+        save_kwargs: dict, *, submission_blocked: dict | None = None,
+        started: bool = True) -> dict:
     """永続化用 save kwargs を JSON-safe な RPC 応答へ限定投影する。
     期間端点 (`period`) と保存時刻 (`now`) は agent に見せない (遮断 7、
     `improve_rpc_tools._FORBIDDEN_KEYS`) — 台帳用の元データは属性で運ぶ。
@@ -156,7 +157,11 @@ def _backtest_reply_from_save_kwargs(
     は**agent へ返る公開面にだけ**足す — `save_kwargs` (= 台帳/Tx-2 が
     読む非公開の元データ) には一切混ぜない (`improve_rpc_tools.py:150-154`
     の `save_kwargs` 契約を痩せさせない)。in_sample 段が合格のときは
-    キー自体を作らない (`None` を渡さない呼び出し元の既定)。"""
+    キー自体を作らない (`None` を渡さない呼び出し元の既定)。
+
+    [indicator-consumption-wiring] T5b Step 5-4c: `started` は F4 の裏
+    (成功応答にも `started` キーを載せる) — 子が解放しない判定を
+    キーの有無ではなく値で行えるようにする。"""
     reply = {
         "scope": save_kwargs["scope"],
         "pair": save_kwargs["pair"],
@@ -167,6 +172,7 @@ def _backtest_reply_from_save_kwargs(
     }
     if submission_blocked is not None:
         reply["submission_blocked"] = submission_blocked
+    reply["started"] = started
     return _BacktestReply(reply, save_kwargs)
 
 
@@ -949,20 +955,44 @@ class ImproveLoop:
                 return {"error": "loader_rejected: content changed during backtest"}
             if content_hash_bytes(plugin_py, config_yaml) != meta.content_hash:
                 return {"error": "loader_rejected: content changed during backtest"}
+            # [indicator-consumption-wiring] §2.9(c): 解決は**親でしか
+            # できない** (`ImproveRunContext.inventory` は親にしかない)。
+            # 予約は子で先に起きているので、ここで未解決なら backtest を
+            # 走らせずに `started: false` を返し、**子が予約を戻す**。
+            # 探索中なので `pin_mode="check"` (pin があれば一致を要求、
+            # 無ければ通す)。`available` は inventory の indicator 名だけ
+            # (staging・examples は含まない)。
+            from agentic_fx.plugin.resolve import (
+                IndicatorResolutionError, resolve_indicator_deps,
+            )
+            # [indicator-consumption-wiring] T5b 逸脱是正: `inventory` は
+            # `prepare()` 経由の本番経路では常に非 None だが、
+            # `tests/loops/test_improve_loop_rpc_handlers.py` は
+            # `_build_rpc_handlers(ledger, staging_dir=...)` を `inventory=`
+            # 省略で直接呼ぶ既存テストを多数持つ (T4b の `_run_plugin_gate`
+            # と同じ「直接呼び出しテスト用フォールバック」— `_empty_
+            # inventory_result` を流用する)。
+            inv = (inventory if inventory is not None
+                  else _empty_inventory_result(self._root / "plugins"))
+            try:
+                resolved = resolve_indicator_deps(
+                    meta, inv.inventory, settings=self._settings,
+                    pin_mode="check")
+            except IndicatorResolutionError as exc:
+                return {
+                    "started": False, "error": "indicator_unresolved",
+                    "alias": exc.alias, "reason": exc.reason,
+                    "available": sorted(
+                        m.name for m in inv.inventory.metas
+                        if m.kind == "indicator" and m.outputs is not None),
+                }
             try:
                 conn = self._db_readonly_conn_factory()
                 captured: list[dict] = []
                 dataset = self._settings.backtest.dataset()
-                from agentic_fx.plugin.resolve import ResolvedIndicatorSet
                 intent_source = strategy_adapter.build_intent_source(
                     meta, conn=conn, pair=args["pair"], dataset=dataset,
-                    settings=self._settings,
-                    # [indicator-consumption-wiring] T3 暫定 (T5b Step 5-4
-                    # で `ImproveRunContext.inventory` からの `check` 解決に
-                    # 置き換える)。それまでは依存ありの staging 候補は
-                    # worker 内で `KeyError` → `SandboxError` →
-                    # `backtest_failed` になる = fail closed。
-                    resolved=ResolvedIndicatorSet.empty(self._root / "plugins"))
+                    settings=self._settings, resolved=resolved)
                 try:
                     holdout.run_in_sample(
                         self._settings, history_conn=conn, symbol=args["pair"],

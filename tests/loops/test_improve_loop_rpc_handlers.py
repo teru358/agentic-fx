@@ -84,7 +84,13 @@ def _patch_strategy_lookup(monkeypatch):
             content_hash=content_hash_bytes(
                 (path / "plugin.py").read_bytes(),
                 (path / "config.yaml").read_bytes()),
-            pairs=("USDJPY",))
+            pairs=("USDJPY",),
+            # [indicator-consumption-wiring] T5b 逸脱是正: `run_backtest_
+            # handler` (Step 5-4c) が `resolve_indicator_deps(meta, ...)`
+            # を呼ぶようになり、`meta.indicators` を読む。この fake meta は
+            # 依存なし strategy を表す (config.yaml に `indicators:` が無い)
+            # ので空 tuple。
+            indicators=())
 
     monkeypatch.setattr("agentic_fx.plugin.loader._discover_one", discover)
     monkeypatch.setattr(
@@ -307,6 +313,9 @@ def test_run_backtest_handler_returns_json_safe_limited_reply(
     out = tools["run_backtest"].func(name="myst", pair="USDJPY")
 
     json.dumps(out)
+    # [indicator-consumption-wiring] T5b 逸脱是正: Step 5-4c の
+    # `_backtest_reply_from_save_kwargs` が成功応答へ `started: True` を
+    # 足すようになった (F4 の裏 — 成功応答にも `started` キーが載る)。
     assert out == {
         "scope": "in_sample",
         "pair": "USDJPY",
@@ -314,6 +323,7 @@ def test_run_backtest_handler_returns_json_safe_limited_reply(
         "source": "dukascopy",
         "metrics": {"pf": 1.3, "trades": 40, "avg_r": 0.1, "evaluable": True},
         "trial_count": 1,
+        "started": True,
     }
     assert "period" not in out and "now" not in out
     assert "content_hash" not in out
@@ -595,7 +605,7 @@ def test_run_backtest_handler_reports_missing_history_with_available_pairs(
         lambda path, name: SimpleNamespace(
             name="myst", kind="strategy", timeframe="1h",
             content_hash=content_hash_bytes(b"plugin", b"config"),
-            pairs=("EURUSD",)))
+            pairs=("EURUSD",), indicators=()))
     handlers = loop_min._build_rpc_handlers(
         ImproveRpcLedger(rpc_timeout_sec_by_kind={}), staging_dir=staging_dir)
 
@@ -723,7 +733,7 @@ def test_run_backtest_handler_reports_pair_not_declared(
         lambda path, name: SimpleNamespace(
             name="myst", kind="strategy", timeframe="1h",
             content_hash=content_hash_bytes(b"plugin", b"config"),
-            pairs=("EURUSD",)))
+            pairs=("EURUSD",), indicators=()))
     monkeypatch.setattr(
         "agentic_fx.loops.improve_loop.holdout.run_in_sample",
         lambda *a, **kw: (_ for _ in ()).throw(ValueError(

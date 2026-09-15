@@ -28,6 +28,14 @@ from agentic_fx.service import build_app, run_init
 from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store.db import connect, connect_readonly
 
+from tests.fixtures.wiring_envs import (
+    activity_text as _activity_text,
+    improve_env as _improve_env,
+    improve_env_with_activity as _improve_env_with_activity,
+    mission_for as _mission,
+    prepare_ctx as _prepare_ctx,
+)
+from tests.fixtures.wiring_envs import completed_result as _completed_result
 from tests.store.test_rag import FakeEmbedding
 from tests.test_service_app import _no_real_network
 
@@ -1833,3 +1841,111 @@ def test_source_snapshot_dir_is_readonly_to_parent_after_prepare(
             mission_result = worker.run(mission)
             loop.commit(mission=mission, ctx=ctx, result=mission_result,
                        now=NOW)
+
+
+def test_run_backtest_handler_refuses_unresolved_dependency(tmp_path):
+    """F4: 親は backtest を走らせず `{"started": false, ...}` を返す。
+    staging 内 indicator は `available` に出ない。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root = _improve_env(tmp_path)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    # staging に indicator 候補を置いても inventory には入らない
+    fx.write_indicator(ctx.staging_dir, "adx")
+    cand = fx.write_rsi_pullback(ctx.staging_dir, pins=None)
+    import yaml
+    cfg = yaml.safe_load((cand / "config.yaml").read_text())
+    cfg["indicators"]["rsi"]["plugin"] = "adx"       # staging 内を指す
+    (cand / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+
+    out = ctx.rpc_handlers["run_backtest"](
+        {"name": "rsi_pullback", "pair": "USDJPY"})
+
+    assert out["started"] is False
+    assert out["error"] == "indicator_unresolved"
+    assert out["alias"] == "rsi" and out["reason"] == "not_found"
+    assert out["available"] == ["rsi"]       # staging の adx は出ない
+    assert conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == 0
+
+
+def test_unresolved_run_backtest_leaves_the_backlog_last_result_untouched(
+        tmp_path):
+    """F4 (`last_result` 不変、**codex plan r1 I8**)。
+
+    設計書 §6 F4 は counters と並べて **`last_result` 不変**を要求している
+    (遮断 8: 未解決の RPC は改善 worker に渡る文字列を 1 文字も動かさない)。
+    v1.2 はこれを 1 箇所も観測していなかった。**実 DB (tmp) の
+    `improvement_backlog` 行に見張り値を入れ、handler を回した後に
+    同じ値のままであること**を pin する (`last_result` を書くのは
+    mission の終端 (`_finalize_*`) だけ、という規律の回帰にもなる)。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root = _improve_env(tmp_path)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": "a" * 64})  # pin 破れ
+    # [indicator-consumption-wiring] T5b 逸脱是正: プラン本文は「backlog が
+    # 空なら 1 行作ってから回すこと」と自ら注記していたが具体的な INSERT を
+    # 書いていなかった (実測: `_improve_env`/`_prepare_ctx` だけでは
+    # improvement_backlog は空)。`backlog_store.add` で見張り行を 1 本作る。
+    from agentic_fx.store import backlog as backlog_store
+    backlog_store.add(conn, "sentinel idea", "test", now=fx.NOW)
+    conn.execute(
+        "UPDATE improvement_backlog SET last_result='SENTINEL_UNCHANGED'")
+    conn.commit()
+
+    out = ctx.rpc_handlers["run_backtest"](
+        {"name": "rsi_pullback", "pair": "USDJPY"})
+
+    assert out["started"] is False
+    rows = conn.execute("SELECT last_result FROM improvement_backlog").fetchall()
+    assert rows, "見張り行が無い (backlog が空なら 1 行作ってから回すこと)"
+    assert all(r["last_result"] == "SENTINEL_UNCHANGED" for r in rows)
+
+
+def test_run_backtest_handler_accepts_unpinned_candidates(tmp_path):
+    """探索中は `check` — pin 無しでも通る (提出時に `require` で落ちる)。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root = _improve_env(tmp_path)
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    fx.write_rsi_pullback(ctx.staging_dir, pins=None)
+    out = ctx.rpc_handlers["run_backtest"](
+        {"name": "rsi_pullback", "pair": "USDJPY"})
+    assert out.get("started") is not False
+    assert "metrics" in out
+
+
+def test_run_backtest_handler_refuses_stale_pin_under_check(tmp_path):
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root = _improve_env(tmp_path)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": "a" * 64})
+    out = ctx.rpc_handlers["run_backtest"](
+        {"name": "rsi_pullback", "pair": "USDJPY"})
+    assert out["started"] is False and out["reason"] == "pin_mismatch"
+
+
+def test_started_true_is_present_on_success(tmp_path):
+    """F4 の裏: 成功応答にも `started` キーが載る (子が解放しない判定を
+    キーの有無ではなく値で行えるように)。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root = _improve_env(tmp_path)
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
+    out = ctx.rpc_handlers["run_backtest"](
+        {"name": "rsi_pullback", "pair": "USDJPY"})
+    assert out["started"] is True
