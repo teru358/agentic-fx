@@ -88,9 +88,9 @@ def test_approved_plugins_excludes_unapproved(tmp_path, caplog):
     conn = _conn(tmp_path)
 
     with caplog.at_level(logging.WARNING):
-        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+        metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
-    assert metas == []
+    assert metas == ()
     assert "unapproved_ind" in caplog.text
 
 
@@ -104,7 +104,7 @@ def test_approved_plugins_includes_approved_hash_match(tmp_path):
     from agentic_fx.plugin.loader import content_hash
     _approve(conn, "good_ind", content_hash(d))
 
-    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+    metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
     assert len(metas) == 1
     assert metas[0].name == "good_ind"
@@ -126,9 +126,9 @@ def test_approved_plugins_excludes_pending_only(tmp_path, caplog):
                      {"name": "pending_ind", "content_hash": content_hash(d)}, NOW)
 
     with caplog.at_level(logging.WARNING):
-        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+        metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
-    assert metas == []
+    assert metas == ()
     assert "pending_ind" in caplog.text
 
 
@@ -144,9 +144,9 @@ def test_approved_plugins_excludes_rejected_only(tmp_path, caplog):
                      reason="quality")
 
     with caplog.at_level(logging.WARNING):
-        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+        metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
-    assert metas == []
+    assert metas == ()
     assert "rejected_ind" in caplog.text
 
 
@@ -164,16 +164,16 @@ def test_approved_plugins_excludes_after_post_approval_edit(tmp_path, caplog):
     (d / "plugin.py").write_text(INDICATOR_PY + "\n# edited after approval\n")
 
     with caplog.at_level(logging.WARNING):
-        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+        metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
-    assert metas == []
+    assert metas == ()
     assert "edited_ind" in caplog.text
 
 
 def test_approved_plugins_tolerates_missing_dir(tmp_path):
     conn = _conn(tmp_path)
-    metas = plugin_loader.approved_plugins(conn, tmp_path / "no_such_dir")
-    assert metas == []
+    metas = plugin_loader.approved_plugins(conn, tmp_path / "no_such_dir", settings=_SETTINGS).inventory.metas
+    assert metas == ()
 
 
 # ④ get_indicators 合成 (fake sandbox_run) -------------------------------
@@ -453,9 +453,9 @@ def test_approved_plugins_reject_after_approve_revokes(tmp_path):
     _decide(conn, "flip_ind", h, status="rejected",
            now=NOW + timedelta(minutes=1))
 
-    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+    metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
-    assert metas == []
+    assert metas == ()
 
 
 def test_approved_plugins_approve_after_reject_readmits(tmp_path):
@@ -470,7 +470,7 @@ def test_approved_plugins_approve_after_reject_readmits(tmp_path):
     _decide(conn, "flip_back_ind", h, status="approved",
            now=NOW + timedelta(minutes=1))
 
-    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+    metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
     assert len(metas) == 1 and metas[0].name == "flip_back_ind"
 
@@ -500,7 +500,7 @@ def test_approved_plugins_expired_after_approve_does_not_revoke(tmp_path):
                        (aid,)).fetchone()
     assert row["status"] == "expired"  # 前提: 2 件目の要求が確かに expired になった
 
-    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+    metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
     assert len(metas) == 1 and metas[0].name == "expire_noop_ind"
 
@@ -525,7 +525,7 @@ def test_approved_plugins_invalidated_after_approve_does_not_revoke(tmp_path):
          later.isoformat(), later.isoformat()))
     conn.commit()
 
-    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+    metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
     assert len(metas) == 1 and metas[0].name == "invalidated_noop_ind"
 
@@ -548,9 +548,9 @@ def test_approved_plugins_excludes_approved_row_with_null_decided_at(
          NOW.isoformat()))
     conn.commit()
 
-    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+    metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
-    assert metas == []
+    assert metas == ()
 
 
 def test_approved_plugins_orders_by_decided_at_not_insertion_order(
@@ -573,11 +573,11 @@ def test_approved_plugins_orders_by_decided_at_not_insertion_order(
     # id=2 (後に INSERT) が approve だが decided_at は「先」(NOW)。
     _decide(conn, "chronology_ind", h, status="approved", now=NOW)
 
-    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+    metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
     # decided_at 基準の正しい時系列は approve(NOW) → reject(later) なので
     # 最終決定は reject = 除外。
-    assert metas == []
+    assert metas == ()
 
 
 def test_approved_plugins_same_decided_at_ties_break_by_higher_id(tmp_path):
@@ -600,9 +600,9 @@ def test_approved_plugins_same_decided_at_ties_break_by_higher_id(tmp_path):
     _decide(conn, "tie_ind", h, status="approved", now=NOW)  # id 小
     _decide(conn, "tie_ind", h, status="rejected", now=NOW)  # id 大・同時刻
 
-    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+    metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
-    assert metas == []  # id が大きい reject が勝つ
+    assert metas == ()  # id が大きい reject が勝つ
 
 
 def test_approved_plugins_reject_of_other_hash_does_not_revoke(tmp_path):
@@ -619,7 +619,7 @@ def test_approved_plugins_reject_of_other_hash_does_not_revoke(tmp_path):
     _decide(conn, "pairkey_ind", "0" * 64, status="rejected",
             now=NOW + timedelta(minutes=1))
 
-    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+    metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
     assert len(metas) == 1 and metas[0].name == "pairkey_ind"
 
@@ -643,7 +643,7 @@ def test_approved_plugins_keeps_all_approved_hashes_for_a_name(tmp_path):
     # ため、集合そのものを内部ヘルパで直接ピンする。
     assert plugin_loader._approved_hashes_by_name(conn) == {
         "multi_ind": {h, "1" * 64}}
-    metas = plugin_loader.approved_plugins(conn, plugins_dir)
+    metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
     assert len(metas) == 1 and metas[0].name == "multi_ind"
 
 
@@ -683,7 +683,7 @@ def test_approved_plugins_skips_row_with_malformed_payload_json(
     conn.commit()
 
     with caplog.at_level(logging.WARNING):
-        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+        metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
     assert len(metas) == 1 and metas[0].name == "broken_json_ind"
     assert "JSON" in caplog.text
@@ -711,7 +711,7 @@ def test_approved_plugins_skips_row_with_non_dict_payload(tmp_path, caplog):
     conn.commit()
 
     with caplog.at_level(logging.WARNING):
-        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+        metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
     assert len(metas) == 1 and metas[0].name == "nondict_payload_ind"
     assert "dict" in caplog.text
@@ -736,7 +736,7 @@ def test_approved_plugins_skips_row_with_non_str_name(tmp_path, caplog):
     conn.commit()
 
     with caplog.at_level(logging.WARNING):
-        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+        metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
     assert len(metas) == 1 and metas[0].name == "nonstr_name_ind"
     assert "name/content_hash" in caplog.text
@@ -765,8 +765,96 @@ def test_approved_plugins_skips_row_with_non_str_content_hash(tmp_path, caplog):
 
     with caplog.at_level(logging.WARNING):
         hashes = plugin_loader._approved_hashes_by_name(conn)
-        metas = plugin_loader.approved_plugins(conn, plugins_dir)
+        metas = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS).inventory.metas
 
     assert hashes == {"nonstr_hash_ind": {h}}  # 5 が混入していない
     assert len(metas) == 1 and metas[0].name == "nonstr_hash_ind"
     assert "name/content_hash" in caplog.text
+
+
+# --- [indicator-consumption-wiring] T1: 二相 inventory ---------------------
+
+from tests.backtest.factories import SETTINGS as _SETTINGS
+
+_STRATEGY_PY2 = ("def evaluate(df, indicators, signals, params):\n"
+                 "    return {'action': 'hold', 'rationale': 'x'}\n")
+_IND_SERIES_CONFIG = "kind: indicator\noutputs: [v]\nparams:\n  period: 14\n"
+
+
+def _strategy_config(pin: str | None) -> str:
+    ref = "{plugin: rsi" + (f", pin: '{pin}'" if pin else "") + "}"
+    return ("kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\n"
+            "exit_mode: levels\nmax_bars: 200\n"
+            f"indicators:\n  rsi: {ref}\n")
+
+
+def test_phase2_admits_pinned_strategy_and_keeps_resolved(tmp_path):
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    from agentic_fx.plugin.loader import content_hash
+    rsi_dir = _write_plugin(plugins_dir, "rsi", config_yaml=_IND_SERIES_CONFIG)
+    rsi_hash = content_hash(rsi_dir)
+    s_dir = _write_plugin(plugins_dir, "s", plugin_py=_STRATEGY_PY2,
+                          config_yaml=_strategy_config(rsi_hash))
+    conn = _conn(tmp_path)
+    _approve(conn, "rsi", rsi_hash)
+    _approve(conn, "s", content_hash(s_dir))
+
+    result = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS)
+
+    assert sorted(m.name for m in result.inventory.metas) == ["rsi", "s"]
+    assert sorted(m.name for m in result.phase1_metas) == ["rsi", "s"]
+    assert result.rejected_strategies == ()
+    key = ("s", content_hash(s_dir))
+    assert key in result.resolved
+    assert result.resolved[key].items[0].content_hash == rsi_hash
+    assert result.inventory.root == plugins_dir.resolve()
+
+
+def test_phase2_drops_strategy_with_broken_pin(tmp_path, caplog):
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    from agentic_fx.plugin.loader import content_hash
+    rsi_dir = _write_plugin(plugins_dir, "rsi", config_yaml=_IND_SERIES_CONFIG)
+    s_dir = _write_plugin(plugins_dir, "s", plugin_py=_STRATEGY_PY2,
+                          config_yaml=_strategy_config("a" * 64))
+    conn = _conn(tmp_path)
+    _approve(conn, "rsi", content_hash(rsi_dir))
+    _approve(conn, "s", content_hash(s_dir))
+
+    with caplog.at_level(logging.WARNING):
+        result = plugin_loader.approved_plugins(conn, plugins_dir,
+                                                settings=_SETTINGS)
+
+    assert [m.name for m in result.inventory.metas] == ["rsi"]
+    assert sorted(m.name for m in result.phase1_metas) == ["rsi", "s"]
+    assert len(result.rejected_strategies) == 1
+    rej = result.rejected_strategies[0]
+    assert (rej.name, rej.alias, rej.reason) == ("s", "rsi", "pin_mismatch")
+    assert "pin_mismatch" in caplog.text
+    assert result.resolved == {}
+
+
+def test_phase2_drops_unpinned_strategy(tmp_path):
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    from agentic_fx.plugin.loader import content_hash
+    rsi_dir = _write_plugin(plugins_dir, "rsi", config_yaml=_IND_SERIES_CONFIG)
+    s_dir = _write_plugin(plugins_dir, "s", plugin_py=_STRATEGY_PY2,
+                          config_yaml=_strategy_config(None))
+    conn = _conn(tmp_path)
+    _approve(conn, "rsi", content_hash(rsi_dir))
+    _approve(conn, "s", content_hash(s_dir))
+    result = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS)
+    assert [m.name for m in result.inventory.metas] == ["rsi"]
+    assert result.rejected_strategies[0].reason == "unpinned"
+
+
+def test_missing_plugins_dir_returns_empty_result(tmp_path):
+    conn = _conn(tmp_path)
+    result = plugin_loader.approved_plugins(conn, tmp_path / "nope",
+                                            settings=_SETTINGS)
+    assert result.inventory.metas == ()
+    assert result.phase1_metas == ()
+    assert result.resolved == {}
+    assert result.rejected_strategies == ()

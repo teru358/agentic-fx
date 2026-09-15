@@ -24,8 +24,12 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from agentic_fx.plugin.loader import PluginMeta, discover
+
+if TYPE_CHECKING:
+    from agentic_fx.plugin.resolve import InventoryBuildResult, ResolvedIndicatorSet
 
 _log = logging.getLogger(__name__)
 
@@ -34,40 +38,76 @@ _log = logging.getLogger(__name__)
 APPROVAL_KIND = "plugin"
 
 
-def approved_plugins(conn: sqlite3.Connection, plugins_dir: Path) -> list[PluginMeta]:
-    """`plugins_dir` を discover し、承認済みかつハッシュ一致の plugin のみ返す。
+def approved_plugins(conn: sqlite3.Connection, plugins_dir: Path, *,
+                     settings) -> "InventoryBuildResult":
+    """`plugins_dir` を discover し、承認済みかつハッシュ一致の plugin を
+    **二相**で admit する ([indicator-consumption-wiring] 設計書 §2.3)。
 
-    `plugins_dir` が存在しない場合は `discover` を呼ばず `[]` を返す
-    (`discover` は存在しないディレクトリに対し `iterdir()` で
-    `FileNotFoundError` を送出する — 未初期化環境で service.py の起動を
-    妨げないよう、ここで吸収する)。
+    第 1 相 = 既存規律 (discover + 最新決定 approved + hash 一致)。
+    第 2 相 = strategy を第 1 相の indicator 集合に対して
+    `resolve_indicator_deps(pin_mode="require")` に通し、成功したものだけ
+    最終 admit する (失敗は warning + reason を log)。
 
-    同一 (name, content_hash) に対して決定 (approved/rejected) が複数
-    存在する場合、**最新の決定** (`decided_at` 最大、同時刻は `id` 最大)
-    が有効になる (設計書 §7 / D4、プラン9 Task 12)。後から reject すれば
-    承認は取り消され、後から re-approve すれば再承認される。`expired` /
-    `invalidated` は決定として数えない (新しい要求の失効が古い承認を
-    取り消すのは誤り)。
+    戻り値は `InventoryBuildResult` — **`list[PluginMeta]` ではない**。
+    最終 admit 済の一覧は `result.inventory.metas`、snapshot の材料は
+    `result.phase1_metas` (pin 破れ strategy を含む)、prompt の
+    「pin 破れ N 本」は `result.rejected_strategies` から作る。
+    第 2 相で成功した strategy の `ResolvedIndicatorSet` は
+    `result.resolved[(name, content_hash)]` に入る — **消費側は再解決せず
+    これをそのまま渡す** (resolver 呼び出しは strategy ごとに 1 回、
+    codex r5 I1 / r6 I1)。
     """
+    from agentic_fx.plugin.resolve import (
+        ApprovedInventory, IndicatorResolutionError, InventoryBuildResult,
+        RejectedStrategy, resolve_indicator_deps,
+    )
     if not plugins_dir.is_dir():
         _log.info("plugins dir %s does not exist — no plugins loaded", plugins_dir)
-        return []
+        empty = ApprovedInventory(root=plugins_dir, metas=())
+        return InventoryBuildResult(inventory=empty, phase1_metas=(),
+                                    resolved={}, rejected_strategies=())
 
     metas = discover(plugins_dir)
-    if not metas:
-        return []
-
     approved_hashes_by_name = _approved_hashes_by_name(conn)
 
-    result: list[PluginMeta] = []
+    phase1: list[PluginMeta] = []
     for meta in metas:
         if meta.content_hash in approved_hashes_by_name.get(meta.name, ()):
-            result.append(meta)
+            phase1.append(meta)
         else:
             _log.warning(
                 "plugin %s: 未承認 (承認済みハッシュと不一致、または承認要求が"
                 "存在しない) — excluding from load", meta.name)
-    return result
+
+    root = plugins_dir.resolve()
+    indicator_inventory = ApprovedInventory(
+        root=root, metas=tuple(m for m in phase1 if m.kind == "indicator"))
+
+    admitted: list[PluginMeta] = []
+    resolved: dict[tuple[str, str], "ResolvedIndicatorSet"] = {}
+    rejected: list[RejectedStrategy] = []
+    for meta in phase1:
+        if meta.kind != "strategy":
+            admitted.append(meta)
+            continue
+        try:
+            rset = resolve_indicator_deps(
+                meta, indicator_inventory, settings=settings, pin_mode="require")
+        except IndicatorResolutionError as exc:
+            _log.warning(
+                "plugin %s: indicator_unresolved:%s:%s — excluding from load",
+                meta.name, exc.alias or "-", exc.reason)
+            rejected.append(RejectedStrategy(
+                name=meta.name, content_hash=meta.content_hash,
+                alias=exc.alias, reason=exc.reason))
+            continue
+        admitted.append(meta)
+        resolved[(meta.name, meta.content_hash)] = rset
+
+    return InventoryBuildResult(
+        inventory=ApprovedInventory(root=root, metas=tuple(admitted)),
+        phase1_metas=tuple(phase1), resolved=resolved,
+        rejected_strategies=tuple(rejected))
 
 
 def _approved_hashes_by_name(conn: sqlite3.Connection) -> dict[str, set[str]]:
