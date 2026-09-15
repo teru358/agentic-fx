@@ -85,7 +85,7 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
                              "plugin:%s key (built-ins unaffected)",
                              meta.name, exc, meta.name)
                 continue
-            result[f"plugin:{meta.name}"] = plugin_result
+            result[f"plugin:{meta.name}"] = _project_indicator_output(plugin_result)
         return result
 
     def get_econ_calendar(days: int = 1) -> list[dict]:
@@ -109,3 +109,27 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
                                          "maximum": 7}},
                  "required": []}, get_econ_calendar),
     ]
+
+
+def _project_indicator_output(plugin_result: dict) -> dict:
+    """[indicator-consumption-wiring] §2.5: 系列は**末尾値**へ射影し、
+
+    **入力は `sandbox.run_plugin` の戻り (= `_validate_indicator_result` を
+    通した後) に限る** — 系列は `list[float | None]`、スカラー NaN は
+    `None` (opus r1 I4 で契約を固定)。wire 封筒 `{"series": [...]}` は
+    ここへは来ない。
+
+    値が未確定 (スカラー NaN = None、系列末尾 None) のキーは落とす
+    (fail-open 維持 — LLM 向けの参考情報なので「値が無い」ことを
+    `null` で見せるより落とす方が誤読が少ない)。空系列も落とす。"""
+    out: dict = {}
+    for key, value in plugin_result.items():
+        if isinstance(value, list):
+            if not value or value[-1] is None:
+                continue
+            out[key] = float(value[-1])
+            continue
+        if value is None:
+            continue
+        out[key] = value
+    return out

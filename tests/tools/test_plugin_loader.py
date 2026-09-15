@@ -981,3 +981,61 @@ def test_every_approved_plugins_caller_consumes_the_inventory_result():
     assert offenders == [], (
         "approved_plugins(...) の戻り値から未知の属性を読んでいる箇所: "
         f"{offenders}")
+
+
+def test_get_indicators_projects_series_to_last_value_and_drops_nan(tmp_path):
+    """S1 (観測点 2): 系列は末尾値へ射影。スカラー NaN と系列末尾 NaN は
+    キー単位で落とす。"""
+    from agentic_fx.config import load_settings
+    settings = load_settings(
+        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+    meta = PluginMeta(name="ind", kind="indicator", path=tmp_path,
+                      params={}, timeframe=None, pairs=(), max_bars=50,
+                      content_hash="h" * 64, outputs=("a", "b", "c", "d"))
+    provider = MagicMock()
+    provider.get_bars.return_value = _bars()
+
+    def fake_sandbox_run(meta_arg, payload, *, settings):
+        # opus r1 I4 是正: `sandbox_run` の既定は `sandbox.run_plugin` であり、
+        # その戻り値は **`_validate_indicator_result` を通した後**の形
+        # (`{key: float | list[float|None] | None}`) — wire 形式
+        # `{"series": [...]}` ではない。fake も同じ形で返す。
+        # **契約 (1 行で固定)**: `market_tools.get_indicators` は
+        # `run_plugin` の戻りしか見ない = 系列は **list**。wire の
+        # `{"series": [...]}` 封筒を解くのは `sandbox.py` の
+        # `_validate_indicator_result` の責務であり、
+        # `_project_indicator_output` は封筒を知らない (設計書 §2.5 と整合)。
+        return {"a": 1.5,
+                "b": [1.0, 2.0, 3.0],
+                "c": None,               # スカラー NaN (wire の null を親が None 化)
+                "d": [1.0, None]}        # 系列末尾 NaN
+
+    tools = market_tools.build(provider, MagicMock(), settings,
+                               indicator_plugins=[meta],
+                               sandbox_run=fake_sandbox_run)
+    get_indicators = next(t.func for t in tools if t.name == "get_indicators")
+    out = get_indicators("USDJPY", "1h")
+    assert out["plugin:ind"] == {"a": 1.5, "b": 3.0}
+
+
+def test_scalar_only_indicator_still_works_standalone(tmp_path):
+    """S1: outputs 宣言なし・スカラー返却の既存 plugin は無変更で通る。"""
+    from agentic_fx.config import load_settings
+    from agentic_fx.plugin.sandbox import run_plugin
+    example = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(example).plugin
+    d = tmp_path / "legacy"
+    d.mkdir()
+    (d / "plugin.py").write_text(
+        "def compute(df, params):\n    return {'rsi_14': 55.0}\n")
+    (d / "config.yaml").write_text("kind: indicator\nparams:\n  period: 14\n")
+    (d / "test_plugin.py").write_text("def test_placeholder():\n    pass\n")
+    from agentic_fx.plugin.loader import discover_one_with_reason
+    meta, reason = discover_one_with_reason(d, "legacy")
+    assert reason is None and meta.outputs is None
+    df = pd.DataFrame(
+        {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+         "volume": [1.0]},
+        index=pd.date_range("2026-01-01", periods=1, freq="1h", tz="UTC"))
+    out = run_plugin(meta, {"df": df, "params": meta.params}, settings=settings)
+    assert out == {"rsi_14": 55.0}

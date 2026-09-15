@@ -1190,3 +1190,23 @@ def test_worker_asserts_global_state_unchanged(tmp_path, plugin_settings):
     with PluginSession(meta, settings=plugin_settings, resolved=resolved) as s:
         with pytest.raises(SandboxError, match="global state"):
             s.call({"df": _df(10), "params": {}})
+
+
+def test_standalone_indicator_response_rejects_extra_or_missing_outputs_keys():
+    """codex plan r2 束1 Important: worker を迂回した/破損した応答 (wire を
+    直接偽装した呼び出し) が `meta.outputs` と食い違うキー集合を返したとき、
+    **親側の `_validate_indicator_result` が拒否する**こと (worker 側の検査
+    だけに頼らない — 親子の信頼境界を跨いだ値の再検証、S1)。"""
+    from agentic_fx.plugin.sandbox import SandboxError, _validate_indicator_result
+
+    outputs = ("a", "b")
+    # 欠落: outputs=("a","b") のうち "b" が無い
+    with pytest.raises(SandboxError, match="outputs"):
+        _validate_indicator_result({"a": 1.0}, outputs=outputs)
+    # 余分: 宣言に無い "c" が混ざる
+    with pytest.raises(SandboxError, match="outputs"):
+        _validate_indicator_result({"a": 1.0, "b": 2.0, "c": 3.0},
+                                   outputs=outputs)
+    # outputs=None (standalone 宣言なし、S1) は任意のキー集合を許す
+    assert _validate_indicator_result({"whatever": 1.0}, outputs=None) == \
+        {"whatever": 1.0}

@@ -578,7 +578,7 @@ class PluginSession:
 
         result = response.get("result")
         if kind == "indicator":
-            return _validate_indicator_result(result)
+            return _validate_indicator_result(result, outputs=self._meta.outputs)
         if kind == "signal":
             return {"signals": _validate_signal_result(result)}
         return _validate_strategy_result(result)
@@ -756,19 +756,68 @@ def _df_to_wire(df: "pd.DataFrame") -> dict[str, Any]:
 
 # --- 戻り値のスキーマ検証 (kind 別) -------------------------------------
 
-def _validate_indicator_result(result: Any) -> dict[str, float]:
+def _validate_indicator_result(result: Any, *,
+                               outputs: "tuple[str, ...] | None") -> dict[str, Any]:
+    """standalone (`run_plugin` / `PluginSession.call(kind="indicator")`) の
+    応答を親側で**再検証**する ([indicator-consumption-wiring] §2.5)。
+
+    worker は既に `plugin_contract.validate_indicator_result` を通した
+    値を wire 形式 (`{key: float | {"series": [float|null, ...]}}`) で返して
+    いるが、信頼境界を跨いだ値なのでここで形だけもう一度見る。
+    NaN は wire 上で `null` になっている。戻り値は
+    `{key: float | list[float | None]}`。
+
+    **codex plan r2 束1 Important**: wire 形式を Python 値
+    (`float | list[float|None]`) へ復元した**後**、
+    `core.plugin_contract.validate_indicator_result(out, df_index=None,
+    outputs=outputs)` を必ず通す。`df_index=None` なので系列長は検査しない
+    (wire 変換の時点で `list` になっており、系列長は worker 側で既に
+    `df` に対して検査済み — ここで二重にやり直せるのは `outputs` 宣言との
+    キー集合一致のみ、これが親側で唯一欠けていた検査)。`outputs=None`
+    (standalone 宣言なし indicator、S1) は任意のキー集合を許す (従来どおり)。
+    """
     if not isinstance(result, dict):
-        raise SandboxError(f"indicator must return a dict, got {type(result).__name__}")
-    out: dict[str, float] = {}
+        raise SandboxError(
+            f"indicator must return a dict, got {type(result).__name__}")
+    out: dict[str, Any] = {}
     for key, value in result.items():
         if not isinstance(key, str):
             raise SandboxError(f"indicator result keys must be str, got {key!r}")
+        if isinstance(value, dict):
+            series = value.get("series")
+            if set(value) != {"series"} or not isinstance(series, list):
+                raise SandboxError(
+                    f"indicator result[{key!r}] series envelope is malformed")
+            for item in series:
+                if item is None:
+                    continue
+                if isinstance(item, bool) or not isinstance(item, (int, float)):
+                    raise SandboxError(
+                        f"indicator result[{key!r}] series must contain "
+                        f"numbers or null, got {item!r}")
+                if not math.isfinite(float(item)):
+                    raise SandboxError(
+                        f"indicator result[{key!r}] series must be finite")
+            out[key] = [None if item is None else float(item) for item in series]
+            continue
+        if value is None:
+            out[key] = None       # スカラー NaN (wire では null)
+            continue
         if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise SandboxError(f"indicator result[{key!r}] must be a number, got {value!r}")
+            raise SandboxError(
+                f"indicator result[{key!r}] must be a number, got {value!r}")
         fvalue = float(value)
         if not math.isfinite(fvalue):
-            raise SandboxError(f"indicator result[{key!r}] must be finite, got {value!r}")
+            raise SandboxError(
+                f"indicator result[{key!r}] must be finite, got {value!r}")
         out[key] = fvalue
+
+    from agentic_fx.core.plugin_contract import (
+        IndicatorResultError, validate_indicator_result as _validate_common)
+    try:
+        _validate_common(out, df_index=None, outputs=outputs)
+    except IndicatorResultError as exc:
+        raise SandboxError(str(exc)) from exc
     return out
 
 
