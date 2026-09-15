@@ -23,6 +23,7 @@ from agentic_fx.plugin.gate_pytest import (  # M-8: モジュールレベル imp
     check_candidate_snapshot, hashes_of, run_gate_pytest,
 )
 from agentic_fx.plugin.sandbox import SandboxError, check_source
+from agentic_fx.tools import plugin_loader as tools_plugin_loader
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import backtest_runs as backtest_runs_store  # [profitability-floor] T1 Step 1-6: 人間 corridor の gate 行保存
 from agentic_fx.store import candidate_archives as candidate_archives_store  # T4 §1 L4 の archive GC が使う
@@ -779,6 +780,7 @@ def _persist_human_gate_rows(conn: sqlite3.Connection, rows: list[dict], *,
 def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
                    settings, now: datetime,
                    floor_mode: Literal["enforce", "warn"] = "enforce",
+                   plugins_root: Path,
                    activity: "ActivityLog | None" = None):
     """P1 手順 2〜7 / P3 手順 1〜2 の共有ゲート本体 (§8.1-41 pin: P1 と P3
     は同じゲートを通る — 二重実装しない)。合格すれば
@@ -803,6 +805,13 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         raise ValueError(
             f"plugin {name!r}: candidate at {candidate_dir} failed discovery "
             "validation (config/AST ゲート不合格 — ログ参照)")
+
+    # [indicator-consumption-wiring] U4 (2026-09-14): 新規承認では
+    # kind=indicator の `outputs` 宣言を必須にする。固定文言のみ
+    # (候補名も理由も足さない — Global Constraints の語彙一覧)。
+    # 位置は `assert_max_bars_within_limit` と同じ「ゲート本体の手前」。
+    if meta.kind == "indicator" and meta.outputs is None:
+        raise ValueError("outputs_required")
 
     rows: list[dict] = []
     try:
@@ -830,9 +839,15 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         # 前で fail closed する。
         approval.assert_max_bars_within_limit(meta, settings=settings)
 
+        # [indicator-consumption-wiring] §2.3: 承認回廊の inventory は
+        # **ここで 1 回だけ**構築する (submit / bless の両方が通る唯一の
+        # 場所)。`run_kind_gate` は `pin_mode="require"` で解決し、
+        # 失敗は判別子で返る (raise しない)。
+        inventory = tools_plugin_loader.approved_plugins(
+            conn, plugins_root, settings=settings)
         outcome = approval.run_kind_gate(  # 手順 7
             conn, meta, settings=settings, now=now, floor_mode=floor_mode,
-            sink=rows)
+            sink=rows, inventory=inventory, pin_mode="require")
         # CR7 (2026-09-13): `sink=rows` を渡したので `outcome.gate_rows`
         # は `rows` と同一オブジェクト — 二重の list を作らない。
         assert outcome.gate_rows is rows
@@ -846,6 +861,13 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
         raise
 
+    # [indicator-consumption-wiring] §2.8: 判別子から固定 ValueError。
+    # 例外メッセージの部分一致による分類は禁止 — ここも判別子だけを見る。
+    if outcome.verdict_kind == "indicator_unresolved":
+        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        raise ValueError(
+            f"indicator_unresolved:{outcome.indicator_alias or '-'}:"
+            f"{outcome.indicator_reason}")
     if outcome.verdict_kind == "insufficient_trades":
         _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
         raise ValueError(
@@ -920,7 +942,7 @@ def submit_candidate(
     with _plugin_lock(plugins_root, name):
         meta, content_hash, artifact_hash, outcome = _run_full_gate(
             conn, candidate_dir, name=name, settings=settings, now=now,
-            floor_mode="enforce", activity=activity)
+            floor_mode="enforce", plugins_root=plugins_root, activity=activity)
 
         g = settings.improve.gate
         payload = {
@@ -1595,7 +1617,7 @@ def bless_candidate(
 
         meta, content_hash, artifact_hash, outcome = _run_full_gate(
             conn, human_dir, name=name, settings=settings, now=now,
-            floor_mode="warn")
+            floor_mode="warn", plugins_root=plugins_root)
 
         if outcome.floor_warning:
             if on_floor_warning is not None:

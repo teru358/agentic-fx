@@ -16,7 +16,7 @@ from agentic_fx.store import db as db_store
 NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
 
 INDICATOR_PY = "def compute(df, params):\n    return {'v': 1.0}\n"
-CONFIG_YAML = "kind: indicator\n"
+CONFIG_YAML = "kind: indicator\noutputs: [v]\n"
 TEST_PY_OK = "def test_x():\n    pass\n"
 
 

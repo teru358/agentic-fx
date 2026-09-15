@@ -33,7 +33,7 @@ def test_reject_waits_for_approve_flock_and_then_gets_already_decided(tmp_path, 
     (plugins_dir / "_staging" / "1" / "sma").mkdir(parents=True)
     (plugins_dir / "_staging" / "1" / "sma" / "plugin.py").write_text(
         "def compute(df, params):\n    return {'v': 1.0}\n")
-    (plugins_dir / "_staging" / "1" / "sma" / "config.yaml").write_text("kind: indicator\n")
+    (plugins_dir / "_staging" / "1" / "sma" / "config.yaml").write_text("kind: indicator\noutputs: [v]\n")
     (plugins_dir / "_staging" / "1" / "sma" / "test_plugin.py").write_text(
         "def test_x():\n    pass\n")
 
@@ -95,7 +95,7 @@ def test_same_name_different_content_hash_approvals_are_independent(tmp_path, mo
     dir_b.mkdir(parents=True)
     (dir_b / "plugin.py").write_text(
         "def compute(df, params):\n    return {'v': 1.0}\n")
-    (dir_b / "config.yaml").write_text("kind: indicator\n")
+    (dir_b / "config.yaml").write_text("kind: indicator\noutputs: [v]\n")
     (dir_b / "test_plugin.py").write_text("def test_x():\n    pass\n")
     approval_b = switch.submit_candidate(
         conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
@@ -107,7 +107,7 @@ def test_same_name_different_content_hash_approvals_are_independent(tmp_path, mo
     dir_c.mkdir(parents=True)
     (dir_c / "plugin.py").write_text(
         "def compute(df, params):\n    return {'v': 2.0}\n")
-    (dir_c / "config.yaml").write_text("kind: indicator\n")
+    (dir_c / "config.yaml").write_text("kind: indicator\noutputs: [v]\n")
     (dir_c / "test_plugin.py").write_text("def test_x():\n    pass\n")
     approval_c = switch.submit_candidate(
         conn, name="sma", staging_dir=plugins_dir / "_staging" / "2",

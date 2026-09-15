@@ -11,14 +11,22 @@ import pytest
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_settings
 from agentic_fx.plugin import switch, version_store
+from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import db as db_store
 from agentic_fx.store import plugin_switch_journal as journal_store
+from tests.fixtures.wiring_envs import (
+    SETTINGS_FIXTURE as SETTINGS, switch_env as _switch_env,
+)
 
 NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
 
 INDICATOR_PY = "def compute(df, params):\n    return {'v': 1.0}\n"
-CONFIG_YAML = "kind: indicator\n"
+# [indicator-consumption-wiring] U4a (2026-09-14): submit/bless の
+# kind=indicator は outputs 宣言必須になった。本ファイルの既存候補は
+# outputs_required の受入対象ではない (lock/journal/tx 挙動の検証) ため、
+# `plugin.py` が実際に返すキーをそのまま宣言してゲートを通す。
+CONFIG_YAML = "kind: indicator\noutputs: [v]\n"
 TEST_PY_OK = "def test_x():\n    pass\n"
 
 
@@ -1464,3 +1472,72 @@ def test_bless_candidate_strategy_payload_eval_timeframe_maps_1d_to_24h(
         "SELECT payload_json FROM approval_requests WHERE id=?",
         (approval_id,)).fetchone()["payload_json"])
     assert payload["eval_timeframe"] == "24h"
+
+
+# --- [indicator-consumption-wiring] T4: 人間回廊の非送出 (F3'/U4a) --------
+
+from tests.fixtures import indicator_wiring as fx
+
+
+def test_submit_candidate_rejects_unpinned_with_fixed_text(tmp_path):
+    """F3': unpinned → ValueError('indicator_unresolved:rsi:unpinned')、
+    approval 行 0 / gate 行 0。"""
+    conn, plugins_root = _switch_env(tmp_path)     # tests.fixtures.wiring_envs (T6b)
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    fx.write_rsi_pullback(plugins_root / "_human", pins=None)
+    with pytest.raises(ValueError) as ei:
+        plugin_switch.submit_candidate(
+            conn, name="rsi_pullback", staging_dir=plugins_root / "_human",
+            candidate_origin="human", mission_id=None, backlog_id=None,
+            settings=SETTINGS, now=fx.NOW)
+    assert str(ei.value) == "indicator_unresolved:rsi:unpinned"
+    assert conn.execute("SELECT COUNT(*) FROM approval_requests "
+                        "WHERE json_extract(payload_json,'$.name')="
+                        "'rsi_pullback'").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == 0
+
+
+def test_submit_candidate_rejects_indicator_without_outputs(tmp_path):
+    """U4a: kind=indicator で outputs 無し → ValueError('outputs_required')、
+    approval 行 0。"""
+    conn, plugins_root = _switch_env(tmp_path)
+    d = plugins_root / "_human" / "legacy_ind"
+    d.mkdir(parents=True)
+    (d / "plugin.py").write_text(
+        "def compute(df, params):\n    return {'rsi_14': 1.0}\n")
+    (d / "config.yaml").write_text("kind: indicator\nparams:\n  period: 14\n")
+    (d / "test_plugin.py").write_text("def test_x():\n    pass\n")
+    with pytest.raises(ValueError) as ei:
+        plugin_switch.submit_candidate(
+            conn, name="legacy_ind", staging_dir=plugins_root / "_human",
+            candidate_origin="human", mission_id=None, backlog_id=None,
+            settings=SETTINGS, now=fx.NOW)
+    assert str(ei.value) == "outputs_required"
+    assert conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 0
+
+
+def test_bless_candidate_rejects_indicator_without_outputs(tmp_path):
+    conn, plugins_root = _switch_env(tmp_path)
+    d = plugins_root / "_human" / "legacy_ind"
+    d.mkdir(parents=True)
+    (d / "plugin.py").write_text(
+        "def compute(df, params):\n    return {'rsi_14': 1.0}\n")
+    (d / "config.yaml").write_text("kind: indicator\nparams:\n  period: 14\n")
+    (d / "test_plugin.py").write_text("def test_x():\n    pass\n")
+    with pytest.raises(ValueError, match="^outputs_required$"):
+        plugin_switch.bless_candidate(
+            conn, name="legacy_ind", human_dir=d, settings=SETTINGS,
+            now=fx.NOW, decided_by="human_cli")
+    assert conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 0
+
+
+def test_indicator_with_outputs_passes_the_gate(tmp_path):
+    """U4a の裏: outputs を宣言した indicator は従来どおり通る。"""
+    conn, plugins_root = _switch_env(tmp_path)
+    fx.write_indicator(plugins_root / "_human", "rsi")
+    approval_id = plugin_switch.submit_candidate(
+        conn, name="rsi", staging_dir=plugins_root / "_human",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS, now=fx.NOW)
+    assert approval_id > 0

@@ -30,7 +30,7 @@ def test_materialize_then_submit_from_human_cli_e2e(tmp_path, monkeypatch, capsy
     plugin_dir.mkdir()
     (plugin_dir / "plugin.py").write_text(
         "def compute(df, params):\n    return {'v': 1.0}\n")
-    (plugin_dir / "config.yaml").write_text("kind: indicator\n")
+    (plugin_dir / "config.yaml").write_text("kind: indicator\noutputs: [v]\n")
     (plugin_dir / "test_plugin.py").write_text("def test_x():\n    pass\n")
     (root / "config").mkdir()
     (root / "config" / "settings.yaml").write_bytes(
@@ -66,7 +66,7 @@ def test_bless_without_from_human_is_always_rejected(tmp_path, monkeypatch, caps
     plugin_dir.mkdir()
     (plugin_dir / "plugin.py").write_text(
         "def compute(df, params):\n    return {'v': 1.0}\n")
-    (plugin_dir / "config.yaml").write_text("kind: indicator\n")
+    (plugin_dir / "config.yaml").write_text("kind: indicator\noutputs: [v]\n")
     (plugin_dir / "test_plugin.py").write_text("def test_x():\n    pass\n")
     (root / "config").mkdir()
     (root / "config" / "settings.yaml").write_bytes(

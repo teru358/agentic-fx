@@ -62,7 +62,7 @@ def _write_plugin(base: Path, name: str, *, kind: str) -> Path:
     d.mkdir(parents=True)
     if kind == "indicator":
         (d / "plugin.py").write_text(INDICATOR_PY)
-        (d / "config.yaml").write_text("kind: indicator\n")
+        (d / "config.yaml").write_text("kind: indicator\noutputs: [v]\n")
     else:
         (d / "plugin.py").write_text(STRATEGY_PY)
         (d / "config.yaml").write_text(

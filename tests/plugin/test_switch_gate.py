@@ -24,7 +24,10 @@ TEST_PY_OK = "def test_x():\n    pass\n"
 def _write_candidate(dirpath: Path, *, max_bars: int | None) -> None:
     dirpath.mkdir(parents=True)
     (dirpath / "plugin.py").write_text(INDICATOR_PY)
-    config = "kind: indicator\n"
+    # [indicator-consumption-wiring] U4a: submit/bless の kind=indicator は
+    # outputs 宣言必須。このファイルの候補は outputs_required の受入対象
+    # ではない (max_bars ゲートの検証) ため宣言しておく。
+    config = "kind: indicator\noutputs: [v]\n"
     if max_bars is not None:
         config += f"max_bars: {max_bars}\n"
     (dirpath / "config.yaml").write_text(config)
