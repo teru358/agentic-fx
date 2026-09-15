@@ -1033,3 +1033,59 @@ def test_strategy_indicator_ref_is_frozen_and_ordered(tmp_path):
     assert meta.outputs is None
     with pytest.raises(Exception):
         meta.indicators[0].alias = "x"   # frozen dataclass
+
+
+@pytest.mark.parametrize("config_body,reason", [
+    ("params:\n  d: 2026-01-01\n", "params_not_json_safe:params.d"),
+    ("params:\n  s: !!set {a: null}\n", "params_not_json_safe:params.s"),
+    ("params:\n  f: .inf\n", "params_not_json_safe:params.f"),
+    ("params:\n  f: .nan\n", "params_not_json_safe:params.f"),
+    ("params:\n  b: !!binary aGk=\n", "params_not_json_safe:params.b"),
+    ("params:\n  nested:\n    - {deep: .inf}\n",
+     "params_not_json_safe:params.nested[0].deep"),
+])
+def test_params_json_safe_rejects(tmp_path, config_body, reason):
+    d = _write(tmp_path, "pj", plugin_py=_INDICATOR_PY,
+               config_yaml="kind: indicator\n" + config_body)
+    meta, got = loader.discover_one_with_reason(d, "pj")
+    assert meta is None
+    assert got == reason
+
+
+def test_params_json_safe_accepts_all_allowed_types(tmp_path):
+    body = ("params:\n  s: text\n  i: 3\n  b: true\n  f: 1.5\n  n: null\n"
+            "  l: [1, two, null]\n  m: {a: 1}\n")
+    d = _write(tmp_path, "pok", plugin_py=_INDICATOR_PY,
+               config_yaml="kind: indicator\n" + body)
+    meta, reason = loader.discover_one_with_reason(d, "pok")
+    assert reason is None
+    assert meta.params["l"] == [1, "two", None]
+
+
+def test_params_too_large_boundary(tmp_path):
+    from agentic_fx.plugin.loader import MAX_PARAMS_BYTES
+    import json as _json
+    # canonical JSON がちょうど MAX_PARAMS_BYTES になる値を作る
+    fixed = len(_json.dumps({"big": ""}, separators=(",", ":"),
+                            sort_keys=True, ensure_ascii=False))
+    ok_value = "x" * (MAX_PARAMS_BYTES - fixed)
+    d_ok = _write(tmp_path, "pbok", plugin_py=_INDICATOR_PY,
+                  config_yaml=f"kind: indicator\nparams:\n  big: '{ok_value}'\n")
+    meta, reason = loader.discover_one_with_reason(d_ok, "pbok")
+    assert reason is None
+    d_ng = _write(tmp_path, "pbng", plugin_py=_INDICATOR_PY,
+                  config_yaml=f"kind: indicator\nparams:\n  big: '{ok_value}x'\n")
+    meta, reason = loader.discover_one_with_reason(d_ng, "pbng")
+    assert meta is None
+    assert reason == "params_too_large:params"
+
+
+def test_indicator_ref_params_too_large(tmp_path):
+    from agentic_fx.plugin.loader import MAX_PARAMS_BYTES
+    value = "x" * MAX_PARAMS_BYTES
+    body = f"indicators:\n  rsi: {{plugin: rsi, params: {{big: '{value}'}}}}\n"
+    d = _write(tmp_path, "sbig", plugin_py=_STRATEGY_PY,
+               config_yaml=_STRATEGY_HEAD + body)
+    meta, reason = loader.discover_one_with_reason(d, "sbig")
+    assert meta is None
+    assert reason == "params_too_large:indicators.rsi.params"

@@ -17,7 +17,9 @@ from __future__ import annotations
 import ast
 import contextvars
 import hashlib
+import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -157,9 +159,44 @@ def _reject(name: str, reason: str) -> None:
         sink.append(reason)
 
 
-def _check_json_safe(value: object, path: str) -> str | None:
-    """[indicator-consumption-wiring] T1 Step 1-1 のスタブ。本実装は
-    Step 1-2 で入れる (opus r1 M5)。"""
+def _check_json_safe(value, path: str) -> str | None:
+    """`params` が JSON-safe かを再帰検査する (設計書 §2.2)。
+    reject reason 文字列 (`params_not_json_safe:<path>` /
+    `params_too_large:<path>`) を返す。問題なければ None。
+
+    許容: str / int (bool 含む) / 有限 float / None / list / dict (キーは str)。
+    YAML の date・datetime・set・bytes・±Inf・NaN は reject
+    (json.dumps は NaN/Inf を通してしまうため型検査で先に落とす)。
+    """
+    stack = [(value, path)]
+    while stack:
+        node, node_path = stack.pop()
+        if node is None or isinstance(node, (str, bool)):
+            continue
+        if isinstance(node, int):
+            continue
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                return f"params_not_json_safe:{node_path}"
+            continue
+        if isinstance(node, list):
+            for i, item in enumerate(node):
+                stack.append((item, f"{node_path}[{i}]"))
+            continue
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if not isinstance(key, str):
+                    return f"params_not_json_safe:{node_path}"
+                stack.append((item, f"{node_path}.{key}"))
+            continue
+        return f"params_not_json_safe:{node_path}"
+    try:
+        encoded = json.dumps(value, separators=(",", ":"), sort_keys=True,
+                             ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return f"params_not_json_safe:{path}"
+    if len(encoded.encode("utf-8")) > MAX_PARAMS_BYTES:
+        return f"params_too_large:{path}"
     return None
 
 
@@ -182,6 +219,10 @@ def _validate_config(raw: dict, name: str) -> dict | None:
     params = raw.get("params", {})
     if not isinstance(params, dict):
         _reject(name, "params must be a mapping")
+        return None
+    bad = _check_json_safe(params, "params")
+    if bad is not None:
+        _reject(name, bad)
         return None
 
     timeframe_required = kind in ("signal", "strategy")
