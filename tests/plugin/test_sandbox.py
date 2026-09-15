@@ -1066,3 +1066,56 @@ def test_handshake_includes_outputs_key_for_indicator_kind(tmp_path,
         pass
     assert sent, "handshake was never sent"
     assert "outputs" in sent[0]
+
+
+def test_cpu_sec_is_float_after_graceful_close(tmp_path, plugin_settings):
+    """C1: 正常終了で float。close 前は None。"""
+    meta = _meta(tmp_path, "ind_cpu", "indicator", INDICATOR_OK_PY)
+    session = PluginSession(meta, settings=plugin_settings)
+    session.__enter__()
+    assert session.cpu_sec is None
+    session.call({"df": _df(), "params": {}})
+    assert session.cpu_sec is None
+    session.close()
+    assert isinstance(session.cpu_sec, float)
+    assert session.cpu_sec >= 0.0
+
+
+def test_cpu_sec_is_none_when_enter_failed(tmp_path, plugin_settings):
+    """C1: __enter__ 失敗 (worker 未起動) は None のまま。"""
+    meta = _meta(tmp_path, "ind_bad_hash", "indicator", INDICATOR_OK_PY)
+    (meta.path / "plugin.py").write_text(INDICATOR_OK_PY + "\n# tamper\n")
+    session = PluginSession(meta, settings=plugin_settings)
+    with pytest.raises(SandboxError):
+        session.__enter__()
+    assert session.cpu_sec is None
+
+
+def test_cpu_sec_is_none_after_timeout_kill(tmp_path):
+    """C1: SIGKILL fallback (timeout でセッションが死んだ後) は None。"""
+    settings = load_settings(EXAMPLE).plugin.model_copy(
+        update={"sandbox_timeout_sec": 1.0})
+    meta = _meta(tmp_path, "ind_spin", "indicator",
+                 "def compute(df, params):\n"
+                 "    while True:\n        pass\n")
+    session = PluginSession(meta, settings=settings)
+    session.__enter__()
+    with pytest.raises(SandboxError, match="timed out"):
+        session.call({"df": _df(), "params": {}})
+    session.close()
+    assert session.cpu_sec is None
+
+
+def test_cpu_sec_is_float_after_plugin_error(tmp_path, plugin_settings):
+    """C1: plugin error 後は worker が生きているので graceful close が成立し
+    `cpu_sec` は **float**。plugin コード自身の例外はセッションを `_dead` に
+    しない既存契約 (`sandbox.py`) のため。`None` になるのは SIGKILL fallback
+    (timeout 後) と worker 未起動 (`__enter__` 失敗) の 2 経路だけ。"""
+    meta = _meta(tmp_path, "ind_err", "indicator",
+                 "def compute(df, params):\n    raise ValueError('x')\n")
+    session = PluginSession(meta, settings=plugin_settings)
+    session.__enter__()
+    with pytest.raises(SandboxError):
+        session.call({"df": _df(), "params": {}})
+    session.close()
+    assert isinstance(session.cpu_sec, float)

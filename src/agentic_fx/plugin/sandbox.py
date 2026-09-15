@@ -468,12 +468,35 @@ class PluginSession:
         return False
 
     def close(self) -> None:
+        """graceful close (設計書 §2.4): worker が生きていれば
+        `{"op": "close"}` を送り `{"ok": true, "cpu_sec": ...}` を
+        `sandbox_timeout_sec` 以内で待つ。応答が来れば `cpu_sec` が確定し、
+        来なければ従来どおり SIGKILL (`cpu_sec` は None のまま)。"""
         self._check_owner_thread()
         proc = self._proc
         if proc is None:
             return
         if proc.poll() is None:
-            self._kill()
+            if not self._dead:
+                try:
+                    self._write_line({"op": "close"})
+                    response = self._read_response(
+                        self._settings.sandbox_timeout_sec, _STARTUP_MAX_BYTES)
+                    if response.get("ok"):
+                        value = response.get("cpu_sec")
+                        if isinstance(value, (int, float)) and not isinstance(
+                                value, bool):
+                            self._cpu_sec = float(value)
+                    try:
+                        proc.wait(timeout=self._settings.sandbox_timeout_sec)
+                    except subprocess.TimeoutExpired:
+                        pass
+                except (SandboxError, OSError):
+                    # timeout/EOF/書き込み失敗 — fallback で kill する
+                    # (`_read_response` は失敗時に自分で _kill する)。
+                    self._cpu_sec = None
+            if proc.poll() is None:
+                self._kill()
         # 不変条件: この時点で proc は必ず終了済み (`_kill()` が
         # `wait()` まで済ませている)。`_kill()` が実効性を失う変異を
         # 注入すると `proc.stdout.close()` が **デッドロックする**
