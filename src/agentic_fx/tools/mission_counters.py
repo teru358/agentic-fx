@@ -151,6 +151,16 @@ class MissionToolCounters:
             self.backtest_calls[name] += 1
             return True
 
+    def release_backtest(self, name: str) -> None:
+        """[indicator-consumption-wiring] §2.9(c): 親が backtest を
+        **開始しなかった**とき (`{"started": false, ...}`) に予約を戻す。
+        `reserve_backtest` と同じ lock 区間で減算し、0 未満にはしない
+        (二重解放・未予約の解放を吸収する)。`successful_backtests` は
+        触らない — 「成功した backtest の回数」の意味を変えない。"""
+        with self._lock:
+            if self.backtest_calls[name] > 0:
+                self.backtest_calls[name] -= 1
+
     def record_backtest_result(self, name: str, ok: bool) -> None:
         if not ok:
             return

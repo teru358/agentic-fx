@@ -231,3 +231,26 @@ def test_error_messages_differing_only_past_60_chars_share_one_streak():
         c.record_tool_result("run_backtest", False, base + tail)
     assert c.abort_pending is True
     assert c.abort_trigger == "tool_errors:run_backtest"
+
+
+# --- [indicator-consumption-wiring] T5a Step 5-3: release_backtest (F4) ---
+
+def test_release_backtest_decrements_and_never_goes_negative():
+    c = MissionToolCounters(budget=_budget(max_backtests_per_candidate=2))
+    assert c.reserve_backtest("cand", 2) is True
+    assert c.backtest_calls["cand"] == 1
+    c.release_backtest("cand")
+    assert c.backtest_calls["cand"] == 0
+    c.release_backtest("cand")
+    assert c.backtest_calls["cand"] == 0      # 0 未満にしない
+    c.release_backtest("never_reserved")
+    assert c.backtest_calls["never_reserved"] == 0
+
+
+def test_release_backtest_does_not_touch_successful_backtests():
+    c = MissionToolCounters(budget=_budget(max_backtests_per_candidate=2))
+    c.reserve_backtest("cand", 2)
+    c.record_backtest_result("cand", ok=True)
+    before = c.successful_backtests["cand"]
+    c.release_backtest("cand")
+    assert c.successful_backtests["cand"] == before

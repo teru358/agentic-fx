@@ -506,3 +506,111 @@ def test_is_successful_backtest_rejects_malformed_replies(result):
     tool 経由では踏めない — 後続 (`result.get("trial_count", 1)`、
     `_strip_forbidden`) が dict を前提にしているため、関数を直接呼んで pin する。"""
     assert _is_successful_backtest(result) is False
+
+
+# --- [indicator-consumption-wiring] T5a Step 5-3: release_backtest (F4) ---
+
+from tests.fixtures.wiring_envs import (
+    rpc_tooldefs as _rpc_tooldefs,
+    rpc_tools as _rpc_tools,
+)
+from tests.tools.test_mission_counters import _budget
+
+
+def test_unresolved_backtest_releases_the_reservation(tmp_path):
+    """F4 (予約・解放の部分): `{"started": false, ...}` で予約を戻す。
+
+    **opus r1 I12 是正**: 旧案は `before_calls = dict(counters.backtest_calls)`
+    → `assert dict(counters.backtest_calls) == before_calls` と書いていたが、
+    `backtest_calls` は `defaultdict(int)` なので呼び出し前は `{}`、
+    `reserve_backtest("cand", …)` で `{"cand": 1}`、`release_backtest("cand")`
+    で `{"cand": 0}` になる。`{} != {"cand": 0}` なので **予約解放が正しく
+    動いていてもこの assert は落ちる**し、逆変異 (M8: `release_backtest` を
+    no-op) でも同じ理由で落ちる = 判別力ゼロだった。**キー単位の直接 assert**
+    にする (段 0 の M8 の観測点も同じものに差し替えること —
+    [[mutation-testing]] の「pin の観測点は probe で決める」)。
+
+    **`_strip_forbidden` は denylist** (`{k: … for k, v in value.items()
+    if k not in _FORBIDDEN_KEYS}`、着手時に
+    `rg -n 'def _strip_forbidden' -A 12 src/agentic_fx/tools/improve_rpc_tools.py`
+    で再確認する) なので、新規キー `started` / `alias` / `reason` /
+    `available` はそのまま通る (opus r1 I11)。`_FORBIDDEN_KEYS` には
+    `start` はあるが `started` は**別キー**で完全一致では当たらない。
+    **src 側の変更は不要** — 下の 4 キーの pin がそれを固定する。
+    """
+    counters = MissionToolCounters(budget=_budget())
+    handler_result = {"started": False, "error": "indicator_unresolved",
+                      "alias": "rsi", "reason": "not_found",
+                      "available": ["sma", "adx"]}
+    tools = _rpc_tools(tmp_path, counters=counters,
+                       run_backtest_handler=lambda args: handler_result)
+
+    out = tools["run_backtest"](name="cand", pair="USDJPY")
+
+    # `_strip_forbidden` (denylist) を通っても 4 キーが残る (opus r1 I11)
+    assert out["started"] is False
+    assert out["error"] == "indicator_unresolved"
+    assert out["alias"] == "rsi"
+    assert out["reason"] == "not_found"
+    assert out["available"] == ["sma", "adx"]
+    # 予約 → 解放で 0 に戻る (opus r1 I12: defaultdict 比較にしない)
+    assert counters.backtest_calls["cand"] == 0
+    assert counters.successful_backtests["cand"] == 0
+
+
+def test_unresolved_backtest_counts_errors_and_streak_via_the_registry(tmp_path):
+    """F4 (counters の残りのフィールド、**opus r1 I5 是正**)。
+
+    設計書 §5 は「未解決 `run_backtest` は予算枠を消費しないが `errors` /
+    refusal streak に計上」と書いているが、`errors` / `recoverable_refusal_streak`
+    を増やすのは **`ToolRegistry` の `_notify_result` → `counters.record_tool_result`**
+    だけ (`registry.py` の `if isinstance(result, dict) and "error" in result:`
+    分岐、配線は `mission_registry.py` の `on_result=counters.record_tool_result`。
+    着手時に `rg -n 'on_result' src/agentic_fx/tools/registry.py src/agentic_fx/tools/mission_registry.py`
+    で再取得)。tooldef を**直接呼ぶ** `_rpc_tools` 経路は registry を通らない
+    ので、上のテストだけでは受入が空振りする。**registry 経由で 1 本足す**。
+
+    前提 (1 行で固定): `started:false` 応答には `"error"` キーが含まれる
+    ので registry は `ok=False` と判定する。
+    """
+    from agentic_fx.tools.registry import ToolRegistry
+    counters = MissionToolCounters(budget=_budget())
+    defs = _rpc_tooldefs(tmp_path, counters=counters,
+                         run_backtest_handler=lambda args: {
+                             "started": False, "error": "indicator_unresolved",
+                             "alias": "rsi", "reason": "not_found",
+                             "available": ["sma", "adx"]})
+    registry = ToolRegistry(on_execute=counters.record_call,
+                            on_result=counters.record_tool_result)
+    registry.register_all(defs)
+    before_errors = counters.errors
+    before_total = counters.total_calls        # codex plan r1 I8
+
+    registry.execute("run_backtest", {"name": "cand", "pair": "USDJPY"},
+                     allowed=registry.names())
+
+    assert counters.errors == before_errors + 1
+    assert counters.total_calls == before_total + 1
+    assert counters.recoverable_refusal_streak[
+        ("run_backtest", "tool_error:indicator_unresolved")] == 1
+    assert counters.backtest_calls["cand"] == 0      # 予約は戻っている
+
+
+def test_response_without_started_key_keeps_the_reservation(tmp_path):
+    """F4: `started` キーが無い応答 (旧形式・RPC 失敗) では解放しない
+    (fail closed — 予算は消費されたまま)。"""
+    counters = MissionToolCounters(budget=_budget())
+    tools = _rpc_tools(tmp_path, counters=counters,
+                       run_backtest_handler=lambda args: {"error": "backtest_failed"})
+    tools["run_backtest"](name="cand", pair="USDJPY")
+    assert counters.backtest_calls["cand"] == 1
+
+
+def test_started_true_keeps_the_reservation(tmp_path):
+    counters = MissionToolCounters(budget=_budget())
+    tools = _rpc_tools(tmp_path, counters=counters,
+                       run_backtest_handler=lambda args: {
+                           "started": True, "metrics": {"trades": 5}})
+    tools["run_backtest"](name="cand", pair="USDJPY")
+    assert counters.backtest_calls["cand"] == 1
+    assert counters.successful_backtests["cand"] == 1

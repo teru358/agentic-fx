@@ -140,7 +140,16 @@ def build_improve_rpc_tooldefs(
                     "budget": "max_backtests_per_candidate",
                     "directive": BUDGET_EXHAUSTED_DIRECTIVE}
         result = run_backtest_handler({"name": name, "pair": pair})
-        if counters is not None:
+        # [indicator-consumption-wiring] §2.9(c): 予約 (子) → 親 RPC →
+        # **未開始なら解放**。`started` が明示的に False のときだけ戻す —
+        # キーが無い応答 (旧形式・RPC 失敗) では戻さない (fail closed:
+        # 予算は消費されたまま)。`error` キーがあるので registry の
+        # `on_result` が `errors` と recoverable refusal streak に自動計上し、
+        # 同じ未解決を繰り返す agent は既存規律で abort する。
+        # `max_tool_calls` は常に +1 (`record_call` は registry 側)。
+        if counters is not None and result.get("started") is False:
+            counters.release_backtest(name)
+        if counters is not None and result.get("started") is not False:
             backtest_ok = _is_successful_backtest(result)
             counters.record_backtest_result(name, ok=backtest_ok)
             if backtest_ok:
