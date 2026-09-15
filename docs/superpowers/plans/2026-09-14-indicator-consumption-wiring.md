@@ -1,4 +1,4 @@
-# [indicator-consumption-wiring] 実装プラン v1.3 (設計書 = `docs/superpowers/specs/2026-09-14-indicator-consumption-wiring-design.md` v1.4 準拠)
+# [indicator-consumption-wiring] 実装プラン v1.4 (設計書 = `docs/superpowers/specs/2026-09-14-indicator-consumption-wiring-design.md` v1.4 準拠)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (推奨) または superpowers:executing-plans で task ごとに実行すること。Step は
@@ -138,7 +138,7 @@ codex 設計レビュー 9 周 + opus 1 周の全件採用は設計書 §0/§8�
 | `src/agentic_fx/plugin/approval.py` | `GateOutcome.verdict_kind="indicator_unresolved"` + `indicator_alias` / `indicator_reason` / `resolved`、`run_kind_gate(..., inventory=)` |
 | `src/agentic_fx/plugin/switch.py` | `_plugin_locks`、`_run_full_gate` の inventory 構築 + `outputs_required` + 固定 ValueError、`submit_candidate` / `bless_candidate` / `approve_candidate` のロック集合と再解決、`reconcile_switch_journals` の pin 破れ revert、payload `indicator_deps` |
 | `src/agentic_fx/plugin/noop_gate.py` | `find_noop_copy(..., examples_dir, inventory)`、`same_modulo_pins` + `is_relock_transition` 例外 |
-| `src/agentic_fx/plugin/signal_producer.py` | `evaluate_due_plugins(..., resolved_by_hash)`、strategy は解決済みのみ評価 |
+| `src/agentic_fx/plugin/signal_producer.py` | `evaluate_due_plugins(..., resolved_by_identity)`、strategy は解決済みのみ評価 (codex plan r2 束2 Critical: キーは `(meta.name, meta.content_hash)`。session cache は現状どおり `content_hash` 単独のまま — 根拠は Step 3-2c 参照) |
 | `src/agentic_fx/service.py` | `approved_plugins(..., settings=)` の新契約、`InventoryBuildResult` を producer / registry へ |
 | `src/agentic_fx/mission_worker.py` | trade 子: `approved_plugins(conn, plugins_dir, settings=settings)` → `.inventory.metas`。improve 子: `inventory_view` を registry へ |
 | `src/agentic_fx/runners/worker_runner.py` | handshake に `inventory_view` |
@@ -1851,35 +1851,73 @@ def test_no_caller_uses_legacy_approved_plugins_signature():
 
 
 def test_every_approved_plugins_caller_consumes_the_inventory_result():
-    """[indicator-consumption-wiring] T1 (codex plan r1 I1): `settings=` は
-    付いたが戻り値を `list[PluginMeta]` のまま使っている呼び出しが残ると、
-    `len()` / index / iteration が `InventoryBuildResult` に対して静かに
-    誤動作する (dataclass なので `TypeError` になるとは限らない)。
+    """[indicator-consumption-wiring] T1 (codex plan r1 I1、r2 束1 Important
+    で強化): `settings=` は付いたが戻り値を `list[PluginMeta]` のまま使って
+    いる呼び出しが残ると、`len()` / index / iteration が `InventoryBuildResult`
+    に対して静かに誤動作する (dataclass なので `TypeError` になるとは限らない)。
     **呼び出し式の親が `.inventory` / `.phase1_metas` / `.resolved` /
-    `.rejected_strategies` のいずれかの属性参照であること**を AST で検査する
-    (中間変数に代入する形 = `Assign` の右辺のときは、この検査の対象外にし、
-    代わりに変数名を `*_result` / `*_inventory` にする規約で読み手に示す)。"""
+    `.rejected_strategies` のいずれかの属性参照であること**を AST で検査する。
+
+    **codex plan r2 束1 Important 是正**: v1.3 は「中間変数に代入する形
+    (`result = approved_plugins(...)`) はこの検査の対象外にし、変数名の
+    命名規約 (`*_result` / `*_inventory`) だけで読み手に示す」としていたが、
+    命名規約は**構造的に強制されない** — 現行の全 4 caller
+    (`service.py` の `inventory_result`、`mission_worker.py` の直接
+    チェーン、`improve_loop.py` の `inventory_result`、
+    `improve_context.py` の直接チェーン) のうち 2 本 (`service.py` /
+    `improve_loop.py`) はまさにこの中間変数形なので、旧案では
+    `inventory_result.inventory` 等の属性参照が**一度も検査されていなかった**
+    (「全結果が `InventoryBuildResult` を受けている」を実際には pin できて
+    いない)。**`x = approved_plugins(...)` の代入先変数 `x` を追跡し、
+    `x.<attr>` という後続の属性参照も同じ許可属性集合に限定する** (2 パス:
+    1 パス目で追跡対象の変数名を集め、2 パス目で直後属性参照と追跡変数属性
+    参照の両方を検査する)。"""
     import ast
     from pathlib import Path
     _OK = {"inventory", "phase1_metas", "resolved", "rejected_strategies"}
     repo = Path(__file__).resolve().parents[2]
     offenders = []
+
+    def _is_approved_plugins_call(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        f = node.func
+        name = (f.attr if isinstance(f, ast.Attribute)
+                else f.id if isinstance(f, ast.Name) else None)
+        return name == "approved_plugins"
+
     for root in (repo / "src" / "agentic_fx", repo / "tests"):
         for path in sorted(root.rglob("*.py")):
             if path == repo / "src" / "agentic_fx" / "tools" / "plugin_loader.py":
                 continue
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+            # 1 パス目: `x = approved_plugins(...)` の x を集める (直接代入
+            # のみ — tuple unpack / augassign は現行 4 caller に無い)。
+            tracked_names: set[str] = set()
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Assign)
+                        and _is_approved_plugins_call(node.value)
+                        and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)):
+                    tracked_names.add(node.targets[0].id)
+
+            # 2 パス目: 直後の属性参照 (`approved_plugins(...).X`) と、
+            # 追跡変数経由の属性参照 (`x.X`) の両方を検査する。
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Attribute):
                     continue
-                if not isinstance(node.value, ast.Call):
+                if _is_approved_plugins_call(node.value):
+                    if node.attr not in _OK:
+                        offenders.append(
+                            f"{path.relative_to(repo)}:{node.lineno}:.{node.attr}")
                     continue
-                f = node.value.func
-                called = (f.attr if isinstance(f, ast.Attribute)
-                          else f.id if isinstance(f, ast.Name) else None)
-                if called == "approved_plugins" and node.attr not in _OK:
+                if (isinstance(node.value, ast.Name)
+                        and node.value.id in tracked_names
+                        and node.attr not in _OK):
                     offenders.append(
-                        f"{path.relative_to(repo)}:{node.lineno}:.{node.attr}")
+                        f"{path.relative_to(repo)}:{node.lineno}:.{node.attr} "
+                        f"(via {node.value.id})")
     assert offenders == [], (
         "approved_plugins(...) の戻り値から未知の属性を読んでいる箇所: "
         f"{offenders}")
@@ -2820,6 +2858,26 @@ def test_strategy_session_without_resolved_is_rejected(tmp_path, plugin_settings
     with pytest.raises(SandboxError, match="resolved"):
         PluginSession(meta, settings=plugin_settings).__enter__()
     assert calls == []
+
+
+def test_indicator_session_with_resolved_is_rejected(tmp_path, plugin_settings,
+                                                      monkeypatch):
+    """codex plan r2 束1 Minor: 契約は片方向だけでは不十分 — strategy は
+    `resolved` 必須 (上のテスト) だが、indicator/signal は `resolved` を
+    **受け取ってはいけない**。誤って渡すと依存情報が indicator/signal の
+    handshake に混入し得るので `SandboxError` で拒否する。"""
+    root = tmp_path / "plugins"
+    ind_dep = _dir(root, "dep", _INDICATOR_PY, {"kind": "indicator", "outputs": ["v"]})
+    ind = _dir(root, "ind", _INDICATOR_PY, {"kind": "indicator", "outputs": ["v"]})
+    meta = PluginMeta(name="ind", kind="indicator", path=ind, params={},
+                      timeframe=None, pairs=(), max_bars=200,
+                      content_hash=content_hash(ind), outputs=("v",))
+    resolved = _rset(root, ind_dep)   # indicator に誤って resolved を渡す
+    calls = _no_spawn(monkeypatch)
+    with pytest.raises(SandboxError, match="resolved"):
+        PluginSession(meta, settings=plugin_settings,
+                      resolved=resolved).__enter__()
+    assert calls == []
 ```
 
 - [ ] **Step 2-2e: Run test to verify it fails**
@@ -2881,6 +2939,18 @@ _KIND_PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
                 raise SandboxError(
                     f"plugin {self._meta.name!r}: strategy session requires "
                     "a resolved indicator set (resolved=...)")
+            # codex plan r2 束1 Minor: 契約は片方向だけでは不十分 —
+            # strategy は `resolved` 必須 (上記) だが、indicator/signal は
+            # `resolved` を**受け取ってはいけない** (`None` 固定)。ここを
+            # 検査しないと、indicator/signal に誤って `ResolvedIndicatorSet`
+            # を渡す呼び出しが静かに通り、依存情報 (indicator の実体パス等)
+            # が handshake に混入し得る (kind 別の契約が片方向にしか pin
+            # されていなかった)。
+            if self._meta.kind != "strategy" and self._resolved is not None:
+                raise SandboxError(
+                    f"plugin {self._meta.name!r}: kind={self._meta.kind!r} "
+                    "session must not receive a resolved indicator set "
+                    "(resolved= is strategy-only)")
             indicator_specs: list[dict] = []
             if self._resolved is not None:
                 inventory_root = Path(self._resolved.inventory_root).resolve()
@@ -3305,6 +3375,33 @@ def test_scalar_only_indicator_still_works_standalone(tmp_path, plugin_settings=
         index=pd.date_range("2026-01-01", periods=1, freq="1h", tz="UTC"))
     out = run_plugin(meta, {"df": df, "params": meta.params}, settings=settings)
     assert out == {"rsi_14": 55.0}
+
+
+```
+
+**この 1 本だけ `tests/plugin/test_sandbox.py` (T2 Files、既存 `_validate_indicator_result`
+のテストが既にある場所) に追記する** — `_validate_indicator_result` は
+`sandbox.py` のモジュール関数であり `plugin_loader` 側ではないため:
+
+```python
+def test_standalone_indicator_response_rejects_extra_or_missing_outputs_keys():
+    """codex plan r2 束1 Important: worker を迂回した/破損した応答 (wire を
+    直接偽装した呼び出し) が `meta.outputs` と食い違うキー集合を返したとき、
+    **親側の `_validate_indicator_result` が拒否する**こと (worker 側の検査
+    だけに頼らない — 親子の信頼境界を跨いだ値の再検証、S1)。"""
+    from agentic_fx.plugin.sandbox import SandboxError, _validate_indicator_result
+
+    outputs = ("a", "b")
+    # 欠落: outputs=("a","b") のうち "b" が無い
+    with pytest.raises(SandboxError, match="outputs"):
+        _validate_indicator_result({"a": 1.0}, outputs=outputs)
+    # 余分: 宣言に無い "c" が混ざる
+    with pytest.raises(SandboxError, match="outputs"):
+        _validate_indicator_result({"a": 1.0, "b": 2.0, "c": 3.0},
+                                   outputs=outputs)
+    # outputs=None (standalone 宣言なし、S1) は任意のキー集合を許す
+    assert _validate_indicator_result({"whatever": 1.0}, outputs=None) == \
+        {"whatever": 1.0}
 ```
 
 - [ ] **Step 2-6b: Run test to verify it fails**
@@ -3314,13 +3411,23 @@ Expected: FAIL — 現行 `get_indicators` は `plugin_result` をそのまま�
 `{"a": 1.5, "b": [1.0, 2.0, 3.0], "c": None, "d": [1.0, None]}` が返る
 (期待は `{"a": 1.5, "b": 3.0}`)
 
+Run: `uv run pytest tests/plugin/test_sandbox.py -k "extra_or_missing_outputs" -q`
+Expected: FAIL — `TypeError: _validate_indicator_result() got an unexpected
+keyword argument 'outputs'` (現行シグネチャは `result` 単独)
+
 - [ ] **Step 2-6c: Write minimal implementation**
 
 `src/agentic_fx/plugin/sandbox.py:648-661` の `_validate_indicator_result` を
-**wire 境界の再検証**へ置換:
+**wire 境界の再検証**へ置換 (**codex plan r2 束1 Important 是正**:
+形だけでなく `meta.outputs` 宣言との一致も**共通 validator
+(`core.plugin_contract.validate_indicator_result`) で再検査**する — 旧案は
+wire の型・有限性しか見ておらず、worker を迂回した/破損した応答が余分な
+key・欠落 key を持ち込んでも親が黙って受理してしまい、File Structure が
+謳う「worker と sandbox が唯一の実装を import する」とも矛盾していた):
 
 ```python
-def _validate_indicator_result(result: Any) -> dict[str, Any]:
+def _validate_indicator_result(result: Any, *,
+                               outputs: "tuple[str, ...] | None") -> dict[str, Any]:
     """standalone (`run_plugin` / `PluginSession.call(kind="indicator")`) の
     応答を親側で**再検証**する ([indicator-consumption-wiring] §2.5)。
 
@@ -3328,7 +3435,17 @@ def _validate_indicator_result(result: Any) -> dict[str, Any]:
     値を wire 形式 (`{key: float | {"series": [float|null, ...]}}`) で返して
     いるが、信頼境界を跨いだ値なのでここで形だけもう一度見る。
     NaN は wire 上で `null` になっている。戻り値は
-    `{key: float | list[float | None]}`。"""
+    `{key: float | list[float | None]}`。
+
+    **codex plan r2 束1 Important**: wire 形式を Python 値
+    (`float | list[float|None]`) へ復元した**後**、
+    `core.plugin_contract.validate_indicator_result(out, df_index=None,
+    outputs=outputs)` を必ず通す。`df_index=None` なので系列長は検査しない
+    (wire 変換の時点で `list` になっており、系列長は worker 側で既に
+    `df` に対して検査済み — ここで二重にやり直せるのは `outputs` 宣言との
+    キー集合一致のみ、これが親側で唯一欠けていた検査)。`outputs=None`
+    (standalone 宣言なし indicator、S1) は任意のキー集合を許す (従来どおり)。
+    """
     if not isinstance(result, dict):
         raise SandboxError(
             f"indicator must return a dict, got {type(result).__name__}")
@@ -3364,7 +3481,22 @@ def _validate_indicator_result(result: Any) -> dict[str, Any]:
             raise SandboxError(
                 f"indicator result[{key!r}] must be finite, got {value!r}")
         out[key] = fvalue
+
+    from agentic_fx.core.plugin_contract import (
+        IndicatorResultError, validate_indicator_result as _validate_common)
+    try:
+        _validate_common(out, df_index=None, outputs=outputs)
+    except IndicatorResultError as exc:
+        raise SandboxError(str(exc)) from exc
     return out
+```
+
+`PluginSession.call()` (`sandbox.py:470-472`、既存コード) の indicator 分岐を
+`outputs` を渡す形に変える:
+
+```python
+        if kind == "indicator":
+            return _validate_indicator_result(result, outputs=self._meta.outputs)
 ```
 
 `src/agentic_fx/tools/market_tools.py` の `get_indicators` の合成部分を置換:
@@ -3409,20 +3541,26 @@ Expected: PASS
 
 ```bash
 git add src/agentic_fx/plugin/sandbox.py src/agentic_fx/tools/market_tools.py \
-        tests/tools/test_plugin_loader.py
+        tests/tools/test_plugin_loader.py tests/plugin/test_sandbox.py
 git commit -m "feat(market_tools): project standalone indicator series to last value (S1)"
 ```
 
 **T2 完了条件**:
 - [ ] **V1**: validator の index 不一致 / 長さ不一致 / bool / ±Inf / outputs 集合不一致が
       `SandboxError` として**親に届く**。NaN は通る。全 kind の main plugin params が
-      wire (dict) を通る
+      wire (dict) を通る。**standalone 応答の再検証 (親側)** も
+      `outputs` 集合不一致 (余分 key / 欠落 key) を `SandboxError` で拒否する
+      (`test_standalone_indicator_response_rejects_extra_or_missing_outputs_keys`。
+      codex plan r2 束1 Important — worker 側の検査だけに頼らない)
 - [ ] **V2**: mutation 回帰 (df / nested params / 次回 call) + `check_source` の 7 deny 名 +
       7 属性 Store ケース + worker の `pd.get_option("mode.chained_assignment")` /
       `np.geterr()` 不変 assert
 - [ ] **V3**: 解決後の indicator ファイル書き換え → `__enter__` が `SandboxError`。
       `inventory_root` 外の実体パス (live / snapshot / human の 3 root) も `SandboxError`。
-      いずれも worker spawn 0 回
+      いずれも worker spawn 0 回。**kind 契約は双方向**: strategy は `resolved` 必須
+      (`test_strategy_session_without_resolved_is_rejected`)、indicator/signal は
+      `resolved` を受け取ると `SandboxError`
+      (`test_indicator_session_with_resolved_is_rejected`。codex plan r2 束1 Minor)
 - [ ] **S1**: スカラー返却・`outputs` 宣言なしの既存 indicator が無変更で
       **standalone (`get_indicators`) 経由で**動く (設計書 v1.4 §6 S1 — 依存先には
       できない。依存に書くと resolver が `outputs_undeclared`、それは U4b の観測点)。
@@ -3437,6 +3575,13 @@ git commit -m "feat(market_tools): project standalone indicator series to last v
       `test_check_source_rejects_attribute_store[pd.options...= None]` が落ちる
       (d) `close()` の `{"op": "close"}` 送信を削って即 `_kill()` にする →
       `test_cpu_sec_is_float_after_graceful_close` が落ちる
+      (e) `_validate_indicator_result` 末尾の `_validate_common(out, df_index=None,
+      outputs=outputs)` 呼び出しを削る →
+      `test_standalone_indicator_response_rejects_extra_or_missing_outputs_keys`
+      が落ちる (codex plan r2 束1 Important)
+      (f) `__enter__` の `self._meta.kind != "strategy" and self._resolved is not None`
+      判定を削る → `test_indicator_session_with_resolved_is_rejected` が落ちる
+      (codex plan r2 束1 Minor)
 
 ---
 
@@ -5403,7 +5548,17 @@ def _validate_strategy(conn, meta, *, settings, now, run_in_sample_fn,
 # src/agentic_fx/plugin/signal_producer.py
 def evaluate_due_plugins(self, conn, *, plugins, now, source, sandbox_run=None,
                          settings,
-                         resolved_by_hash: "dict[str, ResolvedIndicatorSet]",
+                         resolved_by_identity: (
+                             "dict[tuple[str, str], ResolvedIndicatorSet]"),
+                         # ^ キーは `(meta.name, meta.content_hash)`
+                         # (codex plan r2 束2 Critical — 旧案 `resolved_by_hash:
+                         # dict[str, ...]` は content_hash 単独キーだったため、
+                         # 同一 content_hash・別名の 2 strategy が存在すると
+                         # `InventoryBuildResult.resolved` (キーは `(name, hash)`)
+                         # から dict comprehension で潰す際にどちらか一方が
+                         # 消え、P3' の「同一オブジェクト」不変条件と Global
+                         # Constraints の既存 identity `(name, content_hash)`
+                         # の両方に反していた)
                          ) -> int: ...
 
 # src/agentic_fx/backtest/cli.py
@@ -5898,7 +6053,8 @@ def test_producer_requires_resolved_for_strategy_and_reuses_the_same_object(
     producer = SignalProducer()
     producer.evaluate_due_plugins(
         conn, plugins=[strategy_meta], now=NOW, source="mt5", settings=SETTINGS,
-        resolved_by_hash={strategy_meta.content_hash: sentinel})
+        resolved_by_identity={(strategy_meta.name, strategy_meta.content_hash):
+                              sentinel})
     assert seen[strategy_meta.content_hash] is sentinel
 
 
@@ -5908,16 +6064,59 @@ def test_producer_skips_strategy_without_resolution(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         inserted = producer.evaluate_due_plugins(
             conn, plugins=[strategy_meta], now=NOW, source="mt5",
-            settings=SETTINGS, resolved_by_hash={})
+            settings=SETTINGS, resolved_by_identity={})
     assert inserted == 0
     assert "unresolved" in caplog.text
+
+
+def test_producer_uses_name_and_hash_identity_not_hash_alone(tmp_path, monkeypatch):
+    """P3' 回帰 (codex plan r2 束2 Critical): 同一 `content_hash`・別名の 2
+    strategy が同時に inventory に存在するとき、producer は
+    `InventoryBuildResult.resolved` の `(name, content_hash)` キーを保ったまま
+    それぞれの `ResolvedIndicatorSet` を渡すこと — `content_hash` だけを
+    キーにした辞書へ潰すと、どちらか一方の strategy が他方の
+    `ResolvedIndicatorSet` を受け取ってしまう (2 つの `PluginSession` は
+    `content_hash` が同一なので session cache 上は 1 個に共有されるが、渡す
+    `resolved` はそれぞれの `(name, hash)` エントリでなければならない)。"""
+    import dataclasses
+    from agentic_fx.plugin.resolve import ResolvedIndicatorSet
+    shared_hash = "b" * 64
+    # `PluginMeta` は `@dataclass(frozen=True, slots=True)` (`__dict__` を
+    # 持たない) — `dataclasses.replace` で複製する。
+    meta_a = dataclasses.replace(
+        strategy_meta, name="strat_a", content_hash=shared_hash)
+    meta_b = dataclasses.replace(
+        strategy_meta, name="strat_b", content_hash=shared_hash)
+    seen = {}
+
+    class _Spy:
+        def __init__(self, meta, *, settings, resolved=None):
+            seen[meta.name] = resolved
+        def __enter__(self):
+            return self
+        def call(self, payload):
+            return {"action": "hold"}
+        def close(self):
+            return None
+
+    monkeypatch.setattr(plugin_sandbox, "PluginSession", _Spy)
+    sentinel_a = ResolvedIndicatorSet.empty(tmp_path / "a")
+    sentinel_b = ResolvedIndicatorSet.empty(tmp_path / "b")
+    producer = SignalProducer()
+    producer.evaluate_due_plugins(
+        conn, plugins=[meta_a, meta_b], now=NOW, source="mt5", settings=SETTINGS,
+        resolved_by_identity={
+            ("strat_a", shared_hash): sentinel_a,
+            ("strat_b", shared_hash): sentinel_b})
+    assert seen["strat_a"] is sentinel_a
+    assert seen["strat_b"] is sentinel_b
 ```
 
 - [ ] **Step 3-2b: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_service_app.py tests/plugin/test_signal_producer.py -q`
 Expected: FAIL — `AttributeError: 'App' object has no attribute 'inventory_result'` /
-`TypeError: evaluate_due_plugins() got an unexpected keyword argument 'resolved_by_hash'`
+`TypeError: evaluate_due_plugins() got an unexpected keyword argument 'resolved_by_identity'`
 
 - [ ] **Step 3-2c: Write minimal implementation**
 
@@ -5940,10 +6139,11 @@ scheduler tick の producer 呼び出し (`service.py:617` 付近) を:
             signal_producer.evaluate_due_plugins(
                 conn_core, plugins=approved, now=now,
                 source=settings.plugin.producer_source, settings=settings,
-                resolved_by_hash={
-                    content_hash: rset
-                    for (_name, content_hash), rset
-                    in inventory_result.resolved.items()})
+                # codex plan r2 束2 Critical: キーは `InventoryBuildResult.resolved`
+                # と同じ `(name, content_hash)` のまま渡す — `content_hash` だけへ
+                # 潰すと、同一 content_hash・別名の 2 strategy が存在するとき
+                # どちらか一方の `ResolvedIndicatorSet` が失われる。
+                resolved_by_identity=dict(inventory_result.resolved))
 ```
 
 `src/agentic_fx/plugin/signal_producer.py`:
@@ -5953,17 +6153,45 @@ scheduler tick の producer 呼び出し (`service.py:617` 付近) を:
                              plugins: list[PluginMeta], now: datetime,
                              source: str, sandbox_run: SandboxRunFn | None = None,
                              settings: "Settings",
-                             resolved_by_hash: "dict[str, ResolvedIndicatorSet]",
+                             resolved_by_identity: (
+                                 "dict[tuple[str, str], ResolvedIndicatorSet]"),
                              ) -> int:
         """承認済み signal/strategy plugin のうち評価期限が来たバケットを
         評価し、新規挿入した signals 行の総数を返す。
 
-        [indicator-consumption-wiring] §2.3: `resolved_by_hash` は
-        `InventoryBuildResult.resolved` を `content_hash` で引けるようにした
-        もの。**strategy は解決済みのものしか評価しない** — 未解決の
-        strategy は warning + skip (fail closed。producer には再解決の
-        責務を持たせない)。session cache のキーも `content_hash`
-        (pin 込みなので実行物と 1:1)。
+        [indicator-consumption-wiring] §2.3 (codex plan r2 束2 Critical 是正):
+        `resolved_by_identity` は `InventoryBuildResult.resolved` をそのまま
+        (キー `(name, content_hash)`) 渡したもの。**strategy は解決済みの
+        ものしか評価しない** — 未解決の strategy は warning + skip
+        (fail closed。producer には再解決の責務を持たせない)。
+
+        `resolved` の取得キーは `(meta.name, meta.content_hash)` (Global
+        Constraints の既存 identity と同じ) — `content_hash` だけでは、
+        同一 content_hash (= `plugin.py` + `config.yaml` が完全に同一バイト
+        列) を持つ別名 strategy が存在したとき、どちらの `ResolvedIndicatorSet`
+        を渡すべきか一意に決まらない。
+
+        **session cache のキーは `content_hash` 単独のまま変えない**
+        (codex plan r2 束2 Critical への回答、根拠 3 点):
+        (1) `content_hash` は `plugin.py + config.yaml` のバイト列そのものの
+        hash であり、`config.yaml` には依存宣言 (`indicators:` ブロックと
+        `pin`) も含まれる — content_hash が一致する 2 つの strategy は
+        **依存宣言も含めてバイト単位で同一**なので、同じ inventory 構築
+        (= 同じ improve/service 起動) の中で解決された `ResolvedIndicatorSet`
+        は値として等価になる。subprocess はコード実体に対して起動するもの
+        であり、名前が違うだけの同一コードに対して 2 subprocess を持つのは
+        無駄な二重起動になる。
+        (2) `resolved` の**受け渡し**は `(name, hash)` 単位に保つ (上記) ため、
+        「渡す値の identity 保証」と「subprocess 再利用の単位」を分離できる
+        — session cache だけ `content_hash` のままでも、各 `PluginSession`
+        の生成時に渡る `resolved` は必ずその meta 自身の `(name, hash)`
+        エントリになる (下記 `_call` 参照: session 未生成時のみ `resolved=`
+        を渡すため、2 度目以降の同一 content_hash session 再利用では
+        `resolved` は再送しないが、対象コードが同一である以上、初回に渡した
+        `resolved` で十分)。
+        (3) `(name, hash)` を session cache キーに含めると、同一コードの
+        strategy を改名しただけで無駄に subprocess が増える退行を生む
+        (改善ループが探索中に同じコードを複数名で試す運用は想定内)。
         """
         inserted = 0
         sessions: dict[str, plugin_sandbox.PluginSession] = {}
@@ -5975,7 +6203,8 @@ scheduler tick の producer 呼び出し (`service.py:617` 付近) を:
             if session is None:
                 session = plugin_sandbox.PluginSession(
                     meta, settings=settings.plugin,
-                    resolved=resolved_by_hash.get(meta.content_hash))
+                    resolved=resolved_by_identity.get(
+                        (meta.name, meta.content_hash)))
                 session.__enter__()
                 sessions[meta.content_hash] = session
             return session.call(payload)
@@ -5985,7 +6214,8 @@ scheduler tick の producer 呼び出し (`service.py:617` 付近) を:
                 if meta.kind not in ("signal", "strategy"):
                     continue
                 if (meta.kind == "strategy"
-                        and meta.content_hash not in resolved_by_hash):
+                        and (meta.name, meta.content_hash)
+                        not in resolved_by_identity):
                     _log.warning(
                         "plugin %s: indicator dependencies are unresolved — "
                         "skipping (fail closed)", meta.name)
@@ -6581,7 +6811,10 @@ git commit -m "feat(cli): afx plugin lock --from _human writes dependency pins (
       warning 1 行 (reason 込み) になり、producer の plugin 一覧に含まれない
       (session cache 未登録はこの帰結であり別途観測しない、2026-09-14 裁定)。
       producer は `InventoryBuildResult.resolved` の**同一オブジェクト**を
-      session へ渡す
+      `(name, content_hash)` の identity を保ったまま session へ渡す
+      (`test_producer_uses_name_and_hash_identity_not_hash_alone` — 同一
+      content_hash・別名の 2 strategy が互いの `ResolvedIndicatorSet` を
+      取り違えない。codex plan r2 束2 Critical)
 - [ ] **A1'**: 配備済 (pinned) `rsi_pullback` の `afx backtest run --plugin` が rc=0 /
       `scope='human_custom'` 行 1 本。承認行を消しても rc=0 (手元評価契約の維持)
 - [ ] **A1''**: 未解決 3 種 (`not_found` / `not_indicator` / `over_max_bars_limit`) で
@@ -6596,8 +6829,11 @@ git commit -m "feat(cli): afx plugin lock --from _human writes dependency pins (
       (b) CLI の解決を `_empty_history_guard` の**後**へ移す →
       `test_cli_backtest_run_plugin_unresolved` の「行数不変」は通るが、
       解決を `save_human_run` の後へ移すと落ちる (順序 pin)
-      (c) producer の `meta.content_hash not in resolved_by_hash` 判定を削る →
-      `test_producer_skips_strategy_without_resolution` が落ちる
+      (c) producer の `(meta.name, meta.content_hash) not in resolved_by_identity`
+      判定を削る → `test_producer_skips_strategy_without_resolution` が落ちる
+      (d) `_call` の `resolved_by_identity.get((meta.name, meta.content_hash))` を
+      `resolved_by_identity.get(meta.content_hash)` (name を落とす) に戻す →
+      `test_producer_uses_name_and_hash_identity_not_hash_alone` が落ちる
 
 ---
 
@@ -7459,7 +7695,22 @@ Consumes するだけ**で、gate の内部には触らない。
 - Modify: `src/agentic_fx/commands.py` (`_approval_detail` + `_dependent_strategies`)
 - Modify: `src/agentic_fx/loops/improve_loop.py` (質検査の再ロック除外 +
   `_build_approval_payload(resolved=None)` の受け口と `indicator_deps` 生成 —
-  実配線は T5b。codex plan r1 I5)
+  実配線は T5b。codex plan r1 I5) + `_finalize_success` の P5 呼び出し
+  (下記 `_check_duplicate_metrics_for_approval` 参照、codex plan r2 束3 Critical)
+- Modify: `src/agentic_fx/loops/improve_run_context.py` (**`inventory` /
+  `inventory_view` の 2 フィールドを互換既定値付きで追加 — codex plan r1 C4 の形を
+  T5a から本 task へ前倒し。codex plan r2 束3 Critical**: T5a Step 5-1 (P5 の
+  `_check_duplicate_metrics_for_approval(inventory=ctx.inventory, ...)` の
+  直前) は元々この 2 フィールドの追加を Produce する task だったが、依存順で
+  T4b → T5a なので T4b の時点では `ImproveRunContext` に `inventory` 属性が
+  まだ無く `AttributeError` になっていた。**追加そのもの (dataclass の 2
+  フィールド、default 値のみ) だけを本 task へ前倒しする** — 「実
+  `prepare()` が非空の `InventoryBuildResult` を作ってここへ渡す」配線
+  (`_materialize_workspace` / `build_inventory_view` / `synthetic_ctx` の更新)
+  は**前倒ししない**、引き続き T5a Step 5-1 が Consumes して行う。本 task の
+  時点では `ctx.inventory` は常に既定値 `None` のまま (`prepare()` がまだ
+  書き込まないため) — P5 の呼び出し側がこれを `self._inventory_for_gate(conn)`
+  へフォールバックする (下記))
 - Test: `tests/plugin/test_switch_paths.py`、`tests/plugin/test_reconcile.py`、
   `tests/plugin/test_approval_payload_common_contract.py` (P3 三経路、
   codex plan r1 I5)、`tests/loops/test_improve_loop_plugin_gate.py`、
@@ -7509,6 +7760,36 @@ def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
 class Commands:
     def _dependent_strategies(self, *, indicator_name: str,
                               candidate_hash: str) -> tuple[list[str], list[str]]: ...
+
+# src/agentic_fx/loops/improve_run_context.py (codex plan r2 束3 Critical —
+# T5a Step 5-1 の C4 フィールド追加を前倒し。既存 8 フィールドは無変更)
+@dataclass(frozen=True)
+class ImproveRunContext:
+    mission_id: int
+    run_id: int
+    staging_dir: Path
+    source_snapshot_dir: Path
+    allowed_backlog_ids: frozenset[int] | None
+    slot_key: tuple[str, int] | None
+    ledger: ImproveRpcLedger
+    rpc_handlers: dict[str, Callable[[dict], dict]]
+    inventory: "InventoryBuildResult | None" = None     # 本 task では常に None
+    inventory_view: dict = field(default_factory=dict)  # (実配線は T5a)
+
+# src/agentic_fx/loops/improve_loop.py
+def _check_duplicate_metrics_for_approval(
+        self, conn, approval_payload: dict, *,
+        inventory: "InventoryBuildResult", staging_dir: Path,
+        ) -> "_DuplicateDemotion | None": ...
+def _deployed_dir_for(self, name: str, *, inventory) -> "Path | None": ...
+def _candidate_dir_for(self, approval_payload, *, staging_dir) -> "Path | None": ...
+def _inventory_for_gate(self, conn) -> "InventoryBuildResult": ...
+    # 本 task 内 (Step 4-6c) で定義する暫定 helper (`approved_plugins` を
+    # 都度呼ぶ)。`_run_plugin_gate` / `commit()` の暫定解決 (既存記述) と
+    # **P5 (`_check_duplicate_metrics_for_approval` 呼び出し) の両方**が
+    # `ctx.inventory is None` のときのフォールバック先として共有する
+    # (Step 4-6c 参照)。T5a Step 5-1 で `ctx.inventory` が実配線された後に
+    # 削除する。
 ```
 
 ### Step 4-4: ロック集合 + `approve_candidate` の決定時解決 + bless の TOCTOU
@@ -8321,6 +8602,44 @@ def test_relock_detection_uses_the_real_dir_helpers(tmp_path):
     # 配線 (差し替えなしで再ロック除外が効く)
     assert loop._check_duplicate_metrics_for_approval(
         conn, payload, inventory=inventory, staging_dir=staging) is None
+
+
+def test_finalize_success_falls_back_to_inventory_for_gate_when_ctx_inventory_is_none(
+        tmp_path):
+    """codex plan r2 束3 Critical: `ImproveRunContext.inventory` は本 task の
+    時点では常に既定値 `None` (実配線は T5a Step 5-1) — `_finalize_success`
+    が `ctx.inventory` をそのまま渡すと strategy kind の承認で
+    `_deployed_dir_for(name, inventory=None)` が `None.phase1_metas` の
+    `AttributeError` を出す。`self._inventory_for_gate(conn)` へフォールバック
+    すれば `ctx.inventory is None` のままでも P5 (質検査) が完走すること
+    を見る。**`synthetic_ctx` (T6b) は本 task の時点では `inventory=` を
+    渡していない**ので既定 `None` のままである (前提を assert で確認)。
+
+    deployed / candidate を同一 pin で配置 (= 再ロック遷移では**ない**) し、
+    `_seed_approved_candidate_metrics` で既承認候補と同じ成績にすることで
+    `_check_duplicate_metrics_for_approval` が `_DuplicateDemotion` を返し、
+    `_finalize_success` は `BEGIN IMMEDIATE` 直後の rollback + early return で
+    終わる (`_persist_ledger_in_tx` 以降の mission/run 行を用意しなくてよい)。
+    """
+    from tests.fixtures import indicator_wiring as fx
+    from tests.fixtures.wiring_envs import synthetic_ctx
+    loop, conn, plugins_root = _loop_env(tmp_path)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    fx.write_rsi_pullback(plugins_root, pins={"rsi": hashes["rsi"]})
+    fx.write_rsi_pullback(loop_staging(loop), pins={"rsi": hashes["rsi"]})
+    _seed_approved_candidate_metrics(conn, pair="USDJPY", trades=40, pf=1.5,
+                                     avg_r=0.2)
+    payload = {"kind": "strategy", "name": "rsi_pullback",
+               "content_hash": "c" * 64, "eval_source": "dukascopy",
+               "base_interval": "5m",
+               "in_sample": {"USDJPY": {"trades": 40, "pf": 1.5, "avg_r": 0.2}}}
+    ctx = synthetic_ctx(loop, conn, plugins_root.parent)
+    assert ctx.inventory is None
+    demotion = loop._finalize_success(
+        conn, mission_id=1, run_id=1, backlog_id=1, slot_key=None,
+        approval_payload=payload, now=fx.NOW, ctx=ctx)
+    assert demotion is not None   # AttributeError にならず質検査まで完走した
 ```
 
 (`_inventory_with_phase1(conn, plugins_root)` は同ファイルのローカルヘルパ:
@@ -8396,9 +8715,14 @@ def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
 ```
 
 (`_run_plugin_gate` に `inventory` 引数を足し、`commit()` が `ctx.inventory` を渡す —
-**T5a Step 5-1 で `ImproveRunContext.inventory` を足すまでは**
-`self._inventory_for_gate(conn)` という private helper で
-`approved_plugins(conn, self._root / "plugins", settings=self._settings)` を呼ぶ。)
+`ImproveRunContext.inventory` フィールド自体は本 task の頭で前倒し追加済み
+(上記 Interfaces) だが、`prepare()` が実際に非空の値を書き込む配線は
+**T5a Step 5-1 の仕事のまま**なので、**それまでは** `ctx.inventory` は
+常に既定値 `None` — `self._inventory_for_gate(conn)` という private helper
+(本 Step で定義。中身は `approved_plugins(conn, self._root / "plugins",
+settings=self._settings)` を都度呼ぶだけ) へフォールバックする。P5
+(`_check_duplicate_metrics_for_approval` 呼び出し) も同じ helper を共有する
+(下記、codex plan r2 束3 Critical)。)
 
 `_check_duplicate_metrics_for_approval` の冒頭に再ロック判定を足す:
 
@@ -8434,7 +8758,12 @@ def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
 > ```python
 >     def _check_duplicate_metrics_for_approval(
 >             self, conn, approval_payload, *,
->             inventory: "InventoryBuildResult", staging_dir: Path) -> str | None: ...
+>             inventory: "InventoryBuildResult", staging_dir: Path,
+>             ) -> "_DuplicateDemotion | None": ...
+>             # ^ codex plan r2 束3 Minor: 実装 (Step 4-6a のテストも)
+>             # 一貫して `_DuplicateDemotion | None` を返す — `str | None` は
+>             # 既存契約 (`_finalize_success` の docstring・呼び出し元の
+>             # `if demotion is not None:` 分岐) と食い違う誤記だった
 >
 >     def _deployed_dir_for(self, name, *, inventory) -> Path | None:
 >         """`inventory.phase1_metas` のうち同名 strategy の `meta.path`。
@@ -8444,19 +8773,54 @@ def find_noop_copy(plugin_dir: Path, *, source_snapshot_dir: Path,
 >         """`staging_dir / approval_payload["name"]`。存在しなければ `None`。"""
 > ```
 >
+> **codex plan r2 束3 Critical 是正 — `_finalize_success` から渡す `inventory`
+> は `ctx.inventory` を直に渡さず、`None` フォールバックを挟む。**
+> `ImproveRunContext.inventory` の 2 フィールドは本 task 冒頭で前倒し追加した
+> (上記 Interfaces / Produces) が、`prepare()` が実際に非空の
+> `InventoryBuildResult` を書き込む配線は**まだ T5a Step 5-1 の仕事のまま**
+> — 本 task が終わった時点でも `ctx.inventory` は常に既定値 `None` である。
+> `_finalize_success` が `inventory=ctx.inventory` をそのまま渡すと、strategy
+> kind の承認で `_deployed_dir_for(name, inventory=None)` →
+> `None.phase1_metas` の `AttributeError` になる。**`ctx.inventory` が
+> `None` のときは Step 4-6c で定義済みの `self._inventory_for_gate(conn)`
+> (`_run_plugin_gate` が既に使っている暫定 helper) へフォールバックする**
+> — これにより本 task は T5a を待たずに自己完結して緑になり、T5a が実配線を
+> 済ませた後は自然に `ctx.inventory` の方が使われる (フォールバック条件が
+> `is None` なので、以後のコード変更は不要):
+>
+> ```python
+>     demotion = self._check_duplicate_metrics_for_approval(
+>         conn, approval_payload,
+>         inventory=(ctx.inventory
+>                    if ctx is not None and ctx.inventory is not None
+>                    else self._inventory_for_gate(conn)),
+>         staging_dir=(ctx.staging_dir if ctx is not None else None))
+>     # `ctx is None` は `_finalize_success(ctx=None)` の直接呼び出し
+>     # テスト専用経路 (本番は常に ctx を渡す) — その経路は
+>     # `approval_payload["kind"] != "strategy"` のケースしか使っていない
+>     # ため、`staging_dir=None` は `_candidate_dir_for` まで届かず安全
+>     # (kind チェックが先に `return None` する)。
+> ```
+>
 > **呼び出し元の移行表** (`rg -n '_check_duplicate_metrics_for_approval\(' src tests`
 > の全結果。行番号は v1.3 執筆時点、着手時に再取得):
 >
 > | path:line | 移行 |
 > |---|---|
 > | `src/agentic_fx/loops/improve_loop.py:1939` | 定義 (上記の新シグネチャ) |
-> | `src/agentic_fx/loops/improve_loop.py:2014` | `_finalize_success` 内。`inventory=ctx.inventory`、`staging_dir=ctx.staging_dir` を渡す (`ctx` はこのスコープに**ある**ことを着手時に `sed -n '1990,2020p'` で確認すること。無ければ `_finalize_success` の引数まで遡って透通させる) |
+> | `src/agentic_fx/loops/improve_loop.py:2014` | `_finalize_success` 内。上記フォールバック式で `inventory=` / `staging_dir=` を渡す (`ctx` はこのスコープに**ある**ことを着手時に `sed -n '1990,2020p'` で確認すること。無ければ `_finalize_success` の引数まで遡って透通させる) |
 > | `tests/loops/test_improve_loop_duplicate_metrics.py:358, 364` | `inventory=` / `staging_dir=` を足す (既存 2 本は依存なし strategy なので `_empty_inventory(tmp_path / "plugins")` でよい) |
 >
 > **`monkeypatch_dirs` は「注入シーム」ではなく「短絡」である**ことを明記する —
 > 2 つの helper を差し替えたテストは helper の中身を検証していない。
 > **実 helper を使う統合テストを 1 本足す** (下の
-> `test_relock_detection_uses_the_real_dir_helpers`)。
+> `test_relock_detection_uses_the_real_dir_helpers`)。**さらに、`ctx.inventory`
+> が `None` のままでも P5 が `_inventory_for_gate(conn)` フォールバックで
+> 正しく動くことを** `test_finalize_success_falls_back_to_inventory_for_gate_
+> when_ctx_inventory_is_none` **で 1 本 pin する** (`prepare_ctx` 実経路は
+> `ctx.inventory` が非 None になるのは T5a 以降なので、本 task の時点では
+> `synthetic_ctx` または `dataclasses.replace(ctx, inventory=None)` で明示的に
+> `None` を再現し、それでも再ロック除外判定が機能することを確認する)。
 
 - [ ] **Step 4-6d: Run test to verify it passes**
 
@@ -8937,7 +9301,11 @@ git commit -m "feat(commands): list dependent strategies in indicator approval d
 - [ ] **P4**: lock しただけの example コピーは `noop_copy_of:_examples/rsi_pullback`、
       正式な再ロックは noop にならず、再ロックなしの複製は `noop_copy_of:S`
 - [ ] **P5**: 再ロックのみの再提出は `duplicate_metrics_of` で降格されない
-      (再ロックでない一致は従来どおり降格する)
+      (再ロックでない一致は従来どおり降格する)。`ctx.inventory` が (本 task
+      時点では常に) `None` のときも `_finalize_success` は
+      `self._inventory_for_gate(conn)` へフォールバックして同じ判定ができる
+      (`test_finalize_success_falls_back_to_inventory_for_gate_when_ctx_
+      inventory_is_none`。codex plan r2 束3 Critical)
 - [ ] **D1**: I2 承認前 = (ii) 欄に S、承認後も (ii) 欄に残る、S 再ロック後 = (i) 欄に S'。
       `_dependent_strategies` は `self.plugins_root` を読む (`self.root` は存在しない —
       opus r1 C4)。`plugins_root` / `settings` が `None` のときは両欄空 (fail-soft)
@@ -8951,6 +9319,10 @@ git commit -m "feat(commands): list dependent strategies in indicator approval d
       (e) `find_noop_copy` の `is_relock_transition` 例外を削る →
       `test_relocked_copy_of_a_deployed_strategy_is_not_a_noop` が落ちる
       (f) reconcile の `_unresolved_after_switch` を `return None` に潰す → R2 が落ちる
+      (g) `_finalize_success` の `inventory=` フォールバック式から
+      `self._inventory_for_gate(conn)` 分岐を削り `ctx.inventory` を直渡しにする →
+      `test_finalize_success_falls_back_to_inventory_for_gate_when_ctx_inventory_is_none`
+      が `AttributeError` で落ちる (codex plan r2 束3 Critical)
 
 ---
 
@@ -8970,8 +9342,10 @@ P3 (露出部分)。
 **着手条件**: T4a・T4b・T6b が main にマージ済み。**worktree 並列不可**。
 
 **Files:**
-- Modify: `src/agentic_fx/loops/improve_run_context.py` (2 フィールドを
-  **互換既定値付き**で末尾に追加 — codex plan r1 C4)
+- (`src/agentic_fx/loops/improve_run_context.py` の 2 フィールド追加
+  (`inventory` / `inventory_view`、互換既定値付き) は **T4b へ前倒し済み**
+  — codex plan r2 束3 Critical。本 task は Modify しない。**Consumes** 側
+  参照)
 - Modify: `tests/fixtures/wiring_envs.py` (`synthetic_ctx` が新 2 フィールドを
   明示的に埋める。T6b は既にマージ済なのでここでは Modify — codex plan r1 C4)
 - Modify: `src/agentic_fx/loops/improve_loop.py:396-410` (`ImproveRunContext` 構築)、
@@ -8996,6 +9370,10 @@ P3 (露出部分)。
 - Consumes: T1 の `InventoryBuildResult` / `lock_config` / `resolve_indicator_deps` /
   `IndicatorResolutionError`、T3 の `build_intent_source(..., resolved)`、
   T4a の `run_kind_gate(..., inventory)` / `GateOutcome.resolved` / `.cpu_samples`、
+  **T4b の `ImproveRunContext.inventory` / `.inventory_view` (2 フィールド、
+  互換既定値付き — codex plan r2 束3 Critical で前倒し。本 task は
+  この 2 フィールドへ実際に非空の値を書き込む「生成元」を配線するだけで、
+  フィールド定義そのものは変更しない)**、
   T6b の `tests.fixtures.wiring_envs` (`improve_env` / `prepare_ctx` /
   `rpc_tooldefs` / `rpc_tools` / `loop_env`)。
   (`evaluate_strategy_adoption_gate(..., resolved, inventory)` /
@@ -9003,20 +9381,9 @@ P3 (露出部分)。
 - Produces:
 
 ```python
-# src/agentic_fx/loops/improve_run_context.py
-@dataclass(frozen=True)
-class ImproveRunContext:
-    mission_id: int
-    run_id: int
-    staging_dir: Path
-    source_snapshot_dir: Path
-    allowed_backlog_ids: frozenset[int] | None
-    slot_key: tuple[str, int] | None
-    ledger: ImproveRpcLedger
-    rpc_handlers: dict[str, Callable[[dict], dict]]
-    # [codex plan r1 C4] **互換既定値付き**で末尾に足す (下記の根拠)
-    inventory: "InventoryBuildResult | None" = None    # 親のみが持つ
-    inventory_view: dict = field(default_factory=dict)  # JSON-safe、handshake
+# src/agentic_fx/loops/improve_run_context.py — 定義そのものは T4b の Produces
+# (2 フィールドは既に存在する)。本 task が変えるのは「誰が inventory / view
+# に非空の値を書き込むか」だけ — `prepare()` が唯一の生成元になる。
 
 # src/agentic_fx/tools/mission_counters.py
 class MissionToolCounters:
@@ -9106,39 +9473,23 @@ def test_inventory_view_is_generated_once_from_the_same_result(tmp_path):
 - [ ] **Step 5-1b: Run test to verify it fails**
 
 Run: `uv run pytest tests/loops/test_improve_loop_source_snapshot.py -k "pin_broken or inventory_view" -q`
-Expected: FAIL — `AttributeError: 'ImproveRunContext' object has no attribute 'inventory'`
+Expected: FAIL — **codex plan r2 束3 Critical 是正**: `ImproveRunContext.inventory` /
+`.inventory_view` フィールドは T4b で前倒し追加済みなので、もはや
+`AttributeError: ... no attribute 'inventory'` にはならない。`prepare()` が
+まだ実 inventory を書き込まない (本 Step の実装対象) ため、既定値のまま
+`ctx.inventory is None` / `ctx.inventory_view == {}` になり、
+`test_pin_broken_strategy_stays_in_the_snapshot_but_not_in_the_inventory` は
+`ctx.inventory_view["plugins"]` で `KeyError: 'plugins'` に、
+`test_prompt_shows_the_number_of_pin_broken_strategies` は prompt に
+「pin 破れ」が出ない `AssertionError` になる (どちらも同じ根: `prepare()` が
+`inventory=` / `inventory_view=` を渡していない)
 
 - [ ] **Step 5-1c: Write minimal implementation**
 
-`src/agentic_fx/loops/improve_run_context.py` に 2 フィールドを追加:
-
-```python
-    # [indicator-consumption-wiring] §2.3: 改善 mission の composition root。
-    # mission 開始時に `_snapshot_src` の材料と同じ 1 回の
-    # `approved_plugins` から作る。**親プロセスにしか無い** — 子 worker は
-    # `inventory_view` (JSON-safe) だけを handshake 経由で見る (§2.9b)。
-    #
-    # **codex plan r1 C4: 既定値を付ける (必須フィールドにしない)。**
-    # 現行 `rg -c 'ImproveRunContext\(' src tests` = **57 箇所**が直接構築して
-    # おり、既定値なしで足すと 56 箇所が `TypeError` になる (v1.2 は `prepare`
-    # 1 箇所しか更新指示が無かった)。`ImproveRunContext` は frozen dataclass で
-    # 既存 8 フィールドがすべて既定値なしなので、**末尾に既定値付きで足す**
-    # のは dataclass の規則上も安全。
-    #   - `inventory = None` … 「inventory を持たない ctx」は
-    #     **依存を 1 本も解決できない** = すべての依存が `not_found` で
-    #     `started:false` になる (fail closed)。読む側は
-    #     `ctx.inventory if ctx.inventory is not None else <空 inventory>`
-    #     に正規化する (Step 5-4c / 5-5c)。
-    #   - `inventory_view = {}` … `list_deployed_plugins` が
-    #     `{"plugins": [], "pin_broken_strategies": []}` を返す形に
-    #     正規化する (`view.get("plugins", [])`)。
-    # **実 `prepare` 経路だけが非空を必須とする** — その検証は Step 5-1a の
-    # `test_prepare_populates_a_non_empty_inventory` が行う (下記)。
-    inventory: "InventoryBuildResult | None" = None
-    inventory_view: dict = field(default_factory=dict)
-```
-
-`dataclasses.field` の import を追加する (`from dataclasses import dataclass, field`)。
+**`src/agentic_fx/loops/improve_run_context.py` の 2 フィールドは T4b で
+追加済みなので、本 Step では触らない** (codex plan r2 束3 Critical — 前倒し
+の詳細と根拠は T4b Step 4-6c を参照)。本 Step がやるのは「誰が
+`inventory=` / `inventory_view=` を渡すか」の配線だけ:
 
 **`tests/fixtures/wiring_envs.py::synthetic_ctx` を同じコミットで更新する**
 (codex plan r1 C4): `prepare_ctx` が成立しない環境での fallback なので、
@@ -9402,6 +9753,13 @@ def test_lock_staging_deps_refuses_unknown_dependency(tmp_path):
 
 
 def test_lock_staging_deps_refuses_outputs_undeclared_dependency(tmp_path):
+    """codex plan r2 束4 Important 是正: `_tools(tmp_path)` の**既定引数**
+    (`view=_VIEW`) に頼ると、`_VIEW` の中身が別の理由で変わったときに
+    この受入がこっそり `not_found` へ後退しても誰も気づけない
+    (`_VIEW` はモジュールレベル共有 fixture — `test_list_deployed_plugins_*`
+    等、他の複数テストとも共用している)。**このテストだけが読む
+    `inventory_view` を明示的にローカルで組み立て**、U4b
+    (`outputs_undeclared`) 分岐に実際に到達することを自己完結で保証する。"""
     from tests.fixtures import indicator_wiring as fx
     staging = tmp_path / "staging"
     d = fx.write_rsi_pullback(staging, pins=None)
@@ -9409,7 +9767,12 @@ def test_lock_staging_deps_refuses_outputs_undeclared_dependency(tmp_path):
     cfg = yaml.safe_load((d / "config.yaml").read_text())
     cfg["indicators"]["rsi"]["plugin"] = "legacy"
     (d / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
-    out = _tools(tmp_path)["lock_staging_deps"]("rsi_pullback")
+    view = {"plugins": [
+                {"name": "legacy", "kind": "indicator", "pairs": [],
+                 "params": {"period": 14}, "outputs": None,
+                 "content_hash": "b" * 64}],
+            "pin_broken_strategies": []}
+    out = _tools(tmp_path, view)["lock_staging_deps"]("rsi_pullback")
     assert out["reason"] == "outputs_undeclared"
 
 
@@ -10251,7 +10614,14 @@ Expected: FAIL — commit は `gate_failed:...` の形の `last_result` を書�
 indicator 候補では未設定なので `{}` になる)。
 
 `_run_plugin_gate` の `find_noop_copy` 呼び出しに `inventory=ctx.inventory` を渡す
-(Step 4-6c の暫定 helper `_inventory_for_gate` を削除する)。
+(Step 4-6c の暫定 helper `_inventory_for_gate` を削除する)。**同じコミットで
+`_finalize_success` の P5 呼び出し (Step 4-6c で足したフォールバック式) も
+`inventory=ctx.inventory` の直渡しへ単純化する** — T5a 完了以降は
+`prepare()` が常に非空の `ctx.inventory` を書き込むため、
+`self._inventory_for_gate(conn)` フォールバック分岐は恒久的に到達不能な死に
+コードになる (codex plan r2 束3 Critical の後始末)。
+`test_finalize_success_falls_back_to_inventory_for_gate_when_ctx_inventory_is_none`
+(T4b) は `_inventory_for_gate` ごと削除する。
 
 - [ ] **Step 5-5d: Run test to verify it passes**
 
@@ -10662,6 +11032,7 @@ prerequisite 3 indicator 配備後、deps=0 と deps=3 の同一 strategy で in
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-15 | v1.4 | **codex プランレビュー r2 (2 周目、4 束並列。合計 Critical 2 / Important 3 / Minor 2、token 実測 = 4 束合計 約 350k) を全件是正。** **Critical**: 束2 — `SignalProducer.evaluate_due_plugins` の `resolved_by_hash: dict[str, ResolvedIndicatorSet]` (content_hash 単独キー) は、同一 content_hash・別名の 2 strategy が存在すると `InventoryBuildResult.resolved` (キーは `(name, content_hash)`) から dict comprehension で潰す際にどちらかが失われ、Global Constraints の既存 identity と P3' の「同一オブジェクト」不変条件に反する。`resolved_by_identity: dict[tuple[str, str], ResolvedIndicatorSet]` に改名しキーを `(meta.name, meta.content_hash)` に統一 (Step 3-2a/c、File Structure、T3 Interfaces Produces、完了条件 F2、段 0 変異 red を更新)。session cache は **`content_hash` 単独のまま維持**と判断 (根拠: content_hash は `plugin.py + config.yaml` のバイト列そのもの — 一致する 2 strategy は依存宣言も含めてバイト単位で同一なので、渡す `resolved` の identity は `(name, hash)` 単位に保ちつつ、subprocess 再利用の単位だけ content だけで 決めても矛盾しない。改名した subprocess 二重起動の回避にもなる)。P3' の回帰ケース `test_producer_uses_name_and_hash_identity_not_hash_alone` (同 hash・別 name の 2 strategy) を新設 / 束3 — T4b Step 4-6c の P5 (`_finalize_success` → `_check_duplicate_metrics_for_approval(inventory=ctx.inventory, ...)`) が、依存順で 後続の T5a Step 5-1 が所有する `ImproveRunContext.inventory` を先取りしており、本番 `AttributeError` になり得た。`ImproveRunContext.inventory` / `.inventory_view` の 2 フィールド追加 (v1.3 C4 の互換既定値付きの形はそのまま) を **T4b へ前倒し**し、T5a Step 5-1 からはフィールド追加を削除して「実 `prepare()` が非空の値を書き込む 配線」だけを Consumes する形に縮小 (T4b/T5a の Files・Interfaces・Produces・Consumes・依存グラフの所有範囲を更新)。**フィールドは前倒ししたが実配線は前倒ししていない**ため、T4b の時点では `ctx.inventory` は常に既定値 `None` — `_finalize_success`の P5 呼び出しは Step 4-6c で定義済みの暫定 helper `self._inventory_for_gate(conn)` へ フォールバックする形にし (`ctx.inventory if ... is not None else self._inventory_for_gate(conn)`)、T5b Step 5-5 (`_inventory_for_gate` 削除と同じコミット)でフォールバック式を `ctx.inventory` の直渡しへ単純化する後始末を明記。新規回帰テスト `test_finalize_success_falls_back_to_inventory_for_gate_when_ctx_inventory_is_none` を T4b Step 4-6a に追加 (T4b 完了条件 P5・段 0 変異 red にも反映)。 **Minor**: 束3 — `_check_duplicate_metrics_for_approval` の戻り値注釈を `str | None` から `_DuplicateDemotion | None` に訂正 (既存実装・呼び出し元の `if demotion is not None:` 分岐と整合) / 束1 — `PluginSession.__enter__` の kind 契約が片方向 (strategy は `resolved` 必須のみ検査) だったのを、`meta.kind != "strategy" and resolved is not None` も `SandboxError` にする双方向検査に強化し、単体テスト `test_indicator_session_with_resolved_is_rejected` を追加 (V3 完了条件・段 0 変異 red)。**Important**: 束1 — `sandbox._validate_indicator_result` が wire 形の再検証しかせず `meta.outputs` との一致を見ていなかった (worker を迂回/破損した応答の余分 key・欠落 key を親が受理し得た) のを `outputs: tuple[str, ...] | None` を受け、wire 復元後に `core.plugin_contract.validate_indicator_result(out, df_index=None, outputs=outputs)` を通す形に是正 (`PluginSession.call()` の呼び出し側も `outputs=self._meta.outputs` を 渡すよう更新)。テスト `test_standalone_indicator_response_rejects_extra_or_missing_outputs_keys` を追加 (V1 完了条件・段 0 変異 red) / 束1 — `test_every_approved_plugins_caller_consumes_the_inventory_result` が「直後の属性参照」しか検査しておらず、`x = approved_plugins(...)` の中間変数代入 (現行 4 caller のうち 2 本が実際にこの形) を経由した誤用をすり抜けていたのを、`Assign` の戻り値変数を追跡し後続の `.attr` 参照も同じ許可属性集合へ限定する 2 パス AST 検査に強化 / 束4 — `test_lock_staging_deps_refuses_outputs_undeclared_dependency` がモジュール共有の `_tools(tmp_path)` 既定引数 (`view=_VIEW`) に暗黙に 依存していたのを、`legacy` (`kind="indicator"`, `outputs=None`) を含む `inventory_view` をテスト自身が明示的に組み立てて渡す形に変更し、U4b (`outputs_undeclared`) 分岐への到達をこのテスト単体で自己完結して保証する形に 是正 | codex プランレビュー 2 周目 (4 束並列) `tmp/plan-indicator-wiring/r2/{codex,mat}-{1,2,3,4}.md` | - |
 | 2026-09-15 | v1.3 | **codex プランレビュー r1 (Critical 5 / Important 10 / Minor 5 — ヘッダの「Minor 4」は本文の実数 5 と食い違っていたので 5 件として扱った) を全件是正。** **Critical**: C1 T4b の strategy submit テスト群に gate double を明示注入 (`switch_env` は空 DB、`submit_candidate` は実 `_run_full_gate` から実 backtest を回すので全ケースが `NoHistoryError` で落ちていた)。`wiring_envs.install_gate_double` を新設 (22 本目のビルダ)、T4b Interfaces に「strategy を submit/bless する全ケースで double か `seed_history` を明示的に選ぶ」規律と `_run_full_gate` 到達前に落ちる例外ケースを明記、`settings` を `SETTINGS_FIXTURE` に統一 / C2 T3 → T4a の契約破綻 (T3 が `run_kind_gate(..., resolved=, inventory=)` を呼ぶが T4a の最終シグネチャは `resolved` を受けず内部解決する) を **T4a への一本化**で解消 — T3 は `switch.py` を一切触らず `run_kind_gate` の**本体**だけが `ResolvedIndicatorSet.empty(meta.path.parent)` を渡す暫定になり、`_run_full_gate(..., plugins_root)` の引数追加と inventory 構築は T4a Step 4-2c が所有 (T3/T4a の Files・Interfaces・Produces・重複していた `_plugin_locks`/`find_noop_copy` を整理) / C3 `_check_duplicate_metrics_for_approval` を `(conn, payload, *, inventory, staging_dir)` に、`_deployed_dir_for(name, *, inventory)` / `_candidate_dir_for(payload, *, staging_dir)` に変更し (旧案は未束縛の `inventory` / `ctx` を読む = 本番 `NameError`、テストは helper を monkeypatch して隠していた)、caller 移行表 3 件と**実 helper を使う統合テスト** `test_relock_detection_uses_the_real_dir_helpers` を追加 / C4 `ImproveRunContext.inventory` / `.inventory_view` に互換既定値 (`None` / `field(default_factory=dict)`) を置いて現行 57 箇所の直接構築を壊さない形にし、`_build_rpc_handlers(..., inventory=None)` で現行 33 caller を維持、`wiring_envs.synthetic_ctx` を T5a の Files に足して空 inventory を明示、**実 `prepare` 経路だけが非空を持つ**ことを `test_prepare_populates_a_non_empty_inventory` で pin / C5 `list_deployed_plugins` の遮断 8 検査を JSON 全文の部分文字列から**フィールド名の再帰走査 (`params` 配下は除外)** に置換 (同じ `_VIEW` が `params: {"period": 14}` を持つため、正しい出力でも必ず落ちる判別力ゼロの assert だった。設計は params 露出を明示的に許可)。 **Important**: I1 `approved_plugins` の caller 表を実測で再生成 (17 → **19**)、全数性 AST テストを `src` + `tests` の双方走査に拡張 + 戻り値属性の検査テストを追加、期待 FAIL を 5 件に訂正 / I2 `build_intent_source` の caller 表を実測で再生成 (patch 12 → **15**、直接呼び出し 7 → **16**)、AST による `resolved=` 必須検査を追加、Step 3-1d の Run に `tests/loops tests/integration` を追加、commit 対象に `improve_loop.py` と非-plugin テストを追加 / I3 trade worker テストを実入口経由に — `mission_worker._build_trade_indicator_metas(conn, plugins_dir, settings)` を新設して helper を実物として呼び、`plugins_dir` / `settings` / `.inventory.metas` / indicator-only filtering を spy で観測 (旧案はテスト自身が fake を呼んで `build_mission_registry` に渡しており src を 1 行も実行していなかった) / I4 A2 fixture が live symlink の解決先 (= 承認済 I1 の version 実体) を改変していたのをやめ、`bump_indicator_version` だけで新版を作る形に / I5 P3 三経路同形テストに **bless payload** と `_build_approval_payload` を足して 3 payload を相互比較 (旧案は submit payload しか見ておらず bless からキーを落としても緑) / I6 P3' の spy 先を `plugin.resolve` モジュール属性から **call site の `approval.resolve_indicator_deps`** に訂正 (関数を直接 import するため旧案は spy が呼ばれず必ず赤)、両 scope の `is` 一致 pin を T4a Step 4-3 の実 gate E2E (`test_resolved_object_identity_across_both_scopes`) に新設 / I7 C1 の cpu_samples assert を `floor_mode="warn"` + scope 列 `== ["in_sample", "holdout"]` + float 型に (旧案は holdout 0 件でも緑) / I8 F4 に `total_calls` +1 (registry 経由) と `last_result` 不変 (T5b Step 5-4 の実 handler + `improvement_backlog` 見張り行) の観測を追加 / I9 D1 の「決定順 (id)」を実装 — `json_extract(payload_json,'$.name')` + `MAX(id)` で最新承認 id を引いて sort し、**名前順と決定順が逆になる fixture** (`z_first` → `a_second`) のテストを追加。 **I10 (= 設計書 v1.4)**: §6 S1 の「`get_indicators` **と依存の両方**で使える」を U4 / U4b に合わせて「standalone `get_indicators` のみ」に訂正。 **Minor**: M1 T6a の Files から `tests/fixtures/wiring_envs.py` を削除 (所有者は T6b 1 箇所) / M2 版表記を v1.3 (設計書 v1.4 準拠) に、task 数を 9 に、`S1'` を独立受入 ID から S1 内の観測点へ (受入 ID は設計書 §6 の 32 件)、ビルダ数を実数 22 に / M3 `cpu_sec` property の docstring を「正常終了・plugin error 後は float、`None` は SIGKILL fallback / worker 未起動の 2 経路のみ」に / M4 RSI warmup assert を `iloc[:14]` + `iloc[14]` の境界 2 点に (旧案は index 13 を見ておらず warmup が 1 本早く明ける変異を検出できなかった) / M5 handshake の `outputs` を辞書リテラルから `kind == "indicator"` 分岐へ移し、非 indicator では**キー自体が無い**ことを pin | codex プランレビュー 1 周目 `tmp/plan-indicator-wiring/codex-plan-r1.md` | - |
 | 2026-09-14 | v1.2 | **ユーザー裁定 (2026-09-14、設計書 v1.3 準拠) を反映、10 件。** ①**置き場変更**: validator を `plugin/indicator_validate.py` から `src/agentic_fx/core/plugin_contract.py` へ (全数置換、`grep -n "indicator_validate"` 残存 0、モジュール docstring に「親 (`plugin/sandbox.py`) と sandbox worker の両方から import される・`agentic_fx.plugin.*` を import してはならない」を追加、テストも `tests/core/test_plugin_contract.py` へ) / ②③④⑤⑦⑧ = 変更なしで採用 (「ユーザー裁定 2026-09-14 採用」と注記) / ⑥**代替**: lock (`lock_config` / `afx plugin lock --from _human` / `lock_staging_deps`) の後は必ず snapshot (content_hash) を取り直す — `lock_config` の戻り値を `(before_text, after_text)` から `(before_text, after_text, new_content_hash)` に変更し (Step 1-5)、T1 単体テスト・T3 `_plugin_lock`・T5a `lock_staging_deps` の 3 箇所で `discover_one_with_reason` の再取得結果と assert 突き合わせるコードを追加。**申し送り F2**: 設計書 §6 F2 を「warning 1 行 (reason 込み)、producer の plugin 一覧に含まれない」に緩和 (session cache 未登録は producer 一覧に無いことの帰結なので別途観測しない)。Step 3-2 のテスト docstring・T3 完了条件を同文言に統一。**申し送り P2'**: 設計書 §6 P2' の「逆順で取っても deadlock しない (順序 pin)」を「`_plugin_lock` の取得順序が常に名前昇順・重複なしであることを spy で pin する」に置換。T4b Step 4-4 に `test_plugin_lock_order_for_approve_candidate_is_sorted_unique` (spy 形、`approve_candidate` の実経路で `_plugin_lock` を monkeypatch し `sorted(set(names))` と一致を assert) を新規追加し、既存の並行ブロッキングテストは相互排除の実測として役割を分離。設計書の変更履歴に v1.3 行、本プランの見出しを v1.2 / 設計書準拠 v1.3 に更新。「指揮者の既定選択」ブロックを「ユーザー裁定 (2026-09-14、指揮者の既定選択 8 件の採否)」ブロックに改題 | ユーザー裁定 (2026-09-14、プラン末尾「指揮者の既定選択」8 件 + 申し送り 2 件の確定) | - |
 | 2026-09-14 | v1.1 | **着手前検証 (opus r1: Critical 6 / Important 12 / Minor 13) を全件是正。** **Critical**: C1 `prepare(conn=…)` → `wiring_envs.prepare_ctx(loop, now=)` (現物は `prepare(*, slot_key, now, on_ready)` → 3-tuple、15 箇所を置換) / C2 `improve_env` の `ImproveLoop(activity=, rag=)` 必須引数を追加 (`_FakeRag` は `tests/loops/conftest.py` から逐語転写) / C3 `ActivityLog.read_text()` は存在しない → `wiring_envs.activity_text` (tab 5 列の行形式を smoke test で固定、4 箇所を置換) / C4 `commands.Shell` → `commands.Commands` (必須 7 引数を `tests/test_commands.py` から転写)、`_dependent_strategies` の `self.root` → `self.plugins_root` (None は fail-soft) / C5 `_resolved()` に `pinned=True` / C6 `run_kind_gate(inventory=)` の既存 5 呼び出しの移行表を Step 4-1a に追加。 **Important**: I1 `build_intent_source` の patch 12 + 直接呼び出し 7 = 19 箇所の移行表を Step 3-1a に追加 (`**kwargs` 一律方針) / I2 移行全数性テストを正規表現 → AST (`ast.Call`) 走査に置換 (docstring 6 件の偽陽性を除去、期待 FAIL を 4 件に訂正) / I3 `wiring_envs` を T6b として独立 task 化 + 20 ビルダ全部に smoke test + Produces に逐語シグネチャ / I4 `_project_indicator_output` の入力契約を list に固定し fake を親再検証後の形へ / I5 F4 の `errors` / refusal streak は registry (`on_result`) 経由でしか増えないため registry 経由テストを追加 (`rpc_tooldefs` ビルダを新設) / I6 `improve_env` の conn factory を毎回新規接続に (handler の `conn.close()` でテスト conn が死ぬ) / I7 `latest_in_sample_metrics` に `variant`/`source`/`base_interval` を追加 / I8 `stage_switched_journal` の payload `content_hash` を新 version dir 実体から算出 + `advance_switch_journal(commit=True)` + T6b に reconcile→`decided` の smoke / I9 oracle の `df.empty: continue` を削除、`expected_eval_timestamps` の死に引数 `conn` を削除、adapter の sink 非呼び出し条件を逐語明記 / I10 設計書 §6 の C1 / R1 を **設計書 v1.2** で改訂 (指揮者へ申告済み) / I11 `_strip_forbidden` は denylist と実測確認 → src 変更不要、4 キーの pin テストへ / I12 `dict(counters.backtest_calls)` 比較 (正しい実装でも落ち、変異でも落ちる = 判別力ゼロ) を `backtest_calls["cand"] == 0` の直接 assert へ (段 0 M8 の観測点も同じに)。 **Minor M1〜M13**: `_current` の死に引数を `plugin_dir` に / `strip_pins` の `default=str` を比較専用と明記 / `_check_number` の型 allowlist (数値文字列拒否) / list 分岐の `pd.isna` 曖昧性 / Step 1-1c の `_check_json_safe` スタブを一意に確定 / `grid` 比較を in_sample 期間に + 週末非混入を直接 assert / テスト名 2 件の改名 / Step 2-2 と 2-3 を 1 Step に統合 / Step 4-3c の申し送りを 4-1c へ実際に移動 / 行番号再取得の指示を Global Constraints へ / oracle のメモ化 + `slow` マーク / T3 の Consumes から `wiring_envs` を除去 / `_unresolved_after_switch` の TOCTOU 窓をコメントで明記。 **task 分割 (観点 7)**: T6 → T6a / T6b、T4 → T4a / T4b、T5 → T5a / T5b の 9 task に。依存グラフと worktree 並列可否 (T3 ∥ T6b) を更新。 **fixture の実測 probe**: `tmp/plan-indicator-wiring/probe_fixture.py` で設計書 §6 の生成式を実行 — in_sample の 1h Wilder RSI(14) は **min 27.2159 / max 78.4162、long 52 + short 50 = 102 opens、先頭 14 本 NaN で index 14 から値**。`opens >= 30` (`EVALUABLE_MIN_TRADES`) を満たすため**設計書 §6 の生成式の是正は不要**。 **自己レビューで新規追記コードも現物照合**: `ToolRegistry` はキーワード専用 `__init__` + `register_all` + `execute(name, args, allowed)` (`call` は存在しない) / `approvals.get()` は存在しない (SQL で status を読む) / journal のテーブル名は `plugin_switch_journal` / `reconcile_switch_journals` は既に `settings` を取る、へ是正。 **T4a Step 4-2 が `wiring_envs.switch_env` を使うため T4a の着手条件に T6b を追加**し依存グラフを訂正 | プラン着手前検証 `tmp/plan-indicator-wiring/opus-plan-r1.md` (opus r1) | - |
