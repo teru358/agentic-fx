@@ -69,7 +69,10 @@ from agentic_fx.plugin import strategy_adapter, strategy_gate
 from agentic_fx.plugin.gate_pytest import GateResult, run_gate_pytest
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.loader import content_hash as _recompute_content_hash
-from agentic_fx.plugin.resolve import ResolvedIndicatorSet
+from agentic_fx.plugin.resolve import (
+    IndicatorResolutionError, PinMode, ResolvedIndicatorSet,
+    resolve_indicator_deps,
+)
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.signal_eval import SandboxRunFn, evaluate_detection
 from agentic_fx.store import approvals as approvals_store
@@ -221,7 +224,8 @@ class GateOutcome:
     """
     metrics: dict
     evaluable: bool
-    verdict_kind: Literal["ok", "insufficient_trades", "floor"] = "ok"
+    verdict_kind: Literal["ok", "insufficient_trades", "floor",
+                          "indicator_unresolved"] = "ok"
     # [profitability-floor] codex 2 周目レビュー CR6 (2026-09-13):
     # `floor_failed` フィールドは削除した (`verdict_kind == "floor"` と
     # 完全な同値で、生産コードのどこからも読まれず — `switch.py::
@@ -235,16 +239,28 @@ class GateOutcome:
     # に `sink=` を渡した場合はその**同じ list オブジェクト**になる
     # (`is` で同一性が成立する) — 既定は空 tuple。
     gate_rows: "tuple[dict, ...] | list[dict]" = field(default_factory=tuple)
+    # [indicator-consumption-wiring] §2.8 (codex r6 I1): 未解決は
+    # 判別子で返す (raise しない)。成功時は `resolved` に解決結果を載せ、
+    # submit / bless / `_build_approval_payload` はここから
+    # `pin_object()` を作る (外で再解決しない)。
+    indicator_alias: str | None = None
+    indicator_reason: str = ""
+    resolved: "ResolvedIndicatorSet | None" = None
+    # (scope, pair, cpu_sec|None) — commit gate は adapter を内部生成する
+    # ため、CPU 実測は verdict 経由でしか ImproveLoop に届かない (r5 I4)。
+    cpu_samples: tuple[tuple[str, str, float | None], ...] = ()
 
 
 # precheck 2026-08-22 wave2: T11-B-11d
 def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
                   settings: "Settings", now: datetime,
+                  inventory: "InventoryBuildResult",
                   sandbox_run: SandboxRunFn | None = None,
                   run_in_sample_fn: RunInSampleFn | None = None,
                   floor_mode: Literal["enforce", "warn"] = "enforce",
                   record_fn: "Callable[[dict], None] | None" = None,
                   sink: "list[dict] | None" = None,
+                  pin_mode: PinMode = "require",
                   ) -> GateOutcome:
     """`switch.py` の `submit_candidate`/`bless_candidate` (`_run_full_gate`
     手順 7) から共有呼び出しされる kind 別検証の入口。indicator/signal は
@@ -291,9 +307,25 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
     `_run_full_gate` は自分の list だけを唯一の正として持てる。
     `record_fn` は引き続き「行 1 件ごとのコールバック通知」用に残す
     (list を持たず単に転送を挟みたい呼び出し元向け、`sink` とは独立)。
+
+    [indicator-consumption-wiring] §2.8: **解決エラーは捕捉して
+    `GateOutcome(verdict_kind="indicator_unresolved")` を返す** (raise
+    しない — Global Constraints)。成功時は `resolved` に解決結果を載せ、
+    `evaluate_strategy_adoption_gate` へ**同じオブジェクト**を渡す
+    (resolver 呼び出しは候補ごとに 1 回、P3')。`inventory` は呼び出し元が
+    composition root で 1 回だけ構築したもの — この関数は構築しない。
     """
     if meta.kind == "strategy":
         rows: list[dict] = sink if sink is not None else []
+        try:
+            resolved = resolve_indicator_deps(
+                meta, inventory.inventory, settings=settings, pin_mode=pin_mode)
+        except IndicatorResolutionError as exc:
+            return GateOutcome(
+                metrics={}, evaluable=False,
+                verdict_kind="indicator_unresolved",
+                indicator_alias=exc.alias, indicator_reason=exc.reason,
+                gate_rows=rows)
 
         def _sink(row: dict) -> None:
             rows.append(row)
@@ -302,13 +334,9 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
 
         verdict = strategy_gate.evaluate_strategy_adoption_gate(
             conn, meta=meta, settings=settings, now=now,
-            floor_mode=floor_mode, record_fn=_sink,
-            # [indicator-consumption-wiring] T3 暫定 (T4a Step 4-1c で
-            # `resolve_indicator_deps(...)` の実解決に置き換える)。
-            # 依存 0 本なら `empty()` の root 引数は解決に使われない。
-            # 依存ありの候補は worker 内で `KeyError` → `SandboxError` →
-            # gate 不合格になる = fail closed (下記コメントも参照)。
-            resolved=ResolvedIndicatorSet.empty(meta.path.parent))
+            floor_mode=floor_mode, record_fn=_sink, resolved=resolved,
+            inventory=inventory)
+        cpu_samples = verdict.cpu_samples if verdict is not None else ()
         if verdict is None or not verdict.evaluable:
             # strategy_gate.evaluate_strategy_adoption_gate は既に
             # "insufficient_trades:<n>" の形で observation_reason を返す。
@@ -316,19 +344,23 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
             return GateOutcome(
                 metrics={}, evaluable=False,
                 verdict_kind="insufficient_trades",
-                insufficient_trades_reason=reason, gate_rows=rows)
+                insufficient_trades_reason=reason, gate_rows=rows,
+                resolved=resolved, cpu_samples=cpu_samples)
         if verdict.floor_reason:
             return GateOutcome(
                 metrics=verdict.candidate_metrics or {}, evaluable=True,
                 verdict_kind="floor",
                 floor_warning=verdict.floor_reason,
-                floor_detail=verdict.floor_detail, gate_rows=rows)
+                floor_detail=verdict.floor_detail, gate_rows=rows,
+                resolved=resolved, cpu_samples=cpu_samples)
         return GateOutcome(
             metrics=verdict.candidate_metrics or {}, evaluable=verdict.evaluable,
-            verdict_kind="ok", gate_rows=rows)
+            verdict_kind="ok", gate_rows=rows, resolved=resolved,
+            cpu_samples=cpu_samples)
     metrics, evaluable = _validate_kind(
         conn, meta, settings=settings, now=now, sandbox_run=sandbox_run,
-        run_in_sample_fn=run_in_sample_fn)
+        run_in_sample_fn=run_in_sample_fn,
+        resolved=ResolvedIndicatorSet.empty(inventory.inventory.root))
     return GateOutcome(metrics=metrics, evaluable=evaluable, verdict_kind="ok",
                        gate_rows=sink if sink is not None else [])
 

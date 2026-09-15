@@ -14,7 +14,9 @@ from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin.loader import PluginMeta
 
 if TYPE_CHECKING:
-    from agentic_fx.plugin.resolve import ResolvedIndicatorSet
+    from agentic_fx.plugin.resolve import (
+        InventoryBuildResult, ResolvedIndicatorSet,
+    )
 
 # timeframe 正規化の単一所有者 (codex 段階2/3 是正 1周目): `plugin/
 # approval.py` はこの辞書を再実装せず `strategy_gate._eval_timeframe` を
@@ -50,6 +52,9 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
     # (テストの fake がそうであるように) 判定に使った実際の pf/avg_r と
     # 一致する保証がないため、判定元の dict をそのまま持たせる。
     holdout_metrics: dict | None = None
+    # [indicator-consumption-wiring] §2.9(e): (scope, pair, cpu_sec|None)。
+    # scope in {"in_sample", "holdout"}。
+    cpu_samples: "tuple[tuple[str, str, float | None], ...]" = ()
 
 
 def _floor_fail_items(
@@ -170,6 +175,7 @@ def floor_rule_text(gate_settings: "ImproveGateSettings", *,
 def evaluate_strategy_adoption_gate(
     conn, *, meta: "PluginMeta | None", now: datetime, settings: "Settings",
     resolved: "ResolvedIndicatorSet",
+    inventory: "InventoryBuildResult | None" = None,
     name: str | None = None, pairs: "list[str] | None" = None,
     timeframe: str | None = None, content_hash: str | None = None,
     kind: str = "strategy",
@@ -263,11 +269,22 @@ def evaluate_strategy_adoption_gate(
     # Important-2 の pin `test_record_fn_is_forwarded_to_run_in_sample_
     # and_run_holdout` が「record_fn はそのまま転送される」ことを要求する
     # ため)。
-    approved_row = conn.execute(
-        "SELECT payload_json FROM approval_requests WHERE kind='plugin' "
-        "AND status='approved' AND json_extract(payload_json,'$.name')=? "
-        "AND json_extract(payload_json,'$.kind')='strategy' "
-        "ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+    # [indicator-consumption-wiring] §2.7: baseline 判定は
+    # `ApprovedInventory` の strategy 集合を正本にする — approval_requests
+    # を直接引くと、pin 破れで配備から外れた同名 strategy を baseline と
+    # 誤認する (それは既に live で動いていない)。`inventory` が渡されない
+    # 経路 (テストの直接呼び出し) は従来の SQL にフォールバックする。
+    if inventory is not None:
+        has_approved_baseline = any(
+            m.name == name and m.kind == "strategy"
+            for m in inventory.inventory.metas)
+    else:
+        has_approved_baseline = conn.execute(
+            "SELECT 1 FROM approval_requests WHERE kind='plugin' "
+            "AND status='approved' "
+            "AND json_extract(payload_json,'$.name')=? "
+            "AND json_extract(payload_json,'$.kind')='strategy' "
+            "LIMIT 1", (name,)).fetchone() is not None
 
     from agentic_fx.store import backtest_runs as backtest_runs_store
 
@@ -280,7 +297,7 @@ def evaluate_strategy_adoption_gate(
     # 別物 — `period` に datetime を含む行を payload に混ぜると
     # `approvals_store.create` の json.dumps で TypeError になる。
     in_sample_rows: list[dict] = []
-    if approved_row is None:
+    if not has_approved_baseline:
         def _in_sample_record_fn(row: dict) -> None:
             in_sample_rows.append(row)
             if record_fn is not None:
@@ -290,6 +307,7 @@ def evaluate_strategy_adoption_gate(
     else:
         _in_sample_record_fn = record_fn
 
+    cpu_samples: list[tuple[str, str, float | None]] = []
     dataset = settings.backtest.dataset()
     per_pair = {}
     for pair in pairs:
@@ -305,12 +323,16 @@ def evaluate_strategy_adoption_gate(
                 record_fn=_in_sample_record_fn)
         finally:
             intent_source.close()
+            # [indicator-consumption-wiring] §2.9(e): close 完了後に確定する
+            # property。例外終了時も必ず 1 件積む (cpu_sec=None)。
+            cpu_samples.append(("in_sample", pair, intent_source.cpu_sec))
     total_trades = sum(m["trades"] for m in per_pair.values())
     evaluable = total_trades >= EVALUABLE_MIN_TRADES
     if not evaluable:
         return StrategyGateVerdict(
             evaluable=False,
-            observation_reason=f"insufficient_trades:{total_trades}")
+            observation_reason=f"insufficient_trades:{total_trades}",
+            cpu_samples=tuple(cpu_samples))
 
     # [profitability-floor] T1 Step 1-2 (2026-09-12、設計書 §3):
     # in_sample 段の判定は total_trades 判定の直後 (holdout ループより前)。
@@ -325,7 +347,8 @@ def evaluate_strategy_adoption_gate(
     if in_sample_floor_reason and floor_mode == "enforce":
         return StrategyGateVerdict(
             evaluable=True, floor_reason=in_sample_floor_reason,
-            floor_detail=in_sample_floor_detail, candidate_metrics=per_pair)
+            floor_detail=in_sample_floor_detail, candidate_metrics=per_pair,
+            cpu_samples=tuple(cpu_samples))
 
     holdout_per_pair: dict = {}
     for pair in pairs:
@@ -343,6 +366,7 @@ def evaluate_strategy_adoption_gate(
                 record_fn=record_fn)
         finally:
             intent_source.close()
+            cpu_samples.append(("holdout", pair, intent_source.cpu_sec))
 
     holdout_floor_reason, holdout_floor_detail = _check_profitability_floor(
         holdout_per_pair, settings=settings, scope="holdout")
@@ -351,13 +375,13 @@ def evaluate_strategy_adoption_gate(
     floor_detail = " | ".join(
         d for d in (in_sample_floor_detail, holdout_floor_detail) if d)
 
-    if approved_row is not None:
+    if has_approved_baseline:
         baseline_row = {"ref_plugin_ref": plugin_ref, "variant": "baseline"}
         return StrategyGateVerdict(
             evaluable=True, baseline_variant="baseline",
             baseline_row=baseline_row, candidate_metrics=per_pair,
             floor_reason=floor_reason, floor_detail=floor_detail,
-            holdout_metrics=holdout_per_pair)
+            holdout_metrics=holdout_per_pair, cpu_samples=tuple(cpu_samples))
 
     for row in in_sample_rows:
         no_strategy_row = dict(row)
@@ -380,4 +404,4 @@ def evaluate_strategy_adoption_gate(
         evaluable=True, baseline_variant="no_strategy",
         baseline_row=baseline_row, candidate_metrics=per_pair,
         floor_reason=floor_reason, floor_detail=floor_detail,
-        holdout_metrics=holdout_per_pair)
+        holdout_metrics=holdout_per_pair, cpu_samples=tuple(cpu_samples))

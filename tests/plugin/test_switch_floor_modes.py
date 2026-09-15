@@ -50,6 +50,19 @@ def _fake_pytest_ok(plugin_dir, *, settings):
                       duration_sec=0.1)
 
 
+def _empty_inventory(root):
+    """[indicator-consumption-wiring] T4a Step 4-1a: `run_kind_gate` の
+    新契約が `inventory` をキーワード必須にしたための移行ヘルパ。本
+    ファイルの候補はすべて依存 0 本 (`_write_strategy_candidate`) なので
+    resolver は deps 0 本で即 `ResolvedIndicatorSet.empty(...)` を返す
+    = 判定に影響しない。`tests/fixtures/wiring_envs.py` には置かない
+    (T4a は `wiring_envs` の残りのビルダを Consumes しない)。"""
+    from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
+    return InventoryBuildResult(
+        inventory=ApprovedInventory(root=root, metas=()),
+        phase1_metas=(), resolved={}, rejected_strategies=())
+
+
 def _floor_fail_gate(conn, *, meta, settings, now, floor_mode="enforce",
                      record_fn=None, **_unused_kwargs):
     """`evaluate_strategy_adoption_gate` のフェイク: 収益性フロア不合格
@@ -125,7 +138,9 @@ def test_f6_9_run_kind_gate_never_raises_for_insufficient_trades(
         "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
         _insufficient_trades_gate)
 
-    outcome = approval.run_kind_gate(conn, meta, settings=settings, now=NOW)
+    outcome = approval.run_kind_gate(
+        conn, meta, settings=settings, now=NOW,
+        inventory=_empty_inventory(plugins_dir))
 
     assert isinstance(outcome, approval.GateOutcome)
     assert outcome.verdict_kind == "insufficient_trades"
@@ -143,7 +158,8 @@ def test_f6_9_run_kind_gate_never_raises_for_floor_failure(env, monkeypatch):
         _floor_fail_gate)
 
     outcome = approval.run_kind_gate(conn, meta, settings=settings, now=NOW,
-                                     floor_mode="enforce")
+                                     floor_mode="enforce",
+                                     inventory=_empty_inventory(plugins_dir))
 
     assert isinstance(outcome, approval.GateOutcome)
     assert outcome.verdict_kind == "floor"
@@ -477,7 +493,8 @@ def test_g3_run_kind_gate_forwards_floor_mode_warn_to_evaluator(env, monkeypatch
         _spy)
 
     approval.run_kind_gate(conn, meta, settings=settings, now=NOW,
-                           floor_mode="warn")
+                           floor_mode="warn",
+                           inventory=_empty_inventory(plugins_dir))
 
     assert seen_floor_modes == ["warn"]
 
@@ -506,7 +523,8 @@ def test_g3_run_kind_gate_default_floor_mode_is_enforce(env, monkeypatch):
         "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
         _spy)
 
-    approval.run_kind_gate(conn, meta, settings=settings, now=NOW)
+    approval.run_kind_gate(conn, meta, settings=settings, now=NOW,
+                           inventory=_empty_inventory(plugins_dir))
 
     assert seen_floor_modes == ["enforce"]
 
@@ -529,7 +547,12 @@ def test_g3_bless_candidate_warn_reaches_holdout_seam_via_real_evaluator(
         "agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.strategy_adapter.build_intent_source",
-        lambda meta, **kw: type("Fake", (), {"close": lambda self: None})())
+        # [indicator-consumption-wiring] T4a Step 4-1c: 本 Step で
+        # `strategy_gate` が `intent_source.cpu_sec` を close 後に読むよう
+        # になったため、この Fake も属性を持つ必要がある (プラン本文に
+        # 明記なし — 機械的対応)。
+        lambda meta, **kw: type(
+            "Fake", (), {"close": lambda self: None, "cpu_sec": None})())
 
     holdout_calls = []
 
@@ -575,7 +598,8 @@ def test_cr7_run_kind_gate_sink_identity_is_preserved(env, monkeypatch):
 
     my_sink: list = []
     outcome = approval.run_kind_gate(
-        conn, meta, settings=settings, now=NOW, sink=my_sink)
+        conn, meta, settings=settings, now=NOW, sink=my_sink,
+        inventory=_empty_inventory(plugins_dir))
 
     assert outcome.gate_rows is my_sink
 

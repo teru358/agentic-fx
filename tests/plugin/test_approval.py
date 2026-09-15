@@ -27,6 +27,7 @@ from agentic_fx.config import load_settings
 from agentic_fx import entry
 from agentic_fx.entry import main
 from agentic_fx.plugin import approval
+from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin.gate_pytest import GateResult
 from agentic_fx.plugin.loader import PluginMeta, content_hash as real_content_hash
 from agentic_fx.plugin.resolve import ResolvedIndicatorSet
@@ -77,6 +78,12 @@ def test_placeholder():
 @pytest.fixture(scope="module")
 def settings():
     return load_settings(_EXAMPLE)
+
+
+# [indicator-consumption-wiring] T4a Step 4-1a: プランのテスト片は
+# `settings` フィクスチャを取らず module-level 定数 `SETTINGS` を直接
+# 使う形で書かれている (T3 report の逸脱と同じ機械的対応)。
+SETTINGS = load_settings(_EXAMPLE)
 
 
 def _conn(tmp_path: Path) -> sqlite3.Connection:
@@ -1052,3 +1059,99 @@ def test_entry_plugin_submit_validation_failure_rc1(tmp_path, monkeypatch, capsy
     assert rc == 1
     run_service.assert_not_called()
     assert "エラー" in capsys.readouterr().err
+
+
+# --- [indicator-consumption-wiring] T4: 未解決の非送出 (F3) ---------------
+
+from agentic_fx.plugin.resolve import (
+    ApprovedInventory, InventoryBuildResult, ResolvedIndicatorSet,
+)
+from tests.fixtures import indicator_wiring as fx
+
+
+def _empty_inventory(root):
+    return InventoryBuildResult(
+        inventory=ApprovedInventory(root=root, metas=()),
+        phase1_metas=(), resolved={}, rejected_strategies=())
+
+
+def test_run_kind_gate_returns_indicator_unresolved_without_raising(tmp_path):
+    """F3: 未解決は例外ではなく判別子で返る。行数は不変。"""
+    conn = _conn(tmp_path)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    cand = fx.write_rsi_pullback(tmp_path / "cand", pins=None)
+    meta, reason = plugin_loader.discover_one_with_reason(cand, "rsi_pullback")
+    assert reason is None
+    before = conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0]
+
+    outcome = approval.run_kind_gate(
+        conn, meta, settings=SETTINGS, now=fx.NOW,
+        inventory=_empty_inventory(root))
+
+    assert outcome.verdict_kind == "indicator_unresolved"
+    assert outcome.indicator_alias == "rsi"
+    assert outcome.indicator_reason == "not_found"
+    assert outcome.resolved is None
+    assert outcome.gate_rows == [] or tuple(outcome.gate_rows) == ()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 0
+
+
+def test_run_kind_gate_unpinned_is_indicator_unresolved_under_require(tmp_path):
+    """F3': require では unpinned が reason='unpinned'。"""
+    conn = _conn(tmp_path)
+    root = tmp_path / "plugins"
+    fx.write_indicator(root, "rsi")
+    inv_meta, _ = plugin_loader.discover_one_with_reason(root / "rsi", "rsi")
+    inventory = InventoryBuildResult(
+        inventory=ApprovedInventory(root=root.resolve(), metas=(inv_meta,)),
+        phase1_metas=(inv_meta,), resolved={}, rejected_strategies=())
+    cand = fx.write_rsi_pullback(tmp_path / "cand", pins=None)
+    meta, _ = plugin_loader.discover_one_with_reason(cand, "rsi_pullback")
+
+    outcome = approval.run_kind_gate(conn, meta, settings=SETTINGS, now=fx.NOW,
+                                     inventory=inventory)
+
+    assert outcome.verdict_kind == "indicator_unresolved"
+    assert (outcome.indicator_alias, outcome.indicator_reason) == ("rsi", "unpinned")
+
+
+def test_run_kind_gate_resolves_once_and_carries_the_same_object(tmp_path,
+                                                                 monkeypatch):
+    """P3': resolver 呼び出しは候補ごとに 1 回。GateOutcome.resolved と
+    in_sample/holdout session が同一オブジェクト。"""
+    conn = _conn(tmp_path)
+    root = tmp_path / "plugins"
+    fx.write_indicator(root, "rsi")
+    inv_meta, _ = plugin_loader.discover_one_with_reason(root / "rsi", "rsi")
+    from agentic_fx.plugin.loader import content_hash
+    inventory = InventoryBuildResult(
+        inventory=ApprovedInventory(root=root.resolve(), metas=(inv_meta,)),
+        phase1_metas=(inv_meta,), resolved={}, rejected_strategies=())
+    cand = fx.write_rsi_pullback(tmp_path / "cand",
+                                 pins={"rsi": content_hash(root / "rsi")})
+    meta, _ = plugin_loader.discover_one_with_reason(cand, "rsi_pullback")
+
+    calls = []
+    real = approval.resolve_indicator_deps
+
+    def _spy(*args, **kwargs):
+        calls.append(kwargs.get("pin_mode"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(approval, "resolve_indicator_deps", _spy)
+    seen = []
+    monkeypatch.setattr(
+        approval.strategy_gate, "evaluate_strategy_adoption_gate",
+        lambda conn_, **kw: seen.append(kw["resolved"]) or
+        approval.strategy_gate.StrategyGateVerdict(
+            evaluable=True, candidate_metrics={"USDJPY": {"trades": 40}}))
+
+    outcome = approval.run_kind_gate(conn, meta, settings=SETTINGS, now=fx.NOW,
+                                     inventory=inventory)
+
+    assert calls == ["require"]
+    assert outcome.resolved is seen[0]
