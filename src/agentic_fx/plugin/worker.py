@@ -14,36 +14,54 @@ pandas` 自体が plugin コードと同じ資源制約の外で走ってしま�
    プロセス/スレッド数 (RLIMIT_NPROC) の上限を設定する
 2. `socket`/`urllib`/`http` を `sys.modules` にダミー登録して塞ぐ
    (plugin.py が import する前に、でなければ意味が無い)
-3. `plugin.py` を 1 回だけ import する (以後、同じモジュールオブジェクト
-   を全 call で使い回す — セッション型 IPC の要)
-4. stdin から JSON 1 行を読むたびに、handshake で指定された kind に対応
-   する関数 (compute/detect/evaluate) を呼び、結果を JSON 1 行で返す
+3. `plugin.py` (main kind) と、strategy の場合は同居する indicator の
+   `plugin.py` 群を、それぞれ一意なモジュール名で import する (以後、
+   同じモジュールオブジェクトを全 call で使い回す — セッション型 IPC の要)
+4. stdin から JSON 1 行を読むたびに、main kind に対応する関数
+   (compute/detect/evaluate) を呼ぶ。strategy の場合は呼ぶ前に同居
+   indicator を `compute` → 共通 validator → 親 df.index へ整列した
+   `indicators` 引数を組み立てる。結果を JSON 1 行で返す
+5. `{"op": "close"}` を受け取ったら `cpu_sec` を添えて応答し終了する
+   (graceful close)
 
 **worker はこのプロセス自身が信頼境界の内側寄りの実行体である** —
 kind 別の戻り値スキーマ検証 (`bar_ts` 拒否、`StrategyDecision` 構築等)
-は一切ここでは行わない。すべて親プロセス (`sandbox.py`) の責務。worker
-は plugin が返した生の値をそのまま JSON にして返すだけであり、JSON化
-に失敗する値 (numpy スカラー等、plugin 作者が `float()` で明示変換し
-忘れた場合) はここで構造化エラーとして報告する。
+は一切ここでは行わない。すべて親プロセス (`sandbox.py`) の責務。**ただし
+indicator の戻り値検証だけは例外** — 同居 indicator の compute 結果は
+`core.plugin_contract.validate_indicator_result` (worker/sandbox の両方が
+import する唯一の実装) を worker 内でも通す。strategy に渡す前に
+不正な indicator 出力を弾く必要があるため。worker は plugin が返した
+生の値をそのまま JSON にして返すだけであり、JSON 化に失敗する値
+(numpy スカラー等、plugin 作者が `float()` で明示変換し忘れた場合) は
+ここで構造化エラーとして報告する。
 
 **ワイヤ形式は `sandbox.py` と対の契約** (変更する場合は両方のモジュール
 docstring を同期すること):
 
 - handshake (最初の 1 行、親から):
-  `{"cpu_sec": int, "memory_mb": int, "nofile": int, "fsize_mb": int, "kind": "indicator"|"signal"|"strategy"}`
+  `{"cpu_sec": int, "memory_mb": int, "nofile": int, "fsize_mb": int,
+    "kind": "indicator"|"signal"|"strategy",
+    "outputs": [...]|null,          # kind == "indicator" のときのみ存在
+    "indicators": [{"alias","plugin_py","params","max_bars","outputs"}]}
+  (`indicators` は strategy のみ非空。indicator/signal は常に `[]`)
 - ready (handshake への応答、plugin.py の import 成功後に送る):
   `{"ok": true, "ready": true, "pid": int}` /
   `{"ok": false, "ready": false, "error": "<message>"}`
 - request (call() のたびに親から):
-  kind=indicator/signal → `{"df": <df wire>, "params": {...}}`
-  kind=strategy         → `{"df": <df wire>, "indicators": {...},
-                            "signals": [...], "params": {...}}`
+  `{"df": <df wire>, "params": {...}}` (indicator/signal/strategy 共通。
+  strategy の `indicators`/`signals` は worker 内で計算・`None` 固定に
+  なったため、もう request には乗らない)
   df wire: `{"index": [iso8601 str, ...], "open": [...], "high": [...],
             "low": [...], "close": [...], "volume": [...]}`
   (float は JSON 往復で bit-exact — CPython の shortest-roundtrip repr)
+- close request (親から、セッション終了時): `{"op": "close"}`
+- close response: `{"ok": true, "cpu_sec": <float>, "pid": int}`
 - response (request 1 件につき 1 行):
   `{"ok": true, "result": <plugin の生の戻り値>, "pid": int}` /
   `{"ok": false, "error": "<message>", "pid": int}`
+  kind == "indicator" の main plugin 応答の `result` は standalone wire
+  形式 (`{key: float|null | {"series": [float|null, ...]}}`)。strategy の
+  `result` は `evaluate()` の生の戻り値 (スキーマ検証は親側)。
 
 脅威モデルは `sandbox.py` のモジュール docstring を参照 (構文名ベースの
 静的検査・resource limit は善意の plugin コードの事故防止が目的であり、
@@ -132,16 +150,35 @@ def _poison_network_modules() -> None:
         sys.modules[name] = _BlockedModule()  # type: ignore[assignment]
 
 
-def _import_plugin(plugin_dir: str):
+def _import_plugin_as(module_name: str, plugin_path: str):
+    """`plugin.py` を **一意なモジュール名**で import する。strategy と
+    同居する indicator を `"plugin"` 固定名で import すると sys.modules が
+    衝突して 2 本目以降が 1 本目に化ける。"""
     import importlib.util
 
-    plugin_path = os.path.join(plugin_dir, "plugin.py")
-    spec = importlib.util.spec_from_file_location("plugin", plugin_path)
+    spec = importlib.util.spec_from_file_location(module_name, plugin_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load plugin module from {plugin_path!r}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _import_plugin(plugin_dir: str):
+    return _import_plugin_as("plugin", os.path.join(plugin_dir, "plugin.py"))
+
+
+def _deep_copy_json(obj):
+    """params の deep copy (call ごとに独立。nested mutation を次 call へ
+    持ち越さない — codex r3 C3)。params は JSON-safe が loader/resolver で
+    保証済みなので json 往復で足りる。"""
+    return json.loads(json.dumps(obj))
+
+
+def _cpu_sec() -> float:
+    import resource as _res
+    usage = _res.getrusage(_res.RUSAGE_SELF)
+    return float(usage.ru_utime + usage.ru_stime)
 
 
 _KIND_FUNC = {"indicator": "compute", "signal": "detect", "strategy": "evaluate"}
@@ -163,7 +200,7 @@ def _read_line() -> dict[str, Any] | None:
 
 
 def _write_line(stream: Any, obj: dict[str, Any]) -> None:
-    stream.write(json.dumps(obj).encode("utf-8") + b"\n")
+    stream.write(json.dumps(obj, allow_nan=False).encode("utf-8") + b"\n")
     stream.flush()
 
 
@@ -183,6 +220,26 @@ def _protect_protocol_stdout() -> Any:
     protocol_out = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     return protocol_out
+
+
+def _indicator_result_to_wire(validated: dict) -> dict:
+    """standalone (`get_indicators`) 応答の wire 表現。
+    スカラーは float、系列は `{"series": [float|null, ...]}`。
+    NaN は `null` にしてから送る (親は allow_nan=False で読める形)。"""
+    import math
+
+    import pandas as pd
+
+    out: dict = {}
+    for key, value in validated.items():
+        if isinstance(value, pd.Series):
+            out[key] = {"series": [None if pd.isna(v) else float(v)
+                                   for v in value.tolist()]}
+        elif isinstance(value, list):
+            out[key] = {"series": [None if v is None else float(v) for v in value]}
+        else:
+            out[key] = None if math.isnan(float(value)) else float(value)
+    return out
 
 
 def main() -> None:
@@ -205,6 +262,16 @@ def main() -> None:
         kind = handshake["kind"]
         func_name = _KIND_FUNC[kind]
         fn = getattr(plugin_module, func_name)
+        main_outputs = handshake.get("outputs") if kind == "indicator" else None
+        # 同居 indicator (strategy のみ非空)。alias 順で来る。
+        deps = []
+        for spec in handshake.get("indicators") or []:
+            module = _import_plugin_as(f"indicator_{spec['alias']}",
+                                       spec["plugin_py"])
+            deps.append({
+                "alias": spec["alias"], "compute": getattr(module, "compute"),
+                "params": spec["params"], "max_bars": int(spec["max_bars"]),
+                "outputs": tuple(spec["outputs"])})
     except Exception as exc:  # noqa: BLE001 — 起動失敗を構造化エラーで報告
         _write_line(protocol_out, {"ok": False, "ready": False,
                     "error": f"{type(exc).__name__}: {exc}", "pid": pid})
@@ -212,17 +279,48 @@ def main() -> None:
 
     _write_line(protocol_out, {"ok": True, "ready": True, "pid": pid})
 
+    import pandas as pd
+    import numpy as np
+    from agentic_fx.core.plugin_contract import validate_indicator_result
+
+    baseline_chained = pd.get_option("mode.chained_assignment")
+    baseline_errstate = dict(np.geterr())
+
     while True:
         request = _read_line()
         if request is None:
             return
+        # graceful close (設計書 §2.4): 親が {"op": "close"} を送る。
+        if request.get("op") == "close":
+            _write_line(protocol_out,
+                        {"ok": True, "cpu_sec": _cpu_sec(), "pid": pid})
+            return
         try:
             df = _wire_to_df(request["df"])
+            params = _deep_copy_json(request["params"])
             if kind == "strategy":
-                result = fn(df, request["indicators"], request["signals"],
-                           request["params"])
+                indicators = {}
+                for dep in deps:
+                    sub_df = df.tail(dep["max_bars"]).copy(deep=True)
+                    raw = dep["compute"](sub_df, _deep_copy_json(dep["params"]))
+                    validated = validate_indicator_result(
+                        raw, df_index=sub_df.index, outputs=dep["outputs"])
+                    indicators[dep["alias"]] = {
+                        key: (value.reindex(df.index)
+                              if isinstance(value, pd.Series) else value)
+                        for key, value in validated.items()}
+                # グローバル状態の不変 assert (設計書 §2.4、V2)
+                if (pd.get_option("mode.chained_assignment") != baseline_chained
+                        or dict(np.geterr()) != baseline_errstate):
+                    raise RuntimeError(
+                        "indicator mutated shared pandas/numpy global state")
+                result = fn(df, indicators, None, params)
             else:
-                result = fn(df, request["params"])
+                result = fn(df, params)
+                if kind == "indicator":
+                    result = _indicator_result_to_wire(
+                        validate_indicator_result(result, df_index=df.index,
+                                                  outputs=main_outputs))
             _write_line(protocol_out, {"ok": True, "result": result, "pid": pid})
         except Exception as exc:  # noqa: BLE001 — トレースバックを stdout
             # プロトコルに乗せない (worker-side エラーは構造化 1 行で

@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from agentic_fx.config import PluginSettings
+    from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 
 
 class SandboxError(Exception):
@@ -272,7 +273,7 @@ def _build_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
 _KIND_PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
     "indicator": ("df", "params"),
     "signal": ("df", "params"),
-    "strategy": ("df", "indicators", "signals", "params"),
+    "strategy": ("df", "params"),
 }
 
 # セッション起動 (handshake → ready 応答) を待つ固定タイムアウト。
@@ -294,7 +295,8 @@ class PluginSession:
     繰り返し呼べるセッション。context manager として使う。
     """
 
-    def __init__(self, meta: PluginMeta, *, settings: "PluginSettings") -> None:
+    def __init__(self, meta: PluginMeta, *, settings: "PluginSettings",
+                 resolved: "ResolvedIndicatorSet | None" = None) -> None:
         """`settings` は **`config.Settings` 全体ではなく `Settings.plugin`
         (`PluginSettings`) を渡す** — brief の記法 (`*, settings`) は
         アプリ全体設定を指しているとも読めるが、サンドボックスをアプリの
@@ -303,16 +305,32 @@ class PluginSession:
         を渡す形を fail-closed 側の設計判断として採用する (呼び出し側の
         取り違えは型で検出できる — `Settings` を渡すと属性アクセスで
         即座に `AttributeError` になる)。
-        """
+
+        `resolved` は strategy kind で**必須** (依存なしでも
+        `ResolvedIndicatorSet.empty(root)`)。indicator/signal は `None`。
+        セッションは内部で再解決しない — 解決は composition root の責務
+        (設計書 §2.3)。"""
         self._meta = meta
         self._settings = settings
+        self._resolved = resolved
         self._proc: subprocess.Popen | None = None
         self._dead = False
+        self._cpu_sec: float | None = None
         self.pid: int | None = None
         # プラン 8 B 束: PluginSession は単一スレッド所有が前提
         # (全使用箇所が単一スレッド — ロックは追加しない)。construction
         # したスレッドを記録し、実行時 assert で境界越えを検出する。
         self._owner_thread = threading.get_ident()
+
+    @property
+    def cpu_sec(self) -> float | None:
+        """worker の累積 CPU 秒。**`close()` 完了後に確定する** —
+        **正常終了・plugin error 後はいずれも float** (plugin コード自身の例外は
+        セッションを `_dead` にしない既存契約なので graceful close が成立する)。
+        **`None` は 2 経路のみ**: SIGKILL fallback (timeout 後の強制終了) と、
+        `__enter__` 失敗による worker 未起動 (設計書 v1.4 §6 C1、ユーザー裁定 ④)。
+        """
+        return self._cpu_sec
 
     def _check_owner_thread(self) -> None:
         current = threading.get_ident()
@@ -363,6 +381,46 @@ class PluginSession:
                     "discovery (hash mismatch) — refusing to execute "
                     f"(expected {self._meta.content_hash}, got {current_hash})")
             check_source(self._meta.path / "plugin.py")
+
+            if self._meta.kind == "strategy" and self._resolved is None:
+                raise SandboxError(
+                    f"plugin {self._meta.name!r}: strategy session requires "
+                    "a resolved indicator set (resolved=...)")
+            # codex plan r2 束1 Minor: 契約は片方向だけでは不十分 —
+            # strategy は `resolved` 必須 (上記) だが、indicator/signal は
+            # `resolved` を**受け取ってはいけない** (`None` 固定)。ここを
+            # 検査しないと、indicator/signal に誤って `ResolvedIndicatorSet`
+            # を渡す呼び出しが静かに通り、依存情報 (indicator の実体パス等)
+            # が handshake に混入し得る (kind 別の契約が片方向にしか pin
+            # されていなかった)。
+            if self._meta.kind != "strategy" and self._resolved is not None:
+                raise SandboxError(
+                    f"plugin {self._meta.name!r}: kind={self._meta.kind!r} "
+                    "session must not receive a resolved indicator set "
+                    "(resolved= is strategy-only)")
+            indicator_specs: list[dict] = []
+            if self._resolved is not None:
+                inventory_root = Path(self._resolved.inventory_root).resolve()
+                for item in self._resolved.items:
+                    real = Path(item.plugin_py).resolve()
+                    try:
+                        real.relative_to(inventory_root)
+                    except ValueError:
+                        raise SandboxError(
+                            f"indicator {item.plugin_name!r} resolves outside "
+                            f"inventory_root ({real})") from None
+                    current = content_hash(real.parent)
+                    if current != item.content_hash:
+                        raise SandboxError(
+                            f"indicator {item.plugin_name!r}: content changed "
+                            "since resolution (hash mismatch) — refusing to "
+                            f"execute (expected {item.content_hash}, got {current})")
+                    check_source(real)
+                indicator_specs = self._resolved.handshake_items()
+                # 検査済みの実体パスだけを handshake に載せる
+                for spec, item in zip(indicator_specs, self._resolved.items):
+                    spec["plugin_py"] = str(Path(item.plugin_py).resolve())
+
             env = _build_env()
             self._proc = subprocess.Popen(
                 [sys.executable, "-m", "agentic_fx.plugin.worker",
@@ -377,7 +435,17 @@ class PluginSession:
                 "nofile": self._settings.sandbox_nofile,
                 "fsize_mb": self._settings.sandbox_fsize_mb,
                 "kind": self._meta.kind,
+                "indicators": indicator_specs,
             }
+            # [indicator-consumption-wiring] §2.4 (codex plan r1 M5):
+            # `outputs` は **kind == "indicator" のときだけ**載せる契約
+            # (設計書 §2.4 / codex 設計 r7 M1)。辞書リテラルに直接書くと
+            # strategy / signal にもキー自体 (`null`) が届き、契約が
+            # 「常に存在する nullable キー」に変質する。**分岐で足す**。
+            if self._meta.kind == "indicator":
+                handshake["outputs"] = (list(self._meta.outputs)
+                                        if self._meta.outputs is not None
+                                        else None)
             self._write_line(handshake)
 
             response = self._read_response(_STARTUP_TIMEOUT_SEC, _STARTUP_MAX_BYTES)
@@ -597,10 +665,12 @@ def _reader_worker(stream: Any, max_bytes: int,
 
 def run_plugin(meta: PluginMeta, payload: dict[str, Any], *,
                timeout_sec: float | None = None,
-               settings: "PluginSettings") -> dict[str, Any]:
+               settings: "PluginSettings",
+               resolved: "ResolvedIndicatorSet | None" = None) -> dict[str, Any]:
     """「セッション 1 回だけ」の薄いラッパ (producer 等の単発評価用)。
     バックテストのように同一 plugin を大量に評価する場合は `PluginSession`
-    を直接使い、プロセス起動コストを 1 回に償却すること。
+    を直接使い、プロセス起動コストを 1 回に償却すること。`resolved` は
+    `PluginSession` にそのまま転送する (strategy kind で必須)。
     """
     eff_settings = settings
     if timeout_sec is not None:
@@ -615,7 +685,7 @@ def run_plugin(meta: PluginMeta, payload: dict[str, Any], *,
             raise SandboxError(
                 f"timeout_sec must be a finite positive number, got {timeout_sec!r}")
         eff_settings = settings.model_copy(update={"sandbox_timeout_sec": timeout_sec})
-    with PluginSession(meta, settings=eff_settings) as session:
+    with PluginSession(meta, settings=eff_settings, resolved=resolved) as session:
         return session.call(payload)
 
 

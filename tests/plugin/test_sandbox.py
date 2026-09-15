@@ -705,8 +705,8 @@ def test_strategy_exit_action_rejected(tmp_path, plugin_settings):
     meta = _meta(tmp_path, "strat", "strategy", STRATEGY_EXIT_PY,
                 timeframe="1h", pairs=("USDJPY",))
     with pytest.raises(SandboxError):
-        run_plugin(meta, {"df": _df(), "indicators": {}, "signals": [], "params": {}},
-                  settings=plugin_settings)
+        run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings,
+                  resolved=ResolvedIndicatorSet.empty(tmp_path))
 
 
 # --- ⑧ open で stop_loss 無し → SandboxError ------------------------------
@@ -715,15 +715,15 @@ def test_strategy_open_without_stop_loss_rejected(tmp_path, plugin_settings):
     meta = _meta(tmp_path, "strat", "strategy", STRATEGY_OPEN_NO_SL_PY,
                 timeframe="1h", pairs=("USDJPY",))
     with pytest.raises(SandboxError):
-        run_plugin(meta, {"df": _df(), "indicators": {}, "signals": [], "params": {}},
-                  settings=plugin_settings)
+        run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings,
+                  resolved=ResolvedIndicatorSet.empty(tmp_path))
 
 
 def test_strategy_open_happy_path(tmp_path, plugin_settings):
     meta = _meta(tmp_path, "strat", "strategy", STRATEGY_OPEN_OK_PY,
                 timeframe="1h", pairs=("USDJPY",))
-    out = run_plugin(meta, {"df": _df(), "indicators": {}, "signals": [], "params": {}},
-                     settings=plugin_settings)
+    out = run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings,
+                     resolved=ResolvedIndicatorSet.empty(tmp_path))
     assert out["action"] == "open"
     assert out["direction"] == "long"
     assert out["entry_type"] == "market"
@@ -733,8 +733,8 @@ def test_strategy_open_happy_path(tmp_path, plugin_settings):
 def test_strategy_hold_happy_path(tmp_path, plugin_settings):
     meta = _meta(tmp_path, "strat", "strategy", STRATEGY_HOLD_PY,
                 timeframe="1h", pairs=("USDJPY",))
-    out = run_plugin(meta, {"df": _df(), "indicators": {}, "signals": [], "params": {}},
-                     settings=plugin_settings)
+    out = run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings,
+                     resolved=ResolvedIndicatorSet.empty(tmp_path))
     assert out["action"] == "hold"
 
 
@@ -745,8 +745,8 @@ def test_strategy_rationale_at_2000_chars_accepted(tmp_path, plugin_settings):
     meta = _meta(tmp_path, "strat_rat_ok", "strategy", STRATEGY_RATIONALE_LEN_PY,
                 timeframe="1h", pairs=("USDJPY",))
     out = run_plugin(
-        meta, {"df": _df(), "indicators": {}, "signals": [],
-              "params": {"rationale_len": 2000}}, settings=plugin_settings)
+        meta, {"df": _df(), "params": {"rationale_len": 2000}},
+        settings=plugin_settings, resolved=ResolvedIndicatorSet.empty(tmp_path))
     assert len(out["rationale"]) == 2000
 
 
@@ -755,8 +755,8 @@ def test_strategy_rationale_over_2000_chars_rejected(tmp_path, plugin_settings):
                 timeframe="1h", pairs=("USDJPY",))
     with pytest.raises(SandboxError, match="rationale exceeds max length"):
         run_plugin(
-            meta, {"df": _df(), "indicators": {}, "signals": [],
-                  "params": {"rationale_len": 2001}}, settings=plugin_settings)
+            meta, {"df": _df(), "params": {"rationale_len": 2001}},
+            settings=plugin_settings, resolved=ResolvedIndicatorSet.empty(tmp_path))
 
 
 # --- signal: happy path + bar_ts 拒否 (denylist mutation ガード) ----------
@@ -843,7 +843,226 @@ def test_sample_sma_cross_passes_check_source_and_runs(plugin_settings):
         {"open": closes, "high": closes, "low": closes, "close": closes,
          "volume": [1.0] * len(closes)}, index=idx)
     out = run_plugin(
-        meta, {"df": df, "indicators": {}, "signals": [], "params": meta.params},
-        settings=plugin_settings)
+        meta, {"df": df, "params": meta.params},
+        settings=plugin_settings, resolved=ResolvedIndicatorSet.empty(plugin_dir.parent))
     assert out["action"] == "open"
     assert out["direction"] == "long"
+
+
+# --- [indicator-consumption-wiring] T2: 同居実行 --------------------------
+
+from agentic_fx.plugin.resolve import (
+    ResolvedIndicator, ResolvedIndicatorSet, freeze_params,
+)
+
+RSI_SERIES_PY = """
+from __future__ import annotations
+
+import pandas as pd
+
+
+def compute(df, params):
+    period = int(params.get("period", 14))
+    close = df["close"].astype(float)
+    delta = close.diff()
+    gain = delta.clip(lower=0.0).ewm(alpha=1.0 / period, adjust=False,
+                                     min_periods=period).mean()
+    loss = (-delta.clip(upper=0.0)).ewm(alpha=1.0 / period, adjust=False,
+                                        min_periods=period).mean()
+    rs = gain / loss
+    out = 100.0 - (100.0 / (1.0 + rs))
+    out = out.where(loss != 0.0, 100.0)
+    out = out.where(~((gain == 0.0) & (loss == 0.0)), 50.0)
+    return {"rsi": out}
+"""
+
+STRATEGY_READS_INDICATORS_PY = """
+def evaluate(df, indicators, signals, params):
+    r = indicators["rsi"]["rsi"]
+    return {"action": "hold",
+            "rationale": f"len={len(r)} last={float(r.iloc[-1]):.4f} "
+                         f"signals={signals!r} keys={sorted(indicators)}"}
+"""
+
+MUTATOR_INDICATOR_PY = """
+import pandas as pd
+
+
+def compute(df, params):
+    df["close"] = 0.0
+    params["nested"]["x"].append(999)
+    return {"v": pd.Series([float(len(params["nested"]["x"]))] * len(df),
+                           index=df.index)}
+"""
+
+
+def _indicator_dir(base, name, plugin_py, *, outputs=("v",), params=None,
+                   max_bars=200):
+    import yaml
+    d = base / name
+    d.mkdir(parents=True)
+    (d / "plugin.py").write_text(plugin_py)
+    (d / "config.yaml").write_text(yaml.safe_dump(
+        {"kind": "indicator", "outputs": list(outputs),
+         "params": params or {}, "max_bars": max_bars}, sort_keys=False))
+    (d / "test_plugin.py").write_text("def test_placeholder():\n    pass\n")
+    return d
+
+
+def _resolved(root, *entries):
+    """entries = [(alias, dir, outputs, params, max_bars)]
+
+    opus r1 C5 是正: `ResolvedIndicator` は 8 フィールド全てが既定値なしの
+    必須引数 (`@dataclass(frozen=True, slots=True)`、Step 1-3 の Produces)
+    なので `pinned=` を落とすと `TypeError: __init__() missing 1 required
+    positional argument: 'pinned'` で本ヘルパを使う 6 テストが全滅する。
+    同 task の `tests/plugin/test_indicator_containment.py` 側は
+    `pinned=True` を渡しており、こちらが転写ミスだった。
+    """
+    from agentic_fx.plugin.loader import content_hash as _ch
+    items = tuple(sorted(
+        (ResolvedIndicator(alias=a, plugin_name=d.name, plugin_py=d / "plugin.py",
+                           content_hash=_ch(d), params=freeze_params(p),
+                           max_bars=mb, outputs=tuple(o), pinned=True)
+         for a, d, o, p, mb in entries), key=lambda i: i.alias))
+    return ResolvedIndicatorSet(inventory_root=root.resolve(), items=items,
+                                all_pinned=True)
+
+
+def test_strategy_receives_indicator_series_from_same_worker(tmp_path,
+                                                             plugin_settings):
+    root = tmp_path / "plugins"
+    rsi_dir = _indicator_dir(root, "rsi", RSI_SERIES_PY, outputs=("rsi",),
+                             params={"period": 14})
+    meta = _meta(tmp_path, "strat", "strategy", STRATEGY_READS_INDICATORS_PY,
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("rsi", rsi_dir, ("rsi",), {"period": 14}, 200))
+    df = _df(40)
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as s:
+        out = s.call({"df": df, "params": {}})
+    assert out["action"] == "hold"
+    assert f"len={len(df)}" in out["rationale"]
+    assert "keys=['rsi']" in out["rationale"]
+    # N1: signals は依然 None
+    assert "signals=None" in out["rationale"]
+
+
+def test_indicator_mutation_does_not_leak_across_calls_or_to_strategy(
+        tmp_path, plugin_settings):
+    """V2: df / params (nested) の書き換えが strategy にも次回 call にも届かない。"""
+    root = tmp_path / "plugins"
+    mut_dir = _indicator_dir(root, "mut", MUTATOR_INDICATOR_PY,
+                             params={"nested": {"x": [1]}})
+    meta = _meta(tmp_path, "strat2", "strategy", """
+def evaluate(df, indicators, signals, params):
+    return {"action": "hold",
+            "rationale": f"close0={float(df['close'].iloc[0]):.2f} "
+                         f"v={float(indicators['mut']['v'].iloc[-1]):.0f} "
+                         f"p={params['keep']}"}
+""", timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("mut", mut_dir, ("v",), {"nested": {"x": [1]}}, 200))
+    df = _df(10)
+    first_close = float(df["close"].iloc[0])
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as s:
+        out1 = s.call({"df": df, "params": {"keep": [1]}})
+        out2 = s.call({"df": df, "params": {"keep": [1]}})
+    # indicator が書き換えた close は strategy に届かない
+    assert f"close0={first_close:.2f}" in out1["rationale"]
+    # 次回 call でも params は元の 1 要素から始まる (v=2 が 2 回)
+    assert "v=2" in out1["rationale"] and "v=2" in out2["rationale"]
+    assert "p=[1]" in out1["rationale"] and "p=[1]" in out2["rationale"]
+    # 親側の df も無傷
+    assert float(df["close"].iloc[0]) == first_close
+
+
+def test_indicator_failure_becomes_sandbox_error(tmp_path, plugin_settings):
+    root = tmp_path / "plugins"
+    bad = _indicator_dir(root, "bad", "def compute(df, params):\n    raise ValueError('boom')\n")
+    meta = _meta(tmp_path, "strat3", "strategy", STRATEGY_READS_INDICATORS_PY,
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("bad", bad, ("v",), {}, 200))
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as s:
+        with pytest.raises(SandboxError, match="boom"):
+            s.call({"df": _df(10), "params": {}})
+
+
+def test_indicator_output_set_mismatch_becomes_sandbox_error(tmp_path,
+                                                             plugin_settings):
+    """V1: outputs 集合不一致は親に SandboxError として届く。"""
+    root = tmp_path / "plugins"
+    wrong = _indicator_dir(root, "wrong",
+                           "def compute(df, params):\n    return {'other': 1.0}\n",
+                           outputs=("v",))
+    meta = _meta(tmp_path, "strat4", "strategy", STRATEGY_READS_INDICATORS_PY,
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("wrong", wrong, ("v",), {}, 200))
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as s:
+        with pytest.raises(SandboxError, match="outputs"):
+            s.call({"df": _df(10), "params": {}})
+
+
+def test_indicator_tail_is_clamped_to_its_own_max_bars(tmp_path, plugin_settings):
+    root = tmp_path / "plugins"
+    counter = _indicator_dir(
+        root, "cnt",
+        "import pandas as pd\n"
+        "def compute(df, params):\n"
+        "    return {'v': pd.Series([float(len(df))] * len(df), index=df.index)}\n",
+        max_bars=5)
+    meta = _meta(tmp_path, "strat5", "strategy", """
+def evaluate(df, indicators, signals, params):
+    v = indicators["cnt"]["v"]
+    return {"action": "hold",
+            "rationale": f"n={len(v)} head={'nan' if v.isna().iloc[0] else 'val'} "
+                         f"last={float(v.iloc[-1]):.0f}"}
+""", timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("cnt", counter, ("v",), {}, 5))
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as s:
+        out = s.call({"df": _df(20), "params": {}})
+    # 系列は strategy の df.index (20 本) に左 NaN 埋めで整列される
+    assert "n=20" in out["rationale"]
+    assert "head=nan" in out["rationale"]
+    assert "last=5" in out["rationale"]      # indicator は 5 本だけ見た
+
+
+def test_handshake_omits_outputs_key_for_non_indicator_kind(tmp_path,
+                                                             plugin_settings,
+                                                             monkeypatch):
+    """[indicator-consumption-wiring] T2: `outputs` は kind == "indicator"
+    のときだけ handshake に載る契約 (codex plan r1 M5)。strategy の
+    handshake には `"outputs"` キー自体が存在しないことを pin する。"""
+    meta = _meta(tmp_path, "strat_hs", "strategy", STRATEGY_HOLD_PY,
+                timeframe="1h", pairs=("USDJPY",))
+    resolved = ResolvedIndicatorSet.empty(tmp_path)
+    sent: list[dict] = []
+    session = PluginSession(meta, settings=plugin_settings, resolved=resolved)
+    real_write_line = session._write_line
+
+    def _spy(obj):
+        sent.append(obj)
+        real_write_line(obj)
+
+    monkeypatch.setattr(session, "_write_line", _spy)
+    with session:
+        pass
+    assert sent, "handshake was never sent"
+    assert "outputs" not in sent[0]
+
+
+def test_handshake_includes_outputs_key_for_indicator_kind(tmp_path,
+                                                            plugin_settings,
+                                                            monkeypatch):
+    meta = _meta(tmp_path, "ind_hs", "indicator", INDICATOR_OK_PY)
+    sent: list[dict] = []
+    session = PluginSession(meta, settings=plugin_settings)
+    real_write_line = session._write_line
+
+    def _spy(obj):
+        sent.append(obj)
+        real_write_line(obj)
+
+    monkeypatch.setattr(session, "_write_line", _spy)
+    with session:
+        pass
+    assert sent, "handshake was never sent"
+    assert "outputs" in sent[0]
