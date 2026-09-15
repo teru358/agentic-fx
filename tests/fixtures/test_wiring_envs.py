@@ -220,6 +220,23 @@ def test_stage_switched_journal_reconciles_to_decided_when_pin_intact(tmp_path):
     old_target, new_target, approval_id, op_id = env.stage_switched_journal(
         conn, plugins_root, name="rsi_pullback",
         pins={"rsi": hashes["rsi"]}, now=fx.NOW)
+    # advisor 指摘: 段 0 変異 (c) (`advance_switch_journal(..., commit=True)`
+    # の `commit=True` 除去) は、同一 conn 上の直後の SELECT では
+    # read-your-own-writes により検出できない (sqlite3 の同一コネクション内
+    # 可視性はコミット有無に依らない)。`commit=True` の契約は「別コネクション
+    # からも見える (= 実際にディスクへ永続化されている)」ことなので、ここで
+    # 別コネクションから `phase == "switched"` が見えることを検査する。
+    from agentic_fx.store.db import connect_readonly
+    other_conn = connect_readonly((tmp_path / "l") / "data" / "agentic.db")
+    try:
+        other_row = other_conn.execute(
+            "SELECT phase FROM plugin_switch_journal WHERE op_id = ?",
+            (op_id,)).fetchone()
+        assert other_row[0] == "switched", (
+            "別コネクションから phase='switched' が見えない — "
+            "advance_switch_journal(commit=True) が効いていない疑い")
+    finally:
+        other_conn.close()
     # 現物は `reconcile_switch_journals(conn, *, plugins_root, now, settings,
     # activity=None, force_revert_op_id=None)` (着手時に
     # `rg -n 'def reconcile_switch_journals' -A 5 src/agentic_fx/plugin/switch.py`
