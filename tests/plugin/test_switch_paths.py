@@ -1541,3 +1541,30 @@ def test_indicator_with_outputs_passes_the_gate(tmp_path):
         candidate_origin="human", mission_id=None, backlog_id=None,
         settings=SETTINGS, now=fx.NOW)
     assert approval_id > 0
+
+
+def test_submit_candidate_rejects_dependency_without_outputs(tmp_path):
+    """U4b (承認経路): `outputs` 宣言なしの配備済 indicator に依存する
+    strategy は `indicator_unresolved:<alias>:outputs_undeclared` で拒否
+    される。"""
+    conn, plugins_root = _switch_env(tmp_path)
+    legacy = plugins_root / "rsi"
+    legacy.mkdir(parents=True)
+    (legacy / "plugin.py").write_text(
+        "def compute(df, params):\n    return {'rsi': [1.0] * len(df)}\n")
+    (legacy / "config.yaml").write_text(
+        "kind: indicator\nparams:\n  period: 14\n")
+    (legacy / "test_plugin.py").write_text("def test_x():\n    pass\n")
+    from agentic_fx.plugin.loader import content_hash as _hash
+    pin = _hash(legacy)
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    fx.write_rsi_pullback(plugins_root / "_human", pins={"rsi": pin})
+    with pytest.raises(ValueError) as ei:
+        plugin_switch.submit_candidate(
+            conn, name="rsi_pullback", staging_dir=plugins_root / "_human",
+            candidate_origin="human", mission_id=None, backlog_id=None,
+            settings=SETTINGS, now=fx.NOW)
+    assert str(ei.value) == "indicator_unresolved:rsi:outputs_undeclared"
+    assert conn.execute("SELECT COUNT(*) FROM approval_requests "
+                        "WHERE json_extract(payload_json,'$.name')="
+                        "'rsi_pullback'").fetchone()[0] == 0
