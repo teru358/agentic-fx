@@ -332,7 +332,8 @@ def test_bless_strategy_below_min_trades_creates_nothing(env, monkeypatch):
     (d / "test_plugin.py").write_text(TEST_PY_OK)
     monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
 
-    def _zero_trades_gate(conn, meta, *, settings, now, record_fn=None, floor_mode="enforce"):
+    def _zero_trades_gate(conn, meta, *, settings, now, record_fn=None,
+                         floor_mode="enforce", **_unused_kwargs):
         # strategy_gate.evaluate_strategy_adoption_gate のフェイク
         # (統合裁定 R-i3: bless_candidate はこの関数だけを呼ぶ — run_in_sample
         # を直接叩かない)。evaluable=False で ValueError を上げる契約は
@@ -1327,7 +1328,8 @@ def test_advance_to_decided_detects_in_place_tamper_of_artifact_hash_only(env, m
 # --- 段階 2 レビュー是正: submit/bless payload の base_interval/eval_timeframe ---
 
 
-def _fake_evaluable_gate(conn, meta, *, settings, now, record_fn=None, floor_mode="enforce"):
+def _fake_evaluable_gate(conn, meta, *, settings, now, record_fn=None, floor_mode="enforce",
+                        **_unused_kwargs):
     """`evaluate_strategy_adoption_gate` のフェイク (evaluable=True)。"""
     from agentic_fx.plugin.strategy_gate import StrategyGateVerdict
     return StrategyGateVerdict(

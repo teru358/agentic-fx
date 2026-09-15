@@ -39,6 +39,7 @@ from agentic_fx.core.contracts import Bar, FixedClock, InstrumentSpec, Quote
 from agentic_fx.plugin import approval, strategy_gate
 from agentic_fx.plugin.gate_pytest import GateResult
 from agentic_fx.plugin.loader import discover
+from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.service import build_app, run_init
@@ -60,6 +61,10 @@ NOW_PRODUCER = H + timedelta(hours=1, seconds=3)
 # ④ tick 呼び出し: producer と同一バケット floor 内 (追加の実サブプロセス
 # 起動を発生させない) かつ cron 締切 (1h) 未到来の時刻。
 NOW_TICK = H + timedelta(hours=1, minutes=5)
+
+# [indicator-consumption-wiring] T3 Step 3-1: `_validate_strategy` の
+# `resolved` はキーワード必須。sma_cross は依存 0 本なので空集合で足りる。
+_EMPTY = ResolvedIndicatorSet.empty(Path("/nonexistent/plugins"))
 
 
 def _install_settings(root: Path) -> None:
@@ -127,7 +132,7 @@ def _submit_and_approve(root: Path) -> None:
 
     metrics, evaluable = approval._validate_strategy(
         conn, meta, settings=settings, now=H,
-        run_in_sample_fn=_fake_run_in_sample)
+        run_in_sample_fn=_fake_run_in_sample, resolved=_EMPTY)
     payload = {
         "name": meta.name, "kind": meta.kind,
         "content_hash": meta.content_hash,

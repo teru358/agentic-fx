@@ -69,12 +69,14 @@ from agentic_fx.plugin import strategy_adapter, strategy_gate
 from agentic_fx.plugin.gate_pytest import GateResult, run_gate_pytest
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.loader import content_hash as _recompute_content_hash
+from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.signal_eval import SandboxRunFn, evaluate_detection
 from agentic_fx.store import approvals as approvals_store
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
+    from agentic_fx.plugin.resolve import InventoryBuildResult
 
 # pytest_runner 注入シームの型: plugin ディレクトリ → GateResult。
 PytestRunnerFn = Callable[[Path], GateResult]
@@ -119,11 +121,16 @@ def _pytest_summary(stdout_text: str) -> str:
 def _validate_strategy(conn: sqlite3.Connection, meta: PluginMeta, *,
                        settings: "Settings", now: datetime,
                        run_in_sample_fn: RunInSampleFn | None,
+                       resolved: "ResolvedIndicatorSet",
                        ) -> tuple[dict[str, dict], bool]:
     """strategy kind の検証: pairs 全数を settings.pairs と照合してから
     (1 pair でも外れていれば ValueError — バックテストは 1 回も実行しない)、
     各 pair について build_intent_source → run_in_sample → try/finally で
     close() する (Task 5 の CLI と同じ規律)。
+
+    [indicator-consumption-wiring] T3 Step 3-1: `resolved` は呼び出し元が
+    composition root で 1 回だけ解決したもの (キーワード必須)。この関数は
+    再解決しない — 各 pair の `build_intent_source(...)` へそのまま渡す。
 
     [profitability-floor] T1 Step 1-7 (2026-09-13、codex C1): `submit_plugin`
     は冒頭で `meta.kind == "strategy"` を拒否するため、この関数の
@@ -161,7 +168,7 @@ def _validate_strategy(conn: sqlite3.Connection, meta: PluginMeta, *,
     for pair in meta.pairs:
         intent_source = strategy_adapter.build_intent_source(
             meta, conn=conn, pair=pair, dataset=dataset,
-            settings=settings)
+            settings=settings, resolved=resolved)
         try:
             per_pair_metrics[pair] = run_in_sample(
                 settings, history_conn=conn, symbol=pair,
@@ -183,7 +190,11 @@ def _validate_kind(conn: sqlite3.Connection, meta: PluginMeta, *,
                    settings: "Settings", now: datetime,
                    sandbox_run: SandboxRunFn | None,
                    run_in_sample_fn: RunInSampleFn | None,
+                   resolved: "ResolvedIndicatorSet | None" = None,
                    ) -> tuple[dict, bool]:
+    """[indicator-consumption-wiring] T3 Step 3-1: `resolved` はキーワード
+    任意 (indicator/signal 分岐では使わない) — strategy 分岐だけがそのまま
+    `_validate_strategy` へ透通する。"""
     if meta.kind == "indicator":
         return {}, True
     if meta.kind == "signal":
@@ -191,7 +202,8 @@ def _validate_kind(conn: sqlite3.Connection, meta: PluginMeta, *,
         return metrics, True
     if meta.kind == "strategy":
         return _validate_strategy(conn, meta, settings=settings, now=now,
-                                  run_in_sample_fn=run_in_sample_fn)
+                                  run_in_sample_fn=run_in_sample_fn,
+                                  resolved=resolved)
     raise ValueError(f"plugin {meta.name!r}: unsupported kind {meta.kind!r}")
 
 
@@ -290,7 +302,13 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
 
         verdict = strategy_gate.evaluate_strategy_adoption_gate(
             conn, meta=meta, settings=settings, now=now,
-            floor_mode=floor_mode, record_fn=_sink)
+            floor_mode=floor_mode, record_fn=_sink,
+            # [indicator-consumption-wiring] T3 暫定 (T4a Step 4-1c で
+            # `resolve_indicator_deps(...)` の実解決に置き換える)。
+            # 依存 0 本なら `empty()` の root 引数は解決に使われない。
+            # 依存ありの候補は worker 内で `KeyError` → `SandboxError` →
+            # gate 不合格になる = fail closed (下記コメントも参照)。
+            resolved=ResolvedIndicatorSet.empty(meta.path.parent))
         if verdict is None or not verdict.evaluable:
             # strategy_gate.evaluate_strategy_adoption_gate は既に
             # "insufficient_trades:<n>" の形で observation_reason を返す。
@@ -392,7 +410,11 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
 
         metrics, evaluable = _validate_kind(
             conn, meta, settings=settings, now=now, sandbox_run=sandbox_run,
-            run_in_sample_fn=run_in_sample_fn)
+            run_in_sample_fn=run_in_sample_fn,
+            # [indicator-consumption-wiring] T3: この経路は kind=strategy
+            # を上で既に拒否しているため strategy 分岐には実際には到達
+            # しないが、防御的に空集合を渡して素通しさせる。
+            resolved=ResolvedIndicatorSet.empty(meta.path.parent))
 
         # F1 (codex Critical レビュー fix round 1): 全検証通過後・
         # approvals.create の直前に content_hash を再計算し、discover 時に

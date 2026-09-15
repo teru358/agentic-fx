@@ -10,10 +10,20 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from pathlib import Path
+
 from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
 from agentic_fx.plugin.loader import PluginMeta
+from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 from agentic_fx.plugin.strategy_gate import evaluate_strategy_adoption_gate
+
+# [indicator-consumption-wiring] T3 Step 3-1: `evaluate_strategy_adoption_gate`
+# の `resolved` はキーワード必須になった。本節のテストは
+# `build_intent_source` を monkeypatch (`_fake_intent_source` / インライン
+# lambda、いずれも `**kw` で受け流す) するため resolver の実解決を経由
+# しない — 呼び出し側は空集合を渡すだけでよい。
+_EMPTY = ResolvedIndicatorSet.empty(Path("/nonexistent/plugins"))
 
 
 def _configure_gate_mock(settings: MagicMock) -> MagicMock:
@@ -85,6 +95,7 @@ def test_below_evaluable_min_trades_is_observation_not_rejected(monkeypatch):
         lambda *a, **kw: _metrics(trades=10, pf=1.0))
     verdict = evaluate_strategy_adoption_gate(
         MagicMock(), name="myst", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h1", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta())
     assert verdict.evaluable is False
@@ -107,6 +118,7 @@ def test_evaluable_min_trades_is_sum_across_pairs(monkeypatch):
         lambda *a, **kw: _metrics(trades=16, pf=1.1))
     verdict = evaluate_strategy_adoption_gate(
         MagicMock(), name="myst", pairs=["USDJPY", "EURUSD"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h1", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(pairs=("USDJPY", "EURUSD")))
     assert verdict.evaluable is True
@@ -124,6 +136,7 @@ def test_baseline_uses_live_d4_approved_same_name_strategy(
         lambda *a, **kw: _metrics(trades=30, pf=1.1))
     verdict = evaluate_strategy_adoption_gate(
         conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        resolved=_EMPTY,
         timeframe="1h", content_hash="h2", now=datetime(2026, 8, 22),
         settings=_SETTINGS, meta=_meta(content_hash="h2"))
     assert verdict.baseline_variant == "baseline"
@@ -141,6 +154,7 @@ def test_baseline_falls_back_to_no_strategy_when_no_approved_same_name(
         lambda *a, **kw: _metrics(trades=30, pf=1.1))
     verdict = evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h3", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy", content_hash="h3"))
     assert verdict.baseline_variant == "no_strategy"
@@ -151,6 +165,7 @@ def test_baseline_falls_back_to_no_strategy_when_no_approved_same_name(
 def test_indicator_and_signal_kinds_skip_this_gate_entirely():
     verdict = evaluate_strategy_adoption_gate(
         None, name="myind", pairs=[], timeframe="1h", content_hash="h4",
+        resolved=_EMPTY,
         now=datetime(2026, 8, 22), kind="indicator", settings=_SETTINGS,
         meta=None)   # kind!="strategy" は meta を使う前に早期 return する
     assert verdict is None
@@ -183,6 +198,7 @@ def test_record_fn_is_forwarded_to_run_in_sample_and_run_holdout(
     sentinel = object()
     evaluate_strategy_adoption_gate(
         conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        resolved=_EMPTY,
         timeframe="1h", content_hash="h5", now=datetime(2026, 8, 22),
         settings=_SETTINGS, meta=_meta(content_hash="h5"), record_fn=sentinel)
     assert seen_record_fns == [("run_in_sample", sentinel),
@@ -207,6 +223,7 @@ def test_content_hash_argument_wins_over_meta_content_hash(
         lambda *a, **kw: _metrics(trades=30, pf=1.1))
     evaluate_strategy_adoption_gate(
         conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        resolved=_EMPTY,
         timeframe="1h", content_hash="recomputed-hash",
         now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(content_hash="stale-meta-hash"))
@@ -230,6 +247,7 @@ def test_pending_only_approval_does_not_count_as_baseline(
         lambda *a, **kw: _metrics(trades=30, pf=1.1))
     verdict = evaluate_strategy_adoption_gate(
         conn_with_pending_strategy, name="myst", pairs=["USDJPY"],
+        resolved=_EMPTY,
         timeframe="1h", content_hash="h2", now=datetime(2026, 8, 22),
         settings=_SETTINGS, meta=_meta(content_hash="h2"))
     assert verdict.baseline_variant == "no_strategy"
@@ -261,6 +279,7 @@ def test_eval_timeframe_normalizes_1d_to_24h_for_run_in_sample_and_holdout(
         _fake_run_holdout)
     evaluate_strategy_adoption_gate(
         conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        resolved=_EMPTY,
         timeframe="1d", content_hash="h6", now=datetime(2026, 8, 22),
         settings=_SETTINGS, meta=_meta(timeframe="1d", content_hash="h6"))
     assert seen_eval_timeframes == [("run_in_sample", "24h"),
@@ -298,6 +317,7 @@ def test_eval_source_follows_backtest_settings(
 
     evaluate_strategy_adoption_gate(
         conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        resolved=_EMPTY,
         timeframe="1h", content_hash="h6", now=datetime(2026, 8, 22),
         settings=settings, meta=_meta(content_hash="h6"))
 
@@ -341,6 +361,7 @@ def test_evaluate_strategy_adoption_gate_uses_single_dataset_object(
 
     evaluate_strategy_adoption_gate(
         conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        resolved=_EMPTY,
         timeframe="1h", content_hash="h6", now=datetime(2026, 8, 22),
         settings=settings, meta=_meta(content_hash="h6"))
 
@@ -398,6 +419,7 @@ def test_no_strategy_row_is_saved_immediately_when_record_fn_is_none(
 
     verdict = evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h3", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy", content_hash="h3"))
     assert verdict.baseline_variant == "no_strategy"
@@ -437,6 +459,7 @@ def test_no_strategy_path_wraps_record_fn_for_run_in_sample_only(
 
     evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h3", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy", content_hash="h3"),
         record_fn=sentinel)
@@ -468,6 +491,7 @@ def test_no_strategy_path_wraps_record_fn_for_run_in_sample_only(
     # 両方を行うことを確認する。
     evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy2", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h3b", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy2", content_hash="h3b"),
         record_fn=_callable_sentinel)
@@ -512,6 +536,7 @@ def test_no_strategy_row_copies_identity_and_replaces_metrics_only(
 
     evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h3", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy", content_hash="h3"))
 
@@ -552,6 +577,7 @@ def test_f1_8_enforce_floor_fail_short_circuits_before_holdout(
         lambda *a, **kw: (holdout_calls.append(1), _metrics(trades=30, pf=1.5))[1])
     verdict = evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h9", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy", content_hash="h9"))
     assert verdict.floor_reason == "unprofitable"
@@ -572,6 +598,7 @@ def test_f6_3_warn_mode_completes_holdout_and_baseline_despite_in_sample_fail(
         lambda *a, **kw: (holdout_calls.append(1), _metrics(trades=30, pf=1.5))[1])
     verdict = evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h10", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy", content_hash="h10"),
         floor_mode="warn")
@@ -593,6 +620,7 @@ def test_holdout_stage_failure_sets_floor_reason_when_in_sample_passes(
         lambda *a, **kw: _metrics(trades=30, pf=0.4, avg_r=0.1))
     verdict = evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h11", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy", content_hash="h11"))
     assert verdict.floor_reason == "unprofitable"
@@ -614,6 +642,7 @@ def test_f2_1_holdout_capture_is_not_discarded(monkeypatch, conn):
                                   evaluable=True))
     verdict = evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h12", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy", content_hash="h12"))
     assert verdict.floor_reason == "unprofitable"
@@ -647,6 +676,7 @@ def test_f9_1_evaluator_calls_shared_floor_helper_for_both_stages(
 
     evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h13", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy", content_hash="h13"))
 
@@ -677,6 +707,7 @@ def test_f9_2_in_sample_stage_helper_is_shared_not_duplicated(
 
     verdict = evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h14", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy", content_hash="h14"))
     # helper がインライン複製されていれば、この差し替えは効かず PASS の
@@ -720,6 +751,7 @@ def test_f9_2_holdout_stage_helper_is_shared_not_duplicated(
 
     verdict = evaluate_strategy_adoption_gate(
         conn, name="brand_new_strategy", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY,
         content_hash="h15", now=datetime(2026, 8, 22), settings=_SETTINGS,
         meta=_meta(name="brand_new_strategy", content_hash="h15"))
     # holdout 段の呼び出しがインライン複製されていれば、run_holdout_gate

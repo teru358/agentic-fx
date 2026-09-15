@@ -6,12 +6,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 from agentic_fx.backtest import holdout
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
 from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin.loader import PluginMeta
+
+if TYPE_CHECKING:
+    from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 
 # timeframe 正規化の単一所有者 (codex 段階2/3 是正 1周目): `plugin/
 # approval.py` はこの辞書を再実装せず `strategy_gate._eval_timeframe` を
@@ -166,6 +169,7 @@ def floor_rule_text(gate_settings: "ImproveGateSettings", *,
 
 def evaluate_strategy_adoption_gate(
     conn, *, meta: "PluginMeta | None", now: datetime, settings: "Settings",
+    resolved: "ResolvedIndicatorSet",
     name: str | None = None, pairs: "list[str] | None" = None,
     timeframe: str | None = None, content_hash: str | None = None,
     kind: str = "strategy",
@@ -176,6 +180,11 @@ def evaluate_strategy_adoption_gate(
 ) -> "StrategyGateVerdict | None":
     """candidate/baseline/no_strategy の identity と評価可能性。
     indicator/signal はこのゲートを課さない (None を返す)。
+
+    [indicator-consumption-wiring] T3 Step 3-1: `resolved` は呼び出し元
+    (`run_kind_gate` / `ImproveLoop`) が composition root で 1 回だけ解決
+    したもの。この関数は再解決しない — in_sample/holdout 両ループの
+    `build_intent_source(...)` へ同じオブジェクトをそのまま渡す (P3')。
 
     **直前修正の申し送り④ (`run_in_sample`/`run_holdout_gate` の欠落引数)**:
     現物シグネチャ `run_in_sample(settings, *, history_conn, symbol, source,
@@ -286,7 +295,7 @@ def evaluate_strategy_adoption_gate(
     for pair in pairs:
         intent_source = strategy_adapter.build_intent_source(
             meta, conn=conn, pair=pair, dataset=dataset,
-            settings=settings)
+            settings=settings, resolved=resolved)
         try:
             per_pair[pair] = run_in_sample(
                 settings, history_conn=history_conn, symbol=pair,
@@ -322,7 +331,7 @@ def evaluate_strategy_adoption_gate(
     for pair in pairs:
         intent_source = strategy_adapter.build_intent_source(
             meta, conn=conn, pair=pair, dataset=dataset,
-            settings=settings)
+            settings=settings, resolved=resolved)
         try:
             # 現行は戻り値を捨てていた (§0「前提を疑う」) — フロア判定の
             # holdout 段はこの戻り値が要る。

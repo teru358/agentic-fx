@@ -894,9 +894,16 @@ class ImproveLoop:
                 conn = self._db_readonly_conn_factory()
                 captured: list[dict] = []
                 dataset = self._settings.backtest.dataset()
+                from agentic_fx.plugin.resolve import ResolvedIndicatorSet
                 intent_source = strategy_adapter.build_intent_source(
                     meta, conn=conn, pair=args["pair"], dataset=dataset,
-                    settings=self._settings)
+                    settings=self._settings,
+                    # [indicator-consumption-wiring] T3 暫定 (T5b Step 5-4
+                    # で `ImproveRunContext.inventory` からの `check` 解決に
+                    # 置き換える)。それまでは依存ありの staging 候補は
+                    # worker 内で `KeyError` → `SandboxError` →
+                    # `backtest_failed` になる = fail closed。
+                    resolved=ResolvedIndicatorSet.empty(self._root / "plugins"))
                 try:
                     holdout.run_in_sample(
                         self._settings, history_conn=conn, symbol=args["pair"],
@@ -1391,15 +1398,21 @@ class ImproveLoop:
             artifact_hash=artifact_hash_before)
 
     def _run_strategy_gate(self, conn, *, name, pairs, timeframe, content_hash,
-                           now, meta, kind="strategy", record_fn=None):
+                           now, meta, resolved, kind="strategy",
+                           record_fn=None):
         # [profitability-floor] T1 Step 1-3 (2026-09-12、設計書 §3 T1-b):
         # 改善ループは常に `floor_mode="enforce"` (in_sample 段の不合格で
         # holdout を回さず即終端 — evaluator の既定と同じ値だが、この
         # 呼び出し元が「常に enforce」であることを明示するために渡す)。
+        #
+        # [indicator-consumption-wiring] T3 Step 3-1 (5 番目): `resolved`
+        # は呼び出し元が composition root で解決したものをそのまま中継する
+        # (再解決しない)。
         return evaluate_strategy_adoption_gate(
             conn, name=name, pairs=pairs, timeframe=timeframe,
             content_hash=content_hash, now=now, settings=self._settings,
-            meta=meta, kind=kind, record_fn=record_fn, floor_mode="enforce")
+            meta=meta, kind=kind, record_fn=record_fn, floor_mode="enforce",
+            resolved=resolved)
 
     def _build_approval_payload(self, conn, *, name, kind, content_hash,
                                 artifact_hash, ctx_ledger, mission_id,
@@ -2257,13 +2270,19 @@ class ImproveLoop:
                     return
                 if kind == "strategy":
                     try:
+                        from agentic_fx.plugin.resolve import ResolvedIndicatorSet
                         strategy_verdict = self._run_strategy_gate(     # 手順4
                             conn, name=artifact["name"],
                             pairs=self._read_candidate_pairs(candidate_dir),
                             timeframe=self._read_candidate_timeframe(candidate_dir),
                             content_hash=gate_verdict.content_hash, now=now,
                             meta=candidate_meta, kind=kind,
-                            record_fn=gate_rows.append)
+                            record_fn=gate_rows.append,
+                            # [indicator-consumption-wiring] T3 暫定
+                            # (T5b Step 5-5 で `ImproveRunContext.inventory`
+                            # からの `require` 解決に置き換える)。
+                            resolved=ResolvedIndicatorSet.empty(
+                                self._root / "plugins"))
                     except holdout.NoHistoryError as exc:
                         # Missing market history is an expected gate verdict;
                         # unrelated ValueErrors still abort the commit.

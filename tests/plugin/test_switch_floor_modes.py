@@ -51,7 +51,7 @@ def _fake_pytest_ok(plugin_dir, *, settings):
 
 
 def _floor_fail_gate(conn, *, meta, settings, now, floor_mode="enforce",
-                     record_fn=None):
+                     record_fn=None, **_unused_kwargs):
     """`evaluate_strategy_adoption_gate` のフェイク: 収益性フロア不合格
     (候補は評価可能、`floor_reason` が立つ)。record_fn へ 1 行積む
     (gate_rows 捕捉の確認用)。"""
@@ -78,7 +78,7 @@ def _floor_fail_gate(conn, *, meta, settings, now, floor_mode="enforce",
 
 
 def _insufficient_trades_gate(conn, *, meta, settings, now, floor_mode="enforce",
-                              record_fn=None):
+                              record_fn=None, **_unused_kwargs):
     """`evaluate_strategy_adoption_gate` のフェイク: 標本不足
     (`evaluable=False`)。**observation_reason に `"unprofitable"` という
     語を混ぜる** — pin F6-10 (文字列部分一致による誤分類が無いことの
@@ -102,7 +102,8 @@ def _insufficient_trades_gate(conn, *, meta, settings, now, floor_mode="enforce"
         observation_reason="insufficient_trades:5 (note: unprofitable-ish)")
 
 
-def _ok_gate(conn, *, meta, settings, now, floor_mode="enforce", record_fn=None):
+def _ok_gate(conn, *, meta, settings, now, floor_mode="enforce", record_fn=None,
+            **_unused_kwargs):
     return StrategyGateVerdict(
         evaluable=True, baseline_variant="no_strategy",
         baseline_row={"plugin_ref": f"no_strategy:{meta.name}",
@@ -315,7 +316,7 @@ def test_f6_12_unexpected_exception_persists_gate_failed_rows_and_reraises(
         pass
 
     def _boom_gate(conn, *, meta, settings, now, floor_mode="enforce",
-                  record_fn=None):
+                  record_fn=None, **_unused_kwargs):
         if record_fn is not None:
             record_fn({
                 "scope": "in_sample", "plugin_ref": f"plugins/{meta.name}",
@@ -462,7 +463,7 @@ def test_g3_run_kind_gate_forwards_floor_mode_warn_to_evaluator(env, monkeypatch
     seen_floor_modes = []
 
     def _spy(conn_arg, *, meta, settings, now, floor_mode="enforce",
-            record_fn=None):
+            record_fn=None, **_unused_kwargs):
         seen_floor_modes.append(floor_mode)
         return StrategyGateVerdict(
             evaluable=True, baseline_variant="no_strategy",
@@ -492,7 +493,7 @@ def test_g3_run_kind_gate_default_floor_mode_is_enforce(env, monkeypatch):
     seen_floor_modes = []
 
     def _spy(conn_arg, *, meta, settings, now, floor_mode="enforce",
-            record_fn=None):
+            record_fn=None, **_unused_kwargs):
         seen_floor_modes.append(floor_mode)
         return StrategyGateVerdict(
             evaluable=True, baseline_variant="no_strategy",

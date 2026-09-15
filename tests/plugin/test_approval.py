@@ -29,6 +29,7 @@ from agentic_fx.entry import main
 from agentic_fx.plugin import approval
 from agentic_fx.plugin.gate_pytest import GateResult
 from agentic_fx.plugin.loader import PluginMeta, content_hash as real_content_hash
+from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import ohlcv as ohlcv_store
 from agentic_fx.store.db import connect, init_db
@@ -38,6 +39,11 @@ _EXAMPLE = _REPO_ROOT / "config" / "settings.yaml.example"
 _SMA_CROSS_DIR = _REPO_ROOT / "docs" / "examples" / "plugins" / "sma_cross"
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+
+# [indicator-consumption-wiring] T3 Step 3-1: `_validate_strategy` の
+# `resolved` はキーワード必須になった。本ファイルの strategy 直接呼び出し
+# はいずれも依存 0 本の strategy を使うため空集合で十分。
+_EMPTY = ResolvedIndicatorSet.empty(Path("/nonexistent/plugins"))
 
 INDICATOR_PY = """
 def compute(df, params):
@@ -460,7 +466,7 @@ def test_validate_strategy_calls_run_in_sample_fn_per_pair_with_expected_kwargs(
 
     metrics, evaluable = approval._validate_strategy(
         conn, meta, settings=two_pair_settings, now=NOW,
-        run_in_sample_fn=fake_run_in_sample)
+        run_in_sample_fn=fake_run_in_sample, resolved=_EMPTY)
 
     assert len(calls) == 2
     symbols = {c["symbol"] for c in calls}
@@ -508,7 +514,8 @@ def test_validate_strategy_uses_single_dataset_object_no_split_brain(
     seen_adapter_dataset = {}
     seen_run_dataset = {}
 
-    def fake_build_intent_source(meta_arg, *, conn, pair, dataset, settings):
+    def fake_build_intent_source(meta_arg, *, conn, pair, dataset, settings,
+                                 **_unused_kwargs):
         seen_adapter_dataset["obj"] = dataset
         return _FakeIntentSource(pair)
 
@@ -520,7 +527,8 @@ def test_validate_strategy_uses_single_dataset_object_no_split_brain(
          patch("agentic_fx.plugin.approval.strategy_adapter.build_intent_source",
                side_effect=fake_build_intent_source):
         approval._validate_strategy(conn, meta, settings=settings, now=NOW,
-                                    run_in_sample_fn=fake_run_in_sample)
+                                    run_in_sample_fn=fake_run_in_sample,
+                                    resolved=_EMPTY)
 
     assert call_count["n"] == 1
     assert seen_adapter_dataset["obj"] is seen_run_dataset["obj"]
@@ -550,7 +558,8 @@ def test_validate_strategy_sandbox_error_from_run_in_sample_propagates(
 
     with pytest.raises(SandboxError, match="plugin worker crashed mid-evaluation"):
         approval._validate_strategy(conn, meta, settings=settings, now=NOW,
-                                    run_in_sample_fn=crashing_run_in_sample)
+                                    run_in_sample_fn=crashing_run_in_sample,
+                                    resolved=_EMPTY)
     assert _count_rows(conn) == 0
 
 
@@ -572,7 +581,8 @@ def test_validate_strategy_eval_timeframe_maps_1d_to_24h(tmp_path, settings):
                 "fallback_spread_used": False}
 
     approval._validate_strategy(conn, meta, settings=settings, now=NOW,
-                                run_in_sample_fn=fake_run_in_sample)
+                                run_in_sample_fn=fake_run_in_sample,
+                                resolved=_EMPTY)
     assert len(calls) == 1
     assert calls[0]["eval_timeframe"] == "24h"
 
@@ -597,7 +607,8 @@ def test_validate_strategy_pair_outside_settings_pairs_raises_value_error(
 
     with pytest.raises(ValueError, match="not in settings.pairs"):
         approval._validate_strategy(conn, meta, settings=settings, now=NOW,
-                                    run_in_sample_fn=fake_run_in_sample)
+                                    run_in_sample_fn=fake_run_in_sample,
+                                    resolved=_EMPTY)
     assert called == []  # 1 pair 目ですでに ValueError — バックテストは 0 回
     assert _count_rows(conn) == 0
 
@@ -627,7 +638,8 @@ def test_validate_strategy_second_pair_outside_settings_pairs_raises_value_error
 
     with pytest.raises(ValueError, match="not in settings.pairs"):
         approval._validate_strategy(conn, meta, settings=settings, now=NOW,
-                                    run_in_sample_fn=fake_run_in_sample)
+                                    run_in_sample_fn=fake_run_in_sample,
+                                    resolved=_EMPTY)
     assert called == []  # 先頭 pair が有効でも、後方の不正で 0 回のまま
     assert _count_rows(conn) == 0
 
@@ -665,7 +677,8 @@ def test_validate_strategy_close_called_for_each_pair_on_success(tmp_path, setti
     created: list[_FakeIntentSource] = []
     seen_sources: list[str] = []
 
-    def fake_build_intent_source(meta_arg, *, conn, pair, dataset, settings):
+    def fake_build_intent_source(meta_arg, *, conn, pair, dataset, settings,
+                                 **_unused_kwargs):
         seen_sources.append(dataset.source)
         src = _FakeIntentSource(pair)
         created.append(src)
@@ -677,7 +690,8 @@ def test_validate_strategy_close_called_for_each_pair_on_success(tmp_path, setti
     with patch("agentic_fx.plugin.approval.strategy_adapter.build_intent_source",
                side_effect=fake_build_intent_source):
         approval._validate_strategy(conn, meta, settings=two_pair_settings, now=NOW,
-                                    run_in_sample_fn=fake_run_in_sample)
+                                    run_in_sample_fn=fake_run_in_sample,
+                                    resolved=_EMPTY)
 
     assert len(created) == 2
     assert all(src.closed for src in created)
@@ -705,7 +719,8 @@ def test_validate_strategy_close_called_even_when_run_in_sample_raises(
 
     created: list[_FakeIntentSource] = []
 
-    def fake_build_intent_source(meta_arg, *, conn, pair, dataset, settings):
+    def fake_build_intent_source(meta_arg, *, conn, pair, dataset, settings,
+                                 **_unused_kwargs):
         src = _FakeIntentSource(pair)
         created.append(src)
         return src
@@ -721,7 +736,7 @@ def test_validate_strategy_close_called_even_when_run_in_sample_raises(
         with pytest.raises(RuntimeError, match="boom"):
             approval._validate_strategy(
                 conn, meta, settings=two_pair_settings, now=NOW,
-                run_in_sample_fn=crashing_run_in_sample)
+                run_in_sample_fn=crashing_run_in_sample, resolved=_EMPTY)
 
     assert run_in_sample_calls == ["USDJPY"]  # 2 pair 目には進まない
     assert len(created) == 1
@@ -938,7 +953,8 @@ def test_integration_strategy_real_session_and_run_in_sample(tmp_path, settings)
 
     started = time.perf_counter()
     metrics, evaluable = approval._validate_strategy(
-        conn, meta, settings=settings, now=NOW, run_in_sample_fn=None)
+        conn, meta, settings=settings, now=NOW, run_in_sample_fn=None,
+        resolved=_EMPTY)
     elapsed = time.perf_counter() - started
     print(f"\n[Task 6 実測] _validate_strategy (実 PluginSession + "
          f"実 run_in_sample, 2 日分 1h 評価): {elapsed:.3f}s")

@@ -18,12 +18,17 @@ from agentic_fx.backtest.runner import run_replay
 from agentic_fx.core.contracts import Bar
 from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin.loader import PluginMeta, content_hash as _real_content_hash
+from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 from agentic_fx.plugin.sandbox import SandboxError
 from agentic_fx.store import ohlcv as ohlcv_store
 from tests.backtest.factories import H, SETTINGS, _conn, _row_at, DATASET_1M
 
 SMA_CROSS_DIR = (Path(__file__).resolve().parents[2] / "docs" / "examples"
                  / "plugins" / "sma_cross")
+
+# [indicator-consumption-wiring] T3 Step 3-1: `resolved` はキーワード必須。
+# 依存 0 本のテストではこの空集合を渡す。
+_EMPTY = ResolvedIndicatorSet.empty(Path("/nonexistent/plugins"))
 
 
 def _meta(*, name: str = "strat", timeframe: str = "4h", max_bars: int = 200,
@@ -88,6 +93,7 @@ def test_fires_only_on_declared_timeframe_boundary(tmp_path):
     session = _FakeSession()
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=_EMPTY,
         session=session)
 
     fired_at = []
@@ -118,6 +124,7 @@ def test_fires_only_on_1h_boundary_with_30m_eval_grid(tmp_path):
     session = _FakeSession()
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=_EMPTY,
         session=session)
 
     fired_at = []
@@ -137,6 +144,7 @@ def test_unknown_eval_bar_interval_raises_value_error():
     meta = _meta(timeframe="4h")
     src = strategy_adapter.build_intent_source(
         meta, conn=object(), pair="USDJPY", dataset=DATASET_1M,
+        resolved=_EMPTY,
         settings=SETTINGS, session=_FakeSession())
     # F5 (sonnet Minor — レビュー fix round 1): エラー文言固有の部分文字列
     # に絞る (本プランのテスト規約)。F1 で幅導出を runner.parse_timeframe
@@ -157,18 +165,16 @@ def test_df_passed_to_session_has_no_lookahead_and_respects_max_bars(tmp_path):
     session = _FakeSession()
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
-        session=session)
+        resolved=_EMPTY, session=session)
 
     closed_bar = _bar(H + timedelta(hours=5))  # bucket_end = H+6h
     result = src(closed_bar)
     assert result is None  # hold
     assert len(session.calls) == 1
     payload = session.calls[0]
-    # 契約 (コントローラ明記): payload = {"df", "indicators": None,
-    # "signals": None, "params": dict} — indicators/signals は None 固定
-    # (将来拡張点)、params は meta.params をそのまま渡す。
-    assert payload["indicators"] is None
-    assert payload["signals"] is None
+    # [indicator-consumption-wiring] T3: indicators は worker 内で計算
+    # されるので payload に載らない — 契約は {"df", "params"} のみ。
+    assert set(payload) == {"df", "params"}
     assert payload["params"] == {"period": 7}
     df = payload["df"]
     assert len(df) <= meta.max_bars
@@ -181,6 +187,85 @@ def test_df_passed_to_session_has_no_lookahead_and_respects_max_bars(tmp_path):
     assert df.index[-1].to_pydatetime() == H + timedelta(hours=5)
 
 
+# --- F1: `resolved` の必須化 + `decision_sink` + `cpu_sec` (T3 Step 3-1) ----
+
+def test_build_intent_source_requires_resolved(tmp_path):
+    """F1: `resolved` 無しは TypeError、worker は 1 つも起動しない。"""
+    import subprocess
+    conn = _conn(tmp_path)
+    meta = _meta(timeframe="1h")
+    calls = []
+    real = subprocess.Popen
+    try:
+        subprocess.Popen = lambda *a, **k: calls.append(a)
+        with pytest.raises(TypeError):
+            strategy_adapter.build_intent_source(
+                meta, conn=conn, pair="USDJPY", dataset=DATASET_1M,
+                settings=SETTINGS)
+    finally:
+        subprocess.Popen = real
+    assert calls == []
+
+
+def test_resolved_is_passed_to_the_lazily_created_session(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 8 * 60 + 1)
+    meta = _meta(timeframe="1h")
+    seen = {}
+
+    class _Spy:
+        def __init__(self, meta_arg, *, settings, resolved=None):
+            seen["resolved"] = resolved
+        def __enter__(self):
+            return self
+        def call(self, payload):
+            return dict(_HOLD_RESULT)
+        def close(self):
+            return None
+        cpu_sec = 1.25
+
+    monkeypatch.setattr(strategy_adapter, "PluginSession", _Spy)
+    sentinel = ResolvedIndicatorSet.empty(Path("/plugins"))
+    src = strategy_adapter.build_intent_source(
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=sentinel)
+    src(_bar(H))
+    assert seen["resolved"] is sentinel      # 同一オブジェクト (再解決しない)
+    src.close()
+    assert src.cpu_sec == 1.25
+
+
+def test_decision_sink_records_every_evaluation_including_holds(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 8 * 60 + 1)
+    meta = _meta(timeframe="1h")
+    open_result = {"action": "open", "rationale": "x", "direction": "long",
+                   "entry_type": "market", "limit_price": None,
+                   "stop_loss": 99.0, "take_profit": 101.0}
+    session = _FakeSession(results=[dict(_HOLD_RESULT), open_result])
+    recorded = []
+    src = strategy_adapter.build_intent_source(
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=_EMPTY, session=session, decision_sink=lambda ts, d:
+            recorded.append((ts, d)))
+    src(_bar(H))                      # hold
+    src(_bar(H + timedelta(hours=1)))  # open
+    assert [ts for ts, _ in recorded] == [H + timedelta(hours=1),
+                                          H + timedelta(hours=2)]
+    assert recorded[0][1]["action"] == "hold"
+    assert recorded[1][1]["action"] == "open"
+    assert recorded[1][1]["stop_loss"] == 99.0
+
+
+def test_decision_sink_defaults_to_none_in_production_path(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 8 * 60 + 1)
+    src = strategy_adapter.build_intent_source(
+        _meta(timeframe="1h"), conn=conn, pair="USDJPY", dataset=DATASET_1M,
+        settings=SETTINGS, resolved=_EMPTY, session=_FakeSession())
+    assert src._decision_sink is None
+
+
 def test_no_fire_when_df_is_empty(tmp_path):
     """発火格子に乗っていてもデータが無ければ評価しない (fail closed)。"""
     conn = _conn(tmp_path)  # 履歴を一切 seed しない
@@ -188,6 +273,7 @@ def test_no_fire_when_df_is_empty(tmp_path):
     session = _FakeSession()
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=_EMPTY,
         session=session)
     result = src(_bar(H))
     assert result is None
@@ -212,6 +298,7 @@ def test_5m_dataset_uses_5m_base_interval_for_load_resampled_frame(tmp_path):
     session = _FakeSession()
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY",
+        resolved=_EMPTY,
         dataset=HistoryDataset("dukascopy", "5m"), settings=SETTINGS,
         session=session)
     src(_bar(H + timedelta(hours=1)))
@@ -238,6 +325,7 @@ def test_build_intent_source_uses_dataset_source_not_settings_eval_source(
     from agentic_fx.backtest.dataset import HistoryDataset
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY",
+        resolved=_EMPTY,
         dataset=HistoryDataset("mt5", "1m"), settings=SETTINGS,
         session=session)
     src(_bar(H + timedelta(hours=1)))
@@ -256,6 +344,7 @@ def test_open_market_without_take_profit_omits_take_profit_key(tmp_path):
         "take_profit": None}])
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=_EMPTY,
         session=session)
 
     intent = src(_bar(H))
@@ -278,6 +367,7 @@ def test_open_market_with_take_profit_includes_take_profit_key(tmp_path):
         "take_profit": 148.0}])
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=_EMPTY,
         session=session)
 
     intent = src(_bar(H))
@@ -296,6 +386,7 @@ def test_open_limit_includes_limit_price_and_expires_in(tmp_path):
         "take_profit": 152.0}])
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=_EMPTY,
         session=session)
 
     intent = src(_bar(H))
@@ -312,6 +403,7 @@ def test_hold_maps_to_none(tmp_path):
     session = _FakeSession(results=[dict(_HOLD_RESULT)])
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=_EMPTY,
         session=session)
     assert src(_bar(H)) is None
 
@@ -325,6 +417,7 @@ def test_sandbox_error_propagates_uncaught(tmp_path):
     session = _FakeSession(raises=SandboxError("plugin crashed"))
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=_EMPTY,
         session=session)
     with pytest.raises(SandboxError, match="plugin crashed"):
         src(_bar(H))
@@ -359,7 +452,7 @@ class _RecordingSession:
 def test_session_none_creates_lazily_on_first_fire_only(tmp_path, monkeypatch):
     created: list[_RecordingSession] = []
 
-    def _factory(meta, *, settings):
+    def _factory(meta, *, settings, resolved=None):
         session = _RecordingSession(meta, settings=settings)
         created.append(session)
         return session
@@ -370,7 +463,8 @@ def test_session_none_creates_lazily_on_first_fire_only(tmp_path, monkeypatch):
     _seed_flat(conn, H, 8 * 60 + 1)
     meta = _meta(timeframe="4h")
     src = strategy_adapter.build_intent_source(
-        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS)
+        meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=_EMPTY)
 
     assert created == []  # 構築時点ではまだ何も起動しない
 
@@ -397,6 +491,7 @@ def test_close_does_not_close_injected_session(tmp_path):
     fake = _FakeSession()
     src = strategy_adapter.build_intent_source(
         meta, conn=conn, pair="USDJPY", dataset=DATASET_1M, settings=SETTINGS,
+        resolved=_EMPTY,
         session=fake)
     src(_bar(H))
     src.close()
@@ -499,6 +594,7 @@ def test_integration_plugin_5h_replay_reaches_orders_with_single_session(
 
     intent_source = strategy_adapter.build_intent_source(
         meta, conn=hist_conn, pair="USDJPY", dataset=DATASET_1M,
+        resolved=_EMPTY,
         settings=SETTINGS)
     session_pid = None
     try:
@@ -529,6 +625,7 @@ def test_build_intent_source_rejects_pair_not_in_meta_pairs(tmp_path):
     with pytest.raises(ValueError, match="pairs"):
         strategy_adapter.build_intent_source(
             meta, conn=_conn(tmp_path), pair="EURUSD",
+            resolved=_EMPTY,
             dataset=DATASET_1M, settings=SETTINGS)
 
 
@@ -544,3 +641,37 @@ def test_plugin_strategy_intent_source_no_longer_accepts_source_kwarg():
         strategy_adapter.PluginStrategyIntentSource(
             _meta(), conn=None, pair="USDJPY", source="dukascopy",
             dataset=DATASET_1M, settings=SETTINGS)
+
+
+# --- AST 全数性検査 (codex plan r1 I2、T1 Step 1-7 と同じ流儀) --------------
+
+def test_no_caller_calls_build_intent_source_without_resolved():
+    """[indicator-consumption-wiring] T3 (F1): `build_intent_source(...)` の
+    呼び出しが `src` にも `tests` にも `resolved=` 無しで残っていないこと。
+    `resolved` はキーワード必須なので実行すれば `TypeError` になるが、
+    patch された経路・未到達分岐では発見が遅れる。**`ast.Call` だけを見る**
+    (docstring 言及箇所を拾わないため)。`**kwargs` で受け流す fake の
+    定義側は `ast.Call` ではないので対象外。"""
+    import ast
+    from pathlib import Path
+    repo = Path(__file__).resolve().parents[2]
+    offenders = []
+    for root in (repo / "src" / "agentic_fx", repo / "tests"):
+        for path in sorted(root.rglob("*.py")):
+            if path == Path(__file__).resolve():
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"),
+                             filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                f = node.func
+                name = (f.attr if isinstance(f, ast.Attribute)
+                        else f.id if isinstance(f, ast.Name) else None)
+                if name != "build_intent_source":
+                    continue
+                if not any(kw.arg == "resolved" for kw in node.keywords):
+                    offenders.append(f"{path.relative_to(repo)}:{node.lineno}")
+    assert offenders == [], (
+        "build_intent_source(...) を resolved= 無しで呼んでいる箇所: "
+        f"{offenders}")

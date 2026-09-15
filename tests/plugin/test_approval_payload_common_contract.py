@@ -92,7 +92,8 @@ def _fake_pytest_ok(plugin_dir, *, settings):
                       duration_sec=0.1)
 
 
-def _fake_evaluable_gate(conn, meta, *, settings, now, record_fn=None, floor_mode="enforce"):
+def _fake_evaluable_gate(conn, meta, *, settings, now, record_fn=None,
+                         floor_mode="enforce", **_unused_kwargs):
     return StrategyGateVerdict(
         evaluable=True, baseline_variant="no_strategy",
         baseline_row={"plugin_ref": f"no_strategy:{meta.name}",

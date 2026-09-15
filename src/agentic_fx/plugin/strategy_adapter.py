@@ -45,7 +45,8 @@ run_replay を続行させたりしない)。
 from __future__ import annotations
 
 import sqlite3
-from typing import TYPE_CHECKING, Any, Protocol
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from agentic_fx.backtest.runner import parse_timeframe
 from agentic_fx.backtest.timeframes import floor_to_bucket, load_resampled_frame
@@ -55,6 +56,7 @@ from agentic_fx.plugin.sandbox import PluginSession
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
+    from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 
 
 class _SessionLike(Protocol):
@@ -73,7 +75,20 @@ class PluginStrategyIntentSource:
 
     def __init__(self, meta: PluginMeta, *, conn: sqlite3.Connection,
                 pair: str, dataset, settings: "Settings",
-                session: _SessionLike | None = None) -> None:
+                resolved: "ResolvedIndicatorSet",
+                session: _SessionLike | None = None,
+                decision_sink: "Callable[[datetime, dict], None] | None" = None,
+                ) -> None:
+        """`resolved` は**必須** ([indicator-consumption-wiring] §2.3) —
+        依存なしでも `ResolvedIndicatorSet.empty(inventory_root)` を渡す。
+        アダプタは**内部で再解決しない**: 解決は composition root で 1 回、
+        同じオブジェクトがここと `PluginSession` を通って worker まで届く。
+
+        `decision_sink` は**テスト専用の観測面** (設計書 §6、codex r7 I2)。
+        `backtest_runs` は metrics しか持たず `orders` は open しか表せない
+        ため、hold を含む全時点の照合はこの sink でしか取れない。本番経路は
+        常に `None` (既定) — 呼び出し元は渡さない。
+        """
         # プラン 8 B 束 (Fable M-1): producer 側 (settings.pairs 外は
         # warning + skip) と対称の検証。adapter は 1 インスタンス = 1 pair
         # の明示的構築であり、meta.pairs に無い pair は「呼び出し側の
@@ -88,14 +103,23 @@ class PluginStrategyIntentSource:
         self._pair = pair
         self._dataset = dataset
         self._settings = settings
+        self._resolved = resolved
         self._session = session
+        self._decision_sink = decision_sink
         # session を注入した呼び出し元がその所有者 (close の責務も持つ)。
         # 既定 (None) はこのアダプタ自身が lazy 生成し、自分で閉じる。
         self._owns_session = session is None
+        self._cpu_sec: float | None = None
         # 観測性用カウンタ (brief 上書き節 6): 発火格子に乗り、かつ df が
         # 非空で実際に plugin を評価した回数。CLI はバックテスト完走後に
         # これが 0 なら「plugin が一度も発火しなかった」警告を出せる。
         self.eval_count = 0
+
+    @property
+    def cpu_sec(self) -> float | None:
+        """自分が生成したセッションの累積 CPU 秒 (`close()` 後に確定)。
+        注入セッション・未評価・異常終了では `None` (設計書 §2.4、C1)。"""
+        return self._cpu_sec
 
     def __call__(self, closed_bar: Bar) -> dict | None:
         # F1 (レビュー fix round 1): TF_MINUTES ではなく runner の
@@ -117,39 +141,44 @@ class PluginStrategyIntentSource:
 
         session = self._ensure_session()
         self.eval_count += 1
-        result = session.call({
-            "df": df, "indicators": None, "signals": None,
-            "params": self._meta.params})
+        result = session.call({"df": df, "params": self._meta.params})
+        if self._decision_sink is not None:
+            self._decision_sink(bucket_end, result)
         return _strategy_result_to_intent(result, self._pair)
 
     def _ensure_session(self) -> _SessionLike:
         if self._session is None:
-            session = PluginSession(self._meta, settings=self._settings.plugin)
+            session = PluginSession(self._meta, settings=self._settings.plugin,
+                                    resolved=self._resolved)
             session.__enter__()
             self._session = session
         return self._session
 
     def close(self) -> None:
         """自分が生成したセッションのみ閉じる (注入されたセッションは
-        呼び出し元の所有物 — close しない。コントローラ裁定)。"""
+        呼び出し元の所有物 — close しない。コントローラ裁定)。close 完了後
+        に `cpu_sec` を取り込む (`PluginSession.cpu_sec` は close 後に確定
+        する property)。"""
         if self._owns_session and self._session is not None:
             self._session.close()
+            self._cpu_sec = getattr(self._session, "cpu_sec", None)
             self._session = None
 
 
 def build_intent_source(meta: PluginMeta, *, conn: sqlite3.Connection,
                         pair: str, dataset, settings: "Settings",
+                        resolved: "ResolvedIndicatorSet",
                         session: _SessionLike | None = None,
+                        decision_sink: "Callable[[datetime, dict], None] | None" = None,
                         ) -> PluginStrategyIntentSource:
     """`meta` (kind="strategy") から `pair` 用の `IntentSource` を組み立てる。
 
     呼び出し元 (CLI 等) は `run_replay` 実行後、必ず `close()` を呼ぶこと
     (try/finally — brief 明記。サンドボックスプロセスのリーク防止)。
-    """
+    `resolved` は必須 — 依存なしでも空 set を渡す。"""
     return PluginStrategyIntentSource(
-        meta, conn=conn, pair=pair, dataset=dataset,
-        settings=settings,
-        session=session)
+        meta, conn=conn, pair=pair, dataset=dataset, settings=settings,
+        resolved=resolved, session=session, decision_sink=decision_sink)
 
 
 def _strategy_result_to_intent(result: dict[str, Any], pair: str) -> dict | None:
