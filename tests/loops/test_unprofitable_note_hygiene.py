@@ -508,6 +508,9 @@ class _FakeRunContext:
     def __init__(self, staging_dir, source_snapshot_dir):
         self.staging_dir = staging_dir
         self.source_snapshot_dir = source_snapshot_dir
+        # [indicator-consumption-wiring] T5a Step 5-1: _render_improve_mission_prompt
+        # が ctx.inventory_view を読むようになった (P1')。
+        self.inventory_view = {"plugins": [], "pin_broken_strategies": []}
 
 
 def _sample_ctx_data_with_origin():

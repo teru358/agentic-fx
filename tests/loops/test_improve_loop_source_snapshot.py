@@ -221,3 +221,84 @@ def test_copied_files_are_readonly_after_copy(tmp_path):
 
     # 実際に書込ができないか確認
     assert not os.access(plugin_file, os.W_OK)
+
+
+# --- [indicator-consumption-wiring] T5a Step 5-1: inventory 実配線 (P1') ---
+
+import json
+
+from tests.fixtures.wiring_envs import (
+    deploy_strategy as _deploy_strategy,
+    improve_env as _improve_env,
+    prepare_ctx as _prepare_ctx,
+)
+
+
+def test_pin_broken_strategy_stays_in_the_snapshot_but_not_in_the_inventory(
+        tmp_path):
+    """P1': phase 2 で落ちた strategy は `_snapshot_src` に残り
+    `read_plugin_source` で読めるが、inventory には出ない。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root = _improve_env(tmp_path)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    _deploy_strategy(conn, plugins_root, "rsi_pullback",
+                     pins={"rsi": "a" * 64})          # pin 破れ
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+
+    snapshot = ctx.source_snapshot_dir
+    assert (snapshot / "rsi_pullback" / "plugin.py").is_file()
+    assert [p["name"] for p in ctx.inventory_view["plugins"]] == ["rsi"]
+    assert ctx.inventory_view["pin_broken_strategies"] == [
+        {"name": "rsi_pullback", "alias": "rsi", "reason": "pin_mismatch"}]
+    assert [m.name for m in ctx.inventory.inventory.metas] == ["rsi"]
+    assert sorted(m.name for m in ctx.inventory.phase1_metas) == \
+        ["rsi", "rsi_pullback"]
+
+
+def test_prompt_shows_the_number_of_pin_broken_strategies(tmp_path):
+    """P1': prompt に「pin 破れで配備から外れている strategy: N 本 (名前)」。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root = _improve_env(tmp_path)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    _deploy_strategy(conn, plugins_root, "rsi_pullback",
+                     pins={"rsi": "a" * 64})          # pin 破れ
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    rendered = loop._last_rendered_prompt
+    assert "pin 破れ" in rendered and "rsi_pullback" in rendered
+
+
+def test_inventory_view_is_generated_once_from_the_same_result(tmp_path):
+    """P3: view は `ImproveRunContext.inventory` と同じ
+    `InventoryBuildResult` から 1 回だけ生成される (prepare 後に live
+    `plugins/` を差し替えても不変)。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root = _improve_env(tmp_path)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    before = json.dumps(ctx.inventory_view, sort_keys=True)
+    fx.write_indicator(plugins_root, "adx")
+    fx.deploy_approved(conn, plugins_root, ["adx"], now=fx.NOW)
+    assert json.dumps(ctx.inventory_view, sort_keys=True) == before
+
+
+def test_prepare_populates_a_non_empty_inventory(tmp_path):
+    """codex plan r1 C4: `ImproveRunContext.inventory` は互換のため
+    `None` 既定だが、**実 `prepare` 経路では必ず非空**であること。
+    (既定値だけ足して `prepare` の更新を忘れる変異を検出する。)"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root = _improve_env(tmp_path)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    assert ctx.inventory is not None
+    assert [m.name for m in ctx.inventory.inventory.metas] == ["rsi"]
+    assert ctx.inventory_view["plugins"][0]["name"] == "rsi"
+    # handlers も同じ inventory を握っている (既定 None のまま作られていない)
+    assert ctx.rpc_handlers["run_backtest"] is not None

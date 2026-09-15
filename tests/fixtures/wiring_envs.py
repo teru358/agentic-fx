@@ -143,17 +143,27 @@ def synthetic_ctx(loop, conn, root: Path):
     判定する)。"""
     from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
     from agentic_fx.loops.improve_run_context import ImproveRunContext
+    from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
     staging_dir = root / "staging"
     source_snapshot_dir = root / "source"
     staging_dir.mkdir(parents=True, exist_ok=True)
     source_snapshot_dir.mkdir(parents=True, exist_ok=True)
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={
         "run_backtest": 600.0, "analyze_corr": 600.0})
+    # [indicator-consumption-wiring] T5a Step 5-1c (codex plan r1 C4): 空の
+    # `InventoryBuildResult` と空 view を明示的に渡す。既定値のままだと
+    # T5b の consumer (`ctx.inventory.inventory` を読む) が
+    # `AttributeError` になる。
+    empty = InventoryBuildResult(
+        inventory=ApprovedInventory(root=(root / "plugins").resolve(), metas=()),
+        phase1_metas=(), resolved={}, rejected_strategies=())
     return ImproveRunContext(
         mission_id=1, run_id=1, staging_dir=staging_dir,
         source_snapshot_dir=source_snapshot_dir,
         allowed_backlog_ids=frozenset(), slot_key=None, ledger=ledger,
-        rpc_handlers={})
+        rpc_handlers={},
+        inventory=empty,
+        inventory_view={"plugins": [], "pin_broken_strategies": []})
 
 
 def activity_text(activity) -> str:

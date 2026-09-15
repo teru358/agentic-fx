@@ -219,6 +219,11 @@ class WorkerRunner(AgentRunner):
                     # 裁定 R-D3: 出所ではなく実体化先 (workdir/source) を
                     # 載せる。
                     "source_snapshot_dir": str(materialized_source),
+                    # [indicator-consumption-wiring] T5a Step 5-1c (P3):
+                    # 子 worker tool (`list_deployed_plugins`) が読む
+                    # JSON-safe view。親が prepare() 時に 1 回だけ生成した
+                    # ものをそのまま透通する。
+                    "inventory_view": self._run_context.inventory_view,
                 }
 
             proc = subprocess.Popen(

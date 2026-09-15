@@ -44,7 +44,7 @@ from agentic_fx.plugin.gate_pytest import (
 )
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin.noop_gate import count_self_test_functions, find_noop_copy
-from agentic_fx.plugin.resolve import is_relock_transition
+from agentic_fx.plugin.resolve import InventoryBuildResult, is_relock_transition
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.strategy_gate import (
     _check_profitability_floor,
@@ -305,6 +305,26 @@ def _chmod_tree_readonly(root: Path) -> None:
         p.chmod(0o500)
 
 
+def build_inventory_view(result: "InventoryBuildResult") -> dict:
+    """[indicator-consumption-wiring] §2.9(b): 子 worker の tool が読む
+    JSON-safe な inventory。**snapshot ディレクトリを列挙しない** —
+    phase 2 で落ちた strategy が inventory に混ざらないようにするため、
+    最終 admit 済 plugin だけを載せる。遮断 8 との照合: 載るのは
+    name / kind / pairs / params / outputs / content_hash のみ
+    (成績・期間・段名は一切含まない)。"""
+    return {
+        "plugins": [
+            {"name": m.name, "kind": m.kind, "pairs": list(m.pairs),
+             "params": m.params,
+             "outputs": (list(m.outputs) if m.outputs is not None else None),
+             "content_hash": m.content_hash}
+            for m in result.inventory.metas],
+        "pin_broken_strategies": [
+            {"name": r.name, "alias": r.alias, "reason": r.reason}
+            for r in result.rejected_strategies],
+    }
+
+
 # Task 12 Step3: `_prepare_report_if_applicable` が OSError を捕まえて
 # その場で Mission を終端させたことを `commit()` に伝えるための sentinel
 # (`None` は「report 対象外 (indicator/plugin や risk_gate)」の既存の
@@ -407,16 +427,19 @@ class ImproveLoop:
         # failure`、10.10 節と同型)。
         try:
             allowed_ids = self._compute_partition_hint(conn, slot_key)
-            staging_dir, source_snapshot_dir = self._materialize_workspace(
-                conn, mission_id, allowed_ids)
+            staging_dir, source_snapshot_dir, inventory_result = \
+                self._materialize_workspace(conn, mission_id, allowed_ids)
             ledger = ImproveRpcLedger(
                 rpc_timeout_sec_by_kind=self._improve_rpc_timeout_sec_by_kind())
-            rpc_handlers = self._build_rpc_handlers(ledger, staging_dir=staging_dir)
+            rpc_handlers = self._build_rpc_handlers(
+                ledger, staging_dir=staging_dir, inventory=inventory_result)
             ctx = ImproveRunContext(
                 mission_id=mission_id, run_id=run_id, staging_dir=staging_dir,
                 source_snapshot_dir=source_snapshot_dir,
                 allowed_backlog_ids=allowed_ids, slot_key=slot_key, ledger=ledger,
-                rpc_handlers=rpc_handlers)
+                rpc_handlers=rpc_handlers,
+                inventory=inventory_result,
+                inventory_view=build_inventory_view(inventory_result))
 
             # precheck 2026-08-22: T8-B8 追随 -- root= が欠落し戻り値キー
             # `prompt_text` も非実在だった (build_improve_context は
@@ -679,6 +702,17 @@ class ImproveLoop:
                 f"{'unprofitable' if i.get('origin_outcome') == 'unprofitable' else ''} |"
                 for i in items)
 
+        # [indicator-consumption-wiring] T5a Step 5-1c (P1'): pin 破れで
+        # 配備から外れている strategy の件数・名前を prompt に出す。
+        # `ctx` は `synthetic_ctx` / テスト直組みでは `None` もありうる
+        # ため `ctx.inventory_view` を防御的に既定 `{}` へ落とす。
+        pin_broken = (ctx.inventory_view.get("pin_broken_strategies", [])
+                     if ctx is not None else [])
+        pin_broken_line = (
+            f"pin 破れで配備から外れている strategy: {len(pin_broken)} 本 "
+            f"({', '.join(p['name'] for p in pin_broken)})"
+            if pin_broken else "pin 破れで配備から外れている strategy: 0 本")
+
         def _dict_to_line(d: dict) -> str:
             # dict の repr は `{`/`}` を含み、テンプレートの `.format()`
             # 展開結果に生の波括弧が残ってしまう (未展開プレースホルダと
@@ -707,6 +741,7 @@ class ImproveLoop:
                 f"{s['name']}({'on' if s['enabled'] else 'off'})"
                 for s in inv["news_sources"]) or "(なし)"),
             "risk_gate_summary": _dict_to_line(inv["risk_gate"]),
+            "pin_broken_strategies": pin_broken_line,
             "backlog_table": (
                 "## 選べる課題 (backlog_id を selected に書けるのはここだけ)\n\n"
                 + _backlog_table(bl["items"])
@@ -727,7 +762,13 @@ class ImproveLoop:
         }
         template_path = (Path(__file__).resolve().parent / "prompts"
                          / "improve_mission.md")
-        return template_path.read_text().format(**render_map)
+        rendered = template_path.read_text().format(**render_map)
+        # [indicator-consumption-wiring] T5a Step 5-1c: テスト専用の観測面
+        # (`tests/loops/test_improve_loop_source_snapshot.py::
+        # test_prompt_shows_the_number_of_pin_broken_strategies`)。本番挙動
+        # は変わらない。
+        self._last_rendered_prompt = rendered
+        return rendered
 
     def _floor_rule_text(self) -> str:
         """[profitability-floor] T2 Step 2-2 (2026-09-13、設計書 §6 T2、
@@ -860,10 +901,16 @@ class ImproveLoop:
         copy_source_snapshot(metas, dest_root=source_snapshot_root,
                             plugin_lock=threading.Lock())
 
-        return staging_dir, source_snapshot_root
+        # [indicator-consumption-wiring] T5a Step 5-1c: `prepare()` が
+        # `ImproveRunContext.inventory` / `.inventory_view` の唯一の生成元。
+        # ここで一度だけ構築した `inventory_result` を呼び出し元へ返す
+        # (第 2 相フィルタ済み — snapshot 材料の第 1 相 `metas` とは別)。
+        return staging_dir, source_snapshot_root, inventory_result
 
     def _build_rpc_handlers(self, ledger: "ImproveRpcLedger", *,
-                            staging_dir: Path) -> dict:
+                            staging_dir: Path,
+                            inventory: "InventoryBuildResult | None" = None,
+                            ) -> dict:
         """10.9 Step 11: run_backtest/analyze_corr の親側実装。
 
         A34 裁定 (2026-08-28、束D検収 verified-local-round1.md §7、

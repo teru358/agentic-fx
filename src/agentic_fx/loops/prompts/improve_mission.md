@@ -27,6 +27,7 @@
 - 組み込み・承認済み plugin: {approved_plugins}
 - ニュースソース: {news_sources}
 - 現在の risk gate 設定: {risk_gate_summary}
+- {pin_broken_strategies}
 
 ## バックログと既知の事実
 

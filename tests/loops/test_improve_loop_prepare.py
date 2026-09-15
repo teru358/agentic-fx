@@ -132,8 +132,8 @@ def test_materialize_workspace_copies_approved_plugin_source_into_snapshot(
     approvals_store.apply_decision(
         conn, aid, status="approved", decided_by="test", now=clock.now())
 
-    staging_dir, source_snapshot_dir = loop_min._materialize_workspace(
-        conn, 42, None)
+    staging_dir, source_snapshot_dir, _inventory_result = \
+        loop_min._materialize_workspace(conn, 42, None)
 
     copied = source_snapshot_dir / "sample_ind"
     assert (copied / "plugin.py").is_file()
@@ -155,8 +155,8 @@ def test_materialize_workspace_creates_staging_dir_with_mode_0700(
     import os
     old_umask = os.umask(0o022)
     try:
-        staging_dir, _source_snapshot_dir = loop_min._materialize_workspace(
-            conn, 44, None)
+        staging_dir, _source_snapshot_dir, _inventory_result = \
+            loop_min._materialize_workspace(conn, 44, None)
     finally:
         os.umask(old_umask)
     assert (staging_dir.stat().st_mode & 0o777) == 0o700
@@ -182,8 +182,8 @@ def test_materialize_workspace_copies_examples_from_self_root_docs_examples_plug
         "def compute(df, params):\n    return {}\n")
     (example_dir / "config.yaml").write_text("kind: indicator\n")
 
-    staging_dir, source_snapshot_dir = loop_min._materialize_workspace(
-        conn, 43, None)
+    staging_dir, source_snapshot_dir, _inventory_result = \
+        loop_min._materialize_workspace(conn, 43, None)
 
     copied = source_snapshot_dir / "_examples" / "sma_cross"
     assert (copied / "plugin.py").is_file()
@@ -324,6 +324,9 @@ class _FakeRunContext:
     def __init__(self, staging_dir, source_snapshot_dir):
         self.staging_dir = staging_dir
         self.source_snapshot_dir = source_snapshot_dir
+        # [indicator-consumption-wiring] T5a Step 5-1: _render_improve_mission_prompt
+        # が ctx.inventory_view を読むようになった (P1')。
+        self.inventory_view = {"plugins": [], "pin_broken_strategies": []}
 
 
 def test_render_improve_mission_prompt_fills_all_placeholders(tmp_path):

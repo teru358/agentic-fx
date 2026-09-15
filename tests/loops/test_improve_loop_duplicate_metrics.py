@@ -546,7 +546,16 @@ def test_finalize_success_falls_back_to_inventory_for_gate_when_ctx_inventory_is
                "content_hash": "c" * 64, "eval_source": "dukascopy",
                "base_interval": "5m",
                "in_sample": {"USDJPY": {"trades": 40, "pf": 1.5, "avg_r": 0.2}}}
-    ctx = synthetic_ctx(loop, conn, plugins_root.parent)
+    # [indicator-consumption-wiring] T5a Step 5-1 逸脱申告: `synthetic_ctx`
+    # は T5a Step 5-1c (codex plan r1 C4) で「空だが非 None の
+    # `InventoryBuildResult`」を返すよう更新された (T5b の consumer が
+    # `ctx.inventory.inventory` を読むための必須変更)。本テストの意図
+    # (`ctx.inventory is None` のときの `_finalize_success` フォールバック
+    # を検証する) を保つため、`dataclasses.replace` で `inventory=None`
+    # を明示的に上書きする。
+    import dataclasses
+    ctx = dataclasses.replace(synthetic_ctx(loop, conn, plugins_root.parent),
+                              inventory=None)
     assert ctx.inventory is None
     demotion = loop._finalize_success(
         conn, mission_id=1, run_id=1, backlog_id=1, slot_key=None,
