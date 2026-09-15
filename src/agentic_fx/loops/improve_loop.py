@@ -842,7 +842,9 @@ class ImproveLoop:
         # (D-3 が突き止めた「テスト factory が共有 conn を返すと閉じた
         # 接続を掴む」と同じ罠を作らない)。
         plugins_dir = self._root / "plugins"
-        metas = approved_plugins(conn, plugins_dir)
+        inventory_result = approved_plugins(conn, plugins_dir,
+                                            settings=self._settings)
+        metas = list(inventory_result.phase1_metas)   # snapshot 材料は第 1 相
         copy_source_snapshot(metas, dest_root=source_snapshot_root,
                             plugin_lock=threading.Lock())
 

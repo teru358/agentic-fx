@@ -323,7 +323,13 @@ def test_build_app_wires_approved_plugins_into_market_tools(tmp_path):
     with patch("agentic_fx.service.plugin_loader.approved_plugins") as approved, \
          patch("agentic_fx.tools.mission_registry.market_tools.build",
                side_effect=spy_build) as build_spy:
-        approved.return_value = [sentinel_meta]
+        # [indicator-consumption-wiring] T1: approved_plugins は
+        # InventoryBuildResult を返す。mock も同型で返す (list 固定は不正確)。
+        from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
+        approved.return_value = InventoryBuildResult(
+            inventory=ApprovedInventory(root=tmp_path / "plugins",
+                                        metas=(sentinel_meta,)),
+            phase1_metas=(sentinel_meta,), resolved={}, rejected_strategies=())
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
 
     assert approved.call_count == 1
@@ -636,8 +642,15 @@ def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
                       params={}, timeframe="1h", pairs=("USDJPY",),
                       max_bars=50, content_hash="h" * 64)
 
+    # [indicator-consumption-wiring] T1: approved_plugins は
+    # InventoryBuildResult を返す。mock も同型で返す。
+    from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
+    inventory_result = InventoryBuildResult(
+        inventory=ApprovedInventory(root=Path("/nonexistent"), metas=(meta,)),
+        phase1_metas=(meta,), resolved={}, rejected_strategies=())
+
     with patch("agentic_fx.service.plugin_loader.approved_plugins",
-              return_value=[meta]), \
+              return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
               _FakeSignalSession):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
@@ -3355,16 +3368,23 @@ def test_service_startup_calls_reconcile_sweep_expire_then_approved_plugins_in_o
     呼び出し経路 (unittest.mock.patch) で確認する。"""
     import unittest.mock as mock
     from agentic_fx.plugin import switch
+    from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
     from agentic_fx.tools import plugin_loader as plugin_loader_mod
 
     _init(tmp_path)
     fake = FakeRunner([MissionResult("completed",
                                      {"action": "hold", "reasoning": "w"},
                                      [])])
+    # [indicator-consumption-wiring] T1: approved_plugins は
+    # InventoryBuildResult を返す。mock も同型で返す。
+    empty_result = InventoryBuildResult(
+        inventory=ApprovedInventory(root=tmp_path / "plugins", metas=()),
+        phase1_metas=(), resolved={}, rejected_strategies=())
     with mock.patch.object(switch, "reconcile_switch_journals") as m_reconcile, \
          mock.patch.object(switch, "sweep_orphans") as m_sweep, \
          mock.patch.object(switch, "process_expired_approvals") as m_expire, \
-         mock.patch.object(plugin_loader_mod, "approved_plugins", return_value=[]) as m_approved:
+         mock.patch.object(plugin_loader_mod, "approved_plugins",
+                           return_value=empty_result) as m_approved:
         # 逸脱 (11f 実装時の実測): `manager.attach_mock` は「以後の」呼び出し
         # しか `manager.mock_calls` へ記録しない (attach 前の呼び出しは
         # 遡って記録されない) — `unittest.mock` の実装上の性質。プラン骨子は

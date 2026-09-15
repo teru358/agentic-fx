@@ -910,7 +910,8 @@ def main() -> None:
         activity = ActivityLog(Path.cwd() / "activity.log")
         plugins_dir = (Path(handshake["plugins_dir"])
                        if handshake.get("plugins_dir") else None)
-        approved = (plugin_loader.approved_plugins(conn, plugins_dir)
+        approved = (list(plugin_loader.approved_plugins(
+                        conn, plugins_dir, settings=settings).inventory.metas)
                    if plugins_dir is not None else [])
 
         # CR-3 対応: `main()` 冒頭で構築した out_seq を、_RagRpcProxy と

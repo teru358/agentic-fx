@@ -820,7 +820,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # プラン 7 Task 3: plugins/ 直下の承認済み plugin をロードする。反映は
         # 次回起動時のみ (hot reload しない — YAGNI)。plugins/ が存在しない環境
         # (未使用のデフォルト) でも approved_plugins は [] を返し起動を妨げない。
-        approved = plugin_loader.approved_plugins(conn_core, plugins_dir)
+        inventory_result = plugin_loader.approved_plugins(
+            conn_core, plugins_dir, settings=settings)
+        approved = list(inventory_result.inventory.metas)
 
         # プラン 7 Task 8: signal producer (承認済み signal/strategy plugin の
         # 評価 → signals キュー投入)。producer は評価 cursor をメモリに持つ

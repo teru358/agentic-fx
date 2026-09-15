@@ -858,3 +858,126 @@ def test_missing_plugins_dir_returns_empty_result(tmp_path):
     assert result.phase1_metas == ()
     assert result.resolved == {}
     assert result.rejected_strategies == ()
+
+
+def test_no_caller_uses_legacy_approved_plugins_signature():
+    """[indicator-consumption-wiring] T1: `approved_plugins(conn, dir)` の
+    2 引数呼び出しが **`src/` にも `tests/` にも**残っていないこと
+    (settings= を渡し忘れると TypeError で落ちるが、動的呼び出しが混ざると
+    発見が遅れる)。
+
+    **codex plan r1 I1 是正**: v1.2 は `src/` しか走査しておらず、設計書
+    §2.3 が要求する `rg 'approved_plugins\\(' src tests` の全移行を
+    構造的に保証できていなかった (テスト側 19 + 1 箇所は「たまたま今回
+    全部直した」以上の保証が無い)。**両方を走査する**。
+
+    **AST で `ast.Call` ノードだけを見る** (opus r1 I2 是正)。正規表現
+    `approved_plugins\\(([^)]*)\\)` は日本語 docstring 中の
+    `` `plugin_loader.approved_plugins()` `` (引数なし) 6 箇所
+    (`plugin/sandbox.py` 2 / `plugin/signal_producer.py` 1 /
+    `tools/market_tools.py` 1 / `service.py` 2 — 着手時に
+    `rg -n 'approved_plugins' src` で再取得すること) にもマッチし、
+    移行後も永久に offender として残る。AST 走査の前例は
+    `tests/test_no_duplicate_module_level_defs.py`。"""
+    import ast
+    from pathlib import Path
+    repo = Path(__file__).resolve().parents[2]
+    roots = [repo / "src" / "agentic_fx", repo / "tests"]
+    offenders = []
+    for root in roots:
+        for path in sorted(root.rglob("*.py")):
+            # 除外は**定義そのもの** (`src/agentic_fx/tools/plugin_loader.py`)
+            # の 1 ファイルだけ。**本テストが住む
+            # `tests/tools/test_plugin_loader.py` は除外しない** — 19 箇所の
+            # 移行漏れを捕まえるのが目的であり、本テスト自身は
+            # `approved_plugins(...)` を 1 度も呼ばない (文字列比較だけ) ので
+            # 自己除外は不要 (codex plan r1 の是正時に付けた自己除外を撤去)。
+            if path == repo / "src" / "agentic_fx" / "tools" / "plugin_loader.py":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = (func.attr if isinstance(func, ast.Attribute)
+                        else func.id if isinstance(func, ast.Name) else None)
+                if name != "approved_plugins":
+                    continue
+                if not any(kw.arg == "settings" for kw in node.keywords):
+                    offenders.append(f"{path.relative_to(repo)}:{node.lineno}")
+    assert offenders == [], (
+        "approved_plugins(...) を settings= 無しで呼んでいる箇所: "
+        f"{offenders}")
+
+
+def test_every_approved_plugins_caller_consumes_the_inventory_result():
+    """[indicator-consumption-wiring] T1 (codex plan r1 I1、r2 束1 Important
+    で強化): `settings=` は付いたが戻り値を `list[PluginMeta]` のまま使って
+    いる呼び出しが残ると、`len()` / index / iteration が `InventoryBuildResult`
+    に対して静かに誤動作する (dataclass なので `TypeError` になるとは限らない)。
+    **呼び出し式の親が `.inventory` / `.phase1_metas` / `.resolved` /
+    `.rejected_strategies` のいずれかの属性参照であること**を AST で検査する。
+
+    **codex plan r2 束1 Important 是正**: v1.3 は「中間変数に代入する形
+    (`result = approved_plugins(...)`) はこの検査の対象外にし、変数名の
+    命名規約 (`*_result` / `*_inventory`) だけで読み手に示す」としていたが、
+    命名規約は**構造的に強制されない** — 現行の全 4 caller
+    (`service.py` の `inventory_result`、`mission_worker.py` の直接
+    チェーン、`improve_loop.py` の `inventory_result`、
+    `improve_context.py` の直接チェーン) のうち 2 本 (`service.py` /
+    `improve_loop.py`) はまさにこの中間変数形なので、旧案では
+    `inventory_result.inventory` 等の属性参照が**一度も検査されていなかった**
+    (「全結果が `InventoryBuildResult` を受けている」を実際には pin できて
+    いない)。**`x = approved_plugins(...)` の代入先変数 `x` を追跡し、
+    `x.<attr>` という後続の属性参照も同じ許可属性集合に限定する** (2 パス:
+    1 パス目で追跡対象の変数名を集め、2 パス目で直後属性参照と追跡変数属性
+    参照の両方を検査する)。"""
+    import ast
+    from pathlib import Path
+    _OK = {"inventory", "phase1_metas", "resolved", "rejected_strategies"}
+    repo = Path(__file__).resolve().parents[2]
+    offenders = []
+
+    def _is_approved_plugins_call(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        f = node.func
+        name = (f.attr if isinstance(f, ast.Attribute)
+                else f.id if isinstance(f, ast.Name) else None)
+        return name == "approved_plugins"
+
+    for root in (repo / "src" / "agentic_fx", repo / "tests"):
+        for path in sorted(root.rglob("*.py")):
+            if path == repo / "src" / "agentic_fx" / "tools" / "plugin_loader.py":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+            # 1 パス目: `x = approved_plugins(...)` の x を集める (直接代入
+            # のみ — tuple unpack / augassign は現行 4 caller に無い)。
+            tracked_names: set[str] = set()
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Assign)
+                        and _is_approved_plugins_call(node.value)
+                        and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)):
+                    tracked_names.add(node.targets[0].id)
+
+            # 2 パス目: 直後の属性参照 (`approved_plugins(...).X`) と、
+            # 追跡変数経由の属性参照 (`x.X`) の両方を検査する。
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Attribute):
+                    continue
+                if _is_approved_plugins_call(node.value):
+                    if node.attr not in _OK:
+                        offenders.append(
+                            f"{path.relative_to(repo)}:{node.lineno}:.{node.attr}")
+                    continue
+                if (isinstance(node.value, ast.Name)
+                        and node.value.id in tracked_names
+                        and node.attr not in _OK):
+                    offenders.append(
+                        f"{path.relative_to(repo)}:{node.lineno}:.{node.attr} "
+                        f"(via {node.value.id})")
+    assert offenders == [], (
+        "approved_plugins(...) の戻り値から未知の属性を読んでいる箇所: "
+        f"{offenders}")

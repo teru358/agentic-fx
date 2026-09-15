@@ -81,7 +81,8 @@ def _improvement_history(conn: "sqlite3.Connection") -> dict:
 def _current_inventory(conn: "sqlite3.Connection", settings: "Settings",
                        root: Path) -> dict:
     plugins_dir = root / "plugins"
-    plugins = approved_plugins(conn, plugins_dir)
+    plugins = approved_plugins(conn, plugins_dir,
+                               settings=settings).inventory.metas
     plugin_summaries = [
         {"name": p.name, "kind": p.kind, "pairs": p.pairs} for p in plugins]
     sources = news_sources.list_all(conn)

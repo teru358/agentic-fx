@@ -202,8 +202,9 @@ def test_approved_strategy_signal_triggers_advanced_mission(tmp_path):
     app = _build_app(tmp_path, runner=fake, bars=bars)
     # sma_cross が実際に承認済みとして拾われていること (③より前の中間状態)
     assert any(m.name == "sma_cross" for m in
-              plugin_loader.approved_plugins(app.conn_core,
-                                             tmp_path / "plugins"))
+              plugin_loader.approved_plugins(
+                  app.conn_core, tmp_path / "plugins",
+                  settings=app.settings).inventory.metas)
 
     _seed_crossover_history(app.conn_core,
                             source=app.settings.plugin.producer_source)
