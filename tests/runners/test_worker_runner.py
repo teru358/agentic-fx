@@ -2894,6 +2894,7 @@ def test_worker_runner_run_context_adds_three_handshake_keys(monkeypatch, tmp_pa
         mission_id = 42
         staging_dir = tmp_path / "staging"
         source_snapshot_dir = source_origin
+        inventory_view = {}
 
     root = _root(tmp_path)
     runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
@@ -3639,6 +3640,7 @@ def test_handshake_source_snapshot_dir_is_workdir_source_with_matching_content(
         mission_id = "rd3-content-test"
         staging_dir = tmp_path / "staging" / "rd3-content-test"
         source_snapshot_dir = origin
+        inventory_view = {}
 
     root = _root(tmp_path)
     runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
@@ -3743,6 +3745,7 @@ def test_real_improve_worker_ready_then_on_ready_then_result_ordering(
         mission_id = "rd1-real-probe"
         staging_dir = staging
         source_snapshot_dir = source_snapshot
+        inventory_view = {}
 
     events: list[str] = []
 
@@ -3817,6 +3820,7 @@ def test_real_improve_worker_on_ready_exception_leaves_no_surviving_child(
         mission_id = "rd1-real-kill-probe"
         staging_dir = staging
         source_snapshot_dir = source_snapshot
+        inventory_view = {}
 
     captured: dict[str, object] = {}
     import agentic_fx.runners.worker_runner as wr_mod
@@ -3909,6 +3913,7 @@ def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
         mission_id = "rd2-real-probe"
         staging_dir = staging
         source_snapshot_dir = source_snapshot
+        inventory_view = {}
 
     handler_calls: list[dict] = []
 
@@ -4566,6 +4571,7 @@ def test_worker_runner_reaps_real_cli_pgid_under_improve_profile(
             self.mission_id = "improve-pgid-probe"
             self.staging_dir = staging_dir
             self.source_snapshot_dir = source_snapshot_dir
+            self.inventory_view = {}
 
     real_popen = subprocess.Popen
     spawned: dict = {}
