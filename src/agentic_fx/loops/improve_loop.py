@@ -455,7 +455,8 @@ class ImproveLoop:
             # 8-I の対応表 (プレースホルダ⇔戻り値キー) に従って組み立てる。
             ctx_data = build_improve_context(
                 conn, settings=self._settings, now=now, root=self._root,
-                allowed_backlog_ids=allowed_ids)
+                allowed_backlog_ids=allowed_ids,
+                inventory_view=ctx.inventory_view)
             prompt_text = self._render_improve_mission_prompt(ctx_data, ctx=ctx)
             # precheck 2026-08-22 wave2: T10-B12/B17 — tools/output_schema は
             # 10.9 節 Step 12 (`_build_mission_tools`) で完成させる。ここでは
@@ -740,8 +741,16 @@ class ImproveLoop:
             # list[dict] (name/kind/pairs, name/enabled) を返す。list[str]
             # 前提の `", ".join(list)` は本番で TypeError になるため、
             # 辞書から name を取り出して結合する
+            # [indicator-consumption-wiring] T5b Step 5-6c (§2.9(a)):
+            # indicator の依存宣言 (`indicators:`) を書くには params/
+            # outputs/content_hash を知る必要がある — 名前と kind だけの
+            # 旧レンダでは agent が `list_deployed_plugins()` を呼ばない
+            # 限り分からなかった。成績・期間・段名は載せない (遮断 8)。
             "approved_plugins": (", ".join(
-                f"{p['name']}({p['kind']})" for p in inv["approved_plugins"])
+                f"{p['name']}({p['kind']}) outputs={p.get('outputs')} "
+                f"params=[{_dict_to_line(p.get('params') or {})}] "
+                f"hash={(p.get('content_hash') or '')[:12]}"
+                for p in inv["approved_plugins"])
                 or "(なし)"),
             "news_sources": (", ".join(
                 f"{s['name']}({'on' if s['enabled'] else 'off'})"
@@ -1005,7 +1014,23 @@ class ImproveLoop:
                         now=self._clock.now(), record_fn=captured.append)
                 finally:
                     intent_source.close()
+                    # [indicator-consumption-wiring] T5b Step 5-6c: `getattr`
+                    # 既定 `None` — 既存テストの多くが `strategy_adapter.
+                    # build_intent_source` を `cpu_sec` を持たない
+                    # `SimpleNamespace(close=lambda: None)` で差し替えている
+                    # (`tests/loops/test_improve_loop_rpc_handlers.py::
+                    # _patch_strategy_lookup`)。直接属性アクセスだと
+                    # それらが軒並み `AttributeError` で退行する (実測で
+                    # 確認) — `activity_extra` と同じく本経路は活動ログの
+                    # 補助情報なので欠測は `null` として扱う。
+                    cpu_sec = getattr(intent_source, "cpu_sec", None)
                     conn.close()
+                self._activity.write(
+                    Category.IMPROVE, "backtest_cpu",
+                    f"mission={staging_dir.name} plugin={args['name']} "
+                    f"scope=in_sample pair={args['pair']} "
+                    f"deps={len(meta.indicators)} "
+                    f"cpu_sec={'null' if cpu_sec is None else cpu_sec}")
             except ValueError as exc:
                 message = str(exc)
                 if isinstance(exc, holdout.NoHistoryError):
@@ -2463,6 +2488,19 @@ class ImproveLoop:
                                     f"{exc}"), now=now,
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls)
                         return
+                    # [indicator-consumption-wiring] §2.9(e): commit gate は
+                    # adapter を `strategy_gate` の内部で生成・close するため、
+                    # CPU 実測は `StrategyGateVerdict.cpu_samples` 経由でしか
+                    # ここへ届かない (codex r5 I4)。scope × pair ごとに 1 行。
+                    # 評価不能な候補でも CPU は記録する (evaluable 判定の前)。
+                    deps = len(candidate_meta.indicators)
+                    for scope, pair, cpu_sec in strategy_verdict.cpu_samples:
+                        self._activity.write(
+                            Category.IMPROVE, "backtest_cpu",
+                            f"mission={ctx.mission_id} "
+                            f"plugin={artifact['name']} scope={scope} "
+                            f"pair={pair} deps={deps} "
+                            f"cpu_sec={'null' if cpu_sec is None else cpu_sec}")
                     if not strategy_verdict.evaluable:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,

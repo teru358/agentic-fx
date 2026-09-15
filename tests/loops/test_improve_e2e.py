@@ -2079,3 +2079,96 @@ def test_pinned_candidate_reaches_the_approval_payload_with_indicator_deps(
     assert payload["indicator_deps"] == {
         "rsi": {"plugin": "rsi", "content_hash": hashes["rsi"],
                 "params": {"period": fx.RSI_PERIOD}}}
+
+
+def test_backtest_cpu_activity_lines_are_verbatim(tmp_path):
+    """C1 (改善経路): scope × pair ごとに 1 行、逐語形式。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    cand = fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
+    (cand / "test_plugin.py").write_text(_MIN3_TEST_PY)
+    loop.commit(mission=_mission(ctx), ctx=ctx,
+                result=_completed_result(
+                    _plugin_artifact("rsi_pullback", kind="strategy")),
+                now=fx.NOW)
+    lines = [l for l in _activity_text(activity).splitlines() if "backtest_cpu" in l]
+    assert lines, "no backtest_cpu activity written"
+    # [indicator-consumption-wiring] T5b 逸脱是正 (T4b/5-5 と同型):
+    # `ActivityLog.write` は event/summary をタブ区切りの別列に書くため、
+    # `"backtest_cpu mission=..."` の単一文字列 in 判定はタブ区切りと
+    # 必ず食い違う。event 列と summary 列を分けて見る。
+    assert any(
+        f"mission={ctx.mission_id} plugin=rsi_pullback "
+        f"scope=in_sample pair=USDJPY deps=1 cpu_sec=" in l for l in lines)
+    assert all("holdout_gate" not in l for l in lines)   # scope は holdout 表記
+
+
+def test_backtest_cpu_is_written_with_null_when_the_session_died(
+        tmp_path, monkeypatch):
+    """C1: 例外終了でも `cpu_sec=null` で 1 行積む。"""
+    from tests.fixtures import indicator_wiring as fx
+    from agentic_fx.plugin import sandbox as plugin_sandbox
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    cand = fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
+    (cand / "test_plugin.py").write_text(_MIN3_TEST_PY)
+
+    # graceful close の応答を殺して SIGKILL fallback に倒す
+    original_close = plugin_sandbox.PluginSession.close
+
+    def _hard_close(self):
+        self._dead = True          # graceful close 経路を通さない
+        original_close(self)
+
+    monkeypatch.setattr(plugin_sandbox.PluginSession, "close", _hard_close)
+    loop.commit(mission=_mission(ctx), ctx=ctx,
+                result=_completed_result(
+                    _plugin_artifact("rsi_pullback", kind="strategy")),
+                now=fx.NOW)
+    assert "cpu_sec=null" in _activity_text(activity)
+
+
+def test_prompt_inventory_includes_params_outputs_and_hash(tmp_path):
+    """P3 / §2.9(a): prompt の `current_inventory.approved_plugins` が
+    indicator の params / outputs / content_hash を含む。
+
+    [indicator-consumption-wiring] T5b 逸脱是正: プラン本文の
+    `'"outputs"' in rendered` / `"period" in rendered` は**判別力ゼロの
+    pin だった** (実測で確認) — `improve_mission.md` 規律2/7 の既存プローズ
+    に単語 "outputs" が、規律7 の例示 URL
+    (`https://example.com/rsi-period-study`) に単語 "period" がそれぞれ
+    元々含まれているため、本 Step 未実装のまま (baseline の
+    `f"{name}({kind})"` レンダのまま) でもこのテストは green になる
+    (実測: 実装前に本テストだけ実行すると 1 passed)。`content_hash` の
+    先頭 12 文字は baseline レンダに一切現れない値なので、これを主判別点
+    にする (RSI params の `period` 値そのものも合わせて見る)。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root = _improve_env(tmp_path)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    rendered = loop._last_rendered_prompt
+    assert hashes["rsi"][:12] in rendered
+    assert "period" in rendered and str(fx.RSI_PERIOD) in rendered
+    assert "outputs" in rendered
+    # 遮断 8: 成績・段名は出さない。
+    # [indicator-consumption-wiring] T5b 逸脱是正: プラン本文の禁止語
+    # リストは `("holdout", "pf=", "avg_r")` だったが、`avg_r` は
+    # `improve_mission.md` 規律3 の既存プローズ (「試したパラメータと
+    # 得られた pf / avg_r を具体的に書いて」— observation のノート作法を
+    # 指示する既存文、本束と無関係) に元々含まれており、その語のままでは
+    # 正しい実装でも赤になる判別力ゼロの pin になる (実測で確認)。
+    # inventory 由来の漏洩を見るという意図を保ちつつ、テンプレ既存文と
+    # 衝突しない `("holdout", "pf=")` に絞る。
+    for forbidden in ("holdout", "pf="):
+        assert forbidden not in rendered

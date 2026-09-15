@@ -79,12 +79,30 @@ def _improvement_history(conn: "sqlite3.Connection") -> dict:
 
 
 def _current_inventory(conn: "sqlite3.Connection", settings: "Settings",
-                       root: Path) -> dict:
-    plugins_dir = root / "plugins"
-    plugins = approved_plugins(conn, plugins_dir,
-                               settings=settings).inventory.metas
-    plugin_summaries = [
-        {"name": p.name, "kind": p.kind, "pairs": p.pairs} for p in plugins]
+                       root: Path, *,
+                       inventory_view: dict | None = None) -> dict:
+    """[indicator-consumption-wiring] §2.9(a): prompt の
+    `current_inventory.approved_plugins` は **mission の inventory view**
+    から作る (prepare 後に live `plugins/` を差し替えても不変、P3)。
+    `inventory_view` が渡されない経路 (CLI 表示等) は従来どおり
+    `approved_plugins` を呼ぶ。
+
+    載せるのは name / kind / pairs / params / outputs / content_hash のみ —
+    成績・期間・段名は載せない (遮断 8)。"""
+    if inventory_view is not None:
+        plugin_summaries = [
+            {"name": p["name"], "kind": p["kind"], "pairs": p["pairs"],
+             "params": p["params"], "outputs": p["outputs"],
+             "content_hash": p["content_hash"]}
+            for p in inventory_view["plugins"]]
+    else:
+        plugins = approved_plugins(conn, root / "plugins",
+                                   settings=settings).inventory.metas
+        plugin_summaries = [
+            {"name": p.name, "kind": p.kind, "pairs": list(p.pairs),
+             "params": p.params,
+             "outputs": (list(p.outputs) if p.outputs is not None else None),
+             "content_hash": p.content_hash} for p in plugins]
     sources = news_sources.list_all(conn)
     return {
         "approved_plugins": plugin_summaries,
@@ -134,11 +152,13 @@ def _references_section() -> dict:
 def build_improve_context(
         conn: "sqlite3.Connection", *, settings: "Settings", now: datetime,
         root: Path,
-        allowed_backlog_ids: "frozenset[int] | None") -> dict[str, Any]:
+        allowed_backlog_ids: "frozenset[int] | None",
+        inventory_view: dict | None = None) -> dict[str, Any]:
     return {
         "performance_report": _performance_report(conn, now),
         "improvement_history": _improvement_history(conn),
-        "current_inventory": _current_inventory(conn, settings, root),
+        "current_inventory": _current_inventory(
+            conn, settings, root, inventory_view=inventory_view),
         "backlog": _backlog_section(conn, allowed_backlog_ids),
         "user_policy": _user_policy_section(root),
         "references": _references_section(),

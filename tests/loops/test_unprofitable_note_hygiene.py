@@ -92,7 +92,12 @@ def _install_floor_strategy_gate(monkeypatch, loop, *, holdout_metrics):
             observation_reason="",
             candidate_metrics={"USDJPY": _floor_metrics(0.5)},
             holdout_metrics=holdout_metrics,
-            baseline_row=None)
+            baseline_row=None,
+            # [indicator-consumption-wiring] T5b 逸脱是正: Step 5-6c が
+            # `commit()` の strategy 分岐で `strategy_verdict.cpu_samples`
+            # を無条件に読むようになった (backtest_cpu activity、評価不能
+            # 判定より前)。
+            cpu_samples=())
 
     monkeypatch.setattr(loop, "_run_strategy_gate", fake_strategy_gate)
 
