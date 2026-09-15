@@ -514,7 +514,7 @@ def test_commit_real_strategy_gate_missing_history_becomes_gate_failed(
         "agentic_fx.plugin.loader._discover_one", lambda *a, **kw: meta)
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_adapter.build_intent_source",
-        lambda *a, **kw: SimpleNamespace(close=lambda: None))
+        lambda *a, **kw: SimpleNamespace(close=lambda: None, cpu_sec=None))
 
     loop_full.commit(mission=mission, ctx=ctx, result=result,
                      now=datetime(2026, 8, 22, tzinfo=timezone.utc))
