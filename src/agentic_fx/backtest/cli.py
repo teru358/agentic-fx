@@ -37,9 +37,13 @@ from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin import strategy_gate
 from agentic_fx.plugin import switch as plugin_switch
+from agentic_fx.plugin.resolve import (
+    IndicatorResolutionError, resolve_indicator_deps,
+)
 from agentic_fx.service import ensure_initialized
 from agentic_fx.store import backtest_runs, ohlcv
 from agentic_fx.store.db import connect, init_db
+from agentic_fx.tools import plugin_loader as tools_plugin_loader
 
 # analyze corr で --to 未指定時の in_sample_until (aware far-future 定数 —
 # 上書き節 D 逐語)。人間の探索は期間自由なので実質「上限なし」を表す。
@@ -398,13 +402,27 @@ def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
              file=sys.stderr)
         return 1
 
+    # [indicator-consumption-wiring] §2.3 の root 表 (人間 CLI):
+    # strategy meta は `discover` のまま (承認不要の手元評価という既存契約を
+    # 変えない)。依存解決用の inventory だけ `approved_plugins` から作り、
+    # `pin_mode="check"` (pin があれば一致を要求、無ければ通す) で解決する。
+    # **解決は保存前・try の中** — 失敗は rc=1 / 固定 stderr / 行なし。
+    inventory = tools_plugin_loader.approved_plugins(
+        conn, plugins_dir, settings=settings)
+    try:
+        resolved = resolve_indicator_deps(
+            meta, inventory.inventory, settings=settings, pin_mode="check")
+    except IndicatorResolutionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     if not _empty_history_guard(conn, args):
         return 1
 
     dataset = HistoryDataset(args.source, args.base_interval)
     intent_source = strategy_adapter.build_intent_source(
         meta, conn=conn, pair=args.symbol, dataset=dataset,
-        settings=settings)
+        settings=settings, resolved=resolved)
     try:
         # strategy_adapter の「貫通」契約 (SandboxError を hold へ読み替え
         # ない・run_replay を止める) は変えない — run_replay は

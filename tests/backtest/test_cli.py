@@ -1341,3 +1341,156 @@ def test_cli_improve_verify_backend_requires_backend_argument(
         entry_main(["improve", "verify-backend"])
     assert exc.value.code == 2
     assert "--backend" in capsys.readouterr().err
+
+
+# --- [indicator-consumption-wiring] T3: CLI の依存解決 (A1'/A1'') ----------
+
+from tests.fixtures import indicator_wiring as fx
+
+
+def _cli_root_with_deployed_rsi_pullback(tmp_path):
+    """配備済 (pinned) `rsi_pullback` + 承認済 `rsi` を持つ CLI root を作る。
+
+    [indicator-consumption-wiring] T3 (逸脱、plan 未記載): 本ファイルの
+    他の `--plugin` CLI テスト (`test_cli_backtest_run_plugin_records_
+    strategy_scope` 等) は `_install_settings(tmp_path)` + `patch(
+    "agentic_fx.backtest.cli.ensure_initialized")` を必ず対にしている
+    (config/settings.yaml が無い・`state.initialized` が False だと
+    `dispatch` が `SystemExit(2)` で落ちる)。plan の Step 3-4a コード片は
+    これを書いておらず、実測で `SystemExit: 2` になった (verify に必須)。
+    このファイルの既存規約に合わせ、ここで `_install_settings` を呼ぶ。"""
+    from agentic_fx.plugin.loader import content_hash
+    from agentic_fx.store import approvals
+    from agentic_fx.store.db import connect, init_db
+    root = tmp_path
+    _install_settings(root)
+    (root / "data").mkdir(parents=True, exist_ok=True)
+    plugins = root / "plugins"
+    plugins.mkdir(exist_ok=True)
+    conn = connect(root / "data" / "agentic.db")
+    init_db(conn)
+    fx.seed_history(conn)
+    fx.write_indicator(plugins, "rsi")
+    hashes = fx.deploy_approved(conn, plugins, ["rsi"], now=fx.NOW)
+    strat = fx.write_rsi_pullback(plugins, pins={"rsi": hashes["rsi"]})
+    aid = approvals.create(conn, "plugin",
+                           {"name": "rsi_pullback", "kind": "strategy",
+                            "content_hash": content_hash(strat)}, fx.NOW)
+    approvals.apply_decision(conn, aid, status="approved", decided_by="t",
+                             now=fx.NOW)
+    conn.commit()
+    conn.close()
+    return root
+
+
+def test_cli_backtest_run_plugin_with_dependency(tmp_path, capsys, monkeypatch):
+    """A1': rc=0、`scope='human_custom'` 行 1 本。承認行を消しても走る
+    (手元評価は承認不要という既存契約の維持)。"""
+    from agentic_fx.store.db import connect
+    root = _cli_root_with_deployed_rsi_pullback(tmp_path)
+    monkeypatch.chdir(root)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        rc = main(["backtest", "run", "--plugin", "rsi_pullback",
+                   "--symbol", "USDJPY", "--source", "dukascopy",
+                   "--base-interval", "5m",
+                   "--from", "2025-12-01", "--to", "2026-01-01"])
+    assert rc == 0
+    conn = connect(root / "data" / "agentic.db")
+    rows = conn.execute(
+        "SELECT scope, plugin_ref FROM backtest_runs").fetchall()
+    assert [(r["scope"], r["plugin_ref"]) for r in rows] == \
+        [("human_custom", "plugins/rsi_pullback")]
+    conn.execute("DELETE FROM approval_requests "
+                 "WHERE json_extract(payload_json,'$.name')='rsi_pullback'")
+    conn.commit()
+    conn.close()
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        assert main(["backtest", "run", "--plugin", "rsi_pullback",
+                     "--symbol", "USDJPY", "--source", "dukascopy",
+                     "--base-interval", "5m",
+                     "--from", "2025-12-01", "--to", "2026-01-01"]) == 0
+
+
+def _redeploy_rsi_variant(root: Path, mutate) -> None:
+    """配備済 `rsi` を削除し、`mutate` を当てた実体で配備し直す。
+
+    `.versions/<name>/<artifact_hash>` の中身を直接書き換えると
+    `loader.py:342-353` の artifact_hash 照合で discover ごと落ち、
+    reason が常に `not_found` になってしまう (= `not_indicator` /
+    `over_max_bars_limit` を観測できない)。よって**正規の配備手順を
+    もう一度回す**。`rsi_pullback` の pin は古い `content_hash` のまま
+    になるが、resolver は kind / outputs / max_bars を pin より先に
+    見るので観測したい reason が先に出る (Step 1-4c の順序)。"""
+    import shutil
+
+    import yaml
+
+    from agentic_fx.store.db import connect
+    from tests.fixtures import indicator_wiring as fx
+    conn = connect(root / "data" / "agentic.db")
+    conn.execute("DELETE FROM approval_requests "
+                 "WHERE json_extract(payload_json,'$.name')='rsi'")
+    conn.commit()
+    plugins = root / "plugins"
+    link = plugins / "rsi"
+    version_dir = link.resolve()
+    link.unlink()
+    shutil.rmtree(version_dir)
+    d = fx.write_indicator(plugins, "rsi")
+    cfg = yaml.safe_load((d / "config.yaml").read_text(encoding="utf-8"))
+    mutate(cfg, d)
+    (d / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    fx.deploy_approved(conn, plugins, ["rsi"], now=fx.NOW)
+    conn.close()
+
+
+@pytest.mark.parametrize("break_it,alias,reason", [
+    ("delete_indicator", "rsi", "not_found"),
+    ("kind_swap", "rsi", "not_indicator"),
+    ("max_bars", "rsi", "over_max_bars_limit"),
+])
+def test_cli_backtest_run_plugin_unresolved(tmp_path, capsys, monkeypatch,
+                                            break_it, alias, reason):
+    """A1'': rc=1、stderr が固定 1 行、backtest_runs 行数不変、traceback なし。"""
+    import yaml
+
+    from agentic_fx.store.db import connect
+    root = _cli_root_with_deployed_rsi_pullback(tmp_path)
+    monkeypatch.chdir(root)
+    conn = connect(root / "data" / "agentic.db")
+    before = conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0]
+    conn.close()
+    plugins = root / "plugins"
+    if break_it == "delete_indicator":
+        conn2 = connect(root / "data" / "agentic.db")
+        conn2.execute("DELETE FROM approval_requests "
+                      "WHERE json_extract(payload_json,'$.name')='rsi'")
+        conn2.commit()
+        conn2.close()
+    elif break_it == "kind_swap":
+        def mutate(cfg, d):
+            cfg.pop("outputs")
+            cfg.update({"kind": "signal", "timeframe": "1h",
+                        "pairs": ["USDJPY"]})
+            (d / "plugin.py").write_text(
+                "def detect(df, params):\n    return []\n")
+        _redeploy_rsi_variant(root, mutate)
+    else:
+        def mutate(cfg, d):
+            cfg["max_bars"] = 100000
+        _redeploy_rsi_variant(root, mutate)
+
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        rc = main(["backtest", "run", "--plugin", "rsi_pullback",
+                   "--symbol", "USDJPY", "--source", "dukascopy",
+                   "--base-interval", "5m",
+                   "--from", "2025-12-01", "--to", "2026-01-01"])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.err.strip().splitlines()[-1] == \
+        f"indicator_unresolved:{alias}:{reason}"
+    assert "Traceback" not in captured.err
+    conn3 = connect(root / "data" / "agentic.db")
+    assert conn3.execute(
+        "SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == before
+    conn3.close()
