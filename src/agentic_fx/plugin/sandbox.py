@@ -9,6 +9,20 @@ plugin コードの事故 (無限ループ・OOM・意図しない I/O)」を防
 承認** (§6 — plugin は承認されるまで discover/実行されず、承認は
 content_hash 一致を人間がレビューした版に限定する)。
 
+**同居実行の残余リスク ([indicator-consumption-wiring] §3)**: strategy と、
+その依存 indicator は**同一 worker プロセス**で実行される (IPC を deps 倍に
+しないため — 非ベクトル化 1 本で 60 秒 CPU 予算が破れた実測がある)。承認前の
+strategy 候補と承認済 indicator が同居するため、以下の 3 面を追加で塞いでいる:
+(i) module 到達 — `import` 遮断 + 一意名 import (`indicator_<alias>`) で
+`sys.modules` 衝突も防ぐ (ii) df / params の mutation — call ごとに deep copy
+(iii) pandas/numpy の**プロセス全体のグローバル状態** — `check_source` の
+deny 名 (`set_option`/`reset_option`/`set_eng_float_format`/`seterr`/
+`seterrcall`/`setbufsize`/`set_printoptions`) と「外部属性への代入・削除の
+一律拒否」、加えて worker 側で `pd.get_option("mode.chained_assignment")` と
+`np.geterr()` の call 前後不変を assert する。いずれも「善意だが不注意な
+plugin の事故」を防ぐ多層防御であり、悪意ある攻撃者からの完全な隔離を
+保証しない — **最終防衛線は人間承認**。
+
 **実行時ハッシュ再検証 (プラン 7 Task 3 レビュー fix round 1 F1)**:
 `PluginSession.__enter__` は worker 起動前に `loader.content_hash` で
 plugin フォルダを再計算し `meta.content_hash` と照合する (TOCTOU 封鎖 —

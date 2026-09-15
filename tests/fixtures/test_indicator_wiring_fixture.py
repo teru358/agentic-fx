@@ -95,3 +95,18 @@ def test_oracle_produces_hold_during_warmup_then_values(tmp_path):
     # 検出する (open 数 >= 成立 trade 数 なので必要条件)。
     assert opens >= 30, f"fixture produces only {opens} entries — A1 would fail "\
                         "with insufficient_trades (escalate to 指揮者)"
+
+
+def test_design_docs_describe_the_new_plugin_contract():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    design = (root / "docs" / "superpowers" / "specs"
+              / "2026-07-25-agentic-fx-design.md").read_text(encoding="utf-8")
+    assert "compute(df, params) -> dict" in design
+    assert "系列" in design and "indicators" in design
+    phase27 = (root / "docs" / "superpowers" / "plans"
+               / "2026-08-02-phase2-7-plugins.md").read_text(encoding="utf-8")
+    assert "indicators/signals 供給は将来拡張 — None 固定" not in phase27
+    sandbox = (root / "src" / "agentic_fx" / "plugin"
+               / "sandbox.py").read_text(encoding="utf-8")
+    assert "同居" in sandbox and "グローバル状態" in sandbox

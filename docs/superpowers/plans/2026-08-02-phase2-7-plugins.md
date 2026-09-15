@@ -243,7 +243,10 @@ def test_intra_bucket_gap_aggregates_present_bars(tmp_path):
 - Produces: `strategy_adapter.build_intent_source(meta, *, conn, pair: str, source, settings, session=None) -> IntentSource` (1 IntentSource = 1 pair。session は注入シーム — 既定は内部で `PluginSession` を生成・保持し、**バックテスト全体で 1 プロセス**を使い回す):
   1. **発火条件**: `closed_bar.ts + eval_tf 幅` が plugin 宣言 tf のバケット境界 (epoch 錨) に一致する tick のみ。**eval_tf 幅は `closed_bar.interval` から導出** (runner の `_aggregate_bucket` が interval=eval_timeframe を設定する — opus R2 M10。新引数を足さない)。乗らないバーは None
   2. `load_resampled_frame(conn, pair, meta.timeframe, source=source, until=closed_bar.ts + eval_tf 幅, max_bars=meta.max_bars)` — **max_bars は承認時・本番で同じ宣言値** (opus R2 I1)
-  3. session で `evaluate(df, indicators=None, signals=None, params)` (indicators/signals 供給は将来拡張 — None 固定)
+  3. session で `evaluate(df, indicators, signals=None, params)` (**indicators は
+   [indicator-consumption-wiring] (2026-09-14) で配線済み** — strategy が
+   `config.yaml` の `indicators:` で宣言した依存だけが渡る。signals は
+   依然 None 固定)
   4. `action="open"` → open intent dict (`{"action": "open", "pair", "direction", "entry_type", "horizon": "day", "stop_loss", "take_profit", "limit_price" (limit のみ), "expires_in": "4h" (limit のみ), "confidence": 0.5, "reasoning": rationale}`)。`"hold"` → None。**SandboxError は送出したまま貫通** (fail closed)
 - CLI `--plugin <name>`: discover + `check_source` は通す (承認は要求しない — 手元評価は承認前が自然)。`--symbol` が meta.pairs 外なら rc=1。`save_human_run(plugin_ref=<plugins/name>, content_hash=..., kind="strategy")`
 
