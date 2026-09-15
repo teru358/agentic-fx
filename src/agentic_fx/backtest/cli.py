@@ -12,6 +12,7 @@ DB は ``root / "data" / "agentic.db"`` (init 済みを要求 — 無ければ
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import sqlite3
@@ -37,6 +38,7 @@ from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin import strategy_gate
 from agentic_fx.plugin import switch as plugin_switch
+from agentic_fx.plugin import resolve as plugin_resolve
 from agentic_fx.plugin.resolve import (
     IndicatorResolutionError, resolve_indicator_deps,
 )
@@ -140,6 +142,13 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
         "materialize", help="live plain plugin を plugins/_human/<name> へ"
                             "読み取り専用コピーする (0700/0600)")
     materialize_parser.add_argument("name")
+    lock_parser = plugin_sub.add_parser(
+        "lock", help="候補の indicators 依存を現在の配備版でロックする "
+                     "(config.yaml の pin を書き換える)")
+    lock_parser.add_argument("name")
+    lock_parser.add_argument(
+        "--from", dest="from_kind", choices=["_human"], default=None,
+        help="'_human' 必須 (submit/bless と同じ --from 規約)")
     retire_parser = plugin_sub.add_parser(
         "retire", help="legacy plain live plugin を plugins/_retired/ へ退避する"
                        " (flock、未完ジャーナルは拒否)")
@@ -609,6 +618,78 @@ def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
     return 0
 
 
+_LOCK_NO_FROM_ERROR = (
+    "afx plugin lock は候補領域を明示する必要があります。"
+    "'afx plugin lock --from _human <name>' を実行してください "
+    "(配備済 plugin は既にロック済みです)。")
+
+
+def _plugin_lock(conn, settings, args: argparse.Namespace, root: Path) -> int:
+    """[indicator-consumption-wiring] §2.1: 人間の明示的なロック操作。
+    **pin はハーネスが書く** — 作者が 64 hex を写さない。現在の inventory で
+    `pin_mode="ignore"` 解決し (古い pin は上書き)、`lock_config` が
+    `config.yaml` を再シリアライズする (U5: コメント・キー順は保持しない
+    ので差分を表示する)。書き換え後に `discover` を通ることを同じ関数内で
+    確認する (壊れた config を残さない)。
+
+    **snapshot 再取得** (ユーザー裁定 2026-09-14 ⑥): `check_candidate_snapshot`
+    (`gate_pytest.py`) はファイル 3 本の存在・属性しか見ず、lock による
+    内容変更を検査しない。そのため「lock 後も submit は無条件で通る」と
+    決め打ちせず、ここでは `lock_config` が書き込み**後**に返す
+    `new_hash` (disk から再計算した content_hash) を唯一の正とし、
+    `resolve_indicator_deps` 実行時点で得た `meta.content_hash` を
+    使い回さない。`discover_one_with_reason` の再実行結果
+    (`relocked.content_hash`) と一致することも assert する
+    (どちらも同じ disk 状態を独立に読んでいるので、食い違えば
+    `lock_config` かここの配線のバグ)。"""
+    if getattr(args, "from_kind", None) != "_human":
+        print(_LOCK_NO_FROM_ERROR, file=sys.stderr)
+        return 1
+    plugins_dir = root / "plugins"
+    candidate_dir = plugins_dir / "_human" / args.name
+    meta, reason = plugin_loader.discover_one_with_reason(candidate_dir, args.name)
+    if meta is None:
+        print(f"エラー: 候補 {candidate_dir} を読めません ({reason})",
+             file=sys.stderr)
+        return 1
+    if meta.kind != "strategy":
+        print(f"エラー: plugin '{args.name}' の kind は {meta.kind!r} です "
+             "(lock は kind=strategy のみ対象)", file=sys.stderr)
+        return 1
+    inventory = tools_plugin_loader.approved_plugins(
+        conn, plugins_dir, settings=settings)
+    try:
+        resolved = resolve_indicator_deps(
+            meta, inventory.inventory, settings=settings, pin_mode="ignore")
+    except IndicatorResolutionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    before_text, after_text, new_hash = plugin_resolve.lock_config(
+        candidate_dir, resolved.pins())
+    relocked, relock_reason = plugin_loader.discover_one_with_reason(
+        candidate_dir, args.name)
+    if relocked is None:
+        print(f"エラー: ロック後の config.yaml が discover を通りません "
+             f"({relock_reason}) — 元に戻してください", file=sys.stderr)
+        return 1
+    assert relocked.content_hash == new_hash, (
+        "lock_config の snapshot 再取得値と discover の再取得値が食い違う"
+        f" ({new_hash} != {relocked.content_hash})")
+    if before_text == after_text:
+        print(f"lock: {args.name} は既に最新の pin です (変更なし)")
+        return 0
+    print(f"lock: {args.name} content_hash {meta.content_hash} -> "
+         f"{new_hash}")
+    for line in difflib.unified_diff(
+            before_text.splitlines(), after_text.splitlines(),
+            fromfile="config.yaml (before)", tofile="config.yaml (after)",
+            lineterm=""):
+        print(line)
+    print("ロック後に self-test と backtest を再実行してから submit してください "
+         "(テストした artifact == 提出する artifact)")
+    return 0
+
+
 def _improve_verify_backend(conn, settings, args: argparse.Namespace,
                             root: Path) -> int:
     from agentic_fx.core.contracts import SystemClock
@@ -654,6 +735,8 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
                     return _plugin_submit(conn, settings, args, root)
                 if args.plugin_command == "materialize":
                     return _plugin_materialize(conn, settings, args, root)
+                if args.plugin_command == "lock":
+                    return _plugin_lock(conn, settings, args, root)
                 if args.plugin_command == "retire":
                     return _plugin_retire(conn, settings, args, root)
                 if args.plugin_command == "bless":

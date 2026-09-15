@@ -1494,3 +1494,70 @@ def test_cli_backtest_run_plugin_unresolved(tmp_path, capsys, monkeypatch,
     assert conn3.execute(
         "SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == before
     conn3.close()
+
+
+# --- [indicator-consumption-wiring] T3 Step 3-5: afx plugin lock ----------
+
+def test_plugin_lock_writes_pins_and_prints_diff(tmp_path, capsys, monkeypatch):
+    """P1 (人間 CLI): pin を書き、content_hash が変わり、書き換え後も
+    discover を通る。差分を表示する。"""
+    from agentic_fx.plugin.loader import content_hash, discover_one_with_reason
+    root = _cli_root_with_deployed_rsi_pullback(tmp_path)
+    monkeypatch.chdir(root)
+    human = root / "plugins" / "_human"
+    fx.write_rsi_pullback(human, pins=None)     # unpinned な候補
+    before = content_hash(human / "rsi_pullback")
+
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        rc = main(["plugin", "lock", "--from", "_human", "rsi_pullback"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "rsi" in out and "pin" in out
+    meta, reason = discover_one_with_reason(human / "rsi_pullback", "rsi_pullback")
+    assert reason is None
+    assert meta.indicators[0].pin is not None
+    assert content_hash(human / "rsi_pullback") != before
+    # 2 回目は no-op (内容が変わらない)
+    after_first = (human / "rsi_pullback" / "config.yaml").read_text()
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        assert main(["plugin", "lock", "--from", "_human",
+                    "rsi_pullback"]) == 0
+    assert (human / "rsi_pullback" / "config.yaml").read_text() == after_first
+
+
+def test_plugin_lock_without_from_is_refused(tmp_path, capsys, monkeypatch):
+    root = _cli_root_with_deployed_rsi_pullback(tmp_path)
+    monkeypatch.chdir(root)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        assert main(["plugin", "lock", "rsi_pullback"]) == 1
+    assert "--from _human" in capsys.readouterr().err
+
+
+def test_plugin_lock_overwrites_stale_pin(tmp_path, monkeypatch):
+    from agentic_fx.plugin.loader import discover_one_with_reason
+    root = _cli_root_with_deployed_rsi_pullback(tmp_path)
+    monkeypatch.chdir(root)
+    human = root / "plugins" / "_human"
+    fx.write_rsi_pullback(human, pins={"rsi": "a" * 64})
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        assert main(["plugin", "lock", "--from", "_human",
+                    "rsi_pullback"]) == 0
+    meta, _ = discover_one_with_reason(human / "rsi_pullback", "rsi_pullback")
+    assert meta.indicators[0].pin != "a" * 64
+
+
+def test_plugin_lock_reports_unresolvable_dependency(tmp_path, capsys, monkeypatch):
+    import yaml
+    root = _cli_root_with_deployed_rsi_pullback(tmp_path)
+    monkeypatch.chdir(root)
+    human = root / "plugins" / "_human"
+    d = fx.write_rsi_pullback(human, pins=None)
+    cfg = yaml.safe_load((d / "config.yaml").read_text())
+    cfg["indicators"]["rsi"]["plugin"] = "nope"
+    (d / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        assert main(["plugin", "lock", "--from", "_human",
+                    "rsi_pullback"]) == 1
+    assert capsys.readouterr().err.strip().splitlines()[-1] == \
+        "indicator_unresolved:rsi:not_found"
