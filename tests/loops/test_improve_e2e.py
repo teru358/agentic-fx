@@ -2172,3 +2172,39 @@ def test_prompt_inventory_includes_params_outputs_and_hash(tmp_path):
     # 衝突しない `("holdout", "pf=")` に絞る。
     for forbidden in ("holdout", "pf="):
         assert forbidden not in rendered
+
+
+def test_commit_gate_passes_ctx_inventory_identity_to_find_noop_copy(tmp_path):
+    """P4: `_run_plugin_gate` (commit() 経由) は `find_noop_copy` へ
+    `ctx.inventory` を**そのまま**渡す (`_inventory_for_gate` フォール
+    バックは撤去済み — 空 `InventoryBuildResult` へすり替わっていないこと
+    を identity で pin する)。
+
+    [indicator-consumption-wiring] T5b 逸脱是正 (仕上げセッション):
+    Step 5-5c はこの配線を `commit()` の呼び出し箇所だけで確認しており
+    (`inventory=ctx.inventory`)、`find_noop_copy` が実際にその同一
+    オブジェクトを受け取ることを検証するテストが本 Step の
+    コードブロックに存在しなかった (仕上げ時の照合で判明したギャップ)。
+    `inventory=None` (→ `_empty_inventory_result` フォールバック) に
+    戻す逆変異では `tests/loops` 全体が green のまま (実測) — このテストが
+    その判別力ゼロの穴を塞ぐ。"""
+    from unittest.mock import ANY
+
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
+
+    with patch("agentic_fx.loops.improve_loop.find_noop_copy") as spy:
+        spy.return_value = None
+        loop.commit(mission=_mission(ctx), ctx=ctx,
+                    result=_completed_result(
+                        _plugin_artifact("rsi_pullback", kind="strategy")),
+                    now=fx.NOW)
+
+    spy.assert_called_once()
+    assert spy.call_args.kwargs["inventory"] is ctx.inventory
