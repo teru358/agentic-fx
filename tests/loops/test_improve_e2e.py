@@ -2188,8 +2188,6 @@ def test_commit_gate_passes_ctx_inventory_identity_to_find_noop_copy(tmp_path):
     `inventory=None` (→ `_empty_inventory_result` フォールバック) に
     戻す逆変異では `tests/loops` 全体が green のまま (実測) — このテストが
     その判別力ゼロの穴を塞ぐ。"""
-    from unittest.mock import ANY
-
     from tests.fixtures import indicator_wiring as fx
     loop, conn, root, activity = _improve_env_with_activity(tmp_path)
     fx.seed_history(conn)
