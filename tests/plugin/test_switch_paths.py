@@ -1630,6 +1630,73 @@ def test_plugin_lock_order_for_approve_candidate_is_sorted_unique(
     assert acquired == sorted({"rsi_pullback", "rsi"})
 
 
+def test_submit_candidate_locks_the_whole_dependency_set(tmp_path, monkeypatch):
+    """段 0 束 2 M2 (SURVIVED の pin): **submit 経路**の lock 集合が
+    `_dependency_names` 由来であることを固定する。
+
+    既存の `test_plugin_lock_order_for_approve_candidate_is_sorted_unique`
+    は `acquired.clear()` で submit 分を捨てており、
+    `submit_candidate` 側の `_plugin_locks(plugins_root, [name])` という
+    変異 (依存 indicator を lock しない) を 1 件も検出できなかった。
+    submit は `_run_full_gate` の中で inventory を構築するので、依存
+    indicator の lock が抜けると「submit の解決中に依存が承認で差し替わる」
+    窓が開く (§2.3 の lock 集合契約)。"""
+    acquired: list[str] = []
+    import contextlib as _ctx
+    real = plugin_switch._plugin_lock
+
+    @_ctx.contextmanager
+    def _spy(root, name):
+        acquired.append(name)
+        with real(root, name):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    conn, plugins_root = _switch_env(tmp_path)
+    _install_gate_double(monkeypatch)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    acquired.clear()   # deploy_approved が取る lock は対象外
+    fx.write_rsi_pullback(plugins_root / "_human", pins={"rsi": hashes["rsi"]})
+    plugin_switch.submit_candidate(
+        conn, name="rsi_pullback", staging_dir=plugins_root / "_human",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS, now=fx.NOW)
+    assert acquired == sorted({"rsi_pullback", "rsi"})
+
+
+def test_bless_candidate_locks_the_whole_dependency_set(tmp_path, monkeypatch):
+    """段 0 束 2 M3 (SURVIVED の pin): **bless 経路**の lock 集合も
+    `pre_deps` (= `_dependency_names`) 由来であることを固定する。
+
+    `test_bless_detects_candidate_change_between_read_and_lock` は
+    `_plugin_locks` 自体を monkeypatch するので、bless が渡す `names`
+    の中身を一切見ていなかった — `_plugin_locks(plugins_root, [name])`
+    への変異が生存した。"""
+    acquired: list[str] = []
+    import contextlib as _ctx
+    real = plugin_switch._plugin_lock
+
+    @_ctx.contextmanager
+    def _spy(root, name):
+        acquired.append(name)
+        with real(root, name):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    conn, plugins_root = _switch_env(tmp_path)
+    _install_gate_double(monkeypatch)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    d = fx.write_rsi_pullback(plugins_root / "_human",
+                              pins={"rsi": hashes["rsi"]})
+    acquired.clear()
+    plugin_switch.bless_candidate(
+        conn, name="rsi_pullback", human_dir=d, settings=SETTINGS,
+        now=fx.NOW, decided_by="human_cli")
+    assert acquired == sorted({"rsi_pullback", "rsi"})
+
+
 def test_dependency_lock_blocks_a_concurrent_indicator_approval(tmp_path):
     """並行実行の相互排除: S の approve が握っている間、依存 indicator I
     の approve は待たされる。"""

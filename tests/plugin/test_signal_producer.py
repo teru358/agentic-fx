@@ -620,3 +620,53 @@ def test_producer_uses_name_and_hash_identity_not_hash_alone(
         source=SOURCE, settings=SETTINGS,
         resolved_by_identity={("strat_b", shared_hash): sentinel_b})
     assert seen == {"strat_b": sentinel_b}
+
+
+def test_producer_looks_up_resolved_by_key_not_by_dict_position(
+        tmp_path, monkeypatch):
+    """段 0 束 2 M11 (SURVIVED) の pin: `resolved_by_identity` は
+    **キーで引く** — 辞書の先頭要素を無条件に使う変異
+    (`next(iter(resolved_by_identity.values()), None)`) を殺す。
+
+    既存の `test_producer_uses_name_and_hash_identity_not_hash_alone` は
+    評価対象 meta の resolved が**辞書の先頭**に置かれた fixture だった
+    ため、「位置で引く」変異と「キーで引く」実装を区別できなかった。
+    ここでは**無関係な strategy の resolved を先頭**に置き、評価する
+    meta の resolved を後ろに置く。"""
+    import dataclasses
+
+    from agentic_fx.plugin import sandbox as plugin_sandbox
+
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    hash_a = "a" * 64
+    hash_other = "c" * 64
+    meta_a = _meta(name="strat_a", kind="strategy", timeframe="1h",
+                   content_hash=hash_a)
+    meta_other = dataclasses.replace(meta_a, name="strat_other",
+                                     content_hash=hash_other)
+    seen = {}
+
+    class _Spy:
+        def __init__(self, meta, *, settings, resolved=None):
+            seen[meta.name] = resolved
+        def __enter__(self):
+            return self
+        def call(self, payload):
+            return dict(_HOLD)
+        def close(self):
+            return None
+
+    monkeypatch.setattr(plugin_sandbox, "PluginSession", _Spy)
+    sentinel_a = ResolvedIndicatorSet.empty(tmp_path / "a")
+    sentinel_other = ResolvedIndicatorSet.empty(tmp_path / "other")
+    assert sentinel_a != sentinel_other
+    producer = SignalProducer()
+    producer.evaluate_due_plugins(
+        conn, plugins=[meta_a], now=H + timedelta(hours=1),
+        source=SOURCE, settings=SETTINGS,
+        resolved_by_identity={            # ← 先頭は評価しない meta のもの
+            ("strat_other", hash_other): sentinel_other,
+            ("strat_a", hash_a): sentinel_a,
+        })
+    assert seen == {"strat_a": sentinel_a}

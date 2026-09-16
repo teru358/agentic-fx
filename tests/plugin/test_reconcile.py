@@ -438,3 +438,39 @@ def test_switched_journal_with_intact_pin_proceeds_to_decided(tmp_path):
     assert conn.execute(
         "SELECT status FROM approval_requests WHERE id=?",
         (approval_id,)).fetchone()["status"] == "approved"
+
+
+def test_reconcile_resolution_holds_the_dependency_locks(tmp_path, monkeypatch):
+    """段 0 束 2 M16 (SURVIVED) の pin: `_unresolved_after_switch` の
+    `require` 再解決は **strategy + 依存 indicator の lock の内側**で行う。
+
+    `with _plugin_locks(...)` を `if True:` へ潰す変異 (lock を取らずに
+    inventory を読む) は R2 の 2 本を含め既存 pin を 1 本も落とさなかった。
+    lock が無いと「reconcile が inventory を読む間に別プロセスが依存
+    indicator を承認する」窓が開き、reconcile が古い inventory で
+    「解決できた」と判断して live に未解決 strategy を残し得る (§2.4)。"""
+    acquired: list[str] = []
+    import contextlib as _ctx
+    real = plugin_switch._plugin_lock
+
+    @_ctx.contextmanager
+    def _spy(root, name):
+        acquired.append(name)
+        with real(root, name):
+            yield
+
+    conn, plugins_root, activity = _reconcile_env(tmp_path)
+    from tests.fixtures import indicator_wiring as fx
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    _stage_switched_journal(
+        conn, plugins_root, name="rsi_pullback",
+        pins={"rsi": hashes["rsi"]}, now=fx.NOW)
+    _bump_indicator_version(conn, plugins_root, "rsi", now=fx.NOW)
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=fx.NOW, settings=SETTINGS,
+        activity=activity)
+
+    assert acquired == sorted({"rsi_pullback", "rsi"})
