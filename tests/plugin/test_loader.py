@@ -1089,3 +1089,30 @@ def test_indicator_ref_params_too_large(tmp_path):
     meta, reason = loader.discover_one_with_reason(d, "sbig")
     assert meta is None
     assert reason == "params_too_large:indicators.rsi.params"
+
+
+# --- codex r1 束1 Important: YAML の非 hashable mapping key -----------------
+
+def test_unhashable_yaml_key_is_rejected_as_invalid_yaml(tmp_path):
+    """`? [a, b]` のような sequence key は `_construct_mapping_no_duplicates`
+    の `key in mapping` / `mapping[key] = ...` で `TypeError: unhashable
+    type: 'list'` になる。この TypeError は `_discover_one` の
+    `yaml.YAMLError` 捕捉にも `discover()` の OSError 捕捉にも入らないため、
+    フォルダ単位 reject (L1) にならず discovery 全体が落ちる。`yaml.YAMLError`
+    系へ写像してフォルダ単位の reject にすること。"""
+    d = _write(tmp_path, "unhashable", plugin_py=_INDICATOR_PY,
+               config_yaml="kind: indicator\n? [a, b]\n: 1\n")
+    meta, reason = loader.discover_one_with_reason(d, "unhashable")
+    assert meta is None
+    assert reason is not None and reason.startswith("invalid YAML")
+
+
+def test_unhashable_yaml_key_does_not_stop_discovery_of_other_plugins(tmp_path):
+    """同上の隔離契約: 不正な 1 plugin が他 plugin の discovery を止めない。"""
+    root = tmp_path / "plugins"
+    root.mkdir()
+    _write(root, "bad", plugin_py=_INDICATOR_PY,
+           config_yaml="kind: indicator\n? [a, b]\n: 1\n")
+    _write(root, "good", plugin_py=_INDICATOR_PY,
+           config_yaml="kind: indicator\noutputs: [v]\n")
+    assert [m.name for m in loader.discover(root)] == ["good"]

@@ -64,6 +64,20 @@ def _construct_mapping_no_duplicates(loader: yaml.SafeLoader, node: yaml.Node,
     mapping: dict = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
+        # codex r1 束1 Important: YAML の複合キー (`? [a, b]` / `? {a: 1}`) は
+        # list / dict になり、`key in mapping` が生の `TypeError:
+        # unhashable type` を送出する。この TypeError は `_discover_one` の
+        # `yaml.YAMLError` 捕捉にも `discover()` の OSError 捕捉にも入らない
+        # ので、不正な 1 plugin が **他 plugin の discovery まで止めて**
+        # しまう (L1 の「フォルダ単位 reject」と loader の隔離契約に反する)。
+        # PyYAML 自身の `construct_mapping` と同じく `ConstructorError`
+        # (= `yaml.YAMLError` のサブクラス) へ写像する。
+        try:
+            hash(key)
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark,
+                f"found unhashable key ({exc})", key_node.start_mark) from exc
         if key in mapping:
             raise yaml.YAMLError(f"duplicate key {key!r} in mapping")
         mapping[key] = loader.construct_object(value_node, deep=deep)
