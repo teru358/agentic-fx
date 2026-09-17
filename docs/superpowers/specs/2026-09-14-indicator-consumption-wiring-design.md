@@ -1,4 +1,4 @@
-# [indicator-consumption-wiring] 設計書 v1.4
+# [indicator-consumption-wiring] 設計書 v1.5
 
 束: 指標層 → 戦略層の配線。strategy plugin が `config.yaml` で宣言した配備済 indicator plugin の出力を、strategy worker 内で計算して `evaluate(df, indicators, ...)` に渡す。依存の版は `config.yaml` の `pin` (= `content_hash` の署名対象) に書き込む「ロック方式」で固定する。ユーザー裁定 U1〜U3 (2026-09-13)、下書き `tmp/design-indicator-wiring/design.md` v0.1〜v0.9 を codex 設計レビュー 9 周 (r1〜r3 sol、r4〜r6 sol、r7〜r9 terra) + opus 独立レビュー 1 周で収束 (r9: Critical 0 / Important 0 / Minor 0)。**v1.4 = 実装プランの codex レビュー r1 (2026-09-15) で判明した §6 S1 の U4 との自己矛盾を訂正**。v1.3 = 実装プランの指揮者裁定 (2026-09-14) で判明した §6 の 2 行 (F2 / P2') を実装プランの申し送りに合わせて改訂。v1.2 = 実装プランの着手前検証 (opus r1) で判明した §6 の 2 行 (C1 / R1) を現物に合わせて改訂。v1.1 = §7 の裁定を反映、実装着手可 (writing-plans へ)。
 
@@ -164,6 +164,14 @@ params: {...}
 ## 5. 遮断・規律との照合
 
 - 遮断 8: 新 tool / inventory 追加分は params/outputs/content_hash のみ。`last_result` 新語彙 = `indicator_unresolved` (alias なし)。
+- **遮断 8 の sink 一覧** (改善 worker に文字列が届く経路。pin は**この 6 つすべて**に対して置くこと — 1 sink だけ見る pin が他の sink の漏れを見逃した事故が段 0 で 2 件 (M4 / M14)):
+  1. `improvement_backlog.last_result` — 固定文言のみ (`indicator_unresolved` / `outputs_required`)。alias も cause も付けない
+  2. `gate_failed` activity の `reason` — 同上。alias/cause は**activity 行の追加フィールド**にだけ書く (activity は agent に渡らない)
+  3. prompt (`improve_mission.md` + `current_inventory`) — §2.9 (a) の`params` / `outputs` / `content_hash` のみ
+  4. **改善 RPC 応答** — §2.9 (c) の `{"started": false, "error": "indicator_unresolved", "alias", "reason", "available": [...]}`。**alias / reason はここでは載せる** (解決失敗の種別 = `pin_mismatch` 等であり holdout 由来の情報ではない。agent が自分の `config.yaml` を是正するのに必要 — codex r4 C1 で確定)
+  5. 提案レポート本文 (`reason` / `report_detail`) — 固定文言のみ
+  6. `inventory_view` (子 tool `list_deployed_plugins` / `lock_staging_deps` が読む) — §2.9 (b) の 6 キーのみ
+  いずれの sink にも **holdout の数値・段名 (`in_sample`/`holdout`)・pair・baseline 差分**を載せない。
 - tool 予算: `list_deployed_plugins` / `lock_staging_deps` は `max_tool_calls` のみ。未解決 `run_backtest` は予約を解放するので backtest 枠を消費しないが `errors` / refusal streak に計上。
 - `IMPROVE_FORBIDDEN` 非交差 (pin)。`_KNOWN_CONFIG_KEYS` fail closed (kind 限定 + allowlist)。`check_source` allowlist + deny 追加、`__enter__` で再適用。`approved_plugins` の hash 一致規律 = 第 1 相そのまま、第 2 相はその延長。`run_kind_gate` 非送出 / `_run_full_gate` 送出。noop gate は pin 除去後の config で比較 (§2.7、ロックだけで noop を回避できない)。外向きリクエストなし。Landlock 変更なし。
 
@@ -314,6 +322,7 @@ params: {...}
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-17 | v1.5 | §5 の遮断 8 の行に **sink 一覧 (6 経路)** を追記。各 sink に何を載せてよいかを逐語で列挙し、**改善 RPC 応答だけは alias/reason/available を載せる** (§2.9c、codex r4 C1 で確定済) ことを明示 | 段 0 束 3 の改善提案 1 — 遮断 8 の pin が 1 sink しか見ておらず他 sink の漏れを見逃した事故が 2 件 (M4 / M14)。1 周目 codex 束 2 も「RPC 応答の alias/reason は規律違反」と Critical を上げており (= 却下、§2.9c が正)、**どの sink に何を載せるかが設計書 §5 から読み取れない**ことが両者の共通原因 | - |
 | 2026-09-15 | v1.4 | §6 S1 の「配備済 `rsi_wilder` 相当 (スカラー、outputs なし) は無変更で `get_indicators` **と依存の両方**で使える」を「**standalone `get_indicators` でのみ**使える (strategy の依存先にはできない — resolver `outputs_undeclared`、それは U4b の観測点)」へ訂正。あわせて系列末尾射影・NaN キー除去の記述を同じ行に明示 | **§0 U4 (2026-09-14 ユーザー裁定) と §6 U4b が「outputs 宣言なしは依存先にできない」と定めているのに、S1 だけが v1.1 以前の文言 (依存でも使える) のまま残っていた自己矛盾**。全受入 ID を逐語 pin する実装プランは S1 と U4b を同時に満たせない (codex プランレビュー r1 の Important、`tmp/plan-indicator-wiring/codex-plan-r1.md`) | - |
 | 2026-09-14 | v1.3 | §6 の F2 (pin 破れ strategy の観測を「producer の plugin 一覧に含まれない」に絞り、session cache 未登録はその帰結として別途観測しない) と P2' (「逆順で取っても deadlock しない」という実測不能な主張を、`_plugin_lock` の取得順序が常に名前昇順・重複なしであることを spy で pin する形に置換) を改訂。指揮者の実装プラン既定選択 8 件のうち①(validator の置き場 = `core/plugin_contract.py`)と⑥(lock 後は snapshot を取り直す)をユーザー裁定で変更、②③④⑤⑦⑧は変更なしで採用 | ユーザー裁定 (2026-09-14、実装プラン `docs/superpowers/plans/2026-09-14-indicator-consumption-wiring.md` 側の指揮者の既定選択 8 件 + 申し送り 2 件の確定) | - |
 | 2026-09-13 | v0.1〜v0.4a | 初稿 → codex r1 (C5/I10/M2) / r2 (C3/I12/M1) / r3 (C3/I8/M2)。identity 論点が 3 周連続 Critical → v0.4 で §2.7 を作り直し (pin を config.yaml に書くロック方式、`execution_hash` 撤回)。r4 部分 (`pin_mode` 3 値) | 設計レビュー | - |
