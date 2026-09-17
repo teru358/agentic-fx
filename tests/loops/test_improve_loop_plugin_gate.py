@@ -375,6 +375,34 @@ def test_relocked_copy_of_a_deployed_strategy_is_not_a_noop(tmp_path):
                           name="rsi_pullback", inventory=inventory) is None
 
 
+def test_relock_exemption_applies_only_to_the_same_named_deployed_plugin(
+        tmp_path):
+    """段 0 束 2 M10 (SURVIVED) の pin: 再ロック例外は **同名**の配備物との
+    比較にだけ効く (`item.name == name`)。
+
+    **別名**の配備物 D (pin I1) と `strip_pins` 同値な候補 C (pin I2、名前は
+    別) は、C の pin が今の inventory と一致していても「D の逐語コピー」で
+    あることに変わりはない — noop として弾かれなければならない。
+    `is_same_name` を `True` に潰す変異 (= どの配備物に対しても再ロック例外
+    を適用する) は既存 pin では 1 本も落ちなかった。"""
+    import shutil
+    from agentic_fx.plugin.resolve import lock_config, resolve_indicator_deps
+    plugins_root = tmp_path / "plugins"
+    fx.write_indicator(plugins_root, "rsi")            # = I2 (現在 inventory)
+    inventory = _inventory_of(plugins_root, ["rsi"])
+    snapshot = tmp_path / "snap"
+    deployed = fx.write_rsi_pullback(snapshot, pins={"rsi": "a" * 64})
+    shutil.move(str(deployed), str(snapshot / "other_strategy"))   # 別名で配備
+    cand = fx.write_rsi_pullback(tmp_path / "staging", pins={"rsi": "a" * 64})
+    meta, _ = plugin_loader.discover_one_with_reason(cand, "rsi_pullback")
+    lock_config(cand, resolve_indicator_deps(
+        meta, inventory.inventory, settings=SETTINGS, pin_mode="ignore").pins())
+    assert find_noop_copy(cand, source_snapshot_dir=snapshot,
+                          examples_dir=snapshot / "_examples",
+                          name="rsi_pullback",
+                          inventory=inventory) == "other_strategy"
+
+
 def test_same_copy_without_relock_is_a_noop(tmp_path):
     """P4: 同じ複製を pin I1 のまま (再ロックなし) 提出すると
     `noop_copy_of:rsi_pullback`。"""

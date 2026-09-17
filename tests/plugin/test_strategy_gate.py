@@ -759,3 +759,64 @@ def test_f9_2_holdout_stage_helper_is_shared_not_duplicated(
     # 共有 spy を経由していれば FAIL に反転する。
     assert verdict.floor_reason == "unprofitable"
     assert verdict.floor_detail == "forced-by-holdout-spy"
+
+
+# --- 段 0 束 2 M8 (SURVIVED) の pin: baseline 判定の正本は inventory ---
+
+def _inventory_with(names_kinds):
+    """`InventoryBuildResult` の最小 double (`evaluate_strategy_adoption_gate`
+    は `inventory.inventory.metas` の name/kind しか読まない)。"""
+    from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
+    metas = tuple(_meta(name=n, content_hash=f"h-{n}") if k == "strategy"
+                  else PluginMeta(name=n, kind=k, path=Path("/tmp/x"),
+                                  params={}, timeframe="1h",
+                                  pairs=("USDJPY",), max_bars=1000,
+                                  content_hash=f"h-{n}")
+                  for n, k in names_kinds)
+    inv = ApprovedInventory(root=Path("/nonexistent"), metas=metas)
+    return InventoryBuildResult(inventory=inv, phase1_metas=metas,
+                                resolved={}, rejected_strategies=())
+
+
+def _stub_runs(monkeypatch):
+    _fake_intent_source(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample",
+        lambda *a, **kw: _metrics(trades=30, pf=1.2))
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate",
+        lambda *a, **kw: _metrics(trades=30, pf=1.1))
+
+
+def test_baseline_ignores_an_approved_row_that_is_not_in_the_inventory(
+        monkeypatch, conn_with_approved_strategy):
+    """[indicator-consumption-wiring] §2.7 (段 0 束 2 M8 の pin):
+    `approval_requests` に approved 行があっても、**pin 破れで
+    `ApprovedInventory` から外れている**同名 strategy は baseline に
+    ならない (それは既に live で動いていない)。
+
+    既存の 2 本 (`..._uses_live_d4_approved_same_name_strategy` /
+    `..._falls_back_to_no_strategy_when_no_approved_same_name`) は
+    どちらも SQL と inventory が同じ答えを返す fixture だったため、
+    `if False and inventory is not None:` (= 旧 SQL 判定へ丸ごと戻す)
+    変異が生存していた。"""
+    _stub_runs(monkeypatch)
+    verdict = evaluate_strategy_adoption_gate(
+        conn_with_approved_strategy, name="myst", pairs=["USDJPY"],
+        resolved=_EMPTY, inventory=_inventory_with([("rsi", "indicator")]),
+        timeframe="1h", content_hash="h2", now=datetime(2026, 8, 22),
+        settings=_SETTINGS, meta=_meta(content_hash="h2"))
+    assert verdict.baseline_variant == "no_strategy"
+
+
+def test_baseline_uses_the_inventory_even_without_an_approved_row(
+        monkeypatch, conn):
+    """同 pin の裏: approved 行が無くても inventory に同名 strategy が
+    居れば baseline になる (SQL へ戻す変異はここで `no_strategy` を返す)。"""
+    _stub_runs(monkeypatch)
+    verdict = evaluate_strategy_adoption_gate(
+        conn, name="myst", pairs=["USDJPY"],
+        resolved=_EMPTY, inventory=_inventory_with([("myst", "strategy")]),
+        timeframe="1h", content_hash="h2", now=datetime(2026, 8, 22),
+        settings=_SETTINGS, meta=_meta(content_hash="h2"))
+    assert verdict.baseline_variant == "baseline"
