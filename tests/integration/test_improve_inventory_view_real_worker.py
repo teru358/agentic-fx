@@ -85,9 +85,12 @@ def test_real_improve_worker_serves_the_prepare_time_inventory_view(tmp_path):
     source_snapshot = workdir / "source"
     source_snapshot.mkdir(mode=0o500)
 
-    # prepare 時の view を作った後で「live な plugins/」が変わっても、worker が
-    # 返すのは view のままであること (worker は plugins/ を読まない) を観測
-    # できるように、live 側の別名 plugin を用意しておく。
+    # 「prepare 後に live plugins/ を変えても view のまま」の対照。**判別力の
+    # 限界を明示しておく**: improve worker は handshake の `plugins_dir` が
+    # `None` で、Landlock で plugins/ へ到達もできない。したがって下の ③ は
+    # 配線がどう壊れていても落ちない (構造的に不可能な混入の確認)。**本テスト
+    # の判別力は ① (`out == _VIEW`) にある** — handshake キー名・引数名・
+    # registry 登録のいずれかがずれれば ① だけが落ちる (変異確認済)。
     live_plugins = tmp_path / "plugins"
     (live_plugins / "added_after_prepare").mkdir(parents=True)
     (live_plugins / "added_after_prepare" / "config.yaml").write_text(
@@ -134,7 +137,8 @@ def test_real_improve_worker_serves_the_prepare_time_inventory_view(tmp_path):
         by_name = {p["name"]: p for p in out["plugins"]}
         assert by_name["legacy"]["outputs"] is None
         assert by_name["rsi_wilder"]["outputs"] == ["rsi"]
-        # ③ live plugins/ と staging 候補は view に現れない
+        # ③ live plugins/ と staging 候補は view に現れない (上記のとおり
+        #    この 3 行は判別力を持たない — 契約の読み手向けの明示)
         names = set(by_name)
         assert names == {"rsi_wilder", "legacy"}
         assert "added_after_prepare" not in names
