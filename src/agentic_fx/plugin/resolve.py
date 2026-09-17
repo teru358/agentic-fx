@@ -23,7 +23,7 @@ from typing import Any, Literal, Mapping
 
 import yaml
 
-from agentic_fx.plugin.loader import PluginMeta, content_hash
+from agentic_fx.plugin.loader import PluginMeta, _check_json_safe, content_hash
 
 # 展開後の canonical handshake 総 byte 数の上限 (設計書 §2.2、codex r5 C1)。
 # 既存 `sandbox._STARTUP_MAX_BYTES` (65536、worker → 親の起動応答) とは
@@ -138,7 +138,21 @@ class InventoryBuildResult:
 
 def _merge_params(base: dict, override: dict) -> dict:
     """indicator の params の deep copy に strategy 側を 1 段上書き
-    (設計書 §2.3)。base は絶対に書き換えない。"""
+    (設計書 §2.3)。base は絶対に書き換えない。
+
+    **codex r1 束1 Important**: `json.dumps` は非 str キー (int / float /
+    bool) を JSON object key の**文字列へ暗黙変換**するので、roundtrip の
+    後に `allow_nan=False` だけを見ても `{1: "x"}` は `{"1": "x"}` として
+    素通りしてしまう。§2.2/§2.3 は params の dict key を str に限定して
+    いるので、**merge の前に**両辺へ loader と同じ再帰型検査 (`str` キー・
+    有限数) をかけ、`ValueError` にして呼び出し元の
+    `params_not_json_safe` へ写像する。同時に、キー型が混在したときに
+    後段の `json.dumps(..., sort_keys=True)` が生の `TypeError` を
+    送出する経路 (handshake 検査は try の外にある) も塞ぐ。"""
+    for label, obj in (("base", base), ("override", override)):
+        bad = _check_json_safe(obj, label)
+        if bad is not None:
+            raise ValueError(bad)
     merged = json.loads(json.dumps(base))   # deep copy (JSON-safe が前提)
     merged.update(json.loads(json.dumps(override)))
     return merged

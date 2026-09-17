@@ -167,6 +167,51 @@ def test_resolve_params_not_json_safe_after_merge(tmp_path):
     assert (ei.value.alias, ei.value.reason) == ("rsi", "params_not_json_safe")
 
 
+@pytest.mark.parametrize("bad_params", [
+    {1: "x"},                       # 非 str キー (int)
+    {"outer": {(1, 2): "x"}},       # 入れ子の非 str キー (tuple)
+])
+def test_resolve_non_string_param_keys_are_rejected(tmp_path, bad_params):
+    """codex r1 束1 Important: `_merge_params` の `json.dumps` は非 str キーを
+    **JSON object key の文字列へ暗黙変換**するので、merge 後に
+    `allow_nan=False` だけを見ても非 str キーは検出できない (`{1: "x"}` は
+    `{"1": "x"}` になって素通りする)。§2.2/§2.3 は params の dict key を str に
+    限定しているので、merge の**前**に再帰型検査をかけて
+    `params_not_json_safe` へ写像すること。"""
+    root = tmp_path / "plugins"
+    ind = _indicator(root, "rsi")
+    from agentic_fx.plugin.loader import IndicatorRef
+    s = _strategy(tmp_path / "c", "s", "indicators:\n  rsi: {plugin: rsi}\n")
+    broken = PluginMeta(
+        name=s.name, kind=s.kind, path=s.path, params=s.params,
+        timeframe=s.timeframe, pairs=s.pairs, max_bars=s.max_bars,
+        content_hash=s.content_hash, artifact_hash=s.artifact_hash,
+        indicators=(IndicatorRef(alias="rsi", plugin="rsi",
+                                 params=bad_params, pin=None),),
+        outputs=None)
+    with pytest.raises(IndicatorResolutionError) as ei:
+        resolve_indicator_deps(broken, _inv(root, ind), settings=SETTINGS,
+                               pin_mode="check")
+    assert (ei.value.alias, ei.value.reason) == ("rsi", "params_not_json_safe")
+
+
+def test_resolve_non_string_param_keys_on_the_dependency_side_are_rejected(tmp_path):
+    """同上の対: 上書き側だけでなく **indicator 側の `params`** が loader 通過後に
+    非 str キーへ変わった場合も fail closed にする。"""
+    root = tmp_path / "plugins"
+    ind = _indicator(root, "rsi")
+    broken_dep = PluginMeta(
+        name=ind.name, kind=ind.kind, path=ind.path, params={1: "x"},
+        timeframe=ind.timeframe, pairs=ind.pairs, max_bars=ind.max_bars,
+        content_hash=ind.content_hash, artifact_hash=ind.artifact_hash,
+        indicators=ind.indicators, outputs=ind.outputs)
+    s = _strategy(tmp_path / "c", "s", "indicators:\n  rsi: {plugin: rsi}\n")
+    with pytest.raises(IndicatorResolutionError) as ei:
+        resolve_indicator_deps(s, _inv(root, broken_dep), settings=SETTINGS,
+                               pin_mode="check")
+    assert (ei.value.alias, ei.value.reason) == ("rsi", "params_not_json_safe")
+
+
 def test_resolve_unpinned_only_fails_under_require(tmp_path):
     root = tmp_path / "plugins"
     ind = _indicator(root, "rsi")
