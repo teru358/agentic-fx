@@ -2933,6 +2933,54 @@ def test_worker_runner_run_context_none_omits_three_handshake_keys(
     assert "source_snapshot_dir" not in handshake
 
 
+def test_worker_runner_handshake_carries_the_run_context_inventory_view(
+        monkeypatch, tmp_path):
+    """[indicator-consumption-wiring] P3 / 段 0 束 3 M1: handshake の
+    `inventory_view` は **run_context の値そのまま**。
+
+    既存のフェイク Mission / `_FakeRunContext` は 6 箇所すべて
+    `inventory_view = {}` を持つため、`WorkerRunner.run()` の
+    `"inventory_view": self._run_context.inventory_view` を `{}` へ
+    固定する変異は判定 suite 全体 (1355 passed) が green のままだった
+    (実測)。**非空の view** を載せて初めて透通が見える — T5b impl-report
+    の申し送り (3) が指摘した「handshake のキー追加を fake が追随する
+    だけで、値が運ばれるかは誰も見ていない」穴を塞ぐ。"""
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        return orig_popen([sys.executable, "-c",
+                           "import sys, json\n"
+                           "line = sys.stdin.readline()\n"
+                           "open('%s', 'w').write(line)\n"
+                           "print(json.dumps({'type':'ready','seq':1,'ok':True}))\n"
+                           % str(tmp_path / 'handshake.json')], **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", spy)
+
+    source_origin = tmp_path / "source_origin"
+    source_origin.mkdir(mode=0o500)
+    view = {"plugins": [{"name": "rsi", "kind": "indicator", "pairs": [],
+                         "params": {"period": 14}, "outputs": ["rsi"],
+                         "content_hash": "a" * 64}],
+            "pin_broken_strategies": [
+                {"name": "rsi_pullback", "alias": "rsi",
+                 "reason": "pin_mismatch"}]}
+
+    class _FakeRunContext:
+        mission_id = 42
+        staging_dir = tmp_path / "staging"
+        source_snapshot_dir = source_origin
+        inventory_view = view
+
+    root = _root(tmp_path)
+    runner = WorkerRunner(root=root, settings=SETTINGS, clock=FixedClock(NOW),
+                          rag=_rag(tmp_path), worker_profile="improve",
+                          run_context=_FakeRunContext())
+    runner.run(_mission())
+    handshake = json.loads((tmp_path / "handshake.json").read_text())
+    assert handshake["inventory_view"] == view
+
+
 # Step 36a-36d: cli_started pgid recovery tests
 _FAKE_CHILD_WITH_CLI_STARTED = (
     "import json, subprocess, sys, time\n"

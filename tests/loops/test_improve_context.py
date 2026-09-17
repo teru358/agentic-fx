@@ -144,3 +144,28 @@ def test_performance_report_window_boundary_narrows_to_90_days_not_61(tmp_path):
     ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=None)
     assert ctx["performance_report"]["by_pair"]["USDJPY"]["count"] == 2
+
+
+def test_inventory_view_overrides_the_live_plugins_dir(tmp_path):
+    """[indicator-consumption-wiring] P3 / 段 0 束 3 M6: `inventory_view` が
+    渡されたら prompt の `approved_plugins` は **その view だけ**から作る —
+    live `plugins/` は読まない (prepare 後に配備が変わっても mission 中の
+    prompt は不変)。
+
+    `if inventory_view is not None:` を `if False:` にして live 経路へ
+    倒す変異は判定 suite 全体 (1355 passed) が green のままだった (実測) —
+    既存テストはどれも view と live `plugins/` が同じ答えを返す形
+    (fixture の縮退) なので、どちらの経路を通ったか区別できていなかった。
+    ここでは **live に何も無い / view にだけ居る** 形にして経路を分ける。"""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    view = {"plugins": [{"name": "rsi", "kind": "indicator", "pairs": [],
+                         "params": {"period": 14}, "outputs": ["rsi"],
+                         "content_hash": "a" * 64}],
+            "pin_broken_strategies": []}
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
+                                allowed_backlog_ids=None, inventory_view=view)
+    assert [p["name"] for p in ctx["current_inventory"]["approved_plugins"]] \
+        == ["rsi"]
+    # 遮断 8: view にしか無い情報でも成績・期間・段名は載らない
+    assert set(ctx["current_inventory"]["approved_plugins"][0]) == {
+        "name", "kind", "pairs", "params", "outputs", "content_hash"}

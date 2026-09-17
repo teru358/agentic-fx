@@ -606,6 +606,29 @@ def test_response_without_started_key_keeps_the_reservation(tmp_path):
     assert counters.backtest_calls["cand"] == 1
 
 
+def test_unstarted_response_is_never_counted_as_a_backtest_result(tmp_path):
+    """[indicator-consumption-wiring] §2.9(c) / 段 0 束 3 M10:
+    `started: False` の応答は **`record_backtest_result` の母集団に入れない**
+    (解放だけして結果は数えない)。
+
+    `record_backtest_result` 側のガード
+    (`and result.get("started") is not False`) を外す変異は判定 suite 全体
+    (1355 passed) が green のままだった (実測) — 現行の親 handler は
+    `started:false` に必ず `error` を載せるので `_is_successful_backtest` が
+    `False` を返し、`record_backtest_result` が冒頭 `if not ok: return` で
+    no-op になるため。つまりこのガードは **`error` を伴わない `started:false`**
+    (将来の handler / 別実装) に対する fail closed の防御であり、その到達
+    経路を明示的に作って pin する。`test_response_without_started_key_keeps_
+    the_reservation` (F4 の裏、解放しない側) と対になる。"""
+    counters = MissionToolCounters(budget=_budget())
+    tools = _rpc_tools(tmp_path, counters=counters,
+                       run_backtest_handler=lambda args: {
+                           "started": False, "metrics": {"trades": 5}})
+    tools["run_backtest"](name="cand", pair="USDJPY")
+    assert counters.backtest_calls["cand"] == 0        # 予約は戻っている
+    assert counters.successful_backtests["cand"] == 0  # 結果は数えていない
+
+
 def test_started_true_keeps_the_reservation(tmp_path):
     counters = MissionToolCounters(budget=_budget())
     tools = _rpc_tools(tmp_path, counters=counters,

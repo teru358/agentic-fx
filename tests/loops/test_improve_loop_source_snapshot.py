@@ -302,3 +302,49 @@ def test_prepare_populates_a_non_empty_inventory(tmp_path):
     assert ctx.inventory_view["plugins"][0]["name"] == "rsi"
     # handlers も同じ inventory を握っている (既定 None のまま作られていない)
     assert ctx.rpc_handlers["run_backtest"] is not None
+
+
+# --- 段 0 変異スイープ 束 3 (2026-09-17): build_inventory_view の生存変異 pin ---
+
+def _meta_for_view(name, kind, *, outputs):
+    from agentic_fx.plugin.loader import PluginMeta
+    return PluginMeta(name=name, kind=kind, path=Path("/nonexistent") / name,
+                      params={"period": 14}, timeframe=None, pairs=(),
+                      max_bars=200, content_hash="a" * 64, outputs=outputs)
+
+
+def _result_for_view(metas):
+    from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
+    return InventoryBuildResult(
+        inventory=ApprovedInventory(root=Path("/nonexistent"), metas=tuple(metas)),
+        phase1_metas=tuple(metas), resolved={}, rejected_strategies=())
+
+
+def test_inventory_view_entries_carry_exactly_the_six_allowed_keys():
+    """遮断 8 (段 0 束 3 M4): `build_inventory_view` の 1 件は
+    name / kind / pairs / params / outputs / content_hash の **6 キー
+    ちょうど**。成績・期間・段名を足す変異 (`metrics` / `holdout` / `pf`)
+    は判定 suite 全体が green のままだった (実測) — `list_deployed_plugins`
+    は view を逐語で子へ返すので、ここで足したキーはそのまま agent に届く。
+    既存の `test_list_deployed_plugins_returns_the_view_verbatim` は
+    手組みの view を使うため、**生成側**のキー集合は誰も見ていなかった。"""
+    from agentic_fx.loops.improve_loop import build_inventory_view
+    view = build_inventory_view(
+        _result_for_view([_meta_for_view("rsi", "indicator", outputs=("rsi",))]))
+    assert set(view["plugins"][0]) == {
+        "name", "kind", "pairs", "params", "outputs", "content_hash"}
+
+
+def test_inventory_view_keeps_outputs_none_distinguishable_from_empty():
+    """U4 (段 0 束 3 M5): `outputs` 未宣言の indicator は view 上で
+    **`None`** — `[]` へ潰す変異は判定 suite 全体が green のままだった
+    (実測)。`lock_staging_deps` の `outputs_undeclared` 拒否は
+    `dep["outputs"] is None` で判定するので、`[]` になると「宣言済だが
+    出力ゼロ」として依存先に選べてしまう。"""
+    from agentic_fx.loops.improve_loop import build_inventory_view
+    view = build_inventory_view(_result_for_view([
+        _meta_for_view("legacy", "indicator", outputs=None),
+        _meta_for_view("rsi", "indicator", outputs=("rsi",))]))
+    by_name = {p["name"]: p for p in view["plugins"]}
+    assert by_name["legacy"]["outputs"] is None
+    assert by_name["rsi"]["outputs"] == ["rsi"]

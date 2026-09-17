@@ -951,3 +951,37 @@ def test_lock_staging_deps_keeps_the_candidate_discoverable(tmp_path):
     meta, reason = discover_one_with_reason(staging / "rsi_pullback",
                                             "rsi_pullback")
     assert reason is None and meta.indicators[0].pin == "c" * 64
+
+
+def test_lock_staging_deps_rolls_back_when_the_locked_config_stops_loading(
+        tmp_path, monkeypatch):
+    """[indicator-consumption-wiring] 段 0 束 3 M8: `lock_staging_deps` は
+    pin を書いた**後**に `discover_one_with_reason` を通し、通らなければ
+    `config.yaml` を書き戻して `loader_rejected_after_lock` を返す。
+
+    この再検査ブロック (と `content_hash` 一致 assert) を丸ごと削る変異は
+    判定 suite 全体 (1355 passed) が green のままだった (実測) —
+    `test_lock_staging_deps_keeps_the_candidate_discoverable` は **tool の
+    外で** discover し直すだけで、tool 自身が再検査しているかは見ていない。
+    ユーザー裁定 2026-09-14 ⑥ (「lock 後に無条件で submit が通ると決め打ち
+    しない」) が構造的に守られていることを pin する。"""
+    from agentic_fx.plugin import loader as plugin_loader
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    cand = fx.write_rsi_pullback(staging, pins=None)
+    before = (cand / "config.yaml").read_text(encoding="utf-8")
+
+    real = plugin_loader.discover_one_with_reason
+    calls = {"n": 0}
+
+    def _fail_on_second(plugin_dir, name):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            return None, "synthetic post-lock failure"
+        return real(plugin_dir, name)
+
+    monkeypatch.setattr(improve_staging_tools.plugin_loader,
+                        "discover_one_with_reason", _fail_on_second)
+    out = _tools(tmp_path)["lock_staging_deps"]("rsi_pullback")
+    assert out.get("error", "").startswith("loader_rejected_after_lock:"), out
+    assert (cand / "config.yaml").read_text(encoding="utf-8") == before
