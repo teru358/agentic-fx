@@ -1604,3 +1604,45 @@ def test_trade_worker_indicator_metas_is_empty_without_a_plugins_dir(tmp_path):
     SETTINGS = load_settings(_REPO_ROOT / "config" / "settings.yaml.example")
     assert mission_worker._build_trade_indicator_metas(
         MagicMock(), None, SETTINGS) == []
+
+
+def test_main_forwards_the_handshake_inventory_view_to_the_improve_mission():
+    """[indicator-consumption-wiring] P3 / 段 0 束 3 M2: `main()` の improve
+    分岐は `_run_improve_mission(...)` へ **handshake の `inventory_view`**
+    を渡す (親 → 子 tool への唯一の経路)。
+
+    `inventory_view=None` へ固定する変異は判定 suite 全体 (1355 passed) が
+    green のままだった (実測) — 既存テストは `_run_improve_mission` を
+    直接呼ぶ (= main の呼び出し辺を通らない) か、`_build_improve_registry`
+    を `inventory_view=None` 既定の lambda で差し替えているだけで、
+    **main が実際に何を渡すか**を誰も見ていない。
+
+    `main()` は bootstrap (resource limit / landlock / backend 起動) を
+    伴うためテストから素直に駆動できないので、**呼び出し辺そのものを AST
+    で pin する** (同種の構造 pin の前例: 本ファイル群の
+    `test_no_caller_uses_legacy_approved_plugins_signature`)。
+    構造 pin なので「値が実際に子へ届くか」は
+    `tests/runners/test_worker_runner.py::
+    test_worker_runner_handshake_carries_the_run_context_inventory_view`
+    (親 → handshake) と `tests/tools/test_improve_staging_tools.py`
+    (view → tool) が別の層で担保する。"""
+    import ast
+    from pathlib import Path
+
+    import agentic_fx.mission_worker as mw_mod
+
+    tree = ast.parse(Path(mw_mod.__file__).read_text(encoding="utf-8"))
+    main_fn = next(n for n in tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "main")
+    calls = [n for n in ast.walk(main_fn)
+             if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name)
+             and n.func.id == "_run_improve_mission"]
+    assert len(calls) == 1, "main() の _run_improve_mission 呼び出しが 1 本でない"
+    kw = {k.arg: k.value for k in calls[0].keywords}
+    assert "inventory_view" in kw, "inventory_view を渡していない"
+    src = ast.unparse(kw["inventory_view"])
+    assert src in ("handshake.get('inventory_view')",
+                   "handshake['inventory_view']"), (
+        "main() は handshake の inventory_view をそのまま渡すこと "
+        f"(実際: {src})")

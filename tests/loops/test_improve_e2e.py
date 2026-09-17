@@ -2206,3 +2206,104 @@ def test_commit_gate_passes_ctx_inventory_identity_to_find_noop_copy(tmp_path):
 
     spy.assert_called_once()
     assert spy.call_args.kwargs["inventory"] is ctx.inventory
+
+
+# --- 段 0 変異スイープ 束 3 (2026-09-17): 生存変異の pin ---------------------
+
+def test_run_backtest_handler_writes_its_own_backtest_cpu_line(tmp_path):
+    """C1 (探索経路) / 段 0 束 3 M12: `backtest_cpu` の activity 行は
+    **2 箇所**で書かれる — commit gate の `cpu_samples` ループと、RPC
+    handler の in_sample 実行。handler 側の write を丸ごと削る変異は
+    判定 suite 全体 (1355 passed) が green のままだった (実測) —
+    `test_backtest_cpu_activity_lines_are_verbatim` /
+    `..._is_written_with_null_when_the_session_died` はどちらも
+    `loop.commit(...)` 経由で commit gate 側しか通らない。
+
+    handler 側は `mission=<staging_dir.name>` (commit gate 側は
+    `mission=<mission_id>`) なので、そこも含めて逐語で pin する。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
+
+    out = ctx.rpc_handlers["run_backtest"](
+        {"name": "rsi_pullback", "pair": "USDJPY"})
+    assert out.get("started") is not False, out
+
+    lines = [l for l in _activity_text(activity).splitlines()
+             if "backtest_cpu" in l]
+    assert any(
+        f"mission={ctx.staging_dir.name} plugin=rsi_pullback "
+        f"scope=in_sample pair=USDJPY deps=1 cpu_sec=" in l for l in lines), \
+        lines
+
+
+def test_indicator_unresolved_report_never_carries_alias_or_cause(tmp_path):
+    """遮断 8 / 段 0 束 3 M14: `alias` / `cause` は **activity 行だけ**。
+    `last_result` (= `test_last_result_never_carries_alias_or_reason`) に
+    加えて **提案レポート本文** にも流れないことを pin する。
+
+    `activity_extra` を `report_detail` にも渡す変異は判定 suite 全体
+    (1355 passed) が green のままだった (実測) — F5 の既存 pin は
+    `improvement_backlog.last_result` という 1 つの sink しか見ておらず、
+    `_finalize_gate_failed` のもう 1 つの公開 sink (report 本文) は
+    誰も見ていなかった。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    cand = fx.write_rsi_pullback(ctx.staging_dir, pins=None)
+    (cand / "test_plugin.py").write_text(_MIN3_TEST_PY)
+    loop.commit(mission=_mission(ctx), ctx=ctx,
+                result=_completed_result(
+                    _plugin_artifact("rsi_pullback", kind="strategy")),
+                now=fx.NOW)
+
+    report_files = list((root / "data" / "improve_reports").glob("improve-*.md"))
+    assert report_files, "gate failed レポートが書かれていない"
+    body = "\n".join(p.read_text(encoding="utf-8") for p in report_files)
+    assert "indicator_unresolved" in body      # 固定文言は載ってよい
+    assert "alias=" not in body
+    assert "cause=" not in body
+    assert "unpinned" not in body
+    # activity 側には出ている (= 情報が消えたのではなく sink が分かれている)
+    assert "alias=rsi cause=unpinned" in _activity_text(activity)
+
+
+def test_commit_gate_passes_ctx_inventory_identity_to_the_strategy_gate(tmp_path):
+    """段 0 束 3 M15: `_run_strategy_gate` → `evaluate_strategy_adoption_gate`
+    にも `ctx.inventory` が**そのまま**渡る。
+
+    `inventory=None` へ戻す変異は判定 suite 全体 (1355 passed) が green の
+    ままだった (実測)。T5b が塞いだのは `_run_plugin_gate` →
+    `find_noop_copy` の辺だけで、**同じ `ctx.inventory` を配る 2 本目の
+    呼び出し辺**は未 pin だった ([[verify-integration-not-just-units]]、
+    束 2 の M2/M3/M16 と同型の「N 個の呼び出し元のうち 1 つしか見て
+    いない」穴)。"""
+    from tests.fixtures import indicator_wiring as fx
+    from agentic_fx.loops import improve_loop as improve_loop_mod
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    cand = fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
+    (cand / "test_plugin.py").write_text(_MIN3_TEST_PY)
+
+    with patch("agentic_fx.loops.improve_loop.evaluate_strategy_adoption_gate",
+               wraps=improve_loop_mod.evaluate_strategy_adoption_gate) as spy:
+        loop.commit(mission=_mission(ctx), ctx=ctx,
+                    result=_completed_result(
+                        _plugin_artifact("rsi_pullback", kind="strategy")),
+                    now=fx.NOW)
+
+    spy.assert_called_once()
+    assert spy.call_args.kwargs["inventory"] is ctx.inventory
