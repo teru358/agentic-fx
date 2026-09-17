@@ -332,6 +332,36 @@ def test_build_intent_source_uses_dataset_source_not_settings_eval_source(
     assert session.calls, "dataset.source が伝播していれば発火するはず"
 
 
+def test_meta_max_bars_is_passed_to_load_resampled_frame(tmp_path, monkeypatch):
+    """codex r1 束2 Minor (= 段 0 束 3 提案 2): `max_bars=None` への変異は
+    既存 E2E を通過してしまう (履歴が上限より短ければ結果が変わらない)。
+    strategy の宣言値がそのまま `load_resampled_frame` の `max_bars` kwarg
+    に届くことを spy で直接 pin する。`strategy_adapter` は
+    `from ... import load_resampled_frame` で取り込んでいるので、差し替える
+    のは **call site の名前** (`strategy_adapter.load_resampled_frame`)。
+    """
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 61)
+    seen: list[dict] = []
+    real = strategy_adapter.load_resampled_frame
+
+    def spy(*args, **kwargs):
+        seen.append(dict(kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(strategy_adapter, "load_resampled_frame", spy)
+    meta = _meta(timeframe="1h", max_bars=37)      # 既定 200 と区別できる値
+    session = _FakeSession()
+    src = strategy_adapter.build_intent_source(
+        meta, conn=conn, pair="USDJPY", resolved=_EMPTY,
+        dataset=DATASET_1M, settings=SETTINGS, session=session)
+    src(_bar(H + timedelta(hours=1)))
+    assert seen, "load_resampled_frame が呼ばれていない"
+    assert "max_bars" in seen[0], "max_bars 引数そのものが落ちている"
+    assert seen[0]["max_bars"] == 37, (
+        "meta.max_bars が伝播していない (None 固定・既定値固定への退行)")
+
+
 # --- ③ open → intent dict 写像 ---------------------------------------------
 
 def test_open_market_without_take_profit_omits_take_profit_key(tmp_path):
