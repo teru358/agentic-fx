@@ -850,6 +850,42 @@ def test_phase2_drops_unpinned_strategy(tmp_path):
     assert result.rejected_strategies[0].reason == "unpinned"
 
 
+def test_phase2_resolves_only_against_approved_indicators(tmp_path, caplog):
+    """段 0 束 1 M8: 第 2 相の依存先 inventory は **第 1 相 (承認済み・hash 一致)**
+    の indicator だけで作る。
+
+    `indicator_inventory` を `phase1` ではなく `discover` の全戻り (`metas`) から
+    作る変異が、判定 suite (1465) + tests/loops + tests/test_commands.py を丸ごと
+    green のまま生存した。この変異が通ると **未承認 (または承認後に改竄された)
+    indicator が strategy の依存先として成立**し、その strategy が配備 inventory に
+    admit され、`resolved` (= worker の handshake に載る実体パス) が未承認 plugin を
+    指す。第 1 相の hash 一致規律 (fail closed) が依存経路だけ迂回される。
+
+    ここでは rsi を **承認せず** (discover はされる)、strategy `s` はその実 hash に
+    pin して承認する。正しい実装では rsi は依存先集合に居ないので `not_found` で
+    s が落ち、inventory は空になる。
+    """
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    from agentic_fx.plugin.loader import content_hash
+    rsi_dir = _write_plugin(plugins_dir, "rsi", config_yaml=_IND_SERIES_CONFIG)
+    s_dir = _write_plugin(plugins_dir, "s", plugin_py=_STRATEGY_PY2,
+                          config_yaml=_strategy_config(content_hash(rsi_dir)))
+    conn = _conn(tmp_path)
+    _approve(conn, "s", content_hash(s_dir))        # rsi は承認しない
+
+    with caplog.at_level(logging.WARNING):
+        result = plugin_loader.approved_plugins(conn, plugins_dir,
+                                                settings=_SETTINGS)
+
+    assert [m.name for m in result.inventory.metas] == []
+    assert [m.name for m in result.phase1_metas] == ["s"]
+    assert len(result.rejected_strategies) == 1
+    rej = result.rejected_strategies[0]
+    assert (rej.name, rej.alias, rej.reason) == ("s", "rsi", "not_found")
+    assert result.resolved == {}
+
+
 def test_missing_plugins_dir_returns_empty_result(tmp_path):
     conn = _conn(tmp_path)
     result = plugin_loader.approved_plugins(conn, tmp_path / "nope",

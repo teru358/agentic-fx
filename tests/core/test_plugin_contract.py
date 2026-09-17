@@ -66,6 +66,24 @@ def test_series_length_mismatch_rejected():
         validate_indicator_result({"a": [1.0, 2.0]}, df_index=idx, outputs=("a",))
 
 
+def test_length_one_series_is_not_accepted_as_a_scalar():
+    """段 0 束 1 M14: 長さ 1 の系列を「スカラー相当」として通さない。
+
+    既存の長さ検査の負例は長さ 2 だけだったため、`len(seq) != expected_len`
+    を `len(seq) not in (1, expected_len)` に緩める変異 (= 1 点しか返さない
+    indicator を全バー系列として受理する) が 判定 suite 丸ごと green のまま
+    生存した。スカラーを返したい indicator は `float` を返す契約であり
+    (設計書 §2.5 (a))、長さ 1 の list/ndarray/Series は df と長さが違う
+    以上つねに不合格でなければならない。
+    """
+    idx = _idx()
+    with pytest.raises(IndicatorResultError, match="length"):
+        validate_indicator_result({"a": [1.0]}, df_index=idx, outputs=("a",))
+    with pytest.raises(IndicatorResultError, match="length"):
+        validate_indicator_result({"a": np.array([1.0])}, df_index=idx,
+                                  outputs=("a",))
+
+
 def test_series_with_inf_or_bool_rejected():
     idx = _idx()
     with pytest.raises(IndicatorResultError):
