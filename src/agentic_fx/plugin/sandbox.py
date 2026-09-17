@@ -828,10 +828,24 @@ def _validate_indicator_result(result: Any, *,
 
     from agentic_fx.core.plugin_contract import (
         IndicatorResultError, validate_indicator_result as _validate_common)
+    # codex r1 束1 Important: 共通 validator は **plugin の生の戻り値**を
+    # 見る前提なので、スカラーの `None` は無条件に拒否する (`_check_number`)。
+    # 一方 wire では scalar NaN が `null` になり、上のループで `None` へ
+    # 復元されている — そのまま渡すと `run_plugin` 経由の scalar NaN が
+    # 必ず `SandboxError` になり、S1 の「値が未確定のキーを落とす」へ
+    # 到達できない。検証の間だけ NaN へ戻し、検証後に契約形 (`None`) を
+    # 復元する (系列の要素 `None` は共通 validator が NaN として受理する
+    # ので変換不要)。
+    nan_keys = [key for key, value in out.items() if value is None]
+    for key in nan_keys:
+        out[key] = float("nan")
     try:
         _validate_common(out, df_index=None, outputs=outputs)
     except IndicatorResultError as exc:
         raise SandboxError(str(exc)) from exc
+    finally:
+        for key in nan_keys:
+            out[key] = None
     return out
 
 

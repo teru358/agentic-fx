@@ -1077,6 +1077,74 @@ def test_scalar_only_indicator_still_works_standalone(tmp_path):
     assert out == {"rsi_14": 55.0}
 
 
+def test_scalar_nan_survives_the_real_worker_and_get_indicators_drops_the_key(
+        tmp_path):
+    """codex r1 束1 Important (S1 の未観測次元): scalar NaN は wire 上で
+    `null` になり、親の `_validate_indicator_result` が `None` へ戻す。その
+    直後に通す共通 validator が `None` を「数値でない」として弾くと、
+    `run_plugin` 経由の scalar NaN は必ず `SandboxError` になり S1 の
+    「値が未確定のキーを落とす」へ到達できない。既存の S1 テストは
+    `sandbox_run` を fake にして親側 validator を通さないので、この経路は
+    **実 worker 経由でしか観測できない**。
+    """
+    from agentic_fx.config import load_settings
+    from agentic_fx.plugin.loader import discover_one_with_reason
+    from agentic_fx.plugin.sandbox import run_plugin
+    example = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(example)
+    d = tmp_path / "nanind"
+    d.mkdir()
+    (d / "plugin.py").write_text(
+        "def compute(df, params):\n"
+        "    return {'ok': 1.5, 'undecided': float('nan')}\n")
+    (d / "config.yaml").write_text("kind: indicator\n")
+    (d / "test_plugin.py").write_text("def test_placeholder():\n    pass\n")
+    meta, reason = discover_one_with_reason(d, "nanind")
+    assert reason is None and meta.outputs is None
+
+    df = pd.DataFrame(
+        {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+         "volume": [1.0]},
+        index=pd.date_range("2026-01-01", periods=1, freq="1h", tz="UTC"))
+    # ① 実 worker → 親側再検証を通って scalar NaN が `None` で返る
+    out = run_plugin(meta, {"df": df, "params": meta.params},
+                     settings=settings.plugin)
+    assert out == {"ok": 1.5, "undecided": None}
+
+    # ② S1: get_indicators (既定 sandbox_run = 実 run_plugin) は未確定キー
+    #    だけを落とし、他のキーと組み込み指標は残す
+    provider = MagicMock()
+    provider.get_bars.return_value = _bars()
+    tools = market_tools.build(provider, MagicMock(), settings,
+                               indicator_plugins=[meta])
+    get_indicators = next(t.func for t in tools if t.name == "get_indicators")
+    assert get_indicators("USDJPY", "1h")["plugin:nanind"] == {"ok": 1.5}
+
+
+def test_declared_outputs_indicator_may_return_scalar_nan(tmp_path):
+    """同 Important の対: `outputs` 宣言済みでも scalar NaN は契約上許され
+    (キー集合は一致させたまま値が未確定)、`None` で親へ返る。"""
+    from agentic_fx.config import load_settings
+    from agentic_fx.plugin.loader import discover_one_with_reason
+    from agentic_fx.plugin.sandbox import run_plugin
+    example = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+    settings = load_settings(example).plugin
+    d = tmp_path / "declared"
+    d.mkdir()
+    (d / "plugin.py").write_text(
+        "def compute(df, params):\n    return {'v': float('nan')}\n")
+    (d / "config.yaml").write_text("kind: indicator\noutputs: [v]\n")
+    (d / "test_plugin.py").write_text("def test_placeholder():\n    pass\n")
+    meta, reason = discover_one_with_reason(d, "declared")
+    assert reason is None and meta.outputs == ("v",)
+    df = pd.DataFrame(
+        {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0],
+         "volume": [1.0]},
+        index=pd.date_range("2026-01-01", periods=1, freq="1h", tz="UTC"))
+    assert run_plugin(meta, {"df": df, "params": meta.params},
+                      settings=settings) == {"v": None}
+
+
 # --- [indicator-consumption-wiring] T3 Step 3-3: 二相後も indicator-only --
 
 def test_market_tools_ignores_non_indicator_kind_after_two_phase(tmp_path):
