@@ -159,13 +159,35 @@ def build_improve_staging_tooldefs(
         # 両者が食い違う = 書き込みと再読取のあいだに何かが起きた (TOCTOU)
         # なので、pin を書いたまま先へ進めてはいけない。
         before, after, new_hash = plugin_resolve.lock_config(candidate_dir, pins)
+
+        def _rollback() -> None:
+            """codex 2 周目 X1 [Important] 是正 (2026-09-18): **自分が書いた
+            内容がまだそこにある場合だけ** `before` へ戻す。
+
+            この 2 分岐はどちらも「`lock_config` の書き込みと
+            `discover_one_with_reason` の再読取のあいだに何かが起きた
+            (TOCTOU)」を理由に失敗扱いにしている。にもかかわらず従来の
+            rollback は現在の内容を一切見ずに `before` を write しており、
+            まさにその「何か」= 第三者の更新を lock 前の内容へ巻き戻して
+            破壊していた (失敗経路自身が競合相手の変更を消す)。
+            不一致なら書き戻さず、同じ error を返して競合側の変更を残す。
+            読めない (`OSError`) 場合も書かない — 状態が分からないまま
+            上書きするのが一番危険。"""
+            path = candidate_dir / "config.yaml"
+            try:
+                current = path.read_text(encoding="utf-8")
+            except OSError:
+                return
+            if current == after:
+                path.write_text(before, encoding="utf-8")
+
         relocked, relock_reason = plugin_loader.discover_one_with_reason(
             candidate_dir, name)
         if relocked is None:
-            (candidate_dir / "config.yaml").write_text(before, encoding="utf-8")
+            _rollback()
             return {"error": f"loader_rejected_after_lock: {relock_reason}"}
         if relocked.content_hash != new_hash:
-            (candidate_dir / "config.yaml").write_text(before, encoding="utf-8")
+            _rollback()
             return {"error": f"lock_hash_mismatch: {new_hash} != "
                              f"{relocked.content_hash}"}
         return {"ok": True, "pins": pins, "changed": after != before,

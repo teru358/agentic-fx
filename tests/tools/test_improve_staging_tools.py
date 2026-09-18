@@ -1095,3 +1095,78 @@ def test_lock_staging_deps_rolls_back_when_the_relocked_hash_disagrees(
     assert out.get("error", "").startswith("lock_hash_mismatch:"), out
     assert "ok" not in out and "pins" not in out
     assert (cand / "config.yaml").read_text(encoding="utf-8") == before
+
+
+# --- codex 2 周目 X1 (2026-09-18): rollback が第三者更新を壊さない ---
+
+def test_lock_staging_deps_rollback_keeps_a_third_party_update(
+        tmp_path, monkeypatch):
+    """codex 2 周目 X1 [Important]: `lock_hash_mismatch` 分岐の rollback は
+    **現在のファイル内容を確認せず** `before` を書いていた。この分岐は
+    「書き込みと再読取のあいだに何かが起きた (TOCTOU)」を理由に失敗扱いに
+    しているのに、失敗処理そのものが競合相手の変更を lock 前の内容へ
+    巻き戻して破壊する。
+
+    既存の 2 本は `dataclasses.replace` で metadata の hash を偽装する
+    だけで、**実ファイルの競合**を作っていないためこの非破壊性を 1 度も
+    観測していない。ここでは lock 後の `discover` 呼び出しの中で実際に
+    `config.yaml` を第三者内容へ書き換える。"""
+    from agentic_fx.plugin import loader as plugin_loader
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    cand = fx.write_rsi_pullback(staging, pins=None)
+
+    real = plugin_loader.discover_one_with_reason
+    calls = {"n": 0}
+
+    third_party: dict[str, str] = {}
+
+    def _third_party_writes_on_second(plugin_dir, name):
+        calls["n"] += 1
+        if calls["n"] >= 2 and not third_party:
+            # lock_config の書き込み後・再読取の前に第三者が追記した。
+            # discover は通るが content_hash は `new_hash` と食い違う
+            # (= `lock_hash_mismatch` 分岐に入る) 内容にする。
+            text = (cand / "config.yaml").read_text(encoding="utf-8")
+            third_party["text"] = text + "# 第三者が lock 後に書いた追記\n"
+            (cand / "config.yaml").write_text(third_party["text"],
+                                              encoding="utf-8")
+        return real(plugin_dir, name)
+
+    monkeypatch.setattr(improve_staging_tools.plugin_loader,
+                        "discover_one_with_reason",
+                        _third_party_writes_on_second)
+    out = _tools(tmp_path)["lock_staging_deps"]("rsi_pullback")
+    assert out.get("error", "").startswith("lock_hash_mismatch:"), out
+    assert "ok" not in out and "pins" not in out
+    # 第三者の変更は保持される (lock 前の内容へ戻さない)
+    assert (cand / "config.yaml").read_text(encoding="utf-8") == \
+        third_party["text"]
+
+
+def test_loader_rejected_after_lock_rollback_keeps_a_third_party_update(
+        tmp_path, monkeypatch):
+    """X1 の同作法を既存分岐 `loader_rejected_after_lock` にも適用する
+    (codex の提案は `lock_hash_mismatch` だけを名指ししているが、
+    同じ 2 行の書き戻しが直前の分岐にもある — 対象範囲の取りこぼし)。"""
+    from agentic_fx.plugin import loader as plugin_loader
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    cand = fx.write_rsi_pullback(staging, pins=None)
+
+    real = plugin_loader.discover_one_with_reason
+    calls = {"n": 0}
+
+    def _third_party_breaks_on_second(plugin_dir, name):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            (cand / "config.yaml").write_text("kind: [broken\n",
+                                              encoding="utf-8")
+        return real(plugin_dir, name)
+
+    monkeypatch.setattr(improve_staging_tools.plugin_loader,
+                        "discover_one_with_reason",
+                        _third_party_breaks_on_second)
+    out = _tools(tmp_path)["lock_staging_deps"]("rsi_pullback")
+    assert out.get("error", "").startswith("loader_rejected_after_lock:"), out
+    assert (cand / "config.yaml").read_text(encoding="utf-8") == "kind: [broken\n"
