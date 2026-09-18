@@ -225,7 +225,20 @@ def _protect_protocol_stdout() -> Any:
 def _indicator_result_to_wire(validated: dict) -> dict:
     """standalone (`get_indicators`) 応答の wire 表現。
     スカラーは float、系列は `{"series": [float|null, ...]}`。
-    NaN は `null` にしてから送る (親は allow_nan=False で読める形)。"""
+    NaN は `null` にしてから送る (親は allow_nan=False で読める形)。
+
+    2 周目 ローカル LLM (c03 muse [Critical] / c03 ornith [Important] /
+    c03 qwen [Minor] — 独立 3 本が同じ行に到達、2026-09-18):
+    `list` 分岐の NaN 正規化が `v is None` だけで、`float('nan')` が
+    素通りする形になっていた。**実害は無い** — 唯一の呼び出し元
+    (`main()` の `kind == "indicator"` 分岐) は
+    `validate_indicator_result(result, df_index=df.index, ...)` の戻り値を
+    渡し、`df_index` が非 None のとき共通 validator は list/tuple/ndarray を
+    **必ず `pd.Series` へ畳む** (probe 実測) ので、`validated` に素の `list`
+    は入らない = この分岐は現状 到達不能。ただし到達すれば `nan` が
+    `_write_line` の JSON に載り、親の `allow_nan=False` 読み取りが落ちる
+    という罠なので、`pd.Series` 分岐と同じ判定に揃えておく (到達可能な
+    経路の挙動は変えない)。"""
     import math
 
     import pandas as pd
@@ -236,7 +249,8 @@ def _indicator_result_to_wire(validated: dict) -> dict:
             out[key] = {"series": [None if pd.isna(v) else float(v)
                                    for v in value.tolist()]}
         elif isinstance(value, list):
-            out[key] = {"series": [None if v is None else float(v) for v in value]}
+            out[key] = {"series": [None if v is None or pd.isna(v) else float(v)
+                                   for v in value]}
         else:
             out[key] = None if math.isnan(float(value)) else float(value)
     return out
