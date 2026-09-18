@@ -10,7 +10,8 @@ def test_subprocess_calls_explicitly_define_stdin_policy():
     # /code-review 2 周目 CR2 是正 (2026-09-18): `find_matching_approved_
     # metrics` に自己一致除外の分岐を足したため、この allowlist の行番号が
     # 327 → 351 にずれた。行番号で固定する allowlist は同ファイルの
-    # 無関係な編集で必ず壊れる (今回で 2 度目) が、「どの呼び出しを許すか」
+    # 無関係な編集で必ず壊れる (この allowlist が行番号ずれで壊れたのは今回が
+    # 初めて — `git log -S` で確認) が、「どの呼び出しを許すか」
     # を関数名で書くと同名の別呼び出しを取り違えるので、位置固定のまま
     # ずれたら直す運用を維持する。
     allowed = {("agentic_fx/store/backtest_runs.py", 351)}
