@@ -445,8 +445,16 @@ class Commands:
                           key=lambda n: (decided.get(n) is None,
                                          decided.get(n, 0), n))
 
+        # /code-review 2 周目 CR4 是正 (2026-09-18、設計書 §2.7 v1.6):
+        # (i) 欄も `phase1_metas` を走査する。旧実装は第 2 相 admit 済
+        # (`result.inventory.metas` = live) だけを見ていたため、
+        # 「候補 hash に pin 済だが現承認 hash と不一致なので live でない」
+        # strategy = **まさにこの候補を承認すれば復帰する strategy** が
+        # (i) にも (ii) にも出ず (その pin は candidate_hash と一致するので
+        # (ii) の条件 `p != candidate_hash` も満たさない)、人間の承認判断
+        # から完全に隠れていた。
         here = _in_decision_order(
-            [m.name for m in result.inventory.metas
+            [m.name for m in result.phase1_metas
              if m.kind == "strategy" and candidate_hash in _pins_to(m)])
         elsewhere = _in_decision_order(
             [m.name for m in result.phase1_metas

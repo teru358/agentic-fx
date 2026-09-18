@@ -840,6 +840,34 @@ def test_dependent_strategy_moves_to_the_first_column_after_relock(tmp_path):
     assert "dependent_pinned_here=s_new" in out
 
 
+def test_dependent_pinned_here_includes_not_live_strategies(tmp_path):
+    """/code-review 2 周目 CR4 (2026-09-18、設計書 §2.7 v1.6): (i) 欄の
+    母集団は `phase1_metas`。
+
+    I1 承認済 → 候補 I2 (pending) → strategy `s_new` を **I2 の hash に
+    pin して配備**すると、`approved_plugins` 第 2 相は現承認 hash (I1) と
+    不一致なので `s_new` を落とす (= `inventory.metas` に居ない)。
+    旧実装は (i) 欄を `inventory.metas` だけで作っていたため、
+    「まさにこの候補を承認すれば復帰する strategy」が (i) にも (ii) にも
+    出ず、人間の承認判断から完全に隠れていた。"""
+    shell, conn, plugins_root = _shell_env(tmp_path)
+    from tests.fixtures import indicator_wiring as fx
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    i2_id, i2_hash = _submit_indicator_v2(conn, plugins_root, "rsi")
+    # I2 は pending のまま (現承認 hash は I1) — s_new は live にならない
+    _deploy_strategy(conn, plugins_root, "s_new", pins={"rsi": i2_hash})
+
+    here, elsewhere = shell._dependent_strategies(
+        indicator_name="rsi", candidate_hash=i2_hash)
+
+    assert here == ["s_new"]
+    assert elsewhere == []          # 二重掲載しない
+    out = shell._approval_detail(i2_id)
+    assert "dependent_pinned_here=s_new" in out
+    assert "dependent_pinned_elsewhere=-" in out
+
+
 def test_dependent_strategies_are_listed_in_decision_id_order(tmp_path):
     """D1 (順序、codex plan r1 I9): 表示順は**決定順 (最新承認の approval id
     昇順)** であり、plugin 名の辞書順ではない。"""
