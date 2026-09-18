@@ -1547,6 +1547,54 @@ def test_plugin_lock_overwrites_stale_pin(tmp_path, monkeypatch):
     assert meta.indicators[0].pin != "a" * 64
 
 
+def test_plugin_lock_reports_content_hash_disagreement_without_assert(
+        tmp_path, capsys, monkeypatch):
+    """1 周目 ローカル LLM (c15 ornith Important、指揮者裁定 2026-09-18 (6)):
+    `afx plugin lock` の lock 後整合も **`assert` ではなく明示チェック**。
+
+    `lock_config` が返す `new_hash` と `discover_one_with_reason` の再取得値は
+    どちらも書き込み後の disk を独立に読むので、食い違い = 書き込みと再読取の
+    あいだに何かが起きた (TOCTOU) ということ。ここは以前 `assert` だったが、
+    `assert` は `python -O` で**消える**ため防御に数えられなかった
+    (`lock_staging_deps` 側と同一の不変条件 — そちらは `c5177ee` で是正済)。
+
+    **`AssertionError` に依存していないこと**を観測するために、
+    `pytest.raises` ではなく「rc == 1 と stderr の文言」で判定する:
+    `assert` 実装ではここまで到達せず `AssertionError` が送出されて
+    テストが error になる (= `-O` 下では素通りする実装だと分かる形)。
+    """
+    from agentic_fx.plugin import loader as plugin_loader
+    import dataclasses
+    root = _cli_root_with_deployed_rsi_pullback(tmp_path)
+    monkeypatch.chdir(root)
+    human = root / "plugins" / "_human"
+    d = fx.write_rsi_pullback(human, pins=None)
+    before = (d / "config.yaml").read_text(encoding="utf-8")
+
+    real = plugin_loader.discover_one_with_reason
+    calls = {"n": 0}
+
+    def _skew_hash_after_lock(plugin_dir, name):
+        calls["n"] += 1
+        meta, reason = real(plugin_dir, name)
+        if calls["n"] >= 2 and meta is not None:
+            meta = dataclasses.replace(meta, content_hash="f" * 64)
+        return meta, reason
+
+    monkeypatch.setattr("agentic_fx.backtest.cli.plugin_loader"
+                        ".discover_one_with_reason", _skew_hash_after_lock)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        rc = main(["plugin", "lock", "--from", "_human", "rsi_pullback"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "ロック後の content_hash が食い違います" in err
+    assert "f" * 64 in err and "元に戻してください" in err
+    # `_human` は人間所有領域なので自動では書き戻さない (直前の
+    # `relocked is None` 分岐と同じ作法 — 人間に委ねる)。
+    assert (d / "config.yaml").read_text(encoding="utf-8") != before
+
+
 def test_plugin_lock_reports_unresolvable_dependency(tmp_path, capsys, monkeypatch):
     import yaml
     root = _cli_root_with_deployed_rsi_pullback(tmp_path)

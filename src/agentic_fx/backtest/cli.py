@@ -672,9 +672,18 @@ def _plugin_lock(conn, settings, args: argparse.Namespace, root: Path) -> int:
         print(f"エラー: ロック後の config.yaml が discover を通りません "
              f"({relock_reason}) — 元に戻してください", file=sys.stderr)
         return 1
-    assert relocked.content_hash == new_hash, (
-        "lock_config の snapshot 再取得値と discover の再取得値が食い違う"
-        f" ({new_hash} != {relocked.content_hash})")
+    if relocked.content_hash != new_hash:
+        # 1 周目 ローカル LLM (c15 ornith Important、指揮者裁定 2026-09-18):
+        # ここは以前 `assert` だったが `python -O` で消えるので防御に
+        # 数えられない (`lock_staging_deps` と同一の不変条件 — 両者とも
+        # 書き込み後の disk を独立に読むので、食い違い = TOCTOU)。
+        # `config.yaml` の自動書き戻しはしない — `_human` は人間所有領域で、
+        # 直前の `relocked is None` 分岐も「元に戻してください」と人間に
+        # 委ねる作法なので揃える。
+        print(f"エラー: ロック後の content_hash が食い違います "
+             f"({new_hash} != {relocked.content_hash}) — 元に戻してください",
+             file=sys.stderr)
+        return 1
     if before_text == after_text:
         print(f"lock: {args.name} は既に最新の pin です (変更なし)")
         return 0
