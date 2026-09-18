@@ -640,3 +640,58 @@ def test_find_matching_approved_metrics_can_exclude_one_plugin_name(tmp_path):
         conn, exclude_name="rsi_pullback", **kw) is None
     assert br.find_matching_approved_metrics(
         conn, exclude_name="other_strategy", **kw) == "d" * 64
+
+
+# --- 段 0 r2 (b)、2026-09-19: `exclude_name` 分岐の NULL 意味論 ---
+
+@pytest.mark.parametrize("payload_name_kwargs, label", [
+    ({}, "no_name_key"),
+    ({"name": None}, "explicit_null_name"),
+])
+def test_exclude_name_keeps_approved_rows_whose_payload_has_no_name(
+        tmp_path, payload_name_kwargs, label):
+    """CR2 (`110fc5f`) が足した分岐は
+    `WHERE json_extract(payload_json, '$.name') IS NOT ?`。SQLite の
+    `IS NOT` は **NULL 安全**な比較なので、`$.name` が無い (または明示的に
+    `null` の) 旧承認行は `NULL IS NOT 'x'` = 真 で母集団に**残る**。
+
+    これが `!= ?` だと `NULL != 'x'` は NULL (= 偽) に評価され、
+    **`$.name` を持たない旧い承認行が母集団から丸ごと消える** —
+    `exclude_name` を渡す再ロック経路でだけ質検査が静かに緩む。
+    probe 実測 (実 sqlite):
+
+        IS NOT ? -> ['{"content_hash":"h"}', '{"name":null}', '{"name":"other"}']
+        !=     ? -> ['{"name":"other"}']
+
+    `$.name` を持つ別名の行が残ることは
+    `test_find_matching_approved_metrics_can_exclude_one_plugin_name` が
+    既に見ているので、ここは NULL 側 2 状態だけを見る。"""
+    from datetime import timedelta
+
+    from agentic_fx.store import approvals, backtest_runs as br
+    _loop, conn, _plugins_root = _loop_env(tmp_path)
+
+    content_hash = "d" * 64
+    aid = approvals.create(
+        conn, "plugin",
+        {"kind": "strategy", "content_hash": content_hash,
+         **payload_name_kwargs}, NOW)
+    approvals.apply_decision(conn, aid, status="approved", decided_by="t",
+                             now=NOW)
+    br.save_harness_run(
+        conn, scope="in_sample", plugin_ref="plugins/legacy",
+        content_hash=content_hash, kind="strategy", pair="USDJPY",
+        timeframe="1h", source="dukascopy", base_interval="5m", params={},
+        period=(NOW - timedelta(days=90), NOW),
+        metrics={"trades": 40, "pf": 1.5, "win_rate": 0.5, "avg_r": 0.2,
+                 "max_drawdown": 0.05, "total_pnl": 100.0, "evaluable": True,
+                 "fallback_spread_used": False},
+        settings_hash="h", core_commit="c", initial_balance=1_000_000.0,
+        now=NOW, variant="candidate", mission_outcome="approval")
+
+    kw = dict(pair="USDJPY", variant="candidate", source="dukascopy",
+              base_interval="5m", trades=40, pf=1.5, avg_r=0.2)
+    assert br.find_matching_approved_metrics(conn, **kw) == content_hash
+    # 除外対象は別名。NULL の行は母集団に残り、一致する。
+    assert br.find_matching_approved_metrics(
+        conn, exclude_name="rsi_pullback", **kw) == content_hash
