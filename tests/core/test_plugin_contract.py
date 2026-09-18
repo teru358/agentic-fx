@@ -84,6 +84,24 @@ def test_length_one_series_is_not_accepted_as_a_scalar():
                                   outputs=("a",))
 
 
+def test_series_longer_than_df_is_rejected():
+    """1 周目 ローカル LLM (c03 ornith): 長さ不一致の**長すぎる側**。
+
+    既存の負例は長さ 2 (`test_series_length_mismatch_rejected`) と長さ 1
+    (段 0 M14) で、どちらも df より**短い**。そのため
+    `len(seq) != expected_len` を `len(seq) < expected_len` に緩める変異が
+    生存した (実測: tests/core + tests/plugin/test_sandbox.py +
+    tests/tools/test_plugin_loader.py で 149 passed)。この変異下で長い系列は
+    長さ検査を通過し、直後の `pd.Series(values, index=df_index)` が
+    **pandas の生の ValueError** を送出する — 段 0 M14 と同じく
+    `except IndicatorResultError` を素通りして上位へ抜ける故障形になる。
+    長さ違いは必ず `IndicatorResultError` へ写像される、という側を pin する。
+    """
+    idx = _idx()
+    with pytest.raises(IndicatorResultError, match="length"):
+        validate_indicator_result({"a": [1.0] * 8}, df_index=idx, outputs=("a",))
+
+
 def test_series_with_inf_or_bool_rejected():
     idx = _idx()
     with pytest.raises(IndicatorResultError):
