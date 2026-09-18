@@ -1082,3 +1082,35 @@ def test_run_backtest_handler_reports_over_max_bars_limit_at_backtest_time(
     assert out["error"] == "indicator_unresolved"
     assert out["alias"] == "rsi"
     assert out["reason"] == "over_max_bars_limit"
+
+
+# [indicator-consumption-wiring] 段 0 r2 (裁定 5、2026-09-19): B-1 #9。
+# 子側 tool (`improve_rpc_tools._safe_join`) は `name` を正規形で検証して
+# から RPC フレームに載せるが、**親側 handler は `staging_dir / args["name"]`
+# を無検証で組んでいた**。CR1 (`switch._plugin_lock`) とまったく同じ形 —
+# source 側だけの防御は sink を守らない。段 0 r2 の probe 実測では
+# `name="../victim"` が `_staging/victim` へ解決し `_discover_one` が
+# そのディレクトリを読んだ (`plugin_ref` の DB 書込・backtest 実行まで
+# 到達しうる)。親側でも正規形を要求する。
+@pytest.mark.parametrize("bad_name", ["../victim", "a/b", "/tmp/zz", "good\n",
+                                      "_staging", ".locks", "", 123])
+def test_run_backtest_handler_refuses_names_outside_the_plugin_name_grammar(
+        loop_full, tmp_path, monkeypatch, bad_name):
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir(parents=True)
+    seen: list = []
+    monkeypatch.setattr(
+        "agentic_fx.plugin.loader._discover_one",
+        lambda *a, **k: seen.append(a) or None)
+
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    handlers = loop_full._build_rpc_handlers(ledger, staging_dir=staging_dir)
+
+    out = handlers["run_backtest"]({"name": bad_name, "pair": "USDJPY"})
+
+    # `started: False` 形で返す (CR5 の契約 — 子はこの形でだけ予約を戻す)。
+    assert out["started"] is False
+    assert out["error"] == "invalid_candidate_name"
+    json.dumps(out)
+    # 検証は join より**前**。ディレクトリを一切読んでいないこと。
+    assert seen == []

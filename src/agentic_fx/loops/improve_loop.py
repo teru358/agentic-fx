@@ -950,6 +950,24 @@ class ImproveLoop:
         )
 
         def run_backtest_handler(args: dict) -> dict:
+            # [indicator-consumption-wiring] 段 0 r2 (裁定 5、2026-09-19):
+            # `name` はここで `staging_dir / name` に連結される **sink**。
+            # 子側 tool (`improve_rpc_tools._safe_join`) が同じ正規形で
+            # 検証しているが、CR1 (`switch._plugin_lock`) で学んだとおり
+            # **source 側だけの防御は sink を守らない** — 将来 RPC を出す
+            # 経路が増えれば素通りする。probe 実測 (段 0 r2): 検証が無いと
+            # `name="../victim"` が `_staging/victim` に解決し、
+            # `_discover_one` がそのディレクトリを読んだ。join より**前**に
+            # 検証する (非 str も来うるので `isinstance` を先に見る —
+            # `fullmatch(123)` は TypeError)。
+            # 応答形は `started: False` 側 (§2.9c / F4) — backtest は
+            # 始まっていないので、子はこの形で予約を戻す。
+            name = args.get("name")
+            if not (isinstance(name, str)
+                    and plugin_loader._PLUGIN_NAME_RE.fullmatch(name)):
+                return {"started": False, "error": "invalid_candidate_name",
+                        "hint": "name は [a-z][a-z0-9_]{0,63} の形だけです。"
+                                "list_staging で確認してください"}
             candidate_dir = staging_dir / args["name"]
             meta = plugin_loader._discover_one(candidate_dir, args["name"])
             if meta is None or meta.kind != "strategy":
