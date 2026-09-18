@@ -148,17 +148,26 @@ def build_improve_staging_tooldefs(
         # はファイル 3 本の存在・属性しか見ないため、lock 後に無条件で
         # submit が通ると決め打ちしない。`lock_config` が書き込み後に
         # 再計算して返す `new_hash` を正とし、`discover_one_with_reason`
-        # の再取得結果 (`relocked.content_hash`) と一致することを assert
-        # する (どちらも書き込み後の disk を独立に読む)。
+        # の再取得結果 (`relocked.content_hash`) と一致することを確かめる
+        # (どちらも書き込み後の disk を独立に読む)。
+        #
+        # 1 周目 ローカル LLM (c15 ornith Important、指揮者裁定 2026-09-18):
+        # ここは以前 `assert` だったが、`assert` は `python -O` で**消える**
+        # ので防御として数えられない。明示チェックにし、失敗時は
+        # `relocked is None` と同じ形 — `config.yaml` を書き戻して error
+        # 辞書を返す (段 0 束 3 M8 の rollback pin と同じ規律) — に写像する。
+        # 両者が食い違う = 書き込みと再読取のあいだに何かが起きた (TOCTOU)
+        # なので、pin を書いたまま先へ進めてはいけない。
         before, after, new_hash = plugin_resolve.lock_config(candidate_dir, pins)
         relocked, relock_reason = plugin_loader.discover_one_with_reason(
             candidate_dir, name)
         if relocked is None:
             (candidate_dir / "config.yaml").write_text(before, encoding="utf-8")
             return {"error": f"loader_rejected_after_lock: {relock_reason}"}
-        assert relocked.content_hash == new_hash, (
-            "lock_config の snapshot 再取得値と discover の再取得値が食い違う"
-            f" ({new_hash} != {relocked.content_hash})")
+        if relocked.content_hash != new_hash:
+            (candidate_dir / "config.yaml").write_text(before, encoding="utf-8")
+            return {"error": f"lock_hash_mismatch: {new_hash} != "
+                             f"{relocked.content_hash}"}
         return {"ok": True, "pins": pins, "changed": after != before,
                 "content_hash": new_hash,
                 "diff": "".join(difflib.unified_diff(

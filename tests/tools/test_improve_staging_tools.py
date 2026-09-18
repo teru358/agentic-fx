@@ -1056,3 +1056,42 @@ def test_lock_staging_deps_rolls_back_when_the_locked_config_stops_loading(
     out = _tools(tmp_path)["lock_staging_deps"]("rsi_pullback")
     assert out.get("error", "").startswith("loader_rejected_after_lock:"), out
     assert (cand / "config.yaml").read_text(encoding="utf-8") == before
+
+
+def test_lock_staging_deps_rolls_back_when_the_relocked_hash_disagrees(
+        tmp_path, monkeypatch):
+    """1 周目 ローカル LLM (c15 ornith Important、指揮者裁定 2026-09-18 で
+    採用): `lock_config` が返す `new_hash` と `discover` の再取得値の
+    食い違いは **`assert` ではなく明示チェック**で扱う。
+
+    `assert relocked.content_hash == new_hash` は `python -O` (最適化
+    起動) で**消える**ので、防御として数えられない。両者は書き込み後の
+    disk を独立に読むので、食い違い = 書き込みと再読取のあいだに何かが
+    起きた (TOCTOU) ということであり、pin を書いたまま先へ進めてはいけない。
+    段 0 束 3 M8 の `..._rolls_back_when_the_locked_config_stops_loading`
+    と同じ形 — `config.yaml` を書き戻し、error 辞書を返す — に写像する。
+    """
+    from agentic_fx.plugin import loader as plugin_loader
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    cand = fx.write_rsi_pullback(staging, pins=None)
+    before = (cand / "config.yaml").read_text(encoding="utf-8")
+
+    real = plugin_loader.discover_one_with_reason
+    calls = {"n": 0}
+
+    import dataclasses
+
+    def _skew_hash_on_second(plugin_dir, name):
+        calls["n"] += 1
+        meta, reason = real(plugin_dir, name)
+        if calls["n"] >= 2 and meta is not None:
+            meta = dataclasses.replace(meta, content_hash="f" * 64)
+        return meta, reason
+
+    monkeypatch.setattr(improve_staging_tools.plugin_loader,
+                        "discover_one_with_reason", _skew_hash_on_second)
+    out = _tools(tmp_path)["lock_staging_deps"]("rsi_pullback")
+    assert out.get("error", "").startswith("lock_hash_mismatch:"), out
+    assert "ok" not in out and "pins" not in out
+    assert (cand / "config.yaml").read_text(encoding="utf-8") == before
