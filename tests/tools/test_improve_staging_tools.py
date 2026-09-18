@@ -973,6 +973,26 @@ def test_lock_staging_deps_refuses_non_indicator_dependency(tmp_path):
     assert "ok" not in out and "pins" not in out
 
 
+def test_lock_staging_deps_rejects_a_non_strategy_candidate(tmp_path):
+    """1 周目 ローカル LLM (c15 qwen Minor): 候補自身の kind ガード。
+
+    既存は依存側 (`dep["kind"]`) しか踏まないため、候補自身の
+    `if meta.kind != "strategy":` を丸ごと削除する変異が 105 passed で
+    生存した。indicator 候補は `meta.indicators` が空なので、この変異下では
+    ループを 0 周して `lock_config(candidate_dir, {})` に落ち、
+    **`{"ok": True, "pins": {}, "changed": False}` を返してしまう** —
+    agent は「indicator にも pin を打てた」と誤解する。
+    """
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    fx.write_indicator(staging, "rsi")
+    out = _tools(tmp_path, _VIEW)["lock_staging_deps"]("rsi")
+    assert out["error"] == ("lock_staging_deps is only for kind=strategy "
+                            "candidates")
+    assert out["candidate_kind"] == "indicator"
+    assert "ok" not in out and "pins" not in out
+
+
 def test_lock_staging_deps_keeps_the_candidate_discoverable(tmp_path):
     from agentic_fx.plugin.loader import discover_one_with_reason
     from tests.fixtures import indicator_wiring as fx
