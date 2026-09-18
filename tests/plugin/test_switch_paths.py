@@ -2,6 +2,8 @@
 設計書 §5.1・§8.1-28・§8.1-29・§8.1-41)。"""
 from __future__ import annotations
 
+import json
+
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1961,9 +1963,13 @@ def test_dependency_names_drops_names_outside_the_plugin_name_grammar(tmp_path):
     for bad in ("a/b", "../evil", "/tmp/abs", "", "Upper", "9lead",
                 "x" * 65, "sub/../../x", "good\n", "good\n\n",
                 "_staging", "_human", "_archive", ".locks", ".", ".."):
+        # 段 0 r2: 値は `json.dumps` で書く。`{bad!r}` (Python repr) だと
+        # `'good\n'` が **YAML の単一引用符スカラー**になり、改行ではなく
+        # リテラルの `\` + `n` が入ってしまう (M-A3 が SURVIVED した理由)。
+        # JSON は YAML の部分集合なので二重引用符で正しくエスケープされる。
         (cand / "config.yaml").write_text(
             "kind: strategy\nindicators:\n  x:\n    plugin: "
-            f"{bad!r}\n", encoding="utf-8")
+            f"{json.dumps(bad)}\n", encoding="utf-8")
         assert plugin_switch._dependency_names(cand, "mystrat") == ["mystrat"], bad
     # 正規形は従来どおり残る
     (cand / "config.yaml").write_text(
