@@ -1033,3 +1033,52 @@ def test_f5_6_submission_blocked_has_no_holdout_language_or_period_endpoints(
     assert "holdout" not in dumped
     assert "period_start" not in dumped
     assert "period_end" not in dumped
+
+
+# --- /code-review 2 周目 CR6 (2026-09-18、却下の根拠 pin) ---
+
+
+def test_run_backtest_handler_reports_over_max_bars_limit_at_backtest_time(
+        loop_min, tmp_path, monkeypatch):
+    """CR6 は「`lock_staging_deps` が正規 resolver を使わず
+    `over_max_bars_limit` を見ない」という指摘だが**却下**した。子 worker
+    には `inventory_view` (6 キー固定、遮断 8 の pin 対象) しか無く
+    `max_bars` を持たないため、lock 時点では構造的に見られない。正規解決は
+    親の `run_backtest` RPC (`pin_mode="check"`) と commit gate が行う。
+
+    却下の根拠 = 「submit まで遅れない」= **backtest の時点で** agent に
+    `over_max_bars_limit` が返ることを、ここで固定する。"""
+    from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
+    from agentic_fx.plugin.version_store import content_hash_bytes
+
+    staging_dir = tmp_path / "staging"
+    cand = staging_dir / "myst"
+    cand.mkdir(parents=True)
+    (cand / "plugin.py").write_bytes(b"plugin")
+    (cand / "config.yaml").write_bytes(b"config")
+    (cand / "test_plugin.py").write_bytes(b"test")
+
+    limit = loop_min._settings.plugin.max_bars_limit
+    dep = SimpleNamespace(name="big_rsi", kind="indicator", outputs=("rsi",),
+                          max_bars=limit + 1, params={},
+                          content_hash="a" * 64, pairs=())
+    inv_result = InventoryBuildResult(
+        inventory=ApprovedInventory(root=tmp_path, metas=(dep,)),
+        phase1_metas=(dep,), resolved={}, rejected_strategies=())
+    ref = SimpleNamespace(alias="rsi", plugin="big_rsi", pin=None, params={})
+    monkeypatch.setattr(
+        "agentic_fx.plugin.loader._discover_one",
+        lambda path, name: SimpleNamespace(
+            name="myst", kind="strategy", timeframe="1h",
+            content_hash=content_hash_bytes(b"plugin", b"config"),
+            pairs=("USDJPY",), indicators=(ref,)))
+    handlers = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}), staging_dir=staging_dir,
+        inventory=inv_result)
+
+    out = handlers["run_backtest"]({"name": "myst", "pair": "USDJPY"})
+
+    assert out["started"] is False
+    assert out["error"] == "indicator_unresolved"
+    assert out["alias"] == "rsi"
+    assert out["reason"] == "over_max_bars_limit"

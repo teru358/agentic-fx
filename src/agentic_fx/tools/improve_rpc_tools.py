@@ -143,7 +143,18 @@ def build_improve_rpc_tooldefs(
         # [indicator-consumption-wiring] §2.9(c): 予約 (子) → 親 RPC →
         # **未開始なら解放**。`started` が明示的に False のときだけ戻す —
         # キーが無い応答 (旧形式・RPC 失敗) では戻さない (fail closed:
-        # 予算は消費されたまま)。`error` キーがあるので registry の
+        # 予算は消費されたまま)。
+        #
+        # /code-review 2 周目 CR5 (2026-09-18、却下 = 設計既定):
+        # `run_backtest_handler` が**応答を返さず例外を投げた**場合
+        # (`_make_rpc_client` の `RuntimeError`/`ProtocolError`、seq 不一致、
+        # パイプ切断) も同じ扱い — 例外は `reserve_backtest` の予約を
+        # 素通りし、`ToolRegistry.execute` の外側 `except Exception` が
+        # 受けるだけで counters には触らない。これは設計書 §2.9c / §6 F4 の
+        # 「RPC 失敗では解放しない (fail closed)」の**より全面的な**ケース
+        # であり、意図どおり。上の「キーが無い応答」という言い方が
+        # 「例外は別扱い」と読めるので明示しておく。
+        # `error` キーがあるので registry の
         # `on_result` が `errors` と recoverable refusal streak に自動計上し、
         # 同じ未解決を繰り返す agent は既存規律で abort する。
         # `max_tool_calls` は常に +1 (`record_call` は registry 側)。
