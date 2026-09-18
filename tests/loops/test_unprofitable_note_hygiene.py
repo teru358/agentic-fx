@@ -81,7 +81,14 @@ def _install_floor_strategy_gate(monkeypatch, loop, *, holdout_metrics):
             passed=True, content_hash="c" * 64, artifact_hash="a" * 64))
     monkeypatch.setattr(
         "agentic_fx.plugin.loader._discover_one",
-        lambda *a, **kw: SimpleNamespace(max_bars=100, indicators=()))
+        # /code-review 2 周目 CR7 是正 (2026-09-18): `outputs_required` の
+        # 判定が `approval.outputs_required_violation(candidate_meta)` に
+        # 一本化され、commit gate が `_read_candidate_kind` の戻り値でなく
+        # `candidate_meta.kind` を見るようになった。実物の `_discover_one`
+        # は必ず `kind`/`outputs` を持つ `PluginMeta` を返すので、この
+        # double にも両方を持たせる (退化した fake が実物より緩かった)。
+        lambda *a, **kw: SimpleNamespace(max_bars=100, indicators=(),
+                                         kind="strategy", outputs=None))
 
     def fake_strategy_gate(*a, **kw):
         kw["record_fn"](_gate_row(scope="in_sample", pf=0.5))
