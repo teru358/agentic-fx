@@ -52,6 +52,29 @@ def test_scalar_rejects(value):
         validate_indicator_result({"a": value}, df_index=idx, outputs=("a",))
 
 
+def test_numpy_scalars_are_accepted_at_the_scalar_position():
+    """1 周目 ローカル LLM (c03 qwen): `_check_number` の numpy allowlist。
+
+    既存テストはスカラー位置に Python の `int` / `float` しか置かない
+    (`np.array(...)` は ndarray 分岐へ行き、`tolist()` で Python の数値に
+    落ちてから `_check_number` に渡る)。そのため
+    `isinstance(value, (int, float, np.integer, np.floating))` から
+    **numpy の 2 型を外す**変異が 156 passed で生存した。実 indicator は
+    `df["close"].iloc[-1]` のような `np.float64` をそのまま返すのが普通なので、
+    この allowlist が落ちると正常な indicator が軒並み
+    `IndicatorResultError` になる (fail closed 側への退行)。
+    `np.bool_` が拒否される側も同時に pin する。
+    """
+    idx = _idx()
+    out = validate_indicator_result(
+        {"a": np.float64(1.5), "b": np.int32(2)},
+        df_index=idx, outputs=("a", "b"))
+    assert out["a"] == 1.5 and out["b"] == 2.0
+    with pytest.raises(IndicatorResultError, match="bool"):
+        validate_indicator_result({"a": np.bool_(True)}, df_index=idx,
+                                  outputs=("a",))
+
+
 def test_series_index_mismatch_rejected():
     idx = _idx()
     other = pd.date_range("2027-01-01", periods=5, freq="1h", tz="UTC")
