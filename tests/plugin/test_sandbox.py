@@ -1252,6 +1252,35 @@ def test_standalone_indicator_response_rejects_bool_and_non_finite_scalars():
     assert _validate_indicator_result({"a": 1.5}, outputs=("a",)) == {"a": 1.5}
 
 
+def test_standalone_indicator_response_rejects_malformed_series_envelope():
+    """2 周目 ローカル LLM (c01 muse Minor / c01 qwen Important、独立 2 本):
+    系列 envelope の**キー集合の厳密一致**が pin されていなかった。
+
+    `if set(value) != {"series"} or not isinstance(series, list)` を
+    `if "series" not in value or ...` へ緩める変異 (= 余分なキーの混入を
+    許す) は、`tests/plugin/test_sandbox.py` + `tests/core/
+    test_plugin_contract.py` の 116 passed が丸ごと green のまま生存した
+    (実測)。緩んだ実装では `{"series": [...], "extra": 1}` が受理され、
+    `extra` は無言で捨てられる — 親子の信頼境界を跨いだ wire 値の形が
+    「1 キーちょうど」であることは誰も見ていなかった。
+
+    `series` が list でない場合も同じ 1 行が守っているので併せて pin する。
+    """
+    from agentic_fx.plugin.sandbox import SandboxError, _validate_indicator_result
+
+    for bad in ({"series": [1.0], "extra": 1},
+                {"series": [1.0], "outputs": ["a"]},
+                {"series": "1.0"},
+                {"series": {"0": 1.0}},
+                {"values": [1.0]},
+                {}):
+        with pytest.raises(SandboxError, match="series envelope is malformed"):
+            _validate_indicator_result({"a": bad}, outputs=("a",))
+    # 正常系 (1 キーちょうど) は通る
+    assert _validate_indicator_result(
+        {"a": {"series": [1.0, None]}}, outputs=("a",)) == {"a": [1.0, None]}
+
+
 def test_standalone_indicator_response_rejects_extra_or_missing_outputs_keys():
     """codex plan r2 束1 Important: worker を迂回した/破損した応答 (wire を
     直接偽装した呼び出し) が `meta.outputs` と食い違うキー集合を返したとき、
