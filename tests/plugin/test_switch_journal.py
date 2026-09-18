@@ -348,3 +348,97 @@ def test_interrupt_reverts_symlink_by_restoring_old_target(tmp_path, conn):
     switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW, settings=SETTINGS,
                                      force_revert_op_id=op_id)
     assert Path(root / "sma").readlink().as_posix() == old_rel
+
+
+# --- 段 0 r2 (裁定 3、2026-09-19): CR1 が reconcile に持ち込んだ
+#     「非正規名の journal 行」の負例 ---
+
+def test_reconcile_row_with_a_noncanonical_name_is_isolated_and_writes_nothing(
+        tmp_path, conn):
+    """CR1 (`cba93e4`) 以降、`switch._plugin_lock` は正規形
+    (`loader._PLUGIN_NAME_RE`) に合致しない名前で `ValueError` を投げる。
+    journal の `name` は `_unresolved_after_switch` →
+    `_dependency_names(version_dir, row["name"])` → `_plugin_locks` と
+    **一切検証されずに** sink へ届くので、CR1 以前に作られた非正規名の行が
+    残っていると、その行は毎回 `ValueError` で失敗する。
+
+    段 0 r2 の probe 実測でこれは per-row `except Exception` (検収 m10 の
+    行ごと隔離) が握り潰し、fail closed 側 (FS も DB も書かない) で
+    止まることが確認できた。**恒久滞留は現状維持 (指揮者裁定 2026-09-19)**
+    — 現在の全入口 (submit / approve / bless / reject) は CR1 後に非正規名を
+    作れないため新規にこの行は生まれない。**CR1 以前に作られた非正規名の
+    行は人間が DB を手当てする必要がある** (起動ごとに同じ activity 行を
+    1 本出して retry し続け、approval は pending のまま)。
+
+    ここで pin するのは 3 点:
+      (i)  他の name の収束が止まらない (行ごと隔離が効く)
+      (ii) その行は FS も DB も書かず `switched` のまま
+      (iii) activity に `switch_reconcile_row_failed` が **1 行だけ**
+    """
+    import shutil
+
+    from agentic_fx.activity import ActivityLog
+    from tests.fixtures import indicator_wiring as fx
+
+    root = _plugins_root(tmp_path)
+
+    # 行 1 (Upper、op_id が小さい方 = ループで先に踏む): 実在する版
+    # ディレクトリ + live symlink 一致 → `_unresolved_after_switch` へ入り、
+    # `_plugin_lock` が正規形違反で ValueError を投げる。
+    src = fx.write_rsi_pullback(tmp_path / "src", pins=None)
+    new_rel = f".versions/Upper/{'n' * 64}"
+    version_dir = root / new_rel
+    version_dir.parent.mkdir(parents=True)
+    shutil.copytree(src, version_dir)
+    (root / "Upper").symlink_to(new_rel)
+    op_id_1 = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=1, name="Upper", old_kind="absent",
+        old_target=None, new_target=new_rel, switch_required=True,
+        actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id_1, phase="switched", now=NOW,
+                                  commit=True)
+
+    # 行 2 (wma): live==old_target → revert 分岐。行 1 に巻き込まれず収束する。
+    old_rel = f".versions/wma/{'o' * 64}"
+    (root / "wma").symlink_to(old_rel)
+    op_id_2 = switch.begin_switch_journal(
+        conn, kind="approve", approval_id=2, name="wma", old_kind="symlink",
+        old_target=old_rel, new_target=f".versions/wma/{'w' * 64}",
+        switch_required=True, actor="human", now=NOW, commit=True)
+    switch.advance_switch_journal(conn, op_id_2, phase="switched", now=NOW,
+                                  commit=True)
+    assert op_id_1 < op_id_2
+
+    before_row_1 = dict(conn.execute(
+        "SELECT * FROM plugin_switch_journal WHERE op_id=?",
+        (op_id_1,)).fetchone())
+
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    switch.reconcile_switch_journals(conn, plugins_root=root, now=NOW,
+                                     settings=SETTINGS, activity=activity)
+
+    # (i) 他の name は収束する
+    assert conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE op_id=?",
+        (op_id_2,)).fetchone()["phase"] == "reverted"
+    assert (root / "wma").readlink().as_posix() == old_rel
+
+    # (ii) 非正規名の行は DB も FS も一切書き換えない
+    assert dict(conn.execute(
+        "SELECT * FROM plugin_switch_journal WHERE op_id=?",
+        (op_id_1,)).fetchone()) == before_row_1
+    assert before_row_1["phase"] == "switched"
+    assert (root / "Upper").readlink().as_posix() == new_rel
+    # lock ファイルも作られない (`_plugin_lock` は mkdir より前に落ちる)
+    assert not (root / ".locks" / "Upper.lock").exists()
+
+    # (iii) activity は `switch_reconcile_row_failed` が 1 行だけ
+    lines = [line.split("\t") for line in
+             (tmp_path / "logs" / "activity.log").read_text().splitlines()]
+    failed = [f for f in lines if f[2] == "switch_reconcile_row_failed"]
+    assert len(failed) == 1
+    assert failed[0][1] == "APPROVAL"
+    assert failed[0][3] == (
+        f"name=Upper op_id={op_id_1} error=ValueError: "
+        "invalid plugin name for lock: 'Upper'")
+    assert failed[0][4] == "-"
