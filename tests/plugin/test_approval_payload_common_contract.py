@@ -303,6 +303,23 @@ def test_indicator_deps_is_empty_object_for_a_strategy_without_deps(
     assert payload["indicator_deps"] == {}
 
 
+def test_improve_payload_indicator_deps_is_empty_object_when_resolved_is_none(
+        tmp_path):
+    """1 周目 ローカル LLM (c17 qwen): 改善経路の `resolved is None` 側。
+
+    `_build_approval_payload` の `resolved.pin_object() if resolved is not
+    None else {}` の **else 側**を値で見るテストが無かったため、
+    `else {}` → `else None` の変異が 44 passed で生存した。この変異下では
+    依存なし strategy の改善経路 approval payload だけ
+    `indicator_deps: null` になり、他 2 経路 (`submit_candidate` /
+    `bless_candidate`) の `{}` と**形が食い違う** (P3' の同形性が崩れる)。
+    """
+    payload = _payload_from_improve_loop(tmp_path, "strategy", resolved=None)
+    assert payload["indicator_deps"] == {}
+    assert payload["indicator_deps"] is not None
+    json.dumps(payload["indicator_deps"])      # plain JSON であること
+
+
 def test_indicator_deps_is_absent_for_indicator_kind(tmp_path):
     """indicator 候補には依存が無いので `indicator_deps` は `{}`。
     gate double 不要 — kind=indicator は strategy backtest を回さない。"""
