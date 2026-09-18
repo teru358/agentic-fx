@@ -1202,3 +1202,82 @@ def test_loader_rejected_after_lock_rollback_keeps_a_third_party_update(
     out = _tools(tmp_path)["lock_staging_deps"]("rsi_pullback")
     assert out.get("error", "").startswith("loader_rejected_after_lock:"), out
     assert (cand / "config.yaml").read_text(encoding="utf-8") == "kind: [broken\n"
+
+
+# --- 段 0 r2 (裁定 1 / 裁定 2、2026-09-19): X1 是正 (`275e83b`) が
+# 持ち込んだ `_rollback` の 2 つの失敗形。どちらも「lock_config の書込と
+# discover 再読取のあいだに第三者が書いた」状況で、rollback 側の
+# 読み方・比べ方が誤っている。
+
+def test_rollback_returns_an_error_dict_when_the_file_is_not_utf8(
+        tmp_path, monkeypatch):
+    """裁定 1: `_rollback` の `path.read_text(encoding="utf-8")` は
+    `except OSError` だけで守られていたが、`UnicodeDecodeError` は
+    `ValueError` のサブクラスで `OSError` ではない — 第三者が非 UTF-8 の
+    バイト列を書くと tool が**例外を投げて**しまい、「error 辞書を返す」
+    という tool の応答契約がこの 1 経路だけ破れていた
+    (隣の CR3 是正 `df4f494` は `(OSError, UnicodeError, ...)` を採って
+    おり不揃いでもあった)。読めない以上は書き戻さない (fail closed)。"""
+    from agentic_fx.plugin import loader as plugin_loader
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    cand = fx.write_rsi_pullback(staging, pins=None)
+
+    real = plugin_loader.discover_one_with_reason
+    calls = {"n": 0}
+    third_party = b"kind: strategy\n# \xff\xfe \n"
+
+    def _third_party_writes_non_utf8_on_second(plugin_dir, name):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            (cand / "config.yaml").write_bytes(third_party)
+        return real(plugin_dir, name)
+
+    monkeypatch.setattr(improve_staging_tools.plugin_loader,
+                        "discover_one_with_reason",
+                        _third_party_writes_non_utf8_on_second)
+
+    out = _tools(tmp_path)["lock_staging_deps"]("rsi_pullback")
+
+    assert isinstance(out, dict) and "error" in out, out
+    assert "ok" not in out and "pins" not in out
+    # 読めなかったので書き戻していない = 第三者のバイト列がそのまま残る
+    assert (cand / "config.yaml").read_bytes() == third_party
+
+
+def test_rollback_compares_bytes_so_a_crlf_third_party_update_is_kept(
+        tmp_path, monkeypatch):
+    """裁定 2: 一致判定が `path.read_text(...) == after` の**文字列**比較
+    だった。`read_text` は universal newline 変換をするので、第三者が
+    `after` と同内容を CRLF で書くと「自分が書いた内容がまだそこにある」と
+    誤判定し、X1 が守ろうとした「第三者の更新を巻き戻さない」が破れる
+    (`before` を LF で上書きしてしまう)。バイト列で比べる。
+
+    `lock_config` は `write_text(..., encoding="utf-8")` で書く。Linux では
+    `os.linesep == "\\n"`・BOM 無しなので、ディスク上のバイト列は
+    `after.encode("utf-8")` と厳密に一致する (probe 実測)。"""
+    from agentic_fx.plugin import loader as plugin_loader
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    cand = fx.write_rsi_pullback(staging, pins=None)
+
+    real = plugin_loader.discover_one_with_reason
+    calls = {"n": 0}
+    crlf: dict[str, bytes] = {}
+
+    def _third_party_rewrites_with_crlf_on_second(plugin_dir, name):
+        calls["n"] += 1
+        if calls["n"] >= 2 and not crlf:
+            text = (cand / "config.yaml").read_text(encoding="utf-8")
+            crlf["bytes"] = text.replace("\n", "\r\n").encode("utf-8")
+            (cand / "config.yaml").write_bytes(crlf["bytes"])
+        return real(plugin_dir, name)
+
+    monkeypatch.setattr(improve_staging_tools.plugin_loader,
+                        "discover_one_with_reason",
+                        _third_party_rewrites_with_crlf_on_second)
+
+    out = _tools(tmp_path)["lock_staging_deps"]("rsi_pullback")
+
+    assert out.get("error", "").startswith("lock_hash_mismatch:"), out
+    assert (cand / "config.yaml").read_bytes() == crlf["bytes"]

@@ -175,14 +175,40 @@ def build_improve_staging_tooldefs(
             まさにその「何か」= 第三者の更新を lock 前の内容へ巻き戻して
             破壊していた (失敗経路自身が競合相手の変更を消す)。
             不一致なら書き戻さず、同じ error を返して競合側の変更を残す。
-            読めない (`OSError`) 場合も書かない — 状態が分からないまま
-            上書きするのが一番危険。"""
+            読めない場合も書かない — 状態が分からないまま上書きするのが
+            一番危険。
+
+            段 0 r2 (裁定 1・2、2026-09-19) の 2 点:
+
+            1. 読みは `read_bytes()` で、捕捉は `(OSError, UnicodeError)`。
+               旧稿は `read_text(encoding="utf-8")` を `except OSError` だけで
+               守っていたが、`UnicodeDecodeError` は `ValueError` の
+               サブクラスで `OSError` ではない — 第三者が非 UTF-8 バイト列を
+               書くと tool が例外を投げ、「error 辞書を返す」という応答契約が
+               この 1 経路だけ破れていた (隣の CR3 是正は
+               `(OSError, UnicodeError, ...)` を採っており不揃いでもあった)。
+               `read_bytes` は decode しないので実際には `UnicodeError` は
+               出ないが、比較の前段に decode が戻っても契約が破れないよう
+               語彙を CR3 と揃えておく。
+            2. 一致判定はバイト列で行う。`read_text` は universal newline
+               変換をするので、第三者が `after` と同内容を **CRLF で**書くと
+               `current == after` が真になり、守ろうとした「第三者の更新を
+               巻き戻さない」が破れる。`lock_config` は
+               `write_text(..., encoding="utf-8")` で書き、Linux では
+               `os.linesep == "\\n"`・BOM 無しなのでディスク上のバイト列は
+               `after.encode("utf-8")` と厳密に一致する (probe 実測)。
+
+            なお `after == before` のときは `lock_config` が書き込みを
+            **省く**。その場合ディスクの改行が CRLF なら
+            `read_bytes() != after.encode(...)` となり書き戻さないが、
+            これは正しい — 何も書いていないのだから戻すものも無く、
+            `before` を書けば黙って CRLF を LF に変えてしまう。"""
             path = candidate_dir / "config.yaml"
             try:
-                current = path.read_text(encoding="utf-8")
-            except OSError:
+                current = path.read_bytes()
+            except (OSError, UnicodeError):
                 return
-            if current == after:
+            if current == after.encode("utf-8"):
                 path.write_text(before, encoding="utf-8")
 
         relocked, relock_reason = plugin_loader.discover_one_with_reason(
