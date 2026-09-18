@@ -938,6 +938,41 @@ def test_lock_staging_deps_refuses_outputs_undeclared_dependency(tmp_path):
     assert out["reason"] == "outputs_undeclared"
 
 
+def test_lock_staging_deps_refuses_non_indicator_dependency(tmp_path):
+    """1 周目 ローカル LLM (c15 muse): `not_indicator` 分岐に到達する受入。
+
+    既存は `not_found` (依存が view に無い) と `outputs_undeclared`
+    (`outputs is None`) しか踏まないため、`if dep["kind"] != "indicator":`
+    の分岐を丸ごと削除する変異が生存した (実測: tests/tools/
+    test_improve_staging_tools.py + tests/loops/test_improve_loop_source_snapshot.py
+    + tests/loops/test_improve_e2e.py で 117 passed)。この変異下では
+    **strategy を依存先に指した候補に pin が書かれてしまい**、
+    `lock_staging_deps` が ok を返す。`available` が indicator だけを
+    挙げることも併せて pin する (agent への誘導が壊れると kind 違いの
+    依存を書き直させられない)。
+    """
+    from tests.fixtures import indicator_wiring as fx
+    staging = tmp_path / "staging"
+    d = fx.write_rsi_pullback(staging, pins=None)
+    import yaml
+    cfg = yaml.safe_load((d / "config.yaml").read_text())
+    cfg["indicators"]["rsi"]["plugin"] = "other_strategy"
+    (d / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    view = {"plugins": [
+                {"name": "other_strategy", "kind": "strategy",
+                 "pairs": ["USDJPY"], "params": {}, "outputs": ["x"],
+                 "content_hash": "d" * 64},
+                {"name": "rsi", "kind": "indicator", "pairs": [],
+                 "params": {"period": 14}, "outputs": ["rsi"],
+                 "content_hash": "c" * 64}],
+            "pin_broken_strategies": []}
+    out = _tools(tmp_path, view)["lock_staging_deps"]("rsi_pullback")
+    assert out["error"] == "indicator_unresolved"
+    assert out["alias"] == "rsi" and out["reason"] == "not_indicator"
+    assert out["available"] == ["rsi"]
+    assert "ok" not in out and "pins" not in out
+
+
 def test_lock_staging_deps_keeps_the_candidate_discoverable(tmp_path):
     from agentic_fx.plugin.loader import discover_one_with_reason
     from tests.fixtures import indicator_wiring as fx
