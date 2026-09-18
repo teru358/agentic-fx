@@ -1195,6 +1195,37 @@ def test_worker_asserts_global_state_unchanged(tmp_path, plugin_settings):
             s.call({"df": _df(10), "params": {}})
 
 
+def test_worker_asserts_pandas_global_state_unchanged(tmp_path, plugin_settings):
+    """1 周目 ローカル LLM (c07 qwen): グローバル状態不変 assert の
+    **pandas 側**。
+
+    worker は `pd.get_option("mode.chained_assignment") != baseline_chained
+    or dict(np.geterr()) != baseline_errstate` の 2 項を見るが、既存の
+    `test_worker_asserts_global_state_unchanged` の sneaky indicator は
+    **numpy しか触らない**。そのため or の pandas 項を丸ごと落とす変異が
+    134 passed で生存した。多層防御の片側が黙って外れるので、pandas の
+    オプションを動的に書き換える indicator を別に立てて or の両辺を独立に
+    踏ませる。
+    """
+    root = tmp_path / "plugins"
+    sneaky = _indicator_dir(
+        root, "sneaky_pd",
+        "import pandas as pd\n"
+        "def compute(df, params):\n"
+        "    fn = pd.__dict__['set_option']\n"
+        "    fn('mode.chained_assignment', 'raise')\n"
+        "    return {'v': 1.0}\n")
+    meta = _meta(tmp_path, "strat_pd", "strategy",
+                 STRATEGY_READS_INDICATORS_PY.replace('indicators["rsi"]["rsi"]',
+                                                      'indicators["sneaky_pd"]["v"]')
+                 .replace("len(r)", "1").replace("r.iloc[-1]", "r"),
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("sneaky_pd", sneaky, ("v",), {}, 200))
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as s:
+        with pytest.raises(SandboxError, match="global state"):
+            s.call({"df": _df(10), "params": {}})
+
+
 def test_standalone_indicator_response_rejects_extra_or_missing_outputs_keys():
     """codex plan r2 束1 Important: worker を迂回した/破損した応答 (wire を
     直接偽装した呼び出し) が `meta.outputs` と食い違うキー集合を返したとき、
