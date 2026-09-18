@@ -320,9 +320,15 @@ def test_improve_payload_indicator_deps_is_empty_object_when_resolved_is_none(
     json.dumps(payload["indicator_deps"])      # plain JSON であること
 
 
-def test_indicator_deps_is_absent_for_indicator_kind(tmp_path):
+def test_indicator_deps_is_empty_object_for_indicator_kind(tmp_path):
     """indicator 候補には依存が無いので `indicator_deps` は `{}`。
-    gate double 不要 — kind=indicator は strategy backtest を回さない。"""
+    gate double 不要 — kind=indicator は strategy backtest を回さない。
+
+    1 周目 ローカル LLM (c17 muse Minor / qwen Minor、指揮者裁定 2026-09-18
+    で改名を採用): 旧名は `..._is_absent_for_indicator_kind` で「キーが
+    無い」を意味していたが、assert は `== {}` (キーは在って値が空)。契約は
+    「3 経路とも常にキーを載せ、依存が無ければ空オブジェクト」なので
+    assert の側が正であり、名前を assert に合わせた (挙動は変えていない)。"""
     conn, plugins_root = _switch_env(tmp_path)
     from tests.fixtures import indicator_wiring as fx
     fx.write_indicator(plugins_root / "_human", "rsi")

@@ -8257,7 +8257,7 @@ def test_indicator_deps_is_empty_object_for_a_strategy_without_deps(
     assert payload["indicator_deps"] == {}
 
 
-def test_indicator_deps_is_absent_for_indicator_kind(tmp_path):
+def test_indicator_deps_is_empty_object_for_indicator_kind(tmp_path):
     """indicator 候補には依存が無いので `indicator_deps` は `{}` (キーは
     schema 安定のため必ず存在する — 他の 4 キーと同じ規約)。
 
