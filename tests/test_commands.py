@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.commands import Commands
 from agentic_fx.config import load_settings
@@ -887,3 +889,53 @@ def test_dependent_strategies_are_listed_in_decision_id_order(tmp_path):
     assert elsewhere == []
     out = shell._approval_detail(i2_id)
     assert "dependent_pinned_elsewhere=z_first, a_second" in out
+
+
+# --- 段 0 r2 (裁定 4、2026-09-19): CR1 が加えた `_plugin_lock` の
+#     `ValueError` が shell の 5 つ目の経路 (reject) から漏れないこと ---
+
+# 実測 (段 0 r2): `approve` は `_plugin_lock` まで届かない — その手前の
+# `candidate_path` 正規形チェック (`approve_candidate` が lock を取る前に
+# 読む `candidate_path_pre`) が先に `ValueError` を投げる。どちらの経路も
+# 同じ `except (ValueError, KeyError)` に落ちて人間向け文言になる。
+@pytest.mark.parametrize("verb,expected", [
+    ("reject", "invalid plugin name for lock: 'Upper'"),
+    ("approve", "does not match the canonical form"),
+])
+def test_plugin_decision_with_a_noncanonical_payload_name_reports_an_error(
+        tmp_path, verb, expected):
+    """段 0 r2 パート B #5 (ブリーフの 4 経路に無い 5 つ目の経路):
+    `switch.reject_candidate` は approval payload の `$.name` を**検証せず**
+    `_plugin_lock` を直接呼ぶ。CR1 後はそこで `ValueError` が上がるので、
+    CR1 以前に作られた非正規名の payload を人間が reject/approve しようと
+    したときに例外が `dispatch` の外へ出ないことを確かめる。
+
+    `dispatch` は既に `except (ValueError, KeyError)` を持つのでこの 5 つ目の
+    経路も人間向けメッセージになる (裁定 4 = pin のみ)。この pin が見るのは
+    **その except が実際にこの経路を覆っていること**と、例外が出た以上
+    決定が成立していない (pending 留置 = fail closed) こと。
+
+    `int(args[0])` も同じ `except ValueError` に落ちるので、文言は
+    `_plugin_lock` のメッセージまで含めて確かめる (前置き `エラー:` だけの
+    assert では別の ValueError と区別できない)。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "Upper", "content_hash": "h1", "artifact_hash": "a1",
+                 "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/1/Upper"},
+        now=NOW)
+
+    out = cmds.dispatch(f"{verb} {approval_id} no good")
+
+    assert "エラー:" in out
+    assert expected in out
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending"
+    # lock ファイルも作られない (`.locks` の mkdir より前に落ちる)
+    assert not (plugins_dir / ".locks").exists()
