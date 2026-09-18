@@ -1925,3 +1925,94 @@ def test_relock_creates_a_new_hash_that_never_collides_with_the_old_rows(
     assert br_store.find_matching_approved_metrics(
         conn, pair="USDJPY", variant="candidate", source="dukascopy",
         base_interval="5m", trades=40, pf=1.5, avg_r=0.2) == old_hash
+
+
+# --- /code-review 2 周目 CR1 (2026-09-18): 依存名の検証と lock path ---
+
+
+def test_dependency_names_ignores_non_mapping_indicators(tmp_path):
+    """CR1 (1): `indicators:` が mapping でない (list/スカラー/文字列) 候補で
+    `_dependency_names` が `AttributeError` を投げない。依存名を足さず
+    `[name]` だけを返し、形状の拒否は `discover` (gate) に委ねる。"""
+    cand = tmp_path / "cand"
+    cand.mkdir()
+    for body in ("kind: strategy\nindicators: [a, b]\n",
+                 "kind: strategy\nindicators: 3\n",
+                 "kind: strategy\nindicators: rsi\n",
+                 "- just\n- a\n- list\n"):
+        (cand / "config.yaml").write_text(body, encoding="utf-8")
+        assert plugin_switch._dependency_names(cand, "mystrat") == ["mystrat"]
+
+
+def test_dependency_names_drops_names_outside_the_plugin_name_grammar(tmp_path):
+    """CR1 (2): plugin 名の正規形 (`loader._PLUGIN_NAME_RE`) に合致しない
+    依存名は lock 集合に入れない。`a/b` / `../evil` / `/abs/path` は
+    `.locks/<name>.lock` を組んだ時点でディレクトリ外へ出る/存在しない
+    ディレクトリを指すため、そもそも lock の材料にしてはいけない。"""
+    cand = tmp_path / "cand"
+    cand.mkdir()
+    for bad in ("a/b", "../evil", "/tmp/abs", "", "Upper", "9lead",
+                "x" * 65, "sub/../../x"):
+        (cand / "config.yaml").write_text(
+            "kind: strategy\nindicators:\n  x:\n    plugin: "
+            f"{bad!r}\n", encoding="utf-8")
+        assert plugin_switch._dependency_names(cand, "mystrat") == ["mystrat"], bad
+    # 正規形は従来どおり残る
+    (cand / "config.yaml").write_text(
+        "kind: strategy\nindicators:\n  x:\n    plugin: rsi_indicator\n",
+        encoding="utf-8")
+    assert plugin_switch._dependency_names(cand, "mystrat") == [
+        "mystrat", "rsi_indicator"]
+
+
+def test_plugin_lock_refuses_names_outside_the_plugin_name_grammar(tmp_path):
+    """CR1 (2) sink 側: `_plugin_lock` は plugin 名の正規形に合致しない
+    名前を `ValueError` で拒否し、`.locks/` の外にファイルを作らない
+    (`open(lock_path, "a+")` は任意パスに空ファイルを作れる sink)。"""
+    plugins_root = tmp_path / "plugins"
+    plugins_root.mkdir()
+    escape = tmp_path / "outside.lock"
+    for bad in ("../outside", "a/b", "/tmp/agentic_fx_probe_should_not_exist",
+                "", "Upper"):
+        with pytest.raises(ValueError):
+            with plugin_switch._plugin_lock(plugins_root, bad):
+                pass
+    assert not escape.exists()
+    assert not (plugins_root / "outside.lock").exists()
+    assert not Path("/tmp/agentic_fx_probe_should_not_exist.lock").exists()
+    # 検証は `mkdir` より前 — 不正名では `.locks/` 自体も作らない
+    assert not (plugins_root / ".locks").exists()
+    # 正規形なら従来どおり取れる
+    with plugin_switch._plugin_lock(plugins_root, "rsi_indicator"):
+        pass
+    assert sorted(p.name for p in (plugins_root / ".locks").iterdir()) == [
+        "rsi_indicator.lock"]
+
+
+def test_unparseable_candidate_config_is_rejected_by_the_gate_not_the_lock_set(
+        tmp_path, monkeypatch):
+    """CR1 (3): `_dependency_names` が parse 失敗で `[name]` に縮退しても
+    守るべき書き込みは起きない — `submit_candidate` は lock の**内側**
+    最初の手順 `_run_full_gate` → `loader._discover_one` で必ず reject し、
+    approval 行・`.versions`・symlink のいずれも作らない (fail closed)。"""
+    conn, plugins_root = _switch_env(tmp_path)
+    _install_gate_double(monkeypatch)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    human = plugins_root / "_human"
+    d = fx.write_rsi_pullback(human, pins={"rsi": hashes["rsi"]})
+    before = conn.execute(
+        "SELECT COUNT(*) FROM approval_requests").fetchone()[0]
+    (d / "config.yaml").write_text("kind: strategy\nindicators: [\n",
+                                   encoding="utf-8")
+    # parse 不能なので lock 集合は自分の名前だけに縮退する
+    assert plugin_switch._dependency_names(d, "rsi_pullback") == ["rsi_pullback"]
+    with pytest.raises(ValueError):
+        plugin_switch.submit_candidate(
+            conn, name="rsi_pullback", staging_dir=human,
+            candidate_origin="human", mission_id=None, backlog_id=None,
+            settings=SETTINGS, now=fx.NOW)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM approval_requests").fetchone()[0] == before
+    assert not (plugins_root / ".versions" / "rsi_pullback").exists()
+    assert not (plugins_root / "rsi_pullback").exists()

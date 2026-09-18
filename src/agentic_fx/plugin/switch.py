@@ -792,6 +792,17 @@ def _plugin_lock(plugins_root: Path, name: str):
     """`plugins/.locks/<name>.lock` を blocking `flock(LOCK_EX)` で取る
     (§5.1 手順 1・11g の multi-process 期待どおり、`LOCK_NB` は使わない —
     reject/approve の競合は待ち合わせで解決する)。"""
+    # /code-review 2 周目 CR1 是正 (2026-09-18): `name` はここで
+    # `.locks/<name>.lock` というパスに連結される **sink** なので、
+    # 呼び出し元が何を渡しても `.locks/` の外に出ないことをこの 1 箇所で
+    # 保証する。実測 (probe): 検証が無いと `plugin: ../evil` で
+    # `plugins/evil.lock` が、`plugin: /tmp/x` で `/tmp/x.lock` が
+    # `open(lock_path, "a+")` によって実際に作られた (候補 `config.yaml`
+    # は改善 loop の agent が書く = 信頼境界の外)。`sweep_locks`
+    # (switch.py:649) が既に同じ正規形で pending 名を検証しているので
+    # 語彙を揃える。
+    if not (isinstance(name, str) and loader._PLUGIN_NAME_RE.fullmatch(name)):
+        raise ValueError(f"invalid plugin name for lock: {name!r}")
     lock_dir = plugins_root / ".locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     lock_path = lock_dir / f"{name}.lock"
@@ -823,15 +834,48 @@ def _plugin_locks(plugins_root: Path, names):
 
 def _dependency_names(candidate_dir: Path, name: str) -> list[str]:
     """候補 `config.yaml` から依存 indicator 名を読む (lock 集合の材料)。
-    読めない/依存なしなら `[name]` だけを返す。"""
+    読めない/依存なしなら `[name]` だけを返す。
+
+    /code-review 2 周目 CR1 是正 (2026-09-18): ここは **gate より前**に
+    走る (lock を取るために先に読む必要がある) ので、`config.yaml` の
+    形状も plugin 名の形式も一切保証されていない。従来は
+    `isinstance(str)` だけを見ていたため、
+
+    - `indicators: [a, b]` (mapping でない) で `.values()` の
+      `AttributeError` が gate に到達する前にクラッシュした
+      (`submit`/`approve`/`bless` の 3 経路すべて)、
+    - `plugin: a/b` で `.locks/a/b.lock` の `FileNotFoundError`、
+      `plugin: ../evil` / `/tmp/x` では `.locks/` の外に実際に
+      lock ファイルが作られた (probe 実測)
+
+    という 2 つの実害があった。**不正形は依存名を足さないだけ**にし、
+    形状・名前の拒否は直後の `_run_full_gate` → `loader._discover_one`
+    (= `discover` の正規 parse) に任せる — ここでクラッシュさせない。
+    縮退して自分の名前だけを lock しても守るべき書き込みは起きない:
+    submit / bless は lock 内側の最初の手順が `_run_full_gate` で、
+    parse 不能な `config.yaml` は `_discover_one` が必ず `None` を返す
+    (approval 行も版も作らない)。approve は payload の `content_hash`
+    との照合で pending 留置になる。この 2 点は
+    `test_unparseable_candidate_config_is_rejected_by_the_gate_not_the_
+    lock_set` で pin してある。
+
+    `bless_candidate` の `pre_deps` 再読比較 (TOCTOU) は lock の前後で
+    **同じこの関数**を使うので、不正形を落とす挙動は対称であり
+    `candidate_changed` の判定を壊さない。
+    """
     try:
         config = yaml.safe_load(
             (candidate_dir / "config.yaml").read_text(encoding="utf-8"))
     except (OSError, ValueError, yaml.YAMLError):
         return [name]
-    refs = (config or {}).get("indicators") or {}
-    deps = [ref.get("plugin") for ref in refs.values()
-            if isinstance(ref, dict) and isinstance(ref.get("plugin"), str)]
+    if not isinstance(config, dict):
+        return [name]
+    refs = config.get("indicators")
+    if not isinstance(refs, dict):
+        return [name]
+    deps = [ref["plugin"] for ref in refs.values()
+            if isinstance(ref, dict) and isinstance(ref.get("plugin"), str)
+            and loader._PLUGIN_NAME_RE.fullmatch(ref["plugin"])]
     return [name, *deps]
 
 
