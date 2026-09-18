@@ -532,3 +532,47 @@ def test_relock_detection_uses_the_real_dir_helpers(tmp_path):
 # バック分岐ごと削除した (プラン本文どおり — T5a 完了以降は `prepare()` が
 # 常に非空の `ctx.inventory` を書き込むため、フォールバック分岐は恒久的に
 # 到達不能な死にコードになっていた)。
+
+
+# --- /code-review 2 周目 CR3 (2026-09-18): tx 内の is_relock_transition ---
+
+
+@pytest.mark.parametrize("exc", [OSError("boom"), UnicodeError("boom"),
+                                 SyntaxError("boom"),
+                                 __import__("yaml").YAMLError("boom")])
+def test_relock_detection_failure_falls_back_to_the_quality_check(tmp_path, exc):
+    """/code-review 2 周目 CR3: `_check_duplicate_metrics_for_approval` は
+    `_finalize_success` の `BEGIN IMMEDIATE` の**内側**から呼ばれる。
+    `is_relock_transition` は file I/O + YAML/AST parse をするので
+    `OSError`/`UnicodeError`/`SyntaxError`/`yaml.YAMLError` を投げうるが、
+    従来は無防備で、`_finalize_success` の外側 `except Exception` が
+    `_compensate_tx2_failure` を走らせて approval 全体を捨てていた。
+
+    `plugin/noop_gate.py:71` の同種呼び出しと**同じ except 集合**で
+    「再ロックではない」に倒し、通常の質検査へ落ちる (fail closed) こと
+    を pin する。"""
+    import agentic_fx.loops.improve_loop as il
+    loop, conn, plugins_root = _loop_env(tmp_path)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    deployed = fx.write_rsi_pullback(plugins_root, pins={"rsi": "a" * 64})
+    candidate = fx.write_rsi_pullback(loop_staging(loop),
+                                      pins={"rsi": hashes["rsi"]})
+    inventory = _inventory_with_phase1(conn, plugins_root)
+    _seed_approved_candidate_metrics(conn, pair="USDJPY", trades=40, pf=1.5,
+                                     avg_r=0.2)
+    payload = {"kind": "strategy", "name": "rsi_pullback",
+               "content_hash": "c" * 64, "eval_source": "dukascopy",
+               "base_interval": "5m",
+               "in_sample": {"USDJPY": {"trades": 40, "pf": 1.5, "avg_r": 0.2}}}
+    monkeypatch_dirs(loop, deployed=deployed, candidate=candidate)
+
+    def _boom(*a, **k):
+        raise exc
+
+    with patch.object(il, "is_relock_transition", _boom):
+        demotion = loop._check_duplicate_metrics_for_approval(
+            conn, payload, inventory=inventory, staging_dir=loop_staging(loop))
+    # 例外は伝播せず、「再ロックではない」として通常の質検査に落ちる
+    assert demotion is not None
+    assert demotion.content_hash == "d" * 64

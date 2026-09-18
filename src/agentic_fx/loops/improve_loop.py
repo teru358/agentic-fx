@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Callable
 
 import json
 import jsonschema
+import yaml  # /code-review 2 周目 CR3: `is_relock_transition` の
+            # `yaml.YAMLError` ガード用 (noop_gate.py と同じ except 集合)
 
 # F-6 是正 (検収 task12): renameat2(2) の AT_FDCWD / RENAME_NOREPLACE。
 # x86_64 Linux の値 (Linux 3.15+ の ABI、glibc 2.28+ が libc wrapper を持つ)。
@@ -2105,9 +2107,23 @@ class ImproveLoop:
                                               inventory=inventory)
         candidate_dir = self._candidate_dir_for(approval_payload,
                                                 staging_dir=staging_dir)
-        if (deployed_dir is not None and candidate_dir is not None
-                and is_relock_transition(candidate_dir, deployed_dir,
-                                        inventory.inventory)):
+        # /code-review 2 周目 CR3 是正 (2026-09-18): この判定は
+        # `_finalize_success` の `BEGIN IMMEDIATE` の**内側**で走る。
+        # `is_relock_transition` は file I/O + YAML/AST parse をするので
+        # 一過性の読取失敗 (`.versions` GC race・permission・一時的に
+        # 読めない等) で例外を投げうる。無防備だと外側の
+        # `except Exception` が `_compensate_tx2_failure` を走らせ、
+        # 完了済みの backtest/approval 試行ごと捨ててしまう。
+        # `plugin/noop_gate.py:71` の同種呼び出しと**同じ except 集合**で
+        # 「再ロックではない」に倒し、通常の質検査へ落とす (fail closed)。
+        is_relock = False
+        if deployed_dir is not None and candidate_dir is not None:
+            try:
+                is_relock = is_relock_transition(candidate_dir, deployed_dir,
+                                                 inventory.inventory)
+            except (OSError, UnicodeError, SyntaxError, yaml.YAMLError):
+                is_relock = False
+        if is_relock:
             return None
         in_sample = approval_payload.get("in_sample") or {}
         eval_source = approval_payload.get("eval_source")
