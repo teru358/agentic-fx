@@ -639,9 +639,17 @@ def _plugin_lock(conn, settings, args: argparse.Namespace, root: Path) -> int:
     `new_hash` (disk から再計算した content_hash) を唯一の正とし、
     `resolve_indicator_deps` 実行時点で得た `meta.content_hash` を
     使い回さない。`discover_one_with_reason` の再実行結果
-    (`relocked.content_hash`) と一致することも assert する
-    (どちらも同じ disk 状態を独立に読んでいるので、食い違えば
-    `lock_config` かここの配線のバグ)。"""
+    (`relocked.content_hash`) と一致することを**明示チェック**し、
+    不一致なら stderr に固定文言を出して `1` を返す (どちらも同じ disk
+    状態を独立に読んでいるので、食い違えば書き込みと再読取のあいだに
+    何かが起きた = TOCTOU)。
+
+    codex 2 周目 X2 [Minor] (2026-09-18): 実装は 1 周目ローカル LLM の
+    是正 (c15 ornith、`assert` は `python -O` で消える) で明示チェック +
+    `rc=1` に変わっていたのに、この docstring だけ「assert する」のまま
+    残っていた — 今回の是正対象そのものと記述が矛盾し、呼出し側が期待
+    する失敗形を誤らせる。`_human` は人間所有領域なので `config.yaml` の
+    自動書き戻しはしない (直前の `relocked is None` 分岐と同じ作法)。"""
     if getattr(args, "from_kind", None) != "_human":
         print(_LOCK_NO_FROM_ERROR, file=sys.stderr)
         return 1
