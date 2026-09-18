@@ -1155,3 +1155,39 @@ def test_run_kind_gate_resolves_once_and_carries_the_same_object(tmp_path,
 
     assert calls == ["require"]
     assert outcome.resolved is seen[0]
+
+
+# --- /code-review 2 周目 CR7 (2026-09-18): outputs_required の単一実装 ---
+
+
+def test_outputs_required_violation_is_the_single_source_of_truth():
+    """CR7: 「kind=indicator は新規承認前に `outputs` 宣言が必須」という
+    規則の述語。`switch._run_full_gate` と `improve_loop` の commit gate が
+    2 本の手書きコピーを持っていたのを 1 つに寄せた (挙動不変)。"""
+    import types
+
+    from agentic_fx.plugin.approval import outputs_required_violation
+
+    def _meta(kind, outputs):
+        return types.SimpleNamespace(kind=kind, outputs=outputs)
+
+    assert outputs_required_violation(_meta("indicator", None)) is True
+    assert outputs_required_violation(_meta("indicator", ("rsi",))) is False
+    assert outputs_required_violation(_meta("indicator", ())) is False
+    assert outputs_required_violation(_meta("strategy", None)) is False
+    assert outputs_required_violation(_meta("signal", None)) is False
+
+
+def test_both_corridors_call_outputs_required_violation():
+    """CR7: 配線そのものの検証 (単体が緑でも「誰からも呼ばれない」が残る)。
+    2 つの承認 corridor のソースがこの述語を参照していることを固定する。"""
+    import inspect
+
+    from agentic_fx.loops import improve_loop as _improve_loop
+    from agentic_fx.plugin import switch as _switch
+
+    for module in (_switch, _improve_loop):
+        src = inspect.getsource(module)
+        assert "outputs_required_violation(" in src, module.__name__
+        # 手書きコピーが残っていない (条件式の再実装が復活したら赤)
+        assert "outputs is None" not in src, module.__name__

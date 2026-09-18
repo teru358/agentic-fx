@@ -115,6 +115,25 @@ def assert_max_bars_within_limit(meta: PluginMeta, *, settings: "Settings") -> N
             f"settings.plugin.max_bars_limit {settings.plugin.max_bars_limit}")
 
 
+def outputs_required_violation(meta: PluginMeta) -> bool:
+    """[indicator-consumption-wiring] U4 / U4a: 「kind=indicator は新規承認
+    の前に `outputs` を宣言していなければならない」という 1 つの規則の
+    **唯一の実装**。
+
+    /code-review 2 周目 CR7 是正 (2026-09-18): この規則は
+    `switch._run_full_gate` (人間 CLI の submit / bless corridor) と
+    `improve_loop` の commit gate (改善ループ corridor) に**同じ条件式が
+    2 本手書きで**置かれており、隣の `assert_max_bars_within_limit` /
+    `resolve_indicator_deps` が `approval.py` / `resolve.py` に括り出されて
+    両 corridor で共有されているのと不揃いだった。将来この規則を変える
+    (例: 再承認でも必須にする) とき 2 箇所を手で揃える必要があり、
+    片方だけ直る drift の土台になる。
+
+    固定文言 `outputs_required` は呼び出し元が作る (`last_result` に流れる
+    sink の語彙は corridor ごとに違うため — 遮断 8)。"""
+    return meta.kind == "indicator" and meta.outputs is None
+
+
 def _pytest_summary(stdout_text: str) -> str:
     """pytest の出力から末尾の非空行 (概ね summary 行) だけを抜き出す。"""
     lines = [line for line in stdout_text.splitlines() if line.strip()]

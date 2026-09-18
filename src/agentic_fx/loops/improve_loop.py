@@ -2475,7 +2475,12 @@ class ImproveLoop:
                 # [indicator-consumption-wiring] U4a: kind=indicator の
                 # `outputs` 宣言は新規承認で必須。固定文言のみ
                 # (`last_result` にそのまま流れる — 遮断 8)。
-                if kind == "indicator" and candidate_meta.outputs is None:
+                # /code-review 2 周目 CR7 (2026-09-18): 条件式は
+                # `approval.outputs_required_violation` に一本化
+                # (`switch._run_full_gate` と共有 — 挙動不変。
+                # `candidate_meta.kind` は discover 由来で、上の
+                # `_read_candidate_kind` と同じ config の `kind`)。
+                if approval.outputs_required_violation(candidate_meta):
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         reason="outputs_required", now=now,

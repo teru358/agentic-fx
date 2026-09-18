@@ -963,7 +963,10 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
     # kind=indicator の `outputs` 宣言を必須にする。固定文言のみ
     # (候補名も理由も足さない — Global Constraints の語彙一覧)。
     # 位置は `assert_max_bars_within_limit` と同じ「ゲート本体の手前」。
-    if meta.kind == "indicator" and meta.outputs is None:
+    # /code-review 2 周目 CR7 (2026-09-18): 条件式は
+    # `approval.outputs_required_violation` に一本化 (improve_loop の
+    # commit gate と共有 — 挙動不変)。
+    if approval.outputs_required_violation(meta):
         raise ValueError("outputs_required")
 
     rows: list[dict] = []
