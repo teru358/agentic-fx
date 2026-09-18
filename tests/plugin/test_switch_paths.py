@@ -1951,8 +1951,16 @@ def test_dependency_names_drops_names_outside_the_plugin_name_grammar(tmp_path):
     ディレクトリを指すため、そもそも lock の材料にしてはいけない。"""
     cand = tmp_path / "cand"
     cand.mkdir()
+    # 段 0 r2 (M-A3): 末尾改行と予約名を追加。`fullmatch` → `match` の
+    # 変異は旧 param 集合だけでは SURVIVED だった — `.match('good\n')` は
+    # 成立する (`$` は末尾改行の前でも合致する) ため、末尾改行のケースが
+    # 無いと `fullmatch` の必要性を誰も観測していなかった。予約名
+    # (`_staging` / `_human` / `_archive` / `.locks` / `.` / `..`) は
+    # 先頭が `[a-z]` でないので正規形の外だが、「正規形が先頭英小文字
+    # 必須であること」を pin が実際に見ているかを明示する。
     for bad in ("a/b", "../evil", "/tmp/abs", "", "Upper", "9lead",
-                "x" * 65, "sub/../../x"):
+                "x" * 65, "sub/../../x", "good\n", "good\n\n",
+                "_staging", "_human", "_archive", ".locks", ".", ".."):
         (cand / "config.yaml").write_text(
             "kind: strategy\nindicators:\n  x:\n    plugin: "
             f"{bad!r}\n", encoding="utf-8")
@@ -1972,8 +1980,12 @@ def test_plugin_lock_refuses_names_outside_the_plugin_name_grammar(tmp_path):
     plugins_root = tmp_path / "plugins"
     plugins_root.mkdir()
     escape = tmp_path / "outside.lock"
+    # 段 0 r2 (M-A4): 同上 — 末尾改行と予約名を追加。`fullmatch` → `match`
+    # の変異は旧 param 集合では SURVIVED だった。
     for bad in ("../outside", "a/b", "/tmp/agentic_fx_probe_should_not_exist",
-                "", "Upper"):
+                "", "Upper", "good\n", "good\n\n",
+                "_staging", "_human", "_archive", ".locks", ".", "..",
+                123, None):
         with pytest.raises(ValueError):
             with plugin_switch._plugin_lock(plugins_root, bad):
                 pass
