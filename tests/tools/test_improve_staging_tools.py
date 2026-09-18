@@ -993,6 +993,22 @@ def test_lock_staging_deps_rejects_a_non_strategy_candidate(tmp_path):
     assert "ok" not in out and "pins" not in out
 
 
+def test_lock_staging_deps_rejects_an_unknown_or_unsafe_candidate_name(tmp_path):
+    """1 周目 ローカル LLM (c15 qwen Minor): 候補ディレクトリのガード。
+
+    `if candidate_dir is None or not candidate_dir.is_dir():` を削除する
+    変異が 67 passed で生存した。`_safe_join` が `None` を返す名前
+    (traversal 形) では、この変異下で `discover_one_with_reason(None, ...)`
+    に `None` が渡り**ツールが例外で落ちる** (error 辞書を返す契約が壊れ、
+    agent が回復できない)。存在しない名前と traversal 形の両方を踏む。
+    """
+    tools = _tools(tmp_path, _VIEW)
+    for name in ("does_not_exist", "../escape"):
+        out = tools["lock_staging_deps"](name)
+        assert out["error"] == "not found"
+        assert "list_staging" in out["hint"]
+
+
 def test_lock_staging_deps_keeps_the_candidate_discoverable(tmp_path):
     from agentic_fx.plugin.loader import discover_one_with_reason
     from tests.fixtures import indicator_wiring as fx
