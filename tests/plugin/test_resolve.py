@@ -137,6 +137,29 @@ def test_resolve_outputs_undeclared(tmp_path):
         assert (ei.value.alias, ei.value.reason) == ("rsi", "outputs_undeclared")
 
 
+def test_resolve_outputs_undeclared_also_under_ignore(tmp_path):
+    """1 周目 ローカル LLM (c01 muse): `outputs_undeclared` は `pin_mode` に
+    依存しない拒否である。
+
+    `test_resolve_outputs_undeclared` は `("require", "check")` しか回さない
+    ため、`if dep.outputs is None:` を `if dep.outputs is None and
+    pin_mode != "ignore":` に緩める変異が判定 suite 丸ごと green のまま生存した
+    (実測: tests/plugin + tests/tools/test_improve_staging_tools.py +
+    tests/loops/test_improve_loop_plugin_gate.py + tests/plugin/test_switch_paths.py
+    で 179 passed)。`ignore` は `lock_config` / `find_noop_copy` の再ロック判定が
+    通る実経路であり、そこだけ U4b が抜けると `outputs` 未宣言の indicator が
+    pin を書かれて依存先に成立してしまう。
+    """
+    root = tmp_path / "plugins"
+    legacy = _indicator(root, "rsi", outputs="")
+    assert legacy.outputs is None
+    s = _strategy(tmp_path / "c", "s", "indicators:\n  rsi: {plugin: rsi}\n")
+    with pytest.raises(IndicatorResolutionError) as ei:
+        resolve_indicator_deps(s, _inv(root, legacy), settings=SETTINGS,
+                               pin_mode="ignore")
+    assert (ei.value.alias, ei.value.reason) == ("rsi", "outputs_undeclared")
+
+
 def test_resolve_over_max_bars_limit(tmp_path):
     root = tmp_path / "plugins"
     big = _indicator(root, "rsi", max_bars=f"max_bars: {SETTINGS.plugin.max_bars_limit + 1}\n")
