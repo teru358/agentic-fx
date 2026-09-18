@@ -373,6 +373,28 @@ max_bars: 0
     assert metas == []
 
 
+def test_discover_accepts_max_bars_one(tmp_path):
+    """1 周目 ローカル LLM (c08 qwen Minor): `max_bars >= 1` の**通過側**。
+
+    既存は `max_bars: 0` (拒否) と非 int (拒否) しか踏まないため、
+    `max_bars < 1` を `max_bars <= 1` に緩める変異が 146 passed で生存した。
+    この変異下では `max_bars: 1` の plugin が discover から静かに消える
+    (fail closed 側への退行 — 正当な config が理由も分からず配備できない)。
+    境界は通過/拒否の両側で押さえる。
+    """
+    _write_plugin(tmp_path, "one_max_bars", plugin_py=STRATEGY_PY,
+                  config_yaml="""
+kind: strategy
+timeframe: 1h
+pairs: [USDJPY]
+exit_mode: levels
+max_bars: 1
+""")
+    metas = discover(tmp_path)
+    assert [m.name for m in metas] == ["one_max_bars"]
+    assert metas[0].max_bars == 1
+
+
 def test_discover_rejects_non_int_max_bars(tmp_path, caplog):
     _write_plugin(tmp_path, "float_max_bars", plugin_py=STRATEGY_PY,
                   config_yaml="""
