@@ -232,7 +232,13 @@ def test_commit_strategy_missing_history_becomes_gate_failed(
         "selection_rationale": "r"}, transcript=[])
     gate_verdict = SimpleNamespace(
         passed=True, content_hash="c" * 64, artifact_hash="a" * 64)
-    meta = SimpleNamespace(max_bars=100, indicators=())
+    # /code-review 2 周目 CR7 是正 (2026-09-18): commit gate の
+    # `outputs_required` 判定が `approval.outputs_required_violation(
+    # candidate_meta)` に一本化され `candidate_meta.kind` を読むように
+    # なった。実物の `_discover_one` は必ず `PluginMeta` を返すので
+    # double にも `kind`/`outputs` を持たせる。
+    meta = SimpleNamespace(max_bars=100, indicators=(),
+                           kind="strategy", outputs=None)
     monkeypatch.setattr(
         loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
     monkeypatch.setattr(
@@ -563,7 +569,13 @@ def test_commit_strategy_other_valueerror_still_propagates(
         "selection_rationale": "r"}, transcript=[])
     gate_verdict = SimpleNamespace(
         passed=True, content_hash="c" * 64, artifact_hash="a" * 64)
-    meta = SimpleNamespace(max_bars=100, indicators=())
+    # /code-review 2 周目 CR7 是正 (2026-09-18): commit gate の
+    # `outputs_required` 判定が `approval.outputs_required_violation(
+    # candidate_meta)` に一本化され `candidate_meta.kind` を読むように
+    # なった。実物の `_discover_one` は必ず `PluginMeta` を返すので
+    # double にも `kind`/`outputs` を持たせる。
+    meta = SimpleNamespace(max_bars=100, indicators=(),
+                           kind="strategy", outputs=None)
     monkeypatch.setattr(
         loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
     monkeypatch.setattr(
