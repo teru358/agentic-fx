@@ -102,6 +102,29 @@ def test_series_longer_than_df_is_rejected():
         validate_indicator_result({"a": [1.0] * 8}, df_index=idx, outputs=("a",))
 
 
+def test_pd_series_elements_reject_bool_and_inf():
+    """1 周目 ローカル LLM (c03 ornith): `pd.Series` 経路の要素検査。
+
+    `test_series_with_inf_or_bool_rejected` は `list` を渡すので
+    `isinstance(value, pd.Series)` 分岐には入らず、`_nan_or_number` 経由の
+    list 経路しか踏まない。そのため Series 分岐の
+    `None if pd.isna(v) else _check_number(v, where)` を
+    `None if pd.isna(v) else float(v)` に緩める変異が生存した
+    (実測: tests/core + tests/plugin/test_sandbox.py +
+    tests/tools/test_plugin_loader.py で 149 passed)。この変異下では
+    bool が 1.0 / 0.0 へ、±Inf と数値文字列がそのまま通り、契約 7 の
+    「bool・±Inf・数値文字列は拒否」が Series 返却の indicator に対して
+    まるごと外れる (実 indicator は `pd.Series` を返すのが本線)。
+    """
+    idx = _idx()
+    for bad in (float("inf"), float("-inf"), True, "1.5"):
+        with pytest.raises(IndicatorResultError):
+            validate_indicator_result(
+                {"a": pd.Series([1.0, 2.0, bad, 4.0, 5.0], index=idx,
+                                dtype="object")},
+                df_index=idx, outputs=("a",))
+
+
 def test_series_with_inf_or_bool_rejected():
     idx = _idx()
     with pytest.raises(IndicatorResultError):
