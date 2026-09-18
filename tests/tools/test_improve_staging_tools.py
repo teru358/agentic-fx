@@ -993,6 +993,38 @@ def test_lock_staging_deps_rejects_a_non_strategy_candidate(tmp_path):
     assert "ok" not in out and "pins" not in out
 
 
+def test_lock_staging_deps_rejects_a_signal_candidate_too(tmp_path):
+    """2 周目 ローカル LLM (c06 ornith [Critical] — ラベルは当てにしないが
+    指摘そのものは当たり): 候補 kind ガードの母集団が `indicator` 1 種
+    だけで pin されていた。
+
+    `_KIND_FUNCS` は `indicator` / `signal` / `strategy` の 3 種なので、
+    `if meta.kind != "strategy":` を `if meta.kind == "indicator":` へ
+    書き換える変異 (= 許可リスト → 拒否リストへの反転) は
+    `tests/tools/test_improve_staging_tools.py` の 72 passed が green の
+    まま生存した (実測)。この変異下では **signal 候補が素通り**し、
+    `meta.indicators` が空なので `lock_config(candidate_dir, {})` に落ちて
+    `{"ok": True, "pins": {}}` を返す — `lock_staging_deps is only for
+    kind=strategy candidates` というガードの意味そのものが失われる。
+    """
+    staging = tmp_path / "staging"
+    d = staging / "sig"
+    d.mkdir(parents=True)
+    (d / "plugin.py").write_text(
+        "def detect(df, params):\n    return []\n", encoding="utf-8")
+    (d / "config.yaml").write_text(
+        "kind: signal\ntimeframe: 1h\npairs: [USDJPY]\n", encoding="utf-8")
+    (d / "test_plugin.py").write_text(
+        "def test_x():\n    pass\n", encoding="utf-8")
+
+    out = _tools(tmp_path, _VIEW)["lock_staging_deps"]("sig")
+
+    assert out["error"] == ("lock_staging_deps is only for kind=strategy "
+                            "candidates")
+    assert out["candidate_kind"] == "signal"
+    assert "ok" not in out and "pins" not in out
+
+
 def test_lock_staging_deps_rejects_an_unknown_or_unsafe_candidate_name(tmp_path):
     """1 周目 ローカル LLM (c15 qwen Minor): 候補ディレクトリのガード。
 
