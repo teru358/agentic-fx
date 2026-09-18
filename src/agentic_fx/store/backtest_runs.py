@@ -248,7 +248,8 @@ def latest_in_sample_metrics(conn: sqlite3.Connection, content_hash: str, *,
 def find_matching_approved_metrics(conn: sqlite3.Connection, *, pair: str,
                                     variant: str, source: str,
                                     base_interval: str, trades: Any,
-                                    pf: Any, avg_r: Any) -> str | None:
+                                    pf: Any, avg_r: Any,
+                                    exclude_name: str | None = None) -> str | None:
     """approval-quality 設計書 §A: 承認済み (``mission_outcome='approval'``)
     かつ **実際に approval_requests へ提出された** (payload の
     ``content_hash`` が一致する行が ``approval_requests`` に存在する)
@@ -269,15 +270,38 @@ def find_matching_approved_metrics(conn: sqlite3.Connection, *, pair: str,
     (承認済みなら `mission_outcome='approval'` で既に絞り込める、設計書
     §A)。``issued_by='harness'`` は ``in_sample_view``/
     ``latest_in_sample_metrics`` と同じ防御レイヤ (人間発行行を母集団
-    から除く)。"""
-    rows = conn.execute(
-        "SELECT content_hash, metrics_json FROM backtest_runs WHERE "
-        "scope='in_sample' AND issued_by='harness' AND variant=? "
-        "AND mission_outcome='approval' AND pair=? AND source=? "
-        "AND base_interval=? AND content_hash IN ("
-        "SELECT json_extract(payload_json, '$.content_hash') "
-        "FROM approval_requests) ORDER BY id",
-        (variant, pair, source, base_interval)).fetchall()
+    から除く)。
+
+    [indicator-consumption-wiring] /code-review 2 周目 CR2 是正
+    (2026-09-18、ユーザー承認、設計書 §2.7(b) v1.6): `exclude_name` を
+    渡すと、`approval_requests` の payload `$.name` がその名前の行だけを
+    母集団から外す (**自己一致除外**)。再ロックのみの再提出が「自分の
+    旧版と成績が一致する」ことで降格されるのを防ぐための最小の穴であり、
+    母集団全体の質検査を skip する代わりに使う。`plugin_ref` は
+    `plugins/<name>` と `plugins/_staging/<mid>/<name>` の 2 形式があり
+    契約ではないので、絞り込みには母集団の定義そのもの
+    (`approval_requests` の payload) を使う。`exclude_name=None` (既定)
+    の SQL は従来と 1 文字も変えない。"""
+    if exclude_name is None:
+        rows = conn.execute(
+            "SELECT content_hash, metrics_json FROM backtest_runs WHERE "
+            "scope='in_sample' AND issued_by='harness' AND variant=? "
+            "AND mission_outcome='approval' AND pair=? AND source=? "
+            "AND base_interval=? AND content_hash IN ("
+            "SELECT json_extract(payload_json, '$.content_hash') "
+            "FROM approval_requests) ORDER BY id",
+            (variant, pair, source, base_interval)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT content_hash, metrics_json FROM backtest_runs WHERE "
+            "scope='in_sample' AND issued_by='harness' AND variant=? "
+            "AND mission_outcome='approval' AND pair=? AND source=? "
+            "AND base_interval=? AND content_hash IN ("
+            "SELECT json_extract(payload_json, '$.content_hash') "
+            "FROM approval_requests "
+            "WHERE json_extract(payload_json, '$.name') IS NOT ?"
+            ") ORDER BY id",
+            (variant, pair, source, base_interval, exclude_name)).fetchall()
     for row in rows:
         try:
             raw_metrics = json.loads(row["metrics_json"])

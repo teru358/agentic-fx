@@ -1585,7 +1585,8 @@ class ImproveLoop:
         }
 
     def _check_duplicate_metrics(self, conn, *, content_hash, pair, variant,
-                                 source, base_interval, metrics) -> str | None:
+                                 source, base_interval, metrics,
+                                 exclude_name=None) -> str | None:
         """approval-quality 設計書 §A: `_build_approval_payload` の直後
         (gate 通過後・approval 提出前) に挟む質検査。候補の
         `(trades, pf, avg_r)` が既存の承認済み candidate 行と一致すれば、
@@ -1596,12 +1597,17 @@ class ImproveLoop:
         `content_hash` (候補自身の hash) はこの検査の比較には使わない —
         `_check_duplicate_metrics` の呼び出し規約を
         `_build_approval_payload` と揃え、将来 activity ログに候補自身の
-        hash も残すときに引数を増やさず済むようにするための保持。"""
+        hash も残すときに引数を増やさず済むようにするための保持。
+
+        /code-review 2 周目 CR2 (2026-09-18): `exclude_name` は
+        `find_matching_approved_metrics` へそのまま渡す自己一致除外
+        (再ロックのみの再提出でのみ使う)。"""
         from agentic_fx.store import backtest_runs as backtest_runs_store
         return backtest_runs_store.find_matching_approved_metrics(
             conn, pair=pair, variant=variant, source=source,
             base_interval=base_interval, trades=metrics.get("trades"),
-            pf=metrics.get("pf"), avg_r=metrics.get("avg_r"))
+            pf=metrics.get("pf"), avg_r=metrics.get("avg_r"),
+            exclude_name=exclude_name)
 
     def _final_report_path(self, reports_dir: Path, *, mission_id: int,
                            now: datetime) -> Path:
@@ -2097,10 +2103,16 @@ class ImproveLoop:
         observation へ倒す (実装時点の未決事項 — 設計書は単一 pair を
         前提にした記述のみで多 pair の合成方針を明示していない)。
 
-        [indicator-consumption-wiring] §2.7 (opus I5): 再ロックのみの
-        再提出は母集団から除外する — pin はハーネスの派生値であり、
-        「同じ戦略を新しい indicator 版に貼り直しただけ」の再提出が
-        成績一致で降格されると正式な再ロック経路が塞がる。"""
+        [indicator-consumption-wiring] §2.7(b) (opus I5 / /code-review
+        2 周目 CR2 で v1.6 に締め付け、2026-09-18 ユーザー承認):
+        再ロックのみの再提出では**自分と同名の承認行だけ**を母集団から
+        外して検査する。pin はハーネスの派生値なので「同じ戦略を新しい
+        indicator 版に貼り直しただけ」の再提出が**自分の旧版との**成績
+        一致で降格されると正式な再ロック経路が塞がる — が、
+        `find_matching_approved_metrics` の一致は名前非依存なので、
+        「質検査を丸ごと skip」にすると**無関係な別 strategy との**成績
+        一致まで見逃してしまい、この検査の目的そのものが再ロック経路
+        経由で回避できてしまう。除外は自己一致に限定する。"""
         if approval_payload.get("kind") != "strategy":
             return None
         deployed_dir = self._deployed_dir_for(approval_payload.get("name"),
@@ -2123,8 +2135,10 @@ class ImproveLoop:
                                                  inventory.inventory)
             except (OSError, UnicodeError, SyntaxError, yaml.YAMLError):
                 is_relock = False
-        if is_relock:
-            return None
+        # CR2 (v1.6): 再ロックなら「自分と同名の承認行」だけを母集団から
+        # 外して検査する (skip しない)。非再ロック時は `exclude_name=None`
+        # = 従来と同一 SQL・同一母集団。
+        exclude_name = approval_payload.get("name") if is_relock else None
         in_sample = approval_payload.get("in_sample") or {}
         eval_source = approval_payload.get("eval_source")
         eval_base_interval = approval_payload.get("base_interval")
@@ -2132,7 +2146,8 @@ class ImproveLoop:
             duplicate_of = self._check_duplicate_metrics(
                 conn, content_hash=approval_payload.get("content_hash"),
                 pair=pair, variant="candidate", source=eval_source,
-                base_interval=eval_base_interval, metrics=pair_metrics)
+                base_interval=eval_base_interval, metrics=pair_metrics,
+                exclude_name=exclude_name)
             if duplicate_of is not None:
                 return _DuplicateDemotion(content_hash=duplicate_of, pair=pair)
         return None

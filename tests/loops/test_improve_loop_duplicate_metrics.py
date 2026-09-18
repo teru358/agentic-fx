@@ -412,19 +412,25 @@ def _approve_plain_strategy(conn, plugins_root, name):
     return chash
 
 
-def _seed_approved_candidate_metrics(conn, *, pair, trades, pf, avg_r):
+def _seed_approved_candidate_metrics(conn, *, pair, trades, pf, avg_r,
+                                     name="rsi_pullback",
+                                     content_hash="d" * 64):
     """既承認候補の in_sample 行を 1 本入れる
-    (`find_matching_approved_metrics` が引き当てる母集団)。"""
+    (`find_matching_approved_metrics` が引き当てる母集団)。
+
+    /code-review 2 周目 CR2 (2026-09-18): 母集団が**名前非依存**である
+    ことを試験するため、承認行の plugin 名と content_hash を引数化した
+    (既定は従来どおり同名 `rsi_pullback` / `"d"*64`)。"""
     from datetime import timedelta
 
     from agentic_fx.store import approvals, backtest_runs as br
     aid = approvals.create(conn, "plugin",
-                           {"name": "rsi_pullback", "kind": "strategy",
-                            "content_hash": "d" * 64}, NOW)
+                           {"name": name, "kind": "strategy",
+                            "content_hash": content_hash}, NOW)
     approvals.apply_decision(conn, aid, status="approved", decided_by="t", now=NOW)
     br.save_harness_run(
-        conn, scope="in_sample", plugin_ref="plugins/rsi_pullback",
-        content_hash="d" * 64, kind="strategy", pair=pair, timeframe="1h",
+        conn, scope="in_sample", plugin_ref=f"plugins/{name}",
+        content_hash=content_hash, kind="strategy", pair=pair, timeframe="1h",
         source="dukascopy", base_interval="5m", params={},
         period=(NOW - timedelta(days=90), NOW),
         metrics={"trades": trades, "pf": pf, "win_rate": 0.5, "avg_r": avg_r,
@@ -458,9 +464,17 @@ def _inventory_with_phase1(conn, plugins_root):
         conn, plugins_root, settings=SETTINGS_FIXTURE)
 
 
-def test_relock_only_resubmission_skips_the_duplicate_metrics_check(tmp_path):
+def test_relock_only_resubmission_is_not_demoted_by_its_own_former_self(tmp_path):
     """P5: indicator を出力不変の変更で更新 → 依存 strategy を再ロック →
-    再提出の成績が既承認版と一致しても `duplicate_metrics_of` で降格されない。"""
+    再提出の成績が**自分の既承認版**と一致しても `duplicate_metrics_of`
+    で降格されない。
+
+    /code-review 2 周目 CR2 (2026-09-18、設計書 §2.7(b) v1.6): 旧名は
+    `..._skips_the_duplicate_metrics_check` だったが、実装は「質検査を
+    skip」ではなく「**同名の行を除外したうえで**検査する」に変わった
+    (この fixture の既承認行は候補と同名なので結果は不変)。別名との
+    一致が残ることは `test_relock_resubmission_is_still_checked_against_
+    other_plugins` で pin する。"""
     loop, conn, plugins_root = _loop_env(tmp_path)
     fx.write_indicator(plugins_root, "rsi")            # = I2 (現在 inventory)
     hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
@@ -576,3 +590,53 @@ def test_relock_detection_failure_falls_back_to_the_quality_check(tmp_path, exc)
     # 例外は伝播せず、「再ロックではない」として通常の質検査に落ちる
     assert demotion is not None
     assert demotion.content_hash == "d" * 64
+
+
+# --- /code-review 2 周目 CR2 (2026-09-18、ユーザー承認): 再ロック免除を
+#     「自己一致除外」に狭める (設計書 §2.7(b) v1.6) ---
+
+
+def test_relock_resubmission_is_still_checked_against_other_plugins(tmp_path):
+    """CR2: 再ロックのみの再提出でも、**別名の**既承認 strategy と成績が
+    一致すれば従来どおり降格する。設計書 §2.7(b) の意図は「自分の旧版との
+    一致で落とされない」ことであって、母集団全体の質検査を丸ごと skip する
+    ことではない (v1.6 で締め付け)。"""
+    loop, conn, plugins_root = _loop_env(tmp_path)
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    deployed = fx.write_rsi_pullback(plugins_root, pins={"rsi": "a" * 64})
+    candidate = fx.write_rsi_pullback(loop_staging(loop),
+                                      pins={"rsi": hashes["rsi"]})
+    inventory = _inventory_with_phase1(conn, plugins_root)
+    # 別名 (`other_strategy`) の既承認候補が同じ成績を持つ
+    _seed_approved_candidate_metrics(conn, pair="USDJPY", trades=40, pf=1.5,
+                                     avg_r=0.2, name="other_strategy",
+                                     content_hash="e" * 64)
+    payload = {"kind": "strategy", "name": "rsi_pullback",
+               "content_hash": "c" * 64, "eval_source": "dukascopy",
+               "base_interval": "5m",
+               "in_sample": {"USDJPY": {"trades": 40, "pf": 1.5, "avg_r": 0.2}}}
+    monkeypatch_dirs(loop, deployed=deployed, candidate=candidate)
+    demotion = loop._check_duplicate_metrics_for_approval(
+        conn, payload, inventory=inventory, staging_dir=loop_staging(loop))
+    assert demotion is not None
+    assert demotion.content_hash == "e" * 64
+
+
+def test_find_matching_approved_metrics_can_exclude_one_plugin_name(tmp_path):
+    """CR2: `find_matching_approved_metrics` の自己一致除外。
+    `exclude_name` を渡すと、`approval_requests` の payload `$.name` が
+    その名前の行だけが母集団から外れる (他名は残る)。
+    `exclude_name=None` (既定) の母集団は従来と 1 行も変わらない。"""
+    from agentic_fx.store import backtest_runs as br
+    loop, conn, plugins_root = _loop_env(tmp_path)
+    _seed_approved_candidate_metrics(conn, pair="USDJPY", trades=40, pf=1.5,
+                                     avg_r=0.2, name="rsi_pullback",
+                                     content_hash="d" * 64)
+    kw = dict(pair="USDJPY", variant="candidate", source="dukascopy",
+              base_interval="5m", trades=40, pf=1.5, avg_r=0.2)
+    assert br.find_matching_approved_metrics(conn, **kw) == "d" * 64
+    assert br.find_matching_approved_metrics(
+        conn, exclude_name="rsi_pullback", **kw) is None
+    assert br.find_matching_approved_metrics(
+        conn, exclude_name="other_strategy", **kw) == "d" * 64
