@@ -22,7 +22,11 @@ if TYPE_CHECKING:
     from agentic_fx.config import ImproveToolBudgetSettings
     from agentic_fx.tools.mission_counters import MissionToolCounters
 
-_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# [indicator-consumption-wiring] 段 0 r2 (裁定 6、2026-09-19): plugin 名の
+# 正規形は `plugin/loader._PLUGIN_NAME_RE` 1 本が正本。ここに同じ文字列を
+# 独立に `re.compile` すると、正本を締めても複製は追随しない。**呼び出し
+# 時点で属性参照する** (別名束縛にしない — 束縛すると正本の差し替えに
+# 追随せず、同一性 pin も `re` のキャッシュのせいで常に緑になる)。
 _ALLOWED_REL = frozenset({"plugin.py", "config.yaml", "test_plugin.py"})
 
 BUDGET_EXHAUSTED_DIRECTIVE = (
@@ -67,7 +71,7 @@ def _failure_signature(full_output: str) -> tuple:
 def _safe_join(root: Path, name: str, rel: str | None = None) -> Path | None:
     # round2 M1 是正 (2026-08-29、verified-round2.md M1): fullmatch に揃える
     # (`.match()` + `$` は末尾改行を受理する — probe 実測)。
-    if not _NAME_RE.fullmatch(name):
+    if not plugin_loader._PLUGIN_NAME_RE.fullmatch(name):
         return None
     if rel is not None and rel not in _ALLOWED_REL:
         return None
@@ -204,11 +208,12 @@ def build_improve_staging_tooldefs(
     def list_staging() -> dict:
         # opencode E2E m11 実測 (2026-08-30): `_snapshot_src/` (staging_dir
         # 直下に実体化される snapshot) を候補として返すと、モデルは
-        # read_staging_file で読もうとして _NAME_RE (先頭 `_` 不可) に必ず
+        # read_staging_file で読もうとして正規形 (先頭 `_` 不可) に必ず
         # 弾かれる。ツールで読めない名前は列挙しない。
         candidates = []
         for d in sorted(p for p in staging_dir.iterdir()
-                        if p.is_dir() and _NAME_RE.fullmatch(p.name)):
+                        if p.is_dir()
+                        and plugin_loader._PLUGIN_NAME_RE.fullmatch(p.name)):
             files = sorted(f.name for f in d.iterdir() if f.is_file())
             candidates.append({"name": d.name, "files": files})
         return {"candidates": candidates}
@@ -264,7 +269,8 @@ def build_improve_staging_tooldefs(
             return {"examples": []}
         examples = sorted(
             d.name for d in examples_dir.iterdir()
-            if d.is_dir() and _NAME_RE.fullmatch(d.name))
+            if d.is_dir()
+            and plugin_loader._PLUGIN_NAME_RE.fullmatch(d.name))
         return {"examples": examples}
 
     def read_example_plugin(name: str) -> dict:

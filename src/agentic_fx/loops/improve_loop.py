@@ -74,7 +74,6 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger("agentic_fx.improve_loop")
 
-_PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 def accepted_entries(entries):
@@ -1277,7 +1276,10 @@ class ImproveLoop:
             # probe 実測)。`fullmatch` に揃える。schema validate より前に置く
             # のは、agent 由来の巨大 name を activity へ 240 文字も echo
             # させないため (120 文字 cap、test_noncanonical_artifact_name_*)。
-            if not _PLUGIN_NAME_RE.fullmatch(name):
+            # [indicator-consumption-wiring] 段 0 r2 (裁定 6、2026-09-19):
+            # 正規形の正本は `plugin/loader._PLUGIN_NAME_RE` 1 本
+            # (ここに複製を置かない — 正本を締めても追随しない)。
+            if not plugin_loader._PLUGIN_NAME_RE.fullmatch(name):
                 display_name = name[:120] + ("…" if len(name) > 120 else "")
                 return _InspectionVerdict(
                     ok=False, reason=f"artifact.name {display_name!r} is not in "

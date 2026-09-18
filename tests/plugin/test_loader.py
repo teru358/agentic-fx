@@ -1138,3 +1138,37 @@ def test_unhashable_yaml_key_does_not_stop_discovery_of_other_plugins(tmp_path):
     _write(root, "good", plugin_py=_INDICATOR_PY,
            config_yaml="kind: indicator\noutputs: [v]\n")
     assert [m.name for m in loader.discover(root)] == ["good"]
+
+
+# [indicator-consumption-wiring] 段 0 r2 (裁定 6、2026-09-19): plugin 名の
+# 正規形は **`loader._PLUGIN_NAME_RE` 1 本が正本**。以前は
+# `loops/improve_loop.py` と `tools/improve_staging_tools.py` が同じ
+# 文字列を独立に `re.compile` しており、正本を締めても (あるいは緩めても)
+# 2 つの複製は追随しなかった (drift の土台)。`switch.py` が既に採っている
+# `loader._PLUGIN_NAME_RE` の**属性参照**の形に揃える。
+#
+# pin の形について (段 0 r2 実測): `improve_loop._PLUGIN_NAME_RE is
+# loader._PLUGIN_NAME_RE` という同一性 assert は**是正前から緑**になる —
+# `re.compile` は同じパターン文字列に対して同じオブジェクトを返す
+# (`re` モジュール内部のキャッシュ、probe 実測 `a is b == True`)。
+# 複製の存在を見るには「正本を差し替えたら両モジュールが追随するか」を
+# 見るしかない。
+def test_plugin_name_grammar_is_read_from_the_loader_at_call_time(monkeypatch):
+    import re as _re
+
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    from agentic_fx.tools import improve_staging_tools
+
+    # 正本だけを「`z` で始まる名前しか許さない」形に差し替える。
+    monkeypatch.setattr(loader, "_PLUGIN_NAME_RE",
+                        _re.compile(r"^z[a-z0-9_]{0,63}$"))
+
+    # (1) 子 worker の tool 側 (`_safe_join`)
+    assert improve_staging_tools._safe_join(Path("/tmp"), "zgood") is not None
+    assert improve_staging_tools._safe_join(Path("/tmp"), "agood") is None
+
+    # (2) 親側の artifact 名検査 (`_inspect_output` の早期 return 分岐は
+    #     `self` を読まないので未構築インスタンスで踏める)
+    loop = ImproveLoop.__new__(ImproveLoop)
+    assert ImproveLoop._inspect_output(
+        loop, {"artifact": {"type": "plugin", "name": "agood"}}, None).ok is False
