@@ -1226,6 +1226,32 @@ def test_worker_asserts_pandas_global_state_unchanged(tmp_path, plugin_settings)
             s.call({"df": _df(10), "params": {}})
 
 
+def test_standalone_indicator_response_rejects_bool_and_non_finite_scalars():
+    """1 周目 ローカル LLM (c06 qwen): 親側再検証のスカラー型ガード。
+
+    既存の `test_standalone_indicator_response_rejects_extra_or_missing_
+    outputs_keys` は**キー集合**しか見ないため、
+    `isinstance(value, bool) or not isinstance(value, (int, float))` から
+    bool 判定を外す変異が 151 passed で生存した。この変異下では wire の
+    `true` が `float(True) == 1.0` になり、後段の共通 validator には
+    **もう bool ではなく float として**渡るので誰も気づけない
+    (契約 7「bool は拒否」が親側で丸ごと外れる)。±Inf と数値文字列も
+    同じ 1 行が守っているので併せて pin する。
+    """
+    from agentic_fx.plugin.sandbox import SandboxError, _validate_indicator_result
+
+    for bad in (True, False, float("inf"), float("-inf"), "1.5"):
+        with pytest.raises(SandboxError):
+            _validate_indicator_result({"a": bad}, outputs=("a",))
+    # 系列側の同じガード (要素の bool / 非有限)
+    for bad in (True, float("inf")):
+        with pytest.raises(SandboxError):
+            _validate_indicator_result({"a": {"series": [1.0, bad]}},
+                                       outputs=("a",))
+    # 正常系は通る (恒真 assert になっていないことの裏取り)
+    assert _validate_indicator_result({"a": 1.5}, outputs=("a",)) == {"a": 1.5}
+
+
 def test_standalone_indicator_response_rejects_extra_or_missing_outputs_keys():
     """codex plan r2 束1 Important: worker を迂回した/破損した応答 (wire を
     直接偽装した呼び出し) が `meta.outputs` と食い違うキー集合を返したとき、
