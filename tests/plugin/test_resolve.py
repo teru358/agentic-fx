@@ -160,6 +160,27 @@ def test_resolve_outputs_undeclared_also_under_ignore(tmp_path):
     assert (ei.value.alias, ei.value.reason) == ("rsi", "outputs_undeclared")
 
 
+def test_resolve_max_bars_exactly_at_the_limit_is_accepted(tmp_path):
+    """1 周目 ローカル LLM (c01 ornith / qwen): `max_bars` 上限の**通過側**。
+
+    `test_resolve_over_max_bars_limit` は `max_bars_limit + 1` (拒否側) しか
+    作らないため、`dep.max_bars > limit` を `>=` に緩める変異が生存した
+    (実測: tests/plugin/test_resolve.py + tests/plugin/test_loader.py +
+    tests/tools/test_plugin_loader.py で 144 passed)。承認回廊は
+    `max_bars == limit` をちょうど許容する (tests/plugin/test_approval.py の
+    境界テスト) ので、resolver がそこで fail closed すると**正規に承認された
+    indicator が依存先にできなくなる**。
+    """
+    root = tmp_path / "plugins"
+    exact = _indicator(root, "rsi",
+                       max_bars=f"max_bars: {SETTINGS.plugin.max_bars_limit}\n")
+    assert exact.max_bars == SETTINGS.plugin.max_bars_limit
+    s = _strategy(tmp_path / "c", "s", "indicators:\n  rsi: {plugin: rsi}\n")
+    resolved = resolve_indicator_deps(s, _inv(root, exact), settings=SETTINGS,
+                                      pin_mode="ignore")
+    assert [i.alias for i in resolved.items] == ["rsi"]
+
+
 def test_resolve_over_max_bars_limit(tmp_path):
     root = tmp_path / "plugins"
     big = _indicator(root, "rsi", max_bars=f"max_bars: {SETTINGS.plugin.max_bars_limit + 1}\n")
