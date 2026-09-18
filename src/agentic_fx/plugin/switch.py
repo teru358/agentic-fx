@@ -820,9 +820,20 @@ def _plugin_locks(plugins_root: Path, names):
     """[indicator-consumption-wiring] §2.3 (codex r4 I1 / r5 I2):
     strategy + 依存 indicator 名を `sorted(set(names))` の順に取る。
 
-    - **重複排除**: 同一 indicator を複数 alias から参照しても 1 回だけ取る
-      (二重取得は同一プロセス内の flock 再入で無害だが、spy が数える
-      「取得回数」を契約として固定する — P2'')。
+    - **重複排除**: 同一 indicator を複数 alias から参照しても 1 回だけ取る。
+
+      /code-review 2 周目 (2026-09-18、「flock 再入」の docstring 主張の
+      事実確認): 旧稿は「二重取得は同一プロセス内の flock 再入で無害」と
+      書いていたが**これは誤り**。`flock(2)` のロックは open file
+      description に紐づくので、同じパスを 2 回 `open()` すれば別 ofd に
+      なり、2 本目の `LOCK_EX` は自プロセスのロックで待たされる
+      (probe 実測: 2 本目の `LOCK_EX|LOCK_NB` が `BlockingIOError`)。
+      `_plugin_lock` は blocking (`LOCK_NB` を使わない) なので、
+      重複排除を外すと同一 indicator を 2 alias で参照する候補の
+      submit/approve/bless は**自己デッドロックで永久に止まる**。
+      つまりこの `set()` は spy の「取得回数」契約 (P2'') のためだけの
+      ものではなく、正しさのために必須。非再入性は
+      `test_plugin_lock_is_not_reentrant_within_one_process` で pin する。
     - **名前昇順**: 逆順で取る呼び出し元が現れても deadlock しないよう
       順序を 1 箇所に固定する (P2')。
     """

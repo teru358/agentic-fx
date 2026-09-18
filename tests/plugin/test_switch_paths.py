@@ -2016,3 +2016,22 @@ def test_unparseable_candidate_config_is_rejected_by_the_gate_not_the_lock_set(
         "SELECT COUNT(*) FROM approval_requests").fetchone()[0] == before
     assert not (plugins_root / ".versions" / "rsi_pullback").exists()
     assert not (plugins_root / "rsi_pullback").exists()
+
+
+def test_plugin_lock_is_not_reentrant_within_one_process(tmp_path):
+    """/code-review 2 周目 (2026-09-18): `_plugin_locks` の `sorted(set(...))`
+    が「spy の取得回数契約」ではなく**正しさ**のために必須であることを
+    pin する。`flock` のロックは open file description 単位なので、
+    `_plugin_lock` が同じ名前で 2 回 `open()` すれば 2 本目は自プロセスの
+    ロックで待たされる (= blocking な `_plugin_lock` では自己デッドロック)。
+    重複排除を外す変異はこのテストで検出できる。"""
+    import fcntl
+    plugins_root = tmp_path / "plugins"
+    plugins_root.mkdir()
+    with plugin_switch._plugin_lock(plugins_root, "rsi"):
+        second = open(plugins_root / ".locks" / "rsi.lock", "a+")
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            second.close()
