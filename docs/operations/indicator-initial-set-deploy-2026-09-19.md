@@ -39,9 +39,16 @@ cp -r docs/examples/plugins/<名前> plugins/_human/<名前>
 
 ### (2) bless
 
+リポジトリの root で実行する。`afx` はプロジェクトの仮想環境 (`.venv/bin/afx`) に
+入っているコマンドで、シェルの PATH には無い — **`uv run` を付ける**:
+
 ```
-afx plugin bless <名前> --from _human
+cd ~/project/agentic-fx
+uv run afx plugin bless <名前> --from _human
 ```
+
+以下、本書の `afx plugin ...` はすべて `uv run afx plugin ...` の意味である
+(`afx> ...` と書いた箇所は、起動中のサービスの対話シェルに打つコマンド)。
 
 ### (3) 結果の確認
 
