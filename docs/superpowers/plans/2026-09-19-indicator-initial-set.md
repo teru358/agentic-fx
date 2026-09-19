@@ -1,4 +1,4 @@
-# [indicator-initial-set] 実装プラン v1.4 (設計書 = `docs/superpowers/specs/2026-09-19-indicator-initial-set-design.md` v1.3e 準拠)
+# [indicator-initial-set] 実装プラン v1.5 (設計書 = `docs/superpowers/specs/2026-09-19-indicator-initial-set-design.md` v1.3f 準拠)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (推奨) または superpowers:executing-plans で task ごとに実行すること。Step は
@@ -479,7 +479,29 @@ def test_unknown_params_raise_value_error(params):
     """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
     (R8 / U3) は承認不要なので、`period` のつもりで `perid` と綴りを誤ると
     現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
-    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    他の params 例外と同じく `params.` で始まる。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [None, [], "period", 14])
+def test_non_mapping_params_raise_value_error_not_type_error(params):
+    """**`params` 自体が dict でない場合も `TypeError` を漏らさず
+    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
+    なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
+def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
+    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
+    それ自体が不正 (loader は str キーしか通さない契約) として扱う。
     """
     with pytest.raises(ValueError, match=r"^params\."):
         compute(_mkdf(n=60), params)
@@ -598,11 +620,26 @@ def _reject_unknown_params(params: dict) -> None:
     **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
     重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
     経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+
+    `params` 自体が dict でない場合、および未知キーの型が混ざっている場合も
+    `TypeError` を漏らさない (3 周目 codex Important)。前者は `params.` 自体
+    を対象とした文言で `ValueError` にする。後者は `str` でないキーをそれ
+    自体不正として扱い (loader は str キーしか通さない契約)、str キーを
+    先に・非 str キーを後に置く決定的な順序で 1 つ選ぶ — 素の `sorted` は
+    型の混ざった集合を比較できず `TypeError` になるため使わない。
     """
-    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if not isinstance(params, dict):
+        raise ValueError(f"params. must be a mapping, got {type(params).__name__}")
+    unknown = sorted(
+        (key for key in params if not isinstance(key, str)
+         or key not in _KNOWN_PARAMS),
+        key=lambda key: (0, key) if isinstance(key, str) else (1, repr(key)),
+    )
     if unknown:
         known = ", ".join(sorted(_KNOWN_PARAMS))
-        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+        first = unknown[0]
+        label = first if isinstance(first, str) else repr(first)
+        raise ValueError(f"params.{label} is not a known parameter, "
                          f"known: {known}")
 
 
@@ -944,6 +981,28 @@ def test_unknown_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [None, [], "period", 14])
+def test_non_mapping_params_raise_value_error_not_type_error(params):
+    """**`params` 自体が dict でない場合も `TypeError` を漏らさず
+    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
+    なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
+def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
+    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
+    それ自体が不正 (loader は str キーしか通さない契約) として扱う。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
 def test_declared_defaults_are_exposed_as_a_constant():
     """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
     公開されていること (受入テストが値の表を重複して持たないため)。"""
@@ -1056,11 +1115,26 @@ def _reject_unknown_params(params: dict) -> None:
     **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
     重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
     経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+
+    `params` 自体が dict でない場合、および未知キーの型が混ざっている場合も
+    `TypeError` を漏らさない (3 周目 codex Important)。前者は `params.` 自体
+    を対象とした文言で `ValueError` にする。後者は `str` でないキーをそれ
+    自体不正として扱い (loader は str キーしか通さない契約)、str キーを
+    先に・非 str キーを後に置く決定的な順序で 1 つ選ぶ — 素の `sorted` は
+    型の混ざった集合を比較できず `TypeError` になるため使わない。
     """
-    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if not isinstance(params, dict):
+        raise ValueError(f"params. must be a mapping, got {type(params).__name__}")
+    unknown = sorted(
+        (key for key in params if not isinstance(key, str)
+         or key not in _KNOWN_PARAMS),
+        key=lambda key: (0, key) if isinstance(key, str) else (1, repr(key)),
+    )
     if unknown:
         known = ", ".join(sorted(_KNOWN_PARAMS))
-        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+        first = unknown[0]
+        label = first if isinstance(first, str) else repr(first)
+        raise ValueError(f"params.{label} is not a known parameter, "
                          f"known: {known}")
 
 
@@ -1433,6 +1507,28 @@ def test_unknown_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [None, [], "period", 14])
+def test_non_mapping_params_raise_value_error_not_type_error(params):
+    """**`params` 自体が dict でない場合も `TypeError` を漏らさず
+    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
+    なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
+def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
+    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
+    それ自体が不正 (loader は str キーしか通さない契約) として扱う。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
 def test_declared_defaults_are_exposed_as_a_constant():
     """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
     公開されていること (受入テストが値の表を重複して持たないため)。"""
@@ -1665,11 +1761,26 @@ def _reject_unknown_params(params: dict) -> None:
     **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
     重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
     経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+
+    `params` 自体が dict でない場合、および未知キーの型が混ざっている場合も
+    `TypeError` を漏らさない (3 周目 codex Important)。前者は `params.` 自体
+    を対象とした文言で `ValueError` にする。後者は `str` でないキーをそれ
+    自体不正として扱い (loader は str キーしか通さない契約)、str キーを
+    先に・非 str キーを後に置く決定的な順序で 1 つ選ぶ — 素の `sorted` は
+    型の混ざった集合を比較できず `TypeError` になるため使わない。
     """
-    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if not isinstance(params, dict):
+        raise ValueError(f"params. must be a mapping, got {type(params).__name__}")
+    unknown = sorted(
+        (key for key in params if not isinstance(key, str)
+         or key not in _KNOWN_PARAMS),
+        key=lambda key: (0, key) if isinstance(key, str) else (1, repr(key)),
+    )
     if unknown:
         known = ", ".join(sorted(_KNOWN_PARAMS))
-        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+        first = unknown[0]
+        label = first if isinstance(first, str) else repr(first)
+        raise ValueError(f"params.{label} is not a known parameter, "
                          f"known: {known}")
 
 
@@ -2048,6 +2159,28 @@ def test_unknown_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [None, [], "period", 14])
+def test_non_mapping_params_raise_value_error_not_type_error(params):
+    """**`params` 自体が dict でない場合も `TypeError` を漏らさず
+    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
+    なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
+def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
+    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
+    それ自体が不正 (loader は str キーしか通さない契約) として扱う。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
 def test_declared_defaults_are_exposed_as_a_constant():
     """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
     公開されていること (受入テストが値の表を重複して持たないため)。"""
@@ -2178,11 +2311,26 @@ def _reject_unknown_params(params: dict) -> None:
     **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
     重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
     経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+
+    `params` 自体が dict でない場合、および未知キーの型が混ざっている場合も
+    `TypeError` を漏らさない (3 周目 codex Important)。前者は `params.` 自体
+    を対象とした文言で `ValueError` にする。後者は `str` でないキーをそれ
+    自体不正として扱い (loader は str キーしか通さない契約)、str キーを
+    先に・非 str キーを後に置く決定的な順序で 1 つ選ぶ — 素の `sorted` は
+    型の混ざった集合を比較できず `TypeError` になるため使わない。
     """
-    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if not isinstance(params, dict):
+        raise ValueError(f"params. must be a mapping, got {type(params).__name__}")
+    unknown = sorted(
+        (key for key in params if not isinstance(key, str)
+         or key not in _KNOWN_PARAMS),
+        key=lambda key: (0, key) if isinstance(key, str) else (1, repr(key)),
+    )
     if unknown:
         known = ", ".join(sorted(_KNOWN_PARAMS))
-        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+        first = unknown[0]
+        label = first if isinstance(first, str) else repr(first)
+        raise ValueError(f"params.{label} is not a known parameter, "
                          f"known: {known}")
 
 
@@ -2554,6 +2702,28 @@ def test_unknown_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [None, [], "period", 14])
+def test_non_mapping_params_raise_value_error_not_type_error(params):
+    """**`params` 自体が dict でない場合も `TypeError` を漏らさず
+    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
+    なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
+def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
+    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
+    それ自体が不正 (loader は str キーしか通さない契約) として扱う。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
 def test_declared_defaults_are_exposed_as_a_constant():
     """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
     公開されていること (受入テストが値の表を重複して持たないため)。"""
@@ -2692,11 +2862,26 @@ def _reject_unknown_params(params: dict) -> None:
     **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
     重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
     経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+
+    `params` 自体が dict でない場合、および未知キーの型が混ざっている場合も
+    `TypeError` を漏らさない (3 周目 codex Important)。前者は `params.` 自体
+    を対象とした文言で `ValueError` にする。後者は `str` でないキーをそれ
+    自体不正として扱い (loader は str キーしか通さない契約)、str キーを
+    先に・非 str キーを後に置く決定的な順序で 1 つ選ぶ — 素の `sorted` は
+    型の混ざった集合を比較できず `TypeError` になるため使わない。
     """
-    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if not isinstance(params, dict):
+        raise ValueError(f"params. must be a mapping, got {type(params).__name__}")
+    unknown = sorted(
+        (key for key in params if not isinstance(key, str)
+         or key not in _KNOWN_PARAMS),
+        key=lambda key: (0, key) if isinstance(key, str) else (1, repr(key)),
+    )
     if unknown:
         known = ", ".join(sorted(_KNOWN_PARAMS))
-        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+        first = unknown[0]
+        label = first if isinstance(first, str) else repr(first)
+        raise ValueError(f"params.{label} is not a known parameter, "
                          f"known: {known}")
 
 
@@ -3070,6 +3255,28 @@ def test_unknown_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [None, [], "period", 14])
+def test_non_mapping_params_raise_value_error_not_type_error(params):
+    """**`params` 自体が dict でない場合も `TypeError` を漏らさず
+    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
+    なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
+def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
+    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
+    それ自体が不正 (loader は str キーしか通さない契約) として扱う。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
 def test_declared_defaults_are_exposed_as_a_constant():
     """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
     公開されていること (受入テストが値の表を重複して持たないため)。"""
@@ -3183,11 +3390,26 @@ def _reject_unknown_params(params: dict) -> None:
     **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
     重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
     経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+
+    `params` 自体が dict でない場合、および未知キーの型が混ざっている場合も
+    `TypeError` を漏らさない (3 周目 codex Important)。前者は `params.` 自体
+    を対象とした文言で `ValueError` にする。後者は `str` でないキーをそれ
+    自体不正として扱い (loader は str キーしか通さない契約)、str キーを
+    先に・非 str キーを後に置く決定的な順序で 1 つ選ぶ — 素の `sorted` は
+    型の混ざった集合を比較できず `TypeError` になるため使わない。
     """
-    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if not isinstance(params, dict):
+        raise ValueError(f"params. must be a mapping, got {type(params).__name__}")
+    unknown = sorted(
+        (key for key in params if not isinstance(key, str)
+         or key not in _KNOWN_PARAMS),
+        key=lambda key: (0, key) if isinstance(key, str) else (1, repr(key)),
+    )
     if unknown:
         known = ", ".join(sorted(_KNOWN_PARAMS))
-        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+        first = unknown[0]
+        label = first if isinstance(first, str) else repr(first)
+        raise ValueError(f"params.{label} is not a known parameter, "
                          f"known: {known}")
 
 
@@ -3596,6 +3818,28 @@ def test_unknown_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [None, [], "period", 14])
+def test_non_mapping_params_raise_value_error_not_type_error(params):
+    """**`params` 自体が dict でない場合も `TypeError` を漏らさず
+    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
+    なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
+def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
+    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
+    それ自体が不正 (loader は str キーしか通さない契約) として扱う。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
 def test_declared_defaults_are_exposed_as_a_constant():
     """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
     公開されていること (受入テストが値の表を重複して持たないため)。"""
@@ -3822,11 +4066,26 @@ def _reject_unknown_params(params: dict) -> None:
     **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
     重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
     経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+
+    `params` 自体が dict でない場合、および未知キーの型が混ざっている場合も
+    `TypeError` を漏らさない (3 周目 codex Important)。前者は `params.` 自体
+    を対象とした文言で `ValueError` にする。後者は `str` でないキーをそれ
+    自体不正として扱い (loader は str キーしか通さない契約)、str キーを
+    先に・非 str キーを後に置く決定的な順序で 1 つ選ぶ — 素の `sorted` は
+    型の混ざった集合を比較できず `TypeError` になるため使わない。
     """
-    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if not isinstance(params, dict):
+        raise ValueError(f"params. must be a mapping, got {type(params).__name__}")
+    unknown = sorted(
+        (key for key in params if not isinstance(key, str)
+         or key not in _KNOWN_PARAMS),
+        key=lambda key: (0, key) if isinstance(key, str) else (1, repr(key)),
+    )
     if unknown:
         known = ", ".join(sorted(_KNOWN_PARAMS))
-        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+        first = unknown[0]
+        label = first if isinstance(first, str) else repr(first)
+        raise ValueError(f"params.{label} is not a known parameter, "
                          f"known: {known}")
 
 
@@ -4238,6 +4497,28 @@ def test_unknown_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [None, [], "period", 14])
+def test_non_mapping_params_raise_value_error_not_type_error(params):
+    """**`params` 自体が dict でない場合も `TypeError` を漏らさず
+    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
+    なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
+def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
+    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
+    それ自体が不正 (loader は str キーしか通さない契約) として扱う。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
 def test_declared_defaults_are_exposed_as_a_constant():
     """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
     公開されていること (受入テストが値の表を重複して持たないため)。"""
@@ -4375,11 +4656,26 @@ def _reject_unknown_params(params: dict) -> None:
     **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
     重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
     経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+
+    `params` 自体が dict でない場合、および未知キーの型が混ざっている場合も
+    `TypeError` を漏らさない (3 周目 codex Important)。前者は `params.` 自体
+    を対象とした文言で `ValueError` にする。後者は `str` でないキーをそれ
+    自体不正として扱い (loader は str キーしか通さない契約)、str キーを
+    先に・非 str キーを後に置く決定的な順序で 1 つ選ぶ — 素の `sorted` は
+    型の混ざった集合を比較できず `TypeError` になるため使わない。
     """
-    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if not isinstance(params, dict):
+        raise ValueError(f"params. must be a mapping, got {type(params).__name__}")
+    unknown = sorted(
+        (key for key in params if not isinstance(key, str)
+         or key not in _KNOWN_PARAMS),
+        key=lambda key: (0, key) if isinstance(key, str) else (1, repr(key)),
+    )
     if unknown:
         known = ", ".join(sorted(_KNOWN_PARAMS))
-        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+        first = unknown[0]
+        label = first if isinstance(first, str) else repr(first)
+        raise ValueError(f"params.{label} is not a known parameter, "
                          f"known: {known}")
 
 
@@ -4747,6 +5043,28 @@ def test_unknown_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [None, [], "period", 14])
+def test_non_mapping_params_raise_value_error_not_type_error(params):
+    """**`params` 自体が dict でない場合も `TypeError` を漏らさず
+    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
+    なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
+def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
+    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
+    それ自体が不正 (loader は str キーしか通さない契約) として扱う。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
 def test_declared_defaults_are_exposed_as_a_constant():
     """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
     公開されていること (受入テストが値の表を重複して持たないため)。"""
@@ -4888,11 +5206,26 @@ def _reject_unknown_params(params: dict) -> None:
     **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
     重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
     経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+
+    `params` 自体が dict でない場合、および未知キーの型が混ざっている場合も
+    `TypeError` を漏らさない (3 周目 codex Important)。前者は `params.` 自体
+    を対象とした文言で `ValueError` にする。後者は `str` でないキーをそれ
+    自体不正として扱い (loader は str キーしか通さない契約)、str キーを
+    先に・非 str キーを後に置く決定的な順序で 1 つ選ぶ — 素の `sorted` は
+    型の混ざった集合を比較できず `TypeError` になるため使わない。
     """
-    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if not isinstance(params, dict):
+        raise ValueError(f"params. must be a mapping, got {type(params).__name__}")
+    unknown = sorted(
+        (key for key in params if not isinstance(key, str)
+         or key not in _KNOWN_PARAMS),
+        key=lambda key: (0, key) if isinstance(key, str) else (1, repr(key)),
+    )
     if unknown:
         known = ", ".join(sorted(_KNOWN_PARAMS))
-        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+        first = unknown[0]
+        label = first if isinstance(first, str) else repr(first)
+        raise ValueError(f"params.{label} is not a known parameter, "
                          f"known: {known}")
 
 
@@ -6609,6 +6942,7 @@ I8(b) の残骸 assert に「journal 0 行」を書くと red /
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-09-19 | v1.0 | 起案。設計書 v1.3a を T0 (共通テンプレート) / T1〜T9 (指標 1 本ずつ、並列可) / T10 (repo 側受入テストと runbook) の 11 task へ分割。**T1〜T9 の逐語コード 27 ファイルは指揮者が scratchpad で生成・実行し 131 passed を確認済み**。逆変異 54 件を実測し 54/54 KILLED (初回 9 件生存 → すべてテスト側の欠陥として修正)。I5 の数値・壊れた実装の red・等価変異 1 件を「着手前検証の記録」に記載 | 設計書 v1.3a (codex 設計レビュー r3 で指摘 0、収束) | - |
+| 2026-09-19 | v1.5 | **3 周目 (絞り込み、codex terra 1 束) の是正を反映。Critical 0 / Important 1** — `_reject_unknown_params` が非 dict の `params` と型混在キーで `TypeError` を出す → `ValueError` の統一形へ。`params` が `dict` でなければキー検査の前に `params.` 接頭辞つきの `ValueError` を投げ、未知キーの選択は型を跨いで比較しない決定的な順序 (str キー優先の辞書順 → 非 str キーは `repr` 順) にする。9 本の `plugin.py` (`_reject_unknown_params` の関数本体は 9 本で逐語同一のまま) と自己テスト (負例 6 件 x 9 本、160 → **214 passed**) に反映し、プラン記載の抽出コマンドで T1〜T9 の 27 ファイル + Step 10-i = 28 ブロックすべて DIFF-ZERO を再確認。設計書 §4 に非 mapping / 型混在キーの文言規則の行を追加 (v1.3f) | `tmp/review-20260919-iis/r3/codex-1.md`、是正 diff `4b09c86..d1e15bf` | `5d8c325` (plugin 9 本 + 自己テスト) / 本行の docs commit |
 | 2026-09-19 | v1.1 | **T10 の着手前検証** (Critical 4 / Important 8 / Minor 5) を全件反映。Step 10-b〜10-h を実物照合済みの記述へ改訂し、**Step 10-i に完成ファイル `tests/plugin/test_indicator_initial_set.py` の逐語 (実測 10 passed / 41.7 秒) を追加**。「着手前検証の記録 §8」の 2 件を設計書 v1.3b へ反映して閉じ、§9 に T10 の実測を追加。**T1〜T9 の節と行番号は一切動かしていない** (改訂は L4438 以降 + 冒頭 1 行の版表記のみ)。なお本文 L24 / L73 の「設計書 v1.3a」表記は、T10 より前の行を動かさない制約のため据え置き — **v1.3b は v1.3a に対する設計変更ゼロの改訂** (観測値の訂正 + 既知の欠落の起票) なので参照の妥当性は保たれる | T10 は起草者自身が「tmp 環境での bless 実測をしていない、最もプラン記述の欠陥を踏みやすい」と申告していた箇所 ([[plan-code-defects-not-implementer-defects]] 「着手前検証を必須工程にする」) | - |
 | 2026-09-19 | v1.4 | **2 周目レビュー (`/code-review high` sonnet 5 + codex terra + ローカル 3 本) の是正を反映。codex 4 件 + /code-review 3 件を採用、/code-review 3 件は見送り (記録のみ)。** ①**C1 + #1**: `examples_copy` の忠実性 (相対パス集合 + ファイル別 sha256) を fixture 本体で assert し、`_nine_metas(root)` を**コピー側 discover の単一出所**に寄せた (`lru_cache` で `discover` の ~46 回再実行を 1 回に、非 slow 8 本 1.13s → 0.85s)。②**C2 (設計変更、ユーザー提示済)**: **9 本の plugin が未知の `params` キーを `ValueError` にする** — `_DEFAULTS` / `_KNOWN_PARAMS` / `_reject_unknown_params` を 9 本に同形で追加し、`_*_param` の既定値も `_DEFAULTS` から引く。自己テストに負例 2 件 + `_DEFAULTS` 公開の pin (133 → **160 passed**)。受入テストは `config.yaml` の params と `_DEFAULTS` を**型込みで**辞書同値比較する。**T1〜T9 の `plugin.py` / `test_plugin.py` と Step 10-i のブロックを同期**。③**C3**: CLI 正常系に symlink の target の形 / 解決先の実在 / inventory の `outputs` を追加。④**C4**: 設計書 §6 I5 の生成式① の `open` を前足 close に訂正 (コードは変えない)。⑤**#5**: `_fail_once` の逐語重複を `_fail_record_version_once` helper に。⑥**#6**: 未参照の `PRICE_KEYS` を `_tolerance` の分類漏れ検知に使い、`test_every_delta_key_is_classified` を新設。プラン記載の抽出コマンドで T1〜T9 の 27 ファイル + Step 10-i = **28 ブロックすべて DIFF-ZERO** を再確認 | 2 周目レビュー `tmp/review-20260919-iis/r2/`、2026-09-19 指揮者裁定 | `684cb84` / `9c4ed5a` / `7a605ea` / `1af592a` / `6655f0b` / `a97b3bc` / `e2214aa` / `063eaaa` |
 | 2026-09-19 | v1.3 | **1 周目レビュー (codex terra 2 束、Critical 0 / Important 4) の是正を反映。4 件とも採用。** ①**X1 (束 1)**: 9 本のモジュール docstring の項目 3 が `max_bars: 400` の根拠を「再帰平滑の初期値依存を 1e-6 未満に抑えるため」と全 9 本で断定していた (設計書 §3.2 はこの上界式が使えるのは `ema` / `macd` / `atr` だけと明記)。**線形再帰 / 比を取る 2 本 (`rsi` `adx`) / 純 rolling 4 本の 3 類型に書き分け**、共通の「依存する strategy は `max_bars` を 400 以上に宣言すること」は全 9 本に残した。**T1〜T9 の `plugin.py` ブロックを同期**。②**X2 (束 2)**: 設計書 §6 I5 の fixture ②「明確な単調トレンド」が受入テストに無かった → `_trend_df` + `test_head_dependence_on_monotonic_trends` (8 系列) を追加、生成式を設計書 v1.3c に明記。③**X3 (束 2)**: I8 が `bless_candidate` を直接呼ぶだけで runbook の CLI (`afx plugin bless --from _human`) を実行していなかった → `_cli_env` + `entry.main` を in-process で叩く 3 ケース (正常系 rc=0 / `approval id=<N>`、ゲート失敗 rc=1 / stderr、未終端 journal での再 bless の traceback = [cli-bless-unresolved-journal] の現状 pin) を追加。runbook 手順 (6) は手動確認と明記。④**X4 (束 2)**: `_load_compute` が repo の `docs/examples/plugins/` を直接 `exec_module` しており `__pycache__` を実資源に書いていた (scratchpad の clean なコピーで再現) → session スコープの `examples_copy` fixture でコピーしてから import する形に変え、`co_filename` が repo 外であることを pin。**Step 10-i のブロックを同期**。プラン記載の抽出コマンドで T1〜T9 の 27 ファイル + Step 10-i = **28 ブロックすべて DIFF-ZERO** を再確認 | 1 周目レビュー `tmp/review-20260919-iis/r1/` (codex 2 束)、2026-09-19 指揮者裁定 | `5131961` / `c734f77` / `5798e05` / `c8eea63` |
