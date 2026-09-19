@@ -119,6 +119,9 @@ def test_ac1_retry_of_switched_but_unswitched_deploys(tmp_path, monkeypatch):
     assert outcome.rolled_back_op_id == row["op_id"]
     assert outcome.target == live.readlink().as_posix()
     assert outcome.status == "approved"
+    # 段 0 pin (S0-80): `op_id=None` に潰す変異が SURVIVED した。
+    # 設計書 §3.5: `deployed_after_rollback` の `op_id` は**新しい方**の行。
+    assert outcome.op_id == rows[1][0]
 
 
 @pytest.mark.slow
@@ -396,6 +399,28 @@ def test_ac9b_iii_phase_changed_live_same(tmp_path, monkeypatch):
     # `switch_reverted` は 1 行も出ない**。行の再取得を落とすと reconcile が
     # 終端行に対して `_revert_one` を再実行し、この行が 1 本出て red になる。
     assert "switch_reverted" not in text, "終端行への二重の巻き戻し記録"
+
+
+@pytest.mark.slow
+def test_revert_under_lock_returns_false_for_a_stale_row(tmp_path, monkeypatch):
+    """段 0 pin (S0-48): stale のとき `True` を返す変異が SURVIVED した。
+    戻り値を見ている呼び出し元は indicator_unresolved 枝の
+    `if not _revert_under_lock(...): continue` だけで、その枝を stale で
+    通すテストが無い。**戻り値そのもの**を直接 pin する
+    ([[mutation-testing]] 6.16 — 本体が red でも呼び出し側は別の変異)。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+
+    assert plugin_switch._revert_under_lock(
+        conn, row, plugins_root=plugins_root, now=NOW, activity=None,
+        expect_class="not_switched") is True, "巻き戻せた回は True"
+
+    # 同じ (古い) 行でもう一度呼ぶ = 競合者が畳んだ後と同じ stale 状態。
+    assert plugin_switch._revert_under_lock(
+        conn, row, plugins_root=plugins_root, now=NOW, activity=None,
+        expect_class="not_switched") is False, \
+        "stale を True で返すと呼び出し元が巻き戻していない行を巻き戻した扱いにする"
+    assert _rows(conn) == [(row["op_id"], "reverted")]
 
 
 @pytest.mark.slow
