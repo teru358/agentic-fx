@@ -54,6 +54,47 @@ PRICE_KEYS = frozenset({"value", "upper", "middle", "lower", "atr", "macd",
                         "signal", "hist", "tenkan", "kijun", "senkou_a",
                         "senkou_b", "chikou"})
 
+#: I5 が観測する系列の完全な一覧 (`<plugin 名>.<出力キー>`)。**20 本ある** —
+#: 出力キー名だけで束ねると `sma.value` と `ema.value` が衝突して
+#: 片方 (dict の後勝ちで `sma`) が一度も観測されない。段 0 の実測では
+#: `sma` の実装を `close.expanding(...).mean()` (先頭依存が最大の形) に
+#: 差し替えても I5 の 3 テストが全て緑のまま通った。
+DELTA_KEYS = frozenset(
+    {f"{name}.{key}"
+     for name, keys in (("sma", ("value",)), ("ema", ("value",)),
+                        ("rsi", ("rsi",)),
+                        ("macd", ("macd", "signal", "hist")),
+                        ("bollinger", ("upper", "middle", "lower")),
+                        ("atr", ("atr",)),
+                        ("adx", ("adx", "plus_di", "minus_di")),
+                        ("stochastic", ("k", "d")),
+                        ("ichimoku", ("tenkan", "kijun", "senkou_a",
+                                      "senkou_b", "chikou")))
+     for key in keys})
+
+
+def _tolerance(delta_key: str, base: float) -> float:
+    """`<plugin 名>.<出力キー>` の出力キー側で値域を引く (設計書 §6 I5)。"""
+    return (1e-6 if delta_key.split(".", 1)[1] in PCT_KEYS
+            else 1e-9 * base)
+
+
+# --- I5 の前提: 宣言 `max_bars` ---------------------------------------------
+
+def test_all_nine_declare_max_bars_400():
+    """9 本の `config.yaml` が `max_bars: 400` を宣言していること (設計書 §3.2 / D4)。
+
+    **`_last_row_deltas` の結合だけでは足りない**ので独立に pin する。段 0 の実測:
+    `ema` を `max_bars: 50` にすると結合した I5 が red になる
+    (span=20 の EMA は 50 本では初期値の重みが `(19/21)**50` = 6.7e-03 残る) が、
+    `sma` / `bollinger` / `stochastic` / `ichimoku` は窓が有限なので
+    `tail(50)` と全長が最終行で厳密に一致し、**結合しても red にならない**。
+    `test_nine_indicators_bless_in_sequence` も同じ値を見ているが、あちらは
+    `slow` の bless 実走 (段 0 実測 41 秒) なのでここに 1 秒の観測点を置く。
+    """
+    for meta in _nine_metas():
+        assert meta.max_bars == 400, (meta.name, meta.max_bars)
+
 #: `__pycache__` / `.pytest_cache` は `check_candidate_snapshot` が無視する
 #: (`gate_pytest.py:43,46-55`) ので**除外しない** — runbook の
 #: `cp -r` がそのまま巻き込んでも通ることを I8(a) で観測する。
@@ -153,21 +194,32 @@ def _degenerate_df(n_pre=200, n_flat=400, base=150.0, spike=1.0, seed=0):
                         index=index)
 
 
-def _last_row_deltas(df: pd.DataFrame, max_bars: int = 400) -> dict:
-    """全 9 本について「末尾 `max_bars` 本だけで計算した最終行」と
-    「全 `len(df)` 本で計算した最終行」の差の絶対値を `{キー: 値}` で返す。
-    両方 NaN のキー (`ichimoku.chikou` 等) は 0.0 とみなす。"""
+def _last_row_deltas(df: pd.DataFrame) -> dict:
+    """全 9 本について「**その plugin が宣言した `max_bars`** 本だけで計算した
+    最終行」と「全 `len(df)` 本で計算した最終行」の差の絶対値を
+    `{"<plugin 名>.<出力キー>": 値}` で返す。
+    両方 NaN のキー (`ichimoku.chikou` 等) は 0.0 とみなす。
+
+    **キーは plugin 名で修飾する** (`DELTA_KEYS` の注記) — 出力キー名だけだと
+    `sma.value` が `ema.value` に上書きされて消える。
+
+    **末尾の本数は `meta.max_bars` から取る** — 400 を引数既定値に固定すると、
+    I5 が「宣言 `max_bars` の本数で保証が成り立つ」ではなく「400 本で
+    成り立つ」しか観測せず、`config.yaml` の宣言を変えても何も red に
+    ならない (段 0 の実測)。
+    """
     out: dict[str, float] = {}
-    tail = df.tail(max_bars).copy(deep=True)
     for meta in _nine_metas():
         compute = _load_compute(meta.name, meta.path / "plugin.py")
+        tail = df.tail(meta.max_bars).copy(deep=True)
         full_res = compute(df, dict(meta.params))
         tail_res = compute(tail, dict(meta.params))
         for key, series in full_res.items():
             a = float(series.iloc[-1])
             b = float(tail_res[key].iloc[-1])
-            out[key] = 0.0 if (np.isnan(a) and np.isnan(b)) else abs(a - b)
-    assert set(out) == PCT_KEYS | PRICE_KEYS, sorted(set(out))
+            out[f"{meta.name}.{key}"] = (
+                0.0 if (np.isnan(a) and np.isnan(b)) else abs(a - b))
+    assert set(out) == DELTA_KEYS, sorted(set(out))
     return out
 
 
@@ -180,7 +232,7 @@ def test_head_dependence_within_tolerance_on_random_walks():
         for seed in range(8):
             deltas = _last_row_deltas(_spike_df(base=base, seed=seed))
             for key, delta in deltas.items():
-                tol = 1e-6 if key in PCT_KEYS else 1e-9 * base
+                tol = _tolerance(key, base)
                 assert delta < tol, (base, seed, key, delta, tol)
                 worst = max(worst, delta)
     assert worst < 1e-6, worst
@@ -193,7 +245,7 @@ def test_head_dependence_on_the_spike_fixture():
     base = 150.0
     deltas = _last_row_deltas(_spike_df(base=base, spike=base * 0.6, seed=1))
     for key, delta in deltas.items():
-        tol = 1e-6 if key in PCT_KEYS else 1e-9 * base
+        tol = _tolerance(key, base)
         assert delta < tol, (key, delta, tol)
 
 
@@ -210,9 +262,10 @@ def test_head_dependence_on_the_degenerate_fixture():
     deltas = _last_row_deltas(_degenerate_df())
     for key, delta in deltas.items():
         assert delta < 1e-4, (key, delta)
-    for key in ("rsi", "plus_di", "minus_di", "k", "d"):
+    for key in ("rsi.rsi", "adx.plus_di", "adx.minus_di",
+                "stochastic.k", "stochastic.d"):
         assert deltas[key] == 0.0, (key, deltas[key])
-    assert 0.0 < deltas["adx"] < 1e-4, deltas["adx"]
+    assert 0.0 < deltas["adx.adx"] < 1e-4, deltas["adx.adx"]
 
 
 # --- I6 / I8: bless の tmp 環境 ---------------------------------------------
