@@ -66,7 +66,7 @@ def _reject_unknown_params(params: dict) -> None:
     経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
 
     `params` 自体が dict でない場合、および未知キーの型が混ざっている場合も
-    `TypeError` を漏らさない (3 周目 codex Important)。前者は `params.` 自体
+    `TypeError` を漏らさない。前者は `params.` 自体
     を対象とした文言で `ValueError` にする。後者は `str` でないキーをそれ
     自体不正として扱い (loader は str キーしか通さない契約)、str キーを
     先に・非 str キーを後に置く決定的な順序で 1 つ選ぶ — 素の `sorted` は

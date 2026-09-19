@@ -254,7 +254,7 @@ def test_unknown_params_raise_value_error(params):
 @pytest.mark.parametrize("params", [None, [], "period", 14])
 def test_non_mapping_params_raise_value_error_not_type_error(params):
     """**`params` 自体が dict でない場合も `TypeError` を漏らさず
-    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    `ValueError` にする**。`_reject_unknown_params`
     は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
     なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
     """
@@ -264,8 +264,8 @@ def test_non_mapping_params_raise_value_error_not_type_error(params):
 
 @pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
 def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
-    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
-    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**。
+    `{0: 1, "typo": 1}` は素の `sorted(set(...))`
     だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
     それ自体が不正 (loader は str キーしか通さない契約) として扱う。
     """
@@ -357,7 +357,7 @@ def _symmetric_expansion_df(n: int = 60, price: float = 150.0,
 
     **`atr` は 0.94 まで育つので ε 規則 (`atr <= EPS*|close|` = 1.5e-07) は
     発火しない** — この pin は退化規則の言い換えではなく、同着規則そのものを
-    見ている (恒真ではないことを段 0 で実測)。
+    見ている (恒真ではないことを実測済み)。
     """
     high = np.array([price + step * (i + 1) for i in range(n)])
     low = np.array([price - step * (i + 1) for i in range(n)])
@@ -372,7 +372,7 @@ def test_equal_up_and_down_move_yields_no_directional_movement():
     """`up_move == down_move` の同着では +DM / -DM とも 0 (Wilder の規則)。
 
     比較を `>` から `>=` に緩めると**同着ぶんが片側へ丸ごと入る**:
-    段 0 の実測で `plus_dm` 側を `>=` にすると `plus_di` が 0.0 -> 1.0598、
+    実測で `plus_dm` 側を `>=` にすると `plus_di` が 0.0 -> 1.0598、
     `adx` が 0.0 -> **100.0** (「方向性なし」が「最強のトレンド」に化ける)。
     `minus_dm` 側を `>=` にすると対称に `minus_di` が 1.0598 / `adx` 100.0。
     ランダムウォークの fixture では同着が測度 0 でしか起きないため、

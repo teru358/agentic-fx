@@ -232,7 +232,7 @@ def test_unknown_params_raise_value_error(params):
 @pytest.mark.parametrize("params", [None, [], "period", 14])
 def test_non_mapping_params_raise_value_error_not_type_error(params):
     """**`params` 自体が dict でない場合も `TypeError` を漏らさず
-    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    `ValueError` にする**。`_reject_unknown_params`
     は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
     なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
     """
@@ -242,8 +242,8 @@ def test_non_mapping_params_raise_value_error_not_type_error(params):
 
 @pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
 def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
-    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
-    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**。
+    `{0: 1, "typo": 1}` は素の `sorted(set(...))`
     だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
     それ自体が不正 (loader は str キーしか通さない契約) として扱う。
     """
@@ -363,9 +363,9 @@ def test_epsilon_threshold_uses_this_rows_close_not_the_previous_one():
 
     `EPS * close.abs()` を `EPS * close.shift(1).abs()` に変えると、この行の
     `avg_loss` (4.0e-06) が閾値 1.5e-07 を上回って判定順 (2) に入らなくなり、
-    式どおりの `99.99999996261333` が返る。段 0 の変異スイープで、既存の
+    式どおりの `99.99999996261333` が返る。変異スイープの実測で、既存の
     fixture (ランダムウォーク / 完全横ばい / 減衰横ばい) では**全行が
-    ビット一致**して生き残ることを実測したため、この観測点を足した。
+    ビット一致**して生き残ることを確認したため、この観測点を足した。
     """
     rsi = compute(_epsilon_basis_df(), {})["rsi"]
     assert float(rsi.iloc[JUMP_ROW]) == 100.0
