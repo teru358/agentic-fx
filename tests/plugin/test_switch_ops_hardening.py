@@ -239,6 +239,44 @@ def test_ac9a_reconcile_revert_holds_the_plugin_lock(tmp_path, monkeypatch):
 
 
 @pytest.mark.slow
+def test_ac9a_revert_runs_while_the_lock_is_still_held(tmp_path, monkeypatch):
+    """段 0 pin (S0-87): `test_ac9a_...` の spy は lock の**取得**しか見て
+    いないので、「lock を取って即解放し、巻き戻しは lock の外でやる」変異が
+    生存した (実測 SURVIVED)。`_revert_one` が呼ばれた**その瞬間**に lock を
+    保持しているかを直接観測する ([[mutation-testing]] 6.5 — 落ちたテストが
+    狙った防御のテストか)。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    import contextlib as _ctx
+    real_lock = plugin_switch._plugin_lock
+    real_revert = plugin_switch._revert_one
+    depth = {"n": 0}
+    held_during = []
+
+    @_ctx.contextmanager
+    def _spy_lock(rt, name):
+        with real_lock(rt, name):
+            depth["n"] += 1
+            try:
+                yield
+            finally:
+                depth["n"] -= 1
+
+    def _spy_revert(conn_, r, **kw):
+        held_during.append(depth["n"])
+        return real_revert(conn_, r, **kw)
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy_lock)
+    monkeypatch.setattr(plugin_switch, "_revert_one", _spy_revert)
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=NOW, settings=SETTINGS)
+
+    assert held_during == [1], \
+        f"巻き戻しが lock の外で走っている (保持深さ={held_during})"
+    assert _rows(conn) == [(row["op_id"], "reverted")]
+
+
+@pytest.mark.slow
 def test_ac9b_i_stale_row_both_changed(tmp_path, monkeypatch):
     """AC-9b-i: lock 待ちの間に競合者が畳んで配備まで完了した場合、
     reconcile は **何もしない** (live は new のまま、approval は approved)。"""
