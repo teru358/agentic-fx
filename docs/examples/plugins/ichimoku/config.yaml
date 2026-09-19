@@ -1,0 +1,7 @@
+kind: indicator
+outputs: [tenkan, kijun, senkou_a, senkou_b, chikou]
+max_bars: 400
+params:
+  tenkan_period: 9
+  kijun_period: 26
+  senkou_b_period: 52
