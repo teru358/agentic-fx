@@ -5551,7 +5551,7 @@ def _nine_metas(root: Path) -> tuple:
     return ordered
 
 
-def _load_compute(name: str, plugin_py: Path):
+def _load_module(name: str, plugin_py: Path):
     """`plugin.py` を **1 本ずつ別のモジュール名で** ロードする。
 
     9 本とも `plugin` という名前で `sys.modules` に入れると衝突し、
@@ -5564,7 +5564,20 @@ def _load_compute(name: str, plugin_py: Path):
         spec.loader.exec_module(mod)
     finally:
         sys.modules.pop(spec.name, None)
-    return mod.compute
+    return mod
+
+
+def _load_compute(name: str, plugin_py: Path):
+    """`_load_module` の `compute` だけを返す薄い包み。"""
+    return _load_module(name, plugin_py).compute
+
+
+def _typed(mapping) -> dict:
+    """`{キー: (型名, 値)}`。**型のドリフトを潰さない**ための包み —
+    `2 == 2.0` なので素の dict 比較では `bollinger` の `num_std` が
+    `2.0` から `2` に落ちても気付けない (指揮者の実測: 変異 J は
+    出力比較だけの版では緑のまま通った)。"""
+    return {k: (type(v).__name__, v) for k, v in mapping.items()}
 
 
 @pytest.fixture(scope="session")
@@ -5668,11 +5681,28 @@ def test_declared_params_match_each_plugins_own_defaults(examples_copy):
     まま、配備された指標だけ別物」になる。
 
     値の表を手で持たずに**振る舞いで**比べる (どちらの向きのずれも捕まる)。
+
+    **振る舞い比較だけでは足りない (r2 codex C2)**。出力に効かない差異
+    (plugin が読まないキーが `config.yaml` に混じる / `2.0` が `2` に
+    型落ちする) は両方の出力が同じなので緑のまま通る。そこで 2 段にした:
+
+    1. **plugin 側が未知の params キーを拒否する**ようになったので
+       (`_reject_unknown_params`)、`config.yaml` に余計なキーがあれば
+       この下の `compute(df, dict(meta.params))` が `ValueError` で落ちる
+       — 受入テスト側に「キー集合 ⊆ 既知キー」を書く必要がない
+       (config に `unused: 1` を足す変異 K で実測)。
+    2. **`_DEFAULTS` との辞書同値比較**を型込みで行う。値の表は
+       `plugin.py` の `_DEFAULTS` に 1 箇所だけ置き、**受入テスト側に
+       重複させない**。
     """
     df = _df(300)
     for meta in _nine_metas(examples_copy):
-        compute = _load_compute(meta.name,
-                                examples_copy / meta.name / "plugin.py")
+        mod = _load_module(meta.name,
+                           examples_copy / meta.name / "plugin.py")
+        assert set(mod._DEFAULTS) == set(mod._KNOWN_PARAMS), meta.name
+        assert _typed(meta.params) == _typed(mod._DEFAULTS), (
+            meta.name, _typed(meta.params), _typed(mod._DEFAULTS))
+        compute = mod.compute
         declared = compute(df, dict(meta.params))
         builtin = compute(df, {})
         for key in meta.outputs:
