@@ -200,6 +200,40 @@ class _SelectionOutcome:  # 新規命名
     # 後から絞り込む必要がなくなった)。
 
 
+def _cell(value: object) -> str:
+    r"""[indicator-consumption-wiring] 段 0 r2 裁定 8 (2026-09-19):
+    improve mission prompt の markdown テーブルに差し込む 1 セルを
+    無害化する。**行・列の偽造を sink 側で構造的に潰す。**
+
+    背景 (段 0 r2 の裁定 7 で発見): observation artifact の `reason` は
+    agent が自由に書くテキストで、`_finalize_observation` が
+    `observation:{safe_text(...)}` にして `improvement_backlog.last_result`
+    へ保存する。`_safe_error.safe_text` は URL / 秘密パラメータしか
+    潰さず**空白を正規化しない**ので、改行を含む `reason` はそのまま
+    `_history_table` の 1 行へ差し込まれ、**1 行が 2 行になって
+    改善履歴テーブルへ任意の行を偽造できた** (probe 実測)。`|` を
+    入れれば同じ行の列を増やせた (6 列 → 8 列、probe 実測)。
+
+    `ActivityLog.write` が `" ".join(summary.split())` で同型の偽造を
+    構造的に潰しているのに prompt 側に対応する正規化が無い、という
+    非対称だったので、同じ語彙で揃える:
+
+    1. `" ".join(str(value).split())` — 改行・タブ・連続空白を 1 個の
+       空白へ (`activity.py:53` / `cli_runner.py:211` /
+       `local_runner.py:54` と同じ形)。
+    2. `|` → `\|` (markdown のセル内エスケープ)。**文字は消さず**
+       読み手には残したまま、列の区切りとしては効かなくする。
+
+    **保存側 (DB の `last_result` / `idea` の値) は変えない**
+    (指揮者裁定 8) — 人間向け `backlog` 表示など他の読み手の挙動を
+    変えないため。無害化は描画するこの 1 箇所に閉じる。
+
+    全セルに適用する (id・attempts のような数値列は影響を受けないが、
+    将来列が増えたときに「自由文の列だけ通し忘れる」形を作らない)。
+    """
+    return " ".join(str(value).split()).replace("|", "\\|")
+
+
 def _empty_inventory_result(plugins_root: Path):
     """[indicator-consumption-wiring] T4b: `inventory` が渡されない直接
     テスト呼び出し (conn を持たない経路) 用のフォールバック — 空
@@ -689,9 +723,10 @@ class ImproveLoop:
             header = ("| id | backlog | idea | result | attempts | "
                       "last_result |\n|---|---|---|---|---|---|\n")
             return header + "\n".join(
-                f"| {r.get('id')} | {r.get('backlog_id')} | {r.get('idea')} | "
-                f"{r.get('result')} | {r.get('attempts')} | "
-                f"{r.get('last_result')} |" for r in rows)
+                f"| {_cell(r.get('id'))} | {_cell(r.get('backlog_id'))} | "
+                f"{_cell(r.get('idea'))} | {_cell(r.get('result'))} | "
+                f"{_cell(r.get('attempts'))} | "
+                f"{_cell(r.get('last_result'))} |" for r in rows)
 
         def _backlog_table(items: list[dict]) -> str:
             # [unprofitable-note-hygiene] 設計書 v2.0 §2-3: `origin` 列。
@@ -705,8 +740,9 @@ class ImproveLoop:
             header = ("| id | idea | status | attempts | assigned | "
                       "origin |\n|---|---|---|---|---|---|\n")
             return header + "\n".join(
-                f"| {i.get('id')} | {i.get('idea')} | {i.get('status')} | "
-                f"{i.get('attempts')} | {i.get('assigned', '')} | "
+                f"| {_cell(i.get('id'))} | {_cell(i.get('idea'))} | "
+                f"{_cell(i.get('status'))} | {_cell(i.get('attempts'))} | "
+                f"{_cell(i.get('assigned', ''))} | "
                 f"{'unprofitable' if i.get('origin_outcome') == 'unprofitable' else ''} |"
                 for i in items)
 
