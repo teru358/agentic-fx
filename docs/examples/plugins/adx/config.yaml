@@ -1,0 +1,5 @@
+kind: indicator
+outputs: [adx, plus_di, minus_di]
+max_bars: 400
+params:
+  period: 14
