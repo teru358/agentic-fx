@@ -1,4 +1,4 @@
-# [indicator-initial-set] 実装プラン v1.0 (設計書 = `docs/superpowers/specs/2026-09-19-indicator-initial-set-design.md` v1.3a 準拠)
+# [indicator-initial-set] 実装プラン v1.1 (設計書 = `docs/superpowers/specs/2026-09-19-indicator-initial-set-design.md` v1.3b 準拠)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (推奨) または superpowers:executing-plans で task ごとに実行すること。Step は
@@ -4442,17 +4442,19 @@ EOF
 `tests/plugin/test_indicator_initial_set.py` (新規) /
 `docs/operations/indicator-initial-set-deploy-2026-09-19.md` (新規)。
 
-> **注意 (着手前検証の範囲)**: T1〜T9 の逐語コードは指揮者が scratchpad で実際に動かして
-> green を確認済みだが、**T10 の I6 / I7 / I8 は tmp 環境での bless 実測を伴うため、
-> 本プランでは「何を観測するか」の仕様と既存 fixture への参照までしか書いていない**
-> (「着手前検証の記録」節に明記)。実装者はここで**プラン記述の欠陥を最も踏みやすい** —
-> 既存 fixture のシグネチャが違う等があれば**黙って回避せず申告**すること
-> ([[plan-code-defects-not-implementer-defects]])。
+> **着手前検証済み (v1.1、2026-09-19)**: v1.0 の T10 は「何を観測するか」の仕様までしか
+> 書いておらず、**I6 / I7 / I8 の tmp 環境実測をしていなかった**。着手前検証で
+> **Critical 4 / Important 8 / Minor 5** を検出し、全件を本節へ反映した
+> (記録: `tmp/plan-indicator-initial-set/prevalidation-T10.md`)。
+> **Step 10-i の完成ファイル (10 テスト) は指揮者が実際に走らせて 10 passed / 41.7 秒を
+> 確認したもの**。それでも**プロジェクトの制約に反する記述を見つけたら、プランどおりの
+> 実装でも欠陥として申告**すること ([[plan-code-defects-not-implementer-defects]])。
 
 ### Step 10-a: I1 — `discover` の包含集合を広げる
 
 - [ ] `rg -n 'test_discover_sample_plugins_directory_not_rejected' tests/plugin/test_loader.py`
-      で現在の行番号を取得する (**本プランの行番号参照はドリフトしている前提で扱う**)
+      で現在の行番号を取得する (**本プランの行番号参照はドリフトしている前提で扱う**。
+      着手前検証時点では `tests/plugin/test_loader.py:763-770`、広げる assert は **L770**)
 - [ ] その関数の `assert {"rsi_indicator", "sma_cross"} <= names` を次の形に広げる:
 
 ```python
@@ -4467,24 +4469,420 @@ EOF
 
 ### Step 10-b: I2 — validator を直接通す
 
-- [ ] `tests/plugin/test_indicator_initial_set.py` を新規作成し、
-      `docs/examples/plugins` を `discover` して kind=indicator の 9 本を取り出し、
-      各 `plugin.py` を `importlib` でロードして `compute(df, dict(meta.params))` の戻り値を
-      `agentic_fx.core.plugin_contract.validate_indicator_result(out, df_index=df.index,
+`tests/plugin/test_indicator_initial_set.py` を新規作成する (**逐語は Step 10-i**)。
+該当テストは `test_all_nine_pass_the_indicator_validator`。
+
+- [ ] `docs/examples/plugins` を `discover` して **名前で** 9 本を取り出し
+      (`_nine_metas()`)、各 `plugin.py` を `importlib` でロードして
+      `compute(df, dict(meta.params))` の戻り値を
+      `core.plugin_contract.validate_indicator_result(out, df_index=df.index,
       outputs=meta.outputs)` に通す (例外が出ないこと)
 - [ ] **既存の `rsi_indicator` は `outputs` を宣言しているので混ざってよい**が、
       対象は「本束で足した 9 名」に限定して名前で選ぶこと (将来 example が増えても壊れない)
+- [ ] **(着手前検証 C3 付随) `importlib` のモジュール名を 1 本ずつ変える**
+      (`_iis_<名前>`)。9 本とも `plugin` という名前で `sys.modules` に入れると衝突し、
+      **最後の 1 本の実装を 9 回検査するだけの恒真テスト**になる。I5 の
+      `_last_row_deltas` も同じヘルパ (`_load_compute`) を通す
+- [ ] **(着手前検証 M5) `docs/examples/plugins/` 配下で pytest を回さないこと。**
+      `.gitignore` に入っているのは `__pycache__/` だけで **`.pytest_cache` は ignore されて
+      いない** (`git check-ignore` で確認済み) ため、`tests/conftest.py:219-` の
+      `_guard_repo_root_has_no_new_untracked_files` に当たる。`importlib` は
+      `__pycache__` しか作らないので本テストは安全
 - [ ] 逆変異: どれか 1 本の `compute` の戻り値から 1 キー落とすと red になること
 
 ### Step 10-c: I5 — 先頭依存の回帰 (**指揮者が実測済みのコードを転写する**)
 
-fixture の生成式・値域・seed は設計書 §6 I5 の逐語仕様。**この Step のコードは指揮者が
-scratchpad で実行して下表の数値を得たもの** (「着手前検証の記録」§3)。
+fixture の生成式・値域・seed は設計書 §6 I5 の逐語仕様。**逐語コードは Step 10-i**
+(`_spike_df` / `_degenerate_df` / `_last_row_deltas` と 3 本のテスト)。
+
+- [ ] **ランダムウォーク 4 値域 (0.5 / 1.5 / 150 / 300) × seed 0〜7**: 末尾 400 本で
+      計算した最終行と全 5000 本の最終行の差が、**0〜100 スケールの出力
+      (`rsi` `k` `d` `adx` `plus_di` `minus_di`) は `abs < 1e-6`**、
+      **価格スケールの出力は `abs < 1e-9 * 基準価格`**。
+      指揮者の実測: **全キーの最大誤差 3.104e-10 / 違反 0** (0.45 秒)
+- [ ] **スパイク fixture** (401 本目に基準価格の 60% = +90): 実測値は
+      `ema` 0.0 / `macd` 2.56e-13 / `signal` 4.11e-13 / `hist` 1.55e-13 /
+      `atr` 1.79e-12 / `rsi` 1.42e-10 / `adx` 3.40e-09 / `plus_di` 1.19e-10 /
+      `minus_di` 2.73e-11 — 上界式 (設計書 §3.2 (i)) の内側。公差はランダムウォークと同じ
+- [ ] **退化 fixture — 公差はランダムウォークの表ではなく設計書 §3.2 (i-b) の `1e-4` を
+      全キーに適用する (着手前検証 C3)。** この fixture は `bollinger` の `upper` / `lower` に
+      **1.08e-06** を出し、価格スケールの `1e-9 * 150` (= 1.5e-7) を**超える**。
+      同じ公差表を退化 fixture にも当てると `bollinger` で必ず red になる。
+      `1e-4` は全キーを覆う (最大は `adx` の **4.31e-06**)。
+      指揮者の実測 (退化 fixture 601 行、全 19 キー):
+
+```
+value 1.7053e-13 / rsi 0 / macd 5.68434e-14 / signal 5.66504e-14 / hist 1.93055e-16 /
+upper 1.08339e-06 / middle 0 / lower 1.08339e-06 / atr 6.03966e-14 / adx 4.31427e-06 /
+plus_di 0 / minus_di 0 / k 0 / d 0 / tenkan 0 / kijun 0 / senkou_a 0 / senkou_b 0 / chikou 0
+```
+
+- [ ] そのうえで **`rsi` / `plus_di` / `minus_di` / `k` / `d` は `abs == 0.0` を個別に pin**
+      する (ここが `EPS` 規則の唯一の観測点)。`adx` だけ `0.0 < abs < 1e-4`
+- [ ] 逆変異: `rsi` / `adx` の `EPS` を 0 にすると**退化 fixture のテストだけ**が red に
+      なることを実測する (ランダムウォーク / スパイクは緑のまま = 退化 fixture が唯一の観測点)
+
+### Step 10-d: I6 — 9 本を順に bless する (tmp 環境)
+
+該当テストは `test_nine_indicators_bless_in_sequence` (**逐語は Step 10-i**)。
+
+- [ ] `tests/fixtures/wiring_envs.py:46-52` の `switch_env` と同じ流儀で `tmp_path/plugins` と
+      tmp sqlite を用意する (`_bless_env`)。**実 `data/agentic.db` と実 `plugins/` に
+      触れないこと** (Global Constraints)
+- [ ] **(着手前検証 I-6) `.locks` は作らなくてよい** — `switch._plugin_lock`
+      (`switch.py:806-807`) が `mkdir(parents=True, exist_ok=True)` する。
+      `tests/plugin/test_switch_paths.py:46-47` の `env` は明示的に作っているが、
+      どちらでも成立する (実測で `.locks/*.lock` が 9 本自動生成された)
+- [ ] `docs/examples/plugins/<名前>` を `tmp_path/plugins/_human/<名前>` へ **`shutil.copytree`**
+      でコピーする。**`__pycache__` / `.pytest_cache` を除外しない** — runbook の `cp -r` が
+      巻き込んでも `check_candidate_snapshot` が無視する (**着手前検証 M2**: 実物は
+      `gate_pytest.py:43` の `_IGNORED_DIR_NAMES` と `:46-55` の `_is_ignored_entry`。
+      v1.0 の `gate_pytest.py:61-64` は誤り)。実測で両方入りのコピーが 9/9 通った
+- [ ] 9 本を **1 本ずつ順に** `switch.bless_candidate(conn, name=..., human_dir=...,
+      settings=..., now=..., decided_by=...)` に通し、**9 回とも `int` (approval_id) が
+      返る**ことを assert する (シグネチャは `switch.py:1772-1777` と一致、実測 9/9)
+- [ ] **pytest ゲートを double にしない。** ここはゲートを実物で回すことが受入そのもの。
+      **`wiring_envs.install_gate_double` は strategy gate (実 backtest) 用で
+      kind=indicator の bless には無関係**なので使わない。
+      指揮者の実測: **9 本合計 11.7 秒** (1 本 1.22〜1.42 秒、`plugin.pytest_timeout_sec: 300`
+      に対して桁で余裕)。Landlock 下でも `import pandas` と自己テストは落ちない
+      (`gate_pytest` が `_SINGLE_THREAD_ENV` を子 env に入れるため —
+      [[pytest-under-landlock-pitfalls]] の RLIMIT_AS × OpenBLAS は踏まない)
+- [ ] **(着手前検証 I-1) `@pytest.mark.slow` を付ける。** `pyproject.toml:44` の
+      `addopts = "-m 'not bench and not realbackend'"` は **slow を除外しない**ので、
+      Step 10-h のフルスイートには残る (`pyproject.toml:42` の marker 定義が
+      「既定で回る」と明記)。既存 `tests/plugin/test_indicator_wiring_e2e.py:21` も同じ形
+- [ ] 同時に観測する: (i) `noop_gate.find_noop_copy` がこの経路に**無い**こと
+      (`switch._run_full_gate` のゲート列に現れない — 設計書 §5.4/§5.5) — したがって
+      「example の丸写し」で弾かれない (ii) `outputs_required` (`switch.py:970`) に掛からない
+      (iii) `max_bars_limit` に掛からない (400 <= 1000)
+- [ ] 9 本 bless 後に `tools.plugin_loader.approved_plugins(conn, tmp_path/"plugins",
+      settings=...)` を呼び、**戻り値 `result` の `result.inventory.metas`** に 9 名が
+      `outputs` 付き・`max_bars == 400` で並ぶことを assert する。
+      **(着手前検証 I-2) `approved_plugins` は `InventoryBuildResult` を返す**
+      (`tools/plugin_loader.py:41-59`) — それ自身に `.metas` は無い
+- [ ] 逆変異: 1 本の `config.yaml` から `outputs:` 行を削ると、**その 1 本だけ**が
+      `ValueError("outputs_required")` になり他の 8 本は配備されること (= 束ではない、
+      設計書 §6.3)。指揮者の実測 (`atr` を削った場合):
+
+```
+blessed: ['sma', 'ema', 'rsi', 'macd', 'bollinger', 'adx', 'stochastic', 'ichimoku']
+failed : [('atr', 'ValueError', 'outputs_required')]
+inventory: ['adx', 'bollinger', 'ema', 'ichimoku', 'macd', 'rsi', 'sma', 'stochastic']
+```
+
+### Step 10-e: I7 — 新 `rsi` を宣言した strategy の E2E
+
+該当テストは `test_strategy_declaring_new_rsi_runs_end_to_end` と
+`test_strategy_with_max_bars_200_runs_but_is_outside_the_i5_guarantee`
+(**逐語は Step 10-i**)。どちらも `@pytest.mark.slow`、実測 1.5 秒ずつ。
+
+- [ ] tmp 環境に `rsi` を bless で配備したうえで、`rsi_pullback` 型の strategy を**別名**で作る
+      (`config.yaml` に `indicators: {rsi: {plugin: rsi, params: {period: 14}}}`、
+      **`max_bars: 400`**、`exit_mode: levels`、`timeframe` / `pairs` あり)
+- [ ] **(着手前検証 C2) pin の書き込みは `agentic_fx.plugin.resolve.lock_config(candidate_dir,
+      {alias: content_hash})` で行う** (`resolve.py:207-208`、戻り値
+      `(before_text, after_text, new_content_hash)`)。人間 CLI の `afx plugin lock` と
+      同じ関数で、YAML 書き換えの実装はここ 1 箇所に閉じている。
+      **v1.0 が書いていた `lock_staging_deps` は使えない** —
+      `tools/improve_staging_tools.py:116` の**内部クロージャ**で import できない。
+      **`afx plugin lock --from _human` の CLI 自体も tmp では使えない**
+      (init 済みリポジトリ root を要求する。実測 `rc=2`「初期化が完了していません」)
+- [ ] `resolve_indicator_deps(meta, inventory, settings=..., pin_mode="require")` が通ること。
+      **(着手前検証 I-3) 第 2 引数は `ApprovedInventory` (= `result.inventory`) で
+      `InventoryBuildResult` ではない** (`resolve.py:161-162`)。
+      未 pin だと `IndicatorResolutionError: indicator_unresolved:rsi:unpinned` (実測)
+- [ ] 実 worker サブプロセスで **`PluginSession(meta, settings=SETTINGS.plugin,
+      resolved=resolved)`** を起動し、`evaluate(df, indicators, None, params)` の
+      `indicators["rsi"]["rsi"]` が **df と同じ index の系列**として届くことを assert
+      (**モックで worker を潰さない** — [[test-fixtures-from-real-transcripts]])。
+      **(着手前検証 C1) v1.0 の `PluginSession(kind="strategy", resolved=...)` は
+      非実在シグネチャ**: 実物は `PluginSession(meta, *, settings: PluginSettings,
+      resolved=None)` (`sandbox.py:330-331`) で **`kind=` は無く**、`settings` は
+      `Settings` 全体ではなく **`Settings.plugin`**。既存の現物呼び出しは
+      `tests/plugin/test_sandbox.py:944` ほか 6 箇所
+- [ ] **`max_bars: 200` の保証外ケース**を別テストで: 同じ strategy を `max_bars: 200` で
+      作ると**動く** (例外にならない) が、**I5 の保証範囲の外**であることを docstring に書く。
+      値の一致は要求しない。**(着手前検証 I-4) 実物は
+      `sub_df = df.tail(dep["max_bars"]).copy(deep=True)` (`worker.py:318`)** —
+      indicator 自身の `max_bars` (= 400) で tail するが、strategy の `max_bars` が 200 なら
+      df 自体が 200 本しかないので 200 本で計算される (`min(200, 400)` という式は実在しない)。
+      その後 `worker.py:321-325` が `reindex(df.index)` を掛けるので、届く系列の長さは
+      **strategy に渡した df と同じ**。指揮者の実測: 最終 `rsi` が
+      `65.797529` (400 本) と `65.797530` (200 本) で食い違う
+
+### Step 10-f: runbook を書く
+
+`docs/operations/indicator-initial-set-deploy-2026-09-19.md` を新規作成する。
+
+- [ ] **冒頭に**: 「**暫定**。[first-run-setup] (初回起動の対話ウィザード) が一括配備に
+      置き換える。**恒久なのは『採用には人間の明示的確認が要る、LLM の自動配備経路は
+      作らない』という規律のほう**」
+- [ ] 手順 (0)〜(6) を逐語で:
+  - **(0) 既存の配備名との衝突確認** — `ls -l plugins/` で `sma` / `ema` / `rsi` / `macd` /
+    `bollinger` / `atr` / `adx` / `stochastic` / `ichimoku` が無いこと。既にあれば
+    bless は**既存名の新版への切り替え**になり、その名前を pin している strategy が
+    pin 破れで inventory から外れる (設計書 §8 D3)
+  - **(1) コピー** — `cp -r docs/examples/plugins/<名前> plugins/_human/<名前>`
+  - **(2) bless** — `afx plugin bless <名前> --from _human`
+  - **(3) 結果の確認** — rc=0 なら stdout に `approval id=<N>`
+    (`src/agentic_fx/backtest/cli.py:592`)。**rc=1 / traceback なら
+    そこで停止**し、失敗が (A) ゲート前か (B) ゲート後かを判定して下の収束手順へ。
+    **既に配備済の分は巻き戻さない** (設計書 §6.3)
+  - **(4) 後片付け** — `rm -rf plugins/_human/<名前>` (bless は消さない。残すと後日の
+    `afx plugin materialize <名前>` が `FileExistsError` になる)
+  - **(5) 9 本ぶん繰り返す**
+  - **(6) 最終確認** — service を再起動し、起動ログに 9 本が載ること
+- [ ] **失敗の 2 系統 (設計書 §6.3) を逐語で転記する**:
+  - **(A) ゲート前・ゲート中** (`check_source` / pytest / `max_bars` / `outputs_required`) —
+    何も残らない。候補を直して同じ名前でやり直すだけ。
+    **指揮者の実測** (5 本目の `test_plugin.py` をわざと落とした場合):
+    `ValueError: plugin 'bollinger': test_plugin.py failed pytest gate (returncode=1)`、
+    先行 4 本は配備済のまま、`.versions/bollinger` なし、未終端 journal なし、pending 0
+  - **(B) ゲート後** (version 作成・history・symlink 切替) — journal / pending approval /
+    `.versions/` が残り、**次の同名 bless は `UnresolvedJournalError` になる**。
+    **この例外は `Exception` を直接継承していて (`switch.py:1572`) `ValueError` ではない**ため、
+    CLI の `except (ValueError, SandboxError)` (`backtest/cli.py:590`) をすり抜け
+    **Python traceback が出る** — 意味は「未終端 journal の検出」。
+    **収束手順 5 ステップを設計書 §6.3 (B) から逐語で転記**
+    (approval id は traceback のメッセージ `op_id=... approval_id=...` から読む /
+    `afx> approval retry <id>` が `preparing` を終端させる唯一の手段 /
+    **サービス再起動だけでは `preparing` は終端しない**)
+  - **(着手前検証 C4) `approval retry <id>` の効き方は失敗した phase で変わる。**
+    設計書 §6.3 (B) の手順 5 (「もう一度 bless して `UnresolvedJournalError` が出ない
+    ことを確認する。そのまま成功すれば配備完了」) は**どちらでも正しく働く**ので、
+    **手順 5 を必ず実行する形のまま**にする。指揮者の実測 (2026-09-19):
+
+    | 失敗した phase | 症状 | `approval retry` 後 | 手順 5 の再 bless |
+    |---|---|---|---|
+    | `preparing` (版作成で失敗) | `.versions/` は増えていない | journal 終端 + **配備完了** | 確認になる (同内容なので切替は no-op) |
+    | `versioned` / `recorded` (版はできた / history・切替直前) | **`.versions/<名前>/<hash>` が増えている** | journal 終端 + **配備完了** | 同上 |
+    | `switched` (切替で失敗し live が新 target を指していない) | live が無い / 旧 target のまま | journal 終端・approval `approved` だが **配備されない** | **必須** |
+
+    **`switched` の行は `src/` 側の観測事項**: `approve_candidate` の 0d は
+    `phase == "switched"` を `_reverify_switched_journal` → `_finalize_decision` で
+    閉じるだけで **`switch_live` を呼ばない** (`switch.py:1440-1454`) ため、
+    「approval は approved なのに何も配備されていない」状態になり得る。
+    **`[retry-switched-approves-without-deploy]` として指揮者へ申告済み** (本束では
+    `src/` を直さない)。起動時 reconcile なら live target を見て巻き戻す
+    (`test_switch_journal.py::test_switched_recovery_absent_old_kind_with_no_live_reverts`)
+  - **`preparing` / `versioned` / `recorded` は再起動では終端しない**
+    (`switch.py:180-183` が skip する) — ここが「`approval retry` が唯一の手段」の
+    意味。**`switched` は再起動の reconcile が扱う**ので、この 2 文を混ぜないこと
+- [ ] **strategy 作者向けの 1 行**: 「これらの indicator に依存する strategy は自分の
+      `max_bars` を **400 以上**に宣言すること」(設計書 §3.2)
+- [ ] **末尾に「任意の後片付け」節** (2026-09-19 ユーザー指示) — **実コードで確認した事実を
+      反映すること**:
+  - 新 `rsi` を配備したあと、**依存する strategy が無いことを確認したうえで**、配備済
+    `rsi_indicator` / `rsi_wilder` を退役させてよい。**人間の判断であり本束の完了条件では
+    ない。**
+  - **ただし現時点で「symlink 配備された plugin を退役させる CLI 経路は存在しない」**
+    (設計書 v1.3b §1 非スコープ、`[retire-symlink-deployed-plugin]` として起票)。
+    **`afx plugin retire <名前>` は引数 1 個 (名前のみ)** だが、**「legacy plain live」
+    — つまり `plugins/<名前>` が普通のディレクトリの場合にしか使えない**。bless で配備した
+    ものは `.versions/` への symlink なので、`retire` は
+    `ValueError("plugins/<名前> is not a plain directory (retire only applies to legacy
+    plain live)")` で**拒否する** (`switch.py:1627-1629`)。未終端 journal があるときも
+    `UnresolvedJournalError` で拒否する (`switch.py:1621-1625`)。
+    **したがって `rsi_indicator` / `rsi_wilder` が bless / approve で配備されている場合、
+    退役はできない — 新 `rsi` と併存させる**
+  - **`retire` は依存 strategy を一切検査しない** (`switch.py:1605-1638` の `retire_plugin`
+    全体に該当コードが無い — 着手前検証 I-8 で行番号を実物に合わせた)。
+    退役させた indicator を pin している strategy は、次の `approved_plugins()` の第 2 相で
+    `not_found` になり**黙って inventory から外れる** (pin 破れ)。**人間が事前に確認すること** —
+    確認手段は対話シェルの `afx> approval <id>` の詳細に出る
+    `dependent_pinned_here` / `dependent_pinned_elsewhere` の 2 欄 (`commands.py:394-400`)
+  - **example 側の `docs/examples/plugins/rsi_indicator` は残す** — example 戦略
+    `rsi_pullback` が依存しており、改善ループの `_examples` スナップショットと
+    `tests/plugin/test_loader.py` / `tests/loops/test_improve_e2e.py` が参照している (R7)
+
+### Step 10-g: I8 — runbook の逐語再現
+
+該当テストは `test_runbook_normal_sequence_deploys_all_nine` /
+`test_runbook_gate_failure_keeps_earlier_deployments_and_resumes` /
+`test_runbook_post_gate_failure_converges_via_approval_retry` (**逐語は Step 10-i**)。
+3 本とも `@pytest.mark.slow`、実測 11.5 / 12.0 / 2.7 秒。
+
+- [ ] **(a) 正常系**: tmp 環境で runbook の手順 (1) コピー → (2) bless → (4) 後片付け →
+      (5) 繰り返し、をそのまま実行し、9 本が配備され inventory に 9 本が現れること。
+      コピーが `__pycache__` / `.pytest_cache` を巻き込んでも通ること (実測済み)
+- [ ] **(b) ゲート前・ゲート中失敗からの再開 (§6.3 (A))**: 5 本目 (`bollinger`) の `_human`
+      候補の `test_plugin.py` をわざと落ちるようにして bless を失敗させ、**4 本が配備済のまま
+      残る**こと → 候補を直して 5 本目から再開すると**最終的に 9 本揃う**こと
+- [ ] **(着手前検証 I-7) (b) の残骸 assert に「journal テーブルの行数が 0」を書かない。**
+      失敗時点で `plugin_switch_journal` には**先行 4 本の終端済 journal が 4 行**残っている
+      (指揮者の実測)。正しい観測点は 3 つ: `.versions/<失敗した名前>` が存在しない /
+      `journal_store.get_open_by_name(conn, <名前>) is None` /
+      `status='pending'` の approval が 0 件
+- [ ] **(c) ゲート後失敗の収束 (§6.3 (B))**:
+      **(着手前検証 C4) 故障注入は `switch.history_git.record_version` のモジュール属性
+      差し替えで行う**
+      (`monkeypatch.setattr(plugin_switch.history_git, "record_version", _fail_once)` —
+      既存 `tests/plugin/test_reconcile.py:268,471` と同じ形)。`_advance_to_decided` は
+      版作成 (`switch.py:1198`) → `phase="versioned"` (`:1205`) → history 記録 (`:1208`)
+      → `phase="recorded"` (`:1212`) → symlink 切替 (`:1219`) の順に進むので、ここで
+      落とすと **`.versions/<名前>/<hash>` は残り / journal は `versioned` / live symlink は
+      無い**という §6.3 (B) の症状 (「`.versions/` が増えている」) がそのまま再現する。
+      **`_advance_to_decided` 自体を差し替えるとこの位置は作れない** (v1.0 の記述)
+- [ ] 観測の順序 (実測どおり):
+      **`.versions/<名前>` + 未終端 journal (`phase == "versioned"`) + pending approval が
+      残る** → **次の同名 bless が `UnresolvedJournalError`** (`ValueError` では**ない**ので
+      CLI をすり抜ける。メッセージに `op_id=` と `approval_id=` が入る) →
+      **`cmds.dispatch(f"approval retry {id}")`** で **journal の終端と配備の完了が同時に
+      起きる** (手順を頭から冪等に流すため) → **手順 5 の再 bless** は
+      「`UnresolvedJournalError` が出ないことの確認」として成功する (approval 行が 1 本
+      増えるのは仕様)
+- [ ] **retry の効き方は失敗 phase で変わる (Step 10-f の表)。`switched` の場合だけ
+      retry では配備されず再 bless が必須**になる
+      (`approve_candidate` の 0d が `switch_live` を呼ばない — `switch.py:1440-1454`、
+      **`[retry-switched-approves-without-deploy]` として申告済み**)。
+      **本テストは `versioned` の経路を観測する** (§6.3 (B) の症状に一致するため)
+- [ ] **(着手前検証 I-5) 対話シェルの現物**: `agentic_fx.commands.Commands.dispatch(line)`
+      (`commands.py:62`)、`approval retry <id>` 分岐は `commands.py:139-153`。
+      `Commands` の組み方は `tests/fixtures/wiring_envs.py:193-222` の `shell_env(root)` が
+      既存ビルダ。**`plugins_root` と `settings` の両方が必須** — どちらかが `None` だと
+      `commands.py:143-144` が「未配線です」を返して**何もせず**、テストが黙って緑になる
+- [ ] **状態遷移そのものは既存テストが pin 済み** — `tests/plugin/test_switch_journal.py`
+      (`test_switched_recovery_*` / `test_interrupt_reverts_*`) と
+      `tests/plugin/test_reconcile.py` を**参照**し、**再実装しない** (設計書 §6.1)。
+      I8(c) が観測するのは「**runbook に書いた手順がそのまま通ること**」だけ。
+      なお両ファイルには **bless 経路の故障注入は無い** (journal 行を直接作って reconcile を
+      呼ぶ形) ので、注入点は上記の `switch_live` 差し替えを使うこと (着手前検証 C4)
+
+### Step 10-h: フルスイートと commit
+
+- [ ] `uv run pytest -q` をフルで回し、**既存テストの退行がゼロ**であること
+      (特に `tests/plugin/test_loader.py` / `tests/loops/test_improve_loop_source_snapshot.py`
+      / `tests/tools/test_improve_staging_tools.py` — `docs/examples/plugins` を列挙する側)
+- [ ] 本ファイルは 10 テストで **実測 41.7 秒** (うち 9 本 bless を回す 3 本が 11.5 / 12.0 /
+      11.5 秒)。`slow` は `addopts` で除外されないのでフルスイートに必ず含まれる
+- [ ] `git status` で `data/` と `plugins/` に変更が無いことを確認する
+- [ ] commit (`feat(indicator-initial-set): 受入テストと配備 runbook (T10)`)
+- [ ] **逸脱の申告**を全件
+
+### Step 10-i: `tests/plugin/test_indicator_initial_set.py` の逐語
+
+**指揮者が実際に走らせて 10 passed / 41.7 秒を確認した完成ファイル** (着手前検証 2026-09-19)。
+`EXAMPLES` を scratchpad に向けた版で実測したので、**repo に置いたら
+`EXAMPLES = _REPO / "docs" / "examples" / "plugins"` のままで走ること**を
+必ず自分で確認すること。
 
 ```python
-PRICE_KEYS = {"value", "upper", "middle", "lower", "atr", "macd", "signal",
-              "hist", "tenkan", "kijun", "senkou_a", "senkou_b", "chikou"}
+"""[indicator-initial-set] repo 側の受入テスト (I2 / I5 / I6 / I7 / I8)。
 
+**実 DB (`data/agentic.db`) と実 `plugins/` には一切触れない** — 全て
+`tmp_path` 配下に作る ([[tests-touching-real-repo-resources]])。
+I1 は `tests/plugin/test_loader.py::test_discover_sample_plugins_directory_not_rejected`
+が担保する (本ファイルには無い)。状態遷移そのものは
+`tests/plugin/test_switch_journal.py` / `test_reconcile.py` が pin 済みなので
+**再実装しない** — I8 が観測するのは「runbook に書いた手順がそのまま通ること」だけ
+(設計書 §6.1)。
+"""
+from __future__ import annotations
+
+import importlib.util
+import shutil
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import numpy as np
+import pandas as pd
+import pytest
+import yaml
+
+from agentic_fx.activity import ActivityLog
+from agentic_fx.commands import Commands
+from agentic_fx.core.contracts import FixedClock
+from agentic_fx.core.health_latch import HealthLatch
+from agentic_fx.core.paper_broker import PaperBroker
+from agentic_fx.core.plugin_contract import validate_indicator_result
+from agentic_fx.plugin import switch as plugin_switch
+from agentic_fx.plugin.loader import discover, discover_one_with_reason
+from agentic_fx.plugin.resolve import lock_config, resolve_indicator_deps
+from agentic_fx.plugin.sandbox import PluginSession
+from agentic_fx.store import db as db_store
+from agentic_fx.store import plugin_switch_journal as journal_store
+from agentic_fx.store.state import StateStore
+from agentic_fx.tools import plugin_loader
+from tests.fixtures.wiring_envs import SETTINGS_FIXTURE as SETTINGS
+
+_REPO = Path(__file__).resolve().parents[2]
+EXAMPLES = _REPO / "docs" / "examples" / "plugins"
+
+#: 本束で足した 9 名。**総数は pin しない** — 将来 example が増えても壊れない
+#: よう、常に名前で選ぶ (設計書 §6 I1 / r1 M1)。
+NINE = ("sma", "ema", "rsi", "macd", "bollinger", "atr", "adx",
+        "stochastic", "ichimoku")
+
+NOW = datetime(2026, 9, 19, 3, 0, tzinfo=timezone.utc)
+
+#: 0〜100 スケールの出力。残りは価格スケール (設計書 §6 I5)。
+PCT_KEYS = frozenset({"rsi", "k", "d", "adx", "plus_di", "minus_di"})
+PRICE_KEYS = frozenset({"value", "upper", "middle", "lower", "atr", "macd",
+                        "signal", "hist", "tenkan", "kijun", "senkou_a",
+                        "senkou_b", "chikou"})
+
+#: `__pycache__` / `.pytest_cache` は `check_candidate_snapshot` が無視する
+#: (`gate_pytest.py:43,46-55`) ので**除外しない** — runbook の
+#: `cp -r` がそのまま巻き込んでも通ることを I8(a) で観測する。
+
+
+def _nine_metas():
+    """`docs/examples/plugins` を discover して 9 名を名前で取り出す。"""
+    metas = {m.name: m for m in discover(EXAMPLES) if m.name in NINE}
+    assert sorted(metas) == sorted(NINE), sorted(metas)
+    return [metas[n] for n in NINE]
+
+
+def _load_compute(name: str, plugin_py: Path):
+    """`plugin.py` を **1 本ずつ別のモジュール名で** ロードする。
+
+    9 本とも `plugin` という名前で `sys.modules` に入れると衝突し、
+    最後の 1 本の実装を 9 回検査するだけの恒真テストになる。
+    """
+    spec = importlib.util.spec_from_file_location(f"_iis_{name}", plugin_py)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.modules.pop(spec.name, None)
+    return mod.compute
+
+
+def _df(n: int, *, base: float = 150.0, seed: int = 0) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = base + np.cumsum(rng.normal(0.0, sigma, n))
+    return pd.DataFrame(
+        {"open": np.concatenate([[close[0]], close[:-1]]),
+         "high": close + sigma, "low": close - sigma, "close": close,
+         "volume": np.ones(n)},
+        index=pd.date_range("2024-01-01", periods=n, freq="1h", tz="UTC"))
+
+
+# --- I2: validator を直接通す ------------------------------------------------
+
+def test_all_nine_pass_the_indicator_validator():
+    """I2: 9 本の戻り値が `validate_indicator_result` を通る
+    (キー集合完全一致 / index 一致 / Inf 不在)。
+
+    **`docs/examples/plugins/` 配下で pytest を回さないこと** —
+    `.pytest_cache` は `.gitignore` に無く、`tests/conftest.py` の
+    untracked ガードに当たる。ここは `importlib` でロードするだけなので
+    `__pycache__` (gitignore 済) しか作らない。
+    """
+    df = _df(300)
+    for meta in _nine_metas():
+        compute = _load_compute(meta.name, meta.path / "plugin.py")
+        out = compute(df, dict(meta.params))
+        validate_indicator_result(out, df_index=df.index,
+                                  outputs=meta.outputs)
+
+
+# --- I5: 先頭依存の回帰 ------------------------------------------------------
 
 def _spike_df(n=5000, base=150.0, spike=0.0, seed=1):
     """設計書 §6 I5 の fixture 生成式 (逐語)。`spike` は 401 本目 (= 400 本窓の
@@ -4518,144 +4916,438 @@ def _degenerate_df(n_pre=200, n_flat=400, base=150.0, spike=1.0, seed=0):
         high.append(top)
         low.append(top)
     open_ = [close[0]] + close[:-1]
-    index = pd.date_range("2020-01-01", periods=len(close), freq="5min", tz="UTC")
+    index = pd.date_range("2020-01-01", periods=len(close), freq="5min",
+                          tz="UTC")
     return pd.DataFrame({"open": open_, "high": high, "low": low,
                          "close": close, "volume": [1.0] * len(close)},
                         index=index)
+
+
+def _last_row_deltas(df: pd.DataFrame, max_bars: int = 400) -> dict:
+    """全 9 本について「末尾 `max_bars` 本だけで計算した最終行」と
+    「全 `len(df)` 本で計算した最終行」の差の絶対値を `{キー: 値}` で返す。
+    両方 NaN のキー (`ichimoku.chikou` 等) は 0.0 とみなす。"""
+    out: dict[str, float] = {}
+    tail = df.tail(max_bars).copy(deep=True)
+    for meta in _nine_metas():
+        compute = _load_compute(meta.name, meta.path / "plugin.py")
+        full_res = compute(df, dict(meta.params))
+        tail_res = compute(tail, dict(meta.params))
+        for key, series in full_res.items():
+            a = float(series.iloc[-1])
+            b = float(tail_res[key].iloc[-1])
+            out[key] = 0.0 if (np.isnan(a) and np.isnan(b)) else abs(a - b)
+    assert set(out) == PCT_KEYS | PRICE_KEYS, sorted(set(out))
+    return out
+
+
+def test_head_dependence_within_tolerance_on_random_walks():
+    """I5 (ランダムウォーク): 4 値域 × seed 0〜7。
+    0〜100 スケールは `< 1e-6`、価格スケールは `< 1e-9 * 基準価格`。
+    指揮者の実測: 全キーの最大誤差 **3.104e-10 / 違反 0**。"""
+    worst = 0.0
+    for base in (0.5, 1.5, 150.0, 300.0):
+        for seed in range(8):
+            deltas = _last_row_deltas(_spike_df(base=base, seed=seed))
+            for key, delta in deltas.items():
+                tol = 1e-6 if key in PCT_KEYS else 1e-9 * base
+                assert delta < tol, (base, seed, key, delta, tol)
+                worst = max(worst, delta)
+    assert worst < 1e-6, worst
+
+
+def test_head_dependence_on_the_spike_fixture():
+    """I5 (スパイク): 401 本目に基準価格の 60% (= +90) を置く。
+    公差は上と同じ。指揮者の実測 (参考): `rsi` 1.42e-10 / `adx` 3.40e-09 /
+    `macd` 2.56e-13 / `atr` 1.79e-12。"""
+    base = 150.0
+    deltas = _last_row_deltas(_spike_df(base=base, spike=base * 0.6, seed=1))
+    for key, delta in deltas.items():
+        tol = 1e-6 if key in PCT_KEYS else 1e-9 * base
+        assert delta < tol, (key, delta, tol)
+
+
+def test_head_dependence_on_the_degenerate_fixture():
+    """I5 (退化): 設計書 §3.2 (i-b) の反例。**公差はランダムウォークの表では
+    なく §3.2 (i-b) の `1e-4` を全キーに適用する** — この fixture は
+    `bollinger` の `upper` / `lower` に **1.08e-06** を出し、価格スケールの
+    `1e-9 * base` (= 1.5e-7) を超える (指揮者の実測)。`1e-4` は全キーを覆う
+    (最大は `adx` の **4.31e-06**)。
+
+    比を取る指標 (`rsi` / `plus_di` / `minus_di`) と rolling の有限記憶
+    (`k` / `d`) は**厳密に 0** になることを個別に pin する — ここが
+    `EPS` 規則の唯一の観測点。"""
+    deltas = _last_row_deltas(_degenerate_df())
+    for key, delta in deltas.items():
+        assert delta < 1e-4, (key, delta)
+    for key in ("rsi", "plus_di", "minus_di", "k", "d"):
+        assert deltas[key] == 0.0, (key, deltas[key])
+    assert 0.0 < deltas["adx"] < 1e-4, deltas["adx"]
+
+
+# --- I6 / I8: bless の tmp 環境 ---------------------------------------------
+
+def _bless_env(tmp_path: Path):
+    """`(root, plugins_dir, conn)`。`tests/fixtures/wiring_envs.py:46-52` の
+    `switch_env` と同じ流儀 (実 DB / 実 `plugins/` を触らない)。
+    **`.locks` は作らなくてよい** — `switch._plugin_lock` (`switch.py:806-807`)
+    が `mkdir(parents=True, exist_ok=True)` する
+    (`tests/plugin/test_switch_paths.py:46-47` は明示的に作っているが、
+    どちらでも成立する)。"""
+    root = tmp_path
+    plugins_dir = root / "plugins"
+    (plugins_dir / "_human").mkdir(parents=True)
+    (root / "logs").mkdir(exist_ok=True)
+    conn = db_store.connect(root / "agentic.db")
+    db_store.init_db(conn)
+    return root, plugins_dir, conn
+
+
+def _stage(plugins_dir: Path, name: str) -> Path:
+    """runbook 手順 (1): `cp -r docs/examples/plugins/<名前> plugins/_human/<名前>`。
+    **`__pycache__` / `.pytest_cache` を除外しない** — 巻き込んでも
+    `check_candidate_snapshot` が無視する (`gate_pytest.py:43,46-55`)
+    ことを実地で観測するため。"""
+    dest = plugins_dir / "_human" / name
+    shutil.copytree(EXAMPLES / name, dest)
+    return dest
+
+
+def _bless(conn, plugins_dir: Path, name: str) -> int:
+    """runbook 手順 (2): `afx plugin bless <名前> --from _human` の中身
+    (`backtest/cli.py:585-588` が呼ぶのと同じ引数)。"""
+    return plugin_switch.bless_candidate(
+        conn, name=name, human_dir=plugins_dir / "_human" / name,
+        settings=SETTINGS, now=NOW, decided_by="human_cli")
+
+
+def _inventory_names(conn, plugins_dir: Path) -> list[str]:
+    """`approved_plugins` は **`InventoryBuildResult`** を返す
+    (`tools/plugin_loader.py:41-59`) — 一覧は `result.inventory.metas`。"""
+    result = plugin_loader.approved_plugins(conn, plugins_dir,
+                                            settings=SETTINGS)
+    return sorted(m.name for m in result.inventory.metas)
+
+
+@pytest.mark.slow
+def test_nine_indicators_bless_in_sequence(tmp_path):
+    """I6: 9 本を 1 本ずつ順に bless でき、9 回とも `int` (approval_id) が返り、
+    inventory に 9 名が `outputs` 付きで並ぶ。
+
+    **pytest ゲートを double にしない** — ここはゲートを実物で回すことが
+    受入そのもの。指揮者の実測で 9 本合計 **11.7 秒** (1 本 1.2〜1.4 秒、
+    `plugin.pytest_timeout_sec: 300` に対して桁で余裕)、Landlock 下でも
+    `import pandas` と自己テストは落ちない (`gate_pytest` が
+    `_SINGLE_THREAD_ENV` を子 env に入れるため)。`slow` marker を付けるが、
+    `pyproject.toml:44` の `addopts` は slow を除外しないのでフルスイートには残る。
+
+    同時に観測していること: (i) `noop_gate.find_noop_copy` はこの経路に**無い**
+    (`switch._run_full_gate` のゲート列に現れない) ので「example の丸写し」で
+    弾かれない (ii) `outputs_required` に掛からない (iii) `max_bars_limit`
+    に掛からない (400 <= 1000)。
+    """
+    _root, plugins_dir, conn = _bless_env(tmp_path)
+    for name in NINE:
+        _stage(plugins_dir, name)
+        approval_id = _bless(conn, plugins_dir, name)
+        assert isinstance(approval_id, int), (name, approval_id)
+        assert (plugins_dir / name).is_symlink(), name
+
+    result = plugin_loader.approved_plugins(conn, plugins_dir,
+                                            settings=SETTINGS)
+    by_name = {m.name: m for m in result.inventory.metas}
+    assert sorted(by_name) == sorted(NINE)
+    for name in NINE:
+        assert by_name[name].kind == "indicator", name
+        assert by_name[name].outputs, name
+        assert by_name[name].max_bars == 400, name
+
+
+# --- I7: 新 `rsi` を宣言した strategy の E2E ---------------------------------
+
+_STRATEGY_PY = '''\
+def evaluate(df, indicators, signals, params):
+    rsi = indicators["rsi"]["rsi"]
+    return {"action": "hold",
+            "rationale": f"len={len(rsi)} nonnan={int(rsi.notna().sum())} "
+                         f"last={float(rsi.iloc[-1]):.6f}"}
+'''
+
+_STRATEGY_TEST_PY = '''\
+from plugin import evaluate
+
+
+def test_evaluate_is_callable():
+    assert callable(evaluate)
+'''
+
+
+def _write_strategy(base: Path, name: str, *, max_bars: int) -> Path:
+    d = base / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "plugin.py").write_text(_STRATEGY_PY)
+    (d / "config.yaml").write_text(yaml.safe_dump(
+        {"kind": "strategy", "timeframe": "1h", "pairs": ["USDJPY"],
+         "exit_mode": "levels", "max_bars": max_bars,
+         "indicators": {"rsi": {"plugin": "rsi", "params": {"period": 14}}},
+         "params": {}}, sort_keys=False))
+    (d / "test_plugin.py").write_text(_STRATEGY_TEST_PY)
+    return d
+
+
+def _deploy_rsi_and_resolve(tmp_path: Path, *, max_bars: int):
+    """新 `rsi` を bless で配備し、`max_bars` の strategy 候補に pin を書いて
+    `pin_mode="require"` で解決する。戻り値 `(meta, resolved)`。
+
+    pin の書き込みは **`plugin.resolve.lock_config`** で行う
+    (`resolve.py:207-208`、人間 CLI の `afx plugin lock` と同じ関数)。
+    `tools.improve_staging_tools` の `lock_staging_deps` は tooldef の
+    **内部クロージャ**で import できず、`afx plugin lock` の CLI 自体は
+    init 済みリポジトリ root を要求する (tmp では
+    `初期化が完了していません` で rc=2)。
+    """
+    _root, plugins_dir, conn = _bless_env(tmp_path)
+    _stage(plugins_dir, "rsi")
+    _bless(conn, plugins_dir, "rsi")
+    inventory = plugin_loader.approved_plugins(
+        conn, plugins_dir, settings=SETTINGS).inventory
+    rsi_meta = inventory.by_name("rsi")
+    assert rsi_meta is not None and rsi_meta.max_bars == 400
+
+    cand = _write_strategy(tmp_path / "cand", f"s{max_bars}",
+                           max_bars=max_bars)
+    lock_config(cand, {"rsi": rsi_meta.content_hash})
+    meta, reason = discover_one_with_reason(cand, f"s{max_bars}")
+    assert reason is None, reason
+    # `resolve_indicator_deps` の第 2 引数は **`ApprovedInventory`**
+    # (`InventoryBuildResult` ではない — `resolve.py:161-162`)。
+    resolved = resolve_indicator_deps(meta, inventory, settings=SETTINGS,
+                                      pin_mode="require")
+    assert [(i.alias, i.plugin_name, i.pinned) for i in resolved.items] == [
+        ("rsi", "rsi", True)]
+    return meta, resolved
+
+
+@pytest.mark.slow
+def test_strategy_declaring_new_rsi_runs_end_to_end(tmp_path):
+    """I7: 新 `rsi` を宣言した strategy を **実 worker サブプロセス**で回し、
+    `indicators["rsi"]["rsi"]` が df と同じ index の系列として届く
+    (**モックで worker を潰さない** — [[test-fixtures-from-real-transcripts]])。
+
+    `PluginSession` のシグネチャは
+    `PluginSession(meta, *, settings: PluginSettings, resolved=None)`
+    (`sandbox.py:330-331`) — **`kind=` という引数は無く**、`settings` は
+    `Settings` 全体ではなく **`Settings.plugin`**。
+    """
+    meta, resolved = _deploy_rsi_and_resolve(tmp_path, max_bars=400)
+    df = _df(600).tail(400)
+    with PluginSession(meta, settings=SETTINGS.plugin,
+                       resolved=resolved) as session:
+        out = session.call({"df": df, "params": {}})
+    assert out["action"] == "hold"
+    # worker は indicator 自身の `max_bars` で `df.tail(...)` したうえで
+    # `reindex(df.index)` を掛ける (`worker.py:318,321-325`) ので、
+    # strategy に渡した df と同じ長さで届く。
+    assert f"len={len(df)}" in out["rationale"], out["rationale"]
+    # warmup (period=14) の分だけ NaN が先頭に残る = 全 NaN でも全非 NaN でもない
+    assert "nonnan=386" in out["rationale"], out["rationale"]
+
+
+@pytest.mark.slow
+def test_strategy_with_max_bars_200_runs_but_is_outside_the_i5_guarantee(
+        tmp_path):
+    """I7 (保証外ケース): 同じ strategy を `max_bars: 200` で作ると**動く**
+    (例外にならない) が、**I5 の保証範囲の外**。
+
+    worker は `sub_df = df.tail(dep["max_bars"])` (`worker.py:318`) と
+    indicator 自身の `max_bars` (= 400) で tail するが、strategy の
+    `max_bars` が 200 なら df 自体が 200 本しかないので 200 本で計算される。
+    **値の一致は要求しない** — 指揮者の実測で最終 `rsi` は
+    `65.797529` (400 本) と `65.797530` (200 本) で食い違う。
+    """
+    meta, resolved = _deploy_rsi_and_resolve(tmp_path, max_bars=200)
+    df = _df(600).tail(200)
+    with PluginSession(meta, settings=SETTINGS.plugin,
+                       resolved=resolved) as session:
+        out = session.call({"df": df, "params": {}})
+    assert out["action"] == "hold"
+    assert "len=200" in out["rationale"], out["rationale"]
+
+
+# --- I8: runbook の逐語再現 --------------------------------------------------
+
+@pytest.mark.slow
+def test_runbook_normal_sequence_deploys_all_nine(tmp_path):
+    """I8(a) 正常系: runbook の手順 (1) コピー → (2) bless → (4) 後片付け →
+    (5) 9 本ぶん繰り返す、をそのまま実行する。コピーが `__pycache__` /
+    `.pytest_cache` を巻き込んでも通る。"""
+    _root, plugins_dir, conn = _bless_env(tmp_path)
+    for name in NINE:
+        _stage(plugins_dir, name)
+        _bless(conn, plugins_dir, name)
+        shutil.rmtree(plugins_dir / "_human" / name)   # 手順 (4)
+    assert _inventory_names(conn, plugins_dir) == sorted(NINE)
+
+
+@pytest.mark.slow
+def test_runbook_gate_failure_keeps_earlier_deployments_and_resumes(tmp_path):
+    """I8(b) ゲート前・ゲート中の失敗 (設計書 §6.3 (A)): 5 本目の候補の
+    `test_plugin.py` をわざと落として bless を失敗させる。
+
+    - **4 本は配備済のまま残る** (9 本は束ではない)
+    - 失敗した 1 本には**何も残らない** — `.versions/<名前>` も、未終端 journal も、
+      pending approval も。**「journal テーブルの行数が 0」を assert しては
+      いけない** — 先行 4 本の**終端済** journal が 4 行残っている (指揮者の実測)
+    - 候補を直して 5 本目から再開すると最終的に 9 本揃う
+    """
+    _root, plugins_dir, conn = _bless_env(tmp_path)
+    broken = NINE[4]   # bollinger
+    for name in NINE:
+        _stage(plugins_dir, name)
+        if name == broken:
+            (plugins_dir / "_human" / name / "test_plugin.py").write_text(
+                "def test_broken():\n    assert False\n")
+            with pytest.raises(ValueError, match="failed pytest gate"):
+                _bless(conn, plugins_dir, name)
+            assert _inventory_names(conn, plugins_dir) == sorted(NINE[:4])
+            assert not (plugins_dir / ".versions" / name).exists()
+            assert journal_store.get_open_by_name(conn, name) is None
+            assert conn.execute(
+                "SELECT COUNT(*) c FROM approval_requests WHERE status='pending'"
+            ).fetchone()["c"] == 0
+            # 候補を直して同じ名前でやり直す (runbook (A))
+            shutil.rmtree(plugins_dir / "_human" / name)
+            _stage(plugins_dir, name)
+        _bless(conn, plugins_dir, name)
+        shutil.rmtree(plugins_dir / "_human" / name)
+    assert _inventory_names(conn, plugins_dir) == sorted(NINE)
+
+
+@pytest.mark.slow
+def test_runbook_post_gate_failure_converges_via_approval_retry(tmp_path,
+                                                                monkeypatch):
+    """I8(c) ゲート後の失敗 (設計書 §6.3 (B)): 版ディレクトリ作成後・symlink
+    切替前で 1 回だけ失敗させ、runbook の収束手順 5 ステップが逐語で通ること
+    を観測する。
+
+    **故障注入は `switch.history_git.record_version` のモジュール属性差し替え**
+    (`test_reconcile.py:268,471` と同じ形)。`_advance_to_decided` は
+    版作成 (`switch.py:1198`) → `phase="versioned"` (`:1205`) →
+    history 記録 (`:1208`) → `phase="recorded"` (`:1212`) → symlink 切替
+    (`:1219`) の順に進むので、ここで落とすと **`.versions/<名前>/<hash>` は
+    残り / journal は `versioned` / live symlink は無い**という §6.3 (B) の
+    症状 (「`.versions/` が増えている」) がそのまま再現する。
+    `_advance_to_decided` 自体を差し替えるとこの位置は作れない。
+
+    **`approval retry` の効き方は失敗 phase で変わる (指揮者の実測、2026-09-19)**:
+
+    | 失敗 phase | retry 後 | 再 bless |
+    |---|---|---|
+    | `preparing` (版作成で失敗) | journal 終端 + **配備完了** | 手順 5 の確認。同内容なので no-op |
+    | `versioned` / `recorded` (history / 切替直前) | journal 終端 + **配備完了** | 同上 (本テストのケース) |
+    | `switched` (切替で失敗し live が新 target でない) | journal 終端・approval `approved` だが **配備されない** (`approve_candidate` の 0d は `switched` を `_reverify_switched_journal` → `_finalize_decision` で閉じるだけで `switch_live` を呼ばない、`switch.py:1440-1454`) | **必須** |
+
+    `switched` の行は **`[retry-switched-approves-without-deploy]` として指揮者へ
+    申告済みの観測**であり、本テストの対象ではない (起動時 reconcile なら
+    live target を見て `_revert_one` する — `test_switch_journal.py::
+    test_switched_recovery_absent_old_kind_with_no_live_reverts`)。
+    §6.3 (B) の手順 5 (「もう一度 bless して `UnresolvedJournalError` が出ない
+    ことを確認する。そのまま成功すれば配備完了」) は **どちらの phase でも
+    正しく働く**ので、runbook は手順 5 を必ず実行する形のままでよい。
+
+    状態遷移そのものは `tests/plugin/test_switch_journal.py` /
+    `test_reconcile.py` が pin 済みなので再実装しない (設計書 §6.1)。
+    """
+    root, plugins_dir, conn = _bless_env(tmp_path)
+    _stage(plugins_dir, "rsi")
+
+    real_record = plugin_switch.history_git.record_version
+    calls = {"n": 0}
+
+    def _fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("injected: after version dir, before symlink switch")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(plugin_switch.history_git, "record_version",
+                        _fail_once)
+
+    with pytest.raises(OSError, match="injected"):
+        _bless(conn, plugins_dir, "rsi")
+
+    # 残るもの: `.versions/` + 未終端 journal (phase=versioned) + pending approval。
+    open_journal = journal_store.get_open_by_name(conn, "rsi")
+    assert open_journal is not None
+    assert open_journal["phase"] == "versioned"
+    approval_id = open_journal["approval_id"]
+    assert conn.execute(
+        "SELECT status FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["status"] == "pending"
+    assert (plugins_dir / ".versions" / "rsi").is_dir()
+    assert not (plugins_dir / "rsi").exists()
+    assert _inventory_names(conn, plugins_dir) == []
+
+    # 手順 2: 同じ bless をもう一度実行して `op_id` / `approval_id` を読む。
+    # 例外は `UnresolvedJournalError` で **`ValueError` ではない**
+    # (`switch.py:1572` は `Exception` を継承) ため、CLI の
+    # `except (ValueError, SandboxError)` (`backtest/cli.py:590`) を
+    # すり抜けて Python traceback が出る — runbook (B) の記述の根拠。
+    with pytest.raises(plugin_switch.UnresolvedJournalError) as excinfo:
+        _bless(conn, plugins_dir, "rsi")
+    assert not isinstance(excinfo.value, ValueError)
+    assert f"op_id={open_journal['op_id']}" in str(excinfo.value)
+    assert f"approval_id={approval_id}" in str(excinfo.value)
+
+    # 手順 3: 対話シェルの `afx> approval retry <id>`
+    # (`commands.py:139-153`。`plugins_root` / `settings` が未配線だと
+    # 何もせず文字列を返すだけなので、必ず両方渡す)。
+    clock = FixedClock(NOW)
+    cmds = Commands(
+        conn=conn, state_store=StateStore(root / "state.json"),
+        broker=PaperBroker(conn, SETTINGS, clock), trade_loop=MagicMock(),
+        activity=ActivityLog(root / "logs" / "activity.log"),
+        log_dir=root / "logs", clock=clock, health_latch=HealthLatch(),
+        plugins_root=plugins_dir, settings=SETTINGS)
+    assert cmds.dispatch(f"approval retry {approval_id}") == (
+        f"approval #{approval_id} を再試行しました")
+
+    # `versioned` からの retry は手順を頭から冪等に流すので、journal の終端と
+    # **配備の完了**が同時に起きる。
+    assert journal_store.get_open_by_name(conn, "rsi") is None
+    assert conn.execute(
+        "SELECT status FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["status"] == "approved"
+    assert (plugins_dir / "rsi").is_symlink()
+    assert _inventory_names(conn, plugins_dir) == ["rsi"]
+
+    # 手順 5: もう一度 bless して `UnresolvedJournalError` が出ないことを確認する。
+    # 同内容なので切替は no-op だが、**approval 行は 1 本増える** (仕様)。
+    second_id = _bless(conn, plugins_dir, "rsi")
+    assert isinstance(second_id, int) and second_id != approval_id
+    assert (plugins_dir / "rsi").is_symlink()
+    assert _inventory_names(conn, plugins_dir) == ["rsi"]
+
+    # 承認詳細に依存 strategy の 2 欄が出る (`commands.py:394-400`) —
+    # runbook の「任意の後片付け」で人間が退役前に確認する手段。
+    detail = cmds.dispatch(f"approval {second_id}")
+    assert "dependent_pinned_here=" in detail
+    assert "dependent_pinned_elsewhere=" in detail
 ```
 
-- [ ] **ランダムウォーク 4 値域 (0.5 / 1.5 / 150 / 300) × seed 0〜7**: 末尾 400 本で
-      計算した最終行と全 5000 本の最終行の差が、**0〜100 スケールの出力
-      (`rsi` `k` `d` `adx` `plus_di` `minus_di`) は `abs < 1e-6`**、
-      **価格スケールの出力は `abs < 1e-9 * 基準価格`**。
-      指揮者の実測: **全キーの最大誤差 3.104e-10 / 違反 0**
-- [ ] **スパイク fixture** (401 本目に基準価格の 60% = +90): 実測値は
-      `ema` 0.0 / `macd` 2.56e-13 / `signal` 4.11e-13 / `hist` 1.55e-13 /
-      `atr` 1.79e-12 / `rsi` 1.42e-10 / `adx` 3.40e-09 / `plus_di` 1.19e-10 /
-      `minus_di` 2.73e-11 — 上界式 (設計書 §3.2 (i)) の内側
-- [ ] **退化 fixture**: `rsi` は `abs == 0.0`、`adx` だけ `abs < 1e-4`
-      (指揮者の実測 **4.31e-06**。設計書 §3.2 (i-b) は 5.2e-06 と書いているが、これは
-      fixture の前段データの作り方で変わる観測値で、どちらも 1e-4 の内側 —
-      「着手前検証の記録」§5 の要裁定 1 件)。
-      `stochastic` は rolling の有限記憶なので `abs == 0.0`
-- [ ] 逆変異: `rsi` / `adx` の `EPS` を 0 にすると**退化 fixture のケースだけ**が red に
-      なることを実測する (ランダムウォークのケースは緑のまま = 退化 fixture が唯一の観測点)
+**転写後の自己検証** (プラン規約):
 
-### Step 10-d: I6 — 9 本を順に bless する (tmp 環境)
+```
+python -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" tests/plugin/test_indicator_initial_set.py
+```
 
-- [ ] `tests/fixtures/wiring_envs.py` の tmp 環境ビルダ (実 DB / 実 `plugins/` を触らない形)
-      に倣い、`tmp_path/plugins` と tmp sqlite を用意する。**実 `data/agentic.db` と
-      実 `plugins/` に触れないこと** (Global Constraints)
-- [ ] `docs/examples/plugins/<名前>` を `tmp_path/plugins/_human/<名前>` へ **`shutil.copytree`**
-      でコピーする (`__pycache__` が混ざっても `check_candidate_snapshot` は無視する —
-      `gate_pytest.py:61-64`、設計書 §6 I8)
-- [ ] 9 本を **1 本ずつ順に** `switch.bless_candidate(conn, name=..., human_dir=...,
-      settings=..., now=..., decided_by="test")` に通し、**9 回とも `int` (approval_id) が
-      返る**ことを assert する
-- [ ] 同時に観測する: (i) `noop_gate.find_noop_copy` がこの経路に**無い**こと
-      (`switch._run_full_gate` のゲート列に現れない — 設計書 §5.4/§5.5) — したがって
-      「example の丸写し」で弾かれない (ii) `outputs_required` に掛からない
-      (iii) `max_bars_limit` に掛からない (400 <= 1000)
-- [ ] 9 本 bless 後に `tools.plugin_loader.approved_plugins(conn, tmp_path/"plugins",
-      settings=...)` を呼び、`inventory.metas` に 9 名が `outputs` 付きで並ぶことを assert
-- [ ] 逆変異: 1 本の `config.yaml` から `outputs:` 行を削ると、**その 1 本だけ**が
-      `ValueError("outputs_required")` になり他の 8 本は配備されること (= 束ではない、
-      設計書 §6.3)
+**機械抽出による照合** (プラン本文との差分ゼロを報告に貼ること):
 
-### Step 10-e: I7 — 新 `rsi` を宣言した strategy の E2E
-
-- [ ] tmp 環境に `rsi` を配備したうえで、`rsi_pullback` 型の strategy を**別名**で作る
-      (`config.yaml` に `indicators: {rsi: {plugin: rsi, params: {period: 14}}}`、
-      **`max_bars: 400`**、`exit_mode: levels`、`timeframe` / `pairs` あり)
-- [ ] `lock_staging_deps` 相当 (人間経路なら `afx plugin lock --from _human`) で pin を
-      書き込み、`resolve_indicator_deps(pin_mode="require")` が通ることを assert
-- [ ] 実 worker サブプロセスで `PluginSession(kind="strategy", resolved=...)` を起動し、
-      `evaluate(df, indicators, None, params)` の `indicators["rsi"]["rsi"]` が
-      **df と同じ index の系列**として届くことを assert
-      (**モックで worker を潰さない** — [[test-fixtures-from-real-transcripts]])
-- [ ] **`max_bars: 200` の保証外ケース**を別テストで: 同じ strategy を `max_bars: 200` で
-      作ると**動く** (例外にならない) が、**I5 の保証範囲の外**であることを docstring に書く。
-      値の一致は要求しない (worker は `df.tail(min(200, 400))` を渡す — `worker.py:318`)
-
-### Step 10-f: runbook を書く
-
-`docs/operations/indicator-initial-set-deploy-2026-09-19.md` を新規作成する。
-
-- [ ] **冒頭に**: 「**暫定**。[first-run-setup] (初回起動の対話ウィザード) が一括配備に
-      置き換える。**恒久なのは『採用には人間の明示的確認が要る、LLM の自動配備経路は
-      作らない』という規律のほう**」
-- [ ] 手順 (0)〜(6) を逐語で:
-  - **(0) 既存の配備名との衝突確認** — `ls -l plugins/` で `sma` / `ema` / `rsi` / `macd` /
-    `bollinger` / `atr` / `adx` / `stochastic` / `ichimoku` が無いこと。既にあれば
-    bless は**既存名の新版への切り替え**になり、その名前を pin している strategy が
-    pin 破れで inventory から外れる (設計書 §8 D3)
-  - **(1) コピー** — `cp -r docs/examples/plugins/<名前> plugins/_human/<名前>`
-  - **(2) bless** — `afx plugin bless <名前> --from _human`
-  - **(3) 結果の確認** — rc=0 なら stdout に `approval id=<N>`。**rc=1 / traceback なら
-    そこで停止**し、失敗が (A) ゲート前か (B) ゲート後かを判定して下の収束手順へ。
-    **既に配備済の分は巻き戻さない** (設計書 §6.3)
-  - **(4) 後片付け** — `rm -rf plugins/_human/<名前>` (bless は消さない。残すと後日の
-    `afx plugin materialize <名前>` が `FileExistsError` になる)
-  - **(5) 9 本ぶん繰り返す**
-  - **(6) 最終確認** — service を再起動し、起動ログに 9 本が載ること
-- [ ] **失敗の 2 系統 (設計書 §6.3) を逐語で転記する**:
-  - **(A) ゲート前・ゲート中** (`check_source` / pytest / `max_bars` / `outputs_required`) —
-    何も残らない。候補を直して同じ名前でやり直すだけ
-  - **(B) ゲート後** (version 作成・history・symlink 切替) — journal / pending approval /
-    `.versions/` が残り、**次の同名 bless は `UnresolvedJournalError` になる**。
-    **この例外は CLI が捕捉していないので Python traceback が出る** — 意味は
-    「未終端 journal の検出」。**収束手順 5 ステップを設計書 §6.3 (B) から逐語で転記**
-    (approval id は traceback のメッセージ `op_id=... approval_id=...` から読む /
-    `afx> approval retry <id>` が `preparing` を終端させる唯一の手段 /
-    **サービス再起動だけでは `preparing` は終端しない**)
-- [ ] **strategy 作者向けの 1 行**: 「これらの indicator に依存する strategy は自分の
-      `max_bars` を **400 以上**に宣言すること」(設計書 §3.2)
-- [ ] **末尾に「任意の後片付け」節** (2026-09-19 ユーザー指示) — **実コードで確認した事実を
-      反映すること**:
-  - 新 `rsi` を配備したあと、**依存する strategy が無いことを確認したうえで**、配備済
-    `rsi_indicator` / `rsi_wilder` を退役させてよい。**人間の判断であり本束の完了条件では
-    ない。**
-  - **`afx plugin retire <名前>` は引数 1 個 (名前のみ)**。ただし**「legacy plain live」
-    — つまり `plugins/<名前>` が普通のディレクトリの場合にしか使えない**。bless で配備した
-    ものは `.versions/` への symlink なので、`retire` は
-    `ValueError("plugins/<名前> is not a plain directory (retire only applies to legacy
-    plain live)")` で**拒否する** (`switch.py:1627-1629`)。未終端 journal があるときも
-    `UnresolvedJournalError` で拒否する (`switch.py:1621-1625`)
-  - **`retire` は依存 strategy を一切検査しない** (`switch.py:1605-1641` の `retire_plugin` 全体に該当コードが無い)。
-    退役させた indicator を pin している strategy は、次の `approved_plugins()` の第 2 相で
-    `not_found` になり**黙って inventory から外れる** (pin 破れ)。**人間が事前に確認すること** —
-    確認手段は対話シェルの `afx> approval <id>` の詳細に出る
-    `dependent_pinned_here` / `dependent_pinned_elsewhere` の 2 欄 (`commands.py:395-400`)
-  - **example 側の `docs/examples/plugins/rsi_indicator` は残す** — example 戦略
-    `rsi_pullback` が依存しており、改善ループの `_examples` スナップショットと
-    `tests/plugin/test_loader.py` / `tests/loops/test_improve_e2e.py` が参照している (R7)
-
-### Step 10-g: I8 — runbook の逐語再現
-
-- [ ] **(a) 正常系**: tmp 環境で runbook のコマンド列をそのまま実行し、9 本が配備され
-      inventory に 9 本が `outputs` 付きで現れること。コピーが `__pycache__` を巻き込んでも
-      通ること
-- [ ] **(b) ゲート前失敗からの再開 (§6.3 (A))**: k 本目 (例 5 本目) の `_human` 候補の
-      `test_plugin.py` をわざと落ちるようにして bless を失敗させ、**k−1 本が配備済のまま
-      残る**こと → 候補を直して k 本目から再開すると**最終的に 9 本揃う**こと
-- [ ] **(c) ゲート後失敗の収束 (§6.3 (B))**: `_advance_to_decided` の途中 (version 作成後・
-      symlink 切替前) を monkeypatch で 1 回だけ失敗させ、**未終端 journal と pending
-      approval が残る** → **次の同名 bless が `UnresolvedJournalError`** → **runbook の
-      収束手順を逐語で実行**すると解け、同名で再 bless して配備が完了すること
-- [ ] **状態遷移そのものは既存テストが pin 済み** — `tests/plugin/test_switch_journal.py`
-      (`test_switched_recovery_*` / `test_interrupt_reverts_*`) と
-      `tests/plugin/test_reconcile.py` を**参照**し、**再実装しない** (設計書 §6.1)。
-      I8(c) が観測するのは「**runbook に書いた手順がそのまま通ること**」だけ
-- [ ] 故障注入の形は上記既存テストの monkeypatch に倣う (シグネチャが違ったら**申告**)
-
-### Step 10-h: フルスイートと commit
-
-- [ ] `uv run pytest -q` をフルで回し、**既存テストの退行がゼロ**であること
-      (特に `tests/plugin/test_loader.py` / `tests/loops/test_improve_loop_source_snapshot.py`
-      / `tests/tools/test_improve_staging_tools.py` — `docs/examples/plugins` を列挙する側)
-- [ ] `git status` で `data/` と `plugins/` に変更が無いことを確認する
-- [ ] commit (`feat(indicator-initial-set): 受入テストと配備 runbook (T10)`)
-- [ ] **逸脱の申告**を全件
+```
+sec = plan.split("### Step 10-i:")[1].split("\n**転写後の自己検証**")[0]
+body = re.findall(r"^```python\n(.*?)^```$", sec, re.S | re.M)[0]
+assert body == open("tests/plugin/test_indicator_initial_set.py").read()
+```
 
 ---
 
@@ -4721,6 +5413,9 @@ def _degenerate_df(n_pre=200, n_flat=400, base=150.0, spike=1.0, seed=0):
   `plus_di` 1.19e-10 / `minus_di` 2.73e-11。
 - **退化 fixture** (200 本 → DM/TR 1 本 → 完全横ばい 400 本): `rsi` **0.0** /
   `adx` **4.31e-06** / `plus_di` 0.0 / `minus_di` 0.0 / `stochastic` 0.0。
+  **`bollinger` の `upper` / `lower` は 1.08e-06** — 価格スケールの公差
+  `1e-9 * 150` を超えるので、退化 fixture には設計書 §3.2 (i-b) の `1e-4` を全キーに
+  適用する (T10 着手前検証 C3、2026-09-19 追記)。
 
 ### 4. 壊れた実装に対する red の実測 (`sma` の `test_plugin.py` を流用)
 
@@ -4789,15 +5484,57 @@ blocks = re.findall(r"^```(?:python|yaml)\n(.*?)^```$", sec, re.S | re.M)
 **「プランに載せた文字列」と「検証した文字列」が同一であることを、目視ではなく `diff` で
 確かめてある** ([[transcription-must-be-machine-diffed]])。
 
-### 8. 設計書との食い違い (指揮者へ申告済み、**勝手に spec を変えていない**)
+### 8. 設計書との食い違い (**v1.1 で解消済み** — 設計書 v1.3b へ反映)
 
-| # | 箇所 | 実測 | 扱い |
+| # | 箇所 | 実測 | 処置 (2026-09-19) |
 |---|---|---|---|
-| 1 | 設計書 §3.2 (i-b) の退化 fixture の `|Δadx|` = **5.2e-06** | 本プランの fixture 生成式では **4.31e-06** | どちらも I5 の公差 `1e-4` の内側で**結論は不変**。数値は前段データの作り方に依存する観測値なので、spec 側を「4e-06 〜 6e-06 のオーダー」と書き換えるか、本プランの fixture を spec の逐語仕様として採用するかは**指揮者の裁定**を仰ぐ |
-| 2 | 設計書 §6.3 は `afx plugin retire` に触れていない | `retire` は **plain live 専用**で symlink 配備 (= bless の結果) は**拒否**し、**依存 strategy を検査しない** | 本プランの Step 10-f に実コードの事実として書いた。spec への反映要否は指揮者の裁定 |
+| 1 | 設計書 §3.2 (i-b) の退化 fixture の `|Δadx|` = **5.2e-06** | 本プランの fixture 生成式では **4.31e-06** | **設計書 v1.3b で 4.31e-06 に差し替え**、「前段データの作り方に依存する観測値で、I5 の公差 1e-4 はこれを覆う」と注記。どちらも結論は不変 |
+| 2 | 設計書 §6.3 は `afx plugin retire` に触れていない | `retire` は **plain live 専用**で symlink 配備 (= bless の結果) は**拒否**し、**依存 strategy を検査しない** | **設計書 v1.3b の R5a 近傍に 1〜2 文 + §1 非スコープに `[retire-symlink-deployed-plugin]` の起票文案**。Step 10-f の「任意の後片付け」も「退役できない/併存させる」に修正 |
+
+### 9. T10 の着手前検証 (2026-09-19、**v1.1 の根拠**)
+
+v1.0 の T10 は「何を観測するか」の仕様までしか書いておらず、**I6 / I7 / I8 の tmp 環境
+実測をしていなかった**。着手前検証で **Critical 4 / Important 8 / Minor 5** を検出し、
+全件を本節へ反映した (詳細: `tmp/plan-indicator-initial-set/prevalidation-T10.md`)。
+
+**Critical 4 件**:
+
+| # | v1.0 の記述 | 実物 |
+|---|---|---|
+| C1 | `PluginSession(kind="strategy", resolved=...)` | `PluginSession(meta, *, settings: PluginSettings, resolved=None)` (`sandbox.py:330-331`)。`kind=` は非実在、`settings` は `Settings.plugin` |
+| C2 | 「`lock_staging_deps` 相当 / `afx plugin lock --from _human`」 | `lock_staging_deps` は tooldef の内部クロージャで import 不能 (`improve_staging_tools.py:116`)。CLI は init 済み root を要求し tmp では rc=2。正は `plugin.resolve.lock_config` (`resolve.py:207-208`) |
+| C3 | I5 のテスト本体が無い + 退化 fixture の公差が未指定 | 退化 fixture で `bollinger` が **1.08e-06** を出し価格スケール公差 (1.5e-7) を超える。設計書 §3.2 (i-b) の `1e-4` を全キーに当てるのが正 |
+| C4 | 「`_advance_to_decided` の途中を monkeypatch」「既存テストの monkeypatch に倣う」 | `_advance_to_decided` 自体を差し替えるとこの位置は作れない。正は `switch.history_git.record_version` のモジュール属性差し替え (phase=`versioned` = §6.3 (B) の症状)。加えて **`approval retry` の効き方は失敗 phase で変わる** — `preparing`/`versioned`/`recorded` は retry で配備まで完了し、`switched` だけ retry 後も未配備のまま `approved` になる (`[retry-switched-approves-without-deploy]` として申告) |
+
+**Important 8 件**: I6 に `slow` marker の指示が無い (実測 9 本 11.7 秒) /
+`approved_plugins` の戻り値は `InventoryBuildResult` /
+`resolve_indicator_deps` の第 2 引数は `ApprovedInventory` /
+`worker.py:318` に `min(200, 400)` という式は無い /
+対話シェルの現物名 (`Commands.dispatch`) が書かれていない /
+`.locks` の扱いが既存 2 流儀で割れている (どちらでも成立する) /
+I8(b) の残骸 assert に「journal 0 行」を書くと red /
+`retire_plugin` の行番号が 3 行ずれ (`1605-1641` → `1605-1638`)。
+
+**Minor 5 件**: `_plugin_bless` は `agentic_fx.cli` ではなく `backtest/cli.py:557` /
+`gate_pytest.py:61-64` → `:43,46-55` / `commands.py:395-400` → `:394-400` /
+`.pytest_cache` は gitignore されていない / `approval id=<N>` の出力位置 (`cli.py:592`、変更不要)。
+
+**T10 の実測** (全て tmp 環境。実 DB・実 `plugins/` には触れていない):
+
+| 観測 | 結果 |
+|---|---|
+| I6: 9 本を実 pytest ゲート込みで順に bless | **9/9 成功、`int` 返り、合計 11.66 秒** (1 本 1.22〜1.42 秒)。Landlock 下で pandas import も自己テストも落ちない |
+| I6 逆変異: `atr` の `outputs:` を削る | **その 1 本だけ `ValueError("outputs_required")`、他 8 本は配備** (束ではない) |
+| I7: 新 `rsi` + strategy を実 worker で | `max_bars: 400` → `len=400 nonnan=386 last=65.797529` / `max_bars: 200` → `len=200 nonnan=186 last=65.797530` (**一致しない = 保証外**) |
+| I8(a) 正常系 (`__pycache__` / `.pytest_cache` 込みコピー) | 9 本配備、inventory 9 名 |
+| I8(b) 5 本目のゲート失敗 → 直して再開 | 失敗時点で 4 本配備済・残骸ゼロ、再開後 9 本揃う |
+| I8(c) ゲート後失敗 → `approval retry` → 手順 5 の再 bless | 失敗 phase 別に実測: `preparing` / `versioned` は **retry で journal 終端 + 配備完了**、`switched` だけ **retry 後も未配備** (approval は `approved`)。いずれも次の同名 bless は `UnresolvedJournalError` で弾かれ、retry 後の再 bless で確実に配備される。受入テストは `versioned` を観測する |
+| **`src/` の観測事項 (本束では直さない)** | `approve_candidate` の 0d は `phase == "switched"` を `_reverify_switched_journal` → `_finalize_decision` で閉じるだけで `switch_live` を呼ばない (`switch.py:1440-1454`) ため、**approval が `approved` なのに何も配備されていない**状態になり得る。**`[retry-switched-approves-without-deploy]` として指揮者へ申告** |
+| 完成ファイル `tests/plugin/test_indicator_initial_set.py` (Step 10-i) | **10 passed / 41.7 秒** (最遅 3 本 = 12.0 / 11.5 / 11.5 秒) |
 
 ## 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-09-19 | v1.0 | 起案。設計書 v1.3a を T0 (共通テンプレート) / T1〜T9 (指標 1 本ずつ、並列可) / T10 (repo 側受入テストと runbook) の 11 task へ分割。**T1〜T9 の逐語コード 27 ファイルは指揮者が scratchpad で生成・実行し 131 passed を確認済み**。逆変異 54 件を実測し 54/54 KILLED (初回 9 件生存 → すべてテスト側の欠陥として修正)。I5 の数値・壊れた実装の red・等価変異 1 件を「着手前検証の記録」に記載 | 設計書 v1.3a (codex 設計レビュー r3 で指摘 0、収束) | - |
+| 2026-09-19 | v1.1 | **T10 の着手前検証** (Critical 4 / Important 8 / Minor 5) を全件反映。Step 10-b〜10-h を実物照合済みの記述へ改訂し、**Step 10-i に完成ファイル `tests/plugin/test_indicator_initial_set.py` の逐語 (実測 10 passed / 41.7 秒) を追加**。「着手前検証の記録 §8」の 2 件を設計書 v1.3b へ反映して閉じ、§9 に T10 の実測を追加。**T1〜T9 の節と行番号は一切動かしていない** (改訂は L4438 以降 + 冒頭 1 行の版表記のみ)。なお本文 L24 / L73 の「設計書 v1.3a」表記は、T10 より前の行を動かさない制約のため据え置き — **v1.3b は v1.3a に対する設計変更ゼロの改訂** (観測値の訂正 + 既知の欠落の起票) なので参照の妥当性は保たれる | T10 は起草者自身が「tmp 環境での bless 実測をしていない、最もプラン記述の欠陥を踏みやすい」と申告していた箇所 ([[plan-code-defects-not-implementer-defects]] 「着手前検証を必須工程にする」) | - |
