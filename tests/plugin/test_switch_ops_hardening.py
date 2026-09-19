@@ -106,6 +106,68 @@ def _activity(root):
     return ActivityLog(root / "logs" / "activity.log")
 
 
+@pytest.mark.slow
+def test_ac16a_entry_guard_refuses_terminal_row_before_touching_fs(tmp_path, monkeypatch):
+    """AC-16a(1): `_advance_to_decided` は終端行を渡されると **FS を触る前**に
+    `ValueError`。live も journal も変わらない。"""
+    from agentic_fx.plugin.gate_pytest import hashes_of
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    plugin_switch._revert_one(conn, row, plugins_root=plugins_root, now=NOW)
+    conn.commit()
+    candidate_dir = plugins_root / "_human" / "sma"
+    content_hash, artifact_hash = hashes_of(candidate_dir)
+
+    with pytest.raises(ValueError, match="terminal/missing"):
+        plugin_switch._advance_to_decided(
+            conn, row["approval_id"], op_id=row["op_id"], name="sma",
+            plugins_root=plugins_root, candidate_dir=candidate_dir,
+            content_hash=content_hash, artifact_hash=artifact_hash,
+            switch_required=True, decided_by="probe", now=NOW)
+
+    assert not (plugins_root / "sma").exists(), "FS に触れてから落ちている"
+    assert _rows(conn) == [(row["op_id"], "reverted")]
+    assert _status(conn, row["approval_id"]) == "pending"
+
+
+@pytest.mark.slow
+def test_ac16a_finalize_guard_refuses_wrong_phase(tmp_path, monkeypatch):
+    """AC-16a(2): `_finalize_decision` は期待 phase 以外を `ValueError`。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugin_switch._revert_one(conn, row, plugins_root=root / "plugins", now=NOW)
+    conn.commit()
+    with pytest.raises(ValueError, match="expects phase='switched'"):
+        plugin_switch._finalize_decision(
+            conn, row["approval_id"], op_id=row["op_id"], decided_by="probe", now=NOW)
+    assert _rows(conn) == [(row["op_id"], "reverted")]
+    assert _status(conn, row["approval_id"]) == "pending"
+
+
+@pytest.mark.slow
+def test_ac16b_switch_required_zero_reaches_decided(tmp_path, monkeypatch):
+    """AC-16b: 同一候補の再 bless は `switch_required=0` の行を作り、
+    `recorded` から `decided` へ進む (ガードを常に `switched` 期待にすると red)。"""
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+    seen = []
+    real = plugin_switch._finalize_decision
+
+    def _spy(conn_, approval_id, *, op_id, decided_by, now):
+        r = journal_store.get(conn_, op_id)
+        seen.append((r["phase"], r["switch_required"]))
+        return real(conn_, approval_id, op_id=op_id, decided_by=decided_by, now=now)
+
+    monkeypatch.setattr(plugin_switch, "_finalize_decision", _spy)
+    assert main(["plugin", "bless", "sma", "--from", "_human"]) == 0
+    assert main(["plugin", "bless", "sma", "--from", "_human"]) == 0
+
+    assert seen == [("switched", 1), ("recorded", 0)]
+    conn = db_store.connect(root / _DB)
+    assert [ph for _op, ph in _rows(conn)] == ["decided", "decided"]
+    conn.close()
+
+
 def _walk_own_body(fn):
     """`fn` の本体を走査する。**入れ子の関数定義の中には入らない**。"""
     stack = list(fn.body)

@@ -1219,7 +1219,21 @@ def _finalize_decision(conn: sqlite3.Connection, approval_id: int, *,
                        op_id: int, decided_by: str, now: datetime) -> None:
     """§4.3 手順 9: `apply_decision(approved)` + ジャーナル `decided` 化を
     1 tx で行う (`apply_decision` 自身はジャーナルに触らない — B-2/§申し
-    送り⑤どおり、Task 11 側がここで拡張する拡張点)。"""
+    送り⑤どおり、Task 11 側がここで拡張する拡張点)。
+
+    [switch-ops-hardening] T2 (設計書 §3.2): **単調性 API を迂回する唯一の
+    `set_phase` 呼び出し**なので、ここで期待 phase を検査する。期待値は
+    `switch_required` で決まる — `phase in ("switched", "recorded")` と
+    書くと `switch_required=1` の行が `recorded` のまま (= 切替をしていない
+    のに) 決定できてしまい IV-3 を破る fail open になる。"""
+    guard_row = journal_store.get(conn, op_id)
+    if guard_row is None:
+        raise ValueError(f"op_id={op_id}: _finalize_decision found no journal row")
+    expected_phase = "switched" if guard_row["switch_required"] else "recorded"
+    if guard_row["phase"] != expected_phase:
+        raise ValueError(
+            f"op_id={op_id}: _finalize_decision expects phase="
+            f"{expected_phase!r} but found {guard_row['phase']!r}")
     conn.execute("BEGIN IMMEDIATE")
     try:
         approvals_store.apply_decision(
@@ -1246,8 +1260,20 @@ def _advance_to_decided(
     冪等)。`advance_switch_journal` は段 0 で単調性チェックを獲得したため、
     既に到達済みの phase へ**後方**の advance を投げると ValueError になる
     — ここで到達済み phase をスキップするガードを持ち、その後方 advance
-    自体を発生させない (§5.1-1 (a) の再試行冪等性を壊さない)。"""
-    current_idx = _PHASE_ORDER.index(journal_store.get(conn, op_id)["phase"])
+    自体を発生させない (§5.1-1 (a) の再試行冪等性を壊さない)。
+
+    [switch-ops-hardening] T2 (設計書 §3.2): **入口で終端行を弾く**。
+    終端行を渡されると全 advance が guard でスキップされる一方 `switch_live`
+    は走ってしまい、「approval は pending なのに live だけ新 target へ進み、
+    行は終端なので次回 reconcile も拾わない」という誰も直さない状態が残る
+    (probe 実測)。FS に触る前に落とすのが fail closed。"""
+    entry_row = journal_store.get(conn, op_id)
+    if entry_row is None or entry_row["phase"] in _TERMINAL_PHASES:
+        raise ValueError(
+            f"op_id={op_id}: _advance_to_decided called on a terminal/missing "
+            f"journal row (phase={entry_row['phase'] if entry_row else None}) "
+            "— 新しい操作は新しい journal 行に載せること (設計書 §3.2)")
+    current_idx = _PHASE_ORDER.index(entry_row["phase"])
 
     version_dir = version_store.create_version_dir(
         plugins_root, name, artifact_hash,
