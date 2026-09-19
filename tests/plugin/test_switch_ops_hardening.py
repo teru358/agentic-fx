@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import os
 import shutil
+import stat
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -586,6 +587,59 @@ def test_classifier_refuses_rows_it_does_not_apply_to(tmp_path):
         with pytest.raises(ValueError, match="分類器は"):
             plugin_switch.classify_live(
                 plugins_root, {**base, "phase": phase, "switch_required": required})
+
+
+@pytest.mark.slow
+def test_ac14_0d2a_deployed_outcome_fields(tmp_path, monkeypatch):
+    """段 0 pin (S0-71/72/73): **0d-2a** (journal も live も `switched`) の
+    経路は既存テストが 1 本も通っておらず、`target` を `old_target` に、
+    `status` を `pending` に潰す変異が全て SURVIVED した。
+    設計書 §3.5 の `return` 地点表どおりの値を全フィールド見る。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    # `switch_live` が失敗した後を手で「切替済み」にする = 0d-2a の前提。
+    (plugins_root / "sma").symlink_to(row["new_target"])
+    assert plugin_switch.classify_live(plugins_root, row) == "switched"
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert outcome.outcome == "deployed"
+    assert outcome.op_id == row["op_id"], "その行の op_id を返していない"
+    assert outcome.target == row["new_target"], "target が new_target でない"
+    assert outcome.status == "approved"
+    assert outcome.rolled_back_op_id is None
+    assert outcome.name == "sma"
+    assert _rows(conn) == [(row["op_id"], "decided")]
+    assert _status(conn, row["approval_id"]) == "approved"
+
+
+@pytest.mark.slow
+def test_ac14_0d2a_reverify_failure_reason(tmp_path, monkeypatch):
+    """段 0 pin (S0-72): 0d-2a の再検証失敗は `still_pending(reverify_failed)`。
+    `reason` を別の理由 (`hash_mismatch`) に取り違える変異が SURVIVED した。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    (plugins_root / "sma").symlink_to(row["new_target"])
+    # 参照先の版を消す → `_reverify_switched_journal` が False を返す
+    # (版ディレクトリは read-only で作られるので先に書き込み権を戻す)。
+    version_dir = plugins_root / row["new_target"]
+    for p in [version_dir, *version_dir.rglob("*")]:
+        p.chmod(p.stat().st_mode | stat.S_IWUSR | stat.S_IXUSR)
+    shutil.rmtree(version_dir)
+    # 候補も消す — 残っていると `_reverify_switched_journal` が版を冪等に
+    # 再作成してしまい、この経路に入らない。
+    shutil.rmtree(plugins_root / "_human" / "sma")
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS, activity=_activity(root))
+
+    assert outcome.outcome == "still_pending"
+    assert outcome.reason == "reverify_failed", "再検証失敗の理由が違う"
+    assert outcome.status == "pending"
+    assert _status(conn, row["approval_id"]) == "pending"
 
 
 @pytest.mark.slow
