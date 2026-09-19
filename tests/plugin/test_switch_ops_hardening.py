@@ -198,6 +198,10 @@ def test_ac3_foreign_live_is_never_touched(tmp_path, monkeypatch):
         plugins_root=plugins_root, settings=SETTINGS,
         activity=_activity(root))
     assert outcome.outcome == "foreign_waiting" and outcome.op_id == row["op_id"]
+    # 段 0 pin (S0-69): `status` をリテラル `"approved"` に潰す変異が
+    # SURVIVED した — 決定していないのだから `pending` でなければならない。
+    assert outcome.status == "pending"
+    assert outcome.rolled_back_op_id is None and outcome.target is None
     assert (plugins_root / "sma").readlink() == before
     assert _status(conn, row["approval_id"]) == "pending"
     assert _rows(conn) == [(row["op_id"], "switched")]
