@@ -73,11 +73,26 @@ def _reject_unknown_params(params: dict) -> None:
     **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
     重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
     経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+
+    `params` 自体が dict でない場合、および未知キーの型が混ざっている場合も
+    `TypeError` を漏らさない (3 周目 codex Important)。前者は `params.` 自体
+    を対象とした文言で `ValueError` にする。後者は `str` でないキーをそれ
+    自体不正として扱い (loader は str キーしか通さない契約)、str キーを
+    先に・非 str キーを後に置く決定的な順序で 1 つ選ぶ — 素の `sorted` は
+    型の混ざった集合を比較できず `TypeError` になるため使わない。
     """
-    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if not isinstance(params, dict):
+        raise ValueError(f"params. must be a mapping, got {type(params).__name__}")
+    unknown = sorted(
+        (key for key in params if not isinstance(key, str)
+         or key not in _KNOWN_PARAMS),
+        key=lambda key: (0, key) if isinstance(key, str) else (1, repr(key)),
+    )
     if unknown:
         known = ", ".join(sorted(_KNOWN_PARAMS))
-        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+        first = unknown[0]
+        label = first if isinstance(first, str) else repr(first)
+        raise ValueError(f"params.{label} is not a known parameter, "
                          f"known: {known}")
 
 

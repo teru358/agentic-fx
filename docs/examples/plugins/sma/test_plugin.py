@@ -190,7 +190,29 @@ def test_unknown_params_raise_value_error(params):
     """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
     (R8 / U3) は承認不要なので、`period` のつもりで `perid` と綴りを誤ると
     現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
-    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    他の params 例外と同じく `params.` で始まる。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [None, [], "period", 14])
+def test_non_mapping_params_raise_value_error_not_type_error(params):
+    """**`params` 自体が dict でない場合も `TypeError` を漏らさず
+    `ValueError` にする** (3 周目 codex Important)。`_reject_unknown_params`
+    は `set(params)` を素朴に呼ぶと `set(None)` などが生の `TypeError` に
+    なり、設計書 §4 の「不正な params は `ValueError`」規約を破る。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+@pytest.mark.parametrize("params", [{0: 1, 'typo': 1}, {('a',): 1}])
+def test_unknown_params_with_non_string_keys_raise_value_error_not_type_error(params):
+    """**未知キーの型が混ざっていても `sorted` の `TypeError` を漏らさない**
+    (3 周目 codex Important)。`{0: 1, "typo": 1}` は素の `sorted(set(...))`
+    だと `int` と `str` を比較して `TypeError` になる。`str` でないキーは
+    それ自体が不正 (loader は str キーしか通さない契約) として扱う。
     """
     with pytest.raises(ValueError, match=r"^params\."):
         compute(_mkdf(n=60), params)
