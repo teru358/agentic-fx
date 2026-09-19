@@ -1,4 +1,4 @@
-# [indicator-initial-set] 設計書 v1.3b
+# [indicator-initial-set] 設計書 v1.3c
 
 束: 改善ループが戦略を作るときに `config.yaml` の `indicators:` で宣言できる **標準指標の初期セット (9 本)** を人間が用意する。成果物は `docs/examples/plugins/<名前>/` に置く plugin 3 点セットと、人間が配備するための runbook のみ。**新しいコマンド・新しい機構・新しい自動配備経路は一切作らない。**
 
@@ -210,13 +210,15 @@ strategy を評価するとき、worker は依存 indicator ごとに `df.tail(d
 
 ## 4. 共通契約 (全 9 本の docstring と params 検証)
 
-**モジュール docstring の必須 5 項目** (`rsi_indicator` の 2 項目を拡張):
+**モジュール docstring の必須 6 項目** (`rsi_indicator` の 2 項目を拡張。v1.3c で見出しの計数を本文の項目数に合わせた):
 1. warmup はこの関数の責務。行が足りなくても「返さない」はできない (宣言 `outputs` と完全一致するキー集合が毎回要る)。足りない期間は NaN。消費側は `pd.isna` を見て hold する。
 2. 1d 足のバケット境界は UTC 00:00 (epoch 錨) であり FX の取引日境界 (NY 17:00) ではない。この plugin は `timeframe` を宣言しないので任意の足で使われ得る。
 3. **`max_bars: 400` の意味と、依存する strategy が `max_bars` を 400 以上に宣言すべき理由** (§3.2)。
 4. **純関数であること** — I/O・乱数・実時計・グローバル状態の書き換えは禁止 (サンドボックスが AST で遮断する)。`df` と `params` を書き換えない。
 5. (ichimoku のみ) 先行/遅行スパンの lookahead 規約 (§3.1)。
 6. (`rsi` / `adx` のみ) **値動きの無い期間は中立値になる** — `rsi` は 50、`adx` の `plus_di`/`minus_di` は 0 (→ `adx` も 0 へ収束)。判定は `<= 1e-9·|close|` の相対 ε (§3.2 (i-b))。**strategy 側は「RSI が 50 付近」「DI が 0」を「中立」ではなく「板が動いていない」と読み分けたいなら、`atr` を併せて宣言して自分で判定すること。** 既存 `rsi_indicator` は同じ場面で 100 を返す — 両者を混ぜて使わない。
+
+**`config.yaml` の `params` は `plugin.py` の既定値と一致させる** (v1.3c で明文化、段 0 の実測を受けた指揮者裁定): 9 本の自己テストは `compute(df, {})` (= `plugin.py` の既定値) だけを、受入テスト I2 は `compute(df, dict(meta.params))` (= `config.yaml` の宣言値) だけを通すので、**両者がずれると「自己テストは緑のまま、配備された指標だけ別物」になる**。宣言値は実際に本番で使われる値である。観測は `tests/plugin/test_indicator_initial_set.py::test_declared_params_match_each_plugins_own_defaults` (値の表を持たず、両方の戻り値を全キーで比較する)。
 
 **params の型と範囲の検証**: **例外を投げず、不正なら出力を全 NaN にする**方針は採らない。逆に、**不正な params は `ValueError` で即座に失敗させる**。理由: `params` は loader が JSON-safe 性しか見ない (`loader._check_json_safe`) ので、型・範囲の責任は plugin にある。全 NaN で黙って返すと、strategy 側は「warmup 不足」と区別できず、改善 agent は「系列が全 NaN → `max_bars` を増やす」という誤った申し送りに誘導される (規律 7 の文言がまさにそう指示している)。例外なら worker が `{"ok": false, "error": "ValueError: ..."}` として構造化報告し、self-test / `run_plugin_tests` / bless の pytest ゲートのいずれかで必ず露見する。
 
@@ -482,6 +484,7 @@ I3 / I4 / I9 は各 plugin の `test_plugin.py` の中 (= bless の pytest ゲ�
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-19 | v1.3c | **1 周目レビュー (codex terra 2 束) の処置。設計変更ゼロ — 主張を狭める / 明文化のみ。** ①**§6 I5**: fixture ②「明確な単調トレンド」の**生成式・seed・値域・8 系列の組み合わせ**を逐語で明記 (受入テストに②が無く、持続的 drift での先頭依存を観測できていなかった — 束 2 Important)。②**§6 I8**: 観測の範囲を明記 — 対象は runbook 手順 (1)〜(5) のみで、**(6) の service 再起動とログ目視は手動確認・自動テストの範囲外**。あわせて CLI 境界 (`afx plugin bless --from _human` の rc / stdout / stderr / `UnresolvedJournalError` の traceback) を 観測対象として明記 (束 2 Important。runbook 側にも同じ注記)。③**§4**: docstring 必須項目の見出しが「5 項目」で本文が 6 項目だったのを訂正し、**`config.yaml` の `params` == `plugin.py` の既定値**を 1 行明文化 (段 0 が足した pin の裁定、指揮者裁定で採用済)。なお束 1 Important (9 本の docstring が `max_bars: 400` の根拠を過大に説明) は **plugin 側の記述を設計書 §3.2 に合わせる**是正で、設計書の変更を伴わない | codex 1 周目 `tmp/review-20260919-iis/r1/codex/codex-{1,2}.md` (Critical 0 / Important 4)、2026-09-19 指揮者裁定で 4 件とも採用 | `c734f77` / `5798e05` / `c8eea63` |
 | 2026-09-19 | v1.3b | **観測値の訂正 + 既知の欠落の起票。設計変更は 1 件のみ (下記 ①後段、**指揮者裁定 2026-09-19 で恒久化** — 原因は完全横ばい区間の rolling 標準偏差 (真値 0) の丸め誤差が窓長に依存することで plugin ロジック由来ではなく、退化 fixture の目的は ε 規則の観測であって bollinger の精度ではない。通常 fixture の公差は不変)。** ①**§3.2 (i-b)**: 退化 fixture の `\|Δadx\|` を **5.2e-06 → 4.31e-06** に訂正 (本文・表・§6 I5・§8.3 対応表)。前段データの作り方に依存する**観測値**で、起草時の ad hoc fixture と実装プランの逐語 fixture (プラン T0 / T10 Step 10-c `_degenerate_df`) で値が変わる。**I5 の公差 1e-4 はどちらも覆う**ので結論は不変。ε 掃引表は ε どうしの相対比較なので起草時の値のまま残し、注記で「絶対値として引くのはプランの fixture での 4.31e-06」と明示。あわせて**同じ退化 fixture で `bollinger` の `upper`/`lower` が 1.08e-06 になる** (価格スケール公差 1.5e-7 を超える) ことを §6 I5 に追記し、**退化 fixture にはランダムウォーク用の公差表を当てず `1e-4` を全キーに適用する**とした。**これは受入条件 I5 の緩和なので「設計変更 1 件、暫定・指揮者裁定待ち」として申告する** — 原因は完全横ばい区間の rolling 標準偏差 (真値は厳密 0) が pandas の逐次更新で窓長に依存した丸め誤差を出すことで plugin ロジック由来ではなく、影響は退化 fixture 1 本のみ (ランダムウォーク / スパイクの公差は無変更、実測最大 3.104e-10)。②**§0 R5a / §1 非スコープ**: **配備済 `rsi_indicator` / `rsi_wilder` を退役させる CLI 経路は存在しない** (`retire_plugin` は plain 専用で symlink 配備を拒否、依存 strategy も検査しない) ことを実コードで確認して追記し、**[retire-symlink-deployed-plugin]** の起票文案を追加。本束では新 `rsi` と併存させる | T10 着手前検証 (2026-09-19、`tmp/plan-indicator-initial-set/prevalidation-T10.md`) の実測。プラン v1.0「着手前検証の記録 §8」で指揮者裁定待ちだった 2 件の処置 | — |
 | 2026-09-19 | v1.3a | §0 R5a に**ユーザー見解**を 1 文追記 (0〜100 の尺度では 50 が中立点なので新定義の方が分かりやすい)。**設計変更なし — 既に確定している新 `rsi` の定義の根拠を補強しただけ** | 2026-09-19 ユーザー見解 | — |
 | 2026-09-19 | v1.3 | 設計レビュー r2 の 3 件を全採用 (§8.3 に対応表)。**§3.2** ADX の解析的上界を撤回し上界式を `ema`/`macd`/`atr` に限定、比を取る指標 (`rsi`/`adx`) の退化を実測で再現 (規則なしで Δadx=22.4) して**相対 ε 規則 (1e-9)** を新設、**§3.1/§0 R5a** に既存 `rsi_indicator` との値の差異を明記、**§6 I4** を「固定 fixture の全 160 行の接頭辞一致」へ (主張を狭め + サンプル → 全行、所要 0.53s を実測)、**I9 (入力不変・反復決定性) を新設**、**§6.2 (3)** に観測不能な形の限界、**§6.3** を (A) ゲート前 / (B) ゲート後の 2 系統に分割し収束手段を実コードで確定 (+ I8(c))、**§1** に CLI の `UnresolvedJournalError` 未捕捉の ticket 文案 | codex terra 設計レビュー 2 周目 `tmp/design-indicator-initial-set/codex-design-r2.md` (Critical 0 / Important 3 / Minor 0)、2026-09-19 指揮者裁定で 3 件とも採用 | — |
