@@ -1,4 +1,4 @@
-# [switch-ops-hardening] 実装プラン v1.0 (設計書 = `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` v1.4 準拠)
+# [switch-ops-hardening] 実装プラン v1.1 (設計書 = `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` v1.5 準拠)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (推奨) または superpowers:executing-plans で task ごとに実行すること。Step は
@@ -97,7 +97,8 @@ dependency_locks` も red になった** — 下記「spec と食い違った点
 | AC-16a / AC-16b / AC-6 の変異終点 | T2 | `test_ac16a_entry_guard_...` / `test_ac16a_finalize_guard_...` / `test_ac16b_switch_required_zero_reaches_decided` |
 | AC-1 / AC-3 / AC-6 / AC-7 / AC-8 | T3 | `test_ac1_...` / `test_ac3_...` / `test_ac7_...` / `test_ac8_...` |
 | AC-2 / AC-9a / AC-9b-i/ii/iii / AC-9c | T4 | `test_ac2_...` / `test_ac9a_...` / `test_ac9b_i/ii/iii_...` / `test_ac9c_...` |
-| AC-14a / AC-14b / AC-14c / AC-14d | T5 | `test_ac14d_*` (switch 側) + `tests/test_commands.py` の追記 |
+| **AC-14d / AC-14a の switch 側** | **T3** (v1.1 で T5 から移動) | `test_ac14d_no_bare_return_in_approval_entrypoints` / `test_ac14d_outcomes_are_known_enum_values` / `test_ac14d_still_pending_on_missing_candidate` / `test_ac14a_already_decided_status_comes_from_the_row` |
+| AC-14a / AC-14b / AC-14c (シェル側) | T5 | `tests/test_commands.py` の追記 (付録 D-1) |
 | AC-10 / AC-11 | T6 | `test_runbook_cli_bless_after_post_gate_failure_raises_traceback` (書き換え) / `test_plugin_materialize_containment_error_is_rc1_message` |
 | AC-12a/b/c / AC-13 | T7 | `tests/test_commands.py` の `approval list` 群 |
 | AC-15 | T8 | フルスイート |
@@ -105,15 +106,18 @@ dependency_locks` も red になった** — 下記「spec と食い違った点
 ## task 依存図
 
 ```
-T1 (分類器 + reconcile 載せ替え、挙動不変)
+T1 (分類器 + ApprovalOutcome の型を置く、挙動不変)
  │
  ├─► T2 (2 段 phase ガード)            ← T1 の _TERMINAL_PHASES を使う
  │    │
- │    └─► T3 (0d 案 C)                 ← 分類器 + 入口ガードの両方に依存
+ │    └─► T3 (0d 案 C + outcome 戻り値) ← 分類器 + 入口ガードの両方に依存
+ │         │                             **v1.1 訂正**: 案 C の受入テストが
+ │         │                             戻り値を assert するので、outcome を
+ │         │                             返す変更は T5 ではなく T3 に属する
  │         │
  │         └─► T4 (reconcile の lock + 再読)   ← T3 の完成形と競合させる
  │              │
- │              └─► T5 (outcome 戻り値 + シェルの文言 + spy 書き換え)
+ │              └─► T5 (**commands.py のみ** — シェルの文言 + spy 書き換え)
  │
  ├─► T6 (CLI の except)        ← switch.py を触らない。T1〜T5 と**並列可**
  └─► T7 (approval list)        ← commands.py の別メソッド。T5 と同ファイルなので
@@ -138,7 +142,9 @@ T8 (runbook / 設計書追記 / フルスイート)   ← 全 task の後
       本文末尾の「新規テストファイル (完成形)」から
       `test_ac5_classifier_compares_the_raw_readlink_string` と
       `test_classifier_refuses_rows_it_does_not_apply_to` を転写する
-- [ ] red を確認する: **予測は** `AttributeError: module 'agentic_fx.plugin.switch' has no attribute 'classify_live'` (起草時は未実走 — 実際の最終行をここに貼ること)
+- [ ] red を確認する (**着手前検証で実走、逐語**):
+      `E       AttributeError: module 'agentic_fx.plugin.switch' has no attribute 'classify_live'`
+      → `2 failed in 0.51s` (`test_ac5_...` / `test_classifier_refuses_...` の 2 本)
 
 ```
 uv run pytest tests/plugin/test_switch_ops_hardening.py -q
@@ -221,7 +227,7 @@ task ごとの diff が重なり、逐語転写と機械 diff が成立しない
 |---|---|---|---|---|
 | T1-M1 | `switch.py` / `classify_live` | `live_target = live.readlink().as_posix() if live.is_symlink() else None` | `live_target = (live.resolve().relative_to(plugins_root.resolve()).as_posix() if live.is_symlink() else None)` | `test_ac5_classifier_compares_the_raw_readlink_string` |
 | T1-M2 | `switch.py` / `classify_live` | `if row["phase"] != "switched" or not row["switch_required"]:` | `if False:` | `test_classifier_refuses_rows_it_does_not_apply_to` |
-| T1-M3 ★未実測 | `switch.py` / `classify_live` | `        return "not_switched"` (`old_kind == "absent"` の枝を含む `if` の本体) | `        return "foreign"` | `tests/plugin/test_switch_journal.py::test_switched_recovery_absent_old_kind_with_no_live_reverts` (**T4 で reconcile が分類器を使うようになってから有効** — T1 時点では分類器が誰からも呼ばれないので無効変異。T4 の Step 4-d で回す) |
+| T1-M3 (**KILLED**、着手前検証で実走) | `switch.py` / `classify_live` | `        return "not_switched"` (`old_kind == "absent"` の枝を含む `if` の本体) | `        return "foreign"` | `tests/plugin/test_switch_journal.py::test_switched_recovery_absent_old_kind_with_no_live_reverts` (**T4 で reconcile が分類器を使うようになってから有効** — T1 時点では分類器が誰からも呼ばれないので無効変異。T4 の Step 4-d で回す) |
 
 - [ ] T1-M1 / T1-M2 が red になることを確認し、**`cp` 退避から復元**する (`git checkout` 不可)
 - [ ] T1-M3 は T4 へ繰り越す (T1 時点では無効変異)
@@ -243,7 +249,11 @@ task ごとの diff が重なり、逐語転写と機械 diff が成立しない
 - [ ] `test_ac16a_entry_guard_refuses_terminal_row_before_touching_fs` /
       `test_ac16a_finalize_guard_refuses_wrong_phase` /
       `test_ac16b_switch_required_zero_reaches_decided` を転写する
-- [ ] red を確認する: **予測は** `Failed: DID NOT RAISE <class 'ValueError'>` (起草時は未実走 — 実際の最終行をここに貼ること)
+- [ ] red を確認する (**着手前検証で実走、逐語**): `E       Failed: DID NOT RAISE ValueError`
+      → `2 failed, 3 passed in 5.42s`。**red は 3 本中 2 本だけ** —
+      `test_ac16b_switch_required_zero_reaches_decided` は**ガード導入前から緑**
+      (`switch_required=0` の正規経路を pin するテストなので当然。このテストは
+      「ガードを常に `switched` 期待にする」fail open 変異 T2-M2 の killer として働く)
 
 ### Step 2-b: 実装を転写する
 
@@ -259,27 +269,52 @@ task ごとの diff が重なり、逐語転写と機械 diff が成立しない
 | T2-M1 | `if entry_row is None or entry_row["phase"] in _TERMINAL_PHASES:` | `if False:` | `test_ac16a_entry_guard_refuses_terminal_row_before_touching_fs` |
 | T2-M2 | `expected_phase = "switched" if guard_row["switch_required"] else "recorded"` | `expected_phase = "switched"` | `test_ac16b_switch_required_zero_reaches_decided` |
 | T2-M3 | 同上 | `expected_phase = guard_row["phase"]` | `test_ac16a_finalize_guard_refuses_wrong_phase` |
-| T2-M4 ★未実測 | `_finalize_decision` の `guard_row` ブロック全体 | 削除 | `test_ac16a_finalize_guard_refuses_wrong_phase` |
+| T2-M4 (**KILLED**、着手前検証で実走) | `_finalize_decision` の `guard_row` ブロック全体 | 削除 | `test_ac16a_finalize_guard_refuses_wrong_phase` |
 
 - [ ] commit: `feat(switch-ops): _advance_to_decided 入口と _finalize_decision の 2 段 phase ガード (T2、設計書 §3.2)`
 
 ---
 
-## T3: 0d の案 C (`switched` 行の retry を配備まで完了させる)
+## T3: 0d の案 C + **lock 内 outcome の戻り値** (v1.1 で範囲を訂正)
 
-**担当**: 設計書 §3.2 の 0d-1 / 0d-2a / 0d-2b / 0d-2c。**本束の中心**。
+**担当**: 設計書 §3.2 の 0d-1 / 0d-2a / 0d-2b / 0d-2c **と §3.5 の `switch.py` 側**
+(`approve_candidate` / `retry_approval` が `ApprovalOutcome` を返す)。**本束の中心**。
+案 C と「lock 内で確定した outcome を返す」は**同じ 1 つの挙動変更**なので 1 task にまとめる
+(v1.0 は T3 / T5 に割っていたが、T3 の受入テストが戻り値を assert するため中間段が
+green にならないことを着手前検証で実測した)。
 
 ### Step 3-a: テストファイルを完成させて red を確認する
 
-- [ ] `tests/plugin/test_switch_ops_hardening.py` を**末尾の完成形どおりに**仕上げる
-      (T1 / T2 の分も含む)。**機械 diff で一致を確認する**
-- [ ] red を確認する: **予測は** `live.is_symlink()` が False になる `AssertionError`
-      (現行は未配備のまま approved)。**起草時は未実走** — 実際の最終行をここに貼ること
+- [ ] **v1.1 訂正**: 付録 C の完成形のうち、**T4 の 6 本を除いた 13 本**を置く
+      (T1 の 2 本 + T2 の 3 本 + 本 task の `test_ac1` / `test_ac3` / `test_ac7` / `test_ac8` +
+      **`test_ac14d_no_bare_return_in_approval_entrypoints` /
+      `test_ac14d_outcomes_are_known_enum_values` /
+      `test_ac14d_still_pending_on_missing_candidate` /
+      `test_ac14a_already_decided_status_comes_from_the_row`**)。
+      除くのは `test_ac2_*` / `test_ac9a_*` / `test_ac9b_i/ii/iii_*` / `test_ac9c_*` の 6 本で、
+      これは **T4 の Step 4-a で足してファイルを完成形にする**。
+      v1.0 は「ここで完成形どおりに仕上げる」と書いていたが、それだと T4 の 6 本が
+      T3 で red のまま残り、Step 4-a の「完成形のファイルに既に含まれている」と矛盾する
+      (着手前検証で実測)。**転写後は機械 diff で一致を確認する**
+- [ ] red を確認する (**着手前検証で実走、訂正後の分割で測り直した値**):
+      `E       AssertionError: assert False` / `E        +  where False = is_symlink()`
+      (`test_ac1`)、`E           Failed: DID NOT RAISE OSError` (`test_ac7`)、
+      `E       FileNotFoundError: [Errno 2] No such file or directory: '.../plugins/sma'` (`test_ac8`)、
+      `E           AssertionError: approve_candidate: outcome を返さない return が [1631, 1605, ...] 行目にある` (`test_ac14d_no_bare_return_*`)、
+      `E       AttributeError: 'NoneType' object has no attribute 'outcome'` (`test_ac14a_*` ほか)
+      → **`8 failed, 5 passed in 14.12s`** (13 本中 8 本が red。緑の 5 本 = T1 の 2 本 + T2 の 3 本)。
+      *参考: v1.0 の分割 (戻り値 8 hunk と 4 本が T5 だった形) では `4 failed, 5 passed in 10.37s`*
 
 ### Step 3-b: 実装を転写する
 
-- [ ] 下の diff の **T3 部分** (0d の `live_class` 分岐、`rolled_back_op_id` の導入、
-      `_close_own_unfinished_journal_if_any` のコメント更新) を当てる
+- [ ] 付録 A の **T3 部分**を当てる。**v1.1 訂正で 3 hunk → 11 hunk**:
+      - 案 C 本体 = `@@ -1439,6` (`rolled_back_op_id` の導入) / `@@ -1447,13` (0d の
+        `live_class` 分岐) / `@@ -1477,8` (`_close_own_unfinished_journal_if_any` のコメント)
+      - **outcome 戻り値** (v1.0 では T5 だった 8 hunk) = `@@ -1366,7` / `@@ -1398,7` /
+        `@@ -1414,7` / `@@ -1500,7` / `@@ -1517,12` / `@@ -1548,7` / `@@ -1568,6` / `@@ -1642,16`
+      - 理由: `test_ac1` / `test_ac3` / `test_ac8` は `retry_approval` の**戻り値**を assert する。
+        戻り値の配線が無いと `AttributeError: 'NoneType' object has no attribute 'outcome'` で
+        red のまま残る (着手前検証で実測: `3 failed, 6 passed`)
 - [ ] **`op_id = None` のリセットを落とさない** — 落とすと停止行の `reverted` が
       上書きされ、T2 の入口ガードで `ValueError` になる (設計書 AC-6)
 
@@ -290,8 +325,15 @@ uv run pytest tests/plugin/test_switch_ops_hardening.py -q
 uv run pytest tests/plugin/test_switch_paths.py tests/plugin/test_switch_journal.py -q
 ```
 
-- [ ] `tests/plugin/test_indicator_initial_set.py::test_runbook_post_gate_failure_converges_via_approval_retry`
-      が red になる (**想定内 — 書き換え対象 1 本目**)。本文末尾の書き換え後の形へ直す
+- [ ] green の実測値 (訂正後の分割): **`13 passed in 14.28s`**。この時点の既存テスト群
+      (`tests/plugin tests/test_commands.py tests/backtest/test_cli.py tests/test_service_app.py`) は
+      **`925 passed, 1 deselected, 0 failed in 229.45s`** — **1 本も壊れない**
+
+- [ ] **訂正 (v1.1、着手前検証で実測)**: `tests/plugin/test_indicator_initial_set.py::
+      test_runbook_post_gate_failure_converges_via_approval_retry` は **T3 では red にならない**
+      (この task は `commands.py` を触らないので、シェルの戻り文言 `approval #N を再試行しました` が
+      そのまま成立する)。この書き換えは **T5 の材料**に移した (付録 F-1)。T3 時点の
+      `tests/plugin` は**この 1 本も含めて無改変で緑**
 
 ### Step 3-d: 逆変異
 
@@ -300,8 +342,8 @@ uv run pytest tests/plugin/test_switch_paths.py tests/plugin/test_switch_journal
 | T3-M1 (8 月設計書の変異「`switched` の復旧を常に完遂にする」を 0d に注ぐ) | `live_class = classify_live(plugins_root, existing_journal)` | `live_class = "switched"` | `test_ac1_retry_of_switched_but_unswitched_deploys` |
 | T3-M2 | `rolled_back_op_id = op_id` + 次行 `op_id = None` | `rolled_back_op_id = op_id` のみ (`op_id = None` を削る) | `test_ac1_retry_of_switched_but_unswitched_deploys` |
 | T3-M3 | `if live_class == "foreign":` | `if False:` | `test_ac3_foreign_live_is_never_touched` |
-| T3-M4 ★未実測 | `_revert_one(conn, existing_journal, ...)` (0d-2c) | 削除 (巻き戻さずに新規経路へ) | `test_ac1_...` (旧行が `switched` のまま残り UNIQUE index に当たる) |
-| T3-M5 ★未実測 | `return "foreign"` (`classify_live`) | `return "not_switched"` | `test_ac3_foreign_live_is_never_touched` |
+| T3-M4 (**KILLED**、着手前検証で実走) | `_revert_one(conn, existing_journal, ...)` (0d-2c) | 削除 (巻き戻さずに新規経路へ) | `test_ac1_...` (旧行が `switched` のまま残り UNIQUE index に当たる) |
+| T3-M5 (**KILLED**、着手前検証で実走) | `return "foreign"` (`classify_live`) | `return "not_switched"` | `test_ac3_foreign_live_is_never_touched` |
 
 - [ ] commit: `feat(switch-ops): 0d の switched 行を分類して巻き戻し + 頭から再実行する (T3、設計書 §3.2 案 C)`
 
@@ -313,9 +355,17 @@ uv run pytest tests/plugin/test_switch_paths.py tests/plugin/test_switch_journal
 
 ### Step 4-a: テストを置いて red を確認する
 
-- [ ] `test_ac2_...` / `test_ac9a_...` / `test_ac9b_i/ii/iii_...` / `test_ac9c_...` を転写する
-      (完成形のファイルに既に含まれている)
-- [ ] red を確認する: **予測は** `AssertionError: 巻き戻しは lock の内側で行われていない` (起草時は未実走)
+- [ ] `test_ac2_...` / `test_ac9a_...` / `test_ac9b_i/ii/iii_...` / `test_ac9c_...` の **6 本を足して
+      `tests/plugin/test_switch_ops_hardening.py` を付録 C の完成形にする** (v1.1 訂正 —
+      v1.0 は「完成形のファイルに既に含まれている」と書いていたが、完成形を T3 で置くと
+      この 6 本が T3 で red のまま残る)。**機械 diff で完成形との一致を確認する**
+- [ ] red を確認する (**着手前検証で実走、逐語**):
+      `E       AssertionError: 巻き戻しは lock の内側で行われていない` /
+      `E       AssertionError: 第三者の symlink を消してはならない` /
+      `E       AssertionError: stale 行で巻き戻され、配備が消えた (IV-3 の破れ)`
+      → **`5 failed, 14 passed in 21.58s`** (訂正後の分割。red は T4 の 6 本のうち
+      `test_ac2_*` を除く 5 本 — `test_ac2` は T3 の実装だけで緑になる)。
+      *参考: v1.0 の分割では `8 failed, 26 passed in 18.12s`*
 
 ### Step 4-b: 実装を転写する
 
@@ -368,9 +418,11 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 
 ### Step 4-c: green
 
+- [ ] green の実測値 (訂正後の分割): **`19 passed in 21.76s`** (付録 C の 19 本が全て緑)
 - [ ] `tests/plugin/test_reconcile.py::test_reconcile_resolution_holds_the_dependency_locks`
       が red になる (**想定内 — 書き換え対象 2 本目**。pin 破れの巻き戻しに lock が
-      1 本増えるため)。末尾の書き換え後の形へ直す
+      1 本増えるため)。付録 G の書き換え後の形へ直す → **`38 passed in 21.66s`**
+- [ ] この時点の既存テスト群: **`931 passed, 1 deselected, 0 failed in 244.46s`**
 
 ### Step 4-d: 逆変異
 
@@ -380,37 +432,45 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 | T4-M2 | `if expect_class is not None:` | `if False:` | `test_ac9b_ii_live_changed_phase_same` |
 | T4-M3 | `with _plugin_lock(plugins_root, row["name"]):` (`_revert_under_lock`) | `if True:` | `test_ac9a_reconcile_revert_holds_the_plugin_lock` |
 | T4-M4 | `if fresh is None or phase_now in _TERMINAL_PHASES or phase_now != row["phase"]:` | `if fresh is None:` | `test_ac9b_iii_phase_changed_live_same` |
-| T4-M5 ★未実測 | force revert 分岐の `_revert_under_lock(..., expect_class=None)` | `_revert_one(conn, row, ...)` + `conn.commit()` (旧実装) | `test_ac9c_force_revert_takes_the_lock_and_refetches` |
+| T4-M5 (**KILLED**、着手前検証で実走) | force revert 分岐の `_revert_under_lock(..., expect_class=None)` | `_revert_one(conn, row, ...)` + `conn.commit()` (旧実装) | `test_ac9c_force_revert_takes_the_lock_and_refetches` |
 
 - [ ] commit: `feat(switch-ops): reconcile の巻き戻し 3 箇所に lock + 行/分類の再読を入れる (T4、設計書 §3.3)`
 
 ---
 
-## T5: outcome 戻り値 + シェルの結果報告
+## T5: シェルの結果報告 (**commands.py のみ**、v1.1 で範囲を訂正)
 
-**担当**: 設計書 §3.5。`approve_candidate` / `retry_approval` が **lock 内で確定した**
-`ApprovalOutcome` を返し、シェルはそれを文言に写すだけにする。
+**担当**: 設計書 §3.5 のうち**シェル側**。`approve_candidate` / `retry_approval` が
+**lock 内で確定した** `ApprovalOutcome` を返す部分 (`switch.py`) は **T3 に移った** ので、
+この task はシェルがそれを文言に写すところだけを担当する。
+**File Structure の `switch.py` 欄の「T1〜T5」は、訂正後は「T1〜T4」と読むこと。**
 
 ### Step 5-a: テストを置いて red を確認する
 
-- [ ] `test_ac14d_no_bare_return_in_approval_entrypoints` /
-      `test_ac14d_outcomes_are_known_enum_values` /
-      `test_ac14d_still_pending_on_missing_candidate` (switch 側) と、
-      `tests/test_commands.py` への追記 (末尾の「`tests/test_commands.py` への追記」) を置く
-- [ ] red を確認する (**起草時に実走した唯一の red、逐語**):
+- [ ] **v1.1 訂正: switch 側の `test_ac14d_*` / `test_ac14a_*` は T3 へ移った。**
+      この task で置くのは (a) **付録 D-1** (`tests/test_commands.py` の spy 書き換え +
+      retry の結果報告 7 本) と (b) **付録 F-1** (`tests/plugin/test_indicator_initial_set.py::
+      test_runbook_post_gate_failure_converges_via_approval_retry` の書き換え —
+      **v1.0 は T3 と書いていたが、T3 では red にならないことを実測した**) の 2 つだけ
+- [ ] red を確認する (**起草時 + 着手前検証の両方で実走、逐語**):
       `assert '再試行' in "エラー: AttributeError: 'NoneType' object has no attribute 'outcome'"`
+      → **`11 failed, 70 passed in 45.92s`** (訂正後の分割。`tests/test_commands.py` の 10 本 +
+      `tests/plugin/test_indicator_initial_set.py::test_runbook_post_gate_failure_converges_via_approval_retry`)。
+      *参考: v1.0 の分割 (switch 側の 4 本も T5 に居た形) では `18 failed, 82 passed in 66.95s`*
 
 ### Step 5-b: 実装を転写する
 
-- [ ] 下の diff の **T5 部分** (`approve_candidate` の全 `return` を `ApprovalOutcome` に、
-      `retry_approval` の透過、`commands.py` の `_retry_outcome_text`) を当てる
+- [ ] **v1.1 訂正: この task は `commands.py` しか触らない。** 当てるのは **付録 B-1**
+      (`outcome` の受け取り + `_retry_outcome_text`) だけ。`switch.py` の
+      `ApprovalOutcome` 戻り値は **T3 で入っている**
 - [ ] **AST 検査は入れ子関数を除外する** — `_close_own_unfinished_journal_if_any` は
-      内部 helper なので bare `return` を持ってよい (テスト側の `_walk_own_body` が担保)
+      内部 helper なので bare `return` を持ってよい (テスト側の `_walk_own_body` が担保。
+      **この受入条件のテストは T3 にある**、設計書 AC-14d の但し書き)
 
 ### Step 5-c: green + 既存 spy の書き換え
 
 - [ ] `tests/test_commands.py::test_approval_retry_dispatches_to_switch_retry_approval`
-      が red になる (**想定内 — 書き換え対象 3 本目**)。spy が `None` を返す
+      が red になる (**想定内 — 書き換え対象 3 本目**。付録 D-1 に含まれる)。spy が `None` を返す
       「実物より緩い fake」なので、**実物と同じ `ApprovalOutcome` を返す**よう直す
       ([[test-fixtures-from-real-transcripts]])
 
@@ -422,10 +482,12 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 | T5-M2 | `switch.py` | `outcome=("deployed_after_rollback" if rolled_back_op_id is not None else "deployed")` | `outcome="deployed"` | `test_ac1_retry_of_switched_but_unswitched_deploys` |
 | T5-M3 | `commands.py` | `raise ValueError(f"unknown approval outcome: {kind!r}")` | `return "結果を判別できませんでした"` | `test_approval_retry_fails_loud_on_unknown_enum_value` |
 | T5-M4 | `commands.py` | `f"{self._retry_outcome_text(outcome)}"` | `"再試行しました"` (固定文言に戻す) | `test_approval_retry_reports_the_locked_outcome` |
-| T5-M5 ★未実測 | `commands.py` | `outcome = plugin_switch.retry_approval(...)` の受け取り | 受け取らず lock 外で `status` を読み直す (v1.1 の案) | `test_approval_retry_message_unaffected_by_later_deployment` |
+| T5-M5 (**KILLED**、着手前検証で実走) | `commands.py` | `outcome = plugin_switch.retry_approval(...)` の受け取り | 受け取りはするが**文言を lock の外で FS から作り直す** (v1.1 の案を適用可能な形に具体化 — `return (f"approval #{approval_id} を再試行しました: " f"{self._retry_outcome_text(outcome)}")` を `_live = self.plugins_root / outcome.name` → `_t = _live.readlink().as_posix() if _live.is_symlink() else None` → `return (f"approval #{approval_id} を再試行しました: " f"配備まで完了しました (plugins/{outcome.name} → {_t})")` に置換) | `test_approval_retry_message_unaffected_by_later_deployment` |
 | T5-M6 | `switch.py` | `status=row["status"]` (`already_decided`) | `status="approved"` | `test_approval_retry_reports_the_locked_outcome[already_decided]` |
 
-- [ ] commit: `feat(switch-ops): approve/retry が lock 内 outcome を返し、シェルはそれを写す (T5、設計書 §3.5)`
+- [ ] green の実測値 (訂正後の分割): **`81 passed in 47.16s`**。この時点の既存テスト群は
+      **`941 passed, 1 deselected, 0 failed in 234.32s`**
+- [ ] commit: `feat(switch-ops): シェルが lock 内 outcome を文言に写す (T5、設計書 §3.5)`
 
 ---
 
@@ -439,14 +501,16 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
       を追記する (末尾の「`tests/backtest/test_cli.py` への追記」)
 - [ ] `tests/plugin/test_indicator_initial_set.py::test_runbook_cli_bless_after_post_gate_failure_raises_traceback`
       を**書き換え後の形**に直す (**書き換え対象 4 本目**)
-- [ ] red を確認する: **予測は** materialize 側が `assert 0 == 1`、bless 側が
-      `UnresolvedJournalError` の素通り (起草時は未実走)
+- [ ] red を確認する (**着手前検証で実走、逐語**):
+      `E       ValueError: materialize_plugin: live symlink target escapes plugins_root: /x` (materialize 側) /
+      `E               agentic_fx.plugin.switch.UnresolvedJournalError: plugin 'sma': an unresolved switch journal (op_id=1, approval_id=1) blocks bless — resolve it first (reconcile or approval retry)` (bless 側の素通り)
+      → `2 failed, 83 passed in 58.69s`
 
 ### Step 6-b: 実装を転写する
 
 ```diff path=src/agentic_fx/backtest/cli.py
---- src/agentic_fx/backtest/cli.py	2026-09-19 09:51:24.688601735 +0900
-+++ /tmp/claude-1000/-home-teru358-project-agentic-fx/979685bc-4fba-4bc5-8819-9a254e15ca67/scratchpad/overlay/agentic_fx/backtest/cli.py	2026-09-19 20:35:39.524595908 +0900
+--- src/agentic_fx/backtest/cli.py
++++ src/agentic_fx/backtest/cli.py
 @@ -586,6 +586,17 @@
              conn, name=args.name, human_dir=human_dir, settings=settings,
              now=datetime.now(timezone.utc), decided_by="human_cli",
@@ -486,7 +550,7 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 | T6-M1 | `except plugin_switch.UnresolvedJournalError as e:` | (この except 節ごと削除) | `test_runbook_cli_bless_after_post_gate_failure_raises_traceback` |
 | T6-M2 | `except (FileExistsError, FileNotFoundError, OSError, ValueError) as e:` | `except (FileExistsError, FileNotFoundError, OSError) as e:` | `test_plugin_materialize_containment_error_is_rc1_message` |
 | T6-M3 | `print(f"エラー: {e}\n  収束手順: ...")` | `print(f"エラー: {e}")` (次の 1 手を落とす) | `test_runbook_cli_bless_...` (`assert "approval retry" in err2`) |
-| T6-M4 ★未実測 | `return 1` (bless の新 except) | `return 0` | 同上 (`assert rc2 == 1`) |
+| T6-M4 (**KILLED**、着手前検証で実走) | `return 1` (bless の新 except) | `return 0` | 同上 (`assert rc2 == 1`) |
 
 - [ ] commit: `fix(switch-ops): afx plugin bless / materialize の例外を retire と同じ作法に揃える (T6、設計書 §3.4)`
 
@@ -499,7 +563,9 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 ### Step 7-a: テストを置いて red を確認する
 
 - [ ] `tests/test_commands.py` に `approval list` 群 (AC-12a/b/c、AC-13) を追記する
-- [ ] red を確認する: **予測は** `assert out == "承認待ちはありません"` が `_HELP` と比較されて失敗 (起草時は未実走)
+- [ ] red を確認する (**着手前検証で実走**): `approval list` が `_HELP` に落ちるため
+      `assert out == "承認待ちはありません"` が `'コマンド一覧:\n  status ...'` と比較されて失敗
+      → `5 failed, 63 passed in 2.79s`
 
 ### Step 7-b: 実装を転写する
 
@@ -537,8 +603,8 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 ## 付録 A: `switch.py` の完全な差分 (T1〜T5、適用可能な形)
 
 ```diff path=src/agentic_fx/plugin/switch.py
---- src/agentic_fx/plugin/switch.py	2026-09-19 09:51:24.692601971 +0900
-+++ /tmp/claude-1000/-home-teru358-project-agentic-fx/979685bc-4fba-4bc5-8819-9a254e15ca67/scratchpad/overlay/agentic_fx/plugin/switch.py	2026-09-19 20:35:36.463723703 +0900
+--- src/agentic_fx/plugin/switch.py
++++ src/agentic_fx/plugin/switch.py
 @@ -10,6 +10,7 @@
  import shutil
  import sqlite3
@@ -939,20 +1005,64 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
  def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
 ```
 
-## 付録 B: `commands.py` の完全な差分 (T5・T7)
+**hunk → task の割り当て (v1.1、着手前検証で 1 task ずつ実走して確定)**
+
+| hunk (`@@` 行) | 内容 | task |
+|---|---|---|
+| `@@ -10,6` | `from dataclasses import dataclass` | T1 |
+| `@@ -36,6` | `_TERMINAL_PHASES` / `APPROVAL_OUTCOMES` / `ApprovalOutcome` / `classify_live` | T1 |
+| `@@ -1165,7` | `_finalize_decision` の `guard_row` ブロック | T2 |
+| `@@ -1192,8` | `_advance_to_decided` の `entry_row` ブロック | T2 |
+| `@@ -1439,6` | `rolled_back_op_id = None` | T3 |
+| `@@ -1447,13` | 0d の `live_class` 分岐 (案 C 本体) | T3 |
+| `@@ -1477,8` | `_close_own_unfinished_journal_if_any` のコメント更新 | T3 |
+| `@@ -1366,7` / `@@ -1398,7` / `@@ -1414,7` / `@@ -1500,7` / `@@ -1517,12` / `@@ -1548,7` / `@@ -1568,6` / `@@ -1642,16` | `approve_candidate` / `retry_approval` の `ApprovalOutcome` 戻り値 (8 hunk) | **T3** (v1.1 で T5 から移動 — 下記) |
+| `@@ -141,6` | `_revert_under_lock` の新設 | T4 |
+| `@@ -171,8` / `@@ -181,11` / `@@ -200,9` / `@@ -221,9` | reconcile の載せ替えと巻き戻し 3 箇所 | T4 |
+
+**v1.1 の訂正 — T3 / T4 の分割は v1.0 のままでは成立しない (実測)**
+
+着手前検証で T1 → T7 を 1 task ずつ当てたところ、**T3 の green が取れなかった**
+(`3 failed, 6 passed`)。原因は分割の欠陥で、設計の欠陥ではない:
+
+- T3 の受入テスト `test_ac1` / `test_ac3` / `test_ac8` は
+  `outcome = plugin_switch.retry_approval(...)` の**戻り値**を assert する。
+  `retry_approval` が `ApprovalOutcome` を返すのは付録 A の `@@ -1642,16` (v1.0 では T5) なので、
+  T3 単独では `AttributeError: 'NoneType' object has no attribute 'outcome'` になる。
+  **構造的な assert (journal 2 行 / live symlink / approval approved) はすべて緑**であり、
+  **T3 の実装自体は正しい** — 足りないのは戻り値の配線だけ。
+- 同じ 3 本が T4 の green でも red のまま残る (`4 failed, 30 passed`)。
+
+**訂正**: 付録 A の `approve_candidate` / `retry_approval` の戻り値 8 hunk
+(`@@ -1366,7` / `@@ -1398,7` / `@@ -1414,7` / `@@ -1500,7` / `@@ -1517,12` / `@@ -1548,7` /
+`@@ -1568,6` / `@@ -1642,16`) と、付録 C の **`test_ac14d_no_bare_return_in_approval_entrypoints` /
+`test_ac14d_outcomes_are_known_enum_values` / `test_ac14d_still_pending_on_missing_candidate` /
+`test_ac14a_already_decided_status_comes_from_the_row` の 4 本**を **T3 へ移す**。
+これにより **T5 は `commands.py` だけの task** (付録 B-1 + 付録 D-1 + 付録 F-1) になる。
+案 C と「lock 内で確定した outcome を返す」は**同じ 1 つの挙動変更**なので、この形が設計にも忠実。
+
+**訂正後の実測** (worktree `soh-preflight` の `soh-t3split` ブランチ、T2 の commit から):
+
+```
+T3 (訂正後) の新規テスト                   : 9 passed in 10.65s
+T3 (訂正後) + T4/T5 のテストも置いた場合   : 14 passed, 5 failed (T4 の lock 系 5 本のみ = 正しい red)
+T3 (訂正後) の既存テスト群                 : 925 passed, 1 deselected, 0 failed in 229.45s
+```
+
+
+
+## 付録 B-1: `commands.py` の差分 — **T5 部分のみ** (retry の結果報告)
+
+**v1.1 で分割**: v1.0 の付録 B は 1 本の完全差分で、`@@ -144,13` の中に T5 の `outcome =` 受け取りと
+T7 の `approval list` dispatch が、`@@ -342,6` の中に `_retry_outcome_text` (T5) と
+`_approval_list` / `_open_journal_lines` (T7) が**同じ hunk に同居**していた。そのままでは
+**T5 を当てると T7 の実装まで入ってしまい T7 の red が取れない**ので、機械的に 2 本へ割った
+(B-1 → B-2 の順に当てると v1.0 の付録 B と**バイト一致**することを確認済)。
 
 ```diff path=src/agentic_fx/commands.py
---- src/agentic_fx/commands.py	2026-09-19 09:51:24.688601735 +0900
-+++ /tmp/claude-1000/-home-teru358-project-agentic-fx/979685bc-4fba-4bc5-8819-9a254e15ca67/scratchpad/overlay/agentic_fx/commands.py	2026-09-19 20:35:43.544031758 +0900
-@@ -23,6 +23,7 @@
-   ask <質問>                  臨時 Mission (回答専用 — 発注はしない)
-   approve <id> / reject <id> [理由]   承認操作
-   approval <id>               承認申請の詳細 (in_sample/holdout 成績を含む)
-+  approval list [n]          承認待ちの一覧 (+ 未終端の切替ジャーナル)
-   approval retry <id>        承認手順を頭から再試行 (§5.3 契機③)
-   killswitch reset           kill switch ラッチの解除 (人間の明示操作)
-   reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
-@@ -144,13 +145,25 @@
+--- src/agentic_fx/commands.py
++++ src/agentic_fx/commands.py
+@@ -144,13 +144,20 @@
                      return "approval retry backend (plugins_root/settings) が未配線です"
                  from agentic_fx.plugin import switch as plugin_switch
                  approval_id = int(args[1])
@@ -972,21 +1082,13 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 -                return f"approval #{approval_id} を再試行しました"
 +                return (f"approval #{approval_id} を再試行しました: "
 +                        f"{self._retry_outcome_text(outcome)}")
-+            if cmd == "approval" and args and args[0] == "list" and len(args) <= 2:
-+                # [switch-ops-hardening] T7 (設計書 §3.5): `approval retry <id>`
-+                # の id を知るための一覧。**holdout / in_sample の数値は出さない**
-+                # (詳細は `approval <id>`)。
-+                return self._approval_list(args[1] if len(args) == 2 else None)
              if cmd == "approval" and len(args) == 1 and args[0].isdigit():
                  # [approval-payload-missing-gate-metrics] 是正 (A4 10 回目
                  # claude #69 観測 A、2026-09-11): approve/reject する前に
-@@ -342,6 +355,84 @@
+@@ -342,6 +349,30 @@
                     for pair, metrics in value.items()]
          return [cls._metrics_line(prefix, None)]
  
-+    _APPROVAL_LIST_DEFAULT = 20
-+    _APPROVAL_LIST_MAX = 200
-+
 +    def _retry_outcome_text(self, outcome) -> str:
 +        """[switch-ops-hardening] T5: `ApprovalOutcome` を文言に写す。
 +        未知 / None はここで `ValueError` になり、`dispatch` の包括 `except`
@@ -1011,6 +1113,50 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 +            return f"この承認は既に決着しています (status={outcome.status})"
 +        raise ValueError(f"unknown approval outcome: {kind!r}")
 +
+     def _approval_detail(self, approval_id: int) -> str:
+         row = self.conn.execute(
+             "SELECT kind, status, payload_json, reason, decided_by, "
+```
+
+## 付録 B-2: `commands.py` の差分 — **T7 部分のみ** (`approval list`)
+
+```diff path=src/agentic_fx/commands.py
+--- src/agentic_fx/commands.py
++++ src/agentic_fx/commands.py
+@@ -23,6 +23,7 @@
+   ask <質問>                  臨時 Mission (回答専用 — 発注はしない)
+   approve <id> / reject <id> [理由]   承認操作
+   approval <id>               承認申請の詳細 (in_sample/holdout 成績を含む)
++  approval list [n]          承認待ちの一覧 (+ 未終端の切替ジャーナル)
+   approval retry <id>        承認手順を頭から再試行 (§5.3 契機③)
+   killswitch reset           kill switch ラッチの解除 (人間の明示操作)
+   reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
+@@ -158,6 +159,11 @@
+                                     f"#{approval_id} via shell", ref_id=str(approval_id))
+                 return (f"approval #{approval_id} を再試行しました: "
+                         f"{self._retry_outcome_text(outcome)}")
++            if cmd == "approval" and args and args[0] == "list" and len(args) <= 2:
++                # [switch-ops-hardening] T7 (設計書 §3.5): `approval retry <id>`
++                # の id を知るための一覧。**holdout / in_sample の数値は出さない**
++                # (詳細は `approval <id>`)。
++                return self._approval_list(args[1] if len(args) == 2 else None)
+             if cmd == "approval" and len(args) == 1 and args[0].isdigit():
+                 # [approval-payload-missing-gate-metrics] 是正 (A4 10 回目
+                 # claude #69 観測 A、2026-09-11): approve/reject する前に
+@@ -349,6 +355,9 @@
+                    for pair, metrics in value.items()]
+         return [cls._metrics_line(prefix, None)]
+ 
++    _APPROVAL_LIST_DEFAULT = 20
++    _APPROVAL_LIST_MAX = 200
++
+     def _retry_outcome_text(self, outcome) -> str:
+         """[switch-ops-hardening] T5: `ApprovalOutcome` を文言に写す。
+         未知 / None はここで `ValueError` になり、`dispatch` の包括 `except`
+@@ -373,6 +382,57 @@
+             return f"この承認は既に決着しています (status={outcome.status})"
+         raise ValueError(f"unknown approval outcome: {kind!r}")
+ 
 +    def _approval_list(self, limit_arg: "str | None") -> str:
 +        """承認待ちの一覧 + 未終端の切替ジャーナル (設計書 §3.5)。"""
 +        limit = self._APPROVAL_LIST_DEFAULT
@@ -1641,11 +1787,14 @@ def test_ac14a_already_decided_status_comes_from_the_row(tmp_path, monkeypatch):
     assert outcome.status == "rejected", "status が行の値でなくリテラルになっている"
 ```
 
-## 付録 D: `tests/test_commands.py` の追記と spy の書き換え (T5・T7)
+## 付録 D-1: `tests/test_commands.py` — **T5 分** (spy の書き換え + retry の結果報告 7 本)
+
+**v1.1 で分割** (付録 B と同じ理由 — v1.0 の `@@ -939,3` に T5 の retry 系と T7 の
+`approval list` 系が同居していた)。D-1 → D-2 の順で v1.0 の付録 D と**バイト一致**。
 
 ```diff path=tests/test_commands.py
---- /home/teru358/project/agentic-fx/tests/test_commands.py	2026-09-19 09:51:24.705602738 +0900
-+++ /tmp/claude-1000/-home-teru358-project-agentic-fx/979685bc-4fba-4bc5-8819-9a254e15ca67/scratchpad/tests/test_commands.py	2026-09-19 20:18:20.976891657 +0900
+--- tests/test_commands.py
++++ tests/test_commands.py
 @@ -2,9 +2,12 @@
  from pathlib import Path
  from unittest.mock import MagicMock
@@ -1681,7 +1830,7 @@ def test_ac14a_already_decided_status_comes_from_the_row(tmp_path, monkeypatch):
      records = activity.tail(10, Category.APPROVAL)
      assert any("retry" in r for r in records)
  
-@@ -939,3 +949,207 @@
+@@ -939,3 +949,139 @@
      assert row["status"] == "pending"
      # lock ファイルも作られない (`.locks` の mkdir より前に落ちる)
      assert not (plugins_dir / ".locks").exists()
@@ -1690,74 +1839,6 @@ def test_ac14a_already_decided_status_comes_from_the_row(tmp_path, monkeypatch):
 +# ============================================================
 +# [switch-ops-hardening] T5 / T7 — `approval list` と retry の結果報告
 +# ============================================================
-+
-+def _pending_plugin_approval(conn, name="sma", chash="a" * 64):
-+    return approvals.create(
-+        conn, kind="plugin",
-+        payload={"name": name, "content_hash": chash, "artifact_hash": "b" * 64,
-+                 "candidate_origin": "staging",
-+                 "candidate_path": f"plugins/_staging/1/{name}"},
-+        now=NOW)
-+
-+
-+def test_approval_list_shows_pending_ids_and_no_metrics(tmp_path):
-+    """AC-12a / AC-13: pending を id 昇順で列挙し、holdout / in_sample の
-+    数値は出さない (詳細は `approval <id>`)。"""
-+    conn, _, _, cmds = _commands(tmp_path)
-+    a1 = _pending_plugin_approval(conn, "sma")
-+    a2 = _pending_plugin_approval(conn, "ema", chash="c" * 64)
-+
-+    out = cmds.dispatch("approval list")
-+
-+    assert out.index(f"#{a1}") < out.index(f"#{a2}")
-+    assert "name=sma" in out and "name=ema" in out
-+    assert "content_hash=aaaaaaaa" in out
-+    for banned in ("in_sample", "holdout", "pf=", "avg_r"):
-+        assert banned not in out
-+
-+
-+def test_approval_list_empty_message(tmp_path):
-+    """AC-12a: 0 件の文言。未終端 journal が無ければ節ごと出ない。"""
-+    _, _, _, cmds = _commands(tmp_path)
-+    out = cmds.dispatch("approval list")
-+    assert out == "承認待ちはありません"
-+    assert "未終端" not in out
-+
-+
-+def test_approval_list_includes_open_journal_section(tmp_path):
-+    """AC-12a: 未終端 journal があれば末尾の節に op_id / name / phase / approval_id。"""
-+    conn, _, _, cmds = _commands(tmp_path)
-+    aid = _pending_plugin_approval(conn, "sma")
-+    op_id = plugin_switch.begin_switch_journal(
-+        conn, kind="bless", approval_id=aid, name="sma", old_kind="absent",
-+        old_target=None, new_target=".versions/sma/" + "b" * 64,
-+        switch_required=True, actor="human_cli", now=NOW, commit=True)
-+
-+    out = cmds.dispatch("approval list")
-+
-+    assert "-- 未終端の切替ジャーナル --" in out
-+    assert f"op_id={op_id} name=sma phase=preparing approval_id={aid}" in out
-+
-+
-+def test_approval_list_limit_and_cap(tmp_path):
-+    """AC-12b: `<n>` が効き、既定 20 / 上限 200 で打ち切る。"""
-+    conn, _, _, cmds = _commands(tmp_path)
-+    for i in range(25):
-+        _pending_plugin_approval(conn, "sma", chash=f"{i:064d}")
-+    assert len(cmds.dispatch("approval list 5").splitlines()) == 5
-+    assert len(cmds.dispatch("approval list").splitlines()) == 20
-+    out = cmds.dispatch("approval list 999")
-+    assert "(上限 200 件で打ち切り)" in out
-+
-+
-+def test_approval_list_rejects_bad_argument(tmp_path):
-+    """AC-12c: 0 / 負数 / 非数値は usage。既存の `approval <id>` を壊さない。"""
-+    conn, _, _, cmds = _commands(tmp_path)
-+    aid = _pending_plugin_approval(conn, "sma")
-+    for bad in ("approval list 0", "approval list -1", "approval list abc"):
-+        assert cmds.dispatch(bad) == "usage: approval list [n]"
-+    assert f"approval #{aid}" in cmds.dispatch(f"approval {aid}")
-+    assert "存在しません" in cmds.dispatch("approval 999")
 +
 +
 +def _fake_outcome(**kw):
@@ -1891,11 +1972,93 @@ def test_ac14a_already_decided_status_comes_from_the_row(tmp_path, monkeypatch):
 +    assert "brand_new_outcome" in out
 ```
 
+## 付録 D-2: `tests/test_commands.py` — **T7 分** (`approval list` 5 本)
+
+```diff path=tests/test_commands.py
+--- tests/test_commands.py
++++ tests/test_commands.py
+@@ -955,6 +955,74 @@
+ # [switch-ops-hardening] T5 / T7 — `approval list` と retry の結果報告
+ # ============================================================
+ 
++def _pending_plugin_approval(conn, name="sma", chash="a" * 64):
++    return approvals.create(
++        conn, kind="plugin",
++        payload={"name": name, "content_hash": chash, "artifact_hash": "b" * 64,
++                 "candidate_origin": "staging",
++                 "candidate_path": f"plugins/_staging/1/{name}"},
++        now=NOW)
++
++
++def test_approval_list_shows_pending_ids_and_no_metrics(tmp_path):
++    """AC-12a / AC-13: pending を id 昇順で列挙し、holdout / in_sample の
++    数値は出さない (詳細は `approval <id>`)。"""
++    conn, _, _, cmds = _commands(tmp_path)
++    a1 = _pending_plugin_approval(conn, "sma")
++    a2 = _pending_plugin_approval(conn, "ema", chash="c" * 64)
++
++    out = cmds.dispatch("approval list")
++
++    assert out.index(f"#{a1}") < out.index(f"#{a2}")
++    assert "name=sma" in out and "name=ema" in out
++    assert "content_hash=aaaaaaaa" in out
++    for banned in ("in_sample", "holdout", "pf=", "avg_r"):
++        assert banned not in out
++
++
++def test_approval_list_empty_message(tmp_path):
++    """AC-12a: 0 件の文言。未終端 journal が無ければ節ごと出ない。"""
++    _, _, _, cmds = _commands(tmp_path)
++    out = cmds.dispatch("approval list")
++    assert out == "承認待ちはありません"
++    assert "未終端" not in out
++
++
++def test_approval_list_includes_open_journal_section(tmp_path):
++    """AC-12a: 未終端 journal があれば末尾の節に op_id / name / phase / approval_id。"""
++    conn, _, _, cmds = _commands(tmp_path)
++    aid = _pending_plugin_approval(conn, "sma")
++    op_id = plugin_switch.begin_switch_journal(
++        conn, kind="bless", approval_id=aid, name="sma", old_kind="absent",
++        old_target=None, new_target=".versions/sma/" + "b" * 64,
++        switch_required=True, actor="human_cli", now=NOW, commit=True)
++
++    out = cmds.dispatch("approval list")
++
++    assert "-- 未終端の切替ジャーナル --" in out
++    assert f"op_id={op_id} name=sma phase=preparing approval_id={aid}" in out
++
++
++def test_approval_list_limit_and_cap(tmp_path):
++    """AC-12b: `<n>` が効き、既定 20 / 上限 200 で打ち切る。"""
++    conn, _, _, cmds = _commands(tmp_path)
++    for i in range(25):
++        _pending_plugin_approval(conn, "sma", chash=f"{i:064d}")
++    assert len(cmds.dispatch("approval list 5").splitlines()) == 5
++    assert len(cmds.dispatch("approval list").splitlines()) == 20
++    out = cmds.dispatch("approval list 999")
++    assert "(上限 200 件で打ち切り)" in out
++
++
++def test_approval_list_rejects_bad_argument(tmp_path):
++    """AC-12c: 0 / 負数 / 非数値は usage。既存の `approval <id>` を壊さない。"""
++    conn, _, _, cmds = _commands(tmp_path)
++    aid = _pending_plugin_approval(conn, "sma")
++    for bad in ("approval list 0", "approval list -1", "approval list abc"):
++        assert cmds.dispatch(bad) == "usage: approval list [n]"
++    assert f"approval #{aid}" in cmds.dispatch(f"approval {aid}")
++    assert "存在しません" in cmds.dispatch("approval 999")
++
+ 
+ def _fake_outcome(**kw):
+     base = dict(outcome="deployed", name="sma", status="approved", op_id=3,
+```
+
 ## 付録 E: `tests/backtest/test_cli.py` の追記 (T6)
 
 ```diff path=tests/backtest/test_cli.py
---- /home/teru358/project/agentic-fx/tests/backtest/test_cli.py	2026-09-19 09:51:24.695602148 +0900
-+++ /tmp/claude-1000/-home-teru358-project-agentic-fx/979685bc-4fba-4bc5-8819-9a254e15ca67/scratchpad/tests/backtest/test_cli.py	2026-09-19 20:16:32.950441032 +0900
+--- tests/backtest/test_cli.py
++++ tests/backtest/test_cli.py
 @@ -1609,3 +1609,26 @@
                      "rsi_pullback"]) == 1
      assert capsys.readouterr().err.strip().splitlines()[-1] == \
@@ -1925,11 +2088,17 @@ def test_ac14a_already_decided_status_comes_from_the_row(tmp_path, monkeypatch):
 +    assert "escapes plugins_root" in err
 ```
 
-## 付録 F: `tests/plugin/test_indicator_initial_set.py` の書き換え 2 本 (T3・T6)
+## 付録 F: `tests/plugin/test_indicator_initial_set.py` の書き換え 2 本 (**T5**・T6)
+
+**v1.1 の訂正**: 1 本目 (`test_runbook_post_gate_failure_converges_via_approval_retry`、
+hunk `@@ -797,15` と `@@ -851,8`) は **T3 ではなく T5 の材料** — 書き換え後の assert が
+`_retry_outcome_text` (T5) の出す文言 (`配備まで完了しました`) を見ているため。**T3 時点では
+このテストは無改変で緑**であることを実測した。2 本目 (`@@ -996,16` と `@@ -1028,6`、
+`test_runbook_cli_bless_after_post_gate_failure_raises_traceback`) は従来どおり T6。
 
 ```diff path=tests/plugin/test_indicator_initial_set.py
---- /home/teru358/project/agentic-fx/tests/plugin/test_indicator_initial_set.py	2026-09-19 18:29:36.313120410 +0900
-+++ /tmp/claude-1000/-home-teru358-project-agentic-fx/979685bc-4fba-4bc5-8819-9a254e15ca67/scratchpad/tests/plugin/test_indicator_initial_set.py	2026-09-19 20:33:56.527160973 +0900
+--- tests/plugin/test_indicator_initial_set.py
++++ tests/plugin/test_indicator_initial_set.py
 @@ -797,15 +797,13 @@
      |---|---|---|
      | `preparing` (版作成で失敗) | journal 終端 + **配備完了** | 手順 5 の確認。同内容なので no-op |
@@ -2011,8 +2180,8 @@ def test_ac14a_already_decided_status_comes_from_the_row(tmp_path, monkeypatch):
 ## 付録 G: `tests/plugin/test_reconcile.py` の書き換え 1 本 (T4)
 
 ```diff path=tests/plugin/test_reconcile.py
---- /home/teru358/project/agentic-fx/tests/plugin/test_reconcile.py	2026-09-19 09:51:24.701602502 +0900
-+++ /tmp/claude-1000/-home-teru358-project-agentic-fx/979685bc-4fba-4bc5-8819-9a254e15ca67/scratchpad/tests/plugin/test_reconcile.py	2026-09-19 20:09:42.249695287 +0900
+--- tests/plugin/test_reconcile.py
++++ tests/plugin/test_reconcile.py
 @@ -473,4 +473,8 @@
          conn, plugins_root=plugins_root, now=fx.NOW, settings=SETTINGS,
          activity=activity)
@@ -2162,42 +2331,194 @@ SAME  tests/plugin/test_switch_ops_hardening.py / tests/test_commands.py /
 
 1. **`docs/` の改訂 (T8) は一切実測していない。** runbook と 8 月設計書の文面は
    設計書 §7.2 の表に従うだけで、動く対象が無い。**文面の整合は人間が読む**こと。
-2. **フルスイート (`uv run pytest -q` 全体) は repo 上で回していない。** 隔離環境では
-   「関連ファイル群 974 本」までしか回していない (上記 3)。**T8 で必ず repo 上の
-   フルスイートを回すこと** — 特に `tests/loops/` `tests/integration/` は未実行。
+2. ~~**フルスイート (`uv run pytest -q` 全体) は repo 上で回していない。**~~
+   → **解消 (v1.1、着手前検証)**。repo の worktree でフルスイートを 2 回実測した
+   (下記「指揮者側の着手前検証」§3)。起草者が見た「974 passed / **1 failed**」の
+   `test_gate_pytest_worker_argv_pins_cacheprovider_and_rootdir` は **repo 上では再現しない**
+   (baseline `4224 passed, 17 deselected` / 全適用後も同数)。T8 でのフルスイートは引き続き必須。
 3. **`tests/test_service_app.py` の reconcile 配線テストは隔離環境で緑だったが、
    `service.py` 自体には 1 行も触っていない**ので、起動時の実挙動 (実 service の起動 →
    reconcile → approved_plugins) は未実測。
 4. **複数プロセス (別 `python` プロセス) での競合は未実測。** barrier テストは同一
-   プロセスの別スレッドで組んだ。`tests/plugin/_flock_worker.py` 方式の実プロセス競合は
-   **AC-9b の範囲外**としたが、必要なら T4 の着手前検証で追加すること。
+   プロセスの別スレッドで組んだ。
+   → **判断済 (v1.1、着手前検証): 追加しない**。理由は下記「指揮者側の着手前検証」§5。
+   **ただし忠実度の差は残る**ので、そのことを明記した上での見送り。
 5. **`approval list` の表示を実際の端末で見ていない。** 桁揃え・折り返しは未評価
    (テストは文字列の包含だけを見ている)。
 6. **性能は測っていない。** `_revert_under_lock` が増やす `journal_store.get` は
    非終端行 1 本あたり 1 回だが、起動時 reconcile の行数が多い環境での実測は無い。
-7. **task ごとの red は 1 つを除いて未実走。** 起草者が実測したのは「全 task を当てた
-   後の green」「既存テスト群」「逆変異」であって、**各 task の Step で書いた red の逐語は
-   T5 の 1 本だけが実測**。残りは `(予測)` と明記してある — 実装時に**実際の最終行に
-   置き換える**こと。**この差は task の分割そのものを検証していない**という意味であり、
-   T1 単独 / T1+T2 のような中間段の overlay は作っていない。
-8. **逆変異は 25 件中 18 件が実走。** `★未実測` を付けた 7 件 (T1-M3 / T2-M4 / T3-M4 /
-   T3-M5 / T4-M5 / T5-M5 / T6-M4) は**机上**である。実装時に回して、生存したら
-   **テストを作り直す** (起草時も 4 件が生存し、うち 2 件はテストの判別力不足だったので
-   作り直した — 下記 4)。
-9. **`force_revert_op_id` の「分類の一致を求めない」判断は、実際にそれで困る場面を
-   作って確かめていない** (既存テスト `test_switch_journal.py:321-350` が緑であること
-   だけを確認した)。
+7. ~~**task ごとの red は 1 つを除いて未実走。**~~
+   → **解消 (v1.1、着手前検証)**。T1 → T7 を 1 task ずつ worktree に当て、全 task の red /
+   green / その時点の既存テスト群を実測した (下記 §2)。`(予測)` は全て実測の逐語に置換済。
+   **そのうえで、task 分割そのものに欠陥が 2 件見つかった** — (a) T3 / T4 の中間段が green に
+   ならない (付録 A の戻り値 8 hunk と新規テスト 4 本を T3 へ移す訂正を入れた)、
+   (b) Step 3-c の「`test_runbook_post_gate_failure_...` が T3 で red」は誤り (T5 の材料)。
+8. ~~**逆変異は 25 件中 18 件が実走。**~~
+   → **解消 (v1.1、着手前検証)**。残り 7 件 (T1-M3 / T2-M4 / T3-M4 / T3-M5 / T4-M5 /
+   T5-M5 / T6-M4) を全適用後の worktree で実走し **7/7 KILLED**、かつ**予測どおりの理由で**
+   死んだ (下記 §4)。T5-M5 は本文に置換前/置換後が無かったので、適用可能な形に具体化した。
+9. ~~**`force_revert_op_id` の「分類の一致を求めない」判断は、実際にそれで困る場面を
+   作って確かめていない**~~ → **解消 (v1.1、着手前検証)**。`tmp_path` の probe を 3 本作って
+   実測した (下記 §6)。**結論: Critical ではない。設計変更は不要**。ただし「第三者が張り替えた
+   live を force_revert が消す / 上書きする」ことは**実測した事実**なので、設計書に記録する
+   価値はある (本束の非スコープ R4 = CLI / シェル入口が無いので、現状は到達経路が無い)。
 
 ## spec と食い違った点 (実装して分かったこと)
 
 | # | 設計書の記述 | 実測 | 処置 |
 |---|---|---|---|
-| 1 | §7.1「書き換える既存テストは **3 本**」 | **4 本**。`tests/plugin/test_reconcile.py::test_reconcile_resolution_holds_the_dependency_locks` が `acquired == sorted({...})` で lock 取得列を完全一致 assert しており、pin 破れの巻き戻しに lock が 1 本増えると red になる | 本プランは **4 本**で進める。設計書 §7.1 / §1 / §8 / AC-15 の「3 本」は **v1.5 で 4 本へ訂正**が要る (指揮者へ申告) |
-| 2 | AC-14d「AST で bare `return` / `return None` が無いこと」 | `approve_candidate` には**入れ子関数** `_close_own_unfinished_journal_if_any` があり、その bare `return` まで拾ってしまう | **入れ子関数の中には入らない**走査 (`_walk_own_body`) にした。設計書 AC-14d にこの但し書きを足すのが望ましい |
-| 3 | AC-5「`resolve()` 化の変異が dangling のケースで red」 | dangling でも `Path.resolve()` は非 strict で同じ文字列を返すので **red にならない**。`./` 付きの綴りも `as_posix()` が畳む | **絶対パスで張った symlink** で分岐が割れることを実測し、その形の単体テストにした |
+| 1 | §7.1「書き換える既存テストは **3 本**」 | **4 本**。`tests/plugin/test_reconcile.py::test_reconcile_resolution_holds_the_dependency_locks` が `acquired == sorted({...})` で lock 取得列を完全一致 assert しており、pin 破れの巻き戻しに lock が 1 本増えると red になる | 本プランは **4 本**で進める。→ **設計書 v1.5 で反映済** (§1 / §3.5 / §7.1 / AC-15 を 4 本へ訂正し、§7.1 の「不変」表からも外した) |
+| 2 | AC-14d「AST で bare `return` / `return None` が無いこと」 | `approve_candidate` には**入れ子関数** `_close_own_unfinished_journal_if_any` があり、その bare `return` まで拾ってしまう | **入れ子関数の中には入らない**走査 (`_walk_own_body`) にした。→ **設計書 v1.5 で反映済** (AC-14d に但し書きを追加) |
+| 3 | AC-5「`resolve()` 化の変異が dangling のケースで red」 | dangling でも `Path.resolve()` は非 strict で同じ文字列を返すので **red にならない**。`./` 付きの綴りも `as_posix()` が畳む | **絶対パスで張った symlink** で分岐が割れることを実測し、その形の単体テストにした。→ **設計書 v1.5 で反映済** (AC-5 を書き換え、dangling で red にならない理由を明記) |
+
+## 指揮者側の着手前検証の記録 (2026-09-19、worktree `tmp/wt/soh-preflight` / ブランチ `soh-preflight`)
+
+起草者の「未実測の申告」の **2・4・7・8・9** を対象に、**repo の worktree** (隔離 overlay では
+なく実ファイル) で実測した。本体 root の `src/` `tests/` は 1 行も触っていない。
+
+### 1. 材料の作り方 (機械抽出のみ)
+
+プラン本文の ```` ```<lang> path=<相対パス> ```` ブロックを正規表現で抽出し、
+**付録 A は hunk index で、付録 C は AST で test 関数ごとに** task へ割った
+(割り当ては付録 A / C の表を正とする)。付録 B / D は 1 hunk に T5 と T7 が同居していたので、
+「完成形から T7 部分を落とした中間形」を作って `diff -u` で 2 本に割った
+(**B-1→B-2 / D-1→D-2 の再合成が v1.0 の付録とバイト一致**することを確認済)。
+
+### 2. task 分割の検証 (申告 7)
+
+| task | (i) テストだけ置いた red | (ii) 実装後の green | (iii) その時点の既存テスト群 |
+|---|---|---|---|
+| T1 | `2 failed in 0.51s` (`AttributeError: ... has no attribute 'classify_live'`) | `2 passed in 0.47s` | `914 passed, 1 deselected` |
+| T2 | `2 failed, 3 passed in 5.42s` (`Failed: DID NOT RAISE ValueError`) | `5 passed in 5.37s` | `917 passed, 1 deselected` |
+| T3 | `4 failed, 5 passed in 10.37s` | **`3 failed, 6 passed`** ← **分割の欠陥** | **`3 failed, 918 passed`** |
+| T4 | `8 failed, 26 passed in 18.12s` | `4 failed, 30 passed` / 付録 G 適用後 `3 failed, 31 passed` | **`3 failed, 924 passed`** |
+| T5 | `18 failed, 82 passed in 66.95s` | `100 passed in 68.16s` | `941 passed, 1 deselected` |
+| T6 | `2 failed, 83 passed in 58.69s` | `85 passed in 58.46s` | `942 passed, 1 deselected` |
+| T7 | `5 failed, 63 passed in 2.79s` | `68 passed in 2.69s` | `947 passed, 1 deselected` |
+
+(iii) の対象は `tests/plugin tests/test_commands.py tests/backtest/test_cli.py tests/test_service_app.py`
+(フルスイートと同じ 2 件を `--deselect`)。**T3 / T4 の 3 failed は常に同じ 3 本**
+(`test_ac1` / `test_ac3` / `test_ac8` の `outcome.*` の assert) で、**既存テストは 1 本も壊れていない**。
+
+**分割の欠陥と訂正**は付録 A の節に書いた。**訂正後の分割でも T3 以降を実測し直した**
+(ブランチ `soh-t3split`):
+
+| task (訂正後) | red | green | その時点の既存テスト群 |
+|---|---|---|---|
+| T3 (案 C + outcome 戻り値、テスト 13 本) | `8 failed, 5 passed in 14.12s` | `13 passed in 14.28s` | **`925 passed, 0 failed`** |
+| T4 (lock + 再読、テスト 19 本に完成) | `5 failed, 14 passed in 21.58s` | `19 passed` → 付録 G 適用後 `38 passed` | **`931 passed, 0 failed`** |
+| T5 (`commands.py` のみ) | `11 failed, 70 passed in 45.92s` | `81 passed in 47.16s` | **`941 passed, 0 failed`** |
+
+**訂正後は全中間段で「既存テストが 1 本も壊れない」かつ「その task の red が全て green になる」**
+が成立する。T6 / T7 は v1.0 の分割のままで問題なし (上表で実測済)。
+
+**機械 diff**: 全 task 適用後の worktree の `switch.py` / `commands.py` / `backtest/cli.py` と、
+5 つのテストファイルが、起草者の隔離環境の成果物と**バイト一致** (DIFF-ZERO)。
+= **hunk 単位の分割は情報を落としていない**。
+
+### 3. フルスイート (申告 2)
+
+```
+baseline (984547e、未適用) : 4224 passed, 17 deselected, 482 warnings in 589.47s (0:09:49)
+全 task 適用後              : 4259 passed, 17 deselected, 482 warnings in 612.06s (0:10:12)
+```
+
+**差は +35 = 新規テストの本数と一致** (`test_switch_ops_hardening.py` 19 + `test_commands.py` 15 +
+`test_cli.py` 1)。**failed は baseline / 適用後とも 0 件**。
+
+`--deselect tests/test_shell_interrupt.py --deselect tests/test_service_app.py::test_interactive_mode_actually_stops_via_stop_event_end_to_end` 付き。
+**起草者が見た 1 failed (`test_gate_pytest_worker_argv_pins_cacheprovider_and_rootdir`) は
+repo 上では再現しない** — baseline が `0 failed` なので、隔離環境の cwd 依存で確定。
+
+### 4. ★未実測 7 件の逆変異 (申告 8)
+
+全 task 適用後の commit の上に注入 → 対象テストのみ実行 → `git checkout -- <file>` で復元
+(毎回 `git status --porcelain` が空であることと `__pycache__` の削除を確認)。
+
+| # | 結果 | red の理由 (逐語) |
+|---|---|---|
+| T1-M3 | **KILLED** | `AssertionError: old_kind=absent かつ live 不在の switched 行が収束せず非終端のまま残った` / `assert 'switched' == 'reverted'` |
+| T2-M4 | **KILLED** | `Failed: DID NOT RAISE ValueError` |
+| T3-M4 | **KILLED** | `sqlite3.IntegrityError: UNIQUE constraint failed: plugin_switch_journal.name` (**プランの予測どおり**) |
+| T3-M5 | **KILLED** | `assert ('deployed_after_rollback' == 'foreign_waiting')` |
+| T4-M5 | **KILLED** | `assert [] == ['sma']` (lock を 1 本も取らない) |
+| T5-M5 | **KILLED** | `AssertionError: 後続配備の target を報告してはならない` |
+| T6-M4 | **KILLED** | `assert 0 == 1` |
+
+**7/7 KILLED、かつ全件が予測どおりの理由で死んだ** (等価変異・判別力不足は 0 件)。
+T5-M5 は本文が「受け取らず lock 外で読み直す (v1.1 の案)」という**説明だけ**で
+適用可能な形になっていなかったので、置換前/置換後を具体化して表に書き戻した。
+
+### 5. 実プロセス競合を足すか (申告 4)
+
+**見送り。** 理由:
+
+- **flock が別プロセス間でブロックすること**は既存の `tests/plugin/test_flock_multiprocess.py::
+  test_reject_waits_for_approve_flock_and_then_gets_already_decided` が
+  **同じ `_plugin_lock` に対して**実プロセスで pin 済み。`_revert_under_lock` はその
+  `_plugin_lock` をそのまま使うので、この性質は継承される。
+- **stale 行の再取得が別コネクションの commit を見ること**は、AC-9b-i が
+  `db_store.connect` で**別の sqlite コネクション**を開いた競合者で既に実測している
+  (プロセス境界ではなくコネクション境界が効く性質)。
+- 足りないのは**両者の合成** (「実際に lock 待ちでブロックしている間に別プロセスが commit する」)
+  だが、これを組むには親が lock を握ったまま子に reconcile を走らせ、握ったまま DB を進めて
+  から解放する **3 点同期**が要り、`_flock_worker.py` に新しい role を足す必要がある。
+  multiprocess テストは既知の flaky 源でもある。
+- **忠実度の差は残る**ことを明記しておく: AC-9b の seam は `_plugin_lock` の**取得直前**で
+  競合者を走らせて終了まで待つ形なので、**flock の待ち合わせ自体は起きていない**。
+
+### 6. `force_revert_op_id` が「分類の一致を求めない」ことの実害 (申告 9)
+
+`tmp_path` の probe 3 本 (実 DB / 実 `plugins/` には触っていない)。
+
+| probe | 仕込み | 実測 |
+|---|---|---|
+| D-a | `old_kind='absent'` の `switched` 行 + live が**第三者の symlink** | force_revert が **`live.unlink()` して第三者の symlink を消す** (`plugins/sma` が消える)。行は `reverted` |
+| D-b | `old_kind='symlink'` の `switched` 行 + live が**第三者の symlink** | force_revert が **`old_target` で上書き**する (第三者の指す先が失われる)。行は `reverted` |
+| D-c | lock 待ちの間に競合者が同じ行を `decided` に畳んで live を `new_target` へ進めた | **巻き戻さない** (`switch_reconcile_skipped_stale_row`)。live は `new_target` のまま、行は `decided` のまま |
+
+**結論: Critical ではない。設計変更は不要。**
+
+- **危険な競合 (D-c) は `expect_class` ではなく「行の再取得」が止めている** — `force_revert` 経路でも
+  この保護は効く。§3.3.2 が `expect_class=None` でも行の再取得だけは必ず行う設計にしているのが正しい。
+- D-a / D-b は**本束が作った挙動ではない** — 旧実装も force_revert 分岐では分類を見ずに
+  `_revert_one` を直接呼んでいた。T4 は保護を**足している**だけで、減らしていない。
+- **到達経路が無い**: `force_revert_op_id` は設計書 §1 の非スコープ R4 で CLI / シェル入口を持たず、
+  現状はプログラムからしか呼べない。
+- とはいえ「phase に依らず巻き戻す割込」という意味論の**帰結**として
+  「第三者が張り替えた live も巻き戻し対象になる」ことは実測事実なので、
+  設計書 §3.3.2 の `expect_class=None` の説明に 1 行添えておく価値はある (指揮者判断)。
+
+### 7. 変更後の再確認
+
+- プラン本文からの機械抽出 → task 順に全適用 → worktree の最終状態と **DIFF-ZERO**
+  (`switch.py` / `commands.py` / `backtest/cli.py` + テスト 5 ファイル)。
+- 付録 B-1 → B-2 / D-1 → D-2 の再合成が v1.0 の付録 B / D と**バイト一致**。
+
+### 8. 逸脱の全件申告
+
+1. **T3 / T4 の中間段で green が取れなかった** — プランの Step どおりに進めると止まる。
+   訂正 (戻り値 8 hunk + 新規テスト 4 本を T3 へ) をプランに書き、訂正版を別ブランチ
+   `soh-t3split` で実測して green を確認した。**worktree の `soh-preflight` ブランチ自体は
+   v1.0 の分割のまま**進めてある (最終状態は同じ = DIFF-ZERO)。
+2. **付録 F の 1 本目を T5 の材料として扱った** (プランは T3 と書いていた)。T3 で red に
+   ならないことを実測した結果の判断。プラン本文も訂正済。
+3. **付録 B / D を task 別に割った** — v1.0 のままでは T5 / T7 の分離が物理的に不可能なため。
+   再合成のバイト一致で担保した。
+4. **`patch -p0` に対象ファイルを明示して当てた** — 付録 D / E / F / G の diff ヘッダが
+   絶対パスなので、`patch` が「potentially dangerous file name」として拒否する。
+   **実装者も同じ問題に当たる**ので、付録の見出しに対象パスがあることを前提に
+   `patch -p0 <target> < <diff>` の形で当てること (プラン本文は変更していない)。
+5. **`patch` が `src/agentic_fx/plugin/switch.py.orig` を残し、1 度 commit に混入した** —
+   worktree 内で削除済。実装時は `--no-backup-if-mismatch` を付けること。
+6. **(iii) の既存テスト群にフルスイートと同じ 2 件の `--deselect` を付けた** (baseline と
+   件数を比較可能にするため)。
+7. **probe 用の一時テストファイル** (`tests/plugin/test_probe_d.py`) を worktree に置いて
+   実行し、削除した。commit には入っていない。
 
 ## 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-09-19 | v1.0 | 初版 (T1〜T8、逆変異 12 件 + task ごとの表、隔離環境での実測記録つき) | 設計書 v1.4 の承認を受けた実装プラン化 | — |
+| 2026-09-19 | v1.1 | 指揮者側の着手前検証 (専用 worktree `soh-preflight` で T1→T7 を 1 task ずつ実走) を反映: **全 task の `(予測)` red を実測の逐語へ置換** / **★未実測 7 件の逆変異を実走し全 KILLED** / **T3・T4 の task 分割が成立しないことを実測**し、付録 A の hunk 10〜12・16〜20 と新規テスト 4 本を T3 へ移す訂正を追加 (訂正後の中間段は `925 passed, 0 failed` を実測) / Step 3-c の「`test_runbook_post_gate_failure_...` が T3 で red」を訂正 (T5 の材料へ) / **付録 B・D を task 別に分割** (B-1/B-2・D-1/D-2) / 付録 A の hunk → task 表を新設 / **訂正を Step 3-a・3-b・4-a・5-a・5-b・5-c と T3 / T5 の見出し・受入条件表・task 依存図に落とした** (Step だけを追う実装者が v1.0 の分割に戻らないように) / **付録 D・E・F・G の diff ヘッダを相対パスへ統一** (絶対パスだと `patch` が "potentially dangerous file name" として拒否する) / フルスイート実測 (baseline `4224 passed` / 全適用後も同数) / `force_revert_op_id` と実プロセス競合の判断を追記 | 起草者が「未実測の申告」に挙げた 2・4・7・8・9 の解消。設計書は v1.5 へ (食い違い 3 件を全件プラン側の実測で採用) | — |
