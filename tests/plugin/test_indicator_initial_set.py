@@ -233,6 +233,30 @@ def _spike_df(n=5000, base=150.0, spike=0.0, seed=1):
                          "close": close, "volume": np.ones(n)}, index=index)
 
 
+def _trend_df(n=5000, base=150.0, direction=1, noise=True, seed=2):
+    """設計書 §6 I5 の fixture ②「明確な単調トレンド」の生成式 (逐語)。
+
+    `drift = 基準価格 × 1e-4` / 本 — `n=5000` で基準価格の ±50% を動く
+    (150 → 225 / 75)。**下降でも価格が 0 を跨がない**幅にしてある
+    (跨ぐと `1e-9 × 基準価格` の絶対公差と `rsi` の相対 ε 基準
+    (`<= 1e-9·|close|`) の意味がどちらも壊れる)。
+    `noise=True` は drift + §6 I5 のランダムウォーク項、`noise=False` は
+    **close が厳密に単調** (high / low の揺らぎだけ残す) — 後者は `rsi` を
+    ε 規則②に突き当てる (上昇で 100.0、下降で 0.0 に張り付く)。
+    """
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    drift = base * 1e-4
+    walk = np.cumsum(rng.normal(0.0, sigma, n)) if noise else np.zeros(n)
+    close = base + direction * drift * np.arange(n) + walk
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2020-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame({"open": open_, "high": high, "low": low,
+                         "close": close, "volume": np.ones(n)}, index=index)
+
+
 def _degenerate_df(n_pre=200, n_flat=400, base=150.0, spike=1.0, seed=0):
     """設計書 §3.2 (i-b) の反例: 通常データ -> DM/TR 1 本 -> 完全横ばい 400 本。"""
     rng = np.random.default_rng(seed)
@@ -312,6 +336,33 @@ def test_head_dependence_on_the_spike_fixture(examples_copy):
     for key, delta in deltas.items():
         tol = _tolerance(key, base)
         assert delta < tol, (key, delta, tol)
+
+
+def test_head_dependence_on_monotonic_trends(examples_copy):
+    """I5 (単調トレンド): 設計書 §6 I5 の fixture ② — **ランダムウォークでは
+    出ない「持続的な一方向の drift」での先頭依存**を見る。公差はランダム
+    ウォークと同じキー別の表。
+
+    4 象限 × 2 値域 = 8 系列: 上昇 / 下降 × `noise=True` (drift + 揺らぎ) /
+    `noise=False` (close が厳密に単調) × 基準価格 1.5 / 150。
+
+    指揮者の実測 (公差に対する最大比は `bollinger.upper` / `lower` の
+    **0.4%**): `rsi` は `noise=True` で 1.01e-11、`noise=False` では
+    **厳密に 0.0** (ε 規則②で 100.0 / 0.0 に張り付くため両側が一致する)。
+    `adx` は 1.5e-11 〜 1.4e-10。**`noise=False` でも `adx` は飽和しない**
+    (high / low の揺らぎが ±DM を両方立てるので、実測で +DI 25.4 / −DI 13.4
+    / ADX 22.3、下降で +DI 18.4 / −DI 21.4 / ADX 26.4)。
+    """
+    for noise in (True, False):
+        for direction in (1, -1):
+            for base in (1.5, 150.0):
+                deltas = _last_row_deltas(
+                    _trend_df(base=base, direction=direction, noise=noise),
+                    examples_copy)
+                for key, delta in deltas.items():
+                    tol = _tolerance(key, base)
+                    assert delta < tol, (noise, direction, base, key,
+                                         delta, tol)
 
 
 def test_head_dependence_on_the_degenerate_fixture(examples_copy):
