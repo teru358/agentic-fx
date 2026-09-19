@@ -1003,6 +1003,44 @@ def test_approval_list_includes_open_journal_section(tmp_path):
     assert f"op_id={op_id} name=sma phase=preparing approval_id={aid}" in out
 
 
+def test_approval_list_line_is_verbatim_and_pending_only(tmp_path):
+    """段 0 pin (S0-21/S0-26/S0-27): 一覧は **pending だけ** を、設計書 §3.5 の
+    表示項目どおりの**逐語**形式で 1 行 1 件出す。部分一致
+    (`"content_hash=aaaaaaaa" in out`) では `WHERE status='pending'` の削除も
+    先頭 8 桁の切り詰めの削除も素通りした (実測 SURVIVED)。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    a1 = _pending_plugin_approval(conn, "sma")
+    a2 = _pending_plugin_approval(conn, "ema", chash="c" * 64)
+    approvals.apply_decision(conn, a2, "approved", decided_by="t", now=NOW,
+                             commit=True)
+    created = conn.execute(
+        "SELECT created_at FROM approval_requests WHERE id=?", (a1,)
+    ).fetchone()["created_at"]
+
+    lines = cmds.dispatch("approval list").splitlines()
+
+    assert lines == [f"#{a1} kind=plugin name=sma created_at={created} "
+                     f"content_hash=aaaaaaaa"]
+
+
+def test_approval_list_journal_line_distinguishes_op_id_from_approval_id(tmp_path):
+    """段 0 pin (S0-31): 既存テストは `op_id == approval_id == 1` の縮退
+    fixture だったので、`approval_id` を `op_id` に取り違える変異が
+    SURVIVED した ([[mutation-testing]] 6.11 ③)。2 つを必ず食い違わせる。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    _pending_plugin_approval(conn, "old")          # id=1 を消費する捨て駒
+    aid = _pending_plugin_approval(conn, "sma")    # id=2
+    op_id = plugin_switch.begin_switch_journal(
+        conn, kind="bless", approval_id=aid, name="sma", old_kind="absent",
+        old_target=None, new_target=".versions/sma/" + "b" * 64,
+        switch_required=True, actor="human_cli", now=NOW, commit=True)
+    assert op_id != aid, "fixture が縮退している (op_id == approval_id)"
+
+    out = cmds.dispatch("approval list")
+
+    assert f"op_id={op_id} name=sma phase=preparing approval_id={aid}" in out
+
+
 def test_approval_list_limit_and_cap(tmp_path):
     """AC-12b: `<n>` が効き、既定 20 / 上限 200 で打ち切る。"""
     conn, _, _, cmds = _commands(tmp_path)
@@ -1044,6 +1082,10 @@ def _fake_outcome(**kw):
      "plugins/sma が旧式のディレクトリのままです"),
     (_fake_outcome(outcome="already_decided", status="rejected", target=None),
      "この承認は既に決着しています (status=rejected)"),
+    # 段 0 pin (S0-15): `invalidated` の行が無く、タプルから外す変異が
+    # SURVIVED した。7 つの outcome を全て写せることを見る。
+    (_fake_outcome(outcome="invalidated", status="invalidated", target=None),
+     "この承認は既に決着しています (status=invalidated)"),
 ])
 def test_approval_retry_reports_the_locked_outcome(tmp_path, monkeypatch, outcome,
                                                    expected):
