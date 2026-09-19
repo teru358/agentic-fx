@@ -1,0 +1,5 @@
+kind: indicator
+outputs: [value]
+max_bars: 400
+params:
+  period: 20
