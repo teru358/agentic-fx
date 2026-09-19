@@ -1,4 +1,4 @@
-# [indicator-initial-set] 設計書 v1.1
+# [indicator-initial-set] 設計書 v1.2
 
 束: 改善ループが戦略を作るときに `config.yaml` の `indicators:` で宣言できる **標準指標の初期セット (9 本)** を人間が用意する。成果物は `docs/examples/plugins/<名前>/` に置く plugin 3 点セットと、人間が配備するための runbook のみ。**新しいコマンド・新しい機構・新しい自動配備経路は一切作らない。**
 
@@ -13,7 +13,7 @@
 | R3 | 配備手順 (暫定) | 人間が `docs/examples/plugins/<名前>` を `plugins/_human/<名前>` へコピー → `afx plugin bless <名前> --from _human` を 1 本ずつ。runbook を `docs/operations/` に置き「暫定、[first-run-setup] で置換」と明記。**恒久なのは「採用には人間の明示的確認が要る、LLM の自動配備経路は作らない」という規律** |
 | R4 | 指標 9 種と出力 | `sma`/`ema` → `value` (20) ／ `rsi` → `rsi` (14, Wilder) ／ `macd` → `macd` `signal` `hist` (12/26/9) ／ `bollinger` → `upper` `middle` `lower` (20, 2.0σ) ／ `atr` → `atr` (14, Wilder) ／ `adx` → `adx` `plus_di` `minus_di` (14) ／ `stochastic` → `k` `d` (14/3/3) ／ `ichimoku` → `tenkan` `kijun` `senkou_a` `senkou_b` `chikou` (9/26/52)。**全出力は df と同じ index の `pd.Series`、足りない期間は NaN、`outputs` 宣言必須** |
 | R5 | ichimoku の lookahead 禁止 | 先行スパンは未来へずらさず「現在バー時点で確定した値」を返す。遅行スパンは「現在の終値」をそのまま返す。雲との比較は strategy 側が `shift` で行う旨を docstring に明記 |
-| R6 | 正しさの担保 | 各指標の自己テストに (i) 独立参照実装 (素朴なループ) との一致 (ii) 末尾切り詰め不変 (iii) warmup 期間が NaN (iv) 出力キー集合が `outputs` と完全一致・index 一致・Inf/bool なし。**ゲートとしての一般化 [indicator-reference-oracle-gate] は別束のまま** |
+| R6 | 正しさの担保 | 各指標の自己テストに (i) 独立参照実装 (素朴なループ) との一致 (ii) 未来を読んでいないことの検査 (承認 v0.1 の「末尾切り詰め不変」は、設計レビュー r1 I2 を受けて**接頭辞因果性**へ強化した — §6.2。意図 (lookahead 禁止の観測) は不変で、検出力だけを上げる変更) (iii) warmup 期間が NaN (iv) 出力キー集合が `outputs` と完全一致・index 一致・Inf/bool なし。**ゲートとしての一般化 [indicator-reference-oracle-gate] は別束のまま** |
 | R7 | 名前 | 短い一般名 (`sma` `ema` `rsi` …)。既存の配備済 `rsi_indicator` / `rsi_wilder` と example の `rsi_indicator` (example 戦略 `rsi_pullback` が依存) は**触らず残す** |
 | R8 | 調整と改造 | 調整 = strategy 側の `indicators.<alias>.params` 上書き (承認不要、[wiring] U3)。改造 = `read_plugin_source` → staging 複製 → **別名** → 承認申請 |
 
@@ -26,7 +26,7 @@
 - **[multi-timeframe-indicator-deps]** — 複数足の依存宣言。9 本はいずれも `timeframe` を宣言せず、呼び出し側が渡した任意の足で動く。
 - **[first-run-setup]** — 初回起動の対話ウィザードによる一括配備。本束の runbook はそれに置き換えられる暫定物。
 - **配備の自動化** — `afx plugin bless-all` のようなコマンドも、改善ループからの自動配備経路も作らない。
-- **`src/` と `tests/` の既存コードの変更** — 本束は既存の契約・ゲート・CLI を一切変えない (§5 / §7)。
+- **`src/` の変更** — 本束は既存の契約・ゲート・CLI を 1 行も変えない (§5 / §7)。`tests/` は **§7 に挙げた既存 1 ファイル (`tests/plugin/test_loader.py`) への追記と、新規テストファイルの追加のみ** — 既存テストの意味を変える改変はしない (r1 M2)。
 - 収益性の検証 — 指標単体に収益性の評価軸は無い (`approval.run_kind_gate` の kind=indicator 分岐は `({}, True)` を返すだけ、`approval.py:220-221`)。
 
 ## 2. 動作目線の設計 (誰が何をどう扱うか)
@@ -58,7 +58,7 @@ strategy を評価するとき、worker は依存 indicator ごとに `df.tail(d
 - **seed の裁定 (D1、§8)**: 再帰平滑の初期値は **`y_0 = x_0`** (pandas `adjust=False` の既定) とし、「先頭 p 本の SMA を seed にする」教科書流は採らない。理由: 既存の配備済 `rsi_indicator` がこの再帰であり (`rsi_indicator/plugin.py:54-57`)、§3.2 の `max_bars` 収束見積りもこの再帰を前提にしている。差は先頭側だけで、`min_periods=p` の NaN に覆われる区間を過ぎれば指数的に消える。
 - **TR / ±DM の行 0**: `TR[0]` と `plus_dm[0]` / `minus_dm[0]` は **NaN** とする (前バーが無いので未確定)。`np.maximum` は NaN を伝播し、`pd.concat(...).max(axis=1)` は NaN を飛ばして `high-low` を返す — **後者は使わない** (warmup 本数が曖昧になる)。
 - **`max_bars` は全 9 本で 400** (§3.2)。`settings.plugin.max_bars_limit` の既定 1000 以内 (`config/settings.yaml.example:129`)。
-- **参照実装の書き方** (`test_plugin.py` の中): pandas のベクトル演算を一切使わず、`list[float]` に対する `for` ループで定義式をそのまま書き下す。`rolling` は毎回スライスして `sum(window)/p`、再帰平滑は `prev` を持ち回る 1 行、`min_periods` は「先頭 p−1 個を `float("nan")` にする」で表現する。plugin.py と**同じ関数を別の書き方で 2 度書く**のが目的なので、plugin.py からの import・コピーは禁止。
+- **参照実装の書き方** (`test_plugin.py` の中): pandas のベクトル演算を一切使わず、`list[float]` に対する `for` ループで定義式をそのまま書き下す。`rolling` は毎回スライスして `sum(window)/p`、再帰平滑は `prev` を持ち回る 1 行。**`min_periods` は位置 (`i < p−1`) ではなく「非 NaN 観測数」で数える** — 詳細と、そこを間違えると `atr` / `adx` の warmup が 1 本ずれて I3 が落ちる理由は §3.3。plugin.py と**同じ関数を別の書き方で 2 度書く**のが目的なので、plugin.py からの import・コピーは禁止。
 
 ### 3.1 定義表
 
@@ -70,19 +70,40 @@ strategy を評価するとき、worker は依存 indicator ごとに `df.tail(d
 | `ema` | `value` | 再帰平滑 α=2/(p+1) of close | `period: 20` | 19 | なし |
 | `rsi` | `rsi` | `delta = close.diff()`、`gain = max(delta,0)`、`loss = max(−delta,0)`、`avg_* = Wilder(p)`、`rsi = 100 − 100/(1 + avg_gain/avg_loss)` | `period: 14` | 14 | `avg_loss == 0 かつ avg_gain > 0` → **100**、`avg_gain == avg_loss == 0` → **50** (既存 `rsi_indicator` と同一規則) |
 | `macd` | `macd` `signal` `hist` | `macd = EMA(fast) − EMA(slow)`、`signal = 再帰平滑(α=2/(signal_period+1)) of macd`、`hist = macd − signal` | `fast: 12, slow: 26, signal_period: 9` | macd 25 / signal 33 / hist 33 | なし |
-| `bollinger` | `upper` `middle` `lower` | `middle = SMA(p)`、`σ = rolling(p).std(ddof=0)` (母標準偏差)、`upper = middle + k·σ`、`lower = middle − k·σ` | `period: 20, num_std: 2.0` | 19 (3 本とも) | σ=0 は除算しないので `upper == middle == lower`。異常ではない |
+| `bollinger` | `upper` `middle` `lower` | `middle = SMA(p)`、`σ = rolling(p).std(ddof=0)` (母標準偏差)、`upper = middle + k·σ`、`lower = middle − k·σ` | `period: 20, num_std: 2.0` | 19 (3 本とも) | σ=0 は除算しないので `upper == middle == lower` (異常ではない)。`num_std` 自体は `> 0` を要求する (§4) |
 | `atr` | `atr` | `TR = max(high−low, |high−prev_close|, |low−prev_close|)` (行 0 は NaN)、`atr = Wilder(p) of TR` | `period: 14` | 14 | なし |
 | `adx` | `adx` `plus_di` `minus_di` | `up = high.diff()`、`dn = −low.diff()`、`plus_dm = up if (up>dn and up>0) else 0`、`minus_dm = dn if (dn>up and dn>0) else 0` (行 0 は両方 NaN)、`atr = Wilder(p) of TR`、`±DI = 100·Wilder(p) of ±DM / atr`、`dx = 100·|plus_di−minus_di|/(plus_di+minus_di)`、`adx = Wilder(p) of dx` | `period: 14` | plus_di 14 / minus_di 14 / adx **27** | `atr == 0` → `plus_di = minus_di = 0.0`。`plus_di + minus_di == 0` → `dx = 0.0` |
 | `stochastic` | `k` `d` | `hh = rolling(p).max(high)`、`ll = rolling(p).min(low)`、`raw = 100·(close−ll)/(hh−ll)`、**`k = SMA(k_period) of raw`**、`d = SMA(d_period) of k` (= 標準的な slow stochastic、裁定 D2) | `period: 14, k_period: 3, d_period: 3` | k 15 / d 17 | `hh == ll` → `raw = 50.0` |
 | `ichimoku` | `tenkan` `kijun` `senkou_a` `senkou_b` `chikou` | `mid(n) = (rolling(n).max(high) + rolling(n).min(low))/2`、`tenkan = mid(tenkan_period)`、`kijun = mid(kijun_period)`、`senkou_a = (tenkan + kijun)/2`、`senkou_b = mid(senkou_b_period)`、`chikou = close` | `tenkan_period: 9, kijun_period: 26, senkou_b_period: 52` | tenkan 8 / kijun 25 / senkou_a 25 / senkou_b 51 / chikou 0 | なし |
 
-**ichimoku の lookahead 禁止 (R5)**: `senkou_a` / `senkou_b` に `shift(+26)` を掛けない。`chikou` に `shift(−26)` を掛けない。**返すのはすべて「そのバー時点で確定している値」**であり、「26 本先へ投影した雲」でも「26 本前へ遡らせた遅行線」でもない。docstring に逐語で書く: *「雲との比較をしたい strategy は `indicators["ichi"]["senkou_a"].shift(kijun_period)` を自分で取ること。この plugin は未来の行に値を置かない (末尾切り詰め不変の担保でもある)」*。
+**ichimoku の lookahead 禁止 (R5)**: `senkou_a` / `senkou_b` に `shift(+26)` を掛けない。`chikou` に `shift(−26)` を掛けない。**返すのはすべて「そのバー時点で確定している値」**であり、「26 本先へ投影した雲」でも「26 本前へ遡らせた遅行線」でもない。docstring に逐語で書く: *「雲との比較をしたい strategy は `indicators["ichi"]["senkou_a"].shift(kijun_period)` を自分で取ること。この plugin は未来の行に値を置かない (接頭辞因果性 §6 I4 の担保でもある)」*。
 
 ### 3.2 `max_bars` の決め方 — 全 9 本で 400
 
-**先頭依存 (head dependence)**: 再帰平滑は `y_0 = x_0` から始まるので、履歴の**先頭**を切ると最終行の値が変わる。誤差は `|Δy_0|·(1−α)^(N−p)` のオーダーで減衰し、ADX はこの減衰が 2 段 (DI → DX → ADX) 入れ子になるため最も遅い。
+**400 は「普遍的な保証」ではない (r1 I3)。** 解析的上界 (i) と、仕様化したデータ範囲での回帰試験 (ii) の 2 段で根拠を置く。契約は OHLC の値域を制限していないので、任意の有効入力に対する 1e-6 保証は原理的に書けない。
 
-実測 (合成ランダムウォーク、初値 150・σ=0.15/本、末尾 N 本で計算した最終行の値と全 5000 本で計算した値の差):
+#### (i) 解析的上界
+
+**先頭依存 (head dependence)**: 再帰平滑は `y_0 = x_0` から始まるので、履歴の**先頭**を切ると seed が変わり、最終行まで残差が残る。線形再帰なので残差は厳密に
+
+> **`|残差(最終行)| = |Δseed| · (1−α)^(N−p)`**  (N = 与えた本数、p = warmup)
+
+`(1−α)^(N−p)` の値 (N = 400):
+
+| 平滑 | α | `(1−α)^(N−p)` |
+|---|---|---|
+| Wilder p=14 (`rsi` / `atr` / `adx` の各段) | 1/14 | **3.77e-13** |
+| EMA p=26 (`macd` の slow) | 2/27 | **3.16e-13** |
+| EMA p=20 (`ema`) | 2/21 | 3.04e-17 |
+| EMA p=12 (`macd` の fast) | 2/13 | 7.09e-29 |
+
+**`|Δseed|` は入力の値域に比例する** — ここが「普遍的保証を書けない」理由。価格スケールの出力 (`ema` / `macd` / `atr`) では `|Δseed|` は最大で価格の変動幅のオーダー、`adx` では DX が [0,100] なので `|Δseed| ≤ 100`。
+
+**ADX の入れ子**: `ADX = Wilder(DX(Wilder(±DM), Wilder(TR)))` で、内側の残差がさらに 1 段平滑される。有効な減衰本数は内側の warmup ぶん後ろへずれるので上界は `(13/14)^(N−2p) = (13/14)^372 = 1.07e-12`。**`|Δseed| ≤ 100` を掛けると `1.07e-10`** — §3.2 の実測 (40 seed の最悪 **1.1e-10**) と桁も値も一致する。上界式が実測を説明できている。
+
+#### (ii) 仕様化したデータ範囲での実測
+
+実測 A (合成ランダムウォーク、初値 150・σ=0.15/本、末尾 N 本で計算した最終行の値と全 5000 本で計算した値の差):
 
 | N | ema20 | rsi14 | macd | atr14 | **adx14 (40 seed の最悪)** |
 |---|---|---|---|---|---|
@@ -93,10 +114,20 @@ strategy を評価するとき、worker は依存 indicator ごとに `df.tail(d
 | 350 | — | — | — | — | **5.6e-09** |
 | **400** | 0 | 1.4e-11 | 5.2e-14 | 1.2e-15 | **1.1e-10** |
 
+実測 B (**上界式の検証 — 400 本窓のちょうど手前 (401 本目) に +100 のスパイクを置く**。これは `|Δseed|` を人為的に最大化する構成):
+
+| 系列 | ema20 | atr14 | macd |
+|---|---|---|---|
+| スパイクなし (価格 150 / σ0.2) | 0.0 | 1.06e-14 | 2.84e-14 |
+| **401 本目に +100 のスパイク** | 0.0 | **1.99e-12** | **3.70e-13** |
+| 価格 300 / σ0.4 | 0.0 | 1.01e-14 | — |
+
+スパイクで `|Δseed|` を 100 に引き上げても残差は 2e-12 で、上界 `100 × 3.77e-13 = 3.8e-11` の内側に収まる。**価格スケールを 2 倍にしても残差は比例するだけ** (1e-14 オーダー) で、主要 FX ペアの値域 (0.5 〜 300 程度) では余裕がある。
+
 純 rolling の 4 本 (`sma` / `bollinger` / `stochastic` / `ichimoku`) は原理的に先頭非依存だが、**厳密な bit 一致ではない**: pandas の `rolling(...).std()` は逐次更新アルゴリズムなので丸めの累積が履歴長に依存し、実測で ~3e-11 の差が残る (`sma.mean()` は ~3e-14)。これは「先頭依存」ではなく浮動小数の丸めであり、許容誤差の形 (§6 I5) を絶対等値でなく公差にする根拠である。
 
 **選定: 全 9 本で `max_bars: 400`。** 理由:
-1. 最も収束が遅い `adx` でも 1.1e-10 < 1e-6 に収まり、他は桁で余裕がある。
+1. 最も収束が遅い `adx` でも上界 1.07e-10・実測 1.1e-10 で、想定データ範囲 (§6 I5 の fixture 仕様) では 1e-6 に桁で収まる。他は更に余裕がある。
 2. **人間の配備者と strategy 作者が覚える数が 1 つで済む。** 指標ごとに 120/160/400 と散らすと、`max_bars: 200` の strategy が「`sma` は正確だが `adx` だけ静かに 7e-06 ずれる」という、テストで気づきにくい部分的劣化を生む (§2.4 の `min(...)` 規則のため)。
 3. 400 は `max_bars_limit` 既定 1000 の 4 割で、resolver の `over_max_bars_limit` にも handshake 総量上限にも届かない。
 
@@ -125,10 +156,60 @@ strategy を評価するとき、worker は依存 indicator ごとに `df.tail(d
 
 **params の型と範囲の検証**: **例外を投げず、不正なら出力を全 NaN にする**方針は採らない。逆に、**不正な params は `ValueError` で即座に失敗させる**。理由: `params` は loader が JSON-safe 性しか見ない (`loader._check_json_safe`) ので、型・範囲の責任は plugin にある。全 NaN で黙って返すと、strategy 側は「warmup 不足」と区別できず、改善 agent は「系列が全 NaN → `max_bars` を増やす」という誤った申し送りに誘導される (規律 7 の文言がまさにそう指示している)。例外なら worker が `{"ok": false, "error": "ValueError: ..."}` として構造化報告し、self-test / `run_plugin_tests` / bless の pytest ゲートのいずれかで必ず露見する。
 
-各 plugin は冒頭で共通の形の検証を行う:
-- `period` 系は `int(params.get(...))` した結果が **1 以上** (`macd` は `fast < slow` も要求)。
-- `bollinger` の `num_std` は **有限かつ 0 以上の float**。
-- bool は int のサブクラスなので `isinstance(x, bool)` を先に弾く。
+**型検査は「変換」ではなく「確認」で行う (r1 I1)**。`int(params.get("period", 14))` の形は使わない — `14.9` を `14` に、`"14"` を `14` に**黙って読み替えて**しまい、strategy が `params: {period: 14.9}` と上書きしたときに「14.9 期間」ではなく「14 期間」の指標が返る。上書きは承認不要 (R8/U3) なので、この読み替えは誰のレビューも通らずに本番へ届く。**元の値の型をそのまま確認し、違えば `ValueError`** とする。
+
+各 plugin が冒頭で行う検証:
+
+| 対象 | 規則 | 理由 |
+|---|---|---|
+| 期間系すべて (`period` / `fast` / `slow` / `signal_period` / `k_period` / `d_period` / `tenkan_period` / `kijun_period` / `senkou_b_period`) | 元値が **`bool` でない `int`** であること → **`>= 1`** | `bool` は `int` の派生なので先に弾く。`float` / `str` は変換せず拒否。下限は一律 1 (`period: 1` は「平滑なし」で数学的に定義でき、`rolling(1).std(ddof=0) == 0` も `alpha = 1/1 = 1` も破綻しない — 使い道の無さを理由に禁じない) |
+| `macd` の `fast` / `slow` | 上に加えて **`fast < slow` を要求** | `fast == slow` は `macd` と `hist` が恒等的に 0 になる (動いているように見えて何も判定していない退化形)。`fast > slow` は**全クロスの符号が反転**し、「macd が signal を上抜けたら買い」が静かに逆売買になる。どちらも救う正当な用途が無い |
+| `ichimoku` の 3 期間 | **順序関係 (`tenkan < kijun < senkou_b`) は要求しない** | 式は任意の順序で well-defined で、符号反転も退化も起きない。順序を強制すると 7/22/44 のような正当なパラメータ探索を塞ぐ (R8 の「調整は承認不要」と衝突する) |
+| `stochastic` の `k_period` | `>= 1` のみ | **`k_period: 1` が fast stochastic** (raw %K そのもの) を与える正式な経路 (裁定 D2) |
+| `bollinger` の `num_std` | 元値が **`bool` でない `int` または `float`**、`math.isfinite`、**`> 0`** | `0` は 3 本が同一系列になる退化形で、`bollinger` を宣言した意味が消える。負値は `upper < lower` の反転 |
+
+**JSON 往復で型は保たれる**ので、この厳密な型検査は端から端まで成立する: YAML の `14` は `int`、`14.0` は `float` として loader を通り、worker は `json.loads(json.dumps(params))` で deep copy する (`worker.py:171-175`) — JSON は int と float を区別するので、`int` で書いた値が `compute` に `float` として届くことはない。
+
+**共通 helper の骨格** (下の 2 関数を**各 plugin の `plugin.py` にそのまま持つ**):
+
+```python
+def _int_param(params: dict, name: str, default: int) -> int:
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"params.{name} must be an int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"params.{name} must be >= 1, got {value}")
+    return value
+
+
+def _float_param(params: dict, name: str, default: float) -> float:
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"params.{name} must be a number, got {value!r}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"params.{name} must be a finite number > 0, got {value}")
+    return value
+```
+
+**重複は避けられない (明示)**: plugin は 1 フォルダ 3 ファイルで完結しなければならず、共有モジュールを置く経路が無い — `loader._reject_unexpected_py_files` (`loader.py:519-539`) が 4 本目の `.py` を拒否し、`sandbox.check_source` は相対 import を拒否し allowlist は `math` / `statistics` / `numpy` / `pandas` / `__future__` だけ (`sandbox.py:118-119`, `:223-225`)。**9 本が同じ十数行を持つ**ことになるが、これは設計上の帰結であって重複の見落としではない。逐語同一にしておき、直すときは 9 本まとめて直す。
+
+**例外文言の形は 9 本で統一する**: `params.<キー名> must be <期待>, got <値>`、相互関係は `params.fast must be < params.slow, got fast=26 slow=12`。plugin 名や候補名は入れない (ゲートの reject reason 語彙に混ぜない)。
+
+**不正 params で `ValueError` を投げたとき、各消費者がどう振る舞うか (実コードで確認)**:
+
+| 場面 | 起きること | 判定 |
+|---|---|---|
+| strategy worker の依存計算 | `worker.py:339-343` の `except Exception` が捕まえ `{"ok": false, "error": "ValueError: params.period must be ..."}` を 1 行で返す。`PluginSession.call` がこれを `SandboxError` に写像 (`sandbox.py:590-591`)。**セッションは死なず**次の call は通る (plugin 自身の例外は timeout/kill とは別分類) | 構造化報告 |
+| bless / submit (承認回廊) | `strategy_adapter` は `SandboxError` を**捕まえず貫通させる**契約 (`strategy_adapter.py:41-43`)。`_run_full_gate` の `except SandboxError` が `ValueError(f"plugin {name!r}: {exc}")` へ写像し (`switch.py:1010-1012`)、`afx plugin bless` が `エラー: ...` を stderr へ出して **rc=1、承認行は作らない** | **fail closed** |
+| 人間 CLI `afx backtest run --plugin` | `cli.py:447` の `except SandboxError` で rc=1 | **fail closed** |
+| 改善ループの `run_backtest` / commit gate | gate verdict が不合格になり候補は承認申請にならない | **fail closed** |
+| 本番 producer (live) | `signal_producer.py:194-199` が plugin 単位で捕まえ、warning を出して**その plugin の cursor を進めず次 tick で再試行**。signal 行は書かれない | **fail open だが無害** — 誤った値で発注することはなく、その strategy が黙って止まる (毎 tick warning が残る) |
+| 取引判断 loop の `get_indicators` | `market_tools.py:88-93` が捕まえ、`plugin:<名前>` キーだけを落として warning。組み込み指標は必ず返る | **fail open** (LLM 向け参考情報なので設計どおり) |
+
+**結論**: 承認・バックテストの全経路で fail closed、本番の 2 経路 (producer / trade LLM) は fail open だが**誤った値が発注判断に届く経路は無い** (値が出ないだけ)。全 NaN で黙って返す案を採らない理由はここにある — 全 NaN は「warmup 不足」と区別できず、改善 agent は規律 7 の文言に従って「`max_bars` を増やせ」という誤った申し送りを書く。
+
+
 
 **loader が形を検証する箇所 (実物)** — 9 本はすべてこの範囲に収まる:
 
@@ -162,11 +243,11 @@ strategy を評価するとき、worker は依存 indicator ごとに `df.tail(d
 | **I1** | 9 本すべてが discover を通る | 既存の `tests/plugin/test_loader.py::test_discover_sample_plugins_directory_not_rejected` が `discover(docs/examples/plugins)` を実行済み (現状 3 本すべてが通ることを実測: `rsi_indicator`(indicator) / `rsi_pullback`(strategy) / `sma_cross`(strategy))。その assert を **9 名の集合 `<= names`** へ拡張する。**総数の厳密 pin は置かない** — 将来 example が 1 本増えただけで落ちる脆いテストになり、観測したい性質 (9 本が reject されない) と一致しない |
 | **I2** | 9 本の戻り値が indicator 契約を通る | 各 `compute` の戻り値を `core.plugin_contract.validate_indicator_result(result, df_index=df.index, outputs=<config の outputs>)` に通して例外なし。キー集合完全一致・index 一致・Inf/bool 不在はこの 1 本で同時に観測される |
 | **I3** | 参照実装と一致 | 各 `test_plugin.py` で、素朴なループの参照実装と**全行**比較。公差は `rel=1e-9, abs=1e-9` の**併用** (bollinger / ichimoku / macd は価格スケール、rsi / k / d / adx / di は [0,100] スケールなので片方だけでは不足)。NaN 行は「両方 NaN」で一致とする |
-| **I4** | 末尾切り詰め不変 | `df` の末尾を k ∈ {1, 5, 17} 本落として再計算し、残った行の値が全出力キーで **bit 一致** (差が厳密に `0.0`。実測: ewm / wilder / rolling std のいずれも k=1/5/50 で 0.0 — 因果的な実装なら丸めの経路まで同じになる)。NaN 行は「両方 NaN」で一致とする。ichimoku の lookahead 禁止 (R5) はこのテストで観測される |
-| **I5** | 先頭依存の誤差が許容内 | `max_bars`(=400) 本以上の履歴を与えたとき、末尾 400 本だけで計算した最終行の値が、長い履歴 (5000 本) で計算した値と **`pytest.approx(full, rel=1e-6, abs=1e-6)`** で一致 (= どちらかの公差を満たせば合格。`macd`/`hist` は 0 を跨ぎ、`dx`/`adx` は凪の区間で 0 に張り付くので、相対公差だけを課すと偽陽性になる)。系列は**ランダムウォークだけでなく、明確なトレンドを持つ系列を最低 1 本**含める (先頭依存の誤差は Δseed = 価格ドリフトに比例するため)。**保証の前提は「indicator に 400 行以上が渡ること」= `min(strategy.max_bars, 400) == 400`** — strategy が 400 未満を宣言した場合はこの保証の外であることをテストの docstring に書く |
+| **I4** | **接頭辞因果性 (prefix causality)** — lookahead の一般的な検出 | 各出力キーについて、warmup 直後・中間の複数点・末尾を含む **8 点以上**の位置 `t` で、`compute(df.iloc[:t+1])[key].iloc[-1]` と `compute(df)[key].iloc[t]` が一致すること (NaN は NaN 同士で一致)。公差は `rel/abs 1e-9` (実測では**正しい実装は bit 一致 (差 0.0)** — 接頭辞は先頭を共有するので rolling の逐次更新の丸めまで同じ経路を辿る。1e-9 は安全率)。fixture は**極値を末尾側と中間の両方**に置く。**旧稿の「末尾を k 本落とす」形は置き換える** (§6.2 に根拠) |
+| **I5** | 先頭依存の誤差が、**仕様化したデータ範囲**で許容内 | **普遍的保証ではなく回帰試験** (§3.2 の解析的上界と対にして読む)。fixture の生成式・seed・値域を spec で固定する (下記)。その範囲で、末尾 400 本だけで計算した最終行の値が長い履歴 (5000 本) の値と一致すること。**公差はどちらも絶対値で置く**: 0〜100 スケールの出力 (`rsi` `k` `d` `adx` `plus_di` `minus_di`) は **`abs < 1e-6`**、価格スケールの出力 (`value` `upper` `middle` `lower` `atr` `macd` `signal` `hist` `tenkan` `kijun` `senkou_a` `senkou_b` `chikou`) は **`abs < 1e-9 × fixture の基準価格`** (基準価格 300 なら 3e-7、0.5 なら 5e-10)。**相対公差を使わない理由**: 残差は `|Δseed| ∝ 入力価格` に比例し、**出力値の大きさには比例しない**。`macd` / `hist` / `atr` は 0 を跨ぐ・0 に近づくので、相対公差にすると値が 1e-6 のとき許容が 1e-15 になり、実測残差 (5e-14) で偽陽性になる (v1.1 で同じ罠を I5 から外した経緯がある)。基準価格に比例させた絶対公差は `ema` / `bollinger` / `ichimoku` では相対 1e-9 と一致し、0 近傍の出力でも壊れない。fixture 集合: ①ランダムウォーク (基準価格 0.5 / 1.5 / 150 / 300、seed 0〜7) ②明確な単調トレンド ③**401 本目 (= 400 本窓のちょうど手前) に基準価格の 60% 相当のスパイクを置いた系列** — ③で上界式と実測が整合すること (§3.2 の実測 B) を同時に観測する。**保証の前提は「indicator に 400 行以上が渡ること」= `min(strategy.max_bars, 400) == 400`**。<br>**fixture の生成式 (逐語、§3.2 の実測 A/B もこの式で σ = 基準価格 × 0.13%)**: `σ = 基準価格 × 0.001〜0.003`、`close = 基準価格 + cumsum(N(0, σ))` (`np.random.default_rng(seed)`)、`high = close + |N(0, σ/2)|`、`low = close − |N(0, σ/2)|`、`open = close`、`volume = 1.0`、index = `pd.date_range(..., freq="1h", tz="UTC")` |
 | **I6** | 9 本を順に bless できる | tmp の `plugins` ディレクトリと tmp の DB に対して、9 本を 1 本ずつ `bless_candidate` に通し 9 回とも approval_id が返ることを実測。**noop / 同一性で弾かれないこと**と、`outputs_required` / `max_bars_limit` / `check_source` / pytest ゲートをすべて通ることを同時に観測する。実 `data/agentic.db` と実 `plugins/` は使わない (`tests/fixtures/wiring_envs.py` の tmp 環境の作り方に倣う) |
 | **I7** | 新 `rsi` を宣言した strategy が E2E で動く | `rsi_pullback` 型の strategy (別名、tmp 環境) が `indicators: {rsi: {plugin: rsi, params: {period: 14}}}` を宣言し、`max_bars: 400` で A1 相当の E2E (resolve → lock → worker 実行 → `evaluate` が系列を受け取る) が通る。**`max_bars: 200` でも動くが I5 の保証外**であることを別ケースで観測する (落ちないことの確認であって、値の一致は要求しない) |
-| **I8** | runbook が逐語再現できる | tmp 環境で runbook のコマンド列をそのまま実行し、9 本が配備され `list_deployed_plugins` 相当の inventory に 9 本が `outputs` 付きで現れる。**コピー手順が `__pycache__` を巻き込んでも `check_candidate_snapshot` が無視すること** (`gate_pytest.py:61-64` で確認済) と、**bless 後も `plugins/_human/<名前>` が残る**ことを runbook のクリーンアップ行で扱う |
+| **I8** | runbook が逐語再現でき、**途中失敗からの再開**も成立する | (a) tmp 環境で runbook のコマンド列をそのまま実行し、9 本が配備され `list_deployed_plugins` 相当の inventory に 9 本が `outputs` 付きで現れる。**コピー手順が `__pycache__` を巻き込んでも `check_candidate_snapshot` が無視すること** (`gate_pytest.py:61-64` で確認済) と、**bless 後も `plugins/_human/<名前>` が残る**ことを runbook のクリーンアップ行で扱う。(b) **部分配備ケース (§6.3)**: k 本目 (例: 5 本目) の `_human` 候補をわざと壊して bless を rc=1 にし、**k−1 本が配備済のまま残る**ことと、候補を直して k 本目から再開すると**最終的に 9 本揃う**ことを観測する |
 
 ### 6.1 テストの置き場と、それぞれが誰に回されるか
 
@@ -174,28 +255,67 @@ strategy を評価するとき、worker は依存 indicator ごとに `df.tail(d
 
 | 系統 | 置き場 | 誰が回すか | 載せるもの |
 |---|---|---|---|
-| 自己テスト | `docs/examples/plugins/<名前>/test_plugin.py` | ① 開発中の `uv run pytest` ② 配備時の bless (`switch._run_full_gate` → `run_gate_pytest`、subprocess + Landlock) ③ 改善 agent が複製・改造したとき `run_plugin_tests` | I3 (参照一致) / I4 (末尾切り詰め不変) / warmup 境界の pin / ゼロ除算の分岐 |
+| 自己テスト | `docs/examples/plugins/<名前>/test_plugin.py` | ① 開発中の `uv run pytest` ② 配備時の bless (`switch._run_full_gate` → `run_gate_pytest`、subprocess + Landlock) ③ 改善 agent が複製・改造したとき `run_plugin_tests` | I3 (参照一致) / I4 (接頭辞因果性) / warmup 境界の pin / ゼロ除算の分岐 / params 検証の分岐 |
 | 回帰テスト | `tests/` | `uv run pytest` のみ | I1 / I2 / I6 / I7 / I8 |
 
 自己テストは **Landlock 下の subprocess で走る**ので、ファイル I/O・ネットワークは使えず、`check_source(..., extra_allowed={"pytest","plugin"})` を通る必要がある (§5.1 で PASS を実測)。**回すたびに全 9 本ぶんが走る**ので、I5 の「5000 本 × 40 seed」のような重い比較は自己テストに置かず、repo 側の回帰テストに置く。自己テストには軽い版 (数百本 × 2〜3 seed) を置く。
 
+### 6.2 I4 を「末尾切り詰め不変」から「接頭辞因果性」へ置き換えた根拠 (実測)
+
+旧稿の I4 (末尾を k 本落として残り行が不変) は、**その切り詰めで参照値が動く未来参照しか捕まえられない** (codex r1 I2)。わざと未来を読む実装 4 種を書いて両方の試験を当てた実測:
+
+| 壊れた実装 | 旧 I4 (末尾切り詰め) | 新 I4 (接頭辞因果性) |
+|---|---|---|
+| (a) `close.shift(-1)` を挟む | 赤 | 赤 |
+| (b) `rolling(..., center=True)` | 赤 | 赤 |
+| (c) 系列全体の min/max で正規化 | **緑 (見逃し)** ※ | 赤 |
+| (d) 行 0 の出力にだけ `close.iloc[1]` を代入 | **緑 (見逃し)** | 赤 |
+| 正しい SMA / rolling std / EMA / Wilder / ADX / Bollinger | 緑 | 緑 (**誤差 0.0**、8 seed × 12 点) |
+
+※ (c) は「極値が削除される末尾側に**も**ある」fixture では旧 I4 でも赤になるが、極値を中間にだけ置いた fixture では素通りした。**fixture の作り方次第で結果が変わる試験は不変条件の観測になっていない** — 接頭辞因果性は fixture に依存せず、`t` 以降の行を 1 つでも読んだ時点で必ず赤になる。
+
+(d) は「行 0 だけ未来を読む」= 末尾をいくら落としても行 0 の値は変わらないので、旧 I4 では**原理的に**検出できない。この 1 件だけで置き換えの根拠は足りている。
+
+**正しい実装での誤差が 0.0 になる理由**: 接頭辞 `df[:t+1]` は全履歴と**先頭を共有する**ので、`ewm` の再帰も `rolling` の逐次更新も同じ順序で同じ浮動小数演算を辿る。先頭依存 (§3.2) の誤差はここには混ざらない — それを測るのは I5 の役目で、2 つの試験は測っている次元が違う。公差 1e-9 は pandas の実装差に対する安全率であって、丸めを吸収するためのものではない。
+
 **warmup 境界の pin の形**は既存 `rsi_indicator/test_plugin.py:46-48` に倣う — 「N 行目までは NaN」だけでなく「N+1 行目には値が入る」も見る (片側だけだと warmup が 1 本早く/遅く明ける変異を検出できない)。§3.1 の warmup 列の数値がその境界。
 
-**I1 の載せ方**: 既存の `test_discover_sample_plugins_directory_not_rejected` は `discover(docs/examples/plugins)` を回して `{"rsi_indicator", "sma_cross"} <= names` を見るだけなので、9 名を集合に足し、総数も pin する。これにより「3 ファイル構成を崩した」「`config.yaml` の未知キーを書いた」が repo の通常テストで即座に落ちる。
+**I1 の載せ方**: 既存の `test_discover_sample_plugins_directory_not_rejected` は `discover(docs/examples/plugins)` を回して `{"rsi_indicator", "sma_cross"} <= names` を見るだけなので、**9 名を集合に足すだけ**にする (現行と同じ包含形)。**総数は pin しない** — example が 1 本増えただけで落ちる脆いテストになり、観測したい性質「9 本が reject されない」と一致しない (§6 I1 と同じ方針、r1 M1)。これにより「3 ファイル構成を崩した」「`config.yaml` の未知キーを書いた」が repo の通常テストで即座に落ちる。
 
 I3 / I4 は各 plugin の `test_plugin.py` の中 (= bless の pytest ゲートが毎回回す)。I1 / I2 / I5 / I6 / I7 / I8 は repo 側 `tests/` の回帰テスト。
+
+### 6.3 部分配備 — 9 本は束ではない (r1 I4)
+
+**9 本は互いに独立であり、束としての原子性は要求しない。** `bless_candidate` は候補 1 本ごとに版作成 → live symlink 切替まで完了する (`switch.py:1772`, `:1818`, `:1905`) ので、5 本目が失敗しても先の 4 本は**有効な配備としてそのまま残る**。9 本を束で巻き戻す機構は無く、作らない (R2「新機構を作らない」)。
+
+runbook の規則:
+
+| 場面 | 何をするか |
+|---|---|
+| bless が rc=0 (`approval id=<N>` を stdout) | 次の 1 本へ進む |
+| bless が rc=1 (`エラー: ...` を stderr、`cli.py:590-593`) | **そこで停止する。既に配備済の分は巻き戻さない** (それらは単体で妥当な配備であり、戻す方がかえって状態を壊す) |
+| 停止後 | 配備済の名前を確認 → 失敗した候補の `plugins/_human/<名前>` を直す → **同じ名前から再開**する。先に成功した分は再実行しない — 再 bless しても害は無いが承認行だけが無駄に増える (実コード: `version_store.create_version_dir` は同 `artifact_hash` の版があれば作り直さず既存を返す冪等実装 `version_store.py:77-85`、`switch_required` も `old_target == new_target` なら False `switch.py:1888`。一方 `approvals_store.create` は無条件に走る `switch.py:1891-1893`) |
+| 9 本完了後 | `plugins/_human/<名前>` を 9 本ぶん片付ける (bless は消さない。残すと後日の `afx plugin materialize <名前>` が `FileExistsError` になる、`switch.py:1576-1581`) |
+
+**配備済名の確認方法 (実コードで確認した事実)**: **`afx` には plugin 一覧のサブコマンドが無い** — `plugin` のサブコマンドは `submit` / `bless` / `materialize` / `lock` / `retire` の 5 つだけ (`backtest/cli.py:126-156`)。運用チャネルの `status` も plugin を出さない (`commands.py:298-315`)。したがって runbook が指示する確認は次の 2 つ:
+1. 各 bless の **rc と stdout の `approval id=<N>`** (1 本ごとの一次証跡)。
+2. `ls -l plugins/` — 配備済は `<名前> -> .versions/<名前>/<artifact_hash>` の symlink として見える (`switch.py` の切替形)。`_human` / `_retired` / `.versions` は先頭 `_`/`.` なので discover 対象外。
+
+配備済かどうかの**最終的な正**は「approved 行 + hash 一致 + discover 通過」を見る `tools.plugin_loader.approved_plugins` であり、これは service 起動時と改善 mission 開始時に評価される。runbook は「service を再起動して起動ログに 9 本が載ることを確認する」を最終確認として置く。
+
+
 
 ## 7. 変更ファイル一覧
 
 **新規 (27 ファイル)**: `docs/examples/plugins/{sma,ema,rsi,macd,bollinger,atr,adx,stochastic,ichimoku}/{plugin.py,config.yaml,test_plugin.py}`
 
-**新規 (1 ファイル)**: `docs/operations/indicator-initial-set-deploy-2026-09-19.md` — 配備 runbook。冒頭に **「暫定。[first-run-setup] (初回起動の対話ウィザード) が一括配備に置き換える。恒久なのは『採用には人間の明示的確認が要る、LLM の自動配備経路は作らない』という規律のほう」** を明記。手順は (0) 既存の配備名との衝突確認 → (1) コピー → (2) `afx plugin bless <名前> --from _human` → (3) `plugins/_human/<名前>` の後始末 → (4) 9 本ぶん繰り返し → (5) 確認。
+**新規 (1 ファイル)**: `docs/operations/indicator-initial-set-deploy-2026-09-19.md` — 配備 runbook。冒頭に **「暫定。[first-run-setup] (初回起動の対話ウィザード) が一括配備に置き換える。恒久なのは『採用には人間の明示的確認が要る、LLM の自動配備経路は作らない』という規律のほう」** を明記。手順は (0) 既存の配備名との衝突確認 → (1) コピー → (2) `afx plugin bless <名前> --from _human` → (3) rc の確認 (**rc=1 ならそこで停止、既配備分は巻き戻さない** — §6.3) → (4) `plugins/_human/<名前>` の後始末 → (5) 9 本ぶん繰り返し → (6) service 再起動による最終確認。**strategy 作者向けに「依存する strategy は `max_bars` を 400 以上に」の 1 行も runbook に置く** (§3.2)。
 
-**変更 (1 ファイル)**: `tests/plugin/test_loader.py` の `test_discover_sample_plugins_directory_not_rejected` に 9 名を追加 (I1)。
+**変更 (1 ファイル)**: `tests/plugin/test_loader.py` の `test_discover_sample_plugins_directory_not_rejected` の包含集合に 9 名を追加 (I1、総数の pin は置かない)。
 
-**新規テスト (1〜2 ファイル)**: I2 / I6 / I7 / I8 を載せる repo 側テスト (`tests/plugin/test_indicator_initial_set.py` 等)。
+**新規テスト (1〜2 ファイル)**: I2 / I5 / I6 / I7 / I8 を載せる repo 側テスト (`tests/plugin/test_indicator_initial_set.py` 等)。
 
-**変更しないもの (明示)**: `src/` 配下すべて、`src/agentic_fx/loops/prompts/improve_mission.md`、`config/settings.yaml*`、既存の `docs/examples/plugins/{rsi_indicator,rsi_pullback,sma_cross}`。
+**変更しないもの (明示)**: `src/` 配下すべて、`src/agentic_fx/loops/prompts/improve_mission.md`、`config/settings.yaml*`、既存の `docs/examples/plugins/{rsi_indicator,rsi_pullback,sma_cross}`、`tests/` の既存ファイル (上記 1 ファイルへの追記を除く)。
 
 **prompt (規律 7) を変えない根拠**: 規律 7 は「配備済 indicator を `list_deployed_plugins()` で見て `indicators:` で宣言せよ」「無い指標は自前計算せず `不足指標:` として起票せよ」と書いてある。初期セットが配備されると `list_deployed_plugins()` の応答が 9 本増えるだけで、**文言が指す動作は何も変わらない** (「無い指標」が減るだけ)。「初期セットの 9 本」を prompt に列挙すると、配備状況と prompt 文言の二重管理が生まれ、片方だけ古くなる drift の土台になる — inventory を唯一の正に保つ。
 
@@ -217,9 +337,23 @@ I3 / I4 は各 plugin の `test_plugin.py` の中 (= bless の pytest ゲート�
 | D3 | **(a) 未配備** — 指揮者が 2026-09-19 に実 `plugins/` の一覧 (`rsi_indicator` / `rsi_wilder` のみ) と実 DB の承認 payload 名 (read-only) を確認済。9 名との衝突なし。runbook の手順 (0) の確認は残す (将来の再実行に備える) | [wiring] U6 の prerequisite 3 本は未着手のまま本束に吸収する |
 | D4 | **(a) 一律 `max_bars: 400`** | §3.2 の理由 2。`min(strategy.max_bars, indicator.max_bars)` 規則の下で一部の依存だけが静かに劣化する形を作らない |
 
+### 8.2 設計レビュー r1 の処置 (codex terra、`tmp/design-indicator-initial-set/codex-design-r1.md`、C0 / I4 / M2)
+
+**6 件とも採用** (2026-09-19 指揮者裁定)。
+
+| r1 | 指摘 | 処置 |
+|---|---|---|
+| I1 | `int(params.get(...))` は型検証でなく変換で、`14.9` / `"14"` を黙って受理する | §4 を書き換え。**元値の型を確認する**形 (`bool` でない `int`) に。`_int_param` / `_float_param` の骨格を掲載し、9 本が同じ十数行を持つ理由 (1 フォルダ 3 ファイル制約) も明記。相互関係は `macd` の `fast < slow` のみ要求 (退化と符号反転を塞ぐ)、`ichimoku` の順序は**要求しない** (パラメータ探索を塞がない)。`num_std` は有限 `> 0`。**例外時の 6 経路の振る舞い**を実コードで確認して表に (承認・バックテストは fail closed、producer / `get_indicators` は fail open だが誤値が発注に届く経路なし) |
+| I2 | I4 (末尾切り詰め不変) は任意の未来参照を検出しない | I4 を**接頭辞因果性**に置換。壊れた実装 4 種で実測し、旧 I4 が (c) 全体 min/max 正規化 (fixture 次第) と (d) 行 0 だけ未来参照を**見逃す**こと、新 I4 が 4 種すべてで赤になり正しい実装では誤差 0.0 になることを §6.2 に記録 |
+| I3 | `max_bars=400` の 1e-6 は受入データ集合から導けない | §3.2 を (i) 解析的上界 `|Δseed|·(1−α)^(N−p)` (Wilder 14 で 3.77e-13、ADX の入れ子で 1.07e-12、`|Δseed| ≤ 100` を掛けて 1.07e-10 = 実測 1.1e-10 と一致) と (ii) 仕様化データ範囲の回帰試験の 2 段に再構成。I5 は「普遍的保証ではなく回帰試験」と明記し、fixture の値域・生成式・seed・401 本目スパイクを仕様化 |
+| I4 | 9 本の逐次 bless 失敗時の部分配備が未規定 | §6.3 を新設。**束としての原子性は要求しない**、失敗したらそこで停止し既配備分は巻き戻さない、同じ名前から再開、完了後に `_human` を片付ける。`afx` に plugin 一覧のサブコマンドが**無い**ことを実コードで確認し (`cli.py:126-156`)、確認方法を rc / `ls -l plugins/` / service 再起動ログの 3 つに具体化。I8 に部分配備からの再開ケース (b) を追加 |
+| M1 | I1 の総数 pin 方針が §6 と §6.1 で矛盾 | §6.1 を「集合包含のみ、総数は pin しない」に統一 |
+| M2 | §1 の「`tests/` を変更しない」が §7 と矛盾 | §1 を「`src/` は変更しない。`tests/` は §7 の既存 1 ファイルへの追記と新規ファイルのみ」に訂正 |
+
 ## 9. 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-19 | v1.2 | 設計レビュー r1 の 6 件を全採用 (§8.2 に対応表)。**§4** params 検証を「変換」から「型の確認」へ書き換え + helper 骨格 + 例外時 6 経路の振る舞い表、**§6 I4** を末尾切り詰め不変 → **接頭辞因果性**へ置換 (+ §6.2 に壊れた実装 4 種の red 実測)、**§3.2** を解析的上界 + 仕様化データ範囲の 2 段に再構成し **I5** を回帰試験と明記、**§6.3** 部分配備の規則を新設 (+ I8 に再開ケース)、§6.1 の総数 pin 矛盾と §1 の `tests/` 記述を訂正 | codex terra 設計レビュー 1 周目 `tmp/design-indicator-initial-set/codex-design-r1.md` (Critical 0 / Important 4 / Minor 2)、2026-09-19 指揮者裁定で 6 件とも採用 | — |
 | 2026-09-19 | v1.1 | §8.1 裁定結果 D1〜D4 を追記 (いずれも推奨どおり: `y_0 = x_0` / slow stochastic、fast は `k_period: 1` の上書きで得る / 9 名は未配備を確認 / `max_bars` 一律 400) | 指揮者裁定 (可逆な定義選択)。D3 は実 `plugins/` 一覧と実 DB の read-only 確認 | — |
 | 2026-09-19 | v1.0 | 初稿。ユーザー承認済 設計 v0.1 (R1〜R8) をコードベースの実測で裏取りし spec 化。noop ゲートが人間 bless 経路に掛からないこと・9 指標の API が `check_source` を通ること・`max_bars` 400 の収束見積り・warmup 本数を実測で確定。要裁定 D1〜D4 を起票 | 設計 v0.1 承認 (2026-09-19)、[indicator-consumption-wiring] 完了後の次束 | - |
