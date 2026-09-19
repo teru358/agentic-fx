@@ -1,0 +1,7 @@
+kind: indicator
+outputs: [macd, signal, hist]
+max_bars: 400
+params:
+  fast: 12
+  slow: 26
+  signal_period: 9
