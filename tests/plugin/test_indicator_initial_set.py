@@ -10,6 +10,8 @@ I1 は `tests/plugin/test_loader.py::test_discover_sample_plugins_directory_not_
 """
 from __future__ import annotations
 
+import functools
+import hashlib
 import importlib.util
 import re
 import shutil
@@ -83,7 +85,7 @@ def _tolerance(delta_key: str, base: float) -> float:
 
 # --- I5 の前提: 宣言 `max_bars` ---------------------------------------------
 
-def test_all_nine_declare_max_bars_400():
+def test_all_nine_declare_max_bars_400(examples_copy):
     """9 本の `config.yaml` が `max_bars: 400` を宣言していること (設計書 §3.2 / D4)。
 
     **`_last_row_deltas` の結合だけでは足りない**ので独立に pin する。段 0 の実測:
@@ -94,19 +96,61 @@ def test_all_nine_declare_max_bars_400():
     `test_nine_indicators_bless_in_sequence` も同じ値を見ているが、あちらは
     `slow` の bless 実走 (段 0 実測 41 秒) なのでここに 1 秒の観測点を置く。
     """
-    for meta in _nine_metas():
+    for meta in _nine_metas(examples_copy):
         assert meta.max_bars == 400, (meta.name, meta.max_bars)
 
 #: `__pycache__` / `.pytest_cache` は `check_candidate_snapshot` が無視する
 #: (`gate_pytest.py:43,46-55`) ので**除外しない** — runbook の
 #: `cp -r` がそのまま巻き込んでも通ることを I8(a) で観測する。
 
+#: `examples_copy` の忠実性比較から外すディレクトリ名。`__pycache__` は
+#: 過去の import が repo 側にだけ残していることがあり (`.gitignore` 済)、
+#: `.pytest_cache` も同様に**コピー対象外**なので、比較の前に両側から落とす。
+_COPY_IGNORED_DIRS = ("__pycache__", ".pytest_cache")
 
-def _nine_metas():
-    """`docs/examples/plugins` を discover して 9 名を名前で取り出す。"""
-    metas = {m.name: m for m in discover(EXAMPLES) if m.name in NINE}
+
+def _relative_file_hashes(root: Path) -> dict[str, str]:
+    """`root` 配下の全ファイルを `{相対パス (posix): sha256}` で返す。
+
+    `_COPY_IGNORED_DIRS` 配下は除外する。**ファイル名を列挙せず木を全走査
+    する** — 「3 ファイルだけ一致」を見ると、将来 4 つ目のファイルを足した
+    ときにコピー側に届いているかを誰も見なくなる。
+    """
+    out: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if any(part in _COPY_IGNORED_DIRS for part in path.parts):
+            continue
+        if not path.is_file():
+            continue
+        out[path.relative_to(root).as_posix()] = hashlib.sha256(
+            path.read_bytes()).hexdigest()
+    return out
+
+
+@functools.lru_cache(maxsize=None)
+def _nine_metas(root: Path) -> tuple:
+    """`root` (= `examples_copy`) を discover して 9 名を名前で取り出す。
+
+    **repo の `docs/examples/plugins` は読まない** (r2 codex C1)。metadata を
+    repo から、`compute` をコピーから取ると**二重出所**になり、コピーが
+    元と食い違っても (`ignore_patterns` を広げる / コピー元を変える)
+    `co_filename` の「repo の外」判定だけでは何も落ちない。忠実性は
+    `examples_copy` fixture が hash で観測し、出所の単一性はここで pin する。
+
+    `lru_cache` は `discover` (ディレクトリ走査 + YAML 解析 + AST 検証 +
+    ハッシュ) のモジュール中 ~46 回の再実行を 1 回に畳む (/code-review #1。
+    指揮者の実測で非 slow 8 本が 1.13s -> 0.85s)。`root` は session スコープ
+    fixture が返す不変の `Path`。**戻り値は tuple** — cache が同じ
+    オブジェクトを配るので、呼び出し側が並べ替えられる list を渡さない。
+    """
+    metas = {m.name: m for m in discover(root) if m.name in NINE}
     assert sorted(metas) == sorted(NINE), sorted(metas)
-    return [metas[n] for n in NINE]
+    ordered = tuple(metas[n] for n in NINE)
+    for meta in ordered:
+        assert Path(meta.path).is_relative_to(root), (meta.name, meta.path)
+        assert not Path(meta.path).is_relative_to(EXAMPLES), (meta.name,
+                                                              meta.path)
+    return ordered
 
 
 def _load_compute(name: str, plugin_py: Path):
@@ -138,11 +182,26 @@ def examples_copy(tmp_path_factory) -> Path:
     `__pycache__` / `.pytest_cache` は複製しない (I8 の `_stage` は逆に
     **除外しない** — あちらは `cp -r` が巻き込んでも bless が通ることを
     観測するのが目的)。
+
+    **コピーの忠実性をここで観測する (r2 codex C1)**。9 本それぞれについて
+    「`_COPY_IGNORED_DIRS` を落とした後の相対パス集合とファイルごとの
+    sha256」が repo 側と一致することを assert する。これが無いと、
+    `ignore_patterns` を広げる / コピー元を取り違える類の変更で、I2 / I5 が
+    **配備されるものとは別の artifact** を静かに検査する形になる
+    (`ignore_patterns` に `*.yaml` を足す変異は、この assert を入れる前は
+    受入テスト 8 本すべて緑のまま通った — 指揮者の実測)。assert を
+    **fixture 本体に置く**ので、これを使う全テストが同時に fail closed になる。
     """
     dest = tmp_path_factory.mktemp("examples") / "plugins"
     shutil.copytree(EXAMPLES, dest,
-                    ignore=shutil.ignore_patterns("__pycache__",
-                                                  ".pytest_cache"))
+                    ignore=shutil.ignore_patterns(*_COPY_IGNORED_DIRS))
+    for name in NINE:
+        want = _relative_file_hashes(EXAMPLES / name)
+        got = _relative_file_hashes(dest / name)
+        assert want, name          # 空同士の一致で通らないこと
+        assert got == want, (name, sorted(set(want) ^ set(got)),
+                             sorted(k for k in set(want) & set(got)
+                                    if want[k] != got[k]))
     return dest
 
 
@@ -150,10 +209,18 @@ def test_loaded_plugins_never_come_from_the_repo_examples_directory(
         examples_copy):
     """I2 / I5 が実行する `compute` が **repo の外**から来ていること。
 
-    この pin が無いと `_load_compute` の引数を `meta.path / "plugin.py"`
-    に戻すだけで repo へ bytecode を書く形に静かに戻る (逆変異で実測)。
+    この pin が無いと `_load_compute` の引数を `EXAMPLES / meta.name /
+    "plugin.py"` に戻すだけで repo へ bytecode を書く形に静かに戻る
+    (逆変異で実測)。
+
+    **r2 codex C1 以後、`meta.path` 自体もコピー側を指す** (`_nine_metas` が
+    `examples_copy` を discover する) ので、ここは「コピーが repo の外に
+    ある」ことの pin であり、**コピーが元と同じ中身であること**は
+    `examples_copy` fixture の hash 比較が、**metadata と実装の出所が
+    1 つであること**は `_nine_metas` の 2 つの assert が担当する。3 つで
+    1 組。
     """
-    for meta in _nine_metas():
+    for meta in _nine_metas(examples_copy):
         compute = _load_compute(meta.name,
                                 examples_copy / meta.name / "plugin.py")
         assert not Path(compute.__code__.co_filename).is_relative_to(
@@ -183,7 +250,7 @@ def test_all_nine_pass_the_indicator_validator(examples_copy):
     (`examples_copy` の注記)。
     """
     df = _df(300)
-    for meta in _nine_metas():
+    for meta in _nine_metas(examples_copy):
         compute = _load_compute(meta.name,
                                 examples_copy / meta.name / "plugin.py")
         out = compute(df, dict(meta.params))
@@ -205,7 +272,7 @@ def test_declared_params_match_each_plugins_own_defaults(examples_copy):
     値の表を手で持たずに**振る舞いで**比べる (どちらの向きのずれも捕まる)。
     """
     df = _df(300)
-    for meta in _nine_metas():
+    for meta in _nine_metas(examples_copy):
         compute = _load_compute(meta.name,
                                 examples_copy / meta.name / "plugin.py")
         declared = compute(df, dict(meta.params))
@@ -297,7 +364,7 @@ def _last_row_deltas(df: pd.DataFrame, examples_copy: Path) -> dict:
     ならない (段 0 の実測)。
     """
     out: dict[str, float] = {}
-    for meta in _nine_metas():
+    for meta in _nine_metas(examples_copy):
         compute = _load_compute(meta.name,
                                 examples_copy / meta.name / "plugin.py")
         tail = df.tail(meta.max_bars).copy(deep=True)
