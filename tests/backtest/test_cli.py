@@ -1609,3 +1609,26 @@ def test_plugin_lock_reports_unresolvable_dependency(tmp_path, capsys, monkeypat
                     "rsi_pullback"]) == 1
     assert capsys.readouterr().err.strip().splitlines()[-1] == \
         "indicator_unresolved:rsi:not_found"
+
+
+def test_plugin_materialize_containment_error_is_rc1_message(tmp_path, monkeypatch, capsys):
+    """[switch-ops-hardening] AC-11: `materialize_plugin` の containment 拒否
+    (`ValueError`) は `_plugin_materialize` の中で処理され、rc=1 と
+    `エラー: ` の 1 行になる (外側の包括 catch に落ちない)。"""
+    import argparse as _argparse
+
+    from agentic_fx.backtest import cli as _cli
+    from agentic_fx.plugin import switch as _switch
+
+    def _boom(root, name):
+        raise ValueError(
+            "materialize_plugin: live symlink target escapes plugins_root: /x")
+
+    monkeypatch.setattr(_switch, "materialize_plugin", _boom)
+    rc = _cli._plugin_materialize(
+        None, None, _argparse.Namespace(name="sma"), tmp_path)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("エラー: ")
+    assert "escapes plugins_root" in err

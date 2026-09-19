@@ -999,16 +999,12 @@ def test_runbook_cli_bless_gate_failure_exits_1_with_error_on_stderr(
 def test_runbook_cli_bless_after_post_gate_failure_raises_traceback(
         tmp_path, monkeypatch, capsys):
     """I8 (CLI ゲート後失敗、設計書 §6.3 (B)): 未終端 journal が残った状態で
-    同名を再 bless すると、CLI から **`UnresolvedJournalError` が素通りして
-    traceback になる** ([[cli-bless-unresolved-journal]])。
-
-    **これは「現状をそのまま pin する」テストであり、望ましい姿ではない** —
-    `UnresolvedJournalError` は `Exception` 直下 (`switch.py:1572`) なので
-    `_plugin_bless` の `except (ValueError, SandboxError)` にも
-    `dispatch` の `except (ValueError, KeyError, OSError, sqlite3.Error, ...)`
-    にも掛からない。ticket [cli-bless-unresolved-journal] が直ったら
-    (rc=1 + 収束手順の案内を stderr に出す形になるはず)、**このテストは
-    その新しい振る舞いへ書き換える**こと。
+    同名を再 bless すると、CLI は **rc=1 と `エラー: ` の 1 行**で拒否する
+    ([switch-ops-hardening] T6 で是正。旧稿は `UnresolvedJournalError` が
+    `_plugin_bless` の `except (ValueError, SandboxError)` を素通りして
+    **traceback** になるのを pin していた — その旧挙動をこの版で置き換えた)。
+    メッセージには収束に必要な `op_id` と `approval_id`、および次の 1 手が
+    含まれる。
 
     1 回目の失敗注入 (`record_version` の `OSError`) は逆に
     `dispatch` の `except OSError` に**捕まる**ので rc=1 になる — 同じ
@@ -1031,6 +1027,12 @@ def test_runbook_cli_bless_after_post_gate_failure_raises_traceback(
     finally:
         conn.close()
 
-    with pytest.raises(plugin_switch.UnresolvedJournalError) as excinfo:
-        main(["plugin", "bless", "sma", "--from", "_human"])
-    assert f"op_id={open_journal['op_id']}" in str(excinfo.value)
+    rc2 = main(["plugin", "bless", "sma", "--from", "_human"])
+    err2 = capsys.readouterr().err
+    assert rc2 == 1
+    assert "Traceback" not in err2
+    assert f"op_id={open_journal['op_id']}" in err2
+    assert f"approval_id={open_journal['approval_id']}" in err2
+    # **この行は T6 で足した案内文そのもの** — 元の例外文言にも
+    # "approval retry" は含まれるので、そちらでは判別力がない (変異で実測)。
+    assert "収束手順: サービスの対話シェルで `approval list`" in err2

@@ -586,6 +586,17 @@ def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
             conn, name=args.name, human_dir=human_dir, settings=settings,
             now=datetime.now(timezone.utc), decided_by="human_cli",
             on_floor_warning=_warn, activity=activity)
+    except plugin_switch.UnresolvedJournalError as e:
+        # [switch-ops-hardening] T6: `UnresolvedJournalError` は `Exception`
+        # 直系なので `(ValueError, SandboxError)` にも外側の包括 catch にも
+        # 掛からず traceback になっていた。`_plugin_retire` (同ファイル) と
+        # 同じ作法 (rc=1 + `エラー: `) に揃え、**次の 1 手**を添える。
+        # 元メッセージの `op_id=` / `approval_id=` は runbook と既存テストが
+        # 依存しているので必ず含める。
+        print(f"エラー: {e}\n"
+              "  収束手順: サービスの対話シェルで `approval list` → "
+              "`approval retry <approval_id>`", file=sys.stderr)
+        return 1
     except (ValueError, plugin_sandbox.SandboxError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
@@ -597,7 +608,10 @@ def _plugin_materialize(conn, settings, args: argparse.Namespace, root: Path) ->
     plugins_dir = root / "plugins"
     try:
         dest = plugin_switch.materialize_plugin(plugins_dir, args.name)
-    except (FileExistsError, FileNotFoundError, OSError) as e:
+    except (FileExistsError, FileNotFoundError, OSError, ValueError) as e:
+        # [switch-ops-hardening] T6: `materialize_plugin` は live symlink が
+        # plugins_root の外を指すとき `ValueError` を投げる (containment 検査)。
+        # 従来は外側の包括 catch に落ちてメッセージ形式だけが不揃いだった。
         print(f"エラー: {e}", file=sys.stderr)
         return 1
     print(f"materialize: {dest}")
