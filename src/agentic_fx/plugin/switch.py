@@ -1446,7 +1446,7 @@ def approve_candidate(
     conn: sqlite3.Connection, approval_id: int, *,
     decided_by: str, now: datetime, plugins_root: Path, settings,
     activity: "ActivityLog | None" = None,
-) -> None:
+) -> "ApprovalOutcome":
     """P2 (approve) の入口。plugins_root は FS 操作 (版・git・切替) の起点、
     settings は将来のゲート再検証・kind 別分岐のために渡す (現行 P2 手順は
     gate を再実行しないが、シグネチャで揃えておくことで retry_approval/
@@ -1478,7 +1478,9 @@ def approve_candidate(
         row = conn.execute(
             "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
         if row["status"] != "pending":
-            return
+            # [switch-ops-hardening] T5: status の出所は **read** (この行の SELECT)。
+            return ApprovalOutcome(outcome="already_decided", name=name,
+                                  status=row["status"])
         payload = json.loads(row["payload_json"])
 
         if _is_superseded(conn, row, payload):  # 0c
@@ -1494,7 +1496,10 @@ def approve_candidate(
             # I1 是正: 終端決定 (invalidated) の tx 直後に staging 候補を
             # 削除する (§5.1 手順 3)。
             _drop_staging_candidate(plugins_root, payload, activity=activity)
-            return
+            # T5: status の出所は **decision 結果** (同 lock 内で成功した
+            # apply_decision に渡したリテラル — 再読しない)。
+            return ApprovalOutcome(outcome="invalidated", name=name,
+                                  status="invalidated")
 
         # [indicator-consumption-wiring] §2.3: P2 (決定時) に `require` で
         # **解決だけ**行う (gate は再実行しない)。submit → approve の間に
@@ -1519,6 +1524,7 @@ def approve_candidate(
         # 経由せずここで直接処理する、11c の NameError landmine を踏まない)。
         existing_journal = journal_store.get_open_by_name(conn, name)
         op_id = None
+        rolled_back_op_id = None  # [switch-ops-hardening] T3 (§3.5)
         if existing_journal is not None and existing_journal["approval_id"] == approval_id:
             op_id = existing_journal["op_id"]
             if existing_journal["phase"] == "switched":
@@ -1527,13 +1533,42 @@ def approve_candidate(
                 # (§5.1-1 (a))。再検証失敗時は `_reverify_switched_journal`
                 # が journal を reverted で閉じ activity ERROR を書く —
                 # ここでは pending のまま return するだけでよい。
-                if not _reverify_switched_journal(
-                        conn, existing_journal, plugins_root=plugins_root,
-                        payload=payload, now=now, activity=activity):
-                    return
-                _finalize_decision(conn, approval_id, op_id=op_id,
-                                   decided_by=decided_by, now=now)
-                return
+                # [switch-ops-hardening] T3 (設計書 §3.2、案 C): journal が
+                # switched でも **live が本当に切り替わっているとは限らない**
+                # (`advance(switched)` を commit してから `switch_live` を
+                # 呼ぶ journal-first の順序ゆえ)。分類してから枝を選ぶ。
+                live_class = classify_live(plugins_root, existing_journal)
+                if live_class == "foreign":
+                    # 0d-2b: 第三者に触られた — 触らず人間待ち (fail closed)。
+                    if activity is not None:
+                        activity.write(
+                            Category.APPROVAL,
+                            "switch_retry_unrecognized_live_target",
+                            f"name={name} op_id={op_id}")
+                    return ApprovalOutcome(outcome="foreign_waiting", name=name,
+                                          status="pending", op_id=op_id)
+                if live_class == "switched":
+                    # 0d-2a: 切替は完了している — 従来どおり再検証して決定。
+                    if not _reverify_switched_journal(
+                            conn, existing_journal, plugins_root=plugins_root,
+                            payload=payload, now=now, activity=activity):
+                        return ApprovalOutcome(
+                            outcome="still_pending", name=name, status="pending",
+                            op_id=op_id, reason="reverify_failed")
+                    _finalize_decision(conn, approval_id, op_id=op_id,
+                                       decided_by=decided_by, now=now)
+                    return ApprovalOutcome(
+                        outcome="deployed", name=name, status="approved",
+                        op_id=op_id, target=existing_journal["new_target"])
+                # 0d-2c (not_switched): 停止行を巻き戻して閉じ、**新しい
+                # journal 行で手順を頭から流す** (§5.3 契機③「手順を頭から
+                # 流す」+ §5.1-1 (b)「巻き戻してから本来の操作を適用する」)。
+                # `op_id` を None に戻さないと下流が終端行を使い回してしまう。
+                _revert_one(conn, existing_journal, plugins_root=plugins_root,
+                           now=now, activity=activity)
+                conn.commit()
+                rolled_back_op_id = op_id
+                op_id = None
         elif existing_journal is not None:
             # 別 approval_id の未完ジャーナルが同名に存在する場合、この
             # approve は進められない — `plugin_switch_journal` の部分
@@ -1557,8 +1592,10 @@ def approve_candidate(
 
         def _close_own_unfinished_journal_if_any() -> None:
             # 確定-1 (Critical): この approval 自身の未完ジャーナル
-            # (preparing/versioned/recorded — switched はここに来ない、上の
-            # 0d 分岐で先に処理・return 済み) が残っていれば、候補が壊れて
+            # (preparing/versioned/recorded。**switched のうち
+            # `not_switched` は 0d-2c が既に閉じて op_id=None にしている**
+            # ので、ここに残る switched 行は無い — [switch-ops-hardening] T3
+            # で前提が変わった箇所) が残っていれば、候補が壊れて
             # pending 留置する前に `_revert_one` で閉じる。閉じないと name が
             # 永久に `UnresolvedJournalError` で封鎖される
             # (verified-local-round1.md 確定-1)。`_revert_one` は非 switched
@@ -1580,7 +1617,10 @@ def approve_candidate(
                 candidate_path=candidate_path, name=name)
         except CandidateMissingError:
             _close_own_unfinished_journal_if_any()
-            return  # pending のまま (§8.1-29)
+            return ApprovalOutcome(  # pending のまま (§8.1-29)
+                outcome="still_pending", name=name, status="pending",
+                op_id=op_id, rolled_back_op_id=rolled_back_op_id,
+                reason="candidate_missing")
 
         try:
             check_candidate_snapshot(candidate_dir)
@@ -1597,12 +1637,18 @@ def approve_candidate(
             # `test_approve_candidate_missing_stays_pending` で red に
             # ならず survive してしまう)。
             _close_own_unfinished_journal_if_any()
-            return  # 候補が壊れている/検査失敗 → pending のまま
+            return ApprovalOutcome(  # 候補が壊れている/検査失敗 → pending のまま
+                outcome="still_pending", name=name, status="pending",
+                op_id=op_id, rolled_back_op_id=rolled_back_op_id,
+                reason="snapshot_invalid")
         if (content_hash != payload["content_hash"]
                 or artifact_hash != payload["artifact_hash"]):
             # 確定-1: ⓐ 不一致でも同様に自分の未完ジャーナルを閉じる。
             _close_own_unfinished_journal_if_any()
-            return  # ⓐ 不一致 → pending のまま
+            return ApprovalOutcome(  # ⓐ 不一致 → pending のまま
+                outcome="still_pending", name=name, status="pending",
+                op_id=op_id, rolled_back_op_id=rolled_back_op_id,
+                reason="hash_mismatch")
 
         live = plugins_root / name
         if live.is_symlink():
@@ -1628,7 +1674,8 @@ def approve_candidate(
                 version_dir=version_dir)
             approvals_store.set_reason(
                 conn, approval_id, "legacy_plain_present", commit=True)
-            return
+            return ApprovalOutcome(outcome="legacy_plain_present", name=name,
+                                  status="pending")
 
         switch_required = not (old_kind == "symlink" and old_target == new_target)
 
@@ -1647,6 +1694,14 @@ def approve_candidate(
 
         if candidate_origin == "staging":
             shutil.rmtree(candidate_dir, ignore_errors=True)
+
+        # [switch-ops-hardening] T5: lock を抜ける前に結果を確定する (§3.5)。
+        return ApprovalOutcome(
+            outcome=("deployed_after_rollback" if rolled_back_op_id is not None
+                     else "deployed"),
+            name=name, status="approved", op_id=op_id,
+            rolled_back_op_id=rolled_back_op_id,
+            target=new_target)
 
 
 class UnresolvedJournalError(Exception):
@@ -1722,16 +1777,17 @@ def retire_plugin(conn: sqlite3.Connection, root: Path, name: str, *,
 def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
                    decided_by: str, now: datetime, plugins_root: Path,
                    settings: "Settings",
-                   activity: "ActivityLog | None" = None) -> None:
+                   activity: "ActivityLog | None" = None) -> "ApprovalOutcome":
     """§5.3 契機③: 手順を頭から流す (lock → plain 検出 → ⓓ → ⓐ → 版(冪等) →
     git(no-op) → 切替(no-op なら済み) → apply_decision)。approve_candidate と
     同じ実装を呼ぶだけ (retry は「approve をもう一度呼ぶ」と同義 — §5.3 本文)。
     B-1 是正で plugins_root/settings を追加した (approve_candidate へそのまま
     透過する)。B3 是正: `activity` も同様に透過する (0d の再検証失敗時の
-    ERROR 記録用)。"""
-    approve_candidate(conn, approval_id, decided_by=decided_by, now=now,
-                      plugins_root=plugins_root, settings=settings,
-                      activity=activity)
+    ERROR 記録用)。[switch-ops-hardening] T5: `approve_candidate` が lock 内で
+    確定した `ApprovalOutcome` を**そのまま透過する** (§3.5)。"""
+    return approve_candidate(conn, approval_id, decided_by=decided_by, now=now,
+                             plugins_root=plugins_root, settings=settings,
+                             activity=activity)
 
 
 def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,

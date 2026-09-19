@@ -92,6 +92,70 @@ def _activity_text(root) -> str:
     return p.read_text(encoding="utf-8") if p.exists() else ""
 
 
+@pytest.mark.slow
+def test_ac1_retry_of_switched_but_unswitched_deploys(tmp_path, monkeypatch):
+    """AC-1 / AC-6: 切替が失敗して journal だけ `switched` になった行を
+    `approval retry` すると、**巻き戻して新しい行で配備まで完了する**。
+    journal は `reverted` + `decided` の **2 行**、旧行は `reverted` のまま。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    live = plugins_root / "sma"
+    assert live.is_symlink()
+    assert live.readlink().as_posix().startswith(".versions/sma/")
+    assert _status(conn, row["approval_id"]) == "approved"
+    rows = _rows(conn)
+    assert len(rows) == 2, f"停止行 + 新行の 2 行でなければならない: {rows}"
+    assert rows[0] == (row["op_id"], "reverted")
+    assert rows[1][1] == "decided" and rows[1][0] != row["op_id"]
+    # outcome (T5)
+    assert outcome.outcome == "deployed_after_rollback"
+    assert outcome.rolled_back_op_id == row["op_id"]
+    assert outcome.target == live.readlink().as_posix()
+    assert outcome.status == "approved"
+
+
+@pytest.mark.slow
+def test_ac7_permanent_switch_failure_keeps_one_open_row(tmp_path, monkeypatch):
+    """AC-7: `switch_live` が失敗し続けても、retry 1 回につき
+    「`reverted` 1 本 + 新しい `switched` 1 本」で **非終端行は常に 1 本**。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch, times=99)
+    plugins_root = root / "plugins"
+
+    for expected_rows in (2, 3):
+        with pytest.raises(OSError, match="injected"):
+            plugin_switch.retry_approval(
+                conn, row["approval_id"], decided_by="human", now=NOW,
+                plugins_root=plugins_root, settings=SETTINGS)
+        rows = _rows(conn)
+        assert len(rows) == expected_rows
+        assert sum(1 for _op, ph in rows if ph not in ("decided", "reverted")) == 1
+        assert _status(conn, row["approval_id"]) == "pending"
+        assert not (plugins_root / "sma").exists()
+
+
+@pytest.mark.slow
+def test_ac8_retry_after_success_is_noop(tmp_path, monkeypatch):
+    """AC-8: 成功後にもう一度 retry しても何も起きない (`already_decided`)。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    plugin_switch.retry_approval(conn, row["approval_id"], decided_by="human",
+                                 now=NOW, plugins_root=plugins_root, settings=SETTINGS)
+    before_rows, before_link = _rows(conn), (plugins_root / "sma").readlink()
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert outcome.outcome == "already_decided" and outcome.status == "approved"
+    assert _rows(conn) == before_rows
+    assert (plugins_root / "sma").readlink() == before_link
+
+
 def _make_foreign(root, row):
     plugins_root = root / "plugins"
     other = plugins_root / ".versions" / "sma" / ("f" * 64)
@@ -99,6 +163,33 @@ def _make_foreign(root, row):
     tmp_link = plugins_root / ".sma.foreign"
     tmp_link.symlink_to(f".versions/sma/{'f' * 64}")
     os.rename(tmp_link, plugins_root / "sma")
+
+
+@pytest.mark.slow
+def test_ac3_foreign_live_is_never_touched(tmp_path, monkeypatch):
+    """AC-3: live が new でも old でもない先を指しているとき、
+    retry も reconcile も **live を 1 バイトも変えない** (fail closed)。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    _make_foreign(root, row)
+    before = (plugins_root / "sma").readlink()
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS,
+        activity=_activity(root))
+    assert outcome.outcome == "foreign_waiting" and outcome.op_id == row["op_id"]
+    assert (plugins_root / "sma").readlink() == before
+    assert _status(conn, row["approval_id"]) == "pending"
+    assert _rows(conn) == [(row["op_id"], "switched")]
+    assert "switch_retry_unrecognized_live_target" in _activity_text(root)
+
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=NOW, settings=SETTINGS,
+        activity=_activity(root))
+    assert (plugins_root / "sma").readlink() == before
+    assert _rows(conn) == [(row["op_id"], "switched")]
+    assert "switch_reconcile_unrecognized_live_target" in _activity_text(root)
 
 
 def _activity(root):
@@ -168,6 +259,24 @@ def test_ac16b_switch_required_zero_reaches_decided(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_ac14d_no_bare_return_in_approval_entrypoints():
+    """AC-14d(1): `approve_candidate` / `retry_approval` の**関数本体**に
+    bare `return` / `return None` が無い (入れ子関数は対象外 — 内部 helper は
+    値を返さなくてよい)。"""
+    src = Path(plugin_switch.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for fn_name in ("approve_candidate", "retry_approval"):
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+        bad = []
+        for node in _walk_own_body(fn):
+            if isinstance(node, ast.Return) and (
+                    node.value is None
+                    or (isinstance(node.value, ast.Constant) and node.value.value is None)):
+                bad.append(node.lineno)
+        assert not bad, f"{fn_name}: outcome を返さない return が {bad} 行目にある"
+
+
 def _walk_own_body(fn):
     """`fn` の本体を走査する。**入れ子の関数定義の中には入らない**。"""
     stack = list(fn.body)
@@ -178,6 +287,45 @@ def _walk_own_body(fn):
             continue
         for child in ast.iter_child_nodes(node):
             stack.append(child)
+
+
+@pytest.mark.slow
+def test_ac14d_outcomes_are_known_enum_values(tmp_path, monkeypatch):
+    """AC-14d(2): 主要な `return` 地点が既知 enum の outcome を返す。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    seen = set()
+
+    # foreign_waiting
+    _make_foreign(root, row)
+    seen.add(plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="h", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS, activity=_activity(root)).outcome)
+    # deployed_after_rollback (live を not_switched に戻してから)
+    (plugins_root / "sma").unlink()
+    seen.add(plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="h", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS).outcome)
+    # already_decided
+    seen.add(plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="h", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS).outcome)
+    assert seen == {"foreign_waiting", "deployed_after_rollback", "already_decided"}
+    assert seen <= plugin_switch.APPROVAL_OUTCOMES
+
+
+@pytest.mark.slow
+def test_ac14d_still_pending_on_missing_candidate(tmp_path, monkeypatch):
+    """AC-14d(2) の続き: 候補が消えた行は `still_pending(candidate_missing)`。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    shutil.rmtree(plugins_root / "_human" / "sma")
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="h", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+    assert outcome.outcome == "still_pending"
+    assert outcome.reason == "candidate_missing"
+    assert outcome.status == "pending"
 
 
 def test_ac5_classifier_compares_the_raw_readlink_string(tmp_path):
@@ -214,3 +362,22 @@ def test_classifier_refuses_rows_it_does_not_apply_to(tmp_path):
         with pytest.raises(ValueError, match="分類器は"):
             plugin_switch.classify_live(
                 plugins_root, {**base, "phase": phase, "switch_required": required})
+
+
+@pytest.mark.slow
+def test_ac14a_already_decided_status_comes_from_the_row(tmp_path, monkeypatch):
+    """AC-14a: `already_decided` の `status` は **lock 内で読んだ行の値**。
+    リテラル (`"approved"` 等) に潰すと red — reject した approval を retry すると
+    `status="rejected"` が返らなければならない。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    plugin_switch.reject_candidate(
+        conn, row["approval_id"], decided_by="human", reason="",
+        now=NOW, plugins_root=plugins_root)
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert outcome.outcome == "already_decided"
+    assert outcome.status == "rejected", "status が行の値でなくリテラルになっている"
