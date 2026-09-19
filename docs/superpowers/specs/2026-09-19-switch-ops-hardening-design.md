@@ -1,4 +1,4 @@
-# [switch-ops-hardening] 設計書 v1.3
+# [switch-ops-hardening] 設計書 v1.4
 
 束: plugin 承認・切替回廊の**収束の穴と、人間から見える状態の穴**を塞ぐ。
 起票済み 3 件 — `[retry-switched-approves-without-deploy]` / `[cli-bless-unresolved-journal]`
@@ -32,7 +32,7 @@
 - `backtest/cli.py`: `_plugin_bless` / `_plugin_materialize` の例外処理を揃える。
 - `switch.py`: 2 段 phase ガード (r1 Important 2 / r2 Important 1 の実測から追加採用、§3.2) と、lock 内 outcome の戻り値 (r2 Important 4、§3.5)。
 - `commands.py`: `approval list` 新設、`approval retry` の結果報告を実態から読み直す、`_HELP` 更新。
-- **既存テスト 2 本**の書き換え (§7.1)、runbook (`docs/operations/indicator-initial-set-deploy-2026-09-19.md`) の改訂。
+- **既存テスト 3 本**の書き換え (§7.1)、runbook (`docs/operations/indicator-initial-set-deploy-2026-09-19.md`) の改訂。
 
 **非スコープ (明示)**
 - **`[retire-symlink-deployed-plugin]`** (件 4)。`retire_plugin` は 1 行も変えない。
@@ -470,7 +470,7 @@ v1.1 は `approve` ハンドラ (検収 m5、`commands.py:102-110`) に倣って
 | `op_id` | その呼び出しで最終的に関与した journal 行 (`foreign_waiting` なら触らなかった行、`deployed_after_rollback` なら**新しい方**) |
 | `rolled_back_op_id` | 0d-2c で畳んだ**停止行**の `op_id` (それ以外は `None`)。**`deployed_after_rollback` はこの値の有無で決まる** |
 | `name` / `target` | plugin 名と、`deployed*` のとき live が指すことを確認した `new_target` |
-| `status` | **lock の内側で読んだ `approval_requests.status`** (r3 Important 1 で追加)。`already_decided` は `:1399` の読みをそのまま、`invalidated` は `apply_decision` 直後の値 (`"invalidated"`)。シェルはこれを写すだけで、**lock 外で読み直さない** |
+| `status` | **lock の内側で確定した approval の status** (r3 I1 で追加、r4 I1 で定義を精密化)。確定の仕方は 2 通りあり、どちらも lock 内: (a) **read** — 非 pending 判定のために `:1398-1401` で読んだ値 (`already_decided`)、(b) **decision 結果** — 同じ lock 内で成功した `apply_decision` に渡したリテラル (`invalidated`)。**(b) は再読しない** — `apply_decision` が例外なく commit された以上その値が DB の状態であり、再読は lock 内でも余計な往復にしかならない。シェルはこれを写すだけで、**lock 外では読み直さない** (この一点が r3 の是正の主旨) |
 | `reason` | `still_pending` の理由 (下表の `return` 地点に 1 対 1) |
 
 **`deployed_after_rollback` の作り方 (r2 追記)**: 新規経路 (`switch.py:1495` 以降) は
@@ -484,34 +484,46 @@ outcome を組み立てる最後の 1 箇所がこの変数を読んで `deploye
 
 | `return` 地点 | 条件 | outcome |
 |---|---|---|
-| `switch.py:1400` | `status != "pending"` | `already_decided` (`status` = `:1399` で読んだ値) |
-| `:1416` | `_is_superseded` (0c) | `invalidated` (`status="invalidated"`) |
-| 0d-2a、`_reverify_switched_journal` が `True` → `_finalize_decision` 後 | 切替済み行の完遂 | `deployed` (`rolled_back_op_id=None`) |
+| `switch.py:1400` | `status != "pending"` | `already_decided` — `status` の出所 = **read** (`:1398-1401` の `SELECT`) |
+| `:1416` | `_is_superseded` (0c) | `invalidated` — `status` の出所 = **decision 結果** (同 lock 内で成功した `apply_decision(..., "invalidated")` のリテラル。再読しない) |
+| 0d-2a、`_reverify_switched_journal` が `True` → `_finalize_decision` 後 | 切替済み行の完遂 | `deployed` (`rolled_back_op_id=None`)。`status` = **decision 結果** (`"approved"`) |
 | 0d-2a、`_reverify_switched_journal` が `False` | 版も候補も無く `reverted` で閉じた | `still_pending` (`reason=reverify_failed`) |
 | 0d-2b (新設) | 分類 `foreign` | `foreign_waiting` |
 | `:1500` 付近 `CandidateMissingError` | 候補が無い | `still_pending` (`reason=candidate_missing`) |
 | `:1520` 付近 `ValueError` (`check_candidate_snapshot` / `hashes_of`) | 候補の形が不正 | `still_pending` (`reason=snapshot_invalid`) |
 | `:1521-1525` | payload と hash が不一致 | `still_pending` (`reason=hash_mismatch`) |
 | `:1537-1550` | live が plain dir | `legacy_plain_present` |
-| 末尾 (`_advance_to_decided` 完了後) | 正常完了 | `rolled_back_op_id` が `None` なら `deployed`、非 `None` なら `deployed_after_rollback` |
+| 末尾 (`_advance_to_decided` 完了後) | 正常完了 | `rolled_back_op_id` が `None` なら `deployed`、非 `None` なら `deployed_after_rollback`。`status` = **decision 結果** (`"approved"`) |
+| (上記以外の `still_pending` / `foreign_waiting` / `legacy_plain_present`) | 決定していない | `status` = **read** (`"pending"` — `:1398-1401` の値。決定していないので変わらない) |
 
-**approval 行が存在しない場合は outcome を返さない (r3 Important 1 の裁定)**:
+**approval 行が存在しない場合は outcome を返さない (r3 I1 の裁定、r4 I3 で捕捉先を訂正)**:
 現実装どおり `approve_candidate` が **`ValueError(f"approval {approval_id} not found")` を送出する**
-(`switch.py:1378-1381`)。`retry_approval` はそれを透過し、シェルは既存の包括 `except Exception`
-(`commands.py:294`) で `エラー: approval N not found` に落とす。
+(`switch.py:1378-1381`)。`retry_approval` はそれを透過する。
+**捕捉するのは包括 `except Exception` ではなく、先行する `except (ValueError, KeyError)`**
+(`commands.py:292-293`) で、**戻り文字列は `エラー: approval N not found` + 改行 + `_HELP` 全文**。
+v1.3 は `commands.py:294` と書いていたが誤り (r4 I3)。**retry だけを別扱いにして 1 行契約にはしない** —
+現行の表示を変えない方が、他のコマンドとの一貫性が保てる。
 **v1.2 にあった「状態を確認できませんでした (approval 行が見つかりません)」の専用文言は削除した** —
 outcome 列挙にも `return` 地点にも存在しない文言を表に置いていたのが誤りで、
 `approval_not_found` という outcome を新設するより**既存の送出契約に揃える方が変更が小さい**
 (`approve` ハンドラ・`reject_candidate` も同じ ID 不存在を例外で扱っており、作法が揃う)。
 
-**例外はこの表の外**: **approval 行の不在 (`ValueError`、`:1378-1381`、上記)**、
-別 approval の未終端 journal (`UnresolvedJournalError`、`:1471`)、
-pin 解決失敗 (`ValueError`、`:1432`)、切替後再照合の不一致 (`RuntimeError`、`:1236-1240`)、
-**`switch_live` の `OSError` (`:1219`)** は**従来どおり送出する** — `approve_candidate` で捕まえて
-`still_pending` に化けさせ**ない**。理由: (i) 既存テストが
-`pytest.raises(RuntimeError, match="content_hash mismatch")` 等でこの送出を pin している、
-(ii) I/O 障害を「pending 留置」と同じ籠に入れると原因が消える。
-シェル側は既存の `except Exception` (`commands.py:294`) が `エラー: ...` に落とすので traceback にはならない。
+**例外はこの表の外 — どの `except` に落ちてどう表示されるか (r4 I3、実コードで確認した)**
+
+| 例外 | 送出元 | `Commands.dispatch` のどの `except` | 戻り文字列 |
+|---|---|---|---|
+| `ValueError("approval N not found")` | `switch.py:1378-1381` | **`except (ValueError, KeyError)`** (`commands.py:292-293`) | `エラー: approval N not found` + **改行 + `_HELP` 全文** |
+| `ValueError` (pin 解決失敗) | `:1432` | 同上 | `エラー: <resolver の文言>` + 改行 + `_HELP` |
+| `UnresolvedJournalError` | `:1471` | **`except Exception`** (`:294`、`Exception` 直系で `ValueError` ではない) | `エラー: plugin '<name>': an unresolved switch journal (op_id=..., approval_id=...) …` (`_HELP` は付かない) |
+| `RuntimeError` (切替後再照合の不一致) | `:1236-1240` | `except Exception` | `エラー: plugin '<name>': live content_hash mismatch after switch …` |
+| `OSError` (`switch_live` の失敗) | `:1219` | `except Exception` (`OSError` は `(ValueError, KeyError)` に入らない) | `エラー: <OS の文言>` |
+
+**どれも traceback にはならない** (シェル経路)。CLI 経路の扱いは §3.4 (`_plugin_bless` ほか) が別に定める。
+**表示を変えるのは §3.4 の CLI 側だけで、シェル側の既存の捕捉順序・文言形は 1 つも変えない。**
+
+上記のいずれも `approve_candidate` で捕まえて `still_pending` に化けさせ**ない**。
+理由: (i) 既存テストが `pytest.raises(RuntimeError, match="content_hash mismatch")` 等で
+この送出を pin している、(ii) I/O 障害を「pending 留置」と同じ籠に入れると原因が消える。
 **AC-7 (恒久失敗での連打) はこの送出経路で成立する** — DB/FS の終点 (旧行 `reverted` + 新行 `switched`) は同じ。
 
 **戻り値の後方互換 (全数確認)**: `approve_candidate` / `retry_approval` は現在 `None` を返す。
@@ -531,15 +543,19 @@ reconcile は引き続き**戻り値を無視する** (無人経路なので報�
 | `still_pending` | `approved になりませんでした (reason=<reason>)` |
 | `legacy_plain_present` | `plugins/<name> が旧式のディレクトリのままです (先に afx plugin retire が要ります)` |
 | `already_decided` / `invalidated` | `この承認は既に決着しています (status=<status>)` |
-| **outcome が `None` / 未知の値** | `結果を判別できませんでした` (防御的な fallback。下記) |
 
-**`None` の fallback が要る理由 (v1.3 で判明)**: 既存テスト
-`tests/test_commands.py:541` は `switch.retry_approval` を **spy に差し替えて `None` を返させる**。
-シェルが `outcome.outcome` を無条件に読むと `AttributeError` → `dispatch` の包括 `except` に落ち、
-戻り文字列から「再試行」が消えて**この既存テストが red になる**。
-そこで**未知 / `None` は接頭辞 + `結果を判別できませんでした` に落とす** (接頭辞は常に付く)。
-これは「approval 行が読めない」(= `ValueError` 送出へ統一、上記) とは別物で、
-**呼び出しが outcome を返さなかった場合**の防御。
+**`None` / 未知 outcome の fallback は置かない (v1.4 で方針変更、r4 I2)**:
+v1.3 は既存 spy との互換のために「`結果を判別できませんでした`」という fallback 行を置いていたが、
+これは **本体の `return` 漏れ (outcome を返し忘れた return) を「普通の応答」に化けさせる**。
+本束の欠陥そのもの (「表示が実態と食い違う」) を新しい場所で再生産するので**撤回する**。
+
+- シェルは既知 enum 以外を**文言にしない**。`outcome` が `None` / 未知値なら属性参照または
+  明示の `raise` で例外になり、**`dispatch` の `except Exception` (`commands.py:294`) が
+  `エラー: ...` を返す** (fail loud、接頭辞は付かない)。
+- そのため **`tests/test_commands.py:541` の spy は「実物より緩い fake」** であり、
+  **実物と同じ形の outcome を返すよう書き換える** ([[test-fixtures-from-real-transcripts]] と同じ規律 —
+  手書きの偽形状は緑のまま本番で外れる)。→ **書き換える既存テストは 3 本**になる (§7.1)。
+- 返し忘れ自体を落とす受入条件を新設した (**AC-14d**)。
 
 **文言 → フィールドの突き合わせ (r3 Important 1、全行を 1 行ずつ確認した)**
 
@@ -552,11 +568,12 @@ reconcile は引き続き**戻り値を無視する** (無人経路なので報�
 | `<op_id>` (`foreign_waiting`) | `outcome.op_id` (触らなかった行) | OK |
 | `<reason>` (`still_pending`) | `outcome.reason` | OK |
 | `<status>` (`already_decided` / `invalidated`) | `outcome.status` | **v1.3 で追加**。v1.2 では出所が無かった (r3 の指摘) |
-| (旧) 「approval 行が見つかりません」 | — | **文言ごと削除**。送出契約に統一 (上記) |
-| `結果を判別できませんでした` | — (値を持たない) | OK (fallback 専用。接頭辞のみ) |
+| (旧) 「approval 行が見つかりません」 | — | **文言ごと削除** (v1.3)。送出契約に統一 (上記) |
+| (旧) `結果を判別できませんでした` | — | **文言ごと削除** (v1.4、r4 I2)。`None` / 未知は fail loud |
 
 → **文言表の全行が outcome のフィールド (と、シェルが自分で持つ approval id) だけで組み立てられることを確認した。
-シェルは lock 外で DB も FS も読まない。**
+シェルは lock 外で DB も FS も読まない。** 7 種の outcome が 6 行の文言カテゴリに写る
+(`already_decided` と `invalidated` は同じ 1 行に併記される)。
 
 **「⚠ approved ですが live が一致しません」は廃止する** — lock 内で確定した事実だけを報告するので、
 この文言が指していた「契約違反かもしれない状態」を表示側が判断する必要がなくなる
@@ -641,10 +658,11 @@ phase は従来どおり `preparing → versioned → recorded → switched → 
 | **AC-12b** | `approval list 5` が 5 件に制限される。`approval list` の既定が 20 件。**`approval list 999` は 200 件で打ち切られ、打ち切りの断り書きが出る** (上限が実装されていないと red) |
 | **AC-12c** | `approval list 0` / `approval list -1` / `approval list abc` が `usage: approval list [n]` を返し、**一覧を出さず例外も出さない**。`approval 999` (既存の詳細表示) と `approval retry <id>` が**この追加で壊れない** |
 | **AC-13** | `approval list` の出力に holdout / in_sample の数値が**含まれない** |
-| **AC-14a** | `approval retry` の戻り文言 (§3.5 の文言表の**全 7 行 = outcome 6 種 + `None` fallback**) をそれぞれの到達状態で観測する。特に **`foreign_waiting` のときに「配備まで完了しました」と言わない**こと、`foreign_waiting` と `still_pending` が**別の文言**になること、`already_decided` / `invalidated` が **`outcome.status` を写した値**を出すこと (lock 外で読み直した値ではない)。<br>**存在しない approval id に対する `approval retry`** は outcome ではなく **`ValueError("approval N not found")` の送出**で、シェルは既存の包括 `except` で `エラー: approval N not found` を返す (v1.2 の専用文言は削除 — r3 Important 1) |
+| **AC-14a** | `approval retry` の戻り文言 (§3.5 の文言表の**全 6 行**。**outcome は 7 種**で、`already_decided` と `invalidated` が 1 行に併記されるため行数は 6 — r4 Minor 1 の訂正) をそれぞれの到達状態で観測する。特に **`foreign_waiting` のときに「配備まで完了しました」と言わない**こと、`foreign_waiting` と `still_pending` が**別の文言**になること、`already_decided` / `invalidated` が **`outcome.status` を写した値**を出すこと (lock 外で読み直した値ではない)。<br>**存在しない approval id に対する `approval retry`** は outcome ではなく **`ValueError("approval N not found")` の送出**で、戻り文字列は **`エラー: approval N not found` + 改行 + `_HELP` 全文** (先行する `except (ValueError, KeyError)` に捕まる — r4 I3。逐語で assert する) |
+| **AC-14d** | **outcome の網羅性 (r4 I2)**: (1) **AST 検査** — `approve_candidate` と `retry_approval` の関数本体に **bare `return` / `return None` が 1 つも無い**こと (`ast.parse` で全 `Return` ノードを走査し、`value is None` または `Constant(None)` を落とす)。(2) **各 `return` 地点を実際に通すテスト**が、戻り値が outcome 型であり `outcome` が**既知 enum 値**であることを assert する (§3.5 の `return` 地点表の全行に 1 テスト以上を対応させる)。(3) シェルは未知 / `None` の outcome を**文言にしない** — 与えると例外になり `エラー: ...` が返る (fail loud、接頭辞が付かないことも assert) |
 | **AC-14b** | **後続配備との競合 (r2 Important 4 の killer)**: barrier で、`retry_approval` が lock を解放した**直後・シェルが文言を組み立てる前**に、別スレッド + 別コネクションが同名 plugin の**別の候補を正規に bless して live をさらに進める**。**観測**: retry の報告は **`配備まで完了しました (… → <この retry の target>)` のまま**で、「⚠ live が一致しません」を出さない。**変異**: lock 解放後に live を読み直して分類する実装 (v1.1 の案) に戻すと red |
 | **AC-14c** | `approve_candidate` / `retry_approval` が outcome を返すようになっても、**戻り値を使っていない既存の呼び出し元 4 箇所** (`commands.py:93` / `:147` / `switch.py:221` / `:1652`) とテスト 30 箇所あまりが**書き換えなしで緑** |
-| **AC-15** | 既存の `tests/plugin/test_switch_journal.py` / `test_reconcile.py` / `test_switch_paths.py` / `test_materialize_retire.py` / `test_commands.py` / `tests/fixtures/test_wiring_envs.py` / `tests/test_service_app.py` が**1 本も書き換えずに緑**。`tests/plugin/test_indicator_initial_set.py` は §7.1 の **2 本だけ**が書き換え対象で、**同ファイルの他のテストは不変** |
+| **AC-15** | 既存の `tests/plugin/test_switch_journal.py` / `test_reconcile.py` / `test_switch_paths.py` / `test_materialize_retire.py` / `tests/fixtures/test_wiring_envs.py` / `tests/test_service_app.py` が**1 本も書き換えずに緑**。書き換えるのは §7.1 の **3 本だけ** (`test_indicator_initial_set.py` の 2 本 + `test_commands.py:541` の spy) で、**同ファイルの他のテストは不変** |
 | **AC-16a** | **2 段ガードの負例**: (1) `_advance_to_decided` に終端行 (`reverted` / `decided`) の `op_id` を渡すと **FS を触る前に** `ValueError`、live も journal も不変。(2) `_finalize_decision` に期待 phase 以外の行を渡すと `ValueError`、journal 行の phase が変わらない |
 | **AC-16b** | **`switch_required=0` の正規経路の E2E (r2 Important 3)**: live が既に候補の `new_target` を指している状態から**同じ候補をもう一度 bless (または approve)** すると、journal は `switch_required=0` で作られ `recorded` から `decided` へ進み、approval が `approved` になる (probe `test_Q3_...` の実測: `_finalize_decision` 到達時 `(op_id=2, phase='recorded', switch_required=0)`)。**変異**: ガードを常に `phase == "switched"` と実装すると、この E2E が `ValueError` で red (既存の `test_runbook_post_gate_failure_converges_via_approval_retry` の手順 5 = 2 回目の bless も同時に red になる — 二重の網) |
 
@@ -659,7 +677,7 @@ phase は従来どおり `preparing → versioned → recorded → switched → 
 | `src/agentic_fx/commands.py` | `approval list` / `approval retry` の結果報告 (**受け取った outcome を文言に写すだけ — lock 外での再読み・再分類はしない**) / `_HELP` |
 | `tests/plugin/test_switch_ops_hardening.py` (新規) | AC-1〜AC-9c、AC-16a / AC-16b。**AC-9b は barrier 付きの競合テスト**なので、既存の multi-process 流儀 (`tests/plugin/_flock_worker.py`) かスレッド + 別コネクションで書く |
 | `tests/backtest/test_cli.py` または新規 | AC-10 / AC-11 |
-| `tests/test_commands.py` | AC-12a〜AC-12c / AC-13 / AC-14a〜AC-14c を**追記** (既存は書き換えない) |
+| `tests/test_commands.py` | AC-12a〜AC-12c / AC-13 / AC-14a〜AC-14d を**追記**。**`:541` の spy だけ書き換える** (§7.1) |
 | `docs/operations/indicator-initial-set-deploy-2026-09-19.md` | 改訂 (下記) |
 | `docs/superpowers/specs/2026-08-16-phase2-10-improve-loop-design.md` | §5.1-1 に「retry の `not_switched` 処置」を 1 段落追記 (既存規則の具体化。規則自体は変えない) |
 
@@ -669,18 +687,25 @@ phase は従来どおり `preparing → versioned → recorded → switched → 
 に加え、`dispatch("approval` / `retry_approval` / `reconcile_switch_journals` / `_revert_one` の呼び出しを全数。
 ヒットした 1 本ずつを開いて**完全一致 (`==`) か部分一致 (`in`) か**を確認した。
 
-**書き換える (2 本)**
+**書き換える (3 本)**
 
 | テスト | 現状が pin しているもの | 扱い |
 |---|---|---|
 | `tests/plugin/test_indicator_initial_set.py::test_runbook_post_gate_failure_converges_via_approval_retry` (`:854-855`) | `cmds.dispatch(f"approval retry {id}") == f"approval #{id} を再試行しました"` — **完全一致** | **書き換え**。§3.5 の新文言 (接頭辞 + `: 配備まで完了しました (...)`) に更新。**docstring の phase 別表 (`:794-806`) も更新対象** — `switched` 行の「journal 終端・approval `approved` だが**配備されない**」「再 bless **必須**」は本束で偽になる。`[retry-switched-approves-without-deploy]` を「指揮者へ申告済みの観測」と書いた段落も削除する。本体の `versioned` 経路のアサーション (`:857-876`) は**不変** |
 | `tests/plugin/test_indicator_initial_set.py::test_runbook_cli_bless_after_post_gate_failure_raises_traceback` (`:996-1033`) | CLI から `UnresolvedJournalError` が素通りして traceback になること (テスト自身の docstring が「直ったら書き換えること」と明記 `:1006-1008`) | **書き換え**。`pytest.raises` → `rc == 1` + stderr の `op_id=` / `approval_id=` |
+| `tests/test_commands.py:541-565` (`test_approval_retry_dispatches_to_switch_retry_approval`) | `retry_approval` を **`None` を返す spy** に差し替え、`calls == [(42, "shell")]` / `"再試行" in out` / activity `retry` | **書き換え** (v1.4、r4 I2)。**spy が実物より緩い** (実物は必ず outcome を返す) ため、`None` fallback を置かない方針では `AttributeError` になる。spy を**実物と同じ形の outcome を返す fake** に直す ([[test-fixtures-from-real-transcripts]])。`calls` と activity のアサーションは不変、`"再試行" in out` も新文言の接頭辞で成立する |
+
+**`None` を返す spy の全数確認 (v1.4)**: `retry_approval` / `approve_candidate` を差し替えているテストは
+`grep -rn 'setattr(.*\(retry_approval\|approve_candidate\)'` で 2 件のみ —
+`tests/test_commands.py:558` (上記、書き換え対象) と `tests/plugin/test_switch_journal.py:214` (`_boom`、
+**例外を送出する fake** なので戻り値契約に依存しない)。
+`tests/plugin/test_switch_journal.py:83` の lambda は `None` を返すが、**呼び出し元は reconcile** であり
+reconcile は戻り値を無視する契約 (§3.5) なので**不変**。
 
 **不変 (1 本ずつ確認した根拠付き)**
 
 | テスト | 何を見ているか | 不変である根拠 |
 |---|---|---|
-| `tests/test_commands.py:541` (`approval_retry_dispatches_to_switch_retry_approval`) | `calls == [(42, "shell")]` / **`assert "再試行" in out` (部分一致)** / activity `retry` | 新文言の接頭辞 `approval #N を再試行しました: ` に「再試行」を含む。**この spy は `None` を返す**ので §3.5 の **`None` fallback** (`結果を判別できませんでした`) に落ちるが、接頭辞が付くので部分一致は成立する。**fallback が無いと `AttributeError` でこのテストが red になる** — v1.3 で気付いた依存関係 |
 | `tests/test_commands.py:569` (未配線) | `"未配線" in out` | 未配線の早期 return は変えない |
 | `tests/test_commands.py:125-155` (`approve_plugin_kind_reports_actual_outcome`) | `out != f"approval #{id} approved"` / `"pending" in out` | **`approve` ハンドラは変更しない** (揃える先であって、揃えられる側ではない) |
 | `tests/test_commands.py:599 / :615 / :637 / :653 / :681 / :698 / :714 / :732 / :750 / :772 / :780` (`approval <id>` の詳細表示 11 本) | `approval #<id>` の詳細出力 | `approval list` の dispatch 条件は `args[0] == "list"` で、`isdigit()` 分岐と衝突しない (§3.5)。`approval 999` (`:780`) も不変 |
@@ -766,11 +791,23 @@ terra は v1.2 の改訂箇所に限定して静的読解し、**2 段 phase ガ
 |---|---|---|---|
 | I1 | lock 内 outcome の戻り値だけでは文言の全分岐を作れない — (a) `already_decided` / `invalidated` が要求する `status` がフィールド表に無く、lock 外の再読は同節が禁じている (b) 「approval 行が読めない」文言は outcome 列挙にも `return` 地点表にも無く、現実装は `return` ではなく `ValueError` を送出する (`switch.py:1378-1381`) | **両方そのとおり** (実コードで確認 — `:1378-1381` は `row is None` で `raise ValueError(f"approval {approval_id} not found")`)。v1.2 の文言表は、戻り値に無い情報を 2 行で要求していた | (a) **`status` をフィールドに追加** (lock 内で読んだ値。`already_decided` は `:1399` の読み、`invalidated` は `apply_decision` 直後の値)。(b) **専用文言を削除し、送出契約に統一** (`approval_not_found` outcome は新設しない — `approve` ハンドラ・`reject_candidate` も ID 不存在を例外で扱っており作法が揃う)。outcome 列挙 / `return` 地点表 / 例外の一覧 / 文言表 / AC-14a をこの形に揃えた。**あわせて文言表の全行について「その値が outcome のどのフィールドから来るか」の突き合わせ表を §3.5 に新設**し、全行が outcome だけで組み立てられることを確認した。**この突き合わせの副産物として、既存テスト `tests/test_commands.py:541` の spy が `None` を返すため、シェルに `None` / 未知 outcome の fallback が必要**であることが判明したので、文言表に 1 行追加した (無いと既存テストが `AttributeError` で red) (`#N` はシェルが自分で受け取った引数、`M` のような曖昧な記法は `<op_id>` に修正) |
 
+### 8.4 設計レビュー r4 の処置 (codex terra、`tmp/design-switch-ops/codex-design-r4.md`、C0 / I3 / M1)
+
+**4 件とも採用**。いずれも契約の記述の精度に関する指摘で、設計の骨格 (分類器 / 案 C / 2 段ガード / lock 内 outcome) は動いていない。
+
+| # | 指摘 | 事実確認の結果 | 処置 |
+|---|---|---|---|
+| I1 | `invalidated` の `status` は「lock 内で読んだ値」ではなくリテラルで、出所契約と記述が一致しない | **そのとおり** (`switch.py:1397-1417` — lock 内の再読は非 pending 判定の `:1398-1401` だけ) | `status` の定義を「**lock の内側で確定した値** = (a) read か (b) 同じ lock 内で成功した `apply_decision` の結果」に精密化。`return` 地点表の**全行に出所 (read / decision 結果) を明記**。「lock 外で読み直さない」は不変 |
+| I2 | `None` / 未知 outcome の fallback が、本体の `return` 漏れを普通の応答に化けさせる | **そのとおり**。本束が直そうとしている「表示が実態と食い違う」を新しい場所で再生産する | **方針変更 — fallback を撤回**。シェルは既知 enum 以外を文言にせず fail loud。`tests/test_commands.py:541` の spy は「実物より緩い fake」なので**実物と同じ outcome を返すよう書き換える** (§7.1、**書き換え 2 本 → 3 本**)。**AC-14d を新設** (AST で bare `return` / `return None` が無いことの検査 + 全 `return` 地点を通すテストが outcome 型と enum 値を assert + 未知/`None` が文言にならないこと)。`None` を返す spy の全数確認も §7.1 に記録 |
+| I3 | approval 不在の `ValueError` の捕捉先が実コードと違う (包括 `except Exception` ではなく先行する `except (ValueError, KeyError)`、表示に `_HELP` が付く) | **そのとおり** (`commands.py:292-295` — `except (ValueError, KeyError)` は `f"エラー: {...}\n{_HELP}"` を返す) | §3.5 の記述を訂正し、**例外 → `except` → 戻り文字列の対応表**を新設 (`ValueError` / `UnresolvedJournalError` / `RuntimeError` / `OSError` の 5 行)。AC-14a を**実際の戻り文字列** (`エラー: approval N not found` + 改行 + `_HELP`) に合わせた。**retry だけ別扱いの 1 行契約にはしない** (現行の表示を変えない) |
+| M1 | AC-14a の「outcome 6 種」が列挙 (7 種) と不一致 | **そのとおり** | 「**outcome 7 種 / 文言カテゴリ 6 行**」(`already_decided` と `invalidated` は 1 行に併記) と明記。fallback 行は I2 で削除 |
+
 ## 9. 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-09-19 | v1.0 | 初版 (設計案 v0.1 の全裁定 R1〜R8 を反映。分類器の契約表・クラッシュ点の全数表・二重実行の排他調査・既存テスト全数表・runbook 改訂表を追加) | `tmp/design-switch-ops/design.md` v0.1 のユーザー承認を受けた spec 化 | `66b4248` |
+| 2026-09-19 | v1.4 | 設計レビュー r4 の 4 件を採用: `status` の出所を「lock 内で**確定**した値 (read / decision 結果)」に精密化し `return` 地点表の全行に明記 (I1) / **`None`・未知 outcome の fallback を撤回**し fail loud + **AC-14d (網羅性)** を新設、`tests/test_commands.py:541` の spy を書き換え対象に (書き換え 2 本 → **3 本**) (I2) / 例外 → `except` → 戻り文字列の対応表を新設し AC-14a を実文字列に (I3) / outcome 7 種・文言 6 行の訂正 (M1)。AC は 25 → 26 項目 | `tmp/design-switch-ops/codex-design-r4.md` (C0 / I3 / M1)。`commands.py:292-295` と `switch.py:1397-1417` を実コードで確認 | — |
 | 2026-09-19 | v1.3 | 設計レビュー r3 (I1) を採用: outcome に **`status`** を追加し `already_decided` / `invalidated` の文言の出所を確定 / 「approval 行が読めない」の専用文言を**削除**し `ValueError` 送出契約へ統一 (outcome 列挙・`return` 地点表・例外一覧・文言表・AC-14a を同時に整合) / **文言 → outcome フィールドの突き合わせ表**を §3.5 に新設 (全 6 行を 1 行ずつ確認) | `tmp/design-switch-ops/codex-design-r3.md` (C0 / I1 / M0)。実コード `switch.py:1378-1381` で approval 不在時の送出を確認 | — |
 | 2026-09-19 | v1.2 | 設計レビュー r2 の 5 件を全採用: phase ガードを **2 段構え**へ (入口 = FS より前、`_finalize_decision` = 0d-2a の唯一の防御) と AC-6 の終点訂正 (I1) / AC-9b を i・ii・iii に分割し (iii) の位置づけを明示 (I2) / `switch_required=0` の正規経路を AC-16b として E2E 化 (I3) / retry の結果報告を **lock 内 outcome 方式**へ、IV-3 に時点を明記、分類器の `commands.py` import 要件を削除 (I4) / 書き換えテスト本数を 2 本に統一 (M1)。AC を 19 → 25 項目に | `tmp/design-switch-ops/codex-design-r2.md` (C0 / I4 / M1)。5 件とも実コードで確認、4 件を `tmp/design-switch-ops/probe/test_probe_r2.py` で実測 | — |
 | 2026-09-19 | v1.1 | 設計レビュー r1 の 5 件を全採用: §3.3 を stale row 再検証プロトコルへ全面改稿 (C1) / live 書き換え経路を 3 箇所へ訂正し §4 に全経路表 (I1) / §3.2 の `op_id = None` の根拠を probe で訂正し `_finalize_decision` の phase ガードを追加採用 (I2) / §3.5 に dispatch 条件と `<n>` の表 (I3) / §7.1 を grep 全数から作り直し書き換え対象を 2 本に、§7.2 に runbook L167-169 を追加 (I4)。AC を 15 → 19 項目に | `tmp/design-switch-ops/codex-design-r1.md` (C1 / I4 / M0)。5 件とも実コードで事実確認、C1 と I2 は `tmp/design-switch-ops/probe/test_probe_r1.py` で再現を実測 | — |
