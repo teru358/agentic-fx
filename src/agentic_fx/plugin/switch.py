@@ -10,6 +10,7 @@ import re
 import shutil
 import sqlite3
 import stat
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal
@@ -35,6 +36,59 @@ from agentic_fx.store import candidate_archives as candidate_archives_store  # T
 from agentic_fx.store import plugin_switch_journal as journal_store  # Task 8 produces
 
 _PHASE_ORDER = ["preparing", "versioned", "recorded", "switched", "decided", "reverted"]
+
+_TERMINAL_PHASES = ("decided", "reverted")
+
+# [switch-ops-hardening] T5: lock の内側で確定した結果 (設計書 §3.5)。
+APPROVAL_OUTCOMES = frozenset({
+    "deployed", "deployed_after_rollback", "already_decided", "foreign_waiting",
+    "still_pending", "legacy_plain_present", "invalidated",
+})
+
+
+@dataclass(frozen=True)
+class ApprovalOutcome:
+    """`approve_candidate` / `retry_approval` が **plugin flock の内側で確定**
+    した結果 (設計書 §3.5)。呼び出し元はこの値を文言に写すだけで、
+    lock の外で DB / FS を読み直さない (読み直すと、別プロセスの後続の
+    正規配備を「契約違反」と誤報する — r2 Important 4)。"""
+    outcome: str
+    name: str
+    status: str
+    op_id: int | None = None
+    rolled_back_op_id: int | None = None
+    target: str | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.outcome not in APPROVAL_OUTCOMES:
+            raise ValueError(f"unknown approval outcome: {self.outcome!r}")
+
+
+def classify_live(plugins_root: Path, row) -> str:
+    """[switch-ops-hardening] T1 (設計書 §3.1): `switched` で止まった journal 行
+    に対し、**live symlink が実際にどこを指しているか**を 3 値で返す。
+
+    比較は `readlink` の生文字列で行う (`resolve()` は使わない) — journal の
+    `new_target`/`old_target` は plugins_root 相対の文字列として書かれ、
+    `switch_live` がそれをそのまま symlink の中身にするため。`resolve()` に
+    すると版ディレクトリが消えた dangling symlink で比較が壊れる。
+
+    **読み取り専用** (IV-5)。`phase='switched'` かつ `switch_required=1` の
+    行にしか意味が無いので、それ以外で呼ばれたら fail closed。"""
+    if row["phase"] != "switched" or not row["switch_required"]:
+        raise ValueError(
+            f"classify_live: op_id={row['op_id']} is phase={row['phase']!r} "
+            f"switch_required={row['switch_required']} — 分類器は "
+            "phase='switched' かつ switch_required=1 の行にのみ適用する")
+    live = plugins_root / row["name"]
+    live_target = live.readlink().as_posix() if live.is_symlink() else None
+    if live_target == row["new_target"]:
+        return "switched"
+    if live_target == row["old_target"] or (
+            row["old_kind"] == "absent" and live_target is None):
+        return "not_switched"
+    return "foreign"
 
 
 # precheck 2026-08-22 wave2: T11-B2 / T11-B3 / T11-B1
