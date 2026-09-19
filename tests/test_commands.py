@@ -955,6 +955,74 @@ def test_plugin_decision_with_a_noncanonical_payload_name_reports_an_error(
 # [switch-ops-hardening] T5 / T7 — `approval list` と retry の結果報告
 # ============================================================
 
+def _pending_plugin_approval(conn, name="sma", chash="a" * 64):
+    return approvals.create(
+        conn, kind="plugin",
+        payload={"name": name, "content_hash": chash, "artifact_hash": "b" * 64,
+                 "candidate_origin": "staging",
+                 "candidate_path": f"plugins/_staging/1/{name}"},
+        now=NOW)
+
+
+def test_approval_list_shows_pending_ids_and_no_metrics(tmp_path):
+    """AC-12a / AC-13: pending を id 昇順で列挙し、holdout / in_sample の
+    数値は出さない (詳細は `approval <id>`)。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    a1 = _pending_plugin_approval(conn, "sma")
+    a2 = _pending_plugin_approval(conn, "ema", chash="c" * 64)
+
+    out = cmds.dispatch("approval list")
+
+    assert out.index(f"#{a1}") < out.index(f"#{a2}")
+    assert "name=sma" in out and "name=ema" in out
+    assert "content_hash=aaaaaaaa" in out
+    for banned in ("in_sample", "holdout", "pf=", "avg_r"):
+        assert banned not in out
+
+
+def test_approval_list_empty_message(tmp_path):
+    """AC-12a: 0 件の文言。未終端 journal が無ければ節ごと出ない。"""
+    _, _, _, cmds = _commands(tmp_path)
+    out = cmds.dispatch("approval list")
+    assert out == "承認待ちはありません"
+    assert "未終端" not in out
+
+
+def test_approval_list_includes_open_journal_section(tmp_path):
+    """AC-12a: 未終端 journal があれば末尾の節に op_id / name / phase / approval_id。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    aid = _pending_plugin_approval(conn, "sma")
+    op_id = plugin_switch.begin_switch_journal(
+        conn, kind="bless", approval_id=aid, name="sma", old_kind="absent",
+        old_target=None, new_target=".versions/sma/" + "b" * 64,
+        switch_required=True, actor="human_cli", now=NOW, commit=True)
+
+    out = cmds.dispatch("approval list")
+
+    assert "-- 未終端の切替ジャーナル --" in out
+    assert f"op_id={op_id} name=sma phase=preparing approval_id={aid}" in out
+
+
+def test_approval_list_limit_and_cap(tmp_path):
+    """AC-12b: `<n>` が効き、既定 20 / 上限 200 で打ち切る。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    for i in range(25):
+        _pending_plugin_approval(conn, "sma", chash=f"{i:064d}")
+    assert len(cmds.dispatch("approval list 5").splitlines()) == 5
+    assert len(cmds.dispatch("approval list").splitlines()) == 20
+    out = cmds.dispatch("approval list 999")
+    assert "(上限 200 件で打ち切り)" in out
+
+
+def test_approval_list_rejects_bad_argument(tmp_path):
+    """AC-12c: 0 / 負数 / 非数値は usage。既存の `approval <id>` を壊さない。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    aid = _pending_plugin_approval(conn, "sma")
+    for bad in ("approval list 0", "approval list -1", "approval list abc"):
+        assert cmds.dispatch(bad) == "usage: approval list [n]"
+    assert f"approval #{aid}" in cmds.dispatch(f"approval {aid}")
+    assert "存在しません" in cmds.dispatch("approval 999")
+
 
 def _fake_outcome(**kw):
     base = dict(outcome="deployed", name="sma", status="approved", op_id=3,

@@ -23,6 +23,7 @@ _HELP = """コマンド一覧:
   ask <質問>                  臨時 Mission (回答専用 — 発注はしない)
   approve <id> / reject <id> [理由]   承認操作
   approval <id>               承認申請の詳細 (in_sample/holdout 成績を含む)
+  approval list [n]          承認待ちの一覧 (+ 未終端の切替ジャーナル)
   approval retry <id>        承認手順を頭から再試行 (§5.3 契機③)
   killswitch reset           kill switch ラッチの解除 (人間の明示操作)
   reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
@@ -158,6 +159,11 @@ class Commands:
                                     f"#{approval_id} via shell", ref_id=str(approval_id))
                 return (f"approval #{approval_id} を再試行しました: "
                         f"{self._retry_outcome_text(outcome)}")
+            if cmd == "approval" and args and args[0] == "list" and len(args) <= 2:
+                # [switch-ops-hardening] T7 (設計書 §3.5): `approval retry <id>`
+                # の id を知るための一覧。**holdout / in_sample の数値は出さない**
+                # (詳細は `approval <id>`)。
+                return self._approval_list(args[1] if len(args) == 2 else None)
             if cmd == "approval" and len(args) == 1 and args[0].isdigit():
                 # [approval-payload-missing-gate-metrics] 是正 (A4 10 回目
                 # claude #69 観測 A、2026-09-11): approve/reject する前に
@@ -349,6 +355,9 @@ class Commands:
                    for pair, metrics in value.items()]
         return [cls._metrics_line(prefix, None)]
 
+    _APPROVAL_LIST_DEFAULT = 20
+    _APPROVAL_LIST_MAX = 200
+
     def _retry_outcome_text(self, outcome) -> str:
         """[switch-ops-hardening] T5: `ApprovalOutcome` を文言に写す。
         未知 / None はここで `ValueError` になり、`dispatch` の包括 `except`
@@ -372,6 +381,57 @@ class Commands:
         if kind in ("already_decided", "invalidated"):
             return f"この承認は既に決着しています (status={outcome.status})"
         raise ValueError(f"unknown approval outcome: {kind!r}")
+
+    def _approval_list(self, limit_arg: "str | None") -> str:
+        """承認待ちの一覧 + 未終端の切替ジャーナル (設計書 §3.5)。"""
+        limit = self._APPROVAL_LIST_DEFAULT
+        truncated = False
+        if limit_arg is not None:
+            try:
+                limit = int(limit_arg)
+            except ValueError:
+                return "usage: approval list [n]"
+            if limit <= 0:
+                return "usage: approval list [n]"
+            if limit > self._APPROVAL_LIST_MAX:
+                limit = self._APPROVAL_LIST_MAX
+                truncated = True
+        rows = self.conn.execute(
+            "SELECT id, kind, payload_json, created_at FROM approval_requests "
+            "WHERE status='pending' ORDER BY id ASC LIMIT ?", (limit,)).fetchall()
+        lines = []
+        for row in rows:
+            try:
+                payload = (json.loads(row["payload_json"])
+                          if row["payload_json"] else {})
+            except (TypeError, ValueError):
+                payload = {}
+            content_hash = payload.get("content_hash") or ""
+            lines.append(
+                f"#{row['id']} kind={row['kind']} "
+                f"name={payload.get('name', '-')} "
+                f"created_at={row['created_at']} "
+                f"content_hash={content_hash[:8] or '-'}")
+        if not lines:
+            lines.append("承認待ちはありません")
+        if truncated:
+            lines.append(f"(上限 {self._APPROVAL_LIST_MAX} 件で打ち切り)")
+        journal_lines = self._open_journal_lines()
+        if journal_lines:
+            lines.append("-- 未終端の切替ジャーナル --")
+            lines += journal_lines
+        return "\n".join(lines)
+
+    def _open_journal_lines(self) -> list:
+        """未終端 journal の行 (0 件なら空 list = 節ごと出さない)。
+        `plugins_root` 未配線でも DB だけで引けるが、fail-soft に揃える。"""
+        try:
+            from agentic_fx.store import plugin_switch_journal as journal_store
+            rows = journal_store.list_non_terminal(self.conn)
+        except Exception:  # noqa: BLE001 — 一覧表示は fail-soft
+            return []
+        return [f"op_id={r['op_id']} name={r['name']} phase={r['phase']} "
+                f"approval_id={r['approval_id']}" for r in rows]
 
     def _approval_detail(self, approval_id: int) -> str:
         row = self.conn.execute(
