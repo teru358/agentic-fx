@@ -280,6 +280,56 @@ def test_monotonic_rise_is_one_hundred():
     assert float(compute(df, {})["rsi"].iloc[-1]) == 100.0
 
 
+def _epsilon_basis_df(wiggle: float = 1e-5, base: float = 150.0,
+                      n_wiggle: int = 24, mult: float = 1000.0):
+    """ε の基準が「その行自身の close」か「前の行の close」かを判別する fixture。
+
+    構成: `base` の周りを `±wiggle` で `n_wiggle` 本だけ上下させ (Wilder 平滑の
+    `avg_loss` を約 `4.0e-06` に落とす)、その次の 1 本で close を `mult` 倍する。
+    その行 (`JUMP_ROW`) では
+
+      EPS * |close[t-1]| = 1.5e-07  <  avg_loss = 4.0e-06  <  EPS * |close[t]| = 1.5e-04
+
+    となり、**閾値の基準をどちらに取るかで判定順 (2) に入るかどうかが変わる**
+    唯一の行になる (下側 26.7 倍・上側 37.5 倍の余裕)。
+
+    **この構成でしか差が出ない**: `t` 行で基準が有意に変わるには close 自身が
+    大きく動く必要があり、そのとき `avg_gain >= Δclose / period` なので比が
+    極端になり、両者の差は高々 `100 * period * EPS` (= 1.4e-06) しかない。
+    値の差で見ると `_same` の許容 (1e-07) 付近で脆いので、**判定順 (2) が返す
+    リテラル `100.0` との厳密一致**で見る (基準を前行にすると
+    `99.99999996261333` になり `== 100.0` が落ちる)。
+    """
+    closes = [base]
+    for i in range(n_wiggle):
+        closes.append(closes[-1] + (wiggle if i % 2 == 0 else -wiggle))
+    closes.append(closes[-1] * mult)
+    closes.append(closes[-1])
+    values = np.array(closes, dtype="float64")
+    index = pd.date_range("2026-01-01", periods=len(values), freq="1h",
+                          tz="UTC")
+    return pd.DataFrame(
+        {"open": values, "high": values, "low": values, "close": values,
+         "volume": np.ones(len(values))}, index=index)
+
+
+#: `_epsilon_basis_df` で基準が効く唯一の行 (`n_wiggle` 本の上下の次)。
+JUMP_ROW = 25
+
+
+def test_epsilon_threshold_uses_this_rows_close_not_the_previous_one():
+    """ε の基準は **その行自身の `|close|`** (設計書 §3.2 (i-b) / docstring)。
+
+    `EPS * close.abs()` を `EPS * close.shift(1).abs()` に変えると、この行の
+    `avg_loss` (4.0e-06) が閾値 1.5e-07 を上回って判定順 (2) に入らなくなり、
+    式どおりの `99.99999996261333` が返る。段 0 の変異スイープで、既存の
+    fixture (ランダムウォーク / 完全横ばい / 減衰横ばい) では**全行が
+    ビット一致**して生き残ることを実測したため、この観測点を足した。
+    """
+    rsi = compute(_epsilon_basis_df(), {})["rsi"]
+    assert float(rsi.iloc[JUMP_ROW]) == 100.0
+
+
 def test_eps_rule_does_not_fire_on_ordinary_data():
     """通常データで ε 規則が誤発火しないこと (設計書 §3.2 (i-b) の余裕 7e+03 倍)。"""
     rsi = compute(_mkdf(), {})["rsi"]
