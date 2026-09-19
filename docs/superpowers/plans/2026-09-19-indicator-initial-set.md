@@ -1,0 +1,4803 @@
+# [indicator-initial-set] 実装プラン v1.0 (設計書 = `docs/superpowers/specs/2026-09-19-indicator-initial-set-design.md` v1.3a 準拠)
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
+> (推奨) または superpowers:executing-plans で task ごとに実行すること。Step は
+> チェックボックス (`- [ ]`) で追跡する。
+
+**Goal:** 改善ループが戦略を作るとき `config.yaml` の `indicators:` で宣言できる
+**標準指標の初期セット 9 本** (`sma` / `ema` / `rsi` / `macd` / `bollinger` / `atr` /
+`adx` / `stochastic` / `ichimoku`) を `docs/examples/plugins/<名前>/` に用意し、人間が
+1 本ずつ `afx plugin bless --from _human` で配備するための runbook を書く。
+**配備用の新コマンド・新機構・LLM の自動配備経路は一切作らない。**
+
+**Architecture:** 既存の plugin 契約の上に「中身」だけを載せる。各 plugin は
+`plugin.py` / `config.yaml` / `test_plugin.py` の 3 ファイルで**完結**し、互いに
+一切依存しない (共有モジュールを置く経路が無い — `loader._reject_unexpected_py_files`
+が 4 本目の `.py` を拒否し、`sandbox.check_source` は相対 import を拒否する)。
+したがって **T1〜T9 は完全に独立で並列実行できる**。正しさは各 plugin の
+`test_plugin.py` (bless の pytest ゲートが毎回回す) と、repo 側の受入テスト
+(`tests/`) の 2 層で担保する。
+
+**Tech Stack:** Python 3.13 / uv / pytest / pandas / numpy / PyYAML。
+**`src/` の変更はゼロ。DB スキーマ変更なし。`config/settings.yaml*` の変更なし。**
+
+**Spec:** `docs/superpowers/specs/2026-09-19-indicator-initial-set-design.md` (v1.3a)。
+**設計を変えない** — ユーザー裁定 R1〜R8 / R5a、指揮者裁定 D1〜D4、codex 設計レビュー
+r1 (C0/I4/M2 全件採用) / r2 (C0/I3/M0 全件採用) / r3 (**指摘 0、収束**) は設計書
+§0 / §8.1 / §8.2 / §8.3 に確定記録済みなので「裁定待ち」は無い。設計書に無い判断が
+必要になったら**実装を止めて指揮者へ申告**すること。
+
+## Global Constraints
+
+- **実 DB (`data/agentic.db`) を読み書きしないこと**。repo 側テストは必ず `tmp_path` 上の
+  sqlite を使う。`tests/conftest.py` の session ガードを無効化・迂回しない
+  ([[tests-touching-real-repo-resources]])
+- **実 `plugins/` ディレクトリを読み書きしないこと**。T10 の bless 実測は `tmp_path` 配下に
+  作った plugins dir に対して行う (`tests/fixtures/wiring_envs.py` の流儀)
+- **`src/` を 1 行も変更しない。** 本束が触るのは `docs/examples/plugins/` (新規 27 ファイル)、
+  `docs/operations/` (新規 1 ファイル)、`tests/` (既存 1 ファイルへの追記 + 新規テスト) のみ
+  (設計書 §7)。`src/` の修正が必要だと判断したら**実装を止めて指揮者へ申告**する
+  (既知の 1 件 = `afx plugin bless` の `UnresolvedJournalError` 未捕捉は
+  `[cli-bless-unresolved-journal]` として起票済み・本束では直さない)
+- **plugin は 1 フォルダ 3 ファイルで完結する。** 4 本目の `.py` を置かない。
+  `_int_param` / `_float_param` / `_true_range` は**使う plugin がそれぞれ逐語で持つ**
+  (共有 import は構造的に不可能)。直すときは該当する全 plugin をまとめて直す
+- **`check_source` で落ちる 3 形を使わない** (実測済み): `df.open` のような属性アクセス
+  (`open` は denylist)、`to_frame` を含む `to_` 接頭辞のメソッド (許可は
+  `to_dict`/`to_list`/`to_numpy`/`to_pydatetime` の 4 つのみ)、`getattr`。
+  加えて `global` 文と**外部オブジェクトの属性への代入**も拒否される。
+  **OHLCV 列は必ず `df["open"]` のように添字で取る**
+- **params は「変換」ではなく「型の確認」** (設計書 §4)。`int(params.get(...))` を書かない。
+  期間系は「`bool` でない `int`」かつ `>= 1`、`num_std` は「`bool` でない `int|float`」かつ
+  有限かつ `> 0`。`macd` のみ `fast < slow` を要求、`ichimoku` の期間の順序は要求しない
+- **例外文言の形 (逐語、9 本で統一)**: `params.<キー名> must be <期待>, got <値>` /
+  `params.fast must be < params.slow, got fast=<n> slow=<n>`。**plugin 名・候補名を
+  入れない**。`test_plugin.py` は `pytest.raises(ValueError, match=r"^params\.")` で
+  **文言まで pin する** — `match` を外すと、検査を削る変異を入れても pandas 自身の
+  `ValueError` でテストが緑のまま通る (変異スイープの実測)
+- **`max_bars` は全 9 本で 400** (設計書 §3.2、`settings.plugin.max_bars_limit` 既定 1000 内)
+- **docstring の必須項目** (設計書 §4): (1) warmup は自分の責務・足りない期間は NaN
+  (2) 1d 足の epoch 錨 (3) `max_bars: 400` の意味と「依存する strategy は `max_bars` を
+  400 以上に」 (4) 純関数であること (5) `rsi`/`adx` は値動きなしで中立値・`ichimoku` は
+  lookahead 規約
+- **遮断 8 に関わる新しい sink を作らない。** 9 本の docstring・test・config に成績
+  (pf / avg_r / 勝率)・期間・段名 (`in_sample` / `holdout`)・pair・baseline 差分を
+  **書かない** — `read_example_plugin` 経由で改善 agent に届く。指標の定義式・参照実装は
+  秘密ではないので載せてよい
+- **`docs/examples/plugins/{rsi_indicator,rsi_pullback,sma_cross}` を変更しない** (設計書 R7)
+- **一時ファイルは `tmp/` か scratchpad**。`rm` を使ってよいのは自分が同セッションで作った
+  一時領域だけ ([[rm-allowed-directories]])
+
+## プラン規約
+
+- **設計を変えない。** 設計書 v1.3a が正。設計書に無い判断が必要になったら**実装を止めて
+  指揮者へ申告**する。設計レビューは 3 周で収束済み (r3 は指摘 0) なので、同じ論点の
+  蒸し返しには「設計書 §X で決着済み」と返して閉じる
+- **プラン記述自体が欠陥源になり得る** ([[plan-code-defects-not-implementer-defects]])。
+  本プランのコードは**指揮者が scratchpad で実際に動かして green を確認してから**
+  載せたもの (「着手前検証の記録」節に実測を記載) だが、それでも**プロジェクトの制約に
+  反する記述を見つけたら、プランどおりの実装でも欠陥として申告**すること。黙って直さない
+- **逸脱は必ず申告する** ([[haiku-silently-adapts-report-deviations]])。プランの Step
+  どおりに書けなかった箇所は、実装報告に「Step 番号 / 何を / なぜ」を明示すること。
+  **「食い違いなし」という報告は額面どおりに受け取られない** — 指揮者が同じコマンドを
+  独立に再実行して照合する。報告に貼った出力は作業ログであって証拠ではない
+- **逐語転写は機械 diff する** ([[transcription-must-be-machine-diffed]])。
+  - **markdown のフェンス行 (` ```python ` / ` ``` `) をファイルに書かないこと。**
+  - 書いた直後に `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" <file>` で
+    自己検証すること (`.py` の 2 本とも)。
+  - **各 task の最後に、プラン本文からコードブロックを機械抽出して `diff` を取り、
+    その出力 (差分ゼロ) を報告に貼ること。** 抽出コマンドは各 task の Step に逐語で書いてある
+  - 報告には**書いたファイルの絶対パスと `wc -l` の行数**を書くこと
+- **変異テストの規律** ([[mutation-testing]])。
+  - 各 task の逆変異リストは **4〜6 件 = 下限であって上限ではない**。思いついた変異は足してよい
+  - **「落ちるはず」で済ませない。** 1 件ずつ実際に適用して pytest を回し、`FAILED` の
+    テスト名を報告に貼る。本プランの表に「red になるべきテスト」を書いてあるので照合する
+  - 適用 → 実測 → **必ず元に戻す** (`git checkout` は使わない。`cp` で退避して戻す)
+  - **等価変異は正直に等価だと書く。** 本プランには 1 件記録がある (T3 の注記)
+- **実 DB / 実 `plugins/` を触らない**。`git status` と `data/` の mtime で検収する
+- **fresh worktree でフルスイート**を最後に回す (残骸ゼロ)
+
+## File Structure
+
+```
+docs/examples/plugins/
+  sma/         plugin.py  config.yaml  test_plugin.py     <- T1 (新規)
+  ema/         plugin.py  config.yaml  test_plugin.py     <- T2 (新規)
+  rsi/         plugin.py  config.yaml  test_plugin.py     <- T3 (新規)
+  macd/        plugin.py  config.yaml  test_plugin.py     <- T4 (新規)
+  bollinger/   plugin.py  config.yaml  test_plugin.py     <- T5 (新規)
+  atr/         plugin.py  config.yaml  test_plugin.py     <- T6 (新規)
+  adx/         plugin.py  config.yaml  test_plugin.py     <- T7 (新規)
+  stochastic/  plugin.py  config.yaml  test_plugin.py     <- T8 (新規)
+  ichimoku/    plugin.py  config.yaml  test_plugin.py     <- T9 (新規)
+  rsi_indicator/ rsi_pullback/ sma_cross/                 <- 既存、触らない (R7)
+
+docs/operations/
+  indicator-initial-set-deploy-2026-09-19.md              <- T10 (新規、runbook)
+
+tests/
+  plugin/test_loader.py                                   <- T10 (既存、1 assert に 9 名を追記)
+  plugin/test_indicator_initial_set.py                    <- T10 (新規、I2/I5/I6/I7/I8)
+```
+
+**触らないもの**: `src/` 配下すべて、`src/agentic_fx/loops/prompts/improve_mission.md`
+(規律 7 の変更は不要 — 設計書 §7 の根拠)、`config/settings.yaml*`、`tests/` の既存
+ファイル (`test_loader.py` の 1 assert への追記を除く)。
+
+## 受入条件 (設計書 §6) と task の対応
+
+| ID | 内容 | 担保する task / テスト |
+|---|---|---|
+| **I1** | 9 本すべてが `discover` を通る | **T10** — `tests/plugin/test_loader.py::test_discover_sample_plugins_directory_not_rejected` の包含集合に 9 名を追加 (**総数は pin しない**) |
+| **I2** | 戻り値が indicator 契約を通る (キー集合完全一致 / index 一致 / Inf 不在) | **T1〜T9** の `test_outputs_match_declared_keys_and_index` (自己テスト) + **T10** の `test_all_nine_pass_the_indicator_validator` (`core.plugin_contract.validate_indicator_result` を直接通す) |
+| **I3** | 独立参照実装との全行一致 (`rel/abs 1e-9`) | **T1〜T9** の `test_matches_reference_implementation_on_every_row` |
+| **I4** | 固定 fixture における**全 160 行**の接頭辞一致 | **T1〜T9** の `test_prefix_consistency_on_every_row` |
+| **I5** | 先頭依存の誤差が仕様化データ範囲で許容内 | **T10** の `test_head_dependence_within_tolerance` (4 値域 × 8 seed + スパイク + 退化 fixture) |
+| **I6** | 9 本を順に bless できる | **T10** の `test_nine_indicators_bless_in_sequence` (tmp の plugins dir + tmp DB) |
+| **I7** | 新 `rsi` を宣言した strategy が E2E で動く | **T10** の `test_strategy_declaring_new_rsi_runs_end_to_end` (+ `max_bars: 200` の保証外ケース) |
+| **I8** | runbook が逐語再現できる ((a) 正常 (b) ゲート前失敗からの再開 (c) ゲート後失敗の収束) | **T10** の `test_runbook_*` 3 本 |
+| **I9** | 入力不変・反復決定性 | **T1〜T9** の `test_input_frame_is_not_mutated` / `test_repeated_calls_are_deterministic` |
+
+**抜けが無いことの確認**: I1〜I9 の 9 件すべてに担保する task が付いている。I2/I3/I4/I9 は
+9 本 × 自己テストで 9 重に、I1/I5/I6/I7/I8 は T10 で 1 回ずつ観測する。
+
+## task 依存図
+
+```
+          T0 (テンプレート定義 — コードは書かない、プラン内の規約)
+           |
+   +---+---+---+---+---+---+---+---+
+   |   |   |   |   |   |   |   |   |
+  T1  T2  T3  T4  T5  T6  T7  T8  T9     <- 9 本は完全に独立 / 並列実行可
+  sma ema rsi macd boll atr adx sto ichi     (worktree 分離、依存は T0 のみ)
+   |   |   |   |   |   |   |   |   |
+   +---+---+---+---+---+---+---+---+
+           |
+          T10 (repo 側受入テスト I1/I2/I5/I6/I7/I8 + runbook)
+```
+
+- **T0 は文書 task** (本プランの T0 節を読むだけ。ファイルは作らない)。
+- **T1〜T9 は互いに一切依存しない。** 別 worktree で同時に走らせてよい。
+  **`subagent は指揮者の cwd を継承する`** ([[subagent-inherits-session-cwd]]) ので、
+  並列 dispatch の前に cwd を repo root へ戻し、各 task には `git -C <worktree>` の形で
+  コマンドを書いて渡すこと。
+- **T10 は T1〜T9 の全マージ後**に 1 レーンで実行する。
+
+---
+
+## T0: 共通の土台 (テンプレート定義 — ファイルは作らない)
+
+**この task は文書 task。** T1〜T9 の実装者は着手前にこの節を読むこと。ここで 1 回だけ
+定義する規約を、各 task の逐語コードが実体化している。
+
+### T0-1: `plugin.py` の形 (全 9 本共通)
+
+1. **モジュール docstring** — 設計書 §4 の必須 5 項目 (+ `rsi`/`adx`/`ichimoku` は 6 項目め)。
+2. `from __future__ import annotations` → 標準ライブラリ (`math`) → 空行 → `numpy` / `pandas`。
+   **`math` は `bollinger` (`isfinite`/`sqrt`) だけが import する**。`numpy` は
+   `atr` / `adx` (`np.maximum`) だけ。
+3. (`rsi` / `adx` のみ) モジュール定数 `EPS = 1e-9`。
+4. ヘルパ (`_int_param` / `_float_param` / `_true_range` / `_midpoint`) — **使う plugin だけが
+   持つ**。共有 import は構造的に不可能 (Global Constraints)。
+5. `def compute(df: pd.DataFrame, params: dict) -> dict:` — **モジュールトップレベル、
+   位置引数名は `df, params` で完全一致、デコレータなし、必須 kwonly なし**
+   (`loader._has_matching_function` がこの 4 点を AST で検証する)。
+
+### T0-2: `config.yaml` の形 (全 9 本共通)
+
+```yaml
+kind: indicator
+outputs: [<宣言キーをカンマ区切り>]
+max_bars: 400
+params:
+  <キー>: <既定値>
+```
+
+**`timeframe` / `pairs` / `exit_mode` / `indicators` を書かない。**
+`exit_mode` は kind=strategy 専用なので書くと `loader` に reject される。
+
+### T0-3: `test_plugin.py` の骨格 (全 9 本共通、差分は参照実装と追加テストだけ)
+
+**固定 fixture `_mkdf`** (全 9 本で逐語同一):
+
+- 160 行 (= `ichimoku` の `senkou_b` warmup 51 + 余裕)、`freq="1h"`、UTC。
+- `close = base + cumsum(N(0, base*0.002))`、`np.random.default_rng(seed)`。
+- **極値を中間 (`n//2`) と末尾側 (`n-7`) の両方**に置く — 片側だけだと「系列全体の
+  min/max で正規化する」型の未来参照を fixture 次第で見逃す (設計書 §6.2)。
+- **bar 1 に決定論的な上げ** (`high[1] = high[0] + base*0.01`) — ここが平坦だと
+  「`±DM[0]` を NaN でなく 0.0 にする」変異が fixture 次第で生き残る (変異スイープの実測)。
+- **`open` は前バーの終値** (`close` と別系列) — `open == close` の fixture だと
+  「`close` の代わりに `open` を読む」型の変異を検出できない (変異スイープの実測)。
+
+**参照実装** (`_ref_*`、素朴なループ。**`plugin.py` から import・コピーしない**):
+
+- `_ref_sma(values, period)` — 毎回スライスして `sum(window)/period`。
+- `_ref_recursive(values, alpha, period)` — **`min_periods` は位置ではなく「非 NaN 観測数」で
+  数える**。seed は最初の非 NaN 値 (`y_0 = x_0`)。位置で `i < period - 1` と書くと `atr` の
+  warmup が 14 でなく 13 になり I3 が落ちる (設計書 §3.3)。
+- `_ref_rolling(values, period, pick)` / `_ref_true_range(df)` / `_ref_std(values, period)`。
+- **`rsi` / `adx` の参照実装は ε 規則も書き写す** — 同じ閾値 (`EPS = 1e-9`)、同じ基準
+  (**その行自身の `|close|`**)、同じ判定順。参照実装は「別の書き方」であって
+  「別の仕様」ではない (設計書 §3.3)。
+
+**共通テスト 8 本** (全 9 本が持つ):
+
+| テスト名 | 担保 |
+|---|---|
+| `test_outputs_match_declared_keys_and_index` | I2 |
+| `test_matches_reference_implementation_on_every_row` | I3 |
+| `test_prefix_consistency_on_every_row` | I4 (**全 160 行**。サンプル点だと「行 37 だけ未来を読む」型を素通りする — 実測) |
+| `test_input_frame_is_not_mutated` | I9 (a) |
+| `test_repeated_calls_are_deterministic` | I9 (b)。fresh な df で 2 回 + **同じ df で 2 回** |
+| `test_warmup_boundary_is_pinned_on_both_sides` | warmup。**両側を pin する** |
+| `test_short_frame_returns_all_declared_keys_as_all_nan` | 宣言キーを必ず全部返す |
+| `test_invalid_params_raise_value_error` | params 型検証。**`match=r"^params\."` で文言まで pin** |
+| `test_valid_param_override_changes_the_result` | 上書きが効いている |
+
+`min_test_functions: 3` は改善ループ側のゲートで人間の bless には掛からないが、
+9 本とも 12 本以上のテストを持つ。
+
+### T0-4: params 検証の負例表 (全 9 本共通の形)
+
+| 負例 | 期待 |
+|---|---|
+| `{"<期間>": 20.0}` (float) | `ValueError` (`^params\.`) — `int()` 変換しないので通らない |
+| `{"<期間>": "20"}` (str) | 同上 |
+| `{"<期間>": True}` (bool) | 同上 — `bool` は `int` の派生なので**先に**弾く |
+| `{"<期間>": 0}` / `{"<期間>": -1}` | 同上 (`>= 1`) |
+| `{"num_std": 0.0}` / `{"num_std": -2.0}` / `{"num_std": float("inf")}` | 同上 (`bollinger` のみ) |
+| `{"fast": 26, "slow": 26}` / `{"fast": 30, "slow": 26}` | 同上 (`macd` のみ、`fast < slow`) |
+
+### T0-5: red の作り方 (全 task 共通の手順)
+
+**「テストが無い状態」でなく「stub がある状態」で red を作る。** `plugin.py` を置かずに
+pytest を回すと `ImportError` (collection error) になり、**どの assert が守られているのかを
+観測できない**。手順:
+
+1. `config.yaml` と `test_plugin.py` を先に転写する。
+2. `plugin.py` を**全出力キーを全 NaN で返す stub** にする (各 task の Step b に逐語がある)。
+3. `pytest -q test_plugin.py` を回し、**assert-red** (collection は成功し、複数の
+   `FAILED` が出る) ことを確認する。**この pytest 出力を逐語で報告に貼る。**
+4. `plugin.py` を本実装へ差し替えて green にする。
+
+---
+
+## T1: `sma` — SMA (単純移動平均)
+
+**出力**: `value` ／ **warmup (最初に値が入る 0 起点行)**: `value`=19 ／ **`max_bars`**: 400
+**依存**: T0 のみ。他の指標 task と**並列実行可**。
+**触るファイル**: `docs/examples/plugins/sma/` の 3 ファイルのみ。
+
+**この task の要点**: 最も単純。ここで T0 の骨格を体得してから他へ進むとよい。
+
+### Step 1-a: `config.yaml` と `test_plugin.py` を転写する
+
+- [ ] `docs/examples/plugins/sma/` を作る
+- [ ] `docs/examples/plugins/sma/config.yaml` を**逐語**で作る:
+
+```yaml
+kind: indicator
+outputs: [value]
+max_bars: 400
+params:
+  period: 20
+```
+
+- [ ] `docs/examples/plugins/sma/test_plugin.py` を**逐語**で作る
+      (**フェンス行 ` ```python ` / ` ``` ` をファイルに書かないこと**):
+
+```python
+"""sma indicator plugin の自己テスト ([indicator-initial-set] 設計書 §6)。
+
+担保する受入条件: **I2** (outputs 完全一致 / index 一致 / Inf 不在)、
+**I3** (独立参照実装との全行一致)、**I4** (固定 fixture における全行の
+接頭辞一致)、**I9** (入力不変・反復決定性)、warmup 境界の両側 pin、
+params の型検証。
+
+このファイルは bless の pytest ゲート (subprocess + Landlock) で毎回走る。
+`check_source(..., extra_allowed={"pytest", "plugin"})` を通る範囲で書くこと
+(`to_frame` / `df.open` / `getattr` は使えない)。
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from plugin import compute
+
+OUTPUTS = ('value',)
+WARMUP = {'value': 19}
+
+
+def _mkdf(n: int = 160, *, seed: int = 0, base: float = 150.0) -> pd.DataFrame:
+    """設計書 §6 I4 の固定 fixture。160 行は `ichimoku` の `senkou_b` warmup
+    51 + 余裕。**極値を中間と末尾側の両方に置く** — 片側だけだと「全体の
+    min/max で正規化する」型の未来参照を fixture 次第で見逃す (§6.2)。
+    """
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = base + np.cumsum(rng.normal(0.0, sigma, n))
+    if n >= 20:
+        close[n // 2] += base * 0.05
+        close[n - 7] -= base * 0.06
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    if n >= 2:
+        # **bar 1 に決定論的な上げを置く** — ここが平坦だと `+DM[0]` を NaN に
+        # するか 0.0 にするかが Wilder の seed に効かず、行 0 の扱いを潰す変異
+        # (M-adx-4) が fixture 次第で生き残る (変異スイープの実測)。
+        high[1] = high[0] + base * 0.01
+    # **open は close と別の系列にする** (前バーの終値)。`open == close` の
+    # fixture だと「close の代わりに open を読む」型の変異を検出できない
+    # (M-sma-4 の実測)。
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close,
+          "volume": np.ones(n)}, index=index)
+
+
+def _same(got, want, *, rel: float = 1e-9, tol: float = 1e-9) -> bool:
+    """NaN 同士は一致。数値は相対/絶対のどちらかを満たせば一致。"""
+    got_nan = got is None or bool(pd.isna(got))
+    want_nan = want is None or bool(pd.isna(want))
+    if got_nan or want_nan:
+        return got_nan and want_nan
+    got = float(got)
+    want = float(want)
+    return abs(got - want) <= max(tol, rel * abs(want))
+
+
+# --- 独立参照実装 (plugin.py とは別の書き方。plugin.py から import しない) ---
+
+def _isnan(value) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+def _ref_sma(values: list, period: int) -> list:
+    """SMA を素朴なスライスで。先頭 period-1 個は NaN。"""
+    out = []
+    for i in range(len(values)):
+        window = values[i - period + 1:i + 1]
+        if i < period - 1 or any(_isnan(v) for v in window):
+            out.append(float("nan"))
+        else:
+            out.append(sum(window) / float(period))
+    return out
+
+
+def _reference(df, params: dict) -> dict:
+    period = int(params.get("period", 20))
+    return {"value": _ref_sma(df["close"].tolist(), period)}
+
+
+# --- I2: 宣言キー集合 / index 一致 / Inf 不在 -------------------------------
+
+def test_outputs_match_declared_keys_and_index():
+    df = _mkdf()
+    out = compute(df, {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        assert isinstance(out[key], pd.Series), key
+        assert out[key].index.equals(df.index), key
+        assert not bool(np.isinf(out[key].to_numpy(dtype="float64")).any()), key
+
+
+# --- I3: 独立参照実装との全行一致 -------------------------------------------
+
+def test_matches_reference_implementation_on_every_row():
+    df = _mkdf()
+    got = compute(df, {})
+    want = _reference(df, {})
+    for key in OUTPUTS:
+        for i in range(len(df)):
+            assert _same(got[key].iloc[i], want[key][i]), (key, i)
+
+
+# --- I4: 固定 fixture における接頭辞一致 (全 160 行) ------------------------
+
+def test_prefix_consistency_on_every_row():
+    """`compute(df[:t+1])[key].iloc[-1] == compute(df)[key].iloc[t]` を
+    **全行**で。サンプル点だけだと「サンプルされない行だけ未来を読む」実装
+    (実測: 行 37 のみ書き換え) を素通りする (設計書 §6.2)。
+    """
+    df = _mkdf()
+    full = compute(df, {})
+    for t in range(len(df)):
+        sub = compute(df.iloc[:t + 1], {})
+        for key in OUTPUTS:
+            assert _same(sub[key].iloc[-1], full[key].iloc[t]), (key, t)
+
+
+# --- I9: 入力不変 / 反復決定性 ----------------------------------------------
+
+def test_input_frame_is_not_mutated():
+    """`check_source` は添字代入 `df["x"] = ...` を拒否しない (設計書 §4)。
+    入力を壊さない規律の観測点はこのテストだけ。"""
+    df = _mkdf()
+    before = df.copy(deep=True)
+    compute(df, {})
+    assert df.equals(before)
+    assert list(df.columns) == list(before.columns)
+    assert df.index.equals(before.index)
+    assert bool((df.dtypes == before.dtypes).all())
+
+
+def test_repeated_calls_are_deterministic():
+    """(1) fresh な df で 2 回 (2) **同じ df オブジェクトで 2 回** —
+    (2) が module レベルの状態持ち越しを捕まえる。"""
+    first = compute(_mkdf(), {})
+    second = compute(_mkdf(), {})
+    df = _mkdf()
+    third = compute(df, {})
+    fourth = compute(df, {})
+    for key in OUTPUTS:
+        for i in range(len(first[key])):
+            assert _same(first[key].iloc[i], second[key].iloc[i]), ("fresh", key, i)
+            assert _same(third[key].iloc[i], fourth[key].iloc[i]), ("same", key, i)
+
+
+# --- warmup 境界 (両側を pin する) ------------------------------------------
+
+def test_warmup_boundary_is_pinned_on_both_sides():
+    """「N 行目まで NaN」だけでなく「N+1 行目に値が入る」も見る — 片側だけ
+    だと warmup が 1 本早く/遅く明ける変異を検出できない。"""
+    out = compute(_mkdf(), {})
+    for key, first_valid in WARMUP.items():
+        series = out[key]
+        if first_valid > 0:
+            assert bool(series.iloc[:first_valid].isna().all()), key
+        assert not bool(pd.isna(series.iloc[first_valid])), key
+
+
+def test_short_frame_returns_all_declared_keys_as_all_nan():
+    """行が足りなくても「返さない」はできない — 宣言キーは必ず全部返す。"""
+    out = compute(_mkdf(n=3), {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        if WARMUP[key] >= 3:
+            assert bool(out[key].isna().all()), key
+
+
+# --- params の型検証 (変換ではなく型の確認) ---------------------------------
+
+@pytest.mark.parametrize("params", [{'period': 20.0}, {'period': '20'}, {'period': True}, {'period': 0}, {'period': -1}])
+def test_invalid_params_raise_value_error(params):
+    """**文言まで pin する。** `match` が無いと、検査を外す変異を入れても
+    pandas 自身が投げる `ValueError` (`span must satisfy: span >= 1` 等) で
+    テストが緑のまま通ってしまう (変異スイープの実測: M-sma-5 / M-ema-4)。
+    本 plugin の文言はすべて `params.<キー名> ...` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_valid_param_override_changes_the_result():
+    df = _mkdf()
+    base = compute(df, {})
+    other = compute(df, {'period': 5})
+    key = OUTPUTS[0]
+    assert not _same(base[key].iloc[-1], other[key].iloc[-1])
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/sma/test_plugin.py`
+
+### Step 1-b: stub を置いて **red** を確認する
+
+- [ ] `docs/examples/plugins/sma/plugin.py` を**この stub**にする:
+
+```python
+"""stub (red 確認用)。**このファイルは Step c で本実装に差し替える。**"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    nan_series = pd.Series(np.full(len(df), np.nan), index=df.index,
+                           dtype="float64")
+    return {
+            "value": nan_series,
+    }
+```
+
+- [ ] `cd docs/examples/plugins/sma && uv run pytest -q test_plugin.py` を回す
+- [ ] **collection error ではなく assert-red** (複数の `FAILED`) になることを確認する
+- [ ] **この pytest 出力を逐語で報告に貼る** (「red を確認した」という申告は証拠にならない)
+
+### Step 1-c: `plugin.py` の本実装を転写する
+
+- [ ] `docs/examples/plugins/sma/plugin.py` を**逐語**で差し替える:
+
+```python
+"""SMA (単純移動平均) indicator plugin。
+
+plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
+`compute(df, params) -> dict` を実装する。df はハーネスが供給する完成バー
+のみの DataFrame (DatetimeIndex は UTC・昇順、末尾最大 `config.yaml` の
+`max_bars` 本)。純関数のみ — I/O・乱数・実時計へのアクセスは禁止。
+使ってよいのは pandas / numpy / math のみ。
+
+作者向け注意 (設計書 §4 の必須項目):
+
+1. **warmup はこの関数自身の責務。** `max_bars` は「渡す DataFrame の末尾
+   最大本数の上限宣言」であり「常に同じ本数が入っている保証」ではない。
+   系列契約では「行が足りないので何も返さない」はできない (ハーネスは宣言
+   `outputs` と完全一致するキー集合を毎回要求する)。足りない期間は **NaN**
+   にする — 消費側 (strategy) は `pd.isna` を見て hold を返す規約。
+
+2. **1d 足のバケット境界は UTC 00:00 (epoch 錨)** であり、FX の取引日境界
+   (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
+   ため、呼び出し側が渡す任意の足で使われ得る。
+
+3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
+   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
+   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+   `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
+   渡る履歴が短くなり値がわずかにずれる。
+
+4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
+   Series を作る)。モジュールレベルの状態を持たない。
+
+入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+
+
+def _int_param(params: dict, name: str, default: int) -> int:
+    """**変換ではなく型の確認** (設計書 §4)。`int(params.get(...))` は
+    `14.9` を `14` に、`"14"` を `14` に黙って読み替えてしまい、承認不要の
+    params 上書き (U3) 経由で誰のレビューも通らず本番へ届く。`bool` は
+    `int` の派生なので先に弾く。
+
+    **この関数は 9 本の plugin に逐語で重複している。** plugin は 1 フォルダ
+    3 ファイルで完結しなければならず (loader が 4 本目の `.py` を拒否、
+    sandbox が相対 import を拒否)、共有モジュールを置く経路が無い。
+    直すときは 9 本まとめて直すこと。
+    """
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"params.{name} must be an int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"params.{name} must be >= 1, got {value}")
+    return value
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    """単純移動平均 (SMA) を系列で返す。warmup (先頭 period-1 行) は NaN。"""
+    period = _int_param(params, "period", 20)
+    close = df["close"].astype(float)
+    value = close.rolling(window=period, min_periods=period).mean()
+    return {"value": value}
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/sma/plugin.py`
+
+### Step 1-d: **green** を確認する
+
+- [ ] `cd docs/examples/plugins/sma && uv run pytest -q test_plugin.py`
+      → **13 passed** になること (この本数を報告に書く)
+- [ ] `check_source` が 2 本とも通ること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.sandbox import check_source
+d = Path('docs/examples/plugins/sma')
+check_source(d / 'plugin.py')
+check_source(d / 'test_plugin.py', extra_allowed=frozenset({'pytest', 'plugin'}))
+print('check_source ok')"
+```
+
+- [ ] `discover` が通り `outputs` / `max_bars` が宣言どおりであること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.loader import discover_one_with_reason
+meta, reason = discover_one_with_reason(Path('docs/examples/plugins/sma'), 'sma')
+print(meta.kind, list(meta.outputs), meta.max_bars, meta.params, reason)"
+```
+
+### Step 1-e: 逆変異 (**6 件 = 下限であって上限ではない**)
+
+1 件ずつ `plugin.py` に適用 → `uv run pytest -q test_plugin.py --tb=no` → **元に戻す**。
+`git checkout` は使わない (`cp plugin.py /tmp/...bak` で退避して戻す)。
+**`FAILED` のテスト名を報告に貼り、下表と照合する。**
+
+| # | 変異 | red になるべきテスト (指揮者の実測値) |
+|---|---|---|
+| M-sma-1 | rolling -> ewm (平滑の種類を入れ替え) | `test_matches_reference_implementation_on_every_row` |
+| M-sma-2 | min_periods を外す | `test_matches_reference_implementation_on_every_row`, `test_short_frame_returns_all_declared_keys_as_all_nan`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-sma-3 | period の既定を 20 -> 14 | `test_matches_reference_implementation_on_every_row`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-sma-4 | close -> open | `test_matches_reference_implementation_on_every_row` |
+| M-sma-5 | params の bool 除外を外す | `test_invalid_params_raise_value_error[params2]` |
+| M-sma-6 | 未来参照 shift(-1) | `test_matches_reference_implementation_on_every_row`, `test_prefix_consistency_on_every_row`, `test_valid_param_override_changes_the_result` |
+
+- [ ] 6 件すべてが KILLED になることを実測し、テスト名を報告に貼る
+- [ ] 元のファイルに戻っていることを `diff` で確認する
+
+### Step 1-f: 機械 diff と commit
+
+- [ ] **プラン本文から抽出して `diff` を取る** (差分ゼロを報告に貼る):
+
+```
+PLAN=docs/superpowers/plans/2026-09-19-indicator-initial-set.md
+uv run python - <<'EOF'
+import re, pathlib, subprocess
+pathlib.Path("tmp").mkdir(exist_ok=True)   # **`/tmp` 直下は使わない** (Global Constraints)
+plan = pathlib.Path("docs/superpowers/plans/2026-09-19-indicator-initial-set.md").read_text()
+# 見出し行 (行頭の "## T1: ") から次の "## " 見出しの直前までを節とする。
+# **行頭アンカー (re.M) が要る** — この抽出スクリプト自身が節の中に
+# 同じ文字列を含むため、素の split だと節が途中で切れる (実測)。
+sec = re.search(r"^## T1: .*?(?=^## |\Z)", plan, re.S | re.M).group(0)
+blocks = re.findall(r"^```(?:python|yaml)\n(.*?)^```$", sec, re.S | re.M)
+assert len(blocks) == 4, len(blocks)
+# blocks[0]=config.yaml, blocks[1]=test_plugin.py, blocks[2]=stub, blocks[3]=plugin.py
+for text, path in ((blocks[0], "config.yaml"), (blocks[1], "test_plugin.py"),
+                   (blocks[3], "plugin.py")):
+    want = pathlib.Path("tmp/expect_" + path)
+    want.write_text(text)
+    real = pathlib.Path("docs/examples/plugins/sma") / path
+    r = subprocess.run(["diff", str(want), str(real)], capture_output=True, text=True)
+    print(path, "DIFF-ZERO" if r.returncode == 0 else "MISMATCH\n" + r.stdout)
+EOF
+```
+
+- [ ] 各ファイルの絶対パスと `wc -l` を報告に書く
+- [ ] `git add docs/examples/plugins/sma && git commit`
+      (メッセージ: `feat(indicator-initial-set): sma indicator plugin (T1)`)
+- [ ] **逸脱の申告** — 上の Step どおりに書けなかった箇所を「Step 番号 / 何を / なぜ」で全件
+
+---
+
+## T2: `ema` — EMA (指数移動平均)
+
+**出力**: `value` ／ **warmup (最初に値が入る 0 起点行)**: `value`=19 ／ **`max_bars`**: 400
+**依存**: T0 のみ。他の指標 task と**並列実行可**。
+**触るファイル**: `docs/examples/plugins/ema/` の 3 ファイルのみ。
+
+**この task の要点**: `span=period, adjust=False` (= alpha 2/(p+1))。Wilder (1/p) と混同しない。
+
+### Step 2-a: `config.yaml` と `test_plugin.py` を転写する
+
+- [ ] `docs/examples/plugins/ema/` を作る
+- [ ] `docs/examples/plugins/ema/config.yaml` を**逐語**で作る:
+
+```yaml
+kind: indicator
+outputs: [value]
+max_bars: 400
+params:
+  period: 20
+```
+
+- [ ] `docs/examples/plugins/ema/test_plugin.py` を**逐語**で作る
+      (**フェンス行 ` ```python ` / ` ``` ` をファイルに書かないこと**):
+
+```python
+"""ema indicator plugin の自己テスト ([indicator-initial-set] 設計書 §6)。
+
+担保する受入条件: **I2** (outputs 完全一致 / index 一致 / Inf 不在)、
+**I3** (独立参照実装との全行一致)、**I4** (固定 fixture における全行の
+接頭辞一致)、**I9** (入力不変・反復決定性)、warmup 境界の両側 pin、
+params の型検証。
+
+このファイルは bless の pytest ゲート (subprocess + Landlock) で毎回走る。
+`check_source(..., extra_allowed={"pytest", "plugin"})` を通る範囲で書くこと
+(`to_frame` / `df.open` / `getattr` は使えない)。
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from plugin import compute
+
+OUTPUTS = ('value',)
+WARMUP = {'value': 19}
+
+
+def _mkdf(n: int = 160, *, seed: int = 0, base: float = 150.0) -> pd.DataFrame:
+    """設計書 §6 I4 の固定 fixture。160 行は `ichimoku` の `senkou_b` warmup
+    51 + 余裕。**極値を中間と末尾側の両方に置く** — 片側だけだと「全体の
+    min/max で正規化する」型の未来参照を fixture 次第で見逃す (§6.2)。
+    """
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = base + np.cumsum(rng.normal(0.0, sigma, n))
+    if n >= 20:
+        close[n // 2] += base * 0.05
+        close[n - 7] -= base * 0.06
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    if n >= 2:
+        # **bar 1 に決定論的な上げを置く** — ここが平坦だと `+DM[0]` を NaN に
+        # するか 0.0 にするかが Wilder の seed に効かず、行 0 の扱いを潰す変異
+        # (M-adx-4) が fixture 次第で生き残る (変異スイープの実測)。
+        high[1] = high[0] + base * 0.01
+    # **open は close と別の系列にする** (前バーの終値)。`open == close` の
+    # fixture だと「close の代わりに open を読む」型の変異を検出できない
+    # (M-sma-4 の実測)。
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close,
+          "volume": np.ones(n)}, index=index)
+
+
+def _same(got, want, *, rel: float = 1e-9, tol: float = 1e-9) -> bool:
+    """NaN 同士は一致。数値は相対/絶対のどちらかを満たせば一致。"""
+    got_nan = got is None or bool(pd.isna(got))
+    want_nan = want is None or bool(pd.isna(want))
+    if got_nan or want_nan:
+        return got_nan and want_nan
+    got = float(got)
+    want = float(want)
+    return abs(got - want) <= max(tol, rel * abs(want))
+
+
+# --- 独立参照実装 (plugin.py とは別の書き方。plugin.py から import しない) ---
+
+def _isnan(value) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+def _ref_recursive(values: list, alpha: float, period: int) -> list:
+    """再帰平滑。**`min_periods` は位置ではなく「非 NaN 観測数」で数える**
+    (設計書 §3.3) — 位置で `i < period - 1` と書くと `atr` / `adx` の warmup
+    が 1 本早く明け、I3 が落ちる。seed は最初の非 NaN 値 (`y_0 = x_0`)。
+    """
+    out = []
+    prev = None
+    seen = 0
+    for value in values:
+        if _isnan(value):
+            out.append(float("nan"))
+            continue
+        prev = value if prev is None else alpha * value + (1.0 - alpha) * prev
+        seen += 1
+        out.append(prev if seen >= period else float("nan"))
+    return out
+
+
+def _reference(df, params: dict) -> dict:
+    period = int(params.get("period", 20))
+    alpha = 2.0 / (period + 1.0)
+    return {"value": _ref_recursive(df["close"].tolist(), alpha, period)}
+
+
+# --- I2: 宣言キー集合 / index 一致 / Inf 不在 -------------------------------
+
+def test_outputs_match_declared_keys_and_index():
+    df = _mkdf()
+    out = compute(df, {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        assert isinstance(out[key], pd.Series), key
+        assert out[key].index.equals(df.index), key
+        assert not bool(np.isinf(out[key].to_numpy(dtype="float64")).any()), key
+
+
+# --- I3: 独立参照実装との全行一致 -------------------------------------------
+
+def test_matches_reference_implementation_on_every_row():
+    df = _mkdf()
+    got = compute(df, {})
+    want = _reference(df, {})
+    for key in OUTPUTS:
+        for i in range(len(df)):
+            assert _same(got[key].iloc[i], want[key][i]), (key, i)
+
+
+# --- I4: 固定 fixture における接頭辞一致 (全 160 行) ------------------------
+
+def test_prefix_consistency_on_every_row():
+    """`compute(df[:t+1])[key].iloc[-1] == compute(df)[key].iloc[t]` を
+    **全行**で。サンプル点だけだと「サンプルされない行だけ未来を読む」実装
+    (実測: 行 37 のみ書き換え) を素通りする (設計書 §6.2)。
+    """
+    df = _mkdf()
+    full = compute(df, {})
+    for t in range(len(df)):
+        sub = compute(df.iloc[:t + 1], {})
+        for key in OUTPUTS:
+            assert _same(sub[key].iloc[-1], full[key].iloc[t]), (key, t)
+
+
+# --- I9: 入力不変 / 反復決定性 ----------------------------------------------
+
+def test_input_frame_is_not_mutated():
+    """`check_source` は添字代入 `df["x"] = ...` を拒否しない (設計書 §4)。
+    入力を壊さない規律の観測点はこのテストだけ。"""
+    df = _mkdf()
+    before = df.copy(deep=True)
+    compute(df, {})
+    assert df.equals(before)
+    assert list(df.columns) == list(before.columns)
+    assert df.index.equals(before.index)
+    assert bool((df.dtypes == before.dtypes).all())
+
+
+def test_repeated_calls_are_deterministic():
+    """(1) fresh な df で 2 回 (2) **同じ df オブジェクトで 2 回** —
+    (2) が module レベルの状態持ち越しを捕まえる。"""
+    first = compute(_mkdf(), {})
+    second = compute(_mkdf(), {})
+    df = _mkdf()
+    third = compute(df, {})
+    fourth = compute(df, {})
+    for key in OUTPUTS:
+        for i in range(len(first[key])):
+            assert _same(first[key].iloc[i], second[key].iloc[i]), ("fresh", key, i)
+            assert _same(third[key].iloc[i], fourth[key].iloc[i]), ("same", key, i)
+
+
+# --- warmup 境界 (両側を pin する) ------------------------------------------
+
+def test_warmup_boundary_is_pinned_on_both_sides():
+    """「N 行目まで NaN」だけでなく「N+1 行目に値が入る」も見る — 片側だけ
+    だと warmup が 1 本早く/遅く明ける変異を検出できない。"""
+    out = compute(_mkdf(), {})
+    for key, first_valid in WARMUP.items():
+        series = out[key]
+        if first_valid > 0:
+            assert bool(series.iloc[:first_valid].isna().all()), key
+        assert not bool(pd.isna(series.iloc[first_valid])), key
+
+
+def test_short_frame_returns_all_declared_keys_as_all_nan():
+    """行が足りなくても「返さない」はできない — 宣言キーは必ず全部返す。"""
+    out = compute(_mkdf(n=3), {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        if WARMUP[key] >= 3:
+            assert bool(out[key].isna().all()), key
+
+
+# --- params の型検証 (変換ではなく型の確認) ---------------------------------
+
+@pytest.mark.parametrize("params", [{'period': 20.0}, {'period': '20'}, {'period': True}, {'period': 0}])
+def test_invalid_params_raise_value_error(params):
+    """**文言まで pin する。** `match` が無いと、検査を外す変異を入れても
+    pandas 自身が投げる `ValueError` (`span must satisfy: span >= 1` 等) で
+    テストが緑のまま通ってしまう (変異スイープの実測: M-sma-5 / M-ema-4)。
+    本 plugin の文言はすべて `params.<キー名> ...` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_valid_param_override_changes_the_result():
+    df = _mkdf()
+    base = compute(df, {})
+    other = compute(df, {'period': 5})
+    key = OUTPUTS[0]
+    assert not _same(base[key].iloc[-1], other[key].iloc[-1])
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/ema/test_plugin.py`
+
+### Step 2-b: stub を置いて **red** を確認する
+
+- [ ] `docs/examples/plugins/ema/plugin.py` を**この stub**にする:
+
+```python
+"""stub (red 確認用)。**このファイルは Step c で本実装に差し替える。**"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    nan_series = pd.Series(np.full(len(df), np.nan), index=df.index,
+                           dtype="float64")
+    return {
+            "value": nan_series,
+    }
+```
+
+- [ ] `cd docs/examples/plugins/ema && uv run pytest -q test_plugin.py` を回す
+- [ ] **collection error ではなく assert-red** (複数の `FAILED`) になることを確認する
+- [ ] **この pytest 出力を逐語で報告に貼る** (「red を確認した」という申告は証拠にならない)
+
+### Step 2-c: `plugin.py` の本実装を転写する
+
+- [ ] `docs/examples/plugins/ema/plugin.py` を**逐語**で差し替える:
+
+```python
+"""EMA (指数移動平均) indicator plugin。
+
+plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
+`compute(df, params) -> dict` を実装する。df はハーネスが供給する完成バー
+のみの DataFrame (DatetimeIndex は UTC・昇順、末尾最大 `config.yaml` の
+`max_bars` 本)。純関数のみ — I/O・乱数・実時計へのアクセスは禁止。
+使ってよいのは pandas / numpy / math のみ。
+
+作者向け注意 (設計書 §4 の必須項目):
+
+1. **warmup はこの関数自身の責務。** `max_bars` は「渡す DataFrame の末尾
+   最大本数の上限宣言」であり「常に同じ本数が入っている保証」ではない。
+   系列契約では「行が足りないので何も返さない」はできない (ハーネスは宣言
+   `outputs` と完全一致するキー集合を毎回要求する)。足りない期間は **NaN**
+   にする — 消費側 (strategy) は `pd.isna` を見て hold を返す規約。
+
+2. **1d 足のバケット境界は UTC 00:00 (epoch 錨)** であり、FX の取引日境界
+   (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
+   ため、呼び出し側が渡す任意の足で使われ得る。
+
+3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
+   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
+   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+   `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
+   渡る履歴が短くなり値がわずかにずれる。
+
+4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
+   Series を作る)。モジュールレベルの状態を持たない。
+
+入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+
+
+def _int_param(params: dict, name: str, default: int) -> int:
+    """**変換ではなく型の確認** (設計書 §4)。`int(params.get(...))` は
+    `14.9` を `14` に、`"14"` を `14` に黙って読み替えてしまい、承認不要の
+    params 上書き (U3) 経由で誰のレビューも通らず本番へ届く。`bool` は
+    `int` の派生なので先に弾く。
+
+    **この関数は 9 本の plugin に逐語で重複している。** plugin は 1 フォルダ
+    3 ファイルで完結しなければならず (loader が 4 本目の `.py` を拒否、
+    sandbox が相対 import を拒否)、共有モジュールを置く経路が無い。
+    直すときは 9 本まとめて直すこと。
+    """
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"params.{name} must be an int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"params.{name} must be >= 1, got {value}")
+    return value
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    """指数移動平均 (EMA、alpha = 2/(period+1)) を系列で返す。
+
+    再帰の初期値は `y_0 = x_0` (pandas `adjust=False` の既定、設計書 D1)。
+    教科書流の「先頭 period 本の SMA を seed にする」は採らない — 配備済
+    `rsi_indicator` と同じ再帰に揃えるため。
+    """
+    period = _int_param(params, "period", 20)
+    close = df["close"].astype(float)
+    value = close.ewm(span=period, adjust=False, min_periods=period).mean()
+    return {"value": value}
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/ema/plugin.py`
+
+### Step 2-d: **green** を確認する
+
+- [ ] `cd docs/examples/plugins/ema && uv run pytest -q test_plugin.py`
+      → **12 passed** になること (この本数を報告に書く)
+- [ ] `check_source` が 2 本とも通ること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.sandbox import check_source
+d = Path('docs/examples/plugins/ema')
+check_source(d / 'plugin.py')
+check_source(d / 'test_plugin.py', extra_allowed=frozenset({'pytest', 'plugin'}))
+print('check_source ok')"
+```
+
+- [ ] `discover` が通り `outputs` / `max_bars` が宣言どおりであること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.loader import discover_one_with_reason
+meta, reason = discover_one_with_reason(Path('docs/examples/plugins/ema'), 'ema')
+print(meta.kind, list(meta.outputs), meta.max_bars, meta.params, reason)"
+```
+
+### Step 2-e: 逆変異 (**6 件 = 下限であって上限ではない**)
+
+1 件ずつ `plugin.py` に適用 → `uv run pytest -q test_plugin.py --tb=no` → **元に戻す**。
+`git checkout` は使わない (`cp plugin.py /tmp/...bak` で退避して戻す)。
+**`FAILED` のテスト名を報告に貼り、下表と照合する。**
+
+| # | 変異 | red になるべきテスト (指揮者の実測値) |
+|---|---|---|
+| M-ema-1 | span -> alpha=1/p (EMA を Wilder に) | `test_matches_reference_implementation_on_every_row` |
+| M-ema-2 | adjust=False -> True | `test_matches_reference_implementation_on_every_row` |
+| M-ema-3 | min_periods を外す | `test_matches_reference_implementation_on_every_row`, `test_short_frame_returns_all_declared_keys_as_all_nan`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-ema-4 | period の下限検査を外す | `test_invalid_params_raise_value_error[params3]` |
+| M-ema-5 | int 型検査を int() 変換に | `test_invalid_params_raise_value_error[params0]`, `test_invalid_params_raise_value_error[params1]`, `test_invalid_params_raise_value_error[params2]` |
+| M-ema-6 | 未来参照 rolling(center=True) | `test_matches_reference_implementation_on_every_row`, `test_prefix_consistency_on_every_row`, `test_valid_param_override_changes_the_result` |
+
+- [ ] 6 件すべてが KILLED になることを実測し、テスト名を報告に貼る
+- [ ] 元のファイルに戻っていることを `diff` で確認する
+
+### Step 2-f: 機械 diff と commit
+
+- [ ] **プラン本文から抽出して `diff` を取る** (差分ゼロを報告に貼る):
+
+```
+PLAN=docs/superpowers/plans/2026-09-19-indicator-initial-set.md
+uv run python - <<'EOF'
+import re, pathlib, subprocess
+pathlib.Path("tmp").mkdir(exist_ok=True)   # **`/tmp` 直下は使わない** (Global Constraints)
+plan = pathlib.Path("docs/superpowers/plans/2026-09-19-indicator-initial-set.md").read_text()
+# 見出し行 (行頭の "## T2: ") から次の "## " 見出しの直前までを節とする。
+# **行頭アンカー (re.M) が要る** — この抽出スクリプト自身が節の中に
+# 同じ文字列を含むため、素の split だと節が途中で切れる (実測)。
+sec = re.search(r"^## T2: .*?(?=^## |\Z)", plan, re.S | re.M).group(0)
+blocks = re.findall(r"^```(?:python|yaml)\n(.*?)^```$", sec, re.S | re.M)
+assert len(blocks) == 4, len(blocks)
+# blocks[0]=config.yaml, blocks[1]=test_plugin.py, blocks[2]=stub, blocks[3]=plugin.py
+for text, path in ((blocks[0], "config.yaml"), (blocks[1], "test_plugin.py"),
+                   (blocks[3], "plugin.py")):
+    want = pathlib.Path("tmp/expect_" + path)
+    want.write_text(text)
+    real = pathlib.Path("docs/examples/plugins/ema") / path
+    r = subprocess.run(["diff", str(want), str(real)], capture_output=True, text=True)
+    print(path, "DIFF-ZERO" if r.returncode == 0 else "MISMATCH\n" + r.stdout)
+EOF
+```
+
+- [ ] 各ファイルの絶対パスと `wc -l` を報告に書く
+- [ ] `git add docs/examples/plugins/ema && git commit`
+      (メッセージ: `feat(indicator-initial-set): ema indicator plugin (T2)`)
+- [ ] **逸脱の申告** — 上の Step どおりに書けなかった箇所を「Step 番号 / 何を / なぜ」で全件
+
+---
+
+## T3: `rsi` — RSI (Wilder 平滑)
+
+**出力**: `rsi` ／ **warmup (最初に値が入る 0 起点行)**: `rsi`=14 ／ **`max_bars`**: 400
+**依存**: T0 のみ。他の指標 task と**並列実行可**。
+**触るファイル**: `docs/examples/plugins/rsi/` の 3 ファイルのみ。
+
+**この task の要点**: 退化規則 (ε) の**判定順**と、参照実装にも同じ ε 規則を書き写すこと。`|close|` は**その行自身の close** (`shift` も平均も使わない)。配備済 `rsi_indicator` とは横ばい相場で値が違う (設計書 §0 R5a)。
+
+### Step 3-a: `config.yaml` と `test_plugin.py` を転写する
+
+- [ ] `docs/examples/plugins/rsi/` を作る
+- [ ] `docs/examples/plugins/rsi/config.yaml` を**逐語**で作る:
+
+```yaml
+kind: indicator
+outputs: [rsi]
+max_bars: 400
+params:
+  period: 14
+```
+
+- [ ] `docs/examples/plugins/rsi/test_plugin.py` を**逐語**で作る
+      (**フェンス行 ` ```python ` / ` ``` ` をファイルに書かないこと**):
+
+```python
+"""rsi indicator plugin の自己テスト ([indicator-initial-set] 設計書 §6)。
+
+担保する受入条件: **I2** (outputs 完全一致 / index 一致 / Inf 不在)、
+**I3** (独立参照実装との全行一致)、**I4** (固定 fixture における全行の
+接頭辞一致)、**I9** (入力不変・反復決定性)、warmup 境界の両側 pin、
+params の型検証。
+
+このファイルは bless の pytest ゲート (subprocess + Landlock) で毎回走る。
+`check_source(..., extra_allowed={"pytest", "plugin"})` を通る範囲で書くこと
+(`to_frame` / `df.open` / `getattr` は使えない)。
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from plugin import compute
+
+OUTPUTS = ('rsi',)
+WARMUP = {'rsi': 14}
+EPS = 1e-9
+
+
+def _mkdf(n: int = 160, *, seed: int = 0, base: float = 150.0) -> pd.DataFrame:
+    """設計書 §6 I4 の固定 fixture。160 行は `ichimoku` の `senkou_b` warmup
+    51 + 余裕。**極値を中間と末尾側の両方に置く** — 片側だけだと「全体の
+    min/max で正規化する」型の未来参照を fixture 次第で見逃す (§6.2)。
+    """
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = base + np.cumsum(rng.normal(0.0, sigma, n))
+    if n >= 20:
+        close[n // 2] += base * 0.05
+        close[n - 7] -= base * 0.06
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    if n >= 2:
+        # **bar 1 に決定論的な上げを置く** — ここが平坦だと `+DM[0]` を NaN に
+        # するか 0.0 にするかが Wilder の seed に効かず、行 0 の扱いを潰す変異
+        # (M-adx-4) が fixture 次第で生き残る (変異スイープの実測)。
+        high[1] = high[0] + base * 0.01
+    # **open は close と別の系列にする** (前バーの終値)。`open == close` の
+    # fixture だと「close の代わりに open を読む」型の変異を検出できない
+    # (M-sma-4 の実測)。
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close,
+          "volume": np.ones(n)}, index=index)
+
+
+def _same(got, want, *, rel: float = 1e-9, tol: float = 1e-9) -> bool:
+    """NaN 同士は一致。数値は相対/絶対のどちらかを満たせば一致。"""
+    got_nan = got is None or bool(pd.isna(got))
+    want_nan = want is None or bool(pd.isna(want))
+    if got_nan or want_nan:
+        return got_nan and want_nan
+    got = float(got)
+    want = float(want)
+    return abs(got - want) <= max(tol, rel * abs(want))
+
+
+# --- 独立参照実装 (plugin.py とは別の書き方。plugin.py から import しない) ---
+
+def _isnan(value) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+def _ref_recursive(values: list, alpha: float, period: int) -> list:
+    """再帰平滑。**`min_periods` は位置ではなく「非 NaN 観測数」で数える**
+    (設計書 §3.3) — 位置で `i < period - 1` と書くと `atr` / `adx` の warmup
+    が 1 本早く明け、I3 が落ちる。seed は最初の非 NaN 値 (`y_0 = x_0`)。
+    """
+    out = []
+    prev = None
+    seen = 0
+    for value in values:
+        if _isnan(value):
+            out.append(float("nan"))
+            continue
+        prev = value if prev is None else alpha * value + (1.0 - alpha) * prev
+        seen += 1
+        out.append(prev if seen >= period else float("nan"))
+    return out
+
+
+def _reference(df, params: dict) -> dict:
+    """plugin.py とは別の書き方だが、**ε 規則は同じ閾値・同じ基準
+    (その行の |close|)・同じ判定順 (1)->(2)->(3) で書き写す** (設計書 §3.3)。
+    ここを素朴な式のままにすると閾値付近の行で I3 が落ちる。
+    """
+    period = int(params.get("period", 14))
+    close = df["close"].tolist()
+    gain = [float("nan")]
+    loss = [float("nan")]
+    for i in range(1, len(close)):
+        delta = close[i] - close[i - 1]
+        gain.append(delta if delta > 0.0 else 0.0)
+        loss.append(-delta if delta < 0.0 else 0.0)
+    alpha = 1.0 / period
+    avg_gain = _ref_recursive(gain, alpha, period)
+    avg_loss = _ref_recursive(loss, alpha, period)
+    out = []
+    for i in range(len(close)):
+        if _isnan(avg_gain[i]) or _isnan(avg_loss[i]):
+            out.append(float("nan"))
+            continue
+        threshold = EPS * abs(close[i])
+        if avg_gain[i] + avg_loss[i] <= threshold:
+            out.append(50.0)
+        elif avg_loss[i] <= threshold:
+            out.append(100.0)
+        else:
+            out.append(100.0 - 100.0 / (1.0 + avg_gain[i] / avg_loss[i]))
+    return {"rsi": out}
+
+
+# --- I2: 宣言キー集合 / index 一致 / Inf 不在 -------------------------------
+
+def test_outputs_match_declared_keys_and_index():
+    df = _mkdf()
+    out = compute(df, {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        assert isinstance(out[key], pd.Series), key
+        assert out[key].index.equals(df.index), key
+        assert not bool(np.isinf(out[key].to_numpy(dtype="float64")).any()), key
+
+
+# --- I3: 独立参照実装との全行一致 -------------------------------------------
+
+def test_matches_reference_implementation_on_every_row():
+    df = _mkdf()
+    got = compute(df, {})
+    want = _reference(df, {})
+    for key in OUTPUTS:
+        for i in range(len(df)):
+            assert _same(got[key].iloc[i], want[key][i]), (key, i)
+
+
+# --- I4: 固定 fixture における接頭辞一致 (全 160 行) ------------------------
+
+def test_prefix_consistency_on_every_row():
+    """`compute(df[:t+1])[key].iloc[-1] == compute(df)[key].iloc[t]` を
+    **全行**で。サンプル点だけだと「サンプルされない行だけ未来を読む」実装
+    (実測: 行 37 のみ書き換え) を素通りする (設計書 §6.2)。
+    """
+    df = _mkdf()
+    full = compute(df, {})
+    for t in range(len(df)):
+        sub = compute(df.iloc[:t + 1], {})
+        for key in OUTPUTS:
+            assert _same(sub[key].iloc[-1], full[key].iloc[t]), (key, t)
+
+
+# --- I9: 入力不変 / 反復決定性 ----------------------------------------------
+
+def test_input_frame_is_not_mutated():
+    """`check_source` は添字代入 `df["x"] = ...` を拒否しない (設計書 §4)。
+    入力を壊さない規律の観測点はこのテストだけ。"""
+    df = _mkdf()
+    before = df.copy(deep=True)
+    compute(df, {})
+    assert df.equals(before)
+    assert list(df.columns) == list(before.columns)
+    assert df.index.equals(before.index)
+    assert bool((df.dtypes == before.dtypes).all())
+
+
+def test_repeated_calls_are_deterministic():
+    """(1) fresh な df で 2 回 (2) **同じ df オブジェクトで 2 回** —
+    (2) が module レベルの状態持ち越しを捕まえる。"""
+    first = compute(_mkdf(), {})
+    second = compute(_mkdf(), {})
+    df = _mkdf()
+    third = compute(df, {})
+    fourth = compute(df, {})
+    for key in OUTPUTS:
+        for i in range(len(first[key])):
+            assert _same(first[key].iloc[i], second[key].iloc[i]), ("fresh", key, i)
+            assert _same(third[key].iloc[i], fourth[key].iloc[i]), ("same", key, i)
+
+
+# --- warmup 境界 (両側を pin する) ------------------------------------------
+
+def test_warmup_boundary_is_pinned_on_both_sides():
+    """「N 行目まで NaN」だけでなく「N+1 行目に値が入る」も見る — 片側だけ
+    だと warmup が 1 本早く/遅く明ける変異を検出できない。"""
+    out = compute(_mkdf(), {})
+    for key, first_valid in WARMUP.items():
+        series = out[key]
+        if first_valid > 0:
+            assert bool(series.iloc[:first_valid].isna().all()), key
+        assert not bool(pd.isna(series.iloc[first_valid])), key
+
+
+def test_short_frame_returns_all_declared_keys_as_all_nan():
+    """行が足りなくても「返さない」はできない — 宣言キーは必ず全部返す。"""
+    out = compute(_mkdf(n=3), {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        if WARMUP[key] >= 3:
+            assert bool(out[key].isna().all()), key
+
+
+# --- params の型検証 (変換ではなく型の確認) ---------------------------------
+
+@pytest.mark.parametrize("params", [{'period': 14.0}, {'period': '14'}, {'period': True}, {'period': 0}])
+def test_invalid_params_raise_value_error(params):
+    """**文言まで pin する。** `match` が無いと、検査を外す変異を入れても
+    pandas 自身が投げる `ValueError` (`span must satisfy: span >= 1` 等) で
+    テストが緑のまま通ってしまう (変異スイープの実測: M-sma-5 / M-ema-4)。
+    本 plugin の文言はすべて `params.<キー名> ...` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_valid_param_override_changes_the_result():
+    df = _mkdf()
+    base = compute(df, {})
+    other = compute(df, {'period': 5})
+    key = OUTPUTS[0]
+    assert not _same(base[key].iloc[-1], other[key].iloc[-1])
+
+
+def _decayed_flat_df(n_flat: int = 260, price: float = 150.0,
+                     move: float = 1.0) -> pd.DataFrame:
+    """1 本だけ上げたあと `n_flat` 本の完全横ばい。
+
+    平滑量は指数的に減衰して**実質ゼロ**になるが、**厳密なゼロにはならない**
+    — 厳密 `== 0` 判定では捕まらず、比を取る指標が「値動きが無いのに強い
+    トレンド」という値を返す構成 (設計書 §3.2 (i-b) の反例)。相対 ε 規則が
+    効いているかはこの fixture でしか観測できない (変異スイープの実測:
+    完全横ばいだけの fixture では EPS=0 への変異が生き残る)。
+    """
+    closes = [price] * 5 + [price + move] * (n_flat + 1)
+    values = np.array(closes, dtype="float64")
+    index = pd.date_range("2026-01-01", periods=len(values), freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": values, "high": values, "low": values, "close": values,
+         "volume": np.ones(len(values))}, index=index)
+
+
+def test_eps_rule_fires_after_the_averages_decay():
+    """`avg_loss` が厳密 0 でも `avg_gain` が実質ゼロまで減衰した区間では
+    **50 (中立)** を返す。EPS を 0 にすると (1) の分岐に到達せず 100 を返す
+    ので、この fixture が ε 規則の唯一の観測点になる。"""
+    rsi = compute(_decayed_flat_df(), {})["rsi"]
+    assert float(rsi.iloc[-1]) == 50.0
+
+
+# --- 退化規則 (ε) と既存 `rsi_indicator` との差異 ---------------------------
+
+def _flat_df(n: int = 60, price: float = 150.0) -> pd.DataFrame:
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    values = np.full(n, price)
+    return pd.DataFrame(
+        {"open": values, "high": values, "low": values, "close": values,
+         "volume": np.ones(n)}, index=index)
+
+
+def test_flat_market_is_neutral_not_one_hundred():
+    """完全横ばい = 値動きなし -> **50** (中立)。配備済 `rsi_indicator` は
+    同じ場面で 100 を返す (厳密 `== 0` 判定で「下げが無い」に倒すため) —
+    両者を同じ strategy で混ぜて使わないこと (設計書 §0 R5a)。"""
+    rsi = compute(_flat_df(), {})["rsi"]
+    assert float(rsi.iloc[-1]) == 50.0
+
+
+def test_monotonic_rise_is_one_hundred():
+    """下げが一度も無く上げが有意 -> 100 (判定順 (2))。"""
+    closes = [100.0 + i for i in range(40)]
+    index = pd.date_range("2026-01-01", periods=len(closes), freq="1h", tz="UTC")
+    df = pd.DataFrame(
+        {"open": closes, "high": closes, "low": closes, "close": closes,
+         "volume": [1.0] * len(closes)}, index=index)
+    assert float(compute(df, {})["rsi"].iloc[-1]) == 100.0
+
+
+def test_eps_rule_does_not_fire_on_ordinary_data():
+    """通常データで ε 規則が誤発火しないこと (設計書 §3.2 (i-b) の余裕 7e+03 倍)。"""
+    rsi = compute(_mkdf(), {})["rsi"]
+    assert 0.0 < float(rsi.iloc[-1]) < 100.0
+    assert float(rsi.iloc[-1]) != 50.0
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/rsi/test_plugin.py`
+
+### Step 3-b: stub を置いて **red** を確認する
+
+- [ ] `docs/examples/plugins/rsi/plugin.py` を**この stub**にする:
+
+```python
+"""stub (red 確認用)。**このファイルは Step c で本実装に差し替える。**"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    nan_series = pd.Series(np.full(len(df), np.nan), index=df.index,
+                           dtype="float64")
+    return {
+            "rsi": nan_series,
+    }
+```
+
+- [ ] `cd docs/examples/plugins/rsi && uv run pytest -q test_plugin.py` を回す
+- [ ] **collection error ではなく assert-red** (複数の `FAILED`) になることを確認する
+- [ ] **この pytest 出力を逐語で報告に貼る** (「red を確認した」という申告は証拠にならない)
+
+### Step 3-c: `plugin.py` の本実装を転写する
+
+- [ ] `docs/examples/plugins/rsi/plugin.py` を**逐語**で差し替える:
+
+```python
+"""RSI (Relative Strength Index、Wilder 平滑) indicator plugin。
+
+plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
+`compute(df, params) -> dict` を実装する。df はハーネスが供給する完成バー
+のみの DataFrame (DatetimeIndex は UTC・昇順、末尾最大 `config.yaml` の
+`max_bars` 本)。純関数のみ — I/O・乱数・実時計へのアクセスは禁止。
+使ってよいのは pandas / numpy / math のみ。
+
+作者向け注意 (設計書 §4 の必須項目):
+
+1. **warmup はこの関数自身の責務。** `max_bars` は「渡す DataFrame の末尾
+   最大本数の上限宣言」であり「常に同じ本数が入っている保証」ではない。
+   系列契約では「行が足りないので何も返さない」はできない (ハーネスは宣言
+   `outputs` と完全一致するキー集合を毎回要求する)。足りない期間は **NaN**
+   にする — 消費側 (strategy) は `pd.isna` を見て hold を返す規約。
+
+2. **1d 足のバケット境界は UTC 00:00 (epoch 錨)** であり、FX の取引日境界
+   (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
+   ため、呼び出し側が渡す任意の足で使われ得る。
+
+3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
+   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
+   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+   `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
+   渡る履歴が短くなり値がわずかにずれる。
+
+4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
+   Series を作る)。モジュールレベルの状態を持たない。
+
+5. **値動きの無い期間は中立値を返す** (設計書 §3.2 (i-b))。判定は
+   `<= EPS * |close|` の相対 ε (EPS = 1e-9)。`|close|` は**その行自身の
+   close**。strategy 側で「中立」と「板が動いていない」を読み分けたいなら
+   `atr` を併せて宣言して自分で判定すること。
+
+入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+
+
+EPS = 1e-9
+
+
+def _int_param(params: dict, name: str, default: int) -> int:
+    """**変換ではなく型の確認** (設計書 §4)。`int(params.get(...))` は
+    `14.9` を `14` に、`"14"` を `14` に黙って読み替えてしまい、承認不要の
+    params 上書き (U3) 経由で誰のレビューも通らず本番へ届く。`bool` は
+    `int` の派生なので先に弾く。
+
+    **この関数は 9 本の plugin に逐語で重複している。** plugin は 1 フォルダ
+    3 ファイルで完結しなければならず (loader が 4 本目の `.py` を拒否、
+    sandbox が相対 import を拒否)、共有モジュールを置く経路が無い。
+    直すときは 9 本まとめて直すこと。
+    """
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"params.{name} must be an int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"params.{name} must be >= 1, got {value}")
+    return value
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    """Wilder 平滑の RSI を系列で返す。
+
+    **退化規則 (設計書 §3.2 (i-b))**: 値動きが実質ゼロの区間では
+    `avg_gain` と `avg_loss` が同率で減衰し、その比が残るため「横ばいなのに
+    RSI が 100」という誤った値になる。相対 ε で潰す。**判定順は固定**:
+
+      (1) `avg_gain + avg_loss <= EPS * |close|`  -> 50.0 (値動きなし = 中立)
+      (2) それ以外で `avg_loss <= EPS * |close|`  -> 100.0 (上げのみ)
+      (3) それ以外は式どおり
+
+    `|close|` は **その行自身の close** (shift も平均も使わない)。
+
+    **配備済 `rsi_indicator` との差異**: あちらは厳密な `== 0` 判定で
+    「下げが無い -> 100」しか持たない。横ばい相場で両者の値は一致しない
+    (既存 100 / 本 plugin 50)。**両方を同じ strategy で混ぜて使わないこと。**
+    """
+    period = _int_param(params, "period", 14)
+    close = df["close"].astype(float)
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False,
+                        min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False,
+                        min_periods=period).mean()
+    threshold = EPS * close.abs()
+    rsi = 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+    rsi = rsi.where(avg_loss > threshold, 100.0)
+    rsi = rsi.where(avg_gain + avg_loss > threshold, 50.0)
+    rsi = rsi.where(~(avg_gain.isna() | avg_loss.isna()))
+    return {"rsi": rsi}
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/rsi/plugin.py`
+
+### Step 3-d: **green** を確認する
+
+- [ ] `cd docs/examples/plugins/rsi && uv run pytest -q test_plugin.py`
+      → **16 passed** になること (この本数を報告に書く)
+- [ ] `check_source` が 2 本とも通ること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.sandbox import check_source
+d = Path('docs/examples/plugins/rsi')
+check_source(d / 'plugin.py')
+check_source(d / 'test_plugin.py', extra_allowed=frozenset({'pytest', 'plugin'}))
+print('check_source ok')"
+```
+
+- [ ] `discover` が通り `outputs` / `max_bars` が宣言どおりであること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.loader import discover_one_with_reason
+meta, reason = discover_one_with_reason(Path('docs/examples/plugins/rsi'), 'rsi')
+print(meta.kind, list(meta.outputs), meta.max_bars, meta.params, reason)"
+```
+
+### Step 3-e: 逆変異 (**6 件 = 下限であって上限ではない**)
+
+1 件ずつ `plugin.py` に適用 → `uv run pytest -q test_plugin.py --tb=no` → **元に戻す**。
+`git checkout` は使わない (`cp plugin.py /tmp/...bak` で退避して戻す)。
+**`FAILED` のテスト名を報告に貼り、下表と照合する。**
+
+| # | 変異 | red になるべきテスト (指揮者の実測値) |
+|---|---|---|
+| M-rsi-1 | Wilder alpha -> EMA span | `test_matches_reference_implementation_on_every_row` |
+| M-rsi-2 | ε 規則の判定順を入れ替え | `test_eps_rule_fires_after_the_averages_decay`, `test_flat_market_is_neutral_not_one_hundred` |
+| M-rsi-3 | EPS を 0 に (厳密判定へ戻す) | `test_eps_rule_fires_after_the_averages_decay` |
+| M-rsi-4 | gain/loss を入れ替え | `test_matches_reference_implementation_on_every_row`, `test_monotonic_rise_is_one_hundred` |
+| M-rsi-5 | warmup の NaN 復元を削る | `test_matches_reference_implementation_on_every_row`, `test_short_frame_returns_all_declared_keys_as_all_nan`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-rsi-6 | 退化規則 (1) を削る | `test_eps_rule_fires_after_the_averages_decay`, `test_flat_market_is_neutral_not_one_hundred` |
+
+- [ ] 6 件すべてが KILLED になることを実測し、テスト名を報告に貼る
+- [ ] 元のファイルに戻っていることを `diff` で確認する
+
+### Step 3-f: 機械 diff と commit
+
+- [ ] **プラン本文から抽出して `diff` を取る** (差分ゼロを報告に貼る):
+
+```
+PLAN=docs/superpowers/plans/2026-09-19-indicator-initial-set.md
+uv run python - <<'EOF'
+import re, pathlib, subprocess
+pathlib.Path("tmp").mkdir(exist_ok=True)   # **`/tmp` 直下は使わない** (Global Constraints)
+plan = pathlib.Path("docs/superpowers/plans/2026-09-19-indicator-initial-set.md").read_text()
+# 見出し行 (行頭の "## T3: ") から次の "## " 見出しの直前までを節とする。
+# **行頭アンカー (re.M) が要る** — この抽出スクリプト自身が節の中に
+# 同じ文字列を含むため、素の split だと節が途中で切れる (実測)。
+sec = re.search(r"^## T3: .*?(?=^## |\Z)", plan, re.S | re.M).group(0)
+blocks = re.findall(r"^```(?:python|yaml)\n(.*?)^```$", sec, re.S | re.M)
+assert len(blocks) == 4, len(blocks)
+# blocks[0]=config.yaml, blocks[1]=test_plugin.py, blocks[2]=stub, blocks[3]=plugin.py
+for text, path in ((blocks[0], "config.yaml"), (blocks[1], "test_plugin.py"),
+                   (blocks[3], "plugin.py")):
+    want = pathlib.Path("tmp/expect_" + path)
+    want.write_text(text)
+    real = pathlib.Path("docs/examples/plugins/rsi") / path
+    r = subprocess.run(["diff", str(want), str(real)], capture_output=True, text=True)
+    print(path, "DIFF-ZERO" if r.returncode == 0 else "MISMATCH\n" + r.stdout)
+EOF
+```
+
+- [ ] 各ファイルの絶対パスと `wc -l` を報告に書く
+- [ ] `git add docs/examples/plugins/rsi && git commit`
+      (メッセージ: `feat(indicator-initial-set): rsi indicator plugin (T3)`)
+- [ ] **逸脱の申告** — 上の Step どおりに書けなかった箇所を「Step 番号 / 何を / なぜ」で全件
+
+---
+
+## T4: `macd` — MACD
+
+**出力**: `macd`, `signal`, `hist` ／ **warmup (最初に値が入る 0 起点行)**: `macd`=25, `signal`=33, `hist`=33 ／ **`max_bars`**: 400
+**依存**: T0 のみ。他の指標 task と**並列実行可**。
+**触るファイル**: `docs/examples/plugins/macd/` の 3 ファイルのみ。
+
+**この task の要点**: `fast < slow` を `>=` で弾く (`>` ではない — `fast == slow` も退化形)。
+
+### Step 4-a: `config.yaml` と `test_plugin.py` を転写する
+
+- [ ] `docs/examples/plugins/macd/` を作る
+- [ ] `docs/examples/plugins/macd/config.yaml` を**逐語**で作る:
+
+```yaml
+kind: indicator
+outputs: [macd, signal, hist]
+max_bars: 400
+params:
+  fast: 12
+  slow: 26
+  signal_period: 9
+```
+
+- [ ] `docs/examples/plugins/macd/test_plugin.py` を**逐語**で作る
+      (**フェンス行 ` ```python ` / ` ``` ` をファイルに書かないこと**):
+
+```python
+"""macd indicator plugin の自己テスト ([indicator-initial-set] 設計書 §6)。
+
+担保する受入条件: **I2** (outputs 完全一致 / index 一致 / Inf 不在)、
+**I3** (独立参照実装との全行一致)、**I4** (固定 fixture における全行の
+接頭辞一致)、**I9** (入力不変・反復決定性)、warmup 境界の両側 pin、
+params の型検証。
+
+このファイルは bless の pytest ゲート (subprocess + Landlock) で毎回走る。
+`check_source(..., extra_allowed={"pytest", "plugin"})` を通る範囲で書くこと
+(`to_frame` / `df.open` / `getattr` は使えない)。
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from plugin import compute
+
+OUTPUTS = ('macd', 'signal', 'hist')
+WARMUP = {'macd': 25, 'signal': 33, 'hist': 33}
+
+
+def _mkdf(n: int = 160, *, seed: int = 0, base: float = 150.0) -> pd.DataFrame:
+    """設計書 §6 I4 の固定 fixture。160 行は `ichimoku` の `senkou_b` warmup
+    51 + 余裕。**極値を中間と末尾側の両方に置く** — 片側だけだと「全体の
+    min/max で正規化する」型の未来参照を fixture 次第で見逃す (§6.2)。
+    """
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = base + np.cumsum(rng.normal(0.0, sigma, n))
+    if n >= 20:
+        close[n // 2] += base * 0.05
+        close[n - 7] -= base * 0.06
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    if n >= 2:
+        # **bar 1 に決定論的な上げを置く** — ここが平坦だと `+DM[0]` を NaN に
+        # するか 0.0 にするかが Wilder の seed に効かず、行 0 の扱いを潰す変異
+        # (M-adx-4) が fixture 次第で生き残る (変異スイープの実測)。
+        high[1] = high[0] + base * 0.01
+    # **open は close と別の系列にする** (前バーの終値)。`open == close` の
+    # fixture だと「close の代わりに open を読む」型の変異を検出できない
+    # (M-sma-4 の実測)。
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close,
+          "volume": np.ones(n)}, index=index)
+
+
+def _same(got, want, *, rel: float = 1e-9, tol: float = 1e-9) -> bool:
+    """NaN 同士は一致。数値は相対/絶対のどちらかを満たせば一致。"""
+    got_nan = got is None or bool(pd.isna(got))
+    want_nan = want is None or bool(pd.isna(want))
+    if got_nan or want_nan:
+        return got_nan and want_nan
+    got = float(got)
+    want = float(want)
+    return abs(got - want) <= max(tol, rel * abs(want))
+
+
+# --- 独立参照実装 (plugin.py とは別の書き方。plugin.py から import しない) ---
+
+def _isnan(value) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+def _ref_recursive(values: list, alpha: float, period: int) -> list:
+    """再帰平滑。**`min_periods` は位置ではなく「非 NaN 観測数」で数える**
+    (設計書 §3.3) — 位置で `i < period - 1` と書くと `atr` / `adx` の warmup
+    が 1 本早く明け、I3 が落ちる。seed は最初の非 NaN 値 (`y_0 = x_0`)。
+    """
+    out = []
+    prev = None
+    seen = 0
+    for value in values:
+        if _isnan(value):
+            out.append(float("nan"))
+            continue
+        prev = value if prev is None else alpha * value + (1.0 - alpha) * prev
+        seen += 1
+        out.append(prev if seen >= period else float("nan"))
+    return out
+
+
+def _reference(df, params: dict) -> dict:
+    fast = int(params.get("fast", 12))
+    slow = int(params.get("slow", 26))
+    signal_period = int(params.get("signal_period", 9))
+    close = df["close"].tolist()
+    fast_ema = _ref_recursive(close, 2.0 / (fast + 1.0), fast)
+    slow_ema = _ref_recursive(close, 2.0 / (slow + 1.0), slow)
+    macd = [float("nan") if _isnan(a) or _isnan(b) else a - b
+            for a, b in zip(fast_ema, slow_ema)]
+    signal = _ref_recursive(macd, 2.0 / (signal_period + 1.0), signal_period)
+    hist = [float("nan") if _isnan(a) or _isnan(b) else a - b
+            for a, b in zip(macd, signal)]
+    return {"macd": macd, "signal": signal, "hist": hist}
+
+
+# --- I2: 宣言キー集合 / index 一致 / Inf 不在 -------------------------------
+
+def test_outputs_match_declared_keys_and_index():
+    df = _mkdf()
+    out = compute(df, {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        assert isinstance(out[key], pd.Series), key
+        assert out[key].index.equals(df.index), key
+        assert not bool(np.isinf(out[key].to_numpy(dtype="float64")).any()), key
+
+
+# --- I3: 独立参照実装との全行一致 -------------------------------------------
+
+def test_matches_reference_implementation_on_every_row():
+    df = _mkdf()
+    got = compute(df, {})
+    want = _reference(df, {})
+    for key in OUTPUTS:
+        for i in range(len(df)):
+            assert _same(got[key].iloc[i], want[key][i]), (key, i)
+
+
+# --- I4: 固定 fixture における接頭辞一致 (全 160 行) ------------------------
+
+def test_prefix_consistency_on_every_row():
+    """`compute(df[:t+1])[key].iloc[-1] == compute(df)[key].iloc[t]` を
+    **全行**で。サンプル点だけだと「サンプルされない行だけ未来を読む」実装
+    (実測: 行 37 のみ書き換え) を素通りする (設計書 §6.2)。
+    """
+    df = _mkdf()
+    full = compute(df, {})
+    for t in range(len(df)):
+        sub = compute(df.iloc[:t + 1], {})
+        for key in OUTPUTS:
+            assert _same(sub[key].iloc[-1], full[key].iloc[t]), (key, t)
+
+
+# --- I9: 入力不変 / 反復決定性 ----------------------------------------------
+
+def test_input_frame_is_not_mutated():
+    """`check_source` は添字代入 `df["x"] = ...` を拒否しない (設計書 §4)。
+    入力を壊さない規律の観測点はこのテストだけ。"""
+    df = _mkdf()
+    before = df.copy(deep=True)
+    compute(df, {})
+    assert df.equals(before)
+    assert list(df.columns) == list(before.columns)
+    assert df.index.equals(before.index)
+    assert bool((df.dtypes == before.dtypes).all())
+
+
+def test_repeated_calls_are_deterministic():
+    """(1) fresh な df で 2 回 (2) **同じ df オブジェクトで 2 回** —
+    (2) が module レベルの状態持ち越しを捕まえる。"""
+    first = compute(_mkdf(), {})
+    second = compute(_mkdf(), {})
+    df = _mkdf()
+    third = compute(df, {})
+    fourth = compute(df, {})
+    for key in OUTPUTS:
+        for i in range(len(first[key])):
+            assert _same(first[key].iloc[i], second[key].iloc[i]), ("fresh", key, i)
+            assert _same(third[key].iloc[i], fourth[key].iloc[i]), ("same", key, i)
+
+
+# --- warmup 境界 (両側を pin する) ------------------------------------------
+
+def test_warmup_boundary_is_pinned_on_both_sides():
+    """「N 行目まで NaN」だけでなく「N+1 行目に値が入る」も見る — 片側だけ
+    だと warmup が 1 本早く/遅く明ける変異を検出できない。"""
+    out = compute(_mkdf(), {})
+    for key, first_valid in WARMUP.items():
+        series = out[key]
+        if first_valid > 0:
+            assert bool(series.iloc[:first_valid].isna().all()), key
+        assert not bool(pd.isna(series.iloc[first_valid])), key
+
+
+def test_short_frame_returns_all_declared_keys_as_all_nan():
+    """行が足りなくても「返さない」はできない — 宣言キーは必ず全部返す。"""
+    out = compute(_mkdf(n=3), {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        if WARMUP[key] >= 3:
+            assert bool(out[key].isna().all()), key
+
+
+# --- params の型検証 (変換ではなく型の確認) ---------------------------------
+
+@pytest.mark.parametrize("params", [{'fast': 12.0}, {'slow': '26'}, {'signal_period': True}, {'fast': 0}, {'fast': 26, 'slow': 26}, {'fast': 30, 'slow': 26}])
+def test_invalid_params_raise_value_error(params):
+    """**文言まで pin する。** `match` が無いと、検査を外す変異を入れても
+    pandas 自身が投げる `ValueError` (`span must satisfy: span >= 1` 等) で
+    テストが緑のまま通ってしまう (変異スイープの実測: M-sma-5 / M-ema-4)。
+    本 plugin の文言はすべて `params.<キー名> ...` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_valid_param_override_changes_the_result():
+    df = _mkdf()
+    base = compute(df, {})
+    other = compute(df, {'fast': 5, 'slow': 13, 'signal_period': 4})
+    key = OUTPUTS[0]
+    assert not _same(base[key].iloc[-1], other[key].iloc[-1])
+
+
+# --- fast < slow の要求 ------------------------------------------------------
+
+def test_hist_equals_macd_minus_signal():
+    out = compute(_mkdf(), {})
+    tail = slice(33, None)
+    difference = (out["macd"].iloc[tail] - out["signal"].iloc[tail]
+                  - out["hist"].iloc[tail]).abs().max()
+    assert float(difference) < 1e-12
+
+
+def test_fast_equal_to_slow_is_rejected():
+    """`fast == slow` は macd/hist が恒等的に 0 になる退化形 (設計書 §4)。"""
+    with pytest.raises(ValueError):
+        compute(_mkdf(n=60), {"fast": 26, "slow": 26})
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/macd/test_plugin.py`
+
+### Step 4-b: stub を置いて **red** を確認する
+
+- [ ] `docs/examples/plugins/macd/plugin.py` を**この stub**にする:
+
+```python
+"""stub (red 確認用)。**このファイルは Step c で本実装に差し替える。**"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    nan_series = pd.Series(np.full(len(df), np.nan), index=df.index,
+                           dtype="float64")
+    return {
+            "macd": nan_series,
+            "signal": nan_series,
+            "hist": nan_series,
+    }
+```
+
+- [ ] `cd docs/examples/plugins/macd && uv run pytest -q test_plugin.py` を回す
+- [ ] **collection error ではなく assert-red** (複数の `FAILED`) になることを確認する
+- [ ] **この pytest 出力を逐語で報告に貼る** (「red を確認した」という申告は証拠にならない)
+
+### Step 4-c: `plugin.py` の本実装を転写する
+
+- [ ] `docs/examples/plugins/macd/plugin.py` を**逐語**で差し替える:
+
+```python
+"""MACD indicator plugin。
+
+plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
+`compute(df, params) -> dict` を実装する。df はハーネスが供給する完成バー
+のみの DataFrame (DatetimeIndex は UTC・昇順、末尾最大 `config.yaml` の
+`max_bars` 本)。純関数のみ — I/O・乱数・実時計へのアクセスは禁止。
+使ってよいのは pandas / numpy / math のみ。
+
+作者向け注意 (設計書 §4 の必須項目):
+
+1. **warmup はこの関数自身の責務。** `max_bars` は「渡す DataFrame の末尾
+   最大本数の上限宣言」であり「常に同じ本数が入っている保証」ではない。
+   系列契約では「行が足りないので何も返さない」はできない (ハーネスは宣言
+   `outputs` と完全一致するキー集合を毎回要求する)。足りない期間は **NaN**
+   にする — 消費側 (strategy) は `pd.isna` を見て hold を返す規約。
+
+2. **1d 足のバケット境界は UTC 00:00 (epoch 錨)** であり、FX の取引日境界
+   (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
+   ため、呼び出し側が渡す任意の足で使われ得る。
+
+3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
+   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
+   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+   `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
+   渡る履歴が短くなり値がわずかにずれる。
+
+4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
+   Series を作る)。モジュールレベルの状態を持たない。
+
+入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+
+
+def _int_param(params: dict, name: str, default: int) -> int:
+    """**変換ではなく型の確認** (設計書 §4)。`int(params.get(...))` は
+    `14.9` を `14` に、`"14"` を `14` に黙って読み替えてしまい、承認不要の
+    params 上書き (U3) 経由で誰のレビューも通らず本番へ届く。`bool` は
+    `int` の派生なので先に弾く。
+
+    **この関数は 9 本の plugin に逐語で重複している。** plugin は 1 フォルダ
+    3 ファイルで完結しなければならず (loader が 4 本目の `.py` を拒否、
+    sandbox が相対 import を拒否)、共有モジュールを置く経路が無い。
+    直すときは 9 本まとめて直すこと。
+    """
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"params.{name} must be an int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"params.{name} must be >= 1, got {value}")
+    return value
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    """MACD / signal / histogram を系列で返す。
+
+    `fast < slow` を要求する (設計書 §4): `fast == slow` は macd と hist が
+    恒等的に 0 になる退化形、`fast > slow` は全クロスの符号が反転して
+    「macd が signal を上抜けたら買い」が静かに逆売買になる。
+    """
+    fast = _int_param(params, "fast", 12)
+    slow = _int_param(params, "slow", 26)
+    signal_period = _int_param(params, "signal_period", 9)
+    if fast >= slow:
+        raise ValueError(
+            f"params.fast must be < params.slow, got fast={fast} slow={slow}")
+    close = df["close"].astype(float)
+    fast_ema = close.ewm(span=fast, adjust=False, min_periods=fast).mean()
+    slow_ema = close.ewm(span=slow, adjust=False, min_periods=slow).mean()
+    macd = fast_ema - slow_ema
+    signal = macd.ewm(span=signal_period, adjust=False,
+                      min_periods=signal_period).mean()
+    return {"macd": macd, "signal": signal, "hist": macd - signal}
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/macd/plugin.py`
+
+### Step 4-d: **green** を確認する
+
+- [ ] `cd docs/examples/plugins/macd && uv run pytest -q test_plugin.py`
+      → **16 passed** になること (この本数を報告に書く)
+- [ ] `check_source` が 2 本とも通ること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.sandbox import check_source
+d = Path('docs/examples/plugins/macd')
+check_source(d / 'plugin.py')
+check_source(d / 'test_plugin.py', extra_allowed=frozenset({'pytest', 'plugin'}))
+print('check_source ok')"
+```
+
+- [ ] `discover` が通り `outputs` / `max_bars` が宣言どおりであること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.loader import discover_one_with_reason
+meta, reason = discover_one_with_reason(Path('docs/examples/plugins/macd'), 'macd')
+print(meta.kind, list(meta.outputs), meta.max_bars, meta.params, reason)"
+```
+
+### Step 4-e: 逆変異 (**6 件 = 下限であって上限ではない**)
+
+1 件ずつ `plugin.py` に適用 → `uv run pytest -q test_plugin.py --tb=no` → **元に戻す**。
+`git checkout` は使わない (`cp plugin.py /tmp/...bak` で退避して戻す)。
+**`FAILED` のテスト名を報告に貼り、下表と照合する。**
+
+| # | 変異 | red になるべきテスト (指揮者の実測値) |
+|---|---|---|
+| M-macd-1 | fast/slow を入れ替え | `test_matches_reference_implementation_on_every_row` |
+| M-macd-2 | fast < slow を <= に | `test_fast_equal_to_slow_is_rejected`, `test_invalid_params_raise_value_error[params4]` |
+| M-macd-3 | signal を macd でなく close から | `test_matches_reference_implementation_on_every_row`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-macd-4 | hist の符号反転 | `test_hist_equals_macd_minus_signal`, `test_matches_reference_implementation_on_every_row` |
+| M-macd-5 | signal の min_periods を外す | `test_matches_reference_implementation_on_every_row`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-macd-6 | slow の既定 26 -> 12 | `test_hist_equals_macd_minus_signal`, `test_input_frame_is_not_mutated`, `test_matches_reference_implementation_on_every_row` |
+
+- [ ] 6 件すべてが KILLED になることを実測し、テスト名を報告に貼る
+- [ ] 元のファイルに戻っていることを `diff` で確認する
+
+### Step 4-f: 機械 diff と commit
+
+- [ ] **プラン本文から抽出して `diff` を取る** (差分ゼロを報告に貼る):
+
+```
+PLAN=docs/superpowers/plans/2026-09-19-indicator-initial-set.md
+uv run python - <<'EOF'
+import re, pathlib, subprocess
+pathlib.Path("tmp").mkdir(exist_ok=True)   # **`/tmp` 直下は使わない** (Global Constraints)
+plan = pathlib.Path("docs/superpowers/plans/2026-09-19-indicator-initial-set.md").read_text()
+# 見出し行 (行頭の "## T4: ") から次の "## " 見出しの直前までを節とする。
+# **行頭アンカー (re.M) が要る** — この抽出スクリプト自身が節の中に
+# 同じ文字列を含むため、素の split だと節が途中で切れる (実測)。
+sec = re.search(r"^## T4: .*?(?=^## |\Z)", plan, re.S | re.M).group(0)
+blocks = re.findall(r"^```(?:python|yaml)\n(.*?)^```$", sec, re.S | re.M)
+assert len(blocks) == 4, len(blocks)
+# blocks[0]=config.yaml, blocks[1]=test_plugin.py, blocks[2]=stub, blocks[3]=plugin.py
+for text, path in ((blocks[0], "config.yaml"), (blocks[1], "test_plugin.py"),
+                   (blocks[3], "plugin.py")):
+    want = pathlib.Path("tmp/expect_" + path)
+    want.write_text(text)
+    real = pathlib.Path("docs/examples/plugins/macd") / path
+    r = subprocess.run(["diff", str(want), str(real)], capture_output=True, text=True)
+    print(path, "DIFF-ZERO" if r.returncode == 0 else "MISMATCH\n" + r.stdout)
+EOF
+```
+
+- [ ] 各ファイルの絶対パスと `wc -l` を報告に書く
+- [ ] `git add docs/examples/plugins/macd && git commit`
+      (メッセージ: `feat(indicator-initial-set): macd indicator plugin (T4)`)
+- [ ] **逸脱の申告** — 上の Step どおりに書けなかった箇所を「Step 番号 / 何を / なぜ」で全件
+
+---
+
+## T5: `bollinger` — ボリンジャーバンド
+
+**出力**: `upper`, `middle`, `lower` ／ **warmup (最初に値が入る 0 起点行)**: `upper`=19, `middle`=19, `lower`=19 ／ **`max_bars`**: 400
+**依存**: T0 のみ。他の指標 task と**並列実行可**。
+**触るファイル**: `docs/examples/plugins/bollinger/` の 3 ファイルのみ。
+
+**この task の要点**: `ddof=0` (母標準偏差)。`num_std` は有限かつ `> 0`。
+
+### Step 5-a: `config.yaml` と `test_plugin.py` を転写する
+
+- [ ] `docs/examples/plugins/bollinger/` を作る
+- [ ] `docs/examples/plugins/bollinger/config.yaml` を**逐語**で作る:
+
+```yaml
+kind: indicator
+outputs: [upper, middle, lower]
+max_bars: 400
+params:
+  period: 20
+  num_std: 2.0
+```
+
+- [ ] `docs/examples/plugins/bollinger/test_plugin.py` を**逐語**で作る
+      (**フェンス行 ` ```python ` / ` ``` ` をファイルに書かないこと**):
+
+```python
+"""bollinger indicator plugin の自己テスト ([indicator-initial-set] 設計書 §6)。
+
+担保する受入条件: **I2** (outputs 完全一致 / index 一致 / Inf 不在)、
+**I3** (独立参照実装との全行一致)、**I4** (固定 fixture における全行の
+接頭辞一致)、**I9** (入力不変・反復決定性)、warmup 境界の両側 pin、
+params の型検証。
+
+このファイルは bless の pytest ゲート (subprocess + Landlock) で毎回走る。
+`check_source(..., extra_allowed={"pytest", "plugin"})` を通る範囲で書くこと
+(`to_frame` / `df.open` / `getattr` は使えない)。
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from plugin import compute
+
+OUTPUTS = ('upper', 'middle', 'lower')
+WARMUP = {'upper': 19, 'middle': 19, 'lower': 19}
+
+
+def _mkdf(n: int = 160, *, seed: int = 0, base: float = 150.0) -> pd.DataFrame:
+    """設計書 §6 I4 の固定 fixture。160 行は `ichimoku` の `senkou_b` warmup
+    51 + 余裕。**極値を中間と末尾側の両方に置く** — 片側だけだと「全体の
+    min/max で正規化する」型の未来参照を fixture 次第で見逃す (§6.2)。
+    """
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = base + np.cumsum(rng.normal(0.0, sigma, n))
+    if n >= 20:
+        close[n // 2] += base * 0.05
+        close[n - 7] -= base * 0.06
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    if n >= 2:
+        # **bar 1 に決定論的な上げを置く** — ここが平坦だと `+DM[0]` を NaN に
+        # するか 0.0 にするかが Wilder の seed に効かず、行 0 の扱いを潰す変異
+        # (M-adx-4) が fixture 次第で生き残る (変異スイープの実測)。
+        high[1] = high[0] + base * 0.01
+    # **open は close と別の系列にする** (前バーの終値)。`open == close` の
+    # fixture だと「close の代わりに open を読む」型の変異を検出できない
+    # (M-sma-4 の実測)。
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close,
+          "volume": np.ones(n)}, index=index)
+
+
+def _same(got, want, *, rel: float = 1e-9, tol: float = 1e-9) -> bool:
+    """NaN 同士は一致。数値は相対/絶対のどちらかを満たせば一致。"""
+    got_nan = got is None or bool(pd.isna(got))
+    want_nan = want is None or bool(pd.isna(want))
+    if got_nan or want_nan:
+        return got_nan and want_nan
+    got = float(got)
+    want = float(want)
+    return abs(got - want) <= max(tol, rel * abs(want))
+
+
+# --- 独立参照実装 (plugin.py とは別の書き方。plugin.py から import しない) ---
+
+def _isnan(value) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+def _ref_sma(values: list, period: int) -> list:
+    """SMA を素朴なスライスで。先頭 period-1 個は NaN。"""
+    out = []
+    for i in range(len(values)):
+        window = values[i - period + 1:i + 1]
+        if i < period - 1 or any(_isnan(v) for v in window):
+            out.append(float("nan"))
+        else:
+            out.append(sum(window) / float(period))
+    return out
+
+
+def _ref_std(values: list, period: int) -> list:
+    """母標準偏差 (ddof=0) を素朴に。"""
+    out = []
+    for i in range(len(values)):
+        if i < period - 1:
+            out.append(float("nan"))
+            continue
+        window = values[i - period + 1:i + 1]
+        mean = sum(window) / float(period)
+        out.append(math.sqrt(sum((v - mean) ** 2 for v in window) / float(period)))
+    return out
+
+
+def _reference(df, params: dict) -> dict:
+    period = int(params.get("period", 20))
+    num_std = float(params.get("num_std", 2.0))
+    close = df["close"].tolist()
+    middle = _ref_sma(close, period)
+    sigma = _ref_std(close, period)
+    upper = [float("nan") if _isnan(m) else m + num_std * s
+             for m, s in zip(middle, sigma)]
+    lower = [float("nan") if _isnan(m) else m - num_std * s
+             for m, s in zip(middle, sigma)]
+    return {"upper": upper, "middle": middle, "lower": lower}
+
+
+# --- I2: 宣言キー集合 / index 一致 / Inf 不在 -------------------------------
+
+def test_outputs_match_declared_keys_and_index():
+    df = _mkdf()
+    out = compute(df, {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        assert isinstance(out[key], pd.Series), key
+        assert out[key].index.equals(df.index), key
+        assert not bool(np.isinf(out[key].to_numpy(dtype="float64")).any()), key
+
+
+# --- I3: 独立参照実装との全行一致 -------------------------------------------
+
+def test_matches_reference_implementation_on_every_row():
+    df = _mkdf()
+    got = compute(df, {})
+    want = _reference(df, {})
+    for key in OUTPUTS:
+        for i in range(len(df)):
+            assert _same(got[key].iloc[i], want[key][i]), (key, i)
+
+
+# --- I4: 固定 fixture における接頭辞一致 (全 160 行) ------------------------
+
+def test_prefix_consistency_on_every_row():
+    """`compute(df[:t+1])[key].iloc[-1] == compute(df)[key].iloc[t]` を
+    **全行**で。サンプル点だけだと「サンプルされない行だけ未来を読む」実装
+    (実測: 行 37 のみ書き換え) を素通りする (設計書 §6.2)。
+    """
+    df = _mkdf()
+    full = compute(df, {})
+    for t in range(len(df)):
+        sub = compute(df.iloc[:t + 1], {})
+        for key in OUTPUTS:
+            assert _same(sub[key].iloc[-1], full[key].iloc[t]), (key, t)
+
+
+# --- I9: 入力不変 / 反復決定性 ----------------------------------------------
+
+def test_input_frame_is_not_mutated():
+    """`check_source` は添字代入 `df["x"] = ...` を拒否しない (設計書 §4)。
+    入力を壊さない規律の観測点はこのテストだけ。"""
+    df = _mkdf()
+    before = df.copy(deep=True)
+    compute(df, {})
+    assert df.equals(before)
+    assert list(df.columns) == list(before.columns)
+    assert df.index.equals(before.index)
+    assert bool((df.dtypes == before.dtypes).all())
+
+
+def test_repeated_calls_are_deterministic():
+    """(1) fresh な df で 2 回 (2) **同じ df オブジェクトで 2 回** —
+    (2) が module レベルの状態持ち越しを捕まえる。"""
+    first = compute(_mkdf(), {})
+    second = compute(_mkdf(), {})
+    df = _mkdf()
+    third = compute(df, {})
+    fourth = compute(df, {})
+    for key in OUTPUTS:
+        for i in range(len(first[key])):
+            assert _same(first[key].iloc[i], second[key].iloc[i]), ("fresh", key, i)
+            assert _same(third[key].iloc[i], fourth[key].iloc[i]), ("same", key, i)
+
+
+# --- warmup 境界 (両側を pin する) ------------------------------------------
+
+def test_warmup_boundary_is_pinned_on_both_sides():
+    """「N 行目まで NaN」だけでなく「N+1 行目に値が入る」も見る — 片側だけ
+    だと warmup が 1 本早く/遅く明ける変異を検出できない。"""
+    out = compute(_mkdf(), {})
+    for key, first_valid in WARMUP.items():
+        series = out[key]
+        if first_valid > 0:
+            assert bool(series.iloc[:first_valid].isna().all()), key
+        assert not bool(pd.isna(series.iloc[first_valid])), key
+
+
+def test_short_frame_returns_all_declared_keys_as_all_nan():
+    """行が足りなくても「返さない」はできない — 宣言キーは必ず全部返す。"""
+    out = compute(_mkdf(n=3), {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        if WARMUP[key] >= 3:
+            assert bool(out[key].isna().all()), key
+
+
+# --- params の型検証 (変換ではなく型の確認) ---------------------------------
+
+@pytest.mark.parametrize("params", [{'period': 20.0}, {'period': 0}, {'num_std': '2.0'}, {'num_std': True}, {'num_std': 0.0}, {'num_std': -2.0}, {"num_std": float("inf")}])
+def test_invalid_params_raise_value_error(params):
+    """**文言まで pin する。** `match` が無いと、検査を外す変異を入れても
+    pandas 自身が投げる `ValueError` (`span must satisfy: span >= 1` 等) で
+    テストが緑のまま通ってしまう (変異スイープの実測: M-sma-5 / M-ema-4)。
+    本 plugin の文言はすべて `params.<キー名> ...` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_valid_param_override_changes_the_result():
+    df = _mkdf()
+    base = compute(df, {})
+    other = compute(df, {'period': 5})
+    key = OUTPUTS[0]
+    assert not _same(base[key].iloc[-1], other[key].iloc[-1])
+
+
+# --- sigma == 0 の退化 -------------------------------------------------------
+
+def test_zero_sigma_collapses_the_three_bands():
+    n = 40
+    values = np.full(n, 150.0)
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    df = pd.DataFrame(
+        {"open": values, "high": values, "low": values, "close": values,
+         "volume": np.ones(n)}, index=index)
+    out = compute(df, {})
+    assert float(out["upper"].iloc[-1]) == float(out["middle"].iloc[-1])
+    assert float(out["lower"].iloc[-1]) == float(out["middle"].iloc[-1])
+
+
+def test_bands_are_ordered():
+    out = compute(_mkdf(), {})
+    tail = slice(19, None)
+    assert bool((out["upper"].iloc[tail] >= out["middle"].iloc[tail]).all())
+    assert bool((out["middle"].iloc[tail] >= out["lower"].iloc[tail]).all())
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/bollinger/test_plugin.py`
+
+### Step 5-b: stub を置いて **red** を確認する
+
+- [ ] `docs/examples/plugins/bollinger/plugin.py` を**この stub**にする:
+
+```python
+"""stub (red 確認用)。**このファイルは Step c で本実装に差し替える。**"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    nan_series = pd.Series(np.full(len(df), np.nan), index=df.index,
+                           dtype="float64")
+    return {
+            "upper": nan_series,
+            "middle": nan_series,
+            "lower": nan_series,
+    }
+```
+
+- [ ] `cd docs/examples/plugins/bollinger && uv run pytest -q test_plugin.py` を回す
+- [ ] **collection error ではなく assert-red** (複数の `FAILED`) になることを確認する
+- [ ] **この pytest 出力を逐語で報告に貼る** (「red を確認した」という申告は証拠にならない)
+
+### Step 5-c: `plugin.py` の本実装を転写する
+
+- [ ] `docs/examples/plugins/bollinger/plugin.py` を**逐語**で差し替える:
+
+```python
+"""ボリンジャーバンド indicator plugin。
+
+plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
+`compute(df, params) -> dict` を実装する。df はハーネスが供給する完成バー
+のみの DataFrame (DatetimeIndex は UTC・昇順、末尾最大 `config.yaml` の
+`max_bars` 本)。純関数のみ — I/O・乱数・実時計へのアクセスは禁止。
+使ってよいのは pandas / numpy / math のみ。
+
+作者向け注意 (設計書 §4 の必須項目):
+
+1. **warmup はこの関数自身の責務。** `max_bars` は「渡す DataFrame の末尾
+   最大本数の上限宣言」であり「常に同じ本数が入っている保証」ではない。
+   系列契約では「行が足りないので何も返さない」はできない (ハーネスは宣言
+   `outputs` と完全一致するキー集合を毎回要求する)。足りない期間は **NaN**
+   にする — 消費側 (strategy) は `pd.isna` を見て hold を返す規約。
+
+2. **1d 足のバケット境界は UTC 00:00 (epoch 錨)** であり、FX の取引日境界
+   (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
+   ため、呼び出し側が渡す任意の足で使われ得る。
+
+3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
+   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
+   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+   `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
+   渡る履歴が短くなり値がわずかにずれる。
+
+4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
+   Series を作る)。モジュールレベルの状態を持たない。
+
+入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
+"""
+from __future__ import annotations
+
+import math
+
+import pandas as pd
+
+
+
+def _int_param(params: dict, name: str, default: int) -> int:
+    """**変換ではなく型の確認** (設計書 §4)。`int(params.get(...))` は
+    `14.9` を `14` に、`"14"` を `14` に黙って読み替えてしまい、承認不要の
+    params 上書き (U3) 経由で誰のレビューも通らず本番へ届く。`bool` は
+    `int` の派生なので先に弾く。
+
+    **この関数は 9 本の plugin に逐語で重複している。** plugin は 1 フォルダ
+    3 ファイルで完結しなければならず (loader が 4 本目の `.py` を拒否、
+    sandbox が相対 import を拒否)、共有モジュールを置く経路が無い。
+    直すときは 9 本まとめて直すこと。
+    """
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"params.{name} must be an int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"params.{name} must be >= 1, got {value}")
+    return value
+
+
+def _float_param(params: dict, name: str, default: float) -> float:
+    """有限かつ正の数であることを確認する (設計書 §4)。`bool` を先に弾く。"""
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"params.{name} must be a number, got {value!r}")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(
+            f"params.{name} must be a finite number > 0, got {value}")
+    return value
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    """ボリンジャーバンドを系列で返す (母標準偏差 `ddof=0`)。
+
+    sigma == 0 の行は除算を伴わないので `upper == middle == lower` になる
+    — 異常ではない。`num_std` 自体は有限かつ `> 0` を要求する
+    (0 は 3 本が同一系列になる退化形、負値は upper/lower の反転)。
+    """
+    period = _int_param(params, "period", 20)
+    num_std = _float_param(params, "num_std", 2.0)
+    close = df["close"].astype(float)
+    middle = close.rolling(window=period, min_periods=period).mean()
+    sigma = close.rolling(window=period, min_periods=period).std(ddof=0)
+    return {"upper": middle + num_std * sigma,
+            "middle": middle,
+            "lower": middle - num_std * sigma}
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/bollinger/plugin.py`
+
+### Step 5-d: **green** を確認する
+
+- [ ] `cd docs/examples/plugins/bollinger && uv run pytest -q test_plugin.py`
+      → **17 passed** になること (この本数を報告に書く)
+- [ ] `check_source` が 2 本とも通ること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.sandbox import check_source
+d = Path('docs/examples/plugins/bollinger')
+check_source(d / 'plugin.py')
+check_source(d / 'test_plugin.py', extra_allowed=frozenset({'pytest', 'plugin'}))
+print('check_source ok')"
+```
+
+- [ ] `discover` が通り `outputs` / `max_bars` が宣言どおりであること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.loader import discover_one_with_reason
+meta, reason = discover_one_with_reason(Path('docs/examples/plugins/bollinger'), 'bollinger')
+print(meta.kind, list(meta.outputs), meta.max_bars, meta.params, reason)"
+```
+
+### Step 5-e: 逆変異 (**6 件 = 下限であって上限ではない**)
+
+1 件ずつ `plugin.py` に適用 → `uv run pytest -q test_plugin.py --tb=no` → **元に戻す**。
+`git checkout` は使わない (`cp plugin.py /tmp/...bak` で退避して戻す)。
+**`FAILED` のテスト名を報告に貼り、下表と照合する。**
+
+| # | 変異 | red になるべきテスト (指揮者の実測値) |
+|---|---|---|
+| M-bol-1 | ddof=0 -> ddof=1 | `test_matches_reference_implementation_on_every_row` |
+| M-bol-2 | upper/lower の符号を入れ替え | `test_matches_reference_implementation_on_every_row` |
+| M-bol-3 | num_std の既定 2.0 -> 1.0 | `test_matches_reference_implementation_on_every_row` |
+| M-bol-4 | num_std > 0 の検査を >= 0 に | `test_invalid_params_raise_value_error[params4]` |
+| M-bol-5 | num_std の有限検査を外す | `test_invalid_params_raise_value_error[params6]` |
+| M-bol-6 | middle の min_periods を外す | `test_matches_reference_implementation_on_every_row`, `test_short_frame_returns_all_declared_keys_as_all_nan`, `test_warmup_boundary_is_pinned_on_both_sides` |
+
+- [ ] 6 件すべてが KILLED になることを実測し、テスト名を報告に貼る
+- [ ] 元のファイルに戻っていることを `diff` で確認する
+
+### Step 5-f: 機械 diff と commit
+
+- [ ] **プラン本文から抽出して `diff` を取る** (差分ゼロを報告に貼る):
+
+```
+PLAN=docs/superpowers/plans/2026-09-19-indicator-initial-set.md
+uv run python - <<'EOF'
+import re, pathlib, subprocess
+pathlib.Path("tmp").mkdir(exist_ok=True)   # **`/tmp` 直下は使わない** (Global Constraints)
+plan = pathlib.Path("docs/superpowers/plans/2026-09-19-indicator-initial-set.md").read_text()
+# 見出し行 (行頭の "## T5: ") から次の "## " 見出しの直前までを節とする。
+# **行頭アンカー (re.M) が要る** — この抽出スクリプト自身が節の中に
+# 同じ文字列を含むため、素の split だと節が途中で切れる (実測)。
+sec = re.search(r"^## T5: .*?(?=^## |\Z)", plan, re.S | re.M).group(0)
+blocks = re.findall(r"^```(?:python|yaml)\n(.*?)^```$", sec, re.S | re.M)
+assert len(blocks) == 4, len(blocks)
+# blocks[0]=config.yaml, blocks[1]=test_plugin.py, blocks[2]=stub, blocks[3]=plugin.py
+for text, path in ((blocks[0], "config.yaml"), (blocks[1], "test_plugin.py"),
+                   (blocks[3], "plugin.py")):
+    want = pathlib.Path("tmp/expect_" + path)
+    want.write_text(text)
+    real = pathlib.Path("docs/examples/plugins/bollinger") / path
+    r = subprocess.run(["diff", str(want), str(real)], capture_output=True, text=True)
+    print(path, "DIFF-ZERO" if r.returncode == 0 else "MISMATCH\n" + r.stdout)
+EOF
+```
+
+- [ ] 各ファイルの絶対パスと `wc -l` を報告に書く
+- [ ] `git add docs/examples/plugins/bollinger && git commit`
+      (メッセージ: `feat(indicator-initial-set): bollinger indicator plugin (T5)`)
+- [ ] **逸脱の申告** — 上の Step どおりに書けなかった箇所を「Step 番号 / 何を / なぜ」で全件
+
+---
+
+## T6: `atr` — ATR (Wilder 平滑)
+
+**出力**: `atr` ／ **warmup (最初に値が入る 0 起点行)**: `atr`=14 ／ **`max_bars`**: 400
+**依存**: T0 のみ。他の指標 task と**並列実行可**。
+**触るファイル**: `docs/examples/plugins/atr/` の 3 ファイルのみ。
+
+**この task の要点**: TR の行 0 は **NaN**。`pd.concat(...).max(axis=1)` は NaN を飛ばすので使わない。
+
+### Step 6-a: `config.yaml` と `test_plugin.py` を転写する
+
+- [ ] `docs/examples/plugins/atr/` を作る
+- [ ] `docs/examples/plugins/atr/config.yaml` を**逐語**で作る:
+
+```yaml
+kind: indicator
+outputs: [atr]
+max_bars: 400
+params:
+  period: 14
+```
+
+- [ ] `docs/examples/plugins/atr/test_plugin.py` を**逐語**で作る
+      (**フェンス行 ` ```python ` / ` ``` ` をファイルに書かないこと**):
+
+```python
+"""atr indicator plugin の自己テスト ([indicator-initial-set] 設計書 §6)。
+
+担保する受入条件: **I2** (outputs 完全一致 / index 一致 / Inf 不在)、
+**I3** (独立参照実装との全行一致)、**I4** (固定 fixture における全行の
+接頭辞一致)、**I9** (入力不変・反復決定性)、warmup 境界の両側 pin、
+params の型検証。
+
+このファイルは bless の pytest ゲート (subprocess + Landlock) で毎回走る。
+`check_source(..., extra_allowed={"pytest", "plugin"})` を通る範囲で書くこと
+(`to_frame` / `df.open` / `getattr` は使えない)。
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from plugin import compute
+
+OUTPUTS = ('atr',)
+WARMUP = {'atr': 14}
+
+
+def _mkdf(n: int = 160, *, seed: int = 0, base: float = 150.0) -> pd.DataFrame:
+    """設計書 §6 I4 の固定 fixture。160 行は `ichimoku` の `senkou_b` warmup
+    51 + 余裕。**極値を中間と末尾側の両方に置く** — 片側だけだと「全体の
+    min/max で正規化する」型の未来参照を fixture 次第で見逃す (§6.2)。
+    """
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = base + np.cumsum(rng.normal(0.0, sigma, n))
+    if n >= 20:
+        close[n // 2] += base * 0.05
+        close[n - 7] -= base * 0.06
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    if n >= 2:
+        # **bar 1 に決定論的な上げを置く** — ここが平坦だと `+DM[0]` を NaN に
+        # するか 0.0 にするかが Wilder の seed に効かず、行 0 の扱いを潰す変異
+        # (M-adx-4) が fixture 次第で生き残る (変異スイープの実測)。
+        high[1] = high[0] + base * 0.01
+    # **open は close と別の系列にする** (前バーの終値)。`open == close` の
+    # fixture だと「close の代わりに open を読む」型の変異を検出できない
+    # (M-sma-4 の実測)。
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close,
+          "volume": np.ones(n)}, index=index)
+
+
+def _same(got, want, *, rel: float = 1e-9, tol: float = 1e-9) -> bool:
+    """NaN 同士は一致。数値は相対/絶対のどちらかを満たせば一致。"""
+    got_nan = got is None or bool(pd.isna(got))
+    want_nan = want is None or bool(pd.isna(want))
+    if got_nan or want_nan:
+        return got_nan and want_nan
+    got = float(got)
+    want = float(want)
+    return abs(got - want) <= max(tol, rel * abs(want))
+
+
+# --- 独立参照実装 (plugin.py とは別の書き方。plugin.py から import しない) ---
+
+def _isnan(value) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+def _ref_recursive(values: list, alpha: float, period: int) -> list:
+    """再帰平滑。**`min_periods` は位置ではなく「非 NaN 観測数」で数える**
+    (設計書 §3.3) — 位置で `i < period - 1` と書くと `atr` / `adx` の warmup
+    が 1 本早く明け、I3 が落ちる。seed は最初の非 NaN 値 (`y_0 = x_0`)。
+    """
+    out = []
+    prev = None
+    seen = 0
+    for value in values:
+        if _isnan(value):
+            out.append(float("nan"))
+            continue
+        prev = value if prev is None else alpha * value + (1.0 - alpha) * prev
+        seen += 1
+        out.append(prev if seen >= period else float("nan"))
+    return out
+
+def _ref_true_range(df) -> list:
+    """TR の素朴実装。**行 0 は NaN** (前バーが無い)。"""
+    high = df["high"].tolist()
+    low = df["low"].tolist()
+    close = df["close"].tolist()
+    out = [float("nan")]
+    for i in range(1, len(close)):
+        out.append(max(high[i] - low[i],
+                       abs(high[i] - close[i - 1]),
+                       abs(low[i] - close[i - 1])))
+    return out
+
+
+def _reference(df, params: dict) -> dict:
+    period = int(params.get("period", 14))
+    return {"atr": _ref_recursive(_ref_true_range(df), 1.0 / period, period)}
+
+
+# --- I2: 宣言キー集合 / index 一致 / Inf 不在 -------------------------------
+
+def test_outputs_match_declared_keys_and_index():
+    df = _mkdf()
+    out = compute(df, {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        assert isinstance(out[key], pd.Series), key
+        assert out[key].index.equals(df.index), key
+        assert not bool(np.isinf(out[key].to_numpy(dtype="float64")).any()), key
+
+
+# --- I3: 独立参照実装との全行一致 -------------------------------------------
+
+def test_matches_reference_implementation_on_every_row():
+    df = _mkdf()
+    got = compute(df, {})
+    want = _reference(df, {})
+    for key in OUTPUTS:
+        for i in range(len(df)):
+            assert _same(got[key].iloc[i], want[key][i]), (key, i)
+
+
+# --- I4: 固定 fixture における接頭辞一致 (全 160 行) ------------------------
+
+def test_prefix_consistency_on_every_row():
+    """`compute(df[:t+1])[key].iloc[-1] == compute(df)[key].iloc[t]` を
+    **全行**で。サンプル点だけだと「サンプルされない行だけ未来を読む」実装
+    (実測: 行 37 のみ書き換え) を素通りする (設計書 §6.2)。
+    """
+    df = _mkdf()
+    full = compute(df, {})
+    for t in range(len(df)):
+        sub = compute(df.iloc[:t + 1], {})
+        for key in OUTPUTS:
+            assert _same(sub[key].iloc[-1], full[key].iloc[t]), (key, t)
+
+
+# --- I9: 入力不変 / 反復決定性 ----------------------------------------------
+
+def test_input_frame_is_not_mutated():
+    """`check_source` は添字代入 `df["x"] = ...` を拒否しない (設計書 §4)。
+    入力を壊さない規律の観測点はこのテストだけ。"""
+    df = _mkdf()
+    before = df.copy(deep=True)
+    compute(df, {})
+    assert df.equals(before)
+    assert list(df.columns) == list(before.columns)
+    assert df.index.equals(before.index)
+    assert bool((df.dtypes == before.dtypes).all())
+
+
+def test_repeated_calls_are_deterministic():
+    """(1) fresh な df で 2 回 (2) **同じ df オブジェクトで 2 回** —
+    (2) が module レベルの状態持ち越しを捕まえる。"""
+    first = compute(_mkdf(), {})
+    second = compute(_mkdf(), {})
+    df = _mkdf()
+    third = compute(df, {})
+    fourth = compute(df, {})
+    for key in OUTPUTS:
+        for i in range(len(first[key])):
+            assert _same(first[key].iloc[i], second[key].iloc[i]), ("fresh", key, i)
+            assert _same(third[key].iloc[i], fourth[key].iloc[i]), ("same", key, i)
+
+
+# --- warmup 境界 (両側を pin する) ------------------------------------------
+
+def test_warmup_boundary_is_pinned_on_both_sides():
+    """「N 行目まで NaN」だけでなく「N+1 行目に値が入る」も見る — 片側だけ
+    だと warmup が 1 本早く/遅く明ける変異を検出できない。"""
+    out = compute(_mkdf(), {})
+    for key, first_valid in WARMUP.items():
+        series = out[key]
+        if first_valid > 0:
+            assert bool(series.iloc[:first_valid].isna().all()), key
+        assert not bool(pd.isna(series.iloc[first_valid])), key
+
+
+def test_short_frame_returns_all_declared_keys_as_all_nan():
+    """行が足りなくても「返さない」はできない — 宣言キーは必ず全部返す。"""
+    out = compute(_mkdf(n=3), {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        if WARMUP[key] >= 3:
+            assert bool(out[key].isna().all()), key
+
+
+# --- params の型検証 (変換ではなく型の確認) ---------------------------------
+
+@pytest.mark.parametrize("params", [{'period': 14.0}, {'period': '14'}, {'period': True}, {'period': 0}])
+def test_invalid_params_raise_value_error(params):
+    """**文言まで pin する。** `match` が無いと、検査を外す変異を入れても
+    pandas 自身が投げる `ValueError` (`span must satisfy: span >= 1` 等) で
+    テストが緑のまま通ってしまう (変異スイープの実測: M-sma-5 / M-ema-4)。
+    本 plugin の文言はすべて `params.<キー名> ...` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_valid_param_override_changes_the_result():
+    df = _mkdf()
+    base = compute(df, {})
+    other = compute(df, {'period': 5})
+    key = OUTPUTS[0]
+    assert not _same(base[key].iloc[-1], other[key].iloc[-1])
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/atr/test_plugin.py`
+
+### Step 6-b: stub を置いて **red** を確認する
+
+- [ ] `docs/examples/plugins/atr/plugin.py` を**この stub**にする:
+
+```python
+"""stub (red 確認用)。**このファイルは Step c で本実装に差し替える。**"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    nan_series = pd.Series(np.full(len(df), np.nan), index=df.index,
+                           dtype="float64")
+    return {
+            "atr": nan_series,
+    }
+```
+
+- [ ] `cd docs/examples/plugins/atr && uv run pytest -q test_plugin.py` を回す
+- [ ] **collection error ではなく assert-red** (複数の `FAILED`) になることを確認する
+- [ ] **この pytest 出力を逐語で報告に貼る** (「red を確認した」という申告は証拠にならない)
+
+### Step 6-c: `plugin.py` の本実装を転写する
+
+- [ ] `docs/examples/plugins/atr/plugin.py` を**逐語**で差し替える:
+
+```python
+"""ATR (Average True Range、Wilder 平滑) indicator plugin。
+
+plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
+`compute(df, params) -> dict` を実装する。df はハーネスが供給する完成バー
+のみの DataFrame (DatetimeIndex は UTC・昇順、末尾最大 `config.yaml` の
+`max_bars` 本)。純関数のみ — I/O・乱数・実時計へのアクセスは禁止。
+使ってよいのは pandas / numpy / math のみ。
+
+作者向け注意 (設計書 §4 の必須項目):
+
+1. **warmup はこの関数自身の責務。** `max_bars` は「渡す DataFrame の末尾
+   最大本数の上限宣言」であり「常に同じ本数が入っている保証」ではない。
+   系列契約では「行が足りないので何も返さない」はできない (ハーネスは宣言
+   `outputs` と完全一致するキー集合を毎回要求する)。足りない期間は **NaN**
+   にする — 消費側 (strategy) は `pd.isna` を見て hold を返す規約。
+
+2. **1d 足のバケット境界は UTC 00:00 (epoch 錨)** であり、FX の取引日境界
+   (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
+   ため、呼び出し側が渡す任意の足で使われ得る。
+
+3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
+   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
+   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+   `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
+   渡る履歴が短くなり値がわずかにずれる。
+
+4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
+   Series を作る)。モジュールレベルの状態を持たない。
+
+入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+
+def _int_param(params: dict, name: str, default: int) -> int:
+    """**変換ではなく型の確認** (設計書 §4)。`int(params.get(...))` は
+    `14.9` を `14` に、`"14"` を `14` に黙って読み替えてしまい、承認不要の
+    params 上書き (U3) 経由で誰のレビューも通らず本番へ届く。`bool` は
+    `int` の派生なので先に弾く。
+
+    **この関数は 9 本の plugin に逐語で重複している。** plugin は 1 フォルダ
+    3 ファイルで完結しなければならず (loader が 4 本目の `.py` を拒否、
+    sandbox が相対 import を拒否)、共有モジュールを置く経路が無い。
+    直すときは 9 本まとめて直すこと。
+    """
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"params.{name} must be an int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"params.{name} must be >= 1, got {value}")
+    return value
+
+
+def _true_range(df: "pd.DataFrame") -> "pd.Series":
+    """TR = max(high-low, |high-prev_close|, |low-prev_close|)。
+
+    **行 0 は NaN** (前バーが無いので未確定)。`np.maximum` は NaN を伝播
+    するのでこの性質が保たれる — `pd.concat([...], axis=1).max(axis=1)` は
+    NaN を飛ばして `high - low` を返してしまうので使わない (設計書 §3.0)。
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    prev_close = df["close"].astype(float).shift(1)
+    return pd.Series(
+        np.maximum(np.maximum((high - low).to_numpy(),
+                              (high - prev_close).abs().to_numpy()),
+                   (low - prev_close).abs().to_numpy()),
+        index=df.index)
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    """Wilder 平滑の ATR を系列で返す。TR の行 0 は NaN なので、値が入るのは
+    index `period` (= period+1 本目) から。"""
+    period = _int_param(params, "period", 14)
+    true_range = _true_range(df)
+    atr = true_range.ewm(alpha=1.0 / period, adjust=False,
+                         min_periods=period).mean()
+    return {"atr": atr}
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/atr/plugin.py`
+
+### Step 6-d: **green** を確認する
+
+- [ ] `cd docs/examples/plugins/atr && uv run pytest -q test_plugin.py`
+      → **12 passed** になること (この本数を報告に書く)
+- [ ] `check_source` が 2 本とも通ること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.sandbox import check_source
+d = Path('docs/examples/plugins/atr')
+check_source(d / 'plugin.py')
+check_source(d / 'test_plugin.py', extra_allowed=frozenset({'pytest', 'plugin'}))
+print('check_source ok')"
+```
+
+- [ ] `discover` が通り `outputs` / `max_bars` が宣言どおりであること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.loader import discover_one_with_reason
+meta, reason = discover_one_with_reason(Path('docs/examples/plugins/atr'), 'atr')
+print(meta.kind, list(meta.outputs), meta.max_bars, meta.params, reason)"
+```
+
+### Step 6-e: 逆変異 (**6 件 = 下限であって上限ではない**)
+
+1 件ずつ `plugin.py` に適用 → `uv run pytest -q test_plugin.py --tb=no` → **元に戻す**。
+`git checkout` は使わない (`cp plugin.py /tmp/...bak` で退避して戻す)。
+**`FAILED` のテスト名を報告に貼り、下表と照合する。**
+
+| # | 変異 | red になるべきテスト (指揮者の実測値) |
+|---|---|---|
+| M-atr-1 | Wilder alpha -> EMA span | `test_matches_reference_implementation_on_every_row` |
+| M-atr-2 | TR の行 0 を NaN でなく high-low に | `test_matches_reference_implementation_on_every_row`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-atr-3 | shift(1) -> shift(-1) (未来参照) | `test_matches_reference_implementation_on_every_row`, `test_prefix_consistency_on_every_row`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-atr-4 | max -> min | `test_matches_reference_implementation_on_every_row` |
+| M-atr-5 | min_periods を外す | `test_matches_reference_implementation_on_every_row`, `test_short_frame_returns_all_declared_keys_as_all_nan`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-atr-6 | period の既定 14 -> 20 | `test_matches_reference_implementation_on_every_row`, `test_warmup_boundary_is_pinned_on_both_sides` |
+
+- [ ] 6 件すべてが KILLED になることを実測し、テスト名を報告に貼る
+- [ ] 元のファイルに戻っていることを `diff` で確認する
+
+### Step 6-f: 機械 diff と commit
+
+- [ ] **プラン本文から抽出して `diff` を取る** (差分ゼロを報告に貼る):
+
+```
+PLAN=docs/superpowers/plans/2026-09-19-indicator-initial-set.md
+uv run python - <<'EOF'
+import re, pathlib, subprocess
+pathlib.Path("tmp").mkdir(exist_ok=True)   # **`/tmp` 直下は使わない** (Global Constraints)
+plan = pathlib.Path("docs/superpowers/plans/2026-09-19-indicator-initial-set.md").read_text()
+# 見出し行 (行頭の "## T6: ") から次の "## " 見出しの直前までを節とする。
+# **行頭アンカー (re.M) が要る** — この抽出スクリプト自身が節の中に
+# 同じ文字列を含むため、素の split だと節が途中で切れる (実測)。
+sec = re.search(r"^## T6: .*?(?=^## |\Z)", plan, re.S | re.M).group(0)
+blocks = re.findall(r"^```(?:python|yaml)\n(.*?)^```$", sec, re.S | re.M)
+assert len(blocks) == 4, len(blocks)
+# blocks[0]=config.yaml, blocks[1]=test_plugin.py, blocks[2]=stub, blocks[3]=plugin.py
+for text, path in ((blocks[0], "config.yaml"), (blocks[1], "test_plugin.py"),
+                   (blocks[3], "plugin.py")):
+    want = pathlib.Path("tmp/expect_" + path)
+    want.write_text(text)
+    real = pathlib.Path("docs/examples/plugins/atr") / path
+    r = subprocess.run(["diff", str(want), str(real)], capture_output=True, text=True)
+    print(path, "DIFF-ZERO" if r.returncode == 0 else "MISMATCH\n" + r.stdout)
+EOF
+```
+
+- [ ] 各ファイルの絶対パスと `wc -l` を報告に書く
+- [ ] `git add docs/examples/plugins/atr && git commit`
+      (メッセージ: `feat(indicator-initial-set): atr indicator plugin (T6)`)
+- [ ] **逸脱の申告** — 上の Step どおりに書けなかった箇所を「Step 番号 / 何を / なぜ」で全件
+
+---
+
+## T7: `adx` — ADX / +DI / -DI
+
+**出力**: `adx`, `plus_di`, `minus_di` ／ **warmup (最初に値が入る 0 起点行)**: `adx`=27, `plus_di`=14, `minus_di`=14 ／ **`max_bars`**: 400
+**依存**: T0 のみ。他の指標 task と**並列実行可**。
+**触るファイル**: `docs/examples/plugins/adx/` の 3 ファイルのみ。
+
+**この task の要点**: ε 判定を `±DI` を作る**前**に置くこと。`±DM` の行 0 は `mask` で **NaN** にする (0.0 のままだと Wilder の seed が変わる)。
+
+### Step 7-a: `config.yaml` と `test_plugin.py` を転写する
+
+- [ ] `docs/examples/plugins/adx/` を作る
+- [ ] `docs/examples/plugins/adx/config.yaml` を**逐語**で作る:
+
+```yaml
+kind: indicator
+outputs: [adx, plus_di, minus_di]
+max_bars: 400
+params:
+  period: 14
+```
+
+- [ ] `docs/examples/plugins/adx/test_plugin.py` を**逐語**で作る
+      (**フェンス行 ` ```python ` / ` ``` ` をファイルに書かないこと**):
+
+```python
+"""adx indicator plugin の自己テスト ([indicator-initial-set] 設計書 §6)。
+
+担保する受入条件: **I2** (outputs 完全一致 / index 一致 / Inf 不在)、
+**I3** (独立参照実装との全行一致)、**I4** (固定 fixture における全行の
+接頭辞一致)、**I9** (入力不変・反復決定性)、warmup 境界の両側 pin、
+params の型検証。
+
+このファイルは bless の pytest ゲート (subprocess + Landlock) で毎回走る。
+`check_source(..., extra_allowed={"pytest", "plugin"})` を通る範囲で書くこと
+(`to_frame` / `df.open` / `getattr` は使えない)。
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from plugin import compute
+
+OUTPUTS = ('adx', 'plus_di', 'minus_di')
+WARMUP = {'adx': 27, 'plus_di': 14, 'minus_di': 14}
+EPS = 1e-9
+
+
+def _mkdf(n: int = 160, *, seed: int = 0, base: float = 150.0) -> pd.DataFrame:
+    """設計書 §6 I4 の固定 fixture。160 行は `ichimoku` の `senkou_b` warmup
+    51 + 余裕。**極値を中間と末尾側の両方に置く** — 片側だけだと「全体の
+    min/max で正規化する」型の未来参照を fixture 次第で見逃す (§6.2)。
+    """
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = base + np.cumsum(rng.normal(0.0, sigma, n))
+    if n >= 20:
+        close[n // 2] += base * 0.05
+        close[n - 7] -= base * 0.06
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    if n >= 2:
+        # **bar 1 に決定論的な上げを置く** — ここが平坦だと `+DM[0]` を NaN に
+        # するか 0.0 にするかが Wilder の seed に効かず、行 0 の扱いを潰す変異
+        # (M-adx-4) が fixture 次第で生き残る (変異スイープの実測)。
+        high[1] = high[0] + base * 0.01
+    # **open は close と別の系列にする** (前バーの終値)。`open == close` の
+    # fixture だと「close の代わりに open を読む」型の変異を検出できない
+    # (M-sma-4 の実測)。
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close,
+          "volume": np.ones(n)}, index=index)
+
+
+def _same(got, want, *, rel: float = 1e-9, tol: float = 1e-9) -> bool:
+    """NaN 同士は一致。数値は相対/絶対のどちらかを満たせば一致。"""
+    got_nan = got is None or bool(pd.isna(got))
+    want_nan = want is None or bool(pd.isna(want))
+    if got_nan or want_nan:
+        return got_nan and want_nan
+    got = float(got)
+    want = float(want)
+    return abs(got - want) <= max(tol, rel * abs(want))
+
+
+# --- 独立参照実装 (plugin.py とは別の書き方。plugin.py から import しない) ---
+
+def _isnan(value) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+def _ref_recursive(values: list, alpha: float, period: int) -> list:
+    """再帰平滑。**`min_periods` は位置ではなく「非 NaN 観測数」で数える**
+    (設計書 §3.3) — 位置で `i < period - 1` と書くと `atr` / `adx` の warmup
+    が 1 本早く明け、I3 が落ちる。seed は最初の非 NaN 値 (`y_0 = x_0`)。
+    """
+    out = []
+    prev = None
+    seen = 0
+    for value in values:
+        if _isnan(value):
+            out.append(float("nan"))
+            continue
+        prev = value if prev is None else alpha * value + (1.0 - alpha) * prev
+        seen += 1
+        out.append(prev if seen >= period else float("nan"))
+    return out
+
+def _ref_true_range(df) -> list:
+    """TR の素朴実装。**行 0 は NaN** (前バーが無い)。"""
+    high = df["high"].tolist()
+    low = df["low"].tolist()
+    close = df["close"].tolist()
+    out = [float("nan")]
+    for i in range(1, len(close)):
+        out.append(max(high[i] - low[i],
+                       abs(high[i] - close[i - 1]),
+                       abs(low[i] - close[i - 1])))
+    return out
+
+
+def _reference(df, params: dict) -> dict:
+    """ε 規則も plugin.py と同じ閾値・基準・順序で書き写す (設計書 §3.3)。"""
+    period = int(params.get("period", 14))
+    high = df["high"].tolist()
+    low = df["low"].tolist()
+    close = df["close"].tolist()
+    plus_dm = [float("nan")]
+    minus_dm = [float("nan")]
+    for i in range(1, len(close)):
+        up_move = high[i] - high[i - 1]
+        down_move = low[i - 1] - low[i]
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0.0) else 0.0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0.0) else 0.0)
+    alpha = 1.0 / period
+    atr = _ref_recursive(_ref_true_range(df), alpha, period)
+    sm_plus = _ref_recursive(plus_dm, alpha, period)
+    sm_minus = _ref_recursive(minus_dm, alpha, period)
+    plus_di = []
+    minus_di = []
+    dx = []
+    for i in range(len(close)):
+        if _isnan(atr[i]) or _isnan(sm_plus[i]) or _isnan(sm_minus[i]):
+            plus_di.append(float("nan"))
+            minus_di.append(float("nan"))
+            dx.append(float("nan"))
+            continue
+        if atr[i] <= EPS * abs(close[i]):
+            pdi = 0.0
+            mdi = 0.0
+        else:
+            pdi = 100.0 * sm_plus[i] / atr[i]
+            mdi = 100.0 * sm_minus[i] / atr[i]
+        plus_di.append(pdi)
+        minus_di.append(mdi)
+        denominator = pdi + mdi
+        dx.append(0.0 if denominator == 0.0
+                  else 100.0 * abs(pdi - mdi) / denominator)
+    return {"adx": _ref_recursive(dx, alpha, period),
+            "plus_di": plus_di, "minus_di": minus_di}
+
+
+# --- I2: 宣言キー集合 / index 一致 / Inf 不在 -------------------------------
+
+def test_outputs_match_declared_keys_and_index():
+    df = _mkdf()
+    out = compute(df, {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        assert isinstance(out[key], pd.Series), key
+        assert out[key].index.equals(df.index), key
+        assert not bool(np.isinf(out[key].to_numpy(dtype="float64")).any()), key
+
+
+# --- I3: 独立参照実装との全行一致 -------------------------------------------
+
+def test_matches_reference_implementation_on_every_row():
+    df = _mkdf()
+    got = compute(df, {})
+    want = _reference(df, {})
+    for key in OUTPUTS:
+        for i in range(len(df)):
+            assert _same(got[key].iloc[i], want[key][i]), (key, i)
+
+
+# --- I4: 固定 fixture における接頭辞一致 (全 160 行) ------------------------
+
+def test_prefix_consistency_on_every_row():
+    """`compute(df[:t+1])[key].iloc[-1] == compute(df)[key].iloc[t]` を
+    **全行**で。サンプル点だけだと「サンプルされない行だけ未来を読む」実装
+    (実測: 行 37 のみ書き換え) を素通りする (設計書 §6.2)。
+    """
+    df = _mkdf()
+    full = compute(df, {})
+    for t in range(len(df)):
+        sub = compute(df.iloc[:t + 1], {})
+        for key in OUTPUTS:
+            assert _same(sub[key].iloc[-1], full[key].iloc[t]), (key, t)
+
+
+# --- I9: 入力不変 / 反復決定性 ----------------------------------------------
+
+def test_input_frame_is_not_mutated():
+    """`check_source` は添字代入 `df["x"] = ...` を拒否しない (設計書 §4)。
+    入力を壊さない規律の観測点はこのテストだけ。"""
+    df = _mkdf()
+    before = df.copy(deep=True)
+    compute(df, {})
+    assert df.equals(before)
+    assert list(df.columns) == list(before.columns)
+    assert df.index.equals(before.index)
+    assert bool((df.dtypes == before.dtypes).all())
+
+
+def test_repeated_calls_are_deterministic():
+    """(1) fresh な df で 2 回 (2) **同じ df オブジェクトで 2 回** —
+    (2) が module レベルの状態持ち越しを捕まえる。"""
+    first = compute(_mkdf(), {})
+    second = compute(_mkdf(), {})
+    df = _mkdf()
+    third = compute(df, {})
+    fourth = compute(df, {})
+    for key in OUTPUTS:
+        for i in range(len(first[key])):
+            assert _same(first[key].iloc[i], second[key].iloc[i]), ("fresh", key, i)
+            assert _same(third[key].iloc[i], fourth[key].iloc[i]), ("same", key, i)
+
+
+# --- warmup 境界 (両側を pin する) ------------------------------------------
+
+def test_warmup_boundary_is_pinned_on_both_sides():
+    """「N 行目まで NaN」だけでなく「N+1 行目に値が入る」も見る — 片側だけ
+    だと warmup が 1 本早く/遅く明ける変異を検出できない。"""
+    out = compute(_mkdf(), {})
+    for key, first_valid in WARMUP.items():
+        series = out[key]
+        if first_valid > 0:
+            assert bool(series.iloc[:first_valid].isna().all()), key
+        assert not bool(pd.isna(series.iloc[first_valid])), key
+
+
+def test_short_frame_returns_all_declared_keys_as_all_nan():
+    """行が足りなくても「返さない」はできない — 宣言キーは必ず全部返す。"""
+    out = compute(_mkdf(n=3), {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        if WARMUP[key] >= 3:
+            assert bool(out[key].isna().all()), key
+
+
+# --- params の型検証 (変換ではなく型の確認) ---------------------------------
+
+@pytest.mark.parametrize("params", [{'period': 14.0}, {'period': '14'}, {'period': True}, {'period': 0}])
+def test_invalid_params_raise_value_error(params):
+    """**文言まで pin する。** `match` が無いと、検査を外す変異を入れても
+    pandas 自身が投げる `ValueError` (`span must satisfy: span >= 1` 等) で
+    テストが緑のまま通ってしまう (変異スイープの実測: M-sma-5 / M-ema-4)。
+    本 plugin の文言はすべて `params.<キー名> ...` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_valid_param_override_changes_the_result():
+    df = _mkdf()
+    base = compute(df, {})
+    other = compute(df, {'period': 5})
+    key = OUTPUTS[0]
+    assert not _same(base[key].iloc[-1], other[key].iloc[-1])
+
+
+def _decayed_flat_df(n_flat: int = 260, price: float = 150.0,
+                     move: float = 1.0) -> pd.DataFrame:
+    """1 本だけ上げたあと `n_flat` 本の完全横ばい。
+
+    平滑量は指数的に減衰して**実質ゼロ**になるが、**厳密なゼロにはならない**
+    — 厳密 `== 0` 判定では捕まらず、比を取る指標が「値動きが無いのに強い
+    トレンド」という値を返す構成 (設計書 §3.2 (i-b) の反例)。相対 ε 規則が
+    効いているかはこの fixture でしか観測できない (変異スイープの実測:
+    完全横ばいだけの fixture では EPS=0 への変異が生き残る)。
+    """
+    closes = [price] * 5 + [price + move] * (n_flat + 1)
+    values = np.array(closes, dtype="float64")
+    index = pd.date_range("2026-01-01", periods=len(values), freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": values, "high": values, "low": values, "close": values,
+         "volume": np.ones(len(values))}, index=index)
+
+
+def test_eps_rule_fires_after_the_atr_decays():
+    """ATR が厳密 0 でなく実質ゼロまで減衰した区間でも +DI/-DI/ADX は 0。
+    判定を `atr != 0.0` (厳密) に戻すと、`Wilder(+DM)` と `ATR` が同率で
+    減衰して比が残り `plus_di` が 100 近くになる (設計書 §3.2 (i-b))。"""
+    out = compute(_decayed_flat_df(), {})
+    assert float(out["plus_di"].iloc[-1]) == 0.0
+    assert float(out["minus_di"].iloc[-1]) == 0.0
+    # `adx` は `Wilder(DX)` なので厳密 0 にはならない — ε 規則が効き始めるのは
+    # ATR が閾値を割ってから (約 180 本後) で、そこから DX=0 が続いた本数ぶん
+    # しか減衰しない (設計書 §3.2 (i-b) の「境界付近では ε をどう選んでも残る」)。
+    # 規則が無ければここは 90 以上になるので、この上界で十分に判別できる。
+    assert float(out["adx"].iloc[-1]) < 1.0
+
+
+# --- 退化規則 (ε) -----------------------------------------------------------
+
+def _flat_df(n: int = 60, price: float = 150.0) -> pd.DataFrame:
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    values = np.full(n, price)
+    return pd.DataFrame(
+        {"open": values, "high": values, "low": values, "close": values,
+         "volume": np.ones(n)}, index=index)
+
+
+def test_flat_market_yields_zero_di_and_zero_adx():
+    """完全横ばいでは `atr <= EPS*|close|` が成立し +DI/-DI/ADX が 0 になる。
+    規則が無いと `Wilder(+DM)` と `ATR` が同率で減衰して比が残り、「値動きが
+    無いのに +DI が 100」という誤った値を返す (設計書 §3.2 (i-b))。"""
+    out = compute(_flat_df(), {})
+    assert float(out["plus_di"].iloc[-1]) == 0.0
+    assert float(out["minus_di"].iloc[-1]) == 0.0
+    assert float(out["adx"].iloc[-1]) == 0.0
+
+
+def test_eps_rule_does_not_fire_on_ordinary_data():
+    out = compute(_mkdf(), {})
+    assert float(out["plus_di"].iloc[-1]) > 0.0
+    assert float(out["minus_di"].iloc[-1]) > 0.0
+
+
+def test_di_stays_within_bounds():
+    out = compute(_mkdf(), {})
+    for key in ("adx", "plus_di", "minus_di"):
+        values = out[key].dropna()
+        assert bool((values >= 0.0).all()) and bool((values <= 100.0).all()), key
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/adx/test_plugin.py`
+
+### Step 7-b: stub を置いて **red** を確認する
+
+- [ ] `docs/examples/plugins/adx/plugin.py` を**この stub**にする:
+
+```python
+"""stub (red 確認用)。**このファイルは Step c で本実装に差し替える。**"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    nan_series = pd.Series(np.full(len(df), np.nan), index=df.index,
+                           dtype="float64")
+    return {
+            "adx": nan_series,
+            "plus_di": nan_series,
+            "minus_di": nan_series,
+    }
+```
+
+- [ ] `cd docs/examples/plugins/adx && uv run pytest -q test_plugin.py` を回す
+- [ ] **collection error ではなく assert-red** (複数の `FAILED`) になることを確認する
+- [ ] **この pytest 出力を逐語で報告に貼る** (「red を確認した」という申告は証拠にならない)
+
+### Step 7-c: `plugin.py` の本実装を転写する
+
+- [ ] `docs/examples/plugins/adx/plugin.py` を**逐語**で差し替える:
+
+```python
+"""ADX / +DI / -DI (Wilder 平滑) indicator plugin。
+
+plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
+`compute(df, params) -> dict` を実装する。df はハーネスが供給する完成バー
+のみの DataFrame (DatetimeIndex は UTC・昇順、末尾最大 `config.yaml` の
+`max_bars` 本)。純関数のみ — I/O・乱数・実時計へのアクセスは禁止。
+使ってよいのは pandas / numpy / math のみ。
+
+作者向け注意 (設計書 §4 の必須項目):
+
+1. **warmup はこの関数自身の責務。** `max_bars` は「渡す DataFrame の末尾
+   最大本数の上限宣言」であり「常に同じ本数が入っている保証」ではない。
+   系列契約では「行が足りないので何も返さない」はできない (ハーネスは宣言
+   `outputs` と完全一致するキー集合を毎回要求する)。足りない期間は **NaN**
+   にする — 消費側 (strategy) は `pd.isna` を見て hold を返す規約。
+
+2. **1d 足のバケット境界は UTC 00:00 (epoch 錨)** であり、FX の取引日境界
+   (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
+   ため、呼び出し側が渡す任意の足で使われ得る。
+
+3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
+   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
+   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+   `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
+   渡る履歴が短くなり値がわずかにずれる。
+
+4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
+   Series を作る)。モジュールレベルの状態を持たない。
+
+5. **値動きの無い期間は中立値を返す** (設計書 §3.2 (i-b))。判定は
+   `<= EPS * |close|` の相対 ε (EPS = 1e-9)。`|close|` は**その行自身の
+   close**。strategy 側で「中立」と「板が動いていない」を読み分けたいなら
+   `atr` を併せて宣言して自分で判定すること。
+
+入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+
+EPS = 1e-9
+
+
+def _int_param(params: dict, name: str, default: int) -> int:
+    """**変換ではなく型の確認** (設計書 §4)。`int(params.get(...))` は
+    `14.9` を `14` に、`"14"` を `14` に黙って読み替えてしまい、承認不要の
+    params 上書き (U3) 経由で誰のレビューも通らず本番へ届く。`bool` は
+    `int` の派生なので先に弾く。
+
+    **この関数は 9 本の plugin に逐語で重複している。** plugin は 1 フォルダ
+    3 ファイルで完結しなければならず (loader が 4 本目の `.py` を拒否、
+    sandbox が相対 import を拒否)、共有モジュールを置く経路が無い。
+    直すときは 9 本まとめて直すこと。
+    """
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"params.{name} must be an int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"params.{name} must be >= 1, got {value}")
+    return value
+
+
+def _true_range(df: "pd.DataFrame") -> "pd.Series":
+    """TR = max(high-low, |high-prev_close|, |low-prev_close|)。
+
+    **行 0 は NaN** (前バーが無いので未確定)。`np.maximum` は NaN を伝播
+    するのでこの性質が保たれる — `pd.concat([...], axis=1).max(axis=1)` は
+    NaN を飛ばして `high - low` を返してしまうので使わない (設計書 §3.0)。
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    prev_close = df["close"].astype(float).shift(1)
+    return pd.Series(
+        np.maximum(np.maximum((high - low).to_numpy(),
+                              (high - prev_close).abs().to_numpy()),
+                   (low - prev_close).abs().to_numpy()),
+        index=df.index)
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    """ADX / +DI / -DI を系列で返す (すべて Wilder 平滑)。
+
+    **退化規則 (設計書 §3.2 (i-b))**: 値動きが実質ゼロの区間では
+    `Wilder(+DM)` と `ATR` が同率で減衰し比が残るため、「400 本まったく
+    値動きが無いのに +DI が 100 (= 強い上昇トレンド)」という誤った値になる。
+    `atr <= EPS * |close|` の行では `plus_di = minus_di = 0` に倒す
+    (-> `dx = 0`)。`|close|` は **その行自身の close**。
+    判定は `+/-DI` を作る**前**に行う。
+
+    +DM / -DM の行 0 は NaN (前バーが無いので未確定)。
+    """
+    period = _int_param(params, "period", 14)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    true_range = _true_range(df)
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0.0), 0.0)
+    plus_dm = plus_dm.mask(up_move.isna())
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0.0), 0.0)
+    minus_dm = minus_dm.mask(down_move.isna())
+
+    alpha = 1.0 / period
+    atr = true_range.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    flat = atr <= EPS * close.abs()
+    plus_di = 100.0 * plus_dm.ewm(alpha=alpha, adjust=False,
+                                  min_periods=period).mean() / atr
+    minus_di = 100.0 * minus_dm.ewm(alpha=alpha, adjust=False,
+                                    min_periods=period).mean() / atr
+    plus_di = plus_di.where(~flat, 0.0)
+    minus_di = minus_di.where(~flat, 0.0)
+
+    denominator = plus_di + minus_di
+    dx = 100.0 * (plus_di - minus_di).abs() / denominator
+    dx = dx.where(denominator != 0.0, 0.0)
+    adx = dx.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    return {"adx": adx, "plus_di": plus_di, "minus_di": minus_di}
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/adx/plugin.py`
+
+### Step 7-d: **green** を確認する
+
+- [ ] `cd docs/examples/plugins/adx && uv run pytest -q test_plugin.py`
+      → **16 passed** になること (この本数を報告に書く)
+- [ ] `check_source` が 2 本とも通ること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.sandbox import check_source
+d = Path('docs/examples/plugins/adx')
+check_source(d / 'plugin.py')
+check_source(d / 'test_plugin.py', extra_allowed=frozenset({'pytest', 'plugin'}))
+print('check_source ok')"
+```
+
+- [ ] `discover` が通り `outputs` / `max_bars` が宣言どおりであること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.loader import discover_one_with_reason
+meta, reason = discover_one_with_reason(Path('docs/examples/plugins/adx'), 'adx')
+print(meta.kind, list(meta.outputs), meta.max_bars, meta.params, reason)"
+```
+
+### Step 7-e: 逆変異 (**6 件 = 下限であって上限ではない**)
+
+1 件ずつ `plugin.py` に適用 → `uv run pytest -q test_plugin.py --tb=no` → **元に戻す**。
+`git checkout` は使わない (`cp plugin.py /tmp/...bak` で退避して戻す)。
+**`FAILED` のテスト名を報告に貼り、下表と照合する。**
+
+| # | 変異 | red になるべきテスト (指揮者の実測値) |
+|---|---|---|
+| M-adx-1 | ε 規則を削る (flat 判定なし) | `test_eps_rule_fires_after_the_atr_decays` |
+| M-adx-2 | ε 判定を DI の後ろへ (順序入れ替え) | `test_eps_rule_fires_after_the_atr_decays` |
+| M-adx-3 | +DM / -DM を入れ替え | `test_matches_reference_implementation_on_every_row` |
+| M-adx-4 | DM の行 0 マスクを削る | `test_matches_reference_implementation_on_every_row` |
+| M-adx-5 | Wilder alpha -> EMA span | `test_matches_reference_implementation_on_every_row` |
+| M-adx-6 | dx のゼロ除算規則を削る | `test_eps_rule_fires_after_the_atr_decays`, `test_flat_market_yields_zero_di_and_zero_adx` |
+
+- [ ] 6 件すべてが KILLED になることを実測し、テスト名を報告に貼る
+- [ ] 元のファイルに戻っていることを `diff` で確認する
+
+### Step 7-f: 機械 diff と commit
+
+- [ ] **プラン本文から抽出して `diff` を取る** (差分ゼロを報告に貼る):
+
+```
+PLAN=docs/superpowers/plans/2026-09-19-indicator-initial-set.md
+uv run python - <<'EOF'
+import re, pathlib, subprocess
+pathlib.Path("tmp").mkdir(exist_ok=True)   # **`/tmp` 直下は使わない** (Global Constraints)
+plan = pathlib.Path("docs/superpowers/plans/2026-09-19-indicator-initial-set.md").read_text()
+# 見出し行 (行頭の "## T7: ") から次の "## " 見出しの直前までを節とする。
+# **行頭アンカー (re.M) が要る** — この抽出スクリプト自身が節の中に
+# 同じ文字列を含むため、素の split だと節が途中で切れる (実測)。
+sec = re.search(r"^## T7: .*?(?=^## |\Z)", plan, re.S | re.M).group(0)
+blocks = re.findall(r"^```(?:python|yaml)\n(.*?)^```$", sec, re.S | re.M)
+assert len(blocks) == 4, len(blocks)
+# blocks[0]=config.yaml, blocks[1]=test_plugin.py, blocks[2]=stub, blocks[3]=plugin.py
+for text, path in ((blocks[0], "config.yaml"), (blocks[1], "test_plugin.py"),
+                   (blocks[3], "plugin.py")):
+    want = pathlib.Path("tmp/expect_" + path)
+    want.write_text(text)
+    real = pathlib.Path("docs/examples/plugins/adx") / path
+    r = subprocess.run(["diff", str(want), str(real)], capture_output=True, text=True)
+    print(path, "DIFF-ZERO" if r.returncode == 0 else "MISMATCH\n" + r.stdout)
+EOF
+```
+
+- [ ] 各ファイルの絶対パスと `wc -l` を報告に書く
+- [ ] `git add docs/examples/plugins/adx && git commit`
+      (メッセージ: `feat(indicator-initial-set): adx indicator plugin (T7)`)
+- [ ] **逸脱の申告** — 上の Step どおりに書けなかった箇所を「Step 番号 / 何を / なぜ」で全件
+
+---
+
+## T8: `stochastic` — ストキャスティクス (slow)
+
+**出力**: `k`, `d` ／ **warmup (最初に値が入る 0 起点行)**: `k`=15, `d`=17 ／ **`max_bars`**: 400
+**依存**: T0 のみ。他の指標 task と**並列実行可**。
+**触るファイル**: `docs/examples/plugins/stochastic/` の 3 ファイルのみ。
+
+**この task の要点**: `k` は **raw %K の SMA** (slow)。`k_period: 1` で fast になる。
+
+### Step 8-a: `config.yaml` と `test_plugin.py` を転写する
+
+- [ ] `docs/examples/plugins/stochastic/` を作る
+- [ ] `docs/examples/plugins/stochastic/config.yaml` を**逐語**で作る:
+
+```yaml
+kind: indicator
+outputs: [k, d]
+max_bars: 400
+params:
+  period: 14
+  k_period: 3
+  d_period: 3
+```
+
+- [ ] `docs/examples/plugins/stochastic/test_plugin.py` を**逐語**で作る
+      (**フェンス行 ` ```python ` / ` ``` ` をファイルに書かないこと**):
+
+```python
+"""stochastic indicator plugin の自己テスト ([indicator-initial-set] 設計書 §6)。
+
+担保する受入条件: **I2** (outputs 完全一致 / index 一致 / Inf 不在)、
+**I3** (独立参照実装との全行一致)、**I4** (固定 fixture における全行の
+接頭辞一致)、**I9** (入力不変・反復決定性)、warmup 境界の両側 pin、
+params の型検証。
+
+このファイルは bless の pytest ゲート (subprocess + Landlock) で毎回走る。
+`check_source(..., extra_allowed={"pytest", "plugin"})` を通る範囲で書くこと
+(`to_frame` / `df.open` / `getattr` は使えない)。
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from plugin import compute
+
+OUTPUTS = ('k', 'd')
+WARMUP = {'k': 15, 'd': 17}
+
+
+def _mkdf(n: int = 160, *, seed: int = 0, base: float = 150.0) -> pd.DataFrame:
+    """設計書 §6 I4 の固定 fixture。160 行は `ichimoku` の `senkou_b` warmup
+    51 + 余裕。**極値を中間と末尾側の両方に置く** — 片側だけだと「全体の
+    min/max で正規化する」型の未来参照を fixture 次第で見逃す (§6.2)。
+    """
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = base + np.cumsum(rng.normal(0.0, sigma, n))
+    if n >= 20:
+        close[n // 2] += base * 0.05
+        close[n - 7] -= base * 0.06
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    if n >= 2:
+        # **bar 1 に決定論的な上げを置く** — ここが平坦だと `+DM[0]` を NaN に
+        # するか 0.0 にするかが Wilder の seed に効かず、行 0 の扱いを潰す変異
+        # (M-adx-4) が fixture 次第で生き残る (変異スイープの実測)。
+        high[1] = high[0] + base * 0.01
+    # **open は close と別の系列にする** (前バーの終値)。`open == close` の
+    # fixture だと「close の代わりに open を読む」型の変異を検出できない
+    # (M-sma-4 の実測)。
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close,
+          "volume": np.ones(n)}, index=index)
+
+
+def _same(got, want, *, rel: float = 1e-9, tol: float = 1e-9) -> bool:
+    """NaN 同士は一致。数値は相対/絶対のどちらかを満たせば一致。"""
+    got_nan = got is None or bool(pd.isna(got))
+    want_nan = want is None or bool(pd.isna(want))
+    if got_nan or want_nan:
+        return got_nan and want_nan
+    got = float(got)
+    want = float(want)
+    return abs(got - want) <= max(tol, rel * abs(want))
+
+
+# --- 独立参照実装 (plugin.py とは別の書き方。plugin.py から import しない) ---
+
+def _isnan(value) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+def _ref_sma(values: list, period: int) -> list:
+    """SMA を素朴なスライスで。先頭 period-1 個は NaN。"""
+    out = []
+    for i in range(len(values)):
+        window = values[i - period + 1:i + 1]
+        if i < period - 1 or any(_isnan(v) for v in window):
+            out.append(float("nan"))
+        else:
+            out.append(sum(window) / float(period))
+    return out
+
+def _ref_rolling(values: list, period: int, pick) -> list:
+    """rolling min / max を素朴なスライスで。"""
+    out = []
+    for i in range(len(values)):
+        if i < period - 1:
+            out.append(float("nan"))
+        else:
+            out.append(pick(values[i - period + 1:i + 1]))
+    return out
+
+
+def _reference(df, params: dict) -> dict:
+    period = int(params.get("period", 14))
+    k_period = int(params.get("k_period", 3))
+    d_period = int(params.get("d_period", 3))
+    close = df["close"].tolist()
+    highest = _ref_rolling(df["high"].tolist(), period, max)
+    lowest = _ref_rolling(df["low"].tolist(), period, min)
+    raw_k = []
+    for i in range(len(close)):
+        if _isnan(highest[i]) or _isnan(lowest[i]):
+            raw_k.append(float("nan"))
+            continue
+        span = highest[i] - lowest[i]
+        raw_k.append(50.0 if span == 0.0
+                     else 100.0 * (close[i] - lowest[i]) / span)
+    k = _ref_sma(raw_k, k_period)
+    return {"k": k, "d": _ref_sma(k, d_period)}
+
+
+# --- I2: 宣言キー集合 / index 一致 / Inf 不在 -------------------------------
+
+def test_outputs_match_declared_keys_and_index():
+    df = _mkdf()
+    out = compute(df, {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        assert isinstance(out[key], pd.Series), key
+        assert out[key].index.equals(df.index), key
+        assert not bool(np.isinf(out[key].to_numpy(dtype="float64")).any()), key
+
+
+# --- I3: 独立参照実装との全行一致 -------------------------------------------
+
+def test_matches_reference_implementation_on_every_row():
+    df = _mkdf()
+    got = compute(df, {})
+    want = _reference(df, {})
+    for key in OUTPUTS:
+        for i in range(len(df)):
+            assert _same(got[key].iloc[i], want[key][i]), (key, i)
+
+
+# --- I4: 固定 fixture における接頭辞一致 (全 160 行) ------------------------
+
+def test_prefix_consistency_on_every_row():
+    """`compute(df[:t+1])[key].iloc[-1] == compute(df)[key].iloc[t]` を
+    **全行**で。サンプル点だけだと「サンプルされない行だけ未来を読む」実装
+    (実測: 行 37 のみ書き換え) を素通りする (設計書 §6.2)。
+    """
+    df = _mkdf()
+    full = compute(df, {})
+    for t in range(len(df)):
+        sub = compute(df.iloc[:t + 1], {})
+        for key in OUTPUTS:
+            assert _same(sub[key].iloc[-1], full[key].iloc[t]), (key, t)
+
+
+# --- I9: 入力不変 / 反復決定性 ----------------------------------------------
+
+def test_input_frame_is_not_mutated():
+    """`check_source` は添字代入 `df["x"] = ...` を拒否しない (設計書 §4)。
+    入力を壊さない規律の観測点はこのテストだけ。"""
+    df = _mkdf()
+    before = df.copy(deep=True)
+    compute(df, {})
+    assert df.equals(before)
+    assert list(df.columns) == list(before.columns)
+    assert df.index.equals(before.index)
+    assert bool((df.dtypes == before.dtypes).all())
+
+
+def test_repeated_calls_are_deterministic():
+    """(1) fresh な df で 2 回 (2) **同じ df オブジェクトで 2 回** —
+    (2) が module レベルの状態持ち越しを捕まえる。"""
+    first = compute(_mkdf(), {})
+    second = compute(_mkdf(), {})
+    df = _mkdf()
+    third = compute(df, {})
+    fourth = compute(df, {})
+    for key in OUTPUTS:
+        for i in range(len(first[key])):
+            assert _same(first[key].iloc[i], second[key].iloc[i]), ("fresh", key, i)
+            assert _same(third[key].iloc[i], fourth[key].iloc[i]), ("same", key, i)
+
+
+# --- warmup 境界 (両側を pin する) ------------------------------------------
+
+def test_warmup_boundary_is_pinned_on_both_sides():
+    """「N 行目まで NaN」だけでなく「N+1 行目に値が入る」も見る — 片側だけ
+    だと warmup が 1 本早く/遅く明ける変異を検出できない。"""
+    out = compute(_mkdf(), {})
+    for key, first_valid in WARMUP.items():
+        series = out[key]
+        if first_valid > 0:
+            assert bool(series.iloc[:first_valid].isna().all()), key
+        assert not bool(pd.isna(series.iloc[first_valid])), key
+
+
+def test_short_frame_returns_all_declared_keys_as_all_nan():
+    """行が足りなくても「返さない」はできない — 宣言キーは必ず全部返す。"""
+    out = compute(_mkdf(n=3), {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        if WARMUP[key] >= 3:
+            assert bool(out[key].isna().all()), key
+
+
+# --- params の型検証 (変換ではなく型の確認) ---------------------------------
+
+@pytest.mark.parametrize("params", [{'period': 14.0}, {'k_period': '3'}, {'d_period': True}, {'period': 0}, {'k_period': 0}])
+def test_invalid_params_raise_value_error(params):
+    """**文言まで pin する。** `match` が無いと、検査を外す変異を入れても
+    pandas 自身が投げる `ValueError` (`span must satisfy: span >= 1` 等) で
+    テストが緑のまま通ってしまう (変異スイープの実測: M-sma-5 / M-ema-4)。
+    本 plugin の文言はすべて `params.<キー名> ...` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_valid_param_override_changes_the_result():
+    df = _mkdf()
+    base = compute(df, {})
+    other = compute(df, {'period': 5, 'k_period': 1})
+    key = OUTPUTS[0]
+    assert not _same(base[key].iloc[-1], other[key].iloc[-1])
+
+
+# --- ゼロ除算 (HH == LL) と fast への切替 -----------------------------------
+
+def test_flat_window_yields_fifty():
+    """期間内が完全横ばい (HH == LL) の行は raw %K を 50 にする。"""
+    n = 40
+    values = np.full(n, 150.0)
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    df = pd.DataFrame(
+        {"open": values, "high": values, "low": values, "close": values,
+         "volume": np.ones(n)}, index=index)
+    out = compute(df, {})
+    assert float(out["k"].iloc[-1]) == 50.0
+    assert float(out["d"].iloc[-1]) == 50.0
+
+
+def test_k_period_one_gives_fast_stochastic():
+    """`k_period: 1` は raw %K そのもの = fast stochastic (設計書 D2)。"""
+    df = _mkdf()
+    fast = compute(df, {"k_period": 1})
+    assert not bool(pd.isna(fast["k"].iloc[13]))
+    assert bool(pd.isna(fast["k"].iloc[12]))
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/stochastic/test_plugin.py`
+
+### Step 8-b: stub を置いて **red** を確認する
+
+- [ ] `docs/examples/plugins/stochastic/plugin.py` を**この stub**にする:
+
+```python
+"""stub (red 確認用)。**このファイルは Step c で本実装に差し替える。**"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    nan_series = pd.Series(np.full(len(df), np.nan), index=df.index,
+                           dtype="float64")
+    return {
+            "k": nan_series,
+            "d": nan_series,
+    }
+```
+
+- [ ] `cd docs/examples/plugins/stochastic && uv run pytest -q test_plugin.py` を回す
+- [ ] **collection error ではなく assert-red** (複数の `FAILED`) になることを確認する
+- [ ] **この pytest 出力を逐語で報告に貼る** (「red を確認した」という申告は証拠にならない)
+
+### Step 8-c: `plugin.py` の本実装を転写する
+
+- [ ] `docs/examples/plugins/stochastic/plugin.py` を**逐語**で差し替える:
+
+```python
+"""ストキャスティクス (slow、%K / %D) indicator plugin。
+
+plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
+`compute(df, params) -> dict` を実装する。df はハーネスが供給する完成バー
+のみの DataFrame (DatetimeIndex は UTC・昇順、末尾最大 `config.yaml` の
+`max_bars` 本)。純関数のみ — I/O・乱数・実時計へのアクセスは禁止。
+使ってよいのは pandas / numpy / math のみ。
+
+作者向け注意 (設計書 §4 の必須項目):
+
+1. **warmup はこの関数自身の責務。** `max_bars` は「渡す DataFrame の末尾
+   最大本数の上限宣言」であり「常に同じ本数が入っている保証」ではない。
+   系列契約では「行が足りないので何も返さない」はできない (ハーネスは宣言
+   `outputs` と完全一致するキー集合を毎回要求する)。足りない期間は **NaN**
+   にする — 消費側 (strategy) は `pd.isna` を見て hold を返す規約。
+
+2. **1d 足のバケット境界は UTC 00:00 (epoch 錨)** であり、FX の取引日境界
+   (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
+   ため、呼び出し側が渡す任意の足で使われ得る。
+
+3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
+   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
+   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+   `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
+   渡る履歴が短くなり値がわずかにずれる。
+
+4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
+   Series を作る)。モジュールレベルの状態を持たない。
+
+入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+
+
+def _int_param(params: dict, name: str, default: int) -> int:
+    """**変換ではなく型の確認** (設計書 §4)。`int(params.get(...))` は
+    `14.9` を `14` に、`"14"` を `14` に黙って読み替えてしまい、承認不要の
+    params 上書き (U3) 経由で誰のレビューも通らず本番へ届く。`bool` は
+    `int` の派生なので先に弾く。
+
+    **この関数は 9 本の plugin に逐語で重複している。** plugin は 1 フォルダ
+    3 ファイルで完結しなければならず (loader が 4 本目の `.py` を拒否、
+    sandbox が相対 import を拒否)、共有モジュールを置く経路が無い。
+    直すときは 9 本まとめて直すこと。
+    """
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"params.{name} must be an int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"params.{name} must be >= 1, got {value}")
+    return value
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    """slow stochastic の %K / %D を系列で返す (既定 14/3/3、設計書 D2)。
+
+      raw %K = 100 * (close - LL(period)) / (HH(period) - LL(period))
+      k      = SMA(k_period) of raw %K
+      d      = SMA(d_period) of k
+
+    `HH == LL` (期間内が完全な横ばい) の行は raw %K を 50.0 にする。
+    `k_period: 1` を上書きすると fast stochastic になる (承認不要の調整)。
+    """
+    period = _int_param(params, "period", 14)
+    k_period = _int_param(params, "k_period", 3)
+    d_period = _int_param(params, "d_period", 3)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    highest = high.rolling(window=period, min_periods=period).max()
+    lowest = low.rolling(window=period, min_periods=period).min()
+    span = highest - lowest
+    raw_k = 100.0 * (close - lowest) / span
+    raw_k = raw_k.where(span != 0.0, 50.0)
+    k = raw_k.rolling(window=k_period, min_periods=k_period).mean()
+    d = k.rolling(window=d_period, min_periods=d_period).mean()
+    return {"k": k, "d": d}
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/stochastic/plugin.py`
+
+### Step 8-d: **green** を確認する
+
+- [ ] `cd docs/examples/plugins/stochastic && uv run pytest -q test_plugin.py`
+      → **15 passed** になること (この本数を報告に書く)
+- [ ] `check_source` が 2 本とも通ること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.sandbox import check_source
+d = Path('docs/examples/plugins/stochastic')
+check_source(d / 'plugin.py')
+check_source(d / 'test_plugin.py', extra_allowed=frozenset({'pytest', 'plugin'}))
+print('check_source ok')"
+```
+
+- [ ] `discover` が通り `outputs` / `max_bars` が宣言どおりであること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.loader import discover_one_with_reason
+meta, reason = discover_one_with_reason(Path('docs/examples/plugins/stochastic'), 'stochastic')
+print(meta.kind, list(meta.outputs), meta.max_bars, meta.params, reason)"
+```
+
+### Step 8-e: 逆変異 (**6 件 = 下限であって上限ではない**)
+
+1 件ずつ `plugin.py` に適用 → `uv run pytest -q test_plugin.py --tb=no` → **元に戻す**。
+`git checkout` は使わない (`cp plugin.py /tmp/...bak` で退避して戻す)。
+**`FAILED` のテスト名を報告に貼り、下表と照合する。**
+
+| # | 変異 | red になるべきテスト (指揮者の実測値) |
+|---|---|---|
+| M-sto-1 | k を raw %K にする (slow -> fast) | `test_matches_reference_implementation_on_every_row`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-sto-2 | d を raw から取る | `test_matches_reference_implementation_on_every_row`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-sto-3 | HH/LL を入れ替え | `test_matches_reference_implementation_on_every_row` |
+| M-sto-4 | span==0 の 50.0 規則を削る | `test_flat_window_yields_fifty` |
+| M-sto-5 | rolling を center=True に (未来参照) | `test_flat_window_yields_fifty`, `test_matches_reference_implementation_on_every_row`, `test_prefix_consistency_on_every_row` |
+| M-sto-6 | min_periods を外す | `test_matches_reference_implementation_on_every_row`, `test_warmup_boundary_is_pinned_on_both_sides` |
+
+- [ ] 6 件すべてが KILLED になることを実測し、テスト名を報告に貼る
+- [ ] 元のファイルに戻っていることを `diff` で確認する
+
+### Step 8-f: 機械 diff と commit
+
+- [ ] **プラン本文から抽出して `diff` を取る** (差分ゼロを報告に貼る):
+
+```
+PLAN=docs/superpowers/plans/2026-09-19-indicator-initial-set.md
+uv run python - <<'EOF'
+import re, pathlib, subprocess
+pathlib.Path("tmp").mkdir(exist_ok=True)   # **`/tmp` 直下は使わない** (Global Constraints)
+plan = pathlib.Path("docs/superpowers/plans/2026-09-19-indicator-initial-set.md").read_text()
+# 見出し行 (行頭の "## T8: ") から次の "## " 見出しの直前までを節とする。
+# **行頭アンカー (re.M) が要る** — この抽出スクリプト自身が節の中に
+# 同じ文字列を含むため、素の split だと節が途中で切れる (実測)。
+sec = re.search(r"^## T8: .*?(?=^## |\Z)", plan, re.S | re.M).group(0)
+blocks = re.findall(r"^```(?:python|yaml)\n(.*?)^```$", sec, re.S | re.M)
+assert len(blocks) == 4, len(blocks)
+# blocks[0]=config.yaml, blocks[1]=test_plugin.py, blocks[2]=stub, blocks[3]=plugin.py
+for text, path in ((blocks[0], "config.yaml"), (blocks[1], "test_plugin.py"),
+                   (blocks[3], "plugin.py")):
+    want = pathlib.Path("tmp/expect_" + path)
+    want.write_text(text)
+    real = pathlib.Path("docs/examples/plugins/stochastic") / path
+    r = subprocess.run(["diff", str(want), str(real)], capture_output=True, text=True)
+    print(path, "DIFF-ZERO" if r.returncode == 0 else "MISMATCH\n" + r.stdout)
+EOF
+```
+
+- [ ] 各ファイルの絶対パスと `wc -l` を報告に書く
+- [ ] `git add docs/examples/plugins/stochastic && git commit`
+      (メッセージ: `feat(indicator-initial-set): stochastic indicator plugin (T8)`)
+- [ ] **逸脱の申告** — 上の Step どおりに書けなかった箇所を「Step 番号 / 何を / なぜ」で全件
+
+---
+
+## T9: `ichimoku` — 一目均衡表
+
+**出力**: `tenkan`, `kijun`, `senkou_a`, `senkou_b`, `chikou` ／ **warmup (最初に値が入る 0 起点行)**: `tenkan`=8, `kijun`=25, `senkou_a`=25, `senkou_b`=51, `chikou`=0 ／ **`max_bars`**: 400
+**依存**: T0 のみ。他の指標 task と**並列実行可**。
+**触るファイル**: `docs/examples/plugins/ichimoku/` の 3 ファイルのみ。
+
+**この task の要点**: 先行/遅行スパンを **shift しない** (設計書 R5)。3 期間の順序制約は**付けない**。
+
+### Step 9-a: `config.yaml` と `test_plugin.py` を転写する
+
+- [ ] `docs/examples/plugins/ichimoku/` を作る
+- [ ] `docs/examples/plugins/ichimoku/config.yaml` を**逐語**で作る:
+
+```yaml
+kind: indicator
+outputs: [tenkan, kijun, senkou_a, senkou_b, chikou]
+max_bars: 400
+params:
+  tenkan_period: 9
+  kijun_period: 26
+  senkou_b_period: 52
+```
+
+- [ ] `docs/examples/plugins/ichimoku/test_plugin.py` を**逐語**で作る
+      (**フェンス行 ` ```python ` / ` ``` ` をファイルに書かないこと**):
+
+```python
+"""ichimoku indicator plugin の自己テスト ([indicator-initial-set] 設計書 §6)。
+
+担保する受入条件: **I2** (outputs 完全一致 / index 一致 / Inf 不在)、
+**I3** (独立参照実装との全行一致)、**I4** (固定 fixture における全行の
+接頭辞一致)、**I9** (入力不変・反復決定性)、warmup 境界の両側 pin、
+params の型検証。
+
+このファイルは bless の pytest ゲート (subprocess + Landlock) で毎回走る。
+`check_source(..., extra_allowed={"pytest", "plugin"})` を通る範囲で書くこと
+(`to_frame` / `df.open` / `getattr` は使えない)。
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from plugin import compute
+
+OUTPUTS = ('tenkan', 'kijun', 'senkou_a', 'senkou_b', 'chikou')
+WARMUP = {'tenkan': 8, 'kijun': 25, 'senkou_a': 25, 'senkou_b': 51, 'chikou': 0}
+
+
+def _mkdf(n: int = 160, *, seed: int = 0, base: float = 150.0) -> pd.DataFrame:
+    """設計書 §6 I4 の固定 fixture。160 行は `ichimoku` の `senkou_b` warmup
+    51 + 余裕。**極値を中間と末尾側の両方に置く** — 片側だけだと「全体の
+    min/max で正規化する」型の未来参照を fixture 次第で見逃す (§6.2)。
+    """
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = base + np.cumsum(rng.normal(0.0, sigma, n))
+    if n >= 20:
+        close[n // 2] += base * 0.05
+        close[n - 7] -= base * 0.06
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    if n >= 2:
+        # **bar 1 に決定論的な上げを置く** — ここが平坦だと `+DM[0]` を NaN に
+        # するか 0.0 にするかが Wilder の seed に効かず、行 0 の扱いを潰す変異
+        # (M-adx-4) が fixture 次第で生き残る (変異スイープの実測)。
+        high[1] = high[0] + base * 0.01
+    # **open は close と別の系列にする** (前バーの終値)。`open == close` の
+    # fixture だと「close の代わりに open を読む」型の変異を検出できない
+    # (M-sma-4 の実測)。
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close,
+          "volume": np.ones(n)}, index=index)
+
+
+def _same(got, want, *, rel: float = 1e-9, tol: float = 1e-9) -> bool:
+    """NaN 同士は一致。数値は相対/絶対のどちらかを満たせば一致。"""
+    got_nan = got is None or bool(pd.isna(got))
+    want_nan = want is None or bool(pd.isna(want))
+    if got_nan or want_nan:
+        return got_nan and want_nan
+    got = float(got)
+    want = float(want)
+    return abs(got - want) <= max(tol, rel * abs(want))
+
+
+# --- 独立参照実装 (plugin.py とは別の書き方。plugin.py から import しない) ---
+
+def _isnan(value) -> bool:
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+def _ref_rolling(values: list, period: int, pick) -> list:
+    """rolling min / max を素朴なスライスで。"""
+    out = []
+    for i in range(len(values)):
+        if i < period - 1:
+            out.append(float("nan"))
+        else:
+            out.append(pick(values[i - period + 1:i + 1]))
+    return out
+
+
+def _ref_midpoint(df, window: int) -> list:
+    highest = _ref_rolling(df["high"].tolist(), window, max)
+    lowest = _ref_rolling(df["low"].tolist(), window, min)
+    return [float("nan") if _isnan(h) else (h + l) / 2.0
+            for h, l in zip(highest, lowest)]
+
+
+def _reference(df, params: dict) -> dict:
+    tenkan = _ref_midpoint(df, int(params.get("tenkan_period", 9)))
+    kijun = _ref_midpoint(df, int(params.get("kijun_period", 26)))
+    return {"tenkan": tenkan,
+            "kijun": kijun,
+            "senkou_a": [float("nan") if _isnan(t) or _isnan(k) else (t + k) / 2.0
+                         for t, k in zip(tenkan, kijun)],
+            "senkou_b": _ref_midpoint(df, int(params.get("senkou_b_period", 52))),
+            "chikou": list(df["close"].tolist())}
+
+
+# --- I2: 宣言キー集合 / index 一致 / Inf 不在 -------------------------------
+
+def test_outputs_match_declared_keys_and_index():
+    df = _mkdf()
+    out = compute(df, {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        assert isinstance(out[key], pd.Series), key
+        assert out[key].index.equals(df.index), key
+        assert not bool(np.isinf(out[key].to_numpy(dtype="float64")).any()), key
+
+
+# --- I3: 独立参照実装との全行一致 -------------------------------------------
+
+def test_matches_reference_implementation_on_every_row():
+    df = _mkdf()
+    got = compute(df, {})
+    want = _reference(df, {})
+    for key in OUTPUTS:
+        for i in range(len(df)):
+            assert _same(got[key].iloc[i], want[key][i]), (key, i)
+
+
+# --- I4: 固定 fixture における接頭辞一致 (全 160 行) ------------------------
+
+def test_prefix_consistency_on_every_row():
+    """`compute(df[:t+1])[key].iloc[-1] == compute(df)[key].iloc[t]` を
+    **全行**で。サンプル点だけだと「サンプルされない行だけ未来を読む」実装
+    (実測: 行 37 のみ書き換え) を素通りする (設計書 §6.2)。
+    """
+    df = _mkdf()
+    full = compute(df, {})
+    for t in range(len(df)):
+        sub = compute(df.iloc[:t + 1], {})
+        for key in OUTPUTS:
+            assert _same(sub[key].iloc[-1], full[key].iloc[t]), (key, t)
+
+
+# --- I9: 入力不変 / 反復決定性 ----------------------------------------------
+
+def test_input_frame_is_not_mutated():
+    """`check_source` は添字代入 `df["x"] = ...` を拒否しない (設計書 §4)。
+    入力を壊さない規律の観測点はこのテストだけ。"""
+    df = _mkdf()
+    before = df.copy(deep=True)
+    compute(df, {})
+    assert df.equals(before)
+    assert list(df.columns) == list(before.columns)
+    assert df.index.equals(before.index)
+    assert bool((df.dtypes == before.dtypes).all())
+
+
+def test_repeated_calls_are_deterministic():
+    """(1) fresh な df で 2 回 (2) **同じ df オブジェクトで 2 回** —
+    (2) が module レベルの状態持ち越しを捕まえる。"""
+    first = compute(_mkdf(), {})
+    second = compute(_mkdf(), {})
+    df = _mkdf()
+    third = compute(df, {})
+    fourth = compute(df, {})
+    for key in OUTPUTS:
+        for i in range(len(first[key])):
+            assert _same(first[key].iloc[i], second[key].iloc[i]), ("fresh", key, i)
+            assert _same(third[key].iloc[i], fourth[key].iloc[i]), ("same", key, i)
+
+
+# --- warmup 境界 (両側を pin する) ------------------------------------------
+
+def test_warmup_boundary_is_pinned_on_both_sides():
+    """「N 行目まで NaN」だけでなく「N+1 行目に値が入る」も見る — 片側だけ
+    だと warmup が 1 本早く/遅く明ける変異を検出できない。"""
+    out = compute(_mkdf(), {})
+    for key, first_valid in WARMUP.items():
+        series = out[key]
+        if first_valid > 0:
+            assert bool(series.iloc[:first_valid].isna().all()), key
+        assert not bool(pd.isna(series.iloc[first_valid])), key
+
+
+def test_short_frame_returns_all_declared_keys_as_all_nan():
+    """行が足りなくても「返さない」はできない — 宣言キーは必ず全部返す。"""
+    out = compute(_mkdf(n=3), {})
+    assert set(out) == set(OUTPUTS)
+    for key in OUTPUTS:
+        if WARMUP[key] >= 3:
+            assert bool(out[key].isna().all()), key
+
+
+# --- params の型検証 (変換ではなく型の確認) ---------------------------------
+
+@pytest.mark.parametrize("params", [{'tenkan_period': 9.0}, {'kijun_period': '26'}, {'senkou_b_period': True}, {'tenkan_period': 0}])
+def test_invalid_params_raise_value_error(params):
+    """**文言まで pin する。** `match` が無いと、検査を外す変異を入れても
+    pandas 自身が投げる `ValueError` (`span must satisfy: span >= 1` 等) で
+    テストが緑のまま通ってしまう (変異スイープの実測: M-sma-5 / M-ema-4)。
+    本 plugin の文言はすべて `params.<キー名> ...` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_valid_param_override_changes_the_result():
+    df = _mkdf()
+    base = compute(df, {})
+    other = compute(df, {'tenkan_period': 3, 'kijun_period': 7, 'senkou_b_period': 15})
+    key = OUTPUTS[0]
+    assert not _same(base[key].iloc[-1], other[key].iloc[-1])
+
+
+# --- lookahead 禁止 (R5) ----------------------------------------------------
+
+def test_spans_are_not_shifted_into_the_future():
+    """`senkou_a` / `senkou_b` は「そのバー時点で確定した値」。未来へずらして
+    いないことは (i) warmup 境界が shift 無しの位置にあること
+    (ii) 全行の接頭辞一致 (`test_prefix_consistency_on_every_row`) で観測する。
+    ここでは (i) を独立に pin する。"""
+    out = compute(_mkdf(), {})
+    assert bool(out["senkou_b"].iloc[:51].isna().all())
+    assert not bool(pd.isna(out["senkou_b"].iloc[51]))
+    assert bool(out["senkou_a"].iloc[:25].isna().all())
+    assert not bool(pd.isna(out["senkou_a"].iloc[25]))
+
+
+def test_chikou_is_the_current_close_not_shifted():
+    """遅行スパンは「現在の終値」そのもの。`shift(-26)` を掛けない。"""
+    df = _mkdf()
+    chikou = compute(df, {})["chikou"]
+    assert bool((chikou.to_numpy() == df["close"].to_numpy()).all())
+    assert not bool(chikou.isna().any())
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/ichimoku/test_plugin.py`
+
+### Step 9-b: stub を置いて **red** を確認する
+
+- [ ] `docs/examples/plugins/ichimoku/plugin.py` を**この stub**にする:
+
+```python
+"""stub (red 確認用)。**このファイルは Step c で本実装に差し替える。**"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    nan_series = pd.Series(np.full(len(df), np.nan), index=df.index,
+                           dtype="float64")
+    return {
+            "tenkan": nan_series,
+            "kijun": nan_series,
+            "senkou_a": nan_series,
+            "senkou_b": nan_series,
+            "chikou": nan_series,
+    }
+```
+
+- [ ] `cd docs/examples/plugins/ichimoku && uv run pytest -q test_plugin.py` を回す
+- [ ] **collection error ではなく assert-red** (複数の `FAILED`) になることを確認する
+- [ ] **この pytest 出力を逐語で報告に貼る** (「red を確認した」という申告は証拠にならない)
+
+### Step 9-c: `plugin.py` の本実装を転写する
+
+- [ ] `docs/examples/plugins/ichimoku/plugin.py` を**逐語**で差し替える:
+
+```python
+"""一目均衡表 indicator plugin。
+
+plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
+`compute(df, params) -> dict` を実装する。df はハーネスが供給する完成バー
+のみの DataFrame (DatetimeIndex は UTC・昇順、末尾最大 `config.yaml` の
+`max_bars` 本)。純関数のみ — I/O・乱数・実時計へのアクセスは禁止。
+使ってよいのは pandas / numpy / math のみ。
+
+作者向け注意 (設計書 §4 の必須項目):
+
+1. **warmup はこの関数自身の責務。** `max_bars` は「渡す DataFrame の末尾
+   最大本数の上限宣言」であり「常に同じ本数が入っている保証」ではない。
+   系列契約では「行が足りないので何も返さない」はできない (ハーネスは宣言
+   `outputs` と完全一致するキー集合を毎回要求する)。足りない期間は **NaN**
+   にする — 消費側 (strategy) は `pd.isna` を見て hold を返す規約。
+
+2. **1d 足のバケット境界は UTC 00:00 (epoch 錨)** であり、FX の取引日境界
+   (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
+   ため、呼び出し側が渡す任意の足で使われ得る。
+
+3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
+   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
+   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+   `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
+   渡る履歴が短くなり値がわずかにずれる。
+
+4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
+   Series を作る)。モジュールレベルの状態を持たない。
+
+5. **先行/遅行スパンの lookahead 規約** — 下の `compute` の docstring を参照。
+
+入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+
+
+def _int_param(params: dict, name: str, default: int) -> int:
+    """**変換ではなく型の確認** (設計書 §4)。`int(params.get(...))` は
+    `14.9` を `14` に、`"14"` を `14` に黙って読み替えてしまい、承認不要の
+    params 上書き (U3) 経由で誰のレビューも通らず本番へ届く。`bool` は
+    `int` の派生なので先に弾く。
+
+    **この関数は 9 本の plugin に逐語で重複している。** plugin は 1 フォルダ
+    3 ファイルで完結しなければならず (loader が 4 本目の `.py` を拒否、
+    sandbox が相対 import を拒否)、共有モジュールを置く経路が無い。
+    直すときは 9 本まとめて直すこと。
+    """
+    value = params.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"params.{name} must be an int, got {value!r}")
+    if value < 1:
+        raise ValueError(f"params.{name} must be >= 1, got {value}")
+    return value
+
+
+def _midpoint(df: pd.DataFrame, window: int) -> pd.Series:
+    """(期間内の最高値 + 最安値) / 2。"""
+    highest = df["high"].astype(float).rolling(
+        window=window, min_periods=window).max()
+    lowest = df["low"].astype(float).rolling(
+        window=window, min_periods=window).min()
+    return (highest + lowest) / 2.0
+
+
+def compute(df: pd.DataFrame, params: dict) -> dict:
+    """一目均衡表の 5 本を系列で返す (既定 9/26/52)。
+
+    **lookahead 禁止 (設計書 R5)**: `senkou_a` / `senkou_b` に `shift(+26)`
+    を掛けない。`chikou` に `shift(-26)` を掛けない。**返すのはすべて
+    「そのバー時点で確定している値」**であり、「26 本先へ投影した雲」でも
+    「26 本前へ遡らせた遅行線」でもない。
+
+    雲との比較をしたい strategy は
+    `indicators["ichi"]["senkou_a"].shift(kijun_period)` を自分で取ること。
+    この plugin は未来の行に値を置かない (接頭辞一致 §6 I4 の担保でもある)。
+
+    3 期間の順序 (`tenkan < kijun < senkou_b`) は**要求しない** — 式は任意の
+    順序で well-defined で、符号反転も退化も起きない。順序を強制すると
+    7/22/44 のような正当なパラメータ探索を塞ぐ (設計書 §4)。
+    """
+    tenkan_period = _int_param(params, "tenkan_period", 9)
+    kijun_period = _int_param(params, "kijun_period", 26)
+    senkou_b_period = _int_param(params, "senkou_b_period", 52)
+    tenkan = _midpoint(df, tenkan_period)
+    kijun = _midpoint(df, kijun_period)
+    return {"tenkan": tenkan,
+            "kijun": kijun,
+            "senkou_a": (tenkan + kijun) / 2.0,
+            "senkou_b": _midpoint(df, senkou_b_period),
+            "chikou": df["close"].astype(float)}
+```
+
+- [ ] `python -c "import ast,sys; ast.parse(open(sys.argv[1]).read()); print('ok')" docs/examples/plugins/ichimoku/plugin.py`
+
+### Step 9-d: **green** を確認する
+
+- [ ] `cd docs/examples/plugins/ichimoku && uv run pytest -q test_plugin.py`
+      → **14 passed** になること (この本数を報告に書く)
+- [ ] `check_source` が 2 本とも通ること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.sandbox import check_source
+d = Path('docs/examples/plugins/ichimoku')
+check_source(d / 'plugin.py')
+check_source(d / 'test_plugin.py', extra_allowed=frozenset({'pytest', 'plugin'}))
+print('check_source ok')"
+```
+
+- [ ] `discover` が通り `outputs` / `max_bars` が宣言どおりであること:
+
+```
+uv run python -c "
+from pathlib import Path
+from agentic_fx.plugin.loader import discover_one_with_reason
+meta, reason = discover_one_with_reason(Path('docs/examples/plugins/ichimoku'), 'ichimoku')
+print(meta.kind, list(meta.outputs), meta.max_bars, meta.params, reason)"
+```
+
+### Step 9-e: 逆変異 (**6 件 = 下限であって上限ではない**)
+
+1 件ずつ `plugin.py` に適用 → `uv run pytest -q test_plugin.py --tb=no` → **元に戻す**。
+`git checkout` は使わない (`cp plugin.py /tmp/...bak` で退避して戻す)。
+**`FAILED` のテスト名を報告に貼り、下表と照合する。**
+
+| # | 変異 | red になるべきテスト (指揮者の実測値) |
+|---|---|---|
+| M-ich-1 | senkou を未来へ shift (lookahead) | `test_matches_reference_implementation_on_every_row`, `test_prefix_consistency_on_every_row`, `test_valid_param_override_changes_the_result` |
+| M-ich-2 | chikou を shift(-26) に (lookahead) | `test_chikou_is_the_current_close_not_shifted`, `test_matches_reference_implementation_on_every_row`, `test_prefix_consistency_on_every_row` |
+| M-ich-3 | senkou_a を tenkan だけに | `test_matches_reference_implementation_on_every_row`, `test_spans_are_not_shifted_into_the_future`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-ich-4 | midpoint を平均に | `test_matches_reference_implementation_on_every_row` |
+| M-ich-5 | senkou_b の既定 52 -> 26 | `test_matches_reference_implementation_on_every_row`, `test_spans_are_not_shifted_into_the_future`, `test_warmup_boundary_is_pinned_on_both_sides` |
+| M-ich-6 | min_periods を外す (2 箇所とも) | `test_matches_reference_implementation_on_every_row`, `test_short_frame_returns_all_declared_keys_as_all_nan`, `test_spans_are_not_shifted_into_the_future` |
+
+- [ ] 6 件すべてが KILLED になることを実測し、テスト名を報告に貼る
+- [ ] 元のファイルに戻っていることを `diff` で確認する
+
+### Step 9-f: 機械 diff と commit
+
+- [ ] **プラン本文から抽出して `diff` を取る** (差分ゼロを報告に貼る):
+
+```
+PLAN=docs/superpowers/plans/2026-09-19-indicator-initial-set.md
+uv run python - <<'EOF'
+import re, pathlib, subprocess
+pathlib.Path("tmp").mkdir(exist_ok=True)   # **`/tmp` 直下は使わない** (Global Constraints)
+plan = pathlib.Path("docs/superpowers/plans/2026-09-19-indicator-initial-set.md").read_text()
+# 見出し行 (行頭の "## T9: ") から次の "## " 見出しの直前までを節とする。
+# **行頭アンカー (re.M) が要る** — この抽出スクリプト自身が節の中に
+# 同じ文字列を含むため、素の split だと節が途中で切れる (実測)。
+sec = re.search(r"^## T9: .*?(?=^## |\Z)", plan, re.S | re.M).group(0)
+blocks = re.findall(r"^```(?:python|yaml)\n(.*?)^```$", sec, re.S | re.M)
+assert len(blocks) == 4, len(blocks)
+# blocks[0]=config.yaml, blocks[1]=test_plugin.py, blocks[2]=stub, blocks[3]=plugin.py
+for text, path in ((blocks[0], "config.yaml"), (blocks[1], "test_plugin.py"),
+                   (blocks[3], "plugin.py")):
+    want = pathlib.Path("tmp/expect_" + path)
+    want.write_text(text)
+    real = pathlib.Path("docs/examples/plugins/ichimoku") / path
+    r = subprocess.run(["diff", str(want), str(real)], capture_output=True, text=True)
+    print(path, "DIFF-ZERO" if r.returncode == 0 else "MISMATCH\n" + r.stdout)
+EOF
+```
+
+- [ ] 各ファイルの絶対パスと `wc -l` を報告に書く
+- [ ] `git add docs/examples/plugins/ichimoku && git commit`
+      (メッセージ: `feat(indicator-initial-set): ichimoku indicator plugin (T9)`)
+- [ ] **逸脱の申告** — 上の Step どおりに書けなかった箇所を「Step 番号 / 何を / なぜ」で全件
+
+---
+
+## T10: repo 側の受入テストと runbook
+
+**依存**: T1〜T9 の全マージ後。1 レーンで直列実行する。
+**触るファイル**: `tests/plugin/test_loader.py` (既存、1 assert に追記) /
+`tests/plugin/test_indicator_initial_set.py` (新規) /
+`docs/operations/indicator-initial-set-deploy-2026-09-19.md` (新規)。
+
+> **注意 (着手前検証の範囲)**: T1〜T9 の逐語コードは指揮者が scratchpad で実際に動かして
+> green を確認済みだが、**T10 の I6 / I7 / I8 は tmp 環境での bless 実測を伴うため、
+> 本プランでは「何を観測するか」の仕様と既存 fixture への参照までしか書いていない**
+> (「着手前検証の記録」節に明記)。実装者はここで**プラン記述の欠陥を最も踏みやすい** —
+> 既存 fixture のシグネチャが違う等があれば**黙って回避せず申告**すること
+> ([[plan-code-defects-not-implementer-defects]])。
+
+### Step 10-a: I1 — `discover` の包含集合を広げる
+
+- [ ] `rg -n 'test_discover_sample_plugins_directory_not_rejected' tests/plugin/test_loader.py`
+      で現在の行番号を取得する (**本プランの行番号参照はドリフトしている前提で扱う**)
+- [ ] その関数の `assert {"rsi_indicator", "sma_cross"} <= names` を次の形に広げる:
+
+```python
+    assert {"rsi_indicator", "sma_cross", "sma", "ema", "rsi", "macd",
+            "bollinger", "atr", "adx", "stochastic", "ichimoku"} <= names
+```
+
+- [ ] **総数 (`len(metas)`) は pin しない** — example が 1 本増えただけで落ちる脆いテストに
+      なり、観測したい性質「9 本が reject されない」と一致しない (設計書 §6 I1 / r1 M1)
+- [ ] 逆変異: どれか 1 本の `config.yaml` に未知キー (`timeframe: 1h`) を足すと**この**
+      テストが red になることを実測する
+
+### Step 10-b: I2 — validator を直接通す
+
+- [ ] `tests/plugin/test_indicator_initial_set.py` を新規作成し、
+      `docs/examples/plugins` を `discover` して kind=indicator の 9 本を取り出し、
+      各 `plugin.py` を `importlib` でロードして `compute(df, dict(meta.params))` の戻り値を
+      `agentic_fx.core.plugin_contract.validate_indicator_result(out, df_index=df.index,
+      outputs=meta.outputs)` に通す (例外が出ないこと)
+- [ ] **既存の `rsi_indicator` は `outputs` を宣言しているので混ざってよい**が、
+      対象は「本束で足した 9 名」に限定して名前で選ぶこと (将来 example が増えても壊れない)
+- [ ] 逆変異: どれか 1 本の `compute` の戻り値から 1 キー落とすと red になること
+
+### Step 10-c: I5 — 先頭依存の回帰 (**指揮者が実測済みのコードを転写する**)
+
+fixture の生成式・値域・seed は設計書 §6 I5 の逐語仕様。**この Step のコードは指揮者が
+scratchpad で実行して下表の数値を得たもの** (「着手前検証の記録」§3)。
+
+```python
+PRICE_KEYS = {"value", "upper", "middle", "lower", "atr", "macd", "signal",
+              "hist", "tenkan", "kijun", "senkou_a", "senkou_b", "chikou"}
+
+
+def _spike_df(n=5000, base=150.0, spike=0.0, seed=1):
+    """設計書 §6 I5 の fixture 生成式 (逐語)。`spike` は 401 本目 (= 400 本窓の
+    ちょうど手前) に置く — `|Δseed|` を人為的に最大化する構成。"""
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = base + np.cumsum(rng.normal(0.0, sigma, n))
+    if spike:
+        close[n - 401] += spike
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2020-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame({"open": open_, "high": high, "low": low,
+                         "close": close, "volume": np.ones(n)}, index=index)
+
+
+def _degenerate_df(n_pre=200, n_flat=400, base=150.0, spike=1.0, seed=0):
+    """設計書 §3.2 (i-b) の反例: 通常データ -> DM/TR 1 本 -> 完全横ばい 400 本。"""
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    close = list(base + np.cumsum(rng.normal(0.0, sigma, n_pre)))
+    high = [v + sigma / 2.0 for v in close]
+    low = [v - sigma / 2.0 for v in close]
+    top = close[-1] + spike
+    close.append(top)
+    high.append(top)
+    low.append(close[-2])
+    for _ in range(n_flat):
+        close.append(top)
+        high.append(top)
+        low.append(top)
+    open_ = [close[0]] + close[:-1]
+    index = pd.date_range("2020-01-01", periods=len(close), freq="5min", tz="UTC")
+    return pd.DataFrame({"open": open_, "high": high, "low": low,
+                         "close": close, "volume": [1.0] * len(close)},
+                        index=index)
+```
+
+- [ ] **ランダムウォーク 4 値域 (0.5 / 1.5 / 150 / 300) × seed 0〜7**: 末尾 400 本で
+      計算した最終行と全 5000 本の最終行の差が、**0〜100 スケールの出力
+      (`rsi` `k` `d` `adx` `plus_di` `minus_di`) は `abs < 1e-6`**、
+      **価格スケールの出力は `abs < 1e-9 * 基準価格`**。
+      指揮者の実測: **全キーの最大誤差 3.104e-10 / 違反 0**
+- [ ] **スパイク fixture** (401 本目に基準価格の 60% = +90): 実測値は
+      `ema` 0.0 / `macd` 2.56e-13 / `signal` 4.11e-13 / `hist` 1.55e-13 /
+      `atr` 1.79e-12 / `rsi` 1.42e-10 / `adx` 3.40e-09 / `plus_di` 1.19e-10 /
+      `minus_di` 2.73e-11 — 上界式 (設計書 §3.2 (i)) の内側
+- [ ] **退化 fixture**: `rsi` は `abs == 0.0`、`adx` だけ `abs < 1e-4`
+      (指揮者の実測 **4.31e-06**。設計書 §3.2 (i-b) は 5.2e-06 と書いているが、これは
+      fixture の前段データの作り方で変わる観測値で、どちらも 1e-4 の内側 —
+      「着手前検証の記録」§5 の要裁定 1 件)。
+      `stochastic` は rolling の有限記憶なので `abs == 0.0`
+- [ ] 逆変異: `rsi` / `adx` の `EPS` を 0 にすると**退化 fixture のケースだけ**が red に
+      なることを実測する (ランダムウォークのケースは緑のまま = 退化 fixture が唯一の観測点)
+
+### Step 10-d: I6 — 9 本を順に bless する (tmp 環境)
+
+- [ ] `tests/fixtures/wiring_envs.py` の tmp 環境ビルダ (実 DB / 実 `plugins/` を触らない形)
+      に倣い、`tmp_path/plugins` と tmp sqlite を用意する。**実 `data/agentic.db` と
+      実 `plugins/` に触れないこと** (Global Constraints)
+- [ ] `docs/examples/plugins/<名前>` を `tmp_path/plugins/_human/<名前>` へ **`shutil.copytree`**
+      でコピーする (`__pycache__` が混ざっても `check_candidate_snapshot` は無視する —
+      `gate_pytest.py:61-64`、設計書 §6 I8)
+- [ ] 9 本を **1 本ずつ順に** `switch.bless_candidate(conn, name=..., human_dir=...,
+      settings=..., now=..., decided_by="test")` に通し、**9 回とも `int` (approval_id) が
+      返る**ことを assert する
+- [ ] 同時に観測する: (i) `noop_gate.find_noop_copy` がこの経路に**無い**こと
+      (`switch._run_full_gate` のゲート列に現れない — 設計書 §5.4/§5.5) — したがって
+      「example の丸写し」で弾かれない (ii) `outputs_required` に掛からない
+      (iii) `max_bars_limit` に掛からない (400 <= 1000)
+- [ ] 9 本 bless 後に `tools.plugin_loader.approved_plugins(conn, tmp_path/"plugins",
+      settings=...)` を呼び、`inventory.metas` に 9 名が `outputs` 付きで並ぶことを assert
+- [ ] 逆変異: 1 本の `config.yaml` から `outputs:` 行を削ると、**その 1 本だけ**が
+      `ValueError("outputs_required")` になり他の 8 本は配備されること (= 束ではない、
+      設計書 §6.3)
+
+### Step 10-e: I7 — 新 `rsi` を宣言した strategy の E2E
+
+- [ ] tmp 環境に `rsi` を配備したうえで、`rsi_pullback` 型の strategy を**別名**で作る
+      (`config.yaml` に `indicators: {rsi: {plugin: rsi, params: {period: 14}}}`、
+      **`max_bars: 400`**、`exit_mode: levels`、`timeframe` / `pairs` あり)
+- [ ] `lock_staging_deps` 相当 (人間経路なら `afx plugin lock --from _human`) で pin を
+      書き込み、`resolve_indicator_deps(pin_mode="require")` が通ることを assert
+- [ ] 実 worker サブプロセスで `PluginSession(kind="strategy", resolved=...)` を起動し、
+      `evaluate(df, indicators, None, params)` の `indicators["rsi"]["rsi"]` が
+      **df と同じ index の系列**として届くことを assert
+      (**モックで worker を潰さない** — [[test-fixtures-from-real-transcripts]])
+- [ ] **`max_bars: 200` の保証外ケース**を別テストで: 同じ strategy を `max_bars: 200` で
+      作ると**動く** (例外にならない) が、**I5 の保証範囲の外**であることを docstring に書く。
+      値の一致は要求しない (worker は `df.tail(min(200, 400))` を渡す — `worker.py:318`)
+
+### Step 10-f: runbook を書く
+
+`docs/operations/indicator-initial-set-deploy-2026-09-19.md` を新規作成する。
+
+- [ ] **冒頭に**: 「**暫定**。[first-run-setup] (初回起動の対話ウィザード) が一括配備に
+      置き換える。**恒久なのは『採用には人間の明示的確認が要る、LLM の自動配備経路は
+      作らない』という規律のほう**」
+- [ ] 手順 (0)〜(6) を逐語で:
+  - **(0) 既存の配備名との衝突確認** — `ls -l plugins/` で `sma` / `ema` / `rsi` / `macd` /
+    `bollinger` / `atr` / `adx` / `stochastic` / `ichimoku` が無いこと。既にあれば
+    bless は**既存名の新版への切り替え**になり、その名前を pin している strategy が
+    pin 破れで inventory から外れる (設計書 §8 D3)
+  - **(1) コピー** — `cp -r docs/examples/plugins/<名前> plugins/_human/<名前>`
+  - **(2) bless** — `afx plugin bless <名前> --from _human`
+  - **(3) 結果の確認** — rc=0 なら stdout に `approval id=<N>`。**rc=1 / traceback なら
+    そこで停止**し、失敗が (A) ゲート前か (B) ゲート後かを判定して下の収束手順へ。
+    **既に配備済の分は巻き戻さない** (設計書 §6.3)
+  - **(4) 後片付け** — `rm -rf plugins/_human/<名前>` (bless は消さない。残すと後日の
+    `afx plugin materialize <名前>` が `FileExistsError` になる)
+  - **(5) 9 本ぶん繰り返す**
+  - **(6) 最終確認** — service を再起動し、起動ログに 9 本が載ること
+- [ ] **失敗の 2 系統 (設計書 §6.3) を逐語で転記する**:
+  - **(A) ゲート前・ゲート中** (`check_source` / pytest / `max_bars` / `outputs_required`) —
+    何も残らない。候補を直して同じ名前でやり直すだけ
+  - **(B) ゲート後** (version 作成・history・symlink 切替) — journal / pending approval /
+    `.versions/` が残り、**次の同名 bless は `UnresolvedJournalError` になる**。
+    **この例外は CLI が捕捉していないので Python traceback が出る** — 意味は
+    「未終端 journal の検出」。**収束手順 5 ステップを設計書 §6.3 (B) から逐語で転記**
+    (approval id は traceback のメッセージ `op_id=... approval_id=...` から読む /
+    `afx> approval retry <id>` が `preparing` を終端させる唯一の手段 /
+    **サービス再起動だけでは `preparing` は終端しない**)
+- [ ] **strategy 作者向けの 1 行**: 「これらの indicator に依存する strategy は自分の
+      `max_bars` を **400 以上**に宣言すること」(設計書 §3.2)
+- [ ] **末尾に「任意の後片付け」節** (2026-09-19 ユーザー指示) — **実コードで確認した事実を
+      反映すること**:
+  - 新 `rsi` を配備したあと、**依存する strategy が無いことを確認したうえで**、配備済
+    `rsi_indicator` / `rsi_wilder` を退役させてよい。**人間の判断であり本束の完了条件では
+    ない。**
+  - **`afx plugin retire <名前>` は引数 1 個 (名前のみ)**。ただし**「legacy plain live」
+    — つまり `plugins/<名前>` が普通のディレクトリの場合にしか使えない**。bless で配備した
+    ものは `.versions/` への symlink なので、`retire` は
+    `ValueError("plugins/<名前> is not a plain directory (retire only applies to legacy
+    plain live)")` で**拒否する** (`switch.py:1627-1629`)。未終端 journal があるときも
+    `UnresolvedJournalError` で拒否する (`switch.py:1621-1625`)
+  - **`retire` は依存 strategy を一切検査しない** (`switch.py:1605-1641` の `retire_plugin` 全体に該当コードが無い)。
+    退役させた indicator を pin している strategy は、次の `approved_plugins()` の第 2 相で
+    `not_found` になり**黙って inventory から外れる** (pin 破れ)。**人間が事前に確認すること** —
+    確認手段は対話シェルの `afx> approval <id>` の詳細に出る
+    `dependent_pinned_here` / `dependent_pinned_elsewhere` の 2 欄 (`commands.py:395-400`)
+  - **example 側の `docs/examples/plugins/rsi_indicator` は残す** — example 戦略
+    `rsi_pullback` が依存しており、改善ループの `_examples` スナップショットと
+    `tests/plugin/test_loader.py` / `tests/loops/test_improve_e2e.py` が参照している (R7)
+
+### Step 10-g: I8 — runbook の逐語再現
+
+- [ ] **(a) 正常系**: tmp 環境で runbook のコマンド列をそのまま実行し、9 本が配備され
+      inventory に 9 本が `outputs` 付きで現れること。コピーが `__pycache__` を巻き込んでも
+      通ること
+- [ ] **(b) ゲート前失敗からの再開 (§6.3 (A))**: k 本目 (例 5 本目) の `_human` 候補の
+      `test_plugin.py` をわざと落ちるようにして bless を失敗させ、**k−1 本が配備済のまま
+      残る**こと → 候補を直して k 本目から再開すると**最終的に 9 本揃う**こと
+- [ ] **(c) ゲート後失敗の収束 (§6.3 (B))**: `_advance_to_decided` の途中 (version 作成後・
+      symlink 切替前) を monkeypatch で 1 回だけ失敗させ、**未終端 journal と pending
+      approval が残る** → **次の同名 bless が `UnresolvedJournalError`** → **runbook の
+      収束手順を逐語で実行**すると解け、同名で再 bless して配備が完了すること
+- [ ] **状態遷移そのものは既存テストが pin 済み** — `tests/plugin/test_switch_journal.py`
+      (`test_switched_recovery_*` / `test_interrupt_reverts_*`) と
+      `tests/plugin/test_reconcile.py` を**参照**し、**再実装しない** (設計書 §6.1)。
+      I8(c) が観測するのは「**runbook に書いた手順がそのまま通ること**」だけ
+- [ ] 故障注入の形は上記既存テストの monkeypatch に倣う (シグネチャが違ったら**申告**)
+
+### Step 10-h: フルスイートと commit
+
+- [ ] `uv run pytest -q` をフルで回し、**既存テストの退行がゼロ**であること
+      (特に `tests/plugin/test_loader.py` / `tests/loops/test_improve_loop_source_snapshot.py`
+      / `tests/tools/test_improve_staging_tools.py` — `docs/examples/plugins` を列挙する側)
+- [ ] `git status` で `data/` と `plugins/` に変更が無いことを確認する
+- [ ] commit (`feat(indicator-initial-set): 受入テストと配備 runbook (T10)`)
+- [ ] **逸脱の申告**を全件
+
+---
+
+## レビュー段
+
+1. **段 0 (指揮者の変異スイープ)** — レビュー前に必ず回す。**本プランの T1〜T9 の
+   Step e に書いた 54 件は指揮者が実測済み (54/54 KILLED)** なので、段 0 では
+   **実装者の報告と指揮者の再実測を照合する** ([[haiku-silently-adapts-report-deviations]]
+   — 報告は証拠にならない)。加えて T10 の逆変異 3 件を回す。
+   **変異の適用と復元は必ず対で行い、復元漏れが後続の測定を汚さないようにする** —
+   指揮者の scratchpad 検証でも 1 度これを踏んだ (「着手前検証の記録」§6)。
+2. **1 周目** = codex + ローカル LLM 3 本 (並列)。
+3. **2 周目** = `/code-review high` + codex + ローカル 3 本 (有償 2 本は並列にしない)。
+4. **3 周目** = 必要に応じてブリーフ付き sonnet。
+
+**レビュアーへの依頼文に必ず入れる**: 「**プロジェクトの制約に反するなら、プラン記述
+どおりの実装でも欠陥として挙げてほしい**」([[plan-code-defects-not-implementer-defects]])。
+
+## 完了条件 (束全体)
+
+- [ ] `docs/examples/plugins/` に 9 本 × 3 ファイル = 27 ファイルが存在する
+- [ ] 9 本の自己テストが **合計 131 passed** (指揮者の実測値。増える方向は可)
+- [ ] `discover(docs/examples/plugins)` の結果に **9 名すべてが含まれる** (既存 3 + 新 9 = 12 本。
+      **総数は pin しない** — I1 の方針と同じ。ここは束の完了時に 1 回見るだけの確認)
+- [ ] 受入 I1〜I9 の 9 件すべてに緑のテストが対応している (対応表の抜けゼロ)
+- [ ] 逆変異 54 件 + T10 の 3 件が KILLED
+- [ ] `docs/operations/indicator-initial-set-deploy-2026-09-19.md` が存在し、I8 が通る
+- [ ] `uv run pytest -q` フルスイートで退行ゼロ
+- [ ] `git status` に `data/` / `plugins/` / `src/` の変更が無い
+- [ ] fresh worktree でフルスイートを 1 回 (残骸ゼロ)
+
+## 着手前検証の記録 (指揮者が scratchpad で実測、2026-09-19)
+
+本プランの T1〜T9 の逐語コード (27 ファイル) は、**プランに載せる前に scratchpad で
+実際に生成して動かし、green を確認したもの**。実測の内訳:
+
+### 1. 静的ゲート
+
+| 検査 | 結果 |
+|---|---|
+| `check_source(plugin.py)` × 9 | **9/9 PASS** |
+| `check_source(test_plugin.py, extra_allowed={"pytest","plugin"})` × 9 | **9/9 PASS** |
+| `loader.discover(<9 本のディレクトリ>)` | **9 本すべて admit**。`kind=indicator` / `max_bars=400` / `outputs` 宣言あり |
+| `core.plugin_contract.validate_indicator_result` × 9 | **9/9 PASS** (キー集合・index・Inf/bool) |
+
+### 2. 自己テスト
+
+| plugin | passed | plugin | passed | plugin | passed |
+|---|---|---|---|---|---|
+| `sma` | 13 | `macd` | 16 | `adx` | 16 |
+| `ema` | 12 | `bollinger` | 17 | `stochastic` | 15 |
+| `rsi` | 16 | `atr` | 12 | `ichimoku` | 14 |
+
+**合計 131 passed / 9 本合計 3.3 秒** (`pytest_timeout_sec: 300` に対して桁で余裕)。
+うち **I4 の全 160 行の接頭辞検査**が 9 本合計 0.53 秒 (最悪 `adx` 0.224 秒)。
+
+### 3. I5 (先頭依存) の実測
+
+- ランダムウォーク **4 値域 (0.5 / 1.5 / 150 / 300) × seed 0〜7**、全 9 本の全出力キー:
+  **最大誤差 3.104e-10 / 公差違反 0**。
+- **401 本目に +90 のスパイク**: `ema` 0.0 / `macd` 2.56e-13 / `signal` 4.11e-13 /
+  `hist` 1.55e-13 / `atr` 1.79e-12 / `rsi` 1.42e-10 / `adx` 3.40e-09 /
+  `plus_di` 1.19e-10 / `minus_di` 2.73e-11。
+- **退化 fixture** (200 本 → DM/TR 1 本 → 完全横ばい 400 本): `rsi` **0.0** /
+  `adx` **4.31e-06** / `plus_di` 0.0 / `minus_di` 0.0 / `stochastic` 0.0。
+
+### 4. 壊れた実装に対する red の実測 (`sma` の `test_plugin.py` を流用)
+
+| 壊れた実装 | red になったテスト |
+|---|---|
+| **行 37 だけ**未来を読む (`value.iloc[37] = close.iloc[38]`) | `test_prefix_consistency_on_every_row` / `test_matches_reference_implementation_on_every_row` |
+| 入力 df を添字代入で壊す (`df["close"] = close * 2.0`) | `test_input_frame_is_not_mutated` / `test_repeated_calls_are_deterministic` / 他 2 本 |
+| module レベルの状態を持ち越す (`_SEEN.append(...)`) | `test_repeated_calls_are_deterministic` / 他 2 本 |
+| `close.shift(-1)` を挟む | `test_prefix_consistency_on_every_row` / 他 2 本 |
+
+**「行 37 だけ未来を読む」は 8 点サンプル検査では緑になる** (設計書 §6.2) — 全行検査が
+必要な理由の実測。
+
+### 5. 逆変異スイープ
+
+**54 件 / 54 KILLED / 生存 0。** 初回は **9 件が生存**し、そのすべてが**テスト側の欠陥**
+だった。修正内容 (T0-3 / T0-4 に反映済み):
+
+| 生存した変異 | 原因 | 打った手 |
+|---|---|---|
+| `sma`: `close` → `open` | fixture が `open == close` だった | `_mkdf` の `open` を**前バーの終値**に変更 |
+| `sma`/`ema`: params 検査を削る | pandas 自身の `ValueError` でテストが緑になっていた | `pytest.raises(..., match=r"^params\.")` で**文言まで pin** |
+| `rsi`: `EPS` → 0 | 完全横ばい fixture では厳密 0 判定でも 50 になる | **減衰した横ばい** fixture (`_decayed_flat_df`) を追加 |
+| `adx`: ε 規則を厳密 0 判定に戻す (2 件) | 同上 | 同上 |
+| `adx`: `±DM` の行 0 マスクを削る | fixture の bar 1 が平坦で seed 差が出なかった | `_mkdf` の **bar 1 に決定論的な上げ**を置く |
+| `ichimoku`: `min_periods` を外す | **変異定義の欠陥** (2 箇所あるのに 1 箇所しか置換していなかった) | 変異定義を修正 (両方置換) |
+
+**等価変異 1 件 (正直に記録する)**: `rsi` / `adx` の `EPS * close.abs()` を
+`EPS * close.shift(1).abs()` に変える変異は、**隣接バーの価格比が 1 に近い限り等価**で
+自己テストでは殺せない。これは規約 (設計書 §3.1 の「`|close|` はその行自身の close」) と
+docstring・参照実装の一致で担保する ([[mutation-testing]] の「リストは下限」)。
+
+### 6. 検証手順そのものの落とし穴 (実測)
+
+変異スイープの出力を `| grep` に通したところ、**SIGPIPE でスイープが途中終了し、変異を
+適用したままのファイルが残って後続の測定を汚した** (`atr` の自己テストが一度 red になった)。
+**変異の適用と復元は対で、パイプで打ち切られない形で回すこと。** 本プランの Step e は
+「1 件ずつ適用 → 実測 → 必ず戻す → `diff` で確認」の順を明示している。
+
+### 7. 機械抽出による再検証 (転写ずれの検出)
+
+本プランを書き終えたあと、**プラン本文の ` ```python ` / ` ```yaml ` フェンスから 27 ファイルを
+機械抽出して別ディレクトリに再展開し、§1〜§5 と同じ検証を全部もう一度回した**。抽出スクリプト
+(各 task の Step f に載せたものと同じ正規表現):
+
+```
+sec = plan.split(f"## T{i}: `{name}` —")[1].split("\n---\n")[0]
+blocks = re.findall(r"^```(?:python|yaml)\n(.*?)^```$", sec, re.S | re.M)
+# blocks[0]=config.yaml  blocks[1]=test_plugin.py  blocks[2]=stub  blocks[3]=plugin.py
+```
+
+結果:
+
+| 再検証 | 結果 |
+|---|---|
+| 生成元 (source of truth) との `diff -r` | **差分ゼロ (27 ファイルすべて一致)** |
+| `check_source` 18 件 | **18/18 PASS** |
+| `discover` | **9 本すべて admit** |
+| `validate_indicator_result` 9 件 | **9/9 PASS** |
+| 自己テスト | **131 passed / 3.3 秒** (§2 と同値) |
+| 逆変異 54 件 | **54/54 KILLED** (§5 と同値) |
+| I5 / 退化 fixture / 壊れた実装 4 種 | **§3 / §4 と数値まで同一** (最大誤差 3.104e-10、`adx` 退化 4.314e-06) |
+
+**初回の抽出では 1 件だけ差分が出た** — `config.yaml` の末尾に空行が 1 行余分にあり、プラン側の
+`.rstrip()` で落ちていた。生成元を直して再生成・再抽出し、差分ゼロにしてからこの記録を書いた。
+**「プランに載せた文字列」と「検証した文字列」が同一であることを、目視ではなく `diff` で
+確かめてある** ([[transcription-must-be-machine-diffed]])。
+
+### 8. 設計書との食い違い (指揮者へ申告済み、**勝手に spec を変えていない**)
+
+| # | 箇所 | 実測 | 扱い |
+|---|---|---|---|
+| 1 | 設計書 §3.2 (i-b) の退化 fixture の `|Δadx|` = **5.2e-06** | 本プランの fixture 生成式では **4.31e-06** | どちらも I5 の公差 `1e-4` の内側で**結論は不変**。数値は前段データの作り方に依存する観測値なので、spec 側を「4e-06 〜 6e-06 のオーダー」と書き換えるか、本プランの fixture を spec の逐語仕様として採用するかは**指揮者の裁定**を仰ぐ |
+| 2 | 設計書 §6.3 は `afx plugin retire` に触れていない | `retire` は **plain live 専用**で symlink 配備 (= bless の結果) は**拒否**し、**依存 strategy を検査しない** | 本プランの Step 10-f に実コードの事実として書いた。spec への反映要否は指揮者の裁定 |
+
+## 変更履歴
+
+| 日付 | 版 | 変更 | 理由 | commit |
+|---|---|---|---|---|
+| 2026-09-19 | v1.0 | 起案。設計書 v1.3a を T0 (共通テンプレート) / T1〜T9 (指標 1 本ずつ、並列可) / T10 (repo 側受入テストと runbook) の 11 task へ分割。**T1〜T9 の逐語コード 27 ファイルは指揮者が scratchpad で生成・実行し 131 passed を確認済み**。逆変異 54 件を実測し 54/54 KILLED (初回 9 件生存 → すべてテスト側の欠陥として修正)。I5 の数値・壊れた実装の red・等価変異 1 件を「着手前検証の記録」に記載 | 設計書 v1.3a (codex 設計レビュー r3 で指摘 0、収束) | - |

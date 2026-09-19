@@ -1,4 +1,4 @@
-# [indicator-initial-set] 設計書 v1.3
+# [indicator-initial-set] 設計書 v1.3a
 
 束: 改善ループが戦略を作るときに `config.yaml` の `indicators:` で宣言できる **標準指標の初期セット (9 本)** を人間が用意する。成果物は `docs/examples/plugins/<名前>/` に置く plugin 3 点セットと、人間が配備するための runbook のみ。**新しいコマンド・新しい機構・新しい自動配備経路は一切作らない。**
 
@@ -14,7 +14,7 @@
 | R4 | 指標 9 種と出力 | `sma`/`ema` → `value` (20) ／ `rsi` → `rsi` (14, Wilder) ／ `macd` → `macd` `signal` `hist` (12/26/9) ／ `bollinger` → `upper` `middle` `lower` (20, 2.0σ) ／ `atr` → `atr` (14, Wilder) ／ `adx` → `adx` `plus_di` `minus_di` (14) ／ `stochastic` → `k` `d` (14/3/3) ／ `ichimoku` → `tenkan` `kijun` `senkou_a` `senkou_b` `chikou` (9/26/52)。**全出力は df と同じ index の `pd.Series`、足りない期間は NaN、`outputs` 宣言必須** |
 | R5 | ichimoku の lookahead 禁止 | 先行スパンは未来へずらさず「現在バー時点で確定した値」を返す。遅行スパンは「現在の終値」をそのまま返す。雲との比較は strategy 側が `shift` で行う旨を docstring に明記 |
 | R6 | 正しさの担保 | 各指標の自己テストに (i) 独立参照実装 (素朴なループ) との一致 (ii) 未来を読んでいないことの検査 (承認 v0.1 の「末尾切り詰め不変」は、設計レビュー r1 I2 を受けて**接頭辞因果性**へ強化した — §6.2。意図 (lookahead 禁止の観測) は不変で、検出力だけを上げる変更) (iii) warmup 期間が NaN (iv) 出力キー集合が `outputs` と完全一致・index 一致・Inf/bool なし。**ゲートとしての一般化 [indicator-reference-oracle-gate] は別束のまま** |
-| R5a (r2 追記) | 新 `rsi` / `adx` の退化時の値 | **値動きが実質ゼロの区間では中立値を返す** (`rsi` → 50、`adx` の `plus_di`/`minus_di` → 0)。判定は相対 ε (`<= 1e-9·|close|`)。**既存 `rsi_indicator` は厳密 `== 0` 判定で「下げが無い → 100」**なので、横ばい相場で両者の値は一致しない。既存は R7 どおり触らないため、**同名の指標が 2 種類ある状態を許容する** (依存する strategy はどちらを宣言したかで挙動が変わる) |
+| R5a (r2 追記) | 新 `rsi` / `adx` の退化時の値 | **値動きが実質ゼロの区間では中立値を返す** (`rsi` → 50、`adx` の `plus_di`/`minus_di` → 0)。判定は相対 ε (`<= 1e-9·|close|`)。**既存 `rsi_indicator` は厳密 `== 0` 判定で「下げが無い → 100」**なので、横ばい相場で両者の値は一致しない。既存は R7 どおり触らないため、**同名の指標が 2 種類ある状態を許容する** (依存する strategy はどちらを宣言したかで挙動が変わる)。**2026-09-19 ユーザー見解: RSI は 0〜100 の指数で 50 が中立点なので、値動きなしで 50 を返す新定義の方が分かりやすい — 新 `rsi` の定義はこのまま進める。** |
 | R7 | 名前 | 短い一般名 (`sma` `ema` `rsi` …)。既存の配備済 `rsi_indicator` / `rsi_wilder` と example の `rsi_indicator` (example 戦略 `rsi_pullback` が依存) は**触らず残す** |
 | R8 | 調整と改造 | 調整 = strategy 側の `indicators.<alias>.params` 上書き (承認不要、[wiring] U3)。改造 = `read_plugin_source` → staging 複製 → **別名** → 承認申請 |
 
@@ -469,6 +469,7 @@ I3 / I4 / I9 は各 plugin の `test_plugin.py` の中 (= bless の pytest ゲ�
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-19 | v1.3a | §0 R5a に**ユーザー見解**を 1 文追記 (0〜100 の尺度では 50 が中立点なので新定義の方が分かりやすい)。**設計変更なし — 既に確定している新 `rsi` の定義の根拠を補強しただけ** | 2026-09-19 ユーザー見解 | — |
 | 2026-09-19 | v1.3 | 設計レビュー r2 の 3 件を全採用 (§8.3 に対応表)。**§3.2** ADX の解析的上界を撤回し上界式を `ema`/`macd`/`atr` に限定、比を取る指標 (`rsi`/`adx`) の退化を実測で再現 (規則なしで Δadx=22.4) して**相対 ε 規則 (1e-9)** を新設、**§3.1/§0 R5a** に既存 `rsi_indicator` との値の差異を明記、**§6 I4** を「固定 fixture の全 160 行の接頭辞一致」へ (主張を狭め + サンプル → 全行、所要 0.53s を実測)、**I9 (入力不変・反復決定性) を新設**、**§6.2 (3)** に観測不能な形の限界、**§6.3** を (A) ゲート前 / (B) ゲート後の 2 系統に分割し収束手段を実コードで確定 (+ I8(c))、**§1** に CLI の `UnresolvedJournalError` 未捕捉の ticket 文案 | codex terra 設計レビュー 2 周目 `tmp/design-indicator-initial-set/codex-design-r2.md` (Critical 0 / Important 3 / Minor 0)、2026-09-19 指揮者裁定で 3 件とも採用 | — |
 | 2026-09-19 | v1.2 | 設計レビュー r1 の 6 件を全採用 (§8.2 に対応表)。**§4** params 検証を「変換」から「型の確認」へ書き換え + helper 骨格 + 例外時 6 経路の振る舞い表、**§6 I4** を末尾切り詰め不変 → **接頭辞因果性**へ置換 (+ §6.2 に壊れた実装 4 種の red 実測)、**§3.2** を解析的上界 + 仕様化データ範囲の 2 段に再構成し **I5** を回帰試験と明記、**§6.3** 部分配備の規則を新設 (+ I8 に再開ケース)、§6.1 の総数 pin 矛盾と §1 の `tests/` 記述を訂正 | codex terra 設計レビュー 1 周目 `tmp/design-indicator-initial-set/codex-design-r1.md` (Critical 0 / Important 4 / Minor 2)、2026-09-19 指揮者裁定で 6 件とも採用 | — |
 | 2026-09-19 | v1.1 | §8.1 裁定結果 D1〜D4 を追記 (いずれも推奨どおり: `y_0 = x_0` / slow stochastic、fast は `k_period: 1` の上書きで得る / 9 名は未配備を確認 / `max_bars` 一律 400) | 指揮者裁定 (可逆な定義選択)。D3 は実 `plugins/` 一覧と実 DB の read-only 確認 | — |
