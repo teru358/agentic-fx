@@ -533,11 +533,17 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
    (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
    ため、呼び出し側が渡す任意の足で使われ得る。
 
-3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
-   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
-   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+3. **`max_bars` は 400。** この指標は**有限の窓しか見ない** (rolling) ので
+   先頭依存そのものは無い — 同じ最終行を出すのに 400 本は要らない。
+   400 に揃えてあるのは、9 本で値を 1 つにするため (設計書 §3.2 / 裁定
+   D4): 指標ごとに散らすと、依存する strategy が小さく宣言したときに
+   「一部の指標だけ静かにずれる」という気づきにくい部分的劣化になる。
+   ただし窓 (下の `params`) より短い履歴では値は NaN のままである。
+   **この indicator に依存する strategy は、自分の `max_bars` を 400 以上
+   に宣言すること** — strategy worker は依存に
    `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
-   渡る履歴が短くなり値がわずかにずれる。
+   渡る履歴が短くなり、窓を満たせない期間は NaN のままになる
+   (rolling の逐次更新に由来する丸めの差もわずかに残る)。
 
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
@@ -935,9 +941,14 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
    (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
    ため、呼び出し側が渡す任意の足で使われ得る。
 
-3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
-   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
-   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+3. **`max_bars` は 400。** この指標は**再帰平滑** (前の行の値を使う) を
+   含むので、履歴の先頭を切ると初期値 (seed) が変わり、その残差が最終行
+   まで残る。再帰が線形なので残差は `|Δseed| × (1−α)^(本数−warmup)` で
+   減衰し、400 本あればこの係数が 1e-13 の桁まで落ちる (設計書 §3.2 の
+   上界式)。残差の大きさは入力の値域に比例するので、**「400 本なら必ず
+   1e-6 以内」という普遍的な保証ではない**。
+   **この indicator に依存する strategy は、自分の `max_bars` を 400 以上
+   に宣言すること** — strategy worker は依存に
    `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
    渡る履歴が短くなり値がわずかにずれる。
 
@@ -1479,9 +1490,15 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
    (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
    ため、呼び出し側が渡す任意の足で使われ得る。
 
-3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
-   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
-   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+3. **`max_bars` は 400。** この指標は平滑量どうしの**比**を取り、その比が
+   非線形な除算を通って次の段へ入る。したがって線形再帰の上界式は
+   **使えず、400 本で一致するという普遍的な保証は書けない**
+   (設計書 §3.2 (i-b))。保証の形は「設計書 §6 I5 が生成式と seed まで
+   仕様化した fixture 集合での受入公差」であって、任意の入力に対する
+   上界ではない。値動きの無い期間で比が退化する件は、下の
+   「値動きの無い期間は中立値を返す」の項 (ε 規則) で扱う。
+   **この indicator に依存する strategy は、自分の `max_bars` を 400 以上
+   に宣言すること** — strategy worker は依存に
    `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
    渡る履歴が短くなり値がわずかにずれる。
 
@@ -1944,9 +1961,14 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
    (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
    ため、呼び出し側が渡す任意の足で使われ得る。
 
-3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
-   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
-   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+3. **`max_bars` は 400。** この指標は**再帰平滑** (前の行の値を使う) を
+   含むので、履歴の先頭を切ると初期値 (seed) が変わり、その残差が最終行
+   まで残る。再帰が線形なので残差は `|Δseed| × (1−α)^(本数−warmup)` で
+   減衰し、400 本あればこの係数が 1e-13 の桁まで落ちる (設計書 §3.2 の
+   上界式)。残差の大きさは入力の値域に比例するので、**「400 本なら必ず
+   1e-6 以内」という普遍的な保証ではない**。
+   **この indicator に依存する strategy は、自分の `max_bars` を 400 以上
+   に宣言すること** — strategy worker は依存に
    `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
    渡る履歴が短くなり値がわずかにずれる。
 
@@ -2398,11 +2420,17 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
    (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
    ため、呼び出し側が渡す任意の足で使われ得る。
 
-3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
-   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
-   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+3. **`max_bars` は 400。** この指標は**有限の窓しか見ない** (rolling) ので
+   先頭依存そのものは無い — 同じ最終行を出すのに 400 本は要らない。
+   400 に揃えてあるのは、9 本で値を 1 つにするため (設計書 §3.2 / 裁定
+   D4): 指標ごとに散らすと、依存する strategy が小さく宣言したときに
+   「一部の指標だけ静かにずれる」という気づきにくい部分的劣化になる。
+   ただし窓 (下の `params`) より短い履歴では値は NaN のままである。
+   **この indicator に依存する strategy は、自分の `max_bars` を 400 以上
+   に宣言すること** — strategy worker は依存に
    `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
-   渡る履歴が短くなり値がわずかにずれる。
+   渡る履歴が短くなり、窓を満たせない期間は NaN のままになる
+   (rolling の逐次更新に由来する丸めの差もわずかに残る)。
 
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
@@ -2834,9 +2862,14 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
    (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
    ため、呼び出し側が渡す任意の足で使われ得る。
 
-3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
-   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
-   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+3. **`max_bars` は 400。** この指標は**再帰平滑** (前の行の値を使う) を
+   含むので、履歴の先頭を切ると初期値 (seed) が変わり、その残差が最終行
+   まで残る。再帰が線形なので残差は `|Δseed| × (1−α)^(本数−warmup)` で
+   減衰し、400 本あればこの係数が 1e-13 の桁まで落ちる (設計書 §3.2 の
+   上界式)。残差の大きさは入力の値域に比例するので、**「400 本なら必ず
+   1e-6 以内」という普遍的な保証ではない**。
+   **この indicator に依存する strategy は、自分の `max_bars` を 400 以上
+   に宣言すること** — strategy worker は依存に
    `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
    渡る履歴が短くなり値がわずかにずれる。
 
@@ -3408,9 +3441,15 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
    (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
    ため、呼び出し側が渡す任意の足で使われ得る。
 
-3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
-   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
-   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+3. **`max_bars` は 400。** この指標は平滑量どうしの**比**を取り、その比が
+   非線形な除算を通って次の段へ入る。したがって線形再帰の上界式は
+   **使えず、400 本で一致するという普遍的な保証は書けない**
+   (設計書 §3.2 (i-b))。保証の形は「設計書 §6 I5 が生成式と seed まで
+   仕様化した fixture 集合での受入公差」であって、任意の入力に対する
+   上界ではない。値動きの無い期間で比が退化する件は、下の
+   「値動きの無い期間は中立値を返す」の項 (ε 規則) で扱う。
+   **この indicator に依存する strategy は、自分の `max_bars` を 400 以上
+   に宣言すること** — strategy worker は依存に
    `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
    渡る履歴が短くなり値がわずかにずれる。
 
@@ -3913,11 +3952,17 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
    (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
    ため、呼び出し側が渡す任意の足で使われ得る。
 
-3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
-   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
-   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+3. **`max_bars` は 400。** この指標は**有限の窓しか見ない** (rolling) ので
+   先頭依存そのものは無い — 同じ最終行を出すのに 400 本は要らない。
+   400 に揃えてあるのは、9 本で値を 1 つにするため (設計書 §3.2 / 裁定
+   D4): 指標ごとに散らすと、依存する strategy が小さく宣言したときに
+   「一部の指標だけ静かにずれる」という気づきにくい部分的劣化になる。
+   ただし窓 (下の `params`) より短い履歴では値は NaN のままである。
+   **この indicator に依存する strategy は、自分の `max_bars` を 400 以上
+   に宣言すること** — strategy worker は依存に
    `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
-   渡る履歴が短くなり値がわずかにずれる。
+   渡る履歴が短くなり、窓を満たせない期間は NaN のままになる
+   (rolling の逐次更新に由来する丸めの差もわずかに残る)。
 
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
@@ -4367,11 +4412,17 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
    (NY 17:00 ロールオーバー) ではない。本 plugin は `timeframe` を宣言しない
    ため、呼び出し側が渡す任意の足で使われ得る。
 
-3. **`max_bars` は 400。** 再帰平滑の初期値依存を 1e-6 未満に抑えるための
-   本数 (設計書 §3.2)。**この indicator に依存する strategy は、自分の
-   `max_bars` を 400 以上に宣言すること** — strategy worker は依存に
+3. **`max_bars` は 400。** この指標は**有限の窓しか見ない** (rolling) ので
+   先頭依存そのものは無い — 同じ最終行を出すのに 400 本は要らない。
+   400 に揃えてあるのは、9 本で値を 1 つにするため (設計書 §3.2 / 裁定
+   D4): 指標ごとに散らすと、依存する strategy が小さく宣言したときに
+   「一部の指標だけ静かにずれる」という気づきにくい部分的劣化になる。
+   ただし窓 (下の `params`) より短い履歴では値は NaN のままである。
+   **この indicator に依存する strategy は、自分の `max_bars` を 400 以上
+   に宣言すること** — strategy worker は依存に
    `df.tail(min(strategy.max_bars, 400))` を渡すので、小さく宣言すると
-   渡る履歴が短くなり値がわずかにずれる。
+   渡る履歴が短くなり、窓を満たせない期間は NaN のままになる
+   (rolling の逐次更新に由来する丸めの差もわずかに残る)。
 
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
@@ -4873,6 +4924,7 @@ I1 は `tests/plugin/test_loader.py::test_discover_sample_plugins_directory_not_
 from __future__ import annotations
 
 import importlib.util
+import re
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -4890,6 +4942,7 @@ from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.plugin_contract import validate_indicator_result
+from agentic_fx.entry import main
 from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.plugin.loader import discover, discover_one_with_reason
 from agentic_fx.plugin.resolve import lock_config, resolve_indicator_deps
@@ -4985,6 +5038,41 @@ def _load_compute(name: str, plugin_py: Path):
     return mod.compute
 
 
+@pytest.fixture(scope="session")
+def examples_copy(tmp_path_factory) -> Path:
+    """`docs/examples/plugins` の **コピー** (session に 1 回)。
+
+    I2 / I5 は `plugin.py` を `exec_module` で実際に import する。素の
+    importlib は **ソースと同じディレクトリに `__pycache__` を書く** ので、
+    repo の `docs/examples/plugins/<名前>/` を直接 import すると
+    `tmp_path` の外の実資源を書き換える経路になる
+    ([[tests-touching-real-repo-resources]])。bytecode を抑止する設定に
+    頼るのではなく、**書き込み先が repo の外になる構造**を採る。
+    `__pycache__` / `.pytest_cache` は複製しない (I8 の `_stage` は逆に
+    **除外しない** — あちらは `cp -r` が巻き込んでも bless が通ることを
+    観測するのが目的)。
+    """
+    dest = tmp_path_factory.mktemp("examples") / "plugins"
+    shutil.copytree(EXAMPLES, dest,
+                    ignore=shutil.ignore_patterns("__pycache__",
+                                                  ".pytest_cache"))
+    return dest
+
+
+def test_loaded_plugins_never_come_from_the_repo_examples_directory(
+        examples_copy):
+    """I2 / I5 が実行する `compute` が **repo の外**から来ていること。
+
+    この pin が無いと `_load_compute` の引数を `meta.path / "plugin.py"`
+    に戻すだけで repo へ bytecode を書く形に静かに戻る (逆変異で実測)。
+    """
+    for meta in _nine_metas():
+        compute = _load_compute(meta.name,
+                                examples_copy / meta.name / "plugin.py")
+        assert not Path(compute.__code__.co_filename).is_relative_to(
+            EXAMPLES), (meta.name, compute.__code__.co_filename)
+
+
 def _df(n: int, *, base: float = 150.0, seed: int = 0) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     sigma = base * 0.002
@@ -4998,24 +5086,25 @@ def _df(n: int, *, base: float = 150.0, seed: int = 0) -> pd.DataFrame:
 
 # --- I2: validator を直接通す ------------------------------------------------
 
-def test_all_nine_pass_the_indicator_validator():
+def test_all_nine_pass_the_indicator_validator(examples_copy):
     """I2: 9 本の戻り値が `validate_indicator_result` を通る
     (キー集合完全一致 / index 一致 / Inf 不在)。
 
     **`docs/examples/plugins/` 配下で pytest を回さないこと** —
     `.pytest_cache` は `.gitignore` に無く、`tests/conftest.py` の
-    untracked ガードに当たる。ここは `importlib` でロードするだけなので
-    `__pycache__` (gitignore 済) しか作らない。
+    untracked ガードに当たる。import も repo では行わない
+    (`examples_copy` の注記)。
     """
     df = _df(300)
     for meta in _nine_metas():
-        compute = _load_compute(meta.name, meta.path / "plugin.py")
+        compute = _load_compute(meta.name,
+                                examples_copy / meta.name / "plugin.py")
         out = compute(df, dict(meta.params))
         validate_indicator_result(out, df_index=df.index,
                                   outputs=meta.outputs)
 
 
-def test_declared_params_match_each_plugins_own_defaults():
+def test_declared_params_match_each_plugins_own_defaults(examples_copy):
     """`config.yaml` の `params` が `plugin.py` の既定値と一致していること。
 
     **どちらのテストも片側しか見ていなかった**: 9 本の自己テストは
@@ -5030,7 +5119,8 @@ def test_declared_params_match_each_plugins_own_defaults():
     """
     df = _df(300)
     for meta in _nine_metas():
-        compute = _load_compute(meta.name, meta.path / "plugin.py")
+        compute = _load_compute(meta.name,
+                                examples_copy / meta.name / "plugin.py")
         declared = compute(df, dict(meta.params))
         builtin = compute(df, {})
         for key in meta.outputs:
@@ -5050,6 +5140,30 @@ def _spike_df(n=5000, base=150.0, spike=0.0, seed=1):
     close = base + np.cumsum(rng.normal(0.0, sigma, n))
     if spike:
         close[n - 401] += spike
+    high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
+    low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    index = pd.date_range("2020-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame({"open": open_, "high": high, "low": low,
+                         "close": close, "volume": np.ones(n)}, index=index)
+
+
+def _trend_df(n=5000, base=150.0, direction=1, noise=True, seed=2):
+    """設計書 §6 I5 の fixture ②「明確な単調トレンド」の生成式 (逐語)。
+
+    `drift = 基準価格 × 1e-4` / 本 — `n=5000` で基準価格の ±50% を動く
+    (150 → 225 / 75)。**下降でも価格が 0 を跨がない**幅にしてある
+    (跨ぐと `1e-9 × 基準価格` の絶対公差と `rsi` の相対 ε 基準
+    (`<= 1e-9·|close|`) の意味がどちらも壊れる)。
+    `noise=True` は drift + §6 I5 のランダムウォーク項、`noise=False` は
+    **close が厳密に単調** (high / low の揺らぎだけ残す) — 後者は `rsi` を
+    ε 規則②に突き当てる (上昇で 100.0、下降で 0.0 に張り付く)。
+    """
+    rng = np.random.default_rng(seed)
+    sigma = base * 0.002
+    drift = base * 1e-4
+    walk = np.cumsum(rng.normal(0.0, sigma, n)) if noise else np.zeros(n)
+    close = base + direction * drift * np.arange(n) + walk
     high = close + np.abs(rng.normal(0.0, sigma / 2.0, n))
     low = close - np.abs(rng.normal(0.0, sigma / 2.0, n))
     open_ = np.concatenate([[close[0]], close[:-1]])
@@ -5081,7 +5195,7 @@ def _degenerate_df(n_pre=200, n_flat=400, base=150.0, spike=1.0, seed=0):
                         index=index)
 
 
-def _last_row_deltas(df: pd.DataFrame) -> dict:
+def _last_row_deltas(df: pd.DataFrame, examples_copy: Path) -> dict:
     """全 9 本について「**その plugin が宣言した `max_bars`** 本だけで計算した
     最終行」と「全 `len(df)` 本で計算した最終行」の差の絶対値を
     `{"<plugin 名>.<出力キー>": 値}` で返す。
@@ -5097,7 +5211,8 @@ def _last_row_deltas(df: pd.DataFrame) -> dict:
     """
     out: dict[str, float] = {}
     for meta in _nine_metas():
-        compute = _load_compute(meta.name, meta.path / "plugin.py")
+        compute = _load_compute(meta.name,
+                                examples_copy / meta.name / "plugin.py")
         tail = df.tail(meta.max_bars).copy(deep=True)
         full_res = compute(df, dict(meta.params))
         tail_res = compute(tail, dict(meta.params))
@@ -5110,14 +5225,15 @@ def _last_row_deltas(df: pd.DataFrame) -> dict:
     return out
 
 
-def test_head_dependence_within_tolerance_on_random_walks():
+def test_head_dependence_within_tolerance_on_random_walks(examples_copy):
     """I5 (ランダムウォーク): 4 値域 × seed 0〜7。
     0〜100 スケールは `< 1e-6`、価格スケールは `< 1e-9 * 基準価格`。
     指揮者の実測: 全キーの最大誤差 **3.104e-10 / 違反 0**。"""
     worst = 0.0
     for base in (0.5, 1.5, 150.0, 300.0):
         for seed in range(8):
-            deltas = _last_row_deltas(_spike_df(base=base, seed=seed))
+            deltas = _last_row_deltas(_spike_df(base=base, seed=seed),
+                                      examples_copy)
             for key, delta in deltas.items():
                 tol = _tolerance(key, base)
                 assert delta < tol, (base, seed, key, delta, tol)
@@ -5125,18 +5241,46 @@ def test_head_dependence_within_tolerance_on_random_walks():
     assert worst < 1e-6, worst
 
 
-def test_head_dependence_on_the_spike_fixture():
+def test_head_dependence_on_the_spike_fixture(examples_copy):
     """I5 (スパイク): 401 本目に基準価格の 60% (= +90) を置く。
     公差は上と同じ。指揮者の実測 (参考): `rsi` 1.42e-10 / `adx` 3.40e-09 /
     `macd` 2.56e-13 / `atr` 1.79e-12。"""
     base = 150.0
-    deltas = _last_row_deltas(_spike_df(base=base, spike=base * 0.6, seed=1))
+    deltas = _last_row_deltas(_spike_df(base=base, spike=base * 0.6, seed=1),
+                              examples_copy)
     for key, delta in deltas.items():
         tol = _tolerance(key, base)
         assert delta < tol, (key, delta, tol)
 
 
-def test_head_dependence_on_the_degenerate_fixture():
+def test_head_dependence_on_monotonic_trends(examples_copy):
+    """I5 (単調トレンド): 設計書 §6 I5 の fixture ② — **ランダムウォークでは
+    出ない「持続的な一方向の drift」での先頭依存**を見る。公差はランダム
+    ウォークと同じキー別の表。
+
+    4 象限 × 2 値域 = 8 系列: 上昇 / 下降 × `noise=True` (drift + 揺らぎ) /
+    `noise=False` (close が厳密に単調) × 基準価格 1.5 / 150。
+
+    指揮者の実測 (公差に対する最大比は `bollinger.upper` / `lower` の
+    **0.4%**): `rsi` は `noise=True` で 1.01e-11、`noise=False` では
+    **厳密に 0.0** (ε 規則②で 100.0 / 0.0 に張り付くため両側が一致する)。
+    `adx` は 1.5e-11 〜 1.4e-10。**`noise=False` でも `adx` は飽和しない**
+    (high / low の揺らぎが ±DM を両方立てるので、実測で +DI 25.4 / −DI 13.4
+    / ADX 22.3、下降で +DI 18.4 / −DI 21.4 / ADX 26.4)。
+    """
+    for noise in (True, False):
+        for direction in (1, -1):
+            for base in (1.5, 150.0):
+                deltas = _last_row_deltas(
+                    _trend_df(base=base, direction=direction, noise=noise),
+                    examples_copy)
+                for key, delta in deltas.items():
+                    tol = _tolerance(key, base)
+                    assert delta < tol, (noise, direction, base, key,
+                                         delta, tol)
+
+
+def test_head_dependence_on_the_degenerate_fixture(examples_copy):
     """I5 (退化): 設計書 §3.2 (i-b) の反例。**公差はランダムウォークの表では
     なく §3.2 (i-b) の `1e-4` を全キーに適用する** — この fixture は
     `bollinger` の `upper` / `lower` に **1.08e-06** を出し、価格スケールの
@@ -5146,7 +5290,7 @@ def test_head_dependence_on_the_degenerate_fixture():
     比を取る指標 (`rsi` / `plus_di` / `minus_di`) と rolling の有限記憶
     (`k` / `d`) は**厳密に 0** になることを個別に pin する — ここが
     `EPS` 規則の唯一の観測点。"""
-    deltas = _last_row_deltas(_degenerate_df())
+    deltas = _last_row_deltas(_degenerate_df(), examples_copy)
     for key, delta in deltas.items():
         assert delta < 1e-4, (key, delta)
     for key in ("rsi.rsi", "adx.plus_di", "adx.minus_di",
@@ -5503,6 +5647,147 @@ def test_runbook_post_gate_failure_converges_via_approval_retry(tmp_path,
     detail = cmds.dispatch(f"approval {second_id}")
     assert "dependent_pinned_here=" in detail
     assert "dependent_pinned_elsewhere=" in detail
+
+
+# --- I8: runbook の CLI 境界 (`afx plugin bless <名前> --from _human`) --------
+
+def _cli_env(tmp_path: Path) -> Path:
+    """`afx` の CLI が要求する形の tmp root を作って返す。
+
+    `backtest/cli.py:dispatch` は root を `Path.cwd()` として受け取り
+    (`entry.py:23`)、**`ensure_initialized(root)`** (`service.py:75-79`、
+    `data/state/app_state.json` の `initialized`) と
+    **`config/settings.yaml`**、**`data/agentic.db`** を見る。上の
+    `_bless_env` は DB を `root/agentic.db` に置くので**混ぜない** — CLI 用は
+    このビルダで別に作る。
+
+    `ensure_initialized` を monkeypatch で潰さない (`tests/backtest/test_cli.py`
+    は潰している) — ここで観測したいのは「runbook の人間が打つコマンドが
+    そのまま通ること」なので、初期化済みの状態も実物で用意する。
+    `settings.yaml.example` は `SETTINGS_FIXTURE` の生成元そのもの
+    (`tests/fixtures/wiring_envs.py:24`) なので `plugin.*` の値は上の
+    テスト群と同じ。
+    """
+    (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+    shutil.copy(_REPO / "config" / "settings.yaml.example",
+                tmp_path / "config" / "settings.yaml")
+    (tmp_path / "data" / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    (tmp_path / "plugins" / "_human").mkdir(parents=True, exist_ok=True)
+    StateStore(tmp_path / "data" / "state" / "app_state.json").update(
+        initialized=True)
+    conn = db_store.connect(tmp_path / "data" / "agentic.db")
+    db_store.init_db(conn)
+    conn.close()
+    return tmp_path
+
+
+@pytest.mark.slow
+def test_runbook_cli_bless_succeeds_and_prints_approval_id(
+        tmp_path, monkeypatch, capsys):
+    """I8 (CLI 正常系): runbook 手順 (2) の
+    `afx plugin bless <名前> --from _human` を **CLI の入口から**実行し、
+    rc=0 と stdout の `approval id=<N>` を観測する。
+
+    `entry.main` を **in-process** で呼ぶ (`tests/backtest/test_cli.py` の流儀)。
+    subprocess にしないのは、(a) `main` が argparse → `dispatch` →
+    `_plugin_bless` の CLI 境界そのものであり rc / stdout / stderr が
+    同じであること、(b) 下の (B) が `record_version` の monkeypatch を
+    同一プロセスに載せる必要があること、の 2 点による。
+    `pyproject.toml:28` の `afx = "agentic_fx.entry:main"` が runbook の
+    `afx ...` と同じ入口。
+    """
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+
+    rc = main(["plugin", "bless", "sma", "--from", "_human"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert re.search(r"^approval id=\d+$", out, re.M), out
+    assert (root / "plugins" / "sma").is_symlink()
+
+
+@pytest.mark.slow
+def test_runbook_cli_bless_gate_failure_exits_1_with_error_on_stderr(
+        tmp_path, monkeypatch, capsys):
+    """I8 (CLI ゲート失敗、設計書 §6.3 (A)): 候補の `test_plugin.py` を壊すと
+    `bless_candidate` が `ValueError` を投げ、`_plugin_bless` の
+    `except (ValueError, SandboxError)` (`backtest/cli.py:591-593`) が
+    **rc=1 + stderr の `エラー: `** に写像する。承認行も symlink も残らない。
+    """
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    dest = root / "plugins" / "_human" / "sma"
+    shutil.copytree(EXAMPLES / "sma", dest)
+    (dest / "test_plugin.py").write_text(
+        "def test_broken():\n    assert False\n")
+
+    rc = main(["plugin", "bless", "sma", "--from", "_human"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "エラー: " in captured.err, captured.err
+    assert "failed pytest gate" in captured.err, captured.err
+    assert not (root / "plugins" / "sma").exists()
+    conn = db_store.connect(root / "data" / "agentic.db")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM approval_requests").fetchone()["c"] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.slow
+def test_runbook_cli_bless_after_post_gate_failure_raises_traceback(
+        tmp_path, monkeypatch, capsys):
+    """I8 (CLI ゲート後失敗、設計書 §6.3 (B)): 未終端 journal が残った状態で
+    同名を再 bless すると、CLI から **`UnresolvedJournalError` が素通りして
+    traceback になる** ([[cli-bless-unresolved-journal]])。
+
+    **これは「現状をそのまま pin する」テストであり、望ましい姿ではない** —
+    `UnresolvedJournalError` は `Exception` 直下 (`switch.py:1572`) なので
+    `_plugin_bless` の `except (ValueError, SandboxError)` にも
+    `dispatch` の `except (ValueError, KeyError, OSError, sqlite3.Error, ...)`
+    にも掛からない。ticket [cli-bless-unresolved-journal] が直ったら
+    (rc=1 + 収束手順の案内を stderr に出す形になるはず)、**このテストは
+    その新しい振る舞いへ書き換える**こと。
+
+    1 回目の失敗注入 (`record_version` の `OSError`) は逆に
+    `dispatch` の `except OSError` に**捕まる**ので rc=1 になる — 同じ
+    §6.3 (B) でも CLI から見える形が 1 回目と 2 回目で違うことを両方観測する。
+    """
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+
+    real_record = plugin_switch.history_git.record_version
+    calls = {"n": 0}
+
+    def _fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("injected: after version dir, before symlink switch")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(plugin_switch.history_git, "record_version",
+                        _fail_once)
+
+    rc = main(["plugin", "bless", "sma", "--from", "_human"])
+    assert rc == 1
+    assert "injected" in capsys.readouterr().err
+
+    conn = db_store.connect(root / "data" / "agentic.db")
+    try:
+        open_journal = journal_store.get_open_by_name(conn, "sma")
+        assert open_journal is not None and open_journal["phase"] == "versioned"
+    finally:
+        conn.close()
+
+    with pytest.raises(plugin_switch.UnresolvedJournalError) as excinfo:
+        main(["plugin", "bless", "sma", "--from", "_human"])
+    assert f"op_id={open_journal['op_id']}" in str(excinfo.value)
 ```
 
 **転写後の自己検証** (プラン規約):
