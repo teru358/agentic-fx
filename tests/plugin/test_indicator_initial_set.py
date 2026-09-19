@@ -904,7 +904,32 @@ def test_runbook_cli_bless_succeeds_and_prints_approval_id(
     assert rc == 0
     out = capsys.readouterr().out
     assert re.search(r"^approval id=\d+$", out, re.M), out
-    assert (root / "plugins" / "sma").is_symlink()
+
+    # **「symlink がある」だけでは足りない (r2 codex C3)** — 壊れた target を
+    # 指していても通ってしまう。runbook の bless 成功は「live artifact が
+    # 配備されたこと」なので、target の形 / 解決先の実在 / inventory から
+    # metadata が引けることまで見る。target は相対 `.versions/<名前>/<hash>`
+    # (`switch.py:1218-1219`)。
+    live = root / "plugins" / "sma"
+    assert live.is_symlink()
+    target = live.readlink()
+    assert target.parts[:2] == (".versions", "sma"), target
+    assert len(target.parts) == 3, target
+    assert re.fullmatch(r"[0-9a-f]{8,}", target.parts[2]), target
+    resolved = (root / "plugins" / target).resolve()
+    assert resolved.is_dir(), resolved
+    assert (resolved / "plugin.py").is_file(), resolved
+    assert (live / "config.yaml").is_file(), live
+
+    conn = db_store.connect(root / "data" / "agentic.db")
+    try:
+        inv = plugin_loader.approved_plugins(
+            conn, root / "plugins", settings=SETTINGS).inventory
+    finally:
+        conn.close()
+    sma = inv.by_name("sma")
+    assert sma is not None and sma.kind == "indicator", sma
+    assert tuple(sma.outputs) == ("value",), sma.outputs
 
 
 @pytest.mark.slow
