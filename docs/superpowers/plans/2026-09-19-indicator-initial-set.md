@@ -4991,9 +4991,33 @@ DELTA_KEYS = frozenset(
 
 
 def _tolerance(delta_key: str, base: float) -> float:
-    """`<plugin 名>.<出力キー>` の出力キー側で値域を引く (設計書 §6 I5)。"""
-    return (1e-6 if delta_key.split(".", 1)[1] in PCT_KEYS
-            else 1e-9 * base)
+    """`<plugin 名>.<出力キー>` の出力キー側で値域を引く (設計書 §6 I5)。
+
+    **どちらにも属さないキーは黙って価格スケール扱いにせず落とす**
+    (/code-review #6)。`PRICE_KEYS` は定義だけされて誰も読んでいなかったので、
+    新しい出力キーが足されたときに公差の分類漏れが `1e-9 * base` の
+    フォールバックで静かに通ってしまう形だった。20 系列の全キーが 2 つの
+    集合のどちらかに属することは `test_every_delta_key_is_classified` が
+    独立に pin する。
+    """
+    key = delta_key.split(".", 1)[1]
+    assert key in PCT_KEYS or key in PRICE_KEYS, delta_key
+    return 1e-6 if key in PCT_KEYS else 1e-9 * base
+
+
+def test_every_delta_key_is_classified():
+    """I5 が観測する 20 系列の出力キーが、`PCT_KEYS` と `PRICE_KEYS` の
+    **どちらか一方**に属すること (/code-review #6)。
+
+    `_tolerance` の assert は「その呼び出しで使われたキー」しか見ないので、
+    `DELTA_KEYS` 側だけを増やして分類を忘れた場合の観測点をここに置く。
+    2 集合が交わらないことも同時に見る — 交わると `_tolerance` の分岐が
+    `PCT_KEYS` 優先で静かに片方を選ぶ。
+    """
+    keys = {k.split(".", 1)[1] for k in DELTA_KEYS}
+    assert not (PCT_KEYS & PRICE_KEYS), sorted(PCT_KEYS & PRICE_KEYS)
+    assert keys <= (PCT_KEYS | PRICE_KEYS), sorted(keys - PCT_KEYS
+                                                   - PRICE_KEYS)
 
 
 # --- I5 の前提: 宣言 `max_bars` ---------------------------------------------
