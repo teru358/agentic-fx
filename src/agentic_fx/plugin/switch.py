@@ -195,6 +195,44 @@ def _revert_one(conn: sqlite3.Connection, row: dict, *, plugins_root: Path,
                        f"name={row['name']} op_id={row['op_id']}")
 
 
+def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Path,
+                       now: datetime, activity: "ActivityLog | None",
+                       expect_class: str | None) -> bool:
+    """[switch-ops-hardening] T4 (設計書 §3.3.2): 巻き戻しは必ず
+    (1) name lock を取り (2) `op_id` で journal 行を取り直し (3) (分類を使う枝なら)
+    live を読み直して分類をやり直し、(4) すべて一致したときだけ `_revert_one` する。
+
+    lock を取るだけでは足りない — lock 待ちの間に別プロセスの `approval retry` が
+    同じ行を畳んで配備を完了していると、手元の古い行で live を巻き戻して
+    「approved だが未配備」を作ってしまう (r1 Critical 1、probe で実測)。
+
+    `expect_class=None` は `force_revert_op_id` 経路 — 「phase に依らず巻き戻す
+    割込」という既存の意味論を保つため、**行の再取得だけ**を行い分類は見ない。"""
+    with _plugin_lock(plugins_root, row["name"]):
+        fresh = journal_store.get(conn, row["op_id"])
+        phase_now = fresh["phase"] if fresh is not None else None
+        if fresh is None or phase_now in _TERMINAL_PHASES or phase_now != row["phase"]:
+            if activity is not None:
+                activity.write(
+                    Category.APPROVAL, "switch_reconcile_skipped_stale_row",
+                    f"name={row['name']} op_id={row['op_id']} "
+                    f"phase_before={row['phase']} phase_now={phase_now}")
+            return False
+        if expect_class is not None:
+            class_now = classify_live(plugins_root, fresh)
+            if class_now != expect_class:
+                if activity is not None:
+                    activity.write(
+                        Category.APPROVAL, "switch_reconcile_skipped_stale_row",
+                        f"name={row['name']} op_id={row['op_id']} "
+                        f"phase_before={row['phase']} phase_now={phase_now} "
+                        f"class_before={expect_class} class_now={class_now}")
+                return False
+        _revert_one(conn, fresh, plugins_root=plugins_root, now=now, activity=activity)
+        conn.commit()
+        return True
+
+
 def reconcile_switch_journals(conn: sqlite3.Connection, *,
                               plugins_root: Path, now: datetime,
                               settings,
@@ -225,8 +263,10 @@ def reconcile_switch_journals(conn: sqlite3.Connection, *,
                 # 割込操作の巻き戻しは収束規則より優先する (B-3)。phase が
                 # switched でなくても _revert_one は非 FS 操作 (phase="reverted"
                 # への書き換えのみ) に閉じるので安全。
-                _revert_one(conn, row, plugins_root=plugins_root, now=now, activity=activity)
-                conn.commit()
+                # [switch-ops-hardening] T4: lock + 行の再取得を通す
+                # (分類の一致は求めない — 割込の意味論を保つ、§3.3.3)。
+                _revert_under_lock(conn, row, plugins_root=plugins_root, now=now,
+                                  activity=activity, expect_class=None)
                 continue
             if row["phase"] != "switched":
                 # preparing/versioned/recorded: 「同じ操作の再試行」は 11d の
@@ -235,11 +275,9 @@ def reconcile_switch_journals(conn: sqlite3.Connection, *,
                 # まだ無いので触らずスキップ — 実際の完了は次回の approve/
                 # approval retry が担う (§5.1-1 (a))。
                 continue
-            live = plugins_root / row["name"]
-            live_target = live.readlink().as_posix() if live.is_symlink() else None
-            new_norm = row["new_target"]
-            old_norm = row["old_target"]
-            if live_target == new_norm:
+            # [switch-ops-hardening] T1: 分類は 1 つの関数に寄せる (§3.1)。
+            live_class = classify_live(plugins_root, row)
+            if live_class == "switched":
                 # [indicator-consumption-wiring] §2.4 (codex r5 I3):
                 # switched (symlink 切替済・DB decided 前) のまま停止し、
                 # 再起動までに indicator が更新されて pin が破れた場合、
@@ -254,9 +292,10 @@ def reconcile_switch_journals(conn: sqlite3.Connection, *,
                     conn, row, plugins_root=plugins_root, settings=settings)
                 if unresolved is not None:
                     alias, reason = unresolved
-                    _revert_one(conn, row, plugins_root=plugins_root, now=now,
-                               activity=activity)
-                    conn.commit()
+                    if not _revert_under_lock(
+                            conn, row, plugins_root=plugins_root, now=now,
+                            activity=activity, expect_class="switched"):
+                        continue  # stale — 次回の reconcile が再評価する
                     if activity is not None:
                         # Global Constraints の固定文言 (逐語):
                         # `switch_reverted reason=indicator_unresolved
@@ -275,9 +314,9 @@ def reconcile_switch_journals(conn: sqlite3.Connection, *,
                 retry_approval(conn, row["approval_id"], decided_by="system_reconcile",
                                 now=now, plugins_root=plugins_root, settings=settings,
                                 activity=activity)
-            elif live_target == old_norm or (row["old_kind"] == "absent" and live_target is None):
-                _revert_one(conn, row, plugins_root=plugins_root, now=now, activity=activity)
-                conn.commit()
+            elif live_class == "not_switched":
+                _revert_under_lock(conn, row, plugins_root=plugins_root, now=now,
+                                  activity=activity, expect_class="not_switched")
             else:
                 # 第三者に触られた — activity ERROR、人間待ち。触らない。
                 # B-2: journal_store 層に activity を書かせない (層違反) —

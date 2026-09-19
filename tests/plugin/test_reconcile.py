@@ -473,4 +473,8 @@ def test_reconcile_resolution_holds_the_dependency_locks(tmp_path, monkeypatch):
         conn, plugins_root=plugins_root, now=fx.NOW, settings=SETTINGS,
         activity=activity)
 
-    assert acquired == sorted({"rsi_pullback", "rsi"})
+    # [switch-ops-hardening] T4: pin 破れの巻き戻しも name lock の内側で
+    # 行うようになった (§3.3.3 の 3 箇所目) ため、解決時の 2 本に続いて
+    # **巻き戻しの 1 本**が増える。この pin の主旨 (解決が依存 lock の
+    # 内側であること) は不変で、増えた 1 本は巻き戻し専用。
+    assert acquired == [*sorted({"rsi_pullback", "rsi"}), "rsi_pullback"]

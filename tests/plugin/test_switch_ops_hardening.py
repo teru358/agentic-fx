@@ -32,7 +32,6 @@ _DB = "data/agentic.db"
 
 # ---------------------------------------------------------------- helpers
 
-
 def _cli_env(tmp_path: Path) -> Path:
     (tmp_path / "config").mkdir(parents=True, exist_ok=True)
     shutil.copy(_REPO / "config" / "settings.yaml.example",
@@ -92,6 +91,8 @@ def _activity_text(root) -> str:
     return p.read_text(encoding="utf-8") if p.exists() else ""
 
 
+# ---------------------------------------------------------------- AC-1 / 6 / 7 / 8
+
 @pytest.mark.slow
 def test_ac1_retry_of_switched_but_unswitched_deploys(tmp_path, monkeypatch):
     """AC-1 / AC-6: 切替が失敗して journal だけ `switched` になった行を
@@ -117,6 +118,21 @@ def test_ac1_retry_of_switched_but_unswitched_deploys(tmp_path, monkeypatch):
     assert outcome.rolled_back_op_id == row["op_id"]
     assert outcome.target == live.readlink().as_posix()
     assert outcome.status == "approved"
+
+
+@pytest.mark.slow
+def test_ac2_reconcile_on_same_row_reverts_and_keeps_pending(tmp_path, monkeypatch):
+    """AC-2: 同じ状態に起動時 reconcile を掛けると `reverted` + `pending`
+    (**現行と同じ = 無人経路は前に進めない**)。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=NOW, settings=SETTINGS)
+
+    assert _rows(conn) == [(row["op_id"], "reverted")]
+    assert _status(conn, row["approval_id"]) == "pending"
+    assert not (plugins_root / "sma").exists()
 
 
 @pytest.mark.slow
@@ -155,6 +171,8 @@ def test_ac8_retry_after_success_is_noop(tmp_path, monkeypatch):
     assert _rows(conn) == before_rows
     assert (plugins_root / "sma").readlink() == before_link
 
+
+# ---------------------------------------------------------------- AC-3 (foreign)
 
 def _make_foreign(root, row):
     plugins_root = root / "plugins"
@@ -196,6 +214,172 @@ def _activity(root):
     from agentic_fx.activity import ActivityLog
     return ActivityLog(root / "logs" / "activity.log")
 
+
+# ---------------------------------------------------------------- AC-9 (lock / stale row)
+
+@pytest.mark.slow
+def test_ac9a_reconcile_revert_holds_the_plugin_lock(tmp_path, monkeypatch):
+    """AC-9a: reconcile の巻き戻しは `plugins/.locks/<name>.lock` の内側。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    import contextlib as _ctx
+    real = plugin_switch._plugin_lock
+    held = []
+
+    @_ctx.contextmanager
+    def _spy(rt, name):
+        with real(rt, name):
+            held.append((name, plugin_switch.journal_store.get(conn, row["op_id"])["phase"]))
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=NOW, settings=SETTINGS)
+    assert held == [("sma", "switched")], "巻き戻しは lock の内側で行われていない"
+
+
+@pytest.mark.slow
+def test_ac9b_i_stale_row_both_changed(tmp_path, monkeypatch):
+    """AC-9b-i: lock 待ちの間に競合者が畳んで配備まで完了した場合、
+    reconcile は **何もしない** (live は new のまま、approval は approved)。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    done = threading.Event()
+
+    def _competitor():
+        c2 = db_store.connect(root / _DB)
+        try:
+            plugin_switch.retry_approval(
+                c2, row["approval_id"], decided_by="competitor", now=NOW,
+                plugins_root=plugins_root, settings=SETTINGS)
+        finally:
+            c2.close()
+            done.set()
+
+    import contextlib as _ctx
+    real = plugin_switch._plugin_lock
+    fired = {"n": 0}
+
+    @_ctx.contextmanager
+    def _seam(rt, name):
+        # **lock を取る直前**に競合者を走らせ、終わる (= lock を解放する) まで待つ。
+        if fired["n"] == 0:
+            fired["n"] = 1
+            th = threading.Thread(target=_competitor, daemon=True)
+            th.start()
+            assert done.wait(timeout=30), "競合者が 30 秒で終わらない (deadlock)"
+            th.join(timeout=30)
+        with real(rt, name):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _seam)
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=NOW, settings=SETTINGS,
+        activity=_activity(root))
+
+    live = plugins_root / "sma"
+    assert live.is_symlink(), "stale 行で巻き戻され、配備が消えた (IV-3 の破れ)"
+    assert _status(conn, row["approval_id"]) == "approved"
+    rows = _rows(conn)
+    assert rows[0] == (row["op_id"], "reverted") and rows[1][1] == "decided"
+    assert "switch_reconcile_skipped_stale_row" in _activity_text(root)
+
+
+@pytest.mark.slow
+def test_ac9b_ii_live_changed_phase_same(tmp_path, monkeypatch):
+    """AC-9b-ii: phase は `switched` のまま live だけ第三者が張り替えた場合
+    (**分類の再確認**だけが検出できる)。live は触られない。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    import contextlib as _ctx
+    real = plugin_switch._plugin_lock
+    fired = {"n": 0}
+
+    @_ctx.contextmanager
+    def _seam(rt, name):
+        if fired["n"] == 0:
+            fired["n"] = 1
+            _make_foreign(root, row)  # phase は変えない
+        with real(rt, name):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _seam)
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=NOW, settings=SETTINGS,
+        activity=_activity(root))
+
+    assert (plugins_root / "sma").is_symlink(), "第三者の symlink を消してはならない"
+    assert (plugins_root / "sma").readlink().as_posix().endswith("f" * 64)
+    assert _rows(conn) == [(row["op_id"], "switched")]
+    text = _activity_text(root)
+    assert "switch_reconcile_skipped_stale_row" in text
+    assert "class_now=foreign" in text
+
+
+@pytest.mark.slow
+def test_ac9b_iii_phase_changed_live_same(tmp_path, monkeypatch):
+    """AC-9b-iii: live の分類は同じまま phase だけ終端化した場合
+    (**行の再取得**だけが検出できる)。終端行に二重の巻き戻しを記録しない。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    import contextlib as _ctx
+    real = plugin_switch._plugin_lock
+    fired = {"n": 0}
+
+    @_ctx.contextmanager
+    def _seam(rt, name):
+        if fired["n"] == 0:
+            fired["n"] = 1
+            c2 = db_store.connect(root / _DB)
+            try:  # 競合者は巻き戻しだけして配備に進まない
+                plugin_switch._revert_one(
+                    c2, journal_store.get(c2, row["op_id"]),
+                    plugins_root=plugins_root, now=NOW)
+                c2.commit()
+            finally:
+                c2.close()
+        with real(rt, name):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _seam)
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=NOW, settings=SETTINGS,
+        activity=_activity(root))
+
+    assert _rows(conn) == [(row["op_id"], "reverted")]
+    text = _activity_text(root)
+    assert "switch_reconcile_skipped_stale_row" in text
+    # 競合者は activity を渡していないので、**正しい実装なら
+    # `switch_reverted` は 1 行も出ない**。行の再取得を落とすと reconcile が
+    # 終端行に対して `_revert_one` を再実行し、この行が 1 本出て red になる。
+    assert "switch_reverted" not in text, "終端行への二重の巻き戻し記録"
+
+
+@pytest.mark.slow
+def test_ac9c_force_revert_takes_the_lock_and_refetches(tmp_path, monkeypatch):
+    """AC-9c: `force_revert_op_id` も lock + 行の再取得を通る
+    (**分類の一致は求めない** — phase 無視の割込という既存の意味論)。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    import contextlib as _ctx
+    real = plugin_switch._plugin_lock
+    held = []
+
+    @_ctx.contextmanager
+    def _spy(rt, name):
+        held.append(name)
+        with real(rt, name):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=NOW, settings=SETTINGS,
+        force_revert_op_id=row["op_id"])
+    assert held == ["sma"]
+    assert _rows(conn) == [(row["op_id"], "reverted")]
+
+
+# ---------------------------------------------------------------- AC-16 (2 段ガード)
 
 @pytest.mark.slow
 def test_ac16a_entry_guard_refuses_terminal_row_before_touching_fs(tmp_path, monkeypatch):
@@ -258,6 +442,8 @@ def test_ac16b_switch_required_zero_reaches_decided(tmp_path, monkeypatch):
     assert [ph for _op, ph in _rows(conn)] == ["decided", "decided"]
     conn.close()
 
+
+# ---------------------------------------------------------------- AC-14d (網羅性)
 
 def test_ac14d_no_bare_return_in_approval_entrypoints():
     """AC-14d(1): `approve_candidate` / `retry_approval` の**関数本体**に
