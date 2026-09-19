@@ -767,7 +767,8 @@ def test_discover_sample_plugins_directory_not_rejected():
                   / "plugins")
     metas = discover(samples_dir)
     names = {m.name for m in metas}
-    assert {"rsi_indicator", "sma_cross"} <= names
+    assert {"rsi_indicator", "sma_cross", "sma", "ema", "rsi", "macd",
+            "bollinger", "atr", "adx", "stochastic", "ichimoku"} <= names
 
 
 def test_discover_rejects_version_dir_with_mismatched_artifact_hash(tmp_path):
