@@ -306,6 +306,43 @@ def test_eps_rule_does_not_fire_on_ordinary_data():
     assert float(out["minus_di"].iloc[-1]) > 0.0
 
 
+def _symmetric_expansion_df(n: int = 60, price: float = 150.0,
+                            step: float = 0.01) -> pd.DataFrame:
+    """毎バー high が `+step`・low が `-step` で対称に広がる (close は不動)。
+
+    すべての行で `up_move == down_move == step > 0` の**同着**になる。Wilder の
+    規則は「同着なら +DM も -DM も 0」なので `plus_di == minus_di == 0`、
+    したがって `dx = 0` / `adx = 0` になる。
+
+    **`atr` は 0.94 まで育つので ε 規則 (`atr <= EPS*|close|` = 1.5e-07) は
+    発火しない** — この pin は退化規則の言い換えではなく、同着規則そのものを
+    見ている (恒真ではないことを段 0 で実測)。
+    """
+    high = np.array([price + step * (i + 1) for i in range(n)])
+    low = np.array([price - step * (i + 1) for i in range(n)])
+    close = np.full(n, price)
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": close, "high": high, "low": low, "close": close,
+         "volume": np.ones(n)}, index=index)
+
+
+def test_equal_up_and_down_move_yields_no_directional_movement():
+    """`up_move == down_move` の同着では +DM / -DM とも 0 (Wilder の規則)。
+
+    比較を `>` から `>=` に緩めると**同着ぶんが片側へ丸ごと入る**:
+    段 0 の実測で `plus_dm` 側を `>=` にすると `plus_di` が 0.0 -> 1.0598、
+    `adx` が 0.0 -> **100.0** (「方向性なし」が「最強のトレンド」に化ける)。
+    `minus_dm` 側を `>=` にすると対称に `minus_di` が 1.0598 / `adx` 100.0。
+    ランダムウォークの fixture では同着が測度 0 でしか起きないため、
+    この構成でしか観測できない (M32 / M41 は既存の 16 テストを素通りした)。
+    """
+    out = compute(_symmetric_expansion_df(), {})
+    assert float(out["plus_di"].iloc[-1]) == 0.0
+    assert float(out["minus_di"].iloc[-1]) == 0.0
+    assert float(out["adx"].iloc[-1]) == 0.0
+
+
 def test_di_stays_within_bounds():
     out = compute(_mkdf(), {})
     for key in ("adx", "plus_di", "minus_di"):

@@ -153,6 +153,31 @@ def test_all_nine_pass_the_indicator_validator():
                                   outputs=meta.outputs)
 
 
+def test_declared_params_match_each_plugins_own_defaults():
+    """`config.yaml` の `params` が `plugin.py` の既定値と一致していること。
+
+    **どちらのテストも片側しか見ていなかった**: 9 本の自己テストは
+    `compute(df, {})` (= `plugin.py` の既定値) だけを、I2 は
+    `compute(df, dict(meta.params))` (= `config.yaml` の宣言値) だけを通す。
+    段 0 の実測で `sma` の `period: 20 -> 5`、`bollinger` の
+    `num_std: 2.0 -> 3.0` がどちらも全テストを素通りした (M39 / M40)。
+    宣言値は**実際に本番で使われる値**であり、ずれると「自己テストが緑の
+    まま、配備された指標だけ別物」になる。
+
+    値の表を手で持たずに**振る舞いで**比べる (どちらの向きのずれも捕まる)。
+    """
+    df = _df(300)
+    for meta in _nine_metas():
+        compute = _load_compute(meta.name, meta.path / "plugin.py")
+        declared = compute(df, dict(meta.params))
+        builtin = compute(df, {})
+        for key in meta.outputs:
+            assert np.array_equal(
+                declared[key].to_numpy(dtype="float64"),
+                builtin[key].to_numpy(dtype="float64"),
+                equal_nan=True), (meta.name, key, dict(meta.params))
+
+
 # --- I5: 先頭依存の回帰 ------------------------------------------------------
 
 def _spike_df(n=5000, base=150.0, spike=0.0, seed=1):
