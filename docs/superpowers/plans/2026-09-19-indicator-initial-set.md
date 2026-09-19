@@ -5985,7 +5985,7 @@ I8(b) の残骸 assert に「journal 0 行」を書くと red /
 | I8(b) 5 本目のゲート失敗 → 直して再開 | 失敗時点で 4 本配備済・残骸ゼロ、再開後 9 本揃う |
 | I8(c) ゲート後失敗 → `approval retry` → 手順 5 の再 bless | 失敗 phase 別に実測: `preparing` / `versioned` は **retry で journal 終端 + 配備完了**、`switched` だけ **retry 後も未配備** (approval は `approved`)。いずれも次の同名 bless は `UnresolvedJournalError` で弾かれ、retry 後の再 bless で確実に配備される。受入テストは `versioned` を観測する |
 | **`src/` の観測事項 (本束では直さない)** | `approve_candidate` の 0d は `phase == "switched"` を `_reverify_switched_journal` → `_finalize_decision` で閉じるだけで `switch_live` を呼ばない (`switch.py:1440-1454`) ため、**approval が `approved` なのに何も配備されていない**状態になり得る。**`[retry-switched-approves-without-deploy]` として指揮者へ申告** |
-| 完成ファイル `tests/plugin/test_indicator_initial_set.py` (Step 10-i) | v1.1 時点 **10 passed / 41.7 秒** (最遅 3 本 = 12.0 / 11.5 / 11.5 秒)。**段 0 の是正後 v1.2 = 12 passed / 41.4 秒** |
+| 完成ファイル `tests/plugin/test_indicator_initial_set.py` (Step 10-i) | v1.1 時点 **10 passed / 41.7 秒** (最遅 3 本 = 12.0 / 11.5 / 11.5 秒)。**段 0 の是正後 v1.2 = 12 passed / 41.4 秒**。**1 周目の是正後 v1.3 = 17 passed / 45.6 秒** (X4 の `examples_copy` pin 1 本 + X2 の単調トレンド 1 本 + X3 の CLI 3 本) |
 
 ## 変更履歴
 
