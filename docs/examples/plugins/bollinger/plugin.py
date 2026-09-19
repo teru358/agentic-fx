@@ -33,6 +33,11 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
@@ -41,6 +46,32 @@ import math
 
 import pandas as pd
 
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"period": 20, "num_std": 2.0}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -81,8 +112,9 @@ def compute(df: pd.DataFrame, params: dict) -> dict:
     — 異常ではない。`num_std` 自体は有限かつ `> 0` を要求する
     (0 は 3 本が同一系列になる退化形、負値は upper/lower の反転)。
     """
-    period = _int_param(params, "period", 20)
-    num_std = _float_param(params, "num_std", 2.0)
+    _reject_unknown_params(params)
+    period = _int_param(params, "period", _DEFAULTS["period"])
+    num_std = _float_param(params, "num_std", _DEFAULTS["num_std"])
     close = df["close"].astype(float)
     middle = close.rolling(window=period, min_periods=period).mean()
     sigma = close.rolling(window=period, min_periods=period).std(ddof=0)

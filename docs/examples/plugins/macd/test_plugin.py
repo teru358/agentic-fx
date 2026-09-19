@@ -201,6 +201,25 @@ def test_invalid_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [{'fat': 12}, {'fast': 12, 'slow': 26, 'signal_period': 9, 'unused': 1}])
+def test_unknown_params_raise_value_error(params):
+    """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
+    (R8 / U3) は承認不要なので、`fast` のつもりで `fat` と綴りを誤ると
+    現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
+    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_declared_defaults_are_exposed_as_a_constant():
+    """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
+    公開されていること (受入テストが値の表を重複して持たないため)。"""
+    from plugin import _DEFAULTS, _KNOWN_PARAMS
+    assert set(_DEFAULTS) == set(_KNOWN_PARAMS)
+    assert _DEFAULTS == {'fast': 12, 'slow': 26, 'signal_period': 9}
+
+
 def test_valid_param_override_changes_the_result():
     df = _mkdf()
     base = compute(df, {})

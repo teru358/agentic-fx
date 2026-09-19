@@ -35,12 +35,43 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
 
 5. **先行/遅行スパンの lookahead 規約** — 下の `compute` の docstring を参照。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
 
 import pandas as pd
 
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"tenkan_period": 9, "kijun_period": 26, "senkou_b_period": 52}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -87,9 +118,11 @@ def compute(df: pd.DataFrame, params: dict) -> dict:
     順序で well-defined で、符号反転も退化も起きない。順序を強制すると
     7/22/44 のような正当なパラメータ探索を塞ぐ (設計書 §4)。
     """
-    tenkan_period = _int_param(params, "tenkan_period", 9)
-    kijun_period = _int_param(params, "kijun_period", 26)
-    senkou_b_period = _int_param(params, "senkou_b_period", 52)
+    _reject_unknown_params(params)
+    tenkan_period = _int_param(params, "tenkan_period", _DEFAULTS["tenkan_period"])
+    kijun_period = _int_param(params, "kijun_period", _DEFAULTS["kijun_period"])
+    senkou_b_period = _int_param(params, "senkou_b_period",
+                                 _DEFAULTS["senkou_b_period"])
     tenkan = _midpoint(df, tenkan_period)
     kijun = _midpoint(df, kijun_period)
     return {"tenkan": tenkan,

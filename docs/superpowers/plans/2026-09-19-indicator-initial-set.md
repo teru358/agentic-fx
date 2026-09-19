@@ -474,6 +474,25 @@ def test_invalid_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [{'perid': 20}, {'period': 20, 'unused': 1}])
+def test_unknown_params_raise_value_error(params):
+    """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
+    (R8 / U3) は承認不要なので、`period` のつもりで `perid` と綴りを誤ると
+    現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
+    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_declared_defaults_are_exposed_as_a_constant():
+    """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
+    公開されていること (受入テストが値の表を重複して持たないため)。"""
+    from plugin import _DEFAULTS, _KNOWN_PARAMS
+    assert set(_DEFAULTS) == set(_KNOWN_PARAMS)
+    assert _DEFAULTS == {'period': 20}
+
+
 def test_valid_param_override_changes_the_result():
     df = _mkdf()
     base = compute(df, {})
@@ -548,12 +567,43 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
 
 import pandas as pd
 
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"period": 20}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -577,7 +627,8 @@ def _int_param(params: dict, name: str, default: int) -> int:
 
 def compute(df: pd.DataFrame, params: dict) -> dict:
     """単純移動平均 (SMA) を系列で返す。warmup (先頭 period-1 行) は NaN。"""
-    period = _int_param(params, "period", 20)
+    _reject_unknown_params(params)
+    period = _int_param(params, "period", _DEFAULTS["period"])
     close = df["close"].astype(float)
     value = close.rolling(window=period, min_periods=period).mean()
     return {"value": value}
@@ -882,6 +933,25 @@ def test_invalid_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [{'perid': 20}, {'period': 20, 'unused': 1}])
+def test_unknown_params_raise_value_error(params):
+    """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
+    (R8 / U3) は承認不要なので、`period` のつもりで `perid` と綴りを誤ると
+    現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
+    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_declared_defaults_are_exposed_as_a_constant():
+    """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
+    公開されていること (受入テストが値の表を重複して持たないため)。"""
+    from plugin import _DEFAULTS, _KNOWN_PARAMS
+    assert set(_DEFAULTS) == set(_KNOWN_PARAMS)
+    assert _DEFAULTS == {'period': 20}
+
+
 def test_valid_param_override_changes_the_result():
     df = _mkdf()
     base = compute(df, {})
@@ -955,12 +1025,43 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
 
 import pandas as pd
 
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"period": 20}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -989,7 +1090,8 @@ def compute(df: pd.DataFrame, params: dict) -> dict:
     教科書流の「先頭 period 本の SMA を seed にする」は採らない — 配備済
     `rsi_indicator` と同じ再帰に揃えるため。
     """
-    period = _int_param(params, "period", 20)
+    _reject_unknown_params(params)
+    period = _int_param(params, "period", _DEFAULTS["period"])
     close = df["close"].astype(float)
     value = close.ewm(span=period, adjust=False, min_periods=period).mean()
     return {"value": value}
@@ -1320,6 +1422,25 @@ def test_invalid_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [{'perid': 14}, {'period': 14, 'unused': 1}])
+def test_unknown_params_raise_value_error(params):
+    """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
+    (R8 / U3) は承認不要なので、`period` のつもりで `perid` と綴りを誤ると
+    現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
+    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_declared_defaults_are_exposed_as_a_constant():
+    """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
+    公開されていること (受入テストが値の表を重複して持たないため)。"""
+    from plugin import _DEFAULTS, _KNOWN_PARAMS
+    assert set(_DEFAULTS) == set(_KNOWN_PARAMS)
+    assert _DEFAULTS == {'period': 14}
+
+
 def test_valid_param_override_changes_the_result():
     df = _mkdf()
     base = compute(df, {})
@@ -1510,6 +1631,11 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
    close**。strategy 側で「中立」と「板が動いていない」を読み分けたいなら
    `atr` を併せて宣言して自分で判定すること。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
@@ -1519,6 +1645,32 @@ import pandas as pd
 
 
 EPS = 1e-9
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"period": 14}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -1557,7 +1709,8 @@ def compute(df: pd.DataFrame, params: dict) -> dict:
     「下げが無い -> 100」しか持たない。横ばい相場で両者の値は一致しない
     (既存 100 / 本 plugin 50)。**両方を同じ strategy で混ぜて使わないこと。**
     """
-    period = _int_param(params, "period", 14)
+    _reject_unknown_params(params)
+    period = _int_param(params, "period", _DEFAULTS["period"])
     close = df["close"].astype(float)
     delta = close.diff()
     gain = delta.clip(lower=0.0)
@@ -1884,6 +2037,25 @@ def test_invalid_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [{'fat': 12}, {'fast': 12, 'slow': 26, 'signal_period': 9, 'unused': 1}])
+def test_unknown_params_raise_value_error(params):
+    """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
+    (R8 / U3) は承認不要なので、`fast` のつもりで `fat` と綴りを誤ると
+    現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
+    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_declared_defaults_are_exposed_as_a_constant():
+    """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
+    公開されていること (受入テストが値の表を重複して持たないため)。"""
+    from plugin import _DEFAULTS, _KNOWN_PARAMS
+    assert set(_DEFAULTS) == set(_KNOWN_PARAMS)
+    assert _DEFAULTS == {'fast': 12, 'slow': 26, 'signal_period': 9}
+
+
 def test_valid_param_override_changes_the_result():
     df = _mkdf()
     base = compute(df, {})
@@ -1975,12 +2147,43 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
 
 import pandas as pd
 
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"fast": 12, "slow": 26, "signal_period": 9}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -2009,9 +2212,11 @@ def compute(df: pd.DataFrame, params: dict) -> dict:
     恒等的に 0 になる退化形、`fast > slow` は全クロスの符号が反転して
     「macd が signal を上抜けたら買い」が静かに逆売買になる。
     """
-    fast = _int_param(params, "fast", 12)
-    slow = _int_param(params, "slow", 26)
-    signal_period = _int_param(params, "signal_period", 9)
+    _reject_unknown_params(params)
+    fast = _int_param(params, "fast", _DEFAULTS["fast"])
+    slow = _int_param(params, "slow", _DEFAULTS["slow"])
+    signal_period = _int_param(params, "signal_period",
+                               _DEFAULTS["signal_period"])
     if fast >= slow:
         raise ValueError(
             f"params.fast must be < params.slow, got fast={fast} slow={slow}")
@@ -2338,6 +2543,25 @@ def test_invalid_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [{'perid': 20}, {'period': 20, 'num_std': 2.0, 'unused': 1}])
+def test_unknown_params_raise_value_error(params):
+    """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
+    (R8 / U3) は承認不要なので、`period` のつもりで `perid` と綴りを誤ると
+    現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
+    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_declared_defaults_are_exposed_as_a_constant():
+    """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
+    公開されていること (受入テストが値の表を重複して持たないため)。"""
+    from plugin import _DEFAULTS, _KNOWN_PARAMS
+    assert set(_DEFAULTS) == set(_KNOWN_PARAMS)
+    assert _DEFAULTS == {'period': 20, 'num_std': 2.0}
+
+
 def test_valid_param_override_changes_the_result():
     df = _mkdf()
     base = compute(df, {})
@@ -2435,6 +2659,11 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
@@ -2443,6 +2672,32 @@ import math
 
 import pandas as pd
 
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"period": 20, "num_std": 2.0}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -2483,8 +2738,9 @@ def compute(df: pd.DataFrame, params: dict) -> dict:
     — 異常ではない。`num_std` 自体は有限かつ `> 0` を要求する
     (0 は 3 本が同一系列になる退化形、負値は upper/lower の反転)。
     """
-    period = _int_param(params, "period", 20)
-    num_std = _float_param(params, "num_std", 2.0)
+    _reject_unknown_params(params)
+    period = _int_param(params, "period", _DEFAULTS["period"])
+    num_std = _float_param(params, "num_std", _DEFAULTS["num_std"])
     close = df["close"].astype(float)
     middle = close.rolling(window=period, min_periods=period).mean()
     sigma = close.rolling(window=period, min_periods=period).std(ddof=0)
@@ -2803,6 +3059,25 @@ def test_invalid_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [{'perid': 14}, {'period': 14, 'unused': 1}])
+def test_unknown_params_raise_value_error(params):
+    """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
+    (R8 / U3) は承認不要なので、`period` のつもりで `perid` と綴りを誤ると
+    現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
+    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_declared_defaults_are_exposed_as_a_constant():
+    """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
+    公開されていること (受入テストが値の表を重複して持たないため)。"""
+    from plugin import _DEFAULTS, _KNOWN_PARAMS
+    assert set(_DEFAULTS) == set(_KNOWN_PARAMS)
+    assert _DEFAULTS == {'period': 14}
+
+
 def test_valid_param_override_changes_the_result():
     df = _mkdf()
     base = compute(df, {})
@@ -2876,6 +3151,11 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
@@ -2883,6 +3163,32 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"period": 14}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -2924,7 +3230,8 @@ def _true_range(df: "pd.DataFrame") -> "pd.Series":
 def compute(df: pd.DataFrame, params: dict) -> dict:
     """Wilder 平滑の ATR を系列で返す。TR の行 0 は NaN なので、値が入るのは
     index `period` (= period+1 本目) から。"""
-    period = _int_param(params, "period", 14)
+    _reject_unknown_params(params)
+    period = _int_param(params, "period", _DEFAULTS["period"])
     true_range = _true_range(df)
     atr = true_range.ewm(alpha=1.0 / period, adjust=False,
                          min_periods=period).mean()
@@ -3278,6 +3585,25 @@ def test_invalid_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [{'perid': 14}, {'period': 14, 'unused': 1}])
+def test_unknown_params_raise_value_error(params):
+    """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
+    (R8 / U3) は承認不要なので、`period` のつもりで `perid` と綴りを誤ると
+    現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
+    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_declared_defaults_are_exposed_as_a_constant():
+    """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
+    公開されていること (受入テストが値の表を重複して持たないため)。"""
+    from plugin import _DEFAULTS, _KNOWN_PARAMS
+    assert set(_DEFAULTS) == set(_KNOWN_PARAMS)
+    assert _DEFAULTS == {'period': 14}
+
+
 def test_valid_param_override_changes_the_result():
     df = _mkdf()
     base = compute(df, {})
@@ -3461,6 +3787,11 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
    close**。strategy 側で「中立」と「板が動いていない」を読み分けたいなら
    `atr` を併せて宣言して自分で判定すること。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
@@ -3471,6 +3802,32 @@ import pandas as pd
 
 
 EPS = 1e-9
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"period": 14}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -3521,7 +3878,8 @@ def compute(df: pd.DataFrame, params: dict) -> dict:
 
     +DM / -DM の行 0 は NaN (前バーが無いので未確定)。
     """
-    period = _int_param(params, "period", 14)
+    _reject_unknown_params(params)
+    period = _int_param(params, "period", _DEFAULTS["period"])
     high = df["high"].astype(float)
     low = df["low"].astype(float)
     close = df["close"].astype(float)
@@ -3869,6 +4227,25 @@ def test_invalid_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [{'perid': 14}, {'period': 14, 'k_period': 3, 'd_period': 3, 'unused': 1}])
+def test_unknown_params_raise_value_error(params):
+    """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
+    (R8 / U3) は承認不要なので、`period` のつもりで `perid` と綴りを誤ると
+    現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
+    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_declared_defaults_are_exposed_as_a_constant():
+    """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
+    公開されていること (受入テストが値の表を重複して持たないため)。"""
+    from plugin import _DEFAULTS, _KNOWN_PARAMS
+    assert set(_DEFAULTS) == set(_KNOWN_PARAMS)
+    assert _DEFAULTS == {'period': 14, 'k_period': 3, 'd_period': 3}
+
+
 def test_valid_param_override_changes_the_result():
     df = _mkdf()
     base = compute(df, {})
@@ -3967,12 +4344,43 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
 
 import pandas as pd
 
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"period": 14, "k_period": 3, "d_period": 3}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -4004,9 +4412,10 @@ def compute(df: pd.DataFrame, params: dict) -> dict:
     `HH == LL` (期間内が完全な横ばい) の行は raw %K を 50.0 にする。
     `k_period: 1` を上書きすると fast stochastic になる (承認不要の調整)。
     """
-    period = _int_param(params, "period", 14)
-    k_period = _int_param(params, "k_period", 3)
-    d_period = _int_param(params, "d_period", 3)
+    _reject_unknown_params(params)
+    period = _int_param(params, "period", _DEFAULTS["period"])
+    k_period = _int_param(params, "k_period", _DEFAULTS["k_period"])
+    d_period = _int_param(params, "d_period", _DEFAULTS["d_period"])
     high = df["high"].astype(float)
     low = df["low"].astype(float)
     close = df["close"].astype(float)
@@ -4327,6 +4736,25 @@ def test_invalid_params_raise_value_error(params):
         compute(_mkdf(n=60), params)
 
 
+@pytest.mark.parametrize("params", [{'tenkan_perid': 9}, {'tenkan_period': 9, 'kijun_period': 26, 'senkou_b_period': 52, 'unused': 1}])
+def test_unknown_params_raise_value_error(params):
+    """**未知の params キーは黙って無視しない。** strategy 側の params 上書き
+    (R8 / U3) は承認不要なので、`tenkan_period` のつもりで `tenkan_perid` と綴りを誤ると
+    現状は既定値のまま動き、backtest がその値を前提に結果を出す。文言は
+    他の params 例外と同じく `params.` で始まる (設計書 §4)。
+    """
+    with pytest.raises(ValueError, match=r"^params\."):
+        compute(_mkdf(n=60), params)
+
+
+def test_declared_defaults_are_exposed_as_a_constant():
+    """`_DEFAULTS` が `config.yaml` の `params` と突き合わせられる形で
+    公開されていること (受入テストが値の表を重複して持たないため)。"""
+    from plugin import _DEFAULTS, _KNOWN_PARAMS
+    assert set(_DEFAULTS) == set(_KNOWN_PARAMS)
+    assert _DEFAULTS == {'tenkan_period': 9, 'kijun_period': 26, 'senkou_b_period': 52}
+
+
 def test_valid_param_override_changes_the_result():
     df = _mkdf()
     base = compute(df, {})
@@ -4429,12 +4857,43 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
 
 5. **先行/遅行スパンの lookahead 規約** — 下の `compute` の docstring を参照。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
 
 import pandas as pd
 
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"tenkan_period": 9, "kijun_period": 26, "senkou_b_period": 52}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -4481,9 +4940,11 @@ def compute(df: pd.DataFrame, params: dict) -> dict:
     順序で well-defined で、符号反転も退化も起きない。順序を強制すると
     7/22/44 のような正当なパラメータ探索を塞ぐ (設計書 §4)。
     """
-    tenkan_period = _int_param(params, "tenkan_period", 9)
-    kijun_period = _int_param(params, "kijun_period", 26)
-    senkou_b_period = _int_param(params, "senkou_b_period", 52)
+    _reject_unknown_params(params)
+    tenkan_period = _int_param(params, "tenkan_period", _DEFAULTS["tenkan_period"])
+    kijun_period = _int_param(params, "kijun_period", _DEFAULTS["kijun_period"])
+    senkou_b_period = _int_param(params, "senkou_b_period",
+                                 _DEFAULTS["senkou_b_period"])
     tenkan = _midpoint(df, tenkan_period)
     kijun = _midpoint(df, kijun_period)
     return {"tenkan": tenkan,

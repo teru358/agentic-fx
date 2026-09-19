@@ -32,12 +32,43 @@ plugin 契約 ([indicator-initial-set] 設計書 §3 / §4)。indicator kind は
 4. **純関数であること。** `df` と `params` を書き換えない (必要なら新しい
    Series を作る)。モジュールレベルの状態を持たない。
 
+**未知の `params` キーは `ValueError` にする。** この plugin が読むキーは
+下の `_DEFAULTS` がすべてである。strategy 側の params 上書きは承認不要
+なので、`period` のつもりで綴りを誤ったまま黙って既定値で動くと、その
+値を前提にした backtest 結果が出てしまう。
+
 入力に NaN は無いものとする (挙動は未規定。ただし例外は送出しない)。
 """
 from __future__ import annotations
 
 import pandas as pd
 
+
+
+#: **この plugin が読む params と既定値。** `config.yaml` の `params` はこの表と
+#: 一致していなければならない (設計書 §4)。既定値をここに 1 箇所だけ持ち、
+#: `compute` も受入テストもここを読む。
+_DEFAULTS = {"fast": 12, "slow": 26, "signal_period": 9}
+#: 既知キー集合。`_DEFAULTS` から導くので、両者がずれることはない。
+_KNOWN_PARAMS = frozenset(_DEFAULTS)
+
+
+def _reject_unknown_params(params: dict) -> None:
+    """**既知でない params キーを `ValueError` にする** (設計書 §4)。
+
+    「出力に効かないから無害」ではない — 綴り誤りが黙って既定値で動くと、
+    strategy の作者もレビュー担当も「上書きが効いている」と読み違える。
+    承認・backtest・bless のどの経路でも fail closed になるのが正しい。
+
+    **この関数も `_DEFAULTS` / `_KNOWN_PARAMS` も 9 本の plugin に同形で
+    重複している** (下の `_int_param` と同じ理由 — 共有モジュールを置く
+    経路が無い)。違うのは `_DEFAULTS` の中身だけ。直すときは 9 本まとめて。
+    """
+    unknown = sorted(set(params) - _KNOWN_PARAMS)
+    if unknown:
+        known = ", ".join(sorted(_KNOWN_PARAMS))
+        raise ValueError(f"params.{unknown[0]} is not a known parameter, "
+                         f"known: {known}")
 
 
 def _int_param(params: dict, name: str, default: int) -> int:
@@ -66,9 +97,11 @@ def compute(df: pd.DataFrame, params: dict) -> dict:
     恒等的に 0 になる退化形、`fast > slow` は全クロスの符号が反転して
     「macd が signal を上抜けたら買い」が静かに逆売買になる。
     """
-    fast = _int_param(params, "fast", 12)
-    slow = _int_param(params, "slow", 26)
-    signal_period = _int_param(params, "signal_period", 9)
+    _reject_unknown_params(params)
+    fast = _int_param(params, "fast", _DEFAULTS["fast"])
+    slow = _int_param(params, "slow", _DEFAULTS["slow"])
+    signal_period = _int_param(params, "signal_period",
+                               _DEFAULTS["signal_period"])
     if fast >= slow:
         raise ValueError(
             f"params.fast must be < params.slow, got fast={fast} slow={slow}")
