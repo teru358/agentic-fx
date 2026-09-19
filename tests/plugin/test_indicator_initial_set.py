@@ -715,6 +715,36 @@ def test_runbook_gate_failure_keeps_earlier_deployments_and_resumes(tmp_path):
     assert _inventory_names(conn, plugins_dir) == sorted(NINE)
 
 
+#: `_fail_record_version_once` が 1 回目に送出する文言。2 つのテストが
+#: `match` / `in stderr` でこの文字列を見るので定数で持つ。
+_INJECTED = "injected: after version dir, before symlink switch"
+
+
+def _fail_record_version_once(monkeypatch) -> None:
+    """`switch.history_git.record_version` を **1 回だけ** `OSError` にする。
+
+    版ディレクトリ作成 (`switch.py:1198`) の**後**・symlink 切替
+    (`:1219`) の**前**という §6.3 (B) の位置に故障を作るための注入で、
+    差し替えはモジュール属性 (`test_reconcile.py:268,471` と同じ形)。
+    `_advance_to_decided` 自体を差し替えるとこの位置は作れない。
+
+    I8(c) と CLI (B) の 2 テストが逐語で同じブロックを持っていたので
+    ここへ寄せた (/code-review #5)。**挙動は不変** — 2 回目以降は本物へ
+    委譲するので、収束手順 (retry / 再 bless) はそのまま成功する。
+    """
+    real_record = plugin_switch.history_git.record_version
+    calls = {"n": 0}
+
+    def _fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(_INJECTED)
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(plugin_switch.history_git, "record_version",
+                        _fail_once)
+
+
 @pytest.mark.slow
 def test_runbook_post_gate_failure_converges_via_approval_retry(tmp_path,
                                                                 monkeypatch):
@@ -753,17 +783,7 @@ def test_runbook_post_gate_failure_converges_via_approval_retry(tmp_path,
     root, plugins_dir, conn = _bless_env(tmp_path)
     _stage(plugins_dir, "rsi")
 
-    real_record = plugin_switch.history_git.record_version
-    calls = {"n": 0}
-
-    def _fail_once(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise OSError("injected: after version dir, before symlink switch")
-        return real_record(*args, **kwargs)
-
-    monkeypatch.setattr(plugin_switch.history_git, "record_version",
-                        _fail_once)
+    _fail_record_version_once(monkeypatch)
 
     with pytest.raises(OSError, match="injected"):
         _bless(conn, plugins_dir, "rsi")
@@ -940,17 +960,7 @@ def test_runbook_cli_bless_after_post_gate_failure_raises_traceback(
     monkeypatch.chdir(root)
     shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
 
-    real_record = plugin_switch.history_git.record_version
-    calls = {"n": 0}
-
-    def _fail_once(*args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise OSError("injected: after version dir, before symlink switch")
-        return real_record(*args, **kwargs)
-
-    monkeypatch.setattr(plugin_switch.history_git, "record_version",
-                        _fail_once)
+    _fail_record_version_once(monkeypatch)
 
     rc = main(["plugin", "bless", "sma", "--from", "_human"])
     assert rc == 1
