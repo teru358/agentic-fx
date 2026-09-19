@@ -11,6 +11,7 @@ I1 は `tests/plugin/test_loader.py::test_discover_sample_plugins_directory_not_
 from __future__ import annotations
 
 import importlib.util
+import re
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.plugin_contract import validate_indicator_result
+from agentic_fx.entry import main
 from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.plugin.loader import discover, discover_one_with_reason
 from agentic_fx.plugin.resolve import lock_config, resolve_indicator_deps
@@ -732,3 +734,144 @@ def test_runbook_post_gate_failure_converges_via_approval_retry(tmp_path,
     detail = cmds.dispatch(f"approval {second_id}")
     assert "dependent_pinned_here=" in detail
     assert "dependent_pinned_elsewhere=" in detail
+
+
+# --- I8: runbook の CLI 境界 (`afx plugin bless <名前> --from _human`) --------
+
+def _cli_env(tmp_path: Path) -> Path:
+    """`afx` の CLI が要求する形の tmp root を作って返す。
+
+    `backtest/cli.py:dispatch` は root を `Path.cwd()` として受け取り
+    (`entry.py:23`)、**`ensure_initialized(root)`** (`service.py:75-79`、
+    `data/state/app_state.json` の `initialized`) と
+    **`config/settings.yaml`**、**`data/agentic.db`** を見る。上の
+    `_bless_env` は DB を `root/agentic.db` に置くので**混ぜない** — CLI 用は
+    このビルダで別に作る。
+
+    `ensure_initialized` を monkeypatch で潰さない (`tests/backtest/test_cli.py`
+    は潰している) — ここで観測したいのは「runbook の人間が打つコマンドが
+    そのまま通ること」なので、初期化済みの状態も実物で用意する。
+    `settings.yaml.example` は `SETTINGS_FIXTURE` の生成元そのもの
+    (`tests/fixtures/wiring_envs.py:24`) なので `plugin.*` の値は上の
+    テスト群と同じ。
+    """
+    (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+    shutil.copy(_REPO / "config" / "settings.yaml.example",
+                tmp_path / "config" / "settings.yaml")
+    (tmp_path / "data" / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    (tmp_path / "plugins" / "_human").mkdir(parents=True, exist_ok=True)
+    StateStore(tmp_path / "data" / "state" / "app_state.json").update(
+        initialized=True)
+    conn = db_store.connect(tmp_path / "data" / "agentic.db")
+    db_store.init_db(conn)
+    conn.close()
+    return tmp_path
+
+
+@pytest.mark.slow
+def test_runbook_cli_bless_succeeds_and_prints_approval_id(
+        tmp_path, monkeypatch, capsys):
+    """I8 (CLI 正常系): runbook 手順 (2) の
+    `afx plugin bless <名前> --from _human` を **CLI の入口から**実行し、
+    rc=0 と stdout の `approval id=<N>` を観測する。
+
+    `entry.main` を **in-process** で呼ぶ (`tests/backtest/test_cli.py` の流儀)。
+    subprocess にしないのは、(a) `main` が argparse → `dispatch` →
+    `_plugin_bless` の CLI 境界そのものであり rc / stdout / stderr が
+    同じであること、(b) 下の (B) が `record_version` の monkeypatch を
+    同一プロセスに載せる必要があること、の 2 点による。
+    `pyproject.toml:28` の `afx = "agentic_fx.entry:main"` が runbook の
+    `afx ...` と同じ入口。
+    """
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+
+    rc = main(["plugin", "bless", "sma", "--from", "_human"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert re.search(r"^approval id=\d+$", out, re.M), out
+    assert (root / "plugins" / "sma").is_symlink()
+
+
+@pytest.mark.slow
+def test_runbook_cli_bless_gate_failure_exits_1_with_error_on_stderr(
+        tmp_path, monkeypatch, capsys):
+    """I8 (CLI ゲート失敗、設計書 §6.3 (A)): 候補の `test_plugin.py` を壊すと
+    `bless_candidate` が `ValueError` を投げ、`_plugin_bless` の
+    `except (ValueError, SandboxError)` (`backtest/cli.py:591-593`) が
+    **rc=1 + stderr の `エラー: `** に写像する。承認行も symlink も残らない。
+    """
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    dest = root / "plugins" / "_human" / "sma"
+    shutil.copytree(EXAMPLES / "sma", dest)
+    (dest / "test_plugin.py").write_text(
+        "def test_broken():\n    assert False\n")
+
+    rc = main(["plugin", "bless", "sma", "--from", "_human"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "エラー: " in captured.err, captured.err
+    assert "failed pytest gate" in captured.err, captured.err
+    assert not (root / "plugins" / "sma").exists()
+    conn = db_store.connect(root / "data" / "agentic.db")
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM approval_requests").fetchone()["c"] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.slow
+def test_runbook_cli_bless_after_post_gate_failure_raises_traceback(
+        tmp_path, monkeypatch, capsys):
+    """I8 (CLI ゲート後失敗、設計書 §6.3 (B)): 未終端 journal が残った状態で
+    同名を再 bless すると、CLI から **`UnresolvedJournalError` が素通りして
+    traceback になる** ([[cli-bless-unresolved-journal]])。
+
+    **これは「現状をそのまま pin する」テストであり、望ましい姿ではない** —
+    `UnresolvedJournalError` は `Exception` 直下 (`switch.py:1572`) なので
+    `_plugin_bless` の `except (ValueError, SandboxError)` にも
+    `dispatch` の `except (ValueError, KeyError, OSError, sqlite3.Error, ...)`
+    にも掛からない。ticket [cli-bless-unresolved-journal] が直ったら
+    (rc=1 + 収束手順の案内を stderr に出す形になるはず)、**このテストは
+    その新しい振る舞いへ書き換える**こと。
+
+    1 回目の失敗注入 (`record_version` の `OSError`) は逆に
+    `dispatch` の `except OSError` に**捕まる**ので rc=1 になる — 同じ
+    §6.3 (B) でも CLI から見える形が 1 回目と 2 回目で違うことを両方観測する。
+    """
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+
+    real_record = plugin_switch.history_git.record_version
+    calls = {"n": 0}
+
+    def _fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("injected: after version dir, before symlink switch")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(plugin_switch.history_git, "record_version",
+                        _fail_once)
+
+    rc = main(["plugin", "bless", "sma", "--from", "_human"])
+    assert rc == 1
+    assert "injected" in capsys.readouterr().err
+
+    conn = db_store.connect(root / "data" / "agentic.db")
+    try:
+        open_journal = journal_store.get_open_by_name(conn, "sma")
+        assert open_journal is not None and open_journal["phase"] == "versioned"
+    finally:
+        conn.close()
+
+    with pytest.raises(plugin_switch.UnresolvedJournalError) as excinfo:
+        main(["plugin", "bless", "sma", "--from", "_human"])
+    assert f"op_id={open_journal['op_id']}" in str(excinfo.value)
