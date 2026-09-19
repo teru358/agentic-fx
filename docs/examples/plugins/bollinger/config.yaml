@@ -1,0 +1,6 @@
+kind: indicator
+outputs: [upper, middle, lower]
+max_bars: 400
+params:
+  period: 20
+  num_std: 2.0
