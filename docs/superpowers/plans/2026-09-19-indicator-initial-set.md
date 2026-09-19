@@ -4533,7 +4533,8 @@ EOF
 > 書いておらず、**I6 / I7 / I8 の tmp 環境実測をしていなかった**。着手前検証で
 > **Critical 4 / Important 8 / Minor 5** を検出し、全件を本節へ反映した
 > (記録: `tmp/plan-indicator-initial-set/prevalidation-T10.md`)。
-> **Step 10-i の完成ファイル (10 テスト) は指揮者が実際に走らせて 10 passed / 41.7 秒を
+> **Step 10-i の完成ファイル (v1.1 時点 10 テスト = 10 passed / 41.7 秒、段 0 の是正で
+> **12 テスト / 41.4 秒** に増えた。以下の記述は v1.1 当時の実測) は指揮者が実際に走らせて
 > 確認したもの**。それでも**プロジェクトの制約に反する記述を見つけたら、プランどおりの
 > 実装でも欠陥として申告**すること ([[plan-code-defects-not-implementer-defects]])。
 
@@ -4841,7 +4842,10 @@ inventory: ['adx', 'bollinger', 'ema', 'ichimoku', 'macd', 'rsi', 'sma', 'stocha
 - [ ] `uv run pytest -q` をフルで回し、**既存テストの退行がゼロ**であること
       (特に `tests/plugin/test_loader.py` / `tests/loops/test_improve_loop_source_snapshot.py`
       / `tests/tools/test_improve_staging_tools.py` — `docs/examples/plugins` を列挙する側)
-- [ ] 本ファイルは 10 テストで **実測 41.7 秒** (うち 9 本 bless を回す 3 本が 11.5 / 12.0 /
+- [ ] 本ファイルは **12 テスト** で **実測 41.4 秒** (v1.1 時点は 10 テスト / 41.7 秒。
+      段 0 で `test_all_nine_declare_max_bars_400` と
+      `test_declared_params_match_each_plugins_own_defaults` の 2 本が増えた。どちらも
+      `slow` ではなく 1 秒未満) (うち 9 本 bless を回す 3 本が 11.5 / 12.0 /
       11.5 秒)。`slow` は `addopts` で除外されないのでフルスイートに必ず含まれる
 - [ ] `git status` で `data/` と `plugins/` に変更が無いことを確認する
 - [ ] commit (`feat(indicator-initial-set): 受入テストと配備 runbook (T10)`)
@@ -4849,7 +4853,8 @@ inventory: ['adx', 'bollinger', 'ema', 'ichimoku', 'macd', 'rsi', 'sma', 'stocha
 
 ### Step 10-i: `tests/plugin/test_indicator_initial_set.py` の逐語
 
-**指揮者が実際に走らせて 10 passed / 41.7 秒を確認した完成ファイル** (着手前検証 2026-09-19)。
+**指揮者が実際に走らせて確認した完成ファイル** (着手前検証 2026-09-19 で 10 passed / 41.7 秒、
+**段 0 の是正後 2026-09-19 で 12 passed / 41.4 秒**)。
 `EXAMPLES` を scratchpad に向けた版で実測したので、**repo に置いたら
 `EXAMPLES = _REPO / "docs" / "examples" / "plugins"` のままで走ること**を
 必ず自分で確認すること。
@@ -5695,7 +5700,7 @@ I8(b) の残骸 assert に「journal 0 行」を書くと red /
 | I8(b) 5 本目のゲート失敗 → 直して再開 | 失敗時点で 4 本配備済・残骸ゼロ、再開後 9 本揃う |
 | I8(c) ゲート後失敗 → `approval retry` → 手順 5 の再 bless | 失敗 phase 別に実測: `preparing` / `versioned` は **retry で journal 終端 + 配備完了**、`switched` だけ **retry 後も未配備** (approval は `approved`)。いずれも次の同名 bless は `UnresolvedJournalError` で弾かれ、retry 後の再 bless で確実に配備される。受入テストは `versioned` を観測する |
 | **`src/` の観測事項 (本束では直さない)** | `approve_candidate` の 0d は `phase == "switched"` を `_reverify_switched_journal` → `_finalize_decision` で閉じるだけで `switch_live` を呼ばない (`switch.py:1440-1454`) ため、**approval が `approved` なのに何も配備されていない**状態になり得る。**`[retry-switched-approves-without-deploy]` として指揮者へ申告** |
-| 完成ファイル `tests/plugin/test_indicator_initial_set.py` (Step 10-i) | **10 passed / 41.7 秒** (最遅 3 本 = 12.0 / 11.5 / 11.5 秒) |
+| 完成ファイル `tests/plugin/test_indicator_initial_set.py` (Step 10-i) | v1.1 時点 **10 passed / 41.7 秒** (最遅 3 本 = 12.0 / 11.5 / 11.5 秒)。**段 0 の是正後 v1.2 = 12 passed / 41.4 秒** |
 
 ## 変更履歴
 
@@ -5703,4 +5708,4 @@ I8(b) の残骸 assert に「journal 0 行」を書くと red /
 |---|---|---|---|---|
 | 2026-09-19 | v1.0 | 起案。設計書 v1.3a を T0 (共通テンプレート) / T1〜T9 (指標 1 本ずつ、並列可) / T10 (repo 側受入テストと runbook) の 11 task へ分割。**T1〜T9 の逐語コード 27 ファイルは指揮者が scratchpad で生成・実行し 131 passed を確認済み**。逆変異 54 件を実測し 54/54 KILLED (初回 9 件生存 → すべてテスト側の欠陥として修正)。I5 の数値・壊れた実装の red・等価変異 1 件を「着手前検証の記録」に記載 | 設計書 v1.3a (codex 設計レビュー r3 で指摘 0、収束) | - |
 | 2026-09-19 | v1.1 | **T10 の着手前検証** (Critical 4 / Important 8 / Minor 5) を全件反映。Step 10-b〜10-h を実物照合済みの記述へ改訂し、**Step 10-i に完成ファイル `tests/plugin/test_indicator_initial_set.py` の逐語 (実測 10 passed / 41.7 秒) を追加**。「着手前検証の記録 §8」の 2 件を設計書 v1.3b へ反映して閉じ、§9 に T10 の実測を追加。**T1〜T9 の節と行番号は一切動かしていない** (改訂は L4438 以降 + 冒頭 1 行の版表記のみ)。なお本文 L24 / L73 の「設計書 v1.3a」表記は、T10 より前の行を動かさない制約のため据え置き — **v1.3b は v1.3a に対する設計変更ゼロの改訂** (観測値の訂正 + 既知の欠落の起票) なので参照の妥当性は保たれる | T10 は起草者自身が「tmp 環境での bless 実測をしていない、最もプラン記述の欠陥を踏みやすい」と申告していた箇所 ([[plan-code-defects-not-implementer-defects]] 「着手前検証を必須工程にする」) | - |
-| 2026-09-19 | v1.2 | **段 0 (指揮者の変異スイープ、レビュー前) の結果を反映。** 変異 78 件 (実装者の 60 件とは別次元) を打ち、**生存 8 件 → 是正 3 commit**。(a) **I5 が何も観測していなかった** — `_last_row_deltas` が出力キー名だけで束ねていたため `sma.value` が `ema.value` に上書きされ、9 本 20 系列のうち 19 本しか測っていなかった (`sma` を `expanding` = 先頭依存最大の実装に差し替えても 3 テストとも緑)。さらに末尾本数が `max_bars: int = 400` の**関数引数に固定**されており、`config.yaml` の宣言を変えても red にならなかった。キーを `<plugin 名>.<出力キー>` に修飾し、`df.tail(meta.max_bars)` を plugin ごとに取り、`test_all_nine_declare_max_bars_400` を追加 (窓が有限な 4 本は結合だけでは守れないため両方要る)。(b) `config.yaml` の `params` と `plugin.py` の既定値の乖離が**どちらのテストからも見えていなかった** (自己テストは `compute(df, {})`、I2 は `meta.params`) → `test_declared_params_match_each_plugins_own_defaults` を追加。(c) ADX の DM **同着規則** (`up_move > down_move` を `>=` に緩めると `adx` 0.0 → **100.0**) がランダムウォーク fixture では測度 0 で観測できず生存 → `_symmetric_expansion_df` を追加。(d) `rsi` の ε 基準 (「その行自身の `close`」) を判別する fixture を追加 (起草者の「等価」記録を訂正 — 価格比が 1 から大きく外れる行は作れる)。**Step 10-i / T3 / T7 のコードブロックを実ファイルへ同期し機械抽出で差分ゼロを再確認済み。** 併せて**実装者が報告した逆変異表の 5 件の誤りを訂正**: ① `rolling(window=p)` の `min_periods` を「外す」は pandas の既定が window なので**等価** (sma / bollinger / stochastic / ichimoku の 4 件)、さらに stochastic / ichimoku では `min_periods=1` を **`highest` か `lowest` の片側だけ**に当てても反対側の NaN が `highest - lowest` / `(highest + lowest)/2` を通って伝播するため**等価** (両側同時に当てて初めて KILLED) ② `ema` に `rolling(center=True)` は適用不可 ③ macd-6 は 9 本落ちる ④ bollinger-2 は 2 本落ちる ⑤ **Step 10-a の例示変異 `timeframe: 1h` は red にならない** — `timeframe` は loader の許可トップレベルキー (`plugin/loader.py:102-104`) なので「未知キー」ではない | 段 0 は 1 周目レビューの前提 ([[mutation-testing]] 3.6「変異を注入する主体は同時に 1 つだけ」)。生存の 4 類型のうち本束で出たのは「②生成側のキー集合が未検査」「③fixture の縮退で 2 経路が同じ答え」の 2 つ | `53f5b8c` / `2e56515` / `7cd0e6c` |
+| 2026-09-19 | v1.2 | **段 0 (指揮者の変異スイープ、レビュー前) の結果を反映。** **別個の変異 104 件** (実装者の 60 件とは別次元) を打ち、post-fix の再測定 7 件を合わせて 111 回測定した (ほかに語分割による無効測定 3 回を棄却)。**生存 9 件 → pin 4 本 / 是正 3 commit**、等価 5 件、プラン記述の欠陥 1 件 (⑤)。(a) **I5 が何も観測していなかった** — `_last_row_deltas` が出力キー名だけで束ねていたため `sma.value` が `ema.value` に上書きされ、9 本 20 系列のうち 19 本しか測っていなかった (`sma` を `expanding` = 先頭依存最大の実装に差し替えても 3 テストとも緑)。さらに末尾本数が `max_bars: int = 400` の**関数引数に固定**されており、`config.yaml` の宣言を変えても red にならなかった。キーを `<plugin 名>.<出力キー>` に修飾し、`df.tail(meta.max_bars)` を plugin ごとに取り、`test_all_nine_declare_max_bars_400` を追加 (窓が有限な 4 本は結合だけでは守れないため両方要る)。(b) `config.yaml` の `params` と `plugin.py` の既定値の乖離が**どちらのテストからも見えていなかった** (自己テストは `compute(df, {})`、I2 は `meta.params`) → `test_declared_params_match_each_plugins_own_defaults` を追加。(c) ADX の DM **同着規則** (`up_move > down_move` を `>=` に緩めると `adx` 0.0 → **100.0**) がランダムウォーク fixture では測度 0 で観測できず生存 → `_symmetric_expansion_df` を追加。(d) `rsi` の ε 基準 (「その行自身の `close`」) を判別する fixture を追加 (起草者の「等価」記録を訂正 — 価格比が 1 から大きく外れる行は作れる)。**Step 10-i / T3 / T7 のコードブロックを実ファイルへ同期し機械抽出で差分ゼロを再確認済み。** 併せて**実装者が報告した逆変異表の 5 件の誤りを訂正**: ① `rolling(window=p)` の `min_periods` を「外す」は pandas の既定が window なので**等価** (sma / bollinger / stochastic / ichimoku の 4 件)、さらに stochastic / ichimoku では `min_periods=1` を **`highest` か `lowest` の片側だけ**に当てても反対側の NaN が `highest - lowest` / `(highest + lowest)/2` を通って伝播するため**等価** (両側同時に当てて初めて KILLED) ② `ema` に `rolling(center=True)` は適用不可 ③ macd-6 は 9 本落ちる ④ bollinger-2 は 2 本落ちる ⑤ **Step 10-a の例示変異 `timeframe: 1h` は red にならない** — `timeframe` は loader の許可トップレベルキー (`plugin/loader.py:102-104`) なので「未知キー」ではない | 段 0 は 1 周目レビューの前提 ([[mutation-testing]] 3.6「変異を注入する主体は同時に 1 つだけ」)。生存の 4 類型のうち本束で出たのは「②生成側のキー集合が未検査」「③fixture の縮退で 2 経路が同じ答え」の 2 つ | `53f5b8c` / `2e56515` / `7cd0e6c` |
