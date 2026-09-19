@@ -557,6 +557,51 @@ def test_ac14d_still_pending_on_missing_candidate(tmp_path, monkeypatch):
     assert outcome.status == "pending"
 
 
+@pytest.mark.slow
+def test_ac14_invalidated_status_comes_from_the_decision(tmp_path, monkeypatch):
+    """段 0 pin (S0-15/S0-68): `invalidated` は 7 つの outcome のうち
+    **どのテストも通っていなかった**ので、`status` のリテラルを「lock 内で
+    読んだ行の値」(= `pending`) に差し替える変異が SURVIVED した。
+    設計書 §3.5: `invalidated` の `status` の出所は **decision 結果**
+    (同 lock 内で成功した `apply_decision` に渡したリテラル) であって、
+    その前に読んだ行の値ではない。"""
+    from agentic_fx.store import approvals as approvals_store
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    # 0c (ⓓ): 同名・別 content_hash の **後発の approved** を置く。
+    newer = approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "d" * 64,
+                 "artifact_hash": "e" * 64, "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/9/sma"}, now=NOW)
+    approvals_store.apply_decision(conn, newer, "approved", decided_by="t",
+                                   now=NOW, commit=True)
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS, activity=_activity(root))
+
+    assert outcome.outcome == "invalidated"
+    assert outcome.status == "invalidated", \
+        "status が decision 結果でなく、決定前に読んだ行の値になっている"
+    assert outcome.name == "sma"
+    assert _status(conn, row["approval_id"]) == "invalidated"
+
+
+def test_approval_outcome_rejects_unknown_enum_values():
+    """段 0 pin (S0-40): `ApprovalOutcome.__post_init__` の enum 検査を
+    外す変異が SURVIVED した (不正な outcome を作るテストが 1 本も無い)。"""
+    with pytest.raises(ValueError, match="unknown approval outcome"):
+        plugin_switch.ApprovalOutcome(outcome="brand_new", name="sma",
+                                      status="pending")
+    for known in sorted(plugin_switch.APPROVAL_OUTCOMES):
+        plugin_switch.ApprovalOutcome(outcome=known, name="sma", status="pending")
+    # 既定値 (下流が取り違えていないかの基準)
+    o = plugin_switch.ApprovalOutcome(outcome="deployed", name="sma",
+                                      status="approved")
+    assert (o.op_id, o.rolled_back_op_id, o.target, o.reason) == (None,) * 4
+
+
 def test_ac5_classifier_compares_the_raw_readlink_string(tmp_path):
     """AC-5: 分類は `readlink` の**生文字列**で行う (`resolve()` ではない)。
 
