@@ -1052,6 +1052,55 @@ def test_approval_list_limit_and_cap(tmp_path):
     assert "(上限 200 件で打ち切り)" in out
 
 
+@pytest.mark.parametrize("payload_json,expected", [
+    ('{"name": "sma"}', ("name=sma", "content_hash=-")),                     # キー欠落
+    ('{"name": "sma", "content_hash": null}', ("name=sma", "content_hash=-")),  # 値 None
+    ('{"name": "sma", "content_hash": ""}', ("name=sma", "content_hash=-")),    # 空
+    ("{oops", ("name=-", "content_hash=-")),                                 # 壊れた JSON
+    ("", ("name=-", "content_hash=-")),                                      # 空文字列
+    # (payload_json は NOT NULL なので NULL は DB 側が弾く — 空文字列が下限)
+])
+def test_approval_list_is_fail_soft_for_odd_payloads(tmp_path, payload_json,
+                                                     expected):
+    """段 0 pin (S0-23/S0-24/S0-25/S0-26): payload の 3 値 (キー欠落 / 値 None /
+    空) と壊れた JSON / NULL を 1 本も渡していなかったので、`json.loads` の
+    try/except・`or ""`・`get('name', '-')`・`[:8] or '-'` の**全部**が
+    SURVIVED した ([[mutation-testing]] 6.6)。一覧は落ちずに `-` を出す。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    aid = _pending_plugin_approval(conn, "sma")
+    conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?",
+                 (payload_json, aid))
+    conn.commit()
+
+    out = cmds.dispatch("approval list")
+
+    assert out.startswith(f"#{aid} kind=plugin ")
+    for part in expected:
+        assert part in out, f"{part!r} が出ていない: {out!r}"
+
+
+def test_approval_list_argument_boundaries(tmp_path):
+    """段 0 pin (S0-19/S0-33/S0-93): 設計書 §3.5 の引数の表のうち
+    「引数過多 → `_HELP`」と「ちょうど上限 (200) は丸めない」が未 pin で、
+    `len(args) <= 3` への緩和も `>` → `>=` も SURVIVED した。
+    丸めた件数そのもの (MAX の 2 倍にする変異) も測る。"""
+    from agentic_fx.commands import _HELP
+    conn, _, _, cmds = _commands(tmp_path)
+    for i in range(3):
+        _pending_plugin_approval(conn, "sma", chash=f"{i:064d}")
+
+    assert cmds.dispatch("approval list 5 6") == _HELP, "引数過多は _HELP"
+    assert "打ち切り" not in cmds.dispatch("approval list 200"), \
+        "ちょうど上限では丸めていないので打ち切り文言を出してはならない"
+    assert "(上限 200 件で打ち切り)" in cmds.dispatch("approval list 201")
+    # 丸めた先の件数が本当に上限ちょうどか (打ち切り文言だけでは測れない)
+    for i in range(3, Commands._APPROVAL_LIST_MAX + 5):
+        _pending_plugin_approval(conn, "sma", chash=f"{i:064d}")
+    out = cmds.dispatch("approval list 999").splitlines()
+    assert len(out) == Commands._APPROVAL_LIST_MAX + 1, \
+        f"丸めた先の件数が上限 + 打ち切り 1 行と違う: {len(out)}"
+
+
 def test_approval_list_rejects_bad_argument(tmp_path):
     """AC-12c: 0 / 負数 / 非数値は usage。既存の `approval <id>` を壊さない。"""
     conn, _, _, cmds = _commands(tmp_path)
