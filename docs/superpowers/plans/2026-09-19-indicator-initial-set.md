@@ -1,4 +1,4 @@
-# [indicator-initial-set] 実装プラン v1.1 (設計書 = `docs/superpowers/specs/2026-09-19-indicator-initial-set-design.md` v1.3b 準拠)
+# [indicator-initial-set] 実装プラン v1.2 (設計書 = `docs/superpowers/specs/2026-09-19-indicator-initial-set-design.md` v1.3b 準拠)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (推奨) または superpowers:executing-plans で task ごとに実行すること。Step は
@@ -1369,6 +1369,56 @@ def test_monotonic_rise_is_one_hundred():
         {"open": closes, "high": closes, "low": closes, "close": closes,
          "volume": [1.0] * len(closes)}, index=index)
     assert float(compute(df, {})["rsi"].iloc[-1]) == 100.0
+
+
+def _epsilon_basis_df(wiggle: float = 1e-5, base: float = 150.0,
+                      n_wiggle: int = 24, mult: float = 1000.0):
+    """ε の基準が「その行自身の close」か「前の行の close」かを判別する fixture。
+
+    構成: `base` の周りを `±wiggle` で `n_wiggle` 本だけ上下させ (Wilder 平滑の
+    `avg_loss` を約 `4.0e-06` に落とす)、その次の 1 本で close を `mult` 倍する。
+    その行 (`JUMP_ROW`) では
+
+      EPS * |close[t-1]| = 1.5e-07  <  avg_loss = 4.0e-06  <  EPS * |close[t]| = 1.5e-04
+
+    となり、**閾値の基準をどちらに取るかで判定順 (2) に入るかどうかが変わる**
+    唯一の行になる (下側 26.7 倍・上側 37.5 倍の余裕)。
+
+    **この構成でしか差が出ない**: `t` 行で基準が有意に変わるには close 自身が
+    大きく動く必要があり、そのとき `avg_gain >= Δclose / period` なので比が
+    極端になり、両者の差は高々 `100 * period * EPS` (= 1.4e-06) しかない。
+    値の差で見ると `_same` の許容 (1e-07) 付近で脆いので、**判定順 (2) が返す
+    リテラル `100.0` との厳密一致**で見る (基準を前行にすると
+    `99.99999996261333` になり `== 100.0` が落ちる)。
+    """
+    closes = [base]
+    for i in range(n_wiggle):
+        closes.append(closes[-1] + (wiggle if i % 2 == 0 else -wiggle))
+    closes.append(closes[-1] * mult)
+    closes.append(closes[-1])
+    values = np.array(closes, dtype="float64")
+    index = pd.date_range("2026-01-01", periods=len(values), freq="1h",
+                          tz="UTC")
+    return pd.DataFrame(
+        {"open": values, "high": values, "low": values, "close": values,
+         "volume": np.ones(len(values))}, index=index)
+
+
+#: `_epsilon_basis_df` で基準が効く唯一の行 (`n_wiggle` 本の上下の次)。
+JUMP_ROW = 25
+
+
+def test_epsilon_threshold_uses_this_rows_close_not_the_previous_one():
+    """ε の基準は **その行自身の `|close|`** (設計書 §3.2 (i-b) / docstring)。
+
+    `EPS * close.abs()` を `EPS * close.shift(1).abs()` に変えると、この行の
+    `avg_loss` (4.0e-06) が閾値 1.5e-07 を上回って判定順 (2) に入らなくなり、
+    式どおりの `99.99999996261333` が返る。段 0 の変異スイープで、既存の
+    fixture (ランダムウォーク / 完全横ばい / 減衰横ばい) では**全行が
+    ビット一致**して生き残ることを実測したため、この観測点を足した。
+    """
+    rsi = compute(_epsilon_basis_df(), {})["rsi"]
+    assert float(rsi.iloc[JUMP_ROW]) == 100.0
 
 
 def test_eps_rule_does_not_fire_on_ordinary_data():
@@ -3261,6 +3311,43 @@ def test_eps_rule_does_not_fire_on_ordinary_data():
     assert float(out["minus_di"].iloc[-1]) > 0.0
 
 
+def _symmetric_expansion_df(n: int = 60, price: float = 150.0,
+                            step: float = 0.01) -> pd.DataFrame:
+    """毎バー high が `+step`・low が `-step` で対称に広がる (close は不動)。
+
+    すべての行で `up_move == down_move == step > 0` の**同着**になる。Wilder の
+    規則は「同着なら +DM も -DM も 0」なので `plus_di == minus_di == 0`、
+    したがって `dx = 0` / `adx = 0` になる。
+
+    **`atr` は 0.94 まで育つので ε 規則 (`atr <= EPS*|close|` = 1.5e-07) は
+    発火しない** — この pin は退化規則の言い換えではなく、同着規則そのものを
+    見ている (恒真ではないことを段 0 で実測)。
+    """
+    high = np.array([price + step * (i + 1) for i in range(n)])
+    low = np.array([price - step * (i + 1) for i in range(n)])
+    close = np.full(n, price)
+    index = pd.date_range("2026-01-01", periods=n, freq="1h", tz="UTC")
+    return pd.DataFrame(
+        {"open": close, "high": high, "low": low, "close": close,
+         "volume": np.ones(n)}, index=index)
+
+
+def test_equal_up_and_down_move_yields_no_directional_movement():
+    """`up_move == down_move` の同着では +DM / -DM とも 0 (Wilder の規則)。
+
+    比較を `>` から `>=` に緩めると**同着ぶんが片側へ丸ごと入る**:
+    段 0 の実測で `plus_dm` 側を `>=` にすると `plus_di` が 0.0 -> 1.0598、
+    `adx` が 0.0 -> **100.0** (「方向性なし」が「最強のトレンド」に化ける)。
+    `minus_dm` 側を `>=` にすると対称に `minus_di` が 1.0598 / `adx` 100.0。
+    ランダムウォークの fixture では同着が測度 0 でしか起きないため、
+    この構成でしか観測できない (M32 / M41 は既存の 16 テストを素通りした)。
+    """
+    out = compute(_symmetric_expansion_df(), {})
+    assert float(out["plus_di"].iloc[-1]) == 0.0
+    assert float(out["minus_di"].iloc[-1]) == 0.0
+    assert float(out["adx"].iloc[-1]) == 0.0
+
+
 def test_di_stays_within_bounds():
     out = compute(_mkdf(), {})
     for key in ("adx", "plus_di", "minus_di"):
@@ -4824,6 +4911,47 @@ PRICE_KEYS = frozenset({"value", "upper", "middle", "lower", "atr", "macd",
                         "signal", "hist", "tenkan", "kijun", "senkou_a",
                         "senkou_b", "chikou"})
 
+#: I5 が観測する系列の完全な一覧 (`<plugin 名>.<出力キー>`)。**20 本ある** —
+#: 出力キー名だけで束ねると `sma.value` と `ema.value` が衝突して
+#: 片方 (dict の後勝ちで `sma`) が一度も観測されない。段 0 の実測では
+#: `sma` の実装を `close.expanding(...).mean()` (先頭依存が最大の形) に
+#: 差し替えても I5 の 3 テストが全て緑のまま通った。
+DELTA_KEYS = frozenset(
+    {f"{name}.{key}"
+     for name, keys in (("sma", ("value",)), ("ema", ("value",)),
+                        ("rsi", ("rsi",)),
+                        ("macd", ("macd", "signal", "hist")),
+                        ("bollinger", ("upper", "middle", "lower")),
+                        ("atr", ("atr",)),
+                        ("adx", ("adx", "plus_di", "minus_di")),
+                        ("stochastic", ("k", "d")),
+                        ("ichimoku", ("tenkan", "kijun", "senkou_a",
+                                      "senkou_b", "chikou")))
+     for key in keys})
+
+
+def _tolerance(delta_key: str, base: float) -> float:
+    """`<plugin 名>.<出力キー>` の出力キー側で値域を引く (設計書 §6 I5)。"""
+    return (1e-6 if delta_key.split(".", 1)[1] in PCT_KEYS
+            else 1e-9 * base)
+
+
+# --- I5 の前提: 宣言 `max_bars` ---------------------------------------------
+
+def test_all_nine_declare_max_bars_400():
+    """9 本の `config.yaml` が `max_bars: 400` を宣言していること (設計書 §3.2 / D4)。
+
+    **`_last_row_deltas` の結合だけでは足りない**ので独立に pin する。段 0 の実測:
+    `ema` を `max_bars: 50` にすると結合した I5 が red になる
+    (span=20 の EMA は 50 本では初期値の重みが `(19/21)**50` = 6.7e-03 残る) が、
+    `sma` / `bollinger` / `stochastic` / `ichimoku` は窓が有限なので
+    `tail(50)` と全長が最終行で厳密に一致し、**結合しても red にならない**。
+    `test_nine_indicators_bless_in_sequence` も同じ値を見ているが、あちらは
+    `slow` の bless 実走 (段 0 実測 41 秒) なのでここに 1 秒の観測点を置く。
+    """
+    for meta in _nine_metas():
+        assert meta.max_bars == 400, (meta.name, meta.max_bars)
+
 #: `__pycache__` / `.pytest_cache` は `check_candidate_snapshot` が無視する
 #: (`gate_pytest.py:43,46-55`) ので**除外しない** — runbook の
 #: `cp -r` がそのまま巻き込んでも通ることを I8(a) で観測する。
@@ -4882,6 +5010,31 @@ def test_all_nine_pass_the_indicator_validator():
                                   outputs=meta.outputs)
 
 
+def test_declared_params_match_each_plugins_own_defaults():
+    """`config.yaml` の `params` が `plugin.py` の既定値と一致していること。
+
+    **どちらのテストも片側しか見ていなかった**: 9 本の自己テストは
+    `compute(df, {})` (= `plugin.py` の既定値) だけを、I2 は
+    `compute(df, dict(meta.params))` (= `config.yaml` の宣言値) だけを通す。
+    段 0 の実測で `sma` の `period: 20 -> 5`、`bollinger` の
+    `num_std: 2.0 -> 3.0` がどちらも全テストを素通りした (M39 / M40)。
+    宣言値は**実際に本番で使われる値**であり、ずれると「自己テストが緑の
+    まま、配備された指標だけ別物」になる。
+
+    値の表を手で持たずに**振る舞いで**比べる (どちらの向きのずれも捕まる)。
+    """
+    df = _df(300)
+    for meta in _nine_metas():
+        compute = _load_compute(meta.name, meta.path / "plugin.py")
+        declared = compute(df, dict(meta.params))
+        builtin = compute(df, {})
+        for key in meta.outputs:
+            assert np.array_equal(
+                declared[key].to_numpy(dtype="float64"),
+                builtin[key].to_numpy(dtype="float64"),
+                equal_nan=True), (meta.name, key, dict(meta.params))
+
+
 # --- I5: 先頭依存の回帰 ------------------------------------------------------
 
 def _spike_df(n=5000, base=150.0, spike=0.0, seed=1):
@@ -4923,21 +5076,32 @@ def _degenerate_df(n_pre=200, n_flat=400, base=150.0, spike=1.0, seed=0):
                         index=index)
 
 
-def _last_row_deltas(df: pd.DataFrame, max_bars: int = 400) -> dict:
-    """全 9 本について「末尾 `max_bars` 本だけで計算した最終行」と
-    「全 `len(df)` 本で計算した最終行」の差の絶対値を `{キー: 値}` で返す。
-    両方 NaN のキー (`ichimoku.chikou` 等) は 0.0 とみなす。"""
+def _last_row_deltas(df: pd.DataFrame) -> dict:
+    """全 9 本について「**その plugin が宣言した `max_bars`** 本だけで計算した
+    最終行」と「全 `len(df)` 本で計算した最終行」の差の絶対値を
+    `{"<plugin 名>.<出力キー>": 値}` で返す。
+    両方 NaN のキー (`ichimoku.chikou` 等) は 0.0 とみなす。
+
+    **キーは plugin 名で修飾する** (`DELTA_KEYS` の注記) — 出力キー名だけだと
+    `sma.value` が `ema.value` に上書きされて消える。
+
+    **末尾の本数は `meta.max_bars` から取る** — 400 を引数既定値に固定すると、
+    I5 が「宣言 `max_bars` の本数で保証が成り立つ」ではなく「400 本で
+    成り立つ」しか観測せず、`config.yaml` の宣言を変えても何も red に
+    ならない (段 0 の実測)。
+    """
     out: dict[str, float] = {}
-    tail = df.tail(max_bars).copy(deep=True)
     for meta in _nine_metas():
         compute = _load_compute(meta.name, meta.path / "plugin.py")
+        tail = df.tail(meta.max_bars).copy(deep=True)
         full_res = compute(df, dict(meta.params))
         tail_res = compute(tail, dict(meta.params))
         for key, series in full_res.items():
             a = float(series.iloc[-1])
             b = float(tail_res[key].iloc[-1])
-            out[key] = 0.0 if (np.isnan(a) and np.isnan(b)) else abs(a - b)
-    assert set(out) == PCT_KEYS | PRICE_KEYS, sorted(set(out))
+            out[f"{meta.name}.{key}"] = (
+                0.0 if (np.isnan(a) and np.isnan(b)) else abs(a - b))
+    assert set(out) == DELTA_KEYS, sorted(set(out))
     return out
 
 
@@ -4950,7 +5114,7 @@ def test_head_dependence_within_tolerance_on_random_walks():
         for seed in range(8):
             deltas = _last_row_deltas(_spike_df(base=base, seed=seed))
             for key, delta in deltas.items():
-                tol = 1e-6 if key in PCT_KEYS else 1e-9 * base
+                tol = _tolerance(key, base)
                 assert delta < tol, (base, seed, key, delta, tol)
                 worst = max(worst, delta)
     assert worst < 1e-6, worst
@@ -4963,7 +5127,7 @@ def test_head_dependence_on_the_spike_fixture():
     base = 150.0
     deltas = _last_row_deltas(_spike_df(base=base, spike=base * 0.6, seed=1))
     for key, delta in deltas.items():
-        tol = 1e-6 if key in PCT_KEYS else 1e-9 * base
+        tol = _tolerance(key, base)
         assert delta < tol, (key, delta, tol)
 
 
@@ -4980,9 +5144,10 @@ def test_head_dependence_on_the_degenerate_fixture():
     deltas = _last_row_deltas(_degenerate_df())
     for key, delta in deltas.items():
         assert delta < 1e-4, (key, delta)
-    for key in ("rsi", "plus_di", "minus_di", "k", "d"):
+    for key in ("rsi.rsi", "adx.plus_di", "adx.minus_di",
+                "stochastic.k", "stochastic.d"):
         assert deltas[key] == 0.0, (key, deltas[key])
-    assert 0.0 < deltas["adx"] < 1e-4, deltas["adx"]
+    assert 0.0 < deltas["adx.adx"] < 1e-4, deltas["adx.adx"]
 
 
 # --- I6 / I8: bless の tmp 環境 ---------------------------------------------
@@ -5538,3 +5703,4 @@ I8(b) の残骸 assert に「journal 0 行」を書くと red /
 |---|---|---|---|---|
 | 2026-09-19 | v1.0 | 起案。設計書 v1.3a を T0 (共通テンプレート) / T1〜T9 (指標 1 本ずつ、並列可) / T10 (repo 側受入テストと runbook) の 11 task へ分割。**T1〜T9 の逐語コード 27 ファイルは指揮者が scratchpad で生成・実行し 131 passed を確認済み**。逆変異 54 件を実測し 54/54 KILLED (初回 9 件生存 → すべてテスト側の欠陥として修正)。I5 の数値・壊れた実装の red・等価変異 1 件を「着手前検証の記録」に記載 | 設計書 v1.3a (codex 設計レビュー r3 で指摘 0、収束) | - |
 | 2026-09-19 | v1.1 | **T10 の着手前検証** (Critical 4 / Important 8 / Minor 5) を全件反映。Step 10-b〜10-h を実物照合済みの記述へ改訂し、**Step 10-i に完成ファイル `tests/plugin/test_indicator_initial_set.py` の逐語 (実測 10 passed / 41.7 秒) を追加**。「着手前検証の記録 §8」の 2 件を設計書 v1.3b へ反映して閉じ、§9 に T10 の実測を追加。**T1〜T9 の節と行番号は一切動かしていない** (改訂は L4438 以降 + 冒頭 1 行の版表記のみ)。なお本文 L24 / L73 の「設計書 v1.3a」表記は、T10 より前の行を動かさない制約のため据え置き — **v1.3b は v1.3a に対する設計変更ゼロの改訂** (観測値の訂正 + 既知の欠落の起票) なので参照の妥当性は保たれる | T10 は起草者自身が「tmp 環境での bless 実測をしていない、最もプラン記述の欠陥を踏みやすい」と申告していた箇所 ([[plan-code-defects-not-implementer-defects]] 「着手前検証を必須工程にする」) | - |
+| 2026-09-19 | v1.2 | **段 0 (指揮者の変異スイープ、レビュー前) の結果を反映。** 変異 78 件 (実装者の 60 件とは別次元) を打ち、**生存 8 件 → 是正 3 commit**。(a) **I5 が何も観測していなかった** — `_last_row_deltas` が出力キー名だけで束ねていたため `sma.value` が `ema.value` に上書きされ、9 本 20 系列のうち 19 本しか測っていなかった (`sma` を `expanding` = 先頭依存最大の実装に差し替えても 3 テストとも緑)。さらに末尾本数が `max_bars: int = 400` の**関数引数に固定**されており、`config.yaml` の宣言を変えても red にならなかった。キーを `<plugin 名>.<出力キー>` に修飾し、`df.tail(meta.max_bars)` を plugin ごとに取り、`test_all_nine_declare_max_bars_400` を追加 (窓が有限な 4 本は結合だけでは守れないため両方要る)。(b) `config.yaml` の `params` と `plugin.py` の既定値の乖離が**どちらのテストからも見えていなかった** (自己テストは `compute(df, {})`、I2 は `meta.params`) → `test_declared_params_match_each_plugins_own_defaults` を追加。(c) ADX の DM **同着規則** (`up_move > down_move` を `>=` に緩めると `adx` 0.0 → **100.0**) がランダムウォーク fixture では測度 0 で観測できず生存 → `_symmetric_expansion_df` を追加。(d) `rsi` の ε 基準 (「その行自身の `close`」) を判別する fixture を追加 (起草者の「等価」記録を訂正 — 価格比が 1 から大きく外れる行は作れる)。**Step 10-i / T3 / T7 のコードブロックを実ファイルへ同期し機械抽出で差分ゼロを再確認済み。** 併せて**実装者が報告した逆変異表の 5 件の誤りを訂正**: ① `rolling(window=p)` の `min_periods` を「外す」は pandas の既定が window なので**等価** (sma / bollinger / stochastic / ichimoku の 4 件)、さらに stochastic / ichimoku では `min_periods=1` を **`highest` か `lowest` の片側だけ**に当てても反対側の NaN が `highest - lowest` / `(highest + lowest)/2` を通って伝播するため**等価** (両側同時に当てて初めて KILLED) ② `ema` に `rolling(center=True)` は適用不可 ③ macd-6 は 9 本落ちる ④ bollinger-2 は 2 本落ちる ⑤ **Step 10-a の例示変異 `timeframe: 1h` は red にならない** — `timeframe` は loader の許可トップレベルキー (`plugin/loader.py:102-104`) なので「未知キー」ではない | 段 0 は 1 周目レビューの前提 ([[mutation-testing]] 3.6「変異を注入する主体は同時に 1 つだけ」)。生存の 4 類型のうち本束で出たのは「②生成側のキー集合が未検査」「③fixture の縮退で 2 経路が同じ答え」の 2 つ | `53f5b8c` / `2e56515` / `7cd0e6c` |
