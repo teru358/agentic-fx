@@ -2,9 +2,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import os
+
 import pytest
 
 from agentic_fx.activity import ActivityLog, Category
+from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.commands import Commands
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
@@ -553,7 +556,13 @@ def test_approval_retry_dispatches_to_switch_retry_approval(tmp_path, monkeypatc
 
     def _spy(conn_, approval_id, *, decided_by, now, plugins_root, settings,
             activity=None):
+        # [switch-ops-hardening] T5: 実物は **必ず `ApprovalOutcome` を返す**。
+        # 旧 spy は `None` を返す「実物より緩い fake」で、シェルが outcome を
+        # 文言に写す契約 (設計書 §3.5) を素通りさせていた。
         calls.append((approval_id, decided_by))
+        return plugin_switch.ApprovalOutcome(
+            outcome="deployed", name="sma", status="approved", op_id=7,
+            target=".versions/sma/" + "a" * 64)
 
     monkeypatch.setattr("agentic_fx.plugin.switch.retry_approval", _spy)
 
@@ -561,6 +570,7 @@ def test_approval_retry_dispatches_to_switch_retry_approval(tmp_path, monkeypatc
 
     assert calls == [(42, "shell")]
     assert "再試行" in out
+    assert "配備まで完了しました" in out
     records = activity.tail(10, Category.APPROVAL)
     assert any("retry" in r for r in records)
 
@@ -939,3 +949,139 @@ def test_plugin_decision_with_a_noncanonical_payload_name_reports_an_error(
     assert row["status"] == "pending"
     # lock ファイルも作られない (`.locks` の mkdir より前に落ちる)
     assert not (plugins_dir / ".locks").exists()
+
+
+# ============================================================
+# [switch-ops-hardening] T5 / T7 — `approval list` と retry の結果報告
+# ============================================================
+
+
+def _fake_outcome(**kw):
+    base = dict(outcome="deployed", name="sma", status="approved", op_id=3,
+                target=".versions/sma/" + "a" * 64)
+    base.update(kw)
+    return plugin_switch.ApprovalOutcome(**base)
+
+
+@pytest.mark.parametrize("outcome,expected", [
+    (_fake_outcome(), "配備まで完了しました (plugins/sma → .versions/sma/" + "a" * 64 + ")"),
+    (_fake_outcome(outcome="deployed_after_rollback", rolled_back_op_id=2),
+     "中断していた切替 (op_id=2) を巻き戻してから再実行し、配備まで完了しました"),
+    (_fake_outcome(outcome="foreign_waiting", status="pending", target=None),
+     "live が第三者に触られているため自動収束しません (op_id=3)"),
+    (_fake_outcome(outcome="still_pending", status="pending", target=None,
+                   reason="candidate_missing"),
+     "approved になりませんでした (reason=candidate_missing)"),
+    (_fake_outcome(outcome="legacy_plain_present", status="pending", target=None),
+     "plugins/sma が旧式のディレクトリのままです"),
+    (_fake_outcome(outcome="already_decided", status="rejected", target=None),
+     "この承認は既に決着しています (status=rejected)"),
+])
+def test_approval_retry_reports_the_locked_outcome(tmp_path, monkeypatch, outcome,
+                                                   expected):
+    """AC-14a: シェルは lock 内で確定した outcome を文言に写すだけ (全 6 行)。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / ".locks").mkdir(parents=True)
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    monkeypatch.setattr("agentic_fx.plugin.switch.retry_approval",
+                        lambda *a, **kw: outcome)
+
+    out = cmds.dispatch("approval retry 7")
+
+    assert out.startswith("approval #7 を再試行しました: ")
+    assert expected in out
+
+
+def test_approval_retry_fails_loud_on_unknown_outcome(tmp_path, monkeypatch):
+    """AC-14d(3): 未知 / None の outcome は**文言にしない** (fail loud)。
+    接頭辞も付かず `エラー: ...` になる。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / ".locks").mkdir(parents=True)
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    monkeypatch.setattr("agentic_fx.plugin.switch.retry_approval",
+                        lambda *a, **kw: None)
+
+    out = cmds.dispatch("approval retry 7")
+
+    assert out.startswith("エラー: ")
+    assert "を再試行しました" not in out
+
+
+def test_approval_retry_missing_id_is_value_error_with_help(tmp_path, monkeypatch):
+    """AC-14a: 存在しない approval への retry は `ValueError` 送出で、
+    先行する `except (ValueError, KeyError)` に捕まり `_HELP` が付く。"""
+    from agentic_fx.commands import _HELP
+    conn, _, _, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / ".locks").mkdir(parents=True)
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+
+    def _raise(*a, **kw):
+        raise ValueError("approval 42 not found")
+
+    monkeypatch.setattr("agentic_fx.plugin.switch.retry_approval", _raise)
+
+    out = cmds.dispatch("approval retry 42")
+
+    assert out == f"エラー: ValueError: approval 42 not found\n{_HELP}"
+
+
+def test_approval_retry_message_unaffected_by_later_deployment(tmp_path, monkeypatch):
+    """AC-14b: lock 解放後に別の正規配備が live を進めても、**この retry の
+    報告は自分の target のまま**。シェルが lock 外で読み直さないことの pin。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / ".locks").mkdir(parents=True)
+    (plugins_dir / ".versions" / "sma" / ("a" * 64)).mkdir(parents=True)
+    (plugins_dir / ".versions" / "sma" / ("z" * 64)).mkdir(parents=True)
+    (plugins_dir / "sma").symlink_to(".versions/sma/" + "a" * 64)
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    mine = _fake_outcome()
+
+    def _retry_then_competitor(*a, **kw):
+        # retry は自分の target まで配備した。その直後に別プロセスが
+        # **正規に**次の版を配備して live を進める (IV-3 は「approved に
+        # なった瞬間」の条件なので、これは契約違反ではない)。
+        tmp_link = plugins_dir / ".sma.next"
+        tmp_link.symlink_to(".versions/sma/" + "z" * 64)
+        os.rename(tmp_link, plugins_dir / "sma")
+        return mine
+
+    monkeypatch.setattr("agentic_fx.plugin.switch.retry_approval",
+                        _retry_then_competitor)
+
+    out = cmds.dispatch("approval retry 7")
+
+    assert "配備まで完了しました" in out
+    assert "a" * 64 in out, "後続配備の target を報告してはならない"
+    assert "z" * 64 not in out
+    assert "一致しません" not in out
+
+
+def test_approval_retry_fails_loud_on_unknown_enum_value(tmp_path, monkeypatch):
+    """AC-14d(3) の対: **未知の enum 値**も文言にしない (fail loud)。
+    `None` は属性参照で落ちるが、この経路は文字列の網羅漏れを狙う。"""
+    from types import SimpleNamespace
+    conn, _, _, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / ".locks").mkdir(parents=True)
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    monkeypatch.setattr(
+        "agentic_fx.plugin.switch.retry_approval",
+        lambda *a, **kw: SimpleNamespace(outcome="brand_new_outcome", name="sma",
+                                         status="pending", op_id=1,
+                                         rolled_back_op_id=None, target=None,
+                                         reason=None))
+
+    out = cmds.dispatch("approval retry 7")
+
+    assert out.startswith("エラー: ")
+    assert "を再試行しました" not in out
+    assert "brand_new_outcome" in out

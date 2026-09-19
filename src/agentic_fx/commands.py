@@ -144,13 +144,20 @@ class Commands:
                     return "approval retry backend (plugins_root/settings) が未配線です"
                 from agentic_fx.plugin import switch as plugin_switch
                 approval_id = int(args[1])
-                plugin_switch.retry_approval(
+                # [switch-ops-hardening] T5 (設計書 §3.5): `retry_approval` が
+                # **plugin flock の内側で確定した** outcome を返す。ここでは
+                # それを文言に写すだけで、lock の外で DB / FS を読み直さない
+                # (読み直すと、別プロセスの後続の正規配備を「契約違反」と
+                # 誤報する)。未知 / None は文言にせず例外に落とす (fail loud) —
+                # 本体の return 漏れを「普通の応答」に化けさせないため。
+                outcome = plugin_switch.retry_approval(
                     self.conn, approval_id, decided_by="shell", now=self.clock.now(),
                     plugins_root=self.plugins_root, settings=self.settings,
                     activity=self.activity)
                 self.activity.write(Category.APPROVAL, "retry",
                                     f"#{approval_id} via shell", ref_id=str(approval_id))
-                return f"approval #{approval_id} を再試行しました"
+                return (f"approval #{approval_id} を再試行しました: "
+                        f"{self._retry_outcome_text(outcome)}")
             if cmd == "approval" and len(args) == 1 and args[0].isdigit():
                 # [approval-payload-missing-gate-metrics] 是正 (A4 10 回目
                 # claude #69 観測 A、2026-09-11): approve/reject する前に
@@ -341,6 +348,30 @@ class Commands:
             return [cls._metrics_line(f"{prefix} {pair}", metrics)
                    for pair, metrics in value.items()]
         return [cls._metrics_line(prefix, None)]
+
+    def _retry_outcome_text(self, outcome) -> str:
+        """[switch-ops-hardening] T5: `ApprovalOutcome` を文言に写す。
+        未知 / None はここで `ValueError` になり、`dispatch` の包括 `except`
+        が `エラー: ...` を返す (fail loud — 設計書 §3.5)。"""
+        kind = outcome.outcome  # None なら AttributeError (fail loud)
+        if kind in ("deployed", "deployed_after_rollback"):
+            tail = f"配備まで完了しました (plugins/{outcome.name} → {outcome.target})"
+            if kind == "deployed_after_rollback":
+                return (f"中断していた切替 (op_id={outcome.rolled_back_op_id}) を"
+                        f"巻き戻してから再実行し、{tail}")
+            return tail
+        if kind == "foreign_waiting":
+            return (f"live が第三者に触られているため自動収束しません "
+                    f"(op_id={outcome.op_id})。plugins/{outcome.name} の状態を"
+                    "確認してください")
+        if kind == "still_pending":
+            return f"approved になりませんでした (reason={outcome.reason})"
+        if kind == "legacy_plain_present":
+            return (f"plugins/{outcome.name} が旧式のディレクトリのままです "
+                    "(先に afx plugin retire が要ります)")
+        if kind in ("already_decided", "invalidated"):
+            return f"この承認は既に決着しています (status={outcome.status})"
+        raise ValueError(f"unknown approval outcome: {kind!r}")
 
     def _approval_detail(self, approval_id: int) -> str:
         row = self.conn.execute(

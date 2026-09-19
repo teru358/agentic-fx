@@ -797,15 +797,13 @@ def test_runbook_post_gate_failure_converges_via_approval_retry(tmp_path,
     |---|---|---|
     | `preparing` (版作成で失敗) | journal 終端 + **配備完了** | 手順 5 の確認。同内容なので no-op |
     | `versioned` / `recorded` (history / 切替直前) | journal 終端 + **配備完了** | 同上 (本テストのケース) |
-    | `switched` (切替で失敗し live が新 target でない) | journal 終端・approval `approved` だが **配備されない** (`approve_candidate` の 0d は `switched` を `_reverify_switched_journal` → `_finalize_decision` で閉じるだけで `switch_live` を呼ばない、`switch.py:1440-1454`) | **必須** |
+    | `switched` (切替で失敗し live が新 target でない) | journal 終端 + **配備完了** (停止行を巻き戻して閉じ、新しい journal 行で手順を頭から流す — [switch-ops-hardening] 案 C) | 確認 (no-op) |
 
-    `switched` の行は **`[retry-switched-approves-without-deploy]` として指揮者へ
-    申告済みの観測**であり、本テストの対象ではない (起動時 reconcile なら
-    live target を見て `_revert_one` する — `test_switch_journal.py::
-    test_switched_recovery_absent_old_kind_with_no_live_reverts`)。
+    `switched` の行は [switch-ops-hardening] で解消済み。0d は live の指す先を
+    分類し、`not_switched` なら巻き戻してから新しい行で配備まで完了させる。
+    live が第三者に触られている (`foreign`) ときだけ、触らず人間待ちになる。
     §6.3 (B) の手順 5 (「もう一度 bless して `UnresolvedJournalError` が出ない
-    ことを確認する。そのまま成功すれば配備完了」) は **どちらの phase でも
-    正しく働く**ので、runbook は手順 5 を必ず実行する形のままでよい。
+    ことを確認する」) は **どの phase でも確認 (no-op)** として働く。
 
     状態遷移そのものは `tests/plugin/test_switch_journal.py` /
     `test_reconcile.py` が pin 済みなので再実装しない (設計書 §6.1)。
@@ -851,8 +849,13 @@ def test_runbook_post_gate_failure_converges_via_approval_retry(tmp_path,
         activity=ActivityLog(root / "logs" / "activity.log"),
         log_dir=root / "logs", clock=clock, health_latch=HealthLatch(),
         plugins_root=plugins_dir, settings=SETTINGS)
-    assert cmds.dispatch(f"approval retry {approval_id}") == (
-        f"approval #{approval_id} を再試行しました")
+    # [switch-ops-hardening] T5: シェルは lock 内で確定した outcome を文言に
+    # 写す (設計書 §3.5)。`versioned` からの retry は新規経路を流し切るので
+    # `deployed`。
+    retry_out = cmds.dispatch(f"approval retry {approval_id}")
+    assert retry_out.startswith(f"approval #{approval_id} を再試行しました: ")
+    assert "配備まで完了しました" in retry_out
+    assert f"plugins/rsi → .versions/rsi/" in retry_out
 
     # `versioned` からの retry は手順を頭から冪等に流すので、journal の終端と
     # **配備の完了**が同時に起きる。
