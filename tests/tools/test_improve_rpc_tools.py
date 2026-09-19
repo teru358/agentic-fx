@@ -16,8 +16,8 @@ from agentic_fx.backtest.analysis import analyze_for_agent
 from agentic_fx.config import ImproveToolBudgetSettings
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.tools.improve_rpc_tools import (
-    RpcOutcome, _FORBIDDEN_KEYS, _is_successful_backtest, _strip_forbidden,
-    build_improve_rpc_tooldefs, build_rpc_handlers,
+    RpcOutcome, _FORBIDDEN_KEYS, _RUN_BACKTEST_KIND_HINT, _is_successful_backtest,
+    _strip_forbidden, build_improve_rpc_tooldefs, build_rpc_handlers,
 )
 from agentic_fx.tools.mission_counters import MissionToolCounters
 
@@ -83,6 +83,39 @@ def test_parent_rpc_wrapper_returns_public_private_without_recording(tmp_path):
     assert isinstance(outcome, RpcOutcome)
     assert outcome.public == {"metrics": {"pf": 1.2}, "trial_count": 3}
     assert outcome.private == result.save_kwargs
+
+
+@pytest.mark.parametrize("bad_name", [123, "../victim", "good\n"])
+def test_build_rpc_handlers_run_backtest_rejects_bad_name_before_reaching_handler(
+        tmp_path, bad_name):
+    """3 周目レビュー指摘 1 (review-r3.md 指摘 1): `improve_rpc_tools.
+    build_rpc_handlers` (= `_build_worker_runner` が実際に WorkerRunner へ
+    渡す本番の dispatch 経路そのもの) でラップした `run_backtest` に非 str
+    な `name` (`123`) を渡すと、`_safe_join` 内の `fullmatch` が
+    `TypeError` を送出していた (是正前は例外、是正後は既存のエラー応答形で
+    fail closed)。`"../victim"`/`"good\n"` も同じ実配線経路で回帰保護する
+    — いずれも内側の `run_backtest_handler` (= WorkerRunner 経由で
+    `improve_loop._build_rpc_handlers` が返す本物) には到達しない。"""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    seen: list = []
+
+    def run_backtest_handler(args):
+        seen.append(args)
+        return {"started": False}
+
+    handlers = build_rpc_handlers(
+        {"run_backtest": run_backtest_handler,
+         "analyze_corr": lambda args: {"trial_count": 1}},
+        staging_dir,
+    )
+
+    outcome = handlers["run_backtest"]({"name": bad_name, "pair": "USDJPY"})
+
+    assert isinstance(outcome, RpcOutcome)
+    assert outcome.public == {"error": "invalid candidate name",
+                              "candidate_kind": None, "hint": _RUN_BACKTEST_KIND_HINT}
+    assert seen == []
 
 
 def test_run_backtest_records_to_ledger_and_returns_handler_result():

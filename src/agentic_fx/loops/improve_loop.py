@@ -996,6 +996,14 @@ class ImproveLoop:
             # `_discover_one` がそのディレクトリを読んだ。join より**前**に
             # 検証する (非 str も来うるので `isinstance` を先に見る —
             # `fullmatch(123)` は TypeError)。
+            #
+            # 3 周目レビュー指摘 1 (review-r3.md、2026-09-19、Minor):
+            # 現行の唯一の呼び出し元は `improve_rpc_tools` のラッパ
+            # (`build_rpc_handlers`/`build_improve_rpc_tooldefs` の
+            # `run_backtest` closure) で、そこで `_safe_join` が先に同じ
+            # 正規形検査をするため、実配線ではこのガードに到達しない。
+            # ラッパを経由しない呼び出し元が将来増えた場合の二重防御として
+            # 残す。
             # 応答形は `started: False` 側 (§2.9c / F4) — backtest は
             # 始まっていないので、子はこの形で予約を戻す。
             name = args.get("name")

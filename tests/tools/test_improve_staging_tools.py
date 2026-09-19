@@ -102,6 +102,19 @@ def test_safe_join_rejects_name_with_trailing_newline(tmp_path):
     assert not any(p.name.endswith("\n") for p in staging_dir.iterdir())
 
 
+@pytest.mark.parametrize("bad_name", [123, None, ["a"], {"a": 1}])
+def test_safe_join_rejects_non_str_name_without_raising(tmp_path, bad_name):
+    """3 周目レビュー指摘 1 (review-r3.md): `_PLUGIN_NAME_RE.fullmatch(name)`
+    は `name` が str でないと `TypeError` を送出する。RPC 越しの直呼び
+    (`improve_rpc_tools.build_rpc_handlers` が wire の生 JSON に対して
+    handler を呼ぶ経路) は jsonschema を経由しないため、非 str が
+    そのままここへ届きうる — 例外ではなく既存の「不正名は None」契約に
+    揃える。"""
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    assert improve_staging_tools._safe_join(staging_dir, bad_name) is None
+
+
 def test_write_staging_file_rejects_rel_outside_allowed_set(tmp_path):
     tools, _, _ = _build(tmp_path)
     out = tools["write_staging_file"].func(

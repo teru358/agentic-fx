@@ -71,6 +71,13 @@ def _failure_signature(full_output: str) -> tuple:
 def _safe_join(root: Path, name: str, rel: str | None = None) -> Path | None:
     # round2 M1 是正 (2026-08-29、verified-round2.md M1): fullmatch に揃える
     # (`.match()` + `$` は末尾改行を受理する — probe 実測)。
+    # 3 周目レビュー指摘 1 (review-r3.md、2026-09-19): `name` が str で
+    # ないと `fullmatch(name)` が `TypeError` を送出する。RPC 越しの直呼び
+    # (`improve_rpc_tools.build_rpc_handlers` が wire の生 JSON に対して
+    # handler を呼ぶ経路) は jsonschema を経由しないため、先に isinstance
+    # で弾き、既存の「不正名は None」契約に揃える。
+    if not isinstance(name, str):
+        return None
     if not plugin_loader._PLUGIN_NAME_RE.fullmatch(name):
         return None
     if rel is not None and rel not in _ALLOWED_REL:
