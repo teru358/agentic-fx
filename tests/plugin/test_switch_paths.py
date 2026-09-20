@@ -188,12 +188,19 @@ def test_approve_live_plain_stays_pending_with_legacy_reason(env, monkeypatch):
         candidate_origin="staging", mission_id=1, backlog_id=None,
         settings=settings, now=NOW)
 
-    switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW, plugins_root=plugins_dir, settings=settings)  # B-1
+    outcome = switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW, plugins_root=plugins_dir, settings=settings)  # B-1
 
     row = conn.execute("SELECT status, reason FROM approval_requests WHERE id=?",
                        (approval_id,)).fetchone()
     assert row["status"] == "pending"  # 決定しない
     assert row["reason"] == "legacy_plain_present"  # B-6: 厳密一致で書かれること
+    # 段 0 pin (S0-78): `legacy_plain_present` 分岐の `ApprovalOutcome.status`
+    # を `"approved"` に潰す変異が SURVIVED した。シェル文言テスト
+    # (`tests/test_commands.py`) は偽の `ApprovalOutcome` を渡すので
+    # `approve_candidate` の実経路を測れない — ここで実物の戻り値を見る。
+    assert outcome.outcome == "legacy_plain_present"
+    assert outcome.status == "pending", \
+        "legacy_plain_present の status が実経路から得られていない"
     assert (plugins_dir / "sma").is_dir() and not (plugins_dir / "sma").is_symlink()
     # 版は作られている (git まで進める) — M-9 是正: 意味不明な式を「非空」に書き直す
     version_dirs = list((plugins_dir / ".versions" / "sma").glob("*"))
