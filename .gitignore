@@ -12,6 +12,7 @@ wheels/
 # Secrets / personal config
 .env
 config/settings.yaml
+policy/directives.md
 
 # Local data / logs / personal notes
 data/
