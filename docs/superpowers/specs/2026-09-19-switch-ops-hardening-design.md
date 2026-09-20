@@ -1,4 +1,4 @@
-# [switch-ops-hardening] 設計書 v1.6a
+# [switch-ops-hardening] 設計書 v1.6b
 
 束: plugin 承認・切替回廊の**収束の穴と、人間から見える状態の穴**を塞ぐ。
 起票済み 3 件 — `[retry-switched-approves-without-deploy]` / `[cli-bless-unresolved-journal]`
@@ -48,7 +48,7 @@
   「id が見えない」「retry が効かない」という本来の困りごとは消える。
 - **journal の phase 語彙・DDL の変更**。本束は既存の 6 phase の中で閉じる。
 - **切替の順序 (journal-first) の変更**。`_advance_to_decided` が `phase='switched'` を commit してから
-  `switch_live` を呼ぶ順序 (`switch.py:1231-1234`) は設計書 §5.1 の要求どおりで**正しい**。変えない。
+  `switch_live` を呼ぶ順序 (`switch.py:1336-1338`) は設計書 §5.1 の要求どおりで**正しい**。変えない。
 - **承認の自動化**。approved にする契機は従来どおり人間の `approve` / `bless` / `approval retry` のみ。
 
 ---
@@ -94,7 +94,7 @@ retry は「人間が今ここにいて、この承認を成立させたい」�
 **v1.2 (r2 Important 4) で `commands.py` からの import 要件は削除した** — シェルは lock の外で分類し直すのではなく、
 `approve_candidate` が **lock の内側で確定した outcome** を受け取って文言に写すだけにする (§3.5)。
 
-**比較方法は既存 reconcile を正とする** (`switch.py:184-186` 逐語):
+**比較方法は既存 reconcile を正とする** (`switch.py:84-85` 逐語):
 
 ```python
 live = plugins_root / row["name"]
@@ -103,15 +103,15 @@ live_target = live.readlink().as_posix() if live.is_symlink() else None
 
 - **`readlink` の生文字列**で比較する。`resolve()` は**使わない**。
   理由: journal の `new_target` / `old_target` は `.versions/<name>/<hash>` という
-  **`plugins_root` 相対の文字列**として書かれ (`switch.py:1234` / `:1535`)、`switch_live` はそれをそのまま
-  symlink の中身にする (`_atomic_symlink_swap`、`:113-125`)。`resolve()` を使うと
+  **`plugins_root` 相対の文字列**として書かれ (`switch.py:1700` / `:2062`)、`switch_live` はそれをそのまま
+  symlink の中身にする (`_atomic_symlink_swap`、`:167-179`)。`resolve()` を使うと
   (i) **dangling symlink** (版 dir が消えている) で比較が壊れ、(ii) `plugins_root` 自体が symlink 経由の
   パスだと別名に化ける。**0d 側を既存 reconcile の比較に揃える** (逆をしない)。
 - 正規化 (`Path.as_posix()` 以外の normalize) は**しない**。書いた側と読む側が同じ規約なので不要であり、
   「見かけ上一致するが実体が違う」を作らないため。
 
 **判定表** (`old_kind` は DDL 上 `absent` / `symlink` の 2 値のみ — `db.py:169` の CHECK 制約。
-`plain` は journal 行を作らない = `legacy_plain_present` で pending 留置される `switch.py:1537-1550` ので
+`plain` は journal 行を作らない = `legacy_plain_present` で pending 留置される `switch.py:1702-1716` ので
 この表に現れない):
 
 | `old_kind` | live の状態 | `live_target` | 分類 | 意味 |
@@ -126,7 +126,7 @@ live_target = live.readlink().as_posix() if live.is_symlink() else None
 | `absent` | `old_target` (通常 `None`) を指す symlink | `== old_target` | **`not_switched`** | disjunct 1 側 |
 | `absent` | 別の先を指す symlink | 上記以外 | **`foreign`** | 第三者が触った |
 
-- `old_kind='absent'` の `not_switched` は **2 つの disjunct**を持つ。実コード (`switch.py:224` 逐語) は
+- `old_kind='absent'` の `not_switched` は **2 つの disjunct**を持つ。実コード (`switch.py:88-89` 逐語) は
   `live_target == old_norm or (row["old_kind"] == "absent" and live_target is None)` であり、
   **disjunct 2 は `old_target` の値に一切条件を付けない**。通常の呼び出し元は `old_target=None` を渡すので
   disjunct 1 だけで足りるが、DB 層は `old_kind` と `old_target` を独立に受けるため
@@ -137,12 +137,12 @@ live_target = live.readlink().as_posix() if live.is_symlink() else None
   この既存テストが red になる)。
 - **`absent` かつ live が symlink でない実体 (plain dir / 通常ファイル)** は `live_target = None` なので
   disjunct 2 により `not_switched`。このとき `_revert_one` は **FS 上 no-op** —
-  `old_kind='absent'` の枝は `if live.is_symlink(): live.unlink()` しか行わない (`switch.py:132-134`) ため、
+  `old_kind='absent'` の枝は `if live.is_symlink(): live.unlink()` しか行わない (`switch.py:186-188`) ため、
   **人間が置いた plain ディレクトリを消さない**。0d-2c で新規経路へ落ちた後は
-  `old_kind` が `plain` と判定され (`switch.py:1529-1531`)、`legacy_plain_present` で pending 留置になる
+  `old_kind` が `plain` と判定され (`switch.py:1693-1698`)、`legacy_plain_present` で pending 留置になる
   (`:1537-1550`)。つまり **fail closed で、既存の legacy plain 回廊 (`retire` → `approval retry`) に合流する**。
 - **`switch_required=0` の行はこの分類器の対象外**。`advance_switch_journal` が
-  `switch_required=0` の行の `switched` 化を `ValueError` で禁じている (`switch.py:99-102`) ので、
+  `switch_required=0` の行の `switched` 化を `ValueError` で禁じている (`switch.py:150-153`) ので、
   そもそも `phase='switched'` に到達しない。分類器は**呼び出し側が `phase == 'switched'` かつ
   `switch_required=1` を確認してから呼ぶ**契約にし、それ以外で呼ばれたら `ValueError` (fail closed)。
 - **dangling symlink** (live は `new_target` を指すが版 dir が無い) は `switched` に分類される。
@@ -152,10 +152,10 @@ live_target = live.readlink().as_posix() if live.is_symlink() else None
 
 ### 3.2 `approve_candidate` 0d の新しい手順 (R1 = 案 C)
 
-**現行** (`switch.py:1437-1456`): `phase == 'switched'` なら `_reverify_switched_journal` → `_finalize_decision`。
+**現行** (`switch.py:1589-1601`): `phase == 'switched'` なら `_reverify_switched_journal` → `_finalize_decision`。
 **live を一度も読まない**ため、切替が失敗した行を「approved だが未配備」で終端させる (probe 実測、§6 AC-1)。
 
-**新しい手順** (すべて `_plugin_locks(plugins_root, dep_names)` の内側 = `switch.py:1397`):
+**新しい手順** (すべて `_plugin_locks(plugins_root, dep_names)` の内側 = `switch.py:1516`):
 
 | 段 | 分類 | 何をするか | journal | approval | FS | commit |
 |---|---|---|---|---|---|---|
@@ -165,8 +165,8 @@ live_target = live.readlink().as_posix() if live.is_symlink() else None
 | 0d-2c | `not_switched` | `_revert_one` で live を旧状態へ戻し停止行を閉じる → **`op_id = None` かつ `rolled_back_op_id = <畳んだ op_id>`** (§3.5) → そのまま新規経路へ落ちる | → `reverted` (+ 後段で新しい行) | `pending` のまま (後段で決まる) | live が旧状態へ | `_revert_one` 直後に commit |
 
 **0d-2c の必須事項 (probe で確認、v1.1 で根拠を訂正)**: 0d は `op_id = existing_journal["op_id"]` を
-保持したまま下流へ進み (`switch.py:1440`)、新規経路は **`if op_id is None:` のときだけ
-`begin_switch_journal` を呼ぶ** (`switch.py:1554-1559`)。したがって 0d-2c では
+保持したまま下流へ進み (`switch.py:1568`)、新規経路は **`if op_id is None:` のときだけ
+`begin_switch_journal` を呼ぶ** (`switch.py:1721-1726`)。したがって 0d-2c では
 **`op_id = None` への再設定が必須**である。
 
 **v1.0 の根拠は誤りだった** (r1 Important 2)。v1.0 は「戻さないと `advance_switch_journal` の
@@ -181,11 +181,11 @@ live_target = live.readlink().as_posix() if live.is_symlink() else None
 [P1] live is_symlink = True
 ```
 
-理由 (実コード): `_advance_to_decided` は先頭で現在 phase を読み (`switch.py:1196`)、
+理由 (実コード): `_advance_to_decided` は先頭で現在 phase を読み (`switch.py:1309`)、
 `reverted` は `_PHASE_ORDER` の**末尾** (index 5) なので `versioned` / `recorded` / `switched` への
-advance はすべて `if current_idx < ...` の guard でスキップされる (`:1200-1217`)。
+advance はすべて `if current_idx < ...` の guard でスキップされる (`:1323-1336`)。
 `switch_live` は guard の外なので**実行され**、最後の `_finalize_decision` は単調性 API を通さず
-`journal_store.set_phase(..., phase="decided")` を直接書く (`:1174`)。
+`journal_store.set_phase(..., phase="decided")` を直接書く (`:1281`)。
 
 **正しい必須理由**: `op_id = None` は、**巻き戻した停止行を `reverted` のまま監査記録として残し、
 新しい操作を新しい journal 行に載せる**ために必要。落とすと (a) 「いつ何が巻き戻されたか」の記録が
@@ -198,8 +198,8 @@ AC-7 の非終端 1 本の数え方が崩れる。**ガードを入れる前は�
 **あわせて採用する防御 (`_finalize_decision` の phase ガード)**: 上の実測は
 「`_finalize_decision` が終端行 (`reverted`) を `decided` に上書きできる」という、本束の欠陥とは独立の
 穴も示している。`journal_store.set_phase` の呼び出し元は全数で 3 箇所
-(`switch.py:100` = `advance_switch_journal` (単調性チェック付き) / `:138` = `_revert_one` (`reverted` 固定) /
-`:1174` = `_finalize_decision` (`decided` 固定)) であり、**単調性 API を迂回しているのは `:1174` だけ**。
+(`switch.py:154` = `advance_switch_journal` (単調性チェック付き) / `:192` = `_revert_one` (`reverted` 固定) /
+`:1281` = `_finalize_decision` (`decided` 固定)) であり、**単調性 API を迂回しているのは `:1281` だけ**。
 そこで `_finalize_decision` に「行を読み直し、期待 phase でなければ `ValueError` で fail closed」という
 ガードを入れる。**期待 phase は `switch_required` で決まる** — 逐語で:
 
@@ -210,7 +210,7 @@ AC-7 の非終端 1 本の数え方が崩れる。**ガードを入れる前は�
 **`phase in ("switched", "recorded")` と書いてはいけない** — `switch_required=1` の行が `recorded` のまま
 (= 切替をしていないのに) 決定できてしまい、IV-3 を破る fail open になる。
 `switch_required=0` の行が `recorded` で終わるのは `_advance_to_decided` の `switched` 昇格が
-`if switch_required:` の内側にある (`switch.py:1218-1233`) ためで、これが唯一の正規の例外。
+`if switch_required:` の内側にある (`switch.py:1334-1357`) ためで、これが唯一の正規の例外。
 
 - **なぜ `journal_store.set_phase` 側に置かないか**: `set_phase` は `_revert_one` が
   「まだ非終端の行を `reverted` にする」ためにも使う汎用 setter で、ここに終端書込一律禁止を入れると
@@ -220,7 +220,7 @@ AC-7 の非終端 1 本の数え方が崩れる。**ガードを入れる前は�
   (switch_required=1 なら `switched`、0 なら `recorded`) と 0d-2a (`switched`) の 2 つだけなので、
   ガードは正規の呼び出しを 1 つも塞がない (§6 AC-16a / AC-16b で観測)。
   **`switch_required=0` / `recorded` の経路は実在する** — `switch_required` は
-  `not (old_kind == "symlink" and old_target == new_target)` (`switch.py:1553` / `:1888`) なので、
+  `not (old_kind == "symlink" and old_target == new_target)` (`switch.py:1719` / `:2063`) なので、
   **live が既に同じ `artifact_hash` の版を指している状態で同じ候補を再 bless / 再 approve すると 0 になる**。
   これは runbook §6.3 (B) 手順 5 (「もう一度 bless して未終端 journal が無いことを確認する」) が
   毎回通る経路で、probe で実測した (`test_probe_r2.py::test_Q3_switch_required_zero_reaches_finalize`):
@@ -247,15 +247,15 @@ r2 の指摘どおり、**ガードを入れた後に `op_id = None` だけを�
 1. **`_advance_to_decided` の入口**: 渡された `op_id` の行を読み、**終端 (`decided` / `reverted`) または不在なら
    即 `ValueError`** (FS より前)。これが主たる防御。
 2. **`_finalize_decision` の中**: 上記の `switch_required` 依存の期待 phase チェック。
-   **0d-2a は `_advance_to_decided` を通らず直接 `_finalize_decision` を呼ぶ** (`switch.py:1451-1454`) ので、
+   **0d-2a は `_advance_to_decided` を通らず直接 `_finalize_decision` を呼ぶ** (`switch.py:1589-1598`) ので、
    1 だけでは 0d-2a 経路が無防備になる。2 は多層防御であると同時に、この経路の唯一の防御でもある。
 
-**`_close_own_unfinished_journal_if_any` との一本化**: 同 helper (`switch.py:1468-1489`) は
+**`_close_own_unfinished_journal_if_any` との一本化**: 同 helper (`switch.py:1632-1649`) は
 「preparing/versioned/recorded の自分の未完ジャーナルを閉じる」もので、コメントに
 **「switched はここに来ない — 上の 0d 分岐で先に処理・return 済み」**と書いてある。
 0d-2c の導入でこの前提が**古くなる**ので、「停止行を `_revert_one` で閉じて `op_id` を `None` に戻す」処理を
 **この helper に寄せて 1 本化**し、コメントを新しい事実 (switched の `not_switched` も通る) に書き換える。
-`_revert_one` は非 `switched` 行に対して FS 副作用を持たない (`switch.py:130-137`) ので、
+`_revert_one` は非 `switched` 行に対して FS 副作用を持たない (`switch.py:182-195`) ので、
 1 本化しても既存経路の意味は変わらない。
 
 **巻き戻し自体が失敗したときの終点**: `_revert_one` の `_atomic_symlink_swap` が `OSError` を投げた場合、
@@ -275,12 +275,12 @@ temp → rename の 1 手なので「live が消えた瞬間」は作らない)�
 | S1 の前 | 停止行 `switched` / live 旧 / pending | 分類 `not_switched` → 巻き戻し → `reverted`、pending 留置 | 0d-2c から同じ処理をやり直す (冪等) |
 | S1 と S2 の間 (FS は戻ったが phase 未 commit) | 行は `switched` のまま / live 旧 | 同上 (`not_switched`)。`_revert_one` は既に旧状態の live に対して**同じ target を書き直す no-op** | 同上 |
 | S2 の後・S3 の前 | 停止行 `reverted` (終端) / live 旧 / pending / **非終端行なし** | 非終端行が無いので何もしない | `get_open_by_name` が `None` → **素の新規 approve 経路**で完遂 |
-| S3 の後 (`preparing`) | 新行 `preparing` / live 旧 | `phase != 'switched'` → **skip** (`switch.py:180-183`) | 0d の自分の行 → 頭から再実行 (`create_version_dir` / `record_version` は冪等) |
-| S4 の後 (`versioned`) | 新行 `versioned` / 版あり / live 旧 | skip | 同上 (到達済み phase をスキップして続行 `switch.py:1204-1216`) |
+| S3 の後 (`preparing`) | 新行 `preparing` / live 旧 | `phase != 'switched'` → **skip** (`switch.py:271-277`) | 0d の自分の行 → 頭から再実行 (`create_version_dir` / `record_version` は冪等) |
+| S4 の後 (`versioned`) | 新行 `versioned` / 版あり / live 旧 | skip | 同上 (到達済み phase をスキップして続行 `switch.py:1323-1332`) |
 | S5 の後 (`recorded`) | 新行 `recorded` / 版 + git / live 旧 | skip | 同上 |
 | S6 の `switch_live` 前後 (切替失敗) | 新行 `switched` / live 旧 | 分類 `not_switched` → 巻き戻し → `reverted`、pending 留置 | **再び 0d-2c** (巻き戻し → 新行 → …)。行は retry 1 回につき 1 本増えるが、**非終端行は常に高々 1 本** (部分 UNIQUE index を破らない) |
-| S6 の再照合で不一致 | 新行 `switched` / live **新** / pending | 分類 `switched` → `_unresolved_after_switch` を経て `retry_approval` → 0d-2a。**候補から版を再作成できれば完遂** (`switch.py:1303-1345`、`test_switch_paths.py:770` が pin)、候補も無ければ `reverted` (`:807` が pin) | 0d-2a (現行どおり、同上) |
-| S7 の tx の中 | tx は atomic (`BEGIN IMMEDIATE` + rollback、`switch.py:1167-1179`) — approved と decided は**同時に成立するか両方成立しないか** | 分類 `switched` → 完遂 | 0d-2a → `_finalize_decision` |
+| S6 の再照合で不一致 | 新行 `switched` / live **新** / pending | 分類 `switched` → `_unresolved_after_switch` を経て `retry_approval` → 0d-2a。**候補から版を再作成できれば完遂** (`switch.py:1393-1481`、`test_switch_paths.py:770` が pin)、候補も無ければ `reverted` (`:807` が pin) | 0d-2a (現行どおり、同上) |
+| S7 の tx の中 | tx は atomic (`BEGIN IMMEDIATE` + rollback、`switch.py:1276-1285`) — approved と decided は**同時に成立するか両方成立しないか** | 分類 `switched` → 完遂 | 0d-2a → `_finalize_decision` |
 | S7 の後 | `decided` / `approved` / live 新 | 終端なので対象外 | approval が pending でないので早期 return (no-op) |
 
 **不変条件**: どのクラッシュ点から再開しても、**approved になるのは live が `new_target` を指しているときだけ**
@@ -291,7 +291,7 @@ temp → rename の 1 手なので「live が消えた瞬間」は作らない)�
 | 組み合わせ | 排他するもの | 根拠 |
 |---|---|---|
 | 起動時 reconcile ↔ 同一プロセスの対話シェル `approval retry` | **時間的に重ならない** | `reconcile_switch_journals` の呼び出し元は `service.py:802` の 1 箇所のみ (grep 全数)。これは `build_app` の中で、scheduler / watchdog スレッドの起動 (`service.py:1389-1390`) とシェル起動 (`:1407-1408`) より**前**に完了する |
-| 対話シェル `approval retry` ↔ scheduler スレッドの期限切れ処理 | **plugin flock** | `process_expired_approvals` は行ごとに `plugins/.locks/<name>.lock` を `flock(LOCK_EX)` してから未終端 journal の有無を確認する (`switch.py:1745-1752`)。0d は `_plugin_locks` (`:1397`) で同じパスを取る |
+| 対話シェル `approval retry` ↔ scheduler スレッドの期限切れ処理 | **plugin flock** | `process_expired_approvals` は行ごとに `plugins/.locks/<name>.lock` を `flock(LOCK_EX)` してから未終端 journal の有無を確認する (`switch.py:1920-1944`)。0d は `_plugin_locks` (`:1516`) で同じパスを取る |
 | 対話シェル ↔ scheduler スレッド (DB) | **別コネクション** | シェルは `conn_shell`、scheduler は `conn_core` (`service.py:705` / `:1049-1055`)。`_finalize_decision` は `BEGIN IMMEDIATE` で書込を直列化する |
 | サービス起動時 reconcile ↔ **別プロセスの CLI** (`afx plugin bless` 等) | **現状は何も無い ← 本束で塞ぐ (R5)** | サービスは `acquire_instance_lock(root/"data")` を取る (`service.py:681`) が、**CLI はこの lock を取らない** (`backtest/cli.py` / `entry.py` に `instance_lock` の参照なし)。CLI 側の `bless` / `approve` は `_plugin_locks` を取るのに、**reconcile のループは plugin flock を一切取らない** (`switch.py:167-232`) |
 
@@ -360,8 +360,8 @@ live を書き換える操作は、**すべて次の順で行う**:
 
 | # | `_revert_one` の呼び出し元 | 直後の `conn.commit()` | 保持している lock | lock の内側か |
 |---|---|---|---|---|
-| 1 | `_revert_under_lock` (`switch.py:231-232`) | あり | `_plugin_lock(plugins_root, row["name"])` (`:220`) | **内側** |
-| 2 | `_reverify_switched_journal` (`:1471-1472`) | あり | 0d の `_plugin_locks` (`:1512`) | **内側** |
+| 1 | `_revert_under_lock` (`switch.py:231-232`) | あり | `_plugin_lock(plugins_root, row["name"])` (`:211`) | **内側** |
+| 2 | `_reverify_switched_journal` (`:1471-1472`) | あり | 0d の `_plugin_locks` (`:1516`) | **内側** |
 | 3 | `approve_candidate` 0d-2c (`:1606-1608`) | あり | 同上 | **内側** |
 | 4 | `_close_own_unfinished_journal_if_any` (`:1647-1649`) | あり | 同上 | **内側** |
 | 5 | `reject_candidate` (`:1874-1875`) | あり | `_plugin_lock(plugins_root, name)` (`:1866`) | **内側** |
@@ -374,9 +374,9 @@ live を書き換える操作は、**すべて次の順で行う**:
 
 | # | 箇所 | 現行行 | 分類 | 扱い |
 |---|---|---|---|---|
-| 1 | `force_revert_op_id` 分岐の `_revert_one` | `switch.py:174` | (分類を経ない割込) | **lock + 行の再取得を適用** (r1 Important 1)。**分類の一致確認は求めない** — force revert は「phase に依らず巻き戻す」割込操作という既存の意味論 (`:170-173` のコメント、表 2) を保つため。行が既に終端なら skip。**帰結 (v1.5、着手前検証 probe D-a/D-b で実測)**: 行が非終端のままなら、第三者が張り替えた live (`foreign`) も巻き戻し対象になる (`old_kind=absent` なら unlink、`symlink` なら `old_target` で上書き)。旧実装から不変の挙動で、R4 により人間向けの到達経路は無い。入口を足す束ではこの帰結を再検討すること |
-| 2 | `switched` かつ pin 破れ → `_revert_one` | `switch.py:203-207` | `switched` | lock + 行の再取得 + **分類の再確認** |
-| 3 | `not_switched` → `_revert_one` | `switch.py:225-226` | `not_switched` | lock + 行の再取得 + **分類の再確認** |
+| 1 | `force_revert_op_id` 分岐の `_revert_one` | `switch.py:268` | (分類を経ない割込) | **lock + 行の再取得を適用** (r1 Important 1)。**分類の一致確認は求めない** — force revert は「phase に依らず巻き戻す」割込操作という既存の意味論 (`:263-267` のコメント、表 2) を保つため。行が既に終端なら skip。**帰結 (v1.5、着手前検証 probe D-a/D-b で実測)**: 行が非終端のままなら、第三者が張り替えた live (`foreign`) も巻き戻し対象になる (`old_kind=absent` なら unlink、`symlink` なら `old_target` で上書き)。旧実装から不変の挙動で、R4 により人間向けの到達経路は無い。入口を足す束ではこの帰結を再検討すること |
+| 2 | `switched` かつ pin 破れ → `_revert_one` | `switch.py:295-297` | `switched` | lock + 行の再取得 + **分類の再確認** |
+| 3 | `not_switched` → `_revert_one` | `switch.py:318-319` | `not_switched` | lock + 行の再取得 + **分類の再確認** |
 
 v1.0 は 1 を数え落としていた (「2 箇所」)。`force_revert_op_id` は R4 により人間向け入口を作らないだけで
 **引数としては残り、既存テスト `tests/plugin/test_switch_journal.py:321-350` が switched live の除去・復元を
@@ -384,26 +384,26 @@ v1.0 は 1 を数え落としていた (「2 箇所」)。`force_revert_op_id` �
 
 #### 3.3.4 包まない枝とその理由
 
-- **`switched` かつ pin 健全 → `retry_approval`** (`:216-220`): `retry_approval` → `approve_candidate` は
+- **`switched` かつ pin 健全 → `retry_approval`** (`:314-316`): `retry_approval` → `approve_candidate` は
   **`_plugin_locks` を自分で取る**。外側で同じ lock を持っていると**自己デッドロックする** —
   `flock(2)` のロックは open file description に紐づき、同じパスを 2 回 `open()` すれば別 ofd になるため
-  自プロセスのロックで待たされる (`_plugin_locks` docstring の probe 実測 `switch.py:820-846`、
+  自プロセスのロックで待たされる (`_plugin_locks` docstring の probe 実測 `switch.py:912-936`、
   `test_plugin_lock_is_not_reentrant_within_one_process` が pin)。
-  `_unresolved_after_switch` の docstring (`:262-269`) も同じ理由を明記している。**この規律を守る。**
+  `_unresolved_after_switch` の docstring (`:352-362`) も同じ理由を明記している。**この規律を守る。**
   **stale row 問題は生じない** — `approve_candidate` が lock を取った後に自分で
   `get_open_by_name` と live を読み直すため (§3.3.5)。reconcile は「この行を retry に委譲する」という
   判断だけを lock の外で行い、**FS/DB は 1 バイトも触らない**。
-- **`foreign`** (`:227-232`): FS を触らないので lock 不要。activity を書くだけ。
-- **`phase != 'switched'`** (`:180-183`): skip。FS 効果が無い。
+- **`foreign`** (`:320-327`): FS を触らないので lock 不要。activity を書くだけ。
+- **`phase != 'switched'`** (`:271-277`): skip。FS 効果が無い。
 
 #### 3.3.5 0d (人間の retry) 側は既に同じ規律か — 実コードで確認した
 
 | 読むもの | 場所 | lock との関係 |
 |---|---|---|
-| `dep_names` の材料 (候補 `config.yaml`) | `switch.py:1386-1395` | **lock の外** (lock 集合を決めるために先に読む必要がある)。この値は lock 対象の決定にのみ使い、FS 更新の判断には使わない。`bless_candidate` は同じ問題に対し lock 取得後の再読比較 (`candidate_changed`、`:1802-1806`) を持つ |
-| approval 行 (`status` / `payload`) | `:1398-1402` | **lock の内側で読み直している** (lock 前にも読むが、内側の読み直しを正として使う) |
-| 未完 journal (`get_open_by_name`) | `:1437` | **lock の内側** |
-| live の形 (`old_kind` / `old_target`) | `:1527-1533` | **lock の内側** |
+| `dep_names` の材料 (候補 `config.yaml`) | `switch.py:1504-1514` | **lock の外** (lock 集合を決めるために先に読む必要がある)。この値は lock 対象の決定にのみ使い、FS 更新の判断には使わない。`bless_candidate` は同じ問題に対し lock 取得後の再読比較 (`candidate_changed`、`:1977-1980`) を持つ |
+| approval 行 (`status` / `payload`) | `:1517-1523` | **lock の内側で読み直している** (lock 前にも読むが、内側の読み直しを正として使う) |
+| 未完 journal (`get_open_by_name`) | `:1564` | **lock の内側** |
+| live の形 (`old_kind` / `old_target`) | `:1692-1699` | **lock の内側** |
 
 → **0d は既に「lock の内側で読んだ値だけで FS を触る」規律を満たしている。** 本束で追加する分類器の呼び出しも
 0d-1 として lock の内側に置く (§3.2 の表)。**0d 側の是正は不要**で、直すのは reconcile 側のみ。
@@ -418,18 +418,18 @@ v1.0 は 1 を数え落としていた (「2 箇所」)。`force_revert_op_id` �
 
 **自己デッドロックしないことの根拠 (全数)**: 新しく lock を取る 3 箇所の内側から呼ばれるのは
 `journal_store.get` / `_revert_one` / `journal_store.set_phase` / `activity.write` と §3.1 の分類器だけで、
-**いずれも `_plugin_lock` を取らない** (`switch.py:128-142`、分類器は読み取りのみ)。
+**いずれも `_plugin_lock` を取らない** (`switch.py:68-91`、分類器は読み取りのみ)。
 `retry_approval` / `approve_candidate` / `_unresolved_after_switch` はどれも lock の**外**に置く。
 
 ### 3.4 件 2: CLI の例外の扱い
 
-`_plugin_retire` (`cli.py:611-620`) の形を正とする:
+`_plugin_retire` (`cli.py:621-632`) の形を正とする:
 `except (plugin_switch.UnresolvedJournalError, ValueError, OSError) as e: print(f"エラー: {e}", file=sys.stderr); return 1`
 
 | 関数 | 現行 | 変更後 |
 |---|---|---|
-| `_plugin_bless` (`cli.py:589`) | `except (ValueError, SandboxError)` | **`UnresolvedJournalError` を追加** |
-| `_plugin_materialize` (`cli.py:600`) | `except (FileExistsError, FileNotFoundError, OSError)` | **`ValueError` を追加** (`materialize_plugin` は live symlink が `plugins_root` の外を指すとき `ValueError` を投げる `switch.py:1591-1597`。現状は外側の包括 catch `cli.py:766-770` に落ち、メッセージ形式だけが不揃い) |
+| `_plugin_bless` (`cli.py:600`) | `except (ValueError, SandboxError)` | **`UnresolvedJournalError` を追加** |
+| `_plugin_materialize` (`cli.py:611`) | `except (FileExistsError, FileNotFoundError, OSError)` | **`ValueError` を追加** (`materialize_plugin` は live symlink が `plugins_root` の外を指すとき `ValueError` を投げる `switch.py:1766-1768`。現状は外側の包括 catch `cli.py:781-784` に落ち、メッセージ形式だけが不揃い) |
 | `_plugin_submit` / `_plugin_lock` / `_plugin_retire` | — | **変更なし** (全数確認済、同型の穴なし。`submit_candidate` は journal を見ないので `UnresolvedJournalError` を投げない) |
 
 **文言** (bless):
@@ -437,7 +437,7 @@ v1.0 は 1 を数え落としていた (「2 箇所」)。`force_revert_op_id` �
 エラー: plugin 'sma' に未終端の切替ジャーナルが残っています (op_id=3, approval_id=12)。
   先に収束させてください: サービスの対話シェルで `approval list` → `approval retry 12`
 ```
-`UnresolvedJournalError` の元メッセージが `op_id=` と `approval_id=` を含むこと (`switch.py:1812-1816`) は
+`UnresolvedJournalError` の元メッセージが `op_id=` と `approval_id=` を含むこと (`switch.py:1987-1991`) は
 **維持する** — runbook と既存テストがこの 2 語に依存している。
 
 ### 3.5 件 3: 対話シェル
@@ -449,15 +449,15 @@ v1.0 は 1 を数え落としていた (「2 箇所」)。`force_revert_op_id` �
 cmd == "approval" and args and args[0] == "list" and len(args) <= 2
 ```
 
-既存の `approval <id>` は `len(args) == 1 and args[0].isdigit()` (`commands.py:154`) なので**衝突しない**
+既存の `approval <id>` は `len(args) == 1 and args[0].isdigit()` (`commands.py:170`) なので**衝突しない**
 (`list` は `isdigit()` が False。`approval 999` の既存テスト `tests/test_commands.py:780` も不変)。
-`approval retry <id>` は `len(args) == 2 and args[0] == "retry"` (`:139`) で、こちらとも衝突しない。
+`approval retry <id>` は `len(args) == 2 and args[0] == "retry"` (`:143`) で、こちらとも衝突しない。
 
 **引数 `<n>` の扱い**:
 
 | 入力 | 挙動 | 根拠 |
 |---|---|---|
-| `approval list` | 既定 **20** 件 | `log` / `activity` の既定 20 に揃える (`commands.py:70-76`) |
+| `approval list` | 既定 **20** 件 | `log` / `activity` の既定 20 に揃える (`commands.py:71-74`) |
 | `approval list 5` | 5 件 | 同上の `[n]` 作法 |
 | `approval list 999` | **上限 200 で丸める**。丸めたときは末尾に `(上限 200 件で打ち切り)` を出す | 端末に流し込む量の上限。丸めたことを黙らない |
 | `approval list 0` / 負数 | `usage: approval list [n]` を返す (一覧を出さない) | 0 件表示は「承認待ちが無い」と区別がつかないので拒否する方が fail closed |
@@ -472,19 +472,19 @@ cmd == "approval" and args and args[0] == "list" and len(args) <= 2
 | 表示項目 | `id` / `kind` / `name` / `created_at` / (plugin なら) `content_hash` 先頭 8 桁 | **1 行 1 件で id を見つけるための道具**。成績や判断材料は `approval <id>` (詳細) の役目で、二重には持たない |
 | 0 件 | `承認待ちはありません` | `activity` の `(なし)` と同じ作法 |
 | 未終端 journal の節 | 出力の末尾に `-- 未終端の切替ジャーナル --` として `op_id` / `name` / `phase` / `approval_id`。**0 件なら節ごと出さない** | R3。材料は `journal_store.list_non_terminal(conn)` (reconcile が使っているものと同一) |
-| `plugins_root` 未配線 | journal の節だけ省略し、approval の一覧は出す | 既存の fail-soft 作法 (`_dependent_strategies` `commands.py:404-418`) |
+| `plugins_root` 未配線 | journal の節だけ省略し、approval の一覧は出す | 既存の fail-soft 作法 (`_dependent_strategies` `commands.py:499-518`) |
 
 **遮断 8 との関係**: `approval list` は **holdout / in_sample の数値を一切出さない** (上表)。
 そもそも遮断 8 は「改善 agent のプロンプトに holdout 情報を渡さない」規律であり、
-人間向け表示は対象外 (`approval <id>` は既に holdout を人間に出している `commands.py:363-364`、
-`cli.py:584` の `floor_rule_text(g, audience="human")` のコメント「人間は遮断 8 の対象外」と同じ区分)。
+人間向け表示は対象外 (`approval <id>` は既に holdout を人間に出している `commands.py:458-459`、
+`cli.py:576-578` の `floor_rule_text(g, audience="human")` のコメント「人間は遮断 8 の対象外」と同じ区分)。
 **この文字列が改善 agent に届く経路が無いことの確認 (全数)**: `Commands.dispatch` の戻り値は
 `shell.run_shell` が端末へ書くだけで、`approval_requests.reason` のように
 `backlog.last_result` → 改善プロンプトへ流れる経路を持たない
 (`[[human-reject-reason-leaks-to-improve-prompt]]` の漏洩経路は `reason` 列であり、シェルの出力文字列ではない)。
 **新しい文字列を `reason` 列や backlog に書かないこと**を本束の遮断条件とする (§5)。
 
-**`approval retry <id>` の結果報告** (`commands.py:139-153`) — **v1.2 で lock 内 outcome 方式に変更 (r2 Important 4)**:
+**`approval retry <id>` の結果報告** (`commands.py:143-163`) — **v1.2 で lock 内 outcome 方式に変更 (r2 Important 4)**:
 
 現行は `retry_approval` の後に**無条件で**「approval #N を再試行しました」と返す。
 v1.1 は `approve` ハンドラ (検収 m5、`commands.py:102-110`) に倣って
@@ -505,10 +505,10 @@ v1.1 は `approve` ハンドラ (検収 m5、`commands.py:102-110`) に倣って
 | `op_id` | その呼び出しで最終的に関与した journal 行 (`foreign_waiting` なら触らなかった行、`deployed_after_rollback` なら**新しい方**) |
 | `rolled_back_op_id` | 0d-2c で畳んだ**停止行**の `op_id` (それ以外は `None`)。**`deployed_after_rollback` はこの値の有無で決まる** |
 | `name` / `target` | plugin 名と、`deployed*` のとき live が指すことを確認した `new_target` |
-| `status` | **lock の内側で確定した approval の status** (r3 I1 で追加、r4 I1 で定義を精密化)。確定の仕方は 2 通りあり、どちらも lock 内: (a) **read** — 非 pending 判定のために `:1398-1401` で読んだ値 (`already_decided`)、(b) **decision 結果** — 同じ lock 内で成功した `apply_decision` に渡したリテラル (`invalidated`)。**(b) は再読しない** — `apply_decision` が例外なく commit された以上その値が DB の状態であり、再読は lock 内でも余計な往復にしかならない。シェルはこれを写すだけで、**lock 外では読み直さない** (この一点が r3 の是正の主旨) |
+| `status` | **lock の内側で確定した approval の status** (r3 I1 で追加、r4 I1 で定義を精密化)。確定の仕方は 2 通りあり、どちらも lock 内: (a) **read** — 非 pending 判定のために `:1517-1519` で読んだ値 (`already_decided`)、(b) **decision 結果** — 同じ lock 内で成功した `apply_decision` に渡したリテラル (`invalidated`)。**(b) は再読しない** — `apply_decision` が例外なく commit された以上その値が DB の状態であり、再読は lock 内でも余計な往復にしかならない。シェルはこれを写すだけで、**lock 外では読み直さない** (この一点が r3 の是正の主旨) |
 | `reason` | `still_pending` の理由 (下表の `return` 地点に 1 対 1) |
 
-**`deployed_after_rollback` の作り方 (r2 追記)**: 新規経路 (`switch.py:1495` 以降) は
+**`deployed_after_rollback` の作り方 (r2 追記)**: 新規経路 (`switch.py:1602` 以降) は
 「直前に巻き戻しがあったか」を知らない。そこで **0d-2c がローカル変数
 `rolled_back_op_id = <畳んだ op_id>` を立て、`op_id = None` と対にして下流へ持ち回る**。
 outcome を組み立てる最後の 1 箇所がこの変数を読んで `deployed` と `deployed_after_rollback` を分ける。
@@ -519,24 +519,24 @@ outcome を組み立てる最後の 1 箇所がこの変数を読んで `deploye
 
 | `return` 地点 | 条件 | outcome |
 |---|---|---|
-| `switch.py:1400` | `status != "pending"` | `already_decided` — `status` の出所 = **read** (`:1398-1401` の `SELECT`) |
+| `switch.py:1519-1522` | `status != "pending"` | `already_decided` — `status` の出所 = **read** (`:1517-1519` の `SELECT`) |
 | `:1416` | `_is_superseded` (0c) | `invalidated` — `status` の出所 = **decision 結果** (同 lock 内で成功した `apply_decision(..., "invalidated")` のリテラル。再読しない) |
 | 0d-2a、`_reverify_switched_journal` が `True` → `_finalize_decision` 後 | 切替済み行の完遂 | `deployed` (`rolled_back_op_id=None`)。`status` = **decision 結果** (`"approved"`) |
 | 0d-2a、`_reverify_switched_journal` が `False` | 版も候補も無く `reverted` で閉じた | `still_pending` (`reason=reverify_failed`) |
 | 0d-2b (新設) | 分類 `foreign` | `foreign_waiting` |
-| `:1500` 付近 `CandidateMissingError` | 候補が無い | `still_pending` (`reason=candidate_missing`) |
-| `:1520` 付近 `ValueError` (`check_candidate_snapshot` / `hashes_of`) | 候補の形が不正 | `still_pending` (`reason=snapshot_invalid`) |
-| `:1521-1525` | payload と hash が不一致 | `still_pending` (`reason=hash_mismatch`) |
-| `:1537-1550` | live が plain dir | `legacy_plain_present` |
+| `:1657` 付近 `CandidateMissingError` | 候補が無い | `still_pending` (`reason=candidate_missing`) |
+| `:1667` 付近 `ValueError` (`check_candidate_snapshot` / `hashes_of`) | 候補の形が不正 | `still_pending` (`reason=snapshot_invalid`) |
+| `:1683-1690` | payload と hash が不一致 | `still_pending` (`reason=hash_mismatch`) |
+| `:1702-1717` | live が plain dir | `legacy_plain_present` |
 | 末尾 (`_advance_to_decided` 完了後) | 正常完了 | `rolled_back_op_id` が `None` なら `deployed`、非 `None` なら `deployed_after_rollback`。`status` = **decision 結果** (`"approved"`) |
-| (上記以外の `still_pending` / `foreign_waiting` / `legacy_plain_present`) | 決定していない | `status` = **read** (`"pending"` — `:1398-1401` の値。決定していないので変わらない) |
+| (上記以外の `still_pending` / `foreign_waiting` / `legacy_plain_present`) | 決定していない | `status` = **read** (`"pending"` — `:1517-1519` の値。決定していないので変わらない) |
 
 **approval 行が存在しない場合は outcome を返さない (r3 I1 の裁定、r4 I3 で捕捉先を訂正)**:
 現実装どおり `approve_candidate` が **`ValueError(f"approval {approval_id} not found")` を送出する**
-(`switch.py:1378-1381`)。`retry_approval` はそれを透過する。
+(`switch.py:1499-1500`)。`retry_approval` はそれを透過する。
 **捕捉するのは包括 `except Exception` ではなく、先行する `except (ValueError, KeyError)`**
-(`commands.py:292-293`) で、**戻り文字列は `エラー: approval N not found` + 改行 + `_HELP` 全文**。
-v1.3 は `commands.py:294` と書いていたが誤り (r4 I3)。**retry だけを別扱いにして 1 行契約にはしない** —
+(`commands.py:308-309`) で、**戻り文字列は `エラー: approval N not found` + 改行 + `_HELP` 全文**。
+v1.3 は `commands.py:310` と書いていたが誤り (r4 I3)。**retry だけを別扱いにして 1 行契約にはしない** —
 現行の表示を変えない方が、他のコマンドとの一貫性が保てる。
 **v1.2 にあった「状態を確認できませんでした (approval 行が見つかりません)」の専用文言は削除した** —
 outcome 列挙にも `return` 地点にも存在しない文言を表に置いていたのが誤りで、
@@ -547,11 +547,11 @@ outcome 列挙にも `return` 地点にも存在しない文言を表に置い�
 
 | 例外 | 送出元 | `Commands.dispatch` のどの `except` | 戻り文字列 |
 |---|---|---|---|
-| `ValueError("approval N not found")` | `switch.py:1378-1381` | **`except (ValueError, KeyError)`** (`commands.py:292-293`) | `エラー: approval N not found` + **改行 + `_HELP` 全文** |
-| `ValueError` (pin 解決失敗) | `:1432` | 同上 | `エラー: <resolver の文言>` + 改行 + `_HELP` |
-| `UnresolvedJournalError` | `:1471` | **`except Exception`** (`:294`、`Exception` 直系で `ValueError` ではない) | `エラー: plugin '<name>': an unresolved switch journal (op_id=..., approval_id=...) …` (`_HELP` は付かない) |
-| `RuntimeError` (切替後再照合の不一致) | `:1236-1240` | `except Exception` | `エラー: plugin '<name>': live content_hash mismatch after switch …` |
-| `OSError` (`switch_live` の失敗) | `:1219` | `except Exception` (`OSError` は `(ValueError, KeyError)` に入らない) | `エラー: <OS の文言>` |
+| `ValueError("approval N not found")` | `switch.py:1499-1500` | **`except (ValueError, KeyError)`** (`commands.py:308-309`) | `エラー: approval N not found` + **改行 + `_HELP` 全文** |
+| `ValueError` (pin 解決失敗) | `:1558` | 同上 | `エラー: <resolver の文言>` + 改行 + `_HELP` |
+| `UnresolvedJournalError` | `:1625-1630` | **`except Exception`** (`:310`、`Exception` 直系で `ValueError` ではない) | `エラー: plugin '<name>': an unresolved switch journal (op_id=..., approval_id=...) …` (`_HELP` は付かない) |
+| `RuntimeError` (切替後再照合の不一致) | `:1354-1357` | `except Exception` | `エラー: plugin '<name>': live content_hash mismatch after switch …` |
+| `OSError` (`switch_live` の失敗) | `:1338` | `except Exception` (`OSError` は `(ValueError, KeyError)` に入らない) | `エラー: <OS の文言>` |
 
 **どれも traceback にはならない** (シェル経路)。CLI 経路の扱いは §3.4 (`_plugin_bless` ほか) が別に定める。
 **表示を変えるのは §3.4 の CLI 側だけで、シェル側の既存の捕捉順序・文言形は 1 つも変えない。**
@@ -588,7 +588,7 @@ v1.3 は既存 spy との互換のために「`結果を判別できませんで
 本束の欠陥そのもの (「表示が実態と食い違う」) を新しい場所で再生産するので**撤回する**。
 
 - シェルは既知 enum 以外を**文言にしない**。`outcome` が `None` / 未知値なら属性参照または
-  明示の `raise` で例外になり、**`dispatch` の `except Exception` (`commands.py:294`) が
+  明示の `raise` で例外になり、**`dispatch` の `except Exception` (`commands.py:310`) が
   `エラー: ...` を返す** (fail loud、接頭辞は付かない)。
 - そのため **`tests/test_commands.py:541` の spy は「実物より緩い fake」** であり、
   **実物と同じ形の outcome を返すよう書き換える** ([[test-fixtures-from-real-transcripts]] と同じ規律 —
@@ -619,7 +619,7 @@ v1.3 は既存 spy との互換のために「`結果を判別できませんで
 この文言が指していた「契約違反かもしれない状態」を表示側が判断する必要がなくなる
 (IV-3 の検証は実装側の assert と AC の仕事)。
 
-**`approve` ハンドラ (`commands.py:86-117`) も同じ outcome を使う** — **v1.6 で本束の範囲に入れた**
+**`approve` ハンドラ (`commands.py:81-121`) も同じ outcome を使う** — **v1.6 で本束の範囲に入れた**
 (2026-09-20 ユーザー裁定)。段 0 の変異スイープが「§3.5 が retry について『誤報を生む』として排した
 lock 外の読み直しが、隣の `approve` にそのまま残っている」ことを報告したため。
 **同じ欠陥クラスであり、文言生成を共用できるので小さく、別束にすると同じレビュー材料を 2 度作ることになる。**
@@ -687,8 +687,8 @@ lock 外の読み直しが、隣の `approve` にそのまま残っている」�
 
 | 経路 | 現行 | v1.6 |
 |---|---|---|
-| **非 plugin kind の approve** (`approvals.apply_decision` 直行、`commands.py:113-115`) | `approval #<id> approved` + activity | **不変**。`ApprovalOutcome` はここに入らない (`approve_candidate` を通らないため) |
-| **存在しない id** (`approve 9999`) | `SELECT kind` が `None` → 非 plugin 枝 → `apply_decision` が `ValueError` → `エラー: approval 9999 は存在しません` + `_HELP` | **不変**。`approve_candidate` の `ValueError("approval N not found")` (`switch.py:1497-1499`) は **`approve` からは到達しない** (kind を読めない行は plugin 枝に入らない)。retry とはここが違う (retry は id だけで `retry_approval` を呼ぶので送出経路がある、§3.5) |
+| **非 plugin kind の approve** (`approvals.apply_decision` 直行、`commands.py:115-121`) | `approval #<id> approved` + activity | **不変**。`ApprovalOutcome` はここに入らない (`approve_candidate` を通らないため) |
+| **存在しない id** (`approve 9999`) | `SELECT kind` が `None` → 非 plugin 枝 → `apply_decision` が `ValueError` → `エラー: approval 9999 は存在しません` + `_HELP` | **不変**。`approve_candidate` の `ValueError("approval N not found")` (`switch.py:1499-1500`) は **`approve` からは到達しない** (kind を読めない行は plugin 枝に入らない)。retry とはここが違う (retry は id だけで `retry_approval` を呼ぶので送出経路がある、§3.5) |
 | **未配線** (`plugins_root` / `settings` が `None`) | `plugin approval backend (plugins_root/settings) が未配線です` | **不変** |
 | **例外** (`UnresolvedJournalError` / `RuntimeError` / `OSError` / pin 解決失敗の `ValueError`) | §3.5 の「例外 → `except` → 戻り文字列」表と同じ | **不変**。`approve_candidate` で捕まえて outcome に化けさせない |
 | **`reject <id>`** | 不変 | 不変 (本束では触らない) |
@@ -873,7 +873,7 @@ reconcile は戻り値を無視する契約 (§3.5) なので**不変**。
 | L155-164 | `[retry-switched-approves-without-deploy]` の既知の観測事項としての説明 | **削除** (本束で解消)。代わりに「`foreign` は自動収束しない」を残す |
 | **L167-169** (v1.1 で追加、r1 Important 4) | 「いずれの phase でも、**手順 5 (もう一度 bless する) を必ず実行する**」「`switched` では**必須の配備手順**になる」 | **改訂**。本束の後は `switched` でも `approval retry` が配備まで完了するので、手順 5 は**どの phase でも確認 (no-op)** になる。旧手順のままだと不要な再 bless を要求し、**approval 行を 1 本無駄に増やす** (同ファイル「共通の規則」の表が自認している副作用)。「`foreign` (live が第三者に触られている) のときだけ人間が判断する」に置き換える |
 | 「approval id の入手」節 | 「同じ bless をもう一度実行して例外文言から読む」「`sqlite3 -readonly` で見る」 | **`afx> approval list` を第一手**に差し替え (例外文言と直接 SQL は代替手段として残す) |
-| L162-165 (`preparing` 等は再起動で終端しない / `switched` は reconcile が扱う) | 現状のまま正しい | **不変** (実コードの skip `switch.py:180-183` は変えない) |
+| L162-165 (`preparing` 等は再起動で終端しない / `switched` は reconcile が扱う) | 現状のまま正しい | **不変** (実コードの skip `switch.py:271-277` は変えない) |
 
 ---
 
