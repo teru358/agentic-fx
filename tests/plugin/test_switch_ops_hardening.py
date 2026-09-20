@@ -865,6 +865,43 @@ def test_ac9d_retry_rollback_is_durable_before_pending_return(tmp_path, monkeypa
         "0d-2c の巻き戻しが lock 内で commit されていない (別コネクションから未 commit)"
 
 
+@pytest.mark.slow
+def test_close_own_unfinished_journal_candidate_missing_commit_is_durable(
+        tmp_path, monkeypatch):
+    """[switch-ops-hardening] B (T10/AC-9d と同じ流儀の追加 pin、
+    `_close_own_unfinished_journal_if_any` の `conn.commit()`、
+    `switch.py:1658` 付近)。この helper は `approve_candidate` の pending
+    留置 3 経路 (candidate_missing / snapshot_invalid / hash_mismatch) の
+    共通部で、閉じた直後にそのまま `return` するため後続の commit が無い
+    (T11 の再開判定経路では直後に `begin_switch_journal(commit=True)` が
+    続くので等価だが、この 3 経路には続く commit が無く load-bearing —
+    プラン T11-M6-scope / 設計書 v1.8b 参照)。
+
+    `_stopped_before` で **switched より前 (preparing)** の行を作ってから
+    候補を消し、`candidate_missing` 経路に入らせる (`_stopped_at_switched`
+    を使う既存 `test_ac9d_retry_rollback_is_durable_before_pending_return`
+    は 0d-2c 自身の commit を見ており、この helper の commit を単独では
+    確かめていない — switched 行は 0d-2c が先に op_id を None にするため
+    この helper には来ない)。別コネクションから停止行が `reverted` に
+    なっていることを読み、lock 内で commit まで完了していることを確認する。
+    """
+    root, conn, row = _stopped_before(tmp_path, monkeypatch, "versioned", "preparing")
+    plugins_root = root / "plugins"
+    shutil.rmtree(root / "plugins" / "_human" / "sma")
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert outcome.outcome == "still_pending"
+    assert outcome.reason == "candidate_missing"
+    assert journal_store.get_open_by_name(conn, "sma") is None, \
+        "自分の未完ジャーナルが閉じられていない"
+    assert _phase_from_another_connection(root, row["op_id"]) == "reverted", \
+        "_close_own_unfinished_journal_if_any の commit が lock 内で完了していない " \
+        "(別コネクションから未 commit)"
+
+
 # ---------------------------------------------------------------- T11 (AC-16c、
 # 再開の前提 (3 つ組) が崩れていたら巻き戻して新しい op_id で流し直す。
 # ヘルパ `_fail_advance_at` / `_stopped_before` / `_third_party_points_live_at`

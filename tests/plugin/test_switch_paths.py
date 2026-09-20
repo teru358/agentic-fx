@@ -456,6 +456,14 @@ def test_approve_candidate_snapshot_invalid_stays_pending_with_reason(env, monke
     assert not (plugins_dir / "sma").exists()
     assert outcome.outcome == "still_pending"
     assert outcome.reason == "snapshot_invalid"
+    # [switch-ops-hardening] T14 (2 周目ローカル LLM T2-01): `outcome.status`
+    # はここまで pin されていなかった。DB 側 (row["status"]) は決定していない
+    # ので "pending" のままだが、`outcome.status` を "approved" に変える変異は
+    # DB 側の assert では捕まらない。`commands.py` の approve ハンドラは
+    # `outcome.status` を `(status={outcome.status})` としてそのまま人間へ
+    # 出すので、潰れると「承認されませんでした (status=approved)」という
+    # 矛盾文言になる (段 0 S0-78 と同じ形)。
+    assert outcome.status == "pending"
 
 
 def test_approve_candidate_hash_mismatch_stays_pending_with_reason(env, monkeypatch):
@@ -485,6 +493,9 @@ def test_approve_candidate_hash_mismatch_stays_pending_with_reason(env, monkeypa
     assert not (plugins_dir / "sma").exists()
     assert outcome.outcome == "still_pending"
     assert outcome.reason == "hash_mismatch"
+    # [switch-ops-hardening] T14 (2 周目ローカル LLM T2-01): 同じ理由で
+    # `outcome.status` を pin する (snapshot_invalid 版と対の枝)。
+    assert outcome.status == "pending"
 
 
 # --- 段 0 M12: P2 が「稼働中 live symlink を新版へ差し替える」本命経路 ---
@@ -1227,6 +1238,57 @@ def test_stuck_preparing_journal_is_closed_when_candidate_no_longer_matches(env,
     assert row["status"] == "pending"
     assert journal_store.get_open_by_name(conn, "sma") is None, (
         "自分の未完ジャーナルが閉じられず name が永久封鎖された (確定-1 の欠陥)")
+
+
+def test_stuck_preparing_journal_is_closed_when_candidate_snapshot_becomes_invalid(env, monkeypatch):
+    """[switch-ops-hardening] T14 (2 周目ローカル LLM T2-02):
+    確定-1 の pending 留置 3 経路 (candidate_missing / snapshot_invalid /
+    hash_mismatch) のうち、**`op_id` が None でない状態で snapshot_invalid に
+    到達するテストが無く**、その枝の `_close_own_unfinished_journal_if_any()`
+    呼び出しだけ未 pin だった (candidate_missing は上の
+    `..._goes_missing`、hash_mismatch は `..._no_longer_matches` が既に pin
+    済 — 新規 submit → approve の経路は `op_id is None` で helper が早期
+    return するため、これらとは別に用意する必要がある)。
+    上の `..._no_longer_matches` と同じ作りで、候補の改変だけ「plugin.py の
+    中身を差し替える (hash 不一致)」から「`extra.txt` を足す (snapshot 検査
+    = REQUIRED_FILES ちょうど 3 本の検査を落とす)」に変える。"""
+    root, plugins_dir, conn, settings = env
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    candidate_dir = plugins_dir / "_staging" / "1" / "sma"
+    _write_candidate(candidate_dir)
+    approval_id = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+
+    def _boom(*a, **kw):
+        raise OSError("simulated crash during create_version_dir")
+    monkeypatch.setattr(version_store, "create_version_dir", _boom)
+    with pytest.raises(OSError):
+        switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW,
+                                 plugins_root=plugins_dir, settings=settings)
+    monkeypatch.undo()
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+
+    j = journal_store.get_open_by_name(conn, "sma")
+    assert j is not None and j["phase"] == "preparing"
+
+    # 候補に余分なファイルが混入 (snapshot 検査を落とす) — この枝は
+    # `op_id` が既に preparing 行を指した状態で snapshot_invalid に入る。
+    (candidate_dir / "extra.txt").write_text("stray")
+
+    outcome = switch.retry_approval(
+        conn, approval_id, decided_by="human", now=NOW,
+        plugins_root=plugins_dir, settings=settings)
+
+    assert outcome.outcome == "still_pending"
+    assert outcome.reason == "snapshot_invalid"
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending"
+    assert journal_store.get_open_by_name(conn, "sma") is None, (
+        "自分の未完ジャーナルが閉じられず name が永久封鎖された "
+        "(snapshot_invalid 枝の _close_own_unfinished_journal_if_any 欠落)")
 
 
 def test_stuck_preparing_journal_is_closed_when_candidate_goes_missing(env, monkeypatch):
