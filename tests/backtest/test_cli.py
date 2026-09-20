@@ -1632,3 +1632,28 @@ def test_plugin_materialize_containment_error_is_rc1_message(tmp_path, monkeypat
     err = capsys.readouterr().err
     assert err.startswith("エラー: ")
     assert "escapes plugins_root" in err
+
+
+def test_plugin_materialize_os_error_subclass_is_rc1_message(tmp_path, monkeypatch, capsys):
+    """1 周目トリアージ T-04 = S0-03: `_plugin_materialize` の except タプル
+    `(FileExistsError, FileNotFoundError, OSError, ValueError)` から
+    `OSError` を外しても、上の `test_plugin_materialize_containment_error_
+    is_rc1_message` (`ValueError` 注入) は green のまま通る — `OSError` の
+    他のサブクラス (`FileExistsError`/`FileNotFoundError` 以外、例えば
+    `PermissionError`) を注入する負例が無かった (段 0 pin 済 S0-03)。"""
+    import argparse as _argparse
+
+    from agentic_fx.backtest import cli as _cli
+    from agentic_fx.plugin import switch as _switch
+
+    def _boom(root, name):
+        raise PermissionError("materialize_plugin: permission denied")
+
+    monkeypatch.setattr(_switch, "materialize_plugin", _boom)
+    rc = _cli._plugin_materialize(
+        None, None, _argparse.Namespace(name="sma"), tmp_path)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("エラー: ")
+    assert "permission denied" in err

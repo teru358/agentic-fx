@@ -1003,6 +1003,31 @@ def test_approval_list_includes_open_journal_section(tmp_path):
     assert f"op_id={op_id} name=sma phase=preparing approval_id={aid}" in out
 
 
+def test_approval_list_open_journal_lines_fail_soft_on_list_non_terminal_error(
+        tmp_path, monkeypatch):
+    """1 周目トリアージ T-02 = S0-32: `_open_journal_lines` は
+    `list_non_terminal` が例外を送出しても fail-soft (空 list) に落ちる
+    ([[commands.py]] `except Exception: return []`、一覧表示は fail-soft)。
+    既存テストは正常系しか通しておらず、この except 節を削除する変異
+    (素通しにする) を検出できなかった。pending 行の表示は journal 節の
+    失敗に引きずられない (dispatch の外側 `except Exception` に落ちて
+    `approval list` 全体が `エラー: ...` になってはならない)。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    aid = _pending_plugin_approval(conn, "sma")
+    from agentic_fx.store import plugin_switch_journal as journal_store_mod
+
+    def _boom(_conn):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(journal_store_mod, "list_non_terminal", _boom)
+
+    out = cmds.dispatch("approval list")
+
+    assert f"#{aid}" in out, "journal 節の故障が pending 一覧まで巻き込んではならない"
+    assert "未終端の切替ジャーナル" not in out
+    assert not out.startswith("エラー: "), "例外が dispatch の外側まで伝播した"
+
+
 def test_approval_list_line_is_verbatim_and_pending_only(tmp_path):
     """段 0 pin (S0-21/S0-26/S0-27): 一覧は **pending だけ** を、設計書 §3.5 の
     表示項目どおりの**逐語**形式で 1 行 1 件出す。部分一致
@@ -1099,6 +1124,17 @@ def test_approval_list_argument_boundaries(tmp_path):
     out = cmds.dispatch("approval list 999").splitlines()
     assert len(out) == Commands._APPROVAL_LIST_MAX + 1, \
         f"丸めた先の件数が上限 + 打ち切り 1 行と違う: {len(out)}"
+
+
+def test_help_includes_approval_list_journal_hint():
+    """1 周目トリアージ T-03 = S0-38: `_HELP` の `approval list [n]` 行
+    (未終端の切替ジャーナルが一緒に出る旨のヒント) をリテラルで pin する。
+    既存の `dispatch("approval list 5 6") == _HELP` は同じ定数同士の比較
+    なので `_HELP` 自体からこの 1 行を削除しても両辺が揃って green になり、
+    検出できない (段 0 pin 済 S0-38)。"""
+    from agentic_fx.commands import _HELP
+    assert "approval list [n]          承認待ちの一覧 (+ 未終端の切替ジャーナル)" \
+        in _HELP
 
 
 def test_approval_list_rejects_bad_argument(tmp_path):

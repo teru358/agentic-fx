@@ -459,6 +459,42 @@ def test_ac9c_force_revert_takes_the_lock_and_refetches(tmp_path, monkeypatch):
     assert _rows(conn) == [(row["op_id"], "reverted")]
 
 
+@pytest.mark.slow
+def test_t01_force_revert_stale_when_phase_advances_but_stays_non_terminal(
+        tmp_path, monkeypatch):
+    """1 周目トリアージ T-01 = 段 0 pin (S0-47): `_revert_under_lock` の
+    stale 判定は `phase_now in _TERMINAL_PHASES` と
+    `phase_now != row["phase"]` の 2 条件からなる。`force_revert_op_id`
+    経路 (`expect_class=None`) では後者だけが検出できる場合がある —
+    競合者が lock 待ちの間に行を **終端化はせず別の非終端 phase へ前進**
+    させたケース (`test_ac9b_iii` は `expect_class` ありの switched 行しか
+    covered しておらず、そこでは非終端 → 非終端の前進が起きないため等価に
+    なる — この経路でだけ差が出る)。この項を削除すると stale row を
+    見落として二重に巻き戻す。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    # 呼び出し元 (reconcile) が list_non_terminal で拾った時点の
+    # 「古い」行を模す。
+    journal_store.set_phase(conn, row["op_id"], phase="recorded", now=NOW,
+                            commit=True)
+    stale_row = journal_store.get(conn, row["op_id"])
+    assert stale_row["phase"] == "recorded"
+    # 競合者が lock を取る前に非終端のまま前進させる (recorded → switched)。
+    journal_store.set_phase(conn, row["op_id"], phase="switched", now=NOW,
+                            commit=True)
+
+    result = plugin_switch._revert_under_lock(
+        conn, stale_row, plugins_root=plugins_root, now=NOW,
+        activity=_activity(root), expect_class=None)
+
+    assert result is False, "stale (phase 前進) を見落として巻き戻した"
+    assert _rows(conn) == [(row["op_id"], "switched")], \
+        "stale 行を誤って reverted にしてはならない"
+    text = _activity_text(root)
+    assert "switch_reconcile_skipped_stale_row" in text
+    assert "phase_before=recorded phase_now=switched" in text
+
+
 # ---------------------------------------------------------------- AC-16 (2 段ガード)
 
 @pytest.mark.slow
