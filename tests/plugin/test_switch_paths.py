@@ -414,12 +414,77 @@ def test_approve_candidate_missing_stays_pending(env, monkeypatch):
     import shutil
     shutil.rmtree(plugins_dir / "_staging" / "1" / "sma")
 
-    switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW, plugins_root=plugins_dir, settings=settings)  # B-1
+    outcome = switch.approve_candidate(conn, approval_id, decided_by="human", now=NOW, plugins_root=plugins_dir, settings=settings)  # B-1
 
     row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
                        (approval_id,)).fetchone()
     assert row["status"] == "pending"
     assert not (plugins_dir / "sma").exists()
+    assert outcome.outcome == "still_pending"
+    assert outcome.reason == "candidate_missing"
+
+
+# --- 段 0 S0-77: still_pending の他 2 理由 (snapshot_invalid / hash_mismatch) ---
+# `candidate_missing` だけが pin されていたため、3 理由を取り違える変異
+# (S0-76: candidate_missing<->snapshot_invalid の取り違え。既に KILLED) と
+# S0-77 (hash_mismatch<->snapshot_invalid の取り違え) のうち後者が
+# SURVIVED した。2 経路とも個別に踏む。
+
+def test_approve_candidate_snapshot_invalid_stays_pending_with_reason(env, monkeypatch):
+    """候補が REQUIRED_FILES の完全性検査 (`check_candidate_snapshot`) に
+    落ちる (余分なファイルが混入) と `still_pending(snapshot_invalid)`。
+    S0-77: この `reason` を `hash_mismatch` に取り違える変異が SURVIVED
+    した — `snapshot_invalid` を単独で踏む pin が無かった。"""
+    root, plugins_dir, conn, settings = env
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    approval_id = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+    # submit 後に候補が壊れる (余分なファイルが混入 — REQUIRED_FILES ちょうど
+    # 3 本の検査に違反する)。
+    (plugins_dir / "_staging" / "1" / "sma" / "extra.txt").write_text("stray")
+
+    outcome = switch.approve_candidate(
+        conn, approval_id, decided_by="human", now=NOW,
+        plugins_root=plugins_dir, settings=settings)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending"
+    assert not (plugins_dir / "sma").exists()
+    assert outcome.outcome == "still_pending"
+    assert outcome.reason == "snapshot_invalid"
+
+
+def test_approve_candidate_hash_mismatch_stays_pending_with_reason(env, monkeypatch):
+    """submit 時に記録した `content_hash`/`artifact_hash` と、approve 時に
+    候補ディレクトリから再算出した値が食い違うと
+    `still_pending(hash_mismatch)`。S0-77 の裏 (この `reason` を
+    `snapshot_invalid` に取り違える変異が同じ枝で殺せることを確認する)。"""
+    root, plugins_dir, conn, settings = env
+    _write_candidate(plugins_dir / "_staging" / "1" / "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    approval_id = switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_dir / "_staging" / "1",
+        candidate_origin="staging", mission_id=1, backlog_id=None,
+        settings=settings, now=NOW)
+    # submit 後に候補の内容だけ差し替える (ファイル数は 3 本のまま = snapshot
+    # 検査は通る、しかし content_hash/artifact_hash が payload と食い違う)。
+    (plugins_dir / "_staging" / "1" / "sma" / "plugin.py").write_text(
+        "def compute(df, params):\n    return {'v': 999.0}\n")
+
+    outcome = switch.approve_candidate(
+        conn, approval_id, decided_by="human", now=NOW,
+        plugins_root=plugins_dir, settings=settings)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending"
+    assert not (plugins_dir / "sma").exists()
+    assert outcome.outcome == "still_pending"
+    assert outcome.reason == "hash_mismatch"
 
 
 # --- 段 0 M12: P2 が「稼働中 live symlink を新版へ差し替える」本命経路 ---
