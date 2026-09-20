@@ -478,3 +478,64 @@ def test_reconcile_resolution_holds_the_dependency_locks(tmp_path, monkeypatch):
     # **巻き戻しの 1 本**が増える。この pin の主旨 (解決が依存 lock の
     # 内側であること) は不変で、増えた 1 本は巻き戻し専用。
     assert acquired == [*sorted({"rsi_pullback", "rsi"}), "rsi_pullback"]
+
+
+def test_indicator_unresolved_stale_row_does_not_report_reverted(tmp_path, monkeypatch):
+    """段 0 S0-59 (SURVIVED): reconcile の indicator_unresolved 枝
+    (`switch.py` の `if not _revert_under_lock(...): continue`) から
+    `continue` を落とす変異が生存した。`_revert_under_lock` が stale
+    (= 巻き戻していない) で `False` を返した場合、この `continue` が無いと
+    **巻き戻していない行に** Global Constraints の固定文言
+    `switch_reverted reason=indicator_unresolved ...` を書いてしまう。
+
+    `_plugin_lock("rsi_pullback")` の 2 回目の呼び出し
+    (`_unresolved_after_switch` の依存 lock で 1 回目、`_revert_under_lock`
+    の name lock で 2 回目 — 直前の `test_reconcile_resolution_holds_the_
+    dependency_locks` の `acquired` 列で確認済みの順序) の直前に、
+    別コネクションで同じ行を直接巻き戻して stale を作る
+    (`test_ac9b_iii_phase_changed_live_same` と同型の競合者注入)。"""
+    conn, plugins_root, activity = _reconcile_env(tmp_path)
+    from tests.fixtures import indicator_wiring as fx
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    _old, _new, approval_id, op_id = _stage_switched_journal(
+        conn, plugins_root, name="rsi_pullback",
+        pins={"rsi": hashes["rsi"]}, now=fx.NOW)
+    _bump_indicator_version(conn, plugins_root, "rsi", now=fx.NOW)  # pin を破る
+
+    import contextlib as _ctx
+    from agentic_fx.store import db as db_store
+    from agentic_fx.store import plugin_switch_journal as journal_store
+    real_lock = plugin_switch._plugin_lock
+    seen = {"n": 0}
+
+    @_ctx.contextmanager
+    def _seam(root, name):
+        if name == "rsi_pullback":
+            seen["n"] += 1
+            if seen["n"] == 2:
+                # `_revert_under_lock` が name lock を取る直前 — 競合者が
+                # 同じ行を直接巻き戻して stale にする。
+                c2 = db_store.connect(tmp_path / "data" / "agentic.db")
+                try:
+                    plugin_switch._revert_one(
+                        c2, journal_store.get(c2, op_id),
+                        plugins_root=plugins_root, now=fx.NOW)
+                    c2.commit()
+                finally:
+                    c2.close()
+        with real_lock(root, name):
+            yield
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _seam)
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=fx.NOW, settings=SETTINGS,
+        activity=activity)
+
+    assert conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE op_id=?",
+        (op_id,)).fetchone()["phase"] == "reverted"
+    text = _activity_text(activity)
+    assert "switch_reconcile_skipped_stale_row" in text
+    assert "reason=indicator_unresolved" not in text, \
+        "巻き戻していない stale 行に indicator_unresolved の固定文言を書いている"
