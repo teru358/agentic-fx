@@ -1629,7 +1629,7 @@ def approve_candidate(
                 f"approval {approval_id} — resolve it first (reconcile or "
                 "approval retry)")
 
-        def _close_own_unfinished_journal_if_any() -> None:
+        def _close_own_unfinished_journal_if_any() -> int | None:
             # 確定-1 (Critical): この approval 自身の未完ジャーナル
             # (preparing/versioned/recorded。**switched のうち
             # `not_switched` は 0d-2c が既に閉じて op_id=None にしている**
@@ -1640,13 +1640,16 @@ def approve_candidate(
             # (verified-local-round1.md 確定-1)。`_revert_one` は非 switched
             # 行に対して FS 副作用を一切持たない (`switch.py:156-158` と
             # 同じ論拠 — 安全)。
+            # v1.7 / v1.8: 再開の前提 (3 つ組) が崩れた行もここで閉じる。
             if op_id is None:
-                return
+                return None
             journal_row = journal_store.get(conn, op_id)
             if journal_row is not None and journal_row["phase"] != "switched":
                 _revert_one(conn, journal_row, plugins_root=plugins_root,
                            now=now, activity=activity)
                 conn.commit()
+                return op_id
+            return None
 
         candidate_origin = payload["candidate_origin"]
         candidate_path = payload["candidate_path"]
@@ -1698,6 +1701,37 @@ def approve_candidate(
             old_kind, old_target = "absent", None
 
         new_target = f".versions/{name}/{artifact_hash}"
+        switch_required = not (old_kind == "symlink" and old_target == new_target)
+
+        if op_id is not None and (
+                bool(existing_journal["switch_required"]),
+                existing_journal["old_kind"],
+                existing_journal["old_target"]) != (
+                    switch_required, old_kind, old_target):
+            # [switch-ops-hardening] T11 (設計書 §3.2 / R13): 再開の前提が
+            # resume 時点で崩れている。journal の (switch_required, old_kind,
+            # old_target) は**行の作成時**の live から決まった値で、store 層に
+            # 更新 API は無い。同じ行を使い回すと (i)「切替の要否・実際の切替・
+            # finalize の期待」が別々の値を見て詰まり、(ii) old_target が
+            # 古いままなので後の巻き戻しが第三者の変更を上書きして戻す。
+            # 0d-2c と同形に、停止行を巻き戻して閉じ、新しい op_id で頭から
+            # 流し直す。live が plain に化けた場合も old_kind の不一致として
+            # ここで拾われる (journal の old_kind は absent/symlink のみ)。
+            if activity is not None:
+                activity.write(
+                    Category.APPROVAL, "switch_resume_precondition_changed",
+                    f"name={name} op_id={op_id} "
+                    f"phase={existing_journal['phase']} "
+                    f"stored=({int(bool(existing_journal['switch_required']))},"
+                    f"{existing_journal['old_kind']},"
+                    f"{existing_journal['old_target']}) "
+                    f"now=({int(switch_required)},{old_kind},{old_target}) "
+                    f"stored_switch_required={int(bool(existing_journal['switch_required']))} "
+                    f"recomputed={int(switch_required)}")
+            closed = _close_own_unfinished_journal_if_any()
+            if closed is not None:
+                rolled_back_op_id = closed
+                op_id = None
 
         if old_kind == "plain":
             # 2a: plain 分岐 — 版+git のみ進め、切替と decide はスキップ
@@ -1715,8 +1749,6 @@ def approve_candidate(
                 conn, approval_id, "legacy_plain_present", commit=True)
             return ApprovalOutcome(outcome="legacy_plain_present", name=name,
                                   status="pending")
-
-        switch_required = not (old_kind == "symlink" and old_target == new_target)
 
         if op_id is None:
             op_id = begin_switch_journal(

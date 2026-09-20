@@ -863,3 +863,401 @@ def test_ac9d_retry_rollback_is_durable_before_pending_return(tmp_path, monkeypa
     assert outcome.rolled_back_op_id == row["op_id"]
     assert _phase_from_another_connection(root, row["op_id"]) == "reverted", \
         "0d-2c の巻き戻しが lock 内で commit されていない (別コネクションから未 commit)"
+
+
+# ---------------------------------------------------------------- T11 (AC-16c、
+# 再開の前提 (3 つ組) が崩れていたら巻き戻して新しい op_id で流し直す。
+# ヘルパ `_fail_advance_at` / `_stopped_before` / `_third_party_points_live_at`
+# は probe `tmp/review-20260920-soh/r2/cr1-probe/test_probe_cr1.py` を転写
+# (機械 diff で 0 を確認済)。`_stopped_before_sw0` は probe に無い新規ヘルパ
+# (switch_required=0 の行を preparing/versioned/recorded で止める)。
+
+def _fail_advance_at(monkeypatch, phase_to_fail: str):
+    real = plugin_switch.advance_switch_journal
+
+    def _fake(conn, op_id, *, phase, now, commit=False):
+        if phase == phase_to_fail:
+            raise OSError(f"injected: crash before advance({phase})")
+        return real(conn, op_id, phase=phase, now=now, commit=commit)
+
+    monkeypatch.setattr(plugin_switch, "advance_switch_journal", _fake)
+    return real
+
+
+def _stopped_before(tmp_path, monkeypatch, fail_phase: str, expect_phase: str):
+    """bless を `fail_phase` への advance 直前で落とし、journal
+    (switch_required=1) を `expect_phase` (preparing/versioned/recorded) で
+    停止させる (probe `test_probe_cr1.py:77-92` を転写)。"""
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+    real = _fail_advance_at(monkeypatch, fail_phase)
+    main(["plugin", "bless", "sma", "--from", "_human"])
+    monkeypatch.setattr(plugin_switch, "advance_switch_journal", real)
+    conn = db_store.connect(root / _DB)
+    row = journal_store.get_open_by_name(conn, "sma")
+    assert row is not None and row["phase"] == expect_phase, (
+        f"前提: {expect_phase} で停止 / 実際={row and row['phase']}")
+    assert not (root / "plugins" / "sma").exists(), "前提: live は未切替"
+    assert row["switch_required"] == 1, "前提: 保存 switch_required=1"
+    return root, conn, row
+
+
+def _third_party_points_live_at(root, target: str) -> None:
+    """第三者が live symlink を外から `target` へ張り替える
+    (probe `test_probe_cr1.py:95-101` を転写)。"""
+    plugins_root = root / "plugins"
+    tmp = plugins_root / ".sma.thirdparty"
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+    tmp.symlink_to(target)
+    os.rename(tmp, plugins_root / "sma")
+
+
+_SW0_FAIL_AT = {"preparing": "versioned", "versioned": "recorded"}
+
+
+def _stopped_before_sw0(tmp_path, monkeypatch, expect_phase: str):
+    """**probe に無い新規ヘルパ**: `switch_required=0` の行を
+    `preparing`/`versioned`/`recorded` で止める。まず同一候補を 1 回 bless
+    して live を配備し (switch_required=1 で完遂)、同じ候補をもう一度
+    bless する (2 回目は switch_required=0 の行になる — `test_ac16b_*` と
+    同じ作り)。`preparing`/`versioned` は `_fail_advance_at` で止まる
+    (advance("versioned")/advance("recorded") を落とす)。`recorded` は
+    `advance("switched")` をそもそも呼ばない (§11-a の注のとおり) ので
+    `_finalize_decision` を落とす (probe `test_probe_c_reverse_stored_zero_
+    recomputed_true` `:199-206` の `_boom` と同形)。"""
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+    assert main(["plugin", "bless", "sma", "--from", "_human"]) == 0
+
+    if expect_phase == "recorded":
+        real_fin = plugin_switch._finalize_decision
+        state = {"n": 0}
+
+        def _boom(*a, **kw):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise OSError("injected: crash before finalize")
+            return real_fin(*a, **kw)
+
+        monkeypatch.setattr(plugin_switch, "_finalize_decision", _boom)
+        main(["plugin", "bless", "sma", "--from", "_human"])
+        monkeypatch.setattr(plugin_switch, "_finalize_decision", real_fin)
+    else:
+        real = _fail_advance_at(monkeypatch, _SW0_FAIL_AT[expect_phase])
+        main(["plugin", "bless", "sma", "--from", "_human"])
+        monkeypatch.setattr(plugin_switch, "advance_switch_journal", real)
+
+    conn = db_store.connect(root / _DB)
+    row = journal_store.get_open_by_name(conn, "sma")
+    assert row is not None and row["phase"] == expect_phase and row["switch_required"] == 0, (
+        f"前提: switch_required=0 / {expect_phase} で停止 / "
+        f"実際={dict(row) if row else None}")
+    return root, conn, row
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("fail_phase,expect_phase", [
+    ("versioned", "preparing"),
+    ("recorded", "versioned"),
+    ("switched", "recorded"),
+])
+def test_ac16c1_resume_with_stale_switch_required_rolls_back_and_redeploys(
+        tmp_path, monkeypatch, fail_phase, expect_phase):
+    """AC-16c-1 (a): 保存 switch_required=1 / 再計算 False の 3 phase。
+    第三者が live を **ちょうど new_target** へ向けた状態から retry する
+    と、巻き戻して新しい op_id で流し直し完遂する (現行は 3 通りとも
+    ValueError で永久に詰まる)。"""
+    root, conn, row = _stopped_before(tmp_path, monkeypatch, fail_phase, expect_phase)
+    plugins_root = root / "plugins"
+    new_target = row["new_target"]
+    _third_party_points_live_at(root, new_target)
+    assert (plugins_root / "sma").readlink().as_posix() == new_target
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert _status(conn, row["approval_id"]) == "approved"
+    assert journal_store.list_non_terminal(conn) == []
+    all_rows = _rows(conn)
+    assert len(all_rows) == 2, f"停止行 + 新行の 2 行でなければならない: {all_rows}"
+    assert all_rows[0] == (row["op_id"], "reverted")
+    new_op_id = all_rows[1][0]
+    assert all_rows[1][1] == "decided" and new_op_id != row["op_id"]
+    new_row = journal_store.get(conn, new_op_id)
+    assert new_row["old_kind"] == "symlink"
+    assert new_row["old_target"] == new_target
+    assert new_row["switch_required"] == 0
+    assert (plugins_root / "sma").readlink().as_posix() == new_target, "live は不変"
+    assert outcome.outcome == "deployed_after_rollback"
+    assert outcome.rolled_back_op_id == row["op_id"]
+    assert outcome.op_id == new_op_id
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("expect_phase", ["preparing", "versioned", "recorded"])
+def test_ac16c2_reverse_stored_zero_recomputed_true_rolls_back(
+        tmp_path, monkeypatch, expect_phase):
+    """AC-16c-2 (c、逆向き): 保存 switch_required=0 / 再計算 True の 3
+    phase。第三者が live を消した状態から retry すると、巻き戻して新しい
+    op_id (switch_required=1) で流し直し完遂する (現行は
+    `advance_switch_journal` の switch_required=0 ガードで ValueError)。"""
+    root, conn, row = _stopped_before_sw0(tmp_path, monkeypatch, expect_phase)
+    plugins_root = root / "plugins"
+    (plugins_root / "sma").unlink()  # 第三者が live を消す
+    rows_before = _rows(conn)
+    assert rows_before[-1] == (row["op_id"], expect_phase), \
+        f"前提: 停止行が末尾のはず (先行する完遂行 1 本を含む): {rows_before}"
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert journal_store.list_non_terminal(conn) == []
+    all_rows = _rows(conn)
+    assert len(all_rows) == len(rows_before) + 1, (
+        "停止行の巻き戻し (reverted) + 新行 (decided) の計 1 行増でなければ"
+        f"ならない: before={rows_before} after={all_rows}")
+    assert all_rows[len(rows_before) - 1] == (row["op_id"], "reverted")
+    new_op_id = all_rows[-1][0]
+    new_row = journal_store.get(conn, new_op_id)
+    assert new_row["switch_required"] == 1
+    live = plugins_root / "sma"
+    assert live.is_symlink()
+    assert live.readlink().as_posix() == new_row["new_target"]
+    assert _status(conn, row["approval_id"]) == "approved"
+    assert outcome.outcome == "deployed_after_rollback"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("switch_required,fail_phase,expect_phase", [
+    (1, "versioned", "preparing"),
+    (1, "recorded", "versioned"),
+    (1, "switched", "recorded"),
+    (0, None, "preparing"),
+    (0, None, "versioned"),
+    (0, None, "recorded"),
+])
+def test_ac16c3_resume_without_drift_reuses_the_same_op_id(
+        tmp_path, monkeypatch, switch_required, fail_phase, expect_phase):
+    """AC-16c-3 (回帰防止)。**この AC が「常に巻き戻す」への退化を殺す
+    唯一の網** — 食い違いが無いときは live を一切触らず retry しても
+    op_id を再利用したまま完遂する (`switch_required` の両方 (0 と 1) ×
+    3 phase、v1.8a)。"""
+    if switch_required:
+        root, conn, row = _stopped_before(tmp_path, monkeypatch, fail_phase, expect_phase)
+    else:
+        root, conn, row = _stopped_before_sw0(tmp_path, monkeypatch, expect_phase)
+    plugins_root = root / "plugins"
+    # live には一切触れない (no-drift)。
+    rows_before = _rows(conn)
+    assert rows_before[-1] == (row["op_id"], expect_phase), \
+        f"前提: 停止行が末尾のはず: {rows_before}"
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS, activity=_activity(root))
+
+    all_rows = _rows(conn)
+    assert all_rows == rows_before[:-1] + [(row["op_id"], "decided")], (
+        "停止行と同じ op_id が再利用されているはず "
+        f"(新しい行が増えていない): {all_rows}")
+    assert outcome.outcome == "deployed"
+    assert outcome.rolled_back_op_id is None
+    assert "switch_resume_precondition_changed" not in _activity_text(root)
+
+
+@pytest.mark.slow
+def test_ac16c4_precondition_change_leaves_a_dedicated_activity_event(tmp_path, monkeypatch):
+    """AC-16c-4: 監査の観測。activity に `switch_resume_precondition_changed`
+    が **1 本**残り、その**直後**に `switch_reverted` が並ぶ (2 行になる)。
+    巻き戻した行は終端 `reverted` のまま。"""
+    root, conn, row = _stopped_before(tmp_path, monkeypatch, "switched", "recorded")
+    plugins_root = root / "plugins"
+    _third_party_points_live_at(root, row["new_target"])
+
+    plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS, activity=_activity(root))
+
+    lines = [l for l in _activity_text(root).splitlines() if l.strip()]
+    precond = [l for l in lines if "switch_resume_precondition_changed" in l]
+    assert len(precond) == 1, f"1 本のはず: {precond}"
+    line = precond[0]
+    assert f"op_id={row['op_id']}" in line
+    assert "phase=recorded" in line
+    assert "stored_switch_required=1" in line
+    assert "recomputed=0" in line
+    idx = lines.index(line)
+    assert "switch_reverted" in lines[idx + 1], "直後が switch_reverted でない"
+    assert _rows(conn)[0] == (row["op_id"], "reverted")
+
+
+@pytest.mark.slow
+def test_ac16c5_resume_rollback_is_committed_inside_the_lock(tmp_path, monkeypatch):
+    """AC-16c-5 (IV-6): 巻き戻しは `_plugin_locks` の内側で起き、commit も
+    lock の内側で完了している。T10 の観測装置
+    (`_phase_from_another_connection`) を再利用する。"""
+    root, conn, row = _stopped_before(tmp_path, monkeypatch, "switched", "recorded")
+    plugins_root = root / "plugins"
+    _third_party_points_live_at(root, row["new_target"])
+    import contextlib as _ctx
+    real_locks = plugin_switch._plugin_locks
+    op_id = row["op_id"]
+    seen = []
+
+    @_ctx.contextmanager
+    def _spy(rt, names):
+        with real_locks(rt, names):
+            try:
+                yield
+            finally:
+                # 実 lock を解放する前に別コネクションから読む。
+                seen.append(_phase_from_another_connection(root, op_id))
+
+    monkeypatch.setattr(plugin_switch, "_plugin_locks", _spy)
+    plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert seen == ["reverted"], \
+        f"lock 解放直前の観測が reverted になっていない (観測={seen})"
+    # 静的確認 (Step 11-e): `_revert_one` の呼び出し元は 5 箇所のまま
+    # (定義行 `def _revert_one(` 自身は除く — 設計書 §3.3.2 の全数表と同じ数え方)。
+    src_lines = Path(plugin_switch.__file__).read_text(encoding="utf-8").splitlines()
+    call_sites = [l for l in src_lines
+                 if "_revert_one(" in l and not l.lstrip().startswith("def ")]
+    assert len(call_sites) == 5, call_sites
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("fail_phase,expect_phase", [
+    ("versioned", "preparing"),
+    ("recorded", "versioned"),
+    ("switched", "recorded"),
+])
+def test_ac16c6_plain_branch_closes_its_own_unfinished_journal(
+        tmp_path, monkeypatch, fail_phase, expect_phase):
+    """AC-16c-6: 第三者が live を plain ディレクトリへ差し替えた状態で
+    retry すると、`legacy_plain_present` のまま (文言・フィールド不変) で
+    非終端 journal が 0 本になり、続く bless が `UnresolvedJournalError`
+    にならない。"""
+    root, conn, row = _stopped_before(tmp_path, monkeypatch, fail_phase, expect_phase)
+    plugins_root = root / "plugins"
+    live = plugins_root / "sma"
+    if live.exists() or live.is_symlink():
+        live.unlink()
+    live.mkdir()
+    (live / "marker.txt").write_text("plain")
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert outcome.outcome == "legacy_plain_present"
+    assert outcome.status == "pending"
+    assert journal_store.list_non_terminal(conn) == []
+
+    assert main(["plugin", "bless", "sma", "--from", "_human"]) == 0, \
+        "非終端行が残っていれば UnresolvedJournalError で rc=1 のはず"
+
+
+@pytest.mark.slow
+def test_ac16c7_crash_between_rollback_commit_and_new_journal_converges(tmp_path, monkeypatch):
+    """AC-16c-7 (codex r5 #4): 巻き戻しの commit と新 journal 行の作成の
+    間で落ちても、次の retry で素の新規 approve 経路を通って収束する。"""
+    root, conn, row = _stopped_before(tmp_path, monkeypatch, "switched", "recorded")
+    plugins_root = root / "plugins"
+    _third_party_points_live_at(root, row["new_target"])
+
+    real_begin = plugin_switch.begin_switch_journal
+    state = {"n": 0}
+
+    def _boom(*a, **kw):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise OSError("injected: crash before begin_switch_journal")
+        return real_begin(*a, **kw)
+
+    monkeypatch.setattr(plugin_switch, "begin_switch_journal", _boom)
+
+    with pytest.raises(OSError, match="injected"):
+        plugin_switch.retry_approval(
+            conn, row["approval_id"], decided_by="human", now=NOW,
+            plugins_root=plugins_root, settings=SETTINGS)
+
+    assert _rows(conn) == [(row["op_id"], "reverted")]
+    assert journal_store.list_non_terminal(conn) == []
+    assert _status(conn, row["approval_id"]) == "pending"
+    assert (plugins_root / "sma").readlink().as_posix() == row["new_target"]
+
+    monkeypatch.setattr(plugin_switch, "begin_switch_journal", real_begin)
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    all_rows = _rows(conn)
+    assert len(all_rows) == 2
+    assert all_rows[0] == (row["op_id"], "reverted")
+    assert all_rows[1][1] == "decided"
+    assert _status(conn, row["approval_id"]) == "approved"
+    assert outcome.outcome == "deployed"
+    assert outcome.rolled_back_op_id is None, \
+        "巻き戻したのは前回の呼び出しなので今回は巻き戻していない"
+
+
+def _write_v2_candidate(human_dir: Path) -> None:
+    """AC-16c-8: 別 artifact_hash の候補にする (内容を変えるだけ)。"""
+    p = human_dir / "plugin.py"
+    p.write_text(p.read_text(encoding="utf-8") + "\n# v2\n", encoding="utf-8")
+
+
+@pytest.mark.slow
+def test_ac16c8_old_target_drift_is_detected(tmp_path, monkeypatch):
+    """AC-16c-8 (R13 の主契約): 保存も再計算も switch_required=1 のままで、
+    `old_kind='symlink'` の行の live を第三者が **old_target でも
+    new_target でもない第 3 の先 Y** へ張り替えると、巻き戻しが起き、
+    新しい行の `old_target == Y` になる (v1.7 の述語ではこの drift を
+    検出できない)。"""
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+    assert main(["plugin", "bless", "sma", "--from", "_human"]) == 0
+    conn = db_store.connect(root / _DB)
+    plugins_root = root / "plugins"
+    old_target = (plugins_root / "sma").readlink().as_posix()
+
+    _write_v2_candidate(plugins_root / "_human" / "sma")
+    real = _fail_advance_at(monkeypatch, "switched")
+    main(["plugin", "bless", "sma", "--from", "_human"])
+    monkeypatch.setattr(plugin_switch, "advance_switch_journal", real)
+    row = journal_store.get_open_by_name(conn, "sma")
+    assert row is not None and row["phase"] == "recorded"
+    assert row["switch_required"] == 1
+    assert row["old_kind"] == "symlink" and row["old_target"] == old_target
+
+    y_target = f".versions/sma/{'9' * 64}"
+    _third_party_points_live_at(root, y_target)
+    rows_before = _rows(conn)
+    assert rows_before[-1] == (row["op_id"], "recorded"), \
+        f"前提: 停止行が末尾のはず (先行する完遂行 1 本を含む): {rows_before}"
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert journal_store.list_non_terminal(conn) == []
+    all_rows = _rows(conn)
+    assert len(all_rows) == len(rows_before) + 1, (
+        "停止行の巻き戻し (reverted) + 新行 (decided) の計 1 行増でなければ"
+        f"ならない: before={rows_before} after={all_rows}")
+    assert all_rows[len(rows_before) - 1] == (row["op_id"], "reverted")
+    new_op_id = all_rows[-1][0]
+    new_row = journal_store.get(conn, new_op_id)
+    assert new_row["old_target"] == y_target, \
+        "R13 の主契約: old_target の drift が検出されていない"
+    assert outcome.outcome == "deployed_after_rollback"
+    assert (plugins_root / "sma").readlink().as_posix() == row["new_target"]
