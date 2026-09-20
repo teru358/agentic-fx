@@ -1261,3 +1261,262 @@ def test_ac16c8_old_target_drift_is_detected(tmp_path, monkeypatch):
         "R13 の主契約: old_target の drift が検出されていない"
     assert outcome.outcome == "deployed_after_rollback"
     assert (plugins_root / "sma").readlink().as_posix() == row["new_target"]
+
+
+# ---------------------------------------------------------------- T13 (AC-19、
+# 版 dir の hash 再照合を切替の要否にかかわらず通す)
+#
+# **着手時の実測で判明した構成上の注意**: `history_git.record_version` は
+# `_advance_to_decided` の**呼び出しのたびに無条件で** (switch_required の
+# 値に関係なく) 版 dir の実ファイルを git blob hash で候補の
+# (content_hash, artifact_hash) と独立に再照合する (`history_git.py:162-171`)。
+# `create_version_dir` の後に単純に版 dir を書き換えるだけでは、
+# switch_required=0 の分岐 (T13 が新設する箇所) に到達する**前**にこの
+# 既存照合が `HistoryGitError` (`index blob hash mismatch`) を投げてしまい、
+# T13 の分岐を検証できない (実測して確認した — 2 回目の `main(["plugin",
+# "bless", ...])` を試すと `HistoryGitError` が uncaught で漏れた)。
+# `tests/plugin/test_switch_paths.py::
+# test_advance_to_decided_detects_in_place_tamper_of_artifact_hash_only`
+# (`:1391-1400`) が使う **「record_version を実体で呼んだ直後に改竄する」**
+# seam (機械 diff で確認済) を転用し、正しい記録が済んだ**後**に版 dir を
+# 改竄することで、T13 が新設する switch_required=0 の照合だけを狙って
+# 落とす。
+
+def _record_then_tamper_version_dir(monkeypatch):
+    """`test_switch_paths.py:1388-1398` の `_record_then_tamper` と同じ
+    流儀 (機械 diff で確認)。"""
+    from agentic_fx.plugin import history_git as history_git_mod
+    real_record_version = history_git_mod.record_version
+
+    def _record_then_tamper(*a, **kw):
+        result = real_record_version(*a, **kw)
+        version_dir = kw["version_dir"]
+        version_dir.chmod(0o700)
+        (version_dir / "plugin.py").chmod(0o600)
+        (version_dir / "plugin.py").write_text("def compute(df, params):\n    return {}\n# TAMPERED\n")
+        version_dir.chmod(0o500)
+        return result
+
+    monkeypatch.setattr("agentic_fx.plugin.switch.history_git.record_version",
+                        _record_then_tamper)
+
+
+def _switch_required_zero_pending_approval(root, conn) -> int:
+    """AC-19a/b/c: 同一候補 (`_human/sma`、live は既に配備済み) をもう一度
+    `submit_candidate` して `switch_required=0` の pending approval を作る
+    (**approve 経路** — AC-19d/e の bless 経路とは意図的に別にする)。"""
+    plugins_root = root / "plugins"
+    return plugin_switch.submit_candidate(
+        conn, name="sma", staging_dir=plugins_root / "_human",
+        candidate_origin="human", mission_id=None, backlog_id=None,
+        settings=SETTINGS, now=NOW)
+
+
+@pytest.mark.slow
+def test_ac19a_switch_not_required_verifies_version_dir_before_deciding(tmp_path, monkeypatch):
+    """AC-19a (IV-7 の主契約): switch_required=0 でも版 dir の照合が走る。
+    版 dir を第三者が in-place 編集してから (T13 の分岐の直前で改竄する
+    seam を使う) approve すると、approval は pending のまま、
+    still_pending(reverify_failed)、非終端行は 0 本、live は不変。
+    **現行 (T13 前) は照合を通らず approved になる**。"""
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+    assert main(["plugin", "bless", "sma", "--from", "_human"]) == 0
+    conn = db_store.connect(root / _DB)
+    plugins_root = root / "plugins"
+    target = (plugins_root / "sma").readlink().as_posix()
+
+    approval_id = _switch_required_zero_pending_approval(root, conn)
+    _record_then_tamper_version_dir(monkeypatch)
+    outcome = plugin_switch.approve_candidate(
+        conn, approval_id, decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert outcome.outcome == "still_pending"
+    assert outcome.reason == "reverify_failed"
+    assert outcome.status == "pending"
+    assert _status(conn, approval_id) == "pending"
+    assert journal_store.list_non_terminal(conn) == [], "名前が凍らない"
+    assert (plugins_root / "sma").readlink().as_posix() == target, "live は不変"
+
+
+@pytest.mark.slow
+def test_ac19b_verification_runs_before_finalize(tmp_path, monkeypatch):
+    """AC-19b: 照合は decide の前にある — `_finalize_decision` は
+    1 度も呼ばれない。"""
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+    assert main(["plugin", "bless", "sma", "--from", "_human"]) == 0
+    conn = db_store.connect(root / _DB)
+    plugins_root = root / "plugins"
+
+    approval_id = _switch_required_zero_pending_approval(root, conn)
+    _record_then_tamper_version_dir(monkeypatch)
+    calls = []
+    real_fin = plugin_switch._finalize_decision
+
+    def _spy(*a, **kw):
+        calls.append(1)
+        return real_fin(*a, **kw)
+
+    monkeypatch.setattr(plugin_switch, "_finalize_decision", _spy)
+    plugin_switch.approve_candidate(
+        conn, approval_id, decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert calls == [], "照合の前に _finalize_decision が呼ばれている"
+
+
+@pytest.mark.slow
+def test_ac19c_same_candidate_reapproval_still_succeeds(tmp_path, monkeypatch):
+    """AC-19c (正常系の回帰): 版 dir を触らない同じ候補の再 approve は
+    従来どおり approved になる (switch_required=0 / recorded → decided)。"""
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+    assert main(["plugin", "bless", "sma", "--from", "_human"]) == 0
+    conn = db_store.connect(root / _DB)
+    plugins_root = root / "plugins"
+    target = (plugins_root / "sma").readlink().as_posix()
+    # 版 dir は触らない。
+
+    approval_id = _switch_required_zero_pending_approval(root, conn)
+    outcome = plugin_switch.approve_candidate(
+        conn, approval_id, decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert outcome.outcome == "deployed"
+    assert outcome.status == "approved"
+    assert _status(conn, approval_id) == "approved"
+    j = journal_store.get(conn, outcome.op_id)
+    assert j["switch_required"] == 0 and j["phase"] == "decided"
+    assert (plugins_root / "sma").readlink().as_posix() == target
+
+
+@pytest.mark.slow
+def test_ac19d_bless_raises_when_version_dir_is_tampered(tmp_path, monkeypatch):
+    """AC-19d (§3.7.3): switch_required=0 の bless で版 dir が壊れている
+    と RuntimeError が上がり、bless は自分の未完行を閉じない (設計どおりの
+    残余) — 解除は reject で閉じられる。
+
+    **申告 (プランからの逸脱)**: 設計 (§3.7.3 / Step 13-a AC-19d) は
+    「`afx plugin bless` (CLI) を打つと rc=1・stderr に `エラー: `・
+    traceback が出ない」と書くが、現物 `backtest/cli.py` の `_plugin_bless`
+    の except は `(UnresolvedJournalError, ValueError, SandboxError)` のみで
+    `RuntimeError` を捕らない (`:589-601`)。外側の包括 catch
+    (`:781-784`、`(ValueError, KeyError, OSError, sqlite3.Error,
+    VerifyBackendGateError)`) にも `RuntimeError` は無い。**CLI で試すと
+    traceback が出る** — Global Constraints は本束で足す `except` を 3 つ
+    (`_plugin_bless` の `UnresolvedJournalError` / `_plugin_materialize` の
+    `ValueError` / T12 の `_plugin_retire`) に限定しており、T13 の担当は
+    `switch.py` のみ (cli.py は対象外) なので、4 つ目の `except` を無断で
+    追加しない。ここでは `bless_candidate` を直接呼んで RuntimeError と
+    残余行を確認する。CLI 経由の rc=1 化 (cli.py の是正) は別途申告する。"""
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+    assert main(["plugin", "bless", "sma", "--from", "_human"]) == 0
+    conn = db_store.connect(root / _DB)
+    plugins_root = root / "plugins"
+    human_dir = plugins_root / "_human" / "sma"
+
+    _record_then_tamper_version_dir(monkeypatch)
+    with pytest.raises(RuntimeError, match="content_hash mismatch"):
+        plugin_switch.bless_candidate(
+            conn, name="sma", human_dir=human_dir, settings=SETTINGS,
+            now=NOW, decided_by="human_cli")
+
+    non_terminal = journal_store.list_non_terminal(conn)
+    assert len(non_terminal) == 1, "bless は自分の未完行を閉じない (設計どおりの残余)"
+    residual = non_terminal[0]
+    assert residual["phase"] == "recorded"
+
+    plugin_switch.reject_candidate(
+        conn, residual["approval_id"], decided_by="human", reason="",
+        now=NOW, plugins_root=plugins_root)
+    assert journal_store.list_non_terminal(conn) == [], \
+        "reject で残余行が閉じられていない"
+
+
+@pytest.mark.slow
+def test_ac19e_bless_residual_resolved_by_approval_retry_when_repaired(tmp_path, monkeypatch):
+    """AC-19e (v1.8a 新規、repaired=True の側): bless の残余は `reject` だけ
+    でなく `approval retry` でも解除できる — 版 dir を直してから打てば
+    `decided`/`approved` まで完遂し、非終端行は残らない。"""
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+    assert main(["plugin", "bless", "sma", "--from", "_human"]) == 0
+    conn = db_store.connect(root / _DB)
+    plugins_root = root / "plugins"
+    human_dir = plugins_root / "_human" / "sma"
+    target = (plugins_root / "sma").readlink().as_posix()
+
+    _record_then_tamper_version_dir(monkeypatch)
+    with pytest.raises(RuntimeError, match="content_hash mismatch"):
+        plugin_switch.bless_candidate(
+            conn, name="sma", human_dir=human_dir, settings=SETTINGS,
+            now=NOW, decided_by="human_cli")
+    residual = journal_store.list_non_terminal(conn)[0]
+
+    # 版 dir を直す — patch を外し (real record_version に戻す)、
+    # 改竄済み版 dir を消して `create_version_dir` が候補から作り直せる
+    # ようにする。
+    monkeypatch.undo()
+    version_dir = plugins_root / target
+    for p in [version_dir, *version_dir.rglob("*")]:
+        p.chmod(p.stat().st_mode | stat.S_IWUSR | stat.S_IXUSR)
+    shutil.rmtree(version_dir)
+
+    outcome = plugin_switch.retry_approval(
+        conn, residual["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert journal_store.list_non_terminal(conn) == [], \
+        "版 dir を直せば非終端行が残らない (bless の残余は永久凍結ではない)"
+    assert outcome.outcome == "deployed"
+    assert _status(conn, residual["approval_id"]) == "approved"
+
+
+@pytest.mark.slow
+def test_ac19e_bless_residual_unrepaired_retry_raises_history_git_error(tmp_path, monkeypatch):
+    """AC-19e (repaired=False の側): **申告 (設計との食い違い)**。
+    設計 (Step 13-a #6) は「直さなければ `still_pending(reverify_failed)`
+    になり非終端行が 0 本になる」と書くが、実測するとそうならない —
+    `_advance_to_decided` は毎回無条件で `history_git.record_version` を
+    呼び直すため (このファイル冒頭の T13 節の注)、直さずに retry すると
+    **改竄済みの版 dir を `record_version` 自身が独立に再照合して
+    `HistoryGitError` を送出する** (T13 の switch_required=0 分岐に到達する
+    前)。この例外は `switch.py`・`retry_approval`・呼び出し元のどこにも
+    catch されず、**残余行は非終端のまま残り** (`still_pending` にはならず、
+    plugin 名は凍ったまま) 例外が upstream へ抜ける。設計の記述と実際の
+    挙動が食い違う (指揮者へ要申告) ので、ここでは**実測した実際の挙動**
+    を pin する。"""
+    root = _cli_env(tmp_path)
+    monkeypatch.chdir(root)
+    shutil.copytree(EXAMPLES / "sma", root / "plugins" / "_human" / "sma")
+    assert main(["plugin", "bless", "sma", "--from", "_human"]) == 0
+    conn = db_store.connect(root / _DB)
+    plugins_root = root / "plugins"
+    human_dir = plugins_root / "_human" / "sma"
+
+    _record_then_tamper_version_dir(monkeypatch)
+    with pytest.raises(RuntimeError, match="content_hash mismatch"):
+        plugin_switch.bless_candidate(
+            conn, name="sma", human_dir=human_dir, settings=SETTINGS,
+            now=NOW, decided_by="human_cli")
+    residual = journal_store.list_non_terminal(conn)[0]
+
+    # 版 dir を直さずそのまま retry する。patch (record_then_tamper) は
+    # 維持したまま — 実運用では改竄が残ったまま、という状況の模擬。
+    from agentic_fx.plugin import history_git as history_git_mod
+    with pytest.raises(history_git_mod.HistoryGitError, match="index blob hash mismatch"):
+        plugin_switch.retry_approval(
+            conn, residual["approval_id"], decided_by="human", now=NOW,
+            plugins_root=plugins_root, settings=SETTINGS)
+
+    assert journal_store.list_non_terminal(conn) == [dict(residual)], \
+        "残余行は非終端のまま残る (still_pending への収束はしない)"
+    assert _status(conn, residual["approval_id"]) == "pending"

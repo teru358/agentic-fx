@@ -1289,7 +1289,7 @@ def _advance_to_decided(
     conn: sqlite3.Connection, approval_id: int, *, op_id: int, name: str,
     plugins_root: Path, candidate_dir: Path, content_hash: str,
     artifact_hash: str, switch_required: bool, decided_by: str, now: datetime,
-) -> None:
+) -> bool:
     """preparing 済みジャーナルを versioned → recorded → (switched →
     切替) → decided まで進める (P2 手順 5〜9 / P3 手順 6A〜11A の共有部)。
 
@@ -1331,22 +1331,26 @@ def _advance_to_decided(
         advance_switch_journal(conn, op_id, phase="recorded", now=now, commit=True)
         current_idx = _PHASE_ORDER.index("recorded")
 
+    new_target = f".versions/{name}/{artifact_hash}"
     if switch_required:
         if current_idx < _PHASE_ORDER.index("switched"):
             advance_switch_journal(conn, op_id, phase="switched", now=now, commit=True)
-        new_target = f".versions/{name}/{artifact_hash}"
         switch_live(plugins_root, name, new_target=new_target, op_id=op_id)
-        # 手順 8a: 切替後の再照合 (fail closed — 自動巻き戻しは
-        # reconcile_switch_journals の switched 収束規則に委ねる。ここでは
-        # 例外を送出して手順 9 (decide) へ進ませない)。確定-7: 旧稿は
-        # content_hash のみを見ており、resume 経路
-        # (`_reverify_switched_journal._new_target_hash_ok`) が持つ
-        # artifact_hash 照合 + ディレクトリ名照合 (in-place 編集検出) が
-        # 無かった (経路の非対称) — `_version_dir_hashes_ok` を共有する形へ
-        # 揃える。
-        resolved_after = (plugins_root / new_target).resolve()
-        if not _version_dir_hashes_ok(
-                resolved_after, content_hash=content_hash, artifact_hash=artifact_hash):
+
+    # [switch-ops-hardening] T13 (設計書 §3.7 / R14 / IV-7): 切替の要否に
+    # かかわらず、decide の前に版 dir の中身を照合する。switch_required=0
+    # の枝では版 dir が「この回に作ったもの」ではなく「既に在ったもの」
+    # (create_version_dir は同 artifact_hash の dir があれば中身を作り直さ
+    # ない — version_store.py:78-86) なので、照合が無いと第三者の in-place
+    # 編集を無検証で approved にしてしまう。手順 8a (旧稿の切替後再照合)
+    # はこの照合に合流した — 位置は switch_required=1 でも従来どおり
+    # switch_live の直後 (decide の直前)。
+    resolved_after = (plugins_root / new_target).resolve()
+    if not _version_dir_hashes_ok(
+            resolved_after, content_hash=content_hash, artifact_hash=artifact_hash):
+        if switch_required:
+            # 行は switched。reconcile / 0d-2a の _reverify_switched_journal に
+            # 自動収束経路があるので、現行どおり送出する (既存 pin)。
             # メッセージ中の "content_hash mismatch" 部分文字列は既存テスト
             # `test_approve_upgrade_reverifies_content_hash_after_switch`
             # の `pytest.raises(match=...)` が pin している (既存テスト
@@ -1355,8 +1359,12 @@ def _advance_to_decided(
                 f"plugin {name!r}: live content_hash mismatch after switch "
                 f"(expected content_hash={content_hash} "
                 f"artifact_hash={artifact_hash})")
+        # 行は recorded。reconcile は非 switched 行を飛ばすので、ここで
+        # 送出すると名前が凍る。呼び出し元に処置を委ねる (§3.7.2)。
+        return False
 
     _finalize_decision(conn, approval_id, op_id=op_id, decided_by=decided_by, now=now)
+    return True
 
 
 def _version_dir_hashes_ok(version_dir: Path, *, content_hash: str | None,
@@ -1757,11 +1765,19 @@ def approve_candidate(
                 switch_required=switch_required, actor=decided_by, now=now,
                 commit=True)
 
-        _advance_to_decided(
-            conn, approval_id, op_id=op_id, name=name, plugins_root=plugins_root,
-            candidate_dir=candidate_dir, content_hash=content_hash,
-            artifact_hash=artifact_hash, switch_required=switch_required,
-            decided_by=decided_by, now=now)
+        if not _advance_to_decided(
+                conn, approval_id, op_id=op_id, name=name, plugins_root=plugins_root,
+                candidate_dir=candidate_dir, content_hash=content_hash,
+                artifact_hash=artifact_hash, switch_required=switch_required,
+                decided_by=decided_by, now=now):
+            # [switch-ops-hardening] T13 (設計書 §3.7.2): switch_required=0
+            # で版 dir の照合が不成立 — 自分の未完行を閉じて pending 留置する
+            # (reconcile は非 switched 行を飛ばすので、閉じないと名前が凍る)。
+            _close_own_unfinished_journal_if_any()
+            return ApprovalOutcome(
+                outcome="still_pending", name=name, status="pending",
+                op_id=op_id, rolled_back_op_id=rolled_back_op_id,
+                reason="reverify_failed")
 
         if candidate_origin == "staging":
             shutil.rmtree(candidate_dir, ignore_errors=True)
@@ -2109,9 +2125,16 @@ def bless_candidate(
             conn.rollback()
             raise
 
-        _advance_to_decided(
-            conn, approval_id, op_id=op_id, name=name, plugins_root=plugins_root,
-            candidate_dir=human_dir, content_hash=content_hash,
-            artifact_hash=artifact_hash, switch_required=switch_required,
-            decided_by=decided_by, now=now)
+        if not _advance_to_decided(
+                conn, approval_id, op_id=op_id, name=name, plugins_root=plugins_root,
+                candidate_dir=human_dir, content_hash=content_hash,
+                artifact_hash=artifact_hash, switch_required=switch_required,
+                decided_by=decided_by, now=now):
+            # [switch-ops-hardening] T13 (設計書 §3.7.3): bless は自分の
+            # 未完行を閉じない (設計どおりの残余 — `_revert_one` の呼び出し
+            # 元を 6 箇所目に増やさない選択、§5 残余 5)。
+            raise RuntimeError(
+                f"plugin {name!r}: live content_hash mismatch after switch "
+                f"(expected content_hash={content_hash} "
+                f"artifact_hash={artifact_hash})")
         return approval_id
