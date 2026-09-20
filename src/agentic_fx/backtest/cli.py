@@ -625,7 +625,16 @@ def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
         plugin_switch.retire_plugin(
             conn, plugins_dir, args.name, now=datetime.now(timezone.utc),
             activity=activity)
-    except (plugin_switch.UnresolvedJournalError, ValueError, OSError) as e:
+    except plugin_switch.UnresolvedJournalError as e:
+        # [switch-ops-hardening] T12 (設計書 §3.4 / R12): 同じ原因
+        # (未終端の切替ジャーナル) には `_plugin_bless` と同じ案内を出す。
+        # `retire_plugin` の例外文言は `op_id=` のみで `approval_id=` を
+        # 含まないので、**第一手が `approval list` であることに意味がある**。
+        print(f"エラー: {e}\n"
+              "  収束手順: サービスの対話シェルで `approval list` → "
+              "`approval retry <approval_id>`", file=sys.stderr)
+        return 1
+    except (ValueError, OSError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
     print(f"plugin {args.name!r} を retire しました")

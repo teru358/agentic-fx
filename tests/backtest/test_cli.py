@@ -1657,3 +1657,85 @@ def test_plugin_materialize_os_error_subclass_is_rc1_message(tmp_path, monkeypat
     err = capsys.readouterr().err
     assert err.startswith("エラー: ")
     assert "permission denied" in err
+
+
+def _cli_root_for_plugin_commands(tmp_path: Path) -> Path:
+    """`afx plugin ...` が要求する tmp root
+    (`tests/plugin/test_indicator_initial_set.py::_cli_env` と同じ作り —
+    `ensure_initialized` / `config/settings.yaml` / `data/agentic.db`)。"""
+    (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+    shutil.copy(_REPO_ROOT / "config" / "settings.yaml.example",
+               tmp_path / "config" / "settings.yaml")
+    (tmp_path / "data" / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    (tmp_path / "plugins" / "_human").mkdir(parents=True, exist_ok=True)
+    StateStore(tmp_path / "data" / "state" / "app_state.json").update(
+        initialized=True)
+    conn = connect(tmp_path / "data" / "agentic.db")
+    init_db(conn)
+    conn.close()
+    return tmp_path
+
+
+def test_plugin_retire_unresolved_journal_is_rc1_with_next_step(
+        tmp_path, monkeypatch, capsys):
+    """[switch-ops-hardening] T12 / AC-18: `afx plugin retire <name>` が
+    未終端の切替ジャーナルで拒否されるとき、`_plugin_bless` (AC-10) と
+    **同じ 2 行目の案内**を出す (`approval list` → `approval retry`)。
+    `retire_plugin` は未終端ジャーナルの確認を live の実在確認より**先**に
+    行う (`switch.py:1842-1851`) ので、live (`plugins/sma`) を用意しなくても
+    この経路に到達できる。"""
+    from agentic_fx.plugin import switch as _switch
+
+    root = _cli_root_for_plugin_commands(tmp_path)
+    monkeypatch.chdir(root)
+    conn = connect(root / "data" / "agentic.db")
+    try:
+        _switch.begin_switch_journal(
+            conn, kind="approve", approval_id=1, name="sma",
+            old_kind="symlink", old_target=f".versions/sma/{'a' * 64}",
+            new_target=f".versions/sma/{'b' * 64}",
+            switch_required=True, actor="human",
+            now=datetime(2026, 9, 20, 0, 0, tzinfo=timezone.utc), commit=True)
+        journal_row = _switch.journal_store.get_open_by_name(conn, "sma")
+    finally:
+        conn.close()
+    assert journal_row is not None
+
+    rc = main(["plugin", "retire", "sma"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err, err
+    assert f"op_id={journal_row['op_id']}" in err, err
+    assert "approval list" in err, err
+    assert "approval retry" in err, err
+    # bless (AC-10) と同じ 2 行目であることを逐語一致で確認する
+    # (片方だけ変わる drift を殺す)。
+    second_line = err.splitlines()[1]
+    assert second_line == (
+        "  収束手順: サービスの対話シェルで `approval list` → "
+        "`approval retry <approval_id>`"), second_line
+
+
+def test_plugin_retire_value_error_is_rc1_without_next_step(
+        tmp_path, monkeypatch, capsys):
+    """[switch-ops-hardening] T12: `except` を 2 節に割っても
+    `(ValueError, OSError)` 側の捕捉集合と表示は不変であることの pin
+    (節を割っただけで新しい握りつぶしを作らないことの観測)。live が
+    symlink のとき `retire_plugin` は `ValueError` を投げる
+    (`switch.py:1849-1851`) — この経路には「次の 1 手」が付かない。"""
+    root = _cli_root_for_plugin_commands(tmp_path)
+    monkeypatch.chdir(root)
+    (root / "plugins" / ".versions" / "sma" / ("a" * 64)).mkdir(parents=True)
+    live = root / "plugins" / "sma"
+    live.symlink_to(f".versions/sma/{'a' * 64}")
+
+    rc = main(["plugin", "retire", "sma"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.strip() == "エラー: plugins/sma is not a plain directory " \
+        "(retire only applies to legacy plain live)"
+    assert "approval list" not in err
+    assert "approval retry" not in err
