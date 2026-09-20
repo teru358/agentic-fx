@@ -170,6 +170,54 @@ ValueError: plugin 'bollinger': test_plugin.py failed pytest gate (returncode=1)
 phase でも確認 (no-op)** になる。`foreign` (live が第三者に触られている)
 のときだけ、手順 5 の前に人間が `plugins/<名前>` の状態を判断する必要がある。
 
+## plugin 名が凍ったとき
+
+`bless` / `retire` / (別の候補への) `approve` を打って、次のような表示が出ることがある:
+
+```
+エラー: plugin 'sma' has an unresolved switch journal (op_id=3, approval_id=12) blocks approval 7 — resolve it first (reconcile or approval retry)
+  収束手順: サービスの対話シェルで `approval list` → `approval retry 12`
+```
+
+(`retire` は 2 行目のみ同じ文言で、1 行目に `approval_id=` を含まない —
+`op_id=` だけが出る。)
+
+これは「その plugin 名に未終端の切替ジャーナル (`preparing`/`versioned`/
+`recorded`/`switched` のいずれか) が既に 1 本残っていて、新しい操作を
+同じ名前に対して行えない」という意味 (IV-1: 非終端行は name ごとに高々 1 本)。
+表示された `エラー: ...UnresolvedJournalError...` の文字列そのものに
+`op_id=` (と、bless/approve 経路なら `approval_id=`) が含まれる。
+
+**解く手順**:
+
+1. サービスの対話シェルで `afx> approval list` を打つ。未終端 journal の節に
+   `op_id` / `name` / `phase` / `approval_id` が並ぶ (`approval_id` が
+   1 行目に出ていなかった場合もここで拾える)。
+2. `afx> approval retry <approval_id>` を打つ。多くの場合これで完遂する
+   (journal が終端になり、必要なら live まで配備される)。
+3. **起動時 reconcile では解けない** — reconcile は `switched` 以外の
+   非終端行 (`preparing`/`versioned`/`recorded`) をそもそも見に行かない。
+   サービスの再起動を待っても名前は凍ったままなので、必ず人間が
+   `approval retry` (または後述の `reject`) を打つ必要がある。
+4. **版 dir の中身が候補と合わない場合** (`bless`/`approve` の残余で、
+   直前に `content_hash mismatch` や `reverify_failed` を見ていたとき):
+   版 dir を直さずに `approval retry` を打つと、`still_pending` には
+   ならず `HistoryGitError: ... index blob hash mismatch ...` が
+   そのまま上がってくる (`record_version` が版 dir の実ファイルを
+   独立に再照合しているため)。この場合は先に版 dir
+   (`plugins/.versions/<名前>/<artifact_hash>`) の中身を確認し、
+   壊れていれば消してから (`create_version_dir` が候補から作り直す)
+   `approval retry` を打ち直す。
+5. **最後の手段**: `afx> reject <approval_id>` で閉じることもできる。
+   `reject` はこの approval 自身の未完 journal を巻き戻して終端にするが、
+   **live への副作用は「切替が既に済んでいた (`switched`) 行」に限られる**
+   — 版 dir 作成・git 記録止まり (`recorded` 以前) の行は `_revert_one` の
+   FS 副作用の条件 (`row["phase"] == "switched" and row["switch_required"]`、
+   `switch.py:185`) に当たらないため、**live は今指している版のまま
+   1 バイトも変わらない** (bless の残余のように `recorded` で止まっている
+   行が典型)。`reject` すると、その approval 自体は「承認しない」で
+   終わるので、必要ならあらためて `submit`/`bless` からやり直す。
+
 ## strategy 作者向けの注意
 
 これらの indicator に依存する strategy は、自分の `max_bars` を
