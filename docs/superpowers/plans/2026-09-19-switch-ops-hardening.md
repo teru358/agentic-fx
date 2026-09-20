@@ -1,4 +1,4 @@
-# [switch-ops-hardening] 実装プラン v1.1 (設計書 = `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` v1.5 準拠)
+# [switch-ops-hardening] 実装プラン v1.2 (設計書 = `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` v1.6 準拠)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (推奨) または superpowers:executing-plans で task ごとに実行すること。Step は
@@ -11,6 +11,9 @@
 の規律に載せる。(3) `approve_candidate` / `retry_approval` が **lock 内で確定した
 outcome** を返し、シェルはそれを文言に写すだけにする。(4) CLI の例外の扱いを揃え、
 (5) 対話シェルに `approval list` を足す。**新しい配備経路も自動化も作らない。**
+(6) **シェルの `approve <id>` も同じ lock 内 outcome を文言に写す** (v1.2、設計書 §3.6)。
+(7) **巻き戻しの commit が lock の内側で完了していることを別コネクションから pin する**
+(v1.2、設計書 AC-9d。**本体コードの変更は無い**)。
 
 **Architecture:** 変更は 3 ファイルに閉じる —
 `src/agentic_fx/plugin/switch.py` (分類器 / 2 段ガード / 0d 案 C / reconcile の lock +
@@ -22,10 +25,13 @@ journal-first の順序は不変**。判定 (live がどこを指しているか
 
 **Tech Stack:** Python 3.13 / uv / pytest / sqlite3 / fcntl.flock。
 
-**Spec:** `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` v1.4。
-ユーザー裁定 R1〜R8 と設計レビュー r1 (C1/I4)・r2 (C0/I4/M1)・r3 (C0/I1)・r4 (C0/I3/M1)
+**Spec:** `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` v1.6。
+ユーザー裁定 R1〜R8 (2026-09-19) と **R9 / R10 (2026-09-20、段 0 が報告した設計判断 2 点)**、
+設計レビュー r1 (C1/I4)・r2 (C0/I4/M1)・r3 (C0/I1)・r4 (C0/I3/M1)
 は設計書 §0 / §8.1〜§8.4 に確定記録済みで、**裁定待ちは無い**。設計書に無い判断が
 必要になったら**実装を止めて指揮者へ申告**すること。
+**T1〜T8 は worktree `tmp/wt/soh` (HEAD `3f4f553`) で実装 + 段 0 まで完了済み。
+v1.2 で追加する T9 / T10 はその上に積む。**
 
 ## Global Constraints
 
@@ -45,8 +51,10 @@ journal-first の順序は不変**。判定 (live がどこを指しているか
   ので可。**tool 応答・prompt・`docs/examples/plugins/` は届く**ので、そこに
   「codex」「レビュー r2」等を書かない
 - **`run_kind_gate` は raise しない**等の既存規約を変えない。gate の再実行も増やさない
-- **既存テストの書き換えは §7.1 の 4 本のみ** (下記 File Structure)。**それ以外が red に
-  なったら黙って直さず、指揮者へ申告する** ([[plan-code-defects-not-implementer-defects]])
+- **既存テストの書き換えは §7.1 の 4 本のみ** (下記 File Structure)。**T9 / T10 は既存テストを
+  1 本も書き換えない** — `tests/test_commands.py::test_approve_plugin_kind_reports_actual_outcome_not_always_approved`
+  が無改変で緑になる文言形を設計書 §3.6.3 が選んである。**red になったら黙って直さず、指揮者へ申告する**
+  ([[plan-code-defects-not-implementer-defects]])
 - **未コミットの差分の上で `git checkout` / `git restore` を使わない。** 逆変異の復元は
   `cp` 退避で行う ([[no-git-checkout-over-uncommitted-subagent-work]])
 - **出力を `| grep` / `| head` に通して途中終了させない。** pytest の結果は最後まで読む
@@ -55,7 +63,7 @@ journal-first の順序は不変**。判定 (live がどこを指しているか
 
 ## プラン規約
 
-- **設計を変えない。** 設計書 v1.4 が正。設計書に無い判断が要るときは**実装を止めて申告**
+- **設計を変えない。** 設計書 v1.6 が正。設計書に無い判断が要るときは**実装を止めて申告**
 - **テスト先行**: 各 task は「テストを置く → **red の逐語確認** → 実装 → **green** →
   **逆変異** → commit」の順。red の出力 (最終行) を Step のチェック時に貼る
 - **逐語転写は機械 diff する** ([[transcription-must-be-machine-diffed]])。本文のコード
@@ -75,10 +83,10 @@ journal-first の順序は不変**。判定 (live がどこを指しているか
 | ファイル | 変更 | task |
 |---|---|---|
 | `src/agentic_fx/plugin/switch.py` | 分類器 / `_revert_under_lock` / reconcile の載せ替え / 2 段ガード / 0d 案 C / outcome | T1〜T5 |
-| `src/agentic_fx/commands.py` | `approval retry` の結果報告 / `approval list` / `_HELP` | T5・T7 |
+| `src/agentic_fx/commands.py` | `approval retry` の結果報告 / `approval list` / `_HELP` / **`approve <id>` の結果報告 + `_retry_outcome_text` → `_approval_outcome_text` の改名** | T5・T7・**T9** |
 | `src/agentic_fx/backtest/cli.py` | `_plugin_bless` / `_plugin_materialize` の except | T6 |
-| `tests/plugin/test_switch_ops_hardening.py` | **新規** (AC-1〜AC-9c / AC-14d / AC-16a/b) | T1〜T5 |
-| `tests/test_commands.py` | **追記** (AC-12 / AC-13 / AC-14a/b/d) + **`:541` の spy を書き換え** | T5・T7 |
+| `tests/plugin/test_switch_ops_hardening.py` | **新規** (AC-1〜AC-9c / **AC-9d** / AC-14d / AC-16a/b) | T1〜T5・**T10** |
+| `tests/test_commands.py` | **追記** (AC-12 / AC-13 / AC-14a/b/d / **AC-17a〜d**) + **`:541` の spy を書き換え** | T5・T7・**T9** |
 | `tests/backtest/test_cli.py` | **追記** (AC-11) | T6 |
 | `tests/plugin/test_indicator_initial_set.py` | **2 本を書き換え** (retry の戻り文言 / CLI の traceback) | T3・T6 |
 | `tests/plugin/test_reconcile.py` | **1 本を書き換え** (lock 取得列に巻き戻しの 1 本が増える) | T4 |
@@ -102,6 +110,8 @@ dependency_locks` も red になった** — 下記「spec と食い違った点
 | AC-10 / AC-11 | T6 | `test_runbook_cli_bless_after_post_gate_failure_raises_traceback` (書き換え) / `test_plugin_materialize_containment_error_is_rc1_message` |
 | AC-12a/b/c / AC-13 | T7 | `tests/test_commands.py` の `approval list` 群 |
 | AC-15 | T8 | フルスイート |
+| **AC-9d** (巻き戻しの commit が lock 内) | **T10** | `test_ac9d_reconcile_revert_is_durable_from_another_connection` / `test_ac9d_revert_is_committed_before_the_lock_is_released` / `test_ac9d_retry_rollback_is_durable_before_pending_return` |
+| **AC-17a / AC-17b / AC-17c / AC-17d** (approve の outcome 報告) | **T9** | `test_approve_plugin_reports_the_locked_outcome` / `test_approve_plugin_writes_activity_only_when_deployed` / `test_approve_plugin_message_unaffected_by_later_decision` / `test_approve_plugin_fails_loud_on_unknown_outcome` |
 
 ## task 依存図
 
@@ -110,24 +120,29 @@ T1 (分類器 + ApprovalOutcome の型を置く、挙動不変)
  │
  ├─► T2 (2 段 phase ガード)            ← T1 の _TERMINAL_PHASES を使う
  │    │
- │    └─► T3 (0d 案 C + outcome 戻り値) ← 分類器 + 入口ガードの両方に依存
- │         │                             **v1.1 訂正**: 案 C の受入テストが
- │         │                             戻り値を assert するので、outcome を
- │         │                             返す変更は T5 ではなく T3 に属する
+ │    └─► T3 (0d 案 C + outcome 戻り値)
  │         │
- │         └─► T4 (reconcile の lock + 再読)   ← T3 の完成形と競合させる
+ │         └─► T4 (reconcile の lock + lock 内の再読)
  │              │
- │              └─► T5 (**commands.py のみ** — シェルの文言 + spy 書き換え)
+ │              ├─► T5 (commands.py — retry の文言 + spy 書き換え)
+ │              │    │
+ │              │    └─► T7 (approval list)
+ │              │         │
+ │              │         └─► T9 (**v1.2 新設** — approve の文言。commands.py なので T5/T7 と直列)
+ │              │
+ │              └─► T10 (**v1.2 新設** — AC-9d の pin。**テストのみ**、T9 と並列可)
  │
- ├─► T6 (CLI の except)        ← switch.py を触らない。T1〜T5 と**並列可**
- └─► T7 (approval list)        ← commands.py の別メソッド。T5 と同ファイルなので
-                                  **T5 の後に直列**が安全 (並列にするなら別 worktree)
-T8 (runbook / 設計書追記 / フルスイート)   ← 全 task の後
+ └─► T6 (CLI の except)        ← 独立、並列可
+T8 (runbook / 設計書追記 / フルスイート)   ← 全 task の後 (T9 / T10 を含む)
 ```
 
 - **T1〜T5 は同じ `switch.py` の同じ領域を触るので 1 レーン直列。**
 - **T6 は完全に独立** (`backtest/cli.py` のみ) — 別レーンで並列可。
 - **T7 は `commands.py` を触る**ので T5 と同ファイル。worktree を分けないなら T5 → T7 の直列。
+- **T9 と T10 は触るファイルが重ならない** (`tests/test_commands.py` + `commands.py` ↔
+  `tests/plugin/test_switch_ops_hardening.py`) ので**並列可**。worktree を分けなくてよい。
+- **T9 は T5 / T7 の後**。同じ `commands.py` の同じメソッド群を触るため。
+- **T10 は T4 の後** (`_revert_under_lock` が要る) だが、実態としては **T1〜T8 完了後に積む**。
 
 ## T1: live の分類器 + reconcile の載せ替え (挙動不変)
 
@@ -587,6 +602,239 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 
 ---
 
+## T9: シェルの `approve <id>` も lock 内 outcome を写す (**commands.py のみ**、v1.2 新設)
+
+**担当**: 設計書 §3.6 / AC-17a〜AC-17d。段 0 が報告した設計判断 1 (2026-09-20 ユーザー裁定 R9)。
+**触るのは `commands.py` と `tests/test_commands.py` だけ。`switch.py` は 1 行も変えない。**
+
+### Step 9-a: テストを置いて red を確認する
+
+- [ ] `tests/test_commands.py` に 6 本を追記する (下記)。**既存テストは 1 本も書き換えない。**
+      `_fake_outcome` ヘルパ (`:552-557`) は既存のものを再利用する。
+
+| # | テスト名 | AC | 何を観測するか |
+|---|---|---|---|
+| 1 | `test_approve_plugin_reports_the_locked_outcome` (7 パラメタ) | AC-17a | `approve_candidate` の spy が 7 種の outcome を返すとき、戻り文字列が設計書 §3.6.3 の**逐語** (接頭辞込み、`==` で完全一致) |
+| 2 | `test_approve_plugin_writes_activity_only_when_deployed` (7 パラメタ) | AC-17b | `activity.tail(10, Category.APPROVAL)` に `approved` を含む行が出るのは `deployed` / `deployed_after_rollback` のときだけ。**`already_decided` かつ `status="approved"` でも出ない** |
+| 3 | `test_approve_plugin_message_unaffected_by_later_decision` | **AC-17c (主 killer)** | 下記の競合 fixture (競合者は**別コネクションで `approvals.apply_decision(..., "approved")`** を直接打つ — 期限切れ sweep / 別プロセスの CLI / もう一人の運用者を代表させる)。戻り文字列が**逐語一致**で `(status=pending): … (reason=candidate_missing)` のまま。activity にも `approved` が無い |
+| 4 | `test_approve_plugin_fails_loud_on_unknown_outcome` | AC-17d | spy が `None` / 未知 enum 値を返すと `out.startswith("エラー: ")` かつ `"approval #" not in out.split("\n")[0]` (接頭辞が付かない) |
+| 5 | `test_approve_plugin_outcome_text_is_shared_with_retry` | (共用の pin) | 同じ `ApprovalOutcome` を `approve` 経路と `approval retry` 経路に流し、**接頭辞を除いた残りが 1 文字も違わない**こと。文言生成の二重実装が入ると red |
+| 6 | `test_approve_non_plugin_kind_is_unchanged` | §3.6.4 | `kind="tech_plugin"` の approve が `approval #<id> approved` (逐語) を返し、DB が `approved`、activity に `approved` が出る (= 非 plugin 枝が巻き添えにならない) |
+
+- [ ] **AC-17c の fixture (逐語で書く)**: 競合者は**同一スレッド・別コネクション**でよい
+      (`approve_candidate` が return した時点で `_plugin_locks` は解放済みなので、
+      barrier もスレッドも要らない。既存 AC-14b のスレッド版より読みやすく、flock も競合しない)。
+
+      ```python
+      def test_approve_plugin_message_unaffected_by_later_decision(tmp_path, monkeypatch):
+          """AC-17c: lock を抜けた後に別プロセスがこの approval を承認しても、
+          シェルは **自分の呼び出しが返した outcome** を報告する。lock 外で
+          `SELECT status` し直す実装 (v1.1 までの approve ハンドラ) では
+          「自分が下していない決定」を自分の結果として報告してしまう。"""
+          conn, _, activity, cmds = _commands(tmp_path)
+          # ... plugins_root / settings を配線し、candidate_missing になる
+          #     pending plugin approval を 1 本作る (既存
+          #     test_approve_plugin_kind_reports_actual_outcome_not_always_approved
+          #     の前半と同じ形) ...
+          real = plugin_switch.approve_candidate
+
+          def _then_competitor(*a, **kw):
+              outcome = real(*a, **kw)          # lock はここで解放される
+              # 競合者: 別コネクションで同じ approval を approved にする
+              # `_commands(tmp_path)` の DB は **ファイル** `tmp_path/"t.db"`
+              # (`tests/test_commands.py::_commands` が `connect(tmp_path / "t.db")`)
+              # なので、第 2 コネクションが作れる (実測確認済、2026-09-20)。
+              conn2 = connect(tmp_path / "t.db")
+              approvals.apply_decision(conn2, approval_id, "approved",
+                                       decided_by="competitor", now=NOW, commit=True)
+              conn2.close()
+              return outcome
+
+          monkeypatch.setattr("agentic_fx.plugin.switch.approve_candidate",
+                              _then_competitor)
+
+          out = cmds.dispatch(f"approve {approval_id}")
+
+          # 逐語で見る。`"approved: " not in out` だけでは旧文言
+          # `approval #N approved` (コロン無し) と区別できない。
+          assert out == (
+              f"approval #{approval_id} は今回の操作では承認されませんでした "
+              f"(status=pending): approved になりませんでした (reason=candidate_missing)")
+          assert not any("approved" in r for r in activity.tail(10, Category.APPROVAL))
+      ```
+
+      **確認済 (2026-09-20)**: `_commands(tmp_path)` は `connect(tmp_path / "t.db")` の
+      **ファイル DB** なので第 2 コネクションが作れる。fixture の書き換えは不要。
+
+- [ ] red を確認する (**逐語で貼る**)。予想される主な失敗:
+      `AssertionError: assert 'approval #1 approved: 配備まで完了しました (...)' == 'approval #1 approved'`
+      および `assert 'approved: ' not in 'approval #1 approved'`
+
+### Step 9-b: 実装を転写する
+
+- [ ] `commands.py:361` の **`_retry_outcome_text` を `_approval_outcome_text` に改名**する
+      (中身は 1 行も変えない)。docstring の `T5` を `T5 / T9` に、
+      「`ApprovalOutcome` を文言に写す」の前に「(`approve` / `approval retry` 共用)」を足す。
+- [ ] `commands.py:161` の呼び出しを `self._approval_outcome_text(outcome)` に変える。
+      **retry の接頭辞と文言は 1 文字も変えない。**
+- [ ] `approve` ハンドラ (`commands.py:94-110`) の plugin 枝を差し替える。**置換前 (逐語)**:
+
+      ```python
+                      plugin_switch.approve_candidate(
+                          self.conn, approval_id, decided_by="shell",
+                          now=self.clock.now(), plugins_root=self.plugins_root,
+                          settings=self.settings, activity=self.activity)
+                      # 検収 m5 是正: `approve_candidate` は正常な主要経路として
+                      # non-pending 以外にも pending 留置で return しうる
+                      # (§5.1: legacy_plain_present / candidate_missing /
+                      # hash 不一致 / 未完ジャーナル)。旧稿は結果を確認せず
+                      # 無条件に「approved」と報告していた — 実際の到達状態を
+                      # 読み直して報告する。
+                      outcome = self.conn.execute(
+                          "SELECT status, reason FROM approval_requests WHERE id=?",
+                          (approval_id,)).fetchone()
+                      if outcome is None or outcome["status"] != "approved":
+                          status = outcome["status"] if outcome else "不明"
+                          reason = (outcome["reason"] if outcome else None) or "-"
+                          return (f"approval #{args[0]} は approved になりません"
+                                 f"でした (status={status}, reason={reason})")
+      ```
+
+      **置換後 (逐語)**:
+
+      ```python
+                      # [switch-ops-hardening] T9 (設計書 §3.6、2026-09-20 裁定 R9):
+                      # `approve_candidate` は **plugin flock の内側で確定した**
+                      # `ApprovalOutcome` を返す。検収 m5 是正の「実際の到達状態を
+                      # 読み直して報告する」形は、lock を抜けた後の DB を読むため
+                      # **別プロセスの決定を自分の結果として報告しうる** (§3.6.1)。
+                      # retry と同じく、写すだけにする。未知 / None は文言にせず
+                      # 例外に落とす (fail loud)。
+                      outcome = plugin_switch.approve_candidate(
+                          self.conn, approval_id, decided_by="shell",
+                          now=self.clock.now(), plugins_root=self.plugins_root,
+                          settings=self.settings, activity=self.activity)
+                      text = self._approval_outcome_text(outcome)
+                      if outcome.outcome not in ("deployed", "deployed_after_rollback"):
+                          # 「今回の操作では」= status が既に `approved` の
+                          # 二重 approve (`already_decided`) でも文が矛盾しない
+                          # ようにするため (§3.6.3 / §3.6.5 の 1)。
+                          return (f"approval #{args[0]} は今回の操作では承認されません"
+                                 f"でした (status={outcome.status}): {text}")
+                      self.activity.write(Category.APPROVAL, "approved",
+                                          f"#{args[0]} via shell", ref_id=args[0])
+                      return f"approval #{args[0]} approved: {text}"
+      ```
+
+      **注意 (転写の落とし穴)**: 置換後の plugin 枝は **`return` で必ず抜ける**ので、
+      以降の共通の `self.activity.write(...)` / `return f"approval #{args[0]} approved"`
+      **には落ちない**。共通部分は**非 plugin 枝 (`else:`) 専用になる** — 削除も移動もせず、
+      そのまま残すこと (§3.6.4 の 1 行目 = `test_approve` / `test_approve_non_plugin_kind_is_unchanged` が pin)。
+
+- [ ] 機械 diff (`diff` で 0) を確認してから次へ。目視は不可 ([[transcription-must-be-machine-diffed]])。
+
+### Step 9-c: green
+
+- [ ] `uv run pytest tests/test_commands.py -q` が green。**書き換えた既存テストが 0 本**であることを、
+      `git diff --stat tests/test_commands.py` が**追記のみ** (削除行 0) であることで確認する
+      ([[spec-must-check-existing-guards]] — 検収は削除行から読む)
+- [ ] `uv run pytest tests/ -q` (フルスイート) が green。**基準は段 0 完了時の 4274 passed + 新規 6 本**
+
+### Step 9-d: 逆変異 (**リストは下限**)
+
+| # | ファイル | 置換前 | 置換後 | red になるテスト |
+|---|---|---|---|---|
+| T9-M1 | `commands.py` | `outcome = plugin_switch.approve_candidate(...)` 〜 `return f"approval #{args[0]} approved: {text}"` の全体 | **v1.1 の実装に戻す** (`approve_candidate(...)` の戻り値を捨て、`SELECT status, reason` で読み直す旧ブロック) | `test_approve_plugin_message_unaffected_by_later_decision` (**AC-17c = この task の存在理由**) |
+| T9-M2 | `commands.py` | `if outcome.outcome not in ("deployed", "deployed_after_rollback"):` | `if False:` | `test_approve_plugin_reports_the_locked_outcome[still_pending]` / `test_approve_plugin_writes_activity_only_when_deployed[still_pending]` |
+| T9-M3 | `commands.py` | `if outcome.outcome not in ("deployed", "deployed_after_rollback"):` | `if outcome.outcome != "deployed":` | `test_approve_plugin_reports_the_locked_outcome[deployed_after_rollback]` |
+| T9-M4 | `commands.py` | 接頭辞全体 | `f"approval #{args[0]} は承認されませんでした: {text}"` (`(status=...)` と「今回の操作では」を削る) | `test_approve_plugin_reports_the_locked_outcome[*]` (逐語一致) + **既存の `test_approve_plugin_kind_reports_actual_outcome_not_always_approved` の `"pending" in out`** (二重の網) |
+| T9-M4b | `commands.py` | `は今回の操作では承認されませんでした` | `は承認されませんでした` (限定句だけ削る) | `test_approve_plugin_reports_the_locked_outcome[already_decided]` (逐語一致。**`status=approved` なのに「承認されませんでした」と言う矛盾**を殺す) |
+| T9-M5 | `commands.py` | `text = self._approval_outcome_text(outcome)` を使った戻り値 | `return f"approval #{args[0]} approved"` (固定文言に戻す) | `test_approve_plugin_reports_the_locked_outcome[deployed]` |
+| T9-M6 | `commands.py` | `self.activity.write(Category.APPROVAL, "approved", ...)` を plugin 枝の **`return` の前**から**失敗枝の前**へ移す (= 全 outcome で書く) | (移動) | `test_approve_plugin_writes_activity_only_when_deployed[already_decided]` |
+| T9-M7 | `commands.py` | `_approval_outcome_text` の `raise ValueError(...)` | `return "結果を判別できませんでした"` | `test_approve_plugin_fails_loud_on_unknown_outcome` (+ 既存の `test_approval_retry_fails_loud_on_unknown_outcome`) |
+| T9-M8 | `commands.py` | approve 枝の `text = self._approval_outcome_text(outcome)` | approve 専用に文言を別実装する (例: `text = f"status={outcome.status}"`) | `test_approve_plugin_outcome_text_is_shared_with_retry` |
+
+- [ ] commit: `feat(switch-ops): approve も lock 内 outcome を文言に写す (T9、設計書 §3.6)`
+
+---
+
+## T10: 巻き戻しの commit が lock 内で完了していることの pin (**テストのみ**、v1.2 新設)
+
+**担当**: 設計書 §3.3.2 手順 4 / IV-6 / AC-9d。段 0 の未 pin **S0-54 / S0-55 / S0-75** を殺す。
+**本体コードは 1 行も変えない** — 現実装は既に 5 箇所すべて lock 内 commit であることを
+設計書 §3.3.2 の全数表が記録している。**もし実装が違っていたら、テストを緩めずに指揮者へ申告する。**
+
+### Step 10-a: 観測点を決める (probe で先に確かめる)
+
+- [ ] `tests/plugin/test_switch_ops_hardening.py` の DB は **`tmp_path/data/agentic.db` のファイル**
+      (`_cli_env` が `db_store.connect(tmp_path / _DB)`) であり、**`db_store.connect` は WAL**
+      (`store/db.py:353`)。よって**同一プロセスの第 2 コネクションから committed だけが見える** —
+      これが観測装置になる。
+- [ ] 第 2 コネクションのヘルパをファイル先頭のヘルパ群 (`_rows` / `_status` の隣) に足す:
+
+      ```python
+      def _phase_from_another_connection(root, op_id):
+          """別コネクションから journal の phase を読む (AC-9d)。
+          **commit されていない書込はここからは見えない** — これが
+          「lock の内側で commit まで完了しているか」の観測装置になる。"""
+          other = db_store.connect(root / _DB)
+          try:
+              row = journal_store.get(other, op_id)
+              return row["phase"] if row is not None else None
+          finally:
+              other.close()
+      ```
+
+- [ ] **ActivityLog は DB を触らない** (`activity.py` はファイル追記) ことを確認する。
+      触るなら `_revert_one` 内の `activity.write` が暗黙 commit を起こし、S0-54 が等価変異になる。
+      **確認できなければ指揮者へ申告**して観測点を変える。
+
+### Step 10-b: テストを置いて red を確認する (**変異を当ててから**)
+
+**本体は変えないので、通常の red → green は取れない。** 代わりに
+[[mutation-testing]] の流儀で「**変異を当てた状態で red、戻して green**」を確認する。
+
+| # | テスト名 | 殺す変異 | 作り | 観測 |
+|---|---|---|---|---|
+| 1 | `test_ac9d_reconcile_revert_is_durable_from_another_connection` | **S0-54** (`_revert_under_lock` の `conn.commit()` を落とす) | `_stopped_at_switched` で `switched` / live 未切替を作り、`reconcile_switch_journals` を 1 回回す | `_phase_from_another_connection(root, op_id) == "reverted"`。同時に `_rows(conn) == [(op_id, "reverted")]` も見て「自分のコネクションからは見える」ことと区別する |
+| 2 | `test_ac9d_revert_is_committed_before_the_lock_is_released` | **S0-55** (commit を `with _plugin_lock(...)` の外へ出す) | 既存の S0-87 pin (`test_ac9a_revert_runs_while_the_lock_is_still_held`、`:250`) と**同じ `_plugin_lock` spy の型**を使い、`finally` で**実 lock を解放する前に**別コネクションから phase を読む | 解放直前の観測が `"reverted"` (変異を当てると `"switched"`) |
+| 3 | `test_ac9d_retry_rollback_is_durable_before_pending_return` | **S0-75** (0d-2c の `conn.commit()` を落とす) | `_stopped_at_switched` の後に**候補ディレクトリを消す** (`shutil.rmtree(root/"plugins"/"_human"/"sma")`) → `retry_approval` を 1 回。0d-2c が巻き戻して commit した直後に `CandidateMissingError` → `still_pending` で戻る (**その間に commit する箇所が無い**ことをコードで確認済: `_close_own_unfinished_journal_if_any` は `op_id is None` で即 return する) | 戻り値が `outcome="still_pending"` / `reason="candidate_missing"` / `rolled_back_op_id == op_id`。かつ `_phase_from_another_connection(root, op_id) == "reverted"` |
+
+- [ ] **2 の spy の形 (逐語)** — 既存 `:250` の `_spy_lock` に観測を足すだけ:
+
+      ```python
+      @_ctx.contextmanager
+      def _spy_lock(rt, name):
+          with real_lock(rt, name):
+              try:
+                  yield
+              finally:
+                  # **実 lock を解放する前に**別コネクションから読む。
+                  # commit が with の外に出ていると、ここではまだ見えない。
+                  seen.append(_phase_from_another_connection(root, op_id))
+      ```
+
+      **例外を飲み込まないこと** (`finally` の中で例外を起こさない / `except` を書かない)。
+      観測が失敗したら `seen` に `None` が入り、アサーションで落ちる形にする。
+
+- [ ] 3 つとも、**まず正実装で green** を確認し、**次に §Step 10-c の変異を 1 つずつ当てて red**
+      (逐語で貼る) → `cp` 退避から復元。`git checkout` / `git restore` は使わない。
+
+### Step 10-c: 逆変異 (= この task の本体。3 件とも段 0 の SURVIVED)
+
+| # | ファイル | 置換前 | 置換後 | red になるテスト |
+|---|---|---|---|---|
+| T10-M1 (S0-54) | `switch.py` `_revert_under_lock` | `        _revert_one(conn, fresh, plugins_root=plugins_root, now=now, activity=activity)\n        conn.commit()` | `        _revert_one(conn, fresh, plugins_root=plugins_root, now=now, activity=activity)` (commit を削る) | `test_ac9d_reconcile_revert_is_durable_from_another_connection` |
+| T10-M2 (S0-55) | `switch.py` `_revert_under_lock` | 同上 (commit が `with` の内側) | commit を `with` ブロックの外に出し、`return True` の直前に置く | `test_ac9d_revert_is_committed_before_the_lock_is_released` |
+| T10-M3 (S0-75) | `switch.py` 0d-2c | `                _revert_one(conn, existing_journal, plugins_root=plugins_root,\n                           now=now, activity=activity)\n                conn.commit()` | `conn.commit()` を削る | `test_ac9d_retry_rollback_is_durable_before_pending_return` |
+
+- [ ] **副作用の確認**: T10-M1 / M3 を当てたとき、**他のどのテストが red になるか**も記録する。
+      もし既存テストが既に殺しているなら段 0 の「未 pin」判定が誤っていたことになるので申告する
+      (段 0 は「同一コネクションなので観測できない」と判定済み)。
+- [ ] commit: `test(switch-ops): 巻き戻しの commit が lock 内で完了していることを別コネクションで pin (T10、AC-9d)`
+
+---
+
 ## T8: runbook / 設計書の追記 / フルスイート
 
 - [ ] `docs/operations/indicator-initial-set-deploy-2026-09-19.md` を設計書 §7.2 の表のとおり改訂する
@@ -594,6 +842,9 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
       **L167-169 の「いずれの phase でも再 bless 必須」**、approval id の入手節)
 - [ ] `docs/superpowers/specs/2026-08-16-phase2-10-improve-loop-design.md` §5.1-1 に
       「retry の `not_switched` 処置」を 1 段落追記する (既存規則の具体化。規則自体は変えない)
+- [ ] **v1.2**: 設計書 §3.6 / §3.3.2 手順 4 / IV-6 / AC-9d / AC-17a〜d が v1.6 に入っていることと、
+      runbook の「approval id の入手」節が `approve` の新文言と矛盾しないことを確認する
+      (runbook は `approval list` を第一手にしており、`approve` の戻り文言は引用していない — 要確認)
 - [ ] **フルスイート**を回す: `uv run pytest -q`。**書き換えた 4 本以外が red になったら
       黙って直さず申告する**
 - [ ] commit: `docs(switch-ops): runbook と 8 月設計書を本束の挙動に合わせる (T8)`
@@ -2521,4 +2772,5 @@ T5-M5 は本文が「受け取らず lock 外で読み直す (v1.1 の案)」と
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-09-19 | v1.0 | 初版 (T1〜T8、逆変異 12 件 + task ごとの表、隔離環境での実測記録つき) | 設計書 v1.4 の承認を受けた実装プラン化 | — |
+| 2026-09-20 | v1.2 | 設計書 v1.6 (ユーザー裁定 R9 / R10) に追随: **T9 (シェルの `approve <id>` も lock 内 outcome を文言に写す、`commands.py` のみ、逆変異 8 件)** と **T10 (巻き戻しの commit が lock 内で完了していることを別コネクションから pin、テストのみ、逆変異 3 件 = 段 0 の S0-54 / S0-55 / S0-75)** を新設。File Structure / Global Constraints (書き換え 0 本の宣言) / 受入条件表 / task 依存図 (T9 は T5・T7 と直列、T10 は T9 と並列) / T8 の確認項目を同時に更新。**T10 は本体コードを 1 行も変えない** — 現実装が既に lock 内 commit であることを設計書 §3.3.2 の全数表が記録している | `tmp/review-20260920-soh/stage0.md` §3 の未 pin 3 件と §6 の設計判断 2 点に対する 2026-09-20 ユーザー裁定 | — |
 | 2026-09-19 | v1.1 | 指揮者側の着手前検証 (専用 worktree `soh-preflight` で T1→T7 を 1 task ずつ実走) を反映: **全 task の `(予測)` red を実測の逐語へ置換** / **★未実測 7 件の逆変異を実走し全 KILLED** / **T3・T4 の task 分割が成立しないことを実測**し、付録 A の hunk 10〜12・16〜20 と新規テスト 4 本を T3 へ移す訂正を追加 (訂正後の中間段は `925 passed, 0 failed` を実測) / Step 3-c の「`test_runbook_post_gate_failure_...` が T3 で red」を訂正 (T5 の材料へ) / **付録 B・D を task 別に分割** (B-1/B-2・D-1/D-2) / 付録 A の hunk → task 表を新設 / **訂正を Step 3-a・3-b・4-a・5-a・5-b・5-c と T3 / T5 の見出し・受入条件表・task 依存図に落とした** (Step だけを追う実装者が v1.0 の分割に戻らないように) / **付録 D・E・F・G の diff ヘッダを相対パスへ統一** (絶対パスだと `patch` が "potentially dangerous file name" として拒否する) / フルスイート実測 (baseline `4224 passed` / 全適用後も同数) / `force_revert_op_id` と実プロセス競合の判断を追記 | 起草者が「未実測の申告」に挙げた 2・4・7・8・9 の解消。設計書は v1.5 へ (食い違い 3 件を全件プラン側の実測で採用) | — |
