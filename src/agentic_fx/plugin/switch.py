@@ -2133,8 +2133,11 @@ def bless_candidate(
             # [switch-ops-hardening] T13 (設計書 §3.7.3): bless は自分の
             # 未完行を閉じない (設計どおりの残余 — `_revert_one` の呼び出し
             # 元を 6 箇所目に増やさない選択、§5 残余 5)。
+            # この分岐は switch_required=0 (recorded 止まり) の枝でのみ
+            # `_advance_to_decided` が False を返す — switch_live は呼ばれて
+            # いないので、文言に "after switch" (切替後) を含めない。
             raise RuntimeError(
-                f"plugin {name!r}: live content_hash mismatch after switch "
+                f"plugin {name!r}: 版 dir の content_hash mismatch "
                 f"(expected content_hash={content_hash} "
                 f"artifact_hash={artifact_hash})")
         return approval_id

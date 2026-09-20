@@ -513,6 +513,14 @@ _BLESS_NO_FROM_ERROR = (
     "'afx plugin materialize <name>' で候補を書き出し、編集してから "
     "'afx plugin bless --from _human <name>' を実行してください。")
 
+# [switch-ops-hardening] T6: `UnresolvedJournalError` の収束手順案内。
+# `_plugin_bless` / `_plugin_retire` の両方の except ハンドラから参照する
+# (元メッセージの `op_id=` / `approval_id=` は呼び出し元ごとに異なるので
+# ここには含めない — 案内文の2行のみ共有)。
+_UNRESOLVED_JOURNAL_RECOVERY_HINT = (
+    "  収束手順: サービスの対話シェルで `approval list` → "
+    "`approval retry <approval_id>`")
+
 
 def _plugin_submit(conn, settings, args: argparse.Namespace, root: Path) -> int:
     if getattr(args, "from_kind", None) == "_human":
@@ -593,9 +601,7 @@ def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
         # 同じ作法 (rc=1 + `エラー: `) に揃え、**次の 1 手**を添える。
         # 元メッセージの `op_id=` / `approval_id=` は runbook と既存テストが
         # 依存しているので必ず含める。
-        print(f"エラー: {e}\n"
-              "  収束手順: サービスの対話シェルで `approval list` → "
-              "`approval retry <approval_id>`", file=sys.stderr)
+        print(f"エラー: {e}\n{_UNRESOLVED_JOURNAL_RECOVERY_HINT}", file=sys.stderr)
         return 1
     except (ValueError, plugin_sandbox.SandboxError) as e:
         print(f"エラー: {e}", file=sys.stderr)
@@ -630,9 +636,7 @@ def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
         # (未終端の切替ジャーナル) には `_plugin_bless` と同じ案内を出す。
         # `retire_plugin` の例外文言は `op_id=` のみで `approval_id=` を
         # 含まないので、**第一手が `approval list` であることに意味がある**。
-        print(f"エラー: {e}\n"
-              "  収束手順: サービスの対話シェルで `approval list` → "
-              "`approval retry <approval_id>`", file=sys.stderr)
+        print(f"エラー: {e}\n{_UNRESOLVED_JOURNAL_RECOVERY_HINT}", file=sys.stderr)
         return 1
     except (ValueError, OSError) as e:
         print(f"エラー: {e}", file=sys.stderr)
