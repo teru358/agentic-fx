@@ -87,6 +87,18 @@ def _status(conn, approval_id):
                         (approval_id,)).fetchone()["status"]
 
 
+def _phase_from_another_connection(root, op_id):
+    """別コネクションから journal の phase を読む (AC-9d、T10)。
+    **commit されていない書込はここからは見えない** — これが
+    「lock の内側で commit まで完了しているか」の観測装置になる。"""
+    other = db_store.connect(root / _DB)
+    try:
+        row = journal_store.get(other, op_id)
+        return row["phase"] if row is not None else None
+    finally:
+        other.close()
+
+
 def _activity_text(root) -> str:
     p = root / "logs" / "activity.log"
     return p.read_text(encoding="utf-8") if p.exists() else ""
@@ -733,3 +745,85 @@ def test_ac14a_already_decided_status_comes_from_the_row(tmp_path, monkeypatch):
 
     assert outcome.outcome == "already_decided"
     assert outcome.status == "rejected", "status が行の値でなくリテラルになっている"
+
+
+# ---------------------------------------------------------------- AC-9d (T10、
+# 巻き戻しの commit が lock 内で完了していることの pin。**本体コードは
+# 1 行も変えない** — 現実装が既に lock 内 commit であることは設計書
+# §3.3.2 の全数表が記録している。段 0 の未 pin S0-54 / S0-55 / S0-75 を殺す
+# (置換前 → 置換後で red → green を確認する変異テストの流儀)。
+
+@pytest.mark.slow
+def test_ac9d_reconcile_revert_is_durable_from_another_connection(tmp_path, monkeypatch):
+    """AC-9d(a) / S0-54 の killer: `_revert_under_lock` の
+    `conn.commit()` を落とすと、ActivityLog は DB を触らずファイルにしか
+    書かないので (Step 10-a で確認済)、`not_switched` 枝の後には commit する
+    箇所が無く未 commit のまま残る。別コネクションから読んで `reverted` に
+    なっていることを確認する — 同一コネクションからの観測 (`_rows`) だけでは
+    未 commit でも見えてしまうため区別する。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=NOW, settings=SETTINGS)
+
+    assert _rows(conn) == [(row["op_id"], "reverted")], \
+        "前提: 自分のコネクションからは reverted に見えるはず"
+    assert _phase_from_another_connection(root, row["op_id"]) == "reverted", \
+        "巻き戻しが lock 内で commit されていない (別コネクションから未 commit)"
+
+
+@pytest.mark.slow
+def test_ac9d_revert_is_committed_before_the_lock_is_released(tmp_path, monkeypatch):
+    """AC-9d(b) / S0-55 の killer: `_revert_under_lock` の `conn.commit()` を
+    `with _plugin_lock(...)` の外へ出す変異では、lock 解放**直前**の観測が
+    まだ `switched` のまま (commit 前) になる。既存 `:250`
+    (`test_ac9a_revert_runs_while_the_lock_is_still_held`) と同じ spy の型を
+    使い、実 lock を解放する前に別コネクションから phase を読む。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    import contextlib as _ctx
+    real_lock = plugin_switch._plugin_lock
+    op_id = row["op_id"]
+    seen = []
+
+    @_ctx.contextmanager
+    def _spy_lock(rt, name):
+        with real_lock(rt, name):
+            try:
+                yield
+            finally:
+                # **実 lock を解放する前に**別コネクションから読む。
+                # commit が with の外に出ていると、ここではまだ見えない。
+                seen.append(_phase_from_another_connection(root, op_id))
+
+    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy_lock)
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=NOW, settings=SETTINGS)
+
+    assert seen == ["reverted"], \
+        f"lock 解放直前の観測が reverted になっていない (観測={seen})"
+
+
+@pytest.mark.slow
+def test_ac9d_retry_rollback_is_durable_before_pending_return(tmp_path, monkeypatch):
+    """AC-9d(c) / S0-75 の killer: `approval retry` が 0d-2c で停止行を
+    巻き戻して閉じた後、候補ディレクトリが消えていると
+    `CandidateMissingError` → `_close_own_unfinished_journal_if_any` は
+    `op_id is None` で即 return する (0d-2c が既に op_id を None に戻して
+    いるため、ここで commit する箇所は無い)。0d-2c 自身の `conn.commit()`
+    を落とすと、`still_pending` を返して戻ってきた時点で停止行が
+    未 commit のまま残る。"""
+    root, conn, row = _stopped_at_switched(tmp_path, monkeypatch)
+    plugins_root = root / "plugins"
+    shutil.rmtree(root / "plugins" / "_human" / "sma")
+
+    outcome = plugin_switch.retry_approval(
+        conn, row["approval_id"], decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=SETTINGS)
+
+    assert outcome.outcome == "still_pending"
+    assert outcome.reason == "candidate_missing"
+    assert outcome.rolled_back_op_id == row["op_id"]
+    assert _phase_from_another_connection(root, row["op_id"]) == "reverted", \
+        "0d-2c の巻き戻しが lock 内で commit されていない (別コネクションから未 commit)"
