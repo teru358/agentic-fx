@@ -1,4 +1,4 @@
-# [switch-ops-hardening] 設計書 v1.6b
+# [switch-ops-hardening] 設計書 v1.7
 
 束: plugin 承認・切替回廊の**収束の穴と、人間から見える状態の穴**を塞ぐ。
 起票済み 3 件 — `[retry-switched-approves-without-deploy]` / `[cli-bless-unresolved-journal]`
@@ -23,6 +23,8 @@
 | R8 | CLI / シェルの例外 (件 2) | `_plugin_bless` / `_plugin_materialize` を `_plugin_retire` の作法 (rc=1 + `エラー: ` + 次の 1 手) に揃える。`UnresolvedJournalError` の文言が `op_id` / `approval_id` を含むことは維持する |
 | R9 | シェルの `approve <id>` の結果報告 (段 0 の設計判断 1) | **`approve_candidate` が返す `ApprovalOutcome` を文言に写す**。lock 解放後に DB を読み直す方式は廃止。文言生成は `approval retry` と共用する (`_retry_outcome_text` → `_approval_outcome_text` に改名・一般化)。**採用根拠**: §3.5 が retry について排したのと同じ欠陥クラスで、小さく、別束にするとレビュー材料を 2 回作ることになる (2026-09-20 ユーザー裁定)。→ §3.6 / AC-17a〜d |
 | R10 | 巻き戻しの `conn.commit()` の位置 (段 0 の設計判断 2、S0-55) | **lock の内側**で完了させることを設計書に明文化する。**採用根拠**: lock を放した瞬間に他プロセスが未 commit の旧行を非終端として読む窓を防ぐ。**本体コードの変更は不要** (現実装の 5 箇所すべてが内側 — §3.3.2 の全数表)。**別コネクションから読む pin を足して S0-54 / S0-55 / S0-75 を殺す** (2026-09-20 ユーザー裁定)。→ §3.3.2 手順 4 / IV-6 / AC-9d |
+| R11 | 再開時に `switch_required` が食い違う (2 周目 `/code-review` #1、probe で再現) | **案 3**: `approve_candidate` が自分の未完 journal (`switched` 未到達 = `preparing` / `versioned` / `recorded`) を再開するとき、**その回に再計算した `switch_required` が journal に保存された値と食い違ったら、その行を巻き戻して閉じ、新しい `op_id` で頭から流し直す** (0d-2c と同形)。activity に**専用イベントを 1 本**残す。**`_finalize_decision` の phase ガード (T2) は緩めない** — 緩めると本束以前の fail open (第三者が置いた symlink の中身を無検証で approved にする) に戻る。**採用根拠は §3.2「#### 再開の前提が崩れていたら…」** (2026-09-20 ユーザー裁定)。→ §3.2 / AC-16c-1〜6 |
+| R12 | `afx plugin retire` の案内 (同 `/code-review` #5) | **同じ原因には同じ案内を出す**。`_plugin_retire` の `UnresolvedJournalError` にも bless (§3.4) と同じ「次の一手」(`approval list` → `approval retry`) を添える。→ §3.4 / AC-18 |
 
 ---
 
@@ -32,6 +34,12 @@
 - `switch.py`: `switched` 行の live 分類器の新設、`reconcile_switch_journals` の載せ替え (挙動不変)、
   `approve_candidate` 0d の R1 化、reconcile の巻き戻し枝の flock 化 (R5)。
 - `backtest/cli.py`: `_plugin_bless` / `_plugin_materialize` の例外処理を揃える。
+  **v1.7 で `_plugin_retire` を追加** — 既存の `except (UnresolvedJournalError, ValueError, OSError)` を
+  **2 節に割り、`UnresolvedJournalError` にだけ「次の 1 手」を添える** (R12、§3.4)。
+  **捕まえる例外の集合は 1 つも変わらない** (節を割るだけ) ので、新しい握りつぶしは生じない。
+- `switch.py`: **再開の前提 (`switch_required`) が崩れていたら巻き戻して新しい `op_id` で流し直す**
+  (R11、§3.2)。`_close_own_unfinished_journal_if_any` を再利用し、**新しい `return` 地点も
+  新しい `_revert_one` 呼び出し元も増やさない**。
 - `switch.py`: 2 段 phase ガード (r1 Important 2 / r2 Important 1 の実測から追加採用、§3.2) と、lock 内 outcome の戻り値 (r2 Important 4、§3.5)。
 - `commands.py`: `approval list` 新設、`approval retry` の結果報告を **lock 内 outcome から写す**、
   **`approve <id>` (kind=plugin) の結果報告も同じ outcome から写す** (v1.6、§3.6)、`_HELP` 更新。
@@ -264,6 +272,189 @@ r2 の指摘どおり、**ガードを入れた後に `op_id = None` だけを�
 temp → rename の 1 手なので「live が消えた瞬間」は作らない)。
 → **次回起動の reconcile が同じ行を同じ分類器で再評価する**。fail closed。
 
+#### 再開の前提が崩れていたら巻き戻して新しい `op_id` で流し直す (v1.7、R11 = 2 周目 `/code-review` #1)
+
+**出所**: 2 周目 `/code-review high` の指摘 #1。**probe で再現済み** —
+`tmp/review-20260920-soh/r2/cr1-probe.md` (経路の file:line と実測出力)、
+probe 本体 `tmp/review-20260920-soh/r2/cr1-probe/test_probe_cr1.py` (`4 passed`)。
+
+##### 何が起きるか (動作目線)
+
+配備の途中でプロセスが落ち、journal が `preparing` / `versioned` / `recorded` のどれかで止まる。
+その後、**第三者 (または人間) が live を手で動かす**。人間が `approval retry <id>` (または `approve <id>`) を打つ。
+
+- 0d は「自分の未完行だ」と判断して **`op_id` を再利用する** (`switch.py:1567-1568`)。
+  `phase == 'switched'` の分岐 (`:1569-1610`) には入らないので、**分類も巻き戻しも起きない**。
+- 下流は live の現況から `old_kind` / `old_target` を読み直し (`:1692-1700`)、
+  **`switch_required` を再計算する** (`:1719`)。
+- しかし journal 行の `switch_required` は**作成時の値のまま**で、更新する API は store 層に存在しない
+  (`store/plugin_switch_journal.py` は `insert` / `set_phase` / `set_temp_path` / `get` /
+  `get_open_by_name` / `list_non_terminal` のみ)。
+- 結果、**切替の要否を決める値・実際に切替をする判断・`_finalize_decision` の期待 phase の 3 者が
+  別々の値を見る**。
+
+| 変種 | 保存値 | 再計算値 | 起きること (probe 実測) |
+|---|---|---|---|
+| **(a)** | `switch_required=1` | `False` (第三者が live をちょうど `new_target` へ向けた) | `_advance_to_decided` が切替ブロックを丸ごとスキップし phase は `recorded` のまま → `_finalize_decision` が保存値から期待 `switched` を導き **`ValueError`**。`preparing` / `versioned` / `recorded` の 3 通りとも、以後**何回 retry しても同じ例外**。再起動時 reconcile は非 `switched` 行を飛ばし (`:271-277`)、`process_expired_approvals` は未完 journal があるとスキップするので、**無人の抜け道が 1 つも無い** |
+| **(c)** | `switch_required=0` | `True` (第三者が live を消した / 別の先へ向けた) | `advance_switch_journal` の `switch_required=0` ガード (`:150-153`) が先に落とす。**FS は触られない** (fail closed) が、やはり永久に詰まる。**本束以前からの既存欠陥** |
+
+どちらも症状は「この approval が詰まる」ではなく **「この plugin 名が丸ごと凍る」** —
+非終端行が残るので、別 approval の `approve_candidate` (`:1611-1631`) も `bless_candidate` (`:1985-1991`) も
+`UnresolvedJournalError` で拒否される。抜け道は **`reject` ただ 1 つ**で、しかも `_revert_one` は
+非 `switched` 行に FS 副作用を持たないため、**却下したのに live は第三者の状態のまま残る**。
+人間に見えるのは内部用語の 1 行 (`op_id=1: _finalize_decision expects phase='switched' but found 'recorded'`)
+と `_HELP` 全文だけで、**activity には痕跡が 1 行も残らない**。
+
+##### 採った形 = 案 3 (検討して退けた案も記す)
+
+| 案 | 動作 | 採否と理由 |
+|---|---|---|
+| 案 1 | `_advance_to_decided` が**その回の `switch_required`** を `_finalize_decision` へ渡し、期待 phase をそれで決める | **不採用**。(i) **(c) を閉じない** — (c) は `advance_switch_journal` の `:150` ガードで先に落ちるので、別途 `switch_required` の書き換えが要る。(ii) `switch_required=False` 枝は `_version_dir_hashes_ok` を通らない (`:1334` の `if switch_required:` の内側にしかない) ため、**第三者が置いた symlink の指す版を無検証で approved にする** = 本束以前の fail open に戻る。塞ぐには hash 再照合の追加が必須で、差分は最小でなくなる。(iii) journal 行の `old_kind` / `old_target` は作成時のまま残るので、行が「この操作が何をしたか」を語らなくなる |
+| 案 2 | 再開時に保存 `switch_required` を再計算値で UPDATE する | **不採用**。`_revert_one` は `old_kind` / `old_target` で巻き戻す (`:182-195`)。`switch_required` だけ書き換えると、後の巻き戻しが **resume 時点ではなく作成時点の `old_target`** へ戻す。整合させるには 4 列全部を書き換える = **行の同一性を作り直す**ことになり、案 3 と同義でありながら監査記録を上書きで失う。store 層に新しい UPDATE API も要る |
+| **案 3 (採用)** | 再計算値と保存値が食い違ったら、**停止行を巻き戻して閉じ、`op_id = None` にして新しい行で頭から流す** | **採用**。(1) **既存の 0d-2c (T3) と完全に同形** — 「再開できない停止行は巻き戻して新しい行で頭から流す」という判定軸 (「保存された前提が今も成り立つか」) の別条件を同じ処理へ合流させるだけで、**新しい概念を 1 つも持ち込まない**。(2) **(a) と (c) を 1 つの是正で両方閉じる**。(3) journal 行を書き換えないので `_revert_one` が使う `old_kind` / `old_target` が常に「その行が実際に出発した状態」を指す。(4) **IV-3 を構造的に守る** — 切替の要否・実際の切替・finalize の期待値が**同じ行の同じ値**に一本化される (今の欠陥は「3 者が別の値を見ている」こと自体)。(5) **監査行が 2 本残る** (停止行 `reverted` + 新行 `decided`) — §3.2 が `op_id = None` を必須にした理由と完全に整合 |
+
+**`_finalize_decision` の phase ガード (T2) は緩めない。** 緩めれば (a) は通るが、
+それは**本束以前の fail open** (第三者が置いた symlink を無検証で approved に戻す) そのものである
+(§8.5 / `cr1-probe.md` §4 に旧コードの読解を記録)。
+
+##### 判定を置く位置 — 0d の全分岐を数えて決めた
+
+食い違いの判定には `old_kind` / `old_target` が要るので、**live の形を lock 内で読む `:1692-1700` より後**
+にしか置けない。そこで **`approve_candidate` の `return` 地点を全数**列挙し、
+**「食い違った未完行を抱えたまま return する経路」が残らないか**を確かめた。
+
+| # | 分岐 / `return` 地点 | 自分の未完行 (`op_id`) を持っているか | 現行で行を閉じるか | v1.7 の扱い |
+|---|---|---|---|---|
+| 1 | `:1518-1522` `status != "pending"` → `already_decided` | **持たない** (0d より前。`op_id` は未設定) | — | **不変**。0d に到達しないので食い違いは生じない。なお「決着済みなのに非終端行が残る」状態は本束以前からの残余で、`reject` / `retry` の経路でしか解けない (§5 の残余に記録) |
+| 2 | `:1526-1540` `_is_superseded` → `invalidated` | 同上 | — | **不変** (同上) |
+| 3 | 0d: `existing_journal is None` | 持たない | — | **不変** (素の新規経路) |
+| 4 | 0d: 別 `approval_id` の未完行 → `UnresolvedJournalError` | 他人の行 | — | **不変** (fail closed) |
+| 5 | 0d-2b: 自分の `switched` 行 + `foreign` → `foreign_waiting` | 持つ (`switched`) | **閉じない (意図的)** | **不変**。`switched` 行なので `switch_required=1` が保存時も再開時も自明に成立しており、本節の食い違いは起きない。第三者の live は**触らないのが正** |
+| 6 | 0d-2a: 自分の `switched` 行 + `switched` → `deployed` / `still_pending(reverify_failed)` | 持つ | `_reverify_switched_journal` が失敗時に閉じる | **不変** |
+| 7 | 0d-2c: 自分の `switched` 行 + `not_switched` | 持つ | **閉じて `op_id = None`** | **不変** (v1.7 の判定はこの後段に置くので二重には走らない — `op_id is None` で素通り) |
+| 8 | **0d: 自分の非 `switched` 行 (`preparing` / `versioned` / `recorded`)** | **持つ** | **閉じない** | ← **欠陥の入口**。以下 9〜12 で決着する |
+| 9 | `:1657` 付近 `CandidateMissingError` → `still_pending` | 持ちうる | **閉じる** (`_close_own_unfinished_journal_if_any`) | **不変** (既に閉じている) |
+| 10 | `:1667` 付近 `ValueError` → `still_pending(snapshot_invalid)` | 持ちうる | **閉じる** | **不変** |
+| 11 | `:1683-1690` hash 不一致 → `still_pending(hash_mismatch)` | 持ちうる | **閉じる** | **不変** |
+| 12 | **`:1702-1717` `old_kind == "plain"` → `legacy_plain_present`** | 持ちうる | **閉じない** ← **第 2 の穴** | **直す (T11-A)**。下記 |
+| 13 | `:1719` 以降の本線 (`begin_switch_journal` → `_advance_to_decided` → `deployed*`) | 持ちうる | — | **直す (T11-B)**。下記 |
+| 14 | 例外の送出 (`UnresolvedJournalError` / `RuntimeError` / `OSError` / pin 解決の `ValueError`) | 持ちうる | 閉じない (意図的) | **不変**。§3.5 の送出契約どおり上へ抜け、行は非終端で残る → 次回 reconcile / retry が再評価する (fail closed) |
+
+→ **判定を置くのは 2 箇所だけで、どちらも live の形を読んだ直後**。12 と 13 以外に
+「食い違った未完行を抱えたまま return する経路」は無い。
+
+**T11-A (plain 分岐、`:1702` の直前)**: journal 行の `old_kind` は DDL の CHECK 制約上
+`absent` / `symlink` の 2 値しか取れない (`db.py:169`)。したがって **`op_id` を持ったまま
+plain 分岐に到達する = 再開の前提が崩れている**ことが無条件に言える (行の作成時は plain でなかった)。
+よって専用の比較は要らず、**`_close_own_unfinished_journal_if_any()` を呼んでから
+`legacy_plain_present` を返す**だけでよい。これは 9〜11 の失敗分岐と同じ作法であり、
+`legacy_plain_present` の outcome フィールドも文言 (§3.5) も**変えない**。
+これを足さないと、「非 `switched` で停止 + 第三者が live を plain dir に置き換えた」場合に
+**例外すら出ずに毎回 `legacy_plain_present` を返し、行は非終端のまま永久に残る** (名前が凍る)。
+本束以前からの既存欠陥だが、形は同一 (再開の前提が崩れている) なので同じ節で閉じる。
+
+**T11-B (`:1719` の直後・`:1721` の `if op_id is None:` の直前)**:
+
+```
+if op_id is not None and bool(existing_journal["switch_required"]) != switch_required:
+    activity に switch_resume_precondition_changed を 1 行
+    closed = _close_own_unfinished_journal_if_any()   # 巻き戻して commit
+    if closed is not None:
+        rolled_back_op_id = closed
+        op_id = None
+```
+
+- **activity は helper 呼び出しの直前に書く** — ログが因果の順に読める
+  (`switch_resume_precondition_changed` → `_revert_one` が書く `switch_reverted`)。
+  イベント名は**新規** (`grep -rn "resume_precondition" src/ tests/` は空)。
+  フィールドは `name=<name> op_id=<M> phase=<p> stored_switch_required=<0|1> recomputed=<0|1>`。
+- `closed is None` は**到達不能** (helper が `None` を返すのは `op_id is None` か行が `switched` の
+  ときだけで、T11-B の地点ではどちらも成立しない)。万一そうなっても `op_id` を保持したまま下流へ進み、
+  **§3.2 の 2 段ガードが FS より前に `ValueError` で止める** ので fail closed。新しい分岐は足さない。
+
+##### `_close_own_unfinished_journal_if_any` を再利用する (1 本化)
+
+同 helper (`switch.py:1632-1649`) は既に「自分の未完行を `_revert_one` で閉じて commit する」処理そのもの
+であり、**非 `switched` 行に対して FS 副作用を持たない** (`:182-195`) ことも本節の要件と一致する。
+そこで **新しい巻き戻し関数は作らず、helper の戻り値だけを `None` → `int | None`
+(閉じた `op_id`、閉じなければ `None`) に変える**。呼び出し元 9〜11 は戻り値を使わないので**不変**。
+
+**この形を採る具体的な payoff**:
+- **`approve_candidate` に新しい `return` 地点が 1 つも増えない** → §3.5 の `return` 地点表と
+  **AC-14d (網羅性) はそのまま成立する**。
+- **`_revert_one` の呼び出し元が増えない** → §3.3.2 の「全 5 箇所が lock 内 commit」の全数表が
+  **そのまま真であり続ける** (IV-6 / AC-9d を作り直さなくてよい)。
+- 巻き戻しは `_plugin_locks` (`:1516`) の内側で起き、helper が `conn.commit()` まで済ませるので
+  **IV-6 (commit も lock 内) を自動的に満たす**。
+- **AC-14d の但し書きを 1 文だけ改める** — 「`_close_own_unfinished_journal_if_any` は `-> None` の
+  手続きなので bare `return` を持ってよい」は v1.7 で `-> int | None` になるため、
+  「**入れ子関数なので `_walk_own_body` の走査対象外**」という本来の理由に書き直す (AC-14d 参照)。
+
+##### 巻き戻した後の outcome — 既存の `deployed_after_rollback` に乗せる
+
+**新しい outcome も新しい `reason` も作らない。** T11-B は 0d-2c と同じく
+`rolled_back_op_id` を立てて `op_id = None` にするだけなので、末尾の組み立て (`:1737-1742`) が
+自動的に `deployed_after_rollback` を返す。**`commands.py` の `_approval_outcome_text` は 1 行も変わらず、
+§3.5 の文言表・§3.6.3 の `approve` 表・AC-14a / AC-17a も変わらない。**
+
+**文言が事実と合うかを確認した** (変種 (a) は「切替をしていないのに `配備まで完了しました`」に見えるため):
+
+| 文言の断片 | (a) での事実 | 判定 |
+|---|---|---|
+| `中断していた切替 (op_id=<M>) を巻き戻してから` | 停止行 `M` を `reverted` で閉じた。**FS の巻き戻しは no-op** (非 `switched` 行) | **可**。「切替」は journal 上の操作を指しており、symlink を動かしたとは言っていない |
+| `再実行し` | 新しい `op_id` で版作成 → git 記録 → decide を頭から流した | **可** |
+| `配備まで完了しました (plugins/<name> → <target>)` | live は `<target>` (= `new_target`) を指しており、approval は `approved` | **可**。**IV-3 の定義そのもの** (「approved になる瞬間に live が `new_target` を指している」)。切替を**行った**とは言っていない |
+
+→ 新 outcome を足すより**既存の 1 語に合流させる方が、文言表・`_approval_outcome_text`・
+AC-14a / AC-17a への影響が 0 で済む**。**採用**。
+
+##### 起動時 reconcile は触らない (推奨)
+
+reconcile は非 `switched` 行を飛ばす (`:271-277`)。したがって案 3 は
+**`approve` / `retry` / (人間の) 契機でしか解けず、人間が retry を打つまで plugin 名は凍ったまま**になる。
+**これを許容する。**
+
+- **触らない理由**: (i) reconcile は**無人**の経路であり、非 `switched` 行は「別プロセスの
+  `approve_candidate` / `bless_candidate` が今まさに進めている途中」でもありうる (FS 効果がまだ無いので
+  reconcile が飛ばすのは設計どおり)。ここに自動巻き戻しを足すと、**進行中の操作を横から畳む**新しい競合を作る。
+  (ii) 巻き戻しても approval は `pending` のままなので、**人間の操作は結局必要**であり、
+  自動化の利得は「名前の凍結が早く解ける」だけ。(iii) IV-4 (承認の自動化禁止) 自体は破らないが、
+  **無人経路に新しい FS 書込契機を足すのは本束の非スコープ** (「新しい自動化は作らない」)。
+- **代わりに運用で閉じる**: v1.7 の後は **`approval retry` が (a) (c) のどちらも 1 回で解く**ので、
+  凍結の解除手順は既存の「`approval list` → `approval retry <id>`」で足りる。
+  **runbook にこの 1 行を足す** (§7.2)。`afx plugin bless` / `afx plugin retire` の
+  `UnresolvedJournalError` にも同じ案内が出る (§3.4、R12)。
+
+##### `bless_candidate` には波及しない (実コードで確認した)
+
+`bless_candidate` は **未完 journal があれば無条件に `UnresolvedJournalError` を投げる**
+(`switch.py:1985-1991`) — **再開経路を持たない**。`begin_switch_journal` (`:2066-2071`) は毎回
+新しい行を、その場で読んだ `old_kind` / `old_target` (`:2005-2011`) から計算した
+`switch_required` (`:2063`) で作るので、**保存値と再計算値が食い違う余地が構造的に無い**。
+→ **`bless_candidate` は 1 行も変えない。** 共通関数化もしない (共有すべき処理が無い)。
+bless から見える影響は「凍った名前が retry で解けるようになる」ことだけである。
+
+##### 既知の残余 (本束では直さない)
+
+1. **`switch_required=0` の枝は版 dir の hash 再照合を通らない** —
+   `_version_dir_hashes_ok` は `_advance_to_decided` の `if switch_required:` の内側にしかない
+   (`:1334-1358`)。変種 (a) の再実行は `switch_required=False` で `approved` に至るので、
+   **第三者が live に向けた版の中身は検証されない**。これは (a) に限らず
+   **`switch_required=0` の正規経路 (同一候補の再 bless、runbook §6.3 手順 5) すべてに共通する既存の穴**で、
+   IV-3 の文言 (live が `new_target` を指している) はパス名の一致しか要求していないため
+   現行は仕様どおりである。**ticket `[switch-not-required-skips-hash-verify]` で追う**
+   (案 1 では是正が必須だったが、案 3 では独立した別件になる — これも案 3 を採る理由の 1 つ)。
+2. **`old_kind` / `old_target` が動いたのに `switch_required` が動かない drift は検出しない** —
+   判定は R11 の裁定どおり **`switch_required` の一致**だけを見る。保存 `(symlink, X)` → 再開時
+   `(symlink, Y)` (X ≠ Y ≠ `new_target`) や、保存 `(absent, None)` → 再開時 `(symlink, Y)` では
+   どちらも `switch_required=1` のままなので**食い違いにならず、行は再利用される**。
+   このとき配備の結末は変わらない (live は `new_target` になる) が、**行に残る `old_target` が
+   resume 時点の live と違う**ため、後の巻き戻しが第三者の `Y` ではなく `X` を復元する。
+   **より強い述語 (`(old_kind, old_target)` の一致。`switch_required` の一致はこれから導かれる) に
+   広げれば閉じる**が、R11 の裁定の範囲外なので本束では採らない。
+   **ticket `[resume-stale-old-target-not-detected]` として起票し、指揮者に申告する。**
+   実装は述語をタプル比較に広げる 1 行の拡張で足りる (T11 のテストはそのまま通る)。
+
 #### クラッシュ点の全数表 (0d-2c を通る 1 回の retry)
 
 `S1` = `_revert_one` の FS 操作、`S2` = 停止行 `reverted` の commit、`S3` = 新 journal 行 (`preparing`) の commit、
@@ -282,6 +473,16 @@ temp → rename の 1 手なので「live が消えた瞬間」は作らない)�
 | S6 の再照合で不一致 | 新行 `switched` / live **新** / pending | 分類 `switched` → `_unresolved_after_switch` を経て `retry_approval` → 0d-2a。**候補から版を再作成できれば完遂** (`switch.py:1393-1481`、`test_switch_paths.py:770` が pin)、候補も無ければ `reverted` (`:807` が pin) | 0d-2a (現行どおり、同上) |
 | S7 の tx の中 | tx は atomic (`BEGIN IMMEDIATE` + rollback、`switch.py:1276-1285`) — approved と decided は**同時に成立するか両方成立しないか** | 分類 `switched` → 完遂 | 0d-2a → `_finalize_decision` |
 | S7 の後 | `decided` / `approved` / live 新 | 終端なので対象外 | approval が pending でないので早期 return (no-op) |
+
+**T11-B (v1.7) を通る 1 回の retry も同じ表に載る**。判定は `S1` より後・`S3` より前の
+**`R`** (= 停止行の巻き戻し + `reverted` の commit、FS 副作用なし) という 1 段が増えるだけで、
+新しい行が作られた後は **`S3`〜`S7` が字句どおり同じ**である。
+
+| 落ちた位置 (T11-B) | 残る状態 | 次の起動時 reconcile が見るもの | 次の `approval retry` が見るもの |
+|---|---|---|---|
+| `R` の前 (判定はしたが巻き戻す前) | 停止行 `preparing`/`versioned`/`recorded` / live は第三者の状態 / pending | `phase != 'switched'` → **skip** | 同じ判定をやり直す (**冪等** — 再計算値は同じなので再び食い違い、巻き戻しから流す) |
+| `R` の後・`S3` の前 | 停止行 `reverted` (終端) / **非終端行なし** / pending | 非終端行が無いので何もしない | `get_open_by_name` が `None` → **素の新規 approve 経路**で完遂 (S2 の後と同じ行) |
+| `S3` 以降 | 上表の `S3`〜`S7` と同一 | 同上 | 同上 |
 
 **不変条件**: どのクラッシュ点から再開しても、**approved になるのは live が `new_target` を指しているときだけ**
 (IV-3)。これが本束が直す欠陥そのものである。
@@ -430,7 +631,8 @@ v1.0 は 1 を数え落としていた (「2 箇所」)。`force_revert_op_id` �
 |---|---|---|
 | `_plugin_bless` (`cli.py:600`) | `except (ValueError, SandboxError)` | **`UnresolvedJournalError` を追加** |
 | `_plugin_materialize` (`cli.py:611`) | `except (FileExistsError, FileNotFoundError, OSError)` | **`ValueError` を追加** (`materialize_plugin` は live symlink が `plugins_root` の外を指すとき `ValueError` を投げる `switch.py:1766-1768`。現状は外側の包括 catch `cli.py:781-784` に落ち、メッセージ形式だけが不揃い) |
-| `_plugin_submit` / `_plugin_lock` / `_plugin_retire` | — | **変更なし** (全数確認済、同型の穴なし。`submit_candidate` は journal を見ないので `UnresolvedJournalError` を投げない) |
+| `_plugin_retire` (`cli.py:628`) | `except (UnresolvedJournalError, ValueError, OSError)` の **1 節で `エラー: {e}` だけ** | **v1.7 (R12)**: `UnresolvedJournalError` を**先行する別の節に割り**、bless と**同じ「次の 1 手」**を添える。`(ValueError, OSError)` の節は現行のまま残す。**捕まえる例外の集合も rc も変わらない** (節を割るだけ = 新しい握りつぶしを作らない) |
+| `_plugin_submit` / `_plugin_lock` | — | **変更なし** (全数確認済、同型の穴なし。`submit_candidate` は journal を見ないので `UnresolvedJournalError` を投げない) |
 
 **文言** (bless):
 ```
@@ -439,6 +641,18 @@ v1.0 は 1 を数え落としていた (「2 箇所」)。`force_revert_op_id` �
 ```
 `UnresolvedJournalError` の元メッセージが `op_id=` と `approval_id=` を含むこと (`switch.py:1987-1991`) は
 **維持する** — runbook と既存テストがこの 2 語に依存している。
+
+**文言** (retire、v1.7 / R12 — bless と**同じ 2 行目**を使う):
+```
+エラー: plugin 'sma' has an unresolved switch journal (op_id=3) — resolve it first (reconcile or approval retry)
+  収束手順: サービスの対話シェルで `approval list` → `approval retry <approval_id>`
+```
+**`retire_plugin` が投げるメッセージには `approval_id=` が含まれない** (`switch.py:1795-1798` —
+`op_id=` のみ。`approve_candidate` / `bless_candidate` の文言とはここが違う)。
+**だからこそ案内の第一手が `approval list` であることに意味がある** — 一覧の未終端 journal の節が
+`op_id` / `name` / `phase` / `approval_id` を並べる (§3.5) ので、**この 2 行だけで人間は次に打つ id に辿り着ける**。
+`retire_plugin` 側の例外文言は**変えない** (既存テスト `tests/plugin/test_materialize_retire.py:62` が
+型だけを pin しており、文言を足す必要は無い)。
 
 ### 3.5 件 3: 対話シェル
 
@@ -503,7 +717,7 @@ v1.1 は `approve` ハンドラ (検収 m5、`commands.py:102-110`) に倣って
 |---|---|
 | `outcome` | `deployed` / `deployed_after_rollback` / `already_decided` / `foreign_waiting` / `still_pending` / `legacy_plain_present` / `invalidated` のいずれか |
 | `op_id` | その呼び出しで最終的に関与した journal 行 (`foreign_waiting` なら触らなかった行、`deployed_after_rollback` なら**新しい方**) |
-| `rolled_back_op_id` | 0d-2c で畳んだ**停止行**の `op_id` (それ以外は `None`)。**`deployed_after_rollback` はこの値の有無で決まる** |
+| `rolled_back_op_id` | 0d-2c **または T11-B (v1.7、§3.2)** で畳んだ**停止行**の `op_id` (それ以外は `None`)。**`deployed_after_rollback` はこの値の有無で決まる** — 契機が 2 つになっても組み立ての 1 箇所は変わらない |
 | `name` / `target` | plugin 名と、`deployed*` のとき live が指すことを確認した `new_target` |
 | `status` | **lock の内側で確定した approval の status** (r3 I1 で追加、r4 I1 で定義を精密化)。確定の仕方は 2 通りあり、どちらも lock 内: (a) **read** — 非 pending 判定のために `:1517-1519` で読んだ値 (`already_decided`)、(b) **decision 結果** — 同じ lock 内で成功した `apply_decision` に渡したリテラル (`invalidated`)。**(b) は再読しない** — `apply_decision` が例外なく commit された以上その値が DB の状態であり、再読は lock 内でも余計な往復にしかならない。シェルはこれを写すだけで、**lock 外では読み直さない** (この一点が r3 の是正の主旨) |
 | `reason` | `still_pending` の理由 (下表の `return` 地点に 1 対 1) |
@@ -512,6 +726,9 @@ v1.1 は `approve` ハンドラ (検収 m5、`commands.py:102-110`) に倣って
 「直前に巻き戻しがあったか」を知らない。そこで **0d-2c がローカル変数
 `rolled_back_op_id = <畳んだ op_id>` を立て、`op_id = None` と対にして下流へ持ち回る**。
 outcome を組み立てる最後の 1 箇所がこの変数を読んで `deployed` と `deployed_after_rollback` を分ける。
+**v1.7 で同じ変数を立てる契機が 2 つになった** (0d-2c = `switched` 行の `not_switched` /
+T11-B = 非 `switched` 行の前提崩れ) が、**組み立ても文言も `_approval_outcome_text` も 1 行も変わらない**
+(§3.2「巻き戻した後の outcome」で文言が事実と合うことを断片ごとに確認済)。
 (別案「`deployed` に一本化して `rolled_back_op_id` の有無だけで表現する」も等価だが、
 シェルの文言が 2 種類に分かれる (下表) ので **outcome 名でも区別できる方が写すだけの実装になる**。)
 
@@ -731,7 +948,7 @@ phase は従来どおり `preparing → versioned → recorded → switched → 
 |---|---|---|---|---|
 | `_advance_to_decided` → `switch_live` (approve / bless の本線) | `switch.py:1338` (`_advance_to_decided` 内の `switch_live` 呼び出し) | `_plugin_locks` (approve_candidate `:1516` / bless_candidate `:1977`) | **はい** (live の形は approve_candidate `:1692-1699`、bless_candidate `:2005-2011` で lock 内、§3.3.5) | 直さない (現状で正しい) |
 | `_reverify_switched_journal` → `_revert_one` (再検証失敗) | `switch.py:1471` | 0d の `_plugin_locks` の内側 (`:1516`) | はい (0d が lock 内で読んだ行をそのまま使う) | 直さない |
-| `approve_candidate` の自分の未完 journal を閉じる `_revert_one` | `switch.py:1606` (0d-2c) / `:1647` (`_close_own_unfinished_journal_if_any`) | `_plugin_locks` の内側 (`:1516`) | はい (0d-2c は `get_open_by_name` `:1564` + `classify_live` `:1579`、`_close_own_unfinished_journal_if_any` は `journal_store.get` `:1645`) | 直さない (0d-2c の 1 本化先、§3.2) |
+| `approve_candidate` の自分の未完 journal を閉じる `_revert_one` | `switch.py:1606` (0d-2c) / `:1647` (`_close_own_unfinished_journal_if_any`) | `_plugin_locks` の内側 (`:1516`) | はい (0d-2c は `get_open_by_name` `:1564` + `classify_live` `:1579`、`_close_own_unfinished_journal_if_any` は `journal_store.get` `:1645`) | 直さない (0d-2c の 1 本化先、§3.2)。**v1.7 の T11-A / T11-B もこの `:1647` を再利用する**ので、`_revert_one` の呼び出し元は **5 箇所のまま増えない** (§3.3.2 の全数表と AC-9d はそのまま成立する) |
 | `reject_candidate` の自分の未完 journal を閉じる `_revert_one` | `switch.py:1874` | `_plugin_lock` (`:1866`) | **行の再取得のみ、分類 (`classify_live`) はしない** (`get_open_by_name` を lock 内 `:1872`) | **直さない** — ticket [reject-revert-without-live-classification] で追う (v1.6a、IV-6 参照) |
 | **reconcile: `force_revert_op_id` 分岐** | `switch.py:268` (`_revert_under_lock` 呼び出し、条件 `:260-262`) | **本束で追加** | — | **直す** (lock + 行の再取得。分類の一致は求めない — §3.3.3) |
 | **reconcile: pin 破れの `_revert_one`** | `switch.py:295` (`_revert_under_lock` 呼び出し) | **本束で追加** | — | **直す** (lock + 行 + 分類) |
@@ -759,6 +976,16 @@ phase は従来どおり `preparing → versioned → recorded → switched → 
 - **資金保護との関係**: plugin の配備状態は発注経路に直接は関わらないが、
   「approved なのに未配備」は運用者の認識と現物のずれなので、**表示と現物を一致させる**ことが本束の安全上の主張。
 - **新しい外向きリクエスト・新しい sink・新しい入力経路は増えない**。
+- **本束を通しても残る既知の残余 (v1.7、明記する)**:
+  1. `switch_required=0` の枝は版 dir の hash 再照合を通らない —
+     ticket `[switch-not-required-skips-hash-verify]` (§3.2「既知の残余」1)。
+  2. `(old_kind, old_target)` の drift は検出しない —
+     ticket `[resume-stale-old-target-not-detected]` (§3.2「既知の残余」2)。
+  3. `reject_candidate` の巻き戻しは live を分類しない —
+     ticket `[reject-revert-without-live-classification]` (IV-6 の例外 2、v1.6a)。
+  4. 決着済み (`already_decided` / `invalidated`) の approval に非終端 journal が残っていると
+     名前は凍ったまま — 解除は `approval retry` / `reject` のみ (§3.2 の全分岐表 1 / 2)。
+  いずれも **fail closed 側の残余** (誤配備・誤承認には至らない)。
 
 ---
 
@@ -789,7 +1016,7 @@ phase は従来どおり `preparing → versioned → recorded → switched → 
 | **AC-12c** | `approval list 0` / `approval list -1` / `approval list abc` が `usage: approval list [n]` を返し、**一覧を出さず例外も出さない**。`approval 999` (既存の詳細表示) と `approval retry <id>` が**この追加で壊れない** |
 | **AC-13** | `approval list` の出力に holdout / in_sample の数値が**含まれない** |
 | **AC-14a** | `approval retry` の戻り文言 (§3.5 の文言表の**全 6 行**。**outcome は 7 種**で、`already_decided` と `invalidated` が 1 行に併記されるため行数は 6 — r4 Minor 1 の訂正) をそれぞれの到達状態で観測する。特に **`foreign_waiting` のときに「配備まで完了しました」と言わない**こと、`foreign_waiting` と `still_pending` が**別の文言**になること、`already_decided` / `invalidated` が **`outcome.status` を写した値**を出すこと (lock 外で読み直した値ではない)。<br>**存在しない approval id に対する `approval retry`** は outcome ではなく **`ValueError("approval N not found")` の送出**で、戻り文字列は **`エラー: approval N not found` + 改行 + `_HELP` 全文** (先行する `except (ValueError, KeyError)` に捕まる — r4 I3。逐語で assert する) |
-| **AC-14d** | **outcome の網羅性 (r4 I2)**: (1) **AST 検査** — `approve_candidate` と `retry_approval` の関数本体に **bare `return` / `return None` が 1 つも無い**こと (`ast.parse` で `Return` ノードを走査し、`value is None` または `Constant(None)` を落とす)。<br>**但し書き (v1.5、実装プランの着手前検証で実測)**: 走査は**入れ子関数の本体には入らない**。`approve_candidate` は内部 helper `_close_own_unfinished_journal_if_any` を持ち、これは `-> None` の手続きなので bare `return` を持ってよい。素朴な `ast.walk` はこれを拾って偽 red になるため、**自分の本体だけを辿る走査** (テスト側の `_walk_own_body`) を使う。(2) **各 `return` 地点を実際に通すテスト**が、戻り値が outcome 型であり `outcome` が**既知 enum 値**であることを assert する (§3.5 の `return` 地点表の全行に 1 テスト以上を対応させる)。(3) シェルは未知 / `None` の outcome を**文言にしない** — 与えると例外になり `エラー: ...` が返る (fail loud、接頭辞が付かないことも assert) |
+| **AC-14d** | **outcome の網羅性 (r4 I2)**: (1) **AST 検査** — `approve_candidate` と `retry_approval` の関数本体に **bare `return` / `return None` が 1 つも無い**こと (`ast.parse` で `Return` ノードを走査し、`value is None` または `Constant(None)` を落とす)。<br>**但し書き (v1.5、実装プランの着手前検証で実測)**: 走査は**入れ子関数の本体には入らない**。`approve_candidate` は内部 helper `_close_own_unfinished_journal_if_any` を持ち、**入れ子関数は `approve_candidate` 自身の `return` 契約の対象外**なので、その本体の `return` は拾ってはいけない。素朴な `ast.walk` はこれを拾って偽 red になるため、**自分の本体だけを辿る走査** (テスト側の `_walk_own_body`) を使う。<br>**v1.7 訂正**: v1.5 は除外の理由を「helper は `-> None` の手続きだから」と書いていたが、**v1.7 で helper の戻り値は `-> int | None` (閉じた `op_id`) になる** (§3.2「1 本化」) ので、この理由は使えない。正しい理由は上記の「入れ子関数だから」であり、**`_walk_own_body` の実装は変えなくてよい**。(2) **各 `return` 地点を実際に通すテスト**が、戻り値が outcome 型であり `outcome` が**既知 enum 値**であることを assert する (§3.5 の `return` 地点表の全行に 1 テスト以上を対応させる)。(3) シェルは未知 / `None` の outcome を**文言にしない** — 与えると例外になり `エラー: ...` が返る (fail loud、接頭辞が付かないことも assert) |
 | **AC-14b** | **後続配備との競合 (r2 Important 4 の killer)**: barrier で、`retry_approval` が lock を解放した**直後・シェルが文言を組み立てる前**に、別スレッド + 別コネクションが同名 plugin の**別の候補を正規に bless して live をさらに進める**。**観測**: retry の報告は **`配備まで完了しました (… → <この retry の target>)` のまま**で、「⚠ live が一致しません」を出さない。**変異**: lock 解放後に live を読み直して分類する実装 (v1.1 の案) に戻すと red |
 | **AC-14c** | `approve_candidate` / `retry_approval` が outcome を返すようになっても、**戻り値を使っていない既存の呼び出し元 = 本体コード 2 箇所** (reconcile → `retry_approval` / `retry_approval` → `approve_candidate`) **+ テスト 30 箇所あまり**が**書き換えなしで緑**。**v1.6 訂正**: v1.5 は本体「4 箇所」と書いていたが、retry ハンドラ (v1.2 から) と approve ハンドラ ((A) から) が戻り値を**使う**側に移ったので本体は 2 箇所 |
 | **AC-15** | 既存の `tests/plugin/test_switch_journal.py` / `test_switch_paths.py` / `test_materialize_retire.py` / `tests/fixtures/test_wiring_envs.py` / `tests/test_service_app.py` が**1 本も書き換えずに緑**。書き換えるのは §7.1 の **4 本だけ** (`test_indicator_initial_set.py` の 2 本 + `test_commands.py:541` の spy + `test_reconcile.py::test_reconcile_resolution_holds_the_dependency_locks`) で、**同ファイルの他のテストは不変** (`test_reconcile.py` は v1.5 で「無改変」の側から外した — 下記 §7.1) |
@@ -799,6 +1026,13 @@ phase は従来どおり `preparing → versioned → recorded → switched → 
 | **AC-17b** | **activity の書込は `deployed*` のときだけ** (v1.6)。`still_pending` / `foreign_waiting` / `legacy_plain_present` / `already_decided` / `invalidated` のいずれでも `APPROVAL approved` の行が増えない。**`already_decided` かつ `status == "approved"` (二重 approve) でも増えない** (§3.6.5 の 1) |
 | **AC-17c** | **後続決定との競合 (AC-14b の approve 版、v1.6 の主 killer)**。`approve_candidate` が `still_pending(candidate_missing)` を返した**直後・シェルが文言を組み立てる前**に、**別コネクションの競合者が同じ approval を `approved` にする** (`approvals.apply_decision(conn2, id, "approved", ...)`。これは期限切れ sweep / 別プロセスの CLI / もう一人の運用者の決定を代表させたもの)。**観測**: シェルの報告は **`approval #<id> は今回の操作では承認されませんでした (status=pending): approved になりませんでした (reason=candidate_missing)` の逐語のまま**で、activity にも `approved` が増えない。**変異**: lock 解放後に `SELECT status, reason` で読み直す実装 (= v1.5 までの approve ハンドラ) に戻すと red |
 | **AC-17d** | **未知 / `None` outcome は文言にしない** (AC-14d(3) の approve 版)。`approve_candidate` の spy が `None` を返すと `エラー: ...` になり、**接頭辞が付かない** (fail loud) |
+| **AC-16c-1** | **(a) 保存 `switch_required=1` / 再計算 `False` の 3 phase** (v1.7、§3.2)。停止 phase = `preparing` / `versioned` / `recorded` の 3 通りで journal を止め、第三者が live をちょうど `new_target` へ向けた状態から `approval retry` (または `approve`) を **1 回**打つと、3 通りとも: approval が **`approved`**、journal が **2 本** (停止行 `reverted` + **別の新しい `op_id`** が `decided`)、**新しい行の `old_kind='symlink'` / `old_target == new_target` / `switch_required == 0`**、**live は 1 バイトも変わらない** (第三者が向けた `new_target` のまま)、戻り値が `outcome="deployed_after_rollback"` かつ `rolled_back_op_id == 停止行の op_id`。**現行は 3 通りとも `ValueError` で永久に詰まる** (probe `test_probe_a_b_stuck_when_third_party_points_live_at_new_target` が実測) |
+| **AC-16c-2** | **(c) 逆向き (保存 `switch_required=0` / 再計算 `True`)** (v1.7)。`recorded` で止まった `switch_required=0` の行に対し、第三者が live を消した状態から `approval retry` を 1 回打つと: **新しい行の `switch_required == 1`**、live が `new_target` を指す symlink になり、approval が `approved`、journal 2 本。**現行は `advance_switch_journal` の `switch_required=0` ガード (`switch.py:150-153`) で `ValueError`** (probe `test_probe_c_reverse_stored_zero_recomputed_true` が実測) |
+| **AC-16c-3** | **回帰防止 (食い違いが無いときは従来どおり `op_id` を再利用する)** (v1.7)。`recorded` で止めた行を、**live を一切触らずに** `approval retry` すると: journal は **1 本のまま**で、**`decided` になるのは停止行と同じ `op_id`**、`rolled_back_op_id is None`、outcome は **`deployed`** (`deployed_after_rollback` ではない)、activity に `switch_resume_precondition_changed` が **出ない**。**この AC が「常に巻き戻す」への退化を殺す唯一の網** (他の AC は全部緑のままになる) |
+| **AC-16c-4** | **監査の観測** (v1.7)。AC-16c-1 の実行で activity に **`switch_resume_precondition_changed`** が **1 本** (`name=` / `op_id=` / `phase=` / `stored_switch_required=` / `recomputed=` を含む) 残り、その**直後**に `_revert_one` の `switch_reverted` が並ぶ (= 2 行になる。「ちょうど 1 行」ではない)。巻き戻した行は終端 `reverted` の**まま**で、後から `decided` に上書きされない (T2 の入口ガードと合わせた二重の網) |
+| **AC-16c-5** | **lock 内で完結すること (IV-6)** (v1.7)。AC-16c-1 の巻き戻しが `_plugin_locks` の内側で起き、**commit も lock の内側で完了している** — AC-9d と同じ観測装置 (`_phase_from_another_connection`) で、`approve_candidate` が戻る前・かつ lock 解放前に**別コネクションから停止行が `reverted` に見える**。**`_revert_one` の呼び出し元は 5 箇所のまま増えていない** (`grep -n "_revert_one(" src/agentic_fx/plugin/switch.py` が 5 件) |
+| **AC-16c-6** | **plain 分岐でも自分の未完行が閉じる (T11-A)** (v1.7)。`recorded` で止まった行に対し、第三者が live を **plain ディレクトリ**に置き換えた状態で `approval retry` を打つと: 戻り値は **`legacy_plain_present` のまま** (文言・フィールドとも不変)、かつ **非終端 journal が 0 本**になり、**続けて別 approval の `approve` / `bless` を打っても `UnresolvedJournalError` にならない**。**現行は行が非終端のまま残り名前が永久に凍る** |
+| **AC-18** | **`afx plugin retire` の案内 (R12)** (v1.7)。未終端 journal が残った状態で `uv run afx plugin retire <name>` → **rc=1**、stderr に `op_id=` と **`approval list`** と **`approval retry`** が出て、**traceback が出ない**。bless (AC-10) と**同じ 2 行目**であること。`(ValueError, OSError)` 側の既存の失敗は **rc=1 + `エラー: ` のまま不変** (節を割っても捕捉集合が変わらないことの pin) |
 
 ---
 
@@ -807,10 +1041,12 @@ phase は従来どおり `preparing → versioned → recorded → switched → 
 | ファイル | 変更 |
 |---|---|
 | `src/agentic_fx/plugin/switch.py` | 分類器の新設 (公開関数) / `reconcile_switch_journals` の載せ替え + **巻き戻し 3 箇所の flock 化と stale row 再検証** (§3.3) / `approve_candidate` 0d の R1 化 + `op_id = None` / `_close_own_unfinished_journal_if_any` の 1 本化とコメント更新 / **`_advance_to_decided` 入口 + `_finalize_decision` の 2 段 phase ガード** (§3.2) / **`approve_candidate` / `retry_approval` が lock 内で確定した outcome を返す** (§3.5) / 新 activity イベント `switch_retry_unrecognized_live_target` と `switch_reconcile_skipped_stale_row` |
-| `src/agentic_fx/backtest/cli.py` | `_plugin_bless` に `UnresolvedJournalError`、`_plugin_materialize` に `ValueError` |
+| `src/agentic_fx/plugin/switch.py` (v1.7) | **T11-A**: plain 分岐 (`:1702`) の手前で `_close_own_unfinished_journal_if_any()` を呼ぶ / **T11-B**: `switch_required` 再計算 (`:1719`) の直後に保存値との食い違い判定を置き、activity `switch_resume_precondition_changed` → helper → `rolled_back_op_id` / `op_id = None` / **helper の戻り値を `None` → `int | None` に変える** (新しい `return` 地点も新しい `_revert_one` 呼び出し元も増やさない) |
+| `src/agentic_fx/backtest/cli.py` | `_plugin_bless` に `UnresolvedJournalError`、`_plugin_materialize` に `ValueError`、**`_plugin_retire` の `UnresolvedJournalError` を別節に割って「次の 1 手」を添える** (v1.7 / R12) |
 | `src/agentic_fx/commands.py` | `approval list` / `approval retry` の結果報告 / **`approve <id>` (kind=plugin) の結果報告** (v1.6、§3.6) — いずれも**受け取った outcome を文言に写すだけで、lock 外での再読み・再分類はしない** / `_retry_outcome_text` → **`_approval_outcome_text`** への改名 (中身は不変) / `_HELP` |
 | `tests/plugin/test_switch_ops_hardening.py` (新規) | AC-1〜AC-9c、**AC-9d** (v1.6、別コネクション観測)、AC-16a / AC-16b。**AC-9b は barrier 付きの競合テスト**なので、既存の multi-process 流儀 (`tests/plugin/_flock_worker.py`) かスレッド + 別コネクションで書く |
-| `tests/backtest/test_cli.py` または新規 | AC-10 / AC-11 |
+| `tests/plugin/test_switch_ops_hardening.py` (v1.7 で追記) | **AC-16c-1〜AC-16c-6**。probe `tmp/review-20260920-soh/r2/cr1-probe/test_probe_cr1.py` のヘルパと 3 phase の parametrize を**転写し、assert を目標状態へ反転**して red の種にする |
+| `tests/backtest/test_cli.py` または新規 | AC-10 / AC-11 / **AC-18** (v1.7) |
 | `tests/test_commands.py` | AC-12a〜AC-12c / AC-13 / AC-14a〜AC-14d / **AC-17a〜AC-17d** を**追記**。**`:541` の spy だけ書き換える** (§7.1) |
 | `docs/operations/indicator-initial-set-deploy-2026-09-19.md` | 改訂 (下記) |
 | `docs/superpowers/specs/2026-08-16-phase2-10-improve-loop-design.md` | §5.1-1 に「retry の `not_switched` 処置」を 1 段落追記 (既存規則の具体化。規則自体は変えない) |
@@ -873,13 +1109,26 @@ reconcile は戻り値を無視する契約 (§3.5) なので**不変**。
 | L155-164 | `[retry-switched-approves-without-deploy]` の既知の観測事項としての説明 | **削除** (本束で解消)。代わりに「`foreign` は自動収束しない」を残す |
 | **L167-169** (v1.1 で追加、r1 Important 4) | 「いずれの phase でも、**手順 5 (もう一度 bless する) を必ず実行する**」「`switched` では**必須の配備手順**になる」 | **改訂**。本束の後は `switched` でも `approval retry` が配備まで完了するので、手順 5 は**どの phase でも確認 (no-op)** になる。旧手順のままだと不要な再 bless を要求し、**approval 行を 1 本無駄に増やす** (同ファイル「共通の規則」の表が自認している副作用)。「`foreign` (live が第三者に触られている) のときだけ人間が判断する」に置き換える |
 | 「approval id の入手」節 | 「同じ bless をもう一度実行して例外文言から読む」「`sqlite3 -readonly` で見る」 | **`afx> approval list` を第一手**に差し替え (例外文言と直接 SQL は代替手段として残す) |
+| **「plugin 名が凍ったとき」(v1.7 で新設)** | 記述なし | **1 節を足す**: `bless` / `retire` / 別 approval の `approve` が `UnresolvedJournalError` で拒否されたら、**`approval list` → `approval retry <approval_id>`**。retry は (i) 切替が途中で止まった行、(ii) **再開の前提 (`switch_required`) が resume 時点で崩れた行** (§3.2、第三者が live を触った場合) のどちらも 1 回で収束させる。**起動時 reconcile では解けない** — 非 `switched` 行は飛ばす仕様なので、サービスを再起動しても凍結は解けない。**`foreign` (live が第三者に触られた `switched` 行) のときだけ人間が判断する** |
 | L162-165 (`preparing` 等は再起動で終端しない / `switched` は reconcile が扱う) | 現状のまま正しい | **不変** (実コードの skip `switch.py:271-277` は変えない) |
 
 ---
 
 ## 8. 要裁定事項
 
-なし (§0 の R1〜R8 と、**§0 の R9 / R10 (2026-09-20 追加裁定)** で確定済み)。
+なし (§0 の R1〜R8 と、**§0 の R9 / R10 / R11 / R12 (2026-09-20 追加裁定)** で確定済み)。
+
+**v1.7 で指揮者へ申告する 1 点 (本束の裁定は不要、ticket の起票判断のみ)**:
+`[resume-stale-old-target-not-detected]` — 判定述語を R11 の裁定どおり `switch_required` の一致に
+留めたため、`(old_kind, old_target)` だけが動いた drift は検出しない (§3.2「既知の残余」2)。
+**より強い述語 (タプル比較) に広げれば閉じるが、配備の結末は変わらず、影響は後の巻き戻しの復元先だけ**
+なので本束では採らない。広げる場合も T11 のテストはそのまま通る。
+
+**v1.7 で既存テストの書き換えは増えない (確認した)**: T11 は「前提が崩れていない再開」の挙動を
+1 バイトも変えない (AC-16c-3 が回帰防止として pin する) ので
+`tests/plugin/test_switch_paths.py:677 / :1119 / :1160` (`recorded` からの retry) は不変。
+T12 は **CLI の `_plugin_retire` の失敗経路を踏む既存テストが 1 本も無い**
+(`grep -rn "_plugin_retire\|\"retire\"" tests/` = 0 件) ため不変。**§7.1 の書き換えは 4 本のまま。**
 
 起草中に上がった 1 点 (`tests/test_commands.py:541` の戻り文字列アサーションが §3.5 で壊れないか) は
 **現物を読んで解消した** — §3.5 の共通接頭辞により既存アサーションは通る (§7.1)。
@@ -944,10 +1193,24 @@ terra は v1.2 の改訂箇所に限定して静的読解し、**2 段 phase ガ
 | I3 | approval 不在の `ValueError` の捕捉先が実コードと違う (包括 `except Exception` ではなく先行する `except (ValueError, KeyError)`、表示に `_HELP` が付く) | **そのとおり** (`commands.py:292-295` — `except (ValueError, KeyError)` は `f"エラー: {...}\n{_HELP}"` を返す) | §3.5 の記述を訂正し、**例外 → `except` → 戻り文字列の対応表**を新設 (`ValueError` / `UnresolvedJournalError` / `RuntimeError` / `OSError` の 5 行)。AC-14a を**実際の戻り文字列** (`エラー: approval N not found` + 改行 + `_HELP`) に合わせた。**retry だけ別扱いの 1 行契約にはしない** (現行の表示を変えない) |
 | M1 | AC-14a の「outcome 6 種」が列挙 (7 種) と不一致 | **そのとおり** | 「**outcome 7 種 / 文言カテゴリ 6 行**」(`already_decided` と `invalidated` は 1 行に併記) と明記。fallback 行は I2 で削除 |
 
+### 8.5 2 周目 `/code-review high` の処置 (v1.7、`tmp/review-20260920-soh/r2/code-review.md`)
+
+`main..switch-ops-hardening` 全体に対する 10 件のうち、**本束で是正するのは #1 と #5 の 2 件**
+(2026-09-20 ユーザー裁定)。#1 は**指揮者側の probe で再現を実測**した
+(`tmp/review-20260920-soh/r2/cr1-probe.md`、`tmp/review-20260920-soh/r2/cr1-probe/test_probe_cr1.py` = `4 passed`)。
+
+| # | 指摘 | 事実確認の結果 | 処置 |
+|---|---|---|---|
+| #1 | `_finalize_decision` の phase ガードが行の**作成時**の `switch_required` を読むため、非 `switched` phase で止まった行を再開すると、その回に再計算された値と食い違って approve / retry が永久に詰まる | **再現した (Important)**。停止 phase `preparing` / `versioned` / `recorded` の 3 通りとも詰まり、reconcile・expire・再起動のいずれでも解けない。`reject` だけが抜け道で、しかも live は第三者の状態のまま残る。**逆向き (保存 0 / 再計算 1) は `advance_switch_journal` の既存ガードで詰まる別経路**で、これは本束以前からの欠陥。なお**本束以前の挙動は「正しく finalize できていた」のではなく fail open** (第三者が置いた symlink の中身を無検証で approved にしていた) — **ガードを戻す方向の是正は採らない** | **案 3 を採用** (§0 R11)。§3.2 に「#### 再開の前提が崩れていたら…」を新設 — 0d の**全分岐表**で判定を置く 2 箇所 (plain 分岐の手前 / `switch_required` 再計算の直後) を特定し、`_close_own_unfinished_journal_if_any` に 1 本化、outcome は既存の `deployed_after_rollback` に合流、activity に専用イベント。§3.2 のクラッシュ点表に T11-B の段を追加。§3.5 の `rolled_back_op_id` の契機を 2 つに。§4 の全経路表に「呼び出し元は 5 箇所のまま」を追記。§5 に残余 2 件。**AC-16c-1〜6 を新設** |
+| #5 | bless に足した「次の一手」が `_plugin_retire` の同型ハンドラ (`cli.py:628`) に無い — 同じ原因に違う案内 | **そのとおり**。`retire_plugin` の例外文言は `op_id=` のみで **`approval_id=` を含まない** (`switch.py:1795-1798`) ため、案内の第一手が `approval list` であることに意味がある | §3.4 に retire の行と文言を追加 (**既存の 1 節を 2 節に割るだけで捕捉集合は不変**)。**AC-18 を新設** (§0 R12) |
+| #2 (`reject_candidate` が `classify_live` を通らない) | 既知 | 既に ticket `[reject-revert-without-live-classification]` (IV-6 の例外 2、v1.6a)。**本束では直さない** |
+| #3 / #4 / #6 / #7 / #8 / #9 / #10 | compare-and-set の共通化 / `except ValueError` の広さ / outcome 構築のコピペ / `status` の Literal 化 / `approvals.pending` の再利用 / `payload_json` パースの重複 / 冗長な DB 読み | いずれも altitude・reuse 系で**正しさの risk は無い** (レビュアー自身の要約もそう述べている) | **本束では扱わない** (2026-09-20 ユーザー裁定 = 採用は #1 と #5 のみ) |
+
 ## 9. 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-20 | v1.7 | **2 周目 `/code-review high` の #1 (probe で再現、Important) と #5 を是正する設計を追加**: §0 に **R11 / R12** / §3.2 に「**#### 再開の前提が崩れていたら巻き戻して新しい `op_id` で流し直す**」を新設 (0d の**全分岐表**・案 1/2/3 の比較と採用根拠・判定を置く 2 箇所 (T11-A = plain 分岐の手前 / T11-B = `switch_required` 再計算の直後)・`_close_own_unfinished_journal_if_any` への 1 本化 (戻り値 `None` → `int | None`)・outcome は既存 `deployed_after_rollback` に合流 (文言が事実と合うことを断片ごとに確認)・**reconcile は触らない**判断・**`bless_candidate` は再開経路を持たないので波及しない**ことの確認・既知の残余 2 件) / §3.2 のクラッシュ点表に T11-B の段 / §3.4 に retire の行と文言 (**節を割るだけで捕捉集合は不変**) / §3.5 の `rolled_back_op_id` の契機を 2 つに / §4 の全経路表に「`_revert_one` の呼び出し元は 5 箇所のまま」/ §5 に残余 4 件 / **AC-16c-1〜6 と AC-18 を新設** (AC は 31 → 38 項目) / AC-14d の但し書きの理由を「入れ子関数だから」に訂正 / §7 変更ファイル表 / §7.2 runbook に「plugin 名が凍ったとき」の節 / §8 に申告 1 点 (ticket `[resume-stale-old-target-not-detected]`) と「**既存テストの書き換えは 4 本のまま**」の確認 / **§8.5 新設** | 2 周目 `/code-review high` (`tmp/review-20260920-soh/r2/code-review.md`) の #1 / #5。**#1 は指揮者側の probe で再現を実測** (`tmp/review-20260920-soh/r2/cr1-probe.md`、probe 本体 `r2/cr1-probe/test_probe_cr1.py` = `4 passed`)。採用 = 案 3、是正範囲 = #1 と #5 のみ (2026-09-20 ユーザー裁定)。行番号は現物 `tmp/wt/soh` HEAD `b753dbd` と照合済 | — |
 | 2026-09-20 | v1.6a | 1 周目 codex (terra/medium) の指摘 3 件を反映: **§8 の「書き換える既存テストは 2 本」が §1/§7.1 の現行「4 本」と食い違っていたのを訂正** (4 本の内訳を明記) / **IV-6 の「唯一の例外は `force_revert_op_id`」を訂正** — `reject_candidate` (`switch.py:1866-1875`) も lock 内で journal 行は読み直すが live の分類 (`classify_live`) はせずに `_revert_one` を呼ぶ既存経路であり、これも例外に数える (本束では直さず ticket 化) / **§4 全経路表の行番号を全数照合し訂正** (reconcile 3 箇所は T4 で生 `_revert_one` から `_revert_under_lock` 呼び出しへ変わっており旧番号のままだった。同様の drift が §3.3.3/§3.3.4/§3.3.5 にも残っているが本束のスコープ外 — 別途申告)。ticket `[reject-revert-without-live-classification]` は本 commit では起票しない (置き場候補 `.superpowers/sdd/plan10-plan/tickets.md` が `.gitignore:34` で除外され worktree にも存在しないため — 指揮者へ申告、テキストは報告に添付) | 2026-09-20 [switch-ops-hardening] 1 周目 codex (terra/medium)、`tmp/review-20260920-soh/r1/codex-triage.md`。実コード `switch.py` で全数照合 | — |
 | 2026-09-19 | v1.0 | 初版 (設計案 v0.1 の全裁定 R1〜R8 を反映。分類器の契約表・クラッシュ点の全数表・二重実行の排他調査・既存テスト全数表・runbook 改訂表を追加) | `tmp/design-switch-ops/design.md` v0.1 のユーザー承認を受けた spec 化 | `66b4248` |
 | 2026-09-20 | v1.6 | 段 0 (指揮者の変異スイープ) が報告した**設計判断 2 点**のユーザー裁定を反映: **(A) シェルの `approve <id>` も lock 内 `ApprovalOutcome` を文言に写す**形へ (§3.6 新設 / §3.5 末尾の「本束では変更しない」を撤回 / §1 スコープ / §7 変更ファイル表 / AC-17a〜AC-17d 新設 / §7.1 の該当行を「不変の根拠」付きで書き直し / §3.5 の後方互換「本体 4 箇所」→「本体 2 箇所 + テスト」と AC-14c を訂正)。文言生成は `_retry_outcome_text` を `_approval_outcome_text` に改名して共用し、接頭辞に `(status=...)` を置くことで**既存テストの追加書き換えを 0 本に抑えた**。**(B) 巻き戻しの `conn.commit()` を lock の内側で完了させることを明文化** (§3.3.2 手順 4 / IV-6 / **AC-9d 新設**)。`_revert_one` の呼び出し元 5 箇所を全数確認し、**本体コードの変更は不要**であることを記録。AC は 26 → 31 項目 | `tmp/review-20260920-soh/stage0.md` §3 (S0-54 / S0-55 / S0-75 が未 pin)・§6 (設計判断 2 点) の報告に対する 2026-09-20 ユーザー裁定。実コード `commands.py:86-117` / `switch.py` の `_revert_one` 呼び出し元 5 箇所で事実確認 | — |
