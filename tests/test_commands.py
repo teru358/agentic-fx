@@ -1244,3 +1244,224 @@ def test_approval_retry_fails_loud_on_unknown_enum_value(tmp_path, monkeypatch):
     assert out.startswith("エラー: ")
     assert "を再試行しました" not in out
     assert "brand_new_outcome" in out
+
+
+# ============================================================
+# [switch-ops-hardening] T9 (設計書 §3.6) — `approve <id>` も lock 内 outcome
+# を文言に写す (AC-17a〜AC-17d)。
+# ============================================================
+
+_APPROVE_TARGET = ".versions/sma/" + "a" * 64
+
+_APPROVE_OUTCOME_CASES = [
+    pytest.param(
+        _fake_outcome(op_id=3),
+        "approval #{aid} approved: 配備まで完了しました "
+        f"(plugins/sma → {_APPROVE_TARGET})",
+        True, id="deployed"),
+    pytest.param(
+        _fake_outcome(outcome="deployed_after_rollback", rolled_back_op_id=2),
+        "approval #{aid} approved: 中断していた切替 (op_id=2) を"
+        f"巻き戻してから再実行し、配備まで完了しました (plugins/sma → {_APPROVE_TARGET})",
+        True, id="deployed_after_rollback"),
+    pytest.param(
+        _fake_outcome(outcome="foreign_waiting", status="pending", target=None),
+        "approval #{aid} は今回の操作では承認されませんでした "
+        "(status=pending): live が第三者に触られているため自動収束しません "
+        "(op_id=3)。plugins/sma の状態を確認してください",
+        False, id="foreign_waiting"),
+    pytest.param(
+        _fake_outcome(outcome="still_pending", status="pending", target=None,
+                     reason="candidate_missing"),
+        "approval #{aid} は今回の操作では承認されませんでした "
+        "(status=pending): approved になりませんでした (reason=candidate_missing)",
+        False, id="still_pending"),
+    pytest.param(
+        _fake_outcome(outcome="legacy_plain_present", status="pending", target=None),
+        "approval #{aid} は今回の操作では承認されませんでした "
+        "(status=pending): plugins/sma が旧式のディレクトリのままです "
+        "(先に afx plugin retire が要ります)",
+        False, id="legacy_plain_present"),
+    # 二重 approve (既に approved 済みの承認をもう一度 approve): §3.6.5 の 1。
+    # status=approved なのに「承認されませんでした」と言う矛盾を pin する
+    # (T9-M4b の killer)。
+    pytest.param(
+        _fake_outcome(outcome="already_decided", status="approved", target=None),
+        "approval #{aid} は今回の操作では承認されませんでした "
+        "(status=approved): この承認は既に決着しています (status=approved)",
+        False, id="already_decided"),
+    pytest.param(
+        _fake_outcome(outcome="invalidated", status="invalidated", target=None),
+        "approval #{aid} は今回の操作では承認されませんでした "
+        "(status=invalidated): この承認は既に決着しています (status=invalidated)",
+        False, id="invalidated"),
+]
+
+
+@pytest.mark.parametrize("outcome,template,writes_activity", _APPROVE_OUTCOME_CASES)
+def test_approve_plugin_reports_the_locked_outcome(tmp_path, monkeypatch, outcome,
+                                                    template, writes_activity):
+    """AC-17a: `approve_candidate` の spy が 7 種の outcome を返すとき、
+    戻り文字列は §3.6.3 の逐語 (接頭辞込み、`==` で完全一致)。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / ".locks").mkdir(parents=True)
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    approval_id = _pending_plugin_approval(conn, "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.approve_candidate",
+                        lambda *a, **kw: outcome)
+
+    out = cmds.dispatch(f"approve {approval_id}")
+
+    assert out == template.format(aid=approval_id)
+
+
+@pytest.mark.parametrize("outcome,template,writes_activity", _APPROVE_OUTCOME_CASES)
+def test_approve_plugin_writes_activity_only_when_deployed(tmp_path, monkeypatch,
+                                                            outcome, template,
+                                                            writes_activity):
+    """AC-17b: activity `approved` を書くのは `deployed` / `deployed_after_rollback`
+    のときだけ。`already_decided` かつ `status="approved"` (二重 approve) でも
+    書かない。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / ".locks").mkdir(parents=True)
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    approval_id = _pending_plugin_approval(conn, "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.approve_candidate",
+                        lambda *a, **kw: outcome)
+
+    cmds.dispatch(f"approve {approval_id}")
+
+    records = activity.tail(10, Category.APPROVAL)
+    assert any("approved" in r for r in records) == writes_activity
+
+
+def test_approve_plugin_message_unaffected_by_later_decision(tmp_path, monkeypatch):
+    """AC-17c: lock を抜けた後に別プロセスがこの approval を承認しても、
+    シェルは **自分の呼び出しが返した outcome** を報告する。lock 外で
+    `SELECT status` し直す実装 (v1.1 までの approve ハンドラ) では
+    「自分が下していない決定」を自分の結果として報告してしまう。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    (plugins_dir / ".locks").mkdir()
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    approval_id = approvals.create(
+        conn, kind="plugin",
+        payload={"name": "sma", "content_hash": "h1", "artifact_hash": "a1",
+                 "candidate_origin": "staging",
+                 "candidate_path": "plugins/_staging/1/sma"},
+        now=NOW)  # candidate_path のディレクトリを作らない → candidate_missing
+    real = plugin_switch.approve_candidate
+
+    def _then_competitor(*a, **kw):
+        outcome = real(*a, **kw)          # lock はここで解放される
+        # 競合者: 別コネクションで同じ approval を approved にする
+        conn2 = connect(tmp_path / "t.db")
+        approvals.apply_decision(conn2, approval_id, "approved",
+                                 decided_by="competitor", now=NOW, commit=True)
+        conn2.close()
+        return outcome
+
+    monkeypatch.setattr("agentic_fx.plugin.switch.approve_candidate",
+                        _then_competitor)
+
+    out = cmds.dispatch(f"approve {approval_id}")
+
+    # 逐語で見る。`"approved: " not in out` だけでは旧文言
+    # `approval #N approved` (コロン無し) と区別できない。
+    assert out == (
+        f"approval #{approval_id} は今回の操作では承認されませんでした "
+        f"(status=pending): approved になりませんでした (reason=candidate_missing)")
+    assert not any("approved" in r for r in activity.tail(10, Category.APPROVAL))
+
+
+def test_approve_plugin_fails_loud_on_unknown_outcome(tmp_path, monkeypatch):
+    """AC-17d: spy が `None` を返すと `エラー: ` で始まり、
+    接頭辞 (`approval #<id> ...`) は付かない (fail loud)。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / ".locks").mkdir(parents=True)
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    approval_id = _pending_plugin_approval(conn, "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.approve_candidate",
+                        lambda *a, **kw: None)
+
+    out = cmds.dispatch(f"approve {approval_id}")
+
+    assert out.startswith("エラー: ")
+    assert "approval #" not in out.split("\n")[0]
+
+
+def test_approve_plugin_fails_loud_on_unknown_enum_value(tmp_path, monkeypatch):
+    """AC-17d の対: **未知の enum 値**も文言にしない (fail loud)。`None` は
+    属性参照 (`outcome.outcome`) で落ちるだけなので `_approval_outcome_text`
+    末尾の `raise ValueError` までは届かない — この経路は文字列の網羅漏れ
+    (T9-M7) を狙う (`test_approval_retry_fails_loud_on_unknown_enum_value`
+    の approve 版)。"""
+    from types import SimpleNamespace
+    conn, _, _, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / ".locks").mkdir(parents=True)
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    approval_id = _pending_plugin_approval(conn, "sma")
+    monkeypatch.setattr(
+        "agentic_fx.plugin.switch.approve_candidate",
+        lambda *a, **kw: SimpleNamespace(outcome="brand_new_outcome", name="sma",
+                                         status="pending", op_id=1,
+                                         rolled_back_op_id=None, target=None,
+                                         reason=None))
+
+    out = cmds.dispatch(f"approve {approval_id}")
+
+    assert out.startswith("エラー: ")
+    assert "approval #" not in out.split("\n")[0]
+    assert "brand_new_outcome" in out
+
+
+def test_approve_plugin_outcome_text_is_shared_with_retry(tmp_path, monkeypatch):
+    """同じ `ApprovalOutcome` を `approve` 経路と `approval retry` 経路に流し、
+    接頭辞を除いた残りが 1 文字も違わないこと。文言生成の二重実装が入ると
+    red になる。"""
+    conn, _, _, cmds = _commands(tmp_path)
+    plugins_dir = tmp_path / "plugins"
+    (plugins_dir / ".locks").mkdir(parents=True)
+    cmds.plugins_root = plugins_dir
+    cmds.settings = SETTINGS
+    outcome = _fake_outcome()
+    approve_id = _pending_plugin_approval(conn, "sma")
+    monkeypatch.setattr("agentic_fx.plugin.switch.approve_candidate",
+                        lambda *a, **kw: outcome)
+
+    approve_out = cmds.dispatch(f"approve {approve_id}")
+
+    monkeypatch.setattr("agentic_fx.plugin.switch.retry_approval",
+                        lambda *a, **kw: outcome)
+
+    retry_out = cmds.dispatch("approval retry 99")
+
+    approve_text = approve_out[len(f"approval #{approve_id} approved: "):]
+    retry_text = retry_out[len("approval #99 を再試行しました: "):]
+    assert approve_text == retry_text
+
+
+def test_approve_non_plugin_kind_is_unchanged(tmp_path):
+    """§3.6.4: 非 plugin kind の approve は `approve_candidate` を通らず、
+    `approval #<id> approved` (逐語) + DB `approved` + activity `approved`
+    のまま (非 plugin 枝が巻き添えにならないことの pin)。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    aid = approvals.create(conn, "tech_plugin", {}, NOW)
+
+    out = cmds.dispatch(f"approve {aid}")
+
+    assert out == f"approval #{aid} approved"
+    row = conn.execute(
+        "SELECT status FROM approval_requests WHERE id=?", (aid,)).fetchone()
+    assert row["status"] == "approved"
+    assert any("approved" in r for r in activity.tail(10, Category.APPROVAL))

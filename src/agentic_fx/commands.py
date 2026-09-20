@@ -91,24 +91,27 @@ class Commands:
                         return ("plugin approval backend "
                                "(plugins_root/settings) が未配線です")
                     from agentic_fx.plugin import switch as plugin_switch
-                    plugin_switch.approve_candidate(
+                    # [switch-ops-hardening] T9 (設計書 §3.6、2026-09-20 裁定 R9):
+                    # `approve_candidate` は **plugin flock の内側で確定した**
+                    # `ApprovalOutcome` を返す。検収 m5 是正の「実際の到達状態を
+                    # 読み直して報告する」形は、lock を抜けた後の DB を読むため
+                    # **別プロセスの決定を自分の結果として報告しうる** (§3.6.1)。
+                    # retry と同じく、写すだけにする。未知 / None は文言にせず
+                    # 例外に落とす (fail loud)。
+                    outcome = plugin_switch.approve_candidate(
                         self.conn, approval_id, decided_by="shell",
                         now=self.clock.now(), plugins_root=self.plugins_root,
                         settings=self.settings, activity=self.activity)
-                    # 検収 m5 是正: `approve_candidate` は正常な主要経路として
-                    # non-pending 以外にも pending 留置で return しうる
-                    # (§5.1: legacy_plain_present / candidate_missing /
-                    # hash 不一致 / 未完ジャーナル)。旧稿は結果を確認せず
-                    # 無条件に「approved」と報告していた — 実際の到達状態を
-                    # 読み直して報告する。
-                    outcome = self.conn.execute(
-                        "SELECT status, reason FROM approval_requests WHERE id=?",
-                        (approval_id,)).fetchone()
-                    if outcome is None or outcome["status"] != "approved":
-                        status = outcome["status"] if outcome else "不明"
-                        reason = (outcome["reason"] if outcome else None) or "-"
-                        return (f"approval #{args[0]} は approved になりません"
-                               f"でした (status={status}, reason={reason})")
+                    text = self._approval_outcome_text(outcome)
+                    if outcome.outcome not in ("deployed", "deployed_after_rollback"):
+                        # 「今回の操作では」= status が既に `approved` の
+                        # 二重 approve (`already_decided`) でも文が矛盾しない
+                        # ようにするため (§3.6.3 / §3.6.5 の 1)。
+                        return (f"approval #{args[0]} は今回の操作では承認されません"
+                               f"でした (status={outcome.status}): {text}")
+                    self.activity.write(Category.APPROVAL, "approved",
+                                        f"#{args[0]} via shell", ref_id=args[0])
+                    return f"approval #{args[0]} approved: {text}"
                 else:
                     approvals.apply_decision(
                         self.conn, approval_id, "approved", decided_by="shell",
@@ -158,7 +161,7 @@ class Commands:
                 self.activity.write(Category.APPROVAL, "retry",
                                     f"#{approval_id} via shell", ref_id=str(approval_id))
                 return (f"approval #{approval_id} を再試行しました: "
-                        f"{self._retry_outcome_text(outcome)}")
+                        f"{self._approval_outcome_text(outcome)}")
             if cmd == "approval" and args and args[0] == "list" and len(args) <= 2:
                 # [switch-ops-hardening] T7 (設計書 §3.5): `approval retry <id>`
                 # の id を知るための一覧。**holdout / in_sample の数値は出さない**
@@ -358,10 +361,11 @@ class Commands:
     _APPROVAL_LIST_DEFAULT = 20
     _APPROVAL_LIST_MAX = 200
 
-    def _retry_outcome_text(self, outcome) -> str:
-        """[switch-ops-hardening] T5: `ApprovalOutcome` を文言に写す。
-        未知 / None はここで `ValueError` になり、`dispatch` の包括 `except`
-        が `エラー: ...` を返す (fail loud — 設計書 §3.5)。"""
+    def _approval_outcome_text(self, outcome) -> str:
+        """[switch-ops-hardening] T5 / T9: `ApprovalOutcome` を文言に写す
+        (`approve` / `approval retry` 共用)。未知 / None はここで
+        `ValueError` になり、`dispatch` の包括 `except` が `エラー: ...`
+        を返す (fail loud — 設計書 §3.5 / §3.6)。"""
         kind = outcome.outcome  # None なら AttributeError (fail loud)
         if kind in ("deployed", "deployed_after_rollback"):
             tail = f"配備まで完了しました (plugins/{outcome.name} → {outcome.target})"
