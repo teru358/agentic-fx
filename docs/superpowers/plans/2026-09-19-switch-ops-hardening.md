@@ -1,4 +1,4 @@
-# [switch-ops-hardening] 実装プラン v1.2 (設計書 = `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` v1.6 準拠)
+# [switch-ops-hardening] 実装プラン v1.2a (設計書 = `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` v1.6a 準拠)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (推奨) または superpowers:executing-plans で task ごとに実行すること。Step は
@@ -738,7 +738,9 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 - [ ] `uv run pytest tests/test_commands.py -q` が green。**書き換えた既存テストが 0 本**であることを、
       `git diff --stat tests/test_commands.py` が**追記のみ** (削除行 0) であることで確認する
       ([[spec-must-check-existing-guards]] — 検収は削除行から読む)
-- [ ] `uv run pytest tests/ -q` (フルスイート) が green。**基準は段 0 完了時の 4274 passed + 新規 6 本**
+- [ ] `uv run pytest tests/ -q` (フルスイート) が green。**基準 (v1.2a 訂正) は T9 着手前 4278 passed
+      → T9 後 4297 passed (+19。実測 `2f88df8` = 新規テスト関数 7 本、うち 2 本が 7 パラメタ化
+      (7×2=14) + 非パラメタ化 5 本 = 収集項目 19 件)**
 
 ### Step 9-d: 逆変異 (**リストは下限**)
 
@@ -831,6 +833,9 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 - [ ] **副作用の確認**: T10-M1 / M3 を当てたとき、**他のどのテストが red になるか**も記録する。
       もし既存テストが既に殺しているなら段 0 の「未 pin」判定が誤っていたことになるので申告する
       (段 0 は「同一コネクションなので観測できない」と判定済み)。
+- [ ] `uv run pytest tests/ -q` (フルスイート) が green。**基準 (v1.2a 訂正) は T9 後 4297 passed
+      → T10 後 4300 passed (+3、新規 3 本)**。実測 `4300 passed, 17 deselected` (2026-09-20、
+      HEAD `c1abf8d`)
 - [ ] commit: `test(switch-ops): 巻き戻しの commit が lock 内で完了していることを別コネクションで pin (T10、AC-9d)`
 
 ---
@@ -2771,6 +2776,7 @@ T5-M5 は本文が「受け取らず lock 外で読み直す (v1.1 の案)」と
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-20 | v1.2a | 1 周目 codex (terra/medium) の指摘を反映: **T9 Step 9-c と T10 のフルスイート基準値が 4274 / 4278 で混在していたのを訂正** — 正は **T9 着手前 4278 passed → T9 後 4297 (+19) → T10 後 4300 (+3)**、実測 `4300 passed, 17 deselected` (2026-09-20、HEAD `c1abf8d`)。段 0 完了時 4274 passed から T9/T10 着手前の 4278 passed への +4 は、未 pin 4 群を pin した `6e1d431` / `0e079ee` / `3952962` / `5cee9f5` (2026-09-20) による | 2026-09-20 [switch-ops-hardening] 1 周目 codex (terra/medium)、`tmp/review-20260920-soh/r1/codex-triage.md` | — |
 | 2026-09-19 | v1.0 | 初版 (T1〜T8、逆変異 12 件 + task ごとの表、隔離環境での実測記録つき) | 設計書 v1.4 の承認を受けた実装プラン化 | — |
 | 2026-09-20 | v1.2 | 設計書 v1.6 (ユーザー裁定 R9 / R10) に追随: **T9 (シェルの `approve <id>` も lock 内 outcome を文言に写す、`commands.py` のみ、逆変異 8 件)** と **T10 (巻き戻しの commit が lock 内で完了していることを別コネクションから pin、テストのみ、逆変異 3 件 = 段 0 の S0-54 / S0-55 / S0-75)** を新設。File Structure / Global Constraints (書き換え 0 本の宣言) / 受入条件表 / task 依存図 (T9 は T5・T7 と直列、T10 は T9 と並列) / T8 の確認項目を同時に更新。**T10 は本体コードを 1 行も変えない** — 現実装が既に lock 内 commit であることを設計書 §3.3.2 の全数表が記録している | `tmp/review-20260920-soh/stage0.md` §3 の未 pin 3 件と §6 の設計判断 2 点に対する 2026-09-20 ユーザー裁定 | — |
 | 2026-09-19 | v1.1 | 指揮者側の着手前検証 (専用 worktree `soh-preflight` で T1→T7 を 1 task ずつ実走) を反映: **全 task の `(予測)` red を実測の逐語へ置換** / **★未実測 7 件の逆変異を実走し全 KILLED** / **T3・T4 の task 分割が成立しないことを実測**し、付録 A の hunk 10〜12・16〜20 と新規テスト 4 本を T3 へ移す訂正を追加 (訂正後の中間段は `925 passed, 0 failed` を実測) / Step 3-c の「`test_runbook_post_gate_failure_...` が T3 で red」を訂正 (T5 の材料へ) / **付録 B・D を task 別に分割** (B-1/B-2・D-1/D-2) / 付録 A の hunk → task 表を新設 / **訂正を Step 3-a・3-b・4-a・5-a・5-b・5-c と T3 / T5 の見出し・受入条件表・task 依存図に落とした** (Step だけを追う実装者が v1.0 の分割に戻らないように) / **付録 D・E・F・G の diff ヘッダを相対パスへ統一** (絶対パスだと `patch` が "potentially dangerous file name" として拒否する) / フルスイート実測 (baseline `4224 passed` / 全適用後も同数) / `force_revert_op_id` と実プロセス競合の判断を追記 | 起草者が「未実測の申告」に挙げた 2・4・7・8・9 の解消。設計書は v1.5 へ (食い違い 3 件を全件プラン側の実測で採用) | — |
