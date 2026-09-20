@@ -1,4 +1,4 @@
-# [switch-ops-hardening] 実装プラン v1.3 (設計書 = `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` v1.7 準拠)
+# [switch-ops-hardening] 実装プラン v1.4 (設計書 = `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` v1.8 準拠)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (推奨) または superpowers:executing-plans で task ごとに実行すること。Step は
@@ -18,6 +18,10 @@ outcome** を返し、シェルはそれを文言に写すだけにする。(4) 
 頭から流し直す** (v1.3 = **T11**、設計書 §3.2 / R11。2 周目 `/code-review` #1 を probe で再現)。
 (9) **`afx plugin retire` の `UnresolvedJournalError` にも bless と同じ「次の 1 手」を添える**
 (v1.3 = **T12**、設計書 §3.4 / R12)。
+(10) **版 dir の hash 再照合を切替の要否にかかわらず通す** (v1.4 = **T13**、設計書 §3.7 / R14 / IV-7)。
+(11) **2 周目ローカル LLM の確定 2 件 (テスト欠落) を pin する** (v1.4 = **T14**、テストのみ)。
+**v1.4 では T11 の判定述語を 3 つ組 `(switch_required, old_kind, old_target)` に強め** (設計書 R13)、
+**判定を 1 箇所に統合した** (plain 分岐専用の hunk は不要になった)。
 
 **Architecture:** 変更は 3 ファイルに閉じる —
 `src/agentic_fx/plugin/switch.py` (分類器 / 2 段ガード / 0d 案 C / reconcile の lock +
@@ -55,8 +59,10 @@ v1.2 で追加する T9 / T10 はその上に積む。**
   ので可。**tool 応答・prompt・`docs/examples/plugins/` は届く**ので、そこに
   「codex」「レビュー r2」等を書かない
 - **`run_kind_gate` は raise しない**等の既存規約を変えない。gate の再実行も増やさない
-- **既存テストの書き換えは §7.1 の 4 本のみ** (下記 File Structure)。**T9 / T10 / T11 / T12 は既存テストを
-  1 本も書き換えない** (T11 は「前提が崩れていない再開」の挙動を変えない = **AC-16c-3 が回帰防止として pin する**。
+- **既存テストの書き換えは §7.1 の 4 本のみ** (下記 File Structure)。**T9 / T10 / T11 / T12 / T13 / T14 は
+  既存テストを 1 本も書き換えない** (T13 は `switch_required=1` の枝を 1 行も変えないので既存 pin
+  `tests/plugin/test_switch_paths.py:569` / `:1401` はそのまま。T14 は**既存テストに assert を足す**が、
+  既存の assert は 1 つも消さない) (T11 は「前提が崩れていない再開」の挙動を変えない = **AC-16c-3 が回帰防止として pin する**。
   T12 は CLI の `_plugin_retire` 失敗経路を踏む既存テストが 0 件 — 設計書 §8 で確認済)。
   T9 については `tests/test_commands.py::test_approve_plugin_kind_reports_actual_outcome_not_always_approved`
   が無改変で緑になる文言形を設計書 §3.6.3 が選んである。**red になったら黙って直さず、指揮者へ申告する**
@@ -89,14 +95,15 @@ v1.2 で追加する T9 / T10 はその上に積む。**
 
 | ファイル | 変更 | task |
 |---|---|---|
-| `src/agentic_fx/plugin/switch.py` | 分類器 / `_revert_under_lock` / reconcile の載せ替え / 2 段ガード / 0d 案 C / outcome / **再開の前提が崩れたときの巻き戻し (T11)** | T1〜T5・**T11** |
+| `src/agentic_fx/plugin/switch.py` | 分類器 / `_revert_under_lock` / reconcile の載せ替え / 2 段ガード / 0d 案 C / outcome / **再開の前提 (3 つ組) が崩れたときの巻き戻し (T11)** / **版 dir の hash 再照合を常に通す (T13)** | T1〜T5・**T11**・**T13** |
 | `src/agentic_fx/commands.py` | `approval retry` の結果報告 / `approval list` / `_HELP` / **`approve <id>` の結果報告 + `_retry_outcome_text` → `_approval_outcome_text` の改名** | T5・T7・**T9** |
 | `src/agentic_fx/backtest/cli.py` | `_plugin_bless` / `_plugin_materialize` の except / **`_plugin_retire` の except を 2 節に割る (T12)** | T6・**T12** |
-| `tests/plugin/test_switch_ops_hardening.py` | **新規** (AC-1〜AC-9c / **AC-9d** / AC-14d / AC-16a/b) + **追記 (AC-16c-1〜6)** | T1〜T5・**T10**・**T11** |
+| `tests/plugin/test_switch_ops_hardening.py` | **新規** (AC-1〜AC-9c / **AC-9d** / AC-14d / AC-16a/b) + **追記 (AC-16c-1〜8 / AC-19a〜d)** | T1〜T5・**T10**・**T11**・**T13** |
 | `tests/test_commands.py` | **追記** (AC-12 / AC-13 / AC-14a/b/d / **AC-17a〜d**) + **`:541` の spy を書き換え** | T5・T7・**T9** |
 | `tests/backtest/test_cli.py` | **追記** (AC-11 / **AC-18**) | T6・**T12** |
 | `tests/plugin/test_indicator_initial_set.py` | **2 本を書き換え** (retry の戻り文言 / CLI の traceback) | T3・T6 |
 | `tests/plugin/test_reconcile.py` | **1 本を書き換え** (lock 取得列に巻き戻しの 1 本が増える) | T4 |
+| `tests/plugin/test_switch_paths.py` | **既存 2 本に pin を 1 行ずつ「追加」+ 1 本を新規追加** (T2-01 / T2-02)。**既存の assert は 1 つも消さない・変えない**ので §7.1 の「書き換え 4 本」には数えない (設計書 AC-15 の注) | **T14** |
 | `docs/operations/indicator-initial-set-deploy-2026-09-19.md` | runbook 改訂 (設計書 §7.2) | T8 |
 | `docs/superpowers/specs/2026-08-16-phase2-10-improve-loop-design.md` | §5.1-1 に 1 段落追記 | T8 |
 
@@ -118,8 +125,10 @@ dependency_locks` も red になった** — 下記「spec と食い違った点
 | AC-12a/b/c / AC-13 | T7 | `tests/test_commands.py` の `approval list` 群 |
 | AC-15 | T8 | フルスイート |
 | **AC-9d** (巻き戻しの commit が lock 内) | **T10** | `test_ac9d_reconcile_revert_is_durable_from_another_connection` / `test_ac9d_revert_is_committed_before_the_lock_is_released` / `test_ac9d_retry_rollback_is_durable_before_pending_return` |
-| **AC-16c-1〜AC-16c-6** (再開の前提が崩れたら巻き戻して新 `op_id`) | **T11** | `test_ac16c1_resume_with_stale_switch_required_rolls_back_and_redeploys` / `test_ac16c2_reverse_stored_zero_recomputed_true_rolls_back` / `test_ac16c3_resume_without_drift_reuses_the_same_op_id` / `test_ac16c4_precondition_change_leaves_a_dedicated_activity_event` / `test_ac16c5_resume_rollback_is_committed_inside_the_lock` / `test_ac16c6_plain_branch_closes_its_own_unfinished_journal` |
+| **AC-16c-1〜AC-16c-8** (再開の前提 (3 つ組) が崩れたら巻き戻して新 `op_id`) | **T11** | `test_ac16c1_resume_with_stale_switch_required_rolls_back_and_redeploys` / `test_ac16c2_reverse_stored_zero_recomputed_true_rolls_back` / `test_ac16c3_resume_without_drift_reuses_the_same_op_id` / `test_ac16c4_precondition_change_leaves_a_dedicated_activity_event` / `test_ac16c5_resume_rollback_is_committed_inside_the_lock` / `test_ac16c6_plain_branch_closes_its_own_unfinished_journal` |
 | **AC-18** (retire の「次の 1 手」) | **T12** | `test_plugin_retire_unresolved_journal_is_rc1_with_next_step` |
+| **AC-19a〜AC-19d** (版 dir の照合を常に通す、IV-7) | **T13** | `test_ac19a_switch_not_required_verifies_version_dir_before_deciding` / `test_ac19b_verification_runs_before_finalize` / `test_ac19c_same_candidate_reapproval_still_succeeds` / `test_ac19d_bless_raises_when_version_dir_is_tampered` |
+| (2 周目ローカル LLM T2-01 / T2-02、AC 番号なし) | **T14** | `tests/plugin/test_switch_paths.py` の 2 本に `assert outcome.status == "pending"` + `snapshot_invalid` 版の未完 journal クローズ 1 本 |
 | **AC-17a / AC-17b / AC-17c / AC-17d** (approve の outcome 報告) | **T9** | `test_approve_plugin_reports_the_locked_outcome` / `test_approve_plugin_writes_activity_only_when_deployed` / `test_approve_plugin_message_unaffected_by_later_decision` / `test_approve_plugin_fails_loud_on_unknown_outcome` |
 
 ## task 依存図
@@ -141,13 +150,19 @@ T1 (分類器 + ApprovalOutcome の型を置く、挙動不変)
  │              │
  │              ├─► T10 (**v1.2 新設** — AC-9d の pin。**テストのみ**、T9 と並列可)
  │              │
- │              └─► T11 (**v1.3 新設** — 再開の前提が崩れたら巻き戻して新 op_id。switch.py + 新規テスト)
+ │              └─► T11 (**v1.3 新設 / v1.4 で述語を 3 つ組へ** — 再開の前提が崩れたら巻き戻して新 op_id)
+ │                   │
+ │                   └─► T13 (**v1.4 新設** — 版 dir の hash 再照合を常に通す。同じ switch.py なので直列)
  │
  ├─► T6 (CLI の except)        ← 独立、並列可
  │    │
  │    └─► T12 (**v1.3 新設** — retire の「次の 1 手」。`cli.py` なので T6 と同ファイル → 直列)
  │
-T8 (runbook / 設計書追記 / フルスイート)   ← 全 task の後 (T9 / T10 / T11 / T12 を含む)
+ │
+ ├─► T14 (**v1.4 新設** — テストのみ。`tests/plugin/test_switch_paths.py` だけなので **T13 の後**に置く
+ │        = T11/T13 で対象の行番号が動くため、関数名・分岐名で特定する)
+ │
+T8 (runbook / 設計書追記 / フルスイート)   ← 全 task の後 (T9〜T14 を含む)
 ```
 
 - **T1〜T5 は同じ `switch.py` の同じ領域を触るので 1 レーン直列。**
@@ -161,6 +176,9 @@ T8 (runbook / 設計書追記 / フルスイート)   ← 全 task の後 (T9 / 
   **T1〜T10 完了後に積む**。**T9 / T10 とはファイルが重なる** (`tests/plugin/test_switch_ops_hardening.py` を
   T10 と共有) ので **T10 の後に直列**で置く。T12 とは重ならないので **T11 ∥ T12 は並列可**。
 - **T12 は T6 の後**。`backtest/cli.py` の同じ領域を触る。
+- **T13 は T11 の後**。同じ `_advance_to_decided` / `approve_candidate` を触るので 1 レーン直列。
+- **T14 は T13 の後**。テストのみだが、**T11 / T13 で `switch.py` の行番号が動く**ので、
+  対象を**関数名・分岐名・`reason` 値**で特定する書き方にすること (行番号で書かない)。
 
 ## T1: live の分類器 + reconcile の載せ替え (挙動不変)
 
@@ -858,9 +876,9 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 
 ---
 
-## T11: 再開の前提が崩れていたら巻き戻して新しい `op_id` で流し直す (v1.3 新設)
+## T11: 再開の前提が崩れていたら巻き戻して新しい `op_id` で流し直す (v1.3 新設、**v1.4 で述語を 3 つ組へ**)
 
-**担当**: 設計書 §3.2「#### 再開の前提が崩れていたら…」/ §0 R11 / AC-16c-1〜6。
+**担当**: 設計書 §3.2「#### 再開の前提が崩れていたら…」/ §0 R11 + **R13** / AC-16c-1〜8。
 **出所**: 2 周目 `/code-review high` の指摘 #1。**指揮者側の probe で再現済み**
 (`tmp/review-20260920-soh/r2/cr1-probe.md`、probe 本体
 `tmp/review-20260920-soh/r2/cr1-probe/test_probe_cr1.py` = `4 passed`)。
@@ -904,6 +922,15 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
       | `recorded` | `versioned` |
       | `switched` | `recorded` |
 
+- [ ] **⚠ この対応表が使えるのは `switch_required=1` の行だけ** (v1.4 の追記)。
+      **`switch_required=0` の行は `advance(switched)` を一度も呼ばない**
+      (`_advance_to_decided` の `if switch_required:` の内側にしかない) ので、
+      **`_fail_advance_at("switched")` では止まらず最後まで完走してしまう**。
+      `switch_required=0` の行を `recorded` で止めるには **`_finalize_decision` を落とす**
+      (probe `test_probe_cr1.py:202` の `_boom` がその形)。
+      → **テスト 1 / 3 / 6 (すべて `switch_required=1`) は上の対応表どおり、
+      テスト 2 (`switch_required=0`) だけが別の止め方**になる。**取り違えると恒真テストになる**
+
       probe の実測では、停止 phase が `preparing` / `versioned` のときは **1 回目の retry が
       `recorded` まで前進してからそこで落ちる**ので、**3 通りとも同じ吸収状態**
       (`recorded` / `switch_required=1` / 非終端 1 本 / approval `pending`) に収束する
@@ -918,11 +945,13 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
 | # | テスト名 | AC | 作り | 観測 (= assert) |
 |---|---|---|---|---|
 | 1 | `test_ac16c1_resume_with_stale_switch_required_rolls_back_and_redeploys` (**3 parametrize**) | AC-16c-1 | `_stopped_before` で 3 通りに止める → `_third_party_points_live_at(root, new_target)` → `retry_approval` を **1 回** | `_status(conn, aid) == "approved"` / `_rows(conn)` が **2 行** (停止行 `reverted` + 新 `op_id` が `decided`) / 新行の `old_kind == "symlink"` かつ `old_target == new_target` かつ `switch_required == 0` / `live.readlink().as_posix() == new_target` (**不変**) / 戻り値 `outcome.outcome == "deployed_after_rollback"` かつ `outcome.rolled_back_op_id == 停止行の op_id` かつ `outcome.op_id == 新 op_id` |
-| 2 | `test_ac16c2_reverse_stored_zero_recomputed_true_rolls_back` | AC-16c-2 | probe の `test_probe_c_*` と同じ組み立て — **同一候補を再 bless して `switch_required=0` の行を作り、`_finalize_decision` を `_boom` (probe `:202`) で落として `recorded` で止める** → live を外から**消す** → `retry_approval` | 新行の `switch_required == 1` / `live` が `new_target` を指す symlink になる / `_status == "approved"` / `_rows` が 2 行 |
-| 3 | `test_ac16c3_resume_without_drift_reuses_the_same_op_id` | **AC-16c-3 (回帰防止)** | `_stopped_before(..., "switched", "recorded")` で止め、**live を一切触らずに** `retry_approval` | `_rows(conn)` が **1 行だけ**で、その `op_id` が**停止行と同じ**かつ `phase == "decided"` / `outcome.outcome == "deployed"` / `outcome.rolled_back_op_id is None` / activity に `switch_resume_precondition_changed` が **1 件も無い** |
+| 2 | `test_ac16c2_reverse_stored_zero_recomputed_true_rolls_back` (**3 parametrize**、v1.4) | AC-16c-2 | **まず `switch_required=0` の行を作る** — 1 本目の候補を配備して live を `.versions/<name>/<hash>` へ向け、**同一候補を再 bless / 再 approve** する (これで `old_kind='symlink'` かつ `old_target == new_target` = `switch_required=0`)。**停止のさせ方は phase ごとに違う (下の注を読むこと)**: `preparing` ← `_fail_advance_at("versioned")` / `versioned` ← `_fail_advance_at("recorded")` / `recorded` ← **`_finalize_decision` を `_boom` で落とす** (probe `:202` の形)。そのあと live を外から**消す** → `retry_approval` | 新行の `switch_required == 1` / `live` が `new_target` を指す symlink になる / `_status == "approved"` / `_rows` が 2 行 |
+| 3 | `test_ac16c3_resume_without_drift_reuses_the_same_op_id` (**3 parametrize**、v1.4) | **AC-16c-3 (回帰防止)** | **3 通り**で止め、**live を一切触らずに** `retry_approval` | `_rows(conn)` が **1 行だけ**で、その `op_id` が**停止行と同じ**かつ `phase == "decided"` / `outcome.outcome == "deployed"` / `outcome.rolled_back_op_id is None` / activity に `switch_resume_precondition_changed` が **1 件も無い** |
 | 4 | `test_ac16c4_precondition_change_leaves_a_dedicated_activity_event` | AC-16c-4 | 1 と同じ状態 (`fail_phase="switched"` の 1 通りでよい) | activity 行に `switch_resume_precondition_changed` が **1 本**あり、`name=` / `op_id=<停止行>` / `phase=recorded` / `stored_switch_required=1` / `recomputed=0` を含む。**その直後の行が `switch_reverted`** (= 2 行になる。「ちょうど 1 行」と書かない) / 停止行は最終的に `reverted` の**まま** |
 | 5 | `test_ac16c5_resume_rollback_is_committed_inside_the_lock` | AC-16c-5 (IV-6) | 1 と同じ状態 + T10 の `_plugin_lock` spy (`finally` で**実 lock を解放する前に**別コネクションから読む)。**spy は `_stopped_*` の中の bless でも発火する** (そのとき停止行はまだ存在せず観測は `None`) ので、**`retry_approval` の呼び出し中に取れた観測だけを見る** (spy を仕掛けるのを retry の直前にするか、`seen` を retry 前にクリアする) | 解放直前の観測が `"reverted"` / かつ `grep` 相当の静的確認として `_revert_one(` の呼び出し元が **5 箇所のまま** (テストではなく Step 11-e のチェック項目で見る) |
-| 6 | `test_ac16c6_plain_branch_closes_its_own_unfinished_journal` | AC-16c-6 (T11-A) | `_stopped_before(..., "switched", "recorded")` で止め、live symlink を**削除して同名の plain ディレクトリを置く** → `retry_approval` | `outcome.outcome == "legacy_plain_present"` (**文言もフィールドも不変**) / `journal_store.list_non_terminal(conn)` が **空** / 続けて `bless_candidate` (または別 approval の `approve_candidate`) を呼んでも `UnresolvedJournalError` に**ならない** |
+| 6 | `test_ac16c6_plain_branch_closes_its_own_unfinished_journal` (**3 parametrize**、v1.4) | AC-16c-6 | **3 通り**で止め、live symlink を**削除して同名の plain ディレクトリを置く** → `retry_approval` | `outcome.outcome == "legacy_plain_present"` (**文言もフィールドも不変**) / `journal_store.list_non_terminal(conn)` が **空** / 続けて `bless_candidate` (または別 approval の `approve_candidate`) を呼んでも `UnresolvedJournalError` に**ならない** |
+| 7 | `test_ac16c7_crash_between_rollback_commit_and_new_journal_converges` (**v1.4、codex r5 #4**) | AC-16c-7 | 1 と同じ状態 (`fail_phase="switched"` の 1 通りでよい) + **`begin_switch_journal` を 1 回だけ例外にする** monkeypatch → `retry_approval` (例外が上がる) → patch を外して **もう 1 回** `retry_approval` | 1 回目の直後: 停止行が **`reverted`**、`journal_store.list_non_terminal(conn)` が **空**、approval `pending`、live 不変。2 回目の後: `_rows(conn)` が **2 行** (旧 `reverted` + 新 `decided`)、approval `approved`、**`outcome.outcome == "deployed"` かつ `outcome.rolled_back_op_id is None`** (巻き戻したのは前回の呼び出しなので、今回は巻き戻していない) |
+| 8 | `test_ac16c8_old_target_drift_is_detected` (**v1.4、R13 の主 killer**) | AC-16c-8 | `_stopped_before(..., "switched", "recorded")` で **`old_kind='symlink'` の行**を作り (= 先に別の版を配備してから 2 本目の候補を approve する)、第三者が live を **`old_target` でも `new_target` でもない第 3 の先 `Y`** へ張り替える → `retry_approval` | **保存も再計算も `switch_required=1` のまま**なのに巻き戻しが起きること: `_rows` が **2 行** (旧 `reverted` + 新 `decided`)、**新しい行の `old_target == Y`** (`journal_store.get` で読む)、`outcome.outcome == "deployed_after_rollback"`、live は `new_target`。**`switch_required` だけを比べる v1.7 の述語では巻き戻しが起きず 1 行のまま**なので、この 1 本が R13 の存在理由 |
 
 - [ ] red の出力 (最終行) を逐語で貼る。**1 / 2 は `ValueError` で red になるはず** (probe と同じ文言:
       `op_id=N: _finalize_decision expects phase='switched' but found 'recorded'` /
@@ -937,36 +966,45 @@ def _revert_under_lock(conn: sqlite3.Connection, row: dict, *, plugins_root: Pat
       **既存の 3 つの呼び出し元 (`candidate_missing` / `snapshot_invalid` / `hash_mismatch`) は
       戻り値を使わないので 1 文字も変えない。** docstring の
       「**switched のうち `not_switched` は 0d-2c が既に閉じて…**」の段落に
-      「**v1.7: 再開の前提 (`switch_required`) が崩れた行と、live が plain に化けた行もここで閉じる**」を足す
-- [ ] **hunk 2 (T11-A)** — `if old_kind == "plain":` (`:1702`) のブロックの**先頭**で
-      `_close_own_unfinished_journal_if_any()` を呼ぶ。**戻り値は使わない**。
-      `return ApprovalOutcome(outcome="legacy_plain_present", ...)` は**そのまま**
-- [ ] **hunk 3 (T11-B)** — `switch_required = not (...)` (`:1719`) の**直後**、
-      `if op_id is None:` (`:1721`) の**直前**に:
+      「**v1.7 / v1.8: 再開の前提 (3 つ組) が崩れた行もここで閉じる**」を足す
+- [ ] **hunk 2 (判定、v1.8 で 1 箇所に統合)** — `new_target` (`:1717`) と `switch_required` (`:1719`) の
+      **2 行を `old_kind` / `old_target` を読んだ直後 (`:1700` の直後) へ繰り上げ**、
+      その下・`if old_kind == "plain":` (`:1702`) の**直前**に判定を置く。
+      **v1.7 が持っていた plain 分岐専用の hunk は不要**(`old_kind` の不一致として自動的に拾われる、設計書 §3.2):
 
       ```python
-      if (op_id is not None
-              and bool(existing_journal["switch_required"]) != switch_required):
-          # [switch-ops-hardening] T11 (設計書 §3.2): 再開の前提が resume
-          # 時点で崩れている — 保存された switch_required は作成時の live
-          # から計算された値で、store 層に更新 API は無い。同じ行を使い回すと
-          # 「切替の要否・実際の切替・finalize の期待 phase」が別々の値を見て
-          # 詰まる (2 周目 /code-review #1、probe で再現)。0d-2c と同形に、
-          # 停止行を巻き戻して閉じ、新しい op_id で頭から流し直す。
+      if op_id is not None and (
+              bool(existing_journal["switch_required"]),
+              existing_journal["old_kind"],
+              existing_journal["old_target"]) != (
+                  switch_required, old_kind, old_target):
+          # [switch-ops-hardening] T11 (設計書 §3.2 / R13): 再開の前提が
+          # resume 時点で崩れている。journal の (switch_required, old_kind,
+          # old_target) は**行の作成時**の live から決まった値で、store 層に
+          # 更新 API は無い。同じ行を使い回すと (i)「切替の要否・実際の切替・
+          # finalize の期待 phase」が別々の値を見て詰まり、(ii) old_target が
+          # 古いままなので後の巻き戻しが第三者の変更を上書きして戻す。
+          # 0d-2c と同形に、停止行を巻き戻して閉じ、新しい op_id で頭から
+          # 流し直す。live が plain に化けた場合も old_kind の不一致として
+          # ここで拾われる (journal の old_kind は absent/symlink のみ)。
           if activity is not None:
               activity.write(
                   Category.APPROVAL, "switch_resume_precondition_changed",
                   f"name={name} op_id={op_id} "
                   f"phase={existing_journal['phase']} "
-                  f"stored_switch_required="
-                  f"{int(bool(existing_journal['switch_required']))} "
-                  f"recomputed={int(switch_required)}")
+                  f"stored=({int(bool(existing_journal['switch_required']))},"
+                  f"{existing_journal['old_kind']},"
+                  f"{existing_journal['old_target']}) "
+                  f"now=({int(switch_required)},{old_kind},{old_target})")
           closed = _close_own_unfinished_journal_if_any()
           if closed is not None:
               rolled_back_op_id = closed
               op_id = None
       ```
 
+- [ ] **繰り上げが挙動を変えないことを確認する** — `new_target` / `switch_required` は
+      plain 分岐では**使われない** (plain 分岐は `artifact_hash` しか使わない) ので、
+      計算位置を上げても観測される挙動は変わらない。**変わったら申告**
 - [ ] **activity は helper の前に書く** (ログが因果の順に読める)。
       **`closed is None` の枝は足さない** — 到達不能で、万一そうなっても T2 の入口ガードが
       FS より前に `ValueError` で止める (fail closed、設計書 §3.2)
@@ -992,15 +1030,18 @@ uv run pytest tests/test_commands.py tests/plugin/test_indicator_initial_set.py 
 
 | # | ファイル / 箇所 | 置換前 | 置換後 | red になるテスト |
 |---|---|---|---|---|
-| T11-M1 | `switch.py` hunk 3 | `if (op_id is not None and bool(existing_journal["switch_required"]) != switch_required):` | `if False:` (判定ごと落とす = 現行に戻す) | `test_ac16c1_*` (3 通りとも `ValueError`) / `test_ac16c2_*` |
-| T11-M2 (**「常に巻き戻す」への退化を殺す**) | `switch.py` hunk 3 | 同上 | `if op_id is not None:` (食い違いを見ずに必ず巻き戻す) | **`test_ac16c3_resume_without_drift_reuses_the_same_op_id`**。**「これだけが殺す」は未実測** — `tests/plugin/test_switch_paths.py:677 / :1119 / :1160` も行数や `op_id` を pin していれば同時に red になりうる。**Step 11-e の副作用確認で全数を記録すること** |
-| T11-M3 | `switch.py` hunk 3 | `op_id = None` | (この 1 行を削る) | `test_ac16c1_*` (停止行が `reverted` のまま再利用され、T2 の入口ガードが `ValueError`。journal は 1 行・`reverted`・live 不変で終わる) |
-| T11-M4 | `switch.py` hunk 3 | `rolled_back_op_id = closed` | (この 1 行を削る) | `test_ac16c1_*` (`outcome.outcome` が `deployed` に化け、`rolled_back_op_id is None` になる) |
+| T11-M1 | `switch.py` hunk 2 | 判定の `if` 全体 | `if False:` (判定ごと落とす = 現行に戻す) | `test_ac16c1_*` (3 通りとも `ValueError`) / `test_ac16c2_*` / `test_ac16c6_*` |
+| T11-M2 (**「常に巻き戻す」への退化を殺す**) | `switch.py` hunk 2 | 同上 | `if op_id is not None:` (食い違いを見ずに必ず巻き戻す) | **`test_ac16c3_resume_without_drift_reuses_the_same_op_id`**。**「これだけが殺す」は未実測** — `tests/plugin/test_switch_paths.py:677 / :1119 / :1160` も行数や `op_id` を pin していれば同時に red になりうる。**Step 11-e の副作用確認で全数を記録すること** |
+| T11-M3 | `switch.py` hunk 2 | `op_id = None` | (この 1 行を削る) | `test_ac16c1_*` (停止行が `reverted` のまま再利用され、T2 の入口ガードが `ValueError`。journal は 1 行・`reverted`・live 不変で終わる) |
+| T11-M4 | `switch.py` hunk 2 | `rolled_back_op_id = closed` | (この 1 行を削る) | `test_ac16c1_*` (`outcome.outcome` が `deployed` に化け、`rolled_back_op_id is None` になる) |
 | T11-M5 | `switch.py` hunk 1 | `_close_own_unfinished_journal_if_any` の中の `_revert_one(...)` | 削除 (行を閉じずに `op_id` だけ返す) | `test_ac16c1_*` (停止行が非終端のまま残り、`begin_switch_journal` が部分 UNIQUE index に当たって `IntegrityError`) |
 | T11-M6 | `switch.py` hunk 1 | `_close_own_unfinished_journal_if_any` の中の `conn.commit()` | 削除 | `test_ac16c5_resume_rollback_is_committed_inside_the_lock` (別コネクションから `reverted` が見えない) |
-| T11-M7 | `switch.py` hunk 2 (T11-A) | plain 分岐先頭の `_close_own_unfinished_journal_if_any()` | 削除 | `test_ac16c6_*` (非終端が 1 本残り、続く `bless` が `UnresolvedJournalError`) |
-| T11-M8 | `switch.py` hunk 3 | `activity.write(..., "switch_resume_precondition_changed", ...)` のブロック | 削除 | `test_ac16c4_*` |
-| T11-M9 | `switch.py` hunk 3 | `bool(existing_journal["switch_required"]) != switch_required` | `existing_journal["switch_required"] != switch_required` (`bool()` を落とす) | **等価変異と予想する (要実測)**。`sqlite3` は `switch_required` を `int` (0/1) で返し、Python では `1 != True` も `0 != False` も `False` なので、**`bool()` の有無で判定は変わらない**。**等価なら「殺せない変異」として記録し、`bool()` は可読性のために残す**と明記する ([[mutation-testing]] の規律 — 等価変異を無理に殺さない) |
+| T11-M7 (**v1.4 で意味が変わった**) | `switch.py` hunk 2 | 判定を `if old_kind == "plain":` の**後ろ**へ動かす (= v1.7 の配置に戻す) | 同上 | `test_ac16c6_*` (plain のケースだけ判定に届かず、非終端が 1 本残って続く `bless` が `UnresolvedJournalError`) |
+| **T11-M10 (v1.4、R13)** | `switch.py` hunk 2 | 3 つ組の比較 | **`switch_required` だけ**比較する (v1.7 の述語に戻す) | `test_ac16c6_*` (plain は `switch_required` が両方 `True` になり得て判定をすり抜ける) + **`test_ac16c8_old_target_drift_is_detected`** (下記 8 本目) |
+| **T11-M11 (v1.4、R13)** | `switch.py` hunk 2 | 同上 | **`old_kind` だけ**比較する | `test_ac16c1_*` / `test_ac16c8_*` |
+| **T11-M12 (v1.4、R13)** | `switch.py` hunk 2 | 同上 | **`old_target` だけ**比較する | `test_ac16c2_*` (`absent`↔`symlink` で `old_target` が両方 `None` になるケース) |
+| T11-M8 | `switch.py` hunk 2 | `activity.write(..., "switch_resume_precondition_changed", ...)` のブロック | 削除 | `test_ac16c4_*` |
+| T11-M9 | `switch.py` hunk 2 | `bool(existing_journal["switch_required"]) != switch_required` | `existing_journal["switch_required"] != switch_required` (`bool()` を落とす) | **等価変異と予想する (要実測)**。`sqlite3` は `switch_required` を `int` (0/1) で返し、Python では `1 != True` も `0 != False` も `False` なので、**`bool()` の有無で判定は変わらない**。**等価なら「殺せない変異」として記録し、`bool()` は可読性のために残す**と明記する ([[mutation-testing]] の規律 — 等価変異を無理に殺さない) |
 | T11-M10 | `switch.py` `_finalize_decision` | `expected_phase = "switched" if guard_row["switch_required"] else "recorded"` | `expected_phase = guard_row["phase"]` (**ガードを緩める = 案 1 への退化**) | 既存 `test_ac16a_finalize_guard_refuses_wrong_phase` (T2)。**T11 でガードを緩めていないことの確認**として毎回回す |
 
 - [ ] 各変異は `cp` 退避 → 適用 → 該当テストで red を逐語確認 → 復元。
@@ -1080,6 +1121,177 @@ uv run pytest tests/test_commands.py tests/plugin/test_indicator_initial_set.py 
 
 ---
 
+## T13: 版 dir の hash 再照合を切替の要否にかかわらず通す (v1.4 新設、R14)
+
+**担当**: 設計書 §3.7 / §0 R14 / IV-7 / AC-19a〜d。
+**出所**: codex sol 設計レビュー r5 #3 (= 指揮者の問い 6 への回答) + 2026-09-20 ユーザー裁定。
+**T11 と同じ `switch.py` の同じ関数群を触るので T11 → T13 の直列。**
+
+**この task で変える挙動**: `_advance_to_decided` が `_finalize_decision` を呼ぶ**前**に、
+**切替の要否にかかわらず** `new_target` の版 dir の中身を照合する。
+**`switch_required=1` の枝の扱いは 1 行も変えない** (既存 pin `tests/plugin/test_switch_paths.py:569` / `:1401`)。
+
+**設計を変えない。** **修復 (候補からの版の作り直し) はしない** — 裁定の文言は「pending 留置」。
+新しい outcome も新しい `reason` も作らない (既存の `still_pending(reverify_failed)` に合流)。
+
+### Step 13-a: テストを置いて red を確認する
+
+| # | テスト名 | AC | 作り | 観測 |
+|---|---|---|---|---|
+| 1 | `test_ac19a_switch_not_required_verifies_version_dir_before_deciding` | AC-19a | **同一候補の再 approve で `switch_required=0` の状態**を作る (live が既に `.versions/<name>/<artifact_hash>` を指す) → **版 dir の `plugin.py` を in-place 編集** (`os.chmod` で書けるようにしてから書き換え、`create_version_dir` は 0500/0400 で作る) → `approve_candidate` | approval が **`pending`** / 戻り値が **`still_pending`** かつ `reason == "reverify_failed"` / **非終端 journal が 0 本** (名前が凍らない) / **live は不変** |
+| 2 | `test_ac19b_verification_runs_before_finalize` | AC-19b | 1 と同じ状態 + `_finalize_decision` を spy | spy が **1 度も呼ばれない** |
+| 4 | `test_ac19c_same_candidate_reapproval_still_succeeds` | AC-19c (**正常系の回帰**) | 版 dir を**触らずに**同一候補を再 approve / 再 bless | 従来どおり `approved` / outcome `deployed` / journal `switch_required=0` が `recorded` → `decided` |
+| 5 | `test_ac19d_bless_raises_when_version_dir_is_tampered` | AC-19d | 1 と同じ改竄を作ってから `afx plugin bless` (CLI) | **rc=1** / stderr に `content_hash mismatch` / **traceback が出ない** / **未終端行が 1 本残る** (設計どおりの残余、§3.7.3) / そのあと `approval list` に出て `reject` で閉じられる |
+
+- [ ] red の最終行を逐語で貼る。**1 / 2 / 5 は現行では red** (照合を通らず `approved` になる)。
+      **4 は実装前から green** (回帰防止) — green のまま置くことを明示する
+- [ ] **新しいテストは書かない項目が 1 つある** — `switch_required=1` 枝の `RuntimeError` は
+      既存 `tests/plugin/test_switch_paths.py:569` / `:1401` が pin 済なので、
+      **Step 13-c のチェック項目として「無改変で緑」を確認するだけ**にする (AC-19b の後半)
+
+### Step 13-b: 実装を転写する (`switch.py` の 2 hunk)
+
+- [ ] **hunk 1** — `_advance_to_decided` (`:1288-1360`):
+      - `new_target = f".versions/{name}/{artifact_hash}"` (`:1335`) を **`if switch_required:` の外**へ出す
+      - `if switch_required:` ブロックは**切替まで**を担当し、`_version_dir_hashes_ok` の照合 (`:1348-1358`) を
+        ブロックの**外**、`_finalize_decision` (`:1359`) の**直前**へ移す
+      - **`switch_required=1` の不一致は現行どおり `RuntimeError`**、
+        **`switch_required=0` の不一致は `return False`**
+      - 関数の戻り値を `-> None` → **`-> bool`** に変え、末尾を `_finalize_decision(...)` → `return True` にする
+
+      ```python
+      # (骨子。逐語は実装時に現物へ合わせ、機械 diff で確認する)
+      new_target = f".versions/{name}/{artifact_hash}"
+      if switch_required:
+          if current_idx < _PHASE_ORDER.index("switched"):
+              advance_switch_journal(conn, op_id, phase="switched", now=now, commit=True)
+          switch_live(plugins_root, name, new_target=new_target, op_id=op_id)
+
+      # [switch-ops-hardening] T13 (設計書 §3.7 / R14 / IV-7): 切替の要否に
+      # かかわらず、decide の前に版 dir の中身を照合する。switch_required=0 の
+      # 枝では版 dir が「この回に作ったもの」ではなく「既に在ったもの」
+      # (create_version_dir は同 artifact_hash の dir があれば中身を作り直さ
+      # ない — version_store.py:84-86) なので、照合が無いと第三者の in-place
+      # 編集を無検証で approved にしてしまう。
+      resolved_after = (plugins_root / new_target).resolve()
+      if not _version_dir_hashes_ok(
+              resolved_after, content_hash=content_hash, artifact_hash=artifact_hash):
+          if switch_required:
+              # 行は switched。reconcile / 0d-2a の _reverify_switched_journal に
+              # 自動収束経路があるので、現行どおり送出する (既存 pin)。
+              raise RuntimeError(
+                  f"plugin {name!r}: live content_hash mismatch after switch "
+                  f"(expected content_hash={content_hash} "
+                  f"artifact_hash={artifact_hash})")
+          # 行は recorded。reconcile は非 switched 行を飛ばすので、ここで
+          # 送出すると名前が凍る。呼び出し元に処置を委ねる (§3.7.2)。
+          return False
+
+      _finalize_decision(conn, approval_id, op_id=op_id, decided_by=decided_by, now=now)
+      return True
+      ```
+
+- [ ] **RuntimeError の文言は 1 文字も変えない** — 既存 pin が
+      `pytest.raises(RuntimeError, match="content_hash mismatch")` で部分一致している
+- [ ] **hunk 2** — 呼び出し元 2 箇所:
+      - `approve_candidate` (`:1728-1733`): `if not _advance_to_decided(...):` →
+        `_close_own_unfinished_journal_if_any()` → `return ApprovalOutcome(outcome="still_pending",
+        name=name, status="pending", op_id=op_id, rolled_back_op_id=rolled_back_op_id,
+        reason="reverify_failed")`
+      - `bless_candidate` (`:2080-2085`): `if not _advance_to_decided(...): raise RuntimeError(...)`
+        (文言は上と同形。**行は閉じない** — 設計どおりの残余、§3.7.3)
+- [ ] **AC-14d が緑のままであることを確認する** — 足した `return` は **outcome を返す return** なので
+      bare `return` の検査には掛からない。掛かったら**黙って直さず申告**
+
+### Step 13-c: green + 副作用の確認
+
+```
+uv run pytest tests/plugin/test_switch_ops_hardening.py -q
+uv run pytest tests/plugin/test_switch_paths.py tests/plugin/test_switch_journal.py tests/plugin/test_history_git.py -q
+uv run pytest tests/plugin/test_indicator_initial_set.py tests/test_commands.py -q
+```
+
+- [ ] **既存の `switch_required=1` の pin 2 本** (`tests/plugin/test_switch_paths.py:569` / `:1401`) が
+      **無改変で緑**
+- [ ] **`test_runbook_post_gate_failure_converges_via_approval_retry` の手順 5 (2 回目の bless)** が
+      **無改変で緑** (= `switch_required=0` の正常系が照合を通る)
+- [ ] `tests/plugin/test_switch_ops_hardening.py:513` (`_advance_to_decided` を直接呼ぶ AC-16a) が
+      戻り値の変更で壊れないこと
+
+### Step 13-d: 逆変異 (**リストは下限**)
+
+| # | ファイル / 箇所 | 置換前 | 置換後 | red になるテスト |
+|---|---|---|---|---|
+| T13-M1 | `switch.py` hunk 1 | 照合ブロック (`if not _version_dir_hashes_ok(...)` 以下) | **`if switch_required:` の内側へ戻す** (= 現行) | `test_ac19a_*` / `test_ac19d_*` |
+| T13-M2 | `switch.py` hunk 1 | `if switch_required: raise ... / return False` | **`return False` の枝を削る** (不一致でも素通り) | `test_ac19a_*` |
+| T13-M3 | `switch.py` hunk 1 | 同上 | **両枝とも `raise RuntimeError`** (処置を揃えてしまう) | `test_ac19a_*` (`still_pending` にならず例外になる + **非終端行が 1 本残る**) |
+| T13-M4 | `switch.py` hunk 1 | 照合の位置 | **`_finalize_decision` の後ろ**へ動かす | `test_ac19b_verification_runs_before_finalize` (`_finalize_decision` の spy が呼ばれてしまう) + `test_ac19a_*` (approval が `approved` になる) |
+| T13-M5 | `switch.py` hunk 1 | `if not _version_dir_hashes_ok(resolved_after, ...)` | `if False:` | `test_ac19a_*` / `test_ac19d_*` / 既存 `tests/plugin/test_switch_paths.py:569` / `:1401` |
+| T13-M6 | `switch.py` hunk 1 | `if not _version_dir_hashes_ok(...)` | `if True:` (常に不一致) | **`test_ac19c_same_candidate_reapproval_still_succeeds`** (正常系の回帰) + `AC-16b` + 既存の手順 5 — **三重の網** |
+| T13-M7 | `switch.py` hunk 2 | `approve_candidate` の `_close_own_unfinished_journal_if_any()` | 削除 | `test_ac19a_*` (非終端が 1 本残る) |
+| T13-M8 | `switch.py` hunk 2 | `reason="reverify_failed"` | `reason="hash_mismatch"` | `test_ac19a_*` (`reason` の逐語一致) |
+| T13-M9 | `switch.py` hunk 1 | `return True` (末尾) | `return False` | 多数 (`deployed` 系がすべて `still_pending` に化ける) — **等価でないことの確認用** |
+
+- [ ] 各変異は `cp` 退避 → 適用 → red の逐語確認 → 復元。**`git checkout` / `git restore` は使わない**
+- [ ] **副作用の確認**: T13-M5 / M6 を当てたとき **他のどのテストが red になるか**も記録する
+- [ ] フルスイートが green。**基準は T11 後の実測値 + T13 の新規分** (予測値を書かない)
+- [ ] commit: `fix(switch-ops): 版 dir の hash 再照合を切替の要否にかかわらず通す (T13、設計書 §3.7 / IV-7 / AC-19)`
+
+---
+
+## T14: 2 周目ローカル LLM の確定 2 件を pin する (**テストのみ**、v1.4 新設)
+
+**担当**: `tmp/review-20260920-soh/r2/local/triage.md` の **T2-01 / T2-02**。
+**本体コードは 1 行も変えない** — どちらも「実装は正しいがテストが無い」。
+**T11 / T13 で行番号が動くので、行番号ではなく関数名・分岐名・reason 値で特定すること。**
+
+### Step 14-a: T2-01 — `still_pending` の `outcome.status` が 2 箇所だけ未 pin
+
+- [ ] 対象: `approve_candidate` の **`snapshot_invalid` の枝**と **`hash_mismatch` の枝**が返す
+      `ApprovalOutcome(..., status="pending", ...)`。
+      `approve_candidate` が `status="pending"` を返す 6 箇所のうち、
+      `foreign_waiting` / `reverify_failed` / `candidate_missing` / `legacy_plain` の 4 つは pin 済で、
+      **この 2 つだけが未 pin** (トリアージで全数確認済)
+- [ ] 生き残る変異: その 2 箇所の `status="pending"` を **`status="approved"`** に変える。
+      DB は決定していないので `row["status"]` は `"pending"` のままで、**変異が DB 側に現れない**
+- [ ] 是正 (各 1 行): `tests/plugin/test_switch_paths.py` の
+      **`test_approve_candidate_snapshot_invalid_stays_pending_with_reason`** (`:433`) と
+      **`test_approve_candidate_hash_mismatch_stays_pending_with_reason`** (`:461`) の末尾に
+      `assert outcome.status == "pending"` を足す
+- [ ] 影響の根拠 (テストの docstring に 1 行書く): `outcome.status` は
+      `commands.py` の approve ハンドラが `(status={outcome.status})` として**人間に直接出す**ので、
+      潰れると「承認されませんでした (status=approved)」という矛盾文言になる (**段 0 S0-78 と同じ形**)
+
+### Step 14-b: T2-02 — `snapshot_invalid` の枝だけ `_close_own_unfinished_journal_if_any()` が未 pin
+
+- [ ] 生き残る変異: **`snapshot_invalid` の枝の `_close_own_unfinished_journal_if_any()` 1 行だけ**を削る
+      (`candidate_missing` / `hash_mismatch` の 2 箇所は残す)
+- [ ] なぜ生き残るか: 既存 pin は
+      `tests/plugin/test_switch_paths.py::test_stuck_preparing_journal_is_closed_when_candidate_no_longer_matches`
+      (`:1191`、hash_mismatch 側) と `::test_stuck_preparing_journal_is_closed_when_candidate_goes_missing`
+      (`:1232`、candidate_missing 側) の 2 本だけで、
+      **`op_id` が `None` でない状態で `snapshot_invalid` に到達するテストが無い**
+      (新規 submit → approve の経路は `op_id is None` で helper が早期 return する)
+- [ ] 是正: `test_stuck_preparing_journal_is_closed_when_candidate_no_longer_matches` を**丸ごと流用**し、
+      候補の改竄 (hash 不一致) の代わりに **`extra.txt` を足す** (= snapshot 検査を落とす) 1 本を隣に追加する。
+      観測は同じ — `switch.get_open_by_name(conn, name) is None` と `outcome.reason == "snapshot_invalid"`
+- [ ] これで **3 呼び出しすべてが pin される**
+
+### Step 14-c: 逆変異 (= この task の本体)
+
+| # | ファイル | 置換前 | 置換後 | red になるテスト |
+|---|---|---|---|---|
+| T14-M1 | `switch.py` | `snapshot_invalid` の枝の `status="pending"` | `status="approved"` | 14-a で足した assert |
+| T14-M2 | `switch.py` | `hash_mismatch` の枝の `status="pending"` | `status="approved"` | 同上 |
+| T14-M3 | `switch.py` | `snapshot_invalid` の枝の `_close_own_unfinished_journal_if_any()` | 削除 | 14-b で足したテスト |
+
+- [ ] **3 件とも「まず正実装で green、次に変異で red、復元」**の順で逐語確認する (T10 と同じ流儀)
+- [ ] **T2-03 / T2-04 は本束では扱わない** (トリアージの判断どおり — T2-03 は
+      「どの例外を通すのが契約か」を先に決める必要があり、T2-04 は本束の diff 外)
+- [ ] commit: `test(switch-ops): still_pending の status と snapshot_invalid の journal 閉じを pin (T14、2 周目ローカル LLM T2-01/T2-02)`
+
+---
+
 ## T8: runbook / 設計書の追記 / フルスイート
 
 - [ ] `docs/operations/indicator-initial-set-deploy-2026-09-19.md` を設計書 §7.2 の表のとおり改訂する
@@ -1095,6 +1307,12 @@ uv run pytest tests/test_commands.py tests/plugin/test_indicator_initial_set.py 
       **`approval list` → `approval retry <approval_id>`**、**起動時 reconcile では解けない**
       (非 `switched` 行は飛ばす)、**`foreign` のときだけ人間が判断する**
 - [ ] **v1.3**: 設計書 §3.2 の T11 節 / §3.4 の retire 行 / AC-16c-1〜6 / AC-18 が v1.7 に
+      入っていることを確認する
+- [ ] **v1.4**: runbook に「**版 dir の中身が候補と合わないとき**」の節を足す (設計書 §7.2 の最終行) —
+      `reason=reverify_failed` / bless の `content_hash mismatch` を見たら、
+      **機械は自動で版を作り直さない**こと、人間が版 dir を確認し壊れていれば消して `approval retry`、
+      bless 経路では未終端行が残るので先に `approval list` → `approval retry` / `reject`
+- [ ] **v1.4**: 設計書 §3.7 / IV-7 / AC-16c-7 / AC-16c-8 / AC-19a〜d / §8.6 が v1.8 に
       入っていることを確認する
 - [ ] **フルスイート**を回す: `uv run pytest -q`。**書き換えた 4 本以外が red になったら
       黙って直さず申告する**。**基準 (v1.3)**: T10 後 `4300 passed` →
@@ -2856,6 +3074,35 @@ SAME  tests/plugin/test_switch_ops_hardening.py / tests/test_commands.py /
   (`grep -rn "_plugin_retire\|\"retire\"" tests/` = 0 件) ので、
   **argparse の subcommand 名と引数の形を現物 (`cli.py:772` 付近) で確認してから書くこと**。
 
+### v1.4 (T13 / T14 と T11 の変更分) の未実測
+
+- **T13-a1**: **版 dir を in-place 編集する手順**が実際に効くか。`create_version_dir` は
+  dir を `0500`、ファイルを `0400` で作る (`version_store.py`) ので、テストは
+  `os.chmod` で書けるようにしてから編集する必要がある。**`_reverify_switched_journal` が
+  同じことをしている** (`switch.py:1455-1461`) のでそこを写す。**未実走**。
+- **T13-a2**: `switch_required=0` を作る最短手順 (同一候補の再 approve) で、
+  **`_advance_to_decided` に本当に到達するか** (0d-2a や `already_decided` で早期 return しないか)。
+  設計書 AC-16b が同じ状態を既に踏んでいるので流用できるはずだが**未確認**。
+- **T13-a3**: `bless_candidate` の `False` 経路 (AC-19d) が、**`_run_full_gate` を通さずに**
+  組み立てられるか。bless は gate を回すので、テストは既存の
+  `tests/plugin/test_switch_paths.py` の bless fixture (gate を fake する形) を写すこと。**未実走**。
+- **T13-a4**: T13-M9 (`return True` → `return False`) が「多数 red」で済むか、
+  **収集エラーなど別の壊れ方をしないか**。
+- **T13-a5 / T11-a9 (v1.4)**: **`switch_required=0` の行を 3 phase で止める手順**が実際に効くか。
+  `preparing` / `versioned` は `_fail_advance_at`、`recorded` は `_finalize_decision` の `_boom` という
+  **2 つの機構を使い分ける**必要がある (上記 Step 11-a の注)。**未実走** — ここを取り違えると
+  テストが恒真になるので、**着手前検証で 3 通りとも「狙った phase で止まっている」ことを
+  `_rows(conn)` で確認してから assert を書くこと**。
+- **T14-a1**: T2-01 / T2-02 の変異が**本当に SURVIVED か** (トリアージはコード読解と grep による
+  全数確認で、**変異は打っていない**)。**T14 の Step 14-c で 3 件とも実走して確認すること**。
+  もし既存テストが既に殺しているなら、トリアージの「未 pin」判定が誤っていたことになるので**申告する**。
+- **T11-a7 (v1.4)**: 3 つ組の述語で **`test_ac16c8_old_target_drift_is_detected` の状態
+  (`old_kind='symlink'` の行 + 第三者が第 3 の先へ張り替え)** が組み立てられるか。
+  既存の `_write_candidate_v` (`tests/plugin/test_switch_paths.py:490` 付近、内容を変えた 2 つ目の候補を作る)
+  を使うと 2 本目の版を作れる。**未実走**。
+- **T11-a8 (v1.4)**: `new_target` / `switch_required` の 2 行を plain 分岐より前へ**繰り上げても
+  挙動が変わらない**こと (設計上は plain 分岐で未使用なので不変のはず)。**フルスイートで確認**。
+
 ### v1.0〜v1.2 の申告 (既存)
 
 1. **`docs/` の改訂 (T8) は一切実測していない。** runbook と 8 月設計書の文面は
@@ -3049,6 +3296,7 @@ T5-M5 は本文が「受け取らず lock 外で読み直す (v1.1 の案)」と
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-09-20 | v1.4 | 設計書 v1.8 (**R13 / R14** と codex sol r5 の確定 4 件) に追随: **T11 を R13 に合わせて書き換え** (判定述語を 3 つ組 `(switch_required, old_kind, old_target)` へ / **hunk を 3 → 2 に統合** — `new_target` と `switch_required` の 2 行を live の読み取り直後へ繰り上げ、判定を plain 分岐の**前**に 1 箇所だけ置く / テストを 6 → 8 本へ (**AC-16c-2 / -3 / -6 を 3 phase parametrize**、**AC-16c-7 = rollback commit と新行作成の間のクラッシュ**、**AC-16c-8 = `old_target` drift = R13 の主 killer**) / 変異表に **3 つ組のうち 1 要素だけ比べる退化 ×3 (T11-M10/M11/M12)** を追加、T11-M7 を「判定を plain 分岐の後ろへ動かす」へ差し替え)。**T13 を新設** (R14 — 版 dir の hash 再照合を切替の要否にかかわらず `_finalize_decision` の直前で通す。`switch_required=1` は現行どおり `RuntimeError`、`=0` は `_advance_to_decided` が `False` → 呼び出し元が行を閉じて `still_pending(reverify_failed)`。テスト 5 本 + 逆変異 9 件)。**T14 を新設** (テストのみ。2 周目ローカル LLM の確定 2 件 = `still_pending` の `outcome.status` 2 箇所と `snapshot_invalid` 枝の journal クローズ。**行番号ではなく関数名・分岐名で特定**する書き方に)。**`switch_required=0` の行は `_fail_advance_at("switched")` では止まらない** (`advance(switched)` を呼ばないため) ので、AC-16c-2 だけ `_finalize_decision` の `_boom` で止める注を Step 11-a に明記。Goal (10)(11) / Global Constraints / File Structure / 受入条件表 / task 依存図 (T11 → T13 → T14 の直列) / T8 の確認項目と runbook 追記 / 「未実測の申告」に v1.4 の 8 件を同時に更新 | codex sol 設計レビュー r5 (`tmp/review-20260920-soh/r2/design/codex-out.md` / `codex-triage.md`、C0 / I5) の 確定 4 件 + 2026-09-20 ユーザー裁定 2 点、および 2 周目ローカル LLM (`tmp/review-20260920-soh/r2/local/triage.md` の T2-01 / T2-02) | — |
 | 2026-09-20 | v1.3 | 設計書 v1.7 (ユーザー裁定 **R11 / R12**) に追随: **T11 (再開時に `switch_required` が保存値と食い違ったら巻き戻して新しい `op_id` で流し直す。`switch.py` の 3 hunk + 新規テスト 6 本 + 逆変異 10 件)** と **T12 (`afx plugin retire` の `UnresolvedJournalError` にも「次の 1 手」。`cli.py` の 1 hunk + テスト 1 本 + 逆変異 4 件)** を新設。Goal (8)(9) / Global Constraints (`except` は 3 つ・T11/T12 も既存テストを書き換えない) / File Structure / 受入条件表 (AC-16c-1〜6 / AC-18) / task 依存図 (T11 は T10 の後、T12 は T6 の後、T11 ∥ T12) / T8 の確認項目とフルスイート基準を同時に更新。**T11 の red の種は指揮者側の probe (`tmp/review-20260920-soh/r2/cr1-probe/test_probe_cr1.py`) のヘルパと 3 parametrize を転写し、assert を目標状態へ反転して作る** (probe をそのまま置かない — 実装後に probe 側が red になるため)。**T11-M2 (「常に巻き戻す」への退化) を殺すのは `test_ac16c3_*`** であることを変異表に明記 (「だけ」は未実測なので Step 11-e に副作用の全数確認を置いた)。**「未実測の申告」に T11/T12 の 7 件を追加**。**既存 `_rows` が `(op_id, phase)` の 2 タプルで probe の 3 タプル版と食い違う**ことを Step 11-a に明記し、`switch_required` / `old_target` は `journal_store.get` で読む形を指定した (既存 `_rows` を書き換えると T1〜T10 のテストが全滅する) | 2 周目 `/code-review high` (`tmp/review-20260920-soh/r2/code-review.md`) の #1 (probe で再現、Important) と #5 に対する 2026-09-20 ユーザー裁定 (採用 = 案 3、是正範囲 = #1 と #5 のみ) | — |
 | 2026-09-20 | v1.2a | 1 周目 codex (terra/medium) の指摘を反映: **T9 Step 9-c と T10 のフルスイート基準値が 4274 / 4278 で混在していたのを訂正** — 正は **T9 着手前 4278 passed → T9 後 4297 (+19) → T10 後 4300 (+3)**、実測 `4300 passed, 17 deselected` (2026-09-20、HEAD `c1abf8d`)。段 0 完了時 4274 passed から T9/T10 着手前の 4278 passed への +4 は、未 pin 4 群を pin した `6e1d431` / `0e079ee` / `3952962` / `5cee9f5` (2026-09-20) による | 2026-09-20 [switch-ops-hardening] 1 周目 codex (terra/medium)、`tmp/review-20260920-soh/r1/codex-triage.md` | — |
 | 2026-09-19 | v1.0 | 初版 (T1〜T8、逆変異 12 件 + task ごとの表、隔離環境での実測記録つき) | 設計書 v1.4 の承認を受けた実装プラン化 | — |
