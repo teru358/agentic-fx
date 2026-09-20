@@ -539,3 +539,43 @@ def test_indicator_unresolved_stale_row_does_not_report_reverted(tmp_path, monke
     assert "switch_reconcile_skipped_stale_row" in text
     assert "reason=indicator_unresolved" not in text, \
         "巻き戻していない stale 行に indicator_unresolved の固定文言を書いている"
+
+
+def test_reconcile_treats_old_kind_symlink_with_absent_live_as_foreign(tmp_path):
+    """段 0 S0-92 (SURVIVED): `classify_live` に渡す行の `old_kind` を
+    `"absent"` に固定する変異が生存した。差が出るのは
+    **`old_kind == "symlink"` かつ live が実在しない** (第三者が live
+    symlink を unlink した) ときだけ — 正しい分類は `foreign` (触らない)
+    だが、変異では `not_switched` に化けて **旧 symlink を復元してしまう**。
+    `old_kind == "absent"` の fixture しか使っていなかった既存 AC-3 テスト
+    (`test_ac3_foreign_live_is_never_touched`) では踏めない組み合わせを
+    直接踏む。"""
+    conn, plugins_root, activity = _reconcile_env(tmp_path)
+    from tests.fixtures import indicator_wiring as fx
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    old_target, new_target, approval_id, op_id = _stage_switched_journal(
+        conn, plugins_root, name="rsi_pullback",
+        pins={"rsi": hashes["rsi"]}, now=fx.NOW)
+    live = plugins_root / "rsi_pullback"
+    assert live.is_symlink() and live.readlink().as_posix() == new_target
+    # 第三者が live symlink を unlink した (old_kind は "symlink" のまま —
+    # DB の journal 行は old_kind="symlink" を保持している)。
+    live.unlink()
+    assert not live.exists() and not live.is_symlink()
+
+    plugin_switch.reconcile_switch_journals(
+        conn, plugins_root=plugins_root, now=fx.NOW, settings=SETTINGS,
+        activity=activity)
+
+    # foreign (触らない) — live を新設したり old_target へ「復元」しない。
+    assert not live.exists() and not live.is_symlink(), \
+        "foreign (live 不在) のはずが symlink を作ってしまった"
+    assert conn.execute(
+        "SELECT phase FROM plugin_switch_journal WHERE op_id=?",
+        (op_id,)).fetchone()["phase"] == "switched", "触っていない行の phase が変わった"
+    assert conn.execute(
+        "SELECT status FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()["status"] == "pending"
+    text = _activity_text(activity)
+    assert "switch_reconcile_unrecognized_live_target" in text
