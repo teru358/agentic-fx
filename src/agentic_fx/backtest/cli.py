@@ -513,7 +513,7 @@ _BLESS_NO_FROM_ERROR = (
     "'afx plugin materialize <name>' で候補を書き出し、編集してから "
     "'afx plugin bless --from _human <name>' を実行してください。")
 
-# [switch-ops-hardening] T6: `UnresolvedJournalError` の収束手順案内。
+# [switch-ops-hardening] T6 / T12: `UnresolvedJournalError` の収束手順案内。
 # `_plugin_bless` / `_plugin_retire` の両方の except ハンドラから参照する
 # (元メッセージの `op_id=` / `approval_id=` は呼び出し元ごとに異なるので
 # ここには含めない — 案内文の2行のみ共有)。

@@ -1460,10 +1460,17 @@ def test_ac19d_bless_raises_when_version_dir_is_tampered(tmp_path, monkeypatch):
     human_dir = plugins_root / "_human" / "sma"
 
     _record_then_tamper_version_dir(monkeypatch)
-    with pytest.raises(RuntimeError, match="content_hash mismatch"):
+    with pytest.raises(RuntimeError, match="content_hash mismatch") as excinfo:
         plugin_switch.bless_candidate(
             conn, name="sma", human_dir=human_dir, settings=SETTINGS,
             now=NOW, decided_by="human_cli")
+
+    # 2 周目やり直し /code-review r2b #3 の是正 (`b126dd2`) の pin:
+    # switch_required=0 の枝 (switch_live 未実行) なので "after switch"
+    # (切替後) と言わない。switch_required=1 側 (`_advance_to_decided`
+    # 内、`switch.py:1359`) の "after switch" は変えていない。
+    assert "after switch" not in str(excinfo.value)
+    assert "版 dir の content_hash mismatch" in str(excinfo.value)
 
     non_terminal = journal_store.list_non_terminal(conn)
     assert len(non_terminal) == 1, "bless は自分の未完行を閉じない (設計どおりの残余)"
