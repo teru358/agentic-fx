@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import unicodedata
 from pathlib import Path
 
 from agentic_fx._safe_error import safe_error_text
@@ -35,6 +36,14 @@ _HELP = """コマンド一覧:
   policy add <text>          policy/directives.md へ追記
   stop                       graceful shutdown (シェルのみ)
 (Phase 2 で追加: news / model / mode / autopilot)"""
+
+
+def _normalize_idea_display(text: str) -> tuple[str, int]:
+    """`improve add` の表示と警告判定用に文字列を正規化する。"""
+    step1 = text.replace("\n", " ")
+    kept = [ch for ch in step1 if not unicodedata.category(ch).startswith("C")]
+    removed = len(step1) - len(kept)
+    return "".join(kept).strip(), removed
 
 
 class Commands:
@@ -230,7 +239,19 @@ class Commands:
                                   now=self.clock.now())
                 self.activity.write(Category.IMPROVE, "backlog_added",
                                     f"#{bid} via shell", ref_id=str(bid))
-                return f"backlog #{bid} を追加しました"
+                display, removed = _normalize_idea_display(text)
+                reply = f"backlog #{bid} を追加しました: 「{display}」"
+                is_placeholder = ((display.startswith("<") and display.endswith(">"))
+                                  or (display.startswith("[") and display.endswith("]")))
+                is_too_short = len(display) < 4
+                if is_placeholder or is_too_short:
+                    reply += ("\n⚠ 短い/プレースホルダのように見えます。意図した内容で"
+                             "あることを確認してください (削除・訂正は "
+                             f"`backlog reject {bid}` の上で `improve add` を"
+                             "やり直す)")
+                if removed:
+                    reply += f"\n表示できない文字を {removed} 個含みます"
+                return reply
             if cmd == "backlog" and len(args) == 2 and args[0] == "reject":
                 bid = int(args[1])
                 # 検収 B3 (2026-08-22): 設計書 §4.3 の状態機械 — reject は

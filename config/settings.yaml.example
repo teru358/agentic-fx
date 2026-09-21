@@ -111,6 +111,10 @@ improve:
 logging:
   level: INFO
 
+service:
+  secret_env_allowlist: []   # ⑤検査 (起動時、CLI backend のみ) が誤検知した exported env 変数の名前をここに書くと除外される。
+                              # 名前の完全一致のみ (パターン不可)。値は見ない — 本当に秘密でないと自分で確認してから追加すること
+
 api:
   enabled: false
   host: 127.0.0.1

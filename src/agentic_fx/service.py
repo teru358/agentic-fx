@@ -274,27 +274,53 @@ def _read_proc_self_environ_names() -> set[str]:
 
 
 def _check_service_initial_env_has_no_secrets(
-        settings, *,
+        settings, *, which: str = "improve", backend: str = "claude",
         read_initial_env_names=_read_proc_self_environ_names) -> None:
     """検査⑤ (設計書 §1.4、裁定 R3): サービス自身の**初期 env**
     (`/proc/self/environ` 相当。既定 seam = `_read_proc_self_environ_names`) に
     秘密名パターンがあれば起動拒否する。`.env`→`load_dotenv()` で
     `os.environ` にのみ現れるキーは対象外 (設計が明示的に許容している —
-    exported shell env にだけ秘密を置くな、という検査)。`settings` は
-    呼び出し規約を他の `_check_*` 検査と揃えるために受け取るのみで、
-    現状は未使用。"""
+    exported shell env にだけ秘密を置くな、という検査)。`settings` の
+    `service.secret_env_allowlist` は完全一致する名前だけを除外する。"""
     names = read_initial_env_names()
+    allowlist = set(settings.service.secret_env_allowlist)
     # #94 (verified-round1.md 1-B): `_SECRET_ENV_PATTERNS` は大文字のみ
     # なので、照合前に `k.upper()` を掛けて小文字/混在の env 名 (`my_api_key`
     # 等) も検出する。
-    leaked = [k for k in names
-              if any(pat in k.upper() for pat in _SECRET_ENV_PATTERNS)]
+    def _matched_pattern(k: str) -> str | None:
+        upper = k.upper()
+        for pat in _SECRET_ENV_PATTERNS:
+            if pat in upper:
+                return pat
+        return None
+
+    leaked = []
+    matches: dict[str, str] = {}
+    excluded_by_allowlist: list[str] = []
+    for k in names:
+        if k in allowlist:
+            if _matched_pattern(k) is not None:
+                excluded_by_allowlist.append(k)
+            continue
+        pat = _matched_pattern(k)
+        if pat is not None:
+            leaked.append(k)
+            matches[k] = pat
+    if excluded_by_allowlist:
+        _log.warning(
+            "secret_env_allowlist により次の名前を検査⑤から除外した: %s "
+            "— 同 UID の CLI worker は /proc/<pid>/environ からこの値を"
+            "読める", sorted(excluded_by_allowlist))
     if leaked:
+        patterns_hit = sorted(set(matches.values()))
         raise RuntimeError(
-            "improve+claude backend refuses to start: service initial env "
-            f"contains secret-like variable name(s) {leaked!r} — improve "
-            "worker can read /proc/self/environ of same-UID processes "
-            "(R10). Put secrets in .env, not exported shell env.")
+            f"{which}+{backend} backend refuses to start: service initial env "
+            f"contains secret-like variable name(s) {leaked!r} — same-UID "
+            "CLI worker can read this service's /proc/<pid>/environ "
+            f"(R10) (matched pattern(s) {patterns_hit!r}). Put secrets in "
+            ".env, not exported shell env. If a name is NOT a secret, either "
+            "unset it before starting the service, or add its exact name to "
+            "service.secret_env_allowlist in settings.yaml.")
 
 
 def _check_cli_backend(settings, *, which: str):
@@ -375,7 +401,7 @@ def _check_cli_backend(settings, *, which: str):
         settings = settings.model_copy(update={"runner": settings.runner.model_copy(
             update={"opencode": settings.runner.opencode.model_copy(
                 update={"bin": str(bin_path)})})})
-    _check_service_initial_env_has_no_secrets(settings)
+    _check_service_initial_env_has_no_secrets(settings, which=which, backend=backend)
     return settings
 
 
@@ -1261,6 +1287,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                             activity=activity, log_dir=root / "logs", clock=clock,
                             health_latch=health_latch,
                             improve_supervisor=improve_supervisor,
+                            policy_path=root / "policy" / "directives.md",
                             plugins_root=plugins_dir, settings=settings,
                             outage=outage)
         return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,

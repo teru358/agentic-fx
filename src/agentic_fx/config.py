@@ -388,6 +388,10 @@ class LoggingSettings(_Strict):
     level: str = "INFO"
 
 
+class ServiceSettings(_Strict):
+    secret_env_allowlist: list[str] = Field(default_factory=list)
+
+
 class ApiSettings(_Strict):
     enabled: bool = False
     host: str = "127.0.0.1"
@@ -530,6 +534,7 @@ class Settings(_Strict):
     improve: ImproveSettings = Field(default_factory=ImproveSettings)
     logging: LoggingSettings
     api: ApiSettings
+    service: ServiceSettings = Field(default_factory=ServiceSettings)
     discord: DiscordSettings
     analysis: AnalysisSettings
     paper: PaperSettings

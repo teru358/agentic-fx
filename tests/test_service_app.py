@@ -222,6 +222,82 @@ def test_build_app_wires_everything(tmp_path):
         assert name in app.registry.names()
 
 
+def test_build_app_wires_policy_path(tmp_path):
+    """build_app が Commands へ policy_path を渡す。"""
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        assert app.commands._policy_path == tmp_path / "policy" / "directives.md"
+    finally:
+        app.close()
+
+
+def test_build_app_wired_policy_path_can_append_via_dispatch(tmp_path):
+    """build_app 経由の policy add が directives.md へ追記する。"""
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        result = app.commands.dispatch("policy add こんにちは")
+        assert result == "policy に追記しました"
+        text = (tmp_path / "policy" / "directives.md").read_text(encoding="utf-8")
+        assert "こんにちは" in text
+    finally:
+        app.close()
+
+
+def test_commands_optional_params_all_wired_by_build_app(tmp_path, monkeypatch):
+    """Commands の全オプション引数を build_app が明示配線する。"""
+    import inspect
+
+    import agentic_fx.service as service_mod
+    from agentic_fx.commands import Commands as RealCommands
+
+    EXPECTED_OPTIONAL_PARAMS = {
+        "health_latch", "improve_supervisor", "policy_path",
+        "plugins_root", "settings",
+    }
+    sig = inspect.signature(RealCommands.__init__)
+    optional_params = {
+        name for name, p in sig.parameters.items()
+        if name != "self" and p.default is not inspect.Parameter.empty
+    }
+    assert optional_params == EXPECTED_OPTIONAL_PARAMS, (
+        "Commands.__init__ のオプション引数と EXPECTED_OPTIONAL_PARAMS が "
+        "食い違っている — 新規引数を追記するか、削除された引数を消すこと")
+
+    captured_kwargs: dict = {}
+
+    def _spy(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return RealCommands(*args, **kwargs)
+
+    monkeypatch.setattr(service_mod, "Commands", _spy)
+
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        missing = EXPECTED_OPTIONAL_PARAMS - captured_kwargs.keys()
+        assert not missing, (
+            f"build_app が Commands(...) に渡していないオプション引数: {missing}")
+    finally:
+        app.close()
+
+
+def test_settings_without_service_section_loads_with_default_empty_allowlist(tmp_path):
+    """service 節のない設定でも空 allowlist の既定値でロードできる。"""
+    from agentic_fx.config import load_settings
+
+    _init(tmp_path)
+    path = tmp_path / "config" / "settings.yaml"
+    import yaml as _yaml
+    raw = _yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw.pop("service", None)
+    path.write_text(_yaml.safe_dump(raw), encoding="utf-8")
+
+    settings = load_settings(path)
+    assert settings.service.secret_env_allowlist == []
+
+
 def test_build_app_seeds_default_news_sources_idempotently(tmp_path):
     """afx init 未実行の DB でも起動時 seed され、再起動で重複しない。"""
     config_dir = tmp_path / "config"
@@ -3856,7 +3932,7 @@ def test_build_app_opencode_does_not_require_credentials(
 
     monkeypatch.setattr(
         service_mod, "_check_service_initial_env_has_no_secrets",
-        lambda settings, *, read_initial_env_names=None: None)
+        lambda settings, *, which=None, backend=None, read_initial_env_names=None: None)
     vendor_codex = _find_vendor_codex_bin()
     if vendor_codex is None:
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
@@ -3877,7 +3953,10 @@ def test_build_app_rejects_when_service_initial_env_has_secret_pattern(tmp_path,
     import sys
     import agentic_fx.service as service_mod
 
-    def _raise(settings, *, read_initial_env_names=None):
+    captured = {}
+
+    def _raise(settings, *, which=None, backend=None, read_initial_env_names=None):
+        captured["which"], captured["backend"] = which, backend
         raise RuntimeError("SOME_SERVICE_API_KEY leaked")
 
     monkeypatch.setattr(service_mod, "_check_service_initial_env_has_no_secrets", _raise)
@@ -3889,6 +3968,7 @@ def test_build_app_rejects_when_service_initial_env_has_secret_pattern(tmp_path,
         "claude": {"bin": sys.executable, "credentials_file": str(creds_file)}})
     with pytest.raises(RuntimeError, match="API_KEY"):
         build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    assert captured == {"which": "improve", "backend": "claude"}
 
 
 def test_build_app_does_not_check_secret_env_when_improve_backend_is_local(
@@ -3905,6 +3985,182 @@ def test_build_app_does_not_check_secret_env_when_improve_backend_is_local(
     build_app(tmp_path, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())  # 例外を出さない
 
 
+def _settings_stub(allowlist=()):
+    """秘密 env 検査に必要な service 設定だけを持つダミー設定を返す。"""
+    from types import SimpleNamespace
+    return SimpleNamespace(service=SimpleNamespace(secret_env_allowlist=list(allowlist)))
+
+
+@contextmanager
+def _capture_service_warnings():
+    """agentic_fx.service の WARNING レコードを一時的に収集する。"""
+    import logging
+
+    logger = logging.getLogger("agentic_fx.service")
+    records: list[str] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _ListHandler()
+    orig_level = logger.level
+    logger.setLevel(logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(orig_level)
+
+
+def test_check_service_initial_env_has_no_secrets_allowlist_excludes_exact_name():
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    settings = _settings_stub(["CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS"])
+    _check_service_initial_env_has_no_secrets(
+        settings, which="trade", backend="codex",
+        read_initial_env_names=lambda: {
+            "CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS", "HOME"})
+
+
+def test_check_service_initial_env_has_no_secrets_allowlist_is_exact_match_only():
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    settings = _settings_stub(["CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS"])
+    with pytest.raises(RuntimeError, match="secret"):
+        _check_service_initial_env_has_no_secrets(
+            settings, which="trade", backend="codex",
+            read_initial_env_names=lambda: {
+                "CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS_V2", "HOME"})
+
+
+def test_check_service_initial_env_has_no_secrets_message_includes_which_backend_and_pattern():
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    settings = _settings_stub([])
+    with pytest.raises(RuntimeError) as exc_info:
+        _check_service_initial_env_has_no_secrets(
+            settings, which="trade", backend="codex",
+            read_initial_env_names=lambda: {
+                "CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS", "HOME"})
+    msg = str(exc_info.value)
+    assert "trade+codex" in msg
+    assert "OPENAI_" in msg
+    assert "secret_env_allowlist" in msg
+
+
+def test_check_service_initial_env_has_no_secrets_allowlist_hit_warns_names_only():
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    settings = _settings_stub(["CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS"])
+    with _capture_service_warnings() as records:
+        _check_service_initial_env_has_no_secrets(
+            settings, which="trade", backend="codex",
+            read_initial_env_names=lambda: {
+                "CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS", "HOME"})
+    text = "\n".join(records)
+    assert "CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS" in text
+    assert "secret_env_allowlist" in text
+
+
+def test_check_service_initial_env_has_no_secrets_no_warning_when_nothing_excluded():
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    with _capture_service_warnings() as records:
+        _check_service_initial_env_has_no_secrets(
+            _settings_stub([]), which="trade", backend="codex",
+            read_initial_env_names=lambda: {"HOME", "PATH"})
+    assert records == []
+
+    with _capture_service_warnings() as records:
+        _check_service_initial_env_has_no_secrets(
+            _settings_stub(["CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS"]),
+            which="trade", backend="codex",
+            read_initial_env_names=lambda: {"HOME", "PATH"})
+    assert records == []
+
+
+def test_check_service_initial_env_has_no_secrets_allowlist_hit_requires_pattern_match():
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    with _capture_service_warnings() as records:
+        _check_service_initial_env_has_no_secrets(
+            _settings_stub(["HARMLESS_NAME"]), which="trade", backend="codex",
+            read_initial_env_names=lambda: {"HARMLESS_NAME", "HOME"})
+    assert records == []
+
+
+def test_check_service_initial_env_has_no_secrets_allowlist_hit_warning_is_sorted():
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    with _capture_service_warnings() as records:
+        _check_service_initial_env_has_no_secrets(
+            _settings_stub(["Z_TOKEN", "A_TOKEN"]), which="trade", backend="codex",
+            read_initial_env_names=lambda: {"Z_TOKEN", "A_TOKEN", "HOME"})
+    text = "\n".join(records)
+    assert text.index("A_TOKEN") < text.index("Z_TOKEN")
+
+
+def test_check_service_initial_env_has_no_secrets_message_includes_exact_matched_pattern_clause():
+    """[ops-first-contact-fixes r2] T2-M4/E11 是正: 段 0 の生存変異
+    (`matches`/`patterns_hit` の追跡を無効化しても `assert "OPENAI_" in msg`
+    が別経路 — 当たった変数名の `leaked!r` 表示自体に偶然パターン文字列を
+    含む — で素通りしていた) の pin。変数名は `MY_TOKEN_NAME` (パターン
+    `TOKEN` に一致) にし、メッセージが `matched pattern(s) ['TOKEN']` という
+    **整形済みの句そのもの**を含むことを見る — `leaked!r` (`['MY_TOKEN_NAME']`)
+    にはこの角括弧付き句は現れないため、`matches`/`patterns_hit` の追跡が
+    無効化されれば (patterns_hit が空リストになれば) この assert は
+    `matched pattern(s) []` に変わり red になる。"""
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    settings = _settings_stub([])
+    with pytest.raises(RuntimeError) as exc_info:
+        _check_service_initial_env_has_no_secrets(
+            settings, which="trade", backend="codex",
+            read_initial_env_names=lambda: {"MY_TOKEN_NAME", "HOME"})
+    msg = str(exc_info.value)
+    assert "matched pattern(s) ['TOKEN']" in msg
+
+
+def test_check_service_initial_env_has_no_secrets_allowlist_is_case_sensitive():
+    """[ops-first-contact-fixes r2] E1 是正: allowlist の完全一致は
+    大文字小文字も区別する (`k in allowlist` を `k.upper() in allowlist` に
+    緩める変異が、既存テストの env 変数名が全て大文字のため段 0 で検出
+    できなかった)。allowlist に大文字名 `MY_API_KEY` を登録しても、env に
+    実在するのが小文字 `my_api_key` (別名として完全一致しない) であれば
+    除外されず起動拒否のままであることを見る。"""
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    settings = _settings_stub(["MY_API_KEY"])
+    with pytest.raises(RuntimeError, match="secret"):
+        _check_service_initial_env_has_no_secrets(
+            settings, which="trade", backend="codex",
+            read_initial_env_names=lambda: {"my_api_key", "HOME"})
+
+
+def test_check_cli_backend_forwards_which_trade_to_secret_check(tmp_path, monkeypatch):
+    import sys
+    import agentic_fx.service as service_mod
+
+    captured = {}
+
+    def _raise(settings, *, which=None, backend=None, read_initial_env_names=None):
+        captured["which"], captured["backend"] = which, backend
+        raise RuntimeError("SOME_SERVICE_API_KEY leaked")
+
+    monkeypatch.setattr(service_mod, "_check_service_initial_env_has_no_secrets", _raise)
+    creds_file = tmp_path / ".credentials.json"
+    creds_file.write_text('{"token":"x"}')
+    creds_file.chmod(0o600)
+    root = _root_with_settings(tmp_path, runner={
+        "trade": {"backend": "claude", "model": "m"},
+        "claude": {"bin": sys.executable, "credentials_file": str(creds_file)}})
+    with pytest.raises(RuntimeError, match="API_KEY"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    assert captured == {"which": "trade", "backend": "claude"}
+
+
 def test_check_service_initial_env_has_no_secrets_rejects_leaked_key_via_seam():
     """⑤ 検査本体 (R3): seam に注入した名前集合に秘密パターンがあれば拒否する。
     `settings` 引数は現状未使用 (呼び出し規約を `_check_cli_backend` と
@@ -3913,7 +4169,7 @@ def test_check_service_initial_env_has_no_secrets_rejects_leaked_key_via_seam():
 
     with pytest.raises(RuntimeError, match="API_KEY|secret"):
         _check_service_initial_env_has_no_secrets(
-            object(), read_initial_env_names=lambda: {"SOME_SERVICE_API_KEY", "HOME"})
+            _settings_stub(), read_initial_env_names=lambda: {"SOME_SERVICE_API_KEY", "HOME"})
 
 
 def test_check_service_initial_env_has_no_secrets_passes_when_seam_clean():
@@ -3921,7 +4177,7 @@ def test_check_service_initial_env_has_no_secrets_passes_when_seam_clean():
     from agentic_fx.service import _check_service_initial_env_has_no_secrets
 
     _check_service_initial_env_has_no_secrets(
-        object(), read_initial_env_names=lambda: {"HOME", "PATH"})  # 例外を出さない
+        _settings_stub(), read_initial_env_names=lambda: {"HOME", "PATH"})  # 例外を出さない
 
 
 def test_check_service_initial_env_has_no_secrets_default_seam_is_proc_self_environ():
@@ -3965,7 +4221,7 @@ def test_check_service_initial_env_has_no_secrets_rejects_each_pattern(leaked_na
 
     with pytest.raises(RuntimeError, match="secret"):
         _check_service_initial_env_has_no_secrets(
-            object(), read_initial_env_names=lambda: {leaked_name, "HOME"})
+            _settings_stub(), read_initial_env_names=lambda: {leaked_name, "HOME"})
 
 
 def test_check_service_initial_env_has_no_secrets_rejects_lowercase_name():
@@ -3975,7 +4231,7 @@ def test_check_service_initial_env_has_no_secrets_rejects_lowercase_name():
 
     with pytest.raises(RuntimeError, match="secret"):
         _check_service_initial_env_has_no_secrets(
-            object(), read_initial_env_names=lambda: {"my_api_key", "HOME"})
+            _settings_stub(), read_initial_env_names=lambda: {"my_api_key", "HOME"})
 
 
 def test_check_cli_version_rejects_when_binary_cannot_be_executed(tmp_path):
@@ -4071,7 +4327,7 @@ def test_build_app_rewrites_relative_claude_bin_to_absolute_path(
 
     monkeypatch.setattr(
         service_mod, "_check_service_initial_env_has_no_secrets",
-        lambda settings, *, read_initial_env_names=None: None)
+        lambda settings, *, which=None, backend=None, read_initial_env_names=None: None)
 
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
@@ -4131,7 +4387,7 @@ def test_improve_loop_receives_settings_with_resolved_cli_bin(tmp_path, monkeypa
 
     monkeypatch.setattr(
         service_mod, "_check_service_initial_env_has_no_secrets",
-        lambda settings, *, read_initial_env_names=None: None)
+        lambda settings, *, which=None, backend=None, read_initial_env_names=None: None)
 
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
@@ -4176,7 +4432,7 @@ def test_build_app_rewrites_relative_codex_bin_to_absolute_path(tmp_path, monkey
 
     monkeypatch.setattr(
         service_mod, "_check_service_initial_env_has_no_secrets",
-        lambda settings, *, read_initial_env_names=None: None)
+        lambda settings, *, which=None, backend=None, read_initial_env_names=None: None)
 
     vendor_codex = _find_vendor_codex_bin()
     if vendor_codex is None:
@@ -4215,7 +4471,10 @@ def test_check_service_initial_env_has_no_secrets_is_called_for_opencode_backend
     `/proc/<pid>/environ` を読めるため脅威モデルは同じ)。"""
     import agentic_fx.service as service_mod
 
-    def _raise(settings, *, read_initial_env_names=None):
+    captured = {}
+
+    def _raise(settings, *, which=None, backend=None, read_initial_env_names=None):
+        captured["which"], captured["backend"] = which, backend
         raise RuntimeError("SOME_SERVICE_API_KEY leaked (codex branch)")
 
     monkeypatch.setattr(service_mod, "_check_service_initial_env_has_no_secrets", _raise)
@@ -4228,6 +4487,7 @@ def test_check_service_initial_env_has_no_secrets_is_called_for_opencode_backend
         improve={"llama_swap_verified": True})
     with pytest.raises(RuntimeError, match="API_KEY"):
         build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    assert captured == {"which": "improve", "backend": "opencode"}
 
 
 # --- プラン10 Task11f: 起動時 reconcile 配線 pin (B-15/B-7/M6 是正) --------
