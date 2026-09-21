@@ -1,4 +1,4 @@
-# [backtest-failure-readable] 設計書 v1.0
+# [backtest-failure-readable] 設計書 v1.1
 
 対象 commit: `fc318ab`。束 A は、現行の CPU 上限を変えずに、backtest と live plugin 評価の失敗を人間には診断可能に、改善 agent には安全な固定分類として届ける。
 
@@ -38,6 +38,7 @@
 
 - `sandbox_session_cpu_sec` の名称・意味・既定値・設定 schema/example の変更。
 - per-call CPU、平均 CPU、startup 枠、planned call 数、`getrusage` 差分、旧キー移行。
+- replay 後に得る raw grid 数を session 開始前の planned call 数や CPU 予算式へ使うこと。raw grid metadata は replay 後にしか得られず、これらは束 B で扱う。
 - RPC timeout の cancellation/process-group 中止、live maintenance の非同期化、scheduler busy watchdog、資金保護 tick の遅延上限。
 - worker rotation、backtest 高速化、holdout 期間・gate・承認基準、実設定/DB/log/plugin の変更、サービス再起動。
 - process group を抜けた孫の完全回収・CPU 完全計上、悪意ある plugin の完全隔離。
@@ -66,11 +67,11 @@
 | `error_code` | 内部固定 enum |
 | `stderr_tail` | 技術ログ出力直前だけに保持する最大 8 KiB の escaped text |
 
-`_read_response()` は reader queue だけを待たず、短い間隔で queue と `wait4(WNOHANG)` を競合させる。worker が死に、孫だけが stdout を保持しても deadline より先に死因を確定する。deadline 時は最後にもう一度 reap を試し、生存しているときだけ `parent_kill_sent=True` を保存して killpg する。kill 後は最大 5 秒、non-blocking `wait4` だけを再試行する。
+`_read_response()` は reader queue だけを待たず、短い間隔で queue と `wait4(WNOHANG)` を競合させる。worker が死に、孫だけが stdout を保持しても deadline より先に死因を確定する。deadline 時は最後にもう一度 reap を試し、生存しているときだけ `parent_kill_sent=True` を保存して killpg する。kill 後は最大 5 秒、non-blocking `wait4` だけを再試行する。正常 close を含め、`PluginStrategyIntentSource.close()` は session 参照を消す前に親観測の `cpu_sec`、`worker_returncode`、`worker_signal` を adapter へ取り込む。handler の outer `finally` はこの診断を成功・失敗を問わず activity に渡し、close 応答の worker 自己申告 `cpu_sec` は protocol 互換のため残しても比較・fallback に使わない。
 
 5 秒以内に reap できなければ session は `UNREAPED_CLOSED` となる。CPU は `null`、分類は `crashed`、親側 fd は閉じる。この状態で 2 回目以降の `close()` と `__exit__()` は kill、reap、fd close をせず即 return する。
 
-unreaped `Popen` は session が参照を外さず、モジュール内の上限付き強参照 orphan リストへ移す。これにより destructor の cleanup 経路に渡さない。新 session 作成直前とサービス終了時に helper が各 orphan を一度だけ `WNOHANG` で試し、回収できればリストから外して技術ログに 1 行記録する。内部上限を超えても最古を捨てず、WARNING を 1 回だけ出す。
+unreaped `Popen` は session が参照を外さず、モジュール内の上限 64 の強参照 orphan リストへ移す。これにより destructor の cleanup 経路に渡さない。新 session 作成直前とサービス終了時に helper が各 orphan を一度だけ `WNOHANG` で試し、回収できればリストから外して技術ログに 1 行記録する。64 を超えても最古を捨てず、GC cleanup を避けるため保持したまま WARNING を 1 回だけ出す。64 は設定ノブにしない内部定数である。
 
 分類は親の行為と観測値だけで決める。
 
@@ -84,7 +85,7 @@ unreaped `Popen` は session が参照を外さず、モジュール内の上限
 | 生存 worker の `ok:false` | `plugin_error` | plugin/依存/validation/serialization failure |
 | invalid JSON、oversize、read failure | `protocol_error` | IPC protocol failure |
 
-CPU 判定の許容幅は 0 秒である。設定値 1、5、60 で CPU kill の親観測値が `>= limit` になることを実装前 harness で確認し、下回れば分類を実装せず裁定へ戻す。OOM、外部 kill、自発 kill が閾値近くで重なる誤分類、group 外へ逃げた孫の未回収・未計上は残余リスクとして隠さない。
+CPU 判定の許容幅は 0 秒である。設定値 1、5、60 で CPU kill の親観測値が `>= limit` になることを実装前 harness で確認し、下回れば分類を実装せず裁定へ戻す。OOM、外部 kill、自発 `SIGKILL` が閾値近くで重なる誤分類、kernel tick/float の丸め、worker が wait していない孫（特に group 外へ逃げた孫）の未計上・未回収は残余リスクとして隠さない。activity/技術ログに親観測 CPU と signal を併記し、人間が再判定できるようにする。
 
 `SandboxError` は互換 constructor `SandboxError(message, *, code="backtest_failed")` を持ち、既存の人間向け message は維持する。runtime lifecycle の分岐は具体 code を必ず指定し、stderr を `__str__` や diagnostic snapshot に含めない。
 
@@ -92,9 +93,9 @@ CPU 判定の許容幅は 0 秒である。設定値 1、5、60 で CPU kill の
 
 親は `Popen` 前に `TemporaryFile(mode="w+b")` を作り `stderr=` に渡す。所有者は `PluginSession` であり、startup failure、正常 close、timeout、EOF、oversize、明示 close を含む全 path で閉じる。`PIPE` と drain thread は使わない。TemporaryFile が作れないときは `DEVNULL` に限定フォールバックし、評価は続け、技術ログには固定値 `stderr_unavailable=true` を残す。
 
-回収時は末尾最大 8 KiB の bytes を読み、backslash、不正 UTF-8、Unicode `Cc`/`Cf`/`Zl`/`Zp` を可視 escape して 1 log record にする。先頭を落としたときは `truncated=true` を加える。raw bytes や複数行は logger に渡さない。worker は handshake 後、plugin/依存 import 前に `RLIMIT_CORE=(0,0)` を fail closed で設定する。host 側 core collector の完全封鎖は主張しない。
+回収時は末尾最大 8 KiB の bytes を読み、backslash、不正 UTF-8、Unicode `Cc`/`Cf`/`Zl`/`Zp` を可視 escape して 1 log record にする。先頭を落としたときは `truncated=true` を加える。tail が空なら `stderr_tail` 本文を出さない。raw bytes や複数行は logger に渡さない。worker は handshake 後、plugin/依存 import 前に `RLIMIT_CORE=(0,0)` を fail closed で設定する。pipe 型 `core_pattern` 等の host 側 collector が limit 0 をどう扱うかは host policy に依存するため、束 A だけでの完全封鎖は主張しない。
 
-技術ログには固定 prefix、plugin 名、内部 code、親 CPU、returncode/signal、`stderr_unavailable`、escaped `stderr_tail` だけを許す。stderr と、その有無を示す bool も、tool response、transcript、ledger、`last_result`、改善 prompt、report、activity、`SandboxError.__str__` へは出さない。改善 agent が `agentic.log` と `activity.log` を read/listdir できないことを実 worker の Landlock negative test と registry/context inventory の両方で固定する。
+技術ログには固定 prefix、plugin 名、内部 code、親 CPU、returncode/signal、`stderr_unavailable`、escaped `stderr_tail` だけを許す。stderr と、その有無を示す bool は、tool response、transcript、ledger、`last_result`、改善 prompt、report、activity、`SandboxError.__str__` へ出さない。改善 agent が `agentic.log` と `activity.log` を read/listdir できないことを実 worker の Landlock negative test と registry/context inventory の両方で固定する。
 
 ### 2.3 改善 agent: 固定公開分類と固定 hint を受ける
 
@@ -117,7 +118,7 @@ response に許すのは `error`、固定 `hint`、`started`、既存 wrapper �
 2. handler が `started:true, error:"worker_cpu_limit"` を返したときだけ、lock 内で +1 する。
 3. 観測数 2 は handler を呼ばず、候補枠も消費せず、`started:false, error:"repeated_worker_cpu_limit"` と固定 hint を返す。
 
-この 3 回目拒否だけは専用 finalization で ledger に残す。tool call として `total_calls`、`errors`、refusal streak は増えるが、候補別 `backtest_calls` と CPU 観測数は増えない。既存 3 種の preflight は変えない。`worker_crashed`、`worker_timeout`、`backtest_failed` は対象外であり、content hash または pair が変われば再試行できる。これは mission 終了保証ではない。
+この 3 回目拒否だけは専用 finalization で ledger に残す。tool call として `total_calls`、`errors`、refusal streak は増えるが、候補別 `backtest_calls` と CPU 観測数は増えない。既存 3 種の preflight は変えない。`worker_crashed`、`worker_timeout`、`backtest_failed` は対象外であり、content hash または pair が変われば再試行できる。これは mission 終了保証ではない。agent が hash/pair を変えて続行すれば、既存の候補別 6 回枠、budget refusal、refusal/tool-call 上限、runner の待ち loop が最終停止を担い、3 回目拒否だけで `abort_pending` を立てない。
 
 ### 2.5 人間: activity で backtest と live を読む
 
@@ -133,7 +134,7 @@ live producer は `ActivityLog` を composition root から受け、bucket 評�
 | `SandboxError(plugin_error)` / `SandboxError(protocol_error)` | `plugin_error` |
 | `SandboxError` 以外 | `internal_error` |
 
-抑制 key は `(plugin_name, content_hash, pair, bucket, result)` とする。key ごとに初回、以後 60 回抑制した次の試行（61、121、…回目）だけ activity と warning を出し、再通知に `suppressed_count=60` を載せる。成功、content hash 変更、bucket 放棄で key を解除する。抑制された結果も同じ写像を使う。cursor 不変、同 tick の break、次 tick の新 worker、scheduler 非終了は現状どおりである。
+抑制 key は `(plugin_name, content_hash, pair, bucket, result)` とする。key ごとに初回、以後 60 回抑制した次の試行（61、121、…回目）だけ activity と warning を出し、再通知に `suppressed_count=60` を載せる。成功、content hash 変更、bucket 放棄で key を解除する。抑制された結果も同じ写像を使う。cursor 不変、同 tick の break、次 tick の新 worker、scheduler 非終了は現状どおりである。live maintenance は同期 hook のままなので、束 A が保証するのは例外で scheduler を終了させないことまでであり、完了する重い plugin の wall 遅延や hook の非同期化は束 B の範囲である。
 
 ### 2.6 15m 戦略で実際に見えること
 
@@ -160,16 +161,20 @@ live producer は `ActivityLog` を composition root から受け、bucket 評�
 | IV-15 | `UNREAPED_CLOSED` の close/exit は冪等で追加の kill/reap/fd close をしない |
 | IV-16 | orphan `Popen` は強参照で保持し、helper 以外の cleanup/GC 経路へ渡さない |
 | IV-17 | 新 `backtest_cpu` は `parent_wait4` を明記し、旧 self-report 行と CPU を比較しない |
+| IV-18 | orphan リストは内部上限 64 を超えても最古を捨てず、WARNING は 1 回だけ出す |
+| IV-19 | raw grid metadata は replay 後にだけ得られ、束 A の planned call 数や CPU 予算式に使わない |
 
 ## 4. 受入条件
 
 | ID | 観測可能な受入条件 |
 |---|---|
 | AC-1 | 正常 close と異常終了の `cpu_sec` はともに親 `wait4` rusage であり、close 応答の偽 CPU は採用しない |
+| AC-1a | `PluginStrategyIntentSource.close()` は session 参照を消す前に親観測の CPU/returncode/signal を adapter へ取り込み、outer `finally` の activity が成功・失敗ともその診断を使う。逆変異: session 参照を先に消す。殺すテスト: close 応答の偽 CPU と親 `wait4` 診断を異なる値にした成功/失敗 fixture で、activity が親診断のみを記録することを assert する |
 | AC-2 | 全 reap は単一 helper を通り、1 PID を一度だけ wait する。fake process の `wait/poll` と、2 回目の `wait4` を fail にして各 path を検証する |
 | AC-2a | reap 不能後の `UNREAPED_CLOSED` は backtest/live/close/`__exit__` から復帰し、二重 close と close→`__exit__` は kill/reap/fd close を追加しない |
 | AC-2b | helper reap 後は `Popen` wait 系 API を混在させず、実 Popen の `ECHILD` harness でも returncode を固定する |
 | AC-2c | unreaped `Popen` は GC/`_cleanup` に触れず強参照 orphan に残り、後続 session 作成時の helper 試行で回収・技術ログ記録される |
+| AC-2d | orphan リストは 64 件を超えても最古を捨てず、WARNING は 1 回だけ出す。逆変異: 65 件目で最古を除去する、又は WARNING を都度出す。殺すテスト: unreaped fake を 65 件登録し、先頭を含む全参照が残ることと WARNING が 1 回だけであることを assert する |
 | AC-3 | 孫が stdout を保持しても worker 死亡を timeout より先に観測し、親 kill 未送信・非 timeout に分類する |
 | AC-4 | deadline 直前の死亡は元死因、生存時だけ kill-before-reap の timeout となる |
 | AC-5 | 設定値 1/5/60 の各 `RLIMIT_CPU` は厳密に `(n, n)` である |
@@ -179,6 +184,7 @@ live producer は `ActivityLog` を composition root から受け、bucket 評�
 | AC-9 | 大量 stderr でも停止せず、匿名 file は全 lifecycle path で close される |
 | AC-10 | 多数 session、TemporaryFile 失敗、孫 fd 継承を bounded に扱い、stderr 取得不能でも評価は継続する |
 | AC-11 | stderr tail は 8 KiB 以下の 1 行 escaped text で技術ログだけにあり、agent sink と例外文字列にはない |
+| AC-11a | 空の stderr tail は技術ログ本文から省略し、tail の有無 bool も agent 面に出ない。逆変異: 空 `stderr_tail` 又は `has_stderr_tail` を公開 sink に追加する。殺すテスト: 0 B stderr の fixture で技術ログに tail 本文がないこと、tool response/transcript/ledger/activity/例外文字列に両 field がないことを assert する |
 | AC-12 | CPU death の agent response は固定 `worker_cpu_limit`、hint、`started:true` だけで、内部診断を含まない |
 | AC-13 | timeout/crashed は別 streak、plugin/protocol/general failure と既存 no-history/pair 分岐は既存分類を保つ |
 | AC-14 | tool response、transcript、ledger `result_summary`、counter の error 値は同じ公開分類である |
@@ -285,4 +291,5 @@ pytest や実サービスではなく、実装 task の最初に小さい proces
 | 2026-09-21 | v0.2 | 可読化を先行する束へ分割し、typed 分類・stderr 隔離・activity・再試行抑制を定義 | 安全上限と予算設計を分離 | — |
 | 2026-09-21 | v0.3 | 親 wait4、soft==hard、core 無効化、死亡監視、sink 隔離、live 抑制を追加 | 観測の信頼境界と運用安全性を明確化 | — |
 | 2026-09-21 | v0.4 | reap 期限、許容幅 0、CPU source、preflight 規律、live 通知、実 Popen harness を明確化 | 境界条件と検証可能性を固定 | — |
-| 2026-09-21 | v1.0 | orphan 強参照・冪等終端状態・live 完全写像・runbook を反映して公開向けに清書 | 最終裁定を全設計要素へ反映 | (本 commit) |
+| 2026-09-21 | v1.0 | orphan 強参照・冪等終端状態・live 完全写像・runbook を反映して公開向けに清書 | 最終裁定を全設計要素へ反映 | `630edc8` |
+| 2026-09-21 | v1.1 | 清書時に圧縮で落ちた8契約と対応ACを復元 | 清書時の圧縮で落ちた契約の復元 | (本 commit) |
