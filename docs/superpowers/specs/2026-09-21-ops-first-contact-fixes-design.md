@@ -1,0 +1,336 @@
+# [ops-first-contact-fixes] 設計書 v1.0
+
+束: 2026-09-20 の実機運用でユーザー本人が直接踏んだ小さな不具合 3 件の是正。
+新しい機能・新しい配備経路・新しい自動化は作らない。3 件とも入口層 (`service.py` の起動時検査/配線、
+`commands.py` の CLI 分岐) の小改修に閉じる。
+
+対象:
+1. `[policy-add-unwired-in-service]` (台帳起票済、`.superpowers/sdd/plan10-plan/tickets.md:109`)
+2. `[secret-env-guard-false-positive]` (台帳起票済、`.superpowers/sdd/plan10-plan/tickets.md:110`)
+3. `improve add` が中身の無い課題文を受け付ける (未起票、本書で起票を兼ねる)
+
+下書き (調査記録 + 選択肢比較) は `tmp/design-ops-first-contact/design.md` (2026-09-21、ユーザー承認済)。
+本書はその承認内容を spec 化したもの。**設計判断は下書きから変えていない** — 本書は §0 にユーザー/指揮者の
+最終裁定 4 点を追記し、§2〜§6 を実装プランが直接参照できる形 (動作目線 + AC + file:line) に整理した。
+
+対象コードは main `ceedd1d` 時点の現物。
+
+---
+
+## 0. 位置づけとユーザー裁定 (2026-09-21)
+
+下書きの推奨 (各件 A 案) は **3 件ともユーザー承認 (2026-09-21)**。加えて指揮者が以下 4 点を決めた:
+
+| # | 論点 | 裁定 |
+|---|---|---|
+| R1 | 件 2: 許可リストの置き場所 | **`service.secret_env_allowlist` を新設**。既存の `runner.*` 配下には合流させない (backend 選択の意味論と別物のため) |
+| R2 | 件 2: エラー文に当たったパターン名を含めるか | **含める** (デバッグ性優先。標準エラーは外部公開されない) |
+| R3 | 件 3: 警告条件 | **「strip 後の可視文字数が 4 文字未満」または「全体が `<…>` か `[…]` の形」のどちらか**。**登録は止めない** (非ブロッキング、拒否しない) |
+| R4 | 件 3: 対話確認 (2 段階) | **見送り、`[ops-ui]` 方針の設計時に改めて検討**。本束は echo-back + 非ブロッキング警告のみ |
+
+下書きで退けた案 (件 2 のパターン語境界化・値検査、件 3 の入力ブロック・対話確認) は本書でも退けたまま —
+理由は各件の §3 に転記する。
+
+---
+
+## 1. スコープと非スコープ
+
+**スコープ**
+- `src/agentic_fx/service.py`: `build_app` の `Commands(...)` 呼び出しに `policy_path` を追加 (件 1)。
+  `_check_service_initial_env_has_no_secrets` に allowlist 適用 + `which`/`backend`/当たったパターンを
+  メッセージに埋め込む (件 2)。
+- `src/agentic_fx/config.py`: `ServiceSettings.secret_env_allowlist: list[str] = []` を新設し
+  `Settings.service` として追加 (件 2)。
+- `src/agentic_fx/commands.py`: `improve add` の応答に登録原文を echo-back + 条件付き警告 1 行 (件 3)。
+- `config/settings.yaml.example`: 新規キー `service.secret_env_allowlist` を追記・コメント付け (件 2)。
+- `tests/test_service_app.py`: 件 1 の配線テスト 2 本 (個別 + 構造的シグネチャ突合)、件 2 の allowlist / メッセージテスト。
+- `tests/commands/test_improve_commands.py`: 件 3 の echo-back / 警告条件テスト。
+
+**非スコープ (明示)**
+- **件 2 のパターン変更** (`_SECRET_ENV_PATTERNS` の中身・照合ロジック自体)。既存の回帰 pin
+  (`tests/test_service_app.py::test_check_service_initial_env_has_no_secrets_rejects_each_pattern`
+  の `"SECRETSTUFF"` = 境界なし部分一致の pin) を維持する。本束はパターンの**外側**に allowlist を足すだけ。
+- **件 3 の入力ブロック・対話確認**。警告は表示のみで登録を止めない (R3)。2 段階確認は `[ops-ui]` へ (R4)。
+- **改善 mission 側の「課題文が意味を成さない」判断ロジック**。`improve_loop.py` の
+  `_upsert_backlog_idea` やプロンプト設計には触れない — mission が選んだ backlog 項目をどう解釈するかは
+  改善ループの設計 (spec) 側の話で、この束の規模を超える。**別途 ticket として申告**
+  (`[improve-mission-no-bearing-idea-handling]`、本書末尾「残余」参照)。
+- **`Commands.__init__` の必須引数化**。下書きで検討した C 案 (デフォルト `None` 全廃) は
+  既存の大量のテスト呼び出し元を洗い出す規模になるため見送り。件 1 の構造的テスト (AC-1c) で代替する。
+- **`policy_path` 以外の未配線調査の再実施**。下書きで全数確認済み (5 個のオプション引数のうち未配線は
+  `policy_path` のみ) — 本束はその結果を前提にする。
+
+---
+
+## 2. 動作目線の設計 (誰が何をどう扱うか)
+
+### 2.1 件 1: `policy add` を打つ人 (人間、`afx>` シェル)
+
+**現状**: `afx> policy add 週末はドル円のみ` と打つと、常に
+`policy directives の path が未配線です` が返り、`policy/directives.md` に何も書かれない
+(本番の `Commands` に `policy_path` が渡っていないため)。取引・改善 mission への反映経路
+(`policy/directives.md` を都度読み直す) 自体は生きているので、手でファイルを編集すれば効くが、
+CLI からは一切書けない。
+
+**直した後**: 同じコマンドを打つと `policy に追記しました` が返り、`policy/directives.md` に
+`\n- 週末はドル円のみ\n` が追記される。次回以降の mission (取引・改善) の prompt にこの行が乗る
+(`Policy.tail` が毎回読み直すため再起動不要 — 既存動作のまま、変更なし)。
+
+### 2.2 件 2: CLI backend (claude/codex/opencode) でサービスを起動する人 (人間、シェル起動)
+
+**現状**: `runner.trade.backend: codex` (または improve 側) でサービスを起動すると、
+起動時検査⑤が自身の初期 env (`/proc/self/environ`) を走査し、`~/.bashrc` の
+`CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` (llama-swap のコンテキスト長の表、秘密ではない) を
+`OPENAI_` パターンで誤検知し、
+`improve+claude backend refuses to start: ... contains secret-like variable name(s) ['CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS'] ...`
+と表示して**起動を拒否する**。`which`/`backend` は実際が `trade`/`codex` でも文言は常に
+`improve+claude` 固定で嘘をつく。暫定運用は `env -u CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS uv run python main.py`。
+
+**直した後**:
+- `settings.yaml` に何も足さずに起動した場合、拒否メッセージは実態を正確に言う:
+  `trade+codex backend refuses to start: service initial env contains secret-like variable name(s) ['CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS'] (matched pattern 'OPENAI_') — improve/trade worker can read /proc/self/environ of same-UID processes (R10). If this name is NOT a secret, either (a) unset it before starting the service, or (b) add its exact name to service.secret_env_allowlist in settings.yaml. Otherwise move the value into .env.`
+  (`which`/`backend` が実値、当たったパターン名を含む、次の一手 2 つを案内)
+- `settings.yaml` に
+  ```yaml
+  service:
+    secret_env_allowlist: [CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS]
+  ```
+  を足してから起動すると、この名前だけが除外され、他に秘密っぽい名前が無ければ起動できる。
+  allowlist に載っていない秘密っぽい名前が env にあれば従来通り拒否される (守りは弱めない)。
+
+### 2.3 件 3: `improve add` を打つ人 (人間、`afx>` シェル)
+
+**現状**: `afx> improve add <案 1>` と打つと `backlog #77 を追加しました` とだけ返り、
+登録された課題文そのものは画面に出ない。ユーザーは自分が打った内容の記憶に頼るしかなく、
+手順書の置換記号を打ち間違えたことに気づく手掛かりが無い。後日、改善 mission #86 がこの
+4 文字を「自分なりに解釈」して戦略を 1 本作り承認申請まで出した。
+
+**直した後**:
+```
+afx> improve add <案1>
+backlog #78 を追加しました: 「<案1>」
+⚠ 短い/プレースホルダのように見えます。意図した内容であることを確認してください (削除・訂正は `backlog reject 78` の上で `improve add` をやり直す)
+```
+```
+afx> improve add USDJPY のスプレッドが広い時間帯の指値精度を上げたい
+backlog #79 を追加しました: 「USDJPY のスプレッドが広い時間帯の指値精度を上げたい」
+```
+(警告は R3 の条件に合致したときだけ 2 行目に出る。合致しなければ 1 行のみ。**登録はどちらも成立する** — 拒否しない)
+
+---
+
+## 3. 件ごとの設計 (前提を疑う節・選択肢・退けた案)
+
+### 3.1 件 1
+
+**現物確認 (全数)**: `Commands.__init__` (`commands.py:38-61`) のオプション引数 5 個
+(`health_latch` / `improve_supervisor` / `policy_path` / `plugins_root` / `settings`) のうち、
+`build_app` の `Commands(...)` 呼び出し (`service.py:1054-1060`) が渡していないのは **`policy_path` のみ**。
+他 4 個は正しく配線されている。`policy_path` が `None` のときの唯一の影響範囲は `dispatch()` の
+`policy add` 分岐 (`commands.py:284-294`) だけで、他コマンドへの副作用はない。
+
+既存の配線テスト (`tests/test_service_app.py:120` `test_build_app_wires_everything` とその周辺)
+は `conn`/`broker`/`health_latch` は確認しているが、`policy_path`/`plugins_root`/`settings` は
+1 本も検証していない。ユニット側 (`tests/commands/test_improve_commands.py:181-188`) は
+`cmds._policy_path = ...` の直接代入で常に緑になっており、これが本番の未配線を隠していた
+([[verify-integration-not-just-units]] の実例)。
+
+**前提を疑う**: 「`policy_path` を足すだけ」で直るが、`Commands.__init__` は今後も引数が増える設計
+(実際プラン 7〜11 で段階的に増えた)。個別テストを 1 本足すだけでは「次に増える引数」の配線漏れを
+検出できない。→ **構造的な配線検査**を対案として採用する: `Commands.__init__` のオプション引数名の集合を
+`inspect.signature` で取り、`build_app` が構築した `Commands` インスタンスの対応属性が (デフォルトの
+`None`/falsy のままでなく) 実際に設定されていることを機械的に確認する 1 本を足す。
+
+**選択肢**:
+- **A (採用)**: `policy_path` 配線 + 個別配線テスト + 構造的シグネチャ突合テスト。
+  採用根拠: このバグ自体が「引数を足したのに呼び出し側を直し忘れた」形なので、個別 pin だけでは
+  同型の再発を防げない。構造的テストの実装コストは低い (introspection のみ、実行時オーバーヘッドなし)。
+- B: `policy_path` の配線だけ直し、個別テストのみ足す。次に同型の引数が増えたとき再発しうる。**退ける**。
+- C: `Commands` のオプション引数を必須化。全呼び出し元 (`tests/commands/*` 含む) の書き換えが要り、
+  本束の規模を超える。**退ける** (将来検討事項として非スコープに記録)。
+
+### 3.2 件 2
+
+**現物確認**: `_SECRET_ENV_PATTERNS = ("_API_KEY", "TOKEN", "SECRET", "WEBHOOK", "ANTHROPIC_", "OPENAI_")`
+(`service.py:200-201`)、照合は `any(pat in k.upper() for pat in _SECRET_ENV_PATTERNS)`
+(`service.py:285-286`) — 完全な部分一致、アンカーも語境界もない。`CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS`
+が当たったのは `"OPENAI_"` (文字列中央に語境界付きで出現)。検査は `_check_cli_backend` の末尾
+(`service.py:373`) から呼ばれ、`which="trade"` と `which="improve"` の両方の経路で backend が
+`local` 以外なら実行される (`build_app` は両方を呼ぶ) — **trade 側でも走る**。エラーメッセージは
+`which`/`backend` を無視して常に `"improve+claude"` 固定 (`service.py:288-289`)。
+
+設計書該当箇所 (`docs/superpowers/specs/2026-08-16-phase2-10-improve-loop-design.md` R10、§1.4-⑤、
+§2.2、§2.4) の脅威モデル: claude/codex/opencode worker は Landlock 下で `/proc` read-only を許可され、
+同一 UID の他プロセスの `/proc/<pid>/environ` (exec 時点の初期 env のみ、`load_dotenv()` 経由の
+`os.environ` セットは対象外) を読める。検査はこのプロセス自身の初期 env に秘密**名**が無いことだけを
+名前ベースで確認する — 値は一切読まない設計。
+
+**既存の回帰 pin**: `tests/test_service_app.py:3086-3097`
+(`test_check_service_initial_env_has_no_secrets_rejects_each_pattern`) は `leaked_name` に
+`"SECRETSTUFF"` (前後どちらの境界も無い純粋な部分一致) を明示的に pin している。コメントに
+「`endswith` へ緩める変異が生存するのを防ぐため」とある — **部分一致であること自体が意図的な設計判断**。
+
+**前提を疑う**: 「パターンを絞れば直る」という前提を疑う。`OPENAI_` を前方一致限定にしても、
+`CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` は `OPENAI_` が `_` で挟まれた独立セグメントとして
+文字列の中央に出現するため、語境界化 (`\bOPENAI_\b` 相当) でもこの誤検知は解消しない。
+前方一致限定 (`k.startswith("OPENAI_")`) なら回避できるが、同時に「変数名の途中に埋め込まれた
+本物の秘密名」の検出力を落とし、かつ既存 pin (`SECRETSTUFF`) と正面衝突する。**パターン側の調整では
+守りを弱めずにこの誤検知だけを消すことはできない**。
+
+**選択肢**:
+- **A (採用)**: パターンは無変更 + 明示的ユーザー宣言のホワイトリスト (`service.secret_env_allowlist`、
+  既定空) + エラーメッセージ修正 (`which`/`backend`/当たったパターン名を実値にする)。
+  採用根拠: ①脅威モデル (R10) を一切弱めない — allowlist 未記載の変数は従来通り fail closed
+  ②ユーザーの意思決定を明示的な設定行として残す (黙って通すのではなく「これは秘密でないと自分で
+  確認した」という記録になる、[[product-vision-grown-by-its-user]] の「育てる」哲学と合致)
+  ③実装コストが小さい (`leaked` の内包表記に 1 条件足すだけ) ④メッセージが正確になり、初めて
+  遭遇したユーザーも正確に読める。
+- B: パターンを前方一致/語境界化に変更。当該誤検知を解消できず、既存 pin と衝突する。**退ける**。
+- C: 変数名でなく値の形状で判定。「値を見ずに名前だけで守る」という検査の設計原則 (`.env` 経由の値は
+  最初から対象外) と矛盾し、値をエラーメッセージ/ログに載せるリスクを新たに生む。**退ける**。
+
+### 3.3 件 3
+
+**現物確認 (投入経路の全数)**: `backlog.add()` (`store/backlog.py:42-52`) の呼び出し元は
+**`commands.py` の `improve add` (`commands.py:215-223`) 1 箇所のみ** — 人間の手入力経路はここだけ。
+検証は「空文字でないこと」のみ、`idea.strip().lower()` の正規化以外に長さ・内容の検査は無い。
+改善 mission 自身の discovery/研究由来の投入は別関数 `improve_loop._upsert_backlog_idea`
+(`improve_loop.py:1391-1421`) で、こちらも同様に長さ・内容の妥当性検査は無い (対象外、後述)。
+`upsert_system_note` (`backlog.py:19-38`) は system note 専用で人間入力とは無関係。
+
+改善 mission 側に「選ばれた backlog 項目の課題文が意味を成さない」と判断して observation に
+落とす専用経路は無い — 既存の `observation` 遷移は全て決定論的なライフサイクルイベント
+(`interrupted`/`report_failed`/gate 不合格、`improve_loop.py:673`,`1815` 他) の発火であり、
+LLM が内容を読んで判断する形の `observation` 落としは存在しない。
+
+**前提を疑う**: 「入力検証で防ぐ」を最初の対策にする前提を疑う。プレースホルダ記号や極端な短さは
+機械的に定義しづらく (正当な短い課題文もありうる)、ヒューリスティックな入力検証は
+「今回のパターンだけ狭く塞ぐ」か「広く塞いで正当な短文まで弾く」かのトレードオフを常に抱える。
+一方、今回の不具合の本質は「ユーザーが自分の入力ミスに気づける手掛かりが画面に無かった」ことであり、
+入力を機械的に弾くことではない。**登録直後に登録された課題文をそのまま見せて確認させる方が
+[[product-vision-grown-by-its-user]] の製品像に合う** — あらゆる種類の入力ミス (プレースホルダに
+限らずタイプミス・貼り付け位置ずれ) に一般化して効き、実装コストも最小。
+
+改善 mission 側の判断ロジック追加 (「意味を成さない」の検出、プロンプト変更) は、この束の対象外
+(§1 非スコープ参照、別途 ticket 化)。
+
+**選択肢**:
+- **A (採用)**: echo-back (登録直後に課題文を逐語表示) + 非ブロッキング警告
+  (R3 の条件: 可視 4 文字未満、または全体が `<…>`/`[…]` の形)。登録は止めない。
+  採用根拠: ①一般化する (echo-back は入力ミスの種類を問わず効く) ②資金・承認に関わらない低リスク
+  操作なので「拒否」でなく「見せる + 軽く警告」で十分 ③実装が CLI 表示層のみに閉じ、遮断規律・承認の
+  重みに触れない ④[[product-vision-grown-by-its-user]] の「失敗や空振りが見える・理由が分かる」に直接合致。
+- B: echo-back のみ (警告なし)。実装最小だが、破綻パターンでも特筆しないので見落とし率が上がる。
+  今回は R3 で A (警告あり) を裁定したため **退ける**。
+- C: 最小文字数/プレースホルダパターンで拒否 (ブロッキング)。正当な短文を弾く恐れがあり、
+  資金操作でも承認操作でもない操作を拒否までする理由が乏しい。**退ける**。
+- D: 対話 2 段階確認。`Commands.dispatch(line: str) -> str` が 1 行 1 応答の同期モデルであり、
+  複数行にまたがる確認フローを持たない。R4 により **`[ops-ui]` へ先送り**。
+
+---
+
+## 4. 不変条件・遮断規律との関係
+
+| ID | 不変条件 | この束での扱い |
+|---|---|---|
+| IV-1 | 秘密 env の守りを弱めない | 件 2 は `_SECRET_ENV_PATTERNS` を 1 文字も変えない。allowlist は**名前の完全一致のみ**で、パターン/正規表現/前方一致は不可 (実装で `k in allowlist` の単純な集合所属判定にする — ワイルドカードを許すと守りが弱まる)。allowlist が空 (既定) のときの挙動は現状と完全に同じ (既存 pin 全数が退行しないことを AC で確認する) |
+| IV-2 | 遮断 8 (改善プロンプトへの人間判断の漏洩) | 件 3 の echo-back・警告文言は `Commands.dispatch` の**戻り値 (端末表示) にのみ**書く。`backlog.idea` (ユーザーの原文そのもの、これは元々改善プロンプトに乗る設計) 以外の新しい文字列 (警告文・確認文言) を `improvement_backlog.last_result` / `approval_requests.reason` などの改善プロンプト注入経路の DB 列に書き込まない。件 1・件 2 は DB 書き込みを増やさない |
+| IV-3 | 承認の重みを変えない | 3 件とも承認 (`approve`/`reject`/plugin 切替) のフローに触れない。件 3 の登録は従来通り `status='open'` で、改善ループの選択・承認プロセスは無変更 |
+| IV-4 | `.env` を読まない / 値を読まない (件 2) | 件 2 の allowlist は変数**名**の集合であり、実装・テストとも env の**値**を読む経路を増やさない (既存の `_read_proc_self_environ_names` は名前だけを返す契約のまま) |
+
+---
+
+## 5. 受入条件 (ID 付き、観測可能)
+
+### 件 1
+
+| ID | 観測 |
+|---|---|
+| **AC-1a** | `build_app` で構築した `App.commands._policy_path == root / "policy" / "directives.md"` |
+| **AC-1b** | `build_app` 経由で構築した `Commands` に対し `dispatch("policy add こんにちは")` を実行すると `policy/directives.md` に追記され、戻り値が `"policy に追記しました"` |
+| **AC-1c** | **構造的テスト**: `Commands.__init__` のキーワード専用オプション引数名の集合 (`{"health_latch", "improve_supervisor", "policy_path", "plugins_root", "settings"}`) と、テスト側が保持する「パラメータ名 → `Commands` インスタンス属性名」対応表 (`{"health_latch": "health_latch", "improve_supervisor": "improve_supervisor", "policy_path": "_policy_path", "plugins_root": "plugins_root", "settings": "settings"}`) のキー集合が一致する (新しいオプション引数が対応表に無ければこの比較で red — 対応表の更新を強制する)。かつ `build_app` で構築した `App.commands` の各対応属性が **falsy でない** (`None`/`""`/`0` のいずれでもない) ことを確認する |
+
+**変異案**: `policy_path=` の行を削除 → AC-1a/AC-1b が red。`Commands.__init__` にダミーのオプション引数を追加し
+対応表を更新しない → AC-1c が red (この束で一番大事な変異 — 「次の再発」を模擬する)。
+
+### 件 2
+
+| ID | 観測 |
+|---|---|
+| **AC-2a** | `settings.service.secret_env_allowlist` に `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` を含めた settings で `_check_service_initial_env_has_no_secrets` を呼ぶと、他に秘密っぽい名前が無い限り例外を投げない |
+| **AC-2b** | allowlist が空 (既定) のとき、既存の全 pin (6 パターン + 小文字混在 + `SECRETSTUFF`) が**そのまま red のまま**維持される (退行防止の回帰確認、既存テストの書き換えなしで緑のまま) |
+| **AC-2c** | エラーメッセージに実際の `which` (`trade`/`improve`) と実際の `backend` (`claude`/`codex`/`opencode`) が入る (trade+codex で拒否したとき `improve+claude` と出ない) |
+| **AC-2d** | エラーメッセージに「当たったパターン名」と「allowlist へ追加する」案内文言が入る |
+| **AC-2e** | allowlist の一致は**完全一致のみ** — `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` を allowlist に入れても `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS_V2` のような類似名は除外されない (部分一致・前方一致に広げていないことの pin) |
+
+**変異案**: `k not in allowlist` の条件を落とす → AC-2a が red。allowlist 判定を `in` から
+先頭一致 (`any(k.startswith(a) for a in allowlist)`) に緩める → AC-2e が red。
+メッセージ文字列から `which`/`backend`/パターン名の埋め込みを外す → AC-2c/AC-2d が red。
+
+### 件 3
+
+| ID | 観測 |
+|---|---|
+| **AC-3a** | `dispatch("improve add 何かの課題")` の戻り値に、登録した idea の原文 (正規化前、ユーザーが打った通りの文字列) が `「…」` の形で含まれる |
+| **AC-3b** | idea が `<…>` または `[…]` で完全に囲まれている、または strip 後の可視文字数が 4 未満のとき、戻り値に警告行 (`⚠` で始まる) が追加される |
+| **AC-3c** | AC-3b の条件に合致しない (通常の長さ・非プレースホルダの) idea では警告行が付かない (否定側 pin) |
+| **AC-3d** | 警告が出ても `backlog.add` は実行され、登録された行の `status` は従来通り `'open'` (ブロックしない) |
+| **AC-3e** | echo-back・警告文言のいずれも `improvement_backlog.last_result` / `approval_requests.reason` 等 DB 列に新規の文字列を書き込まない (`dispatch` の戻り値以外に副作用が増えないことを確認する。activity ログの記録内容も従来 (`"#{bid} via shell"`) から変えない) |
+
+**変異案**: echo-back の文字列連結を消す → AC-3a が red。警告条件の `<`/`[` 判定を落とす、
+短さ閾値 (`< 4`) を変える → AC-3b・AC-3c の両方 (正例・否定側) で検出。`backlog.add` 呼び出しを
+警告分岐の中に誤って移動する (警告時にブロックしてしまう退行) → AC-3d が red。
+
+---
+
+## 6. 変更ファイル一覧
+
+| ファイル | 変更 | 件 |
+|---|---|---|
+| `src/agentic_fx/service.py` | `Commands(...)` に `policy_path=` 追加 / `_check_service_initial_env_has_no_secrets` に allowlist・`which`・`backend`・当たったパターンの引き渡し / `_check_cli_backend` の呼び出し変更 | 1・2 |
+| `src/agentic_fx/config.py` | `ServiceSettings` 新設、`Settings.service` フィールド追加 | 2 |
+| `src/agentic_fx/commands.py` | `improve add` 分岐: echo-back + 警告判定 | 3 |
+| `config/settings.yaml.example` | 新規キー `service.secret_env_allowlist` を追記 (下記「settings.yaml.example の同期」参照) | 2 |
+| `tests/test_service_app.py` | AC-1a〜AC-1c、AC-2a〜AC-2e | 1・2 |
+| `tests/commands/test_improve_commands.py` | AC-3a〜AC-3e | 3 |
+
+### `settings.yaml.example` の同期 (CLAUDE.md 規約)
+
+新規キー `service.secret_env_allowlist` を `config/settings.yaml.example` に追加する
+(実装 task の対象、T2 が行う)。コメント案:
+```yaml
+service:
+  secret_env_allowlist: []   # ⑤検査 (起動時、CLI backend のみ) が誤検知した exported env 変数の名前をここに書くと除外される。
+                              # 名前の完全一致のみ (パターン不可)。値は見ない — 本当に秘密でないと自分で確認してから追加すること
+```
+
+**`config/settings.yaml` (ユーザーの個人設定、gitignore) は実装 task では触らない** — pydantic の
+`Settings.service` はデフォルト値 (`Field(default_factory=ServiceSettings)`) を持つため、個人設定に
+このキーが無くても起動できる。`CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` を実際に allowlist へ入れたい場合は
+**ユーザー自身が** 個人 `settings.yaml` に以下の 1 行を足す (runbook 的な案内、実装ではない):
+```yaml
+service:
+  secret_env_allowlist: [CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS]
+```
+
+---
+
+## 7. 残余 (この束で閉じない項目)
+
+- **`[improve-mission-no-bearing-idea-handling]` (新規申告)**: 改善 mission が選択した backlog 項目の
+  課題文が意味を成さない場合に、mission 側で「解釈を試みず observation へ落とす」判断ロジックを持たせるか。
+  §3.3 で検討したが、改善ループのプロンプト/判断設計 (spec) 側の変更でありこの束の規模を超えるため
+  ticket 化のみ行い、設計は別途起こす。
+- **未確認事項**: ユーザーの実 `~/.bashrc` の中身 (値・変数名とも) — 下書き作成時点ではこのセッション自身の
+  env 変数名一覧 (`CLAUDE_CODE_MESSAGING_TOKEN` が `TOKEN` パターンに当たる例) で代替観測した。
+  実機の `env | cut -d= -f1` (値は読まない) を別途確認すれば、allowlist に載せるべき他の名前が
+  見つかる可能性がある。件 3 の echo-back 導入で実際に #77→#86 のケースでユーザーが気づけたかは
+  実装後の実運用でしか確認できない。
+
+---
+
+## 8. 変更履歴
+
+| 日付 | 版 | 変更 | 理由 | commit |
+|---|---|---|---|---|
+| 2026-09-21 | v1.0 | 初版。`tmp/design-ops-first-contact/design.md` (下書き、3 件とも A 案) のユーザー承認 (2026-09-21) を受けて spec 化。§0 に指揮者裁定 4 点 (R1〜R4: allowlist 置き場所 `service.*` 新設 / エラー文にパターン名を含める / 件 3 警告条件 = 4 文字未満 or `<…>`/`[…]` 完全一致・非ブロッキング / 対話確認は `[ops-ui]` へ先送り) を追加し、AC・変更ファイル表・不変条件表・`settings.yaml.example` 同期方針 (個人 `settings.yaml` はユーザー自身が追記するランブック扱い) を新設 | 下書き承認 + 指揮者裁定 | (本 commit) |
