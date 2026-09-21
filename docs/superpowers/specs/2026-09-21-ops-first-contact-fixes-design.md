@@ -1,4 +1,4 @@
-# [ops-first-contact-fixes] 設計書 v1.2
+# [ops-first-contact-fixes] 設計書 v1.3
 
 束: 2026-09-20 の実機運用でユーザー本人が直接踏んだ小さな不具合 3 件の是正。
 新しい機能・新しい配備経路・新しい自動化は作らない。3 件とも入口層 (`service.py` の起動時検査/配線、
@@ -362,6 +362,7 @@ spy wrapper への monkeypatch が `build_app` の他の挙動を壊さない。
 | **AC-2e** | allowlist の一致は**完全一致のみ** — `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` を allowlist に入れても `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS_V2` のような類似名は除外されない (部分一致・前方一致に広げていないことの pin) |
 | **AC-2f** (v1.1、新規) | allowlist に載っていて、かつ初期 env に実在し、かつ秘密名パターンに当たった名前 (= 実際に除外された名前) があれば、起動時に WARNING が 1 回出る。ログ本文に変数**名**のみ (ソート済み) を含み、値に相当する文字列は含まない。allowlist に載っているが env に無い名前・パターンに当たらない名前がある場合は WARNING を出さない (雑音にしない)。除外が 0 件のとき (allowlist が空、または allowlist と env の交差が無いとき) は WARNING を出さない。**(v1.2、codex r2 W3)** 「パターンに当たらない名前では出さない」条件と「複数名はソート順」の 2 点をそれぞれ個別にテストで pin する |
 | **AC-2g** (v1.2、新規、codex r2 W1) | `build_app` は `_check_cli_backend` を `which="trade"` → `which="improve"` の順に呼ぶ (`service.py:851-852`)。trade 側が非 local backend のとき、検査⑤に実際に渡る `which` は `"trade"` である (改行を跨いだ「`which` が `"improve"` に固定されていても見た目上は動く」という変異を、trade 経路でも検出できることの pin) |
+| **AC-2h** (v1.3、新規、codex 1周目レビュー Important F1) | `_read_proc_self_environ_names` が非 UTF-8 な env 名を `errors="replace"` で復号すると、異なる生バイト列の名前が同じ U+FFFD 入り文字列に多対一で潰れる可能性がある。allowlist は**この復号後文字列に U+FFFD (`�`) を含む名前を除外対象にしない** (fail-closed — 通常の秘密名パターン検査に回し、当たれば起動拒否のまま。読み取り側の復号方式 [`errors="replace"`] 自体は変えない) |
 
 **変異案**: `k not in allowlist` の条件を落とす → AC-2a が red。allowlist 判定を `in` から
 先頭一致 (`any(k.startswith(a) for a in allowlist)`) に緩める → AC-2e が red。
@@ -372,6 +373,9 @@ WARNING の呼び出しを削除する、または条件を「allowlist 非空�
 AC-2f の否定側 (パターン不一致) が red。`sorted(excluded_by_allowlist)` の `sorted` を外す →
 AC-2f のソート順 pin が red。`_check_cli_backend` 内で `which=which` を `which="improve"` に固定する →
 AC-2g が red (v1.2、`which="improve"` 固定変異が v1.1 の 2 本の pin では検出できなかったことに対する追加)。
+**(v1.3 追加)** `"�" not in k and k in allowlist` の `"�" not in k and` を落とす (元の
+`k in allowlist` に戻す) → AC-2h が red (U+FFFD を含む名前が allowlist で除外されてしまい、拒否も
+WARNING も起きない)。
 
 ### 件 3
 
@@ -451,3 +455,4 @@ service:
 | 2026-09-21 | v1.0 | 初版。`tmp/design-ops-first-contact/design.md` (下書き、3 件とも A 案) のユーザー承認 (2026-09-21) を受けて spec 化。§0 に指揮者裁定 4 点 (R1〜R4: allowlist 置き場所 `service.*` 新設 / エラー文にパターン名を含める / 件 3 警告条件 = 4 文字未満 or `<…>`/`[…]` 完全一致・非ブロッキング / 対話確認は `[ops-ui]` へ先送り) を追加し、AC・変更ファイル表・不変条件表・`settings.yaml.example` 同期方針 (個人 `settings.yaml` はユーザー自身が追記するランブック扱い) を新設 | 下書き承認 + 指揮者裁定 | (本 commit) |
 | 2026-09-21 | v1.1 | §0.1 に codex r1 の反映を追記。V1: 既存テストの `object()` 引数 stub が `AttributeError` になることを認め、Global Constraints・スコープ側の記述を訂正 (本番コードへの互換層は入れない)。V2: AC-2f (allowlist 除外時の起動 WARNING、値は出さず名前のみ) を新設、IV-1 に追記。V3: AC-1c を truthy 検査から spy 方式 (kwargs 記録 wrapper) に書き換え、`health_latch` の truthy-default 見逃しを解消。V4: AC-3a/AC-3b を Unicode 正規化 (改行→空白 + カテゴリ C* 除去) 基準に書き換え、AC-3f〜AC-3h (ゼロ幅文字・端末制御列・複数行) を新設。全角括弧検出・長さ上限・対話確認は不採用のまま (非スコープに明記) | codex 設計レビュー r1 (Important 4 件、Critical 0) | `34d3dc9` |
 | 2026-09-21 | v1.2 | §0.2 に codex r2 の反映を追記。W1: AC-2g (trade 非 local 経路での `which` 転送 pin) を新設 — v1.1 の pin 2 本は trade=local のため `which="improve"` 固定変異を検出できていなかった。W2: WARNING テストを `caplog` から `logging.getLogger("agentic_fx.service")` への直接 handler 付与に変更 (`agentic_fx` logger の `propagate=False` 固定に依存しない)。W3: AC-2f に否定側 (非秘密パターン名) とソート順の pin を追加。W4: AC-3a/AC-3d の「逐語」を「tokenizer (`commands.py:63-67`) 通過後の文字列」と定義し直し、tokenizer の空白畳み込み変更は非スコープに明記、AC-3i (保存側は C* 文字を含め無加工) を新設。M1/M2: T3 の新規テスト本数記載・§6 変更ファイル表を実数/実 AC に合わせて訂正 | codex 設計レビュー r2 (Important 4 件・Minor 2 件、Critical 0) | (未コミット) |
+| 2026-09-21 | v1.3 | §1.4 AC-2c/2d 引用のエラー文言を r1-fix C (実装コードレビュー1周目) に合わせて同期 (`improve worker can read...` → `same-UID CLI worker can read this service's /proc/<pid>/environ`、呼び出し元 loop を名指ししない表現に統一)。AC-2h を新設 — codex 実装コードレビュー1周目 Important F1: `_read_proc_self_environ_names` の `errors="replace"` 復号が異なる生バイト列の env 名を同じ U+FFFD 入り文字列に潰し得るため、U+FFFD を含む名前は allowlist で除外しない (fail-closed) | 実装コードレビュー1周目 (codex Important 1 件 [F1]・Minor 1 件 [policy パス一元化、対象外] + ローカル3本確定3件 [P1〜P3、テスト側のみ]) | (未コミット) |

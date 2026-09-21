@@ -1,6 +1,6 @@
-# [ops-first-contact-fixes] 実装プラン v1.3
+# [ops-first-contact-fixes] 実装プラン v1.4
 
-設計書: `docs/superpowers/specs/2026-09-21-ops-first-contact-fixes-design.md` v1.2。
+設計書: `docs/superpowers/specs/2026-09-21-ops-first-contact-fixes-design.md` v1.3。
 v1.1 (main `34d3dc9` コミット済) からの変更点は末尾「変更履歴」。v1.0→v1.1 裁定の詳細は
 `tmp/design-ops-first-contact/codex-r1/verdicts.md`、v1.1→v1.2 裁定 (W1〜W4/M1/M2、全件採用) の根拠は
 `tmp/design-ops-first-contact/codex-r2/codex-out.md`。
@@ -239,6 +239,15 @@ def test_commands_optional_params_all_wired_by_build_app(tmp_path, monkeypatch):
 | T1-M2 | `EXPECTED_OPTIONAL_PARAMS = {...}` (5 エントリ) | `policy_path` のエントリだけ削除した 4 エントリ版 | `test_commands_optional_params_all_wired_by_build_app` (集合比較 `optional_params == EXPECTED_OPTIONAL_PARAMS` が false) |
 | T1-M3 (この束で一番大事な変異、「次の再発」の模擬) | `Commands.__init__` にダミーのオプション引数 (例 `dummy_flag: bool = False`) を 1 個追加し、`build_app` の `Commands(...)` 呼び出しに**対応する行を足さない** | (上記の追加のみ) | `test_commands_optional_params_all_wired_by_build_app` (対応表とシグネチャの集合が食い違う) |
 | T1-M4 (v1.1 追加、codex r1 V3 の killer) | `build_app` の `Commands(...)` 呼び出しから `health_latch=health_latch,` を削除 | (この行ごと削除) | `test_commands_optional_params_all_wired_by_build_app` (spy の captured_kwargs に `health_latch` が無くなる — v1.0 の truthy 検査ではこの変異を検出できなかった。`self.health_latch = health_latch or HealthLatch()` により属性は削除後も truthy なままになるため) |
+| T1-M5 (v1.4 追加、実装コードレビュー1周目 ローカル P3) | `build_app` の `Commands(...)` 呼び出しの `plugins_root=plugins_dir` | `plugins_root=root` (別の Path を渡す退行) | `test_commands_optional_params_all_wired_by_build_app` (`captured_kwargs["plugins_root"] == tmp_path / "plugins"` の等値比較が false。v1.3 までの spy はキーの有無しか見ておらず値の破損を検出できなかった) |
+| T1-M6 (v1.4 追加、同上 P3) | 同呼び出しの `settings=settings` | `settings=None` | `test_commands_optional_params_all_wired_by_build_app` (`captured_kwargs["settings"] is app.settings` が `None is Settings(...)` で false) |
+
+**Step 1-a の spy 検査を拡張 (v1.4、P3)**: `test_commands_optional_params_all_wired_by_build_app` の
+`missing` 判定 (キーの有無) はそのまま残し、直後に値検査を追加する。`plugins_root` は build_app が
+計算する固定値 (`root / "plugins"`) そのものなので**等値**で検査 (App 側に直接比較できる属性が無い
+ため)。`settings` は build_app が構築した唯一の `Settings` インスタンスが `Commands` と `App` の
+両方へ**同一オブジェクトのまま**渡る契約 (どちらも `settings` ローカル変数をそのまま渡す) なので
+`app.settings` との**同一性 (`is`)** で検査する (等値だが同一でない `model_copy` 漏れも検出したい)。
 
 - [ ] commit: `fix(ops-first-contact): build_app が Commands に policy_path を渡すよう配線 + 構造的配線テスト (T1)`
 
@@ -737,6 +746,29 @@ codex には 1 ファイル 2 箇所の変更としてまとめて渡してよ�
 | T2-M4/E11 pin | `test_check_service_initial_env_has_no_secrets_message_includes_exact_matched_pattern_clause` | エラー文が `matched pattern(s) [...]` の整形済み句を実際に含む (`matches`/`patterns_hit` 追跡が機能している) | `matches[k] = pat` を削除 | 新規テスト (KILLED、`leaked!r` 単独には現れない `matched pattern(s) ['TOKEN']` という角括弧付きの句で判定するため、旧 assert `"OPENAI_" in msg` の偶然一致を回避) |
 | E1 pin | `test_check_service_initial_env_has_no_secrets_allowlist_is_case_sensitive` | allowlist の完全一致は大文字小文字を区別する | `if k in allowlist:` → `if k.upper() in allowlist:` | 新規テスト (KILLED、allowlist=`["MY_API_KEY"]` / env=`{"my_api_key"}` で拒否のままであることを見る) |
 
+### Step 2-f (v1.4 追加): F1 是正 (codex 実装コードレビュー1周目 Important)
+
+`_read_proc_self_environ_names` (`service.py:254-262`) は非 UTF-8 な env 名を
+`key.decode("utf-8", errors="replace")` で復号する。異なる生バイト列が同じ U+FFFD 入り文字列に
+多対一で潰れ得るため、allowlist の完全一致がこの**復号後**文字列だけを比較すると、allowlist に
+登録した 1 項目が意図しない別の生バイト名まで除外してしまう可能性がある (fail-closed の逆)。
+**読み取り側の復号方式は変えない** — allowlist の判定側で「U+FFFD を含む名前は除外対象にしない」
+条件を 1 つ足すだけ。
+
+- [ ] red を確認する (実測): `test_check_service_initial_env_has_no_secrets_allowlist_excludes_neither_replacement_char_name`
+      (allowlist=`["MY_�_API_KEY"]`、env=`{"MY_�_API_KEY", "HOME"}` → `RuntimeError` を
+      期待するが、是正前は allowlist の完全一致でこの名前が除外され `DID NOT RAISE RuntimeError`)
+- [ ] 実装: `_check_service_initial_env_has_no_secrets` の allowlist 分岐:
+      ```diff
+      -        if k in allowlist:
+      +        if "�" not in k and k in allowlist:
+      ```
+      (コメントは理由を 1〜2 行、レビュー由来語を入れない)
+- [ ] green を確認する (実測): 対象テスト + 検査⑤関連の既存テスト全部が green
+- [ ] 逆変異: `"�" not in k and ` を外し `if k in allowlist:` に戻す →
+      `test_check_service_initial_env_has_no_secrets_allowlist_excludes_neither_replacement_char_name`
+      が red (U+FFFD を含む名前が allowlist で除外され、拒否も WARNING も起きなくなる)
+
 - [ ] commit: `fix(ops-first-contact): 起動時検査⑤に secret_env_allowlist + which/backend/パターン/allowlist除外WARNINGを含むメッセージ (T2)`
 
 ---
@@ -1006,6 +1038,16 @@ codex には 1 ファイル 3 箇所の変更としてまとめて渡してよ�
 に `assert s.service.secret_env_allowlist == []` を追記 (KILLED、`secret_env_allowlist: []` →
 `["SOME_DUMMY"]` の変異で確認済み)。
 
+### Step 3-f (v1.4 追加): 実装コードレビュー1周目 ローカル確定 (P1・P2)
+
+いずれも「実装は設計どおり正しいが、次の同型の退行を検出する pin が無い」型 (段0の r2 是正と同じ性質)。
+テスト追加のみ、実装は変えない。
+
+| # | 追加テスト | 守る性質 | 逆変異 (置換前→後) | killer |
+|---|---|---|---|---|
+| P1 pin (ローカル cC 確定) | `test_improve_add_placeholder_detection_uses_normalized_display_not_raw_text` | `is_placeholder` の判定対象が**正規化後**の `display` であること (`text` 取り違えではないこと)。既存テストの生入力は C* 文字がブラケット外側に無いため `display`/`text` どちらで判定しても同じ結果になり検出できなかった | `is_placeholder` の判定対象を `display` → `text` (正規化前) に取り違える | 新規テスト (KILLED、入力 `"​<test​>"` — `display` 基準では `<test>` で `is_placeholder=True`、`text` 基準では先頭がゼロ幅文字なので `False` に分岐) |
+| P2 pin (ローカル cD 確定) | `test_improve_add_does_not_leak_warning_or_display_into_activity_log` | `improve add` の echo-back・警告文・`display` が `self.activity.write(...)` の引数 (実際に書かれる activity ログ行) に混入しない。既存テストは `improvement_backlog.last_result` (常に `None`) しか見ておらず、activity ログを検証するテストが無かった | `activity.write(...)` の呼び出し位置を `display`/`reply` 計算の**後**に繰り上げ、summary に `reply` を渡す | 新規テスト (KILLED、`activity.log` の該当行の summary フィールドが `#<bid> via shell` と完全一致しなくなる) |
+
 - [ ] commit: `fix(ops-first-contact): improve add の登録文を正規化して echo-back + 短文/プレースホルダ/不可視文字警告 (T3、拒否しない)`
 
 ---
@@ -1083,3 +1125,4 @@ def test_settings_without_service_section_loads_with_default_empty_allowlist(tmp
 | 2026-09-21 | v1.1 | codex 設計レビュー r1 (Important 4) の反映。Global Constraints の「既存テストの書き換え 0 本」を訂正 (引数 stub 7 箇所・実行 11 本の差し替えを明記、assert 本体は無改変)。T1: 構造的テストを truthy 検査から spy 方式に変更 (AC-1c、`health_latch` の見逃しを解消)。T2: allowlist 除外時の起動 WARNING (AC-2f) を追加、テストヘルパーを `load_settings` 経由から軽量 `SimpleNamespace` (`_settings_stub`) に変更 (caplog が `agentic_fx` logger の `propagate=False` に阻まれる罠を回避)、旧 settings.yaml 無改変ロードの pin テストを追加。T3: 表示・警告判定共通の正規化関数 `_normalize_idea_display` を新設 (Unicode カテゴリ C* 除去 + 改行→空白、AC-3a/AC-3b 書き換え + AC-3f〜AC-3h 新設)、`commands` フィクスチャが `(cmds, conn, tmp_path)` のタプルを返す実仕様に合わせてテストコードの unpacking を訂正 (v1.0 の下書きコードのバグ) | codex 設計レビュー r1 (Important 4 件、Critical 0) + 実コード照合時に発見したプラン記述の欠陥 | `34d3dc9` |
 | 2026-09-21 | v1.2 | codex 設計レビュー r2 (Important 4・Minor 2) の反映。W1: AC-2g (`test_check_cli_backend_forwards_which_trade_to_secret_check`) を新設 — trade 非 local 経路で `which="trade"` の転送を pin し、v1.1 の 2 本 (trade=local のみ踏む) では検出できなかった `which="improve"` 固定変異を検出できるようにした (T2-M8)。W2: WARNING テスト 2 本を `caplog` から `_capture_service_warnings()` (`agentic_fx.service` logger への直接 handler 付与) に差し替え — `caplog` は `agentic_fx` logger の `propagate=False` がプロセス内で他テストにより既に固定されているとテスト順序依存で記録を拾えないことが判明したため。W3: AC-2f に否定側 (`HARMLESS_NAME`、秘密パターン不一致) とソート順 (`A_TOKEN`/`Z_TOKEN`) の pin テスト 2 本を追加 (T2-M9/T2-M10)。W4: AC-3a/AC-3d の「逐語」の定義を「`Commands.dispatch` の tokenizer [`commands.py:63-67`] 通過後の文字列」に訂正し、tokenizer の空白畳み込み変更を非スコープに明記。AC-3i (`test_improve_add_stores_idea_without_display_normalization`) を新設し、C* 文字を含む idea でも保存側が無加工であることを pin (T3-M10)。M1: T3 新規テスト本数の記載を実数 (v1.1 時点 7 本、v1.2 で 8 本) に訂正。M2: 設計書 §6 の変更ファイル表を AC-2f〜AC-2g・AC-3f〜AC-3i を含む形に更新 | codex 設計レビュー r2 (Important 4 件・Minor 2 件、Critical 0) | (未コミット) |
 | 2026-09-21 | v1.3 | 段 0 検収 r2 (`tmp/review-20260921-ofc/stage0.md`/`stage0-r2.md`) の裁定を反映。**A (regression 是正)**: Global Constraints・Step 2-a の既存 monkeypatch 差し替え箇所数の記載漏れを訂正 (3 箇所→実数 6 箇所・実行 7 本、`test_build_app_rewrites_relative_claude_bin_to_absolute_path`[×2]・`test_improve_loop_receives_settings_with_resolved_cli_bin`・`test_build_app_rewrites_relative_codex_bin_to_absolute_path` の 3 箇所 4 実行が抜けていたためフルスイートで 4 failed が顕在化していた)。**B (pin 追加)**: 段 0 生存変異 8 件全てをテスト不足と裁定、Step 2-e/3-e に pin 7 本 (T2-M4/E11 は同根のため 1 本、E1, E3, E6, E7, E13, E15) を追加、KILLED 実測済み。**C (文言是正)**: `service.py` のエラー文 "improve worker can read..." を which に関わらず loop を名指ししない "same-UID CLI worker can read this service's /proc/<pid>/environ" に修正 (事前 grep でこの句を pin する既存テスト無しを確認済み、設計書 §1.4 の AC 引用箇所も同期)。T3-M3 の `len("<案1>")` 記載 (誤 3 → 正 4) を訂正 | 段 0 検収 r2 の裁定 (regression 是正・生存変異全 pin・文言是正) | (未コミット) |
+| 2026-09-21 | v1.4 | 実装コードレビュー1周目 (codex + ローカル3本) の裁定を反映。**F1 (codex Important、AC-2h 新設)**: `_read_proc_self_environ_names` の `errors="replace"` 復号が異なる生バイト列の env 名を同じ U+FFFD 入り文字列に潰し得るため、allowlist 分岐に `"�" not in k and` を追加 (fail-closed、Step 2-f、読み取り側の復号方式は変えない)。**P1 (ローカル cC 確定)**: `is_placeholder` の判定対象が正規化後 `display` であることの pin (Step 3-f)。**P2 (ローカル cD 確定)**: `improve add` の警告文・echo-back・`display` が `activity.write` の引数へ混入しないことの pin (Step 3-f)。**P3 (ローカル cE 確定)**: 配線 spy テストで `plugins_root`/`settings` の**値**も検査するよう拡張 (Step 1-d、キーの有無だけでは値の破損を検出できなかった)。codex の Minor 1 件 (policy パスの出所一元化) は範囲外・対応せず。設計書は v1.3 (AC-2h 新設 + エラー文言の引用同期) | 実装コードレビュー1周目 (codex Critical 0・Important 1・Minor 1、ローカル3本 確定3・誤検知17) | (未コミット) |
