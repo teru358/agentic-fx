@@ -4154,12 +4154,12 @@ def test_check_service_initial_env_has_no_secrets_allowlist_excludes_neither_rep
     見る (WARNING も出ない — 除外していないため)。"""
     from agentic_fx.service import _check_service_initial_env_has_no_secrets
 
-    settings = _settings_stub(["MY_�_API_KEY"])
+    settings = _settings_stub(["MY_\ufffd_API_KEY"])
     with _capture_service_warnings() as records:
         with pytest.raises(RuntimeError, match="secret"):
             _check_service_initial_env_has_no_secrets(
                 settings, which="trade", backend="codex",
-                read_initial_env_names=lambda: {"MY_�_API_KEY", "HOME"})
+                read_initial_env_names=lambda: {"MY_\ufffd_API_KEY", "HOME"})
     assert records == []
 
 
