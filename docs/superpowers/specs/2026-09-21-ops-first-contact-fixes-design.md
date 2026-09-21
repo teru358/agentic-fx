@@ -1,4 +1,4 @@
-# [ops-first-contact-fixes] 設計書 v1.0
+# [ops-first-contact-fixes] 設計書 v1.1
 
 束: 2026-09-20 の実機運用でユーザー本人が直接踏んだ小さな不具合 3 件の是正。
 新しい機能・新しい配備経路・新しい自動化は作らない。3 件とも入口層 (`service.py` の起動時検査/配線、
@@ -31,6 +31,19 @@
 下書きで退けた案 (件 2 のパターン語境界化・値検査、件 3 の入力ブロック・対話確認) は本書でも退けたまま —
 理由は各件の §3 に転記する。
 
+### 0.1 codex 設計レビュー r1 の反映 (2026-09-21、v1.1)
+
+v1.0 を対象に codex (terra/medium) 設計レビュー 1 周を実施 (Critical 0 / Important 4)。
+裁定 (`tmp/design-ops-first-contact/codex-r1/verdicts.md`、指揮者確定) を反映して v1.1 とした。
+4 件とも採用 (V4 は範囲を絞って採用):
+
+| # | 指摘 | 裁定 |
+|---|---|---|
+| V1 | T2 で `settings.service.secret_env_allowlist` を読むようになると、`object()` を渡す既存呼び出し 4 箇所 (実行 8 本) が `AttributeError` になる。「既存テストの書き換えは 0 本」という Global Constraints の記述自体が誤り | 本番コードに互換層は入れない。テスト側の第一引数 stub を最小構成に差し替える (assert 本体は無改変)。Global Constraints の記述を訂正する |
+| V2 | allowlist が本物の秘密名を無警告で通す (人間の誤設定への safety net が無い) | allowlist が実際に除外した名前があれば起動時に WARNING を 1 回出す (値は出さない、名前のみ)。攻撃面拡大ではなく誤用時の可視性の話 |
+| V3 | T1 の構造的テストが「値が truthy」を見ているため、正当な falsy 値・truthy な default 値の未配線を見逃す (`commands.py:54` の `health_latch or HealthLatch()` は現に未配線でも truthy) | truthy 検査を廃止し、`Commands` を kwargs 記録 wrapper に差し替える spy 方式にする |
+| V4 | 「strip 後の可視文字数」の実装 (`len(stripped)`) は Unicode コードポイント数であり、ゼロ幅文字・端末制御列を可視文字として数えてしまう | 表示・警告判定共通の正規化 (Unicode カテゴリ C* 除去 + 改行→空白) を新設し、AC-3b をこの定義で書き換える。全角括弧の検出・長さ上限・対話確認は本束の範囲外のまま (不採用) |
+
 ---
 
 ## 1. スコープと非スコープ
@@ -38,13 +51,16 @@
 **スコープ**
 - `src/agentic_fx/service.py`: `build_app` の `Commands(...)` 呼び出しに `policy_path` を追加 (件 1)。
   `_check_service_initial_env_has_no_secrets` に allowlist 適用 + `which`/`backend`/当たったパターンを
-  メッセージに埋め込む (件 2)。
+  メッセージに埋め込む + allowlist が実際に除外した名前があれば起動時 WARNING を 1 回出す (件 2、v1.1)。
 - `src/agentic_fx/config.py`: `ServiceSettings.secret_env_allowlist: list[str] = []` を新設し
   `Settings.service` として追加 (件 2)。
-- `src/agentic_fx/commands.py`: `improve add` の応答に登録原文を echo-back + 条件付き警告 1 行 (件 3)。
+- `src/agentic_fx/commands.py`: `improve add` の応答に、表示・警告判定共通の正規化 (v1.1、Unicode
+  カテゴリ C* 除去 + 改行→空白) を通した登録文を echo-back + 条件付き警告 1 行 (件 3)。
 - `config/settings.yaml.example`: 新規キー `service.secret_env_allowlist` を追記・コメント付け (件 2)。
-- `tests/test_service_app.py`: 件 1 の配線テスト 2 本 (個別 + 構造的シグネチャ突合)、件 2 の allowlist / メッセージテスト。
-- `tests/commands/test_improve_commands.py`: 件 3 の echo-back / 警告条件テスト。
+- `tests/test_service_app.py`: 件 1 の配線テスト (spy 方式の構造的テストに変更、v1.1)、件 2 の
+  allowlist / メッセージ / WARNING テスト (v1.1)。既存の `object()` 引数 stub 4 箇所・
+  `which`/`backend` 未対応の monkeypatch スタブ 3 箇所の差し替え (v1.1、詳細はプラン Global Constraints)。
+- `tests/commands/test_improve_commands.py`: 件 3 の echo-back / 警告条件 / 制御文字正規化テスト (v1.1)。
 
 **非スコープ (明示)**
 - **件 2 のパターン変更** (`_SECRET_ENV_PATTERNS` の中身・照合ロジック自体)。既存の回帰 pin
@@ -58,7 +74,12 @@
 - **`Commands.__init__` の必須引数化**。下書きで検討した C 案 (デフォルト `None` 全廃) は
   既存の大量のテスト呼び出し元を洗い出す規模になるため見送り。件 1 の構造的テスト (AC-1c) で代替する。
 - **`policy_path` 以外の未配線調査の再実施**。下書きで全数確認済み (5 個のオプション引数のうち未配線は
-  `policy_path` のみ) — 本束はその結果を前提にする。
+  `policy_path` のみ) — 本束はその結果を前提にする。実装プラン起草時 (2026-09-21) に `service.py:1054-1060`
+  の `Commands(...)` 呼び出しで再確認済み: `health_latch=health_latch` / `improve_supervisor=improve_supervisor` /
+  `plugins_root=plugins_dir` / `settings=settings` は渡されており、未配線は引き続き `policy_path` のみ。
+- **件 3 の全角括弧 (`＜＞`・`【】`・`［］`) や `{…}` の検出 (v1.1、範囲外)**。R3 裁定の範囲は ASCII の
+  `<…>`/`[…]` のみ。「プレースホルダのように見える」を広く意図する拡張は別途検討事項として別 ticket に回す
+  (本束では追加しない)。
 
 ---
 
@@ -115,7 +136,11 @@ backlog #78 を追加しました: 「<案1>」
 afx> improve add USDJPY のスプレッドが広い時間帯の指値精度を上げたい
 backlog #79 を追加しました: 「USDJPY のスプレッドが広い時間帯の指値精度を上げたい」
 ```
-(警告は R3 の条件に合致したときだけ 2 行目に出る。合致しなければ 1 行のみ。**登録はどちらも成立する** — 拒否しない)
+(警告は R3 の条件に合致したときだけ 2 行目に出る。合致しなければ 1 行のみ。**登録はどちらも成立する** — 拒否しない。
+警告判定と echo-back の表示はどちらも同じ正規化 (v1.1、§3.3 参照) を通した文字列を使う。ゼロ幅文字や
+端末制御列 (`\x1b[...` 等) を含む入力ではこの正規化で除去され、除去が起きた場合は 3 行目に
+`表示できない文字を N 個含みます` が付く。**backlog に保存する課題文自体は無加工のまま** — 正規化は
+表示・警告判定にのみ使う)
 
 ---
 
@@ -138,8 +163,17 @@ backlog #79 を追加しました: 「USDJPY のスプレッドが広い時間�
 **前提を疑う**: 「`policy_path` を足すだけ」で直るが、`Commands.__init__` は今後も引数が増える設計
 (実際プラン 7〜11 で段階的に増えた)。個別テストを 1 本足すだけでは「次に増える引数」の配線漏れを
 検出できない。→ **構造的な配線検査**を対案として採用する: `Commands.__init__` のオプション引数名の集合を
-`inspect.signature` で取り、`build_app` が構築した `Commands` インスタンスの対応属性が (デフォルトの
-`None`/falsy のままでなく) 実際に設定されていることを機械的に確認する 1 本を足す。
+`inspect.signature` で取る。
+
+**前提を疑う (v1.1、codex r1 V3)**: 「構築後のインスタンス属性が truthy であること」を配線の証拠にする
+という前提も疑う。`commands.py:54` の `self.health_latch = health_latch or HealthLatch()` により、
+`health_latch` は `build_app` が渡し忘れても `or HealthLatch()` で truthy な新規インスタンスが入り、
+truthy 検査は通ってしまう (現在のプラン記述のままでも 5 引数中 1 本を見逃す、将来 `dry_run: bool = True`
+のような truthy default を持つ引数が増えれば同様の穴が増える)。→ **spy 方式**に変更する:
+`agentic_fx.service.Commands` (`service.py:25` で module 属性として import、`:1054` で呼ばれる ため
+monkeypatch 可能) を、渡された kwargs を記録してから本物へ委譲する wrapper に差し替えて `build_app` を
+1 回実行し、`Commands.__init__` の「既定値を持つ keyword 引数」全部が実際に渡された kwargs のキー集合に
+含まれることを assert する。属性の truthy 検査は廃止する。
 
 **選択肢**:
 - **A (採用)**: `policy_path` 配線 + 個別配線テスト + 構造的シグネチャ突合テスト。
@@ -189,6 +223,18 @@ backlog #79 を追加しました: 「USDJPY のスプレッドが広い時間�
 - C: 変数名でなく値の形状で判定。「値を見ずに名前だけで守る」という検査の設計原則 (`.env` 経由の値は
   最初から対象外) と矛盾し、値をエラーメッセージ/ログに載せるリスクを新たに生む。**退ける**。
 
+**前提を疑う (v1.1、codex r1 V2)**: 「allowlist に載っていれば起動を通すだけでよい」という前提を疑う。
+allowlist は利用者が自分の意思で正確な変数名を打鍵する必要がある誤用経路であり、改善/取引 worker が
+`config/settings.yaml` を書き換えて allowlist に足す自動昇格経路は無い (`mission_worker.py:163-203` の
+handshake に `db_path`/`plugins_dir`/config path が含まれず、Landlock で `code_root` は read-only —
+確認済み)。したがって攻撃面の拡大ではないが、利用者が誤って本物の秘密名 (例: `OPENAI_API_KEY`) を
+allowlist に書いてしまっても、現状は無警告で起動が通ってしまう — safety net が無い。
+**直す (追加)**: allowlist に載っていて、かつ初期 env に実在し、かつ秘密名パターンに当たった名前
+(= allowlist が実際に除外した名前) があれば、起動時に **WARNING を 1 回**出す。内容は変数名のみ
+(ソート済み)、**値は出さない**。allowlist に載っているが env に無い名前・パターンに当たらない名前は
+何も出さない (雑音にしない)。パターンに当たる名前を allowlist に書くこと自体は拒否しない (それが
+allowlist の用途)。
+
 ### 3.3 件 3
 
 **現物確認 (投入経路の全数)**: `backlog.add()` (`store/backlog.py:42-52`) の呼び出し元は
@@ -227,13 +273,28 @@ LLM が内容を読んで判断する形の `observation` 落としは存在し�
 - D: 対話 2 段階確認。`Commands.dispatch(line: str) -> str` が 1 行 1 応答の同期モデルであり、
   複数行にまたがる確認フローを持たない。R4 により **`[ops-ui]` へ先送り**。
 
+**前提を疑う (v1.1、codex r1 V4)**: 「strip 後の `len()`」が「可視文字数」だという前提を疑う。
+`len()` は Unicode コードポイント数であり、ゼロ幅スペース (U+200B) や bidi 制御文字のような
+「画面に何も描画しない」文字も 1 文字として数える。ゼロ幅文字 4 個を貼り付けると `len(stripped) == 4`
+で「4 文字未満」警告が出ない (見た目は空なのに警告なしで登録される) し、`\x1b[2J` のような端末制御列を
+含む原文をそのまま echo-back すると端末側で解釈され表示が壊れる恐れがある。
+**直す (採用、範囲を絞る)**: 表示と警告判定の両方に使う正規化を 1 個定義する。改行 (`\n`) は空白 1 個に
+置換してから (複数行の貼り付けが単語ごと連結しないように)、`unicodedata.category(ch)` が `C` で始まる
+文字 (Cc 制御 / Cf 書式 = ゼロ幅・bidi 制御など) を除去し、`strip()` する。警告判定 (AC-3b) と
+echo-back の表示 (AC-3a) はどちらもこの正規化後の文字列を使う。正規化で 1 文字でも除去された場合は
+非ブロッキング警告と同じ枠で「表示できない文字を N 個含みます」を追加の 1 行で出す。**backlog に保存する
+課題文自体 (`backlog.idea`) は従来どおり無加工** — 保存側の変更は本束の範囲外。
+**不採用 (報告のみ、範囲外)**: 表示の長さ上限 (端末が折り返すだけで欠陥ではない — 逐語表示が件 3 の
+目的)。全角 `＜＞`・`【】`・`［］`・`{…}` のプレースホルダ検出 (R3 裁定の範囲は ASCII の `<…>`/`[…]` のみ
+— これを超える仕様拡張になるため本束では入れない)。対話確認は引き続き R4 により `[ops-ui]` へ先送り。
+
 ---
 
 ## 4. 不変条件・遮断規律との関係
 
 | ID | 不変条件 | この束での扱い |
 |---|---|---|
-| IV-1 | 秘密 env の守りを弱めない | 件 2 は `_SECRET_ENV_PATTERNS` を 1 文字も変えない。allowlist は**名前の完全一致のみ**で、パターン/正規表現/前方一致は不可 (実装で `k in allowlist` の単純な集合所属判定にする — ワイルドカードを許すと守りが弱まる)。allowlist が空 (既定) のときの挙動は現状と完全に同じ (既存 pin 全数が退行しないことを AC で確認する) |
+| IV-1 | 秘密 env の守りを弱めない | 件 2 は `_SECRET_ENV_PATTERNS` を 1 文字も変えない。allowlist は**名前の完全一致のみ**で、パターン/正規表現/前方一致は不可 (実装で `k in allowlist` の単純な集合所属判定にする — ワイルドカードを許すと守りが弱まる)。allowlist が空 (既定) のときの挙動は現状と完全に同じ (既存 pin 全数が退行しないことを AC で確認する)。**(v1.1 追加)** allowlist が実際に名前を除外したときは起動時 WARNING を出す (拒否はしない、可視性のみ追加 — 守りの強さ自体は変えない) |
 | IV-2 | 遮断 8 (改善プロンプトへの人間判断の漏洩) | 件 3 の echo-back・警告文言は `Commands.dispatch` の**戻り値 (端末表示) にのみ**書く。`backlog.idea` (ユーザーの原文そのもの、これは元々改善プロンプトに乗る設計) 以外の新しい文字列 (警告文・確認文言) を `improvement_backlog.last_result` / `approval_requests.reason` などの改善プロンプト注入経路の DB 列に書き込まない。件 1・件 2 は DB 書き込みを増やさない |
 | IV-3 | 承認の重みを変えない | 3 件とも承認 (`approve`/`reject`/plugin 切替) のフローに触れない。件 3 の登録は従来通り `status='open'` で、改善ループの選択・承認プロセスは無変更 |
 | IV-4 | `.env` を読まない / 値を読まない (件 2) | 件 2 の allowlist は変数**名**の集合であり、実装・テストとも env の**値**を読む経路を増やさない (既存の `_read_proc_self_environ_names` は名前だけを返す契約のまま) |
@@ -248,10 +309,12 @@ LLM が内容を読んで判断する形の `observation` 落としは存在し�
 |---|---|
 | **AC-1a** | `build_app` で構築した `App.commands._policy_path == root / "policy" / "directives.md"` |
 | **AC-1b** | `build_app` 経由で構築した `Commands` に対し `dispatch("policy add こんにちは")` を実行すると `policy/directives.md` に追記され、戻り値が `"policy に追記しました"` |
-| **AC-1c** | **構造的テスト**: `Commands.__init__` のキーワード専用オプション引数名の集合 (`{"health_latch", "improve_supervisor", "policy_path", "plugins_root", "settings"}`) と、テスト側が保持する「パラメータ名 → `Commands` インスタンス属性名」対応表 (`{"health_latch": "health_latch", "improve_supervisor": "improve_supervisor", "policy_path": "_policy_path", "plugins_root": "plugins_root", "settings": "settings"}`) のキー集合が一致する (新しいオプション引数が対応表に無ければこの比較で red — 対応表の更新を強制する)。かつ `build_app` で構築した `App.commands` の各対応属性が **falsy でない** (`None`/`""`/`0` のいずれでもない) ことを確認する |
+| **AC-1c** | **構造的テスト (v1.1、spy 方式に変更)**: `Commands.__init__` のキーワード専用オプション引数名の集合 (`inspect.signature` で取得) と、テスト側が保持する対応表のキー集合が一致する (新しいオプション引数が対応表に無ければこの比較で red — 対応表の更新を強制する)。かつ `agentic_fx.service.Commands` を、渡された kwargs を記録してから本物の `Commands` へ委譲する wrapper に monkeypatch で差し替えて `build_app` を実行し、シグネチャ上の全オプション引数名が実際に渡された kwargs のキー集合に**含まれる**ことを確認する (**属性の truthy 検査はしない** — `commands.py:54` の `health_latch or HealthLatch()` のように truthy な default 値を持つ引数は、truthy 検査では未配線を見逃すため) |
 
-**変異案**: `policy_path=` の行を削除 → AC-1a/AC-1b が red。`Commands.__init__` にダミーのオプション引数を追加し
+**変異案**: `policy_path=` の行を削除 → AC-1a/AC-1b/AC-1c が red (v1.1: spy が `policy_path` を kwargs に
+見ないため AC-1c も red になる)。`Commands.__init__` にダミーのオプション引数を追加し
 対応表を更新しない → AC-1c が red (この束で一番大事な変異 — 「次の再発」を模擬する)。
+`build_app` から `health_latch=` を渡す行を外す → AC-1c が red (v1.1 追加、truthy 検査では拾えなかった変異)。
 
 ### 件 2
 
@@ -262,24 +325,33 @@ LLM が内容を読んで判断する形の `observation` 落としは存在し�
 | **AC-2c** | エラーメッセージに実際の `which` (`trade`/`improve`) と実際の `backend` (`claude`/`codex`/`opencode`) が入る (trade+codex で拒否したとき `improve+claude` と出ない) |
 | **AC-2d** | エラーメッセージに「当たったパターン名」と「allowlist へ追加する」案内文言が入る |
 | **AC-2e** | allowlist の一致は**完全一致のみ** — `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` を allowlist に入れても `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS_V2` のような類似名は除外されない (部分一致・前方一致に広げていないことの pin) |
+| **AC-2f** (v1.1、新規) | allowlist に載っていて、かつ初期 env に実在し、かつ秘密名パターンに当たった名前 (= 実際に除外された名前) があれば、起動時に WARNING が 1 回出る。ログ本文に変数**名**のみ (ソート済み) を含み、値に相当する文字列は含まない。allowlist に載っているが env に無い名前・パターンに当たらない名前がある場合は WARNING を出さない (雑音にしない)。除外が 0 件のとき (allowlist が空、または allowlist と env の交差が無いとき) は WARNING を出さない |
 
 **変異案**: `k not in allowlist` の条件を落とす → AC-2a が red。allowlist 判定を `in` から
 先頭一致 (`any(k.startswith(a) for a in allowlist)`) に緩める → AC-2e が red。
 メッセージ文字列から `which`/`backend`/パターン名の埋め込みを外す → AC-2c/AC-2d が red。
+WARNING の呼び出しを削除する、または条件を「allowlist 非空なら常に出す」に変える (実際に除外した名前の
+有無を見ない) → AC-2f が red (v1.1 追加)。
 
 ### 件 3
 
 | ID | 観測 |
 |---|---|
-| **AC-3a** | `dispatch("improve add 何かの課題")` の戻り値に、登録した idea の原文 (正規化前、ユーザーが打った通りの文字列) が `「…」` の形で含まれる |
-| **AC-3b** | idea が `<…>` または `[…]` で完全に囲まれている、または strip 後の可視文字数が 4 未満のとき、戻り値に警告行 (`⚠` で始まる) が追加される |
+| **AC-3a** | `dispatch("improve add 何かの課題")` の戻り値に、登録した idea の**正規化後の表示文字列** (v1.1: 改行→空白 + Unicode カテゴリ C* 除去 + strip。制御文字・ゼロ幅文字を含まない通常の入力では原文と一致する) が `「…」` の形で含まれる |
+| **AC-3b** (v1.1 書き換え) | 正規化後の表示文字列が `<…>` または `[…]` で完全に囲まれている、または**正規化後の文字列の `len()`** (= Unicode カテゴリ C* を除去済みなので「可視文字数」に一致する) が 4 未満のとき、戻り値に警告行 (`⚠` で始まる) が追加される |
 | **AC-3c** | AC-3b の条件に合致しない (通常の長さ・非プレースホルダの) idea では警告行が付かない (否定側 pin) |
-| **AC-3d** | 警告が出ても `backlog.add` は実行され、登録された行の `status` は従来通り `'open'` (ブロックしない) |
+| **AC-3d** | 警告が出ても `backlog.add` は実行され、登録された行の `status` は従来通り `'open'` (ブロックしない)。`backlog.idea` 列には**正規化前の原文**がそのまま入る (保存側は無加工、本束の範囲外) |
 | **AC-3e** | echo-back・警告文言のいずれも `improvement_backlog.last_result` / `approval_requests.reason` 等 DB 列に新規の文字列を書き込まない (`dispatch` の戻り値以外に副作用が増えないことを確認する。activity ログの記録内容も従来 (`"#{bid} via shell"`) から変えない) |
+| **AC-3f** (v1.1、新規) | idea にゼロ幅スペース (U+200B) を 4 個含む入力は、正規化後の可視文字数が 0 になり AC-3b の短さ条件に合致して警告が出る。かつ戻り値に「表示できない文字を N 個含みます」の行が追加される |
+| **AC-3g** (v1.1、新規) | idea に端末制御列 (`\x1b[2J` 等) を含む入力では、戻り値 (echo-back・警告行とも) に `\x1b` に相当する文字が含まれない |
+| **AC-3h** (v1.1、新規) | idea が複数行にまたがる入力 (`\n` を含む) では、正規化後の表示文字列は改行が空白 1 個に置換され、単語同士が連結しない |
 
 **変異案**: echo-back の文字列連結を消す → AC-3a が red。警告条件の `<`/`[` 判定を落とす、
 短さ閾値 (`< 4`) を変える → AC-3b・AC-3c の両方 (正例・否定側) で検出。`backlog.add` 呼び出しを
 警告分岐の中に誤って移動する (警告時にブロックしてしまう退行) → AC-3d が red。
+正規化関数 (Unicode カテゴリ C* 除去) を丸ごと外す、または改行→空白の置換だけを外す → AC-3f/AC-3g/AC-3h が
+red (v1.1 追加)。警告判定だけを正規化前の生文字列に戻す、または echo-back だけを正規化前の生文字列に戻す →
+それぞれ AC-3b/AC-3f 側、AC-3a/AC-3g 側が red (v1.1 追加、正規化の適用箇所を個別に殺す変異)。
 
 ---
 
@@ -334,3 +406,4 @@ service:
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-09-21 | v1.0 | 初版。`tmp/design-ops-first-contact/design.md` (下書き、3 件とも A 案) のユーザー承認 (2026-09-21) を受けて spec 化。§0 に指揮者裁定 4 点 (R1〜R4: allowlist 置き場所 `service.*` 新設 / エラー文にパターン名を含める / 件 3 警告条件 = 4 文字未満 or `<…>`/`[…]` 完全一致・非ブロッキング / 対話確認は `[ops-ui]` へ先送り) を追加し、AC・変更ファイル表・不変条件表・`settings.yaml.example` 同期方針 (個人 `settings.yaml` はユーザー自身が追記するランブック扱い) を新設 | 下書き承認 + 指揮者裁定 | (本 commit) |
+| 2026-09-21 | v1.1 | §0.1 に codex r1 の反映を追記。V1: 既存テストの `object()` 引数 stub が `AttributeError` になることを認め、Global Constraints・スコープ側の記述を訂正 (本番コードへの互換層は入れない)。V2: AC-2f (allowlist 除外時の起動 WARNING、値は出さず名前のみ) を新設、IV-1 に追記。V3: AC-1c を truthy 検査から spy 方式 (kwargs 記録 wrapper) に書き換え、`health_latch` の truthy-default 見逃しを解消。V4: AC-3a/AC-3b を Unicode 正規化 (改行→空白 + カテゴリ C* 除去) 基準に書き換え、AC-3f〜AC-3h (ゼロ幅文字・端末制御列・複数行) を新設。全角括弧検出・長さ上限・対話確認は不採用のまま (非スコープに明記) | codex 設計レビュー r1 (Important 4 件、Critical 0) | (未コミット) |
