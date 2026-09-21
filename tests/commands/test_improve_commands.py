@@ -199,6 +199,43 @@ def test_improve_add_warns_exactly_at_length_boundary(commands):
     assert "⚠" in result_three
 
 
+def test_improve_add_placeholder_detection_uses_normalized_display_not_raw_text(commands):
+    """[ops-first-contact-fixes r1-fix] P1 (ローカル cC 確定): `is_placeholder`
+    の判定対象が**正規化後**の `display` であることの pin。既存テストの
+    生入力 (`<案1>` / `[TODO]` 等) は C* 文字がブラケットの外側に無いため
+    `display` 基準・`text` (正規化前) 基準のどちらで判定しても同じ結果に
+    なり、判定対象を取り違える変異を検出できなかった。ゼロ幅スペース
+    (U+200B、Cf) を `<`/`>` の外側に隣接させた入力 (`_normalize_idea_display`
+    で除去後 `<test>` になる) で、`display` 基準なら `is_placeholder=True`
+    (警告あり)・`text` 基準なら先頭がゼロ幅文字なので `False` (警告なし)
+    に分岐することを利用する。"""
+    cmds, conn, _ = commands
+    idea = "​<test​>"
+    result = cmds.dispatch(f"improve add {idea}")
+    assert "⚠" in result
+
+
+def test_improve_add_does_not_leak_warning_or_display_into_activity_log(commands):
+    """[ops-first-contact-fixes r1-fix] P2 (ローカル cD 確定): `improve add`
+    の警告文・echo-back・正規化後文字列 (`display`) が `self.activity.write`
+    の引数 (実際に書かれる activity ログの行) に混入しないことの pin。
+    既存テストは `improvement_backlog.last_result` (常に None) だけを見て
+    おり、`activity.write(...)` の第 3 引数 (summary) を検証するテストが
+    無かった。警告が出る入力 (`<案1>`) で dispatch した後、activity.log の
+    該当行が従来どおり `#<bid> via shell` だけ (タブ区切りの summary
+    フィールドで完全一致) であることを見る — `⚠`・`display` の内容
+    (`<案1>` 自体) がどちらも log ファイル全体に現れない。"""
+    cmds, conn, tmp_path = commands
+    result = cmds.dispatch("improve add <案1>")
+    bid = int(result.split("#")[1].split(" ")[0])
+    log_text = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
+    lines = [ln.split("\t") for ln in log_text.splitlines() if ln]
+    backlog_line = next(f for f in lines if f[2] == "backlog_added" and f[4] == str(bid))
+    assert backlog_line[3] == f"#{bid} via shell"
+    assert "⚠" not in log_text
+    assert "<案1>" not in log_text
+
+
 def test_improve_add_warning_includes_reject_command_with_actual_bid(commands):
     """[ops-first-contact-fixes r2] E13 是正: 段 0 の生存変異 (警告本文の
     案内文 [`backlog reject {bid}` での訂正手順] をマーカー `⚠` のみに

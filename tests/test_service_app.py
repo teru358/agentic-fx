@@ -279,6 +279,19 @@ def test_commands_optional_params_all_wired_by_build_app(tmp_path, monkeypatch):
         missing = EXPECTED_OPTIONAL_PARAMS - captured_kwargs.keys()
         assert not missing, (
             f"build_app が Commands(...) に渡していないオプション引数: {missing}")
+        # [ops-first-contact-fixes r1-fix] P3 (ローカル cE 確定): 上の
+        # `missing` 判定は kwargs の**キーの有無**しか見ず、値が壊れて
+        # いても (例 `plugins_root=None`/`settings=None`) green になる。
+        # `plugins_root` は build_app が計算する固定値 (`root / "plugins"`)
+        # そのものなので**等値**で検査する (build_app 内で新規オブジェクトを
+        # 都度生成しないが、Path の等値比較の方が経路の変化に強い)。
+        # `settings` は build_app が構築した唯一の `Settings` インスタンスが
+        # `Commands` と `App` の両方へ**同一オブジェクトのまま**渡る契約
+        # (どちらも `settings` というローカル変数をそのまま渡す) なので、
+        # `app.settings` との**同一性**で検査する (別インスタンスへの
+        # 差し替え — 等値だが同一でない model_copy 漏れ — も検出したい)。
+        assert captured_kwargs["plugins_root"] == tmp_path / "plugins"
+        assert captured_kwargs["settings"] is app.settings
     finally:
         app.close()
 
@@ -4137,6 +4150,26 @@ def test_check_service_initial_env_has_no_secrets_allowlist_is_case_sensitive():
         _check_service_initial_env_has_no_secrets(
             settings, which="trade", backend="codex",
             read_initial_env_names=lambda: {"my_api_key", "HOME"})
+
+
+def test_check_service_initial_env_has_no_secrets_allowlist_excludes_neither_replacement_char_name():
+    """[ops-first-contact-fixes r1-fix] F1 是正 (codex 1周目レビュー
+    Important): `_read_proc_self_environ_names` は非 UTF-8 な env 名を
+    `errors="replace"` で復号するため、異なる生バイト列の名前が同じ
+    U+FFFD 入り文字列に多対一で潰れ得る。allowlist の完全一致がこの
+    復号後文字列だけを比較すると、意図しない別名まで除外してしまう
+    (fail-closed の逆)。U+FFFD を含む名前は allowlist で除外せず、通常の
+    秘密名パターン検査に回すことで、当たれば起動拒否のままであることを
+    見る (WARNING も出ない — 除外していないため)。"""
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    settings = _settings_stub(["MY_�_API_KEY"])
+    with _capture_service_warnings() as records:
+        with pytest.raises(RuntimeError, match="secret"):
+            _check_service_initial_env_has_no_secrets(
+                settings, which="trade", backend="codex",
+                read_initial_env_names=lambda: {"MY_�_API_KEY", "HOME"})
+    assert records == []
 
 
 def test_check_cli_backend_forwards_which_trade_to_secret_check(tmp_path, monkeypatch):
