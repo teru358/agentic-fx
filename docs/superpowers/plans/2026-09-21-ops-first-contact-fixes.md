@@ -1,4 +1,4 @@
-# [ops-first-contact-fixes] 実装プラン v1.2
+# [ops-first-contact-fixes] 実装プラン v1.3
 
 設計書: `docs/superpowers/specs/2026-09-21-ops-first-contact-fixes-design.md` v1.2。
 v1.1 (main `34d3dc9` コミット済) からの変更点は末尾「変更履歴」。v1.0→v1.1 裁定の詳細は
@@ -37,12 +37,20 @@ pytest を回せないことがあるため)。
   `service=SimpleNamespace(secret_env_allowlist=[])` を持つだけ) に差し替える。assert 本体・
   parametrize の値は 1 つも変えない**。加えて、`_check_cli_backend` (`service.py:373`) の呼び出しが
   `which=which, backend=backend` をキーワードで渡すよう変わるため、既存の monkeypatch 型配線テストが
-  持つ差し替え関数 (`tests/test_service_app.py:2989` のラムダ、`:3010`/`:3348` の `_raise`) のうち
-  **実際にこの呼び出しへ到達する 3 箇所** (backend=local で早期 return する
+  持つ差し替え関数のうち **実際にこの呼び出しへ到達する箇所** は `which=`/`backend=` を受け取れる形に
+  シグネチャを直す必要がある。**v1.2 時点の本節は `tests/test_service_app.py:2989` のラムダ、
+  `:3010`/`:3348` の `_raise` の計 3 箇所のみを列挙していたが、これは網羅漏れだった (r2 是正、
+  段 0 検収で実測確認)。実際には他に 3 箇所 (4 実行) — `test_build_app_rewrites_relative_claude_bin_to_absolute_path`
+  (`which_runner` で `["trade", "improve"]` を parametrize、2 実行)・
+  `test_improve_loop_receives_settings_with_resolved_cli_bin`・
+  `test_build_app_rewrites_relative_codex_bin_to_absolute_path` — が同じ呼び出しへ到達し、
+  シグネチャ未対応のまま `TypeError: ... unexpected keyword argument 'which'` で落ちる
+  (フルスイート実測で 4 failed として顕在化、r1 段 0 `tmp/review-20260921-ofc/stage0.md` §7)。
+  **正しい件数は計 6 箇所 (実行 7 本)** (backend=local で早期 return する
   `test_build_app_does_not_check_secret_env_when_improve_backend_is_local` の `_raise` は到達しないため
-  対象外) は `which=`/`backend=` を受け取れる形にシグネチャを直す。**「既存テストの assert 本体・
-  parametrize は無改変」という不変で挙動が変わっていないことを示す** — 引数 stub・関数シグネチャの
-  差し替え (計 7 箇所、実行本数 11 本) は上記不変の対象外
+  対象外のまま)。「既存テストの assert 本体・parametrize は無改変」という不変で挙動が変わっていないことを
+  示す** — 引数 stub・関数シグネチャの差し替え (計 10 箇所 [object() stub 4 + monkeypatch シグネチャ 6]、
+  実行本数 15 本 [8+7]) は上記不変の対象外
 - **未コミットの差分の上で `git checkout` / `git restore` を使わない。** 逆変異の復元は `cp` 退避で行う
   ([[no-git-checkout-over-uncommitted-subagent-work]])
 - **出力を `| grep` / `| head` に通して途中終了させない。** pytest の結果は最後まで読む
@@ -467,9 +475,11 @@ def test_check_cli_backend_forwards_which_trade_to_secret_check(tmp_path, monkey
     意味は変わらない)。
   - 検査⑤の呼び出しが `_check_cli_backend` から `which=which, backend=backend` をキーワードで渡す形に
     変わる (Step 2-b)。既存の monkeypatch 型配線テストのうち、`_check_service_initial_env_has_no_secrets`
-    を差し替え関数に monkeypatch していて **かつ実際にこの呼び出しへ到達する** 3 箇所は、差し替え関数の
+    を差し替え関数に monkeypatch していて **かつ実際にこの呼び出しへ到達する** 箇所は、差し替え関数の
     シグネチャに `which=`/`backend=` を追加しないと `TypeError: got an unexpected keyword argument
-    'which'` になる (assert 本体は変えない、シグネチャのみ):
+    'which'` になる (assert 本体は変えない、シグネチャのみ)。**v1.2 まではここを 3 箇所と記載していたが
+    網羅漏れだった (r2 是正、段 0 検収 `tmp/review-20260921-ofc/stage0.md` §7 で実測確認 — フルスイートで
+    4 failed として顕在化)。正しくは計 6 箇所 (実行 7 本)**:
     - `:2987-2989` (`test_build_app_opencode_does_not_require_credentials`、improve.backend=opencode →
       到達する): `lambda settings, *, read_initial_env_names=None: None` →
       `lambda settings, *, which=None, backend=None, read_initial_env_names=None: None`
@@ -481,6 +491,15 @@ def test_check_cli_backend_forwards_which_trade_to_secret_check(tmp_path, monkey
     - `:3348-3351` (`test_check_service_initial_env_has_no_secrets_is_called_for_opencode_backend`、
       improve.backend=opencode、実際に到達するのは `which="improve", backend="opencode"`) — 同様に
       `which=None, backend=None` を足し、捕捉値を pin する
+    - **(r2 追加、v1.2 で網羅漏れだった 3 箇所、4 実行)** `test_build_app_rewrites_relative_claude_bin_to_absolute_path`
+      (`@pytest.mark.parametrize("which_runner", ["trade", "improve"])` で 2 実行、いずれも
+      `runner.claude.bin` を相対値にして claude backend 経由で検査⑤へ到達する) /
+      `test_improve_loop_receives_settings_with_resolved_cli_bin` (improve.backend=claude で到達) /
+      `test_build_app_rewrites_relative_codex_bin_to_absolute_path` (codex backend で到達) —
+      いずれも `lambda settings, *, read_initial_env_names=None: None` →
+      `lambda settings, *, which=None, backend=None, read_initial_env_names=None: None` に直すだけで足りる
+      (これら 3 本は検査⑤の配線を見るテストではなく F1 (bin 絶対化書き戻し) を見るテストのため、
+      `captured` assert の追加は不要 — 元々「検査⑤を no-op にしてノイズを消す」目的の monkeypatch)
   - **対象外 (到達しないので変更不要)**: `:3030-3033`
     (`test_build_app_does_not_check_secret_env_when_improve_backend_is_local`) の `_raise` —
     `_check_cli_backend` は `backend == "local"` で検査⑤に到達する前に early return するため、この
@@ -706,6 +725,17 @@ codex には 1 ファイル 2 箇所の変更としてまとめて渡してよ�
 | T2-M8 (v1.2 追加、codex r2 W1) | `_check_cli_backend` 内の `_check_service_initial_env_has_no_secrets(settings, which=which, backend=backend)` | `_check_service_initial_env_has_no_secrets(settings, which="improve", backend=backend)` (`which` を固定) | `test_check_cli_backend_forwards_which_trade_to_secret_check` (trade 経路の `captured["which"]` が `"trade"` にならず red。v1.1 の 2 本 [T2-M5 の対象] は trade=local のため検出できなかった変異) |
 | T2-M9 (v1.2 追加、codex r2 W3) | `if k in allowlist:` の内側の `if _matched_pattern(k) is not None: excluded_by_allowlist.append(k)` | `excluded_by_allowlist.append(k)` (パターン照合条件を外し、allowlist 一致だけで対象にする) | `test_check_service_initial_env_has_no_secrets_allowlist_hit_requires_pattern_match` (`HARMLESS_NAME` で警告が出てしまい red) |
 | T2-M10 (v1.2 追加、codex r2 W3) | `sorted(excluded_by_allowlist)` | `excluded_by_allowlist` (`sorted` を外す) | `test_check_service_initial_env_has_no_secrets_allowlist_hit_warning_is_sorted` (集合のイテレーション順に依存し、`A_TOKEN` が `Z_TOKEN` より前に来る保証が失われる) |
+
+### Step 2-e (r2 追加): 段0検収の生存変異 pin
+
+段 0 検収 (`tmp/review-20260921-ofc/stage0.md`) で SURVIVED と裁定された 2 件 (T2-M4/E11、E1) を
+テスト不足と裁定し pin を追加する。いずれも `tests/test_service_app.py` に追記済み、KILLED 実測済み
+(`tmp/review-20260921-ofc/stage0-r2.md` §B)。
+
+| # | 追加テスト | 守る性質 | 逆変異 (置換前→後) | killer |
+|---|---|---|---|---|
+| T2-M4/E11 pin | `test_check_service_initial_env_has_no_secrets_message_includes_exact_matched_pattern_clause` | エラー文が `matched pattern(s) [...]` の整形済み句を実際に含む (`matches`/`patterns_hit` 追跡が機能している) | `matches[k] = pat` を削除 | 新規テスト (KILLED、`leaked!r` 単独には現れない `matched pattern(s) ['TOKEN']` という角括弧付きの句で判定するため、旧 assert `"OPENAI_" in msg` の偶然一致を回避) |
+| E1 pin | `test_check_service_initial_env_has_no_secrets_allowlist_is_case_sensitive` | allowlist の完全一致は大文字小文字を区別する | `if k in allowlist:` → `if k.upper() in allowlist:` | 新規テスト (KILLED、allowlist=`["MY_API_KEY"]` / env=`{"my_api_key"}` で拒否のままであることを見る) |
 
 - [ ] commit: `fix(ops-first-contact): 起動時検査⑤に secret_env_allowlist + which/backend/パターン/allowlist除外WARNINGを含むメッセージ (T2)`
 
@@ -950,7 +980,7 @@ codex には 1 ファイル 3 箇所の変更としてまとめて渡してよ�
 |---|---|---|---|
 | T3-M1 | `reply = f"backlog #{bid} を追加しました: 「{display}」"` | `reply = f"backlog #{bid} を追加しました"` (echo-back を消す) | `test_improve_add_echoes_the_registered_idea_text` / `test_improve_add_warns_on_short_or_placeholder_idea` |
 | T3-M2 | `is_too_short = len(display) < 4` | `is_too_short = len(display) < 1` (閾値を実質無効化) | `test_improve_add_warns_on_short_or_placeholder_idea` (`"ab"` で警告が付かなくなる) |
-| T3-M3 | `(display.startswith("<") and display.endswith(">"))` | `False` (プレースホルダ判定を無効化) | `test_improve_add_warns_on_short_or_placeholder_idea` (`<案1>` は 3 文字扱いになり短さ判定で拾われるので、**`[TODO]` (6 文字、短さでは拾えない) を使う枝**が red — この変異の真の killer は `[TODO]` 側の assert であることに注意。着手時に `python3 -c 'print(len("<案1>"))'` (3) と `python3 -c 'print(len("[TODO]"))'` (6) で実測し直すこと) |
+| T3-M3 | `(display.startswith("<") and display.endswith(">"))` | `False` (プレースホルダ判定を無効化) | `test_improve_add_warns_on_short_or_placeholder_idea` (**r2 訂正**: `<案1>` は `<`,`案`,`1`,`>` の 4 文字 — `python3 -c 'print(len("<案1>"))'` の実測値は 3 ではなく **4**。v1.2 までの本行は実測値を誤記していた。4 文字は `is_too_short` (`< 4`) の閾値ちょうどのため短さ判定にも拾われず、この変異単体では `<案1>` 側の `assert "⚠" in result_placeholder` が直接 red になる — 段 0 検収 `tmp/review-20260921-ofc/stage0.md` §5-2 で実測確認、killer 判定自体への影響は無い。`[TODO]` (6 文字、短さでは拾えない) 側の assert も引き続き red の一因になる) |
 | T3-M4 | `if is_placeholder or is_too_short:` の下の `reply +=` ブロックを `backlog.add` 呼び出しの**前**に繰り上げ、失敗時に return する (誤ってブロッキング化する退行) | (上記の入れ替え) | `test_improve_add_does_not_block_registration_when_warned` |
 | T3-M5 | `self.activity.write(Category.IMPROVE, "backlog_added", f"#{bid} via shell", ...)` | `self.activity.write(Category.IMPROVE, "backlog_added", f"#{bid} via shell: {text}", ...)` (警告文言や原文を activity 経由で別経路に漏らす方向の変異) | 直接の red は無いが (activity は遮断 8 の対象外)、**AC-3e は `last_result` 列のみを見る**ため、この変異では red にならないことを実装時に確認し、`last_result` に触れる変異 (例: `backlog.add` の直後に `last_result` を更新するコードを誤って追加する) を追加で 1 本足す (T3-M5': `backlog.add` 呼び出し後に `self.conn.execute("UPDATE improvement_backlog SET last_result=? WHERE id=?", (text, bid))` を挿入 → `test_improve_add_warning_text_does_not_leak_to_backlog_last_result` が red) |
 | T3-M6 (v1.1 追加) | `kept = [ch for ch in step1 if not unicodedata.category(ch).startswith("C")]` | `kept = list(step1)` (C* 除去を丸ごと外す) | `test_improve_add_warns_and_notes_removed_chars_for_zero_width_input` (ゼロ幅 4 個が `len()==4` のまま警告が出なくなる) / `test_improve_add_strips_terminal_control_sequences_from_reply` (`\x1b` がそのまま残る) |
@@ -958,6 +988,23 @@ codex には 1 ファイル 3 箇所の変更としてまとめて渡してよ�
 | T3-M8 (v1.1 追加、判定だけ raw に戻す) | `is_placeholder`/`is_too_short` の判定対象を `display` から `text.strip()` に戻す (echo-back は正規化後のまま) | (上記の差し替え) | `test_improve_add_warns_and_notes_removed_chars_for_zero_width_input` (`len(text.strip())==4` になり短さ警告が出なくなる) |
 | T3-M9 (v1.1 追加、echo だけ raw に戻す) | `reply = f"backlog #{bid} を追加しました: 「{display}」"` の `display` を `text` に戻す (判定は正規化後のまま) | (上記の差し替え) | `test_improve_add_strips_terminal_control_sequences_from_reply` (`\x1b` が戻り値に残る) |
 | T3-M10 (v1.2 追加、codex r2 W4) | `bid = backlog.add(self.conn, idea=text, source="user", now=self.clock.now())` | `bid = backlog.add(self.conn, idea=display, source="user", now=self.clock.now())` (保存側にも表示用正規化をかけてしまう退行 — `display` は `_normalize_idea_display(text)` の後に計算されるため、実際の diff では `display, removed = _normalize_idea_display(text)` を `backlog.add` の**前**に繰り上げた上でこの変異を当てる) | `test_improve_add_stores_idea_without_display_normalization` (`row["idea"]` から `​` が消え、tokenizer 通過後の原文と一致しなくなる) |
+
+### Step 3-e (r2 追加): 段0検収の生存変異 pin
+
+段 0 検収 (`tmp/review-20260921-ofc/stage0.md`) で SURVIVED と裁定された 4 件 (E3, E6, E7, E13) を
+テスト不足と裁定し pin を追加する (`tests/commands/test_improve_commands.py`)。全て KILLED 実測済み
+(`tmp/review-20260921-ofc/stage0-r2.md` §B)。
+
+| # | 追加テスト | 守る性質 | 逆変異 (置換前→後) | killer |
+|---|---|---|---|---|
+| E3 pin | `test_normalize_idea_display_strips_leading_and_trailing_whitespace` | `_normalize_idea_display` は前後の空白 (C* 除去とは独立) も除去する | `"".join(kept).strip()` → `"".join(kept)` | 新規テスト (KILLED) |
+| E6 pin | `test_improve_add_does_not_warn_on_unclosed_bracket_prefix` | 開き括弧のみ (閉じ括弧なし) かつ十分長い idea はプレースホルダ扱いにしない | `is_placeholder` の `endswith` 判定を外す | 新規テスト (KILLED、`<`/`[` 側両方を確認) |
+| E7 pin | `test_improve_add_warns_exactly_at_length_boundary` | 長さ境界 (ちょうど4文字は警告なし・3文字は警告あり) | `len(display) < 4` → `<= 4` | 新規テスト (KILLED) |
+| E13 pin | `test_improve_add_warning_includes_reject_command_with_actual_bid` | 警告本文に実際の bid を含む `backlog reject {bid}` 案内が存在する | 案内文ブロックを `"\n⚠"` のみに短縮 | 新規テスト (KILLED) |
+
+`config/settings.yaml.example` の既定値 pin (E15) は `tests/test_config.py::test_example_file_loads`
+に `assert s.service.secret_env_allowlist == []` を追記 (KILLED、`secret_env_allowlist: []` →
+`["SOME_DUMMY"]` の変異で確認済み)。
 
 - [ ] commit: `fix(ops-first-contact): improve add の登録文を正規化して echo-back + 短文/プレースホルダ/不可視文字警告 (T3、拒否しない)`
 
@@ -987,8 +1034,8 @@ codex には 1 ファイル 3 箇所の変更としてまとめて渡してよ�
   セクション無し) は無改変でロードできる (`extra="forbid"` は未知キーを拒否するだけで、省略された
   フィールドは default で埋まる — pydantic の通常挙動)。**残す確認**: T2 の Step に「`service:` 節の無い
   yaml をロードするテスト 1 本」を追加すること (下記追記)。
-- **T3-M3 の killer**: 逆変異表 (Step 3-d) に実測値 (`len("<案1>")` = 3、`len("[TODO]")` = 6) を反映済み。
-  着手時に念のため再確認すること。
+- **T3-M3 の killer**: 逆変異表 (Step 3-d) に実測値 (`len("<案1>")` = 4 [r2 訂正、v1.2 までは誤って
+  3 と記載]、`len("[TODO]")` = 6) を反映済み。着手時に念のため再確認すること。
 - **v1.2 で解消 (codex r2 W2)**: v1.1 は「`_settings_stub()` でフル `Settings`/`_init` を避けたので
   `caplog` が `agentic_fx` logger の `propagate=False` の罠を回避できる」としていたが、これは
   **不十分だった** — `_settings_stub()` 自身が `_init`/`build_app` を呼ばなくても、**同一テストプロセス
@@ -1035,3 +1082,4 @@ def test_settings_without_service_section_loads_with_default_empty_allowlist(tmp
 | 2026-09-21 | v1.0 | 初版。設計書 v1.0 の AC-1a〜AC-3e に対応する T1/T2/T3 を起こす。3 task は互いに独立ファイル域で完全並列、codex にはテスト+本体コードのみ渡し red/green・フルスイート・変異確認は指揮者側 subagent が担当する体制を明記 | 設計書 v1.0 承認 (2026-09-21) を受けたプラン起草 | (本 commit) |
 | 2026-09-21 | v1.1 | codex 設計レビュー r1 (Important 4) の反映。Global Constraints の「既存テストの書き換え 0 本」を訂正 (引数 stub 7 箇所・実行 11 本の差し替えを明記、assert 本体は無改変)。T1: 構造的テストを truthy 検査から spy 方式に変更 (AC-1c、`health_latch` の見逃しを解消)。T2: allowlist 除外時の起動 WARNING (AC-2f) を追加、テストヘルパーを `load_settings` 経由から軽量 `SimpleNamespace` (`_settings_stub`) に変更 (caplog が `agentic_fx` logger の `propagate=False` に阻まれる罠を回避)、旧 settings.yaml 無改変ロードの pin テストを追加。T3: 表示・警告判定共通の正規化関数 `_normalize_idea_display` を新設 (Unicode カテゴリ C* 除去 + 改行→空白、AC-3a/AC-3b 書き換え + AC-3f〜AC-3h 新設)、`commands` フィクスチャが `(cmds, conn, tmp_path)` のタプルを返す実仕様に合わせてテストコードの unpacking を訂正 (v1.0 の下書きコードのバグ) | codex 設計レビュー r1 (Important 4 件、Critical 0) + 実コード照合時に発見したプラン記述の欠陥 | `34d3dc9` |
 | 2026-09-21 | v1.2 | codex 設計レビュー r2 (Important 4・Minor 2) の反映。W1: AC-2g (`test_check_cli_backend_forwards_which_trade_to_secret_check`) を新設 — trade 非 local 経路で `which="trade"` の転送を pin し、v1.1 の 2 本 (trade=local のみ踏む) では検出できなかった `which="improve"` 固定変異を検出できるようにした (T2-M8)。W2: WARNING テスト 2 本を `caplog` から `_capture_service_warnings()` (`agentic_fx.service` logger への直接 handler 付与) に差し替え — `caplog` は `agentic_fx` logger の `propagate=False` がプロセス内で他テストにより既に固定されているとテスト順序依存で記録を拾えないことが判明したため。W3: AC-2f に否定側 (`HARMLESS_NAME`、秘密パターン不一致) とソート順 (`A_TOKEN`/`Z_TOKEN`) の pin テスト 2 本を追加 (T2-M9/T2-M10)。W4: AC-3a/AC-3d の「逐語」の定義を「`Commands.dispatch` の tokenizer [`commands.py:63-67`] 通過後の文字列」に訂正し、tokenizer の空白畳み込み変更を非スコープに明記。AC-3i (`test_improve_add_stores_idea_without_display_normalization`) を新設し、C* 文字を含む idea でも保存側が無加工であることを pin (T3-M10)。M1: T3 新規テスト本数の記載を実数 (v1.1 時点 7 本、v1.2 で 8 本) に訂正。M2: 設計書 §6 の変更ファイル表を AC-2f〜AC-2g・AC-3f〜AC-3i を含む形に更新 | codex 設計レビュー r2 (Important 4 件・Minor 2 件、Critical 0) | (未コミット) |
+| 2026-09-21 | v1.3 | 段 0 検収 r2 (`tmp/review-20260921-ofc/stage0.md`/`stage0-r2.md`) の裁定を反映。**A (regression 是正)**: Global Constraints・Step 2-a の既存 monkeypatch 差し替え箇所数の記載漏れを訂正 (3 箇所→実数 6 箇所・実行 7 本、`test_build_app_rewrites_relative_claude_bin_to_absolute_path`[×2]・`test_improve_loop_receives_settings_with_resolved_cli_bin`・`test_build_app_rewrites_relative_codex_bin_to_absolute_path` の 3 箇所 4 実行が抜けていたためフルスイートで 4 failed が顕在化していた)。**B (pin 追加)**: 段 0 生存変異 8 件全てをテスト不足と裁定、Step 2-e/3-e に pin 7 本 (T2-M4/E11 は同根のため 1 本、E1, E3, E6, E7, E13, E15) を追加、KILLED 実測済み。**C (文言是正)**: `service.py` のエラー文 "improve worker can read..." を which に関わらず loop を名指ししない "same-UID CLI worker can read this service's /proc/<pid>/environ" に修正 (事前 grep でこの句を pin する既存テスト無しを確認済み、設計書 §1.4 の AC 引用箇所も同期)。T3-M3 の `len("<案1>")` 記載 (誤 3 → 正 4) を訂正 | 段 0 検収 r2 の裁定 (regression 是正・生存変異全 pin・文言是正) | (未コミット) |

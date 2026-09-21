@@ -128,7 +128,10 @@ CLI からは一切書けない。
 
 **直した後**:
 - `settings.yaml` に何も足さずに起動した場合、拒否メッセージは実態を正確に言う:
-  `trade+codex backend refuses to start: service initial env contains secret-like variable name(s) ['CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS'] (matched pattern 'OPENAI_') — improve/trade worker can read /proc/self/environ of same-UID processes (R10). If this name is NOT a secret, either (a) unset it before starting the service, or (b) add its exact name to service.secret_env_allowlist in settings.yaml. Otherwise move the value into .env.`
+  `trade+codex backend refuses to start: service initial env contains secret-like variable name(s) ['CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS'] — same-UID CLI worker can read this service's /proc/<pid>/environ (R10) (matched pattern(s) ['OPENAI_']). If this name is NOT a secret, either (a) unset it before starting the service, or (b) add its exact name to service.secret_env_allowlist in settings.yaml. Otherwise move the value into .env.`
+  (r2 是正: 旧文言は `improve/trade worker` のように呼び出し元 loop を名指ししていたが、実装は
+  `which`/`backend` に関わらず脅威モデルとしては「同 UID の CLI worker 一般」なので loop 名を出さない
+  表現に統一した — `which`/`backend` は既に文の先頭で実値を言っているため重複しない)
   (`which`/`backend` が実値、当たったパターン名を含む、次の一手 2 つを案内)
 - `settings.yaml` に
   ```yaml
