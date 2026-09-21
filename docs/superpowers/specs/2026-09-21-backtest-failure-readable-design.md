@@ -1,4 +1,4 @@
-# [backtest-failure-readable] 設計書 v1.1
+# [backtest-failure-readable] 設計書 v1.2
 
 対象 commit: `fc318ab`。束 A は、現行の CPU 上限を変えずに、backtest と live plugin 評価の失敗を人間には診断可能に、改善 agent には安全な固定分類として届ける。
 
@@ -79,13 +79,13 @@ unreaped `Popen` は session が参照を外さず、モジュール内の上限
 |---|---|---|
 | kill 後 5 秒の reap 期限超過 | `crashed` | unreaped、`cpu_sec=null` |
 | `parent_kill_sent` かつ wall deadline | `timeout` | 親が生存確認後に timeout kill |
-| 親 kill なし、`SIGKILL`、CPU が limit 以上 | `cpu_limit` | worker 寿命の累積 CPU 上限 |
+| 親 kill なし、`SIGKILL`、CPU が `limit − 0.05 秒` 以上 | `cpu_limit` | worker 寿命の累積 CPU 上限 |
 | 親 kill なしの `SIGKILL` で CPU 欠測/閾値未満 | `crashed` | OOM/external kill 等を CPU と断定しない |
 | `SIGXFSZ`、その他 signal/exit/EOF 未確定 | `crashed` | 技術ログには事実を残し原因は断定しない |
 | 生存 worker の `ok:false` | `plugin_error` | plugin/依存/validation/serialization failure |
 | invalid JSON、oversize、read failure | `protocol_error` | IPC protocol failure |
 
-CPU 判定の許容幅は 0 秒である。設定値 1、5、60 で CPU kill の親観測値が `>= limit` になることを実装前 harness で確認し、下回れば分類を実装せず裁定へ戻す。OOM、外部 kill、自発 `SIGKILL` が閾値近くで重なる誤分類、kernel tick/float の丸め、worker が wait していない孫（特に group 外へ逃げた孫）の未計上・未回収は残余リスクとして隠さない。activity/技術ログに親観測 CPU と signal を併記し、人間が再判定できるようにする。
+CPU 判定の許容幅は 0.05 秒の内部定数である (設定ノブにしない)。カーネルが `RLIMIT_CPU` を判定する時刻と `wait4` が返す精密な累積 CPU は一致せず、実測 (2026-09-21、設定値 1/2/5/60、計 56 回) では親観測値が上限を最大 26 ms 下回った。許容幅 0 では CPU 上限死のほぼ全部が `crashed` になるため、実測最大の約 2 倍を取る。実装前 harness は実 plugin worker でも同じ測定を行い、不足が 0.05 秒を超えたら分類を実装せず裁定へ戻す。OOM、外部 kill、自発 `SIGKILL` が閾値近くで重なる誤分類、kernel tick/float の丸め、worker が wait していない孫（特に group 外へ逃げた孫）の未計上・未回収は残余リスクとして隠さない。activity/技術ログに親観測 CPU と signal を併記し、人間が再判定できるようにする。
 
 `SandboxError` は互換 constructor `SandboxError(message, *, code="backtest_failed")` を持ち、既存の人間向け message は維持する。runtime lifecycle の分岐は具体 code を必ず指定し、stderr を `__str__` や diagnostic snapshot に含めない。
 
@@ -138,14 +138,14 @@ live producer は `ActivityLog` を composition root から受け、bucket 評�
 
 ### 2.6 15m 戦略で実際に見えること
 
-対象戦略を再実行すると、worker は現行どおり累積 60 CPU 秒の hard 到達で終了する。親が kill を送らず、`wait4` CPU が limit 以上なら `cpu_limit` となる。人間には技術ログの `code=cpu_limit`、signal、実測 CPU、escaped stderr tail と、`backtest_cpu result=cpu_limit cpu_source=parent_wait4` が残る。agent には `worker_cpu_limit` と固定 hint だけが届く。2 回目までは実測し、同じ content hash/pair の 3 回目は `repeated_worker_cpu_limit` で事前拒否する。
+対象戦略を再実行すると、worker は現行どおり累積 60 CPU 秒の hard 到達で終了する。親が kill を送らず、`wait4` CPU が `limit − 0.05 秒` 以上なら `cpu_limit` となる。人間には技術ログの `code=cpu_limit`、signal、実測 CPU、escaped stderr tail と、`backtest_cpu result=cpu_limit cpu_source=parent_wait4` が残る。agent には `worker_cpu_limit` と固定 hint だけが届く。2 回目までは実測し、同じ content hash/pair の 3 回目は `repeated_worker_cpu_limit` で事前拒否する。
 
 ## 3. 不変条件
 
 | ID | 不変条件 |
 |---|---|
 | IV-1 | `sandbox_session_cpu_sec` は worker 寿命の累積 CPU 上限、既定 60、soft==hard を維持する |
-| IV-2 | CPU 判定は親 kill なし、`SIGKILL`、親観測 CPU `>= limit` の積だけで行う |
+| IV-2 | CPU 判定は親 kill なし、`SIGKILL`、親観測 CPU `>= limit − 0.05 秒` の積だけで行う |
 | IV-3 | stderr は匿名 file から技術ログへの一方向で、agent 面へ出ない |
 | IV-4 | tool/transcript/ledger/counter の公開 error は一致する |
 | IV-5 | 欠測値は推測せず `null` にする |
@@ -227,7 +227,7 @@ T1 の最初の成果物として測り、結果を実装報告に残す。項�
 pytest や実サービスではなく、実装 task の最初に小さい process/fake-process harness で境界値を確認する。
 
 1. 対象 Linux/Python の `wait4` が正常終了・`RLIMIT_CPU`・親killで返す status/rusage と、設定値
-   1/5/60 で CPU kill が `cpu_sec >= limit` になること。下回る実測が出たら分類裁定へ戻す。
+   1/5/60 で CPU kill の `limit − cpu_sec` が 0.05 秒以内に収まること (純 Python の busy loop では最大 26 ms を実測済)。実 plugin worker で超える実測が出たら分類裁定へ戻す。
 2. `Popen` を親が `wait4` で reap した後に `returncode` を設定したとき、destructor/closeで二重waitや
    ResourceWarningがないこと。実Popenで `ECHILD`、returncode固定、reaped後のPID再waitなしも確認する。EOFより先に死亡、孫がstdout保持、deadline直前死亡もprobeする。
 3. 匿名 stderr file に 0 B、8 KiB 境界、8 MiB 超を書いたときの回収時間、`SIGXFSZ`、fd close。
@@ -279,7 +279,7 @@ pytest や実サービスではなく、実装 task の最初に小さい proces
 
 ### この設計書の提示で確認する点
 
-- `cpu_limit` は、親が観測した worker 寿命累積 CPU が limit 以上、親 kill なし、`SIGKILL` の三条件でだけ判定する。許容幅は 0 秒である。
+- `cpu_limit` は、親が観測した worker 寿命累積 CPU が `limit − 0.05 秒` 以上、親 kill なし、`SIGKILL` の三条件でだけ判定する。許容幅は 0.05 秒 (内部定数、実測最大 26 ms の約 2 倍) である。当初案の許容幅 0 は実測で不成立と分かったため改めた。
 - 三条件の確証がないものは `crashed` とする。CPU とは断定しない。
 - 同一失敗の事前打ち切りは `cpu_limit` だけに適用し、同一 content hash/pair の 3 回目からに限る。crash、timeout、一般 failure は対象外である。
 
@@ -292,4 +292,5 @@ pytest や実サービスではなく、実装 task の最初に小さい proces
 | 2026-09-21 | v0.3 | 親 wait4、soft==hard、core 無効化、死亡監視、sink 隔離、live 抑制を追加 | 観測の信頼境界と運用安全性を明確化 | — |
 | 2026-09-21 | v0.4 | reap 期限、許容幅 0、CPU source、preflight 規律、live 通知、実 Popen harness を明確化 | 境界条件と検証可能性を固定 | — |
 | 2026-09-21 | v1.0 | orphan 強参照・冪等終端状態・live 完全写像・runbook を反映して公開向けに清書 | 最終裁定を全設計要素へ反映 | `630edc8` |
-| 2026-09-21 | v1.1 | 清書時に圧縮で落ちた8契約と対応ACを復元 | 清書時の圧縮で落ちた契約の復元 | (本 commit) |
+| 2026-09-21 | v1.1 | 清書時に圧縮で落ちた8契約と対応ACを復元 | 清書時の圧縮で落ちた契約の復元 | `d95990d` |
+| 2026-09-21 | v1.2 | `cpu_limit` 判定の許容幅を 0 → 0.05 秒 (内部定数) | 実測: RLIMIT_CPU の kill 時、親が観測する累積 CPU は上限を最大 26 ms 下回る | (本 commit) |
